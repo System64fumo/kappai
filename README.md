@@ -1,0 +1,2 @@
+# kappai
+Personal AI playground
