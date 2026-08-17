@@ -1,0 +1,117 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf { uint w0[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly buffer RBuf { float residual[]; };
+layout(set = 0, binding = 3) writeonly buffer YBuf { float y[]; };
+#else
+layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    int n;
+    int k;
+} params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+
+void main() {
+    uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+    uint tid = gl_LocalInvocationID.x;
+    int  k   = params.k;
+    int  blocks_per_row = k / 32;
+
+    precise float acc[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++) acc[r] = 0.0;
+    bool valid[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++)
+        valid[r] = (int(base_i) + r < params.n);
+
+    for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+        int tile_end = min(tile_start + TILE_K, k);
+        int tile_len = tile_end - tile_start;
+
+        for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+            x_shared[j] = x[tile_start + j];
+        barrier();
+
+        int block_start = tile_start / 32;
+        int block_end   = tile_end / 32;
+        for (int bi = block_start; bi < block_end; bi++) {
+            int x_base = bi * 32 - tile_start;
+            float xv[32];
+            for (int j = 0; j < 32; j++) xv[j] = x_shared[x_base + j];
+
+            float amax = 0.0;
+            for (int j = 0; j < 32; j++) {
+                float ax = abs(xv[j]);
+                if (ax > amax) amax = ax;
+            }
+            float dx = amax / 127.0;
+            float idx_ = dx > 0.0 ? 1.0 / dx : 0.0;
+
+            float dx_scale = half_to_float(float_to_half(dx));
+            int xq[32];
+            for (int j = 0; j < 32; j++) {
+                float scaled = xv[j] * idx_;
+
+                float rounded = scaled >= 0.0 ? floor(scaled + 0.5) : ceil(scaled - 0.5);
+                int v = int(rounded);
+                if (v > 127) v = 127;
+                if (v < -127) v = -127;
+                xq[j] = v;
+            }
+
+            for (int r = 0; r < ROWS_PER_THREAD; r++) {
+                if (!valid[r]) continue;
+                uint row_idx = base_i + uint(r);
+                uint block_off = row_idx * uint(blocks_per_row) * Q8_0_BLOCK_BYTES + uint(bi) * Q8_0_BLOCK_BYTES;
+                float d = half_to_float(w0_read_u16(block_off));
+                uint qs_off = block_off + 2u;
+
+                int sumi = 0;
+                for (int w4 = 0; w4 < 8; w4++) {
+                    uint word = w0_read_u32(qs_off + uint(w4 * 4));
+                    int b0 = int((word      ) & 0xFFu);
+                    int b1 = int((word >>  8u) & 0xFFu);
+                    int b2 = int((word >> 16u) & 0xFFu);
+                    int b3 = int((word >> 24u) & 0xFFu);
+                    int q0 = b0 >= 128 ? b0 - 256 : b0;
+                    int q1 = b1 >= 128 ? b1 - 256 : b1;
+                    int q2 = b2 >= 128 ? b2 - 256 : b2;
+                    int q3 = b3 >= 128 ? b3 - 256 : b3;
+                    int j = w4 * 4;
+                    sumi += q0 * xq[j]
+                          + q1 * xq[j + 1]
+                          + q2 * xq[j + 2]
+                          + q3 * xq[j + 3];
+                }
+                acc[r] += d * dx_scale * float(sumi);
+            }
+        }
+        barrier();
+    }
+
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+        if (!valid[r]) continue;
+#ifdef HAS_RESIDUAL
+        y[base_i + uint(r)] = acc[r] + residual[base_i + uint(r)];
+#else
+        y[base_i + uint(r)] = acc[r];
+#endif
+    }
+}

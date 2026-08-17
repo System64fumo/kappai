@@ -1,0 +1,373 @@
+#include "compute.h"
+#include "backend/cpu/scalar/quants.h"
+#include "log.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+void compute_scratch_init(compute_scratch *s) {
+	memset(s, 0, sizeof(*s));
+}
+
+static void compute_scratch_set_router_bufs(compute_scratch *s) {
+	buffer *rid	  = &s->slots[RECIPE_SLOT_ROUTER_IDS];
+	buffer *rw	  = &s->slots[RECIPE_SLOT_ROUTER_W];
+	rid->handle	  = s->router_ids_host;
+	rid->host_ptr = s->router_ids_host;
+	rid->size	  = sizeof(s->router_ids_host);
+	rid->owner	  = NULL;
+	rw->handle	  = s->router_w_host;
+	rw->host_ptr  = s->router_w_host;
+	rw->size	  = sizeof(s->router_w_host);
+	rw->owner	  = NULL;
+}
+
+static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head_dim, float theta) {
+	const int	 half		 = head_dim / 2;
+	const double theta_scale = pow(theta, -2.0 / (double)head_dim);
+	double		 freq		 = 1.0;
+	for (int j = 0; j < half; j++) {
+		double step_cos = cos(freq);
+		double step_sin = sin(freq);
+		double c		= 1.0;
+		double s		= 0.0;
+		float *cos_col	= cos_out + j;
+		float *sin_col	= sin_out + j;
+		for (int pos = 0; pos < n_ctx; pos++) {
+			cos_col[(ptrdiff_t)pos * half] = (float)c;
+			sin_col[(ptrdiff_t)pos * half] = (float)s;
+			double nc					   = (c * step_cos) - (s * step_sin);
+			s							   = (c * step_sin) + (s * step_cos);
+			c							   = nc;
+		}
+		freq *= theta_scale;
+	}
+}
+
+static void free_buf(buffer *b) {
+	if (!b->owner)
+		return;
+	b->owner->buffer_free(b->owner, b);
+}
+
+static void scratch_free_device_buffers(compute_scratch *s) {
+	free_buf(&s->slots[RECIPE_SLOT_X]);
+	free_buf(&s->slots[RECIPE_SLOT_XB]);
+	free_buf(&s->slots[RECIPE_SLOT_XB2]);
+	free_buf(&s->slots[RECIPE_SLOT_ATTN_OUT]);
+	free_buf(&s->slots[RECIPE_SLOT_Q]);
+	free_buf(&s->slots[RECIPE_SLOT_K]);
+	free_buf(&s->slots[RECIPE_SLOT_V]);
+	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
+	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
+	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
+	free_buf(&s->ple_proj);
+	free_buf(&s->ple_inp);
+	free_buf(&s->ple_slice);
+	free_buf(&s->ple_all);
+	free_buf(&s->ple_proj_gpu);
+	free_buf(&s->ple_proj_norm_w_gpu);
+	free_buf(&s->router_softmax_inp_gpu);
+	free_buf(&s->router_logits_gpu);
+	free(s->logits_host);
+}
+
+static void scratch_free_host_buffers(compute_scratch *s) {
+	free(s->rope_cos);
+	free(s->rope_sin);
+	free(s->rope_cos_swa);
+	free(s->rope_sin_swa);
+	free(s->ple_buf);
+	free(s->ple_inp_host);
+	s->ple_inp_host = NULL;
+	free(s->cur_host);
+	s->cur_host = NULL;
+	free(s->out_proj_host);
+	s->out_proj_host = NULL;
+	free(s->vf_host);
+	s->vf_host = NULL;
+	free(s->xf_host);
+	s->xf_host				   = NULL;
+	s->small_host_dim		   = 0;
+	s->small_host_intermediate = 0;
+	s->small_host_kv_out	   = 0;
+	free(s->ple_proj_host.p);
+	free(s->inpL_host.p);
+	s->ple_proj_host.p	 = NULL;
+	s->ple_proj_host.cap = 0;
+	s->inpL_host.p		 = NULL;
+	s->inpL_host.cap	 = 0;
+	free(s->moe_all_scratch.p);
+	free(s->moe_all_outs.p);
+	free(s->moe_scratch.p);
+	free(s->moe_xb_f.p);
+	free(s->moe_shared_y.p);
+	s->moe_all_scratch.p = NULL;
+	s->moe_all_outs.p	 = NULL;
+	s->moe_scratch.p	 = NULL;
+	s->moe_xb_f.p		 = NULL;
+	s->moe_shared_y.p	 = NULL;
+
+	if (s->bs) {
+		batch_scratch_free(s->bs);
+		free(s->bs);
+		s->bs = NULL;
+	}
+	free(s->batch_logits_tmp.p);
+	s->batch_logits_tmp.cap = 0;
+}
+
+void compute_scratch_free(compute_scratch *s) {
+	scratch_free_device_buffers(s);
+	scratch_free_host_buffers(s);
+	memset(s, 0, sizeof(*s));
+}
+
+void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, int kv_out) {
+	if (s->small_host_dim >= dim && s->small_host_intermediate >= intermediate &&
+		s->small_host_kv_out >= kv_out)
+		return;
+
+	int new_dim = s->small_host_dim < dim ? dim : s->small_host_dim;
+	int new_int =
+		s->small_host_intermediate < intermediate ? intermediate : s->small_host_intermediate;
+	int new_kv				   = s->small_host_kv_out < kv_out ? kv_out : s->small_host_kv_out;
+	s->ple_inp_host			   = xrealloc(s->ple_inp_host, (size_t)new_int * sizeof(float));
+	s->cur_host				   = xrealloc(s->cur_host, (size_t)new_dim * sizeof(float));
+	s->out_proj_host		   = xrealloc(s->out_proj_host, (size_t)new_dim * sizeof(float));
+	s->vf_host				   = xrealloc(s->vf_host, (size_t)new_kv * sizeof(float));
+	s->xf_host				   = xrealloc(s->xf_host, (size_t)new_dim * sizeof(float));
+	s->small_host_dim		   = new_dim;
+	s->small_host_intermediate = new_int;
+	s->small_host_kv_out	   = new_kv;
+}
+
+static int layer_max_kv_heads(const model *m) {
+	int best = 0;
+	for (int i = 0; i < m->n_layers; i++) {
+		int v = model_layer_kv_heads(m, i);
+		if (v > best)
+			best = v;
+	}
+	return best;
+}
+
+static int layer_max_intermediate(const model *m) {
+	int best = 0;
+	for (int i = 0; i < m->n_layers; i++) {
+		int v = model_layer_intermediate(m, i);
+		if (v > best)
+			best = v;
+	}
+	return best;
+}
+
+static status_code scratch_alloc(backend *a, buffer *dst, size_t size, const char *name) {
+	status_code st = a->buffer_alloc_scratch(a, size, dst);
+	if (st != OK) {
+		ERROR(
+			"compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes, status=%d)",
+			name, size, st);
+	}
+	return st;
+}
+
+status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
+	if (!compute_model_changed(s, m, n_ctx))
+		return OK;
+
+	scratch_free_device_buffers(s);
+	scratch_free_host_buffers(s);
+
+	s->backend = m->backend;
+	backend *a = s->backend;
+
+	int max_head_dim = m->head_dim;
+	int max_kv_heads = m->n_kv_heads;
+	if (m->arch_info->has_variable_layer_dims) {
+		max_head_dim = m->layer_dims.head_dim_global > m->layer_dims.head_dim_swa
+						   ? m->layer_dims.head_dim_global
+						   : m->layer_dims.head_dim_swa;
+		max_kv_heads = layer_max_kv_heads(m);
+		if (max_kv_heads == 0)
+			max_kv_heads = m->n_kv_heads;
+	}
+
+	int attn_buf_size = m->dim;
+	if (m->arch_info->has_variable_layer_dims) {
+		int q_out_max = m->n_heads * max_head_dim;
+		if (q_out_max > attn_buf_size)
+			attn_buf_size = q_out_max;
+	}
+	if (m->arch_info->is_mla) {
+		int mla_out = m->n_heads * m->mla.v_head;
+		if (mla_out > attn_buf_size)
+			attn_buf_size = mla_out;
+	}
+
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)attn_buf_size * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_X]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)attn_buf_size * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_XB]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)attn_buf_size * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_XB2]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)m->dim * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_ATTN_OUT]");
+		if (_st != OK)
+			return _st;
+	}
+
+	{
+		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q],
+										(size_t)m->n_heads * max_head_dim * sizeof(float),
+										"&s->slots[RECIPE_SLOT_Q]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K],
+										(size_t)max_kv_heads * max_head_dim * sizeof(float),
+										"&s->slots[RECIPE_SLOT_K]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V],
+										(size_t)max_kv_heads * max_head_dim * sizeof(float),
+										"&s->slots[RECIPE_SLOT_V]");
+		if (_st != OK)
+			return _st;
+	}
+
+	int max_intermediate = m->intermediate;
+	if (m->arch_info->has_variable_layer_dims) {
+		int layer_max = layer_max_intermediate(m);
+		if (layer_max > max_intermediate)
+			max_intermediate = layer_max;
+	}
+	{
+		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
+										(size_t)max_intermediate * 2 * sizeof(float),
+										"&s->slots[RECIPE_SLOT_FFN_GATE_UP]");
+		if (_st != OK)
+			return _st;
+	}
+	s->slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], 0,
+												  (size_t)max_intermediate * sizeof(float));
+	s->slots[RECIPE_SLOT_FFN_UP] =
+		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)max_intermediate * sizeof(float),
+					 (size_t)max_intermediate * sizeof(float));
+	int ffn_act_size = max_intermediate;
+	if (m->dim > ffn_act_size)
+		ffn_act_size = m->dim;
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)ffn_act_size * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_FFN_ACT]");
+		if (_st != OK)
+			return _st;
+	}
+	{
+		status_code _st =
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
+						  "&s->slots[RECIPE_SLOT_LOGITS]");
+		if (_st != OK)
+			return _st;
+	}
+
+	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
+
+	compute_scratch_set_router_bufs(s);
+
+	if (m->arch_info->has_variable_layer_dims) {
+		const int half_swa = m->layer_dims.head_dim_swa / 2;
+		s->rope_cos_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
+		s->rope_sin_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
+		build_rope_table(s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
+						 m->layer_dims.rope_theta_swa);
+
+		const int half_global = m->layer_dims.head_dim_global / 2;
+		s->rope_cos			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
+		s->rope_sin			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
+		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
+						 m->layer_dims.rope_theta_global);
+
+		if (m->has_per_layer_embeddings) {
+			s->ple_buf =
+				xmalloc((size_t)m->layer_dims.n_embd_per_layer * m->n_layers * sizeof(float));
+			{
+				status_code _st = scratch_alloc(a, &s->ple_proj,
+												(size_t)m->layer_dims.n_embd_per_layer *
+													m->n_layers * sizeof(float),
+												"&s->ple_proj");
+				if (_st != OK)
+					return _st;
+			}
+			{
+				status_code _st = scratch_alloc(
+					a, &s->ple_inp, (size_t)m->layer_dims.n_embd_per_layer * sizeof(float),
+					"&s->ple_inp");
+				if (_st != OK)
+					return _st;
+			}
+			{
+				status_code _st = scratch_alloc(
+					a, &s->ple_slice, (size_t)m->layer_dims.n_embd_per_layer * sizeof(float),
+					"&s->ple_slice");
+				if (_st != OK)
+					return _st;
+			}
+		}
+	} else {
+		const int rope_head_dim = m->arch_info->is_mla ? m->mla.qk_rope : m->head_dim;
+		const int half			= rope_head_dim / 2;
+		s->rope_cos				= xmalloc((size_t)n_ctx * half * sizeof(float));
+		s->rope_sin				= xmalloc((size_t)n_ctx * half * sizeof(float));
+		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+	}
+
+	s->allocated_n_ctx = n_ctx;
+	s->last_model	   = m;
+	s->last_n_ctx	   = n_ctx;
+
+	return OK;
+}
+status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int token, int pos,
+							int flash_attn, float *logits_out) {
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	return compute_forward_recipe(m, cache, s, token, pos, flash_attn, logits_out);
+}
+
+status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
+								  const int32_t *tokens, int n_tokens, int pos_start,
+								  int flash_attn, float *logits_out) {
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	return compute_forward_batch_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn,
+										logits_out);
+}
+
+void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud) {
+	s->layer_cb	   = cb;
+	s->layer_cb_ud = ud;
+}

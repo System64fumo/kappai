@@ -1,0 +1,124 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+layout(local_size_x_id = 3) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf    { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf    { uint kcache[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf    { uint vcache[]; };
+layout(set = 0, binding = 3) writeonly buffer OutBuf { float out_[]; };
+
+layout(push_constant) uniform Params {
+    uint layer_off;
+    int pos;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int n_ctx;
+    float scale;
+    int stride_head_dim;
+    int attn_start;
+} params;
+
+layout(constant_id = 0) const int HEAD_DIM = 64;
+layout(constant_id = 1) const int N_HEADS_PER_WG = 4;
+layout(constant_id = 2) const int LANES_PER_HEAD = 16;
+layout(constant_id = 3) const int LOCAL_SIZE_X = 64;
+
+const int MAX_DPL = 16;
+const int TILE_T = 16;
+const int MAX_HEAD_DIM = 256;
+
+#include "common.glsl"
+
+shared float k_tile[TILE_T * HEAD_DIM];
+shared float v_tile[TILE_T * HEAD_DIM];
+shared float red_tile[N_HEADS_PER_WG * LANES_PER_HEAD];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    int hg      = int(tid) / LANES_PER_HEAD;
+    int lane    = int(tid) % LANES_PER_HEAD;
+    int n_groups = params.n_heads / params.n_kv_heads;
+    int kvh = int(gl_WorkGroupID.x);
+    int head_base = kvh * n_groups;
+
+    int my_head = head_base + hg;
+    bool valid = (my_head < params.n_heads) && (hg < N_HEADS_PER_WG);
+    int pos = params.pos;
+    int attn_start = params.attn_start;
+    float scale = params.scale;
+
+    int dpl = HEAD_DIM / LANES_PER_HEAD;
+    uint q_base = uint(my_head) * uint(HEAD_DIM);
+    float qv[MAX_DPL];
+    if (valid) {
+        for (int i = 0; i < dpl; i++) qv[i] = q[q_base + uint(lane) * uint(dpl) + uint(i)];
+    } else {
+        for (int i = 0; i < dpl; i++) qv[i] = 0.0;
+    }
+
+    uint kvh_stride = uint(params.n_ctx) * uint(params.stride_head_dim);
+    uint kv_base    = params.layer_off + uint(kvh) * kvh_stride;
+
+    precise float M = uintBitsToFloat(0xFF800000u);
+    precise float S = 0.0;
+    precise float vkq[MAX_DPL];
+    for (int i = 0; i < dpl; i++) vkq[i] = 0.0;
+
+    int red_base = hg * LANES_PER_HEAD;
+
+    for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
+        int tile_t1 = min(tile_t0 + TILE_T, pos + 1);
+        int tile_len = tile_t1 - tile_t0;
+
+        int total_words = tile_len * (HEAD_DIM / 2);
+        for (int idx = int(tid); idx < total_words; idx += LOCAL_SIZE_X) {
+            int t   = idx / (HEAD_DIM / 2);
+            int dw  = idx % (HEAD_DIM / 2);
+            uint kv_off = kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
+            uint word = kcache[kv_off >> 1u];
+            k_tile[t * HEAD_DIM + dw * 2]     = half_to_float(word & 0xFFFFu);
+            k_tile[t * HEAD_DIM + dw * 2 + 1] = half_to_float(word >> 16u);
+
+            word = vcache[kv_off >> 1u];
+            v_tile[t * HEAD_DIM + dw * 2]     = half_to_float(word & 0xFFFFu);
+            v_tile[t * HEAD_DIM + dw * 2 + 1] = half_to_float(word >> 16u);
+        }
+        barrier();
+
+        for (int t = 0; t < tile_len; t++) {
+            int kd = t * HEAD_DIM + lane * dpl;
+            precise float partial = 0.0;
+            for (int i = 0; i < dpl; i++) partial += qv[i] * k_tile[kd + i];
+
+            red_tile[red_base + lane] = partial;
+            barrier();
+            for (int stride = LANES_PER_HEAD / 2; stride > 0; stride >>= 1) {
+                if (lane < stride) {
+                    red_tile[red_base + lane] += red_tile[red_base + lane + stride];
+                }
+                barrier();
+            }
+            precise float score = red_tile[red_base] * scale;
+            barrier();
+
+            precise float m_new = max(M, score);
+            precise float ms = exp(M - m_new);
+            precise float vs = exp(score - m_new);
+
+            for (int i = 0; i < dpl; i++) vkq[i] = vkq[i] * ms + v_tile[kd + i] * vs;
+
+            S = S * ms + vs;
+            M = m_new;
+        }
+        barrier();
+    }
+
+    if (valid) {
+        precise float inv_S = S > 0.0 ? 1.0 / S : 0.0;
+        uint d0 = q_base + uint(lane) * uint(dpl);
+        for (int i = 0; i < dpl; i++) out_[d0 + uint(i)] = vkq[i] * inv_S;
+    }
+}

@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf { float logits[]; };
+layout(set = 0, binding = 1) buffer OutBuf { uint best_idx[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+} params;
+
+shared float s_val[64];
+shared uint  s_idx[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint n   = uint(params.n);
+
+    float my_val = uintBitsToFloat(0xFF800000u);
+    uint  my_idx = 0u;
+
+    for (uint i = tid; i < n; i += 64u) {
+        float v = logits[i];
+        if (v > my_val) {
+            my_val = v;
+            my_idx = i;
+        }
+    }
+
+    s_val[tid] = my_val;
+    s_idx[tid] = my_idx;
+    barrier();
+
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) {
+            float ov = s_val[tid + s];
+            float mv = s_val[tid];
+            if (ov > mv) {
+                s_val[tid] = ov;
+                s_idx[tid] = s_idx[tid + s];
+            }
+        }
+        barrier();
+    }
+
+    if (tid == 0u) {
+        best_idx[0] = s_idx[0];
+    }
+}

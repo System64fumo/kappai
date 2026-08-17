@@ -1,0 +1,60 @@
+#version 450
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer WBuf { float w[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly buffer RBuf { float residual[]; };
+layout(set = 0, binding = 3) writeonly buffer YBuf { float y[]; };
+#else
+layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    int n;
+    int k;
+} params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K = 2048;
+
+shared float x_shared[TILE_K];
+
+void main() {
+    uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+    uint tid = gl_LocalInvocationID.x;
+    int  k   = params.k;
+
+    float acc[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++) acc[r] = 0.0;
+    bool valid[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++)
+        valid[r] = (int(base_i) + r < params.n);
+
+    for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+        int tile_end = min(tile_start + TILE_K, k);
+        int tile_len = tile_end - tile_start;
+
+        for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+            x_shared[j] = x[tile_start + j];
+        barrier();
+
+        for (int r = 0; r < ROWS_PER_THREAD; r++) {
+            if (!valid[r]) continue;
+            uint row_idx = base_i + uint(r);
+            uint row_off = row_idx * uint(k);
+            for (int j = 0; j < tile_len; j++)
+                acc[r] += w[row_off + uint(tile_start + j)] * x_shared[j];
+        }
+        barrier();
+    }
+
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+        if (!valid[r]) continue;
+#ifdef HAS_RESIDUAL
+        y[base_i + uint(r)] = acc[r] + residual[base_i + uint(r)];
+#else
+        y[base_i + uint(r)] = acc[r];
+#endif
+    }
+}

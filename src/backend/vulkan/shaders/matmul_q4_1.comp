@@ -1,0 +1,129 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf { uint w0[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly buffer RBuf { float residual[]; };
+layout(set = 0, binding = 3) writeonly buffer YBuf { float y[]; };
+#else
+layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    int n;
+    int k;
+} params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+shared int xq_shared[TILE_K];
+shared float xq_d[TILE_K / 32];
+shared float xq_s[TILE_K / 32];
+
+void main() {
+    uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+    uint tid = gl_LocalInvocationID.x;
+    int  k   = params.k;
+    int  blocks_per_row = k / 32;
+
+    precise float acc[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++) acc[r] = 0.0;
+    bool valid[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++)
+        valid[r] = (int(base_i) + r < params.n);
+
+    for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+        int tile_end = min(tile_start + TILE_K, k);
+        int tile_len = tile_end - tile_start;
+
+        for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+            x_shared[j] = x[tile_start + j];
+        barrier();
+
+        int block_start = tile_start / 32;
+        int block_end   = tile_end / 32;
+
+        for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+            int x_base = bi * 32 - tile_start;
+            float amax = 0.0;
+            for (int j = 0; j < 32; j++) {
+                float ax = abs(x_shared[x_base + j]);
+                if (ax > amax) amax = ax;
+            }
+            float d = amax / 127.0;
+            float id = d > 0.0 ? 1.0 / d : 0.0;
+            xq_d[bi - block_start] = f32_to_f16_to_f32(d);
+            int sum = 0;
+            for (int j = 0; j < 32; j++) {
+                int q = round_away(x_shared[x_base + j] * id);
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                xq_shared[x_base + j] = q;
+                sum += q;
+            }
+            xq_s[bi - block_start] = f32_to_f16_to_f32(d * float(sum));
+        }
+        barrier();
+
+        for (int bi = block_start; bi < block_end; bi++) {
+            int x_base = bi * 32 - tile_start;
+            float d_xq = xq_d[bi - block_start];
+            float s_xq = xq_s[bi - block_start];
+
+            for (int r = 0; r < ROWS_PER_THREAD; r++) {
+                if (!valid[r]) continue;
+                uint row_idx = base_i + uint(r);
+                uint block_off = row_idx * uint(blocks_per_row) * Q4_1_BLOCK_BYTES + uint(bi) * Q4_1_BLOCK_BYTES;
+                float d = half_to_float(w0_read_u16(block_off)) * d_xq;
+                float m = half_to_float(w0_read_u16(block_off + 2u)) * s_xq;
+                uint qs_off = block_off + 4u;
+                int sumi0 = 0, sumi1 = 0;
+                for (int w4 = 0; w4 < 4; w4++) {
+                    uint word = w0_read_u32(qs_off + uint(w4 * 4));
+                    int lo_nibbles = int(word & 0x0F0F0F0Fu);
+                    int hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
+
+                    int j = w4 * 4;
+                    int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + j]),
+                                                  int8_t(xq_shared[x_base + j + 1]),
+                                                  int8_t(xq_shared[x_base + j + 2]),
+                                                  int8_t(xq_shared[x_base + j + 3])));
+                    int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + j + 16]),
+                                                  int8_t(xq_shared[x_base + j + 17]),
+                                                  int8_t(xq_shared[x_base + j + 18]),
+                                                  int8_t(xq_shared[x_base + j + 19])));
+
+                    sumi0 += dotPacked4x8EXT(lo_nibbles, xq_word0);
+                    sumi1 += dotPacked4x8EXT(hi_nibbles, xq_word1);
+                }
+                acc[r] += d * float(sumi0 + sumi1) + m;
+            }
+        }
+        barrier();
+    }
+
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+        if (!valid[r]) continue;
+#ifdef HAS_RESIDUAL
+        y[base_i + uint(r)] = acc[r] + residual[base_i + uint(r)];
+#else
+        y[base_i + uint(r)] = acc[r];
+#endif
+    }
+}

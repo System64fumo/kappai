@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer GateBuf { float gate[]; };
+layout(set = 0, binding = 1) readonly buffer UpBuf { float up[]; };
+layout(set = 0, binding = 2) writeonly buffer OutBuf { float out_[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    int activation;
+} params;
+
+float gelu_tanh(float x) {
+    const float c = 0.7978845608028654;
+    float x3 = x * x * x;
+    float inner = c * (x + 0.044715 * x3);
+    return 0.5 * x * (1.0 + tanh(inner));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (int(i) >= params.n) return;
+    float g = gate[i];
+    float u = up[i];
+    if (params.activation == 1) {
+        out_[i] = gelu_tanh(g) * u;
+    } else {
+        out_[i] = g / (1.0 + exp(-g)) * u;
+    }
+}

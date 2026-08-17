@@ -1,0 +1,244 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer EmbdBuf { uint embd[]; };
+layout(set = 0, binding = 1) writeonly buffer OutBuf  { float out_[]; };
+
+layout(push_constant) uniform Params {
+    int token;
+    int dim;
+    int type;
+    int row_stride;
+} params;
+
+#include "common.glsl"
+#include "iq4nl_table.glsl"
+
+#define IQ3S_GRID_BINDING 2
+#include "iq3s_grid.glsl"
+
+uint embd_read_u8(uint byte_offset) {
+    uint word = embd[byte_offset >> 2];
+    uint shift = (byte_offset & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+uint embd_read_u16(uint byte_offset) {
+    return embd_read_u8(byte_offset) | (embd_read_u8(byte_offset + 1u) << 8u);
+}
+
+void get_scale_min_k4(uint s_off, int j, out uint d_out, out uint m_out) {
+    if (j < 4) {
+        d_out = embd_read_u8(s_off + uint(j)) & 63u;
+        m_out = embd_read_u8(s_off + uint(j + 4)) & 63u;
+    } else {
+        uint qj4 = embd_read_u8(s_off + uint(j + 4));
+        uint qjm4 = embd_read_u8(s_off + uint(j - 4));
+        uint qj0 = embd_read_u8(s_off + uint(j));
+        d_out = (qj4 & 0xFu) | ((qjm4 >> 6u) << 4u);
+        m_out = (qj4 >> 4u)  | ((qj0  >> 6u) << 4u);
+    }
+}
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (int(d) >= params.dim) return;
+
+    uint row_off = uint(params.token) * uint(params.row_stride);
+    float val = 0.0;
+
+    switch (params.type) {
+    case 0:
+        val = uintBitsToFloat(embd[(row_off + d * 4u) >> 2u]);
+        break;
+    case 1:
+        val = half_to_float(embd_read_u16(row_off + d * 2u));
+        break;
+    case 2: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * Q4_0_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        uint byte = embd_read_u8(block_off + 2u + uint(in_block % 16));
+        int q = (in_block < 16) ? int(byte & 0xFu) - 8 : int(byte >> 4u) - 8;
+        val = float(q) * df;
+        break;
+    }
+    case 3: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * Q4_1_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        float mf = half_to_float(embd_read_u16(block_off + 2u));
+        uint byte = embd_read_u8(block_off + 4u + uint(in_block % 16));
+        int q = (in_block < 16) ? int(byte & 0xFu) : int(byte >> 4u);
+        val = float(q) * df + mf;
+        break;
+    }
+    case 6: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * Q5_0_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        uint qh_word = embd_read_u16(block_off + 2u) | (embd_read_u16(block_off + 4u) << 16u);
+        uint byte = embd_read_u8(block_off + 6u + uint(in_block % 16));
+        int q4 = (in_block < 16) ? int(byte & 0xFu) : int(byte >> 4u);
+        int qh = int((qh_word >> uint(in_block)) & 1u);
+        val = float((q4 | (qh << 4)) - 16) * df;
+        break;
+    }
+    case 7: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * Q5_1_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        float mf = half_to_float(embd_read_u16(block_off + 2u));
+        uint qh_word = embd_read_u16(block_off + 4u) | (embd_read_u16(block_off + 6u) << 16u);
+        uint byte = embd_read_u8(block_off + 8u + uint(in_block % 16));
+        int q4 = (in_block < 16) ? int(byte & 0xFu) : int(byte >> 4u);
+        int qh = int((qh_word >> uint(in_block)) & 1u);
+        val = float(q4 | (qh << 4)) * df + mf;
+        break;
+    }
+    case 8: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * Q8_0_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        uint byte = embd_read_u8(block_off + 2u + uint(in_block));
+        int q = byte >= 128u ? int(byte) - 256 : int(byte);
+        val = float(q) * df;
+        break;
+    }
+    case 12: {
+        int block_idx = int(d) / 256;
+        int in_block  = int(d) % 256;
+        uint block_off = row_off + uint(block_idx) * Q4_K_BLOCK_BYTES;
+        float d_big   = half_to_float(embd_read_u16(block_off));
+        float dmin    = half_to_float(embd_read_u16(block_off + 2u));
+        int group     = in_block / 64;
+        int in_group  = in_block % 64;
+        int is_hi     = in_group / 32;
+        int pos       = in_group % 32;
+        uint s_off = block_off + 4u;
+        uint sc_u, m_u;
+        get_scale_min_k4(s_off, group * 2 + is_hi, sc_u, m_u);
+        float sc = float(sc_u);
+        float m  = float(m_u);
+        uint q_byte = embd_read_u8(block_off + 16u + uint(group * 32 + pos));
+        int q = is_hi == 0 ? int(q_byte & 0xFu) : int(q_byte >> 4u);
+        val = d_big * sc * float(q) - dmin * m;
+        break;
+    }
+    case 13: {
+        int block_idx = int(d) / 256;
+        int in_block  = int(d) % 256;
+        uint block_off = row_off + uint(block_idx) * Q5_K_BLOCK_BYTES;
+        float d_big   = half_to_float(embd_read_u16(block_off));
+        float dmin    = half_to_float(embd_read_u16(block_off + 2u));
+        int group     = in_block / 64;
+        int in_group  = in_block % 64;
+        int is_hi     = in_group / 32;
+        int pos       = in_group % 32;
+        uint s_off = block_off + 4u;
+        uint sc_u, m_u;
+        get_scale_min_k4(s_off, group * 2 + is_hi, sc_u, m_u);
+        float sc = float(sc_u);
+        float m  = float(m_u);
+        uint q_byte = embd_read_u8(block_off + 48u + uint(group * 32 + pos));
+        int q4 = is_hi == 0 ? int(q_byte & 0xFu) : int(q_byte >> 4u);
+        uint qh_byte = embd_read_u8(block_off + 16u + uint(pos));
+        uint u_mask = is_hi == 0 ? (1u << uint(group * 2)) : (2u << uint(group * 2));
+        int qh = (qh_byte & u_mask) != 0u ? 1 : 0;
+        val = d_big * sc * float(q4 | (qh << 4)) - dmin * m;
+        break;
+    }
+    case 14: {
+        int block_idx = int(d) / 256;
+        int in_block  = int(d) % 256;
+        uint block_off = row_off + uint(block_idx) * Q6_K_BLOCK_BYTES;
+        float d_big = half_to_float(embd_read_u16(block_off + 208u));
+
+        int n_iter = in_block / 128;
+        int l = in_block % 128;
+        int is_idx = l / 16;
+        uint ql_byte = embd_read_u8(block_off + uint(n_iter * 64 + l % 64));
+        uint qh_byte = embd_read_u8(block_off + 128u + uint(n_iter * 32 + l % 32));
+        int q;
+        if (l < 32) {
+            q = int((ql_byte & 0xFu) | (((qh_byte >> 0u) & 3u) << 4u)) - 32;
+        } else if (l < 64) {
+            q = int((ql_byte & 0xFu) | (((qh_byte >> 2u) & 3u) << 4u)) - 32;
+        } else if (l < 96) {
+            q = int((ql_byte >> 4u) | (((qh_byte >> 4u) & 3u) << 4u)) - 32;
+        } else {
+            q = int((ql_byte >> 4u) | (((qh_byte >> 6u) & 3u) << 4u)) - 32;
+        }
+        uint sc_u = embd_read_u8(block_off + 192u + uint(n_iter * 8 + is_idx));
+        int sc_signed = sc_u >= 128u ? int(sc_u) - 256 : int(sc_u);
+        val = d_big * float(sc_signed) * float(q);
+        break;
+    }
+    case 20: {
+        int block_idx = int(d) / 32;
+        int in_block  = int(d) % 32;
+        uint block_off = row_off + uint(block_idx) * IQ4_NL_BLOCK_BYTES;
+        float df = half_to_float(embd_read_u16(block_off));
+        uint byte = embd_read_u8(block_off + 2u + uint(in_block % 16));
+        int q = (in_block < 16) ? IQ4NL_VALUES[byte & 0xFu] : IQ4NL_VALUES[byte >> 4u];
+        val = float(q) * df;
+        break;
+    }
+    case 21: {
+        int block_idx = int(d) / 256;
+        int in_block  = int(d) % 256;
+
+        int ib32_step = in_block / 64;
+        int step      = ib32_step;
+        int rem64     = in_block % 64;
+        int is_group2 = rem64 / 32;
+        int rem32     = rem64 % 32;
+        int l         = rem32 / 8;
+        int pos8      = rem32 % 8;
+
+        uint block_off  = row_off + uint(block_idx) * 110u;
+        uint qs_off     = block_off + 2u;
+        uint qh_off     = block_off + 66u;
+        uint signs_off  = block_off + 74u;
+        uint scales_off = block_off + 106u;
+
+        float d_w = half_to_float(embd_read_u16(block_off));
+
+        uint scale_byte = embd_read_u8(scales_off + uint(step));
+        int sc = (is_group2 == 1) ? (1 + 2 * int(scale_byte >> 4u)) : (1 + 2 * int(scale_byte & 0xFu));
+
+        uint qh = embd_read_u8(qh_off + uint(step) * 2u + uint(is_group2));
+
+        uint qs_base = qs_off + uint(step) * 16u + uint(is_group2) * 8u + uint(2 * l);
+        uint q2l  = embd_read_u8(qs_base);
+        uint q2l1 = embd_read_u8(qs_base + 1u);
+        uint gidx1 = q2l  | ((qh << uint(8 - 2 * l)) & 256u);
+        uint gidx2 = q2l1 | ((qh << uint(7 - 2 * l)) & 256u);
+
+        uint signs_base = signs_off + uint(step) * 8u + uint(is_group2) * 4u + uint(l);
+        uint sign_byte = embd_read_u8(signs_base);
+
+        int g;
+        if (pos8 < 4) {
+            g = iq3s_grid_byte(gidx1, pos8);
+        } else {
+            g = iq3s_grid_byte(gidx2, pos8 - 4);
+        }
+        bool neg = (sign_byte & (1u << uint(pos8))) != 0u;
+        float sval = neg ? -float(sc) : float(sc);
+        val = d_w * sval * float(g);
+        break;
+    }
+    default:
+        val = 0.0;
+        break;
+    }
+
+    out_[d] = val;
+}

@@ -1,0 +1,149 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer QBuf    { float q[]; };
+layout(set = 0, binding = 1) readonly buffer KBuf    { uint kcache[]; };
+layout(set = 0, binding = 2) readonly buffer VBuf    { uint vcache[]; };
+layout(set = 0, binding = 3) buffer       ScoresBuf  { float scores[]; };
+layout(set = 0, binding = 4) writeonly buffer OutBuf  { float out_[]; };
+
+layout(push_constant) uniform Params {
+    uint layer_off;
+    int pos;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int n_ctx;
+    float scale;
+    int stride_head_dim;
+    int attn_start;
+} params;
+
+#include "common.glsl"
+
+shared float red[64];
+shared float q_shared[512];
+
+const int TILE_T = 8;
+shared float kv_tile[TILE_T * 512];
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    int n_groups = params.n_heads / params.n_kv_heads;
+    int kvh      = int(h) / n_groups;
+    int head_dim = params.head_dim;
+    int pos      = params.pos;
+    int n_ctx    = params.n_ctx;
+
+    uint q_base = h * uint(head_dim);
+    for (int d = int(tid); d < head_dim; d += 64) {
+        q_shared[d] = q[q_base + uint(d)];
+    }
+    barrier();
+
+    uint kvh_stride = uint(n_ctx) * uint(params.stride_head_dim);
+    uint kv_base    = params.layer_off + uint(kvh) * kvh_stride;
+
+    uint sc_base = h * uint(n_ctx);
+    int attn_start = params.attn_start;
+
+    for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
+        int tile_t1 = min(tile_t0 + TILE_T, pos + 1);
+        int tile_len = tile_t1 - tile_t0;
+
+        int total_words = tile_len * (head_dim / 2);
+        for (int idx = int(tid); idx < total_words; idx += 64) {
+            int t  = idx / (head_dim / 2);
+            int dw = idx % (head_dim / 2);
+            uint elem_idx = kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
+            uint word = kcache[elem_idx >> 1u];
+            kv_tile[t * head_dim + dw * 2]     = half_to_float(word & 0xFFFFu);
+            kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+        }
+        barrier();
+
+        for (int t = int(tid); t < tile_len; t += 64) {
+            float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+            int d = 0;
+            int hd_main = head_dim - (head_dim % 8);
+            for (; d < hd_main; d += 8) {
+                a0 += q_shared[d]   * kv_tile[t * head_dim + d]   + q_shared[d+4] * kv_tile[t * head_dim + d+4];
+                a1 += q_shared[d+1] * kv_tile[t * head_dim + d+1] + q_shared[d+5] * kv_tile[t * head_dim + d+5];
+                a2 += q_shared[d+2] * kv_tile[t * head_dim + d+2] + q_shared[d+6] * kv_tile[t * head_dim + d+6];
+                a3 += q_shared[d+3] * kv_tile[t * head_dim + d+3] + q_shared[d+7] * kv_tile[t * head_dim + d+7];
+            }
+            for (; d < head_dim; d++) a0 += q_shared[d] * kv_tile[t * head_dim + d];
+            float dot = (a0 + a1) + (a2 + a3);
+            scores[sc_base + uint(tile_t0 + t)] = dot * params.scale;
+        }
+        barrier();
+    }
+
+
+    memoryBarrierBuffer();
+    barrier();
+
+    float local_max = uintBitsToFloat(0xFF800000u);
+    for (int t = attn_start + int(tid); t <= pos; t += 64) {
+        local_max = max(local_max, scores[sc_base + uint(t)]);
+    }
+    red[tid] = local_max;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] = max(red[tid], red[tid + stride]);
+        barrier();
+    }
+    float mx = red[0];
+    barrier();
+
+    float local_sum = 0.0;
+    for (int t = attn_start + int(tid); t <= pos; t += 64) {
+        float e = exp(scores[sc_base + uint(t)] - mx);
+        scores[sc_base + uint(t)] = e;
+        local_sum += e;
+    }
+    red[tid] = local_sum;
+    barrier();
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        barrier();
+    }
+    float inv_sum = red[0] > 0.0 ? 1.0 / red[0] : 0.0;
+    barrier();
+
+    for (int d = int(tid); d < head_dim; d += 64) {
+        out_[h * uint(head_dim) + uint(d)] = 0.0;
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
+        int tile_t1 = min(tile_t0 + TILE_T, pos + 1);
+        int tile_len = tile_t1 - tile_t0;
+
+        int total_words = tile_len * (head_dim / 2);
+        for (int idx = int(tid); idx < total_words; idx += 64) {
+            int t  = idx / (head_dim / 2);
+            int dw = idx % (head_dim / 2);
+            uint elem_idx = kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
+            uint word = vcache[elem_idx >> 1u];
+            kv_tile[t * head_dim + dw * 2]     = half_to_float(word & 0xFFFFu);
+            kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+        }
+        barrier();
+
+        for (int d = int(tid); d < head_dim; d += 64) {
+            precise float acc = 0.0;
+            for (int t = 0; t < tile_len; t++) {
+                precise float sv = scores[sc_base + uint(tile_t0 + t)] * inv_sum;
+                acc += sv * kv_tile[t * head_dim + d];
+            }
+            out_[h * uint(head_dim) + uint(d)] += acc;
+        }
+        barrier();
+    }
+}

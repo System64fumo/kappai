@@ -1,0 +1,394 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 { uint b0[]; };
+layout(set = 0, binding = 1) readonly buffer B1 { float b1f[]; };
+layout(set = 0, binding = 2) readonly buffer B2 { float b2f[]; };
+layout(set = 0, binding = 3) writeonly buffer B3 { float b3f[]; };
+layout(set = 0, binding = 4) writeonly buffer B4 { float b4f[]; };
+layout(set = 0, binding = 5) readonly buffer B5 { uint b5[]; };
+layout(set = 0, binding = 6) writeonly buffer B6 { float b6f[]; };
+
+layout(push_constant) uniform Params {
+    int mode;
+    int n;
+    int n1;
+    int k;
+    int activation;
+    int has_residual;
+    int n2;
+} params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#include "common.glsl"
+#include "iq4nl_table.glsl"
+
+#define MODE_SINGLE   0
+#define MODE_MULTI    1
+#define MODE_FFN_DOWN 2
+#define MODE_QKV      3
+
+uint w0_read_u16(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = b0[word_idx];
+    if (shift + 8u <= 32u) return (lo >> shift) & 0xFFFFu;
+    uint hi = b0[word_idx + 1u];
+    return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
+}
+
+uint w0_read_u32(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = b0[word_idx];
+    if (shift == 0u) return lo;
+    uint hi = b0[word_idx + 1u];
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+uint w1_read_u16(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = floatBitsToUint(b1f[word_idx]);
+    if (shift + 8u <= 32u) return (lo >> shift) & 0xFFFFu;
+    uint hi = floatBitsToUint(b1f[word_idx + 1u]);
+    return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
+}
+
+uint w1_read_u32(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = floatBitsToUint(b1f[word_idx]);
+    if (shift == 0u) return lo;
+    uint hi = floatBitsToUint(b1f[word_idx + 1u]);
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+uint w2_read_u16(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = b5[word_idx];
+    if (shift + 8u <= 32u) return (lo >> shift) & 0xFFFFu;
+    uint hi = b5[word_idx + 1u];
+    return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
+}
+
+uint w2_read_u32(uint byte_offset) {
+    uint word_idx = byte_offset >> 2u;
+    uint shift = (byte_offset & 3u) * 8u;
+    uint lo = b5[word_idx];
+    if (shift == 0u) return lo;
+    uint hi = b5[word_idx + 1u];
+    return (lo >> shift) | (hi << (32u - shift));
+}
+
+float erf_precise(float x) {
+    float sign = x >= 0.0 ? 1.0 : -1.0;
+    float ax = abs(x);
+    float p = 0.3275911;
+    float t = 1.0 / (1.0 + p * ax);
+    float a1 = 0.254829592;
+    float a2 = -0.284496736;
+    float a3 = 1.421413741;
+    float a4 = -1.453152027;
+    float a5 = 1.061405429;
+    float poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (1.0 - poly * exp(-ax * ax));
+}
+
+float activate(float g, float u) {
+    if (params.activation == 1) {
+        return 0.5 * g * (1.0 + erf_precise(g * 0.7071067811865475)) * u;
+    } else {
+        return g / (1.0 + exp(-g)) * u;
+    }
+}
+
+shared int kvalue_iq4nl_lut[16];
+shared float x_shared[TILE_K];
+shared int   xq_shared[TILE_K];
+shared float xq_d[TILE_K / 32];
+
+void load_x_tile(int tile_start, int tile_len) {
+    uint tid = gl_LocalInvocationID.x;
+    for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+        float val;
+        if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+            val = b2f[uint(tile_start + j)];
+        } else if (params.mode == MODE_FFN_DOWN) {
+            float g = b1f[uint(tile_start + j)];
+            float u = b2f[uint(tile_start + j)];
+            val = activate(g, u);
+        } else {
+            val = b1f[uint(tile_start + j)];
+        }
+        x_shared[j] = val;
+    }
+}
+
+float dot_block_w0(uint block_off, int x_base, float d_xq) {
+    float d = half_to_float(w0_read_u16(block_off)) * d_xq;
+    uint qs_off = block_off + 2u;
+
+    int wq[32];
+    for (int w4 = 0; w4 < 4; w4++) {
+        uint word = w0_read_u32(qs_off + uint(w4 * 4));
+        int b0_ = int((word      ) & 0xFFu);
+        int b1_ = int((word >>  8u) & 0xFFu);
+        int b2_ = int((word >> 16u) & 0xFFu);
+        int b3_ = int((word >> 24u) & 0xFFu);
+        int j = w4 * 4;
+        wq[j    ] = kvalue_iq4nl_lut[b0_ & 0xF];
+        wq[j + 1] = kvalue_iq4nl_lut[b1_ & 0xF];
+        wq[j + 2] = kvalue_iq4nl_lut[b2_ & 0xF];
+        wq[j + 3] = kvalue_iq4nl_lut[b3_ & 0xF];
+        wq[j + 16] = kvalue_iq4nl_lut[b0_ >> 4];
+        wq[j + 17] = kvalue_iq4nl_lut[b1_ >> 4];
+        wq[j + 18] = kvalue_iq4nl_lut[b2_ >> 4];
+        wq[j + 19] = kvalue_iq4nl_lut[b3_ >> 4];
+    }
+
+    int sumi = 0;
+    for (int w4 = 0; w4 < 4; w4++) {
+        int j = w4 * 4;
+        int w_word0 = pack32(i8vec4(int8_t(wq[j    ]),
+                                     int8_t(wq[j + 1]),
+                                     int8_t(wq[j + 2]),
+                                     int8_t(wq[j + 3])));
+        int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + j]),
+                                      int8_t(xq_shared[x_base + j + 1]),
+                                      int8_t(xq_shared[x_base + j + 2]),
+                                      int8_t(xq_shared[x_base + j + 3])));
+        sumi += dotPacked4x8EXT(w_word0, xq_word0);
+
+        int w_word1 = pack32(i8vec4(int8_t(wq[j + 16]),
+                                     int8_t(wq[j + 17]),
+                                     int8_t(wq[j + 18]),
+                                     int8_t(wq[j + 19])));
+        int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + j + 16]),
+                                      int8_t(xq_shared[x_base + j + 17]),
+                                      int8_t(xq_shared[x_base + j + 18]),
+                                      int8_t(xq_shared[x_base + j + 19])));
+        sumi += dotPacked4x8EXT(w_word1, xq_word1);
+    }
+    return d * float(sumi);
+}
+
+float dot_block_w1(uint block_off, int x_base, float d_xq) {
+    float d = half_to_float(w1_read_u16(block_off)) * d_xq;
+    uint qs_off = block_off + 2u;
+
+    int wq[32];
+    for (int w4 = 0; w4 < 4; w4++) {
+        uint word = w1_read_u32(qs_off + uint(w4 * 4));
+        int b0_ = int((word      ) & 0xFFu);
+        int b1_ = int((word >>  8u) & 0xFFu);
+        int b2_ = int((word >> 16u) & 0xFFu);
+        int b3_ = int((word >> 24u) & 0xFFu);
+        int j = w4 * 4;
+        wq[j    ] = kvalue_iq4nl_lut[b0_ & 0xF];
+        wq[j + 1] = kvalue_iq4nl_lut[b1_ & 0xF];
+        wq[j + 2] = kvalue_iq4nl_lut[b2_ & 0xF];
+        wq[j + 3] = kvalue_iq4nl_lut[b3_ & 0xF];
+        wq[j + 16] = kvalue_iq4nl_lut[b0_ >> 4];
+        wq[j + 17] = kvalue_iq4nl_lut[b1_ >> 4];
+        wq[j + 18] = kvalue_iq4nl_lut[b2_ >> 4];
+        wq[j + 19] = kvalue_iq4nl_lut[b3_ >> 4];
+    }
+
+    int sumi = 0;
+    for (int w4 = 0; w4 < 4; w4++) {
+        int j = w4 * 4;
+        int w_word0 = pack32(i8vec4(int8_t(wq[j    ]),
+                                     int8_t(wq[j + 1]),
+                                     int8_t(wq[j + 2]),
+                                     int8_t(wq[j + 3])));
+        int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + j]),
+                                      int8_t(xq_shared[x_base + j + 1]),
+                                      int8_t(xq_shared[x_base + j + 2]),
+                                      int8_t(xq_shared[x_base + j + 3])));
+        sumi += dotPacked4x8EXT(w_word0, xq_word0);
+
+        int w_word1 = pack32(i8vec4(int8_t(wq[j + 16]),
+                                     int8_t(wq[j + 17]),
+                                     int8_t(wq[j + 18]),
+                                     int8_t(wq[j + 19])));
+        int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + j + 16]),
+                                      int8_t(xq_shared[x_base + j + 17]),
+                                      int8_t(xq_shared[x_base + j + 18]),
+                                      int8_t(xq_shared[x_base + j + 19])));
+        sumi += dotPacked4x8EXT(w_word1, xq_word1);
+    }
+    return d * float(sumi);
+}
+
+float dot_block_w2(uint block_off, int x_base, float d_xq) {
+    float d = half_to_float(w2_read_u16(block_off)) * d_xq;
+    uint qs_off = block_off + 2u;
+
+    int wq[32];
+    for (int w4 = 0; w4 < 4; w4++) {
+        uint word = w2_read_u32(qs_off + uint(w4 * 4));
+        int b0_ = int((word      ) & 0xFFu);
+        int b1_ = int((word >>  8u) & 0xFFu);
+        int b2_ = int((word >> 16u) & 0xFFu);
+        int b3_ = int((word >> 24u) & 0xFFu);
+        int j = w4 * 4;
+        wq[j    ] = kvalue_iq4nl_lut[b0_ & 0xF];
+        wq[j + 1] = kvalue_iq4nl_lut[b1_ & 0xF];
+        wq[j + 2] = kvalue_iq4nl_lut[b2_ & 0xF];
+        wq[j + 3] = kvalue_iq4nl_lut[b3_ & 0xF];
+        wq[j + 16] = kvalue_iq4nl_lut[b0_ >> 4];
+        wq[j + 17] = kvalue_iq4nl_lut[b1_ >> 4];
+        wq[j + 18] = kvalue_iq4nl_lut[b2_ >> 4];
+        wq[j + 19] = kvalue_iq4nl_lut[b3_ >> 4];
+    }
+
+    int sumi = 0;
+    for (int w4 = 0; w4 < 4; w4++) {
+        int j = w4 * 4;
+        int w_word0 = pack32(i8vec4(int8_t(wq[j    ]),
+                                     int8_t(wq[j + 1]),
+                                     int8_t(wq[j + 2]),
+                                     int8_t(wq[j + 3])));
+        int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + j]),
+                                      int8_t(xq_shared[x_base + j + 1]),
+                                      int8_t(xq_shared[x_base + j + 2]),
+                                      int8_t(xq_shared[x_base + j + 3])));
+        sumi += dotPacked4x8EXT(w_word0, xq_word0);
+
+        int w_word1 = pack32(i8vec4(int8_t(wq[j + 16]),
+                                     int8_t(wq[j + 17]),
+                                     int8_t(wq[j + 18]),
+                                     int8_t(wq[j + 19])));
+        int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + j + 16]),
+                                      int8_t(xq_shared[x_base + j + 17]),
+                                      int8_t(xq_shared[x_base + j + 18]),
+                                      int8_t(xq_shared[x_base + j + 19])));
+        sumi += dotPacked4x8EXT(w_word1, xq_word1);
+    }
+    return d * float(sumi);
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    if (tid < 16u) {
+        kvalue_iq4nl_lut[tid] = IQ4NL_VALUES[tid];
+    }
+    barrier();
+
+    uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+    int  k   = params.k;
+    int  blocks_per_row = k / 32;
+
+    int n_out_a = params.n;  
+    int n_out_b = params.n1; 
+    int n_out_c = params.n2; 
+
+    precise float acc0[ROWS_PER_THREAD];
+    precise float acc1[ROWS_PER_THREAD];
+    precise float acc2[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++) { acc0[r] = 0.0; acc1[r] = 0.0; acc2[r] = 0.0; }
+    bool valid0[ROWS_PER_THREAD];
+    bool valid1[ROWS_PER_THREAD];
+    bool valid2[ROWS_PER_THREAD];
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+        valid0[r] = (int(base_i) + r < n_out_a);
+        valid1[r] = (int(base_i) + r < n_out_b);
+        valid2[r] = (params.mode == MODE_QKV) && (int(base_i) + r < n_out_c);
+    }
+
+    for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+        int tile_end = min(tile_start + TILE_K, k);
+        int tile_len = tile_end - tile_start;
+
+        load_x_tile(tile_start, tile_len);
+        barrier();
+
+        int block_start = tile_start / 32;
+        int block_end   = tile_end / 32;
+
+        for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+            int x_base = bi * 32 - tile_start;
+            float amax = 0.0;
+            for (int j = 0; j < 32; j++) {
+                float ax = abs(x_shared[x_base + j]);
+                if (ax > amax) amax = ax;
+            }
+            float d = amax / 127.0;
+            float id = d > 0.0 ? 1.0 / d : 0.0;
+            xq_d[bi - block_start] = f32_to_f16_to_f32(d);
+            for (int j = 0; j < 32; j++) {
+                int q = round_away(x_shared[x_base + j] * id);
+                if (q > 127) q = 127;
+                if (q < -127) q = -127;
+                xq_shared[x_base + j] = q;
+            }
+        }
+        barrier();
+
+        for (int bi = block_start; bi < block_end; bi++) {
+            int x_base = bi * 32 - tile_start;
+            float d_xq = xq_d[bi - block_start];
+
+            for (int r = 0; r < ROWS_PER_THREAD; r++) {
+                if (!valid0[r]) continue;
+                uint row_idx = base_i + uint(r);
+                uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
+                               + uint(bi) * IQ4_NL_BLOCK_BYTES;
+                acc0[r] += dot_block_w0(block_off, x_base, d_xq);
+            }
+
+            if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+                for (int r = 0; r < ROWS_PER_THREAD; r++) {
+                    if (!valid1[r]) continue;
+                    uint row_idx = base_i + uint(r);
+                    uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
+                                   + uint(bi) * IQ4_NL_BLOCK_BYTES;
+                    acc1[r] += dot_block_w1(block_off, x_base, d_xq);
+                }
+            }
+
+            if (params.mode == MODE_QKV) {
+                for (int r = 0; r < ROWS_PER_THREAD; r++) {
+                    if (!valid2[r]) continue;
+                    uint row_idx = base_i + uint(r);
+                    uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
+                                   + uint(bi) * IQ4_NL_BLOCK_BYTES;
+                    acc2[r] += dot_block_w2(block_off, x_base, d_xq);
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (int r = 0; r < ROWS_PER_THREAD; r++) {
+        if (!valid0[r]) continue;
+        float result = acc0[r];
+        if (params.mode == MODE_SINGLE && params.has_residual != 0) {
+            result += b2f[base_i + uint(r)];
+        }
+        b3f[base_i + uint(r)] = result;
+    }
+
+    if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+        for (int r = 0; r < ROWS_PER_THREAD; r++) {
+            if (!valid1[r]) continue;
+            b4f[base_i + uint(r)] = acc1[r];
+        }
+    }
+
+    if (params.mode == MODE_QKV) {
+        for (int r = 0; r < ROWS_PER_THREAD; r++) {
+            if (!valid2[r]) continue;
+            b6f[base_i + uint(r)] = acc2[r];
+        }
+    }
+}

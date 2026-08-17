@@ -1,0 +1,337 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x_id = 0) in;
+
+#ifdef NMAT_DUAL
+#define NMAT 2
+#else
+#define NMAT 1
+#endif
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#if NMAT >= 2
+layout(set = 0, binding = 0) readonly buffer W0Buf { uint w0[]; };
+layout(set = 0, binding = 1) readonly buffer W1Buf { uint w1[]; };
+layout(set = 0, binding = 2) readonly buffer XBuf  { float x[];  };
+layout(set = 0, binding = 3) writeonly buffer Y0Buf { float y0[]; };
+layout(set = 0, binding = 4) writeonly buffer Y1Buf { float y1[]; };
+#else
+layout(set = 0, binding = 0) readonly buffer W0Buf { uint w0[]; };
+layout(set = 0, binding = 1) readonly buffer XBuf { float x[]; };
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly buffer RBuf { float residual[]; };
+layout(set = 0, binding = 3) writeonly buffer Y0Buf { float y0[]; };
+#else
+layout(set = 0, binding = 2) writeonly buffer Y0Buf { float y0[]; };
+#endif
+#endif
+
+layout(push_constant) uniform Params {
+    int n0;
+    int n1;
+    int k;
+} params;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+#if NMAT >= 2
+#define W_NAME w1
+#define W_PFX w1_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+#endif
+
+const int BLOCK = 256;
+const int BLOCKS_PER_TILE = TILE_K / BLOCK;
+
+shared float x_shared[TILE_K];
+shared int   xq_shared[TILE_K];
+shared float xq_d[BLOCKS_PER_TILE];
+
+int dequant_q6k_val_w0(uint ql_base, uint qh_base, int m) {
+    int l = m & 31;
+    int group = m >> 5;
+    uint qh_v = w0_read_u8(qh_base + uint(l));
+    int lo, shift;
+    if (group == 0) {
+        lo = int(w0_read_u8(ql_base + uint(l)) & 0xFu);
+        shift = 0;
+    } else if (group == 1) {
+        lo = int(w0_read_u8(ql_base + uint(l) + 32u) & 0xFu);
+        shift = 2;
+    } else if (group == 2) {
+        lo = int(w0_read_u8(ql_base + uint(l)) >> 4u);
+        shift = 4;
+    } else {
+        lo = int(w0_read_u8(ql_base + uint(l) + 32u) >> 4u);
+        shift = 6;
+    }
+    int hi = int((qh_v >> uint(shift)) & 3u) << 4;
+    return (lo | hi) - 32;
+}
+
+#if NMAT >= 2
+int dequant_q6k_val_w1(uint ql_base, uint qh_base, int m) {
+    int l = m & 31;
+    int group = m >> 5;
+    uint qh_v = w1_read_u8(qh_base + uint(l));
+    int lo, shift;
+    if (group == 0) {
+        lo = int(w1_read_u8(ql_base + uint(l)) & 0xFu);
+        shift = 0;
+    } else if (group == 1) {
+        lo = int(w1_read_u8(ql_base + uint(l) + 32u) & 0xFu);
+        shift = 2;
+    } else if (group == 2) {
+        lo = int(w1_read_u8(ql_base + uint(l)) >> 4u);
+        shift = 4;
+    } else {
+        lo = int(w1_read_u8(ql_base + uint(l) + 32u) >> 4u);
+        shift = 6;
+    }
+    int hi = int((qh_v >> uint(shift)) & 3u) << 4;
+    return (lo | hi) - 32;
+}
+#endif
+
+void main() {
+    uint i   = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+    int  k   = params.k;
+
+    int blocks_per_row = k / 256;
+    uint row_stride = uint(blocks_per_row) * Q6_K_BLOCK_BYTES;
+
+    precise float acc0 = 0.0;
+    bool valid0 = (int(i) < params.n0);
+
+#if NMAT >= 2
+    precise float acc1 = 0.0;
+    bool valid1 = (int(i) < params.n1);
+#endif
+
+    for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+        int tile_end = min(tile_start + TILE_K, k);
+        int tile_len = tile_end - tile_start;
+
+        for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+            x_shared[j] = x[tile_start + j];
+        }
+        barrier();
+
+        int block_start = tile_start / 256;
+        int block_end   = tile_end / 256;
+
+        for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+            int x_base = bi * 256 - tile_start;
+            float maxv = 0.0, amax = 0.0;
+            for (int j = 0; j < 256; j++) {
+                float ax = abs(x_shared[x_base + j]);
+                if (ax > amax) { amax = ax; maxv = x_shared[x_base + j]; }
+            }
+            int local_bi = bi - block_start;
+            if (amax == 0.0) {
+                xq_d[local_bi] = 0.0;
+                for (int j = 0; j < 256; j++) xq_shared[x_base + j] = 0;
+            } else {
+                float iscale = -127.0 / maxv;
+                for (int j = 0; j < 256; j++) {
+                    int v = nearest_int(iscale * x_shared[x_base + j]);
+                    if (v > 127) v = 127;
+                    xq_shared[x_base + j] = v;
+                }
+                xq_d[local_bi] = 1.0 / iscale;
+            }
+        }
+        barrier();
+
+        if (valid0) {
+            uint row_off = i * row_stride;
+            for (int bi = block_start; bi < block_end; bi++) {
+                uint block_off = row_off + uint(bi) * Q6_K_BLOCK_BYTES;
+                uint ql_off = block_off;
+                uint qh_off = block_off + 128u;
+                uint sc_off = block_off + 192u;
+                float d_w = half_to_float(w0_read_u16(block_off + 208u));
+
+                int local_bi = bi - block_start;
+                int x_base = bi * 256 - tile_start;
+                float d = d_w * xq_d[local_bi];
+
+                int acc0_l = 0, acc1_l = 0;
+                for (int n_iter = 0; n_iter < 2; n_iter++) {
+                    uint ql_base = ql_off + uint(n_iter) * 64u;
+                    uint qh_base = qh_off + uint(n_iter) * 32u;
+
+                    int j_base = n_iter * 8;
+                    int xq_off_base = x_base + n_iter * 128;
+                    for (int jj = 0; jj < 8; jj++) {
+                        int j = j_base + jj;
+                        int s = w0_read_i8(sc_off + uint(j));
+
+                        int a_base = jj * 16;
+                        int xq_base = xq_off_base + jj * 16;
+
+                        int av0_0 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 0);
+                        int av0_1 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 1);
+                        int av0_2 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 2);
+                        int av0_3 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 3);
+                        int w0_lo = pack32(i8vec4(int8_t(av0_0), int8_t(av0_1),
+                                                   int8_t(av0_2), int8_t(av0_3)));
+                        int xq0_lo = pack32(i8vec4(int8_t(xq_shared[xq_base + 0]),
+                                                    int8_t(xq_shared[xq_base + 1]),
+                                                    int8_t(xq_shared[xq_base + 2]),
+                                                    int8_t(xq_shared[xq_base + 3])));
+                        int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
+
+                        int av0_4 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 4);
+                        int av0_5 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 5);
+                        int av0_6 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 6);
+                        int av0_7 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 7);
+                        int w0_hi = pack32(i8vec4(int8_t(av0_4), int8_t(av0_5),
+                                                   int8_t(av0_6), int8_t(av0_7)));
+                        int xq0_hi = pack32(i8vec4(int8_t(xq_shared[xq_base + 4]),
+                                                    int8_t(xq_shared[xq_base + 5]),
+                                                    int8_t(xq_shared[xq_base + 6]),
+                                                    int8_t(xq_shared[xq_base + 7])));
+                        l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
+
+                        int av1_0 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 8);
+                        int av1_1 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 9);
+                        int av1_2 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 10);
+                        int av1_3 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 11);
+                        int w1_lo = pack32(i8vec4(int8_t(av1_0), int8_t(av1_1),
+                                                   int8_t(av1_2), int8_t(av1_3)));
+                        int xq1_lo = pack32(i8vec4(int8_t(xq_shared[xq_base + 8]),
+                                                    int8_t(xq_shared[xq_base + 9]),
+                                                    int8_t(xq_shared[xq_base + 10]),
+                                                    int8_t(xq_shared[xq_base + 11])));
+                        int l1 = dotPacked4x8EXT(w1_lo, xq1_lo);
+
+                        int av1_4 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 12);
+                        int av1_5 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 13);
+                        int av1_6 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 14);
+                        int av1_7 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 15);
+                        int w1_hi = pack32(i8vec4(int8_t(av1_4), int8_t(av1_5),
+                                                   int8_t(av1_6), int8_t(av1_7)));
+                        int xq1_hi = pack32(i8vec4(int8_t(xq_shared[xq_base + 12]),
+                                                    int8_t(xq_shared[xq_base + 13]),
+                                                    int8_t(xq_shared[xq_base + 14]),
+                                                    int8_t(xq_shared[xq_base + 15])));
+                        l1 += dotPacked4x8EXT(w1_hi, xq1_hi);
+
+                        acc0_l += s * l0;
+                        acc1_l += s * l1;
+                    }
+                }
+                acc0 += d * float(acc0_l + acc1_l);
+            }
+        }
+
+#if NMAT >= 2
+        if (valid1) {
+            uint row_off = i * row_stride;
+            for (int bi = block_start; bi < block_end; bi++) {
+                uint block_off = row_off + uint(bi) * Q6_K_BLOCK_BYTES;
+                uint ql_off = block_off;
+                uint qh_off = block_off + 128u;
+                uint sc_off = block_off + 192u;
+                float d_w = half_to_float(w1_read_u16(block_off + 208u));
+
+                int local_bi = bi - block_start;
+                int x_base = bi * 256 - tile_start;
+                float d = d_w * xq_d[local_bi];
+
+                int acc0_l = 0, acc1_l = 0;
+                for (int n_iter = 0; n_iter < 2; n_iter++) {
+                    uint ql_base = ql_off + uint(n_iter) * 64u;
+                    uint qh_base = qh_off + uint(n_iter) * 32u;
+
+                    int j_base = n_iter * 8;
+                    int xq_off_base = x_base + n_iter * 128;
+                    for (int jj = 0; jj < 8; jj++) {
+                        int j = j_base + jj;
+                        int s = w1_read_i8(sc_off + uint(j));
+
+                        int a_base = jj * 16;
+                        int xq_base = xq_off_base + jj * 16;
+
+                        int av0_0 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 0);
+                        int av0_1 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 1);
+                        int av0_2 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 2);
+                        int av0_3 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 3);
+                        int w0_lo = pack32(i8vec4(int8_t(av0_0), int8_t(av0_1),
+                                                   int8_t(av0_2), int8_t(av0_3)));
+                        int xq0_lo = pack32(i8vec4(int8_t(xq_shared[xq_base + 0]),
+                                                    int8_t(xq_shared[xq_base + 1]),
+                                                    int8_t(xq_shared[xq_base + 2]),
+                                                    int8_t(xq_shared[xq_base + 3])));
+                        int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
+
+                        int av0_4 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 4);
+                        int av0_5 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 5);
+                        int av0_6 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 6);
+                        int av0_7 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 7);
+                        int w0_hi = pack32(i8vec4(int8_t(av0_4), int8_t(av0_5),
+                                                   int8_t(av0_6), int8_t(av0_7)));
+                        int xq0_hi = pack32(i8vec4(int8_t(xq_shared[xq_base + 4]),
+                                                    int8_t(xq_shared[xq_base + 5]),
+                                                    int8_t(xq_shared[xq_base + 6]),
+                                                    int8_t(xq_shared[xq_base + 7])));
+                        l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
+
+                        int av1_0 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 8);
+                        int av1_1 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 9);
+                        int av1_2 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 10);
+                        int av1_3 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 11);
+                        int w1_lo = pack32(i8vec4(int8_t(av1_0), int8_t(av1_1),
+                                                   int8_t(av1_2), int8_t(av1_3)));
+                        int xq1_lo = pack32(i8vec4(int8_t(xq_shared[xq_base + 8]),
+                                                    int8_t(xq_shared[xq_base + 9]),
+                                                    int8_t(xq_shared[xq_base + 10]),
+                                                    int8_t(xq_shared[xq_base + 11])));
+                        int l1 = dotPacked4x8EXT(w1_lo, xq1_lo);
+
+                        int av1_4 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 12);
+                        int av1_5 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 13);
+                        int av1_6 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 14);
+                        int av1_7 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 15);
+                        int w1_hi = pack32(i8vec4(int8_t(av1_4), int8_t(av1_5),
+                                                   int8_t(av1_6), int8_t(av1_7)));
+                        int xq1_hi = pack32(i8vec4(int8_t(xq_shared[xq_base + 12]),
+                                                    int8_t(xq_shared[xq_base + 13]),
+                                                    int8_t(xq_shared[xq_base + 14]),
+                                                    int8_t(xq_shared[xq_base + 15])));
+                        l1 += dotPacked4x8EXT(w1_hi, xq1_hi);
+
+                        acc0_l += s * l0;
+                        acc1_l += s * l1;
+                    }
+                }
+                acc1 += d * float(acc0_l + acc1_l);
+            }
+        }
+#endif
+        barrier();
+    }
+
+#if NMAT >= 2
+    if (valid0) y0[i] = acc0;
+    if (valid1) y1[i] = acc1;
+#elif defined(HAS_RESIDUAL)
+    if (valid0) y0[i] = acc0 + residual[i];
+#else
+    if (valid0) y0[i] = acc0;
+#endif
+}

@@ -1,0 +1,78 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer VecBuf { mediump float vec[]; };
+layout(set = 0, binding = 1) readonly buffer CosBuf { mediump float rcos[]; };
+layout(set = 0, binding = 2) readonly buffer SinBuf { mediump float rsin[]; };
+#ifdef HAS_FF
+layout(set = 0, binding = 3) readonly buffer FfBuf { mediump float ff[]; };
+#endif
+
+layout(push_constant) uniform Params {
+    int n_heads;
+    int head_dim;
+    int pos;
+#ifdef HAS_FF
+    int has_ff;
+    int neox;
+#else
+    int neox;
+#endif
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int half_dim = params.head_dim / 2;
+    int total = params.n_heads * half_dim;
+    if (int(gid) >= total) return;
+
+    int h = int(gid) / half_dim;
+    int j = int(gid) % half_dim;
+
+#ifdef HAS_FF
+    int base = h * params.head_dim;
+    if (params.has_ff != 0) {
+        mediump float fj = ff[j];
+        if (fj > 1e10) return;
+        float theta = pow(10000.0f, -2.0f * float(j) / float(params.head_dim));
+        float angle = float(params.pos) * theta * fj;
+        float c = cos(angle);
+        float s = sin(angle);
+        mediump float v0 = vec[base + j];
+        mediump float v1 = vec[base + j + half_dim];
+        vec[base + j]            = v0 * c - v1 * s;
+        vec[base + j + half_dim] = v0 * s + v1 * c;
+    } else {
+        int rope_off = params.pos * half_dim + j;
+        mediump float c = rcos[rope_off];
+        mediump float s = rsin[rope_off];
+        if (params.neox != 0) {
+            mediump float v0 = vec[base + j];
+            mediump float v1 = vec[base + j + half_dim];
+            vec[base + j]            = v0 * c - v1 * s;
+            vec[base + j + half_dim] = v0 * s + v1 * c;
+        } else {
+            mediump float v0 = vec[base + 2 * j];
+            mediump float v1 = vec[base + 2 * j + 1];
+            vec[base + 2 * j]     = v0 * c - v1 * s;
+            vec[base + 2 * j + 1] = v0 * s + v1 * c;
+        }
+    }
+#else
+    int base = h * params.head_dim;
+    int rope_off = params.pos * half_dim + j;
+    mediump float c = rcos[rope_off];
+    mediump float s = rsin[rope_off];
+    if (params.neox != 0) {
+        mediump float v0 = vec[base + j];
+        mediump float v1 = vec[base + j + half_dim];
+        vec[base + j]            = v0 * c - v1 * s;
+        vec[base + j + half_dim] = v0 * s + v1 * c;
+    } else {
+        mediump float v0 = vec[base + 2 * j];
+        mediump float v1 = vec[base + 2 * j + 1];
+        vec[base + 2 * j]     = v0 * c - v1 * s;
+        vec[base + 2 * j + 1] = v0 * s + v1 * c;
+    }
+#endif
+}

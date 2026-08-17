@@ -1,0 +1,115 @@
+#version 450
+
+#ifdef USE_SUBGROUP
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer XBuf { float x[]; };
+
+#ifdef HAS_WEIGHT
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; };
+  #ifdef ADD_RESIDUAL
+  layout(set = 0, binding = 2) readonly buffer RBuf { float residual[]; };
+  layout(set = 0, binding = 3) writeonly buffer YBuf { float y[]; };
+  #else
+  layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
+  #endif
+#else
+  #ifdef ADD_RESIDUAL
+  layout(set = 0, binding = 1) readonly buffer RBuf { float residual[]; };
+  layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
+  #else
+  layout(set = 0, binding = 1) writeonly buffer YBuf { float y[]; };
+  #endif
+#endif
+
+#ifdef PER_HEAD
+layout(push_constant) uniform Params {
+    int n_heads;
+    int head_dim;
+    float eps;
+} params;
+#else
+layout(push_constant) uniform Params {
+    int n;
+    float eps;
+} params;
+#endif
+
+#ifdef USE_SUBGROUP
+shared float sg_partial[256];
+#else
+shared float partial[256];
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+#ifdef PER_HEAD
+    int h = int(gl_WorkGroupID.x);
+    if (h >= params.n_heads) return;
+    int head_dim = params.head_dim;
+    int base = h * head_dim;
+    int n = head_dim;
+#else
+    int n = params.n;
+    int base = 0;
+#endif
+
+    float sum = 0.0;
+    for (int i = int(tid); i < n; i += 256) {
+        float v = x[base + i];
+        sum += v * v;
+    }
+
+#ifdef USE_SUBGROUP
+    sum = subgroupAdd(sum);
+    if (gl_NumSubgroups > 1) {
+        if (gl_SubgroupInvocationID == 0) {
+            sg_partial[gl_SubgroupID] = sum;
+        }
+        barrier();
+        if (gl_SubgroupID == 0) {
+            uint n_sg = gl_NumSubgroups;
+            float sg_sum = (gl_SubgroupInvocationID < n_sg)
+                         ? sg_partial[gl_SubgroupInvocationID]
+                         : 0.0;
+            sg_sum = subgroupAdd(sg_sum);
+            if (gl_SubgroupInvocationID == 0) {
+                sg_partial[0] = sg_sum;
+            }
+        }
+        barrier();
+        sum = sg_partial[0];
+    }
+#else
+    partial[tid] = sum;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        barrier();
+    }
+    sum = partial[0];
+#endif
+
+    float scale = (sum > 0.0 || params.eps > 0.0)
+                ? inversesqrt(sum / float(n) + params.eps)
+                : 0.0;
+
+    for (int i = int(tid); i < n; i += 256) {
+        float xv = x[base + i];
+        float result;
+#ifdef HAS_WEIGHT
+        result = xv * scale * w[i];
+#else
+        result = xv * scale;
+#endif
+#ifdef ADD_RESIDUAL
+        result += residual[base + i];
+#endif
+        y[base + i] = result;
+    }
+}

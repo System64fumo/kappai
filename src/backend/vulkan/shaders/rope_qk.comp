@@ -1,0 +1,62 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer QBuf { mediump float q[]; };
+layout(set = 0, binding = 1) buffer KBuf { mediump float k[]; };
+layout(set = 0, binding = 2) readonly buffer CosBuf { mediump float rcos[]; };
+layout(set = 0, binding = 3) readonly buffer SinBuf { mediump float rsin[]; };
+
+layout(push_constant) uniform Params {
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int pos;
+    int neox;
+} params;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int hd2 = params.head_dim / 2;
+    int total_q = params.n_heads * hd2;
+    int total_k = params.n_kv_heads * hd2;
+
+    if (int(gid) < total_q) {
+        int h = int(gid) / hd2;
+        int j = int(gid) % hd2;
+        mediump float c = rcos[uint(params.pos) * uint(hd2) + uint(j)];
+        mediump float s = rsin[uint(params.pos) * uint(hd2) + uint(j)];
+        uint base = uint(h) * uint(params.head_dim);
+        if (params.neox != 0) {
+            mediump float v0 = q[base + uint(j)];
+            mediump float v1 = q[base + uint(j) + uint(hd2)];
+            q[base + uint(j)]            = v0 * c - v1 * s;
+            q[base + uint(j) + uint(hd2)] = v0 * s + v1 * c;
+        } else {
+            mediump float v0 = q[base + uint(j * 2)];
+            mediump float v1 = q[base + uint(j * 2 + 1)];
+            q[base + uint(j * 2)]     = v0 * c - v1 * s;
+            q[base + uint(j * 2 + 1)] = v0 * s + v1 * c;
+        }
+        return;
+    }
+
+    uint kid = gid - uint(total_q);
+    if (int(kid) < total_k) {
+        int h = int(kid) / hd2;
+        int j = int(kid) % hd2;
+        mediump float c = rcos[uint(params.pos) * uint(hd2) + uint(j)];
+        mediump float s = rsin[uint(params.pos) * uint(hd2) + uint(j)];
+        uint base = uint(h) * uint(params.head_dim);
+        if (params.neox != 0) {
+            mediump float v0 = k[base + uint(j)];
+            mediump float v1 = k[base + uint(j) + uint(hd2)];
+            k[base + uint(j)]            = v0 * c - v1 * s;
+            k[base + uint(j) + uint(hd2)] = v0 * s + v1 * c;
+        } else {
+            mediump float v0 = k[base + uint(j * 2)];
+            mediump float v1 = k[base + uint(j * 2 + 1)];
+            k[base + uint(j * 2)]     = v0 * c - v1 * s;
+            k[base + uint(j * 2 + 1)] = v0 * s + v1 * c;
+        }
+    }
+}

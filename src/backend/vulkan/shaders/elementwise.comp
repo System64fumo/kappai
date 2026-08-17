@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer DstBuf { mediump float dst[]; };
+layout(set = 0, binding = 1) readonly buffer Src1Buf { mediump float src1[]; };
+layout(set = 0, binding = 2) readonly buffer Src2Buf { mediump float src2[]; };
+
+layout(push_constant) uniform Params {
+    int n;
+    int mode;
+    mediump float scale;
+    int _pad;
+} params;
+
+#define MODE_COPY          0
+#define MODE_ADD_INPLACE   1
+#define MODE_SCALE_INPLACE 2
+#define MODE_PLE_COMBINE   3
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (int(i) >= params.n) return;
+
+    switch (params.mode) {
+    case MODE_COPY:
+        dst[i] = src1[i];
+        break;
+    case MODE_ADD_INPLACE:
+        dst[i] = dst[i] + src1[i];
+        break;
+    case MODE_SCALE_INPLACE:
+        dst[i] = dst[i] * params.scale;
+        break;
+    case MODE_PLE_COMBINE:
+        dst[i] = (dst[i] + src1[i]) * params.scale;
+        break;
+    default:
+        break;
+    }
+}

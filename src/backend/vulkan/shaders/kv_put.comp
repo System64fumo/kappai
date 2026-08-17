@@ -1,0 +1,49 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) writeonly buffer KCache { uint kcache[]; };
+layout(set = 0, binding = 1) writeonly buffer VCache { uint vcache[]; };
+layout(set = 0, binding = 2) readonly buffer KIn { float kin[]; };
+layout(set = 0, binding = 3) readonly buffer VIn { float vin[]; };
+
+layout(push_constant) uniform Params {
+    uint layer_off;
+    int pos;
+    int n_kv_heads;
+    int head_dim;
+    int n_ctx;
+    int stride_head_dim;
+} params;
+
+#include "common.glsl"
+
+void main() {
+    uint pair = gl_GlobalInvocationID.x;
+    int head_dim = params.head_dim;
+    int stride_head_dim = params.stride_head_dim;
+    int n_pairs_per_head = head_dim / 2;
+    int total_pairs = params.n_kv_heads * n_pairs_per_head;
+    if (int(pair) >= total_pairs) return;
+
+    int kvh = int(pair) / n_pairs_per_head;
+    int d_pair = int(pair) % n_pairs_per_head;
+    int d0 = d_pair * 2;
+    int d1 = d0 + 1;
+
+    uint kvh_stride = uint(params.n_ctx) * uint(stride_head_dim);
+    uint pos_off    = uint(params.pos) * uint(stride_head_dim);
+    uint base = params.layer_off + uint(kvh) * kvh_stride + pos_off;
+    uint word_idx = (base + uint(d0)) >> 1u;
+
+    int in_idx0 = kvh * head_dim + d0;
+    int in_idx1 = kvh * head_dim + d1;
+
+    uint k0 = float_to_half(kin[in_idx0]);
+    uint k1 = float_to_half(kin[in_idx1]);
+    kcache[word_idx] = k0 | (k1 << 16u);
+
+    uint v0 = float_to_half(vin[in_idx0]);
+    uint v1 = float_to_half(vin[in_idx1]);
+    vcache[word_idx] = v0 | (v1 << 16u);
+}
