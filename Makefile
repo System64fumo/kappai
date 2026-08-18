@@ -48,20 +48,10 @@ endif
 MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros \
 	      -fcx-limited-range
 
-# Sanitizers default to ON for debug (bug-hunting), OFF elsewhere. Set
-# SANITIZE=1 to force-enable them in any build, e.g. make BUILD=release-rdbg SANITIZE=1.
-SANITIZE ?= 0
-ifeq ($(BUILD),debug)
-  SANITIZE := 1
-endif
-ifeq ($(SANITIZE),1)
-  ifeq ($(TSAN),1)
-    SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
-  else
-    SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
-  endif
+ifeq ($(TSAN),1)
+  SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
 else
-  SANITIZE_FLAGS :=
+  SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
 endif
 
 ifeq ($(BUILD),debug)
@@ -72,7 +62,7 @@ ifeq ($(BUILD),debug)
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 
 else ifeq ($(BUILD),release-rdbg)
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -g3 -ggdb3 -fno-omit-frame-pointer \
+  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
 	     -Wall -Wextra -Wformat=2 \
 	     $(MATH_FLAGS) $(ARCH_FLAGS) \
@@ -284,7 +274,6 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_STAMP)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
 
-# x86_64 SIMD kernels need explicit ISA flags (AVX2/F16C/FMA are not baseline x86-64).
 ifeq ($(HOST_ARCH),x86_64)
   $(OBJ_DIR)/backend/cpu/x86_64/quants.o: CFLAGS += -mavx2 -mf16c -mfma
   $(OBJ_DIR)/backend/cpu/x86_64/core.o: CFLAGS += -mavx2 -mf16c -mfma
@@ -303,7 +292,6 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
-	@echo "SANITIZE           = $(SANITIZE)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
 	@echo "BACKENDS           = $(REQUESTED_BACKENDS)"
 	@echo "LIB_SRCS           = $(LIB_SRCS)"
