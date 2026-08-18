@@ -96,18 +96,51 @@ status_code context_init(context *c, const config *cfg) {
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
 	uint64_t load_t0 = time_us();
-	s = model_load_backend_ex_repack(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack,
-									 cfg->ctx_size);
-	uint64_t load_us = time_us() - load_t0;
+	s = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack, cfg->ctx_size);
 	if (s != OK) {
-		ERROR("failed to load model '%s'", cfg->model);
+		ERROR("failed to parse model '%s'", cfg->model);
 		monitor_emit_load_phase_model_failed(&c->monitor, s);
 		goto fail_backend;
 	}
-	monitor_emit_load_phase_model_done(&c->monitor, load_us / 1000, c->m.n_layers, c->m.dim,
-									   c->m.vocab_size);
 
 	c->backend->rope_neox = c->m.arch_info->uses_neox_rope;
+
+	if (cfg->ngl >= 0) {
+		int n_gpu = cfg->ngl;
+		if (n_gpu > c->m.n_layers)
+			n_gpu = c->m.n_layers;
+		if (n_gpu < c->m.n_layers) {
+			s = model_set_layer_backend_range(&c->m, n_gpu, c->m.n_layers, backend_host());
+			if (s != OK) {
+				ERROR("failed to apply --ngl");
+				goto fail_model;
+			}
+			if (c->m.arch_info->is_mla) {
+				WARN("--ngl: MLA architectures do not yet support per-layer KV on host; "
+					 "MLA layers running on host may fall back to primary KV path");
+			}
+			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_gpu, c->backend->name,
+				 c->m.n_layers - n_gpu);
+		}
+	}
+
+	s = model_upload_weights(&c->m);
+	if (s != OK) {
+		ERROR("failed to upload weights for '%s'", cfg->model);
+		monitor_emit_load_phase_model_failed(&c->monitor, s);
+		goto fail_model;
+	}
+
+	s = model_build_recipe(&c->m);
+	if (s != OK) {
+		ERROR("failed to build recipe for '%s'", cfg->model);
+		monitor_emit_load_phase_model_failed(&c->monitor, s);
+		goto fail_model;
+	}
+
+	uint64_t load_us = time_us() - load_t0;
+	monitor_emit_load_phase_model_done(&c->monitor, load_us / 1000, c->m.n_layers, c->m.dim,
+									   c->m.vocab_size);
 
 	s = tokenizer_init(&c->tok, &c->m.gctx);
 	if (s != OK) {
@@ -153,8 +186,18 @@ status_code context_init(context *c, const config *cfg) {
 		goto fail_chat;
 	}
 
+	if (c->m.mixed_backend_mode) {
+		s = kvcache_alloc_host_mirror(&c->kv, &c->m);
+		if (s != OK) {
+			ERROR("failed to allocate host-side KV cache mirror for mixed backend mode");
+			goto fail_chat;
+		}
+		DEBUG("mixed backend mode: allocated host KV cache mirror");
+	}
+
 	compute_scratch_init(&c->scratch);
 	c->scratch.interrupt = &c->interrupt;
+	c->scratch.backend	 = c->backend;
 	sampler_init(&c->samp, cfg->seed);
 	sampler_set_vocab(&c->samp, c->m.vocab_size);
 

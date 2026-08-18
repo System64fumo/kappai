@@ -29,7 +29,7 @@ typedef struct {
 	const moe_expert_slot *slot_buf;
 	const int			  *expert_ids;
 	const float			  *weights;
-	const buffer		  *xb;
+	const float			  *xb_f;
 	const buffer		  *xb_q8_gate;
 	backend				  *a;
 	float				  *all_scratch;
@@ -308,9 +308,10 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 		logits = xmalloc((size_t)E * sizeof(float));
 
 	buffer *inp_buf = &s->router_softmax_inp_gpu;
-	if (inp_buf->size < (size_t)dim * sizeof(float)) {
+	if (inp_buf->size < (size_t)dim * sizeof(float) || inp_buf->owner != a) {
 		if (inp_buf->owner)
 			inp_buf->owner->buffer_free(inp_buf->owner, inp_buf);
+		memset(inp_buf, 0, sizeof(*inp_buf));
 		status_code ast = a->buffer_alloc_scratch(a, (size_t)dim * sizeof(float), inp_buf);
 		if (ast != OK) {
 			if (logits != logits_fallback)
@@ -326,9 +327,10 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 	}
 
 	buffer *logits_gpu_buf = &s->router_logits_gpu;
-	if (logits_gpu_buf->size < (size_t)E * sizeof(float)) {
+	if (logits_gpu_buf->size < (size_t)E * sizeof(float) || logits_gpu_buf->owner != a) {
 		if (logits_gpu_buf->owner)
 			logits_gpu_buf->owner->buffer_free(logits_gpu_buf->owner, logits_gpu_buf);
+		memset(logits_gpu_buf, 0, sizeof(*logits_gpu_buf));
 		status_code ast = a->buffer_alloc_scratch(a, (size_t)E * sizeof(float), logits_gpu_buf);
 		if (ast != OK) {
 			if (logits != logits_fallback)
@@ -371,9 +373,10 @@ static status_code op_moe_router_direct(backend *a, layer_weights *L, int E, int
 		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, &logits_buf, E, dim);
 	} else {
 		buffer *logits_gpu_buf = &s->router_logits_gpu;
-		if (logits_gpu_buf->size < (size_t)E * sizeof(float)) {
+		if (logits_gpu_buf->size < (size_t)E * sizeof(float) || logits_gpu_buf->owner != a) {
 			if (logits_gpu_buf->owner)
 				logits_gpu_buf->owner->buffer_free(logits_gpu_buf->owner, logits_gpu_buf);
+			memset(logits_gpu_buf, 0, sizeof(*logits_gpu_buf));
 			status_code ast = a->buffer_alloc_scratch(a, (size_t)E * sizeof(float), logits_gpu_buf);
 			if (ast != OK) {
 				if (logits != logits_fallback)
@@ -405,11 +408,11 @@ status_code op_moe_router(exec_ctx *ctx) {
 	struct model		   *m	  = ctx->m;
 	struct compute_scratch *s	  = ctx->s;
 	int						li	  = ctx->li;
-	buffer				   *slots = ctx->s->slots;
+	buffer				   *slots = compute_slots_array(ctx->s);
 	if (!model_layer_is_moe(m, li))
 		return OK;
 
-	backend		  *a			= m->backend;
+	backend		  *a			= model_layer_backend(ctx->m, ctx->li);
 	layer_weights *L			= &m->layers[li];
 	int			   E			= m->moe.n_experts;
 	int			   K			= m->moe.n_experts_used;
@@ -449,7 +452,7 @@ static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
 		.q8_gate_ok	  = j->xb_q8_gate_ok,
 		.q8_gate_type = j->gate_q8_type,
 		.xb_q8_gate	  = j->xb_q8_gate,
-		.xb_f		  = (const float *)((char *)j->xb->handle + j->xb->offset),
+		.xb_f		  = j->xb_f,
 		.out		  = (float *)((char *)j->all_outs + ((size_t)tid * j->per_thread_out)),
 	};
 	cx.scratch = (float *)((char *)j->all_scratch + ((size_t)tid * j->per_thread_scratch));
@@ -510,6 +513,16 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	for (int d = 0; d < dim; d++)
 		outf[d] = 0.0f;
 
+	float *xb_f = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
+	{
+		backend *xb_owner = xb->owner ? xb->owner : a;
+		if (xb_owner->synchronize)
+			xb_owner->synchronize(xb_owner);
+		status_code rs = xb_owner->buffer_read_f32(xb_owner, xb, xb_f, dim);
+		if (rs != OK)
+			return rs;
+	}
+
 	moe_par_job job = {.m				   = m,
 					   .li				   = li,
 					   .top_k			   = K,
@@ -522,7 +535,7 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 					   .slot_buf		   = slot_buf,
 					   .expert_ids		   = expert_ids,
 					   .weights			   = weights,
-					   .xb				   = xb,
+					   .xb_f			   = xb_f,
 					   .xb_q8_gate		   = xb_q8_gate,
 					   .a				   = a,
 					   .all_scratch		   = all_scratch,
@@ -564,8 +577,11 @@ static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, 
 	(void)li;
 	float *scratch = float_buf_ensure(&s->moe_scratch, scratch_need / sizeof(float));
 
-	float	   *xb_f = float_buf_ensure(&s->moe_xb_f, dim);
-	status_code st	 = a->buffer_read_f32(a, xb, xb_f, dim);
+	float	*xb_f	  = float_buf_ensure(&s->moe_xb_f, dim);
+	backend *xb_owner = xb->owner ? xb->owner : a;
+	if (xb_owner->synchronize)
+		xb_owner->synchronize(xb_owner);
+	status_code st = xb_owner->buffer_read_f32(xb_owner, xb, xb_f, dim);
 	if (st != OK)
 		return st;
 
@@ -600,7 +616,7 @@ status_code op_moe_experts(exec_ctx *ctx) {
 	struct model		   *m		= ctx->m;
 	struct compute_scratch *s		= ctx->s;
 	int						li		= ctx->li;
-	buffer				   *slots	= ctx->s->slots;
+	buffer				   *slots	= compute_slots_array(ctx->s);
 	buffer				   *out_buf = &slots[RECIPE_SLOT_XB2];
 	int						dim		= m->dim;
 
@@ -633,9 +649,10 @@ status_code op_moe_experts(exec_ctx *ctx) {
 		return OK;
 	}
 
-	backend *a = m->backend;
-	int		 K = m->moe.n_experts_used;
-	int		 I = m->moe.moe_intermediate;
+	backend *a		= model_layer_backend(ctx->m, ctx->li);
+	backend *host_a = backend_host();
+	int		 K		= m->moe.n_experts_used;
+	int		 I		= m->moe.moe_intermediate;
 
 	const int	*expert_ids = (const int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
 	const float *weights	= (const float *)slots[RECIPE_SLOT_ROUTER_W].handle;
@@ -708,12 +725,12 @@ status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	if (par) {
-		st = moe_experts_run_parallel(m, li, K, dim, a, slot_buf, expert_ids, weights, xb, s, I,
-									  any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type, &xb_q8_gate,
-									  scratch_need, pool, interleave, moe_op, outf);
+		st = moe_experts_run_parallel(m, li, K, dim, host_a, slot_buf, expert_ids, weights, xb, s,
+									  I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
+									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
 	} else {
-		st = moe_experts_run_sequential(m, li, K, dim, a, slot_buf, expert_ids, weights, xb, s, I,
-										use_gelu, xb_q8_gate_ok, gate_q8_type, &xb_q8_gate,
+		st = moe_experts_run_sequential(m, li, K, dim, host_a, slot_buf, expert_ids, weights, xb, s,
+										I, use_gelu, xb_q8_gate_ok, gate_q8_type, &xb_q8_gate,
 										scratch_need, outf);
 	}
 
@@ -748,8 +765,8 @@ status_code op_moe_shared(exec_ctx *ctx) {
 	struct model		   *m	   = ctx->m;
 	struct compute_scratch *s	   = ctx->s;
 	int						li	   = ctx->li;
-	buffer				   *slots  = ctx->s->slots;
-	backend				   *a	   = m->backend;
+	buffer				   *slots  = compute_slots_array(ctx->s);
+	backend				   *a	   = model_layer_backend(ctx->m, ctx->li);
 	layer_weights		   *L	   = &m->layers[li];
 	int						dim	   = m->dim;
 	int						is_moe = model_layer_is_moe(m, li);

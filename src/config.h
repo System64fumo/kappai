@@ -19,6 +19,7 @@ typedef struct config {
 	int kv_quant;
 	int moe_cache_cap;
 	int moe_pin;
+	int ngl;
 
 	bool debug;
 	bool use_mmap;

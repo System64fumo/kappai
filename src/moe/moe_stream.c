@@ -1514,8 +1514,8 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 		return OK;
 
 	{
-		tpool *pool =
-			(m->backend && m->backend->get_pool) ? m->backend->get_pool(m->backend) : NULL;
+		backend *host_be = backend_host();
+		tpool	*pool	 = (host_be && host_be->get_pool) ? host_be->get_pool(host_be) : NULL;
 
 		if (pool) {
 			size_t need_chunks = moe_miss_chunk_budget(m, layer, misses, n_misses);
