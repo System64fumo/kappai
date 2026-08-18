@@ -48,10 +48,20 @@ endif
 MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros \
 	      -fcx-limited-range
 
-ifeq ($(TSAN),1)
-  SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
+# Sanitizers default to ON for debug (bug-hunting), OFF elsewhere. Set
+# SANITIZE=1 to force-enable them in any build, e.g. make BUILD=release-rdbg SANITIZE=1.
+SANITIZE ?= 0
+ifeq ($(BUILD),debug)
+  SANITIZE := 1
+endif
+ifeq ($(SANITIZE),1)
+  ifeq ($(TSAN),1)
+    SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
+  else
+    SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
+  endif
 else
-  SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
+  SANITIZE_FLAGS :=
 endif
 
 ifeq ($(BUILD),debug)
@@ -62,7 +72,7 @@ ifeq ($(BUILD),debug)
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 
 else ifeq ($(BUILD),release-rdbg)
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
+  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
 	     -Wall -Wextra -Wformat=2 \
 	     $(MATH_FLAGS) $(ARCH_FLAGS) \
@@ -293,6 +303,7 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
+	@echo "SANITIZE           = $(SANITIZE)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
 	@echo "BACKENDS           = $(REQUESTED_BACKENDS)"
 	@echo "LIB_SRCS           = $(LIB_SRCS)"
