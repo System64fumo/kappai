@@ -94,6 +94,10 @@ ifeq ($(CPU_ARCH_OPT),1)
     LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/quants.c
     LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/core.c
   endif
+  ifeq ($(HOST_ARCH),x86_64)
+    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/quants.c
+    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/core.c
+  endif
 endif
 
 ifneq ($(HAS_VULKAN),)
@@ -113,6 +117,7 @@ TEST_BIN    := $(OUT_DIR)/test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
 BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
+	      $(OBJ_DIR)/backend/cpu/x86_64 \
 	      $(OBJ_DIR)/backend/vulkan \
 	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor \
 	      $(OBJ_DIR)/models $(OBJ_DIR)/test
@@ -268,6 +273,11 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_STAMP)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
+
+ifeq ($(HOST_ARCH),x86_64)
+  $(OBJ_DIR)/backend/cpu/x86_64/quants.o: CFLAGS += -mavx2 -mf16c -mfma
+  $(OBJ_DIR)/backend/cpu/x86_64/core.o: CFLAGS += -mavx2 -mf16c -mfma
+endif
 
 $(OUT_DIR):
 	@mkdir -p $(BUILD_DIRS)
