@@ -162,14 +162,41 @@ typedef struct model {
 	model_recipe *recipe;
 	int			  batchable;
 	weight_ref	**wrefs_by_layer;
+
+	backend **layer_backends;
+	int		  n_layer_backends;
+	int		  mixed_backend_mode;
 } model;
 
 status_code model_load(model *m, const char *path);
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *accel, int use_mmap,
 										 const char *repack_config, int requested_n_ctx);
+
+status_code model_load_parse(model *m, const char *path, backend *accel, int use_mmap,
+							 const char *repack_config, int requested_n_ctx);
+status_code model_upload_weights(model *m);
+status_code model_build_recipe(model *m);
 void		model_free(model *m);
 
 int model_should_repack(uint32_t type, const char *repack_config);
+
+static inline backend *model_layer_backend(const model *m, int li) {
+	if (!m || !m->layer_backends || li < 0 || li >= m->n_layer_backends)
+		return m ? m->backend : NULL;
+	backend *b = m->layer_backends[li];
+	return b ? b : m->backend;
+}
+
+static inline int model_layer_backend_is_host(const model *m, int li) {
+	backend *b = model_layer_backend(m, li);
+	return b && backend_has_cap(b, BCAP_IS_HOST);
+}
+
+static inline int model_mixed_backend_mode(const model *m) {
+	return m && m->mixed_backend_mode;
+}
+
+status_code model_set_layer_backend_range(model *m, int begin, int end, backend *b);
 
 static inline int model_layer_is_sliding(const model *m, int li) {
 	return m->sliding_window > 0 && m->layers[li].is_sliding;

@@ -35,8 +35,8 @@ status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 	struct kvcache *cache	  = ctx->cache;
 	int				pos		  = ctx->pos;
 	int				li		  = ctx->li;
-	buffer		   *slots	  = ctx->s->slots;
-	backend		   *a		  = m->backend;
+	buffer		   *slots	  = compute_slots_array(ctx->s);
+	backend		   *a		  = model_layer_backend(m, ctx->li);
 	layer_weights  *L		  = &m->layers[li];
 	const int		dim		  = m->dim;
 	const int		q_lora	  = m->mla.q_lora;
@@ -94,8 +94,8 @@ status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 status_code op_mla_q_proj(exec_ctx *ctx) {
 	struct model  *m		= ctx->m;
 	int			   li		= ctx->li;
-	buffer		  *slots	= ctx->s->slots;
-	backend		  *a		= m->backend;
+	buffer		  *slots	= compute_slots_array(ctx->s);
+	backend		  *a		= model_layer_backend(m, ctx->li);
 	layer_weights *L		= &m->layers[li];
 	const int	   dim		= m->dim;
 	const int	   q_lora	= m->mla.q_lora;
@@ -122,8 +122,8 @@ status_code op_mla_kv_proj(exec_ctx *ctx) {
 	struct kvcache *cache	  = ctx->cache;
 	int				pos		  = ctx->pos;
 	int				li		  = ctx->li;
-	buffer		   *slots	  = ctx->s->slots;
-	backend		   *a		  = m->backend;
+	buffer		   *slots	  = compute_slots_array(ctx->s);
+	backend		   *a		  = model_layer_backend(m, ctx->li);
 	layer_weights  *L		  = &m->layers[li];
 	const int		dim		  = m->dim;
 	const int		kv_lora	  = m->mla.kv_lora;
@@ -150,9 +150,9 @@ status_code op_attention_mla(exec_ctx *ctx) {
 	struct compute_scratch *s	  = ctx->s;
 	int						li	  = ctx->li;
 	int						pos	  = ctx->pos;
-	buffer				   *slots = ctx->s->slots;
+	buffer				   *slots = compute_slots_array(ctx->s);
 	(void)ctx->flash_attn;
-	backend		  *a	   = m->backend;
+	backend		  *a	   = model_layer_backend(m, ctx->li);
 	layer_weights *L	   = &m->layers[li];
 	int			   n_heads = op->u.attention.n_heads;
 	int			   qk_head = m->mla.qk_head;

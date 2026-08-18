@@ -61,7 +61,6 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
 	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
 	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->ple_proj);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
 	free_buf(&s->ple_all);
@@ -69,6 +68,33 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->ple_proj_norm_w_gpu);
 	free_buf(&s->router_softmax_inp_gpu);
 	free_buf(&s->router_logits_gpu);
+
+	free_buf(&s->mirror_slots[RECIPE_SLOT_X]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_XB]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_XB2]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_ATTN_OUT]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_Q]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_K]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_V]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_ACT]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_LOGITS]);
+	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
+		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
+			continue;
+		s->mirror_slots[i].owner	= NULL;
+		s->mirror_slots[i].handle	= NULL;
+		s->mirror_slots[i].host_ptr = NULL;
+		s->mirror_slots[i].size		= 0;
+		s->mirror_slots[i].offset	= 0;
+	}
+	s->mirror_slots_alloced = 0;
+	s->mirror_backend		= NULL;
+	s->active_backend		= NULL;
+	s->active_is_mirror		= 0;
+	free(s->transfer_buf);
+	s->transfer_buf		= NULL;
+	s->transfer_buf_cap = 0;
 	free(s->logits_host);
 }
 
@@ -313,14 +339,6 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 			s->ple_buf =
 				xmalloc((size_t)m->layer_dims.n_embd_per_layer * m->n_layers * sizeof(float));
 			{
-				status_code _st = scratch_alloc(a, &s->ple_proj,
-												(size_t)m->layer_dims.n_embd_per_layer *
-													m->n_layers * sizeof(float),
-												"&s->ple_proj");
-				if (_st != OK)
-					return _st;
-			}
-			{
 				status_code _st = scratch_alloc(
 					a, &s->ple_inp, (size_t)m->layer_dims.n_embd_per_layer * sizeof(float),
 					"&s->ple_inp");
@@ -370,4 +388,180 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud) {
 	s->layer_cb	   = cb;
 	s->layer_cb_ud = ud;
+}
+
+static status_code ensure_transfer_buf(compute_scratch *s, size_t need_floats) {
+	if (s->transfer_buf_cap >= need_floats)
+		return OK;
+	s->transfer_buf		= xrealloc(s->transfer_buf, need_floats * sizeof(float));
+	s->transfer_buf_cap = need_floats;
+	return OK;
+}
+
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx) {
+	(void)n_ctx;
+	if (s->mirror_slots_alloced && s->mirror_backend)
+		return OK;
+	if (!m || !m->mixed_backend_mode)
+		return OK;
+	backend *host = backend_host();
+	if (!host)
+		return ERR_UNSUPPORTED;
+
+	s->mirror_backend = host;
+
+	int max_head_dim = m->head_dim;
+	int max_kv_heads = m->n_kv_heads;
+	if (m->arch_info->has_variable_layer_dims) {
+		max_head_dim = m->layer_dims.head_dim_global > m->layer_dims.head_dim_swa
+						   ? m->layer_dims.head_dim_global
+						   : m->layer_dims.head_dim_swa;
+		max_kv_heads = layer_max_kv_heads(m);
+		if (max_kv_heads == 0)
+			max_kv_heads = m->n_kv_heads;
+	}
+	int attn_buf_size = m->dim;
+	if (m->arch_info->has_variable_layer_dims) {
+		int q_out_max = m->n_heads * max_head_dim;
+		if (q_out_max > attn_buf_size)
+			attn_buf_size = q_out_max;
+	}
+	if (m->arch_info->is_mla) {
+		int mla_out = m->n_heads * m->mla.v_head;
+		if (mla_out > attn_buf_size)
+			attn_buf_size = mla_out;
+	}
+
+	int max_intermediate = m->intermediate;
+	if (m->arch_info->has_variable_layer_dims) {
+		int layer_max = layer_max_intermediate(m);
+		if (layer_max > max_intermediate)
+			max_intermediate = layer_max;
+	}
+	int ffn_act_size = max_intermediate > m->dim ? max_intermediate : m->dim;
+
+	status_code st;
+#define MIRROR_ALLOC(slot, size)                                                                   \
+	do {                                                                                           \
+		st = scratch_alloc(host, &s->mirror_slots[slot], (size), "mirror_slots[" #slot "]");       \
+		if (st != OK)                                                                              \
+			return st;                                                                             \
+	} while (0)
+
+	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)m->dim * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)m->n_heads * max_head_dim * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)max_kv_heads * max_head_dim * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)max_kv_heads * max_head_dim * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)max_intermediate * 2 * sizeof(float));
+	s->mirror_slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(
+		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)max_intermediate * sizeof(float));
+	s->mirror_slots[RECIPE_SLOT_FFN_UP] = buffer_slice(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP],
+													   (size_t)max_intermediate * sizeof(float),
+													   (size_t)max_intermediate * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)ffn_act_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_LOGITS, (size_t)m->vocab_size * sizeof(float));
+#undef MIRROR_ALLOC
+
+	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].size	 = sizeof(s->router_ids_host);
+	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].offset	 = 0;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].owner	 = NULL;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_W].handle	 = s->router_w_host;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_W].host_ptr	 = s->router_w_host;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_W].size		 = sizeof(s->router_w_host);
+	s->mirror_slots[RECIPE_SLOT_ROUTER_W].offset	 = 0;
+	s->mirror_slots[RECIPE_SLOT_ROUTER_W].owner		 = NULL;
+
+	s->mirror_slots_alloced = 1;
+	return OK;
+}
+
+status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim) {
+	if (!target)
+		target = s->backend;
+	backend *current = compute_active_backend(s);
+	if (target == current) {
+		s->active_backend	= current;
+		s->active_is_mirror = (current == s->mirror_backend);
+		return OK;
+	}
+
+	if (target != s->backend && target != s->mirror_backend) {
+		ERROR("compute_switch_active_backend: target backend '%s' is neither primary nor mirror",
+			  target->name);
+		return ERR_UNSUPPORTED;
+	}
+
+	buffer *src_x =
+		s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
+	buffer *dst_x =
+		(target == s->mirror_backend) ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
+
+	backend *src_be = current;
+	if (src_be && src_be->synchronize)
+		src_be->synchronize(src_be);
+
+	status_code st = compute_copy_buffer_cross(s, src_x, dst_x, dim);
+	if (st != OK)
+		return st;
+
+	s->active_backend	= target;
+	s->active_is_mirror = (target == s->mirror_backend);
+	return OK;
+}
+
+status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n) {
+	if (!src || !dst || n <= 0)
+		return ERR_INVALID_ARG;
+
+	backend *src_owner = src->owner;
+	backend *dst_owner = dst->owner;
+
+	if (src_owner == dst_owner) {
+		if (src_owner && src_owner->copy_buffer)
+			return src_owner->copy_buffer(src_owner, src, dst, n);
+		if (src_owner && src_owner->buffer_read_f32 && src_owner->buffer_write_f32) {
+			status_code st = ensure_transfer_buf(s, (size_t)n);
+			if (st != OK)
+				return st;
+			st = src_owner->buffer_read_f32(src_owner, src, s->transfer_buf, n);
+			if (st != OK)
+				return st;
+			return src_owner->buffer_write_f32(src_owner, dst, s->transfer_buf, n);
+		}
+		if (src->host_ptr && dst->host_ptr) {
+			memcpy((void *)dst->host_ptr, src->host_ptr, (size_t)n * sizeof(float));
+			return OK;
+		}
+		return ERR_UNSUPPORTED;
+	}
+
+	if (src_owner && src_owner->synchronize)
+		src_owner->synchronize(src_owner);
+
+	status_code st = ensure_transfer_buf(s, (size_t)n);
+	if (st != OK)
+		return st;
+
+	if (src_owner && src_owner->buffer_read_f32) {
+		st = src_owner->buffer_read_f32(src_owner, src, s->transfer_buf, n);
+		if (st != OK)
+			return st;
+	} else if (src->host_ptr) {
+		memcpy(s->transfer_buf, src->host_ptr, (size_t)n * sizeof(float));
+	} else {
+		return ERR_UNSUPPORTED;
+	}
+
+	if (dst_owner && dst_owner->buffer_write_f32) {
+		return dst_owner->buffer_write_f32(dst_owner, dst, s->transfer_buf, n);
+	} else if (dst->host_ptr) {
+		memcpy((void *)dst->host_ptr, s->transfer_buf, (size_t)n * sizeof(float));
+		return OK;
+	}
+	return ERR_UNSUPPORTED;
 }

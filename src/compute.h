@@ -22,7 +22,6 @@ typedef struct compute_scratch {
 	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
 	float		*rope_cos_swa, *rope_sin_swa;
-	buffer		 ple_proj;
 	buffer		 ple_inp;
 	buffer		 ple_slice;
 	buffer		 ple_all;
@@ -37,6 +36,14 @@ typedef struct compute_scratch {
 	profile		 prof;
 
 	buffer slots[RECIPE_SLOT_MAX];
+
+	buffer	 mirror_slots[RECIPE_SLOT_MAX];
+	int		 mirror_slots_alloced;
+	backend *mirror_backend;
+	backend *active_backend;
+	int		 active_is_mirror;
+	float	*transfer_buf;
+	size_t	 transfer_buf_cap;
 
 	float *ple_inp_host;
 	float *cur_host;
@@ -84,5 +91,16 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  int flash_attn, float *logits_out);
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
+
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx);
+status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim);
+status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
+static inline backend *compute_active_backend(compute_scratch *s) {
+	return s->active_backend ? s->active_backend : s->backend;
+}
+
+static inline buffer *compute_slots_array(compute_scratch *s) {
+	return s->active_is_mirror ? s->mirror_slots : s->slots;
+}
 
 #endif

@@ -357,20 +357,26 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	return 0;
 }
 
-static status_code upload_tensor(model *m, const void *host_ptr, uint32_t type, int n_dims,
-								 uint64_t d0, uint64_t d1, weight_class wc, buffer *out) {
+static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
+									uint64_t d0, uint64_t d1, weight_class wc,
+									backend *target_backend, buffer *out) {
 	tensor_desc desc = {
 		.type	   = type,
 		.n_dims	   = n_dims,
 		.dims	   = {d0, d1, 0, 0},
 		.host_data = host_ptr,
 	};
-	backend	   *home = backend_weight_home(m->backend, wc);
+	backend	   *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
 	status_code s	 = home->buffer_alloc_weight(home, &desc, out);
 	if (s != OK)
 		return s;
 
 	return OK;
+}
+
+static status_code upload_tensor(model *m, const void *host_ptr, uint32_t type, int n_dims,
+								 uint64_t d0, uint64_t d1, weight_class wc, buffer *out) {
+	return upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, m->backend, out);
 }
 
 static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes) {
@@ -471,11 +477,11 @@ static void fill_expert_desc(struct expert_desc *ed, const void *gate_w, const v
 	ed->down_off	  = down_off;
 }
 
-static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t *type_io,
-										int n_dims, uint64_t d0, uint64_t d1, weight_class wc,
-										buffer *out) {
+static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint32_t *type_io,
+										   int n_dims, uint64_t d0, uint64_t d1, weight_class wc,
+										   backend *target_backend, buffer *out) {
 	uint32_t type = type_io ? *type_io : (host_ptr ? GGML_TYPE_F32 : 0);
-	backend *home = backend_weight_home(m->backend, wc);
+	backend *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
 
 	int home_is_cpu = (home && home->name && strcmp(home->name, "cpu") == 0);
 
@@ -528,10 +534,16 @@ static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t
 		return OK;
 	}
 
-	status_code s = upload_tensor(m, host_ptr, type, n_dims, d0, d1, wc, out);
+	status_code s = upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out);
 	if (s != OK)
 		return s;
 	return OK;
+}
+
+static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t *type_io,
+										int n_dims, uint64_t d0, uint64_t d1, weight_class wc,
+										buffer *out) {
+	return upload_tensor_repack_to(m, host_ptr, type_io, n_dims, d0, d1, wc, m->backend, out);
 }
 
 static void dequant_weight_to_f32(const void **w, uint32_t *type, size_t row_len, size_t n_rows) {
@@ -637,7 +649,8 @@ static void upload_embeddings(model *m) {
 
 static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	status_code	   s;
-	layer_weights *L = &m->layers[i];
+	layer_weights *L		= &m->layers[i];
+	backend		  *layer_be = model_layer_backend(m, i);
 
 	int q_out		 = m->n_heads * model_layer_head_dim(m, i);
 	int kv_out		 = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
@@ -648,16 +661,16 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
 		(ref)->type = (wtype);                                                                     \
-		s			= upload_tensor(m, (ref)->host_ptr, (ref)->type, (ndims), (d0), (d1), (wc),    \
-									&(ref)->buf);                                                  \
+		s = upload_tensor_to(m, (ref)->host_ptr, (ref)->type, (ndims), (d0), (d1), (wc), layer_be, \
+							 &(ref)->buf);                                                         \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
 
 #define UPLOAD_REP(ref, ndims, d0, d1, wc)                                                         \
 	do {                                                                                           \
-		s = upload_tensor_repack(m, (ref)->host_ptr, &(ref)->type, (ndims), (d0), (d1), (wc),      \
-								 &(ref)->buf);                                                     \
+		s = upload_tensor_repack_to(m, (ref)->host_ptr, &(ref)->type, (ndims), (d0), (d1), (wc),   \
+									layer_be, &(ref)->buf);                                        \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
@@ -760,8 +773,9 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 					build_fused_gate_up(m, L->shexp_gate_w.host_ptr, L->shexp_up_w.host_ptr,
 										L->shexp_gate_w.type, (uint64_t)m->dim, (uint64_t)sh_inter);
 				uint32_t fused_type = L->shexp_gate_w.type;
-				s = upload_tensor_repack(m, fused, &fused_type, 2, m->dim, (uint64_t)2 * sh_inter,
-										 WCLASS_MATMUL, &L->shexp_gate_w.buf);
+				s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
+											(uint64_t)2 * sh_inter, WCLASS_MATMUL, layer_be,
+											&L->shexp_gate_w.buf);
 				if (s != OK) {
 					free(fused);
 					return s;
@@ -811,8 +825,9 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 				build_fused_gate_up(m, L->gate_w.host_ptr, L->up_w.host_ptr, L->gate_w.type,
 									(uint64_t)m->dim, (uint64_t)intermediate);
 			uint32_t fused_type = L->gate_w.type;
-			s = upload_tensor_repack(m, fused, &fused_type, 2, m->dim, (uint64_t)2 * intermediate,
-									 WCLASS_MATMUL, &L->gate_up_w.buf);
+			s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
+										(uint64_t)2 * intermediate, WCLASS_MATMUL, layer_be,
+										&L->gate_up_w.buf);
 			if (s == OK) {
 				L->gate_up_w.type = fused_type;
 				L->gate_up_fused  = 1;
@@ -2108,8 +2123,26 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 	return OK;
 }
 
-status_code model_load_backend_ex_repack(model *m, const char *path, backend *accel, int use_mmap,
-										 const char *repack_config, int requested_n_ctx) {
+status_code model_set_layer_backend_range(model *m, int begin, int end, backend *b) {
+	if (!m || !m->layers || begin < 0 || end <= begin)
+		return ERR_INVALID_ARG;
+	if (end > m->n_layers)
+		end = m->n_layers;
+	if (!m->layer_backends) {
+		m->layer_backends	= xcalloc((size_t)m->n_layers, sizeof(backend *));
+		m->n_layer_backends = m->n_layers;
+		for (int i = 0; i < m->n_layers; i++)
+			m->layer_backends[i] = m->backend;
+	}
+	for (int i = begin; i < end; i++)
+		m->layer_backends[i] = b;
+	if (b != m->backend)
+		m->mixed_backend_mode = 1;
+	return OK;
+}
+
+status_code model_load_parse(model *m, const char *path, backend *accel, int use_mmap,
+							 const char *repack_config, int requested_n_ctx) {
 	memset(m, 0, sizeof(*m));
 	m->batchable = -1;
 	m->backend	 = accel;
@@ -2161,6 +2194,15 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *ac
 	recommend_memory_config(m, report_n_ctx, avail_before_load,
 							(kv_quant_type)config_get()->kv_quant);
 
+	return OK;
+
+fail:
+	ERROR("model_load_parse: aborting load of '%s' due to above error", path);
+	model_free(m);
+	return ERR_FORMAT;
+}
+
+status_code model_upload_weights(model *m) {
 	if (g_monitor && g_monitor->fd >= 0) {
 		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"upload_weights_start\"}");
 		monitor_poll(g_monitor);
@@ -2168,7 +2210,7 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *ac
 	uint64_t up_t0 = time_us();
 
 	if (upload_all_weights(m) != OK) {
-		goto fail;
+		return ERR_FORMAT;
 	}
 
 	INFO("weights uploaded in %llu ms", (unsigned long long)((time_us() - up_t0) / 1000));
@@ -2177,23 +2219,41 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *ac
 					 (unsigned long long)((time_us() - up_t0) / 1000));
 		monitor_poll(g_monitor);
 	}
+	return OK;
+}
 
+status_code model_build_recipe(model *m) {
 	m->recipe = recipe_build(m);
 	if (!m->recipe) {
 		ERROR("model_load: no recipe builder registered for arch '%s' "
 			  "— cannot load model",
 			  m->arch_info->gguf_name);
-		goto fail;
+		return ERR_FORMAT;
 	}
 	DEBUG("recipe: built for arch '%s' (pre=%d layer=%d post=%d ops)", m->arch_info->gguf_name,
 		  m->recipe->n_pre_ops, m->recipe->layer.n_ops, m->recipe->n_post_ops);
+	return OK;
+}
+
+status_code model_load_backend_ex_repack(model *m, const char *path, backend *accel, int use_mmap,
+										 const char *repack_config, int requested_n_ctx) {
+	status_code s = model_load_parse(m, path, accel, use_mmap, repack_config, requested_n_ctx);
+	if (s != OK)
+		return s;
+
+	s = model_upload_weights(m);
+	if (s != OK) {
+		model_free(m);
+		return s;
+	}
+
+	s = model_build_recipe(m);
+	if (s != OK) {
+		model_free(m);
+		return s;
+	}
 
 	return OK;
-
-fail:
-	ERROR("model_load: aborting load of '%s' due to above error", path);
-	model_free(m);
-	return ERR_FORMAT;
 }
 
 static void free_weight_buf(buffer *buf) {
@@ -2303,6 +2363,20 @@ void model_free(model *m) {
 	}
 	free(m->wrefs_by_layer);
 	m->wrefs_by_layer = NULL;
+
+	if (m->layer_backends) {
+		if (m->owns_backend) {
+			for (int i = 0; i < m->n_layer_backends; i++) {
+				if (m->layer_backends[i] && m->layer_backends[i] != m->backend &&
+					!backend_has_cap(m->layer_backends[i], BCAP_IS_HOST)) {
+					backend_destroy(m->layer_backends[i]);
+				}
+			}
+		}
+		free(m->layer_backends);
+		m->layer_backends	= NULL;
+		m->n_layer_backends = 0;
+	}
 
 	if (m->owns_backend)
 		backend_destroy(m->backend);

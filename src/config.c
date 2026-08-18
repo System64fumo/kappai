@@ -19,6 +19,7 @@ config config_defaults(void) {
 	c.reasoning		= true;
 	c.moe_stream	= true;
 	c.moe_cache_cap = 0;
+	c.ngl			= -1;
 
 	return c;
 }
@@ -53,6 +54,9 @@ void usage(FILE *fp) {
 			"  -c, --ctx-size <n>       context size (0 = from model)\n"
 			"  --accel <name>           accelerator backend (default: auto)\n"
 			"  --gpu-device <n>         GPU device index\n"
+			"  --ngl <n>                offload the first <n> layers to the --accel backend\n"
+			"                           and keep the remaining layers on CPU (-1 = all on accel,\n"
+			"                           0 = all on CPU; default: -1)\n"
 			"  --threads <n>            CPU worker threads (default: auto)\n"
 			"  -f, --flash-attn [on|off]  flash attention kernel (default: on)\n"
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
@@ -170,7 +174,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_DISABLE_FAILSAFES,
 		OPT_SHOW_TEMPLATE,
 		OPT_GREP_VOCAB,
-		OPT_KV_QUANT
+		OPT_KV_QUANT,
+		OPT_NGL
 	};
 
 	static struct option long_opts[] = {
@@ -208,6 +213,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"show-template", no_argument, NULL, OPT_SHOW_TEMPLATE},
 		{"grep-vocab", required_argument, NULL, OPT_GREP_VOCAB},
 		{"kv-quant", required_argument, NULL, OPT_KV_QUANT},
+		{"ngl", required_argument, NULL, OPT_NGL},
 		{0, 0, 0, 0}};
 
 	int c;
@@ -279,6 +285,9 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 			break;
 		case OPT_KV_QUANT:
 			parse_kv_quant(optarg, cfg);
+			break;
+		case OPT_NGL:
+			cfg->ngl = atoi(optarg);
 			break;
 		case OPT_DEBUG:
 			cfg->debug = 1;
