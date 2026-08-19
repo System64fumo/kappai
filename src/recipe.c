@@ -736,24 +736,35 @@ static status_code op_ple_build(exec_ctx *ctx) {
 					   m->layer_dims.per_layer_model_proj.type, inpL_host, ple_proj, total_ple,
 					   ple_dim);
 
+	backend *host = backend_host();
+
 	{
-		float scale = inv_sqrt_ple;
-		for (int i = 0; i < total_ple; i++)
-			ple_proj[i] *= scale;
+		buffer proj_view = {0};
+		proj_view.handle = ple_proj;
+		proj_view.owner	 = host;
+		host->scale_inplace(host, &proj_view, inv_sqrt_ple, total_ple);
 	}
 
 	{
-		const float *proj_norm_w = m->layer_dims.per_layer_proj_norm_w.host_ptr;
+		buffer		  w_view = {0};
+		w_view.handle		 = (void *)m->layer_dims.per_layer_proj_norm_w.host_ptr;
+		w_view.owner		 = host;
 		for (int l = 0; l < n_layers; l++) {
-			float *row = ple_proj + ((size_t)l * n_embd_per_layer);
-			rmsnorm(row, proj_norm_w, row, n_embd_per_layer, eps);
+			buffer row_view = {0};
+			row_view.handle = ple_proj + ((size_t)l * n_embd_per_layer);
+			row_view.owner	= host;
+			host->rmsnorm(host, &row_view, &w_view, &row_view, n_embd_per_layer, eps);
 		}
 	}
 
 	{
-		float scale = 0.70710678118654752f;
-		for (int i = 0; i < total_ple; i++)
-			ple[i] = (ple[i] + ple_proj[i]) * scale;
+		buffer ple_view	 = {0};
+		ple_view.handle	 = ple;
+		ple_view.owner	 = host;
+		buffer proj_view = {0};
+		proj_view.handle = ple_proj;
+		proj_view.owner	 = host;
+		host->ple_combine(host, &ple_view, &proj_view, total_ple, 0.70710678118654752f);
 	}
 
 	if (a->copy_buffer) {
@@ -1845,6 +1856,7 @@ struct batch_scratch {
 
 static void bs_ensure_wrap(batch_scratch *bs, float_buf *fb, buffer *buf, size_t n_elems,
 						   backend *ow) {
+	(void)bs;
 	float_buf_ensure(fb, n_elems);
 	buf->handle	  = fb->p;
 	buf->host_ptr = fb->p;

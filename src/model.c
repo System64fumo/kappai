@@ -80,8 +80,16 @@ static status_code req_f32(const gguf_ctx *g, const char *prefix, const char *su
 }
 
 static const gguf_tensor *find_tensor_fmt(const gguf_ctx *g, char *tname, size_t tname_sz,
+										  const char *fmt, int i)
+	__attribute__((format(printf, 4, 0)));
+
+static const gguf_tensor *find_tensor_fmt(const gguf_ctx *g, char *tname, size_t tname_sz,
 										  const char *fmt, int i) {
-	snprintf(tname, tname_sz, (const char *)fmt, i);
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+	snprintf(tname, tname_sz, fmt, i);
+#pragma GCC diagnostic pop
 	const gguf_tensor *t = gguf_find_tensor(g, tname);
 	if (!t)
 		ERROR("model_load: missing required tensor '%s'", tname);
@@ -127,14 +135,27 @@ static int require_dims_2d(const gguf_ctx *g, const char *name, uint64_t d0, uin
 }
 
 static int require_layer_dims_1d(const gguf_ctx *g, char *tname, size_t tname_sz, const char *fmt,
+								 int i, uint64_t d0) __attribute__((format(printf, 4, 0)));
+
+static int require_layer_dims_1d(const gguf_ctx *g, char *tname, size_t tname_sz, const char *fmt,
 								 int i, uint64_t d0) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
 	snprintf(tname, tname_sz, fmt, i);
+#pragma GCC diagnostic pop
 	return require_dims_1d(g, tname, d0);
 }
 
 static int require_layer_dims_2d(const gguf_ctx *g, char *tname, size_t tname_sz, const char *fmt,
+								 int i, uint64_t d0, uint64_t d1)
+	__attribute__((format(printf, 4, 0)));
+
+static int require_layer_dims_2d(const gguf_ctx *g, char *tname, size_t tname_sz, const char *fmt,
 								 int i, uint64_t d0, uint64_t d1) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
 	snprintf(tname, tname_sz, fmt, i);
+#pragma GCC diagnostic pop
 	return require_dims_2d(g, tname, d0, d1);
 }
 
@@ -1515,7 +1536,12 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 
 static status_code load_layer_tensor(const gguf_ctx *g, char *tname, size_t tname_sz, int i,
 									 layer_weights *L, weight_ref *ref, const char *fmt,
+									 int debug_first) __attribute__((format(printf, 7, 0)));
+
+static status_code load_layer_tensor(const gguf_ctx *g, char *tname, size_t tname_sz, int i,
+									 layer_weights *L, weight_ref *ref, const char *fmt,
 									 int debug_first) {
+	(void)L;
 	const gguf_tensor *t = find_tensor_fmt(g, tname, tname_sz, fmt, i);
 	if (!t)
 		return ERR_FORMAT;

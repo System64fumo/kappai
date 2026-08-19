@@ -73,7 +73,7 @@ void main() {
             for (int j = 0; j < 32; j++) {
                 int q = round_away(x_shared[x_base + j] * id);
                 if (q > 127) q = 127;
-                if (q < -127) q = -127;
+                if (q < -128) q = -128;
                 xq_shared[x_base + j] = q;
                 sum += q;
             }
@@ -112,7 +112,7 @@ void main() {
                     sumi0 += dotPacked4x8EXT(lo_nibbles, xq_word0);
                     sumi1 += dotPacked4x8EXT(hi_nibbles, xq_word1);
                 }
-                acc[r] += d * float(sumi0 + sumi1) + m;
+                acc[r] = fma(d, float(sumi0 + sumi1), m + acc[r]);
             }
         }
         barrier();

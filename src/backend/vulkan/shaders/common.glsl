@@ -14,6 +14,10 @@
 #define BLOCK_ELEMS_32  32
 #define BLOCK_ELEMS_256 256
 
+float bf16_to_float(uint b) {
+    return uintBitsToFloat(b << 16u);
+}
+
 float half_to_float(uint h) {
     uint w_bits = h << 16u;
     uint sign   = w_bits & 0x80000000u;

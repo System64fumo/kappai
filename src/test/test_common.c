@@ -75,6 +75,8 @@ const char *op_family_name(op_family f) {
 		[OPFAM_EDGE_CASE]		 = "edge_case",
 		[OPFAM_REPACK_PARITY]	 = "repack_parity",
 		[OPFAM_KV_QUANT_PARITY]	 = "kv_quant_parity",
+		[OPFAM_RMSNORM_ADD]		 = "rmsnorm_add",
+		[OPFAM_PLE_COMBINE]		 = "ple_combine",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";

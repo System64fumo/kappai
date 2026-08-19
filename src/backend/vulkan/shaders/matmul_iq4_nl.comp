@@ -133,7 +133,7 @@ void load_x_tile(int tile_start, int tile_len) {
     }
 }
 
-float dot_block_w0(uint block_off, int x_base, float d_xq) {
+float dot_block_w0(uint block_off, int x_base, float d_xq, float acc) {
     float d = half_to_float(w0_read_u16(block_off)) * d_xq;
     uint qs_off = block_off + 2u;
 
@@ -178,10 +178,10 @@ float dot_block_w0(uint block_off, int x_base, float d_xq) {
                                       int8_t(xq_shared[x_base + j + 19])));
         sumi += dotPacked4x8EXT(w_word1, xq_word1);
     }
-    return d * float(sumi);
+    return fma(d, float(sumi), acc);
 }
 
-float dot_block_w1(uint block_off, int x_base, float d_xq) {
+float dot_block_w1(uint block_off, int x_base, float d_xq, float acc) {
     float d = half_to_float(w1_read_u16(block_off)) * d_xq;
     uint qs_off = block_off + 2u;
 
@@ -226,10 +226,10 @@ float dot_block_w1(uint block_off, int x_base, float d_xq) {
                                       int8_t(xq_shared[x_base + j + 19])));
         sumi += dotPacked4x8EXT(w_word1, xq_word1);
     }
-    return d * float(sumi);
+    return fma(d, float(sumi), acc);
 }
 
-float dot_block_w2(uint block_off, int x_base, float d_xq) {
+float dot_block_w2(uint block_off, int x_base, float d_xq, float acc) {
     float d = half_to_float(w2_read_u16(block_off)) * d_xq;
     uint qs_off = block_off + 2u;
 
@@ -274,7 +274,7 @@ float dot_block_w2(uint block_off, int x_base, float d_xq) {
                                       int8_t(xq_shared[x_base + j + 19])));
         sumi += dotPacked4x8EXT(w_word1, xq_word1);
     }
-    return d * float(sumi);
+    return fma(d, float(sumi), acc);
 }
 
 void main() {
@@ -343,7 +343,7 @@ void main() {
                 uint row_idx = base_i + uint(r);
                 uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
                                + uint(bi) * IQ4_NL_BLOCK_BYTES;
-                acc0[r] += dot_block_w0(block_off, x_base, d_xq);
+                acc0[r] = dot_block_w0(block_off, x_base, d_xq, acc0[r]);
             }
 
             if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
@@ -352,7 +352,7 @@ void main() {
                     uint row_idx = base_i + uint(r);
                     uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
                                    + uint(bi) * IQ4_NL_BLOCK_BYTES;
-                    acc1[r] += dot_block_w1(block_off, x_base, d_xq);
+                    acc1[r] = dot_block_w1(block_off, x_base, d_xq, acc1[r]);
                 }
             }
 
@@ -362,7 +362,7 @@ void main() {
                     uint row_idx = base_i + uint(r);
                     uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES
                                    + uint(bi) * IQ4_NL_BLOCK_BYTES;
-                    acc2[r] += dot_block_w2(block_off, x_base, d_xq);
+                    acc2[r] = dot_block_w2(block_off, x_base, d_xq, acc2[r]);
                 }
             }
         }

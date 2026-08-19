@@ -65,14 +65,17 @@ static inline int kvcache_slot_on_host(const kvcache *c, int slot) {
 }
 
 static inline buffer *kvcache_k_for_layer(kvcache *c, const model *m, int layer) {
+	(void)m;
 	return kvcache_slot_on_host(c, layer) ? &c->k_host : &c->k;
 }
 
 static inline buffer *kvcache_v_for_layer(kvcache *c, const model *m, int layer) {
+	(void)m;
 	return kvcache_slot_on_host(c, layer) ? &c->v_host : &c->v;
 }
 
 static inline backend *kvcache_backend_for_layer(kvcache *c, const model *m, int layer) {
+	(void)m;
 	return kvcache_slot_on_host(c, layer) ? (c->k_host.owner ? c->k_host.owner : backend_host())
 										  : (c->k.owner ? c->k.owner : c->backend);
 }

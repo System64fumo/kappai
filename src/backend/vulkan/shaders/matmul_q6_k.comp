@@ -149,6 +149,7 @@ void main() {
                 for (int j = 0; j < 256; j++) {
                     int v = nearest_int(iscale * x_shared[x_base + j]);
                     if (v > 127) v = 127;
+                    if (v < -127) v = -127;
                     xq_shared[x_base + j] = v;
                 }
                 xq_d[local_bi] = 1.0 / iscale;
@@ -235,7 +236,7 @@ void main() {
                         acc1_l += s * l1;
                     }
                 }
-                acc0 += d * float(acc0_l + acc1_l);
+                acc0 = fma(d, float(acc0_l + acc1_l), acc0);
             }
         }
 
@@ -319,7 +320,7 @@ void main() {
                         acc1_l += s * l1;
                     }
                 }
-                acc1 += d * float(acc0_l + acc1_l);
+                acc1 = fma(d, float(acc0_l + acc1_l), acc1);
             }
         }
 #endif

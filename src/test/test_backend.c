@@ -637,6 +637,129 @@ static void test_op_add_inplace(backend *cpu, backend *tgt, int n) {
 	tgt->buffer_free(tgt, &y_tgt);
 }
 
+static void test_op_ple_combine(backend *cpu, backend *tgt, int n) {
+	if (!tgt->ple_combine) {
+		char label[96];
+		snprintf(label, sizeof(label), "ple_combine N=%d (%s)", n, tgt->name);
+		record_result(OPFAM_PLE_COMBINE, label, V_SKIP, "backend has no native ple_combine");
+		return;
+	}
+	float *ple	= xmalloc((size_t)n * sizeof(float));
+	float *proj = xmalloc((size_t)n * sizeof(float));
+	seed_test_rng(0xFE1E0ULL + (uint64_t)n);
+	fill_random_f32(ple, n, 1.0f);
+	fill_random_f32(proj, n, 1.0f);
+	const float combine_scale = 0.70710678118654752f;
+
+	buffer ple_cpu	= {0};
+	buffer proj_cpu = {0};
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &ple_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &proj_cpu);
+	cpu->buffer_write_f32(cpu, &ple_cpu, ple, n);
+	cpu->buffer_write_f32(cpu, &proj_cpu, proj, n);
+	cpu->ple_combine(cpu, &ple_cpu, &proj_cpu, n, combine_scale);
+	if (cpu->synchronize)
+		cpu->synchronize(cpu);
+	float *r_ref = xmalloc((size_t)n * sizeof(float));
+	cpu->buffer_read_f32(cpu, &ple_cpu, r_ref, n);
+
+	buffer ple_tgt	= {0};
+	buffer proj_tgt = {0};
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &ple_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &proj_tgt);
+	tgt->buffer_write_f32(tgt, &ple_tgt, ple, n);
+	tgt->buffer_write_f32(tgt, &proj_tgt, proj, n);
+	status_code s_tgt = tgt->ple_combine(tgt, &ple_tgt, &proj_tgt, n, combine_scale);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *r_got = xmalloc((size_t)n * sizeof(float));
+	tgt->buffer_read_f32(tgt, &ple_tgt, r_got, n);
+
+	char label[96];
+	char detail[256];
+	snprintf(label, sizeof(label), "ple_combine N=%d", n);
+	verdict v = classify_output("tight", r_ref, r_got, n, s_tgt, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(r_ref, r_got, n);
+	record_result(OPFAM_PLE_COMBINE, label, v, detail);
+
+	free(ple);
+	free(proj);
+	free(r_ref);
+	free(r_got);
+	cpu->buffer_free(cpu, &ple_cpu);
+	cpu->buffer_free(cpu, &proj_cpu);
+	tgt->buffer_free(tgt, &ple_tgt);
+	tgt->buffer_free(tgt, &proj_tgt);
+}
+
+static void test_op_rmsnorm_add(backend *cpu, backend *tgt, int n) {
+	if (!tgt->rmsnorm_add || !backend_has_cap(tgt, BCAP_RMSNORM_ADD)) {
+		char label[96];
+		snprintf(label, sizeof(label), "rmsnorm_add N=%d (%s)", n, tgt->name);
+		record_result(OPFAM_RMSNORM_ADD, label, V_SKIP, "backend has no native rmsnorm_add");
+		return;
+	}
+	float *x		= xmalloc((size_t)n * sizeof(float));
+	float *w		= xmalloc((size_t)n * sizeof(float));
+	float *residual = xmalloc((size_t)n * sizeof(float));
+	seed_test_rng(0xADD2ULL + (uint64_t)n);
+	fill_random_f32(x, n, 1.0f);
+	fill_random_f32(w, n, 1.0f);
+	fill_random_f32(residual, n, 1.0f);
+	const float eps = 1e-6f;
+
+	buffer x_cpu = {0}, w_cpu = {0}, r_cpu = {0}, y_cpu = {0};
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &x_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &w_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &r_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &y_cpu);
+	cpu->buffer_write_f32(cpu, &x_cpu, x, n);
+	cpu->buffer_write_f32(cpu, &w_cpu, w, n);
+	cpu->buffer_write_f32(cpu, &r_cpu, residual, n);
+	cpu->rmsnorm_add(cpu, &x_cpu, &w_cpu, &r_cpu, &y_cpu, n, eps);
+	if (cpu->synchronize)
+		cpu->synchronize(cpu);
+	float *r_ref = xmalloc((size_t)n * sizeof(float));
+	cpu->buffer_read_f32(cpu, &y_cpu, r_ref, n);
+
+	buffer x_tgt = {0}, w_tgt = {0}, r_tgt = {0}, y_tgt = {0};
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &x_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &w_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &r_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &y_tgt);
+	tgt->buffer_write_f32(tgt, &x_tgt, x, n);
+	tgt->buffer_write_f32(tgt, &w_tgt, w, n);
+	tgt->buffer_write_f32(tgt, &r_tgt, residual, n);
+	status_code s_tgt = tgt->rmsnorm_add(tgt, &x_tgt, &w_tgt, &r_tgt, &y_tgt, n, eps);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *r_got = xmalloc((size_t)n * sizeof(float));
+	tgt->buffer_read_f32(tgt, &y_tgt, r_got, n);
+
+	char label[96];
+	char detail[256];
+	snprintf(label, sizeof(label), "rmsnorm_add N=%d", n);
+	verdict v = classify_output("loose", r_ref, r_got, n, s_tgt, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(r_ref, r_got, n);
+	record_result(OPFAM_RMSNORM_ADD, label, v, detail);
+
+	free(x);
+	free(w);
+	free(residual);
+	free(r_ref);
+	free(r_got);
+	cpu->buffer_free(cpu, &x_cpu);
+	cpu->buffer_free(cpu, &w_cpu);
+	cpu->buffer_free(cpu, &r_cpu);
+	cpu->buffer_free(cpu, &y_cpu);
+	tgt->buffer_free(tgt, &x_tgt);
+	tgt->buffer_free(tgt, &w_tgt);
+	tgt->buffer_free(tgt, &r_tgt);
+	tgt->buffer_free(tgt, &y_tgt);
+}
+
 static void test_op_ffn_activate(backend *cpu, backend *tgt, int n) {
 	if (!tgt->ffn_activate) {
 		char label[96];
@@ -2254,6 +2377,14 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	test_op_add_inplace(cpu, tgt, 256);
 	test_op_add_inplace(cpu, tgt, 4096);
 	flush_family(OPFAM_ADD_INPLACE);
+
+	test_op_ple_combine(cpu, tgt, 256);
+	test_op_ple_combine(cpu, tgt, 4096);
+	flush_family(OPFAM_PLE_COMBINE);
+
+	test_op_rmsnorm_add(cpu, tgt, 256);
+	test_op_rmsnorm_add(cpu, tgt, 4096);
+	flush_family(OPFAM_RMSNORM_ADD);
 
 	test_op_ffn_activate(cpu, tgt, 256);
 	test_op_ffn_activate(cpu, tgt, 4096);
