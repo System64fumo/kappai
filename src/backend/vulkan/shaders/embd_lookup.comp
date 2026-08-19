@@ -235,6 +235,9 @@ void main() {
         val = d_w * sval * float(g);
         break;
     }
+    case 30:
+        val = bf16_to_float(embd_read_u16(row_off + d * 2u));
+        break;
     default:
         val = 0.0;
         break;

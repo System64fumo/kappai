@@ -9,7 +9,7 @@
 
 #define MATMUL_MR 8
 
-static inline float q4_0_dot(const q4_0_block *blk, const int8_t *xq8, float d_xq) {
+static inline float q4_0_dot(const q4_0_block *blk, const int8_t *xq8, float d_xq, float acc) {
 	const uint8_t *qs	 = blk->qs;
 	int			   sumi0 = 0;
 	int			   sumi1 = 0;
@@ -17,18 +17,18 @@ static inline float q4_0_dot(const q4_0_block *blk, const int8_t *xq8, float d_x
 		sumi0 += ((int)(qs[j] & 0xF) - 8) * (int)xq8[j];
 		sumi1 += ((int)(qs[j] >> 4) - 8) * (int)xq8[j + 16];
 	}
-	return f16_to_f32(blk->d) * d_xq * (float)(sumi0 + sumi1);
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)(sumi0 + sumi1), acc);
 }
 
-static inline float q8_0_dot(const q8_0_block *blk, const int8_t *xq8, float d_xq) {
+static inline float q8_0_dot(const q8_0_block *blk, const int8_t *xq8, float d_xq, float acc) {
 	const int8_t *qs   = blk->qs;
 	int			  sumi = 0;
 	for (int j = 0; j < 32; j++)
 		sumi += (int)qs[j] * (int)xq8[j];
-	return f16_to_f32(blk->d) * d_xq * (float)sumi;
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)sumi, acc);
 }
 
-static inline float iq4_nl_dot(const iq4_nl_block *blk, const int8_t *xq8, float d_xq) {
+static inline float iq4_nl_dot(const iq4_nl_block *blk, const int8_t *xq8, float d_xq, float acc) {
 	const uint8_t *qs	 = blk->qs;
 	int			   sumi0 = 0;
 	int			   sumi1 = 0;
@@ -36,10 +36,12 @@ static inline float iq4_nl_dot(const iq4_nl_block *blk, const int8_t *xq8, float
 		sumi0 += (int)xq8[j] * (int)kvalues_iq4nl[qs[j] & 0xF];
 		sumi1 += (int)xq8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
 	}
-	return f16_to_f32(blk->d) * d_xq * (float)(sumi0 + sumi1);
+	const float scaled = f16_to_f32(blk->d) * d_xq;
+	return fmaf(scaled, (float)(sumi0 + sumi1), acc);
 }
 
-static inline float q4_1_dot(const q4_1_block *blk, const int8_t *xq8, float d_xq, float s_xq) {
+static inline float q4_1_dot(const q4_1_block *blk, const int8_t *xq8, float d_xq, float s_xq,
+							 float acc) {
 	const uint8_t *qs	 = blk->qs;
 	int			   sumi0 = 0;
 	int			   sumi1 = 0;
@@ -47,10 +49,10 @@ static inline float q4_1_dot(const q4_1_block *blk, const int8_t *xq8, float d_x
 		sumi0 += (int)(qs[j] & 0xF) * (int)xq8[j];
 		sumi1 += (int)(qs[j] >> 4) * (int)xq8[j + 16];
 	}
-	return (f16_to_f32(blk->d) * d_xq * (float)(sumi0 + sumi1)) + (f16_to_f32(blk->m) * s_xq);
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)(sumi0 + sumi1), f16_to_f32(blk->m) * s_xq + acc);
 }
 
-static inline float q5_0_dot(const q5_0_block *blk, const int8_t *xq8, float d_xq) {
+static inline float q5_0_dot(const q5_0_block *blk, const int8_t *xq8, float d_xq, float acc) {
 	const uint8_t *qs = blk->qs;
 	uint32_t	   qh;
 	memcpy(&qh, blk->qh, 4);
@@ -62,10 +64,11 @@ static inline float q5_0_dot(const q5_0_block *blk, const int8_t *xq8, float d_x
 		sumi0 += (lo - 16) * (int)xq8[j];
 		sumi1 += (hi - 16) * (int)xq8[j + 16];
 	}
-	return f16_to_f32(blk->d) * d_xq * (float)(sumi0 + sumi1);
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)(sumi0 + sumi1), acc);
 }
 
-static inline float q5_1_dot(const q5_1_block *blk, const int8_t *xq8, float d_xq, float s_xq) {
+static inline float q5_1_dot(const q5_1_block *blk, const int8_t *xq8, float d_xq, float s_xq,
+							 float acc) {
 	const uint8_t *qs = blk->qs;
 	uint32_t	   qh;
 	memcpy(&qh, blk->qh, 4);
@@ -77,11 +80,11 @@ static inline float q5_1_dot(const q5_1_block *blk, const int8_t *xq8, float d_x
 		sumi0 += lo * (int)xq8[j];
 		sumi1 += hi * (int)xq8[j + 16];
 	}
-	return (f16_to_f32(blk->d) * d_xq * (float)(sumi0 + sumi1)) + (f16_to_f32(blk->m) * s_xq);
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)(sumi0 + sumi1), f16_to_f32(blk->m) * s_xq + acc);
 }
 
-static inline float q6_k_dot(const q6_k_block *blk, const int8_t *xq8, float d_xq,
-							 int8_t *q_unpack) {
+static inline float q6_k_dot(const q6_k_block *blk, const int8_t *xq8, float d_xq, int8_t *q_unpack,
+							 float acc) {
 	const uint8_t *ql = blk->ql;
 	const uint8_t *qh = blk->qh;
 	int8_t		  *a  = q_unpack;
@@ -114,11 +117,11 @@ static inline float q6_k_dot(const q6_k_block *blk, const int8_t *xq8, float d_x
 		q8 += 16;
 		a += 16;
 	}
-	return f16_to_f32(blk->d) * d_xq * (float)(acc0 + acc1);
+	return fmaf(f16_to_f32(blk->d) * d_xq, (float)(acc0 + acc1), acc);
 }
 
-static inline float q4_k_dot(const q4_k_block *blk, const int8_t *xq8, const int16_t *bs,
-							 float xd) {
+static inline float q4_k_dot(const q4_k_block *blk, const int8_t *xq8, const int16_t *bs, float xd,
+							 float acc) {
 	const float	   d	  = f16_to_f32(blk->d);
 	const float	   dmin	  = f16_to_f32(blk->dmin);
 	const uint8_t *qbytes = blk->qs;
@@ -153,11 +156,11 @@ static inline float q4_k_dot(const q4_k_block *blk, const int8_t *xq8, const int
 		ib += 2;
 		is += 2;
 	}
-	return xd * ((d * (float)sumi) - (dmin * (float)summ));
+	return fmaf(xd, (d * (float)sumi) - (dmin * (float)summ), acc);
 }
 
-static inline float q5_k_dot(const q5_k_block *blk, const int8_t *xq8, const int16_t *bs,
-							 float xd) {
+static inline float q5_k_dot(const q5_k_block *blk, const int8_t *xq8, const int16_t *bs, float xd,
+							 float acc) {
 	const float	   d	  = f16_to_f32(blk->d);
 	const float	   dmin	  = f16_to_f32(blk->dmin);
 	const uint8_t *qbytes = blk->qs;
@@ -199,7 +202,7 @@ static inline float q5_k_dot(const q5_k_block *blk, const int8_t *xq8, const int
 		u1 <<= 2;
 		u2 <<= 2;
 	}
-	return xd * ((d * (float)sumi) - (dmin * (float)summ));
+	return fmaf(xd, (d * (float)sumi) - (dmin * (float)summ), acc);
 }
 
 #define IQ3_S_RE_OFF_D 0
@@ -686,7 +689,7 @@ static void matmul_iq3_s_q8_k_qonly_f32_row(const void *w, const q8_k_block *res
 					group_sum += (int32_t)a[(g * 32) + j] * (int32_t)q8[(g * 32) + j];
 				total += sc * group_sum;
 			}
-			sumf += d * (float)total;
+			sumf = fmaf(d, (float)total, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -892,10 +895,13 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 					}
 					total += sc * group_sum;
 				}
-				sumf[r] += f16_to_f32(dst_d[r]) * yb->d * (float)total;
+				sumf[r] = fmaf(f16_to_f32(dst_d[r]) * yb->d, (float)total, sumf[r]);
 			}
 		}
-		for (int r = 0; r < IQ3_S_RE8_ROWS; r++)
+		int rows_out = n - g;
+		if (rows_out > IQ3_S_RE8_ROWS)
+			rows_out = IQ3_S_RE8_ROWS;
+		for (int r = 0; r < rows_out; r++)
 			y[g + r] = sumf[r];
 	}
 }
@@ -1108,10 +1114,13 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *r
 					sumi += (int32_t)kvalues_iq4nl[row_qs[j] & 0xF] * (int32_t)xq8[j];
 					sumi += (int32_t)kvalues_iq4nl[row_qs[j] >> 4] * (int32_t)xq8[j + 16];
 				}
-				sumf[r] += f16_to_f32(d_w[r]) * d_xq * (float)sumi;
+				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < IQ4_NL_R8_ROWS; r++)
+		int rows_out = n - g;
+		if (rows_out > IQ4_NL_R8_ROWS)
+			rows_out = IQ4_NL_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
 			y[g + r] = sumf[r];
 	}
 }
@@ -1175,10 +1184,13 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 				int32_t		  sumi	 = 0;
 				for (int j = 0; j < 32; j++)
 					sumi += (int32_t)row_qs[j] * (int32_t)xq8[j];
-				sumf[r] += f16_to_f32(d_w[r]) * d_xq * (float)sumi;
+				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < Q8_0_R8_ROWS; r++)
+		int rows_out = n - g;
+		if (rows_out > Q8_0_R8_ROWS)
+			rows_out = Q8_0_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
 			y[g + r] = sumf[r];
 	}
 }
@@ -1244,10 +1256,13 @@ static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 					sumi += ((int32_t)(row_qs[j] & 0xF) - 8) * (int32_t)xq8[j];
 					sumi += ((int32_t)(row_qs[j] >> 4) - 8) * (int32_t)xq8[j + 16];
 				}
-				sumf[r] += f16_to_f32(d_w[r]) * d_xq * (float)sumi;
+				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < Q4_0_R8_ROWS; r++)
+		int rows_out = n - g;
+		if (rows_out > Q4_0_R8_ROWS)
+			rows_out = Q4_0_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
 			y[g + r] = sumf[r];
 	}
 }
@@ -1470,13 +1485,6 @@ __attribute__((weak)) void quantize_q8_1(const float *x, void *dst, int n) {
 	}
 }
 
-static inline int nearest_int(float fval) {
-	float val = fval + 12582912.0f;
-	int	  i;
-	memcpy(&i, &val, sizeof(int));
-	return (i & 0x007fffff) - 0x00400000;
-}
-
 __attribute__((weak)) void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 	int nb = n / 256;
 	for (int i = 0; i < nb; i++) {
@@ -1498,9 +1506,11 @@ __attribute__((weak)) void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 		}
 		float iscale = -127.0f / max;
 		for (int j = 0; j < 256; j++) {
-			int v = nearest_int(iscale * x[j]);
+			int v = (int)roundf(iscale * x[j]);
 			if (v > 127)
 				v = 127;
+			if (v < -127)
+				v = -127;
 			y[i].qs[j] = (int8_t)v;
 		}
 		for (int j = 0; j < 16; j++) {
@@ -1548,7 +1558,7 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const q4_0_block *row =
 						(const q4_0_block *)(row_base[r] + ((size_t)bi * sizeof(q4_0_block)));
-					sumf[r] += q4_0_dot(row, xq8, d_xq);
+					sumf[r] = q4_0_dot(row, xq8, d_xq, sumf[r]);
 				}
 			}
 		}
@@ -1563,7 +1573,7 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
-			sumf += q4_0_dot(&row[bi], xq8, d_xq);
+			sumf					   = q4_0_dot(&row[bi], xq8, d_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1597,7 +1607,7 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const q8_0_block *row =
 						(const q8_0_block *)(row_base[r] + ((size_t)bi * sizeof(q8_0_block)));
-					sumf[r] += q8_0_dot(row, xq8, d_xq);
+					sumf[r] = q8_0_dot(row, xq8, d_xq, sumf[r]);
 				}
 			}
 		}
@@ -1612,7 +1622,7 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
-			sumf += q8_0_dot(&row[bi], xq8, d_xq);
+			sumf					   = q8_0_dot(&row[bi], xq8, d_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1650,7 +1660,7 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const iq4_nl_block *row =
 						(const iq4_nl_block *)(row_base[r] + ((size_t)bi * sizeof(iq4_nl_block)));
-					sumf[r] += iq4_nl_dot(row, xq8, d_xq);
+					sumf[r] = iq4_nl_dot(row, xq8, d_xq, sumf[r]);
 				}
 			}
 		}
@@ -1665,7 +1675,7 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
-			sumf += iq4_nl_dot(&row[bi], xq8, d_xq);
+			sumf					   = iq4_nl_dot(&row[bi], xq8, d_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1702,7 +1712,7 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const q4_1_block *row =
 						(const q4_1_block *)(row_base[r] + ((size_t)bi * sizeof(q4_1_block)));
-					sumf[r] += q4_1_dot(row, xq8, d_xq, s_xq);
+					sumf[r] = q4_1_dot(row, xq8, d_xq, s_xq, sumf[r]);
 				}
 			}
 		}
@@ -1718,7 +1728,7 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
 			const float s_xq		   = f16_to_f32(xq[bi].s);
-			sumf += q4_1_dot(&row[bi], xq8, d_xq, s_xq);
+			sumf					   = q4_1_dot(&row[bi], xq8, d_xq, s_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1754,7 +1764,7 @@ static void matmul_q5_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const q5_0_block *row =
 						(const q5_0_block *)(row_base[r] + ((size_t)bi * sizeof(q5_0_block)));
-					sumf[r] += q5_0_dot(row, xq8, d_xq);
+					sumf[r] = q5_0_dot(row, xq8, d_xq, sumf[r]);
 				}
 			}
 		}
@@ -1769,7 +1779,7 @@ static void matmul_q5_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
-			sumf += q5_0_dot(&row[bi], xq8, d_xq);
+			sumf					   = q5_0_dot(&row[bi], xq8, d_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1806,7 +1816,7 @@ static void matmul_q5_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 				for (int r = 0; r < MATMUL_MR; r++) {
 					const q5_1_block *row =
 						(const q5_1_block *)(row_base[r] + ((size_t)bi * sizeof(q5_1_block)));
-					sumf[r] += q5_1_dot(row, xq8, d_xq, s_xq);
+					sumf[r] = q5_1_dot(row, xq8, d_xq, s_xq, sumf[r]);
 				}
 			}
 		}
@@ -1822,7 +1832,7 @@ static void matmul_q5_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
 			const float s_xq		   = f16_to_f32(xq[bi].s);
-			sumf += q5_1_dot(&row[bi], xq8, d_xq, s_xq);
+			sumf					   = q5_1_dot(&row[bi], xq8, d_xq, s_xq, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1856,7 +1866,7 @@ static void matmul_q6_k_q8_qonly_f32_row(const void *w, const q8_k_block *restri
 			for (int r = 0; r < MATMUL_MR; r++) {
 				const q6_k_block *restrict b =
 					(const q6_k_block *)(row_base[r] + ((size_t)bi * sizeof(q6_k_block)));
-				sumf[r] += q6_k_dot(b, yb->qs, d_xq, q_unpack);
+				sumf[r] = q6_k_dot(b, yb->qs, d_xq, q_unpack, sumf[r]);
 			}
 		}
 		for (int r = 0; r < MATMUL_MR; r++)
@@ -1869,7 +1879,7 @@ static void matmul_q6_k_q8_qonly_f32_row(const void *w, const q8_k_block *restri
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const q8_k_block *restrict yb = &xq[bi];
 			const float d_xq			  = yb->d;
-			sumf += q6_k_dot(&bx[bi], yb->qs, d_xq, q_unpack);
+			sumf						  = q6_k_dot(&bx[bi], yb->qs, d_xq, q_unpack, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1904,7 +1914,7 @@ static void matmul_q4_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			for (int r = 0; r < MATMUL_MR; r++) {
 				const q4_k_block *restrict b =
 					(const q4_k_block *)(row_base[r] + ((size_t)bi * sizeof(q4_k_block)));
-				sumf[r] += q4_k_dot(b, xq8, bs, xd);
+				sumf[r] = q4_k_dot(b, xq8, bs, xd, sumf[r]);
 			}
 		}
 		for (int r = 0; r < MATMUL_MR; r++)
@@ -1920,7 +1930,7 @@ static void matmul_q4_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			const float xd				  = xb->d;
 			const int8_t *restrict xq8	  = xb->qs;
 			const int16_t *restrict bs	  = xb->bsums;
-			sumf += q4_k_dot(&row[bi], xq8, bs, xd);
+			sumf						  = q4_k_dot(&row[bi], xq8, bs, xd, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -1955,7 +1965,7 @@ static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			for (int r = 0; r < MATMUL_MR; r++) {
 				const q5_k_block *restrict b =
 					(const q5_k_block *)(row_base[r] + ((size_t)bi * sizeof(q5_k_block)));
-				sumf[r] += q5_k_dot(b, xq8, bs, xd);
+				sumf[r] = q5_k_dot(b, xq8, bs, xd, sumf[r]);
 			}
 		}
 		for (int r = 0; r < MATMUL_MR; r++)
@@ -1971,7 +1981,7 @@ static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			const float xd				  = xb->d;
 			const int8_t *restrict xq8	  = xb->qs;
 			const int16_t *restrict bs	  = xb->bsums;
-			sumf += q5_k_dot(&row[bi], xq8, bs, xd);
+			sumf						  = q5_k_dot(&row[bi], xq8, bs, xd, sumf);
 		}
 		y[i] = sumf;
 	}

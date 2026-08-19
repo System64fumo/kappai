@@ -103,7 +103,7 @@ void main() {
             for (int j = 0; j < 32; j++) {
                 int q = round_away(x_shared[x_base + j] * id);
                 if (q > 127) q = 127;
-                if (q < -127) q = -127;
+                if (q < -128) q = -128;
                 xq_shared[x_base + j] = q;
                 sum += q;
             }
@@ -149,7 +149,7 @@ void main() {
                 }
 
                 int corrected = sumi - 8 * xsum;
-                acc0[r] += d * float(corrected);
+                acc0[r] = fma(d, float(corrected), acc0[r]);
             }
 
 #if NMAT >= 2
@@ -172,7 +172,7 @@ void main() {
                 }
 
                 int corrected = sumi - 8 * xsum;
-                acc1[r] += d * float(corrected);
+                acc1[r] = fma(d, float(corrected), acc1[r]);
             }
 #endif
         }

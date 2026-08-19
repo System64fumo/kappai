@@ -100,7 +100,7 @@ void main() {
                           + q2 * xq[j + 2]
                           + q3 * xq[j + 3];
                 }
-                acc[r] += d * dx_scale * float(sumi);
+                acc[r] = fma(d * dx_scale, float(sumi), acc[r]);
             }
         }
         barrier();

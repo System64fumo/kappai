@@ -1984,7 +1984,7 @@ static void cpu_ffn_act_batch_chunk(int begin, int end, int tid, void *ctx) {
 		float		*o = j->o + ((size_t)row * j->n);
 		if (j->activation == 1) {
 			for (int i = 0; i < j->n; i++)
-				o[i] = 0.5f * g[i] * (1.0f + erff(g[i] * 0.7071067811865475f)) * u[i];
+				o[i] = gelu_tanh(g[i]) * u[i];
 		} else {
 			for (int i = 0; i < j->n; i++) {
 				float gv = g[i];
@@ -2383,7 +2383,7 @@ static status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *pro
 	float		*pf = cpu_ptr(ple);
 	const float *pr = cpu_ptr(proj);
 	for (int i = 0; i < n; i++)
-		pf[i] = pf[i] + (pr[i] * combine_scale);
+		pf[i] = (pf[i] + pr[i]) * combine_scale;
 	return OK;
 }
 
@@ -2394,10 +2394,8 @@ __attribute__((weak)) void cpu_ffn_down_act_chunk(int begin, int end, int tid, v
 	const float *restrict u	 = a->u;
 	float *restrict o		 = a->o;
 	if (a->activation == 1) {
-		for (int i = begin; i < end; i++) {
-			float gv = g[i];
-			o[i]	 = 0.5f * gv * (1.0f + erff(gv * 0.7071067811865475f)) * u[i];
-		}
+		for (int i = begin; i < end; i++)
+			o[i] = gelu_tanh(g[i]) * u[i];
 	} else {
 		for (int i = begin; i < end; i++) {
 			float gv = g[i];

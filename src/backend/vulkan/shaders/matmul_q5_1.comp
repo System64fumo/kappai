@@ -1,5 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
 layout(local_size_x_id = 0) in;
 
 layout(set = 0, binding = 0) readonly buffer W0Buf { uint w0[]; };
@@ -28,6 +32,9 @@ layout(constant_id = 2) const int TILE_K = 2048;
 #undef W_PFX
 
 shared float x_shared[TILE_K];
+shared int   xq_shared[TILE_K];
+shared float xq_d[TILE_K / 32];
+shared float xq_s[TILE_K / 32];
 
 void main() {
     uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
@@ -51,33 +58,81 @@ void main() {
 
         int block_start = tile_start / 32;
         int block_end   = tile_end / 32;
+
+        for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+            int x_base = bi * 32 - tile_start;
+            float amax = 0.0;
+            for (int j = 0; j < 32; j++) {
+                float ax = abs(x_shared[x_base + j]);
+                if (ax > amax) amax = ax;
+            }
+            float d = amax / 127.0;
+            float id = d > 0.0 ? 1.0 / d : 0.0;
+            xq_d[bi - block_start] = f32_to_f16_to_f32(d);
+            int sum = 0;
+            for (int j = 0; j < 32; j++) {
+                int q = round_away(x_shared[x_base + j] * id);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                xq_shared[x_base + j] = q;
+                sum += q;
+            }
+            xq_s[bi - block_start] = f32_to_f16_to_f32(d * float(sum));
+        }
+        barrier();
+
         for (int bi = block_start; bi < block_end; bi++) {
             int x_base = bi * 32 - tile_start;
-            float xv[32];
-            for (int j = 0; j < 32; j++) xv[j] = x_shared[x_base + j];
+            float d_xq = xq_d[bi - block_start];
+            float s_xq = xq_s[bi - block_start];
+
+            int xq_words[4];
+            int xq_words_hi[4];
+            for (int w4 = 0; w4 < 4; w4++) {
+                int j = w4 * 4;
+                xq_words[w4] = pack32(i8vec4(int8_t(xq_shared[x_base + j    ]),
+                                              int8_t(xq_shared[x_base + j + 1]),
+                                              int8_t(xq_shared[x_base + j + 2]),
+                                              int8_t(xq_shared[x_base + j + 3])));
+                xq_words_hi[w4] = pack32(i8vec4(int8_t(xq_shared[x_base + j + 16]),
+                                                int8_t(xq_shared[x_base + j + 17]),
+                                                int8_t(xq_shared[x_base + j + 18]),
+                                                int8_t(xq_shared[x_base + j + 19])));
+            }
 
             for (int r = 0; r < ROWS_PER_THREAD; r++) {
                 if (!valid[r]) continue;
                 uint row_idx = base_i + uint(r);
-                uint block_off = row_idx * uint(blocks_per_row) * Q5_1_BLOCK_BYTES + uint(bi) * Q5_1_BLOCK_BYTES;
-                float d = half_to_float(w0_read_u16(block_off));
-                float m = half_to_float(w0_read_u16(block_off + 2u));
+                uint block_off = row_idx * uint(blocks_per_row) * Q5_1_BLOCK_BYTES
+                               + uint(bi) * Q5_1_BLOCK_BYTES;
+                float d = half_to_float(w0_read_u16(block_off)) * d_xq;
+                float m = half_to_float(w0_read_u16(block_off + 2u)) * s_xq;
                 uint qh = w0_read_u32(block_off + 4u);
                 uint qs_off = block_off + 8u;
-                float block_sum = 0.0;
-                float x_sum = 0.0;
+
+                int sumi = 0;
                 for (int w4 = 0; w4 < 4; w4++) {
                     uint word = w0_read_u32(qs_off + uint(w4 * 4));
-                    for (int b = 0; b < 4; b++) {
-                        int j = w4 * 4 + b;
-                        uint byte = (word >> uint(b * 8)) & 0xFFu;
-                        int lo = int((byte & 0xFu) | (((qh >> uint(j))      & 1u) << 4u));
-                        int hi = int((byte >> 4u)  | (((qh >> uint(j + 16)) & 1u) << 4u));
-                        block_sum += float(lo) * xv[j] + float(hi) * xv[j + 16];
-                        x_sum += xv[j] + xv[j + 16];
-                    }
+                    int lo_nibbles = int(word & 0x0F0F0F0Fu);
+                    int hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
+                    int j = w4 * 4;
+
+                    int lo_qh =  int((qh >> uint(j    )) & 1u)
+                              | (int((qh >> uint(j + 1)) & 1u) <<  8)
+                              | (int((qh >> uint(j + 2)) & 1u) << 16)
+                              | (int((qh >> uint(j + 3)) & 1u) << 24);
+                    int hi_qh =  int((qh >> uint(j + 16)) & 1u)
+                              | (int((qh >> uint(j + 17)) & 1u) <<  8)
+                              | (int((qh >> uint(j + 18)) & 1u) << 16)
+                              | (int((qh >> uint(j + 19)) & 1u) << 24);
+                    int lo_vals = lo_nibbles | (lo_qh << 4);
+                    int hi_vals = hi_nibbles | (hi_qh << 4);
+
+                    sumi += dotPacked4x8EXT(lo_vals, xq_words[w4]);
+                    sumi += dotPacked4x8EXT(hi_vals, xq_words_hi[w4]);
                 }
-                acc[r] += d * block_sum + m * x_sum;
+
+                acc[r] = fma(d, float(sumi), m + acc[r]);
             }
         }
         barrier();

@@ -2196,7 +2196,10 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			struct tm	tm;
 			localtime_r(&now, &tm);
 			char buf[128];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
 			strftime(buf, sizeof(buf), fmt, &tm);
+#pragma GCC diagnostic pop
 			return jinja_string(buf);
 		}
 		jinja_value *macro = scope_lookup(ctx->sc, e->str);
