@@ -22,6 +22,10 @@ static inline __m128 loadu_f16x4_to_ps_128(const uint16_t *p) {
 	return _mm_cvtph_ps(h);
 }
 
+static inline __m256 loadu_f16x8_to_ps_256(const uint16_t *p) {
+	return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)));
+}
+
 static inline float vreduce_add_ps_128(__m128 v) {
 	v = _mm_add_ps(v, _mm_movehl_ps(v, v));
 	v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
@@ -3746,6 +3750,75 @@ void matmul_f32_f32(const float *restrict w, const float *restrict x, float *res
 	}
 }
 
+void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, float *restrict y,
+						  int n, int k, int m, int x_row_stride, int y_row_stride) {
+	const int MB = 4;
+	int		  mb = 0;
+	for (; mb + MB <= m; mb += MB) {
+		const float *xb[4];
+		for (int t = 0; t < 4; t++)
+			xb[t] = x + (size_t)(mb + t) * x_row_stride;
+
+		const int NR = 2;
+		int		  i	 = 0;
+		for (; i + NR <= n; i += NR) {
+			const float *rows[2];
+			for (int r = 0; r < 2; r++)
+				rows[r] = w + (size_t)(i + r) * k;
+
+			__m256 acc[4][2];
+			for (int t = 0; t < 4; t++)
+				for (int r = 0; r < 2; r++)
+					acc[t][r] = _mm256_setzero_ps();
+
+			int j = 0;
+			for (; j + 8 <= k; j += 8) {
+				if (j + 32 < k) {
+					__builtin_prefetch(xb[0] + j + 32, 0, 1);
+					for (int r = 0; r < 2; r++)
+						__builtin_prefetch(rows[r] + j + 32, 0, 1);
+				}
+				__m256 w0 = _mm256_loadu_ps(rows[0] + j);
+				__m256 w1 = _mm256_loadu_ps(rows[1] + j);
+				for (int t = 0; t < 4; t++) {
+					__m256 xv = _mm256_loadu_ps(xb[t] + j);
+					acc[t][0] = _mm256_fmadd_ps(xv, w0, acc[t][0]);
+					acc[t][1] = _mm256_fmadd_ps(xv, w1, acc[t][1]);
+				}
+			}
+			for (int t = 0; t < 4; t++) {
+				float s[2];
+				for (int r = 0; r < 2; r++)
+					s[r] = vreduce_add_ps(acc[t][r]);
+				for (int j2 = j; j2 < k; j2++) {
+					float xv = xb[t][j2];
+					for (int r = 0; r < 2; r++)
+						s[r] += rows[r][j2] * xv;
+				}
+				for (int r = 0; r < 2; r++)
+					y[(size_t)(mb + t) * y_row_stride + i + r] = s[r];
+			}
+		}
+		for (; i < n; i++) {
+			const float *wr = w + (size_t)i * k;
+			for (int t = 0; t < 4; t++) {
+				__m256 acc = _mm256_setzero_ps();
+				int		j  = 0;
+				for (; j + 8 <= k; j += 8)
+					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), _mm256_loadu_ps(wr + j),
+										  acc);
+				float s = vreduce_add_ps(acc);
+				for (; j < k; j++)
+					s += wr[j] * xb[t][j];
+				y[(size_t)(mb + t) * y_row_stride + i] = s;
+			}
+		}
+	}
+	for (; mb < m; mb++) {
+		matmul_f32_f32(w, x + (size_t)mb * x_row_stride, y + (size_t)mb * y_row_stride, n, k);
+	}
+}
+
 void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
 					 int k) {
 	const uint16_t *Wb = w;
@@ -3849,6 +3922,159 @@ void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *res
 			s += v.f * x[j];
 		}
 		y[i] = s;
+	}
+}
+
+void matmul_f16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
+					int k) {
+	const uint16_t *Wb = w;
+	const int		mr = 8;
+	int				i  = 0;
+	for (; i + mr <= n; i += mr) {
+		__m256 acc[8];
+		for (int r = 0; r < 8; r++)
+			acc[r] = _mm256_setzero_ps();
+
+		const uint16_t *rows[8];
+		for (int r = 0; r < 8; r++)
+			rows[r] = Wb + (size_t)(i + r) * k;
+
+		int j = 0;
+		for (; j + 32 <= k; j += 32) {
+			__builtin_prefetch(x + j + 64, 0, 1);
+			for (int r = 0; r < 8; r++)
+				__builtin_prefetch(rows[r] + j + 64, 0, 1);
+			__m256 x0 = _mm256_loadu_ps(x + j);
+			__m256 x1 = _mm256_loadu_ps(x + j + 8);
+			__m256 x2 = _mm256_loadu_ps(x + j + 16);
+			__m256 x3 = _mm256_loadu_ps(x + j + 24);
+			for (int r = 0; r < 8; r++) {
+				acc[r] = _mm256_fmadd_ps(x0, loadu_f16x8_to_ps_256(rows[r] + j), acc[r]);
+				acc[r] = _mm256_fmadd_ps(x1, loadu_f16x8_to_ps_256(rows[r] + j + 8), acc[r]);
+				acc[r] = _mm256_fmadd_ps(x2, loadu_f16x8_to_ps_256(rows[r] + j + 16), acc[r]);
+				acc[r] = _mm256_fmadd_ps(x3, loadu_f16x8_to_ps_256(rows[r] + j + 24), acc[r]);
+			}
+		}
+		for (; j + 16 <= k; j += 16) {
+			__m256 x0 = _mm256_loadu_ps(x + j);
+			__m256 x1 = _mm256_loadu_ps(x + j + 8);
+			for (int r = 0; r < 8; r++) {
+				acc[r] = _mm256_fmadd_ps(x0, loadu_f16x8_to_ps_256(rows[r] + j), acc[r]);
+				acc[r] = _mm256_fmadd_ps(x1, loadu_f16x8_to_ps_256(rows[r] + j + 8), acc[r]);
+			}
+		}
+		for (int r = 0; r < 8; r++) {
+			__m128 rem_acc = _mm_setzero_ps();
+			int		j2	   = j;
+			for (; j2 + 4 <= k; j2 += 4)
+				rem_acc = _mm_fmadd_ps(_mm_loadu_ps(x + j2),
+									   loadu_f16x4_to_ps_128(rows[r] + j2), rem_acc);
+			float s = vreduce_add_ps(acc[r]) + vreduce_add_ps_128(rem_acc);
+			for (; j2 < k; j2++)
+				s += f16_to_f32_fast(rows[r][j2]) * x[j2];
+			y[i + r] = s;
+		}
+	}
+	for (; i < n; i++) {
+		const uint16_t *restrict wr = Wb + (size_t)i * k;
+		__m256 acc0				= _mm256_setzero_ps();
+		__m256 acc1				= _mm256_setzero_ps();
+		__m256 acc2				= _mm256_setzero_ps();
+		__m256 acc3				= _mm256_setzero_ps();
+		int		j				= 0;
+		for (; j + 32 <= k; j += 32) {
+			__builtin_prefetch(wr + j + 64, 0, 1);
+			__builtin_prefetch(x + j + 64, 0, 1);
+			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_f16x8_to_ps_256(wr + j), acc0);
+			acc1 =
+				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
+							   acc1);
+			acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 16),
+								   loadu_f16x8_to_ps_256(wr + j + 16), acc2);
+			acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 24),
+								   loadu_f16x8_to_ps_256(wr + j + 24), acc3);
+		}
+		for (; j + 16 <= k; j += 16) {
+			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_f16x8_to_ps_256(wr + j), acc0);
+			acc1 =
+				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
+							   acc1);
+		}
+		for (; j + 8 <= k; j += 8)
+			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_f16x8_to_ps_256(wr + j), acc0);
+		float s = vreduce_add_ps(acc0) + vreduce_add_ps(acc1) + vreduce_add_ps(acc2) +
+				  vreduce_add_ps(acc3);
+		for (; j < k; j++)
+			s += f16_to_f32_fast(wr[j]) * x[j];
+		y[i] = s;
+	}
+}
+
+void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y,
+						  int n, int k, int m, int x_row_stride, int y_row_stride) {
+	const uint16_t *Wb = w;
+	const int		MB = 4;
+	int				mb = 0;
+	for (; mb + MB <= m; mb += MB) {
+		const float *xb[4];
+		for (int t = 0; t < 4; t++)
+			xb[t] = x + (size_t)(mb + t) * x_row_stride;
+
+		const int NR = 2;
+		int		  i	 = 0;
+		for (; i + NR <= n; i += NR) {
+			const uint16_t *rows[2];
+			for (int r = 0; r < 2; r++)
+				rows[r] = Wb + (size_t)(i + r) * k;
+
+			__m256 acc[4][2];
+			for (int t = 0; t < 4; t++)
+				for (int r = 0; r < 2; r++)
+					acc[t][r] = _mm256_setzero_ps();
+
+			int j = 0;
+			for (; j + 8 <= k; j += 8) {
+				__builtin_prefetch(xb[0] + j + 32, 0, 1);
+				for (int r = 0; r < 2; r++)
+					__builtin_prefetch(rows[r] + j + 32, 0, 1);
+				__m256 w0 = loadu_f16x8_to_ps_256(rows[0] + j);
+				__m256 w1 = loadu_f16x8_to_ps_256(rows[1] + j);
+				for (int t = 0; t < 4; t++) {
+					__m256 xv = _mm256_loadu_ps(xb[t] + j);
+					acc[t][0] = _mm256_fmadd_ps(xv, w0, acc[t][0]);
+					acc[t][1] = _mm256_fmadd_ps(xv, w1, acc[t][1]);
+				}
+			}
+			for (int t = 0; t < 4; t++) {
+				float s[2];
+				for (int r = 0; r < 2; r++)
+					s[r] = vreduce_add_ps(acc[t][r]);
+				for (int j2 = j; j2 < k; j2++) {
+					float xv = xb[t][j2];
+					for (int r = 0; r < 2; r++)
+						s[r] += f16_to_f32_fast(rows[r][j2]) * xv;
+				}
+				for (int r = 0; r < 2; r++)
+					y[(size_t)(mb + t) * y_row_stride + i + r] = s[r];
+			}
+		}
+		for (; i < n; i++) {
+			const uint16_t *wr = Wb + (size_t)i * k;
+			for (int t = 0; t < 4; t++) {
+				__m256 acc = _mm256_setzero_ps();
+				int		j  = 0;
+				for (; j + 8 <= k; j += 8)
+					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j),
+										  loadu_f16x8_to_ps_256(wr + j), acc);
+				float s = vreduce_add_ps(acc);
+				for (; j < k; j++)
+					s += f16_to_f32_fast(wr[j]) * xb[t][j];
+				y[(size_t)(mb + t) * y_row_stride + i] = s;
+			}
+		}
+	}
+	for (; mb < m; mb++) {
+		matmul_f16_f32(w, x + (size_t)mb * x_row_stride, y + (size_t)mb * y_row_stride, n, k);
 	}
 }
 
