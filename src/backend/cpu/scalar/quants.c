@@ -1395,6 +1395,9 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	case GGML_TYPE_F32:
 		matmul_f32_f32(w, x, y, n, k);
 		return;
+	case GGML_TYPE_F16:
+		matmul_f16_f32(w, x, y, n, k);
+		return;
 	case GGML_TYPE_BF16:
 		matmul_bf16_f32(w, x, y, n, k);
 		return;
@@ -2027,6 +2030,39 @@ __attribute__((weak)) void matmul_bf16_f32(const void *restrict w, const float *
 		}
 		y[i] = acc;
 	}
+}
+
+__attribute__((weak)) void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x,
+												 float *restrict y, int n, int k, int m,
+												 int x_row_stride, int y_row_stride) {
+	for (int row = 0; row < m; row++)
+		matmul_bf16_f32(w, x + (size_t)row * x_row_stride, y + (size_t)row * y_row_stride, n, k);
+}
+
+__attribute__((weak)) void matmul_f32_f32_batch(const float *restrict w, const float *restrict x,
+												float *restrict y, int n, int k, int m,
+												int x_row_stride, int y_row_stride) {
+	for (int row = 0; row < m; row++)
+		matmul_f32_f32(w, x + (size_t)row * x_row_stride, y + (size_t)row * y_row_stride, n, k);
+}
+
+__attribute__((weak)) void matmul_f16_f32(const void *restrict w, const float *restrict x,
+										  float *restrict y, int n, int k) {
+	const uint16_t *wb = w;
+	for (int i = 0; i < n; i++) {
+		const uint16_t *restrict wr = wb + ((size_t)i * k);
+		float acc					= 0.0f;
+		for (int j = 0; j < k; j++)
+			acc += f16_to_f32(wr[j]) * x[j];
+		y[i] = acc;
+	}
+}
+
+__attribute__((weak)) void matmul_f16_f32_batch(const void *restrict w, const float *restrict x,
+												float *restrict y, int n, int k, int m,
+												int x_row_stride, int y_row_stride) {
+	for (int row = 0; row < m; row++)
+		matmul_f16_f32(w, x + (size_t)row * x_row_stride, y + (size_t)row * y_row_stride, n, k);
 }
 
 __attribute__((weak)) float dot_f32(const float *restrict a, const float *restrict b, int n) {

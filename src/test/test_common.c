@@ -178,19 +178,29 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 	float pmax = n_valid_diff > 0 ? diffs[n_valid_diff - 1] : 0;
 	free(diffs);
 
+	const int dbg_cap = (int)sizeof(g_debug_buf);
+
 	int off = snprintf(g_debug_buf, sizeof(g_debug_buf),
 					   "CPU:  min=%+.4e  max=%+.4e  mean=%+.4e  |max|=%.4e  nf=%d/%d\n"
 					   "TGT:  min=%+.4e  max=%+.4e  mean=%+.4e  |max|=%.4e  nf=%d/%d\n"
 					   "err:  p50=%.3e  p90=%.3e  p99=%.3e  max=%.3e  (%d valid)",
 					   r_min, r_max, r_mean, r_maxabs, r_nf, n, g_min, g_max, g_mean, g_maxabs,
 					   g_nf, n, p50, p90, p99, pmax, n_valid_diff);
+	if (off < 0)
+		off = 0;
+	if (off > dbg_cap)
+		off = dbg_cap;
 
 	if (g_nf > 0) {
 		for (int i = 0; i < n; i++) {
 			if (!isfinite(y_got[i])) {
-				off += snprintf(g_debug_buf + off, sizeof(g_debug_buf) - off,
-								"\nfirst NaN/Inf: TGT[%d]=%f (CPU=%f)", i, y_got[i],
-								i < n ? y_ref[i] : 0.0f);
+				int rem = dbg_cap - off;
+				if (rem > 0)
+					off += snprintf(g_debug_buf + off, (size_t)rem,
+									"\nfirst NaN/Inf: TGT[%d]=%f (CPU=%f)", i, y_got[i],
+									i < n ? y_ref[i] : 0.0f);
+				if (off > dbg_cap)
+					off = dbg_cap;
 				break;
 			}
 		}
@@ -203,20 +213,32 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 		float diff	= fabsf(y_ref[i] - y_got[i]);
 		float scale = fmaxf(fabsf(y_ref[i]), fabsf(y_got[i]));
 		if (scale > 1e-8f && diff / scale > 0.01f) {
-			off +=
-				snprintf(g_debug_buf + off, sizeof(g_debug_buf) - off, "%s[%d] CPU=%+.6f TGT=%+.6f",
-						 shown == 0 ? "\nmismatch: " : ", ", i, y_ref[i], y_got[i]);
+			int rem = dbg_cap - off;
+			if (rem > 0)
+				off += snprintf(g_debug_buf + off, (size_t)rem, "%s[%d] CPU=%+.6f TGT=%+.6f",
+								shown == 0 ? "\nmismatch: " : ", ", i, y_ref[i], y_got[i]);
+			if (off > dbg_cap)
+				off = dbg_cap;
 			shown++;
 		}
 	}
 
 	if (n <= 16 && n > 0) {
-		off += snprintf(g_debug_buf + off, sizeof(g_debug_buf) - off, "\nelement dump:");
+		int rem = dbg_cap - off;
+		if (rem > 0)
+			off += snprintf(g_debug_buf + off, (size_t)rem, "\nelement dump:");
+		if (off > dbg_cap)
+			off = dbg_cap;
 		for (int i = 0; i < n; i++) {
-			off += snprintf(g_debug_buf + off, sizeof(g_debug_buf) - off,
+			int rem2 = dbg_cap - off;
+			if (rem2 <= 0)
+				break;
+			off += snprintf(g_debug_buf + off, (size_t)rem2,
 							"\n  [%2d] CPU=%+.6e  TGT=%+.6e  diff=%.3e", i, y_ref[i], y_got[i],
 							isfinite(y_ref[i]) && isfinite(y_got[i]) ? fabsf(y_ref[i] - y_got[i])
 																	 : (float)INFINITY);
+			if (off > dbg_cap)
+				off = dbg_cap;
 		}
 	}
 }
@@ -517,17 +539,134 @@ void fill_random_f32(float *x, int n, float scale) {
 	}
 }
 
+static void fill_random_f16(uint16_t *x, int n) {
+	for (int i = 0; i < n; i++) {
+		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
+		x[i]	  = f32_to_f16((float)r / 1000.0f);
+	}
+}
+
+static void fill_random_bf16(uint16_t *x, int n) {
+	for (int i = 0; i < n; i++) {
+		int32_t	 r = (int32_t)(next_u32() % 2001) - 1000;
+		float	 f = (float)r / 1000.0f;
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		x[i] = (uint16_t)(bits >> 16);
+	}
+}
+
+typedef void (*test_repack_fn)(const void *src, void *dst, int n_rows, int k);
+
+static test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
+	switch (type) {
+	case GGML_TYPE_Q4_0_R8:
+		*base_type_out = GGML_TYPE_Q4_0;
+		return repack_q4_0_to_q4_0_r8;
+	case GGML_TYPE_Q8_0_R8:
+		*base_type_out = GGML_TYPE_Q8_0;
+		return repack_q8_0_to_q8_0_r8;
+	case GGML_TYPE_IQ4_NL_R8:
+		*base_type_out = GGML_TYPE_IQ4_NL;
+		return repack_iq4_nl_to_iq4_nl_r8;
+	case GGML_TYPE_IQ3_S_RE:
+		*base_type_out = GGML_TYPE_IQ3_S;
+		return repack_iq3_s;
+	case GGML_TYPE_IQ3_S_RE8:
+		*base_type_out = GGML_TYPE_IQ3_S;
+		return repack_iq3_s_to_iq3_s_re8;
+	default:
+		*base_type_out = type;
+		return NULL;
+	}
+}
+
+int test_type_per_row(uint32_t type) {
+	switch (type) {
+	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ3_S_RE8:
+		return 0;
+	default:
+		return 1;
+	}
+}
+
+void *test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes) {
+	int bpr = k / qt->block;
+
+	uint32_t	   base_type;
+	test_repack_fn repack = test_repack_for_type(qt->type, &base_type);
+	if (repack) {
+		int	   n_pad	  = (n_rows + 7) & ~7;
+		size_t base_bytes = ggml_row_size(base_type, (size_t)k) / (size_t)bpr;
+		int	   n_base	  = n_pad * bpr;
+		void  *base		  = xcalloc((size_t)n_base, base_bytes);
+		fill_random_blocks(base, n_base, base_bytes, base_type);
+
+		size_t bytes = (size_t)n_pad * ggml_row_size(qt->type, (size_t)k);
+		void  *buf	 = xmalloc(bytes);
+		repack(base, buf, n_pad, k);
+		free(base);
+		if (out_bytes)
+			*out_bytes = bytes;
+		return buf;
+	}
+
+	if (qt->type == GGML_TYPE_F32) {
+		size_t bytes = (size_t)n_rows * (size_t)k * sizeof(float);
+		float *buf	 = xmalloc(bytes);
+		fill_random_f32(buf, n_rows * k, 1.0f);
+		if (out_bytes)
+			*out_bytes = bytes;
+		return buf;
+	}
+	if (qt->type == GGML_TYPE_F16) {
+		size_t	  bytes = (size_t)n_rows * (size_t)k * sizeof(uint16_t);
+		uint16_t *buf	= xmalloc(bytes);
+		fill_random_f16(buf, n_rows * k);
+		if (out_bytes)
+			*out_bytes = bytes;
+		return buf;
+	}
+	if (qt->type == GGML_TYPE_BF16) {
+		size_t	  bytes = (size_t)n_rows * (size_t)k * sizeof(uint16_t);
+		uint16_t *buf	= xmalloc(bytes);
+		fill_random_bf16(buf, n_rows * k);
+		if (out_bytes)
+			*out_bytes = bytes;
+		return buf;
+	}
+
+	int	   n_blocks = n_rows * bpr;
+	size_t bytes	= (size_t)n_blocks * qt->bytes;
+	void  *buf		= xcalloc((size_t)n_blocks, qt->bytes);
+	fill_random_blocks(buf, n_blocks, qt->bytes, qt->type);
+	if (out_bytes)
+		*out_bytes = bytes;
+	return buf;
+}
+
 const qtype_info QTYPES[] = {
 	{"q4_0", GGML_TYPE_Q4_0, 32, sizeof(q4_0_block)},
 	{"q4_1", GGML_TYPE_Q4_1, 32, sizeof(q4_1_block)},
 	{"q5_0", GGML_TYPE_Q5_0, 32, sizeof(q5_0_block)},
 	{"q5_1", GGML_TYPE_Q5_1, 32, sizeof(q5_1_block)},
 	{"q8_0", GGML_TYPE_Q8_0, 32, sizeof(q8_0_block)},
-	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, sizeof(iq4_nl_block)},
 	{"q4_K", GGML_TYPE_Q4_K, 256, sizeof(q4_k_block)},
 	{"q5_K", GGML_TYPE_Q5_K, 256, sizeof(q5_k_block)},
 	{"q6_K", GGML_TYPE_Q6_K, 256, sizeof(q6_k_block)},
+	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, sizeof(iq4_nl_block)},
 	{"iq3_s", GGML_TYPE_IQ3_S, 256, sizeof(iq3_s_block)},
+	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, sizeof(q4_0_block)},
+	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, sizeof(q8_0_block)},
+	{"iq4_nl_r8", GGML_TYPE_IQ4_NL_R8, 32, sizeof(iq4_nl_block)},
+	{"iq3_s_re", GGML_TYPE_IQ3_S_RE, 256, sizeof(iq3_s_block)},
+	{"iq3_s_re8", GGML_TYPE_IQ3_S_RE8, 256, sizeof(iq3_s_block)},
+	{"f16", GGML_TYPE_F16, 1, sizeof(uint16_t)},
+	{"bf16", GGML_TYPE_BF16, 1, sizeof(uint16_t)},
+	{"f32", GGML_TYPE_F32, 1, sizeof(float)},
 };
 const int QTYPES_N = (int)(sizeof(QTYPES) / sizeof(QTYPES[0]));
 #define QTYPES_N ((int)(sizeof(QTYPES) / sizeof(QTYPES[0])))

@@ -559,21 +559,16 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	const matmul_kernel *entry = j->kernel;
 	if (entry) {
 		entry->qonly(W_sub, j->xq, j->xq_row_stride_blocks, y_sub, j->n, n_sub, j->k, j->m);
+	} else if (j->w_type == GGML_TYPE_F32) {
+		matmul_f32_f32_batch((const float *)W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
+	} else if (j->w_type == GGML_TYPE_F16) {
+		matmul_f16_f32_batch(W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
+	} else if (j->w_type == GGML_TYPE_BF16) {
+		matmul_bf16_f32_batch(W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
 	} else {
 		for (int row = 0; row < j->m; row++) {
 			float *y = j->y + ((size_t)row * j->n) + begin;
-			switch (j->w_type) {
-			case GGML_TYPE_F32:
-				matmul_f32_f32((const float *)W_sub, j->xf + ((size_t)row * j->k), y, n_sub, j->k);
-				break;
-			case GGML_TYPE_BF16:
-				matmul_bf16_f32((const uint16_t *)W_sub, j->xf + ((size_t)row * j->k), y, n_sub,
-								j->k);
-				break;
-			default:
-				matmul_generic_f32(W_sub, j->w_type, j->xf + ((size_t)row * j->k), y, n_sub, j->k);
-				break;
-			}
+			matmul_generic_f32(W_sub, j->w_type, j->xf + ((size_t)row * j->k), y, n_sub, j->k);
 		}
 	}
 
@@ -637,6 +632,8 @@ static size_t cpu_matmul_w_row_stride(uint32_t w_type, int k) {
 		return (size_t)(k / 32) * sizeof(q5_1_block);
 	case GGML_TYPE_F32:
 		return (size_t)k * sizeof(float);
+	case GGML_TYPE_F16:
+		return (size_t)k * sizeof(uint16_t);
 	case GGML_TYPE_BF16:
 		return (size_t)k * sizeof(uint16_t);
 	default:
@@ -819,7 +816,7 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	int q8_class = job.kernel ? job.kernel->q8_class : 0;
 	if (q8_class) {
 		job.xq = cpu_matmul_quantize_x(&p->qscratch, q8_class, x, k);
-	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16) {
+	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
 		const float *res = residual;
 		if (aliases_residual) {
 			status_code grow_st = cpu_scratch_grow_aligned(
@@ -1131,7 +1128,7 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 			job->xq_row_stride / cpu_matmul_q8_block_size(job->kernel->q8_class);
 		job->xq =
 			cpu_matmul_quantize_x_rows(self, &p->qscratch, q8_class, xf, k, m, job->xq_row_stride);
-	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16) {
+	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
 		for (int i = 0; i < m; i++)
 			cpu_matmul_one(W, w_type, xf + ((size_t)i * k), yf + ((size_t)i * n), n, k,
 						   &p->qscratch);
