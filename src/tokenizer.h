@@ -55,6 +55,10 @@ int			tokenizer_encode_with_specials(tokenizer *t, const char *text, int add_spe
 										   int32_t *out_ids, int max_out, profile *prof);
 int			tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int max_out,
 							 profile *prof);
+size_t		tokenizer_token_decoded_len(const tokenizer *t, int32_t id);
+int			tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
+											size_t max_bytes);
+char	   *tokenizer_decode_prefix(const tokenizer *t, const int32_t *ids, int count);
 int			tokenizer_is_eog(const tokenizer *t, int32_t id);
 int32_t		tokenizer_find_token(const tokenizer *t, const char *text);
 

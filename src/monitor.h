@@ -64,7 +64,7 @@ void monitor_emit_token(monitor *mon, int token_idx, int32_t token_id, int pos, 
 						int piece_len);
 
 void monitor_emit_end(monitor *mon, int tokens_generated, double pp_tps, double tg_tps,
-					  const moe_stats_summary *moe);
+					  double ttft_ms, const moe_stats_summary *moe);
 
 void monitor_emit_moe_experts(monitor *mon, int layer, int token_idx, const int32_t *expert_ids,
 							  const float *weights, int K);

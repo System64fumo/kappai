@@ -220,6 +220,7 @@ fail_backend:
 void context_free(context *c) {
 	if (!c)
 		return;
+	context_idle_prefill_wait(c);
 	monitor_free(&c->monitor);
 	g_monitor = NULL;
 	sampler_free(&c->samp);
@@ -233,10 +234,12 @@ void context_free(context *c) {
 }
 
 void context_reset(context *c) {
+	context_idle_prefill_wait(c);
 	kvcache_reset(&c->kv);
 	c->samp.recent_count = 0;
 	c->samp.recent_head	 = 0;
 	chat_template_clear_messages(&c->chat);
+	c->warmup_done = false;
 }
 
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
@@ -262,7 +265,7 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 	return pos + 1;
 }
 
-int context_feed_tokens_batch(context *c, const int32_t *tokens, int n) {
+int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool quiet) {
 	if (n <= 0)
 		return 0;
 	if (c->kv.n_pos + n > c->n_ctx)
@@ -287,7 +290,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n) {
 	if (chunk > n)
 		chunk = n;
 	progress prog;
-	int		 show_progress = n > 1;
+	int		 show_progress = n > 1 && !quiet;
 	if (show_progress)
 		progress_start(&prog, "prompt processing", (uint64_t)n);
 
@@ -420,11 +423,13 @@ static void monitor_setup_cb(context *c, sub_token_cb_ud *cb, const char *phase,
 }
 
 static int context_decode_loop(context *c, int max_tokens, float temperature, int top_k,
-							   void (*on_token)(int32_t, const char *, int, void *), void *ud) {
+							   void (*on_token)(int32_t, const char *, int, void *), void *ud,
+							   uint64_t ttft_start_us, uint64_t *out_ttft_us) {
 	(void)temperature;
 	(void)top_k;
 	int				generated = 0;
 	sub_token_cb_ud cb;
+	bool			ttft_captured = (out_ttft_us == NULL);
 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
@@ -440,6 +445,11 @@ static int context_decode_loop(context *c, int max_tokens, float temperature, in
 			if (pn < 0)
 				pn = 0;
 			piece[pn] = '\0';
+			if (!ttft_captured) {
+				if (out_ttft_us)
+					*out_ttft_us = time_us() - ttft_start_us;
+				ttft_captured = true;
+			}
 			if (on_token)
 				on_token(tok, piece, pn, ud);
 			if (monitor_active(&c->monitor))
@@ -463,10 +473,11 @@ static int context_decode_loop(context *c, int max_tokens, float temperature, in
 	return generated;
 }
 
-static void send_generation_end(context *c, int generated, double pf_tps, double dec_tps) {
+static void send_generation_end(context *c, int generated, double pf_tps, double dec_tps,
+								double ttft_ms) {
 	moe_stats_summary ms;
 	moe_stream_summarize(&c->m, &ms);
-	monitor_emit_end(&c->monitor, generated, pf_tps, dec_tps, &ms);
+	monitor_emit_end(&c->monitor, generated, pf_tps, dec_tps, ttft_ms, &ms);
 }
 
 void context_monitor_send_start(context *c) {
@@ -476,54 +487,13 @@ void context_monitor_send_start(context *c) {
 					   c->m.moe.n_experts_used);
 }
 
-int context_prefill_preamble(context *c, const char *system) {
-	if (!system || !*system)
-		return 0;
-
-	char  errbuf[512];
-	char *preamble;
-	if (chat_template_add_turn(&c->chat, "system", system, 0, &preamble, errbuf, sizeof(errbuf)) !=
-		OK) {
-		ERROR("chat template render failed: %s", errbuf);
-		return -1;
-	}
-
-	if (c->show_template)
-		fprintf(stderr, "=== chat template ===\n%s\n======================\n", preamble);
-
-	int		 cap = c->n_ctx;
-	int32_t *ids = xmalloc((size_t)(cap + 1) * sizeof(int32_t));
-	int		 n	 = tokenizer_encode_with_specials(&c->tok, preamble, 0, ids, cap, &c->scratch.prof);
-	free(preamble);
-	if (n < 0) {
-		free(ids);
-		ERROR("preamble too long");
-		return -1;
-	}
-
-	context_monitor_send_start(c);
-
-	prefill_result pf = context_prefill_tokens(c, ids, n, "warmup");
-	free(ids);
-	if (pf.rc == CTX_COMPUTE_ERROR) {
-		ERROR("GPU compute error during preamble prefill");
-		return -1;
-	}
-	if (pf.rc < 0) {
-		ERROR("context overflow during preamble");
-		return -1;
-	}
-	DEBUG("preamble: %d tokens", n);
-	return 0;
-}
-
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,
-									  const char *phase) {
+									  const char *phase, bool quiet) {
 	prefill_result	result = {0};
 	sub_token_cb_ud cb;
 	monitor_setup_cb(c, &cb, phase, 0, n_tokens);
 	uint64_t t_start = time_us();
-	result.rc		 = context_feed_tokens_batch(c, tokens, n_tokens);
+	result.rc		 = context_feed_tokens_batch(c, tokens, n_tokens, quiet);
 	if (c->backend && c->backend->synchronize)
 		c->backend->synchronize(c->backend);
 	uint64_t t_end = time_us();
@@ -535,14 +505,60 @@ prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_t
 	return result;
 }
 
+static void print_metrics(const char *spec, double pp, double tg, double ttft_ms) {
+	char		buf[160];
+	size_t		pos	  = 0;
+	const char *p	  = spec;
+	int			first = 1;
+
+	while (*p) {
+		const char *seg = p;
+		while (*p && *p != ',' && *p != ' ')
+			p++;
+		size_t seg_len = (size_t)(p - seg);
+		while (*p == ',' || *p == ' ')
+			p++;
+		if (seg_len == 0)
+			continue;
+
+		char part[48];
+		if (seg_len == 2 && (seg[0] | 0x20) == 'p' && (seg[1] | 0x20) == 'p')
+			snprintf(part, sizeof(part), "PP: %.2f t/s", pp);
+		else if (seg_len == 2 && (seg[0] | 0x20) == 't' && (seg[1] | 0x20) == 'g')
+			snprintf(part, sizeof(part), "TG: %.2f t/s", tg);
+		else if (seg_len == 4 && (seg[0] | 0x20) == 't' && (seg[1] | 0x20) == 't' &&
+				 (seg[2] | 0x20) == 'f' && (seg[3] | 0x20) == 't') {
+			if (ttft_ms >= 0)
+				snprintf(part, sizeof(part), "TTFT: %.2f ms", ttft_ms);
+			else
+				snprintf(part, sizeof(part), "TTFT: --");
+		} else
+			continue;
+
+		const char *sep	   = first ? "" : " | ";
+		size_t		seplen = strlen(sep);
+		size_t		plen   = strlen(part);
+		if (pos + seplen + plen + 1 >= sizeof(buf))
+			break;
+		memcpy(buf + pos, sep, seplen);
+		pos += seplen;
+		memcpy(buf + pos, part, plen);
+		pos += plen;
+		first = 0;
+	}
+	buf[pos] = '\0';
+	if (pos > 0)
+		fprintf(stderr, "\033[35m[ %s ]\033[0m\n", buf);
+}
+
 static int run_generation(context *c, const int32_t *tokens, int n_tokens, int max_tokens,
 						  const sampler_params *samp,
 						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
-						  int show_pp_tg) {
+						  int show_pp_tg, const char *metrics_spec, uint64_t t_turn_start_us) {
 	context_monitor_send_start(c);
 	bool prof_was_on = c->scratch.prof.enabled;
 
-	prefill_result pf = context_prefill_tokens(c, tokens, n_tokens, "prefill");
+	prefill_result pf = context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
 	if (pf.rc == CTX_INTERRUPTED)
 		return 0;
 	if (pf.rc == CTX_COMPUTE_ERROR) {
@@ -560,21 +576,23 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 					   64);
 
 	uint64_t t_dec_start = time_us();
-	int		 generated =
-		context_decode_loop(c, max_tokens, samp->temperature, samp->top_k, on_token, ud);
+	uint64_t ttft_us	 = 0;
+	int generated = context_decode_loop(c, max_tokens, samp->temperature, samp->top_k, on_token, ud,
+										t_turn_start_us, &ttft_us);
 	if (c->backend && c->backend->synchronize)
 		c->backend->synchronize(c->backend);
 	uint64_t t_dec_end = time_us();
 
 	uint64_t decode_us	= t_dec_end - t_dec_start;
 	double	 decode_tps = generated > 0 ? generated * 1.0e6 / (double)decode_us : 0.0;
+	double	 ttft_ms	= (double)ttft_us / 1000.0;
 	fputc('\n', stderr);
-	if (show_pp_tg)
-		fprintf(stderr, "\033[35m[ PP: %.2f t/s | TG: %.2f t/s ]\033[0m\n", pf.tps, decode_tps);
+	if (show_pp_tg && metrics_spec && metrics_spec[0])
+		print_metrics(metrics_spec, pf.tps, decode_tps, ttft_us > 0 ? ttft_ms : -1);
 	if (prof_was_on)
 		profile_print(&c->scratch.prof, "decode", stderr);
 
-	send_generation_end(c, generated, pf.tps, decode_tps);
+	send_generation_end(c, generated, pf.tps, decode_tps, ttft_ms);
 	return generated;
 }
 
@@ -603,9 +621,11 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 
 int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
 					  int max_tokens, const sampler_params						 *samp,
-					  void (*on_token)(int32_t, const char *, int, void *), void *ud) {
-	char  errbuf[512];
-	char *turn_str;
+					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+					  const char *metrics_spec) {
+	uint64_t t_turn_start = time_us();
+	char	 errbuf[512];
+	char	*turn_str;
 	if (chat_template_add_turn(&c->chat, role, content, add_generation_prompt, &turn_str, errbuf,
 							   sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
@@ -630,9 +650,9 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	acap.on_token			  = on_token;
 	acap.ud					  = ud;
 
-	int generated =
-		run_generation(c, ids, n, max_tokens, samp,
-					   add_generation_prompt ? assistant_capture_cb : on_token, &acap, 1);
+	int generated = run_generation(c, ids, n, max_tokens, samp,
+								   add_generation_prompt ? assistant_capture_cb : on_token, &acap,
+								   1, metrics_spec ? metrics_spec : "pp,tg", t_turn_start);
 	free(ids);
 
 	if (add_generation_prompt && generated > 0) {
@@ -643,4 +663,86 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	}
 	free(acap.buf);
 	return generated;
+}
+
+static size_t ctx_lcp_len(const char *a, const char *b) {
+	size_t i = 0;
+	while (a[i] && b[i] && a[i] == b[i])
+		i++;
+	return i;
+}
+
+static size_t ctx_rstrip_nl(const char *s, size_t len) {
+	return (len > 0 && s[len - 1] == '\n') ? len - 1 : len;
+}
+
+static void *idle_prefill_thread(void *arg) {
+	context *c = (context *)arg;
+	char	 errbuf[512];
+
+	char	   *r1 = NULL, *r2 = NULL;
+	status_code s1 = chat_template_preview_next_turn(&c->chat, "user", "aaaa", false, &r1, errbuf,
+													 sizeof(errbuf));
+	status_code s2 = (s1 == OK) ? chat_template_preview_next_turn(&c->chat, "user", "bbbb", false,
+																  &r2, errbuf, sizeof(errbuf))
+								: ERR_FORMAT;
+	if (s1 != OK || s2 != OK || c->interrupt)
+		goto out;
+
+	size_t header_bytes = ctx_lcp_len(r1, r2);
+	if (header_bytes == 0)
+		goto out;
+
+	int		 cap = c->n_ctx;
+	int32_t *ids = xmalloc((size_t)(cap + 1) * sizeof(int32_t));
+	int		 n	 = tokenizer_encode_with_specials(&c->tok, r1, 0, ids, cap, &c->scratch.prof);
+	if (n < 0 || c->interrupt)
+		goto out_ids;
+
+	int header_count = tokenizer_token_count_for_bytes(&c->tok, ids, n, header_bytes);
+	if (header_count == 0)
+		goto out_ids;
+
+	size_t prev_len = ctx_rstrip_nl(c->chat.last_render, strlen(c->chat.last_render));
+	if (prev_len == 0 || strncmp(r1, c->chat.last_render, prev_len) != 0)
+		goto out_ids;
+
+	int prefilled_count = tokenizer_token_count_for_bytes(&c->tok, ids, header_count, prev_len);
+	if (prefilled_count >= header_count || c->interrupt)
+		goto out_ids;
+
+	int			   to_prefill = header_count - prefilled_count;
+	prefill_result pf = context_prefill_tokens(c, ids + prefilled_count, to_prefill, "idle", true);
+	if (pf.rc < 0)
+		goto out_ids;
+
+	char *decoded = tokenizer_decode_prefix(&c->tok, ids, header_count);
+	if (decoded) {
+		free(c->chat.last_render);
+		c->chat.last_render = decoded;
+	}
+
+	DEBUG("idle-prefill: %d tokens [%d..%d) of %d", to_prefill, prefilled_count, header_count, n);
+
+out_ids:
+	free(ids);
+out:
+	free(r1);
+	free(r2);
+	return NULL;
+}
+
+void context_idle_prefill_start(context *c) {
+	if (!c || c->idle.active)
+		return;
+	c->idle.active = true;
+	if (pthread_create(&c->idle.thread, NULL, idle_prefill_thread, c) != 0)
+		c->idle.active = false;
+}
+
+void context_idle_prefill_wait(context *c) {
+	if (!c || !c->idle.active)
+		return;
+	pthread_join(c->idle.thread, NULL);
+	c->idle.active = false;
 }

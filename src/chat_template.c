@@ -95,16 +95,24 @@ void chat_template_free(chat_template_state *cts) {
 	memset(cts, 0, sizeof(*cts));
 }
 
-static jinja_value *build_globals(chat_template_state *cts, int add_generation_prompt) {
-	jinja_value *g = jinja_dict();
-
+static jinja_value *build_globals(chat_template_state *cts, const chat_message *extra,
+								  size_t n_extra, int add_generation_prompt) {
+	jinja_value *g	  = jinja_dict();
 	jinja_value *msgs = jinja_list();
+
 	for (size_t i = 0; i < cts->n_messages; i++) {
 		jinja_value *m = jinja_dict();
 		jinja_dict_set(m, "role", jinja_string(cts->messages[i].role));
 		jinja_dict_set(m, "content", jinja_string(cts->messages[i].content));
 		jinja_list_append(msgs, m);
 	}
+	for (size_t i = 0; i < n_extra; i++) {
+		jinja_value *m = jinja_dict();
+		jinja_dict_set(m, "role", jinja_string(extra[i].role));
+		jinja_dict_set(m, "content", jinja_string(extra[i].content));
+		jinja_list_append(msgs, m);
+	}
+
 	jinja_dict_set(g, "messages", msgs);
 	jinja_dict_set(g, "add_generation_prompt", jinja_bool(add_generation_prompt));
 	jinja_dict_set(g, "enable_thinking", jinja_bool(cts->enable_thinking));
@@ -112,6 +120,66 @@ static jinja_value *build_globals(chat_template_state *cts, int add_generation_p
 	jinja_dict_set(g, "eos_token", jinja_string(cts->eos_token));
 	jinja_dict_set(g, "strftime_now", jinja_bool(1));
 	return g;
+}
+
+static size_t lcp_len(const char *a, const char *b) {
+	size_t i = 0;
+	while (a[i] && b[i] && a[i] == b[i])
+		i++;
+	return i;
+}
+
+static size_t rstrip_one_newline(const char *s, size_t len) {
+	return (len > 0 && s[len - 1] == '\n') ? len - 1 : len;
+}
+
+status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,
+											const char *content, int add_generation_prompt,
+											char **out, char *errbuf, size_t errbuf_len) {
+	if (!cts || !cts->prog || !out)
+		return ERR_INVALID_ARG;
+	*out = NULL;
+
+	chat_message extra = {.role	   = (char *)(role ? role : "user"),
+						  .content = (char *)(content ? content : "")};
+	jinja_value *g	   = build_globals(cts, &extra, 1, add_generation_prompt);
+	status_code	 rc	   = jinja_render(cts->prog, g, out, errbuf, errbuf_len);
+	jinja_value_free(g);
+	return rc == OK ? OK : ERR_FORMAT;
+}
+
+size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *system) {
+	if (!cts || !cts->prog)
+		return 0;
+
+	const char	*sys	 = (system && *system) ? system : "";
+	chat_message sys_msg = {.role = (char *)"system", .content = (char *)sys};
+
+	char  *r1 = NULL, *r2 = NULL;
+	size_t prefix_len = 0;
+
+	jinja_set_time_shift(0);
+	jinja_value *g1	 = build_globals(cts, &sys_msg, 1, 0);
+	status_code	 rc1 = jinja_render(cts->prog, g1, &r1, NULL, 0);
+	jinja_value_free(g1);
+	if (rc1 != OK)
+		goto out;
+
+	jinja_set_time_shift(86400);
+	jinja_value *g2	 = build_globals(cts, &sys_msg, 1, 0);
+	status_code	 rc2 = jinja_render(cts->prog, g2, &r2, NULL, 0);
+	jinja_value_free(g2);
+	if (rc2 != OK)
+		goto out;
+
+	prefix_len = lcp_len(r1, r2);
+	DEBUG("static prefix: %zu bytes", prefix_len);
+
+out:
+	jinja_set_time_shift(0);
+	free(r1);
+	free(r2);
+	return prefix_len;
 }
 
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
@@ -122,24 +190,26 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 	cts->messages[cts->n_messages].content = xstrdup(content);
 	cts->n_messages++;
 
-	jinja_value *globals = build_globals(cts, add_generation_prompt);
+	jinja_value *globals = build_globals(cts, NULL, 0, add_generation_prompt);
 	char		*rendered;
 	status_code	 rc = jinja_render(cts->prog, globals, &rendered, errbuf, errbuf_len);
 	jinja_value_free(globals);
 	if (rc != OK)
 		return rc;
 
-	size_t prev_len = strlen(cts->last_render);
 	size_t new_len	= strlen(rendered);
+	size_t prev_len = strlen(cts->last_render);
+	size_t new_cmp	= rstrip_one_newline(rendered, new_len);
+	size_t prev_cmp = rstrip_one_newline(cts->last_render, prev_len);
 
 	const char *diff;
 	size_t		diff_len;
-	if (new_len < prev_len || strncmp(rendered, cts->last_render, prev_len) != 0) {
+	if (new_cmp < prev_cmp || strncmp(rendered, cts->last_render, prev_cmp) != 0) {
 		diff	 = rendered;
 		diff_len = new_len;
 	} else {
-		diff	 = rendered + prev_len;
-		diff_len = new_len - prev_len;
+		diff	 = rendered + prev_cmp;
+		diff_len = new_len - prev_cmp;
 	}
 	*out = xstrdup(diff);
 
