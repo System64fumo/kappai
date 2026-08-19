@@ -753,12 +753,20 @@ void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt,
 	}
 	if (dim % qt->block != 0)
 		return;
+	if (!test_type_per_row(qt->type)) {
+		char label[128];
+		snprintf(label, sizeof(label), "%s dequant_parity dim=%d rows=%d (skip)", qt->name, dim,
+				 n_rows);
+		record_result(OPFAM_DEQUANT_PARITY, label, V_SKIP,
+					  "group-repacked type has no per-row lookup");
+		return;
+	}
 
-	int	  vocab	   = n_rows;
-	int	  n_blocks = vocab * (dim / qt->block);
-	void *blocks   = xcalloc((size_t)n_blocks, qt->bytes);
+	int	  vocab = n_rows;
+	void *blocks;
 	seed_test_rng(0xDE44ULL + qt->type + ((uint64_t)dim * 17));
-	fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
+	blocks					= test_make_weight(qt, vocab, dim, NULL);
+	const size_t row_stride = ggml_row_size(qt->type, (size_t)dim);
 
 	tensor_desc wd = {
 		.host_data = blocks,
@@ -767,12 +775,10 @@ void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt,
 		.dims	   = {dim, vocab},
 	};
 
-	dequant_fn dq	   = get_dequant_fn(qt->type);
-	float	  *ref_all = xmalloc((size_t)vocab * dim * sizeof(float));
+	float *ref_all = xmalloc((size_t)vocab * dim * sizeof(float));
 	for (int row = 0; row < vocab; row++) {
-		const void *row_blocks =
-			(const char *)blocks + ((size_t)row * (dim / qt->block) * qt->bytes);
-		dq(row_blocks, dim / qt->block, ref_all + (row * dim));
+		const void *row_blocks = (const uint8_t *)blocks + (size_t)row * row_stride;
+		dequant_row_dispatch(qt->type, row_blocks, dim, ref_all + (row * dim));
 	}
 
 	buffer w_tgt   = {0};
@@ -829,10 +835,9 @@ void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt,
 	}
 
 	for (int row = 0; row < vocab; row++) {
-		const void *row_blocks =
-			(const char *)blocks + ((size_t)row * (dim / qt->block) * qt->bytes);
-		float tmp[4096];
-		dq(row_blocks, dim / qt->block, tmp);
+		const void *row_blocks = (const uint8_t *)blocks + (size_t)row * row_stride;
+		float		tmp[4096];
+		dequant_row_dispatch(qt->type, row_blocks, dim, tmp);
 	}
 	float *ref_worst = ref_all + (worst_row * dim);
 	float *tgt_worst = tgt_all + (worst_row * dim);

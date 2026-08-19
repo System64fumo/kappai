@@ -15,10 +15,8 @@ static void test_op_matmul(backend *cpu, backend *tgt, const qtype_info *qt, int
 		return;
 	}
 
-	int	  n_blocks = n * (k / qt->block);
-	void *blocks   = xcalloc((size_t)n_blocks, qt->bytes);
 	seed_test_rng((0xA5A5ULL * (qt->type + 1) * 1000003ULL) + ((uint64_t)n * 31) + (uint64_t)k);
-	fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
+	void *blocks = test_make_weight(qt, n, k, NULL);
 
 	float *x = xmalloc((size_t)k * sizeof(float));
 	fill_random_f32(x, k, 1.0f);
@@ -89,12 +87,17 @@ static void test_op_embd_lookup(backend *cpu, backend *tgt, const qtype_info *qt
 	}
 	if (dim % qt->block != 0)
 		return;
+	if (!test_type_per_row(qt->type)) {
+		char label[128];
+		snprintf(label, sizeof(label), "%s embd_lookup dim=%d (skip)", qt->name, dim);
+		record_result(OPFAM_EMBD_LOOKUP, label, V_SKIP,
+					  "group-repacked type has no per-row lookup");
+		return;
+	}
 
-	int	  n_blocks = vocab * (dim / qt->block);
-	void *blocks   = xcalloc((size_t)n_blocks, qt->bytes);
 	seed_test_rng((0xC0FFEEULL * (qt->type + 1)) + ((uint64_t)dim * 17));
-	fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
-	int token = (int)(next_u32() % (uint32_t)vocab);
+	void *blocks = test_make_weight(qt, vocab, dim, NULL);
+	int	  token	 = (int)(next_u32() % (uint32_t)vocab);
 
 	tensor_desc wd = {
 		.host_data = blocks,
@@ -1633,11 +1636,9 @@ static void test_op_matmul_residual(backend *cpu, backend *tgt, const qtype_info
 		return;
 	}
 
-	int	  n_blocks = n * (k / qt->block);
-	void *blocks   = xcalloc((size_t)n_blocks, qt->bytes);
 	seed_test_rng((0xA5A5ULL * (qt->type + 1) * 1000003ULL) + ((uint64_t)n * 31) + (uint64_t)k +
 				  0x1234);
-	fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
+	void *blocks = test_make_weight(qt, n, k, NULL);
 
 	float *x		= xmalloc((size_t)k * sizeof(float));
 	float *residual = xmalloc((size_t)n * sizeof(float));

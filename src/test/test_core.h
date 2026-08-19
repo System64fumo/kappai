@@ -118,6 +118,8 @@ uint32_t next_u32(void);
 void	 seed_test_rng(uint64_t s);
 void	 fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t type);
 void	 fill_random_f32(float *x, int n, float scale);
+int		 test_type_per_row(uint32_t type);
+void	*test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes);
 
 void print_summary_table(void);
 void print_final_results(void);

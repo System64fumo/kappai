@@ -10,17 +10,90 @@ static double bench_mul_batch_once(backend *b, const buffer *w, uint32_t w_type,
 	return (double)(time_us() - t0);
 }
 
+typedef void (*repack_fn)(const void *src, void *dst, int n_rows, int k);
+
+static repack_fn bench_repack_fn(uint32_t type, uint32_t *base_type_out) {
+	switch (type) {
+	case GGML_TYPE_Q4_0_R8:
+		*base_type_out = GGML_TYPE_Q4_0;
+		return repack_q4_0_to_q4_0_r8;
+	case GGML_TYPE_Q8_0_R8:
+		*base_type_out = GGML_TYPE_Q8_0;
+		return repack_q8_0_to_q8_0_r8;
+	case GGML_TYPE_IQ4_NL_R8:
+		*base_type_out = GGML_TYPE_IQ4_NL;
+		return repack_iq4_nl_to_iq4_nl_r8;
+	case GGML_TYPE_IQ3_S_RE:
+		*base_type_out = GGML_TYPE_IQ3_S;
+		return repack_iq3_s;
+	case GGML_TYPE_IQ3_S_RE8:
+		*base_type_out = GGML_TYPE_IQ3_S;
+		return repack_iq3_s_to_iq3_s_re8;
+	default:
+		*base_type_out = type;
+		return NULL;
+	}
+}
+
+static void fill_random_f16(uint16_t *x, int n) {
+	for (int i = 0; i < n; i++) {
+		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
+		x[i]	  = f32_to_f16((float)r / 1000.0f);
+	}
+}
+
+static void fill_random_bf16(uint16_t *x, int n) {
+	for (int i = 0; i < n; i++) {
+		int32_t	 r = (int32_t)(next_u32() % 2001) - 1000;
+		float	 f = (float)r / 1000.0f;
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		x[i] = (uint16_t)(bits >> 16);
+	}
+}
+
 static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, int m, int iters) {
-	int	  n_blocks = n * (k / qt->block);
-	void *blocks   = xcalloc((size_t)n_blocks, qt->bytes);
 	seed_test_rng((0xBEEFULL * (qt->type + 1) * 1000003ULL) + (uint64_t)n);
-	fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
+
+	uint32_t  base_type = qt->type;
+	repack_fn repack	= bench_repack_fn(qt->type, &base_type);
+
+	void  *weight_buf;
+	size_t weight_bytes;
+
+	if (qt->type == GGML_TYPE_F32) {
+		weight_bytes = (size_t)n * (size_t)k * sizeof(float);
+		weight_buf	 = xmalloc(weight_bytes);
+		fill_random_f32(weight_buf, n * k, 1.0f);
+	} else if (qt->type == GGML_TYPE_F16) {
+		weight_bytes = (size_t)n * (size_t)k * sizeof(uint16_t);
+		weight_buf	 = xmalloc(weight_bytes);
+		fill_random_f16(weight_buf, n * k);
+	} else if (qt->type == GGML_TYPE_BF16) {
+		weight_bytes = (size_t)n * (size_t)k * sizeof(uint16_t);
+		weight_buf	 = xmalloc(weight_bytes);
+		fill_random_bf16(weight_buf, n * k);
+	} else {
+		int	  n_blocks = n * (k / qt->block);
+		void *base	   = xcalloc((size_t)n_blocks, qt->bytes);
+		fill_random_blocks(base, n_blocks, qt->bytes, base_type);
+
+		if (repack) {
+			weight_bytes = (size_t)n * ggml_row_size(qt->type, (size_t)k);
+			weight_buf	 = xmalloc(weight_bytes);
+			repack(base, weight_buf, n, k);
+			free(base);
+		} else {
+			weight_bytes = (size_t)n_blocks * qt->bytes;
+			weight_buf	 = base;
+		}
+	}
 
 	float *x = xmalloc((size_t)k * (size_t)m * sizeof(float));
 	for (int t = 0; t < m; t++)
 		fill_random_f32(x + (size_t)t * k, k, 1.0f);
 
-	tensor_desc wd = {.host_data = blocks, .type = qt->type, .n_dims = 2, .dims = {k, n}};
+	tensor_desc wd = {.host_data = weight_buf, .type = qt->type, .n_dims = 2, .dims = {k, n}};
 	buffer		w = {0}, xb = {0}, yb = {0};
 	b->buffer_alloc_weight(b, &wd, &w);
 	b->buffer_alloc_scratch(b, (size_t)k * (size_t)m * sizeof(float), &xb);
@@ -41,7 +114,7 @@ static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, i
 	b->buffer_free(b, &xb);
 	b->buffer_free(b, &yb);
 	free(x);
-	free(blocks);
+	free(weight_buf);
 
 	return (2.0 * (double)n * (double)k * (double)m) / best_us * 1e-3;
 }
@@ -101,7 +174,7 @@ int run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_back
 			backend_destroy(b);
 			continue;
 		}
-		printf("  %-6s", "quant");
+		printf("  %-10s", "quant");
 		for (int mi = 0; mi < n_ms; mi++) {
 			printf("   M=%-6d", ms[mi]);
 		}
@@ -111,7 +184,10 @@ int run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_back
 				continue;
 			if (b->matmul_type_native && !b->matmul_type_native(b, QTYPES[qi].type))
 				continue;
-			printf("  %-6s", QTYPES[qi].name);
+			uint32_t repack_base;
+			if (bench_repack_fn(QTYPES[qi].type, &repack_base) && n % 8 != 0)
+				continue;
+			printf("  %-10s", QTYPES[qi].name);
 			fflush(stdout);
 			for (int mi = 0; mi < n_ms; mi++) {
 				double g = bench_mul_gflops(b, &QTYPES[qi], n, k, ms[mi], iters);

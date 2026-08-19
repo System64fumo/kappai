@@ -263,8 +263,16 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k);
+void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, float *restrict y,
+						  int n, int k, int m, int x_row_stride, int y_row_stride);
+void matmul_f16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
+					int k);
+void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y, int n,
+						  int k, int m, int x_row_stride, int y_row_stride);
 void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
 					 int k);
+void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y,
+						   int n, int k, int m, int x_row_stride, int y_row_stride);
 
 float dot_f32(const float *restrict a, const float *restrict b, int n);
 
