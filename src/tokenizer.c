@@ -884,6 +884,60 @@ int tokenizer_is_eog(const tokenizer *t, int32_t id) {
 	return 0;
 }
 
+size_t tokenizer_token_decoded_len(const tokenizer *t, int32_t id) {
+	if (id < 0 || (size_t)id >= t->n_tokens)
+		return 0;
+	const vocab_token *tok = &t->tokens[id];
+	if (tok->type == TOK_TYPE_BYTE)
+		return 1;
+	size_t decoded = 0;
+	size_t i	   = 0;
+	while (i < tok->text_len) {
+		int cp;
+		int k = utf8_to_cp(tok->text + i, (int)(tok->text_len - i), &cp);
+		if (k <= 0)
+			break;
+		int b = (cp < 512) ? g_cp_to_byte[cp] : -1;
+		decoded += (b >= 0) ? 1 : (size_t)k;
+		i += (size_t)k;
+	}
+	return decoded;
+}
+
+int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
+									size_t max_bytes) {
+	size_t cumulative = 0;
+	for (int i = 0; i < n; i++) {
+		int32_t id = ids[i];
+		if (id < 0 || (size_t)id >= t->n_tokens)
+			return i;
+		size_t tlen = tokenizer_token_decoded_len(t, id);
+		if (cumulative + tlen > max_bytes)
+			return i;
+		cumulative += tlen;
+	}
+	return n;
+}
+
+char *tokenizer_decode_prefix(const tokenizer *t, const int32_t *ids, int count) {
+	size_t max_decoded = 0;
+	for (int i = 0; i < count; i++) {
+		int32_t id = ids[i];
+		if (id < 0 || (size_t)id >= t->n_tokens)
+			break;
+		max_decoded += t->tokens[id].text_len;
+	}
+	max_decoded += 16;
+
+	char *out = xmalloc(max_decoded + 1);
+	int	  len = tokenizer_decode((tokenizer *)t, ids, count, out, (int)max_decoded + 1, NULL);
+	if (len < 0) {
+		free(out);
+		return NULL;
+	}
+	return out;
+}
+
 int32_t tokenizer_find_token(const tokenizer *t, const char *text) {
 	if (t->hash) {
 		int32_t id =

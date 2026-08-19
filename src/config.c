@@ -2,6 +2,7 @@
 #include "backend/backend.h"
 #include "log.h"
 
+#include <ctype.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,6 +79,11 @@ void usage(FILE *fp) {
 			"  -M, --min-p <f>          min-p sampling (default 0.10, 0.0 = disabled)\n"
 			"  -s, --seed <n>           RNG seed (0 = random)\n"
 			"  --reasoning [on|off]     allow model reasoning/thinking (default: on)\n\n"
+			"Metrics / startup:\n"
+			"  --metrics <list>         comma-separated metrics to print after generation,\n"
+			"                           in any order: pp,tg,ttft (default: pp,tg)\n"
+			"  --warmup [on|off]        pre-process the static prefix of the chat template\n"
+			"                           at startup (default: off)\n\n"
 			"Tools / debug:\n"
 			"  --list-accels            list available accelerator backends and exit\n"
 			"  --dump-metadata          print raw GGUF metadata and exit\n"
@@ -148,6 +154,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 	a->top_p		 = 0.90f;
 	a->min_p		 = 0.10f;
 	a->output_stream = true;
+	snprintf(a->metrics, sizeof(a->metrics), "pp,tg");
+	a->warmup = false;
 
 	setenv("POSIXLY_CORRECT", "1", 1);
 
@@ -175,7 +183,9 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_SHOW_TEMPLATE,
 		OPT_GREP_VOCAB,
 		OPT_KV_QUANT,
-		OPT_NGL
+		OPT_NGL,
+		OPT_METRICS,
+		OPT_WARMUP
 	};
 
 	static struct option long_opts[] = {
@@ -214,6 +224,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"grep-vocab", required_argument, NULL, OPT_GREP_VOCAB},
 		{"kv-quant", required_argument, NULL, OPT_KV_QUANT},
 		{"ngl", required_argument, NULL, OPT_NGL},
+		{"metrics", required_argument, NULL, OPT_METRICS},
+		{"warmup", optional_argument, NULL, OPT_WARMUP},
 		{0, 0, 0, 0}};
 
 	int c;
@@ -330,6 +342,29 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 			break;
 		case OPT_DISABLE_FAILSAFES:
 			cfg->disable_failsafes = 1;
+			break;
+		case OPT_METRICS: {
+			size_t l = strlen(optarg);
+			if (l == 0 || l >= sizeof(a->metrics)) {
+				fprintf(stderr, "invalid --metrics value '%s' (max %zu chars)\n", optarg,
+						sizeof(a->metrics) - 1);
+				return -1;
+			}
+			for (size_t i = 0; i < l; i++) {
+				char ch = optarg[i];
+				if (ch == ',' || ch == ' ' || (ch >= 'a' && ch <= 'z') ||
+					(ch >= 'A' && ch <= 'Z')) {
+					a->metrics[i] = (char)tolower((unsigned char)ch);
+				} else {
+					fprintf(stderr, "invalid character '%c' in --metrics value '%s'\n", ch, optarg);
+					return -1;
+				}
+			}
+			a->metrics[l] = '\0';
+			break;
+		}
+		case OPT_WARMUP:
+			a->warmup = parse_bool_flag(peek_optional_bool_arg(optarg, argc, argv, &optind), 1);
 			break;
 		case '?':
 			return -1;

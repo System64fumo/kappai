@@ -309,19 +309,22 @@ void monitor_emit_token(monitor *mon, int token_idx, int32_t token_id, int pos, 
 }
 
 void monitor_emit_end(monitor *mon, int tokens_generated, double pp_tps, double tg_tps,
-					  const moe_stats_summary *moe) {
+					  double ttft_ms, const moe_stats_summary *moe) {
 	if (moe && moe->has_moe) {
 		monitor_send(mon,
 					 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f,"
+					 "\"ttft_ms\":%.2f,"
 					 "\"moe_hit\":%.1f,\"moe_pin\":%.1f,\"moe_lru\":%.1f,\"moe_miss\":%llu,"
 					 "\"moe_direct_ok\":%llu,\"moe_direct_fallback\":%llu}",
-					 tokens_generated, pp_tps, tg_tps, moe->hit_rate, moe->pin_rate, moe->lru_rate,
-					 (unsigned long long)moe->cache_misses, (unsigned long long)moe->direct_io_ok,
+					 tokens_generated, pp_tps, tg_tps, ttft_ms, moe->hit_rate, moe->pin_rate,
+					 moe->lru_rate, (unsigned long long)moe->cache_misses,
+					 (unsigned long long)moe->direct_io_ok,
 					 (unsigned long long)moe->direct_io_fallback);
 	} else {
 		monitor_send(mon,
-					 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f}",
-					 tokens_generated, pp_tps, tg_tps);
+					 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f,"
+					 "\"ttft_ms\":%.2f}",
+					 tokens_generated, pp_tps, tg_tps, ttft_ms);
 	}
 }
 

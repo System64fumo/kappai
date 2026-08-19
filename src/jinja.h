@@ -3,6 +3,8 @@
 
 #include "common.h"
 
+#include <time.h>
+
 typedef enum {
 	JV_NONE = 0,
 	JV_BOOL,
@@ -53,5 +55,7 @@ void		   jinja_program_free(jinja_program *prog);
 
 status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, char *errbuf,
 						 size_t errbuf_len);
+
+void jinja_set_time_shift(time_t seconds);
 
 #endif

@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "log.h"
 #include "moe/moe_stream.h"
+#include "warmup.h"
 
 #include <malloc.h>
 #include <signal.h>
@@ -101,17 +102,27 @@ static int run_chat_turn(context *c, cli_args *a, const char *text) {
 	on_token_ud	   ud	= {a->output_stream,	 &gen, false, true, false, c->chat.think_start_id,
 						   c->chat.think_end_id, c};
 	sampler_params samp = {a->temperature, a->top_k, a->top_p, a->min_p};
-	return context_chat_turn(c, "user", text, true, a->n_predict, &samp, on_token_cb, &ud);
+	return context_chat_turn(c, "user", text, true, a->n_predict, &samp, on_token_cb, &ud,
+							 a->metrics[0] ? a->metrics : "pp,tg");
 }
 
 static int run_one_shot(context *c, cli_args *a) {
-	context_reset(c);
-	if (context_prefill_preamble(c, a->system) < 0)
-		return -1;
+	if (!c->warmup_done) {
+		context_reset(c);
+		if (a->warmup)
+			warmup_run(c, a->system);
+	}
+	c->warmup_done = false;
+
+	if (a->warmup)
+		context_idle_prefill_start(c);
 
 	if (a->output_stream)
 		fflush(stderr);
 	int r = run_chat_turn(c, a, a->prompt);
+
+	context_idle_prefill_wait(c);
+
 	if (a->output_stream)
 		printf("\n");
 	if (c->context_limit_hit) {
@@ -125,13 +136,28 @@ static int run_one_shot(context *c, cli_args *a) {
 	return 0;
 }
 
+static void reset_and_warmup(context *c, cli_args *a, const char *system) {
+	context_idle_prefill_wait(c);
+	context_reset(c);
+	if (a->warmup) {
+		warmup_run(c, system);
+		context_idle_prefill_start(c);
+	}
+}
+
 static int run_interactive(context *c, cli_args *a) {
 	printf("kappai interactive chat.\n");
 	printf("Commands: /exit /reset /system <text>  (Ctrl+C interrupts generation)\n\n");
 
-	context_reset(c);
-	if (context_prefill_preamble(c, a->system) < 0)
-		return -1;
+	if (!c->warmup_done) {
+		context_reset(c);
+		if (a->warmup)
+			warmup_run(c, a->system);
+	}
+	c->warmup_done = false;
+
+	if (a->warmup)
+		context_idle_prefill_start(c);
 
 	char line[4096];
 	while (1) {
@@ -148,19 +174,23 @@ static int run_interactive(context *c, cli_args *a) {
 		if (!strcmp(line, "/exit") || !strcmp(line, "/quit"))
 			break;
 		if (!strcmp(line, "/reset")) {
-			context_reset(c);
-			context_prefill_preamble(c, a->system);
+			reset_and_warmup(c, a, a->system);
 			printf("[context reset]\n\n");
 			continue;
 		}
 		if (!strncmp(line, "/system ", 8)) {
-			context_reset(c);
-			context_prefill_preamble(c, line + 8);
+			reset_and_warmup(c, a, line + 8);
 			printf("[system prompt updated]\n\n");
 			continue;
 		}
 
+		context_idle_prefill_wait(c);
+
 		int r = run_chat_turn(c, a, line);
+
+		if (a->warmup)
+			context_idle_prefill_start(c);
+
 		if (c->interrupt) {
 			c->interrupt = 0;
 			printf("\n[interrupted]");
@@ -172,10 +202,11 @@ static int run_interactive(context *c, cli_args *a) {
 		printf("\n\n");
 		if (r < 0) {
 			ERROR("turn failed; resetting context");
-			context_reset(c);
-			context_prefill_preamble(c, a->system);
+			reset_and_warmup(c, a, a->system);
 		}
 	}
+
+	context_idle_prefill_wait(c);
 	return 0;
 }
 

@@ -73,7 +73,12 @@ typedef struct {
 	size_t		  cap;
 } jinja_arena;
 
-static _Thread_local jinja_arena *g_render_arena = NULL;
+static _Thread_local jinja_arena *g_render_arena	 = NULL;
+static _Thread_local time_t		  g_jinja_time_shift = 0;
+
+void jinja_set_time_shift(time_t seconds) {
+	g_jinja_time_shift = seconds;
+}
 
 static void arena_free_shallow(jinja_value *v) {
 	switch (v->type) {
@@ -2187,7 +2192,7 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 		}
 		if (!strcmp(e->str, "strftime_now")) {
 			const char *fmt = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "%d %b %Y";
-			time_t		now = time(NULL);
+			time_t		now = time(NULL) + g_jinja_time_shift;
 			struct tm	tm;
 			localtime_r(&now, &tm);
 			char buf[128];

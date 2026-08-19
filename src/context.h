@@ -10,6 +10,7 @@
 #include "monitor.h"
 #include "sampler.h"
 #include "tokenizer.h"
+#include <pthread.h>
 #include <signal.h>
 
 #define CTX_INTERRUPTED (-2)
@@ -31,6 +32,11 @@ typedef struct {
 	backend				 *backend;
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;
+	bool				  warmup_done;
+	struct {
+		pthread_t thread;
+		bool	  active;
+	} idle;
 } context;
 
 typedef struct {
@@ -54,13 +60,15 @@ void		context_reset(context *c);
 
 void context_monitor_send_start(context *c);
 
-int context_prefill_preamble(context *c, const char *system);
-
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,
-									  const char *phase);
+									  const char *phase, bool quiet);
 
 int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
 					  int max_tokens, const sampler_params						 *samp,
-					  void (*on_token)(int32_t, const char *, int, void *), void *ud);
+					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+					  const char *metrics_spec);
+
+void context_idle_prefill_start(context *c);
+void context_idle_prefill_wait(context *c);
 
 #endif

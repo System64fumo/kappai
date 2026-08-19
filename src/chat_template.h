@@ -38,4 +38,10 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 								   int add_generation_prompt, char **out, char *errbuf,
 								   size_t errbuf_len);
 
+size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *system);
+
+status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,
+											const char *content, int add_generation_prompt,
+											char **out, char *errbuf, size_t errbuf_len);
+
 #endif

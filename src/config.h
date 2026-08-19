@@ -55,6 +55,8 @@ typedef struct {
 	bool		dump_metadata;
 	bool		show_template;
 	const char *grep_vocab;
+	char		metrics[32];
+	bool		warmup;
 } cli_args;
 
 void usage(FILE *fp);
