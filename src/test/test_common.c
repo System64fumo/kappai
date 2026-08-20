@@ -518,6 +518,11 @@ void fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t
 		uint16_t d16   = f32_to_f16(d_val);
 		if (type == GGML_TYPE_Q6_K) {
 			memcpy(bp + 208, &d16, 2);
+		} else if (type == GGML_TYPE_Q2_K) {
+			memcpy(bp + 80, &d16, 2);
+			float	 dmin_val = 0.0002f + (0.005f * ((next_u32() % 997) / 997.0f));
+			uint16_t dmin16	  = f32_to_f16(dmin_val);
+			memcpy(bp + 82, &dmin16, 2);
 		} else {
 			memcpy(bp, &d16, 2);
 			if (type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1) {
@@ -656,11 +661,18 @@ const qtype_info QTYPES[] = {
 	{"q5_0", GGML_TYPE_Q5_0, 32, sizeof(q5_0_block)},
 	{"q5_1", GGML_TYPE_Q5_1, 32, sizeof(q5_1_block)},
 	{"q8_0", GGML_TYPE_Q8_0, 32, sizeof(q8_0_block)},
+	{"q2_K", GGML_TYPE_Q2_K, 256, sizeof(q2_k_block)},
 	{"q4_K", GGML_TYPE_Q4_K, 256, sizeof(q4_k_block)},
 	{"q5_K", GGML_TYPE_Q5_K, 256, sizeof(q5_k_block)},
 	{"q6_K", GGML_TYPE_Q6_K, 256, sizeof(q6_k_block)},
 	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, sizeof(iq4_nl_block)},
 	{"iq4_xs", GGML_TYPE_IQ4_XS, 256, sizeof(iq4_xs_block)},
+	{"iq2_xxs", GGML_TYPE_IQ2_XXS, 256, sizeof(iq2_xxs_block)},
+	{"iq2_xs", GGML_TYPE_IQ2_XS, 256, sizeof(iq2_xs_block)},
+	{"iq2_s", GGML_TYPE_IQ2_S, 256, sizeof(iq2_s_block)},
+	{"iq3_xxs", GGML_TYPE_IQ3_XXS, 256, sizeof(iq3_xxs_block)},
+	{"iq1_s", GGML_TYPE_IQ1_S, 256, sizeof(iq1_s_block)},
+	{"iq1_m", GGML_TYPE_IQ1_M, 256, sizeof(iq1_m_block)},
 	{"iq3_s", GGML_TYPE_IQ3_S, 256, sizeof(iq3_s_block)},
 	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, sizeof(q4_0_block)},
 	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, sizeof(q8_0_block)},

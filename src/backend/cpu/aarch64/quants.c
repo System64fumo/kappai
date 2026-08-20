@@ -259,6 +259,13 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_IQ4_XS:
+	case GGML_TYPE_Q2_K:
+	case GGML_TYPE_IQ2_XXS:
+	case GGML_TYPE_IQ2_XS:
+	case GGML_TYPE_IQ2_S:
+	case GGML_TYPE_IQ3_XXS:
+	case GGML_TYPE_IQ1_S:
+	case GGML_TYPE_IQ1_M:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_Q4_K:
 	case GGML_TYPE_Q5_K:
@@ -290,6 +297,27 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 			break;
 		case GGML_TYPE_IQ4_XS:
 			matmul_iq4_xs_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q2_K:
+			matmul_q2_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ2_XXS:
+			matmul_iq2_xxs_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ2_XS:
+			matmul_iq2_xs_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ2_S:
+			matmul_iq2_s_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ3_XXS:
+			matmul_iq3_xxs_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ1_S:
+			matmul_iq1_s_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ1_M:
+			matmul_iq1_m_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q6_K:
 			matmul_q6_k_q8_f32(w, x, y, n, k, &qs);

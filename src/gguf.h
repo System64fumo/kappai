@@ -39,10 +39,15 @@ typedef enum {
 	GGML_TYPE_Q5_K			= 13,
 	GGML_TYPE_Q6_K			= 14,
 	GGML_TYPE_Q8_K			= 15,
-	GGML_TYPE_IQ4_XS_LEGACY = 18,
+	GGML_TYPE_IQ2_XXS		= 16,
+	GGML_TYPE_IQ2_XS			= 17,
+	GGML_TYPE_IQ3_XXS		= 18,
+	GGML_TYPE_IQ1_S			= 19,
 	GGML_TYPE_IQ4_NL		= 20,
 	GGML_TYPE_IQ3_S			= 21,
+	GGML_TYPE_IQ2_S			= 22,
 	GGML_TYPE_IQ4_XS		= 23,
+	GGML_TYPE_IQ1_M			= 29,
 	GGML_TYPE_BF16			= 30,
 
 	/* 0x40+ = engine-internal repacked types */
