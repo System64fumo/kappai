@@ -1626,3 +1626,17 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 
 	return OK;
 }
+
+void detect_features(char *buf, size_t cap) {
+	buf[0] = '\0';
+	feat_add(buf, cap, "x86_64");
+#if defined(__AVX2__)
+	feat_add(buf, cap, "avx2");
+#endif
+#if defined(__FMA__)
+	feat_add(buf, cap, "fma");
+#endif
+#if defined(__F16C__)
+	feat_add(buf, cap, "f16c");
+#endif
+}

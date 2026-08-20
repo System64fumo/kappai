@@ -746,9 +746,9 @@ static status_code op_ple_build(exec_ctx *ctx) {
 	}
 
 	{
-		buffer		  w_view = {0};
-		w_view.handle		 = (void *)m->layer_dims.per_layer_proj_norm_w.host_ptr;
-		w_view.owner		 = host;
+		buffer w_view = {0};
+		w_view.handle = (void *)m->layer_dims.per_layer_proj_norm_w.host_ptr;
+		w_view.owner  = host;
 		for (int l = 0; l < n_layers; l++) {
 			buffer row_view = {0};
 			row_view.handle = ple_proj + ((size_t)l * n_embd_per_layer);

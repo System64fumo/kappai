@@ -2030,3 +2030,23 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 
 	return OK;
 }
+
+void detect_features(char *buf, size_t cap) {
+	buf[0] = '\0';
+	feat_add(buf, cap, "aarch64");
+#if defined(__ARM_FEATURE_FMA)
+	feat_add(buf, cap, "fma");
+#endif
+#if defined(__ARM_NEON)
+	feat_add(buf, cap, "neon");
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+	feat_add(buf, cap, "dotprod");
+#endif
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+	feat_add(buf, cap, "fp16");
+#endif
+#if defined(__ARM_FEATURE_SVE)
+	feat_add(buf, cap, "sve");
+#endif
+}

@@ -294,7 +294,7 @@ static model_recipe *build_gemma4_recipe(const model *m) {
 		recipe_op *ops = xcalloc(cap, sizeof(recipe_op));
 		int		   i   = recipe_append_gemma4_attn_block(ops, 0, m);
 		i			   = build_gemma4_ffn_prefix(ops, i, m, dim, eps);
-		i			   = build_gemma4_ffn_tail(ops, i, m, eps, r);
+		build_gemma4_ffn_tail(ops, i, m, eps, r);
 	}
 
 	recipe_build_post_ops(r, m);
@@ -374,7 +374,7 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 			.stage = STAGE_ADD,
 		};
 
-		i = build_gemma4_ffn_tail(ops, i, m, eps, r);
+		build_gemma4_ffn_tail(ops, i, m, eps, r);
 	}
 
 	{
