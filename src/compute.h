@@ -72,6 +72,10 @@ typedef struct compute_scratch {
 
 	batch_scratch *bs;
 	float_buf	   batch_logits_tmp;
+	float_buf	   mtp_h;
+	float_buf	   spec_logits;
+	float_buf	   spec_h;
+	int			   spec_rows;
 } compute_scratch;
 
 static inline int compute_model_changed(const compute_scratch *s, const model *m, int n_ctx) {

@@ -367,7 +367,8 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	}
 
 	ctx->chat.enable_thinking = ec->reasoning;
-	DEBUG("reasoning=%s", ec->reasoning ? "on" : "off");
+	DEBUG("reasoning=%s spec-type=%s", ec->reasoning ? "on" : "off",
+		  ec->spec_type == SPEC_TYPE_MTP ? "mtp" : "none");
 
 	if (ec->debug_forward) {
 		ctx->debug_forward = true;

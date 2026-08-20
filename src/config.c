@@ -21,6 +21,7 @@ config config_defaults(void) {
 	c.moe_stream	= true;
 	c.moe_cache_cap = 0;
 	c.ngl			= -1;
+	c.spec_type		= SPEC_TYPE_MTP;
 
 	return c;
 }
@@ -68,7 +69,9 @@ void usage(FILE *fp) {
 			"  --moe-preload            eagerly load all expert weights at startup\n"
 			"  --moe-pin <n>            pin first n experts per layer (never evicted)\n"
 			"  --moe-pin-list <ids>     pin specific expert ids, e.g. \"3,17,42\"\n"
-			"  --stream [on|off]        stream partial output as it's generated (default: on)\n\n"
+			"  --stream [on|off]        stream partial output as it's generated (default: on)\n"
+			"  --spec-type TYPE         speculative decoding types, comma-separated\n"
+			"                           (default: mtp; supported: none, mtp)\n\n"
 			"LLM behavior:\n"
 			"  -p, --prompt <text>      one-shot prompt (or last positional arg)\n"
 			"  --system <text>          system prompt\n"
@@ -119,6 +122,33 @@ static const char *peek_optional_bool_arg(const char *optarg, int argc, char **a
 		return candidate;
 	}
 	return NULL;
+}
+
+static int parse_spec_type(const char *s, config *cfg) {
+	cfg->spec_type = SPEC_TYPE_NONE;
+	const char *p  = s;
+	while (*p) {
+		while (*p == ',' || *p == ' ')
+			p++;
+		if (!*p)
+			break;
+		const char *end = p;
+		while (*end && *end != ',')
+			end++;
+		size_t n = (size_t)(end - p);
+		while (n > 0 && p[n - 1] == ' ')
+			n--;
+		if (n == 4 && !strncmp(p, "none", 4))
+			;
+		else if (n == 3 && !strncmp(p, "mtp", 3))
+			cfg->spec_type = SPEC_TYPE_MTP;
+		else {
+			fprintf(stderr, "invalid --spec-type value '%.*s' (expected none or mtp)\n", (int)n, p);
+			return -1;
+		}
+		p = *end ? end + 1 : end;
+	}
+	return 0;
 }
 
 static void parse_kv_quant(const char *optarg, config *cfg) {
@@ -185,7 +215,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_KV_QUANT,
 		OPT_NGL,
 		OPT_METRICS,
-		OPT_WARMUP
+		OPT_WARMUP,
+		OPT_SPEC_TYPE
 	};
 
 	static struct option long_opts[] = {
@@ -226,6 +257,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"ngl", required_argument, NULL, OPT_NGL},
 		{"metrics", required_argument, NULL, OPT_METRICS},
 		{"warmup", optional_argument, NULL, OPT_WARMUP},
+		{"spec-type", required_argument, NULL, OPT_SPEC_TYPE},
 		{0, 0, 0, 0}};
 
 	int c;
@@ -365,6 +397,10 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		}
 		case OPT_WARMUP:
 			a->warmup = parse_bool_flag(peek_optional_bool_arg(optarg, argc, argv, &optind), 1);
+			break;
+		case OPT_SPEC_TYPE:
+			if (parse_spec_type(optarg, cfg) != 0)
+				return -1;
 			break;
 		case '?':
 			return -1;

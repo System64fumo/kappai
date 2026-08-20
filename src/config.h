@@ -30,7 +30,14 @@ typedef struct config {
 	bool profile_time;
 	bool reasoning;
 	bool disable_failsafes;
+
+	int spec_type;
 } config;
+
+enum {
+	SPEC_TYPE_NONE = 0,
+	SPEC_TYPE_MTP  = 1,
+};
 
 config config_defaults(void);
 

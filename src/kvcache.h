@@ -16,9 +16,12 @@ typedef struct kvcache_mla {
 typedef struct kvcache_qwen35 {
 	float *conv_state;
 	float *recurrent_state;
+	float *conv_ckpt;
+	float *recurrent_ckpt;
 	size_t conv_stride;
 	size_t recurrent_stride;
 	int n_layers;
+	int ckpt_enable;
 } kvcache_qwen35;
 
 typedef struct kvcache {
@@ -44,6 +47,7 @@ typedef struct kvcache {
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant);
 void		kvcache_free(kvcache *c);
 void		kvcache_reset(kvcache *c);
+void		kvcache_qwen35_ckpt_restore(kvcache *c);
 
 status_code kvcache_alloc_host_mirror(kvcache *c, const model *m);
 

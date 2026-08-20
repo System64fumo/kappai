@@ -149,7 +149,7 @@ typedef struct model {
 	model_arch		 arch;
 	const arch_info *arch_info;
 
-	int	  n_layers, n_ctx, dim, n_heads, n_kv_heads, head_dim;
+	int	  n_layers, n_layer_nextn, n_ctx, dim, n_heads, n_kv_heads, head_dim;
 	float dim_sqrt;
 	int	  intermediate, vocab_size, rope_dim;
 	float norm_eps, rope_theta;
@@ -165,6 +165,7 @@ typedef struct model {
 	int			 rope_freqs_count;
 
 	weight_ref	   tok_embd, output_norm_w, output_w;
+	weight_ref	   mtp_eh_proj, mtp_enorm, mtp_hnorm, mtp_shared_head_norm;
 	layer_weights *layers;
 
 	model_mla_params		mla;
@@ -272,6 +273,12 @@ static inline int model_layer_is_moe(const model *m, int li) {
 	if (li < 0 || li >= m->n_layers)
 		return 0;
 	return m->layers[li].is_moe_layer;
+}
+
+static inline int model_n_all_layers(const model *m) {
+	if (!m)
+		return 0;
+	return m->n_layers + m->n_layer_nextn;
 }
 
 static inline int model_layer_is_recurrent(const model *m, int li) {

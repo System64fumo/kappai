@@ -982,7 +982,7 @@ static status_code upload_all_weights(model *m) {
 	upload_embeddings(m);
 
 	progress prog;
-	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers);
+	progress_start(&prog, "Preparing weights", (uint64_t)model_n_all_layers(m));
 
 	if (m->gctx.fd >= 0 && m->gctx.map && m->gctx.n_tensors > 0) {
 		uint64_t ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
@@ -1025,6 +1025,46 @@ static status_code upload_all_weights(model *m) {
 		if (s != OK) {
 			progress_finish(&prog);
 			return s;
+		}
+	}
+
+	if (m->n_layer_nextn == 1) {
+		s = upload_layer_weights(m, m->n_layers, &prog);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
+		}
+		backend *be = m->backend;
+		s = upload_tensor_repack_to(m, m->mtp_eh_proj.host_ptr, &m->mtp_eh_proj.type, 2,
+									(uint64_t)(2 * m->dim), (uint64_t)m->dim, WCLASS_MATMUL, be,
+									&m->mtp_eh_proj.buf);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
+		}
+		m->mtp_enorm.type = GGML_TYPE_F32;
+		s = upload_tensor_to(m, m->mtp_enorm.host_ptr, m->mtp_enorm.type, 1, (uint64_t)m->dim, 0,
+							 WCLASS_NORM, be, &m->mtp_enorm.buf);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
+		}
+		m->mtp_hnorm.type = GGML_TYPE_F32;
+		s = upload_tensor_to(m, m->mtp_hnorm.host_ptr, m->mtp_hnorm.type, 1, (uint64_t)m->dim, 0,
+							 WCLASS_NORM, be, &m->mtp_hnorm.buf);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
+		}
+		if (m->mtp_shared_head_norm.host_ptr) {
+			m->mtp_shared_head_norm.type = GGML_TYPE_F32;
+			s = upload_tensor_to(m, m->mtp_shared_head_norm.host_ptr, m->mtp_shared_head_norm.type,
+								 1, (uint64_t)m->dim, 0, WCLASS_NORM, be,
+								 &m->mtp_shared_head_norm.buf);
+			if (s != OK) {
+				progress_finish(&prog);
+				return s;
+			}
 		}
 	}
 
@@ -1552,10 +1592,14 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 			 prefix, n_layer_nextn, n_layer_all);
 		n_layer_nextn = 0;
 	}
-	m->n_layers = n_layer_all - n_layer_nextn;
-	if (n_layer_nextn > 0) {
-		DEBUG("skipping %d NextN/MTP layers (n_layers=%d of %d)", n_layer_nextn, m->n_layers,
-			  n_layer_all);
+	m->n_layers		 = n_layer_all - n_layer_nextn;
+	m->n_layer_nextn = 0;
+	if (n_layer_nextn == 1) {
+		if (config_get()->spec_type == SPEC_TYPE_MTP)
+			m->n_layer_nextn = 1;
+	} else if (n_layer_nextn > 1) {
+		WARN("model_load: nextn_predict_layers=%d not supported (need 1); MTP disabled",
+			 n_layer_nextn);
 	}
 	if (req_i32(g, prefix, "context_length", &v32) != OK) {
 		return ERR_FORMAT;
@@ -1718,6 +1762,144 @@ static int qwen35_layer_is_recurrent(const model *m, const gguf_ctx *g, int laye
 	return ((layer + 1) % m->qwen35.full_attention_interval) != 0;
 }
 
+static status_code load_weight_named(const gguf_ctx *g, weight_ref *ref, const char *name,
+									 int required) {
+	const gguf_tensor *t = gguf_find_tensor(g, name);
+	if (!t) {
+		if (required) {
+			ERROR("model_load: missing required tensor '%s'", name);
+			return ERR_FORMAT;
+		}
+		*ref = (weight_ref){0};
+		return OK;
+	}
+	ref->host_ptr = t->data;
+	ref->type	  = t->type;
+	return OK;
+}
+
+static status_code load_mtp_layer(model *m, const gguf_ctx *g) {
+	if (m->n_layer_nextn != 1)
+		return OK;
+	int			   i = m->n_layers;
+	layer_weights *L = &m->layers[i];
+	char		   tname[160];
+
+	L->head_dim		= m->head_dim;
+	L->intermediate = m->intermediate;
+	L->n_kv_heads	= m->n_kv_heads;
+	L->rope_dim		= m->rope_dim;
+	L->has_own_v	= 1;
+	L->is_recurrent = 0;
+
+	snprintf(tname, sizeof(tname), "blk.%d.nextn.eh_proj.weight", i);
+	if (load_weight_named(g, &m->mtp_eh_proj, tname, 0) != OK || !m->mtp_eh_proj.host_ptr) {
+		WARN("MTP: %s missing; draft head disabled", tname);
+		m->n_layer_nextn = 0;
+		return OK;
+	}
+	snprintf(tname, sizeof(tname), "blk.%d.nextn.enorm.weight", i);
+	if (load_weight_named(g, &m->mtp_enorm, tname, 1) != OK)
+		return ERR_FORMAT;
+	snprintf(tname, sizeof(tname), "blk.%d.nextn.hnorm.weight", i);
+	if (load_weight_named(g, &m->mtp_hnorm, tname, 1) != OK)
+		return ERR_FORMAT;
+	snprintf(tname, sizeof(tname), "blk.%d.nextn.shared_head_norm.weight", i);
+	load_weight_named(g, &m->mtp_shared_head_norm, tname, 0);
+
+	if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_norm_w, "blk.%d.attn_norm.weight",
+						  0) != OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wq, "blk.%d.attn_q.weight", 0) != OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wk, "blk.%d.attn_k.weight", 0) != OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wo, "blk.%d.attn_output.weight", 0) !=
+			OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->gate_w, "blk.%d.ffn_gate.weight", 0) !=
+			OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->up_w, "blk.%d.ffn_up.weight", 0) !=
+			OK ||
+		load_layer_tensor(g, tname, sizeof(tname), i, L, &L->down_w, "blk.%d.ffn_down.weight", 0) !=
+			OK)
+		return ERR_FORMAT;
+
+	snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", i);
+	if (load_weight_named(g, &L->wv, tname, 1) != OK)
+		return ERR_FORMAT;
+	if (m->arch_info->has_attn_post_norm) {
+		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->post_attn_norm_w,
+							  "blk.%d.post_attention_norm.weight", 0) != OK)
+			return ERR_FORMAT;
+	}
+	if (m->arch_info->has_qk_norm) {
+		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_q_norm_w,
+							  "blk.%d.attn_q_norm.weight", 0) != OK ||
+			load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_k_norm_w,
+							  "blk.%d.attn_k_norm.weight", 0) != OK)
+			return ERR_FORMAT;
+	}
+	INFO("MTP: loaded blk.%d NextN draft head", i);
+	return OK;
+}
+
+static void fill_wrefs_row(model *m, int li) {
+	layer_weights *L   = &m->layers[li];
+	weight_ref	 **row = &m->wrefs_by_layer[(size_t)li * WIDX_COUNT];
+	row[WIDX_TOK_EMBD]		  = (weight_ref *)&m->tok_embd;
+	row[WIDX_OUTPUT_NORM]	  = (weight_ref *)&m->output_norm_w;
+	row[WIDX_OUTPUT_W]		  = (weight_ref *)&m->output_w;
+	row[WIDX_ATTN_NORM]		  = &L->attn_norm_w;
+	row[WIDX_WQ]			  = &L->wq;
+	row[WIDX_WK]			  = &L->wk;
+	row[WIDX_WV]			  = &L->wv;
+	row[WIDX_WO]			  = &L->wo;
+	row[WIDX_FFN_NORM]		  = &L->ffn_norm_w;
+	row[WIDX_GATE]			  = &L->gate_w;
+	row[WIDX_UP]			  = &L->up_w;
+	row[WIDX_DOWN]			  = &L->down_w;
+	row[WIDX_GATE_UP]		  = &L->gate_up_w;
+	row[WIDX_POST_ATTN_NORM]  = &L->post_attn_norm_w;
+	row[WIDX_POST_FFN_NORM]	  = &L->post_ffn_norm_w;
+	row[WIDX_ATTN_Q_NORM]	  = &L->attn_q_norm_w;
+	row[WIDX_ATTN_K_NORM]	  = &L->attn_k_norm_w;
+	row[WIDX_PLE_POST_NORM]	  = &L->ple_post_norm_w;
+	row[WIDX_PLE_INP_GATE]	  = &L->ple_inp_gate_w;
+	row[WIDX_PLE_PROJ]		  = &L->ple_proj_w;
+	row[WIDX_LAYER_OUT_SCALE] = &L->layer_out_scale_w;
+	row[WIDX_ROPE_FREQS]	  = m->rope_freqs_count > 0 ? (weight_ref *)&m->rope_freqs_w : NULL;
+	row[WIDX_PER_LAYER_TOK_EMBD]   = (weight_ref *)&m->layer_dims.per_layer_tok_embd;
+	row[WIDX_PER_LAYER_MODEL_PROJ] = (weight_ref *)&m->layer_dims.per_layer_model_proj;
+	row[WIDX_PER_LAYER_PROJ_NORM]  = (weight_ref *)&m->layer_dims.per_layer_proj_norm_w;
+	row[WIDX_FFN_GATE_INP]		   = &L->router_w;
+	row[WIDX_EXP_PROBS_BIAS]	   = &L->router_bias;
+	row[WIDX_FFN_GATE_INP_S]	   = &L->router_scale_w;
+	row[WIDX_FFN_PRE_NORM_2]	   = &L->ffn_pre_norm_2_w;
+	row[WIDX_FFN_POST_NORM_1]	   = &L->ffn_post_norm_1_w;
+	row[WIDX_FFN_POST_NORM_2]	   = &L->ffn_post_norm_2_w;
+	row[WIDX_SHEXP_GATE]		   = &L->shexp_gate_w;
+	row[WIDX_SHEXP_UP]			   = &L->shexp_up_w;
+	row[WIDX_SHEXP_DOWN]		   = &L->shexp_down_w;
+	row[WIDX_MLA_Q_A]			   = &L->q_a_w;
+	row[WIDX_MLA_Q_B]			   = &L->q_b_w;
+	row[WIDX_MLA_Q_A_NORM]		   = &L->q_a_norm_w;
+	row[WIDX_MLA_KV_A]			   = &L->kv_a_w;
+	row[WIDX_MLA_K_B]			   = &L->k_b_w;
+	row[WIDX_MLA_V_B]			   = &L->v_b_w;
+	row[WIDX_MLA_KV_A_NORM]		   = &L->kv_a_norm_w;
+	row[WIDX_ATTN_QKV]			   = &L->attn_qkv_w;
+	row[WIDX_ATTN_GATE]			   = &L->attn_gate_w;
+	row[WIDX_SSM_CONV1D]			   = &L->ssm_conv1d_w;
+	row[WIDX_SSM_DT]				   = &L->ssm_dt_b;
+	row[WIDX_SSM_A]				   = &L->ssm_a;
+	row[WIDX_SSM_BETA]			   = &L->ssm_beta_w;
+	row[WIDX_SSM_ALPHA]			   = &L->ssm_alpha_w;
+	row[WIDX_SSM_NORM]			   = &L->ssm_norm_w;
+	row[WIDX_SSM_OUT]				   = &L->ssm_out_w;
+	row[WIDX_MTP_EH_PROJ]		   = &m->mtp_eh_proj;
+	row[WIDX_MTP_ENORM]			   = &m->mtp_enorm;
+	row[WIDX_MTP_HNORM]			   = &m->mtp_hnorm;
+	row[WIDX_MTP_HEAD_NORM]		   = m->mtp_shared_head_norm.host_ptr ? &m->mtp_shared_head_norm
+																	  : (weight_ref *)&m->output_norm_w;
+}
+
 static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 	if (!m->use_mmap) {
 		status_code rs = gguf_sparse_read_tensors(&m->gctx, m->model_path);
@@ -1782,7 +1964,7 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		m->layer_dims.per_layer_proj_norm_w.host_ptr = t->data;
 	}
 
-	m->layers = xcalloc(m->n_layers, sizeof(layer_weights));
+	m->layers = xcalloc((size_t)model_n_all_layers(m), sizeof(layer_weights));
 	char tname[128];
 	for (int i = 0; i < m->n_layers; i++) {
 		layer_weights	  *L = &m->layers[i];
@@ -2296,61 +2478,13 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		}
 	}
 
-	m->wrefs_by_layer = xcalloc((size_t)m->n_layers * WIDX_COUNT, sizeof(weight_ref *));
-	for (int li = 0; li < m->n_layers; li++) {
-		layer_weights *L		  = &m->layers[li];
-		weight_ref	 **row		  = &m->wrefs_by_layer[(size_t)li * WIDX_COUNT];
-		row[WIDX_TOK_EMBD]		  = (weight_ref *)&m->tok_embd;
-		row[WIDX_OUTPUT_NORM]	  = (weight_ref *)&m->output_norm_w;
-		row[WIDX_OUTPUT_W]		  = (weight_ref *)&m->output_w;
-		row[WIDX_ATTN_NORM]		  = &L->attn_norm_w;
-		row[WIDX_WQ]			  = &L->wq;
-		row[WIDX_WK]			  = &L->wk;
-		row[WIDX_WV]			  = &L->wv;
-		row[WIDX_WO]			  = &L->wo;
-		row[WIDX_FFN_NORM]		  = &L->ffn_norm_w;
-		row[WIDX_GATE]			  = &L->gate_w;
-		row[WIDX_UP]			  = &L->up_w;
-		row[WIDX_DOWN]			  = &L->down_w;
-		row[WIDX_GATE_UP]		  = &L->gate_up_w;
-		row[WIDX_POST_ATTN_NORM]  = &L->post_attn_norm_w;
-		row[WIDX_POST_FFN_NORM]	  = &L->post_ffn_norm_w;
-		row[WIDX_ATTN_Q_NORM]	  = &L->attn_q_norm_w;
-		row[WIDX_ATTN_K_NORM]	  = &L->attn_k_norm_w;
-		row[WIDX_PLE_POST_NORM]	  = &L->ple_post_norm_w;
-		row[WIDX_PLE_INP_GATE]	  = &L->ple_inp_gate_w;
-		row[WIDX_PLE_PROJ]		  = &L->ple_proj_w;
-		row[WIDX_LAYER_OUT_SCALE] = &L->layer_out_scale_w;
-		row[WIDX_ROPE_FREQS]	  = m->rope_freqs_count > 0 ? (weight_ref *)&m->rope_freqs_w : NULL;
-		row[WIDX_PER_LAYER_TOK_EMBD]   = (weight_ref *)&m->layer_dims.per_layer_tok_embd;
-		row[WIDX_PER_LAYER_MODEL_PROJ] = (weight_ref *)&m->layer_dims.per_layer_model_proj;
-		row[WIDX_PER_LAYER_PROJ_NORM]  = (weight_ref *)&m->layer_dims.per_layer_proj_norm_w;
-		row[WIDX_FFN_GATE_INP]		   = &L->router_w;
-		row[WIDX_EXP_PROBS_BIAS]	   = &L->router_bias;
-		row[WIDX_FFN_GATE_INP_S]	   = &L->router_scale_w;
-		row[WIDX_FFN_PRE_NORM_2]	   = &L->ffn_pre_norm_2_w;
-		row[WIDX_FFN_POST_NORM_1]	   = &L->ffn_post_norm_1_w;
-		row[WIDX_FFN_POST_NORM_2]	   = &L->ffn_post_norm_2_w;
-		row[WIDX_SHEXP_GATE]		   = &L->shexp_gate_w;
-		row[WIDX_SHEXP_UP]			   = &L->shexp_up_w;
-		row[WIDX_SHEXP_DOWN]		   = &L->shexp_down_w;
-		row[WIDX_MLA_Q_A]			   = &L->q_a_w;
-		row[WIDX_MLA_Q_B]			   = &L->q_b_w;
-		row[WIDX_MLA_Q_A_NORM]		   = &L->q_a_norm_w;
-		row[WIDX_MLA_KV_A]			   = &L->kv_a_w;
-		row[WIDX_MLA_K_B]			   = &L->k_b_w;
-		row[WIDX_MLA_V_B]			   = &L->v_b_w;
-		row[WIDX_MLA_KV_A_NORM]		   = &L->kv_a_norm_w;
-		row[WIDX_ATTN_QKV]			   = &L->attn_qkv_w;
-		row[WIDX_ATTN_GATE]			   = &L->attn_gate_w;
-		row[WIDX_SSM_CONV1D]			   = &L->ssm_conv1d_w;
-		row[WIDX_SSM_DT]				   = &L->ssm_dt_b;
-		row[WIDX_SSM_A]				   = &L->ssm_a;
-		row[WIDX_SSM_BETA]			   = &L->ssm_beta_w;
-		row[WIDX_SSM_ALPHA]			   = &L->ssm_alpha_w;
-		row[WIDX_SSM_NORM]			   = &L->ssm_norm_w;
-		row[WIDX_SSM_OUT]				   = &L->ssm_out_w;
-	}
+	if (load_mtp_layer(m, g) != OK)
+		return ERR_FORMAT;
+
+	int n_all = model_n_all_layers(m);
+	m->wrefs_by_layer = xcalloc((size_t)n_all * WIDX_COUNT, sizeof(weight_ref *));
+	for (int li = 0; li < n_all; li++)
+		fill_wrefs_row(m, li);
 
 	return OK;
 }
@@ -2504,7 +2638,7 @@ void model_free(model *m) {
 	}
 
 	if (m->backend && m->layers) {
-		for (int i = 0; i < m->n_layers; i++) {
+		for (int i = 0; i < model_n_all_layers(m); i++) {
 			layer_weights *L = &m->layers[i];
 			free_weight_buf(&L->attn_norm_w.buf);
 			free_weight_buf(&L->wq.buf);
@@ -2572,6 +2706,10 @@ void model_free(model *m) {
 		free_weight_buf(&m->tok_embd.buf);
 		free_weight_buf(&m->output_norm_w.buf);
 		free_weight_buf(&m->output_w.buf);
+		free_weight_buf(&m->mtp_eh_proj.buf);
+		free_weight_buf(&m->mtp_enorm.buf);
+		free_weight_buf(&m->mtp_hnorm.buf);
+		free_weight_buf(&m->mtp_shared_head_norm.buf);
 		if (m->has_per_layer_embeddings) {
 			free_weight_buf(&m->layer_dims.per_layer_tok_embd.buf);
 			free_weight_buf(&m->layer_dims.per_layer_model_proj.buf);

@@ -422,6 +422,33 @@ static void monitor_setup_cb(context *c, sub_token_cb_ud *cb, const char *phase,
 	compute_set_layer_progress_cb(&c->scratch, sub_token_cb, cb);
 }
 
+static void context_sync_logits_slot(context *c) {
+	buffer *lb = &c->scratch.slots[RECIPE_SLOT_LOGITS];
+	if (lb->owner && lb->owner->buffer_write_f32)
+		lb->owner->buffer_write_f32(lb->owner, lb, c->scratch.logits_host, c->m.vocab_size);
+}
+
+static void context_emit_tok(context *c, int32_t tok, int gen_idx,
+							 void (*on_token)(int32_t, const char *, int, void *), void *ud,
+							 uint64_t ttft_start_us, uint64_t *out_ttft_us, bool *ttft_captured) {
+	if (!(on_token || monitor_active(&c->monitor)))
+		return;
+	char piece[256];
+	int	 pn = tokenizer_decode(&c->tok, &tok, 1, piece, sizeof(piece), &c->scratch.prof);
+	if (pn < 0)
+		pn = 0;
+	piece[pn] = '\0';
+	if (!*ttft_captured) {
+		if (out_ttft_us)
+			*out_ttft_us = time_us() - ttft_start_us;
+		*ttft_captured = true;
+	}
+	if (on_token)
+		on_token(tok, piece, pn, ud);
+	if (monitor_active(&c->monitor))
+		monitor_emit_token(&c->monitor, gen_idx, tok, c->kv.n_pos, piece, pn);
+}
+
 static int context_decode_loop(context *c, int max_tokens, float temperature, int top_k,
 							   void (*on_token)(int32_t, const char *, int, void *), void *ud,
 							   uint64_t ttft_start_us, uint64_t *out_ttft_us) {
@@ -430,35 +457,76 @@ static int context_decode_loop(context *c, int max_tokens, float temperature, in
 	int				generated = 0;
 	sub_token_cb_ud cb;
 	bool			ttft_captured = (out_ttft_us == NULL);
-
-	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
+	for (; max_tokens < 0 || generated < max_tokens;) {
 		if (c->interrupt)
 			break;
 		monitor_poll(&c->monitor);
-		monitor_setup_cb(c, &cb, "decode", i, i + 1);
+		monitor_setup_cb(c, &cb, "decode", generated, generated + 1);
 		int32_t tok = context_sample_next(c);
 		if (tokenizer_is_eog(&c->tok, tok))
 			break;
-		if (on_token || monitor_active(&c->monitor)) {
-			char piece[256];
-			int	 pn = tokenizer_decode(&c->tok, &tok, 1, piece, sizeof(piece), &c->scratch.prof);
-			if (pn < 0)
-				pn = 0;
-			piece[pn] = '\0';
-			if (!ttft_captured) {
-				if (out_ttft_us)
-					*out_ttft_us = time_us() - ttft_start_us;
-				ttft_captured = true;
-			}
-			if (on_token)
-				on_token(tok, piece, pn, ud);
-			if (monitor_active(&c->monitor))
-				monitor_emit_token(&c->monitor, i, tok, c->kv.n_pos - 1, piece, pn);
-		}
+		context_emit_tok(c, tok, generated, on_token, ud, ttft_start_us, out_ttft_us,
+						 &ttft_captured);
 		generated++;
+
+		int can_spec = c->m.n_layer_nextn == 1 && c->scratch.mtp_h.p &&
+					   (max_tokens < 0 || generated < max_tokens) && c->kv.n_pos + 2 <= c->n_ctx;
+		if (can_spec) {
+			int32_t draft = -1;
+			int		pos	  = c->kv.n_pos;
+			status_code st =
+				mtp_draft_token(&c->m, &c->kv, &c->scratch, tok, pos, c->scratch.mtp_h.p,
+								c->flash_attn, &draft);
+			if (st == OK && draft >= 0 && !tokenizer_is_eog(&c->tok, draft)) {
+				int32_t pair[2] = {tok, draft};
+				if (c->kv.qwen35)
+					c->kv.qwen35->ckpt_enable = 1;
+				c->scratch.spec_rows = 2;
+				st = compute_forward_batch(&c->m, &c->kv, &c->scratch, pair, 2, pos, c->flash_attn,
+										   c->scratch.logits_host);
+				c->scratch.spec_rows = 0;
+				if (c->kv.qwen35)
+					c->kv.qwen35->ckpt_enable = 0;
+				if (st == ERR_INTERRUPTED)
+					break;
+				if (st != OK) {
+					ERROR("decode aborted: speculative batch failed at pos=%d", pos);
+					break;
+				}
+				int32_t target = sampler_sample(&c->samp, c->scratch.spec_logits.p, c->m.vocab_size);
+				if (target == draft) {
+					sampler_observe(&c->samp, draft);
+					context_emit_tok(c, draft, generated, on_token, ud, ttft_start_us, out_ttft_us,
+									 &ttft_captured);
+					generated++;
+					c->kv.n_pos = pos + 2;
+					memcpy(c->scratch.logits_host,
+						   c->scratch.spec_logits.p + (size_t)c->m.vocab_size,
+						   (size_t)c->m.vocab_size * sizeof(float));
+					if (c->scratch.spec_h.p)
+						memcpy(float_buf_ensure(&c->scratch.mtp_h, (size_t)c->m.dim),
+							   c->scratch.spec_h.p + (size_t)c->m.dim,
+							   (size_t)c->m.dim * sizeof(float));
+					context_sync_logits_slot(c);
+					mtp_draft_token(&c->m, &c->kv, &c->scratch, draft, pos + 1, c->scratch.spec_h.p,
+									c->flash_attn, NULL);
+					continue;
+				}
+				kvcache_qwen35_ckpt_restore(&c->kv);
+				c->kv.n_pos = pos + 1;
+				memcpy(c->scratch.logits_host, c->scratch.spec_logits.p,
+					   (size_t)c->m.vocab_size * sizeof(float));
+				if (c->scratch.spec_h.p)
+					memcpy(float_buf_ensure(&c->scratch.mtp_h, (size_t)c->m.dim),
+						   c->scratch.spec_h.p, (size_t)c->m.dim * sizeof(float));
+				context_sync_logits_slot(c);
+				continue;
+			}
+		}
+
 		int rc = context_feed_token_inner(c, tok, c->scratch.logits_host);
 		if (rc == CTX_COMPUTE_ERROR) {
-			ERROR("decode aborted: GPU compute error at token %d (pos=%d)", i, c->kv.n_pos);
+			ERROR("decode aborted: GPU compute error at token %d (pos=%d)", generated, c->kv.n_pos);
 			break;
 		}
 		if (rc == CTX_INTERRUPTED)

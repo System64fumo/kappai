@@ -35,6 +35,8 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 
 	int n_kv_layers =
 		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
+	if (m->n_layer_nextn > 0 && m->layer_dims.n_layer_kv_from_start <= 0)
+		n_kv_layers = model_n_all_layers(m);
 	c->n_kv_layers = n_kv_layers;
 
 	if (is_mla) {
@@ -57,6 +59,9 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		q->n_layers = m->n_layers;
 		q->conv_state = xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
 		q->recurrent_state =
+			xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		q->conv_ckpt = xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
+		q->recurrent_ckpt =
 			xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
 		c->qwen35 = q;
 	}
@@ -82,7 +87,7 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	}
 
 	kv_desc desc = {
-		.n_layers		  = m->n_layers,
+		.n_layers		  = n_kv_layers,
 		.n_kv_layers	  = n_kv_layers,
 		.n_kv_heads		  = c->n_kv_heads_max,
 		.head_dim		  = c->head_dim_max,
@@ -131,6 +136,8 @@ void kvcache_free(kvcache *c) {
 	if (c->qwen35) {
 		free(c->qwen35->conv_state);
 		free(c->qwen35->recurrent_state);
+		free(c->qwen35->conv_ckpt);
+		free(c->qwen35->recurrent_ckpt);
 		free(c->qwen35);
 		c->qwen35 = NULL;
 	}
@@ -241,6 +248,16 @@ void kvcache_reset(kvcache *c) {
 	}
 }
 
+void kvcache_qwen35_ckpt_restore(kvcache *c) {
+	if (!c || !c->qwen35 || !c->qwen35->conv_ckpt)
+		return;
+	kvcache_qwen35 *q = c->qwen35;
+	size_t conv_bytes = (size_t)q->n_layers * q->conv_stride * sizeof(float);
+	size_t rec_bytes  = (size_t)q->n_layers * q->recurrent_stride * sizeof(float);
+	memcpy(q->conv_state, q->conv_ckpt, conv_bytes);
+	memcpy(q->recurrent_state, q->recurrent_ckpt, rec_bytes);
+}
+
 static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats) {
 	if (c->kv_transfer_cap >= need_floats)
 		return OK;
@@ -253,7 +270,7 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 						const buffer *v_in) {
 	if (pos < 0 || pos >= c->n_ctx)
 		return ERR_INVALID_ARG;
-	if (layer < 0 || layer >= m->n_layers)
+	if (layer < 0 || layer >= model_n_all_layers(m))
 		return ERR_INVALID_ARG;
 	int		 hd				 = model_layer_head_dim(m, layer);
 	int		 kvh_stride		 = kvcache_kv_heads_stride(c);

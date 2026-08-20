@@ -45,6 +45,34 @@ static float qwen_silu(float x) {
 	return x * qwen_sigmoid(x);
 }
 
+#if defined(__AVX2__)
+static inline __m256 qwen_vexp_ps(__m256 x) {
+	x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-88.0f)), _mm256_set1_ps(88.0f));
+	const __m256 inv_ln2 = _mm256_set1_ps(1.4426950408889634f);
+	const __m256 ln2_hi	 = _mm256_set1_ps(6.9314718055994529e-01f);
+	const __m256 ln2_lo	 = _mm256_set1_ps(1.9082149292705877e-10f);
+	__m256 n_f = _mm256_round_ps(_mm256_mul_ps(x, inv_ln2),
+								_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+	__m256i n_i = _mm256_cvtps_epi32(n_f);
+	__m256 r = _mm256_fnmadd_ps(n_f, ln2_hi, x);
+	r		 = _mm256_fnmadd_ps(n_f, ln2_lo, r);
+	__m256 p = _mm256_set1_ps(1.0f / 120.0f);
+	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f / 24.0f));
+	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f / 6.0f));
+	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(0.5f));
+	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f));
+	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f));
+	__m256i e = _mm256_add_epi32(n_i, _mm256_set1_epi32(127));
+	return _mm256_mul_ps(p, _mm256_castsi256_ps(_mm256_slli_epi32(e, 23)));
+}
+
+static inline __m256 qwen_silu_ps(__m256 x) {
+	__m256 one = _mm256_set1_ps(1.0f);
+	__m256 den = _mm256_add_ps(one, qwen_vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), x)));
+	return _mm256_div_ps(x, den);
+}
+#endif
+
 static float qwen_softplus(float x) {
 	if (x > 20.0f)
 		return x;
@@ -221,7 +249,22 @@ static void qwen_gdn_conv_tokens(float *conv_out, float *conv_state, const float
 		for (int t = 0; t < n_tokens; t++) {
 			const float *mix = mixed + (size_t)t * mixed_stride;
 			float *out = conv_out + (size_t)t * conv_dim;
-			for (int c = 0; c < conv_dim; c++) {
+			int c = 0;
+#if defined(__AVX2__)
+			for (; c + 8 <= conv_dim; c += 8) {
+				float sum[8];
+				for (int i = 0; i < 8; i++) {
+					const float *w = conv_w + (size_t)(c + i) * 4;
+					float *hist = conv_state + (size_t)(c + i) * 3;
+					sum[i] = hist[0] * w[0] + hist[1] * w[1] + hist[2] * w[2] + mix[c + i] * w[3];
+					hist[0] = hist[1];
+					hist[1] = hist[2];
+					hist[2] = mix[c + i];
+				}
+				_mm256_storeu_ps(out + c, qwen_silu_ps(_mm256_loadu_ps(sum)));
+			}
+#endif
+			for (; c < conv_dim; c++) {
 				const float *w = conv_w + (size_t)c * 4;
 				float *hist = conv_state + (size_t)c * 3;
 				float sum = hist[0] * w[0] + hist[1] * w[1] + hist[2] * w[2] + mix[c] * w[3];
@@ -385,7 +428,15 @@ static void qwen_gdn_heads(int vh0, int vh1, const qwen_gdn_job *j, float *scrat
 			for (int d = 0; d < kd; d++)
 				qwen_state_update_out(shead + (size_t)d * vd, y, delta, k_s[d], q_s[d], vd);
 			float inv_rms = 1.0f / sqrtf(j->eps + qwen_dot_f32(y, y, vd) / (float)vd);
-			for (int jj = 0; jj < vd; jj++)
+			__m256 vinv = _mm256_set1_ps(inv_rms);
+			int jj = 0;
+			for (; jj + 8 <= vd; jj += 8) {
+				__m256 yv = _mm256_loadu_ps(y + jj);
+				__m256 nw = _mm256_loadu_ps(j->norm_w + jj);
+				__m256 zv = qwen_silu_ps(_mm256_loadu_ps(z_t + jj));
+				_mm256_storeu_ps(y + jj, _mm256_mul_ps(_mm256_mul_ps(yv, vinv), _mm256_mul_ps(nw, zv)));
+			}
+			for (; jj < vd; jj++)
 				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * qwen_silu(z_t[jj]);
 #else
 			float qn = j->eps;
@@ -462,9 +513,6 @@ static status_code qwen_gdn_run(exec_ctx *ctx, const float *mixed, const float *
 		memset(state, 0, cache->recurrent_stride * sizeof(float));
 	}
 
-	qwen_gdn_conv_tokens(conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel, n_tokens,
-						 mixed_stride);
-
 	qwen_gdn_job job = {
 		.state = state,
 		.conv = conv,
@@ -489,10 +537,40 @@ static status_code qwen_gdn_run(exec_ctx *ctx, const float *mixed, const float *
 		.scratch_stride = scratch_stride,
 		.eps = m->norm_eps,
 	};
-	if (pool && p->n_value_heads > 1)
-		tpool_parallel_for(pool, p->n_value_heads, 1, qwen_gdn_chunk, &job);
-	else
-		qwen_gdn_heads(0, p->n_value_heads, &job, scratch);
+
+	int split = cache->ckpt_enable && n_tokens > 1;
+	int t_count = split ? n_tokens : 1;
+	for (int t = 0; t < t_count; t++) {
+		if (split) {
+			qwen_gdn_conv_tokens(conv + (size_t)t * p->conv_dim, conv_state,
+								 mixed + (size_t)t * mixed_stride, conv_w, p->conv_dim,
+								 p->conv_kernel, 1, mixed_stride);
+			job.n_tokens = 1;
+			job.conv = conv + (size_t)t * p->conv_dim;
+			job.z = z + (size_t)t * z_stride;
+			job.alpha = alpha + (size_t)t * alpha_stride;
+			job.beta = beta + (size_t)t * beta_stride;
+			job.out = out + (size_t)t * out_stride;
+			job.z_stride = z_stride;
+			job.alpha_stride = 0;
+			job.beta_stride = 0;
+			job.out_stride = out_stride;
+			job.conv_stride = p->conv_dim;
+		} else {
+			qwen_gdn_conv_tokens(conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel,
+								 n_tokens, mixed_stride);
+		}
+		if (pool && p->n_value_heads > 1)
+			tpool_parallel_for(pool, p->n_value_heads, 1, qwen_gdn_chunk, &job);
+		else
+			qwen_gdn_heads(0, p->n_value_heads, &job, scratch);
+		if (split && t == 0) {
+			memcpy(cache->conv_ckpt + (size_t)ctx->li * cache->conv_stride, conv_state,
+				   cache->conv_stride * sizeof(float));
+			memcpy(cache->recurrent_ckpt + (size_t)ctx->li * cache->recurrent_stride, state,
+				   cache->recurrent_stride * sizeof(float));
+		}
+	}
 	return OK;
 }
 
@@ -748,10 +826,11 @@ static model_recipe *build_qwen35_recipe(const model *m) {
 	}
 
 	const int ops_per_layer = 24;
+	int n_all = model_n_all_layers(m);
 	r->layer.ops = xcalloc((size_t)ops_per_layer, sizeof(recipe_op));
 	r->layer.n_ops = ops_per_layer;
-	r->per_layer_ops = xcalloc((size_t)m->n_layers * ops_per_layer, sizeof(recipe_op));
-	for (int li = 0; li < m->n_layers; li++) {
+	r->per_layer_ops = xcalloc((size_t)n_all * ops_per_layer, sizeof(recipe_op));
+	for (int li = 0; li < n_all; li++) {
 		recipe_op *ops = r->per_layer_ops + (size_t)li * ops_per_layer;
 		int n = model_layer_is_recurrent(m, li) ? qwen_append_recurrent(ops, m, li)
 											 : qwen_append_full_attention(ops, m, li);

@@ -8,6 +8,7 @@
 #include "moe/moe_common.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
+#include "sampler.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -216,14 +217,16 @@ model_recipe *recipe_build(const struct model *m) {
 	if (!has_vld) {
 		recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
 		if (r->per_layer_ops) {
-			for (int li = 0; li < m->n_layers; li++)
+			int n_all = model_n_all_layers(m);
+			for (int li = 0; li < n_all; li++)
 				recipe_coalesce_matmul_runs(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
 											r->layer.n_ops);
 		}
 	}
 
-	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
-	for (int li = 0; li < m->n_layers; li++) {
+	int n_all_layers = model_n_all_layers(m);
+	r->layer_ctx = xcalloc((size_t)n_all_layers, sizeof(layer_ctx_entry));
+	for (int li = 0; li < n_all_layers; li++) {
 		layer_ctx_entry *lc = &r->layer_ctx[li];
 		lc->head_dim		= model_layer_head_dim(m, li);
 		lc->n_kv_heads		= model_layer_kv_heads(m, li);
@@ -243,7 +246,7 @@ model_recipe *recipe_build(const struct model *m) {
 		int max_inter = r->max_intermediate;
 		int max_hd	  = r->max_head_dim;
 		int max_kvh	  = r->max_kv_heads;
-		for (int li = 0; li < m->n_layers; li++) {
+		for (int li = 0; li < n_all_layers; li++) {
 			const layer_ctx_entry *lc = &r->layer_ctx[li];
 			if (lc->intermediate > max_inter)
 				max_inter = lc->intermediate;
@@ -340,11 +343,11 @@ static const weight_ref WEIGHT_REF_NONE = {0};
 static weight_ref *resolve_weight_ref(const model *m, int li, uint8_t w_idx) {
 	if (w_idx == RECIPE_NO_WEIGHT || w_idx == WIDX_NONE)
 		return (weight_ref *)&WEIGHT_REF_NONE;
-	if (li >= 0 && li < m->n_layers && m->wrefs_by_layer) {
+	if (li >= 0 && li < model_n_all_layers(m) && m->wrefs_by_layer) {
 		weight_ref *w = m->wrefs_by_layer[(size_t)li * WIDX_COUNT + w_idx];
 		return w ? w : (weight_ref *)&WEIGHT_REF_NONE;
 	}
-	layer_weights *L = (li >= 0 && li < m->n_layers) ? &m->layers[li] : NULL;
+	layer_weights *L = (li >= 0 && li < model_n_all_layers(m)) ? &m->layers[li] : NULL;
 	switch ((weight_idx)w_idx) {
 	case WIDX_TOK_EMBD:
 		return (weight_ref *)&m->tok_embd;
@@ -447,6 +450,15 @@ static weight_ref *resolve_weight_ref(const model *m, int li, uint8_t w_idx) {
 		return L ? &L->ssm_norm_w : (weight_ref *)&WEIGHT_REF_NONE;
 	case WIDX_SSM_OUT:
 		return L ? &L->ssm_out_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_MTP_EH_PROJ:
+		return (weight_ref *)&m->mtp_eh_proj;
+	case WIDX_MTP_ENORM:
+		return (weight_ref *)&m->mtp_enorm;
+	case WIDX_MTP_HNORM:
+		return (weight_ref *)&m->mtp_hnorm;
+	case WIDX_MTP_HEAD_NORM:
+		return m->mtp_shared_head_norm.host_ptr ? (weight_ref *)&m->mtp_shared_head_norm
+											   : (weight_ref *)&m->output_norm_w;
 	default:
 		return (weight_ref *)&WEIGHT_REF_NONE;
 	}
@@ -1156,7 +1168,7 @@ static status_code op_rmsnorm(exec_ctx *ctx) {
 static status_code op_matmul(exec_ctx *ctx) {
 	const recipe_op *op = ctx->op;
 	int				 li = ctx->li;
-	if (op->w_idx == WIDX_WV && li >= 0 && li < ctx->m->n_layers &&
+	if (op->w_idx == WIDX_WV && li >= 0 && li < model_n_all_layers(ctx->m) &&
 		!ctx->m->recipe->layer_ctx[li].has_own_v) {
 		if (exec_is_batch(ctx))
 			return op_batch_matmul_impl(ctx);
@@ -1727,6 +1739,21 @@ static status_code op_moe_shared_unified(exec_ctx *ctx) {
 	return op_moe_shared(ctx);
 }
 
+static void mtp_capture_slot_h(struct model *m, struct compute_scratch *s, float_buf *dst,
+							   int row) {
+	if (!m || !s || !dst)
+		return;
+	float *h = float_buf_ensure(dst, (size_t)(row + 1) * (size_t)m->dim);
+	buffer *xb = &s->slots[RECIPE_SLOT_XB];
+	float *out = h + (size_t)row * m->dim;
+	if (xb->owner && xb->owner->buffer_read_f32)
+		xb->owner->buffer_read_f32(xb->owner, xb, out, m->dim);
+	else if (xb->handle)
+		memcpy(out, (char *)xb->handle + xb->offset, (size_t)m->dim * sizeof(float));
+	else if (xb->host_ptr)
+		memcpy(out, xb->host_ptr, (size_t)m->dim * sizeof(float));
+}
+
 static status_code exec_op(const recipe_op *op, struct model *m, struct kvcache *cache,
 						   struct compute_scratch *s, int token, int pos, int li, int flash_attn,
 						   float *logits_out) {
@@ -1875,6 +1902,8 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 			if (st != OK)
 				goto fail;
 		}
+		if (m->n_layer_nextn)
+			mtp_capture_slot_h(m, s, &s->mtp_h, 0);
 	}
 
 	return OK;
@@ -3252,20 +3281,38 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		a->end_batch(a);
 
 	{
-		buffer	 last_x	 = batch_row_view(&bs->x_b, n_tokens - 1, dim);
+		int n_logit_rows = (s->spec_rows > 0 && logits_out) ? n_tokens : 1;
+		float *spec_l = NULL;
+		if (n_logit_rows > 1)
+			spec_l = float_buf_ensure(&s->spec_logits, (size_t)n_tokens * (size_t)m->vocab_size);
 		backend *owner_x = s->slots[RECIPE_SLOT_X].owner;
-		float	*tmp	 = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
-		memcpy(tmp, batch_buf_ptr(&last_x), (size_t)dim * sizeof(float));
-		st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
-		if (st != OK)
-			goto done;
-
-		for (int i = 0; i < r->n_post_ops; i++) {
-			st = exec_op(&r->post_ops[i], m, cache, s, tokens[n_tokens - 1],
-						 pos_start + n_tokens - 1, -1, flash_attn, logits_out);
+		float *tmp = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
+		for (int row = n_tokens - n_logit_rows; row < n_tokens; row++) {
+			buffer xrow = batch_row_view(&bs->x_b, row, dim);
+			memcpy(tmp, batch_buf_ptr(&xrow), (size_t)dim * sizeof(float));
+			st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
 			if (st != OK)
 				goto done;
+			float *row_logits = (n_logit_rows > 1) ? spec_l + (size_t)row * m->vocab_size : logits_out;
+			for (int i = 0; i < r->n_post_ops; i++) {
+				st = exec_op(&r->post_ops[i], m, cache, s, tokens[row], pos_start + row, -1,
+							 flash_attn, row_logits);
+				if (st != OK)
+					goto done;
+			}
+			if (m->n_layer_nextn) {
+				if (n_logit_rows > 1)
+					mtp_capture_slot_h(m, s, &s->spec_h, row);
+				else
+					mtp_capture_slot_h(m, s, &s->mtp_h, 0);
+			}
 		}
+		if (n_logit_rows > 1 && logits_out)
+			memcpy(logits_out, spec_l + (size_t)(n_tokens - 1) * m->vocab_size,
+				   (size_t)m->vocab_size * sizeof(float));
+		if (n_logit_rows > 1 && m->n_layer_nextn && s->spec_h.p)
+			memcpy(float_buf_ensure(&s->mtp_h, (size_t)dim),
+				   s->spec_h.p + (size_t)(n_tokens - 1) * dim, (size_t)dim * sizeof(float));
 	}
 
 done:
@@ -3295,11 +3342,16 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 	if (chunked)
 		bk->begin_batch(bk);
 
+	int fill_all = s->spec_rows > 0 && logits_out;
+	float *spec_l = NULL;
+	if (fill_all)
+		spec_l = float_buf_ensure(&s->spec_logits, (size_t)n_tokens * (size_t)m->vocab_size);
 	for (int i = 0; i < n_tokens; i++) {
 		int			is_last = (i == n_tokens - 1);
-		float	   *out		= is_last ? logits_out : NULL;
+		float	   *out		= fill_all ? spec_l + (size_t)i * m->vocab_size
+									   : (is_last ? logits_out : NULL);
 		status_code st		= compute_forward_recipe_one(m, cache, s, tokens[i], pos_start + i,
-														 flash_attn, out, !chunked, is_last);
+														 flash_attn, out, !chunked, fill_all || is_last);
 		if (st != OK) {
 			if (chunked && bk->end_batch)
 				bk->end_batch(bk);
@@ -3307,10 +3359,17 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 				memset(logits_out, 0, (size_t)m->vocab_size * sizeof(float));
 			return st;
 		}
+		if (fill_all && m->n_layer_nextn && s->mtp_h.p) {
+			float *hs = float_buf_ensure(&s->spec_h, (size_t)n_tokens * (size_t)m->dim);
+			memcpy(hs + (size_t)i * m->dim, s->mtp_h.p, (size_t)m->dim * sizeof(float));
+		}
 	}
 
 	if (chunked && bk->end_batch)
 		bk->end_batch(bk);
+	if (fill_all && logits_out)
+		memcpy(logits_out, spec_l + (size_t)(n_tokens - 1) * m->vocab_size,
+			   (size_t)m->vocab_size * sizeof(float));
 	return OK;
 }
 recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage stage) {
@@ -3404,4 +3463,105 @@ void recipe_build_post_ops(model_recipe *r, const model *m) {
 
 	r->post_ops	  = ops;
 	r->n_post_ops = i;
+}
+
+static float *mtp_slot_ptr(buffer *b) {
+	if (!b)
+		return NULL;
+	if (b->handle)
+		return (float *)((char *)b->handle + b->offset);
+	return (float *)b->host_ptr;
+}
+
+status_code mtp_draft_token(struct model *m, struct kvcache *cache, struct compute_scratch *s,
+							int token, int pos, const float *h, int flash_attn, int32_t *out_tok) {
+	if (!m || !m->n_layer_nextn || !m->recipe || !s || !h)
+		return ERR_INVALID_ARG;
+	int				 li	 = m->n_layers;
+	int				 dim = m->dim;
+	const model_recipe *r = m->recipe;
+	status_code		 st;
+	recipe_op		 op;
+
+	op = (recipe_op){
+		.kind  = OP_EMBD_LOOKUP,
+		.out   = RECIPE_SLOT_X,
+		.w_idx = WIDX_TOK_EMBD,
+		.stage = STAGE_EMBD,
+	};
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	op = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, WIDX_MTP_ENORM, m->norm_eps, STAGE_RMSNORM);
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	buffer *xb = &s->slots[RECIPE_SLOT_XB];
+	if (xb->owner && xb->owner->buffer_write_f32)
+		st = xb->owner->buffer_write_f32(xb->owner, xb, h, dim);
+	else if (mtp_slot_ptr(xb))
+		memcpy(mtp_slot_ptr(xb), h, (size_t)dim * sizeof(float));
+	else
+		return ERR_INVALID_ARG;
+	if (st != OK)
+		return st;
+
+	op = mk_rmsnorm(RECIPE_SLOT_XB, RECIPE_SLOT_XB2, WIDX_MTP_HNORM, m->norm_eps, STAGE_RMSNORM);
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	float *e_n	 = mtp_slot_ptr(&s->slots[RECIPE_SLOT_ATTN_OUT]);
+	float *h_n	 = mtp_slot_ptr(&s->slots[RECIPE_SLOT_XB2]);
+	float *cat	 = mtp_slot_ptr(&s->slots[RECIPE_SLOT_QWEN_PROJ]);
+	if (!e_n || !h_n || !cat)
+		return ERR_INVALID_ARG;
+	memcpy(cat, e_n, (size_t)dim * sizeof(float));
+	memcpy(cat + dim, h_n, (size_t)dim * sizeof(float));
+
+	op = mk_matmul(RECIPE_SLOT_QWEN_PROJ, RECIPE_SLOT_X, WIDX_MTP_EH_PROJ, dim, 2 * dim,
+				   STAGE_MATMUL);
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	const recipe_op *lops = r->per_layer_ops ? &r->per_layer_ops[(size_t)li * r->layer.n_ops]
+											 : r->layer.ops;
+	for (int j = 0; j < r->layer.n_ops; j++) {
+		if (lops[j].kind == OP_NONE)
+			continue;
+		st = exec_op(&lops[j], m, cache, s, token, pos, li, flash_attn, NULL);
+		if (st != OK)
+			return st;
+	}
+
+	if (!out_tok)
+		return OK;
+
+	op = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_MTP_HEAD_NORM, m->norm_eps,
+					STAGE_LOGITS_NORM);
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	op = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_LOGITS, WIDX_OUTPUT_W, m->vocab_size, dim,
+				   STAGE_LOGITS_MATMUL);
+	st = exec_op(&op, m, cache, s, token, pos, li, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	float *draft_logits = float_buf_ensure(&s->spec_logits, (size_t)m->vocab_size);
+	buffer *lb = &s->slots[RECIPE_SLOT_LOGITS];
+	if (lb->owner && lb->owner->buffer_read_f32)
+		st = lb->owner->buffer_read_f32(lb->owner, lb, draft_logits, m->vocab_size);
+	else if (mtp_slot_ptr(lb))
+		memcpy(draft_logits, mtp_slot_ptr(lb), (size_t)m->vocab_size * sizeof(float));
+	else
+		return ERR_INVALID_ARG;
+	if (st != OK)
+		return st;
+	*out_tok = sampler_argmax(draft_logits, m->vocab_size);
+	return OK;
 }

@@ -150,6 +150,10 @@ typedef enum {
 	WIDX_SSM_ALPHA,
 	WIDX_SSM_NORM,
 	WIDX_SSM_OUT,
+	WIDX_MTP_EH_PROJ,
+	WIDX_MTP_ENORM,
+	WIDX_MTP_HNORM,
+	WIDX_MTP_HEAD_NORM,
 	WIDX_COUNT
 } weight_idx;
 
@@ -294,6 +298,9 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,
 										 int n_tokens, int pos_start, int flash_attn,
 										 float *logits_out);
+
+status_code mtp_draft_token(struct model *m, struct kvcache *cache, struct compute_scratch *s,
+							int token, int pos, const float *h, int flash_attn, int32_t *out_tok);
 
 void batch_scratch_free(struct batch_scratch *bs);
 

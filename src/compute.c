@@ -152,6 +152,15 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	}
 	free(s->batch_logits_tmp.p);
 	s->batch_logits_tmp.cap = 0;
+	free(s->mtp_h.p);
+	s->mtp_h.p = NULL;
+	s->mtp_h.cap = 0;
+	free(s->spec_logits.p);
+	s->spec_logits.p = NULL;
+	s->spec_logits.cap = 0;
+	free(s->spec_h.p);
+	s->spec_h.p = NULL;
+	s->spec_h.cap = 0;
 }
 
 void compute_scratch_free(compute_scratch *s) {
