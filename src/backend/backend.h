@@ -158,6 +158,8 @@ struct backend {
 	status_code (*add_batch)(backend *self, buffer *x, const buffer *y, int n, int m);
 	status_code (*ffn_activate_batch)(backend *self, const buffer *gate, const buffer *up,
 									  buffer *out, int n, int activation, int m);
+	status_code (*ffn_activate_fused_batch)(backend *self, const buffer *fused, buffer *out, int n,
+											int activation, int m);
 	status_code (*rope_batch)(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
 							  const float *rope_cos_base, const float *rope_sin_base, int m);
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,

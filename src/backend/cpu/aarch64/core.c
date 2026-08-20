@@ -1650,12 +1650,13 @@ status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer 
 
 static void cpu_ffn_act_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	(void)tid;
-	cpu_ffn_act_batch_job *j = ctx;
-	int					   n = j->n;
+	cpu_ffn_act_batch_job *j	  = ctx;
+	int					   n	  = j->n;
+	size_t				   stride = j->fused_stride ? (size_t)j->fused_stride : (size_t)n;
 	tpool_chunk_fn fn = (j->activation == 1) ? cpu_ffn_gelu_chunk_neon : cpu_ffn_silu_chunk_neon;
 	for (int row = begin; row < end; row++) {
-		cpu_ffn_act_args a = {.g = j->g + ((size_t)row * n),
-							  .u = j->u + ((size_t)row * n),
+		cpu_ffn_act_args a = {.g = j->g + ((size_t)row * stride),
+							  .u = j->u + ((size_t)row * stride),
 							  .o = j->o + ((size_t)row * n)};
 		fn(0, n, 0, &a);
 	}
@@ -1666,6 +1667,20 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 	cpu_priv			 *p	  = self->priv;
 	cpu_ffn_act_batch_job job = {
 		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
+	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk_neon, &job);
+	return OK;
+}
+
+status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out, int n,
+										 int activation, int m) {
+	cpu_priv			 *p	 = self->priv;
+	const float			 *fp = cpu_ptr(fused);
+	cpu_ffn_act_batch_job job = {.g			   = fp,
+								 .u			   = fp + n,
+								 .o			   = cpu_ptr(out),
+								 .n			   = n,
+								 .activation   = activation,
+								 .fused_stride = 2 * n};
 	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk_neon, &job);
 	return OK;
 }

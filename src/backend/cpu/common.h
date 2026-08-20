@@ -183,6 +183,7 @@ typedef struct {
 	float		*o;
 	int			 n;
 	int			 activation;
+	int			 fused_stride;
 } cpu_ffn_act_batch_job;
 
 static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {

@@ -1031,18 +1031,6 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 	if (n_matmuls > CPU_MATMUL_MULTI_MAX)
 		return ERR_INVALID_ARG;
 
-	for (int i = 0; i < n_matmuls; i++) {
-		if (grouped_matmul_kernel_lookup(w_types[i])) {
-			for (int ii = 0; ii < n_matmuls; ii++) {
-				status_code st =
-					cpu_matmul_batch(self, w[ii], w_types[ii], x, y[ii], n_list[ii], k, m);
-				if (st != OK)
-					return st;
-			}
-			return OK;
-		}
-	}
-
 	quant_scratch *local_scratch  = p->matmul_multi_scratch;
 	void		  *xq_by_class[4] = {NULL, NULL, NULL, NULL};
 
@@ -1090,6 +1078,50 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 		(size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		for (int i = 0; i < n_matmuls; i++)
 			cpu_matmul_rows_worker(0, n_list[i], -1, &mj.jobs[i]);
+		return OK;
+	}
+
+	int all_grouped = 1;
+	int gr			= 0;
+	for (int i = 0; i < n_matmuls; i++) {
+		const grouped_matmul_kernel *gk = grouped_matmul_kernel_lookup(w_types[i]);
+		if (!gk) {
+			all_grouped = 0;
+			break;
+		}
+		if (gr == 0)
+			gr = gk->group_rows;
+		else if (gk->group_rows != gr) {
+			all_grouped = 0;
+			break;
+		}
+	}
+	if (all_grouped && gr > 0) {
+		mj.group_rows	   = gr;
+		mj.group_offset[0] = 0;
+		int total_groups   = 0;
+		for (int i = 0; i < n_matmuls; i++) {
+			int n_groups_i = n_list[i] / gr;
+			total_groups += n_groups_i;
+			mj.group_offset[i + 1] = total_groups;
+			mj.jobs[i].group_rows  = gr;
+		}
+		int min_groups_per_thr = CPU_MATMUL_MIN_ROWS_PER_THREAD / gr;
+		if (min_groups_per_thr < 1)
+			min_groups_per_thr = 1;
+		tpool_parallel_for(p->pool, total_groups, min_groups_per_thr, cpu_matmul_multi_groups_worker,
+						   &mj);
+		return OK;
+	}
+
+	int any_grouped = 0;
+	for (int i = 0; i < n_matmuls; i++)
+		if (grouped_matmul_kernel_lookup(w_types[i]))
+			any_grouped = 1;
+	if (any_grouped) {
+		for (int i = 0; i < n_matmuls; i++)
+			cpu_matmul_dispatch_rows(p->pool, w_types[i], n_list[i], &mj.jobs[i],
+									 cpu_matmul_rows_worker);
 		return OK;
 	}
 
@@ -1999,10 +2031,11 @@ __attribute__((weak)) status_code cpu_add_batch(backend *self, buffer *x, const 
 
 static void cpu_ffn_act_batch_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
-	cpu_ffn_act_batch_job *j = ctx;
+	cpu_ffn_act_batch_job *j	  = ctx;
+	size_t				   stride = j->fused_stride ? (size_t)j->fused_stride : (size_t)j->n;
 	for (int row = begin; row < end; row++) {
-		const float *g = j->g + ((size_t)row * j->n);
-		const float *u = j->u + ((size_t)row * j->n);
+		const float *g = j->g + ((size_t)row * stride);
+		const float *u = j->u + ((size_t)row * stride);
 		float		*o = j->o + ((size_t)row * j->n);
 		if (j->activation == 1) {
 			for (int i = 0; i < j->n; i++)
@@ -2022,6 +2055,21 @@ __attribute__((weak)) status_code cpu_ffn_activate_batch(backend *self, const bu
 	cpu_priv			 *p	  = self->priv;
 	cpu_ffn_act_batch_job job = {
 		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
+	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk, &job);
+	return OK;
+}
+
+__attribute__((weak)) status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused,
+															   buffer *out, int n, int activation,
+															   int m) {
+	cpu_priv	 *p	 = self->priv;
+	const float *fp = cpu_ptr(fused);
+	cpu_ffn_act_batch_job job = {.g			   = fp,
+								 .u			   = fp + n,
+								 .o			   = cpu_ptr(out),
+								 .n			   = n,
+								 .activation   = activation,
+								 .fused_stride = 2 * n};
 	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk, &job);
 	return OK;
 }
@@ -2520,6 +2568,7 @@ static status_code cpu_ctor(backend *out) {
 	out->rmsnorm_batch			   = cpu_rmsnorm_batch;
 	out->add_batch				   = cpu_add_batch;
 	out->ffn_activate_batch		   = cpu_ffn_activate_batch;
+	out->ffn_activate_fused_batch  = cpu_ffn_activate_fused_batch;
 	out->rope_batch				   = cpu_rope_batch;
 	out->rope_qk_batch			   = cpu_rope_qk_batch;
 	out->attention_batch		   = cpu_attention_batch;

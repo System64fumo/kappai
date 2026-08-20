@@ -282,11 +282,11 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		if (pool)
 			n_threads = tpool_n_threads(pool);
 	}
-	int chunk = n_threads > 1 ? (n_threads * 16) : 64;
+	int chunk = n_threads > 1 ? (n_threads * 64) : 64;
 	if (chunk < 64)
 		chunk = 64;
-	if (chunk > 256)
-		chunk = 256;
+	if (chunk > 1024)
+		chunk = 1024;
 	if (chunk > n)
 		chunk = n;
 	progress prog;

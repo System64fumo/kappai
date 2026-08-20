@@ -2403,16 +2403,21 @@ static status_code op_batch_attention_impl(exec_ctx *ctx) {
 }
 
 static status_code op_batch_ffn_activate_fused_impl(exec_ctx *ctx) {
+	backend *a	  = exec_layer_backend(ctx);
+	int		 n	  = ctx->op->u.ffn_act.n;
+	int		 act  = ctx->op->u.ffn_act.activation;
+	buffer	*fused = batch_slot(ctx->bs, ctx->op->in[0]);
+	buffer	*out   = batch_slot(ctx->bs, ctx->op->out);
+	if (a->ffn_activate_fused_batch)
+		return a->ffn_activate_fused_batch(a, fused, out, n, act, ctx->n_rows);
 
-	int			 n			  = ctx->op->u.ffn_act.n;
-	int			 act		  = ctx->op->u.ffn_act.activation;
-	const float *fused		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
-	float		*out		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
+	const float *fp			  = batch_buf_ptr(fused);
+	float		*op			  = batch_buf_ptr(out);
 	const int	 fused_stride = 2 * n;
 	for (int row = 0; row < ctx->n_rows; row++) {
-		const float *g = fused + (size_t)row * fused_stride;
+		const float *g = fp + (size_t)row * fused_stride;
 		const float *u = g + n;
-		float		*o = out + (size_t)row * n;
+		float		*o = op + (size_t)row * n;
 		if (act == 1) {
 			for (int i = 0; i < n; i++)
 				o[i] = 0.5f * g[i] * (1.0f + erff(g[i] * 0.7071067811865475f)) * u[i];

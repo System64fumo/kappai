@@ -1313,15 +1313,17 @@ typedef struct {
 	float		*o;
 	int			 n;
 	int			 activation;
+	int			 fused_stride;
 } cpu_ffn_act_batch_args;
 
 static void cpu_ffn_act_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_ffn_act_batch_args *j  = ctx;
-	tpool_chunk_fn			fn = j->activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
+	cpu_ffn_act_batch_args *j	  = ctx;
+	tpool_chunk_fn			fn	  = j->activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
+	size_t					stride = j->fused_stride ? (size_t)j->fused_stride : (size_t)j->n;
 	for (int row = begin; row < end; row++) {
 		cpu_ffn_act_args a = {
-			.g = j->g + ((size_t)row * j->n),
-			.u = j->u + ((size_t)row * j->n),
+			.g = j->g + ((size_t)row * stride),
+			.u = j->u + ((size_t)row * stride),
 			.o = j->o + ((size_t)row * j->n),
 		};
 		fn(0, j->n, tid, &a);
@@ -1336,6 +1338,24 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 								   .o		   = cpu_ptr(out),
 								   .n		   = n,
 								   .activation = activation};
+	if (p->pool && m >= 2) {
+		tpool_parallel_for(p->pool, m, 1, cpu_ffn_act_batch_chunk_avx, &job);
+	} else {
+		cpu_ffn_act_batch_chunk_avx(0, m, 0, &job);
+	}
+	return OK;
+}
+
+status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out, int n,
+										 int activation, int m) {
+	cpu_priv			   *p  = self->priv;
+	const float			   *fp = cpu_ptr(fused);
+	cpu_ffn_act_batch_args	job = {.g			 = fp,
+								   .u			 = fp + n,
+								   .o			 = cpu_ptr(out),
+								   .n			 = n,
+								   .activation	 = activation,
+								   .fused_stride = 2 * n};
 	if (p->pool && m >= 2) {
 		tpool_parallel_for(p->pool, m, 1, cpu_ffn_act_batch_chunk_avx, &job);
 	} else {
