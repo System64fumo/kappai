@@ -1347,16 +1347,18 @@ static stmt_node *parse_block(parser *p) {
 }
 
 static const char *supported_filters[] = {
-	"trim",		  "default", "length", "upper", "lower", "dictsort", "list", "map",
-	"capitalize", "replace", "tojson", "int",	"first", "last",	 "join", NULL};
+	"trim",       "default", "length", "upper", "lower", "dictsort", "list", "map",
+	"capitalize", "replace", "tojson", "int",   "first", "last",     "join", "safe",
+	"string",     NULL};
 
 static const char *supported_methods[] = {
-	"get",		  "split",	 "strip", "trim",		"join",		"lower", "upper",
-	"capitalize", "replace", "items", "startswith", "endswith", NULL};
+	"get",     "split", "strip", "lstrip", "rstrip", "trim", "join", "lower",
+	"upper",   "capitalize", "replace", "items", "startswith", "endswith", NULL};
 
-static const char *supported_tests[] = {"none",	   "null",	   "defined",  "undefined",
-										"string",  "mapping",  "iterable", "number",
-										"integer", "sequence", "boolean",  NULL};
+static const char *supported_tests[] = {
+	"none",    "null",     "defined", "undefined", "string",  "mapping", "iterable",
+	"number",  "integer",  "sequence", "boolean",   "true",    "false",   "dict",
+	NULL};
 
 static int list_has(const char **list, const char *s) {
 	for (int i = 0; list[i]; i++)
@@ -1919,6 +1921,10 @@ static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
 	}
 	if (!strcmp(e->str, "list"))
 		return base;
+	if (!strcmp(e->str, "safe"))
+		return base;
+	if (!strcmp(e->str, "string"))
+		return jinja_string(value_as_cstr(base));
 	if (!strcmp(e->str, "map")) {
 		const char	*fname = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
 		jinja_value *out   = jinja_list();
@@ -2240,14 +2246,17 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			}
 			return out;
 		}
-		if (!strcmp(e->str, "strip") || !strcmp(e->str, "trim")) {
+		if (!strcmp(e->str, "strip") || !strcmp(e->str, "lstrip") ||
+			!strcmp(e->str, "rstrip") || !strcmp(e->str, "trim")) {
 			const char *s = value_as_cstr(base);
-			while (*s && isspace((unsigned char)*s))
-				s++;
+			if (strcmp(e->str, "rstrip"))
+				while (*s && isspace((unsigned char)*s))
+					s++;
 			char  *dup = xstrdup(s);
 			size_t n   = strlen(dup);
-			while (n > 0 && isspace((unsigned char)dup[n - 1]))
-				dup[--n] = '\0';
+			if (strcmp(e->str, "lstrip"))
+				while (n > 0 && isspace((unsigned char)dup[n - 1]))
+					dup[--n] = '\0';
 			jinja_value *out = jinja_string(dup);
 			free(dup);
 			return out;
@@ -2331,6 +2340,12 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 							  isdigit((unsigned char)value_as_cstr(v)[0]));
 		if (!strcmp(test, "sequence"))
 			return jinja_bool(v && v->type == JV_LIST);
+		if (!strcmp(test, "boolean"))
+			return jinja_bool(v && v->type == JV_BOOL);
+		if (!strcmp(test, "true"))
+			return jinja_bool(v && v->type == JV_BOOL && v->as.b);
+		if (!strcmp(test, "false"))
+			return jinja_bool(v && v->type == JV_BOOL && !v->as.b);
 		everr(ctx, "unsupported test");
 		return jinja_none();
 	}
