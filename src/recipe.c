@@ -259,6 +259,11 @@ model_recipe *recipe_build(const struct model *m) {
 			for (int j = 0; j < n_ops; j++) {
 				recipe_op *op = &dst[j];
 				if (!lc->has_kv) {
+					if (op->kind == OP_MATMUL_MULTI && op->w_idx == WIDX_WQ) {
+						op->kind		 = OP_MATMUL;
+						op->u.matmul.n = lc->q_row_stride;
+						op->u.matmul.k = m->dim;
+					}
 					if ((op->w_idx == WIDX_WK || op->w_idx == WIDX_WV) || op->kind == OP_KV_PUT ||
 						(op->kind == OP_ROPE_EXT && op->in[0] == RECIPE_SLOT_K) ||
 						(op->kind == OP_RMSNORM_PER_HEAD && op->w_idx == WIDX_ATTN_K_NORM) ||
@@ -446,8 +451,9 @@ static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *c
 	status_code			 st;
 	backend				*a			= model_layer_backend(m, li);
 	const layer_weights *L			= &m->layers[li];
+	const layer_ctx_entry *lc		= &m->recipe->layer_ctx[li];
 	int					 k			= op->u.matmul_multi.k;
-	int					 n			= op->u.matmul_multi.n;
+	int					 n			= lc->has_own_v ? 3 : 2;
 	const buffer		*w_list[3]	= {&L->wq.buf, &L->wk.buf, &L->wv.buf};
 	uint32_t			 w_types[3] = {L->wq.type, L->wk.type, L->wv.type};
 	buffer				*y_list[3]	= {&slots[op->out], &slots[op->out + 1], &slots[op->out + 2]};
@@ -458,14 +464,18 @@ static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *c
 		st = a->matmul(a, w_list[0], w_types[0], &slots[op->in[0]], y_list[0], n_out[0], k);
 		if (st == OK)
 			st = a->matmul(a, w_list[1], w_types[1], &slots[op->in[0]], y_list[1], n_out[1], k);
-		if (st == OK)
+		if (st == OK && lc->has_own_v)
 			st = a->matmul(a, w_list[2], w_types[2], &slots[op->in[0]], y_list[2], n_out[2], k);
+		if (st == OK && !lc->has_own_v)
+			st = copy_k_to_v_slot(m, s, li);
 		profile_end(prof, &ps);
 		return st;
 	}
 
 	ps = profile_begin(prof, STAGE_MATMUL_QKV);
 	st = a->matmul_multi(a, w_list, w_types, &slots[op->in[0]], y_list, n_out, k, n);
+	if (st == OK && !lc->has_own_v)
+		st = copy_k_to_v_slot(m, s, li);
 	profile_end(prof, &ps);
 	return st;
 }
@@ -2114,14 +2124,19 @@ static status_code op_batch_matmul_multi_impl(exec_ctx *ctx) {
 	int					   k  = ctx->op->u.matmul_multi.k;
 	if (ctx->op->w_idx == WIDX_WQ) {
 		const int *n_out = ctx->op->u.matmul_multi.n_out;
+		int		   n_w	 = lc->has_own_v ? 3 : 2;
 		if (a->matmul_multi_batch) {
 			const buffer *ws[3]	 = {&lw->wq.buf, &lw->wk.buf, &lw->wv.buf};
 			uint32_t	  wts[3] = {lw->wq.type, lw->wk.type, lw->wv.type};
 			buffer		 *ys[3]	 = {batch_slot(ctx->bs, ctx->op->out),
 									batch_slot(ctx->bs, ctx->op->out + 1),
 									batch_slot(ctx->bs, ctx->op->out + 2)};
-			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
-										 k, 3, ctx->n_rows);
+			status_code st =
+				a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out, k,
+									  n_w, ctx->n_rows);
+			if (st == OK && !lc->has_own_v)
+				st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->n_rows);
+			return st;
 		}
 		status_code st =
 			a->matmul_batch(a, &lw->wq.buf, lw->wq.type, batch_slot(ctx->bs, ctx->op->in[0]),
@@ -2129,9 +2144,11 @@ static status_code op_batch_matmul_multi_impl(exec_ctx *ctx) {
 		if (st == OK)
 			st = a->matmul_batch(a, &lw->wk.buf, lw->wk.type, batch_slot(ctx->bs, ctx->op->in[0]),
 								 batch_slot(ctx->bs, ctx->op->out + 1), n_out[1], k, ctx->n_rows);
-		if (st == OK)
+		if (st == OK && lc->has_own_v)
 			st = a->matmul_batch(a, &lw->wv.buf, lw->wv.type, batch_slot(ctx->bs, ctx->op->in[0]),
 								 batch_slot(ctx->bs, ctx->op->out + 2), n_out[2], k, ctx->n_rows);
+		if (st == OK && !lc->has_own_v)
+			st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->n_rows);
 		return st;
 	}
 	if (ctx->op->w_idx == WIDX_WK) {
