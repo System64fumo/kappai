@@ -720,7 +720,6 @@ status_code op_moe_experts(exec_ctx *ctx) {
 				xb_q8_gate_ok = 1;
 			else if (st != ERR_UNSUPPORTED)
 				goto cleanup;
-			st = OK;
 		}
 	}
 

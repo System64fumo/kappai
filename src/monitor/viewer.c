@@ -1,26 +1,26 @@
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
-#include <signal.h>
-#include <ctype.h>
-#include <time.h>
 #include <locale.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <curses.h>
 #include <json-c/json.h>
 
 #define DEFAULT_PATH "/tmp/kappai.monitor"
-#define MAX_OUTPUT   16384
-#define MAX_EXPERTS  256
-#define MAX_LAYERS   128
-#define MAX_TOPK     64
+#define MAX_OUTPUT 16384
+#define MAX_EXPERTS 256
+#define MAX_LAYERS 128
+#define MAX_TOPK 64
 #define MAX_LOAD_STEPS 24
 
 enum { V_OUTPUT = 0, V_HEATMAP, V_SORTED };
@@ -32,56 +32,56 @@ enum {
 };
 
 typedef struct {
-	char   arch[64];
-	char   model_path[128];
-	int    n_layers;
-	int    dim;
-	int    n_ctx;
-	int    vocab;
-	int    is_moe;
-	int    n_experts;
-	int    topk;
+	char arch[64];
+	char model_path[128];
+	int	 n_layers;
+	int	 dim;
+	int	 n_ctx;
+	int	 vocab;
+	int	 is_moe;
+	int	 n_experts;
+	int	 topk;
 
 	char   phase[16];
-	int    decoding;
-	int    token_idx;
-	int    cur_layer;
+	int	   decoding;
+	int	   token_idx;
+	int	   cur_layer;
 	double pct;
 	double cumulative_tps;
 
 	double pp_tps;
 	double tg_tps;
-	int    n_prefill;
-	int    n_generated;
+	int	   n_prefill;
+	int	   n_generated;
 
-	char   load_phase[32];
-	int    load_ms;
-	int    load_done;
-	int    load_error;
+	char	 load_phase[32];
+	int		 load_ms;
+	int		 load_done;
+	int		 load_error;
 	uint64_t load_t0_ms;
 
-	int    phase_tokens;
-	int    tokens_done;
+	int phase_tokens;
+	int tokens_done;
 
-	double moe_hit;
-	double moe_pin;
-	double moe_lru;
+	double			   moe_hit;
+	double			   moe_pin;
+	double			   moe_lru;
 	unsigned long long moe_misses;
 
 	char output[MAX_OUTPUT];
-	int  output_len;
+	int	 output_len;
 
 	int expert_hits[MAX_LAYERS][MAX_EXPERTS];
 
-	int cur_experts[MAX_LAYERS][MAX_TOPK];
-	int cur_n_experts[MAX_LAYERS];
+	int	  cur_experts[MAX_LAYERS][MAX_TOPK];
+	int	  cur_n_experts[MAX_LAYERS];
 	float cur_weights[MAX_LAYERS][MAX_TOPK];
-	int has_current_token;
+	int	  has_current_token;
 
 	int expert_total[MAX_EXPERTS];
 
 	char load_steps[MAX_LOAD_STEPS][48];
-	int  n_load_steps;
+	int	 n_load_steps;
 
 	int scroll_x;
 	int scroll_y;
@@ -90,7 +90,8 @@ typedef struct {
 static volatile sig_atomic_t g_running = 1;
 
 static void on_sigint(int sig) {
-	(void)sig; g_running = 0;
+	(void)sig;
+	g_running = 0;
 }
 
 static uint64_t now_ms(void) {
@@ -112,8 +113,8 @@ static void append_output(monitor_state *st, const char *text) {
 }
 
 static int wrap_text(const char *text, int width, char *lines[], int max_lines) {
-	int		 count = 0;
-	const char *p	= text;
+	int			count = 0;
+	const char *p	  = text;
 	while (*p && count < max_lines) {
 		while (*p == ' ')
 			p++;
@@ -131,9 +132,9 @@ static int wrap_text(const char *text, int width, char *lines[], int max_lines) 
 			if (!line)
 				break;
 			memcpy(line, p, (size_t)len);
-			line[len] = '\0';
+			line[len]	   = '\0';
 			lines[count++] = line;
-			p = nl ? nl + 1 : p + len;
+			p			   = nl ? nl + 1 : p + len;
 		} else {
 			int ba = width;
 			while (ba > 0 && p[ba] != ' ')
@@ -144,7 +145,7 @@ static int wrap_text(const char *text, int width, char *lines[], int max_lines) 
 			if (!line)
 				break;
 			memcpy(line, p, (size_t)ba);
-			line[ba] = '\0';
+			line[ba]	   = '\0';
 			lines[count++] = line;
 			p += ba;
 			if (*p == ' ')
@@ -160,7 +161,7 @@ static void free_lines(char *lines[], int n) {
 }
 
 static void pretty_phase(char *out, size_t n, const char *p) {
-	size_t j = 0;
+	size_t j   = 0;
 	int	   cap = 1;
 	for (size_t i = 0; p[i] && j < n - 1; i++) {
 		char c = p[i];
@@ -170,7 +171,7 @@ static void pretty_phase(char *out, size_t n, const char *p) {
 			cap = 1;
 		} else {
 			out[j++] = cap ? (char)toupper((unsigned char)c) : c;
-			cap			= 0;
+			cap		 = 0;
 		}
 	}
 	out[j] = '\0';
@@ -248,8 +249,8 @@ static void draw_vscrollbar(WINDOW *win, int y0, int y1, int cols, int pos, int 
 	int h = y1 - y0 + 1;
 	if (h < 2 || view >= total)
 		return;
-	int x	= cols - 2;
-	int th	= h * view / total;
+	int x  = cols - 2;
+	int th = h * view / total;
 	if (th < 1)
 		th = 1;
 	if (th > h)
@@ -342,7 +343,7 @@ static int render_top(WINDOW *win, monitor_state *st, int cols) {
 	}
 
 	char rhs[64];
-	int  x = 3;
+	int	 x = 3;
 
 	if (!st->load_done) {
 		char ph[48];
@@ -396,8 +397,8 @@ static int render_top(WINDOW *win, monitor_state *st, int cols) {
 	}
 
 	int running = st->phase[0] != 0;
-	int prompt  = is_prompt_phase(st);
-	int decode  = is_decode_phase(st);
+	int prompt	= is_prompt_phase(st);
+	int decode	= is_decode_phase(st);
 
 	if (prompt) {
 		double show = st->cumulative_tps > 0 ? st->cumulative_tps : st->pp_tps;
@@ -426,9 +427,9 @@ static int render_top(WINDOW *win, monitor_state *st, int cols) {
 	if (bw < 8)
 		bw = 8;
 	if (prompt) {
-		int	total = st->phase_tokens > 0 ? st->phase_tokens : st->n_prefill;
-		int	done  = st->tokens_done >= 0 ? st->tokens_done : 0;
-		double pct  = 0.0;
+		int	   total = st->phase_tokens > 0 ? st->phase_tokens : st->n_prefill;
+		int	   done	 = st->tokens_done >= 0 ? st->tokens_done : 0;
+		double pct	 = 0.0;
 		if (total > 0) {
 			pct = 100.0 * (double)done / (double)total;
 			if (pct > 100.0)
@@ -468,8 +469,8 @@ static int render_top(WINDOW *win, monitor_state *st, int cols) {
 	y++;
 
 	char info[192];
-	int n = snprintf(info, sizeof(info), "%s | %dL | %dd | ctx %d | vocab %d",
-					 st->arch[0] ? st->arch : "?", st->n_layers, st->dim, st->n_ctx, st->vocab);
+	int	 n = snprintf(info, sizeof(info), "%s | %dL | %dd | ctx %d | vocab %d",
+					  st->arch[0] ? st->arch : "?", st->n_layers, st->dim, st->n_ctx, st->vocab);
 	if (st->is_moe)
 		snprintf(info + n, sizeof(info) - (size_t)n, " | MoE %de/%d", st->n_experts, st->topk);
 	wattron(win, A_DIM);
@@ -496,8 +497,8 @@ static void render_loading(WINDOW *win, monitor_state *st, int y0, int max_y, in
 	(void)cols;
 	if (y0 >= max_y)
 		return;
-	int n	 = st->n_load_steps;
-	int show = max_y - y0;
+	int n	  = st->n_load_steps;
+	int show  = max_y - y0;
 	int start = n > show ? n - show : 0;
 
 	for (int i = start; i < n && y0 < max_y; i++) {
@@ -553,9 +554,9 @@ static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int
 	for (int i = 0; i < n_experts; i++)
 		idx[i] = i;
 	for (int i = 1; i < n_experts; i++) {
-		int key	  = idx[i];
+		int key		 = idx[i];
 		int key_hits = st->expert_total[key];
-		int j	   = i - 1;
+		int j		 = i - 1;
 		while (j >= 0 && st->expert_total[idx[j]] < key_hits) {
 			idx[j + 1] = idx[j];
 			j--;
@@ -584,7 +585,7 @@ static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int
 	if (*sy < 0)
 		*sy = 0;
 	int has_v = n_experts > body_rows;
-	int top	 = y0;
+	int top	  = y0;
 
 	mvwprintw(win, y0, 1, "%-6s %-7s %-7s %s", "EID", "Hits", "Share", "Bar");
 	y0++;
@@ -597,14 +598,14 @@ static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int
 		bar_w = 5;
 
 	for (int i = 0; i < body_rows; i++) {
-		int	 row  = *sy + i;
+		int row = *sy + i;
 		if (row >= n_experts)
 			break;
-		int	 eid  = idx[row];
-		int	 hits = st->expert_total[eid];
+		int	   eid		 = idx[row];
+		int	   hits		 = st->expert_total[eid];
 		double share_pct = 100.0 * (double)hits / (double)total_dispatches;
-		double rel_pct = 100.0 * (double)hits / (double)max_hits;
-		int	 filled  = (int)(rel_pct / 100.0 * (double)bar_w);
+		double rel_pct	 = 100.0 * (double)hits / (double)max_hits;
+		int	   filled	 = (int)(rel_pct / 100.0 * (double)bar_w);
 		if (filled > bar_w)
 			filled = bar_w;
 
@@ -640,12 +641,12 @@ static void render_heatmap(WINDOW *win, monitor_state *st, int y0, int max_y, in
 	if (n_experts > MAX_EXPERTS)
 		n_experts = MAX_EXPERTS;
 
-	const int label_w = 5;
-	int view_cols = cols - 8;
+	const int label_w	= 5;
+	int		  view_cols = cols - 8;
 	if (view_cols < 1)
 		view_cols = 1;
 
-	int has_h	  = n_experts > view_cols;
+	int has_h	   = n_experts > view_cols;
 	int legend_row = has_h ? max_y - 2 : max_y - 1;
 	if (legend_row <= y0)
 		legend_row = y0;
@@ -742,8 +743,7 @@ static void render_heatmap(WINDOW *win, monitor_state *st, int y0, int max_y, in
 					int lvl = (hits * 3) / max_hits;
 					if (lvl > 2)
 						lvl = 2;
-					mvwprintw(win, y, x, "%s",
-							  "\xe2\x96\x91\xe2\x96\x92\xe2\x96\x93" + lvl * 3);
+					mvwprintw(win, y, x, "%s", "\xe2\x96\x91\xe2\x96\x92\xe2\x96\x93" + lvl * 3);
 				}
 			}
 		}
@@ -752,7 +752,8 @@ static void render_heatmap(WINDOW *win, monitor_state *st, int y0, int max_y, in
 
 	if (y <= legend_row && legend_row < max_y) {
 		wattron(win, A_DIM);
-		mvwprintw(win, legend_row, 1, ". empty  \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93 intensity  # active");
+		mvwprintw(win, legend_row, 1,
+				  ". empty  \xe2\x96\x91\xe2\x96\x92\xe2\x96\x93 intensity  # active");
 		wattroff(win, A_DIM);
 	}
 
@@ -773,8 +774,8 @@ static void render(WINDOW *win, monitor_state *st, int view_mode) {
 
 	int content_start = render_top(win, st, cols);
 
-	int keybar_row = rows - 2;
-	int bottom_div = keybar_row - 1;
+	int keybar_row	= rows - 2;
+	int bottom_div	= keybar_row - 1;
 	int content_end = bottom_div;
 	if (content_end < content_start)
 		content_end = content_start;
@@ -797,8 +798,7 @@ static void render(WINDOW *win, monitor_state *st, int view_mode) {
 }
 
 static void record_load_step(monitor_state *st, const char *phase) {
-	if (st->n_load_steps == 0 ||
-		strcmp(st->load_steps[st->n_load_steps - 1], phase) != 0) {
+	if (st->n_load_steps == 0 || strcmp(st->load_steps[st->n_load_steps - 1], phase) != 0) {
 		if (st->n_load_steps < MAX_LOAD_STEPS) {
 			snprintf(st->load_steps[st->n_load_steps], sizeof(st->load_steps[0]), "%s", phase);
 			st->n_load_steps++;
@@ -831,19 +831,19 @@ static void process_event(monitor_state *st, struct json_object *root) {
 		if (json_object_object_get_ex(root, "topk", &j))
 			st->topk = json_object_get_int(j);
 
-		st->load_done	= 1;
-		st->phase[0]	= '\0';
-		st->decoding	= 0;
-		st->token_idx	= 0;
-		st->cur_layer	= 0;
-		st->pct			= 0;
-		st->cumulative_tps = 0;
-		st->pp_tps		= 0;
-		st->tg_tps		= 0;
-		st->n_prefill	= 0;
-		st->n_generated = 0;
-		st->phase_tokens = 0;
-		st->tokens_done = 0;
+		st->load_done		  = 1;
+		st->phase[0]		  = '\0';
+		st->decoding		  = 0;
+		st->token_idx		  = 0;
+		st->cur_layer		  = 0;
+		st->pct				  = 0;
+		st->cumulative_tps	  = 0;
+		st->pp_tps			  = 0;
+		st->tg_tps			  = 0;
+		st->n_prefill		  = 0;
+		st->n_generated		  = 0;
+		st->phase_tokens	  = 0;
+		st->tokens_done		  = 0;
 		st->has_current_token = 0;
 	} else if (strcmp(type, "load") == 0) {
 		struct json_object *j;
@@ -882,9 +882,9 @@ static void process_event(monitor_state *st, struct json_object *root) {
 		if (json_object_object_get_ex(root, "tps", &j))
 			st->pp_tps = json_object_get_double(j);
 		if (json_object_object_get_ex(root, "n_tokens", &j)) {
-			st->n_prefill = json_object_get_int(j);
+			st->n_prefill	 = json_object_get_int(j);
 			st->phase_tokens = st->n_prefill;
-			st->tokens_done = st->n_prefill;
+			st->tokens_done	 = st->n_prefill;
 		}
 		st->cumulative_tps = 0;
 		snprintf(st->phase, sizeof(st->phase), "prefill");
@@ -922,14 +922,14 @@ static void process_event(monitor_state *st, struct json_object *root) {
 			append_output(st, json_object_get_string(j));
 		if (json_object_object_get_ex(root, "token_idx", &j))
 			st->token_idx = json_object_get_int(j);
-		st->n_generated = st->token_idx + 1;
-		st->decoding = 1;
+		st->n_generated		  = st->token_idx + 1;
+		st->decoding		  = 1;
 		st->has_current_token = 1;
 	} else if (strcmp(type, "moe_experts") == 0) {
 		struct json_object *jlayer;
 		struct json_object *jexperts;
 		struct json_object *jweights;
-		int layer = -1;
+		int					layer = -1;
 		if (json_object_object_get_ex(root, "layer", &jlayer))
 			layer = json_object_get_int(jlayer);
 		if (layer < 0 || layer >= MAX_LAYERS)
@@ -944,8 +944,8 @@ static void process_event(monitor_state *st, struct json_object *root) {
 				n = MAX_TOPK;
 			st->cur_n_experts[layer] = n;
 			for (int k = 0; k < n; k++) {
-				struct json_object *je = json_object_array_get_idx(jexperts, k);
-				int eid = json_object_get_int(je);
+				struct json_object *je	  = json_object_array_get_idx(jexperts, k);
+				int					eid	  = json_object_get_int(je);
 				st->cur_experts[layer][k] = eid;
 				if (eid >= 0 && eid < MAX_EXPERTS) {
 					st->expert_hits[layer][eid]++;
@@ -959,7 +959,7 @@ static void process_event(monitor_state *st, struct json_object *root) {
 			if (n > MAX_TOPK)
 				n = MAX_TOPK;
 			for (int k = 0; k < n; k++) {
-				struct json_object *jw = json_object_array_get_idx(jweights, k);
+				struct json_object *jw	  = json_object_array_get_idx(jweights, k);
 				st->cur_weights[layer][k] = (float)json_object_get_double(jw);
 			}
 		}
@@ -971,9 +971,9 @@ static void process_event(monitor_state *st, struct json_object *root) {
 			st->tg_tps = json_object_get_double(j);
 		if (json_object_object_get_ex(root, "tokens_generated", &j))
 			st->n_generated = json_object_get_int(j);
-		st->cumulative_tps = 0;
-		st->phase[0] = '\0';
-		st->decoding = 0;
+		st->cumulative_tps	  = 0;
+		st->phase[0]		  = '\0';
+		st->decoding		  = 0;
 		st->has_current_token = 0;
 
 		if (json_object_object_get_ex(root, "moe_hit", &j))
@@ -1037,18 +1037,18 @@ int main(int argc, char **argv) {
 	memset(&st, 0, sizeof(st));
 
 	char linebuf[8192];
-	int  linepos = 0;
-	int  view_mode = 0;
-	int  prev_view = 0;
+	int	 linepos   = 0;
+	int	 view_mode = 0;
+	int	 prev_view = 0;
 
 	while (g_running) {
 		fd_set rfds;
 		FD_ZERO(&rfds);
 		FD_SET(fd, &rfds);
 		struct timeval tv = {0, 100000};
-		int rv = select(fd + 1, &rfds, NULL, NULL, &tv);
+		int			   rv = select(fd + 1, &rfds, NULL, NULL, &tv);
 		if (rv > 0) {
-			char buf[4096];
+			char	buf[4096];
 			ssize_t n = read(fd, buf, sizeof(buf));
 			if (n <= 0)
 				break;
@@ -1078,7 +1078,7 @@ int main(int argc, char **argv) {
 			}
 			if (ch == 'c' || ch == 'C') {
 				st.output_len = 0;
-				st.output[0] = '\0';
+				st.output[0]  = '\0';
 			}
 			if (ch == 'o' || ch == 'O' || ch == 't' || ch == 'T')
 				view_mode = V_OUTPUT;
@@ -1134,7 +1134,7 @@ int main(int argc, char **argv) {
 			break;
 
 		if (view_mode != prev_view) {
-			prev_view = view_mode;
+			prev_view	= view_mode;
 			st.scroll_x = 0;
 			st.scroll_y = 0;
 		}

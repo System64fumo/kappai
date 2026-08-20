@@ -70,6 +70,9 @@ typedef struct {
 	quant_scratch matmul_multi_scratch[4];
 } cpu_priv;
 
+void feat_add(char *buf, size_t cap, const char *name);
+void detect_features(char *buf, size_t cap);
+
 static inline status_code cpu_scratch_grow(void **buf, size_t *cap_bytes, size_t need_bytes) {
 	if (*cap_bytes >= need_bytes)
 		return OK;

@@ -161,7 +161,9 @@ static size_t cpu_mem_total(backend *self) {
 	return get_total_memory();
 }
 
-static void feat_add(char *buf, size_t cap, const char *name);
+__attribute__((weak)) void detect_features(char *buf, size_t cap) {
+	snprintf(buf, cap, "generic");
+}
 
 static status_code cpu_init(backend *self, int device_index) {
 	(void)device_index;
@@ -177,36 +179,14 @@ static status_code cpu_init(backend *self, int device_index) {
 		p->thread_scratch = xcalloc((size_t)p->n_threads, sizeof(cpu_thread_scratch));
 	}
 
-	const char *arch = "generic";
-#if defined(__aarch64__)
-	arch = "aarch64";
-#endif
-
-	char feat[128] = "";
-#if defined(__ARM_FEATURE_FMA)
-	feat_add(feat, sizeof(feat), "fma");
-#endif
-#if defined(__ARM_NEON)
-	feat_add(feat, sizeof(feat), "neon");
-#endif
-#if defined(__ARM_FEATURE_DOTPROD)
-	feat_add(feat, sizeof(feat), "dotprod");
-#endif
-#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-	feat_add(feat, sizeof(feat), "fp16");
-#endif
-#if defined(__ARM_FEATURE_SVE)
-	feat_add(feat, sizeof(feat), "sve");
-#endif
-
-	log_tag("CPU", "%s, %d threads", arch, p->n_threads > 0 ? p->n_threads : 1);
-	if (feat[0])
-		log_tag("CPU", "  features: %s", feat);
+	char cpu_desc[128] = "";
+	detect_features(cpu_desc, sizeof(cpu_desc));
+	log_tag("CPU", "%d threads, %s", p->n_threads > 0 ? p->n_threads : 1, cpu_desc);
 
 	return OK;
 }
 
-static void feat_add(char *buf, size_t cap, const char *name) {
+void feat_add(char *buf, size_t cap, const char *name) {
 	size_t used = strlen(buf);
 	int	   n	= snprintf(buf + used, cap - used, used ? ", %s" : "%s", name);
 	if (n < 0 || (size_t)n >= cap - used)

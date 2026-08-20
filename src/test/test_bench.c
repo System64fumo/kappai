@@ -84,8 +84,7 @@ static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, i
 			repack(base, weight_buf, n, k);
 			free(base);
 		} else {
-			weight_bytes = (size_t)n_blocks * qt->bytes;
-			weight_buf	 = base;
+			weight_buf = base;
 		}
 	}
 

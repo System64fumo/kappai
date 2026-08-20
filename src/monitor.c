@@ -343,6 +343,6 @@ void monitor_emit_moe_experts(monitor *mon, int layer, int token_idx, const int3
 	n += snprintf(buf + n, sizeof(buf) - n, "],\"weights\":[");
 	for (int k = 0; k < K && n < (int)sizeof(buf) - 64; k++)
 		n += snprintf(buf + n, sizeof(buf) - n, "%s%.4f", k ? "," : "", weights[k]);
-	n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
+	snprintf(buf + n, sizeof(buf) - n, "]}\n");
 	monitor_send(mon, "%s", buf);
 }

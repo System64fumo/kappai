@@ -228,7 +228,7 @@ endif
 FORMAT_FLAGS := -i -style=file
 
 TIDY_LOG  := $(OUT_DIR)/tidy.log
-TIDY_SRCS := $(LIB_SRCS) $(SRC_DIR)/cli/main.c $(TEST_SRCS)
+ALL_SRCS  := $(LIB_SRCS) $(SRC_DIR)/cli/main.c $(TEST_SRCS) $(wildcard $(SRC_DIR)/monitor/*.c)
 
 .PHONY: all cli test monitor clean print-config format tidy backends-help
 
@@ -298,7 +298,7 @@ print-config:
 
 format:
 	@which clang-format >/dev/null 2>&1 || { echo "clang-format not found"; exit 1; }
-	@for f in $(TIDY_SRCS) $(HEADERS); do \
+	@for f in $(ALL_SRCS) $(HEADERS); do \
 	        echo "  FMT     $$f"; \
 	        clang-format $(FORMAT_FLAGS) $$f; \
 	done
@@ -307,7 +307,7 @@ tidy: | $(OUT_DIR)
 	@which clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 1; }
 	@echo "  TIDY    -> $(TIDY_LOG)"
 	@: > $(TIDY_LOG)
-	@printf '%s\n' $(TIDY_SRCS) | \
+	@printf '%s\n' $(ALL_SRCS) | \
 		xargs -P $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) \
 		-I {} sh -c ' \
 			echo "  TIDY    {}"; \

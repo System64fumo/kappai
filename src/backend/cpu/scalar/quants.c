@@ -3,9 +3,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 
 #define MATMUL_MR 8
 
@@ -1010,7 +1007,8 @@ __attribute__((weak)) void dequant_iq4_nl_row(const void *blocks, size_t n_block
 	}
 }
 
-void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+__attribute__((weak)) void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin,
+													  int row_end, int k) {
 	const int	 blocks_per_row = k / 32;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(iq4_nl_block);
 	const size_t dst_stride		= (size_t)blocks_per_row * sizeof(q8_0_block);
@@ -1018,24 +1016,6 @@ void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int r
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-#if defined(__ARM_NEON)
-	const uint8x16_t kvalues_u = vreinterpretq_u8_s8(vld1q_s8(kvalues_iq4nl));
-	const uint8x16_t lo_mask   = vdupq_n_u8(0x0F);
-
-	for (int r = row_begin; r < row_end; r++) {
-		const iq4_nl_block *srow = (const iq4_nl_block *)(sp + (size_t)r * src_stride);
-		q8_0_block		   *drow = (q8_0_block *)(dp + (size_t)r * dst_stride);
-
-		for (int bi = 0; bi < blocks_per_row; bi++) {
-			drow[bi].d				= srow[bi].d;
-			const uint8x16_t qs		= vld1q_u8(srow[bi].qs);
-			const uint8x16_t lo_idx = vandq_u8(qs, lo_mask);
-			const uint8x16_t hi_idx = vshrq_n_u8(qs, 4);
-			vst1q_s8(drow[bi].qs, vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, lo_idx)));
-			vst1q_s8(drow[bi].qs + 16, vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, hi_idx)));
-		}
-	}
-#else
 	for (int r = row_begin; r < row_end; r++) {
 		const iq4_nl_block *srow = (const iq4_nl_block *)(sp + (size_t)r * src_stride);
 		q8_0_block		   *drow = (q8_0_block *)(dp + (size_t)r * dst_stride);
@@ -1049,7 +1029,6 @@ void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int r
 			}
 		}
 	}
-#endif
 }
 
 void repack_iq4_nl_to_q8_0(const void *src, void *dst, int n_rows, int k) {
