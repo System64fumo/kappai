@@ -703,9 +703,22 @@ static int qwen_append_ffn(recipe_op *ops, int i, const model *m, int li) {
 			.u.ffn_act = {.n = inter, .activation = ACTIVATION_SILU},
 		};
 	}
-	ops[i++] = qwen_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter);
-	ops[i++] = mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_X, STAGE_ADD);
-	ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+	int can_fuse_ffn_residual =
+		backend_has_cap(m->backend, BCAP_MATMUL_RESIDUAL) && !m->arch_info->has_ffn_post_norm;
+	if (can_fuse_ffn_residual) {
+		ops[i++] = (recipe_op){
+			.kind	  = OP_MATMUL_RESIDUAL,
+			.in		  = {RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
+			.out	  = RECIPE_SLOT_X,
+			.w_idx	  = WIDX_DOWN,
+			.stage	  = STAGE_MATMUL,
+			.u.matmul = {.n = dim, .k = inter},
+		};
+	} else {
+		ops[i++] = qwen_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter);
+		ops[i++] = mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_X, STAGE_ADD);
+		ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+	}
 	return i;
 }
 
@@ -743,6 +756,8 @@ static int qwen_append_full_attention(recipe_op *ops, const model *m, int li) {
 	ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps,
 					  STAGE_RMSNORM);
 	ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_QWEN_PROJ, WIDX_WQ, 2 * q_out, dim);
+	ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim);
+	ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim);
 	ops[i++] = (recipe_op){
 		.kind = OP_QWEN_SPLIT_QGATE,
 		.in = {RECIPE_SLOT_QWEN_PROJ, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
@@ -750,8 +765,6 @@ static int qwen_append_full_attention(recipe_op *ops, const model *m, int li) {
 		.w_idx = RECIPE_NO_WEIGHT,
 		.stage = STAGE_MATMUL,
 	};
-	ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim);
-	ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim);
 	ops[i++] = (recipe_op){
 		.kind = OP_RMSNORM_PER_HEAD,
 		.in = {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},

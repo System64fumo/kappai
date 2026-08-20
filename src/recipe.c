@@ -3287,37 +3287,81 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 
 	{
 		int n_logit_rows = (s->spec_rows > 0 && logits_out) ? n_tokens : 1;
-		float *spec_l = NULL;
-		if (n_logit_rows > 1)
-			spec_l = float_buf_ensure(&s->spec_logits, (size_t)n_tokens * (size_t)m->vocab_size);
-		backend *owner_x = s->slots[RECIPE_SLOT_X].owner;
-		float *tmp = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
-		for (int row = n_tokens - n_logit_rows; row < n_tokens; row++) {
-			buffer xrow = batch_row_view(&bs->x_b, row, dim);
-			memcpy(tmp, batch_buf_ptr(&xrow), (size_t)dim * sizeof(float));
-			st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
+		int vocab		 = m->vocab_size;
+		if (n_logit_rows > 1 && a->rmsnorm_batch && a->matmul_batch) {
+			const buffer *norm_w = resolve_weight(m, -1, WIDX_OUTPUT_NORM);
+			weight_ref	 *ow	 = resolve_weight_ref(m, -1, WIDX_OUTPUT_W);
+			int			  row0	 = n_tokens - n_logit_rows;
+			buffer		  xsrc	 = buffer_slice(&bs->x_b, (size_t)row0 * dim * sizeof(float),
+												(size_t)n_logit_rows * dim * sizeof(float));
+			bs_ensure_wrap(bs, &bs->xb, &bs->xb_b, (size_t)n_logit_rows * dim, a);
+			profile_scope ps = profile_begin(&s->prof, STAGE_LOGITS_NORM);
+			st = a->rmsnorm_batch(a, &xsrc, norm_w, &bs->xb_b, dim, m->norm_eps, n_logit_rows);
+			profile_end(&s->prof, &ps);
 			if (st != OK)
 				goto done;
-			float *row_logits = (n_logit_rows > 1) ? spec_l + (size_t)row * m->vocab_size : logits_out;
-			for (int i = 0; i < r->n_post_ops; i++) {
-				st = exec_op(&r->post_ops[i], m, cache, s, tokens[row], pos_start + row, -1,
-							 flash_attn, row_logits);
-				if (st != OK)
-					goto done;
+
+			float *spec_l = float_buf_ensure(&s->spec_logits, (size_t)n_logit_rows * vocab);
+			buffer logits_b = {.handle	 = spec_l,
+							   .host_ptr = spec_l,
+							   .size	 = (size_t)n_logit_rows * vocab * sizeof(float),
+							   .owner	 = a};
+			ps = profile_begin(&s->prof, STAGE_LOGITS_MATMUL);
+			st = a->matmul_batch(a, &ow->buf, ow->type, &bs->xb_b, &logits_b, vocab, dim,
+								 n_logit_rows);
+			profile_end(&s->prof, &ps);
+			if (st != OK)
+				goto done;
+
+			if (logits_out)
+				memcpy(logits_out, spec_l + (size_t)(n_logit_rows - 1) * vocab,
+					   (size_t)vocab * sizeof(float));
+			if (m->final_logit_softcap > 0.0f && logits_out) {
+				float cap	  = m->final_logit_softcap;
+				float inv_cap = 1.0f / cap;
+				for (int i = 0; i < vocab; i++)
+					logits_out[i] = cap * tanhf(logits_out[i] * inv_cap);
 			}
 			if (m->n_layer_nextn) {
-				if (n_logit_rows > 1)
-					mtp_capture_slot_h(m, s, &s->spec_h, row);
-				else
-					mtp_capture_slot_h(m, s, &s->mtp_h, 0);
+				float *hs = float_buf_ensure(&s->spec_h, (size_t)n_logit_rows * dim);
+				memcpy(hs, batch_buf_ptr(&bs->xb_b), (size_t)n_logit_rows * dim * sizeof(float));
+				memcpy(float_buf_ensure(&s->mtp_h, (size_t)dim),
+					   hs + (size_t)(n_logit_rows - 1) * dim, (size_t)dim * sizeof(float));
 			}
+		} else {
+			float *spec_l = NULL;
+			if (n_logit_rows > 1)
+				spec_l = float_buf_ensure(&s->spec_logits, (size_t)n_tokens * (size_t)vocab);
+			backend *owner_x = s->slots[RECIPE_SLOT_X].owner;
+			float	*tmp	 = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
+			for (int row = n_tokens - n_logit_rows; row < n_tokens; row++) {
+				buffer xrow = batch_row_view(&bs->x_b, row, dim);
+				memcpy(tmp, batch_buf_ptr(&xrow), (size_t)dim * sizeof(float));
+				st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
+				if (st != OK)
+					goto done;
+				float *row_logits =
+					(n_logit_rows > 1) ? spec_l + (size_t)row * vocab : logits_out;
+				for (int i = 0; i < r->n_post_ops; i++) {
+					st = exec_op(&r->post_ops[i], m, cache, s, tokens[row], pos_start + row, -1,
+								 flash_attn, row_logits);
+					if (st != OK)
+						goto done;
+				}
+				if (m->n_layer_nextn) {
+					if (n_logit_rows > 1)
+						mtp_capture_slot_h(m, s, &s->spec_h, row);
+					else
+						mtp_capture_slot_h(m, s, &s->mtp_h, 0);
+				}
+			}
+			if (n_logit_rows > 1 && logits_out)
+				memcpy(logits_out, spec_l + (size_t)(n_tokens - 1) * vocab,
+					   (size_t)vocab * sizeof(float));
+			if (n_logit_rows > 1 && m->n_layer_nextn && s->spec_h.p)
+				memcpy(float_buf_ensure(&s->mtp_h, (size_t)dim),
+					   s->spec_h.p + (size_t)(n_tokens - 1) * dim, (size_t)dim * sizeof(float));
 		}
-		if (n_logit_rows > 1 && logits_out)
-			memcpy(logits_out, spec_l + (size_t)(n_tokens - 1) * m->vocab_size,
-				   (size_t)m->vocab_size * sizeof(float));
-		if (n_logit_rows > 1 && m->n_layer_nextn && s->spec_h.p)
-			memcpy(float_buf_ensure(&s->mtp_h, (size_t)dim),
-				   s->spec_h.p + (size_t)(n_tokens - 1) * dim, (size_t)dim * sizeof(float));
 	}
 
 done:
