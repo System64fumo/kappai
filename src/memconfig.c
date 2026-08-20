@@ -49,30 +49,49 @@ static size_t calc_embeddings_bytes(const model *m) {
 	return total;
 }
 
+static size_t wr_bytes(const weight_ref *w, uint64_t d0, uint64_t d1) {
+	if (!w->host_ptr)
+		return 0;
+	size_t row = ggml_row_size(w->type, d0);
+	return d1 ? row * d1 : row;
+}
+
 static size_t calc_attn_bytes(const model *m, int i) {
 	const layer_weights *L	   = &m->layers[i];
-	size_t				 total = 0;
+	size_t				 total = wr_bytes(&L->attn_norm_w, m->dim, 0);
 	if (m->arch_info->is_mla) {
-		total += ggml_row_size(L->q_a_w.type, m->dim) * m->mla.q_lora;
-		total += ggml_row_size(L->q_b_w.type, m->mla.q_lora) * (m->n_heads * m->mla.qk_head);
-		total += m->mla.q_lora * sizeof(float);
-		total += ggml_row_size(L->kv_a_w.type, m->dim) * (m->mla.kv_lora + m->mla.qk_rope);
-		total += ggml_row_size(L->k_b_w.type, m->mla.qk_nope * m->mla.kv_lora) * m->n_heads;
-		total += ggml_row_size(L->v_b_w.type, m->mla.kv_lora * m->mla.v_head) * m->n_heads;
-		total += m->mla.kv_lora * sizeof(float);
+		total += wr_bytes(&L->q_a_w, m->dim, m->mla.q_lora);
+		total += wr_bytes(&L->q_b_w, m->mla.q_lora, (uint64_t)m->n_heads * m->mla.qk_head);
+		total += wr_bytes(&L->q_a_norm_w, m->mla.q_lora, 0);
+		total += wr_bytes(&L->kv_a_w, m->dim, (uint64_t)m->mla.kv_lora + m->mla.qk_rope);
+		total += wr_bytes(&L->k_b_w, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads);
+		total += wr_bytes(&L->v_b_w, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads);
+		total += wr_bytes(&L->kv_a_norm_w, m->mla.kv_lora, 0);
 		int wo_in = m->n_heads * m->mla.v_head;
-		total += ggml_row_size(L->wo.type, wo_in) * m->dim;
+		total += wr_bytes(&L->wo, wo_in, m->dim);
+	} else if (L->attn_qkv_w.host_ptr) {
+		const model_qwen35_params *p = &m->qwen35;
+		total += wr_bytes(&L->attn_qkv_w, m->dim, p->conv_dim);
+		total += wr_bytes(&L->attn_gate_w, m->dim, p->value_dim);
+		total += wr_bytes(&L->ssm_conv1d_w, p->conv_kernel, p->conv_dim);
+		total += wr_bytes(&L->ssm_dt_b, p->n_value_heads, 0);
+		total += wr_bytes(&L->ssm_a, p->n_value_heads, 0);
+		total += wr_bytes(&L->ssm_beta_w, m->dim, p->n_value_heads);
+		total += wr_bytes(&L->ssm_alpha_w, m->dim, p->n_value_heads);
+		total += wr_bytes(&L->ssm_norm_w, p->value_head_dim, 0);
+		total += wr_bytes(&L->ssm_out_w, p->value_dim, m->dim);
 	} else {
-		int head_dim = m->layers[i].head_dim;
+		int head_dim = L->head_dim;
 		int q_out	 = m->n_heads * head_dim;
-		int kv_out	 = m->layers[i].n_kv_heads * head_dim;
-		total += ggml_row_size(L->wq.type, m->dim) * q_out;
-		total += ggml_row_size(L->wk.type, m->dim) * kv_out;
-		if (m->layers[i].has_own_v)
-			total += ggml_row_size(L->wv.type, m->dim) * kv_out;
-		total += ggml_row_size(L->wo.type, q_out) * m->dim;
+		int kv_out	 = L->n_kv_heads * head_dim;
+		total += wr_bytes(&L->wq, m->dim, q_out);
+		total += wr_bytes(&L->wk, m->dim, kv_out);
+		total += wr_bytes(&L->wv, m->dim, kv_out);
+		total += wr_bytes(&L->wo, q_out, m->dim);
+		total += wr_bytes(&L->attn_q_norm_w, head_dim, 0);
+		total += wr_bytes(&L->attn_k_norm_w, head_dim, 0);
 	}
-	total += m->dim * sizeof(float) * 4;
+	total += wr_bytes(&L->post_attn_norm_w, m->dim, 0);
 	return total;
 }
 
@@ -80,11 +99,13 @@ static size_t calc_dense_ffn_bytes(const model *m, int i) {
 	const layer_weights *L = &m->layers[i];
 	if (L->is_moe_layer && !m->arch_info->uses_moe_shared_dense_ffn)
 		return 0;
-	int	   inter = m->layers[i].intermediate;
+	int	   inter = L->intermediate;
 	size_t total = 0;
-	total += ggml_row_size(L->gate_w.type, m->dim) * inter;
-	total += ggml_row_size(L->up_w.type, m->dim) * inter;
-	total += ggml_row_size(L->down_w.type, inter) * m->dim;
+	total += wr_bytes(&L->gate_w, m->dim, inter);
+	total += wr_bytes(&L->up_w, m->dim, inter);
+	total += wr_bytes(&L->down_w, inter, m->dim);
+	total += wr_bytes(&L->ffn_norm_w, m->dim, 0);
+	total += wr_bytes(&L->post_ffn_norm_w, m->dim, 0);
 	return total;
 }
 
