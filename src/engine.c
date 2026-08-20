@@ -67,9 +67,11 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	u->first_token = false;
 
 	if (id == u->think_start_id) {
-		u->in_thinking = true;
-		u->skip_label  = true;
-		print_start_thinking();
+		u->skip_label = true;
+		if (!u->in_thinking) {
+			u->in_thinking = true;
+			print_start_thinking();
+		}
 		return;
 	}
 	if (id == u->think_end_id) {

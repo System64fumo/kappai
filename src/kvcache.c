@@ -13,6 +13,7 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	c->kv_quant = kv_quant;
 
 	int is_mla = m->arch_info->is_mla;
+	int is_qwen35 = m->arch_info->is_hybrid_recurrent;
 
 	if (kv_quant != KV_QUANT_F16 && is_mla) {
 		ERROR("kvcache: quantized KV cache is not supported for MLA models");
@@ -46,6 +47,18 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		c->mla->qk_rope_dim = m->mla.qk_rope;
 		return m->backend->kv_alloc_mla(m->backend, m->n_layers, n_ctx, c->mla->lora_dim,
 										c->mla->qk_rope_dim, &c->mla->kv);
+	}
+
+	if (is_qwen35) {
+		kvcache_qwen35 *q = xcalloc(1, sizeof(*q));
+		q->conv_stride = (size_t)m->qwen35.conv_dim * (size_t)(m->qwen35.conv_kernel - 1);
+		q->recurrent_stride = (size_t)m->qwen35.n_value_heads *
+						  (size_t)m->qwen35.state_size * (size_t)m->qwen35.value_head_dim;
+		q->n_layers = m->n_layers;
+		q->conv_state = xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
+		q->recurrent_state =
+			xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		c->qwen35 = q;
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
@@ -114,6 +127,12 @@ void kvcache_free(kvcache *c) {
 			}
 			c->has_host_kv = 0;
 		}
+	}
+	if (c->qwen35) {
+		free(c->qwen35->conv_state);
+		free(c->qwen35->recurrent_state);
+		free(c->qwen35);
+		c->qwen35 = NULL;
 	}
 	free(c->kv_slot_on_host);
 	c->kv_slot_on_host = NULL;
@@ -214,6 +233,12 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 
 void kvcache_reset(kvcache *c) {
 	c->n_pos = 0;
+	if (c->qwen35) {
+		memset(c->qwen35->conv_state, 0,
+			   (size_t)c->qwen35->n_layers * c->qwen35->conv_stride * sizeof(float));
+		memset(c->qwen35->recurrent_state, 0,
+			   (size_t)c->qwen35->n_layers * c->qwen35->recurrent_stride * sizeof(float));
+	}
 }
 
 static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats) {

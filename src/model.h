@@ -33,6 +33,15 @@ typedef struct layer_weights {
 
 	weight_ref attn_q_norm_w;
 	weight_ref attn_k_norm_w;
+	weight_ref attn_qkv_w;
+	weight_ref attn_gate_w;
+	weight_ref ssm_conv1d_w;
+	weight_ref ssm_dt_b;
+	weight_ref ssm_a;
+	weight_ref ssm_beta_w;
+	weight_ref ssm_alpha_w;
+	weight_ref ssm_norm_w;
+	weight_ref ssm_out_w;
 	weight_ref ple_post_norm_w;
 	weight_ref ple_inp_gate_w;
 	weight_ref ple_proj_w;
@@ -46,6 +55,7 @@ typedef struct layer_weights {
 	int n_kv_heads;
 	int has_own_v;
 	int rope_dim;
+	int is_recurrent;
 
 	weight_ref q_a_w, q_b_w, q_a_norm_w;
 	weight_ref kv_a_w, k_b_w, v_b_w, kv_a_norm_w;
@@ -122,6 +132,19 @@ typedef struct model_layer_dims_params {
 	weight_ref per_layer_proj_norm_w;
 } model_layer_dims_params;
 
+typedef struct model_qwen35_params {
+	int conv_kernel;
+	int inner_size;
+	int state_size;
+	int n_value_heads;
+	int n_key_heads;
+	int full_attention_interval;
+	int key_dim;
+	int value_head_dim;
+	int value_dim;
+	int conv_dim;
+} model_qwen35_params;
+
 typedef struct model {
 	model_arch		 arch;
 	const arch_info *arch_info;
@@ -147,6 +170,7 @@ typedef struct model {
 	model_mla_params		mla;
 	model_moe_params		moe;
 	model_layer_dims_params layer_dims;
+	model_qwen35_params	qwen35;
 
 	struct moe_stream_cache *moe_cache;
 	int						 moe_stream_enabled;
@@ -248,6 +272,14 @@ static inline int model_layer_is_moe(const model *m, int li) {
 	if (li < 0 || li >= m->n_layers)
 		return 0;
 	return m->layers[li].is_moe_layer;
+}
+
+static inline int model_layer_is_recurrent(const model *m, int li) {
+	if (!m || !m->arch_info || !m->arch_info->is_hybrid_recurrent)
+		return 0;
+	if (li < 0 || li >= m->n_layers)
+		return 0;
+	return m->layers[li].is_recurrent;
 }
 
 #endif

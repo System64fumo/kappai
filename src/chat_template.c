@@ -211,14 +211,21 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 		diff	 = rendered + prev_cmp;
 		diff_len = new_len - prev_cmp;
 	}
-	*out = xstrdup(diff);
-
 	cts->think_open = false;
 	if (add_generation_prompt && cts->think_start_text) {
-		size_t l = strlen(cts->think_start_text);
-		if (l <= diff_len && strcmp(diff + diff_len - l, cts->think_start_text) == 0)
-			cts->think_open = true;
+		size_t l   = strlen(cts->think_start_text);
+		size_t end = diff_len;
+		while (end > 0 && isspace((unsigned char)diff[end - 1]))
+			end--;
+		if (l <= end && memcmp(diff + end - l, cts->think_start_text, l) == 0) {
+			size_t keep = end - l;
+			while (keep > 0 && isspace((unsigned char)diff[keep - 1]))
+				keep--;
+			rendered[(size_t)(diff - rendered) + keep] = '\0';
+			diff_len = keep;
+		}
 	}
+	*out = xstrdup(diff);
 
 	free(cts->last_render);
 	cts->last_render = rendered;

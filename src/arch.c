@@ -74,6 +74,18 @@ static const arch_info k_registry[] = {
 		.moe_first_dense_layers	 = 3,
 		.uses_moe_norm_topk_prob = true,
 	},
+	{
+		.arch						 = ARCH_QWEN35,
+		.gguf_name					 = "qwen35",
+		.key_prefix					 = "qwen35",
+		.default_rope_theta			 = 10000000.0f,
+		.has_qk_norm					 = true,
+		.has_attn_post_norm			 = true,
+		.has_attn_output_gate			 = true,
+		.uses_post_attn_norm_for_ffn = true,
+		.is_hybrid_recurrent			 = true,
+		.uses_neox_rope				 = true,
+	},
 };
 
 const arch_info *arch_lookup(model_arch a) {

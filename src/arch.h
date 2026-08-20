@@ -10,6 +10,7 @@ typedef enum {
 	ARCH_GEMMA4,
 	ARCH_GEMMA4_MOE,
 	ARCH_GLM_DSA,
+	ARCH_QWEN35,
 } model_arch;
 
 typedef struct {
@@ -36,6 +37,9 @@ typedef struct {
 	bool has_shared_expert;
 	bool uses_moe_shared_dense_ffn;
 	bool is_mla;
+	bool is_hybrid_recurrent;
+	bool has_attn_output_gate;
+	bool uses_post_attn_norm_for_ffn;
 	int	 moe_first_dense_layers;
 	bool uses_moe_norm_topk_prob;
 } arch_info;

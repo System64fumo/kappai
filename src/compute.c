@@ -61,6 +61,10 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
 	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
 	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
+	free_buf(&s->slots[RECIPE_SLOT_QWEN_PROJ]);
+	free_buf(&s->slots[RECIPE_SLOT_QWEN_GATE]);
+	free_buf(&s->slots[RECIPE_SLOT_QWEN_ALPHA]);
+	free_buf(&s->slots[RECIPE_SLOT_QWEN_BETA]);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
 	free_buf(&s->ple_all);
@@ -79,6 +83,10 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP]);
 	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_ACT]);
 	free_buf(&s->mirror_slots[RECIPE_SLOT_LOGITS]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_QWEN_PROJ]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_QWEN_GATE]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_QWEN_ALPHA]);
+	free_buf(&s->mirror_slots[RECIPE_SLOT_QWEN_BETA]);
 	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
 		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
 			continue;
@@ -128,11 +136,14 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->moe_scratch.p);
 	free(s->moe_xb_f.p);
 	free(s->moe_shared_y.p);
+	free(s->qwen_host.p);
 	s->moe_all_scratch.p = NULL;
 	s->moe_all_outs.p	 = NULL;
 	s->moe_scratch.p	 = NULL;
 	s->moe_xb_f.p		 = NULL;
 	s->moe_shared_y.p	 = NULL;
+	s->qwen_host.p		 = NULL;
+	s->qwen_host.cap	 = 0;
 
 	if (s->bs) {
 		batch_scratch_free(s->bs);
@@ -230,11 +241,34 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		if (mla_out > attn_buf_size)
 			attn_buf_size = mla_out;
 	}
+	if (m->arch_info->is_hybrid_recurrent && m->qwen35.value_dim > attn_buf_size)
+		attn_buf_size = m->qwen35.value_dim;
 
 	{
 		status_code _st =
 			scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)attn_buf_size * sizeof(float),
 						  "&s->slots[RECIPE_SLOT_X]");
+		if (_st != OK)
+			return _st;
+	}
+	if (m->arch_info->is_hybrid_recurrent) {
+		int q_out = m->n_heads * m->head_dim;
+		int proj_size = m->qwen35.conv_dim > 2 * q_out ? m->qwen35.conv_dim : 2 * q_out;
+		int gate_size = m->qwen35.value_dim > q_out ? m->qwen35.value_dim : q_out;
+		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_QWEN_PROJ],
+								   (size_t)proj_size * sizeof(float), "qwen projection");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_QWEN_GATE],
+							(size_t)gate_size * sizeof(float), "qwen gate");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_QWEN_ALPHA],
+							(size_t)m->qwen35.n_value_heads * sizeof(float), "qwen alpha");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_QWEN_BETA],
+							(size_t)m->qwen35.n_value_heads * sizeof(float), "qwen beta");
 		if (_st != OK)
 			return _st;
 	}
@@ -254,7 +288,8 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	}
 	{
 		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)m->dim * sizeof(float),
+			scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT],
+						  (size_t)attn_buf_size * sizeof(float),
 						  "&s->slots[RECIPE_SLOT_ATTN_OUT]");
 		if (_st != OK)
 			return _st;
@@ -354,7 +389,9 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 			}
 		}
 	} else {
-		const int rope_head_dim = m->arch_info->is_mla ? m->mla.qk_rope : m->head_dim;
+		const int rope_head_dim = m->arch_info->is_mla ? m->mla.qk_rope
+											  : (m->arch_info->is_hybrid_recurrent ? m->rope_dim
+																				 : m->head_dim);
 		const int half			= rope_head_dim / 2;
 		s->rope_cos				= xmalloc((size_t)n_ctx * half * sizeof(float));
 		s->rope_sin				= xmalloc((size_t)n_ctx * half * sizeof(float));
@@ -431,6 +468,8 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 		if (mla_out > attn_buf_size)
 			attn_buf_size = mla_out;
 	}
+	if (m->arch_info->is_hybrid_recurrent && m->qwen35.value_dim > attn_buf_size)
+		attn_buf_size = m->qwen35.value_dim;
 
 	int max_intermediate = m->intermediate;
 	if (m->arch_info->has_variable_layer_dims) {
@@ -449,9 +488,20 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	} while (0)
 
 	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)attn_buf_size * sizeof(float));
+	if (m->arch_info->is_hybrid_recurrent) {
+		int q_out = m->n_heads * m->head_dim;
+		int proj_size = m->qwen35.conv_dim > 2 * q_out ? m->qwen35.conv_dim : 2 * q_out;
+		int gate_size = m->qwen35.value_dim > q_out ? m->qwen35.value_dim : q_out;
+		MIRROR_ALLOC(RECIPE_SLOT_QWEN_PROJ, (size_t)proj_size * sizeof(float));
+		MIRROR_ALLOC(RECIPE_SLOT_QWEN_GATE, (size_t)gate_size * sizeof(float));
+		MIRROR_ALLOC(RECIPE_SLOT_QWEN_ALPHA,
+					 (size_t)m->qwen35.n_value_heads * sizeof(float));
+		MIRROR_ALLOC(RECIPE_SLOT_QWEN_BETA,
+					 (size_t)m->qwen35.n_value_heads * sizeof(float));
+	}
 	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)attn_buf_size * sizeof(float));
 	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)m->dim * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)attn_buf_size * sizeof(float));
 	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)m->n_heads * max_head_dim * sizeof(float));
 	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)max_kv_heads * max_head_dim * sizeof(float));
 	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)max_kv_heads * max_head_dim * sizeof(float));
