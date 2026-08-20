@@ -579,6 +579,17 @@ static void dequant_weight_to_f32(const void **w, uint32_t *type, size_t row_len
 	*type = GGML_TYPE_F32;
 }
 
+static void convert_weight_f32_to_f16(const void **w, uint32_t *type, size_t n_elems) {
+	if (*type != GGML_TYPE_F32)
+		return;
+	const float *src = *w;
+	uint16_t *dst = xmalloc_aligned(n_elems * sizeof(uint16_t), 64);
+	for (size_t i = 0; i < n_elems; i++)
+		dst[i] = f32_to_f16(src[i]);
+	*w = dst;
+	*type = GGML_TYPE_F16;
+}
+
 static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w, uint32_t type,
 								 uint64_t dim, uint64_t intermediate) {
 	size_t	 row_stride = ggml_row_size(type, dim);
@@ -634,7 +645,13 @@ static void upload_embeddings(model *m) {
 				m->layer_dims.per_layer_tok_embd.host_ptr;
 			m->layer_dims.per_layer_tok_embd.buf.owner = NULL;
 		}
-		if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_BF16) {
+		if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_BF16 && m->backend &&
+			strcmp(m->backend->name, "cpu") == 0) {
+			s = upload_one(m, &m->layer_dims.per_layer_model_proj, GGML_TYPE_BF16, 2, m->dim,
+						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, WCLASS_MATMUL);
+			if (s != OK)
+				return;
+		} else if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_BF16) {
 			size_t n_elems = (size_t)m->dim * (size_t)m->layer_dims.n_embd_per_layer * m->n_layers;
 			float *f32_buf = xmalloc(n_elems * sizeof(float));
 			dequant_bf16_row(m->layer_dims.per_layer_model_proj.host_ptr, (int)n_elems, f32_buf);
@@ -748,7 +765,12 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	if (m->has_per_layer_embeddings) {
 		UPLOAD(&L->ple_post_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 		int gate_owned = 0;
-		if (L->ple_inp_gate_w.type != GGML_TYPE_F32) {
+		if (layer_be && strcmp(layer_be->name, "cpu") == 0 &&
+			L->ple_inp_gate_w.type == GGML_TYPE_F32) {
+			convert_weight_f32_to_f16(&L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
+									 (size_t)m->layer_dims.n_embd_per_layer * (size_t)m->dim);
+			gate_owned = 1;
+		} else if (L->ple_inp_gate_w.type != GGML_TYPE_F32) {
 			dequant_weight_to_f32(&L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
 								  (size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
 			gate_owned = 1;
@@ -758,7 +780,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		if (gate_owned)
 			L->ple_inp_gate_w.buf.host_ptr = NULL;
 		int proj_owned = 0;
-		if (L->ple_proj_w.type != GGML_TYPE_F32) {
+		if (layer_be && strcmp(layer_be->name, "cpu") == 0 && L->ple_proj_w.type == GGML_TYPE_F32) {
+			convert_weight_f32_to_f16(&L->ple_proj_w.host_ptr, &L->ple_proj_w.type,
+									 (size_t)m->dim * (size_t)m->layer_dims.n_embd_per_layer);
+			proj_owned = 1;
+		} else if (L->ple_proj_w.type != GGML_TYPE_F32) {
 			dequant_weight_to_f32(&L->ple_proj_w.host_ptr, &L->ple_proj_w.type, (size_t)m->dim,
 								  (size_t)m->layer_dims.n_embd_per_layer);
 			proj_owned = 1;

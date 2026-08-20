@@ -40,6 +40,8 @@ const char *stage_name(stage s) {
 		[STAGE_ATTN]			= "attention",
 		[STAGE_FFN_ACT]			= "ffn_activate",
 		[STAGE_ADD]				= "residual_add",
+		[STAGE_PLE_BUILD]		= "ple_build",
+		[STAGE_PLE_INJECT]		= "ple_inject",
 		[STAGE_LOGITS_NORM]		= "logits_norm",
 		[STAGE_LOGITS_MATMUL]	= "logits_matmul",
 		[STAGE_LOGITS_READBACK] = "logits_readback",
