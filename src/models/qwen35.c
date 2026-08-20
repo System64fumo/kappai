@@ -577,7 +577,7 @@ static recipe_op qwen_matmul(uint8_t in, uint8_t out, uint8_t weight, int n, int
 	return mk_matmul(in, out, weight, n, k, STAGE_MATMUL);
 }
 
-static int qwen_append_ffn(recipe_op *ops, int i, const model *m) {
+static int qwen_append_ffn(recipe_op *ops, int i, const model *m, int li) {
 	int dim = m->dim;
 	int inter = m->intermediate;
 	float eps = m->norm_eps;
@@ -585,7 +585,7 @@ static int qwen_append_ffn(recipe_op *ops, int i, const model *m) {
 	ops[i++] = mk_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, STAGE_ADD);
 	ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
 	ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_POST_ATTN_NORM, eps, STAGE_RMSNORM);
-	if (m->layers[0].gate_up_fused) {
+	if (m->layers[li].gate_up_fused) {
 		ops[i++] = qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP,
 						  2 * inter, dim);
 		ops[i++] = (recipe_op){
@@ -631,7 +631,7 @@ static int qwen_append_ffn(recipe_op *ops, int i, const model *m) {
 	return i;
 }
 
-static int qwen_append_recurrent(recipe_op *ops, const model *m) {
+static int qwen_append_recurrent(recipe_op *ops, const model *m, int li) {
 	int i = 0;
 	int dim = m->dim;
 	const model_qwen35_params *p = &m->qwen35;
@@ -654,10 +654,10 @@ static int qwen_append_recurrent(recipe_op *ops, const model *m) {
 	};
 	ops[i++] = qwen_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_SSM_OUT, dim,
 						  p->value_dim);
-	return qwen_append_ffn(ops, i, m);
+	return qwen_append_ffn(ops, i, m, li);
 }
 
-static int qwen_append_full_attention(recipe_op *ops, const model *m) {
+static int qwen_append_full_attention(recipe_op *ops, const model *m, int li) {
 	int i = 0;
 	int dim = m->dim;
 	int q_out = m->n_heads * m->head_dim;
@@ -727,7 +727,7 @@ static int qwen_append_full_attention(recipe_op *ops, const model *m) {
 		.stage = STAGE_ATTN,
 	};
 	ops[i++] = qwen_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out);
-	return qwen_append_ffn(ops, i, m);
+	return qwen_append_ffn(ops, i, m, li);
 }
 
 static model_recipe *build_qwen35_recipe(const model *m) {
@@ -753,8 +753,8 @@ static model_recipe *build_qwen35_recipe(const model *m) {
 	r->per_layer_ops = xcalloc((size_t)m->n_layers * ops_per_layer, sizeof(recipe_op));
 	for (int li = 0; li < m->n_layers; li++) {
 		recipe_op *ops = r->per_layer_ops + (size_t)li * ops_per_layer;
-		int n = model_layer_is_recurrent(m, li) ? qwen_append_recurrent(ops, m)
-											 : qwen_append_full_attention(ops, m);
+		int n = model_layer_is_recurrent(m, li) ? qwen_append_recurrent(ops, m, li)
+											 : qwen_append_full_attention(ops, m, li);
 		if (n > ops_per_layer)
 			return NULL;
 	}

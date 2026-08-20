@@ -49,6 +49,14 @@ _Static_assert(sizeof(iq4_nl_block) == 18, "");
 
 typedef struct {
 	uint16_t d;
+	uint16_t scales_h;
+	uint8_t	 scales_l[4];
+	uint8_t	 qs[128];
+} iq4_xs_block;
+_Static_assert(sizeof(iq4_xs_block) == 136, "");
+
+typedef struct {
+	uint16_t d;
 	uint8_t	 qs[64];
 	uint8_t	 qh[8];
 	uint8_t	 signs[32];
@@ -129,6 +137,7 @@ void dequant_q4_k_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_q5_k_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_q6_k_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_iq4_nl_row(const void *blocks, size_t n_blocks, float *dst);
+void dequant_iq4_xs_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_f16_row(const void *src, int n, float *dst);
 void dequant_bf16_row(const void *src, int n, float *dst);
@@ -150,6 +159,7 @@ static inline uint32_t wtype_to_q8type(uint32_t w_type) {
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ3_S:
 	case GGML_TYPE_IQ3_S_RE:
+	case GGML_TYPE_IQ4_XS:
 		return GGML_TYPE_Q8_K;
 	default:
 		return 0;
@@ -170,6 +180,8 @@ void matmul_q8_0_q8_f32(const void *w, const float *restrict x, float *restrict 
 void matmul_q4_1_q8_f32(const void *w, const float *x, float *y, int n, int k, quant_scratch *qs);
 void matmul_iq4_nl_q8_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
 						  quant_scratch *qs);
+void matmul_iq4_xs_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
+							quant_scratch *qs);
 void matmul_q6_k_q8_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
 						quant_scratch *qs);
 void matmul_q4_k_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
@@ -235,6 +247,9 @@ void matmul_q8_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 								size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								int n, int k, int m);
+void matmul_iq4_xs_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								  int n, int k, int m);
 void matmul_q4_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 							  int n, int k, int m);

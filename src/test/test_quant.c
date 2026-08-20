@@ -16,6 +16,8 @@ static dequant_fn get_dequant_fn(uint32_t type) {
 		return dequant_q8_0_row;
 	case GGML_TYPE_IQ4_NL:
 		return dequant_iq4_nl_row;
+	case GGML_TYPE_IQ4_XS:
+		return dequant_iq4_xs_row;
 	case GGML_TYPE_Q4_K:
 		return dequant_q4_k_row;
 	case GGML_TYPE_Q5_K:

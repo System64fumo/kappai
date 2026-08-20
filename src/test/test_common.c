@@ -660,6 +660,7 @@ const qtype_info QTYPES[] = {
 	{"q5_K", GGML_TYPE_Q5_K, 256, sizeof(q5_k_block)},
 	{"q6_K", GGML_TYPE_Q6_K, 256, sizeof(q6_k_block)},
 	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, sizeof(iq4_nl_block)},
+	{"iq4_xs", GGML_TYPE_IQ4_XS, 256, sizeof(iq4_xs_block)},
 	{"iq3_s", GGML_TYPE_IQ3_S, 256, sizeof(iq3_s_block)},
 	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, sizeof(q4_0_block)},
 	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, sizeof(q8_0_block)},

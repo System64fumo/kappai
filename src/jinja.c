@@ -805,11 +805,39 @@ static expr_node *parse_primary(parser *p) {
 	} else if (ptok_is(p, TOK_LPAREN)) {
 		padvance(p);
 		free(n);
-		n = parse_expr(p);
-		if (!ptok_is(p, TOK_RPAREN))
-			perr(p, "expected ')'");
-		else
+		if (ptok_is(p, TOK_RPAREN)) {
+			n		= xmalloc(sizeof(*n));
+			memset(n, 0, sizeof(*n));
+			n->kind = EX_LIST;
 			padvance(p);
+		} else {
+			expr_node *first = parse_expr(p);
+			if (ptok_is(p, TOK_COMMA)) {
+				n		= xmalloc(sizeof(*n));
+				memset(n, 0, sizeof(*n));
+				n->kind = EX_LIST;
+				n->items			   = xmalloc(sizeof(expr_node *));
+				n->items[0]			   = first;
+				n->n_items			   = 1;
+				while (ptok_is(p, TOK_COMMA)) {
+					padvance(p);
+					if (ptok_is(p, TOK_RPAREN))
+						break;
+					n->items = xrealloc(n->items, (n->n_items + 1) * sizeof(expr_node *));
+					n->items[n->n_items++] = parse_expr(p);
+				}
+				if (!ptok_is(p, TOK_RPAREN))
+					perr(p, "expected ')'");
+				else
+					padvance(p);
+			} else {
+				n = first;
+				if (!ptok_is(p, TOK_RPAREN))
+					perr(p, "expected ')'");
+				else
+					padvance(p);
+			}
+		}
 	} else {
 		perr(p, "expected expression");
 		n->kind = EX_STRING;
@@ -880,8 +908,12 @@ static expr_node *parse_primary(parser *p) {
 			}
 			if (ptok_is(p, TOK_COLON)) {
 				padvance(p);
-				if (!ptok_is(p, TOK_RBRACKET))
-					(void)parse_expr(p);
+				if (!ptok_is(p, TOK_RBRACKET)) {
+					expr_arg *step = xmalloc(sizeof(*step));
+					memset(step, 0, sizeof(*step));
+					step->val  = parse_expr(p);
+					attr->args = step;
+				}
 			}
 			attr->a = n;
 			if (!ptok_is(p, TOK_RBRACKET))
@@ -1349,7 +1381,7 @@ static stmt_node *parse_block(parser *p) {
 static const char *supported_filters[] = {
 	"trim",       "default", "length", "upper", "lower", "dictsort", "list", "map",
 	"capitalize", "replace", "tojson", "int",   "first", "last",     "join", "safe",
-	"string",     NULL};
+	"string",     "items",   NULL};
 
 static const char *supported_methods[] = {
 	"get",     "split", "strip", "lstrip", "rstrip", "trim", "join", "lower",
@@ -1925,6 +1957,18 @@ static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
 		return base;
 	if (!strcmp(e->str, "string"))
 		return jinja_string(value_as_cstr(base));
+	if (!strcmp(e->str, "items")) {
+		jinja_value *out = jinja_list();
+		if (base && base->type == JV_DICT) {
+			for (jinja_dict_entry *en = base->as.dict; en; en = en->next) {
+				jinja_value *pair = jinja_list();
+				jinja_list_append(pair, jinja_string(en->key));
+				jinja_list_append(pair, en->val);
+				jinja_list_append(out, pair);
+			}
+		}
+		return out;
+	}
 	if (!strcmp(e->str, "map")) {
 		const char	*fname = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
 		jinja_value *out   = jinja_list();
@@ -2100,30 +2144,54 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			n = (long)base->as.list.n;
 		else
 			return jinja_none();
-		long start = 0, end = n;
+		long start = 0, end = n, step = 1;
 		if (e->b)
 			start = atol(value_as_cstr(eval_expr(ctx, e->b)));
 		if (e->c)
 			end = atol(value_as_cstr(eval_expr(ctx, e->c)));
+		if (e->args)
+			step = atol(value_as_cstr(eval_expr(ctx, e->args->val)));
+		if (step == 0)
+			step = 1;
 		if (start < 0)
 			start += n;
 		if (end < 0)
 			end += n;
+		if (step < 0 && !e->b)
+			start = n - 1;
+		if (step < 0 && !e->c)
+			end = -1;
 		if (start < 0)
 			start = 0;
 		if (start > n)
 			start = n;
-		if (end < 0)
-			end = 0;
-		if (end > n)
-			end = n;
-		if (end < start)
-			end = start;
-		if (base->type == JV_STRING)
-			return jinja_string_n(base->as.s + start, (size_t)(end - start));
+		if (step > 0) {
+			if (end < 0)
+				end = 0;
+			if (end > n)
+				end = n;
+			if (end < start)
+				end = start;
+		}
+		if (base->type == JV_STRING) {
+			if (step == 1)
+				return jinja_string_n(base->as.s + start, (size_t)(end - start));
+			strbuf sb;
+			sb_init(&sb);
+			for (long i = start; step > 0 ? i < end : i > end; i += step)
+				sb_append(&sb, base->as.s + i, 1);
+			jinja_value *out = jinja_string(sb.p);
+			free(sb.p);
+			return out;
+		}
 		jinja_value *out = jinja_list();
-		for (long i = start; i < end; i++)
-			jinja_list_append(out, base->as.list.items[i]);
+		if (step > 0) {
+			for (long i = start; i < end; i += step)
+				jinja_list_append(out, base->as.list.items[i]);
+		} else {
+			for (long i = start; i > end; i += step)
+				jinja_list_append(out, base->as.list.items[i]);
+		}
 		return out;
 	}
 	case EX_DYNINDEX: {

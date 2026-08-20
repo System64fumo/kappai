@@ -108,6 +108,7 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 		[GGML_TYPE_Q6_K]	  = {GGML_TYPE_Q6_K, "q6_K", 210, 256},
 		[GGML_TYPE_IQ4_NL]	  = {GGML_TYPE_IQ4_NL, "iq4_nl", 18, 32},
 		[GGML_TYPE_IQ3_S]	  = {GGML_TYPE_IQ3_S, "iq3_s", 110, 256},
+		[GGML_TYPE_IQ4_XS]	  = {GGML_TYPE_IQ4_XS, "iq4_xs", 136, 256},
 		[GGML_TYPE_IQ3_S_RE]  = {GGML_TYPE_IQ3_S_RE, "iq3_s_re", 134, 256},
 		[GGML_TYPE_Q8_0_R8]	  = {GGML_TYPE_Q8_0_R8, "q8_0_r8", 34, 32},
 		[GGML_TYPE_Q4_0_R8]	  = {GGML_TYPE_Q4_0_R8, "q4_0_r8", 18, 32},

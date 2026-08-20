@@ -99,6 +99,7 @@ typedef struct {
 static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_0, matmul_q4_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL, matmul_iq4_nl_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_IQ4_XS, matmul_iq4_xs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_Q8_0, matmul_q8_0_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q4_1, matmul_q4_1_q8_qonly_f32, 2),
 	MATMUL_KERNEL(GGML_TYPE_Q5_0, matmul_q5_0_q8_qonly_f32, 1),
@@ -723,6 +724,9 @@ void cpu_matmul_one(const void *restrict W, uint32_t w_type, const float *restri
 		break;
 	case GGML_TYPE_IQ4_NL:
 		matmul_iq4_nl_q8_f32(W, x, y, n, k, qs);
+		break;
+	case GGML_TYPE_IQ4_XS:
+		matmul_iq4_xs_q8_k_f32(W, x, y, n, k, qs);
 		break;
 	case GGML_TYPE_Q6_K:
 		matmul_q6_k_q8_f32(W, x, y, n, k, qs);
