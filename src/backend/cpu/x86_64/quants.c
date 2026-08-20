@@ -1,4 +1,5 @@
 #include "backend/cpu/scalar/quants.h"
+#include "backend/cpu/x86_64/common.h"
 #include "common.h"
 #include "threadpool.h"
 
@@ -958,6 +959,7 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q8_0:
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_Q6_K:
@@ -979,6 +981,9 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 			break;
 		case GGML_TYPE_Q4_0_R8:
 			matmul_q4_0_r8_q8_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ4_NL_R8:
+			matmul_iq4_nl_r8_q8_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q4_1:
 			matmul_q4_1_q8_f32(w, x, y, n, k, &qs);
@@ -1982,6 +1987,146 @@ void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		for (; t < m; t++) {
 			matmul_q4_0_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
 											y + ((size_t)t * y_row_stride) + i, MR, k);
+		}
+	}
+}
+#undef NR
+
+#define IQ4_NL_R8_GROUP_BYTES (IQ4_NL_R8_ROWS * sizeof(uint16_t) + IQ4_NL_R8_ROWS * 16)
+
+static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int		blocks_per_row = k / 32;
+	const size_t	row_stride	   = (size_t)blocks_per_row * sizeof(iq4_nl_block);
+	const uint8_t  *Wb			   = w;
+	const __m128i	kvalues_u	   = _mm_loadu_si128((const __m128i *)(kvalues_iq4nl));
+	const __m128i	lo_mask		   = _mm_set1_epi8(0x0F);
+	int				i			   = 0;
+
+	for (; i + MR <= n; i += MR) {
+		__m128 acc_lo = _mm_setzero_ps();
+		__m128 acc_hi = _mm_setzero_ps();
+
+		const uint8_t *group = Wb + ((size_t)i * row_stride);
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t *blk = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
+
+			if (bi + 1 < blocks_per_row)
+				__builtin_prefetch(blk + IQ4_NL_R8_GROUP_BYTES, 0, 1);
+
+			const float	  d_xq = f16_to_f32_fast(xq[bi].d);
+			const __m256i xq8  = _mm256_loadu_si256((const __m256i *)(xq[bi].qs));
+
+			const uint16_t *d_ptr  = (const uint16_t *)blk;
+			const uint8_t  *qs_ptr = blk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+
+			int32_t dots[8];
+			for (int r = 0; r < 8; r++) {
+				const __m128i q		 = _mm_loadu_si128((const __m128i *)(qs_ptr + (size_t)r * 16));
+				const __m128i lo_idx = _mm_and_si128(q, lo_mask);
+				const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
+				const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
+				const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
+				const __m256i q32 =
+					_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32(q32, xq8));
+			}
+
+			__m128i sumi_lo = _mm_setr_epi32(dots[0], dots[1], dots[2], dots[3]);
+			__m128i sumi_hi = _mm_setr_epi32(dots[4], dots[5], dots[6], dots[7]);
+
+			__m128 d_w0	 = loadu_f16x4_to_ps_128(d_ptr);
+			__m128 d_w1	 = loadu_f16x4_to_ps_128(d_ptr + 4);
+			__m128 d_xq_v = _mm_set1_ps(d_xq);
+
+			acc_lo = _mm_fmadd_ps(_mm_cvtepi32_ps(sumi_lo), _mm_mul_ps(d_w0, d_xq_v), acc_lo);
+			acc_hi = _mm_fmadd_ps(_mm_cvtepi32_ps(sumi_hi), _mm_mul_ps(d_w1, d_xq_v), acc_hi);
+		}
+
+		float tmp0[4], tmp1[4];
+		_mm_storeu_ps(tmp0, acc_lo);
+		_mm_storeu_ps(tmp1, acc_hi);
+		for (int r = 0; r < 4; r++) {
+			y[i + r]	 = tmp0[r];
+			y[i + 4 + r] = tmp1[r];
+		}
+	}
+}
+
+#define NR 4
+void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m) {
+	const int	   blocks_per_row = k / 32;
+	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(iq4_nl_block);
+	const uint8_t *Wb			  = w;
+	const __m128i  kvalues_u	  = _mm_loadu_si128((const __m128i *)(kvalues_iq4nl));
+	const __m128i  lo_mask		  = _mm_set1_epi8(0x0F);
+	int			   i			  = 0;
+
+	for (; i + MR <= n; i += MR) {
+		const uint8_t *group = Wb + ((size_t)i * row_stride);
+
+		int t = 0;
+		for (; t + NR <= m; t += NR) {
+			__m128 acc_row[MR];
+			for (int r = 0; r < MR; r++)
+				acc_row[r] = _mm_setzero_ps();
+
+			const q8_0_block *xrow[NR];
+			for (int c = 0; c < NR; c++)
+				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
+
+			for (int bi = 0; bi < blocks_per_row; bi++) {
+				const uint8_t *blk = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
+
+				if (bi + 1 < blocks_per_row)
+					__builtin_prefetch(blk + IQ4_NL_R8_GROUP_BYTES, 0, 1);
+
+				float	xd[NR];
+				__m256i xq32[NR];
+				for (int c = 0; c < NR; c++) {
+					xd[c]	= f16_to_f32_fast(xrow[c][bi].d);
+					xq32[c] = _mm256_loadu_si256((const __m256i *)(xrow[c][bi].qs));
+				}
+				const __m128 xd_vec = _mm_loadu_ps(xd);
+
+				const uint16_t *d_ptr  = (const uint16_t *)blk;
+				const uint8_t  *qs_ptr = blk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+
+				for (int r = 0; r < MR; r++) {
+					const float	  d_w	 = f16_to_f32_fast(d_ptr[r]);
+					const __m128i q		 = _mm_loadu_si128((const __m128i *)(qs_ptr + (size_t)r * 16));
+					const __m128i lo_idx = _mm_and_si128(q, lo_mask);
+					const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
+					const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
+					const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
+					const __m256i q32 =
+						_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+
+					int32_t sumi_arr[NR];
+					for (int c = 0; c < NR; c++)
+						sumi_arr[c] = vreduce_add_epi32(dotprod_s8_s8_i32(q32, xq32[c]));
+					const __m128i sumi4 = _mm_loadu_si128((const __m128i *)sumi_arr);
+
+					const __m128 sumi_f = _mm_cvtepi32_ps(sumi4);
+					acc_row[r] =
+						_mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)), acc_row[r]);
+				}
+			}
+
+			for (int r = 0; r < MR; r++) {
+				float tmp[4];
+				_mm_storeu_ps(tmp, acc_row[r]);
+				for (int c = 0; c < NR; c++)
+					y[((size_t)(t + c) * y_row_stride) + (i + r)] = tmp[c];
+			}
+		}
+
+		for (; t < m; t++) {
+			matmul_iq4_nl_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+											  y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
