@@ -170,14 +170,9 @@ static int run_one_shot(context *c, cli_args *a) {
 	}
 	c->warmup_done = false;
 
-	if (a->warmup)
-		context_idle_prefill_start(c);
-
 	if (a->output_stream)
 		fflush(stderr);
 	int r = run_chat_turn(c, a, a->prompt);
-
-	context_idle_prefill_wait(c);
 
 	if (a->output_stream)
 		printf("\n");
