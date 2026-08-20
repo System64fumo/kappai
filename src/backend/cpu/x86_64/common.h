@@ -16,6 +16,11 @@ static inline __m256 loadu_f16x8_to_ps(const uint16_t *p) {
 	return _mm256_cvtph_ps(h);
 }
 
+static inline __m256 loadu_bf16x8_to_ps(const uint16_t *p) {
+	__m128i h = _mm_loadu_si128((const __m128i *)p);
+	return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+}
+
 static inline __m256 vexp_ps(__m256 x) {
 	x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-88.0f)), _mm256_set1_ps(88.0f));
 
@@ -70,6 +75,14 @@ static inline int32_t vreduce_add_epi32(__m256i v) {
 	return _mm_cvtsi128_si32(s);
 }
 
+static inline __m128i vreduce4_add_epi32(__m256i a, __m256i b, __m256i c, __m256i d) {
+	__m128i a4 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+	__m128i b4 = _mm_add_epi32(_mm256_castsi256_si128(b), _mm256_extracti128_si256(b, 1));
+	__m128i c4 = _mm_add_epi32(_mm256_castsi256_si128(c), _mm256_extracti128_si256(c, 1));
+	__m128i d4 = _mm_add_epi32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
+	return _mm_hadd_epi32(_mm_hadd_epi32(a4, b4), _mm_hadd_epi32(c4, d4));
+}
+
 static inline float vreduce_max_ps(__m256 v) {
 	__m128 lo = _mm256_castps256_ps128(v);
 	__m128 hi = _mm256_extractf128_ps(v, 1);
@@ -85,11 +98,13 @@ static inline __m256i dotprod_u8_s8_i32(__m256i a_u, __m256i b_s) {
 }
 
 static inline __m256i dotprod_s8_s8_i32(__m256i a, __m256i b) {
-	__m256i a_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(a));
-	__m256i a_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 1));
-	__m256i b_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(b));
-	__m256i b_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b, 1));
-	return _mm256_add_epi32(_mm256_madd_epi16(a_lo, b_lo), _mm256_madd_epi16(a_hi, b_hi));
+	/* IQ/Q8 quantizers clamp to [-127, 127], so abs(a) is representable as u8.
+	 * Move a's sign into b and use the AVX2 u8*s8 pairwise dot product.  Each
+	 * adjacent pair is bounded by 2*127*127, avoiding maddubs saturation. */
+	const __m256i a_abs = _mm256_abs_epi8(a);
+	const __m256i b_signed = _mm256_sign_epi8(b, a);
+	return _mm256_madd_epi16(_mm256_maddubs_epi16(a_abs, b_signed),
+							 _mm256_set1_epi16(1));
 }
 
 static inline void vld16_s8_to_ps(const int8_t *p, __m256 *o0, __m256 *o1) {

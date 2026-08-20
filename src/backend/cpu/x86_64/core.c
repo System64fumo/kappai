@@ -1308,6 +1308,42 @@ status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer 
 	return OK;
 }
 
+typedef struct {
+	const float *g, *u;
+	float		*o;
+	int			 n;
+	int			 activation;
+} cpu_ffn_act_batch_args;
+
+static void cpu_ffn_act_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	cpu_ffn_act_batch_args *j  = ctx;
+	tpool_chunk_fn			fn = j->activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
+	for (int row = begin; row < end; row++) {
+		cpu_ffn_act_args a = {
+			.g = j->g + ((size_t)row * j->n),
+			.u = j->u + ((size_t)row * j->n),
+			.o = j->o + ((size_t)row * j->n),
+		};
+		fn(0, j->n, tid, &a);
+	}
+}
+
+status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up, buffer *out,
+								   int n, int activation, int m) {
+	cpu_priv			   *p	= self->priv;
+	cpu_ffn_act_batch_args	job = {.g		   = cpu_ptr(gate),
+								   .u		   = cpu_ptr(up),
+								   .o		   = cpu_ptr(out),
+								   .n		   = n,
+								   .activation = activation};
+	if (p->pool && m >= 2) {
+		tpool_parallel_for(p->pool, m, 1, cpu_ffn_act_batch_chunk_avx, &job);
+	} else {
+		cpu_ffn_act_batch_chunk_avx(0, m, 0, &job);
+	}
+	return OK;
+}
+
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
 	(void)self;
 	const float *lp		= cpu_ptr(logits);
