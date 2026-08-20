@@ -56,6 +56,7 @@ typedef enum {
 	GGML_TYPE_Q4_0_R8	= 0x44,
 	GGML_TYPE_IQ3_S_RE8 = 0x45,
 	GGML_TYPE_IQ4_NL_R8 = 0x46,
+	GGML_TYPE_Q4_K_R8	= 0x47,
 
 } ggml_type;
 

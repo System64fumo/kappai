@@ -1482,6 +1482,83 @@ MATMUL_QONLY_DISPATCH(q4_0_r8_q8, q8_0_block)
 
 MATMUL_Q8_F32(q4_0_r8_q8, q8_0_block, 32, quantize_q8_0, matmul_q4_0_r8_q8_qonly_f32)
 
+#define Q4_K_R8_GROUP_BYTES (Q4_K_R8_ROWS * sizeof(q4_k_block))
+
+void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+	const int	 blocks_per_row = k / 256;
+	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q4_k_block);
+
+	const uint8_t *sp = src;
+	uint8_t		  *dp = dst;
+
+	int group_begin = row_begin - (row_begin % Q4_K_R8_ROWS);
+	for (int g = group_begin; g < row_end; g += Q4_K_R8_ROWS) {
+		const q4_k_block *srow[Q4_K_R8_ROWS];
+		for (int r = 0; r < Q4_K_R8_ROWS; r++)
+			srow[r] = (const q4_k_block *)(sp + (size_t)(g + r) * src_stride);
+
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(q4_k_block);
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			uint8_t	 *dblk	   = dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+			uint16_t *dst_d	   = (uint16_t *)dblk;
+			uint16_t *dst_dmin = dst_d + Q4_K_R8_ROWS;
+			uint8_t	 *dst_sc   = dblk + (size_t)Q4_K_R8_ROWS * 2 * sizeof(uint16_t);
+			uint8_t	 *dst_qs   = dst_sc + (size_t)Q4_K_R8_ROWS * 12;
+			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+				dst_d[r]	= srow[r][bi].d;
+				dst_dmin[r] = srow[r][bi].dmin;
+				memcpy(dst_sc + (size_t)r * 12, srow[r][bi].scales, 12);
+				memcpy(dst_qs + (size_t)r * 128, srow[r][bi].qs, 128);
+			}
+		}
+	}
+}
+
+void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_k_to_q4_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *wb			  = w;
+
+	for (int g = 0; g < n; g += Q4_K_R8_ROWS) {
+		const uint8_t *dgroup			  = wb + (size_t)g * blocks_per_row * sizeof(q4_k_block);
+		float		   sumf[Q4_K_R8_ROWS] = {0};
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t  *dblk	= dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+			const uint16_t *d_w		= (const uint16_t *)dblk;
+			const uint16_t *dmin_w	= d_w + Q4_K_R8_ROWS;
+			const uint8_t  *sc_w	= dblk + (size_t)Q4_K_R8_ROWS * 2 * sizeof(uint16_t);
+			const uint8_t  *qs_w	= sc_w + (size_t)Q4_K_R8_ROWS * 12;
+			const int8_t   *xq8		= xq[bi].qs;
+			const int16_t  *bs		= xq[bi].bsums;
+			const float		xd		= xq[bi].d;
+
+			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+				q4_k_block tmp;
+				tmp.d	 = d_w[r];
+				tmp.dmin = dmin_w[r];
+				memcpy(tmp.scales, sc_w + (size_t)r * 12, 12);
+				memcpy(tmp.qs, qs_w + (size_t)r * 128, 128);
+				sumf[r] = q4_k_dot(&tmp, xq8, bs, xd, sumf[r]);
+			}
+		}
+		int rows_out = n - g;
+		if (rows_out > Q4_K_R8_ROWS)
+			rows_out = Q4_K_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
+			y[g + r] = sumf[r];
+	}
+}
+
+MATMUL_QONLY_DISPATCH(q4_k_r8_q8_k, q8_k_block)
+
+MATMUL_Q8_F32(q4_k_r8_q8_k, q8_k_block, 256, quantize_q8_k, matmul_q4_k_r8_q8_k_qonly_f32)
+
 __attribute__((weak)) void dequant_f16_row(const void *src, int n, float *dst) {
 	const uint16_t *s = src;
 	for (int i = 0; i < n; i++)
@@ -1590,10 +1667,12 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	case GGML_TYPE_Q8_0:
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q4_K_R8:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_IQ4_XS:
 	case GGML_TYPE_Q2_K:
+	case GGML_TYPE_Q3_K:
 	case GGML_TYPE_IQ2_XXS:
 	case GGML_TYPE_IQ2_XS:
 	case GGML_TYPE_IQ2_S:
@@ -1636,6 +1715,9 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 		case GGML_TYPE_Q2_K:
 			matmul_q2_k_q8_k_f32(w, x, y, n, k, &qs);
 			break;
+		case GGML_TYPE_Q3_K:
+			matmul_q3_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
 		case GGML_TYPE_IQ2_XXS:
 			matmul_iq2_xxs_q8_k_f32(w, x, y, n, k, &qs);
 			break;
@@ -1659,6 +1741,9 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 			break;
 		case GGML_TYPE_Q4_K:
 			matmul_q4_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q4_K_R8:
+			matmul_q4_k_r8_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q5_K:
 			matmul_q5_k_q8_k_f32(w, x, y, n, k, &qs);
@@ -2342,6 +2427,55 @@ static inline float q2_k_dot_q8k(const q2_k_block *b, const q8_k_block *xq, floa
 	return fmaf(dall, (float)isum, acc) - dmin * (float)summs;
 }
 
+static inline void q3_k_unpack_scales(const uint8_t *sc, int8_t scales[16]) {
+	const uint32_t kmask1 = 0x03030303;
+	const uint32_t kmask2 = 0x0f0f0f0f;
+	uint32_t	   aux[4];
+	memcpy(aux, sc, 12);
+	uint32_t tmp = aux[2];
+	aux[2]		 = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+	aux[3]		 = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+	aux[0]		 = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+	aux[1]		 = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+	memcpy(scales, aux, 16);
+}
+
+static inline float q3_k_dot_q8k(const q3_k_block *b, const q8_k_block *xq, float acc) {
+	int8_t scales[16];
+	q3_k_unpack_scales(b->scales, scales);
+	const float	   d  = f16_to_f32(b->d) * xq->d;
+	const uint8_t *q  = b->qs;
+	const uint8_t *hm = b->hmask;
+	const int8_t  *q8 = xq->qs;
+	uint8_t		   m  = 1;
+	int			   isum = 0;
+	int			   is	= 0;
+	for (int blk = 0; blk < 2; blk++) {
+		int shift = 0;
+		for (int j = 0; j < 4; j++) {
+			int sc0 = (int)scales[is++] - 32;
+			int s0	= 0;
+			for (int l = 0; l < 16; l++) {
+				int v = (int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+				s0 += (int)q8[l] * v;
+			}
+			isum += sc0 * s0;
+			int sc1 = (int)scales[is++] - 32;
+			int s1	= 0;
+			for (int l = 0; l < 16; l++) {
+				int v = (int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+				s1 += (int)q8[l + 16] * v;
+			}
+			isum += sc1 * s1;
+			shift += 2;
+			m <<= 1;
+			q8 += 32;
+		}
+		q += 32;
+	}
+	return fmaf(d, (float)isum, acc);
+}
+
 static inline float iq2_xxs_dot_q8k(const iq2_xxs_block *b, const q8_k_block *xq, float acc) {
 	const float		d	  = f16_to_f32(b->d) * xq->d;
 	const int8_t   *q8	  = xq->qs;
@@ -2542,6 +2676,7 @@ static inline float iq1_m_dot_q8k(const iq1_m_block *b, const q8_k_block *xq, fl
 	}
 
 MATMUL_Q8K_ROWS(q2_k, q2_k_block, q2_k_dot_q8k)
+MATMUL_Q8K_ROWS(q3_k, q3_k_block, q3_k_dot_q8k)
 MATMUL_Q8K_ROWS(iq2_xxs, iq2_xxs_block, iq2_xxs_dot_q8k)
 MATMUL_Q8K_ROWS(iq2_xs, iq2_xs_block, iq2_xs_dot_q8k)
 MATMUL_Q8K_ROWS(iq2_s, iq2_s_block, iq2_s_dot_q8k)
@@ -2551,6 +2686,7 @@ MATMUL_Q8K_ROWS(iq1_m, iq1_m_block, iq1_m_dot_q8k)
 #undef MATMUL_Q8K_ROWS
 
 MATMUL_Q8_F32(q2_k_q8_k, q8_k_block, 256, quantize_q8_k, matmul_q2_k_q8_k_qonly_f32)
+MATMUL_Q8_F32(q3_k_q8_k, q8_k_block, 256, quantize_q8_k, matmul_q3_k_q8_k_qonly_f32)
 MATMUL_Q8_F32(iq2_xxs_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq2_xxs_q8_k_qonly_f32)
 MATMUL_Q8_F32(iq2_xs_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq2_xs_q8_k_qonly_f32)
 MATMUL_Q8_F32(iq2_s_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq2_s_q8_k_qonly_f32)
@@ -2562,6 +2698,7 @@ MATMUL_Q8_F32(iq1_m_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq1_m_q8_k_qonl
 MATMUL_QONLY_DISPATCH(q5_k_q8_k, q8_k_block)
 MATMUL_QONLY_DISPATCH(iq4_xs_q8_k, q8_k_block)
 MATMUL_QONLY_DISPATCH(q2_k_q8_k, q8_k_block)
+MATMUL_QONLY_DISPATCH(q3_k_q8_k, q8_k_block)
 MATMUL_QONLY_DISPATCH(iq2_xxs_q8_k, q8_k_block)
 MATMUL_QONLY_DISPATCH(iq2_xs_q8_k, q8_k_block)
 MATMUL_QONLY_DISPATCH(iq2_s_q8_k, q8_k_block)

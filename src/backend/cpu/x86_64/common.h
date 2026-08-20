@@ -97,6 +97,10 @@ static inline __m256i dotprod_u8_s8_i32(__m256i a_u, __m256i b_s) {
 	return _mm256_madd_epi16(prod, _mm256_set1_epi16(1));
 }
 
+static inline __m256i maddubs_scale_i32(__m256i a_u, __m256i b_s, int scale) {
+	return _mm256_madd_epi16(_mm256_maddubs_epi16(a_u, b_s), _mm256_set1_epi16((int16_t)scale));
+}
+
 static inline __m256i dotprod_s8_s8_i32(__m256i a, __m256i b) {
 	/* IQ/Q8 quantizers clamp to [-127, 127], so abs(a) is representable as u8.
 	 * Move a's sign into b and use the AVX2 u8*s8 pairwise dot product.  Each

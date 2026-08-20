@@ -101,6 +101,7 @@ static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL, matmul_iq4_nl_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_XS, matmul_iq4_xs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_Q2_K, matmul_q2_k_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q3_K, matmul_q3_k_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ2_XXS, matmul_iq2_xxs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ2_XS, matmul_iq2_xs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ2_S, matmul_iq2_s_q8_k_qonly_f32, 3),
@@ -120,6 +121,7 @@ static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_Q8_0_R8, matmul_q8_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q4_0_R8, matmul_q4_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL_R8, matmul_iq4_nl_r8_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q4_K_R8, matmul_q4_k_r8_q8_k_qonly_f32, 3),
 };
 
 static inline status_code cpu_scratch_grow_aligned(void **buf, size_t *cap_bytes, size_t need_bytes,
@@ -576,6 +578,7 @@ static const grouped_matmul_kernel k_grouped_kernels[] = {
 	{GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker},
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
@@ -738,6 +741,9 @@ void cpu_matmul_one(const void *restrict W, uint32_t w_type, const float *restri
 	case GGML_TYPE_Q2_K:
 		matmul_q2_k_q8_k_f32(W, x, y, n, k, qs);
 		break;
+	case GGML_TYPE_Q3_K:
+		matmul_q3_k_q8_k_f32(W, x, y, n, k, qs);
+		break;
 	case GGML_TYPE_IQ2_XXS:
 		matmul_iq2_xxs_q8_k_f32(W, x, y, n, k, qs);
 		break;
@@ -761,6 +767,9 @@ void cpu_matmul_one(const void *restrict W, uint32_t w_type, const float *restri
 		break;
 	case GGML_TYPE_Q4_K:
 		matmul_q4_k_q8_k_f32(W, x, y, n, k, qs);
+		break;
+	case GGML_TYPE_Q4_K_R8:
+		matmul_q4_k_r8_q8_k_f32(W, x, y, n, k, qs);
 		break;
 	case GGML_TYPE_Q5_K:
 		matmul_q5_k_q8_k_f32(W, x, y, n, k, qs);
@@ -898,7 +907,8 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 	int has_grouped = 0;
 	for (int i = 0; i < n_matmuls; i++)
 		if (w_types[i] == GGML_TYPE_Q8_0_R8 || w_types[i] == GGML_TYPE_Q4_0_R8 ||
-			w_types[i] == GGML_TYPE_IQ3_S_RE8 || w_types[i] == GGML_TYPE_IQ4_NL_R8)
+			w_types[i] == GGML_TYPE_IQ3_S_RE8 || w_types[i] == GGML_TYPE_IQ4_NL_R8 ||
+			w_types[i] == GGML_TYPE_Q4_K_R8)
 			has_grouped = 1;
 
 	if (!can_recurse || !p->pool || n_matmuls > CPU_MATMUL_MULTI_MAX ||

@@ -32,6 +32,8 @@ static dequant_fn get_dequant_fn(uint32_t type) {
 		return dequant_iq1_m_row;
 	case GGML_TYPE_Q2_K:
 		return dequant_q2_k_row;
+	case GGML_TYPE_Q3_K:
+		return dequant_q3_k_row;
 	case GGML_TYPE_Q4_K:
 		return dequant_q4_k_row;
 	case GGML_TYPE_Q5_K:
@@ -506,6 +508,8 @@ static const repack_spec REPACK_SPECS[] = {
 	 "q8_0_r8"},
 	{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0_R8, 32, Q4_0_R8_ROWS, sizeof(q4_0_block), sizeof(q4_0_block),
 	 "q4_0_r8"},
+	{GGML_TYPE_Q4_K, GGML_TYPE_Q4_K_R8, 256, Q4_K_R8_ROWS, sizeof(q4_k_block), sizeof(q4_k_block),
+	 "q4_k_r8"},
 	{GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S_RE8, 256, IQ3_S_RE8_ROWS, sizeof(iq3_s_block),
 	 IQ3_S_RE8_GROUP_BYTES / IQ3_S_RE8_ROWS, "iq3_s_re8"},
 };
@@ -516,6 +520,8 @@ static void repack_spec_do(const repack_spec *s, const void *src, void *dst, int
 		repack_q8_0_to_q8_0_r8(src, dst, n_rows, k);
 	else if (s->src_type == GGML_TYPE_Q4_0)
 		repack_q4_0_to_q4_0_r8(src, dst, n_rows, k);
+	else if (s->src_type == GGML_TYPE_Q4_K)
+		repack_q4_k_to_q4_k_r8(src, dst, n_rows, k);
 	else
 		repack_iq3_s_to_iq3_s_re8(src, dst, n_rows, k);
 }

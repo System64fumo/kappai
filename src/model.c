@@ -449,7 +449,7 @@ int model_should_repack(uint32_t type, const char *repack_config) {
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
 	if (strcmp(repack_config, "all") == 0)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ||
-			   type == GGML_TYPE_Q4_0;
+			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K;
 	if (strcmp(repack_config, "none") == 0)
 		return 0;
 
@@ -488,6 +488,9 @@ static void repack_weight(backend *home, const void *src, void *dst, uint32_t ty
 	} else if (type == GGML_TYPE_Q4_0) {
 		job.rows_per_group = Q4_0_R8_ROWS;
 		job.repack_fn	   = repack_q4_0_to_q4_0_r8_rows;
+	} else if (type == GGML_TYPE_Q4_K) {
+		job.rows_per_group = Q4_K_R8_ROWS;
+		job.repack_fn	   = repack_q4_k_to_q4_k_r8_rows;
 	} else if (type == GGML_TYPE_IQ3_S) {
 		job.rows_per_group = IQ3_S_RE8_ROWS;
 		job.repack_fn	   = repack_iq3_s_to_iq3_s_re8_rows;
@@ -543,7 +546,37 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 			re_type = GGML_TYPE_Q8_0_R8;
 		} else if (type == GGML_TYPE_Q4_0 && (d0 % 32) == 0 && (d1 % Q4_0_R8_ROWS) == 0) {
 			re_type = GGML_TYPE_Q4_0_R8;
+		} else if (type == GGML_TYPE_Q4_K && (d0 % 256) == 0 && (d1 % Q4_K_R8_ROWS) == 0) {
+			re_type = GGML_TYPE_Q4_K_R8;
 		}
+	}
+
+	if (re_type) {
+		int	   k			 = (int)d0;
+		int	   n_rows		 = (int)d1;
+		size_t src_row_bytes = ggml_row_size(type, (size_t)k);
+		size_t src_total	 = src_row_bytes * (size_t)n_rows;
+		size_t dst_row_bytes = ggml_row_size(re_type, (size_t)k);
+		size_t dst_total	 = dst_row_bytes * (size_t)n_rows;
+		int	   writable		 = m->gctx.map_is_heap;
+
+		if (re_type == GGML_TYPE_Q4_K_R8 && dst_total == src_total && writable && host_ptr) {
+			int	   rpg		   = Q4_K_R8_ROWS;
+			size_t group_bytes = (size_t)rpg * src_row_bytes;
+			void  *tmp		   = xmalloc(group_bytes);
+			uint8_t *base	   = (uint8_t *)host_ptr;
+			for (int g = 0; g < n_rows; g += rpg) {
+				uint8_t *grp = base + ((size_t)g * src_row_bytes);
+				memcpy(tmp, grp, group_bytes);
+				repack_q4_k_to_q4_k_r8_rows(tmp, grp, 0, rpg, k);
+			}
+			free(tmp);
+			if (type_io)
+				*type_io = re_type;
+			return upload_tensor_to(m, host_ptr, re_type, n_dims, d0, d1, wc, target_backend, out);
+		}
+		if (re_type == GGML_TYPE_Q4_K_R8 && !writable)
+			re_type = 0;
 	}
 
 	if (re_type) {
