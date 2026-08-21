@@ -17,6 +17,7 @@ enum {
 enum {
 	TOK_PRE_GPT2 = 0,
 	TOK_PRE_LLAMA3,
+	TOK_PRE_QWEN35,
 };
 
 typedef struct {

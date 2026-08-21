@@ -62,6 +62,7 @@ typedef struct compute_scratch {
 	float_buf moe_scratch;
 	float_buf moe_xb_f;
 	float_buf moe_shared_y;
+	float_buf hybrid_host;
 
 	moe_expert_slot moe_slot_buf[512];
 

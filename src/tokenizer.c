@@ -331,7 +331,7 @@ static int cp_at(const char *s, size_t len, size_t j, int *cp_len) {
 	return k > 0 ? cp : (unsigned char)s[j];
 }
 
-static size_t next_pretoken_llama3(const char *s, size_t len, size_t *pos) {
+static size_t next_pretoken_unicode(const char *s, size_t len, size_t *pos, int digit_run) {
 	size_t i = *pos;
 	if (i >= len)
 		return 0;
@@ -377,7 +377,7 @@ static size_t next_pretoken_llama3(const char *s, size_t len, size_t *pos) {
 	if (is_utf8_digit(c)) {
 		size_t j = i;
 		int	   n = 0;
-		while (j < len && is_utf8_digit((unsigned char)s[j]) && n < 3) {
+		while (j < len && is_utf8_digit((unsigned char)s[j]) && n < digit_run) {
 			j++;
 			n++;
 		}
@@ -614,8 +614,13 @@ static int encode_gpt2_chunk(tokenizer *t, const char *text, size_t start, size_
 	size_t sub_pos = start;
 	while (sub_pos < end) {
 		size_t pstart = sub_pos;
-		size_t plen	  = (t->pre_type == TOK_PRE_LLAMA3) ? next_pretoken_llama3(text, end, &sub_pos)
-														: next_pretoken(text, end, &sub_pos);
+		size_t plen;
+		if (t->pre_type == TOK_PRE_LLAMA3)
+			plen = next_pretoken_unicode(text, end, &sub_pos, 3);
+		else if (t->pre_type == TOK_PRE_QWEN35)
+			plen = next_pretoken_unicode(text, end, &sub_pos, 1);
+		else
+			plen = next_pretoken(text, end, &sub_pos);
 		if (plen == 0)
 			break;
 		size_t enc_len;
@@ -809,11 +814,16 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		t->add_bos = (t->bos_id >= 0);
 	}
 
-	t->pre_type			= TOK_PRE_GPT2;
-	const char *pre_str = NULL;
-	if (gguf_get_str(g, "tokenizer.ggml.pretokenizer", &pre_str) == OK && pre_str) {
+	t->pre_type			   = TOK_PRE_GPT2;
+	const char *pre_str	   = NULL;
+	status_code pre_status = gguf_get_str(g, "tokenizer.ggml.pre", &pre_str);
+	if (pre_status != OK)
+		pre_status = gguf_get_str(g, "tokenizer.ggml.pretokenizer", &pre_str);
+	if (pre_status == OK && pre_str) {
 		if (strstr(pre_str, "llama3") || strstr(pre_str, "llama-bpe")) {
 			t->pre_type = TOK_PRE_LLAMA3;
+		} else if (strstr(pre_str, "qwen35")) {
+			t->pre_type = TOK_PRE_QWEN35;
 		}
 	} else if (!t->is_sentencepiece && model_name && (strstr(model_name, "gpt2") == NULL)) {
 		WARN("tokenizer: pretokenizer unset, assuming GPT-2 regex (wrong for some models)");
