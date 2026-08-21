@@ -195,11 +195,10 @@ void recommend_memory_config(const model *m, int n_ctx, size_t avail, kv_quant_t
 	INFO("model total: %.1f GB", to_unit(non_expert + total_expert, MEM_UNIT_GB));
 
 	if (per_expert == 0 || n_experts == 0) {
-		if (non_expert > avail) {
-			WARN("RAM: model doesn't fit in RAM (%.1f MB > %.1f GB available), will stream "
-				 "from disk",
-				 to_unit(non_expert, MEM_UNIT_MB), to_unit(avail, MEM_UNIT_GB));
-		}
+		if (non_expert > avail)
+			DEBUG("RAM: model (%.1f MB) exceeds available memory (%.1f GB); relying on "
+				  "mmap/page cache",
+				  to_unit(non_expert, MEM_UNIT_MB), to_unit(avail, MEM_UNIT_GB));
 		return;
 	}
 
