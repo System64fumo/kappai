@@ -447,19 +447,21 @@ static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *c
 	backend				*a			= model_layer_backend(m, li);
 	const layer_weights *L			= &m->layers[li];
 	int					 k			= op->u.matmul_multi.k;
-	int					 n			= op->u.matmul_multi.n;
 	const buffer		*w_list[3]	= {&L->wq.buf, &L->wk.buf, &L->wv.buf};
 	uint32_t			 w_types[3] = {L->wq.type, L->wk.type, L->wv.type};
 	buffer				*y_list[3]	= {&slots[op->out], &slots[op->out + 1], &slots[op->out + 2]};
 	const int			*n_out		= op->u.matmul_multi.n_out;
+	const int			 has_kv		= model_layer_has_kv(m, li);
+	int					 n			= has_kv ? op->u.matmul_multi.n : 1;
 
-	if (!a->matmul_multi) {
+	if (!a->matmul_multi || n == 1) {
 		ps = profile_begin(prof, STAGE_MATMUL_QKV);
 		st = a->matmul(a, w_list[0], w_types[0], &slots[op->in[0]], y_list[0], n_out[0], k);
-		if (st == OK)
+		if (st == OK && has_kv) {
 			st = a->matmul(a, w_list[1], w_types[1], &slots[op->in[0]], y_list[1], n_out[1], k);
-		if (st == OK)
-			st = a->matmul(a, w_list[2], w_types[2], &slots[op->in[0]], y_list[2], n_out[2], k);
+			if (st == OK)
+				st = a->matmul(a, w_list[2], w_types[2], &slots[op->in[0]], y_list[2], n_out[2], k);
+		}
 		profile_end(prof, &ps);
 		return st;
 	}
@@ -1852,6 +1854,9 @@ struct batch_scratch {
 
 	float_buf ple_buf;
 	buffer	  ple_all;
+	float_buf ple_inp;
+	float_buf ple_proj;
+	float_buf ple_slice;
 };
 
 static void bs_ensure_wrap(batch_scratch *bs, float_buf *fb, buffer *buf, size_t n_elems,
@@ -1922,6 +1927,9 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->ple_buf.p);
 	if (bs->ple_all.owner)
 		bs->ple_all.owner->buffer_free(bs->ple_all.owner, &bs->ple_all);
+	free(bs->ple_inp.p);
+	free(bs->ple_proj.p);
+	free(bs->ple_slice.p);
 	memset(bs, 0, sizeof(*bs));
 }
 
@@ -2114,6 +2122,10 @@ static status_code op_batch_matmul_multi_impl(exec_ctx *ctx) {
 	int					   k  = ctx->op->u.matmul_multi.k;
 	if (ctx->op->w_idx == WIDX_WQ) {
 		const int *n_out = ctx->op->u.matmul_multi.n_out;
+		if (!lc->has_kv) {
+			return a->matmul_batch(a, &lw->wq.buf, lw->wq.type, batch_slot(ctx->bs, ctx->op->in[0]),
+								   batch_slot(ctx->bs, ctx->op->out), n_out[0], k, ctx->n_rows);
+		}
 		if (a->matmul_multi_batch) {
 			const buffer *ws[3]	 = {&lw->wq.buf, &lw->wk.buf, &lw->wv.buf};
 			uint32_t	  wts[3] = {lw->wq.type, lw->wk.type, lw->wv.type};
@@ -2847,47 +2859,156 @@ static status_code op_batch_ple_build_impl(exec_ctx *ctx) {
 
 	if (!ctx->m->has_per_layer_embeddings)
 		return OK;
-	const int n_embd_per_layer = ctx->m->layer_dims.n_embd_per_layer;
-	const int total_ple		   = n_embd_per_layer * ctx->m->n_layers;
-	backend	 *a				   = exec_layer_backend(ctx);
+	struct model *m				   = ctx->m;
+	backend		 *a				   = exec_layer_backend(ctx);
+	const int	  n_embd_per_layer = m->layer_dims.n_embd_per_layer;
+	const int	  n_layers		   = m->n_layers;
+	const int	  total_ple		   = n_embd_per_layer * n_layers;
+	const int	  dim			   = m->dim;
+	const int	  n_rows		   = ctx->n_rows;
+	const float	  eps			   = m->norm_eps;
+	const float	  n_embd_sqrt	   = sqrtf((float)n_embd_per_layer);
+	const float	  inv_sqrt_ple	   = m->dim_sqrt > 0 ? 1.0f / m->dim_sqrt : 0.0f;
+	const float	  combine_scale	   = 0.70710678118654752f;
 
-	float_buf_ensure(&ctx->bs->ple_buf, (size_t)ctx->n_rows * total_ple);
-	if (ctx->bs->ple_all.size < (size_t)ctx->n_rows * total_ple * sizeof(float)) {
+	float_buf_ensure(&ctx->bs->ple_buf, (size_t)n_rows * total_ple);
+	if (ctx->bs->ple_all.size < (size_t)n_rows * total_ple * sizeof(float)) {
 		if (ctx->bs->ple_all.owner)
 			ctx->bs->ple_all.owner->buffer_free(ctx->bs->ple_all.owner, &ctx->bs->ple_all);
-		status_code st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * total_ple * sizeof(float),
+		status_code st = a->buffer_alloc_scratch(a, (size_t)n_rows * total_ple * sizeof(float),
 												 &ctx->bs->ple_all);
 		if (st != OK)
 			return st;
 	}
+	float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
 
-	buffer saved_x		 = ctx->s->slots[RECIPE_SLOT_X];
-	float *saved_ple_buf = ctx->s->ple_buf;
-	buffer saved_ple_all = ctx->s->ple_all;
-
-	status_code st = OK;
-	for (int row = 0; row < ctx->n_rows; row++) {
-		ctx->s->slots[RECIPE_SLOT_X] = batch_row_view(&ctx->bs->x_b, row, ctx->m->dim);
-		ctx->s->ple_buf				 = ctx->bs->ple_buf.p + (size_t)row * total_ple;
-		ctx->s->ple_all				 = ctx->bs->ple_all;
-		ctx->s->ple_all.offset = ctx->bs->ple_all.offset + (size_t)row * total_ple * sizeof(float);
-		exec_ctx row_ctx	   = {.op		  = ctx->op,
-								  .m		  = ctx->m,
-								  .cache	  = ctx->cache,
-								  .s		  = ctx->s,
-								  .token	  = ctx->bs->tokens ? ctx->bs->tokens[row] : 0,
-								  .pos		  = ctx->pos_start + row,
-								  .li		  = -1,
-								  .flash_attn = ctx->flash_attn};
-		st					   = op_ple_build(&row_ctx);
-		if (st != OK)
-			break;
+	float *ple = ctx->bs->ple_buf.p;
+	for (int row = 0; row < n_rows; row++) {
+		int			   token	  = ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
+		size_t		   row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
+		const uint8_t *embd		  = (const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr +
+									((size_t)token * row_stride);
+		float		  *ple_row	  = ple + (size_t)row * total_ple;
+		dequant_row_dispatch(m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple_row);
+		for (int i = 0; i < total_ple; i++)
+			ple_row[i] *= n_embd_sqrt;
 	}
 
-	ctx->s->slots[RECIPE_SLOT_X] = saved_x;
-	ctx->s->ple_buf				 = saved_ple_buf;
-	ctx->s->ple_all				 = saved_ple_all;
-	return st;
+	int gpu_path_ok = (a->matmul_batch && a->scale_inplace && a->rmsnorm_batch && a->ple_combine &&
+					   m->layer_dims.per_layer_model_proj.buf.handle);
+
+	if (gpu_path_ok) {
+		status_code st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+		if (st != OK)
+			return st;
+
+		buffer *xb		  = batch_slot(ctx->bs, RECIPE_SLOT_X);
+		buffer	proj_buf  = {0};
+		proj_buf.handle	  = ctx->bs->ple_proj.p;
+		proj_buf.host_ptr = ctx->bs->ple_proj.p;
+		proj_buf.size	  = (size_t)n_rows * total_ple * sizeof(float);
+		proj_buf.owner	  = a;
+
+		st = a->matmul_batch(a, &m->layer_dims.per_layer_model_proj.buf,
+							 m->layer_dims.per_layer_model_proj.type, xb, &proj_buf, total_ple, dim,
+							 n_rows);
+		if (st != OK)
+			return st;
+
+		st = a->scale_inplace(a, &proj_buf, inv_sqrt_ple, n_rows * total_ple);
+		if (st != OK)
+			return st;
+
+		if (!ctx->s->ple_proj_norm_w_uploaded) {
+			if (ctx->s->ple_proj_norm_w_gpu.size < (size_t)n_embd_per_layer * sizeof(float)) {
+				if (ctx->s->ple_proj_norm_w_gpu.owner)
+					ctx->s->ple_proj_norm_w_gpu.owner->buffer_free(
+						ctx->s->ple_proj_norm_w_gpu.owner, &ctx->s->ple_proj_norm_w_gpu);
+				st = a->buffer_alloc_scratch(a, (size_t)n_embd_per_layer * sizeof(float),
+											 &ctx->s->ple_proj_norm_w_gpu);
+				if (st != OK)
+					return st;
+			}
+			st =
+				a->buffer_write_f32(a, &ctx->s->ple_proj_norm_w_gpu,
+									m->layer_dims.per_layer_proj_norm_w.host_ptr, n_embd_per_layer);
+			if (st != OK)
+				return st;
+			ctx->s->ple_proj_norm_w_uploaded = 1;
+		}
+
+		for (int l = 0; l < n_layers; l++) {
+			for (int row = 0; row < n_rows; row++) {
+				buffer x_slice = proj_buf;
+				x_slice.offset =
+					((size_t)row * total_ple + (size_t)l * n_embd_per_layer) * sizeof(float);
+				st = a->rmsnorm(a, &x_slice, &ctx->s->ple_proj_norm_w_gpu, &x_slice,
+								n_embd_per_layer, eps);
+				if (st != OK)
+					return st;
+			}
+		}
+
+		return a->ple_combine(a, &ctx->bs->ple_all, &proj_buf, n_rows * total_ple, combine_scale);
+	}
+
+	if (a->synchronize)
+		a->synchronize(a);
+
+	float *ple_proj	 = float_buf_ensure(&ctx->s->ple_proj_host, (size_t)n_rows * total_ple);
+	float *inpL_host = float_buf_ensure(&ctx->s->inpL_host, (size_t)n_rows * dim);
+
+	buffer	   *xb		= batch_slot(ctx->bs, RECIPE_SLOT_X);
+	backend	   *x_owner = xb->owner;
+	status_code st		= x_owner->buffer_read_f32(x_owner, xb, inpL_host, n_rows * dim);
+	if (st != OK)
+		return st;
+
+	backend *host = backend_host();
+	for (int row = 0; row < n_rows; row++)
+		matmul_generic_f32(m->layer_dims.per_layer_model_proj.host_ptr,
+						   m->layer_dims.per_layer_model_proj.type, inpL_host + (size_t)row * dim,
+						   ple_proj + (size_t)row * total_ple, total_ple, dim);
+
+	{
+		buffer proj_view = {0};
+		proj_view.handle = ple_proj;
+		proj_view.owner	 = host;
+		host->scale_inplace(host, &proj_view, inv_sqrt_ple, n_rows * total_ple);
+	}
+
+	{
+		buffer w_view = {0};
+		w_view.handle = (void *)m->layer_dims.per_layer_proj_norm_w.host_ptr;
+		w_view.owner  = host;
+		for (int row = 0; row < n_rows; row++) {
+			for (int l = 0; l < n_layers; l++) {
+				buffer row_view = {0};
+				row_view.handle =
+					ple_proj + ((size_t)row * total_ple) + ((size_t)l * n_embd_per_layer);
+				row_view.owner = host;
+				host->rmsnorm(host, &row_view, &w_view, &row_view, n_embd_per_layer, eps);
+			}
+		}
+	}
+
+	{
+		buffer ple_view	 = {0};
+		ple_view.handle	 = ple;
+		ple_view.owner	 = host;
+		buffer proj_view = {0};
+		proj_view.handle = ple_proj;
+		proj_view.owner	 = host;
+		host->ple_combine(host, &ple_view, &proj_view, n_rows * total_ple, combine_scale);
+	}
+
+	if (a->copy_buffer) {
+		st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+		if (st != OK)
+			return st;
+	}
+
+	return OK;
 }
 
 static status_code op_batch_ple_proj_inject_impl(exec_ctx *ctx) {
@@ -2896,40 +3017,74 @@ static status_code op_batch_ple_proj_inject_impl(exec_ctx *ctx) {
 		return ERR_INVALID_ARG;
 	if (!ctx->m->has_per_layer_embeddings)
 		return OK;
-	const int n_embd_per_layer = ctx->m->layer_dims.n_embd_per_layer;
-	const int total_ple		   = n_embd_per_layer * ctx->m->n_layers;
+	struct model			   *m				 = ctx->m;
+	const struct layer_weights *L				 = &m->layers[ctx->li];
+	backend					   *a				 = exec_layer_backend(ctx);
+	const int					n_embd_per_layer = m->layer_dims.n_embd_per_layer;
+	const int					total_ple		 = n_embd_per_layer * m->n_layers;
+	const int					inj_dim			 = m->dim;
+	const int					n_rows			 = ctx->n_rows;
+	const float					eps				 = m->norm_eps;
 
-	buffer saved_xb2	  = ctx->s->slots[RECIPE_SLOT_XB2];
-	buffer saved_attn_out = ctx->s->slots[RECIPE_SLOT_ATTN_OUT];
-	float *saved_ple_buf  = ctx->s->ple_buf;
-	buffer saved_ple_all  = ctx->s->ple_all;
+	float_buf_ensure(&ctx->bs->ple_inp, (size_t)n_rows * n_embd_per_layer);
+	float_buf_ensure(&ctx->bs->ple_slice, (size_t)n_rows * n_embd_per_layer);
 
-	status_code st = OK;
-	for (int row = 0; row < ctx->n_rows; row++) {
-		ctx->s->slots[RECIPE_SLOT_XB2] = batch_row_view(&ctx->bs->xb2_b, row, ctx->m->dim);
-		ctx->s->slots[RECIPE_SLOT_ATTN_OUT] =
-			batch_row_view(&ctx->bs->attn_out_b, row, ctx->m->dim);
-		ctx->s->ple_buf		   = ctx->bs->ple_buf.p + (size_t)row * total_ple;
-		ctx->s->ple_all		   = ctx->bs->ple_all;
-		ctx->s->ple_all.offset = ctx->bs->ple_all.offset + (size_t)row * total_ple * sizeof(float);
-		exec_ctx row_ctx	   = {.op		  = ctx->op,
-								  .m		  = ctx->m,
-								  .cache	  = ctx->cache,
-								  .s		  = ctx->s,
-								  .token	  = ctx->bs->tokens ? ctx->bs->tokens[row] : 0,
-								  .pos		  = ctx->pos_start + row,
-								  .li		  = ctx->li,
-								  .flash_attn = ctx->flash_attn};
-		st					   = op_ple_proj_inject(&row_ctx);
-		if (st != OK)
-			break;
+	buffer ple_inp_b   = {0};
+	ple_inp_b.handle   = ctx->bs->ple_inp.p;
+	ple_inp_b.host_ptr = ctx->bs->ple_inp.p;
+	ple_inp_b.size	   = (size_t)n_rows * n_embd_per_layer * sizeof(float);
+	ple_inp_b.owner	   = a;
+
+	buffer ple_slice_b	 = {0};
+	ple_slice_b.handle	 = ctx->bs->ple_slice.p;
+	ple_slice_b.host_ptr = ctx->bs->ple_slice.p;
+	ple_slice_b.size	 = (size_t)n_rows * n_embd_per_layer * sizeof(float);
+	ple_slice_b.owner	 = a;
+
+	status_code st;
+	if (ctx->bs->ple_all.handle) {
+		for (int row = 0; row < n_rows; row++) {
+			buffer ple_src = ctx->bs->ple_all;
+			ple_src.offset +=
+				((size_t)row * total_ple + (size_t)ctx->li * n_embd_per_layer) * sizeof(float);
+			buffer dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
+			st = compute_copy_buffer_cross(ctx->s, &ple_src, &dst_row, n_embd_per_layer);
+			if (st != OK)
+				return st;
+		}
+	} else {
+		for (int row = 0; row < n_rows; row++) {
+			float *ple_row =
+				ctx->bs->ple_buf.p + (size_t)row * total_ple + (size_t)ctx->li * n_embd_per_layer;
+			buffer dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
+			st			   = a->buffer_write_f32(a, &dst_row, ple_row, n_embd_per_layer);
+			if (st != OK)
+				return st;
+		}
 	}
 
-	ctx->s->slots[RECIPE_SLOT_XB2]		= saved_xb2;
-	ctx->s->slots[RECIPE_SLOT_ATTN_OUT] = saved_attn_out;
-	ctx->s->ple_buf						= saved_ple_buf;
-	ctx->s->ple_all						= saved_ple_all;
-	return st;
+	buffer *xb2b = batch_slot(ctx->bs, RECIPE_SLOT_XB2);
+	st			 = a->matmul_batch(a, &L->ple_inp_gate_w.buf, GGML_TYPE_F32, xb2b, &ple_inp_b,
+								   n_embd_per_layer, inj_dim, n_rows);
+	if (st != OK)
+		return st;
+
+	st = a->ffn_activate_batch(a, &ple_inp_b, &ple_slice_b, &ple_inp_b, n_embd_per_layer,
+							   ACTIVATION_GELU, n_rows);
+	if (st != OK)
+		return st;
+
+	buffer *aob = batch_slot(ctx->bs, RECIPE_SLOT_ATTN_OUT);
+	st			= a->matmul_batch(a, &L->ple_proj_w.buf, GGML_TYPE_F32, &ple_inp_b, aob, inj_dim,
+								  n_embd_per_layer, n_rows);
+	if (st != OK)
+		return st;
+
+	st = a->rmsnorm_batch(a, aob, &L->ple_post_norm_w.buf, aob, inj_dim, eps, n_rows);
+	if (st != OK)
+		return st;
+
+	return a->add_batch(a, xb2b, aob, inj_dim, n_rows);
 }
 
 static status_code exec_op_batch(const recipe_op *op, model *m, kvcache *cache, compute_scratch *s,

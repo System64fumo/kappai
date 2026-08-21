@@ -13,18 +13,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static int all_layers_have_own_kv(const model *m) {
-	if (!m->arch_info->has_variable_layer_dims)
-		return 1;
-	if (m->layer_dims.n_layer_kv_from_start < m->n_layers)
-		return 0;
-	for (int li = 0; li < m->n_layers; li++) {
-		if (!model_layer_has_own_v(m, li))
-			return 0;
-	}
-	return 1;
-}
-
 static void recipe_build_gemma4_pre_ops(model_recipe *r, const model *m) {
 	int n = 2;
 	if (m->has_per_layer_embeddings)
@@ -73,7 +61,7 @@ static int recipe_append_gemma4_attn_block(recipe_op *ops, int i, const model *m
 
 	ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
 
-	const int fuse_qkv = has_matmul_multi && all_layers_have_own_kv(m);
+	const int fuse_qkv = has_matmul_multi;
 
 	if (fuse_qkv) {
 		ops[i++] = (recipe_op){

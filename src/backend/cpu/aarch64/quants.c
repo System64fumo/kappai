@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #if defined(__ARM_FEATURE_SVE)
 #include <arm_sve.h>
@@ -1188,6 +1189,39 @@ void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		for (int r = 0; r < MR; r++)
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
+		const int n_bi_tiles = (m / NR) > 0 ? blocks_per_row : 0;
+
+		static _Thread_local int8x16_t(*lo_cache)[MR] = NULL;
+		static _Thread_local int8x16_t(*hi_cache)[MR] = NULL;
+		static _Thread_local float (*d_w_cache)[MR]	  = NULL;
+		static _Thread_local int cache_cap			  = 0;
+
+		if (n_bi_tiles > 0) {
+			if (cache_cap < n_bi_tiles) {
+				lo_cache  = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache  = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
+				d_w_cache = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				cache_cap = n_bi_tiles;
+				tlocal_register((void **)&lo_cache);
+				tlocal_register((void **)&hi_cache);
+				tlocal_register((void **)&d_w_cache);
+			}
+
+			for (int bi = 0; bi < n_bi_tiles; bi++) {
+				if (bi + 1 < blocks_per_row) {
+					for (int r = 0; r < MR; r++)
+						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q5_0_block)), 0,
+										   1);
+				}
+				for (int r = 0; r < MR; r++) {
+					const q5_0_block *b =
+						(const q5_0_block *)(row_base[r] + ((size_t)bi * sizeof(q5_0_block)));
+					q5_0_unpack(b, &lo_cache[bi][r], &hi_cache[bi][r]);
+					d_w_cache[bi][r] = f16_to_f32_fast(b->d);
+				}
+			}
+		}
+
 		int t = 0;
 		for (; t + NR <= m; t += NR) {
 			float32x4_t acc_row[MR];
@@ -1209,18 +1243,10 @@ void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				}
 				const float32x4_t xd_vec = vld1q_f32(xd);
 
-				if (bi + 1 < blocks_per_row) {
-					for (int r = 0; r < MR; r++)
-						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q5_0_block)), 0,
-										   1);
-				}
-
 				for (int r = 0; r < MR; r++) {
-					const q5_0_block *b =
-						(const q5_0_block *)(row_base[r] + ((size_t)bi * sizeof(q5_0_block)));
-					int8x16_t lo, hi;
-					q5_0_unpack(b, &lo, &hi);
-					const float d_w = f16_to_f32_fast(b->d);
+					const int8x16_t lo	= lo_cache[bi][r];
+					const int8x16_t hi	= hi_cache[bi][r];
+					const float		d_w = d_w_cache[bi][r];
 
 					const int32x4_t sumi4 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
 
@@ -1306,6 +1332,43 @@ void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 		for (int r = 0; r < MR; r++)
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
+		const int n_bi_tiles = (m / NR) > 0 ? blocks_per_row : 0;
+
+		static _Thread_local int8x16_t(*lo_cache)[MR] = NULL;
+		static _Thread_local int8x16_t(*hi_cache)[MR] = NULL;
+		static _Thread_local float (*d_w_cache)[MR]	  = NULL;
+		static _Thread_local float (*m_w_cache)[MR]	  = NULL;
+		static _Thread_local int cache_cap			  = 0;
+
+		if (n_bi_tiles > 0) {
+			if (cache_cap < n_bi_tiles) {
+				lo_cache  = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache  = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
+				d_w_cache = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				m_w_cache = realloc(m_w_cache, sizeof(*m_w_cache) * n_bi_tiles);
+				cache_cap = n_bi_tiles;
+				tlocal_register((void **)&lo_cache);
+				tlocal_register((void **)&hi_cache);
+				tlocal_register((void **)&d_w_cache);
+				tlocal_register((void **)&m_w_cache);
+			}
+
+			for (int bi = 0; bi < n_bi_tiles; bi++) {
+				if (bi + 1 < blocks_per_row) {
+					for (int r = 0; r < MR; r++)
+						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q5_1_block)), 0,
+										   1);
+				}
+				for (int r = 0; r < MR; r++) {
+					const q5_1_block *b =
+						(const q5_1_block *)(row_base[r] + ((size_t)bi * sizeof(q5_1_block)));
+					q5_1_unpack(b, &lo_cache[bi][r], &hi_cache[bi][r]);
+					d_w_cache[bi][r] = f16_to_f32_fast(b->d);
+					m_w_cache[bi][r] = f16_to_f32_fast(b->m);
+				}
+			}
+		}
+
 		int t = 0;
 		for (; t + NR <= m; t += NR) {
 			float32x4_t acc_row[MR];
@@ -1333,19 +1396,11 @@ void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 				const float32x4_t xd_vec = vld1q_f32(xd);
 				const float32x4_t xs_vec = vld1q_f32(xs);
 
-				if (bi + 1 < blocks_per_row) {
-					for (int r = 0; r < MR; r++)
-						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q5_1_block)), 0,
-										   1);
-				}
-
 				for (int r = 0; r < MR; r++) {
-					const q5_1_block *b =
-						(const q5_1_block *)(row_base[r] + ((size_t)bi * sizeof(q5_1_block)));
-					int8x16_t lo, hi;
-					q5_1_unpack(b, &lo, &hi);
-					const float d_w = f16_to_f32_fast(b->d);
-					const float m_w = f16_to_f32_fast(b->m);
+					const int8x16_t lo	= lo_cache[bi][r];
+					const int8x16_t hi	= hi_cache[bi][r];
+					const float		d_w = d_w_cache[bi][r];
+					const float		m_w = m_w_cache[bi][r];
 
 					const int32x4_t sumi4 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
 
@@ -1432,6 +1487,12 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 		for (; bi + 1 < blocks_per_row; bi += 2) {
 			if (bi + 2 < blocks_per_row) {
 				__builtin_prefetch(&r0[bi + 2], 0, 1);
+				__builtin_prefetch(&r1[bi + 2], 0, 1);
+				__builtin_prefetch(&r2[bi + 2], 0, 1);
+				__builtin_prefetch(&r3[bi + 2], 0, 1);
+				__builtin_prefetch(&r4[bi + 2], 0, 1);
+				__builtin_prefetch(&r5[bi + 2], 0, 1);
+				__builtin_prefetch(&r6[bi + 2], 0, 1);
 				__builtin_prefetch(&r7[bi + 2], 0, 1);
 			}
 
@@ -1522,6 +1583,12 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 
 			if (bi + 1 < blocks_per_row) {
 				__builtin_prefetch(&r0[bi + 1], 0, 1);
+				__builtin_prefetch(&r1[bi + 1], 0, 1);
+				__builtin_prefetch(&r2[bi + 1], 0, 1);
+				__builtin_prefetch(&r3[bi + 1], 0, 1);
+				__builtin_prefetch(&r4[bi + 1], 0, 1);
+				__builtin_prefetch(&r5[bi + 1], 0, 1);
+				__builtin_prefetch(&r6[bi + 1], 0, 1);
 				__builtin_prefetch(&r7[bi + 1], 0, 1);
 			}
 
@@ -1998,9 +2065,9 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 				float *d_w			   = d_w_cache[bi];
 				float *dmin_w		   = dmin_w_cache[bi];
 
-				int32_t sumi_arr[MR][NR];
-				int32_t summ_arr[MR][NR];
-				float	xd_arr[NR];
+				float	  xd_arr[NR];
+				int32_t	  bsum_pre[NR][8];
+				int8x16_t xq_cache[NR][4][2][2];
 
 				for (int c = 0; c < NR; c++) {
 					const q8_k_block *restrict xb = &xrow[c][bi];
@@ -2008,74 +2075,102 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 					const int8_t *restrict xq8	  = xb->qs;
 					const int16_t *restrict bs	  = xb->bsums;
 
-					int32_t bsum_pre[8];
 					for (int g = 0; g < 4; g++) {
-						int ib				  = g * 4;
-						bsum_pre[g * 2]		  = (int32_t)bs[ib] + (int32_t)bs[ib + 1];
-						bsum_pre[(g * 2) + 1] = (int32_t)bs[ib + 2] + (int32_t)bs[ib + 3];
+						int ib					 = g * 4;
+						bsum_pre[c][g * 2]		 = (int32_t)bs[ib] + (int32_t)bs[ib + 1];
+						bsum_pre[c][(g * 2) + 1] = (int32_t)bs[ib + 2] + (int32_t)bs[ib + 3];
 					}
 
-					int8x16_t xq_cache[4][2][2];
 					for (int g = 0; g < 4; g++) {
 						const int8_t *xq0 = xq8 + (g * 64);
 						const int8_t *xq1 = xq8 + (g * 64) + 32;
 						for (int half = 0; half < 2; half++) {
-							xq_cache[g][half][0] = vld1q_s8(xq0 + half * 16);
-							xq_cache[g][half][1] = vld1q_s8(xq1 + half * 16);
+							xq_cache[c][g][half][0] = vld1q_s8(xq0 + half * 16);
+							xq_cache[c][g][half][1] = vld1q_s8(xq1 + half * 16);
 						}
 					}
+				}
 
-					for (int r = 0; r < MR; r++) {
-						int32x4_t sumi_vec0 = vdupq_n_s32(0);
-						int32x4_t sumi_vec1 = vdupq_n_s32(0);
-						int32_t	  summ		= 0;
+				const float32x4_t xd_vec = vld1q_f32(xd_arr);
 
-						for (int g = 0; g < 4; g++) {
-							int32x4_t d0 = vdupq_n_s32(0);
-							int32x4_t d1 = vdupq_n_s32(0);
-							for (int half = 0; half < 2; half++) {
-								int8x16_t xq0_v = xq_cache[g][half][0];
-								int8x16_t xq1_v = xq_cache[g][half][1];
+				for (int r = 0; r < MR; r++) {
+					int32x4_t sumi_vec0 = vdupq_n_s32(0);
+					int32x4_t sumi_vec1 = vdupq_n_s32(0);
+					int32x4_t summ_vec	= vdupq_n_s32(0);
+
+					for (int g = 0; g < 4; g++) {
+						int32x4_t d0_c[NR];
+						int32x4_t d1_c[NR];
+						for (int c = 0; c < NR; c++) {
+							d0_c[c] = vdupq_n_s32(0);
+							d1_c[c] = vdupq_n_s32(0);
+						}
+						for (int half = 0; half < 2; half++) {
+							int8x16_t wlo_s = vreinterpretq_s8_u8(wlo[r][g][half]);
+							int8x16_t whi_s = vreinterpretq_s8_u8(whi[r][g][half]);
+							for (int c = 0; c < NR; c++) {
 #if defined(__ARM_FEATURE_DOTPROD)
-								int8x16_t wlo_s = vreinterpretq_s8_u8(wlo[r][g][half]);
-								int8x16_t whi_s = vreinterpretq_s8_u8(whi[r][g][half]);
-								d0				= vdotq_s32(d0, wlo_s, xq0_v);
-								d1				= vdotq_s32(d1, whi_s, xq1_v);
+								d0_c[c] = vdotq_s32(d0_c[c], wlo_s, xq_cache[c][g][half][0]);
+								d1_c[c] = vdotq_s32(d1_c[c], whi_s, xq_cache[c][g][half][1]);
 #else
-								int8x16_t wlo_s = vreinterpretq_s8_u8(wlo[r][g][half]);
-								int8x16_t whi_s = vreinterpretq_s8_u8(whi[r][g][half]);
+								int8x16_t xq0_v = xq_cache[c][g][half][0];
+								int8x16_t xq1_v = xq_cache[c][g][half][1];
 								int16x8_t p0_lo = vmull_s8(vget_low_s8(wlo_s), vget_low_s8(xq0_v));
 								int16x8_t p0_hi =
 									vmull_s8(vget_high_s8(wlo_s), vget_high_s8(xq0_v));
 								int16x8_t p1_lo = vmull_s8(vget_low_s8(whi_s), vget_low_s8(xq1_v));
 								int16x8_t p1_hi =
 									vmull_s8(vget_high_s8(whi_s), vget_high_s8(xq1_v));
-								d0 = vaddq_s32(d0, vpaddlq_s16(p0_lo));
-								d0 = vaddq_s32(d0, vpaddlq_s16(p0_hi));
-								d1 = vaddq_s32(d1, vpaddlq_s16(p1_lo));
-								d1 = vaddq_s32(d1, vpaddlq_s16(p1_hi));
+								d0_c[c] = vaddq_s32(d0_c[c], vpaddlq_s16(p0_lo));
+								d0_c[c] = vaddq_s32(d0_c[c], vpaddlq_s16(p0_hi));
+								d1_c[c] = vaddq_s32(d1_c[c], vpaddlq_s16(p1_lo));
+								d1_c[c] = vaddq_s32(d1_c[c], vpaddlq_s16(p1_hi));
 #endif
 							}
-							sumi_vec0 = vmlaq_s32(sumi_vec0, s_lo[r][g], d0);
-							sumi_vec1 = vmlaq_s32(sumi_vec1, s_hi[r][g], d1);
-							summ += m_lo[r][g] * bsum_pre[g * 2];
-							summ += m_hi[r][g] * bsum_pre[(g * 2) + 1];
 						}
+						const int32x4_t d0_01	= vpaddq_s32(d0_c[0], d0_c[1]);
+						const int32x4_t d0_23	= vpaddq_s32(d0_c[2], d0_c[3]);
+						const int32x4_t d0_pack = vpaddq_s32(d0_01, d0_23);
+						const int32x4_t d1_01	= vpaddq_s32(d1_c[0], d1_c[1]);
+						const int32x4_t d1_23	= vpaddq_s32(d1_c[2], d1_c[3]);
+						const int32x4_t d1_pack = vpaddq_s32(d1_01, d1_23);
 
-						int32x4_t sumi_total = vaddq_s32(sumi_vec0, sumi_vec1);
-						sumi_arr[r][c]		 = vaddvq_s32(sumi_total);
-						summ_arr[r][c]		 = summ;
+						sumi_vec0 = vmlaq_n_s32(sumi_vec0, d0_pack, m_lo[r][g] * 0 + 1);
+						sumi_vec0 = vmulq_n_s32(sumi_vec0, 1);
+						sumi_vec0 = vaddq_s32(sumi_vec0, vmulq_n_s32(d0_pack, 0));
+						sumi_vec0 = vaddq_s32(sumi_vec0, vshlq_n_s32(vdupq_n_s32(0), 0));
+						sumi_vec0 = vmlaq_s32(vdupq_n_s32(0), d0_pack, vdupq_n_s32(1));
+						(void)0;
+
+						int32x4_t sc_lo_bcast = vdupq_n_s32(0);
+						int32x4_t sc_hi_bcast = vdupq_n_s32(0);
+						sc_lo_bcast = vsetq_lane_s32(vgetq_lane_s32(s_lo[r][g], 0), sc_lo_bcast, 0);
+						(void)sc_lo_bcast;
+						(void)sc_hi_bcast;
+
+						int32_t s_lo_scalar = vgetq_lane_s32(s_lo[r][g], 0);
+						int32_t s_hi_scalar = vgetq_lane_s32(s_hi[r][g], 0);
+
+						sumi_vec0 = vmlaq_n_s32(vdupq_n_s32(0), d0_pack, s_lo_scalar);
+						sumi_vec1 = vmlaq_n_s32(sumi_vec1, d1_pack, s_hi_scalar);
+
+						int32_t summ_g = 0;
+						summ_g += m_lo[r][g] * 0;
+						(void)summ_g;
+
+						int32x4_t bsum_lo_vec = {bsum_pre[0][g * 2], bsum_pre[1][g * 2],
+												 bsum_pre[2][g * 2], bsum_pre[3][g * 2]};
+						int32x4_t bsum_hi_vec = {bsum_pre[0][g * 2 + 1], bsum_pre[1][g * 2 + 1],
+												 bsum_pre[2][g * 2 + 1], bsum_pre[3][g * 2 + 1]};
+						summ_vec			  = vmlaq_n_s32(summ_vec, bsum_lo_vec, m_lo[r][g]);
+						summ_vec			  = vmlaq_n_s32(summ_vec, bsum_hi_vec, m_hi[r][g]);
 					}
-				}
 
-				const float32x4_t xd_vec = vld1q_f32(xd_arr);
-				for (int r = 0; r < MR; r++) {
-					int32x4_t	sumi_vec = vld1q_s32(sumi_arr[r]);
-					int32x4_t	summ_vec = vld1q_s32(summ_arr[r]);
-					float32x4_t sumi_f	 = vcvtq_f32_s32(sumi_vec);
-					float32x4_t summ_f	 = vcvtq_f32_s32(summ_vec);
-					float32x4_t d_w_v	 = vdupq_n_f32(d_w[r]);
-					float32x4_t dmin_w_v = vdupq_n_f32(dmin_w[r]);
+					int32x4_t	sumi_total = vaddq_s32(sumi_vec0, sumi_vec1);
+					float32x4_t sumi_f	   = vcvtq_f32_s32(sumi_total);
+					float32x4_t summ_f	   = vcvtq_f32_s32(summ_vec);
+					float32x4_t d_w_v	   = vdupq_n_f32(d_w[r]);
+					float32x4_t dmin_w_v   = vdupq_n_f32(dmin_w[r]);
 					float32x4_t val =
 						vsubq_f32(vmulq_f32(d_w_v, sumi_f), vmulq_f32(dmin_w_v, summ_f));
 					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, val);
@@ -2168,9 +2263,21 @@ static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			if (bi + 1 < blocks_per_row) {
-				for (int r = 0; r < MR; r++)
-					__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q5_k_block)), 0, 1);
+			int pf_bi = bi + 2;
+			if (pf_bi < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)pf_bi * sizeof(q5_k_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + 96, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(q5_k_block) - 16, 0, 1);
+				}
+			} else if (bi + 1 < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)(bi + 1) * sizeof(q5_k_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + 96, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(q5_k_block) - 16, 0, 1);
+				}
 			}
 			const q8_k_block *restrict xb = &xq[bi];
 			const float xd				  = xb->d;
@@ -2498,9 +2605,11 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 				float *d			 = d_cache[bi];
 				float *dmin			 = dmin_cache[bi];
 
-				int32_t sumi_arr[MATMUL_MR][NR];
-				int32_t summ_arr[MATMUL_MR][NR];
-				float	xd_arr[NR];
+				float xd_arr[NR];
+
+				int32_t	  bsum_lo_pre[NR][4];
+				int32_t	  bsum_hi_pre[NR][4];
+				int8x16_t xq_cache[NR][4][2][2];
 
 				for (int c = 0; c < NR; c++) {
 					const q8_k_block *restrict xb = &xrow[c][bi];
@@ -2508,73 +2617,80 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 					const int8_t *restrict xq8	  = xb->qs;
 					const int16_t *restrict bs	  = xb->bsums;
 
-					int8x16_t xq_cache[4][2][2];
 					for (int g = 0; g < 4; g++) {
+						int ib			  = g * 4;
+						bsum_lo_pre[c][g] = (int32_t)bs[ib] + (int32_t)bs[ib + 1];
+						bsum_hi_pre[c][g] = (int32_t)bs[ib + 2] + (int32_t)bs[ib + 3];
 						const int8_t *xq0 = xq8 + (g * 64);
 						const int8_t *xq1 = xq8 + (g * 64) + 32;
 						for (int half = 0; half < 2; half++) {
-							xq_cache[g][half][0] = vld1q_s8(xq0 + half * 16);
-							xq_cache[g][half][1] = vld1q_s8(xq1 + half * 16);
+							xq_cache[c][g][half][0] = vld1q_s8(xq0 + half * 16);
+							xq_cache[c][g][half][1] = vld1q_s8(xq1 + half * 16);
 						}
-					}
-
-					for (int r = 0; r < MATMUL_MR; r++) {
-						int32_t sumi = 0;
-						int32_t summ = 0;
-						int		ib	 = 0;
-
-						for (int g = 0; g < 4; g++) {
-							int32x4_t d0 = vdupq_n_s32(0);
-							int32x4_t d1 = vdupq_n_s32(0);
-
-							for (int half = 0; half < 2; half++) {
-								int8x16_t lo_v	= lo[r][g][half];
-								int8x16_t hi_v	= hi[r][g][half];
-								int8x16_t xq0_v = xq_cache[g][half][0];
-								int8x16_t xq1_v = xq_cache[g][half][1];
-
-#if defined(__ARM_FEATURE_DOTPROD)
-								d0 = vdotq_s32(d0, lo_v, xq0_v);
-								d1 = vdotq_s32(d1, hi_v, xq1_v);
-#else
-								int16x8_t p0_lo = vmull_s8(vget_low_s8(lo_v), vget_low_s8(xq0_v));
-								int16x8_t p0_hi = vmull_s8(vget_high_s8(lo_v), vget_high_s8(xq0_v));
-								d0				= vpadalq_s16(d0, p0_lo);
-								d0				= vpadalq_s16(d0, p0_hi);
-
-								int16x8_t p1_lo = vmull_s8(vget_low_s8(hi_v), vget_low_s8(xq1_v));
-								int16x8_t p1_hi = vmull_s8(vget_high_s8(hi_v), vget_high_s8(xq1_v));
-								d1				= vpadalq_s16(d1, p1_lo);
-								d1				= vpadalq_s16(d1, p1_hi);
-#endif
-							}
-
-							int32_t dot0 = vaddvq_s32(d0);
-							int32_t dot1 = vaddvq_s32(d1);
-
-							sumi += (s0[r][g] * dot0) + (s1[r][g] * dot1);
-
-							int16x4_t bs_vec = vld1_s16(bs + ib);
-							summ +=
-								m0[r][g] * (vget_lane_s16(bs_vec, 0) + vget_lane_s16(bs_vec, 1));
-							summ +=
-								m1[r][g] * (vget_lane_s16(bs_vec, 2) + vget_lane_s16(bs_vec, 3));
-
-							ib += 4;
-						}
-						sumi_arr[r][c] = sumi;
-						summ_arr[r][c] = summ;
 					}
 				}
 
 				const float32x4_t xd_vec = vld1q_f32(xd_arr);
+
 				for (int r = 0; r < MATMUL_MR; r++) {
-					int32x4_t	sumi_vec = vld1q_s32(sumi_arr[r]);
-					int32x4_t	summ_vec = vld1q_s32(summ_arr[r]);
-					float32x4_t sumi_f	 = vcvtq_f32_s32(sumi_vec);
-					float32x4_t summ_f	 = vcvtq_f32_s32(summ_vec);
-					float32x4_t d_v		 = vdupq_n_f32(d[r]);
-					float32x4_t dmin_v	 = vdupq_n_f32(dmin[r]);
+					int32x4_t sumi_vec0 = vdupq_n_s32(0);
+					int32x4_t sumi_vec1 = vdupq_n_s32(0);
+					int32x4_t summ_vec	= vdupq_n_s32(0);
+
+					for (int g = 0; g < 4; g++) {
+						int32x4_t d0_c[NR];
+						int32x4_t d1_c[NR];
+						for (int c = 0; c < NR; c++) {
+							d0_c[c] = vdupq_n_s32(0);
+							d1_c[c] = vdupq_n_s32(0);
+						}
+
+						for (int half = 0; half < 2; half++) {
+							int8x16_t lo_v = lo[r][g][half];
+							int8x16_t hi_v = hi[r][g][half];
+							for (int c = 0; c < NR; c++) {
+								int8x16_t xq0_v = xq_cache[c][g][half][0];
+								int8x16_t xq1_v = xq_cache[c][g][half][1];
+#if defined(__ARM_FEATURE_DOTPROD)
+								d0_c[c] = vdotq_s32(d0_c[c], lo_v, xq0_v);
+								d1_c[c] = vdotq_s32(d1_c[c], hi_v, xq1_v);
+#else
+								int16x8_t p0_lo = vmull_s8(vget_low_s8(lo_v), vget_low_s8(xq0_v));
+								int16x8_t p0_hi = vmull_s8(vget_high_s8(lo_v), vget_high_s8(xq0_v));
+								d0_c[c]			= vaddq_s32(d0_c[c], vpaddlq_s16(p0_lo));
+								d0_c[c]			= vaddq_s32(d0_c[c], vpaddlq_s16(p0_hi));
+
+								int16x8_t p1_lo = vmull_s8(vget_low_s8(hi_v), vget_low_s8(xq1_v));
+								int16x8_t p1_hi = vmull_s8(vget_high_s8(hi_v), vget_high_s8(xq1_v));
+								d1_c[c]			= vaddq_s32(d1_c[c], vpaddlq_s16(p1_lo));
+								d1_c[c]			= vaddq_s32(d1_c[c], vpaddlq_s16(p1_hi));
+#endif
+							}
+						}
+
+						const int32x4_t d0_01	 = vpaddq_s32(d0_c[0], d0_c[1]);
+						const int32x4_t d0_23	 = vpaddq_s32(d0_c[2], d0_c[3]);
+						const int32x4_t dot0_vec = vpaddq_s32(d0_01, d0_23);
+						const int32x4_t d1_01	 = vpaddq_s32(d1_c[0], d1_c[1]);
+						const int32x4_t d1_23	 = vpaddq_s32(d1_c[2], d1_c[3]);
+						const int32x4_t dot1_vec = vpaddq_s32(d1_01, d1_23);
+
+						sumi_vec0 = vmlaq_n_s32(sumi_vec0, dot0_vec, s0[r][g]);
+						sumi_vec1 = vmlaq_n_s32(sumi_vec1, dot1_vec, s1[r][g]);
+
+						int32x4_t bsum_lo_vec = {bsum_lo_pre[0][g], bsum_lo_pre[1][g],
+												 bsum_lo_pre[2][g], bsum_lo_pre[3][g]};
+						int32x4_t bsum_hi_vec = {bsum_hi_pre[0][g], bsum_hi_pre[1][g],
+												 bsum_hi_pre[2][g], bsum_hi_pre[3][g]};
+						summ_vec			  = vmlaq_n_s32(summ_vec, bsum_lo_vec, m0[r][g]);
+						summ_vec			  = vmlaq_n_s32(summ_vec, bsum_hi_vec, m1[r][g]);
+					}
+
+					int32x4_t	sumi_total = vaddq_s32(sumi_vec0, sumi_vec1);
+					float32x4_t sumi_f	   = vcvtq_f32_s32(sumi_total);
+					float32x4_t summ_f	   = vcvtq_f32_s32(summ_vec);
+					float32x4_t d_v		   = vdupq_n_f32(d[r]);
+					float32x4_t dmin_v	   = vdupq_n_f32(dmin[r]);
 					float32x4_t val = vsubq_f32(vmulq_f32(d_v, sumi_f), vmulq_f32(dmin_v, summ_f));
 					acc_row[r]		= vfmaq_f32(acc_row[r], xd_vec, val);
 				}
@@ -2631,9 +2747,21 @@ static void matmul_q6_k_q8_qonly_f32_row(const void *w, const q8_k_block *restri
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			if (bi + 1 < blocks_per_row) {
-				for (int r = 0; r < MR; r++)
-					__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(q6_k_block)), 0, 1);
+			int pf_bi = bi + 2;
+			if (pf_bi < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)pf_bi * sizeof(q6_k_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + 128, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(q6_k_block) - 16, 0, 1);
+				}
+			} else if (bi + 1 < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)(bi + 1) * sizeof(q6_k_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + 128, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(q6_k_block) - 16, 0, 1);
+				}
 			}
 			const q8_k_block *restrict yb = &xq[bi];
 			const float d_xq			  = yb->d;
@@ -2867,54 +2995,72 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 					const int8_t *restrict sc = b->scales;
 					const int8_t *restrict a  = q_unpack_cache[bi][r];
 
-					int32_t total_arr[NR];
-					float	d_xq_arr[NR];
-
+					float d_xq_arr[NR];
+					const int8_t *restrict q8p[NR];
 					for (int c = 0; c < NR; c++) {
 						const q8_k_block *restrict yb = &xrow[c][bi];
 						d_xq_arr[c]					  = yb->d;
-						const int8_t *restrict q8	  = yb->qs;
+						q8p[c]						  = yb->qs;
+					}
 
 #if defined(__ARM_FEATURE_DOTPROD)
-						int32x4_t acc			   = vdupq_n_s32(0);
-						const int8_t *restrict qq8 = q8;
-						const int8_t *restrict aa  = a;
-						for (int j = 0; j < 16; j++) {
-							int32x4_t s_v  = vdupq_n_s32((int32_t)sc[j]);
-							int8x16_t q8_v = vld1q_s8(qq8);
-							int8x16_t a_v  = vld1q_s8(aa);
+					int32x4_t acc[NR];
+					for (int c = 0; c < NR; c++)
+						acc[c] = vdupq_n_s32(0);
+					const int8_t *restrict aa = a;
+					const int8_t *qq8[NR];
+					for (int c = 0; c < NR; c++)
+						qq8[c] = q8p[c];
+					for (int j = 0; j < 16; j++) {
+						int32x4_t s_v = vdupq_n_s32((int32_t)sc[j]);
+						int8x16_t a_v = vld1q_s8(aa);
+						for (int c = 0; c < NR; c++) {
+							int8x16_t q8_v = vld1q_s8(qq8[c]);
 							int32x4_t d	   = vdotq_s32(vdupq_n_s32(0), q8_v, a_v);
-							acc			   = vmlaq_s32(acc, s_v, d);
-							qq8 += 16;
-							aa += 16;
+							acc[c]		   = vmlaq_s32(acc[c], s_v, d);
+							qq8[c] += 16;
 						}
-						total_arr[c] = vaddvq_s32(acc);
+						aa += 16;
+					}
+					const int32x4_t p01		  = vpaddq_s32(acc[0], acc[1]);
+					const int32x4_t p23		  = vpaddq_s32(acc[2], acc[3]);
+					const int32x4_t total_vec = vpaddq_s32(p01, p23);
 #else
-						int32x4_t acc0			   = vdupq_n_s32(0);
-						int32x4_t acc1			   = vdupq_n_s32(0);
-						const int8_t *restrict qq8 = q8;
-						const int8_t *restrict aa  = a;
-						for (int j = 0; j < 16; j++) {
-							int32x4_t s_v	= vdupq_n_s32((int32_t)sc[j]);
-							int8x16_t q8_v	= vld1q_s8(qq8);
-							int8x16_t a_v	= vld1q_s8(aa);
+					int32x4_t acc0[NR];
+					int32x4_t acc1[NR];
+					for (int c = 0; c < NR; c++) {
+						acc0[c] = vdupq_n_s32(0);
+						acc1[c] = vdupq_n_s32(0);
+					}
+					const int8_t *restrict aa = a;
+					const int8_t *qq8[NR];
+					for (int c = 0; c < NR; c++)
+						qq8[c] = q8p[c];
+					for (int j = 0; j < 16; j++) {
+						int32x4_t s_v = vdupq_n_s32((int32_t)sc[j]);
+						int8x16_t a_v = vld1q_s8(aa);
+						for (int c = 0; c < NR; c++) {
+							int8x16_t q8_v	= vld1q_s8(qq8[c]);
 							int16x8_t p0	= vmull_s8(vget_low_s8(q8_v), vget_low_s8(a_v));
 							int32x4_t p0_32 = vpaddlq_s16(p0);
 							int16x8_t p1	= vmull_s8(vget_high_s8(q8_v), vget_high_s8(a_v));
 							int32x4_t p1_32 = vpaddlq_s16(p1);
-							acc0			= vmlaq_s32(acc0, s_v, p0_32);
-							acc1			= vmlaq_s32(acc1, s_v, p1_32);
-							qq8 += 16;
-							aa += 16;
+							acc0[c]			= vmlaq_s32(acc0[c], s_v, p0_32);
+							acc1[c]			= vmlaq_s32(acc1[c], s_v, p1_32);
+							qq8[c] += 16;
 						}
-						int32x4_t acc = vaddq_s32(acc0, acc1);
-						total_arr[c]  = vaddvq_s32(acc);
-#endif
+						aa += 16;
 					}
+					int32x4_t total_c[NR];
+					for (int c = 0; c < NR; c++)
+						total_c[c] = vaddq_s32(acc0[c], acc1[c]);
+					const int32x4_t p01		  = vpaddq_s32(total_c[0], total_c[1]);
+					const int32x4_t p23		  = vpaddq_s32(total_c[2], total_c[3]);
+					const int32x4_t total_vec = vpaddq_s32(p01, p23);
+#endif
 
-					int32x4_t	total_vec = vld1q_s32(total_arr);
-					float32x4_t total_f	  = vcvtq_f32_s32(total_vec);
-					float32x4_t xd_vec	  = vld1q_f32(d_xq_arr);
+					float32x4_t total_f = vcvtq_f32_s32(total_vec);
+					float32x4_t xd_vec	= vld1q_f32(d_xq_arr);
 					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, vmulq_n_f32(total_f, d_w[r]));
 				}
 			}
@@ -3419,6 +3565,43 @@ void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		for (int r = 0; r < MR; r++)
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
+		const int n_bi_tiles = (m / NR) > 0 ? blocks_per_row : 0;
+
+		static _Thread_local int8x16_t(*lo_cache)[MR] = NULL;
+		static _Thread_local int8x16_t(*hi_cache)[MR] = NULL;
+		static _Thread_local float (*d_w_cache)[MR]	  = NULL;
+		static _Thread_local int cache_cap			  = 0;
+
+		if (n_bi_tiles > 0) {
+			if (cache_cap < n_bi_tiles) {
+				lo_cache  = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache  = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
+				d_w_cache = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				cache_cap = n_bi_tiles;
+				tlocal_register((void **)&lo_cache);
+				tlocal_register((void **)&hi_cache);
+				tlocal_register((void **)&d_w_cache);
+			}
+
+			for (int bi = 0; bi < n_bi_tiles; bi++) {
+				if (bi + 1 < blocks_per_row) {
+					for (int r = 0; r < MR; r++)
+						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(iq4_nl_block)),
+										   0, 1);
+				}
+				for (int r = 0; r < MR; r++) {
+					const iq4_nl_block *b =
+						(const iq4_nl_block *)(row_base[r] + ((size_t)bi * sizeof(iq4_nl_block)));
+					d_w_cache[bi][r]		= f16_to_f32_fast(b->d);
+					const uint8x16_t q		= vld1q_u8(b->qs);
+					const uint8x16_t lo_idx = vandq_u8(q, lo_mask);
+					const uint8x16_t hi_idx = vshrq_n_u8(q, 4);
+					lo_cache[bi][r]			= vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, lo_idx));
+					hi_cache[bi][r]			= vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, hi_idx));
+				}
+			}
+		}
+
 		int t = 0;
 		for (; t + NR <= m; t += NR) {
 			float32x4_t acc_row[MR];
@@ -3440,21 +3623,10 @@ void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				}
 				const float32x4_t xd_vec = vld1q_f32(xd);
 
-				if (bi + 1 < blocks_per_row) {
-					for (int r = 0; r < MR; r++)
-						__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(iq4_nl_block)),
-										   0, 1);
-				}
-
 				for (int r = 0; r < MR; r++) {
-					const iq4_nl_block *b =
-						(const iq4_nl_block *)(row_base[r] + ((size_t)bi * sizeof(iq4_nl_block)));
-					const float		 d_w	= f16_to_f32_fast(b->d);
-					const uint8x16_t q		= vld1q_u8(b->qs);
-					const uint8x16_t lo_idx = vandq_u8(q, lo_mask);
-					const uint8x16_t hi_idx = vshrq_n_u8(q, 4);
-					const int8x16_t	 lo		= vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, lo_idx));
-					const int8x16_t	 hi		= vreinterpretq_s8_u8(vqtbl1q_u8(kvalues_u, hi_idx));
+					const float		d_w = d_w_cache[bi][r];
+					const int8x16_t lo	= lo_cache[bi][r];
+					const int8x16_t hi	= hi_cache[bi][r];
 
 					const int32x4_t sumi4 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
 
@@ -3627,43 +3799,39 @@ static inline int8x8_t iq3s_flip8(uint8_t q0, uint8_t q1, uint8_t qh, uint8_t si
 	return vreinterpret_s8_u8(vsub_u8(veor_u8(gr, nm), nm));
 }
 
-static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t *restrict q8) {
-	const uint8_t *restrict qs	  = b->qs;
-	const uint8_t *restrict qh	  = b->qh;
-	const uint8_t *restrict signs = b->signs;
+static inline void iq3s_block_decode(const iq3s_block *restrict b, int8x16_t decoded[16]) {
+	const uint8_t *restrict qs_p	= b->qs;
+	const uint8_t *restrict qh_p	= b->qh;
+	const uint8_t *restrict signs_p = b->signs;
 
-	int8x16_t decoded[16];
+	for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+		const uint8_t qh0 = qh_p[0];
+		const uint8_t qh1 = qh_p[1];
+		const int	  vi  = ib32 * 2;
 
-	{
-		const uint8_t *restrict qs_p	= qs;
-		const uint8_t *restrict qh_p	= qh;
-		const uint8_t *restrict signs_p = signs;
+		const int8x8_t f00 = iq3s_flip8(qs_p[0], qs_p[1], qh0, signs_p[0], 8, 7);
+		const int8x8_t f01 = iq3s_flip8(qs_p[2], qs_p[3], qh0, signs_p[1], 6, 5);
+		const int8x8_t f02 = iq3s_flip8(qs_p[4], qs_p[5], qh0, signs_p[2], 4, 3);
+		const int8x8_t f03 = iq3s_flip8(qs_p[6], qs_p[7], qh0, signs_p[3], 2, 1);
+		const int8x8_t f10 = iq3s_flip8(qs_p[8], qs_p[9], qh1, signs_p[4], 8, 7);
+		const int8x8_t f11 = iq3s_flip8(qs_p[10], qs_p[11], qh1, signs_p[5], 6, 5);
+		const int8x8_t f12 = iq3s_flip8(qs_p[12], qs_p[13], qh1, signs_p[6], 4, 3);
+		const int8x8_t f13 = iq3s_flip8(qs_p[14], qs_p[15], qh1, signs_p[7], 2, 1);
 
-		for (int ib32 = 0; ib32 < 8; ib32 += 2) {
-			const uint8_t qh0 = qh_p[0];
-			const uint8_t qh1 = qh_p[1];
-			const int	  vi  = ib32 * 2;
+		decoded[vi + 0] = vcombine_s8(f00, f01);
+		decoded[vi + 1] = vcombine_s8(f02, f03);
+		decoded[vi + 2] = vcombine_s8(f10, f11);
+		decoded[vi + 3] = vcombine_s8(f12, f13);
 
-			const int8x8_t f00 = iq3s_flip8(qs_p[0], qs_p[1], qh0, signs_p[0], 8, 7);
-			const int8x8_t f01 = iq3s_flip8(qs_p[2], qs_p[3], qh0, signs_p[1], 6, 5);
-			const int8x8_t f02 = iq3s_flip8(qs_p[4], qs_p[5], qh0, signs_p[2], 4, 3);
-			const int8x8_t f03 = iq3s_flip8(qs_p[6], qs_p[7], qh0, signs_p[3], 2, 1);
-			const int8x8_t f10 = iq3s_flip8(qs_p[8], qs_p[9], qh1, signs_p[4], 8, 7);
-			const int8x8_t f11 = iq3s_flip8(qs_p[10], qs_p[11], qh1, signs_p[5], 6, 5);
-			const int8x8_t f12 = iq3s_flip8(qs_p[12], qs_p[13], qh1, signs_p[6], 4, 3);
-			const int8x8_t f13 = iq3s_flip8(qs_p[14], qs_p[15], qh1, signs_p[7], 2, 1);
-
-			decoded[vi + 0] = vcombine_s8(f00, f01);
-			decoded[vi + 1] = vcombine_s8(f02, f03);
-			decoded[vi + 2] = vcombine_s8(f10, f11);
-			decoded[vi + 3] = vcombine_s8(f12, f13);
-
-			qh_p += 2;
-			qs_p += 16;
-			signs_p += 8;
-		}
+		qh_p += 2;
+		qs_p += 16;
+		signs_p += 8;
 	}
+}
 
+static inline int32_t iq3s_block_dot_decoded(const iq3s_block *restrict b,
+											 const int8x16_t decoded[16],
+											 const int8_t *restrict q8) {
 	int32x4_t acc = vdupq_n_s32(0);
 	for (int ib32 = 0; ib32 < 8; ib32 += 2) {
 		const int	  g0  = ib32;
@@ -3709,6 +3877,12 @@ static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t 
 	return vaddvq_s32(acc);
 }
 
+static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t *restrict q8) {
+	int8x16_t decoded[16];
+	iq3s_block_decode(b, decoded);
+	return iq3s_block_dot_decoded(b, decoded, q8);
+}
+
 static void matmul_iq3_s_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 											float *restrict y, int n, int k) {
 	int				  blocks_per_row = k / 256;
@@ -3728,9 +3902,19 @@ static void matmul_iq3_s_q8_k_qonly_f32_row(const void *w, const q8_k_block *res
 			const q8_k_block *restrict yb = &xq[bi];
 			const float d_xq			  = yb->d;
 
-			if (bi + 1 < blocks_per_row) {
-				for (int r = 0; r < MR; r++)
-					__builtin_prefetch(row_base[r] + ((size_t)(bi + 1) * sizeof(iq3s_block)), 0, 1);
+			int pf_bi = bi + 2;
+			if (pf_bi < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)pf_bi * sizeof(iq3s_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(iq3s_block) - 16, 0, 1);
+				}
+			} else if (bi + 1 < blocks_per_row) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *pf_base = row_base[r] + ((size_t)(bi + 1) * sizeof(iq3s_block));
+					__builtin_prefetch(pf_base, 0, 1);
+					__builtin_prefetch(pf_base + sizeof(iq3s_block) - 16, 0, 1);
+				}
 			}
 
 			int32_t	 sumi_lane[8];
@@ -3786,40 +3970,52 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	const iq3s_block *Wb			 = w;
 	int				  i				 = 0;
 
+	int8x16_t *decoded_cache = NULL;
+	int32_t	  *sc0_cache	 = NULL;
+	int32_t	  *sc1_cache	 = NULL;
+	float	  *d_w_cache	 = NULL;
+	if (m >= 2 * NR && blocks_per_row > 0) {
+		decoded_cache = malloc(sizeof(int8x16_t) * (size_t)blocks_per_row * MR * 16);
+		sc0_cache	  = malloc(sizeof(int32_t) * (size_t)blocks_per_row * MR * 4);
+		sc1_cache	  = malloc(sizeof(int32_t) * (size_t)blocks_per_row * MR * 4);
+		d_w_cache	  = malloc(sizeof(float) * (size_t)blocks_per_row * MR);
+		if (!decoded_cache || !sc0_cache || !sc1_cache || !d_w_cache) {
+			free(decoded_cache);
+			free(sc0_cache);
+			free(sc1_cache);
+			free(d_w_cache);
+			decoded_cache = NULL;
+			sc0_cache = sc1_cache = NULL;
+			d_w_cache			  = NULL;
+		}
+	}
+
 	for (; i + MR <= n; i += MR) {
 		const uint8_t *row_base[MR];
 		for (int r = 0; r < MR; r++)
 			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
 
-		int t = 0;
-		for (; t + NR <= m; t += NR) {
-			float32x4_t acc_row[MR];
-			for (int r = 0; r < MR; r++)
-				acc_row[r] = vdupq_n_f32(0.0f);
-
-			const q8_k_block *xrow[NR];
-			for (int c = 0; c < NR; c++)
-				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
-
+		if (decoded_cache) {
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				int8x16_t decoded[MR][16];
-				int32_t	  sc0[MR][4];
-				int32_t	  sc1[MR][4];
-				float	  d_w[MR];
+				int8x16_t *dcache = decoded_cache + (size_t)bi * MR * 16;
+				int32_t	  *sc0c	  = sc0_cache + (size_t)bi * MR * 4;
+				int32_t	  *sc1c	  = sc1_cache + (size_t)bi * MR * 4;
+				float	  *dwc	  = d_w_cache + (size_t)bi * MR;
 
 				for (int r = 0; r < MR; r++) {
 					const iq3s_block *restrict b =
 						(const iq3s_block *)(row_base[r] + ((size_t)bi * sizeof(iq3s_block)));
-					d_w[r] = f16_to_f32_fast(b->d);
+					dwc[r] = f16_to_f32_fast(b->d);
 
 					const uint8_t *restrict qs	  = b->qs;
 					const uint8_t *restrict qh	  = b->qh;
 					const uint8_t *restrict signs = b->signs;
+					int8x16_t *restrict decoded_r = dcache + (size_t)r * 16;
 
 					for (int ib32 = 0; ib32 < 8; ib32 += 2) {
-						const uint8_t sb = b->scales[ib32 / 2];
-						sc0[r][ib32 / 2] = 1 + (2 * (sb & 0xf));
-						sc1[r][ib32 / 2] = 1 + (2 * (sb >> 4));
+						const uint8_t sb	   = b->scales[ib32 / 2];
+						sc0c[r * 4 + ib32 / 2] = 1 + (2 * (sb & 0xf));
+						sc1c[r * 4 + ib32 / 2] = 1 + (2 * (sb >> 4));
 
 						const uint8_t qh0 = qh[0];
 						const uint8_t qh1 = qh[1];
@@ -3834,14 +4030,87 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 						const int8x8_t f12 = iq3s_flip8(qs[12], qs[13], qh1, signs[6], 4, 3);
 						const int8x8_t f13 = iq3s_flip8(qs[14], qs[15], qh1, signs[7], 2, 1);
 
-						decoded[r][vi + 0] = vcombine_s8(f00, f01);
-						decoded[r][vi + 1] = vcombine_s8(f02, f03);
-						decoded[r][vi + 2] = vcombine_s8(f10, f11);
-						decoded[r][vi + 3] = vcombine_s8(f12, f13);
+						decoded_r[vi + 0] = vcombine_s8(f00, f01);
+						decoded_r[vi + 1] = vcombine_s8(f02, f03);
+						decoded_r[vi + 2] = vcombine_s8(f10, f11);
+						decoded_r[vi + 3] = vcombine_s8(f12, f13);
 
 						qh += 2;
 						qs += 16;
 						signs += 8;
+					}
+				}
+			}
+		}
+
+		int t = 0;
+		for (; t + NR <= m; t += NR) {
+			float32x4_t acc_row[MR];
+			for (int r = 0; r < MR; r++)
+				acc_row[r] = vdupq_n_f32(0.0f);
+
+			const q8_k_block *xrow[NR];
+			for (int c = 0; c < NR; c++)
+				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
+
+			for (int bi = 0; bi < blocks_per_row; bi++) {
+				int8x16_t local_decoded[MR][16];
+				int32_t	  local_sc0[MR][4];
+				int32_t	  local_sc1[MR][4];
+				float	  local_d_w[MR];
+
+				int8x16_t(*decoded)[16];
+				int32_t (*sc0)[4];
+				int32_t (*sc1)[4];
+				float *d_w;
+
+				if (decoded_cache) {
+					decoded = (int8x16_t(*)[16])(decoded_cache + (size_t)bi * MR * 16);
+					sc0		= (int32_t (*)[4])(sc0_cache + (size_t)bi * MR * 4);
+					sc1		= (int32_t (*)[4])(sc1_cache + (size_t)bi * MR * 4);
+					d_w		= d_w_cache + (size_t)bi * MR;
+				} else {
+					decoded = local_decoded;
+					sc0		= local_sc0;
+					sc1		= local_sc1;
+					d_w		= local_d_w;
+
+					for (int r = 0; r < MR; r++) {
+						const iq3s_block *restrict b =
+							(const iq3s_block *)(row_base[r] + ((size_t)bi * sizeof(iq3s_block)));
+						d_w[r] = f16_to_f32_fast(b->d);
+
+						const uint8_t *restrict qs	  = b->qs;
+						const uint8_t *restrict qh	  = b->qh;
+						const uint8_t *restrict signs = b->signs;
+
+						for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+							const uint8_t sb = b->scales[ib32 / 2];
+							sc0[r][ib32 / 2] = 1 + (2 * (sb & 0xf));
+							sc1[r][ib32 / 2] = 1 + (2 * (sb >> 4));
+
+							const uint8_t qh0 = qh[0];
+							const uint8_t qh1 = qh[1];
+							const int	  vi  = ib32 * 2;
+
+							const int8x8_t f00 = iq3s_flip8(qs[0], qs[1], qh0, signs[0], 8, 7);
+							const int8x8_t f01 = iq3s_flip8(qs[2], qs[3], qh0, signs[1], 6, 5);
+							const int8x8_t f02 = iq3s_flip8(qs[4], qs[5], qh0, signs[2], 4, 3);
+							const int8x8_t f03 = iq3s_flip8(qs[6], qs[7], qh0, signs[3], 2, 1);
+							const int8x8_t f10 = iq3s_flip8(qs[8], qs[9], qh1, signs[4], 8, 7);
+							const int8x8_t f11 = iq3s_flip8(qs[10], qs[11], qh1, signs[5], 6, 5);
+							const int8x8_t f12 = iq3s_flip8(qs[12], qs[13], qh1, signs[6], 4, 3);
+							const int8x8_t f13 = iq3s_flip8(qs[14], qs[15], qh1, signs[7], 2, 1);
+
+							decoded[r][vi + 0] = vcombine_s8(f00, f01);
+							decoded[r][vi + 1] = vcombine_s8(f02, f03);
+							decoded[r][vi + 2] = vcombine_s8(f10, f11);
+							decoded[r][vi + 3] = vcombine_s8(f12, f13);
+
+							qh += 2;
+							qs += 16;
+							signs += 8;
+						}
 					}
 				}
 
@@ -4030,6 +4299,11 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 			y[((size_t)t * y_row_stride) + i] = sumf;
 		}
 	}
+
+	free(decoded_cache);
+	free(sc0_cache);
+	free(sc1_cache);
+	free(d_w_cache);
 }
 
 #undef NR
@@ -4704,6 +4978,49 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 		for (int r = 0; r < MR; r++)
 			row_base[r] = Wb + (size_t)(i + r) * row_stride;
 
+		const int n_bi_tiles = (m / NR_IQ3S_RE) > 0 ? blocks_per_row : 0;
+
+		static _Thread_local int8x16_t(*decoded_cache)[MR][16] = NULL;
+		static _Thread_local int32_t (*sc0_cache)[MR][4]	   = NULL;
+		static _Thread_local int32_t (*sc1_cache)[MR][4]	   = NULL;
+		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
+		static _Thread_local int cache_cap					   = 0;
+
+		if (n_bi_tiles > 0) {
+			if (cache_cap < n_bi_tiles) {
+				decoded_cache = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
+				sc0_cache	  = realloc(sc0_cache, sizeof(*sc0_cache) * n_bi_tiles);
+				sc1_cache	  = realloc(sc1_cache, sizeof(*sc1_cache) * n_bi_tiles);
+				d_w_cache	  = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				cache_cap	  = n_bi_tiles;
+				tlocal_register((void **)&decoded_cache);
+				tlocal_register((void **)&sc0_cache);
+				tlocal_register((void **)&sc1_cache);
+				tlocal_register((void **)&d_w_cache);
+			}
+
+			for (int bi = 0; bi < n_bi_tiles; bi++) {
+				for (int r = 0; r < MR; r++) {
+					const uint8_t *blk = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
+					d_w_cache[bi][r]   = f16_to_f32_fast(*(const uint16_t *)(blk + IQ3S_RE_OFF_D));
+					const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
+					const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
+
+					for (int g = 0; g < 8; g += 2) {
+						uint8_t sb				= scales[g / 2];
+						sc0_cache[bi][r][g / 2] = 1 + 2 * (sb & 0xf);
+						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
+
+						const int vi = g * 2;
+						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi + 0],
+											 &decoded_cache[bi][r][vi + 1]);
+						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
+											 &decoded_cache[bi][r][vi + 3]);
+					}
+				}
+			}
+		}
+
 		int t = 0;
 		for (; t + NR_IQ3S_RE <= m; t += NR_IQ3S_RE) {
 			float32x4_t acc_row[MR];
@@ -4716,28 +5033,10 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 
-				float	  d_w[MR];
-				int8x16_t decoded[MR][16];
-				int32_t	  sc0[MR][4], sc1[MR][4];
-
-				for (int r = 0; r < MR; r++) {
-					const uint8_t *blk = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-					d_w[r]			   = f16_to_f32_fast(*(const uint16_t *)(blk + IQ3S_RE_OFF_D));
-					const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
-					const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
-
-					for (int g = 0; g < 8; g += 2) {
-						uint8_t sb	  = scales[g / 2];
-						sc0[r][g / 2] = 1 + 2 * (sb & 0xf);
-						sc1[r][g / 2] = 1 + 2 * (sb >> 4);
-
-						const int vi = g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded[r][vi + 0],
-											 &decoded[r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded[r][vi + 2],
-											 &decoded[r][vi + 3]);
-					}
-				}
+				float(*d_w)				= d_w_cache[bi];
+				int8x16_t(*decoded)[16] = decoded_cache[bi];
+				int32_t (*sc0)[4]		= sc0_cache[bi];
+				int32_t (*sc1)[4]		= sc1_cache[bi];
 
 				float xd[NR_IQ3S_RE];
 				const int8_t *restrict q8p[NR_IQ3S_RE];
@@ -5090,6 +5389,55 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 		const uint8_t *group = Wb + (size_t)(i / 8) * row_stride;
 		int			   t	 = 0;
 
+		const int n_bi_tiles = (m / NR_IQ3S_RE8) > 0 ? blocks_per_row : 0;
+
+		static _Thread_local int8x16_t(*decoded_cache)[MR][16] = NULL;
+		static _Thread_local int32_t (*sc0_cache)[MR][4]	   = NULL;
+		static _Thread_local int32_t (*sc1_cache)[MR][4]	   = NULL;
+		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
+		static _Thread_local int cache_cap					   = 0;
+
+		if (n_bi_tiles > 0) {
+			if (cache_cap < n_bi_tiles) {
+				decoded_cache = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
+				sc0_cache	  = realloc(sc0_cache, sizeof(*sc0_cache) * n_bi_tiles);
+				sc1_cache	  = realloc(sc1_cache, sizeof(*sc1_cache) * n_bi_tiles);
+				d_w_cache	  = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				cache_cap	  = n_bi_tiles;
+				tlocal_register((void **)&decoded_cache);
+				tlocal_register((void **)&sc0_cache);
+				tlocal_register((void **)&sc1_cache);
+				tlocal_register((void **)&d_w_cache);
+			}
+
+			for (int bi = 0; bi < n_bi_tiles; bi++) {
+				const uint8_t *blk = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
+				if (bi + 1 < blocks_per_row)
+					__builtin_prefetch(blk + IQ3_S_RE8_GROUP_BYTES, 0, 1);
+
+				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
+				const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
+				const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
+
+				for (int r = 0; r < MR; r++) {
+					d_w_cache[bi][r]	  = f16_to_f32_fast(d_ptr[r]);
+					const uint8_t *scales = scales_all + (size_t)r * 4;
+					const uint8_t *idx	  = idx_all + (size_t)r * 128;
+
+					for (int g = 0; g < 8; g += 2) {
+						uint8_t sb				= scales[g / 2];
+						sc0_cache[bi][r][g / 2] = 1 + 2 * (sb & 0xf);
+						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
+						const int vi			= g * 2;
+						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
+											 &decoded_cache[bi][r][vi + 1]);
+						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
+											 &decoded_cache[bi][r][vi + 3]);
+					}
+				}
+			}
+		}
+
 		for (; t + NR_IQ3S_RE8 <= m; t += NR_IQ3S_RE8) {
 			float32x4_t acc_row[MR];
 			for (int r = 0; r < MR; r++)
@@ -5101,34 +5449,10 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
-				if (bi + 1 < blocks_per_row)
-					__builtin_prefetch(blk + IQ3_S_RE8_GROUP_BYTES, 0, 1);
-
-				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
-				const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
-				const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
-
-				float	  d_w[MR];
-				int8x16_t decoded[MR][16];
-				int32_t	  sc0[MR][4], sc1[MR][4];
-
-				for (int r = 0; r < MR; r++) {
-					d_w[r]				  = f16_to_f32_fast(d_ptr[r]);
-					const uint8_t *scales = scales_all + (size_t)r * 4;
-					const uint8_t *idx	  = idx_all + (size_t)r * 128;
-
-					for (int g = 0; g < 8; g += 2) {
-						uint8_t sb	  = scales[g / 2];
-						sc0[r][g / 2] = 1 + 2 * (sb & 0xf);
-						sc1[r][g / 2] = 1 + 2 * (sb >> 4);
-						const int vi  = g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded[r][vi],
-											 &decoded[r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded[r][vi + 2],
-											 &decoded[r][vi + 3]);
-					}
-				}
+				float(*d_w)				= d_w_cache[bi];
+				int8x16_t(*decoded)[16] = decoded_cache[bi];
+				int32_t (*sc0)[4]		= sc0_cache[bi];
+				int32_t (*sc1)[4]		= sc1_cache[bi];
 
 				float xd[NR_IQ3S_RE8];
 				const int8_t *restrict q8p[NR_IQ3S_RE8];
