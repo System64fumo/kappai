@@ -207,6 +207,8 @@ status_code backend_create_best(int device_index, backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
 
+status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
+
 backend *backend_host(void);
 
 void backend_host_use(backend *b);

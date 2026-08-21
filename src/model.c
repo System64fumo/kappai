@@ -2251,6 +2251,12 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		}
 	}
 
+	model_build_weight_refs(m);
+
+	return OK;
+}
+
+status_code model_build_weight_refs(model *m) {
 	m->wrefs_by_layer = xcalloc((size_t)m->n_layers * WIDX_COUNT, sizeof(weight_ref *));
 	for (int li = 0; li < m->n_layers; li++) {
 		layer_weights *L		  = &m->layers[li];

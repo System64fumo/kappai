@@ -729,6 +729,7 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 	}
 	g_synth_build_cfg = NULL;
 
+	model_build_weight_refs(&sm->m);
 	m->recipe			  = recipe_build(m);
 	m->moe_stream_enabled = 0;
 	return sm;
@@ -823,6 +824,8 @@ static void synth_model_free(synth_model *sm) {
 	free(sm->output_norm_raw);
 	free(sm->output_w_raw);
 	free(sm->m.layers);
+	free(sm->m.wrefs_by_layer);
+	sm->m.wrefs_by_layer = NULL;
 	free(sm->m.layer_dims.is_global_layer);
 	free(sm->m.layer_dims.ffn_lengths);
 	free(sm->m.layer_dims.n_kv_heads_per_layer);

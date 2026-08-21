@@ -282,6 +282,37 @@ static inline float silu(float x) {
 	return x / (1.0f + expf(-x));
 }
 
+static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rope_dim,
+									const float *rope_cos, const float *rope_sin) {
+	int half = rope_dim / 2;
+	for (int h = 0; h < n_heads; h++) {
+		float *vh = v + ((size_t)h * head_dim);
+		for (int j = 0; j < half; j++) {
+			float c		 = rope_cos[j];
+			float s		 = rope_sin[j];
+			float v0	 = vh[j];
+			float v1	 = vh[j + half];
+			vh[j]		 = (v0 * c) - (v1 * s);
+			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+	}
+}
+
+static inline float sigmoidf(float x) {
+	if (x >= 0.0f)
+		return 1.0f / (1.0f + expf(-x));
+	float z = expf(x);
+	return z / (1.0f + z);
+}
+
+static inline float softplusf(float x) {
+	if (x > 20.0f)
+		return x;
+	if (x < -20.0f)
+		return expf(x);
+	return log1pf(expf(x));
+}
+
 static inline float gelu_tanh(float x) {
 	const float c	  = 0.7978845608028654f;
 	float		x3	  = x * x * x;

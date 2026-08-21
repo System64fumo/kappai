@@ -105,49 +105,25 @@ int32_t sampler_argmax(const float *logits, int vocab) {
 }
 
 static int top_k_heap(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	if (k >= vocab)
+	static float *hs;
+	static int	 *hi;
+	static int	  cap;
+
+	if (k > vocab)
 		k = vocab;
 	if (k <= 0)
 		return 0;
-	int n = 0;
-	for (int i = 0; i < vocab; i++) {
-		float v = logits[i];
-		if (n < k) {
-			out[n].v = v;
-			out[n].i = i;
-			int j	 = n;
-			while (j > 0) {
-				int p = (j - 1) >> 1;
-				if (out[p].v <= out[j].v)
-					break;
-				sampler_top_k_entry t = out[p];
-				out[p]				  = out[j];
-				out[j]				  = t;
-				j					  = p;
-			}
-			n++;
-		} else if (v > out[0].v) {
-			out[0].v = v;
-			out[0].i = i;
-			int j	 = 0;
-			while (1) {
-				int l		 = (2 * j) + 1;
-				int r		 = (2 * j) + 2;
-				int smallest = j;
-				if (l < k && out[l].v < out[smallest].v)
-					smallest = l;
-				if (r < k && out[r].v < out[smallest].v)
-					smallest = r;
-				if (smallest == j)
-					break;
-				sampler_top_k_entry t = out[smallest];
-				out[smallest]		  = out[j];
-				out[j]				  = t;
-				j					  = smallest;
-			}
-		}
+	if (cap < k) {
+		hs	= xrealloc(hs, (size_t)k * sizeof(float));
+		hi	= xrealloc(hi, (size_t)k * sizeof(int));
+		cap = k;
 	}
-	return n;
+	int hn = topk_heap_select(logits, vocab, k, hs, hi);
+	for (int i = 0; i < hn; i++) {
+		out[i].v = hs[i];
+		out[i].i = hi[i];
+	}
+	return hn;
 }
 
 static int cmp_desc(const void *a, const void *b) {

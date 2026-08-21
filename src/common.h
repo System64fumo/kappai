@@ -137,6 +137,55 @@ static inline float *float_buf_ensure(float_buf *b, size_t need) {
 	return b->p;
 }
 
+static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {
+	for (;;) {
+		int l = 2 * pos + 1, r = 2 * pos + 2, smallest = pos;
+		if (l < n && score[l] < score[smallest])
+			smallest = l;
+		if (r < n && score[r] < score[smallest])
+			smallest = r;
+		if (smallest == pos)
+			return;
+		float ts		= score[pos];
+		score[pos]		= score[smallest];
+		score[smallest] = ts;
+		int ti			= idx[pos];
+		idx[pos]		= idx[smallest];
+		idx[smallest]	= ti;
+		pos				= smallest;
+	}
+}
+
+static inline int topk_heap_select(const float *scores, int n_scores, int k, float *out_score,
+								   int *out_idx) {
+	int hn = 0;
+	for (int e = 0; e < n_scores && hn < k; e++) {
+		out_idx[hn]	  = e;
+		out_score[hn] = scores[e];
+		int pos		  = hn++;
+		while (pos > 0) {
+			int parent = (pos - 1) / 2;
+			if (out_score[parent] <= out_score[pos])
+				break;
+			float ts		  = out_score[pos];
+			out_score[pos]	  = out_score[parent];
+			out_score[parent] = ts;
+			int ti			  = out_idx[pos];
+			out_idx[pos]	  = out_idx[parent];
+			out_idx[parent]	  = ti;
+			pos				  = parent;
+		}
+	}
+	for (int e = hn; e < n_scores; e++) {
+		if (scores[e] > out_score[0]) {
+			out_score[0] = scores[e];
+			out_idx[0]	 = e;
+			topk_heap_sift_down(out_score, out_idx, hn, 0);
+		}
+	}
+	return hn;
+}
+
 static inline uint64_t fnv1a(const char *s, size_t n) {
 	uint64_t h = 0xcbf29ce484222325ULL;
 	for (size_t i = 0; i < n; i++) {

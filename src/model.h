@@ -223,6 +223,7 @@ static inline int model_mixed_backend_mode(const model *m) {
 }
 
 status_code model_set_layer_backend_range(model *m, int begin, int end, backend *b);
+status_code model_build_weight_refs(model *m);
 
 static inline int model_layer_is_sliding(const model *m, int li) {
 	return m->sliding_window > 0 && m->layers[li].is_sliding;

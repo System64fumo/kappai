@@ -33,34 +33,7 @@ static model_recipe *build_standard_recipe(const model *m) {
 	r->max_head_dim		= head_dim;
 	r->max_kv_heads		= n_kv_heads;
 
-	{
-		int n = 1;
-		if (m->arch_info->has_scale_embeddings)
-			n++;
-		recipe_op *ops = xcalloc(n, sizeof(recipe_op));
-		int		   i   = 0;
-
-		ops[i++] = (recipe_op){
-			.kind  = OP_EMBD_LOOKUP,
-			.in	   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_X,
-			.w_idx = WIDX_TOK_EMBD,
-			.stage = STAGE_EMBD,
-		};
-
-		if (m->arch_info->has_scale_embeddings) {
-			ops[i++] = (recipe_op){
-				.kind  = OP_SCALE_EMBEDDINGS,
-				.in	   = {RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out   = RECIPE_SLOT_X,
-				.w_idx = RECIPE_NO_WEIGHT,
-				.stage = STAGE_EMBD,
-			};
-		}
-
-		r->pre_ops	 = ops;
-		r->n_pre_ops = i;
-	}
+	recipe_build_pre_ops(r, m);
 
 	{
 		int		   cap = 24;

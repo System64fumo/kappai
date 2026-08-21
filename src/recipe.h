@@ -267,10 +267,6 @@ static inline int recipe_exec_is_batch(const exec_ctx *ctx) {
 	return ctx && ctx->bs != NULL;
 }
 
-status_code op_mla_qkv_proj_fused(exec_ctx *ctx);
-status_code op_mla_q_proj(exec_ctx *ctx);
-status_code op_mla_kv_proj(exec_ctx *ctx);
-status_code op_attention_mla(exec_ctx *ctx);
 status_code op_split_qgate(exec_ctx *ctx);
 status_code op_partial_rope_qk(exec_ctx *ctx);
 status_code op_attn_output_gate(exec_ctx *ctx);
@@ -305,6 +301,7 @@ recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage);
 recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage);
 
 void recipe_build_post_ops(model_recipe *r, const struct model *m);
+void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 
 #define RECIPE_REGISTER(id, arch_name_str, builder_fn)                                             \
 	static void __attribute__((constructor)) recipe_autoreg_##id(void) {                           \
