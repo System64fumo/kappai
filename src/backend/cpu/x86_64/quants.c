@@ -2177,9 +2177,13 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 	void	  *xq_heap = NULL;
 
 	if (blocks_per_row > 256) {
-		xq_heap = xmalloc((size_t)blocks_per_row * (sizeof(float) + sizeof(__m256i)));
-		xq_d	= (float *)xq_heap;
-		xq32	= (__m256i *)(xq_d + blocks_per_row);
+		size_t fbytes = (size_t)blocks_per_row * sizeof(float);
+		size_t pad	  = (32 - (fbytes & 31)) & 31;
+		if (posix_memalign(&xq_heap, 32, fbytes + pad + (size_t)blocks_per_row * sizeof(__m256i)) !=
+			0)
+			return;
+		xq_d = (float *)xq_heap;
+		xq32 = (__m256i *)((char *)xq_heap + fbytes + pad);
 	}
 
 	for (int bi = 0; bi < blocks_per_row; bi++) {
@@ -3043,9 +3047,13 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				q_ymm_cache = realloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
-				sc_cache	= realloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
-				d_w_cache	= realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				size_t old_cap = cache_cap;
+				q_ymm_cache	 = xrealloc_aligned(q_ymm_cache, 32, sizeof(*q_ymm_cache) * old_cap,
+												 sizeof(*q_ymm_cache) * n_bi_tiles);
+				sc_cache	= xrealloc_aligned(sc_cache, 32, sizeof(*sc_cache) * old_cap,
+											   sizeof(*sc_cache) * n_bi_tiles);
+				d_w_cache	= xrealloc_aligned(d_w_cache, 32, sizeof(*d_w_cache) * old_cap,
+											   sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
 				tlocal_register((void **)&q_ymm_cache);
 				tlocal_register((void **)&sc_cache);
@@ -3233,14 +3241,24 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				wlo_cache	 = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = realloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
-				s_lo_cache	 = realloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
-				s_hi_cache	 = realloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
-				m_lo_cache	 = realloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
-				m_hi_cache	 = realloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
-				d_w_cache	 = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				dmin_w_cache = realloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
+				size_t old_cap = cache_cap;
+				wlo_cache	 = xrealloc_aligned(wlo_cache, 32, sizeof(*wlo_cache) * old_cap,
+												sizeof(*wlo_cache) * n_bi_tiles);
+				whi_cache	 = xrealloc_aligned(whi_cache, 32, sizeof(*whi_cache) * old_cap,
+												sizeof(*whi_cache) * n_bi_tiles);
+				s_lo_cache	 = xrealloc_aligned(s_lo_cache, 32, sizeof(*s_lo_cache) * old_cap,
+												sizeof(*s_lo_cache) * n_bi_tiles);
+				s_hi_cache	 = xrealloc_aligned(s_hi_cache, 32, sizeof(*s_hi_cache) * old_cap,
+												sizeof(*s_hi_cache) * n_bi_tiles);
+				m_lo_cache	 = xrealloc_aligned(m_lo_cache, 32, sizeof(*m_lo_cache) * old_cap,
+												sizeof(*m_lo_cache) * n_bi_tiles);
+				m_hi_cache	 = xrealloc_aligned(m_hi_cache, 32, sizeof(*m_hi_cache) * old_cap,
+												sizeof(*m_hi_cache) * n_bi_tiles);
+				d_w_cache	 = xrealloc_aligned(d_w_cache, 32, sizeof(*d_w_cache) * old_cap,
+												sizeof(*d_w_cache) * n_bi_tiles);
+				dmin_w_cache = xrealloc_aligned(dmin_w_cache, 32,
+												sizeof(*dmin_w_cache) * old_cap,
+												sizeof(*dmin_w_cache) * n_bi_tiles);
 				cache_cap	 = n_bi_tiles;
 				tlocal_register((void **)&wlo_cache);
 				tlocal_register((void **)&whi_cache);
@@ -3578,15 +3596,24 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				lo_cache   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				hi_cache   = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				s0_cache   = realloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
-				s1_cache   = realloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
-				m0_cache   = realloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
-				m1_cache   = realloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
-				d_cache	   = realloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
-				dmin_cache = realloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
-				cache_cap  = n_bi_tiles;
+				size_t old_cap = cache_cap;
+				lo_cache	   = xrealloc_aligned(lo_cache, 32, sizeof(*lo_cache) * old_cap,
+												  sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache	   = xrealloc_aligned(hi_cache, 32, sizeof(*hi_cache) * old_cap,
+												  sizeof(*hi_cache) * n_bi_tiles);
+				s0_cache	   = xrealloc_aligned(s0_cache, 32, sizeof(*s0_cache) * old_cap,
+												  sizeof(*s0_cache) * n_bi_tiles);
+				s1_cache	   = xrealloc_aligned(s1_cache, 32, sizeof(*s1_cache) * old_cap,
+												  sizeof(*s1_cache) * n_bi_tiles);
+				m0_cache	   = xrealloc_aligned(m0_cache, 32, sizeof(*m0_cache) * old_cap,
+												  sizeof(*m0_cache) * n_bi_tiles);
+				m1_cache	   = xrealloc_aligned(m1_cache, 32, sizeof(*m1_cache) * old_cap,
+												  sizeof(*m1_cache) * n_bi_tiles);
+				d_cache		   = xrealloc_aligned(d_cache, 32, sizeof(*d_cache) * old_cap,
+												 sizeof(*d_cache) * n_bi_tiles);
+				dmin_cache	   = xrealloc_aligned(dmin_cache, 32, sizeof(*dmin_cache) * old_cap,
+												 sizeof(*dmin_cache) * n_bi_tiles);
+				cache_cap	   = n_bi_tiles;
 				tlocal_register((void **)&lo_cache);
 				tlocal_register((void **)&hi_cache);
 				tlocal_register((void **)&s0_cache);

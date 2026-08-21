@@ -4,7 +4,21 @@
 #include <immintrin.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+
+static inline void *xrealloc_aligned(void *p, size_t align, size_t old_size, size_t new_size) {
+	void *np = NULL;
+	if (posix_memalign(&np, align, new_size) != 0) {
+		free(p);
+		return NULL;
+	}
+	if (p) {
+		memcpy(np, p, old_size < new_size ? old_size : new_size);
+		free(p);
+	}
+	return np;
+}
 
 static inline float f16_to_f32_fast(uint16_t h) {
 	__m128 v = _mm_cvtph_ps(_mm_set1_epi16((short)h));
