@@ -48,6 +48,15 @@ static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 		return &ctx->s->mirror_slots[idx];
 	return &ctx->s->slots[idx];
 }
+
+float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b)
+		return NULL;
+	if (b->handle)
+		return (float *)((char *)b->handle + b->offset);
+	return (float *)b->host_ptr;
+}
 static inline buffer *exec_slots(const exec_ctx *ctx) {
 	if (ctx->s && ctx->s->active_is_mirror)
 		return ctx->s->mirror_slots;
@@ -204,8 +213,14 @@ model_recipe *recipe_build(const struct model *m) {
 
 	int has_vld = m->arch_info->has_variable_layer_dims;
 
-	if (!has_vld)
+	if (!has_vld) {
 		recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
+		if (r->per_layer_ops) {
+			for (int li = 0; li < m->n_layers; li++)
+				recipe_coalesce_matmul_runs(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
+											r->layer.n_ops);
+		}
+	}
 
 	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
 	for (int li = 0; li < m->n_layers; li++) {
@@ -409,6 +424,24 @@ static weight_ref *resolve_weight_ref(const model *m, int li, uint8_t w_idx) {
 		return L ? &L->v_b_w : (weight_ref *)&WEIGHT_REF_NONE;
 	case WIDX_MLA_KV_A_NORM:
 		return L ? &L->kv_a_norm_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_ATTN_QKV:
+		return L ? &L->attn_qkv_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_ATTN_GATE:
+		return L ? &L->attn_gate_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_CONV1D:
+		return L ? &L->ssm_conv1d_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_DT:
+		return L ? &L->ssm_dt_b : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_A:
+		return L ? &L->ssm_a : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_BETA:
+		return L ? &L->ssm_beta_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_ALPHA:
+		return L ? &L->ssm_alpha_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_NORM:
+		return L ? &L->ssm_norm_w : (weight_ref *)&WEIGHT_REF_NONE;
+	case WIDX_SSM_OUT:
+		return L ? &L->ssm_out_w : (weight_ref *)&WEIGHT_REF_NONE;
 	default:
 		return (weight_ref *)&WEIGHT_REF_NONE;
 	}
@@ -599,6 +632,40 @@ static int exec_matmul_run_coalesced(const recipe_op *ops, int n_ops, model *m, 
 	profile		 *prof = &s->prof;
 	profile_scope ps   = profile_begin(prof, matmul_substage(ops[0].w_idx));
 	status_code st = a->matmul_multi(a, w_list, w_types, &slots[ops[0].in[0]], y_list, n_out, k, n);
+	profile_end(prof, &ps);
+
+	*out_status = st;
+	return n;
+}
+
+static int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m,
+										   compute_scratch *s, batch_scratch *bs, int li,
+										   int n_rows, status_code *out_status) {
+	backend *a = m->backend;
+	if (!a->matmul_multi_batch || n_ops < 2) {
+		*out_status = OK;
+		return 0;
+	}
+
+	int			  n = n_ops > RECIPE_COALESCE_MAX ? RECIPE_COALESCE_MAX : n_ops;
+	const buffer *w_list[RECIPE_COALESCE_MAX];
+	uint32_t	  w_types[RECIPE_COALESCE_MAX];
+	buffer		 *y_list[RECIPE_COALESCE_MAX];
+	int			  n_out[RECIPE_COALESCE_MAX];
+	int			  k = ops[0].u.matmul.k;
+
+	for (int i = 0; i < n; i++) {
+		weight_ref *w = resolve_weight_ref(m, li, ops[i].w_idx);
+		w_list[i]	  = &w->buf;
+		w_types[i]	  = w->type;
+		y_list[i]	  = batch_slot(bs, ops[i].out);
+		n_out[i]	  = ops[i].u.matmul.n;
+	}
+
+	profile		 *prof = &s->prof;
+	profile_scope ps   = profile_begin(prof, matmul_substage(ops[0].w_idx));
+	status_code st = a->matmul_multi_batch(a, w_list, w_types, batch_slot(bs, ops[0].in[0]), y_list,
+										   n_out, k, n, n_rows);
 	profile_end(prof, &ps);
 
 	*out_status = st;
@@ -1600,6 +1667,10 @@ static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
 	[OP_MOE_ROUTER]			 = op_moe_router_unified,
 	[OP_MOE_EXPERTS]		 = op_moe_experts_unified,
 	[OP_MOE_SHARED]			 = op_moe_shared_unified,
+	[OP_SPLIT_QGATE]		 = op_split_qgate,
+	[OP_PARTIAL_ROPE_QK]	 = op_partial_rope_qk,
+	[OP_ATTN_OUTPUT_GATE]	 = op_attn_output_gate,
+	[OP_GATED_DELTA_NET]	 = op_gated_delta_net,
 };
 
 static status_code op_mla_q_proj_unified(exec_ctx *ctx) {
@@ -1807,8 +1878,10 @@ struct batch_scratch {
 	float_buf q, k, v;
 	float_buf ffn_gate, ffn_up, ffn_gate_up, ffn_act;
 	float_buf resid_tmp;
+	float_buf hyb_proj, hyb_gate, hyb_alpha, hyb_beta;
 	buffer	  x_b, xb_b, xb2_b, attn_out_b, q_b, k_b, v_b;
 	buffer	  ffn_gate_b, ffn_up_b, ffn_gate_up_b, ffn_act_b, resid_tmp_b;
+	buffer	  hyb_proj_b, hyb_gate_b, hyb_alpha_b, hyb_beta_b;
 
 	int	  *moe_router_ids;
 	float *moe_router_w;
@@ -1903,6 +1976,10 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->ffn_gate_up.p);
 	free(bs->ffn_act.p);
 	free(bs->resid_tmp.p);
+	free(bs->hyb_proj.p);
+	free(bs->hyb_gate.p);
+	free(bs->hyb_alpha.p);
+	free(bs->hyb_beta.p);
 	free(bs->moe_router_ids);
 	free(bs->moe_router_w);
 	free(bs->moe_union_ids);
@@ -1959,6 +2036,14 @@ static buffer *batch_slot(batch_scratch *bs, uint8_t slot) {
 		return &bs->ffn_gate_up_b;
 	case RECIPE_SLOT_RESID_TMP:
 		return &bs->resid_tmp_b;
+	case RECIPE_SLOT_HYB_PROJ:
+		return &bs->hyb_proj_b;
+	case RECIPE_SLOT_HYB_GATE:
+		return &bs->hyb_gate_b;
+	case RECIPE_SLOT_HYB_ALPHA:
+		return &bs->hyb_alpha_b;
+	case RECIPE_SLOT_HYB_BETA:
+		return &bs->hyb_beta_b;
 	default:
 		return NULL;
 	}
@@ -1976,23 +2061,47 @@ static inline float *batch_buf_ptr(const buffer *b) {
 
 static const op_handler g_op_dispatch[OP_KIND_COUNT];
 
+static int recipe_ops_are_batchable(const recipe_op *ops, int n) {
+	if (!ops || n <= 0)
+		return 0;
+	for (int j = 0; j < n; j++) {
+		if (ops[j].kind == OP_NONE)
+			continue;
+		if (ops[j].kind < 0 || ops[j].kind >= OP_KIND_COUNT || !g_op_dispatch[ops[j].kind])
+			return 0;
+	}
+	return 1;
+}
+
 static int recipe_is_batchable(const model *m) {
 	const model_recipe *r = m->recipe;
 	if (!r)
 		return 0;
-	for (int j = 0; j < r->layer.n_ops; j++)
-		if (!g_op_dispatch[r->layer.ops[j].kind])
+	if (r->per_layer_ops) {
+		if (r->layer.n_ops <= 0)
 			return 0;
+		for (int li = 0; li < m->n_layers; li++) {
+			if (!recipe_ops_are_batchable(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
+										  r->layer.n_ops))
+				return 0;
+		}
+	} else if (!recipe_ops_are_batchable(r->layer.ops, r->layer.n_ops)) {
+		return 0;
+	}
 	for (int i = 0; i < r->n_pre_ops; i++) {
 		op_kind k = r->pre_ops[i].kind;
-		if (k == OP_EMBD_LOOKUP || k == OP_SCALE_EMBEDDINGS)
+		if (k == OP_EMBD_LOOKUP || k == OP_SCALE_EMBEDDINGS || k == OP_NONE)
 			continue;
-		if (!g_op_dispatch[k])
+		if (k < 0 || k >= OP_KIND_COUNT || !g_op_dispatch[k])
 			return 0;
 	}
-	for (int i = 0; i < r->n_post_ops; i++)
-		if (!g_op_dispatch[r->post_ops[i].kind])
+	for (int i = 0; i < r->n_post_ops; i++) {
+		op_kind k = r->post_ops[i].kind;
+		if (k == OP_NONE)
+			continue;
+		if (k < 0 || k >= OP_KIND_COUNT || !g_op_dispatch[k])
 			return 0;
+	}
 	return 1;
 }
 
@@ -3147,6 +3256,8 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		if (mla_out > attn_buf_size)
 			attn_buf_size = mla_out;
 	}
+	if (m->arch_info->is_hybrid_recurrent && m->hybrid.value_dim > attn_buf_size)
+		attn_buf_size = m->hybrid.value_dim;
 
 	if (!s->bs) {
 		s->bs = xcalloc(1, sizeof(batch_scratch));
@@ -3155,6 +3266,16 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	bs->tokens			 = tokens;
 	bs->n_tokens_stashed = n_tokens;
 	batch_scratch_alloc(bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size);
+	if (m->arch_info->is_hybrid_recurrent) {
+		bs_ensure_wrap(bs, &bs->hyb_proj, &bs->hyb_proj_b,
+					   (size_t)n_tokens * model_hybrid_proj_size(m), a);
+		bs_ensure_wrap(bs, &bs->hyb_gate, &bs->hyb_gate_b,
+					   (size_t)n_tokens * model_hybrid_gate_size(m), a);
+		bs_ensure_wrap(bs, &bs->hyb_alpha, &bs->hyb_alpha_b,
+					   (size_t)n_tokens * m->hybrid.n_value_heads, a);
+		bs_ensure_wrap(bs, &bs->hyb_beta, &bs->hyb_beta_b,
+					   (size_t)n_tokens * m->hybrid.n_value_heads, a);
+	}
 
 	status_code st = OK;
 
@@ -3188,12 +3309,29 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 
 	for (int li = 0; li < m->n_layers; li++) {
 		const recipe_op *ops = &ops_base[(size_t)li * ops_stride];
-		for (int j = 0; j < r->layer.n_ops; j++) {
-			if (ops[j].kind == OP_NONE)
+		int				 j	 = 0;
+		while (j < r->layer.n_ops) {
+			if (ops[j].kind == OP_NONE) {
+				j++;
 				continue;
+			}
+			if (ops[j].coalesce_run_len > 1) {
+				status_code coalesced_status;
+				int			consumed = exec_matmul_run_coalesced_batch(
+					&ops[j], ops[j].coalesce_run_len, m, s, bs, li, n_tokens, &coalesced_status);
+				if (consumed > 0) {
+					if (coalesced_status != OK) {
+						st = coalesced_status;
+						goto done;
+					}
+					j += consumed;
+					continue;
+				}
+			}
 			st = exec_op_batch(&ops[j], m, cache, s, bs, pos_start, n_tokens, li, flash_attn);
 			if (st != OK)
 				goto done;
+			j++;
 		}
 		if (s->layer_cb)
 			s->layer_cb(li + 1, m->n_layers, -1, 1, s->layer_cb_ud);

@@ -213,6 +213,7 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 			return -1;
 		}
 		int q_out		 = m->n_heads * head_dim;
+		int q_weight_out = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
 		int kv_heads	 = model_layer_kv_heads(m, i);
 		int kv_out		 = kv_heads * head_dim;
 		int intermediate = model_layer_intermediate(m, i);
@@ -221,7 +222,28 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 
 		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_norm.weight", i, m->dim))
 			return -1;
-		if (is_mla_layer) {
+		if (model_layer_is_recurrent(m, i)) {
+			const model_hybrid_params *q = &m->hybrid;
+			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_qkv.weight", i, m->dim,
+									  q->conv_dim) ||
+				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_gate.weight", i, m->dim,
+									  q->value_dim) ||
+				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", i,
+									  q->conv_kernel, q->conv_dim) ||
+				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_dt.bias", i,
+									  q->n_value_heads) ||
+				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_a", i,
+									  q->n_value_heads) ||
+				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_beta.weight", i, m->dim,
+									  q->n_value_heads) ||
+				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_alpha.weight", i, m->dim,
+									  q->n_value_heads) ||
+				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_norm.weight", i,
+									  q->value_head_dim) ||
+				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_out.weight", i,
+									  q->value_dim, m->dim))
+				return -1;
+		} else if (is_mla_layer) {
 			int q_lora	  = m->mla.q_lora;
 			int kv_lora	  = m->mla.kv_lora;
 			int kv_a_rows = kv_lora + m->mla.qk_rope;
@@ -252,7 +274,7 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 				return -1;
 		} else {
 			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_q.weight", i, m->dim,
-									  q_out))
+									  q_weight_out))
 				return -1;
 			if (model_layer_has_kv(m, i))
 				if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_k.weight", i,
@@ -267,8 +289,9 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 									  q_out, m->dim))
 				return -1;
 		}
-		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ffn_norm.weight", i, m->dim))
-			return -1;
+		if (!m->arch_info->uses_post_attn_norm_for_ffn)
+			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ffn_norm.weight", i, m->dim))
+				return -1;
 		if (is_moe_layer) {
 			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ffn_gate_inp.weight", i,
 									  m->dim, m->moe.n_experts))
@@ -346,7 +369,7 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 									  m->dim))
 				return -1;
 		}
-		if (m->arch_info->has_qk_norm) {
+		if (m->arch_info->has_qk_norm && !model_layer_is_recurrent(m, i)) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_q_norm.weight", i,
 									  head_dim))
 				return -1;
@@ -674,6 +697,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	backend		  *layer_be = model_layer_backend(m, i);
 
 	int q_out		 = m->n_heads * model_layer_head_dim(m, i);
+	int q_weight_out = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
 	int kv_out		 = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
 	int intermediate = model_layer_intermediate(m, i);
 	int is_mla_layer = m->arch_info->is_mla;
@@ -698,7 +722,18 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 	UPLOAD(&L->attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
-	if (is_mla_layer) {
+	if (model_layer_is_recurrent(m, i)) {
+		UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
+		UPLOAD_REP(&L->attn_gate_w, 2, m->dim, m->hybrid.value_dim, WCLASS_MATMUL);
+		UPLOAD(&L->ssm_conv1d_w, GGML_TYPE_F32, 2, m->hybrid.conv_kernel, m->hybrid.conv_dim,
+			   WCLASS_MISC);
+		UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
+		UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
+		UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
+		UPLOAD_REP(&L->ssm_alpha_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
+		UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, m->hybrid.value_head_dim, 0, WCLASS_NORM);
+		UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
+	} else if (is_mla_layer) {
 		int q_lora	  = m->mla.q_lora;
 		int kv_lora	  = m->mla.kv_lora;
 		int kv_a_rows = kv_lora + m->mla.qk_rope;
@@ -718,7 +753,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		memset(&L->wk.buf, 0, sizeof(L->wk.buf));
 		memset(&L->wv.buf, 0, sizeof(L->wv.buf));
 	} else {
-		UPLOAD_REP(&L->wq, 2, m->dim, q_out, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wq, 2, m->dim, q_weight_out, WCLASS_MATMUL);
 		if (model_layer_has_kv(m, i)) {
 			UPLOAD_REP(&L->wk, 2, m->dim, kv_out, WCLASS_MATMUL);
 		} else {
@@ -731,7 +766,8 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		}
 		UPLOAD_REP(&L->wo, 2, q_out, m->dim, WCLASS_MATMUL);
 	}
-	UPLOAD(&L->ffn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
+	if (!m->arch_info->uses_post_attn_norm_for_ffn)
+		UPLOAD(&L->ffn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
 	if (m->arch_info->has_attn_post_norm) {
 		UPLOAD(&L->post_attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
@@ -740,7 +776,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		UPLOAD(&L->post_ffn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 	}
 
-	if (m->arch_info->has_qk_norm) {
+	if (m->arch_info->has_qk_norm && !model_layer_is_recurrent(m, i)) {
 		UPLOAD(&L->attn_q_norm_w, GGML_TYPE_F32, 1, L->head_dim, 0, WCLASS_NORM);
 		if (model_layer_has_kv(m, i))
 			UPLOAD(&L->attn_k_norm_w, GGML_TYPE_F32, 1, L->head_dim, 0, WCLASS_NORM);
@@ -1354,6 +1390,87 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 		  m->mla.v_head, m->head_dim, m->rope_dim);
 }
 
+static int hybrid_count_full_attention(const model *m) {
+	int n = 0;
+	for (int i = 0; i < m->n_layers; i++)
+		n += !m->hybrid.recurrent_layers[i];
+	return n;
+}
+
+static status_code load_hybrid_metadata(model *m, const gguf_ctx *g, const char *prefix) {
+	int32_t				 v32;
+	model_hybrid_params *q = &m->hybrid;
+
+	if (req_i32(g, prefix, "ssm.conv_kernel", &v32) != OK)
+		return ERR_FORMAT;
+	q->conv_kernel = v32;
+	if (req_i32(g, prefix, "ssm.inner_size", &v32) != OK)
+		return ERR_FORMAT;
+	q->inner_size = v32;
+	if (req_i32(g, prefix, "ssm.state_size", &v32) != OK)
+		return ERR_FORMAT;
+	q->state_size = v32;
+	if (req_i32(g, prefix, "ssm.time_step_rank", &v32) != OK)
+		return ERR_FORMAT;
+	q->n_value_heads = v32;
+	if (req_i32(g, prefix, "ssm.group_count", &v32) != OK)
+		return ERR_FORMAT;
+	q->n_key_heads = v32;
+
+	q->full_attention_interval = 4;
+	if (akey_i32(g, prefix, "attention.full_attention_interval", &v32) == OK ||
+		akey_i32(g, prefix, "full_attention_interval", &v32) == OK)
+		q->full_attention_interval = v32;
+
+	if (q->conv_kernel < 1 || q->inner_size < 1 || q->state_size < 1 || q->n_value_heads < 1 ||
+		q->n_key_heads < 1 || q->inner_size % q->n_value_heads != 0 ||
+		q->n_value_heads % q->n_key_heads != 0 || q->full_attention_interval < 1) {
+		ERROR("hybrid: invalid recurrent dimensions (conv=%d inner=%d state=%d "
+			  "value_heads=%d key_heads=%d interval=%d)",
+			  q->conv_kernel, q->inner_size, q->state_size, q->n_value_heads, q->n_key_heads,
+			  q->full_attention_interval);
+		return ERR_FORMAT;
+	}
+
+	q->key_dim		  = q->state_size * q->n_key_heads;
+	q->value_head_dim = q->inner_size / q->n_value_heads;
+	q->value_dim	  = q->inner_size;
+	q->conv_dim		  = 2 * q->key_dim + q->value_dim;
+
+	q->recurrent_layers		= xmalloc((size_t)m->n_layers);
+	const uint8_t *rec_bool = NULL;
+	const int32_t *rec_i32	= NULL;
+	size_t		   rec_len	= 0;
+	char		   key[128];
+	snprintf(key, sizeof(key), "%s.attention.recurrent_layers", prefix);
+	for (size_t i = 0; i < g->n_kv; i++) {
+		if (strcmp(g->kv_keys[i], key) != 0 || g->kv_types[i] != GGUF_TYPE_ARRAY)
+			continue;
+		rec_len = g->kv_arr_len[i];
+		if (g->kv_arr_type[i] == GGUF_TYPE_BOOL)
+			rec_bool = (const uint8_t *)g->kv_arr_data[i];
+		else if (g->kv_arr_type[i] == GGUF_TYPE_I32)
+			rec_i32 = (const int32_t *)g->kv_arr_data[i];
+		break;
+	}
+	for (int i = 0; i < m->n_layers; i++) {
+		int rec;
+		if (rec_bool && (size_t)i < rec_len)
+			rec = rec_bool[i] != 0;
+		else if (rec_i32 && (size_t)i < rec_len)
+			rec = rec_i32[i] != 0;
+		else
+			rec = ((i + 1) % q->full_attention_interval) != 0;
+		q->recurrent_layers[i] = rec ? 1 : 0;
+	}
+	DEBUG("hybrid GDN: conv=%d inner=%d state=%d key_heads=%d value_heads=%d interval=%d "
+		  "recurrent=%d/%d%s",
+		  q->conv_kernel, q->inner_size, q->state_size, q->n_key_heads, q->n_value_heads,
+		  q->full_attention_interval, m->n_layers - hybrid_count_full_attention(m), m->n_layers,
+		  (rec_bool || rec_i32) ? " (explicit)" : "");
+	return OK;
+}
+
 static status_code model_load_open(model *m, const char *path, int use_mmap,
 								   const char *repack_config, int requested_n_ctx) {
 	(void)requested_n_ctx;
@@ -1530,6 +1647,10 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 	if (m->arch_info->is_mla) {
 		load_mla_metadata(m, g, prefix);
 	}
+	if (m->arch_info->is_hybrid_recurrent) {
+		if (load_hybrid_metadata(m, g, prefix) != OK)
+			return ERR_FORMAT;
+	}
 
 	return OK;
 }
@@ -1641,12 +1762,39 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			L->n_kv_heads	   = m->n_kv_heads;
 		}
 		L->has_own_v = 1;
+		if (m->arch_info->is_hybrid_recurrent)
+			L->is_recurrent = m->hybrid.recurrent_layers[i] != 0;
 
 		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_norm_w,
 							  "blk.%d.attn_norm.weight", 0) != OK)
 			return ERR_FORMAT;
 
-		if (m->arch_info && m->arch_info->is_mla) {
+		if (model_layer_is_recurrent(m, i)) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
+								  "blk.%d.attn_qkv.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_gate_w,
+								  "blk.%d.attn_gate.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
+								  "blk.%d.ssm_conv1d.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_dt_b, "blk.%d.ssm_dt.bias",
+								  0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_a, "blk.%d.ssm_a", 0) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_beta_w,
+								  "blk.%d.ssm_beta.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_alpha_w,
+								  "blk.%d.ssm_alpha.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_norm_w,
+								  "blk.%d.ssm_norm.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
+								  "blk.%d.ssm_out.weight", 1) != OK)
+				return ERR_FORMAT;
+			L->wq		 = (weight_ref){0};
+			L->wk		 = (weight_ref){0};
+			L->wv		 = (weight_ref){0};
+			L->wo		 = (weight_ref){0};
+			L->has_own_v = 0;
+		} else if (m->arch_info && m->arch_info->is_mla) {
 			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->q_a_w,
 								  "blk.%d.attn_q_a.weight", 1) != OK)
 				return ERR_FORMAT;
@@ -1736,12 +1884,16 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			}
 		}
 
-		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wo, "blk.%d.attn_output.weight",
-							  1) != OK)
-			return ERR_FORMAT;
-		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ffn_norm_w,
-							  "blk.%d.ffn_norm.weight", 0) != OK)
-			return ERR_FORMAT;
+		if (!model_layer_is_recurrent(m, i)) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wo,
+								  "blk.%d.attn_output.weight", 1) != OK)
+				return ERR_FORMAT;
+		}
+		if (!m->arch_info->uses_post_attn_norm_for_ffn) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ffn_norm_w,
+								  "blk.%d.ffn_norm.weight", 0) != OK)
+				return ERR_FORMAT;
+		}
 
 		if (m->arch_info->is_moe) {
 			L->is_moe_layer = (i >= m->moe.first_dense_layer);
@@ -2047,7 +2199,7 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			L->post_ffn_norm_w.host_ptr = t->data;
 		}
 
-		if (m->arch_info->has_qk_norm) {
+		if (m->arch_info->has_qk_norm && !model_layer_is_recurrent(m, i)) {
 			t = find_tensor_fmt(g, tname, sizeof(tname), "blk.%d.attn_q_norm.weight", i);
 			if (!t) {
 				return ERR_FORMAT;
@@ -2144,6 +2296,15 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		row[WIDX_MLA_K_B]			   = &L->k_b_w;
 		row[WIDX_MLA_V_B]			   = &L->v_b_w;
 		row[WIDX_MLA_KV_A_NORM]		   = &L->kv_a_norm_w;
+		row[WIDX_ATTN_QKV]			   = &L->attn_qkv_w;
+		row[WIDX_ATTN_GATE]			   = &L->attn_gate_w;
+		row[WIDX_SSM_CONV1D]		   = &L->ssm_conv1d_w;
+		row[WIDX_SSM_DT]			   = &L->ssm_dt_b;
+		row[WIDX_SSM_A]				   = &L->ssm_a;
+		row[WIDX_SSM_BETA]			   = &L->ssm_beta_w;
+		row[WIDX_SSM_ALPHA]			   = &L->ssm_alpha_w;
+		row[WIDX_SSM_NORM]			   = &L->ssm_norm_w;
+		row[WIDX_SSM_OUT]			   = &L->ssm_out_w;
 	}
 
 	return OK;
@@ -2305,6 +2466,15 @@ void model_free(model *m) {
 			free_weight_buf(&L->wk.buf);
 			free_weight_buf(&L->wv.buf);
 			free_weight_buf(&L->wo.buf);
+			free_weight_buf(&L->attn_qkv_w.buf);
+			free_weight_buf(&L->attn_gate_w.buf);
+			free_weight_buf(&L->ssm_conv1d_w.buf);
+			free_weight_buf(&L->ssm_dt_b.buf);
+			free_weight_buf(&L->ssm_a.buf);
+			free_weight_buf(&L->ssm_beta_w.buf);
+			free_weight_buf(&L->ssm_alpha_w.buf);
+			free_weight_buf(&L->ssm_norm_w.buf);
+			free_weight_buf(&L->ssm_out_w.buf);
 			free_weight_buf(&L->q_a_w.buf);
 			free_weight_buf(&L->q_b_w.buf);
 			free_weight_buf(&L->q_a_norm_w.buf);
@@ -2377,6 +2547,8 @@ void model_free(model *m) {
 	free(m->layer_dims.is_global_layer);
 	free(m->layer_dims.ffn_lengths);
 	free(m->layer_dims.n_kv_heads_per_layer);
+	free(m->hybrid.recurrent_layers);
+	m->hybrid.recurrent_layers = NULL;
 	gguf_free(&m->gctx);
 	free(m->model_path);
 	m->model_path = NULL;

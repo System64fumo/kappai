@@ -12,7 +12,8 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	c->backend	= m->backend;
 	c->kv_quant = kv_quant;
 
-	int is_mla = m->arch_info->is_mla;
+	int is_mla	  = m->arch_info->is_mla;
+	int is_hybrid = m->arch_info->is_hybrid_recurrent;
 
 	if (kv_quant != KV_QUANT_F16 && is_mla) {
 		ERROR("kvcache: quantized KV cache is not supported for MLA models");
@@ -46,6 +47,18 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		c->mla->qk_rope_dim = m->mla.qk_rope;
 		return m->backend->kv_alloc_mla(m->backend, m->n_layers, n_ctx, c->mla->lora_dim,
 										c->mla->qk_rope_dim, &c->mla->kv);
+	}
+
+	if (is_hybrid) {
+		kvcache_hybrid *q	= xcalloc(1, sizeof(*q));
+		q->conv_stride		= (size_t)m->hybrid.conv_dim * (size_t)(m->hybrid.conv_kernel - 1);
+		q->recurrent_stride = (size_t)m->hybrid.n_value_heads * (size_t)m->hybrid.state_size *
+							  (size_t)m->hybrid.value_head_dim;
+		q->conv_total		= (size_t)m->n_layers * q->conv_stride;
+		q->recurrent_total	= (size_t)m->n_layers * q->recurrent_stride;
+		q->conv_state		= xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
+		q->recurrent_state	= xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		c->hybrid			= q;
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
@@ -114,6 +127,12 @@ void kvcache_free(kvcache *c) {
 			}
 			c->has_host_kv = 0;
 		}
+	}
+	if (c->hybrid) {
+		free(c->hybrid->conv_state);
+		free(c->hybrid->recurrent_state);
+		free(c->hybrid);
+		c->hybrid = NULL;
 	}
 	free(c->kv_slot_on_host);
 	c->kv_slot_on_host = NULL;
@@ -214,6 +233,10 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 
 void kvcache_reset(kvcache *c) {
 	c->n_pos = 0;
+	if (c->hybrid) {
+		memset(c->hybrid->conv_state, 0, c->hybrid->conv_total * sizeof(float));
+		memset(c->hybrid->recurrent_state, 0, c->hybrid->recurrent_total * sizeof(float));
+	}
 }
 
 static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats) {

@@ -13,6 +13,15 @@ typedef struct kvcache_mla {
 	int	   host_alloced;
 } kvcache_mla;
 
+typedef struct kvcache_hybrid {
+	float *conv_state;
+	float *recurrent_state;
+	size_t conv_stride;
+	size_t recurrent_stride;
+	size_t conv_total;
+	size_t recurrent_total;
+} kvcache_hybrid;
+
 typedef struct kvcache {
 	int			  n_ctx, n_pos;
 	int			  n_kv_layers;
@@ -29,7 +38,8 @@ typedef struct kvcache {
 	int head_dim_max;
 	int n_kv_heads_max;
 
-	kvcache_mla *mla;
+	kvcache_mla	   *mla;
+	kvcache_hybrid *hybrid;
 } kvcache;
 
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant);

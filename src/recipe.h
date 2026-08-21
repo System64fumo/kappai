@@ -20,7 +20,11 @@
 #define RECIPE_SLOT_LOGITS 14
 #define RECIPE_SLOT_ROUTER_IDS 15
 #define RECIPE_SLOT_ROUTER_W 16
-#define RECIPE_SLOT_MAX 17
+#define RECIPE_SLOT_HYB_PROJ 17
+#define RECIPE_SLOT_HYB_GATE 18
+#define RECIPE_SLOT_HYB_ALPHA 19
+#define RECIPE_SLOT_HYB_BETA 20
+#define RECIPE_SLOT_MAX 21
 
 #define RECIPE_SLOT_NONE 0xFF
 
@@ -81,6 +85,11 @@ typedef enum {
 	OP_MOE_EXPERTS,
 	OP_MOE_SHARED,
 
+	OP_SPLIT_QGATE,
+	OP_PARTIAL_ROPE_QK,
+	OP_ATTN_OUTPUT_GATE,
+	OP_GATED_DELTA_NET,
+
 	OP_KIND_COUNT
 } op_kind;
 
@@ -132,6 +141,15 @@ typedef enum {
 	WIDX_MLA_K_B,
 	WIDX_MLA_V_B,
 	WIDX_MLA_KV_A_NORM,
+	WIDX_ATTN_QKV,
+	WIDX_ATTN_GATE,
+	WIDX_SSM_CONV1D,
+	WIDX_SSM_DT,
+	WIDX_SSM_A,
+	WIDX_SSM_BETA,
+	WIDX_SSM_ALPHA,
+	WIDX_SSM_NORM,
+	WIDX_SSM_OUT,
 	WIDX_COUNT
 } weight_idx;
 
@@ -243,10 +261,20 @@ typedef struct {
 	float				   *logits_out;
 } exec_ctx;
 
+float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
+
+static inline int recipe_exec_is_batch(const exec_ctx *ctx) {
+	return ctx && ctx->bs != NULL;
+}
+
 status_code op_mla_qkv_proj_fused(exec_ctx *ctx);
 status_code op_mla_q_proj(exec_ctx *ctx);
 status_code op_mla_kv_proj(exec_ctx *ctx);
 status_code op_attention_mla(exec_ctx *ctx);
+status_code op_split_qgate(exec_ctx *ctx);
+status_code op_partial_rope_qk(exec_ctx *ctx);
+status_code op_attn_output_gate(exec_ctx *ctx);
+status_code op_gated_delta_net(exec_ctx *ctx);
 
 typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 
