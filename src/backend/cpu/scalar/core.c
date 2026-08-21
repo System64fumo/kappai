@@ -696,54 +696,20 @@ static void *cpu_matmul_quantize_x(quant_scratch *qs, int q8_class, const float 
 
 void cpu_matmul_one(const void *restrict W, uint32_t w_type, const float *restrict x,
 					float *restrict y, int n, int k, quant_scratch *qs) {
+	const matmul_kernel *entry = matmul_kernel_lookup(w_type);
+	if (entry && entry->q8_class) {
+		void *xq = cpu_matmul_quantize_x(qs, entry->q8_class, x, k);
+		if (xq) {
+			entry->qonly(W, xq, 0, y, n, n, k, 1);
+			return;
+		}
+	}
 	switch (w_type) {
-	case GGML_TYPE_Q4_0:
-		matmul_q4_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q8_0:
-		matmul_q8_0_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q8_0_R8:
-		matmul_q8_0_r8_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q4_0_R8:
-		matmul_q4_0_r8_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_IQ4_NL_R8:
-		matmul_iq4_nl_r8_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q4_1:
-		matmul_q4_1_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q5_0:
-		matmul_q5_0_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q5_1:
-		matmul_q5_1_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_IQ4_NL:
-		matmul_iq4_nl_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q6_K:
-		matmul_q6_k_q8_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q4_K:
-		matmul_q4_k_q8_k_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_Q5_K:
-		matmul_q5_k_q8_k_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_IQ3_S:
-		matmul_iq3_s_q8_k_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_IQ3_S_RE:
-		matmul_iq3_s_re_q8_k_f32(W, x, y, n, k, qs);
-		break;
-	case GGML_TYPE_IQ3_S_RE8:
-		matmul_iq3_s_re8_q8_k_f32(W, x, y, n, k, qs);
-		break;
 	case GGML_TYPE_F32:
 		matmul_f32_f32(W, x, y, n, k);
+		break;
+	case GGML_TYPE_F16:
+		matmul_f16_f32(W, x, y, n, k);
 		break;
 	case GGML_TYPE_BF16:
 		matmul_bf16_f32(W, x, y, n, k);
@@ -1060,9 +1026,9 @@ static status_code cpu_matmul(backend *self, const buffer *w, uint32_t w_type, c
 							  buffer *y, int n, int k) {
 	return cpu_matmul_batch(self, w, w_type, x, y, n, k, 1);
 }
-
-status_code cpu_matmul_residual(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
-								const buffer *residual, buffer *y, int n, int k) {
+static status_code cpu_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
+									   const buffer *x, const buffer *residual, buffer *y, int n,
+									   int k) {
 	const void	*W	= cpu_ptr(w);
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
@@ -1184,22 +1150,19 @@ static void cpu_rope_one(float *v, int n_heads, int head_dim, const float *rope_
 						 const float *rope_sin, const float *freq_factors, int neox) {
 	int half = head_dim / 2;
 	(void)freq_factors;
+	if (neox) {
+		rope_rotate_neox(v, n_heads, head_dim, head_dim, rope_cos, rope_sin);
+		return;
+	}
 	for (int h = 0; h < n_heads; h++) {
 		float *vh = v + ((size_t)h * head_dim);
 		for (int j = 0; j < half; j++) {
-			float c = rope_cos[j];
-			float s = rope_sin[j];
-			if (neox) {
-				float v0	 = vh[j];
-				float v1	 = vh[j + half];
-				vh[j]		 = (v0 * c) - (v1 * s);
-				vh[j + half] = (v0 * s) + (v1 * c);
-			} else {
-				float v0		= vh[2 * j];
-				float v1		= vh[(2 * j) + 1];
-				vh[2 * j]		= (v0 * c) - (v1 * s);
-				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
-			}
+			float c			= rope_cos[j];
+			float s			= rope_sin[j];
+			float v0		= vh[2 * j];
+			float v1		= vh[(2 * j) + 1];
+			vh[2 * j]		= (v0 * c) - (v1 * s);
+			vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
 		}
 	}
 }

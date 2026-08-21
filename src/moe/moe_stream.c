@@ -201,6 +201,10 @@ static inline void slot_from_expert_desc(moe_expert_slot *s, int eid, const stru
 	s->gate_off		 = e->gate_off;
 	s->up_off		 = e->up_off;
 	s->down_off		 = e->down_off;
+	s->owned		 = 0;
+	s->heap_buf		 = NULL;
+	s->heap_size	 = 0;
+	s->pinned		 = 0;
 }
 
 static void moe_direct_io_probe(moe_stream_cache *c) {

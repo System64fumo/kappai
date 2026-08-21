@@ -14,37 +14,7 @@
 #include <string.h>
 
 static void recipe_build_gemma4_pre_ops(model_recipe *r, const model *m) {
-	int n = 2;
-	if (m->has_per_layer_embeddings)
-		n++;
-	recipe_op *ops = xcalloc(n, sizeof(recipe_op));
-	int		   i   = 0;
-
-	ops[i++] = (recipe_op){
-		.kind  = OP_EMBD_LOOKUP,
-		.in	   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-		.out   = RECIPE_SLOT_X,
-		.w_idx = WIDX_TOK_EMBD,
-		.stage = STAGE_EMBD,
-	};
-	ops[i++] = (recipe_op){
-		.kind  = OP_SCALE_EMBEDDINGS,
-		.in	   = {RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-		.out   = RECIPE_SLOT_X,
-		.w_idx = RECIPE_NO_WEIGHT,
-		.stage = STAGE_EMBD,
-	};
-	if (m->has_per_layer_embeddings) {
-		ops[i++] = (recipe_op){
-			.kind  = OP_PLE_BUILD,
-			.in	   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_NONE,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_EMBD,
-		};
-	}
-	r->pre_ops	 = ops;
-	r->n_pre_ops = i;
+	recipe_build_pre_ops(r, m);
 }
 
 static int recipe_append_gemma4_attn_block(recipe_op *ops, int i, const model *m) {
@@ -365,49 +335,7 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 		build_gemma4_ffn_tail(ops, i, m, eps, r);
 	}
 
-	{
-		int n_post = 3;
-		if (m->final_logit_softcap > 0.0f)
-			n_post++;
-		recipe_op *ops = xcalloc(n_post, sizeof(recipe_op));
-		int		   i   = 0;
-		ops[i++]	   = (recipe_op){
-			.kind	   = OP_RMSNORM,
-			.in		   = {RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	   = RECIPE_SLOT_XB,
-			.w_idx	   = WIDX_OUTPUT_NORM,
-			.stage	   = STAGE_LOGITS_NORM,
-			.u.rmsnorm = {.eps = eps, .n_heads = 0},
-		};
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MATMUL,
-			.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	  = RECIPE_SLOT_LOGITS,
-			.w_idx	  = WIDX_OUTPUT_W,
-			.stage	  = STAGE_LOGITS_MATMUL,
-			.u.matmul = {.n = m->vocab_size, .k = dim},
-		};
-		ops[i++] = (recipe_op){
-			.kind  = OP_LOGITS_READBACK,
-			.in	   = {RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_NONE,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_LOGITS_READBACK,
-		};
-		if (m->final_logit_softcap > 0.0f) {
-			ops[i++] = (recipe_op){
-				.kind	   = OP_SOFTCAP,
-				.in		   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	   = RECIPE_SLOT_NONE,
-				.w_idx	   = RECIPE_NO_WEIGHT,
-				.stage	   = STAGE_LOGITS_READBACK,
-				.u.softcap = {.cap = m->final_logit_softcap},
-			};
-		}
-		r->post_ops	  = ops;
-		r->n_post_ops = i;
-	}
-
+	recipe_build_post_ops(r, m);
 	moe_stream_cache_init((struct model *)m);
 	return r;
 }

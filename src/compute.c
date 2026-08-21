@@ -209,6 +209,52 @@ static status_code scratch_alloc(backend *a, buffer *dst, size_t size, const cha
 	return st;
 }
 
+typedef struct {
+	int attn_buf_size;
+	int q_out;
+	int kv_out;
+	int max_head_dim;
+	int max_kv_heads;
+	int max_intermediate;
+	int ffn_act_size;
+} compute_layout;
+
+static void compute_layout_init(const model *m, compute_layout *L) {
+	L->max_head_dim = m->head_dim;
+	L->max_kv_heads = m->n_kv_heads;
+	if (m->arch_info->has_variable_layer_dims) {
+		L->max_head_dim = MAX(m->layer_dims.head_dim_global, m->layer_dims.head_dim_swa);
+		L->max_kv_heads = layer_max_kv_heads(m);
+		if (L->max_kv_heads == 0)
+			L->max_kv_heads = m->n_kv_heads;
+	}
+
+	L->attn_buf_size = m->dim;
+	if (m->arch_info->has_variable_layer_dims) {
+		int q_out_max = m->n_heads * L->max_head_dim;
+		if (q_out_max > L->attn_buf_size)
+			L->attn_buf_size = q_out_max;
+	}
+	if (m->arch_info->is_mla) {
+		int mla_out = m->n_heads * m->mla.v_head;
+		if (mla_out > L->attn_buf_size)
+			L->attn_buf_size = mla_out;
+	}
+	if (m->arch_info->is_hybrid_recurrent && m->hybrid.value_dim > L->attn_buf_size)
+		L->attn_buf_size = m->hybrid.value_dim;
+
+	L->q_out  = m->n_heads * L->max_head_dim;
+	L->kv_out = L->max_kv_heads * L->max_head_dim;
+
+	L->max_intermediate = m->intermediate;
+	if (m->arch_info->has_variable_layer_dims) {
+		int layer_max = layer_max_intermediate(m);
+		if (layer_max > L->max_intermediate)
+			L->max_intermediate = layer_max;
+	}
+	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
+}
+
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
 	if (!compute_model_changed(s, m, n_ctx))
 		return OK;
@@ -219,42 +265,16 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	s->backend = m->backend;
 	backend *a = s->backend;
 
-	int max_head_dim = m->head_dim;
-	int max_kv_heads = m->n_kv_heads;
-	if (m->arch_info->has_variable_layer_dims) {
-		max_head_dim = m->layer_dims.head_dim_global > m->layer_dims.head_dim_swa
-						   ? m->layer_dims.head_dim_global
-						   : m->layer_dims.head_dim_swa;
-		max_kv_heads = layer_max_kv_heads(m);
-		if (max_kv_heads == 0)
-			max_kv_heads = m->n_kv_heads;
-	}
+	compute_layout L;
+	compute_layout_init(m, &L);
 
-	int attn_buf_size = m->dim;
-	if (m->arch_info->has_variable_layer_dims) {
-		int q_out_max = m->n_heads * max_head_dim;
-		if (q_out_max > attn_buf_size)
-			attn_buf_size = q_out_max;
-	}
-	if (m->arch_info->is_mla) {
-		int mla_out = m->n_heads * m->mla.v_head;
-		if (mla_out > attn_buf_size)
-			attn_buf_size = mla_out;
-	}
-	if (m->arch_info->is_hybrid_recurrent && m->hybrid.value_dim > attn_buf_size)
-		attn_buf_size = m->hybrid.value_dim;
-
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)attn_buf_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_X]");
-		if (_st != OK)
-			return _st;
-	}
+	status_code _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)L.attn_buf_size * sizeof(float), "X");
+	if (_st != OK)
+		return _st;
 	if (m->arch_info->is_hybrid_recurrent) {
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_PROJ],
-						  (size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
+		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_PROJ],
+							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
 		if (_st != OK)
 			return _st;
 		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_GATE],
@@ -270,85 +290,44 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		if (_st != OK)
 			return _st;
 	}
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)attn_buf_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_XB]");
-		if (_st != OK)
-			return _st;
-	}
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)attn_buf_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_XB2]");
-		if (_st != OK)
-			return _st;
-	}
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)attn_buf_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_ATTN_OUT]");
-		if (_st != OK)
-			return _st;
-	}
-
-	{
-		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q],
-										(size_t)m->n_heads * max_head_dim * sizeof(float),
-										"&s->slots[RECIPE_SLOT_Q]");
-		if (_st != OK)
-			return _st;
-	}
-	{
-		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K],
-										(size_t)max_kv_heads * max_head_dim * sizeof(float),
-										"&s->slots[RECIPE_SLOT_K]");
-		if (_st != OK)
-			return _st;
-	}
-	{
-		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V],
-										(size_t)max_kv_heads * max_head_dim * sizeof(float),
-										"&s->slots[RECIPE_SLOT_V]");
-		if (_st != OK)
-			return _st;
-	}
-
-	int max_intermediate = m->intermediate;
-	if (m->arch_info->has_variable_layer_dims) {
-		int layer_max = layer_max_intermediate(m);
-		if (layer_max > max_intermediate)
-			max_intermediate = layer_max;
-	}
-	{
-		status_code _st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
-										(size_t)max_intermediate * 2 * sizeof(float),
-										"&s->slots[RECIPE_SLOT_FFN_GATE_UP]");
-		if (_st != OK)
-			return _st;
-	}
+	_st =
+		scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)L.attn_buf_size * sizeof(float), "XB");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)L.attn_buf_size * sizeof(float),
+						"XB2");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)L.attn_buf_size * sizeof(float),
+						"ATTN_OUT");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q], (size_t)L.q_out * sizeof(float), "Q");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K], (size_t)L.kv_out * sizeof(float), "K");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V], (size_t)L.kv_out * sizeof(float), "V");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
+						(size_t)L.max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
+	if (_st != OK)
+		return _st;
 	s->slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], 0,
-												  (size_t)max_intermediate * sizeof(float));
+												  (size_t)L.max_intermediate * sizeof(float));
 	s->slots[RECIPE_SLOT_FFN_UP] =
-		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)max_intermediate * sizeof(float),
-					 (size_t)max_intermediate * sizeof(float));
-	int ffn_act_size = max_intermediate;
-	if (m->dim > ffn_act_size)
-		ffn_act_size = m->dim;
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)ffn_act_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_FFN_ACT]");
-		if (_st != OK)
-			return _st;
-	}
-	{
-		status_code _st =
-			scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
-						  "&s->slots[RECIPE_SLOT_LOGITS]");
-		if (_st != OK)
-			return _st;
-	}
+		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)L.max_intermediate * sizeof(float),
+					 (size_t)L.max_intermediate * sizeof(float));
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)L.ffn_act_size * sizeof(float),
+						"FFN_ACT");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
+						"LOGITS");
+	if (_st != OK)
+		return _st;
 
 	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
 
@@ -444,37 +423,8 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 
 	s->mirror_backend = host;
 
-	int max_head_dim = m->head_dim;
-	int max_kv_heads = m->n_kv_heads;
-	if (m->arch_info->has_variable_layer_dims) {
-		max_head_dim = m->layer_dims.head_dim_global > m->layer_dims.head_dim_swa
-						   ? m->layer_dims.head_dim_global
-						   : m->layer_dims.head_dim_swa;
-		max_kv_heads = layer_max_kv_heads(m);
-		if (max_kv_heads == 0)
-			max_kv_heads = m->n_kv_heads;
-	}
-	int attn_buf_size = m->dim;
-	if (m->arch_info->has_variable_layer_dims) {
-		int q_out_max = m->n_heads * max_head_dim;
-		if (q_out_max > attn_buf_size)
-			attn_buf_size = q_out_max;
-	}
-	if (m->arch_info->is_mla) {
-		int mla_out = m->n_heads * m->mla.v_head;
-		if (mla_out > attn_buf_size)
-			attn_buf_size = mla_out;
-	}
-	if (m->arch_info->is_hybrid_recurrent && m->hybrid.value_dim > attn_buf_size)
-		attn_buf_size = m->hybrid.value_dim;
-
-	int max_intermediate = m->intermediate;
-	if (m->arch_info->has_variable_layer_dims) {
-		int layer_max = layer_max_intermediate(m);
-		if (layer_max > max_intermediate)
-			max_intermediate = layer_max;
-	}
-	int ffn_act_size = max_intermediate > m->dim ? max_intermediate : m->dim;
+	compute_layout L;
+	compute_layout_init(m, &L);
 
 	status_code st;
 #define MIRROR_ALLOC(slot, size)                                                                   \
@@ -484,26 +434,26 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 			return st;                                                                             \
 	} while (0)
 
-	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)L.attn_buf_size * sizeof(float));
 	if (m->arch_info->is_hybrid_recurrent) {
 		MIRROR_ALLOC(RECIPE_SLOT_HYB_PROJ, (size_t)model_hybrid_proj_size(m) * sizeof(float));
 		MIRROR_ALLOC(RECIPE_SLOT_HYB_GATE, (size_t)model_hybrid_gate_size(m) * sizeof(float));
 		MIRROR_ALLOC(RECIPE_SLOT_HYB_ALPHA, (size_t)m->hybrid.n_value_heads * sizeof(float));
 		MIRROR_ALLOC(RECIPE_SLOT_HYB_BETA, (size_t)m->hybrid.n_value_heads * sizeof(float));
 	}
-	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)m->n_heads * max_head_dim * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)max_kv_heads * max_head_dim * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)max_kv_heads * max_head_dim * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)max_intermediate * 2 * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)L.attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)L.attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)L.attn_buf_size * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)L.q_out * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)L.kv_out * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)L.kv_out * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)L.max_intermediate * 2 * sizeof(float));
 	s->mirror_slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(
-		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)max_intermediate * sizeof(float));
+		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L.max_intermediate * sizeof(float));
 	s->mirror_slots[RECIPE_SLOT_FFN_UP] = buffer_slice(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP],
-													   (size_t)max_intermediate * sizeof(float),
-													   (size_t)max_intermediate * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)ffn_act_size * sizeof(float));
+													   (size_t)L.max_intermediate * sizeof(float),
+													   (size_t)L.max_intermediate * sizeof(float));
+	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)L.ffn_act_size * sizeof(float));
 	MIRROR_ALLOC(RECIPE_SLOT_LOGITS, (size_t)m->vocab_size * sizeof(float));
 #undef MIRROR_ALLOC
 

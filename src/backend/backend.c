@@ -149,6 +149,17 @@ void backend_destroy(backend *b) {
 	free(b);
 }
 
+status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {
+	if (!a || !a->buffer_alloc_scratch)
+		return ERR_UNSUPPORTED;
+	if (b->owner == a && b->size >= bytes)
+		return OK;
+	if (b->owner)
+		b->owner->buffer_free(b->owner, b);
+	memset(b, 0, sizeof(*b));
+	return a->buffer_alloc_scratch(a, bytes, b);
+}
+
 size_t backend_mem_available(const backend *b) {
 	if (b && b->mem_available)
 		return b->mem_available((backend *)b);

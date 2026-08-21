@@ -1,4 +1,5 @@
 #include "backend/backend.h"
+#include "backend/cpu/scalar/quants.h"
 #include "common.h"
 #include "compute.h"
 #include "kvcache.h"
@@ -12,27 +13,6 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
-
-static float gdn_sigmoid(float x) {
-	if (x >= 0.0f) {
-		float z = expf(-x);
-		return 1.0f / (1.0f + z);
-	}
-	float z = expf(x);
-	return z / (1.0f + z);
-}
-
-static float gdn_silu(float x) {
-	return x * gdn_sigmoid(x);
-}
-
-static float gdn_softplus(float x) {
-	if (x > 20.0f)
-		return x;
-	if (x < -20.0f)
-		return expf(x);
-	return log1pf(expf(x));
-}
 
 static void split_qgate_rows(const float *mixed, float *q, float *gate, int n_heads, int head_dim,
 							 int n_rows) {
@@ -71,16 +51,7 @@ status_code op_split_qgate(exec_ctx *ctx) {
 
 static void partial_rope_one(float *x, int n_heads, int head_dim, int rope_dim, const float *cosv,
 							 const float *sinv) {
-	int half = rope_dim / 2;
-	for (int h = 0; h < n_heads; h++) {
-		float *v = x + (size_t)h * head_dim;
-		for (int j = 0; j < half; j++) {
-			float a		= v[j];
-			float b		= v[j + half];
-			v[j]		= a * cosv[j] - b * sinv[j];
-			v[j + half] = a * sinv[j] + b * cosv[j];
-		}
-	}
+	rope_rotate_neox(x, n_heads, head_dim, rope_dim, cosv, sinv);
 }
 
 status_code op_partial_rope_qk(exec_ctx *ctx) {
@@ -118,7 +89,7 @@ status_code op_attn_output_gate(exec_ctx *ctx) {
 		float		*o = out + (size_t)row * n;
 		const float *g = gate + (size_t)row * n;
 		for (int i = 0; i < n; i++)
-			o[i] *= gdn_sigmoid(g[i]);
+			o[i] *= sigmoidf(g[i]);
 	}
 	return OK;
 }
@@ -138,7 +109,7 @@ static void gdn_conv_tokens(float *conv_out, float *conv_state, const float *mix
 				hist[0]			 = hist[1];
 				hist[1]			 = hist[2];
 				hist[2]			 = mix[c];
-				out[c]			 = gdn_silu(sum);
+				out[c]			 = silu(sum);
 			}
 		}
 		return;
@@ -157,7 +128,7 @@ static void gdn_conv_tokens(float *conv_out, float *conv_state, const float *mix
 					memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
 				hist[history - 1] = mix[c];
 			}
-			out[c] = gdn_silu(sum);
+			out[c] = silu(sum);
 		}
 	}
 }
@@ -280,8 +251,8 @@ static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 			float		 alpha_t = j->alpha[(size_t)t * j->alpha_stride + vh];
 			float		 beta_t	 = j->beta[(size_t)t * j->beta_stride + vh];
 
-			float decay = expf(j->a[vh] * gdn_softplus(alpha_t + j->dt[vh]));
-			float b		= gdn_sigmoid(beta_t);
+			float decay = expf(j->a[vh] * softplusf(alpha_t + j->dt[vh]));
+			float b		= sigmoidf(beta_t);
 #if defined(__AVX2__)
 			float qn = q_scale / sqrtf(j->eps + qwen_dot_f32(q, q, kd));
 			float kn = 1.0f / sqrtf(j->eps + qwen_dot_f32(k, k, kd));
@@ -296,7 +267,7 @@ static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 				qwen_state_update_out(shead + (size_t)d * vd, y, delta, k_s[d], q_s[d], vd);
 			float inv_rms = 1.0f / sqrtf(j->eps + qwen_dot_f32(y, y, vd) / (float)vd);
 			for (int jj = 0; jj < vd; jj++)
-				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * gdn_silu(z_t[jj]);
+				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * silu(z_t[jj]);
 #else
 			float qn = j->eps;
 			float kn = j->eps;
@@ -338,7 +309,7 @@ static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 				mean_sq += y[jj] * y[jj] / (float)vd;
 			float inv_rms = 1.0f / sqrtf(mean_sq);
 			for (int jj = 0; jj < vd; jj++)
-				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * gdn_silu(z_t[jj]);
+				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * silu(z_t[jj]);
 #endif
 		}
 	}
@@ -601,17 +572,7 @@ static model_recipe *build_qwen35_recipe(const model *m) {
 	r->max_intermediate = m->intermediate;
 	r->max_head_dim		= m->head_dim;
 	r->max_kv_heads		= m->n_kv_heads;
-	{
-		r->pre_ops	  = xcalloc(1, sizeof(recipe_op));
-		r->pre_ops[0] = (recipe_op){
-			.kind  = OP_EMBD_LOOKUP,
-			.in	   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_X,
-			.w_idx = WIDX_TOK_EMBD,
-			.stage = STAGE_EMBD,
-		};
-		r->n_pre_ops = 1;
-	}
+	recipe_build_pre_ops(r, m);
 
 	r->layer.ops	 = xcalloc(QWEN35_MAX_OPS_PER_LAYER, sizeof(recipe_op));
 	r->layer.n_ops	 = QWEN35_MAX_OPS_PER_LAYER;

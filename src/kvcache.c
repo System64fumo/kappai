@@ -247,6 +247,21 @@ static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats) {
 	return OK;
 }
 
+static void kv_host_pair_bufs(kvcache *c, int k_floats, buffer *k_out, buffer *v_out) {
+	memset(k_out, 0, sizeof(*k_out));
+	memset(v_out, 0, sizeof(*v_out));
+	k_out->handle	= c->kv_transfer_buf;
+	k_out->host_ptr = c->kv_transfer_buf;
+	k_out->size		= (size_t)k_floats * sizeof(float);
+	k_out->offset	= 0;
+	k_out->owner	= backend_host();
+	v_out->handle	= (char *)c->kv_transfer_buf + (size_t)k_floats * sizeof(float);
+	v_out->host_ptr = v_out->handle;
+	v_out->size		= (size_t)k_floats * sizeof(float);
+	v_out->offset	= 0;
+	v_out->owner	= backend_host();
+}
+
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in) {
 	if (pos < 0 || pos >= c->n_ctx)
@@ -274,17 +289,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 		status_code st		 = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
 		if (st != OK)
 			return st;
-		buffer k_host_buf = {0}, v_host_buf = {0};
-		k_host_buf.handle	= c->kv_transfer_buf;
-		k_host_buf.host_ptr = c->kv_transfer_buf;
-		k_host_buf.size		= (size_t)k_floats * sizeof(float);
-		k_host_buf.offset	= 0;
-		k_host_buf.owner	= backend_host();
-		v_host_buf.handle	= (char *)c->kv_transfer_buf + (size_t)k_floats * sizeof(float);
-		v_host_buf.host_ptr = v_host_buf.handle;
-		v_host_buf.size		= (size_t)k_floats * sizeof(float);
-		v_host_buf.offset	= 0;
-		v_host_buf.owner	= backend_host();
+		buffer k_host_buf, v_host_buf;
+		kv_host_pair_bufs(c, k_floats, &k_host_buf, &v_host_buf);
 
 		if (k_in_owner && k_in_owner->buffer_read_f32) {
 			st = k_in_owner->buffer_read_f32(k_in_owner, k_in, c->kv_transfer_buf, k_floats);
@@ -321,17 +327,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 			status_code ts		 = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
 			if (ts != OK)
 				return ts;
-			buffer k_host_buf = {0}, v_host_buf = {0};
-			k_host_buf.handle	= c->kv_transfer_buf;
-			k_host_buf.host_ptr = c->kv_transfer_buf;
-			k_host_buf.size		= (size_t)k_floats * sizeof(float);
-			k_host_buf.offset	= 0;
-			k_host_buf.owner	= backend_host();
-			v_host_buf.handle	= (char *)c->kv_transfer_buf + (size_t)k_floats * sizeof(float);
-			v_host_buf.host_ptr = v_host_buf.handle;
-			v_host_buf.size		= (size_t)k_floats * sizeof(float);
-			v_host_buf.offset	= 0;
-			v_host_buf.owner	= backend_host();
+			buffer k_host_buf, v_host_buf;
+			kv_host_pair_bufs(c, k_floats, &k_host_buf, &v_host_buf);
 			if (kv_backend->buffer_read_f32) {
 				ts = kv_backend->buffer_read_f32(kv_backend, k_in, c->kv_transfer_buf, k_floats);
 				if (ts != OK)
