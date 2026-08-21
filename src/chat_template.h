@@ -28,11 +28,18 @@ typedef struct {
 	bool		think_open;
 
 	char *last_render;
+
+	char	 *static_prefix;
+	int32_t	 *static_prefix_ids;
+	int		  n_static_prefix_ids;
 } chat_template_state;
 
 status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, const tokenizer *tok);
 void		chat_template_free(chat_template_state *cts);
 void		chat_template_clear_messages(chat_template_state *cts);
+
+status_code chat_template_warmup(chat_template_state *cts, const tokenizer *tok,
+								 const char *system);
 
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
 								   int add_generation_prompt, char **out, char *errbuf,

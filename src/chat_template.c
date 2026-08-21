@@ -91,6 +91,8 @@ void chat_template_free(chat_template_state *cts) {
 	free(cts->last_render);
 	free(cts->bos_token);
 	free(cts->eos_token);
+	free(cts->static_prefix);
+	free(cts->static_prefix_ids);
 	jinja_program_free(cts->prog);
 	memset(cts, 0, sizeof(*cts));
 }
@@ -180,6 +182,75 @@ out:
 	free(r1);
 	free(r2);
 	return prefix_len;
+}
+
+status_code chat_template_warmup(chat_template_state *cts, const tokenizer *tok,
+								 const char *system) {
+	if (!cts || !cts->prog || !tok)
+		return ERR_INVALID_ARG;
+
+	size_t prefix_bytes = chat_template_detect_static_prefix(cts, system);
+	if (prefix_bytes == 0)
+		return OK;
+
+	const char	*sys	 = (system && *system) ? system : "";
+	chat_message sys_msg = {.role = (char *)"system", .content = (char *)sys};
+
+	char *render = NULL;
+	jinja_set_time_shift(0);
+	jinja_value *g  = build_globals(cts, &sys_msg, 1, 0);
+	status_code	 rc = jinja_render(cts->prog, g, &render, NULL, 0);
+	jinja_value_free(g);
+	jinja_set_time_shift(0);
+	if (rc != OK)
+		return ERR_FORMAT;
+
+	size_t render_len = strlen(render);
+	if (prefix_bytes > render_len)
+		prefix_bytes = render_len;
+
+	int		 cap = (int)render_len + 1;
+	int32_t *ids = xmalloc((size_t)cap * sizeof(int32_t));
+	int		 n   = tokenizer_encode_with_specials((tokenizer *)tok, render, 0, ids, cap, NULL);
+	if (n < 0) {
+		free(ids);
+		free(render);
+		return ERR_FORMAT;
+	}
+
+	int count = tokenizer_token_count_for_bytes(tok, ids, n, prefix_bytes);
+
+	char *prefix = xmalloc(prefix_bytes + 1);
+	memcpy(prefix, render, prefix_bytes);
+	prefix[prefix_bytes] = '\0';
+	free(render);
+
+	if (count == 0) {
+		free(ids);
+		free(prefix);
+		return OK;
+	}
+
+	free(cts->static_prefix);
+	free(cts->static_prefix_ids);
+	cts->static_prefix		 = prefix;
+	cts->static_prefix_ids	 = ids;
+	cts->n_static_prefix_ids = count;
+
+	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
+	cts->messages[cts->n_messages].role	   = xstrdup("system");
+	cts->messages[cts->n_messages].content = xstrdup(sys);
+	cts->n_messages++;
+
+	char *decoded = tokenizer_decode_prefix(tok, ids, count);
+	if (decoded) {
+		free(cts->last_render);
+		cts->last_render = decoded;
+	}
+
+	DEBUG("chat_template warmup: pre-cached %zu bytes / %d tokens before variable tags",
+		  prefix_bytes, count);
+	return OK;
 }
 
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
