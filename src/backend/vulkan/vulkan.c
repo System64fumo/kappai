@@ -2004,7 +2004,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->p_attention.name = "attention";
 	p->flash_count = 0;
 	memset(p->p_attention_flash, 0, sizeof(p->p_attention_flash));
-	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 24,
+	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 32,
 												 &p->p_kv_put);
 	if (s != OK)
 		return s;
@@ -2778,12 +2778,41 @@ static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer,
 
 	struct {
 		uint32_t layer_off;
-		int32_t pos, n_kv_heads, head_dim, n_ctx, stride_head_dim;
+		int32_t pos_start, n_kv_heads, head_dim, n_ctx, stride_head_dim;
+		int32_t in_row_stride, m_tokens;
 	} push = {(uint32_t)vk_kv_layer_off_elems(kh, layer), pos, n_kv_heads, head_dim, n_ctx,
-						head_dim};
+						head_dim, n_kv_heads * head_dim, 1};
 	vk_buf *bufs[4] = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
 	int total_pairs = n_active * (head_dim / 2);
 	uint32_t groups = (uint32_t)((total_pairs + 127) / 128);
+	return vk_dispatch_masked(p, &p->p_kv_put, bufs, 4, &push, sizeof(push),
+														groups, 0x3);
+}
+
+static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								   const buffer *k_in, const buffer *v_in, int in_row_stride,
+								   int n_kv_heads, int head_dim, int n_ctx,
+								   int n_kv_heads_active, int m) {
+	vk_priv *p = self->priv;
+	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+
+	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
+	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
+	int shader_layer_k;
+	int shader_layer_v;
+	vk_buf *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
+	vk_buf *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
+
+	struct {
+		uint32_t layer_off;
+		int32_t pos_start, n_kv_heads, head_dim, n_ctx, stride_head_dim;
+		int32_t in_row_stride, m_tokens;
+	} push = {(uint32_t)vk_kv_layer_off_elems(kh, layer), pos_start, n_kv_heads, head_dim, n_ctx,
+			  head_dim, in_row_stride > 0 ? in_row_stride : n_kv_heads * head_dim, m};
+	vk_buf *bufs[4] = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
+	int total_pairs = n_active * (head_dim / 2);
+	uint64_t total = (uint64_t)total_pairs * (uint64_t)m;
+	uint32_t groups = (uint32_t)((total + 127) / 128);
 	return vk_dispatch_masked(p, &p->p_kv_put, bufs, 4, &push, sizeof(push),
 														groups, 0x3);
 }
@@ -4539,6 +4568,7 @@ static status_code vk_ctor(backend *out) {
 	out->kv_alloc = vk_kv_alloc;
 	out->kv_free = vk_kv_free;
 	out->kv_put = vk_kv_put;
+	out->kv_put_batch = vk_kv_put_batch;
 	out->embd_lookup = vk_embd_lookup;
 	out->rmsnorm = vk_rmsnorm;
 	out->matmul = vk_matmul;

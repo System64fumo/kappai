@@ -11,6 +11,7 @@ typedef struct config {
 	const char *moe_pin_list;
 	const char *monitor;
 	const char *repack;
+	const char *fuse;
 	uint64_t	seed;
 
 	int n_threads;

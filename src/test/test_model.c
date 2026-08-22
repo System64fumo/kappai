@@ -2,6 +2,166 @@
 
 static const int g_model_flash = 1;
 
+static int32_t tok_test_hash_lookup(const struct tok_hash_entry *ht, size_t cap, const char *key,
+									size_t klen) {
+	uint64_t h = fnv1a(key, klen) & (cap - 1);
+	while (ht[h].used) {
+		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0)
+			return ht[h].id;
+		h = (h + 1) & (cap - 1);
+	}
+	return -1;
+}
+
+typedef struct {
+	const char *p;
+	size_t		n;
+	int32_t		id;
+} tok_ref_piece;
+
+static int32_t tok_ref_pair_rank(const tokenizer *t, const tok_ref_piece *a, const tok_ref_piece *b,
+								 char *key) {
+	size_t klen = a->n + b->n;
+	memcpy(key, a->p, a->n);
+	memcpy(key + a->n, b->p, b->n);
+	if (t->has_merges)
+		return tok_test_hash_lookup(t->merge_hash, t->merge_hash_capacity, key, klen);
+	return tok_test_hash_lookup(t->hash, t->hash_capacity, key, klen);
+}
+
+static void tok_ref_bpe(const tokenizer *t, const char *text, size_t len, int32_t *out_ids,
+						int *n_out) {
+	tok_ref_piece *pcs	= xmalloc((len + 1) * sizeof(tok_ref_piece));
+	int			   npcs = 0;
+	size_t		   ci	= 0;
+	while (ci < len) {
+		unsigned char c	 = (unsigned char)text[ci];
+		size_t		  cl = 1;
+		if (c >= 0xF0)
+			cl = 4;
+		else if (c >= 0xE0)
+			cl = 3;
+		else if (c >= 0xC0)
+			cl = 2;
+		if (ci + cl > len)
+			cl = 1;
+		int32_t id = tok_test_hash_lookup(t->hash, t->hash_capacity, text + ci, cl);
+		if (id < 0)
+			id = (t->unk_id >= 0) ? t->unk_id : 0;
+		pcs[npcs].p	 = text + ci;
+		pcs[npcs].n	 = cl;
+		pcs[npcs].id = id;
+		npcs++;
+		ci += cl;
+	}
+
+	char  *key		  = xmalloc(len * 2 + 4);
+	char  *arena	  = xmalloc(len + 1);
+	size_t arena_used = 0;
+
+	while (npcs > 1) {
+		int		best_i	  = -1;
+		int32_t best_rank = INT32_MAX;
+		size_t	best_klen = 0;
+		for (int i = 0; i < npcs - 1; i++) {
+			int32_t rank = tok_ref_pair_rank(t, &pcs[i], &pcs[i + 1], key);
+			if (rank < 0 || rank >= best_rank)
+				continue;
+			best_rank = rank;
+			best_i	  = i;
+			best_klen = pcs[i].n + pcs[i + 1].n;
+		}
+		if (best_i < 0)
+			break;
+		char *merged = arena + arena_used;
+		memcpy(merged, pcs[best_i].p, pcs[best_i].n);
+		memcpy(merged + pcs[best_i].n, pcs[best_i + 1].p, pcs[best_i + 1].n);
+		arena_used += best_klen;
+		pcs[best_i].p  = merged;
+		pcs[best_i].n  = best_klen;
+		int32_t mid	   = tok_test_hash_lookup(t->hash, t->hash_capacity, merged, best_klen);
+		pcs[best_i].id = (mid >= 0) ? mid : ((t->unk_id >= 0) ? t->unk_id : 0);
+		for (int i = best_i + 1; i < npcs - 1; i++)
+			pcs[i] = pcs[i + 1];
+		npcs--;
+	}
+
+	*n_out = npcs;
+	for (int i = 0; i < npcs; i++)
+		out_ids[i] = pcs[i].id;
+	free(pcs);
+	free(key);
+	free(arena);
+}
+
+static uint64_t tok_rng_state = 0x12345678ULL;
+
+static uint64_t tok_rng_next(void) {
+	tok_rng_state ^= tok_rng_state << 13;
+	tok_rng_state ^= tok_rng_state >> 7;
+	tok_rng_state ^= tok_rng_state << 17;
+	return tok_rng_state;
+}
+
+static void run_tokenizer_bpe_differential(const tokenizer *t) {
+	const int			n_lens	= 6;
+	static const size_t lens[]	= {1, 2, 7, 33, 129, 511};
+	int32_t			   *ids_new = xmalloc((lens[n_lens - 1] + 16) * sizeof(int32_t));
+	int32_t			   *ids_ref = xmalloc((lens[n_lens - 1] + 16) * sizeof(int32_t));
+	char			   *text	= xmalloc(lens[n_lens - 1] + 1);
+
+	int mismatches = 0;
+	int trials	   = 0;
+	for (int trial = 0; trial < 256; trial++) {
+		size_t			  len		 = lens[trial % n_lens];
+		static const char alphabet[] = " the quick brown fox  \xe2\x96\x81"
+									   "abcdef";
+		for (size_t i = 0; i < len; i++)
+			text[i] = alphabet[tok_rng_next() % (sizeof(alphabet) - 1)];
+		len = strnlen(text, len);
+		if (len == 0)
+			continue;
+		trials++;
+		int n_new = 0, n_ref = 0;
+		tokenizer_bpe_encode((tokenizer *)t, text, len, ids_new, (int)(len + 8), &n_new);
+		tok_ref_bpe(t, text, len, ids_ref, &n_ref);
+		if (n_new != n_ref || memcmp(ids_new, ids_ref, (size_t)n_new * sizeof(int32_t)) != 0) {
+			mismatches++;
+			if (mismatches <= 3)
+				fprintf(stderr, "BPE mismatch trial=%d len=%zu n_new=%d n_ref=%d\n", trial, len,
+						n_new, n_ref);
+		}
+	}
+
+	record_result(OPFAM_ARCH_PIPELINE, "tokenizer.bpe_differential",
+				  mismatches == 0 ? V_PASS : V_FAIL,
+				  mismatches == 0 ? "heap BPE matches reference merge order"
+								  : "BPE output diverges from reference");
+	free(ids_new);
+	free(ids_ref);
+	free(text);
+}
+
+static void run_tokenizer_roundtrip(tokenizer *t) {
+	static const char *texts[] = {
+		"Hello world!",
+		"The quick brown fox jumps over the lazy dog.",
+		"def fibonacci(n):\n    if n < 2:\n        return n\n    return "
+		"fibonacci(n-1)+fibonacci(n-2)\n",
+		"\xe2\x96\x81unicode \xc3\xa9\xc3\xa8 mix \xe2\x82\xac end",
+	};
+	int n_texts = (int)(sizeof(texts) / sizeof(texts[0]));
+	for (int ti = 0; ti < n_texts; ti++) {
+		const char *txt = texts[ti];
+		int32_t		ids1[512], ids2[512];
+		int			n1 = tokenizer_encode_with_specials(t, txt, 0, ids1, 512, NULL);
+		int			n2 = tokenizer_encode_with_specials(t, txt, 0, ids2, 512, NULL);
+		int ok = (n1 == n2 && n1 > 0 && memcmp(ids1, ids2, (size_t)n1 * sizeof(int32_t)) == 0);
+		record_result(OPFAM_ARCH_PIPELINE, "tokenizer.encode_deterministic", ok ? V_PASS : V_FAIL,
+					  ok ? "repeated encode identical" : "encode not stable");
+	}
+}
+
 static void run_model_cross(const char *path, backend *cpu, backend *tgt, int n_prefill,
 							int n_decode) {
 	printf("\n========================================\n");
@@ -25,6 +185,13 @@ static void run_model_cross(const char *path, backend *cpu, backend *tgt, int n_
 	gguf_ctx  gctx	   = {0};
 	tokenizer tok	   = {0};
 	int		  have_tok = (gguf_load(&gctx, path) == OK) && (tokenizer_init(&tok, &gctx) == OK);
+	if (have_tok) {
+		tok_rng_state = 0x12345678ULL;
+		run_tokenizer_bpe_differential(&tok);
+		flush_family(OPFAM_ARCH_PIPELINE);
+		run_tokenizer_roundtrip(&tok);
+		flush_family(OPFAM_ARCH_PIPELINE);
+	}
 
 	int32_t prompt_buf[64];
 	int		n_prompt;

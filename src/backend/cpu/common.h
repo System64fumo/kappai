@@ -127,6 +127,14 @@ static inline void cpu_kv_put_q8_0_head(uint8_t *kd, uint8_t *vd, const float *k
 	}
 }
 
+static inline void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *kfh,
+									   const float *vfh, int head_dim) {
+	for (int i = 0; i < head_dim; i++) {
+		kd[i] = f32_to_f16(kfh[i]);
+		vd[i] = f32_to_f16(vfh[i]);
+	}
+}
+
 typedef struct {
 	const uint16_t *kl_base, *vl_base;
 	const float	   *qf;

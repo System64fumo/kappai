@@ -382,14 +382,6 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 	return OK;
 }
 
-static void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *kfh, const float *vfh,
-								int head_dim) {
-	for (int i = 0; i < head_dim; i++) {
-		kd[i] = f32_to_f16(kfh[i]);
-		vd[i] = f32_to_f16(vfh[i]);
-	}
-}
-
 __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer,
 											 int pos, const buffer *k_in, const buffer *v_in,
 											 int n_kv_heads, int head_dim, int n_ctx,
@@ -425,6 +417,89 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 		cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 							vf + ((size_t)kvh * head_dim), head_dim);
 	}
+	return OK;
+}
+
+typedef struct {
+	cpu_priv	*p;
+	buffer		*k, *v;
+	int			 layer;
+	int			 pos_start;
+	const float *kf_base;
+	const float *vf_base;
+	int			 in_row_stride;
+	int			 n_kv_heads;
+	int			 head_dim;
+	int			 n_ctx;
+	int			 n_active;
+} cpu_kv_put_batch_job;
+
+static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_kv_put_batch_job *j		   = ctx;
+	cpu_priv			 *p		   = j->p;
+	int					  n_active = j->n_active > 0 ? j->n_active : j->n_kv_heads;
+
+	for (int idx = begin; idx < end; idx++) {
+		int	   row = idx / n_active;
+		int	   kvh = idx % n_active;
+		size_t layer_base =
+			p->kv_layer_off
+				? p->kv_layer_off[j->layer]
+				: ((size_t)j->layer * (size_t)j->n_kv_heads * j->n_ctx *
+				   ((p->kv_quant == KV_QUANT_Q8_0) ? (((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) /
+													  KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
+												   : ((size_t)j->head_dim * sizeof(uint16_t))));
+		const float *kf = j->kf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		const float *vf = j->vf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		if (p->kv_quant == KV_QUANT_Q8_0) {
+			size_t n_blocks	  = ((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+			size_t blk_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
+			size_t kvh_stride = (size_t)j->n_ctx * blk_stride;
+			size_t off =
+				layer_base + (size_t)kvh * kvh_stride + (size_t)(j->pos_start + row) * blk_stride;
+			cpu_kv_put_q8_0_head((uint8_t *)j->k->handle + off, (uint8_t *)j->v->handle + off, kf,
+								 vf, j->head_dim);
+		} else {
+			size_t	  hd_stride	 = (size_t)j->head_dim;
+			size_t	  kvh_stride = (size_t)j->n_ctx * hd_stride;
+			uint16_t *kd_base	 = (uint16_t *)cpu_ptr(j->k);
+			uint16_t *vd_base	 = (uint16_t *)cpu_ptr(j->v);
+			size_t	  off		 = (layer_base / sizeof(uint16_t)) + (size_t)kvh * kvh_stride +
+								   (size_t)(j->pos_start + row) * hd_stride;
+			cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf, vf, j->head_dim);
+		}
+	}
+}
+
+static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+									const buffer *k_in, const buffer *v_in, int in_row_stride,
+									int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+									int m) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int		  total	   = m * n_active;
+	if (total <= 0)
+		return OK;
+
+	cpu_kv_put_batch_job job = {.p			   = p,
+								.k			   = k,
+								.v			   = v,
+								.layer		   = layer,
+								.pos_start	   = pos_start,
+								.kf_base	   = (const float *)cpu_ptr(k_in),
+								.vf_base	   = (const float *)cpu_ptr(v_in),
+								.in_row_stride = in_row_stride,
+								.n_kv_heads	   = n_kv_heads,
+								.head_dim	   = head_dim,
+								.n_ctx		   = n_ctx,
+								.n_active	   = n_active};
+
+	if (p->pool && tpool_current_tid() < 0 && total >= 2) {
+		tpool_parallel_for(p->pool, total, 1, cpu_kv_put_batch_chunk, &job);
+		return OK;
+	}
+	cpu_kv_put_batch_chunk(0, total, -1, &job);
 	return OK;
 }
 
@@ -955,33 +1030,18 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 	if (n_matmuls > CPU_MATMUL_MULTI_MAX)
 		return ERR_INVALID_ARG;
 
-	for (int i = 0; i < n_matmuls; i++) {
-		if (grouped_matmul_kernel_lookup(w_types[i])) {
-			for (int ii = 0; ii < n_matmuls; ii++) {
-				status_code st =
-					cpu_matmul_batch(self, w[ii], w_types[ii], x, y[ii], n_list[ii], k, m);
-				if (st != OK)
-					return st;
-			}
-			return OK;
-		}
-	}
-
 	quant_scratch *local_scratch  = p->matmul_multi_scratch;
 	void		  *xq_by_class[4] = {NULL, NULL, NULL, NULL};
 
 	cpu_matmul_multi_job mj = {.n_matmuls = n_matmuls};
 	mj.row_offset[0]		= 0;
+	int has_grouped			= 0;
 	for (int i = 0; i < n_matmuls; i++) {
-		mj.row_offset[i + 1] = mj.row_offset[i] + n_list[i];
-
 		cpu_matmul_job *j = &mj.jobs[i];
 		j->W			  = cpu_ptr(w[i]);
 		j->w_type		  = w_types[i];
 		j->y			  = cpu_ptr(y[i]);
 		j->k			  = k;
-		j->n			  = n_list[i];
-		j->m			  = m;
 		j->xf			  = xf;
 
 		cpu_matmul_job_prepare_kernel(j);
@@ -995,15 +1055,22 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 			j->xq					= xq_by_class[q8_class];
 			j->xq_row_stride		= cpu_matmul_xq_row_stride(q8_class, k);
 			j->xq_row_stride_blocks = j->xq_row_stride / cpu_matmul_q8_block_size(q8_class);
-		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16) {
-			for (int ii = 0; ii < n_matmuls; ii++)
-				for (int row = 0; row < m; row++)
-					cpu_matmul_one(cpu_ptr(w[ii]), w_types[ii], xf + ((size_t)row * k),
-								   cpu_ptr(y[ii]) + ((size_t)row * n_list[ii]), n_list[ii], k,
-								   &p->qscratch);
-			return OK;
+		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16 &&
+				   w_types[i] != GGML_TYPE_F16) {
+			for (int row = 0; row < m; row++)
+				cpu_matmul_one(j->W, w_types[i], xf + ((size_t)row * k),
+							   cpu_ptr(y[i]) + ((size_t)row * n_list[i]), n_list[i], k,
+							   &p->qscratch);
+			j->n				 = 0;
+			mj.row_offset[i + 1] = mj.row_offset[i];
+			continue;
 		}
-		j->row_stride = cpu_matmul_w_row_stride(w_types[i], k);
+		j->n				 = n_list[i];
+		j->m				 = m;
+		mj.row_offset[i + 1] = mj.row_offset[i] + n_list[i];
+		j->row_stride		 = cpu_matmul_w_row_stride(w_types[i], k);
+		if (grouped_matmul_kernel_lookup(w_types[i]))
+			has_grouped = 1;
 	}
 
 	int cur_tid		= tpool_current_tid();
@@ -1012,13 +1079,62 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 
 	if (!can_recurse || !p->pool ||
 		(size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
-		for (int i = 0; i < n_matmuls; i++)
-			cpu_matmul_rows_worker(0, n_list[i], -1, &mj.jobs[i]);
+		for (int i = 0; i < n_matmuls; i++) {
+			cpu_matmul_job *j = &mj.jobs[i];
+			if (j->n == 0)
+				continue;
+			cpu_matmul_rows_worker(0, j->n, -1, j);
+		}
+		return OK;
+	}
+
+	if (has_grouped) {
+		int all_grouped = 1;
+		int gr			= 0;
+		for (int i = 0; i < n_matmuls; i++) {
+			const grouped_matmul_kernel *gk = grouped_matmul_kernel_lookup(w_types[i]);
+			if (!gk) {
+				all_grouped = 0;
+				break;
+			}
+			if (gr == 0)
+				gr = gk->group_rows;
+			else if (gk->group_rows != gr) {
+				all_grouped = 0;
+				break;
+			}
+		}
+
+		if (all_grouped && gr > 0) {
+			mj.group_rows	   = gr;
+			mj.group_offset[0] = 0;
+			int total_groups   = 0;
+			for (int i = 0; i < n_matmuls; i++) {
+				int n_groups_i = n_list[i] / gr;
+				total_groups += n_groups_i;
+				mj.group_offset[i + 1] = total_groups;
+				mj.jobs[i].group_rows  = gr;
+			}
+			int min_groups_per_thr = CPU_MATMUL_MIN_ROWS_PER_THREAD / gr;
+			if (min_groups_per_thr < 1)
+				min_groups_per_thr = 1;
+			tpool_parallel_for(p->pool, total_groups, min_groups_per_thr,
+							   cpu_matmul_multi_groups_worker, &mj);
+			return OK;
+		}
+
+		for (int i = 0; i < n_matmuls; i++) {
+			cpu_matmul_job *j = &mj.jobs[i];
+			if (j->n == 0)
+				continue;
+			cpu_matmul_dispatch_rows(p->pool, w_types[i], n_list[i], j, cpu_matmul_rows_worker);
+		}
 		return OK;
 	}
 
 	tpool_parallel_for(p->pool, total_rows, CPU_MATMUL_MIN_ROWS_PER_THREAD, cpu_matmul_multi_worker,
 					   &mj);
+
 	return OK;
 }
 
@@ -1056,7 +1172,8 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 		return OK;
 	}
 
-	cpu_matmul_job *job = xmalloc(sizeof(*job));
+	cpu_matmul_job	job_storage;
+	cpu_matmul_job *job = &job_storage;
 	memset(job, 0, sizeof(*job));
 	job->W		= W;
 	job->w_type = w_type;
@@ -1078,13 +1195,11 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 		for (int i = 0; i < m; i++)
 			cpu_matmul_one(W, w_type, xf + ((size_t)i * k), yf + ((size_t)i * n), n, k,
 						   &p->qscratch);
-		free(job);
 		return OK;
 	}
 	job->row_stride = cpu_matmul_w_row_stride(w_type, k);
 
 	cpu_matmul_dispatch_rows(p->pool, w_type, n, job, cpu_matmul_rows_worker);
-	free(job);
 	return OK;
 }
 
@@ -2409,6 +2524,7 @@ static status_code cpu_ctor(backend *out) {
 	out->buffer_write_f32		   = cpu_buffer_write_f32;
 	out->kv_alloc				   = cpu_kv_alloc;
 	out->kv_put					   = cpu_kv_put;
+	out->kv_put_batch			   = cpu_kv_put_batch;
 	out->embd_lookup			   = cpu_embd_lookup;
 	out->rmsnorm				   = cpu_rmsnorm;
 	out->matmul					   = cpu_matmul;

@@ -402,8 +402,6 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 		usable = 1;
 	if (usable > n_threads)
 		usable = n_threads;
-	if (usable < n_threads && n_items >= n_threads)
-		usable = n_threads;
 
 	if (usable <= 1 || !pool) {
 		fn(0, n_items, 0, ctx);

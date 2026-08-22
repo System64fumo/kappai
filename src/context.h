@@ -37,6 +37,15 @@ typedef struct {
 		pthread_t thread;
 		bool	  active;
 	} idle;
+
+	struct {
+		int32_t *p;
+		int		 cap;
+	} ids_buf;
+	struct {
+		int32_t *p;
+		int		 cap;
+	} idle_ids_buf;
 } context;
 
 typedef struct {
@@ -70,5 +79,7 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 
 void context_idle_prefill_start(context *c);
 void context_idle_prefill_wait(context *c);
+
+int32_t *context_ids_scratch(context *c, int n);
 
 #endif

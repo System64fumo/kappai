@@ -19,9 +19,6 @@
 
 #define REPACK_MIN_ROWS_PER_THREAD 8
 
-#define PREFETCH_MAX_THREADS 64
-#define PREFETCH_CHUNK_MIN ((size_t)4u * 1024 * 1024)
-
 static void madvise_dontneed(const void *map_base, size_t map_size, const void *ptr, size_t bytes) {
 	if (!map_base || map_size == 0)
 		return;
@@ -44,12 +41,6 @@ typedef struct {
 	int			rows_per_group;
 	void (*repack_fn)(const void *src, void *dst, int begin, int end, int k);
 } repack_job;
-
-typedef struct {
-	int	   fd;
-	off_t  offset;
-	size_t len;
-} prefetch_range;
 
 static status_code akey_i32(const gguf_ctx *g, const char *prefix, const char *suffix,
 							int32_t *out) {
@@ -618,6 +609,40 @@ static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w,
 	return buf;
 }
 
+static void *build_fused_qkv(model *m, const layer_weights *L, int has_kv, int has_own_v,
+							 uint32_t type, uint64_t dim, uint64_t q_rows, uint64_t kv_rows,
+							 uint64_t *total_rows_out) {
+	if (!has_kv || !L->wk.host_ptr)
+		return NULL;
+	if (has_own_v && !L->wv.host_ptr)
+		return NULL;
+	size_t	 row_stride = ggml_row_size(type, dim);
+	size_t	 q_bytes	= row_stride * q_rows;
+	size_t	 kv_bytes	= row_stride * kv_rows;
+	size_t	 total		= q_bytes + (has_kv ? kv_bytes : 0) + (has_own_v && has_kv ? kv_bytes : 0);
+	uint8_t *buf		= xmalloc(total);
+	memcpy(buf, L->wq.host_ptr, q_bytes);
+	size_t off = q_bytes;
+	if (has_kv) {
+		memcpy(buf + off, L->wk.host_ptr, kv_bytes);
+		off += kv_bytes;
+	}
+	if (has_own_v && has_kv) {
+		memcpy(buf + off, L->wv.host_ptr, kv_bytes);
+		off += kv_bytes;
+	}
+	*total_rows_out = off / row_stride;
+
+	if (m->use_mmap && m->gctx.map && m->gctx.map_size > 0) {
+		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wq.host_ptr, q_bytes);
+		if (has_kv)
+			madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wk.host_ptr, kv_bytes);
+		if (has_own_v && has_kv)
+			madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wv.host_ptr, kv_bytes);
+	}
+	return buf;
+}
+
 static status_code upload_one(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
 							  uint64_t d1, weight_class wc) {
 	ref->type = wtype;
@@ -753,16 +778,59 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		memset(&L->wk.buf, 0, sizeof(L->wk.buf));
 		memset(&L->wv.buf, 0, sizeof(L->wv.buf));
 	} else {
-		UPLOAD_REP(&L->wq, 2, m->dim, q_weight_out, WCLASS_MATMUL);
-		if (model_layer_has_kv(m, i)) {
-			UPLOAD_REP(&L->wk, 2, m->dim, kv_out, WCLASS_MATMUL);
-		} else {
-			memset(&L->wk.buf, 0, sizeof(L->wk.buf));
+		int fuse_qkv	 = m->fuse_config && strstr(m->fuse_config, "qkv") != NULL &&
+						   !m->arch_info->has_variable_layer_dims;
+		int did_qkv_fuse = 0;
+		if (fuse_qkv && L->wq.host_ptr && L->wq.type == L->wk.type &&
+			(!L->has_own_v || L->wq.type == L->wv.type)) {
+			uint64_t fused_rows = 0;
+			void *fused = build_fused_qkv(m, L, model_layer_has_kv(m, i), L->has_own_v, L->wq.type,
+										  (uint64_t)m->dim, (uint64_t)q_weight_out,
+										  (uint64_t)kv_out, &fused_rows);
+			if (fused) {
+				uint32_t fused_type = L->wq.type;
+				s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim, fused_rows,
+											WCLASS_MATMUL, layer_be, &L->qkv_w.buf);
+				if (s == OK) {
+					size_t row_bytes = ggml_row_size(fused_type, m->dim);
+					L->wq.type		 = fused_type;
+					L->wk.type		 = fused_type;
+					if (L->has_own_v)
+						L->wv.type = fused_type;
+					L->wq.buf = L->qkv_w.buf;
+					L->wk.buf = buffer_slice(&L->qkv_w.buf, (size_t)q_weight_out * row_bytes,
+											 (size_t)kv_out * row_bytes);
+					if (L->has_own_v)
+						L->wv.buf = buffer_slice(
+							&L->qkv_w.buf, ((size_t)q_weight_out + (size_t)kv_out) * row_bytes,
+							(size_t)kv_out * row_bytes);
+					if (L->qkv_w.buf.host_ptr == fused) {
+						L->qkv_fused_host = fused;
+					} else {
+						free(fused);
+						L->qkv_fused_host = NULL;
+					}
+					L->qkv_fused = 1;
+					did_qkv_fuse = 1;
+					m->qkv_fused_layers++;
+				} else {
+					free(fused);
+					return s;
+				}
+			}
 		}
-		if (L->has_own_v) {
-			UPLOAD_REP(&L->wv, 2, m->dim, kv_out, WCLASS_MATMUL);
-		} else {
-			memset(&L->wv.buf, 0, sizeof(L->wv.buf));
+		if (!did_qkv_fuse) {
+			UPLOAD_REP(&L->wq, 2, m->dim, q_weight_out, WCLASS_MATMUL);
+			if (model_layer_has_kv(m, i)) {
+				UPLOAD_REP(&L->wk, 2, m->dim, kv_out, WCLASS_MATMUL);
+			} else {
+				memset(&L->wk.buf, 0, sizeof(L->wk.buf));
+			}
+			if (L->has_own_v) {
+				UPLOAD_REP(&L->wv, 2, m->dim, kv_out, WCLASS_MATMUL);
+			} else {
+				memset(&L->wv.buf, 0, sizeof(L->wv.buf));
+			}
 		}
 		UPLOAD_REP(&L->wo, 2, q_out, m->dim, WCLASS_MATMUL);
 	}
@@ -785,8 +853,13 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		UPLOAD(&L->ple_post_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 		int gate_owned = 0;
 		if (L->ple_inp_gate_w.type != GGML_TYPE_F32) {
+			const void *orig = L->ple_inp_gate_w.host_ptr;
+			size_t		orig_bytes =
+				ggml_row_size(L->ple_inp_gate_w.type, (size_t)m->layer_dims.n_embd_per_layer) *
+				(size_t)m->dim;
 			dequant_weight_to_f32(&L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
 								  (size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
+			release_original_weight_data(m, orig, orig_bytes);
 			gate_owned = 1;
 		}
 		UPLOAD(&L->ple_inp_gate_w, L->ple_inp_gate_w.type, 2, m->dim,
@@ -795,8 +868,12 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 			L->ple_inp_gate_w.buf.host_ptr = NULL;
 		int proj_owned = 0;
 		if (L->ple_proj_w.type != GGML_TYPE_F32) {
+			const void *orig	   = L->ple_proj_w.host_ptr;
+			size_t		orig_bytes = ggml_row_size(L->ple_proj_w.type, (size_t)m->dim) *
+									 (size_t)m->layer_dims.n_embd_per_layer;
 			dequant_weight_to_f32(&L->ple_proj_w.host_ptr, &L->ple_proj_w.type, (size_t)m->dim,
 								  (size_t)m->layer_dims.n_embd_per_layer);
+			release_original_weight_data(m, orig, orig_bytes);
 			proj_owned = 1;
 		}
 		UPLOAD(&L->ple_proj_w, L->ple_proj_w.type, 2, m->layer_dims.n_embd_per_layer, m->dim,
@@ -812,6 +889,9 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 	L->gate_up_fused	  = 0;
 	L->gate_up_fused_host = NULL;
+	L->qkv_fused		  = 0;
+	L->qkv_fused_host	  = NULL;
+	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 	memset(&L->gate_w.buf, 0, sizeof(L->gate_w.buf));
 	memset(&L->up_w.buf, 0, sizeof(L->up_w.buf));
 	memset(&L->down_w.buf, 0, sizeof(L->down_w.buf));
@@ -1189,61 +1269,10 @@ status_code model_load(model *m, const char *path) {
 	return OK;
 }
 
-static void *prefetch_worker(void *arg) {
-	prefetch_range *r	  = arg;
-	size_t			chunk = (size_t)128u * 1024 * 1024;
-	if (chunk > r->len)
-		chunk = r->len;
-	for (size_t off = 0; off < r->len; off += chunk) {
-		size_t n = r->len - off < chunk ? r->len - off : chunk;
-		readahead(r->fd, r->offset + (off_t)off, n);
-	}
-	return NULL;
-}
-
 static void model_prefetch_mmap(gguf_ctx *g) {
 	if (!g || g->fd < 0 || !g->map || g->map_size == 0 || g->map_is_heap)
 		return;
-
-	long n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
-	if (n_cpu < 1)
-		n_cpu = 1;
-	int n_threads = (int)n_cpu * 4;
-	if (n_threads > PREFETCH_MAX_THREADS)
-		n_threads = PREFETCH_MAX_THREADS;
-
-	size_t total = g->map_size;
-	if (total / (size_t)n_threads < PREFETCH_CHUNK_MIN) {
-		n_threads = (int)(total / PREFETCH_CHUNK_MIN);
-		if (n_threads < 1)
-			n_threads = 1;
-	}
-
-	pthread_t	   threads[PREFETCH_MAX_THREADS];
-	prefetch_range ranges[PREFETCH_MAX_THREADS];
-	size_t		   base_len	 = total / (size_t)n_threads;
-	size_t		   off		 = 0;
-	int			   n_spawned = 0;
-
-	for (int i = 0; i < n_threads; i++) {
-		size_t len = (i == n_threads - 1) ? (total - off) : base_len;
-		ranges[i]  = (prefetch_range){.fd = g->fd, .offset = (off_t)off, .len = len};
-		off += len;
-		if (i == 0)
-			continue;
-		if (pthread_create(&threads[i], NULL, prefetch_worker, &ranges[i]) == 0)
-			n_spawned++;
-		else
-			threads[i] = 0;
-	}
-
-	prefetch_worker(&ranges[0]);
-
-	for (int i = 1; i < n_threads; i++) {
-		if (threads[i])
-			pthread_join(threads[i], NULL);
-	}
-	(void)n_spawned;
+	readahead(g->fd, 0, (off_t)g->map_size);
 }
 
 static status_code load_moe_metadata(model *m, const gguf_ctx *g, const char *prefix) {
@@ -1828,14 +1857,24 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 								  "blk.%d.attn_v_b.weight", 1) != OK)
 				return ERR_FORMAT;
 			if (m->backend && strcmp(m->backend->name, "cpu") == 0) {
-				L->mla_kb_vb_f32 = 1;
+				L->mla_kb_vb_f32	= 1;
+				const void *kb_orig = L->k_b_w.host_ptr;
+				size_t		kb_bytes =
+					ggml_row_size(L->k_b_w.type, (size_t)m->mla.qk_nope * m->mla.kv_lora) *
+					(size_t)m->n_heads;
 				dequant_weight_to_f32(&L->k_b_w.host_ptr, &L->k_b_w.type,
 									  (size_t)m->mla.qk_nope * m->mla.kv_lora, (size_t)m->n_heads);
+				release_original_weight_data(m, kb_orig, kb_bytes);
 				L->k_b_w.buf.handle	  = (void *)L->k_b_w.host_ptr;
 				L->k_b_w.buf.host_ptr = NULL;
 
+				const void *vb_orig = L->v_b_w.host_ptr;
+				size_t		vb_bytes =
+					ggml_row_size(L->v_b_w.type, (size_t)m->mla.kv_lora * m->mla.v_head) *
+					(size_t)m->n_heads;
 				dequant_weight_to_f32(&L->v_b_w.host_ptr, &L->v_b_w.type,
 									  (size_t)m->mla.kv_lora * m->mla.v_head, (size_t)m->n_heads);
+				release_original_weight_data(m, vb_orig, vb_bytes);
 				L->v_b_w.buf.handle	  = (void *)L->v_b_w.host_ptr;
 				L->v_b_w.buf.host_ptr = NULL;
 			}
@@ -2467,11 +2506,19 @@ void model_free(model *m) {
 	if (m->backend && m->layers) {
 		for (int i = 0; i < m->n_layers; i++) {
 			layer_weights *L = &m->layers[i];
+			if (L->qkv_fused) {
+				memset(&L->wq.buf, 0, sizeof(L->wq.buf));
+				memset(&L->wk.buf, 0, sizeof(L->wk.buf));
+				memset(&L->wv.buf, 0, sizeof(L->wv.buf));
+			}
 			free_weight_buf(&L->attn_norm_w.buf);
 			free_weight_buf(&L->wq.buf);
 			free_weight_buf(&L->wk.buf);
 			free_weight_buf(&L->wv.buf);
 			free_weight_buf(&L->wo.buf);
+			free_weight_buf(&L->qkv_w.buf);
+			free(L->qkv_fused_host);
+			L->qkv_fused_host = NULL;
 			free_weight_buf(&L->attn_qkv_w.buf);
 			free_weight_buf(&L->attn_gate_w.buf);
 			free_weight_buf(&L->ssm_conv1d_w.buf);

@@ -114,17 +114,15 @@ static status_code warmup_run(context *c, const char *system) {
 		return OK;
 
 	int		 cap = c->n_ctx;
-	int32_t *ids = xmalloc((size_t)(cap + 1) * sizeof(int32_t));
+	int32_t *ids = context_ids_scratch(c, cap + 1);
 	int		 n	 = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
 	if (n < 0) {
-		free(ids);
 		free(render);
 		return OK;
 	}
 
 	int count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
 	if (count == 0) {
-		free(ids);
 		free(render);
 		return OK;
 	}
@@ -132,7 +130,6 @@ static status_code warmup_run(context *c, const char *system) {
 	context_monitor_send_start(c);
 	prefill_result pf = context_prefill_tokens(c, ids, count, "warmup", true);
 	if (pf.rc < 0) {
-		free(ids);
 		free(render);
 		return ERR_INTERNAL;
 	}
@@ -146,7 +143,6 @@ static status_code warmup_run(context *c, const char *system) {
 
 	DEBUG("warmup: prefilled %d tokens", count);
 
-	free(ids);
 	free(render);
 	return OK;
 }

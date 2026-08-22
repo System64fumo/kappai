@@ -33,6 +33,8 @@ static inline int monitor_active(const monitor *mon) {
 
 extern monitor *g_monitor;
 
+int monitor_maybe_emit(void);
+
 void monitor_emit_load_phase_backend(monitor *mon, const char *backend_name);
 void monitor_emit_load_phase_model_start(monitor *mon, const char *model_path);
 void monitor_emit_load_phase_model_done(monitor *mon, uint64_t ms, int n_layers, int dim,

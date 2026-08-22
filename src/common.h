@@ -129,12 +129,20 @@ static inline char *xstrdup(const char *s) {
 	return p;
 }
 
-static inline float *float_buf_ensure(float_buf *b, size_t need) {
+static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
 	if (need > b->cap) {
-		b->p   = xrealloc(b->p, need * sizeof(float));
+		float *np = xmalloc_aligned(need * sizeof(float), align);
+		if (b->p && b->cap > 0)
+			memcpy(np, b->p, b->cap * sizeof(float));
+		free(b->p);
+		b->p   = np;
 		b->cap = need;
 	}
 	return b->p;
+}
+
+static inline float *float_buf_ensure(float_buf *b, size_t need) {
+	return float_buf_ensure_aligned(b, need, 64);
 }
 
 static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {

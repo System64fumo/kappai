@@ -1506,7 +1506,7 @@ __attribute__((weak)) void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 void quant_scratch_ensure(quant_scratch *qs, size_t need) {
 	if (qs->q8_buf_elems < need) {
 		free(qs->q8_buf);
-		qs->q8_buf		 = xmalloc(need);
+		qs->q8_buf		 = xmalloc_aligned(need, 64);
 		qs->q8_buf_elems = need;
 	}
 }

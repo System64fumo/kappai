@@ -105,6 +105,9 @@ status_code context_init(context *c, const config *cfg) {
 
 	c->backend->rope_neox = c->m.arch_info->uses_neox_rope;
 
+	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
+		c->m.fuse_config = cfg->fuse;
+
 	if (cfg->ngl >= 0) {
 		int n_gpu = cfg->ngl;
 		if (n_gpu > c->m.n_layers)
@@ -130,6 +133,8 @@ status_code context_init(context *c, const config *cfg) {
 		monitor_emit_load_phase_model_failed(&c->monitor, s);
 		goto fail_model;
 	}
+	if (c->m.qkv_fused_layers > 0)
+		INFO("fused qkv: %d layer(s) use a single concatenated QKV matmul", c->m.qkv_fused_layers);
 
 	s = model_build_recipe(&c->m);
 	if (s != OK) {
@@ -230,6 +235,8 @@ void context_free(context *c) {
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
 	backend_destroy(c->backend);
+	free(c->ids_buf.p);
+	free(c->idle_ids_buf.p);
 	memset(c, 0, sizeof(*c));
 }
 
@@ -265,6 +272,31 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 	return pos + 1;
 }
 
+#define PREFILL_CHUNK_WS_TARGET_BYTES (8ull << 20)
+
+static size_t context_kv_bytes_per_token(const context *c) {
+	size_t head_row;
+	if (c->kv.kv_quant == KV_QUANT_Q8_0) {
+		size_t n_blocks = ((size_t)c->kv.head_dim_max + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+		head_row		= n_blocks * KV_Q8_0_BLOCK_BYTES;
+	} else {
+		head_row = (size_t)c->kv.head_dim_max * sizeof(uint16_t);
+	}
+	return 2 * (size_t)c->kv.n_kv_heads_max * head_row *
+		   (size_t)(c->kv.n_kv_layers > 0 ? c->kv.n_kv_layers : 1);
+}
+
+static int context_prefill_chunk_size(const context *c, int n_threads) {
+	size_t kv_per_tok = context_kv_bytes_per_token(c);
+	int	   chunk	  = PREFILL_CHUNK_WS_TARGET_BYTES / (kv_per_tok > 0 ? kv_per_tok : 1);
+	if (chunk < 32)
+		chunk = 32;
+	if (chunk > 512)
+		chunk = 512;
+	(void)n_threads;
+	return chunk;
+}
+
 int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool quiet) {
 	if (n <= 0)
 		return 0;
@@ -282,11 +314,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		if (pool)
 			n_threads = tpool_n_threads(pool);
 	}
-	int chunk = n_threads > 1 ? (n_threads * 4) : 64;
-	if (chunk < 32)
-		chunk = 32;
-	if (chunk > 256)
-		chunk = 256;
+	int chunk = context_prefill_chunk_size(c, n_threads);
 	if (chunk > n)
 		chunk = n;
 	progress prog;
@@ -619,6 +647,22 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 		ud->on_token(id, piece, n, ud->ud);
 }
 
+static int32_t *context_ids_buf_grow(int32_t **pp, int *cap, int n) {
+	if (n > *cap) {
+		int new_cap = *cap > 0 ? *cap : 256;
+		while (new_cap < n)
+			new_cap *= 2;
+		free(*pp);
+		*pp	 = xmalloc((size_t)new_cap * sizeof(int32_t));
+		*cap = new_cap;
+	}
+	return *pp;
+}
+
+int32_t *context_ids_scratch(context *c, int n) {
+	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
+}
+
 int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
 					  int max_tokens, const sampler_params						 *samp,
 					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
@@ -636,15 +680,13 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 		fprintf(stderr, "=== chat template ===\n%s\n======================\n", turn_str);
 
 	int		 cap = c->n_ctx;
-	int32_t *ids = xmalloc((size_t)(cap + 1) * sizeof(int32_t));
+	int32_t *ids = context_ids_scratch(c, cap + 1);
 
 	profile_reset(&c->scratch.prof);
 	int n = tokenizer_encode_with_specials(&c->tok, turn_str, 0, ids, cap, &c->scratch.prof);
 	free(turn_str);
-	if (n < 0) {
-		free(ids);
+	if (n < 0)
 		return -1;
-	}
 
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
@@ -653,7 +695,6 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	int generated = run_generation(c, ids, n, max_tokens, samp,
 								   add_generation_prompt ? assistant_capture_cb : on_token, &acap,
 								   1, metrics_spec ? metrics_spec : "pp,tg", t_turn_start);
-	free(ids);
 
 	if (add_generation_prompt && generated > 0) {
 		char *discard;
@@ -694,27 +735,27 @@ static void *idle_prefill_thread(void *arg) {
 		goto out;
 
 	int		 cap = c->n_ctx;
-	int32_t *ids = xmalloc((size_t)(cap + 1) * sizeof(int32_t));
+	int32_t *ids = context_ids_buf_grow(&c->idle_ids_buf.p, &c->idle_ids_buf.cap, cap + 1);
 	int		 n	 = tokenizer_encode_with_specials(&c->tok, r1, 0, ids, cap, &c->scratch.prof);
 	if (n < 0 || c->interrupt)
-		goto out_ids;
+		goto out;
 
 	int header_count = tokenizer_token_count_for_bytes(&c->tok, ids, n, header_bytes);
 	if (header_count == 0)
-		goto out_ids;
+		goto out;
 
 	size_t prev_len = ctx_rstrip_nl(c->chat.last_render, strlen(c->chat.last_render));
 	if (prev_len == 0 || strncmp(r1, c->chat.last_render, prev_len) != 0)
-		goto out_ids;
+		goto out;
 
 	int prefilled_count = tokenizer_token_count_for_bytes(&c->tok, ids, header_count, prev_len);
 	if (prefilled_count >= header_count || c->interrupt)
-		goto out_ids;
+		goto out;
 
 	int			   to_prefill = header_count - prefilled_count;
 	prefill_result pf = context_prefill_tokens(c, ids + prefilled_count, to_prefill, "idle", true);
 	if (pf.rc < 0)
-		goto out_ids;
+		goto out;
 
 	char *decoded = tokenizer_decode_prefix(&c->tok, ids, header_count);
 	if (decoded) {
@@ -724,8 +765,6 @@ static void *idle_prefill_thread(void *arg) {
 
 	DEBUG("idle-prefill: %d tokens [%d..%d) of %d", to_prefill, prefilled_count, header_count, n);
 
-out_ids:
-	free(ids);
 out:
 	free(r1);
 	free(r2);

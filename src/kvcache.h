@@ -93,4 +93,8 @@ static inline backend *kvcache_backend_for_layer(kvcache *c, const model *m, int
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in);
 
+status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
+							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
+							  int n_rows);
+
 #endif

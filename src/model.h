@@ -29,6 +29,10 @@ typedef struct layer_weights {
 	void	  *gate_up_fused_host;
 	void	  *shexp_fused_host;
 
+	weight_ref qkv_w;
+	int		   qkv_fused;
+	void	  *qkv_fused_host;
+
 	int is_sliding;
 
 	weight_ref attn_q_norm_w;
@@ -182,6 +186,8 @@ typedef struct model {
 	int			use_mmap;
 	char	   *model_path;
 	const char *repack_config;
+	const char *fuse_config;
+	int			qkv_fused_layers;
 
 	gguf_ctx gctx;
 

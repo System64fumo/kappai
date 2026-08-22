@@ -16,6 +16,18 @@
 
 monitor *g_monitor = NULL;
 
+static _Atomic int	g_monitors_listening;
+static _Atomic long g_moe_emit_count;
+
+int monitor_maybe_emit(void) {
+	if (atomic_load_explicit(&g_monitors_listening, memory_order_relaxed) <= 0)
+		return 0;
+	long n = atomic_fetch_add_explicit(&g_moe_emit_count, 1, memory_order_relaxed);
+	if (n > 8192 && (n & 1023) != 0)
+		return 0;
+	return 1;
+}
+
 void monitor_reset(monitor *mon) {
 	memset(mon, 0, sizeof(*mon));
 	mon->fd = -1;
@@ -65,6 +77,7 @@ status_code monitor_init(monitor *mon, const char *path) {
 
 	mon->fd = fd;
 	atomic_store_explicit(&mon->n_clients, 0, memory_order_relaxed);
+	atomic_fetch_add_explicit(&g_monitors_listening, 1, memory_order_relaxed);
 	INFO("monitor: listening on %s", mon->path);
 	return OK;
 }
@@ -146,6 +159,7 @@ void monitor_free(monitor *mon) {
 	if (mon->fd >= 0) {
 		close(mon->fd);
 		mon->fd = -1;
+		atomic_fetch_sub_explicit(&g_monitors_listening, 1, memory_order_relaxed);
 	}
 	if (mon->path[0])
 		unlink(mon->path);
@@ -330,6 +344,8 @@ void monitor_emit_end(monitor *mon, int tokens_generated, double pp_tps, double 
 
 void monitor_emit_moe_experts(monitor *mon, int layer, int token_idx, const int32_t *expert_ids,
 							  const float *weights, int K) {
+	if (!monitor_maybe_emit())
+		return;
 	if (!monitor_active(mon) || atomic_load_explicit(&mon->n_clients, memory_order_relaxed) <= 0)
 		return;
 

@@ -92,6 +92,10 @@ struct backend {
 	status_code (*kv_put)(backend *self, buffer *k, buffer *v, int layer, int pos,
 						  const buffer *k_in, const buffer *v_in, int n_kv_heads, int head_dim,
 						  int n_ctx, int n_kv_heads_active);
+	status_code (*kv_put_batch)(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								const buffer *k_in, const buffer *v_in, int in_row_stride,
+								int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+								int m);
 	status_code (*embd_lookup)(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
 							   int token, int dim, buffer *x_out);
 	status_code (*rmsnorm)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,

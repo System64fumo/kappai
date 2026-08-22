@@ -579,6 +579,62 @@ static int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, mode
 	return n;
 }
 
+static int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb,
+								 buffer **y_list, int li, int n_rows, status_code *out_status) {
+	backend *a	= m->backend;
+	*out_status = OK;
+	if (n_ops < 2 || !backend_has_cap(a, BCAP_MATMUL_QONLY) || !a->prequantize_x ||
+		!a->matmul_qonly)
+		return 0;
+
+	int n = n_ops > RECIPE_COALESCE_MAX ? RECIPE_COALESCE_MAX : n_ops;
+	for (int i = 0; i < n; i++) {
+		if (ops[i].w_idx == WIDX_WV && li >= 0 && !model_layer_has_own_v(m, li)) {
+			n = i;
+			break;
+		}
+	}
+	if (n < 2)
+		return 0;
+
+	int		 k	= ops[0].u.matmul.k;
+	uint32_t q8 = wtype_to_q8type(resolve_weight_ref(m, li, ops[0].w_idx)->type);
+	if (!q8)
+		return 0;
+	for (int i = 1; i < n; i++) {
+		if (ops[i].u.matmul.k != k ||
+			wtype_to_q8type(resolve_weight_ref(m, li, ops[i].w_idx)->type) != q8) {
+			n = i;
+			break;
+		}
+	}
+	if (n < 2)
+		return 0;
+
+	buffer		xq = {0};
+	status_code st = a->prequantize_x(a, xb, k, q8, &xq);
+	if (st != OK) {
+		if (st == ERR_UNSUPPORTED || st == ERR_INVALID_ARG) {
+			*out_status = OK;
+			return 0;
+		}
+		*out_status = st;
+		return -1;
+	}
+
+	for (int i = 0; i < n; i++) {
+		weight_ref *w = resolve_weight_ref(m, li, ops[i].w_idx);
+		status_code ost =
+			a->matmul_qonly(a, &w->buf, w->type, &xq, q8, y_list[i], ops[i].u.matmul.n, k, n_rows);
+		if (ost != OK) {
+			*out_status = ost;
+			return -1;
+		}
+	}
+	*out_status = OK;
+	return n;
+}
+
 static inline backend *op_backend_fallback(backend *a) {
 	if (a->synchronize)
 		a->synchronize(a);
@@ -1228,17 +1284,12 @@ static status_code op_kv_put(exec_ctx *ctx) {
 	status_code	  st;
 	if (exec_is_batch(ctx)) {
 		int kv_row_stride = ctx->m->recipe->layer_ctx[ctx->li].kv_row_stride;
-		for (int row = 0; row < ctx->n_rows; row++) {
-			buffer krow = batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, kv_row_stride);
-			buffer vrow = batch_row_view(batch_slot(ctx->bs, ctx->op->in[1]), row, kv_row_stride);
-			st = kvcache_put(ctx->cache, ctx->m, ctx->li, ctx->pos_start + row, &krow, &vrow);
-			if (st != OK)
-				break;
-		}
-	} else {
-		st = kvcache_put(ctx->cache, ctx->m, ctx->li, ctx->pos, exec_slot(ctx, ctx->op->in[0]),
-						 exec_slot(ctx, ctx->op->in[1]));
+		return kvcache_put_batch(ctx->cache, ctx->m, ctx->li, ctx->pos_start,
+								 batch_slot(ctx->bs, ctx->op->in[0]),
+								 batch_slot(ctx->bs, ctx->op->in[1]), kv_row_stride, ctx->n_rows);
 	}
+	st = kvcache_put(ctx->cache, ctx->m, ctx->li, ctx->pos, exec_slot(ctx, ctx->op->in[0]),
+					 exec_slot(ctx, ctx->op->in[1]));
 	profile_end(&ctx->s->prof, &ps);
 	return st;
 }
@@ -1356,6 +1407,20 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 	return st;
 }
 
+typedef struct {
+	float *logits;
+	int	   vocab;
+	float  inv_cap;
+	float  cap;
+} softcap_job;
+
+static void softcap_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	softcap_job *j = ctx;
+	for (int i = begin; i < end; i++)
+		j->logits[i] = j->cap * tanhf(j->logits[i] * j->inv_cap);
+}
+
 static status_code op_softcap(exec_ctx *ctx) {
 	float *logits_out = ctx->logits_out;
 	if (!logits_out)
@@ -1363,8 +1428,15 @@ static status_code op_softcap(exec_ctx *ctx) {
 	float cap = ctx->op->u.softcap.cap;
 	if (cap <= 0.0f)
 		return OK;
-	int	  vocab	  = ctx->m->vocab_size;
-	float inv_cap = 1.0f / cap;
+	int		 vocab	 = ctx->m->vocab_size;
+	float	 inv_cap = 1.0f / cap;
+	backend *a		 = exec_layer_backend(ctx);
+	tpool	*pool	 = (a && a->get_pool) ? a->get_pool(a) : NULL;
+	if (pool && tpool_n_threads(pool) > 1 && vocab >= 2 * 4096 && tpool_current_tid() < 0) {
+		softcap_job job = {.logits = logits_out, .vocab = vocab, .inv_cap = inv_cap, .cap = cap};
+		tpool_parallel_for(pool, vocab, 4096, softcap_chunk, &job);
+		return OK;
+	}
 	for (int i = 0; i < vocab; i++)
 		logits_out[i] = cap * tanhf(logits_out[i] * inv_cap);
 	return OK;
@@ -1632,6 +1704,19 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 				status_code coalesced_status;
 				int consumed = exec_matmul_run_coalesced(&lops[j], run_len, m, s, li, s->slots,
 														 &coalesced_status);
+				if (consumed == 0 && coalesced_status == OK && !s->active_is_mirror) {
+					buffer *ys[RECIPE_COALESCE_MAX];
+					for (int q = 0; q < run_len; q++)
+						ys[q] = &s->slots[lops[j + q].out];
+					consumed = exec_matmul_run_qonly(&lops[j], run_len, m, &s->slots[lops[j].in[0]],
+													 ys, li, 1, &coalesced_status);
+				}
+				if (consumed < 0) {
+					if (has_end)
+						bk->end_batch(bk);
+					st = coalesced_status;
+					goto fail;
+				}
 				if (consumed > 0) {
 					if (coalesced_status != OK) {
 						if (has_end)
@@ -1703,6 +1788,18 @@ typedef struct {
 	buffer	  b;
 } bs_pair;
 
+typedef struct {
+	int cnt;
+	int u;
+} moe_order_pair;
+
+static int moe_order_pair_cmp(const void *pa, const void *pb) {
+	const moe_order_pair *a = pa, *b = pb;
+	if (a->cnt != b->cnt)
+		return b->cnt - a->cnt;
+	return a->u - b->u;
+}
+
 struct batch_scratch {
 	bs_pair pair[RECIPE_SLOT_MAX];
 
@@ -1726,14 +1823,23 @@ struct batch_scratch {
 	int	 moe_union_order_cap;
 	int *moe_union_sorted_ids;
 	int	 moe_union_sorted_ids_cap;
-	int	 moe_router_ids_cap_tokens;
-	int	 moe_router_ids_cap_k;
+
+	moe_order_pair *moe_order_pairs;
+	int				moe_order_pairs_cap;
+	int				moe_router_ids_cap_tokens;
+	int				moe_router_ids_cap_k;
 
 	float_buf moe_expert_out;
 	float_buf moe_out;
 	float_buf moe_router_logits;
 	float_buf moe_router_inp;
 	float_buf moe_xb_f;
+
+	float_buf moe_gather_x;
+	float_buf moe_exp_gu;
+	float_buf moe_up_scratch;
+	float_buf moe_exp_act;
+	float_buf moe_exp_y;
 
 	moe_expert_slot *moe_per_token_slots;
 	int				 moe_per_token_slots_cap;
@@ -1832,11 +1938,17 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_expert_seen_gen);
 	free(bs->moe_union_order);
 	free(bs->moe_union_sorted_ids);
+	free(bs->moe_order_pairs);
 	free(bs->moe_expert_out.p);
 	free(bs->moe_out.p);
 	free(bs->moe_router_logits.p);
 	free(bs->moe_router_inp.p);
 	free(bs->moe_xb_f.p);
+	free(bs->moe_gather_x.p);
+	free(bs->moe_exp_gu.p);
+	free(bs->moe_up_scratch.p);
+	free(bs->moe_exp_act.p);
+	free(bs->moe_exp_y.p);
 	free(bs->moe_per_token_slots);
 	free(bs->moe_union_slots);
 	if (bs->moe_xb_q8_gate.owner)
@@ -2239,20 +2351,21 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 			ctx->bs->moe_union_sorted_ids	  = xmalloc((size_t)n_union * sizeof(int));
 			ctx->bs->moe_union_sorted_ids_cap = n_union;
 		}
-		for (int u = 0; u < n_union; u++)
-			ctx->bs->moe_union_order[u] = u;
-		for (int i = 1; i < n_union; i++) {
-			int ord = ctx->bs->moe_union_order[i];
-			int cnt = ctx->bs->moe_union_count[ord];
-			int j	= i - 1;
-			while (j >= 0 && ctx->bs->moe_union_count[ctx->bs->moe_union_order[j]] < cnt) {
-				ctx->bs->moe_union_order[j + 1] = ctx->bs->moe_union_order[j];
-				j--;
-			}
-			ctx->bs->moe_union_order[j + 1] = ord;
+		if (ctx->bs->moe_order_pairs_cap < n_union) {
+			free(ctx->bs->moe_order_pairs);
+			ctx->bs->moe_order_pairs	 = xmalloc((size_t)n_union * sizeof(moe_order_pair));
+			ctx->bs->moe_order_pairs_cap = n_union;
 		}
-		for (int i = 0; i < n_union; i++)
-			ctx->bs->moe_union_sorted_ids[i] = ctx->bs->moe_union_ids[ctx->bs->moe_union_order[i]];
+		for (int u = 0; u < n_union; u++)
+			ctx->bs->moe_order_pairs[u] =
+				(moe_order_pair){.cnt = ctx->bs->moe_union_count[u], .u = u};
+		qsort(ctx->bs->moe_order_pairs, (size_t)n_union, sizeof(moe_order_pair),
+			  moe_order_pair_cmp);
+		for (int i = 0; i < n_union; i++) {
+			ctx->bs->moe_union_order[i] = ctx->bs->moe_order_pairs[i].u;
+			ctx->bs->moe_union_sorted_ids[i] =
+				ctx->bs->moe_union_ids[ctx->bs->moe_order_pairs[i].u];
+		}
 	}
 
 	{
@@ -2273,6 +2386,104 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	moe_stream_resolve(ctx->m, ctx->li, ctx->bs->moe_union_sorted_ids, n_union,
 					   ctx->bs->moe_union_slots);
 	ctx->bs->moe_union_pending_n = n_union;
+	return OK;
+}
+
+static buffer moe_host_view(float *p, size_t n_elems) {
+	buffer b   = {0};
+	b.handle   = p;
+	b.host_ptr = p;
+	b.size	   = n_elems * sizeof(float);
+	return b;
+}
+
+static buffer moe_weight_view(const void *w) {
+	buffer b   = {0};
+	b.handle   = (void *)w;
+	b.host_ptr = (const void *)w;
+	return b;
+}
+
+static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K, int I,
+									   int use_gelu) {
+	batch_scratch *bs	   = ctx->bs;
+	int			   n_rows  = ctx->n_rows;
+	int			   n_union = bs->moe_n_union;
+	const float	  *xb_base = batch_buf_ptr(batch_slot(bs, ctx->op->in[0]));
+	float		  *out	   = bs->moe_out.p;
+	status_code	   st;
+
+	float_buf_ensure(&bs->moe_gather_x, (size_t)n_rows * dim);
+	float_buf_ensure(&bs->moe_exp_act, (size_t)n_rows * I);
+	float_buf_ensure(&bs->moe_exp_y, (size_t)n_rows * dim);
+
+	for (int i = 0; i < n_union; i++) {
+		int				 u	  = bs->moe_union_order[i];
+		int				 cnt  = bs->moe_union_count[u];
+		const int		*rows = bs->moe_union_rows + bs->moe_union_offsets[u];
+		const int		*kidx = bs->moe_union_kidx + bs->moe_union_offsets[u];
+		moe_expert_slot *es	  = &bs->moe_union_slots[i];
+		if (cnt <= 0 || es->eid < 0 || !es->gate_w)
+			continue;
+		moe_stream_wait_slot(es);
+
+		float *X = bs->moe_gather_x.p;
+		for (int c = 0; c < cnt; c++)
+			memcpy(X + (size_t)c * dim, xb_base + (size_t)rows[c] * dim,
+				   (size_t)dim * sizeof(float));
+		buffer Xb = moe_host_view(X, (size_t)cnt * dim);
+		float *A  = bs->moe_exp_act.p;
+
+		if (es->gate_up_fused) {
+			float *GU = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I * 2);
+			buffer Wb = moe_weight_view(es->gate_w);
+			buffer Gb = moe_host_view(GU, (size_t)cnt * I * 2);
+			st		  = a->matmul_batch(a, &Wb, es->gate_type, &Xb, &Gb, I * 2, dim, cnt);
+			if (st != OK)
+				return st;
+			for (int c = 0; c < cnt; c++)
+				moe_activate(A + (size_t)c * I, GU + (size_t)c * I * 2, GU + (size_t)c * I * 2 + I,
+							 I, es->gate_scale, es->up_scale, use_gelu);
+		} else {
+			float *G  = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I);
+			float *U  = float_buf_ensure(&bs->moe_up_scratch, (size_t)cnt * I);
+			buffer Wg = moe_weight_view(es->gate_w);
+			buffer Wu = moe_weight_view(es->up_w);
+			buffer Gb = moe_host_view(G, (size_t)cnt * I);
+			buffer Ub = moe_host_view(U, (size_t)cnt * I);
+			st		  = a->matmul_batch(a, &Wg, es->gate_type, &Xb, &Gb, I, dim, cnt);
+			if (st != OK)
+				return st;
+			st = a->matmul_batch(a, &Wu, es->up_type, &Xb, &Ub, I, dim, cnt);
+			if (st != OK)
+				return st;
+			for (int c = 0; c < cnt; c++)
+				moe_activate(A + (size_t)c * I, G + (size_t)c * I, U + (size_t)c * I, I,
+							 es->gate_scale, es->up_scale, use_gelu);
+		}
+
+		float *Y  = bs->moe_exp_y.p;
+		buffer Wd = moe_weight_view(es->down_w);
+		buffer Ab = moe_host_view(A, (size_t)cnt * I);
+		buffer Yb = moe_host_view(Y, (size_t)cnt * dim);
+		st		  = a->matmul_batch(a, &Wd, es->down_type, &Ab, &Yb, dim, I, cnt);
+		if (st != OK)
+			return st;
+
+		float ds = es->down_scale;
+		for (int c = 0; c < cnt; c++) {
+			float		 w = bs->moe_router_w[(size_t)rows[c] * K + kidx[c]];
+			const float *y = Y + (size_t)c * dim;
+			float		*o = out + (size_t)rows[c] * dim;
+			if (ds == 1.0f) {
+				for (int d = 0; d < dim; d++)
+					o[d] += w * y[d];
+			} else {
+				for (int d = 0; d < dim; d++)
+					o[d] += w * (ds * y[d]);
+			}
+		}
+	}
 	return OK;
 }
 
@@ -2316,6 +2527,13 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 
 	float_buf_ensure(&ctx->bs->moe_out, (size_t)ctx->n_rows * dim);
 	memset(ctx->bs->moe_out.p, 0, ctx->n_rows * dim * sizeof(float));
+
+	if (ctx->n_rows > 1 && a->matmul_batch && a->matmul_thread_local) {
+		status_code gst = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
+		if (gst != OK)
+			return gst;
+		goto finish;
+	}
 
 	tpool *pool			 = (ctx->m->backend && ctx->m->backend->get_pool)
 							   ? ctx->m->backend->get_pool(ctx->m->backend)
@@ -2406,8 +2624,9 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 		}
 	}
 
-	buffer *xb2		= batch_slot(ctx->bs, ctx->op->out);
-	float  *xb2_ptr = batch_buf_ptr(xb2);
+	buffer *xb2 = batch_slot(ctx->bs, ctx->op->out);
+finish:
+	float *xb2_ptr = batch_buf_ptr(xb2);
 	memcpy(xb2_ptr, ctx->bs->moe_out.p, (size_t)ctx->n_rows * dim * sizeof(float));
 
 	for (int row = 0; row < ctx->n_rows; row++) {
@@ -3902,6 +4121,18 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 				status_code coalesced_status;
 				int			consumed = exec_matmul_run_coalesced_batch(
 					&ops[j], ops[j].coalesce_run_len, m, s, bs, li, n_tokens, &coalesced_status);
+				if (consumed == 0 && coalesced_status == OK) {
+					buffer *ys[RECIPE_COALESCE_MAX];
+					for (int q = 0; q < ops[j].coalesce_run_len; q++)
+						ys[q] = batch_slot(bs, ops[j + q].out);
+					consumed = exec_matmul_run_qonly(&ops[j], ops[j].coalesce_run_len, m,
+													 batch_slot(bs, ops[j].in[0]), ys, li, n_tokens,
+													 &coalesced_status);
+				}
+				if (consumed < 0) {
+					st = coalesced_status;
+					goto done;
+				}
 				if (consumed > 0) {
 					if (coalesced_status != OK) {
 						st = coalesced_status;

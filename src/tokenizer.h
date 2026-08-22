@@ -1,6 +1,5 @@
 #ifndef TOKENIZER_H
 #define TOKENIZER_H
-
 #include "common.h"
 #include "gguf.h"
 #include "profile.h"
@@ -28,6 +27,13 @@ typedef struct {
 	int			type;
 } vocab_token;
 
+typedef struct tok_hash_entry {
+	const char *key;
+	size_t		key_len;
+	int32_t		id;
+	int			used;
+} tok_hash_entry;
+
 typedef struct {
 	vocab_token			  *tokens;
 	size_t				   n_tokens;
@@ -46,6 +52,11 @@ typedef struct {
 	size_t				   n_special_ids;
 	int32_t				  *special_by_first_byte;
 	size_t				   special_by_first_byte_off[257];
+	unsigned char		   special_first_byte_bitmap[32];
+	unsigned char		   special_first_bytes[256];
+	size_t				   n_special_first_bytes;
+	void				  *bpe_work;
+	size_t				   bpe_work_cap;
 	void				  *bpe_pcs_cache;
 	size_t				   bpe_pcs_cache_cap;
 } tokenizer;
@@ -54,13 +65,15 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g);
 void		tokenizer_free(tokenizer *t);
 int			tokenizer_encode_with_specials(tokenizer *t, const char *text, int add_specials,
 										   int32_t *out_ids, int max_out, profile *prof);
-int			tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int max_out,
-							 profile *prof);
-size_t		tokenizer_token_decoded_len(const tokenizer *t, int32_t id);
-int			tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
-											size_t max_bytes);
-char	   *tokenizer_decode_prefix(const tokenizer *t, const int32_t *ids, int count);
-int			tokenizer_is_eog(const tokenizer *t, int32_t id);
-int32_t		tokenizer_find_token(const tokenizer *t, const char *text);
+int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *out_ids, int max_out,
+						 int *n_out);
+int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int max_out,
+					 profile *prof);
+size_t	tokenizer_token_decoded_len(const tokenizer *t, int32_t id);
+int		tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
+										size_t max_bytes);
+char   *tokenizer_decode_prefix(const tokenizer *t, const int32_t *ids, int count);
+int		tokenizer_is_eog(const tokenizer *t, int32_t id);
+int32_t tokenizer_find_token(const tokenizer *t, const char *text);
 
 #endif

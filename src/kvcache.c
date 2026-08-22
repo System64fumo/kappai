@@ -344,3 +344,44 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 	}
 	return st;
 }
+
+status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
+							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
+							  int n_rows) {
+	if (!c || !m || n_rows <= 0)
+		return ERR_INVALID_ARG;
+	if (layer < 0 || layer >= m->n_layers)
+		return ERR_INVALID_ARG;
+	if (pos_start < 0 || pos_start + n_rows > c->n_ctx)
+		return ERR_INVALID_ARG;
+
+	int hd				= model_layer_head_dim(m, layer);
+	int kvh_stride		= kvcache_kv_heads_stride(c);
+	int kvh_active		= model_layer_kv_heads(m, layer);
+	int slot_needs_host = kvcache_slot_on_host(c, layer);
+
+	backend *kv_backend = c->k.owner ? c->k.owner : c->backend;
+	backend *k_owner	= k_in->owner ? k_in->owner : kv_backend;
+	backend *v_owner	= v_in->owner ? v_in->owner : kv_backend;
+
+	bool same_backend = (k_owner == kv_backend && v_owner == kv_backend);
+	bool fast_ok	  = same_backend && kv_backend->kv_put_batch != NULL &&
+						!kvcache_layer_uses_host_kv(c, m, layer) && !slot_needs_host;
+	if (fast_ok) {
+		return kv_backend->kv_put_batch(kv_backend, &c->k, &c->v, layer, pos_start, k_in, v_in,
+										kv_row_stride, kvh_stride, hd, c->n_ctx, kvh_active,
+										n_rows);
+	}
+
+	for (int row = 0; row < n_rows; row++) {
+		buffer krow = *k_in;
+		buffer vrow = *v_in;
+		size_t off	= (size_t)row * (size_t)kv_row_stride * sizeof(float);
+		krow.offset += off;
+		vrow.offset += off;
+		status_code st = kvcache_put(c, m, layer, pos_start + row, &krow, &vrow);
+		if (st != OK)
+			return st;
+	}
+	return OK;
+}
