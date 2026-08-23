@@ -2029,4 +2029,7 @@ void detect_features(char *buf, size_t cap) {
 #if defined(__ARM_FEATURE_SVE)
 	feat_add(buf, cap, "sve");
 #endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+	feat_add(buf, cap, "i8mm");
+#endif
 }
