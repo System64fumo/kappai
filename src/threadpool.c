@@ -93,7 +93,7 @@ static inline void tpool_run_timed(tpool_slot *slot, tpool_chunk_fn fn, int begi
 
 typedef struct {
 	_Atomic tpool_chunk_fn job_fn;
-	_Atomic void		  *job_ctx;
+	_Atomic uintptr_t	   job_ctx;
 	_Atomic int			   job_end;
 	_Atomic int			   chunk_size;
 	_Atomic int			   n_workers;
@@ -199,9 +199,9 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 		if (live_epoch != expected_epoch)
 			return 0;
 
-		tpool_chunk_fn fn	 = atomic_load_explicit(&pool->job.job_fn, memory_order_acquire);
-		void		  *ctx	 = atomic_load_explicit(&pool->job.job_ctx, memory_order_acquire);
-		int			   end	 = atomic_load_explicit(&pool->job.job_end, memory_order_acquire);
+		tpool_chunk_fn fn  = atomic_load_explicit(&pool->job.job_fn, memory_order_acquire);
+		void		  *ctx = (void *)atomic_load_explicit(&pool->job.job_ctx, memory_order_acquire);
+		int			   end = atomic_load_explicit(&pool->job.job_end, memory_order_acquire);
 		int			   chunk = atomic_load_explicit(&pool->job.chunk_size, memory_order_acquire);
 		if (!fn)
 			return 1;
@@ -298,7 +298,7 @@ tpool *tpool_create(int n_threads) {
 						  memory_order_relaxed);
 	pool->job.chunk_size = 1;
 	pool->job.job_fn	 = NULL;
-	pool->job.job_ctx	 = NULL;
+	pool->job.job_ctx	 = 0;
 	atomic_store_explicit(&pool->job.cursor_ep, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.executed, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.job_epoch, 0, memory_order_relaxed);
@@ -420,7 +420,7 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 	atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.chunk_size, chunk_size, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.job_fn, fn, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.job_ctx, ctx, memory_order_relaxed);
+	atomic_store_explicit(&pool->job.job_ctx, (uintptr_t)ctx, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.executed, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.cursor_ep, (int64_t)new_epoch << 32, memory_order_relaxed);
 

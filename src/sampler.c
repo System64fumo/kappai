@@ -186,8 +186,12 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 		kept = top_k_heap(s, logits, vocab, s->top_k, arr);
 		qsort(arr, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	} else {
-		int cap = vocab < 1024 ? vocab : 1024;
-		kept	= top_all_desc(s, logits, vocab, arr, cap);
+		int cap;
+		if (s->top_p < 1.0f || s->min_p > 0.0f)
+			cap = vocab < 1024 ? vocab : 1024;
+		else
+			cap = vocab;
+		kept = top_all_desc(s, logits, vocab, arr, cap);
 	}
 	return kept;
 }
@@ -254,7 +258,7 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 	if (s->temperature <= 0.0f || s->top_k == 1)
 		return sampler_argmax(logits, vocab);
 
-	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : (vocab < 1024 ? vocab : 1024);
+	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
 	grow_buf(&s->cand_buf, &s->cand_vocab, need_cands, sizeof(sampler_top_k_entry));
 	sampler_top_k_entry *arr  = s->cand_buf;
 	int					 kept = collect_candidates(s, logits, vocab, arr);

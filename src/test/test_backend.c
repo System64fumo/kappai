@@ -1463,8 +1463,11 @@ static void test_op_kv_put_batch(backend *cpu, backend *tgt, int n_kv_heads, int
 			tgt->buffer_write_f32(tgt, &row_v, v_all + (size_t)r * n_kv, n_kv);
 			status_code prs = tgt->kv_put(tgt, &kc_ref, &vc_ref, 0, pos_start + r, &row_k, &row_v,
 										  n_kv_heads, head_dim, n_ctx, n_kv_heads);
-			if (prs != OK)
-				s_tgt = prs;
+			if (prs != OK) {
+				v = V_FAIL;
+				snprintf(detail, sizeof(detail), "reference kv_put failed at row %d: %d", r, prs);
+				goto record;
+			}
 		}
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
