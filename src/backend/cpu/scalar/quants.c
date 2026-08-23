@@ -1211,6 +1211,307 @@ void repack_q4_0_to_q4_0_r8(const void *src, void *dst, int n_rows, int k) {
 	repack_q4_0_to_q4_0_r8_rows(src, dst, 0, n_rows, k);
 }
 
+#define Q4_K_R8_ROW_BYTES (Q4_K_R8_GROUP_BYTES / Q4_K_R8_ROWS)
+#define Q5_K_R8_ROW_BYTES (Q5_K_R8_GROUP_BYTES / Q5_K_R8_ROWS)
+
+static void q4_k_expand_scales(const uint8_t *restrict sc, uint8_t *restrict se) {
+	for (int is = 0; is < 8; is++) {
+		uint8_t s, m;
+		get_scale_min_k4(is, sc, &s, &m);
+		se[is * 2 + 0] = s;
+		se[is * 2 + 1] = m;
+	}
+}
+
+void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+	const int	 blocks_per_row = k / 256;
+	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q4_k_block);
+
+	const uint8_t *sp = src;
+	uint8_t		  *dp = dst;
+
+	int group_begin = row_begin - (row_begin % Q4_K_R8_ROWS);
+	for (int g = group_begin; g < row_end; g += Q4_K_R8_ROWS) {
+		const q4_k_block *srow[Q4_K_R8_ROWS];
+		for (int r = 0; r < Q4_K_R8_ROWS; r++)
+			srow[r] = (const q4_k_block *)(sp + (size_t)(g + r) * src_stride);
+
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q4_K_R8_ROW_BYTES;
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			uint8_t *dblk = dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q4_K_R8_OFF_D);
+			uint16_t *dst_m	 = (uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
+			uint8_t	 *dst_se = dblk + Q4_K_R8_OFF_SE;
+			uint8_t	 *dst_q	 = dblk + Q4_K_R8_OFF_QS;
+			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+				dst_d[r] = srow[r][bi].d;
+				dst_m[r] = srow[r][bi].dmin;
+				q4_k_expand_scales(srow[r][bi].scales, dst_se + (size_t)r * 16);
+				memcpy(dst_q + (size_t)r * 128, srow[r][bi].qs, 128);
+			}
+		}
+	}
+}
+
+void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_k_to_q4_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+	const int	 blocks_per_row = k / 256;
+	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q5_k_block);
+
+	const uint8_t *sp = src;
+	uint8_t		  *dp = dst;
+
+	int group_begin = row_begin - (row_begin % Q5_K_R8_ROWS);
+	for (int g = group_begin; g < row_end; g += Q5_K_R8_ROWS) {
+		const q5_k_block *srow[Q5_K_R8_ROWS];
+		for (int r = 0; r < Q5_K_R8_ROWS; r++)
+			srow[r] = (const q5_k_block *)(sp + (size_t)(g + r) * src_stride);
+
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q5_K_R8_ROW_BYTES;
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			uint8_t *dblk = dgroup + (size_t)bi * Q5_K_R8_GROUP_BYTES;
+
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q5_K_R8_OFF_D);
+			uint16_t *dst_m	 = (uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
+			uint8_t	 *dst_se = dblk + Q5_K_R8_OFF_SE;
+			uint8_t	 *dst_qh = dblk + Q5_K_R8_OFF_QH;
+			uint8_t	 *dst_qs = dblk + Q5_K_R8_OFF_QS;
+			for (int r = 0; r < Q5_K_R8_ROWS; r++) {
+				dst_d[r] = srow[r][bi].d;
+				dst_m[r] = srow[r][bi].dmin;
+				q4_k_expand_scales(srow[r][bi].scales, dst_se + (size_t)r * 16);
+				memcpy(dst_qh + (size_t)r * 32, srow[r][bi].qh, 32);
+				memcpy(dst_qs + (size_t)r * 128, srow[r][bi].qs, 128);
+			}
+		}
+	}
+}
+
+void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q5_k_to_q5_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q6_k_to_q6_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+	const int	 blocks_per_row = k / 256;
+	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q6_k_block);
+
+	const uint8_t *sp = src;
+	uint8_t		  *dp = dst;
+
+	int group_begin = row_begin - (row_begin % Q6_K_R8_ROWS);
+	for (int g = group_begin; g < row_end; g += Q6_K_R8_ROWS) {
+		const q6_k_block *srow[Q6_K_R8_ROWS];
+		for (int r = 0; r < Q6_K_R8_ROWS; r++)
+			srow[r] = (const q6_k_block *)(sp + (size_t)(g + r) * src_stride);
+
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(q6_k_block);
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			uint8_t *dblk = dgroup + (size_t)bi * Q6_K_R8_GROUP_BYTES;
+
+			uint8_t	 *dst_ql = dblk + Q6_K_R8_OFF_QL;
+			uint8_t	 *dst_qh = dblk + Q6_K_R8_OFF_QH;
+			int8_t	 *dst_sc = (int8_t *)(dblk + Q6_K_R8_OFF_SCALES);
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q6_K_R8_OFF_D);
+			for (int r = 0; r < Q6_K_R8_ROWS; r++) {
+				memcpy(dst_ql + (size_t)r * 128, srow[r][bi].ql, 128);
+				memcpy(dst_qh + (size_t)r * 64, srow[r][bi].qh, 64);
+				memcpy(dst_sc + (size_t)r * 16, srow[r][bi].scales, 16);
+				dst_d[r] = srow[r][bi].d;
+			}
+		}
+	}
+}
+
+void repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q6_k_to_q6_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *wb			  = w;
+
+	for (int g = 0; g < n; g += Q4_K_R8_ROWS) {
+		const uint8_t *dgroup =
+			wb + ((size_t)g / Q4_K_R8_ROWS) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
+		float sumf[Q4_K_R8_ROWS] = {0};
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_D);
+			const uint16_t *ms	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
+			const uint8_t  *qss	 = dblk + Q4_K_R8_OFF_QS;
+
+			const q8_k_block *restrict xb = &xq[bi];
+			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+				const uint8_t *se	= dblk + Q4_K_R8_OFF_SE + (size_t)r * 16;
+				const uint8_t *qb	= qss + (size_t)r * 128;
+				float		   d	= f16_to_f32(ds[r]);
+				float		   dmin = f16_to_f32(ms[r]);
+				int32_t		   sumi = 0, summ = 0;
+				uint8_t		   scu8, mu8;
+				int			   is = 0, ib = 0;
+				for (int g = 0; g < 4; g++) {
+					int s0 = se[is * 2 + 0], m0 = se[is * 2 + 1];
+					int s1 = se[is * 2 + 2], m1 = se[is * 2 + 3];
+					const uint8_t *restrict qg = qb + (g * 32);
+					int32_t dot0 = 0, dot1 = 0;
+					for (int l = 0; l < 32; l++) {
+						dot0 += (int32_t)(qg[l] & 0xF) * (int32_t)xb->qs[g * 64 + l];
+						dot1 += (int32_t)(qg[l] >> 4) * (int32_t)xb->qs[g * 64 + 32 + l];
+					}
+					sumi += (s0 * dot0) + (s1 * dot1);
+					summ += m0 * (int)(xb->bsums[ib] + xb->bsums[ib + 1]);
+					ib += 2;
+					summ += m1 * (int)(xb->bsums[ib] + xb->bsums[ib + 1]);
+					ib += 2;
+					is += 2;
+				}
+				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
+			}
+		}
+		int rows_out = n - g;
+		if (rows_out > Q4_K_R8_ROWS)
+			rows_out = Q4_K_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
+			y[g + r] = sumf[r];
+	}
+}
+
+MATMUL_QONLY_DISPATCH(q4_k_r8_q8_k, q8_k_block)
+
+static void matmul_q5_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *wb			  = w;
+
+	for (int g = 0; g < n; g += Q5_K_R8_ROWS) {
+		const uint8_t *dgroup =
+			wb + ((size_t)g / Q5_K_R8_ROWS) * blocks_per_row * Q5_K_R8_GROUP_BYTES;
+		float sumf[Q5_K_R8_ROWS] = {0};
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q5_K_R8_GROUP_BYTES;
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_D);
+			const uint16_t *ms	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
+			const uint8_t  *qhs	 = dblk + Q5_K_R8_OFF_QH;
+			const uint8_t  *qss	 = dblk + Q5_K_R8_OFF_QS;
+
+			const q8_k_block *restrict xb = &xq[bi];
+			for (int r = 0; r < Q5_K_R8_ROWS; r++) {
+				const uint8_t *se	= dblk + Q5_K_R8_OFF_SE + (size_t)r * 16;
+				const uint8_t *qh	= qhs + (size_t)r * 32;
+				const uint8_t *qb	= qss + (size_t)r * 128;
+				float		   d	= f16_to_f32(ds[r]);
+				float		   dmin = f16_to_f32(ms[r]);
+				int32_t		   sumi = 0, summ = 0;
+				int			   is = 0, ib = 0;
+				uint8_t		   u1 = 1, u2 = 2;
+				for (int g = 0; g < 4; g++) {
+					int s0 = se[is * 2 + 0], m0 = se[is * 2 + 1];
+					int s1 = se[is * 2 + 2], m1 = se[is * 2 + 3];
+					const uint8_t *restrict qg = qb + (g * 32);
+					int32_t dot0 = 0, dot1 = 0;
+					for (int l = 0; l < 32; l++) {
+						int hi0 = (qh[l] & u1) ? 16 : 0;
+						int hi1 = (qh[l] & u2) ? 16 : 0;
+						dot0 += (int32_t)((qg[l] & 0xF) + hi0) * (int32_t)xb->qs[g * 64 + l];
+						dot1 += (int32_t)((qg[l] >> 4) + hi1) * (int32_t)xb->qs[g * 64 + 32 + l];
+					}
+					sumi += (s0 * dot0) + (s1 * dot1);
+					summ += m0 * (int)(xb->bsums[ib] + xb->bsums[ib + 1]);
+					ib += 2;
+					summ += m1 * (int)(xb->bsums[ib] + xb->bsums[ib + 1]);
+					ib += 2;
+					is += 2;
+					u1 <<= 2;
+					u2 <<= 2;
+				}
+				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
+			}
+		}
+		int rows_out = n - g;
+		if (rows_out > Q5_K_R8_ROWS)
+			rows_out = Q5_K_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
+			y[g + r] = sumf[r];
+	}
+}
+
+MATMUL_QONLY_DISPATCH(q5_k_r8_q8_k, q8_k_block)
+
+static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc, uint16_t d_raw,
+						 const int8_t *xq8, float xd, float acc) {
+	float  d = f16_to_f32(d_raw) * xd;
+	int8_t a[256];
+	int8_t *restrict ap = a;
+	for (int n_iter = 0; n_iter < 2; n_iter++) {
+		for (int l = 0; l < 32; l++) {
+			ap[l]	   = (int8_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+			ap[l + 32] = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+			ap[l + 64] = (int8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+			ap[l + 96] = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+		}
+		ap += 128;
+		ql += 64;
+		qh += 32;
+	}
+
+	int32_t total = 0;
+	for (int j = 0; j < 16; j++) {
+		int32_t l0 = 0;
+		int32_t l1 = 0;
+		for (int l = 0; l < 8; l++) {
+			l0 += (int)xq8[l] * (int)ap[l];
+			l1 += (int)xq8[l + 8] * (int)ap[l + 8];
+		}
+		total += sc[j] * (l0 + l1);
+		xq8 += 16;
+		ap += 16;
+	}
+	return acc + d * (float)total;
+}
+
+static void matmul_q6_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *wb			  = w;
+
+	for (int g = 0; g < n; g += Q6_K_R8_ROWS) {
+		const uint8_t *dgroup =
+			wb + ((size_t)g / Q6_K_R8_ROWS) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
+		float sumf[Q6_K_R8_ROWS] = {0};
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q6_K_R8_GROUP_BYTES;
+			const uint8_t  *qls	 = dblk + Q6_K_R8_OFF_QL;
+			const uint8_t  *qhs	 = dblk + Q6_K_R8_OFF_QH;
+			const int8_t   *scs	 = (const int8_t *)(dblk + Q6_K_R8_OFF_SCALES);
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q6_K_R8_OFF_D);
+
+			const q8_k_block *restrict xb = &xq[bi];
+			for (int r = 0; r < Q6_K_R8_ROWS; r++) {
+				sumf[r] = q6_k_r8_dot(qls + (size_t)r * 128, qhs + (size_t)r * 64,
+									  scs + (size_t)r * 16, ds[r], xb->qs, xb->d, sumf[r]);
+			}
+		}
+		int rows_out = n - g;
+		if (rows_out > Q6_K_R8_ROWS)
+			rows_out = Q6_K_R8_ROWS;
+		for (int r = 0; r < rows_out; r++)
+			y[g + r] = sumf[r];
+	}
+}
+
+MATMUL_QONLY_DISPATCH(q6_k_r8_q8_k, q8_k_block)
+
 static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 											float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 32;

@@ -577,6 +577,15 @@ static test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_ou
 	case GGML_TYPE_IQ3_S_RE8:
 		*base_type_out = GGML_TYPE_IQ3_S;
 		return repack_iq3_s_to_iq3_s_re8;
+	case GGML_TYPE_Q4_K_R8:
+		*base_type_out = GGML_TYPE_Q4_K;
+		return repack_q4_k_to_q4_k_r8;
+	case GGML_TYPE_Q5_K_R8:
+		*base_type_out = GGML_TYPE_Q5_K;
+		return repack_q5_k_to_q5_k_r8;
+	case GGML_TYPE_Q6_K_R8:
+		*base_type_out = GGML_TYPE_Q6_K;
+		return repack_q6_k_to_q6_k_r8;
 	default:
 		*base_type_out = type;
 		return NULL;
@@ -666,6 +675,9 @@ const qtype_info QTYPES[] = {
 	{"iq4_nl_r8", GGML_TYPE_IQ4_NL_R8, 32, sizeof(iq4_nl_block)},
 	{"iq3_s_re", GGML_TYPE_IQ3_S_RE, 256, sizeof(iq3_s_block)},
 	{"iq3_s_re8", GGML_TYPE_IQ3_S_RE8, 256, sizeof(iq3_s_block)},
+	{"q4_k_r8", GGML_TYPE_Q4_K_R8, 256, Q4_K_R8_GROUP_BYTES / Q4_K_R8_ROWS},
+	{"q5_k_r8", GGML_TYPE_Q5_K_R8, 256, Q5_K_R8_GROUP_BYTES / Q5_K_R8_ROWS},
+	{"q6_k_r8", GGML_TYPE_Q6_K_R8, 256, Q6_K_R8_GROUP_BYTES / Q6_K_R8_ROWS},
 	{"f16", GGML_TYPE_F16, 1, sizeof(uint16_t)},
 	{"bf16", GGML_TYPE_BF16, 1, sizeof(uint16_t)},
 	{"f32", GGML_TYPE_F32, 1, sizeof(float)},

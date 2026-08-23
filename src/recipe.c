@@ -497,6 +497,8 @@ static stage matmul_substage(uint8_t w_idx) {
 	case WIDX_SHEXP_UP:
 	case WIDX_SHEXP_DOWN:
 		return STAGE_MATMUL_FFN;
+	case WIDX_OUTPUT_W:
+		return STAGE_LOGITS_MATMUL;
 	default:
 		return STAGE_MATMUL;
 	}

@@ -451,10 +451,12 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 }
 int model_should_repack(uint32_t type, const char *repack_config) {
 	if (!repack_config)
-		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL;
+		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
+			   type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
 	if (strcmp(repack_config, "all") == 0)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ||
-			   type == GGML_TYPE_Q4_0;
+			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+			   type == GGML_TYPE_Q6_K;
 	if (strcmp(repack_config, "none") == 0)
 		return 0;
 
@@ -499,6 +501,15 @@ static void repack_weight(backend *home, const void *src, void *dst, uint32_t ty
 	} else if (type == GGML_TYPE_IQ4_NL) {
 		job.rows_per_group = IQ4_NL_R8_ROWS;
 		job.repack_fn	   = repack_iq4_nl_to_iq4_nl_r8_rows;
+	} else if (type == GGML_TYPE_Q4_K) {
+		job.rows_per_group = Q4_K_R8_ROWS;
+		job.repack_fn	   = repack_q4_k_to_q4_k_r8_rows;
+	} else if (type == GGML_TYPE_Q5_K) {
+		job.rows_per_group = Q5_K_R8_ROWS;
+		job.repack_fn	   = repack_q5_k_to_q5_k_r8_rows;
+	} else if (type == GGML_TYPE_Q6_K) {
+		job.rows_per_group = Q6_K_R8_ROWS;
+		job.repack_fn	   = repack_q6_k_to_q6_k_r8_rows;
 	} else {
 		job.rows_per_group = 1;
 		job.repack_fn	   = repack_iq4_nl_to_q8_0_rows;
@@ -548,6 +559,12 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 			re_type = GGML_TYPE_Q8_0_R8;
 		} else if (type == GGML_TYPE_Q4_0 && (d0 % 32) == 0 && (d1 % Q4_0_R8_ROWS) == 0) {
 			re_type = GGML_TYPE_Q4_0_R8;
+		} else if (type == GGML_TYPE_Q4_K && (d0 % 256) == 0 && (d1 % Q4_K_R8_ROWS) == 0) {
+			re_type = GGML_TYPE_Q4_K_R8;
+		} else if (type == GGML_TYPE_Q5_K && (d0 % 256) == 0 && (d1 % Q5_K_R8_ROWS) == 0) {
+			re_type = GGML_TYPE_Q5_K_R8;
+		} else if (type == GGML_TYPE_Q6_K && (d0 % 256) == 0 && (d1 % Q6_K_R8_ROWS) == 0) {
+			re_type = GGML_TYPE_Q6_K_R8;
 		}
 	}
 

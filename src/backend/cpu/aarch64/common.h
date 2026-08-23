@@ -4,6 +4,26 @@
 #include <arm_neon.h>
 #include <string.h>
 
+#ifndef CACHE_LINE_BYTES
+#define CACHE_LINE_BYTES 64
+#endif
+
+#ifndef L1D_SIZE_BYTES
+#define L1D_SIZE_BYTES (32 * 1024)
+#endif
+
+#ifndef L2_SIZE_BYTES
+#define L2_SIZE_BYTES (512 * 1024)
+#endif
+
+#ifndef PREFETCH_LOCALITY
+#define PREFETCH_LOCALITY 1
+#endif
+
+#define PREFETCH(addr) __builtin_prefetch((addr), 0, PREFETCH_LOCALITY)
+
+#define PF_ELEMS(base_elems_64b_line) (((base_elems_64b_line) * (CACHE_LINE_BYTES)) / 64)
+
 static inline float f16_to_f32_fast(uint16_t h) {
 	__fp16 v;
 	memcpy(&v, &h, sizeof(v));

@@ -54,6 +54,29 @@ else
   SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
 endif
 
+ifeq ($(CPU_ARCH_OPT),1)
+  ifeq ($(HOST_ARCH),aarch64)
+    KAI_CACHE_LINE   := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
+    KAI_L1D_KB	     := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
+    KAI_L2_KB	     := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
+			    if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
+			      cat $$d/size | tr -dc '0-9'; break; fi; done)
+  endif
+endif
+
+ifneq ($(strip $(KAI_CACHE_LINE)),)
+  CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
+endif
+ifneq ($(strip $(KAI_L1D_KB)),)
+  CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
+endif
+ifneq ($(strip $(KAI_L2_KB)),)
+  CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
+  ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
+    CFLAGS += -DPREFETCH_LOCALITY=0
+  endif
+endif
+
 ifeq ($(BUILD),debug)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O0 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
@@ -123,7 +146,8 @@ BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
 	      $(OBJ_DIR)/models $(OBJ_DIR)/test
 
 CONFIG_STAMP := $(OUT_DIR)/.build-config
-CONFIG_SIG   := BUILD=$(BUILD) BACKENDS=$(sort $(REQUESTED_BACKENDS)) CPU_ARCH_OPT=$(CPU_ARCH_OPT) HOST_ARCH=$(HOST_ARCH)
+CONFIG_SIG   := BUILD=$(BUILD) BACKENDS=$(sort $(REQUESTED_BACKENDS)) CPU_ARCH_OPT=$(CPU_ARCH_OPT) HOST_ARCH=$(HOST_ARCH) \
+		CACHE_LINE=$(KAI_CACHE_LINE) L1D_KB=$(KAI_L1D_KB) L2_KB=$(KAI_L2_KB)
 PREV_SIG     := $(shell cat $(CONFIG_STAMP) 2>/dev/null)
 
 CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help
@@ -292,6 +316,8 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
+	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
+	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
 	@echo "BACKENDS           = $(REQUESTED_BACKENDS)"
 	@echo "LIB_SRCS           = $(LIB_SRCS)"

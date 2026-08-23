@@ -29,6 +29,15 @@ static repack_fn bench_repack_fn(uint32_t type, uint32_t *base_type_out) {
 	case GGML_TYPE_IQ3_S_RE8:
 		*base_type_out = GGML_TYPE_IQ3_S;
 		return repack_iq3_s_to_iq3_s_re8;
+	case GGML_TYPE_Q4_K_R8:
+		*base_type_out = GGML_TYPE_Q4_K;
+		return repack_q4_k_to_q4_k_r8;
+	case GGML_TYPE_Q5_K_R8:
+		*base_type_out = GGML_TYPE_Q5_K;
+		return repack_q5_k_to_q5_k_r8;
+	case GGML_TYPE_Q6_K_R8:
+		*base_type_out = GGML_TYPE_Q6_K;
+		return repack_q6_k_to_q6_k_r8;
 	default:
 		*base_type_out = type;
 		return NULL;

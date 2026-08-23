@@ -112,6 +112,9 @@ static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_Q8_0_R8, matmul_q8_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q4_0_R8, matmul_q4_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL_R8, matmul_iq4_nl_r8_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q4_K_R8, matmul_q4_k_r8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q5_K_R8, matmul_q5_k_r8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q6_K_R8, matmul_q6_k_r8_q8_k_qonly_f32, 3),
 };
 
 static inline status_code cpu_scratch_grow_aligned(void **buf, size_t *cap_bytes, size_t need_bytes,
@@ -644,6 +647,9 @@ static const grouped_matmul_kernel k_grouped_kernels[] = {
 	{GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q5_K_R8, Q5_K_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q6_K_R8, Q6_K_R8_ROWS, cpu_matmul_groups_worker},
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
