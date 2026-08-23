@@ -1321,26 +1321,9 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	while (m_pow2 < m)
 		m_pow2 <<= 1;
 
-	int	 bitrev_stack[ATTN_BITREV_STACK_MAX];
 	int *bitrev_perm = NULL;
-	if (use_bitrev) {
-		if (m_pow2 <= ATTN_BITREV_STACK_MAX) {
-			bitrev_perm = bitrev_stack;
-		} else {
-			bitrev_perm = xmalloc((size_t)m_pow2 * sizeof(int));
-		}
-		unsigned bits = 0;
-		while ((1u << bits) < (unsigned)m_pow2)
-			bits++;
-		for (int r = 0; r < m_pow2; r++) {
-			unsigned rev = 0, tmp = (unsigned)r;
-			for (unsigned b = 0; b < bits; b++) {
-				rev = (rev << 1) | (tmp & 1u);
-				tmp >>= 1;
-			}
-			bitrev_perm[r] = (int)rev;
-		}
-	}
+	if (use_bitrev)
+		bitrev_perm = cpu_bitrev_perm_get(p, m_pow2);
 
 	cpu_attn_batch_job_neon job = {.kl_base		= kl_base_raw,
 								   .vl_base		= vl_base_raw,
@@ -1367,9 +1350,6 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	} else {
 		cpu_attn_batch_chunk_neon(0, total, 0, &job);
 	}
-
-	if (bitrev_perm != bitrev_stack && bitrev_perm != NULL)
-		free(bitrev_perm);
 
 	return OK;
 }
@@ -1648,25 +1628,19 @@ status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer 
 	return OK;
 }
 
-static void cpu_ffn_act_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	cpu_ffn_act_batch_job *j = ctx;
-	int					   n = j->n;
-	tpool_chunk_fn fn = (j->activation == 1) ? cpu_ffn_gelu_chunk_neon : cpu_ffn_silu_chunk_neon;
-	for (int row = begin; row < end; row++) {
-		cpu_ffn_act_args a = {.g = j->g + ((size_t)row * n),
-							  .u = j->u + ((size_t)row * n),
-							  .o = j->o + ((size_t)row * n)};
-		fn(0, n, 0, &a);
-	}
-}
-
 status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								   int n, int activation, int m) {
-	cpu_priv			 *p	  = self->priv;
-	cpu_ffn_act_batch_job job = {
-		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
-	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk_neon, &job);
+	cpu_priv		*p	   = self->priv;
+	tpool_chunk_fn	 fn	   = (activation == 1) ? cpu_ffn_gelu_chunk_neon : cpu_ffn_silu_chunk_neon;
+	cpu_ffn_act_args a	   = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
+	const size_t	 total = (size_t)m * (size_t)n;
+
+	if (tpool_current_tid() < 0 && p->pool && total >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
+		tpool_parallel_for(p->pool, (int)total, CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
+		return OK;
+	}
+
+	fn(0, (int)total, 0, &a);
 	return OK;
 }
 
@@ -2048,5 +2022,8 @@ void detect_features(char *buf, size_t cap) {
 #endif
 #if defined(__ARM_FEATURE_SVE)
 	feat_add(buf, cap, "sve");
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+	feat_add(buf, cap, "i8mm");
 #endif
 }

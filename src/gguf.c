@@ -113,6 +113,9 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 		[GGML_TYPE_Q4_0_R8]	  = {GGML_TYPE_Q4_0_R8, "q4_0_r8", 18, 32},
 		[GGML_TYPE_IQ3_S_RE8] = {GGML_TYPE_IQ3_S_RE8, "iq3_s_re8", 134, 256},
 		[GGML_TYPE_IQ4_NL_R8] = {GGML_TYPE_IQ4_NL_R8, "iq4_nl_r8", 18, 32},
+		[GGML_TYPE_Q4_K_R8]	  = {GGML_TYPE_Q4_K_R8, "q4_k_r8", 148, 256},
+		[GGML_TYPE_Q5_K_R8]	  = {GGML_TYPE_Q5_K_R8, "q5_k_r8", 180, 256},
+		[GGML_TYPE_Q6_K_R8]	  = {GGML_TYPE_Q6_K_R8, "q6_k_r8", 210, 256},
 	};
 	if (t >= ARRAY_LEN(table))
 		return NULL;

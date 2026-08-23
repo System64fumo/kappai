@@ -22,26 +22,60 @@ static void compute_scratch_set_router_bufs(compute_scratch *s) {
 	rw->owner	  = NULL;
 }
 
-static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head_dim, float theta) {
-	const int	 half		 = head_dim / 2;
-	const double theta_scale = pow(theta, -2.0 / (double)head_dim);
-	double		 freq		 = 1.0;
-	for (int j = 0; j < half; j++) {
+typedef struct {
+	float *cos_out;
+	float *sin_out;
+	int	   n_ctx;
+	int	   half;
+	double theta_scale;
+} rope_table_job;
+
+#define ROPE_TABLE_BLOCK 4096
+
+static void rope_table_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	rope_table_job *j = ctx;
+	for (int col = begin; col < end; col++) {
+		double freq		= pow(j->theta_scale, (double)col);
 		double step_cos = cos(freq);
 		double step_sin = sin(freq);
-		double c		= 1.0;
-		double s		= 0.0;
-		float *cos_col	= cos_out + j;
-		float *sin_col	= sin_out + j;
-		for (int pos = 0; pos < n_ctx; pos++) {
-			cos_col[(ptrdiff_t)pos * half] = (float)c;
-			sin_col[(ptrdiff_t)pos * half] = (float)s;
-			double nc					   = (c * step_cos) - (s * step_sin);
-			s							   = (c * step_sin) + (s * step_cos);
-			c							   = nc;
+		float *cos_col	= j->cos_out + col;
+		float *sin_col	= j->sin_out + col;
+		for (int base = 0; base < j->n_ctx; base += ROPE_TABLE_BLOCK) {
+			int	   stop	 = base + ROPE_TABLE_BLOCK > j->n_ctx ? j->n_ctx : base + ROPE_TABLE_BLOCK;
+			double angle = freq * (double)base;
+			double c	 = cos(angle);
+			double s	 = sin(angle);
+			cos_col[(ptrdiff_t)base * j->half] = (float)c;
+			sin_col[(ptrdiff_t)base * j->half] = (float)s;
+			for (int pos = base + 1; pos < stop; pos++) {
+				double nc						  = (c * step_cos) - (s * step_sin);
+				s								  = (c * step_sin) + (s * step_cos);
+				c								  = nc;
+				cos_col[(ptrdiff_t)pos * j->half] = (float)c;
+				sin_col[(ptrdiff_t)pos * j->half] = (float)s;
+			}
 		}
-		freq *= theta_scale;
 	}
+}
+
+static void build_rope_table(backend *a, float *cos_out, float *sin_out, int n_ctx, int head_dim,
+							 float theta) {
+	const int	   half		   = head_dim / 2;
+	const double   theta_scale = pow(theta, -2.0 / (double)head_dim);
+	rope_table_job job		   = {.cos_out	   = cos_out,
+								  .sin_out	   = sin_out,
+								  .n_ctx	   = n_ctx,
+								  .half		   = half,
+								  .theta_scale = theta_scale};
+
+	tpool *pool = (a && a->get_pool) ? a->get_pool(a) : NULL;
+	if (pool && tpool_n_threads(pool) > 1 && half >= tpool_n_threads(pool) &&
+		tpool_current_tid() < 0) {
+		tpool_parallel_for(pool, half, 1, rope_table_chunk, &job);
+		return;
+	}
+	rope_table_chunk(0, half, -1, &job);
 }
 
 static void free_buf(buffer *b) {
@@ -103,7 +137,10 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free(s->transfer_buf);
 	s->transfer_buf		= NULL;
 	s->transfer_buf_cap = 0;
-	free(s->logits_host);
+	if (!s->logits_alias)
+		free(s->logits_host);
+	s->logits_host	= NULL;
+	s->logits_alias = 0;
 }
 
 static void scratch_free_host_buffers(compute_scratch *s) {
@@ -329,7 +366,14 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	if (_st != OK)
 		return _st;
 
-	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
+	if (backend_has_cap(a, BCAP_IS_HOST)) {
+		buffer *lb		= &s->slots[RECIPE_SLOT_LOGITS];
+		s->logits_host	= (float *)((char *)lb->handle + lb->offset);
+		s->logits_alias = 1;
+	} else {
+		s->logits_host	= xmalloc((size_t)m->vocab_size * sizeof(float));
+		s->logits_alias = 0;
+	}
 
 	compute_scratch_set_router_bufs(s);
 
@@ -337,13 +381,13 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
 		s->rope_cos_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
 		s->rope_sin_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		build_rope_table(s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
+		build_rope_table(a, s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
 						 m->layer_dims.rope_theta_swa);
 
 		const int half_global = m->layer_dims.head_dim_global / 2;
 		s->rope_cos			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
 		s->rope_sin			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
+		build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
 						 m->layer_dims.rope_theta_global);
 
 		if (m->has_per_layer_embeddings) {
@@ -371,7 +415,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		const int half = rope_head_dim / 2;
 		s->rope_cos	   = xmalloc((size_t)n_ctx * half * sizeof(float));
 		s->rope_sin	   = xmalloc((size_t)n_ctx * half * sizeof(float));
-		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+		build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
 	}
 
 	s->allocated_n_ctx = n_ctx;

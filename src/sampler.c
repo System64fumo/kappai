@@ -62,6 +62,8 @@ void sampler_free(sampler *s) {
 	free(s->recent);
 	free(s->logits_buf);
 	free(s->cand_buf);
+	free(s->heap_scores);
+	free(s->heap_idx);
 	memset(s, 0, sizeof(*s));
 }
 
@@ -104,20 +106,34 @@ int32_t sampler_argmax(const float *logits, int vocab) {
 	return cpu_argmax_f32(logits, vocab);
 }
 
-static int top_k_heap(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	static float *hs;
-	static int	 *hi;
-	static int	  cap;
+static int top_k_heap(sampler *s, const float *logits, int vocab, int k, sampler_top_k_entry *out) {
+	float	*hs = NULL;
+	int32_t *hi = NULL;
+	if (s) {
+		if (s->heap_cap < k) {
+			s->heap_scores = xrealloc(s->heap_scores, (size_t)k * sizeof(float));
+			s->heap_idx	   = xrealloc(s->heap_idx, (size_t)k * sizeof(int32_t));
+			s->heap_cap	   = k;
+		}
+		hs = s->heap_scores;
+		hi = s->heap_idx;
+	} else {
+		static _Thread_local float	 *tls_h;
+		static _Thread_local int32_t *tls_i;
+		static _Thread_local int	  tls_cap;
+		if (tls_cap < k) {
+			tls_h	= xrealloc(tls_h, (size_t)k * sizeof(float));
+			tls_i	= xrealloc(tls_i, (size_t)k * sizeof(int32_t));
+			tls_cap = k;
+		}
+		hs = tls_h;
+		hi = tls_i;
+	}
 
 	if (k > vocab)
 		k = vocab;
 	if (k <= 0)
 		return 0;
-	if (cap < k) {
-		hs	= xrealloc(hs, (size_t)k * sizeof(float));
-		hi	= xrealloc(hi, (size_t)k * sizeof(int));
-		cap = k;
-	}
 	int hn = topk_heap_select(logits, vocab, k, hs, hi);
 	for (int i = 0; i < hn; i++) {
 		out[i].v = hs[i];
@@ -133,18 +149,19 @@ static int cmp_desc(const void *a, const void *b) {
 }
 
 int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	int kept = top_k_heap(logits, vocab, k, out);
+	int kept = top_k_heap(NULL, logits, vocab, k, out);
 	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	return kept;
 }
 
-static int top_all_desc(const float *logits, int vocab, sampler_top_k_entry *out, int max_keep) {
+static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_k_entry *out,
+						int max_keep) {
 	if (max_keep > vocab)
 		max_keep = vocab;
 	if (max_keep <= 0)
 		return 0;
 
-	int kept = top_k_heap(logits, vocab, max_keep, out);
+	int kept = top_k_heap(s, logits, vocab, max_keep, out);
 	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	return kept;
 }
@@ -166,7 +183,7 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 							  sampler_top_k_entry *arr) {
 	int kept;
 	if (s->top_k > 0 && s->top_k < vocab) {
-		kept = top_k_heap(logits, vocab, s->top_k, arr);
+		kept = top_k_heap(s, logits, vocab, s->top_k, arr);
 		qsort(arr, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	} else {
 		int cap;
@@ -174,7 +191,7 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 			cap = vocab < 1024 ? vocab : 1024;
 		else
 			cap = vocab;
-		kept = top_all_desc(logits, vocab, arr, cap);
+		kept = top_all_desc(s, logits, vocab, arr, cap);
 	}
 	return kept;
 }

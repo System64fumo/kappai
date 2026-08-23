@@ -18,10 +18,11 @@ typedef struct {
 	const char *key_prefix;
 	model_arch	arch;
 
-	bool  has_scale_embeddings;
 	float default_rope_theta;
 	int	  sliding_window_period;
+	int	  moe_first_dense_layers;
 
+	bool has_scale_embeddings;
 	bool has_qk_norm;
 	bool has_per_layer_embeddings;
 	bool has_post_norm_ple;
@@ -40,7 +41,6 @@ typedef struct {
 	bool is_hybrid_recurrent;
 	bool has_attn_output_gate;
 	bool uses_post_attn_norm_for_ffn;
-	int	 moe_first_dense_layers;
 	bool uses_moe_norm_topk_prob;
 } arch_info;
 

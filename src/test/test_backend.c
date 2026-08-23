@@ -1361,6 +1361,168 @@ static void test_op_kv_put(backend *cpu, backend *tgt, int n_kv_heads, int head_
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static void test_op_kv_put_batch(backend *cpu, backend *tgt, int n_kv_heads, int head_dim,
+								 int n_ctx, int pos_start, int m) {
+	char label[112];
+	snprintf(label, sizeof(label), "kv_put_batch h=%d d=%d pos=%d m=%d", n_kv_heads, head_dim,
+			 pos_start, m);
+	if (!tgt->kv_put_batch) {
+		record_result(OPFAM_KV_PUT, label, V_SKIP, "backend has no native kv_put_batch");
+		return;
+	}
+
+	int		is_host = backend_has_cap(tgt, BCAP_IS_HOST);
+	int		n_kv	= n_kv_heads * head_dim;
+	size_t	total	= (size_t)m * (size_t)n_kv;
+	kv_desc kvd		= {.n_ctx		= n_ctx,
+					   .n_kv_heads	= n_kv_heads,
+					   .head_dim	= head_dim,
+					   .n_layers	= 1,
+					   .n_kv_layers = 1};
+
+	float *k_all = xmalloc(total * sizeof(float));
+	float *v_all = xmalloc(total * sizeof(float));
+	seed_test_rng(0x4B57ULL + ((uint64_t)n_kv_heads * 11) + ((uint64_t)head_dim * 5) +
+				  (uint64_t)pos_start + (uint64_t)m);
+	fill_random_f32(k_all, (int)total, 1.0f);
+	fill_random_f32(v_all, (int)total, 1.0f);
+
+	buffer kc_cpu = {0}, vc_cpu = {0}, ki_cpu = {0}, vi_cpu = {0};
+	cpu->kv_alloc(cpu, &kvd, &kc_cpu, &vc_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n_kv * sizeof(float), &ki_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n_kv * sizeof(float), &vi_cpu);
+	for (int r = 0; r < m; r++) {
+		cpu->buffer_write_f32(cpu, &ki_cpu, k_all + (size_t)r * n_kv, n_kv);
+		cpu->buffer_write_f32(cpu, &vi_cpu, v_all + (size_t)r * n_kv, n_kv);
+		cpu->kv_put(cpu, &kc_cpu, &vc_cpu, 0, pos_start + r, &ki_cpu, &vi_cpu, n_kv_heads, head_dim,
+					n_ctx, n_kv_heads);
+	}
+	if (cpu->synchronize)
+		cpu->synchronize(cpu);
+
+	buffer kc_tgt = {0}, vc_tgt = {0}, ki_tgt = {0}, vi_tgt = {0};
+	tgt->kv_alloc(tgt, &kvd, &kc_tgt, &vc_tgt);
+	tgt->buffer_alloc_scratch(tgt, total * sizeof(float), &ki_tgt);
+	tgt->buffer_alloc_scratch(tgt, total * sizeof(float), &vi_tgt);
+	tgt->buffer_write_f32(tgt, &ki_tgt, k_all, (int)total);
+	tgt->buffer_write_f32(tgt, &vi_tgt, v_all, (int)total);
+	status_code s_tgt = tgt->kv_put_batch(tgt, &kc_tgt, &vc_tgt, 0, pos_start, &ki_tgt, &vi_tgt,
+										  n_kv, n_kv_heads, head_dim, n_ctx, n_kv_heads, m);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+
+	verdict v;
+	char	detail[256];
+	if (is_host || !tgt->attention) {
+		if (!is_host) {
+			v = V_SKIP;
+			snprintf(detail, sizeof(detail),
+					 "non-host backend has no attention for indirect check");
+			goto record;
+		}
+		uint16_t *kc_cpu_p	 = kc_cpu.handle;
+		uint16_t *vc_cpu_p	 = vc_cpu.handle;
+		uint16_t *kc_tgt_p	 = kc_tgt.handle;
+		uint16_t *vc_tgt_p	 = vc_tgt.handle;
+		size_t	  kvh_stride = (size_t)n_ctx * head_dim;
+		int		  fail		 = 0;
+		for (int r = 0; r < m && !fail; r++) {
+			for (int h = 0; h < n_kv_heads && !fail; h++) {
+				size_t base = ((size_t)h * kvh_stride) + (size_t)(pos_start + r) * head_dim;
+				for (int d = 0; d < head_dim; d++) {
+					float kr = f16_to_f32(kc_cpu_p[base + d]);
+					float kt = f16_to_f32(kc_tgt_p[base + d]);
+					float vr = f16_to_f32(vc_cpu_p[base + d]);
+					float vt = f16_to_f32(vc_tgt_p[base + d]);
+					if (kr != kt || vr != vt) {
+						fail = 1;
+						break;
+					}
+				}
+			}
+		}
+		v = (s_tgt == OK && !fail) ? V_PASS : V_FAIL;
+		snprintf(detail, sizeof(detail), "%s",
+				 (s_tgt == OK && !fail) ? "batched write matches per-row writes"
+										: "batched KV write mismatch");
+	} else {
+		int	  n_att = n_kv_heads * head_dim;
+		float scale = 1.0f / sqrtf((float)head_dim);
+		int	  last	= pos_start + m - 1;
+
+		float *q = xmalloc((size_t)n_att * sizeof(float));
+		fill_random_f32(q, n_att, 1.0f);
+
+		buffer kc_ref = {0}, vc_ref = {0};
+		tgt->kv_alloc(tgt, &kvd, &kc_ref, &vc_ref);
+		buffer row_k = {0}, row_v = {0};
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_k);
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_v);
+		for (int r = 0; r < m; r++) {
+			tgt->buffer_write_f32(tgt, &row_k, k_all + (size_t)r * n_kv, n_kv);
+			tgt->buffer_write_f32(tgt, &row_v, v_all + (size_t)r * n_kv, n_kv);
+			status_code prs = tgt->kv_put(tgt, &kc_ref, &vc_ref, 0, pos_start + r, &row_k, &row_v,
+										  n_kv_heads, head_dim, n_ctx, n_kv_heads);
+			if (prs != OK) {
+				v = V_FAIL;
+				snprintf(detail, sizeof(detail), "reference kv_put failed at row %d: %d", r, prs);
+				goto record;
+			}
+		}
+		if (tgt->synchronize)
+			tgt->synchronize(tgt);
+		tgt->buffer_free(tgt, &row_k);
+		tgt->buffer_free(tgt, &row_v);
+
+		buffer q_tgt = {0}, out_a = {0}, out_b = {0};
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_att * sizeof(float), &q_tgt);
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_att * sizeof(float), &out_a);
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_att * sizeof(float), &out_b);
+		tgt->buffer_write_f32(tgt, &q_tgt, q, n_att);
+		status_code st_batch =
+			tgt->attention(tgt, &q_tgt, &kc_tgt, &vc_tgt, &out_a, 0, last, n_kv_heads, n_kv_heads,
+						   head_dim, n_ctx, 0, scale, n_kv_heads);
+		status_code st_rows =
+			tgt->attention(tgt, &q_tgt, &kc_ref, &vc_ref, &out_b, 0, last, n_kv_heads, n_kv_heads,
+						   head_dim, n_ctx, 0, scale, n_kv_heads);
+		if (tgt->synchronize)
+			tgt->synchronize(tgt);
+
+		float *y_batch = xmalloc((size_t)n_att * sizeof(float));
+		float *y_rows  = xmalloc((size_t)n_att * sizeof(float));
+		tgt->buffer_read_f32(tgt, &out_a, y_batch, n_att);
+		tgt->buffer_read_f32(tgt, &out_b, y_rows, n_att);
+
+		v = classify_output("exact", y_rows, y_batch, n_att, (st_batch == OK ? st_rows : st_batch),
+							detail, sizeof(detail));
+		int dl = (int)strlen(detail);
+		snprintf(detail + dl, sizeof(detail) - dl,
+				 " | indirect: batch-written cache vs per-row cache, same backend");
+		free(q);
+		free(y_batch);
+		free(y_rows);
+		tgt->buffer_free(tgt, &q_tgt);
+		tgt->buffer_free(tgt, &out_a);
+		tgt->buffer_free(tgt, &out_b);
+		tgt->buffer_free(tgt, &kc_ref);
+		tgt->buffer_free(tgt, &vc_ref);
+	}
+
+record:
+	record_result(OPFAM_KV_PUT, label, v, detail);
+
+	free(k_all);
+	free(v_all);
+	cpu->buffer_free(cpu, &ki_cpu);
+	cpu->buffer_free(cpu, &vi_cpu);
+	cpu->buffer_free(cpu, &kc_cpu);
+	cpu->buffer_free(cpu, &vc_cpu);
+	tgt->buffer_free(tgt, &ki_tgt);
+	tgt->buffer_free(tgt, &vi_tgt);
+	tgt->buffer_free(tgt, &kc_tgt);
+	tgt->buffer_free(tgt, &vc_tgt);
+}
+
 static void test_op_kv_quant_parity(backend *b, int n_kv_heads, int head_dim, int n_ctx, int pos) {
 	char label[128];
 	snprintf(label, sizeof(label), "kv_quant q8_0 vs f16 h=%d d=%d pos=%d [%s]", n_kv_heads,
@@ -2436,6 +2598,8 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	test_op_kv_put(cpu, tgt, 4, 64, 1024, 0);
 	test_op_kv_put(cpu, tgt, 4, 64, 1024, 127);
 	test_op_kv_put(cpu, tgt, 8, 128, 2048, 511);
+	test_op_kv_put_batch(cpu, tgt, 4, 64, 1024, 0, 7);
+	test_op_kv_put_batch(cpu, tgt, 8, 128, 2048, 511, 33);
 	flush_family(OPFAM_KV_PUT);
 
 	run_kv_quant_parity_tests(cpu, tgt);

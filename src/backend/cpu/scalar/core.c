@@ -112,6 +112,9 @@ static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_Q8_0_R8, matmul_q8_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q4_0_R8, matmul_q4_0_r8_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL_R8, matmul_iq4_nl_r8_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q4_K_R8, matmul_q4_k_r8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q5_K_R8, matmul_q5_k_r8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q6_K_R8, matmul_q6_k_r8_q8_k_qonly_f32, 3),
 };
 
 static inline status_code cpu_scratch_grow_aligned(void **buf, size_t *cap_bytes, size_t need_bytes,
@@ -215,6 +218,7 @@ static void cpu_free(backend *self) {
 
 	free(p->mla_krot.buf);
 	free(p->residual_tmp);
+	free(p->bitrev_perm_cache);
 	free(p->rope_cs.cs);
 	free(p->kv_layer_off);
 	free(p);
@@ -382,14 +386,6 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 	return OK;
 }
 
-static void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *kfh, const float *vfh,
-								int head_dim) {
-	for (int i = 0; i < head_dim; i++) {
-		kd[i] = f32_to_f16(kfh[i]);
-		vd[i] = f32_to_f16(vfh[i]);
-	}
-}
-
 __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer,
 											 int pos, const buffer *k_in, const buffer *v_in,
 											 int n_kv_heads, int head_dim, int n_ctx,
@@ -425,6 +421,89 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 		cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 							vf + ((size_t)kvh * head_dim), head_dim);
 	}
+	return OK;
+}
+
+typedef struct {
+	cpu_priv	*p;
+	buffer		*k, *v;
+	int			 layer;
+	int			 pos_start;
+	const float *kf_base;
+	const float *vf_base;
+	int			 in_row_stride;
+	int			 n_kv_heads;
+	int			 head_dim;
+	int			 n_ctx;
+	int			 n_active;
+} cpu_kv_put_batch_job;
+
+static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_kv_put_batch_job *j		   = ctx;
+	cpu_priv			 *p		   = j->p;
+	int					  n_active = j->n_active > 0 ? j->n_active : j->n_kv_heads;
+
+	for (int idx = begin; idx < end; idx++) {
+		int	   row = idx / n_active;
+		int	   kvh = idx % n_active;
+		size_t layer_base =
+			p->kv_layer_off
+				? p->kv_layer_off[j->layer]
+				: ((size_t)j->layer * (size_t)j->n_kv_heads * j->n_ctx *
+				   ((p->kv_quant == KV_QUANT_Q8_0) ? (((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) /
+													  KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
+												   : ((size_t)j->head_dim * sizeof(uint16_t))));
+		const float *kf = j->kf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		const float *vf = j->vf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		if (p->kv_quant == KV_QUANT_Q8_0) {
+			size_t n_blocks	  = ((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+			size_t blk_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
+			size_t kvh_stride = (size_t)j->n_ctx * blk_stride;
+			size_t off =
+				layer_base + (size_t)kvh * kvh_stride + (size_t)(j->pos_start + row) * blk_stride;
+			cpu_kv_put_q8_0_head((uint8_t *)j->k->handle + off, (uint8_t *)j->v->handle + off, kf,
+								 vf, j->head_dim);
+		} else {
+			size_t	  hd_stride	 = (size_t)j->head_dim;
+			size_t	  kvh_stride = (size_t)j->n_ctx * hd_stride;
+			uint16_t *kd_base	 = (uint16_t *)cpu_ptr(j->k);
+			uint16_t *vd_base	 = (uint16_t *)cpu_ptr(j->v);
+			size_t	  off		 = (layer_base / sizeof(uint16_t)) + (size_t)kvh * kvh_stride +
+								   (size_t)(j->pos_start + row) * hd_stride;
+			cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf, vf, j->head_dim);
+		}
+	}
+}
+
+static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+									const buffer *k_in, const buffer *v_in, int in_row_stride,
+									int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+									int m) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int		  total	   = m * n_active;
+	if (total <= 0)
+		return OK;
+
+	cpu_kv_put_batch_job job = {.p			   = p,
+								.k			   = k,
+								.v			   = v,
+								.layer		   = layer,
+								.pos_start	   = pos_start,
+								.kf_base	   = (const float *)cpu_ptr(k_in),
+								.vf_base	   = (const float *)cpu_ptr(v_in),
+								.in_row_stride = in_row_stride,
+								.n_kv_heads	   = n_kv_heads,
+								.head_dim	   = head_dim,
+								.n_ctx		   = n_ctx,
+								.n_active	   = n_active};
+
+	if (p->pool && tpool_current_tid() < 0 && total >= 2) {
+		tpool_parallel_for(p->pool, total, 1, cpu_kv_put_batch_chunk, &job);
+		return OK;
+	}
+	cpu_kv_put_batch_chunk(0, total, -1, &job);
 	return OK;
 }
 
@@ -568,6 +647,9 @@ static const grouped_matmul_kernel k_grouped_kernels[] = {
 	{GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker},
 	{GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q5_K_R8, Q5_K_R8_ROWS, cpu_matmul_groups_worker},
+	{GGML_TYPE_Q6_K_R8, Q6_K_R8_ROWS, cpu_matmul_groups_worker},
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
@@ -955,33 +1037,18 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 	if (n_matmuls > CPU_MATMUL_MULTI_MAX)
 		return ERR_INVALID_ARG;
 
-	for (int i = 0; i < n_matmuls; i++) {
-		if (grouped_matmul_kernel_lookup(w_types[i])) {
-			for (int ii = 0; ii < n_matmuls; ii++) {
-				status_code st =
-					cpu_matmul_batch(self, w[ii], w_types[ii], x, y[ii], n_list[ii], k, m);
-				if (st != OK)
-					return st;
-			}
-			return OK;
-		}
-	}
-
 	quant_scratch *local_scratch  = p->matmul_multi_scratch;
 	void		  *xq_by_class[4] = {NULL, NULL, NULL, NULL};
 
 	cpu_matmul_multi_job mj = {.n_matmuls = n_matmuls};
 	mj.row_offset[0]		= 0;
+	int has_grouped			= 0;
 	for (int i = 0; i < n_matmuls; i++) {
-		mj.row_offset[i + 1] = mj.row_offset[i] + n_list[i];
-
 		cpu_matmul_job *j = &mj.jobs[i];
 		j->W			  = cpu_ptr(w[i]);
 		j->w_type		  = w_types[i];
 		j->y			  = cpu_ptr(y[i]);
 		j->k			  = k;
-		j->n			  = n_list[i];
-		j->m			  = m;
 		j->xf			  = xf;
 
 		cpu_matmul_job_prepare_kernel(j);
@@ -995,15 +1062,22 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 			j->xq					= xq_by_class[q8_class];
 			j->xq_row_stride		= cpu_matmul_xq_row_stride(q8_class, k);
 			j->xq_row_stride_blocks = j->xq_row_stride / cpu_matmul_q8_block_size(q8_class);
-		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16) {
-			for (int ii = 0; ii < n_matmuls; ii++)
-				for (int row = 0; row < m; row++)
-					cpu_matmul_one(cpu_ptr(w[ii]), w_types[ii], xf + ((size_t)row * k),
-								   cpu_ptr(y[ii]) + ((size_t)row * n_list[ii]), n_list[ii], k,
-								   &p->qscratch);
-			return OK;
+		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16 &&
+				   w_types[i] != GGML_TYPE_F16) {
+			for (int row = 0; row < m; row++)
+				cpu_matmul_one(j->W, w_types[i], xf + ((size_t)row * k),
+							   cpu_ptr(y[i]) + ((size_t)row * n_list[i]), n_list[i], k,
+							   &p->qscratch);
+			j->n				 = 0;
+			mj.row_offset[i + 1] = mj.row_offset[i];
+			continue;
 		}
-		j->row_stride = cpu_matmul_w_row_stride(w_types[i], k);
+		j->n				 = n_list[i];
+		j->m				 = m;
+		mj.row_offset[i + 1] = mj.row_offset[i] + n_list[i];
+		j->row_stride		 = cpu_matmul_w_row_stride(w_types[i], k);
+		if (grouped_matmul_kernel_lookup(w_types[i]))
+			has_grouped = 1;
 	}
 
 	int cur_tid		= tpool_current_tid();
@@ -1012,13 +1086,62 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 
 	if (!can_recurse || !p->pool ||
 		(size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
-		for (int i = 0; i < n_matmuls; i++)
-			cpu_matmul_rows_worker(0, n_list[i], -1, &mj.jobs[i]);
+		for (int i = 0; i < n_matmuls; i++) {
+			cpu_matmul_job *j = &mj.jobs[i];
+			if (j->n == 0)
+				continue;
+			cpu_matmul_rows_worker(0, j->n, -1, j);
+		}
+		return OK;
+	}
+
+	if (has_grouped) {
+		int all_grouped = 1;
+		int gr			= 0;
+		for (int i = 0; i < n_matmuls; i++) {
+			const grouped_matmul_kernel *gk = grouped_matmul_kernel_lookup(w_types[i]);
+			if (!gk) {
+				all_grouped = 0;
+				break;
+			}
+			if (gr == 0)
+				gr = gk->group_rows;
+			else if (gk->group_rows != gr) {
+				all_grouped = 0;
+				break;
+			}
+		}
+
+		if (all_grouped && gr > 0) {
+			mj.group_rows	   = gr;
+			mj.group_offset[0] = 0;
+			int total_groups   = 0;
+			for (int i = 0; i < n_matmuls; i++) {
+				int n_groups_i = n_list[i] / gr;
+				total_groups += n_groups_i;
+				mj.group_offset[i + 1] = total_groups;
+				mj.jobs[i].group_rows  = gr;
+			}
+			int min_groups_per_thr = CPU_MATMUL_MIN_ROWS_PER_THREAD / gr;
+			if (min_groups_per_thr < 1)
+				min_groups_per_thr = 1;
+			tpool_parallel_for(p->pool, total_groups, min_groups_per_thr,
+							   cpu_matmul_multi_groups_worker, &mj);
+			return OK;
+		}
+
+		for (int i = 0; i < n_matmuls; i++) {
+			cpu_matmul_job *j = &mj.jobs[i];
+			if (j->n == 0)
+				continue;
+			cpu_matmul_dispatch_rows(p->pool, w_types[i], n_list[i], j, cpu_matmul_rows_worker);
+		}
 		return OK;
 	}
 
 	tpool_parallel_for(p->pool, total_rows, CPU_MATMUL_MIN_ROWS_PER_THREAD, cpu_matmul_multi_worker,
 					   &mj);
+
 	return OK;
 }
 
@@ -1056,7 +1179,8 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 		return OK;
 	}
 
-	cpu_matmul_job *job = xmalloc(sizeof(*job));
+	cpu_matmul_job	job_storage;
+	cpu_matmul_job *job = &job_storage;
 	memset(job, 0, sizeof(*job));
 	job->W		= W;
 	job->w_type = w_type;
@@ -1078,13 +1202,11 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 		for (int i = 0; i < m; i++)
 			cpu_matmul_one(W, w_type, xf + ((size_t)i * k), yf + ((size_t)i * n), n, k,
 						   &p->qscratch);
-		free(job);
 		return OK;
 	}
 	job->row_stride = cpu_matmul_w_row_stride(w_type, k);
 
 	cpu_matmul_dispatch_rows(p->pool, w_type, n, job, cpu_matmul_rows_worker);
-	free(job);
 	return OK;
 }
 
@@ -1332,6 +1454,123 @@ static status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int hea
 		cpu_rope_one((float *)cpu_ptr(vec), n_heads, head_dim, rope_cos, rope_sin, NULL,
 					 self->rope_neox);
 	}
+	return OK;
+}
+
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
+
+static void cpu_rope_ext_batch_row(float *v, int n_heads, int half, const float *cs, int neox) {
+	for (int h = 0; h < n_heads; h++) {
+		float *vh = v + ((size_t)h * half * 2);
+		for (int j = 0; j < half; j++) {
+			float c = cs[2 * j];
+			float s = cs[(2 * j) + 1];
+			if (neox) {
+				float v0	 = vh[j];
+				float v1	 = vh[j + half];
+				vh[j]		 = (v0 * c) - (v1 * s);
+				vh[j + half] = (v0 * s) + (v1 * c);
+			} else {
+				float v0		= vh[2 * j];
+				float v1		= vh[(2 * j) + 1];
+				vh[2 * j]		= (v0 * c) - (v1 * s);
+				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+			}
+		}
+	}
+}
+
+static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rope_ext_batch_job *j			= ctx;
+	int						half		= j->head_dim / 2;
+	double					theta_scale = pow((double)j->theta, -2.0 / (double)j->head_dim);
+
+	for (int r = begin; r < end; r++) {
+		int	   pos = j->pos_start + r;
+		float  cs[512];
+		float *csp = cs;
+		if (half > 256)
+			csp = xmalloc((size_t)half * 2 * sizeof(float));
+		if (j->freq_factors) {
+			double base_freq = 1.0;
+			for (int jj = 0; jj < half; jj++) {
+				double ff;
+				float  fv = j->freq_factors[jj];
+				ff		  = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+				if (ff > 0.0) {
+					double angle	  = base_freq * ff * (double)pos;
+					csp[2 * jj]		  = (float)cos(angle);
+					csp[(2 * jj) + 1] = (float)sin(angle);
+				} else {
+					csp[2 * jj]		  = 1.0f;
+					csp[(2 * jj) + 1] = 0.0f;
+				}
+				base_freq *= theta_scale;
+			}
+		}
+		float *v = j->base + (size_t)r * j->row_stride;
+		if (j->freq_factors) {
+			cpu_rope_ext_batch_row(v, j->n_heads, half, csp, j->neox);
+		} else {
+			const float *rc = j->cos_base + ((size_t)pos * half);
+			const float *rs = j->sin_base + ((size_t)pos * half);
+			for (int h = 0; h < j->n_heads; h++) {
+				float *vh = v + ((size_t)h * j->head_dim);
+				for (int jj = 0; jj < half; jj++) {
+					float c = rc[jj];
+					float s = rs[jj];
+					if (j->neox) {
+						float v0	  = vh[jj];
+						float v1	  = vh[jj + half];
+						vh[jj]		  = (v0 * c) - (v1 * s);
+						vh[jj + half] = (v0 * s) + (v1 * c);
+					} else {
+						float v0		 = vh[2 * jj];
+						float v1		 = vh[(2 * jj) + 1];
+						vh[2 * jj]		 = (v0 * c) - (v1 * s);
+						vh[(2 * jj) + 1] = (v0 * s) + (v1 * c);
+					}
+				}
+			}
+		}
+		if (csp != cs)
+			free(csp);
+	}
+}
+
+static status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
+									  int pos_start, const float *rope_cos_base,
+									  const float *rope_sin_base, const float *freq_factors,
+									  int m) {
+	cpu_priv *p = self->priv;
+	if (m <= 1)
+		return cpu_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
+							freq_factors);
+
+	cpu_rope_ext_batch_job job = {.base			= (float *)cpu_ptr(vec),
+								  .n_heads		= n_heads,
+								  .head_dim		= head_dim,
+								  .row_stride	= n_heads * head_dim,
+								  .pos_start	= pos_start,
+								  .theta		= self->rope_theta,
+								  .neox			= self->rope_neox,
+								  .freq_factors = freq_factors,
+								  .cos_base		= rope_cos_base,
+								  .sin_base		= rope_sin_base};
+
+	if (p->pool && tpool_current_tid() < 0) {
+		tpool_parallel_for(p->pool, m, 1, cpu_rope_ext_batch_chunk, &job);
+		return OK;
+	}
+	cpu_rope_ext_batch_chunk(0, m, -1, &job);
 	return OK;
 }
 
@@ -1793,26 +2032,9 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, cons
 	while (m_pow2 < m)
 		m_pow2 <<= 1;
 
-	int	 bitrev_stack[ATTN_BITREV_STACK_MAX];
 	int *bitrev_perm = NULL;
-	if (use_bitrev) {
-		if (m_pow2 <= ATTN_BITREV_STACK_MAX) {
-			bitrev_perm = bitrev_stack;
-		} else {
-			bitrev_perm = xmalloc((size_t)m_pow2 * sizeof(int));
-		}
-		unsigned bits = 0;
-		while ((1u << bits) < (unsigned)m_pow2)
-			bits++;
-		for (int r = 0; r < m_pow2; r++) {
-			unsigned rev = 0, tmp = (unsigned)r;
-			for (unsigned b = 0; b < bits; b++) {
-				rev = (rev << 1) | (tmp & 1u);
-				tmp >>= 1;
-			}
-			bitrev_perm[r] = (int)rev;
-		}
-	}
+	if (use_bitrev)
+		bitrev_perm = cpu_bitrev_perm_get(p, m_pow2);
 
 	cpu_attn_batch_job job = {.kl_base		  = kl_base_raw,
 							  .vl_base		  = vl_base_raw,
@@ -1840,9 +2062,6 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, cons
 	} else {
 		cpu_attn_batch_chunk(0, n_heads * m, 0, &job);
 	}
-
-	if (bitrev_perm != bitrev_stack && bitrev_perm != NULL)
-		free(bitrev_perm);
 
 	return OK;
 }
@@ -1975,6 +2194,83 @@ static status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x,
 		rmsnorm_noweight(xf + ((size_t)h * head_dim), yf + ((size_t)h * head_dim), head_dim, eps);
 	}
 	return OK;
+}
+
+typedef struct {
+	const buffer *x;
+	const buffer *w;
+	buffer		 *y;
+	int			  n_heads, head_dim, row_stride;
+	float		  eps;
+	int			  noweight;
+} cpu_rmsnorm_row_batch_job;
+
+static void cpu_rmsnorm_row_batch_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rmsnorm_row_batch_job *j	  = ctx;
+	size_t					   stride = (size_t)j->row_stride;
+	for (int r = begin; r < end; r++) {
+		const float *xr = (const float *)cpu_ptr(j->x) + (size_t)r * stride;
+		float		*yr = (float *)cpu_ptr(j->y) + (size_t)r * stride;
+		if (j->noweight) {
+			if (j->n_heads > 0) {
+				for (int h = 0; h < j->n_heads; h++)
+					rmsnorm_noweight(xr + ((size_t)h * j->head_dim), yr + ((size_t)h * j->head_dim),
+									 j->head_dim, j->eps);
+			} else {
+				rmsnorm_noweight(xr, yr, j->row_stride, j->eps);
+			}
+		} else {
+			rmsnorm_per_head(xr, cpu_ptr(j->w), yr, j->n_heads, j->head_dim, j->eps);
+		}
+	}
+}
+
+static status_code cpu_rmsnorm_row_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
+										 int n_heads, int head_dim, int row_stride, float eps,
+										 int m, int noweight) {
+	cpu_priv *p = self->priv;
+	if (m <= 1 || !p->pool || tpool_current_tid() >= 0) {
+		cpu_rmsnorm_row_batch_job job = {.x			 = x,
+										 .w			 = w,
+										 .y			 = y,
+										 .n_heads	 = n_heads,
+										 .head_dim	 = head_dim,
+										 .row_stride = row_stride,
+										 .eps		 = eps,
+										 .noweight	 = noweight};
+		cpu_rmsnorm_row_batch_chunk(0, m, -1, &job);
+		return OK;
+	}
+	cpu_rmsnorm_row_batch_job job = {.x			 = x,
+									 .w			 = w,
+									 .y			 = y,
+									 .n_heads	 = n_heads,
+									 .head_dim	 = head_dim,
+									 .row_stride = row_stride,
+									 .eps		 = eps,
+									 .noweight	 = noweight};
+	tpool_parallel_for(p->pool, m, 1, cpu_rmsnorm_row_batch_chunk, &job);
+	return OK;
+}
+
+static status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w,
+											  buffer *y, int n_heads, int head_dim, float eps,
+											  int m) {
+	int row_stride = n_heads * head_dim;
+	return cpu_rmsnorm_row_batch(self, x, w, y, n_heads, head_dim, row_stride, eps, m, 0);
+}
+
+static status_code cpu_rmsnorm_noweight_batch(backend *self, const buffer *x, buffer *y, int n,
+											  float eps, int m) {
+	return cpu_rmsnorm_row_batch(self, x, NULL, y, 0, 0, n, eps, m, 1);
+}
+
+static status_code cpu_rmsnorm_noweight_per_head_batch(backend *self, const buffer *x, buffer *y,
+													   int n_heads, int head_dim, float eps,
+													   int m) {
+	return cpu_rmsnorm_row_batch(self, x, NULL, y, n_heads, head_dim, n_heads * head_dim, eps, m,
+								 1);
 }
 
 __attribute__((weak)) status_code cpu_argmax(backend *self, const buffer *logits, int n,
@@ -2401,55 +2697,60 @@ static status_code cpu_ctor(backend *out) {
 	out->probe = cpu_probe;
 	out->init  = cpu_init;
 	out->free  = cpu_free;
-	out->buffer_alloc_weight	   = cpu_buffer_alloc_weight;
-	out->buffer_alloc_scratch	   = cpu_buffer_alloc_scratch;
-	out->buffer_free			   = cpu_buffer_free;
-	out->copy_buffer			   = cpu_copy_buffer;
-	out->buffer_read_f32		   = cpu_buffer_read_f32;
-	out->buffer_write_f32		   = cpu_buffer_write_f32;
-	out->kv_alloc				   = cpu_kv_alloc;
-	out->kv_put					   = cpu_kv_put;
-	out->embd_lookup			   = cpu_embd_lookup;
-	out->rmsnorm				   = cpu_rmsnorm;
-	out->matmul					   = cpu_matmul;
-	out->matmul_residual		   = cpu_matmul_residual;
-	out->matmul_batch			   = cpu_matmul_batch;
-	out->matmul_multi			   = cpu_matmul_multi;
-	out->matmul_multi_batch		   = cpu_matmul_multi_batch;
-	out->matmul_qonly			   = cpu_matmul_qonly;
-	out->prequantize_x			   = cpu_prequantize_x;
-	out->rope					   = cpu_rope;
-	out->rope_qk				   = cpu_rope_qk;
-	out->rope_ext				   = cpu_rope_ext;
-	out->attention				   = cpu_attention;
-	out->attention_swa			   = cpu_attention_swa;
-	out->add_inplace			   = cpu_add_inplace;
-	out->ffn_activate			   = cpu_ffn_activate;
-	out->ffn_activate_ex		   = cpu_ffn_activate_ex;
-	out->rmsnorm_per_head		   = cpu_rmsnorm_per_head;
-	out->rmsnorm_noweight		   = cpu_rmsnorm_noweight;
-	out->rmsnorm_noweight_per_head = cpu_rmsnorm_noweight_per_head;
-	out->argmax					   = cpu_argmax;
-	out->synchronize			   = cpu_synchronize;
-	out->attention_mla			   = cpu_attention_mla;
-	out->kv_alloc_mla			   = cpu_kv_alloc_mla;
-	out->kv_put_mla				   = cpu_kv_put_mla;
-	out->get_pool				   = cpu_get_pool;
-	out->matmul_thread_local	   = cpu_matmul_thread_local;
-	out->mem_available			   = cpu_mem_available;
-	out->mem_total				   = cpu_mem_total;
-	out->rmsnorm_batch			   = cpu_rmsnorm_batch;
-	out->add_batch				   = cpu_add_batch;
-	out->ffn_activate_batch		   = cpu_ffn_activate_batch;
-	out->rope_batch				   = cpu_rope_batch;
-	out->rope_qk_batch			   = cpu_rope_qk_batch;
-	out->attention_batch		   = cpu_attention_batch;
-	out->attention_swa_batch	   = cpu_attention_swa_batch;
-	out->rmsnorm_add			   = cpu_rmsnorm_add;
-	out->scale_inplace			   = cpu_scale_inplace;
-	out->ple_combine			   = cpu_ple_combine;
-	out->matmul_ffn_down		   = cpu_matmul_ffn_down;
-	out->kv_free				   = cpu_kv_free;
+	out->buffer_alloc_weight			 = cpu_buffer_alloc_weight;
+	out->buffer_alloc_scratch			 = cpu_buffer_alloc_scratch;
+	out->buffer_free					 = cpu_buffer_free;
+	out->copy_buffer					 = cpu_copy_buffer;
+	out->buffer_read_f32				 = cpu_buffer_read_f32;
+	out->buffer_write_f32				 = cpu_buffer_write_f32;
+	out->kv_alloc						 = cpu_kv_alloc;
+	out->kv_put							 = cpu_kv_put;
+	out->kv_put_batch					 = cpu_kv_put_batch;
+	out->embd_lookup					 = cpu_embd_lookup;
+	out->rmsnorm						 = cpu_rmsnorm;
+	out->matmul							 = cpu_matmul;
+	out->matmul_residual				 = cpu_matmul_residual;
+	out->matmul_batch					 = cpu_matmul_batch;
+	out->matmul_multi					 = cpu_matmul_multi;
+	out->matmul_multi_batch				 = cpu_matmul_multi_batch;
+	out->matmul_qonly					 = cpu_matmul_qonly;
+	out->prequantize_x					 = cpu_prequantize_x;
+	out->rope							 = cpu_rope;
+	out->rope_qk						 = cpu_rope_qk;
+	out->rope_ext						 = cpu_rope_ext;
+	out->rope_ext_batch					 = cpu_rope_ext_batch;
+	out->attention						 = cpu_attention;
+	out->attention_swa					 = cpu_attention_swa;
+	out->add_inplace					 = cpu_add_inplace;
+	out->ffn_activate					 = cpu_ffn_activate;
+	out->ffn_activate_ex				 = cpu_ffn_activate_ex;
+	out->rmsnorm_per_head				 = cpu_rmsnorm_per_head;
+	out->rmsnorm_per_head_batch			 = cpu_rmsnorm_per_head_batch;
+	out->rmsnorm_noweight_batch			 = cpu_rmsnorm_noweight_batch;
+	out->rmsnorm_noweight_per_head_batch = cpu_rmsnorm_noweight_per_head_batch;
+	out->rmsnorm_noweight				 = cpu_rmsnorm_noweight;
+	out->rmsnorm_noweight_per_head		 = cpu_rmsnorm_noweight_per_head;
+	out->argmax							 = cpu_argmax;
+	out->synchronize					 = cpu_synchronize;
+	out->attention_mla					 = cpu_attention_mla;
+	out->kv_alloc_mla					 = cpu_kv_alloc_mla;
+	out->kv_put_mla						 = cpu_kv_put_mla;
+	out->get_pool						 = cpu_get_pool;
+	out->matmul_thread_local			 = cpu_matmul_thread_local;
+	out->mem_available					 = cpu_mem_available;
+	out->mem_total						 = cpu_mem_total;
+	out->rmsnorm_batch					 = cpu_rmsnorm_batch;
+	out->add_batch						 = cpu_add_batch;
+	out->ffn_activate_batch				 = cpu_ffn_activate_batch;
+	out->rope_batch						 = cpu_rope_batch;
+	out->rope_qk_batch					 = cpu_rope_qk_batch;
+	out->attention_batch				 = cpu_attention_batch;
+	out->attention_swa_batch			 = cpu_attention_swa_batch;
+	out->rmsnorm_add					 = cpu_rmsnorm_add;
+	out->scale_inplace					 = cpu_scale_inplace;
+	out->ple_combine					 = cpu_ple_combine;
+	out->matmul_ffn_down				 = cpu_matmul_ffn_down;
+	out->kv_free						 = cpu_kv_free;
 	return OK;
 }
 

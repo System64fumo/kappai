@@ -13,6 +13,31 @@
 #define IQ3_S_RE8_GROUP_BYTES                                                                      \
 	(IQ3_S_RE8_ROWS * sizeof(uint16_t) + IQ3_S_RE8_ROWS * 4 + IQ3_S_RE8_ROWS * 128)
 
+#define Q4_K_R8_ROWS 8
+#define Q4_K_R8_OFF_D 0
+#define Q4_K_R8_OFF_DMIN 16
+#define Q4_K_R8_OFF_SCALES 32
+#define Q4_K_R8_OFF_SE 32
+
+#define Q4_K_R8_OFF_QS 160
+#define Q4_K_R8_GROUP_BYTES (Q4_K_R8_OFF_QS + Q4_K_R8_ROWS * 128)
+
+#define Q5_K_R8_ROWS 8
+#define Q5_K_R8_OFF_D 0
+#define Q5_K_R8_OFF_DMIN 16
+#define Q5_K_R8_OFF_SCALES 32
+#define Q5_K_R8_OFF_SE 32
+#define Q5_K_R8_OFF_QH 160
+#define Q5_K_R8_OFF_QS 416
+#define Q5_K_R8_GROUP_BYTES (Q5_K_R8_OFF_QS + Q5_K_R8_ROWS * 128)
+
+#define Q6_K_R8_ROWS 8
+#define Q6_K_R8_OFF_QL 0
+#define Q6_K_R8_OFF_QH (Q6_K_R8_OFF_QL + Q6_K_R8_ROWS * 128)
+#define Q6_K_R8_OFF_SCALES (Q6_K_R8_OFF_QH + Q6_K_R8_ROWS * 64)
+#define Q6_K_R8_OFF_D (Q6_K_R8_OFF_SCALES + Q6_K_R8_ROWS * 16)
+#define Q6_K_R8_GROUP_BYTES (Q6_K_R8_OFF_D + Q6_K_R8_ROWS * 2)
+
 typedef struct {
 	uint16_t d;
 	uint8_t	 qs[16];
@@ -205,6 +230,24 @@ void repack_q4_0_to_q4_0_r8_rows(const void *src, void *dst, int row_begin, int 
 void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								 int n, int k, int m);
+
+void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k);
+void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
+void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m);
+
+void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k);
+void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
+void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m);
+
+void repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k);
+void repack_q6_k_to_q6_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
+void matmul_q6_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m);
 
 void repack_iq3_s(const void *src, void *dst, int n_rows, int k);
 void repack_iq3_s_rows(const void *src, void *dst, int row_begin, int row_end, int k);

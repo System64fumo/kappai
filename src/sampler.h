@@ -24,6 +24,9 @@ typedef struct {
 	void	*cand_buf;
 	int		 buf_vocab;
 	int		 cand_vocab;
+	float	*heap_scores;
+	int32_t *heap_idx;
+	int		 heap_cap;
 } sampler;
 
 void	sampler_init(sampler *s, uint64_t seed);

@@ -35,6 +35,9 @@ typedef struct kvcache {
 	kv_quant_type kv_quant;
 	backend		 *backend;
 
+	int *mirror_remap;
+	int	 n_mirror_remap;
+
 	int head_dim_max;
 	int n_kv_heads_max;
 
@@ -66,6 +69,13 @@ static inline int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, i
 	return 1;
 }
 
+static inline int kvcache_mirror_layer(const kvcache *c, int layer) {
+	if (!c->mirror_remap || layer < 0 || layer >= c->n_mirror_remap)
+		return layer;
+	int mapped = c->mirror_remap[layer];
+	return mapped >= 0 ? mapped : layer;
+}
+
 static inline int kvcache_slot_on_host(const kvcache *c, int slot) {
 	if (!c || !c->kv_slot_on_host)
 		return 0;
@@ -92,5 +102,9 @@ static inline backend *kvcache_backend_for_layer(kvcache *c, const model *m, int
 
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in);
+
+status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
+							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
+							  int n_rows);
 
 #endif

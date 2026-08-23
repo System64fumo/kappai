@@ -68,6 +68,7 @@ typedef struct {
 	kv_quant_type kv_quant;
 	const int	 *layer_head_dim;
 	const int	 *layer_n_kv_heads;
+	const int	 *layer_pos_cap;
 } kv_desc;
 
 typedef struct {
@@ -92,6 +93,10 @@ struct backend {
 	status_code (*kv_put)(backend *self, buffer *k, buffer *v, int layer, int pos,
 						  const buffer *k_in, const buffer *v_in, int n_kv_heads, int head_dim,
 						  int n_ctx, int n_kv_heads_active);
+	status_code (*kv_put_batch)(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								const buffer *k_in, const buffer *v_in, int in_row_stride,
+								int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+								int m);
 	status_code (*embd_lookup)(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
 							   int token, int dim, buffer *x_out);
 	status_code (*rmsnorm)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -117,6 +122,9 @@ struct backend {
 	status_code (*rope_ext)(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
 							const float *rope_cos_base, const float *rope_sin_base,
 							const float *freq_factors);
+	status_code (*rope_ext_batch)(backend *self, buffer *vec, int n_heads, int head_dim,
+								  int pos_start, const float *rope_cos_base,
+								  const float *rope_sin_base, const float *freq_factors, int m);
 	status_code (*attention)(backend *self, const buffer *q, const buffer *k_cache,
 							 const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
 							 int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
@@ -142,6 +150,12 @@ struct backend {
 											 int head_dim, float eps);
 	status_code (*rmsnorm_add)(backend *self, const buffer *x, const buffer *w,
 							   const buffer *residual, buffer *y, int n, float eps);
+	status_code (*rmsnorm_per_head_batch)(backend *self, const buffer *x, const buffer *w,
+										  buffer *y, int n_heads, int head_dim, float eps, int m);
+	status_code (*rmsnorm_noweight_batch)(backend *self, const buffer *x, buffer *y, int n,
+										  float eps, int m);
+	status_code (*rmsnorm_noweight_per_head_batch)(backend *self, const buffer *x, buffer *y,
+												   int n_heads, int head_dim, float eps, int m);
 	status_code (*matmul_ffn_down)(backend *self, const buffer *w, uint32_t w_type,
 								   const buffer *gate, const buffer *up, buffer *y, int n, int k,
 								   int activation);

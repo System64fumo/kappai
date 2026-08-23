@@ -63,6 +63,7 @@ void usage(FILE *fp) {
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
 			"  --mmap [on|off]          mmap model weights (default: on)\n"
 			"  --repack MODE            weight repacking: all|none|<types> (default: smart)\n"
+			"  --fuse LIST              load-time weight fusion, comma list: qkv\n"
 			"  --moe-stream [on|off]    streaming expert cache for MoE models (default: on)\n"
 			"  --moe-cache <n>          per-layer LRU capacity for expert cache\n"
 			"  --moe-preload            eagerly load all expert weights at startup\n"
@@ -178,6 +179,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_MONITOR,
 		OPT_MMAP,
 		OPT_REPACK,
+		OPT_FUSE,
 		OPT_REASONING,
 		OPT_DISABLE_FAILSAFES,
 		OPT_SHOW_TEMPLATE,
@@ -218,6 +220,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"monitor", optional_argument, NULL, OPT_MONITOR},
 		{"mmap", optional_argument, NULL, OPT_MMAP},
 		{"repack", required_argument, NULL, OPT_REPACK},
+		{"fuse", required_argument, NULL, OPT_FUSE},
 		{"reasoning", optional_argument, NULL, OPT_REASONING},
 		{"disable-failsafes", no_argument, NULL, OPT_DISABLE_FAILSAFES},
 		{"show-template", no_argument, NULL, OPT_SHOW_TEMPLATE},
@@ -335,6 +338,9 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 			break;
 		case OPT_REPACK:
 			cfg->repack = optarg;
+			break;
+		case OPT_FUSE:
+			cfg->fuse = optarg;
 			break;
 		case OPT_REASONING:
 			cfg->reasoning =

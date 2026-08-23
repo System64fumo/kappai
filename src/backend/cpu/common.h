@@ -26,10 +26,9 @@ typedef struct {
 } cpu_mla_krot_cache;
 
 typedef struct {
-	double theta_scale;
-	double theta_cached;
-	int	   head_dim_cached;
-
+	double		 theta_scale;
+	double		 theta_cached;
+	int			 head_dim_cached;
 	float		*cs;
 	int			 cs_cap;
 	int			 pos_cached;
@@ -48,6 +47,8 @@ typedef struct {
 	int			  kv_head_dim_max;
 	kv_quant_type kv_quant;
 
+	size_t *kv_pos_cap;
+
 	size_t kv_block_stride;
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
@@ -59,6 +60,9 @@ typedef struct {
 
 	float *residual_tmp;
 	size_t residual_tmp_cap;
+
+	int *bitrev_perm_cache;
+	int	 bitrev_perm_cap;
 
 	cpu_mla_krot_cache mla_krot;
 	cpu_rope_cs_cache  rope_cs;
@@ -125,6 +129,34 @@ static inline void cpu_kv_put_q8_0_head(uint8_t *kd, uint8_t *vd, const float *k
 						  KV_Q8_0_BLOCK);
 		}
 	}
+}
+
+static inline void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *kfh,
+									   const float *vfh, int head_dim) {
+	for (int i = 0; i < head_dim; i++) {
+		kd[i] = f32_to_f16(kfh[i]);
+		vd[i] = f32_to_f16(vfh[i]);
+	}
+}
+
+static inline int *cpu_bitrev_perm_get(cpu_priv *p, int m_pow2) {
+	if (p->bitrev_perm_cap >= m_pow2)
+		return p->bitrev_perm_cache;
+	free(p->bitrev_perm_cache);
+	p->bitrev_perm_cache = xmalloc((size_t)m_pow2 * sizeof(int));
+	p->bitrev_perm_cap	 = m_pow2;
+	unsigned bits		 = 0;
+	while ((1u << bits) < (unsigned)m_pow2)
+		bits++;
+	for (int r = 0; r < m_pow2; r++) {
+		unsigned rev = 0, tmp = (unsigned)r;
+		for (unsigned b = 0; b < bits; b++) {
+			rev = (rev << 1) | (tmp & 1u);
+			tmp >>= 1;
+		}
+		p->bitrev_perm_cache[r] = (int)rev;
+	}
+	return p->bitrev_perm_cache;
 }
 
 typedef struct {

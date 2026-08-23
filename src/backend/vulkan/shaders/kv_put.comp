@@ -9,11 +9,13 @@ layout(set = 0, binding = 3) readonly buffer VIn { float vin[]; };
 
 layout(push_constant) uniform Params {
     uint layer_off;
-    int pos;
+    int pos_start;
     int n_kv_heads;
     int head_dim;
     int n_ctx;
     int stride_head_dim;
+    int in_row_stride;
+    int m_tokens;
 } params;
 
 #include "common.glsl"
@@ -24,20 +26,22 @@ void main() {
     int stride_head_dim = params.stride_head_dim;
     int n_pairs_per_head = head_dim / 2;
     int total_pairs = params.n_kv_heads * n_pairs_per_head;
-    if (int(pair) >= total_pairs) return;
+    if (int(pair) >= total_pairs * params.m_tokens) return;
 
-    int kvh = int(pair) / n_pairs_per_head;
-    int d_pair = int(pair) % n_pairs_per_head;
+    int row = int(pair) / total_pairs;
+    int kvh = int(pair % uint(total_pairs)) / n_pairs_per_head;
+    int d_pair = int(pair % uint(total_pairs)) % n_pairs_per_head;
     int d0 = d_pair * 2;
     int d1 = d0 + 1;
 
     uint kvh_stride = uint(params.n_ctx) * uint(stride_head_dim);
-    uint pos_off    = uint(params.pos) * uint(stride_head_dim);
+    uint pos_off    = uint(params.pos_start + row) * uint(stride_head_dim);
     uint base = params.layer_off + uint(kvh) * kvh_stride + pos_off;
     uint word_idx = (base + uint(d0)) >> 1u;
 
-    int in_idx0 = kvh * head_dim + d0;
-    int in_idx1 = kvh * head_dim + d1;
+    int in_base = row * params.in_row_stride + kvh * head_dim;
+    int in_idx0 = in_base + d0;
+    int in_idx1 = in_base + d1;
 
     uint k0 = float_to_half(kin[in_idx0]);
     uint k1 = float_to_half(kin[in_idx1]);
