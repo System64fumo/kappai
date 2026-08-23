@@ -21,6 +21,7 @@ typedef struct compute_scratch {
 	int			 router_ids_host[64];
 	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
+	int			 logits_alias;
 	float		*rope_cos_swa, *rope_sin_swa;
 	buffer		 ple_inp;
 	buffer		 ple_slice;

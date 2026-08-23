@@ -14,23 +14,50 @@
 #include <immintrin.h>
 #endif
 
-static void split_qgate_rows(const float *mixed, float *q, float *gate, int n_heads, int head_dim,
-							 int n_rows) {
-	int q_out		 = n_heads * head_dim;
-	int mixed_stride = 2 * q_out;
-	for (int row = 0; row < n_rows; row++) {
-		const float *src = mixed + (size_t)row * mixed_stride;
-		float		*qd	 = q + (size_t)row * q_out;
-		float		*gd	 = gate + (size_t)row * q_out;
-		for (int h = 0; h < n_heads; h++, src += 2 * head_dim) {
-			for (int j = 0; j < head_dim; j++) {
-				qd[j] = src[j];
-				gd[j] = src[j + head_dim];
+static tpool *qwen_pool(const model *m) {
+	if (m->backend && m->backend->get_pool)
+		return m->backend->get_pool(m->backend);
+	return NULL;
+}
+
+typedef struct {
+	const float *mixed;
+	float		*q, *gate;
+	int			 n_heads, head_dim, n_rows;
+} qwen_split_job;
+
+static void qwen_split_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_split_job *j			 = ctx;
+	int				q_out		 = j->n_heads * j->head_dim;
+	int				mixed_stride = 2 * q_out;
+	for (int row = begin; row < end; row++) {
+		const float *src = j->mixed + (size_t)row * mixed_stride;
+		float		*qd	 = j->q + (size_t)row * q_out;
+		float		*gd	 = j->gate + (size_t)row * q_out;
+		for (int h = 0; h < j->n_heads; h++, src += 2 * j->head_dim) {
+			for (int jj = 0; jj < j->head_dim; jj++) {
+				qd[jj] = src[jj];
+				gd[jj] = src[jj + j->head_dim];
 			}
-			qd += head_dim;
-			gd += head_dim;
+			qd += j->head_dim;
+			gd += j->head_dim;
 		}
 	}
+}
+
+static void split_qgate_rows(tpool *pool, const float *mixed, float *q, float *gate, int n_heads,
+							 int head_dim, int n_rows) {
+	qwen_split_job job = {.mixed	= mixed,
+						  .q		= q,
+						  .gate		= gate,
+						  .n_heads	= n_heads,
+						  .head_dim = head_dim,
+						  .n_rows	= n_rows};
+	if (pool && n_rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, n_rows, 1, qwen_split_chunk, &job);
+	else
+		qwen_split_chunk(0, n_rows, -1, &job);
 }
 
 status_code op_split_qgate(exec_ctx *ctx) {
@@ -44,14 +71,28 @@ status_code op_split_qgate(exec_ctx *ctx) {
 	float		*gate	  = recipe_slot_f32(ctx, RECIPE_SLOT_HYB_GATE);
 	if (!mixed || !q || !gate)
 		return ERR_INVALID_ARG;
-	split_qgate_rows(mixed, q, gate, n_heads, head_dim,
+	split_qgate_rows(qwen_pool(m), mixed, q, gate, n_heads, head_dim,
 					 recipe_exec_is_batch(ctx) ? ctx->n_rows : 1);
 	return OK;
 }
 
-static void partial_rope_one(float *x, int n_heads, int head_dim, int rope_dim, const float *cosv,
-							 const float *sinv) {
-	rope_rotate_neox(x, n_heads, head_dim, rope_dim, cosv, sinv);
+typedef struct {
+	float		*q, *k;
+	const float *cos_base, *sin_base;
+	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim, pos0, rows;
+} qwen_rope_job;
+
+static void qwen_partial_rope_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_rope_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
+		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
+		rope_rotate_neox(j->q + (size_t)row * j->qn, j->n_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+		rope_rotate_neox(j->k + (size_t)row * j->kn, j->n_kv_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+	}
 }
 
 status_code op_partial_rope_qk(exec_ctx *ctx) {
@@ -67,13 +108,43 @@ status_code op_partial_rope_qk(exec_ctx *ctx) {
 	float *k	= recipe_slot_f32(ctx, RECIPE_SLOT_K);
 	if (!q || !k)
 		return ERR_INVALID_ARG;
-	for (int row = 0; row < rows; row++) {
-		const float *cosv = ctx->s->rope_cos + (size_t)(pos0 + row) * half;
-		const float *sinv = ctx->s->rope_sin + (size_t)(pos0 + row) * half;
-		partial_rope_one(q + (size_t)row * qn, m->n_heads, m->head_dim, m->rope_dim, cosv, sinv);
-		partial_rope_one(k + (size_t)row * kn, m->n_kv_heads, m->head_dim, m->rope_dim, cosv, sinv);
-	}
+
+	qwen_rope_job job  = {.q		  = q,
+						  .k		  = k,
+						  .cos_base	  = ctx->s->rope_cos,
+						  .sin_base	  = ctx->s->rope_sin,
+						  .qn		  = qn,
+						  .kn		  = kn,
+						  .half		  = half,
+						  .rope_dim	  = m->rope_dim,
+						  .n_heads	  = m->n_heads,
+						  .n_kv_heads = m->n_kv_heads,
+						  .head_dim	  = m->head_dim,
+						  .pos0		  = pos0,
+						  .rows		  = rows};
+	tpool		 *pool = qwen_pool(m);
+	if (pool && rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, rows, 1, qwen_partial_rope_chunk, &job);
+	else
+		qwen_partial_rope_chunk(0, rows, -1, &job);
 	return OK;
+}
+
+typedef struct {
+	float		*out;
+	const float *gate;
+	int			 n, rows;
+} qwen_gate_job;
+
+static void qwen_output_gate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_gate_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		float		*o = j->out + (size_t)row * j->n;
+		const float *g = j->gate + (size_t)row * j->n;
+		for (int i = 0; i < j->n; i++)
+			o[i] *= sigmoidf(g[i]);
+	}
 }
 
 status_code op_attn_output_gate(exec_ctx *ctx) {
@@ -85,52 +156,78 @@ status_code op_attn_output_gate(exec_ctx *ctx) {
 	const float *gate = recipe_slot_f32(ctx, RECIPE_SLOT_HYB_GATE);
 	if (!out || !gate)
 		return ERR_INVALID_ARG;
-	for (int row = 0; row < rows; row++) {
-		float		*o = out + (size_t)row * n;
-		const float *g = gate + (size_t)row * n;
-		for (int i = 0; i < n; i++)
-			o[i] *= sigmoidf(g[i]);
-	}
+
+	qwen_gate_job job  = {.out = out, .gate = gate, .n = n, .rows = rows};
+	tpool		 *pool = qwen_pool(ctx->m);
+	if (pool && rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, rows, 1, qwen_output_gate_chunk, &job);
+	else
+		qwen_output_gate_chunk(0, rows, -1, &job);
 	return OK;
 }
 
-static void gdn_conv_tokens(float *conv_out, float *conv_state, const float *mixed,
+typedef struct {
+	float		*conv_out, *conv_state;
+	const float *mixed, *conv_w;
+	int			 conv_dim, conv_kernel, n_tokens, mixed_stride, history;
+} gdn_conv_job;
+
+static void gdn_conv_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	gdn_conv_job *j		  = ctx;
+	int			  history = j->history;
+	for (int c = begin; c < end; c++) {
+		const float *w	   = j->conv_w + (size_t)c * j->conv_kernel;
+		float		*hist  = j->conv_state + (size_t)c * history;
+		const float *mix_c = j->mixed + c;
+		if (history == 3) {
+			float h0 = hist[0], h1 = hist[1], h2 = hist[2];
+			for (int t = 0; t < j->n_tokens; t++) {
+				float m	  = mix_c[(size_t)t * j->mixed_stride];
+				float sum = h0 * w[0] + h1 * w[1] + h2 * w[2] + m * w[3];
+				h0		  = h1;
+				h1		  = h2;
+				h2		  = m;
+				j->conv_out[(size_t)t * j->conv_dim + c] = silu(sum);
+			}
+			hist[0] = h0;
+			hist[1] = h1;
+			hist[2] = h2;
+		} else {
+			for (int t = 0; t < j->n_tokens; t++) {
+				const float *mix = j->mixed + (size_t)t * j->mixed_stride;
+				float		*oc	 = j->conv_out + (size_t)t * j->conv_dim;
+				float		 sum = mix[c] * w[history];
+				if (history > 0) {
+					for (int jj = 0; jj < history; jj++)
+						sum += hist[jj] * w[jj];
+					if (history > 1)
+						memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
+					hist[history - 1] = mix[c];
+				}
+				oc[c] = silu(sum);
+			}
+		}
+	}
+}
+
+static void gdn_conv_tokens(tpool *pool, float *conv_out, float *conv_state, const float *mixed,
 							const float *conv_w, int conv_dim, int conv_kernel, int n_tokens,
 							int mixed_stride) {
-	int history = conv_kernel - 1;
-	if (history == 3) {
-		for (int t = 0; t < n_tokens; t++) {
-			const float *mix = mixed + (size_t)t * mixed_stride;
-			float		*out = conv_out + (size_t)t * conv_dim;
-			for (int c = 0; c < conv_dim; c++) {
-				const float *w	  = conv_w + (size_t)c * 4;
-				float		*hist = conv_state + (size_t)c * 3;
-				float		 sum = hist[0] * w[0] + hist[1] * w[1] + hist[2] * w[2] + mix[c] * w[3];
-				hist[0]			 = hist[1];
-				hist[1]			 = hist[2];
-				hist[2]			 = mix[c];
-				out[c]			 = silu(sum);
-			}
-		}
+	gdn_conv_job job = {.conv_out	  = conv_out,
+						.conv_state	  = conv_state,
+						.mixed		  = mixed,
+						.conv_w		  = conv_w,
+						.conv_dim	  = conv_dim,
+						.conv_kernel  = conv_kernel,
+						.n_tokens	  = n_tokens,
+						.mixed_stride = mixed_stride,
+						.history	  = conv_kernel - 1};
+	if (pool && conv_dim > 8 && tpool_current_tid() < 0) {
+		tpool_parallel_for(pool, conv_dim, 8, gdn_conv_chunk, &job);
 		return;
 	}
-	for (int t = 0; t < n_tokens; t++) {
-		const float *mix = mixed + (size_t)t * mixed_stride;
-		float		*out = conv_out + (size_t)t * conv_dim;
-		for (int c = 0; c < conv_dim; c++) {
-			const float *w	 = conv_w + (size_t)c * conv_kernel;
-			float		 sum = mix[c] * w[history];
-			if (history > 0) {
-				float *hist = conv_state + (size_t)c * history;
-				for (int j = 0; j < history; j++)
-					sum += hist[j] * w[j];
-				if (history > 1)
-					memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
-				hist[history - 1] = mix[c];
-			}
-			out[c] = silu(sum);
-		}
-	}
+	gdn_conv_chunk(0, conv_dim, -1, &job);
 }
 
 typedef struct {
@@ -345,7 +442,7 @@ static status_code gdn_run(exec_ctx *ctx, const float *mixed, const float *z, co
 	float *conv			  = ws;
 	float *scratch		  = ws + (size_t)n_tokens * p->conv_dim;
 
-	gdn_conv_tokens(conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel, n_tokens,
+	gdn_conv_tokens(pool, conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel, n_tokens,
 					p->conv_dim);
 
 	gdn_job job = {

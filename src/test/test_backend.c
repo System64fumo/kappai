@@ -1455,21 +1455,21 @@ static void test_op_kv_put_batch(backend *cpu, backend *tgt, int n_kv_heads, int
 
 		buffer kc_ref = {0}, vc_ref = {0};
 		tgt->kv_alloc(tgt, &kvd, &kc_ref, &vc_ref);
+		buffer row_k = {0}, row_v = {0};
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_k);
+		tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_v);
 		for (int r = 0; r < m; r++) {
-			buffer row_k, row_v;
-			tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_k);
-			tgt->buffer_alloc_scratch(tgt, (size_t)n_kv * sizeof(float), &row_v);
 			tgt->buffer_write_f32(tgt, &row_k, k_all + (size_t)r * n_kv, n_kv);
 			tgt->buffer_write_f32(tgt, &row_v, v_all + (size_t)r * n_kv, n_kv);
 			status_code prs = tgt->kv_put(tgt, &kc_ref, &vc_ref, 0, pos_start + r, &row_k, &row_v,
 										  n_kv_heads, head_dim, n_ctx, n_kv_heads);
 			if (prs != OK)
 				s_tgt = prs;
-			tgt->buffer_free(tgt, &row_k);
-			tgt->buffer_free(tgt, &row_v);
 		}
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
+		tgt->buffer_free(tgt, &row_k);
+		tgt->buffer_free(tgt, &row_v);
 
 		buffer q_tgt = {0}, out_a = {0}, out_b = {0};
 		tgt->buffer_alloc_scratch(tgt, (size_t)n_att * sizeof(float), &q_tgt);

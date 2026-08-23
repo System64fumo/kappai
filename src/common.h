@@ -131,11 +131,30 @@ static inline char *xstrdup(const char *s) {
 
 static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
 	if (need > b->cap) {
-		float *np = xmalloc_aligned(need * sizeof(float), align);
+		size_t bytes = need * sizeof(float);
+		if (bytes >= (2u << 20))
+			align = align < 4096 ? 4096 : align;
+		float *np = xmalloc_aligned(bytes, align);
+		if (bytes >= (2u << 20))
+			madvise_hugepage(np, bytes);
 		if (b->p && b->cap > 0)
 			memcpy(np, b->p, b->cap * sizeof(float));
 		free(b->p);
 		b->p   = np;
+		b->cap = need;
+	}
+	return b->p;
+}
+
+static inline float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align) {
+	if (need > b->cap) {
+		size_t bytes = need * sizeof(float);
+		if (bytes >= (2u << 20))
+			align = align < 4096 ? 4096 : align;
+		free(b->p);
+		b->p = xmalloc_aligned(bytes, align);
+		if (bytes >= (2u << 20))
+			madvise_hugepage(b->p, bytes);
 		b->cap = need;
 	}
 	return b->p;

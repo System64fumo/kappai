@@ -379,7 +379,7 @@ fail:
 
 static void debug_print_logits(context *c) {
 	buffer *logits = &c->scratch.slots[RECIPE_SLOT_LOGITS];
-	if (c->backend && c->backend->argmax) {
+	if (c->backend && c->backend->argmax && !c->scratch.logits_alias) {
 		if (c->backend->synchronize)
 			c->backend->synchronize(c->backend);
 		backend *owner = logits->owner ? logits->owner : c->backend;

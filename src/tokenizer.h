@@ -57,6 +57,12 @@ typedef struct {
 	size_t				   n_special_first_bytes;
 	void				  *bpe_work;
 	size_t				   bpe_work_cap;
+	char				  *bpe_arena;
+	size_t				   bpe_arena_cap;
+	char				  *bpe_rank_buf;
+	size_t				   bpe_rank_cap;
+	char				  *bpe_sp_text;
+	size_t				   bpe_sp_cap;
 	void				  *bpe_pcs_cache;
 	size_t				   bpe_pcs_cache_cap;
 } tokenizer;

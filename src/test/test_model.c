@@ -56,7 +56,8 @@ static void tok_ref_bpe(const tokenizer *t, const char *text, size_t len, int32_
 	}
 
 	char  *key		  = xmalloc(len * 2 + 4);
-	char  *arena	  = xmalloc(len + 1);
+	size_t arena_cap  = len + 1;
+	char  *arena	  = xmalloc(arena_cap);
 	size_t arena_used = 0;
 
 	while (npcs > 1) {
@@ -73,6 +74,21 @@ static void tok_ref_bpe(const tokenizer *t, const char *text, size_t len, int32_
 		}
 		if (best_i < 0)
 			break;
+		if (arena_used + best_klen > arena_cap) {
+			uintptr_t old_base = (uintptr_t)arena;
+			size_t	  old_used = arena_used;
+			while (arena_used + best_klen > arena_cap)
+				arena_cap *= 2;
+			char *new_arena = xrealloc(arena, arena_cap);
+			if ((uintptr_t)new_arena != old_base) {
+				for (int i = 0; i < npcs; i++) {
+					uintptr_t p = (uintptr_t)pcs[i].p;
+					if (p >= old_base && p < old_base + old_used)
+						pcs[i].p = new_arena + (p - old_base);
+				}
+			}
+			arena = new_arena;
+		}
 		char *merged = arena + arena_used;
 		memcpy(merged, pcs[best_i].p, pcs[best_i].n);
 		memcpy(merged + pcs[best_i].n, pcs[best_i + 1].p, pcs[best_i + 1].n);
@@ -111,7 +127,6 @@ static void run_tokenizer_bpe_differential(const tokenizer *t) {
 	char			   *text	= xmalloc(lens[n_lens - 1] + 1);
 
 	int mismatches = 0;
-	int trials	   = 0;
 	for (int trial = 0; trial < 256; trial++) {
 		size_t			  len		 = lens[trial % n_lens];
 		static const char alphabet[] = " the quick brown fox  \xe2\x96\x81"
@@ -121,7 +136,6 @@ static void run_tokenizer_bpe_differential(const tokenizer *t) {
 		len = strnlen(text, len);
 		if (len == 0)
 			continue;
-		trials++;
 		int n_new = 0, n_ref = 0;
 		tokenizer_bpe_encode((tokenizer *)t, text, len, ids_new, (int)(len + 8), &n_new);
 		tok_ref_bpe(t, text, len, ids_ref, &n_ref);

@@ -10,6 +10,7 @@
 #include "monitor.h"
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,7 @@ static status_code	 ple_proj_inject_batch(exec_ctx *ctx);
 static status_code	 matmul_multi_batch_body(exec_ctx *ctx);
 static void			 moe_batch_expert_chunk(int begin, int end, int tid, void *ctx);
 static status_code	 batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_tokens);
+static uint32_t		 op_batch_slot_mask(const recipe_op *op);
 
 static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 	if (ctx->bs)
@@ -302,6 +304,13 @@ model_recipe *recipe_build(const struct model *m) {
 			recipe_coalesce_matmul_runs(dst, n_ops);
 		}
 	}
+
+	uint32_t bs_mask = 0;
+	for (int i = 0; i < r->n_pre_ops; i++)
+		bs_mask |= op_batch_slot_mask(&r->pre_ops[i]);
+	for (int j = 0; j < r->layer.n_ops; j++)
+		bs_mask |= op_batch_slot_mask(&r->layer.ops[j]);
+	r->bs_slot_mask = bs_mask;
 
 	return r;
 }
@@ -962,6 +971,14 @@ static status_code op_rope_ext(exec_ctx *ctx) {
 	int			  pos			 = is_batch ? ctx->pos_start : ctx->pos;
 	int			  n_applications = is_batch ? ctx->n_rows : 1;
 
+	if (is_batch && a->rope_ext_batch && a->rope_ext) {
+		buffer *whole = batch_slot(ctx->bs, op->in[0]);
+		st = a->rope_ext_batch(a, whole, n_heads, head_dim, pos, rope_cos, rope_sin, freq_factors,
+							   ctx->n_rows);
+		profile_end(prof, &ps);
+		return st;
+	}
+
 	for (int r = 0; r < n_applications; r++) {
 		buffer vec;
 		if (is_batch) {
@@ -996,8 +1013,10 @@ static status_code op_attention_impl(const recipe_op *op, struct model *m, struc
 	int use_swa = (sliding_window > 0) && (li >= 0) && model_layer_is_sliding(m, li) && has_swa;
 	profile_scope ps = profile_begin(prof, op->stage);
 	status_code	  st;
-	buffer		 *kb = kvcache_k_for_layer(cache, m, kv_layer);
-	buffer		 *vb = kvcache_v_for_layer(cache, m, kv_layer);
+	if (cache->mirror_remap && kvcache_slot_on_host(cache, kv_layer))
+		kv_layer = kvcache_mirror_layer(cache, kv_layer);
+	buffer *kb = kvcache_k_for_layer(cache, m, kv_layer);
+	buffer *vb = kvcache_v_for_layer(cache, m, kv_layer);
 	if (use_swa) {
 		backend *t = allow_backend_fallback ? OP_BACKEND(attention_swa) : a;
 		st = t->attention_swa(t, &slots[op->in[0]], kb, vb, &slots[op->out], kv_layer, pos, n_heads,
@@ -1451,6 +1470,9 @@ static status_code op_logits_readback(exec_ctx *ctx) {
 	status_code	  st;
 	if (!logits_out)
 		return OK;
+	if (ctx->s->logits_alias && logits_out == ctx->s->logits_host &&
+		backend_has_cap(a, BCAP_IS_HOST))
+		return OK;
 	buffer	*lb	   = &slots[ctx->op->in[0]];
 	int		 vocab = ctx->m->vocab_size;
 	backend *owner = lb->owner;
@@ -1473,11 +1495,18 @@ static status_code op_rmsnorm_per_head(exec_ctx *ctx) {
 	int row_stride = (ctx->op->w_idx == WIDX_ATTN_Q_NORM) ? lc->q_row_stride : lc->kv_row_stride;
 	backend *t	   = OP_BACKEND(rmsnorm_per_head);
 	if (exec_is_batch(ctx)) {
-		for (int row = 0; row < ctx->n_rows; row++) {
-			buffer rowb = batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, row_stride);
-			st = t->rmsnorm_per_head(t, &rowb, w, &rowb, n_heads, lc->head_dim, ctx->m->norm_eps);
-			if (st != OK)
-				break;
+		if (t->rmsnorm_per_head_batch) {
+			st = t->rmsnorm_per_head_batch(t, exec_slot(ctx, ctx->op->in[0]), w,
+										   exec_slot(ctx, ctx->op->in[0]), n_heads, lc->head_dim,
+										   ctx->m->norm_eps, ctx->n_rows);
+		} else {
+			for (int row = 0; row < ctx->n_rows; row++) {
+				buffer rowb = batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, row_stride);
+				st			= t->rmsnorm_per_head(t, &rowb, w, &rowb, n_heads, lc->head_dim,
+												  ctx->m->norm_eps);
+				if (st != OK)
+					break;
+			}
 		}
 	} else {
 		st = t->rmsnorm_per_head(t, exec_slot(ctx, ctx->op->in[0]), w, exec_slot(ctx, ctx->op->out),
@@ -1497,7 +1526,15 @@ static status_code op_rmsnorm_noweight(exec_ctx *ctx) {
 	backend_sync_rope(t, a);
 	ps = profile_begin(prof, ctx->op->stage);
 	if (exec_is_batch(ctx)) {
-		if (t->rmsnorm_noweight_per_head) {
+		if (t->rmsnorm_noweight_per_head_batch) {
+			st = t->rmsnorm_noweight_per_head_batch(t, exec_slot(ctx, ctx->op->in[0]),
+													exec_slot(ctx, ctx->op->in[0]), lc->n_kv_heads,
+													lc->head_dim, ctx->m->norm_eps, ctx->n_rows);
+		} else if (t->rmsnorm_noweight_batch) {
+			st = t->rmsnorm_noweight_batch(t, exec_slot(ctx, ctx->op->in[0]),
+										   exec_slot(ctx, ctx->op->in[0]), lc->kv_row_stride,
+										   ctx->m->norm_eps, ctx->n_rows);
+		} else if (t->rmsnorm_noweight_per_head) {
 			for (int row = 0; row < ctx->n_rows; row++) {
 				buffer rowb =
 					batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, lc->kv_row_stride);
@@ -1542,7 +1579,7 @@ static status_code op_rmsnorm_add(exec_ctx *ctx) {
 	const buffer *w = resolve_weight(ctx->m, ctx->li, ctx->op->w_idx);
 	int			  n = ctx->m->dim;
 	if (exec_is_batch(ctx)) {
-		if (a->rmsnorm_add && backend_has_cap(a, BCAP_RMSNORM_ADD)) {
+		if (a->rmsnorm_add && backend_has_cap(a, BCAP_RMSNORM_ADD) && ctx->n_rows < 4) {
 			for (int row = 0; row < ctx->n_rows; row++) {
 				buffer xrow	  = batch_row_view(exec_slot(ctx, ctx->op->in[0]), row, n);
 				buffer resrow = batch_row_view(exec_slot(ctx, ctx->op->in[1]), row, n);
@@ -1593,12 +1630,7 @@ static status_code op_scale(exec_ctx *ctx) {
 	int scale_dim = ctx->m->dim;
 	if (exec_is_batch(ctx)) {
 		if (a->scale_inplace) {
-			for (int row = 0; row < ctx->n_rows; row++) {
-				buffer rowb = batch_row_view(exec_slot(ctx, ctx->op->in[0]), row, scale_dim);
-				st			= a->scale_inplace(a, &rowb, sc, scale_dim);
-				if (st != OK)
-					break;
-			}
+			st = a->scale_inplace(a, exec_slot(ctx, ctx->op->in[0]), sc, scale_dim * ctx->n_rows);
 		} else {
 			if (a->synchronize)
 				a->synchronize(a);
@@ -1870,9 +1902,64 @@ static const uint8_t bs_slot_valid[RECIPE_SLOT_MAX] = {
 	[RECIPE_SLOT_HYB_BETA] = 1,
 };
 
+static uint32_t bs_slot_bit(uint8_t slot) {
+	return (slot < RECIPE_SLOT_MAX) ? (1u << slot) : 0;
+}
+
+static uint32_t op_batch_slot_mask(const recipe_op *op) {
+	uint32_t m = 0;
+	for (int i = 0; i < 3; i++)
+		if (op->in[i] != RECIPE_SLOT_NONE)
+			m |= bs_slot_bit(op->in[i]);
+	if (op->out != RECIPE_SLOT_NONE)
+		m |= bs_slot_bit(op->out);
+
+	switch (op->kind) {
+	case OP_MATMUL:
+	case OP_MATMUL_MULTI:
+		m |= bs_slot_bit(RECIPE_SLOT_K) | bs_slot_bit(RECIPE_SLOT_V);
+		break;
+	case OP_MATMUL_RESIDUAL:
+		m |= bs_slot_bit(RECIPE_SLOT_RESID_TMP);
+		break;
+	case OP_MATMUL_FUSED_GATEUP:
+		m |= bs_slot_bit(RECIPE_SLOT_FFN_GATE_UP);
+		break;
+	case OP_MATMUL_FFN_DOWN:
+		m |= bs_slot_bit(RECIPE_SLOT_FFN_ACT);
+		break;
+	case OP_SPLIT_QGATE:
+		m |= bs_slot_bit(RECIPE_SLOT_HYB_PROJ) | bs_slot_bit(RECIPE_SLOT_Q) |
+			 bs_slot_bit(RECIPE_SLOT_HYB_GATE);
+		break;
+	case OP_PARTIAL_ROPE_QK:
+		m |= bs_slot_bit(RECIPE_SLOT_Q) | bs_slot_bit(RECIPE_SLOT_K);
+		break;
+	case OP_ATTN_OUTPUT_GATE:
+		m |= bs_slot_bit(RECIPE_SLOT_HYB_GATE);
+		break;
+	case OP_GATED_DELTA_NET:
+		m |= bs_slot_bit(RECIPE_SLOT_HYB_PROJ) | bs_slot_bit(RECIPE_SLOT_HYB_GATE) |
+			 bs_slot_bit(RECIPE_SLOT_HYB_ALPHA) | bs_slot_bit(RECIPE_SLOT_HYB_BETA) |
+			 bs_slot_bit(RECIPE_SLOT_XB2);
+		break;
+	case OP_MOE_ROUTER:
+	case OP_MOE_EXPERTS:
+	case OP_MOE_SHARED:
+		m |= bs_slot_bit(RECIPE_SLOT_XB) | bs_slot_bit(RECIPE_SLOT_XB2) |
+			 bs_slot_bit(RECIPE_SLOT_FFN_GATE) | bs_slot_bit(RECIPE_SLOT_FFN_UP) |
+			 bs_slot_bit(RECIPE_SLOT_FFN_ACT) | bs_slot_bit(RECIPE_SLOT_FFN_GATE_UP) |
+			 bs_slot_bit(RECIPE_SLOT_RESID_TMP);
+		break;
+	default:
+		break;
+	}
+	return m & 0x1ffffu;
+}
+
 static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
 	bs_pair *p = &bs->pair[slot];
-	float_buf_ensure(&p->fb, n_elems);
+	float_buf_ensure_nocopy(&p->fb, n_elems, 64);
 	p->b.handle	  = p->fb.p;
 	p->b.host_ptr = p->fb.p;
 	p->b.size	  = n_elems * sizeof(float);
@@ -1907,10 +1994,13 @@ static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int inte
 }
 
 static void batch_scratch_alloc(batch_scratch *bs, backend *owner, int m, int dim, int q_out,
-								int kv_out, int intermediate, int attn_buf_size) {
+								int kv_out, int intermediate, int attn_buf_size,
+								uint32_t slot_mask) {
 	int ffn_act_size = intermediate > dim ? intermediate : dim;
 	for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++) {
 		if (!bs_slot_valid[slot])
+			continue;
+		if (slot_mask && !(slot_mask & bs_slot_bit((uint8_t)slot)))
 			continue;
 		size_t elems = bs_slot_elems((uint8_t)slot, m, q_out, kv_out, intermediate, attn_buf_size,
 									 ffn_act_size);
@@ -2206,6 +2296,33 @@ static status_code op_moe_router_direct(backend *a, layer_weights *L, int E, int
 	return OK;
 }
 
+typedef struct {
+	batch_scratch *bs;
+	layer_weights *L;
+	int			   E, K, rows;
+	int			   uses_softmax, norm_topk;
+	float		   routed_scale;
+} moe_router_emit_job;
+
+static void moe_router_emit_chunk(int begin, int end, int tid, void *v) {
+	(void)tid;
+	moe_router_emit_job *j = v;
+	for (int row = begin; row < end; row++) {
+		float		*logits	 = j->bs->moe_router_logits.p + (size_t)row * j->E;
+		int			*row_ids = j->bs->moe_router_ids + (size_t)row * j->K;
+		float		*row_w	 = j->bs->moe_router_w + (size_t)row * j->K;
+		const float *bias	 = (const float *)j->L->router_bias.host_ptr;
+		int			 K_row	 = moe_router_emit(
+			j->E, j->K, j->uses_softmax, j->norm_topk, j->routed_scale, logits, bias,
+			j->bs->moe_router_logits.p + (size_t)j->rows * j->E + (size_t)row * j->E, row_ids,
+			row_w);
+		for (int k = K_row; k < j->K; k++) {
+			row_ids[k] = -1;
+			row_w[k]   = 0.0f;
+		}
+	}
+}
+
 static status_code moe_router_batch(exec_ctx *ctx) {
 
 	backend *a = exec_layer_backend(ctx);
@@ -2279,18 +2396,33 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	if (st != OK)
 		return st;
 
-	for (int row = 0; row < ctx->n_rows; row++) {
-		float		*logits	 = ctx->bs->moe_router_logits.p + (size_t)row * E;
-		int			*row_ids = ctx->bs->moe_router_ids + (size_t)row * K;
-		float		*row_w	 = ctx->bs->moe_router_w + (size_t)row * K;
-		const float *bias	 = (const float *)L->router_bias.host_ptr;
-		int K_row = moe_router_emit(E, K, uses_softmax, norm_topk, routed_scale, logits, bias,
-									ctx->bs->moe_router_logits.p + (size_t)ctx->n_rows * E +
-										(size_t)row * E,
-									row_ids, row_w);
-		for (int k = K_row; k < K; k++) {
-			row_ids[k] = -1;
-			row_w[k]   = 0.0f;
+	tpool *router_pool = (ctx->m->backend && ctx->m->backend->get_pool)
+							 ? ctx->m->backend->get_pool(ctx->m->backend)
+							 : NULL;
+	if (router_pool && ctx->n_rows >= 8 && E >= 8 && tpool_current_tid() < 0) {
+		moe_router_emit_job emit_job = {.bs			  = ctx->bs,
+										.L			  = L,
+										.E			  = E,
+										.K			  = K,
+										.rows		  = ctx->n_rows,
+										.uses_softmax = uses_softmax,
+										.norm_topk	  = norm_topk,
+										.routed_scale = routed_scale};
+		tpool_parallel_for(router_pool, ctx->n_rows, 1, moe_router_emit_chunk, &emit_job);
+	} else {
+		for (int row = 0; row < ctx->n_rows; row++) {
+			float		*logits	 = ctx->bs->moe_router_logits.p + (size_t)row * E;
+			int			*row_ids = ctx->bs->moe_router_ids + (size_t)row * K;
+			float		*row_w	 = ctx->bs->moe_router_w + (size_t)row * K;
+			const float *bias	 = (const float *)L->router_bias.host_ptr;
+			int K_row = moe_router_emit(E, K, uses_softmax, norm_topk, routed_scale, logits, bias,
+										ctx->bs->moe_router_logits.p + (size_t)ctx->n_rows * E +
+											(size_t)row * E,
+										row_ids, row_w);
+			for (int k = K_row; k < K; k++) {
+				row_ids[k] = -1;
+				row_w[k]   = 0.0f;
+			}
 		}
 	}
 
@@ -2624,9 +2756,9 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 		}
 	}
 
-	buffer *xb2 = batch_slot(ctx->bs, ctx->op->out);
 finish:
-	float *xb2_ptr = batch_buf_ptr(xb2);
+	buffer *xb2		= batch_slot(ctx->bs, ctx->op->out);
+	float  *xb2_ptr = batch_buf_ptr(xb2);
 	memcpy(xb2_ptr, ctx->bs->moe_out.p, (size_t)ctx->n_rows * dim * sizeof(float));
 
 	for (int row = 0; row < ctx->n_rows; row++) {
@@ -2691,13 +2823,21 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_GATE, (size_t)ctx->n_rows * sh_inter);
 		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_UP, (size_t)ctx->n_rows * sh_inter);
 
-		status_code st =
-			a->matmul_batch(a, gate_w_buf, gate_wt, xb, &ctx->bs->pair[RECIPE_SLOT_FFN_GATE].b,
-							sh_inter, dim, ctx->n_rows);
-		if (st != OK)
-			return st;
-		st = a->matmul_batch(a, up_w_buf, up_wt, xb, &ctx->bs->pair[RECIPE_SLOT_FFN_UP].b, sh_inter,
-							 dim, ctx->n_rows);
+		status_code st;
+		if (a->matmul_multi_batch) {
+			const buffer *ws[2]	   = {gate_w_buf, up_w_buf};
+			uint32_t	  wts[2]   = {gate_wt, up_wt};
+			buffer		 *ys[2]	   = {&ctx->bs->pair[RECIPE_SLOT_FFN_GATE].b,
+									  &ctx->bs->pair[RECIPE_SLOT_FFN_UP].b};
+			int			  n_out[2] = {sh_inter, sh_inter};
+			st = a->matmul_multi_batch(a, ws, wts, xb, ys, n_out, dim, 2, ctx->n_rows);
+		} else {
+			st = a->matmul_batch(a, gate_w_buf, gate_wt, xb, &ctx->bs->pair[RECIPE_SLOT_FFN_GATE].b,
+								 sh_inter, dim, ctx->n_rows);
+			if (st == OK)
+				st = a->matmul_batch(a, up_w_buf, up_wt, xb, &ctx->bs->pair[RECIPE_SLOT_FFN_UP].b,
+									 sh_inter, dim, ctx->n_rows);
+		}
 		if (st != OK)
 			return st;
 
@@ -3620,12 +3760,20 @@ static status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 		kv_a_b.size		= (size_t)ctx->n_rows * kv_a_rows * sizeof(float);
 		kv_a_b.owner	= a;
 
-		status_code st =
-			a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, &q_a_b, q_lora, dim, ctx->n_rows);
-		if (st != OK)
-			return st;
-		st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, &kv_a_b, kv_a_rows, dim,
-							 ctx->n_rows);
+		status_code st;
+		if (a->matmul_multi_batch) {
+			const buffer *ws[2]	   = {&L->q_a_w.buf, &L->kv_a_w.buf};
+			uint32_t	  wts[2]   = {L->q_a_w.type, L->kv_a_w.type};
+			buffer		 *ys[2]	   = {&q_a_b, &kv_a_b};
+			int			  n_out[2] = {q_lora, kv_a_rows};
+			st = a->matmul_multi_batch(a, ws, wts, xb, ys, n_out, dim, 2, ctx->n_rows);
+		} else {
+			st = a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, &q_a_b, q_lora, dim,
+								 ctx->n_rows);
+			if (st == OK)
+				st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, &kv_a_b, kv_a_rows, dim,
+									 ctx->n_rows);
+		}
 		if (st != OK)
 			return st;
 
@@ -4027,6 +4175,35 @@ static status_code exec_op_batch(const recipe_op *op, model *m, kvcache *cache, 
 	return h(&ctx);
 }
 
+typedef struct {
+	model		  *m;
+	backend		  *a;
+	const int32_t *tokens;
+	buffer		  *xs;
+	int			   dim;
+	int			   scale_embd;
+	_Atomic int	  *first_err;
+} embd_fill_job;
+
+static void embd_fill_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	embd_fill_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		buffer		xrow = batch_row_view(j->xs, row, j->dim);
+		status_code st	 = j->a->embd_lookup(j->a, &j->m->tok_embd.buf, j->m->tok_embd.type,
+											 j->tokens[row], j->dim, &xrow);
+		if (st != OK) {
+			atomic_store_explicit(j->first_err, st, memory_order_relaxed);
+			continue;
+		}
+		if (j->scale_embd) {
+			float *xf = batch_buf_ptr(&xrow);
+			for (int i = 0; i < j->dim; i++)
+				xf[i] *= j->m->dim_sqrt;
+		}
+	}
+}
+
 static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvcache *cache,
 													 struct compute_scratch *s,
 													 const int32_t *tokens, int n_tokens,
@@ -4071,7 +4248,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	batch_scratch *bs	 = s->bs;
 	bs->tokens			 = tokens;
 	bs->n_tokens_stashed = n_tokens;
-	batch_scratch_alloc(bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size);
+	uint32_t slot_mask	 = r->bs_slot_mask;
+	if (!slot_mask)
+		slot_mask = 0xffffffffu;
+	batch_scratch_alloc(bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size, slot_mask);
 	if (m->arch_info->is_hybrid_recurrent) {
 		bs_ensure_slot(bs, a, RECIPE_SLOT_HYB_PROJ, (size_t)n_tokens * model_hybrid_proj_size(m));
 		bs_ensure_slot(bs, a, RECIPE_SLOT_HYB_GATE, (size_t)n_tokens * model_hybrid_gate_size(m));
@@ -4081,16 +4261,33 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 
 	status_code st = OK;
 
-	for (int row = 0; row < n_tokens; row++) {
-		buffer xrow = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, row, dim);
-		st = a->embd_lookup(a, &m->tok_embd.buf, m->tok_embd.type, tokens[row], dim, &xrow);
+	tpool *embd_pool = (a->get_pool) ? a->get_pool(a) : NULL;
+	if (embd_pool && n_tokens >= 16 && backend_has_cap(a, BCAP_IS_HOST) &&
+		tpool_current_tid() < 0 && tpool_n_threads(embd_pool) > 1) {
+		_Atomic int	  embd_err = OK;
+		embd_fill_job efj	   = {.m		  = m,
+								  .a		  = a,
+								  .tokens	  = tokens,
+								  .xs		  = &bs->pair[RECIPE_SLOT_X].b,
+								  .dim		  = dim,
+								  .scale_embd = m->arch_info->has_scale_embeddings,
+								  .first_err  = &embd_err};
+		tpool_parallel_for(embd_pool, n_tokens, 4, embd_fill_chunk, &efj);
+		st = atomic_load_explicit(&embd_err, memory_order_relaxed);
 		if (st != OK)
 			goto done;
-		if (m->arch_info->has_scale_embeddings) {
-			float  scale = m->dim_sqrt;
-			float *xf	 = batch_buf_ptr(&xrow);
-			for (int i = 0; i < dim; i++)
-				xf[i] *= scale;
+	} else {
+		for (int row = 0; row < n_tokens; row++) {
+			buffer xrow = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, row, dim);
+			st = a->embd_lookup(a, &m->tok_embd.buf, m->tok_embd.type, tokens[row], dim, &xrow);
+			if (st != OK)
+				goto done;
+			if (m->arch_info->has_scale_embeddings) {
+				float  scale = m->dim_sqrt;
+				float *xf	 = batch_buf_ptr(&xrow);
+				for (int i = 0; i < dim; i++)
+					xf[i] *= scale;
+			}
 		}
 	}
 

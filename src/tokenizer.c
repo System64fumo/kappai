@@ -473,10 +473,16 @@ static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 	const piece *a	  = &bs->pcs[i];
 	const piece *b	  = &bs->pcs[bs->next[i]];
 	size_t		 klen = a->n + b->n;
-	if (klen > bs->key_cap) {
-		bs->key_cap = klen * 2;
-		bs->key		= xrealloc(bs->key, bs->key_cap);
+	if (klen > t->bpe_rank_cap) {
+		size_t cap = t->bpe_rank_cap > 0 ? t->bpe_rank_cap : 128;
+		while (cap < klen)
+			cap *= 2;
+		free(t->bpe_rank_buf);
+		t->bpe_rank_buf = xmalloc(cap);
+		t->bpe_rank_cap = cap;
 	}
+	bs->key		= t->bpe_rank_buf;
+	bs->key_cap = t->bpe_rank_cap;
 	memcpy(bs->key, a->p, a->n);
 	memcpy(bs->key + a->n, b->p, b->n);
 	if (t->has_merges)
@@ -586,7 +592,7 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 	size_t heap_cap	 = (size_t)(3 * npcs + 8);
 	size_t work_need = ((size_t)npcs * sizeof(int)) * 2 +
 					   ((size_t)npcs * (sizeof(uint8_t) + sizeof(uint32_t))) +
-					   (heap_cap * (sizeof(int32_t) + sizeof(int) + sizeof(uint32_t)));
+					   (heap_cap * (sizeof(int32_t) + sizeof(int) + sizeof(uint32_t))) + 8 * 8;
 	bpe_work_reserve(t, work_need);
 
 	bpe_state bs;
@@ -595,7 +601,8 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 		uintptr_t cursor = (uintptr_t)t->bpe_work;
 #define BPE_TAKE(ptr, type, count)                                                                 \
 	do {                                                                                           \
-		(ptr) = (type *)cursor;                                                                    \
+		cursor = (cursor + (_Alignof(type) - 1)) & ~(uintptr_t)(_Alignof(type) - 1);               \
+		(ptr)  = (type *)cursor;                                                                   \
 		cursor += (size_t)(count) * sizeof(type);                                                  \
 	} while (0)
 		BPE_TAKE(bs.prev, int, npcs);
@@ -609,7 +616,7 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 		bs.pcs	= pcs;
 		bs.npcs = npcs;
 		bs.head = 0;
-		bs.key	= NULL;
+		bs.key	= t->bpe_rank_buf;
 	}
 
 	for (int i = 0; i < npcs; i++) {
@@ -624,11 +631,17 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 			bpe_heap_push(&bs, r, i, 0);
 	}
 
-	size_t arena_cap	 = len;
-	char  *arena		 = xmalloc(arena_cap);
-	size_t arena_used	 = 0;
-	size_t merge_key_cap = len * 2 + 4;
-	char  *merge_key	 = xmalloc(merge_key_cap);
+	size_t arena_cap = t->bpe_arena_cap;
+	if (arena_cap < len) {
+		size_t cap = arena_cap > 0 ? arena_cap : 64;
+		while (cap < len)
+			cap *= 2;
+		free(t->bpe_arena);
+		t->bpe_arena	 = xmalloc(cap);
+		t->bpe_arena_cap = cap;
+	}
+	char  *arena	  = t->bpe_arena;
+	size_t arena_used = 0;
 
 	while (bs.hn > 0) {
 		int32_t	 top_rank;
@@ -645,17 +658,15 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 		}
 		int nx		  = bs.next[nd];
 		int best_klen = (int)(bs.pcs[nd].n + bs.pcs[nx].n);
-		if ((size_t)best_klen > merge_key_cap) {
-			merge_key_cap = (size_t)best_klen * 2;
-			merge_key	  = xrealloc(merge_key, merge_key_cap);
-		}
 		if (arena_used + (size_t)best_klen > arena_cap) {
 			uintptr_t old_base = (uintptr_t)arena;
 			size_t	  old_used = arena_used;
-			size_t	  new_cap  = arena_cap * 2;
+			size_t	  new_cap  = t->bpe_arena_cap * 2;
 			while (arena_used + (size_t)best_klen > new_cap)
 				new_cap *= 2;
-			char *new_arena = xrealloc(arena, new_cap);
+			char *new_arena	 = xrealloc(arena, new_cap);
+			t->bpe_arena	 = new_arena;
+			t->bpe_arena_cap = new_cap;
 			if ((uintptr_t)new_arena != old_base) {
 				for (int i = bs.head; i >= 0; i = bs.next[i]) {
 					uintptr_t p = (uintptr_t)pcs[i].p;
@@ -700,23 +711,25 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 			goto fail;
 		out_ids[written++] = pcs[i].id;
 	}
-	free(merge_key);
-	free(arena);
-	free(bs.key);
 	*n_out = written;
 	return 0;
 
 fail:
-	free(merge_key);
-	free(arena);
-	free(bs.key);
 	return -1;
 }
 
 static int encode_sp_chunk(tokenizer *t, const char *text, size_t start, size_t end,
 						   int32_t *out_ids, int max_out, int *written) {
 	size_t sub_len = end - start;
-	char  *sp_text = xmalloc((sub_len * 3) + 1);
+	if (t->bpe_sp_cap < sub_len * 3 + 1) {
+		size_t cap = t->bpe_sp_cap > 0 ? t->bpe_sp_cap : 256;
+		while (cap < sub_len * 3 + 1)
+			cap *= 2;
+		free(t->bpe_sp_text);
+		t->bpe_sp_text = xmalloc(cap);
+		t->bpe_sp_cap  = cap;
+	}
+	char  *sp_text = t->bpe_sp_text;
 	size_t sp_len  = 0;
 	for (size_t i = start; i < end; i++) {
 		if (text[i] == ' ') {
@@ -729,11 +742,8 @@ static int encode_sp_chunk(tokenizer *t, const char *text, size_t start, size_t 
 	}
 	sp_text[sp_len] = '\0';
 	int n;
-	if (tokenizer_bpe_encode(t, sp_text, sp_len, out_ids + *written, max_out - *written, &n) < 0) {
-		free(sp_text);
+	if (tokenizer_bpe_encode(t, sp_text, sp_len, out_ids + *written, max_out - *written, &n) < 0)
 		return -1;
-	}
-	free(sp_text);
 	*written += n;
 	return 0;
 }
@@ -1034,6 +1044,9 @@ void tokenizer_free(tokenizer *t) {
 	free(t->special_by_first_byte);
 	free(t->bpe_pcs_cache);
 	free(t->bpe_work);
+	free(t->bpe_arena);
+	free(t->bpe_rank_buf);
+	free(t->bpe_sp_text);
 	memset(t, 0, sizeof(*t));
 }
 

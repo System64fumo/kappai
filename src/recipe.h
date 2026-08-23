@@ -247,6 +247,8 @@ typedef struct model_recipe {
 	int max_intermediate;
 	int max_head_dim;
 	int max_kv_heads;
+
+	uint32_t bs_slot_mask;
 } model_recipe;
 
 typedef struct {

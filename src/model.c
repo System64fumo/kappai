@@ -33,6 +33,21 @@ static void madvise_dontneed(const void *map_base, size_t map_size, const void *
 	}
 }
 
+static void madvise_access_pattern(const void *map_base, size_t map_size, const void *ptr,
+								   size_t bytes, int advice) {
+	if (!map_base || map_size == 0 || !ptr || bytes == 0)
+		return;
+	long ps = sysconf(_SC_PAGESIZE);
+	if (ps <= 0)
+		ps = 4096;
+	uintptr_t addr		 = (uintptr_t)ptr;
+	uintptr_t page_start = addr & ~((uintptr_t)ps - 1);
+	uintptr_t page_end	 = (addr + bytes + ps - 1) & ~((uintptr_t)ps - 1);
+	if (page_start >= (uintptr_t)map_base && page_end <= (uintptr_t)map_base + map_size) {
+		madvise((void *)page_start, page_end - page_start, advice);
+	}
+}
+
 typedef struct {
 	const void *src;
 	void	   *dst;
@@ -660,6 +675,11 @@ static void upload_embeddings(model *m) {
 	s = upload_one(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING);
 	if (s != OK)
 		return;
+	if (!m->tie_embeddings && m->gctx.map && !m->gctx.map_is_heap) {
+		size_t embd_bytes = ggml_row_size(m->tok_embd.type, (size_t)m->dim) * (size_t)m->vocab_size;
+		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
+							   MADV_RANDOM);
+	}
 	s = upload_one(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 	if (s != OK)
 		return;
