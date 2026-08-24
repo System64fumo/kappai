@@ -236,6 +236,8 @@ void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int 
 void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								   int n, int k, int m);
+void matmul_q4_k_r8_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
+							 quant_scratch *qs);
 
 void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k);
 void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);

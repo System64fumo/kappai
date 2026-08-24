@@ -9,6 +9,13 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
+/* Caches holding __m256i lanes must be at least 32-byte (we use 64) aligned:
+ * the compiler emits aligned vmovdqa stores for __m256i-typed objects, and
+ * malloc/realloc only guarantee 16-byte alignment. */
+static inline void *ymm_cache_alloc(size_t bytes) {
+	return xmalloc_aligned(bytes, 64);
+}
+
 typedef struct {
 	uint16_t d;
 	uint8_t	 qs[64];
@@ -961,6 +968,7 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_Q4_0_R8:
 	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_Q4_K_R8:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_Q6_K:
@@ -997,6 +1005,9 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 			break;
 		case GGML_TYPE_Q4_K:
 			matmul_q4_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q4_K_R8:
+			matmul_q4_k_r8_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q5_K:
 			matmul_q5_k_q8_k_f32(w, x, y, n, k, &qs);
@@ -3043,7 +3054,7 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				q_ymm_cache = realloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
+				q_ymm_cache = ymm_cache_alloc(sizeof(*q_ymm_cache) * n_bi_tiles);
 				sc_cache	= realloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
 				d_w_cache	= realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
@@ -3233,8 +3244,8 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				wlo_cache	 = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = realloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
+				wlo_cache	 = ymm_cache_alloc(sizeof(*wlo_cache) * n_bi_tiles);
+				whi_cache	 = ymm_cache_alloc(sizeof(*whi_cache) * n_bi_tiles);
 				s_lo_cache	 = realloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
 				s_hi_cache	 = realloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
 				m_lo_cache	 = realloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
@@ -3542,6 +3553,186 @@ static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 			sumf += xd * ((d * (float)sumi) - (dmin * (float)summ));
 		}
 		y[i] = sumf;
+	}
+}
+
+static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *Wb			  = w;
+	const __m256i  lo_mask		  = _mm256_set1_epi8(0x0F);
+	int			   i			  = 0;
+
+	for (; i + MR <= n; i += MR) {
+		__m256 acc	  = _mm256_setzero_ps();
+		const uint8_t *group =
+			Wb + ((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t *blk = group + ((size_t)bi * Q4_K_R8_GROUP_BYTES);
+			if (bi + 1 < blocks_per_row)
+				__builtin_prefetch(blk + Q4_K_R8_GROUP_BYTES, 0, 1);
+
+			const q8_k_block *restrict xb = &xq[bi];
+			const float xd				  = xb->d;
+			const int8_t *restrict xq8	  = xb->qs;
+			const int16_t *restrict bs	  = xb->bsums;
+			__m256i xq0_v[4], xq1_v[4];
+			for (int g = 0; g < 4; g++) {
+				xq0_v[g] = _mm256_loadu_si256((const __m256i *)(xq8 + (g * 64)));
+				xq1_v[g] = _mm256_loadu_si256((const __m256i *)(xq8 + (g * 64) + 32));
+			}
+			int32_t bsum_pre[8];
+			for (int g = 0; g < 4; g++) {
+				int ib				  = g * 4;
+				bsum_pre[g * 2]		  = (int32_t)bs[ib] + (int32_t)bs[ib + 1];
+				bsum_pre[(g * 2) + 1] = (int32_t)bs[ib + 2] + (int32_t)bs[ib + 3];
+			}
+
+			const uint16_t *d_ptr	 = (const uint16_t *)blk;
+			const uint16_t *dmin_ptr = d_ptr + Q4_K_R8_ROWS;
+			const uint8_t  *sc_base	 = blk + Q4_K_R8_OFF_SE;
+			const uint8_t  *qs_base	 = blk + Q4_K_R8_OFF_QS;
+			int32_t			sumi_lane[8];
+			int32_t			summ_lane[8];
+			for (int r = 0; r < MR; r++) {
+				const uint8_t *restrict sc	   = sc_base + ((size_t)r * 16);
+				const uint8_t *restrict qbytes = qs_base + ((size_t)r * 128);
+				__m256i sumi_v				   = _mm256_setzero_si256();
+				int32_t summ				   = 0;
+				for (int g = 0; g < 4; g++) {
+					int s0 = sc[g * 4 + 0], m0 = sc[g * 4 + 1];
+					int s1 = sc[g * 4 + 2], m1 = sc[g * 4 + 3];
+					const __m256i qg   = _mm256_loadu_si256((const __m256i *)(qbytes + (g * 32)));
+					const __m256i lo_u = _mm256_and_si256(qg, lo_mask);
+					const __m256i hi_u = _mm256_and_si256(_mm256_srli_epi16(qg, 4), lo_mask);
+					sumi_v			   = _mm256_add_epi32(
+						  sumi_v, _mm256_add_epi32(maddubs_scale_i32(lo_u, xq0_v[g], s0),
+												   maddubs_scale_i32(hi_u, xq1_v[g], s1)));
+					summ += m0 * bsum_pre[g * 2];
+					summ += m1 * bsum_pre[(g * 2) + 1];
+				}
+				sumi_lane[r] = vreduce_add_epi32(sumi_v);
+				summ_lane[r] = summ;
+			}
+			__m256 sumi_f = _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)sumi_lane));
+			__m256 summ_f = _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)summ_lane));
+			__m256 d_w	  = loadu_f16x8_to_ps(d_ptr);
+			__m256 dmin_w = loadu_f16x8_to_ps(dmin_ptr);
+			__m256 val =
+				_mm256_sub_ps(_mm256_mul_ps(d_w, sumi_f), _mm256_mul_ps(dmin_w, summ_f));
+			acc = _mm256_fmadd_ps(_mm256_set1_ps(xd), val, acc);
+		}
+		_mm256_storeu_ps(y + i, acc);
+	}
+}
+
+void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m) {
+	if (m == 1) {
+		matmul_q4_k_r8_q8_k_qonly_f32_row(w, xq, y, n, k);
+		return;
+	}
+
+	const int	   blocks_per_row = k / 256;
+	const uint8_t *Wb			  = w;
+	const __m256i  lo_mask		  = _mm256_set1_epi8(0x0F);
+
+	static _Thread_local float *acc_buf = NULL;
+	static _Thread_local int	acc_cap = 0;
+	const int					need	= MR * m;
+	if (acc_cap < need) {
+		float *nb = realloc(acc_buf, (size_t)need * sizeof(float));
+		if (!nb) {
+			for (int t = 0; t < m; t++)
+				matmul_q4_k_r8_q8_k_qonly_f32_row(w, xq + ((size_t)t * xq_row_stride_blocks),
+												  y + ((size_t)t * y_row_stride), n, k);
+			return;
+		}
+		acc_buf = nb;
+		acc_cap = need;
+		tlocal_register((void **)&acc_buf);
+	}
+
+	int i = 0;
+	for (; i + MR <= n; i += MR) {
+		const uint8_t *group =
+			Wb + ((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
+		for (int t = 0; t < m; t++)
+			_mm256_storeu_ps(acc_buf + (size_t)t * MR, _mm256_setzero_ps());
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const uint8_t *blk = group + ((size_t)bi * Q4_K_R8_GROUP_BYTES);
+			if (bi + 1 < blocks_per_row)
+				__builtin_prefetch(blk + Q4_K_R8_GROUP_BYTES, 0, 1);
+
+			const uint16_t *d_ptr	 = (const uint16_t *)blk;
+			const uint16_t *dmin_ptr = d_ptr + Q4_K_R8_ROWS;
+			const uint8_t  *sc_base	 = blk + Q4_K_R8_OFF_SE;
+			const uint8_t  *qs_base	 = blk + Q4_K_R8_OFF_QS;
+			__m256			d_w		 = loadu_f16x8_to_ps(d_ptr);
+			__m256			dmin_w	 = loadu_f16x8_to_ps(dmin_ptr);
+
+			__m256i wlo[MR][4], whi[MR][4];
+			int32_t s_lo[MR][4], s_hi[MR][4], m_lo[MR][4], m_hi[MR][4];
+			for (int r = 0; r < MR; r++) {
+				const uint8_t *restrict sc = sc_base + ((size_t)r * 16);
+				const uint8_t *qbytes	   = qs_base + ((size_t)r * 128);
+				for (int g = 0; g < 4; g++) {
+					s_lo[r][g] = (int32_t)sc[g * 4 + 0];
+					m_lo[r][g] = (int32_t)sc[g * 4 + 1];
+					s_hi[r][g] = (int32_t)sc[g * 4 + 2];
+					m_hi[r][g] = (int32_t)sc[g * 4 + 3];
+					const __m256i qg = _mm256_loadu_si256((const __m256i *)(qbytes + (g * 32)));
+					wlo[r][g]		 = _mm256_and_si256(qg, lo_mask);
+					whi[r][g]		 = _mm256_and_si256(_mm256_srli_epi16(qg, 4), lo_mask);
+				}
+			}
+
+			for (int t = 0; t < m; t++) {
+				const q8_k_block *restrict xb = xq + ((size_t)t * xq_row_stride_blocks) + bi;
+				const float xd				  = xb->d;
+				const int8_t *restrict xq8	  = xb->qs;
+				const int16_t *restrict bs	  = xb->bsums;
+				int32_t bsum_pre[8];
+				for (int g = 0; g < 4; g++) {
+					int ib				  = g * 4;
+					bsum_pre[g * 2]		  = (int32_t)bs[ib] + (int32_t)bs[ib + 1];
+					bsum_pre[(g * 2) + 1] = (int32_t)bs[ib + 2] + (int32_t)bs[ib + 3];
+				}
+				__m256i xq0_v[4], xq1_v[4];
+				for (int g = 0; g < 4; g++) {
+					xq0_v[g] = _mm256_loadu_si256((const __m256i *)(xq8 + (g * 64)));
+					xq1_v[g] = _mm256_loadu_si256((const __m256i *)(xq8 + (g * 64) + 32));
+				}
+				int32_t sumi_lane[8];
+				int32_t summ_lane[8];
+				for (int r = 0; r < MR; r++) {
+					__m256i acc	 = _mm256_setzero_si256();
+					int32_t summ = 0;
+					for (int g = 0; g < 4; g++) {
+						acc = _mm256_add_epi32(
+							acc, _mm256_add_epi32(maddubs_scale_i32(wlo[r][g], xq0_v[g], s_lo[r][g]),
+												  maddubs_scale_i32(whi[r][g], xq1_v[g], s_hi[r][g])));
+						summ += m_lo[r][g] * bsum_pre[g * 2];
+						summ += m_hi[r][g] * bsum_pre[(g * 2) + 1];
+					}
+					sumi_lane[r] = vreduce_add_epi32(acc);
+					summ_lane[r] = summ;
+				}
+				__m256 sumi_f = _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)sumi_lane));
+				__m256 summ_f = _mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)summ_lane));
+				__m256 val =
+					_mm256_sub_ps(_mm256_mul_ps(d_w, sumi_f), _mm256_mul_ps(dmin_w, summ_f));
+				float *ap = acc_buf + (size_t)t * MR;
+				_mm256_storeu_ps(ap, _mm256_fmadd_ps(_mm256_set1_ps(xd), val, _mm256_loadu_ps(ap)));
+			}
+		}
+
+		for (int t = 0; t < m; t++)
+			_mm256_storeu_ps(y + ((size_t)t * y_row_stride) + i,
+							 _mm256_loadu_ps(acc_buf + (size_t)t * MR));
 	}
 }
 

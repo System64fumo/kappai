@@ -1387,6 +1387,8 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *r
 
 MATMUL_QONLY_DISPATCH(q4_k_r8_q8_k, q8_k_block)
 
+MATMUL_Q8_F32(q4_k_r8_q8_k, q8_k_block, 256, quantize_q8_k, matmul_q4_k_r8_q8_k_qonly_f32)
+
 static void matmul_q5_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 											  float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 256;
@@ -1464,6 +1466,7 @@ static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc,
 		qh += 32;
 	}
 
+	ap = a;
 	int32_t total = 0;
 	for (int j = 0; j < 16; j++) {
 		int32_t l0 = 0;
@@ -1635,6 +1638,7 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	case GGML_TYPE_Q8_0:
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q4_K_R8:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_Q6_K:
@@ -1672,6 +1676,9 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 			break;
 		case GGML_TYPE_Q4_K:
 			matmul_q4_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q4_K_R8:
+			matmul_q4_k_r8_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q5_K:
 			matmul_q5_k_q8_k_f32(w, x, y, n, k, &qs);

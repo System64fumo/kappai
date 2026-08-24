@@ -529,6 +529,11 @@ void fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t
 				uint16_t dmin16	  = f32_to_f16(dmin_val);
 				memcpy(bp + 2, &dmin16, 2);
 			}
+			if (type == GGML_TYPE_Q8_0) {
+				for (size_t j = 2; j < block_bytes; j++)
+					if (bp[j] == 0x80)
+						bp[j] = 0x81;
+			}
 		}
 		bp += block_bytes;
 	}
