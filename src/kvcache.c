@@ -50,15 +50,21 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	}
 
 	if (is_hybrid) {
-		kvcache_hybrid *q	= xcalloc(1, sizeof(*q));
-		q->conv_stride		= (size_t)m->hybrid.conv_dim * (size_t)(m->hybrid.conv_kernel - 1);
-		q->recurrent_stride = (size_t)m->hybrid.n_value_heads * (size_t)m->hybrid.state_size *
-							  (size_t)m->hybrid.value_head_dim;
+		int				conv_state_only = m->arch_info->hybrid_shortconv;
+		size_t			chans = m->hybrid.conv_channels > 0 ? (size_t)m->hybrid.conv_channels
+															: (size_t)m->hybrid.conv_dim;
+		kvcache_hybrid *q	  = xcalloc(1, sizeof(*q));
+		q->conv_stride		  = chans * (size_t)(m->hybrid.conv_kernel - 1);
+		q->recurrent_stride = conv_state_only
+								  ? 0
+								  : (size_t)m->hybrid.n_value_heads * (size_t)m->hybrid.state_size *
+										(size_t)m->hybrid.value_head_dim;
 		q->conv_total		= (size_t)m->n_layers * q->conv_stride;
 		q->recurrent_total	= (size_t)m->n_layers * q->recurrent_stride;
 		q->conv_state		= xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
-		q->recurrent_state	= xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
-		c->hybrid			= q;
+		if (q->recurrent_stride > 0)
+			q->recurrent_state = xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		c->hybrid = q;
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
@@ -72,12 +78,19 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 
 	int *layer_head_dim	  = NULL;
 	int *layer_n_kv_heads = NULL;
-	if (m->arch_info->has_variable_layer_dims) {
+	if ((m->arch_info->has_variable_layer_dims || is_hybrid) &&
+		backend_has_cap(kv_backend, BCAP_IS_HOST)) {
 		layer_head_dim	 = xcalloc(m->n_layers, sizeof(int));
 		layer_n_kv_heads = xcalloc(m->n_layers, sizeof(int));
 		for (int i = 0; i < m->n_layers; i++) {
-			layer_head_dim[i]	= model_layer_head_dim(m, i);
-			layer_n_kv_heads[i] = model_layer_kv_heads(m, i);
+			layer_head_dim[i] = model_layer_head_dim(m, i);
+			int kvh			  = model_layer_kv_heads(m, i);
+			if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
+				i < m->n_layers)
+				kvh = m->layer_dims.n_kv_heads_per_layer[i] > 0
+						  ? m->layer_dims.n_kv_heads_per_layer[i]
+						  : 0;
+			layer_n_kv_heads[i] = kvh;
 		}
 	}
 
@@ -255,8 +268,10 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 void kvcache_reset(kvcache *c) {
 	c->n_pos = 0;
 	if (c->hybrid) {
-		memset(c->hybrid->conv_state, 0, c->hybrid->conv_total * sizeof(float));
-		memset(c->hybrid->recurrent_state, 0, c->hybrid->recurrent_total * sizeof(float));
+		if (c->hybrid->conv_state && c->hybrid->conv_total > 0)
+			memset(c->hybrid->conv_state, 0, c->hybrid->conv_total * sizeof(float));
+		if (c->hybrid->recurrent_state && c->hybrid->recurrent_total > 0)
+			memset(c->hybrid->recurrent_state, 0, c->hybrid->recurrent_total * sizeof(float));
 	}
 }
 

@@ -86,6 +86,16 @@ static const arch_info k_registry[] = {
 		.is_hybrid_recurrent		 = true,
 		.uses_neox_rope				 = true,
 	},
+	{
+		.arch				 = ARCH_LFM2,
+		.gguf_name			 = "lfm2",
+		.key_prefix			 = "lfm2",
+		.default_rope_theta	 = 1000000.0f,
+		.has_qk_norm		 = true,
+		.uses_neox_rope		 = true,
+		.is_hybrid_recurrent = true,
+		.hybrid_shortconv	 = true,
+	},
 };
 
 const arch_info *arch_lookup(model_arch a) {

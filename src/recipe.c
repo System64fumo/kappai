@@ -308,8 +308,16 @@ model_recipe *recipe_build(const struct model *m) {
 	uint32_t bs_mask = 0;
 	for (int i = 0; i < r->n_pre_ops; i++)
 		bs_mask |= op_batch_slot_mask(&r->pre_ops[i]);
-	for (int j = 0; j < r->layer.n_ops; j++)
-		bs_mask |= op_batch_slot_mask(&r->layer.ops[j]);
+	if (r->per_layer_ops && m->n_layers > 0 && r->layer.n_ops > 0) {
+		for (int li = 0; li < m->n_layers; li++) {
+			const recipe_op *lops = &r->per_layer_ops[(size_t)li * r->layer.n_ops];
+			for (int j = 0; j < r->layer.n_ops; j++)
+				bs_mask |= op_batch_slot_mask(&lops[j]);
+		}
+	} else {
+		for (int j = 0; j < r->layer.n_ops; j++)
+			bs_mask |= op_batch_slot_mask(&r->layer.ops[j]);
+	}
 	r->bs_slot_mask = bs_mask;
 
 	return r;
@@ -4064,6 +4072,7 @@ static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
 	[OP_PARTIAL_ROPE_QK]	 = op_partial_rope_qk,
 	[OP_ATTN_OUTPUT_GATE]	 = op_attn_output_gate,
 	[OP_GATED_DELTA_NET]	 = op_gated_delta_net,
+	[OP_SHORTCONV]			 = op_shortconv,
 };
 
 static int recipe_ops_are_batchable(const recipe_op *ops, int n) {

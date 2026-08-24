@@ -593,6 +593,7 @@ typedef enum {
 	ST_LIST,
 	ST_SET,
 	ST_MACRO,
+	ST_GENERATION,
 	ST_NOOP,
 } stmt_kind;
 
@@ -835,6 +836,22 @@ static expr_node *parse_primary(parser *p) {
 		padvance(p);
 		free(n);
 		n = parse_expr(p);
+		if (ptok_is(p, TOK_COMMA)) {
+			expr_node *tuple = xmalloc(sizeof(*tuple));
+			memset(tuple, 0, sizeof(*tuple));
+			tuple->kind					   = EX_LIST;
+			tuple->items				   = xrealloc(NULL, sizeof(expr_node *));
+			tuple->items[tuple->n_items++] = n;
+			while (ptok_is(p, TOK_COMMA)) {
+				padvance(p);
+				if (ptok_is(p, TOK_RPAREN))
+					break;
+				expr_node *item = parse_expr(p);
+				tuple->items = xrealloc(tuple->items, (tuple->n_items + 1) * sizeof(expr_node *));
+				tuple->items[tuple->n_items++] = item;
+			}
+			n = tuple;
+		}
 		if (!ptok_is(p, TOK_RPAREN))
 			perr(p, "expected ')'");
 		else
@@ -1292,7 +1309,8 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 		return parse_for_stmt(p);
 
 	if (stmt_kw_is(p, "endif") || stmt_kw_is(p, "endfor") || stmt_kw_is(p, "else") ||
-		stmt_kw_is(p, "elif") || stmt_kw_is(p, "endmacro") || stmt_kw_is(p, "endset")) {
+		stmt_kw_is(p, "elif") || stmt_kw_is(p, "endmacro") || stmt_kw_is(p, "endset") ||
+		stmt_kw_is(p, "endgeneration")) {
 		*is_block_end = 1;
 		*end_kw		  = "end";
 		return NULL;
@@ -1300,6 +1318,19 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 
 	if (stmt_kw_is(p, "set"))
 		return parse_set_stmt(p);
+
+	if (stmt_kw_is(p, "generation")) {
+		stmt_node *s = new_stmt(ST_GENERATION);
+		padvance(p);
+		expect_stmt_close(p, "generation tag");
+		s->body = parse_block(p);
+		if (!stmt_kw_is(p, "endgeneration"))
+			perr(p, "expected 'endgeneration'");
+		else
+			padvance(p);
+		expect_stmt_close(p, "endgeneration");
+		return s;
+	}
 
 	if (stmt_kw_is(p, "macro"))
 		return parse_macro_stmt(p);
@@ -1375,9 +1406,10 @@ static stmt_node *parse_block(parser *p) {
 	return head;
 }
 
-static const char *supported_filters[] = {
-	"trim",	   "default", "length", "upper", "lower", "dictsort", "list", "map",	"capitalize",
-	"replace", "tojson",  "int",	"first", "last",  "join",	  "safe", "string", NULL};
+static const char *supported_filters[] = {"trim",	  "default", "length", "upper",		 "lower",
+										  "dictsort", "list",	 "map",	   "capitalize", "replace",
+										  "tojson",	  "int",	 "first",  "last",		 "join",
+										  "safe",	  "string",	 "items",  NULL};
 
 static const char *supported_methods[] = {
 	"get",	 "split",	   "strip",	  "lstrip", "rstrip",	  "trim",	  "join", "lower",
@@ -1954,6 +1986,18 @@ static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
 		return base;
 	if (!strcmp(e->str, "string"))
 		return jinja_string(value_as_cstr(base));
+	if (!strcmp(e->str, "items")) {
+		jinja_value *out = jinja_list();
+		if (base && base->type == JV_DICT) {
+			for (jinja_dict_entry *en = base->as.dict; en; en = en->next) {
+				jinja_value *pair = jinja_list();
+				jinja_list_append(pair, jinja_string(en->key));
+				jinja_list_append(pair, en->val);
+				jinja_list_append(out, pair);
+			}
+		}
+		return out;
+	}
 	if (!strcmp(e->str, "map")) {
 		const char	*fname = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
 		jinja_value *out   = jinja_list();
@@ -2506,6 +2550,9 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 	case ST_LIST:
 		for (size_t i = 0; i < s->n_items && !ctx->failed; i++)
 			exec_stmt(ctx, s->items[i], out);
+		return;
+	case ST_GENERATION:
+		exec_stmts(ctx, s->body, out);
 		return;
 	case ST_NOOP:
 		return;

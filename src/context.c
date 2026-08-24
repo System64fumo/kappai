@@ -286,9 +286,26 @@ static size_t context_kv_bytes_per_token(const context *c) {
 		   (size_t)(c->kv.n_kv_layers > 0 ? c->kv.n_kv_layers : 1);
 }
 
+static size_t context_slot_bytes_per_token(const context *c) {
+	const model *m		= &c->m;
+	size_t		 floats = 4 * (size_t)m->dim + (size_t)m->n_heads * m->head_dim +
+						  2 * (size_t)m->n_kv_heads * m->head_dim + 2 * (size_t)m->intermediate;
+	floats += m->intermediate > m->dim ? m->intermediate : m->dim;
+	if (m->arch_info->is_hybrid_recurrent)
+		floats += (size_t)model_hybrid_proj_size(m) + (size_t)model_hybrid_gate_size(m) +
+				  2 * (size_t)m->hybrid.n_value_heads;
+	return floats * sizeof(float);
+}
+
 static int context_prefill_chunk_size(const context *c, int n_threads) {
-	size_t kv_per_tok = context_kv_bytes_per_token(c);
-	int	   chunk	  = PREFILL_CHUNK_WS_TARGET_BYTES / (kv_per_tok > 0 ? kv_per_tok : 1);
+	size_t kv_per_tok	= context_kv_bytes_per_token(c);
+	int	   chunk		= PREFILL_CHUNK_WS_TARGET_BYTES / (kv_per_tok > 0 ? kv_per_tok : 1);
+	size_t slot_per_tok = context_slot_bytes_per_token(c);
+	if (slot_per_tok > 0) {
+		int by_slots = PREFILL_CHUNK_WS_TARGET_BYTES / (size_t)slot_per_tok;
+		if (by_slots < chunk)
+			chunk = by_slots;
+	}
 	if (chunk < 32)
 		chunk = 32;
 	if (chunk > 512)
