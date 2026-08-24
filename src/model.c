@@ -10,6 +10,9 @@
 #include "threadpool.h"
 #include <fcntl.h>
 #include <math.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,8 +197,11 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 
 	if (require_dims_2d(g, "token_embd.weight", m->dim, m->vocab_size))
 		return -1;
-	if (require_dims_1d(g, "output_norm.weight", m->dim))
+	if (check_dims_1d(g, "output_norm.weight", m->dim) != 0 &&
+		check_dims_1d(g, "token_embd_norm.weight", m->dim) != 0) {
+		ERROR("model: missing or wrong-shape output norm tensor");
 		return -1;
+	}
 	if (!m->tie_embeddings) {
 		if (require_dims_2d(g, "output.weight", m->dim, m->vocab_size))
 			return -1;
@@ -230,24 +236,34 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 			return -1;
 		if (model_layer_is_recurrent(m, i)) {
 			const model_hybrid_params *q = &m->hybrid;
-			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_qkv.weight", i, m->dim,
-									  q->conv_dim) ||
-				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_gate.weight", i, m->dim,
-									  q->value_dim) ||
-				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", i,
-									  q->conv_kernel, q->conv_dim) ||
-				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_dt.bias", i,
-									  q->n_value_heads) ||
-				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_a", i,
-									  q->n_value_heads) ||
-				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_beta.weight", i, m->dim,
-									  q->n_value_heads) ||
-				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_alpha.weight", i, m->dim,
-									  q->n_value_heads) ||
-				require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_norm.weight", i,
-									  q->value_head_dim) ||
-				require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_out.weight", i,
-									  q->value_dim, m->dim))
+			if (m->arch_info->hybrid_shortconv) {
+				if (require_layer_dims_2d(g, tname, sizeof(tname),
+										  "blk.%d.shortconv.in_proj.weight", i, m->dim,
+										  q->conv_dim) ||
+					require_layer_dims_2d(g, tname, sizeof(tname),
+										  "blk.%d.shortconv.out_proj.weight", i, q->value_dim,
+										  m->dim) ||
+					require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.shortconv.conv.weight",
+										  i, q->conv_kernel, m->dim))
+					return -1;
+			} else if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_qkv.weight", i,
+											 m->dim, q->conv_dim) ||
+					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_gate.weight", i,
+											 m->dim, q->value_dim) ||
+					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", i,
+											 q->conv_kernel, q->conv_dim) ||
+					   require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_dt.bias", i,
+											 q->n_value_heads) ||
+					   require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_a", i,
+											 q->n_value_heads) ||
+					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_beta.weight", i,
+											 m->dim, q->n_value_heads) ||
+					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_alpha.weight", i,
+											 m->dim, q->n_value_heads) ||
+					   require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ssm_norm.weight", i,
+											 q->value_head_dim) ||
+					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_out.weight", i,
+											 q->value_dim, m->dim))
 				return -1;
 		} else if (is_mla_layer) {
 			int q_lora	  = m->mla.q_lora;
@@ -438,7 +454,7 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 	if (m->gctx.map && !m->gctx.map_is_heap) {
 
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, host_ptr, bytes);
-	} else if (m->gctx.map_is_heap) {
+	} else if (m->gctx.owns_tensor_data) {
 
 		for (size_t i = 0; i < m->gctx.n_tensors; i++) {
 			if (m->gctx.tensors[i].data == host_ptr) {
@@ -785,16 +801,22 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	UPLOAD(&L->attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
 	if (model_layer_is_recurrent(m, i)) {
-		UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
-		UPLOAD_REP(&L->attn_gate_w, 2, m->dim, m->hybrid.value_dim, WCLASS_MATMUL);
-		UPLOAD(&L->ssm_conv1d_w, GGML_TYPE_F32, 2, m->hybrid.conv_kernel, m->hybrid.conv_dim,
-			   WCLASS_MISC);
-		UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
-		UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
-		UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
-		UPLOAD_REP(&L->ssm_alpha_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
-		UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, m->hybrid.value_head_dim, 0, WCLASS_NORM);
-		UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
+		if (m->arch_info->hybrid_shortconv) {
+			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
+			UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
+			UPLOAD(&L->ssm_conv1d_w, GGML_TYPE_F32, 2, m->hybrid.conv_kernel, m->dim, WCLASS_MISC);
+		} else {
+			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
+			UPLOAD_REP(&L->attn_gate_w, 2, m->dim, m->hybrid.value_dim, WCLASS_MATMUL);
+			UPLOAD(&L->ssm_conv1d_w, GGML_TYPE_F32, 2, m->hybrid.conv_kernel, m->hybrid.conv_dim,
+				   WCLASS_MISC);
+			UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
+			UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
+			UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
+			UPLOAD_REP(&L->ssm_alpha_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);
+			UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, m->hybrid.value_head_dim, 0, WCLASS_NORM);
+			UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
+		}
 	} else if (is_mla_layer) {
 		int q_lora	  = m->mla.q_lora;
 		int kv_lora	  = m->mla.kv_lora;
@@ -1011,6 +1033,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 					free(fused);
 					L->gate_up_fused_host = NULL;
 				}
+				size_t frow_bytes = ggml_row_size(L->gate_w.type, m->dim);
+				release_original_weight_data(m, L->gate_w.host_ptr, frow_bytes * intermediate);
+				release_original_weight_data(m, L->up_w.host_ptr, frow_bytes * intermediate);
+				L->gate_w.host_ptr = NULL;
+				L->up_w.host_ptr   = NULL;
 			} else {
 				free(fused);
 				return s;
@@ -1627,40 +1654,75 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 	if (req_i32(g, prefix, "attention.head_count", &v32) != OK) {
 		return ERR_FORMAT;
 	}
-	m->n_heads = v32;
-	if (akey_i32(g, prefix, "attention.head_count_kv", &v32) == OK) {
-		m->n_kv_heads = v32;
-	} else {
-		const int32_t *kv_arr;
-		size_t		   kv_n;
-		char		   kv_key[128];
-		snprintf(kv_key, sizeof(kv_key), "%s.attention.head_count_kv", prefix);
-		if (gguf_get_arr_i32(g, kv_key, &kv_arr, &kv_n) == OK && kv_n > 0) {
-			m->n_kv_heads = kv_arr[0];
-			int uniform	  = 1;
-			for (size_t i = 1; i < kv_n; i++) {
-				if (kv_arr[i] != kv_arr[0]) {
-					uniform = 0;
-					break;
+	m->n_heads			   = v32;
+	int kv_from_lfm2_array = 0;
+	if (m->arch_info->is_hybrid_recurrent && m->arch_info->hybrid_shortconv) {
+		char key[128];
+		snprintf(key, sizeof(key), "%s.attention.head_count_kv", prefix);
+		const int32_t *kv_arr = NULL;
+		size_t		   kv_n	  = 0;
+		if (gguf_get_arr_i32(g, key, &kv_arr, &kv_n) != OK || !kv_arr ||
+			kv_n != (size_t)m->n_layers) {
+			ERROR("model_load: '%s' must be an i32 array of length %d for lfm2 "
+				  "(0 marks shortconv layers)",
+				  key, m->n_layers);
+			return ERR_FORMAT;
+		}
+		m->n_kv_heads = 0;
+		for (size_t i = 0; i < kv_n; i++) {
+			if (kv_arr[i] > m->n_kv_heads)
+				m->n_kv_heads = kv_arr[i];
+		}
+		free(m->hybrid.recurrent_layers);
+		m->hybrid.recurrent_layers = xmalloc((size_t)m->n_layers);
+		free(m->layer_dims.n_kv_heads_per_layer);
+		m->layer_dims.n_kv_heads_per_layer = xcalloc((size_t)m->n_layers, sizeof(int32_t));
+		int n_recurrent					   = 0;
+		for (int i = 0; i < m->n_layers; i++) {
+			m->hybrid.recurrent_layers[i]		  = (kv_arr[i] == 0);
+			m->layer_dims.n_kv_heads_per_layer[i] = kv_arr[i];
+			n_recurrent += (kv_arr[i] == 0);
+		}
+		kv_from_lfm2_array = 1;
+		DEBUG("lfm2: %d shortconv layers, %d attention layers (kv_heads=%d)", n_recurrent,
+			  m->n_layers - n_recurrent, m->n_kv_heads);
+	}
+	if (!kv_from_lfm2_array) {
+		if (akey_i32(g, prefix, "attention.head_count_kv", &v32) == OK) {
+			m->n_kv_heads = v32;
+		} else {
+			const int32_t *kv_arr;
+			size_t		   kv_n;
+			char		   kv_key[128];
+			snprintf(kv_key, sizeof(kv_key), "%s.attention.head_count_kv", prefix);
+			if (gguf_get_arr_i32(g, kv_key, &kv_arr, &kv_n) == OK && kv_n > 0) {
+				m->n_kv_heads = kv_arr[0];
+				int uniform	  = 1;
+				for (size_t i = 1; i < kv_n; i++) {
+					if (kv_arr[i] != kv_arr[0]) {
+						uniform = 0;
+						break;
+					}
 				}
-			}
-			if (!uniform) {
-				if (m->arch_info->has_variable_layer_dims) {
-					DEBUG("n_kv_heads varies per layer ([%d, %d, ...] -- per-layer dims supported)",
-						  kv_arr[0], kv_n > 1 ? kv_arr[1] : kv_arr[0]);
+				if (!uniform) {
+					if (m->arch_info->has_variable_layer_dims) {
+						DEBUG("n_kv_heads varies per layer ([%d, %d, ...] -- per-layer dims "
+							  "supported)",
+							  kv_arr[0], kv_n > 1 ? kv_arr[1] : kv_arr[0]);
+					} else {
+						ERROR("%s: %s varies per layer ([%d, %d, ...]); this engine "
+							  "only supports a single model-wide KV head count for "
+							  "this architecture",
+							  m->arch_info->gguf_name, kv_key, kv_arr[0],
+							  kv_n > 1 ? kv_arr[1] : kv_arr[0]);
+						return ERR_FORMAT;
+					}
 				} else {
-					ERROR("%s: %s varies per layer ([%d, %d, ...]); this engine "
-						  "only supports a single model-wide KV head count for "
-						  "this architecture",
-						  m->arch_info->gguf_name, kv_key, kv_arr[0],
-						  kv_n > 1 ? kv_arr[1] : kv_arr[0]);
-					return ERR_FORMAT;
+					DEBUG("n_kv_heads = %d (uniform)", m->n_kv_heads);
 				}
 			} else {
-				DEBUG("n_kv_heads = %d (uniform)", m->n_kv_heads);
+				m->n_kv_heads = m->n_heads;
 			}
-		} else {
-			m->n_kv_heads = m->n_heads;
 		}
 	}
 	if (req_f32(g, prefix, "attention.layer_norm_rms_epsilon", &vf) != OK) {
@@ -1714,8 +1776,31 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 		load_mla_metadata(m, g, prefix);
 	}
 	if (m->arch_info->is_hybrid_recurrent) {
-		if (load_hybrid_metadata(m, g, prefix) != OK)
+		if (m->arch_info->hybrid_shortconv) {
+			int32_t l_cache = 0;
+			if (!m->hybrid.recurrent_layers ||
+				req_i32(g, prefix, "shortconv.l_cache", &l_cache) != OK || l_cache < 2 ||
+				m->n_kv_heads < 1) {
+				ERROR("model_load: invalid lfm2 shortconv configuration "
+					  "(l_cache=%d kv_heads=%d)",
+					  l_cache, m->n_kv_heads);
+				return ERR_FORMAT;
+			}
+			model_hybrid_params *q	   = &m->hybrid;
+			q->conv_kernel			   = l_cache;
+			q->conv_dim				   = 3 * m->dim;
+			q->conv_channels		   = m->dim;
+			q->value_dim			   = m->dim;
+			q->inner_size			   = m->dim;
+			q->state_size			   = 1;
+			q->n_key_heads			   = 1;
+			q->n_value_heads		   = 1;
+			q->value_head_dim		   = m->dim;
+			q->key_dim				   = 1;
+			q->full_attention_interval = 1;
+		} else if (load_hybrid_metadata(m, g, prefix) != OK) {
 			return ERR_FORMAT;
+		}
 	}
 
 	return OK;
@@ -1759,6 +1844,8 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 	}
 	{
 		const gguf_tensor *t = gguf_find_tensor(g, "output_norm.weight");
+		if (!t)
+			t = gguf_find_tensor(g, "token_embd_norm.weight");
 		if (!t) {
 			ERROR("model_load: missing required tensor 'output_norm.weight'");
 			return ERR_FORMAT;
@@ -1836,24 +1923,33 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			return ERR_FORMAT;
 
 		if (model_layer_is_recurrent(m, i)) {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
-								  "blk.%d.attn_qkv.weight", 1) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_gate_w,
-								  "blk.%d.attn_gate.weight", 1) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
-								  "blk.%d.ssm_conv1d.weight", 0) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_dt_b, "blk.%d.ssm_dt.bias",
-								  0) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_a, "blk.%d.ssm_a", 0) !=
-					OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_beta_w,
-								  "blk.%d.ssm_beta.weight", 0) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_alpha_w,
-								  "blk.%d.ssm_alpha.weight", 0) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_norm_w,
-								  "blk.%d.ssm_norm.weight", 0) != OK ||
-				load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
-								  "blk.%d.ssm_out.weight", 1) != OK)
+			int is_conv = m->arch_info->hybrid_shortconv;
+			if (is_conv) {
+				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
+									  "blk.%d.shortconv.in_proj.weight", 1) != OK ||
+					load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
+									  "blk.%d.shortconv.out_proj.weight", 1) != OK ||
+					load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
+									  "blk.%d.shortconv.conv.weight", 0) != OK)
+					return ERR_FORMAT;
+			} else if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
+										 "blk.%d.attn_qkv.weight", 1) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_gate_w,
+										 "blk.%d.attn_gate.weight", 1) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
+										 "blk.%d.ssm_conv1d.weight", 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_dt_b,
+										 "blk.%d.ssm_dt.bias", 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_a, "blk.%d.ssm_a",
+										 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_beta_w,
+										 "blk.%d.ssm_beta.weight", 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_alpha_w,
+										 "blk.%d.ssm_alpha.weight", 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_norm_w,
+										 "blk.%d.ssm_norm.weight", 0) != OK ||
+					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
+										 "blk.%d.ssm_out.weight", 1) != OK)
 				return ERR_FORMAT;
 			L->wq		 = (weight_ref){0};
 			L->wk		 = (weight_ref){0};
@@ -2483,6 +2579,9 @@ status_code model_upload_weights(model *m) {
 	}
 
 	INFO("weights uploaded in %llu ms", (unsigned long long)((time_us() - up_t0) / 1000));
+#ifdef __GLIBC__
+	malloc_trim(0);
+#endif
 	if (g_monitor && g_monitor->fd >= 0) {
 		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"upload_weights_done\",\"ms\":%llu}",
 					 (unsigned long long)((time_us() - up_t0) / 1000));

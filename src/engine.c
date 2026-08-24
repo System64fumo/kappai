@@ -379,6 +379,8 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 
 	context_set_show_template(ctx, a->show_template);
 
+	malloc_trim(0);
+
 	return OK;
 }
 

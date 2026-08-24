@@ -147,6 +147,7 @@ typedef struct model_hybrid_params {
 	int value_head_dim;
 	int value_dim;
 	int conv_dim;
+	int conv_channels;
 
 	uint8_t *recurrent_layers;
 } model_hybrid_params;

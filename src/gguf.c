@@ -22,6 +22,10 @@
 #define GGUF_LOAD_CHUNK_TARGET_BYTES ((size_t)(8 * 1024 * 1024))
 #define GGUF_LOAD_MAX_THREADS 64
 
+static inline size_t align_up_bytes(size_t v, size_t a) {
+	return (v + a - 1) & ~(a - 1);
+}
+
 typedef struct {
 	uint32_t	type;
 	const char *name;
@@ -57,6 +61,7 @@ typedef struct {
 	size_t			   len;
 	void			  *dst;
 	size_t			   tidx;
+	int				   plain;
 } gguf_load_chunk;
 
 typedef struct {
@@ -732,12 +737,11 @@ static void *gguf_load_worker(void *arg) {
 			break;
 
 		gguf_load_chunk *ch = &j->chunks[i];
-		if (gguf_range_read(j->plain_fd, j->direct_fd, j->align, ch->file_off, ch->len, ch->dst) !=
-			0) {
-			int expected = OK;
-			if (atomic_compare_exchange_strong(&j->first_err, &expected, ERR_IO)) {
-				ERROR("gguf_load_sparse: I/O error reading tensor '%s'", ch->t->name);
-			}
+		int rr = gguf_range_read(j->plain_fd, ch->plain ? -1 : j->direct_fd, j->align, ch->file_off,
+								 ch->len, ch->dst);
+		if (rr != 0) {
+			atomic_fetch_sub_explicit(&j->chunk_remaining[ch->tidx], 1, memory_order_acq_rel);
+			atomic_store(&j->first_err, ERR_IO);
 			break;
 		}
 		atomic_fetch_add_explicit(&j->bytes_read, ch->len, memory_order_relaxed);
@@ -839,10 +843,11 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 
 	posix_fadvise(fd, 0, (off_t)have, POSIX_FADV_DONTNEED);
 	close(fd);
-	ctx->fd			 = -1;
-	ctx->map		 = buf;
-	ctx->map_size	 = have;
-	ctx->map_is_heap = 1;
+	ctx->fd = -1;
+	free(buf);
+	ctx->map		 = NULL;
+	ctx->map_size	 = 0;
+	ctx->map_is_heap = 0;
 	return OK;
 }
 
@@ -864,7 +869,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			struct stat st;
 			long		blk = 4096;
 			if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-				blk = st.st_blksize;
+				blk = st.st_blksize < 4096 ? st.st_blksize : 4096;
 			void  *probe;
 			size_t a = (size_t)blk;
 			if (posix_memalign(&probe, a, a) != 0 || !probe) {
@@ -911,8 +916,14 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		}
 
 		size_t alloc_align = align > 0 ? align : sizeof(void *);
-		void  *buf		   = NULL;
-		if (posix_memalign(&buf, alloc_align, tbytes) != 0) {
+		size_t pad		   = 0;
+		if (align > 0) {
+			uint64_t off64 = ctx->data_file_offset + t->offset;
+			size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
+			pad			   = align_up_bytes(slop + tbytes, align) - tbytes;
+		}
+		void *buf = NULL;
+		if (posix_memalign(&buf, alloc_align, tbytes + pad) != 0) {
 			ERROR("gguf_load_sparse: OOM allocating %zu bytes for tensor '%s'", tbytes, t->name);
 			ret = ERR_OUT_OF_MEMORY;
 			break;
@@ -941,7 +952,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			size_t tbytes;
 			if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
 				continue;
-			n_chunks_cap += (tbytes / chunk_bytes) + 1;
+			n_chunks_cap += (tbytes / chunk_bytes) + (align > 0 ? 2 : 1);
 		}
 
 		int has_experts = 0;
@@ -953,6 +964,9 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		_Atomic size_t	*chunk_remaining = xcalloc(n_load, sizeof(*chunk_remaining));
 		size_t			 n_chunks		 = 0;
 		size_t			 load_idx		 = 0;
+		struct stat		 fst;
+		uint64_t file_end = fstat(plain_fd, &fst) == 0 ? (uint64_t)fst.st_size
+													   : (ctx->data_file_offset + ctx->data_size);
 		for (size_t i = 0; i < ctx->n_tensors; i++) {
 			gguf_tensor *t = &ctx->tensors[i];
 			if (!t->data)
@@ -964,6 +978,33 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			uint64_t base_off		 = ctx->data_file_offset + t->offset;
 			size_t	 off			 = 0;
 			size_t	 n_tensor_chunks = 0;
+			if (align > 0) {
+				uint64_t a_base = base_off & ~(uint64_t)(align - 1);
+				size_t	 slop	= (size_t)(base_off - a_base);
+				size_t	 need	= align_up_bytes(slop + tbytes, align);
+				uint64_t limit	= file_end - a_base;
+				if (need > limit)
+					need = (size_t)limit;
+				size_t roff = 0;
+				while (roff < need) {
+					size_t piece = need - roff;
+					if (piece > chunk_bytes)
+						piece = chunk_bytes;
+					int plain				  = (piece & (align - 1)) != 0;
+					chunks[n_chunks].t		  = t;
+					chunks[n_chunks].file_off = a_base + roff;
+					chunks[n_chunks].len	  = piece;
+					chunks[n_chunks].dst	  = (char *)t->data + roff;
+					chunks[n_chunks].tidx	  = load_idx;
+					chunks[n_chunks].plain	  = plain;
+					n_chunks++;
+					n_tensor_chunks++;
+					roff += piece;
+				}
+				chunk_remaining[load_idx] = n_tensor_chunks;
+				load_idx++;
+				continue;
+			}
 			while (off < tbytes) {
 				size_t piece = tbytes - off;
 				if (piece > chunk_bytes)
@@ -973,6 +1014,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 				chunks[n_chunks].len	  = piece;
 				chunks[n_chunks].dst	  = (char *)t->data + off;
 				chunks[n_chunks].tidx	  = load_idx;
+				chunks[n_chunks].plain	  = 0;
 				n_chunks++;
 				n_tensor_chunks++;
 				off += piece;
@@ -1033,6 +1075,21 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		int err = atomic_load(&job.first_err);
 		if (err != OK)
 			ret = err;
+
+		if (err == OK && align > 0) {
+			for (size_t i = 0; i < ctx->n_tensors; i++) {
+				gguf_tensor *t = &ctx->tensors[i];
+				if (!t->data)
+					continue;
+				size_t tbytes;
+				if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+					continue;
+				uint64_t off64 = ctx->data_file_offset + t->offset;
+				size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
+				if (slop)
+					memmove(t->data, (char *)t->data + slop, tbytes);
+			}
+		}
 
 		if (err == OK) {
 			double elapsed_ms = (time_us() - read_t0) / 1000.0;

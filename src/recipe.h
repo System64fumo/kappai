@@ -89,6 +89,7 @@ typedef enum {
 	OP_PARTIAL_ROPE_QK,
 	OP_ATTN_OUTPUT_GATE,
 	OP_GATED_DELTA_NET,
+	OP_SHORTCONV,
 
 	OP_KIND_COUNT
 } op_kind;
@@ -273,6 +274,7 @@ status_code op_split_qgate(exec_ctx *ctx);
 status_code op_partial_rope_qk(exec_ctx *ctx);
 status_code op_attn_output_gate(exec_ctx *ctx);
 status_code op_gated_delta_net(exec_ctx *ctx);
+status_code op_shortconv(exec_ctx *ctx);
 
 typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 
