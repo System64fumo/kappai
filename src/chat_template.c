@@ -80,6 +80,13 @@ void chat_template_clear_messages(chat_template_state *cts) {
 	cts->last_render = xstrdup("");
 }
 
+void chat_template_add_message(chat_template_state *cts, const char *role, const char *content) {
+	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
+	cts->messages[cts->n_messages].role	   = xstrdup(role ? role : "");
+	cts->messages[cts->n_messages].content = xstrdup(content ? content : "");
+	cts->n_messages++;
+}
+
 void chat_template_free(chat_template_state *cts) {
 	if (!cts)
 		return;
@@ -185,10 +192,7 @@ out:
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
 								   int add_generation_prompt, char **out, char *errbuf,
 								   size_t errbuf_len) {
-	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
-	cts->messages[cts->n_messages].role	   = xstrdup(role);
-	cts->messages[cts->n_messages].content = xstrdup(content);
-	cts->n_messages++;
+	chat_template_add_message(cts, role, content);
 
 	jinja_value *globals = build_globals(cts, NULL, 0, add_generation_prompt);
 	char		*rendered;

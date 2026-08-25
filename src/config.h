@@ -58,6 +58,10 @@ typedef struct {
 	const char *grep_vocab;
 	char		metrics[32];
 	bool		warmup;
+
+	const char *server_host;
+	int			server_port;
+	const char *server_api_key;
 } cli_args;
 
 void usage(FILE *fp);

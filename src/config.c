@@ -85,6 +85,10 @@ void usage(FILE *fp) {
 			"                           in any order: pp,tg,ttft (default: pp,tg)\n"
 			"  --warmup [on|off]        pre-process the static prefix of the chat template\n"
 			"                           at startup (default: off)\n\n"
+			"Server (kappai-server):\n"
+			"  --host <addr>            bind address (default: 127.0.0.1)\n"
+			"  --port <n>               listen port (default: 8080)\n"
+			"  --api-key <key>          require 'Authorization: Bearer <key>' on /v1 requests\n\n"
 			"Tools / debug:\n"
 			"  --list-accels            list available accelerator backends and exit\n"
 			"  --dump-metadata          print raw GGUF metadata and exit\n"
@@ -156,7 +160,9 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 	a->min_p		 = 0.10f;
 	a->output_stream = true;
 	snprintf(a->metrics, sizeof(a->metrics), "pp,tg");
-	a->warmup = false;
+	a->warmup	   = false;
+	a->server_host = "127.0.0.1";
+	a->server_port = 8080;
 
 	setenv("POSIXLY_CORRECT", "1", 1);
 
@@ -187,7 +193,10 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_KV_QUANT,
 		OPT_NGL,
 		OPT_METRICS,
-		OPT_WARMUP
+		OPT_WARMUP,
+		OPT_HOST,
+		OPT_PORT,
+		OPT_API_KEY
 	};
 
 	static struct option long_opts[] = {
@@ -229,6 +238,9 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"ngl", required_argument, NULL, OPT_NGL},
 		{"metrics", required_argument, NULL, OPT_METRICS},
 		{"warmup", optional_argument, NULL, OPT_WARMUP},
+		{"host", required_argument, NULL, OPT_HOST},
+		{"port", required_argument, NULL, OPT_PORT},
+		{"api-key", required_argument, NULL, OPT_API_KEY},
 		{0, 0, 0, 0}};
 
 	int c;
@@ -371,6 +383,19 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		}
 		case OPT_WARMUP:
 			a->warmup = parse_bool_flag(peek_optional_bool_arg(optarg, argc, argv, &optind), 1);
+			break;
+		case OPT_HOST:
+			a->server_host = optarg;
+			break;
+		case OPT_PORT:
+			a->server_port = atoi(optarg);
+			if (a->server_port <= 0 || a->server_port > 65535) {
+				fprintf(stderr, "invalid --port value '%s'\n", optarg);
+				return -1;
+			}
+			break;
+		case OPT_API_KEY:
+			a->server_api_key = optarg;
 			break;
 		case '?':
 			return -1;

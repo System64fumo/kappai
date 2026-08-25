@@ -603,7 +603,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	context_monitor_send_start(c);
 	bool prof_was_on = c->scratch.prof.enabled;
 
-	prefill_result pf = context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
+	prefill_result pf = context_prefill_tokens(c, tokens, n_tokens, "prefill", c->quiet_progress);
 	if (pf.rc == CTX_INTERRUPTED)
 		return 0;
 	if (pf.rc == CTX_COMPUTE_ERROR) {
@@ -704,6 +704,7 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	free(turn_str);
 	if (n < 0)
 		return -1;
+	c->last_prompt_tokens = n;
 
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
@@ -721,6 +722,28 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	}
 	free(acap.buf);
 	return generated;
+}
+
+int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,
+					   void (*on_token)(int32_t, const char *, int, void *), void *ud) {
+	if (!prompt)
+		return -1;
+	uint64_t t_turn_start = time_us();
+
+	int		 cap = c->n_ctx;
+	int32_t *ids = context_ids_scratch(c, cap + 2);
+	int		 n	 = 0;
+	if (c->tok.add_bos && c->tok.bos_id >= 0)
+		ids[n++] = c->tok.bos_id;
+
+	profile_reset(&c->scratch.prof);
+	int r = tokenizer_encode_with_specials(&c->tok, prompt, 0, ids + n, cap - n, &c->scratch.prof);
+	if (r < 0)
+		return -1;
+	n += r;
+	c->last_prompt_tokens = n;
+
+	return run_generation(c, ids, n, max_tokens, samp, on_token, ud, 1, "", t_turn_start);
 }
 
 static size_t ctx_lcp_len(const char *a, const char *b) {
