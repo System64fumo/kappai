@@ -34,6 +34,8 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 void		chat_template_free(chat_template_state *cts);
 void		chat_template_clear_messages(chat_template_state *cts);
 
+void chat_template_add_message(chat_template_state *cts, const char *role, const char *content);
+
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
 								   int add_generation_prompt, char **out, char *errbuf,
 								   size_t errbuf_len);

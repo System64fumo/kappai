@@ -118,6 +118,7 @@ struct tpool {
 	tpool_worker_cleanup_fn worker_cleanup;
 	pthread_mutex_t			wake_mtx;
 	pthread_cond_t			wake_cv;
+	pthread_mutex_t			pub_mtx;
 	pthread_t				threads[TPOOL_MAX_THREADS];
 	int						n_threads;
 	int						stats_enabled;
@@ -283,6 +284,7 @@ tpool *tpool_create(int n_threads) {
 	pool->n_threads = n_threads;
 	pool->slot		= xcalloc((size_t)n_threads, sizeof(tpool_slot));
 	pthread_mutex_init(&pool->wake_mtx, NULL);
+	pthread_mutex_init(&pool->pub_mtx, NULL);
 	{
 		pthread_condattr_t cattr;
 		pthread_condattr_init(&cattr);
@@ -361,6 +363,7 @@ void tpool_destroy(tpool *pool) {
 	for (int i = 1; i < pool->n_threads; i++)
 		pthread_join(pool->threads[i], NULL);
 	pthread_mutex_destroy(&pool->wake_mtx);
+	pthread_mutex_destroy(&pool->pub_mtx);
 	pthread_cond_destroy(&pool->wake_cv);
 	free(pool->slot);
 	free(pool);
@@ -417,17 +420,24 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 
 	int new_epoch = atomic_load_explicit(&pool->sync.epoch, memory_order_relaxed) + 1;
 
-	atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.chunk_size, chunk_size, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.job_fn, fn, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.job_ctx, (uintptr_t)ctx, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.executed, 0, memory_order_relaxed);
-	atomic_store_explicit(&pool->job.cursor_ep, (int64_t)new_epoch << 32, memory_order_relaxed);
+	pthread_mutex_lock(&pool->pub_mtx);
+	{
+		new_epoch = atomic_load_explicit(&pool->sync.epoch, memory_order_relaxed) + 1;
 
-	int n_workers = usable - 1;
-	atomic_store_explicit(&pool->job.n_workers, n_workers, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.chunk_size, chunk_size, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.job_fn, fn, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.job_ctx, (uintptr_t)ctx, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.executed, 0, memory_order_relaxed);
+		atomic_store_explicit(&pool->job.cursor_ep, (int64_t)new_epoch << 32, memory_order_relaxed);
 
-	atomic_store_explicit(&pool->job.job_epoch, new_epoch, memory_order_release);
+		int n_workers = usable - 1;
+		atomic_store_explicit(&pool->job.n_workers, n_workers, memory_order_relaxed);
+
+		atomic_store_explicit(&pool->job.job_epoch, new_epoch, memory_order_release);
+	}
+	pthread_mutex_unlock(&pool->pub_mtx);
+
 	if (atomic_load_explicit(&pool->sync.parked_workers, memory_order_relaxed) == 0) {
 		atomic_store_explicit(&pool->sync.epoch, new_epoch, memory_order_release);
 	} else {

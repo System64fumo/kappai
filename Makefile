@@ -136,13 +136,14 @@ TEST_OBJS     := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS)
 
 ENGINE      := $(OUT_DIR)/libkappai.so
 CLI_BIN     := $(OUT_DIR)/kappai-cli
+SERVER_BIN  := $(OUT_DIR)/kappai-server
 TEST_BIN    := $(OUT_DIR)/test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
 BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
 	      $(OBJ_DIR)/backend/cpu/x86_64 \
 	      $(OBJ_DIR)/backend/vulkan \
-	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor \
+	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor $(OBJ_DIR)/server \
 	      $(OBJ_DIR)/models $(OBJ_DIR)/test
 
 CONFIG_STAMP := $(OUT_DIR)/.build-config
@@ -252,11 +253,18 @@ endif
 FORMAT_FLAGS := -i -style=file
 
 TIDY_LOG  := $(OUT_DIR)/tidy.log
-ALL_SRCS  := $(LIB_SRCS) $(SRC_DIR)/cli/main.c $(TEST_SRCS) $(wildcard $(SRC_DIR)/monitor/*.c)
+ALL_SRCS  := $(LIB_SRCS) $(SRC_DIR)/cli/main.c $(SRC_DIR)/server/main.c \
+	     $(SRC_DIR)/server/openai.c \
+	     $(TEST_SRCS) $(wildcard $(SRC_DIR)/monitor/*.c)
 
-.PHONY: all cli test monitor clean print-config format tidy backends-help
+SERVER_SRCS := $(SRC_DIR)/server/main.c \
+	       $(SRC_DIR)/server/openai.c
+SERVER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
+SERVER_LIBS := -ljson-c -lmicrohttpd
 
-all: cli test
+.PHONY: all cli test server monitor clean print-config format tidy backends-help
+
+all: cli test server
 
 backends-help:
 	@echo "available backends: $(AVAILABLE_BACKENDS)"
@@ -275,6 +283,11 @@ cli: $(CLI_BIN)
 $(CLI_BIN): $(SRC_DIR)/cli/main.c $(ENGINE)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $< -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -o $@
+
+server: $(SERVER_BIN)
+$(SERVER_BIN): $(SERVER_OBJS) $(ENGINE)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(SERVER_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread $(SERVER_LIBS) -o $@
 
 test: $(TEST_BIN)
 $(TEST_BIN): $(TEST_OBJS) $(ENGINE)

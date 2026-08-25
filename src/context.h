@@ -29,6 +29,8 @@ typedef struct {
 	volatile sig_atomic_t interrupt;
 	bool				  context_limit_hit;
 	bool				  show_template;
+	bool				  quiet_progress;
+	int					  last_prompt_tokens;
 	backend				 *backend;
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;
@@ -76,6 +78,9 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 					  int max_tokens, const sampler_params						 *samp,
 					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
 					  const char *metrics_spec);
+
+int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,
+					   void (*on_token)(int32_t, const char *, int, void *), void *ud);
 
 void context_idle_prefill_start(context *c);
 void context_idle_prefill_wait(context *c);
