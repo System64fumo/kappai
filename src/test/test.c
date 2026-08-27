@@ -8,7 +8,22 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		return 1;
 	}
 
+	synth_suite_common_init();
+
 	run_arch_tests(cpu, NULL);
+
+	run_sampler_tests();
+	flush_family(OPFAM_SAMPLER);
+	run_tokenizer_tests();
+	flush_family(OPFAM_TOKENIZER);
+	run_jinja_tests();
+	flush_family(OPFAM_EDGE_CASE);
+	run_hybrid_state_tests(cpu);
+	flush_family(OPFAM_HYBRID_STATE);
+	run_orchestration_tests();
+	flush_family(OPFAM_ORCHESTRATION);
+	run_moe_stream_tests();
+	flush_family(OPFAM_MOE_STREAM);
 
 	int run_all = wants_all(argc, argv);
 	int any_run = 0;
@@ -67,6 +82,15 @@ int main(int argc, char **argv) {
 	for (int ai = 1; ai < argc; ai++) {
 		if (strcmp(argv[ai], "--bench") == 0)
 			return run_matmul_bench_mode(argc, argv, infos, n_backends);
+	}
+	for (int ai = 1; ai < argc; ai++) {
+		if (argv[ai][0] == '-' && argv[ai][1] == '-' && argv[ai][2] != '\0' &&
+			strcmp(argv[ai], "--all") != 0) {
+			fprintf(stderr, "error: unknown option '%s' (use plain backend name, e.g. 'cpu')\n",
+					argv[ai]);
+			usage(argv[0]);
+			return 1;
+		}
 	}
 	return run_per_op_mode(argc, argv, infos, n_backends);
 }

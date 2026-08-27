@@ -1356,7 +1356,6 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *r
 				float		   d	= f16_to_f32(ds[r]);
 				float		   dmin = f16_to_f32(ms[r]);
 				int32_t		   sumi = 0, summ = 0;
-				uint8_t		   scu8, mu8;
 				int			   is = 0, ib = 0;
 				for (int g = 0; g < 4; g++) {
 					int s0 = se[is * 2 + 0], m0 = se[is * 2 + 1];
@@ -1463,6 +1462,8 @@ static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc,
 		ql += 64;
 		qh += 32;
 	}
+
+	ap = a;
 
 	int32_t total = 0;
 	for (int j = 0; j < 16; j++) {

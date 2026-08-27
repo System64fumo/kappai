@@ -140,7 +140,7 @@ static inline void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *
 }
 
 static inline int *cpu_bitrev_perm_get(cpu_priv *p, int m_pow2) {
-	if (p->bitrev_perm_cap >= m_pow2)
+	if (p->bitrev_perm_cap == m_pow2 && p->bitrev_perm_cache)
 		return p->bitrev_perm_cache;
 	free(p->bitrev_perm_cache);
 	p->bitrev_perm_cache = xmalloc((size_t)m_pow2 * sizeof(int));

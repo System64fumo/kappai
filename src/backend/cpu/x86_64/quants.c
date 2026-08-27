@@ -171,7 +171,7 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 				const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
 				const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
 
-				int32_t total = 0;
+				__m256i acc = _mm256_setzero_si256();
 				for (int g = 0; g < 8; g += 2) {
 					uint8_t sb	= scales[g / 2];
 					int		sc0 = 1 + 2 * (sb & 0xf);
@@ -183,17 +183,16 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 					const int8_t *restrict qg0 = q8 + g * 32;
 					const int8_t *restrict qg1 = q8 + (g + 1) * 32;
 
-					int32_t a0 =
-						vreduce_add_epi32(dotprod_s8_s8_i32(d0, _mm256_loadu_si256(
-															  (const __m256i *)(qg0))));
-					int32_t a1 =
-						vreduce_add_epi32(dotprod_s8_s8_i32(d1, _mm256_loadu_si256(
-															  (const __m256i *)(qg1))));
-
-					total += sc0 * a0;
-					total += sc1 * a1;
+					acc = _mm256_add_epi32(
+						acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+													d0, _mm256_loadu_si256((const __m256i *)(qg0))),
+												_mm256_set1_epi32(sc0)));
+					acc = _mm256_add_epi32(
+						acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+													d1, _mm256_loadu_si256((const __m256i *)(qg1))),
+												_mm256_set1_epi32(sc1)));
 				}
-				sumi_lane[r] = total;
+				sumi_lane[r] = vreduce_add_epi32(acc);
 			}
 
 			__m128 sumi0 = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(sumi_lane)));
@@ -226,7 +225,7 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 
 			const q8_k_block *restrict yb = &xq[bi];
 			const int8_t *restrict q8	  = yb->qs;
-			int32_t total				  = 0;
+			__m256i acc					   = _mm256_setzero_si256();
 
 			for (int g = 0; g < 8; g += 2) {
 				uint8_t sb	= scales[g / 2];
@@ -239,17 +238,16 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 				const int8_t *restrict qg0 = q8 + g * 32;
 				const int8_t *restrict qg1 = q8 + (g + 1) * 32;
 
-				int32_t a0 =
-					vreduce_add_epi32(dotprod_s8_s8_i32(d0, _mm256_loadu_si256(
-														  (const __m256i *)(qg0))));
-				int32_t a1 =
-					vreduce_add_epi32(dotprod_s8_s8_i32(d1, _mm256_loadu_si256(
-														  (const __m256i *)(qg1))));
-
-				total += sc0 * a0;
-				total += sc1 * a1;
+				acc = _mm256_add_epi32(
+					acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+												d0, _mm256_loadu_si256((const __m256i *)(qg0))),
+											_mm256_set1_epi32(sc0)));
+				acc = _mm256_add_epi32(
+					acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+												d1, _mm256_loadu_si256((const __m256i *)(qg1))),
+											_mm256_set1_epi32(sc1)));
 			}
-			sumf += d_w * yb->d * (float)total;
+			sumf += d_w * yb->d * (float)vreduce_add_epi32(acc);
 		}
 		y[i] = sumf;
 	}
@@ -311,7 +309,9 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 				__m128 xd_vec = _mm_loadu_ps(xd);
 
 				for (int r = 0; r < MR; r++) {
-					int32_t total_arr[4] = {0, 0, 0, 0};
+					__m256i acc[4];
+					for (int c = 0; c < 4; c++)
+						acc[c] = _mm256_setzero_si256();
 
 					for (int g = 0; g < 8; g += 2) {
 						const __m256i c0 = decoded[r][g];
@@ -322,20 +322,28 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 						for (int c = 0; c < 4; c++) {
 							const int8_t *restrict qg0 = q8p[c] + g * 32;
 							const int8_t *restrict qg1 = q8p[c] + (g + 1) * 32;
-							int32_t a0 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									c0, _mm256_loadu_si256((const __m256i *)(qg0))));
-							int32_t a1 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									c1, _mm256_loadu_si256((const __m256i *)(qg1))));
-							total_arr[c] += sc0v * a0 + sc1v * a1;
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												c0, _mm256_loadu_si256((const __m256i *)(qg0))),
+											_mm256_set1_epi32(sc0v)));
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												c1, _mm256_loadu_si256((const __m256i *)(qg1))),
+											_mm256_set1_epi32(sc1v)));
 						}
 					}
+
+					int32_t total_arr[4];
+					for (int c = 0; c < 4; c++)
+						total_arr[c] = vreduce_add_epi32(acc[c]);
 
 					const __m128i total4 = _mm_loadu_si128((const __m128i *)total_arr);
 					__m128 total4f = _mm_cvtepi32_ps(total4);
 					__m128 dw		 = _mm_set1_ps(d_w[r]);
-					acc_row[r] = _mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
+					acc_row[r] =
+						_mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
 				}
 			}
 
@@ -405,7 +413,7 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 				const uint8_t *scales = scales_all + (size_t)r * 4;
 				const uint8_t *idx	  = idx_all + (size_t)r * 128;
 
-				__m128i totalv = _mm_setzero_si128();
+				__m256i acc = _mm256_setzero_si256();
 
 				for (int g = 0; g < 8; g += 2) {
 					uint8_t sb	= scales[g / 2];
@@ -418,19 +426,16 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 					const int8_t *restrict qg0 = q8 + g * 32;
 					const int8_t *restrict qg1 = q8 + (g + 1) * 32;
 
-					int32_t a0 =
-						vreduce_add_epi32(dotprod_s8_s8_i32(d0, _mm256_loadu_si256(
-															  (const __m256i *)(qg0))));
-					int32_t a1 =
-						vreduce_add_epi32(dotprod_s8_s8_i32(d1, _mm256_loadu_si256(
-															  (const __m256i *)(qg1))));
-
-					__m128i sc0v = _mm_set1_epi32(sc0);
-					__m128i sc1v = _mm_set1_epi32(sc1);
-					totalv		 = _mm_add_epi32(totalv, _mm_mullo_epi32(sc0v, _mm_set1_epi32(a0)));
-					totalv		 = _mm_add_epi32(totalv, _mm_mullo_epi32(sc1v, _mm_set1_epi32(a1)));
+					acc = _mm256_add_epi32(
+						acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+													d0, _mm256_loadu_si256((const __m256i *)(qg0))),
+												_mm256_set1_epi32(sc0)));
+					acc = _mm256_add_epi32(
+						acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+													d1, _mm256_loadu_si256((const __m256i *)(qg1))),
+												_mm256_set1_epi32(sc1)));
 				}
-				sumi_lane[r] = _mm_cvtsi128_si32(totalv);
+				sumi_lane[r] = vreduce_add_epi32(acc);
 			}
 
 			__m128 sumi0 = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(sumi_lane)));
@@ -470,7 +475,7 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 			const uint8_t *scales = scales_all + (size_t)(i % 8) * 4;
 			const uint8_t *idx	  = idx_all + (size_t)(i % 8) * 128;
 
-			__m128i totalv = _mm_setzero_si128();
+			__m256i acc = _mm256_setzero_si256();
 
 			for (int g = 0; g < 8; g += 2) {
 				uint8_t sb	= scales[g / 2];
@@ -483,21 +488,17 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 				const int8_t *restrict qg0 = q8 + g * 32;
 				const int8_t *restrict qg1 = q8 + (g + 1) * 32;
 
-				int32_t a0 =
-					vreduce_add_epi32(dotprod_s8_s8_i32(d0, _mm256_loadu_si256(
-														  (const __m256i *)(qg0))));
-				int32_t a1 =
-					vreduce_add_epi32(dotprod_s8_s8_i32(d1, _mm256_loadu_si256(
-														  (const __m256i *)(qg1))));
-
-				__m128i sc0v = _mm_set1_epi32(sc0);
-				__m128i sc1v = _mm_set1_epi32(sc1);
-				totalv		 = _mm_add_epi32(totalv, _mm_mullo_epi32(sc0v, _mm_set1_epi32(a0)));
-				totalv		 = _mm_add_epi32(totalv, _mm_mullo_epi32(sc1v, _mm_set1_epi32(a1)));
+				acc = _mm256_add_epi32(
+					acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+												d0, _mm256_loadu_si256((const __m256i *)(qg0))),
+											_mm256_set1_epi32(sc0)));
+				acc = _mm256_add_epi32(
+					acc, _mm256_mullo_epi32(dotprod_s8_s8_i32_noclamp(
+												d1, _mm256_loadu_si256((const __m256i *)(qg1))),
+											_mm256_set1_epi32(sc1)));
 			}
 
-			int32_t total = _mm_cvtsi128_si32(totalv);
-			sumf += d_w * d_xq * (float)total;
+			sumf += d_w * d_xq * (float)vreduce_add_epi32(acc);
 		}
 		y[i] = sumf;
 	}
@@ -565,7 +566,9 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 				__m128 xd_vec = _mm_loadu_ps(xd);
 
 				for (int r = 0; r < MR; r++) {
-					int32_t total_arr[4] = {0, 0, 0, 0};
+					__m256i acc[4];
+					for (int c = 0; c < 4; c++)
+						acc[c] = _mm256_setzero_si256();
 
 					for (int g = 0; g < 8; g += 2) {
 						const __m256i c0 = decoded[r][g];
@@ -576,20 +579,28 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 						for (int c = 0; c < 4; c++) {
 							const int8_t *restrict qg0 = q8p[c] + g * 32;
 							const int8_t *restrict qg1 = q8p[c] + (g + 1) * 32;
-							int32_t a0 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									c0, _mm256_loadu_si256((const __m256i *)(qg0))));
-							int32_t a1 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									c1, _mm256_loadu_si256((const __m256i *)(qg1))));
-							total_arr[c] += sc0v * a0 + sc1v * a1;
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												c0, _mm256_loadu_si256((const __m256i *)(qg0))),
+											_mm256_set1_epi32(sc0v)));
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												c1, _mm256_loadu_si256((const __m256i *)(qg1))),
+											_mm256_set1_epi32(sc1v)));
 						}
 					}
+
+					int32_t total_arr[4];
+					for (int c = 0; c < 4; c++)
+						total_arr[c] = vreduce_add_epi32(acc[c]);
 
 					const __m128i total4 = _mm_loadu_si128((const __m128i *)total_arr);
 					__m128 total4f = _mm_cvtepi32_ps(total4);
 					__m128 dw		 = _mm_set1_ps(d_w[r]);
-					acc_row[r] = _mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
+					acc_row[r] =
+						_mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
 				}
 			}
 
@@ -686,7 +697,7 @@ static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t 
 		}
 	}
 
-	int32_t total = 0;
+	__m256i acc = _mm256_setzero_si256();
 	for (int ib32 = 0; ib32 < 8; ib32 += 2) {
 		const int	  g0  = ib32;
 		const uint8_t sb  = b->scales[ib32 / 2];
@@ -705,15 +716,16 @@ static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t 
 		const int8_t *restrict qg0 = q8 + (g0 * 32);
 		const int8_t *restrict qg1 = q8 + ((g0 + 1) * 32);
 
-		int32_t a0 =
-			vreduce_add_epi32(dotprod_s8_s8_i32(dec0, _mm256_loadu_si256((const __m256i *)(qg0))));
-		int32_t a1 =
-			vreduce_add_epi32(dotprod_s8_s8_i32(dec1, _mm256_loadu_si256((const __m256i *)(qg1))));
-
-		total += sc0 * a0;
-		total += sc1 * a1;
+		acc = _mm256_add_epi32(
+			acc, _mm256_mullo_epi32(
+					 dotprod_s8_s8_i32_noclamp(dec0, _mm256_loadu_si256((const __m256i *)(qg0))),
+					 _mm256_set1_epi32(sc0)));
+		acc = _mm256_add_epi32(
+			acc, _mm256_mullo_epi32(
+					 dotprod_s8_s8_i32_noclamp(dec1, _mm256_loadu_si256((const __m256i *)(qg1))),
+					 _mm256_set1_epi32(sc1)));
 	}
-	return total;
+	return vreduce_add_epi32(acc);
 }
 
 static void matmul_iq3_s_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
@@ -863,7 +875,9 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 				__m128 xd_vec = _mm_loadu_ps(xd);
 
 				for (int r = 0; r < MR; r++) {
-					int32_t total_arr[4] = {0, 0, 0, 0};
+					__m256i acc[4];
+					for (int c = 0; c < 4; c++)
+						acc[c] = _mm256_setzero_si256();
 
 					for (int ib32 = 0; ib32 < 8; ib32 += 2) {
 						const __m128i c00 = decoded[r][(ib32 * 2) + 0];
@@ -871,28 +885,34 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 						const __m128i c10 = decoded[r][(ib32 * 2) + 2];
 						const __m128i c11 = decoded[r][(ib32 * 2) + 3];
 
-						__m256i dec0 =
-							_mm256_inserti128_si256(_mm256_castsi128_si256(c00), c01, 1);
-						__m256i dec1 =
-							_mm256_inserti128_si256(_mm256_castsi128_si256(c10), c11, 1);
+						__m256i dec0 = _mm256_inserti128_si256(_mm256_castsi128_si256(c00), c01, 1);
+						__m256i dec1 = _mm256_inserti128_si256(_mm256_castsi128_si256(c10), c11, 1);
 
 						for (int c = 0; c < 4; c++) {
 							const int8_t *restrict qg0 = q8p[c] + (ib32 * 32);
 							const int8_t *restrict qg1 = q8p[c] + ((ib32 + 1) * 32);
-							int32_t a0 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									dec0, _mm256_loadu_si256((const __m256i *)(qg0))));
-							int32_t a1 =
-								vreduce_add_epi32(dotprod_s8_s8_i32(
-									dec1, _mm256_loadu_si256((const __m256i *)(qg1))));
-							total_arr[c] += sc0[r][ib32 / 2] * a0 + sc1[r][ib32 / 2] * a1;
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												dec0, _mm256_loadu_si256((const __m256i *)(qg0))),
+											_mm256_set1_epi32(sc0[r][ib32 / 2])));
+							acc[c] = _mm256_add_epi32(
+								acc[c], _mm256_mullo_epi32(
+											dotprod_s8_s8_i32_noclamp(
+												dec1, _mm256_loadu_si256((const __m256i *)(qg1))),
+											_mm256_set1_epi32(sc1[r][ib32 / 2])));
 						}
 					}
+
+					int32_t total_arr[4];
+					for (int c = 0; c < 4; c++)
+						total_arr[c] = vreduce_add_epi32(acc[c]);
 
 					const __m128i total4 = _mm_loadu_si128((const __m128i *)total_arr);
 					__m128 total4f = _mm_cvtepi32_ps(total4);
 					__m128 dw		 = _mm_set1_ps(d_w[r]);
-					acc_row[r] = _mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
+					acc_row[r] =
+						_mm_add_ps(acc_row[r], _mm_mul_ps(_mm_mul_ps(dw, total4f), xd_vec));
 				}
 			}
 
@@ -966,6 +986,8 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_Q4_K:
 	case GGML_TYPE_Q5_K:
+	case GGML_TYPE_Q5_0:
+	case GGML_TYPE_Q5_1:
 	case GGML_TYPE_IQ3_S: {
 		static _Thread_local quant_scratch qs = {NULL, 0};
 		if (!qs.q8_buf)
@@ -1000,6 +1022,12 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 			break;
 		case GGML_TYPE_Q5_K:
 			matmul_q5_k_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q5_0:
+			matmul_q5_0_q8_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q5_1:
+			matmul_q5_1_q8_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_IQ3_S:
 			matmul_iq3_s_q8_k_f32(w, x, y, n, k, &qs);
@@ -1158,14 +1186,14 @@ void quantize_q8_0(const float *x, q8_0_block *dst, int n) {
 		dst[i].d = f32_to_f16(d);
 
 		__m256 id_v = _mm256_set1_ps(id);
-		__m256i q0	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v0, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q1	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v1, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q2	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v2, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q3	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v3, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q0	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v0, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q1	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v1, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q2	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v2, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q3	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v3, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
 
 		__m128i n0 = _mm_packs_epi32(_mm256_castsi256_si128(q0), _mm256_extracti128_si256(q0, 1));
 		__m128i n1 = _mm_packs_epi32(_mm256_castsi256_si128(q1), _mm256_extracti128_si256(q1, 1));
@@ -1200,14 +1228,14 @@ void quantize_q8_1(const float *x, void *dst, int n) {
 		y[i].d	 = f32_to_f16(d);
 
 		__m256 id_v = _mm256_set1_ps(id);
-		__m256i q0	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v0, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q1	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v1, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q2	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v2, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-		__m256i q3	= _mm256_cvtps_epi32(
-			_mm256_round_ps(_mm256_mul_ps(v3, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q0	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v0, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q1	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v1, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q2	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v2, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+		__m256i q3	   = _mm256_cvtps_epi32(_mm256_round_ps(
+			_mm256_mul_ps(v3, id_v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
 
 		__m256i s01 = _mm256_add_epi32(q0, q1);
 		__m256i s23 = _mm256_add_epi32(q2, q3);
@@ -1283,8 +1311,10 @@ void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 				q1			= _mm256_max_epi32(_mm256_min_epi32(q1, hi), lo);
 				__m256i s_all = _mm256_add_epi32(q0, q1);
 				int32_t sum	= vreduce_add_epi32(s_all);
-				__m128i n0 = _mm_packs_epi32(_mm256_castsi256_si128(q0), _mm256_extracti128_si256(q0, 1));
-				__m128i n1 = _mm_packs_epi32(_mm256_castsi256_si128(q1), _mm256_extracti128_si256(q1, 1));
+				__m128i n0 =
+					_mm_packs_epi32(_mm256_castsi256_si128(q0), _mm256_extracti128_si256(q0, 1));
+				__m128i n1 =
+					_mm_packs_epi32(_mm256_castsi256_si128(q1), _mm256_extracti128_si256(q1, 1));
 				__m128i b0 = _mm_packs_epi16(n0, n1);
 				_mm_storeu_si128((__m128i *)(qsp), b0);
 				y[i].bsums[(outer * 4) + sub] = (int16_t)sum;
@@ -1329,8 +1359,7 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 					(const q4_0_block *)(row_base[r] + (size_t)bi * sizeof(q4_0_block));
 				const __m128i q	 = _mm_loadu_si128((const __m128i *)(row->qs));
 				const __m128i lo_u = _mm_and_si128(q, _mm_set1_epi8(0x0F));
-				const __m128i hi_u =
-					_mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
+				const __m128i hi_u = _mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
 				const __m128i lo = _mm_sub_epi8(lo_u, _mm_set1_epi8(8));
 				const __m128i hi = _mm_sub_epi8(hi_u, _mm_set1_epi8(8));
 				__m256i		  lo32 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
@@ -1434,14 +1463,13 @@ void matmul_q4_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m256i q32_hi = _mm256_cvtepi8_epi16(hi);
 
 					for (int c = 0; c < NR; c++) {
-						const __m256i x_lo =
-							_mm256_loadu_si256((const __m256i *)(&xq16[c][bi][0]));
+						const __m256i x_lo = _mm256_loadu_si256((const __m256i *)(&xq16[c][bi][0]));
 						const __m256i x_hi =
 							_mm256_loadu_si256((const __m256i *)(&xq16[c][bi][16]));
 						__m256i dot = _mm256_madd_epi16(q32_lo, x_lo);
 						dot			= _mm256_add_epi32(dot, _mm256_madd_epi16(q32_hi, x_hi));
-						acc_f[c]	= _mm256_fmadd_ps(
-							_mm256_cvtepi32_ps(dot), _mm256_set1_ps(d_w * d_xq[c][bi]), acc_f[c]);
+						acc_f[c]	= _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot),
+													  _mm256_set1_ps(d_w * d_xq[c][bi]), acc_f[c]);
 					}
 				}
 
@@ -1509,9 +1537,9 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 			int32_t dots_a[8], dots_b[8];
 			const q8_0_block *rows_a[8] = {r0, r1, r2, r3, r4, r5, r6, r7};
 			for (int r = 0; r < 8; r++) {
-				dots_a[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots_a[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(rows_a[r][bi].qs)), xq0));
-				dots_b[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots_b[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(rows_a[r][bi + 1].qs)), xq1));
 			}
 
@@ -1555,7 +1583,7 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 			int32_t dots[8];
 			const q8_0_block *rows[8] = {r0, r1, r2, r3, r4, r5, r6, r7};
 			for (int r = 0; r < 8; r++)
-				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(rows[r][bi].qs)), xq8));
 
 			__m128i sumi_lo = _mm_setr_epi32(dots[0], dots[1], dots[2], dots[3]);
@@ -1592,7 +1620,7 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const __m256i qs	= _mm256_loadu_si256((const __m256i *)(row[bi].qs));
 			const __m256i xq8	= _mm256_loadu_si256((const __m256i *)(xq[bi].qs));
-			int32_t		sumi	= vreduce_add_epi32(dotprod_s8_s8_i32(qs, xq8));
+			int32_t	   sumi = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(qs, xq8));
 			const float d = f16_to_f32_fast(row[bi].d) * f16_to_f32_fast(xq[bi].d);
 			sumf = fmaf(d, (float)sumi, sumf);
 		}
@@ -1649,14 +1677,13 @@ void matmul_q8_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m256i q32_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q8, 1));
 
 					for (int c = 0; c < NR; c++) {
-						const __m256i x_lo =
-							_mm256_loadu_si256((const __m256i *)(&xq16[c][bi][0]));
+						const __m256i x_lo = _mm256_loadu_si256((const __m256i *)(&xq16[c][bi][0]));
 						const __m256i x_hi =
 							_mm256_loadu_si256((const __m256i *)(&xq16[c][bi][16]));
 						__m256i dot = _mm256_madd_epi16(q32_lo, x_lo);
 						dot			= _mm256_add_epi32(dot, _mm256_madd_epi16(q32_hi, x_hi));
-						acc_f[c]	= _mm256_fmadd_ps(
-							_mm256_cvtepi32_ps(dot), _mm256_set1_ps(d_w * d_xq[c][bi]), acc_f[c]);
+						acc_f[c]	= _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot),
+													  _mm256_set1_ps(d_w * d_xq[c][bi]), acc_f[c]);
 					}
 				}
 
@@ -1716,9 +1743,9 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 
 			int32_t dots_a[8], dots_b[8];
 			for (int r = 0; r < 8; r++) {
-				dots_a[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots_a[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(qs0 + (size_t)r * 32)), xq0));
-				dots_b[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots_b[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(qs1 + (size_t)r * 32)), xq1));
 			}
 
@@ -1756,7 +1783,7 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 
 			int32_t dots[8];
 			for (int r = 0; r < 8; r++)
-				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32(
+				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32_noclamp(
 					_mm256_loadu_si256((const __m256i *)(qs_ptr + (size_t)r * 32)), xq8));
 
 			__m128i sumi_lo = _mm_setr_epi32(dots[0], dots[1], dots[2], dots[3]);
@@ -1829,7 +1856,8 @@ void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 
 					int32_t sumi_arr[NR];
 					for (int c = 0; c < NR; c++)
-						sumi_arr[c] = vreduce_add_epi32(dotprod_s8_s8_i32(qs8, xq32[c]));
+						sumi_arr[c] = vreduce_add_epi32(
+							dotprod_s8_s8_i32_noclamp(qs8, xq32[c]));
 					const __m128i sumi4 = _mm_loadu_si128((const __m128i *)sumi_arr);
 
 					const __m128 sumi_f = _mm_cvtepi32_ps(sumi4);
@@ -1886,12 +1914,10 @@ static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 			for (int r = 0; r < 8; r++) {
 				const __m128i q	 = _mm_loadu_si128((const __m128i *)(qs_ptr + (size_t)r * 16));
 				const __m128i lo_u = _mm_and_si128(q, _mm_set1_epi8(0x0F));
-				const __m128i hi_u =
-					_mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
+				const __m128i hi_u = _mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
 				const __m128i lo = _mm_sub_epi8(lo_u, _mm_set1_epi8(8));
 				const __m128i hi = _mm_sub_epi8(hi_u, _mm_set1_epi8(8));
-				__m256i		  q32 =
-					_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+				__m256i	   q32  = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 				dots[r] = dotprod_s8_s8_i32(q32, xq8);
 			}
 
@@ -1962,8 +1988,7 @@ void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m128i	hi_u = _mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
 					const __m128i	lo	 = _mm_sub_epi8(lo_u, _mm_set1_epi8(8));
 					const __m128i	hi	 = _mm_sub_epi8(hi_u, _mm_set1_epi8(8));
-					const __m256i	q32 =
-						_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+					const __m256i q32  = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 
 					int32_t sumi_arr[NR];
 					for (int c = 0; c < NR; c++)
@@ -2029,8 +2054,7 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *r
 				const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 				const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
 				const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
-				const __m256i q32 =
-					_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+				const __m256i q32	= _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 				dots[r] = dotprod_s8_s8_i32(q32, xq8);
 			}
 
@@ -2103,8 +2127,7 @@ void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 					const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
 					const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
-					const __m256i q32 =
-						_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+					const __m256i q32 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 
 					int32_t sumi_arr[NR];
 					for (int c = 0; c < NR; c++)
@@ -2170,15 +2193,22 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 	const __m128i		kvalues_u	   = _mm_loadu_si128((const __m128i *)(kvalues_iq4nl));
 	const __m128i		lo_mask		   = _mm_set1_epi8(0x0F);
 
+	static _Thread_local float *xq_prepack	 = NULL;
+	static _Thread_local size_t xq_prepack_cap = 0;
+
 	float	   xq_d_stack[256];
 	__m256i	   xq32_stack[256];
 	float	  *xq_d	 = xq_d_stack;
 	__m256i	  *xq32	 = xq32_stack;
-	void	  *xq_heap = NULL;
 
 	if (blocks_per_row > 256) {
-		xq_heap = xmalloc((size_t)blocks_per_row * (sizeof(float) + sizeof(__m256i)));
-		xq_d	= (float *)xq_heap;
+		size_t need = (size_t)blocks_per_row * (sizeof(float) + sizeof(__m256i));
+		if (need > xq_prepack_cap) {
+			xq_prepack	 = xrealloc(xq_prepack, need);
+			xq_prepack_cap = need;
+			tlocal_register((void **)&xq_prepack);
+		}
+		xq_d = xq_prepack;
 		xq32	= (__m256i *)(xq_d + blocks_per_row);
 	}
 
@@ -2214,8 +2244,7 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 				const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 				const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
 				const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
-				const __m256i q32 =
-					_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+				const __m256i q32	= _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 				dots[r] = vreduce_add_epi32(dotprod_s8_s8_i32(q32, xq8));
 			}
 
@@ -2256,16 +2285,13 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 			const __m128i	 hi_idx	 = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 			const __m128i	 lo		 = _mm_shuffle_epi8(kvalues_u, lo_idx);
 			const __m128i	 hi		 = _mm_shuffle_epi8(kvalues_u, hi_idx);
-			const __m256i	 q32	 =
-				_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+			const __m256i q32	= _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 			const int32_t sumi = vreduce_add_epi32(dotprod_s8_s8_i32(q32, xq8));
 			const float d = f16_to_f32_fast(row[bi].d) * d_xq;
 			sumf += d * (float)sumi;
 		}
 		y[i] = sumf;
 	}
-
-	free(xq_heap);
 }
 
 #define NR 4
@@ -2318,8 +2344,7 @@ void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m128i	hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 					const __m128i	lo		= _mm_shuffle_epi8(kvalues_u, lo_idx);
 					const __m128i	hi		= _mm_shuffle_epi8(kvalues_u, hi_idx);
-					const __m256i	q32	=
-						_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+					const __m256i q32 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 
 int32_t sumi_arr[NR];
 					for (int c = 0; c < NR; c++)
@@ -2327,8 +2352,8 @@ int32_t sumi_arr[NR];
 					const __m128i sumi4 = _mm_loadu_si128((const __m128i *)sumi_arr);
 
 					const __m128 sumi_f = _mm_cvtepi32_ps(sumi4);
-					acc_row[r] = _mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)),
-											  acc_row[r]);
+					acc_row[r] =
+						_mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)), acc_row[r]);
 				}
 			}
 
@@ -2358,8 +2383,7 @@ int32_t sumi_arr[NR];
 				const __m128i hi_idx = _mm_and_si128(_mm_srli_epi16(q, 4), lo_mask);
 				const __m128i lo	 = _mm_shuffle_epi8(kvalues_u, lo_idx);
 				const __m128i hi	 = _mm_shuffle_epi8(kvalues_u, hi_idx);
-				const __m256i q32 =
-					_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+				const __m256i q32	= _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 				const __m256i xq8	= _mm256_loadu_si256((const __m256i *)(xrow[bi].qs));
 				const int32_t sumi = vreduce_add_epi32(dotprod_s8_s8_i32(q32, xq8));
 				const float d = f16_to_f32_fast(row[bi].d) * f16_to_f32_fast(xrow[bi].d);
@@ -2510,8 +2534,7 @@ void matmul_q4_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 					const __m128i q	 = _mm_loadu_si128((const __m128i *)(b->qs));
 					const __m128i lo	 = _mm_and_si128(q, _mm_set1_epi8(0x0F));
 					const __m128i hi	 = _mm_and_si128(_mm_srli_epi16(q, 4), _mm_set1_epi8(0x0F));
-					const __m256i q32 =
-						_mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+					const __m256i q32 = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 					const float d_w = f16_to_f32_fast(b->d);
 					const float m_w = f16_to_f32_fast(b->m);
 
@@ -2573,16 +2596,14 @@ static inline __m128i spread_byte_bits(uint8_t b) {
 }
 
 static inline __m128i q5_bitmask_lo(uint32_t qh) {
-	const __m128i lo_mask =
-		_mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0);
+	const __m128i lo_mask = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0);
 	__m128i b0 = spread_byte_bits(qh & 0xFF);
 	__m128i b1 = spread_byte_bits((qh >> 8) & 0xFF);
 	return _mm_or_si128(_mm_and_si128(b0, lo_mask), _mm_andnot_si128(lo_mask, b1));
 }
 
 static inline __m128i q5_bitmask_hi(uint32_t qh) {
-	const __m128i lo_mask =
-		_mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0);
+	const __m128i lo_mask = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0);
 	__m128i b0 = spread_byte_bits((qh >> 16) & 0xFF);
 	__m128i b1 = spread_byte_bits((qh >> 24) & 0xFF);
 	return _mm_or_si128(_mm_and_si128(b0, lo_mask), _mm_andnot_si128(lo_mask, b1));
@@ -2697,8 +2718,8 @@ void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 					const __m128i sumi4 = _mm_loadu_si128((const __m128i *)sumi_arr);
 
 					const __m128 sumi_f = _mm_cvtepi32_ps(sumi4);
-					acc_row[r] = _mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)),
-											  acc_row[r]);
+					acc_row[r] =
+						_mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)), acc_row[r]);
 				}
 			}
 
@@ -2825,8 +2846,8 @@ void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 					const __m128i sumi4 = _mm_loadu_si128((const __m128i *)sumi_arr);
 
 					const __m128 sumi_f = _mm_cvtepi32_ps(sumi4);
-					acc_row[r] = _mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)),
-											  acc_row[r]);
+					acc_row[r] =
+						_mm_fmadd_ps(sumi_f, _mm_mul_ps(xd_vec, _mm_set1_ps(d_w)), acc_row[r]);
 					off_row[r] = _mm_fmadd_ps(xs_vec, _mm_set1_ps(m_w), off_row[r]);
 				}
 			}
@@ -2945,7 +2966,8 @@ static inline void q6_k_unpack_ymm(const q6_k_block *b, __m256i out[8]) {
 static inline int32_t q6k_dot_ymm(const __m256i a[8], const int8_t *q8, const int8_t *sc) {
 	__m256i acc = _mm256_setzero_si256();
 	for (int j = 0; j < 8; j++) {
-		__m256i d = dotprod_s8_s8_i32(_mm256_loadu_si256((const __m256i *)(q8 + j * 32)), a[j]);
+		__m256i d =
+			dotprod_s8_s8_i32_noclamp(_mm256_loadu_si256((const __m256i *)(q8 + j * 32)), a[j]);
 		__m256i scv = _mm256_set_m128i(_mm_set1_epi32((int32_t)sc[2 * j + 1]),
 									   _mm_set1_epi32((int32_t)sc[2 * j]));
 		acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d, scv));
@@ -3165,8 +3187,7 @@ static inline void q4k_block_dot(const q4_k_block *b, const q8_k_block *xb, int3
 		const __m256i xq1v = _mm256_loadu_si256((const __m256i *)xq1);
 		const __m256i d0 = dotprod_u8_s8_i32(lo_u, xq0v);
 		const __m256i d1 = dotprod_u8_s8_i32(hi_u, xq1v);
-		sumi_v = _mm256_add_epi32(
-			sumi_v,
+		sumi_v = _mm256_add_epi32(sumi_v,
 			_mm256_add_epi32(_mm256_mullo_epi32(d0, _mm256_set1_epi32(s0)),
 							 _mm256_mullo_epi32(d1, _mm256_set1_epi32(s1))));
 		summ += m0 * (int32_t)((int32_t)bs[ib] + (int32_t)bs[ib + 1]);
@@ -3278,11 +3299,9 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 						m_hi_cache[bi][r][g] = (int32_t)mu8;
 						is += 2;
 
-						const __m256i qg_v =
-							_mm256_loadu_si256((const __m256i *)(qbytes + g * 32));
+						const __m256i qg_v = _mm256_loadu_si256((const __m256i *)(qbytes + g * 32));
 						wlo_cache[bi][r][g] = _mm256_and_si256(qg_v, lo_mask);
-						whi_cache[bi][r][g] =
-							_mm256_and_si256(_mm256_srli_epi16(qg_v, 4), lo_mask);
+						whi_cache[bi][r][g] = _mm256_and_si256(_mm256_srli_epi16(qg_v, 4), lo_mask);
 					}
 				}
 			}
@@ -3358,8 +3377,8 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 						_mm256_cvtepi32_ps(_mm256_loadu_si256((const __m256i *)(summ_arr[r])));
 					__m256 d_w_v	 = _mm256_set1_ps(d_w[r]);
 					__m256 dmin_w_v = _mm256_set1_ps(dmin_w[r]);
-					__m256 val =
-						_mm256_sub_ps(_mm256_mul_ps(d_w_v, sumi_f), _mm256_mul_ps(dmin_w_v, summ_f));
+					__m256 val		  = _mm256_sub_ps(_mm256_mul_ps(d_w_v, sumi_f),
+													_mm256_mul_ps(dmin_w_v, summ_f));
 					acc_row[r] = _mm256_fmadd_ps(xd_vec, val, acc_row[r]);
 				}
 			}
@@ -3689,8 +3708,10 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 						const int8_t *xq0 = xq8 + (g * 64);
 						const int8_t *xq1 = xq8 + (g * 64) + 32;
 						for (int half = 0; half < 2; half++) {
-							xq_cache[g][half][0] = _mm_loadu_si128((const __m128i *)(xq0 + half * 16));
-							xq_cache[g][half][1] = _mm_loadu_si128((const __m128i *)(xq1 + half * 16));
+							xq_cache[g][half][0] =
+								_mm_loadu_si128((const __m128i *)(xq0 + half * 16));
+							xq_cache[g][half][1] =
+								_mm_loadu_si128((const __m128i *)(xq1 + half * 16));
 						}
 					}
 
@@ -3719,8 +3740,10 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 				const __m128 xd_vec = _mm_loadu_ps(xd_arr);
 				for (int r = 0; r < MATMUL_MR; r++) {
-					__m128 sumi_f = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(sumi_arr[r])));
-					__m128 summ_f = _mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(summ_arr[r])));
+					__m128 sumi_f =
+						_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(sumi_arr[r])));
+					__m128 summ_f =
+						_mm_cvtepi32_ps(_mm_loadu_si128((const __m128i *)(summ_arr[r])));
 					__m128 d_v		= _mm_set1_ps(d[r]);
 					__m128 dmin_v	= _mm_set1_ps(dmin[r]);
 					__m128 val	= _mm_sub_ps(_mm_mul_ps(d_v, sumi_f), _mm_mul_ps(dmin_v, summ_f));
@@ -3795,8 +3818,7 @@ void matmul_f32_f32(const float *restrict w, const float *restrict x, float *res
 			__m128 rem_acc = _mm_setzero_ps();
 			int		j2	   = j;
 			for (; j2 + 4 <= k; j2 += 4)
-				rem_acc =
-					_mm_fmadd_ps(_mm_loadu_ps(xp + j2), _mm_loadu_ps(rows[r] + j2), rem_acc);
+				rem_acc = _mm_fmadd_ps(_mm_loadu_ps(xp + j2), _mm_loadu_ps(rows[r] + j2), rem_acc);
 			float s = vreduce_add_ps(acc[r]) + vreduce_add_ps_128(rem_acc);
 			for (; j2 < k; j2++)
 				s += rows[r][j2] * xp[j2];
@@ -3894,8 +3916,7 @@ void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, floa
 				__m256 acc = _mm256_setzero_ps();
 				int		j  = 0;
 				for (; j + 8 <= k; j += 8)
-					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), _mm256_loadu_ps(wr + j),
-										  acc);
+					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), _mm256_loadu_ps(wr + j), acc);
 				float s = vreduce_add_ps(acc);
 				for (; j < k; j++)
 					s += wr[j] * xb[t][j];
@@ -3971,12 +3992,12 @@ void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *res
 		for (; j + 32 <= k; j += 32) {
 			__builtin_prefetch(wr + j + 64, 0, 1);
 			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_bf16x8_to_ps(wr + j), acc0);
-			acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8),
-								  loadu_bf16x8_to_ps(wr + j + 8), acc1);
-			acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 16),
-								  loadu_bf16x8_to_ps(wr + j + 16), acc2);
-			acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 24),
-								  loadu_bf16x8_to_ps(wr + j + 24), acc3);
+			acc1 =
+				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_bf16x8_to_ps(wr + j + 8), acc1);
+			acc2 =
+				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 16), loadu_bf16x8_to_ps(wr + j + 16), acc2);
+			acc3 =
+				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 24), loadu_bf16x8_to_ps(wr + j + 24), acc3);
 		}
 		for (; j + 8 <= k; j += 8)
 			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_bf16x8_to_ps(wr + j), acc0);
@@ -4056,8 +4077,8 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 				__m256 acc = _mm256_setzero_ps();
 				int		j	= 0;
 				for (; j + 8 <= k; j += 8)
-					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j),
-										 loadu_bf16x8_to_ps(wr + j), acc);
+					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), loadu_bf16x8_to_ps(wr + j),
+										  acc);
 				float sum = vreduce_add_ps(acc);
 				for (; j < k; j++) {
 					union {
@@ -4072,8 +4093,7 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 		}
 	}
 	for (; mb < m; mb++)
-		matmul_bf16_f32(Wb, x + (size_t)mb * x_row_stride,
-						 y + (size_t)mb * y_row_stride, n, k);
+		matmul_bf16_f32(Wb, x + (size_t)mb * x_row_stride, y + (size_t)mb * y_row_stride, n, k);
 }
 
 void matmul_f16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
@@ -4118,8 +4138,8 @@ void matmul_f16_f32(const void *restrict w, const float *restrict x, float *rest
 			__m128 rem_acc = _mm_setzero_ps();
 			int		j2	   = j;
 			for (; j2 + 4 <= k; j2 += 4)
-				rem_acc = _mm_fmadd_ps(_mm_loadu_ps(x + j2),
-									   loadu_f16x4_to_ps_128(rows[r] + j2), rem_acc);
+				rem_acc = _mm_fmadd_ps(_mm_loadu_ps(x + j2), loadu_f16x4_to_ps_128(rows[r] + j2),
+									   rem_acc);
 			float s = vreduce_add_ps(acc[r]) + vreduce_add_ps_128(rem_acc);
 			for (; j2 < k; j2++)
 				s += f16_to_f32_fast(rows[r][j2]) * x[j2];
@@ -4137,18 +4157,16 @@ void matmul_f16_f32(const void *restrict w, const float *restrict x, float *rest
 			__builtin_prefetch(wr + j + 64, 0, 1);
 			__builtin_prefetch(x + j + 64, 0, 1);
 			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_f16x8_to_ps_256(wr + j), acc0);
-			acc1 =
-				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
+			acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
 							   acc1);
-			acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 16),
-								   loadu_f16x8_to_ps_256(wr + j + 16), acc2);
-			acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 24),
-								   loadu_f16x8_to_ps_256(wr + j + 24), acc3);
+			acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 16), loadu_f16x8_to_ps_256(wr + j + 16),
+								   acc2);
+			acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 24), loadu_f16x8_to_ps_256(wr + j + 24),
+								   acc3);
 		}
 		for (; j + 16 <= k; j += 16) {
 			acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j), loadu_f16x8_to_ps_256(wr + j), acc0);
-			acc1 =
-				_mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
+			acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(x + j + 8), loadu_f16x8_to_ps_256(wr + j + 8),
 							   acc1);
 		}
 		for (; j + 8 <= k; j += 8)
@@ -4161,8 +4179,8 @@ void matmul_f16_f32(const void *restrict w, const float *restrict x, float *rest
 	}
 }
 
-void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y,
-						  int n, int k, int m, int x_row_stride, int y_row_stride) {
+void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y, int n,
+						  int k, int m, int x_row_stride, int y_row_stride) {
 	const uint16_t *Wb = w;
 	const int		MB = 4;
 	int				mb = 0;
@@ -4215,8 +4233,8 @@ void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float
 				__m256 acc = _mm256_setzero_ps();
 				int		j  = 0;
 				for (; j + 8 <= k; j += 8)
-					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j),
-										  loadu_f16x8_to_ps_256(wr + j), acc);
+					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), loadu_f16x8_to_ps_256(wr + j),
+										  acc);
 				float s = vreduce_add_ps(acc);
 				for (; j < k; j++)
 					s += f16_to_f32_fast(wr[j]) * xb[t][j];
@@ -4286,8 +4304,8 @@ void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 	__m128		scale_v = _mm_set1_ps(scale);
 	int			i		= 0;
 	for (; i + 16 <= n; i += 16) {
-		_mm_storeu_ps(y + i, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(x + i), scale_v),
-										_mm_loadu_ps(w + i)));
+		_mm_storeu_ps(y + i,
+					  _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(x + i), scale_v), _mm_loadu_ps(w + i)));
 		_mm_storeu_ps(y + i + 4, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(x + i + 4), scale_v),
 											_mm_loadu_ps(w + i + 4)));
 		_mm_storeu_ps(y + i + 8, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(x + i + 8), scale_v),
@@ -4329,8 +4347,8 @@ void rmsnorm_per_head(const float *x, const float *w, float *y, int n_heads, int
 		__m128		scale_v = _mm_set1_ps(scale);
 		int			j	 = 0;
 		for (; j + 16 <= head_dim; j += 16) {
-			_mm_storeu_ps(yh + j, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j), scale_v),
-											 _mm_loadu_ps(w + j)));
+			_mm_storeu_ps(
+				yh + j, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j), scale_v), _mm_loadu_ps(w + j)));
 			_mm_storeu_ps(yh + j + 4, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j + 4), scale_v),
 												 _mm_loadu_ps(w + j + 4)));
 			_mm_storeu_ps(yh + j + 8, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j + 8), scale_v),
@@ -4339,8 +4357,8 @@ void rmsnorm_per_head(const float *x, const float *w, float *y, int n_heads, int
 												  _mm_loadu_ps(w + j + 12)));
 		}
 		for (; j + 4 <= head_dim; j += 4)
-			_mm_storeu_ps(yh + j, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j), scale_v),
-											 _mm_loadu_ps(w + j)));
+			_mm_storeu_ps(
+				yh + j, _mm_mul_ps(_mm_mul_ps(_mm_loadu_ps(xh + j), scale_v), _mm_loadu_ps(w + j)));
 		for (; j < head_dim; j++)
 			yh[j] = xh[j] * scale * w[j];
 	}

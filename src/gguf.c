@@ -200,7 +200,7 @@ static int gguf_reader_str(gguf_reader *r, gguf_str *o) {
 	uint64_t n;
 	if (gguf_reader_u64(r, &n))
 		return -1;
-	if (gguf_reader_left(r) < (ptrdiff_t)n)
+	if ((uint64_t)gguf_reader_left(r) < n)
 		return -1;
 	o->len	= n;
 	o->data = (const char *)r->p;
@@ -214,6 +214,12 @@ static int gguf_reader_bool(gguf_reader *r, int *o) {
 		return -1;
 	*o = v != 0;
 	return 0;
+}
+
+static int gguf_arr_len_ok(const gguf_reader *r, uint64_t n, size_t elem_size) {
+	if (elem_size == 0 || n > (uint64_t)(SIZE_MAX / elem_size))
+		return 0;
+	return n * (uint64_t)elem_size <= (uint64_t)gguf_reader_left(r);
 }
 
 static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
@@ -321,6 +327,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 		case GGUF_TYPE_U8:
 		case GGUF_TYPE_I8:
 		case GGUF_TYPE_BOOL:
+			if (!gguf_arr_len_ok(r, n, 1))
+				return -1;
 			e->arr_data = xmalloc(n);
 			for (uint64_t i = 0; i < n; i++) {
 				uint8_t v;
@@ -331,6 +339,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 			break;
 		case GGUF_TYPE_U16:
 		case GGUF_TYPE_I16:
+			if (!gguf_arr_len_ok(r, n, 2))
+				return -1;
 			e->arr_data = xmalloc(n * 2);
 			for (uint64_t i = 0; i < n; i++) {
 				uint16_t v;
@@ -342,6 +352,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 		case GGUF_TYPE_U32:
 		case GGUF_TYPE_I32:
 		case GGUF_TYPE_F32:
+			if (!gguf_arr_len_ok(r, n, 4))
+				return -1;
 			e->arr_data = xmalloc(n * 4);
 			for (uint64_t i = 0; i < n; i++) {
 				uint32_t v;
@@ -353,6 +365,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 		case GGUF_TYPE_U64:
 		case GGUF_TYPE_I64:
 		case GGUF_TYPE_F64:
+			if (!gguf_arr_len_ok(r, n, 8))
+				return -1;
 			e->arr_data = xmalloc(n * 8);
 			for (uint64_t i = 0; i < n; i++) {
 				uint64_t v;
@@ -362,6 +376,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 			}
 			break;
 		case GGUF_TYPE_STRING: {
+			if (!gguf_arr_len_ok(r, n, sizeof(char *)))
+				return -1;
 			char **arr = (char **)xmalloc(n * sizeof(char *));
 			for (uint64_t i = 0; i < n; i++) {
 				gguf_str s;
@@ -447,8 +463,10 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		goto bad;
 	if (gguf_reader_u32(&r, &version))
 		goto bad;
-	if (version != GGUF_VERSION)
+	if (version != 2u && version != GGUF_VERSION)
 		goto bad;
+	if (version != GGUF_VERSION)
+		DEBUG("gguf: accepting v%u header (layout identical to v%u)", version, GGUF_VERSION);
 	if (gguf_reader_u64(&r, &ctx->n_tensors))
 		goto bad;
 	if (gguf_reader_u64(&r, &ctx->n_kv))
@@ -488,9 +506,13 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		gguf_str name;
 		if (gguf_reader_str(&r, &name))
 			goto bad_kv_ts;
-		size_t nl = MIN(name.len, sizeof(ts[i].name) - 1);
-		memcpy(ts[i].name, name.data, nl);
-		ts[i].name[nl] = '\0';
+		if (name.len >= sizeof(ts[i].name)) {
+			ERROR("gguf: tensor name too long (%llu bytes, max %zu)", (unsigned long long)name.len,
+				  sizeof(ts[i].name) - 1);
+			goto bad_kv_ts;
+		}
+		memcpy(ts[i].name, name.data, name.len);
+		ts[i].name[name.len] = '\0';
 		if (gguf_reader_u32(&r, &ts[i].n_dims))
 			goto bad_kv_ts;
 		if (ts[i].n_dims > 4)
@@ -529,12 +551,13 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			ts[i].data = NULL;
 			continue;
 		}
-		if (ts[i].offset > ctx->data_size)
-			goto bad_kv_ts;
 		size_t tsize;
-		if (gguf_tensor_byte_size(&ts[i], &tsize) == 0)
-			if (tsize > ctx->data_size - ts[i].offset)
-				goto bad_kv_ts;
+		if (gguf_tensor_byte_size(&ts[i], &tsize) != 0) {
+			ERROR("gguf: cannot size tensor '%s' (unknown type or bad dims)", ts[i].name);
+			goto bad_kv_ts;
+		}
+		if (ts[i].offset > ctx->data_size || tsize > ctx->data_size - ts[i].offset)
+			goto bad_kv_ts;
 		ts[i].data = (const uint8_t *)ctx->data_start + ts[i].offset;
 	}
 
@@ -545,9 +568,19 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		ctx->tensor_hash	 = xcalloc(cap, sizeof(*ctx->tensor_hash));
 		ctx->tensor_hash_cap = cap;
 		for (size_t i = 0; i < ctx->n_tensors; i++) {
-			uint64_t h = fnv1a_str(ts[i].name) & (cap - 1);
-			while (ctx->tensor_hash[h].used)
+			uint64_t h	 = fnv1a_str(ts[i].name) & (cap - 1);
+			int		 dup = 0;
+			while (ctx->tensor_hash[h].used) {
+				if (strcmp(ctx->tensor_hash[h].name, ts[i].name) == 0) {
+					dup = 1;
+					break;
+				}
 				h = (h + 1) & (cap - 1);
+			}
+			if (dup) {
+				WARN("gguf: duplicate tensor name '%s' ignored", ts[i].name);
+				continue;
+			}
 			ctx->tensor_hash[h].name = ts[i].name;
 			ctx->tensor_hash[h].idx	 = i;
 			ctx->tensor_hash[h].used = 1;
@@ -588,8 +621,10 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 				}
 				h = (h + 1) & (cap - 1);
 			}
-			if (dup)
+			if (dup) {
+				WARN("gguf: duplicate metadata key '%s' ignored", ctx->kv_keys[i]);
 				continue;
+			}
 			ctx->kv_hash[h].key	 = ctx->kv_keys[i];
 			ctx->kv_hash[h].idx	 = i;
 			ctx->kv_hash[h].used = 1;
@@ -839,7 +874,9 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 		ctx->tensors[i].data = NULL;
 
 	ctx->data_start = NULL;
-	ctx->data_size	= real_fsize;
+	ctx->data_size	= real_fsize >= (size_t)ctx->data_file_offset
+						  ? real_fsize - (size_t)ctx->data_file_offset
+						  : 0;
 
 	posix_fadvise(fd, 0, (off_t)have, POSIX_FADV_DONTNEED);
 	close(fd);
@@ -910,7 +947,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		if (tbytes == 0)
 			continue;
 		if (t->offset > ctx->data_size || tbytes > ctx->data_size - t->offset) {
-			ERROR("gguf_load_sparse: tensor '%s' extends past end of file", t->name);
+			ERROR("gguf_load_sparse: tensor '%s' extends past end of data section", t->name);
 			ret = ERR_FORMAT;
 			break;
 		}
@@ -1062,6 +1099,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			progress_update(&prog, (uint64_t)done);
 			if (done >= n_load)
 				break;
+			if (atomic_load(&job.first_err) != OK)
+				break;
 			struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
 			nanosleep(&ts, NULL);
 		}
@@ -1087,7 +1126,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 				uint64_t off64 = ctx->data_file_offset + t->offset;
 				size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
 				if (slop)
-					memmove(t->data, (char *)t->data + slop, tbytes);
+					memmove((void *)t->data, (const char *)t->data + slop, tbytes);
 			}
 		}
 
@@ -1349,9 +1388,12 @@ void gguf_dump(const gguf_ctx *c, FILE *fp) {
 			fprintf(fp, "%g", v);
 			break;
 		}
-		case GGUF_TYPE_F64:
-			fprintf(fp, "%g", *(double *)&c->kv_vals[i]);
+		case GGUF_TYPE_F64: {
+			double v;
+			memcpy(&v, &c->kv_vals[i], sizeof(v));
+			fprintf(fp, "%g", v);
 			break;
+		}
 		case GGUF_TYPE_STRING:
 			fprintf(fp, "\"%.*s\"", (int)c->kv_strs[i].len, c->kv_strs[i].data);
 			break;

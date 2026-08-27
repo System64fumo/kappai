@@ -26,7 +26,8 @@ typedef struct {
 	context *c;
 } on_token_ud;
 
-static int g_use_color = 0;
+static int g_use_color	   = 0;
+static int g_stdout_isatty = 0;
 
 static context *g_ctx = NULL;
 
@@ -91,7 +92,8 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 
 	if (n > 0) {
 		fwrite(piece, 1, n, stdout);
-		fflush(stdout);
+		if (g_stdout_isatty)
+			fflush(stdout);
 		u->first_token = false;
 	}
 }
@@ -106,44 +108,51 @@ static status_code warmup_run(context *c, const char *system) {
 	if (prefix_bytes == 0)
 		return OK;
 
+	char *prev_render = xstrdup(c->chat.last_render);
+
 	char	   *render = NULL;
 	char		errbuf[512];
 	status_code rc =
 		chat_template_add_turn(&c->chat, "system", sys, 0, &render, errbuf, sizeof(errbuf));
-	if (rc != OK)
+	if (rc != OK) {
+		free(prev_render);
 		return OK;
+	}
 
 	int		 cap = c->n_ctx;
 	int32_t *ids = context_ids_scratch(c, cap + 1);
 	int		 n	 = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
 	if (n < 0) {
 		free(render);
-		return OK;
+		goto restore;
 	}
 
 	int count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
 	if (count == 0) {
 		free(render);
-		return OK;
+		goto restore;
 	}
 
 	context_monitor_send_start(c);
 	prefill_result pf = context_prefill_tokens(c, ids, count, "warmup", true);
 	if (pf.rc < 0) {
 		free(render);
+		free(prev_render);
+		c->session_poisoned = true;
 		return ERR_INTERNAL;
 	}
 
-	char *decoded = tokenizer_decode_prefix(&c->tok, ids, count);
-	if (decoded) {
-		free(c->chat.last_render);
-		c->chat.last_render = decoded;
-	}
 	c->warmup_done = true;
 
 	DEBUG("warmup: prefilled %d tokens", count);
 
 	free(render);
+	free(prev_render);
+	return OK;
+
+restore:
+	free(c->chat.last_render);
+	c->chat.last_render = prev_render;
 	return OK;
 }
 
@@ -151,12 +160,15 @@ static int run_chat_turn(context *c, cli_args *a, const char *text) {
 	int			   gen	= 0;
 	on_token_ud	   ud	= {a->output_stream,	 &gen, false, true, false, c->chat.think_start_id,
 						   c->chat.think_end_id, c};
-	sampler_params samp = {a->temperature, a->top_k, a->top_p, a->min_p};
+	sampler_params samp = {a->temperature, a->top_k,		  a->top_p,
+						   a->min_p,	   a->repeat_penalty, a->repeat_last_n};
 	return context_chat_turn(c, "user", text, true, a->n_predict, &samp, on_token_cb, &ud,
 							 a->metrics[0] ? a->metrics : "pp,tg");
 }
 
 static int run_one_shot(context *c, cli_args *a) {
+	context_idle_prefill_wait(c);
+
 	if (!c->warmup_done) {
 		context_reset(c);
 		if (a->warmup)
@@ -164,26 +176,31 @@ static int run_one_shot(context *c, cli_args *a) {
 	}
 	c->warmup_done = false;
 
-	if (a->warmup)
-		context_idle_prefill_start(c);
+	if (c->session_poisoned) {
+		ERROR("startup warmup left inconsistent state; refusing to generate");
+		return -1;
+	}
 
 	if (a->output_stream)
 		fflush(stderr);
 	int r = run_chat_turn(c, a, a->prompt);
+	printf("\n");
 
-	context_idle_prefill_wait(c);
-
-	if (a->output_stream)
-		printf("\n");
+	int rc = 0;
+	if (r < 0)
+		rc = -1;
 	if (c->context_limit_hit) {
 		c->context_limit_hit = false;
-		printf("[context limit reached]\n");
+		WARN("context window exhausted (n_ctx=%d). Shorten the prompt, lower "
+			 "--n-predict, or raise --ctx-size.",
+			 c->n_ctx);
+		rc = ENGINE_EXIT_CONTEXT_FULL;
 	}
-	if (r < 0) {
-		ERROR("generation failed");
-		return -1;
+	if (c->session_poisoned) {
+		ERROR("generation left inconsistent cache state; session must be reset");
+		rc = -1;
 	}
-	return 0;
+	return rc;
 }
 
 static void reset_and_warmup(context *c, cli_args *a, const char *system) {
@@ -191,7 +208,8 @@ static void reset_and_warmup(context *c, cli_args *a, const char *system) {
 	context_reset(c);
 	if (a->warmup) {
 		warmup_run(c, system);
-		context_idle_prefill_start(c);
+		if (!c->session_poisoned)
+			context_idle_prefill_start(c);
 	}
 }
 
@@ -206,7 +224,7 @@ static int run_interactive(context *c, cli_args *a) {
 	}
 	c->warmup_done = false;
 
-	if (a->warmup)
+	if (a->warmup && !c->session_poisoned)
 		context_idle_prefill_start(c);
 
 	char line[4096];
@@ -236,10 +254,9 @@ static int run_interactive(context *c, cli_args *a) {
 
 		context_idle_prefill_wait(c);
 
-		int r = run_chat_turn(c, a, line);
+		c->interrupt = 0;
 
-		if (a->warmup)
-			context_idle_prefill_start(c);
+		int r = run_chat_turn(c, a, line);
 
 		if (c->interrupt) {
 			c->interrupt = 0;
@@ -250,9 +267,14 @@ static int run_interactive(context *c, cli_args *a) {
 			printf("\n[context limit reached]");
 		}
 		printf("\n\n");
-		if (r < 0) {
-			ERROR("turn failed; resetting context");
+		if (c->session_poisoned || r < 0) {
+			if (c->session_poisoned)
+				ERROR("turn left inconsistent cache state; resetting context");
+			else
+				ERROR("turn failed; resetting context");
 			reset_and_warmup(c, a, a->system);
+		} else if (a->warmup) {
+			context_idle_prefill_start(c);
 		}
 	}
 
@@ -317,11 +339,13 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	mallopt(M_MMAP_MAX, 0);
 	mallopt(M_TRIM_THRESHOLD, -1);
 
+	log_level saved_log_level = log_get_level();
 	log_init(log_default_config());
+	log_set_level(saved_log_level);
 
 	config cfg;
 	if (parse_args(argc, argv, &cfg, a) < 0) {
-		usage(stderr);
+		usage(stderr, a->is_server);
 		return ERR_INVALID_ARG;
 	}
 
@@ -377,7 +401,7 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	if (!(ec->profile_time))
 		profile_reset(&ctx->scratch.prof);
 
-	context_set_show_template(ctx, a->show_template);
+	context_set_debug_prompt(ctx, a->debug_prompt);
 
 	malloc_trim(0);
 
@@ -385,7 +409,8 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 }
 
 int engine_run(context *ctx, cli_args *a) {
-	g_use_color = isatty(STDOUT_FILENO) && isatty(STDERR_FILENO);
+	g_use_color		= isatty(STDOUT_FILENO) && isatty(STDERR_FILENO);
+	g_stdout_isatty = isatty(STDOUT_FILENO);
 
 	g_ctx = ctx;
 	signal(SIGINT, on_sigint);

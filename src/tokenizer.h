@@ -40,7 +40,10 @@ typedef struct {
 	int32_t				   bos_id, eos_id, eot_id, pad_id, unk_id;
 	int					   add_bos, add_eos;
 	int					   is_sentencepiece;
+	int					   add_space_prefix;
 	int					   pre_type;
+	int32_t				   byte_fallback_ids[256];
+	size_t				   n_byte_fallback;
 	struct tok_hash_entry *hash;
 	size_t				   hash_capacity;
 	struct tok_hash_entry *merge_hash;
@@ -78,7 +81,6 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 size_t	tokenizer_token_decoded_len(const tokenizer *t, int32_t id);
 int		tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
 										size_t max_bytes);
-char   *tokenizer_decode_prefix(const tokenizer *t, const int32_t *ids, int count);
 int		tokenizer_is_eog(const tokenizer *t, int32_t id);
 int32_t tokenizer_find_token(const tokenizer *t, const char *text);
 

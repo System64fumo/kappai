@@ -54,6 +54,7 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 			cts->think_start_id	  = start_id;
 			cts->think_end_id	  = end_id;
 			cts->think_start_text = think_marker_pairs[i].start;
+			cts->think_end_text	  = think_marker_pairs[i].end;
 			break;
 		}
 	}
@@ -80,10 +81,34 @@ void chat_template_clear_messages(chat_template_state *cts) {
 	cts->last_render = xstrdup("");
 }
 
+static char *strip_thinking_span(chat_template_state *cts, const char *content) {
+	if (!cts->think_start_text || !cts->think_end_text || !content)
+		return xstrdup(content ? content : "");
+
+	const char *start = strstr(content, cts->think_start_text);
+	if (!start)
+		return xstrdup(content);
+
+	const char *after_start = start + strlen(cts->think_start_text);
+	const char *end			= strstr(after_start, cts->think_end_text);
+	if (!end)
+		return xstrdup(content);
+
+	const char *tail	 = end + strlen(cts->think_end_text);
+	size_t		head_len = (size_t)(start - content);
+	size_t		tail_len = strlen(tail);
+	char	   *stripped = xmalloc(head_len + tail_len + 1);
+	memcpy(stripped, content, head_len);
+	memcpy(stripped + head_len, tail, tail_len);
+	stripped[head_len + tail_len] = '\0';
+	return stripped;
+}
+
 void chat_template_add_message(chat_template_state *cts, const char *role, const char *content) {
 	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
+	char *clean							   = strip_thinking_span(cts, content);
 	cts->messages[cts->n_messages].role	   = xstrdup(role ? role : "");
-	cts->messages[cts->n_messages].content = xstrdup(content ? content : "");
+	cts->messages[cts->n_messages].content = clean;
 	cts->n_messages++;
 }
 
@@ -134,10 +159,6 @@ static size_t lcp_len(const char *a, const char *b) {
 	while (a[i] && b[i] && a[i] == b[i])
 		i++;
 	return i;
-}
-
-static size_t rstrip_one_newline(const char *s, size_t len) {
-	return (len > 0 && s[len - 1] == '\n') ? len - 1 : len;
 }
 
 status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,
@@ -201,21 +222,12 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 	if (rc != OK)
 		return rc;
 
-	size_t new_len	= strlen(rendered);
-	size_t prev_len = strlen(cts->last_render);
-	size_t new_cmp	= rstrip_one_newline(rendered, new_len);
-	size_t prev_cmp = rstrip_one_newline(cts->last_render, prev_len);
+	size_t new_len = strlen(rendered);
+	size_t common  = lcp_len(rendered, cts->last_render);
 
-	const char *diff;
-	size_t		diff_len;
-	if (new_cmp < prev_cmp || strncmp(rendered, cts->last_render, prev_cmp) != 0) {
-		diff	 = rendered;
-		diff_len = new_len;
-	} else {
-		diff	 = rendered + prev_cmp;
-		diff_len = new_len - prev_cmp;
-	}
-	cts->think_open = false;
+	const char *diff	 = rendered + common;
+	size_t		diff_len = new_len - common;
+	cts->think_open		 = false;
 	if (add_generation_prompt && cts->think_start_text) {
 		size_t l   = strlen(cts->think_start_text);
 		size_t end = diff_len;

@@ -122,12 +122,13 @@ static inline status_code cpu_scratch_grow_aligned(void **buf, size_t *cap_bytes
 	if (*cap_bytes >= need_bytes)
 		return OK;
 	free(*buf);
-	*buf = aligned_alloc(align, need_bytes);
+	size_t aligned_need = ((need_bytes + align - 1) / align) * align;
+	*buf				= aligned_alloc(align, aligned_need);
 	if (!*buf) {
 		*cap_bytes = 0;
 		return ERR_OUT_OF_MEMORY;
 	}
-	*cap_bytes = need_bytes;
+	*cap_bytes = aligned_need;
 	return OK;
 }
 
@@ -1850,16 +1851,14 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 		} else {
 			scores = p->scores;
 		}
-		for (int kvh = 0; kvh < n_active; kvh++) {
+		for (int h = 0; h < n_heads; h++) {
+			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 			const uint8_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
-			for (int hg = 0; hg < n_groups; hg++) {
-				int			 h	   = (kvh * n_groups) + hg;
-				const float *qh	   = qf + ((size_t)h * head_dim);
-				float		*out_h = outf + ((size_t)h * head_dim);
-				cpu_attention_inner_q8_0(k_slice, v_slice, elem_stride, qh, out_h, head_dim, n_pos,
-										 scale, flash_attn, scores);
-			}
+			const float	  *qh	   = qf + ((size_t)h * head_dim);
+			float		  *out_h   = outf + ((size_t)h * head_dim);
+			cpu_attention_inner_q8_0(k_slice, v_slice, elem_stride, qh, out_h, head_dim, n_pos,
+									 scale, flash_attn, scores);
 		}
 		return OK;
 	}
@@ -1903,17 +1902,15 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 	} else {
 		scores = p->scores;
 	}
-	for (int kvh = 0; kvh < n_active; kvh++) {
+	for (int h = 0; h < n_heads; h++) {
+		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 		uint16_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
 
-		for (int hg = 0; hg < n_groups; hg++) {
-			int			 h	   = (kvh * n_groups) + hg;
-			const float *qh	   = qf + ((size_t)h * head_dim);
-			float		*out_h = outf + ((size_t)h * head_dim);
-			cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
-								flash_attn, scores);
-		}
+		const float *qh	   = qf + ((size_t)h * head_dim);
+		float		*out_h = outf + ((size_t)h * head_dim);
+		cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
+							flash_attn, scores);
 	}
 	return OK;
 }

@@ -27,7 +27,9 @@ typedef struct layer_weights {
 	weight_ref gate_up_w;
 	int		   gate_up_fused;
 	void	  *gate_up_fused_host;
-	void	  *shexp_fused_host;
+
+	int	  shexp_fused;
+	void *shexp_fused_host;
 
 	weight_ref qkv_w;
 	int		   qkv_fused;
@@ -63,7 +65,8 @@ typedef struct layer_weights {
 
 	weight_ref q_a_w, q_b_w, q_a_norm_w;
 	weight_ref kv_a_w, k_b_w, v_b_w, kv_a_norm_w;
-	int		   mla_kb_vb_f32;
+	int		   mla_kb_f32;
+	int		   mla_vb_f32;
 
 	weight_ref router_w;
 	weight_ref router_bias;

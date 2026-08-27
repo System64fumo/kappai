@@ -32,13 +32,12 @@
 #define ARCH_GENERATE_N_DECODE 3
 
 #define MAX_RESULTS_PER_FAMILY 128
-#define V_COUNT 4
+#define V_COUNT 3
 
 typedef enum {
-	V_PASS	= 0,
-	V_LOSSY = 1,
-	V_FAIL	= 2,
-	V_SKIP	= 3,
+	V_PASS = 0,
+	V_FAIL = 1,
+	V_SKIP = 2,
 } verdict;
 
 typedef enum {
@@ -70,6 +69,11 @@ typedef enum {
 	OPFAM_KV_QUANT_PARITY,
 	OPFAM_RMSNORM_ADD,
 	OPFAM_PLE_COMBINE,
+	OPFAM_SAMPLER,
+	OPFAM_TOKENIZER,
+	OPFAM_HYBRID_STATE,
+	OPFAM_ORCHESTRATION,
+	OPFAM_MOE_STREAM,
 	OPFAM_COUNT
 } op_family;
 
@@ -94,7 +98,7 @@ typedef struct {
 	size_t		bytes;
 } qtype_info;
 
-extern int g_pass, g_lossy, g_fail, g_skip;
+extern int g_pass, g_fail, g_skip;
 
 extern const qtype_info QTYPES[];
 extern const int		QTYPES_N;
@@ -132,10 +136,22 @@ void usage(const char *prog);
 int	 run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends);
 void run_per_op_tests(backend *cpu, backend *tgt);
 void run_arch_tests(backend *cpu, backend *tgt);
-void test_quant_determinism(const qtype_info *qt);
-void test_quant_finiteness(const qtype_info *qt);
-void test_quant_q8_0_roundtrip(void);
-void run_repack_parity_tests(backend *cpu);
+
+void		synth_suite_common_init(void);
+extern char synth_fixture_dir[256];
+extern char synth_chat_model_path[512];
+extern char synth_lfm2_model_path[512];
+extern char synth_dsa_model_path[512];
+void		run_sampler_tests(void);
+void		run_tokenizer_tests(void);
+void		run_jinja_tests(void);
+void		run_hybrid_state_tests(backend *cpu);
+void		run_orchestration_tests(void);
+void		run_moe_stream_tests(void);
+void		test_quant_determinism(const qtype_info *qt);
+void		test_quant_finiteness(const qtype_info *qt);
+void		test_quant_q8_0_roundtrip(void);
+void		run_repack_parity_tests(backend *cpu);
 void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt, int dim, int n);
 int	 run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
 int	 run_model_mode(int argc, char **argv, backend_info *infos, int n_backends);

@@ -105,6 +105,29 @@ static const synth_cfg ARCH_CFG_MLA = {
 	.v_head			   = 64,
 };
 
+static const synth_cfg ARCH_CFG_MLA_DENSE_FIRST = {
+	.n_layers		   = 4,
+	.dim			   = 512,
+	.n_heads		   = 8,
+	.n_kv_heads		   = 8,
+	.head_dim		   = 64,
+	.intermediate	   = 1024,
+	.vocab			   = 512,
+	.n_experts		   = 16,
+	.n_experts_used	   = 4,
+	.n_shared_experts  = 1,
+	.moe_intermediate  = 512,
+	.routed_scale	   = 1.0f,
+	.norm_topk_prob	   = 1,
+	.first_dense_layer = 2,
+	.q_lora			   = 256,
+	.kv_lora		   = 128,
+	.qk_head		   = 64,
+	.qk_rope		   = 32,
+	.qk_nope		   = 32,
+	.v_head			   = 64,
+};
+
 static const synth_cfg ARCH_CFG_MLA_WIDE = {
 	.n_layers		   = 2,
 	.dim			   = 512,
@@ -1056,6 +1079,8 @@ static void test_arch_batch_vs_single(backend *cpu, model_arch arch, const synth
 
 	if (arch == ARCH_GEMMA4 || arch == ARCH_GEMMA4_MOE)
 		sm_batch->m.batchable = -1;
+	if (arch == ARCH_GLM_DSA)
+		sm_batch->m.batchable = -1;
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
 	seed_test_rng(0xBA7C9B9ULL + (uint64_t)arch);
@@ -1118,7 +1143,6 @@ static void test_arch_batch_vs_single(backend *cpu, model_arch arch, const synth
 				record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
 			} else {
 				snprintf(detail, sizeof(detail), "max_diff=%.6f", max_diff);
-				fprintf(stderr, "  [PASS] batch_vs_single[%s]: %s\n", arch_name, detail);
 				record_result(OPFAM_ARCH_GENERATE, label, V_PASS, detail);
 			}
 		}
@@ -1444,6 +1468,7 @@ void run_arch_tests(backend *cpu, backend *tgt) {
 	test_arch_generate(cpu, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA, 16, ARCH_GENERATE_N_DECODE, 1);
 	test_arch_generate(cpu, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 16, ARCH_GENERATE_N_DECODE, 1);
 	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA, 8, 1);
+	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 8, 1);
 	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 8, 1);
 	test_arch_batch_vs_single(cpu, ARCH_GEMMA4, &ARCH_CFG_SMALL, 8, 1);
 	test_arch_batch_vs_single(cpu, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 8, 1);

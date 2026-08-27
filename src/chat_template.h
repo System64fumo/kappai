@@ -25,6 +25,7 @@ typedef struct {
 	int32_t		think_start_id;
 	int32_t		think_end_id;
 	const char *think_start_text;
+	const char *think_end_text;
 	bool		think_open;
 
 	char *last_render;

@@ -52,9 +52,12 @@ typedef struct {
 	float top_p;
 	float min_p;
 
+	float repeat_penalty;
+	int	  repeat_last_n;
+
 	bool		list_accels;
 	bool		dump_metadata;
-	bool		show_template;
+	bool		debug_prompt;
 	const char *grep_vocab;
 	char		metrics[32];
 	bool		warmup;
@@ -62,9 +65,11 @@ typedef struct {
 	const char *server_host;
 	int			server_port;
 	const char *server_api_key;
+
+	bool is_server;
 } cli_args;
 
-void usage(FILE *fp);
+void usage(FILE *fp, bool is_server);
 
 int parse_args(int argc, char **argv, config *cfg, cli_args *a);
 

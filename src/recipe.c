@@ -9,6 +9,7 @@
 #include "moe/moe_stream.h"
 #include "monitor.h"
 
+#include <assert.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -200,6 +201,18 @@ model_recipe *recipe_build(const struct model *m) {
 	model_recipe *r = (*fb)(m);
 	if (!r)
 		return NULL;
+
+	assert(m->moe.n_experts <= MOE_MAX_K);
+	if (m->moe.n_experts > MOE_MAX_K) {
+		ERROR("recipe_build: n_experts=%d exceeds supported maximum MOE_MAX_K=%d", m->moe.n_experts,
+			  MOE_MAX_K);
+		recipe_free(r);
+		return NULL;
+	}
+	if (m->moe.n_experts > 0 && m->moe.n_experts_used > MOE_MAX_TOPK)
+		ERROR("recipe_build: n_experts_used=%d exceeds supported top-k %d; execution will fail "
+			  "rather than silently truncate",
+			  m->moe.n_experts_used, MOE_MAX_TOPK);
 
 	int has_vld = m->arch_info->has_variable_layer_dims;
 
@@ -2124,6 +2137,92 @@ int moe_topk_select(const float *scores, int n_experts, int top_k, int *top_idx,
 	return top_k;
 }
 
+static int moe_grouped_topk_select(const float *scores, int E, int K, int n_group, int topk_group,
+								   int *top_idx, float *top_score) {
+	if (n_group <= 1 || topk_group <= 0 || topk_group >= n_group || n_group > E)
+		return moe_topk_select(scores, E, K, top_idx, top_score);
+
+	enum { GROUP_STACK_CAP = 256, CAND_STACK_CAP = 2048 };
+	float  group_sum_stack[GROUP_STACK_CAP];
+	float  group_kept_stack[GROUP_STACK_CAP];
+	int	   group_sel_stack[GROUP_STACK_CAP];
+	float  cand_score_stack[CAND_STACK_CAP];
+	int	   cand_eid_stack[CAND_STACK_CAP];
+	float *group_sum  = group_sum_stack;
+	float *group_kept = group_kept_stack;
+	int	  *group_sel  = group_sel_stack;
+	float *cand_score = cand_score_stack;
+	int	  *cand_eid	  = cand_eid_stack;
+	if (n_group > GROUP_STACK_CAP) {
+		group_sum  = xmalloc((size_t)n_group * sizeof(float));
+		group_kept = xmalloc((size_t)n_group * sizeof(float));
+		group_sel  = xmalloc((size_t)n_group * sizeof(int));
+	}
+	if (E > CAND_STACK_CAP) {
+		cand_score = xmalloc((size_t)E * sizeof(float));
+		cand_eid   = xmalloc((size_t)E * sizeof(int));
+	}
+
+	int epg		= E / n_group;
+	int rem		= E % n_group;
+	int g_start = 0;
+	for (int g = 0; g < n_group; g++) {
+		int	  g_end	 = g_start + epg + (g < rem ? 1 : 0);
+		float best	 = -1e30f;
+		float second = -1e30f;
+		for (int e = g_start; e < g_end; e++) {
+			if (scores[e] > best) {
+				second = best;
+				best   = scores[e];
+			} else if (scores[e] > second) {
+				second = scores[e];
+			}
+		}
+		group_sum[g] = best + second;
+		g_start		 = g_end;
+	}
+
+	int n_kept = topk_heap_select(group_sum, n_group, topk_group, group_kept, group_sel);
+
+	for (int i = 1; i < n_kept; i++) {
+		int g = group_sel[i];
+		int j = i - 1;
+		while (j >= 0 && group_sel[j] > g) {
+			group_sel[j + 1] = group_sel[j];
+			j--;
+		}
+		group_sel[j + 1] = g;
+	}
+
+	int n_cand = 0;
+	for (int i = 0; i < n_kept; i++) {
+		int g  = group_sel[i];
+		int gs = g * epg + (g < rem ? g : rem);
+		int ge = gs + epg + (g < rem ? 1 : 0);
+		for (int e = gs; e < ge; e++) {
+			cand_score[n_cand] = scores[e];
+			cand_eid[n_cand]   = e;
+			n_cand++;
+		}
+	}
+
+	int sel = moe_topk_select(cand_score, n_cand, K, top_idx, top_score);
+	for (int k = 0; k < sel; k++)
+		if (top_idx[k] >= 0)
+			top_idx[k] = cand_eid[top_idx[k]];
+
+	if (group_sum != group_sum_stack) {
+		free(group_sum);
+		free(group_kept);
+		free(group_sel);
+	}
+	if (cand_score != cand_score_stack) {
+		free(cand_score);
+		free(cand_eid);
+	}
+	return sel;
+}
+
 void moe_apply_weights(float *weight, int n_k, int norm_topk, float routed_scale) {
 	if (norm_topk) {
 		float sum = 0.0f;
@@ -2168,8 +2267,22 @@ void moe_router_normalize_input(const struct model *m, const struct layer_weight
 	}
 }
 
+static int moe_router_logits_finite(const float *logits, int n) {
+	for (int e = 0; e < n; e++)
+		if (!isfinite(logits[e]))
+			return 0;
+	return 1;
+}
+
 int moe_router_emit(int E, int K, int use_softmax, int norm_topk, float routed_scale, float *logits,
 					const float *bias, float *scores_scratch, int *ids_out, float *w_out) {
+	return moe_router_emit_ex(E, K, use_softmax, norm_topk, routed_scale, 1, 0, logits, bias,
+							  scores_scratch, ids_out, w_out);
+}
+
+int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
+					   int n_group, int topk_group, float *logits, const float *bias,
+					   float *scores_scratch, int *ids_out, float *w_out) {
 	int	  top_idx[MOE_MAX_TOPK];
 	float top_score[MOE_MAX_TOPK];
 	float weight[MOE_MAX_TOPK];
@@ -2194,7 +2307,7 @@ int moe_router_emit(int E, int K, int use_softmax, int norm_topk, float routed_s
 														 : xmalloc((size_t)E * sizeof(float));
 		for (int e = 0; e < E; e++)
 			scores[e] = (1.0f / (1.0f + expf(-logits[e]))) + (bias ? bias[e] : 0.0f);
-		K = moe_topk_select(scores, E, K, top_idx, top_score);
+		K = moe_grouped_topk_select(scores, E, K, n_group, topk_group, top_idx, top_score);
 		if (scores != scores_scratch && scores != scores_stack)
 			free(scores);
 		for (int k = 0; k < K; k++)
@@ -2256,6 +2369,13 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 		return st;
 	}
 
+	if (!moe_router_logits_finite(logits, E)) {
+		ERROR("op_moe_router_softmax: non-finite router logit (E=%d)", E);
+		if (logits != logits_fallback)
+			free(logits);
+		return ERR_FORMAT;
+	}
+
 	int	  *idx_out = (int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
 	float *w_out   = (float *)slots[RECIPE_SLOT_ROUTER_W].handle;
 	moe_router_emit(E, K, 1, norm_topk, routed_scale, logits, NULL, NULL, idx_out, w_out);
@@ -2264,8 +2384,8 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 	return OK;
 }
 
-static status_code op_moe_router_direct(backend *a, layer_weights *L, int E, int K, int dim,
-										int norm_topk, float routed_scale, buffer *inp,
+static status_code op_moe_router_direct(backend *a, const model *m, layer_weights *L, int E, int K,
+										int dim, int norm_topk, float routed_scale, buffer *inp,
 										struct compute_scratch *s, buffer *slots) {
 	float  logits_fallback[8192];
 	float *logits = logits_fallback;
@@ -2297,10 +2417,18 @@ static status_code op_moe_router_direct(backend *a, layer_weights *L, int E, int
 		return st;
 	}
 
+	if (!moe_router_logits_finite(logits, E)) {
+		ERROR("op_moe_router_direct: non-finite router logit (E=%d)", E);
+		if (logits != logits_fallback)
+			free(logits);
+		return ERR_FORMAT;
+	}
+
 	const float *bias	 = (const float *)L->router_bias.host_ptr;
 	int			*idx_out = (int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
 	float		*w_out	 = (float *)slots[RECIPE_SLOT_ROUTER_W].handle;
-	moe_router_emit(E, K, 0, norm_topk, routed_scale, logits, bias, NULL, idx_out, w_out);
+	moe_router_emit_ex(E, K, 0, norm_topk, routed_scale, m->moe.n_group, m->moe.topk_group, logits,
+					   bias, NULL, idx_out, w_out);
 	if (logits != logits_fallback)
 		free(logits);
 	return OK;
@@ -2312,6 +2440,7 @@ typedef struct {
 	int			   E, K, rows;
 	int			   uses_softmax, norm_topk;
 	float		   routed_scale;
+	int			   n_group, topk_group;
 } moe_router_emit_job;
 
 static void moe_router_emit_chunk(int begin, int end, int tid, void *v) {
@@ -2322,10 +2451,10 @@ static void moe_router_emit_chunk(int begin, int end, int tid, void *v) {
 		int			*row_ids = j->bs->moe_router_ids + (size_t)row * j->K;
 		float		*row_w	 = j->bs->moe_router_w + (size_t)row * j->K;
 		const float *bias	 = (const float *)j->L->router_bias.host_ptr;
-		int			 K_row	 = moe_router_emit(
-			j->E, j->K, j->uses_softmax, j->norm_topk, j->routed_scale, logits, bias,
-			j->bs->moe_router_logits.p + (size_t)j->rows * j->E + (size_t)row * j->E, row_ids,
-			row_w);
+		int			 K_row	 = moe_router_emit_ex(
+			j->E, j->K, j->uses_softmax, j->norm_topk, j->routed_scale, j->n_group, j->topk_group,
+			logits, bias, j->bs->moe_router_logits.p + (size_t)j->rows * j->E + (size_t)row * j->E,
+			row_ids, row_w);
 		for (int k = K_row; k < j->K; k++) {
 			row_ids[k] = -1;
 			row_w[k]   = 0.0f;
@@ -2406,6 +2535,12 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	if (st != OK)
 		return st;
 
+	if (!moe_router_logits_finite(ctx->bs->moe_router_logits.p, (size_t)ctx->n_rows * E)) {
+		ERROR("moe_router_batch: non-finite router logit (layer=%d, rows=%d, E=%d)", ctx->li,
+			  ctx->n_rows, E);
+		return ERR_FORMAT;
+	}
+
 	tpool *router_pool = (ctx->m->backend && ctx->m->backend->get_pool)
 							 ? ctx->m->backend->get_pool(ctx->m->backend)
 							 : NULL;
@@ -2417,7 +2552,9 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 										.rows		  = ctx->n_rows,
 										.uses_softmax = uses_softmax,
 										.norm_topk	  = norm_topk,
-										.routed_scale = routed_scale};
+										.routed_scale = routed_scale,
+										.n_group	  = ctx->m->moe.n_group,
+										.topk_group	  = ctx->m->moe.topk_group};
 		tpool_parallel_for(router_pool, ctx->n_rows, 1, moe_router_emit_chunk, &emit_job);
 	} else {
 		for (int row = 0; row < ctx->n_rows; row++) {
@@ -2425,10 +2562,11 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 			int			*row_ids = ctx->bs->moe_router_ids + (size_t)row * K;
 			float		*row_w	 = ctx->bs->moe_router_w + (size_t)row * K;
 			const float *bias	 = (const float *)L->router_bias.host_ptr;
-			int K_row = moe_router_emit(E, K, uses_softmax, norm_topk, routed_scale, logits, bias,
-										ctx->bs->moe_router_logits.p + (size_t)ctx->n_rows * E +
-											(size_t)row * E,
-										row_ids, row_w);
+			int			 K_row	 = moe_router_emit_ex(
+				E, K, uses_softmax, norm_topk, routed_scale, ctx->m->moe.n_group,
+				ctx->m->moe.topk_group, logits, bias,
+				ctx->bs->moe_router_logits.p + (size_t)ctx->n_rows * E + (size_t)row * E, row_ids,
+				row_w);
 			for (int k = K_row; k < K; k++) {
 				row_ids[k] = -1;
 				row_w[k]   = 0.0f;
@@ -2521,12 +2659,19 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 
 	if (ctx->bs->moe_union_slots_cap < n_union) {
 		free(ctx->bs->moe_union_slots);
-		ctx->bs->moe_union_slots	 = xmalloc((size_t)n_union * sizeof(moe_expert_slot));
+		ctx->bs->moe_union_slots	 = xcalloc((size_t)n_union, sizeof(moe_expert_slot));
 		ctx->bs->moe_union_slots_cap = n_union;
 	}
 
-	moe_stream_resolve(ctx->m, ctx->li, ctx->bs->moe_union_sorted_ids, n_union,
-					   ctx->bs->moe_union_slots);
+	status_code rst = moe_stream_resolve(ctx->m, ctx->li, ctx->bs->moe_union_sorted_ids, n_union,
+										 ctx->bs->moe_union_slots);
+	if (rst != OK) {
+		ERROR("moe_router_batch: moe_stream_resolve failed (layer=%d, union=%d, st=%d)", ctx->li,
+			  n_union, rst);
+		ctx->bs->moe_n_union		 = 0;
+		ctx->bs->moe_union_pending_n = 0;
+		return ERR_INTERNAL;
+	}
 	ctx->bs->moe_union_pending_n = n_union;
 	return OK;
 }
@@ -2633,8 +2778,12 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 
 	backend	 *a	  = exec_layer_backend(ctx);
 	const int dim = ctx->m->dim;
-	if (!model_layer_is_moe(ctx->m, ctx->li))
+	if (!model_layer_is_moe(ctx->m, ctx->li)) {
+		buffer *dst	  = batch_slot(ctx->bs, ctx->op->out);
+		float  *dst_p = batch_buf_ptr(dst);
+		memset(dst_p, 0, (size_t)ctx->n_rows * dim * sizeof(float));
 		return OK;
+	}
 
 	int K		 = ctx->m->moe.n_experts_used;
 	int I		 = ctx->m->moe.moe_intermediate;
@@ -2670,10 +2819,9 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 	float_buf_ensure(&ctx->bs->moe_out, (size_t)ctx->n_rows * dim);
 	memset(ctx->bs->moe_out.p, 0, ctx->n_rows * dim * sizeof(float));
 
+	status_code st = OK;
 	if (ctx->n_rows > 1 && a->matmul_batch && a->matmul_thread_local) {
-		status_code gst = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
-		if (gst != OK)
-			return gst;
+		st = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
 		goto finish;
 	}
 
@@ -2771,26 +2919,28 @@ finish:
 	float  *xb2_ptr = batch_buf_ptr(xb2);
 	memcpy(xb2_ptr, ctx->bs->moe_out.p, (size_t)ctx->n_rows * dim * sizeof(float));
 
-	for (int row = 0; row < ctx->n_rows; row++) {
-		for (int k = 0; k < K; k++) {
-			moe_expert_slot *es = &ctx->bs->moe_per_token_slots[(size_t)row * K + k];
-			if (es->eid < 0)
-				continue;
-			if (es->owned && es->heap_buf) {
-				free(es->heap_buf);
-				es->heap_buf = NULL;
-			} else if (!es->owned) {
-				moe_stream_release_slot(ctx->m, ctx->li, es);
-			}
-			es->eid		 = -1;
-			es->owned	 = 0;
-			es->heap_buf = NULL;
-			es->gate_w	 = NULL;
-			es->up_w	 = NULL;
-			es->down_w	 = NULL;
+	for (int i = 0; i < n_union; i++) {
+		moe_expert_slot *us = &ctx->bs->moe_union_slots[i];
+		if (us->owned && us->heap_buf) {
+			free(us->heap_buf);
+			us->heap_buf = NULL;
+			us->eid		 = -1;
 		}
 	}
-	return OK;
+	moe_stream_release_slots(ctx->m, ctx->li, ctx->bs->moe_union_slots, n_union);
+
+	for (int i = 0; i < n_union; i++)
+		ctx->bs->moe_union_slots[i].eid = -1;
+	for (int i = 0; i < ctx->n_rows * K; i++) {
+		moe_expert_slot *es = &ctx->bs->moe_per_token_slots[i];
+		es->eid				= -1;
+		es->owned			= 0;
+		es->heap_buf		= NULL;
+		es->gate_w			= NULL;
+		es->up_w			= NULL;
+		es->down_w			= NULL;
+	}
+	return st;
 }
 
 static status_code moe_shared_batch(exec_ctx *ctx) {
@@ -3227,7 +3377,7 @@ static status_code op_moe_router(exec_ctx *ctx) {
 									 slots);
 	}
 
-	return op_moe_router_direct(a, L, E, K, dim, norm_topk, routed_scale, inp, s, slots);
+	return op_moe_router_direct(a, m, L, E, K, dim, norm_topk, routed_scale, inp, s, slots);
 }
 
 static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
@@ -3284,7 +3434,7 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	int n_threads = tpool_n_threads(pool);
 	if (n_threads < 1)
 		n_threads = 1;
-	if (n_threads > K)
+	if (!(interleave && moe_op) && n_threads > K)
 		n_threads = K;
 
 	size_t per_thread_scratch = scratch_need;
@@ -3458,8 +3608,16 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	moe_expert_slot *slot_buf = s->moe_slot_buf;
-	if (K > 64)
-		K = 64;
+	if (K > MOE_MAX_TOPK) {
+		ERROR("op_moe_experts: n_experts_used=%d exceeds supported maximum %d "
+			  "(router scratch capacity); refusing silent truncation",
+			  K, MOE_MAX_TOPK);
+		if (!out_is_host) {
+			out_buf->owner->buffer_write_f32(out_buf->owner, out_buf, outf, dim);
+			free(heap_outf);
+		}
+		return ERR_FORMAT;
+	}
 
 	monitor_emit_moe_experts(g_monitor, li, -1, expert_ids, weights, K);
 
@@ -3523,14 +3681,20 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 										scratch_need, outf);
 	}
 
+cleanup:
+	profile_end(&s->prof, &compute_ps);
+
 	if (moe_op) {
-		moe_stream_op_finish(moe_op);
+		status_code fst = moe_stream_op_finish(moe_op);
+		if (fst != OK) {
+			ERROR("op_moe_experts: moe_stream_op_finish failed (layer=%d, st=%d)", li, fst);
+			if (st == OK)
+				st = ERR_INTERNAL;
+		}
 		moe_stream_op_free(moe_op);
 		moe_op = NULL;
 	}
 
-cleanup:
-	profile_end(&s->prof, &compute_ps);
 	for (int k = 0; k < K; k++) {
 		if (slot_buf[k].owned && slot_buf[k].heap_buf) {
 			free(slot_buf[k].heap_buf);

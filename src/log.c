@@ -98,6 +98,10 @@ void log_tag(const char *tag, const char *fmt, ...) {
 	va_end(ap);
 }
 
+bool log_color_enabled(void) {
+	return g_log.color;
+}
+
 static void progress_render(progress *p) {
 	FILE *out = g_log.stream ? g_log.stream : stderr;
 	if (!p->active)

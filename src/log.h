@@ -65,6 +65,7 @@ void log_msg(log_level level, const char *fmt, ...) __attribute__((format(printf
 void log_msgv(log_level level, const char *fmt, va_list ap);
 
 void log_tag(const char *tag, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+bool log_color_enabled(void);
 
 void progress_start(progress *p, const char *label, uint64_t total);
 void progress_update(progress *p, uint64_t current);

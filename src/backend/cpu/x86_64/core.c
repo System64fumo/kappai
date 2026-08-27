@@ -977,16 +977,14 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 		}
 
 		float *scores = p->scores;
-		for (int kvh = 0; kvh < n_active; kvh++) {
+		for (int h = 0; h < n_heads; h++) {
+			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 			const uint8_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
-			for (int hg = 0; hg < n_groups; hg++) {
-				int			 h	   = (kvh * n_groups) + hg;
-				const float *qh	   = qf + ((size_t)h * head_dim);
-				float		*out_h = outf + ((size_t)h * head_dim);
-				cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, qh, out_h, head_dim,
-										 n_pos, scale, flash_attn, scores);
-			}
+			const float	  *qh	   = qf + ((size_t)h * head_dim);
+			float		  *out_h   = outf + ((size_t)h * head_dim);
+			cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, qh, out_h, head_dim, n_pos,
+									 scale, flash_attn, scores);
 		}
 		return OK;
 	}
@@ -1022,17 +1020,15 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 	}
 
 	float *scores = p->scores;
-	for (int kvh = 0; kvh < n_active; kvh++) {
+	for (int h = 0; h < n_heads; h++) {
+		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 		uint16_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
 
-		for (int hg = 0; hg < n_groups; hg++) {
-			int			 h	   = (kvh * n_groups) + hg;
-			const float *qh	   = qf + ((size_t)h * head_dim);
-			float		*out_h = outf + ((size_t)h * head_dim);
-			cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
-								flash_attn, scores);
-		}
+		const float *qh	   = qf + ((size_t)h * head_dim);
+		float		*out_h = outf + ((size_t)h * head_dim);
+		cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
+							flash_attn, scores);
 	}
 	return OK;
 }

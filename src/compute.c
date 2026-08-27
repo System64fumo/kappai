@@ -289,6 +289,13 @@ static void compute_layout_init(const model *m, compute_layout *L) {
 		if (layer_max > L->max_intermediate)
 			L->max_intermediate = layer_max;
 	}
+	if (m->moe.n_experts > 0 || m->moe.moe_intermediate > 0) {
+		if (m->moe.moe_intermediate > L->max_intermediate)
+			L->max_intermediate = m->moe.moe_intermediate;
+		int sh_inter = m->moe.moe_intermediate * m->moe.n_shared_experts;
+		if (sh_inter > L->max_intermediate)
+			L->max_intermediate = sh_inter;
+	}
 	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
 }
 
