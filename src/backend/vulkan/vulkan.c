@@ -3899,7 +3899,7 @@ static status_code vk_attention_host_fallback(
 		size_t layer_off_elems, size_t layer_n_elems, int n_heads,
 		int n_kv_heads, int n_active, int head_dim, int n_ctx,
 		float scale, int attn_start, int n_pos) {
-	int n_groups = n_heads / n_active;
+	int n_groups = (n_heads + n_active - 1) / n_active;
 	int q_total = n_heads * head_dim;
 	float *qf = xmalloc((size_t)q_total * sizeof(float));
 	float *outf = xmalloc((size_t)q_total * sizeof(float));
@@ -3932,22 +3932,26 @@ static status_code vk_attention_host_fallback(
 	float *k_slice = xmalloc((size_t)n_pos * head_dim * sizeof(float));
 	float *v_slice = xmalloc((size_t)n_pos * head_dim * sizeof(float));
 	float *scores = xmalloc((size_t)n_pos * sizeof(float));
+	int cur_kvh = -1;
 
-	for (int kvh = 0; kvh < n_active; kvh++) {
-		for (int t = 0; t < n_pos; t++) {
-			size_t kv_off = ((size_t)kvh * kvh_stride) +
-											((size_t)(attn_start + t) * head_dim);
-			uint16_t *kd = kd_base_buf + kv_off;
-			uint16_t *vd = vd_base_buf + kv_off;
-			float *ks = k_slice + ((size_t)t * head_dim);
-			float *vs = v_slice + ((size_t)t * head_dim);
-			for (int d = 0; d < head_dim; d++) {
-				ks[d] = f16_to_f32(kd[d]);
-				vs[d] = f16_to_f32(vd[d]);
+	for (int h = 0; h < n_heads; h++) {
+		int kvh = h / n_groups;
+		if (kvh != cur_kvh) {
+			cur_kvh = kvh;
+			for (int t = 0; t < n_pos; t++) {
+				size_t kv_off = ((size_t)kvh * kvh_stride) +
+												((size_t)(attn_start + t) * head_dim);
+				uint16_t *kd = kd_base_buf + kv_off;
+				uint16_t *vd = vd_base_buf + kv_off;
+				float *ks = k_slice + ((size_t)t * head_dim);
+				float *vs = v_slice + ((size_t)t * head_dim);
+				for (int d = 0; d < head_dim; d++) {
+					ks[d] = f16_to_f32(kd[d]);
+					vs[d] = f16_to_f32(vd[d]);
+				}
 			}
 		}
-		for (int hg = 0; hg < n_groups; hg++) {
-			int h = (kvh * n_groups) + hg;
+		{
 			float *qh = qf + ((size_t)h * head_dim);
 			float *out_h = outf + ((size_t)h * head_dim);
 			for (int t = 0; t < n_pos; t++) {
@@ -4056,8 +4060,7 @@ vk_attention_impl(backend *self, const buffer *q, const buffer *k_cache,
 
 	int n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
-	int can_flash = flash_attn && vk_ensure_flash_pipeline(p, head_dim, n_groups,
-																												 &flash_ps) == OK;
+	int can_flash = flash_attn && vk_ensure_flash_pipeline(p, head_dim, n_groups, &flash_ps) == OK;
 
 	size_t layer_off = vk_kv_layer_off_elems(kh, layer);
 

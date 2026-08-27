@@ -5,6 +5,7 @@
 #include "context.h"
 
 #define ENGINE_EXIT 1
+#define ENGINE_EXIT_CONTEXT_FULL 2
 
 status_code engine_init(context *ctx, cli_args *a, int argc, char **argv);
 int			engine_run(context *ctx, cli_args *a);

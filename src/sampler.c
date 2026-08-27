@@ -54,6 +54,7 @@ void sampler_init(sampler *s, uint64_t seed) {
 	rng_seed(&s->rng, seed);
 	s->temperature	   = 1.0f;
 	s->top_p		   = 1.0f;
+	s->repeat_penalty  = 1.0f;
 	s->recent_capacity = 256;
 	s->recent		   = xmalloc(s->recent_capacity * sizeof(int32_t));
 }
@@ -166,6 +167,8 @@ static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_
 	return kept;
 }
 
+#define SAMPLER_TOP_FILTER_CAP 1024
+
 static void apply_repeat_penalty(sampler *s, float *mut, int vocab) {
 	int n = MIN(s->repeat_last_n, s->recent_count);
 	for (int i = s->recent_count - n; i < s->recent_count; i++) {
@@ -188,12 +191,33 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 	} else {
 		int cap;
 		if (s->top_p < 1.0f || s->min_p > 0.0f)
-			cap = vocab < 1024 ? vocab : 1024;
+			cap = MIN(vocab, SAMPLER_TOP_FILTER_CAP);
 		else
 			cap = vocab;
 		kept = top_all_desc(s, logits, vocab, arr, cap);
 	}
 	return kept;
+}
+
+static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
+	float inv_temp = 1.0f / s->temperature;
+	float mx	   = logits[0] * inv_temp;
+	for (int i = 1; i < vocab; i++)
+		if (logits[i] * inv_temp > mx)
+			mx = logits[i] * inv_temp;
+
+	double sum = 0.0;
+	for (int i = 0; i < vocab; i++)
+		sum += expf(logits[i] * inv_temp - mx);
+
+	double rnd = (double)rng_uniform(&s->rng) * sum;
+	double acc = 0.0;
+	for (int i = 0; i < vocab; i++) {
+		acc += expf(logits[i] * inv_temp - mx);
+		if (rnd < acc)
+			return (int32_t)i;
+	}
+	return (int32_t)(vocab - 1);
 }
 
 static void apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float temperature) {
@@ -257,6 +281,9 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 
 	if (s->temperature <= 0.0f || s->top_k == 1)
 		return sampler_argmax(logits, vocab);
+
+	if ((s->top_k <= 0 || s->top_k >= vocab) && s->top_p >= 1.0f && s->min_p <= 0.0f)
+		return sample_full_vocab(s, logits, vocab);
 
 	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
 	grow_buf(&s->cand_buf, &s->cand_vocab, need_cands, sizeof(sampler_top_k_entry));

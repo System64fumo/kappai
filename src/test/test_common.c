@@ -7,10 +7,9 @@ static int	   g_use_color = 1;
 
 const char *verdict_str(verdict v) {
 	static const char *names[] = {
-		[V_PASS]  = "PASS",
-		[V_LOSSY] = "LOSSY",
-		[V_FAIL]  = "FAIL",
-		[V_SKIP]  = "SKIP",
+		[V_PASS] = "PASS",
+		[V_FAIL] = "FAIL",
+		[V_SKIP] = "SKIP",
 	};
 	if (v >= V_COUNT)
 		return "?";
@@ -25,10 +24,9 @@ const char *verdict_color(verdict v) {
 	if (!g_use_color)
 		return "";
 	static const char *colors[] = {
-		[V_PASS]  = "\033[32m",
-		[V_LOSSY] = "\033[33m",
-		[V_FAIL]  = "\033[31m",
-		[V_SKIP]  = "\033[90m",
+		[V_PASS] = "\033[32m",
+		[V_FAIL] = "\033[31m",
+		[V_SKIP] = "\033[90m",
 	};
 	if (v >= V_COUNT)
 		return "";
@@ -77,6 +75,11 @@ const char *op_family_name(op_family f) {
 		[OPFAM_KV_QUANT_PARITY]	 = "kv_quant_parity",
 		[OPFAM_RMSNORM_ADD]		 = "rmsnorm_add",
 		[OPFAM_PLE_COMBINE]		 = "ple_combine",
+		[OPFAM_SAMPLER]			 = "sampler",
+		[OPFAM_TOKENIZER]		 = "tokenizer",
+		[OPFAM_HYBRID_STATE]	 = "hybrid_state",
+		[OPFAM_ORCHESTRATION]	 = "orchestration",
+		[OPFAM_MOE_STREAM]		 = "moe_stream",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";
@@ -86,15 +89,15 @@ const char *op_family_name(op_family f) {
 static result_entry g_results[OPFAM_COUNT][MAX_RESULTS_PER_FAMILY];
 static int			g_results_count[OPFAM_COUNT];
 
-int g_pass = 0, g_lossy = 0, g_fail = 0, g_skip = 0;
+int g_pass = 0, g_fail = 0, g_skip = 0;
 
 static char g_debug_buf[512];
 
 void stats_reset(void) {
 	memset(g_stats, 0, sizeof(g_stats));
 	memset(g_results_count, 0, sizeof(g_results_count));
-	g_pass = g_lossy = g_fail = g_skip = 0;
-	g_debug_buf[0]					   = '\0';
+	g_pass = g_fail = g_skip = 0;
+	g_debug_buf[0]			 = '\0';
 }
 
 void compute_debug(const float *y_ref, const float *y_got, int n) {
@@ -263,9 +266,6 @@ void record_result(op_family fam, const char *label, verdict v, const char *deta
 	case V_PASS:
 		g_pass++;
 		break;
-	case V_LOSSY:
-		g_lossy++;
-		break;
 	case V_FAIL:
 		g_fail++;
 		break;
@@ -282,10 +282,9 @@ void flush_family(op_family fam) {
 	if (n == 0)
 		return;
 
-	int pass  = g_stats[fam].cnt[V_PASS];
-	int lossy = g_stats[fam].cnt[V_LOSSY];
-	int fail  = g_stats[fam].cnt[V_FAIL];
-	int skip  = g_stats[fam].cnt[V_SKIP];
+	int pass = g_stats[fam].cnt[V_PASS];
+	int fail = g_stats[fam].cnt[V_FAIL];
+	int skip = g_stats[fam].cnt[V_SKIP];
 
 	printf("\n%s:\n", op_family_name(fam));
 
@@ -311,12 +310,10 @@ void flush_family(op_family fam) {
 		}
 	}
 	printf("  %s-- %d tests:%s ", color_bold(), n, color_reset());
-	if (fail == 0 && lossy == 0 && skip == 0) {
+	if (fail == 0 && skip == 0) {
 		printf("%sall PASS%s", verdict_color(V_PASS), color_reset());
 	} else {
 		printf("%s%d PASS%s", verdict_color(V_PASS), pass, color_reset());
-		if (lossy)
-			printf(", %s%d LOSSY%s", verdict_color(V_LOSSY), lossy, color_reset());
 		if (fail)
 			printf(", %s%d FAIL%s", verdict_color(V_FAIL), fail, color_reset());
 		if (skip)
@@ -451,9 +448,9 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 		}
 		snprintf(detail, detail_sz,
 				 "max_abs=%.3e@%d ref=%+.6f got=%+.6f tol_ratio=%.3f "
-				 "(exceeds quantized-cache lossy band, unexpectedly lossy)",
+				 "(exceeds quantized-cache tolerance)",
 				 abs_err, at, at >= 0 ? y_ref[at] : 0.0f, at >= 0 ? y_got[at] : 0.0f, ratio);
-		return V_LOSSY;
+		return V_FAIL;
 	}
 
 	float exact_atol;
@@ -475,9 +472,9 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 	if (ratio <= 1.0f) {
 		snprintf(detail, detail_sz,
 				 "max_abs=%.3e@%d ref=%+.6f got=%+.6f tol_ratio=%.3f "
-				 "(within loose band, acceptable hw loss)",
+				 "(within tolerance)",
 				 abs_err, at, at >= 0 ? y_ref[at] : 0.0f, at >= 0 ? y_got[at] : 0.0f, ratio);
-		return V_LOSSY;
+		return V_PASS;
 	}
 
 	snprintf(detail, detail_sz,
@@ -513,6 +510,11 @@ void fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t
 	for (int i = 0; i < n_blocks; i++) {
 		for (size_t j = 0; j < block_bytes; j++)
 			bp[j] = (uint8_t)(next_u32() & 0xFF);
+
+		if (type == GGML_TYPE_Q8_0)
+			for (size_t j = 2; j < block_bytes; j++)
+				if ((int8_t)bp[j] == (int8_t)0x80)
+					bp[j] = (uint8_t)0x81;
 
 		float	 d_val = 0.0005f + (0.02f * ((next_u32() % 997) / 997.0f));
 		uint16_t d16   = f32_to_f16(d_val);
@@ -686,13 +688,11 @@ const int QTYPES_N = (int)(sizeof(QTYPES) / sizeof(QTYPES[0]));
 #define QTYPES_N ((int)(sizeof(QTYPES) / sizeof(QTYPES[0])))
 
 void print_summary_table(void) {
-	int total_pass	= 0;
-	int total_lossy = 0;
-	int total_fail	= 0;
-	int total_skip	= 0;
+	int total_pass = 0;
+	int total_fail = 0;
+	int total_skip = 0;
 	for (int i = 0; i < OPFAM_COUNT; i++) {
 		total_pass += g_stats[i].cnt[V_PASS];
-		total_lossy += g_stats[i].cnt[V_LOSSY];
 		total_fail += g_stats[i].cnt[V_FAIL];
 		total_skip += g_stats[i].cnt[V_SKIP];
 	}
@@ -700,13 +700,12 @@ void print_summary_table(void) {
 	printf("\n========================================\n");
 	printf("%sPer-op summary%s\n", color_bold(), color_reset());
 	printf("========================================\n");
-	printf("  %-20s  %4s %5s %4s %4s  %6s\n", "op", "pass", "lossy", "fail", "skip", "rate");
-	printf("  %-20s  %4s %5s %4s %4s  %6s\n", "----", "----", "-----", "----", "----", "----");
+	printf("  %-20s  %4s %4s %4s  %6s\n", "op", "pass", "fail", "skip", "rate");
+	printf("  %-20s  %4s %4s %4s  %6s\n", "----", "----", "----", "----", "----");
 	for (int i = 0; i < OPFAM_COUNT; i++) {
 		if (g_stats[i].calls == 0)
 			continue;
 		int	   pass	 = g_stats[i].cnt[V_PASS];
-		int	   lossy = g_stats[i].cnt[V_LOSSY];
 		int	   fail	 = g_stats[i].cnt[V_FAIL];
 		int	   skip	 = g_stats[i].cnt[V_SKIP];
 		int	   total = g_stats[i].calls;
@@ -715,26 +714,22 @@ void print_summary_table(void) {
 		const char *op_color;
 		if (fail > 0)
 			op_color = verdict_color(V_FAIL);
-		else if (lossy > 0)
-			op_color = verdict_color(V_LOSSY);
 		else if (skip > 0)
 			op_color = verdict_color(V_SKIP);
 		else
 			op_color = verdict_color(V_PASS);
 
-		printf("  %s%-20s%s  %s%4d%s %s%5d%s %s%4d%s %s%4d%s  %5.1f%%\n", op_color,
+		printf("  %s%-20s%s  %s%4d%s %s%4d%s %s%4d%s  %5.1f%%\n", op_color,
 			   op_family_name((op_family)i), color_reset(), pass ? verdict_color(V_PASS) : "", pass,
-			   color_reset(), lossy ? verdict_color(V_LOSSY) : "", lossy, color_reset(),
-			   fail ? verdict_color(V_FAIL) : "", fail, color_reset(),
+			   color_reset(), fail ? verdict_color(V_FAIL) : "", fail, color_reset(),
 			   skip ? verdict_color(V_SKIP) : "", skip, color_reset(), rate);
 	}
 
-	int	   total_tests = total_pass + total_lossy + total_fail + total_skip;
+	int	   total_tests = total_pass + total_fail + total_skip;
 	double total_rate  = total_tests > 0 ? 100.0 * total_pass / total_tests : 0.0;
-	printf("  %-20s  %s%4d%s %s%5d%s %s%4d%s %s%4d%s  %5.1f%%\n", "TOTAL", verdict_color(V_PASS),
-		   total_pass, color_reset(), verdict_color(V_LOSSY), total_lossy, color_reset(),
-		   verdict_color(V_FAIL), total_fail, color_reset(), verdict_color(V_SKIP), total_skip,
-		   color_reset(), total_rate);
+	printf("  %-20s  %s%4d%s %s%4d%s %s%4d%s  %5.1f%%\n", "TOTAL", verdict_color(V_PASS),
+		   total_pass, color_reset(), verdict_color(V_FAIL), total_fail, color_reset(),
+		   verdict_color(V_SKIP), total_skip, color_reset(), total_rate);
 }
 
 void print_final_results(void) {

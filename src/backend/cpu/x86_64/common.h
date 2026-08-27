@@ -106,6 +106,12 @@ static inline __m256i dotprod_s8_s8_i32(__m256i a, __m256i b) {
 	return _mm256_madd_epi16(_mm256_maddubs_epi16(a_abs, b_signed), _mm256_set1_epi16(1));
 }
 
+static inline __m256i dotprod_s8_s8_i32_noclamp(__m256i a, __m256i b) {
+	const __m256i a_abs	   = _mm256_abs_epi8(a);
+	const __m256i b_signed = _mm256_sign_epi8(b, a);
+	return _mm256_madd_epi16(_mm256_maddubs_epi16(a_abs, b_signed), _mm256_set1_epi16(1));
+}
+
 static inline void vld16_s8_to_ps(const int8_t *p, __m256 *o0, __m256 *o1) {
 	__m128i v = _mm_loadu_si128((const __m128i *)(p));
 	*o0		  = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));

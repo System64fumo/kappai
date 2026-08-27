@@ -1633,7 +1633,7 @@ static void test_op_kv_quant_parity(backend *b, int n_kv_heads, int head_dim, in
 
 	char	detail[256];
 	verdict v = classify_output("kv_quant", y_ref, y_got, n, s_got, detail, sizeof(detail));
-	if (v != V_PASS && v != V_LOSSY && v != V_SKIP)
+	if (v != V_PASS && v != V_SKIP)
 		compute_debug(y_ref, y_got, n);
 	int dl = (int)strlen(detail);
 	snprintf(detail + dl, sizeof(detail) - dl,
@@ -1806,9 +1806,9 @@ static void test_op_kv_packed_layers(backend *b) {
 		}
 	}
 	snprintf(worst_d, sizeof(worst_d), "worst layer=%d rel=%.3e", worst, worst_reld2);
-	verdict v = worst_reld2 < 6e-3f ? V_PASS : (worst_reld2 < 3e-2f ? V_LOSSY : V_FAIL);
+	verdict v = worst_reld2 < 3e-2f ? V_PASS : V_FAIL;
 	record_result(OPFAM_KV_QUANT_PARITY, label, v, worst_d);
-	if (v != V_PASS && v != V_LOSSY)
+	if (v != V_PASS)
 		compute_debug(out, out, 1);
 
 	free(out);

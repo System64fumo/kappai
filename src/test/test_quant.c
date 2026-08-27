@@ -139,17 +139,16 @@ void test_quant_q8_0_roundtrip(void) {
 		if (d > max_step)
 			max_step = d;
 	}
-	float theory_max_err = max_step * 0.5f;
+	float half_step_err		  = max_step * 0.5f;
+	float f16_scale_err		  = max_step * 127.0f / 2048.0f;
+	float roundtrip_err_limit = half_step_err + f16_scale_err;
 
 	snprintf(label, sizeof(label), "q8_0 round-trip (float->q8->float)");
-	snprintf(detail, sizeof(detail), "max_abs=%.4e@%d src=%+.6f dst=%+.6f theory_max=%.4e", max_abs,
-			 at, at >= 0 ? src[at] : 0, at >= 0 ? dst[at] : 0, theory_max_err);
+	snprintf(detail, sizeof(detail), "max_abs=%.4e@%d src=%+.6f dst=%+.6f limit=%.4e", max_abs, at,
+			 at >= 0 ? src[at] : 0, at >= 0 ? dst[at] : 0, roundtrip_err_limit);
 
-	if (max_abs <= theory_max_err + 1e-6f) {
+	if (max_abs <= roundtrip_err_limit) {
 		record_result(OPFAM_QUANT, label, V_PASS, detail);
-	} else if (max_abs <= theory_max_err * 2.0f) {
-		compute_debug(src, dst, n);
-		record_result(OPFAM_QUANT, label, V_LOSSY, detail);
 	} else {
 		compute_debug(src, dst, n);
 		record_result(OPFAM_QUANT, label, V_FAIL, detail);

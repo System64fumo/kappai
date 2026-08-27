@@ -266,6 +266,10 @@ typedef struct {
 
 float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
 
+int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
+					   int n_group, int topk_group, float *logits, const float *bias,
+					   float *scores_scratch, int *ids_out, float *w_out);
+
 static inline int recipe_exec_is_batch(const exec_ctx *ctx) {
 	return ctx && ctx->bs != NULL;
 }

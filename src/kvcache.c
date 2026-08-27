@@ -352,8 +352,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 								  &k_host_buf, &v_host_buf, kvh_stride, hd, c->n_ctx, kvh_active);
 	}
 
-	if (k_in_owner != c->backend && c->backend->synchronize)
-		c->backend->synchronize(c->backend);
+	if (kv_backend != c->backend && kv_backend->synchronize)
+		kv_backend->synchronize(kv_backend);
 	int put_layer  = (layer_on_host || slot_needs_host) ? kvcache_mirror_layer(c, layer) : layer;
 	status_code st = kv_backend->kv_put(kv_backend, kb, vb, put_layer, pos, k_in, v_in, kvh_stride,
 										hd, c->n_ctx, kvh_active);

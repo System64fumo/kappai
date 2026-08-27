@@ -28,7 +28,8 @@ typedef struct {
 	bool				  debug_forward;
 	volatile sig_atomic_t interrupt;
 	bool				  context_limit_hit;
-	bool				  show_template;
+	bool				  session_poisoned;
+	bool				  debug_prompt;
 	bool				  quiet_progress;
 	int					  last_prompt_tokens;
 	backend				 *backend;
@@ -48,6 +49,12 @@ typedef struct {
 		int32_t *p;
 		int		 cap;
 	} idle_ids_buf;
+
+	struct {
+		int32_t *p;
+		int		 cap;
+		int32_t	 n;
+	} fed_ids;
 } context;
 
 typedef struct {
@@ -61,9 +68,11 @@ typedef struct {
 	int	  top_k;
 	float top_p;
 	float min_p;
+	float repeat_penalty;
+	int	  repeat_last_n;
 } sampler_params;
 
-void context_set_show_template(context *c, bool enabled);
+void context_set_debug_prompt(context *c, bool enabled);
 
 status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);

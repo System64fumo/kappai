@@ -168,6 +168,32 @@ static int require_layer_dims_2d(const gguf_ctx *g, char *tname, size_t tname_sz
 	return require_dims_2d(g, tname, d0, d1);
 }
 
+static int require_tensor_f32_if_present(const gguf_ctx *g, const char *name) {
+	const gguf_tensor *t = gguf_find_tensor(g, name);
+	if (!t || t->type == GGML_TYPE_F32)
+		return 0;
+	ERROR("model: tensor '%s' must be %s but the file stores %s", name,
+		  ggml_type_name(GGML_TYPE_F32), ggml_type_name(t->type));
+	return -1;
+}
+
+static int check_expert_tensor_dims(const gguf_ctx *g, const char *name, uint64_t d0,
+									uint64_t d1_rows, int n_experts) {
+	const gguf_tensor *t = gguf_find_tensor(g, name);
+	if (!t)
+		return 0;
+	if (t->n_dims < 3 || t->dims[0] != d0 || t->dims[1] != d1_rows ||
+		t->dims[t->n_dims - 1] != (uint64_t)n_experts) {
+		ERROR("model: %s has wrong shape (expected [%llu, %llu, %d] expert-blocked, got "
+			  "%u-D [%llu, %llu, ...])",
+			  name, (unsigned long long)d0, (unsigned long long)d1_rows, n_experts, t->n_dims,
+			  (unsigned long long)t->dims[0],
+			  t->n_dims > 1 ? (unsigned long long)t->dims[1] : 0ULL);
+		return -1;
+	}
+	return 0;
+}
+
 static int validate_swa_support(const model *m) {
 	if (m->sliding_window <= 0)
 		return 0;
@@ -202,6 +228,12 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 		ERROR("model: missing or wrong-shape output norm tensor");
 		return -1;
 	}
+	if (require_tensor_f32_if_present(g, "output_norm.weight") ||
+		require_tensor_f32_if_present(g, "token_embd_norm.weight"))
+		return -1;
+	if (m->has_per_layer_embeddings &&
+		require_tensor_f32_if_present(g, "per_layer_proj_norm.weight"))
+		return -1;
 	if (!m->tie_embeddings) {
 		if (require_dims_2d(g, "output.weight", m->dim, m->vocab_size))
 			return -1;
@@ -232,7 +264,8 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 		int is_mla_layer = m->arch_info->is_mla;
 		int is_moe_layer = model_layer_is_moe(m, i);
 
-		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_norm.weight", i, m->dim))
+		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_norm.weight", i, m->dim) ||
+			require_tensor_f32_if_present(g, tname))
 			return -1;
 		if (model_layer_is_recurrent(m, i)) {
 			const model_hybrid_params *q = &m->hybrid;
@@ -245,6 +278,9 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 										  m->dim) ||
 					require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.shortconv.conv.weight",
 										  i, q->conv_kernel, m->dim))
+					return -1;
+				snprintf(tname, sizeof(tname), "blk.%d.shortconv.conv.weight", i);
+				if (require_tensor_f32_if_present(g, tname))
 					return -1;
 			} else if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_qkv.weight", i,
 											 m->dim, q->conv_dim) ||
@@ -264,6 +300,33 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 											 q->value_head_dim) ||
 					   require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ssm_out.weight", i,
 											 q->value_dim, m->dim))
+				return -1;
+			snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d.weight", i);
+			if (require_tensor_f32_if_present(g, tname))
+				return -1;
+			snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", i);
+			if (require_tensor_f32_if_present(g, tname))
+				return -1;
+			snprintf(tname, sizeof(tname), "blk.%d.ssm_a", i);
+			if (require_tensor_f32_if_present(g, tname))
+				return -1;
+			{
+				const gguf_tensor *ta = gguf_find_tensor(g, tname);
+				if (ta && ta->data && ta->type == GGML_TYPE_F32) {
+					const float *av = (const float *)ta->data;
+					for (uint32_t h = 0; h < (uint32_t)q->n_value_heads && h < ta->dims[0]; h++) {
+						if (av[h] > 0.0f) {
+							ERROR("model: %s[%u]=%g > 0 violates the GDN convention "
+								  "ssm_a = -exp(A_log) <= 0; the file appears to store "
+								  "raw A_log values, which this engine does not accept",
+								  tname, h, (double)av[h]);
+							return -1;
+						}
+					}
+				}
+			}
+			snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", i);
+			if (require_tensor_f32_if_present(g, tname))
 				return -1;
 		} else if (is_mla_layer) {
 			int q_lora	  = m->mla.q_lora;
@@ -290,6 +353,14 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 					return -1;
 				}
 			}
+			if (require_tensor_f32_if_present(g, tname))
+				return -1;
+			{
+				char qan[128];
+				snprintf(qan, sizeof(qan), "blk.%d.attn_q_a_norm.weight", i);
+				if (require_tensor_f32_if_present(g, qan))
+					return -1;
+			}
 			int wo_in = m->n_heads * m->mla.v_head;
 			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.attn_output.weight", i,
 									  wo_in, m->dim))
@@ -311,9 +382,12 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 									  q_out, m->dim))
 				return -1;
 		}
-		if (!m->arch_info->uses_post_attn_norm_for_ffn)
+		if (!m->arch_info->uses_post_attn_norm_for_ffn) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.ffn_norm.weight", i, m->dim))
 				return -1;
+			if (require_tensor_f32_if_present(g, tname))
+				return -1;
+		}
 		if (is_moe_layer) {
 			if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ffn_gate_inp.weight", i,
 									  m->dim, m->moe.n_experts))
@@ -333,30 +407,58 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 			{
 				char vname[160];
 				snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_up_exps.weight", i);
-				const gguf_tensor *et = gguf_find_tensor(g, vname);
-				if (et) {
-					if (et->n_dims < 2 || et->dims[0] != (uint64_t)m->dim) {
-						ERROR("model: %s has wrong shape", vname);
+				if (gguf_find_tensor(g, vname)) {
+					if (check_expert_tensor_dims(g, vname, m->dim,
+												 (uint64_t)2 * m->moe.moe_intermediate,
+												 m->moe.n_experts))
 						return -1;
-					}
 				} else {
 					snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_exps.weight", i);
-					et = gguf_find_tensor(g, vname);
-					if (et) {
-						if (et->n_dims < 2 || et->dims[0] != (uint64_t)m->dim) {
-							ERROR("model: %s has wrong shape", vname);
-							return -1;
-						}
-					}
+					if (gguf_find_tensor(g, vname) &&
+						check_expert_tensor_dims(
+							g, vname, m->dim, (uint64_t)m->moe.moe_intermediate, m->moe.n_experts))
+						return -1;
+					snprintf(vname, sizeof(vname), "blk.%d.ffn_up_exps.weight", i);
+					if (gguf_find_tensor(g, vname) &&
+						check_expert_tensor_dims(
+							g, vname, m->dim, (uint64_t)m->moe.moe_intermediate, m->moe.n_experts))
+						return -1;
 				}
 				snprintf(vname, sizeof(vname), "blk.%d.ffn_down_exps.weight", i);
-				et = gguf_find_tensor(g, vname);
-				if (et) {
-					if (et->n_dims < 2 || et->dims[0] != (uint64_t)m->moe.moe_intermediate) {
-						ERROR("model: %s has wrong shape", vname);
-						return -1;
-					}
-				}
+				if (gguf_find_tensor(g, vname) &&
+					check_expert_tensor_dims(g, vname, m->moe.moe_intermediate, m->dim,
+											 m->moe.n_experts))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.exp_probs_b.bias", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.exp_probs_bias.bias", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_inp.bias", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_inp.scale", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.pre_ffw_norm_2.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.ffn_pre_norm_2.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.post_ffw_norm_1.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.ffn_post_norm_1.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.post_ffw_norm_2.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
+				snprintf(vname, sizeof(vname), "blk.%d.ffn_post_norm_2.weight", i);
+				if (require_tensor_f32_if_present(g, vname))
+					return -1;
 			}
 			if (m->arch_info->uses_moe_shared_dense_ffn) {
 				if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ffn_gate.weight", i,
@@ -383,26 +485,32 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 
 		if (m->arch_info->has_attn_post_norm) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.post_attention_norm.weight",
-									  i, m->dim))
+									  i, m->dim) ||
+				require_tensor_f32_if_present(g, tname))
 				return -1;
 		}
 		if (m->arch_info->has_ffn_post_norm) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.post_ffw_norm.weight", i,
-									  m->dim))
+									  m->dim) ||
+				require_tensor_f32_if_present(g, tname))
 				return -1;
 		}
 		if (m->arch_info->has_qk_norm && !model_layer_is_recurrent(m, i)) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_q_norm.weight", i,
-									  head_dim))
+									  head_dim) ||
+				require_tensor_f32_if_present(g, tname))
 				return -1;
-			if (model_layer_has_kv(m, i))
+			if (model_layer_has_kv(m, i)) {
 				if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_k_norm.weight", i,
-										  head_dim))
+										  head_dim) ||
+					require_tensor_f32_if_present(g, tname))
 					return -1;
+			}
 		}
 		if (m->has_per_layer_embeddings && m->arch_info->has_post_norm_ple) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.post_norm.weight", i,
-									  m->dim))
+									  m->dim) ||
+				require_tensor_f32_if_present(g, tname))
 				return -1;
 		}
 		if (m->has_per_layer_embeddings) {
@@ -415,7 +523,8 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 		}
 		if (m->arch_info->has_layer_output_scale) {
 			if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.layer_output_scale.weight",
-									  i, 1))
+									  i, 1) ||
+				require_tensor_f32_if_present(g, tname))
 				return -1;
 		}
 	}
@@ -702,24 +811,30 @@ static status_code upload_one_repack(model *m, weight_ref *ref, int ndims, uint6
 	return upload_tensor_repack(m, ref->host_ptr, &ref->type, ndims, d0, d1, wc, &ref->buf);
 }
 
-static void upload_embeddings(model *m) {
+static status_code upload_embeddings(model *m) {
 	status_code s;
 
 	s = upload_one(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING);
-	if (s != OK)
-		return;
+	if (s != OK) {
+		ERROR("model_upload: token_embd upload failed (%d)", s);
+		return s;
+	}
 	if (!m->tie_embeddings && m->gctx.map && !m->gctx.map_is_heap) {
 		size_t embd_bytes = ggml_row_size(m->tok_embd.type, (size_t)m->dim) * (size_t)m->vocab_size;
 		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
 							   MADV_RANDOM);
 	}
 	s = upload_one(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
-	if (s != OK)
-		return;
+	if (s != OK) {
+		ERROR("model_upload: output_norm upload failed (%d)", s);
+		return s;
+	}
 
 	s = upload_one_repack(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL);
-	if (s != OK)
-		return;
+	if (s != OK) {
+		ERROR("model_upload: output head upload failed (%d)", s);
+		return s;
+	}
 
 	if (m->has_per_layer_embeddings) {
 		if (m->backend && strcmp(m->backend->name, "cpu") == 0) {
@@ -727,8 +842,10 @@ static void upload_embeddings(model *m) {
 						   m->layer_dims.per_layer_tok_embd.type, 2,
 						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
 						   WCLASS_EMBEDDING);
-			if (s != OK)
-				return;
+			if (s != OK) {
+				ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
+				return s;
+			}
 		} else {
 			m->layer_dims.per_layer_tok_embd.buf.handle = NULL;
 			m->layer_dims.per_layer_tok_embd.buf.host_ptr =
@@ -747,26 +864,35 @@ static void upload_embeddings(model *m) {
 			m->layer_dims.per_layer_model_proj.host_ptr = f32_buf;
 			s = upload_one(m, &m->layer_dims.per_layer_model_proj, GGML_TYPE_F32, 2, m->dim,
 						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, WCLASS_MATMUL);
-			if (s != OK)
-				return;
+			if (s != OK) {
+				ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
+				return s;
+			}
 		} else {
 			s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
 								  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
 								  WCLASS_MATMUL);
-			if (s != OK)
-				return;
+			if (s != OK) {
+				ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
+				return s;
+			}
 		}
 		s = upload_one(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
 					   m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM);
-		if (s != OK)
-			return;
+		if (s != OK) {
+			ERROR("model_upload: per_layer_proj_norm upload failed (%d)", s);
+			return s;
+		}
 	}
 	if (m->rope_freqs_count > 0) {
 		m->rope_freqs_w.host_ptr = m->rope_freqs;
 		s = upload_one(m, &m->rope_freqs_w, GGML_TYPE_F32, 1, m->rope_freqs_count, 0, WCLASS_MISC);
-		if (s != OK)
-			return;
+		if (s != OK) {
+			ERROR("model_upload: rope_freqs upload failed (%d)", s);
+			return s;
+		}
 	}
+	return OK;
 }
 
 static status_code upload_layer_weights(model *m, int i, progress *prog) {
@@ -948,12 +1074,17 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 	L->gate_up_fused	  = 0;
 	L->gate_up_fused_host = NULL;
+	L->shexp_fused		  = 0;
+	L->shexp_fused_host	  = NULL;
 	L->qkv_fused		  = 0;
 	L->qkv_fused_host	  = NULL;
 	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 	memset(&L->gate_w.buf, 0, sizeof(L->gate_w.buf));
 	memset(&L->up_w.buf, 0, sizeof(L->up_w.buf));
 	memset(&L->down_w.buf, 0, sizeof(L->down_w.buf));
+	memset(&L->shexp_gate_w.buf, 0, sizeof(L->shexp_gate_w.buf));
+	memset(&L->shexp_up_w.buf, 0, sizeof(L->shexp_up_w.buf));
+	memset(&L->shexp_down_w.buf, 0, sizeof(L->shexp_down_w.buf));
 
 	if (is_moe_layer) {
 		UPLOAD_REP(&L->router_w, 2, m->dim, m->moe.n_experts, WCLASS_MATMUL);
@@ -978,18 +1109,17 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 				}
 				L->shexp_gate_w.type = fused_type;
 				L->shexp_up_w.type	 = fused_type;
+				size_t srow_bytes	 = ggml_row_size(fused_type, (size_t)m->dim);
+				L->shexp_up_w.buf =
+					buffer_slice(&L->shexp_gate_w.buf, (size_t)sh_inter * srow_bytes,
+								 (size_t)sh_inter * srow_bytes);
 				if (L->shexp_gate_w.buf.host_ptr != fused) {
 					free(fused);
 					L->shexp_fused_host = NULL;
 				} else {
 					L->shexp_fused_host = fused;
 				}
-				L->shexp_up_w.buf = L->shexp_gate_w.buf;
-				L->shexp_up_w.buf.offset =
-					(size_t)sh_inter * ggml_row_size(L->shexp_gate_w.type, m->dim);
-
-				if (L->shexp_up_w.buf.handle)
-					L->shexp_up_w.buf.host_ptr = L->shexp_up_w.buf.handle;
+				L->shexp_fused = 1;
 			} else {
 				UPLOAD_REP(&L->shexp_gate_w, 2, m->dim, sh_inter, WCLASS_MATMUL);
 				UPLOAD_REP(&L->shexp_up_w, 2, m->dim, sh_inter, WCLASS_MATMUL);
@@ -1059,7 +1189,9 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 static status_code upload_all_weights(model *m) {
 	status_code s;
 
-	upload_embeddings(m);
+	s = upload_embeddings(m);
+	if (s != OK)
+		return s;
 
 	progress prog;
 	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers);
@@ -1174,6 +1306,7 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 			for (int i = 0; i < m->n_layers; i++) {
 				m->layer_dims.is_global_layer[i] = ((i + 1) % period == 0) ? 1 : 0;
 			}
+			int used_period_heuristic = 1;
 			for (size_t i = 0; i < g->n_kv; i++) {
 				if (strcmp(g->kv_keys[i], key1) == 0 && g->kv_types[i] == GGUF_TYPE_ARRAY &&
 					g->kv_arr_type[i] == GGUF_TYPE_BOOL) {
@@ -1181,9 +1314,16 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 					for (int j = 0; j < m->n_layers && j < (int)g->kv_arr_len[i]; j++) {
 						m->layer_dims.is_global_layer[j] = bools[j] ? 0 : 1;
 					}
+					used_period_heuristic = 0;
 					break;
 				}
 			}
+			if (used_period_heuristic)
+				WARN("model: SWA pattern keys '%s'/'%s' absent; guessing the pattern as "
+					 "\"(layer mod %d) == 0 => global, all other layers sliding-window\" "
+					 "(layers are 1-based). If the source model instead uses %d sliding "
+					 "+ 1 global layers (period %d), every layer's polarity is inverted",
+					 key1, key2, period, period, period + 1);
 		}
 	}
 
@@ -1246,6 +1386,11 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 	{
 		const gguf_tensor *t = gguf_find_tensor(g, "rope_freqs.weight");
 		if (t && t->data) {
+			if (t->type != GGML_TYPE_F32) {
+				ERROR("model: 'rope_freqs.weight' must be %s but is %s",
+					  ggml_type_name(GGML_TYPE_F32), ggml_type_name(t->type));
+				return ERR_FORMAT;
+			}
 			m->rope_freqs		= t->data;
 			m->rope_freqs_count = (int)t->dims[0];
 			int			 n_rot	= 0;
@@ -1350,15 +1495,17 @@ static status_code load_moe_metadata(model *m, const gguf_ctx *g, const char *pr
 		} else {
 			m->moe.n_experts = v32;
 		}
-		if (req_i32(g, prefix, "expert_used_count", &v32) != OK) {
-			if (akey_i32(g, prefix, "expert_shared_count", &v32) == OK) {
-				m->moe.n_experts_used = v32;
-			} else {
-				ERROR("model_load: missing '%s.expert_used_count'", prefix);
-				return ERR_FORMAT;
-			}
-		} else {
+		if (akey_i32(g, prefix, "expert_used_count", &v32) == OK) {
 			m->moe.n_experts_used = v32;
+		} else if (akey_i32(g, prefix, "expert_shared_count", &v32) == OK) {
+			WARN("model_load: '%s.expert_used_count' missing; falling back to "
+				 "'%s.expert_shared_count'=%d — the routed top-k is unverified for "
+				 "this file and may be wrong",
+				 prefix, prefix, v32);
+			m->moe.n_experts_used = v32;
+		} else {
+			ERROR("model_load: missing '%s.expert_used_count'", prefix);
+			return ERR_FORMAT;
 		}
 		if (akey_i32(g, prefix, "expert_shared_count", &v32) == OK) {
 			m->moe.n_shared_experts = v32;
@@ -1748,6 +1895,13 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 
 	m->attn_logit_softcap = 0.0f;
 	akey_f32(g, prefix, "attn_logit_softcapping", &m->attn_logit_softcap);
+	if (m->attn_logit_softcap != 0.0f) {
+		ERROR("model_load: '%s.attn_logit_softcapping'=%g is set but attention-logit "
+			  "softcapping is not implemented; refusing to load rather than producing "
+			  "silently wrong outputs",
+			  prefix, (double)m->attn_logit_softcap);
+		return ERR_UNSUPPORTED;
+	}
 	m->final_logit_softcap = 0.0f;
 	akey_f32(g, prefix, "final_logit_softcapping", &m->final_logit_softcap);
 
@@ -1990,26 +2144,28 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 								  "blk.%d.attn_v_b.weight", 1) != OK)
 				return ERR_FORMAT;
 			if (m->backend && strcmp(m->backend->name, "cpu") == 0) {
-				L->mla_kb_vb_f32	= 1;
-				const void *kb_orig = L->k_b_w.host_ptr;
-				size_t		kb_bytes =
-					ggml_row_size(L->k_b_w.type, (size_t)m->mla.qk_nope * m->mla.kv_lora) *
-					(size_t)m->n_heads;
-				dequant_weight_to_f32(&L->k_b_w.host_ptr, &L->k_b_w.type,
-									  (size_t)m->mla.qk_nope * m->mla.kv_lora, (size_t)m->n_heads);
-				release_original_weight_data(m, kb_orig, kb_bytes);
-				L->k_b_w.buf.handle	  = (void *)L->k_b_w.host_ptr;
-				L->k_b_w.buf.host_ptr = NULL;
-
-				const void *vb_orig = L->v_b_w.host_ptr;
-				size_t		vb_bytes =
-					ggml_row_size(L->v_b_w.type, (size_t)m->mla.kv_lora * m->mla.v_head) *
-					(size_t)m->n_heads;
-				dequant_weight_to_f32(&L->v_b_w.host_ptr, &L->v_b_w.type,
-									  (size_t)m->mla.kv_lora * m->mla.v_head, (size_t)m->n_heads);
-				release_original_weight_data(m, vb_orig, vb_bytes);
-				L->v_b_w.buf.handle	  = (void *)L->v_b_w.host_ptr;
-				L->v_b_w.buf.host_ptr = NULL;
+				if (L->k_b_w.type != GGML_TYPE_F32) {
+					const void *kb_orig = L->k_b_w.host_ptr;
+					size_t		kb_bytes =
+						ggml_row_size(L->k_b_w.type, (size_t)m->mla.qk_nope * m->mla.kv_lora) *
+						(size_t)m->n_heads;
+					dequant_weight_to_f32(&L->k_b_w.host_ptr, &L->k_b_w.type,
+										  (size_t)m->mla.qk_nope * m->mla.kv_lora,
+										  (size_t)m->n_heads);
+					release_original_weight_data(m, kb_orig, kb_bytes);
+					L->mla_kb_f32 = 1;
+				}
+				if (L->v_b_w.type != GGML_TYPE_F32) {
+					const void *vb_orig = L->v_b_w.host_ptr;
+					size_t		vb_bytes =
+						ggml_row_size(L->v_b_w.type, (size_t)m->mla.kv_lora * m->mla.v_head) *
+						(size_t)m->n_heads;
+					dequant_weight_to_f32(&L->v_b_w.host_ptr, &L->v_b_w.type,
+										  (size_t)m->mla.kv_lora * m->mla.v_head,
+										  (size_t)m->n_heads);
+					release_original_weight_data(m, vb_orig, vb_bytes);
+					L->mla_vb_f32 = 1;
+				}
 			}
 			L->wq		 = (weight_ref){0};
 			L->wk		 = (weight_ref){0};
@@ -2411,6 +2567,11 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			if (!t) {
 				return ERR_FORMAT;
 			}
+			if (t->type != GGML_TYPE_F32) {
+				ERROR("model_load: '%s' must be %s but is %s", tname, ggml_type_name(GGML_TYPE_F32),
+					  ggml_type_name(t->type));
+				return ERR_FORMAT;
+			}
 			L->layer_out_scale_w.host_ptr = t->data;
 			L->layer_out_scale			  = ((const float *)L->layer_out_scale_w.host_ptr)[0];
 		}
@@ -2523,6 +2684,7 @@ status_code model_load_parse(model *m, const char *path, backend *accel, int use
 
 	m->arch = arch_detect(g);
 	if (m->arch == ARCH_UNKNOWN) {
+		s = ERR_FORMAT;
 		goto fail;
 	}
 	m->arch_info = arch_lookup(m->arch);
@@ -2531,6 +2693,7 @@ status_code model_load_parse(model *m, const char *path, backend *accel, int use
 	if (gguf_get_str(g, "general.architecture", &gguf_arch) != OK || !gguf_arch) {
 		ERROR(
 			"model_load: missing 'general.architecture' (should have been caught by arch_detect)");
+		s = ERR_FORMAT;
 		goto fail;
 	}
 	const char *prefix = gguf_arch;
@@ -2546,10 +2709,12 @@ status_code model_load_parse(model *m, const char *path, backend *accel, int use
 	}
 
 	if (validate_swa_support(m)) {
+		s = ERR_FORMAT;
 		goto fail;
 	}
 
 	if (validate_model_dims(m, g)) {
+		s = ERR_FORMAT;
 		goto fail;
 	}
 
@@ -2564,7 +2729,7 @@ status_code model_load_parse(model *m, const char *path, backend *accel, int use
 fail:
 	ERROR("model_load_parse: aborting load of '%s' due to above error", path);
 	model_free(m);
-	return ERR_FORMAT;
+	return (s == OK) ? ERR_FORMAT : s;
 }
 
 status_code model_upload_weights(model *m) {
@@ -2574,9 +2739,14 @@ status_code model_upload_weights(model *m) {
 	}
 	uint64_t up_t0 = time_us();
 
-	if (upload_all_weights(m) != OK) {
-		return ERR_FORMAT;
+	status_code up_s = upload_all_weights(m);
+	if (up_s != OK) {
+		ERROR("model_upload: weight upload failed (%d)", up_s);
+		return up_s;
 	}
+
+	if (m->gctx.map && m->gctx.map_size > 0)
+		madvise(m->gctx.map, m->gctx.map_size, MADV_RANDOM);
 
 	INFO("weights uploaded in %llu ms", (unsigned long long)((time_us() - up_t0) / 1000));
 #ifdef __GLIBC__
@@ -2670,15 +2840,20 @@ void model_free(model *m) {
 			free_weight_buf(&L->kv_a_w.buf);
 			free_weight_buf(&L->k_b_w.buf);
 			free_weight_buf(&L->v_b_w.buf);
-			if (L->mla_kb_vb_f32) {
+			if (L->mla_kb_f32) {
 				free((void *)L->k_b_w.host_ptr);
+				L->k_b_w.host_ptr = NULL;
+			}
+			if (L->mla_vb_f32) {
 				free((void *)L->v_b_w.host_ptr);
-				L->mla_kb_vb_f32 = 0;
+				L->v_b_w.host_ptr = NULL;
 			}
 			free_weight_buf(&L->kv_a_norm_w.buf);
 			free_weight_buf(&L->router_w.buf);
 			free_weight_buf(&L->router_bias.buf);
 			free_weight_buf(&L->router_scale_w.buf);
+			if (L->shexp_fused)
+				memset(&L->shexp_up_w.buf, 0, sizeof(L->shexp_up_w.buf));
 			free_weight_buf(&L->shexp_gate_w.buf);
 			free_weight_buf(&L->shexp_up_w.buf);
 			free_weight_buf(&L->shexp_down_w.buf);

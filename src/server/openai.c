@@ -788,8 +788,12 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 	g->chat_api	 = chat_api;
 	make_id(g);
 
-	sampler_params sp = {rc->params.temperature, rc->params.top_k, rc->params.top_p,
-						 rc->params.min_p};
+	sampler_params sp = {.temperature	 = rc->params.temperature,
+						 .top_k			 = rc->params.top_k,
+						 .top_p			 = rc->params.top_p,
+						 .min_p			 = rc->params.min_p,
+						 .repeat_penalty = 1.0f,
+						 .repeat_last_n	 = 0};
 
 	pthread_mutex_lock(&st->gen_mtx);
 	{

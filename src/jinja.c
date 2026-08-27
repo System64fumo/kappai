@@ -641,7 +641,11 @@ typedef struct {
 	int		failed;
 	strlist diagnostics;
 	strlist features;
+	int		depth;
 } parser;
+
+#define JINJA_MAX_BLOCK_DEPTH 100
+#define JINJA_MAX_RANGE_ELEMS (1 << 20)
 
 static token *pcur(parser *p) {
 	return &p->lx->toks[p->pos];
@@ -1345,6 +1349,14 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 
 static stmt_node *parse_block(parser *p) {
 	stmt_node *head = NULL, *tail = NULL;
+	if (++p->depth > JINJA_MAX_BLOCK_DEPTH) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "template nesting too deep (>%d) at token offset %zu",
+				 JINJA_MAX_BLOCK_DEPTH, pcur(p)->start ? (size_t)(pcur(p)->start - p->lx->src) : 0);
+		perr(p, buf);
+		p->depth--;
+		return NULL;
+	}
 	for (;;) {
 		if (ptok_is(p, TOK_EOF))
 			break;
@@ -1390,8 +1402,10 @@ static stmt_node *parse_block(parser *p) {
 			int			is_end;
 			const char *end_kw;
 			stmt_node  *s = parse_statement_tag(p, &is_end, &end_kw);
-			if (is_end)
+			if (is_end) {
+				p->depth--;
 				return head;
+			}
 			if (!head)
 				head = tail = s;
 			else {
@@ -1403,6 +1417,7 @@ static stmt_node *parse_block(parser *p) {
 		perr(p, "unexpected token");
 		padvance(p);
 	}
+	p->depth--;
 	return head;
 }
 
@@ -2282,7 +2297,18 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			expr_arg *a2   = a1 ? a1->next : NULL;
 			if (a2)
 				step = atol(value_as_cstr(eval_expr(ctx, a2->val)));
-			jinja_value *out = jinja_list();
+			jinja_value *out  = jinja_list();
+			long		 span = step > 0 ? hi - lo : lo - hi;
+			if (step != 0 && span > 0) {
+				long count = (span + (step > 0 ? step : -step) - 1) / (step > 0 ? step : -step);
+				if (count > JINJA_MAX_RANGE_ELEMS) {
+					char buf[128];
+					snprintf(buf, sizeof(buf), "range() exceeds %d elements",
+							 JINJA_MAX_RANGE_ELEMS);
+					everr(ctx, buf);
+					return out;
+				}
+			}
 			if (step > 0)
 				for (long i = lo; i < hi; i += step) {
 					char buf[32];
@@ -2345,6 +2371,33 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 				jinja_list_append(out, jinja_string_n(cursor, partlen));
 				cursor = hit + seplen;
 			}
+			return out;
+		}
+		if (!strcmp(e->str, "replace")) {
+			const char *old_s = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
+			const char *new_s =
+				e->args && e->args->next ? value_as_cstr(eval_expr(ctx, e->args->next->val)) : "";
+			const char *str	  = value_as_cstr(base);
+			size_t		old_n = strlen(old_s);
+			strbuf		sb;
+			sb_init(&sb);
+			if (!old_n) {
+				sb_append_str(&sb, str);
+			} else {
+				const char *remaining = str;
+				for (;;) {
+					const char *hit = strstr(remaining, old_s);
+					if (!hit) {
+						sb_append_str(&sb, remaining);
+						break;
+					}
+					sb_append(&sb, remaining, (size_t)(hit - remaining));
+					sb_append_str(&sb, new_s);
+					remaining = hit + old_n;
+				}
+			}
+			jinja_value *out = jinja_string(sb.p);
+			free(sb.p);
 			return out;
 		}
 		if (!strcmp(e->str, "strip") || !strcmp(e->str, "lstrip") || !strcmp(e->str, "rstrip") ||
@@ -2422,7 +2475,7 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 	case EX_ISDEFINED: {
 		jinja_value *v	  = eval_expr(ctx, e->a);
 		const char	*test = e->str ? e->str : "defined";
-		if (!strcmp(test, "none") || !strcmp(test, "Null")) {
+		if (!strcmp(test, "none") || !strcmp(test, "Null") || !strcmp(test, "null")) {
 			int is_none = !v || v->type == JV_NONE;
 			return jinja_bool(is_none);
 		}
@@ -2480,7 +2533,14 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		return;
 	case ST_FOR: {
 		jinja_value *iter = eval_expr(ctx, s->iterable);
-		if (!iter || iter->type != JV_LIST) {
+		if (iter && (iter->type == JV_LIST || iter->type == JV_DICT || iter->type == JV_STRING)) {
+			if (iter->type != JV_LIST) {
+				everr(ctx, "for loop over non-list");
+				return;
+			}
+		} else if (!iter || iter->type == JV_NONE) {
+			return;
+		} else {
 			everr(ctx, "for loop over non-list");
 			return;
 		}
