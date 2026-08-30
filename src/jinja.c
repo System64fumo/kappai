@@ -595,6 +595,7 @@ typedef enum {
 	ST_MACRO,
 	ST_GENERATION,
 	ST_NOOP,
+	ST_BREAK,
 } stmt_kind;
 
 typedef struct macro_param {
@@ -1339,6 +1340,13 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 	if (stmt_kw_is(p, "macro"))
 		return parse_macro_stmt(p);
 
+	if (stmt_kw_is(p, "break") || stmt_kw_is(p, "continue")) {
+		stmt_node *s = new_stmt(stmt_kw_is(p, "break") ? ST_BREAK : ST_NOOP);
+		padvance(p);
+		expect_stmt_close(p, "break/continue");
+		return s;
+	}
+
 	perr(p, "unsupported statement");
 	while (!ptok_is(p, TOK_STMT_CLOSE) && !ptok_is(p, TOK_EOF))
 		padvance(p);
@@ -1688,6 +1696,7 @@ typedef struct {
 	size_t errbuf_len;
 	int	   failed;
 	int	   call_depth;
+	int	   break_hit;
 } eval_ctx;
 
 static void everr(eval_ctx *ctx, const char *msg) {
@@ -2568,11 +2577,16 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			jinja_dict_set(loop_obj, "last", jinja_bool(i == n - 1));
 			scope_assign(&loop_sc, "loop", loop_obj);
 
-			scope *saved = ctx->sc;
-			ctx->sc		 = &loop_sc;
+			scope *saved   = ctx->sc;
+			ctx->sc		   = &loop_sc;
+			ctx->break_hit = 0;
 			exec_stmts(ctx, s->body, out);
 			ctx->sc = saved;
 			scope_free_entries(&loop_sc);
+			if (ctx->break_hit) {
+				ctx->break_hit = 0;
+				break;
+			}
 		}
 		return;
 	}
@@ -2616,11 +2630,14 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		return;
 	case ST_NOOP:
 		return;
+	case ST_BREAK:
+		ctx->break_hit = 1;
+		return;
 	}
 }
 
 static void exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out) {
-	for (; s && !ctx->failed; s = s->next)
+	for (; s && !ctx->failed && !ctx->break_hit; s = s->next)
 		exec_stmt(ctx, s, out);
 }
 
@@ -2649,6 +2666,7 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	ctx.errbuf_len = errbuf_len;
 	ctx.failed	   = 0;
 	ctx.call_depth = 0;
+	ctx.break_hit  = 0;
 
 	strbuf sb;
 	sb_init(&sb);
