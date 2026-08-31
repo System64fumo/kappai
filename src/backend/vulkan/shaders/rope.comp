@@ -18,9 +18,7 @@ layout(push_constant) uniform Params {
 #else
     int neox;
 #endif
-#ifdef BATCHED
     int m;
-#endif
 } params;
 
 void main() {
@@ -28,16 +26,10 @@ void main() {
     int half_dim = params.head_dim / 2;
     int total = params.n_heads * half_dim;
 
-#ifdef BATCHED
     uint row = gl_WorkGroupID.y;
     if (row >= uint(params.m)) return;
     int pos = params.pos + int(row);
     uint vec_row_off = row * uint(params.n_heads) * uint(params.head_dim);
-#else
-    const uint row = 0u;
-    int pos = params.pos;
-    const uint vec_row_off = 0u;
-#endif
 
     if (int(gid) >= total) return;
 

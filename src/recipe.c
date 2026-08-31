@@ -309,7 +309,7 @@ model_recipe *recipe_build(const struct model *m) {
 				}
 				if (op->kind == OP_ATTENTION) {
 					op->u.attention.head_dim		  = lc->head_dim;
-					op->u.attention.n_kv_heads		  = m->n_kv_heads;
+					op->u.attention.n_kv_heads		  = lc->n_kv_heads;
 					op->u.attention.n_kv_heads_active = lc->n_kv_heads;
 					op->u.attention.kv_layer		  = lc->kv_layer;
 				}

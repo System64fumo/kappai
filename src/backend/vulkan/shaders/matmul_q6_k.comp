@@ -34,9 +34,7 @@ layout(push_constant) uniform Params {
     int n0;
     int n1;
     int k;
-#ifdef BATCHED
     int m;
-#endif
 } params;
 
 #include "common.glsl"
@@ -116,25 +114,14 @@ void main() {
     int blocks_per_row = k / 256;
     uint row_stride = uint(blocks_per_row) * Q6_K_BLOCK_BYTES;
 
-#ifdef BATCHED
     uint row = gl_WorkGroupID.y;
     uint x_off = row * uint(k);
     uint y0_off = row * uint(params.n0);
-#if NMAT >= 2
-    uint y1_off = row * uint(params.n1);
-#endif
 #ifdef HAS_RESIDUAL
     uint r_off = y0_off;
 #endif
-#else
-    const uint x_off = 0u;
-    const uint y0_off = 0u;
 #if NMAT >= 2
-    const uint y1_off = 0u;
-#endif
-#ifdef HAS_RESIDUAL
-    const uint r_off = 0u;
-#endif
+    uint y1_off = row * uint(params.n1);
 #endif
 
     precise float acc0 = 0.0;

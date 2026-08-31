@@ -194,12 +194,16 @@ rmsnorm_add_FLAGS                    := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDU
 rmsnorm_noweight_per_head_FLAGS      := -DPER_HEAD
 rmsnorm_noweight_per_head_sg_FLAGS   := -DPER_HEAD -DUSE_SUBGROUP
 
+VK_NONBATCH_SPVS := \
+	$(OBJ_DIR)/backend/vulkan/argmax.spv \
+	$(OBJ_DIR)/backend/vulkan/attention.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_big.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_flash.spv \
+	$(OBJ_DIR)/backend/vulkan/embd_lookup.spv \
+	$(OBJ_DIR)/backend/vulkan/kv_put.spv
+
 SHADER_SPVS := \
-	$(patsubst $(VK_SHADERS_DIR)/%.comp,$(OBJ_DIR)/backend/vulkan/%.spv,$(VK_SHADER_FILES)) \
-	$(foreach s,$(MATMUL_DUAL),$(OBJ_DIR)/backend/vulkan/$(s)_residual.spv) \
-	$(foreach s,$(MATMUL_NMAT_DUAL),$(OBJ_DIR)/backend/vulkan/$(s)_dual.spv) \
-	$(foreach s,$(RMSNORM_VARIANTS),$(OBJ_DIR)/backend/vulkan/$(s).spv) \
-	$(foreach s,$(ROPE_EXT_VARIANTS),$(OBJ_DIR)/backend/vulkan/$(s).spv) \
+	$(VK_NONBATCH_SPVS) \
 	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_batch.spv) \
 	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_residual_batch.spv) \
 	$(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_dual_batch.spv) \

@@ -18,9 +18,7 @@ layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
 layout(push_constant) uniform Params {
     int n;
     int k;
-#ifdef BATCHED
     int m;
-#endif
 } params;
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
@@ -45,19 +43,11 @@ void main() {
     int  k   = params.k;
     int  blocks_per_row = k / 32;
 
-#ifdef BATCHED
     uint row = gl_WorkGroupID.y;
     uint x_off = row * uint(k);
     uint y_off = row * uint(params.n);
 #ifdef HAS_RESIDUAL
     uint r_off = y_off;
-#endif
-#else
-    const uint x_off = 0u;
-    const uint y_off = 0u;
-#ifdef HAS_RESIDUAL
-    const uint r_off = 0u;
-#endif
 #endif
 
     precise float acc[ROWS_PER_THREAD];

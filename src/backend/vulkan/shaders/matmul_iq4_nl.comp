@@ -22,9 +22,7 @@ layout(push_constant) uniform Params {
     int activation;
     int has_residual;
     int n2;
-#ifdef BATCHED
     int m;
-#endif
 } params;
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
@@ -295,18 +293,11 @@ void main() {
     int n_out_b = params.n1; 
     int n_out_c = params.n2; 
 
-#ifdef BATCHED
     uint row = gl_WorkGroupID.y;
     uint x_off = row * uint(k);
     uint y0_off = row * uint(n_out_a);
     uint y1_off = row * uint(n_out_b);
     uint y2_off = row * uint(n_out_c);
-#else
-    const uint x_off = 0u;
-    const uint y0_off = 0u;
-    const uint y1_off = 0u;
-    const uint y2_off = 0u;
-#endif
 
     precise float acc0[ROWS_PER_THREAD];
     precise float acc1[ROWS_PER_THREAD];
