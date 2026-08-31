@@ -35,6 +35,9 @@ layout(push_constant) uniform Params {
     int n0;
     int n1;
     int k;
+#ifdef BATCHED
+    int m;
+#endif
 } params;
 
 #include "common.glsl"
@@ -64,6 +67,27 @@ void main() {
     int  k   = params.k;
     int  blocks_per_row = k / 32;
 
+#ifdef BATCHED
+    uint row = gl_WorkGroupID.y;
+    uint x_off = row * uint(k);
+    uint y0_off = row * uint(params.n0);
+#if NMAT >= 2
+    uint y1_off = row * uint(params.n1);
+#endif
+#ifdef HAS_RESIDUAL
+    uint r_off = y0_off;
+#endif
+#else
+    const uint x_off = 0u;
+    const uint y0_off = 0u;
+#if NMAT >= 2
+    const uint y1_off = 0u;
+#endif
+#ifdef HAS_RESIDUAL
+    const uint r_off = 0u;
+#endif
+#endif
+
     precise float acc0[ROWS_PER_THREAD];
     for (int r = 0; r < ROWS_PER_THREAD; r++) acc0[r] = 0.0;
     bool valid0[ROWS_PER_THREAD];
@@ -83,7 +107,7 @@ void main() {
         int tile_len = tile_end - tile_start;
 
         for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
-            x_shared[j] = x[tile_start + j];
+            x_shared[j] = x[x_off + uint(tile_start + j)];
         barrier();
 
         int block_start = tile_start / 32;
@@ -182,18 +206,18 @@ void main() {
     for (int r = 0; r < ROWS_PER_THREAD; r++) {
         if (!valid0[r]) continue;
 #if NMAT >= 2
-        y0[base_i + uint(r)] = acc0[r];
+        y0[y0_off + base_i + uint(r)] = acc0[r];
 #elif defined(HAS_RESIDUAL)
-        y0[base_i + uint(r)] = acc0[r] + residual[base_i + uint(r)];
+        y0[y0_off + base_i + uint(r)] = acc0[r] + residual[r_off + base_i + uint(r)];
 #else
-        y0[base_i + uint(r)] = acc0[r];
+        y0[y0_off + base_i + uint(r)] = acc0[r];
 #endif
     }
 
 #if NMAT >= 2
     for (int r = 0; r < ROWS_PER_THREAD; r++) {
         if (!valid1[r]) continue;
-        y1[base_i + uint(r)] = acc1[r];
+        y1[y1_off + base_i + uint(r)] = acc1[r];
     }
 #endif
 }

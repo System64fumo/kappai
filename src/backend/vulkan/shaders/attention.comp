@@ -18,6 +18,9 @@ layout(push_constant) uniform Params {
     float scale;
     int stride_head_dim;
     int attn_start;
+#ifdef BATCHED
+    int m;
+#endif
 } params;
 
 #include "common.glsl"
@@ -38,7 +41,21 @@ void main() {
     int pos      = params.pos;
     int n_ctx    = params.n_ctx;
 
-    uint q_base = h * uint(head_dim);
+#ifdef BATCHED
+    uint row = gl_WorkGroupID.y;
+    if (row >= uint(params.m)) return;
+    pos = params.pos + int(row);
+    uint q_row_off   = row * uint(params.n_heads) * uint(head_dim);
+    uint sc_row_off  = row * uint(params.n_heads) * uint(n_ctx);
+    uint out_row_off = row * uint(params.n_heads) * uint(head_dim);
+#else
+    const uint row = 0u;
+    const uint q_row_off = 0u;
+    const uint sc_row_off = 0u;
+    const uint out_row_off = 0u;
+#endif
+
+    uint q_base = q_row_off + h * uint(head_dim);
     for (int d = int(tid); d < head_dim; d += 64) {
         q_shared[d] = q[q_base + uint(d)];
     }
@@ -47,7 +64,7 @@ void main() {
     uint kvh_stride = uint(n_ctx) * uint(params.stride_head_dim);
     uint kv_base    = params.layer_off + uint(kvh) * kvh_stride;
 
-    uint sc_base = h * uint(n_ctx);
+    uint sc_base = sc_row_off + h * uint(n_ctx);
     int attn_start = params.attn_start;
 
     for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
@@ -115,7 +132,7 @@ void main() {
     barrier();
 
     for (int d = int(tid); d < head_dim; d += 64) {
-        out_[h * uint(head_dim) + uint(d)] = 0.0;
+        out_[out_row_off + h * uint(head_dim) + uint(d)] = 0.0;
     }
 
     memoryBarrierBuffer();
@@ -142,7 +159,7 @@ void main() {
                 precise float sv = scores[sc_base + uint(tile_t0 + t)] * inv_sum;
                 acc += sv * kv_tile[t * head_dim + d];
             }
-            out_[h * uint(head_dim) + uint(d)] += acc;
+            out_[out_row_off + h * uint(head_dim) + uint(d)] += acc;
         }
         barrier();
     }

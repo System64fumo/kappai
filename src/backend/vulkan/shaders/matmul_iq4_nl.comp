@@ -22,6 +22,9 @@ layout(push_constant) uniform Params {
     int activation;
     int has_residual;
     int n2;
+#ifdef BATCHED
+    int m;
+#endif
 } params;
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
@@ -116,18 +119,18 @@ shared float x_shared[TILE_K];
 shared int   xq_shared[TILE_K];
 shared float xq_d[TILE_K / 32];
 
-void load_x_tile(int tile_start, int tile_len) {
+void load_x_tile(int tile_start, int tile_len, uint x_off) {
     uint tid = gl_LocalInvocationID.x;
     for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
         float val;
         if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
-            val = b2f[uint(tile_start + j)];
+            val = b2f[x_off + uint(tile_start + j)];
         } else if (params.mode == MODE_FFN_DOWN) {
-            float g = b1f[uint(tile_start + j)];
-            float u = b2f[uint(tile_start + j)];
+            float g = b1f[x_off + uint(tile_start + j)];
+            float u = b2f[x_off + uint(tile_start + j)];
             val = activate(g, u);
         } else {
-            val = b1f[uint(tile_start + j)];
+            val = b1f[x_off + uint(tile_start + j)];
         }
         x_shared[j] = val;
     }
@@ -292,6 +295,19 @@ void main() {
     int n_out_b = params.n1; 
     int n_out_c = params.n2; 
 
+#ifdef BATCHED
+    uint row = gl_WorkGroupID.y;
+    uint x_off = row * uint(k);
+    uint y0_off = row * uint(n_out_a);
+    uint y1_off = row * uint(n_out_b);
+    uint y2_off = row * uint(n_out_c);
+#else
+    const uint x_off = 0u;
+    const uint y0_off = 0u;
+    const uint y1_off = 0u;
+    const uint y2_off = 0u;
+#endif
+
     precise float acc0[ROWS_PER_THREAD];
     precise float acc1[ROWS_PER_THREAD];
     precise float acc2[ROWS_PER_THREAD];
@@ -309,7 +325,7 @@ void main() {
         int tile_end = min(tile_start + TILE_K, k);
         int tile_len = tile_end - tile_start;
 
-        load_x_tile(tile_start, tile_len);
+        load_x_tile(tile_start, tile_len, x_off);
         barrier();
 
         int block_start = tile_start / 32;
@@ -373,22 +389,22 @@ void main() {
         if (!valid0[r]) continue;
         float result = acc0[r];
         if (params.mode == MODE_SINGLE && params.has_residual != 0) {
-            result += b2f[base_i + uint(r)];
+            result += b2f[y0_off + base_i + uint(r)];
         }
-        b3f[base_i + uint(r)] = result;
+        b3f[y0_off + base_i + uint(r)] = result;
     }
 
     if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
         for (int r = 0; r < ROWS_PER_THREAD; r++) {
             if (!valid1[r]) continue;
-            b4f[base_i + uint(r)] = acc1[r];
+            b4f[y1_off + base_i + uint(r)] = acc1[r];
         }
     }
 
     if (params.mode == MODE_QKV) {
         for (int r = 0; r < ROWS_PER_THREAD; r++) {
             if (!valid2[r]) continue;
-            b6f[base_i + uint(r)] = acc2[r];
+            b6f[y2_off + base_i + uint(r)] = acc2[r];
         }
     }
 }

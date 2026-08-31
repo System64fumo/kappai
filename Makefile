@@ -172,6 +172,10 @@ MATMUL_DUAL := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmu
 
 MATMUL_NMAT_DUAL := matmul_q4_0 matmul_q4_k matmul_q6_k
 
+MATMUL_BATCH := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32
+
+MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
+
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
 	            rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
 	            rmsnorm_noweight_per_head rmsnorm_noweight_per_head_sg
@@ -195,7 +199,20 @@ SHADER_SPVS := \
 	$(foreach s,$(MATMUL_DUAL),$(OBJ_DIR)/backend/vulkan/$(s)_residual.spv) \
 	$(foreach s,$(MATMUL_NMAT_DUAL),$(OBJ_DIR)/backend/vulkan/$(s)_dual.spv) \
 	$(foreach s,$(RMSNORM_VARIANTS),$(OBJ_DIR)/backend/vulkan/$(s).spv) \
-	$(foreach s,$(ROPE_EXT_VARIANTS),$(OBJ_DIR)/backend/vulkan/$(s).spv)
+	$(foreach s,$(ROPE_EXT_VARIANTS),$(OBJ_DIR)/backend/vulkan/$(s).spv) \
+	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_batch.spv) \
+	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_residual_batch.spv) \
+	$(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_dual_batch.spv) \
+	$(foreach s,$(RMSNORM_ALL),$(OBJ_DIR)/backend/vulkan/$(s)_batch.spv) \
+	$(OBJ_DIR)/backend/vulkan/rope_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_big_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv
 
 SHADERS_H := $(OBJ_DIR)/backend/vulkan/shaders_embedded.h
 
@@ -235,6 +252,84 @@ ifneq ($(HAS_VULKAN),)
 	@mkdir -p $(dir $@)
 	@echo "  GLSLC   rope_ext.spv"
 	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_FF $< -o $@
+
+  # --- Batched variant rules (prefill batching: -DBATCHED) ---
+  define MATMUL_BATCH_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $$(dir $$@)
+	@echo "  GLSLC   $(1)_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $$< -o $$@
+  endef
+  $(foreach s,$(MATMUL_BATCH),$(eval $(call MATMUL_BATCH_RULE,$(s))))
+
+  define MATMUL_RES_BATCH_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)_residual_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $$(dir $$@)
+	@echo "  GLSLC   $(1)_residual_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_RESIDUAL -DBATCHED $$< -o $$@
+  endef
+  $(foreach s,$(MATMUL_BATCH),$(eval $(call MATMUL_RES_BATCH_RULE,$(s))))
+
+  define MATMUL_DUAL_BATCH_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)_dual_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $$(dir $$@)
+	@echo "  GLSLC   $(1)_dual_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DNMAT_DUAL -DBATCHED $$< -o $$@
+  endef
+  $(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(eval $(call MATMUL_DUAL_BATCH_RULE,$(s))))
+
+  define RMSNORM_BATCH_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)_batch.spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $$(dir $$@)
+	@echo "  GLSLC   $(1)_batch.spv  [$$($(1)_FLAGS) -DBATCHED]"
+	@$$(GLSLC) -O --target-env=vulkan1.1 -I$$(VK_SHADERS_DIR) $$($(1)_FLAGS) -DBATCHED $$< -o $$@
+  endef
+  $(foreach s,$(RMSNORM_ALL),$(eval $(call RMSNORM_BATCH_RULE,$(s))))
+
+  $(OBJ_DIR)/backend/vulkan/rope_batch.spv: $(VK_SHADERS_DIR)/rope.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   rope_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv: $(VK_SHADERS_DIR)/rope.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   rope_ext_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_FF -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv: $(VK_SHADERS_DIR)/rope_qk.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   rope_qk_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/attention_batch.spv: $(VK_SHADERS_DIR)/attention.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   attention_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/attention_big_batch.spv: $(VK_SHADERS_DIR)/attention_big.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   attention_big_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv: $(VK_SHADERS_DIR)/attention_flash.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   attention_flash_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv: $(VK_SHADERS_DIR)/ffn_activate.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   ffn_activate_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/elementwise_batch.spv: $(VK_SHADERS_DIR)/elementwise.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   elementwise_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+
+  $(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv: $(VK_SHADERS_DIR)/matmul_iq4_nl.comp $(VK_INC_FILES) | $(OUT_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  GLSLC   matmul_iq4_nl_batch.spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
 
   $(SHADERS_H): $(SHADER_SPVS) | $(OUT_DIR)
 	@echo "  GEN     $@"
