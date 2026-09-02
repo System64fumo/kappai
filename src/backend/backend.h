@@ -22,6 +22,7 @@ typedef enum {
 	BCAP_MATMUL_QONLY		  = 1 << 6,
 	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
+	BCAP_MOE_EXPERT_GPU		  = 1 << 9,
 } backend_cap;
 
 typedef struct {
@@ -32,6 +33,20 @@ typedef struct {
 	backend	   *owner;
 } buffer;
 
+typedef struct {
+	const buffer *gate_w;
+	const buffer *up_w;
+	const buffer *down_w;
+	uint32_t	  gate_type;
+	uint32_t	  up_type;
+	uint32_t	  down_type;
+	int			  gate_up_fused;
+	int			  use_gelu;
+	float		  gate_scale;
+	float		  up_scale;
+	float		  down_scale;
+	float		  weight;
+} moe_gpu_expert;
 static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t byte_len) {
 	buffer s   = *parent;
 	s.host_ptr = parent->host_ptr ? (const char *)parent->host_ptr + byte_off : NULL;
@@ -205,6 +220,14 @@ struct backend {
 	tpool *(*get_pool)(backend *self);
 	status_code (*matmul_thread_local)(backend *self, const void *w, uint32_t w_type,
 									   const float *x, float *y, int n, int k, int tid);
+	status_code (*buffer_alloc_from_host)(backend *self, const void *host_data, size_t size,
+										  buffer *out);
+	status_code (*moe_expert_ffn_gpu)(backend *self, const buffer *x, buffer *out,
+									  const moe_gpu_expert *e, int dim, int inter);
+	status_code (*moe_experts_batch_gpu)(backend *self, const buffer *xb, buffer *out, int n_rows,
+										 int dim, int inter, int use_gelu, int n_experts,
+										 const moe_gpu_expert *experts, const int *counts,
+										 const int *rows_packed, const float *weights_packed);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
 };

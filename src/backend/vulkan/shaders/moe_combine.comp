@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer YBuf { float y[]; };
+layout(set = 0, binding = 1) readonly buffer WBuf { float w[]; };
+layout(set = 0, binding = 2) readonly buffer RowsBuf { int rows[]; };
+layout(set = 0, binding = 3) buffer OutBuf { float out_[]; };
+
+layout(push_constant) uniform Params {
+    int cnt;
+    int dim;
+    float ds;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(params.cnt) * uint(params.dim)) return;
+    uint c = idx / uint(params.dim);
+    uint d = idx - c * uint(params.dim);
+    float v = y[idx] * params.ds * w[c];
+    out_[uint(rows[c]) * uint(params.dim) + d] += v;
+}

@@ -197,6 +197,8 @@ rmsnorm_noweight_per_head_sg_FLAGS   := -DPER_HEAD -DUSE_SUBGROUP
 VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/argmax.spv \
 	$(OBJ_DIR)/backend/vulkan/argmax_reduce.spv \
+	$(OBJ_DIR)/backend/vulkan/moe_gather.spv \
+	$(OBJ_DIR)/backend/vulkan/moe_combine.spv \
 	$(OBJ_DIR)/backend/vulkan/attention.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_big.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash.spv \

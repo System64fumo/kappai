@@ -9,6 +9,8 @@ layout(push_constant) uniform Params {
     int n;
     int activation;
     int m;
+    float gs;
+    float us;
 } params;
 
 float gelu_tanh(float x) {
@@ -24,8 +26,8 @@ void main() {
     uint row_off = row * uint(params.n);
     uint i = gl_GlobalInvocationID.x;
     if (int(i) >= params.n) return;
-    float g = gate[row_off + i];
-    float u = up[row_off + i];
+    float g = gate[row_off + i] * params.gs;
+    float u = up[row_off + i] * params.us;
     if (params.activation == 1) {
         out_[row_off + i] = gelu_tanh(g) * u;
     } else {

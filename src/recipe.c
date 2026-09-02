@@ -222,7 +222,9 @@ static status_code recipe_check_backend_capabilities(const model_recipe *r, cons
 		if (s != OK)
 			return s;
 	}
-	if (m->moe.n_experts > 0 && !a->matmul_thread_local) {
+	if (m->moe.n_experts > 0 && !a->matmul_thread_local &&
+		!(backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_experts_batch_gpu &&
+		  a->moe_expert_ffn_gpu && m->moe.gpu_resident)) {
 		backend *host = backend_host();
 		s = recipe_require_capability(m, a, "matmul_thread_local", 0,
 									  host && host != a && host->matmul_thread_local != NULL, 1);
@@ -2888,6 +2890,65 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 	return OK;
 }
 
+static status_code moe_experts_gpu_grouped(exec_ctx *ctx, backend *a, int dim, int K, int I,
+										   int use_gelu) {
+	batch_scratch *bs	   = ctx->bs;
+	int			   n_rows  = ctx->n_rows;
+	int			   n_union = bs->moe_n_union;
+
+	buffer *xb_gpu = batch_slot(bs, ctx->op->in[0]);
+	buffer *out_b  = batch_slot(bs, ctx->op->out);
+	if (xb_gpu->owner != a || out_b->owner != a)
+		return ERR_UNSUPPORTED;
+
+	int counts[MOE_MAX_TOPK * 8];
+	if (n_union > (int)(sizeof(counts) / sizeof(counts[0])))
+		return ERR_UNSUPPORTED;
+
+	moe_gpu_expert *experts		   = xcalloc((size_t)n_union, sizeof(*experts));
+	int			   *rows_packed	   = xcalloc((size_t)n_rows * K, sizeof(int));
+	float		   *weights_packed = xcalloc((size_t)n_rows * K, sizeof(float));
+	int				packed		   = 0;
+	for (int i = 0; i < n_union; i++) {
+		int				 u	  = bs->moe_union_order[i];
+		int				 cnt  = bs->moe_union_count[u];
+		const int		*rows = bs->moe_union_rows + bs->moe_union_offsets[u];
+		const int		*kidx = bs->moe_union_kidx + bs->moe_union_offsets[u];
+		moe_expert_slot *es	  = &bs->moe_union_slots[i];
+		if (cnt <= 0 || es->eid < 0 || !es->gate_w || !es->gpu_ready) {
+			counts[i] = 0;
+			continue;
+		}
+		counts[i]				 = cnt;
+		experts[i].gate_w		 = &es->gpu_gate;
+		experts[i].up_w			 = &es->gpu_up;
+		experts[i].down_w		 = &es->gpu_down;
+		experts[i].gate_type	 = es->gate_type;
+		experts[i].up_type		 = es->up_type;
+		experts[i].down_type	 = es->down_type;
+		experts[i].gate_up_fused = es->gate_up_fused;
+		experts[i].use_gelu		 = use_gelu;
+		experts[i].gate_scale	 = es->gate_scale;
+		experts[i].up_scale		 = es->up_scale;
+		experts[i].down_scale	 = es->down_scale;
+		for (int c = 0; c < cnt; c++) {
+			rows_packed[packed]	   = rows[c];
+			weights_packed[packed] = ctx->bs->moe_router_w[(size_t)rows[c] * K + kidx[c]];
+			packed++;
+		}
+	}
+
+	status_code st = a->scale_inplace(a, out_b, 0.0f, n_rows * dim);
+	if (st == OK)
+		st = a->moe_experts_batch_gpu(a, xb_gpu, out_b, n_rows, dim, I, use_gelu, n_union, experts,
+									  counts, rows_packed, weights_packed);
+
+	free(experts);
+	free(rows_packed);
+	free(weights_packed);
+	return st;
+}
+
 static status_code moe_experts_batch(exec_ctx *ctx) {
 
 	backend	 *a	  = exec_layer_backend(ctx);
@@ -2937,6 +2998,34 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 
 	status_code st = OK;
 	if (ctx->n_rows > 1 && a->matmul_batch) {
+		if (backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_experts_batch_gpu &&
+			ctx->m->moe.gpu_resident) {
+			st = moe_experts_gpu_grouped(ctx, a, dim, K, I, use_gelu);
+			if (st == OK) {
+				for (int i = 0; i < n_union; i++) {
+					moe_expert_slot *us = &ctx->bs->moe_union_slots[i];
+					if (us->owned && us->heap_buf) {
+						free(us->heap_buf);
+						us->heap_buf = NULL;
+						us->eid		 = -1;
+					}
+				}
+				moe_stream_release_slots(ctx->m, ctx->li, ctx->bs->moe_union_slots, n_union);
+				for (int i = 0; i < n_union; i++)
+					ctx->bs->moe_union_slots[i].eid = -1;
+				for (int i = 0; i < ctx->n_rows * K; i++) {
+					moe_expert_slot *es = &ctx->bs->moe_per_token_slots[i];
+					es->eid				= -1;
+					es->owned			= 0;
+					es->heap_buf		= NULL;
+					es->gate_w			= NULL;
+					es->up_w			= NULL;
+					es->down_w			= NULL;
+				}
+				return OK;
+			}
+			WARN("moe gpu expert batch failed (st=%d) -- falling back to cpu", (int)st);
+		}
 		st = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
 		goto finish;
 	}
@@ -3771,8 +3860,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	buffer				   *out_buf = &slots[RECIPE_SLOT_XB2];
 	int						dim		= m->dim;
 
-	int out_is_host =
-		out_buf->host_ptr != NULL || !out_buf->owner || out_buf->owner == backend_host();
+	int	   out_is_host = out_buf->host_ptr != NULL || !out_buf->owner ||
+						 backend_has_cap(out_buf->owner, BCAP_IS_HOST);
 	float  local_outf[MOE_MAX_DIM_STACK];
 	float *heap_outf = NULL;
 	float *outf;
@@ -3801,7 +3890,6 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	backend *a		= model_layer_backend(ctx->m, ctx->li);
-	backend *host_a = backend_host();
 	int		 K		= m->moe.n_experts_used;
 	int		 I		= m->moe.moe_intermediate;
 
@@ -3828,6 +3916,45 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 			free(heap_outf);
 		}
 		return ERR_FORMAT;
+	}
+
+	buffer *xb_gpu = &slots[RECIPE_SLOT_XB];
+	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_expert_ffn_gpu &&
+		m->moe.gpu_resident && xb_gpu->owner == a && out_buf->owner == a) {
+		status_code gst	   = moe_stream_resolve(m, li, expert_ids, K, slot_buf);
+		int			gpu_ok = (gst == OK);
+		for (int k = 0; gpu_ok && k < K; k++)
+			if (!slot_buf[k].gpu_ready)
+				gpu_ok = 0;
+		if (gpu_ok) {
+			int use_gelu = m->arch_info->uses_gelu_activation;
+			gst			 = a->scale_inplace(a, out_buf, 0.0f, dim);
+			for (int k = 0; gst == OK && k < K; k++) {
+				if (slot_buf[k].eid < 0 || !slot_buf[k].gate_w)
+					continue;
+				moe_gpu_expert ge = {
+					.gate_w		   = &slot_buf[k].gpu_gate,
+					.up_w		   = &slot_buf[k].gpu_up,
+					.down_w		   = &slot_buf[k].gpu_down,
+					.gate_type	   = slot_buf[k].gate_type,
+					.up_type	   = slot_buf[k].up_type,
+					.down_type	   = slot_buf[k].down_type,
+					.gate_up_fused = slot_buf[k].gate_up_fused,
+					.use_gelu	   = use_gelu,
+					.gate_scale	   = slot_buf[k].gate_scale,
+					.up_scale	   = slot_buf[k].up_scale,
+					.down_scale	   = slot_buf[k].down_scale,
+					.weight		   = weights[k],
+				};
+				gst = a->moe_expert_ffn_gpu(a, xb_gpu, out_buf, &ge, dim, I);
+			}
+			if (gst == OK) {
+				moe_stream_release_slots(m, li, slot_buf, K);
+				return OK;
+			}
+			WARN("moe gpu expert ffn failed (st=%d) -- falling back to cpu", (int)gst);
+			moe_stream_release_slots(m, li, slot_buf, K);
+		}
 	}
 
 	monitor_emit_moe_experts(g_monitor, li, -1, expert_ids, weights, K);
@@ -3883,13 +4010,13 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	if (par) {
-		st = moe_experts_run_parallel(m, li, K, dim, host_a, slot_buf, expert_ids, weights, xb, s,
-									  I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
+		st = moe_experts_run_parallel(m, li, K, dim, backend_host(), slot_buf, expert_ids, weights,
+									  xb, s, I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
 									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
 	} else {
-		st = moe_experts_run_sequential(m, li, K, dim, host_a, slot_buf, expert_ids, weights, xb, s,
-										I, use_gelu, xb_q8_gate_ok, gate_q8_type, &xb_q8_gate,
-										scratch_need, outf);
+		st = moe_experts_run_sequential(m, li, K, dim, backend_host(), slot_buf, expert_ids,
+										weights, xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
+										&xb_q8_gate, scratch_need, outf);
 	}
 
 cleanup:

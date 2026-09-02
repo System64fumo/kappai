@@ -1,5 +1,6 @@
 #include "backend/backend.h"
 #include "backend/cpu/scalar/quants.h"
+#include "recipe.h"
 #include "common.h"
 #include "log.h"
 #include "shaders_embedded.h"
@@ -195,6 +196,8 @@ typedef struct {
 	vk_pipeline_set p_embd_lookup;
 	vk_pipeline_set p_argmax;
 	vk_pipeline_set p_argmax_reduce;
+	vk_pipeline_set p_moe_gather;
+	vk_pipeline_set p_moe_combine;
 
 	vk_pipeline_set p_matmul_q4_0_batch;
 	vk_pipeline_set p_matmul_q4_0_res_batch;
@@ -286,6 +289,15 @@ typedef struct {
 	vk_buf argmax_out_buf;
 	size_t argmax_partial_cap;
 	vk_buf argmax_partial_buf;
+
+	vk_buf moe_arena;
+	size_t moe_arena_size;
+	int moe_arena_inter;
+	int moe_arena_dim;
+	vk_buf moe_batch_arena;
+	size_t moe_batch_arena_cap;
+	vk_buf moe_meta;
+	size_t moe_meta_cap;
 
 	vk_buf dummy_buf;
 
@@ -652,6 +664,8 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 				&p->p_embd_lookup,
 				&p->p_argmax,
 				&p->p_argmax_reduce,
+				&p->p_moe_gather,
+				&p->p_moe_combine,
 			&p->p_matmul_q4_0_batch,
 			&p->p_matmul_q4_0_res_batch,
 			&p->p_matmul_q4_0_dual_batch,
@@ -864,10 +878,15 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 		p->timeline_value++;
 		r->signal_value = p->timeline_value;
 
+		uint64_t wait_value = p->last_signal_value;
+		uint32_t wait_count = wait_value > 0 ? 1u : 0u;
+		VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 		VkTimelineSemaphoreSubmitInfo tsi = {
 				.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
 				.signalSemaphoreValueCount = 1,
 				.pSignalSemaphoreValues = &r->signal_value,
+				.waitSemaphoreValueCount = wait_count,
+				.pWaitSemaphoreValues = wait_count ? &wait_value : NULL,
 		};
 		VkSubmitInfo si = {
 				.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -876,6 +895,9 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 				.pCommandBuffers = &r->cmd,
 				.signalSemaphoreCount = 1,
 				.pSignalSemaphores = &p->timeline,
+				.waitSemaphoreCount = wait_count,
+				.pWaitSemaphores = wait_count ? &p->timeline : NULL,
+				.pWaitDstStageMask = wait_count ? &wait_stage : NULL,
 		};
 		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, VK_NULL_HANDLE);
 		if (submit_res != VK_SUCCESS) {
@@ -1039,6 +1061,11 @@ static status_code vk_flush(vk_priv *p) {
 	}
 
 static status_code vk_wbatch_flush(vk_priv *p) {
+	if (p->staging_pending_value && !vk_timeline_done(p, p->staging_pending_value)) {
+		status_code ws = vk_timeline_wait(p, p->staging_pending_value);
+		if (ws != OK)
+			return ws;
+	}
 	if (!p->wbatch_count)
 		return OK;
 	status_code s = vk_flush(p);
@@ -2022,6 +2049,16 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_argmax_reduce.name = "argmax_reduce";
+	s = vk_create_pipeline(p, shader_moe_gather_spv, shader_moe_gather_spv_len, 3, 8,
+						   &p->p_moe_gather);
+	if (s != OK)
+		return s;
+	p->p_moe_gather.name = "moe_gather";
+	s = vk_create_pipeline(p, shader_moe_combine_spv, shader_moe_combine_spv_len, 4, 12,
+						   &p->p_moe_combine);
+	if (s != OK)
+		return s;
+	p->p_moe_combine.name = "moe_combine";
 	{
 		VkBufferUsageFlags grid_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 		VkMemoryPropertyFlags grid_flags =
@@ -2228,6 +2265,8 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
 		vk_destroy_pipeline(p, &p->p_argmax);
 		vk_destroy_pipeline(p, &p->p_argmax_reduce);
+		vk_destroy_pipeline(p, &p->p_moe_gather);
+		vk_destroy_pipeline(p, &p->p_moe_combine);
 
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_res_batch);
@@ -2307,6 +2346,15 @@ static void vk_free(backend *self) {
 		}
 		if (p->argmax_partial_buf.buf) {
 			vk_free_buffer(p, &p->argmax_partial_buf);
+		}
+		if (p->moe_arena.buf) {
+			vk_free_buffer(p, &p->moe_arena);
+		}
+		if (p->moe_batch_arena.buf) {
+			vk_free_buffer(p, &p->moe_batch_arena);
+		}
+		if (p->moe_meta.buf) {
+			vk_free_buffer(p, &p->moe_meta);
 		}
 		if (p->dummy_buf.buf) {
 			vk_free_buffer(p, &p->dummy_buf);
@@ -2628,6 +2676,8 @@ static status_code vk_ensure_staging_cap(vk_priv *p, size_t need) {
 		return OK;
 
 	if (p->staging_buf.buf) {
+		if (!vk_timeline_done(p, p->staging_pending_value))
+			vk_timeline_wait(p, p->staging_pending_value);
 		vk_free_buffer(p, &p->staging_buf);
 		p->staging_cap = 0;
 	}
@@ -2640,6 +2690,325 @@ static status_code vk_ensure_staging_cap(vk_priv *p, size_t need) {
 		return s;
 	p->staging_cap = need;
 	return OK;
+}
+
+
+static status_code vk_buffer_alloc_from_host(backend *self, const void *host_data, size_t size,
+											 buffer *out) {
+	vk_priv *p = self->priv;
+	if (p->device_lost)
+		return ERR_INTERNAL;
+
+	vk_buf *b = xcalloc(1, sizeof(vk_buf));
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+							   VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+	status_code s = vk_alloc_buffer(p, size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b);
+	if (s != OK) {
+		s = vk_alloc_buffer(p, size, usage,
+							VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+								VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b);
+	}
+	if (s != OK) {
+		free(b);
+		return s;
+	}
+
+	if (b->mapped) {
+		memcpy(b->mapped, host_data, size);
+	} else {
+		if (p->wbatch_count || !p->staging_buf.buf ||
+				p->wbatch_off + size > p->staging_cap ||
+				!vk_timeline_done(p, p->staging_pending_value)) {
+			status_code fs = vk_wbatch_flush(p);
+			if (fs != OK) {
+				vk_free_buffer(p, b);
+				free(b);
+				return fs;
+			}
+		}
+		s = vk_ensure_staging_cap(p, size);
+		if (s != OK) {
+			vk_free_buffer(p, b);
+			free(b);
+			return s;
+		}
+		memcpy(p->staging_buf.mapped + p->wbatch_off, host_data, size);
+		VkBufferCopy copy = {.srcOffset = p->wbatch_off, .dstOffset = 0, .size = size};
+		vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, b->buf, 1, &copy);
+		VkMemoryBarrier wbar = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+				.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+		vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wbar, 0, NULL, 0,
+							 NULL);
+		p->wbatch_off += size;
+		p->wbatch_count++;
+		p->ring[p->ring_cur].has_work = 1;
+	}
+
+	out->handle = b;
+	out->size = size;
+	out->host_ptr = NULL;
+	out->owner = self;
+	return OK;
+}
+
+static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
+								   const buffer *x, buffer *y, int n, int k, int m);
+static status_code vk_scale_inplace(backend *self, buffer *x, float scale, int n);
+static status_code vk_ffn_activate_batch_scales(backend *self, const buffer *gate,
+												const buffer *up, buffer *out, int n,
+												int activation, int m, float gs, float us);
+static status_code vk_add_inplace(backend *self, buffer *x, const buffer *y, int n);
+static status_code vk_moe_experts_batch_gpu(backend *self, const buffer *xb, buffer *out,
+											int n_rows, int dim, int inter, int use_gelu,
+											int n_experts, const moe_gpu_expert *experts,
+											const int *counts, const int *rows_packed,
+											const float *weights_packed);
+
+static status_code vk_moe_expert_ffn_gpu(backend *self, const buffer *x, buffer *out,
+										 const moe_gpu_expert *e, int dim, int inter) {
+	vk_priv *p = self->priv;
+	if (p->device_lost)
+		return ERR_INTERNAL;
+	if (!x || !out || !e || !e->gate_w || !e->down_w || (!e->up_w && !e->gate_up_fused))
+		return ERR_INVALID_ARG;
+	if (p->moe_arena.buf && (p->moe_arena_inter != inter || p->moe_arena_dim != dim)) {
+		vk_free_buffer(p, &p->moe_arena);
+		p->moe_arena.buf = VK_NULL_HANDLE;
+	}
+	if (!p->moe_arena.buf) {
+		size_t bytes = ((size_t)3 * inter + dim) * sizeof(float);
+		status_code s = vk_alloc_buffer(p, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+										VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->moe_arena);
+		if (s != OK)
+			return s;
+		p->moe_arena_size = bytes;
+		p->moe_arena_inter = inter;
+		p->moe_arena_dim = dim;
+	}
+	(void)p->moe_arena_size;
+
+	buffer arena = {0};
+	arena.handle = &p->moe_arena;
+	arena.owner = self;
+
+	buffer gate_v = buffer_slice(&arena, 0, (size_t)2 * inter * sizeof(float));
+	buffer up_v = buffer_slice(&arena, (size_t)inter * sizeof(float),
+							   (size_t)inter * sizeof(float));
+	buffer act_v = buffer_slice(&arena, (size_t)2 * inter * sizeof(float),
+								(size_t)inter * sizeof(float));
+	buffer y_v = buffer_slice(&arena, (size_t)3 * inter * sizeof(float),
+							  (size_t)dim * sizeof(float));
+
+	int act = e->use_gelu ? ACTIVATION_GELU : ACTIVATION_SILU;
+
+	if (e->gate_up_fused) {
+		status_code s = vk_matmul_batch(self, e->gate_w, e->gate_type, x, &gate_v, inter * 2,
+										dim, 1);
+		if (s != OK)
+			return s;
+		vk_ffn_activate_batch_scales(self, &gate_v, &up_v, &act_v, inter, act, 1,
+									 e->gate_scale, e->up_scale);
+	} else {
+		status_code s = vk_matmul_batch(self, e->gate_w, e->gate_type, x, &gate_v, inter, dim, 1);
+		if (s != OK)
+			return s;
+		s = vk_matmul_batch(self, e->up_w, e->up_type, x, &up_v, inter, dim, 1);
+		if (s != OK)
+			return s;
+		vk_ffn_activate_batch_scales(self, &gate_v, &up_v, &act_v, inter, act, 1,
+									 e->gate_scale, e->up_scale);
+	}
+
+	status_code s = vk_matmul_batch(self, e->down_w, e->down_type, &act_v, &y_v, dim, inter, 1);
+	if (s != OK)
+		return s;
+
+	float ws = e->weight * e->down_scale;
+	if (ws != 1.0f)
+		vk_scale_inplace(self, &y_v, ws, dim);
+	return vk_add_inplace(self, out, &y_v, dim);
+}
+
+
+static size_t vk_meta_align(size_t v, size_t a) {
+	return (v + a - 1) & ~(a - 1);
+}
+
+static status_code vk_moe_experts_batch_gpu(backend *self, const buffer *xb, buffer *out,
+											int n_rows, int dim, int inter, int use_gelu,
+											int n_experts, const moe_gpu_expert *experts,
+											const int *counts, const int *rows_packed,
+											const float *weights_packed) {
+	(void)n_rows;
+	(void)use_gelu;
+	vk_priv *p = self->priv;
+	if (p->device_lost)
+		return ERR_INTERNAL;
+	if (!p->p_moe_gather.pipeline || !p->p_moe_combine.pipeline)
+		return ERR_UNSUPPORTED;
+
+	size_t align = p->caps.storage_buffer_offset_alignment > 0
+					   ? (size_t)p->caps.storage_buffer_offset_alignment
+					   : 256;
+	if (align < 256)
+		align = 256;
+
+	size_t meta_need = 0;
+	for (int i = 0; i < n_experts; i++)
+		meta_need += vk_meta_align((size_t)counts[i] * 4, align) * 2;
+	if (meta_need == 0)
+		return ERR_INVALID_ARG;
+	if (!p->moe_meta.buf || p->moe_meta_cap < meta_need) {
+		if (p->moe_meta.buf)
+			vk_free_buffer(p, &p->moe_meta);
+		status_code s = vk_alloc_buffer(p, meta_need,
+										VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+										VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+											VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+										&p->moe_meta);
+		if (s != OK)
+			return s;
+		p->moe_meta_cap = meta_need;
+	}
+	if (!p->moe_meta.mapped)
+		return ERR_INTERNAL;
+
+	if (p->last_signal_value > p->timeline_completed || p->ring[p->ring_cur].has_work) {
+		status_code fs = vk_flush(p);
+		if (fs != OK)
+			return fs;
+	}
+
+	size_t batch_bytes = 0;
+	for (int i = 0; i < n_experts; i++) {
+		size_t cnt = (size_t)counts[i];
+		batch_bytes += vk_meta_align(cnt * dim * 4, align);
+		batch_bytes += vk_meta_align(cnt * 2 * inter * 4, align);
+		batch_bytes += vk_meta_align(cnt * inter * 4, align);
+		batch_bytes += vk_meta_align(cnt * dim * 4, align);
+	}
+	if (!p->moe_batch_arena.buf || p->moe_batch_arena_cap < batch_bytes) {
+		if (p->moe_batch_arena.buf)
+			vk_free_buffer(p, &p->moe_batch_arena);
+		status_code s = vk_alloc_buffer(p, batch_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+										VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+										&p->moe_batch_arena);
+		if (s != OK)
+			return s;
+		p->moe_batch_arena_cap = batch_bytes;
+	}
+
+	int *r_off = xmalloc((size_t)n_experts * sizeof(int));
+	int *w_off = xmalloc((size_t)n_experts * sizeof(int));
+	int *x_off = xmalloc((size_t)n_experts * sizeof(int));
+	int *gu_off = xmalloc((size_t)n_experts * sizeof(int));
+	int *act_off = xmalloc((size_t)n_experts * sizeof(int));
+	int *y_off = xmalloc((size_t)n_experts * sizeof(int));
+	if (!r_off || !w_off || !x_off || !gu_off || !act_off || !y_off) {
+		free(r_off); free(w_off); free(x_off); free(gu_off); free(act_off); free(y_off);
+		return ERR_OUT_OF_MEMORY;
+	}
+
+	size_t mo = 0, ao = 0, packed = 0;
+	for (int i = 0; i < n_experts; i++) {
+		size_t cb = (size_t)counts[i] * 4;
+		r_off[i] = (int)mo;
+		memcpy((uint8_t *)p->moe_meta.mapped + mo, rows_packed + packed, cb);
+		mo += vk_meta_align(cb, align);
+		w_off[i] = (int)mo;
+		memcpy((uint8_t *)p->moe_meta.mapped + mo, weights_packed + packed, cb);
+		mo += vk_meta_align(cb, align);
+		x_off[i] = (int)ao;
+		ao += vk_meta_align((size_t)counts[i] * dim * 4, align);
+		gu_off[i] = (int)ao;
+		ao += vk_meta_align((size_t)counts[i] * 2 * inter * 4, align);
+		act_off[i] = (int)ao;
+		ao += vk_meta_align((size_t)counts[i] * inter * 4, align);
+		y_off[i] = (int)ao;
+		ao += vk_meta_align((size_t)counts[i] * dim * 4, align);
+		packed += (size_t)counts[i];
+	}
+
+	buffer arena = {0};
+	arena.handle = &p->moe_batch_arena;
+	arena.owner = self;
+
+	status_code st = OK;
+	for (int i = 0; i < n_experts && st == OK; i++) {
+		int cnt = counts[i];
+		if (cnt <= 0 || !experts[i].gate_w)
+			continue;
+		const moe_gpu_expert *e = &experts[i];
+
+		buffer x_v = buffer_slice(&arena, x_off[i], (size_t)cnt * dim * 4);
+		buffer gu_v = buffer_slice(&arena, gu_off[i], (size_t)cnt * 2 * inter * 4);
+		buffer g_v = buffer_slice(&gu_v, 0, (size_t)cnt * inter * 4);
+		buffer u_v = buffer_slice(&gu_v, (size_t)cnt * inter * 4, (size_t)cnt * inter * 4);
+		buffer act_v = buffer_slice(&arena, act_off[i], (size_t)cnt * inter * 4);
+		buffer y_v = buffer_slice(&arena, y_off[i], (size_t)cnt * dim * 4);
+
+		struct {
+			int32_t cnt, dim;
+		} gpush = {cnt, dim};
+		vk_buf *gbufs[3] = {as_vkbuf(xb), &p->moe_meta, &p->moe_batch_arena};
+		VkDeviceSize goffs[3] = {xb->offset, r_off[i], x_off[i]};
+		uint32_t groups = (uint32_t)(((size_t)cnt * dim + 255) / 256);
+		st = vk_dispatch_ex(p, &p->p_moe_gather, gbufs, goffs, NULL, 3, &gpush, sizeof(gpush),
+							groups, 1, 1u << 2);
+		if (st != OK)
+			break;
+
+		int act = e->use_gelu ? ACTIVATION_GELU : ACTIVATION_SILU;
+		if (e->gate_up_fused) {
+			st = vk_matmul_batch(self, e->gate_w, e->gate_type, &x_v, &gu_v, inter * 2, dim, cnt);
+			if (st != OK)
+				break;
+			for (int c = 0; c < cnt && st == OK; c++) {
+				buffer g_row =
+					buffer_slice(&gu_v, (size_t)c * 2 * inter * 4, (size_t)inter * 4);
+				buffer u_row = buffer_slice(&gu_v, ((size_t)c * 2 + 1) * inter * 4,
+											(size_t)inter * 4);
+				buffer a_row = buffer_slice(&act_v, (size_t)c * inter * 4, (size_t)inter * 4);
+				st = vk_ffn_activate_batch_scales(self, &g_row, &u_row, &a_row, inter, act, 1,
+												  e->gate_scale, e->up_scale);
+			}
+			if (st != OK)
+				break;
+		} else {
+			st = vk_matmul_batch(self, e->gate_w, e->gate_type, &x_v, &g_v, inter, dim, cnt);
+			if (st != OK)
+				break;
+			st = vk_matmul_batch(self, e->up_w, e->up_type, &x_v, &u_v, inter, dim, cnt);
+			if (st != OK)
+				break;
+			st = vk_ffn_activate_batch_scales(self, &g_v, &u_v, &act_v, inter, act, cnt,
+											  e->gate_scale, e->up_scale);
+			if (st != OK)
+				break;
+		}
+		st = vk_matmul_batch(self, e->down_w, e->down_type, &act_v, &y_v, dim, inter, cnt);
+		if (st != OK)
+			break;
+
+		struct {
+			int32_t cnt, dim;
+			float ds;
+		} cpush = {cnt, dim, e->down_scale};
+		vk_buf *cbufs[4] = {&p->moe_batch_arena, &p->moe_meta, &p->moe_meta, as_vkbuf(out)};
+		VkDeviceSize coffs[4] = {y_off[i], w_off[i], r_off[i], out->offset};
+		st = vk_dispatch_ex(p, &p->p_moe_combine, cbufs, coffs, NULL, 4, &cpush,
+							sizeof(cpush), groups, 1, 1u << 3);
+		if (st != OK)
+			break;
+	}
+
+	free(r_off); free(w_off); free(x_off); free(gu_off); free(act_off); free(y_off);
+	return st;
 }
 
 static status_code vk_buffer_upload(backend *self, buffer *buf, const void *host_src, size_t size) {
@@ -2743,6 +3112,20 @@ static status_code vk_buffer_write_f32(backend *self, buffer *buf, const float *
 	return vk_buffer_upload(self, buf, host_src, (size_t)n * sizeof(float));
 }
 
+static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
+	if (!b->buf || !b->size)
+		return OK;
+	vk_ring_slot *r = &p->ring[p->ring_cur];
+	if (!r->recording) {
+		status_code bs = vk_ring_begin(p, p->ring_cur);
+		if (bs != OK)
+			return bs;
+	}
+	vkCmdFillBuffer(p->cmd, b->buf, 0, VK_WHOLE_SIZE, 0);
+	r->has_work = 1;
+	return vk_run_cmd_sync(p);
+}
+
 static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_size,
 									 int n_kv_layers, const size_t *layer_bytes,
 									 size_t *layer_off_elems, vk_kv_store *out) {
@@ -2796,6 +3179,9 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 			s = vk_alloc_buffer(p, total, kv_usage, kv_fallback, &out->single);
 		if (s == OK) {
 			out->chunked = 0;
+			s = vk_zero_buffer(p, &out->single);
+			if (s != OK)
+				return s;
 			return OK;
 		}
 		if (n_kv_layers > 1) {
@@ -2841,6 +3227,13 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 						i, n, layer_sz);
 			return s;
 		}
+			s = vk_zero_buffer(p, &chunks[i]);
+			if (s != OK) {
+				for (int j = 0; j <= i; j++)
+					vk_free_buffer(p, &chunks[j]);
+				free(chunks);
+				return s;
+			}
 	}
 	out->chunked = 1;
 	out->n_chunks = n;
@@ -3199,8 +3592,9 @@ static status_code vk_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_h
 static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
 									 int pos_start, const float *rope_cos_base,
 									 const float *rope_sin_base, const float *freq_factors, int m);
-static status_code vk_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
-										 buffer *out, int n, int activation, int m);
+static status_code vk_ffn_activate_batch_scales(backend *self, const buffer *gate,
+												const buffer *up, buffer *out, int n,
+												int activation, int m, float gs, float us);
 static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n, int m);
 
 static status_code vk_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -4266,7 +4660,7 @@ static status_code vk_ple_combine(backend *self, buffer *ple, const buffer *proj
 
 static status_code vk_ffn_activate(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								   int n) {
-	return vk_ffn_activate_batch(self, gate, up, out, n, 0, 1);
+	return vk_ffn_activate_batch_scales(self, gate, up, out, n, 0, 1, 1.0f, 1.0f);
 }
 
 static status_code vk_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
@@ -4443,7 +4837,7 @@ static status_code vk_rmsnorm_add(backend *self, const buffer *x, const buffer *
 
 static status_code vk_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up,
 									  buffer *out, int n, int activation) {
-	return vk_ffn_activate_batch(self, gate, up, out, n, activation, 1);
+	return vk_ffn_activate_batch_scales(self, gate, up, out, n, activation, 1, 1.0f, 1.0f);
 }
 
 static status_code vk_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
@@ -4818,15 +5212,17 @@ static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n
 							 groups_x, (uint32_t)m, 0x1);
 }
 
-static status_code vk_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
-										 buffer *out, int n, int activation, int m) {
+static status_code vk_ffn_activate_batch_scales(backend *self, const buffer *gate,
+												const buffer *up, buffer *out, int n,
+												int activation, int m, float gs, float us) {
 	vk_priv *p = self->priv;
 	if (!p->p_ffn_activate_batch.pipeline)
 		return ERR_UNSUPPORTED;
 	struct {
 		int32_t n, activation;
 		int32_t m;
-	} push				  = {n, activation, m};
+		float gs, us;
+	} push				  = {n, activation, m, gs, us};
 	vk_buf		*bufs[3]  = {as_vkbuf(gate), as_vkbuf(up), as_vkbuf(out)};
 	VkDeviceSize offs[3]  = {gate->offset, up->offset, out->offset};
 	uint32_t	 groups_x = (uint32_t)((n + 63) / 64);
@@ -5175,12 +5571,17 @@ static status_code vk_attention_swa_batch(backend *self, const buffer *q, const 
 								   n_kv_heads_active, sliding_window, attn_start, m);
 }
 
+static status_code vk_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
+										 buffer *out, int n, int activation, int m) {
+	return vk_ffn_activate_batch_scales(self, gate, up, out, n, activation, m, 1.0f, 1.0f);
+}
+
 static status_code vk_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "vulkan";
 	out->priority = 100;
 	out->caps  = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
-				 BCAP_MATMUL_FFN_DOWN;
+				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_GPU;
 	out->probe = vk_probe;
 	out->init  = vk_init;
 	out->free  = vk_free;
@@ -5205,6 +5606,9 @@ static status_code vk_ctor(backend *out) {
 	out->attention				   = vk_attention;
 	out->add_inplace			   = vk_add_inplace;
 	out->scale_inplace			   = vk_scale_inplace;
+	out->buffer_alloc_from_host	   = vk_buffer_alloc_from_host;
+	out->moe_expert_ffn_gpu		   = vk_moe_expert_ffn_gpu;
+	out->moe_experts_batch_gpu	   = vk_moe_experts_batch_gpu;
 	out->copy_buffer = vk_copy_buffer;
 	out->ple_combine = vk_ple_combine;
 	out->ffn_activate = vk_ffn_activate;
