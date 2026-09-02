@@ -28,11 +28,6 @@ static inline void recipe_unused(int dummy, ...) {
 
 static backend *cached_host_backend = NULL;
 
-void recipe_init(void) {
-	if (!cached_host_backend)
-		cached_host_backend = backend_host();
-}
-
 static inline backend *op_host_backend(void) {
 	backend *b = cached_host_backend;
 	if (!b) {
@@ -41,7 +36,7 @@ static inline backend *op_host_backend(void) {
 	}
 	return b;
 }
-#define OP_BACKEND(field) ((a == op_host_backend() || (a->field)) ? a : op_backend_fallback(a))
+#define OP_BACKEND(field) ((a->field) ? a : (a == op_host_backend() ? a : op_backend_fallback(a)))
 static status_code	 exec_op(const recipe_op *op, struct model *m, struct kvcache *cache,
 							 struct compute_scratch *s, int token, int pos, int li, int flash_attn,
 							 float *logits_out);
@@ -188,6 +183,56 @@ static void recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops) {
 	}
 }
 
+static int model_has_sliding_layers(const model *m);
+
+static int recipe_uses_mla(const model_recipe *r) {
+	for (int i = 0; i < r->layer.n_ops; i++)
+		if (r->layer.ops[i].kind == OP_ATTENTION_MLA)
+			return 1;
+	return 0;
+}
+
+static status_code recipe_require_capability(const struct model *m, const backend *a,
+											 const char *op_name, int native, int fallback_native,
+											 int allow_fallback) {
+	if (native)
+		return OK;
+	if (allow_fallback && fallback_native) {
+		WARN("backend '%s': falling back to cpu for %s", a->name, op_name);
+		return OK;
+	}
+	ERROR("recipe_build: '%s' needs %s, unsupported on backend '%s'%s", m->arch_info->gguf_name,
+		  op_name, a->name, allow_fallback ? " (no CPU fallback)" : "");
+	return allow_fallback ? ERR_FORMAT : ERR_UNSUPPORTED;
+}
+
+static status_code recipe_check_backend_capabilities(const model_recipe *r, const struct model *m) {
+	const backend *a = m->backend;
+	status_code	   s;
+
+	if (recipe_uses_mla(r)) {
+		s = recipe_require_capability(m, a, "attention_mla", a->attention_mla != NULL, 0, 0);
+		if (s != OK)
+			return s;
+	}
+	if (model_has_sliding_layers(m) && !a->attention_swa) {
+		backend *host = backend_host();
+		s = recipe_require_capability(m, a, "attention_swa", 0,
+									  host && host != a && host->attention_swa != NULL, 1);
+		if (s != OK)
+			return s;
+	}
+	if (m->moe.n_experts > 0 && !a->matmul_thread_local) {
+		backend *host = backend_host();
+		s = recipe_require_capability(m, a, "matmul_thread_local", 0,
+									  host && host != a && host->matmul_thread_local != NULL, 1);
+		if (s != OK)
+			return s;
+	}
+
+	return OK;
+}
+
 model_recipe *recipe_build(const struct model *m) {
 	if (!m || !m->arch_info)
 		return NULL;
@@ -332,6 +377,11 @@ model_recipe *recipe_build(const struct model *m) {
 			bs_mask |= op_batch_slot_mask(&r->layer.ops[j]);
 	}
 	r->bs_slot_mask = bs_mask;
+
+	if (recipe_check_backend_capabilities(r, m) != OK) {
+		recipe_free(r);
+		return NULL;
+	}
 
 	return r;
 }
