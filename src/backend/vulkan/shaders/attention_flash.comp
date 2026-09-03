@@ -18,6 +18,9 @@ layout(push_constant) uniform Params {
     float scale;
     int stride_head_dim;
     int attn_start;
+#ifdef BATCHED
+    int m;
+#endif
 } params;
 
 layout(constant_id = 0) const int HEAD_DIM = 64;
@@ -50,8 +53,20 @@ void main() {
     int attn_start = params.attn_start;
     float scale = params.scale;
 
+#ifdef BATCHED
+    uint row = gl_WorkGroupID.y;
+    if (row >= uint(params.m)) return;
+    pos = params.pos + int(row);
+    uint q_row_off   = row * uint(params.n_heads) * uint(HEAD_DIM);
+    uint out_row_off = row * uint(params.n_heads) * uint(HEAD_DIM);
+#else
+    const uint row = 0u;
+    const uint q_row_off = 0u;
+    const uint out_row_off = 0u;
+#endif
+
     int dpl = HEAD_DIM / LANES_PER_HEAD;
-    uint q_base = uint(my_head) * uint(HEAD_DIM);
+    uint q_base = q_row_off + uint(my_head) * uint(HEAD_DIM);
     float qv[MAX_DPL];
     if (valid) {
         for (int i = 0; i < dpl; i++) qv[i] = q[q_base + uint(lane) * uint(dpl) + uint(i)];
@@ -118,7 +133,7 @@ void main() {
 
     if (valid) {
         precise float inv_S = S > 0.0 ? 1.0 / S : 0.0;
-        uint d0 = q_base + uint(lane) * uint(dpl);
+        uint d0 = out_row_off + q_base + uint(lane) * uint(dpl);
         for (int i = 0; i < dpl; i++) out_[d0 + uint(i)] = vkq[i] * inv_S;
     }
 }

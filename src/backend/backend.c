@@ -56,9 +56,13 @@ static void accel_log_op_homes(backend *b) {
 		{"rmsnorm_noweight_per_head", b->rmsnorm_noweight_per_head != NULL},
 		{"matmul", b->matmul != NULL},
 		{"rope", b->rope != NULL},
+		{"rope_ext", b->rope_ext != NULL},
+		{"rope_qk", b->rope_qk != NULL},
 		{"attention", b->attention != NULL},
+		{"attention_swa", b->attention_swa != NULL},
 		{"add_inplace", b->add_inplace != NULL},
 		{"ffn_activate", b->ffn_activate != NULL},
+		{"ffn_activate_ex", b->ffn_activate_ex != NULL},
 		{"argmax", b->argmax != NULL},
 	};
 	int	 n_native = 0;
@@ -74,7 +78,7 @@ static void accel_log_op_homes(backend *b) {
 		snprintf(missing + len, sizeof(missing) - len, "%s%s", len ? ", " : "", ops[i].op);
 	}
 	if (n_native == n_total) {
-		INFO("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
+		DEBUG("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
 	} else {
 		WARN("backend '%s': %d/%d core ops native, falling back to host for: %s", b->name, n_native,
 			 n_total, missing);

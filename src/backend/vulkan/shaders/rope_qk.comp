@@ -12,6 +12,7 @@ layout(push_constant) uniform Params {
     int head_dim;
     int pos;
     int neox;
+    int m;
 } params;
 
 void main() {
@@ -20,12 +21,18 @@ void main() {
     int total_q = params.n_heads * hd2;
     int total_k = params.n_kv_heads * hd2;
 
+    uint row = gl_WorkGroupID.y;
+    if (row >= uint(params.m)) return;
+    int pos = params.pos + int(row);
+    uint q_row_off = row * uint(params.n_heads) * uint(params.head_dim);
+    uint k_row_off = row * uint(params.n_kv_heads) * uint(params.head_dim);
+
     if (int(gid) < total_q) {
         int h = int(gid) / hd2;
         int j = int(gid) % hd2;
-        mediump float c = rcos[uint(params.pos) * uint(hd2) + uint(j)];
-        mediump float s = rsin[uint(params.pos) * uint(hd2) + uint(j)];
-        uint base = uint(h) * uint(params.head_dim);
+        mediump float c = rcos[uint(pos) * uint(hd2) + uint(j)];
+        mediump float s = rsin[uint(pos) * uint(hd2) + uint(j)];
+        uint base = q_row_off + uint(h) * uint(params.head_dim);
         if (params.neox != 0) {
             mediump float v0 = q[base + uint(j)];
             mediump float v1 = q[base + uint(j) + uint(hd2)];
@@ -44,9 +51,9 @@ void main() {
     if (int(kid) < total_k) {
         int h = int(kid) / hd2;
         int j = int(kid) % hd2;
-        mediump float c = rcos[uint(params.pos) * uint(hd2) + uint(j)];
-        mediump float s = rsin[uint(params.pos) * uint(hd2) + uint(j)];
-        uint base = uint(h) * uint(params.head_dim);
+        mediump float c = rcos[uint(pos) * uint(hd2) + uint(j)];
+        mediump float s = rsin[uint(pos) * uint(hd2) + uint(j)];
+        uint base = k_row_off + uint(h) * uint(params.head_dim);
         if (params.neox != 0) {
             mediump float v0 = k[base + uint(j)];
             mediump float v1 = k[base + uint(j) + uint(hd2)];

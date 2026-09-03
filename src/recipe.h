@@ -285,8 +285,6 @@ typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 void					 recipe_register(const char *arch_gguf_name, recipe_builder_fn builder);
 const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name);
 
-void recipe_init(void);
-
 model_recipe *recipe_build(const struct model *m);
 void		  recipe_free(model_recipe *r);
 

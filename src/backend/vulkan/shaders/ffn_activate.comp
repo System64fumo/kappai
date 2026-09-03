@@ -8,6 +8,9 @@ layout(set = 0, binding = 2) writeonly buffer OutBuf { float out_[]; };
 layout(push_constant) uniform Params {
     int n;
     int activation;
+    int m;
+    float gs;
+    float us;
 } params;
 
 float gelu_tanh(float x) {
@@ -18,13 +21,16 @@ float gelu_tanh(float x) {
 }
 
 void main() {
+    uint row = gl_WorkGroupID.y;
+    if (row >= uint(params.m)) return;
+    uint row_off = row * uint(params.n);
     uint i = gl_GlobalInvocationID.x;
     if (int(i) >= params.n) return;
-    float g = gate[i];
-    float u = up[i];
+    float g = gate[row_off + i] * params.gs;
+    float u = up[row_off + i] * params.us;
     if (params.activation == 1) {
-        out_[i] = gelu_tanh(g) * u;
+        out_[row_off + i] = gelu_tanh(g) * u;
     } else {
-        out_[i] = g / (1.0 + exp(-g)) * u;
+        out_[row_off + i] = g / (1.0 + exp(-g)) * u;
     }
 }

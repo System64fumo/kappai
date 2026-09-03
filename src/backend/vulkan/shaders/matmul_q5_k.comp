@@ -18,6 +18,7 @@ layout(set = 0, binding = 2) writeonly buffer YBuf { float y[]; };
 layout(push_constant) uniform Params {
     int n;
     int k;
+    int m;
 } params;
 
 #include "common.glsl"
@@ -45,6 +46,13 @@ void main() {
     int blocks_per_row = k / 256;
     uint row_stride = uint(blocks_per_row) * Q5_K_BLOCK_BYTES;
 
+    uint row = gl_WorkGroupID.y;
+    uint x_off = row * uint(k);
+    uint y_off = row * uint(params.n);
+#ifdef HAS_RESIDUAL
+    uint r_off = y_off;
+#endif
+
     precise float acc = 0.0;
     bool valid = (int(i) < params.n);
 
@@ -53,7 +61,7 @@ void main() {
         int tile_len = tile_end - tile_start;
 
         for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
-            x_shared[j] = x[tile_start + j];
+            x_shared[j] = x[x_off + uint(tile_start + j)];
         }
         barrier();
 
@@ -169,8 +177,8 @@ void main() {
 
     if (!valid) return;
 #ifdef HAS_RESIDUAL
-    y[i] = acc + residual[i];
+    y[y_off + i] = acc + residual[r_off + i];
 #else
-    y[i] = acc;
+    y[y_off + i] = acc;
 #endif
 }

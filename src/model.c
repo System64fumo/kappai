@@ -194,30 +194,6 @@ static int check_expert_tensor_dims(const gguf_ctx *g, const char *name, uint64_
 	return 0;
 }
 
-static int validate_swa_support(const model *m) {
-	if (m->sliding_window <= 0)
-		return 0;
-	int any_sliding = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		if (m->layers[i].is_sliding) {
-			any_sliding = 1;
-			break;
-		}
-	}
-	if (!any_sliding)
-		return 0;
-	int has_swa = m->backend->attention_swa != NULL ||
-				  (backend_host() != m->backend && backend_host()->attention_swa != NULL);
-	if (!has_swa) {
-		ERROR("model: '%s' has sliding-window layers but backend '%s' (and its CPU fallback) "
-			  "have no attention_swa implementation; refusing to load to avoid silently "
-			  "computing full (unwindowed) attention on SWA layers",
-			  m->arch_info->gguf_name, m->backend->name ? m->backend->name : "unknown");
-		return -1;
-	}
-	return 0;
-}
-
 static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	char tname[128];
 
@@ -2705,11 +2681,6 @@ status_code model_load_parse(model *m, const char *path, backend *accel, int use
 
 	s = model_load_tensor_layout(m, g);
 	if (s != OK) {
-		goto fail;
-	}
-
-	if (validate_swa_support(m)) {
-		s = ERR_FORMAT;
 		goto fail;
 	}
 

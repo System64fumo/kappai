@@ -117,6 +117,7 @@ typedef struct model_moe_params {
 	int	  norm_topk_prob;
 	int	  first_dense_layer;
 	float router_dim_scale;
+	int	  gpu_resident;
 } model_moe_params;
 
 typedef struct model_layer_dims_params {

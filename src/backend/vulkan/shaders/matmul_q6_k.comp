@@ -34,6 +34,7 @@ layout(push_constant) uniform Params {
     int n0;
     int n1;
     int k;
+    int m;
 } params;
 
 #include "common.glsl"
@@ -113,6 +114,16 @@ void main() {
     int blocks_per_row = k / 256;
     uint row_stride = uint(blocks_per_row) * Q6_K_BLOCK_BYTES;
 
+    uint row = gl_WorkGroupID.y;
+    uint x_off = row * uint(k);
+    uint y0_off = row * uint(params.n0);
+#ifdef HAS_RESIDUAL
+    uint r_off = y0_off;
+#endif
+#if NMAT >= 2
+    uint y1_off = row * uint(params.n1);
+#endif
+
     precise float acc0 = 0.0;
     bool valid0 = (int(i) < params.n0);
 
@@ -126,7 +137,7 @@ void main() {
         int tile_len = tile_end - tile_start;
 
         for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
-            x_shared[j] = x[tile_start + j];
+            x_shared[j] = x[x_off + uint(tile_start + j)];
         }
         barrier();
 
@@ -328,11 +339,11 @@ void main() {
     }
 
 #if NMAT >= 2
-    if (valid0) y0[i] = acc0;
-    if (valid1) y1[i] = acc1;
+    if (valid0) y0[y0_off + i] = acc0;
+    if (valid1) y1[y1_off + i] = acc1;
 #elif defined(HAS_RESIDUAL)
-    if (valid0) y0[i] = acc0 + residual[i];
+    if (valid0) y0[y0_off + i] = acc0 + residual[r_off + i];
 #else
-    if (valid0) y0[i] = acc0;
+    if (valid0) y0[y0_off + i] = acc0;
 #endif
 }

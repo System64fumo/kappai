@@ -1,8 +1,8 @@
 #version 450
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0) readonly buffer LogitsBuf { float logits[]; };
-layout(set = 0, binding = 1) buffer PartialBuf { uvec2 partials[]; };
+layout(set = 0, binding = 0) readonly buffer PartialBuf { uvec2 partials[]; };
+layout(set = 0, binding = 1) buffer OutBuf { uint best_idx[]; };
 
 layout(push_constant) uniform Params {
     int n;
@@ -15,20 +15,15 @@ shared uint  s_idx[64];
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint n   = uint(params.n);
-    uint wg  = uint(params.groups);
-
-    uint chunk = (n + wg - 1u) / wg;
-    uint lo = gl_WorkGroupID.x * chunk;
-    uint hi = min(lo + chunk, n);
 
     float my_val = uintBitsToFloat(0xFF800000u);
     uint  my_idx = 0u;
 
-    for (uint i = lo + tid; i < hi; i += 64u) {
-        float v = logits[i];
+    for (uint i = tid; i < n; i += 64u) {
+        float v = uintBitsToFloat(partials[i].x);
         if (v > my_val) {
             my_val = v;
-            my_idx = i;
+            my_idx = partials[i].y;
         }
     }
 
@@ -49,6 +44,6 @@ void main() {
     }
 
     if (tid == 0u) {
-        partials[gl_WorkGroupID.x] = uvec2(floatBitsToUint(s_val[0]), s_idx[0]);
+        best_idx[0] = s_idx[0];
     }
 }

@@ -1,0 +1,19 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer SrcBuf { float src[]; };
+layout(set = 0, binding = 1) readonly buffer RowsBuf { int rows[]; };
+layout(set = 0, binding = 2) writeonly buffer DstBuf { float dst[]; };
+
+layout(push_constant) uniform Params {
+    int cnt;
+    int dim;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uint(params.cnt) * uint(params.dim)) return;
+    uint c = idx / uint(params.dim);
+    uint d = idx - c * uint(params.dim);
+    dst[idx] = src[uint(rows[c]) * uint(params.dim) + d];
+}

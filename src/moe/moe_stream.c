@@ -947,6 +947,53 @@ status_code moe_stream_cache_init(struct model *m) {
 			free((void *)layers);
 		}
 	}
+	if (full_resident && m->backend && m->backend->moe_expert_ffn_gpu &&
+		m->backend->buffer_alloc_from_host && (m->backend->caps & BCAP_MOE_EXPERT_GPU)) {
+		int		 uploaded  = 0;
+		int		 failed	   = 0;
+		size_t	 gpu_bytes = 0;
+		uint64_t t0		   = time_us();
+		for (int i = 0; i < m->n_layers && !failed; i++) {
+			for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
+				moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
+				moe_expert_bytes eb = moe_calc_expert_bytes(m, i, sl->eid);
+				status_code		 st = m->backend->buffer_alloc_from_host(m->backend, sl->gate_w,
+																		 eb.gate_b, &sl->gpu_gate);
+				if (st == OK && !sl->gate_up_fused)
+					st = m->backend->buffer_alloc_from_host(m->backend, sl->up_w, eb.up_b,
+															&sl->gpu_up);
+				if (st == OK)
+					st = m->backend->buffer_alloc_from_host(m->backend, sl->down_w, eb.down_b,
+															&sl->gpu_down);
+				if (st != OK) {
+					failed = 1;
+					break;
+				}
+				gpu_bytes += eb.total;
+				sl->gpu_ready = 1;
+				uploaded++;
+			}
+		}
+		if (failed) {
+			for (int i = 0; i < m->n_layers; i++) {
+				for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
+					moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
+					if (sl->gpu_ready && sl->gpu_gate.owner)
+						sl->gpu_gate.owner->buffer_free(sl->gpu_gate.owner, &sl->gpu_gate);
+					if (sl->gpu_up.owner)
+						sl->gpu_up.owner->buffer_free(sl->gpu_up.owner, &sl->gpu_up);
+					if (sl->gpu_down.owner)
+						sl->gpu_down.owner->buffer_free(sl->gpu_down.owner, &sl->gpu_down);
+					sl->gpu_ready = 0;
+				}
+			}
+			INFO("MoE: GPU expert residency unavailable (allocation failed) -- keeping CPU path");
+		} else if (uploaded > 0) {
+			m->moe.gpu_resident = 1;
+			INFO("MoE: %d experts resident on GPU (%.1f MB) in %.1f s", uploaded,
+				 (double)gpu_bytes / (1024.0 * 1024.0), (double)(time_us() - t0) / 1e6);
+		}
+	}
 
 	return OK;
 }
@@ -956,6 +1003,16 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		return;
 
 	for (int i = 0; i < c->n_layers; i++) {
+		for (int s = 0; s < c->layers[i].n_pinned; s++) {
+			moe_expert_slot *sl = &c->layers[i].pinned_slots[s];
+			if (sl->gpu_gate.owner)
+				sl->gpu_gate.owner->buffer_free(sl->gpu_gate.owner, &sl->gpu_gate);
+			if (sl->gpu_up.owner)
+				sl->gpu_up.owner->buffer_free(sl->gpu_up.owner, &sl->gpu_up);
+			if (sl->gpu_down.owner)
+				sl->gpu_down.owner->buffer_free(sl->gpu_down.owner, &sl->gpu_down);
+			sl->gpu_ready = 0;
+		}
 		for (int s = 0; s < c->layers[i].n_pinned; s++) {
 			free(c->layers[i].pinned_slots[s].heap_buf);
 		}
@@ -1203,6 +1260,10 @@ static void slot_zero(moe_expert_slot *s) {
 	s->gate_type	 = 0;
 	s->up_type		 = 0;
 	s->down_type	 = 0;
+	s->gpu_gate		 = (buffer){0};
+	s->gpu_up		 = (buffer){0};
+	s->gpu_down		 = (buffer){0};
+	s->gpu_ready	 = 0;
 	s->eid			 = -1;
 	s->gate_up_fused = 0;
 	s->gate_scale	 = 0.0f;

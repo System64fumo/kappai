@@ -1,6 +1,7 @@
 #ifndef MOE_STREAM_H
 #define MOE_STREAM_H
 
+#include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
 
@@ -25,6 +26,10 @@ typedef struct {
 	uint32_t		 gate_type;
 	uint32_t		 up_type;
 	uint32_t		 down_type;
+	buffer			 gpu_gate;
+	buffer			 gpu_up;
+	buffer			 gpu_down;
+	int				 gpu_ready;
 	int				 eid;
 	int				 gate_up_fused;
 	float			 gate_scale;

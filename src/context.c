@@ -94,7 +94,6 @@ status_code context_init(context *c, const config *cfg) {
 		return s;
 	}
 	backend_host_use(c->backend);
-	recipe_init();
 
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 

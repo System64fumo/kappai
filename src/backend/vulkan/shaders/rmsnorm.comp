@@ -31,11 +31,13 @@ layout(push_constant) uniform Params {
     int n_heads;
     int head_dim;
     float eps;
+    int m;
 } params;
 #else
 layout(push_constant) uniform Params {
     int n;
     float eps;
+    int m;
 } params;
 #endif
 
@@ -59,9 +61,20 @@ void main() {
     int base = 0;
 #endif
 
+#ifdef PER_HEAD
+    uint row = gl_WorkGroupID.y;
+    uint row_stride = uint(params.n_heads) * uint(params.head_dim);
+    uint x_off = row * row_stride + uint(base);
+    uint y_off = row * row_stride + uint(base);
+#else
+    uint row = gl_WorkGroupID.y;
+    uint x_off = row * uint(params.n);
+    uint y_off = row * uint(params.n);
+#endif
+
     float sum = 0.0;
     for (int i = int(tid); i < n; i += 256) {
-        float v = x[base + i];
+        float v = x[x_off + uint(i)];
         sum += v * v;
     }
 
@@ -100,7 +113,7 @@ void main() {
                 : 0.0;
 
     for (int i = int(tid); i < n; i += 256) {
-        float xv = x[base + i];
+        float xv = x[x_off + uint(i)];
         float result;
 #ifdef HAS_WEIGHT
         result = xv * scale * w[i];
@@ -108,8 +121,8 @@ void main() {
         result = xv * scale;
 #endif
 #ifdef ADD_RESIDUAL
-        result += residual[base + i];
+        result += residual[x_off + uint(i)];
 #endif
-        y[base + i] = result;
+        y[y_off + uint(i)] = result;
     }
 }
