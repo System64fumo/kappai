@@ -102,10 +102,10 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
 	free_buf(&s->ple_all);
-	free_buf(&s->ple_proj_gpu);
-	free_buf(&s->ple_proj_norm_w_gpu);
-	free_buf(&s->router_softmax_inp_gpu);
-	free_buf(&s->router_logits_gpu);
+	free_buf(&s->ple_proj);
+	free_buf(&s->ple_proj_norm_w);
+	free_buf(&s->router_softmax_inp);
+	free_buf(&s->router_logits);
 
 	free_buf(&s->mirror_slots[RECIPE_SLOT_X]);
 	free_buf(&s->mirror_slots[RECIPE_SLOT_XB]);

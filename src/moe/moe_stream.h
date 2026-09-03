@@ -26,10 +26,10 @@ typedef struct {
 	uint32_t		 gate_type;
 	uint32_t		 up_type;
 	uint32_t		 down_type;
-	buffer			 gpu_gate;
-	buffer			 gpu_up;
-	buffer			 gpu_down;
-	int				 gpu_ready;
+	buffer			 dev_gate;
+	buffer			 dev_up;
+	buffer			 dev_down;
+	int				 dev_ready;
 	int				 eid;
 	int				 gate_up_fused;
 	float			 gate_scale;

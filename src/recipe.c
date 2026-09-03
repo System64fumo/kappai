@@ -91,6 +91,22 @@ static inline int exec_pos_for_row(const exec_ctx *ctx, int row) {
 	return exec_is_batch(ctx) ? ctx->pos_start + row : ctx->pos;
 }
 
+static status_code ple_ensure_norm_w(backend *a, compute_scratch *s, model *m,
+									 int n_embd_per_layer) {
+	if (s->ple_proj_norm_w_uploaded)
+		return OK;
+	status_code st =
+		buffer_ensure_scratch(a, &s->ple_proj_norm_w, (size_t)n_embd_per_layer * sizeof(float));
+	if (st != OK)
+		return st;
+	st = a->buffer_write_f32(a, &s->ple_proj_norm_w, m->layer_dims.per_layer_proj_norm_w.host_ptr,
+							 n_embd_per_layer);
+	if (st != OK)
+		return st;
+	s->ple_proj_norm_w_uploaded = 1;
+	return OK;
+}
+
 typedef struct {
 	char			  arch_gguf_name[64];
 	recipe_builder_fn builder;
@@ -223,8 +239,8 @@ static status_code recipe_check_backend_capabilities(const model_recipe *r, cons
 			return s;
 	}
 	if (m->moe.n_experts > 0 && !a->matmul_thread_local &&
-		!(backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_experts_batch_gpu &&
-		  a->moe_expert_ffn_gpu && m->moe.gpu_resident)) {
+		!(backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_experts_batch &&
+		  a->moe_expert_ffn && m->moe.experts_resident)) {
 		backend *host = backend_host();
 		s = recipe_require_capability(m, a, "matmul_thread_local", 0,
 									  host && host != a && host->matmul_thread_local != NULL, 1);
@@ -765,14 +781,14 @@ static status_code op_ple_build(exec_ctx *ctx) {
 			ple[i] *= scale;
 	}
 
-	int gpu_path_ok = (a->matmul && a->scale_inplace && a->rmsnorm && a->ple_combine &&
+	int dev_path_ok = (a->matmul && a->scale_inplace && a->rmsnorm && a->ple_combine &&
 					   m->layer_dims.per_layer_model_proj.buf.handle);
 
-	if (gpu_path_ok) {
+	if (dev_path_ok) {
 		st = buffer_ensure_scratch(a, &s->ple_all, (size_t)total_ple * sizeof(float));
 		if (st != OK)
 			return st;
-		st = buffer_ensure_scratch(a, &s->ple_proj_gpu, (size_t)total_ple * sizeof(float));
+		st = buffer_ensure_scratch(a, &s->ple_proj, (size_t)total_ple * sizeof(float));
 		if (st != OK)
 			return st;
 
@@ -781,42 +797,33 @@ static status_code op_ple_build(exec_ctx *ctx) {
 			return st;
 
 		buffer *xb = &slots[RECIPE_SLOT_X];
-		st = a->matmul(a, &m->layer_dims.per_layer_model_proj.buf,
-					   m->layer_dims.per_layer_model_proj.type, xb, &s->ple_proj_gpu, total_ple,
-					   ple_dim);
+		st		   = a->matmul(a, &m->layer_dims.per_layer_model_proj.buf,
+							   m->layer_dims.per_layer_model_proj.type, xb, &s->ple_proj, total_ple,
+							   ple_dim);
 		if (st != OK)
 			return st;
 
 		float inv_sqrt_dim = inv_sqrt_ple;
-		st				   = a->scale_inplace(a, &s->ple_proj_gpu, inv_sqrt_dim, total_ple);
+		st				   = a->scale_inplace(a, &s->ple_proj, inv_sqrt_dim, total_ple);
 		if (st != OK)
 			return st;
 
-		if (!s->ple_proj_norm_w_uploaded) {
-			st = buffer_ensure_scratch(a, &s->ple_proj_norm_w_gpu,
-									   (size_t)n_embd_per_layer * sizeof(float));
-			if (st != OK)
-				return st;
-			st =
-				a->buffer_write_f32(a, &s->ple_proj_norm_w_gpu,
-									m->layer_dims.per_layer_proj_norm_w.host_ptr, n_embd_per_layer);
-			if (st != OK)
-				return st;
-			s->ple_proj_norm_w_uploaded = 1;
-		}
+		st = ple_ensure_norm_w(a, s, m, n_embd_per_layer);
+		if (st != OK)
+			return st;
 
 		for (int l = 0; l < n_layers; l++) {
-			buffer x_slice = s->ple_proj_gpu;
+			buffer x_slice = s->ple_proj;
 			x_slice.offset = (size_t)l * n_embd_per_layer * sizeof(float);
 			ps			   = profile_begin(prof, op->stage);
-			st = a->rmsnorm(a, &x_slice, &s->ple_proj_norm_w_gpu, &x_slice, n_embd_per_layer, eps);
+			st = a->rmsnorm(a, &x_slice, &s->ple_proj_norm_w, &x_slice, n_embd_per_layer, eps);
 			profile_end(prof, &ps);
 			if (st != OK)
 				return st;
 		}
 
 		float combine_scale = 0.70710678118654752f;
-		st = a->ple_combine(a, &s->ple_all, &s->ple_proj_gpu, total_ple, combine_scale);
+		st = a->ple_combine(a, &s->ple_all, &s->ple_proj, total_ple, combine_scale);
 		if (st != OK)
 			return st;
 
@@ -1475,7 +1482,7 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 	int			  n = ctx->op->u.ffn_act.n;
 	if (exec_is_batch(ctx)) {
 		backend	 *a			   = exec_layer_backend(ctx);
-		int			 act		  = ctx->op->u.ffn_act.activation;
+		int		  act		   = ctx->op->u.ffn_act.activation;
 		const int fused_stride = 2 * n;
 		int		  n_rows	   = ctx->n_rows;
 
@@ -1507,8 +1514,8 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 			free(out_host);
 			return st;
 		}
-		const float *fused		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
-		float		*out		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
+		const float *fused = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
+		float		*out   = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
 		for (int row = 0; row < ctx->n_rows; row++) {
 			const float *g = fused + (size_t)row * fused_stride;
 			const float *u = g + n;
@@ -1804,9 +1811,9 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 		}
 	}
 
-	int gpu_ple_build = (bk->ple_combine && bk->matmul && bk->scale_inplace && bk->rmsnorm &&
+	int dev_ple_build = (bk->ple_combine && bk->matmul && bk->scale_inplace && bk->rmsnorm &&
 						 m->layer_dims.per_layer_model_proj.buf.handle);
-	if (!gpu_ple_build) {
+	if (!dev_ple_build) {
 		if (has_end)
 			bk->end_batch(bk);
 		if (has_begin)
@@ -2064,7 +2071,7 @@ static uint32_t op_batch_slot_mask(const recipe_op *op) {
 }
 
 static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
-	bs_pair *p = &bs->pair[slot];
+	bs_pair *p	   = &bs->pair[slot];
 	size_t	 bytes = n_elems * sizeof(float);
 
 	if (!backend_has_cap(owner, BCAP_IS_HOST)) {
@@ -2073,13 +2080,13 @@ static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size
 		memset(&p->b, 0, sizeof(p->b));
 		owner->buffer_alloc_scratch(owner, bytes, &p->b);
 	} else {
-	float_buf_ensure_nocopy(&p->fb, n_elems, 64);
-	p->b.handle	  = p->fb.p;
-	p->b.host_ptr = p->fb.p;
+		float_buf_ensure_nocopy(&p->fb, n_elems, 64);
+		p->b.handle	  = p->fb.p;
+		p->b.host_ptr = p->fb.p;
 		p->b.size	  = bytes;
-	p->b.offset	  = 0;
-	p->b.owner	  = owner;
-}
+		p->b.offset	  = 0;
+		p->b.owner	  = owner;
+	}
 }
 
 static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int intermediate,
@@ -2443,7 +2450,7 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 		logits = xmalloc((size_t)E * sizeof(float));
 	status_code st;
 
-	buffer *inp_buf = &s->router_softmax_inp_gpu;
+	buffer *inp_buf = &s->router_softmax_inp;
 	st				= buffer_ensure_scratch(a, inp_buf, (size_t)dim * sizeof(float));
 	if (st != OK) {
 		if (logits != logits_fallback)
@@ -2456,16 +2463,16 @@ static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, in
 			free(logits);
 		return st2;
 	}
-	status_code st3 = buffer_ensure_scratch(a, &s->router_logits_gpu, (size_t)E * sizeof(float));
+	status_code st3 = buffer_ensure_scratch(a, &s->router_logits, (size_t)E * sizeof(float));
 	if (st3 != OK) {
 		if (logits != logits_fallback)
 			free(logits);
 		return st3;
 	}
 
-	st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp_buf, &s->router_logits_gpu, E, dim);
+	st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp_buf, &s->router_logits, E, dim);
 	if (st == OK)
-		st = a->buffer_read_f32(a, &s->router_logits_gpu, logits, E);
+		st = a->buffer_read_f32(a, &s->router_logits, logits, E);
 	if (st != OK) {
 		if (logits != logits_fallback)
 			free(logits);
@@ -2503,16 +2510,16 @@ static status_code op_moe_router_direct(backend *a, const model *m, layer_weight
 		logits_buf.size		= (size_t)E * sizeof(float);
 		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, &logits_buf, E, dim);
 	} else {
-		buffer	   *logits_gpu_buf = &s->router_logits_gpu;
-		status_code ast = buffer_ensure_scratch(a, logits_gpu_buf, (size_t)E * sizeof(float));
+		buffer	   *logits_buf = &s->router_logits;
+		status_code ast		   = buffer_ensure_scratch(a, logits_buf, (size_t)E * sizeof(float));
 		if (ast != OK) {
 			if (logits != logits_fallback)
 				free(logits);
 			return ast;
 		}
-		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, logits_gpu_buf, E, dim);
+		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, logits_buf, E, dim);
 		if (st == OK)
-			st = a->buffer_read_f32(a, logits_gpu_buf, logits, E);
+			st = a->buffer_read_f32(a, logits_buf, logits, E);
 	}
 	if (st != OK) {
 		if (logits != logits_fallback)
@@ -2610,7 +2617,7 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	float_buf_ensure(&ctx->bs->moe_router_inp, (size_t)ctx->n_rows * router_dim);
 	float_buf_ensure(&ctx->bs->moe_xb_f, (size_t)ctx->n_rows * router_dim);
 
-	buffer *xb	 = batch_slot(ctx->bs, ctx->op->in[0]);
+	buffer *xb = batch_slot(ctx->bs, ctx->op->in[0]);
 
 	int			n_rows	= ctx->n_rows;
 	float	   *xb_host = xmalloc((size_t)n_rows * router_dim * sizeof(float));
@@ -2630,7 +2637,7 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	}
 	free(xb_host);
 
-	buffer router_inp_buf	   = {0};
+	buffer router_inp_buf = {0};
 	st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * router_dim * sizeof(float),
 								 &router_inp_buf);
 	if (st != OK)
@@ -2643,7 +2650,7 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 		return st;
 	}
 
-	buffer router_logits_buf   = {0};
+	buffer router_logits_buf = {0};
 	st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * E * sizeof(float), &router_logits_buf);
 	if (st != OK) {
 		a->buffer_free(a, &router_inp_buf);
@@ -2815,15 +2822,15 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 	int			   n_rows  = ctx->n_rows;
 	int			   n_union = bs->moe_n_union;
 
-	buffer	   *xb_gpu	= batch_slot(bs, ctx->op->in[0]);
+	buffer	   *xb_dev	= batch_slot(bs, ctx->op->in[0]);
 	float	   *xb_host = xmalloc((size_t)n_rows * dim * sizeof(float));
-	status_code st		= a->buffer_read_f32(a, xb_gpu, xb_host, n_rows * dim);
+	status_code st		= a->buffer_read_f32(a, xb_dev, xb_host, n_rows * dim);
 	if (st != OK) {
 		free(xb_host);
 		return st;
 	}
 	const float *xb_base = xb_host;
-	float		  *out	   = bs->moe_out.p;
+	float		*out	 = bs->moe_out.p;
 
 	float_buf_ensure(&bs->moe_gather_x, (size_t)n_rows * dim);
 	float_buf_ensure(&bs->moe_exp_act, (size_t)n_rows * I);
@@ -2843,7 +2850,7 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 		for (int c = 0; c < cnt; c++)
 			memcpy(X + (size_t)c * dim, xb_base + (size_t)rows[c] * dim,
 				   (size_t)dim * sizeof(float));
-		float *A  = bs->moe_exp_act.p;
+		float *A = bs->moe_exp_act.p;
 
 		if (es->gate_up_fused) {
 			float *GU = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I * 2);
@@ -2854,8 +2861,8 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 				moe_activate(A + (size_t)c * I, GU + (size_t)c * I * 2, GU + (size_t)c * I * 2 + I,
 							 I, es->gate_scale, es->up_scale, use_gelu);
 		} else {
-			float *G  = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I);
-			float *U  = float_buf_ensure(&bs->moe_up_scratch, (size_t)cnt * I);
+			float *G = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I);
+			float *U = float_buf_ensure(&bs->moe_up_scratch, (size_t)cnt * I);
 			for (int c = 0; c < cnt; c++) {
 				matmul_generic_f32(es->gate_w, es->gate_type, X + (size_t)c * dim,
 								   G + (size_t)c * I, I, dim);
@@ -2867,7 +2874,7 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 							 es->gate_scale, es->up_scale, use_gelu);
 		}
 
-		float *Y  = bs->moe_exp_y.p;
+		float *Y = bs->moe_exp_y.p;
 		for (int c = 0; c < cnt; c++)
 			matmul_generic_f32(es->down_w, es->down_type, A + (size_t)c * I, Y + (size_t)c * dim,
 							   dim, I);
@@ -2890,39 +2897,39 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 	return OK;
 }
 
-static status_code moe_experts_gpu_grouped(exec_ctx *ctx, backend *a, int dim, int K, int I,
-										   int use_gelu) {
+static status_code moe_experts_resident_grouped(exec_ctx *ctx, backend *a, int dim, int K, int I,
+												int use_gelu) {
 	batch_scratch *bs	   = ctx->bs;
 	int			   n_rows  = ctx->n_rows;
 	int			   n_union = bs->moe_n_union;
 
-	buffer *xb_gpu = batch_slot(bs, ctx->op->in[0]);
+	buffer *xb_dev = batch_slot(bs, ctx->op->in[0]);
 	buffer *out_b  = batch_slot(bs, ctx->op->out);
-	if (xb_gpu->owner != a || out_b->owner != a)
+	if (xb_dev->owner != a || out_b->owner != a)
 		return ERR_UNSUPPORTED;
 
 	int counts[MOE_MAX_TOPK * 8];
 	if (n_union > (int)(sizeof(counts) / sizeof(counts[0])))
 		return ERR_UNSUPPORTED;
 
-	moe_gpu_expert *experts		   = xcalloc((size_t)n_union, sizeof(*experts));
-	int			   *rows_packed	   = xcalloc((size_t)n_rows * K, sizeof(int));
-	float		   *weights_packed = xcalloc((size_t)n_rows * K, sizeof(float));
-	int				packed		   = 0;
+	moe_resident_expert *experts		= xcalloc((size_t)n_union, sizeof(*experts));
+	int					*rows_packed	= xcalloc((size_t)n_rows * K, sizeof(int));
+	float				*weights_packed = xcalloc((size_t)n_rows * K, sizeof(float));
+	int					 packed			= 0;
 	for (int i = 0; i < n_union; i++) {
 		int				 u	  = bs->moe_union_order[i];
 		int				 cnt  = bs->moe_union_count[u];
 		const int		*rows = bs->moe_union_rows + bs->moe_union_offsets[u];
 		const int		*kidx = bs->moe_union_kidx + bs->moe_union_offsets[u];
 		moe_expert_slot *es	  = &bs->moe_union_slots[i];
-		if (cnt <= 0 || es->eid < 0 || !es->gate_w || !es->gpu_ready) {
+		if (cnt <= 0 || es->eid < 0 || !es->gate_w || !es->dev_ready) {
 			counts[i] = 0;
 			continue;
 		}
 		counts[i]				 = cnt;
-		experts[i].gate_w		 = &es->gpu_gate;
-		experts[i].up_w			 = &es->gpu_up;
-		experts[i].down_w		 = &es->gpu_down;
+		experts[i].gate_w		 = &es->dev_gate;
+		experts[i].up_w			 = &es->dev_up;
+		experts[i].down_w		 = &es->dev_down;
 		experts[i].gate_type	 = es->gate_type;
 		experts[i].up_type		 = es->up_type;
 		experts[i].down_type	 = es->down_type;
@@ -2940,8 +2947,8 @@ static status_code moe_experts_gpu_grouped(exec_ctx *ctx, backend *a, int dim, i
 
 	status_code st = a->scale_inplace(a, out_b, 0.0f, n_rows * dim);
 	if (st == OK)
-		st = a->moe_experts_batch_gpu(a, xb_gpu, out_b, n_rows, dim, I, use_gelu, n_union, experts,
-									  counts, rows_packed, weights_packed);
+		st = a->moe_experts_batch(a, xb_dev, out_b, n_rows, dim, I, use_gelu, n_union, experts,
+								  counts, rows_packed, weights_packed);
 
 	free(experts);
 	free(rows_packed);
@@ -2954,7 +2961,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 	backend	 *a	  = exec_layer_backend(ctx);
 	const int dim = ctx->m->dim;
 	if (!model_layer_is_moe(ctx->m, ctx->li)) {
-		buffer *dst	  = batch_slot(ctx->bs, ctx->op->out);
+		buffer *dst = batch_slot(ctx->bs, ctx->op->out);
 
 		float	   *zeros = xcalloc((size_t)ctx->n_rows * dim, sizeof(float));
 		status_code r	  = a->buffer_write_f32(a, dst, zeros, ctx->n_rows * dim);
@@ -2998,9 +3005,9 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 
 	status_code st = OK;
 	if (ctx->n_rows > 1 && a->matmul_batch) {
-		if (backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_experts_batch_gpu &&
-			ctx->m->moe.gpu_resident) {
-			st = moe_experts_gpu_grouped(ctx, a, dim, K, I, use_gelu);
+		if (backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_experts_batch &&
+			ctx->m->moe.experts_resident) {
+			st = moe_experts_resident_grouped(ctx, a, dim, K, I, use_gelu);
 			if (st == OK) {
 				for (int i = 0; i < n_union; i++) {
 					moe_expert_slot *us = &ctx->bs->moe_union_slots[i];
@@ -3024,7 +3031,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 				}
 				return OK;
 			}
-			WARN("moe gpu expert batch failed (st=%d) -- falling back to cpu", (int)st);
+			WARN("moe resident expert batch failed (st=%d) -- falling back to cpu", (int)st);
 		}
 		st = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
 		goto finish;
@@ -3054,16 +3061,16 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 		}
 
 		moe_batch_job job;
-		job.m				   = ctx->m;
-		job.a				   = ctx->m->backend;
-		job.bs				   = ctx->bs;
-		job.slot_buf		   = ctx->bs->moe_per_token_slots;
-		job.li				   = ctx->li;
-		job.top_k			   = K;
-		job.inter			   = I;
-		job.dim				   = dim;
-		job.n_tokens		   = ctx->n_rows;
-		job.use_gelu		   = use_gelu;
+		job.m		 = ctx->m;
+		job.a		 = ctx->m->backend;
+		job.bs		 = ctx->bs;
+		job.slot_buf = ctx->bs->moe_per_token_slots;
+		job.li		 = ctx->li;
+		job.top_k	 = K;
+		job.inter	 = I;
+		job.dim		 = dim;
+		job.n_tokens = ctx->n_rows;
+		job.use_gelu = use_gelu;
 		{
 			buffer *xb_b = batch_slot(ctx->bs, ctx->op->in[0]);
 			float  *xb_h = xmalloc((size_t)ctx->n_rows * dim * sizeof(float));
@@ -3137,7 +3144,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 	}
 
 finish:
-	buffer *xb2		= batch_slot(ctx->bs, ctx->op->out);
+	buffer *xb2 = batch_slot(ctx->bs, ctx->op->out);
 	st			= a->buffer_write_f32(a, xb2, ctx->bs->moe_out.p, ctx->n_rows * dim);
 	if (st != OK)
 		return st;
@@ -3195,7 +3202,7 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 		if (st != OK)
 			return st;
 
-		int use_gelu = ctx->m->arch_info->uses_gelu_activation;
+		int	   use_gelu = ctx->m->arch_info->uses_gelu_activation;
 		int	   n_rows	= ctx->n_rows;
 		float *gu_host	= xmalloc((size_t)n_rows * 2 * sh_inter * sizeof(float));
 		float *act_host = xmalloc((size_t)n_rows * sh_inter * sizeof(float));
@@ -3240,7 +3247,7 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 		if (st != OK)
 			return st;
 
-		int use_gelu = ctx->m->arch_info->uses_gelu_activation;
+		int	   use_gelu = ctx->m->arch_info->uses_gelu_activation;
 		int	   n_rows2	= ctx->n_rows;
 		float *g_host	= xmalloc((size_t)n_rows2 * sh_inter * sizeof(float));
 		float *u_host	= xmalloc((size_t)n_rows2 * sh_inter * sizeof(float));
@@ -3288,7 +3295,7 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 		batch_sync(ctx);
 		memcpy(batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b),
 			   batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b),
-		   (size_t)ctx->n_rows * dim * sizeof(float));
+			   (size_t)ctx->n_rows * dim * sizeof(float));
 	}
 	ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b.size = (size_t)ctx->n_rows * dim * sizeof(float);
 	return OK;
@@ -3415,24 +3422,17 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 			ple_row[i] *= n_embd_sqrt;
 	}
 
-	int gpu_path_ok =
-		(a->matmul_batch && a->scale_inplace && a->rmsnorm_batch && a->ple_combine &&
-				 m->layer_dims.per_layer_model_proj.buf.handle && !backend_has_cap(a, BCAP_IS_HOST)
-			 ? 1
-			 : 0);
+	int dev_path_ok = (a->matmul_batch && a->scale_inplace && a->rmsnorm_batch && a->ple_combine &&
+					   m->layer_dims.per_layer_model_proj.buf.handle);
 
-	if (backend_has_cap(a, BCAP_IS_HOST) && a->matmul_batch && a->scale_inplace &&
-		a->rmsnorm_batch && a->ple_combine && m->layer_dims.per_layer_model_proj.buf.handle)
-		gpu_path_ok = 1;
-
-	if (gpu_path_ok) {
+	if (dev_path_ok) {
 		status_code st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
 		if (st != OK)
 			return st;
 
-		buffer *xb		  = batch_slot(ctx->bs, RECIPE_SLOT_X);
+		buffer *xb = batch_slot(ctx->bs, RECIPE_SLOT_X);
 
-		buffer	proj_buf  = {0};
+		buffer proj_buf = {0};
 		st = a->buffer_alloc_scratch(a, (size_t)n_rows * total_ple * sizeof(float), &proj_buf);
 		if (st != OK)
 			return st;
@@ -3447,31 +3447,17 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 		if (st != OK)
 			goto ple_build_cleanup;
 
-		if (!ctx->s->ple_proj_norm_w_uploaded) {
-			if (ctx->s->ple_proj_norm_w_gpu.size < (size_t)n_embd_per_layer * sizeof(float)) {
-				if (ctx->s->ple_proj_norm_w_gpu.owner)
-					ctx->s->ple_proj_norm_w_gpu.owner->buffer_free(
-						ctx->s->ple_proj_norm_w_gpu.owner, &ctx->s->ple_proj_norm_w_gpu);
-				st = a->buffer_alloc_scratch(a, (size_t)n_embd_per_layer * sizeof(float),
-											 &ctx->s->ple_proj_norm_w_gpu);
-				if (st != OK)
-					goto ple_build_cleanup;
-			}
-			st =
-				a->buffer_write_f32(a, &ctx->s->ple_proj_norm_w_gpu,
-									m->layer_dims.per_layer_proj_norm_w.host_ptr, n_embd_per_layer);
-			if (st != OK)
-				goto ple_build_cleanup;
-			ctx->s->ple_proj_norm_w_uploaded = 1;
-		}
+		st = ple_ensure_norm_w(a, ctx->s, m, n_embd_per_layer);
+		if (st != OK)
+			goto ple_build_cleanup;
 
 		for (int l = 0; l < n_layers; l++) {
 			for (int row = 0; row < n_rows; row++) {
 				buffer x_slice = proj_buf;
 				x_slice.offset =
 					((size_t)row * total_ple + (size_t)l * n_embd_per_layer) * sizeof(float);
-				st = a->rmsnorm(a, &x_slice, &ctx->s->ple_proj_norm_w_gpu, &x_slice,
-								n_embd_per_layer, eps);
+				st = a->rmsnorm(a, &x_slice, &ctx->s->ple_proj_norm_w, &x_slice, n_embd_per_layer,
+								eps);
 				if (st != OK)
 					goto ple_build_cleanup;
 			}
@@ -3563,12 +3549,12 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 	float_buf_ensure(&ctx->bs->ple_slice, (size_t)n_rows * n_embd_per_layer);
 
 	status_code st;
-	buffer ple_inp_b   = {0};
+	buffer		ple_inp_b = {0};
 	st = a->buffer_alloc_scratch(a, (size_t)n_rows * n_embd_per_layer * sizeof(float), &ple_inp_b);
 	if (st != OK)
 		return st;
 
-	buffer ple_slice_b	 = {0};
+	buffer ple_slice_b = {0};
 	st =
 		a->buffer_alloc_scratch(a, (size_t)n_rows * n_embd_per_layer * sizeof(float), &ple_slice_b);
 	if (st != OK) {
@@ -3889,9 +3875,9 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 		return OK;
 	}
 
-	backend *a		= model_layer_backend(ctx->m, ctx->li);
-	int		 K		= m->moe.n_experts_used;
-	int		 I		= m->moe.moe_intermediate;
+	backend *a = model_layer_backend(ctx->m, ctx->li);
+	int		 K = m->moe.n_experts_used;
+	int		 I = m->moe.moe_intermediate;
 
 	const int	*expert_ids = (const int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
 	const float *weights	= (const float *)slots[RECIPE_SLOT_ROUTER_W].handle;
@@ -3918,24 +3904,24 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 		return ERR_FORMAT;
 	}
 
-	buffer *xb_gpu = &slots[RECIPE_SLOT_XB];
-	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_GPU) && a->moe_expert_ffn_gpu &&
-		m->moe.gpu_resident && xb_gpu->owner == a && out_buf->owner == a) {
+	buffer *xb_dev = &slots[RECIPE_SLOT_XB];
+	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_expert_ffn &&
+		m->moe.experts_resident && xb_dev->owner == a && out_buf->owner == a) {
 		status_code gst	   = moe_stream_resolve(m, li, expert_ids, K, slot_buf);
-		int			gpu_ok = (gst == OK);
-		for (int k = 0; gpu_ok && k < K; k++)
-			if (!slot_buf[k].gpu_ready)
-				gpu_ok = 0;
-		if (gpu_ok) {
+		int			dev_ok = (gst == OK);
+		for (int k = 0; dev_ok && k < K; k++)
+			if (!slot_buf[k].dev_ready)
+				dev_ok = 0;
+		if (dev_ok) {
 			int use_gelu = m->arch_info->uses_gelu_activation;
 			gst			 = a->scale_inplace(a, out_buf, 0.0f, dim);
 			for (int k = 0; gst == OK && k < K; k++) {
 				if (slot_buf[k].eid < 0 || !slot_buf[k].gate_w)
 					continue;
-				moe_gpu_expert ge = {
-					.gate_w		   = &slot_buf[k].gpu_gate,
-					.up_w		   = &slot_buf[k].gpu_up,
-					.down_w		   = &slot_buf[k].gpu_down,
+				moe_resident_expert ge = {
+					.gate_w		   = &slot_buf[k].dev_gate,
+					.up_w		   = &slot_buf[k].dev_up,
+					.down_w		   = &slot_buf[k].dev_down,
 					.gate_type	   = slot_buf[k].gate_type,
 					.up_type	   = slot_buf[k].up_type,
 					.down_type	   = slot_buf[k].down_type,
@@ -3946,13 +3932,13 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 					.down_scale	   = slot_buf[k].down_scale,
 					.weight		   = weights[k],
 				};
-				gst = a->moe_expert_ffn_gpu(a, xb_gpu, out_buf, &ge, dim, I);
+				gst = a->moe_expert_ffn(a, xb_dev, out_buf, &ge, dim, I);
 			}
 			if (gst == OK) {
 				moe_stream_release_slots(m, li, slot_buf, K);
 				return OK;
 			}
-			WARN("moe gpu expert ffn failed (st=%d) -- falling back to cpu", (int)gst);
+			WARN("moe resident expert ffn failed (st=%d) -- falling back to cpu", (int)gst);
 			moe_stream_release_slots(m, li, slot_buf, K);
 		}
 	}
@@ -4264,11 +4250,11 @@ static status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_UP].fb, (size_t)ctx->n_rows * kv_a_rows);
 
 		status_code st;
-		buffer q_a_b	= {0};
+		buffer		q_a_b = {0};
 		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * q_lora * sizeof(float), &q_a_b);
 		if (st != OK)
 			return st;
-		buffer kv_a_b	= {0};
+		buffer kv_a_b = {0};
 		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * kv_a_rows * sizeof(float), &kv_a_b);
 		if (st != OK) {
 			a->buffer_free(a, &q_a_b);
@@ -4405,7 +4391,7 @@ static status_code op_mla_q_proj(exec_ctx *ctx) {
 			goto mla_q_cleanup;
 		buffer *q_buf = batch_slot(ctx->bs, RECIPE_SLOT_Q);
 		st = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, &q_a_b, q_buf, q_b_rows, q_lora,
-							   ctx->n_rows);
+							 ctx->n_rows);
 	mla_q_cleanup:
 		if (a->synchronize)
 			a->synchronize(a);
@@ -4813,7 +4799,7 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 			if (st != OK)
 				goto done;
 		}
-			if (m->arch_info->has_scale_embeddings) {
+		if (m->arch_info->has_scale_embeddings) {
 			if (a->scale_inplace) {
 				st = a->scale_inplace(a, &bs->pair[RECIPE_SLOT_X].b, m->dim_sqrt, n_tokens * dim);
 			} else {
@@ -4836,7 +4822,7 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 			ERROR("batch fast-path: pre_op[%d] kind=%d (stage=%d) failed with status=%d", i,
 				  pop->kind, pop->stage, (int)st);
 			goto done;
-	}
+		}
 	}
 
 	if (a->begin_batch)

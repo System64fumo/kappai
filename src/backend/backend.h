@@ -22,7 +22,7 @@ typedef enum {
 	BCAP_MATMUL_QONLY		  = 1 << 6,
 	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
-	BCAP_MOE_EXPERT_GPU		  = 1 << 9,
+	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
 } backend_cap;
 
 typedef struct {
@@ -46,7 +46,7 @@ typedef struct {
 	float		  up_scale;
 	float		  down_scale;
 	float		  weight;
-} moe_gpu_expert;
+} moe_resident_expert;
 static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t byte_len) {
 	buffer s   = *parent;
 	s.host_ptr = parent->host_ptr ? (const char *)parent->host_ptr + byte_off : NULL;
@@ -90,6 +90,7 @@ typedef struct {
 	char	 name[32];
 	int		 priority;
 	int		 available;
+	int		 n_devices;
 	uint64_t caps;
 } backend_info;
 
@@ -98,6 +99,7 @@ struct backend {
 	int			priority;
 	uint64_t	caps;
 	status_code (*probe)(void);
+	int (*device_count)(void);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -222,12 +224,12 @@ struct backend {
 									   const float *x, float *y, int n, int k, int tid);
 	status_code (*buffer_alloc_from_host)(backend *self, const void *host_data, size_t size,
 										  buffer *out);
-	status_code (*moe_expert_ffn_gpu)(backend *self, const buffer *x, buffer *out,
-									  const moe_gpu_expert *e, int dim, int inter);
-	status_code (*moe_experts_batch_gpu)(backend *self, const buffer *xb, buffer *out, int n_rows,
-										 int dim, int inter, int use_gelu, int n_experts,
-										 const moe_gpu_expert *experts, const int *counts,
-										 const int *rows_packed, const float *weights_packed);
+	status_code (*moe_expert_ffn)(backend *self, const buffer *x, buffer *out,
+								  const moe_resident_expert *e, int dim, int inter);
+	status_code (*moe_experts_batch)(backend *self, const buffer *xb, buffer *out, int n_rows,
+									 int dim, int inter, int use_gelu, int n_experts,
+									 const moe_resident_expert *experts, const int *counts,
+									 const int *rows_packed, const float *weights_packed);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
 };
@@ -240,9 +242,11 @@ void backend_register(const char *name, backend_ctor_fn ctor);
 
 int			backend_list(backend_info *out, int max);
 status_code backend_create(const char *name, int device_index, backend **out);
-status_code backend_create_best(int device_index, backend **out);
+status_code backend_create_best(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
+
+int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
 

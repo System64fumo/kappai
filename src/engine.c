@@ -282,17 +282,18 @@ static int run_interactive(context *c, cli_args *a) {
 	return 0;
 }
 
-static int list_accels(void) {
+static int list_devices(void) {
 	backend_info infos[BACKEND_MAX];
 	int			 n = backend_list(infos, BACKEND_MAX);
-	printf("available accelerator backends:\n");
+	printf("available compute devices:\n");
 	for (int i = 0; i < n; i++) {
-		if (infos[i].caps & 0x0001)
+		if (!infos[i].available)
 			continue;
-		printf("  %-10s priority=%-4d %s\n", infos[i].name, infos[i].priority,
-			   infos[i].available ? "available" : "unavailable");
+		for (int d = 0; d < infos[i].n_devices; d++) {
+			bool is_host = (infos[i].caps & BCAP_IS_HOST) != 0;
+			printf("  %s%d%s\n", infos[i].name, d, is_host ? " (host fallback)" : "");
+		}
 	}
-	printf("  (CPU is always available as fallback)\n");
 	return 0;
 }
 
@@ -349,8 +350,8 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 		return ERR_INVALID_ARG;
 	}
 
-	if (a->list_accels) {
-		list_accels();
+	if (a->list_devices) {
+		list_devices();
 		return ENGINE_EXIT;
 	}
 	if (a->dump_metadata) {
@@ -369,8 +370,8 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	model_base			   = model_base ? model_base + 1 : ec->model;
 
 	DEBUG("model path: %s", ec->model);
-	DEBUG("backend=%s gpu_device=%d use_mmap=%d seed=%llu", ec->backend ? ec->backend : "auto",
-		  ec->gpu_device, ec->use_mmap, (unsigned long long)ec->seed);
+	DEBUG("device=%s use_mmap=%d seed=%llu", ec->device ? ec->device : "auto", ec->use_mmap,
+		  (unsigned long long)ec->seed);
 	uint64_t	t0 = time_ms();
 	status_code s  = context_init(ctx, ec);
 	if (s != OK) {

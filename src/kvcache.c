@@ -191,7 +191,7 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 		}
 		if (c->kv_quant == KV_QUANT_Q8_0 && !backend_has_cap(host, BCAP_KV_QUANT_Q8_0)) {
 			ERROR("kvcache: host backend does not support Q8_0 quantized KV cache; "
-				  "use --kv-quant f16 or run all layers on the accelerator backend");
+				  "use --kv-quant f16 or run all layers on the device backend");
 			return ERR_UNSUPPORTED;
 		}
 
