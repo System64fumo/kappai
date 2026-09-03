@@ -16,8 +16,8 @@ typedef void (*layer_progress_cb)(int layer_idx, int n_layers, int token_progres
 								  void *ud);
 
 typedef struct compute_scratch {
-	buffer		 router_softmax_inp_gpu;
-	buffer		 router_logits_gpu;
+	buffer		 router_softmax_inp;
+	buffer		 router_logits;
 	int			 router_ids_host[64];
 	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
@@ -26,8 +26,8 @@ typedef struct compute_scratch {
 	buffer		 ple_inp;
 	buffer		 ple_slice;
 	buffer		 ple_all;
-	buffer		 ple_proj_gpu;
-	buffer		 ple_proj_norm_w_gpu;
+	buffer		 ple_proj;
+	buffer		 ple_proj_norm_w;
 	int			 ple_proj_norm_w_uploaded;
 	float		*ple_buf;
 	backend		*backend;

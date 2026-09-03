@@ -1,6 +1,7 @@
 #include "backend.h"
 #include "log.h"
 #include "memconfig.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,15 +9,15 @@
 typedef struct {
 	char			name[32];
 	backend_ctor_fn ctor;
-} accel_reg_entry;
+} backend_reg_entry;
 
-static accel_reg_entry g_registry[BACKEND_MAX];
-static int			   g_registry_count = 0;
+static backend_reg_entry g_registry[BACKEND_MAX];
+static int				 g_registry_count = 0;
 
 void backend_register(const char *name, backend_ctor_fn ctor) {
 	if (g_registry_count >= BACKEND_MAX)
 		return;
-	accel_reg_entry *e = &g_registry[g_registry_count++];
+	backend_reg_entry *e = &g_registry[g_registry_count++];
 	snprintf(e->name, sizeof(e->name), "%s", name);
 	e->ctor = ctor;
 }
@@ -29,17 +30,21 @@ int backend_list(backend_info *out, int max) {
 		snprintf(out[i].name, sizeof(out[i].name), "%s", g_registry[i].name);
 		out[i].priority	 = 0;
 		out[i].available = 0;
+		out[i].n_devices = 1;
 		out[i].caps		 = 0;
 		if (g_registry[i].ctor(&probe) != OK)
 			continue;
 		out[i].priority	 = probe.priority;
 		out[i].available = (!probe.probe || probe.probe() == OK);
-		out[i].caps		 = probe.caps;
+		out[i].n_devices = probe.device_count ? probe.device_count() : 1;
+		if (out[i].n_devices <= 0)
+			out[i].available = 0;
+		out[i].caps = probe.caps;
 	}
 	return g_registry_count;
 }
 
-static void accel_log_op_homes(backend *b) {
+static void log_op_homes(backend *b) {
 	if (backend_has_cap(b, BCAP_IS_HOST))
 		return;
 
@@ -85,7 +90,7 @@ static void accel_log_op_homes(backend *b) {
 	}
 }
 
-static status_code make_backend(accel_reg_entry *e, int device_index, backend **out) {
+static status_code make_backend(backend_reg_entry *e, int device_index, backend **out) {
 	backend	   *b = xcalloc(1, sizeof(backend));
 	status_code s = e->ctor(b);
 	if (s != OK) {
@@ -104,7 +109,7 @@ static status_code make_backend(accel_reg_entry *e, int device_index, backend **
 		return s;
 	}
 
-	accel_log_op_homes(b);
+	log_op_homes(b);
 
 	*out = b;
 	return OK;
@@ -119,7 +124,7 @@ status_code backend_create(const char *name, int device_index, backend **out) {
 	return ERR_NOT_FOUND;
 }
 
-status_code backend_create_best(int device_index, backend **out) {
+status_code backend_create_best(backend **out) {
 	int best_priority = -1;
 	int best_idx	  = -1;
 
@@ -138,10 +143,32 @@ status_code backend_create_best(int device_index, backend **out) {
 		best_idx	  = i;
 	}
 
-	if (best_idx < 0) {
-		return backend_create("cpu", device_index, out);
+	if (best_idx < 0)
+		return backend_create("cpu", 0, out);
+	return make_backend(&g_registry[best_idx], 0, out);
+}
+
+int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index) {
+	if (!spec || !*spec)
+		return -1;
+	const char *end = spec + strlen(spec);
+	while (end > spec && end[-1] >= '0' && end[-1] <= '9')
+		end--;
+	size_t name_len = (size_t)(end - spec);
+	if (name_len == 0 || name_len >= name_cap)
+		return -1;
+	memcpy(name, spec, name_len);
+	name[name_len] = '\0';
+	int idx		   = 0;
+	if (*end) {
+		char *tail = NULL;
+		long  v	   = strtol(end, &tail, 10);
+		if (*tail != '\0' || v < 0 || v > INT_MAX)
+			return -1;
+		idx = (int)v;
 	}
-	return make_backend(&g_registry[best_idx], device_index, out);
+	*device_index = idx;
+	return 0;
 }
 
 void backend_destroy(backend *b) {

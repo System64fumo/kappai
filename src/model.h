@@ -117,7 +117,7 @@ typedef struct model_moe_params {
 	int	  norm_topk_prob;
 	int	  first_dense_layer;
 	float router_dim_scale;
-	int	  gpu_resident;
+	int	  experts_resident;
 } model_moe_params;
 
 typedef struct model_layer_dims_params {
@@ -206,10 +206,10 @@ typedef struct model {
 } model;
 
 status_code model_load(model *m, const char *path);
-status_code model_load_backend_ex_repack(model *m, const char *path, backend *accel, int use_mmap,
+status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
 										 const char *repack_config, int requested_n_ctx);
 
-status_code model_load_parse(model *m, const char *path, backend *accel, int use_mmap,
+status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
 							 const char *repack_config, int requested_n_ctx);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);

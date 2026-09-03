@@ -2643,11 +2643,11 @@ status_code model_set_layer_backend_range(model *m, int begin, int end, backend 
 	return OK;
 }
 
-status_code model_load_parse(model *m, const char *path, backend *accel, int use_mmap,
+status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
 							 const char *repack_config, int requested_n_ctx) {
 	memset(m, 0, sizeof(*m));
 	m->batchable = -1;
-	m->backend	 = accel;
+	m->backend	 = bk;
 
 	size_t avail_before_load = get_available_memory();
 
@@ -2744,9 +2744,9 @@ status_code model_build_recipe(model *m) {
 	return OK;
 }
 
-status_code model_load_backend_ex_repack(model *m, const char *path, backend *accel, int use_mmap,
+status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
 										 const char *repack_config, int requested_n_ctx) {
-	status_code s = model_load_parse(m, path, accel, use_mmap, repack_config, requested_n_ctx);
+	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config, requested_n_ctx);
 	if (s != OK)
 		return s;
 

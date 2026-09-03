@@ -17,7 +17,7 @@ config config_defaults(void) {
 	config c;
 	memset(&c, 0, sizeof(c));
 
-	c.backend		= "auto";
+	c.device		= "auto";
 	c.use_mmap		= true;
 	c.flash_attn	= true;
 	c.reasoning		= true;
@@ -61,11 +61,12 @@ void usage(FILE *fp, bool is_server) {
 			"Engine:\n"
 			"  -m, --model <path>       model file (required)\n"
 			"  -c, --ctx-size <n>       context size (0 = from model)\n"
-			"  --accel <name>           accelerator backend (default: auto)\n"
-			"  --gpu-device <n>         GPU device index\n"
-			"  --ngl <n>                offload the first <n> layers to the --accel backend\n"
-			"                           and keep the remaining layers on CPU (-1 = all on accel,\n"
-			"                           0 = all on CPU; default: -1)\n"
+			"  --device <spec>          compute device (default: auto)\n"
+			"                           <backend><n>, e.g. vulkan0, vulkan1, cpu0;\n"
+			"                           a bare backend name means device 0\n"
+			"  --ngl <n>                offload the first <n> layers to the --device backend\n"
+			"                           and keep the remaining layers on CPU (-1 = all on the\n"
+			"                           device, 0 = all on CPU; default: -1)\n"
 			"  --threads <n>            CPU worker threads (default: auto)\n"
 			"  -f, --flash-attn [bool]  flash attention kernel (default: on)\n"
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
@@ -105,7 +106,7 @@ void usage(FILE *fp, bool is_server) {
 
 	fprintf(fp,
 			"Tools / debug:\n"
-			"  --list-accels            list available accelerator backends and exit\n"
+			"  --list-devices           list available compute devices and exit\n"
 			"  --dump-metadata          print raw GGUF metadata and exit\n"
 			"  --debug-prompt           print exact tokens/text fed to the model for every "
 			"prefill (chat turns, idle prefill, warmup, cache resync)\n"
@@ -262,9 +263,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_SYSTEM = 256,
 		OPT_STREAM,
 		OPT_TIME,
-		OPT_ACCEL,
-		OPT_GPU_DEV,
-		OPT_LIST_ACCELS,
+		OPT_DEVICE,
+		OPT_LIST_DEVICES,
 		OPT_DUMP_METADATA,
 		OPT_DEBUG_FWD,
 		OPT_DEBUG,
@@ -308,9 +308,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"system", required_argument, NULL, OPT_SYSTEM},
 		{"stream", optional_argument, NULL, OPT_STREAM},
 		{"time", no_argument, NULL, OPT_TIME},
-		{"accel", required_argument, NULL, OPT_ACCEL},
-		{"gpu-device", required_argument, NULL, OPT_GPU_DEV},
-		{"list-accels", no_argument, NULL, OPT_LIST_ACCELS},
+		{"device", required_argument, NULL, OPT_DEVICE},
+		{"list-devices", no_argument, NULL, OPT_LIST_DEVICES},
 		{"dump-metadata", no_argument, NULL, OPT_DUMP_METADATA},
 		{"debug-forward", no_argument, NULL, OPT_DEBUG_FWD},
 		{"debug", no_argument, NULL, OPT_DEBUG},
@@ -401,15 +400,11 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		case OPT_TIME:
 			cfg->profile_time = true;
 			break;
-		case OPT_ACCEL:
-			cfg->backend = optarg;
+		case OPT_DEVICE:
+			cfg->device = optarg;
 			break;
-		case OPT_GPU_DEV:
-			if (parse_int_arg(optarg, "--gpu-device", 0, INT_MAX, &cfg->gpu_device) < 0)
-				return -1;
-			break;
-		case OPT_LIST_ACCELS:
-			a->list_accels = true;
+		case OPT_LIST_DEVICES:
+			a->list_devices = true;
 			break;
 		case OPT_DUMP_METADATA:
 			a->dump_metadata = true;
@@ -553,7 +548,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 	}
 	if (!a->prompt)
 		a->interactive = true;
-	if (a->list_accels)
+	if (a->list_devices)
 		return 0;
 	if (!cfg->model) {
 		ERROR("--model is required");

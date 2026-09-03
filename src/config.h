@@ -6,7 +6,7 @@
 #include <stdio.h>
 
 typedef struct config {
-	const char *backend;
+	const char *device;
 	const char *model;
 	const char *moe_pin_list;
 	const char *monitor;
@@ -15,7 +15,6 @@ typedef struct config {
 	uint64_t	seed;
 
 	int n_threads;
-	int gpu_device;
 	int ctx_size;
 	int kv_quant;
 	int moe_cache_cap;
@@ -55,7 +54,7 @@ typedef struct {
 	float repeat_penalty;
 	int	  repeat_last_n;
 
-	bool		list_accels;
+	bool		list_devices;
 	bool		dump_metadata;
 	bool		debug_prompt;
 	const char *grep_vocab;

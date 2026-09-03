@@ -83,14 +83,23 @@ status_code context_init(context *c, const config *cfg) {
 	if (mon_path) {
 		monitor_init(&c->monitor, mon_path);
 		g_monitor = &c->monitor;
-		monitor_emit_load_phase_backend(&c->monitor, cfg->backend);
+		monitor_emit_load_phase_backend(&c->monitor, cfg->device);
 	}
 
-	status_code s = (cfg->backend && strcmp(cfg->backend, "auto") != 0)
-						? backend_create(cfg->backend, cfg->gpu_device, &c->backend)
-						: backend_create_best(cfg->gpu_device, &c->backend);
+	status_code s = ERR_INVALID_ARG;
+	if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
+		s = backend_create_best(&c->backend);
+	} else {
+		char name[32];
+		int	 device_index = 0;
+		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
+			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
+			return ERR_INVALID_ARG;
+		}
+		s = backend_create(name, device_index, &c->backend);
+	}
 	if (s != OK) {
-		ERROR("failed to initialize accelerator '%s'", cfg->backend ? cfg->backend : "auto");
+		ERROR("failed to initialize device '%s'", cfg->device ? cfg->device : "auto");
 		return s;
 	}
 	backend_host_use(c->backend);
@@ -111,11 +120,11 @@ status_code context_init(context *c, const config *cfg) {
 		c->m.fuse_config = cfg->fuse;
 
 	if (cfg->ngl >= 0) {
-		int n_gpu = cfg->ngl;
-		if (n_gpu > c->m.n_layers)
-			n_gpu = c->m.n_layers;
-		if (n_gpu < c->m.n_layers) {
-			s = model_set_layer_backend_range(&c->m, n_gpu, c->m.n_layers, backend_host());
+		int n_offload = cfg->ngl;
+		if (n_offload > c->m.n_layers)
+			n_offload = c->m.n_layers;
+		if (n_offload < c->m.n_layers) {
+			s = model_set_layer_backend_range(&c->m, n_offload, c->m.n_layers, backend_host());
 			if (s != OK) {
 				ERROR("failed to apply --ngl");
 				goto fail_model;
@@ -124,8 +133,8 @@ status_code context_init(context *c, const config *cfg) {
 				WARN("--ngl: MLA architectures do not yet support per-layer KV on host; "
 					 "MLA layers running on host may fall back to primary KV path");
 			}
-			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_gpu, c->backend->name,
-				 c->m.n_layers - n_gpu);
+			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_offload, c->backend->name,
+				 c->m.n_layers - n_offload);
 		}
 	}
 
@@ -593,7 +602,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		float *logits_out = fast_argmax ? NULL : c->scratch.logits_host;
 		int	   rc		  = context_feed_token_inner(c, tok, logits_out);
 		if (rc == CTX_COMPUTE_ERROR) {
-			ERROR("decode aborted: GPU compute error at token %d (pos=%d)", i, c->kv.n_pos);
+			ERROR("decode aborted: device compute error at token %d (pos=%d)", i, c->kv.n_pos);
 			c->session_poisoned = true;
 			*out_unfed_tail		= true;
 			break;
@@ -755,7 +764,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 		return 0;
 	}
 	if (pf.rc == CTX_COMPUTE_ERROR) {
-		ERROR("prompt processing failed (GPU compute error at pos=%d); session poisoned",
+		ERROR("prompt processing failed (device compute error at pos=%d); session poisoned",
 			  c->kv.n_pos);
 		c->session_poisoned = true;
 		return -1;
