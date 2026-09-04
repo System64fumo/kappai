@@ -264,7 +264,11 @@ typedef struct {
 	float				   *logits_out;
 } exec_ctx;
 
-float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
+float		*recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
+const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
+float		*recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
+status_code	 recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n);
+float		*recipe_slot_rw_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
 
 int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
 					   int n_group, int topk_group, float *logits, const float *bias,
@@ -303,8 +307,20 @@ recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage sta
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1);
 recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage);
 recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage);
+recipe_op mk_kvput(uint8_t k_in, uint8_t v_in);
+recipe_op mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
+					   int n_ctx, float scale, int sliding_window);
+recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
+recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
+recipe_op mk_rope_ext(uint8_t in, int rope_neox);
+recipe_op mk_partial_rope_qk(void);
+
+int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
+int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
+						  uint8_t experts_in_slot, uint8_t out_slot);
 
 void recipe_build_post_ops(model_recipe *r, const struct model *m);
 void recipe_build_pre_ops(model_recipe *r, const struct model *m);

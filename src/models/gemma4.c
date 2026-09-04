@@ -56,14 +56,7 @@ static int recipe_append_gemma4_attn_block(recipe_op *ops, int i, const model *m
 		};
 
 		if (has_matmul_multi) {
-			ops[i++] = (recipe_op){
-				.kind			= OP_MATMUL_MULTI,
-				.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out			= RECIPE_SLOT_K,
-				.w_idx			= WIDX_WK,
-				.stage			= STAGE_MATMUL,
-				.u.matmul_multi = {.n = 2, .k = dim, .n_out = {0, 0}},
-			};
+			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, dim, 0, 0);
 		} else {
 			ops[i++] = (recipe_op){
 				.kind	  = OP_MATMUL,
@@ -111,48 +104,13 @@ static int recipe_append_gemma4_attn_block(recipe_op *ops, int i, const model *m
 		};
 	}
 
-	ops[i++] = (recipe_op){
-		.kind		= OP_ROPE_EXT,
-		.in			= {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-		.out		= RECIPE_SLOT_NONE,
-		.w_idx		= RECIPE_NO_WEIGHT,
-		.stage		= STAGE_ROPE,
-		.u.rope_ext = {.n_heads = 0, .head_dim = 0, .use_freq_factors = 1, .rope_neox = rope_neox},
-	};
-	ops[i++] = (recipe_op){
-		.kind		= OP_ROPE_EXT,
-		.in			= {RECIPE_SLOT_K, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-		.out		= RECIPE_SLOT_NONE,
-		.w_idx		= RECIPE_NO_WEIGHT,
-		.stage		= STAGE_ROPE,
-		.u.rope_ext = {.n_heads = 0, .head_dim = 0, .use_freq_factors = 1, .rope_neox = rope_neox},
-	};
+	ops[i++] = mk_rope_ext(RECIPE_SLOT_Q, rope_neox);
+	ops[i++] = mk_rope_ext(RECIPE_SLOT_K, rope_neox);
 
-	ops[i++] = (recipe_op){
-		.kind  = OP_KV_PUT,
-		.in	   = {RECIPE_SLOT_K, RECIPE_SLOT_V, RECIPE_SLOT_NONE},
-		.out   = RECIPE_SLOT_NONE,
-		.w_idx = RECIPE_NO_WEIGHT,
-		.stage = STAGE_KVPUT,
-	};
+	ops[i++] = mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V);
 
-	ops[i++] = (recipe_op){
-		.kind  = OP_ATTENTION,
-		.in	   = {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-		.out   = RECIPE_SLOT_XB2,
-		.w_idx = RECIPE_NO_WEIGHT,
-		.stage = STAGE_ATTN,
-		.u.attention =
-			{
-				.n_heads		   = n_heads,
-				.n_kv_heads		   = n_kv_heads,
-				.head_dim		   = head_dim,
-				.n_ctx			   = n_ctx,
-				.scale			   = attn_scale,
-				.sliding_window	   = m->sliding_window,
-				.n_kv_heads_active = n_kv_heads,
-			},
-	};
+	ops[i++] = mk_attention(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, n_kv_heads, head_dim, n_ctx,
+							attn_scale, m->sliding_window);
 
 	ops[i++] = mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, 0, STAGE_MATMUL);
 
@@ -166,14 +124,7 @@ static int build_gemma4_ffn_prefix(recipe_op *ops, int i, const model *m, int di
 	const int has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
 	ops[i++] = mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
 	if (has_matmul_multi) {
-		ops[i++] = (recipe_op){
-			.kind			= OP_MATMUL_MULTI,
-			.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out			= RECIPE_SLOT_FFN_GATE,
-			.w_idx			= WIDX_GATE,
-			.stage			= STAGE_MATMUL,
-			.u.matmul_multi = {.n = 2, .k = dim, .n_out = {0, 0}},
-		};
+		ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, dim, 0, 0);
 	} else {
 		ops[i++] = (recipe_op){
 			.kind	  = OP_MATMUL,
@@ -300,22 +251,7 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 			.stage	   = STAGE_RMSNORM,
 			.u.rmsnorm = {.eps = eps, .n_heads = 0},
 		};
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MOE_ROUTER,
-			.in		  = {RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	  = RECIPE_SLOT_ROUTER_IDS,
-			.w_idx	  = WIDX_FFN_GATE_INP,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = m->moe.n_experts, .k = dim},
-		};
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MOE_EXPERTS,
-			.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W},
-			.out	  = RECIPE_SLOT_XB2,
-			.w_idx	  = WIDX_NONE,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = dim, .k = moe_inter},
-		};
+		i = recipe_append_moe_ffn(ops, i, m, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
 		ops[i++] = (recipe_op){
 			.kind	   = OP_RMSNORM,
 			.in		   = {RECIPE_SLOT_XB2, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},

@@ -115,11 +115,7 @@ void chat_template_add_message(chat_template_state *cts, const char *role, const
 void chat_template_free(chat_template_state *cts) {
 	if (!cts)
 		return;
-	for (size_t i = 0; i < cts->n_messages; i++) {
-		free(cts->messages[i].role);
-		free(cts->messages[i].content);
-	}
-	free(cts->messages);
+	chat_template_clear_messages(cts);
 	free(cts->last_render);
 	free(cts->bos_token);
 	free(cts->eos_token);
@@ -152,13 +148,6 @@ static jinja_value *build_globals(chat_template_state *cts, const chat_message *
 	jinja_dict_set(g, "eos_token", jinja_string(cts->eos_token));
 	jinja_dict_set(g, "strftime_now", jinja_bool(1));
 	return g;
-}
-
-static size_t lcp_len(const char *a, const char *b) {
-	size_t i = 0;
-	while (a[i] && b[i] && a[i] == b[i])
-		i++;
-	return i;
 }
 
 status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,
@@ -200,7 +189,7 @@ size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *
 	if (rc2 != OK)
 		goto out;
 
-	prefix_len = lcp_len(r1, r2);
+	prefix_len = str_lcp_len(r1, r2);
 	DEBUG("static prefix: %zu bytes", prefix_len);
 
 out:
@@ -223,7 +212,7 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 		return rc;
 
 	size_t new_len = strlen(rendered);
-	size_t common  = lcp_len(rendered, cts->last_render);
+	size_t common  = str_lcp_len(rendered, cts->last_render);
 
 	const char *diff	 = rendered + common;
 	size_t		diff_len = new_len - common;

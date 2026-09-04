@@ -38,14 +38,7 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 		recipe_op *ops = xcalloc(cap, sizeof(recipe_op));
 		int		   i   = 0;
 
-		ops[i++] = (recipe_op){
-			.kind	   = OP_RMSNORM,
-			.in		   = {RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	   = RECIPE_SLOT_XB,
-			.w_idx	   = WIDX_ATTN_NORM,
-			.stage	   = STAGE_RMSNORM,
-			.u.rmsnorm = {.eps = eps, .n_heads = 0},
-		};
+		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
 
 		ops[i++] = (recipe_op){
 			.kind	  = OP_MLA_QKV_PROJ_FUSED,
@@ -83,61 +76,13 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 			.u.matmul = {.n = dim, .k = wo_in},
 		};
 
-		ops[i++] = (recipe_op){
-			.kind	   = OP_RMSNORM,
-			.in		   = {RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	   = RECIPE_SLOT_XB,
-			.w_idx	   = WIDX_FFN_NORM,
-			.stage	   = STAGE_RMSNORM,
-			.u.rmsnorm = {.eps = eps, .n_heads = 0},
-		};
+		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
 
-		if (m->moe.n_shared_experts > 0) {
-			int sh_inter = m->moe.moe_intermediate * m->moe.n_shared_experts;
-			ops[i++]	 = (recipe_op){
-				.kind	  = OP_MOE_SHARED,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_ACT,
-				.w_idx	  = WIDX_NONE,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = sh_inter, .k = dim},
-			};
-		}
+		i = recipe_append_moe_ffn(ops, i, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
 
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MOE_ROUTER,
-			.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	  = RECIPE_SLOT_ROUTER_IDS,
-			.w_idx	  = WIDX_FFN_GATE_INP,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = m->moe.n_experts, .k = dim},
-		};
-
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MOE_EXPERTS,
-			.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W},
-			.out	  = RECIPE_SLOT_XB2,
-			.w_idx	  = WIDX_NONE,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = dim, .k = m->moe.moe_intermediate},
-		};
-
-		ops[i++] = (recipe_op){
-			.kind  = OP_ADD,
-			.in	   = {RECIPE_SLOT_X, RECIPE_SLOT_XB2, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_NONE,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_ADD,
-		};
-		if (m->moe.n_shared_experts > 0) {
-			ops[i++] = (recipe_op){
-				.kind  = OP_ADD,
-				.in	   = {RECIPE_SLOT_X, RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_NONE},
-				.out   = RECIPE_SLOT_NONE,
-				.w_idx = RECIPE_NO_WEIGHT,
-				.stage = STAGE_ADD,
-			};
-		}
+		ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+		if (m->moe.n_shared_experts > 0)
+			ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_FFN_ACT, STAGE_ADD);
 
 		r->layer.ops   = ops;
 		r->layer.n_ops = i;

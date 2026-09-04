@@ -308,4 +308,10 @@ static inline int model_hybrid_gate_size(const model *m) {
 	return s;
 }
 
+static inline tpool *model_get_pool(const model *m) {
+	if (m->backend && m->backend->get_pool)
+		return m->backend->get_pool(m->backend);
+	return NULL;
+}
+
 #endif

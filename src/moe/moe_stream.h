@@ -11,6 +11,7 @@ typedef struct moe_stream_cache moe_stream_cache;
 typedef struct moe_stream_op	moe_stream_op;
 
 #define MOE_MAX_K 512
+#define MOE_DEFAULT_CACHE_CAP 64
 
 typedef struct {
 	const void		*gate_w;

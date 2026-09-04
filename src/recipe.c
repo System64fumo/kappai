@@ -66,6 +66,54 @@ float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx) {
 		return (float *)((char *)b->handle + b->offset);
 	return (float *)b->host_ptr;
 }
+
+static inline int slot_is_host_resident(const buffer *b) {
+	if (!b->handle)
+		return 1;
+	return b->owner && backend_has_cap(b->owner, BCAP_IS_HOST);
+}
+
+const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b)
+		return NULL;
+	if (slot_is_host_resident(b))
+		return (const float *)(b->handle ? (char *)b->handle + b->offset : b->host_ptr);
+	float *dst = float_buf_ensure_nocopy(stage, (size_t)n, 64);
+	if (!dst || b->owner->buffer_read_f32(b->owner, b, dst, n) != OK)
+		return NULL;
+	return dst;
+}
+
+float *recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b)
+		return NULL;
+	if (slot_is_host_resident(b))
+		return (float *)(b->handle ? (char *)b->handle + b->offset : b->host_ptr);
+	return float_buf_ensure_nocopy(stage, (size_t)n, 64);
+}
+
+status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b)
+		return ERR_INVALID_ARG;
+	if (slot_is_host_resident(b))
+		return OK;
+	return b->owner->buffer_write_f32(b->owner, b, staged, n);
+}
+
+float *recipe_slot_rw_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b)
+		return NULL;
+	if (slot_is_host_resident(b))
+		return (float *)(b->handle ? (char *)b->handle + b->offset : b->host_ptr);
+	float *dst = float_buf_ensure_nocopy(stage, (size_t)n, 64);
+	if (!dst || b->owner->buffer_read_f32(b->owner, b, dst, n) != OK)
+		return NULL;
+	return dst;
+}
 static inline buffer *exec_slots(const exec_ctx *ctx) {
 	if (ctx->s && ctx->s->active_is_mirror)
 		return ctx->s->mirror_slots;
@@ -4538,6 +4586,539 @@ static status_code op_attention_mla(exec_ctx *ctx) {
 							kv_lora, cache->n_ctx, s->rope_cos, s->rope_sin, scale);
 }
 
+typedef struct {
+	const float *mixed;
+	float		*q, *gate;
+	int			 n_heads, head_dim, n_rows;
+} qwen_split_job;
+
+static void qwen_split_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_split_job *j			 = ctx;
+	int				q_out		 = j->n_heads * j->head_dim;
+	int				mixed_stride = 2 * q_out;
+	for (int row = begin; row < end; row++) {
+		const float *src = j->mixed + (size_t)row * mixed_stride;
+		float		*qd	 = j->q + (size_t)row * q_out;
+		float		*gd	 = j->gate + (size_t)row * q_out;
+		for (int h = 0; h < j->n_heads; h++, src += 2 * j->head_dim) {
+			for (int jj = 0; jj < j->head_dim; jj++) {
+				qd[jj] = src[jj];
+				gd[jj] = src[jj + j->head_dim];
+			}
+			qd += j->head_dim;
+			gd += j->head_dim;
+		}
+	}
+}
+
+static void split_qgate_rows(tpool *pool, const float *mixed, float *q, float *gate, int n_heads,
+							 int head_dim, int n_rows) {
+	qwen_split_job job = {.mixed	= mixed,
+						  .q		= q,
+						  .gate		= gate,
+						  .n_heads	= n_heads,
+						  .head_dim = head_dim,
+						  .n_rows	= n_rows};
+	if (pool && n_rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, n_rows, 1, qwen_split_chunk, &job);
+	else
+		qwen_split_chunk(0, n_rows, -1, &job);
+}
+
+status_code op_split_qgate(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->s)
+		return ERR_INVALID_ARG;
+	model		*m		  = ctx->m;
+	int			 head_dim = m->head_dim;
+	int			 n_heads  = m->n_heads;
+	int			 n_rows	  = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	int			 q_out	  = n_heads * head_dim;
+	int			 mixed_n  = n_rows * 2 * q_out;
+	int			 out_n	  = n_rows * q_out;
+	const float *mixed =
+		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_PROJ, &ctx->s->hybrid_host, mixed_n);
+	float *q	= recipe_slot_write_stage(ctx, RECIPE_SLOT_Q, &ctx->s->hybrid_host2, out_n);
+	float *gate = recipe_slot_write_stage(ctx, RECIPE_SLOT_HYB_GATE, &ctx->s->hybrid_host3, out_n);
+	if (!mixed || !q || !gate)
+		return ERR_INVALID_ARG;
+	split_qgate_rows(model_get_pool(m), mixed, q, gate, n_heads, head_dim, n_rows);
+	status_code st = recipe_slot_write_commit(ctx, RECIPE_SLOT_Q, q, out_n);
+	if (st == OK)
+		st = recipe_slot_write_commit(ctx, RECIPE_SLOT_HYB_GATE, gate, out_n);
+	return st;
+}
+
+typedef struct {
+	float		*q, *k;
+	const float *cos_base, *sin_base;
+	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim, pos0, rows;
+} qwen_rope_job;
+
+static void qwen_partial_rope_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_rope_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
+		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
+		rope_rotate_neox(j->q + (size_t)row * j->qn, j->n_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+		rope_rotate_neox(j->k + (size_t)row * j->kn, j->n_kv_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+	}
+}
+
+status_code op_partial_rope_qk(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->s || ctx->pos < 0)
+		return ERR_INVALID_ARG;
+	model *m	= ctx->m;
+	int	   qn	= m->n_heads * m->head_dim;
+	int	   kn	= m->n_kv_heads * m->head_dim;
+	int	   half = m->rope_dim / 2;
+	int	   rows = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	int	   pos0 = recipe_exec_is_batch(ctx) ? ctx->pos_start : ctx->pos;
+	int	   qn_n = rows * qn;
+	int	   kn_n = rows * kn;
+
+	float *q = recipe_slot_rw_f32(ctx, RECIPE_SLOT_Q, &ctx->s->hybrid_host, qn_n);
+	float *k = recipe_slot_rw_f32(ctx, RECIPE_SLOT_K, &ctx->s->hybrid_host2, kn_n);
+	if (!q || !k)
+		return ERR_INVALID_ARG;
+
+	qwen_rope_job job  = {.q		  = q,
+						  .k		  = k,
+						  .cos_base	  = ctx->s->rope_cos,
+						  .sin_base	  = ctx->s->rope_sin,
+						  .qn		  = qn,
+						  .kn		  = kn,
+						  .half		  = half,
+						  .rope_dim	  = m->rope_dim,
+						  .n_heads	  = m->n_heads,
+						  .n_kv_heads = m->n_kv_heads,
+						  .head_dim	  = m->head_dim,
+						  .pos0		  = pos0,
+						  .rows		  = rows};
+	tpool		 *pool = model_get_pool(m);
+	if (pool && rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, rows, 1, qwen_partial_rope_chunk, &job);
+	else
+		qwen_partial_rope_chunk(0, rows, -1, &job);
+
+	status_code st = recipe_slot_write_commit(ctx, RECIPE_SLOT_Q, q, qn_n);
+	if (st == OK)
+		st = recipe_slot_write_commit(ctx, RECIPE_SLOT_K, k, kn_n);
+	return st;
+}
+
+typedef struct {
+	float		*out;
+	const float *gate;
+	int			 n, rows;
+} qwen_gate_job;
+
+static void qwen_output_gate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	qwen_gate_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		float		*o = j->out + (size_t)row * j->n;
+		const float *g = j->gate + (size_t)row * j->n;
+		for (int i = 0; i < j->n; i++)
+			o[i] *= sigmoidf(g[i]);
+	}
+}
+
+status_code op_attn_output_gate(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->s)
+		return ERR_INVALID_ARG;
+	int			 n		 = ctx->m->n_heads * ctx->m->head_dim;
+	int			 rows	 = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	int			 n_total = rows * n;
+	float		*out	 = recipe_slot_rw_f32(ctx, ctx->op->in[0], &ctx->s->hybrid_host, n_total);
+	const float *gate =
+		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_GATE, &ctx->s->hybrid_host2, n_total);
+	if (!out || !gate)
+		return ERR_INVALID_ARG;
+
+	qwen_gate_job job  = {.out = out, .gate = gate, .n = n, .rows = rows};
+	tpool		 *pool = model_get_pool(ctx->m);
+	if (pool && rows > 1 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, rows, 1, qwen_output_gate_chunk, &job);
+	else
+		qwen_output_gate_chunk(0, rows, -1, &job);
+
+	return recipe_slot_write_commit(ctx, ctx->op->in[0], out, n_total);
+}
+
+typedef struct {
+	float		*conv_out, *conv_state;
+	const float *mixed, *conv_w;
+	int			 conv_dim, conv_kernel, n_tokens, mixed_stride, history;
+} gdn_conv_job;
+
+static void gdn_conv_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	gdn_conv_job *j		  = ctx;
+	int			  history = j->history;
+	for (int c = begin; c < end; c++) {
+		const float *w	   = j->conv_w + (size_t)c * j->conv_kernel;
+		float		*hist  = j->conv_state + (size_t)c * history;
+		const float *mix_c = j->mixed + c;
+		if (history == 3) {
+			float h0 = hist[0], h1 = hist[1], h2 = hist[2];
+			for (int t = 0; t < j->n_tokens; t++) {
+				float m	  = mix_c[(size_t)t * j->mixed_stride];
+				float sum = h0 * w[0] + h1 * w[1] + h2 * w[2] + m * w[3];
+				h0		  = h1;
+				h1		  = h2;
+				h2		  = m;
+				j->conv_out[(size_t)t * j->conv_dim + c] = silu(sum);
+			}
+			hist[0] = h0;
+			hist[1] = h1;
+			hist[2] = h2;
+		} else {
+			for (int t = 0; t < j->n_tokens; t++) {
+				const float *mix = j->mixed + (size_t)t * j->mixed_stride;
+				float		*oc	 = j->conv_out + (size_t)t * j->conv_dim;
+				float		 sum = mix[c] * w[history];
+				if (history > 0) {
+					for (int jj = 0; jj < history; jj++)
+						sum += hist[jj] * w[jj];
+					if (history > 1)
+						memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
+					hist[history - 1] = mix[c];
+				}
+				oc[c] = silu(sum);
+			}
+		}
+	}
+}
+
+static void gdn_conv_tokens(tpool *pool, float *conv_out, float *conv_state, const float *mixed,
+							const float *conv_w, int conv_dim, int conv_kernel, int n_tokens,
+							int mixed_stride) {
+	gdn_conv_job job = {.conv_out	  = conv_out,
+						.conv_state	  = conv_state,
+						.mixed		  = mixed,
+						.conv_w		  = conv_w,
+						.conv_dim	  = conv_dim,
+						.conv_kernel  = conv_kernel,
+						.n_tokens	  = n_tokens,
+						.mixed_stride = mixed_stride,
+						.history	  = conv_kernel - 1};
+	if (pool && conv_dim > 8 && tpool_current_tid() < 0) {
+		tpool_parallel_for(pool, conv_dim, 8, gdn_conv_chunk, &job);
+		return;
+	}
+	gdn_conv_chunk(0, conv_dim, -1, &job);
+}
+
+typedef struct {
+	float		*state;
+	const float *conv;
+	const float *z;
+	const float *alpha;
+	const float *beta;
+	float		*out;
+	const float *dt;
+	const float *a;
+	const float *norm_w;
+	float		*scratch;
+	int			 n_tokens;
+	int			 conv_stride;
+	int			 z_stride;
+	int			 alpha_stride;
+	int			 beta_stride;
+	int			 out_stride;
+	int			 nkh;
+	int			 kd;
+	int			 vd;
+	int			 key_dim;
+	int			 scratch_stride;
+	float		 eps;
+} gdn_job;
+
+static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
+	int	   kd		  = j->kd;
+	int	   vd		  = j->vd;
+	float  q_scale	  = 1.0f / sqrtf((float)kd);
+	float *k_s		  = scratch;
+	float *q_s		  = k_s + kd;
+	float *mem		  = q_s + kd;
+	float *delta	  = mem + vd;
+	int	   state_head = kd * vd;
+
+	for (int vh = vh0; vh < vh1; vh++) {
+		int	   kh	 = vh % j->nkh;
+		float *shead = j->state + (size_t)vh * state_head;
+		for (int t = 0; t < j->n_tokens; t++) {
+			const float *conv_t	 = j->conv + (size_t)t * j->conv_stride;
+			const float *q		 = conv_t + (size_t)kh * kd;
+			const float *k		 = conv_t + j->key_dim + (size_t)kh * kd;
+			const float *v		 = conv_t + 2 * j->key_dim + (size_t)vh * vd;
+			const float *z_t	 = j->z + (size_t)t * j->z_stride + (size_t)vh * vd;
+			float		*y		 = j->out + (size_t)t * j->out_stride + (size_t)vh * vd;
+			float		 alpha_t = j->alpha[(size_t)t * j->alpha_stride + vh];
+			float		 beta_t	 = j->beta[(size_t)t * j->beta_stride + vh];
+
+			float decay = expf(j->a[vh] * softplusf(alpha_t + j->dt[vh]));
+			float b		= sigmoidf(beta_t);
+
+			float qn = j->eps;
+			float kn = j->eps;
+			for (int d = 0; d < kd; d++) {
+				qn += q[d] * q[d];
+				kn += k[d] * k[d];
+			}
+			qn = q_scale / sqrtf(qn);
+			kn = 1.0f / sqrtf(kn);
+			for (int d = 0; d < kd; d++) {
+				q_s[d] = q[d] * qn;
+				k_s[d] = k[d] * kn;
+			}
+
+			memset(mem, 0, (size_t)vd * sizeof(float));
+			for (int d = 0; d < kd; d++) {
+				float *row = shead + (size_t)d * vd;
+				float  ks  = k_s[d];
+				for (int jj = 0; jj < vd; jj++) {
+					row[jj] *= decay;
+					mem[jj] += row[jj] * ks;
+				}
+			}
+			for (int jj = 0; jj < vd; jj++)
+				delta[jj] = (v[jj] - mem[jj]) * b;
+			memset(y, 0, (size_t)vd * sizeof(float));
+			for (int d = 0; d < kd; d++) {
+				float *row = shead + (size_t)d * vd;
+				float  ks  = k_s[d];
+				float  qs  = q_s[d];
+				for (int jj = 0; jj < vd; jj++) {
+					row[jj] += ks * delta[jj];
+					y[jj] += row[jj] * qs;
+				}
+			}
+
+			float mean_sq = j->eps;
+			for (int jj = 0; jj < vd; jj++)
+				mean_sq += y[jj] * y[jj] / (float)vd;
+			float inv_rms = 1.0f / sqrtf(mean_sq);
+			for (int jj = 0; jj < vd; jj++)
+				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * silu(z_t[jj]);
+		}
+	}
+}
+
+static void gdn_chunk(int begin, int end, int tid, void *ctx) {
+	gdn_job *j = (gdn_job *)ctx;
+	gdn_heads(begin, end, j, j->scratch + (size_t)tid * j->scratch_stride);
+}
+
+static status_code gdn_run(exec_ctx *ctx, const float *mixed, const float *z, const float *alpha,
+						   const float *beta, float *out, float *ws, tpool *pool) {
+	model					  *m	  = ctx->m;
+	const model_hybrid_params *p	  = &m->hybrid;
+	layer_weights			  *L	  = &m->layers[ctx->li];
+	const float				  *conv_w = (const float *)L->ssm_conv1d_w.host_ptr;
+	const float				  *dt	  = (const float *)L->ssm_dt_b.host_ptr;
+	const float				  *a	  = (const float *)L->ssm_a.host_ptr;
+	const float				  *norm_w = (const float *)L->ssm_norm_w.host_ptr;
+	if (!conv_w || !dt || !a || !norm_w)
+		return ERR_FORMAT;
+
+	kvcache_hybrid *cache	   = ctx->cache->hybrid;
+	float		   *conv_state = cache->conv_state + (size_t)ctx->li * cache->conv_stride;
+	float		   *state	   = cache->recurrent_state + (size_t)ctx->li * cache->recurrent_stride;
+	if (ctx->pos_start == 0) {
+		memset(conv_state, 0, cache->conv_stride * sizeof(float));
+		memset(state, 0, cache->recurrent_stride * sizeof(float));
+	}
+
+	int	   n_tokens		  = ctx->n_rows > 0 ? ctx->n_rows : 1;
+	int	   scratch_stride = 2 * p->state_size + 2 * p->value_head_dim;
+	float *conv			  = ws;
+	float *scratch		  = ws + (size_t)n_tokens * p->conv_dim;
+
+	gdn_conv_tokens(pool, conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel, n_tokens,
+					p->conv_dim);
+
+	gdn_job job = {
+		.state			= state,
+		.conv			= conv,
+		.z				= z,
+		.alpha			= alpha,
+		.beta			= beta,
+		.out			= out,
+		.dt				= dt,
+		.a				= a,
+		.norm_w			= norm_w,
+		.scratch		= scratch,
+		.n_tokens		= n_tokens,
+		.conv_stride	= p->conv_dim,
+		.z_stride		= p->value_dim,
+		.alpha_stride	= p->n_value_heads,
+		.beta_stride	= p->n_value_heads,
+		.out_stride		= p->value_dim,
+		.nkh			= p->n_key_heads,
+		.kd				= p->state_size,
+		.vd				= p->value_head_dim,
+		.key_dim		= p->key_dim,
+		.scratch_stride = scratch_stride,
+		.eps			= m->norm_eps,
+	};
+	if (pool && p->n_value_heads > 1)
+		tpool_parallel_for(pool, p->n_value_heads, 1, gdn_chunk, &job);
+	else
+		gdn_heads(0, p->n_value_heads, &job, scratch);
+	return OK;
+}
+
+status_code op_gated_delta_net(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->cache || !ctx->s || !ctx->cache->hybrid)
+		return ERR_INVALID_ARG;
+	profile_scope			   ps		= profile_begin(&ctx->s->prof, ctx->op->stage);
+	const model_hybrid_params *p		= &ctx->m->hybrid;
+	int						   n_tokens = ctx->n_rows > 0 ? ctx->n_rows : 1;
+
+	tpool *pool		 = model_get_pool(ctx->m);
+	int	   n_threads = pool ? tpool_n_threads(pool) : 1;
+	if (n_threads < 1)
+		n_threads = 1;
+
+	size_t conv_need	= (size_t)n_tokens * p->conv_dim;
+	size_t scratch_need = (size_t)n_threads * (2 * p->state_size + 2 * p->value_head_dim);
+
+	int mixed_n = n_tokens * p->conv_dim;
+	int z_n		= n_tokens * p->value_dim;
+	int alpha_n = n_tokens * p->n_value_heads;
+	int beta_n	= n_tokens * p->n_value_heads;
+	int out_n	= n_tokens * p->value_dim;
+
+	const float *mixed =
+		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_PROJ, &ctx->s->hybrid_host, mixed_n);
+	const float *z = recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_GATE, &ctx->s->gdn_z_host, z_n);
+	const float *alpha =
+		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_ALPHA, &ctx->s->gdn_alpha_host, alpha_n);
+	const float *beta =
+		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_BETA, &ctx->s->gdn_beta_host, beta_n);
+	float *out = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->gdn_out_host, out_n);
+	if (!mixed || !z || !alpha || !beta || !out)
+		return ERR_INVALID_ARG;
+
+	float	   *ws = float_buf_ensure(&ctx->s->gdn_ws_host, conv_need + scratch_need);
+	status_code st = gdn_run(ctx, mixed, z, alpha, beta, out, ws, pool);
+	if (st == OK)
+		st = recipe_slot_write_commit(ctx, ctx->op->out, out, out_n);
+	profile_end(&ctx->s->prof, &ps);
+	return st;
+}
+static int lfm_attn_buf(const model *m) {
+	int buf	  = m->dim;
+	int q_out = m->n_heads * m->head_dim;
+	return buf > q_out ? buf : q_out;
+}
+
+typedef struct {
+	float		*out;
+	float		*state;
+	const float *mixed;
+	const float *conv_w;
+	int			 dim, kernel, history;
+	int			 in_stride, out_stride;
+	int			 n_rows;
+} shortconv_job;
+
+static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	shortconv_job *j = ctx;
+	const int	   K = j->kernel;
+	for (int c = begin; c < end; c++) {
+		const float *w	   = j->conv_w + (size_t)c * K;
+		float		*hist  = j->state + (size_t)c * j->history;
+		const float *b_col = j->mixed + c;
+		const float *c_col = j->mixed + (size_t)j->dim + c;
+		const float *x_col = j->mixed + 2 * (size_t)j->dim + c;
+		float		*o_col = j->out + c;
+
+		if (K == 3) {
+			float h0 = hist[0], h1 = hist[1];
+			for (int t = 0; t < j->n_rows; t++) {
+				size_t off						 = (size_t)t * j->in_stride;
+				float  bx						 = b_col[off] * x_col[off];
+				float  sum						 = h0 * w[0] + h1 * w[1] + bx * w[2];
+				h0								 = h1;
+				h1								 = bx;
+				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
+			}
+			hist[0] = h0;
+			hist[1] = h1;
+		} else {
+			for (int t = 0; t < j->n_rows; t++) {
+				size_t off = (size_t)t * j->in_stride;
+				float  bx  = b_col[off] * x_col[off];
+				float  sum = bx * w[K - 1];
+				for (int k = 0; k < j->history; k++)
+					sum += hist[k] * w[k];
+				memmove(hist, hist + 1, (size_t)(j->history - 1) * sizeof(float));
+				hist[j->history - 1]			 = bx;
+				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
+			}
+		}
+	}
+}
+
+status_code op_shortconv(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->cache || !ctx->cache->hybrid || !ctx->s)
+		return ERR_INVALID_ARG;
+	model					  *m	  = ctx->m;
+	layer_weights			  *L	  = &m->layers[ctx->li];
+	kvcache_hybrid			  *hc	  = ctx->cache->hybrid;
+	const model_hybrid_params *p	  = &m->hybrid;
+	const float				  *conv_w = (const float *)L->ssm_conv1d_w.host_ptr;
+	if (!conv_w || p->conv_kernel < 2 || ctx->li < 0 || ctx->li >= m->n_layers)
+		return ERR_FORMAT;
+
+	profile_scope ps = profile_begin(&ctx->s->prof, ctx->op->stage);
+
+	int	   n_rows = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	float *state  = hc->conv_state + (size_t)ctx->li * hc->conv_stride;
+	if (ctx->pos_start == 0)
+		memset(state, 0, (size_t)m->dim * (size_t)(p->conv_kernel - 1) * sizeof(float));
+
+	int			 in_stride	= model_hybrid_proj_size(m);
+	int			 out_stride = lfm_attn_buf(m);
+	int			 mixed_n	= n_rows * in_stride;
+	int			 out_n		= n_rows * out_stride;
+	const float *mixed = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->hybrid_host, mixed_n);
+	float		*out   = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->hybrid_host2, out_n);
+
+	shortconv_job job = {
+		.out		= out,
+		.state		= state,
+		.mixed		= mixed,
+		.conv_w		= conv_w,
+		.dim		= m->dim,
+		.kernel		= p->conv_kernel,
+		.history	= p->conv_kernel - 1,
+		.in_stride	= in_stride,
+		.out_stride = out_stride,
+		.n_rows		= n_rows,
+	};
+	if (!job.out || !job.mixed)
+		return ERR_INVALID_ARG;
+
+	tpool *pool = model_get_pool(m);
+	if (pool && m->dim > 8 && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, m->dim, 8, shortconv_chunk, &job);
+	else
+		shortconv_chunk(0, m->dim, -1, &job);
+
+	status_code st = recipe_slot_write_commit(ctx, ctx->op->out, out, out_n);
+
+	profile_end(&ctx->s->prof, &ps);
+	return st;
+}
+
 static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
 	[OP_EMBD_LOOKUP]		 = op_embd_lookup,
 	[OP_SCALE_EMBEDDINGS]	 = op_scale_embeddings,
@@ -4994,6 +5575,18 @@ recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage s
 	return op;
 }
 
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1) {
+	recipe_op op = {
+		.kind			= OP_MATMUL_MULTI,
+		.in				= {in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+		.out			= out,
+		.w_idx			= widx,
+		.stage			= STAGE_MATMUL,
+		.u.matmul_multi = {.n = 2, .k = k, .n_out = {n0, n1}},
+	};
+	return op;
+}
+
 recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage) {
 	recipe_op op = {
 		.kind  = OP_ADD,
@@ -5014,6 +5607,174 @@ recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage) {
 		.stage = stage,
 	};
 	return op;
+}
+
+recipe_op mk_kvput(uint8_t k_in, uint8_t v_in) {
+	recipe_op op = {
+		.kind  = OP_KV_PUT,
+		.in	   = {k_in, v_in, RECIPE_SLOT_NONE},
+		.out   = RECIPE_SLOT_NONE,
+		.w_idx = RECIPE_NO_WEIGHT,
+		.stage = STAGE_KVPUT,
+	};
+	return op;
+}
+
+recipe_op mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
+					   int n_ctx, float scale, int sliding_window) {
+	recipe_op op = {
+		.kind  = OP_ATTENTION,
+		.in	   = {q_in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+		.out   = out,
+		.w_idx = RECIPE_NO_WEIGHT,
+		.stage = STAGE_ATTN,
+		.u.attention =
+			{
+				.n_heads		   = n_heads,
+				.n_kv_heads		   = n_kv_heads,
+				.head_dim		   = head_dim,
+				.n_ctx			   = n_ctx,
+				.scale			   = scale,
+				.sliding_window	   = sliding_window,
+				.n_kv_heads_active = n_kv_heads,
+			},
+	};
+	return op;
+}
+
+recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox) {
+	recipe_op op = {
+		.kind	= OP_ROPE,
+		.in		= {in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+		.out	= RECIPE_SLOT_NONE,
+		.w_idx	= RECIPE_NO_WEIGHT,
+		.stage	= STAGE_ROPE,
+		.u.rope = {.n_heads = n_heads, .head_dim = head_dim, .rope_neox = rope_neox},
+	};
+	return op;
+}
+
+recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox) {
+	recipe_op op = {
+		.kind	= OP_ROPE_QK_FUSED,
+		.in		= {RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE},
+		.out	= RECIPE_SLOT_NONE,
+		.w_idx	= RECIPE_NO_WEIGHT,
+		.stage	= STAGE_ROPE,
+		.u.rope = {.n_heads	   = n_heads,
+				   .n_kv_heads = n_kv_heads,
+				   .head_dim   = head_dim,
+				   .rope_neox  = rope_neox},
+	};
+	return op;
+}
+
+recipe_op mk_rope_ext(uint8_t in, int rope_neox) {
+	recipe_op op = {
+		.kind		= OP_ROPE_EXT,
+		.in			= {in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+		.out		= RECIPE_SLOT_NONE,
+		.w_idx		= RECIPE_NO_WEIGHT,
+		.stage		= STAGE_ROPE,
+		.u.rope_ext = {.n_heads = 0, .head_dim = 0, .use_freq_factors = 1, .rope_neox = rope_neox},
+	};
+	return op;
+}
+
+recipe_op mk_partial_rope_qk(void) {
+	recipe_op op = {
+		.kind  = OP_PARTIAL_ROPE_QK,
+		.in	   = {RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE},
+		.out   = RECIPE_SLOT_NONE,
+		.w_idx = RECIPE_NO_WEIGHT,
+		.stage = STAGE_ROPE,
+	};
+	return op;
+}
+
+int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li) {
+	int	  dim			   = m->dim;
+	int	  inter			   = m->intermediate;
+	float eps			   = m->norm_eps;
+	int	  has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
+	int	  gate_up_fused	   = li >= 0 && m->layers[li].gate_up_fused;
+
+	ops[i++] = mk_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, STAGE_ADD);
+	ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
+	ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
+
+	if (gate_up_fused) {
+		ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP, 2 * inter, dim,
+							 STAGE_MATMUL);
+		ops[i++] = (recipe_op){
+			.kind	   = OP_FFN_ACTIVATE_FUSED,
+			.in		   = {RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+			.out	   = RECIPE_SLOT_FFN_ACT,
+			.w_idx	   = RECIPE_NO_WEIGHT,
+			.stage	   = STAGE_FFN_ACT,
+			.u.ffn_act = {.n = inter, .activation = ACTIVATION_SILU},
+		};
+	} else {
+		if (has_matmul_multi) {
+			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, dim, inter,
+										inter);
+		} else {
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter, dim,
+								 STAGE_MATMUL);
+			ops[i++] =
+				mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL);
+		}
+		ops[i++] = (recipe_op){
+			.kind	   = OP_FFN_ACTIVATE,
+			.in		   = {RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_NONE},
+			.out	   = RECIPE_SLOT_FFN_ACT,
+			.w_idx	   = RECIPE_NO_WEIGHT,
+			.stage	   = STAGE_FFN_ACT,
+			.u.ffn_act = {.n = inter, .activation = ACTIVATION_SILU},
+		};
+	}
+	ops[i++] = mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter, STAGE_MATMUL);
+	ops[i++] = mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_X, STAGE_ADD);
+	ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+	return i;
+}
+
+int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
+						  uint8_t experts_in_slot, uint8_t out_slot) {
+	int dim		  = m->dim;
+	int moe_inter = m->moe.moe_intermediate;
+
+	if (m->moe.n_shared_experts > 0) {
+		int sh_inter = moe_inter * m->moe.n_shared_experts;
+		ops[i++]	 = (recipe_op){
+			.kind	  = OP_MOE_SHARED,
+			.in		  = {experts_in_slot, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+			.out	  = RECIPE_SLOT_FFN_ACT,
+			.w_idx	  = WIDX_NONE,
+			.stage	  = STAGE_MATMUL,
+			.u.matmul = {.n = sh_inter, .k = dim},
+		};
+	}
+
+	ops[i++] = (recipe_op){
+		.kind	  = OP_MOE_ROUTER,
+		.in		  = {router_in_slot, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+		.out	  = RECIPE_SLOT_ROUTER_IDS,
+		.w_idx	  = WIDX_FFN_GATE_INP,
+		.stage	  = STAGE_MATMUL,
+		.u.matmul = {.n = m->moe.n_experts, .k = dim},
+	};
+
+	ops[i++] = (recipe_op){
+		.kind	  = OP_MOE_EXPERTS,
+		.in		  = {experts_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W},
+		.out	  = out_slot,
+		.w_idx	  = WIDX_NONE,
+		.stage	  = STAGE_MATMUL,
+		.u.matmul = {.n = dim, .k = moe_inter},
+	};
+
+	return i;
 }
 
 void recipe_build_pre_ops(model_recipe *r, const model *m) {

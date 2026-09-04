@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MOE_DEFAULT_CACHE_CAP 64
 #define MOE_DIRECT_IO_FALLBACK_ALIGN 4096
 #define MOE_CHUNK_TARGET_BYTES (8 * 1024 * 1024)
 
@@ -695,6 +694,16 @@ static void *pin_copy_worker(void *arg) {
 	return NULL;
 }
 
+static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
+	if (sl->dev_gate.owner)
+		sl->dev_gate.owner->buffer_free(sl->dev_gate.owner, &sl->dev_gate);
+	if (sl->dev_up.owner)
+		sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
+	if (sl->dev_down.owner)
+		sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
+	sl->dev_ready = 0;
+}
+
 status_code moe_stream_cache_init(struct model *m) {
 	if (m->moe_cache) {
 		return OK;
@@ -976,16 +985,8 @@ status_code moe_stream_cache_init(struct model *m) {
 		}
 		if (failed) {
 			for (int i = 0; i < m->n_layers; i++) {
-				for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
-					moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
-					if (sl->dev_ready && sl->dev_gate.owner)
-						sl->dev_gate.owner->buffer_free(sl->dev_gate.owner, &sl->dev_gate);
-					if (sl->dev_up.owner)
-						sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
-					if (sl->dev_down.owner)
-						sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
-					sl->dev_ready = 0;
-				}
+				for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
+					moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[pi]);
 			}
 			INFO("MoE: expert residency unavailable (allocation failed) -- keeping CPU path");
 		} else if (uploaded > 0) {
@@ -1003,16 +1004,8 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		return;
 
 	for (int i = 0; i < c->n_layers; i++) {
-		for (int s = 0; s < c->layers[i].n_pinned; s++) {
-			moe_expert_slot *sl = &c->layers[i].pinned_slots[s];
-			if (sl->dev_gate.owner)
-				sl->dev_gate.owner->buffer_free(sl->dev_gate.owner, &sl->dev_gate);
-			if (sl->dev_up.owner)
-				sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
-			if (sl->dev_down.owner)
-				sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
-			sl->dev_ready = 0;
-		}
+		for (int s = 0; s < c->layers[i].n_pinned; s++)
+			moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[s]);
 		for (int s = 0; s < c->layers[i].n_pinned; s++) {
 			free(c->layers[i].pinned_slots[s].heap_buf);
 		}
@@ -1437,6 +1430,7 @@ static void *moe_fetch_worker(void *arg) {
 		j->misses[idx].st = moe_pin_copy_slot(j->model, j->cache, j->layer, &j->misses[idx].tmp,
 											  j->misses[idx].reuse_buf, j->misses[idx].reuse_size);
 	}
+	moe_stream_thread_cleanup();
 	return NULL;
 }
 

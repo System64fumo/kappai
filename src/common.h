@@ -24,6 +24,13 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
+static inline size_t str_lcp_len(const char *a, const char *b) {
+	size_t i = 0;
+	while (a[i] && b[i] && a[i] == b[i])
+		i++;
+	return i;
+}
+
 #define HEAD_DIM_MAX 512
 
 typedef enum {

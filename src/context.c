@@ -138,6 +138,36 @@ status_code context_init(context *c, const config *cfg) {
 		}
 	}
 
+	{
+		int n_ctx_precheck = cfg->ctx_size;
+		if (n_ctx_precheck <= 0)
+			n_ctx_precheck = c->m.n_ctx;
+		if (n_ctx_precheck > c->m.n_ctx)
+			n_ctx_precheck = c->m.n_ctx;
+
+		backend		 *kv_owner_precheck = c->backend->kv_alloc ? c->backend : backend_host();
+		kv_quant_type kv_quant_precheck = (kv_quant_type)cfg->kv_quant;
+		size_t		  kv_bytes_precheck =
+			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck);
+		size_t avail_precheck = backend_mem_available(kv_owner_precheck);
+
+		size_t reserve_for_weights = 0;
+		if (kv_owner_precheck == c->backend)
+			reserve_for_weights = model_pending_weight_bytes(&c->m, cfg);
+
+		size_t needed_precheck = kv_bytes_precheck + reserve_for_weights;
+		if (!cfg->disable_failsafes && avail_precheck > 0 && needed_precheck > avail_precheck) {
+			ERROR("KV cache (ctx=%d, %.1f MB) + pending weights (%.1f MB) need %.1f MB but only "
+				  "%.1f MB is available on backend '%s' -- refusing to run (see "
+				  "--disable-failsafes).",
+				  n_ctx_precheck, kv_bytes_precheck / (1024.0 * 1024.0),
+				  reserve_for_weights / (1024.0 * 1024.0), needed_precheck / (1024.0 * 1024.0),
+				  avail_precheck / (1024.0 * 1024.0), kv_owner_precheck->name);
+			s = ERR_OUT_OF_MEMORY;
+			goto fail_model;
+		}
+	}
+
 	s = model_upload_weights(&c->m);
 	if (s != OK) {
 		ERROR("failed to upload weights for '%s'", cfg->model);
@@ -184,7 +214,8 @@ status_code context_init(context *c, const config *cfg) {
 		size_t avail	= backend_mem_available(kv_owner);
 		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
-				  "backend '%s' -- refusing to run (see --disable-failsafes).",
+				  "backend '%s' after loading weights -- refusing to run (see "
+				  "--disable-failsafes).",
 				  n_ctx, kv_bytes / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), kv_owner->name);
 			s = ERR_OUT_OF_MEMORY;
 			goto fail_chat;
@@ -989,13 +1020,6 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 						  &unfed_tail, NULL);
 }
 
-static size_t ctx_lcp_len(const char *a, const char *b) {
-	size_t i = 0;
-	while (a[i] && b[i] && a[i] == b[i])
-		i++;
-	return i;
-}
-
 static void *idle_prefill_thread(void *arg) {
 	context *c = (context *)arg;
 	char	 errbuf[512];
@@ -1009,7 +1033,7 @@ static void *idle_prefill_thread(void *arg) {
 	if (s1 != OK || s2 != OK || c->interrupt)
 		goto out;
 
-	size_t header_bytes = ctx_lcp_len(r1, r2);
+	size_t header_bytes = str_lcp_len(r1, r2);
 	if (header_bytes == 0)
 		goto out;
 

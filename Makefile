@@ -10,23 +10,22 @@ OBJ_DIR := $(OUT_DIR)/src
 # --- Build mode: debug | release-rdbg | release ---
 BUILD ?= release-rdbg
 
+HOST_ARCH := $(shell uname -m)
+
+CPU_ARCH_OPT ?= 1
+
+BACKENDS ?=
+
+-include $(OUT_DIR)/config.mk
+
 VALID_BUILDS := debug release-rdbg release
 ifeq ($(filter $(BUILD),$(VALID_BUILDS)),)
   $(error Invalid BUILD='$(BUILD)'. Valid options: $(VALID_BUILDS))
 endif
 
-ifeq ($(BUILD),release)
-  RANLIB := gcc-ranlib
-endif
-
-HOST_ARCH := $(shell uname -m)
-
-CPU_ARCH_OPT ?= 1
-
 AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
 
 comma := ,
-BACKENDS ?=
 REQUESTED_BACKENDS := $(strip $(subst $(comma), ,$(BACKENDS)))
 UNKNOWN_BACKENDS := $(filter-out $(AVAILABLE_BACKENDS),$(REQUESTED_BACKENDS))
 
@@ -36,13 +35,34 @@ endif
 
 HAS_VULKAN := $(filter vulkan,$(REQUESTED_BACKENDS))
 
+ifeq ($(HOST_ARCH),aarch64)
+  DETECTED_CACHE_LINE   := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
+  DETECTED_L1D_KB       := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB        := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
+                            if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
+                              cat $$d/size | tr -dc '0-9'; break; fi; done)
+endif
+
+ifeq ($(HOST_ARCH),x86_64)
+  DETECTED_CACHE_LINE   := $(shell getconf LEVEL1_DCACHE_LINESIZE 2>/dev/null || echo 64)
+  DETECTED_L1D_KB       := $(shell getconf LEVEL1_DCACHE_SIZE 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB        := $(shell getconf LEVEL2_CACHE_SIZE 2>/dev/null | tr -dc '0-9')
+endif
+
+DETECTED_ARCH_FLAGS := $(shell $(CC) -### -E - -march=native 2>&1 | sed -rn '/cc1/!d;s/(\")|(^.* - )//g;s/ -dumpbase -//g;p')
+
+ifeq ($(wildcard $(OUT_DIR)/config.mk),)
+  KAI_CACHE_LINE := $(DETECTED_CACHE_LINE)
+  KAI_L1D_KB := $(DETECTED_L1D_KB)
+  KAI_L2_KB := $(DETECTED_L2_KB)
+  MACHINE_ARCH_FLAGS := $(DETECTED_ARCH_FLAGS)
+endif
+
 BASE_FLAGS := -std=c11 -D_DEFAULT_SOURCE
 DEP_FLAGS  := -MMD -MP
 
 ifeq ($(BUILD),release)
-  ARCH_FLAGS ?= -march=native
-else
-  ARCH_FLAGS ?=
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
 endif
 
 MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros \
@@ -55,25 +75,17 @@ else
 endif
 
 ifeq ($(CPU_ARCH_OPT),1)
-  ifeq ($(HOST_ARCH),aarch64)
-    KAI_CACHE_LINE   := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
-    KAI_L1D_KB	     := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
-    KAI_L2_KB	     := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
-			    if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
-			      cat $$d/size | tr -dc '0-9'; break; fi; done)
+  ifneq ($(strip $(KAI_CACHE_LINE)),)
+    CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
   endif
-endif
-
-ifneq ($(strip $(KAI_CACHE_LINE)),)
-  CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
-endif
-ifneq ($(strip $(KAI_L1D_KB)),)
-  CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
-endif
-ifneq ($(strip $(KAI_L2_KB)),)
-  CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
-  ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
-    CFLAGS += -DPREFETCH_LOCALITY=0
+  ifneq ($(strip $(KAI_L1D_KB)),)
+    CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
+  endif
+  ifneq ($(strip $(KAI_L2_KB)),)
+    CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
+    ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
+      CFLAGS += -DPREFETCH_LOCALITY=0
+    endif
   endif
 endif
 
@@ -146,21 +158,14 @@ BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
 	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor $(OBJ_DIR)/server \
 	      $(OBJ_DIR)/models $(OBJ_DIR)/test
 
-CONFIG_STAMP := $(OUT_DIR)/.build-config
-CONFIG_SIG   := BUILD=$(BUILD) BACKENDS=$(sort $(REQUESTED_BACKENDS)) CPU_ARCH_OPT=$(CPU_ARCH_OPT) HOST_ARCH=$(HOST_ARCH) \
-		CACHE_LINE=$(KAI_CACHE_LINE) L1D_KB=$(KAI_L1D_KB) L2_KB=$(KAI_L2_KB)
-PREV_SIG     := $(shell cat $(CONFIG_STAMP) 2>/dev/null)
+CONFIG_FILE := $(OUT_DIR)/config.mk
 
-CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help
+CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help config
 BUILD_GOALS := $(filter-out $(CONFIG_AGNOSTIC_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all))
 
 ifneq ($(BUILD_GOALS),)
-  ifneq ($(PREV_SIG),)
-    ifneq ($(PREV_SIG),$(CONFIG_SIG))
-      $(info Previous build config: $(PREV_SIG))
-      $(info Requested build config: $(CONFIG_SIG))
-      $(error $(OUT_DIR) was built with different settings. Run 'make clean' first, or match the previous settings)
-    endif
+  ifeq ($(wildcard $(CONFIG_FILE)),)
+    $(error No build configuration found. Run 'make config' first)
   endif
 endif
 
@@ -364,19 +369,31 @@ SERVER_SRCS := $(SRC_DIR)/server/main.c \
 SERVER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
 SERVER_LIBS := -ljson-c -lmicrohttpd
 
-.PHONY: all cli test server monitor clean print-config format tidy backends-help
+.PHONY: all cli test server monitor clean print-config format tidy backends-help config
 
 all: cli test server
 
+config: $(OUT_DIR) $(CONFIG_FILE)
+	@echo "Build configuration created:"
+	@cat $(CONFIG_FILE)
+
+$(CONFIG_FILE): | $(OUT_DIR)
+	@echo "Generating build configuration..."
+	@printf 'BUILD = %s\n' "$(BUILD)" > $@
+	@printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
+	@printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)" >> $@
+	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
+	@printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)" >> $@
+	@printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)" >> $@
+	@printf 'KAI_L1D_KB = %s\n' "$(DETECTED_L1D_KB)" >> $@
+	@printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)" >> $@
+
 backends-help:
 	@echo "available backends: $(AVAILABLE_BACKENDS)"
-	@echo "usage: make BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
-
-$(CONFIG_STAMP): | $(OUT_DIR)
-	@printf '%s' "$(CONFIG_SIG)" > $@
+	@echo "usage: make config BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
 
 monitor: $(MONITOR_BIN)
-$(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_STAMP)
+$(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) -O2 -g -Wall -Wextra -I$(SRC_DIR) $< -o $@ -lncurses -ljson-c
@@ -396,7 +413,7 @@ $(TEST_BIN): $(TEST_OBJS) $(ENGINE)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -o $@
 
-$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_STAMP)
+$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
@@ -408,15 +425,10 @@ $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
 	@$(CC) -shared $(CFLAGS) $^ $(LDFLAGS) -o $@
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_STAMP)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
-
-ifeq ($(HOST_ARCH),x86_64)
-  $(OBJ_DIR)/backend/cpu/x86_64/quants.o: CFLAGS += -mavx2 -mf16c -mfma
-  $(OBJ_DIR)/backend/cpu/x86_64/core.o: CFLAGS += -mavx2 -mf16c -mfma
-endif
 
 $(OUT_DIR):
 	@mkdir -p $(BUILD_DIRS)
@@ -431,6 +443,7 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
+	@echo "MACHINE_ARCH_FLAGS = $(MACHINE_ARCH_FLAGS)"
 	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
