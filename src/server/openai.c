@@ -67,6 +67,9 @@ typedef struct {
 
 	bool streaming;
 	bool chat_api;
+	bool same_session;
+	uint64_t session_key_at_start;
+	bool generation_done;
 
 	pthread_mutex_t q_mtx;
 	pthread_cond_t	q_cv;
@@ -122,6 +125,10 @@ struct openai_state {
 
 	long		  created_at;
 	atomic_ullong req_counter;
+
+	bool	  has_session;
+	uint64_t *prefix_hashes;
+	size_t	  prefix_len;
 
 	pthread_mutex_t gen_mtx;
 
@@ -314,6 +321,32 @@ static void parse_sampling_params(json_object *root, oa_req_params *p) {
 	parse_stop(root, p);
 }
 
+static uint64_t fnv1a_update(uint64_t h, const char *s) {
+	if (!s)
+		return h;
+	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+		h ^= *p;
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static uint64_t *session_prefix_hash_chain(const oa_req_params *p, size_t *out_len) {
+	size_t	  len   = p->n_messages > 0 ? p->n_messages - 1 : 0;
+	uint64_t *chain = xmalloc((len + 1) * sizeof(uint64_t));
+	chain[0]		= 1469598103934665603ULL;
+	for (size_t i = 0; i < len; i++) {
+		uint64_t h = chain[i];
+		h		   = fnv1a_update(h, p->messages[i].role);
+		h		   = fnv1a_update(h, "\x1f");
+		h		   = fnv1a_update(h, p->messages[i].content);
+		h		   = fnv1a_update(h, "\x1e");
+		chain[i + 1] = h;
+	}
+	*out_len = len;
+	return chain;
+}
+
 static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 	parse_sampling_params(root, p);
 
@@ -451,9 +484,12 @@ static void gen_queue_done(oa_gen *g) {
 
 static void gen_mark_client_gone(oa_gen *g) {
 	pthread_mutex_lock(&g->q_mtx);
-	g->client_gone = true;
+	bool was_in_flight = !g->generation_done;
+	g->client_gone	   = true;
 	pthread_cond_broadcast(&g->q_cv);
 	pthread_mutex_unlock(&g->q_mtx);
+	if (was_in_flight && g->st && g->st->ctx)
+		g->st->ctx->interrupt = 1;
 }
 
 static void make_id(oa_gen *g) {
@@ -802,10 +838,12 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 			sampler_init(&c->samp, rc->params.seed);
 			sampler_set_vocab(&c->samp, c->m.vocab_size);
 		}
-		context_reset(c);
+		if (!g->same_session || c->session_poisoned)
+			context_reset(c);
 
 		if (chat_api) {
-			for (size_t i = 0; i + 1 < rc->params.n_messages; i++)
+			size_t start = c->chat.n_messages;
+			for (size_t i = start; i + 1 < rc->params.n_messages; i++)
 				chat_template_add_message(&c->chat, rc->params.messages[i].role,
 										  rc->params.messages[i].content);
 			g->generated = context_chat_turn(c, rc->params.messages[rc->params.n_messages - 1].role,
@@ -817,6 +855,9 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 		}
 		c->interrupt	 = 0;
 		g->prompt_tokens = c->last_prompt_tokens;
+		pthread_mutex_lock(&g->q_mtx);
+		g->generation_done = true;
+		pthread_mutex_unlock(&g->q_mtx);
 	}
 	pthread_mutex_unlock(&st->gen_mtx);
 
@@ -869,11 +910,13 @@ static void request_completed(void *cls, struct MHD_Connection *conn, void **con
 							  enum MHD_RequestTerminationCode toe) {
 	(void)cls;
 	(void)conn;
-	(void)toe;
 	req_ctx *rc = *(req_ctx **)con_cls;
 	if (!rc)
 		return;
+	DEBUG("connection closed (termination_code=%d) for session=%llx interrupt_before=%d",
+		 (int)toe, (unsigned long long)rc->gen.session_key_at_start, (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
 	gen_mark_client_gone(&rc->gen);
+	DEBUG("connection closed: interrupt_after=%d", (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
 	*(req_ctx **)con_cls = NULL;
 	rc_unref(rc);
 }
@@ -897,6 +940,8 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
 							error_body("Invalid API key", "authentication_error"));
 
+	DEBUG("request body [%s]: %s", url, rc->body ? rc->body : "(empty)");
+
 	json_object *body = json_tokener_parse(rc->body ? rc->body : "");
 	if (!body)
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST,
@@ -916,6 +961,32 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST, error_body(err, "invalid_request_error"));
 	}
 	rc->body_json = body;
+
+	if (chat_api) {
+		size_t	  new_len;
+		uint64_t *new_chain = session_prefix_hash_chain(&rc->params, &new_len);
+		uint64_t  key		= new_chain[new_len];
+
+		pthread_mutex_lock(&st->gen_mtx);
+		bool matched = st->has_session && new_len >= st->prefix_len &&
+					  new_chain[st->prefix_len] == st->prefix_hashes[st->prefix_len];
+		if (st->has_session && !matched)
+			WARN("session=%016llx new session detected (previous session's history no "
+				 "longer matches; previous_len=%zu new_len=%zu) -- previous session is "
+				 "now broken; n_messages=%zu",
+				 (unsigned long long)key, st->prefix_len, new_len, rc->params.n_messages);
+		else
+			INFO("session=%016llx %s; n_messages=%zu", (unsigned long long)key,
+				 matched ? "continuing existing session" : "starting first session",
+				 rc->params.n_messages);
+		rc->gen.same_session		 = matched;
+		rc->gen.session_key_at_start = key;
+		st->has_session				 = true;
+		free(st->prefix_hashes);
+		st->prefix_hashes = new_chain;
+		st->prefix_len	  = new_len;
+		pthread_mutex_unlock(&st->gen_mtx);
+	}
 
 	rc->gen.streaming = rc->params.stream;
 
@@ -973,6 +1044,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 
 	if (*con_cls == NULL) {
 		*con_cls = rc_new(st);
+		DEBUG("connection opened: %s %s", method, url);
 		return MHD_YES;
 	}
 	req_ctx *rc = *(req_ctx **)con_cls;
@@ -1110,6 +1182,8 @@ void openai_stop(openai_state *st) {
 	if (!st)
 		return;
 	atomic_store_explicit(&st->shutting_down, true, memory_order_relaxed);
+	if (st->ctx)
+		st->ctx->interrupt = 1;
 	if (st->daemon)
 		MHD_stop_daemon(st->daemon);
 	st->daemon = NULL;
@@ -1122,6 +1196,7 @@ void openai_free(openai_state *st) {
 	free(st->bind_addr);
 	free(st->model_id);
 	free(st->api_key);
+	free(st->prefix_hashes);
 	pthread_mutex_destroy(&st->gen_mtx);
 	free(st);
 }
