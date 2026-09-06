@@ -173,14 +173,27 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->moe_scratch.p);
 	free(s->moe_xb_f.p);
 	free(s->moe_shared_y.p);
-	free(s->hybrid_host.p);
 	s->moe_all_scratch.p = NULL;
 	s->moe_all_outs.p	 = NULL;
 	s->moe_scratch.p	 = NULL;
 	s->moe_xb_f.p		 = NULL;
 	s->moe_shared_y.p	 = NULL;
-	s->hybrid_host.p	 = NULL;
-	s->hybrid_host.cap	 = 0;
+
+#define FREE_FLOAT_BUF(field)                                                                      \
+	do {                                                                                           \
+		free(s->field.p);                                                                          \
+		s->field.p	 = NULL;                                                                       \
+		s->field.cap = 0;                                                                          \
+	} while (0)
+	FREE_FLOAT_BUF(hybrid_host);
+	FREE_FLOAT_BUF(hybrid_host2);
+	FREE_FLOAT_BUF(hybrid_host3);
+	FREE_FLOAT_BUF(gdn_ws_host);
+	FREE_FLOAT_BUF(gdn_z_host);
+	FREE_FLOAT_BUF(gdn_alpha_host);
+	FREE_FLOAT_BUF(gdn_beta_host);
+	FREE_FLOAT_BUF(gdn_out_host);
+#undef FREE_FLOAT_BUF
 
 	if (s->bs) {
 		batch_scratch_free(s->bs);

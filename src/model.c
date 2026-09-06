@@ -508,6 +508,8 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	return 0;
 }
 
+static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes);
+
 static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
 									uint64_t d0, uint64_t d1, weight_class wc,
 									backend *target_backend, buffer *out) {
@@ -521,6 +523,12 @@ static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t typ
 	status_code s	 = home->buffer_alloc_weight(home, &desc, out);
 	if (s != OK)
 		return s;
+
+	if (!backend_has_cap(home, BCAP_IS_HOST)) {
+		size_t bytes = (n_dims == 1) ? ggml_row_size(type, d0) : ggml_row_size(type, d0) * d1;
+		release_original_weight_data(m, host_ptr, bytes);
+		out->host_ptr = NULL;
+	}
 
 	return OK;
 }
@@ -2649,7 +2657,8 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	m->batchable = -1;
 	m->backend	 = bk;
 
-	size_t avail_before_load = get_available_memory();
+	int	   is_host_backend	 = backend_has_cap(bk, BCAP_IS_HOST) ? 1 : 0;
+	size_t avail_before_load = is_host_backend ? get_available_memory() : backend_mem_available(bk);
 
 	status_code s = model_load_open(m, path, use_mmap, repack_config, requested_n_ctx);
 	if (s != OK) {
@@ -2693,7 +2702,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	if (report_n_ctx <= 0 || report_n_ctx > m->n_ctx)
 		report_n_ctx = m->n_ctx;
 	recommend_memory_config(m, report_n_ctx, avail_before_load,
-							(kv_quant_type)config_get()->kv_quant);
+							(kv_quant_type)config_get()->kv_quant, is_host_backend);
 
 	return OK;
 

@@ -451,6 +451,56 @@ int gguf_tensor_byte_size(const gguf_tensor *t, size_t *out_size) {
 	return 0;
 }
 
+static ptrdiff_t strtab_find(const gguf_strtab_entry *table, size_t cap, const char *key) {
+	if (!table)
+		return -1;
+	uint64_t h = fnv1a_str(key) & (cap - 1);
+	while (table[h].used) {
+		if (strcmp(table[h].key, key) == 0)
+			return (ptrdiff_t)table[h].idx;
+		h = (h + 1) & (cap - 1);
+	}
+	return -1;
+}
+
+static void strtab_build(gguf_strtab_entry **out_table, size_t *out_cap, size_t count,
+						 size_t		 min_cap, const char *(*key_of)(const void *ctx, size_t i),
+						 const void *ctx, const char *dup_warn_label) {
+	size_t cap = 1;
+	while (cap < min_cap)
+		cap <<= 1;
+	gguf_strtab_entry *table = xcalloc(cap, sizeof(*table));
+	for (size_t i = 0; i < count; i++) {
+		const char *key = key_of(ctx, i);
+		uint64_t	h	= fnv1a_str(key) & (cap - 1);
+		int			dup = 0;
+		while (table[h].used) {
+			if (strcmp(table[h].key, key) == 0) {
+				dup = 1;
+				break;
+			}
+			h = (h + 1) & (cap - 1);
+		}
+		if (dup) {
+			WARN("gguf: duplicate %s '%s' ignored", dup_warn_label, key);
+			continue;
+		}
+		table[h].key  = key;
+		table[h].idx  = i;
+		table[h].used = 1;
+	}
+	*out_table = table;
+	*out_cap   = cap;
+}
+
+static const char *tensor_name_at(const void *ctx, size_t i) {
+	return ((const gguf_tensor *)ctx)[i].name;
+}
+
+static const char *kv_key_at(const void *ctx, size_t i) {
+	return ((const char *const *)ctx)[i];
+}
+
 static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, int fd, void *map_ptr,
 									 int header_only) {
 	gguf_reader r = {(const uint8_t *)data, (const uint8_t *)data + fsize};
@@ -561,31 +611,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		ts[i].data = (const uint8_t *)ctx->data_start + ts[i].offset;
 	}
 
-	{
-		size_t cap = 1;
-		while (cap < ctx->n_tensors * 2)
-			cap <<= 1;
-		ctx->tensor_hash	 = xcalloc(cap, sizeof(*ctx->tensor_hash));
-		ctx->tensor_hash_cap = cap;
-		for (size_t i = 0; i < ctx->n_tensors; i++) {
-			uint64_t h	 = fnv1a_str(ts[i].name) & (cap - 1);
-			int		 dup = 0;
-			while (ctx->tensor_hash[h].used) {
-				if (strcmp(ctx->tensor_hash[h].name, ts[i].name) == 0) {
-					dup = 1;
-					break;
-				}
-				h = (h + 1) & (cap - 1);
-			}
-			if (dup) {
-				WARN("gguf: duplicate tensor name '%s' ignored", ts[i].name);
-				continue;
-			}
-			ctx->tensor_hash[h].name = ts[i].name;
-			ctx->tensor_hash[h].idx	 = i;
-			ctx->tensor_hash[h].used = 1;
-		}
-	}
+	strtab_build(&ctx->tensor_hash, &ctx->tensor_hash_cap, ctx->n_tensors, ctx->n_tensors * 2,
+				 tensor_name_at, ts, "tensor name");
 
 	ctx->kv_keys	 = (char **)xcalloc(ctx->n_kv, sizeof(char *));
 	ctx->kv_types	 = xcalloc(ctx->n_kv, sizeof(uint32_t));
@@ -605,31 +632,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 	}
 	free(kv);
 
-	{
-		size_t cap = 1;
-		while (cap < (ctx->n_kv * 2) + 1)
-			cap <<= 1;
-		ctx->kv_hash	 = xcalloc(cap, sizeof(*ctx->kv_hash));
-		ctx->kv_hash_cap = cap;
-		for (size_t i = 0; i < ctx->n_kv; i++) {
-			uint64_t h	 = fnv1a_str(ctx->kv_keys[i]) & (cap - 1);
-			int		 dup = 0;
-			while (ctx->kv_hash[h].used) {
-				if (strcmp(ctx->kv_hash[h].key, ctx->kv_keys[i]) == 0) {
-					dup = 1;
-					break;
-				}
-				h = (h + 1) & (cap - 1);
-			}
-			if (dup) {
-				WARN("gguf: duplicate metadata key '%s' ignored", ctx->kv_keys[i]);
-				continue;
-			}
-			ctx->kv_hash[h].key	 = ctx->kv_keys[i];
-			ctx->kv_hash[h].idx	 = i;
-			ctx->kv_hash[h].used = 1;
-		}
-	}
+	strtab_build(&ctx->kv_hash, &ctx->kv_hash_cap, ctx->n_kv, ctx->n_kv * 2 + 1, kv_key_at,
+				 ctx->kv_keys, "metadata key");
 
 	ctx->tensors  = ts;
 	ctx->fd		  = fd;
@@ -1201,15 +1205,7 @@ void gguf_free(gguf_ctx *ctx) {
 }
 
 static ptrdiff_t find_kv(const gguf_ctx *c, const char *key) {
-	if (!c->kv_hash)
-		return -1;
-	uint64_t h = fnv1a_str(key) & (c->kv_hash_cap - 1);
-	while (c->kv_hash[h].used) {
-		if (strcmp(c->kv_hash[h].key, key) == 0)
-			return (ptrdiff_t)c->kv_hash[h].idx;
-		h = (h + 1) & (c->kv_hash_cap - 1);
-	}
-	return -1;
+	return strtab_find(c->kv_hash, c->kv_hash_cap, key);
 }
 
 status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
@@ -1304,15 +1300,8 @@ status_code gguf_get_arr_str(const gguf_ctx *c, const char *k, const char *const
 }
 
 const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name) {
-	if (!c->tensor_hash)
-		return NULL;
-	uint64_t h = fnv1a_str(name) & (c->tensor_hash_cap - 1);
-	while (c->tensor_hash[h].used) {
-		if (strcmp(c->tensor_hash[h].name, name) == 0)
-			return &c->tensors[c->tensor_hash[h].idx];
-		h = (h + 1) & (c->tensor_hash_cap - 1);
-	}
-	return NULL;
+	ptrdiff_t i = strtab_find(c->tensor_hash, c->tensor_hash_cap, name);
+	return i < 0 ? NULL : &c->tensors[i];
 }
 
 static const char *type_name(uint32_t t) {

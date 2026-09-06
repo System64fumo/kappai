@@ -110,33 +110,33 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	return s;
 }
 
+static void kv_buffer_free(buffer *b) {
+	if (b->owner)
+		b->owner->buffer_free(b->owner, b);
+}
+
 void kvcache_free(kvcache *c) {
 	if (!c->backend)
 		return;
 	if (c->mla) {
-		if (c->mla->kv.owner)
-			c->mla->kv.owner->buffer_free(c->mla->kv.owner, &c->mla->kv);
-		if (c->mla->host_alloced && c->mla->kv_host.owner)
-			c->mla->kv_host.owner->buffer_free(c->mla->kv_host.owner, &c->mla->kv_host);
+		kv_buffer_free(&c->mla->kv);
+		if (c->mla->host_alloced)
+			kv_buffer_free(&c->mla->kv_host);
 		free(c->mla);
 	} else {
 		if (c->backend->kv_free) {
 			c->backend->kv_free(c->backend, &c->k, &c->v);
 		} else {
-			if (c->k.owner)
-				c->k.owner->buffer_free(c->k.owner, &c->k);
-			if (c->v.owner)
-				c->v.owner->buffer_free(c->v.owner, &c->v);
+			kv_buffer_free(&c->k);
+			kv_buffer_free(&c->v);
 		}
 		if (c->has_host_kv) {
 			backend *host = backend_host();
 			if (host && host->kv_free) {
 				host->kv_free(host, &c->k_host, &c->v_host);
 			} else {
-				if (c->k_host.owner)
-					c->k_host.owner->buffer_free(c->k_host.owner, &c->k_host);
-				if (c->v_host.owner)
-					c->v_host.owner->buffer_free(c->v_host.owner, &c->v_host);
+				kv_buffer_free(&c->k_host);
+				kv_buffer_free(&c->v_host);
 			}
 			c->has_host_kv = 0;
 		}

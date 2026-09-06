@@ -5,48 +5,66 @@ SRC_DIR := src
 OUT_DIR := build
 OBJ_DIR := $(OUT_DIR)/src
 
-.DEFAULT_GOAL := all
-
-# --- Build mode: debug | release-rdbg | release ---
 BUILD ?= release-rdbg
+CPU_ARCH_OPT ?= 1
+BACKENDS ?=
+
+HOST_ARCH := $(shell uname -m)
+comma := ,
+
+.DEFAULT_GOAL := all
+-include $(OUT_DIR)/config.mk
 
 VALID_BUILDS := debug release-rdbg release
 ifeq ($(filter $(BUILD),$(VALID_BUILDS)),)
   $(error Invalid BUILD='$(BUILD)'. Valid options: $(VALID_BUILDS))
 endif
 
-ifeq ($(BUILD),release)
-  RANLIB := gcc-ranlib
-endif
-
-HOST_ARCH := $(shell uname -m)
-
-CPU_ARCH_OPT ?= 1
-
 AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
-
-comma := ,
-BACKENDS ?=
 REQUESTED_BACKENDS := $(strip $(subst $(comma), ,$(BACKENDS)))
 UNKNOWN_BACKENDS := $(filter-out $(AVAILABLE_BACKENDS),$(REQUESTED_BACKENDS))
-
 ifneq ($(UNKNOWN_BACKENDS),)
   $(error Unknown backend(s): $(UNKNOWN_BACKENDS). Available backends: $(AVAILABLE_BACKENDS))
 endif
-
 HAS_VULKAN := $(filter vulkan,$(REQUESTED_BACKENDS))
+
+CONFIG_FILE := $(OUT_DIR)/config.mk
+CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help config
+BUILD_GOALS := $(filter-out $(CONFIG_AGNOSTIC_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all))
+ifneq ($(BUILD_GOALS),)
+  ifeq ($(wildcard $(CONFIG_FILE)),)
+    $(error No build configuration found. Run 'make config' first)
+  endif
+endif
+
+ifeq ($(HOST_ARCH),aarch64)
+  DETECTED_CACHE_LINE := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
+  DETECTED_L1D_KB      := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB       := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
+                           if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
+                             cat $$d/size | tr -dc '0-9'; break; fi; done)
+endif
+ifeq ($(HOST_ARCH),x86_64)
+  DETECTED_CACHE_LINE := $(shell getconf LEVEL1_DCACHE_LINESIZE 2>/dev/null || echo 64)
+  DETECTED_L1D_KB      := $(shell getconf LEVEL1_DCACHE_SIZE 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB       := $(shell getconf LEVEL2_CACHE_SIZE 2>/dev/null | tr -dc '0-9')
+endif
+DETECTED_ARCH_FLAGS := $(shell $(CC) -### -E - -march=native 2>&1 | sed -rn '/cc1/!d;s/(\")|(^.* - )//g;s/ -dumpbase -//g;p')
+
+ifeq ($(wildcard $(OUT_DIR)/config.mk),)
+  KAI_CACHE_LINE      := $(DETECTED_CACHE_LINE)
+  KAI_L1D_KB          := $(DETECTED_L1D_KB)
+  KAI_L2_KB           := $(DETECTED_L2_KB)
+  MACHINE_ARCH_FLAGS  := $(DETECTED_ARCH_FLAGS)
+endif
 
 BASE_FLAGS := -std=c11 -D_DEFAULT_SOURCE
 DEP_FLAGS  := -MMD -MP
+MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros -fcx-limited-range
 
 ifeq ($(BUILD),release)
-  ARCH_FLAGS ?= -march=native
-else
-  ARCH_FLAGS ?=
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
 endif
-
-MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros \
-	      -fcx-limited-range
 
 ifeq ($(TSAN),1)
   SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
@@ -55,25 +73,17 @@ else
 endif
 
 ifeq ($(CPU_ARCH_OPT),1)
-  ifeq ($(HOST_ARCH),aarch64)
-    KAI_CACHE_LINE   := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
-    KAI_L1D_KB	     := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
-    KAI_L2_KB	     := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
-			    if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
-			      cat $$d/size | tr -dc '0-9'; break; fi; done)
+  ifneq ($(strip $(KAI_CACHE_LINE)),)
+    CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
   endif
-endif
-
-ifneq ($(strip $(KAI_CACHE_LINE)),)
-  CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
-endif
-ifneq ($(strip $(KAI_L1D_KB)),)
-  CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
-endif
-ifneq ($(strip $(KAI_L2_KB)),)
-  CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
-  ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
-    CFLAGS += -DPREFETCH_LOCALITY=0
+  ifneq ($(strip $(KAI_L1D_KB)),)
+    CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
+  endif
+  ifneq ($(strip $(KAI_L2_KB)),)
+    CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
+    ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
+      CFLAGS += -DPREFETCH_LOCALITY=0
+    endif
   endif
 endif
 
@@ -83,7 +93,6 @@ ifeq ($(BUILD),debug)
 	     -Wall -Wextra -Wformat=2 -Wshadow -Wstrict-prototypes \
 	     -DDEBUG_BUILD=1
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
-
 else ifeq ($(BUILD),release-rdbg)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
@@ -91,7 +100,6 @@ else ifeq ($(BUILD),release-rdbg)
 	     $(MATH_FLAGS) $(ARCH_FLAGS) \
 	     -DRELEASE_DBG=1
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
-
 else
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -flto -funroll-loops -funroll-all-loops \
 	     -ftree-vectorize -fvect-cost-model=unlimited -fivopts -fweb \
@@ -114,25 +122,27 @@ LIB_SRCS := \
 
 ifeq ($(CPU_ARCH_OPT),1)
   ifeq ($(HOST_ARCH),aarch64)
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/quants.c
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/core.c
+    LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/quants.c $(SRC_DIR)/backend/cpu/aarch64/core.c
   endif
   ifeq ($(HOST_ARCH),x86_64)
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/quants.c
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/core.c
+    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/quants.c $(SRC_DIR)/backend/cpu/x86_64/core.c
   endif
 endif
-
 ifneq ($(HAS_VULKAN),)
   LIB_SRCS += $(SRC_DIR)/backend/vulkan/vulkan.c
 endif
 
-TEST_SRCS := $(wildcard $(SRC_DIR)/test/*.c)
-HEADERS   := $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
+TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
+SERVER_SRCS := $(SRC_DIR)/server/main.c $(SRC_DIR)/server/openai.c
+SERVER_LIBS := -ljson-c -lmicrohttpd
+HEADERS     := $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
+ALL_SRCS    := $(shell find $(SRC_DIR) -type f \( -name "*.c" -o -name "*.cpp" \))
+ALL_SHADERS := $(shell find $(SRC_DIR) -type f \( -name "*.comp" -o -name "*.glsl" -o -name "*.inc" \))
 
-LIB_OBJS      := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(LIB_SRCS))
-TEST_OBJ_DIR  := $(OBJ_DIR)/test
-TEST_OBJS     := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS))
+LIB_OBJS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(LIB_SRCS))
+TEST_OBJ_DIR := $(OBJ_DIR)/test
+TEST_OBJS    := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS))
+SERVER_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
 
 ENGINE      := $(OUT_DIR)/libkappai.so
 CLI_BIN     := $(OUT_DIR)/kappai-cli
@@ -146,53 +156,29 @@ BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
 	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor $(OBJ_DIR)/server \
 	      $(OBJ_DIR)/models $(OBJ_DIR)/test
 
-CONFIG_STAMP := $(OUT_DIR)/.build-config
-CONFIG_SIG   := BUILD=$(BUILD) BACKENDS=$(sort $(REQUESTED_BACKENDS)) CPU_ARCH_OPT=$(CPU_ARCH_OPT) HOST_ARCH=$(HOST_ARCH) \
-		CACHE_LINE=$(KAI_CACHE_LINE) L1D_KB=$(KAI_L1D_KB) L2_KB=$(KAI_L2_KB)
-PREV_SIG     := $(shell cat $(CONFIG_STAMP) 2>/dev/null)
-
-CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help
-BUILD_GOALS := $(filter-out $(CONFIG_AGNOSTIC_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all))
-
-ifneq ($(BUILD_GOALS),)
-  ifneq ($(PREV_SIG),)
-    ifneq ($(PREV_SIG),$(CONFIG_SIG))
-      $(info Previous build config: $(PREV_SIG))
-      $(info Requested build config: $(CONFIG_SIG))
-      $(error $(OUT_DIR) was built with different settings. Run 'make clean' first, or match the previous settings)
-    endif
-  endif
-endif
+FORMAT_FLAGS := -i -style=file
+TIDY_LOG     := $(OUT_DIR)/tidy.log
 
 VK_SHADERS_DIR := $(SRC_DIR)/backend/vulkan/shaders
-VK_SHADER_FILES := $(wildcard $(VK_SHADERS_DIR)/*.comp)
-VK_INC_FILES    := $(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc)
+VK_INC_FILES   := $(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc)
 
-MATMUL_DUAL := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32
-
-MATMUL_NMAT_DUAL := matmul_q4_0 matmul_q4_k matmul_q6_k
-
-MATMUL_BATCH := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32
-
-MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
+MATMUL_BATCH            := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32
+MATMUL_NMAT_DUAL_BATCH  := matmul_q4_0 matmul_q4_k matmul_q6_k
 
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
 	            rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
 	            rmsnorm_noweight_per_head rmsnorm_noweight_per_head_sg
-
 RMSNORM_ALL := rmsnorm $(RMSNORM_VARIANTS)
 
-ROPE_EXT_VARIANTS := rope_ext
-
-rmsnorm_FLAGS                        := -DHAS_WEIGHT
-rmsnorm_noweight_FLAGS               :=
-rmsnorm_sg_FLAGS                     := -DHAS_WEIGHT -DUSE_SUBGROUP
-rmsnorm_noweight_sg_FLAGS            := -DUSE_SUBGROUP
-rmsnorm_per_head_FLAGS               := -DHAS_WEIGHT -DPER_HEAD
-rmsnorm_per_head_sg_FLAGS            := -DHAS_WEIGHT -DPER_HEAD -DUSE_SUBGROUP
-rmsnorm_add_FLAGS                    := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL
-rmsnorm_noweight_per_head_FLAGS      := -DPER_HEAD
-rmsnorm_noweight_per_head_sg_FLAGS   := -DPER_HEAD -DUSE_SUBGROUP
+rmsnorm_FLAGS                      := -DHAS_WEIGHT
+rmsnorm_noweight_FLAGS              :=
+rmsnorm_sg_FLAGS                    := -DHAS_WEIGHT -DUSE_SUBGROUP
+rmsnorm_noweight_sg_FLAGS           := -DUSE_SUBGROUP
+rmsnorm_per_head_FLAGS              := -DHAS_WEIGHT -DPER_HEAD
+rmsnorm_per_head_sg_FLAGS           := -DHAS_WEIGHT -DPER_HEAD -DUSE_SUBGROUP
+rmsnorm_add_FLAGS                   := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL
+rmsnorm_noweight_per_head_FLAGS     := -DPER_HEAD
+rmsnorm_noweight_per_head_sg_FLAGS  := -DPER_HEAD -DUSE_SUBGROUP
 
 VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/argmax.spv \
@@ -200,7 +186,6 @@ VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/moe_gather.spv \
 	$(OBJ_DIR)/backend/vulkan/moe_combine.spv \
 	$(OBJ_DIR)/backend/vulkan/attention.spv \
-	$(OBJ_DIR)/backend/vulkan/attention_big.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash.spv \
 	$(OBJ_DIR)/backend/vulkan/embd_lookup.spv \
 	$(OBJ_DIR)/backend/vulkan/kv_put.spv
@@ -215,7 +200,6 @@ SHADER_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_batch.spv \
-	$(OBJ_DIR)/backend/vulkan/attention_big_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
@@ -231,112 +215,32 @@ ifneq ($(HAS_VULKAN),)
 	@echo "  GLSLC   $@"
 	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $< -o $@
 
-  define MATMUL_RES_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_residual.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
+  define VK_VARIANT_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/$(3).comp $(VK_INC_FILES) | $(OUT_DIR)
 	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_residual.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_RESIDUAL $$< -o $$@
+	@echo "  GLSLC   $(1)$(2).spv"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $(4) $$< -o $$@
   endef
-  $(foreach s,$(MATMUL_DUAL),$(eval $(call MATMUL_RES_RULE,$(s))))
 
-  define MATMUL_DUAL_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_dual.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
+  define RMSNORM_VARIANT_RULE
+  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) | $(OUT_DIR)
 	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_dual.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DNMAT_DUAL $$< -o $$@
+	@echo "  GLSLC   $(1)$(2).spv  [$$(strip $$($(1)_FLAGS) $(3))]"
+	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $$(strip $$($(1)_FLAGS) $(3)) $$< -o $$@
   endef
-  $(foreach s,$(MATMUL_NMAT_DUAL),$(eval $(call MATMUL_DUAL_RULE,$(s))))
 
-  define RMSNORM_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1).spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1).spv  [$$($(1)_FLAGS)]"
-	@$$(GLSLC) -O --target-env=vulkan1.1 -I$$(VK_SHADERS_DIR) $$($(1)_FLAGS) $$< -o $$@
-  endef
-  $(foreach s,$(RMSNORM_ALL),$(eval $(call RMSNORM_RULE,$(s))))
-
-  $(OBJ_DIR)/backend/vulkan/rope_ext.spv: $(VK_SHADERS_DIR)/rope.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   rope_ext.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_FF $< -o $@
-
-  # --- Batched variant rules (prefill batching: -DBATCHED) ---
-  define MATMUL_BATCH_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $$< -o $$@
-  endef
-  $(foreach s,$(MATMUL_BATCH),$(eval $(call MATMUL_BATCH_RULE,$(s))))
-
-  define MATMUL_RES_BATCH_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_residual_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_residual_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_RESIDUAL -DBATCHED $$< -o $$@
-  endef
-  $(foreach s,$(MATMUL_BATCH),$(eval $(call MATMUL_RES_BATCH_RULE,$(s))))
-
-  define MATMUL_DUAL_BATCH_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_dual_batch.spv: $(VK_SHADERS_DIR)/$(1).comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_dual_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DNMAT_DUAL -DBATCHED $$< -o $$@
-  endef
-  $(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(eval $(call MATMUL_DUAL_BATCH_RULE,$(s))))
-
-  define RMSNORM_BATCH_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)_batch.spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $$(dir $$@)
-	@echo "  GLSLC   $(1)_batch.spv  [$$($(1)_FLAGS) -DBATCHED]"
-	@$$(GLSLC) -O --target-env=vulkan1.1 -I$$(VK_SHADERS_DIR) $$($(1)_FLAGS) -DBATCHED $$< -o $$@
-  endef
-  $(foreach s,$(RMSNORM_ALL),$(eval $(call RMSNORM_BATCH_RULE,$(s))))
-
-  $(OBJ_DIR)/backend/vulkan/rope_batch.spv: $(VK_SHADERS_DIR)/rope.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   rope_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv: $(VK_SHADERS_DIR)/rope.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   rope_ext_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DHAS_FF -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv: $(VK_SHADERS_DIR)/rope_qk.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   rope_qk_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/attention_batch.spv: $(VK_SHADERS_DIR)/attention.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   attention_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/attention_big_batch.spv: $(VK_SHADERS_DIR)/attention_big.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   attention_big_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv: $(VK_SHADERS_DIR)/attention_flash.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   attention_flash_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv: $(VK_SHADERS_DIR)/ffn_activate.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   ffn_activate_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/elementwise_batch.spv: $(VK_SHADERS_DIR)/elementwise.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   elementwise_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
-
-  $(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv: $(VK_SHADERS_DIR)/matmul_iq4_nl.comp $(VK_INC_FILES) | $(OUT_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  GLSLC   matmul_iq4_nl_batch.spv"
-	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) -DBATCHED $< -o $@
+  $(foreach s,$(MATMUL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_batch,$(s),-DBATCHED)))
+  $(foreach s,$(MATMUL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_residual_batch,$(s),-DHAS_RESIDUAL -DBATCHED)))
+  $(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_dual_batch,$(s),-DNMAT_DUAL -DBATCHED)))
+  $(foreach s,$(RMSNORM_ALL),$(eval $(call RMSNORM_VARIANT_RULE,$(s),_batch,-DBATCHED)))
+  $(eval $(call VK_VARIANT_RULE,rope,_batch,rope,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,rope,_ext_batch,rope,-DHAS_FF -DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,rope,_qk_batch,rope_qk,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,attention,_batch,attention,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,attention,_flash_batch,attention_flash,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,ffn,_activate_batch,ffn_activate,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,elementwise,_batch,elementwise,-DBATCHED))
+  $(eval $(call VK_VARIANT_RULE,matmul_iq4_nl,_batch,matmul_iq4_nl,-DBATCHED))
 
   $(SHADERS_H): $(SHADER_SPVS) | $(OUT_DIR)
 	@echo "  GEN     $@"
@@ -352,31 +256,31 @@ ifneq ($(HAS_VULKAN),)
 	@printf '#endif\n' >> $@
 endif
 
-FORMAT_FLAGS := -i -style=file
-
-TIDY_LOG  := $(OUT_DIR)/tidy.log
-ALL_SRCS  := $(LIB_SRCS) $(SRC_DIR)/cli/main.c $(SRC_DIR)/server/main.c \
-	     $(SRC_DIR)/server/openai.c \
-	     $(TEST_SRCS) $(wildcard $(SRC_DIR)/monitor/*.c)
-
-SERVER_SRCS := $(SRC_DIR)/server/main.c \
-	       $(SRC_DIR)/server/openai.c
-SERVER_OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
-SERVER_LIBS := -ljson-c -lmicrohttpd
-
-.PHONY: all cli test server monitor clean print-config format tidy backends-help
+.PHONY: all cli test server monitor clean print-config format tidy backends-help config
 
 all: cli test server
 
+config: $(OUT_DIR) $(CONFIG_FILE)
+	@echo "Build configuration created:"
+	@cat $(CONFIG_FILE)
+
+$(CONFIG_FILE): | $(OUT_DIR)
+	@echo "Generating build configuration..."
+	@printf 'BUILD = %s\n' "$(BUILD)" > $@
+	@printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
+	@printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)" >> $@
+	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
+	@printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)" >> $@
+	@printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)" >> $@
+	@printf 'KAI_L1D_KB = %s\n' "$(DETECTED_L1D_KB)" >> $@
+	@printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)" >> $@
+
 backends-help:
 	@echo "available backends: $(AVAILABLE_BACKENDS)"
-	@echo "usage: make BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
-
-$(CONFIG_STAMP): | $(OUT_DIR)
-	@printf '%s' "$(CONFIG_SIG)" > $@
+	@echo "usage: make config BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
 
 monitor: $(MONITOR_BIN)
-$(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_STAMP)
+$(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) -O2 -g -Wall -Wextra -I$(SRC_DIR) $< -o $@ -lncurses -ljson-c
@@ -396,7 +300,7 @@ $(TEST_BIN): $(TEST_OBJS) $(ENGINE)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -o $@
 
-$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_STAMP)
+$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
@@ -408,15 +312,10 @@ $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
 	@$(CC) -shared $(CFLAGS) $^ $(LDFLAGS) -o $@
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_STAMP)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
-
-ifeq ($(HOST_ARCH),x86_64)
-  $(OBJ_DIR)/backend/cpu/x86_64/quants.o: CFLAGS += -mavx2 -mf16c -mfma
-  $(OBJ_DIR)/backend/cpu/x86_64/core.o: CFLAGS += -mavx2 -mf16c -mfma
-endif
 
 $(OUT_DIR):
 	@mkdir -p $(BUILD_DIRS)
@@ -431,6 +330,7 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
+	@echo "MACHINE_ARCH_FLAGS = $(MACHINE_ARCH_FLAGS)"
 	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
@@ -439,21 +339,25 @@ print-config:
 
 format:
 	@which clang-format >/dev/null 2>&1 || { echo "clang-format not found"; exit 1; }
-	@for f in $(ALL_SRCS) $(HEADERS); do \
+	@for f in $(ALL_SRCS) $(HEADERS) $(ALL_SHADERS); do \
 	        echo "  FMT     $$f"; \
 	        clang-format $(FORMAT_FLAGS) $$f; \
+	        chmod 644 $$f; \
 	done
+
+NON_HOST_CPU_ARCHS := aarch64 x86_64
+NON_HOST_CPU_ARCHS := $(filter-out $(HOST_ARCH),$(NON_HOST_CPU_ARCHS))
+TIDY_SRCS := $(filter-out $(foreach a,$(NON_HOST_CPU_ARCHS),$(SRC_DIR)/backend/cpu/$(a)/%),$(ALL_SRCS))
 
 tidy: | $(OUT_DIR)
 	@which clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 1; }
 	@echo "  TIDY    -> $(TIDY_LOG)"
 	@: > $(TIDY_LOG)
-	@printf '%s\n' $(ALL_SRCS) | \
-		xargs -P $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) \
+	@printf '%s\n' $(TIDY_SRCS) | \
+		xargs -P $$(nproc) \
 		-I {} sh -c ' \
 			echo "  TIDY    {}"; \
-			echo "===== {} =====" >> $(TIDY_LOG); \
-			clang-tidy --config-file=.clang-tidy {} -- $(filter-out -fvect-cost-model=unlimited,$(CFLAGS)) -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true \
+			clang-tidy --config-file=.clang-tidy {} -- $(filter-out $(ARCH_FLAGS) -fvect-cost-model=%,$(CFLAGS)) -march=native -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true \
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 

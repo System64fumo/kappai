@@ -71,37 +71,35 @@ typedef struct {
 } gguf_tensor;
 
 typedef struct {
-	int			 fd;
-	void		*map;
-	size_t		 map_size;
-	int			 map_is_heap;
-	int			 owns_tensor_data;
-	int			 valid;
-	char	   **kv_keys;
-	uint32_t	*kv_types;
-	uint64_t	*kv_vals;
-	gguf_str	*kv_strs;
-	uint32_t	*kv_arr_type;
-	uint64_t	*kv_arr_len;
-	void	   **kv_arr_data;
-	size_t		 n_kv;
-	gguf_tensor *tensors;
-	size_t		 n_tensors;
-	const void	*data_start;
-	size_t		 data_size;
-	uint64_t	 data_file_offset;
-	struct {
-		const char *name;
-		size_t		idx;
-		int			used;
-	}	  *tensor_hash;
-	size_t tensor_hash_cap;
-	struct {
-		const char *key;
-		size_t		idx;
-		int			used;
-	}	  *kv_hash;
-	size_t kv_hash_cap;
+	const char *key;
+	size_t		idx;
+	int			used;
+} gguf_strtab_entry;
+
+typedef struct {
+	int				   fd;
+	void			  *map;
+	size_t			   map_size;
+	int				   map_is_heap;
+	int				   owns_tensor_data;
+	int				   valid;
+	char			 **kv_keys;
+	uint32_t		  *kv_types;
+	uint64_t		  *kv_vals;
+	gguf_str		  *kv_strs;
+	uint32_t		  *kv_arr_type;
+	uint64_t		  *kv_arr_len;
+	void			 **kv_arr_data;
+	size_t			   n_kv;
+	gguf_tensor		  *tensors;
+	size_t			   n_tensors;
+	const void		  *data_start;
+	size_t			   data_size;
+	uint64_t		   data_file_offset;
+	gguf_strtab_entry *tensor_hash;
+	size_t			   tensor_hash_cap;
+	gguf_strtab_entry *kv_hash;
+	size_t			   kv_hash_cap;
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);

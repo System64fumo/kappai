@@ -37,13 +37,15 @@ What started as a fun side project has grown into something much larger than ori
 ### Building
 
 ```bash
-make -j$(nproc) BUILD=release
+make config BUILD=release
+make -j$(nproc)
 ```
 
-With Vulkan: (Experimental, Slower than CPU in some cases)
+With Vulkan: (W.I.P, Slower than CPU in some cases)
 
 ```bash
-make -j$(nproc) BUILD=release BACKENDS=vulkan
+make config BUILD=release BACKENDS=vulkan
+make -j$(nproc)
 ```
 
 ### Usage

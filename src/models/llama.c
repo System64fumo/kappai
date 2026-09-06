@@ -79,61 +79,16 @@ static model_recipe *build_standard_recipe(const model *m) {
 		}
 
 		if (has_rope_qk) {
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE_QK_FUSED,
-				.in		= {RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads	   = n_heads,
-						   .n_kv_heads = n_kv_heads,
-						   .head_dim   = head_dim,
-						   .rope_neox  = rope_neox},
-			};
+			ops[i++] = mk_rope_qk_fused(n_heads, n_kv_heads, head_dim, rope_neox);
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE,
-				.in		= {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads = n_heads, .head_dim = head_dim, .rope_neox = rope_neox},
-			};
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE,
-				.in		= {RECIPE_SLOT_K, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads = n_kv_heads, .head_dim = head_dim, .rope_neox = rope_neox},
-			};
+			ops[i++] = mk_rope(RECIPE_SLOT_Q, n_heads, head_dim, rope_neox);
+			ops[i++] = mk_rope(RECIPE_SLOT_K, n_kv_heads, head_dim, rope_neox);
 		}
 
-		ops[i++] = (recipe_op){
-			.kind  = OP_KV_PUT,
-			.in	   = {RECIPE_SLOT_K, RECIPE_SLOT_V, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_NONE,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_KVPUT,
-		};
+		ops[i++] = mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V);
 
-		ops[i++] = (recipe_op){
-			.kind  = OP_ATTENTION,
-			.in	   = {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_XB2,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_ATTN,
-			.u.attention =
-				{
-					.n_heads		   = n_heads,
-					.n_kv_heads		   = n_kv_heads,
-					.head_dim		   = head_dim,
-					.n_ctx			   = n_ctx,
-					.scale			   = attn_scale,
-					.sliding_window	   = m->sliding_window,
-					.n_kv_heads_active = n_kv_heads,
-				},
-		};
+		ops[i++] = mk_attention(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, n_kv_heads, head_dim,
+								n_ctx, attn_scale, m->sliding_window);
 
 		if (can_fuse_attn_residual) {
 			ops[i++] = (recipe_op){
@@ -175,14 +130,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 				.u.ffn_act = {.n = intermediate, .activation = 0},
 			};
 		} else if (has_matmul_multi) {
-			ops[i++] = (recipe_op){
-				.kind			= OP_MATMUL_MULTI,
-				.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out			= RECIPE_SLOT_FFN_GATE,
-				.w_idx			= WIDX_GATE,
-				.stage			= STAGE_MATMUL,
-				.u.matmul_multi = {.n = 2, .k = dim, .n_out = {intermediate, intermediate}},
-			};
+			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, dim,
+										intermediate, intermediate);
 		} else {
 			ops[i++] = (recipe_op){
 				.kind	  = OP_MATMUL,
