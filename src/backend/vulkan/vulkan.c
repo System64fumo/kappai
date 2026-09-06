@@ -187,8 +187,8 @@ typedef struct {
 	int matmul_tile_k;
 
 	vk_pipeline_set p_attention;
-	vk_pipeline_set p_attention_big;
-	int				attention_big_ready;
+	int				attention_ready;
+	int				attention_head_dim;
 #define VK_FLASH_CACHE_CAP 4
 	vk_pipeline_set p_attention_flash[VK_FLASH_CACHE_CAP];
 	int				flash_head_dim[VK_FLASH_CACHE_CAP];
@@ -239,8 +239,8 @@ typedef struct {
 	vk_pipeline_set p_rope_ext_batch;
 	vk_pipeline_set p_rope_qk_batch;
 	vk_pipeline_set p_attention_batch;
-	vk_pipeline_set p_attention_big_batch;
-	int				attention_big_batch_ready;
+	int				attention_batch_ready;
+	int				attention_batch_head_dim;
 	vk_pipeline_set p_attention_flash_batch[VK_FLASH_CACHE_CAP];
 	int				flash_batch_head_dim[VK_FLASH_CACHE_CAP];
 	int				flash_batch_n_groups[VK_FLASH_CACHE_CAP];
@@ -724,7 +724,6 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_rope_ext_batch,
 			&p->p_rope_qk_batch,
 			&p->p_attention_batch,
-			&p->p_attention_big_batch,
 			&p->p_attention_flash_batch[0],
 			&p->p_attention_flash_batch[1],
 			&p->p_attention_flash_batch[2],
@@ -2057,12 +2056,8 @@ static status_code vk_init(backend *self, int device_index) {
 		kquant_tile_k,
 	};
 
-	s = vk_create_pipeline(p, shader_attention_spv, shader_attention_spv_len, 5, 36,
-						   &p->p_attention);
-	if (s != OK)
-		return s;
-	p->p_attention.name = "attention";
-	p->flash_count		= 0;
+	p->attention_ready = 0;
+	p->flash_count	   = 0;
 	memset(p->p_attention_flash, 0, sizeof(p->p_attention_flash));
 	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 32, &p->p_kv_put);
 	if (s != OK)
@@ -2259,12 +2254,8 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s == OK)
 		p->p_rope_qk_batch.name = "rope_qk_batch";
 
-	s = vk_create_pipeline(p, shader_attention_batch_spv, shader_attention_batch_spv_len, 5, 40,
-						   &p->p_attention_batch);
-	if (s == OK)
-		p->p_attention_batch.name = "attention_batch";
-	p->attention_big_batch_ready = 0;
-	p->flash_batch_count		 = 0;
+	p->attention_batch_ready = 0;
+	p->flash_batch_count	 = 0;
 	memset(p->p_attention_flash_batch, 0, sizeof(p->p_attention_flash_batch));
 	memset(p->flash_batch_head_dim, 0, sizeof(p->flash_batch_head_dim));
 	memset(p->flash_batch_n_groups, 0, sizeof(p->flash_batch_n_groups));
@@ -2291,7 +2282,6 @@ static void vk_free(backend *self) {
 		vkDeviceWaitIdle(p->dev);
 
 		vk_destroy_pipeline(p, &p->p_attention);
-		vk_destroy_pipeline(p, &p->p_attention_big);
 		for (int fi = 0; fi < VK_FLASH_CACHE_CAP; fi++)
 			vk_destroy_pipeline(p, &p->p_attention_flash[fi]);
 		vk_destroy_pipeline(p, &p->p_kv_put);
@@ -2338,7 +2328,6 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_rope_ext_batch);
 		vk_destroy_pipeline(p, &p->p_rope_qk_batch);
 		vk_destroy_pipeline(p, &p->p_attention_batch);
-		vk_destroy_pipeline(p, &p->p_attention_big_batch);
 		for (int fi = 0; fi < VK_FLASH_CACHE_CAP; fi++)
 			vk_destroy_pipeline(p, &p->p_attention_flash_batch[fi]);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_batch);
@@ -3216,7 +3205,6 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 				 "retrying as %d per-layer chunks of %zu bytes each "
 				 "(common on UMA drivers with per-BO size limits)",
 				 total, n_kv_layers, per_layer_for_checks);
-			needs_chunking = 1;
 		} else {
 			ERROR("kv_alloc: failed to allocate %zu bytes for KV cache "
 				  "(single layer, cannot chunk further). The device may not "
@@ -4436,31 +4424,37 @@ static status_code vk_ensure_flash_pipeline(vk_priv *p, int head_dim, int n_grou
 	return OK;
 }
 
-static status_code vk_ensure_attention_big_pipeline(vk_priv *p, int head_dim,
-													vk_pipeline_set **out) {
-	const size_t TILE_T		   = 8;
-	size_t		 q_bytes	   = (size_t)512 * sizeof(float);
-	size_t		 kv_tile_bytes = TILE_T * (size_t)512 * sizeof(float);
-	size_t		 shared_bytes  = q_bytes + kv_tile_bytes;
+static status_code vk_ensure_attention_pipeline(vk_priv *p, int head_dim, vk_pipeline_set **out) {
+	int tile_t = head_dim > 256 ? 8 : 16;
+
+	size_t q_bytes		 = (size_t)head_dim * sizeof(float);
+	size_t kv_tile_bytes = (size_t)tile_t * (size_t)head_dim * sizeof(float);
+	size_t shared_bytes	 = q_bytes + kv_tile_bytes;
 	if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
-		WARN("attention_big pipeline needs %zu bytes shared (device has %u), "
-			 "head_dim=%d",
-			 shared_bytes, p->caps.max_shared_memory, head_dim);
+		WARN("attention pipeline needs %zu bytes shared (device has %u), head_dim=%d", shared_bytes,
+			 p->caps.max_shared_memory, head_dim);
 		return ERR_UNSUPPORTED;
 	}
-	if (p->attention_big_ready) {
-		*out = &p->p_attention_big;
+
+	if (p->attention_ready && p->attention_head_dim == head_dim) {
+		*out = &p->p_attention;
 		return OK;
 	}
-	status_code s = vk_create_pipeline(p, shader_attention_big_spv, shader_attention_big_spv_len, 5,
-									   36, &p->p_attention_big);
+	if (p->attention_ready)
+		vk_destroy_pipeline(p, &p->p_attention);
+
+	uint32_t	spec_data[2] = {(uint32_t)head_dim, (uint32_t)tile_t};
+	status_code s = vk_create_pipeline_spec(p, shader_attention_spv, shader_attention_spv_len, 5,
+											36, spec_data, sizeof(spec_data), &p->p_attention);
 	if (s != OK) {
-		WARN("attention_big pipeline creation failed for head_dim=%d", head_dim);
+		WARN("attention pipeline creation failed for head_dim=%d", head_dim);
+		p->attention_ready = 0;
 		return s;
 	}
-	p->p_attention_big.name = "attention_big";
-	p->attention_big_ready	= 1;
-	*out					= &p->p_attention_big;
+	p->p_attention.name	  = "attention";
+	p->attention_ready	  = 1;
+	p->attention_head_dim = head_dim;
+	*out				  = &p->p_attention;
 	return OK;
 }
 
@@ -4654,15 +4648,11 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 		int32_t	 attn_start;
 	} push = {(uint32_t)layer_off, pos, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			  attn_start};
-	vk_buf *bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
-	if (head_dim > 256) {
-		vk_pipeline_set *ps = NULL;
-		if (vk_ensure_attention_big_pipeline(p, head_dim, &ps) != OK)
-			return ERR_UNSUPPORTED;
-		return vk_dispatch_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads, 0x18);
-	}
-	return vk_dispatch_masked(p, &p->p_attention, bufs, 5, &push, sizeof(push), (uint32_t)n_heads,
-							  0x18);
+	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
+	vk_pipeline_set *ps		 = NULL;
+	if (vk_ensure_attention_pipeline(p, head_dim, &ps) != OK)
+		return ERR_UNSUPPORTED;
+	return vk_dispatch_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads, 0x18);
 }
 
 static status_code vk_attention(backend *self, const buffer *q, const buffer *k_cache,
@@ -5523,22 +5513,38 @@ static status_code vk_ensure_flash_pipeline_batch(vk_priv *p, int head_dim, int 
 	return OK;
 }
 
-static status_code vk_ensure_attention_big_pipeline_batch(vk_priv *p, int head_dim,
-														  vk_pipeline_set **out) {
-	if (p->attention_big_batch_ready) {
-		*out = &p->p_attention_big_batch;
+static status_code vk_ensure_attention_pipeline_batch(vk_priv *p, int head_dim,
+													  vk_pipeline_set **out) {
+	int	   tile_t		 = head_dim > 256 ? 8 : 16;
+	size_t q_bytes		 = (size_t)head_dim * sizeof(float);
+	size_t kv_tile_bytes = (size_t)tile_t * (size_t)head_dim * sizeof(float);
+	size_t shared_bytes	 = q_bytes + kv_tile_bytes;
+	if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
+		WARN("attention_batch pipeline needs %zu bytes shared (device has %u), head_dim=%d",
+			 shared_bytes, p->caps.max_shared_memory, head_dim);
+		return ERR_UNSUPPORTED;
+	}
+
+	if (p->attention_batch_ready && p->attention_batch_head_dim == head_dim) {
+		*out = &p->p_attention_batch;
 		return OK;
 	}
+	if (p->attention_batch_ready)
+		vk_destroy_pipeline(p, &p->p_attention_batch);
+
+	uint32_t	spec_data[2] = {(uint32_t)head_dim, (uint32_t)tile_t};
 	status_code s =
-		vk_create_pipeline(p, shader_attention_big_batch_spv, shader_attention_big_batch_spv_len, 5,
-						   40, &p->p_attention_big_batch);
+		vk_create_pipeline_spec(p, shader_attention_batch_spv, shader_attention_batch_spv_len, 5,
+								40, spec_data, sizeof(spec_data), &p->p_attention_batch);
 	if (s != OK) {
-		WARN("attention_big_batch pipeline creation failed for head_dim=%d", head_dim);
+		WARN("attention_batch pipeline creation failed for head_dim=%d", head_dim);
+		p->attention_batch_ready = 0;
 		return s;
 	}
-	p->p_attention_big_batch.name = "attention_big_batch";
-	p->attention_big_batch_ready  = 1;
-	*out						  = &p->p_attention_big_batch;
+	p->p_attention_batch.name	= "attention_batch";
+	p->attention_batch_ready	= 1;
+	p->attention_batch_head_dim = head_dim;
+	*out						= &p->p_attention_batch;
 	return OK;
 }
 
@@ -5600,23 +5606,16 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		int32_t	 m;
 	} push = {(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			  attn_start,		   m};
-	vk_buf *bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
-	if (head_dim > 256) {
-		vk_pipeline_set *ps = NULL;
-		if (vk_ensure_attention_big_pipeline_batch(p, head_dim, &ps) != OK) {
-			DEBUG("vk_attention_batch: big_batch pipeline unavailable for head_dim=%d at layer=%d",
-				  head_dim, layer);
-			return ERR_UNSUPPORTED;
-		}
-		return vk_dispatch_2d_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads,
-									 (uint32_t)m, 0x18);
-	}
-	if (!p->p_attention_batch.pipeline) {
-		DEBUG("vk_attention_batch: attention_batch pipeline not initialized at layer=%d", layer);
+	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
+	vk_pipeline_set *ps		 = NULL;
+	if (vk_ensure_attention_pipeline_batch(p, head_dim, &ps) != OK) {
+		DEBUG(
+			"vk_attention_batch: attention_batch pipeline unavailable for head_dim=%d at layer=%d",
+			head_dim, layer);
 		return ERR_UNSUPPORTED;
 	}
-	return vk_dispatch_2d_masked(p, &p->p_attention_batch, bufs, 5, &push, sizeof(push),
-								 (uint32_t)n_heads, (uint32_t)m, 0x18);
+	return vk_dispatch_2d_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads,
+								 (uint32_t)m, 0x18);
 }
 
 static status_code vk_attention_batch(backend *self, const buffer *q, const buffer *k_cache,

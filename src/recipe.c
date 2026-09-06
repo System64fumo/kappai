@@ -3081,7 +3081,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 			}
 			WARN("moe resident expert batch failed (st=%d) -- falling back to cpu", (int)st);
 		}
-		st = moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
+		moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
 		goto finish;
 	}
 
@@ -5383,6 +5383,8 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		if (m->arch_info->has_scale_embeddings) {
 			if (a->scale_inplace) {
 				st = a->scale_inplace(a, &bs->pair[RECIPE_SLOT_X].b, m->dim_sqrt, n_tokens * dim);
+				if (st != OK)
+					goto done;
 			} else {
 				if (a->synchronize)
 					a->synchronize(a);

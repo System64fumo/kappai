@@ -96,8 +96,7 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 			__m256 k1 = _mm256_loadu_ps(kfh + i + 8);
 			__m256 k2 = _mm256_loadu_ps(kfh + i + 16);
 			__m256 k3 = _mm256_loadu_ps(kfh + i + 24);
-			_mm_storeu_si128((__m128i *)(kd + i),
-							 _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(kd + i + 8),
 							 _mm256_cvtps_ph(k1, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(kd + i + 16),
@@ -109,8 +108,7 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 			__m256 v1 = _mm256_loadu_ps(vfh + i + 8);
 			__m256 v2 = _mm256_loadu_ps(vfh + i + 16);
 			__m256 v3 = _mm256_loadu_ps(vfh + i + 24);
-			_mm_storeu_si128((__m128i *)(vd + i),
-							 _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(vd + i + 8),
 							 _mm256_cvtps_ph(v1, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(vd + i + 16),
@@ -121,34 +119,28 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 		for (; i + 16 <= head_dim; i += 16) {
 			__m256 k0 = _mm256_loadu_ps(kfh + i);
 			__m256 k1 = _mm256_loadu_ps(kfh + i + 8);
-			_mm_storeu_si128((__m128i *)(kd + i),
-							 _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(kd + i + 8),
 							 _mm256_cvtps_ph(k1, _MM_FROUND_TO_NEAREST_INT));
 
 			__m256 v0 = _mm256_loadu_ps(vfh + i);
 			__m256 v1 = _mm256_loadu_ps(vfh + i + 8);
-			_mm_storeu_si128((__m128i *)(vd + i),
-							 _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
 			_mm_storeu_si128((__m128i *)(vd + i + 8),
 							 _mm256_cvtps_ph(v1, _MM_FROUND_TO_NEAREST_INT));
 		}
 		for (; i + 8 <= head_dim; i += 8) {
 			__m256 k0 = _mm256_loadu_ps(kfh + i);
-			_mm_storeu_si128((__m128i *)(kd + i),
-							 _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
 
 			__m256 v0 = _mm256_loadu_ps(vfh + i);
-			_mm_storeu_si128((__m128i *)(vd + i),
-							 _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
 		}
 		for (; i + 4 <= head_dim; i += 4) {
 			__m128 k0 = _mm_loadu_ps(kfh + i);
 			__m128 v0 = _mm_loadu_ps(vfh + i);
-			_mm_storel_epi64((__m128i *)(kd + i),
-							 _mm_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storel_epi64((__m128i *)(vd + i),
-							 _mm_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storel_epi64((__m128i *)(kd + i), _mm_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
+			_mm_storel_epi64((__m128i *)(vd + i), _mm_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
 		}
 		for (; i < head_dim; i++) {
 			kd[i] = f32_to_f16(kfh[i]);
@@ -184,13 +176,13 @@ static void cpu_rope_one_avx(float *v, int n_heads, int head_dim, const float *r
 		} else {
 			for (; j + 2 <= half; j += 2) {
 				float *base = vh + 2 * j;
-				__m128		 p	 = _mm_loadu_ps(base);
-				__m128		 c	 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_cos + j)));
-				__m128		 s	 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_sin + j)));
-				__m128		 ev	 = _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
-				__m128		 od	 = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
-				__m128		 re	 = _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-				__m128		 im	 = _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+				__m128 p	= _mm_loadu_ps(base);
+				__m128 c	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_cos + j)));
+				__m128 s	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_sin + j)));
+				__m128 ev	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
+				__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
+				__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
+				__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
 				_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
 			}
 			for (; j < half; j++) {
@@ -210,8 +202,7 @@ status_code cpu_rope(backend *self, buffer *vec, int n_heads, int head_dim, int 
 	int			 half	  = head_dim / 2;
 	const float *rope_cos = rope_cos_base + ((size_t)pos * half);
 	const float *rope_sin = rope_sin_base + ((size_t)pos * half);
-	cpu_rope_one_avx((float *)cpu_ptr(vec), n_heads, head_dim, rope_cos, rope_sin,
-					 self->rope_neox);
+	cpu_rope_one_avx((float *)cpu_ptr(vec), n_heads, head_dim, rope_cos, rope_sin, self->rope_neox);
 	return OK;
 }
 
@@ -272,8 +263,8 @@ float dot8(const float *restrict a, const float *restrict b, int head_dim) {
 
 	__m256 acc01 = _mm256_add_ps(acc0, acc1);
 	__m256 acc23 = _mm256_add_ps(acc2, acc3);
-	__m256 acc	  = _mm256_add_ps(acc01, acc23);
-	float s		  = vreduce_add_ps(acc);
+	__m256 acc	 = _mm256_add_ps(acc01, acc23);
+	float  s	 = vreduce_add_ps(acc);
 
 	for (; d < head_dim; d++) {
 		s += a[d] * b[d];
@@ -354,8 +345,8 @@ float dot8_f16(const float *restrict a, const uint16_t *restrict b, int head_dim
 
 	__m256 acc01 = _mm256_add_ps(acc0, acc1);
 	__m256 acc23 = _mm256_add_ps(acc2, acc3);
-	__m256 acc	  = _mm256_add_ps(acc01, acc23);
-	float s		  = vreduce_add_ps(acc);
+	__m256 acc	 = _mm256_add_ps(acc01, acc23);
+	float  s	 = vreduce_add_ps(acc);
 
 	for (; d < head_dim; d++) {
 		s += a[d] * f16_to_f32_fast(b[d]);
@@ -384,9 +375,9 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms			 = expf(M_old - M);
+					ms			= expf(M_old - M);
 					__m256 ms_v = _mm256_set1_ps(ms);
-					int		d	 = 0;
+					int	   d	= 0;
 					for (; d + 64 <= head_dim; d += 64) {
 						_mm256_storeu_ps(VKQ + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), ms_v));
 						_mm256_storeu_ps(VKQ + d + 8,
@@ -479,32 +470,24 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 			S = (S * ms) + vs;
 		}
 
-		float		S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		__m256		inv_v = _mm256_set1_ps(S_inv);
-		int			d	  = 0;
+		float  S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+		__m256 inv_v = _mm256_set1_ps(S_inv);
+		int	   d	 = 0;
 		for (; d + 64 <= head_dim; d += 64) {
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
 			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
-			_mm256_storeu_ps(out_h + d + 32,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), inv_v));
-			_mm256_storeu_ps(out_h + d + 40,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), inv_v));
-			_mm256_storeu_ps(out_h + d + 48,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), inv_v));
-			_mm256_storeu_ps(out_h + d + 56,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), inv_v));
+			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
+			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
+			_mm256_storeu_ps(out_h + d + 32, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), inv_v));
+			_mm256_storeu_ps(out_h + d + 40, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), inv_v));
+			_mm256_storeu_ps(out_h + d + 48, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), inv_v));
+			_mm256_storeu_ps(out_h + d + 56, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), inv_v));
 		}
 		for (; d + 32 <= head_dim; d += 32) {
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
 			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
+			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
+			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
 		}
 		for (; d + 8 <= head_dim; d += 8)
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
@@ -694,12 +677,12 @@ static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_pt
 		for (; j + 8 <= n; j += 8) {
 			__m256 a0 = _mm256_loadu_ps(av + j);
 			__m256 q0 = vld8_s8_to_ps(qs + j);
-			acc0	   = _mm256_fmadd_ps(a0, q0, acc0);
+			acc0	  = _mm256_fmadd_ps(a0, q0, acc0);
 		}
-		__m256 acc01	= _mm256_add_ps(acc0, acc1);
-		__m256 acc23	= _mm256_add_ps(acc2, acc3);
-		__m256 acc		= _mm256_add_ps(acc01, acc23);
-		float	partial = vreduce_add_ps(acc);
+		__m256 acc01   = _mm256_add_ps(acc0, acc1);
+		__m256 acc23   = _mm256_add_ps(acc2, acc3);
+		__m256 acc	   = _mm256_add_ps(acc01, acc23);
+		float  partial = vreduce_add_ps(acc);
 		for (; j < n; j++)
 			partial += av[j] * (float)qs[j];
 		sum += partial * d;
@@ -771,9 +754,9 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms			 = expf(M_old - M);
+					ms			= expf(M_old - M);
 					__m256 ms_v = _mm256_set1_ps(ms);
-					int		d	 = 0;
+					int	   d	= 0;
 					for (; d + 64 <= head_dim; d += 64) {
 						_mm256_storeu_ps(VKQ + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), ms_v));
 						_mm256_storeu_ps(VKQ + d + 8,
@@ -815,32 +798,24 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 			S = (S * ms) + vs;
 		}
 
-		float		S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		__m256		inv_v = _mm256_set1_ps(S_inv);
-		int			d	  = 0;
+		float  S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+		__m256 inv_v = _mm256_set1_ps(S_inv);
+		int	   d	 = 0;
 		for (; d + 64 <= head_dim; d += 64) {
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
 			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
-			_mm256_storeu_ps(out_h + d + 32,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), inv_v));
-			_mm256_storeu_ps(out_h + d + 40,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), inv_v));
-			_mm256_storeu_ps(out_h + d + 48,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), inv_v));
-			_mm256_storeu_ps(out_h + d + 56,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), inv_v));
+			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
+			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
+			_mm256_storeu_ps(out_h + d + 32, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), inv_v));
+			_mm256_storeu_ps(out_h + d + 40, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), inv_v));
+			_mm256_storeu_ps(out_h + d + 48, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), inv_v));
+			_mm256_storeu_ps(out_h + d + 56, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), inv_v));
 		}
 		for (; d + 32 <= head_dim; d += 32) {
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
 			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24,
-							 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
+			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
+			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
 		}
 		for (; d + 8 <= head_dim; d += 8)
 			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
@@ -890,7 +865,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 
 static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 	cpu_attn_job_avx *j = ctx;
-	float			*scores;
+	float			 *scores;
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
@@ -959,19 +934,19 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 
 		if (p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
-			cpu_attn_job_avx job = {.kl_base	 = (const uint16_t *)kl_base,
-									.vl_base	 = (const uint16_t *)vl_base,
-									.qf		 = qf,
-									.outf		 = outf,
-									.n_groups	 = n_groups,
-									.head_dim	 = head_dim,
-									.hd_stride	 = (int)elem_stride,
-									.n_pos		 = n_pos,
+			cpu_attn_job_avx job = {.kl_base	= (const uint16_t *)kl_base,
+									.vl_base	= (const uint16_t *)vl_base,
+									.qf			= qf,
+									.outf		= outf,
+									.n_groups	= n_groups,
+									.head_dim	= head_dim,
+									.hd_stride	= (int)elem_stride,
+									.n_pos		= n_pos,
 									.flash_attn = flash_attn,
-									.scale		 = scale,
+									.scale		= scale,
 									.kvh_stride = kvh_stride,
-									.p			 = p,
-									.kv_quant	 = KV_QUANT_Q8_0};
+									.p			= p,
+									.kv_quant	= KV_QUANT_Q8_0};
 			tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
 			return OK;
 		}
@@ -1002,19 +977,19 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 
 	if (p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
-		cpu_attn_job_avx job = {.kl_base	 = kl_base,
-								.vl_base	 = vl_base,
-								.qf		 = qf,
-								.outf		 = outf,
-								.n_groups	 = n_groups,
-								.head_dim	 = head_dim,
-								.hd_stride	 = hd_stride,
-								.n_pos		 = n_pos,
+		cpu_attn_job_avx job = {.kl_base	= kl_base,
+								.vl_base	= vl_base,
+								.qf			= qf,
+								.outf		= outf,
+								.n_groups	= n_groups,
+								.head_dim	= head_dim,
+								.hd_stride	= hd_stride,
+								.n_pos		= n_pos,
 								.flash_attn = flash_attn,
-								.scale		 = scale,
+								.scale		= scale,
 								.kvh_stride = kvh_stride,
-								.p			 = p,
-								.kv_quant	 = KV_QUANT_F16};
+								.p			= p,
+								.kv_quant	= KV_QUANT_F16};
 		tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
 		return OK;
 	}
@@ -1052,7 +1027,7 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 
 static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	cpu_attn_batch_job_avx *j = ctx;
-	float					*scores;
+	float				   *scores;
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
@@ -1135,21 +1110,21 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 		vl_base_raw		  = p->kv_v + layer_base;
 	}
 
-	cpu_attn_batch_job_avx job = {.kl_base	   = kl_base_raw,
-								  .vl_base	   = vl_base_raw,
-								  .qf		   = (const float *)cpu_ptr(q),
-								  .outf	   = (float *)cpu_ptr(out),
-								  .n_groups   = n_groups,
-								  .head_dim   = head_dim,
+	cpu_attn_batch_job_avx job = {.kl_base	  = kl_base_raw,
+								  .vl_base	  = vl_base_raw,
+								  .qf		  = (const float *)cpu_ptr(q),
+								  .outf		  = (float *)cpu_ptr(out),
+								  .n_groups	  = n_groups,
+								  .head_dim	  = head_dim,
 								  .hd_stride  = hd_stride,
-								  .n_heads	   = n_heads,
+								  .n_heads	  = n_heads,
 								  .pos_start  = pos_start,
-								  .m		   = m,
+								  .m		  = m,
 								  .flash_attn = flash_attn,
-								  .scale	   = scale,
+								  .scale	  = scale,
 								  .kvh_stride = kvh_stride,
-								  .p		   = p,
-								  .kv_quant   = p->kv_quant};
+								  .p		  = p,
+								  .kv_quant	  = p->kv_quant};
 
 	int total		= n_heads * m;
 	int cur_tid		= tpool_current_tid();
@@ -1202,17 +1177,25 @@ static void cpu_ffn_silu_chunk_avx(int begin, int end, int tid, void *ctx) {
 	const float *restrict g = a->g;
 	const float *restrict u = a->u;
 	float *restrict o		= a->o;
-	int			i			= begin;
-	int			n			= end;
+	int i					= begin;
+	int n					= end;
 	for (; i + 32 <= n; i += 32) {
 		__m256 g0 = _mm256_loadu_ps(g + i);
 		__m256 g1 = _mm256_loadu_ps(g + i + 8);
 		__m256 g2 = _mm256_loadu_ps(g + i + 16);
 		__m256 g3 = _mm256_loadu_ps(g + i + 24);
-		__m256 s0 = _mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f), vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
-		__m256 s1 = _mm256_div_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f), vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g1))));
-		__m256 s2 = _mm256_div_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f), vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g2))));
-		__m256 s3 = _mm256_div_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f), vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g3))));
+		__m256 s0 =
+			_mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
+		__m256 s1 =
+			_mm256_div_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g1))));
+		__m256 s2 =
+			_mm256_div_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g2))));
+		__m256 s3 =
+			_mm256_div_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g3))));
 		_mm256_storeu_ps(o + i, _mm256_mul_ps(s0, _mm256_loadu_ps(u + i)));
 		_mm256_storeu_ps(o + i + 8, _mm256_mul_ps(s1, _mm256_loadu_ps(u + i + 8)));
 		_mm256_storeu_ps(o + i + 16, _mm256_mul_ps(s2, _mm256_loadu_ps(u + i + 16)));
@@ -1220,7 +1203,9 @@ static void cpu_ffn_silu_chunk_avx(int begin, int end, int tid, void *ctx) {
 	}
 	for (; i + 8 <= n; i += 8) {
 		__m256 g0 = _mm256_loadu_ps(g + i);
-		__m256 s0 = _mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f), vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
+		__m256 s0 =
+			_mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
 		_mm256_storeu_ps(o + i, _mm256_mul_ps(s0, _mm256_loadu_ps(u + i)));
 	}
 	for (; i < n; i++) {
@@ -1252,30 +1237,34 @@ static void cpu_ffn_gelu_chunk_avx(int begin, int end, int tid, void *ctx) {
 	int			i			= begin;
 	int			n			= end;
 	for (; i + 32 <= n; i += 32) {
-		__m256 g0	 = _mm256_loadu_ps(g + i);
-		__m256 g1	 = _mm256_loadu_ps(g + i + 8);
-		__m256 g2	 = _mm256_loadu_ps(g + i + 16);
-		__m256 g3	 = _mm256_loadu_ps(g + i + 24);
-		__m256 g0sq	 = _mm256_mul_ps(g0, g0);
-		__m256 g1sq	 = _mm256_mul_ps(g1, g1);
-		__m256 g2sq	 = _mm256_mul_ps(g2, g2);
-		__m256 g3sq	 = _mm256_mul_ps(g3, g3);
-		__m256 in0	 = _mm256_mul_ps(_mm256_set1_ps(c_fit),
-								   _mm256_mul_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
-																  _mm256_mul_ps(_mm256_set1_ps(c_x3), g0sq))));
-		__m256 in1	 = _mm256_mul_ps(_mm256_set1_ps(c_fit),
-								   _mm256_mul_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f),
-																  _mm256_mul_ps(_mm256_set1_ps(c_x3), g1sq))));
-		__m256 in2	 = _mm256_mul_ps(_mm256_set1_ps(c_fit),
-								   _mm256_mul_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f),
-																  _mm256_mul_ps(_mm256_set1_ps(c_x3), g2sq))));
-		__m256 in3	 = _mm256_mul_ps(_mm256_set1_ps(c_fit),
-								   _mm256_mul_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f),
-																  _mm256_mul_ps(_mm256_set1_ps(c_x3), g3sq))));
-		__m256 t0	 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in0));
-		__m256 t1	 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in1));
-		__m256 t2	 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in2));
-		__m256 t3	 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in3));
+		__m256 g0	= _mm256_loadu_ps(g + i);
+		__m256 g1	= _mm256_loadu_ps(g + i + 8);
+		__m256 g2	= _mm256_loadu_ps(g + i + 16);
+		__m256 g3	= _mm256_loadu_ps(g + i + 24);
+		__m256 g0sq = _mm256_mul_ps(g0, g0);
+		__m256 g1sq = _mm256_mul_ps(g1, g1);
+		__m256 g2sq = _mm256_mul_ps(g2, g2);
+		__m256 g3sq = _mm256_mul_ps(g3, g3);
+		__m256 in0	= _mm256_mul_ps(
+			_mm256_set1_ps(c_fit),
+			_mm256_mul_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											_mm256_mul_ps(_mm256_set1_ps(c_x3), g0sq))));
+		__m256 in1 = _mm256_mul_ps(
+			_mm256_set1_ps(c_fit),
+			_mm256_mul_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											_mm256_mul_ps(_mm256_set1_ps(c_x3), g1sq))));
+		__m256 in2 = _mm256_mul_ps(
+			_mm256_set1_ps(c_fit),
+			_mm256_mul_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											_mm256_mul_ps(_mm256_set1_ps(c_x3), g2sq))));
+		__m256 in3 = _mm256_mul_ps(
+			_mm256_set1_ps(c_fit),
+			_mm256_mul_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f),
+											_mm256_mul_ps(_mm256_set1_ps(c_x3), g3sq))));
+		__m256 t0 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in0));
+		__m256 t1 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in1));
+		__m256 t2 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in2));
+		__m256 t3 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in3));
 		_mm256_storeu_ps(o + i,
 						 _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), g0), t0),
 									   _mm256_loadu_ps(u + i)));
@@ -1312,8 +1301,8 @@ status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer 
 }
 
 static void cpu_ffn_act_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_ffn_act_batch_args *j  = ctx;
-	tpool_chunk_fn			fn = j->activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
+	cpu_ffn_act_batch_args *j = ctx;
+	tpool_chunk_fn fn = j->activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
 	for (int row = begin; row < end; row++) {
 		cpu_ffn_act_args a = {
 			.g = j->g + ((size_t)row * j->n),
@@ -1326,12 +1315,9 @@ static void cpu_ffn_act_batch_chunk_avx(int begin, int end, int tid, void *ctx) 
 
 status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								   int n, int activation, int m) {
-	cpu_priv			   *p	= self->priv;
-	cpu_ffn_act_batch_args	job = {.g		   = cpu_ptr(gate),
-								   .u		   = cpu_ptr(up),
-								   .o		   = cpu_ptr(out),
-								   .n		   = n,
-								   .activation = activation};
+	cpu_priv			  *p   = self->priv;
+	cpu_ffn_act_batch_args job = {
+		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
 	if (p->pool && m >= 2) {
 		tpool_parallel_for(p->pool, m, 1, cpu_ffn_act_batch_chunk_avx, &job);
 	} else {
@@ -1342,18 +1328,18 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
 	(void)self;
-	const float *lp		= cpu_ptr(logits);
-	__m256		 best_v = _mm256_set1_ps(-INFINITY);
-	__m256i		 best_i = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-	__m256i		 idx	= best_i;
+	const float	 *lp	 = cpu_ptr(logits);
+	__m256		  best_v = _mm256_set1_ps(-INFINITY);
+	__m256i		  best_i = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+	__m256i		  idx	 = best_i;
 	const __m256i stride = _mm256_set1_epi32(8);
-	int			 i		= 0;
+	int			  i		 = 0;
 	for (; i + 8 <= n; i += 8) {
-		__m256  v	 = _mm256_loadu_ps(lp + i);
-		__m256  mask = _mm256_cmp_ps(v, best_v, _CMP_GT_OQ);
-		best_v		 = _mm256_blendv_ps(best_v, v, mask);
-		best_i		 = _mm256_blendv_epi8(best_i, idx, _mm256_castps_si256(mask));
-		idx			 = _mm256_add_epi32(idx, stride);
+		__m256 v	= _mm256_loadu_ps(lp + i);
+		__m256 mask = _mm256_cmp_ps(v, best_v, _CMP_GT_OQ);
+		best_v		= _mm256_blendv_ps(best_v, v, mask);
+		best_i		= _mm256_blendv_epi8(best_i, idx, _mm256_castps_si256(mask));
+		idx			= _mm256_add_epi32(idx, stride);
 	}
 
 	float	vals[8];
@@ -1381,17 +1367,17 @@ status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_
 int32_t cpu_argmax_f32(const float *restrict logits, int vocab) {
 	if (vocab <= 0)
 		return 0;
-	__m256		 best_v = _mm256_set1_ps(-INFINITY);
-	__m256i		 best_i = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-	__m256i		 idx	= best_i;
+	__m256		  best_v = _mm256_set1_ps(-INFINITY);
+	__m256i		  best_i = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+	__m256i		  idx	 = best_i;
 	const __m256i stride = _mm256_set1_epi32(8);
-	int32_t		 i		= 0;
+	int32_t		  i		 = 0;
 	for (; i + 8 <= vocab; i += 8) {
-		__m256  v	 = _mm256_loadu_ps(logits + i);
-		__m256  mask = _mm256_cmp_ps(v, best_v, _CMP_GT_OQ);
-		best_v		 = _mm256_blendv_ps(best_v, v, mask);
-		best_i		 = _mm256_blendv_epi8(best_i, idx, _mm256_castps_si256(mask));
-		idx			 = _mm256_add_epi32(idx, stride);
+		__m256 v	= _mm256_loadu_ps(logits + i);
+		__m256 mask = _mm256_cmp_ps(v, best_v, _CMP_GT_OQ);
+		best_v		= _mm256_blendv_ps(best_v, v, mask);
+		best_i		= _mm256_blendv_epi8(best_i, idx, _mm256_castps_si256(mask));
+		idx			= _mm256_add_epi32(idx, stride);
 	}
 
 	float	vals[8];
@@ -1485,11 +1471,11 @@ static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 			float ms = 1.0f;
 			float vs = 1.0f;
 			if (score > M) {
-				float Mold		= M;
-				M				= score;
-				ms				= expf(Mold - M);
-				__m256 msv		= _mm256_set1_ps(ms);
-				int		i2		= 0;
+				float Mold = M;
+				M		   = score;
+				ms		   = expf(Mold - M);
+				__m256 msv = _mm256_set1_ps(ms);
+				int	   i2  = 0;
 				for (; i2 + 8 <= j->kv_lora; i2 += 8)
 					_mm256_storeu_ps(VKQ_latent + i2,
 									 _mm256_mul_ps(_mm256_loadu_ps(VKQ_latent + i2), msv));
@@ -1499,7 +1485,7 @@ static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 				vs = expf(score - M);
 			}
 			__m256 vsv = _mm256_set1_ps(vs);
-			int		i3	= 0;
+			int	   i3  = 0;
 			for (; i3 + 8 <= j->kv_lora; i3 += 8)
 				_mm256_storeu_ps(VKQ_latent + i3,
 								 _mm256_fmadd_ps(_mm256_loadu_ps(latent + i3), vsv,
@@ -1515,8 +1501,8 @@ static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 			__m256		 acc = _mm256_setzero_ps();
 			int			 i	 = 0;
 			for (; i + 8 <= j->kv_lora; i += 8)
-				acc = _mm256_fmadd_ps(_mm256_loadu_ps(VKQ_latent + i), _mm256_loadu_ps(row + i),
-									   acc);
+				acc =
+					_mm256_fmadd_ps(_mm256_loadu_ps(VKQ_latent + i), _mm256_loadu_ps(row + i), acc);
 			float sum = vreduce_add_ps(acc);
 			for (; i < j->kv_lora; i++)
 				sum += VKQ_latent[i] * row[i];
@@ -1537,13 +1523,13 @@ static void cpu_mla_krot_one(const cpu_mla_krot_job *j, int t) {
 	int jj = 0;
 	for (; jj + 2 <= j->half_rope; jj += 2) {
 		const float *base = k_pe + 2 * jj;
-		__m128		 p	 = _mm_loadu_ps(base);
-		__m128		 c	 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(t_rope_cos + jj)));
-		__m128		 s	 = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(t_rope_sin + jj)));
-		__m128		 ev	 = _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
-		__m128		 od	 = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
-		__m128		 re	 = _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-		__m128		 im	 = _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		__m128		 p	  = _mm_loadu_ps(base);
+		__m128		 c	  = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(t_rope_cos + jj)));
+		__m128		 s	  = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(t_rope_sin + jj)));
+		__m128		 ev	  = _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
+		__m128		 od	  = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
+		__m128		 re	  = _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
+		__m128		 im	  = _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
 		_mm_storeu_ps(dst + 2 * jj, _mm_unpacklo_ps(re, im));
 	}
 	for (; jj < j->half_rope; jj++) {
@@ -1631,23 +1617,23 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	for (int i = 0; i < n_heads * v_head; i++)
 		outf[i] = 0.0f;
 
-	cpu_mla_job_avx job = {.qf			   = qf,
-						   .outf		   = outf,
-						   .layer_c	   = layer_c,
-						   .k_b		   = k_b,
-						   .v_b		   = v_b,
+	cpu_mla_job_avx job = {.qf			  = qf,
+						   .outf		  = outf,
+						   .layer_c		  = layer_c,
+						   .k_b			  = k_b,
+						   .v_b			  = v_b,
 						   .k_pe_rot_all  = k_pe_rot_all,
 						   .rope_cos_base = rope_cos_base,
 						   .rope_sin_base = rope_sin_base,
-						   .qk_head	   = qk_head,
-						   .qk_rope	   = qk_rope,
-						   .qk_nope	   = qk_nope,
-						   .v_head		   = v_head,
-						   .kv_lora	   = kv_lora,
-						   .n_pos		   = n_pos,
-						   .half_rope	   = half_rope,
-						   .pos		   = pos,
-						   .scale		   = scale};
+						   .qk_head		  = qk_head,
+						   .qk_rope		  = qk_rope,
+						   .qk_nope		  = qk_nope,
+						   .v_head		  = v_head,
+						   .kv_lora		  = kv_lora,
+						   .n_pos		  = n_pos,
+						   .half_rope	  = half_rope,
+						   .pos			  = pos,
+						   .scale		  = scale};
 
 	if (p->pool && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)(qk_head + v_head) >= 4096) {

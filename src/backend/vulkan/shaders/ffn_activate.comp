@@ -1,36 +1,42 @@
 #version 450
 layout(local_size_x = 64) in;
 
-layout(set = 0, binding = 0) readonly buffer GateBuf { float gate[]; };
-layout(set = 0, binding = 1) readonly buffer UpBuf { float up[]; };
-layout(set = 0, binding = 2) writeonly buffer OutBuf { float out_[]; };
+layout(set = 0, binding = 0) readonly buffer GateBuf {
+	float gate[];
+};
+layout(set = 0, binding = 1) readonly buffer UpBuf {
+	float up[];
+};
+layout(set = 0, binding = 2) writeonly buffer OutBuf {
+	float out_[];
+};
 
 layout(push_constant) uniform Params {
-    int n;
-    int activation;
-    int m;
-    float gs;
-    float us;
-} params;
+	int	  n;
+	int	  activation;
+	int	  m;
+	float gs;
+	float us;
+}
+params;
 
 float gelu_tanh(float x) {
-    const float c = 0.7978845608028654;
-    float x3 = x * x * x;
-    float inner = c * (x + 0.044715 * x3);
-    return 0.5 * x * (1.0 + tanh(inner));
+	const float c	  = 0.7978845608028654;
+	float		x3	  = x * x * x;
+	float		inner = c * (x + 0.044715 * x3);
+	return 0.5 * x * (1.0 + tanh(inner));
 }
 
 void main() {
-    uint row = gl_WorkGroupID.y;
-    if (row >= uint(params.m)) return;
-    uint row_off = row * uint(params.n);
-    uint i = gl_GlobalInvocationID.x;
-    if (int(i) >= params.n) return;
-    float g = gate[row_off + i] * params.gs;
-    float u = up[row_off + i] * params.us;
-    if (params.activation == 1) {
-        out_[row_off + i] = gelu_tanh(g) * u;
-    } else {
-        out_[row_off + i] = g / (1.0 + exp(-g)) * u;
-    }
+	uint row = gl_WorkGroupID.y;
+	if (row >= uint(params.m))
+		return;
+	uint row_off = row * uint(params.n);
+	uint i		 = gl_GlobalInvocationID.x;
+	if (int(i) >= params.n)
+		return;
+	float g			  = gate[row_off + i] * params.gs;
+	float u			  = up[row_off + i] * params.us;
+	float activated	  = params.activation == 1 ? gelu_tanh(g) : g / (1.0 + exp(-g));
+	out_[row_off + i] = activated * u;
 }
