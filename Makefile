@@ -288,7 +288,7 @@ $(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_FILE)
 cli: $(CLI_BIN)
 $(CLI_BIN): $(SRC_DIR)/cli/main.c $(ENGINE)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $< -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -o $@
+	@$(CC) $(CFLAGS) -I$(SRC_DIR) $< -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
 
 server: $(SERVER_BIN)
 $(SERVER_BIN): $(SERVER_OBJS) $(ENGINE)
@@ -298,7 +298,7 @@ $(SERVER_BIN): $(SERVER_OBJS) $(ENGINE)
 test: $(TEST_BIN)
 $(TEST_BIN): $(TEST_OBJS) $(ENGINE)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -o $@
+	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
 
 $(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
@@ -310,7 +310,7 @@ $(TEST_OBJ_DIR):
 
 $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
-	@$(CC) -shared $(CFLAGS) $^ $(LDFLAGS) -o $@
+	@$(CC) -shared $(CFLAGS) $^ $(LDFLAGS) -ljson-c -o $@
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
@@ -361,4 +361,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d)

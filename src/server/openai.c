@@ -5,6 +5,7 @@
 #include "log.h"
 #include "microhttpd.h"
 #include "sampler.h"
+#include "toolcall.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -21,8 +22,11 @@
 #define SSE_POLL_SEC 1
 
 typedef struct {
-	char *role;
-	char *content;
+	char		*role;
+	char		*content;
+	json_object *tool_calls;
+	const char	*tool_call_id;
+	const char	*name;
 } oa_message;
 
 typedef struct {
@@ -42,34 +46,22 @@ typedef struct {
 	oa_message *messages;
 	size_t		n_messages;
 
+	json_object *tools;
+	char		*tool_choice;
+	char		*forced_function;
+
 	char *prompt;
 } oa_req_params;
-
-typedef struct {
-	char  *p;
-	size_t len;
-	size_t cap;
-} oa_buf;
-
-static void oa_buf_append(oa_buf *b, const char *s, size_t n) {
-	if (b->len + n + 1 > b->cap) {
-		b->cap = b->cap ? b->cap * 2 : 128;
-		b->p   = xrealloc(b->p, b->cap);
-	}
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
-}
 
 typedef struct {
 	openai_state  *st;
 	oa_req_params *params;
 
-	bool streaming;
-	bool chat_api;
-	bool same_session;
+	bool	 streaming;
+	bool	 chat_api;
+	bool	 same_session;
 	uint64_t session_key_at_start;
-	bool generation_done;
+	bool	 generation_done;
 
 	pthread_mutex_t q_mtx;
 	pthread_cond_t	q_cv;
@@ -81,8 +73,8 @@ typedef struct {
 	bool			producer_done;
 	bool			client_gone;
 
-	oa_buf content;
-	oa_buf reasoning;
+	toolcall_buf content;
+	toolcall_buf reasoning;
 
 	bool in_thinking;
 	bool first_token;
@@ -90,6 +82,9 @@ typedef struct {
 
 	bool stopped_by_stop;
 	bool sent_any_chunk;
+	bool tool_fill_logged;
+
+	toolcall_scanner *tsc;
 
 	int	 generated;
 	int	 prompt_tokens;
@@ -332,23 +327,106 @@ static uint64_t fnv1a_update(uint64_t h, const char *s) {
 }
 
 static uint64_t *session_prefix_hash_chain(const oa_req_params *p, size_t *out_len) {
-	size_t	  len   = p->n_messages > 0 ? p->n_messages - 1 : 0;
+	size_t	  len	= p->n_messages > 0 ? p->n_messages - 1 : 0;
 	uint64_t *chain = xmalloc((len + 1) * sizeof(uint64_t));
-	chain[0]		= 1469598103934665603ULL;
+	uint64_t  h		= 1469598103934665603ULL;
+	if (p->tools)
+		h = fnv1a_update(h, json_object_to_json_string(p->tools));
+	h		 = fnv1a_update(h, "\x1f");
+	h		 = fnv1a_update(h, p->tool_choice ? p->tool_choice : "");
+	h		 = fnv1a_update(h, p->forced_function ? p->forced_function : "");
+	h		 = fnv1a_update(h, "\x1e");
+	chain[0] = h;
 	for (size_t i = 0; i < len; i++) {
-		uint64_t h = chain[i];
-		h		   = fnv1a_update(h, p->messages[i].role);
-		h		   = fnv1a_update(h, "\x1f");
-		h		   = fnv1a_update(h, p->messages[i].content);
-		h		   = fnv1a_update(h, "\x1e");
+		h = chain[i];
+		h = fnv1a_update(h, p->messages[i].role);
+		h = fnv1a_update(h, "\x1f");
+		h = fnv1a_update(h, p->messages[i].content);
+		if (p->messages[i].tool_calls)
+			h = fnv1a_update(h, json_object_to_json_string(p->messages[i].tool_calls));
+		h = fnv1a_update(h, "\x1f");
+		h = fnv1a_update(h, p->messages[i].tool_call_id ? p->messages[i].tool_call_id : "");
+		h = fnv1a_update(h, "\x1f");
+		h = fnv1a_update(h, p->messages[i].name ? p->messages[i].name : "");
+		h = fnv1a_update(h, "\x1e");
 		chain[i + 1] = h;
 	}
 	*out_len = len;
 	return chain;
 }
 
+static const char *parse_tools_array(json_object *root, oa_req_params *p) {
+	json_object *tools;
+	if (!json_object_object_get_ex(root, "tools", &tools) ||
+		json_object_is_type(tools, json_type_null))
+		return NULL;
+	if (!json_object_is_type(tools, json_type_array))
+		return "'tools' must be an array";
+	size_t n = json_object_array_length(tools);
+	for (size_t i = 0; i < n; i++) {
+		json_object *t	= json_object_array_get_idx(tools, i);
+		json_object *fn = NULL, *nm = NULL;
+		if (!json_object_is_type(t, json_type_object) ||
+			!json_object_object_get_ex(t, "function", &fn) ||
+			!json_object_is_type(fn, json_type_object) ||
+			!json_object_object_get_ex(fn, "name", &nm) ||
+			!json_object_is_type(nm, json_type_string) || !json_object_get_string_len(nm))
+			return "'tools[]' must be {type:'function', function:{name:'<non-empty>', ...}}";
+	}
+	p->tools = tools;
+	return NULL;
+}
+
+static const char *parse_tool_choice(json_object *root, oa_req_params *p) {
+	p->tool_choice = xstrdup("auto");
+	json_object *tc;
+	if (!json_object_object_get_ex(root, "tool_choice", &tc) ||
+		json_object_is_type(tc, json_type_null))
+		return NULL;
+
+	if (json_object_is_type(tc, json_type_string)) {
+		const char *s = json_object_get_string(tc);
+		if (strcmp(s, "none") && strcmp(s, "auto") && strcmp(s, "required"))
+			return "'tool_choice' must be 'none', 'auto', 'required', or an object";
+		free(p->tool_choice);
+		p->tool_choice = xstrdup(s);
+		return NULL;
+	}
+
+	if (json_object_is_type(tc, json_type_object)) {
+		json_object *t2, *f2, *n2;
+		if (!json_object_object_get_ex(tc, "type", &t2) ||
+			!json_object_is_type(t2, json_type_string) ||
+			strcmp(json_object_get_string(t2), "function") ||
+			!json_object_object_get_ex(tc, "function", &f2) ||
+			!json_object_is_type(f2, json_type_object) ||
+			!json_object_object_get_ex(f2, "name", &n2) ||
+			!json_object_is_type(n2, json_type_string))
+			return "'tool_choice' object must be {type:'function', function:{name:...}}";
+		free(p->tool_choice);
+		p->tool_choice	   = xstrdup("required");
+		p->forced_function = xstrdup(json_object_get_string(n2));
+		return NULL;
+	}
+
+	return "'tool_choice' must be a string or an object";
+}
+
+static const char *parse_tools(json_object *root, oa_req_params *p) {
+	const char *err = parse_tools_array(root, p);
+	if (err)
+		return err;
+	if (!p->tools)
+		return NULL;
+	return parse_tool_choice(root, p);
+}
+
 static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 	parse_sampling_params(root, p);
+
+	const char *terr = parse_tools(root, p);
+	if (terr)
+		return terr;
 
 	json_object *msgs;
 	if (!json_object_object_get_ex(root, "messages", &msgs) ||
@@ -370,6 +448,20 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 			r = json_object_get_string(role);
 		p->messages[i].role	   = xstrdup(r);
 		p->messages[i].content = extract_message_content(m);
+
+		json_object *tcs;
+		if (json_object_object_get_ex(m, "tool_calls", &tcs) &&
+			json_object_is_type(tcs, json_type_array))
+			p->messages[i].tool_calls = tcs;
+
+		json_object *tcid;
+		if (json_object_object_get_ex(m, "tool_call_id", &tcid) &&
+			json_object_is_type(tcid, json_type_string))
+			p->messages[i].tool_call_id = json_object_get_string(tcid);
+
+		json_object *nm;
+		if (json_object_object_get_ex(m, "name", &nm) && json_object_is_type(nm, json_type_string))
+			p->messages[i].name = json_object_get_string(nm);
 	}
 	p->n_messages = n;
 	return NULL;
@@ -419,6 +511,8 @@ static void free_req_params(oa_req_params *p) {
 	}
 	free(p->messages);
 	free(p->prompt);
+	free(p->tool_choice);
+	free(p->forced_function);
 	memset(p, 0, sizeof(*p));
 }
 
@@ -437,6 +531,7 @@ static void rc_unref(req_ctx *rc) {
 	free(rc->gen.frame_lens);
 	free(rc->gen.content.p);
 	free(rc->gen.reasoning.p);
+	toolcall_scanner_free(rc->gen.tsc);
 	pthread_mutex_destroy(&rc->gen.q_mtx);
 	pthread_cond_destroy(&rc->gen.q_cv);
 	free_req_params(&rc->params);
@@ -501,6 +596,8 @@ static void make_id(oa_gen *g) {
 static const char *compute_finish_reason(const oa_gen *g) {
 	if (g->stopped_by_stop)
 		return "stop";
+	if (g->tsc && toolcall_scanner_n_calls(g->tsc) > 0)
+		return "tool_calls";
 	if (g->params->max_tokens > 0 && g->generated >= g->params->max_tokens)
 		return "length";
 	return "stop";
@@ -565,6 +662,9 @@ static json_object *build_completion_body(req_ctx *rc, bool chat_api) {
 		if (g->reasoning.len > 0)
 			json_object_object_add(msg, "reasoning_content",
 								   json_object_new_string(g->reasoning.p));
+		json_object *calls = g->tsc ? toolcall_scanner_calls(g->tsc) : NULL;
+		if (calls && json_object_array_length(calls) > 0)
+			json_object_object_add(msg, "tool_calls", json_object_get(calls));
 		json_object_object_add(choice, "message", msg);
 	} else {
 		json_object_object_add(choice, "text",
@@ -663,6 +763,34 @@ static void sse_send_delta(oa_gen *g, bool reasoning, const char *piece, size_t 
 	}
 }
 
+static void sse_send_tool_call(oa_gen *g, int index, const char *id, const char *name,
+							   const char *args_json) {
+	if (!g->sent_any_chunk) {
+		g->sent_any_chunk = true;
+		if (g->chat_api)
+			sse_send_role_chunk(g);
+		else
+			sse_text_delta(g, "", 0, NULL);
+	}
+	if (g->client_gone || shutting_down(g->st))
+		return;
+
+	json_object *tcd = json_object_new_object();
+	json_object_object_add(tcd, "index", json_object_new_int(index));
+	json_object_object_add(tcd, "id", json_object_new_string(id));
+	json_object_object_add(tcd, "type", json_object_new_string("function"));
+	json_object *fn = json_object_new_object();
+	json_object_object_add(fn, "name", json_object_new_string(name));
+	json_object_object_add(fn, "arguments", json_object_new_string(args_json));
+	json_object_object_add(tcd, "function", fn);
+
+	json_object *arr = json_object_new_array();
+	json_object_array_add(arr, tcd);
+	json_object *delta = json_object_new_object();
+	json_object_object_add(delta, "tool_calls", arr);
+	sse_chat_delta(g, delta, NULL);
+}
+
 static void check_stop_sequences(oa_gen *g) {
 	if (g->stopped_by_stop || g->params->n_stop == 0)
 		return;
@@ -731,6 +859,19 @@ static void check_stop_sequences(oa_gen *g) {
 	free(window);
 }
 
+static void tool_on_content(void *ud, const char *piece, size_t n) {
+	oa_gen *g = (oa_gen *)ud;
+	if (g->streaming && !g->client_gone && !shutting_down(g->st))
+		sse_send_delta(g, false, piece, n);
+}
+
+static void tool_on_call(void *ud, int index, const char *id, const char *name,
+						 const char *args_json) {
+	oa_gen *g = (oa_gen *)ud;
+	if (g->streaming)
+		sse_send_tool_call(g, index, id, name, args_json);
+}
+
 static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	oa_gen *g = (oa_gen *)ud;
 
@@ -740,7 +881,7 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	}
 
 	if (!g->chat_api) {
-		oa_buf_append(&g->content, piece, (size_t)n);
+		toolcall_buf_append(&g->content, piece, (size_t)n);
 		check_stop_sequences(g);
 		if (g->stopped_by_stop) {
 			g->st->ctx->interrupt = 1;
@@ -748,6 +889,16 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 		}
 		if (g->streaming)
 			sse_send_delta(g, false, piece, (size_t)n);
+		return;
+	}
+
+	if (g->tsc && toolcall_scanner_suppressed(g->tsc)) {
+		g->st->ctx->interrupt = 1;
+		return;
+	}
+
+	if (g->tsc && toolcall_scanner_in_capture(g->tsc)) {
+		toolcall_scanner_feed_capture(g->tsc, piece, (size_t)n);
 		return;
 	}
 
@@ -776,16 +927,28 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	if (n <= 0)
 		return;
 
-	oa_buf *dst = g->in_thinking ? &g->reasoning : &g->content;
-	oa_buf_append(dst, piece, (size_t)n);
+	toolcall_buf *dst = g->in_thinking ? &g->reasoning : &g->content;
+	toolcall_buf_append(dst, piece, (size_t)n);
 	check_stop_sequences(g);
 	if (g->stopped_by_stop) {
 		g->st->ctx->interrupt = 1;
 		return;
 	}
 
-	if (g->streaming)
+	if (g->tsc && dst == &g->content) {
+		toolcall_scanner_feed(g->tsc);
+		if (toolcall_scanner_suppressed(g->tsc)) {
+			if (!g->tool_fill_logged) {
+				g->tool_fill_logged = true;
+				WARN("model filled in the tool response slot itself; suppressed "
+					 "the rest of the generation");
+			}
+			g->st->ctx->interrupt = 1;
+			return;
+		}
+	} else if (g->streaming) {
 		sse_send_delta(g, g->in_thinking, piece, (size_t)n);
+	}
 }
 
 static void sse_finish_stream(oa_gen *g) {
@@ -815,6 +978,17 @@ static void sse_finish_stream(oa_gen *g) {
 	gen_queue_done(g);
 }
 
+static chat_message oa_message_to_view(const oa_message *m) {
+	chat_message cm = {
+		.role		  = m->role,
+		.content	  = m->content,
+		.tool_calls	  = m->tool_calls,
+		.tool_call_id = (char *)m->tool_call_id,
+		.name		  = (char *)m->name,
+	};
+	return cm;
+}
+
 static void run_generation(req_ctx *rc, bool chat_api) {
 	openai_state *st = rc->st;
 	oa_gen		 *g	 = &rc->gen;
@@ -842,13 +1016,37 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 			context_reset(c);
 
 		if (chat_api) {
+			chat_template_set_tools(&c->chat, rc->params.tools, rc->params.tool_choice);
+			if (rc->params.forced_function)
+				INFO("tool_choice: function '%s' requested; running in best-effort "
+					 "mode (no grammar forcing)",
+					 rc->params.forced_function);
+
+			g->tsc = (c->chat.tools && c->chat.tool_fmt)
+						 ? toolcall_scanner_new(c->chat.tool_fmt, &g->content, tool_on_content,
+												tool_on_call, g)
+						 : NULL;
+
 			size_t start = c->chat.n_messages;
-			for (size_t i = start; i + 1 < rc->params.n_messages; i++)
-				chat_template_add_message(&c->chat, rc->params.messages[i].role,
-										  rc->params.messages[i].content);
-			g->generated = context_chat_turn(c, rc->params.messages[rc->params.n_messages - 1].role,
-											 rc->params.messages[rc->params.n_messages - 1].content,
-											 true, rc->params.max_tokens, &sp, gen_on_token, g, "");
+			for (size_t i = start; i + 1 < rc->params.n_messages; i++) {
+				chat_message cm = oa_message_to_view(&rc->params.messages[i]);
+				chat_template_add_message_ex(&c->chat, &cm);
+			}
+			{
+				chat_message cm =
+					oa_message_to_view(&rc->params.messages[rc->params.n_messages - 1]);
+				g->generated = context_chat_turn_msg(c, &cm, true, rc->params.max_tokens, &sp,
+													 gen_on_token, g, "");
+			}
+
+			if (g->tsc)
+				toolcall_scanner_finish(g->tsc);
+
+			json_object *calls		= g->tsc ? toolcall_scanner_calls(g->tsc) : NULL;
+			bool		 suppressed = g->tsc && toolcall_scanner_suppressed(g->tsc);
+			if ((calls && json_object_array_length(calls) > 0) || suppressed)
+				chat_template_rewrite_last_assistant(&c->chat, g->content.p ? g->content.p : "",
+													 calls);
 		} else {
 			g->generated = context_completion(c, rc->params.prompt, rc->params.max_tokens, &sp,
 											  gen_on_token, g);
@@ -913,10 +1111,12 @@ static void request_completed(void *cls, struct MHD_Connection *conn, void **con
 	req_ctx *rc = *(req_ctx **)con_cls;
 	if (!rc)
 		return;
-	DEBUG("connection closed (termination_code=%d) for session=%llx interrupt_before=%d",
-		 (int)toe, (unsigned long long)rc->gen.session_key_at_start, (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
+	DEBUG("connection closed (termination_code=%d) for session=%llx interrupt_before=%d", (int)toe,
+		  (unsigned long long)rc->gen.session_key_at_start,
+		  (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
 	gen_mark_client_gone(&rc->gen);
-	DEBUG("connection closed: interrupt_after=%d", (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
+	DEBUG("connection closed: interrupt_after=%d",
+		  (int)(rc->st->ctx ? rc->st->ctx->interrupt : -1));
 	*(req_ctx **)con_cls = NULL;
 	rc_unref(rc);
 }
@@ -969,7 +1169,7 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 
 		pthread_mutex_lock(&st->gen_mtx);
 		bool matched = st->has_session && new_len >= st->prefix_len &&
-					  new_chain[st->prefix_len] == st->prefix_hashes[st->prefix_len];
+					   new_chain[st->prefix_len] == st->prefix_hashes[st->prefix_len];
 		if (st->has_session && !matched)
 			WARN("session=%016llx new session detected (previous session's history no "
 				 "longer matches; previous_len=%zu new_len=%zu) -- previous session is "
