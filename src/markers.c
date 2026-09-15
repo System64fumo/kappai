@@ -3,17 +3,19 @@
 #include <string.h>
 
 static const marker_pair marker_pairs[] = {
-	{"<think>", "</think>", MARKER_THINKING, PAYLOAD_NONE, NULL},
-	{"<|channel>", "<channel|>", MARKER_THINKING, PAYLOAD_NONE, NULL},
-	{"<|think|>", "<|/think|>", MARKER_THINKING, PAYLOAD_NONE, NULL},
-	{"<start_of_thought>", "<|end_of_thought|>", MARKER_THINKING, PAYLOAD_NONE, NULL},
+	{"<think>", "</think>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
+	{"<|channel>", "<channel|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
+	{"<|think|>", "<|/think|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
+	{"<start_of_thought>", "<|end_of_thought|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
 
-	{"<|tool_call>", "<tool_call|>", MARKER_TOOL_CALL, PAYLOAD_CALLCOLON, "<|tool_response>"},
-	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, NULL},
+	{"<|tool_call>", "<tool_call|>", MARKER_TOOL_CALL, PAYLOAD_CALLCOLON, "<|tool_response>", NULL},
+	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLARGS, NULL,
+	 "<arg_key>"},
+	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, NULL, NULL},
 	{"<|tool_call_start|>", "<|tool_call_end|>", MARKER_TOOL_CALL, PAYLOAD_FUNCARGS,
-	 "<|tool_call_end|>"},
-	{"<function=", "</function>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, "<|im_end|>"},
-	{"", "", MARKER_TOOL_CALL, PAYLOAD_AUTO, "<|eot_id|>"},
+	 "<|tool_call_end|>", NULL},
+	{"<function=", "</function>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, "<|im_end|>", NULL},
+	{"", "", MARKER_TOOL_CALL, PAYLOAD_AUTO, "<|eot_id|>", NULL},
 };
 
 const marker_pair *marker_registry(size_t *n_pairs) {
@@ -30,6 +32,14 @@ static const marker_pair *probe(const tokenizer *tok, const char *text, marker_r
 			continue;
 		if (!all[i].open[0])
 			continue;
+		if (all[i].probe_hint) {
+			if (tok) {
+				if (tokenizer_find_token(tok, all[i].probe_hint) < 0)
+					continue;
+			} else if (!text || !strstr(text, all[i].probe_hint)) {
+				continue;
+			}
+		}
 		if (tok) {
 			if (tokenizer_find_token(tok, all[i].open) < 0)
 				continue;

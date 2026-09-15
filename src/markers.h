@@ -15,6 +15,7 @@ typedef enum {
 	PAYLOAD_AUTO,
 	PAYLOAD_FUNCARGS,
 	PAYLOAD_XMLFUNC,
+	PAYLOAD_XMLARGS,
 } marker_payload;
 
 typedef struct {
@@ -23,6 +24,7 @@ typedef struct {
 	marker_role	   role;
 	marker_payload payload;
 	const char	  *stop;
+	const char	  *probe_hint;
 } marker_pair;
 
 const marker_pair *marker_registry(size_t *n_pairs);

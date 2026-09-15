@@ -654,6 +654,77 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 	return 1;
 }
 
+static int payload_xmlargs(const char *p, size_t len, size_t pos, char **name_out,
+						   json_object **args_out, size_t *end_out) {
+	while (pos < len && isspace((unsigned char)p[pos]))
+		pos++;
+	size_t nstart = pos;
+	while (pos < len && p[pos] != '<')
+		pos++;
+	if (pos >= len)
+		return 0;
+	size_t nend = pos;
+	while (nend > nstart && isspace((unsigned char)p[nend - 1]))
+		nend--;
+	while (nstart < nend && isspace((unsigned char)p[nstart]))
+		nstart++;
+	if (nend == nstart)
+		return 0;
+	char *name = xmalloc(nend - nstart + 1);
+	memcpy(name, p + nstart, nend - nstart);
+	name[nend - nstart] = '\0';
+
+	json_object *args = json_object_new_object();
+	for (;;) {
+		if (pos + 9 <= len && memcmp(p + pos, "<arg_key>", 9) == 0) {
+			pos += 9;
+			size_t kstart = pos;
+			long   kend	  = find_marker(p, len, pos, "</arg_key>");
+			if (kend < 0)
+				break;
+			char *key = xmalloc((size_t)kend - kstart + 1);
+			memcpy(key, p + kstart, (size_t)kend - kstart);
+			key[(size_t)kend - kstart] = '\0';
+			pos						   = (size_t)kend + strlen("</arg_key>");
+
+			if (pos + 11 > len || memcmp(p + pos, "<arg_value>", 11) != 0) {
+				free(key);
+				break;
+			}
+			pos += 11;
+			size_t vstart = pos;
+			long   vend	  = find_marker(p, len, pos, "</arg_value>");
+			if (vend < 0) {
+				free(key);
+				break;
+			}
+			size_t		 vraw = (size_t)vend - vstart;
+			json_object *val  = NULL;
+			if (vraw > 0 && (p[vstart] == '{' || p[vstart] == '[')) {
+				json_tokener *tk	 = json_tokener_new();
+				json_object	 *parsed = json_tokener_parse_ex(tk, p + vstart, (int)vraw);
+				if (json_tokener_get_error(tk) == json_tokener_success && parsed)
+					val = parsed;
+				else if (parsed)
+					json_object_put(parsed);
+				json_tokener_free(tk);
+			}
+			if (!val)
+				val = json_object_new_string_len(p + vstart, (int)vraw);
+			json_object_object_add(args, key, val);
+			free(key);
+			pos = (size_t)vend + strlen("</arg_value>");
+			continue;
+		}
+		break;
+	}
+
+	*name_out = name;
+	*args_out = args;
+	*end_out  = pos;
+	return 1;
+}
+
 toolcall_scanner *toolcall_scanner_new(const marker_pair *fmt, toolcall_buf *content,
 									   toolcall_content_fn on_content, toolcall_call_fn on_call,
 									   void *ud) {
@@ -972,6 +1043,9 @@ status_code toolcall_parse(const marker_pair *fmt, const char *text, size_t len,
 		break;
 	case PAYLOAD_XMLFUNC:
 		ok = payload_xmlfunc(text, len, olen, &name, &args, &end);
+		break;
+	case PAYLOAD_XMLARGS:
+		ok = payload_xmlargs(text, len, olen, &name, &args, &end);
 		break;
 	default:
 		ok = payload_auto(text, len, olen, &name, &args, &end);
