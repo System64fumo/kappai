@@ -24,6 +24,7 @@
 typedef struct {
 	char		*role;
 	char		*content;
+	char		*reasoning_content;
 	json_object *tool_calls;
 	const char	*tool_call_id;
 	const char	*name;
@@ -342,6 +343,8 @@ static uint64_t *session_prefix_hash_chain(const oa_req_params *p, size_t *out_l
 		h = fnv1a_update(h, p->messages[i].role);
 		h = fnv1a_update(h, "\x1f");
 		h = fnv1a_update(h, p->messages[i].content);
+		h = fnv1a_update(h,
+						 p->messages[i].reasoning_content ? p->messages[i].reasoning_content : "");
 		if (p->messages[i].tool_calls)
 			h = fnv1a_update(h, json_object_to_json_string(p->messages[i].tool_calls));
 		h = fnv1a_update(h, "\x1f");
@@ -449,6 +452,11 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 		p->messages[i].role	   = xstrdup(r);
 		p->messages[i].content = extract_message_content(m);
 
+		json_object *rc;
+		if (json_object_object_get_ex(m, "reasoning_content", &rc) &&
+			json_object_is_type(rc, json_type_string))
+			p->messages[i].reasoning_content = xstrdup(json_object_get_string(rc));
+
 		json_object *tcs;
 		if (json_object_object_get_ex(m, "tool_calls", &tcs) &&
 			json_object_is_type(tcs, json_type_array))
@@ -508,6 +516,7 @@ static void free_req_params(oa_req_params *p) {
 	for (size_t i = 0; i < p->n_messages; i++) {
 		free(p->messages[i].role);
 		free(p->messages[i].content);
+		free(p->messages[i].reasoning_content);
 	}
 	free(p->messages);
 	free(p->prompt);
@@ -980,11 +989,12 @@ static void sse_finish_stream(oa_gen *g) {
 
 static chat_message oa_message_to_view(const oa_message *m) {
 	chat_message cm = {
-		.role		  = m->role,
-		.content	  = m->content,
-		.tool_calls	  = m->tool_calls,
-		.tool_call_id = (char *)m->tool_call_id,
-		.name		  = (char *)m->name,
+		.role			   = m->role,
+		.content		   = m->content,
+		.reasoning_content = m->reasoning_content,
+		.tool_calls		   = m->tool_calls,
+		.tool_call_id	   = (char *)m->tool_call_id,
+		.name			   = (char *)m->name,
 	};
 	return cm;
 }
@@ -997,6 +1007,18 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 	g->streaming = rc->params.stream;
 	g->chat_api	 = chat_api;
 	make_id(g);
+
+	g->in_thinking		= false;
+	g->first_token		= true;
+	g->skip_label		= false;
+	g->stopped_by_stop	= false;
+	g->sent_any_chunk	= false;
+	g->tool_fill_logged = false;
+	g->generation_done	= false;
+	g->prompt_tokens	= 0;
+	g->generated		= 0;
+	toolcall_buf_reset(&g->content);
+	toolcall_buf_reset(&g->reasoning);
 
 	sampler_params sp = {.temperature	 = rc->params.temperature,
 						 .top_k			 = rc->params.top_k,
@@ -1046,7 +1068,7 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 			bool		 suppressed = g->tsc && toolcall_scanner_suppressed(g->tsc);
 			if ((calls && json_object_array_length(calls) > 0) || suppressed)
 				chat_template_rewrite_last_assistant(&c->chat, g->content.p ? g->content.p : "",
-													 calls);
+													 g->reasoning.p ? g->reasoning.p : "", calls);
 		} else {
 			g->generated = context_completion(c, rc->params.prompt, rc->params.max_tokens, &sp,
 											  gen_on_token, g);

@@ -12,6 +12,7 @@
 typedef struct {
 	char		*role;
 	char		*content;
+	char		*reasoning_content;
 	json_object *tool_calls;
 	char		*tool_call_id;
 	char		*name;
@@ -63,7 +64,7 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 									  size_t errbuf_len);
 
 void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *content,
-										  json_object *tool_calls);
+										  const char *reasoning, json_object *tool_calls);
 
 size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *system);
 

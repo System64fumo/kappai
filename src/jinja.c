@@ -2542,24 +2542,48 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		return;
 	case ST_FOR: {
 		jinja_value *iter = eval_expr(ctx, s->iterable);
-		if (iter && (iter->type == JV_LIST || iter->type == JV_DICT || iter->type == JV_STRING)) {
-			if (iter->type != JV_LIST) {
-				everr(ctx, "for loop over non-list");
-				return;
-			}
-		} else if (!iter || iter->type == JV_NONE) {
+		if (!iter || iter->type == JV_NONE) {
 			return;
-		} else {
+		}
+		if (iter->type != JV_LIST && iter->type != JV_DICT && iter->type != JV_STRING) {
 			everr(ctx, "for loop over non-list");
 			return;
 		}
-		size_t n = iter->as.list.n;
+
+		jinja_value **items	   = NULL;
+		size_t		  n		   = 0;
+		jinja_value	 *key_list = NULL;
+		if (iter->type == JV_LIST) {
+			items = iter->as.list.items;
+			n	  = iter->as.list.n;
+		} else if (iter->type == JV_DICT) {
+			size_t dict_n = 0;
+			for (jinja_dict_entry *en = iter->as.dict; en; en = en->next)
+				dict_n++;
+			key_list = jinja_list();
+			for (jinja_dict_entry *en = iter->as.dict; en; en = en->next)
+				jinja_list_append(key_list, jinja_string(en->key));
+			items = key_list->as.list.items;
+			n	  = dict_n;
+		} else {
+			size_t slen = strlen(iter->as.s);
+			key_list	= jinja_list();
+			for (size_t k = 0; k < slen; k++) {
+				char buf[2];
+				buf[0] = iter->as.s[k];
+				buf[1] = '\0';
+				jinja_list_append(key_list, jinja_string(buf));
+			}
+			items = key_list->as.list.items;
+			n	  = slen;
+		}
+
 		for (size_t i = 0; i < n && !ctx->failed; i++) {
 			scope loop_sc;
 			loop_sc.entries = NULL;
 			loop_sc.parent	= ctx->sc;
 
-			jinja_value *item = iter->as.list.items[i];
+			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
 				scope_assign(&loop_sc, s->loop_var, item->as.list.items[0]);
 				scope_assign(&loop_sc, s->loop_var2, item->as.list.items[1]);
@@ -2575,6 +2599,8 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			jinja_dict_set(loop_obj, "index", jinja_string(buf));
 			jinja_dict_set(loop_obj, "first", jinja_bool(i == 0));
 			jinja_dict_set(loop_obj, "last", jinja_bool(i == n - 1));
+			jinja_dict_set(loop_obj, "previtem", i > 0 ? items[i - 1] : jinja_none());
+			jinja_dict_set(loop_obj, "nextitem", i + 1 < n ? items[i + 1] : jinja_none());
 			scope_assign(&loop_sc, "loop", loop_obj);
 
 			scope *saved   = ctx->sc;

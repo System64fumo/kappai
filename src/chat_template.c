@@ -126,7 +126,10 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 	else
 		cts->eos_token = xstrdup("");
 
-	const marker_pair *think = marker_probe(tok, MARKER_THINKING);
+	const char		  *tmpl_src_for_probe = tmpl_src;
+	const marker_pair *think			  = marker_probe_text(tmpl_src_for_probe, MARKER_THINKING);
+	if (!think)
+		think = marker_probe(tok, MARKER_THINKING);
 	if (think) {
 		cts->think_start_id	  = tokenizer_find_token(tok, think->open);
 		cts->think_end_id	  = tokenizer_find_token(tok, think->close);
@@ -134,9 +137,9 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 		cts->think_end_text	  = think->close;
 	}
 
-	cts->tool_fmt = marker_probe(tok, MARKER_TOOL_CALL);
+	cts->tool_fmt = marker_probe_text(tmpl_src_for_probe, MARKER_TOOL_CALL);
 	if (!cts->tool_fmt)
-		cts->tool_fmt = marker_probe_text(tmpl_src, MARKER_TOOL_CALL);
+		cts->tool_fmt = marker_probe(tok, MARKER_TOOL_CALL);
 
 	DEBUG("chat_template: think_start_id=%d think_end_id=%d tool_fmt=%s", cts->think_start_id,
 		  cts->think_end_id, cts->tool_fmt ? cts->tool_fmt->open : "none");
@@ -151,6 +154,7 @@ void chat_template_clear_messages(chat_template_state *cts) {
 	for (size_t i = 0; i < cts->n_messages; i++) {
 		free(cts->messages[i].role);
 		free(cts->messages[i].content);
+		free(cts->messages[i].reasoning_content);
 		free(cts->messages[i].tool_call_id);
 		free(cts->messages[i].name);
 		if (cts->messages[i].tool_calls)
@@ -230,11 +234,12 @@ void chat_template_add_message_ex(chat_template_state *cts, const chat_message *
 	char		 *clean = strip_thinking_spans(cts, msg->content);
 	chat_message *dst	= &cts->messages[cts->n_messages];
 	memset(dst, 0, sizeof(*dst));
-	dst->role		  = xstrdup(msg->role ? msg->role : "");
-	dst->content	  = clean;
-	dst->tool_calls	  = msg->tool_calls ? json_object_get(msg->tool_calls) : NULL;
-	dst->tool_call_id = msg->tool_call_id ? xstrdup(msg->tool_call_id) : NULL;
-	dst->name		  = msg->name ? xstrdup(msg->name) : NULL;
+	dst->role			   = xstrdup(msg->role ? msg->role : "");
+	dst->content		   = clean;
+	dst->reasoning_content = msg->reasoning_content ? xstrdup(msg->reasoning_content) : NULL;
+	dst->tool_calls		   = msg->tool_calls ? json_object_get(msg->tool_calls) : NULL;
+	dst->tool_call_id	   = msg->tool_call_id ? xstrdup(msg->tool_call_id) : NULL;
+	dst->name			   = msg->name ? xstrdup(msg->name) : NULL;
 	cts->n_messages++;
 }
 
@@ -247,6 +252,9 @@ static jinja_value *build_globals(chat_template_state *cts, const chat_message *
 		jinja_value *m = jinja_dict();
 		jinja_dict_set(m, "role", jinja_string(cts->messages[i].role));
 		jinja_dict_set(m, "content", jinja_string(cts->messages[i].content));
+		if (cts->messages[i].reasoning_content)
+			jinja_dict_set(m, "reasoning_content",
+						   jinja_string(cts->messages[i].reasoning_content));
 		if (cts->messages[i].tool_calls)
 			jinja_dict_set(m, "tool_calls", tool_calls_to_jinja(cts->messages[i].tool_calls));
 		if (cts->messages[i].tool_call_id)
@@ -259,6 +267,8 @@ static jinja_value *build_globals(chat_template_state *cts, const chat_message *
 		jinja_value *m = jinja_dict();
 		jinja_dict_set(m, "role", jinja_string(extra[i].role));
 		jinja_dict_set(m, "content", jinja_string(extra[i].content));
+		if (extra[i].reasoning_content)
+			jinja_dict_set(m, "reasoning_content", jinja_string(extra[i].reasoning_content));
 		if (extra[i].tool_calls)
 			jinja_dict_set(m, "tool_calls", tool_calls_to_jinja(extra[i].tool_calls));
 		if (extra[i].tool_call_id)
@@ -382,7 +392,7 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 }
 
 void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *content,
-										  json_object *tool_calls) {
+										  const char *reasoning, json_object *tool_calls) {
 	if (!cts || cts->n_messages == 0)
 		return;
 	chat_message *last = &cts->messages[cts->n_messages - 1];
@@ -391,6 +401,8 @@ void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *
 
 	free(last->content);
 	last->content = xstrdup(content ? content : "");
+	free(last->reasoning_content);
+	last->reasoning_content = reasoning && reasoning[0] ? xstrdup(reasoning) : NULL;
 	if (last->tool_calls) {
 		json_object_put(last->tool_calls);
 		last->tool_calls = NULL;

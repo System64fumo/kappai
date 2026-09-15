@@ -544,6 +544,10 @@ done:
 
 static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_out,
 						   json_object **args_out, size_t *end_out) {
+	while (pos < len && isspace((unsigned char)p[pos]))
+		pos++;
+	if (pos + 10 <= len && memcmp(p + pos, "<function=", 10) == 0)
+		pos += 10;
 	size_t nstart = pos;
 	while (pos < len && p[pos] != '>')
 		pos++;
@@ -616,7 +620,28 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 				free(key);
 				break;
 			}
-			json_object_object_add(args, key, json_object_new_string_len(p + vstart, (int)vlen));
+			const char *vptr = p + vstart;
+			size_t		vraw = vlen;
+			while (vraw > 0 && isspace((unsigned char)*vptr)) {
+				vptr++;
+				vraw--;
+			}
+			while (vraw > 0 && isspace((unsigned char)vptr[vraw - 1]))
+				vraw--;
+			json_object *val = NULL;
+			if (vraw > 0 && (vptr[0] == '{' || vptr[0] == '[')) {
+				json_tokener *tk	 = json_tokener_new();
+				json_object	 *parsed = json_tokener_parse_ex(tk, vptr, (int)vraw);
+				if (json_tokener_get_error(tk) == json_tokener_success && parsed) {
+					val = parsed;
+				} else if (parsed) {
+					json_object_put(parsed);
+				}
+				json_tokener_free(tk);
+			}
+			if (!val)
+				val = json_object_new_string_len(vptr, (int)vraw);
+			json_object_object_add(args, key, val);
 			free(key);
 			pos += clen;
 		} else {
