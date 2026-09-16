@@ -158,10 +158,60 @@ static void test_range_cap(void) {
 	record_jinja("jinja.small_range_unaffected", ok && strcmp(out, "012") == 0, "");
 }
 
+static void test_for_over_dict(void) {
+	jinja_value *g = mk_globals(NULL, NULL);
+	jinja_value *d = jinja_dict();
+	jinja_dict_set(d, "one", jinja_string("1"));
+	jinja_dict_set(d, "two", jinja_string("2"));
+	jinja_dict_set(d, "three", jinja_string("3"));
+	jinja_dict_set(g, "d", d);
+
+	char out[256];
+	int	 ok	   = render_ok("{% for k in d %}{{ k }},{% endfor %}", g, out, sizeof(out));
+	int	 match = ok && strcmp(out, "three,two,one,") == 0;
+	record_jinja("jinja.for_over_dict_keys", match, "dict keys -> '%s'", out);
+}
+
+static void test_for_over_string(void) {
+	jinja_value *g = mk_globals("s", jinja_string("abc"));
+	char		 out[256];
+	int			 ok	   = render_ok("{% for c in s %}[{{ c }}]{% endfor %}", g, out, sizeof(out));
+	int			 match = ok && strcmp(out, "[a][b][c]") == 0;
+	record_jinja("jinja.for_over_string_chars", match, "string chars -> '%s'", out);
+}
+
+static void test_loop_prev_next(void) {
+	jinja_value *g	   = mk_globals(NULL, NULL);
+	jinja_value *items = jinja_list();
+	jinja_list_append(items, jinja_string("a"));
+	jinja_list_append(items, jinja_string("b"));
+	jinja_list_append(items, jinja_string("c"));
+	jinja_dict_set(g, "items", items);
+
+	char out[256];
+	int	 ok = render_ok(
+		"{% for x in items %}{{ x }}|{{ loop.previtem }}|{{ loop.nextitem }},{% endfor %}", g, out,
+		sizeof(out));
+	int match = ok && strcmp(out, "a||b,b|a|c,c|b|,") == 0;
+	record_jinja("jinja.loop_prev_next", match, "prev/next items -> '%s'", out);
+}
+
+static void test_for_over_empty_dict(void) {
+	jinja_value *g = mk_globals("d", jinja_dict());
+	char		 out[256];
+	int			 ok	   = render_ok("A{% for k in d %}[{{ k }}]{% endfor %}B", g, out, sizeof(out));
+	int			 match = ok && strcmp(out, "AB") == 0;
+	record_jinja("jinja.for_over_empty_dict", match, "empty dict -> '%s'", out);
+}
+
 void run_jinja_tests(void) {
 	test_replace_method();
 	test_is_null();
 	test_for_over_unbound();
+	test_for_over_dict();
+	test_for_over_string();
+	test_loop_prev_next();
+	test_for_over_empty_dict();
 	test_set_in_for_scope();
 	test_depth_cap();
 	test_range_cap();

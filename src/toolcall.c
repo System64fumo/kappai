@@ -4,10 +4,13 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+static atomic_ullong g_call_seq = ATOMIC_VAR_INIT(0);
 
 struct toolcall_scanner {
 	const marker_pair *fmt;
@@ -217,7 +220,6 @@ static int cc_array(cc_lex *s, int depth, json_object **out) {
 	if (!cc_lit(s, "["))
 		return 0;
 	json_object *arr = json_object_new_array();
-	size_t		 n	 = 0;
 	cc_ws(s);
 	if (cc_peek(s) == ']') {
 		s->pos++;
@@ -231,11 +233,7 @@ static int cc_array(cc_lex *s, int depth, json_object **out) {
 			json_object_put(arr);
 			return 0;
 		}
-		if (val)
-			json_object_array_add(arr, val);
-		else
-			json_object_array_put_idx(arr, n, NULL);
-		n++;
+		json_object_array_add(arr, val ? val : json_object_new_null());
 		cc_ws(s);
 		if (cc_lit(s, ",")) {
 			cc_ws(s);
@@ -289,6 +287,8 @@ static int payload_callcolon(const char *p, size_t len, size_t pos, char **name_
 	cc_ws(&s);
 	if (!cc_lit(&s, "call:"))
 		return 0;
+
+	cc_ws(&s);
 	size_t nstart = s.pos;
 	while (s.pos < s.len && s.p[s.pos] != '{' && !isspace((unsigned char)s.p[s.pos]))
 		s.pos++;
@@ -327,11 +327,18 @@ static json_object *json_slice(const char *s, size_t len, size_t *used) {
 
 static json_object *json_args_of(json_object *obj) {
 	json_object *jargs = NULL;
-	if (obj &&
-		(json_object_object_get_ex(obj, "arguments", &jargs) ||
-		 json_object_object_get_ex(obj, "parameters", &jargs)) &&
-		json_object_is_type(jargs, json_type_object))
-		return json_object_get(jargs);
+	if (!obj)
+		return json_object_new_object();
+	if (json_object_object_get_ex(obj, "arguments", &jargs) ||
+		json_object_object_get_ex(obj, "parameters", &jargs)) {
+		if (json_object_is_type(jargs, json_type_object))
+			return json_object_get(jargs);
+		if (json_object_is_type(jargs, json_type_string)) {
+			json_object *parsed = json_tokener_parse(json_object_get_string(jargs));
+			if (parsed)
+				return parsed;
+		}
+	}
 	return json_object_new_object();
 }
 
@@ -463,12 +470,16 @@ static int payload_funcargs(const char *p, size_t len, size_t pos, char **name_o
 	while (pos < len && isspace((unsigned char)p[pos]))
 		pos++;
 	size_t nstart = pos;
-	while (pos < len && p[pos] != '(' && !isspace((unsigned char)p[pos]))
-		pos++;
-	size_t nend = pos;
 	while (pos < len && p[pos] != '(')
 		pos++;
-	if (pos >= len || nend == nstart)
+	if (pos >= len)
+		return 0;
+	size_t nend = pos;
+	while (nend > nstart && isspace((unsigned char)p[nend - 1]))
+		nend--;
+	while (nstart < nend && isspace((unsigned char)p[nstart]))
+		nstart++;
+	if (nend == nstart)
 		return 0;
 	pos++;
 	char *name = xmalloc(nend - nstart + 1);
@@ -780,8 +791,10 @@ static void emit_content(toolcall_scanner *sc, size_t from, size_t to) {
 static void record_call(toolcall_scanner *sc, const char *name, json_object *args) {
 	json_object *tc = json_object_new_object();
 	json_object_object_add(tc, "index", json_object_new_int((int)sc->n_calls));
-	char idbuf[48];
-	snprintf(idbuf, sizeof(idbuf), "call_%llx%03zu", (unsigned long long)time(NULL), sc->n_calls);
+	uint64_t seq = atomic_fetch_add_explicit(&g_call_seq, 1, memory_order_relaxed);
+	char	 idbuf[64];
+	snprintf(idbuf, sizeof(idbuf), "call_%llx_%016llx%03zu", (unsigned long long)time(NULL),
+			 (unsigned long long)seq, sc->n_calls);
 	json_object_object_add(tc, "id", json_object_new_string(idbuf));
 	json_object_object_add(tc, "type", json_object_new_string("function"));
 	json_object *fn = json_object_new_object();
@@ -962,6 +975,10 @@ static void advance(toolcall_scanner *sc) {
 			continue;
 		}
 	}
+	WARN("toolcall scanner: iteration guard fired (input likely malformed; "
+		 "fmt payload=%d in_call=%d scan_pos=%zu buf_len=%zu content_len=%zu)",
+		 (int)fmt->payload, (int)sc->in_call, sc->scan_pos, sc->buf.len,
+		 sc->content ? sc->content->len : (size_t)0);
 }
 
 void toolcall_scanner_feed_capture(toolcall_scanner *sc, const char *piece, size_t n) {

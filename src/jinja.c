@@ -2614,6 +2614,7 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 				break;
 			}
 		}
+		(void)key_list;
 		return;
 	}
 	case ST_SET: {

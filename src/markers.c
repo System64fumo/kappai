@@ -9,8 +9,7 @@ static const marker_pair marker_pairs[] = {
 	{"<start_of_thought>", "<|end_of_thought|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
 
 	{"<|tool_call>", "<tool_call|>", MARKER_TOOL_CALL, PAYLOAD_CALLCOLON, "<|tool_response>", NULL},
-	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLARGS, NULL,
-	 "<arg_key>"},
+	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLARGS, NULL, "<arg_key>"},
 	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, NULL, NULL},
 	{"<|tool_call_start|>", "<|tool_call_end|>", MARKER_TOOL_CALL, PAYLOAD_FUNCARGS,
 	 "<|tool_call_end|>", NULL},
@@ -66,15 +65,4 @@ const marker_pair *marker_probe(const tokenizer *tok, marker_role role) {
 
 const marker_pair *marker_probe_text(const char *text, marker_role role) {
 	return probe(NULL, text, role);
-}
-
-const marker_pair *marker_find_open(const char *open) {
-	if (!open)
-		return NULL;
-	size_t			   n   = 0;
-	const marker_pair *all = marker_registry(&n);
-	for (size_t i = 0; i < n; i++)
-		if (strcmp(all[i].open, open) == 0)
-			return &all[i];
-	return NULL;
 }
