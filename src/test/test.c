@@ -24,6 +24,8 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	flush_family(OPFAM_ORCHESTRATION);
 	run_moe_stream_tests();
 	flush_family(OPFAM_MOE_STREAM);
+	run_toolcall_tests();
+	flush_family(OPFAM_TOOLCALL);
 
 	int run_all = wants_all(argc, argv);
 	int any_run = 0;

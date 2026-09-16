@@ -74,6 +74,7 @@ typedef enum {
 	OPFAM_HYBRID_STATE,
 	OPFAM_ORCHESTRATION,
 	OPFAM_MOE_STREAM,
+	OPFAM_TOOLCALL,
 	OPFAM_COUNT
 } op_family;
 
@@ -148,6 +149,7 @@ void		run_jinja_tests(void);
 void		run_hybrid_state_tests(backend *cpu);
 void		run_orchestration_tests(void);
 void		run_moe_stream_tests(void);
+void		run_toolcall_tests(void);
 void		test_quant_determinism(const qtype_info *qt);
 void		test_quant_finiteness(const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(void);

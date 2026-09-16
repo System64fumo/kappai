@@ -872,10 +872,10 @@ int32_t *context_ids_scratch(context *c, int n) {
 	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
 }
 
-int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
-					  int max_tokens, const sampler_params						 *samp,
-					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
-					  const char *metrics_spec) {
+int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generation_prompt,
+						  int max_tokens, const sampler_params						 *samp,
+						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+						  const char *metrics_spec) {
 	if (c->session_poisoned) {
 		ERROR("session state is inconsistent after an earlier failed turn; "
 			  "context_reset() required");
@@ -888,8 +888,8 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 
 	char *prev_render = xstrdup(c->chat.last_render);
 
-	if (chat_template_add_turn(&c->chat, role, content, add_generation_prompt, &turn_str, errbuf,
-							   sizeof(errbuf)) != OK) {
+	if (chat_template_add_turn_ex(&c->chat, msg, add_generation_prompt, &turn_str, errbuf,
+								  sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
 		free(prev_render);
 		return -1;
@@ -953,9 +953,9 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 		c->chat.last_render = prev_render;
 		prev_render			= NULL;
 	} else if (add_generation_prompt && generated > 0) {
-		char *discard;
-		if (chat_template_add_turn(&c->chat, "assistant", acap.buf ? acap.buf : "", 0, &discard,
-								   errbuf, sizeof(errbuf)) == OK)
+		char		*discard;
+		chat_message am = {.role = (char *)"assistant", .content = acap.buf ? acap.buf : ""};
+		if (chat_template_add_turn_ex(&c->chat, &am, 0, &discard, errbuf, sizeof(errbuf)) == OK)
 			free(discard);
 		else if (!c->session_poisoned) {
 			ERROR("failed to record assistant turn; session poisoned");
@@ -994,6 +994,16 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	free(prev_render);
 	free(acap.buf);
 	return generated;
+}
+
+int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
+					  int max_tokens, const sampler_params						 *samp,
+					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+					  const char *metrics_spec) {
+	chat_message m = {.role	   = (char *)(role ? role : "user"),
+					  .content = (char *)(content ? content : "")};
+	return context_chat_turn_msg(c, &m, add_generation_prompt, max_tokens, samp, on_token, ud,
+								 metrics_spec);
 }
 
 int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,

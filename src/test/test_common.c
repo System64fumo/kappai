@@ -80,6 +80,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_HYBRID_STATE]	 = "hybrid_state",
 		[OPFAM_ORCHESTRATION]	 = "orchestration",
 		[OPFAM_MOE_STREAM]		 = "moe_stream",
+		[OPFAM_TOOLCALL]		 = "toolcall",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";
