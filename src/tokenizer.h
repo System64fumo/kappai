@@ -83,5 +83,6 @@ int		tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int
 										size_t max_bytes);
 int		tokenizer_is_eog(const tokenizer *t, int32_t id);
 int32_t tokenizer_find_token(const tokenizer *t, const char *text);
+int		tokenizer_starts_with_special(const tokenizer *t, const char *s);
 
 #endif

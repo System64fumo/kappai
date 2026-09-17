@@ -5,6 +5,50 @@
 #include <ctype.h>
 #include <string.h>
 
+static char *patch_template_source(const char *src) {
+	const char *marker		= "last_query_index=messages|length - 1";
+	const char *replacement = "last_query_index=0";
+	const char *update_line = "{%- set ns.last_query_index = index %}";
+
+	char *patched = xstrdup(src);
+
+	char *pos = strstr(patched, marker);
+	if (pos) {
+		size_t marker_len = strlen(marker);
+		size_t repl_len	  = strlen(replacement);
+		char  *new_str	  = xmalloc(strlen(patched) - marker_len + repl_len + 1);
+		size_t before	  = pos - patched;
+		memcpy(new_str, patched, before);
+		memcpy(new_str + before, replacement, repl_len);
+		memcpy(new_str + before + repl_len, pos + marker_len, strlen(pos + marker_len) + 1);
+		free(patched);
+		patched = new_str;
+		DEBUG("chat_template: patched last_query_index to stable value 0");
+	}
+
+	pos = strstr(patched, update_line);
+	if (pos) {
+		char *line_start = pos;
+		while (line_start > patched && line_start[-1] != '\n')
+			line_start--;
+		char *line_end = pos + strlen(update_line);
+		while (*line_end && *line_end != '\n')
+			line_end++;
+		if (*line_end == '\n')
+			line_end++;
+		size_t before_len = line_start - patched;
+		size_t after_len  = strlen(line_end);
+		char  *new_str	  = xmalloc(before_len + after_len + 1);
+		memcpy(new_str, patched, before_len);
+		memcpy(new_str + before_len, line_end, after_len + 1);
+		free(patched);
+		patched = new_str;
+		DEBUG("chat_template: removed last_query_index update from scan loop");
+	}
+
+	return patched;
+}
+
 static jinja_value *json_to_jinja(const json_object *jo) {
 	if (!jo || json_object_is_type(jo, json_type_null))
 		return jinja_none();
@@ -109,8 +153,11 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 		return ERR_NOT_FOUND;
 	}
 
+	char *tmpl_src_patched = patch_template_source(tmpl_src);
+
 	char errbuf[512];
-	cts->prog = jinja_compile(tmpl_src, errbuf, sizeof(errbuf));
+	cts->prog = jinja_compile(tmpl_src_patched, errbuf, sizeof(errbuf));
+	free(tmpl_src_patched);
 	if (!cts->prog) {
 		ERROR("failed to compile tokenizer.chat_template: %s", errbuf);
 		return ERR_FORMAT;
@@ -199,6 +246,8 @@ static char *strip_thinking_spans(chat_template_state *cts, const char *content)
 		return xstrdup("");
 	if (!cts->think_start_text || !cts->think_end_text)
 		return xstrdup(content);
+	if (cts->keep_thinking_in_history)
+		return xstrdup(content);
 
 	const size_t slen = strlen(cts->think_start_text);
 	const size_t elen = strlen(cts->think_end_text);
@@ -231,7 +280,7 @@ void chat_template_add_message(chat_template_state *cts, const char *role, const
 
 void chat_template_add_message_ex(chat_template_state *cts, const chat_message *msg) {
 	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
-	char		 *clean = strip_thinking_spans(cts, msg->content);
+	char		 *clean = strip_thinking_spans(cts, msg->content ? msg->content : "");
 	chat_message *dst	= &cts->messages[cts->n_messages];
 	memset(dst, 0, sizeof(*dst));
 	dst->role			   = xstrdup(msg->role ? msg->role : "");
@@ -243,6 +292,20 @@ void chat_template_add_message_ex(chat_template_state *cts, const chat_message *
 	cts->n_messages++;
 }
 
+static void message_to_jinja(jinja_value *m, const chat_message *msg) {
+	jinja_dict_set(m, "role", jinja_string(msg->role ? msg->role : ""));
+	jinja_dict_set(m, "content", jinja_string(msg->content ? msg->content : ""));
+	if (msg->reasoning_content)
+		jinja_dict_set(m, "reasoning_content", jinja_string(msg->reasoning_content));
+
+	if (msg->tool_calls)
+		jinja_dict_set(m, "tool_calls", tool_calls_to_jinja(msg->tool_calls));
+	if (msg->tool_call_id)
+		jinja_dict_set(m, "tool_call_id", jinja_string(msg->tool_call_id));
+	if (msg->name)
+		jinja_dict_set(m, "name", jinja_string(msg->name));
+}
+
 static jinja_value *build_globals(chat_template_state *cts, const chat_message *extra,
 								  size_t n_extra, int add_generation_prompt) {
 	jinja_value *g	  = jinja_dict();
@@ -250,31 +313,12 @@ static jinja_value *build_globals(chat_template_state *cts, const chat_message *
 
 	for (size_t i = 0; i < cts->n_messages; i++) {
 		jinja_value *m = jinja_dict();
-		jinja_dict_set(m, "role", jinja_string(cts->messages[i].role));
-		jinja_dict_set(m, "content", jinja_string(cts->messages[i].content));
-		if (cts->messages[i].reasoning_content)
-			jinja_dict_set(m, "reasoning_content",
-						   jinja_string(cts->messages[i].reasoning_content));
-		if (cts->messages[i].tool_calls)
-			jinja_dict_set(m, "tool_calls", tool_calls_to_jinja(cts->messages[i].tool_calls));
-		if (cts->messages[i].tool_call_id)
-			jinja_dict_set(m, "tool_call_id", jinja_string(cts->messages[i].tool_call_id));
-		if (cts->messages[i].name)
-			jinja_dict_set(m, "name", jinja_string(cts->messages[i].name));
+		message_to_jinja(m, &cts->messages[i]);
 		jinja_list_append(msgs, m);
 	}
 	for (size_t i = 0; i < n_extra; i++) {
 		jinja_value *m = jinja_dict();
-		jinja_dict_set(m, "role", jinja_string(extra[i].role));
-		jinja_dict_set(m, "content", jinja_string(extra[i].content));
-		if (extra[i].reasoning_content)
-			jinja_dict_set(m, "reasoning_content", jinja_string(extra[i].reasoning_content));
-		if (extra[i].tool_calls)
-			jinja_dict_set(m, "tool_calls", tool_calls_to_jinja(extra[i].tool_calls));
-		if (extra[i].tool_call_id)
-			jinja_dict_set(m, "tool_call_id", jinja_string(extra[i].tool_call_id));
-		if (extra[i].name)
-			jinja_dict_set(m, "name", jinja_string(extra[i].name));
+		message_to_jinja(m, &extra[i]);
 		jinja_list_append(msgs, m);
 	}
 

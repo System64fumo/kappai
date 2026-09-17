@@ -35,6 +35,8 @@ typedef struct {
 	const char *think_end_text;
 	bool		think_open;
 
+	bool keep_thinking_in_history;
+
 	const marker_pair *tool_fmt;
 
 	json_object *tools;

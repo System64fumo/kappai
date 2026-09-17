@@ -176,17 +176,22 @@ jinja_value *jinja_list(void) {
 }
 
 void jinja_dict_set(jinja_value *d, const char *key, jinja_value *val) {
+	jinja_dict_entry *last = NULL;
 	for (jinja_dict_entry *e = d->as.dict; e; e = e->next) {
 		if (!strcmp(e->key, key)) {
 			e->val = val;
 			return;
 		}
+		last = e;
 	}
 	jinja_dict_entry *e = xmalloc(sizeof(*e));
 	e->key				= xstrdup(key);
 	e->val				= val;
-	e->next				= d->as.dict;
-	d->as.dict			= e;
+	e->next				= NULL;
+	if (last)
+		last->next = e;
+	else
+		d->as.dict = e;
 }
 
 void jinja_list_append(jinja_value *l, jinja_value *val) {

@@ -199,6 +199,7 @@ status_code context_init(context *c, const config *cfg) {
 		ERROR("failed to init chat template");
 		goto fail_tokenizer;
 	}
+	c->chat.keep_thinking_in_history = c->m.arch_info && c->m.arch_info->is_hybrid_recurrent;
 
 	int n_ctx = cfg->ctx_size;
 	if (n_ctx <= 0)
@@ -900,34 +901,51 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	int32_t *ids = context_ids_scratch(c, c->n_ctx + 1);
 
 	profile_reset(&c->scratch.prof);
-	int n = tokenizer_encode_with_specials(&c->tok, c->chat.last_render, 0, ids, c->n_ctx,
-										   &c->scratch.prof);
-	if (n < 0) {
-		ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
-		free(c->chat.last_render);
-		c->chat.last_render = prev_render;
-		return -1;
-	}
-
+	size_t prev_len = strlen(prev_render);
+	size_t new_len	= strlen(c->chat.last_render);
+	int	   n		= -1;
 	fed_ids_sync(c);
-	int32_t reuse	   = 0;
-	int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
-	while (reuse < common_max && c->fed_ids.p[reuse] == ids[reuse])
-		reuse++;
-	if (reuse < c->fed_ids.n) {
-		if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent) {
-			ERROR("transcript no longer extends the cached stream; recurrent "
-				  "state cannot be rewound -- session poisoned, context_reset() "
-				  "required");
-			c->session_poisoned = true;
-			free(prev_render);
+	int32_t reuse = 0;
+	int		fast  = 0;
+	if (prev_len > 0 && new_len >= prev_len &&
+		memcmp(c->chat.last_render, prev_render, prev_len) == 0 &&
+		tokenizer_starts_with_special(&c->tok, c->chat.last_render + prev_len)) {
+		const char *suffix = c->chat.last_render + prev_len;
+		if (c->fed_ids.n > 0)
+			memcpy(ids, c->fed_ids.p, (size_t)c->fed_ids.n * sizeof(int32_t));
+		int suf = tokenizer_encode_with_specials(&c->tok, suffix, 0, ids + c->fed_ids.n,
+												 c->n_ctx - c->fed_ids.n, &c->scratch.prof);
+		if (suf < 0) {
+			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
+			free(c->chat.last_render);
+			c->chat.last_render = prev_render;
 			return -1;
 		}
+		n	  = c->fed_ids.n + suf;
+		reuse = c->fed_ids.n;
+		fast  = 1;
+		DEBUG("prefix reuse: %d of %d prompt tokens already cached (incremental, no refeed)",
+			  (int)reuse, n);
+	} else {
+		n = tokenizer_encode_with_specials(&c->tok, c->chat.last_render, 0, ids, c->n_ctx,
+										   &c->scratch.prof);
+		if (n < 0) {
+			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
+			free(c->chat.last_render);
+			c->chat.last_render = prev_render;
+			return -1;
+		}
+
+		int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
+		while (reuse < common_max && c->fed_ids.p[reuse] == ids[reuse])
+			reuse++;
+	}
+	if (reuse < c->fed_ids.n) {
 		DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
 			  (int)c->fed_ids.n);
 		c->fed_ids.n = reuse;
 		c->kv.n_pos	 = reuse;
-	} else {
+	} else if (!fast) {
 		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
 	}
 
@@ -953,14 +971,45 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 		c->chat.last_render = prev_render;
 		prev_render			= NULL;
 	} else if (add_generation_prompt && generated > 0) {
-		char		*discard;
-		chat_message am = {.role = (char *)"assistant", .content = acap.buf ? acap.buf : ""};
+		char	   *discard;
+		char	   *rec_content	  = NULL;
+		char	   *rec_reasoning = NULL;
+		const char *raw			  = acap.buf ? acap.buf : "";
+		const char *end_txt		  = c->chat.think_end_text;
+		const char *st_txt		  = c->chat.think_start_text;
+		if (end_txt && end_txt[0]) {
+			const char *e = strstr(raw, end_txt);
+			if (e) {
+				const char *rstart = raw;
+				if (st_txt && st_txt[0] && strncmp(rstart, st_txt, strlen(st_txt)) == 0) {
+					rstart += strlen(st_txt);
+					if (*rstart == '\n')
+						rstart++;
+				}
+				size_t rlen	  = (size_t)(e - rstart);
+				rec_reasoning = xmalloc(rlen + 1);
+				memcpy(rec_reasoning, rstart, rlen);
+				rec_reasoning[rlen] = '\0';
+				const char *cstart	= e + strlen(end_txt);
+				while (*cstart == '\n')
+					cstart++;
+				rec_content = xstrdup(cstart);
+			}
+		}
+		if (!rec_content) {
+			rec_content = xstrdup(raw);
+		}
+		chat_message am = {.role			  = (char *)"assistant",
+						   .content			  = rec_content,
+						   .reasoning_content = rec_reasoning};
 		if (chat_template_add_turn_ex(&c->chat, &am, 0, &discard, errbuf, sizeof(errbuf)) == OK)
 			free(discard);
 		else if (!c->session_poisoned) {
 			ERROR("failed to record assistant turn; session poisoned");
 			c->session_poisoned = true;
 		}
+		free(rec_content);
+		free(rec_reasoning);
 	}
 
 	if (!c->session_poisoned && !c->interrupt && generated >= 0 &&

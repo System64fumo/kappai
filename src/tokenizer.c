@@ -1317,6 +1317,13 @@ int32_t tokenizer_find_token(const tokenizer *t, const char *text) {
 	return -1;
 }
 
+int tokenizer_starts_with_special(const tokenizer *t, const char *s) {
+	if (!t || !s || !s[0])
+		return 0;
+	size_t at = 0;
+	return find_next_special(t, s, strlen(s), 0, &at) >= 0 && at == 0;
+}
+
 int tokenizer_encode_with_specials(tokenizer *t, const char *text, int add_specials,
 								   int32_t *out_ids, int max_out, profile *prof) {
 	profile_scope ps	  = profile_begin(prof, STAGE_TOKENIZE_ENCODE);
