@@ -2613,6 +2613,149 @@ static status_code cpu_scale_inplace(backend *self, buffer *x, float scale, int 
 	return OK;
 }
 
+__attribute__((weak)) void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_softcap_job *j		 = ctx;
+	float			*x		 = j->x;
+	float			 inv_cap = j->inv_cap;
+	float			 cap	 = j->cap;
+	for (int i = begin; i < end; i++)
+		x[i] = cap * tanhf(x[i] * inv_cap);
+}
+
+static status_code cpu_softcap(backend *self, buffer *x, float cap, int n) {
+	if (cap <= 0.0f || n <= 0)
+		return OK;
+	cpu_priv	   *p		= self->priv;
+	float		   *xf		= cpu_ptr(x);
+	float			inv_cap = 1.0f / cap;
+	cpu_softcap_job job		= {.x = xf, .n = n, .inv_cap = inv_cap, .cap = cap};
+	tpool		   *pool	= p ? p->pool : NULL;
+	int				cur_tid = tpool_current_tid();
+	if (pool && cur_tid < 0 && tpool_n_threads(pool) > 1 && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
+		tpool_parallel_for(pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_softcap_chunk, &job);
+	} else {
+		cpu_softcap_chunk(0, n, cur_tid, &job);
+	}
+	return OK;
+}
+
+__attribute__((weak)) void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_split_qgate_job *j			  = ctx;
+	int					 q_out		  = j->n_heads * j->head_dim;
+	int					 mixed_stride = 2 * q_out;
+	for (int row = begin; row < end; row++) {
+		const float *src = j->mixed + (size_t)row * mixed_stride;
+		float		*qd	 = j->q + (size_t)row * q_out;
+		float		*gd	 = j->gate + (size_t)row * q_out;
+		for (int h = 0; h < j->n_heads; h++, src += 2 * j->head_dim) {
+			for (int jj = 0; jj < j->head_dim; jj++) {
+				qd[jj] = src[jj];
+				gd[jj] = src[jj + j->head_dim];
+			}
+			qd += j->head_dim;
+			gd += j->head_dim;
+		}
+	}
+}
+
+static status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+								   int n_heads, int head_dim, int n_rows) {
+	(void)self;
+	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
+		return OK;
+	cpu_split_qgate_job job		= {.mixed	 = cpu_ptr(mixed),
+								   .q		 = cpu_ptr(q),
+								   .gate	 = cpu_ptr(gate),
+								   .n_heads	 = n_heads,
+								   .head_dim = head_dim,
+								   .n_rows	 = n_rows};
+	cpu_priv		   *p		= self->priv;
+	tpool			   *pool	= p ? p->pool : NULL;
+	int					cur_tid = tpool_current_tid();
+	if (pool && cur_tid < 0 && n_rows >= 2)
+		tpool_parallel_for(pool, n_rows, 1, cpu_split_qgate_chunk, &job);
+	else
+		cpu_split_qgate_chunk(0, n_rows, cur_tid, &job);
+	return OK;
+}
+
+__attribute__((weak)) void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_attn_output_gate_job *j = ctx;
+	int						  n = j->n;
+	for (int row = begin; row < end; row++) {
+		float		*o = j->out + (size_t)row * n;
+		const float *g = j->gate + (size_t)row * n;
+		for (int i = 0; i < n; i++)
+			o[i] *= sigmoidf(g[i]);
+	}
+}
+
+static status_code cpu_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
+										int n_rows) {
+	(void)self;
+	if (n <= 0 || n_rows <= 0)
+		return OK;
+	cpu_attn_output_gate_job job = {
+		.out = cpu_ptr(out), .gate = cpu_ptr(gate), .n = n, .n_rows = n_rows};
+	cpu_priv *p		  = self->priv;
+	tpool	 *pool	  = p ? p->pool : NULL;
+	int		  cur_tid = tpool_current_tid();
+	if (pool && cur_tid < 0 && n_rows >= 2)
+		tpool_parallel_for(pool, n_rows, 1, cpu_attn_output_gate_chunk, &job);
+	else
+		cpu_attn_output_gate_chunk(0, n_rows, cur_tid, &job);
+	return OK;
+}
+
+__attribute__((weak)) void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_partial_rope_qk_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
+		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
+		rope_rotate_neox(j->q + (size_t)row * j->qn, j->n_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+		rope_rotate_neox(j->k + (size_t)row * j->kn, j->n_kv_heads, j->head_dim, j->rope_dim, cosv,
+						 sinv);
+	}
+}
+
+static status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
+									   int n_kv_heads, int head_dim, int rope_dim, int pos_start,
+									   const float *rope_cos_base, const float *rope_sin_base,
+									   int n_rows) {
+	(void)self;
+	if (n_rows <= 0 || rope_dim <= 0)
+		return OK;
+	int						qn		= n_heads * head_dim;
+	int						kn		= n_kv_heads * head_dim;
+	int						half	= rope_dim / 2;
+	cpu_partial_rope_qk_job job		= {.q		   = cpu_ptr(q),
+									   .k		   = cpu_ptr(k),
+									   .cos_base   = rope_cos_base,
+									   .sin_base   = rope_sin_base,
+									   .qn		   = qn,
+									   .kn		   = kn,
+									   .half	   = half,
+									   .rope_dim   = rope_dim,
+									   .n_heads	   = n_heads,
+									   .n_kv_heads = n_kv_heads,
+									   .head_dim   = head_dim,
+									   .pos0	   = pos_start,
+									   .n_rows	   = n_rows};
+	cpu_priv			   *p		= self->priv;
+	tpool				   *pool	= p ? p->pool : NULL;
+	int						cur_tid = tpool_current_tid();
+	if (pool && cur_tid < 0 && n_rows >= 2)
+		tpool_parallel_for(pool, n_rows, 1, cpu_partial_rope_qk_chunk, &job);
+	else
+		cpu_partial_rope_qk_chunk(0, n_rows, cur_tid, &job);
+	return OK;
+}
+
 static status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
 								   float combine_scale) {
 	(void)self;
@@ -2745,6 +2888,10 @@ static status_code cpu_ctor(backend *out) {
 	out->attention_swa_batch			 = cpu_attention_swa_batch;
 	out->rmsnorm_add					 = cpu_rmsnorm_add;
 	out->scale_inplace					 = cpu_scale_inplace;
+	out->softcap						 = cpu_softcap;
+	out->split_qgate					 = cpu_split_qgate;
+	out->attn_output_gate				 = cpu_attn_output_gate;
+	out->partial_rope_qk				 = cpu_partial_rope_qk;
 	out->ple_combine					 = cpu_ple_combine;
 	out->matmul_ffn_down				 = cpu_matmul_ffn_down;
 	out->kv_free						 = cpu_kv_free;

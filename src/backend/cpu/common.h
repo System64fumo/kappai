@@ -217,6 +217,32 @@ typedef struct {
 	int			 activation;
 } cpu_ffn_act_batch_job;
 
+typedef struct {
+	float *x;
+	int	   n;
+	float  inv_cap;
+	float  cap;
+} cpu_softcap_job;
+
+typedef struct {
+	const float *mixed;
+	float		*q, *gate;
+	int			 n_heads, head_dim, n_rows;
+} cpu_split_qgate_job;
+
+typedef struct {
+	float		*out;
+	const float *gate;
+	int			 n, n_rows;
+} cpu_attn_output_gate_job;
+
+typedef struct {
+	float		*q, *k;
+	const float *cos_base, *sin_base;
+	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim;
+	int			 pos0, n_rows;
+} cpu_partial_rope_qk_job;
+
 static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {
 	if (tpool_current_tid() < 0 && pool && m >= 2)
 		tpool_parallel_for(pool, m, 1, chunk, job);

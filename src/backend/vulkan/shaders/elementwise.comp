@@ -7,7 +7,7 @@ layout(set = 0, binding = 0) buffer DstBuf {
 layout(set = 0, binding = 1) readonly buffer Src1Buf {
 	mediump float src1[];
 };
-layout(set = 0, binding = 2) readonly buffer Src2Buf {
+layout(set = 0, binding = 2) buffer Src2Buf {
 	mediump float src2[];
 };
 
@@ -24,6 +24,9 @@ params;
 #define MODE_ADD_INPLACE 1
 #define MODE_SCALE_INPLACE 2
 #define MODE_PLE_COMBINE 3
+#define MODE_SOFTCAP 4
+#define MODE_SPLIT_QGATE 5
+#define MODE_ATTN_OUTPUT_GATE 6
 
 void main() {
 	uint row = gl_WorkGroupID.y;
@@ -46,6 +49,21 @@ void main() {
 		break;
 	case MODE_PLE_COMBINE:
 		dst[row_off + i] = (dst[row_off + i] + src1[row_off + i]) * params.scale;
+		break;
+	case MODE_SOFTCAP:
+		dst[row_off + i] = params.scale * tanh(dst[row_off + i] / params.scale);
+		break;
+	case MODE_SPLIT_QGATE: {
+		uint head_dim_v	  = uint(params._pad);
+		uint within_head  = i % head_dim_v;
+		uint flat_idx	  = row_off + i;
+		uint mixed_idx	  = 2u * flat_idx - within_head;
+		dst[row_off + i]  = src1[mixed_idx];
+		src2[row_off + i] = src1[mixed_idx + head_dim_v];
+		break;
+	}
+	case MODE_ATTN_OUTPUT_GATE:
+		dst[row_off + i] = dst[row_off + i] * (1.0 / (1.0 + exp(-src1[row_off + i])));
 		break;
 	default:
 		break;

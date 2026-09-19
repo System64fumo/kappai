@@ -28,10 +28,13 @@
 #define VK_RING_DEPTH 4
 
 enum elem_mode {
-	ELEM_MODE_COPY			= 0,
-	ELEM_MODE_ADD_INPLACE	= 1,
-	ELEM_MODE_SCALE_INPLACE = 2,
-	ELEM_MODE_PLE_COMBINE	= 3,
+	ELEM_MODE_COPY			   = 0,
+	ELEM_MODE_ADD_INPLACE	   = 1,
+	ELEM_MODE_SCALE_INPLACE	   = 2,
+	ELEM_MODE_PLE_COMBINE	   = 3,
+	ELEM_MODE_SOFTCAP		   = 4,
+	ELEM_MODE_SPLIT_QGATE	   = 5,
+	ELEM_MODE_ATTN_OUTPUT_GATE = 6,
 };
 
 typedef struct {
@@ -4686,6 +4689,70 @@ static status_code vk_scale_inplace(backend *self, buffer *x, float scale, int n
 							 groups, 1, 0x1);
 }
 
+static status_code vk_softcap(backend *self, buffer *x, float cap, int n) {
+	vk_priv *p = self->priv;
+	if (cap <= 0.0f || n <= 0)
+		return OK;
+	if (!p->p_elementwise_batch.pipeline)
+		return ERR_UNSUPPORTED;
+	struct {
+		int32_t n, mode;
+		float	scale;
+		int32_t _pad;
+		int32_t m;
+	} push				 = {n, ELEM_MODE_SOFTCAP, cap, 0, 1};
+	vk_buf		*dummy	 = vk_dummy_buf(p);
+	vk_buf		*bufs[3] = {as_vkbuf(x), dummy, dummy};
+	VkDeviceSize offs[3] = {x->offset, 0, 0};
+	uint32_t	 groups	 = (uint32_t)((n + 127) / 128);
+	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
+							 groups, 1, 0x1);
+}
+
+static status_code vk_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+								  int n_heads, int head_dim, int n_rows) {
+	vk_priv *p = self->priv;
+	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
+		return OK;
+	if (!p->p_elementwise_batch.pipeline)
+		return ERR_UNSUPPORTED;
+
+	int n = n_heads * head_dim;
+	struct {
+		int32_t n, mode;
+		float	scale;
+		int32_t _pad;
+		int32_t m;
+	} push				  = {n, ELEM_MODE_SPLIT_QGATE, 0.0f, head_dim, n_rows};
+	vk_buf		*bufs[3]  = {as_vkbuf(q), as_vkbuf(mixed), as_vkbuf(gate)};
+	VkDeviceSize offs[3]  = {q->offset, mixed->offset, gate->offset};
+	uint32_t	 groups_x = (uint32_t)((n + 127) / 128);
+	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
+							 groups_x, (uint32_t)n_rows, 0x5);
+}
+
+static status_code vk_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
+									   int n_rows) {
+	vk_priv *p = self->priv;
+	if (n <= 0 || n_rows <= 0)
+		return OK;
+	if (!p->p_elementwise_batch.pipeline)
+		return ERR_UNSUPPORTED;
+
+	struct {
+		int32_t n, mode;
+		float	scale;
+		int32_t _pad;
+		int32_t m;
+	} push				  = {n, ELEM_MODE_ATTN_OUTPUT_GATE, 0.0f, 0, n_rows};
+	vk_buf		*dummy	  = vk_dummy_buf(p);
+	vk_buf		*bufs[3]  = {as_vkbuf(out), as_vkbuf(gate), dummy};
+	VkDeviceSize offs[3]  = {out->offset, gate->offset, 0};
+	uint32_t	 groups_x = (uint32_t)((n + 127) / 128);
+	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
+							 groups_x, (uint32_t)n_rows, 0x1);
+}
+
 static status_code vk_copy_buffer(backend *self, const buffer *src, buffer *dst, int n) {
 	vk_priv *p = self->priv;
 	if (!p->p_elementwise_batch.pipeline)
@@ -5337,6 +5404,34 @@ static status_code vk_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_h
 							 groups_x, (uint32_t)m, 0x3);
 }
 
+static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
+									  int n_kv_heads, int head_dim, int rope_dim, int pos_start,
+									  const float *rope_cos_base, const float *rope_sin_base,
+									  int n_rows) {
+	vk_priv *p = self->priv;
+	if (n_rows <= 0 || rope_dim <= 0)
+		return OK;
+	if (!p->p_rope_qk_batch.pipeline)
+		return ERR_UNSUPPORTED;
+
+	int			half = head_dim / 2;
+	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t n_heads, n_kv_heads, head_dim, pos, neox, m;
+		int32_t rope_dim;
+	} push = {n_heads, n_kv_heads, head_dim, pos_start, self->rope_neox, n_rows, rope_dim};
+	vk_buf		*bufs[4]  = {as_vkbuf(q), as_vkbuf(k), as_vkbuf(p->rope_cos_buf_active),
+							 as_vkbuf(p->rope_sin_buf_active)};
+	VkDeviceSize offs[4]  = {q->offset, k->offset, 0, 0};
+	uint32_t	 total_q  = (uint32_t)(n_heads * half);
+	uint32_t	 total_k  = (uint32_t)(n_kv_heads * half);
+	uint32_t	 groups_x = (total_q + total_k + 63) / 64;
+	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
+							 groups_x, (uint32_t)n_rows, 0x3);
+}
+
 static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
 									 int pos_start, const float *rope_cos_base,
 									 const float *rope_sin_base, const float *freq_factors, int m) {
@@ -5680,6 +5775,10 @@ static status_code vk_ctor(backend *out) {
 	out->attention				   = vk_attention;
 	out->add_inplace			   = vk_add_inplace;
 	out->scale_inplace			   = vk_scale_inplace;
+	out->softcap				   = vk_softcap;
+	out->split_qgate			   = vk_split_qgate;
+	out->attn_output_gate		   = vk_attn_output_gate;
+	out->partial_rope_qk		   = vk_partial_rope_qk;
 	out->buffer_alloc_from_host	   = vk_buffer_alloc_from_host;
 	out->moe_expert_ffn			   = vk_moe_expert_ffn;
 	out->moe_experts_batch		   = vk_moe_experts_batch;

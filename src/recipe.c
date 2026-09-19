@@ -1587,39 +1587,19 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 	return st;
 }
 
-typedef struct {
-	float *logits;
-	int	   vocab;
-	float  inv_cap;
-	float  cap;
-} softcap_job;
-
-static void softcap_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	softcap_job *j = ctx;
-	for (int i = begin; i < end; i++)
-		j->logits[i] = j->cap * tanhf(j->logits[i] * j->inv_cap);
-}
-
 static status_code op_softcap(exec_ctx *ctx) {
-	float *logits_out = ctx->logits_out;
-	if (!logits_out)
-		return OK;
 	float cap = ctx->op->u.softcap.cap;
 	if (cap <= 0.0f)
 		return OK;
-	int		 vocab	 = ctx->m->vocab_size;
-	float	 inv_cap = 1.0f / cap;
-	backend *a		 = exec_layer_backend(ctx);
-	tpool	*pool	 = (a && a->get_pool) ? a->get_pool(a) : NULL;
-	if (pool && tpool_n_threads(pool) > 1 && vocab >= 2 * 4096 && tpool_current_tid() < 0) {
-		softcap_job job = {.logits = logits_out, .vocab = vocab, .inv_cap = inv_cap, .cap = cap};
-		tpool_parallel_for(pool, vocab, 4096, softcap_chunk, &job);
-		return OK;
-	}
-	for (int i = 0; i < vocab; i++)
-		logits_out[i] = cap * tanhf(logits_out[i] * inv_cap);
-	return OK;
+	backend		 *a		= exec_layer_backend(ctx);
+	profile		 *prof	= &ctx->s->prof;
+	backend		 *t		= OP_BACKEND(softcap);
+	buffer		 *lb	= exec_slot(ctx, RECIPE_SLOT_LOGITS);
+	int			  vocab = ctx->m->vocab_size;
+	profile_scope ps	= profile_begin(prof, ctx->op->stage);
+	status_code	  st	= t->softcap(t, lb, cap, vocab);
+	profile_end(prof, &ps);
+	return st;
 }
 
 static status_code op_logits_readback(exec_ctx *ctx) {
@@ -4586,167 +4566,61 @@ static status_code op_attention_mla(exec_ctx *ctx) {
 							kv_lora, cache->n_ctx, s->rope_cos, s->rope_sin, scale);
 }
 
-typedef struct {
-	const float *mixed;
-	float		*q, *gate;
-	int			 n_heads, head_dim, n_rows;
-} qwen_split_job;
-
-static void qwen_split_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	qwen_split_job *j			 = ctx;
-	int				q_out		 = j->n_heads * j->head_dim;
-	int				mixed_stride = 2 * q_out;
-	for (int row = begin; row < end; row++) {
-		const float *src = j->mixed + (size_t)row * mixed_stride;
-		float		*qd	 = j->q + (size_t)row * q_out;
-		float		*gd	 = j->gate + (size_t)row * q_out;
-		for (int h = 0; h < j->n_heads; h++, src += 2 * j->head_dim) {
-			for (int jj = 0; jj < j->head_dim; jj++) {
-				qd[jj] = src[jj];
-				gd[jj] = src[jj + j->head_dim];
-			}
-			qd += j->head_dim;
-			gd += j->head_dim;
-		}
-	}
-}
-
-static void split_qgate_rows(tpool *pool, const float *mixed, float *q, float *gate, int n_heads,
-							 int head_dim, int n_rows) {
-	qwen_split_job job = {.mixed	= mixed,
-						  .q		= q,
-						  .gate		= gate,
-						  .n_heads	= n_heads,
-						  .head_dim = head_dim,
-						  .n_rows	= n_rows};
-	if (pool && n_rows > 1 && tpool_current_tid() < 0)
-		tpool_parallel_for(pool, n_rows, 1, qwen_split_chunk, &job);
-	else
-		qwen_split_chunk(0, n_rows, -1, &job);
-}
-
 status_code op_split_qgate(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
-	model		*m		  = ctx->m;
-	int			 head_dim = m->head_dim;
-	int			 n_heads  = m->n_heads;
-	int			 n_rows	  = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
-	int			 q_out	  = n_heads * head_dim;
-	int			 mixed_n  = n_rows * 2 * q_out;
-	int			 out_n	  = n_rows * q_out;
-	const float *mixed =
-		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_PROJ, &ctx->s->hybrid_host, mixed_n);
-	float *q	= recipe_slot_write_stage(ctx, RECIPE_SLOT_Q, &ctx->s->hybrid_host2, out_n);
-	float *gate = recipe_slot_write_stage(ctx, RECIPE_SLOT_HYB_GATE, &ctx->s->hybrid_host3, out_n);
-	if (!mixed || !q || !gate)
-		return ERR_INVALID_ARG;
-	split_qgate_rows(model_get_pool(m), mixed, q, gate, n_heads, head_dim, n_rows);
-	status_code st = recipe_slot_write_commit(ctx, RECIPE_SLOT_Q, q, out_n);
-	if (st == OK)
-		st = recipe_slot_write_commit(ctx, RECIPE_SLOT_HYB_GATE, gate, out_n);
+	model		 *m		   = ctx->m;
+	backend		 *a		   = exec_layer_backend(ctx);
+	profile		 *prof	   = &ctx->s->prof;
+	backend		 *t		   = OP_BACKEND(split_qgate);
+	int			  n_heads  = m->n_heads;
+	int			  head_dim = m->head_dim;
+	int			  n_rows   = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	buffer		 *mixed	   = exec_slot(ctx, RECIPE_SLOT_HYB_PROJ);
+	buffer		 *q		   = exec_slot(ctx, RECIPE_SLOT_Q);
+	buffer		 *gate	   = exec_slot(ctx, RECIPE_SLOT_HYB_GATE);
+	profile_scope ps	   = profile_begin(prof, ctx->op->stage);
+	status_code	  st	   = t->split_qgate(t, mixed, q, gate, n_heads, head_dim, n_rows);
+	profile_end(prof, &ps);
 	return st;
-}
-
-typedef struct {
-	float		*q, *k;
-	const float *cos_base, *sin_base;
-	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim, pos0, rows;
-} qwen_rope_job;
-
-static void qwen_partial_rope_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	qwen_rope_job *j = ctx;
-	for (int row = begin; row < end; row++) {
-		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
-		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
-		rope_rotate_neox(j->q + (size_t)row * j->qn, j->n_heads, j->head_dim, j->rope_dim, cosv,
-						 sinv);
-		rope_rotate_neox(j->k + (size_t)row * j->kn, j->n_kv_heads, j->head_dim, j->rope_dim, cosv,
-						 sinv);
-	}
 }
 
 status_code op_partial_rope_qk(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s || ctx->pos < 0)
 		return ERR_INVALID_ARG;
-	model *m	= ctx->m;
-	int	   qn	= m->n_heads * m->head_dim;
-	int	   kn	= m->n_kv_heads * m->head_dim;
-	int	   half = m->rope_dim / 2;
-	int	   rows = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
-	int	   pos0 = recipe_exec_is_batch(ctx) ? ctx->pos_start : ctx->pos;
-	int	   qn_n = rows * qn;
-	int	   kn_n = rows * kn;
-
-	float *q = recipe_slot_rw_f32(ctx, RECIPE_SLOT_Q, &ctx->s->hybrid_host, qn_n);
-	float *k = recipe_slot_rw_f32(ctx, RECIPE_SLOT_K, &ctx->s->hybrid_host2, kn_n);
-	if (!q || !k)
-		return ERR_INVALID_ARG;
-
-	qwen_rope_job job  = {.q		  = q,
-						  .k		  = k,
-						  .cos_base	  = ctx->s->rope_cos,
-						  .sin_base	  = ctx->s->rope_sin,
-						  .qn		  = qn,
-						  .kn		  = kn,
-						  .half		  = half,
-						  .rope_dim	  = m->rope_dim,
-						  .n_heads	  = m->n_heads,
-						  .n_kv_heads = m->n_kv_heads,
-						  .head_dim	  = m->head_dim,
-						  .pos0		  = pos0,
-						  .rows		  = rows};
-	tpool		 *pool = model_get_pool(m);
-	if (pool && rows > 1 && tpool_current_tid() < 0)
-		tpool_parallel_for(pool, rows, 1, qwen_partial_rope_chunk, &job);
-	else
-		qwen_partial_rope_chunk(0, rows, -1, &job);
-
-	status_code st = recipe_slot_write_commit(ctx, RECIPE_SLOT_Q, q, qn_n);
-	if (st == OK)
-		st = recipe_slot_write_commit(ctx, RECIPE_SLOT_K, k, kn_n);
+	model		 *m			 = ctx->m;
+	backend		 *a			 = exec_layer_backend(ctx);
+	profile		 *prof		 = &ctx->s->prof;
+	backend		 *t			 = OP_BACKEND(partial_rope_qk);
+	int			  n_heads	 = m->n_heads;
+	int			  n_kv_heads = m->n_kv_heads;
+	int			  head_dim	 = m->head_dim;
+	int			  rope_dim	 = m->rope_dim;
+	int			  n_rows	 = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	int			  pos_start	 = recipe_exec_is_batch(ctx) ? ctx->pos_start : ctx->pos;
+	buffer		 *q			 = exec_slot(ctx, RECIPE_SLOT_Q);
+	buffer		 *k			 = exec_slot(ctx, RECIPE_SLOT_K);
+	profile_scope ps		 = profile_begin(prof, ctx->op->stage);
+	status_code st = t->partial_rope_qk(t, q, k, n_heads, n_kv_heads, head_dim, rope_dim, pos_start,
+										ctx->s->rope_cos, ctx->s->rope_sin, n_rows);
+	profile_end(prof, &ps);
 	return st;
-}
-
-typedef struct {
-	float		*out;
-	const float *gate;
-	int			 n, rows;
-} qwen_gate_job;
-
-static void qwen_output_gate_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	qwen_gate_job *j = ctx;
-	for (int row = begin; row < end; row++) {
-		float		*o = j->out + (size_t)row * j->n;
-		const float *g = j->gate + (size_t)row * j->n;
-		for (int i = 0; i < j->n; i++)
-			o[i] *= sigmoidf(g[i]);
-	}
 }
 
 status_code op_attn_output_gate(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
-	int			 n		 = ctx->m->n_heads * ctx->m->head_dim;
-	int			 rows	 = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
-	int			 n_total = rows * n;
-	float		*out	 = recipe_slot_rw_f32(ctx, ctx->op->in[0], &ctx->s->hybrid_host, n_total);
-	const float *gate =
-		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_GATE, &ctx->s->hybrid_host2, n_total);
-	if (!out || !gate)
-		return ERR_INVALID_ARG;
-
-	qwen_gate_job job  = {.out = out, .gate = gate, .n = n, .rows = rows};
-	tpool		 *pool = model_get_pool(ctx->m);
-	if (pool && rows > 1 && tpool_current_tid() < 0)
-		tpool_parallel_for(pool, rows, 1, qwen_output_gate_chunk, &job);
-	else
-		qwen_output_gate_chunk(0, rows, -1, &job);
-
-	return recipe_slot_write_commit(ctx, ctx->op->in[0], out, n_total);
+	backend		 *a		 = exec_layer_backend(ctx);
+	profile		 *prof	 = &ctx->s->prof;
+	backend		 *t		 = OP_BACKEND(attn_output_gate);
+	int			  n		 = ctx->m->n_heads * ctx->m->head_dim;
+	int			  n_rows = recipe_exec_is_batch(ctx) ? ctx->n_rows : 1;
+	buffer		 *out	 = exec_slot(ctx, ctx->op->in[0]);
+	const buffer *gate	 = exec_slot(ctx, RECIPE_SLOT_HYB_GATE);
+	profile_scope ps	 = profile_begin(prof, ctx->op->stage);
+	status_code	  st	 = t->attn_output_gate(t, out, gate, n, n_rows);
+	profile_end(prof, &ps);
+	return st;
 }
 
 typedef struct {
@@ -5828,6 +5702,17 @@ void recipe_build_post_ops(model_recipe *r, const model *m) {
 	ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_LOGITS, WIDX_OUTPUT_W, m->vocab_size, dim,
 						 STAGE_LOGITS_MATMUL);
 
+	if (m->final_logit_softcap > 0.0f) {
+		ops[i++] = (recipe_op){
+			.kind	   = OP_SOFTCAP,
+			.in		   = {RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
+			.out	   = RECIPE_SLOT_NONE,
+			.w_idx	   = RECIPE_NO_WEIGHT,
+			.stage	   = STAGE_LOGITS_READBACK,
+			.u.softcap = {.cap = m->final_logit_softcap},
+		};
+	}
+
 	ops[i++] = (recipe_op){
 		.kind  = OP_LOGITS_READBACK,
 		.in	   = {RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
@@ -5835,17 +5720,6 @@ void recipe_build_post_ops(model_recipe *r, const model *m) {
 		.w_idx = RECIPE_NO_WEIGHT,
 		.stage = STAGE_LOGITS_READBACK,
 	};
-
-	if (m->final_logit_softcap > 0.0f) {
-		ops[i++] = (recipe_op){
-			.kind	   = OP_SOFTCAP,
-			.in		   = {RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	   = RECIPE_SLOT_NONE,
-			.w_idx	   = RECIPE_NO_WEIGHT,
-			.stage	   = STAGE_LOGITS_READBACK,
-			.u.softcap = {.cap = m->final_logit_softcap},
-		};
-	}
 
 	r->post_ops	  = ops;
 	r->n_post_ops = i;

@@ -153,6 +153,15 @@ struct backend {
 								 int n_kv_heads_active);
 	status_code (*add_inplace)(backend *self, buffer *x, const buffer *y, int n);
 	status_code (*scale_inplace)(backend *self, buffer *x, float scale, int n);
+	status_code (*softcap)(backend *self, buffer *x, float cap, int n);
+	status_code (*split_qgate)(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+							   int n_heads, int head_dim, int n_rows);
+	status_code (*attn_output_gate)(backend *self, buffer *out, const buffer *gate, int n,
+									int n_rows);
+	status_code (*partial_rope_qk)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+								   int head_dim, int rope_dim, int pos_start,
+								   const float *rope_cos_base, const float *rope_sin_base,
+								   int n_rows);
 	status_code (*copy_buffer)(backend *self, const buffer *src, buffer *dst, int n);
 	status_code (*ple_combine)(backend *self, buffer *ple, const buffer *proj, int n,
 							   float combine_scale);
