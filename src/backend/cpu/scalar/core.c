@@ -145,6 +145,24 @@ static inline status_code cpu_scratch_grow_floats(float **buf, int *cap_count, i
 	return OK;
 }
 
+static float *cpu_serial_scores(cpu_priv *p, int need) {
+	float **buf;
+	int	   *cap;
+	if (p->thread_scratch && p->n_threads > 0) {
+		buf = &p->thread_scratch[0].scores;
+		cap = &p->thread_scratch[0].scores_cap;
+	} else {
+		buf = &p->scores;
+		cap = &p->scores_cap;
+	}
+	if (*cap < need) {
+		free(*buf);
+		*buf = xmalloc((size_t)need * sizeof(float));
+		*cap = need;
+	}
+	return *buf;
+}
+
 static inline quant_scratch *cpu_scratch_for_tid(cpu_priv *p, int tid) {
 	if (p->thread_scratch && tid >= 0 && tid < p->n_threads)
 		return &p->thread_scratch[tid].qscratch;
@@ -203,6 +221,7 @@ static void cpu_free(backend *self) {
 		return;
 	if (p->pool)
 		tpool_destroy(p->pool);
+	tlocal_free_all();
 	if (p->thread_scratch) {
 		for (int i = 0; i < p->n_threads; i++) {
 			free(p->thread_scratch[i].qscratch.q8_buf);
@@ -281,6 +300,14 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 	p->kv_head_dim_max = desc->head_dim;
 	p->kv_quant		   = desc->kv_quant;
 
+	if (k_out->handle) {
+		free(k_out->handle);
+		k_out->handle = NULL;
+	}
+	if (v_out->handle) {
+		free(v_out->handle);
+		v_out->handle = NULL;
+	}
 	free(p->kv_layer_off);
 	p->kv_layer_off	   = NULL;
 	int has_layer_dims = desc->layer_head_dim && desc->layer_n_kv_heads && desc->n_kv_layers > 0;
@@ -367,12 +394,6 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 	p->kv_layer_stride = (size_t)desc->n_kv_heads * desc->n_ctx * p->kv_block_stride;
 	p->kv_kvh_stride   = (size_t)desc->n_ctx * p->kv_block_stride;
 
-	if (desc->n_ctx > p->scores_cap) {
-		free(p->scores);
-		p->scores	  = xmalloc((size_t)desc->n_ctx * sizeof(float));
-		p->scores_cap = desc->n_ctx;
-	}
-
 	if (p->thread_scratch) {
 		for (int i = 0; i < p->n_threads; i++) {
 			cpu_thread_scratch *ts = &p->thread_scratch[i];
@@ -382,6 +403,10 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 				ts->scores_cap = desc->n_ctx;
 			}
 		}
+	} else if (desc->n_ctx > p->scores_cap) {
+		free(p->scores);
+		p->scores	  = xmalloc((size_t)desc->n_ctx * sizeof(float));
+		p->scores_cap = desc->n_ctx;
 	}
 
 	return OK;
@@ -1755,7 +1780,7 @@ static void cpu_attn_head_chunk(int begin, int end, int tid, void *ctx) {
 	cpu_attn_job *j = ctx;
 	float		 *scores;
 	if (tid == 0) {
-		scores = j->p->scores;
+		scores = cpu_serial_scores(j->p, j->n_pos);
 	} else {
 		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
 		if (ts->scores_cap < j->n_pos) {
@@ -1849,7 +1874,19 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 				return grow_st;
 			scores = ts->scores;
 		} else {
-			scores = p->scores;
+			float **serial_buf;
+			int	   *serial_cap;
+			if (p->thread_scratch && p->n_threads > 0) {
+				serial_buf = &p->thread_scratch[0].scores;
+				serial_cap = &p->thread_scratch[0].scores_cap;
+			} else {
+				serial_buf = &p->scores;
+				serial_cap = &p->scores_cap;
+			}
+			status_code grow_st = cpu_scratch_grow_floats(serial_buf, serial_cap, n_pos);
+			if (grow_st != OK)
+				return grow_st;
+			scores = *serial_buf;
 		}
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
@@ -1900,7 +1937,19 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 			return grow_st;
 		scores = ts->scores;
 	} else {
-		scores = p->scores;
+		float **serial_buf;
+		int	   *serial_cap;
+		if (p->thread_scratch && p->n_threads > 0) {
+			serial_buf = &p->thread_scratch[0].scores;
+			serial_cap = &p->thread_scratch[0].scores_cap;
+		} else {
+			serial_buf = &p->scores;
+			serial_cap = &p->scores_cap;
+		}
+		status_code grow_st = cpu_scratch_grow_floats(serial_buf, serial_cap, n_pos);
+		if (grow_st != OK)
+			return grow_st;
+		scores = *serial_buf;
 	}
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
@@ -1940,7 +1989,7 @@ static void cpu_attn_batch_chunk(int begin, int end, int tid, void *ctx) {
 	cpu_attn_batch_job *j = ctx;
 	float			   *scores;
 	if (tid == 0) {
-		scores = j->p->scores;
+		scores = cpu_serial_scores(j->p, j->pos_start + j->m);
 	} else {
 		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
 		int					need = j->pos_start + j->m;

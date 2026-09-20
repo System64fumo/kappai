@@ -100,6 +100,7 @@ typedef struct {
 	size_t			   tensor_hash_cap;
 	gguf_strtab_entry *kv_hash;
 	size_t			   kv_hash_cap;
+	str_arena		   strs;
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);

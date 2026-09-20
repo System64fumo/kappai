@@ -209,22 +209,44 @@ static int byte_token_value(const vocab_token *tok) {
 
 static void hash_insert(tok_hash_entry *ht, size_t cap, const char *key, size_t klen, int32_t id) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0) {
 			return;
 		}
 		h = (h + 1) & (cap - 1);
 	}
 	ht[h].key	  = key;
-	ht[h].key_len = klen;
+	ht[h].key_len = (uint32_t)klen;
 	ht[h].id	  = id;
-	ht[h].used	  = 1;
 }
 
 static int32_t hash_lookup(const tok_hash_entry *ht, size_t cap, const char *key, size_t klen) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0) {
+			return ht[h].id;
+		}
+		h = (h + 1) & (cap - 1);
+	}
+	return -1;
+}
+
+static int32_t hash_lookup_pair(const tok_hash_entry *ht, size_t cap, const char *a, size_t an,
+								const char *b, size_t bn) {
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (size_t i = 0; i < an; i++) {
+		h ^= (uint8_t)a[i];
+		h *= 0x100000001b3ULL;
+	}
+	for (size_t i = 0; i < bn; i++) {
+		h ^= (uint8_t)b[i];
+		h *= 0x100000001b3ULL;
+	}
+	size_t klen = an + bn;
+	h &= (cap - 1);
+	while (ht[h].key) {
+		if (ht[h].key_len == klen && memcmp(ht[h].key, a, an) == 0 &&
+			memcmp(ht[h].key + an, b, bn) == 0) {
 			return ht[h].id;
 		}
 		h = (h + 1) & (cap - 1);
@@ -496,9 +518,6 @@ typedef struct {
 	int32_t	 *hnode;
 	uint32_t *hver;
 	int		  hn;
-
-	char  *key;
-	size_t key_cap;
 } bpe_state;
 
 static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
@@ -506,23 +525,10 @@ static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 	const piece *b = &bs->pcs[bs->next[i]];
 	if (a->locked || b->locked)
 		return -1;
-	size_t klen = a->n + b->n;
-	if (klen > t->bpe_rank_cap) {
-		size_t cap = t->bpe_rank_cap > 0 ? t->bpe_rank_cap : 128;
-		while (cap < klen)
-			cap *= 2;
-		free(t->bpe_rank_buf);
-		t->bpe_rank_buf = xmalloc(cap);
-		t->bpe_rank_cap = cap;
-	}
-	bs->key		= t->bpe_rank_buf;
-	bs->key_cap = t->bpe_rank_cap;
-	memcpy(bs->key, a->p, a->n);
-	memcpy(bs->key + a->n, b->p, b->n);
 	if (t->has_merges)
-		return hash_lookup((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, bs->key,
-						   klen);
-	return hash_lookup(t->hash, t->hash_capacity, bs->key, klen);
+		return hash_lookup_pair((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, a->p,
+								a->n, b->p, b->n);
+	return hash_lookup_pair(t->hash, t->hash_capacity, a->p, a->n, b->p, b->n);
 }
 
 static void bpe_heap_swap(bpe_state *bs, int i, int j) {
@@ -682,7 +688,6 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 		bs.pcs	= pcs;
 		bs.npcs = npcs;
 		bs.head = 0;
-		bs.key	= t->bpe_rank_buf;
 	}
 
 	for (int i = 0; i < npcs; i++) {
@@ -910,6 +915,7 @@ static bool g_warned_no_merges;
 
 status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	memset(t, 0, sizeof(*t));
+	str_arena_init(&t->merge_pool);
 
 	const char *model_name = NULL;
 	if (gguf_get_str(g, "tokenizer.ggml.model", &model_name) != OK) {
@@ -974,7 +980,7 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		}
 	}
 	if (t->n_byte_fallback > 0)
-		DEBUG("tokenizer: %zu byte-fallback pieces registered", t->n_byte_fallback);
+		DEBUG("tokenizer: %u byte-fallback pieces registered", t->n_byte_fallback);
 
 	const char *const *merges	= NULL;
 	size_t			   n_merges = 0;
@@ -986,6 +992,15 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		t->merge_hash		   = xcalloc(mcap, sizeof(tok_hash_entry));
 		t->merge_keys		   = (char **)xcalloc(n_merges, sizeof(char *));
 		t->n_merge_keys		   = 0;
+		size_t pool_need	   = 0;
+		for (size_t i = 0; i < n_merges; i++) {
+			const char *sp = strchr(merges[i], ' ');
+			if (!sp)
+				continue;
+			pool_need += (size_t)(sp - merges[i]) + strlen(sp + 1) + 1;
+		}
+		if (pool_need > 0)
+			str_arena_reserve(&t->merge_pool, pool_need);
 		for (size_t i = 0; i < n_merges; i++) {
 			const char *entry = merges[i];
 			const char *sp	  = strchr(entry, ' ');
@@ -994,7 +1009,7 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 			size_t left_len	 = (size_t)(sp - entry);
 			size_t right_len = strlen(sp + 1);
 			size_t klen		 = left_len + right_len;
-			char  *key		 = xmalloc(klen + 1);
+			char  *key		 = str_arena_alloc(&t->merge_pool, klen + 1);
 			memcpy(key, entry, left_len);
 			memcpy(key + left_len, sp + 1, right_len);
 			key[klen]						 = '\0';
@@ -1143,15 +1158,13 @@ void tokenizer_free(tokenizer *t) {
 	free(t->tokens);
 	free((void *)t->hash);
 	free((void *)t->merge_hash);
-	for (size_t i = 0; i < t->n_merge_keys; i++)
-		free(t->merge_keys[i]);
+	str_arena_free(&t->merge_pool);
 	free((void *)t->merge_keys);
 	free(t->special_ids);
 	free(t->special_by_first_byte);
 	free(t->bpe_pcs_cache);
 	free(t->bpe_work);
 	free(t->bpe_arena);
-	free(t->bpe_rank_buf);
 	free(t->bpe_sp_text);
 	memset(t, 0, sizeof(*t));
 }
@@ -1196,7 +1209,7 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 	int			  *owner	= stack_owner;
 	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
 	size_t		   acc_len	= 0;
-	int			   acc_heap = 0;
+	char		  *heap_blk = NULL;
 
 	for (int i = 0; i < n; i++) {
 		int32_t id = ids[i];
@@ -1213,22 +1226,17 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 			size_t new_cap = acc_cap;
 			while (acc_len + len > new_cap)
 				new_cap <<= 1;
-			char		  *new_acc	 = xmalloc(new_cap);
-			unsigned char *new_mark	 = xmalloc(new_cap);
-			int			  *new_owner = xmalloc(new_cap * sizeof(int));
-			memcpy(new_acc, acc, acc_len);
-			memcpy(new_mark, mark, acc_len);
+			char *blk		= xmalloc(new_cap * 2 + new_cap * sizeof(int));
+			int	 *new_owner = (int *)(blk + new_cap * 2);
+			memcpy(blk, acc, acc_len);
+			memcpy(blk + new_cap, mark, acc_len);
 			memcpy(new_owner, owner, acc_len * sizeof(int));
-			if (acc_heap) {
-				free(acc);
-				free(mark);
-				free(owner);
-			}
-			acc		 = new_acc;
-			mark	 = new_mark;
+			free(heap_blk);
+			heap_blk = blk;
+			acc		 = blk;
+			mark	 = (unsigned char *)(blk + new_cap);
 			owner	 = new_owner;
 			acc_cap	 = new_cap;
-			acc_heap = 1;
 		}
 		if (bv >= 0) {
 			acc[acc_len]  = (char)bv;
@@ -1291,11 +1299,8 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 		result = cur_owner + 1;
 	}
 
-	if (acc_heap) {
-		free(acc);
-		free(mark);
-		free(owner);
-	}
+	if (heap_blk)
+		free(heap_blk);
 	return result;
 }
 
@@ -1381,12 +1386,11 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 	unsigned char stack_mark[TOK_DECODE_STACK_CAP];
 	memset(stack_acc, 0, sizeof(stack_acc));
 	memset(stack_mark, 0, sizeof(stack_mark));
-	char		  *acc		 = stack_acc;
-	unsigned char *mark		 = stack_mark;
-	size_t		   acc_cap	 = TOK_DECODE_STACK_CAP;
-	size_t		   acc_len	 = 0;
-	int			   acc_heap	 = 0;
-	int			   mark_heap = 0;
+	char		  *acc		= stack_acc;
+	unsigned char *mark		= stack_mark;
+	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
+	size_t		   acc_len	= 0;
+	char		  *heap_blk = NULL;
 
 	for (int i = 0; i < n_ids; i++) {
 		int32_t id = ids[i];
@@ -1403,22 +1407,13 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 			size_t new_cap = acc_cap;
 			while (acc_len + n > new_cap)
 				new_cap <<= 1;
-			if (acc_heap) {
-				acc = xrealloc(acc, new_cap);
-			} else {
-				char *heap_acc = xmalloc(new_cap);
-				memcpy(heap_acc, acc, acc_len);
-				acc		 = heap_acc;
-				acc_heap = 1;
-			}
-			if (mark_heap) {
-				mark = xrealloc(mark, new_cap);
-			} else {
-				unsigned char *heap_mark = xmalloc(new_cap);
-				memcpy(heap_mark, mark, acc_len);
-				mark	  = heap_mark;
-				mark_heap = 1;
-			}
+			char *blk = xmalloc(new_cap * 2);
+			memcpy(blk, acc, acc_len);
+			memcpy(blk + new_cap, mark, acc_len);
+			free(heap_blk);
+			heap_blk = blk;
+			acc		 = blk;
+			mark	 = (unsigned char *)(blk + new_cap);
 			memset(mark + acc_len, 0, new_cap - acc_len);
 			acc_cap = new_cap;
 		}
@@ -1469,10 +1464,8 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 		raw_len = gpt2_decode_to_bytes_buf(acc, mark, acc_len, raw);
 	}
 
-	if (acc_heap)
-		free(acc);
-	if (mark_heap)
-		free(mark);
+	if (heap_blk)
+		free(heap_blk);
 
 	if ((int)raw_len >= max_out) {
 		if (raw_heap)

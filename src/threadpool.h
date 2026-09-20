@@ -22,4 +22,6 @@ void tpool_set_worker_cleanup(tpool *pool, tpool_worker_cleanup_fn fn);
 
 void tlocal_register(void **tls_ptr);
 
+void tlocal_free_all(void);
+
 #endif

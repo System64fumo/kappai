@@ -67,6 +67,13 @@ void tlocal_register(void **tls_ptr) {
 	pthread_setspecific(tlocal_key, s);
 }
 
+void tlocal_free_all(void) {
+	if (!tlocal_key)
+		return;
+	tlocal_cleanup(pthread_getspecific(tlocal_key));
+	pthread_setspecific(tlocal_key, NULL);
+}
+
 typedef struct {
 	_Atomic uint64_t total_items;
 	_Atomic uint64_t total_busy_ns;

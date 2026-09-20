@@ -6,15 +6,15 @@
 #include <time.h>
 
 typedef struct {
-	char  *p;
-	size_t len;
-	size_t cap;
+	char	*p;
+	uint32_t len;
+	uint32_t cap;
 } strbuf;
 
 typedef struct {
-	char **msgs;
-	size_t n;
-	size_t cap;
+	char   **msgs;
+	uint32_t n;
+	uint32_t cap;
 } strlist;
 
 static void strlist_add(strlist *sl, char *msg) {
@@ -33,7 +33,7 @@ static void strlist_free(strlist *sl) {
 }
 
 static void sb_init(strbuf *b) {
-	b->cap	= 64;
+	b->cap	= 256;
 	b->len	= 0;
 	b->p	= xmalloc(b->cap);
 	b->p[0] = '\0';
@@ -69,8 +69,8 @@ static void strlist_report(const strlist *sl, char *errbuf, size_t errbuf_len) {
 
 typedef struct {
 	jinja_value **vals;
-	size_t		  n;
-	size_t		  cap;
+	uint32_t	  n;
+	uint32_t	  cap;
 } jinja_arena;
 
 static _Thread_local jinja_arena *g_render_arena	 = NULL;
@@ -171,6 +171,7 @@ jinja_value *jinja_list(void) {
 	v->type			 = JV_LIST;
 	v->as.list.items = NULL;
 	v->as.list.n	 = 0;
+	v->as.list.cap	 = 0;
 	arena_track(v);
 	return v;
 }
@@ -195,7 +196,10 @@ void jinja_dict_set(jinja_value *d, const char *key, jinja_value *val) {
 }
 
 void jinja_list_append(jinja_value *l, jinja_value *val) {
-	l->as.list.items = xrealloc(l->as.list.items, (l->as.list.n + 1) * sizeof(jinja_value *));
+	if (l->as.list.n == l->as.list.cap) {
+		l->as.list.cap	 = l->as.list.cap ? l->as.list.cap * 2 : 8;
+		l->as.list.items = xrealloc(l->as.list.items, l->as.list.cap * sizeof(jinja_value *));
+	}
 	l->as.list.items[l->as.list.n++] = val;
 }
 
@@ -294,27 +298,27 @@ typedef enum {
 typedef struct {
 	tok_type	type;
 	const char *start;
-	size_t		len;
-	int			strip_left;
-	int			strip_right;
+	uint32_t	len;
+	bool		strip_left;
+	bool		strip_right;
 } token;
 
 typedef struct {
 	const char *src;
-	size_t		len;
-	size_t		pos;
+	uint32_t	len;
+	uint32_t	pos;
 	token	   *toks;
-	size_t		n_toks;
-	size_t		cap_toks;
+	uint32_t	n_toks;
+	uint32_t	cap_toks;
 	strlist		diagnostics;
 	char	   *errbuf;
-	size_t		errbuf_len;
-	size_t		text_start;
-	int			next_strip_left;
-	int			next_trim_nl;
-	size_t		tag_start;
-	int			tag_is_expr;
-	int			tag_strip_after;
+	uint32_t	errbuf_len;
+	uint32_t	text_start;
+	bool		next_strip_left;
+	bool		next_trim_nl;
+	uint32_t	tag_start;
+	bool		tag_is_expr;
+	bool		tag_strip_after;
 } lexer;
 
 static void lex_push(lexer *lx, tok_type type, const char *start, size_t len, int strip_left,
@@ -587,7 +591,7 @@ typedef struct expr_node {
 	expr_arg *args;
 
 	struct expr_node **items;
-	size_t			   n_items;
+	uint32_t		   n_items;
 } expr_node;
 
 typedef enum {
@@ -626,7 +630,7 @@ typedef struct stmt_node {
 	struct stmt_node *body;
 
 	struct stmt_node **items;
-	size_t			   n_items;
+	uint32_t		   n_items;
 
 	char	  *set_name;
 	char	  *set_attr;
@@ -640,14 +644,14 @@ typedef struct stmt_node {
 } stmt_node;
 
 typedef struct {
-	lexer  *lx;
-	size_t	pos;
-	char   *errbuf;
-	size_t	errbuf_len;
-	int		failed;
-	strlist diagnostics;
-	strlist features;
-	int		depth;
+	lexer	*lx;
+	uint32_t pos;
+	char	*errbuf;
+	uint32_t errbuf_len;
+	bool	 failed;
+	strlist	 diagnostics;
+	strlist	 features;
+	uint16_t depth;
 } parser;
 
 #define JINJA_MAX_BLOCK_DEPTH 100
@@ -1382,6 +1386,8 @@ static stmt_node *parse_block(parser *p) {
 					start++;
 			while (t->strip_right && len > start && isspace((unsigned char)t->start[len - 1]))
 				len--;
+			if (len == start)
+				continue;
 			stmt_node *s = new_stmt(ST_TEXT);
 			s->text		 = xmalloc(len - start + 1);
 			memcpy(s->text, t->start + start, len - start);
@@ -1696,12 +1702,12 @@ static void scope_free_entries(scope *sc) {
 }
 
 typedef struct {
-	scope *sc;
-	char  *errbuf;
-	size_t errbuf_len;
-	int	   failed;
-	int	   call_depth;
-	int	   break_hit;
+	scope	*sc;
+	char	*errbuf;
+	size_t	 errbuf_len;
+	bool	 failed;
+	uint16_t call_depth;
+	bool	 break_hit;
 } eval_ctx;
 
 static void everr(eval_ctx *ctx, const char *msg) {
@@ -2583,11 +2589,10 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			n	  = slen;
 		}
 
+		scope loop_sc;
+		loop_sc.entries = NULL;
+		loop_sc.parent	= ctx->sc;
 		for (size_t i = 0; i < n && !ctx->failed; i++) {
-			scope loop_sc;
-			loop_sc.entries = NULL;
-			loop_sc.parent	= ctx->sc;
-
 			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
 				scope_assign(&loop_sc, s->loop_var, item->as.list.items[0]);
@@ -2613,12 +2618,12 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			ctx->break_hit = 0;
 			exec_stmts(ctx, s->body, out);
 			ctx->sc = saved;
-			scope_free_entries(&loop_sc);
 			if (ctx->break_hit) {
 				ctx->break_hit = 0;
 				break;
 			}
 		}
+		scope_free_entries(&loop_sc);
 		(void)key_list;
 		return;
 	}
@@ -2701,7 +2706,10 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	ctx.break_hit  = 0;
 
 	strbuf sb;
-	sb_init(&sb);
+	sb.cap	= 4096;
+	sb.len	= 0;
+	sb.p	= xmalloc(sb.cap);
+	sb.p[0] = '\0';
 	exec_stmts(&ctx, prog, &sb);
 
 	scope_free_entries(&global_sc);

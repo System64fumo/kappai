@@ -206,25 +206,35 @@ static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
 		if (logits[i] * inv_temp > mx)
 			mx = logits[i] * inv_temp;
 
+	if (s->buf_vocab < vocab)
+		grow_buf((void **)&s->logits_buf, &s->buf_vocab, vocab, sizeof(float));
+	float *exp = s->logits_buf;
 	double sum = 0.0;
-	for (int i = 0; i < vocab; i++)
-		sum += expf(logits[i] * inv_temp - mx);
+	for (int i = 0; i < vocab; i++) {
+		float e = expf(logits[i] * inv_temp - mx);
+		exp[i]	= e;
+		sum += e;
+	}
 
 	double rnd = (double)rng_uniform(&s->rng) * sum;
 	double acc = 0.0;
 	for (int i = 0; i < vocab; i++) {
-		acc += expf(logits[i] * inv_temp - mx);
+		acc += exp[i];
 		if (rnd < acc)
 			return (int32_t)i;
 	}
 	return (int32_t)(vocab - 1);
 }
 
-static void apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float temperature) {
+static float apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float temperature) {
 	float inv_temp = 1.0f / temperature;
 	float mx	   = arr[0].v * inv_temp;
-	for (int i = 0; i < kept; i++)
+	float sum	   = 0.0f;
+	for (int i = 0; i < kept; i++) {
 		arr[i].v = expf((arr[i].v * inv_temp) - mx);
+		sum += arr[i].v;
+	}
+	return sum;
 }
 
 static int apply_top_p(sampler_top_k_entry *arr, int kept, float top_p, float sum) {
@@ -292,11 +302,7 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 	if (kept <= 0)
 		return -1;
 
-	apply_temperature_softmax(arr, kept, s->temperature);
-
-	float sum = 0.0f;
-	for (int i = 0; i < kept; i++)
-		sum += arr[i].v;
+	float sum = apply_temperature_softmax(arr, kept, s->temperature);
 
 	kept = apply_top_p(arr, kept, s->top_p, sum);
 	kept = apply_min_p(arr, kept, s->min_p, sum);

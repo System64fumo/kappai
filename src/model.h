@@ -15,7 +15,27 @@ typedef struct weight_ref {
 	buffer		buf;
 } weight_ref;
 
+struct expert_desc {
+	const void *gate_w;
+	const void *up_w;
+	const void *down_w;
+	uint32_t	gate_type, up_type, down_type;
+	bool		gate_up_fused;
+	float		gate_scale;
+	float		up_scale;
+	float		down_scale;
+
+	uint64_t gate_off;
+	uint64_t up_off;
+	uint64_t down_off;
+};
+
 typedef struct layer_weights {
+	void			   *gate_up_fused_host;
+	void			   *shexp_fused_host;
+	void			   *qkv_fused_host;
+	struct expert_desc *experts;
+
 	weight_ref attn_norm_w;
 	weight_ref wq, wk, wv, wo;
 	weight_ref ffn_norm_w;
@@ -25,17 +45,7 @@ typedef struct layer_weights {
 	weight_ref post_ffn_norm_w;
 
 	weight_ref gate_up_w;
-	int		   gate_up_fused;
-	void	  *gate_up_fused_host;
-
-	int	  shexp_fused;
-	void *shexp_fused_host;
-
 	weight_ref qkv_w;
-	int		   qkv_fused;
-	void	  *qkv_fused_host;
-
-	int is_sliding;
 
 	weight_ref attn_q_norm_w;
 	weight_ref attn_k_norm_w;
@@ -53,20 +63,8 @@ typedef struct layer_weights {
 	weight_ref ple_proj_w;
 	weight_ref layer_out_scale_w;
 
-	int		head_dim;
-	int		intermediate;
-	uint8_t is_global_layer;
-	float	layer_out_scale;
-
-	int n_kv_heads;
-	int has_own_v;
-	int rope_dim;
-	int is_recurrent;
-
 	weight_ref q_a_w, q_b_w, q_a_norm_w;
 	weight_ref kv_a_w, k_b_w, v_b_w, kv_a_norm_w;
-	int		   mla_kb_f32;
-	int		   mla_vb_f32;
 
 	weight_ref router_w;
 	weight_ref router_bias;
@@ -78,62 +76,63 @@ typedef struct layer_weights {
 	weight_ref ffn_post_norm_1_w;
 	weight_ref ffn_post_norm_2_w;
 
-	struct expert_desc {
-		const void *gate_w;
-		const void *up_w;
-		const void *down_w;
-		uint32_t	gate_type, up_type, down_type;
-		int			gate_up_fused;
-		float		gate_scale;
-		float		up_scale;
-		float		down_scale;
-
-		uint64_t gate_off;
-		uint64_t up_off;
-		uint64_t down_off;
-	}		*experts;
-	int		 is_moe_layer;
-	int		 any_fused_experts;
+	int32_t	 head_dim;
+	int32_t	 intermediate;
+	float	 layer_out_scale;
+	int32_t	 n_kv_heads;
+	int32_t	 rope_dim;
 	uint32_t gate_q8_type;
+
+	bool	gate_up_fused;
+	bool	shexp_fused;
+	bool	qkv_fused;
+	bool	is_sliding;
+	uint8_t is_global_layer;
+	bool	has_own_v;
+	bool	is_recurrent;
+	bool	mla_kb_f32;
+	bool	mla_vb_f32;
+	bool	is_moe_layer;
+	bool	any_fused_experts;
 } layer_weights;
 
 typedef struct model_mla_params {
-	int q_lora;
-	int kv_lora;
-	int qk_nope;
-	int qk_rope;
-	int qk_head;
-	int v_head;
+	int32_t q_lora;
+	int32_t kv_lora;
+	int32_t qk_nope;
+	int32_t qk_rope;
+	int32_t qk_head;
+	int32_t v_head;
 } model_mla_params;
 
 typedef struct model_moe_params {
-	int	  n_experts;
-	int	  n_experts_used;
-	int	  n_shared_experts;
-	int	  moe_intermediate;
-	int	  n_group;
-	int	  topk_group;
-	float routed_scale;
-	int	  norm_topk_prob;
-	int	  first_dense_layer;
-	float router_dim_scale;
-	int	  experts_resident;
+	int32_t n_experts;
+	int32_t n_experts_used;
+	int32_t n_shared_experts;
+	int32_t moe_intermediate;
+	int32_t n_group;
+	int32_t topk_group;
+	float	routed_scale;
+	bool	norm_topk_prob;
+	int32_t first_dense_layer;
+	float	router_dim_scale;
+	bool	experts_resident;
 } model_moe_params;
 
 typedef struct model_layer_dims_params {
-	int		 head_dim_swa;
-	int		 head_dim_global;
-	int		 rope_dim_swa;
-	int		 rope_dim_global;
+	int32_t	 head_dim_swa;
+	int32_t	 head_dim_global;
+	int32_t	 rope_dim_swa;
+	int32_t	 rope_dim_global;
 	float	 rope_theta_swa;
 	float	 rope_theta_global;
-	int		 n_embd_per_layer;
+	int32_t	 n_embd_per_layer;
 	uint8_t *is_global_layer;
-	int		*ffn_lengths;
-	int		*n_kv_heads_per_layer;
-	int		 n_layer_kv_from_start;
-	int		 kv_layer_swa;
-	int		 kv_layer_global;
+	int32_t *ffn_lengths;
+	int32_t *n_kv_heads_per_layer;
+	int32_t	 n_layer_kv_from_start;
+	int32_t	 kv_layer_swa;
+	int32_t	 kv_layer_global;
 
 	weight_ref per_layer_tok_embd;
 	weight_ref per_layer_model_proj;
@@ -141,68 +140,62 @@ typedef struct model_layer_dims_params {
 } model_layer_dims_params;
 
 typedef struct model_hybrid_params {
-	int conv_kernel;
-	int inner_size;
-	int state_size;
-	int n_value_heads;
-	int n_key_heads;
-	int full_attention_interval;
-	int key_dim;
-	int value_head_dim;
-	int value_dim;
-	int conv_dim;
-	int conv_channels;
+	int32_t conv_kernel;
+	int32_t inner_size;
+	int32_t state_size;
+	int32_t n_value_heads;
+	int32_t n_key_heads;
+	int32_t full_attention_interval;
+	int32_t key_dim;
+	int32_t value_head_dim;
+	int32_t value_dim;
+	int32_t conv_dim;
+	int32_t conv_channels;
 
 	uint8_t *recurrent_layers;
 } model_hybrid_params;
 
 typedef struct model {
-	model_arch		 arch;
-	const arch_info *arch_info;
+	const arch_info			*arch_info;
+	const float				*rope_freqs;
+	weight_ref				 rope_freqs_w;
+	weight_ref				 tok_embd, output_norm_w, output_w;
+	layer_weights			*layers;
+	struct moe_stream_cache *moe_cache;
+	backend					*backend;
+	char					*model_path;
+	const char				*repack_config;
+	const char				*fuse_config;
+	model_recipe			*recipe;
+	weight_ref			   **wrefs_by_layer;
+	backend				   **layer_backends;
 
-	int	  n_layers, n_ctx, dim, n_heads, n_kv_heads, head_dim;
-	float dim_sqrt;
-	int	  intermediate, vocab_size, rope_dim;
-	float norm_eps, rope_theta;
-	int	  tie_embeddings;
-
-	float attn_logit_softcap;
-	float final_logit_softcap;
-	int	  sliding_window;
-
-	int			 has_per_layer_embeddings;
-	const float *rope_freqs;
-	weight_ref	 rope_freqs_w;
-	int			 rope_freqs_count;
-
-	weight_ref	   tok_embd, output_norm_w, output_w;
-	layer_weights *layers;
-
-	model_mla_params		mla;
-	model_moe_params		moe;
 	model_layer_dims_params layer_dims;
 	model_hybrid_params		hybrid;
+	gguf_ctx				gctx;
 
-	struct moe_stream_cache *moe_cache;
-	int						 moe_stream_enabled;
+	model_mla_params mla;
+	model_moe_params moe;
 
-	backend	   *backend;
-	int			owns_backend;
-	int			use_mmap;
-	char	   *model_path;
-	const char *repack_config;
-	const char *fuse_config;
-	int			qkv_fused_layers;
+	model_arch arch;
+	int32_t	   n_layers, n_ctx, dim, n_heads, n_kv_heads, head_dim;
+	float	   dim_sqrt;
+	int32_t	   intermediate, vocab_size, rope_dim;
+	float	   norm_eps, rope_theta;
+	float	   attn_logit_softcap;
+	float	   final_logit_softcap;
+	int32_t	   sliding_window;
+	int32_t	   rope_freqs_count;
+	int32_t	   qkv_fused_layers;
+	int32_t	   n_layer_backends;
 
-	gguf_ctx gctx;
-
-	model_recipe *recipe;
-	int			  batchable;
-	weight_ref	**wrefs_by_layer;
-
-	backend **layer_backends;
-	int		  n_layer_backends;
-	int		  mixed_backend_mode;
+	bool tie_embeddings;
+	bool has_per_layer_embeddings;
+	bool moe_stream_enabled;
+	bool owns_backend;
+	bool use_mmap;
+	bool batchable;
+	bool mixed_backend_mode;
 } model;
 
 status_code model_load(model *m, const char *path);

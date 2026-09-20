@@ -2006,6 +2006,8 @@ struct batch_scratch {
 	float_buf moe_out;
 	float_buf moe_router_logits;
 	float_buf moe_router_inp;
+	buffer	  moe_router_logits_dev;
+	buffer	  moe_router_inp_dev;
 	float_buf moe_xb_f;
 
 	float_buf moe_gather_x;
@@ -2185,6 +2187,12 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_out.p);
 	free(bs->moe_router_logits.p);
 	free(bs->moe_router_inp.p);
+	if (bs->moe_router_logits_dev.owner)
+		bs->moe_router_logits_dev.owner->buffer_free(bs->moe_router_logits_dev.owner,
+													 &bs->moe_router_logits_dev);
+	if (bs->moe_router_inp_dev.owner)
+		bs->moe_router_inp_dev.owner->buffer_free(bs->moe_router_inp_dev.owner,
+												  &bs->moe_router_inp_dev);
 	free(bs->moe_xb_f.p);
 	free(bs->moe_gather_x.p);
 	free(bs->moe_exp_gu.p);
@@ -2665,45 +2673,33 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 	}
 	free(xb_host);
 
-	buffer router_inp_buf = {0};
-	st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * router_dim * sizeof(float),
-								 &router_inp_buf);
+	buffer *router_inp_buf = &ctx->bs->moe_router_inp_dev;
+	st = buffer_ensure_scratch(a, router_inp_buf, (size_t)ctx->n_rows * router_dim * sizeof(float));
 	if (st != OK)
 		return st;
 
-	st = a->buffer_write_f32(a, &router_inp_buf, ctx->bs->moe_router_inp.p,
-							 ctx->n_rows * router_dim);
-	if (st != OK) {
-		a->buffer_free(a, &router_inp_buf);
+	st =
+		a->buffer_write_f32(a, router_inp_buf, ctx->bs->moe_router_inp.p, ctx->n_rows * router_dim);
+	if (st != OK)
 		return st;
-	}
 
-	buffer router_logits_buf = {0};
-	st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * E * sizeof(float), &router_logits_buf);
-	if (st != OK) {
-		a->buffer_free(a, &router_inp_buf);
+	buffer *router_logits_buf = &ctx->bs->moe_router_logits_dev;
+	st = buffer_ensure_scratch(a, router_logits_buf, (size_t)ctx->n_rows * E * sizeof(float));
+	if (st != OK)
 		return st;
-	}
 
-	st = a->matmul_batch(a, &L->router_w.buf, L->router_w.type, &router_inp_buf, &router_logits_buf,
+	st = a->matmul_batch(a, &L->router_w.buf, L->router_w.type, router_inp_buf, router_logits_buf,
 						 E, router_dim, ctx->n_rows);
-	if (st != OK) {
-		a->buffer_free(a, &router_inp_buf);
-		a->buffer_free(a, &router_logits_buf);
+	if (st != OK)
 		return st;
-	}
 
-	st = a->buffer_read_f32(a, &router_logits_buf, ctx->bs->moe_router_logits.p, ctx->n_rows * E);
-	a->buffer_free(a, &router_inp_buf);
-	if (st != OK) {
-		a->buffer_free(a, &router_logits_buf);
+	st = a->buffer_read_f32(a, router_logits_buf, ctx->bs->moe_router_logits.p, ctx->n_rows * E);
+	if (st != OK)
 		return st;
-	}
 
 	if (!moe_router_logits_finite(ctx->bs->moe_router_logits.p, (size_t)ctx->n_rows * E)) {
 		ERROR("moe_router_batch: non-finite router logit (layer=%d, rows=%d, E=%d)", ctx->li,
 			  ctx->n_rows, E);
-		a->buffer_free(a, &router_logits_buf);
 		return ERR_FORMAT;
 	}
 
@@ -2836,11 +2832,9 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 			  n_union, rst);
 		ctx->bs->moe_n_union		 = 0;
 		ctx->bs->moe_union_pending_n = 0;
-		a->buffer_free(a, &router_logits_buf);
 		return ERR_INTERNAL;
 	}
 	ctx->bs->moe_union_pending_n = n_union;
-	a->buffer_free(a, &router_logits_buf);
 	return OK;
 }
 
@@ -3921,6 +3915,10 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	moe_expert_slot *slot_buf = s->moe_slot_buf;
+	if (!slot_buf) {
+		slot_buf		= xcalloc(MOE_MAX_K, sizeof(*slot_buf));
+		s->moe_slot_buf = slot_buf;
+	}
 	if (K > MOE_MAX_TOPK) {
 		ERROR("op_moe_experts: n_experts_used=%d exceeds supported maximum %d "
 			  "(router scratch capacity); refusing silent truncation",
@@ -5047,7 +5045,7 @@ static int recipe_ops_are_batchable(const recipe_op *ops, int n) {
 	return 1;
 }
 
-static int recipe_is_batchable(const model *m) {
+int recipe_is_batchable(const model *m) {
 	const model_recipe *r = m->recipe;
 	if (!r)
 		return 0;
@@ -5186,9 +5184,6 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		return ERR_FALLBACK;
 	if (!backend_supports_batch_ops(m))
 		return ERR_FALLBACK;
-
-	if (m->batchable < 0)
-		m->batchable = recipe_is_batchable(m) ? 1 : 0;
 	if (!m->batchable)
 		return ERR_FALLBACK;
 

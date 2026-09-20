@@ -3064,9 +3064,9 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				q_ymm_cache = realloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
-				sc_cache	= realloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
-				d_w_cache	= realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				q_ymm_cache = xrealloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
+				sc_cache	= xrealloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
+				d_w_cache	= xrealloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
 				tlocal_register((void **)&q_ymm_cache);
 				tlocal_register((void **)&sc_cache);
@@ -3253,14 +3253,14 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				wlo_cache	 = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = realloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
-				s_lo_cache	 = realloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
-				s_hi_cache	 = realloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
-				m_lo_cache	 = realloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
-				m_hi_cache	 = realloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
-				d_w_cache	 = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				dmin_w_cache = realloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
+				wlo_cache	 = xrealloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
+				whi_cache	 = xrealloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
+				s_lo_cache	 = xrealloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
+				s_hi_cache	 = xrealloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
+				m_lo_cache	 = xrealloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
+				m_hi_cache	 = xrealloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
+				d_w_cache	 = xrealloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				dmin_w_cache = xrealloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
 				cache_cap	 = n_bi_tiles;
 				tlocal_register((void **)&wlo_cache);
 				tlocal_register((void **)&whi_cache);
@@ -3596,14 +3596,14 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				lo_cache   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				hi_cache   = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				s0_cache   = realloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
-				s1_cache   = realloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
-				m0_cache   = realloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
-				m1_cache   = realloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
-				d_cache	   = realloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
-				dmin_cache = realloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
+				lo_cache   = xrealloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache   = xrealloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
+				s0_cache   = xrealloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
+				s1_cache   = xrealloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
+				m0_cache   = xrealloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
+				m1_cache   = xrealloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
+				d_cache	   = xrealloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
+				dmin_cache = xrealloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
 				cache_cap  = n_bi_tiles;
 				tlocal_register((void **)&lo_cache);
 				tlocal_register((void **)&hi_cache);

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats);
+
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant) {
 	memset(c, 0, sizeof(*c));
 	c->n_ctx	= n_ctx;
@@ -107,7 +109,15 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	status_code s = kv_backend->kv_alloc(kv_backend, &desc, &c->k, &c->v);
 	free(layer_head_dim);
 	free(layer_n_kv_heads);
-	return s;
+	if (s != OK)
+		return s;
+	if (m->mixed_backend_mode || kv_backend != c->backend) {
+		s = kvcache_ensure_transfer_buf(c, (size_t)2 * (size_t)c->n_kv_heads_max *
+											   (size_t)c->head_dim_max);
+		if (s != OK)
+			return s;
+	}
+	return OK;
 }
 
 static void kv_buffer_free(buffer *b) {
@@ -260,6 +270,10 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 		c->has_host_kv	  = 1;
 
 		INFO("mixed backend KV mirror: %d of %d KV slot(s) on host", n_mirrored, m->n_layers);
+		s = kvcache_ensure_transfer_buf(c, (size_t)2 * (size_t)c->n_kv_heads_max *
+											   (size_t)c->head_dim_max);
+		if (s != OK)
+			return s;
 		return OK;
 	}
 	return OK;

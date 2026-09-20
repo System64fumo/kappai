@@ -222,7 +222,7 @@ static int gguf_arr_len_ok(const gguf_reader *r, uint64_t n, size_t elem_size) {
 	return n * (uint64_t)elem_size <= (uint64_t)gguf_reader_left(r);
 }
 
-static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
+static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena *sa) {
 	e->type = type;
 	switch (type) {
 	case GGUF_TYPE_U8: {
@@ -307,11 +307,9 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 		gguf_str s;
 		if (gguf_reader_str(r, &s))
 			return -1;
-		char *owned = xmalloc(s.len + 1);
-		memcpy(owned, s.data, s.len);
-		owned[s.len] = '\0';
-		e->str.len	 = s.len;
-		e->str.data	 = owned;
+		char *owned = str_arena_dup(sa, s.data, s.len);
+		e->str.len	= s.len;
+		e->str.data = owned;
 		return 0;
 	}
 	case GGUF_TYPE_ARRAY: {
@@ -382,14 +380,10 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 			for (uint64_t i = 0; i < n; i++) {
 				gguf_str s;
 				if (gguf_reader_str(r, &s)) {
-					for (uint64_t j = 0; j < i; j++)
-						free(arr[j]);
 					free(arr);
 					return -1;
 				}
-				arr[i] = xmalloc(s.len + 1);
-				memcpy(arr[i], s.data, s.len);
-				arr[i][s.len] = '\0';
+				arr[i] = str_arena_dup(sa, s.data, s.len);
 			}
 			e->arr_data = (void *)arr;
 			break;
@@ -406,18 +400,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 
 static void free_kv(kv_entry *e, size_t n) {
 	for (size_t i = 0; i < n; i++) {
-		free(e[i].key);
-		if (e[i].type == GGUF_TYPE_STRING) {
-			free((void *)e[i].str.data);
-		}
-		if (e[i].type == GGUF_TYPE_ARRAY) {
-			if (e[i].arr_type == GGUF_TYPE_STRING && e[i].arr_data) {
-				char **arr = (char **)e[i].arr_data;
-				for (uint64_t j = 0; j < e[i].arr_len; j++)
-					free(arr[j]);
-			}
+		if (e[i].type == GGUF_TYPE_ARRAY)
 			free(e[i].arr_data);
-		}
 	}
 	free(e);
 }
@@ -504,6 +488,7 @@ static const char *kv_key_at(const void *ctx, size_t i) {
 static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, int fd, void *map_ptr,
 									 int header_only) {
 	gguf_reader r = {(const uint8_t *)data, (const uint8_t *)data + fsize};
+	str_arena_init(&ctx->strs);
 
 	uint32_t magic;
 	uint32_t version;
@@ -537,15 +522,13 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			free_kv(kv, i);
 			goto bad;
 		}
-		kv[i].key = xmalloc(key.len + 1);
-		memcpy(kv[i].key, key.data, key.len);
-		kv[i].key[key.len] = '\0';
+		kv[i].key = str_arena_dup(&ctx->strs, key.data, key.len);
 		uint32_t t;
 		if (gguf_reader_u32(&r, &t)) {
 			free_kv(kv, i + 1);
 			goto bad;
 		}
-		if (parse_kv_value(&r, &kv[i], t)) {
+		if (parse_kv_value(&r, &kv[i], t, &ctx->strs)) {
 			free_kv(kv, i + 1);
 			goto bad;
 		}
@@ -646,6 +629,7 @@ bad_kv_ts:
 	free_kv(kv, ctx->n_kv);
 	free(ts);
 bad:
+	str_arena_free(&ctx->strs);
 	free(ctx->tensor_hash);
 	free(ctx->kv_hash);
 	if (map_ptr) {
@@ -1169,19 +1153,10 @@ void gguf_free(gguf_ctx *ctx) {
 	if (!ctx || !ctx->valid)
 		return;
 	for (size_t i = 0; i < ctx->n_kv; i++) {
-		free(ctx->kv_keys[i]);
-		if (ctx->kv_types[i] == GGUF_TYPE_STRING) {
-			free((void *)ctx->kv_strs[i].data);
-		}
-		if (ctx->kv_types[i] == GGUF_TYPE_ARRAY) {
-			if (ctx->kv_arr_type[i] == GGUF_TYPE_STRING && ctx->kv_arr_data[i]) {
-				char **arr = (char **)ctx->kv_arr_data[i];
-				for (uint64_t j = 0; j < ctx->kv_arr_len[i]; j++)
-					free(arr[j]);
-			}
+		if (ctx->kv_types[i] == GGUF_TYPE_ARRAY)
 			free(ctx->kv_arr_data[i]);
-		}
 	}
+	str_arena_free(&ctx->strs);
 	free((void *)ctx->kv_keys);
 	free(ctx->kv_types);
 	free(ctx->kv_vals);

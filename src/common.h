@@ -171,6 +171,64 @@ static inline float *float_buf_ensure(float_buf *b, size_t need) {
 	return float_buf_ensure_aligned(b, need, 64);
 }
 
+typedef struct {
+	char **chunks;
+	size_t n_chunks;
+	char  *cur;
+	char  *end;
+	size_t next_size;
+} str_arena;
+
+static inline void str_arena_init(str_arena *a) {
+	memset(a, 0, sizeof(*a));
+	a->next_size = 1u << 16;
+}
+
+static inline char *str_arena_alloc(str_arena *a, size_t n) {
+	if (n == 0)
+		n = 1;
+	if (!a->cur || (size_t)(a->end - a->cur) < n) {
+		size_t sz = a->next_size;
+		if (sz < n)
+			sz = (n + 63u) & ~(size_t)63u;
+		a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
+		a->chunks[a->n_chunks] = (char *)xmalloc(sz);
+		a->n_chunks++;
+		a->cur		 = a->chunks[a->n_chunks - 1];
+		a->end		 = a->cur + sz;
+		a->next_size = sz < (1u << 24) ? sz * 2 : sz;
+	}
+	char *p = a->cur;
+	a->cur += n;
+	return p;
+}
+
+static inline void str_arena_reserve(str_arena *a, size_t n) {
+	if (n == 0)
+		return;
+	if (a->cur && (size_t)(a->end - a->cur) >= n)
+		return;
+	a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
+	a->chunks[a->n_chunks] = (char *)xmalloc(n);
+	a->n_chunks++;
+	a->cur = a->chunks[a->n_chunks - 1];
+	a->end = a->cur + n;
+}
+
+static inline char *str_arena_dup(str_arena *a, const char *s, size_t len) {
+	char *p = str_arena_alloc(a, len + 1);
+	memcpy(p, s, len);
+	p[len] = '\0';
+	return p;
+}
+
+static inline void str_arena_free(str_arena *a) {
+	for (size_t i = 0; i < a->n_chunks; i++)
+		free(a->chunks[i]);
+	free(a->chunks);
+	memset(a, 0, sizeof(*a));
+}
+
 static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {
 	for (;;) {
 		int l = 2 * pos + 1, r = 2 * pos + 2, smallest = pos;

@@ -178,6 +178,8 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	s->moe_scratch.p	 = NULL;
 	s->moe_xb_f.p		 = NULL;
 	s->moe_shared_y.p	 = NULL;
+	free(s->moe_slot_buf);
+	s->moe_slot_buf = NULL;
 
 #define FREE_FLOAT_BUF(field)                                                                      \
 	do {                                                                                           \
@@ -397,6 +399,11 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 
 	compute_scratch_set_router_bufs(s);
 
+	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
+
+	if (m->arch_info->is_moe)
+		s->moe_slot_buf = xcalloc(MOE_MAX_K, sizeof(*s->moe_slot_buf));
+
 	if (m->arch_info->has_variable_layer_dims) {
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
 		s->rope_cos_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
@@ -531,6 +538,14 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].size		 = sizeof(s->router_w_host);
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].offset	 = 0;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].owner		 = NULL;
+
+	size_t xfer_need = (size_t)L.attn_buf_size;
+	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0 &&
+		(size_t)m->layer_dims.n_embd_per_layer > xfer_need)
+		xfer_need = (size_t)m->layer_dims.n_embd_per_layer;
+	st = ensure_transfer_buf(s, xfer_need);
+	if (st != OK)
+		return st;
 
 	s->mirror_slots_alloced = 1;
 	return OK;

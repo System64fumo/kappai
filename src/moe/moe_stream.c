@@ -40,6 +40,7 @@ struct moe_stream_layer {
 	uint32_t		*lru_freq;
 	uint32_t		 decay_counter;
 	int				*eid_to_lru;
+	int				*eid_to_pinned;
 
 	int *heap_idx;
 	int *heap_pos;
@@ -811,6 +812,7 @@ status_code moe_stream_cache_init(struct model *m) {
 		L->lru_freq		 = xcalloc(lru_cap, sizeof(uint32_t));
 		L->decay_counter = 0;
 		L->eid_to_lru	 = xmalloc((size_t)m->moe.n_experts * sizeof(int));
+		L->eid_to_pinned = xmalloc((size_t)m->moe.n_experts * sizeof(int));
 		L->heap_idx		 = xmalloc((size_t)lru_cap * sizeof(int));
 		L->heap_pos		 = xmalloc((size_t)lru_cap * sizeof(int));
 		L->heap_n		 = 0;
@@ -818,6 +820,8 @@ status_code moe_stream_cache_init(struct model *m) {
 			L->heap_pos[s] = -1;
 		for (int e = 0; e < m->moe.n_experts; e++)
 			L->eid_to_lru[e] = -1;
+		for (int e = 0; e < m->moe.n_experts; e++)
+			L->eid_to_pinned[e] = -1;
 		for (int s = 0; s < lru_cap; s++) {
 			L->lru_slots[s].eid		  = -1;
 			L->lru_slots[s].pinned	  = 0;
@@ -838,6 +842,8 @@ status_code moe_stream_cache_init(struct model *m) {
 				if (e < 0 || e >= m->moe.n_experts)
 					continue;
 				moe_expert_slot *s = &L->pinned_slots[L->n_pinned++];
+				if (L->eid_to_pinned[e] < 0)
+					L->eid_to_pinned[e] = (int)(s - L->pinned_slots);
 				slot_from_expert_desc(s, e, &m->layers[i].experts[e]);
 				s->last_used = 0;
 				s->pinned	 = 1;
@@ -1016,6 +1022,7 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		free(c->layers[i].lru_freq);
 		free(c->layers[i].pinned_slots);
 		free(c->layers[i].eid_to_lru);
+		free(c->layers[i].eid_to_pinned);
 		free(c->layers[i].heap_idx);
 		free(c->layers[i].heap_pos);
 		pthread_mutex_destroy(&c->layers[i].mtx);
@@ -1140,10 +1147,11 @@ static void heap_push(struct moe_stream_layer *sl, int idx, uint64_t now) {
 }
 
 static moe_expert_slot *layer_find(struct moe_stream_layer *sl, int eid, uint64_t now) {
-	for (int i = 0; i < sl->n_pinned; i++) {
-		if (sl->pinned_slots[i].eid == eid) {
-			sl->pinned_slots[i].last_used = now;
-			return &sl->pinned_slots[i];
+	if (eid >= 0 && sl->eid_to_pinned) {
+		int pi = sl->eid_to_pinned[eid];
+		if (pi >= 0 && pi < sl->n_pinned && sl->pinned_slots[pi].eid == eid) {
+			sl->pinned_slots[pi].last_used = now;
+			return &sl->pinned_slots[pi];
 		}
 	}
 	int i = sl->eid_to_lru[eid];
@@ -1405,9 +1413,12 @@ static void miss_commit(moe_expert_slot *out_slot, moe_miss_entry *me, struct mo
 }
 
 static moe_expert_slot *live_slot_find(struct moe_stream_layer *L, const moe_expert_slot *slot) {
-	for (int i = 0; i < L->n_pinned; i++) {
-		if (L->pinned_slots[i].eid == slot->eid)
-			return &L->pinned_slots[i];
+	if (slot->eid < 0)
+		return NULL;
+	if (L->eid_to_pinned) {
+		int pi = L->eid_to_pinned[slot->eid];
+		if (pi >= 0 && pi < L->n_pinned && L->pinned_slots[pi].eid == slot->eid)
+			return &L->pinned_slots[pi];
 	}
 	int i = L->eid_to_lru[slot->eid];
 	if (i >= 0 && i < L->n_lru && L->lru_slots[i].eid == slot->eid)

@@ -700,6 +700,8 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 			return s;
 		}
 
+		if (out->handle != repacked)
+			free(repacked);
 		out->host_ptr = NULL;
 		out->size	  = dst_total;
 
@@ -782,6 +784,149 @@ static void *build_fused_qkv(model *m, const layer_weights *L, int has_kv, int h
 			madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wv.host_ptr, kv_bytes);
 	}
 	return buf;
+}
+
+static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, const void *up_w,
+											   uint32_t type, uint64_t dim, uint64_t intermediate,
+											   backend *target_backend, buffer *out,
+											   uint32_t *type_out) {
+	backend *home =
+		backend_weight_home(target_backend ? target_backend : m->backend, WCLASS_MATMUL);
+	if (!home || !home->name || strcmp(home->name, "cpu") != 0)
+		return ERR_FALLBACK;
+
+	uint32_t re_type = 0;
+	if (type == GGML_TYPE_IQ3_S && (dim % 256) == 0 && (intermediate % IQ3_S_RE8_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ3_S_RE8;
+	} else if (type == GGML_TYPE_IQ4_NL && (dim % 32) == 0 &&
+			   (intermediate % IQ4_NL_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ4_NL_R8;
+	} else if (type == GGML_TYPE_Q8_0 && (dim % 32) == 0 && (intermediate % Q8_0_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q8_0_R8;
+	} else if (type == GGML_TYPE_Q4_0 && (dim % 32) == 0 && (intermediate % Q4_0_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_0_R8;
+	} else if (type == GGML_TYPE_Q4_K && (dim % 256) == 0 && (intermediate % Q4_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_K_R8;
+	} else if (type == GGML_TYPE_Q5_K && (dim % 256) == 0 && (intermediate % Q5_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q5_K_R8;
+	} else if (type == GGML_TYPE_Q6_K && (dim % 256) == 0 && (intermediate % Q6_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q6_K_R8;
+	}
+
+	if (!re_type || !model_should_repack(type, m->repack_config))
+		return ERR_FALLBACK;
+
+	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
+	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
+	size_t half_src		 = src_row_bytes * (size_t)intermediate;
+	size_t half_dst		 = dst_row_bytes * (size_t)intermediate;
+
+	void *repacked = xmalloc_aligned(half_dst * 2, 64);
+	repack_weight(home, gate_w, repacked, type, (int)intermediate, (int)dim);
+	repack_weight(home, up_w, (uint8_t *)repacked + half_dst, type, (int)intermediate, (int)dim);
+
+	if (m->gctx.map && !m->gctx.map_is_heap) {
+		madvise_dontneed(m->gctx.map, m->gctx.map_size, gate_w, half_src);
+		madvise_dontneed(m->gctx.map, m->gctx.map_size, up_w, half_src);
+	}
+
+	tensor_desc desc = {
+		.type	   = re_type,
+		.n_dims	   = 2,
+		.dims	   = {dim, 2 * intermediate, 0, 0},
+		.host_data = repacked,
+	};
+	status_code s = home->buffer_alloc_weight(home, &desc, out);
+	if (s != OK) {
+		free(repacked);
+		return s;
+	}
+
+	if (out->handle != repacked)
+		free(repacked);
+	out->host_ptr = NULL;
+	out->size	  = half_dst * 2;
+	*type_out	  = re_type;
+	return OK;
+}
+
+static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int has_kv,
+										   int has_own_v, uint32_t type, uint64_t dim,
+										   uint64_t q_rows, uint64_t kv_rows,
+										   backend *target_backend, buffer *out, uint32_t *type_out,
+										   uint64_t *total_rows_out) {
+	backend *home =
+		backend_weight_home(target_backend ? target_backend : m->backend, WCLASS_MATMUL);
+	if (!home || !home->name || strcmp(home->name, "cpu") != 0)
+		return ERR_FALLBACK;
+	if (!has_kv || !L->wq.host_ptr || !L->wk.host_ptr)
+		return ERR_FALLBACK;
+	if (has_own_v && !L->wv.host_ptr)
+		return ERR_FALLBACK;
+
+	uint64_t total_rows = q_rows + (uint64_t)kv_rows + (uint64_t)(has_own_v ? kv_rows : 0);
+
+	uint32_t re_type = 0;
+	if (type == GGML_TYPE_IQ3_S && (dim % 256) == 0 && (total_rows % IQ3_S_RE8_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ3_S_RE8;
+	} else if (type == GGML_TYPE_IQ4_NL && (dim % 32) == 0 && (total_rows % IQ4_NL_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ4_NL_R8;
+	} else if (type == GGML_TYPE_Q8_0 && (dim % 32) == 0 && (total_rows % Q8_0_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q8_0_R8;
+	} else if (type == GGML_TYPE_Q4_0 && (dim % 32) == 0 && (total_rows % Q4_0_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_0_R8;
+	} else if (type == GGML_TYPE_Q4_K && (dim % 256) == 0 && (total_rows % Q4_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_K_R8;
+	} else if (type == GGML_TYPE_Q5_K && (dim % 256) == 0 && (total_rows % Q5_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q5_K_R8;
+	} else if (type == GGML_TYPE_Q6_K && (dim % 256) == 0 && (total_rows % Q6_K_R8_ROWS) == 0) {
+		re_type = GGML_TYPE_Q6_K_R8;
+	}
+
+	if (!re_type || !model_should_repack(type, m->repack_config))
+		return ERR_FALLBACK;
+
+	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
+	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
+	size_t q_src		 = src_row_bytes * (size_t)q_rows;
+	size_t kv_src		 = src_row_bytes * (size_t)kv_rows;
+	size_t total_dst	 = dst_row_bytes * (size_t)total_rows;
+
+	void	*repacked = xmalloc_aligned(total_dst, 64);
+	uint8_t *dst	  = repacked;
+	repack_weight(home, L->wq.host_ptr, dst, type, (int)q_rows, (int)dim);
+	dst += (size_t)q_rows * dst_row_bytes;
+	repack_weight(home, L->wk.host_ptr, dst, type, (int)kv_rows, (int)dim);
+	dst += (size_t)kv_rows * dst_row_bytes;
+	if (has_own_v)
+		repack_weight(home, L->wv.host_ptr, dst, type, (int)kv_rows, (int)dim);
+
+	if (m->gctx.map && !m->gctx.map_is_heap) {
+		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wq.host_ptr, q_src);
+		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wk.host_ptr, kv_src);
+		if (has_own_v)
+			madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wv.host_ptr, kv_src);
+	}
+
+	tensor_desc desc = {
+		.type	   = re_type,
+		.n_dims	   = 2,
+		.dims	   = {dim, total_rows, 0, 0},
+		.host_data = repacked,
+	};
+	status_code s = home->buffer_alloc_weight(home, &desc, out);
+	if (s != OK) {
+		free(repacked);
+		return s;
+	}
+
+	if (out->handle != repacked)
+		free(repacked);
+	out->host_ptr	= NULL;
+	out->size		= total_dst;
+	*type_out		= re_type;
+	*total_rows_out = total_rows;
+	return OK;
 }
 
 static status_code upload_one(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
@@ -953,39 +1098,50 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		if (fuse_qkv && L->wq.host_ptr && L->wq.type == L->wk.type &&
 			(!L->has_own_v || L->wq.type == L->wv.type)) {
 			uint64_t fused_rows = 0;
-			void *fused = build_fused_qkv(m, L, model_layer_has_kv(m, i), L->has_own_v, L->wq.type,
-										  (uint64_t)m->dim, (uint64_t)q_weight_out,
-										  (uint64_t)kv_out, &fused_rows);
-			if (fused) {
-				uint32_t fused_type = L->wq.type;
-				s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim, fused_rows,
-											WCLASS_MATMUL, layer_be, &L->qkv_w.buf);
-				if (s == OK) {
-					size_t row_bytes = ggml_row_size(fused_type, m->dim);
-					L->wq.type		 = fused_type;
-					L->wk.type		 = fused_type;
-					if (L->has_own_v)
-						L->wv.type = fused_type;
-					L->wq.buf = L->qkv_w.buf;
-					L->wk.buf = buffer_slice(&L->qkv_w.buf, (size_t)q_weight_out * row_bytes,
-											 (size_t)kv_out * row_bytes);
-					if (L->has_own_v)
-						L->wv.buf = buffer_slice(
-							&L->qkv_w.buf, ((size_t)q_weight_out + (size_t)kv_out) * row_bytes,
-							(size_t)kv_out * row_bytes);
+			uint32_t fused_type = L->wq.type;
+			s = upload_fused_qkv_repack(m, L, model_layer_has_kv(m, i), L->has_own_v, L->wq.type,
+										(uint64_t)m->dim, (uint64_t)q_weight_out, (uint64_t)kv_out,
+										layer_be, &L->qkv_w.buf, &fused_type, &fused_rows);
+			if (s == ERR_FALLBACK) {
+				void *fused = build_fused_qkv(m, L, model_layer_has_kv(m, i), L->has_own_v,
+											  L->wq.type, (uint64_t)m->dim, (uint64_t)q_weight_out,
+											  (uint64_t)kv_out, &fused_rows);
+				if (fused) {
+					fused_type = L->wq.type;
+					s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim, fused_rows,
+												WCLASS_MATMUL, layer_be, &L->qkv_w.buf);
+					if (s != OK) {
+						free(fused);
+						return s;
+					}
 					if (L->qkv_w.buf.host_ptr == fused) {
 						L->qkv_fused_host = fused;
 					} else {
 						free(fused);
 						L->qkv_fused_host = NULL;
 					}
-					L->qkv_fused = 1;
-					did_qkv_fuse = 1;
-					m->qkv_fused_layers++;
-				} else {
-					free(fused);
-					return s;
 				}
+			} else if (s != OK) {
+				return s;
+			} else {
+				L->qkv_fused_host = NULL;
+			}
+			if (s == OK) {
+				size_t row_bytes = ggml_row_size(fused_type, m->dim);
+				L->wq.type		 = fused_type;
+				L->wk.type		 = fused_type;
+				if (L->has_own_v)
+					L->wv.type = fused_type;
+				L->wq.buf = L->qkv_w.buf;
+				L->wk.buf = buffer_slice(&L->qkv_w.buf, (size_t)q_weight_out * row_bytes,
+										 (size_t)kv_out * row_bytes);
+				if (L->has_own_v)
+					L->wv.buf = buffer_slice(&L->qkv_w.buf,
+											 ((size_t)q_weight_out + (size_t)kv_out) * row_bytes,
+											 (size_t)kv_out * row_bytes);
+				L->qkv_fused = 1;
+				did_qkv_fuse = 1;
+				m->qkv_fused_layers++;
 			}
 		}
 		if (!did_qkv_fuse) {
@@ -1033,8 +1189,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		}
 		UPLOAD(&L->ple_inp_gate_w, L->ple_inp_gate_w.type, 2, m->dim,
 			   m->layer_dims.n_embd_per_layer, WCLASS_MATMUL);
-		if (gate_owned)
+		if (gate_owned) {
+			if (L->ple_inp_gate_w.buf.host_ptr != L->ple_inp_gate_w.host_ptr)
+				free((void *)L->ple_inp_gate_w.host_ptr);
 			L->ple_inp_gate_w.buf.host_ptr = NULL;
+		}
 		int proj_owned = 0;
 		if (L->ple_proj_w.type != GGML_TYPE_F32) {
 			const void *orig	   = L->ple_proj_w.host_ptr;
@@ -1047,8 +1206,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		}
 		UPLOAD(&L->ple_proj_w, L->ple_proj_w.type, 2, m->layer_dims.n_embd_per_layer, m->dim,
 			   WCLASS_MATMUL);
-		if (proj_owned)
+		if (proj_owned) {
+			if (L->ple_proj_w.buf.host_ptr != L->ple_proj_w.host_ptr)
+				free((void *)L->ple_proj_w.host_ptr);
 			L->ple_proj_w.buf.host_ptr = NULL;
+		}
 	}
 	if (m->arch_info->has_layer_output_scale) {
 		UPLOAD(&L->layer_out_scale_w, GGML_TYPE_F32, 1, 1, 0, WCLASS_MISC);
@@ -1080,16 +1242,33 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		if (m->moe.n_shared_experts > 0) {
 			int sh_inter = m->moe.moe_intermediate * m->moe.n_shared_experts;
 			if (L->shexp_gate_w.type == L->shexp_up_w.type) {
-				void *fused =
-					build_fused_gate_up(m, L->shexp_gate_w.host_ptr, L->shexp_up_w.host_ptr,
-										L->shexp_gate_w.type, (uint64_t)m->dim, (uint64_t)sh_inter);
 				uint32_t fused_type = L->shexp_gate_w.type;
-				s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
-											(uint64_t)2 * sh_inter, WCLASS_MATMUL, layer_be,
-											&L->shexp_gate_w.buf);
-				if (s != OK) {
-					free(fused);
-					return s;
+				s = upload_fused_gate_up_repack(m, L->shexp_gate_w.host_ptr, L->shexp_up_w.host_ptr,
+												L->shexp_gate_w.type, (uint64_t)m->dim,
+												(uint64_t)sh_inter, layer_be, &L->shexp_gate_w.buf,
+												&fused_type);
+				if (s == OK) {
+					L->shexp_fused_host = NULL;
+				} else {
+					if (s != ERR_FALLBACK)
+						return s;
+					void *fused = build_fused_gate_up(m, L->shexp_gate_w.host_ptr,
+													  L->shexp_up_w.host_ptr, L->shexp_gate_w.type,
+													  (uint64_t)m->dim, (uint64_t)sh_inter);
+					fused_type	= L->shexp_gate_w.type;
+					s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
+												(uint64_t)2 * sh_inter, WCLASS_MATMUL, layer_be,
+												&L->shexp_gate_w.buf);
+					if (s != OK) {
+						free(fused);
+						return s;
+					}
+					if (L->shexp_gate_w.buf.host_ptr != fused) {
+						free(fused);
+						L->shexp_fused_host = NULL;
+					} else {
+						L->shexp_fused_host = fused;
+					}
 				}
 				L->shexp_gate_w.type = fused_type;
 				L->shexp_up_w.type	 = fused_type;
@@ -1097,12 +1276,6 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 				L->shexp_up_w.buf =
 					buffer_slice(&L->shexp_gate_w.buf, (size_t)sh_inter * srow_bytes,
 								 (size_t)sh_inter * srow_bytes);
-				if (L->shexp_gate_w.buf.host_ptr != fused) {
-					free(fused);
-					L->shexp_fused_host = NULL;
-				} else {
-					L->shexp_fused_host = fused;
-				}
 				L->shexp_fused = 1;
 			} else {
 				UPLOAD_REP(&L->shexp_gate_w, 2, m->dim, sh_inter, WCLASS_MATMUL);
@@ -1131,31 +1304,40 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		}
 	} else {
 		if (L->gate_w.type == L->up_w.type && !m->arch_info->has_variable_layer_dims) {
-			void *fused =
-				build_fused_gate_up(m, L->gate_w.host_ptr, L->up_w.host_ptr, L->gate_w.type,
-									(uint64_t)m->dim, (uint64_t)intermediate);
-			uint32_t fused_type = L->gate_w.type;
-			s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
-										(uint64_t)2 * intermediate, WCLASS_MATMUL, layer_be,
-										&L->gate_up_w.buf);
-			if (s == OK) {
-				L->gate_up_w.type = fused_type;
-				L->gate_up_fused  = 1;
+			uint32_t	fused_type = L->gate_w.type;
+			status_code fs		   = upload_fused_gate_up_repack(
+				m, L->gate_w.host_ptr, L->up_w.host_ptr, L->gate_w.type, (uint64_t)m->dim,
+				(uint64_t)intermediate, layer_be, &L->gate_up_w.buf, &fused_type);
+			if (fs == ERR_FALLBACK) {
+				void *fused =
+					build_fused_gate_up(m, L->gate_w.host_ptr, L->up_w.host_ptr, L->gate_w.type,
+										(uint64_t)m->dim, (uint64_t)intermediate);
+				fused_type = L->gate_w.type;
+				s = upload_tensor_repack_to(m, fused, &fused_type, 2, m->dim,
+											(uint64_t)2 * intermediate, WCLASS_MATMUL, layer_be,
+											&L->gate_up_w.buf);
+				if (s != OK) {
+					free(fused);
+					return s;
+				}
 				if (L->gate_up_w.buf.host_ptr == fused) {
 					L->gate_up_fused_host = fused;
 				} else {
 					free(fused);
 					L->gate_up_fused_host = NULL;
 				}
-				size_t frow_bytes = ggml_row_size(L->gate_w.type, m->dim);
-				release_original_weight_data(m, L->gate_w.host_ptr, frow_bytes * intermediate);
-				release_original_weight_data(m, L->up_w.host_ptr, frow_bytes * intermediate);
-				L->gate_w.host_ptr = NULL;
-				L->up_w.host_ptr   = NULL;
+			} else if (fs != OK) {
+				return fs;
 			} else {
-				free(fused);
-				return s;
+				L->gate_up_fused_host = NULL;
 			}
+			L->gate_up_w.type = fused_type;
+			L->gate_up_fused  = 1;
+			size_t frow_bytes = ggml_row_size(L->gate_w.type, m->dim);
+			release_original_weight_data(m, L->gate_w.host_ptr, frow_bytes * intermediate);
+			release_original_weight_data(m, L->up_w.host_ptr, frow_bytes * intermediate);
+			L->gate_w.host_ptr = NULL;
+			L->up_w.host_ptr   = NULL;
 		}
 		if (!L->gate_up_fused) {
 			UPLOAD_REP(&L->gate_w, 2, m->dim, intermediate, WCLASS_MATMUL);
@@ -1316,7 +1498,7 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 		snprintf(ffn_key, sizeof(ffn_key), "%s.feed_forward_length", prefix);
 		const int32_t *ffn_lens;
 		size_t		   n_ffn;
-		m->layer_dims.ffn_lengths = xcalloc(m->n_layers, sizeof(int));
+		m->layer_dims.ffn_lengths = xcalloc(m->n_layers, sizeof(int32_t));
 		if (gguf_get_arr_i32(g, ffn_key, &ffn_lens, &n_ffn) == OK) {
 			for (int i = 0; i < m->n_layers && i < (int)n_ffn; i++) {
 				m->layer_dims.ffn_lengths[i] = ffn_lens[i];
@@ -1334,7 +1516,7 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 		size_t		   kv_n	  = 0;
 		int32_t		   kv_scalar;
 		snprintf(kv_key, sizeof(kv_key), "%s.attention.head_count_kv", prefix);
-		m->layer_dims.n_kv_heads_per_layer = xcalloc(m->n_layers, sizeof(int));
+		m->layer_dims.n_kv_heads_per_layer = xcalloc(m->n_layers, sizeof(int32_t));
 		if (gguf_get_arr_i32(g, kv_key, &kv_arr, &kv_n) == OK && kv_n > 0) {
 			for (int i = 0; i < m->n_layers; i++) {
 				m->layer_dims.n_kv_heads_per_layer[i] =
@@ -2654,8 +2836,7 @@ status_code model_set_layer_backend_range(model *m, int begin, int end, backend 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
 							 const char *repack_config, int requested_n_ctx) {
 	memset(m, 0, sizeof(*m));
-	m->batchable = -1;
-	m->backend	 = bk;
+	m->backend = bk;
 
 	int	   is_host_backend	 = backend_has_cap(bk, BCAP_IS_HOST) ? 1 : 0;
 	size_t avail_before_load = is_host_backend ? get_available_memory() : backend_mem_available(bk);
@@ -2750,6 +2931,7 @@ status_code model_build_recipe(model *m) {
 	}
 	DEBUG("recipe: built for arch '%s' (pre=%d layer=%d post=%d ops)", m->arch_info->gguf_name,
 		  m->recipe->n_pre_ops, m->recipe->layer.n_ops, m->recipe->n_post_ops);
+	m->batchable = recipe_is_batchable(m) != 0;
 	return OK;
 }
 

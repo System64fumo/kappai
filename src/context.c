@@ -248,6 +248,8 @@ status_code context_init(context *c, const config *cfg) {
 	c->scratch.backend	 = c->backend;
 	sampler_init(&c->samp, cfg->seed);
 	sampler_set_vocab(&c->samp, c->m.vocab_size);
+	c->fed_ids.p   = xmalloc((size_t)n_ctx * sizeof(int32_t));
+	c->fed_ids.cap = n_ctx;
 
 	return OK;
 
@@ -563,6 +565,10 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 	char		   *think_buf	   = NULL;
 	size_t			think_buf_len = 0, think_buf_cap = 0;
 	size_t			end_marker_len = c->chat.think_end_text ? strlen(c->chat.think_end_text) : 0;
+	if (out_think_end_pos && end_marker_len > 0) {
+		think_buf_cap = end_marker_len * 2 + 512;
+		think_buf	  = xmalloc(think_buf_cap);
+	}
 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
@@ -952,6 +958,10 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
 	acap.ud					  = ud;
+	if (max_tokens > 0) {
+		acap.cap = (size_t)max_tokens * 32;
+		acap.buf = xmalloc(acap.cap);
+	}
 
 	bool	unfed_tail	  = false;
 	int32_t think_end_pos = -1;

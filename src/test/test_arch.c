@@ -687,8 +687,8 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 		m->rope_dim						   = cfg->n_heads * hd_global / 2;
 		m->sliding_window				   = m->arch_info->sliding_window_period > 0 ? hd_swa : 0;
 		m->layer_dims.is_global_layer	   = xcalloc((size_t)cfg->n_layers, sizeof(uint8_t));
-		m->layer_dims.ffn_lengths		   = xcalloc((size_t)cfg->n_layers, sizeof(int));
-		m->layer_dims.n_kv_heads_per_layer = xcalloc((size_t)cfg->n_layers, sizeof(int));
+		m->layer_dims.ffn_lengths		   = xcalloc((size_t)cfg->n_layers, sizeof(int32_t));
+		m->layer_dims.n_kv_heads_per_layer = xcalloc((size_t)cfg->n_layers, sizeof(int32_t));
 		for (int li = 0; li < cfg->n_layers; li++) {
 			int period							   = m->arch_info->sliding_window_period;
 			m->layer_dims.is_global_layer[li]	   = period > 0 && (li % period) == (period - 1);
@@ -754,6 +754,7 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 
 	model_build_weight_refs(&sm->m);
 	m->recipe			  = recipe_build(m);
+	m->batchable		  = recipe_is_batchable(m) != 0;
 	m->moe_stream_enabled = 0;
 	return sm;
 }
@@ -1076,11 +1077,6 @@ static void test_arch_batch_vs_single(backend *cpu, model_arch arch, const synth
 
 	synth_model *sm_batch  = synth_model_build(cpu, arch, cfg, n_ctx);
 	synth_model *sm_single = synth_model_build(cpu, arch, cfg, n_ctx);
-
-	if (arch == ARCH_GEMMA4 || arch == ARCH_GEMMA4_MOE)
-		sm_batch->m.batchable = -1;
-	if (arch == ARCH_GLM_DSA)
-		sm_batch->m.batchable = -1;
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
 	seed_test_rng(0xBA7C9B9ULL + (uint64_t)arch);

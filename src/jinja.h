@@ -27,12 +27,13 @@ struct jinja_dict_entry {
 struct jinja_value {
 	jinja_value_type type;
 	union {
-		int				  b;
+		bool			  b;
 		char			 *s;
 		jinja_dict_entry *dict;
 		struct {
 			jinja_value **items;
-			size_t		  n;
+			uint32_t	  n;
+			uint32_t	  cap;
 		} list;
 		stmt_node *macro;
 	} as;

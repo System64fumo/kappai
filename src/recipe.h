@@ -291,6 +291,7 @@ const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name);
 
 model_recipe *recipe_build(const struct model *m);
 void		  recipe_free(model_recipe *r);
+int			  recipe_is_batchable(const struct model *m);
 
 status_code compute_forward_recipe(struct model *m, struct kvcache *cache,
 								   struct compute_scratch *s, int token, int pos, int flash_attn,

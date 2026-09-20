@@ -5,7 +5,7 @@ static const int g_model_flash = 1;
 static int32_t tok_test_hash_lookup(const struct tok_hash_entry *ht, size_t cap, const char *key,
 									size_t klen) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0)
 			return ht[h].id;
 		h = (h + 1) & (cap - 1);
