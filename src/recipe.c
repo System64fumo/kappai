@@ -35,7 +35,15 @@ static inline backend *op_host_backend(void) {
 	}
 	return b;
 }
-#define OP_BACKEND(field) ((a->field) ? a : (a == op_host_backend() ? a : op_backend_fallback(a)))
+#define OP_BACKEND(field) op_backend_pick((a), (a->field != NULL), #field)
+static inline backend *op_backend_fallback(backend *a, const char *op_name);
+static inline backend *op_backend_pick(backend *a, int has_field, const char *op_name) {
+	if (has_field)
+		return a;
+	if (backend_has_cap(a, BCAP_IS_HOST))
+		return a;
+	return op_backend_fallback(a, op_name);
+}
 static status_code	 exec_op(const recipe_op *op, struct model *m, struct kvcache *cache,
 							 struct compute_scratch *s, int token, int pos, int li, int flash_attn,
 							 float *logits_out);
@@ -298,6 +306,105 @@ static status_code recipe_check_backend_capabilities(const model_recipe *r, cons
 	return OK;
 }
 
+static const char *recipe_op_missing_fn(const backend *a, op_kind k) {
+	switch (k) {
+	case OP_EMBD_LOOKUP:
+		return a->embd_lookup ? NULL : "embd_lookup";
+	case OP_SCALE_EMBEDDINGS:
+	case OP_SCALE:
+		return a->scale_inplace ? NULL : "scale_inplace";
+	case OP_RMSNORM:
+		return a->rmsnorm ? NULL : "rmsnorm";
+	case OP_RMSNORM_PER_HEAD:
+		return a->rmsnorm_per_head ? NULL : "rmsnorm_per_head";
+	case OP_RMSNORM_NOWEIGHT:
+		return a->rmsnorm_noweight ? NULL : "rmsnorm_noweight";
+	case OP_RMSNORM_ADD:
+		return a->rmsnorm_add ? NULL : "rmsnorm_add";
+	case OP_MATMUL:
+	case OP_MATMUL_MULTI:
+	case OP_MATMUL_RESIDUAL:
+	case OP_MATMUL_FUSED_GATEUP:
+	case OP_MATMUL_FFN_DOWN:
+	case OP_MLA_Q_PROJ:
+	case OP_MLA_KV_PROJ:
+	case OP_MLA_QKV_PROJ_FUSED:
+	case OP_MOE_ROUTER:
+		return a->matmul ? NULL : "matmul";
+	case OP_ROPE:
+		return a->rope ? NULL : "rope";
+	case OP_ROPE_QK_FUSED:
+		return (a->rope_qk || a->rope) ? NULL : "rope_qk";
+	case OP_ROPE_EXT:
+		return (a->rope_ext || a->rope) ? NULL : "rope_ext";
+	case OP_KV_PUT:
+		return a->kv_put ? NULL : "kv_put";
+	case OP_ATTENTION:
+		return a->attention ? NULL : "attention";
+	case OP_ATTENTION_SWA:
+		return a->attention_swa ? NULL : "attention_swa";
+	case OP_ADD:
+		return a->add_inplace ? NULL : "add_inplace";
+	case OP_FFN_ACTIVATE:
+	case OP_FFN_ACTIVATE_FUSED:
+		return a->ffn_activate ? NULL : "ffn_activate";
+	case OP_FFN_ACTIVATE_EX:
+		return (a->ffn_activate_ex || a->ffn_activate) ? NULL : "ffn_activate_ex";
+	case OP_SOFTCAP:
+		return a->softcap ? NULL : "softcap";
+	case OP_SPLIT_QGATE:
+		return a->split_qgate ? NULL : "split_qgate";
+	case OP_PARTIAL_ROPE_QK:
+		return a->partial_rope_qk ? NULL : "partial_rope_qk";
+	case OP_ATTN_OUTPUT_GATE:
+		return a->attn_output_gate ? NULL : "attn_output_gate";
+	case OP_GATED_DELTA_NET:
+		return a->gated_delta_net ? NULL : "gated_delta_net";
+	case OP_MOE_SHARED:
+		return a->moe_activate ? NULL : "moe_activate";
+	case OP_MOE_EXPERTS:
+		return (a->moe_experts_batch || a->matmul_thread_local) ? NULL : "moe_experts";
+	default:
+		return NULL;
+	}
+}
+
+static int matmul_type_ok(const backend *a, uint32_t t) {
+	return !a->matmul_type_native || a->matmul_type_native((backend *)a, t);
+}
+
+static void recipe_scan_op(const struct model *m, const backend *a, const recipe_op *op) {
+	op_kind k = op->kind;
+	if (k == OP_PLE_BUILD) {
+		int native = a->embd_lookup && a->matmul && a->matmul_batch && a->scale_inplace &&
+					 a->rmsnorm && a->rmsnorm_batch && a->ple_combine &&
+					 matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type) &&
+					 m->layer_dims.per_layer_tok_embd.buf.handle &&
+					 m->layer_dims.per_layer_model_proj.buf.handle;
+		if (!native)
+			backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE, "");
+		return;
+	}
+	if (k == OP_FFN_ACTIVATE_FUSED && !backend_has_cap(a, BCAP_IS_HOST) &&
+		!a->ffn_activate_fused_batch)
+		backend_report_host_fallback(a, "ffn_activate_fused", HFB_BATCH_DESIGN, "");
+	const char *fn = recipe_op_missing_fn(a, k);
+	if (fn)
+		backend_report_host_fallback(a, fn, HFB_OP_NOT_NATIVE, "");
+}
+
+static void recipe_scan_missing(const model_recipe *r, const struct model *m) {
+	const backend *a = m->backend;
+	if (!a)
+		return;
+	for (int i = 0; i < r->n_pre_ops; i++)
+		recipe_scan_op(m, a, &r->pre_ops[i]);
+	for (int i = 0; i < r->layer.n_ops; i++)
+		recipe_scan_op(m, a, &r->layer.ops[i]);
+	for (int i = 0; i < r->n_post_ops; i++)
+		recipe_scan_op(m, a, &r->post_ops[i]);
+}
+
 model_recipe *recipe_build(const struct model *m) {
 	if (!m || !m->arch_info)
 		return NULL;
@@ -447,6 +554,9 @@ model_recipe *recipe_build(const struct model *m) {
 		recipe_free(r);
 		return NULL;
 	}
+
+	recipe_scan_missing(r, m);
+	backend_fallback_report();
 
 	return r;
 }
@@ -782,7 +892,9 @@ static int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buff
 	return n;
 }
 
-static inline backend *op_backend_fallback(backend *a) {
+static inline backend *op_backend_fallback(backend *a, const char *op_name) {
+	backend_report_host_fallback(a, op_name, HFB_OP_NOT_NATIVE,
+								 "device backend has no kernel for this op");
 	if (a->synchronize)
 		a->synchronize(a);
 	return op_host_backend();
@@ -815,26 +927,11 @@ static status_code op_ple_build(exec_ctx *ctx) {
 	const float				n_embd_sqrt		 = sqrtf((float)n_embd_per_layer);
 	const float				inv_sqrt_ple	 = m->dim_sqrt > 0 ? 1.0f / m->dim_sqrt : 0.0f;
 
-	size_t		   row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
-	const uint8_t *embd =
-		(const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr + ((size_t)token * row_stride);
-	float *ple = s->ple_buf;
-
-	backend *dq_host = backend_host();
-	if (!dq_host || !dq_host->dequant_row)
-		return ERR_UNSUPPORTED;
-	st = dq_host->dequant_row(dq_host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple);
-	if (st != OK)
-		return st;
-
-	{
-		float scale = n_embd_sqrt;
-		for (int i = 0; i < total_ple; i++)
-			ple[i] *= scale;
-	}
-
-	int dev_path_ok = (a->matmul && a->scale_inplace && a->rmsnorm && a->ple_combine &&
-					   m->layer_dims.per_layer_model_proj.buf.handle);
+	int dev_path_ok =
+		(a->embd_lookup && a->matmul && a->scale_inplace && a->rmsnorm && a->ple_combine &&
+		 matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type) &&
+		 m->layer_dims.per_layer_model_proj.buf.handle &&
+		 m->layer_dims.per_layer_tok_embd.buf.handle);
 
 	if (dev_path_ok) {
 		st = buffer_ensure_scratch(a, &s->ple_all, (size_t)total_ple * sizeof(float));
@@ -844,7 +941,12 @@ static status_code op_ple_build(exec_ctx *ctx) {
 		if (st != OK)
 			return st;
 
-		st = a->buffer_write_f32(a, &s->ple_all, ple, total_ple);
+		st = a->embd_lookup(a, &m->layer_dims.per_layer_tok_embd.buf,
+							m->layer_dims.per_layer_tok_embd.type, token, total_ple, &s->ple_all);
+		if (st != OK)
+			return st;
+
+		st = a->scale_inplace(a, &s->ple_all, n_embd_sqrt, total_ple);
 		if (st != OK)
 			return st;
 
@@ -880,6 +982,27 @@ static status_code op_ple_build(exec_ctx *ctx) {
 			return st;
 
 		return OK;
+	}
+
+	float *ple = s->ple_buf;
+
+	{
+		size_t		   row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
+		const uint8_t *embd		  = (const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr +
+									((size_t)token * row_stride);
+
+		backend *dq_host = backend_host();
+		if (!dq_host || !dq_host->dequant_row)
+			return ERR_UNSUPPORTED;
+		backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE,
+									 "per-layer token embeddings are dequantized on the host (cpu) "
+									 "before the projection runs");
+		st = dq_host->dequant_row(dq_host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple,
+								  ple);
+		if (st != OK)
+			return st;
+		for (int i = 0; i < total_ple; i++)
+			ple[i] *= n_embd_sqrt;
 	}
 
 	if (a->synchronize)
@@ -1041,6 +1164,10 @@ static status_code op_ffn_activate_ex(exec_ctx *ctx) {
 		profile_end(prof, &ps);
 		return st;
 	}
+	backend_report_host_fallback(
+		a, "ffn_activate_ex", HFB_OP_NOT_NATIVE,
+		"no ffn_activate_ex kernel on device backend; gate/up downloaded and "
+		"activation executed on host (cpu)");
 	float	   *buf		= float_buf_ensure(&ctx->s->moe_scratch, (size_t)intermediate * 3);
 	float	   *g		= buf;
 	float	   *u		= buf + intermediate;
@@ -1549,7 +1676,18 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 		const int fused_stride = 2 * n;
 		int		  n_rows	   = ctx->n_rows;
 
+		if (a->ffn_activate_fused_batch) {
+			st = a->ffn_activate_fused_batch(a, batch_slot(ctx->bs, ctx->op->in[0]),
+											 batch_slot(ctx->bs, ctx->op->out), n, act, n_rows);
+			if (st != ERR_UNSUPPORTED) {
+				profile_end(prof, &ps);
+				return st;
+			}
+		}
 		if (!backend_has_cap(a, BCAP_IS_HOST)) {
+			backend_report_host_fallback(
+				a, "ffn_activate_fused", HFB_BATCH_DESIGN,
+				"batch prefill stages gate/up activation through host memory");
 			buffer *fused_buf  = batch_slot(ctx->bs, ctx->op->in[0]);
 			buffer *out_buf	   = batch_slot(ctx->bs, ctx->op->out);
 			float  *fused_host = xmalloc((size_t)n_rows * fused_stride * sizeof(float));
@@ -2426,6 +2564,9 @@ void moe_apply_weights(float *weight, int n_k, int norm_topk, float routed_scale
 
 status_code moe_activate(backend *a, float *act, const float *gate, const float *up, int n_i,
 						 float gs, float us, int use_gelu) {
+	if (!(a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)))
+		backend_report_host_fallback(a, "moe_activate", HFB_OP_NOT_NATIVE,
+									 "moe activation executes on the host (cpu) fallback");
 	backend *h = (a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)) ? a : backend_host();
 	if (!h || !h->moe_activate)
 		return ERR_UNSUPPORTED;
@@ -3500,35 +3641,27 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 	const float	  combine_scale	   = 0.70710678118654752f;
 	status_code	  st;
 
-	float_buf_ensure(&ctx->bs->ple_buf, (size_t)n_rows * total_ple);
 	st = buffer_ensure_scratch(a, &ctx->bs->ple_all, (size_t)n_rows * total_ple * sizeof(float));
 	if (st != OK)
 		return st;
-	float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
 
-	float *ple = ctx->bs->ple_buf.p;
-	for (int row = 0; row < n_rows; row++) {
-		int			   token	  = ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
-		size_t		   row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
-		const uint8_t *embd		  = (const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr +
-									((size_t)token * row_stride);
-		float		  *ple_row	  = ple + (size_t)row * total_ple;
-		backend		  *host		  = backend_host();
-		if (!host || !host->dequant_row)
-			return ERR_UNSUPPORTED;
-		st = host->dequant_row(host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple,
-							   ple_row);
-		if (st != OK)
-			return st;
-		for (int i = 0; i < total_ple; i++)
-			ple_row[i] *= n_embd_sqrt;
-	}
-
-	int dev_path_ok = (a->matmul_batch && a->scale_inplace && a->rmsnorm_batch && a->ple_combine &&
-					   m->layer_dims.per_layer_model_proj.buf.handle);
+	int dev_path_ok =
+		(a->embd_lookup && a->matmul_batch && a->scale_inplace && a->rmsnorm_batch &&
+		 a->ple_combine && matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type) &&
+		 m->layer_dims.per_layer_model_proj.buf.handle &&
+		 m->layer_dims.per_layer_tok_embd.buf.handle);
 
 	if (dev_path_ok) {
-		status_code st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+		for (int row = 0; row < n_rows; row++) {
+			int	   token	= ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
+			buffer row_view = ctx->bs->ple_all;
+			row_view.offset = (size_t)row * total_ple * sizeof(float);
+			st = a->embd_lookup(a, &m->layer_dims.per_layer_tok_embd.buf,
+								m->layer_dims.per_layer_tok_embd.type, token, total_ple, &row_view);
+			if (st != OK)
+				return st;
+		}
+		st = a->scale_inplace(a, &ctx->bs->ple_all, n_embd_sqrt, n_rows * total_ple);
 		if (st != OK)
 			return st;
 
@@ -3576,6 +3709,29 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 	if (a->synchronize)
 		a->synchronize(a);
 
+	float_buf_ensure(&ctx->bs->ple_buf, (size_t)n_rows * total_ple);
+	float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
+	float *ple = ctx->bs->ple_buf.p;
+	backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE,
+								 "per-layer token embeddings are dequantized on the host (cpu) "
+								 "before the projection runs");
+	for (int row = 0; row < n_rows; row++) {
+		int			   token	  = ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
+		size_t		   row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
+		const uint8_t *embd		  = (const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr +
+									((size_t)token * row_stride);
+		float		  *ple_row	  = ple + (size_t)row * total_ple;
+		backend		  *host		  = backend_host();
+		if (!host || !host->dequant_row)
+			return ERR_UNSUPPORTED;
+		st = host->dequant_row(host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple,
+							   ple_row);
+		if (st != OK)
+			return st;
+		for (int i = 0; i < total_ple; i++)
+			ple_row[i] *= n_embd_sqrt;
+	}
+
 	float *ple_proj	 = float_buf_ensure(&ctx->s->ple_proj_host, (size_t)n_rows * total_ple);
 	float *inpL_host = float_buf_ensure(&ctx->s->inpL_host, (size_t)n_rows * dim);
 
@@ -3585,6 +3741,9 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 	if (st != OK)
 		return st;
 
+	backend_report_host_fallback(a, "ple_proj_matmul", HFB_OP_NOT_NATIVE,
+								 "device backend lacks a batched per-layer projection path; "
+								 "projection matmul executes on host (cpu)");
 	backend *host = backend_host();
 	for (int row = 0; row < n_rows; row++)
 		host_matmul_generic(m->layer_dims.per_layer_model_proj.host_ptr,
@@ -4102,6 +4261,11 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	if (par) {
+		backend_report_host_fallback(
+			a, "moe_experts_batch", HFB_CAPABILITY,
+			"expert FFN batch executes on the host (cpu) fallback (device '%s' "
+			"has no resident-expert batch path)",
+			a->name);
 		st = moe_experts_run_parallel(m, li, K, dim, backend_host(), slot_buf, expert_ids, weights,
 									  xb, s, I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
 									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
@@ -4238,6 +4402,10 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 		}
 	}
 
+	if (!(a && a->moe_activate))
+		backend_report_host_fallback(
+			a, "moe_activate_resident", HFB_OP_NOT_NATIVE,
+			"resident-expert moe activation executes on the host (cpu) fallback");
 	backend *h = a->moe_activate ? a : backend_host();
 	if (!h || !h->moe_activate ||
 		(h != a && !backend_has_cap(a, BCAP_IS_HOST) &&
@@ -4766,7 +4934,10 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 	const model_hybrid_params *p		= &ctx->m->hybrid;
 	int						   n_tokens = ctx->n_rows > 0 ? ctx->n_rows : 1;
 	backend					  *a		= exec_layer_backend(ctx);
-	backend					  *t =
+	if (!(a && a->gated_delta_net && backend_has_cap(a, BCAP_IS_HOST)))
+		backend_report_host_fallback(a, "gated_delta_net", HFB_OP_NOT_NATIVE,
+									 "gated delta net executes on the host (cpu) fallback");
+	backend *t =
 		(a && a->gated_delta_net && backend_has_cap(a, BCAP_IS_HOST)) ? a : op_host_backend();
 	if (!t->gated_delta_net) {
 		profile_end(&ctx->s->prof, &ps);

@@ -53,5 +53,23 @@ void WIO_CAT(W_PFX, get_scale_min_k4)(uint s_off, int j, out uint d_out, out uin
 	}
 }
 
+void WIO_CAT(W_PFX, get_all_scale_min_k4)(uint s_off, out uint d_out[8], out uint m_out[8]) {
+	uint sb[12];
+	for (int t = 0; t < 12; t++)
+		sb[t] = WIO_CAT(W_PFX, read_u8)(s_off + uint(t));
+
+	for (int j = 0; j < 4; j++) {
+		d_out[j] = sb[j] & 63u;
+		m_out[j] = sb[j + 4] & 63u;
+	}
+	for (int j = 4; j < 8; j++) {
+		uint qj4  = sb[j + 4];
+		uint qjm4 = sb[j - 4];
+		uint qj0  = sb[j];
+		d_out[j]  = (qj4 & 0xFu) | ((qjm4 >> 6u) << 4u);
+		m_out[j]  = (qj4 >> 4u) | ((qj0 >> 6u) << 4u);
+	}
+}
+
 #undef WIO_CAT_INNER
 #undef WIO_CAT

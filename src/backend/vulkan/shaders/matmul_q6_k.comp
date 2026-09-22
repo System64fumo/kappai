@@ -81,50 +81,33 @@ shared float x_shared[TILE_K];
 shared int	 xq_shared[TILE_K];
 shared float xq_d[BLOCKS_PER_TILE];
 
-int dequant_q6k_val_w0(uint ql_base, uint qh_base, int m) {
-	int	 l	   = m & 31;
-	int	 group = m >> 5;
-	uint qh_v  = w0_read_u8(qh_base + uint(l));
-	int	 lo, shift;
-	if (group == 0) {
-		lo	  = int(w0_read_u8(ql_base + uint(l)) & 0xFu);
-		shift = 0;
-	} else if (group == 1) {
-		lo	  = int(w0_read_u8(ql_base + uint(l) + 32u) & 0xFu);
-		shift = 2;
-	} else if (group == 2) {
-		lo	  = int(w0_read_u8(ql_base + uint(l)) >> 4u);
-		shift = 4;
-	} else {
-		lo	  = int(w0_read_u8(ql_base + uint(l) + 32u) >> 4u);
-		shift = 6;
-	}
-	int hi = int((qh_v >> uint(shift)) & 3u) << 4;
-	return (lo | hi) - 32;
+uint byte_from_word(uint word, uint byte_idx) {
+	return (word >> (byte_idx * 8u)) & 0xFFu;
 }
 
-#if NMAT >= 2
-int dequant_q6k_val_w1(uint ql_base, uint qh_base, int m) {
-	int	 l	   = m & 31;
-	int	 group = m >> 5;
-	uint qh_v  = w1_read_u8(qh_base + uint(l));
-	int	 lo, shift;
-	if (group == 0) {
-		lo	  = int(w1_read_u8(ql_base + uint(l)) & 0xFu);
-		shift = 0;
-	} else if (group == 1) {
-		lo	  = int(w1_read_u8(ql_base + uint(l) + 32u) & 0xFu);
-		shift = 2;
-	} else if (group == 2) {
-		lo	  = int(w1_read_u8(ql_base + uint(l)) >> 4u);
-		shift = 4;
-	} else {
-		lo	  = int(w1_read_u8(ql_base + uint(l) + 32u) >> 4u);
-		shift = 6;
+#define DEFINE_DEQUANT16_Q6K(SUFFIX)                                                               \
+	void dequant16_q6k_##SUFFIX(uint ql_base, uint qh_base, int a_base, out int vals[16]) {        \
+		int	 l0		   = a_base & 31;                                                              \
+		int	 group	   = a_base >> 5;                                                              \
+		uint ql_start  = uint(l0) + ((group & 1) << 5);                                            \
+		bool nibble_hi = group >= 2;                                                               \
+		uint shift	   = uint(group) << 1;                                                         \
+		for (int w = 0; w < 4; w++) {                                                              \
+			uint ql_word = SUFFIX##_read_u32(ql_base + ql_start + uint(w) * 4u);                   \
+			uint qh_word = SUFFIX##_read_u32(qh_base + uint(l0) + uint(w) * 4u);                   \
+			for (int t = 0; t < 4; t++) {                                                          \
+				uint ql_v		= byte_from_word(ql_word, uint(t));                                \
+				uint qh_v		= byte_from_word(qh_word, uint(t));                                \
+				uint nibble		= nibble_hi ? (ql_v >> 4u) : (ql_v & 0xFu);                        \
+				uint hi			= ((qh_v >> shift) & 3u) << 4u;                                    \
+				vals[w * 4 + t] = int(nibble | hi) - 32;                                           \
+			}                                                                                      \
+		}                                                                                          \
 	}
-	int hi = int((qh_v >> uint(shift)) & 3u) << 4;
-	return (lo | hi) - 32;
-}
+
+DEFINE_DEQUANT16_Q6K(w0)
+#if NMAT >= 2
+DEFINE_DEQUANT16_Q6K(w1)
 #endif
 
 void main() {
@@ -222,45 +205,32 @@ void main() {
 						int a_base	= jj * 16;
 						int xq_base = xq_off_base + jj * 16;
 
-						int av0_0 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 0);
-						int av0_1 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 1);
-						int av0_2 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 2);
-						int av0_3 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 3);
+						int av[16];
+						dequant16_q6k_w0(ql_base, qh_base, a_base, av);
+
 						int w0_lo = pack32(
-							i8vec4(int8_t(av0_0), int8_t(av0_1), int8_t(av0_2), int8_t(av0_3)));
+							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
 						int xq0_lo = pack32(
 							i8vec4(int8_t(xq_shared[xq_base + 0]), int8_t(xq_shared[xq_base + 1]),
 								   int8_t(xq_shared[xq_base + 2]), int8_t(xq_shared[xq_base + 3])));
 						int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
 
-						int av0_4 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 4);
-						int av0_5 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 5);
-						int av0_6 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 6);
-						int av0_7 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 7);
 						int w0_hi = pack32(
-							i8vec4(int8_t(av0_4), int8_t(av0_5), int8_t(av0_6), int8_t(av0_7)));
+							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
 						int xq0_hi = pack32(
 							i8vec4(int8_t(xq_shared[xq_base + 4]), int8_t(xq_shared[xq_base + 5]),
 								   int8_t(xq_shared[xq_base + 6]), int8_t(xq_shared[xq_base + 7])));
 						l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
 
-						int av1_0 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 8);
-						int av1_1 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 9);
-						int av1_2 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 10);
-						int av1_3 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 11);
 						int w1_lo = pack32(
-							i8vec4(int8_t(av1_0), int8_t(av1_1), int8_t(av1_2), int8_t(av1_3)));
+							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
 						int xq1_lo = pack32(i8vec4(
 							int8_t(xq_shared[xq_base + 8]), int8_t(xq_shared[xq_base + 9]),
 							int8_t(xq_shared[xq_base + 10]), int8_t(xq_shared[xq_base + 11])));
 						int l1	   = dotPacked4x8EXT(w1_lo, xq1_lo);
 
-						int av1_4 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 12);
-						int av1_5 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 13);
-						int av1_6 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 14);
-						int av1_7 = dequant_q6k_val_w0(ql_base, qh_base, a_base + 15);
 						int w1_hi = pack32(
-							i8vec4(int8_t(av1_4), int8_t(av1_5), int8_t(av1_6), int8_t(av1_7)));
+							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
 						int xq1_hi = pack32(i8vec4(
 							int8_t(xq_shared[xq_base + 12]), int8_t(xq_shared[xq_base + 13]),
 							int8_t(xq_shared[xq_base + 14]), int8_t(xq_shared[xq_base + 15])));
@@ -302,45 +272,32 @@ void main() {
 						int a_base	= jj * 16;
 						int xq_base = xq_off_base + jj * 16;
 
-						int av0_0 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 0);
-						int av0_1 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 1);
-						int av0_2 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 2);
-						int av0_3 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 3);
+						int av[16];
+						dequant16_q6k_w1(ql_base, qh_base, a_base, av);
+
 						int w0_lo = pack32(
-							i8vec4(int8_t(av0_0), int8_t(av0_1), int8_t(av0_2), int8_t(av0_3)));
+							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
 						int xq0_lo = pack32(
 							i8vec4(int8_t(xq_shared[xq_base + 0]), int8_t(xq_shared[xq_base + 1]),
 								   int8_t(xq_shared[xq_base + 2]), int8_t(xq_shared[xq_base + 3])));
 						int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
 
-						int av0_4 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 4);
-						int av0_5 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 5);
-						int av0_6 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 6);
-						int av0_7 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 7);
 						int w0_hi = pack32(
-							i8vec4(int8_t(av0_4), int8_t(av0_5), int8_t(av0_6), int8_t(av0_7)));
+							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
 						int xq0_hi = pack32(
 							i8vec4(int8_t(xq_shared[xq_base + 4]), int8_t(xq_shared[xq_base + 5]),
 								   int8_t(xq_shared[xq_base + 6]), int8_t(xq_shared[xq_base + 7])));
 						l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
 
-						int av1_0 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 8);
-						int av1_1 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 9);
-						int av1_2 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 10);
-						int av1_3 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 11);
 						int w1_lo = pack32(
-							i8vec4(int8_t(av1_0), int8_t(av1_1), int8_t(av1_2), int8_t(av1_3)));
+							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
 						int xq1_lo = pack32(i8vec4(
 							int8_t(xq_shared[xq_base + 8]), int8_t(xq_shared[xq_base + 9]),
 							int8_t(xq_shared[xq_base + 10]), int8_t(xq_shared[xq_base + 11])));
 						int l1	   = dotPacked4x8EXT(w1_lo, xq1_lo);
 
-						int av1_4 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 12);
-						int av1_5 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 13);
-						int av1_6 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 14);
-						int av1_7 = dequant_q6k_val_w1(ql_base, qh_base, a_base + 15);
 						int w1_hi = pack32(
-							i8vec4(int8_t(av1_4), int8_t(av1_5), int8_t(av1_6), int8_t(av1_7)));
+							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
 						int xq1_hi = pack32(i8vec4(
 							int8_t(xq_shared[xq_base + 12]), int8_t(xq_shared[xq_base + 13]),
 							int8_t(xq_shared[xq_base + 14]), int8_t(xq_shared[xq_base + 15])));

@@ -6,10 +6,187 @@
 #include <dlfcn.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define HFB_MAX_ENTRIES 32
+#define HFB_OP_CAP 40
+#define HFB_DETAIL_CAP 160
+#define HFB_PATH_CAP 512
+#define HFB_LIB_MAX 16
+
+typedef struct {
+	char				 op[HFB_OP_CAP];
+	char				 device[32];
+	host_fallback_reason reason;
+	uint64_t			 count;
+	char				 detail[HFB_DETAIL_CAP];
+	int					 printed;
+} hfb_entry;
+
+static hfb_entry	   g_hfb_entries[HFB_MAX_ENTRIES];
+static int			   g_hfb_n_entries = 0;
+static pthread_mutex_t g_hfb_mtx	   = PTHREAD_MUTEX_INITIALIZER;
+static char			   g_hfb_last[192] = "";
+
+static int g_hfb_reported = 0;
+static int g_hfb_warn	  = 1;
+
+static char g_lib_search_dirs[HFB_LIB_MAX][HFB_PATH_CAP];
+static int	g_n_lib_search_dirs = 0;
+static char g_loaded_lib_paths[HFB_LIB_MAX][HFB_PATH_CAP];
+static int	g_n_loaded_libs = 0;
+static struct {
+	char path[HFB_PATH_CAP];
+	char err[256];
+} g_lib_load_fails[HFB_LIB_MAX];
+static int g_n_lib_load_fails = 0;
+static int g_backend_path_env = 0;
+
+static void lib_note_search_dir(const char *dir) {
+	if (!dir || !*dir || g_n_lib_search_dirs >= HFB_LIB_MAX)
+		return;
+	for (int i = 0; i < g_n_lib_search_dirs; i++)
+		if (strcmp(g_lib_search_dirs[i], dir) == 0)
+			return;
+	snprintf(g_lib_search_dirs[g_n_lib_search_dirs++], HFB_PATH_CAP, "%s", dir);
+}
+
+static const char *hfb_reason_str(host_fallback_reason r) {
+	switch (r) {
+	case HFB_OP_NOT_NATIVE:
+		return "not native";
+	case HFB_BATCH_DESIGN:
+		return "batch staging";
+	case HFB_WEIGHT_TYPE:
+		return "weight type not native";
+	case HFB_BUF_HOST_RESIDENT:
+		return "host-resident buffers";
+	case HFB_CAPABILITY:
+		return "missing capability";
+	case HFB_ERROR:
+		return "device error, retried on host";
+	case HFB_LAYER_NOT_OFFLOADED:
+		return "layer not offloaded";
+	default:
+		return "unknown";
+	}
+}
+
+void backend_report_host_fallback(const backend *device, const char *op,
+								  host_fallback_reason reason, const char *detail_fmt, ...) {
+	if (backend_has_cap(device, BCAP_IS_HOST))
+		return;
+
+	char op_key[HFB_OP_CAP];
+	snprintf(op_key, sizeof(op_key), "%s", op ? op : "unknown");
+
+	char detail[HFB_DETAIL_CAP];
+	if (detail_fmt && *detail_fmt) {
+		va_list ap;
+		va_start(ap, detail_fmt);
+		vsnprintf(detail, sizeof(detail), detail_fmt, ap);
+		va_end(ap);
+	} else {
+		detail[0] = '\0';
+	}
+
+	const char *dev = (device && device->name) ? device->name : "?";
+
+	pthread_mutex_lock(&g_hfb_mtx);
+	snprintf(g_hfb_last, sizeof(g_hfb_last), "op '%s' on backend '%s': %s%s%s", op_key, dev,
+			 hfb_reason_str(reason), detail[0] ? " -- " : "", detail);
+
+	hfb_entry *e = NULL;
+	for (int i = 0; i < g_hfb_n_entries; i++) {
+		hfb_entry *cand = &g_hfb_entries[i];
+		if (cand->reason == reason && strcmp(cand->op, op_key) == 0 &&
+			strcmp(cand->device, dev) == 0) {
+			e = cand;
+			break;
+		}
+	}
+	int first = 0;
+	if (!e && g_hfb_n_entries < HFB_MAX_ENTRIES) {
+		e = &g_hfb_entries[g_hfb_n_entries++];
+		snprintf(e->op, sizeof(e->op), "%s", op_key);
+		snprintf(e->device, sizeof(e->device), "%s", dev);
+		e->reason	 = reason;
+		e->count	 = 0;
+		e->detail[0] = '\0';
+		first		 = 1;
+	}
+	if (e) {
+		first = first || (e->count == 0);
+		if (first && detail[0])
+			snprintf(e->detail, sizeof(e->detail), "%s", detail);
+		e->count++;
+		if (first && !e->printed && (g_hfb_reported || reason == HFB_ERROR)) {
+			if (g_hfb_warn)
+				log_msg(LOG_WARN, "host fallback: %s on '%s': %s", op_key, dev,
+						hfb_reason_str(reason));
+			e->printed = 1;
+		}
+	}
+	pthread_mutex_unlock(&g_hfb_mtx);
+}
+
+void backend_set_fallback_warn(int enable) {
+	pthread_mutex_lock(&g_hfb_mtx);
+	g_hfb_warn = enable ? 1 : 0;
+	pthread_mutex_unlock(&g_hfb_mtx);
+}
+
+void backend_fallback_report(void) {
+	pthread_mutex_lock(&g_hfb_mtx);
+	g_hfb_reported = 1;
+	int n_new	   = 0;
+	for (int i = 0; i < g_hfb_n_entries; i++) {
+		hfb_entry *e = &g_hfb_entries[i];
+		if (e->printed)
+			continue;
+		e->printed = 1;
+		n_new++;
+		if (g_hfb_warn)
+			log_msg(LOG_WARN, "%s on '%s': %s", e->op, e->device, hfb_reason_str(e->reason));
+	}
+	pthread_mutex_unlock(&g_hfb_mtx);
+	if (n_new == 0)
+		return;
+	backend_host();
+}
+
+static void backend_dump_load_diagnosis(void) {
+	if (g_n_lib_search_dirs > 0) {
+		char dirs[HFB_LIB_MAX * HFB_PATH_CAP];
+		dirs[0] = '\0';
+		for (int i = 0; i < g_n_lib_search_dirs; i++)
+			snprintf(dirs + strlen(dirs), sizeof(dirs) - strlen(dirs), "%s%s", i ? "; " : "",
+					 g_lib_search_dirs[i]);
+		ERROR("  backend library search dirs: %s", dirs);
+	} else {
+		ERROR("  backend library search dirs: none");
+	}
+	if (!g_backend_path_env)
+		ERROR("  (set KAPPAI_BACKEND_PATH to the backend .so directory)");
+
+	if (g_n_loaded_libs > 0) {
+		for (int i = 0; i < g_n_loaded_libs; i++)
+			ERROR("  loaded backend library: %s", g_loaded_lib_paths[i]);
+	} else {
+		ERROR("  no backend libraries loaded");
+	}
+	for (int i = 0; i < g_n_lib_load_fails; i++)
+		ERROR("  failed to dlopen '%s': %s", g_lib_load_fails[i].path, g_lib_load_fails[i].err);
+
+	if (g_hfb_last[0])
+		ERROR("  host fallback was triggered by: %s", g_hfb_last);
+	else
+		ERROR("  no host fallback trigger recorded");
+}
 
 typedef struct {
 	char			name[32];
@@ -86,10 +263,23 @@ static void log_op_homes(backend *b) {
 		{"ffn_activate", b->ffn_activate != NULL},
 		{"ffn_activate_ex", b->ffn_activate_ex != NULL},
 		{"argmax", b->argmax != NULL},
+		{"rmsnorm_add", b->rmsnorm_add != NULL},
+		{"matmul_residual", b->matmul_residual != NULL},
+		{"matmul_multi", b->matmul_multi != NULL},
+		{"kv_put_batch", b->kv_put_batch != NULL},
+		{"matmul_batch", b->matmul_batch != NULL},
+		{"rmsnorm_batch", b->rmsnorm_batch != NULL},
+		{"rope_qk_batch", b->rope_qk_batch != NULL},
+		{"attention_batch", b->attention_batch != NULL},
+		{"attention_swa_batch", b->attention_swa_batch != NULL},
+		{"ffn_activate_batch", b->ffn_activate_batch != NULL},
+		{"matmul_multi_batch", b->matmul_multi_batch != NULL},
+		{"moe_activate", b->moe_activate != NULL},
+		{"moe_experts_batch", b->moe_experts_batch != NULL},
 	};
 	int	 n_native = 0;
 	int	 n_total  = (int)ARRAY_LEN(ops);
-	char missing[512];
+	char missing[1024];
 	missing[0] = '\0';
 	for (int i = 0; i < n_total; i++) {
 		if (ops[i].native) {
@@ -102,8 +292,33 @@ static void log_op_homes(backend *b) {
 	if (n_native == n_total) {
 		DEBUG("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
 	} else {
-		WARN("backend '%s': %d/%d core ops native, falling back to host for: %s", b->name, n_native,
-			 n_total, missing);
+		DEBUG("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
+		WARN("backend '%s': missing native ops: %s", b->name, missing);
+	}
+
+	if (b->matmul_type_native) {
+		static const struct {
+			uint32_t	t;
+			const char *n;
+		} types[] = {
+			{GGML_TYPE_F32, "f32"},		{GGML_TYPE_F16, "f16"},	  {GGML_TYPE_BF16, "bf16"},
+			{GGML_TYPE_Q4_0, "q4_0"},	{GGML_TYPE_Q4_1, "q4_1"}, {GGML_TYPE_Q5_0, "q5_0"},
+			{GGML_TYPE_Q5_1, "q5_1"},	{GGML_TYPE_Q8_0, "q8_0"}, {GGML_TYPE_Q4_K, "q4_k"},
+			{GGML_TYPE_Q5_K, "q5_k"},	{GGML_TYPE_Q6_K, "q6_k"}, {GGML_TYPE_IQ4_NL, "iq4_nl"},
+			{GGML_TYPE_IQ3_S, "iq3_s"},
+		};
+		char native[256], nonnative[256];
+		native[0] = nonnative[0] = '\0';
+		for (size_t i = 0; i < ARRAY_LEN(types); i++) {
+			int	   is_native = b->matmul_type_native((backend *)b, types[i].t);
+			char  *dst		 = is_native ? native : nonnative;
+			size_t len		 = strlen(dst);
+			snprintf(dst + len, is_native ? sizeof(native) : sizeof(nonnative), "%s%s",
+					 len ? ", " : "", types[i].n);
+		}
+		DEBUG("backend '%s': matmul native types: %s", b->name, native[0] ? native : "(none)");
+		if (nonnative[0])
+			WARN("backend '%s': matmul host-only types: %s", b->name, nonnative);
 	}
 }
 
@@ -166,6 +381,27 @@ status_code backend_create_host(backend **out) {
 
 	if (!best_ctor) {
 		ERROR("no host (cpu) backend available; was the cpu backend library built?");
+		for (int i = 0; i < g_registry_count; i++) {
+			backend probe;
+			memset(&probe, 0, sizeof(probe));
+			if (g_registry[i].ctor(&probe) != OK) {
+				ERROR("  registered backend '%s': constructor failed", g_registry[i].name);
+				continue;
+			}
+			if (!(probe.caps & BCAP_IS_HOST)) {
+				ERROR("  backend '%s': not host-capable (caps=0x%llx)", g_registry[i].name,
+					  (unsigned long long)probe.caps);
+				continue;
+			}
+			if (probe.probe && probe.probe() != OK) {
+				ERROR("  registered backend '%s': host-capable but hardware probe failed",
+					  g_registry[i].name);
+				continue;
+			}
+		}
+		if (g_registry_count == 0)
+			ERROR("  no backend libraries registered at all");
+		backend_dump_load_diagnosis();
 		return ERR_NOT_FOUND;
 	}
 	backend	   *b = xcalloc(1, sizeof(backend));
@@ -316,7 +552,13 @@ void backend_destroyed(backend *b) {
 
 static void host_backend_init(void) {
 	if (backend_create_host(&g_host_backend) != OK) {
-		ERROR("could not create host fallback backend");
+		pthread_mutex_lock(&g_hfb_mtx);
+		char last[192];
+		snprintf(last, sizeof(last), "%s", g_hfb_last);
+		pthread_mutex_unlock(&g_hfb_mtx);
+		ERROR("could not create host (cpu) fallback backend");
+		if (last[0])
+			ERROR("required by: %s", last);
 		abort();
 	}
 	if (atomic_load(&g_host_override) == NULL)
@@ -416,9 +658,17 @@ static void try_load_backend(const char *path) {
 	if (!handle) {
 		const char *err = dlerror();
 		WARN("backend library '%s' failed to load: %s", path, err ? err : "unknown error");
+		if (g_n_lib_load_fails < HFB_LIB_MAX) {
+			snprintf(g_lib_load_fails[g_n_lib_load_fails].path, HFB_PATH_CAP, "%s", path);
+			snprintf(g_lib_load_fails[g_n_lib_load_fails].err, 256, "%s",
+					 err ? err : "unknown error");
+			g_n_lib_load_fails++;
+		}
 		return;
 	}
 	DEBUG("loaded backend library: %s", path);
+	if (g_n_loaded_libs < HFB_LIB_MAX)
+		snprintf(g_loaded_lib_paths[g_n_loaded_libs++], HFB_PATH_CAP, "%s", path);
 }
 
 static int already_loaded(const char *candidate) {
@@ -436,6 +686,7 @@ static int already_loaded(const char *candidate) {
 }
 
 static void load_from_dir_dedup(const char *dir) {
+	lib_note_search_dir(dir);
 	DIR *d = opendir(dir);
 	if (!d)
 		return;
@@ -471,7 +722,8 @@ static void engine_dir(char *out, size_t cap) {
 static void backends_init(void) {
 	char path[4096];
 
-	const char *env = getenv("KAPPAI_BACKEND_PATH");
+	const char *env	   = getenv("KAPPAI_BACKEND_PATH");
+	g_backend_path_env = (env && *env);
 	if (env && *env) {
 		char *dup = strdup(env);
 		if (dup) {

@@ -487,6 +487,10 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 		return OK;
 	if (!m || !m->mixed_backend_mode)
 		return OK;
+	backend_report_host_fallback(
+		m->backend, "mirror_scratch", HFB_LAYER_NOT_OFFLOADED,
+		"mixed-backend mode: mirror compute slots allocated on the host (cpu) "
+		"fallback for layers not offloaded");
 	backend *host = backend_host();
 	if (!host)
 		return ERR_UNSUPPORTED;

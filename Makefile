@@ -197,7 +197,7 @@ TIDY_LOG     := $(OUT_DIR)/tidy.log
 VK_SHADERS_DIR := $(SRC_DIR)/backend/vulkan/shaders
 VK_INC_FILES   := $(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc)
 
-MATMUL_BATCH            := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32
+MATMUL_BATCH	    := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16
 MATMUL_NMAT_DUAL_BATCH  := matmul_q4_0 matmul_q4_k matmul_q6_k
 
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
@@ -237,6 +237,7 @@ SHADER_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/attention_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/ffn_activate_fused_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv
 

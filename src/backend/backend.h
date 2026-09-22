@@ -206,6 +206,7 @@ struct backend {
 	status_code (*dequant_row)(backend *self, uint32_t type, const void *src, int n_elems,
 							   float *dst);
 	void (*synchronize)(backend *self);
+	void (*submit)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
 	status_code (*rmsnorm_batch)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -215,6 +216,8 @@ struct backend {
 	status_code (*add_batch)(backend *self, buffer *x, const buffer *y, int n, int m);
 	status_code (*ffn_activate_batch)(backend *self, const buffer *gate, const buffer *up,
 									  buffer *out, int n, int activation, int m);
+	status_code (*ffn_activate_fused_batch)(backend *self, const buffer *fused, buffer *out, int n,
+											int activation, int m);
 	status_code (*rope_batch)(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
 							  const float *rope_cos_base, const float *rope_sin_base, int m);
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
@@ -293,6 +296,24 @@ void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *
 backend *backend_host(void);
 
 void backend_host_use(backend *b);
+
+typedef enum {
+	HFB_OP_NOT_NATIVE		= 0,
+	HFB_BATCH_DESIGN		= 1,
+	HFB_WEIGHT_TYPE			= 2,
+	HFB_BUF_HOST_RESIDENT	= 3,
+	HFB_CAPABILITY			= 4,
+	HFB_ERROR				= 5,
+	HFB_LAYER_NOT_OFFLOADED = 6,
+} host_fallback_reason;
+
+void backend_report_host_fallback(const backend *device, const char *op,
+								  host_fallback_reason reason, const char *detail_fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+void backend_fallback_report(void);
+
+void backend_set_fallback_warn(int enable);
 
 backend *backend_weight_home(backend *b, weight_class wc);
 

@@ -124,6 +124,10 @@ status_code context_init(context *c, const config *cfg) {
 		if (n_offload > c->m.n_layers)
 			n_offload = c->m.n_layers;
 		if (n_offload < c->m.n_layers) {
+			backend_report_host_fallback(c->backend, "ngl_layers", HFB_LAYER_NOT_OFFLOADED,
+										 "%d of %d layer(s) intentionally kept on the host (cpu) "
+										 "fallback (--ngl %d)",
+										 c->m.n_layers - n_offload, c->m.n_layers, cfg->ngl);
 			s = model_set_layer_backend_range(&c->m, n_offload, c->m.n_layers, backend_host());
 			if (s != OK) {
 				ERROR("failed to apply --ngl");
@@ -145,7 +149,12 @@ status_code context_init(context *c, const config *cfg) {
 		if (n_ctx_precheck > c->m.n_ctx)
 			n_ctx_precheck = c->m.n_ctx;
 
-		backend		 *kv_owner_precheck = c->backend->kv_alloc ? c->backend : backend_host();
+		backend *kv_owner_precheck = c->backend->kv_alloc ? c->backend : backend_host();
+		if (kv_owner_precheck != c->backend)
+			backend_report_host_fallback(
+				c->backend, "kv_alloc", HFB_CAPABILITY,
+				"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+				c->backend->name);
 		kv_quant_type kv_quant_precheck = (kv_quant_type)cfg->kv_quant;
 		size_t		  kv_bytes_precheck =
 			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck);
@@ -208,7 +217,12 @@ status_code context_init(context *c, const config *cfg) {
 		n_ctx = c->m.n_ctx;
 	c->n_ctx = n_ctx;
 
-	backend		 *kv_owner = c->backend->kv_alloc ? c->backend : backend_host();
+	backend *kv_owner = c->backend->kv_alloc ? c->backend : backend_host();
+	if (kv_owner != c->backend)
+		backend_report_host_fallback(
+			c->backend, "kv_alloc", HFB_CAPABILITY,
+			"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+			c->backend->name);
 	kv_quant_type kv_quant = (kv_quant_type)cfg->kv_quant;
 	{
 		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant);
@@ -280,6 +294,7 @@ void context_free(context *c) {
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
 	backend_destroy(c->backend);
+	c->backend = NULL;
 	free(c->ids_buf.p);
 	free(c->idle_ids_buf.p);
 	free(c->fed_ids.p);

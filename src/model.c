@@ -673,9 +673,14 @@ static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t
 	return upload_tensor_repack_to(m, host_ptr, type_io, n_dims, d0, d1, wc, m->backend, out);
 }
 
-static void dequant_weight_to_f32(const void **w, uint32_t *type, size_t row_len, size_t n_rows) {
+static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *type,
+								  size_t row_len, size_t n_rows) {
 	if (*type == GGML_TYPE_F32)
 		return;
+	backend_report_host_fallback(dev, "weight_dequant", HFB_WEIGHT_TYPE,
+								 "weight type '%s' (type=%u) has no native device upload path; "
+								 "dequantized to f32 on host (cpu) before upload",
+								 ggml_type_name(*type), *type);
 	backend *host = backend_host();
 	if (!host || !host->dequant_row)
 		return;
@@ -914,55 +919,19 @@ static status_code upload_embeddings(model *m) {
 	}
 
 	if (m->has_per_layer_embeddings) {
-		if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
-			s = upload_one(m, &m->layer_dims.per_layer_tok_embd,
-						   m->layer_dims.per_layer_tok_embd.type, 2,
-						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
-						   WCLASS_EMBEDDING);
-			if (s != OK) {
-				ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
-				return s;
-			}
-		} else {
-			m->layer_dims.per_layer_tok_embd.buf.handle = NULL;
-			m->layer_dims.per_layer_tok_embd.buf.host_ptr =
-				m->layer_dims.per_layer_tok_embd.host_ptr;
-			m->layer_dims.per_layer_tok_embd.buf.owner = NULL;
+		s = upload_one(m, &m->layer_dims.per_layer_tok_embd, m->layer_dims.per_layer_tok_embd.type,
+					   2, (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
+					   WCLASS_EMBEDDING);
+		if (s != OK) {
+			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
+			return s;
 		}
-		if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_BF16) {
-			size_t n_elems = (size_t)m->dim * (size_t)m->layer_dims.n_embd_per_layer * m->n_layers;
-			float *f32_buf = xmalloc(n_elems * sizeof(float));
-			backend *host  = backend_host();
-			if (!host || !host->dequant_row) {
-				free(f32_buf);
-				return ERR_UNSUPPORTED;
-			}
-			s = host->dequant_row(host, GGML_TYPE_BF16, m->layer_dims.per_layer_model_proj.host_ptr,
-								  (int)n_elems, f32_buf);
-			if (s != OK) {
-				free(f32_buf);
-				return s;
-			}
-			if (m->gctx.map && m->gctx.map_size > 0) {
-				size_t bf16_bytes = n_elems * sizeof(uint16_t);
-				madvise_dontneed(m->gctx.map, m->gctx.map_size,
-								 m->layer_dims.per_layer_model_proj.host_ptr, bf16_bytes);
-			}
-			m->layer_dims.per_layer_model_proj.host_ptr = f32_buf;
-			s = upload_one(m, &m->layer_dims.per_layer_model_proj, GGML_TYPE_F32, 2, m->dim,
-						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, WCLASS_MATMUL);
-			if (s != OK) {
-				ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
-				return s;
-			}
-		} else {
-			s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
-								  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
-								  WCLASS_MATMUL);
-			if (s != OK) {
-				ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
-				return s;
-			}
+		s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
+							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
+							  WCLASS_MATMUL);
+		if (s != OK) {
+			ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
+			return s;
 		}
 		s = upload_one(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
 					   m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM);
@@ -1140,7 +1109,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 			size_t		orig_bytes =
 				ggml_row_size(L->ple_inp_gate_w.type, (size_t)m->layer_dims.n_embd_per_layer) *
 				(size_t)m->dim;
-			dequant_weight_to_f32(&L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
+			dequant_weight_to_f32(m->backend, &L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
 								  (size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
 			release_original_weight_data(m, orig, orig_bytes);
 			gate_owned = 1;
@@ -1157,8 +1126,8 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 			const void *orig	   = L->ple_proj_w.host_ptr;
 			size_t		orig_bytes = ggml_row_size(L->ple_proj_w.type, (size_t)m->dim) *
 									 (size_t)m->layer_dims.n_embd_per_layer;
-			dequant_weight_to_f32(&L->ple_proj_w.host_ptr, &L->ple_proj_w.type, (size_t)m->dim,
-								  (size_t)m->layer_dims.n_embd_per_layer);
+			dequant_weight_to_f32(m->backend, &L->ple_proj_w.host_ptr, &L->ple_proj_w.type,
+								  (size_t)m->dim, (size_t)m->layer_dims.n_embd_per_layer);
 			release_original_weight_data(m, orig, orig_bytes);
 			proj_owned = 1;
 		}
@@ -2273,7 +2242,7 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 					size_t		kb_bytes =
 						ggml_row_size(L->k_b_w.type, (size_t)m->mla.qk_nope * m->mla.kv_lora) *
 						(size_t)m->n_heads;
-					dequant_weight_to_f32(&L->k_b_w.host_ptr, &L->k_b_w.type,
+					dequant_weight_to_f32(m->backend, &L->k_b_w.host_ptr, &L->k_b_w.type,
 										  (size_t)m->mla.qk_nope * m->mla.kv_lora,
 										  (size_t)m->n_heads);
 					release_original_weight_data(m, kb_orig, kb_bytes);
@@ -2284,7 +2253,7 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 					size_t		vb_bytes =
 						ggml_row_size(L->v_b_w.type, (size_t)m->mla.kv_lora * m->mla.v_head) *
 						(size_t)m->n_heads;
-					dequant_weight_to_f32(&L->v_b_w.host_ptr, &L->v_b_w.type,
+					dequant_weight_to_f32(m->backend, &L->v_b_w.host_ptr, &L->v_b_w.type,
 										  (size_t)m->mla.kv_lora * m->mla.v_head,
 										  (size_t)m->n_heads);
 					release_original_weight_data(m, vb_orig, vb_bytes);
@@ -3014,13 +2983,6 @@ void model_free(model *m) {
 		if (m->has_per_layer_embeddings) {
 			free_weight_buf(&m->layer_dims.per_layer_tok_embd.buf);
 			free_weight_buf(&m->layer_dims.per_layer_model_proj.buf);
-			if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_F32 &&
-				m->layer_dims.per_layer_model_proj.host_ptr &&
-				m->layer_dims.per_layer_model_proj.host_ptr !=
-					m->layer_dims.per_layer_tok_embd.host_ptr) {
-				free((void *)m->layer_dims.per_layer_model_proj.host_ptr);
-				m->layer_dims.per_layer_model_proj.host_ptr = NULL;
-			}
 			free_weight_buf(&m->layer_dims.per_layer_proj_norm_w.buf);
 		}
 		if (m->rope_freqs_count > 0)

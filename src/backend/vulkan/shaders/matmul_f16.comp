@@ -1,0 +1,114 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly restrict buffer WBuf {
+	uint w[];
+};
+layout(set = 0, binding = 1) readonly restrict buffer XBuf {
+	float x[];
+};
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly restrict buffer RBuf {
+	float residual[];
+};
+layout(set = 0, binding = 3) writeonly restrict buffer YBuf {
+	float y[];
+};
+#else
+layout(set = 0, binding = 2) writeonly restrict buffer YBuf {
+	float y[];
+};
+#endif
+
+layout(push_constant) uniform Params {
+	int n;
+	int k;
+	int m;
+}
+params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w
+#define W_PFX w_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+
+void main() {
+	const int n = params.n;
+	const int k = params.k;
+	if (n <= 0)
+		return;
+
+	const uint tid	  = gl_LocalInvocationID.x;
+	const uint wgsize = gl_WorkGroupSize.x;
+	const uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+
+	const uint row	 = gl_WorkGroupID.y;
+	const uint x_off = row * uint(k);
+	const uint y_off = row * uint(n);
+
+	uint row_off[ROWS_PER_THREAD];
+	bool valid[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+		const uint idx = base_i + uint(r);
+		valid[r]	   = idx < uint(n);
+		row_off[r]	   = min(idx, uint(n) - 1u) * uint(k) * 2u;
+	}
+
+	float acc[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; ++r)
+		acc[r] = 0.0;
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		const int  tile_end = min(tile_start + TILE_K, k);
+		const int  tile_len = tile_end - tile_start;
+		const uint tile_off = uint(tile_start);
+
+		for (int j = int(tid); j < tile_len; j += int(wgsize))
+			x_shared[j] = x[x_off + tile_off + uint(j)];
+		barrier();
+
+		int j = 0;
+		for (; j + 2 <= tile_len; j += 2) {
+			const float x0 = x_shared[j + 0];
+			const float x1 = x_shared[j + 1];
+
+			float wv0[ROWS_PER_THREAD];
+			float wv1[ROWS_PER_THREAD];
+			for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+				const uint word = w_read_u32(row_off[r] + uint(tile_off + j) * 2u);
+				wv0[r]			= half_to_float(word & 0xFFFFu);
+				wv1[r]			= half_to_float(word >> 16u);
+			}
+			for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+				acc[r] += wv0[r] * x0;
+				acc[r] += wv1[r] * x1;
+			}
+		}
+		for (; j < tile_len; ++j) {
+			const float xv = x_shared[j];
+			for (int r = 0; r < ROWS_PER_THREAD; ++r)
+				acc[r] += half_to_float(w_read_u16(row_off[r] + uint(tile_off + j) * 2u)) * xv;
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+		if (!valid[r])
+			continue;
+		const uint o = y_off + base_i + uint(r);
+#ifdef HAS_RESIDUAL
+		y[o] = acc[r] + residual[o];
+#else
+		y[o] = acc[r];
+#endif
+	}
+}

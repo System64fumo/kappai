@@ -70,6 +70,11 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
+	if (kv_backend != c->backend)
+		backend_report_host_fallback(
+			c->backend, "kv_alloc", HFB_CAPABILITY,
+			"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+			c->backend->name);
 
 	if (kv_quant == KV_QUANT_Q8_0 && !backend_has_cap(kv_backend, BCAP_KV_QUANT_Q8_0)) {
 		ERROR("kvcache: backend '%s' does not support Q8_0 quantized KV cache; "

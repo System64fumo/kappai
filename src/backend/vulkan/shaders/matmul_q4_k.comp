@@ -173,13 +173,14 @@ void main() {
 				uint s_off = block_off + 4u;
 				uint q_off = block_off + 16u;
 				int	 ib	   = local_bi * 16;
-				int	 is	   = 0;
+
+				uint sc_d[8], sc_m[8];
+				w0_get_all_scale_min_k4(s_off, sc_d, sc_m);
+
 				for (int g = 0; g < 4; g++) {
-					uint sc0_u, m0_u, sc1_u, m1_u;
-					w0_get_scale_min_k4(s_off, is + 0, sc0_u, m0_u);
-					w0_get_scale_min_k4(s_off, is + 1, sc1_u, m1_u);
-					int s0 = int(sc0_u), m0 = int(m0_u);
-					int s1 = int(sc1_u), m1 = int(m1_u);
+					int is = g * 2;
+					int s0 = int(sc_d[is]), m0 = int(sc_m[is]);
+					int s1 = int(sc_d[is + 1]), m1 = int(sc_m[is + 1]);
 
 					int dot0 = 0, dot1 = 0;
 					for (int l = 0; l < 32; l += 4) {
@@ -204,7 +205,6 @@ void main() {
 					ib += 2;
 					summ += m1 * (xq_bsums[ib] + xq_bsums[ib + 1]);
 					ib += 2;
-					is += 2;
 				}
 				acc0 = fma(xd, d * float(sumi) - dmin * float(summ), acc0);
 			}
@@ -226,13 +226,14 @@ void main() {
 				uint s_off = block_off + 4u;
 				uint q_off = block_off + 16u;
 				int	 ib	   = local_bi * 16;
-				int	 is	   = 0;
+
+				uint sc_d[8], sc_m[8];
+				w1_get_all_scale_min_k4(s_off, sc_d, sc_m);
+
 				for (int g = 0; g < 4; g++) {
-					uint sc0_u, m0_u, sc1_u, m1_u;
-					w1_get_scale_min_k4(s_off, is + 0, sc0_u, m0_u);
-					w1_get_scale_min_k4(s_off, is + 1, sc1_u, m1_u);
-					int s0 = int(sc0_u), m0 = int(m0_u);
-					int s1 = int(sc1_u), m1 = int(m1_u);
+					int is = g * 2;
+					int s0 = int(sc_d[is]), m0 = int(sc_m[is]);
+					int s1 = int(sc_d[is + 1]), m1 = int(sc_m[is + 1]);
 
 					int dot0 = 0, dot1 = 0;
 					for (int l = 0; l < 32; l += 4) {
@@ -257,7 +258,6 @@ void main() {
 					ib += 2;
 					summ += m1 * (xq_bsums[ib] + xq_bsums[ib + 1]);
 					ib += 2;
-					is += 2;
 				}
 				acc1 = fma(xd, d * float(sumi) - dmin * float(summ), acc1);
 			}
