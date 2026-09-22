@@ -1,6 +1,5 @@
 #include "moe/moe_common.h"
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
 #include "common.h"
 #include "compute.h"
 #include "config.h"
@@ -56,8 +55,10 @@ status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const
 		st = moe_matmul_maybe_qonly(cx, es->gate_w, es->gate_type, xb, gu_h, cx->inter * 2, tid);
 		if (st != OK)
 			return st;
-		moe_activate(act_h, gu_h, gu_h + cx->inter, cx->inter, es->gate_scale, es->up_scale,
-					 cx->use_gelu);
+		st = moe_activate(cx->a, act_h, gu_h, gu_h + cx->inter, cx->inter, es->gate_scale,
+						  es->up_scale, cx->use_gelu);
+		if (st != OK)
+			return st;
 	} else {
 		st = moe_matmul_maybe_qonly(cx, es->gate_w, es->gate_type, xb, gate_h, cx->inter, tid);
 		if (st != OK)
@@ -65,7 +66,10 @@ status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const
 		st = moe_matmul_maybe_qonly(cx, es->up_w, es->up_type, xb, up_h, cx->inter, tid);
 		if (st != OK)
 			return st;
-		moe_activate(act_h, gate_h, up_h, cx->inter, es->gate_scale, es->up_scale, cx->use_gelu);
+		st = moe_activate(cx->a, act_h, gate_h, up_h, cx->inter, es->gate_scale, es->up_scale,
+						  cx->use_gelu);
+		if (st != OK)
+			return st;
 	}
 
 	st = cx->a->matmul_thread_local(cx->a, es->down_w, es->down_type, act_h, y_h, cx->dim,

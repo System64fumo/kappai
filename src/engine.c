@@ -290,8 +290,11 @@ static int list_devices(void) {
 		if (!infos[i].available)
 			continue;
 		for (int d = 0; d < infos[i].n_devices; d++) {
-			bool is_host = (infos[i].caps & BCAP_IS_HOST) != 0;
-			printf("  %s%d%s\n", infos[i].name, d, is_host ? " (host fallback)" : "");
+			if (infos[i].n_devices > 1)
+				printf("  %s:%d", infos[i].name, d);
+			else
+				printf("  %s", infos[i].name);
+			printf("\n");
 		}
 	}
 	return 0;

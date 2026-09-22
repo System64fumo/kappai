@@ -59,6 +59,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_FFN_ACTIVATE_EX]	 = "ffn_activate_ex",
 		[OPFAM_ATTENTION]		 = "attention",
 		[OPFAM_ATTENTION_SWA]	 = "attention_swa",
+		[OPFAM_ATTENTION_MLA]	 = "attention_mla",
 		[OPFAM_KV_PUT]			 = "kv_put",
 		[OPFAM_ARGMAX]			 = "argmax",
 		[OPFAM_ARCH_LAYER]		 = "arch.single_layer",
@@ -754,16 +755,17 @@ int wants_all(int argc, char **argv) {
 void usage(const char *prog) {
 	fprintf(stderr,
 			"Usage:\n"
-			"  %s [--all | <backend>...]         per-op + combined-op validation vs CPU\n"
+			"  %s [--all | <target>...]        per-op validation: target(s) vs default reference\n"
+			"  %s <ref> <target>...            backend-vs-backend: <ref> is the reference\n"
 			"  %s --bench [--all | <backend>]   per-quant matmul GFLOPS per backend\n"
 			"  %s --model <path> [--all | <b>...]  real-model greedy-decode cross-check\n"
 			"\n"
 			"Modes:\n"
-			"  (default)    per-op correctness (each op vs CPU) plus combined-op tests\n"
+			"  (default)    per-op correctness (each op vs reference) plus combined-op tests\n"
 			"               (single layer, multi-layer prefill, decode chains, and a full\n"
 			"               prompt-processing + %d-token generation sweep across "
 			"architectures) --\n"
-			"               catches compounding errors across op chains; CPU errors or\n"
+			"               catches compounding errors across op chains; reference errors or\n"
 			"               NaN/Inf at any step are always reported as a failure\n"
 			"  --bench      per-quant matmul GFLOPS, every M row count, each backend\n"
 			"  --model      load a real GGUF model and cross-validate greedy decode\n"
@@ -775,7 +777,7 @@ void usage(const char *prog) {
 			"  -h, --help         this message\n"
 			"\n"
 			"Available backends: ",
-			prog, prog, prog, ARCH_GENERATE_N_DECODE);
+			prog, prog, prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
 	backend_info infos[BACKEND_MAX];
 	int			 n = backend_list(infos, BACKEND_MAX);
 	for (int i = 0; i < n; i++)

@@ -8,8 +8,8 @@
 
 int	 moe_topk_select(const float *scores, int n_experts, int top_k, int *top_idx, float *top_score);
 void moe_apply_weights(float *weight, int n_k, int norm_topk, float routed_scale);
-void moe_activate(float *act, const float *gate, const float *up, int n_i, float gs, float us,
-				  int use_gelu);
+status_code moe_activate(backend *a, float *act, const float *gate, const float *up, int n_i,
+						 float gs, float us, int use_gelu);
 
 typedef struct {
 	backend		 *a;

@@ -310,7 +310,7 @@ static void matmul_q5_1_q8_qonly_f32_i8mm(const void *w, const q8_1_block *restr
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -487,7 +487,7 @@ void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -1841,7 +1841,7 @@ static void matmul_q5_0_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restr
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -2000,7 +2000,7 @@ void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -2757,7 +2757,7 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
@@ -3293,7 +3293,7 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -3765,7 +3765,7 @@ static void matmul_q6_k_q8_qonly_f32_i8mm(const void *w, const q8_k_block *restr
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * n_bi_tiles);
@@ -3943,7 +3943,7 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * n_bi_tiles);
@@ -4594,7 +4594,7 @@ static void matmul_iq4_nl_q8_qonly_f32_i8mm(const void *w, const q8_0_block *res
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -4757,7 +4757,7 @@ void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
@@ -4920,7 +4920,7 @@ void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst) {
 				uint32_t idx0 = q0 | ((qh0 << (8 - (2 * l))) & 256);
 				uint32_t idx1 = q1 | ((qh0 << (7 - (2 * l))) & 256);
 
-				uint32x2_t packed = {iq3s_grid[idx0], iq3s_grid[idx1]};
+				uint32x2_t packed = {ggml_iq3s_grid[idx0], ggml_iq3s_grid[idx1]};
 				uint8x8_t  bytes  = vreinterpret_u8_u32(packed);
 				uint16x8_t u16	  = vmovl_u8(bytes);
 				uint32x4_t u32_0  = vmovl_u16(vget_low_u16(u16));
@@ -4951,7 +4951,7 @@ void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst) {
 				uint32_t idx0 = q0 | ((qh1 << (8 - (2 * l))) & 256);
 				uint32_t idx1 = q1 | ((qh1 << (7 - (2 * l))) & 256);
 
-				uint32x2_t packed = {iq3s_grid[idx0], iq3s_grid[idx1]};
+				uint32x2_t packed = {ggml_iq3s_grid[idx0], ggml_iq3s_grid[idx1]};
 				uint8x8_t  bytes  = vreinterpret_u8_u32(packed);
 				uint16x8_t u16	  = vmovl_u8(bytes);
 				uint32x4_t u32_0  = vmovl_u16(vget_low_u16(u16));
@@ -4994,7 +4994,7 @@ static inline int8x8_t iq3s_flip8(uint8_t q0, uint8_t q1, uint8_t qh, uint8_t si
 								  int sh1) {
 	uint32_t   idx0 = q0 | ((qh << sh0) & 256);
 	uint32_t   idx1 = q1 | ((qh << sh1) & 256);
-	uint32x2_t pk	= {iq3s_grid[idx0], iq3s_grid[idx1]};
+	uint32x2_t pk	= {ggml_iq3s_grid[idx0], ggml_iq3s_grid[idx1]};
 	uint8x8_t  gr	= vreinterpret_u8_u32(pk);
 	uint8x8_t  nm	= vld1_u8(iq3s_sign_pattern[sign_byte]);
 	return vreinterpret_s8_u8(vsub_u8(veor_u8(gr, nm), nm));
@@ -5701,6 +5701,16 @@ static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								 int n, int k, int m) {
+	{
+		int n_full = n - (n % Q4_0_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_q4_0_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+													   y + ((size_t)t * y_row_stride), n_full, n,
+													   k);
+		}
+		n = n_full;
+	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	matmul_q4_0_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
@@ -6042,6 +6052,16 @@ static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								 int n, int k, int m) {
+	{
+		int n_full = n - (n % Q8_0_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_q8_0_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+													   y + ((size_t)t * y_row_stride), n_full, n,
+													   k);
+		}
+		n = n_full;
+	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	matmul_q8_0_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
@@ -6300,6 +6320,16 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *
 void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								   int n, int k, int m) {
+	{
+		int n_full = n - (n % IQ4_NL_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_iq4_nl_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+														 y + ((size_t)t * y_row_stride), n_full, n,
+														 k);
+		}
+		n = n_full;
+	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	matmul_iq4_nl_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
@@ -6731,7 +6761,7 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
@@ -7353,6 +7383,16 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 									 size_t		 xq_row_stride_blocks, float *restrict y,
 									 int y_row_stride, int n, int k, int m) {
+	{
+		int n_full = n - (n % IQ3_S_RE8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
+		}
+		n = n_full;
+	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
@@ -7377,7 +7417,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles) {
+			if (cache_cap < n_bi_tiles || !d_w_cache) {
 				void *tmp;
 				int	  grew = 1;
 				tmp		   = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
@@ -7821,98 +7861,6 @@ void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *res
 	const int		mr = 4;
 	int				i  = 0;
 
-#if defined(__ARM_FEATURE_BF16)
-#define F32x2_TO_BF16x8(lo, hi)                                                                    \
-	vreinterpretq_bf16_u16(vcombine_u16(vshrn_n_u32(vreinterpretq_u32_f32(lo), 16),                \
-										vshrn_n_u32(vreinterpretq_u32_f32(hi), 16)))
-
-	for (; i + mr <= n; i += mr) {
-		float32x4_t acc[4];
-		for (int r = 0; r < 4; r++)
-			acc[r] = vdupq_n_f32(0.0f);
-
-		const uint16_t *rows[4];
-		for (int r = 0; r < 4; r++)
-			rows[r] = Wb + (size_t)(i + r) * k;
-
-		int j = 0;
-		for (; j + 16 <= k; j += 16) {
-			PREFETCH(x + j + PF_ELEMS(32));
-			for (int r = 0; r < 4; r++)
-				PREFETCH(rows[r] + j + PF_ELEMS(32));
-			float32x4_t	 x0	 = vld1q_f32(x + j);
-			float32x4_t	 x1	 = vld1q_f32(x + j + 4);
-			float32x4_t	 x2	 = vld1q_f32(x + j + 8);
-			float32x4_t	 x3	 = vld1q_f32(x + j + 12);
-			bfloat16x8_t xb0 = F32x2_TO_BF16x8(x0, x1);
-			bfloat16x8_t xb1 = F32x2_TO_BF16x8(x2, x3);
-			for (int r = 0; r < 4; r++) {
-				bfloat16x8_t wb0 = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j));
-				bfloat16x8_t wb1 = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j + 8));
-				acc[r]			 = vbfdotq_f32(acc[r], wb0, xb0);
-				acc[r]			 = vbfdotq_f32(acc[r], wb1, xb1);
-			}
-		}
-		for (; j + 8 <= k; j += 8) {
-			float32x4_t	 x0 = vld1q_f32(x + j);
-			float32x4_t	 x1 = vld1q_f32(x + j + 4);
-			bfloat16x8_t xb = F32x2_TO_BF16x8(x0, x1);
-			for (int r = 0; r < 4; r++) {
-				bfloat16x8_t wb = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j));
-				acc[r]			= vbfdotq_f32(acc[r], wb, xb);
-			}
-		}
-		for (int r = 0; r < 4; r++) {
-			float s = vaddvq_f32(acc[r]);
-			for (int j2 = j; j2 < k; j2++) {
-				union {
-					uint32_t u;
-					float	 f;
-				} v;
-				v.u = ((uint32_t)rows[r][j2]) << 16;
-				s += v.f * x[j2];
-			}
-			y[i + r] = s;
-		}
-	}
-	for (; i < n; i++) {
-		const uint16_t *restrict wr = Wb + (size_t)i * k;
-		float32x4_t acc0			= vdupq_n_f32(0.0f);
-		float32x4_t acc1			= vdupq_n_f32(0.0f);
-		int			j				= 0;
-		for (; j + 16 <= k; j += 16) {
-			PREFETCH(wr + j + PF_ELEMS(32));
-			float32x4_t	 x0	 = vld1q_f32(x + j);
-			float32x4_t	 x1	 = vld1q_f32(x + j + 4);
-			float32x4_t	 x2	 = vld1q_f32(x + j + 8);
-			float32x4_t	 x3	 = vld1q_f32(x + j + 12);
-			bfloat16x8_t xb0 = F32x2_TO_BF16x8(x0, x1);
-			bfloat16x8_t xb1 = F32x2_TO_BF16x8(x2, x3);
-			bfloat16x8_t wb0 = vreinterpretq_bf16_u16(vld1q_u16(wr + j));
-			bfloat16x8_t wb1 = vreinterpretq_bf16_u16(vld1q_u16(wr + j + 8));
-			acc0			 = vbfdotq_f32(acc0, wb0, xb0);
-			acc1			 = vbfdotq_f32(acc1, wb1, xb1);
-		}
-		for (; j + 8 <= k; j += 8) {
-			float32x4_t	 x0 = vld1q_f32(x + j);
-			float32x4_t	 x1 = vld1q_f32(x + j + 4);
-			bfloat16x8_t xb = F32x2_TO_BF16x8(x0, x1);
-			bfloat16x8_t wb = vreinterpretq_bf16_u16(vld1q_u16(wr + j));
-			acc0			= vbfdotq_f32(acc0, wb, xb);
-		}
-		float s = vaddvq_f32(acc0) + vaddvq_f32(acc1);
-		for (; j < k; j++) {
-			union {
-				uint32_t u;
-				float	 f;
-			} v;
-			v.u = ((uint32_t)wr[j]) << 16;
-			s += v.f * x[j];
-		}
-		y[i] = s;
-	}
-#undef F32x2_TO_BF16x8
-#else
 	for (; i + mr <= n; i += mr) {
 		float32x4_t acc[4];
 		for (int r = 0; r < 4; r++)
@@ -8016,7 +7964,6 @@ void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *res
 		}
 		y[i] = s;
 	}
-#endif
 }
 
 void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y,
@@ -8031,105 +7978,6 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 	const int		mr = 4;
 	int				i  = 0;
 
-#if defined(__ARM_FEATURE_BF16)
-#define F32x2_TO_BF16x8(lo, hi)                                                                    \
-	vreinterpretq_bf16_u16(vcombine_u16(vshrn_n_u32(vreinterpretq_u32_f32(lo), 16),                \
-										vshrn_n_u32(vreinterpretq_u32_f32(hi), 16)))
-
-	for (; i + mr <= n; i += mr) {
-		const uint16_t *rows[4];
-		for (int r = 0; r < 4; r++)
-			rows[r] = Wb + (size_t)(i + r) * k;
-
-		for (int t = 0; t < m; t++) {
-			const float *xt = x + (size_t)t * x_row_stride;
-			float32x4_t	 acc[4];
-			for (int r = 0; r < 4; r++)
-				acc[r] = vdupq_n_f32(0.0f);
-
-			int j = 0;
-			for (; j + 16 <= k; j += 16) {
-				PREFETCH(xt + j + PF_ELEMS(32));
-				for (int r = 0; r < 4; r++)
-					PREFETCH(rows[r] + j + PF_ELEMS(32));
-				float32x4_t	 x0	 = vld1q_f32(xt + j);
-				float32x4_t	 x1	 = vld1q_f32(xt + j + 4);
-				float32x4_t	 x2	 = vld1q_f32(xt + j + 8);
-				float32x4_t	 x3	 = vld1q_f32(xt + j + 12);
-				bfloat16x8_t xb0 = F32x2_TO_BF16x8(x0, x1);
-				bfloat16x8_t xb1 = F32x2_TO_BF16x8(x2, x3);
-				for (int r = 0; r < 4; r++) {
-					bfloat16x8_t wb0 = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j));
-					bfloat16x8_t wb1 = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j + 8));
-					acc[r]			 = vbfdotq_f32(acc[r], wb0, xb0);
-					acc[r]			 = vbfdotq_f32(acc[r], wb1, xb1);
-				}
-			}
-			for (; j + 8 <= k; j += 8) {
-				float32x4_t	 x0 = vld1q_f32(xt + j);
-				float32x4_t	 x1 = vld1q_f32(xt + j + 4);
-				bfloat16x8_t xb = F32x2_TO_BF16x8(x0, x1);
-				for (int r = 0; r < 4; r++) {
-					bfloat16x8_t wb = vreinterpretq_bf16_u16(vld1q_u16(rows[r] + j));
-					acc[r]			= vbfdotq_f32(acc[r], wb, xb);
-				}
-			}
-			float *yt = y + (size_t)t * y_row_stride;
-			for (int r = 0; r < 4; r++) {
-				float s = vaddvq_f32(acc[r]);
-				for (int j2 = j; j2 < k; j2++) {
-					union {
-						uint32_t u;
-						float	 f;
-					} v;
-					v.u = ((uint32_t)rows[r][j2]) << 16;
-					s += v.f * xt[j2];
-				}
-				yt[i + r] = s;
-			}
-		}
-	}
-	for (; i < n; i++) {
-		const uint16_t *restrict wr = Wb + (size_t)i * k;
-		for (int t = 0; t < m; t++) {
-			const float *xt	  = x + (size_t)t * x_row_stride;
-			float32x4_t	 acc0 = vdupq_n_f32(0.0f);
-			float32x4_t	 acc1 = vdupq_n_f32(0.0f);
-			int			 j	  = 0;
-			for (; j + 16 <= k; j += 16) {
-				PREFETCH(wr + j + PF_ELEMS(32));
-				float32x4_t	 x0	 = vld1q_f32(xt + j);
-				float32x4_t	 x1	 = vld1q_f32(xt + j + 4);
-				float32x4_t	 x2	 = vld1q_f32(xt + j + 8);
-				float32x4_t	 x3	 = vld1q_f32(xt + j + 12);
-				bfloat16x8_t xb0 = F32x2_TO_BF16x8(x0, x1);
-				bfloat16x8_t xb1 = F32x2_TO_BF16x8(x2, x3);
-				bfloat16x8_t wb0 = vreinterpretq_bf16_u16(vld1q_u16(wr + j));
-				bfloat16x8_t wb1 = vreinterpretq_bf16_u16(vld1q_u16(wr + j + 8));
-				acc0			 = vbfdotq_f32(acc0, wb0, xb0);
-				acc1			 = vbfdotq_f32(acc1, wb1, xb1);
-			}
-			for (; j + 8 <= k; j += 8) {
-				float32x4_t	 x0 = vld1q_f32(xt + j);
-				float32x4_t	 x1 = vld1q_f32(xt + j + 4);
-				bfloat16x8_t xb = F32x2_TO_BF16x8(x0, x1);
-				bfloat16x8_t wb = vreinterpretq_bf16_u16(vld1q_u16(wr + j));
-				acc0			= vbfdotq_f32(acc0, wb, xb);
-			}
-			float s = vaddvq_f32(acc0) + vaddvq_f32(acc1);
-			for (; j < k; j++) {
-				union {
-					uint32_t u;
-					float	 f;
-				} v;
-				v.u = ((uint32_t)wr[j]) << 16;
-				s += v.f * xt[j];
-			}
-			y[(size_t)t * y_row_stride + i] = s;
-		}
-	}
-#undef F32x2_TO_BF16x8
-#else
 	for (; i + mr <= n; i += mr) {
 		const uint16_t *rows[4];
 		for (int r = 0; r < 4; r++)
@@ -8240,7 +8088,6 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 			y[(size_t)t * y_row_stride + i] = s;
 		}
 	}
-#endif
 }
 
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
@@ -9061,7 +8908,7 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local float (*dmin_w_cache)[MR]		  = NULL;
 		static _Thread_local int cache_cap					  = 0;
 
-		if (cache_cap < blocks_per_row) {
+		if (cache_cap < blocks_per_row || !d_w_cache) {
 			void *tmp;
 			int	  grew = 1;
 			tmp		   = realloc(wlo_cache, sizeof(*wlo_cache) * blocks_per_row);
@@ -9364,6 +9211,16 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								   int n, int k, int m) {
+	{
+		int n_full = n - (n % Q4_K_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_q4_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+														 y + ((size_t)t * y_row_stride), n_full, n,
+														 k);
+		}
+		n = n_full;
+	}
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
 			matmul_q4_k_r8_q8_k_qonly_f32_vec_single(w, xq + ((size_t)t * xq_row_stride_blocks),
@@ -9598,7 +9455,7 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local float (*dmin_cache)[MR]		= NULL;
 		static _Thread_local int cache_cap					= 0;
 
-		if (cache_cap < blocks_per_row) {
+		if (cache_cap < blocks_per_row || !d_cache) {
 			void *tmp;
 			int	  grew = 1;
 			tmp		   = realloc(lo_cache, sizeof(*lo_cache) * blocks_per_row);
@@ -9839,6 +9696,16 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								   int n, int k, int m) {
+	{
+		int n_full = n - (n % Q5_K_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_q5_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+														 y + ((size_t)t * y_row_stride), n_full, n,
+														 k);
+		}
+		n = n_full;
+	}
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
 			matmul_q5_k_r8_q8_k_qonly_f32_vec_single(w, xq + ((size_t)t * xq_row_stride_blocks),
@@ -10046,7 +9913,7 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
 		static _Thread_local int cache_cap					   = 0;
 
-		if (cache_cap < blocks_per_row) {
+		if (cache_cap < blocks_per_row || !d_w_cache) {
 			void *tmp;
 			int	  grew = 1;
 			tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * blocks_per_row);
@@ -10209,7 +10076,7 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
 		static _Thread_local int cache_cap					   = 0;
 
-		if (cache_cap < blocks_per_row) {
+		if (cache_cap < blocks_per_row || !d_w_cache) {
 			void *tmp;
 			int	  grew = 1;
 			tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * blocks_per_row);
@@ -10376,6 +10243,16 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 void matmul_q6_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								   int n, int k, int m) {
+	{
+		int n_full = n - (n % Q6_K_R8_ROWS);
+		if (n_full < n) {
+			for (int t = 0; t < m; t++)
+				matmul_q6_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
+														 y + ((size_t)t * y_row_stride), n_full, n,
+														 k);
+		}
+		n = n_full;
+	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	if (m >= I8MM_NR) {
 		matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k,

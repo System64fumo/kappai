@@ -163,8 +163,8 @@ int run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_back
 
 	int do_all = wants_all(argc, argv);
 	for (int bi = 0; bi < n_backends; bi++) {
-		int want = do_all || strcmp(infos[bi].name, "cpu") == 0 ||
-				   matches_name(argc, argv, infos[bi].name);
+		int want =
+			do_all || (infos[bi].caps & BCAP_IS_HOST) || matches_name(argc, argv, infos[bi].name);
 		if (!want)
 			continue;
 		if (!infos[bi].available) {

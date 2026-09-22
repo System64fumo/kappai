@@ -1,5 +1,4 @@
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
 #include "common.h"
 #include "log.h"
 #include "recipe.h"
@@ -26,6 +25,67 @@
 #define VK_MAX_BINDINGS 8
 #define VK_KV_MAGIC 0x564b4b56u
 #define VK_RING_DEPTH 4
+
+static inline uint32_t vk_f32_to_bits(float f) {
+	union {
+		float	 v;
+		uint32_t b;
+	} u = {.v = f};
+	return u.b;
+}
+
+static inline float vk_f32_from_bits(uint32_t b) {
+	union {
+		uint32_t b;
+		float	 v;
+	} u = {.b = b};
+	return u.v;
+}
+
+static uint16_t vk_f32_to_f16(float f) {
+	float	 base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
+	uint32_t w		= vk_f32_to_bits(f);
+	uint32_t shl1_w = w + w;
+	uint32_t sign	= w & 0x80000000u;
+	uint32_t bias	= shl1_w & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	base			   = vk_f32_from_bits((bias >> 1) + 0x07800000u) + base;
+	uint32_t bits	   = vk_f32_to_bits(base);
+	uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
+	uint32_t mant_bits = bits & 0x0FFFu;
+	uint32_t nonsign   = exp_bits + mant_bits;
+	return (sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign);
+}
+
+static float vk_f16_to_f32(uint16_t h) {
+	uint32_t w			  = (uint32_t)h << 16;
+	uint32_t sign		  = w & 0x80000000u;
+	uint32_t two_w		  = w + w;
+	uint32_t exp_offset	  = 0xE0u << 23;
+	float	 exp_scale	  = 0x1.0p-112f;
+	float	 normalized	  = vk_f32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+	uint32_t magic_mask	  = 126u << 23;
+	float	 denormalized = vk_f32_from_bits((two_w >> 17) | magic_mask) - 0.5f;
+	uint32_t cutoff		  = 1u << 27;
+	uint32_t bits = two_w < cutoff ? vk_f32_to_bits(denormalized) : vk_f32_to_bits(normalized);
+	return vk_f32_from_bits(sign | bits);
+}
+
+static void vk_softmax_masked(float *scores, int n_valid) {
+	float m = scores[0];
+	for (int i = 1; i < n_valid; i++)
+		if (scores[i] > m)
+			m = scores[i];
+	float sum = 0.0f;
+	for (int i = 0; i < n_valid; i++) {
+		scores[i] = expf(scores[i] - m);
+		sum += scores[i];
+	}
+	float inv = 1.0f / sum;
+	for (int i = 0; i < n_valid; i++)
+		scores[i] *= inv;
+}
 
 enum elem_mode {
 	ELEM_MODE_COPY			   = 0,
@@ -339,7 +399,6 @@ typedef struct {
 typedef struct {
 	uint32_t	w_type;
 	const char *name;
-	size_t		block_bytes;
 	int			block_elems;
 	size_t		d_off;
 	int			has_dmin;
@@ -347,16 +406,11 @@ typedef struct {
 } kquant_probe_fmt;
 
 static const kquant_probe_fmt KQUANT_PROBE_FORMATS[] = {
-	{GGML_TYPE_Q4_K, "q4_K", sizeof(q4_k_block), 256, 0, 1, 2},
-	{GGML_TYPE_Q5_K, "q5_K", sizeof(q5_k_block), 256, 0, 1, 2},
-	{GGML_TYPE_Q6_K, "q6_K", sizeof(q6_k_block), 256, 208, 0, 0},
-	{GGML_TYPE_Q4_0, "q4_0", sizeof(q4_0_block), 32, 0, 0, 0},
-	{GGML_TYPE_Q4_1, "q4_1", sizeof(q4_1_block), 32, 0, 1, 2},
-	{GGML_TYPE_Q5_0, "q5_0", sizeof(q5_0_block), 32, 0, 0, 0},
-	{GGML_TYPE_Q5_1, "q5_1", sizeof(q5_1_block), 32, 0, 1, 2},
-	{GGML_TYPE_Q8_0, "q8_0", sizeof(q8_0_block), 32, 0, 0, 0},
-	{GGML_TYPE_IQ4_NL, "iq4_nl", sizeof(iq4_nl_block), 32, 0, 0, 0},
-	{GGML_TYPE_IQ3_S, "iq3_s", sizeof(iq3_s_block), 256, 0, 0, 0},
+	{GGML_TYPE_Q4_K, "q4_K", 256, 0, 1, 2},	   {GGML_TYPE_Q5_K, "q5_K", 256, 0, 1, 2},
+	{GGML_TYPE_Q6_K, "q6_K", 256, 208, 0, 0},  {GGML_TYPE_Q4_0, "q4_0", 32, 0, 0, 0},
+	{GGML_TYPE_Q4_1, "q4_1", 32, 0, 1, 2},	   {GGML_TYPE_Q5_0, "q5_0", 32, 0, 0, 0},
+	{GGML_TYPE_Q5_1, "q5_1", 32, 0, 1, 2},	   {GGML_TYPE_Q8_0, "q8_0", 32, 0, 0, 0},
+	{GGML_TYPE_IQ4_NL, "iq4_nl", 32, 0, 0, 0}, {GGML_TYPE_IQ3_S, "iq3_s", 256, 0, 0, 0},
 };
 
 #define N_KQUANT_PROBE_FORMATS                                                                     \
@@ -2096,13 +2150,13 @@ static status_code vk_init(backend *self, int device_index) {
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 		if (p->caps.unified_memory)
 			grid_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		s = vk_alloc_buffer(p, sizeof(iq3s_grid), grid_usage, grid_flags, &p->iq3s_grid_buf);
+		s = vk_alloc_buffer(p, sizeof(ggml_iq3s_grid), grid_usage, grid_flags, &p->iq3s_grid_buf);
 		if (s != OK) {
 			WARN("vulkan: failed to allocate IQ3_S grid buffer -- "
 				 "IQ3_S grid path will be disabled");
 			p->iq3s_grid_buf.buf = VK_NULL_HANDLE;
 		} else {
-			memcpy(p->iq3s_grid_buf.mapped, iq3s_grid, sizeof(iq3s_grid));
+			memcpy(p->iq3s_grid_buf.mapped, ggml_iq3s_grid, sizeof(ggml_iq3s_grid));
 		}
 	}
 
@@ -3608,20 +3662,18 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 		return ERR_UNSUPPORTED;
 	}
 
-	float *dst_host = xmalloc((size_t)dim * sizeof(float));
-	switch (tok_embd_type) {
-	case GGML_TYPE_F32:
-		memcpy(dst_host, embd_host, (size_t)dim * sizeof(float));
-		break;
-	case GGML_TYPE_F16:
-		dequant_f16_row(embd_host, dim, dst_host);
-		break;
-	case GGML_TYPE_IQ3_S:
-		dequant_iq3_s_row(embd_host, (size_t)dim / 256, dst_host);
-		break;
-	default:
+	float	*dst_host = xmalloc((size_t)dim * sizeof(float));
+	backend *host	  = backend_host();
+	if ((!host || !host->dequant_row) ||
+		(tok_embd_type != GGML_TYPE_F32 && tok_embd_type != GGML_TYPE_F16 &&
+		 tok_embd_type != GGML_TYPE_IQ3_S)) {
 		free(dst_host);
 		return ERR_UNSUPPORTED;
+	}
+	status_code dq = host->dequant_row(host, tok_embd_type, embd_host, dim, dst_host);
+	if (dq != OK) {
+		free(dst_host);
+		return dq;
 	}
 
 	status_code s = vk_buffer_write_f32(self, x_out, dst_host, dim);
@@ -3696,7 +3748,8 @@ static int kquant_probe_shape(backend *self, const kquant_probe_fmt *fmt, int n,
 							  uint32_t seed, float *out_dev0, float *out_cpu0,
 							  status_code *out_status) {
 	int	   blocks_per_row = k / fmt->block_elems;
-	size_t row_bytes	  = fmt->block_bytes * (size_t)blocks_per_row;
+	size_t block_bytes	  = ggml_row_size(fmt->w_type, (size_t)fmt->block_elems);
+	size_t row_bytes	  = block_bytes * (size_t)blocks_per_row;
 	size_t total_bytes	  = row_bytes * (size_t)n;
 
 	uint8_t *wbuf = xcalloc(1, total_bytes);
@@ -3706,13 +3759,13 @@ static int kquant_probe_shape(backend *self, const kquant_probe_fmt *fmt, int n,
 
 	int n_blocks = (int)((size_t)n * blocks_per_row);
 	for (int b = 0; b < n_blocks; b++) {
-		uint8_t *bp	   = wbuf + ((size_t)b * fmt->block_bytes);
+		uint8_t *bp	   = wbuf + ((size_t)b * block_bytes);
 		float	 d_val = 0.0005f + (0.02f * ((kquant_probe_rng_step(&rng) % 997) / 997.0f));
-		uint16_t d16   = f32_to_f16(d_val);
+		uint16_t d16   = vk_f32_to_f16(d_val);
 		memcpy(bp + fmt->d_off, &d16, 2);
 		if (fmt->has_dmin) {
 			float	 dmin_val = 0.0002f + (0.005f * ((kquant_probe_rng_step(&rng) % 997) / 997.0f));
-			uint16_t dmin16	  = f32_to_f16(dmin_val);
+			uint16_t dmin16	  = vk_f32_to_f16(dmin_val);
 			memcpy(bp + fmt->dmin_off, &dmin16, 2);
 		}
 	}
@@ -3750,7 +3803,7 @@ static int kquant_probe_shape(backend *self, const kquant_probe_fmt *fmt, int n,
 	}
 
 	float *y_cpu = xcalloc((size_t)n, sizeof(float));
-	matmul_generic_f32(wbuf, fmt->w_type, x, y_cpu, n, k);
+	host_matmul_generic(wbuf, fmt->w_type, x, y_cpu, n, k);
 
 	int broken = 0;
 	if (s != OK) {
@@ -3906,23 +3959,8 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 				return s;
 			}
 		}
-		float		 *y_host = xmalloc((size_t)n * sizeof(float));
-		quant_scratch qs	 = {0};
-		switch (w_type) {
-		case GGML_TYPE_Q4_K:
-			matmul_q4_k_q8_k_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q5_K:
-			matmul_q5_k_q8_k_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q6_K:
-			matmul_q6_k_q8_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		default:
-			matmul_generic_f32(w->host_ptr, w_type, x_host, y_host, n, k);
-			break;
-		}
-		free(qs.q8_buf);
+		float *y_host = xmalloc((size_t)n * sizeof(float));
+		host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
 		if (has_residual)
 			for (int i = 0; i < n; i++)
 				y_host[i] += r_host[i];
@@ -3953,23 +3991,8 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 				return s;
 			}
 		}
-		float		 *y_host = xmalloc((size_t)n * sizeof(float));
-		quant_scratch qs	 = {0};
-		switch (w_type) {
-		case GGML_TYPE_Q4_K:
-			matmul_q4_k_q8_k_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q5_K:
-			matmul_q5_k_q8_k_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q6_K:
-			matmul_q6_k_q8_f32(w->host_ptr, x_host, y_host, n, k, &qs);
-			break;
-		default:
-			matmul_generic_f32(w->host_ptr, w_type, x_host, y_host, n, k);
-			break;
-		}
-		free(qs.q8_buf);
+		float *y_host = xmalloc((size_t)n * sizeof(float));
+		host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
 		if (has_residual)
 			for (int i = 0; i < n; i++)
 				y_host[i] += r_host[i];
@@ -4015,14 +4038,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 			}
 		}
 		float *y_host = xmalloc((size_t)n * sizeof(float));
-		switch (w_type) {
-		case GGML_TYPE_BF16:
-			matmul_bf16_f32(w->host_ptr, x_host, y_host, n, k);
-			break;
-		default:
-			matmul_generic_f32(w->host_ptr, w_type, x_host, y_host, n, k);
-			break;
-		}
+		host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
 		if (has_residual)
 			for (int i = 0; i < n; i++)
 				y_host[i] += r_host[i];
@@ -4156,29 +4172,27 @@ static status_code vk_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 	if (s != OK)
 		goto ffn_down_cleanup;
 
-	for (int i = 0; i < k; i++) {
-		float g		= gate_host[i];
-		float act	= (activation == 1) ? gelu_tanh(g) : silu(g);
-		act_host[i] = act * up_host[i];
+	backend *host = backend_host();
+	if (!host || !host->ffn_activate_ex) {
+		s = ERR_UNSUPPORTED;
+		goto ffn_down_cleanup;
 	}
+	buffer gb = {0}, ub = {0}, ob = {0};
+	gb.handle = gate_host;
+	gb.owner  = host;
+	gb.size	  = (size_t)k * sizeof(float);
+	ub.handle = up_host;
+	ub.owner  = host;
+	ub.size	  = (size_t)k * sizeof(float);
+	ob.handle = act_host;
+	ob.owner  = host;
+	ob.size	  = (size_t)k * sizeof(float);
+	s		  = host->ffn_activate_ex(host, &gb, &ub, &ob, k, activation);
+	if (s != OK)
+		goto ffn_down_cleanup;
 
 	if (w->host_ptr) {
-		quant_scratch qs = {0};
-		switch (w_type) {
-		case GGML_TYPE_Q4_K:
-			matmul_q4_k_q8_k_f32(w->host_ptr, act_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q5_K:
-			matmul_q5_k_q8_k_f32(w->host_ptr, act_host, y_host, n, k, &qs);
-			break;
-		case GGML_TYPE_Q6_K:
-			matmul_q6_k_q8_f32(w->host_ptr, act_host, y_host, n, k, &qs);
-			break;
-		default:
-			matmul_generic_f32(w->host_ptr, w_type, act_host, y_host, n, k);
-			break;
-		}
-		free(qs.q8_buf);
+		host_matmul_generic(w->host_ptr, w_type, act_host, y_host, n, k);
 	} else {
 		s = ERR_UNSUPPORTED;
 		goto ffn_down_cleanup;
@@ -4512,8 +4526,8 @@ static status_code vk_attention_host_fallback(backend *self, const buffer *q, bu
 				float	 *ks  = k_slice + ((size_t)t * head_dim);
 				float	 *vs  = v_slice + ((size_t)t * head_dim);
 				for (int d = 0; d < head_dim; d++) {
-					ks[d] = f16_to_f32(kd[d]);
-					vs[d] = f16_to_f32(vd[d]);
+					ks[d] = vk_f16_to_f32(kd[d]);
+					vs[d] = vk_f16_to_f32(vd[d]);
 				}
 			}
 		}
@@ -4534,7 +4548,7 @@ static status_code vk_attention_host_fallback(backend *self, const buffer *q, bu
 					dot += qh[d] * kt[d];
 				scores[t] = dot * scale;
 			}
-			softmax_masked(scores, n_pos);
+			vk_softmax_masked(scores, n_pos);
 			for (int d = 0; d < head_dim; d++)
 				out_h[d] = 0.0f;
 			for (int t = 0; t < n_pos; t++) {
@@ -5223,8 +5237,23 @@ static status_code vk_rmsnorm_batch(backend *self, const buffer *x, const buffer
 			float *x_host = xmalloc((size_t)n * sizeof(float));
 			st			  = vk_buffer_read_f32(self, &x_row, x_host, n);
 			if (st == OK) {
-				rmsnorm(x_host, (const float *)w->host_ptr, x_host, n, eps);
-				st = vk_buffer_write_f32(self, &y_row, x_host, n);
+				backend *host = backend_host();
+				if (!host || !host->rmsnorm) {
+					free(x_host);
+					return ERR_UNSUPPORTED;
+				}
+				buffer xb = {0}, wb = {0}, yb = {0};
+				xb.handle = x_host;
+				xb.owner  = host;
+				xb.size	  = (size_t)n * sizeof(float);
+				wb.handle = (void *)w->host_ptr;
+				wb.owner  = host;
+				yb.handle = x_host;
+				yb.owner  = host;
+				yb.size	  = (size_t)n * sizeof(float);
+				st		  = host->rmsnorm(host, &xb, &wb, &yb, n, eps);
+				if (st == OK)
+					st = vk_buffer_write_f32(self, &y_row, x_host, n);
 			}
 			free(x_host);
 		}
@@ -5280,9 +5309,23 @@ static status_code vk_rmsnorm_per_head_batch(backend *self, const buffer *x, con
 			float *x_host = xmalloc((size_t)row_stride * sizeof(float));
 			st			  = vk_buffer_read_f32(self, &x_row, x_host, row_stride);
 			if (st == OK) {
-				rmsnorm_per_head(x_host, (const float *)w->host_ptr, x_host, n_heads, head_dim,
-								 eps);
-				st = vk_buffer_write_f32(self, &y_row, x_host, row_stride);
+				backend *host = backend_host();
+				if (!host || !host->rmsnorm_per_head) {
+					free(x_host);
+					return ERR_UNSUPPORTED;
+				}
+				buffer xb = {0}, wb = {0}, yb = {0};
+				xb.handle = x_host;
+				xb.owner  = host;
+				xb.size	  = (size_t)row_stride * sizeof(float);
+				wb.handle = (void *)w->host_ptr;
+				wb.owner  = host;
+				yb.handle = x_host;
+				yb.owner  = host;
+				yb.size	  = (size_t)row_stride * sizeof(float);
+				st		  = host->rmsnorm_per_head(host, &xb, &wb, &yb, n_heads, head_dim, eps);
+				if (st == OK)
+					st = vk_buffer_write_f32(self, &y_row, x_host, row_stride);
 			}
 			free(x_host);
 		}
@@ -5749,54 +5792,53 @@ static status_code vk_ctor(backend *out) {
 	out->caps  = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
 				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT;
 	out->probe = vk_probe;
-	out->device_count			   = vk_device_count;
-	out->init					   = vk_init;
-	out->free					   = vk_free;
-	out->buffer_alloc_weight	   = vk_buffer_alloc_weight;
-	out->buffer_alloc_scratch	   = vk_buffer_alloc_scratch;
-	out->buffer_free			   = vk_buffer_free;
-	out->buffer_read_f32		   = vk_buffer_read_f32;
-	out->buffer_write_f32		   = vk_buffer_write_f32;
-	out->mem_available			   = vk_mem_available;
-	out->mem_total				   = vk_mem_total;
-	out->kv_alloc				   = vk_kv_alloc;
-	out->kv_free				   = vk_kv_free;
-	out->kv_put					   = vk_kv_put;
-	out->kv_put_batch			   = vk_kv_put_batch;
-	out->embd_lookup			   = vk_embd_lookup;
-	out->rmsnorm				   = vk_rmsnorm;
-	out->matmul					   = vk_matmul;
-	out->matmul_type_native		   = vk_matmul_type_native;
-	out->matmul_residual		   = vk_matmul_residual;
-	out->matmul_multi			   = vk_matmul_multi;
-	out->matmul_ffn_down		   = vk_matmul_ffn_down;
-	out->rope					   = vk_rope;
-	out->rope_qk				   = vk_rope_qk;
-	out->attention				   = vk_attention;
-	out->add_inplace			   = vk_add_inplace;
-	out->scale_inplace			   = vk_scale_inplace;
-	out->softcap				   = vk_softcap;
-	out->split_qgate			   = vk_split_qgate;
-	out->attn_output_gate		   = vk_attn_output_gate;
-	out->partial_rope_qk		   = vk_partial_rope_qk;
-	out->buffer_alloc_from_host	   = vk_buffer_alloc_from_host;
-	out->moe_expert_ffn			   = vk_moe_expert_ffn;
-	out->moe_experts_batch		   = vk_moe_experts_batch;
-	out->copy_buffer			   = vk_copy_buffer;
-	out->ple_combine			   = vk_ple_combine;
-	out->ffn_activate			   = vk_ffn_activate;
-	out->argmax					   = vk_argmax;
-	out->synchronize			   = vk_synchronize;
-	out->begin_batch			   = vk_begin_batch;
-	out->end_batch				   = vk_end_batch;
-	out->rmsnorm_per_head		   = vk_rmsnorm_per_head;
-	out->rmsnorm_noweight		   = vk_rmsnorm_noweight;
-	out->rmsnorm_noweight_per_head = vk_rmsnorm_noweight_per_head;
-	out->rmsnorm_add			   = vk_rmsnorm_add;
-	out->ffn_activate_ex		   = vk_ffn_activate_ex;
-	out->rope_ext				   = vk_rope_ext;
-	out->attention_swa			   = vk_attention_swa;
-
+	out->device_count					 = vk_device_count;
+	out->init							 = vk_init;
+	out->free							 = vk_free;
+	out->buffer_alloc_weight			 = vk_buffer_alloc_weight;
+	out->buffer_alloc_scratch			 = vk_buffer_alloc_scratch;
+	out->buffer_free					 = vk_buffer_free;
+	out->buffer_read_f32				 = vk_buffer_read_f32;
+	out->buffer_write_f32				 = vk_buffer_write_f32;
+	out->mem_available					 = vk_mem_available;
+	out->mem_total						 = vk_mem_total;
+	out->kv_alloc						 = vk_kv_alloc;
+	out->kv_free						 = vk_kv_free;
+	out->kv_put							 = vk_kv_put;
+	out->kv_put_batch					 = vk_kv_put_batch;
+	out->embd_lookup					 = vk_embd_lookup;
+	out->rmsnorm						 = vk_rmsnorm;
+	out->matmul							 = vk_matmul;
+	out->matmul_type_native				 = vk_matmul_type_native;
+	out->matmul_residual				 = vk_matmul_residual;
+	out->matmul_multi					 = vk_matmul_multi;
+	out->matmul_ffn_down				 = vk_matmul_ffn_down;
+	out->rope							 = vk_rope;
+	out->rope_qk						 = vk_rope_qk;
+	out->attention						 = vk_attention;
+	out->add_inplace					 = vk_add_inplace;
+	out->scale_inplace					 = vk_scale_inplace;
+	out->softcap						 = vk_softcap;
+	out->split_qgate					 = vk_split_qgate;
+	out->attn_output_gate				 = vk_attn_output_gate;
+	out->partial_rope_qk				 = vk_partial_rope_qk;
+	out->buffer_alloc_from_host			 = vk_buffer_alloc_from_host;
+	out->moe_expert_ffn					 = vk_moe_expert_ffn;
+	out->moe_experts_batch				 = vk_moe_experts_batch;
+	out->copy_buffer					 = vk_copy_buffer;
+	out->ple_combine					 = vk_ple_combine;
+	out->ffn_activate					 = vk_ffn_activate;
+	out->argmax							 = vk_argmax;
+	out->synchronize					 = vk_synchronize;
+	out->begin_batch					 = vk_begin_batch;
+	out->end_batch						 = vk_end_batch;
+	out->rmsnorm_per_head				 = vk_rmsnorm_per_head;
+	out->rmsnorm_noweight				 = vk_rmsnorm_noweight;
+	out->rmsnorm_noweight_per_head		 = vk_rmsnorm_noweight_per_head;
+	out->rmsnorm_add					 = vk_rmsnorm_add;
+	out->ffn_activate_ex				 = vk_ffn_activate_ex;
+	out->rope_ext						 = vk_rope_ext;
+	out->attention_swa					 = vk_attention_swa;
 	out->matmul_batch					 = vk_matmul_batch;
 	out->matmul_multi_batch				 = vk_matmul_multi_batch;
 	out->rmsnorm_batch					 = vk_rmsnorm_batch;

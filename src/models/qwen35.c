@@ -1,5 +1,4 @@
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
 #include "common.h"
 #include "compute.h"
 #include "kvcache.h"

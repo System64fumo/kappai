@@ -9,7 +9,7 @@ BUILD ?= release-rdbg
 CPU_ARCH_OPT ?= 1
 BACKENDS ?=
 
-HOST_ARCH := $(shell uname -m)
+HOST_ARCH ?= $(shell uname -m)
 comma := ,
 
 .DEFAULT_GOAL := all
@@ -66,6 +66,10 @@ ifeq ($(BUILD),release)
   ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
 endif
 
+ifeq ($(BUILD),release-rdbg)
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
+endif
+
 ifeq ($(TSAN),1)
   SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
 else
@@ -88,6 +92,7 @@ ifeq ($(CPU_ARCH_OPT),1)
 endif
 
 ifeq ($(BUILD),debug)
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O0 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
 	     -Wall -Wextra -Wformat=2 -Wshadow -Wstrict-prototypes \
@@ -109,30 +114,59 @@ else
 endif
 
 ifneq ($(HAS_VULKAN),)
-  CFLAGS  += -DBACKEND_VULKAN -I$(OBJ_DIR)/backend/vulkan -I$(SRC_DIR)/backend/vulkan
-  LDFLAGS += -lvulkan
+  VK_BACKEND_INCLUDES := -I$(OBJ_DIR)/backend/vulkan -I$(SRC_DIR)/backend/vulkan
 endif
 
 LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/*.c) \
 	$(wildcard $(SRC_DIR)/models/*.c) \
 	$(wildcard $(SRC_DIR)/moe/*.c) \
-	$(SRC_DIR)/backend/backend.c \
-	$(wildcard $(SRC_DIR)/backend/cpu/scalar/*.c)
+	$(SRC_DIR)/backend/backend.c
 
+BACKEND_DIR  := $(OUT_DIR)/backends
+BACKEND_OBJ_DIR := $(OUT_DIR)/backend_obj
+BACKEND_CFLAGS := $(CFLAGS) -fvisibility=hidden $(VK_BACKEND_INCLUDES)
+
+SCALAR_CORE_OBJS := \
+	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/core.o \
+	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
+
+SCALAR_BACKEND_OBJS := \
+	$(SCALAR_CORE_OBJS)
+
+CPU_ARCH_DIR :=
 ifeq ($(CPU_ARCH_OPT),1)
   ifeq ($(HOST_ARCH),aarch64)
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/aarch64/quants.c $(SRC_DIR)/backend/cpu/aarch64/core.c
+    CPU_ARCH_DIR := aarch64
   endif
   ifeq ($(HOST_ARCH),x86_64)
-    LIB_SRCS += $(SRC_DIR)/backend/cpu/x86_64/quants.c $(SRC_DIR)/backend/cpu/x86_64/core.c
+    CPU_ARCH_DIR := x86_64
   endif
+  endif
+
+SCALAR_BACKEND := $(BACKEND_DIR)/libkappai_cpu_scalar.so
+BACKEND_LIBS  := $(SCALAR_BACKEND)
+BACKEND_OBJS  := $(SCALAR_BACKEND_OBJS)
+
+ifneq ($(CPU_ARCH_DIR),)
+  ARCH_BACKEND_OBJS := $(SCALAR_CORE_OBJS) \
+		      $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/core.o \
+		      $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/quants.o
+  ARCH_BACKEND := $(BACKEND_DIR)/libkappai_cpu_$(CPU_ARCH_DIR).so
+  BACKEND_LIBS += $(ARCH_BACKEND)
+  BACKEND_OBJS += $(ARCH_BACKEND_OBJS)
 endif
+
+VK_BACKEND_OBJS := $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o \
+	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
 ifneq ($(HAS_VULKAN),)
-  LIB_SRCS += $(SRC_DIR)/backend/vulkan/vulkan.c
+  VK_BACKEND := $(BACKEND_DIR)/libkappai_vulkan.so
+  BACKEND_LIBS += $(VK_BACKEND)
+  BACKEND_OBJS += $(VK_BACKEND_OBJS)
 endif
 
 TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
+TEST_QUANT_OBJ := $(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
 SERVER_SRCS := $(SRC_DIR)/server/main.c $(SRC_DIR)/server/openai.c
 SERVER_LIBS := -ljson-c -lmicrohttpd
 HEADERS     := $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
@@ -150,7 +184,8 @@ SERVER_BIN  := $(OUT_DIR)/kappai-server
 TEST_BIN    := $(OUT_DIR)/test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
-BUILD_DIRS := $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
+BUILD_DIRS := $(BACKEND_DIR) \
+	      $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
 	      $(OBJ_DIR)/backend/cpu/x86_64 \
 	      $(OBJ_DIR)/backend/vulkan \
 	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor $(OBJ_DIR)/server \
@@ -208,7 +243,7 @@ SHADER_SPVS := \
 SHADERS_H := $(OBJ_DIR)/backend/vulkan/shaders_embedded.h
 
 ifneq ($(HAS_VULKAN),)
-  $(OBJ_DIR)/backend/vulkan/vulkan.o: $(SHADERS_H)
+  $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o: $(SHADERS_H)
 
   $(OBJ_DIR)/backend/vulkan/%.spv: $(VK_SHADERS_DIR)/%.comp $(VK_INC_FILES) | $(OUT_DIR)
 	@mkdir -p $(dir $@)
@@ -258,7 +293,7 @@ endif
 
 .PHONY: all cli test server monitor clean print-config format tidy backends-help config
 
-all: cli test server
+all: $(BACKEND_LIBS) cli test server
 
 config: $(OUT_DIR) $(CONFIG_FILE)
 	@echo "Build configuration created:"
@@ -276,7 +311,12 @@ $(CONFIG_FILE): | $(OUT_DIR)
 	@printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)" >> $@
 
 backends-help:
-	@echo "available backends: $(AVAILABLE_BACKENDS)"
+	@echo "optional backends (via BACKENDS=...): $(AVAILABLE_BACKENDS)"
+	@echo "cpu backends are always built as shared libraries:"
+	@echo "  libkappai_cpu_scalar.so   - portable scalar reference implementation"
+	@echo "  libkappai_cpu_$(HOST_ARCH).so - $(HOST_ARCH)-optimized implementation (when CPU_ARCH_OPT=1)"
+	@echo "backend libraries are installed to $(BACKEND_DIR) and dlopen()ed at runtime;"
+	@echo "set KAPPAI_BACKEND_PATH to load backend libraries from another directory"
 	@echo "usage: make config BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
 
 monitor: $(MONITOR_BIN)
@@ -286,19 +326,19 @@ $(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_FILE)
 	@$(CC) -O2 -g -Wall -Wextra -I$(SRC_DIR) $< -o $@ -lncurses -ljson-c
 
 cli: $(CLI_BIN)
-$(CLI_BIN): $(SRC_DIR)/cli/main.c $(ENGINE)
+$(CLI_BIN): $(SRC_DIR)/cli/main.c $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $< -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
 
 server: $(SERVER_BIN)
-$(SERVER_BIN): $(SERVER_OBJS) $(ENGINE)
+$(SERVER_BIN): $(SERVER_OBJS) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(SERVER_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread $(SERVER_LIBS) -o $@
 
 test: $(TEST_BIN)
-$(TEST_BIN): $(TEST_OBJS) $(ENGINE)
+$(TEST_BIN): $(TEST_OBJS) $(TEST_QUANT_OBJ) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
+	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) $(TEST_QUANT_OBJ) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
 
 $(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
@@ -310,7 +350,31 @@ $(TEST_OBJ_DIR):
 
 $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
-	@$(CC) -shared $(CFLAGS) $^ $(LDFLAGS) -ljson-c -o $@
+	@$(CC) -shared -Wl,-soname,libkappai.so $(CFLAGS) $^ $(LDFLAGS) -ljson-c -ldl -o $@
+
+$(BACKEND_OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
+	@mkdir -p $(dir $@)
+	@echo "  CC(b)   $<"
+	@$(CC) $(BACKEND_CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
+
+$(SCALAR_BACKEND): $(SCALAR_BACKEND_OBJS) $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) -shared $(BACKEND_CFLAGS) $(SCALAR_BACKEND_OBJS) \
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
+
+ifneq ($(CPU_ARCH_DIR),)
+$(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) -shared $(BACKEND_CFLAGS) $(ARCH_BACKEND_OBJS) \
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
+endif
+
+ifneq ($(HAS_VULKAN),)
+$(VK_BACKEND): $(VK_BACKEND_OBJS) $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lvulkan -o $@
+endif
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
@@ -335,6 +399,8 @@ print-config:
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
 	@echo "BACKENDS           = $(REQUESTED_BACKENDS)"
+	@echo "CPU_ARCH_DIR       = $(if $(CPU_ARCH_DIR),$(CPU_ARCH_DIR),(none: scalar library only))"
+	@echo "BACKEND_LIBS       = $(BACKEND_LIBS)"
 	@echo "LIB_SRCS           = $(LIB_SRCS)"
 
 format:
@@ -361,4 +427,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d)

@@ -1,12 +1,98 @@
 #include "test_core.h"
 
+typedef struct {
+	const char *ref;
+	const char *targets[BACKEND_MAX];
+	int			n_targets;
+} backend_selection;
+
+static const char *default_reference_name(void) {
+	backend_info infos[BACKEND_MAX];
+	int			 n = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n; i++)
+		if (infos[i].available && strcmp(infos[i].name, "cpu_scalar") == 0)
+			return "cpu_scalar";
+	return "cpu";
+}
+
+static int backend_known(const char *name, backend_info *infos, int n) {
+	for (int i = 0; i < n; i++)
+		if (strcmp(infos[i].name, name) == 0)
+			return 1;
+	return 0;
+}
+
+static int parse_backend_selection(int argc, char **argv, backend_info *infos, int n_backends,
+								   backend_selection *sel) {
+	memset(sel, 0, sizeof(*sel));
+	const char *pos[BACKEND_MAX + 1];
+	int			n_pos = 0;
+	for (int ai = 1; ai < argc; ai++) {
+		if (argv[ai][0] == '-')
+			continue;
+		if (n_pos >= (int)(sizeof(pos) / sizeof(pos[0])))
+			break;
+		pos[n_pos++] = argv[ai];
+	}
+
+	for (int i = 0; i < n_pos; i++) {
+		if (!backend_known(pos[i], infos, n_backends)) {
+			fprintf(stderr, "error: unknown backend '%s'\n", pos[i]);
+			return -1;
+		}
+	}
+
+	if (n_pos == 0) {
+		sel->ref = default_reference_name();
+		return 0;
+	}
+	if (n_pos == 1 && strcmp(pos[0], default_reference_name()) == 0) {
+		const char *best	  = NULL;
+		int			best_prio = -1;
+		for (int i = 0; i < n_backends; i++) {
+			if (!infos[i].available || strcmp(infos[i].name, pos[0]) == 0)
+				continue;
+			if (!(infos[i].caps & BCAP_IS_HOST))
+				continue;
+			if (infos[i].priority > best_prio) {
+				best_prio = infos[i].priority;
+				best	  = infos[i].name;
+			}
+		}
+		if (!best) {
+			fprintf(stderr,
+					"error: '%s' is the only host backend; pass two backends to "
+					"compare (e.g. '%s <other>')\n",
+					pos[0], pos[0]);
+			return -1;
+		}
+		sel->ref					   = best;
+		sel->targets[sel->n_targets++] = pos[0];
+		return 0;
+	}
+
+	sel->ref = pos[0];
+	for (int i = 1; i < n_pos; i++)
+		sel->targets[sel->n_targets++] = pos[i];
+	return 0;
+}
+
 int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 	stats_reset();
-	backend *cpu = NULL;
-	if (backend_create("cpu", 0, &cpu) != OK) {
-		fprintf(stderr, "ERROR: cpu backend (the reference) is unavailable\n");
+
+	backend_selection sel;
+	if (parse_backend_selection(argc, argv, infos, n_backends, &sel) != 0) {
+		usage(argv[0]);
 		return 1;
 	}
+
+	backend *cpu = NULL;
+	if (backend_create(sel.ref, 0, &cpu) != OK) {
+		fprintf(stderr, "ERROR: reference backend '%s' is unavailable\n", sel.ref);
+		return 1;
+	}
+	printf("reference backend: %s%s%s\n", cpu->name, cpu->desc ? "  (" : "",
+		   cpu->desc ? cpu->desc : "", cpu->desc ? ")" : "");
 
 	synth_suite_common_init();
 
@@ -30,8 +116,17 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	int run_all = wants_all(argc, argv);
 	int any_run = 0;
 	for (int bi = 0; bi < n_backends; bi++) {
-		int want = run_all || matches_name(argc, argv, infos[bi].name);
+		int want = 0;
+		if (run_all) {
+			want = 1;
+		} else {
+			for (int t = 0; t < sel.n_targets; t++)
+				if (strcmp(sel.targets[t], infos[bi].name) == 0)
+					want = 1;
+		}
 		if (!want)
+			continue;
+		if (strcmp(infos[bi].name, sel.ref) == 0)
 			continue;
 		if (!infos[bi].available) {
 			printf("\n=== %s: SKIPPED (not available) ===\n", infos[bi].name);

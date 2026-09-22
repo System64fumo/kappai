@@ -104,6 +104,28 @@ typedef struct {
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
+size_t		ggml_row_size(uint32_t type, size_t n);
+
+extern const uint32_t ggml_iq3s_grid[512];
+
+static inline uint32_t wtype_to_q8type(uint32_t w_type) {
+	switch (w_type) {
+	case GGML_TYPE_Q4_0:
+	case GGML_TYPE_IQ4_NL:
+	case GGML_TYPE_Q8_0:
+		return GGML_TYPE_Q8_0;
+	case GGML_TYPE_Q4_1:
+		return GGML_TYPE_Q8_1;
+	case GGML_TYPE_Q4_K:
+	case GGML_TYPE_Q5_K:
+	case GGML_TYPE_Q6_K:
+	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ3_S_RE:
+		return GGML_TYPE_Q8_K;
+	default:
+		return 0;
+	}
+}
 
 status_code gguf_load(gguf_ctx *ctx, const char *path);
 

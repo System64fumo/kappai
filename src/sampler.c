@@ -103,8 +103,21 @@ void sampler_observe(sampler *s, int32_t token) {
 	}
 }
 
+static int32_t sampler_argmax_f32(const float *logits, int vocab) {
+	if (vocab <= 0)
+		return 0;
+	int32_t best  = 0;
+	float	bestv = logits[0];
+	for (int i = 1; i < vocab; i++)
+		if (logits[i] > bestv) {
+			bestv = logits[i];
+			best  = i;
+		}
+	return best;
+}
+
 int32_t sampler_argmax(const float *logits, int vocab) {
-	return cpu_argmax_f32(logits, vocab);
+	return sampler_argmax_f32(logits, vocab);
 }
 
 static int top_k_heap(sampler *s, const float *logits, int vocab, int k, sampler_top_k_entry *out) {

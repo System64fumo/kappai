@@ -416,7 +416,7 @@ static status_code lex_tag_inner(lexer *lx, const char *src) {
 		while (lx->pos < lx->len && isspace((unsigned char)src[lx->pos]))
 			lx->pos++;
 		if (lx->pos >= lx->len) {
-			snprintf(lx->errbuf, lx->errbuf_len, "unterminated tag at offset %zu", lx->tag_start);
+			snprintf(lx->errbuf, lx->errbuf_len, "unterminated tag at offset %u", lx->tag_start);
 			return ERR_FORMAT;
 		}
 		if (src[lx->pos] == '-' && !strncmp(src + lx->pos + 1, close, 2)) {
@@ -494,7 +494,7 @@ static status_code lex_tag_inner(lexer *lx, const char *src) {
 			lx->pos++;
 		} else {
 			char msg[128];
-			snprintf(msg, sizeof(msg), "unsupported character '%c' at offset %zu", c, lx->pos);
+			snprintf(msg, sizeof(msg), "unsupported character '%c' at offset %u", c, lx->pos);
 			strlist_add(&lx->diagnostics, xstrdup(msg));
 			lex_push(lx, TOK_UNKNOWN, src + lx->pos, 1, 0, 0);
 			lx->pos++;

@@ -7,6 +7,14 @@
 #include "threadpool.h"
 #include <stdlib.h>
 
+#define CPU_BACKEND_CAPS                                                                           \
+	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
+	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0)
+
+status_code cpu_backend_fill(backend *out);
+
+int32_t cpu_argmax_f32(const float *logits, int vocab);
+
 typedef struct {
 	quant_scratch qscratch;
 	float		 *scores;

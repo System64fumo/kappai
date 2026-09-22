@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include "model.h"
-#include "backend/cpu/scalar/quants.h"
 #include "config.h"
 #include "log.h"
 #include "memconfig.h"
@@ -50,15 +49,6 @@ static void madvise_access_pattern(const void *map_base, size_t map_size, const 
 		madvise((void *)page_start, page_end - page_start, advice);
 	}
 }
-
-typedef struct {
-	const void *src;
-	void	   *dst;
-	uint32_t	type;
-	int			k;
-	int			rows_per_group;
-	void (*repack_fn)(const void *src, void *dst, int begin, int end, int k);
-} repack_job;
 
 static status_code akey_i32(const gguf_ctx *g, const char *prefix, const char *suffix,
 							int32_t *out) {
@@ -216,6 +206,12 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	}
 
 	if (m->arch_info->is_mla) {
+		if (m->mla.qk_head != m->mla.qk_nope + m->mla.qk_rope) {
+			ERROR("model: MLA dims inconsistent: qk_head=%d but qk_nope(%d) + "
+				  "qk_rope(%d) = %d; the query head must be nope+rope",
+				  m->mla.qk_head, m->mla.qk_nope, m->mla.qk_rope, m->mla.qk_nope + m->mla.qk_rope);
+			return -1;
+		}
 		if (m->mla.qk_head > HEAD_DIM_MAX || m->mla.v_head > HEAD_DIM_MAX ||
 			m->mla.kv_lora > HEAD_DIM_MAX) {
 			ERROR("model: MLA head dims exceed supported maximum %d "
@@ -585,47 +581,11 @@ int model_should_repack(uint32_t type, const char *repack_config) {
 	return 0;
 }
 
-static void repack_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	repack_job *job		  = ctx;
-	int			row_begin = begin * job->rows_per_group;
-	int			row_end	  = end * job->rows_per_group;
-	job->repack_fn(job->src, job->dst, row_begin, row_end, job->k);
-}
-
-static void repack_weight(backend *home, const void *src, void *dst, uint32_t type, int n_rows,
-						  int k) {
-	repack_job job	= {.src = src, .dst = dst, .type = type, .k = k};
-	tpool	  *pool = (home && home->get_pool) ? home->get_pool(home) : NULL;
-
-	if (type == GGML_TYPE_Q8_0) {
-		job.rows_per_group = Q8_0_R8_ROWS;
-		job.repack_fn	   = repack_q8_0_to_q8_0_r8_rows;
-	} else if (type == GGML_TYPE_Q4_0) {
-		job.rows_per_group = Q4_0_R8_ROWS;
-		job.repack_fn	   = repack_q4_0_to_q4_0_r8_rows;
-	} else if (type == GGML_TYPE_IQ3_S) {
-		job.rows_per_group = IQ3_S_RE8_ROWS;
-		job.repack_fn	   = repack_iq3_s_to_iq3_s_re8_rows;
-	} else if (type == GGML_TYPE_IQ4_NL) {
-		job.rows_per_group = IQ4_NL_R8_ROWS;
-		job.repack_fn	   = repack_iq4_nl_to_iq4_nl_r8_rows;
-	} else if (type == GGML_TYPE_Q4_K) {
-		job.rows_per_group = Q4_K_R8_ROWS;
-		job.repack_fn	   = repack_q4_k_to_q4_k_r8_rows;
-	} else if (type == GGML_TYPE_Q5_K) {
-		job.rows_per_group = Q5_K_R8_ROWS;
-		job.repack_fn	   = repack_q5_k_to_q5_k_r8_rows;
-	} else if (type == GGML_TYPE_Q6_K) {
-		job.rows_per_group = Q6_K_R8_ROWS;
-		job.repack_fn	   = repack_q6_k_to_q6_k_r8_rows;
-	} else {
-		job.rows_per_group = 1;
-		job.repack_fn	   = repack_iq4_nl_to_q8_0_rows;
-	}
-
-	int n_groups = n_rows / job.rows_per_group;
-	tpool_parallel_for(pool, n_groups, 1, repack_chunk, &job);
+static status_code repack_weight(backend *home, const void *src, void *dst, uint32_t type,
+								 int n_rows, int k) {
+	if (!home || !home->repack_weight)
+		return ERR_UNSUPPORTED;
+	return home->repack_weight(home, type, src, dst, n_rows, k);
 }
 
 static void fill_expert_desc(struct expert_desc *ed, const void *gate_w, const void *up_w,
@@ -653,29 +613,14 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 	uint32_t type = type_io ? *type_io : (host_ptr ? GGML_TYPE_F32 : 0);
 	backend *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
 
-	int home_is_cpu = (home && home->name && strcmp(home->name, "cpu") == 0);
+	int home_is_cpu = backend_has_cap(home, BCAP_IS_HOST);
 
 	int do_repack = home_is_cpu && n_dims == 2 && wc == WCLASS_MATMUL && d0 > 0 && d1 > 0 &&
 					model_should_repack(type, m->repack_config);
 
 	uint32_t re_type = 0;
-	if (do_repack) {
-		if (type == GGML_TYPE_IQ3_S && (d0 % 256) == 0 && (d1 % IQ3_S_RE8_ROWS) == 0) {
-			re_type = GGML_TYPE_IQ3_S_RE8;
-		} else if (type == GGML_TYPE_IQ4_NL && (d0 % 32) == 0 && (d1 % IQ4_NL_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_IQ4_NL_R8;
-		} else if (type == GGML_TYPE_Q8_0 && (d0 % 32) == 0 && (d1 % Q8_0_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_Q8_0_R8;
-		} else if (type == GGML_TYPE_Q4_0 && (d0 % 32) == 0 && (d1 % Q4_0_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_Q4_0_R8;
-		} else if (type == GGML_TYPE_Q4_K && (d0 % 256) == 0 && (d1 % Q4_K_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_Q4_K_R8;
-		} else if (type == GGML_TYPE_Q5_K && (d0 % 256) == 0 && (d1 % Q5_K_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_Q5_K_R8;
-		} else if (type == GGML_TYPE_Q6_K && (d0 % 256) == 0 && (d1 % Q6_K_R8_ROWS) == 0) {
-			re_type = GGML_TYPE_Q6_K_R8;
-		}
-	}
+	if (do_repack && home->repack_plan)
+		home->repack_plan(home, type, d0, d1, &re_type);
 
 	if (re_type) {
 		int	   k			 = (int)d0;
@@ -685,8 +630,12 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 		size_t dst_row_bytes = ggml_row_size(re_type, (size_t)k);
 		size_t dst_total	 = dst_row_bytes * (size_t)n_rows;
 
-		void *repacked = xmalloc_aligned(dst_total, 64);
-		repack_weight(home, host_ptr, repacked, type, n_rows, k);
+		void	   *repacked = xmalloc_aligned(dst_total, 64);
+		status_code prs		 = repack_weight(home, host_ptr, repacked, type, n_rows, k);
+		if (prs != OK) {
+			free(repacked);
+			return prs;
+		}
 
 		tensor_desc desc = {
 			.type	   = re_type,
@@ -727,11 +676,15 @@ static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t
 static void dequant_weight_to_f32(const void **w, uint32_t *type, size_t row_len, size_t n_rows) {
 	if (*type == GGML_TYPE_F32)
 		return;
+	backend *host = backend_host();
+	if (!host || !host->dequant_row)
+		return;
 	size_t		   row_bytes = ggml_row_size(*type, row_len);
 	float		  *f32_buf	 = xmalloc(n_rows * row_len * sizeof(float));
 	const uint8_t *src		 = *w;
 	for (size_t r = 0; r < n_rows; r++)
-		dequant_row_dispatch(*type, src + (r * row_bytes), (int)row_len, f32_buf + (r * row_len));
+		host->dequant_row(host, *type, src + (r * row_bytes), (int)row_len,
+						  f32_buf + (r * row_len));
 	*w	  = f32_buf;
 	*type = GGML_TYPE_F32;
 }
@@ -792,26 +745,12 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 											   uint32_t *type_out) {
 	backend *home =
 		backend_weight_home(target_backend ? target_backend : m->backend, WCLASS_MATMUL);
-	if (!home || !home->name || strcmp(home->name, "cpu") != 0)
+	if (!home || !backend_has_cap(home, BCAP_IS_HOST))
 		return ERR_FALLBACK;
 
 	uint32_t re_type = 0;
-	if (type == GGML_TYPE_IQ3_S && (dim % 256) == 0 && (intermediate % IQ3_S_RE8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ3_S_RE8;
-	} else if (type == GGML_TYPE_IQ4_NL && (dim % 32) == 0 &&
-			   (intermediate % IQ4_NL_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ4_NL_R8;
-	} else if (type == GGML_TYPE_Q8_0 && (dim % 32) == 0 && (intermediate % Q8_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q8_0_R8;
-	} else if (type == GGML_TYPE_Q4_0 && (dim % 32) == 0 && (intermediate % Q4_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_0_R8;
-	} else if (type == GGML_TYPE_Q4_K && (dim % 256) == 0 && (intermediate % Q4_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_K_R8;
-	} else if (type == GGML_TYPE_Q5_K && (dim % 256) == 0 && (intermediate % Q5_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q5_K_R8;
-	} else if (type == GGML_TYPE_Q6_K && (dim % 256) == 0 && (intermediate % Q6_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q6_K_R8;
-	}
+	if (home->repack_plan)
+		home->repack_plan(home, type, dim, intermediate, &re_type);
 
 	if (!re_type || !model_should_repack(type, m->repack_config))
 		return ERR_FALLBACK;
@@ -821,9 +760,18 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 	size_t half_src		 = src_row_bytes * (size_t)intermediate;
 	size_t half_dst		 = dst_row_bytes * (size_t)intermediate;
 
-	void *repacked = xmalloc_aligned(half_dst * 2, 64);
-	repack_weight(home, gate_w, repacked, type, (int)intermediate, (int)dim);
-	repack_weight(home, up_w, (uint8_t *)repacked + half_dst, type, (int)intermediate, (int)dim);
+	void	   *repacked = xmalloc_aligned(half_dst * 2, 64);
+	status_code prs		 = repack_weight(home, gate_w, repacked, type, (int)intermediate, (int)dim);
+	if (prs != OK) {
+		free(repacked);
+		return prs;
+	}
+	prs = repack_weight(home, up_w, (uint8_t *)repacked + half_dst, type, (int)intermediate,
+						(int)dim);
+	if (prs != OK) {
+		free(repacked);
+		return prs;
+	}
 
 	if (m->gctx.map && !m->gctx.map_is_heap) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, gate_w, half_src);
@@ -857,7 +805,7 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 										   uint64_t *total_rows_out) {
 	backend *home =
 		backend_weight_home(target_backend ? target_backend : m->backend, WCLASS_MATMUL);
-	if (!home || !home->name || strcmp(home->name, "cpu") != 0)
+	if (!home || !backend_has_cap(home, BCAP_IS_HOST))
 		return ERR_FALLBACK;
 	if (!has_kv || !L->wq.host_ptr || !L->wk.host_ptr)
 		return ERR_FALLBACK;
@@ -867,21 +815,8 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 	uint64_t total_rows = q_rows + (uint64_t)kv_rows + (uint64_t)(has_own_v ? kv_rows : 0);
 
 	uint32_t re_type = 0;
-	if (type == GGML_TYPE_IQ3_S && (dim % 256) == 0 && (total_rows % IQ3_S_RE8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ3_S_RE8;
-	} else if (type == GGML_TYPE_IQ4_NL && (dim % 32) == 0 && (total_rows % IQ4_NL_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ4_NL_R8;
-	} else if (type == GGML_TYPE_Q8_0 && (dim % 32) == 0 && (total_rows % Q8_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q8_0_R8;
-	} else if (type == GGML_TYPE_Q4_0 && (dim % 32) == 0 && (total_rows % Q4_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_0_R8;
-	} else if (type == GGML_TYPE_Q4_K && (dim % 256) == 0 && (total_rows % Q4_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_K_R8;
-	} else if (type == GGML_TYPE_Q5_K && (dim % 256) == 0 && (total_rows % Q5_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q5_K_R8;
-	} else if (type == GGML_TYPE_Q6_K && (dim % 256) == 0 && (total_rows % Q6_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q6_K_R8;
-	}
+	if (home->repack_plan)
+		home->repack_plan(home, type, dim, total_rows, &re_type);
 
 	if (!re_type || !model_should_repack(type, m->repack_config))
 		return ERR_FALLBACK;
@@ -892,14 +827,27 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 	size_t kv_src		 = src_row_bytes * (size_t)kv_rows;
 	size_t total_dst	 = dst_row_bytes * (size_t)total_rows;
 
-	void	*repacked = xmalloc_aligned(total_dst, 64);
-	uint8_t *dst	  = repacked;
-	repack_weight(home, L->wq.host_ptr, dst, type, (int)q_rows, (int)dim);
+	void	   *repacked = xmalloc_aligned(total_dst, 64);
+	uint8_t	   *dst		 = repacked;
+	status_code prs		 = repack_weight(home, L->wq.host_ptr, dst, type, (int)q_rows, (int)dim);
+	if (prs != OK) {
+		free(repacked);
+		return prs;
+	}
 	dst += (size_t)q_rows * dst_row_bytes;
-	repack_weight(home, L->wk.host_ptr, dst, type, (int)kv_rows, (int)dim);
+	prs = repack_weight(home, L->wk.host_ptr, dst, type, (int)kv_rows, (int)dim);
+	if (prs != OK) {
+		free(repacked);
+		return prs;
+	}
 	dst += (size_t)kv_rows * dst_row_bytes;
-	if (has_own_v)
-		repack_weight(home, L->wv.host_ptr, dst, type, (int)kv_rows, (int)dim);
+	if (has_own_v) {
+		prs = repack_weight(home, L->wv.host_ptr, dst, type, (int)kv_rows, (int)dim);
+		if (prs != OK) {
+			free(repacked);
+			return prs;
+		}
+	}
 
 	if (m->gctx.map && !m->gctx.map_is_heap) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wq.host_ptr, q_src);
@@ -966,7 +914,7 @@ static status_code upload_embeddings(model *m) {
 	}
 
 	if (m->has_per_layer_embeddings) {
-		if (m->backend && strcmp(m->backend->name, "cpu") == 0) {
+		if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
 			s = upload_one(m, &m->layer_dims.per_layer_tok_embd,
 						   m->layer_dims.per_layer_tok_embd.type, 2,
 						   (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
@@ -984,7 +932,17 @@ static status_code upload_embeddings(model *m) {
 		if (m->layer_dims.per_layer_model_proj.type == GGML_TYPE_BF16) {
 			size_t n_elems = (size_t)m->dim * (size_t)m->layer_dims.n_embd_per_layer * m->n_layers;
 			float *f32_buf = xmalloc(n_elems * sizeof(float));
-			dequant_bf16_row(m->layer_dims.per_layer_model_proj.host_ptr, (int)n_elems, f32_buf);
+			backend *host  = backend_host();
+			if (!host || !host->dequant_row) {
+				free(f32_buf);
+				return ERR_UNSUPPORTED;
+			}
+			s = host->dequant_row(host, GGML_TYPE_BF16, m->layer_dims.per_layer_model_proj.host_ptr,
+								  (int)n_elems, f32_buf);
+			if (s != OK) {
+				free(f32_buf);
+				return s;
+			}
 			if (m->gctx.map && m->gctx.map_size > 0) {
 				size_t bf16_bytes = n_elems * sizeof(uint16_t);
 				madvise_dontneed(m->gctx.map, m->gctx.map_size,
@@ -2309,7 +2267,7 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->v_b_w,
 								  "blk.%d.attn_v_b.weight", 1) != OK)
 				return ERR_FORMAT;
-			if (m->backend && strcmp(m->backend->name, "cpu") == 0) {
+			if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
 				if (L->k_b_w.type != GGML_TYPE_F32) {
 					const void *kb_orig = L->k_b_w.host_ptr;
 					size_t		kb_bytes =

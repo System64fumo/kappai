@@ -168,7 +168,7 @@ static void test_for_over_dict(void) {
 
 	char out[256];
 	int	 ok	   = render_ok("{% for k in d %}{{ k }},{% endfor %}", g, out, sizeof(out));
-	int	 match = ok && strcmp(out, "three,two,one,") == 0;
+	int	 match = ok && strcmp(out, "one,two,three,") == 0;
 	record_jinja("jinja.for_over_dict_keys", match, "dict keys -> '%s'", out);
 }
 

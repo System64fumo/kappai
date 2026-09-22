@@ -1426,9 +1426,9 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 void run_arch_tests(backend *cpu, backend *tgt) {
 	printf("\n========================================\n");
 	if (tgt)
-		printf("Architecture-level tests: %s  vs  cpu (reference)\n", tgt->name);
+		printf("Architecture-level tests: %s  vs  %s (reference)\n", tgt->name, cpu->name);
 	else
-		printf("Architecture-level tests: cpu (self-test)\n");
+		printf("Architecture-level tests: %s (self-test)\n", cpu->name);
 	printf("========================================\n");
 
 	if (tgt) {

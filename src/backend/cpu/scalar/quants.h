@@ -139,8 +139,6 @@ typedef struct {
 	size_t q8_buf_elems;
 } quant_scratch;
 
-extern const uint32_t iq3s_grid[512];
-
 float	 f16_to_f32(uint16_t h);
 uint16_t f32_to_f16(float f);
 
@@ -161,25 +159,6 @@ void dequant_bf16_row(const void *src, int n, float *dst);
 void dequant_row_dispatch(uint32_t type, const void *src, int n_elems, float *dst);
 
 float bf16_to_f32(uint16_t h);
-
-static inline uint32_t wtype_to_q8type(uint32_t w_type) {
-	switch (w_type) {
-	case GGML_TYPE_Q4_0:
-	case GGML_TYPE_IQ4_NL:
-	case GGML_TYPE_Q8_0:
-		return GGML_TYPE_Q8_0;
-	case GGML_TYPE_Q4_1:
-		return GGML_TYPE_Q8_1;
-	case GGML_TYPE_Q4_K:
-	case GGML_TYPE_Q5_K:
-	case GGML_TYPE_Q6_K:
-	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE:
-		return GGML_TYPE_Q8_K;
-	default:
-		return 0;
-	}
-}
 
 void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);
 
@@ -255,6 +234,22 @@ void repack_iq3_s_rows(const void *src, void *dst, int row_begin, int row_end, i
 void repack_iq3_s_to_iq3_s_re8(const void *src, void *dst, int n_rows, int k);
 void repack_iq3_s_to_iq3_s_re8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
 
+void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+												float *restrict y, int row_begin, int row_end,
+												int k);
+void matmul_iq4_nl_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end, int k);
+void matmul_q8_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+											float *restrict y, int row_begin, int row_end, int k);
+void matmul_q4_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+											float *restrict y, int row_begin, int row_end, int k);
+void matmul_q4_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end, int k);
+void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end, int k);
+void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end, int k);
+
 void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 									 size_t		 xq_row_stride_blocks, float *restrict y,
 									 int y_row_stride, int n, int k, int m);
@@ -325,20 +320,11 @@ static inline float silu(float x) {
 	return x / (1.0f + expf(-x));
 }
 
-static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rope_dim,
-									const float *rope_cos, const float *rope_sin) {
-	int half = rope_dim / 2;
-	for (int h = 0; h < n_heads; h++) {
-		float *vh = v + ((size_t)h * head_dim);
-		for (int j = 0; j < half; j++) {
-			float c		 = rope_cos[j];
-			float s		 = rope_sin[j];
-			float v0	 = vh[j];
-			float v1	 = vh[j + half];
-			vh[j]		 = (v0 * c) - (v1 * s);
-			vh[j + half] = (v0 * s) + (v1 * c);
-		}
-	}
+static inline float gelu_tanh(float x) {
+	const float c	  = 0.7978845608028654f;
+	float		x3	  = x * x * x;
+	float		inner = c * (x + (0.044715f * x3));
+	return 0.5f * x * (1.0f + tanhf(inner));
 }
 
 static inline float sigmoidf(float x) {
@@ -356,11 +342,20 @@ static inline float softplusf(float x) {
 	return log1pf(expf(x));
 }
 
-static inline float gelu_tanh(float x) {
-	const float c	  = 0.7978845608028654f;
-	float		x3	  = x * x * x;
-	float		inner = c * (x + (0.044715f * x3));
-	return 0.5f * x * (1.0f + tanhf(inner));
+static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rope_dim,
+									const float *rope_cos, const float *rope_sin) {
+	int half = rope_dim / 2;
+	for (int h = 0; h < n_heads; h++) {
+		float *vh = v + ((size_t)h * head_dim);
+		for (int j = 0; j < half; j++) {
+			float c		 = rope_cos[j];
+			float s		 = rope_sin[j];
+			float v0	 = vh[j];
+			float v1	 = vh[j + half];
+			vh[j]		 = (v0 * c) - (v1 * s);
+			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+	}
 }
 
 void moe_activate_silu(float *restrict act, const float *restrict gate, const float *restrict up,

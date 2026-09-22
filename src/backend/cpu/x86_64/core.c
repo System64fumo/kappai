@@ -358,7 +358,7 @@ float dot8_f16(const float *restrict a, const uint16_t *restrict b, int head_dim
 static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v_slice,
 								int kv_stride, const float *qh, float *out_h, int head_dim,
 								int n_pos, float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
@@ -739,7 +739,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 									 const uint8_t *restrict v_slice, int kv_stride,
 									 const float *qh, float *out_h, int head_dim, int n_pos,
 									 float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
@@ -1658,3 +1658,15 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "f16c");
 #endif
 }
+static status_code cpu_arch_ctor(backend *out) {
+	memset(out, 0, sizeof(*out));
+	out->name	  = "cpu_x86_64";
+	out->priority = 10;
+	out->caps	  = CPU_BACKEND_CAPS;
+	out->desc	  = "host x86_64 SIMD optimized";
+	return cpu_backend_fill(out);
+}
+
+BACKEND_REGISTER("cpu_x86_64", cpu_arch_ctor)
+
+void backend_autoreg_cpu_scalar_ctor(void) {}

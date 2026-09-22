@@ -40,6 +40,24 @@ static inline void neon_zero_f32(float *dst, int n) {
 #define cpu_attn_job_neon cpu_attn_job
 #define cpu_attn_batch_job_neon cpu_attn_batch_job
 
+static float *cpu_neon_serial_scores(cpu_priv *p, int need) {
+	float **buf;
+	int	   *cap;
+	if (p->thread_scratch && p->n_threads > 0) {
+		buf = &p->thread_scratch[0].scores;
+		cap = &p->thread_scratch[0].scores_cap;
+	} else {
+		buf = &p->scores;
+		cap = &p->scores_cap;
+	}
+	if (*cap < need) {
+		free(*buf);
+		*buf = xmalloc((size_t)need * sizeof(float));
+		*cap = need;
+	}
+	return *buf;
+}
+
 typedef struct {
 	const float *g, *u;
 	float		*o;
@@ -529,7 +547,7 @@ static inline void vld1q_f16x8_to_f32x2(const uint16_t *ptr, float32x4_t *lo, fl
 static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v_slice,
 								int kv_stride, const float *qh, float *out_h, int head_dim,
 								int n_pos, float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
@@ -948,7 +966,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 									 const uint8_t *restrict v_slice, int kv_stride,
 									 const float *qh, float *out_h, int head_dim, int n_pos,
 									 float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
@@ -1066,7 +1084,7 @@ static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
 	cpu_attn_job_neon *j = ctx;
 	float			  *scores;
 	if (tid == 0) {
-		scores = j->p->scores;
+		scores = cpu_neon_serial_scores(j->p, j->n_pos);
 	} else {
 		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
 		if (ts->scores_cap < j->n_pos) {
@@ -1149,7 +1167,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 			return OK;
 		}
 
-		float *scores = p->scores;
+		float *scores = cpu_neon_serial_scores(p, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1192,7 +1210,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		return OK;
 	}
 
-	float *scores = p->scores;
+	float *scores = cpu_neon_serial_scores(p, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1227,7 +1245,7 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	cpu_attn_batch_job_neon *j = ctx;
 	float					*scores;
 	if (tid == 0) {
-		scores = j->p->scores;
+		scores = cpu_neon_serial_scores(j->p, j->pos_start + j->m);
 	} else {
 		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
 		int					need = j->pos_start + j->m;
@@ -2023,3 +2041,14 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
+static status_code cpu_arch_ctor(backend *out) {
+	memset(out, 0, sizeof(*out));
+	out->name	  = "cpu_aarch64";
+	out->priority = 10;
+	out->caps	  = CPU_BACKEND_CAPS;
+	return cpu_backend_fill(out);
+}
+
+BACKEND_REGISTER("cpu_aarch64", cpu_arch_ctor)
+
+void backend_autoreg_cpu_scalar_ctor(void) {}

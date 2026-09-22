@@ -1,6 +1,5 @@
 #include "recipe.h"
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
 #include "compute.h"
 #include "kvcache.h"
 #include "log.h"
@@ -821,7 +820,12 @@ static status_code op_ple_build(exec_ctx *ctx) {
 		(const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr + ((size_t)token * row_stride);
 	float *ple = s->ple_buf;
 
-	dequant_row_dispatch(m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple);
+	backend *dq_host = backend_host();
+	if (!dq_host || !dq_host->dequant_row)
+		return ERR_UNSUPPORTED;
+	st = dq_host->dequant_row(dq_host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple);
+	if (st != OK)
+		return st;
 
 	{
 		float scale = n_embd_sqrt;
@@ -890,9 +894,9 @@ static status_code op_ple_build(exec_ctx *ctx) {
 	if (st != OK)
 		return st;
 
-	matmul_generic_f32(m->layer_dims.per_layer_model_proj.host_ptr,
-					   m->layer_dims.per_layer_model_proj.type, inpL_host, ple_proj, total_ple,
-					   ple_dim);
+	host_matmul_generic(m->layer_dims.per_layer_model_proj.host_ptr,
+						m->layer_dims.per_layer_model_proj.type, inpL_host, ple_proj, total_ple,
+						ple_dim);
 
 	backend *host = backend_host();
 
@@ -1049,15 +1053,26 @@ static status_code op_ffn_activate_ex(exec_ctx *ctx) {
 	status_code r_u = u_owner->buffer_read_f32(u_owner, &slots[ctx->op->in[1]], u, intermediate);
 	if (r_u != OK)
 		return r_u;
-	ps = profile_begin(prof, ctx->op->stage);
-	if (activation == ACTIVATION_GELU) {
-		for (int i = 0; i < intermediate; i++)
-			o[i] = gelu_tanh(g[i]) * u[i];
-	} else {
-		for (int i = 0; i < intermediate; i++)
-			o[i] = silu(g[i]) * u[i];
+	ps			  = profile_begin(prof, ctx->op->stage);
+	backend *host = op_host_backend();
+	if (!host || !host->ffn_activate_ex) {
+		profile_end(prof, &ps);
+		return ERR_UNSUPPORTED;
 	}
+	buffer gb = {0}, ub = {0}, ob = {0};
+	gb.handle = g;
+	gb.owner  = host;
+	gb.size	  = (size_t)intermediate * sizeof(float);
+	ub.handle = u;
+	ub.owner  = host;
+	ub.size	  = (size_t)intermediate * sizeof(float);
+	ob.handle = o;
+	ob.owner  = host;
+	ob.size	  = (size_t)intermediate * sizeof(float);
+	st		  = host->ffn_activate_ex(host, &gb, &ub, &ob, intermediate, activation);
 	profile_end(prof, &ps);
+	if (st != OK)
+		return st;
 	backend *o_owner = slots[ctx->op->out].owner;
 	st				 = o_owner->buffer_write_f32(o_owner, &slots[ctx->op->out], o, intermediate);
 	return st;
@@ -1545,16 +1560,31 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 				free(out_host);
 				return st;
 			}
+			backend *t = op_host_backend();
+			if (!t->ffn_activate_ex) {
+				free(fused_host);
+				free(out_host);
+				return ERR_UNSUPPORTED;
+			}
 			for (int row = 0; row < n_rows; row++) {
-				const float *g = fused_host + (size_t)row * fused_stride;
-				const float *u = g + n;
-				float		*o = out_host + (size_t)row * n;
-				if (act == ACTIVATION_GELU) {
-					for (int i = 0; i < n; i++)
-						o[i] = gelu_tanh(g[i]) * u[i];
-				} else {
-					for (int i = 0; i < n; i++)
-						o[i] = silu(g[i]) * u[i];
+				const float *g	= fused_host + (size_t)row * fused_stride;
+				const float *u	= g + n;
+				float		*o	= out_host + (size_t)row * n;
+				buffer		 gb = {0}, ub = {0}, ob = {0};
+				gb.handle = (void *)g;
+				gb.owner  = t;
+				gb.size	  = (size_t)n * sizeof(float);
+				ub.handle = (void *)u;
+				ub.owner  = t;
+				ub.size	  = (size_t)n * sizeof(float);
+				ob.handle = o;
+				ob.owner  = t;
+				ob.size	  = (size_t)n * sizeof(float);
+				st		  = t->ffn_activate_ex(t, &gb, &ub, &ob, n, act);
+				if (st != OK) {
+					free(fused_host);
+					free(out_host);
+					return st;
 				}
 			}
 			st = a->buffer_write_f32(a, out_buf, out_host, n_rows * n);
@@ -1564,17 +1594,26 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 		}
 		const float *fused = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
 		float		*out   = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
+		backend		*t	   = op_host_backend();
+		if (!t->ffn_activate_ex)
+			return ERR_UNSUPPORTED;
 		for (int row = 0; row < ctx->n_rows; row++) {
-			const float *g = fused + (size_t)row * fused_stride;
-			const float *u = g + n;
-			float		*o = out + (size_t)row * n;
-			if (act == ACTIVATION_GELU) {
-				for (int i = 0; i < n; i++)
-					o[i] = gelu_tanh(g[i]) * u[i];
-			} else {
-				for (int i = 0; i < n; i++)
-					o[i] = silu(g[i]) * u[i];
-			}
+			const float *g	= fused + (size_t)row * fused_stride;
+			const float *u	= g + n;
+			float		*o	= out + (size_t)row * n;
+			buffer		 gb = {0}, ub = {0}, ob = {0};
+			gb.handle = (void *)g;
+			gb.owner  = t;
+			gb.size	  = (size_t)n * sizeof(float);
+			ub.handle = (void *)u;
+			ub.owner  = t;
+			ub.size	  = (size_t)n * sizeof(float);
+			ob.handle = o;
+			ob.owner  = t;
+			ob.size	  = (size_t)n * sizeof(float);
+			st		  = t->ffn_activate_ex(t, &gb, &ub, &ob, n, act);
+			if (st != OK)
+				return st;
 		}
 		st = OK;
 	} else {
@@ -2385,15 +2424,22 @@ void moe_apply_weights(float *weight, int n_k, int norm_topk, float routed_scale
 		weight[k] *= routed_scale;
 }
 
-void moe_activate(float *act, const float *gate, const float *up, int n_i, float gs, float us,
-				  int use_gelu) {
-	if (use_gelu) {
-		for (int i = 0; i < n_i; i++)
-			act[i] = gelu_tanh(gate[i] * gs) * (up[i] * us);
-	} else {
-		for (int i = 0; i < n_i; i++)
-			act[i] = silu(gate[i] * gs) * (up[i] * us);
-	}
+status_code moe_activate(backend *a, float *act, const float *gate, const float *up, int n_i,
+						 float gs, float us, int use_gelu) {
+	backend *h = (a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)) ? a : backend_host();
+	if (!h || !h->moe_activate)
+		return ERR_UNSUPPORTED;
+	buffer gb = {0}, ub = {0}, ob = {0};
+	gb.handle = (void *)gate;
+	gb.owner  = h;
+	gb.size	  = (size_t)n_i * sizeof(float);
+	ub.handle = (void *)up;
+	ub.owner  = h;
+	ub.size	  = (size_t)n_i * sizeof(float);
+	ob.handle = act;
+	ob.owner  = h;
+	ob.size	  = (size_t)n_i * sizeof(float);
+	return h->moe_activate(h, &gb, &ub, &ob, n_i, gs, us, use_gelu);
 }
 
 void moe_router_normalize_input(const struct model *m, const struct layer_weights *L, int dim,
@@ -2877,29 +2923,40 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 		if (es->gate_up_fused) {
 			float *GU = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I * 2);
 			for (int c = 0; c < cnt; c++)
-				matmul_generic_f32(es->gate_w, es->gate_type, X + (size_t)c * dim,
-								   GU + (size_t)c * I * 2, I * 2, dim);
-			for (int c = 0; c < cnt; c++)
-				moe_activate(A + (size_t)c * I, GU + (size_t)c * I * 2, GU + (size_t)c * I * 2 + I,
-							 I, es->gate_scale, es->up_scale, use_gelu);
+				host_matmul_generic(es->gate_w, es->gate_type, X + (size_t)c * dim,
+									GU + (size_t)c * I * 2, I * 2, dim);
+			for (int c = 0; c < cnt; c++) {
+				st = moe_activate(a, A + (size_t)c * I, GU + (size_t)c * I * 2,
+								  GU + (size_t)c * I * 2 + I, I, es->gate_scale, es->up_scale,
+								  use_gelu);
+				if (st != OK) {
+					free(xb_host);
+					return st;
+				}
+			}
 		} else {
 			float *G = float_buf_ensure(&bs->moe_exp_gu, (size_t)cnt * I);
 			float *U = float_buf_ensure(&bs->moe_up_scratch, (size_t)cnt * I);
 			for (int c = 0; c < cnt; c++) {
-				matmul_generic_f32(es->gate_w, es->gate_type, X + (size_t)c * dim,
-								   G + (size_t)c * I, I, dim);
-				matmul_generic_f32(es->up_w, es->up_type, X + (size_t)c * dim, U + (size_t)c * I, I,
-								   dim);
+				host_matmul_generic(es->gate_w, es->gate_type, X + (size_t)c * dim,
+									G + (size_t)c * I, I, dim);
+				host_matmul_generic(es->up_w, es->up_type, X + (size_t)c * dim, U + (size_t)c * I,
+									I, dim);
 			}
-			for (int c = 0; c < cnt; c++)
-				moe_activate(A + (size_t)c * I, G + (size_t)c * I, U + (size_t)c * I, I,
-							 es->gate_scale, es->up_scale, use_gelu);
+			for (int c = 0; c < cnt; c++) {
+				st = moe_activate(a, A + (size_t)c * I, G + (size_t)c * I, U + (size_t)c * I, I,
+								  es->gate_scale, es->up_scale, use_gelu);
+				if (st != OK) {
+					free(xb_host);
+					return st;
+				}
+			}
 		}
 
 		float *Y = bs->moe_exp_y.p;
 		for (int c = 0; c < cnt; c++)
-			matmul_generic_f32(es->down_w, es->down_type, A + (size_t)c * I, Y + (size_t)c * dim,
-							   dim, I);
+			host_matmul_generic(es->down_w, es->down_type, A + (size_t)c * I, Y + (size_t)c * dim,
+								dim, I);
 
 		float ds = es->down_scale;
 		for (int c = 0; c < cnt; c++) {
@@ -3141,15 +3198,21 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 					continue;
 
 				if (es->gate_up_fused) {
-					matmul_generic_f32(es->gate_w, es->gate_type, xb_row, gu_h, I * 2, dim);
-					moe_activate(act_h, gu_h, gu_h + I, I, es->gate_scale, es->up_scale, use_gelu);
+					host_matmul_generic(es->gate_w, es->gate_type, xb_row, gu_h, I * 2, dim);
+					st = moe_activate(a, act_h, gu_h, gu_h + I, I, es->gate_scale, es->up_scale,
+									  use_gelu);
 				} else {
-					matmul_generic_f32(es->gate_w, es->gate_type, xb_row, gate_h, I, dim);
-					matmul_generic_f32(es->up_w, es->up_type, xb_row, up_h, I, dim);
-					moe_activate(act_h, gate_h, up_h, I, es->gate_scale, es->up_scale, use_gelu);
+					host_matmul_generic(es->gate_w, es->gate_type, xb_row, gate_h, I, dim);
+					host_matmul_generic(es->up_w, es->up_type, xb_row, up_h, I, dim);
+					st = moe_activate(a, act_h, gate_h, up_h, I, es->gate_scale, es->up_scale,
+									  use_gelu);
+				}
+				if (st != OK) {
+					free(xb_host);
+					return st;
 				}
 
-				matmul_generic_f32(es->down_w, es->down_type, act_h, y_h, dim, I);
+				host_matmul_generic(es->down_w, es->down_type, act_h, y_h, dim, I);
 				if (es->down_scale != 1.0f) {
 					float ds = es->down_scale;
 					for (int d = 0; d < dim; d++)
@@ -3238,7 +3301,12 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 		for (int row = 0; row < n_rows; row++) {
 			const float *gu = gu_host + (size_t)row * 2 * sh_inter;
 			float		*o	= act_host + (size_t)row * sh_inter;
-			moe_activate(o, gu, gu + sh_inter, sh_inter, 1.0f, 1.0f, use_gelu);
+			st				= moe_activate(a, o, gu, gu + sh_inter, sh_inter, 1.0f, 1.0f, use_gelu);
+			if (st != OK) {
+				free(gu_host);
+				free(act_host);
+				return st;
+			}
 		}
 		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].fb, (size_t)n_rows * sh_inter);
 		st = a->buffer_write_f32(a, &ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b, act_host,
@@ -3289,7 +3357,13 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 			const float *g = g_host + (size_t)row * sh_inter;
 			const float *u = u_host + (size_t)row * sh_inter;
 			float		*o = act_host + (size_t)row * sh_inter;
-			moe_activate(o, g, u, sh_inter, 1.0f, 1.0f, use_gelu);
+			st			   = moe_activate(a, o, g, u, sh_inter, 1.0f, 1.0f, use_gelu);
+			if (st != OK) {
+				free(g_host);
+				free(u_host);
+				free(act_host);
+				return st;
+			}
 		}
 		st = a->buffer_write_f32(a, &ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b, act_host,
 								 n_rows2 * sh_inter);
@@ -3439,7 +3513,13 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 		const uint8_t *embd		  = (const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr +
 									((size_t)token * row_stride);
 		float		  *ple_row	  = ple + (size_t)row * total_ple;
-		dequant_row_dispatch(m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple_row);
+		backend		  *host		  = backend_host();
+		if (!host || !host->dequant_row)
+			return ERR_UNSUPPORTED;
+		st = host->dequant_row(host, m->layer_dims.per_layer_tok_embd.type, embd, total_ple,
+							   ple_row);
+		if (st != OK)
+			return st;
 		for (int i = 0; i < total_ple; i++)
 			ple_row[i] *= n_embd_sqrt;
 	}
@@ -3507,9 +3587,9 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 
 	backend *host = backend_host();
 	for (int row = 0; row < n_rows; row++)
-		matmul_generic_f32(m->layer_dims.per_layer_model_proj.host_ptr,
-						   m->layer_dims.per_layer_model_proj.type, inpL_host + (size_t)row * dim,
-						   ple_proj + (size_t)row * total_ple, total_ple, dim);
+		host_matmul_generic(m->layer_dims.per_layer_model_proj.host_ptr,
+							m->layer_dims.per_layer_model_proj.type, inpL_host + (size_t)row * dim,
+							ple_proj + (size_t)row * total_ple, total_ple, dim);
 
 	{
 		buffer proj_view = {0};
@@ -4158,10 +4238,17 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 		}
 	}
 
-	float *g = (float *)((char *)gate_buf->handle + gate_buf->offset);
-	float *u = (float *)((char *)up_buf->handle + up_buf->offset);
-	float *o = (float *)((char *)act_buf->handle + act_buf->offset);
-	moe_activate(o, g, u, sh_inter, 1.0f, 1.0f, m->arch_info->uses_gelu_activation);
+	backend *h = a->moe_activate ? a : backend_host();
+	if (!h || !h->moe_activate ||
+		(h != a && !backend_has_cap(a, BCAP_IS_HOST) &&
+		 !backend_has_cap(a, BCAP_HOST_VISIBLE_BUFFERS))) {
+		st = ERR_UNSUPPORTED;
+		goto done;
+	}
+	st = h->moe_activate(h, gate_buf, up_buf, act_buf, sh_inter, 1.0f, 1.0f,
+						 m->arch_info->uses_gelu_activation);
+	if (st != OK)
+		goto done;
 
 	float *yp	   = float_buf_ensure(&s->moe_shared_y, (size_t)dim);
 	buffer y_buf   = {0};
@@ -4621,173 +4708,8 @@ status_code op_attn_output_gate(exec_ctx *ctx) {
 	return st;
 }
 
-typedef struct {
-	float		*conv_out, *conv_state;
-	const float *mixed, *conv_w;
-	int			 conv_dim, conv_kernel, n_tokens, mixed_stride, history;
-} gdn_conv_job;
-
-static void gdn_conv_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	gdn_conv_job *j		  = ctx;
-	int			  history = j->history;
-	for (int c = begin; c < end; c++) {
-		const float *w	   = j->conv_w + (size_t)c * j->conv_kernel;
-		float		*hist  = j->conv_state + (size_t)c * history;
-		const float *mix_c = j->mixed + c;
-		if (history == 3) {
-			float h0 = hist[0], h1 = hist[1], h2 = hist[2];
-			for (int t = 0; t < j->n_tokens; t++) {
-				float m	  = mix_c[(size_t)t * j->mixed_stride];
-				float sum = h0 * w[0] + h1 * w[1] + h2 * w[2] + m * w[3];
-				h0		  = h1;
-				h1		  = h2;
-				h2		  = m;
-				j->conv_out[(size_t)t * j->conv_dim + c] = silu(sum);
-			}
-			hist[0] = h0;
-			hist[1] = h1;
-			hist[2] = h2;
-		} else {
-			for (int t = 0; t < j->n_tokens; t++) {
-				const float *mix = j->mixed + (size_t)t * j->mixed_stride;
-				float		*oc	 = j->conv_out + (size_t)t * j->conv_dim;
-				float		 sum = mix[c] * w[history];
-				if (history > 0) {
-					for (int jj = 0; jj < history; jj++)
-						sum += hist[jj] * w[jj];
-					if (history > 1)
-						memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
-					hist[history - 1] = mix[c];
-				}
-				oc[c] = silu(sum);
-			}
-		}
-	}
-}
-
-static void gdn_conv_tokens(tpool *pool, float *conv_out, float *conv_state, const float *mixed,
-							const float *conv_w, int conv_dim, int conv_kernel, int n_tokens,
-							int mixed_stride) {
-	gdn_conv_job job = {.conv_out	  = conv_out,
-						.conv_state	  = conv_state,
-						.mixed		  = mixed,
-						.conv_w		  = conv_w,
-						.conv_dim	  = conv_dim,
-						.conv_kernel  = conv_kernel,
-						.n_tokens	  = n_tokens,
-						.mixed_stride = mixed_stride,
-						.history	  = conv_kernel - 1};
-	if (pool && conv_dim > 8 && tpool_current_tid() < 0) {
-		tpool_parallel_for(pool, conv_dim, 8, gdn_conv_chunk, &job);
-		return;
-	}
-	gdn_conv_chunk(0, conv_dim, -1, &job);
-}
-
-typedef struct {
-	float		*state;
-	const float *conv;
-	const float *z;
-	const float *alpha;
-	const float *beta;
-	float		*out;
-	const float *dt;
-	const float *a;
-	const float *norm_w;
-	float		*scratch;
-	int			 n_tokens;
-	int			 conv_stride;
-	int			 z_stride;
-	int			 alpha_stride;
-	int			 beta_stride;
-	int			 out_stride;
-	int			 nkh;
-	int			 kd;
-	int			 vd;
-	int			 key_dim;
-	int			 scratch_stride;
-	float		 eps;
-} gdn_job;
-
-static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
-	int	   kd		  = j->kd;
-	int	   vd		  = j->vd;
-	float  q_scale	  = 1.0f / sqrtf((float)kd);
-	float *k_s		  = scratch;
-	float *q_s		  = k_s + kd;
-	float *mem		  = q_s + kd;
-	float *delta	  = mem + vd;
-	int	   state_head = kd * vd;
-
-	for (int vh = vh0; vh < vh1; vh++) {
-		int	   kh	 = vh % j->nkh;
-		float *shead = j->state + (size_t)vh * state_head;
-		for (int t = 0; t < j->n_tokens; t++) {
-			const float *conv_t	 = j->conv + (size_t)t * j->conv_stride;
-			const float *q		 = conv_t + (size_t)kh * kd;
-			const float *k		 = conv_t + j->key_dim + (size_t)kh * kd;
-			const float *v		 = conv_t + 2 * j->key_dim + (size_t)vh * vd;
-			const float *z_t	 = j->z + (size_t)t * j->z_stride + (size_t)vh * vd;
-			float		*y		 = j->out + (size_t)t * j->out_stride + (size_t)vh * vd;
-			float		 alpha_t = j->alpha[(size_t)t * j->alpha_stride + vh];
-			float		 beta_t	 = j->beta[(size_t)t * j->beta_stride + vh];
-
-			float decay = expf(j->a[vh] * softplusf(alpha_t + j->dt[vh]));
-			float b		= sigmoidf(beta_t);
-
-			float qn = j->eps;
-			float kn = j->eps;
-			for (int d = 0; d < kd; d++) {
-				qn += q[d] * q[d];
-				kn += k[d] * k[d];
-			}
-			qn = q_scale / sqrtf(qn);
-			kn = 1.0f / sqrtf(kn);
-			for (int d = 0; d < kd; d++) {
-				q_s[d] = q[d] * qn;
-				k_s[d] = k[d] * kn;
-			}
-
-			memset(mem, 0, (size_t)vd * sizeof(float));
-			for (int d = 0; d < kd; d++) {
-				float *row = shead + (size_t)d * vd;
-				float  ks  = k_s[d];
-				for (int jj = 0; jj < vd; jj++) {
-					row[jj] *= decay;
-					mem[jj] += row[jj] * ks;
-				}
-			}
-			for (int jj = 0; jj < vd; jj++)
-				delta[jj] = (v[jj] - mem[jj]) * b;
-			memset(y, 0, (size_t)vd * sizeof(float));
-			for (int d = 0; d < kd; d++) {
-				float *row = shead + (size_t)d * vd;
-				float  ks  = k_s[d];
-				float  qs  = q_s[d];
-				for (int jj = 0; jj < vd; jj++) {
-					row[jj] += ks * delta[jj];
-					y[jj] += row[jj] * qs;
-				}
-			}
-
-			float mean_sq = j->eps;
-			for (int jj = 0; jj < vd; jj++)
-				mean_sq += y[jj] * y[jj] / (float)vd;
-			float inv_rms = 1.0f / sqrtf(mean_sq);
-			for (int jj = 0; jj < vd; jj++)
-				y[jj] = y[jj] * inv_rms * j->norm_w[jj] * silu(z_t[jj]);
-		}
-	}
-}
-
-static void gdn_chunk(int begin, int end, int tid, void *ctx) {
-	gdn_job *j = (gdn_job *)ctx;
-	gdn_heads(begin, end, j, j->scratch + (size_t)tid * j->scratch_stride);
-}
-
-static status_code gdn_run(exec_ctx *ctx, const float *mixed, const float *z, const float *alpha,
-						   const float *beta, float *out, float *ws, tpool *pool) {
+static status_code gdn_run(exec_ctx *ctx, backend *t, const float *mixed, const float *z,
+						   const float *alpha, const float *beta, float *out, float *ws) {
 	model					  *m	  = ctx->m;
 	const model_hybrid_params *p	  = &m->hybrid;
 	layer_weights			  *L	  = &m->layers[ctx->li];
@@ -4797,6 +4719,8 @@ static status_code gdn_run(exec_ctx *ctx, const float *mixed, const float *z, co
 	const float				  *norm_w = (const float *)L->ssm_norm_w.host_ptr;
 	if (!conv_w || !dt || !a || !norm_w)
 		return ERR_FORMAT;
+	if (!t->gated_delta_net)
+		return ERR_UNSUPPORTED;
 
 	kvcache_hybrid *cache	   = ctx->cache->hybrid;
 	float		   *conv_state = cache->conv_state + (size_t)ctx->li * cache->conv_stride;
@@ -4806,43 +4730,33 @@ static status_code gdn_run(exec_ctx *ctx, const float *mixed, const float *z, co
 		memset(state, 0, cache->recurrent_stride * sizeof(float));
 	}
 
-	int	   n_tokens		  = ctx->n_rows > 0 ? ctx->n_rows : 1;
-	int	   scratch_stride = 2 * p->state_size + 2 * p->value_head_dim;
-	float *conv			  = ws;
-	float *scratch		  = ws + (size_t)n_tokens * p->conv_dim;
+	int n_tokens = ctx->n_rows > 0 ? ctx->n_rows : 1;
 
-	gdn_conv_tokens(pool, conv, conv_state, mixed, conv_w, p->conv_dim, p->conv_kernel, n_tokens,
-					p->conv_dim);
-
-	gdn_job job = {
-		.state			= state,
-		.conv			= conv,
+	gdn_desc desc = {
+		.n_tokens		= n_tokens,
+		.n_value_heads	= p->n_value_heads,
+		.n_key_heads	= p->n_key_heads,
+		.conv_dim		= p->conv_dim,
+		.conv_kernel	= p->conv_kernel,
+		.key_dim		= p->key_dim,
+		.state_size		= p->state_size,
+		.value_head_dim = p->value_head_dim,
+		.value_dim		= p->value_dim,
+		.eps			= m->norm_eps,
+		.mixed			= mixed,
 		.z				= z,
 		.alpha			= alpha,
 		.beta			= beta,
-		.out			= out,
+		.conv_w			= conv_w,
 		.dt				= dt,
-		.a				= a,
+		.a_vec			= a,
 		.norm_w			= norm_w,
-		.scratch		= scratch,
-		.n_tokens		= n_tokens,
-		.conv_stride	= p->conv_dim,
-		.z_stride		= p->value_dim,
-		.alpha_stride	= p->n_value_heads,
-		.beta_stride	= p->n_value_heads,
-		.out_stride		= p->value_dim,
-		.nkh			= p->n_key_heads,
-		.kd				= p->state_size,
-		.vd				= p->value_head_dim,
-		.key_dim		= p->key_dim,
-		.scratch_stride = scratch_stride,
-		.eps			= m->norm_eps,
+		.conv_state		= conv_state,
+		.state			= state,
+		.out			= out,
+		.ws				= ws,
 	};
-	if (pool && p->n_value_heads > 1)
-		tpool_parallel_for(pool, p->n_value_heads, 1, gdn_chunk, &job);
-	else
-		gdn_heads(0, p->n_value_heads, &job, scratch);
-	return OK;
+	return t->gated_delta_net(t, &desc);
 }
 
 status_code op_gated_delta_net(exec_ctx *ctx) {
@@ -4851,9 +4765,16 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 	profile_scope			   ps		= profile_begin(&ctx->s->prof, ctx->op->stage);
 	const model_hybrid_params *p		= &ctx->m->hybrid;
 	int						   n_tokens = ctx->n_rows > 0 ? ctx->n_rows : 1;
+	backend					  *a		= exec_layer_backend(ctx);
+	backend					  *t =
+		(a && a->gated_delta_net && backend_has_cap(a, BCAP_IS_HOST)) ? a : op_host_backend();
+	if (!t->gated_delta_net) {
+		profile_end(&ctx->s->prof, &ps);
+		return ERR_UNSUPPORTED;
+	}
 
-	tpool *pool		 = model_get_pool(ctx->m);
-	int	   n_threads = pool ? tpool_n_threads(pool) : 1;
+	tpool *bpool	 = (t->get_pool) ? t->get_pool(t) : NULL;
+	int	   n_threads = bpool ? tpool_n_threads(bpool) : 1;
 	if (n_threads < 1)
 		n_threads = 1;
 
@@ -4878,7 +4799,7 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 		return ERR_INVALID_ARG;
 
 	float	   *ws = float_buf_ensure(&ctx->s->gdn_ws_host, conv_need + scratch_need);
-	status_code st = gdn_run(ctx, mixed, z, alpha, beta, out, ws, pool);
+	status_code st = gdn_run(ctx, t, mixed, z, alpha, beta, out, ws);
 	if (st == OK)
 		st = recipe_slot_write_commit(ctx, ctx->op->out, out, out_n);
 	profile_end(&ctx->s->prof, &ps);

@@ -1,5 +1,4 @@
 #include "compute.h"
-#include "backend/cpu/scalar/quants.h"
 #include "log.h"
 #include <math.h>
 #include <stdlib.h>
