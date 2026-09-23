@@ -29,12 +29,14 @@ params;
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
 layout(constant_id = 2) const int TILE_K		  = 2048;
+layout(constant_id = 3) const int M_PER_WG		  = 4;
 
-shared float x_shared[TILE_K];
+shared float x_shared[M_PER_WG][TILE_K];
 
 void main() {
 	const int n = params.n;
 	const int k = params.k;
+	const int m = params.m;
 	if (n <= 0)
 		return;
 
@@ -42,9 +44,8 @@ void main() {
 	const uint wgsize = gl_WorkGroupSize.x;
 	const uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
 
-	const uint row	 = gl_WorkGroupID.y;
-	const uint x_off = row * uint(k);
-	const uint y_off = row * uint(n);
+	const int row_start = int(gl_WorkGroupID.y) * M_PER_WG;
+	const int rows_here = min(M_PER_WG, m - row_start);
 
 	uint row_off[ROWS_PER_THREAD];
 	bool valid[ROWS_PER_THREAD];
@@ -54,26 +55,25 @@ void main() {
 		row_off[r]	   = min(idx, uint(n) - 1u) * uint(k);
 	}
 
-	float acc[ROWS_PER_THREAD];
-	for (int r = 0; r < ROWS_PER_THREAD; ++r)
-		acc[r] = 0.0;
+	float acc[M_PER_WG][ROWS_PER_THREAD];
+	for (int mr = 0; mr < M_PER_WG; ++mr)
+		for (int r = 0; r < ROWS_PER_THREAD; ++r)
+			acc[mr][r] = 0.0;
 
 	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
 		const int  tile_end = min(tile_start + TILE_K, k);
 		const int  tile_len = tile_end - tile_start;
 		const uint tile_off = uint(tile_start);
 
-		for (int j = int(tid); j < tile_len; j += int(wgsize))
-			x_shared[j] = x[x_off + tile_off + uint(j)];
+		for (int mr = 0; mr < rows_here; ++mr) {
+			const uint x_off = uint(row_start + mr) * uint(k);
+			for (int j = int(tid); j < tile_len; j += int(wgsize))
+				x_shared[mr][j] = x[x_off + tile_off + uint(j)];
+		}
 		barrier();
 
 		int j = 0;
 		for (; j + 4 <= tile_len; j += 4) {
-			const float x0 = x_shared[j + 0];
-			const float x1 = x_shared[j + 1];
-			const float x2 = x_shared[j + 2];
-			const float x3 = x_shared[j + 3];
-
 			float wv0[ROWS_PER_THREAD];
 			float wv1[ROWS_PER_THREAD];
 			float wv2[ROWS_PER_THREAD];
@@ -85,29 +85,43 @@ void main() {
 				wv2[r]		   = w[off + 2u];
 				wv3[r]		   = w[off + 3u];
 			}
-			for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-				acc[r] += wv0[r] * x0;
-				acc[r] += wv1[r] * x1;
-				acc[r] += wv2[r] * x2;
-				acc[r] += wv3[r] * x3;
+			for (int mr = 0; mr < rows_here; ++mr) {
+				const float x0 = x_shared[mr][j + 0];
+				const float x1 = x_shared[mr][j + 1];
+				const float x2 = x_shared[mr][j + 2];
+				const float x3 = x_shared[mr][j + 3];
+				for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+					acc[mr][r] += wv0[r] * x0;
+					acc[mr][r] += wv1[r] * x1;
+					acc[mr][r] += wv2[r] * x2;
+					acc[mr][r] += wv3[r] * x3;
+				}
 			}
 		}
 		for (; j < tile_len; ++j) {
-			const float xv = x_shared[j];
+			float wv[ROWS_PER_THREAD];
 			for (int r = 0; r < ROWS_PER_THREAD; ++r)
-				acc[r] += w[row_off[r] + tile_off + uint(j)] * xv;
+				wv[r] = w[row_off[r] + tile_off + uint(j)];
+			for (int mr = 0; mr < rows_here; ++mr) {
+				const float xv = x_shared[mr][j];
+				for (int r = 0; r < ROWS_PER_THREAD; ++r)
+					acc[mr][r] += wv[r] * xv;
+			}
 		}
 		barrier();
 	}
 
-	for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-		if (!valid[r])
-			continue;
-		const uint o = y_off + base_i + uint(r);
+	for (int mr = 0; mr < rows_here; ++mr) {
+		const uint y_off = uint(row_start + mr) * uint(n);
+		for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+			if (!valid[r])
+				continue;
+			const uint o = y_off + base_i + uint(r);
 #ifdef HAS_RESIDUAL
-		y[o] = acc[r] + residual[o];
+			y[o] = acc[mr][r] + residual[o];
 #else
-		y[o] = acc[r];
+			y[o] = acc[mr][r];
 #endif
+		}
 	}
 }

@@ -8,6 +8,7 @@ OBJ_DIR := $(OUT_DIR)/src
 BUILD ?= release-rdbg
 CPU_ARCH_OPT ?= 1
 BACKENDS ?=
+TSAN ?= 0
 
 HOST_ARCH ?= $(shell uname -m)
 comma := ,
@@ -71,7 +72,7 @@ ifeq ($(BUILD),release-rdbg)
 endif
 
 ifeq ($(TSAN),1)
-  SANITIZE_FLAGS := -fsanitize=thread,undefined -fno-sanitize-recover=undefined
+  SANITIZE_FLAGS := -fsanitize=thread
 else
   SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
 endif
@@ -181,7 +182,7 @@ SERVER_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
 ENGINE      := $(OUT_DIR)/libkappai.so
 CLI_BIN     := $(OUT_DIR)/kappai-cli
 SERVER_BIN  := $(OUT_DIR)/kappai-server
-TEST_BIN    := $(OUT_DIR)/test
+TEST_BIN    := $(OUT_DIR)/kappai-test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
 BUILD_DIRS := $(BACKEND_DIR) \
@@ -292,9 +293,9 @@ ifneq ($(HAS_VULKAN),)
 	@printf '#endif\n' >> $@
 endif
 
-.PHONY: all cli test server monitor clean print-config format tidy backends-help config
+.PHONY: all cli kappai-test server monitor clean print-config format tidy backends-help config
 
-all: $(BACKEND_LIBS) cli test server
+all: $(BACKEND_LIBS) cli kappai-test server
 
 config: $(OUT_DIR) $(CONFIG_FILE)
 	@echo "Build configuration created:"
@@ -305,6 +306,7 @@ $(CONFIG_FILE): | $(OUT_DIR)
 	@printf 'BUILD = %s\n' "$(BUILD)" > $@
 	@printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
 	@printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)" >> $@
+	@printf 'TSAN = %s\n' "$(if $(filter 1,$(TSAN)),1,0)" >> $@
 	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
 	@printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)" >> $@
 	@printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)" >> $@
@@ -336,7 +338,7 @@ $(SERVER_BIN): $(SERVER_OBJS) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(SERVER_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread $(SERVER_LIBS) -o $@
 
-test: $(TEST_BIN)
+kappai-test: $(TEST_BIN)
 $(TEST_BIN): $(TEST_OBJS) $(TEST_QUANT_OBJ) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) $(TEST_QUANT_OBJ) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
@@ -395,6 +397,8 @@ print-config:
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
+	@echo "TSAN	       = $(if $(filter 1,$(TSAN)),1,0)"
+	@echo "SANITIZE_FLAGS     = $(SANITIZE_FLAGS)"
 	@echo "MACHINE_ARCH_FLAGS = $(MACHINE_ARCH_FLAGS)"
 	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
@@ -406,11 +410,12 @@ print-config:
 
 format:
 	@which clang-format >/dev/null 2>&1 || { echo "clang-format not found"; exit 1; }
-	@for f in $(ALL_SRCS) $(HEADERS) $(ALL_SHADERS); do \
-	        echo "  FMT     $$f"; \
-	        clang-format $(FORMAT_FLAGS) $$f; \
-	        chmod 644 $$f; \
-	done
+	@printf '%s\n' $(ALL_SRCS) $(HEADERS) $(ALL_SHADERS) | \
+	xargs -P $$(nproc) -I {} sh -c ' \
+		echo "  FMT     {}"; \
+		clang-format $(FORMAT_FLAGS) {}; \
+		chmod 644 {}; \
+	'
 
 NON_HOST_CPU_ARCHS := aarch64 x86_64
 NON_HOST_CPU_ARCHS := $(filter-out $(HOST_ARCH),$(NON_HOST_CPU_ARCHS))

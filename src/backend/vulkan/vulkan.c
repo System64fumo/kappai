@@ -42,22 +42,6 @@ static inline float vk_f32_from_bits(uint32_t b) {
 	return u.v;
 }
 
-static uint16_t vk_f32_to_f16(float f) {
-	float	 base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
-	uint32_t w		= vk_f32_to_bits(f);
-	uint32_t shl1_w = w + w;
-	uint32_t sign	= w & 0x80000000u;
-	uint32_t bias	= shl1_w & 0xFF000000u;
-	if (bias < 0x71000000u)
-		bias = 0x71000000u;
-	base			   = vk_f32_from_bits((bias >> 1) + 0x07800000u) + base;
-	uint32_t bits	   = vk_f32_to_bits(base);
-	uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
-	uint32_t mant_bits = bits & 0x0FFFu;
-	uint32_t nonsign   = exp_bits + mant_bits;
-	return (sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign);
-}
-
 static float vk_f16_to_f32(uint16_t h) {
 	uint32_t w			  = (uint32_t)h << 16;
 	uint32_t sign		  = w & 0x80000000u;
@@ -248,6 +232,7 @@ typedef struct {
 	int matmul_wg_size;
 	int matmul_rows_per_thread;
 	int matmul_tile_k;
+	int matmul_m_per_wg;
 
 	vk_pipeline_set p_attention;
 	int				attention_ready;
@@ -292,6 +277,12 @@ typedef struct {
 	vk_pipeline_set p_matmul_f16_res_batch;
 	vk_pipeline_set p_matmul_bf16_batch;
 	vk_pipeline_set p_matmul_bf16_res_batch;
+	vk_pipeline_set p_matmul_f32_wide_batch;
+	vk_pipeline_set p_matmul_f32_wide_res_batch;
+	vk_pipeline_set p_matmul_f16_wide_batch;
+	vk_pipeline_set p_matmul_f16_wide_res_batch;
+	vk_pipeline_set p_matmul_bf16_wide_batch;
+	vk_pipeline_set p_matmul_bf16_wide_res_batch;
 	vk_pipeline_set p_matmul_iq4_nl_batch;
 	vk_pipeline_set p_rmsnorm_batch;
 	vk_pipeline_set p_rmsnorm_sg_batch;
@@ -1978,31 +1969,37 @@ static status_code vk_init(backend *self, int device_index) {
 		p->matmul_wg_size		  = 32;
 		p->matmul_rows_per_thread = 2;
 		p->matmul_tile_k		  = 1024;
+		p->matmul_m_per_wg		  = 4;
 	} else {
 		p->matmul_wg_size		  = 64;
 		p->matmul_rows_per_thread = 4;
 		p->matmul_tile_k		  = 2048;
+		p->matmul_m_per_wg		  = 4;
 	}
 	if (p->caps.is_mali) {
 		if (p->caps.subgroup_size <= 8) {
 			p->matmul_wg_size		  = 32;
 			p->matmul_rows_per_thread = 1;
 			p->matmul_tile_k		  = 512;
+			p->matmul_m_per_wg		  = 2;
 		} else {
 			p->matmul_wg_size		  = 96;
 			p->matmul_rows_per_thread = 1;
 			p->matmul_tile_k		  = 1152;
+			p->matmul_m_per_wg		  = 2;
 		}
 	}
 	if (p->caps.is_adreno) {
 		p->matmul_wg_size		  = 128;
 		p->matmul_rows_per_thread = 1;
 		p->matmul_tile_k		  = 256;
+		p->matmul_m_per_wg		  = 2;
 	}
 	if (p->caps.is_radv || p->caps.is_amd) {
 		p->matmul_wg_size		  = 128;
 		p->matmul_rows_per_thread = 1;
 		p->matmul_tile_k		  = 2048;
+		p->matmul_m_per_wg		  = 4;
 	}
 
 	VkCommandPoolCreateInfo cpci = {
@@ -2073,6 +2070,33 @@ static status_code vk_init(backend *self, int device_index) {
 		(uint32_t)p->matmul_wg_size,
 		(uint32_t)p->matmul_rows_per_thread,
 		(uint32_t)p->matmul_tile_k,
+	};
+
+	uint32_t spec_matmul_narrow[4] = {
+		(uint32_t)p->matmul_wg_size,
+		(uint32_t)p->matmul_rows_per_thread,
+		(uint32_t)p->matmul_tile_k,
+		1u,
+	};
+
+	uint32_t dense_tile_k	= (uint32_t)p->matmul_tile_k;
+	uint32_t dense_m_per_wg = (uint32_t)p->matmul_m_per_wg;
+	if (p->caps.max_shared_memory > 0) {
+		double	 budget		  = (double)p->caps.max_shared_memory * 0.75;
+		uint32_t max_m_per_wg = (uint32_t)(budget / (4.0 * (double)dense_tile_k));
+		if (max_m_per_wg < 1)
+			max_m_per_wg = 1;
+		if (dense_m_per_wg > max_m_per_wg)
+			dense_m_per_wg = max_m_per_wg;
+	}
+	if (dense_m_per_wg < 1)
+		dense_m_per_wg = 1;
+	p->matmul_m_per_wg			 = (int)dense_m_per_wg;
+	uint32_t spec_matmul_wide[4] = {
+		(uint32_t)p->matmul_wg_size,
+		(uint32_t)p->matmul_rows_per_thread,
+		dense_tile_k,
+		dense_m_per_wg,
 	};
 
 	uint32_t kquant_tile_k = (uint32_t)p->matmul_tile_k;
@@ -2150,7 +2174,8 @@ static status_code vk_init(backend *self, int device_index) {
 	}
 
 	s = vk_create_pipeline_spec(p, shader_matmul_f32_batch_spv, shader_matmul_f32_batch_spv_len, 3,
-								12, spec_matmul, sizeof(spec_matmul), &p->p_matmul_f32_batch);
+								12, spec_matmul_narrow, sizeof(spec_matmul_narrow),
+								&p->p_matmul_f32_batch);
 	if (s != OK)
 		WARN("vulkan: failed to create matmul_f32_batch pipeline -- "
 			 "batched prefill will fall back to per-token dispatch");
@@ -2158,33 +2183,33 @@ static status_code vk_init(backend *self, int device_index) {
 		p->p_matmul_f32_batch.name = "matmul_f32_batch";
 
 	s = vk_create_pipeline_spec(p, shader_matmul_f32_residual_batch_spv,
-								shader_matmul_f32_residual_batch_spv_len, 4, 12, spec_matmul,
-								sizeof(spec_matmul), &p->p_matmul_f32_res_batch);
+								shader_matmul_f32_residual_batch_spv_len, 4, 12, spec_matmul_narrow,
+								sizeof(spec_matmul_narrow), &p->p_matmul_f32_res_batch);
 	if (s != OK)
 		WARN("vulkan: failed to create matmul_f32_res_batch pipeline");
 	else
 		p->p_matmul_f32_res_batch.name = "matmul_f32_res_batch";
 
-#define VK_CREATE_BATCH_MATMUL(qname, spv_prefix, n_bind, push_sz, spec_arr)                       \
+#define VK_CREATE_BATCH_MATMUL_FIELD(field, spv_prefix, n_bind, push_sz, spec_arr)                 \
 	do {                                                                                           \
 		s = vk_create_pipeline_spec(p, shader_##spv_prefix##_batch_spv,                            \
 									shader_##spv_prefix##_batch_spv_len, n_bind, push_sz,          \
-									spec_arr, sizeof(spec_arr), &p->p_matmul_##qname##_batch);     \
+									spec_arr, sizeof(spec_arr), &p->p_matmul_##field##_batch);     \
 		if (s != OK)                                                                               \
 			WARN("vulkan: failed to create " #spv_prefix "_batch pipeline");                       \
 		else                                                                                       \
-			p->p_matmul_##qname##_batch.name = #spv_prefix "_batch";                               \
+			p->p_matmul_##field##_batch.name = #spv_prefix "_batch";                               \
 	} while (0)
 
-#define VK_CREATE_BATCH_MATMUL_RES(qname, spv_prefix, n_bind, push_sz, spec_arr)                   \
+#define VK_CREATE_BATCH_MATMUL_RES_FIELD(field, spv_prefix, n_bind, push_sz, spec_arr)             \
 	do {                                                                                           \
 		s = vk_create_pipeline_spec(p, shader_##spv_prefix##_residual_batch_spv,                   \
 									shader_##spv_prefix##_residual_batch_spv_len, n_bind, push_sz, \
-									spec_arr, sizeof(spec_arr), &p->p_matmul_##qname##_res_batch); \
+									spec_arr, sizeof(spec_arr), &p->p_matmul_##field##_res_batch); \
 		if (s != OK)                                                                               \
 			WARN("vulkan: failed to create " #spv_prefix "_res_batch pipeline");                   \
 		else                                                                                       \
-			p->p_matmul_##qname##_res_batch.name = #spv_prefix "_res_batch";                       \
+			p->p_matmul_##field##_res_batch.name = #spv_prefix "_res_batch";                       \
 	} while (0)
 
 #define VK_CREATE_BATCH_MATMUL_DUAL(qname, spv_prefix, n_bind, push_sz, spec_arr)                  \
@@ -2198,44 +2223,51 @@ static status_code vk_init(backend *self, int device_index) {
 			p->p_matmul_##qname##_dual_batch.name = #spv_prefix "_dual_batch";                     \
 	} while (0)
 
-	VK_CREATE_BATCH_MATMUL(q4_0, matmul_q4_0, 3, 16, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(q4_0, matmul_q4_0, 4, 16, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_0, matmul_q4_0, 3, 16, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_0, matmul_q4_0, 4, 16, spec_matmul);
 	VK_CREATE_BATCH_MATMUL_DUAL(q4_0, matmul_q4_0, 5, 16, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL(q4_1, matmul_q4_1, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(q4_1, matmul_q4_1, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_1, matmul_q4_1, 3, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_1, matmul_q4_1, 4, 12, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL(q5_0, matmul_q5_0, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(q5_0, matmul_q5_0, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_0, matmul_q5_0, 3, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_0, matmul_q5_0, 4, 12, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL(q5_1, matmul_q5_1, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(q5_1, matmul_q5_1, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_1, matmul_q5_1, 3, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_1, matmul_q5_1, 4, 12, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL(q8_0, matmul_q8_0, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(q8_0, matmul_q8_0, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q8_0, matmul_q8_0, 3, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q8_0, matmul_q8_0, 4, 12, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL(q4_k, matmul_q4_k, 3, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES(q4_k, matmul_q4_k, 4, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_k, matmul_q4_k, 3, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_k, matmul_q4_k, 4, 16, spec_matmul_kquant);
 	VK_CREATE_BATCH_MATMUL_DUAL(q4_k, matmul_q4_k, 5, 16, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL(q5_k, matmul_q5_k, 3, 12, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES(q5_k, matmul_q5_k, 4, 12, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_k, matmul_q5_k, 3, 12, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_k, matmul_q5_k, 4, 12, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL(q6_k, matmul_q6_k, 3, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES(q6_k, matmul_q6_k, 4, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q6_k, matmul_q6_k, 3, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(q6_k, matmul_q6_k, 4, 16, spec_matmul_kquant);
 	VK_CREATE_BATCH_MATMUL_DUAL(q6_k, matmul_q6_k, 5, 16, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL(iq3_s, matmul_iq3_s, 4, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES(iq3_s, matmul_iq3_s, 5, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq3_s, matmul_iq3_s, 4, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_s, matmul_iq3_s, 5, 16, spec_matmul_iq3s);
 
-	VK_CREATE_BATCH_MATMUL(f16, matmul_f16, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(f16, matmul_f16, 4, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL(bf16, matmul_bf16, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES(bf16, matmul_bf16, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 3, 12, spec_matmul_narrow);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16, matmul_f16, 4, 12, spec_matmul_narrow);
+	VK_CREATE_BATCH_MATMUL_FIELD(bf16, matmul_bf16, 3, 12, spec_matmul_narrow);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16, matmul_bf16, 4, 12, spec_matmul_narrow);
 
-#undef VK_CREATE_BATCH_MATMUL
-#undef VK_CREATE_BATCH_MATMUL_RES
+	VK_CREATE_BATCH_MATMUL_FIELD(f32_wide, matmul_f32, 3, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(f32_wide, matmul_f32, 4, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_FIELD(f16_wide, matmul_f16, 3, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16_wide, matmul_f16, 4, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_FIELD(bf16_wide, matmul_bf16, 3, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16_wide, matmul_bf16, 4, 12, spec_matmul_wide);
+
 #undef VK_CREATE_BATCH_MATMUL_DUAL
+#undef VK_CREATE_BATCH_MATMUL_FIELD
+#undef VK_CREATE_BATCH_MATMUL_RES_FIELD
 
 	s = vk_create_pipeline_spec(p, shader_matmul_iq4_nl_batch_spv,
 								shader_matmul_iq4_nl_batch_spv_len, 7, 32, spec_matmul,
@@ -2375,6 +2407,12 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_matmul_f16_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_bf16_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_bf16_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_f32_wide_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_f32_wide_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_f16_wide_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_f16_wide_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_bf16_wide_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_bf16_wide_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq4_nl_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_sg_batch);
@@ -3718,7 +3756,8 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	return s;
 }
 
-static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual);
+static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual,
+												 int use_wide);
 static status_code vk_dispatch_iq4_nl_unified(vk_priv *p, int mode, const buffer *w0,
 											  const buffer *b1, const buffer *b2, buffer *y0,
 											  buffer *y1_opt, int n, int n1, int k, int activation,
@@ -3758,7 +3797,7 @@ static status_code vk_rmsnorm(backend *self, const buffer *x, const buffer *w, b
 }
 
 static vk_pipeline_set *vk_matmul_pipeline(vk_priv *p, uint32_t w_type, int residual) {
-	return vk_matmul_batch_pipeline(p, w_type, residual);
+	return vk_matmul_batch_pipeline(p, w_type, residual, 0);
 }
 
 static int vk_matmul_type_native(backend *self, uint32_t w_type) {
@@ -3771,6 +3810,38 @@ static int vk_matmul_type_native(backend *self, uint32_t w_type) {
 	return 1;
 }
 
+static status_code vk_matmul_host_fallback(backend *self, const buffer *w, uint32_t w_type,
+										   const buffer *x, const buffer *residual, buffer *y,
+										   int n, int k) {
+	int			has_residual = (residual != NULL);
+	float	   *x_host		 = xmalloc((size_t)k * sizeof(float));
+	status_code s			 = vk_buffer_read_f32(self, x, x_host, k);
+	if (s != OK) {
+		free(x_host);
+		return s;
+	}
+	float *r_host = NULL;
+	if (has_residual) {
+		r_host = xmalloc((size_t)n * sizeof(float));
+		s	   = vk_buffer_read_f32(self, residual, r_host, n);
+		if (s != OK) {
+			free(x_host);
+			free(r_host);
+			return s;
+		}
+	}
+	float *y_host = xmalloc((size_t)n * sizeof(float));
+	host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
+	if (has_residual)
+		for (int i = 0; i < n; i++)
+			y_host[i] += r_host[i];
+	s = vk_buffer_write_f32(self, y, y_host, n);
+	free(x_host);
+	free(r_host);
+	free(y_host);
+	return s;
+}
+
 static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 								  const buffer *residual, buffer *y, int n, int k) {
 	vk_priv *p			  = self->priv;
@@ -3781,32 +3852,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 			self, "matmul", HFB_BUF_HOST_RESIDENT,
 			"weight buffer is host-resident (never uploaded to the device); "
 			"matmul executed on host (cpu)");
-		float	   *x_host = xmalloc((size_t)k * sizeof(float));
-		status_code s	   = vk_buffer_read_f32(self, x, x_host, k);
-		if (s != OK) {
-			free(x_host);
-			return s;
-		}
-		float *r_host = NULL;
-		if (has_residual) {
-			r_host = xmalloc((size_t)n * sizeof(float));
-			s	   = vk_buffer_read_f32(self, residual, r_host, n);
-			if (s != OK) {
-				free(x_host);
-				free(r_host);
-				return s;
-			}
-		}
-		float *y_host = xmalloc((size_t)n * sizeof(float));
-		host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
-		if (has_residual)
-			for (int i = 0; i < n; i++)
-				y_host[i] += r_host[i];
-		s = vk_buffer_write_f32(self, y, y_host, n);
-		free(x_host);
-		free(r_host);
-		free(y_host);
-		return s;
+		return vk_matmul_host_fallback(self, w, w_type, x, residual, y, n, k);
 	}
 
 	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type, has_residual);
@@ -3831,32 +3877,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 			"no vulkan shader for weight type '%s' (type=%u); matmul executed "
 			"on host (cpu)",
 			ggml_type_name(w_type), w_type);
-		float	   *x_host = xmalloc((size_t)k * sizeof(float));
-		status_code s	   = vk_buffer_read_f32(self, x, x_host, k);
-		if (s != OK) {
-			free(x_host);
-			return s;
-		}
-		float *r_host = NULL;
-		if (has_residual) {
-			r_host = xmalloc((size_t)n * sizeof(float));
-			s	   = vk_buffer_read_f32(self, residual, r_host, n);
-			if (s != OK) {
-				free(x_host);
-				free(r_host);
-				return s;
-			}
-		}
-		float *y_host = xmalloc((size_t)n * sizeof(float));
-		host_matmul_generic(w->host_ptr, w_type, x_host, y_host, n, k);
-		if (has_residual)
-			for (int i = 0; i < n; i++)
-				y_host[i] += r_host[i];
-		s = vk_buffer_write_f32(self, y, y_host, n);
-		free(x_host);
-		free(r_host);
-		free(y_host);
-		return s;
+		return vk_matmul_host_fallback(self, w, w_type, x, residual, y, n, k);
 	}
 
 	int is_iq3_s	 = (w_type == GGML_TYPE_IQ3_S);
@@ -4836,7 +4857,8 @@ static status_code vk_attention_swa(backend *self, const buffer *q, const buffer
 							 sliding_window, attn_start, n_pos - attn_start);
 }
 
-static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual) {
+static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual,
+												 int use_wide) {
 	switch (w_type) {
 	case GGML_TYPE_Q4_0:
 		return residual ? &p->p_matmul_q4_0_res_batch : &p->p_matmul_q4_0_batch;
@@ -4849,10 +4871,16 @@ static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, in
 	case GGML_TYPE_Q8_0:
 		return residual ? &p->p_matmul_q8_0_res_batch : &p->p_matmul_q8_0_batch;
 	case GGML_TYPE_F32:
+		if (use_wide)
+			return residual ? &p->p_matmul_f32_wide_res_batch : &p->p_matmul_f32_wide_batch;
 		return residual ? &p->p_matmul_f32_res_batch : &p->p_matmul_f32_batch;
 	case GGML_TYPE_F16:
+		if (use_wide)
+			return residual ? &p->p_matmul_f16_wide_res_batch : &p->p_matmul_f16_wide_batch;
 		return residual ? &p->p_matmul_f16_res_batch : &p->p_matmul_f16_batch;
 	case GGML_TYPE_BF16:
+		if (use_wide)
+			return residual ? &p->p_matmul_bf16_wide_res_batch : &p->p_matmul_bf16_wide_batch;
 		return residual ? &p->p_matmul_bf16_res_batch : &p->p_matmul_bf16_batch;
 	case GGML_TYPE_Q4_K:
 		return residual ? &p->p_matmul_q4_k_res_batch : &p->p_matmul_q4_k_batch;
@@ -4900,19 +4928,6 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 								 sizeof(push), groups_x, (uint32_t)m, 1u << 3);
 	}
 
-	vk_pipeline_set *ps = vk_matmul_batch_pipeline(p, w_type, 0);
-	if (!ps || !ps->pipeline)
-		return ERR_UNSUPPORTED;
-
-	vk_buf		*bufs[4] = {as_vkbuf(w), as_vkbuf(x), as_vkbuf(y)};
-	VkDeviceSize offs[4] = {w->offset, x->offset, y->offset};
-	int			 n_bufs	 = 3;
-	if (w_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf) {
-		bufs[n_bufs] = &p->iq3s_grid_buf;
-		offs[n_bufs] = 0;
-		n_bufs++;
-	}
-
 	int is_kquant	 = (w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K ||
 						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S);
 	int unified_push = (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K ||
@@ -4927,18 +4942,45 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 		groups_x = (uint32_t)((n + (wg * rows) - 1) / (wg * rows));
 	}
 
+	int is_dense = (w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16);
+	int m_per_wg = p->matmul_m_per_wg > 0 ? p->matmul_m_per_wg : 1;
+	int min_total_groups = 128;
+	int wide_groups_y	 = (m + m_per_wg - 1) / m_per_wg;
+	int use_wide = is_dense && m_per_wg > 1 && (int)groups_x * wide_groups_y >= min_total_groups;
+
+	vk_pipeline_set *ps = vk_matmul_batch_pipeline(p, w_type, 0, use_wide);
+	if (!ps || !ps->pipeline) {
+		use_wide = 0;
+		ps		 = vk_matmul_batch_pipeline(p, w_type, 0, 0);
+	}
+	if (!ps || !ps->pipeline)
+		return ERR_UNSUPPORTED;
+
+	vk_buf		*bufs[4] = {as_vkbuf(w), as_vkbuf(x), as_vkbuf(y)};
+	VkDeviceSize offs[4] = {w->offset, x->offset, y->offset};
+	int			 n_bufs	 = 3;
+	if (w_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf) {
+		bufs[n_bufs] = &p->iq3s_grid_buf;
+		offs[n_bufs] = 0;
+		n_bufs++;
+	}
+
+	uint32_t groups_y = (uint32_t)m;
+	if (use_wide)
+		groups_y = (uint32_t)wide_groups_y;
+
 	if (unified_push) {
 		struct {
 			int32_t n0, n1, k, m;
 		} push = {n, 0, k, m};
 		return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups_x,
-								 (uint32_t)m, 1u << 2);
+								 groups_y, 1u << 2);
 	} else {
 		struct {
 			int32_t n, k, m;
 		} push = {n, k, m};
 		return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups_x,
-								 (uint32_t)m, 1u << 2);
+								 groups_y, 1u << 2);
 	}
 }
 
