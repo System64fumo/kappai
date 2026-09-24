@@ -27,6 +27,14 @@ static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 #define I8MM_NR 4
 #endif
 
+static inline int tls_realloc(void **ptr, size_t elem_size, int n_elems) {
+	void *tmp = realloc(*ptr, elem_size * (size_t)n_elems);
+	if (!tmp)
+		return 0;
+	*ptr = tmp;
+	return 1;
+}
+
 static inline int32x4_t dotprod2_s8(int8x16_t a_lo, int8x16_t b_lo, int8x16_t a_hi,
 									int8x16_t b_hi) {
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -311,28 +319,10 @@ static void matmul_q5_1_q8_qonly_f32_i8mm(const void *w, const q8_1_block *restr
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
-				tmp = realloc(m_w_cache, sizeof(*m_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m_w_cache, sizeof(*m_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -403,7 +393,7 @@ static void matmul_q5_1_q8_qonly_f32_i8mm(const void *w, const q8_1_block *restr
 					const int8x16_t avec[4] = {
 						vcombine_s8(vget_low_s8(l0), vget_low_s8(l1)),
 						vcombine_s8(vget_high_s8(l0), vget_high_s8(l1)),
-						vcombine_s8(vget_low_s8(h0), vget_high_s8(h1)),
+						vcombine_s8(vget_low_s8(h0), vget_low_s8(h1)),
 						vcombine_s8(vget_high_s8(h0), vget_high_s8(h1)),
 					};
 
@@ -488,28 +478,10 @@ void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
-				tmp = realloc(m_w_cache, sizeof(*m_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m_w_cache, sizeof(*m_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -1842,23 +1814,9 @@ static void matmul_q5_0_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restr
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -2001,23 +1959,9 @@ void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -2758,48 +2702,14 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					wlo_cache = tmp;
-				tmp = realloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					whi_cache = tmp;
-				tmp = realloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					s_lo_cache = tmp;
-				tmp = realloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					s_hi_cache = tmp;
-				tmp = realloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m_lo_cache = tmp;
-				tmp = realloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m_hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
-				tmp = realloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					dmin_w_cache = tmp;
+				int grew = tls_realloc((void **)&wlo_cache, sizeof(*wlo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&whi_cache, sizeof(*whi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&s_lo_cache, sizeof(*s_lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&s_hi_cache, sizeof(*s_hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m_lo_cache, sizeof(*m_lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m_hi_cache, sizeof(*m_hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&dmin_w_cache, sizeof(*dmin_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -3294,48 +3204,14 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					s0_cache = tmp;
-				tmp = realloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					s1_cache = tmp;
-				tmp = realloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m0_cache = tmp;
-				tmp = realloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					m1_cache = tmp;
-				tmp = realloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_cache = tmp;
-				tmp = realloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					dmin_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&s0_cache, sizeof(*s0_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&s1_cache, sizeof(*s1_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m0_cache, sizeof(*m0_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&m1_cache, sizeof(*m1_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_cache, sizeof(*d_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&dmin_cache, sizeof(*dmin_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -3766,18 +3642,9 @@ static void matmul_q6_k_q8_qonly_f32_i8mm(const void *w, const q8_k_block *restr
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					q_unpack_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew =
+					tls_realloc((void **)&q_unpack_cache, sizeof(*q_unpack_cache), n_bi_tiles) &&
+					tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -3944,18 +3811,9 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					q_unpack_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew =
+					tls_realloc((void **)&q_unpack_cache, sizeof(*q_unpack_cache), n_bi_tiles) &&
+					tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -4595,23 +4453,9 @@ static void matmul_iq4_nl_q8_qonly_f32_i8mm(const void *w, const q8_0_block *res
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -4758,23 +4602,9 @@ void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					lo_cache = tmp;
-				tmp = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					hi_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), n_bi_tiles) &&
+						   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -6762,28 +6592,11 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					decoded_cache = tmp;
-				tmp = realloc(sc0_cache, sizeof(*sc0_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					sc0_cache = tmp;
-				tmp = realloc(sc1_cache, sizeof(*sc1_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					sc1_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew =
+					tls_realloc((void **)&decoded_cache, sizeof(*decoded_cache), n_bi_tiles) &&
+					tls_realloc((void **)&sc0_cache, sizeof(*sc0_cache), n_bi_tiles) &&
+					tls_realloc((void **)&sc1_cache, sizeof(*sc1_cache), n_bi_tiles) &&
+					tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -7418,28 +7231,11 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 		int tile_ok = 1;
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				void *tmp;
-				int	  grew = 1;
-				tmp		   = realloc(decoded_cache, sizeof(*decoded_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					decoded_cache = tmp;
-				tmp = realloc(sc0_cache, sizeof(*sc0_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					sc0_cache = tmp;
-				tmp = realloc(sc1_cache, sizeof(*sc1_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					sc1_cache = tmp;
-				tmp = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				if (!tmp)
-					grew = 0;
-				else
-					d_w_cache = tmp;
+				int grew =
+					tls_realloc((void **)&decoded_cache, sizeof(*decoded_cache), n_bi_tiles) &&
+					tls_realloc((void **)&sc0_cache, sizeof(*sc0_cache), n_bi_tiles) &&
+					tls_realloc((void **)&sc1_cache, sizeof(*sc1_cache), n_bi_tiles) &&
+					tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
 				if (!grew)
 					tile_ok = 0;
 				else {
@@ -8603,39 +8399,27 @@ void softmax_masked(float *restrict scores, int n_valid) {
 
 void moe_activate_silu(float *restrict act, const float *restrict gate, const float *restrict up,
 					   int n, float gs, float us) {
-	float32x4_t gs_v  = vdupq_n_f32(gs);
-	float32x4_t us_v  = vdupq_n_f32(us);
-	float32x4_t one_v = vdupq_n_f32(1.0f);
-	int			i	  = 0;
+	float32x4_t gs_v = vdupq_n_f32(gs);
+	float32x4_t us_v = vdupq_n_f32(us);
+	int			i	 = 0;
 	for (; i + 16 <= n; i += 16) {
 		float32x4_t g0 = vmulq_f32(vld1q_f32(gate + i), gs_v);
 		float32x4_t g1 = vmulq_f32(vld1q_f32(gate + i + 4), gs_v);
 		float32x4_t g2 = vmulq_f32(vld1q_f32(gate + i + 8), gs_v);
 		float32x4_t g3 = vmulq_f32(vld1q_f32(gate + i + 12), gs_v);
-		float32x4_t s0 = vmulq_f32(g0, vrecpeq_f32(vaddq_f32(one_v, vexpq_f32(vnegq_f32(g0)))));
-		float32x4_t s1 = vmulq_f32(g1, vrecpeq_f32(vaddq_f32(one_v, vexpq_f32(vnegq_f32(g1)))));
-		float32x4_t s2 = vmulq_f32(g2, vrecpeq_f32(vaddq_f32(one_v, vexpq_f32(vnegq_f32(g2)))));
-		float32x4_t s3 = vmulq_f32(g3, vrecpeq_f32(vaddq_f32(one_v, vexpq_f32(vnegq_f32(g3)))));
-		float32x4_t d0 = vaddq_f32(one_v, vexpq_f32(vnegq_f32(g0)));
-		float32x4_t d1 = vaddq_f32(one_v, vexpq_f32(vnegq_f32(g1)));
-		float32x4_t d2 = vaddq_f32(one_v, vexpq_f32(vnegq_f32(g2)));
-		float32x4_t d3 = vaddq_f32(one_v, vexpq_f32(vnegq_f32(g3)));
-		s0			   = vmulq_f32(s0, vmulq_f32(vrecpsq_f32(d0, s0), s0));
-		s1			   = vmulq_f32(s1, vmulq_f32(vrecpsq_f32(d1, s1), s1));
-		s2			   = vmulq_f32(s2, vmulq_f32(vrecpsq_f32(d2, s2), s2));
-		s3			   = vmulq_f32(s3, vmulq_f32(vrecpsq_f32(d3, s3), s3));
-		vst1q_f32(act + i, vmulq_f32(s0, vmulq_f32(vld1q_f32(up + i), us_v)));
-		vst1q_f32(act + i + 4, vmulq_f32(s1, vmulq_f32(vld1q_f32(up + i + 4), us_v)));
-		vst1q_f32(act + i + 8, vmulq_f32(s2, vmulq_f32(vld1q_f32(up + i + 8), us_v)));
-		vst1q_f32(act + i + 12, vmulq_f32(s3, vmulq_f32(vld1q_f32(up + i + 12), us_v)));
+		float32x4_t u0 = vmulq_f32(vld1q_f32(up + i), us_v);
+		float32x4_t u1 = vmulq_f32(vld1q_f32(up + i + 4), us_v);
+		float32x4_t u2 = vmulq_f32(vld1q_f32(up + i + 8), us_v);
+		float32x4_t u3 = vmulq_f32(vld1q_f32(up + i + 12), us_v);
+		vst1q_f32(act + i, silu_mul_vec4(g0, u0));
+		vst1q_f32(act + i + 4, silu_mul_vec4(g1, u1));
+		vst1q_f32(act + i + 8, silu_mul_vec4(g2, u2));
+		vst1q_f32(act + i + 12, silu_mul_vec4(g3, u3));
 	}
 	for (; i + 4 <= n; i += 4) {
 		float32x4_t g = vmulq_f32(vld1q_f32(gate + i), gs_v);
-		float32x4_t d = vaddq_f32(one_v, vexpq_f32(vnegq_f32(g)));
-		float32x4_t r = vrecpeq_f32(d);
-		r			  = vmulq_f32(r, vmulq_f32(vrecpsq_f32(d, r), r));
-		float32x4_t s = vmulq_f32(g, r);
-		vst1q_f32(act + i, vmulq_f32(s, vmulq_f32(vld1q_f32(up + i), us_v)));
+		float32x4_t u = vmulq_f32(vld1q_f32(up + i), us_v);
+		vst1q_f32(act + i, silu_mul_vec4(g, u));
 	}
 	for (; i < n; i++)
 		act[i] = silu(gate[i] * gs) * (up[i] * us);
@@ -8643,46 +8427,27 @@ void moe_activate_silu(float *restrict act, const float *restrict gate, const fl
 
 void moe_activate_gelu(float *restrict act, const float *restrict gate, const float *restrict up,
 					   int n, float gs, float us) {
-	float32x4_t gs_v   = vdupq_n_f32(gs);
-	float32x4_t us_v   = vdupq_n_f32(us);
-	float32x4_t half_v = vdupq_n_f32(0.5f);
-	float32x4_t one_v  = vdupq_n_f32(1.0f);
-	float32x4_t c_v	   = vdupq_n_f32(0.7978845608028654f);
-	float32x4_t k_v	   = vdupq_n_f32(0.044715f);
-	int			i	   = 0;
+	float32x4_t gs_v = vdupq_n_f32(gs);
+	float32x4_t us_v = vdupq_n_f32(us);
+	int			i	 = 0;
 	for (; i + 16 <= n; i += 16) {
-		float32x4_t g0	 = vmulq_f32(vld1q_f32(gate + i), gs_v);
-		float32x4_t g1	 = vmulq_f32(vld1q_f32(gate + i + 4), gs_v);
-		float32x4_t g2	 = vmulq_f32(vld1q_f32(gate + i + 8), gs_v);
-		float32x4_t g3	 = vmulq_f32(vld1q_f32(gate + i + 12), gs_v);
-		float32x4_t x3_0 = vmulq_f32(g0, vmulq_f32(g0, g0));
-		float32x4_t x3_1 = vmulq_f32(g1, vmulq_f32(g1, g1));
-		float32x4_t x3_2 = vmulq_f32(g2, vmulq_f32(g2, g2));
-		float32x4_t x3_3 = vmulq_f32(g3, vmulq_f32(g3, g3));
-		float32x4_t in0	 = vmulq_f32(c_v, vaddq_f32(g0, vmulq_f32(k_v, x3_0)));
-		float32x4_t in1	 = vmulq_f32(c_v, vaddq_f32(g1, vmulq_f32(k_v, x3_1)));
-		float32x4_t in2	 = vmulq_f32(c_v, vaddq_f32(g2, vmulq_f32(k_v, x3_2)));
-		float32x4_t in3	 = vmulq_f32(c_v, vaddq_f32(g3, vmulq_f32(k_v, x3_3)));
-		float32x4_t t0	 = vtanhq_f32(in0);
-		float32x4_t t1	 = vtanhq_f32(in1);
-		float32x4_t t2	 = vtanhq_f32(in2);
-		float32x4_t t3	 = vtanhq_f32(in3);
-		float32x4_t s0	 = vmulq_f32(half_v, vmulq_f32(g0, vaddq_f32(one_v, t0)));
-		float32x4_t s1	 = vmulq_f32(half_v, vmulq_f32(g1, vaddq_f32(one_v, t1)));
-		float32x4_t s2	 = vmulq_f32(half_v, vmulq_f32(g2, vaddq_f32(one_v, t2)));
-		float32x4_t s3	 = vmulq_f32(half_v, vmulq_f32(g3, vaddq_f32(one_v, t3)));
-		vst1q_f32(act + i, vmulq_f32(s0, vmulq_f32(vld1q_f32(up + i), us_v)));
-		vst1q_f32(act + i + 4, vmulq_f32(s1, vmulq_f32(vld1q_f32(up + i + 4), us_v)));
-		vst1q_f32(act + i + 8, vmulq_f32(s2, vmulq_f32(vld1q_f32(up + i + 8), us_v)));
-		vst1q_f32(act + i + 12, vmulq_f32(s3, vmulq_f32(vld1q_f32(up + i + 12), us_v)));
+		float32x4_t g0 = vmulq_f32(vld1q_f32(gate + i), gs_v);
+		float32x4_t g1 = vmulq_f32(vld1q_f32(gate + i + 4), gs_v);
+		float32x4_t g2 = vmulq_f32(vld1q_f32(gate + i + 8), gs_v);
+		float32x4_t g3 = vmulq_f32(vld1q_f32(gate + i + 12), gs_v);
+		float32x4_t u0 = vmulq_f32(vld1q_f32(up + i), us_v);
+		float32x4_t u1 = vmulq_f32(vld1q_f32(up + i + 4), us_v);
+		float32x4_t u2 = vmulq_f32(vld1q_f32(up + i + 8), us_v);
+		float32x4_t u3 = vmulq_f32(vld1q_f32(up + i + 12), us_v);
+		vst1q_f32(act + i, gelu_mul_vec4(g0, u0));
+		vst1q_f32(act + i + 4, gelu_mul_vec4(g1, u1));
+		vst1q_f32(act + i + 8, gelu_mul_vec4(g2, u2));
+		vst1q_f32(act + i + 12, gelu_mul_vec4(g3, u3));
 	}
 	for (; i + 4 <= n; i += 4) {
-		float32x4_t g  = vmulq_f32(vld1q_f32(gate + i), gs_v);
-		float32x4_t x3 = vmulq_f32(g, vmulq_f32(g, g));
-		float32x4_t in = vmulq_f32(c_v, vaddq_f32(g, vmulq_f32(k_v, x3)));
-		float32x4_t t  = vtanhq_f32(in);
-		float32x4_t s  = vmulq_f32(half_v, vmulq_f32(g, vaddq_f32(one_v, t)));
-		vst1q_f32(act + i, vmulq_f32(s, vmulq_f32(vld1q_f32(up + i), us_v)));
+		float32x4_t g = vmulq_f32(vld1q_f32(gate + i), gs_v);
+		float32x4_t u = vmulq_f32(vld1q_f32(up + i), us_v);
+		vst1q_f32(act + i, gelu_mul_vec4(g, u));
 	}
 	for (; i < n; i++)
 		act[i] = gelu_tanh(gate[i] * gs) * (up[i] * us);
@@ -8909,48 +8674,14 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local int cache_cap					  = 0;
 
 		if (cache_cap < blocks_per_row || !d_w_cache) {
-			void *tmp;
-			int	  grew = 1;
-			tmp		   = realloc(wlo_cache, sizeof(*wlo_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				wlo_cache = tmp;
-			tmp = realloc(whi_cache, sizeof(*whi_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				whi_cache = tmp;
-			tmp = realloc(s_lo_cache, sizeof(*s_lo_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				s_lo_cache = tmp;
-			tmp = realloc(s_hi_cache, sizeof(*s_hi_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				s_hi_cache = tmp;
-			tmp = realloc(m_lo_cache, sizeof(*m_lo_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				m_lo_cache = tmp;
-			tmp = realloc(m_hi_cache, sizeof(*m_hi_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				m_hi_cache = tmp;
-			tmp = realloc(d_w_cache, sizeof(*d_w_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				d_w_cache = tmp;
-			tmp = realloc(dmin_w_cache, sizeof(*dmin_w_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				dmin_w_cache = tmp;
+			int grew = tls_realloc((void **)&wlo_cache, sizeof(*wlo_cache), blocks_per_row) &&
+					   tls_realloc((void **)&whi_cache, sizeof(*whi_cache), blocks_per_row) &&
+					   tls_realloc((void **)&s_lo_cache, sizeof(*s_lo_cache), blocks_per_row) &&
+					   tls_realloc((void **)&s_hi_cache, sizeof(*s_hi_cache), blocks_per_row) &&
+					   tls_realloc((void **)&m_lo_cache, sizeof(*m_lo_cache), blocks_per_row) &&
+					   tls_realloc((void **)&m_hi_cache, sizeof(*m_hi_cache), blocks_per_row) &&
+					   tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), blocks_per_row) &&
+					   tls_realloc((void **)&dmin_w_cache, sizeof(*dmin_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
 					matmul_q4_k_r8_q8_k_qonly_f32_vec_single(
@@ -9456,48 +9187,14 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local int cache_cap					= 0;
 
 		if (cache_cap < blocks_per_row || !d_cache) {
-			void *tmp;
-			int	  grew = 1;
-			tmp		   = realloc(lo_cache, sizeof(*lo_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				lo_cache = tmp;
-			tmp = realloc(hi_cache, sizeof(*hi_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				hi_cache = tmp;
-			tmp = realloc(s0_cache, sizeof(*s0_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				s0_cache = tmp;
-			tmp = realloc(s1_cache, sizeof(*s1_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				s1_cache = tmp;
-			tmp = realloc(m0_cache, sizeof(*m0_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				m0_cache = tmp;
-			tmp = realloc(m1_cache, sizeof(*m1_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				m1_cache = tmp;
-			tmp = realloc(d_cache, sizeof(*d_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				d_cache = tmp;
-			tmp = realloc(dmin_cache, sizeof(*dmin_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				dmin_cache = tmp;
+			int grew = tls_realloc((void **)&lo_cache, sizeof(*lo_cache), blocks_per_row) &&
+					   tls_realloc((void **)&hi_cache, sizeof(*hi_cache), blocks_per_row) &&
+					   tls_realloc((void **)&s0_cache, sizeof(*s0_cache), blocks_per_row) &&
+					   tls_realloc((void **)&s1_cache, sizeof(*s1_cache), blocks_per_row) &&
+					   tls_realloc((void **)&m0_cache, sizeof(*m0_cache), blocks_per_row) &&
+					   tls_realloc((void **)&m1_cache, sizeof(*m1_cache), blocks_per_row) &&
+					   tls_realloc((void **)&d_cache, sizeof(*d_cache), blocks_per_row) &&
+					   tls_realloc((void **)&dmin_cache, sizeof(*dmin_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
 					matmul_q5_k_r8_q8_k_qonly_f32_vec_single(
@@ -9914,18 +9611,9 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 		static _Thread_local int cache_cap					   = 0;
 
 		if (cache_cap < blocks_per_row || !d_w_cache) {
-			void *tmp;
-			int	  grew = 1;
-			tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				q_unpack_cache = tmp;
-			tmp = realloc(d_w_cache, sizeof(*d_w_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				d_w_cache = tmp;
+			int grew =
+				tls_realloc((void **)&q_unpack_cache, sizeof(*q_unpack_cache), blocks_per_row) &&
+				tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
 					matmul_q6_k_r8_q8_k_qonly_f32_vec_single(
@@ -10077,18 +9765,9 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		static _Thread_local int cache_cap					   = 0;
 
 		if (cache_cap < blocks_per_row || !d_w_cache) {
-			void *tmp;
-			int	  grew = 1;
-			tmp		   = realloc(q_unpack_cache, sizeof(*q_unpack_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				q_unpack_cache = tmp;
-			tmp = realloc(d_w_cache, sizeof(*d_w_cache) * blocks_per_row);
-			if (!tmp)
-				grew = 0;
-			else
-				d_w_cache = tmp;
+			int grew =
+				tls_realloc((void **)&q_unpack_cache, sizeof(*q_unpack_cache), blocks_per_row) &&
+				tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
 					matmul_q6_k_r8_q8_k_qonly_f32_vec_single(
