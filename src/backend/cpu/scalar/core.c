@@ -117,52 +117,6 @@ static const matmul_kernel k_kernels[] = {
 	MATMUL_KERNEL(GGML_TYPE_Q6_K_R8, matmul_q6_k_r8_q8_k_qonly_f32, 3),
 };
 
-static inline status_code cpu_scratch_grow_aligned(void **buf, size_t *cap_bytes, size_t need_bytes,
-												   size_t align) {
-	if (*cap_bytes >= need_bytes)
-		return OK;
-	free(*buf);
-	size_t aligned_need = ((need_bytes + align - 1) / align) * align;
-	*buf				= aligned_alloc(align, aligned_need);
-	if (!*buf) {
-		*cap_bytes = 0;
-		return ERR_OUT_OF_MEMORY;
-	}
-	*cap_bytes = aligned_need;
-	return OK;
-}
-
-static inline status_code cpu_scratch_grow_floats(float **buf, int *cap_count, int need_count) {
-	if (*cap_count >= need_count)
-		return OK;
-	free(*buf);
-	*buf = malloc((size_t)need_count * sizeof(float));
-	if (!*buf) {
-		*cap_count = 0;
-		return ERR_OUT_OF_MEMORY;
-	}
-	*cap_count = need_count;
-	return OK;
-}
-
-static float *cpu_serial_scores(cpu_priv *p, int need) {
-	float **buf;
-	int	   *cap;
-	if (p->thread_scratch && p->n_threads > 0) {
-		buf = &p->thread_scratch[0].scores;
-		cap = &p->thread_scratch[0].scores_cap;
-	} else {
-		buf = &p->scores;
-		cap = &p->scores_cap;
-	}
-	if (*cap < need) {
-		free(*buf);
-		*buf = xmalloc((size_t)need * sizeof(float));
-		*cap = need;
-	}
-	return *buf;
-}
-
 static inline quant_scratch *cpu_scratch_for_tid(cpu_priv *p, int tid) {
 	if (p->thread_scratch && tid >= 0 && tid < p->n_threads)
 		return &p->thread_scratch[tid].qscratch;
@@ -397,18 +351,10 @@ static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 	p->kv_kvh_stride   = (size_t)desc->n_ctx * p->kv_block_stride;
 
 	if (p->thread_scratch) {
-		for (int i = 0; i < p->n_threads; i++) {
-			cpu_thread_scratch *ts = &p->thread_scratch[i];
-			if (desc->n_ctx > ts->scores_cap) {
-				free(ts->scores);
-				ts->scores	   = xmalloc((size_t)desc->n_ctx * sizeof(float));
-				ts->scores_cap = desc->n_ctx;
-			}
-		}
-	} else if (desc->n_ctx > p->scores_cap) {
-		free(p->scores);
-		p->scores	  = xmalloc((size_t)desc->n_ctx * sizeof(float));
-		p->scores_cap = desc->n_ctx;
+		for (int i = 0; i < p->n_threads; i++)
+			cpu_grow_scores(p, i, desc->n_ctx);
+	} else {
+		cpu_grow_scores(p, -1, desc->n_ctx);
 	}
 
 	return OK;
@@ -842,8 +788,8 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	if (!can_recurse || !p->pool || n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		const float *res = residual;
 		if (aliases_residual) {
-			status_code grow_st = cpu_scratch_grow_aligned(
-				(void **)&p->residual_tmp, &p->residual_tmp_cap, (size_t)n * sizeof(float), 64);
+			status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
+											   (size_t)n * sizeof(float), 64);
 			if (grow_st != OK)
 				return;
 			memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
@@ -873,8 +819,8 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
 		const float *res = residual;
 		if (aliases_residual) {
-			status_code grow_st = cpu_scratch_grow_aligned(
-				(void **)&p->residual_tmp, &p->residual_tmp_cap, (size_t)n * sizeof(float), 64);
+			status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
+											   (size_t)n * sizeof(float), 64);
 			if (grow_st != OK)
 				return;
 			memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
@@ -887,8 +833,8 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	job.row_stride = cpu_matmul_w_row_stride(w_type, k);
 
 	if (aliases_residual && residual) {
-		status_code grow_st = cpu_scratch_grow_aligned(
-			(void **)&p->residual_tmp, &p->residual_tmp_cap, (size_t)n * sizeof(float), 64);
+		status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
+										   (size_t)n * sizeof(float), 64);
 		if (grow_st != OK)
 			return;
 		memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
@@ -1270,7 +1216,7 @@ static status_code cpu_prequantize_x(backend *self, const buffer *x, int k, uint
 	}
 
 	size_t		need	= cpu_matmul_xq_row_stride(q8_class, k);
-	status_code grow_st = cpu_scratch_grow(&p->xq8_buf, &p->xq8_buf_cap, need);
+	status_code grow_st = cpu_buf_grow(&p->xq8_buf, &p->xq8_buf_cap, need, 1);
 	if (grow_st != OK)
 		return grow_st;
 	cpu_quantize_class(cpu_ptr(x), p->xq8_buf, k, q8_class);
@@ -1348,7 +1294,8 @@ static status_code cpu_rope_one_factored(cpu_priv *p, float *v, int n_heads, int
 		p->rope_cs.head_dim_cs_cached == head_dim && p->rope_cs.freq_factors_cached == freq_factors;
 
 	if ((size_t)p->rope_cs.cs_cap < (size_t)half * 2 * sizeof(float)) {
-		status_code grow_st = cpu_scratch_grow_floats(&p->rope_cs.cs, &p->rope_cs.cs_cap, half * 2);
+		status_code grow_st = cpu_buf_grow((void **)&p->rope_cs.cs, &p->rope_cs.cs_cap,
+										   (size_t)half * 2 * sizeof(float), 1);
 		if (grow_st != OK)
 			return grow_st;
 		cache_valid = 0;
@@ -1791,19 +1738,8 @@ static void cpu_attention_inner(const uint16_t *k_slice, const uint16_t *v_slice
 }
 
 static void cpu_attn_head_chunk(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job *j = ctx;
-	float		 *scores;
-	if (tid == 0) {
-		scores = cpu_serial_scores(j->p, j->n_pos);
-	} else {
-		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
-		if (ts->scores_cap < j->n_pos) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)j->n_pos * sizeof(float));
-			ts->scores_cap = j->n_pos;
-		}
-		scores = ts->scores;
-	}
+	cpu_attn_job *j		 = ctx;
+	float		 *scores = cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
@@ -1880,28 +1816,7 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 			return OK;
 		}
 
-		float *scores;
-		if (cur_tid >= 0 && p->thread_scratch && cur_tid < p->n_threads) {
-			cpu_thread_scratch *ts = &p->thread_scratch[cur_tid];
-			status_code grow_st	   = cpu_scratch_grow_floats(&ts->scores, &ts->scores_cap, n_pos);
-			if (grow_st != OK)
-				return grow_st;
-			scores = ts->scores;
-		} else {
-			float **serial_buf;
-			int	   *serial_cap;
-			if (p->thread_scratch && p->n_threads > 0) {
-				serial_buf = &p->thread_scratch[0].scores;
-				serial_cap = &p->thread_scratch[0].scores_cap;
-			} else {
-				serial_buf = &p->scores;
-				serial_cap = &p->scores_cap;
-			}
-			status_code grow_st = cpu_scratch_grow_floats(serial_buf, serial_cap, n_pos);
-			if (grow_st != OK)
-				return grow_st;
-			scores = *serial_buf;
-		}
+		float *scores = cpu_grow_scores(p, cur_tid, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1943,28 +1858,7 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 		return OK;
 	}
 
-	float *scores;
-	if (cur_tid >= 0 && p->thread_scratch && cur_tid < p->n_threads) {
-		cpu_thread_scratch *ts		= &p->thread_scratch[cur_tid];
-		status_code			grow_st = cpu_scratch_grow_floats(&ts->scores, &ts->scores_cap, n_pos);
-		if (grow_st != OK)
-			return grow_st;
-		scores = ts->scores;
-	} else {
-		float **serial_buf;
-		int	   *serial_cap;
-		if (p->thread_scratch && p->n_threads > 0) {
-			serial_buf = &p->thread_scratch[0].scores;
-			serial_cap = &p->thread_scratch[0].scores_cap;
-		} else {
-			serial_buf = &p->scores;
-			serial_cap = &p->scores_cap;
-		}
-		status_code grow_st = cpu_scratch_grow_floats(serial_buf, serial_cap, n_pos);
-		if (grow_st != OK)
-			return grow_st;
-		scores = *serial_buf;
-	}
+	float *scores = cpu_grow_scores(p, cur_tid, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -2000,20 +1894,8 @@ __attribute__((weak)) status_code cpu_attention_swa(backend *self, const buffer 
 }
 
 static void cpu_attn_batch_chunk(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job *j = ctx;
-	float			   *scores;
-	if (tid == 0) {
-		scores = cpu_serial_scores(j->p, j->pos_start + j->m);
-	} else {
-		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
-		int					need = j->pos_start + j->m;
-		if (ts->scores_cap < need) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)need * sizeof(float));
-			ts->scores_cap = need;
-		}
-		scores = ts->scores;
-	}
+	cpu_attn_batch_job *j	   = ctx;
+	float			   *scores = cpu_grow_scores(j->p, tid, j->pos_start + j->m);
 
 	for (int idx = begin; idx < end; idx++) {
 		int dispatch_row = idx / j->n_heads;
@@ -2364,7 +2246,7 @@ status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora
 	if (p) {
 		size_t		krot_need = (size_t)n_ctx * (size_t)qk_rope * sizeof(float);
 		status_code grow_st =
-			cpu_scratch_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need);
+			cpu_buf_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need, 1);
 		if (grow_st != OK)
 			return grow_st;
 	}
@@ -2499,7 +2381,7 @@ __attribute__((weak)) status_code cpu_attention_mla(backend *self, const buffer 
 	int half_rope = qk_rope / 2;
 
 	size_t		krot_need = (size_t)n_pos * qk_rope * sizeof(float);
-	status_code grow_st = cpu_scratch_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need);
+	status_code grow_st	  = cpu_buf_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need, 1);
 	if (grow_st != OK)
 		return grow_st;
 	float *k_pe_rot_all = p->mla_krot.buf;
@@ -2802,8 +2684,8 @@ static status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t 
 	const float *up_f	= cpu_ptr(up);
 	float		*yf		= cpu_ptr(y);
 
-	status_code grow_st = cpu_scratch_grow_aligned((void **)&p->residual_tmp, &p->residual_tmp_cap,
-												   (size_t)k * sizeof(float), 64);
+	status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
+									   (size_t)k * sizeof(float), 64);
 	if (grow_st != OK)
 		return grow_st;
 	float *act = p->residual_tmp;

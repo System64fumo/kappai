@@ -12,7 +12,7 @@ int main(int argc, char **argv) {
 
 	openai_install_signals();
 
-	status_code s = engine_init(&ctx, &a, argc, argv);
+	int s = engine_init(&ctx, &a, argc, argv);
 	if (s == ENGINE_EXIT)
 		return 0;
 	if (s != OK)

@@ -13,16 +13,6 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
-typedef struct {
-	uint16_t d;
-	uint8_t	 qs[64];
-	uint8_t	 qh[8];
-	uint8_t	 signs[32];
-	uint8_t	 scales[4];
-} iq3s_block;
-
-static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 #define I8MM_NR 4
 #endif
@@ -6229,16 +6219,6 @@ void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 
 #undef NR
 
-#define IQ3S_RE_OFF_D 0
-
-#define IQ3S_RE_OFF_SCALES 2
-
-#define IQ3S_RE_OFF_IDX 6
-
-static const int8_t iq3s_re_decode_tbl[16] = {
-	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
-};
-
 static inline void iq3s_re_unpack_group(const uint8_t *idx_ptr, uint8x16_t tbl, int8x16_t *out0,
 										int8x16_t *out1) {
 	uint8x16_t packed = vld1q_u8(idx_ptr);
@@ -6255,7 +6235,7 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
 	const uint8_t *Wb			  = w;
 
-	uint8x16_t tbl = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t tbl = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int		   i   = 0;
 
 	for (; i + 8 <= n; i += 8) {
@@ -6364,7 +6344,7 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block 
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int			   i			  = 0;
 
 	int8x16_t(*decoded_cache)[MR][16]	 = NULL;
@@ -6573,7 +6553,7 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {
@@ -6844,7 +6824,7 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int			   i			  = 0;
 
 	const uint8x16_t mask_0F = vdupq_n_u8(0x0F);
@@ -6990,7 +6970,7 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int			   i			  = 0;
 
 	int8x16_t(*decoded_cache)[MR][16]	 = NULL;
@@ -7213,7 +7193,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode_tbl);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {

@@ -55,7 +55,7 @@ void usage(FILE *fp, bool is_server) {
 			is_server ? "kappai-server" : "kappai-cli", is_server ? "" : " [prompt]",
 			is_server ? "Starts an OpenAI-compatible HTTP server.\n\n"
 					  : "Runs an interactive chat REPL by default. Use -p for a single\n"
-						"non-interactive turn (scripting, testing, experimentation).\n\n");
+						"non-interactive turn (scripting, testing, experimentation).\n");
 
 	fprintf(fp,
 			"Engine:\n"
@@ -94,14 +94,14 @@ void usage(FILE *fp, bool is_server) {
 			"  --repeat-penalty <f>     repetition penalty (default 1.0 = disabled)\n"
 			"  --repeat-last-n <n>      last-n tokens considered by repeat penalty (default 64)\n"
 			"  -s, --seed <n>           RNG seed (0 = random)\n"
-			"  --reasoning [bool]       allow model reasoning/thinking (default: on)\n\n");
+			"  --reasoning [bool]       allow model reasoning/thinking (default: on)\n");
 
 	if (is_server) {
 		fprintf(fp, "Server:\n"
 					"  --host <addr>            bind address (default: 127.0.0.1)\n"
 					"  --port <n>               listen port (default: 8080)\n"
 					"  --api-key <key>          require 'Authorization: Bearer <key>' on /v1 "
-					"requests\n\n");
+					"requests\n");
 	}
 
 	fprintf(fp,
@@ -116,7 +116,7 @@ void usage(FILE *fp, bool is_server) {
 			"  --debug-forward          print per-layer activation stats for first token\n"
 			"  --debug                  enable debug-level logging\n"
 			"  --disable-failsafes      skip memory guardrails (unsafe; debug only)\n"
-			"  -h, --help               show this help\n\n");
+			"  -h, --help               show this help\n");
 }
 
 static int parse_bool_flag(const char *flag, const char *optarg, int default_if_bare, int *out) {
@@ -134,9 +134,8 @@ static int parse_bool_flag(const char *flag, const char *optarg, int default_if_
 		*out = 0;
 		return 0;
 	}
-	fprintf(stderr,
-			"invalid %s value '%s' (expected one of: yes, on, true, 1, no, off, false, 0)\n", flag,
-			optarg);
+	ERROR("invalid %s value '%s' (expected one of: yes, on, true, 1, no, off, false, 0)", flag,
+		  optarg);
 	return -1;
 }
 
@@ -145,11 +144,11 @@ static int parse_int_arg(const char *optarg, const char *flag, long minv, long m
 	errno	  = 0;
 	long v	  = strtol(optarg, &end, 10);
 	if (end == optarg || *end != '\0') {
-		fprintf(stderr, "invalid %s value '%s' (expected an integer)\n", flag, optarg);
+		ERROR("invalid %s value '%s' (expected an integer)", flag, optarg);
 		return -1;
 	}
 	if (errno == ERANGE || v < minv || v > maxv) {
-		fprintf(stderr, "%s value '%s' out of range [%ld, %ld]\n", flag, optarg, minv, maxv);
+		ERROR("%s value '%s' out of range [%ld, %ld]", flag, optarg, minv, maxv);
 		return -1;
 	}
 	*out = (int)v;
@@ -161,12 +160,11 @@ static int parse_seed_arg(const char *optarg, const char *flag, uint64_t *out) {
 	errno	   = 0;
 	uint64_t v = strtoull(optarg, &end, 10);
 	if (end == optarg || *end != '\0') {
-		fprintf(stderr, "invalid %s value '%s' (expected an unsigned integer)\n", flag, optarg);
+		ERROR("invalid %s value '%s' (expected an unsigned integer)", flag, optarg);
 		return -1;
 	}
 	if (errno == ERANGE) {
-		fprintf(stderr, "%s value '%s' out of range [0, %llu]\n", flag, optarg,
-				(unsigned long long)UINT64_MAX);
+		ERROR("%s value '%s' out of range [0, %llu]", flag, optarg, (unsigned long long)UINT64_MAX);
 		return -1;
 	}
 	*out = v;
@@ -179,16 +177,15 @@ static int parse_float_arg(const char *optarg, const char *flag, float minv, flo
 	errno	  = 0;
 	double v  = strtod(optarg, &end);
 	if (end == optarg || *end != '\0') {
-		fprintf(stderr, "invalid %s value '%s' (expected a number)\n", flag, optarg);
+		ERROR("invalid %s value '%s' (expected a number)", flag, optarg);
 		return -1;
 	}
 	if (!isfinite(v)) {
-		fprintf(stderr, "invalid %s value '%s' (must be finite)\n", flag, optarg);
+		ERROR("invalid %s value '%s' (must be finite)", flag, optarg);
 		return -1;
 	}
 	if (errno == ERANGE || (double)v < (double)minv || (double)v > (double)maxv) {
-		fprintf(stderr, "%s value '%s' out of range [%g, %g]\n", flag, optarg, (double)minv,
-				(double)maxv);
+		ERROR("%s value '%s' out of range [%g, %g]", flag, optarg, (double)minv, (double)maxv);
 		return -1;
 	}
 	*out = (float)v;
@@ -219,7 +216,7 @@ static int parse_kv_quant(const char *optarg, config *cfg) {
 	} else if (strcmp(optarg, "q8_0") == 0) {
 		cfg->kv_quant = KV_QUANT_Q8_0;
 	} else {
-		fprintf(stderr, "invalid --kv-quant value '%s' (expected f16 or q8_0)\n", optarg);
+		ERROR("invalid --kv-quant value '%s' (expected f16 or q8_0)", optarg);
 		return -1;
 	}
 	return 0;
@@ -486,8 +483,8 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		case OPT_METRICS: {
 			size_t l = strlen(optarg);
 			if (l == 0 || l >= sizeof(a->metrics)) {
-				fprintf(stderr, "invalid --metrics value '%s' (max %zu chars)\n", optarg,
-						sizeof(a->metrics) - 1);
+				ERROR("invalid --metrics value '%s' (max %zu chars)", optarg,
+					  sizeof(a->metrics) - 1);
 				return -1;
 			}
 			for (size_t i = 0; i < l; i++) {
@@ -496,7 +493,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 					(ch >= 'A' && ch <= 'Z')) {
 					a->metrics[i] = (char)tolower((unsigned char)ch);
 				} else {
-					fprintf(stderr, "invalid character '%c' in --metrics value '%s'\n", ch, optarg);
+					ERROR("invalid character '%c' in --metrics value '%s'", ch, optarg);
 					return -1;
 				}
 			}
@@ -517,7 +514,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		case OPT_PORT:
 			a->server_port = atoi(optarg);
 			if (a->server_port <= 0 || a->server_port > 65535) {
-				fprintf(stderr, "invalid --port value '%s'\n", optarg);
+				ERROR("invalid --port value '%s'", optarg);
 				return -1;
 			}
 			break;

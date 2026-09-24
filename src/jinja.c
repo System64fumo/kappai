@@ -6,12 +6,6 @@
 #include <time.h>
 
 typedef struct {
-	char	*p;
-	uint32_t len;
-	uint32_t cap;
-} strbuf;
-
-typedef struct {
 	char   **msgs;
 	uint32_t n;
 	uint32_t cap;
@@ -32,39 +26,17 @@ static void strlist_free(strlist *sl) {
 	sl->n = sl->cap = 0;
 }
 
-static void sb_init(strbuf *b) {
-	b->cap	= 256;
-	b->len	= 0;
-	b->p	= xmalloc(b->cap);
-	b->p[0] = '\0';
-}
-
-static void sb_append(strbuf *b, const char *s, size_t n) {
-	if (b->len + n + 1 > b->cap) {
-		while (b->len + n + 1 > b->cap)
-			b->cap *= 2;
-		b->p = xrealloc(b->p, b->cap);
-	}
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
-}
-
-static void sb_append_str(strbuf *b, const char *s) {
-	sb_append(b, s, strlen(s));
-}
-
 static void strlist_report(const strlist *sl, char *errbuf, size_t errbuf_len) {
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
 	for (size_t i = 0; i < sl->n; i++) {
 		if (i)
-			sb_append_str(&sb, "\n");
-		sb_append_str(&sb, sl->msgs[i]);
+			sb_puts(&sb, "\n");
+		sb_puts(&sb, sl->msgs[i]);
 	}
 	if (errbuf_len)
 		snprintf(errbuf, errbuf_len, "%s", sb.p);
-	free(sb.p);
+	sb_free(&sb);
 }
 
 typedef struct {
@@ -1709,7 +1681,7 @@ static void everr(eval_ctx *ctx, const char *msg) {
 	ctx->failed = 1;
 }
 
-static void			exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out);
+static void			exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
 static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e);
 
 static void bind_one_param(scope *call_sc, macro_param *mp, expr_arg *args, expr_arg **cur_pos,
@@ -1758,7 +1730,7 @@ static jinja_value *call_macro(eval_ctx *ctx, jinja_value *macro_val, expr_arg *
 	scope *saved = ctx->sc;
 	ctx->sc		 = &call_sc;
 	ctx->call_depth++;
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
 	exec_stmts(ctx, def->macro_body, &sb);
 	ctx->call_depth--;
@@ -1766,7 +1738,7 @@ static jinja_value *call_macro(eval_ctx *ctx, jinja_value *macro_val, expr_arg *
 	scope_free_entries(&call_sc);
 
 	jinja_value *out = jinja_string(sb.p);
-	free(sb.p);
+	sb_free(&sb);
 	return out;
 }
 
@@ -1798,70 +1770,70 @@ static jinja_value *dictsort_value(const jinja_value *base) {
 	return out;
 }
 
-static void json_append_str(strbuf *sb, const char *s) {
-	sb_append(sb, "\"", 1);
+static void json_append_str(str_builder *sb, const char *s) {
+	sb_putb(sb, "\"", 1);
 	for (const char *c = s; *c; c++) {
 		switch (*c) {
 		case '"':
-			sb_append(sb, "\\\"", 2);
+			sb_putb(sb, "\\\"", 2);
 			break;
 		case '\\':
-			sb_append(sb, "\\\\", 2);
+			sb_putb(sb, "\\\\", 2);
 			break;
 		case '\n':
-			sb_append(sb, "\\n", 2);
+			sb_putb(sb, "\\n", 2);
 			break;
 		case '\r':
-			sb_append(sb, "\\r", 2);
+			sb_putb(sb, "\\r", 2);
 			break;
 		case '\t':
-			sb_append(sb, "\\t", 2);
+			sb_putb(sb, "\\t", 2);
 			break;
 		default:
-			sb_append(sb, c, 1);
+			sb_putb(sb, c, 1);
 			break;
 		}
 	}
-	sb_append(sb, "\"", 1);
+	sb_putb(sb, "\"", 1);
 }
 
-static void json_to_json(strbuf *sb, const jinja_value *v) {
+static void json_to_json(str_builder *sb, const jinja_value *v) {
 	if (!v) {
-		sb_append_str(sb, "null");
+		sb_puts(sb, "null");
 		return;
 	}
 	switch (v->type) {
 	case JV_NONE:
-		sb_append_str(sb, "null");
+		sb_puts(sb, "null");
 		break;
 	case JV_BOOL:
-		sb_append_str(sb, v->as.b ? "true" : "false");
+		sb_puts(sb, v->as.b ? "true" : "false");
 		break;
 	case JV_STRING:
 		json_append_str(sb, v->as.s);
 		break;
 	case JV_DICT: {
-		sb_append(sb, "{", 1);
+		sb_putb(sb, "{", 1);
 		int first = 1;
 		for (jinja_dict_entry *e = v->as.dict; e; e = e->next) {
 			if (!first)
-				sb_append_str(sb, ", ");
+				sb_puts(sb, ", ");
 			first = 0;
 			json_append_str(sb, e->key);
-			sb_append_str(sb, ": ");
+			sb_puts(sb, ": ");
 			json_to_json(sb, e->val);
 		}
-		sb_append(sb, "}", 1);
+		sb_putb(sb, "}", 1);
 		break;
 	}
 	case JV_LIST: {
-		sb_append(sb, "[", 1);
+		sb_putb(sb, "[", 1);
 		for (size_t i = 0; i < v->as.list.n; i++) {
 			if (i)
-				sb_append_str(sb, ", ");
+				sb_puts(sb, ", ");
 			json_to_json(sb, v->as.list.items[i]);
 		}
-		sb_append(sb, "]", 1);
+		sb_putb(sb, "]", 1);
 		break;
 	}
 	case JV_MACRO:
@@ -1958,25 +1930,25 @@ static jinja_value *filter_replace(eval_ctx *ctx, jinja_value *base, expr_arg *a
 	const char *new_s = args && args->next ? value_as_cstr(eval_expr(ctx, args->next->val)) : "";
 	const char *str	  = value_as_cstr(base);
 	size_t		old_n = strlen(old_s);
-	strbuf		sb;
+	str_builder sb;
 	sb_init(&sb);
 	if (!old_n) {
-		sb_append_str(&sb, str);
+		sb_puts(&sb, str);
 	} else {
 		const char *remaining = str;
 		for (;;) {
 			const char *hit = strstr(remaining, old_s);
 			if (!hit) {
-				sb_append_str(&sb, remaining);
+				sb_puts(&sb, remaining);
 				break;
 			}
-			sb_append(&sb, remaining, (size_t)(hit - remaining));
-			sb_append_str(&sb, new_s);
+			sb_putb(&sb, remaining, (size_t)(hit - remaining));
+			sb_puts(&sb, new_s);
 			remaining = hit + old_n;
 		}
 	}
 	jinja_value *out = jinja_string(sb.p);
-	free(sb.p);
+	sb_free(&sb);
 	return out;
 }
 
@@ -2024,28 +1996,28 @@ static jinja_value *filter_last(eval_ctx *ctx, jinja_value *base, expr_arg *args
 
 static jinja_value *filter_join(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
 	const char *sep = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
-	strbuf		sb;
+	str_builder sb;
 	sb_init(&sb);
 	if (base && base->type == JV_LIST) {
 		for (size_t i = 0; i < base->as.list.n; i++) {
 			if (i)
-				sb_append_str(&sb, sep);
-			sb_append_str(&sb, value_as_cstr(base->as.list.items[i]));
+				sb_puts(&sb, sep);
+			sb_puts(&sb, value_as_cstr(base->as.list.items[i]));
 		}
 	}
 	jinja_value *out = jinja_string(sb.p);
-	free(sb.p);
+	sb_free(&sb);
 	return out;
 }
 
 static jinja_value *filter_tojson(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
 	(void)ctx;
 	(void)args;
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
 	json_to_json(&sb, base);
 	jinja_value *out = jinja_string(sb.p);
-	free(sb.p);
+	sb_free(&sb);
 	return out;
 }
 
@@ -2257,12 +2229,12 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 			snprintf(buf, sizeof(buf), "%ld", atol(as) + atol(bs));
 			return jinja_string(buf);
 		}
-		strbuf sb;
+		str_builder sb;
 		sb_init(&sb);
-		sb_append_str(&sb, as);
-		sb_append_str(&sb, bs);
+		sb_puts(&sb, as);
+		sb_puts(&sb, bs);
 		jinja_value *out = jinja_string(sb.p);
-		free(sb.p);
+		sb_free(&sb);
 		return out;
 	}
 	if (!strcmp(e->op, "-")) {
@@ -2580,18 +2552,18 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 	return jinja_none();
 }
 
-static void exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out);
+static void exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
 
-static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
+static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 	if (ctx->failed)
 		return;
 	switch (s->kind) {
 	case ST_TEXT:
-		sb_append_str(out, s->text);
+		sb_puts(out, s->text);
 		return;
 	case ST_OUTPUT: {
 		jinja_value *v = eval_expr(ctx, s->expr);
-		sb_append_str(out, value_as_cstr(v));
+		sb_puts(out, value_as_cstr(v));
 		return;
 	}
 	case ST_IF:
@@ -2681,11 +2653,11 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		if (s->set_val) {
 			val = eval_expr(ctx, s->set_val);
 		} else {
-			strbuf sb;
+			str_builder sb;
 			sb_init(&sb);
 			exec_stmts(ctx, s->body, &sb);
 			val = jinja_string(sb.p);
-			free(sb.p);
+			sb_free(&sb);
 		}
 		if (s->set_attr) {
 			jinja_value *target = scope_lookup(ctx->sc, s->set_name);
@@ -2722,7 +2694,7 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 	}
 }
 
-static void exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out) {
+static void exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 	for (; s && !ctx->failed && !ctx->break_hit; s = s->next)
 		exec_stmt(ctx, s, out);
 }
@@ -2754,11 +2726,9 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	ctx.call_depth = 0;
 	ctx.break_hit  = 0;
 
-	strbuf sb;
-	sb.cap	= 4096;
-	sb.len	= 0;
-	sb.p	= xmalloc(sb.cap);
-	sb.p[0] = '\0';
+	str_builder sb;
+	sb_init(&sb);
+	sb_reserve(&sb, 4096);
 	exec_stmts(&ctx, prog, &sb);
 
 	scope_free_entries(&global_sc);
@@ -2767,11 +2737,11 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	g_render_arena = outer;
 
 	if (ctx.failed) {
-		free(sb.p);
+		sb_free(&sb);
 		*out = NULL;
 		return ERR_FORMAT;
 	}
 
-	*out = sb.p;
+	*out = sb_finish(&sb);
 	return OK;
 }

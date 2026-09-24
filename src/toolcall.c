@@ -30,28 +30,6 @@ struct toolcall_scanner {
 	json_object *calls;
 };
 
-void toolcall_buf_append(toolcall_buf *b, const char *s, size_t n) {
-	if (!b || n == 0)
-		return;
-	if (b->len + n + 1 > b->cap) {
-		b->cap = b->cap ? b->cap * 2 : 128;
-		while (b->len + n + 1 > b->cap)
-			b->cap *= 2;
-		b->p = xrealloc(b->p, b->cap);
-	}
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
-}
-
-void toolcall_buf_reset(toolcall_buf *b) {
-	if (!b)
-		return;
-	b->len = 0;
-	if (b->p)
-		b->p[0] = '\0';
-}
-
 static size_t partial_marker_len(const char *s, size_t len, const char *marker) {
 	if (!marker)
 		return 0;
@@ -790,18 +768,18 @@ static void emit_content(toolcall_scanner *sc, size_t from, size_t to) {
 
 static void record_call(toolcall_scanner *sc, const char *name, json_object *args) {
 	json_object *tc = json_object_new_object();
-	json_object_object_add(tc, "index", json_object_new_int((int)sc->n_calls));
+	json_set_int(tc, "index", (int)sc->n_calls);
 	uint64_t seq = atomic_fetch_add_explicit(&g_call_seq, 1, memory_order_relaxed);
 	char	 idbuf[64];
 	snprintf(idbuf, sizeof(idbuf), "call_%llx_%016llx%03zu", (unsigned long long)time(NULL),
 			 (unsigned long long)seq, sc->n_calls);
-	json_object_object_add(tc, "id", json_object_new_string(idbuf));
-	json_object_object_add(tc, "type", json_object_new_string("function"));
+	json_set_str(tc, "id", idbuf);
+	json_set_str(tc, "type", "function");
 	json_object *fn = json_object_new_object();
-	json_object_object_add(fn, "name", json_object_new_string(name));
+	json_set_str(fn, "name", name);
 	const char *args_str =
 		args ? json_object_to_json_string_ext(args, JSON_C_TO_STRING_PLAIN) : "{}";
-	json_object_object_add(fn, "arguments", json_object_new_string(args_str));
+	json_set_str(fn, "arguments", args_str);
 	json_object_object_add(tc, "function", fn);
 	json_object_array_add(sc->calls, tc);
 	if (sc->on_call)

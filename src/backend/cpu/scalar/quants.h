@@ -384,4 +384,16 @@ static const int8_t kvalues_iq4nl[16] = {
 	-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
+typedef iq3_s_block iq3s_block;
+
+static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+static const int8_t iq3s_re_decode[16] = {
+	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
+};
+
+#define IQ3S_RE_OFF_D 0
+#define IQ3S_RE_OFF_SCALES 2
+#define IQ3S_RE_OFF_IDX 6
+
 #endif

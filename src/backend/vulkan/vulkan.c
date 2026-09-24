@@ -465,14 +465,7 @@ static void vk_suballoc_release(vk_priv *p, vk_buf *b) {
 		else
 			break;
 	}
-	if (blk->n_ranges == blk->cap_ranges) {
-		int				   new_cap = blk->cap_ranges ? blk->cap_ranges * 2 : 8;
-		vk_suballoc_range *nr	   = xrealloc(blk->ranges, (size_t)new_cap * sizeof(*nr));
-		if (!nr)
-			return;
-		blk->ranges		= nr;
-		blk->cap_ranges = new_cap;
-	}
+	ARR_RESERVE(blk->ranges, blk->n_ranges, blk->cap_ranges);
 	memmove(blk->ranges + pos + 1, blk->ranges + pos,
 			(size_t)(blk->n_ranges - pos) * sizeof(*blk->ranges));
 	blk->ranges[pos].off  = lo;
@@ -2545,10 +2538,7 @@ static vk_buf *vk_dummy_buf(vk_priv *p) {
 }
 
 static void vk_kv_registry_add(vk_priv *p, void *h) {
-	if (p->kv_handle_count == p->kv_handle_cap) {
-		p->kv_handle_cap = p->kv_handle_cap ? p->kv_handle_cap * 2 : 8;
-		p->kv_handles	 = xrealloc(p->kv_handles, (size_t)p->kv_handle_cap * sizeof(void *));
-	}
+	ARR_RESERVE(p->kv_handles, p->kv_handle_count, p->kv_handle_cap);
 	p->kv_handles[p->kv_handle_count++] = h;
 }
 

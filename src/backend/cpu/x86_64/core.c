@@ -640,7 +640,7 @@ static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_pt
 	float sum	   = 0.0f;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d);
+		float			  d	  = f16_to_f32_fast(blk->d);
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -695,7 +695,7 @@ static void accum_v_q8_0(float *restrict out_h, const uint8_t *restrict block_pt
 	int n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d) * weight;
+		float			  d	  = f16_to_f32_fast(blk->d) * weight;
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -869,13 +869,7 @@ static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
-		if (ts->scores_cap < j->n_pos) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)j->n_pos * sizeof(float));
-			ts->scores_cap = j->n_pos;
-		}
-		scores = ts->scores;
+		scores = cpu_grow_scores(j->p, tid, j->n_pos);
 	}
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
@@ -1031,14 +1025,7 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
-		int					need = j->pos_start + j->m;
-		if (ts->scores_cap < need) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)need * sizeof(float));
-			ts->scores_cap = need;
-		}
-		scores = ts->scores;
+		scores = cpu_grow_scores(j->p, tid, j->pos_start + j->m);
 	}
 
 	for (int idx = begin; idx < end; idx++) {
@@ -1607,7 +1594,7 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	int half_rope = qk_rope / 2;
 
 	size_t		krot_need = (size_t)n_pos * qk_rope * sizeof(float);
-	status_code grow_st = cpu_scratch_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need);
+	status_code grow_st	  = cpu_buf_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need, 1);
 	if (grow_st != OK)
 		return grow_st;
 	float *k_pe_rot_all = p->mla_krot.buf;

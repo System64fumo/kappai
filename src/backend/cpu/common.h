@@ -18,7 +18,7 @@ int32_t cpu_argmax_f32(const float *logits, int vocab);
 typedef struct {
 	quant_scratch qscratch;
 	float		 *scores;
-	int			  scores_cap;
+	size_t		  scores_cap;
 } cpu_thread_scratch;
 
 typedef struct {
@@ -38,7 +38,7 @@ typedef struct {
 	double		 theta_cached;
 	int			 head_dim_cached;
 	float		*cs;
-	int			 cs_cap;
+	size_t		 cs_cap;
 	int			 pos_cached;
 	float		 theta_cs_cached;
 	int			 head_dim_cs_cached;
@@ -51,7 +51,7 @@ typedef struct {
 	void		 *xq8_buf;
 	size_t		  xq8_buf_cap;
 	float		 *scores;
-	int			  scores_cap;
+	size_t		  scores_cap;
 	int			  kv_head_dim_max;
 	kv_quant_type kv_quant;
 
@@ -85,17 +85,46 @@ typedef struct {
 void feat_add(char *buf, size_t cap, const char *name);
 void detect_features(char *buf, size_t cap);
 
-static inline status_code cpu_scratch_grow(void **buf, size_t *cap_bytes, size_t need_bytes) {
+static inline status_code cpu_buf_grow(void **p, size_t *cap_bytes, size_t need_bytes,
+									   size_t align) {
 	if (*cap_bytes >= need_bytes)
 		return OK;
-	free(*buf);
-	*buf = malloc(need_bytes);
-	if (!*buf) {
+	free(*p);
+	*p			 = NULL;
+	size_t bytes = align > 1 ? ((need_bytes + align - 1) / align) * align : need_bytes;
+	if (align > 1)
+		*p = aligned_alloc(align, bytes);
+	else
+		*p = malloc(bytes);
+	if (!*p) {
 		*cap_bytes = 0;
 		return ERR_OUT_OF_MEMORY;
 	}
-	*cap_bytes = need_bytes;
+	*cap_bytes = bytes;
 	return OK;
+}
+
+static inline float *cpu_grow_scores(cpu_priv *p, int tid, int need) {
+	cpu_thread_scratch *ts =
+		(p->thread_scratch && tid >= 0 && tid < p->n_threads) ? &p->thread_scratch[tid] : NULL;
+	float **buf;
+	size_t *cap;
+	if (ts) {
+		buf = &ts->scores;
+		cap = &ts->scores_cap;
+	} else if (p->thread_scratch && p->n_threads > 0) {
+		buf = &p->thread_scratch[0].scores;
+		cap = &p->thread_scratch[0].scores_cap;
+	} else {
+		buf = &p->scores;
+		cap = &p->scores_cap;
+	}
+	if (*cap < (size_t)need) {
+		free(*buf);
+		*buf = xmalloc((size_t)need * sizeof(float));
+		*cap = (size_t)need;
+	}
+	return *buf;
 }
 
 static inline void *cpu_ptr(const buffer *b) {

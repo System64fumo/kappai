@@ -702,15 +702,8 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 			bpe_heap_push(&bs, r, i, 0);
 	}
 
-	size_t arena_cap = t->bpe_arena_cap;
-	if (arena_cap < len) {
-		size_t cap = arena_cap > 0 ? arena_cap : 64;
-		while (cap < len)
-			cap *= 2;
-		free(t->bpe_arena);
-		t->bpe_arena	 = xmalloc(cap);
-		t->bpe_arena_cap = cap;
-	}
+	ARR_ENSURE(t->bpe_arena, len, t->bpe_arena_cap);
+	size_t arena_cap  = t->bpe_arena_cap;
 	char  *arena	  = t->bpe_arena;
 	size_t arena_used = 0;
 
@@ -792,33 +785,19 @@ fail:
 static int encode_sp_chunk(tokenizer *t, const char *text, size_t start, size_t end,
 						   int32_t *out_ids, int max_out, int *written) {
 	size_t sub_len = end - start;
-	if (t->bpe_sp_cap < (sub_len + 1) * 3 + 1) {
-		size_t cap = t->bpe_sp_cap > 0 ? t->bpe_sp_cap : 256;
-		while (cap < (sub_len + 1) * 3 + 1)
-			cap *= 2;
-		free(t->bpe_sp_text);
-		t->bpe_sp_text = xmalloc(cap);
-		t->bpe_sp_cap  = cap;
-	}
-	char  *sp_text = t->bpe_sp_text;
-	size_t sp_len  = 0;
-	if (t->add_space_prefix) {
-		sp_text[sp_len++] = '\xe2';
-		sp_text[sp_len++] = '\x96';
-		sp_text[sp_len++] = '\x81';
-	}
+	sb_reset(&t->bpe_sp);
+	sb_reserve(&t->bpe_sp, (sub_len + 1) * 3 + 1);
+	if (t->add_space_prefix)
+		sb_putb(&t->bpe_sp, "\xe2\x96\x81", 3);
 	for (size_t i = start; i < end; i++) {
-		if (text[i] == ' ') {
-			sp_text[sp_len++] = '\xe2';
-			sp_text[sp_len++] = '\x96';
-			sp_text[sp_len++] = '\x81';
-		} else {
-			sp_text[sp_len++] = text[i];
-		}
+		if (text[i] == ' ')
+			sb_putb(&t->bpe_sp, "\xe2\x96\x81", 3);
+		else
+			sb_putc(&t->bpe_sp, text[i]);
 	}
-	sp_text[sp_len] = '\0';
 	int n;
-	if (tokenizer_bpe_encode(t, sp_text, sp_len, out_ids + *written, max_out - *written, &n) < 0)
+	if (tokenizer_bpe_encode(t, t->bpe_sp.p, t->bpe_sp.len, out_ids + *written, max_out - *written,
+							 &n) < 0)
 		return -1;
 	*written += n;
 	return 0;
@@ -1165,7 +1144,7 @@ void tokenizer_free(tokenizer *t) {
 	free(t->bpe_pcs_cache);
 	free(t->bpe_work);
 	free(t->bpe_arena);
-	free(t->bpe_sp_text);
+	sb_free(&t->bpe_sp);
 	memset(t, 0, sizeof(*t));
 }
 

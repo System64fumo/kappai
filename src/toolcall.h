@@ -7,14 +7,15 @@
 #include <json-c/json.h>
 #include <stddef.h>
 
-typedef struct {
-	char  *p;
-	size_t len;
-	size_t cap;
-} toolcall_buf;
+typedef str_builder toolcall_buf;
 
-void toolcall_buf_append(toolcall_buf *b, const char *s, size_t n);
-void toolcall_buf_reset(toolcall_buf *b);
+static inline void toolcall_buf_append(toolcall_buf *b, const char *s, size_t n) {
+	sb_putb(b, s, n);
+}
+
+static inline void toolcall_buf_reset(toolcall_buf *b) {
+	sb_reset(b);
+}
 
 typedef void (*toolcall_content_fn)(void *ud, const char *piece, size_t n);
 typedef void (*toolcall_call_fn)(void *ud, int index, const char *id, const char *name,

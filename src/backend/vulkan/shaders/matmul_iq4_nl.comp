@@ -51,25 +51,11 @@ layout(constant_id = 2) const int TILE_K		  = 2048;
 #define MODE_FFN_DOWN 2
 #define MODE_QKV 3
 
-uint w0_read_u16(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b0[word_idx];
-	if (shift + 8u <= 32u)
-		return (lo >> shift) & 0xFFFFu;
-	uint hi = b0[word_idx + 1u];
-	return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
-}
-
-uint w0_read_u32(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b0[word_idx];
-	if (shift == 0u)
-		return lo;
-	uint hi = b0[word_idx + 1u];
-	return (lo >> shift) | (hi << (32u - shift));
-}
+#define W_NAME b0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
 
 uint w1_read_u16(uint byte_offset) {
 	uint word_idx = byte_offset >> 2u;
@@ -91,25 +77,11 @@ uint w1_read_u32(uint byte_offset) {
 	return (lo >> shift) | (hi << (32u - shift));
 }
 
-uint w2_read_u16(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b5[word_idx];
-	if (shift + 8u <= 32u)
-		return (lo >> shift) & 0xFFFFu;
-	uint hi = b5[word_idx + 1u];
-	return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
-}
-
-uint w2_read_u32(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b5[word_idx];
-	if (shift == 0u)
-		return lo;
-	uint hi = b5[word_idx + 1u];
-	return (lo >> shift) | (hi << (32u - shift));
-}
+#define W_NAME b5
+#define W_PFX w2_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
 
 float erf_precise(float x) {
 	float sign = x >= 0.0 ? 1.0 : -1.0;

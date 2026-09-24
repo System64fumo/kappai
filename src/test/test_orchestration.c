@@ -641,7 +641,7 @@ static void t_interrupt_prefill_poisons(void) {
 	int healthy	  = !c.session_poisoned && recovered == 4 && c.kv.n_pos > 0;
 	restore_logging();
 
-	int ok = (r1 == 0) && poisoned && (refused == -1) && (n_pos_kept == 0) && healthy;
+	int ok = (r1 == 0) && poisoned && (refused == ERR_INTERNAL) && (n_pos_kept == 0) && healthy;
 	snprintf(detail, sizeof(detail),
 			 "interrupted prefill: turn=%d poisoned=%d next-turn-rc=%d n_pos=%d; "
 			 "after reset turn=%d healthy=%d",
@@ -751,8 +751,8 @@ static void t_context_full_unit(void) {
 		int g3 = context_chat_turn(&c, "user", "hi", true, 2, &sp, gen_capture_cb, &cap3, "");
 		int recovered_ok = (g3 == 2 && !c.session_poisoned);
 
-		int ok = (g1 == 4) && (g2 == -1) && not_poisoned && render_restored && npos_unchanged &&
-				 recovered_ok;
+		int ok = (g1 == 4) && (g2 == ERR_INVALID_ARG) && not_poisoned && render_restored &&
+				 npos_unchanged && recovered_ok;
 		snprintf(detail, sizeof(detail),
 				 "overflow: turn1=%d n_pos=%d; oversized turn2=%d poisoned=%d "
 				 "render_restored=%d n_pos_unchanged=%d; after reset turn=%d",

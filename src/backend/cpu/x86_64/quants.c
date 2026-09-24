@@ -9,16 +9,6 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
-typedef struct {
-	uint16_t d;
-	uint8_t	 qs[64];
-	uint8_t	 qh[8];
-	uint8_t	 signs[32];
-	uint8_t	 scales[4];
-} iq3s_block;
-
-static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-
 static inline __m128 loadu_f16x4_to_ps_128(const uint16_t *p) {
 	__m128i h = _mm_loadl_epi64((const __m128i *)(p));
 	return _mm_cvtph_ps(h);
@@ -118,14 +108,6 @@ void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst) {
 	}
 }
 
-#define IQ3S_RE_OFF_D 0
-#define IQ3S_RE_OFF_SCALES 2
-#define IQ3S_RE_OFF_IDX 6
-
-static const int8_t iq3s_re_decode_tbl[16] = {
-	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
-};
-
 static inline __m256i iq3s_re_unpack_group(const uint8_t *idx_ptr, __m256i tbl) {
 	__m128i packed = _mm_loadu_si128((const __m128i *)(idx_ptr));
 	__m128i lo	   = _mm_and_si128(packed, _mm_set1_epi8(0x0F));
@@ -140,9 +122,8 @@ static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
 	const uint8_t *Wb			  = w;
 
-	__m256i tbl =
-		_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode_tbl)));
-	int i = 0;
+	__m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode)));
+	int		i	= 0;
 
 	for (; i + 8 <= n; i += 8) {
 		__m128 acc0 = _mm_setzero_ps();
@@ -260,9 +241,8 @@ void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
 	const uint8_t *Wb			  = w;
-	__m256i		   tbl =
-		_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode_tbl)));
-	int i = 0;
+	__m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode)));
+	int		i	= 0;
 
 	for (; i + MR <= n; i += MR) {
 		const uint8_t *row_base[MR];
@@ -381,9 +361,8 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	__m256i		   tbl =
-		_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode_tbl)));
-	int i = 0;
+	__m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode)));
+	int		i	= 0;
 
 	for (; i + 8 <= n; i += 8) {
 		__m128 acc0 = _mm_setzero_ps();
@@ -511,9 +490,8 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 	const int	   blocks_per_row = k / 256;
 	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	__m256i		   tbl =
-		_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode_tbl)));
-	int i = 0;
+	__m256i tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq3s_re_decode)));
+	int		i	= 0;
 
 	for (; i + MR <= n; i += MR) {
 		const uint8_t *group = Wb + (size_t)(i / 8) * row_stride;

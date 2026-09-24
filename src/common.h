@@ -44,6 +44,7 @@ typedef enum {
 	ERR_INTERNAL	  = -7,
 	ERR_INTERRUPTED	  = -8,
 	ERR_FALLBACK	  = -9,
+	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
 typedef struct {
@@ -169,6 +170,72 @@ static inline float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t a
 
 static inline float *float_buf_ensure(float_buf *b, size_t need) {
 	return float_buf_ensure_aligned(b, need, 64);
+}
+
+typedef struct {
+	char  *p;
+	size_t len;
+	size_t cap;
+} str_builder;
+
+static inline void sb_reserve(str_builder *b, size_t extra) {
+	size_t need = b->len + extra + 1;
+	if (need <= b->cap)
+		return;
+	size_t cap = b->cap ? b->cap : 128;
+	while (cap < need)
+		cap *= 2;
+	b->p   = xrealloc(b->p, cap);
+	b->cap = cap;
+	if (b->len == 0)
+		b->p[0] = '\0';
+}
+
+static inline void sb_init(str_builder *b) {
+	b->len	= 0;
+	b->cap	= 128;
+	b->p	= xmalloc(b->cap);
+	b->p[0] = '\0';
+}
+
+static inline void sb_putb(str_builder *b, const char *s, size_t n) {
+	if (!b || !s || n == 0)
+		return;
+	sb_reserve(b, n);
+	memcpy(b->p + b->len, s, n);
+	b->len += n;
+	b->p[b->len] = '\0';
+}
+
+static inline void sb_puts(str_builder *b, const char *s) {
+	if (s)
+		sb_putb(b, s, strlen(s));
+}
+
+static inline void sb_putc(str_builder *b, char c) {
+	sb_reserve(b, 1);
+	b->p[b->len++] = c;
+	b->p[b->len]   = '\0';
+}
+
+static inline void sb_reset(str_builder *b) {
+	if (!b)
+		return;
+	b->len = 0;
+	if (b->p)
+		b->p[0] = '\0';
+}
+
+static inline char *sb_finish(str_builder *b) {
+	sb_reserve(b, 0);
+	char *p = b->p ? b->p : xstrdup("");
+	memset(b, 0, sizeof(*b));
+	return p;
+}
+
+static inline void sb_free(str_builder *b) {
+	free(b->p);
+	memset(b, 0, sizeof(*b));
 }
 
 typedef struct {

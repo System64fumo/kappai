@@ -42,7 +42,7 @@ typedef struct {
 	int32_t				  *special_by_first_byte;
 	void				  *bpe_work;
 	char				  *bpe_arena;
-	char				  *bpe_sp_text;
+	str_builder			   bpe_sp;
 	void				  *bpe_pcs_cache;
 	str_arena			   merge_pool;
 	uint32_t			   n_tokens;
@@ -55,7 +55,6 @@ typedef struct {
 	uint32_t			   n_special_first_bytes;
 	uint32_t			   bpe_work_cap;
 	uint32_t			   bpe_arena_cap;
-	uint32_t			   bpe_sp_cap;
 	uint32_t			   bpe_pcs_cache_cap;
 	int32_t				   byte_fallback_ids[256];
 	uint32_t			   special_by_first_byte_off[257];

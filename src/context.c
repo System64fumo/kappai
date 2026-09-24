@@ -315,13 +315,7 @@ void context_reset(context *c) {
 }
 
 static void fed_ids_append(context *c, int32_t token) {
-	if (c->fed_ids.n + 1 > c->fed_ids.cap) {
-		int new_cap = c->fed_ids.cap > 0 ? c->fed_ids.cap : 256;
-		while (new_cap < c->fed_ids.n + 1)
-			new_cap *= 2;
-		c->fed_ids.p   = xrealloc(c->fed_ids.p, (size_t)new_cap * sizeof(int32_t));
-		c->fed_ids.cap = new_cap;
-	}
+	ARR_RESERVE(c->fed_ids.p, c->fed_ids.n, c->fed_ids.cap);
 	c->fed_ids.p[c->fed_ids.n++] = token;
 }
 
@@ -332,23 +326,23 @@ static void fed_ids_sync(context *c) {
 
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
 	if (c->kv.n_pos >= c->n_ctx)
-		return -1;
+		return ERR_INVALID_ARG;
 	if (token < 0 || token >= c->m.vocab_size)
-		return -1;
+		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 	int			pos = c->kv.n_pos;
 	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
 	if (st != OK)
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 	status_code cst =
 		compute_forward(&c->m, &c->kv, &c->scratch, token, pos, c->flash_attn, logits_out);
 	if (cst == ERR_INTERRUPTED)
-		return CTX_INTERRUPTED;
+		return ERR_INTERRUPTED;
 	if (cst != OK) {
 		ERROR("compute_forward failed (status=%d) at pos=%d token=%d -- "
 			  "aborting feed",
 			  (int)cst, pos, (int)token);
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 	}
 	c->kv.n_pos++;
 	fed_ids_append(c, token);
@@ -408,13 +402,13 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 	if (n <= 0)
 		return 0;
 	if (c->kv.n_pos + n > c->n_ctx)
-		return -1;
+		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 
 	int			pos = c->kv.n_pos;
 	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
 	if (st != OK)
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 
 	int n_threads = 1;
 	if (c->backend && c->backend->get_pool) {
@@ -441,11 +435,11 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		compute_set_layer_progress_cb(&c->scratch, prefill_progress_on_layer, &pp);
 	}
 
-	int status = CTX_COMPUTE_ERROR;
+	int status = ERR_COMPUTE_FAIL;
 	int chunk_offset;
 	for (chunk_offset = 0; chunk_offset < n; chunk_offset += chunk) {
 		if (c->interrupt) {
-			status = CTX_INTERRUPTED;
+			status = ERR_INTERRUPTED;
 			goto fail;
 		}
 
@@ -456,14 +450,14 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 			&c->m, &c->kv, &c->scratch, tokens + chunk_offset, chunk_size, pos + chunk_offset,
 			c->flash_attn, (chunk_offset + chunk_size == n) ? c->scratch.logits_host : NULL);
 		if (cfb_st == ERR_INTERRUPTED) {
-			status = CTX_INTERRUPTED;
+			status = ERR_INTERRUPTED;
 			goto fail;
 		}
 		if (cfb_st != OK) {
 			ERROR("compute_forward_batch failed (status=%d) at chunk_offset=%d chunk_size=%d -- "
 				  "prompt processing aborted",
 				  (int)cfb_st, chunk_offset, chunk_size);
-			status = CTX_COMPUTE_ERROR;
+			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
 	}
@@ -501,21 +495,30 @@ static void debug_print_logits(context *c) {
 	int	   vocab = c->m.vocab_size;
 	float *lg	 = c->scratch.logits_host;
 
+	str_builder sb;
+	sb_init(&sb);
 	if (vocab <= 128) {
-		fprintf(stderr, "[DEBUG] full logits (vocab=%d):", vocab);
+		char head[64];
+		snprintf(head, sizeof(head), "full logits (vocab=%d):", vocab);
+		sb_puts(&sb, head);
 		for (int i = 0; i < vocab; i++) {
-			fprintf(stderr, " [%d]=%.6f", i, lg[i]);
+			char piece[48];
+			snprintf(piece, sizeof(piece), " [%d]=%.6f", i, lg[i]);
+			sb_puts(&sb, piece);
 		}
-		fprintf(stderr, "\n");
+		sb_putc(&sb, '\n');
 	}
 
 	sampler_top_k_entry top[8];
 	int					n_top = sampler_top_k(lg, vocab, 8, top);
-	fprintf(stderr, "[DEBUG] top logits:");
+	sb_puts(&sb, "top logits:");
 	for (int i = 0; i < n_top; i++) {
-		fprintf(stderr, " [%d]=%.4f", top[i].i, top[i].v);
+		char piece[48];
+		snprintf(piece, sizeof(piece), " [%d]=%.4f", top[i].i, top[i].v);
+		sb_puts(&sb, piece);
 	}
-	fprintf(stderr, "\n");
+	DEBUG("%s", sb.p);
+	sb_free(&sb);
 }
 
 int32_t context_sample_next(context *c) {
@@ -653,13 +656,13 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		generated++;
 		float *logits_out = fast_argmax ? NULL : c->scratch.logits_host;
 		int	   rc		  = context_feed_token_inner(c, tok, logits_out);
-		if (rc == CTX_COMPUTE_ERROR) {
+		if (rc == ERR_COMPUTE_FAIL) {
 			ERROR("decode aborted: device compute error at token %d (pos=%d)", i, c->kv.n_pos);
 			c->session_poisoned = true;
 			*out_unfed_tail		= true;
 			break;
 		}
-		if (rc == CTX_INTERRUPTED) {
+		if (rc == ERR_INTERRUPTED) {
 			if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent)
 				c->session_poisoned = true;
 			*out_unfed_tail = true;
@@ -807,22 +810,22 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 
 	int32_t		   n_pos_before = c->kv.n_pos;
 	prefill_result pf			= context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
-	if (pf.rc == CTX_INTERRUPTED) {
+	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",
 			  n_pos_before, n_pos_before + n_tokens);
 		c->session_poisoned = true;
 		return 0;
 	}
-	if (pf.rc == CTX_COMPUTE_ERROR) {
+	if (pf.rc == ERR_COMPUTE_FAIL) {
 		ERROR("prompt processing failed (device compute error at pos=%d); session poisoned",
 			  c->kv.n_pos);
 		c->session_poisoned = true;
-		return -1;
+		return ERR_COMPUTE_FAIL;
 	}
 	if (pf.rc < 0) {
 		ERROR("prompt too long (pos=%d, ctx=%d)", c->kv.n_pos, c->n_ctx);
-		return -1;
+		return ERR_INVALID_ARG;
 	}
 	if (prof_was_on)
 		profile_print(&c->scratch.prof, "prefill", stderr);
@@ -876,14 +879,7 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 }
 
 static int32_t *context_ids_buf_grow(int32_t **pp, int *cap, int n) {
-	if (n > *cap) {
-		int new_cap = *cap > 0 ? *cap : 256;
-		while (new_cap < n)
-			new_cap *= 2;
-		free(*pp);
-		*pp	 = xmalloc((size_t)new_cap * sizeof(int32_t));
-		*cap = new_cap;
-	}
+	ARR_ENSURE(*pp, n, *cap);
 	return *pp;
 }
 
@@ -898,7 +894,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	if (c->session_poisoned) {
 		ERROR("session state is inconsistent after an earlier failed turn; "
 			  "context_reset() required");
-		return -1;
+		return ERR_INTERNAL;
 	}
 
 	uint64_t t_turn_start = time_us();
@@ -911,7 +907,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 								  sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
 		free(prev_render);
-		return -1;
+		return ERR_FORMAT;
 	}
 
 	free(turn_str);
@@ -937,7 +933,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
 			free(c->chat.last_render);
 			c->chat.last_render = prev_render;
-			return -1;
+			return ERR_INVALID_ARG;
 		}
 		n	  = c->fed_ids.n + suf;
 		reuse = c->fed_ids.n;
@@ -951,7 +947,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
 			free(c->chat.last_render);
 			c->chat.last_render = prev_render;
-			return -1;
+			return ERR_INVALID_ARG;
 		}
 
 		int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
@@ -1051,7 +1047,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 										 (int)(m - think_start_pos), think_start_pos);
 				int nrc = context_feed_tokens_batch(c, norm + think_start_pos,
 													(int)(m - think_start_pos), true);
-				if (nrc == CTX_INTERRUPTED || nrc == CTX_COMPUTE_ERROR) {
+				if (nrc == ERR_INTERRUPTED || nrc == ERR_COMPUTE_FAIL) {
 					ERROR("cache normalization failed -- session poisoned");
 					c->session_poisoned = true;
 				} else if (nrc < 0) {
@@ -1080,7 +1076,7 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,
 					   void (*on_token)(int32_t, const char *, int, void *), void *ud) {
 	if (!prompt)
-		return -1;
+		return ERR_INVALID_ARG;
 	uint64_t t_turn_start = time_us();
 
 	int		 cap = c->n_ctx;
@@ -1092,7 +1088,7 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 	profile_reset(&c->scratch.prof);
 	int r = tokenizer_encode_with_specials(&c->tok, prompt, 0, ids + n, cap - n, &c->scratch.prof);
 	if (r < 0)
-		return -1;
+		return ERR_INVALID_ARG;
 	n += r;
 	c->last_prompt_tokens = n;
 
@@ -1168,7 +1164,7 @@ static void *idle_prefill_thread(void *arg) {
 
 	int			   to_prefill = header_count - reuse;
 	prefill_result pf		  = context_prefill_tokens(c, ids + reuse, to_prefill, "idle", true);
-	if (pf.rc == CTX_INTERRUPTED || pf.rc == CTX_COMPUTE_ERROR) {
+	if (pf.rc == ERR_INTERRUPTED || pf.rc == ERR_COMPUTE_FAIL) {
 		c->session_poisoned = true;
 		goto out;
 	}

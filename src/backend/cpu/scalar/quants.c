@@ -464,10 +464,6 @@ __attribute__((weak)) void dequant_q6_k_row(const void *blocks, size_t n_blocks,
 	}
 }
 
-static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
-
-typedef iq3_s_block iq3s_block;
-
 __attribute__((weak)) void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst) {
 	const iq3s_block *b = blocks;
 
@@ -674,10 +670,6 @@ typedef void (*matmul_row_fn)(const void *w, const float *restrict x, float *res
 	}
 
 MATMUL_QONLY_DISPATCH(iq3_s_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq3s_block))
-
-static const int8_t iq3s_re_decode[16] = {
-	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
-};
 
 static inline uint8_t iq3s_encode_val(uint8_t magnitude, int sign) {
 

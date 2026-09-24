@@ -55,4 +55,16 @@ static inline struct json_object *json_get_arr(struct json_object *o, const char
 	return v;
 }
 
+static inline void json_set_str(struct json_object *o, const char *key, const char *val) {
+	json_object_object_add(o, key, json_object_new_string(val ? val : ""));
+}
+
+static inline void json_set_int(struct json_object *o, const char *key, int32_t val) {
+	json_object_object_add(o, key, json_object_new_int(val));
+}
+
+static inline void json_set_bool(struct json_object *o, const char *key, int val) {
+	json_object_object_add(o, key, json_object_new_boolean(val ? 1 : 0));
+}
+
 #endif

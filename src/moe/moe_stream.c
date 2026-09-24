@@ -2065,10 +2065,7 @@ static void moe_preload_push_region(moe_preload_region **regions, size_t *n, siz
 									const void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	if (*n == *cap) {
-		*cap *= 2;
-		*regions = xrealloc(*regions, *cap * sizeof(**regions));
-	}
+	ARR_RESERVE(*regions, *n, *cap);
 	(*regions)[*n].ptr	 = ptr;
 	(*regions)[*n].bytes = bytes;
 	(*n)++;

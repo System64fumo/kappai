@@ -178,7 +178,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	if (c->session_poisoned) {
 		ERROR("startup warmup left inconsistent state; refusing to generate");
-		return -1;
+		return ERR_INTERNAL;
 	}
 
 	if (a->output_stream)
@@ -188,7 +188,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	int rc = 0;
 	if (r < 0)
-		rc = -1;
+		rc = ERR_INTERNAL;
 	if (c->context_limit_hit) {
 		c->context_limit_hit = false;
 		WARN("context window exhausted (n_ctx=%d). Shorten the prompt, lower "
@@ -198,7 +198,7 @@ static int run_one_shot(context *c, cli_args *a) {
 	}
 	if (c->session_poisoned) {
 		ERROR("generation left inconsistent cache state; session must be reset");
-		rc = -1;
+		rc = ERR_INTERNAL;
 	}
 	return rc;
 }
@@ -338,7 +338,7 @@ static int grep_vocab(const char *model_path, const char *substr) {
 	return 0;
 }
 
-status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
+int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
 	mallopt(M_MMAP_MAX, 0);
 	mallopt(M_TRIM_THRESHOLD, -1);

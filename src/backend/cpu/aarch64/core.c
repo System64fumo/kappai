@@ -55,24 +55,6 @@ static inline void scale_f32_vec(float *restrict x, int n, float s) {
 #define cpu_attn_job_neon cpu_attn_job
 #define cpu_attn_batch_job_neon cpu_attn_batch_job
 
-static float *cpu_neon_serial_scores(cpu_priv *p, int need) {
-	float **buf;
-	int	   *cap;
-	if (p->thread_scratch && p->n_threads > 0) {
-		buf = &p->thread_scratch[0].scores;
-		cap = &p->thread_scratch[0].scores_cap;
-	} else {
-		buf = &p->scores;
-		cap = &p->scores_cap;
-	}
-	if (*cap < need) {
-		free(*buf);
-		*buf = xmalloc((size_t)need * sizeof(float));
-		*cap = need;
-	}
-	return *buf;
-}
-
 typedef struct {
 	const float *g, *u;
 	float		*o;
@@ -672,9 +654,44 @@ static inline float32x4_t vld1_s8x4_to_f32(const int8_t *p) {
 static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_ptr, int head_dim) {
 	int	  n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 	float sum	   = 0.0f;
+#if defined(__ARM_FEATURE_DOTPROD)
+	float amax = 0.0f;
+	for (int i = 0; i < head_dim; i++) {
+		float v = fabsf(a[i]);
+		if (v > amax)
+			amax = v;
+	}
+	if (amax == 0.0f)
+		return 0.0f;
+	float  qscale = amax / 127.0f;
+	float  qinv	  = 127.0f / amax;
+	int8_t qa[HEAD_DIM_MAX];
+	for (int i = 0; i < head_dim; i++) {
+		int q = (int)lrintf(a[i] * qinv);
+		qa[i] = (int8_t)(q > 127 ? 127 : (q < -128 ? -128 : q));
+	}
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d);
+		float			  d	  = f16_to_f32_fast(blk->d);
+		int				  base = b * KV_Q8_0_BLOCK;
+		int				  n	   = head_dim - base;
+		if (n > KV_Q8_0_BLOCK)
+			n = KV_Q8_0_BLOCK;
+		const int8_t *qs  = blk->qs;
+		int32x4_t	  acc = vdupq_n_s32(0);
+		int			  j	  = 0;
+		for (; j + 16 <= n; j += 16)
+			acc = vdotq_s32(acc, vld1q_s8(qs + j), vld1q_s8(qa + base + j));
+		int32_t s = vaddvq_s32(acc);
+		for (; j < n; j++)
+			s += (int32_t)qs[j] * (int32_t)qa[base + j];
+		sum += (float)s * (d * qscale);
+	}
+	return sum;
+#else
+	for (int b = 0; b < n_blocks; b++) {
+		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
+		float			  d	  = f16_to_f32_fast(blk->d);
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -741,6 +758,7 @@ static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_pt
 			partial += av[j] * (float)qs[j];
 		sum += partial * d;
 	}
+#endif
 	return sum;
 }
 
@@ -749,7 +767,7 @@ static void accum_v_q8_0(float *restrict out_h, const uint8_t *restrict block_pt
 	int n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d) * weight;
+		float			  d	  = f16_to_f32_fast(blk->d) * weight;
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -852,19 +870,8 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 }
 
 static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_neon *j = ctx;
-	float			  *scores;
-	if (tid == 0) {
-		scores = cpu_neon_serial_scores(j->p, j->n_pos);
-	} else {
-		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
-		if (ts->scores_cap < j->n_pos) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)j->n_pos * sizeof(float));
-			ts->scores_cap = j->n_pos;
-		}
-		scores = ts->scores;
-	}
+	cpu_attn_job_neon *j	  = ctx;
+	float			  *scores = cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
@@ -938,7 +945,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 			return OK;
 		}
 
-		float *scores = cpu_neon_serial_scores(p, n_pos);
+		float *scores = cpu_grow_scores(p, -1, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -981,7 +988,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		return OK;
 	}
 
-	float *scores = cpu_neon_serial_scores(p, n_pos);
+	float *scores = cpu_grow_scores(p, -1, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1013,20 +1020,8 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 }
 
 static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job_neon *j = ctx;
-	float					*scores;
-	if (tid == 0) {
-		scores = cpu_neon_serial_scores(j->p, j->pos_start + j->m);
-	} else {
-		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
-		int					need = j->pos_start + j->m;
-		if (ts->scores_cap < need) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)need * sizeof(float));
-			ts->scores_cap = need;
-		}
-		scores = ts->scores;
-	}
+	cpu_attn_batch_job_neon *j		= ctx;
+	float					*scores = cpu_grow_scores(j->p, tid, j->pos_start + j->m);
 
 	for (int idx = begin; idx < end; idx++) {
 		int dispatch_row = idx / j->n_heads;
@@ -1635,7 +1630,7 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	int half_rope = qk_rope / 2;
 
 	size_t		krot_need = (size_t)n_pos * qk_rope * sizeof(float);
-	status_code grow_st = cpu_scratch_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need);
+	status_code grow_st	  = cpu_buf_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need, 1);
 	if (grow_st != OK)
 		return grow_st;
 	float *k_pe_rot_all = p->mla_krot.buf;
