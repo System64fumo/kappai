@@ -1,5 +1,6 @@
 #include "toolcall.h"
 
+#include "json_helpers.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -326,11 +327,12 @@ static json_object *json_slice(const char *s, size_t len, size_t *used) {
 }
 
 static json_object *json_args_of(json_object *obj) {
-	json_object *jargs = NULL;
 	if (!obj)
 		return json_object_new_object();
-	if (json_object_object_get_ex(obj, "arguments", &jargs) ||
-		json_object_object_get_ex(obj, "parameters", &jargs)) {
+	json_object *jargs = json_get(obj, "arguments");
+	if (!jargs)
+		jargs = json_get(obj, "parameters");
+	if (jargs) {
 		if (json_object_is_type(jargs, json_type_object))
 			return json_object_get(jargs);
 		if (json_object_is_type(jargs, json_type_string)) {
@@ -366,14 +368,12 @@ static int payload_auto(const char *p, size_t len, size_t pos, char **name_out,
 		json_object *obj = json_slice(p + pos, len - pos, &used);
 		if (!obj)
 			return 0;
-		json_object *jname	  = NULL;
-		int			 has_name = json_object_object_get_ex(obj, "name", &jname) &&
-								json_object_is_type(jname, json_type_string);
-		if (!has_name) {
+		const char *jname = json_get_str(obj, "name", NULL);
+		if (!jname) {
 			json_object_put(obj);
 			return 0;
 		}
-		*name_out = xstrdup(json_object_get_string(jname));
+		*name_out = xstrdup(jname);
 		*args_out = json_args_of(obj);
 		json_object_put(obj);
 		*end_out = pos + used;
@@ -834,16 +834,15 @@ static void advance(toolcall_scanner *sc) {
 					sc->scan_pos = i;
 					return;
 				}
-				json_object *jname = NULL;
-				if (!json_object_object_get_ex(obj, "name", &jname) ||
-					!json_object_is_type(jname, json_type_string)) {
+				const char *jname = json_get_str(obj, "name", NULL);
+				if (!jname) {
 					json_object_put(obj);
 					emit_content(sc, sc->scan_pos, i + used);
 					sc->scan_pos = i + used;
 					continue;
 				}
 				emit_content(sc, sc->scan_pos, i);
-				char		*name = xstrdup(json_object_get_string(jname));
+				char		*name = xstrdup(jname);
 				json_object *args = json_args_of(obj);
 				json_object_put(obj);
 				record_call(sc, name, args);

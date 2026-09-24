@@ -291,23 +291,11 @@ static int32_t sample_from_candidates(sampler_top_k_entry *arr, int kept, rng *r
 	return arr[picked_i].i;
 }
 
-int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
-	const float *logits	   = logits_in;
-	int			 penalized = s->repeat_penalty != 1.0f && s->recent_count > 0;
+static int32_t sample_greedy(const float *logits, int vocab) {
+	return sampler_argmax(logits, vocab);
+}
 
-	if (penalized) {
-		float *mut = s->logits_buf;
-		memcpy(mut, logits_in, (size_t)vocab * sizeof(float));
-		logits = mut;
-		apply_repeat_penalty(s, mut, vocab);
-	}
-
-	if (s->temperature <= 0.0f || s->top_k == 1)
-		return sampler_argmax(logits, vocab);
-
-	if ((s->top_k <= 0 || s->top_k >= vocab) && s->top_p >= 1.0f && s->min_p <= 0.0f)
-		return sample_full_vocab(s, logits, vocab);
-
+static int32_t sample_filtered(sampler *s, const float *logits, int vocab) {
 	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
 	grow_buf(&s->cand_buf, &s->cand_vocab, need_cands, sizeof(sampler_top_k_entry));
 	sampler_top_k_entry *arr  = s->cand_buf;
@@ -323,4 +311,24 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 		kept = 1;
 
 	return sample_from_candidates(arr, kept, &s->rng);
+}
+
+int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
+	const float *logits	   = logits_in;
+	int			 penalized = s->repeat_penalty != 1.0f && s->recent_count > 0;
+
+	if (penalized) {
+		float *mut = s->logits_buf;
+		memcpy(mut, logits_in, (size_t)vocab * sizeof(float));
+		logits = mut;
+		apply_repeat_penalty(s, mut, vocab);
+	}
+
+	if (s->temperature <= 0.0f || s->top_k == 1)
+		return sample_greedy(logits, vocab);
+
+	if ((s->top_k <= 0 || s->top_k >= vocab) && s->top_p >= 1.0f && s->min_p <= 0.0f)
+		return sample_full_vocab(s, logits, vocab);
+
+	return sample_filtered(s, logits, vocab);
 }

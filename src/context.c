@@ -492,8 +492,7 @@ fail:
 static void debug_print_logits(context *c) {
 	buffer *logits = &c->scratch.slots[RECIPE_SLOT_LOGITS];
 	if (c->backend && c->backend->argmax && !c->scratch.logits_alias) {
-		if (c->backend->synchronize)
-			c->backend->synchronize(c->backend);
+		ensure_sync(c->backend);
 		backend *owner = logits->owner ? logits->owner : c->backend;
 		if (owner->buffer_read_f32) {
 			owner->buffer_read_f32(owner, logits, c->scratch.logits_host, c->m.vocab_size);
@@ -737,8 +736,7 @@ prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_t
 	context_debug_print_feed(c, phase, tokens, n_tokens, c->kv.n_pos);
 	uint64_t t_start = time_us();
 	result.rc		 = context_feed_tokens_batch(c, tokens, n_tokens, quiet);
-	if (c->backend && c->backend->synchronize)
-		c->backend->synchronize(c->backend);
+	ensure_sync(c->backend);
 	uint64_t t_end = time_us();
 	result.us	   = t_end - t_start;
 	result.tps	   = n_tokens > 0 ? n_tokens * 1.0e6 / (double)result.us : 0.0;
@@ -836,8 +834,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	uint64_t ttft_us	 = 0;
 	int		 generated	 = context_decode_loop(c, max_tokens, samp, on_token, ud, t_turn_start_us,
 											   &ttft_us, out_unfed_tail, out_think_end_pos);
-	if (c->backend && c->backend->synchronize)
-		c->backend->synchronize(c->backend);
+	ensure_sync(c->backend);
 	uint64_t t_dec_end = time_us();
 
 	uint64_t decode_us	= t_dec_end - t_dec_start;

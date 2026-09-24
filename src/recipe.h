@@ -309,11 +309,31 @@ recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
 recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1);
+recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1, int n2);
+recipe_op mk_matmul_residual(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, int n, int k);
+recipe_op mk_matmul_fused_gateup(uint8_t in, uint8_t out, uint8_t widx, int n, int k);
+recipe_op mk_matmul_ffn_down(uint8_t gate_in, uint8_t up_in, uint8_t out, uint8_t widx, int n,
+							 int k, int activation);
+recipe_op mk_ffn_activate(uint8_t gate_in, uint8_t up_in, uint8_t out, int n, int activation);
+recipe_op mk_ffn_activate_fused(uint8_t in, uint8_t out, int n, int activation);
+recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads);
+recipe_op mk_rmsnorm_noweight(uint8_t in);
+recipe_op mk_split_qgate(void);
+recipe_op mk_attn_output_gate(uint8_t attn_in, uint8_t gate_in, uint8_t out);
+recipe_op mk_gated_delta_net(uint8_t proj_in, uint8_t gate_in, uint8_t alpha_in, uint8_t out);
+recipe_op mk_shortconv(uint8_t in, uint8_t out);
+recipe_op mk_mla_qkv_proj_fused(uint8_t in, uint8_t out, int n, int k);
+recipe_op mk_attention_mla(uint8_t q_in, uint8_t out, int n_heads, int head_dim, int n_ctx,
+						   float scale);
+recipe_op mk_scale(uint8_t io, uint8_t widx, float scale);
+recipe_op mk_ple_proj_inject(uint8_t in, uint8_t residual, uint8_t widx);
 recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage);
 recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage);
 recipe_op mk_kvput(uint8_t k_in, uint8_t v_in);
 recipe_op mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
 					   int n_ctx, float scale, int sliding_window);
+recipe_op mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_ctx, int sliding_window);
 recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_ext(uint8_t in, int rope_neox);

@@ -297,18 +297,6 @@ static __attribute__((unused)) void tsg_build_vocab_file(const char *path, const
 
 #define TSG_CHAT_VOCAB 357
 
-static __attribute__((unused)) int32_t tsg_chat_char_id(int c) {
-	if (c >= 32 && c <= 126)
-		return 1 + (c - 32);
-	if (c == '\n')
-		return 96;
-	if (c == '\t')
-		return 97;
-	if (c == '\r')
-		return 98;
-	return -1;
-}
-
 static __attribute__((unused)) void tsg_build_chat_vocab_arrays(char (*storage)[8],
 																const char **toks, int32_t *types) {
 	int id = 0;

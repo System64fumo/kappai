@@ -83,21 +83,16 @@ static void free_buf(buffer *b) {
 	b->owner->buffer_free(b->owner, b);
 }
 
+static void scratch_free_slot_buffers(buffer *slots) {
+	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
+		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
+			continue;
+		free_buf(&slots[i]);
+	}
+}
+
 static void scratch_free_device_buffers(compute_scratch *s) {
-	free_buf(&s->slots[RECIPE_SLOT_X]);
-	free_buf(&s->slots[RECIPE_SLOT_XB]);
-	free_buf(&s->slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->slots[RECIPE_SLOT_Q]);
-	free_buf(&s->slots[RECIPE_SLOT_K]);
-	free_buf(&s->slots[RECIPE_SLOT_V]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->slots);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
 	free_buf(&s->ple_all);
@@ -106,20 +101,7 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->router_softmax_inp);
 	free_buf(&s->router_logits);
 
-	free_buf(&s->mirror_slots[RECIPE_SLOT_X]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_Q]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_K]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_V]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->mirror_slots);
 	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
 		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
 			continue;
@@ -313,6 +295,69 @@ static void compute_layout_init(const model *m, compute_layout *L) {
 	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
 }
 
+static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
+									   const compute_layout *L) {
+	status_code _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_X], (size_t)L->attn_buf_size * sizeof(float), "X");
+	if (_st != OK)
+		return _st;
+	if (m->arch_info->is_hybrid_recurrent) {
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_PROJ],
+							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_GATE],
+							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_ALPHA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_BETA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
+		if (_st != OK)
+			return _st;
+	}
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB], (size_t)L->attn_buf_size * sizeof(float), "XB");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB2], (size_t)L->attn_buf_size * sizeof(float), "XB2");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_ATTN_OUT], (size_t)L->attn_buf_size * sizeof(float),
+						"ATTN_OUT");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_Q], (size_t)L->q_out * sizeof(float), "Q");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_K], (size_t)L->kv_out * sizeof(float), "K");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_V], (size_t)L->kv_out * sizeof(float), "V");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_GATE_UP],
+						(size_t)L->max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
+	if (_st != OK)
+		return _st;
+	dst[RECIPE_SLOT_FFN_GATE] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L->max_intermediate * sizeof(float));
+	dst[RECIPE_SLOT_FFN_UP] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], (size_t)L->max_intermediate * sizeof(float),
+					 (size_t)L->max_intermediate * sizeof(float));
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_ACT], (size_t)L->ffn_act_size * sizeof(float),
+						"FFN_ACT");
+	if (_st != OK)
+		return _st;
+	_st =
+		scratch_alloc(a, &dst[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float), "LOGITS");
+	if (_st != OK)
+		return _st;
+	return OK;
+}
+
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
 	if (!compute_model_changed(s, m, n_ctx))
 		return OK;
@@ -326,64 +371,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)L.attn_buf_size * sizeof(float), "X");
-	if (_st != OK)
-		return _st;
-	if (m->arch_info->is_hybrid_recurrent) {
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_PROJ],
-							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_GATE],
-							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_ALPHA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_BETA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
-		if (_st != OK)
-			return _st;
-	}
-	_st =
-		scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)L.attn_buf_size * sizeof(float), "XB");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)L.attn_buf_size * sizeof(float),
-						"XB2");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)L.attn_buf_size * sizeof(float),
-						"ATTN_OUT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q], (size_t)L.q_out * sizeof(float), "Q");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K], (size_t)L.kv_out * sizeof(float), "K");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V], (size_t)L.kv_out * sizeof(float), "V");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
-						(size_t)L.max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
-	if (_st != OK)
-		return _st;
-	s->slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], 0,
-												  (size_t)L.max_intermediate * sizeof(float));
-	s->slots[RECIPE_SLOT_FFN_UP] =
-		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)L.max_intermediate * sizeof(float),
-					 (size_t)L.max_intermediate * sizeof(float));
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)L.ffn_act_size * sizeof(float),
-						"FFN_ACT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
-						"LOGITS");
+	status_code _st = scratch_alloc_slots(a, s->slots, m, &L);
 	if (_st != OK)
 		return _st;
 
@@ -500,36 +488,9 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code st;
-#define MIRROR_ALLOC(slot, size)                                                                   \
-	do {                                                                                           \
-		st = scratch_alloc(host, &s->mirror_slots[slot], (size), "mirror_slots[" #slot "]");       \
-		if (st != OK)                                                                              \
-			return st;                                                                             \
-	} while (0)
-
-	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)L.attn_buf_size * sizeof(float));
-	if (m->arch_info->is_hybrid_recurrent) {
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_PROJ, (size_t)model_hybrid_proj_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_GATE, (size_t)model_hybrid_gate_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_ALPHA, (size_t)m->hybrid.n_value_heads * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_BETA, (size_t)m->hybrid.n_value_heads * sizeof(float));
-	}
-	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)L.q_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)L.max_intermediate * 2 * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(
-		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L.max_intermediate * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_UP] = buffer_slice(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP],
-													   (size_t)L.max_intermediate * sizeof(float),
-													   (size_t)L.max_intermediate * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)L.ffn_act_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_LOGITS, (size_t)m->vocab_size * sizeof(float));
-#undef MIRROR_ALLOC
+	status_code st = scratch_alloc_slots(host, s->mirror_slots, m, &L);
+	if (st != OK)
+		return st;
 
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
@@ -576,8 +537,7 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, i
 		(target == s->mirror_backend) ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
 
 	backend *src_be = current;
-	if (src_be && src_be->synchronize)
-		src_be->synchronize(src_be);
+	ensure_sync(src_be);
 
 	status_code st = compute_copy_buffer_cross(s, src_x, dst_x, dim);
 	if (st != OK)
@@ -614,8 +574,7 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return ERR_UNSUPPORTED;
 	}
 
-	if (src_owner && src_owner->synchronize)
-		src_owner->synchronize(src_owner);
+	ensure_sync(src_owner);
 
 	status_code st = ensure_transfer_buf(s, (size_t)n);
 	if (st != OK)

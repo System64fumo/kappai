@@ -91,8 +91,10 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		fprintf(stderr, "ERROR: reference backend '%s' is unavailable\n", sel.ref);
 		return 1;
 	}
-	printf("reference backend: %s%s%s\n", cpu->name, cpu->desc ? "  (" : "",
-		   cpu->desc ? cpu->desc : "", cpu->desc ? ")" : "");
+	if (cpu->desc)
+		printf("reference backend: %s  (%s)\n", cpu->name, cpu->desc);
+	else
+		printf("reference backend: %s\n", cpu->name);
 
 	synth_suite_common_init();
 

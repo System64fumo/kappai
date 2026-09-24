@@ -37,14 +37,7 @@ static int render_ok(const char *tmpl, jinja_value *globals, char *out, size_t o
 	return 1;
 }
 
-static void record_jinja(const char *label, int ok, const char *detail_fmt, ...) {
-	char	detail[256];
-	va_list ap;
-	va_start(ap, detail_fmt);
-	vsnprintf(detail, sizeof(detail), detail_fmt, ap);
-	va_end(ap);
-	record_result(OPFAM_EDGE_CASE, label, ok ? V_PASS : V_FAIL, detail);
-}
+#define record_jinja(label, ok, ...) record_resultf(OPFAM_EDGE_CASE, (label), (ok), __VA_ARGS__)
 
 static void test_replace_method(void) {
 	char out[256];

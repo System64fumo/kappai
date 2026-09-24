@@ -335,10 +335,9 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 	backend *v_in_owner = v_in->owner ? v_in->owner : kv_backend;
 
 	if (k_in_owner != kv_backend || v_in_owner != kv_backend) {
-		if (k_in_owner && k_in_owner->synchronize)
-			k_in_owner->synchronize(k_in_owner);
-		if (v_in_owner && v_in_owner != k_in_owner && v_in_owner->synchronize)
-			v_in_owner->synchronize(v_in_owner);
+		ensure_sync(k_in_owner);
+		if (v_in_owner != k_in_owner)
+			ensure_sync(v_in_owner);
 
 		int			k_floats = kvh_active * hd;
 		status_code st		 = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
@@ -371,8 +370,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 								  &k_host_buf, &v_host_buf, kvh_stride, hd, c->n_ctx, kvh_active);
 	}
 
-	if (kv_backend != c->backend && kv_backend->synchronize)
-		kv_backend->synchronize(kv_backend);
+	if (kv_backend != c->backend)
+		ensure_sync(kv_backend);
 	int put_layer  = (layer_on_host || slot_needs_host) ? kvcache_mirror_layer(c, layer) : layer;
 	status_code st = kv_backend->kv_put(kv_backend, kb, vb, put_layer, pos, k_in, v_in, kvh_stride,
 										hd, c->n_ctx, kvh_active);

@@ -1,5 +1,6 @@
 #include "chat_template.h"
 
+#include "json_helpers.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -96,32 +97,16 @@ static jinja_value *tool_calls_to_jinja(const json_object *tool_calls) {
 			continue;
 		jinja_value *d = jinja_dict();
 
-		json_object *id;
-		jinja_dict_set(d, "id",
-					   json_object_object_get_ex(tc, "id", &id) &&
-							   json_object_is_type(id, json_type_string)
-						   ? jinja_string(json_object_get_string(id))
-						   : jinja_string(""));
+		jinja_dict_set(d, "id", jinja_string(json_get_str(tc, "id", "")));
 
-		json_object *type;
-		jinja_dict_set(d, "type",
-					   json_object_object_get_ex(tc, "type", &type) &&
-							   json_object_is_type(type, json_type_string)
-						   ? jinja_string(json_object_get_string(type))
-						   : jinja_string("function"));
+		jinja_dict_set(d, "type", jinja_string(json_get_str(tc, "type", "function")));
 
-		jinja_value *fn = jinja_dict();
-		json_object *jfn;
-		if (json_object_object_get_ex(tc, "function", &jfn) &&
-			json_object_is_type(jfn, json_type_object)) {
-			json_object *name;
-			jinja_dict_set(fn, "name",
-						   json_object_object_get_ex(jfn, "name", &name) &&
-								   json_object_is_type(name, json_type_string)
-							   ? jinja_string(json_object_get_string(name))
-							   : jinja_string(""));
-			json_object *args;
-			if (json_object_object_get_ex(jfn, "arguments", &args)) {
+		jinja_value *fn	 = jinja_dict();
+		json_object *jfn = json_get_obj(tc, "function");
+		if (jfn) {
+			jinja_dict_set(fn, "name", jinja_string(json_get_str(jfn, "name", "")));
+			json_object *args = json_get(jfn, "arguments");
+			if (args) {
 				if (json_object_is_type(args, json_type_string)) {
 					json_object *parsed = json_tokener_parse(json_object_get_string(args));
 					if (parsed) {

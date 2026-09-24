@@ -271,6 +271,11 @@ static inline int backend_has_cap(const backend *b, uint64_t cap) {
 	return b && (b->caps & cap) != 0;
 }
 
+static inline void ensure_sync(backend *a) {
+	if (a && a->synchronize)
+		a->synchronize(a);
+}
+
 void backend_register(const char *name, backend_ctor_fn ctor);
 
 void backend_load(void);

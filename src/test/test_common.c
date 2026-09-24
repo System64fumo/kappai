@@ -1,5 +1,6 @@
 #include "test_core.h"
 
+#include <stdarg.h>
 #include <unistd.h>
 
 static op_stat g_stats[OPFAM_COUNT];
@@ -279,6 +280,15 @@ void record_result(op_family fam, const char *label, verdict v, const char *deta
 	}
 }
 
+void record_resultf(op_family fam, const char *label, int ok, const char *fmt, ...) {
+	char	detail[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(detail, sizeof(detail), fmt, ap);
+	va_end(ap);
+	record_result(fam, label, ok ? V_PASS : V_FAIL, detail);
+}
+
 void flush_family(op_family fam) {
 	int n = g_results_count[fam];
 	if (n == 0)
@@ -545,14 +555,14 @@ void fill_random_f32(float *x, int n, float scale) {
 	}
 }
 
-static void fill_random_f16(uint16_t *x, int n) {
+void fill_random_f16(uint16_t *x, int n) {
 	for (int i = 0; i < n; i++) {
 		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
 		x[i]	  = f32_to_f16((float)r / 1000.0f);
 	}
 }
 
-static void fill_random_bf16(uint16_t *x, int n) {
+void fill_random_bf16(uint16_t *x, int n) {
 	for (int i = 0; i < n; i++) {
 		int32_t	 r = (int32_t)(next_u32() % 2001) - 1000;
 		float	 f = (float)r / 1000.0f;
@@ -562,9 +572,7 @@ static void fill_random_bf16(uint16_t *x, int n) {
 	}
 }
 
-typedef void (*test_repack_fn)(const void *src, void *dst, int n_rows, int k);
-
-static test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
+test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
 	switch (type) {
 	case GGML_TYPE_Q4_0_R8:
 		*base_type_out = GGML_TYPE_Q4_0;
@@ -777,7 +785,7 @@ void usage(const char *prog) {
 			"  -h, --help         this message\n"
 			"\n"
 			"Available backends: ",
-			prog, prog, prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
+			prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
 	backend_info infos[BACKEND_MAX];
 	int			 n = backend_list(infos, BACKEND_MAX);
 	for (int i = 0; i < n; i++)

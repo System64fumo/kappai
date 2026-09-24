@@ -10,62 +10,11 @@ static double bench_mul_batch_once(backend *b, const buffer *w, uint32_t w_type,
 	return (double)(time_us() - t0);
 }
 
-typedef void (*repack_fn)(const void *src, void *dst, int n_rows, int k);
-
-static repack_fn bench_repack_fn(uint32_t type, uint32_t *base_type_out) {
-	switch (type) {
-	case GGML_TYPE_Q4_0_R8:
-		*base_type_out = GGML_TYPE_Q4_0;
-		return repack_q4_0_to_q4_0_r8;
-	case GGML_TYPE_Q8_0_R8:
-		*base_type_out = GGML_TYPE_Q8_0;
-		return repack_q8_0_to_q8_0_r8;
-	case GGML_TYPE_IQ4_NL_R8:
-		*base_type_out = GGML_TYPE_IQ4_NL;
-		return repack_iq4_nl_to_iq4_nl_r8;
-	case GGML_TYPE_IQ3_S_RE:
-		*base_type_out = GGML_TYPE_IQ3_S;
-		return repack_iq3_s;
-	case GGML_TYPE_IQ3_S_RE8:
-		*base_type_out = GGML_TYPE_IQ3_S;
-		return repack_iq3_s_to_iq3_s_re8;
-	case GGML_TYPE_Q4_K_R8:
-		*base_type_out = GGML_TYPE_Q4_K;
-		return repack_q4_k_to_q4_k_r8;
-	case GGML_TYPE_Q5_K_R8:
-		*base_type_out = GGML_TYPE_Q5_K;
-		return repack_q5_k_to_q5_k_r8;
-	case GGML_TYPE_Q6_K_R8:
-		*base_type_out = GGML_TYPE_Q6_K;
-		return repack_q6_k_to_q6_k_r8;
-	default:
-		*base_type_out = type;
-		return NULL;
-	}
-}
-
-static void fill_random_f16(uint16_t *x, int n) {
-	for (int i = 0; i < n; i++) {
-		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
-		x[i]	  = f32_to_f16((float)r / 1000.0f);
-	}
-}
-
-static void fill_random_bf16(uint16_t *x, int n) {
-	for (int i = 0; i < n; i++) {
-		int32_t	 r = (int32_t)(next_u32() % 2001) - 1000;
-		float	 f = (float)r / 1000.0f;
-		uint32_t bits;
-		memcpy(&bits, &f, sizeof(bits));
-		x[i] = (uint16_t)(bits >> 16);
-	}
-}
-
 static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, int m, int iters) {
 	seed_test_rng((0xBEEFULL * (qt->type + 1) * 1000003ULL) + (uint64_t)n);
 
-	uint32_t  base_type = qt->type;
-	repack_fn repack	= bench_repack_fn(qt->type, &base_type);
+	uint32_t	   base_type = qt->type;
+	test_repack_fn repack	 = test_repack_for_type(qt->type, &base_type);
 
 	void  *weight_buf;
 	size_t weight_bytes;
@@ -193,7 +142,7 @@ int run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_back
 			if (b->matmul_type_native && !b->matmul_type_native(b, QTYPES[qi].type))
 				continue;
 			uint32_t repack_base;
-			if (bench_repack_fn(QTYPES[qi].type, &repack_base) && n % 8 != 0)
+			if (test_repack_for_type(QTYPES[qi].type, &repack_base) && n % 8 != 0)
 				continue;
 			printf("  %-10s", QTYPES[qi].name);
 			fflush(stdout);

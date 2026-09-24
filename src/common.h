@@ -278,8 +278,10 @@ static inline int topk_heap_select(const float *scores, int n_scores, int k, flo
 	return hn;
 }
 
+#define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
+
 static inline uint64_t fnv1a(const char *s, size_t n) {
-	uint64_t h = 0xcbf29ce484222325ULL;
+	uint64_t h = FNV1A_OFFSET_BASIS;
 	for (size_t i = 0; i < n; i++) {
 		h ^= (uint8_t)s[i];
 		h *= 0x100000001b3ULL;
@@ -291,11 +293,31 @@ static inline uint64_t fnv1a_str(const char *s) {
 	return fnv1a(s, strlen(s));
 }
 
+static inline uint64_t fnv1a_update(uint64_t h, const char *s, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+static inline uint64_t fnv1a_update_str(uint64_t h, const char *s) {
+	return s ? fnv1a_update(h, s, strlen(s)) : h;
+}
+
 #define ARR_RESERVE(items, n, cap)                                                                 \
 	do {                                                                                           \
 		if ((n) == (cap)) {                                                                        \
 			(cap)	= (cap) ? (cap) * 2 : 8;                                                       \
 			(items) = xrealloc((items), (cap) * sizeof(*(items)));                                 \
+		}                                                                                          \
+	} while (0)
+
+#define ARR_ENSURE(items, need, cap)                                                               \
+	do {                                                                                           \
+		if ((cap) < (need)) {                                                                      \
+			(cap)	= (need);                                                                      \
+			(items) = xrealloc((items), (size_t)(cap) * sizeof(*(items)));                         \
 		}                                                                                          \
 	} while (0)
 

@@ -5,22 +5,10 @@
 
 static const arch_info k_registry[] = {
 	{
-		.arch						= ARCH_LLAMA,
-		.gguf_name					= "llama",
-		.key_prefix					= "llama",
-		.has_scale_embeddings		= false,
-		.default_rope_theta			= 10000.0f,
-		.sliding_window_period		= 0,
-		.has_qk_norm				= false,
-		.has_per_layer_embeddings	= false,
-		.has_post_norm_ple			= false,
-		.uses_gelu_activation		= false,
-		.uses_norm_v_without_weight = false,
-		.has_attn_post_norm			= false,
-		.has_ffn_post_norm			= false,
-		.has_layer_output_scale		= false,
-		.has_variable_layer_dims	= false,
-		.uses_neox_rope				= false,
+		.arch				= ARCH_LLAMA,
+		.gguf_name			= "llama",
+		.key_prefix			= "llama",
+		.default_rope_theta = 10000.0f,
 	},
 	{
 		.arch						= ARCH_GEMMA4,

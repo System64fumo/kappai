@@ -437,6 +437,8 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 		return;
 	}
 
+	pthread_mutex_lock(&pool->pub_mtx);
+
 	int chunk_size			  = min_items_per_thread;
 	int min_chunks_per_thread = 4;
 	while (chunk_size > 1 && n_items / chunk_size < usable * min_chunks_per_thread)
@@ -496,6 +498,8 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 	}
 
 	atomic_store_explicit(&pool->sync.in_job, 0, memory_order_relaxed);
+
+	pthread_mutex_unlock(&pool->pub_mtx);
 
 	tpool_update_spin_budget(pool, time_ns() - t_wall_start);
 }

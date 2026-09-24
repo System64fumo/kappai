@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "json_helpers.h"
+
 #include <curses.h>
 #include <json-c/json.h>
 
@@ -806,184 +808,175 @@ static void record_load_step(monitor_state *st, const char *phase) {
 	}
 }
 
-static void process_event(monitor_state *st, struct json_object *root) {
-	struct json_object *jtype;
-	if (!json_object_object_get_ex(root, "type", &jtype))
+static void on_start(monitor_state *st, struct json_object *root) {
+	const char *arch = json_get_str(root, "arch", NULL);
+	if (arch)
+		snprintf(st->arch, sizeof(st->arch), "%s", arch);
+	st->n_layers  = json_get_int(root, "n_layers", st->n_layers);
+	st->dim		  = json_get_int(root, "dim", st->dim);
+	st->n_ctx	  = json_get_int(root, "n_ctx", st->n_ctx);
+	st->vocab	  = json_get_int(root, "vocab", st->vocab);
+	st->is_moe	  = json_get_int(root, "is_moe", st->is_moe);
+	st->n_experts = json_get_int(root, "n_experts", st->n_experts);
+	st->topk	  = json_get_int(root, "topk", st->topk);
+
+	st->load_done		  = 1;
+	st->phase[0]		  = '\0';
+	st->decoding		  = 0;
+	st->token_idx		  = 0;
+	st->cur_layer		  = 0;
+	st->pct				  = 0;
+	st->cumulative_tps	  = 0;
+	st->pp_tps			  = 0;
+	st->tg_tps			  = 0;
+	st->n_prefill		  = 0;
+	st->n_generated		  = 0;
+	st->phase_tokens	  = 0;
+	st->tokens_done		  = 0;
+	st->has_current_token = 0;
+}
+
+static void on_load(monitor_state *st, struct json_object *root) {
+	const char *phase = json_get_str(root, "phase", NULL);
+	if (phase)
+		snprintf(st->load_phase, sizeof(st->load_phase), "%s", phase);
+	st->load_ms		 = json_get_int(root, "ms", st->load_ms);
+	st->n_layers	 = json_get_int(root, "layers", st->n_layers);
+	st->dim			 = json_get_int(root, "dim", st->dim);
+	st->vocab		 = json_get_int(root, "vocab", st->vocab);
+	const char *path = json_get_str(root, "path", NULL);
+	if (path)
+		snprintf(st->model_path, sizeof(st->model_path), "%s", path);
+	if (!st->load_t0_ms)
+		st->load_t0_ms = now_ms();
+
+	record_load_step(st, st->load_phase);
+
+	if (strcmp(st->load_phase, "loading_weights") == 0) {
+		st->cur_layer = json_get_int(root, "layer", st->cur_layer);
+		st->n_layers  = json_get_int(root, "n_layers", st->n_layers);
+		st->pct		  = json_get_num(root, "pct", st->pct);
+	}
+
+	if (strcmp(st->load_phase, "model_load_done") == 0)
+		st->load_done = 1;
+	else if (strcmp(st->load_phase, "model_load_failed") == 0)
+		st->load_error = 1;
+}
+
+static void on_prefill(monitor_state *st, struct json_object *root) {
+	st->pp_tps			   = json_get_num(root, "tps", st->pp_tps);
+	struct json_object *jn = json_get(root, "n_tokens");
+	if (jn) {
+		st->n_prefill	 = json_object_get_int(jn);
+		st->phase_tokens = st->n_prefill;
+		st->tokens_done	 = st->n_prefill;
+	}
+	st->cumulative_tps = 0;
+	snprintf(st->phase, sizeof(st->phase), "prefill");
+}
+
+static void on_layer(monitor_state *st, struct json_object *root) {
+	const char *phase = json_get_str(root, "phase", NULL);
+	if (phase)
+		snprintf(st->phase, sizeof(st->phase), "%s", phase);
+	if (strcmp(st->phase, "decode") == 0)
+		st->decoding = 1;
+	st->token_idx	   = json_get_int(root, "token_idx", st->token_idx);
+	st->phase_tokens   = json_get_int(root, "n_tokens", st->phase_tokens);
+	st->tokens_done	   = json_get_int(root, "tokens_done", st->tokens_done);
+	st->cur_layer	   = json_get_int(root, "layer", st->cur_layer);
+	st->n_layers	   = json_get_int(root, "n_layers", st->n_layers);
+	st->pct			   = json_get_num(root, "pct", st->pct);
+	st->cumulative_tps = json_get_num(root, "cumulative_tps", st->cumulative_tps);
+	st->moe_hit		   = json_get_num(root, "moe_hit", st->moe_hit);
+	st->moe_pin		   = json_get_num(root, "moe_pin", st->moe_pin);
+	st->moe_lru		   = json_get_num(root, "moe_lru", st->moe_lru);
+	st->moe_misses = (unsigned long long)json_get_int(root, "moe_miss", (int64_t)st->moe_misses);
+}
+
+static void on_token(monitor_state *st, struct json_object *root) {
+	const char *text = json_get_str(root, "text", NULL);
+	if (text)
+		append_output(st, text);
+	st->token_idx		  = json_get_int(root, "token_idx", st->token_idx);
+	st->n_generated		  = st->token_idx + 1;
+	st->decoding		  = 1;
+	st->has_current_token = 1;
+}
+
+static void on_moe_experts(monitor_state *st, struct json_object *root) {
+	int layer = (int)json_get_int(root, "layer", -1);
+	if (layer < 0 || layer >= MAX_LAYERS)
 		return;
-	const char *type = json_object_get_string(jtype);
 
-	if (strcmp(type, "start") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "arch", &j))
-			snprintf(st->arch, sizeof(st->arch), "%s", json_object_get_string(j));
-		if (json_object_object_get_ex(root, "n_layers", &j))
-			st->n_layers = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "dim", &j))
-			st->dim = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "n_ctx", &j))
-			st->n_ctx = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "vocab", &j))
-			st->vocab = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "is_moe", &j))
-			st->is_moe = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "n_experts", &j))
-			st->n_experts = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "topk", &j))
-			st->topk = json_object_get_int(j);
+	st->cur_n_experts[layer] = 0;
 
-		st->load_done		  = 1;
-		st->phase[0]		  = '\0';
-		st->decoding		  = 0;
-		st->token_idx		  = 0;
-		st->cur_layer		  = 0;
-		st->pct				  = 0;
-		st->cumulative_tps	  = 0;
-		st->pp_tps			  = 0;
-		st->tg_tps			  = 0;
-		st->n_prefill		  = 0;
-		st->n_generated		  = 0;
-		st->phase_tokens	  = 0;
-		st->tokens_done		  = 0;
-		st->has_current_token = 0;
-	} else if (strcmp(type, "load") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "phase", &j))
-			snprintf(st->load_phase, sizeof(st->load_phase), "%s", json_object_get_string(j));
-		if (json_object_object_get_ex(root, "ms", &j))
-			st->load_ms = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "layers", &j))
-			st->n_layers = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "dim", &j))
-			st->dim = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "vocab", &j))
-			st->vocab = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "path", &j))
-			snprintf(st->model_path, sizeof(st->model_path), "%s", json_object_get_string(j));
-		if (!st->load_t0_ms)
-			st->load_t0_ms = now_ms();
-
-		record_load_step(st, st->load_phase);
-
-		if (strcmp(st->load_phase, "loading_weights") == 0) {
-			if (json_object_object_get_ex(root, "layer", &j))
-				st->cur_layer = json_object_get_int(j);
-			if (json_object_object_get_ex(root, "n_layers", &j))
-				st->n_layers = json_object_get_int(j);
-			if (json_object_object_get_ex(root, "pct", &j))
-				st->pct = json_object_get_double(j);
+	struct json_object *jexperts = json_get_arr(root, "experts");
+	if (jexperts) {
+		int n = json_object_array_length(jexperts);
+		if (n > MAX_TOPK)
+			n = MAX_TOPK;
+		st->cur_n_experts[layer] = n;
+		for (int k = 0; k < n; k++) {
+			struct json_object *je	  = json_object_array_get_idx(jexperts, k);
+			int					eid	  = json_object_get_int(je);
+			st->cur_experts[layer][k] = eid;
+			if (eid >= 0 && eid < MAX_EXPERTS) {
+				st->expert_hits[layer][eid]++;
+				st->expert_total[eid]++;
+			}
 		}
-
-		if (strcmp(st->load_phase, "model_load_done") == 0)
-			st->load_done = 1;
-		else if (strcmp(st->load_phase, "model_load_failed") == 0)
-			st->load_error = 1;
-	} else if (strcmp(type, "prefill") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "tps", &j))
-			st->pp_tps = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "n_tokens", &j)) {
-			st->n_prefill	 = json_object_get_int(j);
-			st->phase_tokens = st->n_prefill;
-			st->tokens_done	 = st->n_prefill;
+	}
+	struct json_object *jweights = json_get_arr(root, "weights");
+	if (jweights) {
+		int n = json_object_array_length(jweights);
+		if (n > MAX_TOPK)
+			n = MAX_TOPK;
+		for (int k = 0; k < n; k++) {
+			struct json_object *jw	  = json_object_array_get_idx(jweights, k);
+			st->cur_weights[layer][k] = (float)json_object_get_double(jw);
 		}
-		st->cumulative_tps = 0;
-		snprintf(st->phase, sizeof(st->phase), "prefill");
-	} else if (strcmp(type, "layer") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "phase", &j))
-			snprintf(st->phase, sizeof(st->phase), "%s", json_object_get_string(j));
-		if (strcmp(st->phase, "decode") == 0)
-			st->decoding = 1;
-		if (json_object_object_get_ex(root, "token_idx", &j))
-			st->token_idx = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "n_tokens", &j))
-			st->phase_tokens = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "tokens_done", &j))
-			st->tokens_done = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "layer", &j))
-			st->cur_layer = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "n_layers", &j))
-			st->n_layers = json_object_get_int(j);
-		if (json_object_object_get_ex(root, "pct", &j))
-			st->pct = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "cumulative_tps", &j))
-			st->cumulative_tps = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_hit", &j))
-			st->moe_hit = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_pin", &j))
-			st->moe_pin = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_lru", &j))
-			st->moe_lru = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_miss", &j))
-			st->moe_misses = (unsigned long long)json_object_get_int64(j);
-	} else if (strcmp(type, "token") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "text", &j))
-			append_output(st, json_object_get_string(j));
-		if (json_object_object_get_ex(root, "token_idx", &j))
-			st->token_idx = json_object_get_int(j);
-		st->n_generated		  = st->token_idx + 1;
-		st->decoding		  = 1;
-		st->has_current_token = 1;
-	} else if (strcmp(type, "moe_experts") == 0) {
-		struct json_object *jlayer;
-		struct json_object *jexperts;
-		struct json_object *jweights;
-		int					layer = -1;
-		if (json_object_object_get_ex(root, "layer", &jlayer))
-			layer = json_object_get_int(jlayer);
-		if (layer < 0 || layer >= MAX_LAYERS)
+	}
+}
+
+static void on_end(monitor_state *st, struct json_object *root) {
+	st->pp_tps			  = json_get_num(root, "pp_tps", st->pp_tps);
+	st->tg_tps			  = json_get_num(root, "tg_tps", st->tg_tps);
+	st->n_generated		  = json_get_int(root, "tokens_generated", st->n_generated);
+	st->cumulative_tps	  = 0;
+	st->phase[0]		  = '\0';
+	st->decoding		  = 0;
+	st->has_current_token = 0;
+
+	st->moe_hit	   = json_get_num(root, "moe_hit", st->moe_hit);
+	st->moe_pin	   = json_get_num(root, "moe_pin", st->moe_pin);
+	st->moe_lru	   = json_get_num(root, "moe_lru", st->moe_lru);
+	st->moe_misses = (unsigned long long)json_get_int(root, "moe_miss", (int64_t)st->moe_misses);
+}
+
+typedef void (*event_handler_fn)(monitor_state *st, struct json_object *root);
+
+typedef struct {
+	const char		*type;
+	event_handler_fn fn;
+} event_handler;
+
+static const event_handler k_event_handlers[] = {
+	{"start", on_start}, {"load", on_load},	  {"prefill", on_prefill},
+	{"layer", on_layer}, {"token", on_token}, {"moe_experts", on_moe_experts},
+	{"end", on_end},
+};
+
+static void process_event(monitor_state *st, struct json_object *root) {
+	const char *type = json_get_str(root, "type", NULL);
+	if (!type)
+		return;
+	for (size_t i = 0; i < sizeof(k_event_handlers) / sizeof(k_event_handlers[0]); i++) {
+		if (strcmp(type, k_event_handlers[i].type) == 0) {
+			k_event_handlers[i].fn(st, root);
 			return;
-
-		st->cur_n_experts[layer] = 0;
-
-		if (json_object_object_get_ex(root, "experts", &jexperts) &&
-			json_object_is_type(jexperts, json_type_array)) {
-			int n = json_object_array_length(jexperts);
-			if (n > MAX_TOPK)
-				n = MAX_TOPK;
-			st->cur_n_experts[layer] = n;
-			for (int k = 0; k < n; k++) {
-				struct json_object *je	  = json_object_array_get_idx(jexperts, k);
-				int					eid	  = json_object_get_int(je);
-				st->cur_experts[layer][k] = eid;
-				if (eid >= 0 && eid < MAX_EXPERTS) {
-					st->expert_hits[layer][eid]++;
-					st->expert_total[eid]++;
-				}
-			}
 		}
-		if (json_object_object_get_ex(root, "weights", &jweights) &&
-			json_object_is_type(jweights, json_type_array)) {
-			int n = json_object_array_length(jweights);
-			if (n > MAX_TOPK)
-				n = MAX_TOPK;
-			for (int k = 0; k < n; k++) {
-				struct json_object *jw	  = json_object_array_get_idx(jweights, k);
-				st->cur_weights[layer][k] = (float)json_object_get_double(jw);
-			}
-		}
-	} else if (strcmp(type, "end") == 0) {
-		struct json_object *j;
-		if (json_object_object_get_ex(root, "pp_tps", &j))
-			st->pp_tps = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "tg_tps", &j))
-			st->tg_tps = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "tokens_generated", &j))
-			st->n_generated = json_object_get_int(j);
-		st->cumulative_tps	  = 0;
-		st->phase[0]		  = '\0';
-		st->decoding		  = 0;
-		st->has_current_token = 0;
-
-		if (json_object_object_get_ex(root, "moe_hit", &j))
-			st->moe_hit = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_pin", &j))
-			st->moe_pin = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_lru", &j))
-			st->moe_lru = json_object_get_double(j);
-		if (json_object_object_get_ex(root, "moe_miss", &j))
-			st->moe_misses = (unsigned long long)json_object_get_int64(j);
 	}
 }
 

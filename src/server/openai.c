@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "json-c/json.h"
+#include "json_helpers.h"
 #include "log.h"
 #include "microhttpd.h"
 #include "sampler.h"
@@ -208,18 +209,13 @@ static char *extract_message_content(json_object *msg) {
 			json_object *part = json_object_array_get_idx(c, i);
 			if (!json_object_is_type(part, json_type_object))
 				continue;
-			json_object *type, *text;
-			const char	*ts = "";
-			if (json_object_object_get_ex(part, "type", &type) &&
-				json_object_is_type(type, json_type_string))
-				ts = json_object_get_string(type);
+			const char *ts = json_get_str(part, "type", "");
 			if (*ts && strcmp(ts, "text") != 0)
 				continue;
-			if (!json_object_object_get_ex(part, "text", &text) ||
-				!json_object_is_type(text, json_type_string))
+			const char *t = json_get_str(part, "text", NULL);
+			if (!t)
 				continue;
-			const char *t	 = json_object_get_string(text);
-			size_t		tlen = strlen(t);
+			size_t tlen = strlen(t);
 			if (len + tlen + 1 > cap) {
 				cap = (len + tlen + 1) * 2;
 				out = xrealloc(out, cap);
@@ -231,27 +227,6 @@ static char *extract_message_content(json_object *msg) {
 		return out ? out : xstrdup("");
 	}
 	return xstrdup("");
-}
-
-static double get_num_or(json_object *root, const char *key, double fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v))
-		return fallback;
-	return json_object_get_double(v);
-}
-
-static bool get_bool_or(json_object *root, const char *key, bool fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v) || !json_object_is_type(v, json_type_boolean))
-		return fallback;
-	return json_object_get_boolean(v);
-}
-
-static int64_t get_int_or(json_object *root, const char *key, int64_t fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v))
-		return fallback;
-	return json_object_get_int64(v);
 }
 
 static const char *parse_stop(json_object *root, oa_req_params *p) {
@@ -280,27 +255,26 @@ static const char *parse_stop(json_object *root, oa_req_params *p) {
 }
 
 static void parse_sampling_params(json_object *root, oa_req_params *p) {
-	p->stream		 = get_bool_or(root, "stream", false);
+	p->stream		 = json_get_bool(root, "stream", false);
 	p->include_usage = false;
-	json_object *so;
-	if (json_object_object_get_ex(root, "stream_options", &so) &&
-		json_object_is_type(so, json_type_object))
-		p->include_usage = get_bool_or(so, "include_usage", false);
+	json_object *so	 = json_get_obj(root, "stream_options");
+	if (so)
+		p->include_usage = json_get_bool(so, "include_usage", false);
 
-	double d	   = get_num_or(root, "temperature", 0.80);
+	double d	   = json_get_num(root, "temperature", 0.80);
 	p->temperature = d < 0 ? 0 : (d > 2 ? 2 : (float)d);
-	d			   = get_num_or(root, "top_p", 0.90);
+	d			   = json_get_num(root, "top_p", 0.90);
 	p->top_p	   = d <= 0 ? 1e-3f : (d > 1 ? 1 : (float)d);
-	d			   = get_num_or(root, "min_p", 0.10);
+	d			   = json_get_num(root, "min_p", 0.10);
 	p->min_p	   = d < 0 ? 0 : (d > 1 ? 1 : (float)d);
 
-	int64_t k = get_int_or(root, "top_k", 40);
+	int64_t k = json_get_int(root, "top_k", 40);
 	p->top_k  = k < 0 ? 0 : (int)(k > INT_MAX ? INT_MAX : k);
 
 	int64_t mt = -1;
-	mt		   = get_int_or(root, "max_completion_tokens", mt);
+	mt		   = json_get_int(root, "max_completion_tokens", mt);
 	if (mt < 0)
-		mt = get_int_or(root, "max_tokens", -1);
+		mt = json_get_int(root, "max_tokens", -1);
 	p->max_tokens = (int)(mt > 100000000 ? 100000000 : mt);
 
 	p->has_seed = false;
@@ -317,41 +291,31 @@ static void parse_sampling_params(json_object *root, oa_req_params *p) {
 	parse_stop(root, p);
 }
 
-static uint64_t fnv1a_update(uint64_t h, const char *s) {
-	if (!s)
-		return h;
-	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-		h ^= *p;
-		h *= 1099511628211ULL;
-	}
-	return h;
-}
-
 static uint64_t *session_prefix_hash_chain(const oa_req_params *p, size_t *out_len) {
 	size_t	  len	= p->n_messages > 0 ? p->n_messages - 1 : 0;
 	uint64_t *chain = xmalloc((len + 1) * sizeof(uint64_t));
-	uint64_t  h		= 1469598103934665603ULL;
+	uint64_t  h		= FNV1A_OFFSET_BASIS;
 	if (p->tools)
-		h = fnv1a_update(h, json_object_to_json_string(p->tools));
-	h		 = fnv1a_update(h, "\x1f");
-	h		 = fnv1a_update(h, p->tool_choice ? p->tool_choice : "");
-	h		 = fnv1a_update(h, p->forced_function ? p->forced_function : "");
-	h		 = fnv1a_update(h, "\x1e");
+		h = fnv1a_update_str(h, json_object_to_json_string(p->tools));
+	h		 = fnv1a_update_str(h, "\x1f");
+	h		 = fnv1a_update_str(h, p->tool_choice ? p->tool_choice : "");
+	h		 = fnv1a_update_str(h, p->forced_function ? p->forced_function : "");
+	h		 = fnv1a_update_str(h, "\x1e");
 	chain[0] = h;
 	for (size_t i = 0; i < len; i++) {
 		h = chain[i];
-		h = fnv1a_update(h, p->messages[i].role);
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].content);
-		h = fnv1a_update(h,
-						 p->messages[i].reasoning_content ? p->messages[i].reasoning_content : "");
+		h = fnv1a_update_str(h, p->messages[i].role);
+		h = fnv1a_update_str(h, "\x1f");
+		h = fnv1a_update_str(h, p->messages[i].content);
+		h = fnv1a_update_str(h, p->messages[i].reasoning_content ? p->messages[i].reasoning_content
+																 : "");
 		if (p->messages[i].tool_calls)
-			h = fnv1a_update(h, json_object_to_json_string(p->messages[i].tool_calls));
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].tool_call_id ? p->messages[i].tool_call_id : "");
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].name ? p->messages[i].name : "");
-		h = fnv1a_update(h, "\x1e");
+			h = fnv1a_update_str(h, json_object_to_json_string(p->messages[i].tool_calls));
+		h = fnv1a_update_str(h, "\x1f");
+		h = fnv1a_update_str(h, p->messages[i].tool_call_id ? p->messages[i].tool_call_id : "");
+		h = fnv1a_update_str(h, "\x1f");
+		h = fnv1a_update_str(h, p->messages[i].name ? p->messages[i].name : "");
+		h = fnv1a_update_str(h, "\x1e");
 		chain[i + 1] = h;
 	}
 	*out_len = len;
@@ -1257,6 +1221,64 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 	return respond_json(conn, MHD_HTTP_OK, build_completion_body(rc, chat_api));
 }
 
+static enum MHD_Result route_health(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method) {
+	(void)st;
+	(void)rc;
+	(void)url;
+	(void)method;
+	return respond_json(conn, MHD_HTTP_OK, health_body());
+}
+
+static enum MHD_Result route_root(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+								  const char *url, const char *method) {
+	(void)rc;
+	(void)url;
+	(void)method;
+	return respond_json(conn, MHD_HTTP_OK, root_body(st));
+}
+
+static enum MHD_Result route_completions(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+										 const char *url, const char *method) {
+	if (rc->too_large)
+		return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
+							error_body("request body too large", "invalid_request_error"));
+	uint64_t		t0 = time_us();
+	enum MHD_Result r  = handle_post(st, conn, rc, url);
+	INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
+	return r;
+}
+
+static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method) {
+	(void)rc;
+	(void)url;
+	if (strcmp(method, "GET") != 0)
+		return respond_json(conn, MHD_HTTP_METHOD_NOT_ALLOWED,
+							error_body("Method not allowed", "invalid_request_error"));
+	if (!check_auth(st, conn))
+		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
+							error_body("Invalid API key", "authentication_error"));
+	return respond_json(conn, MHD_HTTP_OK, models_body(st));
+}
+
+typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method);
+
+typedef struct {
+	const char *method;
+	const char *path;
+	route_fn	fn;
+} route;
+
+static const route routes[] = {
+	{"GET", "/health", route_health},
+	{"GET", "/", route_root},
+	{"POST", "/v1/chat/completions", route_completions},
+	{"POST", "/v1/completions", route_completions},
+	{NULL, "/v1/models", route_models},
+};
+
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, const char *url,
 									  const char *method, const char *version,
 									  const char *upload_data, size_t *upload_data_size,
@@ -1300,31 +1322,12 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 		return r;
 	}
 
-	if (strcmp(url, "/health") == 0 && strcmp(method, "GET") == 0)
-		return respond_json(conn, MHD_HTTP_OK, health_body());
-
-	if (strcmp(url, "/") == 0 && strcmp(method, "GET") == 0)
-		return respond_json(conn, MHD_HTTP_OK, root_body(st));
-
-	if ((strcmp(url, "/v1/chat/completions") == 0 || strcmp(url, "/v1/completions") == 0) &&
-		strcmp(method, "POST") == 0) {
-		if (rc->too_large)
-			return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
-								error_body("request body too large", "invalid_request_error"));
-		uint64_t		t0 = time_us();
-		enum MHD_Result r  = handle_post(st, conn, rc, url);
-		INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
-		return r;
-	}
-
-	if (strcmp(url, "/v1/models") == 0) {
-		if (strcmp(method, "GET") != 0)
-			return respond_json(conn, MHD_HTTP_METHOD_NOT_ALLOWED,
-								error_body("Method not allowed", "invalid_request_error"));
-		if (!check_auth(st, conn))
-			return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
-								error_body("Invalid API key", "authentication_error"));
-		return respond_json(conn, MHD_HTTP_OK, models_body(st));
+	for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+		if (routes[i].method && strcmp(method, routes[i].method) != 0)
+			continue;
+		if (strcmp(url, routes[i].path) != 0)
+			continue;
+		return routes[i].fn(st, conn, rc, url, method);
 	}
 
 	char msgbuf[192];

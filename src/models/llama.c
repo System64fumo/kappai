@@ -4,8 +4,6 @@
 #include "model.h"
 #include "recipe.h"
 
-#include <math.h>
-
 static model_recipe *build_standard_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));
 
@@ -19,7 +17,6 @@ static model_recipe *build_standard_recipe(const model *m) {
 	const int	kv_out		 = n_kv_heads * head_dim;
 	const int	n_ctx		 = m->n_ctx;
 	const float eps			 = m->norm_eps;
-	const float attn_scale	 = 1.0f / sqrtf((float)head_dim);
 	const int	rope_neox	 = m->arch_info->uses_neox_rope;
 
 	const int has_matmul_multi	  = backend_has_cap(a, BCAP_MULTI_MATMUL);
@@ -43,39 +40,12 @@ static model_recipe *build_standard_recipe(const model *m) {
 		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
 
 		if (has_matmul_multi) {
-			ops[i++] = (recipe_op){
-				.kind			= OP_MATMUL_MULTI,
-				.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out			= RECIPE_SLOT_Q,
-				.w_idx			= WIDX_WQ,
-				.stage			= STAGE_MATMUL,
-				.u.matmul_multi = {.n = 3, .k = dim, .n_out = {q_out, kv_out, kv_out}},
-			};
+			ops[i++] = mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, dim, q_out, kv_out,
+										kv_out);
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_Q,
-				.w_idx	  = WIDX_WQ,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = q_out, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_K,
-				.w_idx	  = WIDX_WK,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = kv_out, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_V,
-				.w_idx	  = WIDX_WV,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = kv_out, .k = dim},
-			};
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL);
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL);
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL);
 		}
 
 		if (has_rope_qk) {
@@ -87,18 +57,12 @@ static model_recipe *build_standard_recipe(const model *m) {
 
 		ops[i++] = mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V);
 
-		ops[i++] = mk_attention(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, n_kv_heads, head_dim,
-								n_ctx, attn_scale, m->sliding_window);
+		ops[i++] = mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, n_kv_heads,
+											  head_dim, n_ctx, m->sliding_window);
 
 		if (can_fuse_attn_residual) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_RESIDUAL,
-				.in		  = {RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_X,
-				.w_idx	  = WIDX_WO,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = dim, .k = q_out},
-			};
+			ops[i++] = mk_matmul_residual(RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_WO,
+										  dim, q_out);
 		} else {
 			ops[i++] =
 				mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL);
@@ -113,64 +77,28 @@ static model_recipe *build_standard_recipe(const model *m) {
 		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
 
 		if (m->layers[0].gate_up_fused) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_FUSED_GATEUP,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_GATE_UP,
-				.w_idx	  = WIDX_GATE_UP,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = 2 * intermediate, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	   = OP_FFN_ACTIVATE_FUSED,
-				.in		   = {RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	   = RECIPE_SLOT_FFN_ACT,
-				.w_idx	   = RECIPE_NO_WEIGHT,
-				.stage	   = STAGE_FFN_ACT,
-				.u.ffn_act = {.n = intermediate, .activation = 0},
-			};
+			ops[i++] = mk_matmul_fused_gateup(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP,
+											  2 * intermediate, dim);
+			ops[i++] = mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT,
+											 intermediate, 0);
 		} else if (has_matmul_multi) {
 			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, dim,
 										intermediate, intermediate);
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_GATE,
-				.w_idx	  = WIDX_GATE,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = intermediate, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_UP,
-				.w_idx	  = WIDX_UP,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = intermediate, .k = dim},
-			};
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, intermediate, dim,
+								 STAGE_MATMUL);
+			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, intermediate, dim,
+								 STAGE_MATMUL);
 		}
 
 		if (!m->layers[0].gate_up_fused) {
-			ops[i++] = (recipe_op){
-				.kind	   = OP_FFN_ACTIVATE,
-				.in		   = {RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_NONE},
-				.out	   = RECIPE_SLOT_FFN_ACT,
-				.w_idx	   = RECIPE_NO_WEIGHT,
-				.stage	   = STAGE_FFN_ACT,
-				.u.ffn_act = {.n = intermediate, .activation = 0},
-			};
+			ops[i++] = mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+									   RECIPE_SLOT_FFN_ACT, intermediate, 0);
 		}
 
 		if (can_fuse_ffn_residual) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_RESIDUAL,
-				.in		  = {RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_X,
-				.w_idx	  = WIDX_DOWN,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = dim, .k = intermediate},
-			};
+			ops[i++] = mk_matmul_residual(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_X,
+										  WIDX_DOWN, dim, intermediate);
 		} else {
 			ops[i++] = mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, intermediate,
 								 STAGE_MATMUL);

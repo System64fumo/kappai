@@ -19,12 +19,12 @@
 #define HFB_LIB_MAX 16
 
 typedef struct {
+	uint64_t			 count;
+	host_fallback_reason reason;
+	int					 printed;
 	char				 op[HFB_OP_CAP];
 	char				 device[32];
-	host_fallback_reason reason;
-	uint64_t			 count;
 	char				 detail[HFB_DETAIL_CAP];
-	int					 printed;
 } hfb_entry;
 
 static hfb_entry	   g_hfb_entries[HFB_MAX_ENTRIES];
@@ -162,10 +162,15 @@ void backend_fallback_report(void) {
 static void backend_dump_load_diagnosis(void) {
 	if (g_n_lib_search_dirs > 0) {
 		char dirs[HFB_LIB_MAX * HFB_PATH_CAP];
-		dirs[0] = '\0';
-		for (int i = 0; i < g_n_lib_search_dirs; i++)
-			snprintf(dirs + strlen(dirs), sizeof(dirs) - strlen(dirs), "%s%s", i ? "; " : "",
-					 g_lib_search_dirs[i]);
+		dirs[0]	   = '\0';
+		size_t off = 0;
+		for (int i = 0; i < g_n_lib_search_dirs; i++) {
+			int w = snprintf(dirs + off, sizeof(dirs) - off, "%s%s", i ? "; " : "",
+							 g_lib_search_dirs[i]);
+			if (w < 0 || (size_t)w >= sizeof(dirs) - off)
+				break;
+			off += (size_t)w;
+		}
 		ERROR("  backend library search dirs: %s", dirs);
 	} else {
 		ERROR("  backend library search dirs: none");
@@ -653,13 +658,21 @@ static int str_starts_with(const char *s, const char *prefix) {
 	return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+static void path_copy_trunc(char *dst, const char *src) {
+	size_t n = strlen(src);
+	if (n >= HFB_PATH_CAP)
+		n = HFB_PATH_CAP - 1;
+	memcpy(dst, src, n);
+	dst[n] = '\0';
+}
+
 static void try_load_backend(const char *path) {
 	void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!handle) {
 		const char *err = dlerror();
 		WARN("backend library '%s' failed to load: %s", path, err ? err : "unknown error");
 		if (g_n_lib_load_fails < HFB_LIB_MAX) {
-			snprintf(g_lib_load_fails[g_n_lib_load_fails].path, HFB_PATH_CAP, "%s", path);
+			path_copy_trunc(g_lib_load_fails[g_n_lib_load_fails].path, path);
 			snprintf(g_lib_load_fails[g_n_lib_load_fails].err, 256, "%s",
 					 err ? err : "unknown error");
 			g_n_lib_load_fails++;
@@ -668,7 +681,7 @@ static void try_load_backend(const char *path) {
 	}
 	DEBUG("loaded backend library: %s", path);
 	if (g_n_loaded_libs < HFB_LIB_MAX)
-		snprintf(g_loaded_lib_paths[g_n_loaded_libs++], HFB_PATH_CAP, "%s", path);
+		path_copy_trunc(g_loaded_lib_paths[g_n_loaded_libs++], path);
 }
 
 static int already_loaded(const char *candidate) {

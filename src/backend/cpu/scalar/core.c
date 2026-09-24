@@ -630,18 +630,8 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	const uint8_t *restrict W_sub = (const uint8_t *)j->W + ((size_t)begin * j->row_stride);
 	float *restrict y_sub		  = j->y + begin;
 
-	float		 save_stack[CPU_MATMUL_MIN_ROWS_PER_THREAD];
-	const float *res_ptr;
-	int			 res_off;
-	if (j->m == 1 && j->aliases_residual && j->residual) {
-		for (int i = 0; i < n_sub; i++)
-			save_stack[i] = j->residual[begin + i];
-		res_ptr = save_stack;
-		res_off = 0;
-	} else {
-		res_ptr = j->residual;
-		res_off = begin;
-	}
+	const float *res_ptr = j->residual;
+	int			 res_off = begin;
 
 	const matmul_kernel *entry = j->kernel;
 	if (entry) {
@@ -665,9 +655,17 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 }
 
 static void cpu_matmul_groups_worker(int begin, int end, int tid, void *ctx) {
-	cpu_matmul_job *j  = ctx;
-	int				gr = j->group_rows;
-	cpu_matmul_rows_worker(begin * gr, end * gr, tid, ctx);
+	cpu_matmul_job *j		  = ctx;
+	int				gr		  = j->group_rows;
+	int				row_begin = begin * gr;
+	int				row_end	  = end * gr;
+	if (row_begin < 0)
+		row_begin = 0;
+	if (row_end > j->n)
+		row_end = j->n;
+	if (row_begin >= row_end)
+		return;
+	cpu_matmul_rows_worker(row_begin, row_end, tid, ctx);
 }
 
 static const grouped_matmul_kernel k_grouped_kernels[] = {
@@ -696,7 +694,7 @@ static void cpu_matmul_dispatch_rows(tpool *pool, uint32_t w_type, int n_rows, v
 		return;
 	}
 	((cpu_matmul_job *)job)->group_rows = gk->group_rows;
-	int n_groups						= n_rows / gk->group_rows;
+	int n_groups						= (n_rows + gk->group_rows - 1) / gk->group_rows;
 	int min_groups_per_thr				= CPU_MATMUL_MIN_ROWS_PER_THREAD / gk->group_rows;
 	if (min_groups_per_thr < 1)
 		min_groups_per_thr = 1;
@@ -866,7 +864,7 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 						  .xf				= x,
 						  .bias				= bias,
 						  .residual			= residual,
-						  .aliases_residual = aliases_residual};
+						  .aliases_residual = 0};
 	cpu_matmul_job_prepare_kernel(&job);
 
 	int q8_class = job.kernel ? job.kernel->q8_class : 0;
@@ -887,6 +885,16 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 		return;
 	}
 	job.row_stride = cpu_matmul_w_row_stride(w_type, k);
+
+	if (aliases_residual && residual) {
+		status_code grow_st = cpu_scratch_grow_aligned(
+			(void **)&p->residual_tmp, &p->residual_tmp_cap, (size_t)n * sizeof(float), 64);
+		if (grow_st != OK)
+			return;
+		memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
+		job.residual = p->residual_tmp;
+	}
+	job.aliases_residual = 0;
 
 	cpu_matmul_dispatch_rows(p->pool, w_type, n, &job, cpu_matmul_rows_worker);
 }
@@ -922,6 +930,10 @@ static void cpu_matmul_multi_groups_worker(int begin, int end, int tid, void *ct
 			continue;
 		int row_begin = (b - lo) * gr;
 		int row_end	  = (e - lo) * gr;
+		if (row_end > mj->jobs[i].n)
+			row_end = mj->jobs[i].n;
+		if (row_begin >= row_end)
+			continue;
 		cpu_matmul_rows_worker(row_begin, row_end, tid, &mj->jobs[i]);
 	}
 }
@@ -1024,7 +1036,7 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 			mj.group_offset[0] = 0;
 			int total_groups   = 0;
 			for (int i = 0; i < n_matmuls; i++) {
-				int n_groups_i = n_list[i] / gr;
+				int n_groups_i = (n_list[i] + gr - 1) / gr;
 				total_groups += n_groups_i;
 				mj.group_offset[i + 1] = total_groups;
 				mj.jobs[i].group_rows  = gr;
@@ -1145,7 +1157,7 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 			mj.group_offset[0] = 0;
 			int total_groups   = 0;
 			for (int i = 0; i < n_matmuls; i++) {
-				int n_groups_i = n_list[i] / gr;
+				int n_groups_i = (n_list[i] + gr - 1) / gr;
 				total_groups += n_groups_i;
 				mj.group_offset[i + 1] = total_groups;
 				mj.jobs[i].group_rows  = gr;

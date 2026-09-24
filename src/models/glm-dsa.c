@@ -9,17 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MLA_Q_A_STACK_CAP 4096
-#define MLA_KV_A_STACK_CAP 2048
-
 static model_recipe *build_glm_dsa_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));
 
-	const int	dim		  = m->dim;
-	const int	n_heads	  = m->n_heads;
-	const int	n_ctx	  = m->n_ctx;
-	const float eps		  = m->norm_eps;
-	const int	rope_neox = m->arch_info->uses_neox_rope;
+	const int	dim		= m->dim;
+	const int	n_heads = m->n_heads;
+	const int	n_ctx	= m->n_ctx;
+	const float eps		= m->norm_eps;
 
 	const int qk_head  = m->mla.qk_head;
 	const int v_head   = m->mla.v_head;
@@ -40,41 +36,20 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 
 		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
 
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MLA_QKV_PROJ_FUSED,
-			.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out	  = RECIPE_SLOT_Q,
-			.w_idx	  = WIDX_NONE,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = q_b_rows, .k = dim},
-		};
+		ops[i++] = mk_mla_qkv_proj_fused(RECIPE_SLOT_XB, RECIPE_SLOT_Q, q_b_rows, dim);
 
-		ops[i++] = (recipe_op){
-			.kind  = OP_ATTENTION_MLA,
-			.in	   = {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_XB2,
-			.w_idx = WIDX_NONE,
-			.stage = STAGE_ATTN,
-			.u.attention =
-				{
-					.n_heads		   = n_heads,
-					.n_kv_heads		   = n_heads,
-					.head_dim		   = qk_head,
-					.n_ctx			   = n_ctx,
-					.scale			   = 1.0f / sqrtf((float)qk_head),
-					.sliding_window	   = 0,
-					.n_kv_heads_active = n_heads,
-				},
-		};
+		ops[i++] = mk_attention_mla(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, qk_head, n_ctx,
+									1.0f / sqrtf((float)qk_head));
 
-		ops[i++] = (recipe_op){
-			.kind	  = OP_MATMUL_RESIDUAL,
-			.in		  = {RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
-			.out	  = RECIPE_SLOT_X,
-			.w_idx	  = WIDX_WO,
-			.stage	  = STAGE_MATMUL,
-			.u.matmul = {.n = dim, .k = wo_in},
-		};
+		if (backend_has_cap(m->backend, BCAP_MATMUL_RESIDUAL)) {
+			ops[i++] = mk_matmul_residual(RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_WO,
+										  dim, wo_in);
+		} else {
+			ops[i++] =
+				mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, wo_in, STAGE_MATMUL);
+			ops[i++] = mk_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, STAGE_ADD);
+			ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
+		}
 
 		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
 
@@ -91,7 +66,6 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 	recipe_build_post_ops(r, m);
 
 	moe_stream_cache_init((struct model *)m);
-	(void)rope_neox;
 	return r;
 }
 

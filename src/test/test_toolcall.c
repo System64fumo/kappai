@@ -7,14 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void record_tc(const char *label, int ok, const char *fmt, ...) {
-	char	detail[512];
-	va_list ap;
-	va_start(ap, fmt);
-	vsnprintf(detail, sizeof(detail), fmt, ap);
-	va_end(ap);
-	record_result(OPFAM_TOOLCALL, label, ok ? V_PASS : V_FAIL, detail);
-}
+#define record_tc(label, ok, ...) record_resultf(OPFAM_TOOLCALL, (label), (ok), __VA_ARGS__)
 
 static int parse_str(const marker_pair *fmt, const char *text, char **out_name,
 					 json_object **out_args) {
