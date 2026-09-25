@@ -57,6 +57,7 @@ typedef struct {
 	uint32_t			   bpe_arena_cap;
 	uint32_t			   bpe_pcs_cache_cap;
 	int32_t				   byte_fallback_ids[256];
+	int16_t				  *token_id_to_byte;
 	uint32_t			   special_by_first_byte_off[257];
 	bool				   add_bos, add_eos;
 	bool				   is_sentencepiece;

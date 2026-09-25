@@ -915,14 +915,9 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 			close(fd);
 			return ERR_FORMAT;
 		}
-		void *nbuf = realloc(buf, new_cap);
-		if (!nbuf) {
-			free(buf);
-			close(fd);
-			return ERR_OUT_OF_MEMORY;
-		}
-		buf = nbuf;
-		cap = new_cap;
+		void *nbuf = xrealloc(buf, new_cap);
+		buf		   = nbuf;
+		cap		   = new_cap;
 	}
 
 	for (size_t i = 0; i < ctx->n_tensors; i++)
@@ -943,6 +938,42 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	return OK;
 }
 
+status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
+							   size_t *out_align) {
+	int flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
+		close(fd);
+		DEBUG("%s: O_DIRECT unsupported, using buffered reads", tag);
+		return ERR_IO;
+	}
+	long		blk = 4096;
+	struct stat pst;
+	if (fstat(fd, &pst) == 0 && pst.st_blksize > 0)
+		blk = pst.st_blksize;
+	size_t align = (size_t)blk;
+	if (max_align > 0 && align > max_align)
+		align = max_align;
+	void *probe_buf;
+	if (posix_memalign(&probe_buf, align, align) != 0 || !probe_buf) {
+		close(fd);
+		DEBUG("%s: O_DIRECT probe alloc failed, using buffered reads", tag);
+		return ERR_OUT_OF_MEMORY;
+	}
+	ssize_t rc = pread(fd, probe_buf, align, 0);
+	free(probe_buf);
+	if (rc < 0) {
+		close(fd);
+		DEBUG("%s: O_DIRECT probe failed (%s), using buffered reads", tag, strerror(errno));
+		return ERR_IO;
+	}
+	if (advise_random)
+		posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	if (out_align)
+		*out_align = align;
+	DEBUG("%s: O_DIRECT enabled (align=%zu)", tag, align);
+	return OK;
+}
+
 status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 	int plain_fd = open(path, O_RDONLY);
 	if (plain_fd < 0) {
@@ -957,29 +988,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		if (fd < 0) {
 			DEBUG("gguf sparse-load: O_DIRECT unavailable (%s), using buffered reads",
 				  strerror(errno));
-		} else {
-			struct stat st;
-			long		blk = 4096;
-			if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-				blk = st.st_blksize < 4096 ? st.st_blksize : 4096;
-			void  *probe;
-			size_t a = (size_t)blk;
-			if (posix_memalign(&probe, a, a) != 0 || !probe) {
-				close(fd);
-				DEBUG("gguf sparse-load: O_DIRECT probe alloc failed, using buffered reads");
-			} else {
-				ssize_t rc = pread(fd, probe, a, 0);
-				free(probe);
-				if (rc < 0) {
-					close(fd);
-					DEBUG("gguf sparse-load: O_DIRECT probe failed (%s), using buffered reads",
-						  strerror(errno));
-				} else {
-					direct_fd = fd;
-					align	  = a;
-					DEBUG("gguf sparse-load: O_DIRECT enabled (align=%zu)", align);
-				}
-			}
+		} else if (direct_io_probe_fd(fd, "gguf sparse-load", 4096, 0, &align) == OK) {
+			direct_fd = fd;
 		}
 	}
 
@@ -1250,15 +1260,23 @@ static ptrdiff_t find_kv(const gguf_ctx *c, const char *key) {
 	return strtab_find(c->kv_hash, c->kv_hash_cap, key);
 }
 
+static status_code gguf_find_checked(const gguf_ctx *c, const char *key, uint32_t want,
+									 ptrdiff_t *out_i) {
+	ptrdiff_t i = find_kv(c, key);
+	if (i < 0)
+		return ERR_NOT_FOUND;
+	if (c->kv_types[i] != want)
+		return ERR_INVALID_ARG;
+	if (out_i)
+		*out_i = i;
+	return OK;
+}
+
 status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
 	ptrdiff_t i = find_kv(c, k);
 	if (i < 0)
 		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_I32) {
-		*o = (int32_t)c->kv_vals[i];
-		return OK;
-	}
-	if (c->kv_types[i] == GGUF_TYPE_U32) {
+	if (c->kv_types[i] == GGUF_TYPE_I32 || c->kv_types[i] == GGUF_TYPE_U32) {
 		*o = (int32_t)(uint32_t)c->kv_vals[i];
 		return OK;
 	}
@@ -1266,47 +1284,38 @@ status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
 }
 
 status_code gguf_get_f32(const gguf_ctx *c, const char *k, float *o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_F32) {
-		float v;
-		memcpy(&v, &c->kv_vals[i], 4);
-		*o = v;
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_F32, &i);
+	if (st != OK)
+		return st;
+	memcpy(o, &c->kv_vals[i], 4);
+	return OK;
 }
 
 status_code gguf_get_bool(const gguf_ctx *c, const char *k, int *o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_BOOL) {
-		*o = (int)c->kv_vals[i];
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_BOOL, &i);
+	if (st != OK)
+		return st;
+	*o = (int)c->kv_vals[i];
+	return OK;
 }
 
 status_code gguf_get_str(const gguf_ctx *c, const char *k, const char **o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_STRING) {
-		*o = c->kv_strs[i].data;
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_STRING, &i);
+	if (st != OK)
+		return st;
+	*o = c->kv_strs[i].data;
+	return OK;
 }
 
 static status_code gguf_get_arr_raw(const gguf_ctx *c, const char *k, uint32_t elem_type,
 									const void **o, size_t *out_count) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] != GGUF_TYPE_ARRAY)
-		return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_ARRAY, &i);
+	if (st != OK)
+		return st;
 	if (c->kv_arr_type[i] != elem_type)
 		return ERR_INVALID_ARG;
 	*o = c->kv_arr_data[i];

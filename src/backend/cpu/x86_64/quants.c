@@ -1686,8 +1686,6 @@ void matmul_q8_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 }
 #undef NR
 
-#define Q8_0_R8_GROUP_BYTES (Q8_0_R8_ROWS * sizeof(uint16_t) + Q8_0_R8_ROWS * 32)
-
 static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 											float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 32;
@@ -1879,8 +1877,6 @@ void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 	}
 }
 #undef NR
-
-#define Q4_0_R8_GROUP_BYTES (Q4_0_R8_ROWS * sizeof(uint16_t) + Q4_0_R8_ROWS * 16)
 
 static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 											float *restrict y, int n, int k) {

@@ -23,15 +23,6 @@
 #define SSE_POLL_SEC 1
 
 typedef struct {
-	char		*role;
-	char		*content;
-	char		*reasoning_content;
-	json_object *tool_calls;
-	const char	*tool_call_id;
-	const char	*name;
-} oa_message;
-
-typedef struct {
 	bool	 stream;
 	bool	 include_usage;
 	float	 temperature;
@@ -44,9 +35,12 @@ typedef struct {
 
 	json_object *stop;
 	size_t		 n_stop;
+	const char **stop_needles;
+	size_t		*stop_lens;
+	size_t		 stop_max;
 
-	oa_message *messages;
-	size_t		n_messages;
+	chat_message *messages;
+	size_t		  n_messages;
 
 	json_object *tools;
 	char		*tool_choice;
@@ -54,6 +48,11 @@ typedef struct {
 
 	char *prompt;
 } oa_req_params;
+
+typedef struct {
+	char  *data;
+	size_t len;
+} sse_frame;
 
 typedef struct {
 	openai_state  *st;
@@ -67,8 +66,7 @@ typedef struct {
 
 	pthread_mutex_t q_mtx;
 	pthread_cond_t	q_cv;
-	char		  **queue;
-	size_t		   *frame_lens;
+	sse_frame	   *queue;
 	size_t			q_len;
 	size_t			q_cap;
 	size_t			q_off;
@@ -77,6 +75,9 @@ typedef struct {
 
 	toolcall_buf content;
 	toolcall_buf reasoning;
+
+	char  *stop_window;
+	size_t stop_window_cap;
 
 	bool in_thinking;
 	bool first_token;
@@ -99,10 +100,8 @@ struct req_ctx {
 	openai_state *st;
 	atomic_int	  refs;
 
-	char  *body;
-	size_t body_len;
-	size_t body_cap;
-	bool   too_large;
+	str_builder body;
+	bool		too_large;
 
 	oa_req_params params;
 	json_object	 *body_json;
@@ -204,9 +203,9 @@ static char *extract_message_content(json_object *msg) {
 	if (json_object_is_type(c, json_type_array)) {
 		str_builder sb;
 		sb_init(&sb);
-		size_t n = json_object_array_length(c);
-		for (size_t i = 0; i < n; i++) {
-			json_object *part = json_object_array_get_idx(c, i);
+		json_arr_iter it = json_arr_begin(c);
+		json_object	 *part;
+		while (json_arr_next(&it, &part)) {
 			if (!json_object_is_type(part, json_type_object))
 				continue;
 			const char *ts = json_get_str(part, "type", "");
@@ -224,21 +223,49 @@ static const char *parse_stop(json_object *root, oa_req_params *p) {
 	if (!stop)
 		return NULL;
 	if (json_object_is_type(stop, json_type_string)) {
-		p->stop	  = stop;
-		p->n_stop = json_object_get_string_len(stop) ? 1 : 0;
+		p->stop	 = stop;
+		size_t l = (size_t)json_object_get_string_len(stop);
+		if (l == 0)
+			return NULL;
+		p->stop_needles	   = xmalloc(sizeof(*p->stop_needles));
+		p->stop_lens	   = xmalloc(sizeof(*p->stop_lens));
+		p->stop_needles[0] = json_object_get_string(stop);
+		p->stop_lens[0]	   = l;
+		p->stop_max		   = l;
+		p->n_stop		   = 1;
 		return NULL;
 	}
 	if (json_object_is_type(stop, json_type_array)) {
-		p->stop	 = stop;
-		size_t n = json_object_array_length(stop);
-		for (size_t i = 0; i < n; i++) {
-			json_object *item = json_object_array_get_idx(stop, i);
+		p->stop			 = stop;
+		json_arr_iter it = json_arr_begin(stop);
+		json_object	 *item;
+		size_t		  count = 0;
+		while (json_arr_next(&it, &item)) {
 			if (!json_object_is_type(item, json_type_string))
 				continue;
 			if (json_object_get_string_len(item) == 0)
 				continue;
-			p->n_stop++;
+			count++;
 		}
+		if (count == 0)
+			return NULL;
+		p->stop_needles = xmalloc(count * sizeof(*p->stop_needles));
+		p->stop_lens	= xmalloc(count * sizeof(*p->stop_lens));
+		size_t n		= 0;
+		it				= json_arr_begin(stop);
+		while (json_arr_next(&it, &item)) {
+			if (!json_object_is_type(item, json_type_string))
+				continue;
+			size_t l = (size_t)json_object_get_string_len(item);
+			if (l == 0)
+				continue;
+			p->stop_needles[n] = json_object_get_string(item);
+			p->stop_lens[n]	   = l;
+			if (l > p->stop_max)
+				p->stop_max = l;
+			n++;
+		}
+		p->n_stop = n;
 		return NULL;
 	}
 	return "'stop' must be a string or an array of strings";
@@ -277,7 +304,7 @@ static void parse_sampling_params(json_object *root, oa_req_params *p) {
 	parse_stop(root, p);
 }
 
-static uint64_t oa_message_hash(uint64_t h, const oa_message *m) {
+static uint64_t oa_message_hash(uint64_t h, const chat_message *m) {
 	h = fnv1a_update_str(h, m->role);
 	h = fnv1a_update_str(h, "\x1f");
 	h = fnv1a_update_str(h, m->content);
@@ -316,9 +343,9 @@ static const char *parse_tools_array(json_object *root, oa_req_params *p) {
 		return NULL;
 	if (!json_object_is_type(tools, json_type_array))
 		return "'tools' must be an array";
-	size_t n = json_object_array_length(tools);
-	for (size_t i = 0; i < n; i++) {
-		json_object *t	= json_object_array_get_idx(tools, i);
+	json_arr_iter it = json_arr_begin(tools);
+	json_object	 *t;
+	while (json_arr_next(&it, &t)) {
 		json_object *fn = json_get_obj(t, "function");
 		const char	*nm = fn ? json_get_str(fn, "name", "") : "";
 		if (!json_object_is_type(t, json_type_object) || !fn || !*nm)
@@ -397,8 +424,8 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 		if (tcs)
 			p->messages[i].tool_calls = tcs;
 
-		p->messages[i].tool_call_id = json_get_str(m, "tool_call_id", NULL);
-		p->messages[i].name			= json_get_str(m, "name", NULL);
+		p->messages[i].tool_call_id = (char *)json_get_str(m, "tool_call_id", NULL);
+		p->messages[i].name			= (char *)json_get_str(m, "name", NULL);
 	}
 	p->n_messages = n;
 	return NULL;
@@ -442,6 +469,8 @@ static void free_req_params(oa_req_params *p) {
 	free(p->prompt);
 	free(p->tool_choice);
 	free(p->forced_function);
+	free(p->stop_needles);
+	free(p->stop_lens);
 	memset(p, 0, sizeof(*p));
 }
 
@@ -452,14 +481,14 @@ static void rc_ref(req_ctx *rc) {
 static void rc_unref(req_ctx *rc) {
 	if (!rc || atomic_fetch_sub_explicit(&rc->refs, 1, memory_order_acq_rel) != 1)
 		return;
-	free(rc->body);
+	sb_free(&rc->body);
 	json_object_put(rc->body_json);
 	for (size_t i = 0; i < rc->gen.q_len; i++)
-		free(rc->gen.queue[i]);
+		free(rc->gen.queue[i].data);
 	free(rc->gen.queue);
-	free(rc->gen.frame_lens);
 	free(rc->gen.content.p);
 	free(rc->gen.reasoning.p);
+	free(rc->gen.stop_window);
 	toolcall_scanner_free(rc->gen.tsc);
 	pthread_mutex_destroy(&rc->gen.q_mtx);
 	pthread_cond_destroy(&rc->gen.q_cv);
@@ -482,17 +511,13 @@ static void gen_queue_push(oa_gen *g, const char *payload, size_t len) {
 	pthread_mutex_lock(&g->q_mtx);
 	if (!g->client_gone && !shutting_down(g->st)) {
 		ARR_RESERVE(g->queue, g->q_len, g->q_cap);
-		if (g->q_cap && !g->frame_lens)
-			g->frame_lens = xmalloc(g->q_cap * sizeof(*g->frame_lens));
-		else if (g->frame_lens && g->q_len == g->q_cap)
-			g->frame_lens = xrealloc(g->frame_lens, g->q_cap * sizeof(*g->frame_lens));
 		char *frame = xmalloc(6 + len + 2);
 		memcpy(frame, "data: ", 6);
 		memcpy(frame + 6, payload, len);
 		frame[6 + len]			= '\n';
 		frame[6 + len + 1]		= '\n';
-		g->queue[g->q_len]		= frame;
-		g->frame_lens[g->q_len] = len + 8;
+		g->queue[g->q_len].data = frame;
+		g->queue[g->q_len].len	= len + 8;
 		g->q_len++;
 	}
 	pthread_cond_broadcast(&g->q_cv);
@@ -726,26 +751,15 @@ static void check_stop_sequences(oa_gen *g) {
 	if (total == 0)
 		return;
 
-	bool   is_string	= json_object_is_type(g->params->stop, json_type_string);
-	size_t needle_count = is_string ? 1 : json_object_array_length(g->params->stop);
-	size_t max_needle	= 0;
-
-	for (size_t i = 0; i < needle_count; i++) {
-		json_object *item =
-			is_string ? g->params->stop : json_object_array_get_idx(g->params->stop, i);
-		if (!json_object_is_type(item, json_type_string))
-			continue;
-		size_t l = (size_t)json_object_get_string_len(item);
-		if (l > max_needle)
-			max_needle = l;
-	}
+	size_t max_needle = g->params->stop_max;
 	if (max_needle == 0 || total < max_needle)
 		return;
 
 	size_t window_len	= 2 * max_needle - 1;
 	size_t window_start = total > window_len ? total - window_len : 0;
 	size_t wlen			= total - window_start;
-	char  *window		= xmalloc(wlen + 1);
+	ARR_ENSURE(g->stop_window, wlen + 1, g->stop_window_cap);
+	char *window = g->stop_window;
 	if (window_start < rlen) {
 		memcpy(window, g->reasoning.p + window_start, rlen - window_start);
 		memcpy(window + (rlen - window_start), g->content.p, clen);
@@ -754,15 +768,9 @@ static void check_stop_sequences(oa_gen *g) {
 	}
 	window[wlen] = '\0';
 
-	for (size_t i = 0; i < needle_count && !g->stopped_by_stop; i++) {
-		json_object *item =
-			is_string ? g->params->stop : json_object_array_get_idx(g->params->stop, i);
-		if (!json_object_is_type(item, json_type_string))
-			continue;
-		const char *needle = json_object_get_string(item);
-		if (!needle[0])
-			continue;
-		const char *hit = strstr(window, needle);
+	for (size_t i = 0; i < g->params->n_stop && !g->stopped_by_stop; i++) {
+		const char *needle = g->params->stop_needles[i];
+		const char *hit	   = strstr(window, needle);
 		if (!hit)
 			continue;
 
@@ -779,7 +787,6 @@ static void check_stop_sequences(oa_gen *g) {
 		if (g->content.p)
 			g->content.p[g->content.len] = '\0';
 	}
-	free(window);
 }
 
 static void tool_on_content(void *ud, const char *piece, size_t n) {
@@ -901,18 +908,6 @@ static void sse_finish_stream(oa_gen *g) {
 	gen_queue_done(g);
 }
 
-static chat_message oa_message_to_view(const oa_message *m) {
-	chat_message cm = {
-		.role			   = m->role,
-		.content		   = m->content,
-		.reasoning_content = m->reasoning_content,
-		.tool_calls		   = m->tool_calls,
-		.tool_call_id	   = (char *)m->tool_call_id,
-		.name			   = (char *)m->name,
-	};
-	return cm;
-}
-
 static void run_generation(req_ctx *rc, bool chat_api) {
 	openai_state *st = rc->st;
 	oa_gen		 *g	 = &rc->gen;
@@ -965,14 +960,12 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 
 			size_t start = c->chat.n_messages;
 			for (size_t i = start; i + 1 < rc->params.n_messages; i++) {
-				chat_message cm = oa_message_to_view(&rc->params.messages[i]);
-				chat_template_add_message_ex(&c->chat, &cm);
+				chat_template_add_message_ex(&c->chat, &rc->params.messages[i]);
 			}
 			{
-				chat_message cm =
-					oa_message_to_view(&rc->params.messages[rc->params.n_messages - 1]);
-				g->generated = context_chat_turn_msg(c, &cm, true, rc->params.max_tokens, &sp,
-													 gen_on_token, g, "");
+				g->generated =
+					context_chat_turn_msg(c, &rc->params.messages[rc->params.n_messages - 1], true,
+										  rc->params.max_tokens, &sp, gen_on_token, g, "");
 			}
 
 			if (g->tsc)
@@ -1014,15 +1007,14 @@ static ssize_t sse_read_cb(void *cls, uint64_t pos, char *buf, size_t max) {
 
 	ssize_t out;
 	if (g->q_len > 0) {
-		char  *f	  = g->queue[0];
-		size_t remain = g->frame_lens[0] - g->q_off;
+		char  *f	  = g->queue[0].data;
+		size_t remain = g->queue[0].len - g->q_off;
 		size_t n	  = remain < max ? remain : max;
 		memcpy(buf, f + g->q_off, n);
 		g->q_off += n;
-		if (g->q_off == g->frame_lens[0]) {
+		if (g->q_off == g->queue[0].len) {
 			free(f);
 			memmove(g->queue, g->queue + 1, (g->q_len - 1) * sizeof(*g->queue));
-			memmove(g->frame_lens, g->frame_lens + 1, (g->q_len - 1) * sizeof(*g->frame_lens));
 			g->q_len--;
 			g->q_off = 0;
 		}
@@ -1076,10 +1068,10 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
 							error_body("Invalid API key", "authentication_error"));
 
-	DEBUG("request body [%s] (%zu bytes): %.4096s", url, rc->body_len,
-		  rc->body ? rc->body : "(empty)");
+	DEBUG("request body [%s] (%zu bytes): %.4096s", url, rc->body.len,
+		  rc->body.p ? rc->body.p : "(empty)");
 
-	json_object *body = json_tokener_parse(rc->body ? rc->body : "");
+	json_object *body = json_tokener_parse(rc->body.p ? rc->body.p : "");
 	if (!body)
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST,
 							error_body("Invalid JSON in request body", "invalid_request_error"));
@@ -1243,18 +1235,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 	req_ctx *rc = *(req_ctx **)con_cls;
 
 	if (*upload_data_size > 0) {
-		if (rc->body_len + *upload_data_size > MAX_BODY_BYTES) {
+		if (rc->body.len + *upload_data_size > MAX_BODY_BYTES) {
 			rc->too_large = true;
 		} else {
-			if (rc->body_len + *upload_data_size + 1 > rc->body_cap) {
-				size_t need	 = rc->body_len + *upload_data_size + 1;
-				size_t want	 = need * 2 > MAX_BODY_BYTES + 1 ? MAX_BODY_BYTES + 1 : need * 2;
-				rc->body_cap = want > need ? want : need;
-				rc->body	 = xrealloc(rc->body, rc->body_cap);
-			}
-			memcpy(rc->body + rc->body_len, upload_data, *upload_data_size);
-			rc->body_len += *upload_data_size;
-			rc->body[rc->body_len] = '\0';
+			sb_putb(&rc->body, upload_data, *upload_data_size);
 		}
 		*upload_data_size = 0;
 		return MHD_YES;
@@ -1283,9 +1267,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 
 	char msgbuf[192];
 	snprintf(msgbuf, sizeof(msgbuf), "Unknown endpoint: %s %s", method, url);
-	json_object *root = json_object_new_object();
-	json_object_object_add(root, "error", error_body(msgbuf, "invalid_request_error"));
-	return respond_json(conn, MHD_HTTP_NOT_FOUND, root);
+	return respond_json(conn, MHD_HTTP_NOT_FOUND, error_body(msgbuf, "invalid_request_error"));
 }
 
 openai_state *openai_init(context *ctx, const cli_args *args) {

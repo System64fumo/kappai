@@ -419,11 +419,6 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 	if (n_items <= 0)
 		return;
 
-	if (getenv("HYB_SERIAL")) {
-		fn(0, n_items, 0, ctx);
-		return;
-	}
-
 	int n_threads = pool ? pool->n_threads : 1;
 	if (min_items_per_thread < 1)
 		min_items_per_thread = 1;

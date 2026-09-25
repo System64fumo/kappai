@@ -21,7 +21,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MOE_DIRECT_IO_FALLBACK_ALIGN 4096
 #define MOE_CHUNK_TARGET_BYTES (8 * 1024 * 1024)
 
 #define PIN_COPY_MAX_WORKERS 8
@@ -208,36 +207,12 @@ static void moe_direct_io_probe(moe_stream_cache *c) {
 	if (fd < 0)
 		return;
 
-	int flags = fcntl(fd, F_GETFL);
-	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
-		close(fd);
-		DEBUG("moe direct-io: O_DIRECT unsupported, using buffered reads");
+	size_t align = 0;
+	if (direct_io_probe_fd(fd, "moe direct-io", 0, 1, &align) != OK)
 		return;
-	}
-
-	long		blk = MOE_DIRECT_IO_FALLBACK_ALIGN;
-	struct stat st;
-	if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-		blk = st.st_blksize;
-
-	size_t align = (size_t)blk;
-	void  *probe_buf;
-	if (posix_memalign(&probe_buf, align, align) != 0) {
-		close(fd);
-		return;
-	}
-	ssize_t rc = pread(fd, probe_buf, align, 0);
-	free(probe_buf);
-	if (rc < 0) {
-		close(fd);
-		DEBUG("moe direct-io: O_DIRECT probe failed (%s), using buffered reads", strerror(errno));
-		return;
-	}
 
 	c->direct_io_fd	   = fd;
 	c->direct_io_align = align;
-	posix_fadvise(c->direct_io_fd, 0, 0, POSIX_FADV_RANDOM);
-	DEBUG("moe direct-io: enabled (align=%zu)", align);
 }
 
 static void moe_direct_io_close(moe_stream_cache *c) {
@@ -272,30 +247,12 @@ static void moe_nomap_open(moe_stream_cache *c, const char *path) {
 		return;
 	}
 
-	long		blk = MOE_DIRECT_IO_FALLBACK_ALIGN;
-	struct stat st;
-	if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-		blk = st.st_blksize;
-	size_t align = (size_t)blk;
-
-	void *probe_buf;
-	if (posix_memalign(&probe_buf, align, align) != 0) {
-		close(fd);
-		DEBUG("moe no-mmap: O_DIRECT probe alloc failed, using buffered reads");
+	size_t align = 0;
+	if (direct_io_probe_fd(fd, "moe no-mmap", 0, 1, &align) != OK)
 		return;
-	}
-	ssize_t rc = pread(fd, probe_buf, align, 0);
-	free(probe_buf);
-	if (rc < 0) {
-		close(fd);
-		DEBUG("moe no-mmap: O_DIRECT probe failed (%s), using buffered reads", strerror(errno));
-		return;
-	}
 
 	c->nomap_direct_fd	  = fd;
 	c->nomap_direct_align = align;
-	posix_fadvise(c->nomap_direct_fd, 0, 0, POSIX_FADV_RANDOM);
-	DEBUG("moe no-mmap: O_DIRECT enabled (align=%zu)", align);
 }
 
 static void moe_nomap_close(moe_stream_cache *c) {
@@ -919,11 +876,7 @@ status_code moe_stream_cache_init(struct model *m) {
 			uint64_t t0 = time_us();
 
 			if (g_monitor && g_monitor->fd >= 0) {
-				monitor_send(g_monitor,
-							 "{\"type\":\"load\",\"phase\":\"pin_copy_start\","
-							 "\"n_experts\":%d,\"n_workers\":%d}",
-							 n_total, nw);
-				monitor_poll(g_monitor);
+				monitor_emit_load_pin_copy_start(g_monitor, n_total, nw);
 			}
 
 			pthread_t th[PIN_COPY_MAX_WORKERS];
@@ -951,11 +904,7 @@ status_code moe_stream_cache_init(struct model *m) {
 				 mbps);
 
 			if (g_monitor && g_monitor->fd >= 0) {
-				monitor_send(g_monitor,
-							 "{\"type\":\"load\",\"phase\":\"pin_copy_done\","
-							 "\"n_experts\":%d,\"mb\":%.1f,\"ms\":%llu}",
-							 n_copied, mb, (unsigned long long)(elapsed_us / 1000));
-				monitor_poll(g_monitor);
+				monitor_emit_load_pin_copy_done(g_monitor, n_copied, mb, elapsed_us / 1000);
 			}
 
 			free((void *)slots);
@@ -1289,6 +1238,18 @@ static void slot_take_ready(moe_expert_slot *out, moe_expert_slot *s) {
 	atomic_store_explicit(&out->io_ready, 1, memory_order_release);
 }
 
+static int layer_take_ready_stats(moe_stream_cache *c, moe_expert_slot *s, moe_expert_slot *dst) {
+	if (!s || !atomic_load_explicit(&s->io_ready, memory_order_acquire))
+		return 0;
+	slot_take_ready(dst, s);
+	atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
+	if (s->pinned)
+		atomic_fetch_add_explicit(&c->stat_pin_hits, 1, memory_order_relaxed);
+	else
+		atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+	return 1;
+}
+
 static void miss_fill_desc(moe_miss_entry *me, int k, int eid, void *freed_buf, size_t freed_size,
 						   const struct expert_desc *desc) {
 	moe_expert_slot tmp;
@@ -1458,22 +1419,13 @@ static void resolve_scan_hits(moe_stream_cache *c, struct moe_stream_layer *L, s
 		}
 		moe_expert_slot *s = layer_find(L, eid, now);
 		if (s) {
-			int ready = atomic_load_explicit(&s->io_ready, memory_order_acquire);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			if (s->pinned)
-				atomic_fetch_add_explicit(&c->stat_pin_hits, 1, memory_order_relaxed);
-			else
-				atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
-			if (ready) {
-				slot_take_ready(&out_slots[k], s);
+			if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			} else if (sync_wait_not_ready) {
 				pthread_mutex_unlock(&L->mtx);
 				moe_stream_wait_slot(s);
 				pthread_mutex_lock(&L->mtx);
 				s = layer_find(L, eid, now);
-				if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire))
-					slot_take_ready(&out_slots[k], s);
-				else
+				if (!layer_take_ready_stats(c, s, &out_slots[k]))
 					slot_mark_invalid(&out_slots[k]);
 			} else {
 				slot_zero(&out_slots[k]);
@@ -1503,10 +1455,8 @@ static void resolve_collect_misses(moe_stream_cache *c, struct moe_stream_layer 
 			continue;
 		}
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
+		if (layer_take_ready_stats(c, s, &out_slots[k]))
 			continue;
-		}
 		if (s) {
 			if (wait_needed) {
 				wait_needed[(*n_wait_needed)++] = k;
@@ -1532,9 +1482,7 @@ static void resolve_collect_misses(moe_stream_cache *c, struct moe_stream_layer 
 			moe_stream_wait_slot(s);
 			pthread_mutex_lock(&L->mtx);
 			s = layer_find(L, eid, now);
-			if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire))
-				slot_take_ready(&out_slots[k], s);
-			else
+			if (!layer_take_ready_stats(c, s, &out_slots[k]))
 				slot_mark_invalid(&out_slots[k]);
 			continue;
 		}
@@ -1605,10 +1553,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+		if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			pthread_mutex_unlock(&L->mtx);
 			continue;
 		}
@@ -1709,10 +1654,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+		if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			pthread_mutex_unlock(&L->mtx);
 			continue;
 		}
@@ -1724,11 +1666,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
-		} else {
+		if (!layer_take_ready_stats(c, s, &out_slots[k])) {
 			slot_mark_invalid(&out_slots[k]);
 			if (rc == OK)
 				rc = ERR_IO;
@@ -1751,11 +1689,8 @@ static void moe_stream_op_finalize_miss(moe_stream_op *op, int mi) {
 	if (me->dep >= 0) {
 		pthread_mutex_lock(&op->slayer->mtx);
 		moe_expert_slot *s = layer_find(op->slayer, me->eid, op->now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(out_slot, s);
-		} else {
+		if (!layer_take_ready_stats(op->cache, s, out_slot))
 			slot_mark_invalid(out_slot);
-		}
 		pthread_mutex_unlock(&op->slayer->mtx);
 		return;
 	}

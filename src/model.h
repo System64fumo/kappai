@@ -155,6 +155,11 @@ typedef struct model_hybrid_params {
 	uint8_t *recurrent_layers;
 } model_hybrid_params;
 
+typedef struct model_tensor_slot {
+	const void *data;
+	size_t		tensor_idx;
+} model_tensor_slot;
+
 typedef struct model {
 	const arch_info			*arch_info;
 	const float				*rope_freqs;
@@ -169,6 +174,8 @@ typedef struct model {
 	model_recipe			*recipe;
 	weight_ref			   **wrefs_by_layer;
 	backend				   **layer_backends;
+	model_tensor_slot		*tensor_data_order;
+	size_t					 tensor_data_order_n;
 
 	model_layer_dims_params layer_dims;
 	model_hybrid_params		hybrid;
@@ -182,7 +189,6 @@ typedef struct model {
 	float	   dim_sqrt;
 	int32_t	   intermediate, vocab_size, rope_dim;
 	float	   norm_eps, rope_theta;
-	float	   attn_logit_softcap;
 	float	   final_logit_softcap;
 	int32_t	   sliding_window;
 	int32_t	   rope_freqs_count;

@@ -931,9 +931,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 												 c->n_ctx - c->fed_ids.n, &c->scratch.prof);
 		if (suf < 0) {
 			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
-			free(c->chat.last_render);
-			c->chat.last_render = prev_render;
-			return ERR_INVALID_ARG;
+			goto restore_fail;
 		}
 		n	  = c->fed_ids.n + suf;
 		reuse = c->fed_ids.n;
@@ -945,9 +943,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 										   &c->scratch.prof);
 		if (n < 0) {
 			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
-			free(c->chat.last_render);
-			c->chat.last_render = prev_render;
-			return ERR_INVALID_ARG;
+			goto restore_fail;
 		}
 
 		int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
@@ -1061,6 +1057,11 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	free(prev_render);
 	free(acap.buf);
 	return generated;
+
+restore_fail:
+	free(c->chat.last_render);
+	c->chat.last_render = prev_render;
+	return ERR_INVALID_ARG;
 }
 
 int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,

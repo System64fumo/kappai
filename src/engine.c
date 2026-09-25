@@ -119,41 +119,38 @@ static status_code warmup_run(context *c, const char *system) {
 		return OK;
 	}
 
-	int		 cap = c->n_ctx;
-	int32_t *ids = context_ids_scratch(c, cap + 1);
-	int		 n	 = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
-	if (n < 0) {
-		free(render);
+	status_code ret = OK;
+	int			cap = c->n_ctx;
+	int32_t	   *ids = context_ids_scratch(c, cap + 1);
+	int			n = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
+	int			count = 0;
+	if (n >= 0)
+		count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
+	if (n < 0 || count == 0)
 		goto restore;
-	}
-
-	int count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
-	if (count == 0) {
-		free(render);
-		goto restore;
-	}
 
 	context_monitor_send_start(c);
 	prefill_result pf = context_prefill_tokens(c, ids, count, "warmup", true);
 	if (pf.rc < 0) {
-		free(render);
-		free(prev_render);
 		c->session_poisoned = true;
-		return ERR_INTERNAL;
+		ret					= ERR_INTERNAL;
+		goto out;
 	}
 
 	c->warmup_done = true;
 
 	DEBUG("warmup: prefilled %d tokens", count);
-
-	free(render);
-	free(prev_render);
-	return OK;
+	goto out;
 
 restore:
 	free(c->chat.last_render);
 	c->chat.last_render = prev_render;
-	return OK;
+	prev_render			= NULL;
+
+out:
+	free(render);
+	free(prev_render);
+	return ret;
 }
 
 static int run_chat_turn(context *c, cli_args *a, const char *text) {
@@ -349,7 +346,7 @@ int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 
 	config cfg;
 	if (parse_args(argc, argv, &cfg, a) < 0) {
-		usage(stderr, a->is_server);
+		config_usage(stderr, a->is_server);
 		return ERR_INVALID_ARG;
 	}
 

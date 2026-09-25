@@ -1,9 +1,7 @@
 #include "test_core.h"
 #include "test_synth_gguf.h"
 
-#define usage kappai_config_usage_shim
 #include "config.h"
-#undef usage
 
 #include <stdio.h>
 #include <stdlib.h>

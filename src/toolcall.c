@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "toolcall.h"
 
 #include "json_helpers.h"
@@ -26,41 +27,29 @@ struct toolcall_scanner {
 	bool		 suppressed;
 	toolcall_buf buf;
 	size_t		 scan_pos;
+	size_t		 close_scan;
+	size_t		 auto_stop_end;
+	bool		 auto_stop_found;
+	size_t		 auto_dead_i;
+	size_t		 auto_dead_n;
+	bool		 force_json_attempt;
 	size_t		 n_calls;
 	json_object *calls;
 };
-
-static size_t partial_marker_len(const char *s, size_t len, const char *marker) {
-	if (!marker)
-		return 0;
-	size_t mlen = strlen(marker);
-	if (mlen <= 1)
-		return 0;
-	size_t max = len < mlen - 1 ? len : mlen - 1;
-	for (size_t k = max; k > 0; k--)
-		if (memcmp(s + len - k, marker, k) == 0)
-			return k;
-	return 0;
-}
 
 static long find_marker(const char *s, size_t len, size_t from, const char *marker) {
 	if (!marker || !marker[0])
 		return -1;
 	size_t mlen = strlen(marker);
-	if (len < mlen)
+	if (len < mlen || from > len - mlen)
 		return -1;
-	size_t last = len - mlen;
-	if (from > last)
-		return -1;
-	for (size_t i = from; i <= last; i++)
-		if (s[i] == marker[0] && memcmp(s + i, marker, mlen) == 0)
-			return (long)i;
-	return -1;
+	const char *hit = memmem(s + from, len - from, marker, mlen);
+	return hit ? (long)(hit - s) : -1;
 }
 
 static size_t partial_open_hold(const char *s, size_t len, const marker_pair *fmt) {
-	size_t h1 = partial_marker_len(s, len, fmt->open);
-	size_t h2 = fmt->stop ? partial_marker_len(s, len, fmt->stop) : 0;
+	size_t h1 = marker_tail_len(s, len, fmt->open);
+	size_t h2 = fmt->stop ? marker_tail_len(s, len, fmt->stop) : 0;
 	return h1 > h2 ? h1 : h2;
 }
 
@@ -108,6 +97,24 @@ static json_object *cc_string(cc_lex *s) {
 	return json_object_new_string_len(start, (int)(hit - start));
 }
 
+static json_object *parse_scalar_number(const char *s, size_t len) {
+	char buf[64];
+	if (len == 0 || len >= sizeof(buf))
+		return NULL;
+	memcpy(buf, s, len);
+	buf[len]  = '\0';
+	char *end = NULL;
+	if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')) {
+		long long v = strtoll(buf, &end, 10);
+		if (end && *end == '\0' && end != buf)
+			return json_object_new_int64(v);
+	}
+	double d = strtod(buf, &end);
+	if (end && *end == '\0' && end != buf)
+		return json_object_new_double(d);
+	return NULL;
+}
+
 static json_object *cc_number(cc_lex *s) {
 	size_t start = s->pos;
 	while (s->pos < s->len) {
@@ -120,23 +127,7 @@ static json_object *cc_number(cc_lex *s) {
 	}
 	if (s->pos == start)
 		return NULL;
-	char   buf[64];
-	size_t n = s->pos - start;
-	if (n >= sizeof(buf))
-		return NULL;
-	memcpy(buf, s->p + start, n);
-	buf[n]	  = '\0';
-	char *end = NULL;
-	if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')) {
-		long long v = strtoll(buf, &end, 10);
-		if (end && *end == '\0' && end != buf)
-			return json_object_new_int64(v);
-		return NULL;
-	}
-	double d = strtod(buf, &end);
-	if (end && *end == '\0' && end != buf)
-		return json_object_new_double(d);
-	return NULL;
+	return parse_scalar_number(s->p + start, s->pos - start);
 }
 
 static int cc_value(cc_lex *s, int depth, json_object **out);
@@ -168,9 +159,7 @@ static int cc_dict(cc_lex *s, int depth, json_object **out) {
 		json_object *val = NULL;
 		if (!cc_value(s, depth + 1, &val))
 			goto fail;
-		char *key = xmalloc(kend - kstart + 1);
-		memcpy(key, s->p + kstart, kend - kstart);
-		key[kend - kstart] = '\0';
+		char *key = xstrndup(s->p + kstart, kend - kstart);
 		json_object_object_add(dict, key, val);
 		free(key);
 		cc_ws(s);
@@ -275,10 +264,8 @@ static int payload_callcolon(const char *p, size_t len, size_t pos, char **name_
 	cc_ws(&s);
 	if (s.pos >= s.len || s.p[s.pos] != '{' || nend == nstart)
 		return 0;
-	char *name = xmalloc(nend - nstart + 1);
-	memcpy(name, p + nstart, nend - nstart);
-	name[nend - nstart] = '\0';
-	json_object *args	= NULL;
+	char		*name = xstrndup(p + nstart, nend - nstart);
+	json_object *args = NULL;
 	if (!cc_dict(&s, 0, &args)) {
 		free(name);
 		return 0;
@@ -290,18 +277,7 @@ static int payload_callcolon(const char *p, size_t len, size_t pos, char **name_
 }
 
 static json_object *json_slice(const char *s, size_t len, size_t *used) {
-	if (len > (size_t)INT_MAX)
-		return NULL;
-	json_tokener *tk  = json_tokener_new();
-	json_object	 *obj = json_tokener_parse_ex(tk, s, (int)len);
-	if (json_tokener_get_error(tk) != json_tokener_success) {
-		json_tokener_free(tk);
-		return NULL;
-	}
-	if (used)
-		*used = (size_t)json_tokener_get_parse_end(tk);
-	json_tokener_free(tk);
-	return obj;
+	return json_parse_len_ex(s, len, used, NULL);
 }
 
 static json_object *json_args_of(json_object *obj) {
@@ -371,11 +347,9 @@ static int payload_auto(const char *p, size_t len, size_t pos, char **name_out,
 		json_object_put(obj);
 		return 0;
 	}
-	char *name = xmalloc(nend - nstart + 1);
-	memcpy(name, p + nstart, nend - nstart);
-	name[nend - nstart] = '\0';
-	*name_out			= name;
-	*args_out			= json_obj_as_args(obj);
+	char *name = xstrndup(p + nstart, nend - nstart);
+	*name_out  = name;
+	*args_out  = json_obj_as_args(obj);
 	json_object_put(obj);
 	*end_out = pos + used;
 	return 1;
@@ -417,23 +391,10 @@ static int parse_funcarg_value(const char *s, size_t len, json_object **out) {
 		}
 	}
 	{
-		char buf[64];
-		if (len < sizeof(buf)) {
-			memcpy(buf, s, len);
-			buf[len]  = '\0';
-			char *end = NULL;
-			if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')) {
-				long long v = strtoll(buf, &end, 10);
-				if (end && *end == '\0') {
-					*out = json_object_new_int64(v);
-					return 1;
-				}
-			}
-			double d = strtod(buf, &end);
-			if (end && *end == '\0') {
-				*out = json_object_new_double(d);
-				return 1;
-			}
+		json_object *num = parse_scalar_number(s, len);
+		if (num) {
+			*out = num;
+			return 1;
 		}
 	}
 	return 0;
@@ -460,9 +421,7 @@ static int payload_funcargs(const char *p, size_t len, size_t pos, char **name_o
 	if (nend == nstart)
 		return 0;
 	pos++;
-	char *name = xmalloc(nend - nstart + 1);
-	memcpy(name, p + nstart, nend - nstart);
-	name[nend - nstart] = '\0';
+	char		*name	= xstrndup(p + nstart, nend - nstart);
 	json_object *args	= json_object_new_object();
 	size_t		 depth	= 0;
 	size_t		 vstart = pos;
@@ -487,14 +446,13 @@ static int payload_funcargs(const char *p, size_t len, size_t pos, char **name_o
 		}
 		if (depth == 0 && ch == '=') {
 			size_t klen = pos - vstart;
+			while (vstart < pos && isspace((unsigned char)p[vstart])) {
+				vstart++;
+				klen--;
+			}
 			while (klen > 0 && isspace((unsigned char)p[vstart + klen - 1]))
 				klen--;
-			while (vstart < pos && isspace((unsigned char)p[vstart]))
-				vstart++;
-			klen = pos - vstart;
-			key	 = xmalloc(klen + 1);
-			memcpy(key, p + vstart, klen);
-			key[klen] = '\0';
+			key = xstrndup(p + vstart, klen);
 			pos++;
 			vstart = pos;
 			while (pos < len) {
@@ -549,9 +507,7 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 		nstart++;
 	if (nend == nstart)
 		return 0;
-	char *name = xmalloc(nend - nstart + 1);
-	memcpy(name, p + nstart, nend - nstart);
-	name[nend - nstart] = '\0';
+	char *name = xstrndup(p + nstart, nend - nstart);
 	pos++;
 	json_object *args = json_object_new_object();
 	while (pos < len) {
@@ -591,10 +547,8 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 			pos++;
 			if (kend == kstart)
 				continue;
-			char *key = xmalloc(kend - kstart + 1);
-			memcpy(key, p + kstart, kend - kstart);
-			key[kend - kstart] = '\0';
-			size_t vstart	   = pos;
+			char  *key	  = xstrndup(p + kstart, kend - kstart);
+			size_t vstart = pos;
 			char   close_buf[256];
 			snprintf(close_buf, sizeof(close_buf), "</%s>", tag);
 			size_t clen = strlen(close_buf);
@@ -609,27 +563,14 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 				free(key);
 				break;
 			}
-			const char *vptr = p + vstart;
-			size_t		vraw = vlen;
-			while (vraw > 0 && isspace((unsigned char)*vptr)) {
-				vptr++;
-				vraw--;
-			}
-			while (vraw > 0 && isspace((unsigned char)vptr[vraw - 1]))
-				vraw--;
+			str_span	 vs	 = span_trim(p + vstart, vlen);
 			json_object *val = NULL;
-			if (vraw > 0 && (vptr[0] == '{' || vptr[0] == '[')) {
-				json_tokener *tk	 = json_tokener_new();
-				json_object	 *parsed = json_tokener_parse_ex(tk, vptr, (int)vraw);
-				if (json_tokener_get_error(tk) == json_tokener_success && parsed) {
-					val = parsed;
-				} else if (parsed) {
-					json_object_put(parsed);
-				}
-				json_tokener_free(tk);
+			if (vs.len > 0 && (vs.p[0] == '{' || vs.p[0] == '[')) {
+				const char *perr;
+				val = json_parse_len(vs.p, vs.len, &perr);
 			}
 			if (!val)
-				val = json_object_new_string_len(vptr, (int)vraw);
+				val = json_object_new_string_len(vs.p, (int)vs.len);
 			json_object_object_add(args, key, val);
 			free(key);
 			pos += clen;
@@ -659,9 +600,7 @@ static int payload_xmlargs(const char *p, size_t len, size_t pos, char **name_ou
 		nstart++;
 	if (nend == nstart)
 		return 0;
-	char *name = xmalloc(nend - nstart + 1);
-	memcpy(name, p + nstart, nend - nstart);
-	name[nend - nstart] = '\0';
+	char *name = xstrndup(p + nstart, nend - nstart);
 
 	json_object *args = json_object_new_object();
 	for (;;) {
@@ -671,10 +610,8 @@ static int payload_xmlargs(const char *p, size_t len, size_t pos, char **name_ou
 			long   kend	  = find_marker(p, len, pos, "</arg_key>");
 			if (kend < 0)
 				break;
-			char *key = xmalloc((size_t)kend - kstart + 1);
-			memcpy(key, p + kstart, (size_t)kend - kstart);
-			key[(size_t)kend - kstart] = '\0';
-			pos						   = (size_t)kend + strlen("</arg_key>");
+			char *key = xstrndup(p + kstart, (size_t)kend - kstart);
+			pos		  = (size_t)kend + strlen("</arg_key>");
 
 			if (pos + 11 > len || memcmp(p + pos, "<arg_value>", 11) != 0) {
 				free(key);
@@ -690,13 +627,8 @@ static int payload_xmlargs(const char *p, size_t len, size_t pos, char **name_ou
 			size_t		 vraw = (size_t)vend - vstart;
 			json_object *val  = NULL;
 			if (vraw > 0 && (p[vstart] == '{' || p[vstart] == '[')) {
-				json_tokener *tk	 = json_tokener_new();
-				json_object	 *parsed = json_tokener_parse_ex(tk, p + vstart, (int)vraw);
-				if (json_tokener_get_error(tk) == json_tokener_success && parsed)
-					val = parsed;
-				else if (parsed)
-					json_object_put(parsed);
-				json_tokener_free(tk);
+				const char *perr;
+				val = json_parse_len(p + vstart, vraw, &perr);
 			}
 			if (!val)
 				val = json_object_new_string_len(p + vstart, (int)vraw);
@@ -800,13 +732,43 @@ static void advance(toolcall_scanner *sc) {
 				sc->scan_pos = c->len;
 				return;
 			}
-			long   k_stop	  = fmt->stop ? find_marker(c->p, c->len, sc->scan_pos, fmt->stop) : -1;
-			size_t search_end = k_stop >= 0 ? (size_t)k_stop : c->len;
+			long   k_stop;
+			size_t slen = fmt->stop ? strlen(fmt->stop) : 0;
+			if (slen > 0 && !sc->auto_stop_found && sc->auto_stop_end >= sc->scan_pos &&
+				sc->auto_stop_end <= c->len) {
+				size_t resume = sc->auto_stop_end > slen - 1 ? sc->auto_stop_end - (slen - 1) : 0;
+				size_t from	  = resume > sc->scan_pos ? resume : sc->scan_pos;
+				k_stop		  = find_marker(c->p, c->len, from, fmt->stop);
+			} else {
+				k_stop = fmt->stop ? find_marker(c->p, c->len, sc->scan_pos, fmt->stop) : -1;
+			}
+			sc->auto_stop_end	= c->len;
+			sc->auto_stop_found = k_stop >= 0;
+			size_t search_end	= k_stop >= 0 ? (size_t)k_stop : c->len;
+			size_t tail			= c->len;
+			while (tail > sc->scan_pos && isspace((unsigned char)c->p[tail - 1]))
+				tail--;
+			bool tail_closable =
+				sc->force_json_attempt || (tail > sc->scan_pos && c->p[tail - 1] == '}');
 			for (size_t i = sc->scan_pos; i < search_end; i++) {
 				if (c->p[i] != '{')
 					continue;
-				size_t		 used = 0;
-				json_object *obj  = json_slice(c->p + i, c->len - i, &used);
+				if (!tail_closable) {
+					emit_content(sc, sc->scan_pos, i);
+					sc->scan_pos = i;
+					return;
+				}
+				size_t		 avail = c->len - i;
+				size_t		 used  = 0;
+				json_object *obj   = NULL;
+				if (i != sc->auto_dead_i || avail > sc->auto_dead_n) {
+					enum json_tokener_error perr = json_tokener_success;
+					obj = json_parse_len_ex_code(c->p + i, avail, &used, &perr);
+					if (!obj && perr != json_tokener_continue) {
+						sc->auto_dead_i = i;
+						sc->auto_dead_n = avail;
+					}
+				}
 				if (!obj) {
 					emit_content(sc, sc->scan_pos, i);
 					sc->scan_pos = i;
@@ -886,8 +848,9 @@ static void advance(toolcall_scanner *sc) {
 				c->len = (size_t)k;
 				if (c->p)
 					c->p[c->len] = '\0';
-				sc->in_call	 = true;
-				sc->scan_pos = 0;
+				sc->in_call	   = true;
+				sc->close_scan = 0;
+				sc->scan_pos   = 0;
 				continue;
 			}
 			size_t hold		= partial_open_hold(c->p, c->len, fmt);
@@ -900,9 +863,13 @@ static void advance(toolcall_scanner *sc) {
 		} else {
 			if (!fmt->close)
 				return;
-			long k = find_marker(sc->buf.p, sc->buf.len, 0, fmt->close);
-			if (k < 0)
+			long k = find_marker(sc->buf.p, sc->buf.len, sc->close_scan, fmt->close);
+			if (k < 0) {
+				size_t mlen	   = strlen(fmt->close);
+				size_t keep	   = mlen > 0 ? mlen - 1 : 0;
+				sc->close_scan = sc->buf.len > keep ? sc->buf.len - keep : 0;
 				return;
+			}
 			size_t total		= (size_t)k + strlen(fmt->close);
 			size_t buf_consumed = 0;
 			bool   any_ok		= false;
@@ -943,8 +910,9 @@ static void advance(toolcall_scanner *sc) {
 			sc->buf.len -= total;
 			if (sc->buf.p)
 				sc->buf.p[sc->buf.len] = '\0';
-			sc->in_call	 = false;
-			sc->scan_pos = sc->content ? sc->content->len : 0;
+			sc->in_call	   = false;
+			sc->close_scan = 0;
+			sc->scan_pos   = sc->content ? sc->content->len : 0;
 			if (sc->buf.len > 0 && sc->content) {
 				toolcall_buf_append(sc->content, sc->buf.p, sc->buf.len);
 				toolcall_buf_reset(&sc->buf);
@@ -1004,6 +972,11 @@ void toolcall_scanner_finish(toolcall_scanner *sc) {
 	}
 	if (!sc->in_call && sc->content) {
 		toolcall_scanner_sync(sc);
+		if (!sc->fmt->open[0] && sc->scan_pos < sc->content->len) {
+			sc->force_json_attempt = true;
+			advance(sc);
+			sc->force_json_attempt = false;
+		}
 		if (sc->content->len > sc->scan_pos) {
 			emit_content(sc, sc->scan_pos, sc->content->len);
 			sc->scan_pos = sc->content->len;

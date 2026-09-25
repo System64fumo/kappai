@@ -534,7 +534,7 @@ static status_code vk_suballoc_place(vk_priv *p, VkBuffer buf, const VkMemoryReq
 		return ERR_OUT_OF_MEMORY;
 
 	for (int i = 0; i < blk->n_ranges; i++) {
-		VkDeviceSize aligned = (blk->ranges[i].off + req->alignment - 1) & ~(req->alignment - 1);
+		VkDeviceSize aligned = ALIGN_UP(blk->ranges[i].off, (VkDeviceSize)req->alignment);
 		VkDeviceSize slack	 = aligned - blk->ranges[i].off;
 		if (slack >= blk->ranges[i].size)
 			continue;
@@ -1320,12 +1320,10 @@ static void vk_dirty_remove(vk_priv *p, VkBuffer buf) {
 }
 
 static inline uint64_t vk_desc_hash(const VkBuffer *bufs, const VkDeviceSize *offs, int n_bufs) {
-	uint64_t h = 1469598103934665603ULL;
+	uint64_t h = FNV1A_OFFSET_BASIS;
 	for (int i = 0; i < n_bufs; i++) {
-		h ^= (uint64_t)bufs[i];
-		h *= 1099511628211ULL;
-		h ^= (uint64_t)offs[i];
-		h *= 1099511628211ULL;
+		h = fnv1a_update(h, (const char *)&bufs[i], sizeof(bufs[i]));
+		h = fnv1a_update(h, (const char *)&offs[i], sizeof(offs[i]));
 	}
 	return h;
 }
@@ -2944,10 +2942,6 @@ static status_code vk_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 	return vk_add_inplace(self, out, &y_v, dim);
 }
 
-static size_t vk_meta_align(size_t v, size_t a) {
-	return (v + a - 1) & ~(a - 1);
-}
-
 static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer *out, int n_rows,
 										int dim, int inter, int use_gelu, int n_experts,
 										const moe_resident_expert *experts, const int *counts,
@@ -2968,7 +2962,7 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 
 	size_t meta_need = 0;
 	for (int i = 0; i < n_experts; i++)
-		meta_need += vk_meta_align((size_t)counts[i] * 4, align) * 2;
+		meta_need += ALIGN_UP((size_t)counts[i] * 4, align) * 2;
 	if (meta_need == 0)
 		return ERR_INVALID_ARG;
 	if (!p->moe_meta_slots[0].buf || p->moe_meta_cap < meta_need) {
@@ -3009,10 +3003,10 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 	size_t batch_bytes = 0;
 	for (int i = 0; i < n_experts; i++) {
 		size_t cnt = (size_t)counts[i];
-		batch_bytes += vk_meta_align(cnt * dim * 4, align);
-		batch_bytes += vk_meta_align(cnt * 2 * inter * 4, align);
-		batch_bytes += vk_meta_align(cnt * inter * 4, align);
-		batch_bytes += vk_meta_align(cnt * dim * 4, align);
+		batch_bytes += ALIGN_UP(cnt * dim * 4, align);
+		batch_bytes += ALIGN_UP(cnt * 2 * inter * 4, align);
+		batch_bytes += ALIGN_UP(cnt * inter * 4, align);
+		batch_bytes += ALIGN_UP(cnt * dim * 4, align);
 	}
 	if (!p->moe_batch_arena.buf || p->moe_batch_arena_cap < batch_bytes) {
 		if (p->moe_batch_arena.buf)
@@ -3045,18 +3039,18 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 		size_t cb = (size_t)counts[i] * 4;
 		r_off[i]  = (int)mo;
 		memcpy((uint8_t *)moe_meta->mapped + mo, rows_packed + packed, cb);
-		mo += vk_meta_align(cb, align);
+		mo += ALIGN_UP(cb, align);
 		w_off[i] = (int)mo;
 		memcpy((uint8_t *)moe_meta->mapped + mo, weights_packed + packed, cb);
-		mo += vk_meta_align(cb, align);
+		mo += ALIGN_UP(cb, align);
 		x_off[i] = (int)ao;
-		ao += vk_meta_align((size_t)counts[i] * dim * 4, align);
+		ao += ALIGN_UP((size_t)counts[i] * dim * 4, align);
 		gu_off[i] = (int)ao;
-		ao += vk_meta_align((size_t)counts[i] * 2 * inter * 4, align);
+		ao += ALIGN_UP((size_t)counts[i] * 2 * inter * 4, align);
 		act_off[i] = (int)ao;
-		ao += vk_meta_align((size_t)counts[i] * inter * 4, align);
+		ao += ALIGN_UP((size_t)counts[i] * inter * 4, align);
 		y_off[i] = (int)ao;
-		ao += vk_meta_align((size_t)counts[i] * dim * 4, align);
+		ao += ALIGN_UP((size_t)counts[i] * dim * 4, align);
 		packed += (size_t)counts[i];
 	}
 

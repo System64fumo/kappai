@@ -233,16 +233,8 @@ static int32_t hash_lookup(const tok_hash_entry *ht, size_t cap, const char *key
 
 static int32_t hash_lookup_pair(const tok_hash_entry *ht, size_t cap, const char *a, size_t an,
 								const char *b, size_t bn) {
-	uint64_t h = 0xcbf29ce484222325ULL;
-	for (size_t i = 0; i < an; i++) {
-		h ^= (uint8_t)a[i];
-		h *= 0x100000001b3ULL;
-	}
-	for (size_t i = 0; i < bn; i++) {
-		h ^= (uint8_t)b[i];
-		h *= 0x100000001b3ULL;
-	}
-	size_t klen = an + bn;
+	uint64_t h	  = fnv1a_update(fnv1a(a, an), b, bn);
+	size_t	 klen = an + bn;
 	h &= (cap - 1);
 	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, a, an) == 0 &&
@@ -961,6 +953,11 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	if (t->n_byte_fallback > 0)
 		DEBUG("tokenizer: %u byte-fallback pieces registered", t->n_byte_fallback);
 
+	t->token_id_to_byte = xmalloc(n_toks * sizeof(int16_t));
+	for (size_t i = 0; i < n_toks; i++)
+		t->token_id_to_byte[i] =
+			(t->tokens[i].type == TOK_TYPE_BYTE) ? (int16_t)byte_token_value(&t->tokens[i]) : -1;
+
 	const char *const *merges	= NULL;
 	size_t			   n_merges = 0;
 	if (gguf_get_arr_str(g, "tokenizer.ggml.merges", &merges, &n_merges) == OK && n_merges > 0) {
@@ -1135,6 +1132,7 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 
 void tokenizer_free(tokenizer *t) {
 	free(t->tokens);
+	free(t->token_id_to_byte);
 	free((void *)t->hash);
 	free((void *)t->merge_hash);
 	str_arena_free(&t->merge_pool);
@@ -1163,7 +1161,7 @@ size_t tokenizer_token_decoded_len(const tokenizer *t, int32_t id) {
 		return 0;
 	const vocab_token *tok = &t->tokens[id];
 	if (tok->type == TOK_TYPE_BYTE)
-		return (byte_token_value(tok) >= 0) ? 1 : tok->text_len;
+		return (t->token_id_to_byte[id] >= 0) ? 1 : tok->text_len;
 	size_t decoded = 0;
 	size_t i	   = 0;
 	while (i < tok->text_len) {
@@ -1198,7 +1196,7 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 		int				   bv  = -1;
 		size_t			   len = tok->text_len;
 		if (tok->type == TOK_TYPE_BYTE) {
-			bv	= byte_token_value(tok);
+			bv	= t->token_id_to_byte[id];
 			len = (bv >= 0) ? 1 : tok->text_len;
 		}
 		if (acc_len + len > acc_cap) {
@@ -1379,7 +1377,7 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 		int				   bv  = -1;
 		size_t			   n   = tok->text_len;
 		if (tok->type == TOK_TYPE_BYTE) {
-			bv = byte_token_value(tok);
+			bv = t->token_id_to_byte[id];
 			n  = (bv >= 0) ? 1 : tok->text_len;
 		}
 		if (acc_len + n > acc_cap) {

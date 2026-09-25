@@ -899,8 +899,7 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 
 	int has_grouped = 0;
 	for (int i = 0; i < n_matmuls; i++)
-		if (w_types[i] == GGML_TYPE_Q8_0_R8 || w_types[i] == GGML_TYPE_Q4_0_R8 ||
-			w_types[i] == GGML_TYPE_IQ3_S_RE8 || w_types[i] == GGML_TYPE_IQ4_NL_R8)
+		if (grouped_matmul_kernel_lookup(w_types[i]))
 			has_grouped = 1;
 
 	if (!can_recurse || !p->pool || n_matmuls > CPU_MATMUL_MULTI_MAX ||
@@ -951,7 +950,8 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 				xq_by_class[q8_class] =
 					cpu_matmul_quantize_x(&local_scratch[q8_class], q8_class, xf, k);
 			j->xq = xq_by_class[q8_class];
-		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16) {
+		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16 &&
+				   w_types[i] != GGML_TYPE_F16) {
 			for (int ii = 0; ii < n_matmuls; ii++)
 				cpu_matmul_one(cpu_ptr(w[ii]), w_types[ii], xf, cpu_ptr(y[ii]), n_list[ii], k,
 							   &p->qscratch);

@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "gguf.h"
+#include "log.h"
 #include "profile.h"
 
 #define RECIPE_SLOT_X 0
@@ -54,7 +55,6 @@ typedef enum {
 	OP_MATMUL,
 	OP_MATMUL_RESIDUAL,
 	OP_MATMUL_MULTI,
-	OP_MATMUL_FUSED_GATEUP,
 	OP_MATMUL_FFN_DOWN,
 
 	OP_ROPE,
@@ -218,6 +218,27 @@ typedef struct {
 } recipe_op;
 
 typedef struct {
+	recipe_op  *ops;
+	int			cap;
+	int			count;
+	const char *arch_name;
+} op_emitter;
+
+static inline op_emitter op_emitter_make(recipe_op *ops, int cap, const char *arch_name) {
+	op_emitter e = {ops, cap, 0, arch_name};
+	return e;
+}
+
+#define OP_EMIT(e, op_expr)                                                                        \
+	do {                                                                                           \
+		if ((e)->count >= (e)->cap) {                                                              \
+			ERROR("%s: recipe op emitter overflow (capacity %d)", (e)->arch_name, (e)->cap);       \
+			abort();                                                                               \
+		}                                                                                          \
+		(e)->ops[(e)->count++] = (op_expr);                                                        \
+	} while (0)
+
+typedef struct {
 	recipe_op *ops;
 	int		   n_ops;
 } layer_recipe;
@@ -308,10 +329,9 @@ recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage sta
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
-recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1);
-recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int k, int n0, int n1, int n2);
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int k);
+recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int n2, int k);
 recipe_op mk_matmul_residual(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, int n, int k);
-recipe_op mk_matmul_fused_gateup(uint8_t in, uint8_t out, uint8_t widx, int n, int k);
 recipe_op mk_matmul_ffn_down(uint8_t gate_in, uint8_t up_in, uint8_t out, uint8_t widx, int n,
 							 int k, int activation);
 recipe_op mk_ffn_activate(uint8_t gate_in, uint8_t up_in, uint8_t out, int n, int activation);
@@ -338,8 +358,18 @@ recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_ext(uint8_t in, int rope_neox);
 recipe_op mk_partial_rope_qk(void);
+recipe_op mk_embd_lookup(void);
+recipe_op mk_scale_embeddings(void);
+recipe_op mk_ple_build(void);
+recipe_op mk_softcap(uint8_t in, float cap);
+recipe_op mk_logits_readback(void);
+recipe_op mk_moe_router(uint8_t in, int n_experts, int k);
+recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k);
+recipe_op mk_moe_shared(uint8_t in, int n, int k);
 
 int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
+int recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
+							   uint8_t norm_widx);
 int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
 						  uint8_t experts_in_slot, uint8_t out_slot);
 

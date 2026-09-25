@@ -534,6 +534,36 @@ static status_code upload_tensor(model *m, const void *host_ptr, uint32_t type, 
 	return upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, m->backend, out);
 }
 
+static int cmp_tensor_slot(const void *a, const void *b) {
+	const model_tensor_slot *x = (const model_tensor_slot *)a;
+	const model_tensor_slot *y = (const model_tensor_slot *)b;
+	if ((uintptr_t)x->data < (uintptr_t)y->data)
+		return -1;
+	if ((uintptr_t)x->data > (uintptr_t)y->data)
+		return 1;
+	return 0;
+}
+
+static void tensor_release_index_ensure(model *m) {
+	if (m->tensor_data_order || m->gctx.n_tensors == 0)
+		return;
+	size_t live = 0;
+	for (size_t i = 0; i < m->gctx.n_tensors; i++)
+		if (m->gctx.tensors[i].data)
+			live++;
+	model_tensor_slot *order = xmalloc(live * sizeof(*order));
+	size_t			   w	 = 0;
+	for (size_t i = 0; i < m->gctx.n_tensors; i++)
+		if (m->gctx.tensors[i].data) {
+			order[w].data		= m->gctx.tensors[i].data;
+			order[w].tensor_idx = i;
+			w++;
+		}
+	qsort(order, live, sizeof(*order), cmp_tensor_slot);
+	m->tensor_data_order   = order;
+	m->tensor_data_order_n = live;
+}
+
 static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes) {
 	if (!host_ptr || bytes == 0)
 		return;
@@ -544,11 +574,22 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, host_ptr, bytes);
 	} else if (m->gctx.owns_tensor_data) {
-
-		for (size_t i = 0; i < m->gctx.n_tensors; i++) {
-			if (m->gctx.tensors[i].data == host_ptr) {
-				free((void *)m->gctx.tensors[i].data);
-				m->gctx.tensors[i].data = NULL;
+		tensor_release_index_ensure(m);
+		uintptr_t key = (uintptr_t)host_ptr;
+		size_t	  lo = 0, hi = m->tensor_data_order_n;
+		while (lo < hi) {
+			size_t	  mid = lo + (hi - lo) / 2;
+			uintptr_t d	  = (uintptr_t)m->tensor_data_order[mid].data;
+			if (d < key)
+				lo = mid + 1;
+			else if (d > key)
+				hi = mid;
+			else {
+				size_t i = m->tensor_data_order[mid].tensor_idx;
+				if (i < m->gctx.n_tensors && m->gctx.tensors[i].data == host_ptr) {
+					free((void *)m->gctx.tensors[i].data);
+					m->gctx.tensors[i].data = NULL;
+				}
 				return;
 			}
 		}
@@ -1310,20 +1351,14 @@ static status_code upload_all_weights(model *m) {
 				readahead(m->gctx.fd, (off_t)((a & pm) - base), ((b + ps - 1) & pm) - (a & pm));
 		}
 		if (g_monitor && g_monitor->fd >= 0) {
-			monitor_send(g_monitor,
-						 "{\"type\":\"load\",\"phase\":\"dense_readahead_done\",\"ms\":%llu}",
-						 (unsigned long long)((time_us() - ra_t0) / 1000));
-			monitor_poll(g_monitor);
+			monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
 		}
 	}
 
 	for (int i = 0; i < m->n_layers; i++) {
 		if (g_monitor && g_monitor->fd >= 0) {
-			monitor_send(g_monitor,
-						 "{\"type\":\"load\",\"phase\":\"loading_weights\","
-						 "\"layer\":%d,\"n_layers\":%d,\"pct\":%.1f}",
-						 i, m->n_layers, 100.0 * (double)i / (double)m->n_layers);
-			monitor_poll(g_monitor);
+			monitor_emit_load_weights_progress(g_monitor, i, m->n_layers,
+											   100.0 * (double)i / (double)m->n_layers);
 		}
 
 		s = upload_layer_weights(m, i, &prog);
@@ -1820,9 +1855,7 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 	}
 
 	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"prefetch_mmap\",\"path\":\"%s\"}",
-					 path);
-		monitor_poll(g_monitor);
+		monitor_emit_load_prefetch_mmap(g_monitor, path);
 	}
 	uint64_t pf_t0 = time_us();
 
@@ -1830,9 +1863,7 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 		model_prefetch_mmap(&m->gctx);
 
 	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"prefetch_done\",\"ms\":%llu}",
-					 (unsigned long long)((time_us() - pf_t0) / 1000));
-		monitor_poll(g_monitor);
+		monitor_emit_load_prefetch_done(g_monitor, (time_us() - pf_t0) / 1000);
 	}
 
 	return OK;
@@ -1986,13 +2017,13 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 		m->rope_theta = m->arch_info->default_rope_theta;
 	}
 
-	m->attn_logit_softcap = 0.0f;
-	akey_f32(g, prefix, "attn_logit_softcapping", &m->attn_logit_softcap);
-	if (m->attn_logit_softcap != 0.0f) {
+	float attn_logit_softcap = 0.0f;
+	akey_f32(g, prefix, "attn_logit_softcapping", &attn_logit_softcap);
+	if (attn_logit_softcap != 0.0f) {
 		ERROR("model_load: '%s.attn_logit_softcapping'=%g is set but attention-logit "
 			  "softcapping is not implemented; refusing to load rather than producing "
 			  "silently wrong outputs",
-			  prefix, (double)m->attn_logit_softcap);
+			  prefix, (double)attn_logit_softcap);
 		return ERR_UNSUPPORTED;
 	}
 	m->final_logit_softcap = 0.0f;
@@ -2822,8 +2853,7 @@ fail:
 
 status_code model_upload_weights(model *m) {
 	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"upload_weights_start\"}");
-		monitor_poll(g_monitor);
+		monitor_emit_load_upload_start(g_monitor);
 	}
 	uint64_t up_t0 = time_us();
 
@@ -2841,9 +2871,7 @@ status_code model_upload_weights(model *m) {
 	malloc_trim(0);
 #endif
 	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_send(g_monitor, "{\"type\":\"load\",\"phase\":\"upload_weights_done\",\"ms\":%llu}",
-					 (unsigned long long)((time_us() - up_t0) / 1000));
-		monitor_poll(g_monitor);
+		monitor_emit_load_upload_done(g_monitor, (time_us() - up_t0) / 1000);
 	}
 	return OK;
 }
@@ -2889,6 +2917,21 @@ static void free_weight_buf(buffer *buf) {
 	buf->owner->buffer_free(buf->owner, buf);
 }
 
+static bool widx_is_model_global(weight_idx w) {
+	switch (w) {
+	case WIDX_TOK_EMBD:
+	case WIDX_OUTPUT_NORM:
+	case WIDX_OUTPUT_W:
+	case WIDX_ROPE_FREQS:
+	case WIDX_PER_LAYER_TOK_EMBD:
+	case WIDX_PER_LAYER_MODEL_PROJ:
+	case WIDX_PER_LAYER_PROJ_NORM:
+		return true;
+	default:
+		return false;
+	}
+}
+
 void model_free(model *m) {
 	if (!m)
 		return;
@@ -2906,29 +2949,20 @@ void model_free(model *m) {
 				memset(&L->wk.buf, 0, sizeof(L->wk.buf));
 				memset(&L->wv.buf, 0, sizeof(L->wv.buf));
 			}
-			free_weight_buf(&L->attn_norm_w.buf);
-			free_weight_buf(&L->wq.buf);
-			free_weight_buf(&L->wk.buf);
-			free_weight_buf(&L->wv.buf);
-			free_weight_buf(&L->wo.buf);
+			if (L->shexp_fused)
+				memset(&L->shexp_up_w.buf, 0, sizeof(L->shexp_up_w.buf));
+			if (m->wrefs_by_layer) {
+				weight_ref **row = &m->wrefs_by_layer[(size_t)i * WIDX_COUNT];
+				for (int w = 0; w < WIDX_COUNT; w++) {
+					if (widx_is_model_global((weight_idx)w))
+						continue;
+					if (row[w])
+						free_weight_buf(&row[w]->buf);
+				}
+			}
 			free_weight_buf(&L->qkv_w.buf);
 			free(L->qkv_fused_host);
 			L->qkv_fused_host = NULL;
-			free_weight_buf(&L->attn_qkv_w.buf);
-			free_weight_buf(&L->attn_gate_w.buf);
-			free_weight_buf(&L->ssm_conv1d_w.buf);
-			free_weight_buf(&L->ssm_dt_b.buf);
-			free_weight_buf(&L->ssm_a.buf);
-			free_weight_buf(&L->ssm_beta_w.buf);
-			free_weight_buf(&L->ssm_alpha_w.buf);
-			free_weight_buf(&L->ssm_norm_w.buf);
-			free_weight_buf(&L->ssm_out_w.buf);
-			free_weight_buf(&L->q_a_w.buf);
-			free_weight_buf(&L->q_b_w.buf);
-			free_weight_buf(&L->q_a_norm_w.buf);
-			free_weight_buf(&L->kv_a_w.buf);
-			free_weight_buf(&L->k_b_w.buf);
-			free_weight_buf(&L->v_b_w.buf);
 			if (L->mla_kb_f32) {
 				free((void *)L->k_b_w.host_ptr);
 				L->k_b_w.host_ptr = NULL;
@@ -2937,56 +2971,20 @@ void model_free(model *m) {
 				free((void *)L->v_b_w.host_ptr);
 				L->v_b_w.host_ptr = NULL;
 			}
-			free_weight_buf(&L->kv_a_norm_w.buf);
-			free_weight_buf(&L->router_w.buf);
-			free_weight_buf(&L->router_bias.buf);
-			free_weight_buf(&L->router_scale_w.buf);
-			if (L->shexp_fused)
-				memset(&L->shexp_up_w.buf, 0, sizeof(L->shexp_up_w.buf));
-			free_weight_buf(&L->shexp_gate_w.buf);
-			free_weight_buf(&L->shexp_up_w.buf);
-			free_weight_buf(&L->shexp_down_w.buf);
 			free(L->shexp_fused_host);
 			L->shexp_fused_host = NULL;
-			free_weight_buf(&L->ffn_pre_norm_2_w.buf);
-			free_weight_buf(&L->ffn_post_norm_1_w.buf);
-			free_weight_buf(&L->ffn_post_norm_2_w.buf);
 			free(L->experts);
 			L->experts = NULL;
-			free_weight_buf(&L->ffn_norm_w.buf);
-			free_weight_buf(&L->gate_w.buf);
-			free_weight_buf(&L->up_w.buf);
-			free_weight_buf(&L->gate_up_w.buf);
 			free(L->gate_up_fused_host);
 			L->gate_up_fused_host = NULL;
-			free_weight_buf(&L->down_w.buf);
-			if (m->arch_info->has_attn_post_norm)
-				free_weight_buf(&L->post_attn_norm_w.buf);
-			if (m->arch_info->has_ffn_post_norm)
-				free_weight_buf(&L->post_ffn_norm_w.buf);
-			if (m->arch_info->has_qk_norm) {
-				free_weight_buf(&L->attn_q_norm_w.buf);
-				free_weight_buf(&L->attn_k_norm_w.buf);
-			}
-			if (m->has_per_layer_embeddings) {
-				free_weight_buf(&L->ple_post_norm_w.buf);
-				free_weight_buf(&L->ple_inp_gate_w.buf);
-				free_weight_buf(&L->ple_proj_w.buf);
-			}
-			if (m->arch_info->has_layer_output_scale) {
-				free_weight_buf(&L->layer_out_scale_w.buf);
-			}
 		}
 		free_weight_buf(&m->tok_embd.buf);
 		free_weight_buf(&m->output_norm_w.buf);
 		free_weight_buf(&m->output_w.buf);
-		if (m->has_per_layer_embeddings) {
-			free_weight_buf(&m->layer_dims.per_layer_tok_embd.buf);
-			free_weight_buf(&m->layer_dims.per_layer_model_proj.buf);
-			free_weight_buf(&m->layer_dims.per_layer_proj_norm_w.buf);
-		}
-		if (m->rope_freqs_count > 0)
-			free_weight_buf(&m->rope_freqs_w.buf);
+		free_weight_buf(&m->layer_dims.per_layer_tok_embd.buf);
+		free_weight_buf(&m->layer_dims.per_layer_model_proj.buf);
+		free_weight_buf(&m->layer_dims.per_layer_proj_norm_w.buf);
+		free_weight_buf(&m->rope_freqs_w.buf);
 	}
 
 	free(m->layers);
@@ -3007,6 +3005,9 @@ void model_free(model *m) {
 	}
 	free(m->wrefs_by_layer);
 	m->wrefs_by_layer = NULL;
+	free(m->tensor_data_order);
+	m->tensor_data_order   = NULL;
+	m->tensor_data_order_n = 0;
 
 	if (m->layer_backends) {
 		if (m->owns_backend) {

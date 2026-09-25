@@ -41,6 +41,15 @@ void monitor_emit_load_phase_model_done(monitor *mon, uint64_t ms, int n_layers,
 										int vocab_size);
 void monitor_emit_load_phase_model_failed(monitor *mon, status_code err);
 
+void monitor_emit_load_readahead_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_weights_progress(monitor *mon, int layer, int n_layers, double pct);
+void monitor_emit_load_prefetch_mmap(monitor *mon, const char *path);
+void monitor_emit_load_prefetch_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_upload_start(monitor *mon);
+void monitor_emit_load_upload_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_pin_copy_start(monitor *mon, int n_experts, int n_workers);
+void monitor_emit_load_pin_copy_done(monitor *mon, int n_experts, double mb, uint64_t ms);
+
 void monitor_emit_start(monitor *mon, const char *arch_name, int n_layers, int dim, int n_ctx,
 						int vocab_size, int is_moe, int n_experts, int n_experts_used);
 

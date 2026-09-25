@@ -572,6 +572,42 @@ void fill_random_bf16(uint16_t *x, int n) {
 	}
 }
 
+void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q8_0_to_q8_0_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q4_0_to_q4_0_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_0_to_q4_0_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq3_s_to_iq3_s_re8(const void *src, void *dst, int n_rows, int k) {
+	repack_iq3_s_to_iq3_s_re8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq4_nl_to_iq4_nl_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_iq4_nl_to_iq4_nl_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_k_to_q4_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q5_k_to_q5_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q6_k_to_q6_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq3_s(const void *src, void *dst, int n_rows, int k) {
+	repack_iq3_s_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq4_nl_to_q8_0(const void *src, void *dst, int n_rows, int k) {
+	repack_iq4_nl_to_q8_0_rows(src, dst, 0, n_rows, k);
+}
+
 test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
 	switch (type) {
 	case GGML_TYPE_Q4_0_R8:

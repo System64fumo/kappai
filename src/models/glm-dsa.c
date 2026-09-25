@@ -22,45 +22,40 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 	const int q_b_rows = n_heads * qk_head;
 	const int wo_in	   = n_heads * v_head;
 
-	r->max_intermediate =
-		m->moe.moe_intermediate > m->intermediate ? m->moe.moe_intermediate : m->intermediate;
-	r->max_head_dim = qk_head;
-	r->max_kv_heads = n_heads;
-
 	recipe_build_pre_ops(r, m);
 
 	{
-		int		   cap = 32;
-		recipe_op *ops = xcalloc(cap, sizeof(recipe_op));
-		int		   i   = 0;
+		enum { GLM_DSA_MAX_OPS = 32 };
+		recipe_op *ops = xcalloc(GLM_DSA_MAX_OPS, sizeof(recipe_op));
+		op_emitter e   = op_emitter_make(ops, GLM_DSA_MAX_OPS, "glm-dsa");
 
-		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
+		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM));
 
-		ops[i++] = mk_mla_qkv_proj_fused(RECIPE_SLOT_XB, RECIPE_SLOT_Q, q_b_rows, dim);
+		OP_EMIT(&e, mk_mla_qkv_proj_fused(RECIPE_SLOT_XB, RECIPE_SLOT_Q, q_b_rows, dim));
 
-		ops[i++] = mk_attention_mla(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, qk_head, n_ctx,
-									1.0f / sqrtf((float)qk_head));
+		OP_EMIT(&e, mk_attention_mla(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, qk_head, n_ctx,
+									 1.0f / sqrtf((float)qk_head)));
 
 		if (backend_has_cap(m->backend, BCAP_MATMUL_RESIDUAL)) {
-			ops[i++] = mk_matmul_residual(RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_WO,
-										  dim, wo_in);
+			OP_EMIT(&e, mk_matmul_residual(RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_WO,
+										   dim, wo_in));
 		} else {
-			ops[i++] =
-				mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, wo_in, STAGE_MATMUL);
-			ops[i++] = mk_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, STAGE_ADD);
-			ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, wo_in,
+								  STAGE_MATMUL));
+			OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD));
 		}
 
-		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
+		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 
-		i = recipe_append_moe_ffn(ops, i, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
+		e.count = recipe_append_moe_ffn(e.ops, e.count, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB,
+										RECIPE_SLOT_XB2);
 
-		ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+		OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
 		if (m->moe.n_shared_experts > 0)
-			ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_FFN_ACT, STAGE_ADD);
+			OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_FFN_ACT, STAGE_ADD));
 
 		r->layer.ops   = ops;
-		r->layer.n_ops = i;
+		r->layer.n_ops = e.count;
 	}
 
 	recipe_build_post_ops(r, m);

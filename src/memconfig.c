@@ -146,30 +146,51 @@ static double to_unit(size_t bytes, mem_unit unit) {
 	return bytes / divisor;
 }
 
-static size_t calc_non_expert_bytes(const model *m) {
-	size_t embd_bytes	   = calc_embeddings_bytes(m);
-	size_t attn_bytes	   = 0;
-	size_t dense_ffn_bytes = 0;
-	size_t shexp_bytes	   = 0;
-	size_t router_bytes	   = 0;
+static int moe_layer_count(const model *m) {
+	int n_layers = m->n_layers - m->moe.first_dense_layer;
+	return n_layers < 0 ? 0 : n_layers;
+}
+
+static int moe_cache_cap(const model *m, const config *cfg) {
+	int cache_cap = cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
+	if (cache_cap > 1024)
+		cache_cap = 1024;
+	if (cache_cap > m->moe.n_experts)
+		cache_cap = m->moe.n_experts;
+	return cache_cap;
+}
+
+typedef struct {
+	size_t embd;
+	size_t attn;
+	size_t dense_ffn;
+	size_t shexp;
+	size_t router;
+	size_t total;
+} non_expert_breakdown;
+
+static non_expert_breakdown calc_non_expert_breakdown(const model *m) {
+	non_expert_breakdown b = {0};
+	b.embd				   = calc_embeddings_bytes(m);
 	for (int i = 0; i < m->n_layers; i++) {
-		attn_bytes += calc_attn_bytes(m, i);
-		dense_ffn_bytes += calc_dense_ffn_bytes(m, i);
-		shexp_bytes += calc_shared_expert_bytes(m, i);
-		router_bytes += calc_router_bytes(m, i);
+		b.attn += calc_attn_bytes(m, i);
+		b.dense_ffn += calc_dense_ffn_bytes(m, i);
+		b.shexp += calc_shared_expert_bytes(m, i);
+		b.router += calc_router_bytes(m, i);
 	}
-	return embd_bytes + m->dim * sizeof(float) + attn_bytes + dense_ffn_bytes + shexp_bytes +
-		   router_bytes;
+	b.total = b.embd + m->dim * sizeof(float) + b.attn + b.dense_ffn + b.shexp + b.router;
+	return b;
+}
+
+static size_t calc_non_expert_bytes(const model *m) {
+	return calc_non_expert_breakdown(m).total;
 }
 
 size_t model_total_weight_bytes(const model *m) {
-	size_t non_expert = calc_non_expert_bytes(m);
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
+	size_t non_expert	= calc_non_expert_bytes(m);
+	size_t per_expert	= calc_per_expert_size(m);
+	int	   n_layers		= moe_layer_count(m);
+	size_t total_expert = per_expert * (size_t)m->moe.n_experts * (size_t)n_layers;
 	return non_expert + total_expert;
 }
 
@@ -179,16 +200,8 @@ size_t model_resident_weight_bytes(const model *m, const config *cfg) {
 		return model_total_weight_bytes(m);
 
 	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-
-	int cache_cap = cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
-	if (cache_cap > 1024)
-		cache_cap = 1024;
-	if (cache_cap > n_experts)
-		cache_cap = n_experts;
+	int	   n_layers	  = moe_layer_count(m);
+	int	   cache_cap  = moe_cache_cap(m, cfg);
 
 	size_t resident_expert = per_expert * (size_t)cache_cap * (size_t)n_layers;
 	return calc_non_expert_bytes(m) + resident_expert;
@@ -200,16 +213,8 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 		return cfg->use_mmap ? model_total_weight_bytes(m) : 0;
 
 	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-
-	int cache_cap = cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
-	if (cache_cap > 1024)
-		cache_cap = 1024;
-	if (cache_cap > n_experts)
-		cache_cap = n_experts;
+	int	   n_layers	  = moe_layer_count(m);
+	int	   cache_cap  = moe_cache_cap(m, cfg);
 
 	return per_expert * (size_t)cache_cap * (size_t)n_layers;
 }
@@ -221,38 +226,25 @@ void recommend_memory_config(const model *m, int n_ctx, size_t avail, kv_quant_t
 	if (avail == 0)
 		return;
 
-	size_t embd_bytes	   = calc_embeddings_bytes(m);
-	size_t attn_bytes	   = 0;
-	size_t dense_ffn_bytes = 0;
-	size_t shexp_bytes	   = 0;
-	size_t router_bytes	   = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		attn_bytes += calc_attn_bytes(m, i);
-		dense_ffn_bytes += calc_dense_ffn_bytes(m, i);
-		shexp_bytes += calc_shared_expert_bytes(m, i);
-		router_bytes += calc_router_bytes(m, i);
-	}
-	size_t non_expert = embd_bytes + m->dim * sizeof(float) + attn_bytes + dense_ffn_bytes +
-						shexp_bytes + router_bytes;
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-	int	   topk			= m->moe.n_experts_used;
-	size_t kv_cache		= model_kv_cache_bytes_quant(m, n_ctx, kv_quant);
-	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
+	non_expert_breakdown bd			  = calc_non_expert_breakdown(m);
+	size_t				 non_expert	  = bd.total;
+	size_t				 per_expert	  = calc_per_expert_size(m);
+	int					 n_experts	  = m->moe.n_experts;
+	int					 n_layers	  = moe_layer_count(m);
+	int					 topk		  = m->moe.n_experts_used;
+	size_t				 kv_cache	  = model_kv_cache_bytes_quant(m, n_ctx, kv_quant);
+	size_t				 total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
 
 	INFO("Available memory: %.1f GB", to_unit(avail, MEM_UNIT_GB));
 	DEBUG("memory breakdown:");
-	DEBUG("  embeddings:        %.1f MB", to_unit(embd_bytes, MEM_UNIT_MB));
-	DEBUG("  attention weights: %.1f MB", to_unit(attn_bytes, MEM_UNIT_MB));
-	if (dense_ffn_bytes > 0)
-		DEBUG("  dense FFN weights: %.1f MB", to_unit(dense_ffn_bytes, MEM_UNIT_MB));
-	if (shexp_bytes > 0)
-		DEBUG("  shared experts:    %.1f MB", to_unit(shexp_bytes, MEM_UNIT_MB));
-	if (router_bytes > 0)
-		DEBUG("  MoE routers:       %.1f MB", to_unit(router_bytes, MEM_UNIT_MB));
+	DEBUG("  embeddings:        %.1f MB", to_unit(bd.embd, MEM_UNIT_MB));
+	DEBUG("  attention weights: %.1f MB", to_unit(bd.attn, MEM_UNIT_MB));
+	if (bd.dense_ffn > 0)
+		DEBUG("  dense FFN weights: %.1f MB", to_unit(bd.dense_ffn, MEM_UNIT_MB));
+	if (bd.shexp > 0)
+		DEBUG("  shared experts:    %.1f MB", to_unit(bd.shexp, MEM_UNIT_MB));
+	if (bd.router > 0)
+		DEBUG("  MoE routers:       %.1f MB", to_unit(bd.router, MEM_UNIT_MB));
 	DEBUG("  non-expert total:  %.1f GB", to_unit(non_expert, MEM_UNIT_GB));
 	if (per_expert > 0 && n_experts > 0) {
 		DEBUG("  routed experts:    %.1f GB (%.1f MB/expert, %d experts x %d layers)",

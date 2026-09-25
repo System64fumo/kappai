@@ -69,10 +69,11 @@ static jinja_value *json_to_jinja(const json_object *jo) {
 	case json_type_string:
 		return jinja_string(json_object_get_string((json_object *)jo));
 	case json_type_array: {
-		jinja_value *out = jinja_list();
-		size_t		 n	 = json_object_array_length(jo);
-		for (size_t i = 0; i < n; i++)
-			jinja_list_append(out, json_to_jinja(json_object_array_get_idx(jo, i)));
+		jinja_value	 *out = jinja_list();
+		json_arr_iter it  = json_arr_begin((json_object *)jo);
+		json_object	 *elem;
+		while (json_arr_next(&it, &elem))
+			jinja_list_append(out, json_to_jinja(elem));
 		return out;
 	}
 	case json_type_object: {
@@ -90,9 +91,9 @@ static jinja_value *tool_calls_to_jinja(const json_object *tool_calls) {
 	jinja_value *out = jinja_list();
 	if (!tool_calls || !json_object_is_type(tool_calls, json_type_array))
 		return out;
-	size_t n = json_object_array_length(tool_calls);
-	for (size_t i = 0; i < n; i++) {
-		json_object *tc = json_object_array_get_idx(tool_calls, i);
+	json_arr_iter it = json_arr_begin((json_object *)tool_calls);
+	json_object	 *tc;
+	while (json_arr_next(&it, &tc)) {
 		if (!json_object_is_type(tc, json_type_object))
 			continue;
 		jinja_value *d = jinja_dict();

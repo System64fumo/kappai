@@ -43,6 +43,7 @@ jinja_value *jinja_none(void);
 jinja_value *jinja_bool(int b);
 jinja_value *jinja_string(const char *s);
 jinja_value *jinja_string_n(const char *s, size_t n);
+jinja_value *jinja_string_take(char *s);
 jinja_value *jinja_dict(void);
 jinja_value *jinja_list(void);
 void		 jinja_dict_set(jinja_value *d, const char *key, jinja_value *val);

@@ -4,13 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void grow_buf(void **buf, int *cur_count, int need_count, size_t elem_size) {
-	if (*cur_count >= need_count)
-		return;
-	*buf	   = xrealloc(*buf, (size_t)need_count * elem_size);
-	*cur_count = need_count;
-}
-
 static inline uint64_t rotl64(uint64_t x, int k) {
 	return (x << k) | (x >> (64 - k));
 }
@@ -69,7 +62,7 @@ void sampler_free(sampler *s) {
 }
 
 void sampler_set_vocab(sampler *s, int vocab_size) {
-	grow_buf((void **)&s->logits_buf, &s->buf_vocab, vocab_size, sizeof(float));
+	ARR_ENSURE(s->logits_buf, vocab_size, s->buf_vocab);
 }
 
 void sampler_set_params(sampler *s, float temp, int top_k, float top_p, float min_p,
@@ -121,28 +114,29 @@ int32_t sampler_argmax(const float *logits, int vocab) {
 }
 
 static int top_k_heap(sampler *s, const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	float	*hs = NULL;
-	int32_t *hi = NULL;
+	float						**hs_p;
+	int32_t						**hi_p;
+	int							 *cap_p;
+	static _Thread_local float	 *tls_h;
+	static _Thread_local int32_t *tls_i;
+	static _Thread_local int	  tls_cap;
 	if (s) {
-		if (s->heap_cap < k) {
-			s->heap_scores = xrealloc(s->heap_scores, (size_t)k * sizeof(float));
-			s->heap_idx	   = xrealloc(s->heap_idx, (size_t)k * sizeof(int32_t));
-			s->heap_cap	   = k;
-		}
-		hs = s->heap_scores;
-		hi = s->heap_idx;
+		hs_p  = &s->heap_scores;
+		hi_p  = &s->heap_idx;
+		cap_p = &s->heap_cap;
 	} else {
-		static _Thread_local float	 *tls_h;
-		static _Thread_local int32_t *tls_i;
-		static _Thread_local int	  tls_cap;
-		if (tls_cap < k) {
-			tls_h	= xrealloc(tls_h, (size_t)k * sizeof(float));
-			tls_i	= xrealloc(tls_i, (size_t)k * sizeof(int32_t));
-			tls_cap = k;
-		}
-		hs = tls_h;
-		hi = tls_i;
+		hs_p  = &tls_h;
+		hi_p  = &tls_i;
+		cap_p = &tls_cap;
 	}
+	if (*cap_p < k) {
+		*hs_p  = xrealloc(*hs_p, (size_t)k * sizeof(float));
+		*hi_p  = xrealloc(*hi_p, (size_t)k * sizeof(int32_t));
+		*cap_p = k;
+	}
+
+	float	*hs = *hs_p;
+	int32_t *hi = *hi_p;
 
 	if (k > vocab)
 		k = vocab;
@@ -162,10 +156,15 @@ static int cmp_desc(const void *a, const void *b) {
 	return va < vb ? 1 : va > vb ? -1 : 0;
 }
 
-int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	int kept = top_k_heap(NULL, logits, vocab, k, out);
+static int top_k_sorted(sampler *s, const float *logits, int vocab, int k,
+						sampler_top_k_entry *out) {
+	int kept = top_k_heap(s, logits, vocab, k, out);
 	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	return kept;
+}
+
+int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
+	return top_k_sorted(NULL, logits, vocab, k, out);
 }
 
 static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_k_entry *out,
@@ -174,10 +173,7 @@ static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_
 		max_keep = vocab;
 	if (max_keep <= 0)
 		return 0;
-
-	int kept = top_k_heap(s, logits, vocab, max_keep, out);
-	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
-	return kept;
+	return top_k_sorted(s, logits, vocab, max_keep, out);
 }
 
 #define SAMPLER_TOP_FILTER_CAP 1024
@@ -199,8 +195,7 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 							  sampler_top_k_entry *arr) {
 	int kept;
 	if (s->top_k > 0 && s->top_k < vocab) {
-		kept = top_k_heap(s, logits, vocab, s->top_k, arr);
-		qsort(arr, kept, sizeof(sampler_top_k_entry), cmp_desc);
+		kept = top_k_sorted(s, logits, vocab, s->top_k, arr);
 	} else {
 		int cap;
 		if (s->top_p < 1.0f || s->min_p > 0.0f)
@@ -219,8 +214,7 @@ static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
 		if (logits[i] * inv_temp > mx)
 			mx = logits[i] * inv_temp;
 
-	if (s->buf_vocab < vocab)
-		grow_buf((void **)&s->logits_buf, &s->buf_vocab, vocab, sizeof(float));
+	ARR_ENSURE(s->logits_buf, vocab, s->buf_vocab);
 	float *exp = s->logits_buf;
 	double sum = 0.0;
 	for (int i = 0; i < vocab; i++) {
@@ -297,7 +291,7 @@ static int32_t sample_greedy(const float *logits, int vocab) {
 
 static int32_t sample_filtered(sampler *s, const float *logits, int vocab) {
 	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
-	grow_buf(&s->cand_buf, &s->cand_vocab, need_cands, sizeof(sampler_top_k_entry));
+	ARR_ENSURE(s->cand_buf, need_cands, s->cand_vocab);
 	sampler_top_k_entry *arr  = s->cand_buf;
 	int					 kept = collect_candidates(s, logits, vocab, arr);
 	if (kept <= 0)

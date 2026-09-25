@@ -1,11 +1,9 @@
 #include "test_core.h"
 #include "test_synth_gguf.h"
 
-#define usage kappai_config_usage_shim
 #include "config.h"
 #include "context.h"
 #include "engine.h"
-#undef usage
 
 #include <math.h>
 #include <stdio.h>

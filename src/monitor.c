@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "monitor.h"
+#include "json_helpers.h"
 #include "log.h"
 #include "profile.h"
 
@@ -168,48 +169,6 @@ void monitor_free(monitor *mon) {
 	pthread_mutex_destroy(&mon->mtx);
 }
 
-static size_t json_escape(const char *in, size_t in_len, char *out, size_t out_cap) {
-	size_t n = 0;
-	for (size_t i = 0; i < in_len; i++) {
-		unsigned char c	  = (unsigned char)in[i];
-		const char	 *esc = NULL;
-		char		  buf[8];
-		switch (c) {
-		case '"':
-			esc = "\\\"";
-			break;
-		case '\\':
-			esc = "\\\\";
-			break;
-		case '\n':
-			esc = "\\n";
-			break;
-		case '\r':
-			esc = "\\r";
-			break;
-		case '\t':
-			esc = "\\t";
-			break;
-		default:
-			if (c < 0x20) {
-				snprintf(buf, sizeof(buf), "\\u%04x", c);
-				esc = buf;
-			}
-			break;
-		}
-		size_t elen = esc ? strlen(esc) : 1;
-		if (n + elen >= out_cap)
-			break;
-		if (esc)
-			memcpy(out + n, esc, elen);
-		else
-			out[n] = (char)c;
-		n += elen;
-	}
-	out[n] = '\0';
-	return n;
-}
-
 static void append_moe_json(char *buf, size_t cap, const moe_stats_summary *moe) {
 	buf[0] = '\0';
 	if (!moe || !moe->has_moe)
@@ -241,6 +200,58 @@ void monitor_emit_load_phase_model_done(monitor *mon, uint64_t ms, int n_layers,
 
 void monitor_emit_load_phase_model_failed(monitor *mon, status_code err) {
 	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"model_load_failed\",\"error\":%d}", err);
+}
+
+void monitor_emit_load_readahead_done(monitor *mon, uint64_t ms) {
+	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"dense_readahead_done\",\"ms\":%llu}",
+				 (unsigned long long)ms);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_weights_progress(monitor *mon, int layer, int n_layers, double pct) {
+	monitor_send(mon,
+				 "{\"type\":\"load\",\"phase\":\"loading_weights\","
+				 "\"layer\":%d,\"n_layers\":%d,\"pct\":%.1f}",
+				 layer, n_layers, pct);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_prefetch_mmap(monitor *mon, const char *path) {
+	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"prefetch_mmap\",\"path\":\"%s\"}", path);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_prefetch_done(monitor *mon, uint64_t ms) {
+	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"prefetch_done\",\"ms\":%llu}",
+				 (unsigned long long)ms);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_upload_start(monitor *mon) {
+	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_start\"}");
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_upload_done(monitor *mon, uint64_t ms) {
+	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_done\",\"ms\":%llu}",
+				 (unsigned long long)ms);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_pin_copy_start(monitor *mon, int n_experts, int n_workers) {
+	monitor_send(mon,
+				 "{\"type\":\"load\",\"phase\":\"pin_copy_start\","
+				 "\"n_experts\":%d,\"n_workers\":%d}",
+				 n_experts, n_workers);
+	monitor_poll(mon);
+}
+
+void monitor_emit_load_pin_copy_done(monitor *mon, int n_experts, double mb, uint64_t ms) {
+	monitor_send(mon,
+				 "{\"type\":\"load\",\"phase\":\"pin_copy_done\","
+				 "\"n_experts\":%d,\"mb\":%.1f,\"ms\":%llu}",
+				 n_experts, mb, (unsigned long long)ms);
+	monitor_poll(mon);
 }
 
 void monitor_emit_start(monitor *mon, const char *arch_name, int n_layers, int dim, int n_ctx,
@@ -315,7 +326,7 @@ void monitor_record_layer_event(monitor *mon, monitor_layer_tracker *t, int laye
 void monitor_emit_token(monitor *mon, int token_idx, int32_t token_id, int pos, const char *piece,
 						int piece_len) {
 	char escaped[512];
-	json_escape(piece, (size_t)piece_len, escaped, sizeof(escaped));
+	json_escape_buf(piece, (size_t)piece_len, escaped, sizeof(escaped));
 	monitor_send(mon,
 				 "{\"type\":\"token\",\"token_idx\":%d,\"token_id\":%d,\"pos\":%d,"
 				 "\"text\":\"%s\"}",

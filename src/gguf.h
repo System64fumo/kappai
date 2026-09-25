@@ -133,6 +133,9 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
 
 status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path);
 
+status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
+							   size_t *out_align);
+
 void gguf_free(gguf_ctx *ctx);
 
 int gguf_tensor_byte_size(const gguf_tensor *t, size_t *out_size);

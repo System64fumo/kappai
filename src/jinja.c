@@ -1,4 +1,5 @@
 #include "jinja.h"
+#include "json_helpers.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -88,10 +89,6 @@ static void arena_track(jinja_value *v) {
 	jinja_arena *a = g_render_arena;
 	if (!a)
 		return;
-	if (!a->cap) {
-		a->cap	= 64;
-		a->vals = xrealloc(a->vals, a->cap * sizeof(*a->vals));
-	}
 	ARR_RESERVE(a->vals, a->n, a->cap);
 	a->vals[a->n++] = v;
 }
@@ -126,6 +123,14 @@ jinja_value *jinja_string_n(const char *s, size_t n) {
 	if (n)
 		memcpy(v->as.s, s, n);
 	v->as.s[n] = '\0';
+	arena_track(v);
+	return v;
+}
+
+jinja_value *jinja_string_take(char *s) {
+	jinja_value *v = xmalloc(sizeof(*v));
+	v->type		   = JV_STRING;
+	v->as.s		   = s ? s : xstrdup("");
 	arena_track(v);
 	return v;
 }
@@ -168,10 +173,7 @@ void jinja_dict_set(jinja_value *d, const char *key, jinja_value *val) {
 }
 
 void jinja_list_append(jinja_value *l, jinja_value *val) {
-	if (l->as.list.n == l->as.list.cap) {
-		l->as.list.cap	 = l->as.list.cap ? l->as.list.cap * 2 : 8;
-		l->as.list.items = xrealloc(l->as.list.items, l->as.list.cap * sizeof(jinja_value *));
-	}
+	ARR_RESERVE(l->as.list.items, l->as.list.n, l->as.list.cap);
 	l->as.list.items[l->as.list.n++] = val;
 }
 
@@ -295,10 +297,7 @@ typedef struct {
 
 static void lex_push(lexer *lx, tok_type type, const char *start, size_t len, int strip_left,
 					 int strip_right) {
-	if (lx->n_toks == lx->cap_toks) {
-		lx->cap_toks = lx->cap_toks ? lx->cap_toks * 2 : 64;
-		lx->toks	 = xrealloc(lx->toks, lx->cap_toks * sizeof(token));
-	}
+	ARR_RESERVE(lx->toks, lx->n_toks, lx->cap_toks);
 	token *t	   = &lx->toks[lx->n_toks++];
 	t->type		   = type;
 	t->start	   = start;
@@ -1737,9 +1736,14 @@ static jinja_value *call_macro(eval_ctx *ctx, jinja_value *macro_val, expr_arg *
 	ctx->sc = saved;
 	scope_free_entries(&call_sc);
 
-	jinja_value *out = jinja_string(sb.p);
-	sb_free(&sb);
+	jinja_value *out = jinja_string_take(sb_finish(&sb));
 	return out;
+}
+
+static int dictsort_cmp(const void *a, const void *b) {
+	const jinja_dict_entry *ea = *(const jinja_dict_entry *const *)a;
+	const jinja_dict_entry *eb = *(const jinja_dict_entry *const *)b;
+	return strcmp(ea->key, eb->key);
 }
 
 static jinja_value *dictsort_value(const jinja_value *base) {
@@ -1753,13 +1757,7 @@ static jinja_value *dictsort_value(const jinja_value *base) {
 	size_t			   i   = 0;
 	for (jinja_dict_entry *e = base->as.dict; e; e = e->next)
 		arr[i++] = e;
-	for (size_t a = 0; a < n; a++)
-		for (size_t b = a + 1; b < n; b++)
-			if (strcmp(arr[a]->key, arr[b]->key) > 0) {
-				jinja_dict_entry *tmp = arr[a];
-				arr[a]				  = arr[b];
-				arr[b]				  = tmp;
-			}
+	qsort(arr, n, sizeof(*arr), dictsort_cmp);
 	for (i = 0; i < n; i++) {
 		jinja_value *pair = jinja_list();
 		jinja_list_append(pair, jinja_string(arr[i]->key));
@@ -1772,28 +1770,7 @@ static jinja_value *dictsort_value(const jinja_value *base) {
 
 static void json_append_str(str_builder *sb, const char *s) {
 	sb_putb(sb, "\"", 1);
-	for (const char *c = s; *c; c++) {
-		switch (*c) {
-		case '"':
-			sb_putb(sb, "\\\"", 2);
-			break;
-		case '\\':
-			sb_putb(sb, "\\\\", 2);
-			break;
-		case '\n':
-			sb_putb(sb, "\\n", 2);
-			break;
-		case '\r':
-			sb_putb(sb, "\\r", 2);
-			break;
-		case '\t':
-			sb_putb(sb, "\\t", 2);
-			break;
-		default:
-			sb_putb(sb, c, 1);
-			break;
-		}
-	}
+	json_escape_append(sb, s, strlen(s));
 	sb_putb(sb, "\"", 1);
 }
 
@@ -1876,10 +1853,8 @@ static char *trim_dup(const char *s, int left, int right) {
 static jinja_value *filter_trim(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
 	(void)ctx;
 	(void)args;
-	char		*dup = trim_dup(value_as_cstr(base), 1, 1);
-	jinja_value *out = jinja_string(dup);
-	free(dup);
-	return out;
+	char *dup = trim_dup(value_as_cstr(base), 1, 1);
+	return jinja_string_take(dup);
 }
 
 static jinja_value *filter_default(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -1907,9 +1882,7 @@ static jinja_value *filter_upper(eval_ctx *ctx, jinja_value *base, expr_arg *arg
 	char *dup = xstrdup(value_as_cstr(base));
 	for (char *c = dup; *c; c++)
 		*c = toupper((unsigned char)*c);
-	jinja_value *out = jinja_string(dup);
-	free(dup);
-	return out;
+	return jinja_string_take(dup);
 }
 
 static jinja_value *filter_capitalize(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -1920,36 +1893,17 @@ static jinja_value *filter_capitalize(eval_ctx *ctx, jinja_value *base, expr_arg
 		dup[0] = toupper((unsigned char)dup[0]);
 	for (char *c = dup + 1; *c; c++)
 		*c = tolower((unsigned char)*c);
-	jinja_value *out = jinja_string(dup);
-	free(dup);
-	return out;
+	return jinja_string_take(dup);
 }
 
 static jinja_value *filter_replace(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
 	const char *old_s = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
 	const char *new_s = args && args->next ? value_as_cstr(eval_expr(ctx, args->next->val)) : "";
 	const char *str	  = value_as_cstr(base);
-	size_t		old_n = strlen(old_s);
 	str_builder sb;
 	sb_init(&sb);
-	if (!old_n) {
-		sb_puts(&sb, str);
-	} else {
-		const char *remaining = str;
-		for (;;) {
-			const char *hit = strstr(remaining, old_s);
-			if (!hit) {
-				sb_puts(&sb, remaining);
-				break;
-			}
-			sb_putb(&sb, remaining, (size_t)(hit - remaining));
-			sb_puts(&sb, new_s);
-			remaining = hit + old_n;
-		}
-	}
-	jinja_value *out = jinja_string(sb.p);
-	sb_free(&sb);
-	return out;
+	str_replace_all(&sb, str, old_s, new_s);
+	return jinja_string_take(sb_finish(&sb));
 }
 
 static jinja_value *filter_lower(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -1958,9 +1912,7 @@ static jinja_value *filter_lower(eval_ctx *ctx, jinja_value *base, expr_arg *arg
 	char *dup = xstrdup(value_as_cstr(base));
 	for (char *c = dup; *c; c++)
 		*c = tolower((unsigned char)*c);
-	jinja_value *out = jinja_string(dup);
-	free(dup);
-	return out;
+	return jinja_string_take(dup);
 }
 
 static jinja_value *filter_dictsort(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -2005,9 +1957,7 @@ static jinja_value *filter_join(eval_ctx *ctx, jinja_value *base, expr_arg *args
 			sb_puts(&sb, value_as_cstr(base->as.list.items[i]));
 		}
 	}
-	jinja_value *out = jinja_string(sb.p);
-	sb_free(&sb);
-	return out;
+	return jinja_string_take(sb_finish(&sb));
 }
 
 static jinja_value *filter_tojson(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -2016,9 +1966,7 @@ static jinja_value *filter_tojson(eval_ctx *ctx, jinja_value *base, expr_arg *ar
 	str_builder sb;
 	sb_init(&sb);
 	json_to_json(&sb, base);
-	jinja_value *out = jinja_string(sb.p);
-	sb_free(&sb);
-	return out;
+	return jinja_string_take(sb_finish(&sb));
 }
 
 static jinja_value *filter_passthrough(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -2085,11 +2033,19 @@ static const struct {
 	{"map", filter_map},
 };
 
+static uint64_t k_filter_hash[sizeof(k_filter_table) / sizeof(k_filter_table[0])];
+
 static jinja_filter_fn lookup_filter(const char *name) {
 	if (!name)
 		return NULL;
+	uint64_t h = fnv1a_str(name);
 	for (size_t i = 0; i < sizeof(k_filter_table) / sizeof(k_filter_table[0]); i++) {
-		if (!strcmp(name, k_filter_table[i].name))
+		uint64_t eh = k_filter_hash[i];
+		if (!eh) {
+			eh				 = fnv1a_str(k_filter_table[i].name);
+			k_filter_hash[i] = eh;
+		}
+		if (eh == h && !strcmp(name, k_filter_table[i].name))
 			return k_filter_table[i].fn;
 	}
 	return NULL;
@@ -2147,12 +2103,10 @@ static jinja_value *method_strip(eval_ctx *ctx, jinja_value *base, expr_arg *arg
 								 const char *name) {
 	(void)ctx;
 	(void)args;
-	int			 left  = strcmp(name, "rstrip") != 0;
-	int			 right = strcmp(name, "lstrip") != 0;
-	char		*dup   = trim_dup(value_as_cstr(base), left, right);
-	jinja_value *out   = jinja_string(dup);
-	free(dup);
-	return out;
+	int	  left	= strcmp(name, "rstrip") != 0;
+	int	  right = strcmp(name, "lstrip") != 0;
+	char *dup	= trim_dup(value_as_cstr(base), left, right);
+	return jinja_string_take(dup);
 }
 
 static jinja_value *method_startswith(eval_ctx *ctx, jinja_value *base, expr_arg *args,
@@ -2193,11 +2147,19 @@ static const struct {
 	{"endswith", method_startswith},
 };
 
+static uint64_t k_method_hash[sizeof(k_method_table) / sizeof(k_method_table[0])];
+
 static jinja_method_fn lookup_method(const char *name) {
 	if (!name)
 		return NULL;
+	uint64_t h = fnv1a_str(name);
 	for (size_t i = 0; i < sizeof(k_method_table) / sizeof(k_method_table[0]); i++) {
-		if (!strcmp(name, k_method_table[i].name))
+		uint64_t eh = k_method_hash[i];
+		if (!eh) {
+			eh				 = fnv1a_str(k_method_table[i].name);
+			k_method_hash[i] = eh;
+		}
+		if (eh == h && !strcmp(name, k_method_table[i].name))
 			return k_method_table[i].fn;
 	}
 	return NULL;
@@ -2233,9 +2195,7 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 		sb_init(&sb);
 		sb_puts(&sb, as);
 		sb_puts(&sb, bs);
-		jinja_value *out = jinja_string(sb.p);
-		sb_free(&sb);
-		return out;
+		return jinja_string_take(sb_finish(&sb));
 	}
 	if (!strcmp(e->op, "-")) {
 		jinja_value *a	= eval_expr(ctx, e->a);
@@ -2303,8 +2263,15 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			int			kind;
 		} kw[] = {{"true", 1}, {"True", 1}, {"false", 0}, {"False", 0},
 				  {"none", 2}, {"None", 2}, {NULL, 0}};
+		static uint64_t kw_hash[sizeof(kw) / sizeof(kw[0])];
+		uint64_t		kh = fnv1a_str(e->str);
 		for (int i = 0; kw[i].name; i++) {
-			if (!strcmp(e->str, kw[i].name)) {
+			uint64_t eh = kw_hash[i];
+			if (!eh) {
+				eh		   = fnv1a_str(kw[i].name);
+				kw_hash[i] = eh;
+			}
+			if (eh == kh && !strcmp(e->str, kw[i].name)) {
 				if (kw[i].kind == 1)
 					return jinja_bool(1);
 				if (kw[i].kind == 0)
@@ -2611,8 +2578,9 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 		}
 
 		scope loop_sc;
-		loop_sc.entries = NULL;
-		loop_sc.parent	= ctx->sc;
+		loop_sc.entries		  = NULL;
+		loop_sc.parent		  = ctx->sc;
+		jinja_value *loop_obj = jinja_dict();
 		for (size_t i = 0; i < n && !ctx->failed; i++) {
 			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
@@ -2656,8 +2624,7 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 			str_builder sb;
 			sb_init(&sb);
 			exec_stmts(ctx, s->body, &sb);
-			val = jinja_string(sb.p);
-			sb_free(&sb);
+			val = jinja_string_take(sb_finish(&sb));
 		}
 		if (s->set_attr) {
 			jinja_value *target = scope_lookup(ctx->sc, s->set_name);

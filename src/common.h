@@ -1,6 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <ctype.h>
 #include <execinfo.h>
 #include <limits.h>
 #include <sched.h>
@@ -137,6 +138,48 @@ static inline char *xstrdup(const char *s) {
 	return p;
 }
 
+static inline char *xstrndup(const char *s, size_t n) {
+	char *p = xmalloc(n + 1);
+	memcpy(p, s, n);
+	p[n] = '\0';
+	return p;
+}
+
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+
+typedef struct {
+	const char *p;
+	size_t		len;
+} str_span;
+
+static inline str_span span_trim(const char *s, size_t len) {
+	while (len > 0 && isspace((unsigned char)*s)) {
+		s++;
+		len--;
+	}
+	while (len > 0 && isspace((unsigned char)s[len - 1]))
+		len--;
+	str_span sp = {s, len};
+	return sp;
+}
+
+static inline char *span_dup(str_span sp) {
+	return xstrndup(sp.p, sp.len);
+}
+
+static inline size_t marker_tail_len(const char *s, size_t len, const char *marker) {
+	if (!marker)
+		return 0;
+	size_t mlen = strlen(marker);
+	if (mlen <= 1)
+		return 0;
+	size_t max = len < mlen - 1 ? len : mlen - 1;
+	for (size_t k = max; k > 0; k--)
+		if (memcmp(s + len - k, marker, k) == 0)
+			return k;
+	return 0;
+}
+
 static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
 	if (need > b->cap) {
 		size_t bytes = need * sizeof(float);
@@ -236,6 +279,22 @@ static inline char *sb_finish(str_builder *b) {
 static inline void sb_free(str_builder *b) {
 	free(b->p);
 	memset(b, 0, sizeof(*b));
+}
+
+static inline void str_replace_all(str_builder *out, const char *s, const char *from,
+								   const char *to) {
+	size_t flen = strlen(from);
+	if (flen == 0) {
+		sb_puts(out, s);
+		return;
+	}
+	const char *cur;
+	while ((cur = strstr(s, from)) != NULL) {
+		sb_putb(out, s, (size_t)(cur - s));
+		sb_puts(out, to);
+		s = cur + flen;
+	}
+	sb_puts(out, s);
 }
 
 typedef struct {
