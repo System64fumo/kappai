@@ -33,7 +33,6 @@ typedef struct {
 	bool	 has_seed;
 	uint64_t seed;
 
-	json_object *stop;
 	size_t		 n_stop;
 	const char **stop_needles;
 	size_t		*stop_lens;
@@ -79,9 +78,7 @@ typedef struct {
 	char  *stop_window;
 	size_t stop_window_cap;
 
-	bool in_thinking;
-	bool first_token;
-	bool skip_label;
+	think_filter think;
 
 	bool stopped_by_stop;
 	bool sent_any_chunk;
@@ -137,9 +134,8 @@ struct openai_state {
 static sigset_t g_signal_mask;
 
 static char *derive_model_id(const char *model_path) {
-	const char *base = strrchr(model_path, '/');
-	base			 = base ? base + 1 : model_path;
-	size_t len		 = strlen(base);
+	const char *base = path_basename(model_path);
+	size_t		len	 = strlen(base);
 	if (len > 5 && !strcasecmp(base + len - 5, ".gguf"))
 		len -= 5;
 	char *id = xmalloc(len + 1);
@@ -194,6 +190,10 @@ static bool shutting_down(openai_state *st) {
 	return atomic_load_explicit(&st->shutting_down, memory_order_relaxed);
 }
 
+static inline bool gen_dead(const oa_gen *g) {
+	return g->client_gone || shutting_down(g->st);
+}
+
 static char *extract_message_content(json_object *msg) {
 	json_object *c = json_get(msg, "content");
 	if (!c || json_object_is_type(c, json_type_null))
@@ -223,7 +223,6 @@ static const char *parse_stop(json_object *root, oa_req_params *p) {
 	if (!stop)
 		return NULL;
 	if (json_object_is_type(stop, json_type_string)) {
-		p->stop	 = stop;
 		size_t l = (size_t)json_object_get_string_len(stop);
 		if (l == 0)
 			return NULL;
@@ -236,29 +235,21 @@ static const char *parse_stop(json_object *root, oa_req_params *p) {
 		return NULL;
 	}
 	if (json_object_is_type(stop, json_type_array)) {
-		p->stop			 = stop;
 		json_arr_iter it = json_arr_begin(stop);
 		json_object	 *item;
-		size_t		  count = 0;
-		while (json_arr_next(&it, &item)) {
-			if (!json_object_is_type(item, json_type_string))
-				continue;
-			if (json_object_get_string_len(item) == 0)
-				continue;
-			count++;
-		}
-		if (count == 0)
-			return NULL;
-		p->stop_needles = xmalloc(count * sizeof(*p->stop_needles));
-		p->stop_lens	= xmalloc(count * sizeof(*p->stop_lens));
-		size_t n		= 0;
-		it				= json_arr_begin(stop);
+		size_t		  cap = 0;
+		size_t		  n	  = 0;
 		while (json_arr_next(&it, &item)) {
 			if (!json_object_is_type(item, json_type_string))
 				continue;
 			size_t l = (size_t)json_object_get_string_len(item);
 			if (l == 0)
 				continue;
+			if (n >= cap) {
+				cap				= cap ? cap * 2 : 4;
+				p->stop_needles = xrealloc(p->stop_needles, cap * sizeof(*p->stop_needles));
+				p->stop_lens	= xrealloc(p->stop_lens, cap * sizeof(*p->stop_lens));
+			}
 			p->stop_needles[n] = json_object_get_string(item);
 			p->stop_lens[n]	   = l;
 			if (l > p->stop_max)
@@ -424,8 +415,10 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 		if (tcs)
 			p->messages[i].tool_calls = tcs;
 
-		p->messages[i].tool_call_id = (char *)json_get_str(m, "tool_call_id", NULL);
-		p->messages[i].name			= (char *)json_get_str(m, "name", NULL);
+		const char *tcid			= json_get_str(m, "tool_call_id", NULL);
+		const char *nm				= json_get_str(m, "name", NULL);
+		p->messages[i].tool_call_id = tcid ? xstrdup(tcid) : NULL;
+		p->messages[i].name			= nm ? xstrdup(nm) : NULL;
 	}
 	p->n_messages = n;
 	return NULL;
@@ -464,6 +457,8 @@ static void free_req_params(oa_req_params *p) {
 		free(p->messages[i].role);
 		free(p->messages[i].content);
 		free(p->messages[i].reasoning_content);
+		free(p->messages[i].tool_call_id);
+		free(p->messages[i].name);
 	}
 	free(p->messages);
 	free(p->prompt);
@@ -509,7 +504,7 @@ static req_ctx *rc_new(openai_state *st) {
 
 static void gen_queue_push(oa_gen *g, const char *payload, size_t len) {
 	pthread_mutex_lock(&g->q_mtx);
-	if (!g->client_gone && !shutting_down(g->st)) {
+	if (!gen_dead(g)) {
 		ARR_RESERVE(g->queue, g->q_len, g->q_cap);
 		char *frame = xmalloc(6 + len + 2);
 		memcpy(frame, "data: ", 6);
@@ -574,24 +569,24 @@ static void append_usage(json_object *root, int prompt_tokens, int completion_to
 	json_object_object_add(root, "usage", usage);
 }
 
-static json_object *chat_choice_delta(json_object *delta, const char *finish_reason) {
+static json_object *stream_choice(const char *payload_key, json_object *payload,
+								  const char *finish_reason) {
 	json_object *choice = json_object_new_object();
 	json_set_int(choice, "index", 0);
-	json_object_object_add(choice, "delta", delta ? delta : json_object_new_object());
+	json_object_object_add(choice, payload_key, payload ? payload : json_object_new_object());
 	json_object_object_add(choice, "logprobs", NULL);
 	json_object_object_add(choice, "finish_reason",
 						   finish_reason ? json_object_new_string(finish_reason) : NULL);
 	return choice;
 }
 
+static json_object *chat_choice_delta(json_object *delta, const char *finish_reason) {
+	return stream_choice("delta", delta, finish_reason);
+}
+
 static json_object *text_choice_delta(const char *piece, size_t n, const char *finish_reason) {
-	json_object *choice = json_object_new_object();
-	json_object_object_add(choice, "text", json_object_new_string_len(piece ? piece : "", (int)n));
-	json_set_int(choice, "index", 0);
-	json_object_object_add(choice, "logprobs", NULL);
-	json_object_object_add(choice, "finish_reason",
-						   finish_reason ? json_object_new_string(finish_reason) : NULL);
-	return choice;
+	return stream_choice("text", json_object_new_string_len(piece ? piece : "", (int)n),
+						 finish_reason);
 }
 
 static json_object *build_completion_body(req_ctx *rc, bool chat_api) {
@@ -691,15 +686,19 @@ static void sse_send_role_chunk(oa_gen *g) {
 	sse_chat_delta(g, delta, NULL);
 }
 
+static void sse_ensure_preamble(oa_gen *g) {
+	if (g->sent_any_chunk)
+		return;
+	g->sent_any_chunk = true;
+	if (g->chat_api)
+		sse_send_role_chunk(g);
+	else
+		sse_text_delta(g, "", 0, NULL);
+}
+
 static void sse_send_delta(oa_gen *g, bool reasoning, const char *piece, size_t n) {
-	if (!g->sent_any_chunk) {
-		g->sent_any_chunk = true;
-		if (g->chat_api)
-			sse_send_role_chunk(g);
-		else
-			sse_text_delta(g, "", 0, NULL);
-	}
-	if (g->client_gone || shutting_down(g->st))
+	sse_ensure_preamble(g);
+	if (gen_dead(g))
 		return;
 	if (g->chat_api) {
 		json_object *delta = json_object_new_object();
@@ -713,14 +712,8 @@ static void sse_send_delta(oa_gen *g, bool reasoning, const char *piece, size_t 
 
 static void sse_send_tool_call(oa_gen *g, int index, const char *id, const char *name,
 							   const char *args_json) {
-	if (!g->sent_any_chunk) {
-		g->sent_any_chunk = true;
-		if (g->chat_api)
-			sse_send_role_chunk(g);
-		else
-			sse_text_delta(g, "", 0, NULL);
-	}
-	if (g->client_gone || shutting_down(g->st))
+	sse_ensure_preamble(g);
+	if (gen_dead(g))
 		return;
 
 	json_object *tcd = json_object_new_object();
@@ -791,7 +784,7 @@ static void check_stop_sequences(oa_gen *g) {
 
 static void tool_on_content(void *ud, const char *piece, size_t n) {
 	oa_gen *g = (oa_gen *)ud;
-	if (g->streaming && !g->client_gone && !shutting_down(g->st))
+	if (g->streaming && !gen_dead(g))
 		sse_send_delta(g, false, piece, n);
 }
 
@@ -805,7 +798,7 @@ static void tool_on_call(void *ud, int index, const char *id, const char *name,
 static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	oa_gen *g = (oa_gen *)ud;
 
-	if (g->client_gone || shutting_down(g->st)) {
+	if (gen_dead(g)) {
 		g->st->ctx->interrupt = 1;
 		return;
 	}
@@ -832,32 +825,15 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 		return;
 	}
 
-	if (g->first_token && g->st->ctx->chat.think_open)
-		g->in_thinking = true;
-	g->first_token = false;
-
-	if (id == g->st->ctx->chat.think_start_id) {
-		g->in_thinking = true;
-		g->skip_label  = true;
+	think_filter_event tev =
+		think_filter_feed(&g->think, id, g->st->ctx->chat.think_start_id,
+						  g->st->ctx->chat.think_end_id, g->st->ctx->chat.think_open, &piece, &n);
+	if (tev != THINK_EMIT)
 		return;
-	}
-	if (id == g->st->ctx->chat.think_end_id) {
-		g->in_thinking = false;
-		return;
-	}
-
-	if (g->skip_label) {
-		const char *nl = memchr(piece, '\n', (size_t)n);
-		if (!nl)
-			return;
-		n			  = n - (int)(nl - piece) - 1;
-		piece		  = nl + 1;
-		g->skip_label = false;
-	}
 	if (n <= 0)
 		return;
 
-	toolcall_buf *dst = g->in_thinking ? &g->reasoning : &g->content;
+	toolcall_buf *dst = g->think.in_thinking ? &g->reasoning : &g->content;
 	toolcall_buf_append(dst, piece, (size_t)n);
 	check_stop_sequences(g);
 	if (g->stopped_by_stop) {
@@ -877,21 +853,19 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 			return;
 		}
 	} else if (g->streaming) {
-		sse_send_delta(g, g->in_thinking, piece, (size_t)n);
+		sse_send_delta(g, g->think.in_thinking, piece, (size_t)n);
 	}
 }
 
 static void sse_finish_stream(oa_gen *g) {
 	const char *finish = compute_finish_reason(g);
 
-	if (!g->client_gone && !shutting_down(g->st)) {
+	if (!gen_dead(g)) {
 		if (g->chat_api) {
-			if (!g->sent_any_chunk)
-				sse_send_role_chunk(g);
+			sse_ensure_preamble(g);
 			sse_chat_delta(g, NULL, finish);
 		} else {
-			if (!g->sent_any_chunk)
-				sse_text_delta(g, "", 0, NULL);
+			sse_ensure_preamble(g);
 			sse_text_delta(g, "", 0, finish);
 		}
 
@@ -917,15 +891,15 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 	g->chat_api	 = chat_api;
 	make_id(g);
 
-	g->in_thinking		= false;
-	g->first_token		= true;
-	g->skip_label		= false;
-	g->stopped_by_stop	= false;
-	g->sent_any_chunk	= false;
-	g->tool_fill_logged = false;
-	g->generation_done	= false;
-	g->prompt_tokens	= 0;
-	g->generated		= 0;
+	g->think.in_thinking = false;
+	g->think.first_token = true;
+	g->think.skip_label	 = false;
+	g->stopped_by_stop	 = false;
+	g->sent_any_chunk	 = false;
+	g->tool_fill_logged	 = false;
+	g->generation_done	 = false;
+	g->prompt_tokens	 = 0;
+	g->generated		 = 0;
 	toolcall_buf_reset(&g->content);
 	toolcall_buf_reset(&g->reasoning);
 
@@ -998,7 +972,7 @@ static ssize_t sse_read_cb(void *cls, uint64_t pos, char *buf, size_t max) {
 	(void)pos;
 
 	pthread_mutex_lock(&g->q_mtx);
-	while (g->q_len == 0 && !g->producer_done && !g->client_gone && !shutting_down(g->st)) {
+	while (g->q_len == 0 && !g->producer_done && !gen_dead(g)) {
 		struct timespec ts;
 		clock_gettime(CLOCK_REALTIME, &ts);
 		ts.tv_sec += SSE_POLL_SEC;
@@ -1062,13 +1036,19 @@ static void *gen_thread_main(void *arg) {
 	return NULL;
 }
 
-static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
-								   const char *url) {
-	if (!check_auth(st, conn))
-		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
-							error_body("Invalid API key", "authentication_error"));
+static enum MHD_Result respond_auth_failure(openai_state *st, struct MHD_Connection *conn) {
+	(void)st;
+	return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
+						error_body("Invalid API key", "authentication_error"));
+}
 
-	DEBUG("request body [%s] (%zu bytes): %.4096s", url, rc->body.len,
+static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+								   bool chat_api) {
+	if (!check_auth(st, conn))
+		return respond_auth_failure(st, conn);
+
+	DEBUG("request body [%s] (%zu bytes): %.4096s",
+		  chat_api ? "/v1/chat/completions" : "/v1/completions", rc->body.len,
 		  rc->body.p ? rc->body.p : "(empty)");
 
 	json_object *body = json_tokener_parse(rc->body.p ? rc->body.p : "");
@@ -1082,9 +1062,8 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 			error_body("Request body must be a JSON object", "invalid_request_error"));
 	}
 
-	bool		chat_api = strcmp(url, "/v1/chat/completions") == 0;
-	const char *err		 = chat_api ? parse_chat_request(body, &rc->params)
-									: parse_completion_request(body, &rc->params);
+	const char *err = chat_api ? parse_chat_request(body, &rc->params)
+							   : parse_completion_request(body, &rc->params);
 	if (err) {
 		json_object_put(body);
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST, error_body(err, "invalid_request_error"));
@@ -1131,6 +1110,7 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 			return respond_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
 								error_body("server overloaded", "server_error"));
 		}
+		pthread_detach(tid);
 		rc_ref(rc);
 		struct MHD_Response *resp =
 			MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4096, sse_read_cb, rc, sse_free_cb);
@@ -1182,14 +1162,24 @@ static enum MHD_Result route_root(openai_state *st, struct MHD_Connection *conn,
 }
 
 static enum MHD_Result route_completions(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
-										 const char *url, const char *method) {
+										 const char *url, const char *method, bool chat_api) {
 	if (rc->too_large)
 		return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
 							error_body("request body too large", "invalid_request_error"));
 	uint64_t		t0 = time_us();
-	enum MHD_Result r  = handle_post(st, conn, rc, url);
+	enum MHD_Result r  = handle_post(st, conn, rc, chat_api);
 	INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
 	return r;
+}
+
+static enum MHD_Result route_chat_completions(openai_state *st, struct MHD_Connection *conn,
+											  req_ctx *rc, const char *url, const char *method) {
+	return route_completions(st, conn, rc, url, method, true);
+}
+
+static enum MHD_Result route_text_completions(openai_state *st, struct MHD_Connection *conn,
+											  req_ctx *rc, const char *url, const char *method) {
+	return route_completions(st, conn, rc, url, method, false);
 }
 
 static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
@@ -1198,8 +1188,7 @@ static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *con
 	(void)url;
 	(void)method;
 	if (!check_auth(st, conn))
-		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
-							error_body("Invalid API key", "authentication_error"));
+		return respond_auth_failure(st, conn);
 	return respond_json(conn, MHD_HTTP_OK, models_body(st));
 }
 
@@ -1215,8 +1204,8 @@ typedef struct {
 static const route routes[] = {
 	{"GET", "/health", route_health},
 	{"GET", "/", route_root},
-	{"POST", "/v1/chat/completions", route_completions},
-	{"POST", "/v1/completions", route_completions},
+	{"POST", "/v1/chat/completions", route_chat_completions},
+	{"POST", "/v1/completions", route_text_completions},
 	{"GET", "/v1/models", route_models},
 };
 
@@ -1247,7 +1236,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 	if (strcmp(method, "OPTIONS") == 0) {
 		struct MHD_Response *resp =
 			MHD_create_response_from_buffer(0, (void *)"", MHD_RESPMEM_PERSISTENT);
-		MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
+		add_cors(resp);
 		MHD_add_response_header(resp, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 		MHD_add_response_header(resp, "Access-Control-Allow-Headers",
 								"Content-Type, Authorization");

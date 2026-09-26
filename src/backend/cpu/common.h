@@ -13,6 +13,18 @@
 
 status_code cpu_backend_fill(backend *out);
 
+#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
+	static status_code ctor_fn(backend *out) {                                                     \
+		memset(out, 0, sizeof(*out));                                                              \
+		out->name	  = name_str;                                                                  \
+		out->priority = prio;                                                                      \
+		out->caps	  = CPU_BACKEND_CAPS;                                                          \
+		out->desc	  = desc_str;                                                                  \
+		return cpu_backend_fill(out);                                                              \
+	}                                                                                              \
+	BACKEND_REGISTER(name_str, ctor_fn)                                                            \
+	void backend_autoreg_cpu_scalar_ctor(void) {}
+
 int32_t cpu_argmax_f32(const float *logits, int vocab);
 
 typedef struct {
@@ -280,11 +292,16 @@ typedef struct {
 	int			 pos0, n_rows;
 } cpu_partial_rope_qk_job;
 
-static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {
-	if (tpool_current_tid() < 0 && pool && m >= 2)
-		tpool_parallel_for(pool, m, 1, chunk, job);
+static inline void cpu_run_batch_full(tpool *pool, int m, int grain, int min_m,
+									  tpool_chunk_fn chunk, void *job) {
+	if (tpool_current_tid() < 0 && pool && m >= min_m)
+		tpool_parallel_for(pool, m, grain, chunk, job);
 	else
 		chunk(0, m, 0, job);
+}
+
+static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {
+	cpu_run_batch_full(pool, m, 1, 2, chunk, job);
 }
 
 #endif

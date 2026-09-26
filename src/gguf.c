@@ -733,6 +733,22 @@ status_code gguf_load(gguf_ctx *ctx, const char *path) {
 	return gguf_parse_common(ctx, map, fsize, fd, map, 0);
 }
 
+static ssize_t pread_full(int fd, void *dst, size_t len, uint64_t file_off) {
+	size_t total = 0;
+	while (total < len) {
+		ssize_t n = pread(fd, (char *)dst + total, len - total, (off_t)(file_off + total));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			break;
+		total += (size_t)n;
+	}
+	return (ssize_t)total;
+}
+
 static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t file_off, size_t len,
 						   void *dst) {
 	if (len == 0)
@@ -744,20 +760,10 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 		int len_aligned = ((len & (align - 1)) == 0);
 
 		if (dst_aligned && off_aligned && len_aligned) {
-			size_t total = 0;
-			while (total < len) {
-				ssize_t n =
-					pread(direct_fd, (char *)dst + total, len - total, (off_t)(file_off + total));
-				if (n < 0) {
-					if (errno == EINTR)
-						continue;
-					goto bounce_fallback;
-				}
-				if (n == 0)
-					break;
-				total += (size_t)n;
-			}
-			if (total >= len) {
+			ssize_t total = pread_full(direct_fd, dst, len, file_off);
+			if (total < 0)
+				goto bounce_fallback;
+			if ((size_t)total >= len) {
 				posix_fadvise(direct_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 				return 0;
 			}
@@ -771,23 +777,9 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 
 		void *bounce = NULL;
 		if (posix_memalign(&bounce, align, aligned_len) == 0 && bounce) {
-			size_t	 total	   = 0;
-			int		 io_failed = 0;
-			uint8_t *bp		   = bounce;
-			while (total < aligned_len) {
-				ssize_t n =
-					pread(direct_fd, bp + total, aligned_len - total, (off_t)(aligned_off + total));
-				if (n < 0) {
-					if (errno == EINTR)
-						continue;
-					io_failed = 1;
-					break;
-				}
-				if (n == 0)
-					break;
-				total += (size_t)n;
-			}
-			if (!io_failed && total >= head_slop + len) {
+			uint8_t *bp	   = bounce;
+			ssize_t	 total = pread_full(direct_fd, bp, aligned_len, aligned_off);
+			if (total >= 0 && (size_t)total >= head_slop + len) {
 				memcpy(dst, bp + head_slop, len);
 				free(bounce);
 				posix_fadvise(direct_fd, (off_t)aligned_off, (off_t)aligned_len,
@@ -801,18 +793,8 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 
 	if (plain_fd < 0)
 		return -1;
-	size_t total = 0;
-	while (total < len) {
-		ssize_t n = pread(plain_fd, (char *)dst + total, len - total, (off_t)(file_off + total));
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (n == 0)
-			return -1;
-		total += (size_t)n;
-	}
+	if (pread_full(plain_fd, dst, len, file_off) != (ssize_t)len)
+		return -1;
 	posix_fadvise(plain_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 	return 0;
 }
@@ -860,20 +842,13 @@ static int gguf_affinity_thread_count(void) {
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	gguf_ctx_init(ctx);
 
-	int fd = open(path, O_RDONLY);
+	size_t real_fsize = 0;
+	int	   fd		  = gguf_open_ro(path, &real_fsize);
 	if (fd < 0)
 		return ERR_IO;
-
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
-		close(fd);
-		return ERR_IO;
-	}
-	size_t real_fsize = (size_t)st.st_size;
-	if (real_fsize == 0) {
-		close(fd);
-		return ERR_IO;
-	}
+	status_code rc = ERR_IO;
+	if (real_fsize == 0)
+		goto fail;
 
 	size_t		cap	 = MIN(GGUF_METADATA_INITIAL_CHUNK, real_fsize);
 	void	   *buf	 = xmalloc(cap);
@@ -884,9 +859,8 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 		while (have < cap) {
 			ssize_t n = pread(fd, (char *)buf + have, cap - have, (off_t)have);
 			if (n < 0) {
-				free(buf);
-				close(fd);
-				return ERR_IO;
+				rc = ERR_IO;
+				goto fail_buf;
 			}
 			if (n == 0)
 				break;
@@ -903,17 +877,15 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 		gguf_free(&trial);
 
 		if (have >= real_fsize) {
-			free(buf);
-			close(fd);
-			return ERR_FORMAT;
+			rc = ERR_FORMAT;
+			goto fail_buf;
 		}
 
 		size_t grow	   = MIN(cap, GGUF_METADATA_MAX_CHUNK);
 		size_t new_cap = MIN(cap + grow, real_fsize);
 		if (new_cap <= cap) {
-			free(buf);
-			close(fd);
-			return ERR_FORMAT;
+			rc = ERR_FORMAT;
+			goto fail_buf;
 		}
 		void *nbuf = xrealloc(buf, new_cap);
 		buf		   = nbuf;
@@ -936,6 +908,12 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	ctx->map_size	 = 0;
 	ctx->map_is_heap = 0;
 	return OK;
+
+fail_buf:
+	free(buf);
+fail:
+	close(fd);
+	return rc;
 }
 
 status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
@@ -984,7 +962,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 	int	   direct_fd = -1;
 	size_t align	 = 0;
 	{
-		int fd = open(path, O_RDONLY | O_DIRECT);
+		int fd = open(path, O_RDONLY);
 		if (fd < 0) {
 			DEBUG("gguf sparse-load: O_DIRECT unavailable (%s), using buffered reads",
 				  strerror(errno));
@@ -1273,14 +1251,18 @@ static status_code gguf_find_checked(const gguf_ctx *c, const char *key, uint32_
 }
 
 status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_I32 || c->kv_types[i] == GGUF_TYPE_U32) {
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_I32, &i);
+	if (st == OK) {
 		*o = (int32_t)(uint32_t)c->kv_vals[i];
 		return OK;
 	}
-	return ERR_INVALID_ARG;
+	status_code st2 = gguf_find_checked(c, k, GGUF_TYPE_U32, &i);
+	if (st2 == OK) {
+		*o = (int32_t)(uint32_t)c->kv_vals[i];
+		return OK;
+	}
+	return st == ERR_NOT_FOUND && st2 == ERR_NOT_FOUND ? ERR_NOT_FOUND : ERR_INVALID_ARG;
 }
 
 status_code gguf_get_f32(const gguf_ctx *c, const char *k, float *o) {
@@ -1347,6 +1329,15 @@ status_code gguf_get_arr_str(const gguf_ctx *c, const char *k, const char *const
 	status_code st	= gguf_get_arr_raw(c, k, GGUF_TYPE_STRING, &raw, out_count);
 	if (st == OK)
 		*o = (const char *const *)raw;
+	return st;
+}
+
+status_code gguf_get_arr_bool(const gguf_ctx *c, const char *k, const uint8_t **o,
+							  size_t *out_count) {
+	const void *raw = NULL;
+	status_code st	= gguf_get_arr_raw(c, k, GGUF_TYPE_BOOL, &raw, out_count);
+	if (st == OK)
+		*o = (const uint8_t *)raw;
 	return st;
 }
 

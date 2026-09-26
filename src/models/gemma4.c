@@ -10,17 +10,16 @@
 
 #include <math.h>
 
-static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m) {
-	backend	   *a				 = m->backend;
-	const int	dim				 = m->dim;
-	const int	n_heads			 = m->n_heads;
-	const int	n_kv_heads		 = m->n_kv_heads;
-	const int	head_dim		 = m->head_dim;
-	const int	n_ctx			 = m->n_ctx;
-	const float eps				 = m->norm_eps;
-	const float attn_scale		 = 1.0f;
-	const int	rope_neox		 = m->arch_info->uses_neox_rope;
-	const int	has_matmul_multi = backend_has_cap(a, BCAP_MULTI_MATMUL);
+static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int has_matmul_multi) {
+	backend	   *a		   = m->backend;
+	const int	dim		   = m->dim;
+	const int	n_heads	   = m->n_heads;
+	const int	n_kv_heads = m->n_kv_heads;
+	const int	head_dim   = m->head_dim;
+	const int	n_ctx	   = m->n_ctx;
+	const float eps		   = m->norm_eps;
+	const float attn_scale = 1.0f;
+	const int	rope_neox  = m->arch_info->uses_neox_rope;
 
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM));
 
@@ -32,12 +31,8 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m) {
 	} else {
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, 0, dim, STAGE_MATMUL));
 
-		if (has_matmul_multi) {
-			OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, 0, 0, dim));
-		} else {
-			OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, 0, dim, STAGE_MATMUL));
-			OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, 0, dim, STAGE_MATMUL));
-		}
+		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, 0, dim, STAGE_MATMUL));
+		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, 0, dim, STAGE_MATMUL));
 	}
 
 	if (m->arch_info->has_qk_norm) {
@@ -63,8 +58,8 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m) {
 							  WIDX_POST_ATTN_NORM, eps, STAGE_ADD));
 }
 
-static void build_gemma4_ffn_prefix(op_emitter *e, const model *m, int dim, float eps) {
-	const int has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
+static void build_gemma4_ffn_prefix(op_emitter *e, const model *m, int dim, float eps,
+									int has_matmul_multi) {
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 	if (has_matmul_multi) {
 		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, 0, 0, dim));
@@ -101,10 +96,11 @@ static model_recipe *build_gemma4_recipe(const model *m) {
 
 	{
 		enum { GEMMA4_MAX_OPS = 28 };
-		recipe_op *ops = xcalloc(GEMMA4_MAX_OPS, sizeof(recipe_op));
-		op_emitter e   = op_emitter_make(ops, GEMMA4_MAX_OPS, "gemma4");
-		recipe_append_gemma4_attn_block(&e, m);
-		build_gemma4_ffn_prefix(&e, m, dim, eps);
+		recipe_op *ops	  = xcalloc(GEMMA4_MAX_OPS, sizeof(recipe_op));
+		op_emitter e	  = op_emitter_make(ops, GEMMA4_MAX_OPS, "gemma4");
+		const int  has_mm = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
+		recipe_append_gemma4_attn_block(&e, m, has_mm);
+		build_gemma4_ffn_prefix(&e, m, dim, eps, has_mm);
 		build_gemma4_ffn_tail(&e, m, eps, r);
 	}
 
@@ -124,10 +120,11 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 
 	{
 		enum { GEMMA4_MOE_MAX_OPS = 40 };
-		recipe_op *ops = xcalloc(GEMMA4_MOE_MAX_OPS, sizeof(recipe_op));
-		op_emitter e   = op_emitter_make(ops, GEMMA4_MOE_MAX_OPS, "gemma4_moe");
-		recipe_append_gemma4_attn_block(&e, m);
-		build_gemma4_ffn_prefix(&e, m, dim, eps);
+		recipe_op *ops	  = xcalloc(GEMMA4_MOE_MAX_OPS, sizeof(recipe_op));
+		op_emitter e	  = op_emitter_make(ops, GEMMA4_MOE_MAX_OPS, "gemma4_moe");
+		const int  has_mm = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
+		recipe_append_gemma4_attn_block(&e, m, has_mm);
+		build_gemma4_ffn_prefix(&e, m, dim, eps, has_mm);
 
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_XB2, RECIPE_SLOT_FFN_ACT, WIDX_FFN_POST_NORM_1, eps,
 							   STAGE_RMSNORM));

@@ -119,20 +119,23 @@ void config_usage(FILE *fp, bool is_server) {
 			"  -h, --help               show this help\n");
 }
 
+static const struct {
+	const char *token;
+	int			value;
+} bool_tokens[] = {
+	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
+};
+
 static int parse_bool_flag(const char *flag, const char *optarg, int default_if_bare, int *out) {
 	if (!optarg) {
 		*out = default_if_bare;
 		return 0;
 	}
-	if (!strcmp(optarg, "yes") || !strcmp(optarg, "on") || !strcmp(optarg, "true") ||
-		!strcmp(optarg, "1")) {
-		*out = 1;
-		return 0;
-	}
-	if (!strcmp(optarg, "no") || !strcmp(optarg, "off") || !strcmp(optarg, "false") ||
-		!strcmp(optarg, "0")) {
-		*out = 0;
-		return 0;
+	for (size_t i = 0; i < ARRAY_LEN(bool_tokens); i++) {
+		if (strcmp(optarg, bool_tokens[i].token) == 0) {
+			*out = bool_tokens[i].value;
+			return 0;
+		}
 	}
 	ERROR("invalid %s value '%s' (expected one of: yes, on, true, 1, no, off, false, 0)", flag,
 		  optarg);
@@ -193,8 +196,10 @@ static int parse_float_arg(const char *optarg, const char *flag, float minv, flo
 }
 
 static int bool_token_is_valid(const char *s) {
-	return !strcmp(s, "yes") || !strcmp(s, "on") || !strcmp(s, "true") || !strcmp(s, "1") ||
-		   !strcmp(s, "no") || !strcmp(s, "off") || !strcmp(s, "false") || !strcmp(s, "0");
+	for (size_t i = 0; i < ARRAY_LEN(bool_tokens); i++)
+		if (strcmp(s, bool_tokens[i].token) == 0)
+			return 1;
+	return 0;
 }
 
 static const char *peek_optional_bool_arg(const char *optarg, int argc, char **argv, int *optind) {
@@ -318,12 +323,7 @@ static int handle_cli_option(const cli_option_desc *o, const char *optarg, int a
 		return 0;
 	}
 	case CLI_OPT_PORT:
-		a->server_port = atoi(optarg);
-		if (a->server_port <= 0 || a->server_port > 65535) {
-			ERROR("invalid --port value '%s'", optarg);
-			return -1;
-		}
-		return 0;
+		return parse_int_arg(optarg, flag, 1, 65535, &a->server_port);
 	case CLI_OPT_HELP:
 		config_usage(stdout, a->is_server);
 		exit(0);
@@ -343,8 +343,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 	memset(a, 0, sizeof(*a));
 
 	const char *prog	= (argc > 0 && argv[0]) ? argv[0] : "";
-	const char *prog_bn = strrchr(prog, '/');
-	prog_bn				= prog_bn ? prog_bn + 1 : prog;
+	const char *prog_bn = path_basename(prog);
 	a->is_server		= strstr(prog_bn, "server") != NULL;
 
 	a->n_predict	  = -1;

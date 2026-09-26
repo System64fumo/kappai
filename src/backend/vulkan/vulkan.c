@@ -23,7 +23,6 @@
 
 #define VK_DESC_CACHE_CAP 256
 #define VK_MAX_BINDINGS 8
-#define VK_KV_MAGIC 0x564b4b56u
 #define VK_RING_DEPTH 4
 
 static inline uint32_t vk_f32_to_bits(float f) {
@@ -136,7 +135,6 @@ typedef struct {
 } vk_kv_store;
 
 typedef struct {
-	uint32_t	magic;
 	vk_kv_store store;
 } vk_kv_handle;
 
@@ -187,9 +185,6 @@ typedef struct {
 		int			 is_mali;
 		int			 is_power_vr;
 		int			 is_adreno;
-		int			 is_radv;
-		int			 is_nvidia;
-		int			 is_intel;
 		int			 is_amd;
 		int			 supports_subgroup_basic;
 		int			 supports_subgroup_vote;
@@ -353,7 +348,6 @@ typedef struct {
 	vk_buf argmax_partial_buf;
 
 	vk_buf moe_arena;
-	size_t moe_arena_size;
 	int	   moe_arena_inter;
 	int	   moe_arena_dim;
 	vk_buf moe_batch_arena;
@@ -1918,10 +1912,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.is_mali		= (props.vendorID == 0x13B5);
 	p->caps.is_power_vr = (props.vendorID == 0x1010);
 	p->caps.is_adreno	= (props.vendorID == 0x5143);
-	p->caps.is_nvidia	= (props.vendorID == 0x10DE);
-	p->caps.is_intel	= (props.vendorID == 0x8086);
 	p->caps.is_amd		= (props.vendorID == 0x1002);
-	p->caps.is_radv		= (props.vendorID == 0x1002);
 
 	p->caps.subgroup_size = 1;
 #ifdef VK_VERSION_1_1
@@ -1986,7 +1977,7 @@ static status_code vk_init(backend *self, int device_index) {
 		p->matmul_tile_k		  = 256;
 		p->matmul_m_per_wg		  = 2;
 	}
-	if (p->caps.is_radv || p->caps.is_amd) {
+	if (p->caps.is_amd) {
 		p->matmul_wg_size		  = 128;
 		p->matmul_rows_per_thread = 1;
 		p->matmul_tile_k		  = 2048;
@@ -2914,11 +2905,9 @@ static status_code vk_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 											VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->moe_arena);
 		if (s != OK)
 			return s;
-		p->moe_arena_size  = bytes;
 		p->moe_arena_inter = inter;
 		p->moe_arena_dim   = dim;
 	}
-	(void)p->moe_arena_size;
 
 	buffer arena = {0};
 	arena.handle = &p->moe_arena;
@@ -3024,15 +3013,6 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 	int *gu_off	 = xmalloc((size_t)n_experts * sizeof(int));
 	int *act_off = xmalloc((size_t)n_experts * sizeof(int));
 	int *y_off	 = xmalloc((size_t)n_experts * sizeof(int));
-	if (!r_off || !w_off || !x_off || !gu_off || !act_off || !y_off) {
-		free(r_off);
-		free(w_off);
-		free(x_off);
-		free(gu_off);
-		free(act_off);
-		free(y_off);
-		return ERR_OUT_OF_MEMORY;
-	}
 
 	size_t mo = 0, ao = 0, packed = 0;
 	for (int i = 0; i < n_experts; i++) {
@@ -3386,10 +3366,12 @@ static vk_buf *vk_kv_layer_buf(const vk_kv_handle *h, int layer, int *shader_lay
 			idx = 0;
 		if (idx >= h->store.n_chunks)
 			idx = h->store.n_chunks - 1;
-		*shader_layer_out = 0;
+		if (shader_layer_out)
+			*shader_layer_out = 0;
 		return &h->store.chunks[idx];
 	}
-	*shader_layer_out = layer;
+	if (shader_layer_out)
+		*shader_layer_out = layer;
 	return (vk_buf *)&h->store.single;
 }
 
@@ -3505,8 +3487,6 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 
 	vk_kv_handle *kh = xcalloc(1, sizeof(vk_kv_handle));
 	vk_kv_handle *vh = xcalloc(1, sizeof(vk_kv_handle));
-	kh->magic		 = VK_KV_MAGIC;
-	vh->magic		 = VK_KV_MAGIC;
 
 	status_code s = vk_kv_store_alloc(p, total, per_layer_uniform, n_kv_layers, layer_bytes,
 									  layer_off_elems, &kh->store);
@@ -3555,10 +3535,8 @@ static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int
 
 	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	int					shader_layer_k;
-	int					shader_layer_v;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
+	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
+	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
 
 	struct {
 		uint32_t layer_off;
@@ -3589,10 +3567,8 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 
 	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	int					shader_layer_k;
-	int					shader_layer_v;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
+	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
+	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
 
 	struct {
 		uint32_t layer_off;
@@ -4304,6 +4280,7 @@ static status_code vk_attention_host_fallback(backend *self, const buffer *q, bu
 											  int n_active, int head_dim, int n_ctx, float scale,
 											  int attn_start, int n_pos) {
 	(void)n_kv_heads;
+	(void)layer_n_elems;
 	int			n_groups = (n_heads + n_active - 1) / n_active;
 	int			q_total	 = n_heads * head_dim;
 	float	   *qf		 = xmalloc((size_t)q_total * sizeof(float));
@@ -4316,15 +4293,27 @@ static status_code vk_attention_host_fallback(backend *self, const buffer *q, bu
 		return st;
 	}
 
-	size_t kvh_stride = (size_t)n_ctx * head_dim;
-	size_t dl_bytes	  = layer_n_elems * sizeof(uint16_t);
+	size_t kvh_stride  = (size_t)n_ctx * head_dim;
+	size_t slice_elems = (size_t)n_active * (size_t)n_pos * (size_t)head_dim;
 
-	uint16_t *kd_base_buf = xmalloc(dl_bytes);
-	uint16_t *vd_base_buf = xmalloc(dl_bytes);
-	st = vk_buf_download_raw(self, kb, layer_off_elems * sizeof(uint16_t), kd_base_buf, dl_bytes);
-	if (st == OK)
-		st = vk_buf_download_raw(self, vb, layer_off_elems * sizeof(uint16_t), vd_base_buf,
-								 dl_bytes);
+	uint16_t *kd_base_buf = xmalloc(slice_elems * sizeof(uint16_t));
+	uint16_t *vd_base_buf = xmalloc(slice_elems * sizeof(uint16_t));
+	st					  = OK;
+	for (int kvh = 0; kvh < n_active && st == OK; kvh++) {
+		size_t src_off =
+			(layer_off_elems + (size_t)kvh * kvh_stride + (size_t)attn_start * (size_t)head_dim) *
+			sizeof(uint16_t);
+		uint16_t *kd_dst = kd_base_buf + (size_t)kvh * (size_t)n_pos * (size_t)head_dim;
+		uint16_t *vd_dst = vd_base_buf + (size_t)kvh * (size_t)n_pos * (size_t)head_dim;
+		for (int t = 0; t < n_pos && st == OK; t++) {
+			size_t row_off = src_off + (size_t)t * kvh_stride * sizeof(uint16_t);
+			size_t row_b   = (size_t)head_dim * sizeof(uint16_t);
+			st = vk_buf_download_raw(self, kb, row_off, kd_dst + (size_t)t * head_dim, row_b);
+			if (st == OK)
+				st = vk_buf_download_raw(self, vb, row_off, vd_dst + (size_t)t * head_dim, row_b);
+		}
+	}
+	kvh_stride = (size_t)n_pos * head_dim;
 	if (st != OK) {
 		free(qf);
 		free(outf);
@@ -4343,11 +4332,11 @@ static status_code vk_attention_host_fallback(backend *self, const buffer *q, bu
 		if (kvh != cur_kvh) {
 			cur_kvh = kvh;
 			for (int t = 0; t < n_pos; t++) {
-				size_t kv_off = ((size_t)kvh * kvh_stride) + ((size_t)(attn_start + t) * head_dim);
-				uint16_t *kd  = kd_base_buf + kv_off;
-				uint16_t *vd  = vd_base_buf + kv_off;
-				float	 *ks  = k_slice + ((size_t)t * head_dim);
-				float	 *vs  = v_slice + ((size_t)t * head_dim);
+				size_t	  kv_off = ((size_t)kvh * kvh_stride) + ((size_t)t * head_dim);
+				uint16_t *kd	 = kd_base_buf + kv_off;
+				uint16_t *vd	 = vd_base_buf + kv_off;
+				float	 *ks	 = k_slice + ((size_t)t * head_dim);
+				float	 *vs	 = v_slice + ((size_t)t * head_dim);
 				for (int d = 0; d < head_dim; d++) {
 					ks[d] = vk_f16_to_f32(kd[d]);
 					vs[d] = vk_f16_to_f32(vd[d]);
@@ -5578,9 +5567,8 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 
 	const vk_kv_handle *kh = (const vk_kv_handle *)k_cache->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v_cache->handle;
-	int					shader_layer_k, shader_layer_v;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
+	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
+	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;

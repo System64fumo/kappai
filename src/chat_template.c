@@ -258,9 +258,27 @@ static char *strip_thinking_spans(chat_template_state *cts, const char *content)
 	return out;
 }
 
+static void simple_message(chat_message *m, const char *role, const char *content) {
+	memset(m, 0, sizeof(*m));
+	m->role	   = (char *)(role ? role : "");
+	m->content = (char *)(content ? content : "");
+}
+
+static jinja_value *build_globals(chat_template_state *cts, const chat_message *extra,
+								  size_t n_extra, int add_generation_prompt);
+
+static status_code render_with_globals(chat_template_state *cts, const chat_message *extra,
+									   size_t n_extra, int add_generation_prompt, char **out,
+									   char *errbuf, size_t errbuf_len) {
+	jinja_value *g	= build_globals(cts, extra, n_extra, add_generation_prompt);
+	status_code	 rc = jinja_render(cts->prog, g, out, errbuf, errbuf_len);
+	jinja_value_free(g);
+	return rc == OK ? OK : ERR_FORMAT;
+}
+
 void chat_template_add_message(chat_template_state *cts, const char *role, const char *content) {
-	chat_message m = {.role	   = (char *)(role ? role : ""),
-					  .content = (char *)(content ? content : "")};
+	chat_message m;
+	simple_message(&m, role, content);
 	chat_template_add_message_ex(cts, &m);
 }
 
@@ -323,11 +341,8 @@ status_code chat_template_render(chat_template_state *cts, int add_generation_pr
 								 char *errbuf, size_t errbuf_len) {
 	if (!cts || !cts->prog || !out)
 		return ERR_INVALID_ARG;
-	*out				 = NULL;
-	jinja_value *globals = build_globals(cts, NULL, 0, add_generation_prompt);
-	status_code	 rc		 = jinja_render(cts->prog, globals, out, errbuf, errbuf_len);
-	jinja_value_free(globals);
-	return rc == OK ? OK : ERR_FORMAT;
+	*out = NULL;
+	return render_with_globals(cts, NULL, 0, add_generation_prompt, out, errbuf, errbuf_len);
 }
 
 status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,
@@ -337,12 +352,9 @@ status_code chat_template_preview_next_turn(chat_template_state *cts, const char
 		return ERR_INVALID_ARG;
 	*out = NULL;
 
-	chat_message extra = {.role	   = (char *)(role ? role : "user"),
-						  .content = (char *)(content ? content : "")};
-	jinja_value *g	   = build_globals(cts, &extra, 1, add_generation_prompt);
-	status_code	 rc	   = jinja_render(cts->prog, g, out, errbuf, errbuf_len);
-	jinja_value_free(g);
-	return rc == OK ? OK : ERR_FORMAT;
+	chat_message extra;
+	simple_message(&extra, role ? role : "user", content);
+	return render_with_globals(cts, &extra, 1, add_generation_prompt, out, errbuf, errbuf_len);
 }
 
 size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *system) {
@@ -356,16 +368,12 @@ size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *
 	size_t prefix_len = 0;
 
 	jinja_set_time_shift(0);
-	jinja_value *g1	 = build_globals(cts, &sys_msg, 1, 0);
-	status_code	 rc1 = jinja_render(cts->prog, g1, &r1, NULL, 0);
-	jinja_value_free(g1);
+	status_code rc1 = render_with_globals(cts, &sys_msg, 1, 0, &r1, NULL, 0);
 	if (rc1 != OK)
 		goto out;
 
 	jinja_set_time_shift(86400);
-	jinja_value *g2	 = build_globals(cts, &sys_msg, 1, 0);
-	status_code	 rc2 = jinja_render(cts->prog, g2, &r2, NULL, 0);
-	jinja_value_free(g2);
+	status_code rc2 = render_with_globals(cts, &sys_msg, 1, 0, &r2, NULL, 0);
 	if (rc2 != OK)
 		goto out;
 
@@ -382,8 +390,8 @@ out:
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
 								   int add_generation_prompt, char **out, char *errbuf,
 								   size_t errbuf_len) {
-	chat_message m = {.role	   = (char *)(role ? role : ""),
-					  .content = (char *)(content ? content : "")};
+	chat_message m;
+	simple_message(&m, role, content);
 	return chat_template_add_turn_ex(cts, &m, add_generation_prompt, out, errbuf, errbuf_len);
 }
 
@@ -392,10 +400,9 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 									  size_t errbuf_len) {
 	chat_template_add_message_ex(cts, msg);
 
-	jinja_value *globals = build_globals(cts, NULL, 0, add_generation_prompt);
-	char		*rendered;
-	status_code	 rc = jinja_render(cts->prog, globals, &rendered, errbuf, errbuf_len);
-	jinja_value_free(globals);
+	char	   *rendered;
+	status_code rc =
+		render_with_globals(cts, NULL, 0, add_generation_prompt, &rendered, errbuf, errbuf_len);
 	if (rc != OK)
 		return rc;
 

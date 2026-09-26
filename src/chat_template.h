@@ -68,6 +68,45 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *content,
 										  const char *reasoning, json_object *tool_calls);
 
+typedef enum {
+	THINK_EMIT,
+	THINK_START,
+	THINK_END,
+	THINK_SWALLOW,
+} think_filter_event;
+
+typedef struct {
+	bool in_thinking;
+	bool skip_label;
+	bool first_token;
+} think_filter;
+
+static inline think_filter_event think_filter_feed(think_filter *f, int32_t id, int32_t start_id,
+												   int32_t end_id, int think_open,
+												   const char **piece, int *n) {
+	if (f->first_token && think_open)
+		f->in_thinking = true;
+	f->first_token = false;
+	if (id == start_id) {
+		f->in_thinking = true;
+		f->skip_label  = true;
+		return THINK_START;
+	}
+	if (id == end_id) {
+		f->in_thinking = false;
+		return THINK_END;
+	}
+	if (f->skip_label) {
+		const char *nl = memchr(*piece, '\n', (size_t)*n);
+		if (!nl)
+			return THINK_SWALLOW;
+		*n			  = *n - (int)(nl - *piece) - 1;
+		*piece		  = nl + 1;
+		f->skip_label = false;
+	}
+	return THINK_EMIT;
+}
+
 size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *system);
 
 status_code chat_template_preview_next_turn(chat_template_state *cts, const char *role,

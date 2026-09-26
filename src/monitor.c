@@ -5,6 +5,7 @@
 #include "profile.h"
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,16 @@
 #include <unistd.h>
 
 #define MONITOR_DEFAULT_PATH "/tmp/kappai.monitor"
+
+void monitor_emit(monitor *mon, const char *json_fmt, ...) {
+	va_list ap;
+	va_start(ap, json_fmt);
+	char buf[4096];
+	vsnprintf(buf, sizeof(buf), json_fmt, ap);
+	va_end(ap);
+	monitor_send(mon, "%s", buf);
+	monitor_poll(mon);
+}
 
 monitor *g_monitor = NULL;
 
@@ -177,95 +188,104 @@ static void append_moe_json(char *buf, size_t cap, const moe_stats_summary *moe)
 			 moe->hit_rate, moe->pin_rate, moe->lru_rate, (unsigned long long)moe->cache_misses);
 }
 
+static void append_moe_io_json(char *buf, size_t cap, const moe_stats_summary *moe) {
+	buf[0] = '\0';
+	if (!moe || !moe->has_moe)
+		return;
+	snprintf(buf, cap, ",\"moe_direct_ok\":%llu,\"moe_direct_fallback\":%llu",
+			 (unsigned long long)moe->direct_io_ok, (unsigned long long)moe->direct_io_fallback);
+}
+
+static const char *json_escape_str(const char *s, char *buf, size_t cap) {
+	if (!s)
+		s = "";
+	json_escape_buf(s, strlen(s), buf, cap);
+	return buf;
+}
+
 void monitor_emit_load_phase_backend(monitor *mon, const char *backend_name) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"backend_init\",\"backend\":\"%s\"}",
-				 backend_name ? backend_name : "auto");
-	monitor_poll(mon);
+	char esc[256];
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"backend_init\",\"backend\":\"%s\"}",
+				 json_escape_str(backend_name ? backend_name : "auto", esc, sizeof(esc)));
 }
 
 void monitor_emit_load_phase_model_start(monitor *mon, const char *model_path) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"model_load_start\",\"path\":\"%s\"}",
-				 model_path);
-	monitor_poll(mon);
+	char esc[1024];
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"model_load_start\",\"path\":\"%s\"}",
+				 json_escape_str(model_path, esc, sizeof(esc)));
 }
 
 void monitor_emit_load_phase_model_done(monitor *mon, uint64_t ms, int n_layers, int dim,
 										int vocab_size) {
-	monitor_send(mon,
+	monitor_emit(mon,
 				 "{\"type\":\"load\",\"phase\":\"model_load_done\",\"ms\":%llu,\"layers\":%d,"
 				 "\"dim\":%d,\"vocab\":%d}",
 				 (unsigned long long)ms, n_layers, dim, vocab_size);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_phase_model_failed(monitor *mon, status_code err) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"model_load_failed\",\"error\":%d}", err);
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"model_load_failed\",\"error\":%d}", err);
 }
 
 void monitor_emit_load_readahead_done(monitor *mon, uint64_t ms) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"dense_readahead_done\",\"ms\":%llu}",
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"dense_readahead_done\",\"ms\":%llu}",
 				 (unsigned long long)ms);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_weights_progress(monitor *mon, int layer, int n_layers, double pct) {
-	monitor_send(mon,
+	monitor_emit(mon,
 				 "{\"type\":\"load\",\"phase\":\"loading_weights\","
 				 "\"layer\":%d,\"n_layers\":%d,\"pct\":%.1f}",
 				 layer, n_layers, pct);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_prefetch_mmap(monitor *mon, const char *path) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"prefetch_mmap\",\"path\":\"%s\"}", path);
-	monitor_poll(mon);
+	char esc[1024];
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"prefetch_mmap\",\"path\":\"%s\"}",
+				 json_escape_str(path, esc, sizeof(esc)));
 }
 
 void monitor_emit_load_prefetch_done(monitor *mon, uint64_t ms) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"prefetch_done\",\"ms\":%llu}",
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"prefetch_done\",\"ms\":%llu}",
 				 (unsigned long long)ms);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_upload_start(monitor *mon) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_start\"}");
-	monitor_poll(mon);
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_start\"}");
 }
 
 void monitor_emit_load_upload_done(monitor *mon, uint64_t ms) {
-	monitor_send(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_done\",\"ms\":%llu}",
+	monitor_emit(mon, "{\"type\":\"load\",\"phase\":\"upload_weights_done\",\"ms\":%llu}",
 				 (unsigned long long)ms);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_pin_copy_start(monitor *mon, int n_experts, int n_workers) {
-	monitor_send(mon,
+	monitor_emit(mon,
 				 "{\"type\":\"load\",\"phase\":\"pin_copy_start\","
 				 "\"n_experts\":%d,\"n_workers\":%d}",
 				 n_experts, n_workers);
-	monitor_poll(mon);
 }
 
 void monitor_emit_load_pin_copy_done(monitor *mon, int n_experts, double mb, uint64_t ms) {
-	monitor_send(mon,
+	monitor_emit(mon,
 				 "{\"type\":\"load\",\"phase\":\"pin_copy_done\","
 				 "\"n_experts\":%d,\"mb\":%.1f,\"ms\":%llu}",
 				 n_experts, mb, (unsigned long long)ms);
-	monitor_poll(mon);
 }
 
 void monitor_emit_start(monitor *mon, const char *arch_name, int n_layers, int dim, int n_ctx,
 						int vocab_size, int is_moe, int n_experts, int n_experts_used) {
 	monitor_poll(mon);
-	monitor_send(mon,
+	char esc[256];
+	monitor_emit(mon,
 				 "{\"type\":\"start\",\"arch\":\"%s\",\"n_layers\":%d,\"dim\":%d,\"n_ctx\":%d,"
 				 "\"vocab\":%d,\"is_moe\":%d,\"n_experts\":%d,\"topk\":%d}",
-				 arch_name ? arch_name : "?", n_layers, dim, n_ctx, vocab_size, is_moe, n_experts,
-				 n_experts_used);
+				 json_escape_str(arch_name ? arch_name : "?", esc, sizeof(esc)), n_layers, dim,
+				 n_ctx, vocab_size, is_moe, n_experts, n_experts_used);
 }
 
 void monitor_emit_prefill(monitor *mon, int n_tokens, uint64_t ms, double tps) {
-	monitor_send(mon, "{\"type\":\"prefill\",\"n_tokens\":%d,\"ms\":%llu,\"tps\":%.2f}", n_tokens,
+	monitor_emit(mon, "{\"type\":\"prefill\",\"n_tokens\":%d,\"ms\":%llu,\"tps\":%.2f}", n_tokens,
 				 (unsigned long long)ms, tps);
 }
 
@@ -335,22 +355,14 @@ void monitor_emit_token(monitor *mon, int token_idx, int32_t token_id, int pos, 
 
 void monitor_emit_end(monitor *mon, int tokens_generated, double pp_tps, double tg_tps,
 					  double ttft_ms, const moe_stats_summary *moe) {
-	if (moe && moe->has_moe) {
-		monitor_send(mon,
-					 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f,"
-					 "\"ttft_ms\":%.2f,"
-					 "\"moe_hit\":%.1f,\"moe_pin\":%.1f,\"moe_lru\":%.1f,\"moe_miss\":%llu,"
-					 "\"moe_direct_ok\":%llu,\"moe_direct_fallback\":%llu}",
-					 tokens_generated, pp_tps, tg_tps, ttft_ms, moe->hit_rate, moe->pin_rate,
-					 moe->lru_rate, (unsigned long long)moe->cache_misses,
-					 (unsigned long long)moe->direct_io_ok,
-					 (unsigned long long)moe->direct_io_fallback);
-	} else {
-		monitor_send(mon,
-					 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f,"
-					 "\"ttft_ms\":%.2f}",
-					 tokens_generated, pp_tps, tg_tps, ttft_ms);
-	}
+	char moe_json[160];
+	char moe_io[96];
+	append_moe_json(moe_json, sizeof(moe_json), moe);
+	append_moe_io_json(moe_io, sizeof(moe_io), moe);
+	monitor_send(mon,
+				 "{\"type\":\"end\",\"tokens_generated\":%d,\"pp_tps\":%.2f,\"tg_tps\":%.2f,"
+				 "\"ttft_ms\":%.2f%s%s}",
+				 tokens_generated, pp_tps, tg_tps, ttft_ms, moe_json, moe_io);
 }
 
 void monitor_emit_moe_experts(monitor *mon, int layer, int token_idx, const int32_t *expert_ids,

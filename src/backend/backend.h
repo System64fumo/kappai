@@ -55,6 +55,15 @@ static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t 
 	return s;
 }
 
+static inline buffer buffer_host_view(backend *owner, void *ptr, size_t bytes) {
+	buffer b   = {0};
+	b.handle   = ptr;
+	b.host_ptr = ptr;
+	b.size	   = bytes;
+	b.owner	   = owner;
+	return b;
+}
+
 typedef enum {
 	WCLASS_MATMUL,
 	WCLASS_NORM,
@@ -269,6 +278,12 @@ struct backend {
 
 static inline int backend_has_cap(const backend *b, uint64_t cap) {
 	return b && (b->caps & cap) != 0;
+}
+
+static inline tpool *backend_get_pool(backend *b) {
+	if (b && b->get_pool)
+		return b->get_pool(b);
+	return NULL;
 }
 
 static inline void ensure_sync(backend *a) {

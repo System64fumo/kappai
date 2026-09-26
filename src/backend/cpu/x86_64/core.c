@@ -1149,12 +1149,8 @@ static void cpu_add_inplace_chunk_avx(int begin, int end, int tid, void *ctx) {
 status_code cpu_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
 	cpu_priv *p		  = self->priv;
 	float	 *args[2] = {cpu_ptr(x), (float *)cpu_ptr(y)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_add_inplace_chunk_avx,
-						   args);
-	} else {
-		cpu_add_inplace_chunk_avx(0, n, 0, args);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_add_inplace_chunk_avx, args);
 	return OK;
 }
 
@@ -1205,11 +1201,8 @@ status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up
 							 int n) {
 	cpu_priv		*p = self->priv;
 	cpu_ffn_act_args a = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_ffn_silu_chunk_avx, &a);
-	} else {
-		cpu_ffn_silu_chunk_avx(0, n, 0, &a);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_ffn_silu_chunk_avx, &a);
 	return OK;
 }
 
@@ -1279,11 +1272,8 @@ status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer 
 	cpu_priv		*p	= self->priv;
 	cpu_ffn_act_args a	= {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
 	tpool_chunk_fn	 fn = activation == 1 ? cpu_ffn_gelu_chunk_avx : cpu_ffn_silu_chunk_avx;
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
-	} else {
-		fn(0, n, 0, &a);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD, fn,
+					   &a);
 	return OK;
 }
 
@@ -1305,49 +1295,13 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 	cpu_priv			  *p   = self->priv;
 	cpu_ffn_act_batch_args job = {
 		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
-	if (p->pool && m >= 2) {
-		tpool_parallel_for(p->pool, m, 1, cpu_ffn_act_batch_chunk_avx, &job);
-	} else {
-		cpu_ffn_act_batch_chunk_avx(0, m, 0, &job);
-	}
+	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk_avx, &job);
 	return OK;
 }
 
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
 	(void)self;
-	const float	 *lp	 = cpu_ptr(logits);
-	__m256		  best_v = _mm256_set1_ps(-INFINITY);
-	__m256i		  best_i = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-	__m256i		  idx	 = best_i;
-	const __m256i stride = _mm256_set1_epi32(8);
-	int			  i		 = 0;
-	for (; i + 8 <= n; i += 8) {
-		__m256 v	= _mm256_loadu_ps(lp + i);
-		__m256 mask = _mm256_cmp_ps(v, best_v, _CMP_GT_OQ);
-		best_v		= _mm256_blendv_ps(best_v, v, mask);
-		best_i		= _mm256_blendv_epi8(best_i, idx, _mm256_castps_si256(mask));
-		idx			= _mm256_add_epi32(idx, stride);
-	}
-
-	float	vals[8];
-	int32_t idxs[8];
-	_mm256_storeu_ps(vals, best_v);
-	_mm256_storeu_si256((__m256i *)idxs, best_i);
-	float bestv = vals[0];
-	int	  best	= idxs[0];
-	for (int k = 1; k < 8; k++) {
-		if (vals[k] > bestv) {
-			bestv = vals[k];
-			best  = idxs[k];
-		}
-	}
-	for (; i < n; i++) {
-		if (lp[i] > bestv) {
-			bestv = lp[i];
-			best  = i;
-		}
-	}
-	*out_idx = best;
+	*out_idx = cpu_argmax_f32(cpu_ptr(logits), n);
 	return OK;
 }
 
@@ -1645,15 +1599,4 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "f16c");
 #endif
 }
-static status_code cpu_arch_ctor(backend *out) {
-	memset(out, 0, sizeof(*out));
-	out->name	  = "cpu_x86_64";
-	out->priority = 10;
-	out->caps	  = CPU_BACKEND_CAPS;
-	out->desc	  = "host x86_64 SIMD optimized";
-	return cpu_backend_fill(out);
-}
-
-BACKEND_REGISTER("cpu_x86_64", cpu_arch_ctor)
-
-void backend_autoreg_cpu_scalar_ctor(void) {}
+CPU_BACKEND_REGISTER("cpu_x86_64", cpu_arch_ctor, 10, "host x86_64 SIMD optimized")

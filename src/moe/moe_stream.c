@@ -574,18 +574,13 @@ static status_code moe_pin_prepare_slot(struct model *m, moe_stream_cache *c, in
 		}
 
 		if (c->map_base && c->map_size > 0) {
-			uintptr_t ps = c->page_size;
-			uintptr_t pm = ~(ps - 1);
 			for (int i = 0; i < 3; i++) {
 				if (!regions[i].src || regions[i].len == 0)
 					continue;
-				uintptr_t a = (uintptr_t)regions[i].src;
-				uintptr_t b = a + regions[i].len;
-				if (a < base || b > stop || b < a)
+				page_span r = page_span_for(regions[i].src, regions[i].len, c->page_size);
+				if (!page_span_clamp(&r, base, c->map_size) || r.len == 0)
 					continue;
-				uintptr_t pstart = a & pm;
-				uintptr_t pend	 = (b + ps - 1) & pm;
-				madvise((void *)pstart, pend - pstart, MADV_DONTNEED);
+				madvise((void *)r.start, r.len, MADV_DONTNEED);
 			}
 		}
 
@@ -987,33 +982,18 @@ static void fault_hint(const moe_stream_cache *c, const void *ptr, size_t bytes)
 		return;
 	if (!c->map_base || c->map_size == 0 || !ptr || bytes == 0)
 		return;
-	uintptr_t addr = (uintptr_t)ptr;
-	uintptr_t end  = addr + bytes;
-	uintptr_t base = (uintptr_t)c->map_base;
-	uintptr_t stop = base + c->map_size;
-	if (addr < base || end > stop || end < addr)
+	page_span r = page_span_for(ptr, bytes, c->page_size);
+	if (!page_span_clamp(&r, (uintptr_t)c->map_base, c->map_size) || r.len == 0)
 		return;
-	uintptr_t page_mask = ~((uintptr_t)c->page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + c->page_size - 1) & page_mask;
-	size_t	  count		= pend - pstart;
-	if (count == 0)
-		return;
-
-	madvise((void *)pstart, count, MADV_WILLNEED);
+	madvise((void *)r.start, r.len, MADV_WILLNEED);
 }
 
 static void fault_wait(const void *ptr, size_t bytes, long page_size) {
-	if (!ptr || bytes == 0)
+	page_span r = page_span_for(ptr, bytes, (size_t)page_size);
+	if (r.len == 0)
 		return;
-	uintptr_t addr		= (uintptr_t)ptr;
-	uintptr_t end		= addr + bytes;
-	uintptr_t page_mask = ~((uintptr_t)page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + (uintptr_t)page_size - 1) & page_mask;
-
 	volatile uint8_t acc = 0;
-	for (uintptr_t p = pstart; p < pend; p += (uintptr_t)page_size) {
+	for (uintptr_t p = r.start; p < r.start + r.len; p += (uintptr_t)page_size) {
 		acc |= *((const volatile uint8_t *)p);
 	}
 	(void)acc;
@@ -1022,16 +1002,10 @@ static void fault_wait(const void *ptr, size_t bytes, long page_size) {
 static void drop_pages(const moe_stream_cache *c, const void *ptr, size_t bytes) {
 	if (!c->map_base || c->map_size == 0 || !ptr || bytes == 0)
 		return;
-	uintptr_t addr = (uintptr_t)ptr;
-	uintptr_t end  = addr + bytes;
-	uintptr_t base = (uintptr_t)c->map_base;
-	uintptr_t stop = base + c->map_size;
-	if (addr < base || end > stop)
+	page_span r = page_span_for(ptr, bytes, c->page_size);
+	if (!page_span_clamp(&r, (uintptr_t)c->map_base, c->map_size) || r.len == 0)
 		return;
-	uintptr_t page_mask = ~((uintptr_t)c->page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + c->page_size - 1) & page_mask;
-	madvise((void *)pstart, pend - pstart, MADV_DONTNEED);
+	madvise((void *)r.start, r.len, MADV_DONTNEED);
 }
 
 static inline uint64_t lfru_score(uint32_t freq, uint64_t last_used, uint64_t clock) {
@@ -1890,18 +1864,15 @@ void moe_stream_op_free(moe_stream_op *op) {
 	free(op);
 }
 
+static int moe_slot_ready_pred(void *ud) {
+	const moe_expert_slot *slot = ud;
+	return atomic_load_explicit(&slot->io_ready, memory_order_acquire) != 0;
+}
+
 void moe_stream_wait_slot(const moe_expert_slot *slot) {
 	if (!slot)
 		return;
-	int spins = 0;
-	while (!atomic_load_explicit(&slot->io_ready, memory_order_acquire)) {
-		if (spins < 10000) {
-			cpu_relax();
-			spins++;
-		} else {
-			sched_yield();
-		}
-	}
+	spin_wait_relax(moe_slot_ready_pred, (void *)slot);
 }
 
 void moe_stream_release_slot(struct model *m, int layer, const moe_expert_slot *slot) {

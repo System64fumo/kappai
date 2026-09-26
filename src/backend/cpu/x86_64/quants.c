@@ -966,7 +966,9 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_Q5_0:
 	case GGML_TYPE_Q5_1:
-	case GGML_TYPE_IQ3_S: {
+	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ3_S_RE:
+	case GGML_TYPE_IQ3_S_RE8: {
 		static _Thread_local quant_scratch qs = {NULL, 0};
 		if (!qs.q8_buf)
 			tlocal_register((void **)&qs.q8_buf);
@@ -1010,11 +1012,20 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 		case GGML_TYPE_IQ3_S:
 			matmul_iq3_s_q8_k_f32(w, x, y, n, k, &qs);
 			break;
+		case GGML_TYPE_IQ3_S_RE:
+			matmul_iq3_s_re_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ3_S_RE8:
+			matmul_iq3_s_re8_q8_k_f32(w, x, y, n, k, &qs);
+			break;
 		}
 		return;
 	}
 	case GGML_TYPE_F32:
 		matmul_f32_f32(w, x, y, n, k);
+		return;
+	case GGML_TYPE_F16:
+		matmul_f16_f32(w, x, y, n, k);
 		return;
 	case GGML_TYPE_BF16:
 		matmul_bf16_f32(w, x, y, n, k);

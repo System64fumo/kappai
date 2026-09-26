@@ -324,6 +324,17 @@ static void fed_ids_sync(context *c) {
 		c->fed_ids.n = c->kv.n_pos;
 }
 
+static void context_rewind(context *c, int32_t pos) {
+	if (pos < 0)
+		pos = 0;
+	if (pos > c->fed_ids.n)
+		pos = c->fed_ids.n;
+	if (pos > c->kv.n_pos)
+		pos = c->kv.n_pos;
+	c->fed_ids.n = pos;
+	c->kv.n_pos	 = pos;
+}
+
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
 	if (c->kv.n_pos >= c->n_ctx)
 		return ERR_INVALID_ARG;
@@ -953,8 +964,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	if (reuse < c->fed_ids.n) {
 		DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
 			  (int)c->fed_ids.n);
-		c->fed_ids.n = reuse;
-		c->kv.n_pos	 = reuse;
+		context_rewind(c, reuse);
 	} else if (!fast) {
 		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
 	}
@@ -1037,8 +1047,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 			if (m >= think_start_pos) {
 				DEBUG("dropping thinking span from cache: [%d..%d) of %d, refeeding tail",
 					  (int)think_start_pos, (int)think_end_pos, (int)c->fed_ids.n);
-				c->fed_ids.n = think_start_pos;
-				c->kv.n_pos	 = think_start_pos;
+				context_rewind(c, think_start_pos);
 				context_debug_print_feed(c, "resync", norm + think_start_pos,
 										 (int)(m - think_start_pos), think_start_pos);
 				int nrc = context_feed_tokens_batch(c, norm + think_start_pos,
@@ -1047,8 +1056,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 					ERROR("cache normalization failed -- session poisoned");
 					c->session_poisoned = true;
 				} else if (nrc < 0) {
-					c->fed_ids.n = think_start_pos;
-					c->kv.n_pos	 = think_start_pos;
+					context_rewind(c, think_start_pos);
 				}
 			}
 		}
@@ -1159,8 +1167,7 @@ static void *idle_prefill_thread(void *arg) {
 	if (reuse < c->fed_ids.n) {
 		if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent)
 			goto out;
-		c->fed_ids.n = reuse;
-		c->kv.n_pos	 = reuse;
+		context_rewind(c, reuse);
 	}
 
 	int			   to_prefill = header_count - reuse;

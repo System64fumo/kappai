@@ -1599,12 +1599,16 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_Q4_0_R8:
 	case GGML_TYPE_Q4_1:
+	case GGML_TYPE_Q5_0:
+	case GGML_TYPE_Q5_1:
 	case GGML_TYPE_IQ4_NL:
+	case GGML_TYPE_IQ4_NL_R8:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_Q4_K:
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE: {
+	case GGML_TYPE_IQ3_S_RE:
+	case GGML_TYPE_IQ3_S_RE8: {
 		static _Thread_local quant_scratch qs = {NULL, 0};
 		if (!qs.q8_buf)
 			tlocal_register((void **)&qs.q8_buf);
@@ -1627,6 +1631,12 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 		case GGML_TYPE_Q4_1:
 			matmul_q4_1_q8_f32(w, x, y, n, k, &qs);
 			break;
+		case GGML_TYPE_Q5_0:
+			matmul_q5_0_q8_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_Q5_1:
+			matmul_q5_1_q8_f32(w, x, y, n, k, &qs);
+			break;
 		case GGML_TYPE_IQ4_NL:
 			matmul_iq4_nl_q8_f32(w, x, y, n, k, &qs);
 			break;
@@ -1644,6 +1654,9 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 			break;
 		case GGML_TYPE_IQ3_S_RE:
 			matmul_iq3_s_re_q8_k_f32(w, x, y, n, k, &qs);
+			break;
+		case GGML_TYPE_IQ3_S_RE8:
+			matmul_iq3_s_re8_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		default:
 			break;
@@ -1675,28 +1688,37 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	free(row_buf);
 }
 
+static void quantize_q8_32block(const float *x, uint16_t *d_out, int8_t *qs_out, int32_t *sum_out,
+								uint16_t *s_out) {
+	float amax = 0;
+	for (int j = 0; j < 32; j++) {
+		float ax = fabsf(x[j]);
+		if (ax > amax)
+			amax = ax;
+	}
+	float d		= amax / 127.0f;
+	float id	= d > 0 ? 1.0f / d : 0.0f;
+	*d_out		= f32_to_f16(d);
+	int32_t sum = 0;
+	for (int j = 0; j < 32; j++) {
+		int v = (int)roundf(x[j] * id);
+		if (v > 127)
+			v = 127;
+		if (v < -127)
+			v = -127;
+		qs_out[j] = (int8_t)v;
+		sum += v;
+	}
+	if (sum_out)
+		*sum_out = sum;
+	if (s_out)
+		*s_out = f32_to_f16(d * (float)sum);
+}
+
 __attribute__((weak)) void quantize_q8_0(const float *x, q8_0_block *dst, int n) {
 	int nb = n / 32;
 	for (int i = 0; i < nb; i++) {
-		float amax = 0;
-		for (int j = 0; j < 32; j++) {
-			float ax = fabsf(x[j]);
-			if (ax > amax)
-				amax = ax;
-		}
-		float d	 = amax / 127.0f;
-		float id = d > 0 ? 1.0f / d : 0.0f;
-		dst[i].d = f32_to_f16(d);
-
-		for (int j = 0; j < 32; j++) {
-			int v = (int)roundf(x[j] * id);
-			if (v > 127)
-				v = 127;
-			if (v < -127)
-				v = -127;
-			dst[i].qs[j] = (int8_t)v;
-		}
-		x += 32;
+		quantize_q8_32block(x + (size_t)i * 32, &dst[i].d, dst[i].qs, NULL, NULL);
 	}
 }
 
@@ -1704,27 +1726,7 @@ __attribute__((weak)) void quantize_q8_1(const float *x, void *dst, int n) {
 	int			nb = n / 32;
 	q8_1_block *y  = dst;
 	for (int i = 0; i < nb; i++) {
-		float amax = 0;
-		for (int j = 0; j < 32; j++) {
-			float ax = fabsf(x[j]);
-			if (ax > amax)
-				amax = ax;
-		}
-		float d		= amax / 127.0f;
-		float id	= d > 0 ? 1.0f / d : 0.0f;
-		y[i].d		= f32_to_f16(d);
-		int32_t sum = 0;
-		for (int j = 0; j < 32; j++) {
-			int32_t q = (int32_t)roundf(x[j] * id);
-			if (q > 127)
-				q = 127;
-			if (q < -127)
-				q = -127;
-			y[i].qs[j] = (int8_t)q;
-			sum += q;
-		}
-		y[i].s = f32_to_f16(d * (float)sum);
-		x += 32;
+		quantize_q8_32block(x + (size_t)i * 32, &y[i].d, y[i].qs, NULL, &y[i].s);
 	}
 }
 

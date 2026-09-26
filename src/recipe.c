@@ -115,24 +115,13 @@ status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const flo
 	return b->owner->buffer_write_f32(b->owner, b, staged, n);
 }
 
-float *recipe_slot_rw_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
-	buffer *b = exec_slot(ctx, idx);
-	if (!b)
-		return NULL;
-	if (slot_is_host_resident(b))
-		return (float *)(b->handle ? (char *)b->handle + b->offset : b->host_ptr);
-	float *dst = float_buf_ensure_nocopy(stage, (size_t)n, 64);
-	if (!dst || b->owner->buffer_read_f32(b->owner, b, dst, n) != OK)
-		return NULL;
-	return dst;
-}
 static inline buffer *exec_slots(const exec_ctx *ctx) {
 	if (ctx->s && ctx->s->active_is_mirror)
 		return ctx->s->mirror_slots;
 	return ctx->s->slots;
 }
 static inline int exec_is_batch(const exec_ctx *ctx) {
-	return ctx->bs != NULL;
+	return recipe_exec_is_batch(ctx);
 }
 
 static inline backend *exec_active_backend(const exec_ctx *ctx) {
@@ -145,10 +134,6 @@ static inline backend *exec_layer_backend(const exec_ctx *ctx) {
 	if (ctx->li >= 0 && ctx->m && ctx->m->mixed_backend_mode)
 		return model_layer_backend(ctx->m, ctx->li);
 	return exec_active_backend(ctx);
-}
-
-static inline int exec_pos_for_row(const exec_ctx *ctx, int row) {
-	return exec_is_batch(ctx) ? ctx->pos_start + row : ctx->pos;
 }
 
 static status_code ple_ensure_norm_w(backend *a, compute_scratch *s, model *m,
@@ -375,14 +360,12 @@ static int matmul_type_ok(const backend *a, uint32_t t) {
 	return !a->matmul_type_native || a->matmul_type_native((backend *)a, t);
 }
 
+static int ple_build_dev_path_ok(backend *a, const struct model *m, int batched);
+
 static void recipe_scan_op(const struct model *m, const backend *a, const recipe_op *op) {
 	op_kind k = op->kind;
 	if (k == OP_PLE_BUILD) {
-		int native = a->embd_lookup && a->matmul && a->matmul_batch && a->scale_inplace &&
-					 a->rmsnorm && a->rmsnorm_batch && a->ple_combine &&
-					 matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type) &&
-					 m->layer_dims.per_layer_tok_embd.buf.handle &&
-					 m->layer_dims.per_layer_model_proj.buf.handle;
+		int native = ple_build_dev_path_ok((backend *)a, m, 1);
 		if (!native)
 			backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE, NULL);
 		return;
@@ -593,23 +576,47 @@ static const buffer *resolve_weight(const model *m, int li, uint8_t w_idx) {
 	return &resolve_weight_ref(m, li, w_idx)->buf;
 }
 
+static status_code copy_k_to_v_buffers(backend *a, buffer *kb, buffer *vb, int kv_out,
+									   int kv_stride, int n_rows) {
+	if (a->copy_buffer && kb->owner == vb->owner) {
+		for (int row = 0; row < n_rows; row++) {
+			buffer		krow = batch_row_view(kb, row, kv_stride);
+			buffer		vrow = batch_row_view(vb, row, kv_stride);
+			status_code st	 = a->copy_buffer(a, &krow, &vrow, kv_out);
+			if (st != OK)
+				return st;
+		}
+		return OK;
+	}
+	ensure_sync(a);
+	if (!kb->host_ptr || !vb->host_ptr) {
+		float	   *tmp = xmalloc((size_t)kv_out * sizeof(float));
+		status_code st	= OK;
+		for (int row = 0; row < n_rows && st == OK; row++) {
+			buffer krow = batch_row_view(kb, row, kv_stride);
+			buffer vrow = batch_row_view(vb, row, kv_stride);
+			st			= kb->owner->buffer_read_f32(kb->owner, &krow, tmp, kv_out);
+			if (st == OK)
+				st = vb->owner->buffer_write_f32(vb->owner, &vrow, tmp, kv_out);
+		}
+		free(tmp);
+		return st;
+	}
+	for (int row = 0; row < n_rows; row++) {
+		const float *k =
+			(const float *)((const char *)kb->host_ptr + kb->offset) + (size_t)row * kv_stride;
+		float *v = (float *)((char *)vb->host_ptr + vb->offset) + (size_t)row * kv_stride;
+		memcpy(v, k, (size_t)kv_out * sizeof(float));
+	}
+	return OK;
+}
+
 static status_code copy_k_to_v_slot(model *m, struct compute_scratch *s, int li) {
 	int		 kv_out = m->recipe->layer_ctx[li].kv_row_stride;
 	backend *a		= model_layer_backend(m, li);
 	buffer	*kb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_K] : &s->slots[RECIPE_SLOT_K];
 	buffer	*vb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_V] : &s->slots[RECIPE_SLOT_V];
-	if (a->copy_buffer && kb->owner == vb->owner) {
-		return a->copy_buffer(a, kb, vb, kv_out);
-	}
-	ensure_sync(a);
-	compute_small_host_ensure(s, m->dim, 0, kv_out);
-	float	   *tmp		= s->vf_host;
-	backend	   *k_owner = kb->owner;
-	backend	   *v_owner = vb->owner;
-	status_code st		= k_owner->buffer_read_f32(k_owner, kb, tmp, kv_out);
-	if (st == OK)
-		st = v_owner->buffer_write_f32(v_owner, vb, tmp, kv_out);
-	return st;
+	return copy_k_to_v_buffers(a, kb, vb, kv_out, kv_out, 1);
 }
 
 typedef struct {
@@ -629,11 +636,31 @@ static status_code matmul_sequential_fallback(backend *a, const buffer *x,
 	return st;
 }
 
+static status_code matmul_multi_dispatch(backend *a, const buffer *x, const buffer **w_list,
+										 const uint32_t *w_types, const uint8_t *widx,
+										 buffer **y_list, const int *n_out, int n_mats, int k,
+										 model *m, int li, profile *prof, stage stg,
+										 int force_sequential) {
+	if (force_sequential || !a->matmul_multi || n_mats < 1) {
+		matmul_fallback_item items[3];
+		for (int i = 0; i < n_mats; i++) {
+			items[i].w = resolve_weight_ref(m, li, widx[i]);
+			items[i].y = y_list[i];
+			items[i].n = n_out[i];
+		}
+		return matmul_sequential_fallback(a, x, items, n_mats, k, prof, stg);
+	}
+	profile_scope ps = profile_begin(prof, stg);
+	status_code	  st =
+		a->matmul_multi(a, (const buffer **)w_list, w_types, x, y_list, n_out, k, n_mats);
+	profile_end(prof, &ps);
+	return st;
+}
+
 static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *cache,
 									   compute_scratch *s, int li, buffer *slots) {
 	(void)cache;
 	profile				*prof = &s->prof;
-	profile_scope		 ps;
 	status_code			 st;
 	backend				*a			= model_layer_backend(m, li);
 	const layer_weights *L			= &m->layers[li];
@@ -647,24 +674,9 @@ static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *c
 	int					 n_mats		= (has_kv && has_own_v) ? 3 : (has_kv ? 2 : 1);
 	int					 n			= has_kv ? op->u.matmul_multi.n : 1;
 
-	if (!a->matmul_multi || n == 1 || n_mats < n) {
-		matmul_fallback_item items[3];
-		const uint8_t		 widx[3] = {WIDX_WQ, WIDX_WK, WIDX_WV};
-		for (int i = 0; i < n_mats; i++) {
-			items[i].w = resolve_weight_ref(m, li, widx[i]);
-			items[i].y = y_list[i];
-			items[i].n = n_out[i];
-		}
-		st = matmul_sequential_fallback(a, &slots[op->in[0]], items, n_mats, k, prof,
-										STAGE_MATMUL_QKV);
-		if (st == OK && has_kv && !has_own_v)
-			st = copy_k_to_v_slot(m, s, li);
-		return st;
-	}
-
-	ps = profile_begin(prof, STAGE_MATMUL_QKV);
-	st = a->matmul_multi(a, w_list, w_types, &slots[op->in[0]], y_list, n_out, k, n_mats);
-	profile_end(prof, &ps);
+	st = matmul_multi_dispatch(a, &slots[op->in[0]], w_list, w_types,
+							   (const uint8_t[]){WIDX_WQ, WIDX_WK, WIDX_WV}, y_list, n_out, n_mats,
+							   k, m, li, prof, STAGE_MATMUL_QKV, (n == 1 || n_mats < n));
 	if (st == OK && has_kv && !has_own_v)
 		st = copy_k_to_v_slot(m, s, li);
 	return st;
@@ -674,7 +686,6 @@ static status_code op_matmul_multi_kv(const recipe_op *op, model *m, kvcache *ca
 									  compute_scratch *s, int li, buffer *slots) {
 	(void)cache;
 	profile				  *prof = &s->prof;
-	profile_scope		   ps;
 	status_code			   st;
 	backend				  *a  = model_layer_backend(m, li);
 	const layer_weights	  *L  = &m->layers[li];
@@ -685,7 +696,7 @@ static status_code op_matmul_multi_kv(const recipe_op *op, model *m, kvcache *ca
 	int has_own_v = lc->has_own_v;
 
 	if (!has_own_v) {
-		ps = profile_begin(prof, op->stage);
+		profile_scope ps = profile_begin(prof, op->stage);
 		st = a->matmul(a, &L->wk.buf, L->wk.type, &slots[op->in[0]], &slots[RECIPE_SLOT_K], kv_out,
 					   k);
 		if (st == OK)
@@ -699,29 +710,15 @@ static status_code op_matmul_multi_kv(const recipe_op *op, model *m, kvcache *ca
 	buffer		 *y_list[2]		 = {&slots[RECIPE_SLOT_K], &slots[RECIPE_SLOT_V]};
 	int			  n_out_local[2] = {kv_out, kv_out};
 
-	if (!a->matmul_multi) {
-		matmul_fallback_item items[2];
-		const uint8_t		 widx[2] = {WIDX_WK, WIDX_WV};
-		for (int i = 0; i < 2; i++) {
-			items[i].w = resolve_weight_ref(m, li, widx[i]);
-			items[i].y = y_list[i];
-			items[i].n = kv_out;
-		}
-		return matmul_sequential_fallback(a, &slots[op->in[0]], items, 2, k, prof, op->stage);
-	}
-
-	ps = profile_begin(prof, op->stage);
-	st = a->matmul_multi(a, w_list, w_types, &slots[op->in[0]], y_list, n_out_local, k, 2);
-	profile_end(prof, &ps);
-	return st;
+	return matmul_multi_dispatch(a, &slots[op->in[0]], w_list, w_types,
+								 (const uint8_t[]){WIDX_WK, WIDX_WV}, y_list, n_out_local, 2, k, m,
+								 li, prof, op->stage, 0);
 }
 
 static status_code op_matmul_multi_gateup(const recipe_op *op, model *m, kvcache *cache,
 										  compute_scratch *s, int li, buffer *slots) {
 	(void)cache;
-	profile				*prof = &s->prof;
-	profile_scope		 ps;
-	status_code			 st;
+	profile				*prof	 = &s->prof;
 	backend				*a		 = model_layer_backend(m, li);
 	const layer_weights *L		 = &m->layers[li];
 	int					 k		 = op->u.matmul_multi.k;
@@ -731,21 +728,9 @@ static status_code op_matmul_multi_gateup(const recipe_op *op, model *m, kvcache
 	uint32_t	  w_types[2]	 = {L->gate_w.type, L->up_w.type};
 	buffer		 *y_list[2]		 = {&slots[op->out], &slots[op->out + 1]};
 
-	if (!a->matmul_multi) {
-		matmul_fallback_item items[2];
-		const uint8_t		 widx[2] = {WIDX_GATE, WIDX_UP};
-		for (int i = 0; i < 2; i++) {
-			items[i].w = resolve_weight_ref(m, li, widx[i]);
-			items[i].y = y_list[i];
-			items[i].n = n_out_local[i];
-		}
-		return matmul_sequential_fallback(a, &slots[op->in[0]], items, 2, k, prof, op->stage);
-	}
-
-	ps = profile_begin(prof, op->stage);
-	st = a->matmul_multi(a, w_list, w_types, &slots[op->in[0]], y_list, n_out_local, k, n);
-	profile_end(prof, &ps);
-	return st;
+	return matmul_multi_dispatch(a, &slots[op->in[0]], w_list, w_types,
+								 (const uint8_t[]){WIDX_GATE, WIDX_UP}, y_list, n_out_local, n, k,
+								 m, li, prof, op->stage, 0);
 }
 
 static stage matmul_substage(uint8_t w_idx) {
@@ -957,28 +942,21 @@ static void ple_host_project_row(const ple_build_plan *p, const float *inp_row, 
 }
 
 static void ple_host_finish(const ple_build_plan *p, float *ple, float *proj, int n_rows) {
-	backend *host	   = p->host;
-	buffer	 proj_view = {0};
-	proj_view.handle   = proj;
-	proj_view.owner	   = host;
+	backend *host	 = p->host;
+	buffer proj_view = buffer_host_view(host, proj, (size_t)n_rows * p->total_ple * sizeof(float));
 	host->scale_inplace(host, &proj_view, p->inv_sqrt_ple, n_rows * p->total_ple);
-	buffer w_view = {0};
-	w_view.handle = (void *)p->m->layer_dims.per_layer_proj_norm_w.host_ptr;
-	w_view.owner  = host;
+	buffer w_view = buffer_host_view(host, (void *)p->m->layer_dims.per_layer_proj_norm_w.host_ptr,
+									 (size_t)p->n_embd_per_layer * sizeof(float));
 	for (int row = 0; row < n_rows; row++) {
 		for (int l = 0; l < p->n_layers; l++) {
-			buffer row_view = {0};
-			row_view.handle = proj + (size_t)row * p->total_ple + (size_t)l * p->n_embd_per_layer;
-			row_view.owner	= host;
+			buffer row_view = buffer_host_view(
+				host, proj + (size_t)row * p->total_ple + (size_t)l * p->n_embd_per_layer,
+				(size_t)p->n_embd_per_layer * sizeof(float));
 			host->rmsnorm(host, &row_view, &w_view, &row_view, p->n_embd_per_layer, p->eps);
 		}
 	}
-	buffer ple_view	  = {0};
-	ple_view.handle	  = ple;
-	ple_view.owner	  = host;
-	buffer proj_view2 = {0};
-	proj_view2.handle = proj;
-	proj_view2.owner  = host;
+	buffer ple_view	  = buffer_host_view(host, ple, (size_t)n_rows * p->total_ple * sizeof(float));
+	buffer proj_view2 = buffer_host_view(host, proj, (size_t)n_rows * p->total_ple * sizeof(float));
 	host->ple_combine(host, &ple_view, &proj_view2, n_rows * p->total_ple, 0.70710678118654752f);
 }
 
@@ -1238,16 +1216,9 @@ static status_code op_ffn_activate_ex(exec_ctx *ctx) {
 		profile_end(prof, &ps);
 		return ERR_UNSUPPORTED;
 	}
-	buffer gb = {0}, ub = {0}, ob = {0};
-	gb.handle = g;
-	gb.owner  = host;
-	gb.size	  = (size_t)intermediate * sizeof(float);
-	ub.handle = u;
-	ub.owner  = host;
-	ub.size	  = (size_t)intermediate * sizeof(float);
-	ob.handle = o;
-	ob.owner  = host;
-	ob.size	  = (size_t)intermediate * sizeof(float);
+	buffer gb = buffer_host_view(host, g, (size_t)intermediate * sizeof(float));
+	buffer ub = buffer_host_view(host, u, (size_t)intermediate * sizeof(float));
+	buffer ob = buffer_host_view(host, o, (size_t)intermediate * sizeof(float));
 	st		  = host->ffn_activate_ex(host, &gb, &ub, &ob, intermediate, activation);
 	profile_end(prof, &ps);
 	if (st != OK)
@@ -1495,6 +1466,21 @@ static status_code op_matmul_multi(exec_ctx *ctx) {
 	return ERR_INVALID_ARG;
 }
 
+static status_code ffn_activate_dispatch(backend *a, buffer *g, buffer *u, buffer *o, int n,
+										 int act) {
+	backend *t = OP_BACKEND(a, ffn_activate_ex);
+	if (!t->ffn_activate_ex)
+		t = OP_BACKEND(a, ffn_activate);
+	if (t->ffn_activate_ex)
+		return t->ffn_activate_ex(t, g, u, o, n, act);
+	if (act != ACTIVATION_SILU)
+		return ERR_UNSUPPORTED;
+	return t->ffn_activate(t, g, u, o, n);
+}
+
+static status_code ffn_activate_ex_rows(backend *t, const float *fused, float *out, int n, int act,
+										int n_rows, int fused_stride);
+
 static status_code op_matmul_ffn_down(exec_ctx *ctx) {
 	backend		 *a	   = exec_layer_backend(ctx);
 	profile		 *prof = &ctx->s->prof;
@@ -1529,21 +1515,11 @@ static status_code op_matmul_ffn_down(exec_ctx *ctx) {
 			return st;
 	}
 	{
-		int		 intermediate = k;
-		backend *t			  = OP_BACKEND(a, ffn_activate_ex);
-		if (!t->ffn_activate_ex)
-			t = OP_BACKEND(a, ffn_activate);
-		ps = profile_begin(prof, matmul_substage(ctx->op->w_idx));
-		if (t->ffn_activate_ex) {
-			st = t->ffn_activate_ex(t, exec_slot(ctx, ctx->op->in[0]),
-									exec_slot(ctx, ctx->op->in[1]),
-									exec_slot(ctx, RECIPE_SLOT_FFN_ACT), intermediate, act);
-		} else {
-			if (act != ACTIVATION_SILU)
-				return ERR_UNSUPPORTED;
-			st = t->ffn_activate(t, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
-								 exec_slot(ctx, RECIPE_SLOT_FFN_ACT), intermediate);
-		}
+		int intermediate = k;
+		ps				 = profile_begin(prof, matmul_substage(ctx->op->w_idx));
+		st =
+			ffn_activate_dispatch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
+								  exec_slot(ctx, RECIPE_SLOT_FFN_ACT), intermediate, act);
 		if (st == OK) {
 			backend *tm = OP_BACKEND(a, matmul);
 			st			= tm->matmul(tm, w, wt, exec_slot(ctx, RECIPE_SLOT_FFN_ACT),
@@ -1694,19 +1670,9 @@ static status_code op_ffn_activate(exec_ctx *ctx) {
 			a->ffn_activate_batch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
 								  exec_slot(ctx, ctx->op->out), n, act, ctx->n_rows);
 	} else {
-		backend *t = OP_BACKEND(a, ffn_activate_ex);
-		if (!t->ffn_activate_ex)
-			t = OP_BACKEND(a, ffn_activate);
-		if (t->ffn_activate_ex) {
-			st = t->ffn_activate_ex(t, exec_slot(ctx, ctx->op->in[0]),
-									exec_slot(ctx, ctx->op->in[1]), exec_slot(ctx, ctx->op->out), n,
-									act);
-		} else {
-			if (act != ACTIVATION_SILU)
-				return ERR_UNSUPPORTED;
-			st = t->ffn_activate(t, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
-								 exec_slot(ctx, ctx->op->out), n);
-		}
+		st =
+			ffn_activate_dispatch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
+								  exec_slot(ctx, ctx->op->out), n, act);
 	}
 	profile_end(prof, &ps);
 	return st;
@@ -1744,25 +1710,7 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 		backend		*t	   = op_host_backend();
 		if (!t->ffn_activate_ex)
 			return ERR_UNSUPPORTED;
-		for (int row = 0; row < ctx->n_rows; row++) {
-			const float *g	= fused + (size_t)row * fused_stride;
-			const float *u	= g + n;
-			float		*o	= out + (size_t)row * n;
-			buffer		 gb = {0}, ub = {0}, ob = {0};
-			gb.handle = (void *)g;
-			gb.owner  = t;
-			gb.size	  = (size_t)n * sizeof(float);
-			ub.handle = (void *)u;
-			ub.owner  = t;
-			ub.size	  = (size_t)n * sizeof(float);
-			ob.handle = o;
-			ob.owner  = t;
-			ob.size	  = (size_t)n * sizeof(float);
-			st		  = t->ffn_activate_ex(t, &gb, &ub, &ob, n, act);
-			if (st != OK)
-				return st;
-		}
-		st = OK;
+		st = ffn_activate_ex_rows(t, fused, out, n, act, ctx->n_rows, fused_stride);
 	} else {
 		backend *t	   = OP_BACKEND(a, ffn_activate);
 		buffer	*slots = exec_slots(ctx);
@@ -1810,6 +1758,43 @@ static status_code op_logits_readback(exec_ctx *ctx) {
 	return st;
 }
 
+typedef status_code (*batch_row_fn)(buffer *row, void *ud);
+
+static status_code batch_row_each(exec_ctx *ctx, uint8_t slot, int row_elems, batch_row_fn fn,
+								  void *ud) {
+	for (int row = 0; row < ctx->n_rows; row++) {
+		buffer		rowb = batch_row_view(batch_slot(ctx->bs, slot), row, row_elems);
+		status_code st	 = fn(&rowb, ud);
+		if (st != OK)
+			return st;
+	}
+	return OK;
+}
+
+typedef struct {
+	backend		 *t;
+	const buffer *w;
+	int			  n_heads;
+	int			  head_dim;
+	float		  eps;
+} rmsnorm_ph_row_ud;
+
+static status_code rmsnorm_ph_row_fn(buffer *rowb, void *v) {
+	rmsnorm_ph_row_ud *u = v;
+	return u->t->rmsnorm_per_head(u->t, rowb, u->w, rowb, u->n_heads, u->head_dim, u->eps);
+}
+
+typedef struct {
+	backend *t;
+	float	 eps;
+	int		 n;
+} rmsnorm_nw_row_ud;
+
+static status_code rmsnorm_nw_row_fn(buffer *rowb, void *v) {
+	rmsnorm_nw_row_ud *u = v;
+	return u->t->rmsnorm_noweight(u->t, rowb, rowb, u->n, u->eps);
+}
+
 static status_code op_rmsnorm_per_head(exec_ctx *ctx) {
 	backend				  *a	= exec_layer_backend(ctx);
 	profile				  *prof = &ctx->s->prof;
@@ -1826,13 +1811,8 @@ static status_code op_rmsnorm_per_head(exec_ctx *ctx) {
 										   exec_slot(ctx, ctx->op->in[0]), n_heads, lc->head_dim,
 										   ctx->m->norm_eps, ctx->n_rows);
 		} else {
-			for (int row = 0; row < ctx->n_rows; row++) {
-				buffer rowb = batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, row_stride);
-				st			= t->rmsnorm_per_head(t, &rowb, w, &rowb, n_heads, lc->head_dim,
-												  ctx->m->norm_eps);
-				if (st != OK)
-					break;
-			}
+			rmsnorm_ph_row_ud ud = {t, w, n_heads, lc->head_dim, ctx->m->norm_eps};
+			st = batch_row_each(ctx, ctx->op->in[0], row_stride, rmsnorm_ph_row_fn, &ud);
 		}
 	} else {
 		st = t->rmsnorm_per_head(t, exec_slot(ctx, ctx->op->in[0]), w, exec_slot(ctx, ctx->op->out),
@@ -1869,14 +1849,9 @@ static status_code op_rmsnorm_noweight(exec_ctx *ctx) {
 					break;
 			}
 		} else {
-			backend *t2 = OP_BACKEND(a, rmsnorm_noweight);
-			for (int row = 0; row < ctx->n_rows; row++) {
-				buffer rowb =
-					batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, lc->kv_row_stride);
-				st = t2->rmsnorm_noweight(t2, &rowb, &rowb, lc->kv_row_stride, ctx->m->norm_eps);
-				if (st != OK)
-					break;
-			}
+			backend			 *t2 = OP_BACKEND(a, rmsnorm_noweight);
+			rmsnorm_nw_row_ud ud = {t2, ctx->m->norm_eps, lc->kv_row_stride};
+			st = batch_row_each(ctx, ctx->op->in[0], lc->kv_row_stride, rmsnorm_nw_row_fn, &ud);
 		}
 	} else {
 		int n_kv_heads = lc->n_kv_heads;
@@ -1988,7 +1963,11 @@ typedef struct {
 } op_walker;
 
 static inline buffer *walker_slot(op_walker *w, uint8_t idx) {
-	return w->is_batch ? batch_slot(w->bs, idx) : &w->s->slots[idx];
+	if (w->is_batch)
+		return batch_slot(w->bs, idx);
+	if (w->s && w->s->active_is_mirror)
+		return &w->s->mirror_slots[idx];
+	return &w->s->slots[idx];
 }
 
 static inline status_code walker_exec_one(op_walker *w, const recipe_op *op) {
@@ -2075,9 +2054,10 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 	const model_recipe *r = m->recipe;
 	status_code			st;
 
-	backend	  *bk		 = m->backend;
-	const bool has_begin = (own_batch && bk->begin_batch);
-	const bool has_end	 = (own_batch && bk->end_batch);
+	backend	  *bk		  = m->backend;
+	const bool has_begin  = (own_batch && bk->begin_batch);
+	const bool has_end	  = (own_batch && bk->end_batch);
+	bool	   batch_open = false;
 
 	const bool mixed = model_mixed_backend_mode(m);
 	if (mixed) {
@@ -2088,25 +2068,27 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 	s->active_backend	= NULL;
 	s->active_is_mirror = 0;
 
-	if (has_begin)
+	if (has_begin) {
 		bk->begin_batch(bk);
+		batch_open = true;
+	}
 
 	for (int i = 0; i < r->n_pre_ops; i++) {
 		st = exec_op(&r->pre_ops[i], m, cache, s, token, pos, -1, flash_attn, logits_out);
-		if (st != OK) {
-			if (has_end)
-				bk->end_batch(bk);
+		if (st != OK)
 			goto fail;
-		}
 	}
 
-	int dev_ple_build = (bk->ple_combine && bk->matmul && bk->scale_inplace && bk->rmsnorm &&
-						 m->layer_dims.per_layer_model_proj.buf.handle);
+	int dev_ple_build = ple_build_dev_path_ok(bk, m, own_batch);
 	if (!dev_ple_build) {
-		if (has_end)
+		if (has_end && batch_open) {
 			bk->end_batch(bk);
-		if (has_begin)
+			batch_open = false;
+		}
+		if (has_begin) {
 			bk->begin_batch(bk);
+			batch_open = true;
+		}
 	}
 
 	const recipe_op *ops_base	= r->per_layer_ops ? r->per_layer_ops : r->layer.ops;
@@ -2116,11 +2098,8 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 		if (mixed) {
 			backend *layer_be = model_layer_backend(m, li);
 			st				  = compute_switch_active_backend(s, layer_be, m->dim);
-			if (st != OK) {
-				if (has_end)
-					bk->end_batch(bk);
+			if (st != OK)
 				goto fail;
-			}
 		}
 
 		const recipe_op *lops = &ops_base[(size_t)li * ops_stride];
@@ -2138,24 +2117,20 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 								 .logits_out = logits_out,
 								 .mixed		 = mixed};
 		st					  = walk_layer_ops(&w, lops, r->layer.n_ops);
-		if (st != OK) {
-			if (has_end)
-				bk->end_batch(bk);
+		if (st != OK)
 			goto fail;
-		}
 	}
 
 	if (mixed) {
 		st = compute_switch_active_backend(s, m->backend, m->dim);
-		if (st != OK) {
-			if (has_end)
-				bk->end_batch(bk);
+		if (st != OK)
 			goto fail;
-		}
 	}
 
-	if (has_end)
+	if (has_end && batch_open) {
 		bk->end_batch(bk);
+		batch_open = false;
+	}
 
 	if (need_logits) {
 		for (int i = 0; i < r->n_post_ops; i++) {
@@ -2168,6 +2143,8 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 	return OK;
 
 fail:
+	if (has_end && batch_open)
+		bk->end_batch(bk);
 	if (logits_out)
 		memset(logits_out, 0, (size_t)m->vocab_size * sizeof(float));
 	return st;
@@ -2248,11 +2225,7 @@ struct batch_scratch {
 	int				 moe_union_slots_cap;
 	int				 moe_union_pending_n;
 
-	buffer moe_xb_q8_gate;
-	int	   moe_xb_q8_gate_ok;
-
 	const int32_t *tokens;
-	int			   n_tokens_stashed;
 
 	float_buf ple_buf;
 	buffer	  ple_all;
@@ -2319,7 +2292,7 @@ static uint32_t op_batch_slot_mask(const recipe_op *op) {
 	default:
 		break;
 	}
-	return m & 0x1ffffu;
+	return m & ((RECIPE_SLOT_MAX >= 32) ? 0xffffffffu : ((1u << RECIPE_SLOT_MAX) - 1u));
 }
 
 static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
@@ -2327,11 +2300,18 @@ static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size
 	size_t	 bytes = n_elems * sizeof(float);
 
 	if (!backend_has_cap(owner, BCAP_IS_HOST)) {
-		if (p->b.handle && p->b.owner)
+		if (p->b.owner == owner && p->b.handle && p->b.size >= bytes)
+			return;
+		if (p->b.handle && p->b.owner && !backend_has_cap(p->b.owner, BCAP_IS_HOST))
 			p->b.owner->buffer_free(p->b.owner, &p->b);
 		memset(&p->b, 0, sizeof(p->b));
 		owner->buffer_alloc_scratch(owner, bytes, &p->b);
 	} else {
+		if (p->b.handle && p->b.owner && p->b.owner != owner &&
+			!backend_has_cap(p->b.owner, BCAP_IS_HOST)) {
+			p->b.owner->buffer_free(p->b.owner, &p->b);
+			memset(&p->b, 0, sizeof(p->b));
+		}
 		float_buf_ensure_nocopy(&p->fb, n_elems, 64);
 		p->b.handle	  = p->fb.p;
 		p->b.host_ptr = p->fb.p;
@@ -2426,8 +2406,6 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_zeros.p);
 	free(bs->moe_per_token_slots);
 	free(bs->moe_union_slots);
-	if (bs->moe_xb_q8_gate.owner)
-		bs->moe_xb_q8_gate.owner->buffer_free(bs->moe_xb_q8_gate.owner, &bs->moe_xb_q8_gate);
 	free(bs->ple_buf.p);
 	if (bs->ple_all.owner)
 		bs->ple_all.owner->buffer_free(bs->ple_all.owner, &bs->ple_all);
@@ -2455,6 +2433,22 @@ static inline float *batch_buf_ptr(const buffer *b) {
 	return (float *)((char *)b->handle + b->offset);
 }
 
+static status_code ffn_activate_ex_rows(backend *t, const float *fused, float *out, int n, int act,
+										int n_rows, int fused_stride) {
+	for (int row = 0; row < n_rows; row++) {
+		const float *g	= fused + (size_t)row * fused_stride;
+		const float *u	= g + n;
+		float		*o	= out + (size_t)row * n;
+		buffer		 gb = buffer_host_view(t, (void *)g, (size_t)n * sizeof(float));
+		buffer		 ub = buffer_host_view(t, (void *)u, (size_t)n * sizeof(float));
+		buffer		 ob = buffer_host_view(t, o, (size_t)n * sizeof(float));
+		status_code	 st = t->ffn_activate_ex(t, &gb, &ub, &ob, n, act);
+		if (st != OK)
+			return st;
+	}
+	return OK;
+}
+
 static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a, int n, int act,
 													  int fused_stride, int n_rows) {
 	buffer *fused_buf = batch_slot(ctx->bs, ctx->op->in[0]);
@@ -2468,24 +2462,9 @@ static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a,
 	backend *t = op_host_backend();
 	if (!t->ffn_activate_ex)
 		return ERR_UNSUPPORTED;
-	for (int row = 0; row < n_rows; row++) {
-		const float *g	= fused_host + (size_t)row * fused_stride;
-		const float *u	= g + n;
-		float		*o	= out_host + (size_t)row * n;
-		buffer		 gb = {0}, ub = {0}, ob = {0};
-		gb.handle = (void *)g;
-		gb.owner  = t;
-		gb.size	  = (size_t)n * sizeof(float);
-		ub.handle = (void *)u;
-		ub.owner  = t;
-		ub.size	  = (size_t)n * sizeof(float);
-		ob.handle = o;
-		ob.owner  = t;
-		ob.size	  = (size_t)n * sizeof(float);
-		st		  = t->ffn_activate_ex(t, &gb, &ub, &ob, n, act);
-		if (st != OK)
-			return st;
-	}
+	st = ffn_activate_ex_rows(t, fused_host, out_host, n, act, n_rows, fused_stride);
+	if (st != OK)
+		return st;
 	return a->buffer_write_f32(a, out_buf, out_host, n_rows * n);
 }
 
@@ -2652,16 +2631,9 @@ status_code moe_activate(backend *a, float *act, const float *gate, const float 
 	backend *h = (a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)) ? a : backend_host();
 	if (!h || !h->moe_activate)
 		return ERR_UNSUPPORTED;
-	buffer gb = {0}, ub = {0}, ob = {0};
-	gb.handle = (void *)gate;
-	gb.owner  = h;
-	gb.size	  = (size_t)n_i * sizeof(float);
-	ub.handle = (void *)up;
-	ub.owner  = h;
-	ub.size	  = (size_t)n_i * sizeof(float);
-	ob.handle = act;
-	ob.owner  = h;
-	ob.size	  = (size_t)n_i * sizeof(float);
+	buffer gb = buffer_host_view(h, (void *)gate, (size_t)n_i * sizeof(float));
+	buffer ub = buffer_host_view(h, (void *)up, (size_t)n_i * sizeof(float));
+	buffer ob = buffer_host_view(h, act, (size_t)n_i * sizeof(float));
 	return h->moe_activate(h, &gb, &ub, &ob, n_i, gs, us, use_gelu);
 }
 
@@ -2741,107 +2713,57 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 	return K;
 }
 
-static status_code op_moe_router_softmax(backend *a, layer_weights *L, int E, int K, int dim,
-										 int norm_topk, float routed_scale, float *router_input,
-										 struct compute_scratch *s, buffer *slots) {
-	float  logits_fallback[8192];
-	float *logits = logits_fallback;
-	if (E > (int)(sizeof(logits_fallback) / sizeof(float)))
-		logits = xmalloc((size_t)E * sizeof(float));
-	status_code st;
-
-	buffer *inp_buf = &s->router_softmax_inp;
-	st				= buffer_ensure_scratch(a, inp_buf, (size_t)dim * sizeof(float));
-	if (st != OK) {
-		if (logits != logits_fallback)
-			free(logits);
-		return st;
-	}
-	status_code st2 = a->buffer_write_f32(a, inp_buf, router_input, dim);
-	if (st2 != OK) {
-		if (logits != logits_fallback)
-			free(logits);
-		return st2;
-	}
-	status_code st3 = buffer_ensure_scratch(a, &s->router_logits, (size_t)E * sizeof(float));
-	if (st3 != OK) {
-		if (logits != logits_fallback)
-			free(logits);
-		return st3;
-	}
-
-	st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp_buf, &s->router_logits, E, dim);
-	if (st == OK)
-		st = a->buffer_read_f32(a, &s->router_logits, logits, E);
-	if (st != OK) {
-		if (logits != logits_fallback)
-			free(logits);
-		return st;
-	}
-
-	if (!moe_router_logits_finite(logits, E)) {
-		ERROR("op_moe_router_softmax: non-finite router logit (E=%d)", E);
-		if (logits != logits_fallback)
-			free(logits);
-		return ERR_FORMAT;
-	}
-
-	int	  *idx_out = (int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
-	float *w_out   = (float *)slots[RECIPE_SLOT_ROUTER_W].handle;
-	moe_router_emit(E, K, 1, norm_topk, routed_scale, logits, NULL, NULL, idx_out, w_out);
-	if (logits != logits_fallback)
-		free(logits);
-	return OK;
-}
-
-static status_code op_moe_router_direct(backend *a, const model *m, layer_weights *L, int E, int K,
-										int dim, int norm_topk, float routed_scale, buffer *inp,
+static status_code op_moe_router_single(backend *a, const model *m, layer_weights *L, int E, int K,
+										int dim, int uses_softmax, int norm_topk,
+										float routed_scale, float *router_input, buffer *inp,
 										struct compute_scratch *s, buffer *slots) {
 	float  logits_fallback[8192];
 	float *logits = logits_fallback;
 	if (E > (int)(sizeof(logits_fallback) / sizeof(float)))
 		logits = xmalloc((size_t)E * sizeof(float));
+	status_code st = OK;
 
-	status_code st;
-	if (backend_has_cap(a, BCAP_IS_HOST)) {
-		buffer logits_buf	= {0};
-		logits_buf.handle	= logits;
-		logits_buf.host_ptr = logits;
-		logits_buf.size		= (size_t)E * sizeof(float);
+	if (uses_softmax) {
+		buffer *inp_buf = &s->router_softmax_inp;
+		st				= buffer_ensure_scratch(a, inp_buf, (size_t)dim * sizeof(float));
+		if (st == OK)
+			st = a->buffer_write_f32(a, inp_buf, router_input, dim);
+		if (st == OK)
+			st = buffer_ensure_scratch(a, &s->router_logits, (size_t)E * sizeof(float));
+		if (st == OK)
+			st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp_buf, &s->router_logits, E,
+						   dim);
+		if (st == OK)
+			st = a->buffer_read_f32(a, &s->router_logits, logits, E);
+	} else if (backend_has_cap(a, BCAP_IS_HOST)) {
+		buffer logits_buf = buffer_host_view(a, logits, (size_t)E * sizeof(float));
 		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, &logits_buf, E, dim);
 	} else {
-		buffer	   *logits_buf = &s->router_logits;
-		status_code ast		   = buffer_ensure_scratch(a, logits_buf, (size_t)E * sizeof(float));
-		if (ast != OK) {
-			if (logits != logits_fallback)
-				free(logits);
-			return ast;
-		}
-		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, logits_buf, E, dim);
+		buffer *logits_buf = &s->router_logits;
+		st				   = buffer_ensure_scratch(a, logits_buf, (size_t)E * sizeof(float));
+		if (st == OK)
+			st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, logits_buf, E, dim);
 		if (st == OK)
 			st = a->buffer_read_f32(a, logits_buf, logits, E);
 	}
-	if (st != OK) {
-		if (logits != logits_fallback)
-			free(logits);
-		return st;
+	if (st == OK && !moe_router_logits_finite(logits, E)) {
+		ERROR("op_moe_router: non-finite router logit (E=%d)", E);
+		st = ERR_FORMAT;
 	}
-
-	if (!moe_router_logits_finite(logits, E)) {
-		ERROR("op_moe_router_direct: non-finite router logit (E=%d)", E);
-		if (logits != logits_fallback)
-			free(logits);
-		return ERR_FORMAT;
+	if (st == OK) {
+		int	  *idx_out = (int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
+		float *w_out   = (float *)slots[RECIPE_SLOT_ROUTER_W].handle;
+		if (uses_softmax)
+			moe_router_emit(E, K, 1, norm_topk, routed_scale, logits, NULL, NULL, idx_out, w_out);
+		else {
+			const float *bias = (const float *)L->router_bias.host_ptr;
+			moe_router_emit_ex(E, K, 0, norm_topk, routed_scale, m->moe.n_group, m->moe.topk_group,
+							   logits, bias, NULL, idx_out, w_out);
+		}
 	}
-
-	const float *bias	 = (const float *)L->router_bias.host_ptr;
-	int			*idx_out = (int *)slots[RECIPE_SLOT_ROUTER_IDS].handle;
-	float		*w_out	 = (float *)slots[RECIPE_SLOT_ROUTER_W].handle;
-	moe_router_emit_ex(E, K, 0, norm_topk, routed_scale, m->moe.n_group, m->moe.topk_group, logits,
-					   bias, NULL, idx_out, w_out);
 	if (logits != logits_fallback)
 		free(logits);
-	return OK;
+	return st;
 }
 
 typedef struct {
@@ -2975,37 +2897,21 @@ static status_code moe_router_batch(exec_ctx *ctx) {
 		return ERR_FORMAT;
 	}
 
-	tpool *router_pool = (ctx->m->backend && ctx->m->backend->get_pool)
-							 ? ctx->m->backend->get_pool(ctx->m->backend)
-							 : NULL;
+	tpool			   *router_pool = model_get_pool(ctx->m);
+	moe_router_emit_job emit_job	= {.bs			 = ctx->bs,
+									   .L			 = L,
+									   .E			 = E,
+									   .K			 = K,
+									   .rows		 = ctx->n_rows,
+									   .uses_softmax = uses_softmax,
+									   .norm_topk	 = norm_topk,
+									   .routed_scale = routed_scale,
+									   .n_group		 = ctx->m->moe.n_group,
+									   .topk_group	 = ctx->m->moe.topk_group};
 	if (router_pool && ctx->n_rows >= 8 && E >= 8 && tpool_current_tid() < 0) {
-		moe_router_emit_job emit_job = {.bs			  = ctx->bs,
-										.L			  = L,
-										.E			  = E,
-										.K			  = K,
-										.rows		  = ctx->n_rows,
-										.uses_softmax = uses_softmax,
-										.norm_topk	  = norm_topk,
-										.routed_scale = routed_scale,
-										.n_group	  = ctx->m->moe.n_group,
-										.topk_group	  = ctx->m->moe.topk_group};
 		tpool_parallel_for(router_pool, ctx->n_rows, 1, moe_router_emit_chunk, &emit_job);
 	} else {
-		for (int row = 0; row < ctx->n_rows; row++) {
-			float		*logits	 = ctx->bs->moe_router_logits.p + (size_t)row * E;
-			int			*row_ids = ctx->bs->moe_router_ids + (size_t)row * K;
-			float		*row_w	 = ctx->bs->moe_router_w + (size_t)row * K;
-			const float *bias	 = (const float *)L->router_bias.host_ptr;
-			int			 K_row	 = moe_router_emit_ex(
-				E, K, uses_softmax, norm_topk, routed_scale, ctx->m->moe.n_group,
-				ctx->m->moe.topk_group, logits, bias,
-				ctx->bs->moe_router_logits.p + (size_t)ctx->n_rows * E + (size_t)row * E, row_ids,
-				row_w);
-			for (int k = K_row; k < K; k++) {
-				row_ids[k] = -1;
-				row_w[k]   = 0.0f;
-			}
-		}
+		moe_router_emit_chunk(0, ctx->n_rows, 0, &emit_job);
 	}
 
 	int gen = ++ctx->bs->moe_expert_gen;
@@ -3338,9 +3244,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 		goto finish;
 	}
 
-	tpool *pool			 = (ctx->m->backend && ctx->m->backend->get_pool)
-							   ? ctx->m->backend->get_pool(ctx->m->backend)
-							   : NULL;
+	tpool *pool			 = model_get_pool(ctx->m);
 	int	   total_experts = ctx->n_rows * K;
 
 	if (pool && total_experts >= 2) {
@@ -3949,11 +3853,12 @@ static status_code op_moe_router(exec_ctx *ctx) {
 
 		moe_router_normalize_input(m, L, dim, router_input);
 
-		return op_moe_router_softmax(a, L, E, K, dim, norm_topk, routed_scale, router_input, s,
-									 slots);
+		return op_moe_router_single(a, m, L, E, K, dim, 1, norm_topk, routed_scale, router_input,
+									inp, s, slots);
 	}
 
-	return op_moe_router_direct(a, m, L, E, K, dim, norm_topk, routed_scale, inp, s, slots);
+	return op_moe_router_single(a, m, L, E, K, dim, 0, norm_topk, routed_scale, NULL, inp, s,
+								slots);
 }
 
 static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
@@ -4227,7 +4132,7 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	monitor_emit_moe_experts(g_monitor, li, -1, expert_ids, weights, K);
 
-	tpool *pool		  = (a->get_pool && a->matmul_thread_local) ? a->get_pool(a) : NULL;
+	tpool *pool		  = (a->matmul_thread_local) ? backend_get_pool(a) : NULL;
 	int	   par		  = (pool && a->matmul_thread_local && K >= 2);
 	int	   interleave = par;
 
@@ -4440,11 +4345,7 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 	y_buf.owner	   = NULL;
 	y_buf.size	   = (size_t)dim * sizeof(float);
 
-	if (is_moe) {
-		st = a->matmul(a, plan.down_w, plan.down_type, act_buf, &y_buf, dim, sh_inter);
-	} else {
-		st = a->matmul(a, plan.down_w, plan.down_type, act_buf, &y_buf, dim, sh_inter);
-	}
+	st = a->matmul(a, plan.down_w, plan.down_type, act_buf, &y_buf, dim, sh_inter);
 	if (st != OK)
 		goto done;
 	memcpy(act_buf->handle, yp, (size_t)dim * sizeof(float));
@@ -4491,24 +4392,7 @@ static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_
 	buffer				  *vb			 = &bs->pair[RECIPE_SLOT_V].b;
 	int					   kv_row_stride = lc->kv_row_stride;
 
-	if (a->copy_buffer && kb->owner == vb->owner) {
-		for (int row = 0; row < n_tokens; row++) {
-			buffer		krow = batch_row_view(kb, row, kv_row_stride);
-			buffer		vrow = batch_row_view(vb, row, kv_row_stride);
-			status_code st	 = a->copy_buffer(a, &krow, &vrow, kv_out);
-			if (st != OK)
-				return st;
-		}
-		return OK;
-	}
-	ensure_sync(a);
-	for (int row = 0; row < n_tokens; row++) {
-		const float *k =
-			(const float *)((const char *)kb->host_ptr + kb->offset) + (size_t)row * kv_row_stride;
-		float *v = (float *)((char *)vb->host_ptr + vb->offset) + (size_t)row * kv_row_stride;
-		memcpy(v, k, (size_t)kv_out * sizeof(float));
-	}
-	return OK;
+	return copy_k_to_v_buffers(a, kb, vb, kv_out, kv_row_stride, n_tokens);
 }
 
 static buffer mla_scratch_buf_alloc(float *stack, int stack_cap, int n, int *out_heap) {
@@ -4954,7 +4838,7 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 		return ERR_UNSUPPORTED;
 	}
 
-	tpool *bpool	 = (t->get_pool) ? t->get_pool(t) : NULL;
+	tpool *bpool	 = backend_get_pool(t);
 	int	   n_threads = bpool ? tpool_n_threads(bpool) : 1;
 	if (n_threads < 1)
 		n_threads = 1;
@@ -5312,10 +5196,9 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	if (!s->bs) {
 		s->bs = xcalloc(1, sizeof(batch_scratch));
 	}
-	batch_scratch *bs	 = s->bs;
-	bs->tokens			 = tokens;
-	bs->n_tokens_stashed = n_tokens;
-	uint32_t slot_mask	 = r->bs_slot_mask;
+	batch_scratch *bs  = s->bs;
+	bs->tokens		   = tokens;
+	uint32_t slot_mask = r->bs_slot_mask;
 	if (!slot_mask)
 		slot_mask = 0xffffffffu;
 	batch_scratch_alloc(bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size, slot_mask);
@@ -5328,7 +5211,7 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 
 	status_code st = OK;
 
-	tpool *embd_pool = (a->get_pool) ? a->get_pool(a) : NULL;
+	tpool *embd_pool = backend_get_pool(a);
 	if (embd_pool && n_tokens >= 16 && backend_has_cap(a, BCAP_IS_HOST) &&
 		tpool_current_tid() < 0 && tpool_n_threads(embd_pool) > 1) {
 		_Atomic int	  embd_err = OK;

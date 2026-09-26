@@ -289,7 +289,6 @@ float		*recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
 const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
 float		*recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
 status_code	 recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n);
-float		*recipe_slot_rw_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
 
 int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
 					   int n_group, int topk_group, float *logits, const float *bias,

@@ -1283,9 +1283,8 @@ static stmt_node *parse_macro_stmt(parser *p) {
 	return s;
 }
 
-static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char **end_kw) {
+static stmt_node *parse_statement_tag(parser *p, int *is_block_end) {
 	*is_block_end = 0;
-	*end_kw		  = NULL;
 
 	if (stmt_kw_is(p, "if"))
 		return parse_if_stmt(p);
@@ -1297,7 +1296,6 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 		stmt_kw_is(p, "elif") || stmt_kw_is(p, "endmacro") || stmt_kw_is(p, "endset") ||
 		stmt_kw_is(p, "endgeneration")) {
 		*is_block_end = 1;
-		*end_kw		  = "end";
 		return NULL;
 	}
 
@@ -1389,9 +1387,8 @@ static stmt_node *parse_block(parser *p) {
 		}
 		if (ptok_is(p, TOK_STMT_OPEN)) {
 			padvance(p);
-			int			is_end;
-			const char *end_kw;
-			stmt_node  *s = parse_statement_tag(p, &is_end, &end_kw);
+			int		   is_end;
+			stmt_node *s = parse_statement_tag(p, &is_end);
 			if (is_end) {
 				p->depth--;
 				return head;
@@ -1411,24 +1408,28 @@ static stmt_node *parse_block(parser *p) {
 	return head;
 }
 
-static const char *supported_filters[] = {"trim",	  "default", "length", "upper",		 "lower",
-										  "dictsort", "list",	 "map",	   "capitalize", "replace",
-										  "tojson",	  "int",	 "first",  "last",		 "join",
-										  "safe",	  "string",	 "items",  NULL};
-
-static const char *supported_methods[] = {
-	"get",	 "split",	   "strip",	  "lstrip", "rstrip",	  "trim",	  "join", "lower",
-	"upper", "capitalize", "replace", "items",	"startswith", "endswith", NULL};
-
-static const char *supported_tests[] = {"none",	   "null",	   "defined", "undefined", "string",
-										"mapping", "iterable", "number",  "integer",   "sequence",
-										"boolean", "true",	   "false",	  "dict",	   NULL};
+static const char *k_test_names[] = {
+	"none",	  "null",	 "Null",	 "defined", "undefined", "string", "mapping", "iterable",
+	"number", "integer", "sequence", "boolean", "true",		 "false",  "dict",	  NULL};
 
 static int list_has(const char **list, const char *s) {
 	for (int i = 0; list[i]; i++)
 		if (!strcmp(list[i], s))
 			return 1;
 	return 0;
+}
+
+static int filter_name_supported(const char *name);
+static int method_name_supported(const char *name);
+static int test_name_supported(const char *name);
+
+static void report_unsupported_fn(parser *p, const char *name, int (*supported)(const char *),
+								  const char *prefix, const char *suffix) {
+	if (name && !supported(name)) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "%s%s%s", prefix, name, suffix);
+		strlist_add(&p->features, xstrdup(buf));
+	}
 }
 static void report_unsupported(parser *p, const char *name, const char **table, const char *prefix,
 							   const char *suffix) {
@@ -1447,19 +1448,19 @@ static void scan_expr(parser *p, expr_node *e) {
 		return;
 	switch (e->kind) {
 	case EX_FILTER:
-		report_unsupported(p, e->str, supported_filters, "unsupported filter '", "'");
+		report_unsupported_fn(p, e->str, filter_name_supported, "unsupported filter '", "'");
 		scan_expr(p, e->a);
 		for (expr_arg *a = e->args; a; a = a->next)
 			scan_expr(p, a->val);
 		break;
 	case EX_METHODCALL:
-		report_unsupported(p, e->str, supported_methods, "unsupported method '", "()'");
+		report_unsupported_fn(p, e->str, method_name_supported, "unsupported method '", "()'");
 		scan_expr(p, e->a);
 		for (expr_arg *a = e->args; a; a = a->next)
 			scan_expr(p, a->val);
 		break;
 	case EX_ISDEFINED:
-		report_unsupported(p, e->str, supported_tests, "unsupported test 'is ", "'");
+		report_unsupported_fn(p, e->str, test_name_supported, "unsupported test 'is ", "'");
 		scan_expr(p, e->a);
 		break;
 	case EX_BINOP: {
@@ -2033,22 +2034,22 @@ static const struct {
 	{"map", filter_map},
 };
 
-static uint64_t k_filter_hash[sizeof(k_filter_table) / sizeof(k_filter_table[0])];
+static int test_name_supported(const char *name) {
+	return list_has(k_test_names, name);
+}
 
 static jinja_filter_fn lookup_filter(const char *name) {
 	if (!name)
 		return NULL;
-	uint64_t h = fnv1a_str(name);
 	for (size_t i = 0; i < sizeof(k_filter_table) / sizeof(k_filter_table[0]); i++) {
-		uint64_t eh = k_filter_hash[i];
-		if (!eh) {
-			eh				 = fnv1a_str(k_filter_table[i].name);
-			k_filter_hash[i] = eh;
-		}
-		if (eh == h && !strcmp(name, k_filter_table[i].name))
+		if (!strcmp(name, k_filter_table[i].name))
 			return k_filter_table[i].fn;
 	}
 	return NULL;
+}
+
+static int filter_name_supported(const char *name) {
+	return lookup_filter(name) != NULL;
 }
 
 static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
@@ -2147,22 +2148,18 @@ static const struct {
 	{"endswith", method_startswith},
 };
 
-static uint64_t k_method_hash[sizeof(k_method_table) / sizeof(k_method_table[0])];
-
 static jinja_method_fn lookup_method(const char *name) {
 	if (!name)
 		return NULL;
-	uint64_t h = fnv1a_str(name);
 	for (size_t i = 0; i < sizeof(k_method_table) / sizeof(k_method_table[0]); i++) {
-		uint64_t eh = k_method_hash[i];
-		if (!eh) {
-			eh				 = fnv1a_str(k_method_table[i].name);
-			k_method_hash[i] = eh;
-		}
-		if (eh == h && !strcmp(name, k_method_table[i].name))
+		if (!strcmp(name, k_method_table[i].name))
 			return k_method_table[i].fn;
 	}
 	return NULL;
+}
+
+static int method_name_supported(const char *name) {
+	return lookup_method(name) != NULL;
 }
 
 static jinja_value *eval_methodcall(eval_ctx *ctx, expr_node *e) {
@@ -2263,15 +2260,8 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			int			kind;
 		} kw[] = {{"true", 1}, {"True", 1}, {"false", 0}, {"False", 0},
 				  {"none", 2}, {"None", 2}, {NULL, 0}};
-		static uint64_t kw_hash[sizeof(kw) / sizeof(kw[0])];
-		uint64_t		kh = fnv1a_str(e->str);
 		for (int i = 0; kw[i].name; i++) {
-			uint64_t eh = kw_hash[i];
-			if (!eh) {
-				eh		   = fnv1a_str(kw[i].name);
-				kw_hash[i] = eh;
-			}
-			if (eh == kh && !strcmp(e->str, kw[i].name)) {
+			if (!strcmp(e->str, kw[i].name)) {
 				if (kw[i].kind == 1)
 					return jinja_bool(1);
 				if (kw[i].kind == 0)
@@ -2578,9 +2568,8 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 		}
 
 		scope loop_sc;
-		loop_sc.entries		  = NULL;
-		loop_sc.parent		  = ctx->sc;
-		jinja_value *loop_obj = jinja_dict();
+		loop_sc.entries = NULL;
+		loop_sc.parent	= ctx->sc;
 		for (size_t i = 0; i < n && !ctx->failed; i++) {
 			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
@@ -2613,7 +2602,6 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 			}
 		}
 		scope_free_entries(&loop_sc);
-		(void)key_list;
 		return;
 	}
 	case ST_SET: {

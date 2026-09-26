@@ -151,9 +151,10 @@ status_code gguf_get_arr_f32(const gguf_ctx *c, const char *key, const float **o
 							 size_t *out_count);
 status_code gguf_get_arr_str(const gguf_ctx *c, const char *key, const char *const **out,
 							 size_t *out_count);
+status_code gguf_get_arr_bool(const gguf_ctx *c, const char *key, const uint8_t **out,
+							  size_t *out_count);
 
 const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name);
-size_t			   ggml_row_size(uint32_t type, size_t n);
 
 int gguf_tensor_name_is_expert(const char *name);
 

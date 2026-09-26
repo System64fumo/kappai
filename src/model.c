@@ -19,35 +19,18 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define REPACK_MIN_ROWS_PER_THREAD 8
-
-static void madvise_dontneed(const void *map_base, size_t map_size, const void *ptr, size_t bytes) {
-	if (!map_base || map_size == 0)
-		return;
-	long ps = sysconf(_SC_PAGESIZE);
-	if (ps <= 0)
-		ps = 4096;
-	uintptr_t addr		 = (uintptr_t)ptr;
-	uintptr_t page_start = addr & ~((uintptr_t)ps - 1);
-	uintptr_t page_end	 = (addr + bytes + ps - 1) & ~((uintptr_t)ps - 1);
-	if (page_start >= (uintptr_t)map_base && page_end <= (uintptr_t)map_base + map_size) {
-		madvise((void *)page_start, page_end - page_start, MADV_DONTNEED);
-	}
-}
-
 static void madvise_access_pattern(const void *map_base, size_t map_size, const void *ptr,
 								   size_t bytes, int advice) {
 	if (!map_base || map_size == 0 || !ptr || bytes == 0)
 		return;
-	long ps = sysconf(_SC_PAGESIZE);
-	if (ps <= 0)
-		ps = 4096;
-	uintptr_t addr		 = (uintptr_t)ptr;
-	uintptr_t page_start = addr & ~((uintptr_t)ps - 1);
-	uintptr_t page_end	 = (addr + bytes + ps - 1) & ~((uintptr_t)ps - 1);
-	if (page_start >= (uintptr_t)map_base && page_end <= (uintptr_t)map_base + map_size) {
-		madvise((void *)page_start, page_end - page_start, advice);
-	}
+	page_span r = page_span_for(ptr, bytes, (size_t)page_size_cached());
+	if (!page_span_clamp(&r, (uintptr_t)map_base, map_size) || r.len == 0)
+		return;
+	madvise((void *)r.start, r.len, advice);
+}
+
+static void madvise_dontneed(const void *map_base, size_t map_size, const void *ptr, size_t bytes) {
+	madvise_access_pattern(map_base, map_size, ptr, bytes, MADV_DONTNEED);
 }
 
 static status_code akey_i32(const gguf_ctx *g, const char *prefix, const char *suffix,
@@ -401,36 +384,19 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 					check_expert_tensor_dims(g, vname, m->moe.moe_intermediate, m->dim,
 											 m->moe.n_experts))
 					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.exp_probs_b.bias", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.exp_probs_bias.bias", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_inp.bias", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.ffn_gate_inp.scale", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.pre_ffw_norm_2.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.ffn_pre_norm_2.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.post_ffw_norm_1.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.ffn_post_norm_1.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.post_ffw_norm_2.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
-				snprintf(vname, sizeof(vname), "blk.%d.ffn_post_norm_2.weight", i);
-				if (require_tensor_f32_if_present(g, vname))
-					return -1;
+				static const char *const f32_bias_norm_suffixes[] = {
+					"exp_probs_b.bias",		  "exp_probs_bias.bias",	"ffn_gate_inp.bias",
+					"ffn_gate_inp.scale",	  "pre_ffw_norm_2.weight",	"ffn_pre_norm_2.weight",
+					"post_ffw_norm_1.weight", "ffn_post_norm_1.weight", "post_ffw_norm_2.weight",
+					"ffn_post_norm_2.weight",
+				};
+				for (size_t fi = 0;
+					 fi < sizeof(f32_bias_norm_suffixes) / sizeof(f32_bias_norm_suffixes[0]);
+					 fi++) {
+					snprintf(vname, sizeof(vname), "blk.%d.%s", i, f32_bias_norm_suffixes[fi]);
+					if (require_tensor_f32_if_present(g, vname))
+						return -1;
+				}
 			}
 			if (m->arch_info->uses_moe_shared_dense_ffn) {
 				if (require_layer_dims_2d(g, tname, sizeof(tname), "blk.%d.ffn_gate.weight", i,
@@ -529,11 +495,6 @@ static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t typ
 	return OK;
 }
 
-static status_code upload_tensor(model *m, const void *host_ptr, uint32_t type, int n_dims,
-								 uint64_t d0, uint64_t d1, weight_class wc, buffer *out) {
-	return upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, m->backend, out);
-}
-
 static int cmp_tensor_slot(const void *a, const void *b) {
 	const model_tensor_slot *x = (const model_tensor_slot *)a;
 	const model_tensor_slot *y = (const model_tensor_slot *)b;
@@ -564,13 +525,17 @@ static void tensor_release_index_ensure(model *m) {
 	m->tensor_data_order_n = live;
 }
 
+static int mapped_pages_live(const model *m) {
+	return m->gctx.map && m->gctx.map_size > 0 && !m->gctx.map_is_heap;
+}
+
 static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes) {
 	if (!host_ptr || bytes == 0)
 		return;
 
 	if (m->tie_embeddings && host_ptr == m->tok_embd.host_ptr)
 		return;
-	if (m->gctx.map && !m->gctx.map_is_heap) {
+	if (mapped_pages_live(m)) {
 
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, host_ptr, bytes);
 	} else if (m->gctx.owns_tensor_data) {
@@ -708,12 +673,6 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 	return OK;
 }
 
-static status_code upload_tensor_repack(model *m, const void *host_ptr, uint32_t *type_io,
-										int n_dims, uint64_t d0, uint64_t d1, weight_class wc,
-										buffer *out) {
-	return upload_tensor_repack_to(m, host_ptr, type_io, n_dims, d0, d1, wc, m->backend, out);
-}
-
 static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *type,
 								  size_t row_len, size_t n_rows) {
 	if (*type == GGML_TYPE_F32)
@@ -735,6 +694,16 @@ static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *
 	*type = GGML_TYPE_F32;
 }
 
+static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t n_rows) {
+	if (ref->type == GGML_TYPE_F32)
+		return 0;
+	const void *orig  = ref->host_ptr;
+	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
+	dequant_weight_to_f32(m->backend, &ref->host_ptr, &ref->type, row_len, n_rows);
+	release_original_weight_data(m, orig, bytes);
+	return 1;
+}
+
 static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w, uint32_t type,
 								 uint64_t dim, uint64_t intermediate) {
 	size_t	 row_stride = ggml_row_size(type, dim);
@@ -743,7 +712,7 @@ static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w,
 	memcpy(buf, gate_w, half_bytes);
 	memcpy(buf + half_bytes, up_w, half_bytes);
 
-	if (m->use_mmap && m->gctx.map && m->gctx.map_size > 0) {
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, gate_w, half_bytes);
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, up_w, half_bytes);
 	}
@@ -775,7 +744,7 @@ static void *build_fused_qkv(model *m, const layer_weights *L, int has_kv, int h
 	}
 	*total_rows_out = off / row_stride;
 
-	if (m->use_mmap && m->gctx.map && m->gctx.map_size > 0) {
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wq.host_ptr, q_bytes);
 		if (has_kv)
 			madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wk.host_ptr, kv_bytes);
@@ -819,7 +788,7 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 		return prs;
 	}
 
-	if (m->gctx.map && !m->gctx.map_is_heap) {
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, gate_w, half_src);
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, up_w, half_src);
 	}
@@ -895,7 +864,7 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 		}
 	}
 
-	if (m->gctx.map && !m->gctx.map_is_heap) {
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wq.host_ptr, q_src);
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, L->wk.host_ptr, kv_src);
 		if (has_own_v)
@@ -923,15 +892,26 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 	return OK;
 }
 
+static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
+								 uint64_t d1, weight_class wc, backend *target) {
+	ref->type = wtype;
+	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
+}
+
 static status_code upload_one(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
 							  uint64_t d1, weight_class wc) {
-	ref->type = wtype;
-	return upload_tensor(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, &ref->buf);
+	return upload_one_to(m, ref, wtype, ndims, d0, d1, wc, m->backend);
+}
+
+static status_code upload_one_repack_to(model *m, weight_ref *ref, int ndims, uint64_t d0,
+										uint64_t d1, weight_class wc, backend *target) {
+	return upload_tensor_repack_to(m, ref->host_ptr, &ref->type, ndims, d0, d1, wc, target,
+								   &ref->buf);
 }
 
 static status_code upload_one_repack(model *m, weight_ref *ref, int ndims, uint64_t d0, uint64_t d1,
 									 weight_class wc) {
-	return upload_tensor_repack(m, ref->host_ptr, &ref->type, ndims, d0, d1, wc, &ref->buf);
+	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, m->backend);
 }
 
 static status_code upload_embeddings(model *m) {
@@ -942,7 +922,7 @@ static status_code upload_embeddings(model *m) {
 		ERROR("model_upload: token_embd upload failed (%d)", s);
 		return s;
 	}
-	if (!m->tie_embeddings && m->gctx.map && !m->gctx.map_is_heap) {
+	if (!m->tie_embeddings && mapped_pages_live(m)) {
 		size_t embd_bytes = ggml_row_size(m->tok_embd.type, (size_t)m->dim) * (size_t)m->vocab_size;
 		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
 							   MADV_RANDOM);
@@ -1006,17 +986,14 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
-		(ref)->type = (wtype);                                                                     \
-		s = upload_tensor_to(m, (ref)->host_ptr, (ref)->type, (ndims), (d0), (d1), (wc), layer_be, \
-							 &(ref)->buf);                                                         \
+		s = upload_one_to(m, (ref), (wtype), (ndims), (d0), (d1), (wc), layer_be);                 \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
 
 #define UPLOAD_REP(ref, ndims, d0, d1, wc)                                                         \
 	do {                                                                                           \
-		s = upload_tensor_repack_to(m, (ref)->host_ptr, &(ref)->type, (ndims), (d0), (d1), (wc),   \
-									layer_be, &(ref)->buf);                                        \
+		s = upload_one_repack_to(m, (ref), (ndims), (d0), (d1), (wc), layer_be);                   \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
@@ -1146,14 +1123,8 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		UPLOAD(&L->ple_post_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 		int gate_owned = 0;
 		if (L->ple_inp_gate_w.type != GGML_TYPE_F32) {
-			const void *orig = L->ple_inp_gate_w.host_ptr;
-			size_t		orig_bytes =
-				ggml_row_size(L->ple_inp_gate_w.type, (size_t)m->layer_dims.n_embd_per_layer) *
-				(size_t)m->dim;
-			dequant_weight_to_f32(m->backend, &L->ple_inp_gate_w.host_ptr, &L->ple_inp_gate_w.type,
-								  (size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
-			release_original_weight_data(m, orig, orig_bytes);
-			gate_owned = 1;
+			gate_owned = dequant_ref_to_f32(m, &L->ple_inp_gate_w,
+											(size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
 		}
 		UPLOAD(&L->ple_inp_gate_w, L->ple_inp_gate_w.type, 2, m->dim,
 			   m->layer_dims.n_embd_per_layer, WCLASS_MATMUL);
@@ -1164,13 +1135,8 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		}
 		int proj_owned = 0;
 		if (L->ple_proj_w.type != GGML_TYPE_F32) {
-			const void *orig	   = L->ple_proj_w.host_ptr;
-			size_t		orig_bytes = ggml_row_size(L->ple_proj_w.type, (size_t)m->dim) *
-									 (size_t)m->layer_dims.n_embd_per_layer;
-			dequant_weight_to_f32(m->backend, &L->ple_proj_w.host_ptr, &L->ple_proj_w.type,
-								  (size_t)m->dim, (size_t)m->layer_dims.n_embd_per_layer);
-			release_original_weight_data(m, orig, orig_bytes);
-			proj_owned = 1;
+			proj_owned = dequant_ref_to_f32(m, &L->ple_proj_w, (size_t)m->dim,
+											(size_t)m->layer_dims.n_embd_per_layer);
 		}
 		UPLOAD(&L->ple_proj_w, L->ple_proj_w.type, 2, m->layer_dims.n_embd_per_layer, m->dim,
 			   WCLASS_MATMUL);
@@ -1331,13 +1297,9 @@ static status_code upload_all_weights(model *m) {
 	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers);
 
 	if (m->gctx.fd >= 0 && m->gctx.map && m->gctx.n_tensors > 0) {
-		uint64_t ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
-		long	 ps	   = sysconf(_SC_PAGESIZE);
-		if (ps <= 0)
-			ps = 4096;
-		uintptr_t pm   = ~((uintptr_t)ps - 1);
-		uintptr_t base = (uintptr_t)m->gctx.map;
-		uintptr_t stop = base + m->gctx.map_size;
+		uint64_t  ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
+		size_t	  ps	= (size_t)page_size_cached();
+		uintptr_t base	= (uintptr_t)m->gctx.map;
 		for (size_t ti = 0; ti < m->gctx.n_tensors; ti++) {
 			const gguf_tensor *gt = &m->gctx.tensors[ti];
 			if (gguf_tensor_name_is_expert(gt->name))
@@ -1345,10 +1307,10 @@ static status_code upload_all_weights(model *m) {
 			size_t tbytes;
 			if (gguf_tensor_byte_size(gt, &tbytes) != OK || tbytes == 0)
 				continue;
-			uintptr_t a = (uintptr_t)gt->data;
-			uintptr_t b = a + tbytes;
-			if (a >= base && b <= stop && b >= a)
-				readahead(m->gctx.fd, (off_t)((a & pm) - base), ((b + ps - 1) & pm) - (a & pm));
+			page_span r = page_span_for(gt->data, tbytes, ps);
+			if (!page_span_clamp(&r, base, m->gctx.map_size) || r.len == 0)
+				continue;
+			readahead(m->gctx.fd, (off_t)(r.start - base), r.len);
 		}
 		if (g_monitor && g_monitor->fd >= 0) {
 			monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
@@ -1434,17 +1396,14 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 			for (int i = 0; i < m->n_layers; i++) {
 				m->layer_dims.is_global_layer[i] = ((i + 1) % period == 0) ? 1 : 0;
 			}
-			int used_period_heuristic = 1;
-			for (size_t i = 0; i < g->n_kv; i++) {
-				if (strcmp(g->kv_keys[i], key1) == 0 && g->kv_types[i] == GGUF_TYPE_ARRAY &&
-					g->kv_arr_type[i] == GGUF_TYPE_BOOL) {
-					const uint8_t *bools = g->kv_arr_data[i];
-					for (int j = 0; j < m->n_layers && j < (int)g->kv_arr_len[i]; j++) {
-						m->layer_dims.is_global_layer[j] = bools[j] ? 0 : 1;
-					}
-					used_period_heuristic = 0;
-					break;
+			int			   used_period_heuristic = 1;
+			const uint8_t *swa_bools			 = NULL;
+			size_t		   swa_len				 = 0;
+			if (gguf_get_arr_bool(g, key1, &swa_bools, &swa_len) == OK) {
+				for (int j = 0; j < m->n_layers && j < (int)swa_len; j++) {
+					m->layer_dims.is_global_layer[j] = swa_bools[j] ? 0 : 1;
 				}
+				used_period_heuristic = 0;
 			}
 			if (used_period_heuristic)
 				WARN("model: SWA pattern keys '%s'/'%s' absent; guessing the pattern as "
@@ -1811,15 +1770,10 @@ static status_code load_hybrid_metadata(model *m, const gguf_ctx *g, const char 
 	size_t		   rec_len	= 0;
 	char		   key[128];
 	snprintf(key, sizeof(key), "%s.attention.recurrent_layers", prefix);
-	for (size_t i = 0; i < g->n_kv; i++) {
-		if (strcmp(g->kv_keys[i], key) != 0 || g->kv_types[i] != GGUF_TYPE_ARRAY)
-			continue;
-		rec_len = g->kv_arr_len[i];
-		if (g->kv_arr_type[i] == GGUF_TYPE_BOOL)
-			rec_bool = (const uint8_t *)g->kv_arr_data[i];
-		else if (g->kv_arr_type[i] == GGUF_TYPE_I32)
-			rec_i32 = (const int32_t *)g->kv_arr_data[i];
-		break;
+	if (gguf_get_arr_bool(g, key, &rec_bool, &rec_len) != OK) {
+		rec_bool = NULL;
+		if (gguf_get_arr_i32(g, key, &rec_i32, &rec_len) != OK)
+			rec_i32 = NULL;
 	}
 	for (int i = 0; i < m->n_layers; i++) {
 		int rec;
@@ -1840,8 +1794,7 @@ static status_code load_hybrid_metadata(model *m, const gguf_ctx *g, const char 
 }
 
 static status_code model_load_open(model *m, const char *path, int use_mmap,
-								   const char *repack_config, int requested_n_ctx) {
-	(void)requested_n_ctx;
+								   const char *repack_config) {
 	m->use_mmap		 = use_mmap;
 	m->model_path	 = xstrdup(path);
 	m->repack_config = repack_config ? xstrdup(repack_config) : NULL;
@@ -2085,13 +2038,11 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 }
 
 static status_code load_layer_tensor(const gguf_ctx *g, char *tname, size_t tname_sz, int i,
-									 layer_weights *L, weight_ref *ref, const char *fmt,
-									 int debug_first) __attribute__((format(printf, 7, 0)));
+									 weight_ref *ref, const char *fmt, int debug_first)
+	__attribute__((format(printf, 6, 0)));
 
 static status_code load_layer_tensor(const gguf_ctx *g, char *tname, size_t tname_sz, int i,
-									 layer_weights *L, weight_ref *ref, const char *fmt,
-									 int debug_first) {
-	(void)L;
+									 weight_ref *ref, const char *fmt, int debug_first) {
 	const gguf_tensor *t = find_tensor_fmt(g, tname, tname_sz, fmt, i);
 	if (!t)
 		return ERR_FORMAT;
@@ -2196,37 +2147,37 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		if (m->arch_info->is_hybrid_recurrent)
 			L->is_recurrent = m->hybrid.recurrent_layers[i] != 0;
 
-		if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_norm_w,
+		if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_norm_w,
 							  "blk.%d.attn_norm.weight", 0) != OK)
 			return ERR_FORMAT;
 
 		if (model_layer_is_recurrent(m, i)) {
 			int is_conv = m->arch_info->hybrid_shortconv;
 			if (is_conv) {
-				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
+				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_qkv_w,
 									  "blk.%d.shortconv.in_proj.weight", 1) != OK ||
-					load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
+					load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_out_w,
 									  "blk.%d.shortconv.out_proj.weight", 1) != OK ||
-					load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
+					load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_conv1d_w,
 									  "blk.%d.shortconv.conv.weight", 0) != OK)
 					return ERR_FORMAT;
-			} else if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_qkv_w,
+			} else if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_qkv_w,
 										 "blk.%d.attn_qkv.weight", 1) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->attn_gate_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_gate_w,
 										 "blk.%d.attn_gate.weight", 1) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_conv1d_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_conv1d_w,
 										 "blk.%d.ssm_conv1d.weight", 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_dt_b,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_dt_b,
 										 "blk.%d.ssm_dt.bias", 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_a, "blk.%d.ssm_a",
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_a, "blk.%d.ssm_a",
 										 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_beta_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_beta_w,
 										 "blk.%d.ssm_beta.weight", 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_alpha_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_alpha_w,
 										 "blk.%d.ssm_alpha.weight", 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_norm_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_norm_w,
 										 "blk.%d.ssm_norm.weight", 0) != OK ||
-					   load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ssm_out_w,
+					   load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_out_w,
 										 "blk.%d.ssm_out.weight", 1) != OK)
 				return ERR_FORMAT;
 			L->wq		 = (weight_ref){0};
@@ -2235,16 +2186,16 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			L->wo		 = (weight_ref){0};
 			L->has_own_v = 0;
 		} else if (m->arch_info && m->arch_info->is_mla) {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->q_a_w,
-								  "blk.%d.attn_q_a.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->q_a_w, "blk.%d.attn_q_a.weight",
+								  1) != OK)
 				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->q_b_w,
-								  "blk.%d.attn_q_b.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->q_b_w, "blk.%d.attn_q_b.weight",
+								  1) != OK)
 				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->q_a_norm_w,
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->q_a_norm_w,
 								  "blk.%d.attn_q_a_norm.weight", 0) != OK)
 				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->kv_a_w,
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->kv_a_w,
 								  "blk.%d.attn_kv_a_mqa.weight", 1) != OK)
 				return ERR_FORMAT;
 			{
@@ -2261,33 +2212,21 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 				}
 				L->kv_a_norm_w.host_ptr = nt->data;
 			}
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->k_b_w,
-								  "blk.%d.attn_k_b.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->k_b_w, "blk.%d.attn_k_b.weight",
+								  1) != OK)
 				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->v_b_w,
-								  "blk.%d.attn_v_b.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->v_b_w, "blk.%d.attn_v_b.weight",
+								  1) != OK)
 				return ERR_FORMAT;
 			if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
 				if (L->k_b_w.type != GGML_TYPE_F32) {
-					const void *kb_orig = L->k_b_w.host_ptr;
-					size_t		kb_bytes =
-						ggml_row_size(L->k_b_w.type, (size_t)m->mla.qk_nope * m->mla.kv_lora) *
-						(size_t)m->n_heads;
-					dequant_weight_to_f32(m->backend, &L->k_b_w.host_ptr, &L->k_b_w.type,
-										  (size_t)m->mla.qk_nope * m->mla.kv_lora,
-										  (size_t)m->n_heads);
-					release_original_weight_data(m, kb_orig, kb_bytes);
+					dequant_ref_to_f32(m, &L->k_b_w, (size_t)m->mla.qk_nope * m->mla.kv_lora,
+									   (size_t)m->n_heads);
 					L->mla_kb_f32 = 1;
 				}
 				if (L->v_b_w.type != GGML_TYPE_F32) {
-					const void *vb_orig = L->v_b_w.host_ptr;
-					size_t		vb_bytes =
-						ggml_row_size(L->v_b_w.type, (size_t)m->mla.kv_lora * m->mla.v_head) *
-						(size_t)m->n_heads;
-					dequant_weight_to_f32(m->backend, &L->v_b_w.host_ptr, &L->v_b_w.type,
-										  (size_t)m->mla.kv_lora * m->mla.v_head,
-										  (size_t)m->n_heads);
-					release_original_weight_data(m, vb_orig, vb_bytes);
+					dequant_ref_to_f32(m, &L->v_b_w, (size_t)m->mla.kv_lora * m->mla.v_head,
+									   (size_t)m->n_heads);
 					L->mla_vb_f32 = 1;
 				}
 			}
@@ -2296,11 +2235,11 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			L->wv		 = (weight_ref){0};
 			L->has_own_v = 0;
 		} else {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wq, "blk.%d.attn_q.weight",
-								  1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->wq, "blk.%d.attn_q.weight", 1) !=
+				OK)
 				return ERR_FORMAT;
 			if (model_layer_has_kv(m, i)) {
-				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wk, "blk.%d.attn_k.weight",
+				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->wk, "blk.%d.attn_k.weight",
 									  1) != OK)
 					return ERR_FORMAT;
 			} else {
@@ -2337,12 +2276,12 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		}
 
 		if (!model_layer_is_recurrent(m, i)) {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->wo,
-								  "blk.%d.attn_output.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->wo, "blk.%d.attn_output.weight",
+								  1) != OK)
 				return ERR_FORMAT;
 		}
 		if (!m->arch_info->uses_post_attn_norm_for_ffn) {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->ffn_norm_w,
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->ffn_norm_w,
 								  "blk.%d.ffn_norm.weight", 0) != OK)
 				return ERR_FORMAT;
 		}
@@ -2389,13 +2328,13 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 					}
 				}
 				if (m->moe.n_shared_experts > 0) {
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->shexp_gate_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->shexp_gate_w,
 										  "blk.%d.ffn_gate_shexp.weight", 1) != OK)
 						return ERR_FORMAT;
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->shexp_up_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->shexp_up_w,
 										  "blk.%d.ffn_up_shexp.weight", 1) != OK)
 						return ERR_FORMAT;
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->shexp_down_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->shexp_down_w,
 										  "blk.%d.ffn_down_shexp.weight", 1) != OK)
 						return ERR_FORMAT;
 					L->intermediate = m->moe.moe_intermediate * m->moe.n_shared_experts;
@@ -2537,13 +2476,13 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 					L->up_w	  = (weight_ref){0};
 					L->down_w = (weight_ref){0};
 				} else {
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->gate_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->gate_w,
 										  "blk.%d.ffn_gate.weight", 1) != OK)
 						return ERR_FORMAT;
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->up_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->up_w,
 										  "blk.%d.ffn_up.weight", 1) != OK)
 						return ERR_FORMAT;
-					if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->down_w,
+					if (load_layer_tensor(g, tname, sizeof(tname), i, &L->down_w,
 										  "blk.%d.ffn_down.weight", 1) != OK)
 						return ERR_FORMAT;
 				}
@@ -2586,25 +2525,25 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 					}
 				}
 			} else {
-				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->gate_w,
+				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->gate_w,
 									  "blk.%d.ffn_gate.weight", 1) != OK)
 					return ERR_FORMAT;
-				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->up_w,
-									  "blk.%d.ffn_up.weight", 1) != OK)
+				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->up_w, "blk.%d.ffn_up.weight",
+									  1) != OK)
 					return ERR_FORMAT;
-				if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->down_w,
+				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->down_w,
 									  "blk.%d.ffn_down.weight", 1) != OK)
 					return ERR_FORMAT;
 			}
 		} else {
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->gate_w,
-								  "blk.%d.ffn_gate.weight", 1) != OK)
-				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->up_w, "blk.%d.ffn_up.weight",
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->gate_w, "blk.%d.ffn_gate.weight",
 								  1) != OK)
 				return ERR_FORMAT;
-			if (load_layer_tensor(g, tname, sizeof(tname), i, L, &L->down_w,
-								  "blk.%d.ffn_down.weight", 1) != OK)
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->up_w, "blk.%d.ffn_up.weight",
+								  1) != OK)
+				return ERR_FORMAT;
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->down_w, "blk.%d.ffn_down.weight",
+								  1) != OK)
 				return ERR_FORMAT;
 		}
 
@@ -2799,7 +2738,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	int	   is_host_backend	 = backend_has_cap(bk, BCAP_IS_HOST) ? 1 : 0;
 	size_t avail_before_load = is_host_backend ? get_available_memory() : backend_mem_available(bk);
 
-	status_code s = model_load_open(m, path, use_mmap, repack_config, requested_n_ctx);
+	status_code s = model_load_open(m, path, use_mmap, repack_config);
 	if (s != OK) {
 		goto fail;
 	}

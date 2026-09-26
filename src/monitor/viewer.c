@@ -57,7 +57,6 @@ typedef struct {
 	int	   n_generated;
 
 	char	 load_phase[32];
-	int		 load_ms;
 	int		 load_done;
 	int		 load_error;
 	uint64_t load_t0_ms;
@@ -75,10 +74,9 @@ typedef struct {
 
 	int expert_hits[MAX_LAYERS][MAX_EXPERTS];
 
-	int	  cur_experts[MAX_LAYERS][MAX_TOPK];
-	int	  cur_n_experts[MAX_LAYERS];
-	float cur_weights[MAX_LAYERS][MAX_TOPK];
-	int	  has_current_token;
+	int cur_experts[MAX_LAYERS][MAX_TOPK];
+	int cur_n_experts[MAX_LAYERS];
+	int has_current_token;
 
 	int expert_total[MAX_EXPERTS];
 
@@ -840,7 +838,6 @@ static void on_load(monitor_state *st, struct json_object *root) {
 	const char *phase = json_get_str(root, "phase", NULL);
 	if (phase)
 		snprintf(st->load_phase, sizeof(st->load_phase), "%s", phase);
-	st->load_ms		 = json_get_int(root, "ms", st->load_ms);
 	st->n_layers	 = json_get_int(root, "layers", st->n_layers);
 	st->dim			 = json_get_int(root, "dim", st->dim);
 	st->vocab		 = json_get_int(root, "vocab", st->vocab);
@@ -926,16 +923,6 @@ static void on_moe_experts(monitor_state *st, struct json_object *root) {
 				st->expert_hits[layer][eid]++;
 				st->expert_total[eid]++;
 			}
-		}
-	}
-	struct json_object *jweights = json_get_arr(root, "weights");
-	if (jweights) {
-		int n = json_object_array_length(jweights);
-		if (n > MAX_TOPK)
-			n = MAX_TOPK;
-		for (int k = 0; k < n; k++) {
-			struct json_object *jw	  = json_object_array_get_idx(jweights, k);
-			st->cur_weights[layer][k] = (float)json_object_get_double(jw);
 		}
 	}
 }

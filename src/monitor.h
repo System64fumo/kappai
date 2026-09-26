@@ -23,6 +23,8 @@ void monitor_reset(monitor *mon);
 
 void monitor_send(monitor *mon, const char *json_fmt, ...) __attribute__((format(printf, 2, 3)));
 
+void monitor_emit(monitor *mon, const char *json_fmt, ...) __attribute__((format(printf, 2, 3)));
+
 void monitor_poll(monitor *mon);
 
 void monitor_free(monitor *mon);

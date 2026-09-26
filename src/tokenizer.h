@@ -43,6 +43,7 @@ typedef struct {
 	void				  *bpe_work;
 	char				  *bpe_arena;
 	str_builder			   bpe_sp;
+	str_builder			   gpt2_scratch;
 	void				  *bpe_pcs_cache;
 	str_arena			   merge_pool;
 	uint32_t			   n_tokens;

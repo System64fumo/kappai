@@ -32,6 +32,13 @@ static inline size_t str_lcp_len(const char *a, const char *b) {
 	return i;
 }
 
+static inline const char *path_basename(const char *path) {
+	if (!path)
+		return "";
+	const char *slash = strrchr(path, '/');
+	return slash ? slash + 1 : path;
+}
+
 #define HEAD_DIM_MAX 512
 
 typedef enum {
@@ -61,14 +68,22 @@ static inline void madvise_hugepage(void *ptr, size_t bytes) {
 #endif
 }
 
+static inline long page_size_cached(void) {
+	static long ps = 0;
+	if (ps <= 0) {
+		ps = sysconf(_SC_PAGESIZE);
+		if (ps <= 0)
+			ps = 4096;
+	}
+	return ps;
+}
+
 static inline void prefault(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	long ps = sysconf(_SC_PAGESIZE);
-	if (ps <= 0)
-		ps = 4096;
-	volatile char *p = (volatile char *)ptr;
-	for (size_t off = 0; off < bytes; off += (size_t)ps)
+	size_t		   ps = (size_t)page_size_cached();
+	volatile char *p  = (volatile char *)ptr;
+	for (size_t off = 0; off < bytes; off += ps)
 		p[off] = p[off];
 	p[bytes - 1] = p[bytes - 1];
 }
@@ -81,6 +96,52 @@ static inline void cpu_relax(void) {
 #else
 	sched_yield();
 #endif
+}
+
+typedef int (*spin_until_fn)(void *ud);
+
+static inline void spin_wait_relax(spin_until_fn pred, void *ud) {
+	unsigned spins = 0;
+	while (!pred(ud)) {
+		if (++spins % 1024 == 0)
+			sched_yield();
+		else
+			cpu_relax();
+	}
+}
+
+typedef struct {
+	uintptr_t start;
+	size_t	  len;
+} page_span;
+
+static inline page_span page_span_for(const void *ptr, size_t bytes, size_t page_size) {
+	page_span r = {0, 0};
+	if (!ptr || bytes == 0 || page_size == 0)
+		return r;
+	uintptr_t addr = (uintptr_t)ptr;
+	uintptr_t end  = addr + bytes;
+	if (end < addr)
+		return r;
+	uintptr_t mask	 = ~((uintptr_t)page_size - 1);
+	uintptr_t pstart = addr & mask;
+	uintptr_t pend	 = (end + page_size - 1) & mask;
+	if (pend < pstart)
+		return r;
+	r.start = pstart;
+	r.len	= pend - pstart;
+	return r;
+}
+
+static inline int page_span_clamp(page_span *r, uintptr_t base, size_t size) {
+	if (!r || r->len == 0)
+		return 0;
+	if (r->start < base || r->start + r->len < r->start)
+		return 0;
+	uintptr_t stop = base + size;
+	if (r->start + r->len > stop || stop < base)
+		return 0;
+	return 1;
 }
 
 static inline void oom_abort(size_t bytes) {

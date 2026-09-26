@@ -109,18 +109,28 @@ static int utf8_to_cp(const char *s, int len, int *cp) {
 	return 1;
 }
 
-static char *gpt2_encode_bytes(const char *in, size_t in_len, size_t *out_len) {
-	char  *out = xmalloc((in_len * 2) + 1);
-	size_t n   = 0;
+static char	   g_byte_utf8[256][4];
+static uint8_t g_byte_utf8_len[256];
+static int	   g_byte_utf8_ready = 0;
+
+static void gpt2_byte_table_ensure(void) {
+	if (g_byte_utf8_ready)
+		return;
+	for (int i = 0; i < 256; i++)
+		g_byte_utf8_len[i] = (uint8_t)cp_to_utf8(g_byte_to_cp[i], g_byte_utf8[i]);
+	g_byte_utf8_ready = 1;
+}
+
+static const char *gpt2_encode_bytes(tokenizer *t, const char *in, size_t in_len, size_t *out_len) {
+	gpt2_byte_table_ensure();
+	sb_reset(&t->gpt2_scratch);
+	sb_reserve(&t->gpt2_scratch, in_len * 2 + 1);
 	for (size_t i = 0; i < in_len; i++) {
-		char buf[4];
-		int	 k = cp_to_utf8(g_byte_to_cp[(unsigned char)in[i]], buf);
-		memcpy(out + n, buf, k);
-		n += k;
+		unsigned char b = (unsigned char)in[i];
+		sb_putb(&t->gpt2_scratch, g_byte_utf8[b], g_byte_utf8_len[b]);
 	}
-	out[n]	 = '\0';
-	*out_len = n;
-	return out;
+	*out_len = t->gpt2_scratch.len;
+	return t->gpt2_scratch.p;
 }
 
 static size_t gpt2_decode_to_bytes_buf(const char *in, const unsigned char *byte_mark,
@@ -809,14 +819,12 @@ static int encode_gpt2_chunk(tokenizer *t, const char *text, size_t start, size_
 			plen = next_pretoken(text, end, &sub_pos);
 		if (plen == 0)
 			break;
-		size_t enc_len;
-		char  *enc = gpt2_encode_bytes(text + pstart, plen, &enc_len);
-		int	   n;
+		size_t		enc_len;
+		const char *enc = gpt2_encode_bytes(t, text + pstart, plen, &enc_len);
+		int			n;
 		if (tokenizer_bpe_encode(t, enc, enc_len, out_ids + *written, max_out - *written, &n) < 0) {
-			free(enc);
 			return -1;
 		}
-		free(enc);
 		*written += n;
 	}
 	return 0;
@@ -1143,6 +1151,7 @@ void tokenizer_free(tokenizer *t) {
 	free(t->bpe_work);
 	free(t->bpe_arena);
 	sb_free(&t->bpe_sp);
+	sb_free(&t->gpt2_scratch);
 	memset(t, 0, sizeof(*t));
 }
 
@@ -1176,6 +1185,47 @@ size_t tokenizer_token_decoded_len(const tokenizer *t, int32_t id) {
 	return decoded;
 }
 
+typedef struct {
+	char		  *acc;
+	unsigned char *mark;
+	int			  *owner;
+	size_t		   cap;
+	size_t		   len;
+	char		  *heap;
+} tok_acc;
+
+static void tok_acc_push(tok_acc *a, const char *bytes, size_t n, int is_byte, int owner_id) {
+	if (a->len + n > a->cap) {
+		size_t new_cap = a->cap;
+		while (a->len + n > new_cap)
+			new_cap <<= 1;
+		size_t ints = a->owner ? new_cap * sizeof(int) : 0;
+		char  *blk	= xmalloc(new_cap * 2 + ints);
+		memcpy(blk, a->acc, a->len);
+		memcpy(blk + new_cap, a->mark, a->len);
+		if (a->owner)
+			memcpy(blk + new_cap * 2, a->owner, a->len * sizeof(int));
+		free(a->heap);
+		a->heap	 = blk;
+		a->acc	 = blk;
+		a->mark	 = (unsigned char *)(blk + new_cap);
+		a->owner = a->owner ? (int *)(blk + new_cap * 2) : NULL;
+		a->cap	 = new_cap;
+	}
+	if (is_byte) {
+		a->acc[a->len]	= bytes[0];
+		a->mark[a->len] = 1;
+	} else {
+		memcpy(a->acc + a->len, bytes, n);
+		memset(a->mark + a->len, 0, n);
+	}
+	if (a->owner) {
+		for (size_t j = 0; j < n; j++)
+			a->owner[a->len + j] = owner_id;
+	}
+	a->len += n;
+}
+
 int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
 									size_t max_bytes) {
 	char		   stack_acc[TOK_DECODE_STACK_CAP];
@@ -1187,6 +1237,7 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
 	size_t		   acc_len	= 0;
 	char		  *heap_blk = NULL;
+	tok_acc		   ta		= {stack_acc, stack_mark, stack_owner, TOK_DECODE_STACK_CAP, 0, NULL};
 
 	for (int i = 0; i < n; i++) {
 		int32_t id = ids[i];
@@ -1199,33 +1250,19 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 			bv	= t->token_id_to_byte[id];
 			len = (bv >= 0) ? 1 : tok->text_len;
 		}
-		if (acc_len + len > acc_cap) {
-			size_t new_cap = acc_cap;
-			while (acc_len + len > new_cap)
-				new_cap <<= 1;
-			char *blk		= xmalloc(new_cap * 2 + new_cap * sizeof(int));
-			int	 *new_owner = (int *)(blk + new_cap * 2);
-			memcpy(blk, acc, acc_len);
-			memcpy(blk + new_cap, mark, acc_len);
-			memcpy(new_owner, owner, acc_len * sizeof(int));
-			free(heap_blk);
-			heap_blk = blk;
-			acc		 = blk;
-			mark	 = (unsigned char *)(blk + new_cap);
-			owner	 = new_owner;
-			acc_cap	 = new_cap;
-		}
 		if (bv >= 0) {
-			acc[acc_len]  = (char)bv;
-			mark[acc_len] = 1;
+			char b = (char)bv;
+			tok_acc_push(&ta, &b, 1, 1, i);
 		} else {
-			memcpy(acc + acc_len, tok->text, len);
-			memset(mark + acc_len, 0, len);
+			tok_acc_push(&ta, tok->text, len, 0, i);
 		}
-		for (size_t j = 0; j < len; j++)
-			owner[acc_len + j] = i;
-		acc_len += len;
 	}
+	acc		 = ta.acc;
+	mark	 = ta.mark;
+	owner	 = ta.owner;
+	acc_len	 = ta.len;
+	acc_cap	 = ta.cap;
+	heap_blk = ta.heap;
 
 	int result = 0;
 
@@ -1289,13 +1326,6 @@ int32_t tokenizer_find_token(const tokenizer *t, const char *text) {
 			return id;
 	}
 
-	size_t needle_len = strlen(text);
-	for (size_t i = 0; i < t->n_tokens; i++) {
-		if (t->tokens[i].type != TOK_TYPE_CONTROL && t->tokens[i].type != TOK_TYPE_USER_DEFINED)
-			continue;
-		if (t->tokens[i].text_len == needle_len && memcmp(t->tokens[i].text, text, needle_len) == 0)
-			return (int32_t)i;
-	}
 	return -1;
 }
 
@@ -1368,6 +1398,7 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
 	size_t		   acc_len	= 0;
 	char		  *heap_blk = NULL;
+	tok_acc		   ta		= {stack_acc, stack_mark, NULL, TOK_DECODE_STACK_CAP, 0, NULL};
 
 	for (int i = 0; i < n_ids; i++) {
 		int32_t id = ids[i];
@@ -1380,29 +1411,18 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 			bv = t->token_id_to_byte[id];
 			n  = (bv >= 0) ? 1 : tok->text_len;
 		}
-		if (acc_len + n > acc_cap) {
-			size_t new_cap = acc_cap;
-			while (acc_len + n > new_cap)
-				new_cap <<= 1;
-			char *blk = xmalloc(new_cap * 2);
-			memcpy(blk, acc, acc_len);
-			memcpy(blk + new_cap, mark, acc_len);
-			free(heap_blk);
-			heap_blk = blk;
-			acc		 = blk;
-			mark	 = (unsigned char *)(blk + new_cap);
-			memset(mark + acc_len, 0, new_cap - acc_len);
-			acc_cap = new_cap;
-		}
 		if (bv >= 0) {
-			acc[acc_len]  = (char)bv;
-			mark[acc_len] = 1;
+			char b = (char)bv;
+			tok_acc_push(&ta, &b, 1, 1, 0);
 		} else {
-			memcpy(acc + acc_len, tok->text, n);
-			memset(mark + acc_len, 0, n);
+			tok_acc_push(&ta, tok->text, n, 0, 0);
 		}
-		acc_len += n;
 	}
+	acc		 = ta.acc;
+	mark	 = ta.mark;
+	acc_len	 = ta.len;
+	acc_cap	 = ta.cap;
+	heap_blk = ta.heap;
 
 	if (t->is_sentencepiece && acc_len >= 3) {
 		size_t rd = 0;

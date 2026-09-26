@@ -16,14 +16,12 @@
 #define COLOR_GRAY "\033[90m"
 
 typedef struct {
-	bool	 output_stream;
-	int		*p_gen;
-	bool	 in_thinking;
-	bool	 first_token;
-	bool	 skip_label;
-	int32_t	 think_start_id;
-	int32_t	 think_end_id;
-	context *c;
+	bool		 output_stream;
+	int			*p_gen;
+	think_filter think;
+	int32_t		 think_start_id;
+	int32_t		 think_end_id;
+	context		*c;
 } on_token_ud;
 
 static int g_use_color	   = 0;
@@ -61,40 +59,32 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	if (!u->output_stream)
 		return;
 
-	if (u->first_token && u->c && u->c->chat.think_open) {
-		u->in_thinking = true;
-		print_start_thinking();
-	}
-	u->first_token = false;
-
-	if (id == u->think_start_id) {
-		u->in_thinking = true;
-		u->skip_label  = true;
-		print_start_thinking();
-		return;
-	}
-	if (id == u->think_end_id) {
-		if (u->in_thinking) {
-			u->in_thinking = false;
-			print_end_thinking();
-		}
-		return;
-	}
-
-	if (u->skip_label) {
-		const char *nl = memchr(piece, '\n', (size_t)n);
-		if (!nl)
+	think_filter_event ev;
+	{
+		int	 think_open	  = u->c && u->c->chat.think_open;
+		bool first		  = u->think.first_token;
+		bool was_thinking = u->think.in_thinking || (first && think_open);
+		ev = think_filter_feed(&u->think, id, u->think_start_id, u->think_end_id, think_open,
+							   &piece, &n);
+		if (first && think_open)
+			print_start_thinking();
+		if (ev == THINK_START) {
+			print_start_thinking();
 			return;
-		n			  = n - (int)(nl - piece) - 1;
-		piece		  = nl + 1;
-		u->skip_label = false;
+		}
+		if (ev == THINK_END) {
+			if (was_thinking)
+				print_end_thinking();
+			return;
+		}
+		if (ev != THINK_EMIT)
+			return;
 	}
 
 	if (n > 0) {
 		fwrite(piece, 1, n, stdout);
 		if (g_stdout_isatty)
 			fflush(stdout);
-		u->first_token = false;
 	}
 }
 
@@ -155,7 +145,7 @@ out:
 
 static int run_chat_turn(context *c, cli_args *a, const char *text) {
 	int			   gen	= 0;
-	on_token_ud	   ud	= {a->output_stream,	 &gen, false, true, false, c->chat.think_start_id,
+	on_token_ud	   ud	= {a->output_stream,	 &gen, {false, false, true}, c->chat.think_start_id,
 						   c->chat.think_end_id, c};
 	sampler_params samp = {a->temperature, a->top_k,		  a->top_p,
 						   a->min_p,	   a->repeat_penalty, a->repeat_last_n};
@@ -366,8 +356,7 @@ int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	config_init(&cfg);
 	const config *ec = config_get();
 
-	const char *model_base = strrchr(ec->model, '/');
-	model_base			   = model_base ? model_base + 1 : ec->model;
+	const char *model_base = path_basename(ec->model);
 
 	DEBUG("model path: %s", ec->model);
 	DEBUG("device=%s use_mmap=%d seed=%llu", ec->device ? ec->device : "auto", ec->use_mmap,

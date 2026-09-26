@@ -143,6 +143,11 @@ int tpool_current_tid(void) {
 	return tpool_cur_tid;
 }
 
+static int tpool_retired_pred(void *ud) {
+	tpool *pool = ud;
+	return atomic_load_explicit(&pool->sync.active_workers, memory_order_acquire) == 0;
+}
+
 static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 	uint64_t t_wait_start = time_ns();
 	uint64_t t_spin_start = t_wait_start;
@@ -451,13 +456,7 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 	int new_epoch = atomic_load_explicit(&pool->sync.epoch, memory_order_relaxed) + 1;
 
 	atomic_store_explicit(&pool->sync.pub_gate, new_epoch, memory_order_release);
-	unsigned retire_spins = 0;
-	while (atomic_load_explicit(&pool->sync.active_workers, memory_order_acquire) != 0) {
-		if (++retire_spins % TPOOL_SPIN_CHECK_EVERY == 0)
-			sched_yield();
-		else
-			cpu_relax();
-	}
+	spin_wait_relax(tpool_retired_pred, pool);
 	atomic_store_explicit(&pool->sync.in_job, 1, memory_order_relaxed);
 
 	atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);

@@ -10,7 +10,6 @@
 #define CPU_ELEMWISE_MIN_PER_THREAD 4096
 #define MLA_KROT_PARALLEL_MIN_POS 64
 #define ATTN_BITREV_MIN_M 8
-#define ATTN_BITREV_STACK_MAX 256
 
 static inline void neon_zero_f32(float *dst, int n) {
 	float32x4_t zero = vdupq_n_f32(0.0f);
@@ -1156,12 +1155,8 @@ static void cpu_add_inplace_chunk_neon(int begin, int end, int tid, void *ctx) {
 status_code cpu_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
 	cpu_priv *p		  = self->priv;
 	float	 *args[2] = {cpu_ptr(x), (float *)cpu_ptr(y)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_add_inplace_chunk_neon,
-						   args);
-	} else {
-		cpu_add_inplace_chunk_neon(0, n, 0, args);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_add_inplace_chunk_neon, args);
 	return OK;
 }
 
@@ -1210,11 +1205,8 @@ status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up
 							 int n) {
 	cpu_priv		*p = self->priv;
 	cpu_ffn_act_args a = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_ffn_silu_chunk_neon, &a);
-	} else {
-		cpu_ffn_silu_chunk_neon(0, n, 0, &a);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_ffn_silu_chunk_neon, &a);
 	return OK;
 }
 
@@ -1303,89 +1295,14 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 	cpu_ffn_act_args a	   = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
 	const size_t	 total = (size_t)m * (size_t)n;
 
-	if (tpool_current_tid() < 0 && p->pool && total >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, (int)total, CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
-		return OK;
-	}
-
-	fn(0, (int)total, 0, &a);
+	cpu_run_batch_full(p->pool, (int)total, CPU_ELEMWISE_MIN_PER_THREAD,
+					   2 * CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
 	return OK;
 }
 
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
 	(void)self;
-	const float	   *lp		= cpu_ptr(logits);
-	float32x4_t		best_v0 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v1 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v2 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v3 = vdupq_n_f32(-INFINITY);
-	int32x4_t		best_i0 = vdupq_n_s32(0);
-	int32x4_t		best_i1 = vdupq_n_s32(0);
-	int32x4_t		best_i2 = vdupq_n_s32(0);
-	int32x4_t		best_i3 = vdupq_n_s32(0);
-	int32x4_t		idx0	= {0, 1, 2, 3};
-	int32x4_t		idx1	= {4, 5, 6, 7};
-	int32x4_t		idx2	= {8, 9, 10, 11};
-	int32x4_t		idx3	= {12, 13, 14, 15};
-	const int32x4_t stride	= vdupq_n_s32(16);
-	int				i		= 0;
-	for (; i + 16 <= n; i += 16) {
-		float32x4_t v0 = vld1q_f32(lp + i);
-		float32x4_t v1 = vld1q_f32(lp + i + 4);
-		float32x4_t v2 = vld1q_f32(lp + i + 8);
-		float32x4_t v3 = vld1q_f32(lp + i + 12);
-		uint32x4_t	m0 = vcgtq_f32(v0, best_v0);
-		uint32x4_t	m1 = vcgtq_f32(v1, best_v1);
-		uint32x4_t	m2 = vcgtq_f32(v2, best_v2);
-		uint32x4_t	m3 = vcgtq_f32(v3, best_v3);
-		best_v0		   = vbslq_f32(m0, v0, best_v0);
-		best_v1		   = vbslq_f32(m1, v1, best_v1);
-		best_v2		   = vbslq_f32(m2, v2, best_v2);
-		best_v3		   = vbslq_f32(m3, v3, best_v3);
-		best_i0		   = vbslq_s32(m0, idx0, best_i0);
-		best_i1		   = vbslq_s32(m1, idx1, best_i1);
-		best_i2		   = vbslq_s32(m2, idx2, best_i2);
-		best_i3		   = vbslq_s32(m3, idx3, best_i3);
-		idx0		   = vaddq_s32(idx0, stride);
-		idx1		   = vaddq_s32(idx1, stride);
-		idx2		   = vaddq_s32(idx2, stride);
-		idx3		   = vaddq_s32(idx3, stride);
-	}
-	uint32x4_t	m01	  = vcgtq_f32(best_v1, best_v0);
-	float32x4_t bv01  = vbslq_f32(m01, best_v1, best_v0);
-	int32x4_t	bi01  = vbslq_s32(m01, best_i1, best_i0);
-	uint32x4_t	m23	  = vcgtq_f32(best_v3, best_v2);
-	float32x4_t bv23  = vbslq_f32(m23, best_v3, best_v2);
-	int32x4_t	bi23  = vbslq_s32(m23, best_i3, best_i2);
-	uint32x4_t	m0123 = vcgtq_f32(bv23, bv01);
-	float32x4_t bv	  = vbslq_f32(m0123, bv23, bv01);
-	int32x4_t	bi	  = vbslq_s32(m0123, bi23, bi01);
-
-	float	vals[4];
-	int32_t idxs[4];
-	vst1q_f32(vals, bv);
-	vst1q_s32(idxs, bi);
-	float bestv = vals[0];
-	int	  best	= idxs[0];
-	if (vals[1] > bestv) {
-		bestv = vals[1];
-		best  = idxs[1];
-	}
-	if (vals[2] > bestv) {
-		bestv = vals[2];
-		best  = idxs[2];
-	}
-	if (vals[3] > bestv) {
-		bestv = vals[3];
-		best  = idxs[3];
-	}
-	for (; i < n; i++) {
-		if (lp[i] > bestv) {
-			bestv = lp[i];
-			best  = i;
-		}
-	}
-	*out_idx = best;
+	*out_idx = cpu_argmax_f32(cpu_ptr(logits), n);
 	return OK;
 }
 
@@ -1690,14 +1607,4 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
-static status_code cpu_arch_ctor(backend *out) {
-	memset(out, 0, sizeof(*out));
-	out->name	  = "cpu_aarch64";
-	out->priority = 10;
-	out->caps	  = CPU_BACKEND_CAPS;
-	return cpu_backend_fill(out);
-}
-
-BACKEND_REGISTER("cpu_aarch64", cpu_arch_ctor)
-
-void backend_autoreg_cpu_scalar_ctor(void) {}
+CPU_BACKEND_REGISTER("cpu_aarch64", cpu_arch_ctor, 10, NULL)
