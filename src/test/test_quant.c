@@ -712,21 +712,21 @@ static void test_repack_default_policy(void) {
 #endif
 	const struct {
 		uint32_t type;
-		const char *config;
 		int expected;
+		const char *config;
 		const char *label;
 	} cases[] = {
-		{GGML_TYPE_Q4_K, NULL, !native_k_quants, "q4_K smart default"},
-		{GGML_TYPE_Q5_K, NULL, 1, "q5_K smart default"},
-		{GGML_TYPE_Q6_K, NULL, !native_k_quants, "q6_K smart default"},
-		{GGML_TYPE_Q8_0, NULL, 1, "q8_0 smart default"},
-		{GGML_TYPE_IQ3_S, NULL, 1, "iq3_s smart default"},
-		{GGML_TYPE_IQ4_NL, NULL, 1, "iq4_nl smart default"},
-		{GGML_TYPE_Q4_K, "all", 1, "q4_K explicit all"},
-		{GGML_TYPE_Q5_K, "q5_K,q6_K", 1, "q5_K explicit list"},
-		{GGML_TYPE_Q6_K, "q5_K,q6_K", 1, "q6_K explicit list"},
-		{GGML_TYPE_Q4_K, "q5_K,q6_K", 0, "q4_K excluded from list"},
-		{GGML_TYPE_Q4_K, "none", 0, "q4_K explicit none"},
+		{GGML_TYPE_Q4_K, !native_k_quants, NULL, "q4_K smart default"},
+		{GGML_TYPE_Q5_K, 1, NULL, "q5_K smart default"},
+		{GGML_TYPE_Q6_K, !native_k_quants, NULL, "q6_K smart default"},
+		{GGML_TYPE_Q8_0, 1, NULL, "q8_0 smart default"},
+		{GGML_TYPE_IQ3_S, 1, NULL, "iq3_s smart default"},
+		{GGML_TYPE_IQ4_NL, 1, NULL, "iq4_nl smart default"},
+		{GGML_TYPE_Q4_K, 1, "all", "q4_K explicit all"},
+		{GGML_TYPE_Q5_K, 1, "q5_K,q6_K", "q5_K explicit list"},
+		{GGML_TYPE_Q6_K, 1, "q5_K,q6_K", "q6_K explicit list"},
+		{GGML_TYPE_Q4_K, 0, "q5_K,q6_K", "q4_K excluded from list"},
+		{GGML_TYPE_Q4_K, 0, "none", "q4_K explicit none"},
 	};
 	for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
 		int actual = model_should_repack(cases[i].type, cases[i].config);

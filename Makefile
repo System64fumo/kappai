@@ -355,6 +355,9 @@ format:
 NON_HOST_CPU_ARCHS := aarch64 x86_64
 NON_HOST_CPU_ARCHS := $(filter-out $(HOST_ARCH),$(NON_HOST_CPU_ARCHS))
 TIDY_SRCS := $(filter-out $(foreach a,$(NON_HOST_CPU_ARCHS),$(SRC_DIR)/backend/cpu/$(a)/%),$(ALL_SRCS))
+ifeq ($(HAS_VULKAN),)
+  TIDY_SRCS := $(filter-out $(SRC_DIR)/backend/vulkan/%,$(TIDY_SRCS))
+endif
 
 tidy: | $(OUT_DIR)
 	@which clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 1; }
@@ -364,7 +367,7 @@ tidy: | $(OUT_DIR)
 		xargs -P $$(nproc) \
 		-I {} sh -c ' \
 			echo "  TIDY    {}"; \
-			clang-tidy --config-file=.clang-tidy {} -- $(filter-out $(ARCH_FLAGS) -fvect-cost-model=%,$(CFLAGS)) -march=native -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true \
+			clang-tidy --config-file=.clang-tidy {} -- $(filter-out $(ARCH_FLAGS) -fvect-cost-model=%,$(CFLAGS)) -march=native -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 \
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
