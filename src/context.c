@@ -393,19 +393,40 @@ static int context_prefill_chunk_size(const context *c, int n_threads) {
 		if (end != env && *end == '\0' && v >= 4 && v <= 4096)
 			return (int)v;
 	}
+	if (n_threads < 1)
+		n_threads = 1;
+	size_t ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
+#if defined(L2_SIZE_BYTES) && (L2_SIZE_BYTES > 0)
+	{
+		size_t scaled = (size_t)L2_SIZE_BYTES * (size_t)n_threads;
+		if (scaled < (1ull << 20))
+			scaled = (1ull << 20);
+		if (scaled > PREFILL_CHUNK_WS_TARGET_BYTES)
+			scaled = PREFILL_CHUNK_WS_TARGET_BYTES;
+		ws_target = scaled;
+	}
+#endif
 	size_t kv_per_tok	= context_kv_bytes_per_token(c);
-	int	   chunk		= PREFILL_CHUNK_WS_TARGET_BYTES / (kv_per_tok > 0 ? kv_per_tok : 1);
+	int	   chunk		= (int)(ws_target / (kv_per_tok > 0 ? kv_per_tok : 1));
 	size_t slot_per_tok = context_slot_bytes_per_token(c);
 	if (slot_per_tok > 0) {
-		int by_slots = PREFILL_CHUNK_WS_TARGET_BYTES / (size_t)slot_per_tok;
+		int by_slots = (int)(ws_target / slot_per_tok);
 		if (by_slots < chunk)
 			chunk = by_slots;
 	}
-	if (chunk < 32)
-		chunk = 32;
+	int floor = 4 * n_threads;
+	if (floor < 32)
+		floor = 32;
+	if (floor > 512)
+		floor = 512;
 	if (chunk > 512)
 		chunk = 512;
-	(void)n_threads;
+	if (chunk < floor)
+		chunk = floor;
+	else
+		chunk &= ~3;
+	if (chunk < floor)
+		chunk = floor;
 	return chunk;
 }
 

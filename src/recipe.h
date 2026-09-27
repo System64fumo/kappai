@@ -1,9 +1,11 @@
 #ifndef RECIPE_H
 #define RECIPE_H
 
+#include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
 #include "log.h"
+#include "model.h"
 #include "profile.h"
 
 #define RECIPE_SLOT_X 0
@@ -34,7 +36,6 @@
 struct model;
 struct kvcache;
 struct compute_scratch;
-struct buffer;
 struct layer_weights;
 
 struct batch_scratch;
@@ -283,6 +284,9 @@ typedef struct {
 	int						n_rows;
 	int						pos_start;
 	float				   *logits_out;
+	backend				   *layer_be;
+	buffer				   *slot_base;
+	weight_ref			  **wtab_row;
 } exec_ctx;
 
 float		*recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);

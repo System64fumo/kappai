@@ -2172,10 +2172,18 @@ static jinja_value *eval_methodcall(eval_ctx *ctx, expr_node *e) {
 }
 
 static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
-	if (!strcmp(e->op, "and"))
-		return jinja_bool(truthy(eval_expr(ctx, e->a)) && truthy(eval_expr(ctx, e->b)));
-	if (!strcmp(e->op, "or"))
-		return jinja_bool(truthy(eval_expr(ctx, e->a)) || truthy(eval_expr(ctx, e->b)));
+	if (!strcmp(e->op, "and")) {
+		jinja_value *a = eval_expr(ctx, e->a);
+		if (!truthy(a))
+			return a;
+		return eval_expr(ctx, e->b);
+	}
+	if (!strcmp(e->op, "or")) {
+		jinja_value *a = eval_expr(ctx, e->a);
+		if (truthy(a))
+			return a;
+		return eval_expr(ctx, e->b);
+	}
 	if (!strcmp(e->op, "+")) {
 		jinja_value *a		  = eval_expr(ctx, e->a);
 		jinja_value *b		  = eval_expr(ctx, e->b);

@@ -372,9 +372,9 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 		size_t	 pos_off = (size_t)pos * p->kv_block_stride;
 		uint8_t *kd_base = (uint8_t *)k->handle;
 		uint8_t *vd_base = (uint8_t *)v->handle;
+		size_t	 layer_base =
+			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * p->kv_layer_stride);
 		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t layer_base =
-				p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * p->kv_layer_stride);
 			size_t off = layer_base + ((size_t)kvh * p->kv_kvh_stride) + pos_off;
 			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 								 vf + ((size_t)kvh * head_dim), head_dim);
@@ -386,11 +386,10 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 	uint16_t *vd_base	= v->handle;
 	int		  hd_stride = head_dim;
 	size_t	  pos_off	= (size_t)pos * hd_stride;
+	size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
+										: ((size_t)layer * (size_t)n_kv_heads * n_ctx * hd_stride);
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t layer_base = p->kv_layer_off
-								? p->kv_layer_off[layer] / sizeof(uint16_t)
-								: ((size_t)layer * (size_t)n_kv_heads * n_ctx * hd_stride);
-		size_t off		  = layer_base + ((size_t)kvh * (size_t)n_ctx * hd_stride) + pos_off;
+		size_t off = layer_base + ((size_t)kvh * (size_t)n_ctx * hd_stride) + pos_off;
 		cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 							vf + ((size_t)kvh * head_dim), head_dim);
 	}
@@ -399,52 +398,39 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 
 typedef struct {
 	cpu_priv	*p;
-	buffer		*k, *v;
-	int			 layer;
 	int			 pos_start;
 	const float *kf_base;
 	const float *vf_base;
+	uint8_t		*kd_u8;
+	uint8_t		*vd_u8;
+	uint16_t	*kd_u16;
+	uint16_t	*vd_u16;
+	size_t		 layer_base;
+	size_t		 blk_stride;
+	size_t		 kvh_stride;
 	int			 in_row_stride;
-	int			 n_kv_heads;
 	int			 head_dim;
-	int			 n_ctx;
 	int			 n_active;
+	int			 is_q80;
 } cpu_kv_put_batch_job;
 
 static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
-	cpu_kv_put_batch_job *j		   = ctx;
-	cpu_priv			 *p		   = j->p;
-	int					  n_active = j->n_active > 0 ? j->n_active : j->n_kv_heads;
+	cpu_kv_put_batch_job *j = ctx;
 
 	for (int idx = begin; idx < end; idx++) {
-		int	   row = idx / n_active;
-		int	   kvh = idx % n_active;
-		size_t layer_base =
-			p->kv_layer_off
-				? p->kv_layer_off[j->layer]
-				: ((size_t)j->layer * (size_t)j->n_kv_heads * j->n_ctx *
-				   ((p->kv_quant == KV_QUANT_Q8_0) ? (((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) /
-													  KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
-												   : ((size_t)j->head_dim * sizeof(uint16_t))));
-		const float *kf = j->kf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
-		const float *vf = j->vf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
-		if (p->kv_quant == KV_QUANT_Q8_0) {
-			size_t n_blocks	  = ((size_t)j->head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-			size_t blk_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-			size_t kvh_stride = (size_t)j->n_ctx * blk_stride;
-			size_t off =
-				layer_base + (size_t)kvh * kvh_stride + (size_t)(j->pos_start + row) * blk_stride;
-			cpu_kv_put_q8_0_head((uint8_t *)j->k->handle + off, (uint8_t *)j->v->handle + off, kf,
-								 vf, j->head_dim);
+		int			 row = idx / j->n_active;
+		int			 kvh = idx % j->n_active;
+		const float *kf	 = j->kf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		const float *vf	 = j->vf_base + (size_t)row * j->in_row_stride + (size_t)kvh * j->head_dim;
+		if (j->is_q80) {
+			size_t off = j->layer_base + (size_t)kvh * j->kvh_stride +
+						 (size_t)(j->pos_start + row) * j->blk_stride;
+			cpu_kv_put_q8_0_head(j->kd_u8 + off, j->vd_u8 + off, kf, vf, j->head_dim);
 		} else {
-			size_t	  hd_stride	 = (size_t)j->head_dim;
-			size_t	  kvh_stride = (size_t)j->n_ctx * hd_stride;
-			uint16_t *kd_base	 = (uint16_t *)cpu_ptr(j->k);
-			uint16_t *vd_base	 = (uint16_t *)cpu_ptr(j->v);
-			size_t	  off		 = (layer_base / sizeof(uint16_t)) + (size_t)kvh * kvh_stride +
-								   (size_t)(j->pos_start + row) * hd_stride;
-			cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf, vf, j->head_dim);
+			size_t off = j->layer_base + (size_t)kvh * j->kvh_stride +
+						 (size_t)(j->pos_start + row) * (size_t)j->head_dim;
+			cpu_kv_put_f16_head(j->kd_u16 + off, j->vd_u16 + off, kf, vf, j->head_dim);
 		}
 	}
 }
@@ -459,18 +445,29 @@ static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 	if (total <= 0)
 		return OK;
 
-	cpu_kv_put_batch_job job = {.p			   = p,
-								.k			   = k,
-								.v			   = v,
-								.layer		   = layer,
-								.pos_start	   = pos_start,
-								.kf_base	   = (const float *)cpu_ptr(k_in),
-								.vf_base	   = (const float *)cpu_ptr(v_in),
+	int	   is_q80 = (p->kv_quant == KV_QUANT_Q8_0);
+	size_t blk_stride =
+		is_q80 ? (((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
+			   : ((size_t)head_dim * sizeof(uint16_t));
+	size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer]
+										: ((size_t)layer * (size_t)n_kv_heads * n_ctx * blk_stride);
+
+	cpu_kv_put_batch_job job = {.p			= p,
+								.pos_start	= pos_start,
+								.kf_base	= (const float *)cpu_ptr(k_in),
+								.vf_base	= (const float *)cpu_ptr(v_in),
+								.kd_u8		= (uint8_t *)k->handle,
+								.vd_u8		= (uint8_t *)v->handle,
+								.kd_u16		= (uint16_t *)cpu_ptr(k),
+								.vd_u16		= (uint16_t *)cpu_ptr(v),
+								.layer_base = is_q80 ? layer_base : layer_base / sizeof(uint16_t),
+								.blk_stride = blk_stride,
+								.kvh_stride = is_q80 ? (size_t)n_ctx * blk_stride
+													 : (size_t)n_ctx * (size_t)head_dim,
 								.in_row_stride = in_row_stride,
-								.n_kv_heads	   = n_kv_heads,
 								.head_dim	   = head_dim,
-								.n_ctx		   = n_ctx,
-								.n_active	   = n_active};
+								.n_active	   = n_active,
+								.is_q80		   = is_q80};
 
 	if (p->pool && tpool_current_tid() < 0 && total >= 2) {
 		tpool_parallel_for(p->pool, total, 1, cpu_kv_put_batch_chunk, &job);
@@ -1757,6 +1754,39 @@ static void cpu_attn_head_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
+static void cpu_attn_kvh_chunk(int begin, int end, int tid, void *ctx) {
+	cpu_attn_job *j		 = ctx;
+	float		 *scores = cpu_grow_scores(j->p, tid, j->n_pos);
+	for (int kvh = begin; kvh < end; kvh++) {
+		int h_start = kvh * j->n_groups;
+		int h_end	= h_start + j->n_groups;
+		if (h_end > j->n_heads)
+			h_end = j->n_heads;
+		const uint8_t  *k_slice_q8;
+		const uint8_t  *v_slice_q8;
+		const uint16_t *k_slice_f16;
+		const uint16_t *v_slice_f16;
+		if (j->kv_quant == KV_QUANT_Q8_0) {
+			k_slice_q8 = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride);
+			v_slice_q8 = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride);
+		} else {
+			k_slice_f16 = j->kl_base + ((size_t)kvh * j->kvh_stride);
+			v_slice_f16 = j->vl_base + ((size_t)kvh * j->kvh_stride);
+		}
+		for (int h = h_start; h < h_end; h++) {
+			const float *qh	   = j->qf + ((size_t)h * j->head_dim);
+			float		*out_h = j->outf + ((size_t)h * j->head_dim);
+			if (j->kv_quant == KV_QUANT_Q8_0) {
+				cpu_attention_inner_q8_0(k_slice_q8, v_slice_q8, (size_t)j->hd_stride, qh, out_h,
+										 j->head_dim, j->n_pos, j->scale, j->flash_attn, scores);
+			} else {
+				cpu_attention_inner(k_slice_f16, v_slice_f16, j->hd_stride, qh, out_h, j->head_dim,
+									j->n_pos, j->scale, j->flash_attn, scores);
+			}
+		}
+	}
+}
+
 __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer *q,
 													 const buffer *k_cache, const buffer *v_cache,
 													 buffer *out, int layer, int pos, int n_heads,
@@ -1796,8 +1826,8 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 		const uint8_t *vl_base =
 			(const uint8_t *)p->kv_v + layer_base + ((size_t)attn_start * elem_stride);
 
-		if (can_recurse && p->pool && p->thread_scratch &&
-			(size_t)n_heads * (size_t)n_pos >= 4096) {
+		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
+			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 			cpu_attn_job job = {.kl_base	= (const uint16_t *)kl_base,
 								.vl_base	= (const uint16_t *)vl_base,
 								.qf			= qf,
@@ -1807,11 +1837,15 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 								.hd_stride	= (int)elem_stride,
 								.n_pos		= n_pos,
 								.flash_attn = flash_attn,
+								.n_heads	= n_heads,
 								.scale		= scale,
 								.kvh_stride = kvh_stride,
 								.p			= p,
 								.kv_quant	= KV_QUANT_Q8_0};
-			tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk, &job);
+			if (n_groups > 1)
+				tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk, &job);
+			else
+				tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk, &job);
 			return OK;
 		}
 
@@ -1839,7 +1873,8 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 	kl_base += (size_t)attn_start * hd_stride;
 	vl_base += (size_t)attn_start * hd_stride;
 
-	if (can_recurse && p->pool && p->thread_scratch && (size_t)n_heads * (size_t)n_pos >= 4096) {
+	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
+		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 		cpu_attn_job job = {.kl_base	= kl_base,
 							.vl_base	= vl_base,
 							.qf			= qf,
@@ -1849,11 +1884,15 @@ __attribute__((weak)) status_code cpu_attention_impl(backend *self, const buffer
 							.hd_stride	= hd_stride,
 							.n_pos		= n_pos,
 							.flash_attn = flash_attn,
+							.n_heads	= n_heads,
 							.scale		= scale,
 							.kvh_stride = kvh_stride,
 							.p			= p,
 							.kv_quant	= KV_QUANT_F16};
-		tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk, &job);
+		if (n_groups > 1)
+			tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk, &job);
+		else
+			tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk, &job);
 		return OK;
 	}
 

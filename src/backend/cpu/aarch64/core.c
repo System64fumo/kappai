@@ -51,6 +51,22 @@ static inline void scale_f32_vec(float *restrict x, int n, float s) {
 		x[d] *= s;
 }
 
+static inline void scale_store_f32_vec(float *restrict dst, const float *restrict src, int n,
+									   float s) {
+	float32x4_t s_v = vdupq_n_f32(s);
+	int			d	= 0;
+	for (; d + 16 <= n; d += 16) {
+		vst1q_f32(dst + d, vmulq_f32(vld1q_f32(src + d), s_v));
+		vst1q_f32(dst + d + 4, vmulq_f32(vld1q_f32(src + d + 4), s_v));
+		vst1q_f32(dst + d + 8, vmulq_f32(vld1q_f32(src + d + 8), s_v));
+		vst1q_f32(dst + d + 12, vmulq_f32(vld1q_f32(src + d + 12), s_v));
+	}
+	for (; d + 4 <= n; d += 4)
+		vst1q_f32(dst + d, vmulq_f32(vld1q_f32(src + d), s_v));
+	for (; d < n; d++)
+		dst[d] = src[d] * s;
+}
+
 #define cpu_attn_job_neon cpu_attn_job
 #define cpu_attn_batch_job_neon cpu_attn_batch_job
 
@@ -100,9 +116,9 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 		size_t	 pos_off	  = (size_t)pos * block_stride;
 		uint8_t *kd_base	  = (uint8_t *)k->handle;
 		uint8_t *vd_base	  = (uint8_t *)v->handle;
+		size_t	 layer_base =
+			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t layer_base =
-				p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 			size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
 			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 								 vf + ((size_t)kvh * head_dim), head_dim);
@@ -116,15 +132,15 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 	size_t	  kvh_stride   = (size_t)n_ctx * hd_stride;
 	size_t	  pos_off	   = (size_t)pos * hd_stride;
 
+	size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
+										: ((size_t)layer * layer_stride);
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t		 layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-												  : ((size_t)layer * layer_stride);
-		size_t		 off		= layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		uint16_t	*kd			= kd_base + off;
-		uint16_t	*vd			= vd_base + off;
-		const float *kfh		= kf + ((size_t)kvh * head_dim);
-		const float *vfh		= vf + ((size_t)kvh * head_dim);
-		int			 i			= 0;
+		size_t		 off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
+		uint16_t	*kd	 = kd_base + off;
+		uint16_t	*vd	 = vd_base + off;
+		const float *kfh = kf + ((size_t)kvh * head_dim);
+		const float *vfh = vf + ((size_t)kvh * head_dim);
+		int			 i	 = 0;
 		for (; i + 32 <= head_dim; i += 32) {
 			float32x4_t k0	= vld1q_f32(kfh + i);
 			float32x4_t k1	= vld1q_f32(kfh + i + 4);
@@ -600,8 +616,12 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 		}
 
 		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		scale_f32_vec(VKQ, head_dim, S_inv);
-		memcpy(out_h, VKQ, (size_t)head_dim * sizeof(float));
+		scale_store_f32_vec(out_h, VKQ, head_dim, S_inv);
+		return;
+	}
+
+	if (n_pos == 0) {
+		neon_zero_f32(out_h, head_dim);
 		return;
 	}
 
@@ -610,11 +630,6 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 		scores[t]		   = dot8_f16(qh, kt, head_dim) * scale;
 	}
 	softmax_masked(scores, n_pos);
-
-	if (n_pos == 0) {
-		neon_zero_f32(out_h, head_dim);
-		return;
-	}
 
 	neon_zero_f32(out_h, head_dim);
 	for (int t = 0; t < n_pos; t++) {
@@ -650,25 +665,44 @@ static inline float32x4_t vld1_s8x4_to_f32(const int8_t *p) {
 	return vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
 }
 
-static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_ptr, int head_dim) {
-	int	  n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-	float sum	   = 0.0f;
-#if defined(__ARM_FEATURE_DOTPROD)
+typedef struct {
+	float		 qscale;
+	int8_t		 qa[HEAD_DIM_MAX];
+	const float *qf;
+} q8_preq;
+
+static void prequantize_q8_0(const float *restrict qh, int head_dim, q8_preq *out) {
+	if (head_dim <= 0 || head_dim > HEAD_DIM_MAX) {
+		out->qf		= qh;
+		out->qscale = 0.0f;
+		return;
+	}
 	float amax = 0.0f;
 	for (int i = 0; i < head_dim; i++) {
-		float v = fabsf(a[i]);
+		float v = fabsf(qh[i]);
 		if (v > amax)
 			amax = v;
 	}
-	if (amax == 0.0f)
-		return 0.0f;
-	float  qscale = amax / 127.0f;
-	float  qinv	  = 127.0f / amax;
-	int8_t qa[HEAD_DIM_MAX];
-	for (int i = 0; i < head_dim; i++) {
-		int q = (int)lrintf(a[i] * qinv);
-		qa[i] = (int8_t)(q > 127 ? 127 : (q < -128 ? -128 : q));
+	out->qf = qh;
+	if (amax == 0.0f) {
+		out->qscale = 0.0f;
+		memset(out->qa, 0, (size_t)head_dim);
+		return;
 	}
+	float qinv	= 127.0f / amax;
+	out->qscale = amax / 127.0f;
+	for (int i = 0; i < head_dim; i++) {
+		int q	   = (int)lrintf(qh[i] * qinv);
+		out->qa[i] = (int8_t)(q > 127 ? 127 : (q < -128 ? -128 : q));
+	}
+}
+
+static float dot8_q8_0(const q8_preq *restrict q, const uint8_t *restrict block_ptr, int head_dim) {
+	int	  n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+	float sum	   = 0.0f;
+#if defined(__ARM_FEATURE_DOTPROD)
+	if (q->qscale == 0.0f)
+		return 0.0f;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
 		float			  d	  = f16_to_f32_fast(blk->d);
@@ -680,14 +714,15 @@ static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_pt
 		int32x4_t	  acc = vdupq_n_s32(0);
 		int			  j	  = 0;
 		for (; j + 16 <= n; j += 16)
-			acc = vdotq_s32(acc, vld1q_s8(qs + j), vld1q_s8(qa + base + j));
+			acc = vdotq_s32(acc, vld1q_s8(qs + j), vld1q_s8(q->qa + base + j));
 		int32_t s = vaddvq_s32(acc);
 		for (; j < n; j++)
-			s += (int32_t)qs[j] * (int32_t)qa[base + j];
-		sum += (float)s * (d * qscale);
+			s += (int32_t)qs[j] * (int32_t)q->qa[base + j];
+		sum += (float)s * (d * q->qscale);
 	}
 	return sum;
 #else
+	const float *a = q->qf;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
 		float			  d	  = f16_to_f32_fast(blk->d);
@@ -814,8 +849,9 @@ static void accum_v_q8_0(float *restrict out_h, const uint8_t *restrict block_pt
 
 static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 									 const uint8_t *restrict v_slice, int kv_stride,
-									 const float *qh, float *out_h, int head_dim, int n_pos,
-									 float scale, int flash_attn, float *restrict scores) {
+									 const q8_preq *restrict q, float *out_h, int head_dim,
+									 int n_pos, float scale, int flash_attn,
+									 float *restrict scores) {
 	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
@@ -823,7 +859,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 		neon_zero_f32(VKQ, head_dim);
 		for (int t = 0; t < n_pos; t++) {
 			const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
-			float		   ss = dot8_q8_0(qh, kt, head_dim) * scale;
+			float		   ss = dot8_q8_0(q, kt, head_dim) * scale;
 
 			float vs;
 			float ms = 1.0f;
@@ -845,14 +881,13 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 		}
 
 		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		scale_f32_vec(VKQ, head_dim, S_inv);
-		memcpy(out_h, VKQ, (size_t)head_dim * sizeof(float));
+		scale_store_f32_vec(out_h, VKQ, head_dim, S_inv);
 		return;
 	}
 
 	for (int t = 0; t < n_pos; t++) {
 		const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
-		scores[t]		  = dot8_q8_0(qh, kt, head_dim) * scale;
+		scores[t]		  = dot8_q8_0(q, kt, head_dim) * scale;
 	}
 	softmax_masked(scores, n_pos);
 
@@ -868,23 +903,73 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 	}
 }
 
+#define GQA_GROUP_SIZE 8
+
+static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_slice, int kv_stride,
+									const float *qh_base, int n_group, int head_dim, int n_pos,
+									float scale, float *out_base) {
+	float	M[GQA_GROUP_SIZE], S[GQA_GROUP_SIZE];
+	float	VKQ[GQA_GROUP_SIZE][HEAD_DIM_MAX] __attribute__((aligned(64)));
+	q8_preq qpq[GQA_GROUP_SIZE];
+	for (int g = 0; g < n_group; g++) {
+		M[g] = -INFINITY;
+		S[g] = 0.0f;
+		neon_zero_f32(VKQ[g], head_dim);
+		prequantize_q8_0(qh_base + ((size_t)g * head_dim), head_dim, &qpq[g]);
+	}
+	for (int t = 0; t < n_pos; t++) {
+		const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
+		const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
+		for (int g = 0; g < n_group; g++) {
+			float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
+			float ms = 1.0f;
+			float vs;
+			if (ss > M[g]) {
+				float Mo = M[g];
+				M[g]	 = ss;
+				if (S[g] > 0.0f) {
+					ms = fast_expf(Mo - M[g]);
+					scale_f32_vec(VKQ[g], head_dim, ms);
+				}
+				vs = 1.0f;
+			} else
+				vs = fast_expf(ss - M[g]);
+			accum_v_q8_0(VKQ[g], vt, vs, head_dim);
+			S[g] = (S[g] * ms) + vs;
+		}
+	}
+	for (int g = 0; g < n_group; g++) {
+		float Si = (S[g] == 0.0f) ? 0.0f : 1.0f / S[g];
+		scale_store_f32_vec(out_base + ((size_t)g * head_dim), VKQ[g], head_dim, Si);
+	}
+}
+
 static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
 	cpu_attn_job_neon *j	  = ctx;
 	float			  *scores = cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
-		int			 kvh   = h / j->n_groups;
-		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
-		float		*out_h = j->outf + ((size_t)h * j->head_dim);
+		int kvh = h / j->n_groups;
 		if (j->kv_quant == KV_QUANT_Q8_0) {
 			const uint8_t *k_slice = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride);
 			const uint8_t *v_slice = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride);
-			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, qh, out_h, j->head_dim,
-									 j->n_pos, j->scale, j->flash_attn, scores);
+			if (j->flash_attn) {
+				cpu_attn_gqa_flash_q8_0(k_slice, v_slice, j->hd_stride,
+										j->qf + ((size_t)h * j->head_dim), 1, j->head_dim, j->n_pos,
+										j->scale, j->outf + ((size_t)h * j->head_dim));
+			} else {
+				q8_preq qpq;
+				prequantize_q8_0(j->qf + ((size_t)h * j->head_dim), j->head_dim, &qpq);
+				cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, &qpq,
+										 j->outf + ((size_t)h * j->head_dim), j->head_dim, j->n_pos,
+										 j->scale, j->flash_attn, scores);
+			}
 		} else {
 			const uint16_t *k_slice = j->kl_base + ((size_t)kvh * j->kvh_stride);
 			const uint16_t *v_slice = j->vl_base + ((size_t)kvh * j->kvh_stride);
-			cpu_attention_inner((uint16_t *)k_slice, (uint16_t *)v_slice, j->hd_stride, qh, out_h,
-								j->head_dim, j->n_pos, j->scale, j->flash_attn, scores);
+			cpu_attention_inner((uint16_t *)k_slice, (uint16_t *)v_slice, j->hd_stride,
+								j->qf + ((size_t)h * j->head_dim),
+								j->outf + ((size_t)h * j->head_dim), j->head_dim, j->n_pos,
+								j->scale, j->flash_attn, scores);
 		}
 	}
 }
@@ -913,6 +998,8 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		n_pos	   = sliding_window;
 	}
 
+	int can_recurse = (tpool_current_tid() < 0);
+
 	if (p->kv_quant == KV_QUANT_Q8_0) {
 		size_t n_blocks		= ((size_t)hd_stride_elems + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 		size_t elem_stride	= n_blocks * KV_Q8_0_BLOCK_BYTES;
@@ -925,7 +1012,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		const uint8_t *vl_base =
 			(const uint8_t *)p->kv_v + layer_base + ((size_t)attn_start * elem_stride);
 
-		if (p->pool && p->thread_scratch && n_heads > 1 &&
+		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 			cpu_attn_job_neon job = {.kl_base	 = (const uint16_t *)kl_base,
 									 .vl_base	 = (const uint16_t *)vl_base,
@@ -936,6 +1023,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 									 .hd_stride	 = (int)elem_stride,
 									 .n_pos		 = n_pos,
 									 .flash_attn = flash_attn,
+									 .n_heads	 = n_heads,
 									 .scale		 = scale,
 									 .kvh_stride = kvh_stride,
 									 .p			 = p,
@@ -944,15 +1032,17 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 			return OK;
 		}
 
-		float *scores = cpu_grow_scores(p, -1, n_pos);
+		float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 			const uint8_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
 			const float	  *qh	   = qf + ((size_t)h * head_dim);
 			float		  *out_h   = outf + ((size_t)h * head_dim);
-			cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, qh, out_h, head_dim, n_pos,
-									 scale, flash_attn, scores);
+			q8_preq		   qpq;
+			prequantize_q8_0(qh, head_dim, &qpq);
+			cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, &qpq, out_h, head_dim,
+									 n_pos, scale, flash_attn, scores);
 		}
 		return OK;
 	}
@@ -968,7 +1058,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 	kl_base += (size_t)attn_start * hd_stride;
 	vl_base += (size_t)attn_start * hd_stride;
 
-	if (p->pool && p->thread_scratch && n_heads > 1 &&
+	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 		cpu_attn_job_neon job = {.kl_base	 = kl_base,
 								 .vl_base	 = vl_base,
@@ -979,6 +1069,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 								 .hd_stride	 = hd_stride,
 								 .n_pos		 = n_pos,
 								 .flash_attn = flash_attn,
+								 .n_heads	 = n_heads,
 								 .scale		 = scale,
 								 .kvh_stride = kvh_stride,
 								 .p			 = p,
@@ -987,7 +1078,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		return OK;
 	}
 
-	float *scores = cpu_grow_scores(p, -1, n_pos);
+	float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1046,8 +1137,10 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 									 ((size_t)attn_start * (size_t)j->hd_stride);
 			const uint8_t *v_slice = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride) +
 									 ((size_t)attn_start * (size_t)j->hd_stride);
-			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, qh, out_h, j->head_dim, n_pos,
-									 j->scale, j->flash_attn, scores);
+			q8_preq		   qpq;
+			prequantize_q8_0(qh, j->head_dim, &qpq);
+			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, &qpq, out_h, j->head_dim,
+									 n_pos, j->scale, j->flash_attn, scores);
 		} else {
 			const uint16_t *k_slice =
 				j->kl_base + ((size_t)kvh * j->kvh_stride) + ((size_t)attn_start * j->hd_stride);
@@ -1059,10 +1152,11 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
-								const buffer *v_cache, buffer *out, int layer, int pos_start,
-								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
-								int flash_attn, float scale, int n_kv_heads_active, int m) {
+static status_code cpu_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
+											const buffer *v_cache, buffer *out, int layer,
+											int pos_start, int n_heads, int n_kv_heads,
+											int head_dim, int n_ctx, int flash_attn, float scale,
+											int sliding_window, int n_kv_heads_active, int m) {
 	(void)k_cache;
 	(void)v_cache;
 	cpu_priv *p		   = self->priv;
@@ -1104,22 +1198,23 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	if (use_bitrev)
 		bitrev_perm = cpu_bitrev_perm_get(p, m_pow2);
 
-	cpu_attn_batch_job_neon job = {.kl_base		= kl_base_raw,
-								   .vl_base		= vl_base_raw,
-								   .qf			= (const float *)cpu_ptr(q),
-								   .outf		= (float *)cpu_ptr(out),
-								   .n_groups	= n_groups,
-								   .head_dim	= head_dim,
-								   .hd_stride	= hd_stride,
-								   .n_heads		= n_heads,
-								   .pos_start	= pos_start,
-								   .m			= m,
-								   .flash_attn	= flash_attn,
-								   .scale		= scale,
-								   .kvh_stride	= kvh_stride,
-								   .p			= p,
-								   .bitrev_perm = bitrev_perm,
-								   .kv_quant	= p->kv_quant};
+	cpu_attn_batch_job_neon job = {.kl_base		   = kl_base_raw,
+								   .vl_base		   = vl_base_raw,
+								   .qf			   = (const float *)cpu_ptr(q),
+								   .outf		   = (float *)cpu_ptr(out),
+								   .n_groups	   = n_groups,
+								   .head_dim	   = head_dim,
+								   .hd_stride	   = hd_stride,
+								   .n_heads		   = n_heads,
+								   .pos_start	   = pos_start,
+								   .m			   = m,
+								   .flash_attn	   = flash_attn,
+								   .scale		   = scale,
+								   .sliding_window = sliding_window,
+								   .kvh_stride	   = kvh_stride,
+								   .p			   = p,
+								   .bitrev_perm	   = bitrev_perm,
+								   .kv_quant	   = p->kv_quant};
 
 	int total		= use_bitrev ? (n_heads * m_pow2) : (n_heads * m);
 	int cur_tid		= tpool_current_tid();
@@ -1131,6 +1226,25 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	}
 
 	return OK;
+}
+
+status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
+								const buffer *v_cache, buffer *out, int layer, int pos_start,
+								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+								int flash_attn, float scale, int n_kv_heads_active, int m) {
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, 0,
+									n_kv_heads_active, m);
+}
+
+status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
+									const buffer *v_cache, buffer *out, int layer, int pos_start,
+									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+									int flash_attn, float scale, int sliding_window,
+									int n_kv_heads_active, int m) {
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, sliding_window,
+									n_kv_heads_active, m);
 }
 
 static void cpu_add_inplace_chunk_neon(int begin, int end, int tid, void *ctx) {

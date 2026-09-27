@@ -889,6 +889,45 @@ static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 	}
 }
 
+static void cpu_attn_kvh_chunk_avx(int begin, int end, int tid, void *ctx) {
+	cpu_attn_job_avx *j = ctx;
+	float			 *scores;
+	if (tid == 0) {
+		scores = j->p->scores;
+	} else {
+		scores = cpu_grow_scores(j->p, tid, j->n_pos);
+	}
+	for (int kvh = begin; kvh < end; kvh++) {
+		int h_start = kvh * j->n_groups;
+		int h_end	= h_start + j->n_groups;
+		if (h_end > j->n_heads)
+			h_end = j->n_heads;
+		const uint8_t  *k_slice_q8;
+		const uint8_t  *v_slice_q8;
+		const uint16_t *k_slice_f16;
+		const uint16_t *v_slice_f16;
+		if (j->kv_quant == KV_QUANT_Q8_0) {
+			k_slice_q8 = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride);
+			v_slice_q8 = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride);
+		} else {
+			k_slice_f16 = j->kl_base + ((size_t)kvh * j->kvh_stride);
+			v_slice_f16 = j->vl_base + ((size_t)kvh * j->kvh_stride);
+		}
+		for (int h = h_start; h < h_end; h++) {
+			const float *qh	   = j->qf + ((size_t)h * j->head_dim);
+			float		*out_h = j->outf + ((size_t)h * j->head_dim);
+			if (j->kv_quant == KV_QUANT_Q8_0) {
+				cpu_attention_inner_q8_0(k_slice_q8, v_slice_q8, j->hd_stride, qh, out_h,
+										 j->head_dim, j->n_pos, j->scale, j->flash_attn, scores);
+			} else {
+				cpu_attention_inner((uint16_t *)k_slice_f16, (uint16_t *)v_slice_f16, j->hd_stride,
+									qh, out_h, j->head_dim, j->n_pos, j->scale, j->flash_attn,
+									scores);
+			}
+		}
+	}
+}
+
 static status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_cache,
 									  const buffer *v_cache, buffer *out, int layer, int pos,
 									  int n_heads, int n_kv_heads, int head_dim, int n_ctx,
@@ -914,6 +953,8 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 		n_pos	   = sliding_window;
 	}
 
+	int can_recurse = (tpool_current_tid() < 0);
+
 	if (p->kv_quant == KV_QUANT_Q8_0) {
 		size_t n_blocks		= ((size_t)hd_stride_elems + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 		size_t elem_stride	= n_blocks * KV_Q8_0_BLOCK_BYTES;
@@ -926,7 +967,7 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 		const uint8_t *vl_base =
 			(const uint8_t *)p->kv_v + layer_base + ((size_t)attn_start * elem_stride);
 
-		if (p->pool && p->thread_scratch && n_heads > 1 &&
+		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 			cpu_attn_job_avx job = {.kl_base	= (const uint16_t *)kl_base,
 									.vl_base	= (const uint16_t *)vl_base,
@@ -937,11 +978,15 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 									.hd_stride	= (int)elem_stride,
 									.n_pos		= n_pos,
 									.flash_attn = flash_attn,
+									.n_heads	= n_heads,
 									.scale		= scale,
 									.kvh_stride = kvh_stride,
 									.p			= p,
 									.kv_quant	= KV_QUANT_Q8_0};
-			tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
+			if (n_groups > 1)
+				tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk_avx, &job);
+			else
+				tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
 			return OK;
 		}
 
@@ -969,7 +1014,7 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 	kl_base += (size_t)attn_start * hd_stride;
 	vl_base += (size_t)attn_start * hd_stride;
 
-	if (p->pool && p->thread_scratch && n_heads > 1 &&
+	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 		cpu_attn_job_avx job = {.kl_base	= kl_base,
 								.vl_base	= vl_base,
@@ -980,11 +1025,15 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 								.hd_stride	= hd_stride,
 								.n_pos		= n_pos,
 								.flash_attn = flash_attn,
+								.n_heads	= n_heads,
 								.scale		= scale,
 								.kvh_stride = kvh_stride,
 								.p			= p,
 								.kv_quant	= KV_QUANT_F16};
-		tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
+		if (n_groups > 1)
+			tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk_avx, &job);
+		else
+			tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_head_chunk_avx, &job);
 		return OK;
 	}
 

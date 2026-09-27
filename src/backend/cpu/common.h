@@ -213,6 +213,7 @@ typedef struct {
 	const float	   *qf;
 	float		   *outf;
 	int				n_groups, head_dim, hd_stride, n_pos, flash_attn;
+	int				n_heads;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;

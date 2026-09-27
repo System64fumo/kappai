@@ -414,6 +414,10 @@ format:
 	xargs -P $$(nproc) -I {} sh -c ' \
 		echo "  FMT     {}"; \
 		clang-format $(FORMAT_FLAGS) {}; \
+		if [ -s {} ] && [ "$$(tail -c1 {})" != "" ]; then \
+			printf "\n" >> {}; \
+			echo "  EOL     {}"; \
+		fi; \
 		chmod 644 {}; \
 	'
 

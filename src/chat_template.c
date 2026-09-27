@@ -413,12 +413,20 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 	size_t		diff_len = new_len - common;
 	cts->think_open		 = false;
 	if (add_generation_prompt && cts->think_start_text) {
-		size_t l   = strlen(cts->think_start_text);
-		size_t end = diff_len;
-		while (end > 0 && isspace((unsigned char)diff[end - 1]))
-			end--;
-		if (l <= end && memcmp(diff + end - l, cts->think_start_text, l) == 0)
-			cts->think_open = true;
+		const char *last_open = NULL, *last_close = NULL, *p;
+		p = diff;
+		while ((p = strstr(p, cts->think_start_text)) != NULL) {
+			last_open = p;
+			p += strlen(cts->think_start_text);
+		}
+		if (cts->think_end_text) {
+			p = diff;
+			while ((p = strstr(p, cts->think_end_text)) != NULL) {
+				last_close = p;
+				p += strlen(cts->think_end_text);
+			}
+		}
+		cts->think_open = last_open != NULL && (last_close == NULL || last_open > last_close);
 	}
 
 	*out = xstrdup(diff);

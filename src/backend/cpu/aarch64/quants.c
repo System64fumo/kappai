@@ -1043,6 +1043,44 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 	int				  i				 = 0;
 
 	for (; i + MR <= n; i += MR) {
+#if defined(__ARM_FEATURE_DOTPROD)
+		float acc_lane[MR] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+		const uint8_t *row_base[MR];
+		for (int r = 0; r < MR; r++)
+			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const int8_t *restrict xq8 = xq[bi].qs;
+			const float d_xq		   = f16_to_f32_fast(xq[bi].d);
+
+			const int8x16_t xq_lo = vld1q_s8(xq8);
+			const int8x16_t xq_hi = vld1q_s8(xq8 + 16);
+
+			if (bi + 1 < blocks_per_row) {
+				for (int r = 0; r < MR; r++)
+					PREFETCH(row_base[r] + ((size_t)(bi + 1) * sizeof(q4_0_block)));
+			}
+
+			for (int r = 0; r < 8; r++) {
+				const q4_0_block *row =
+					(const q4_0_block *)(row_base[r] + (size_t)bi * sizeof(q4_0_block));
+				const uint8_t *restrict qs = row->qs;
+				const uint8x16_t q		   = vld1q_u8(qs);
+				const int8x16_t	 lo =
+					vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+				const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(q, 4)), vdupq_n_s8(8));
+
+				int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, xq_lo);
+				acc			  = vdotq_s32(acc, hi, xq_hi);
+				float32_t dw  = f16_to_f32_fast(row->d);
+				acc_lane[r]	  = __builtin_fmaf(dw * d_xq, (float)vaddvq_s32(acc), acc_lane[r]);
+			}
+		}
+
+		for (int r = 0; r < MR; r++)
+			y[i + r] = acc_lane[r];
+#else
 		float32x4_t acc0 = vdupq_n_f32(0.0f);
 		float32x4_t acc1 = vdupq_n_f32(0.0f);
 
@@ -1064,22 +1102,6 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 
 			int32_t	 sumi_lane[8];
 			uint16_t d_w_raw[8];
-#if defined(__ARM_FEATURE_DOTPROD)
-			for (int r = 0; r < 8; r++) {
-				const q4_0_block *row =
-					(const q4_0_block *)(row_base[r] + (size_t)bi * sizeof(q4_0_block));
-				const uint8_t *restrict qs = row->qs;
-				const uint8x16_t q		   = vld1q_u8(qs);
-				const int8x16_t	 lo =
-					vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
-				const int8x16_t hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(q, 4)), vdupq_n_s8(8));
-
-				int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, xq_lo);
-				acc			  = vdotq_s32(acc, hi, xq_hi);
-				sumi_lane[r]  = vaddvq_s32(acc);
-				d_w_raw[r]	  = row->d;
-			}
-#else
 			for (int r = 0; r < 8; r++) {
 				const q4_0_block *row =
 					(const q4_0_block *)(row_base[r] + ((size_t)bi * sizeof(q4_0_block)));
@@ -1099,7 +1121,6 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 				sumi_lane[r]  = vaddvq_s32(acc);
 				d_w_raw[r]	  = row->d;
 			}
-#endif
 			const uint16x8_t d_w_u16 = vld1q_u16(d_w_raw);
 			float32x4_t		 d_w0	 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(d_w_u16)));
 			float32x4_t		 d_w1	 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(d_w_u16)));
@@ -1112,6 +1133,7 @@ static void matmul_q4_q8_qonly_f32_row(const void *w, const q8_0_block *restrict
 		}
 
 		store_acc8(acc0, acc1, y, i);
+#endif
 	}
 
 	for (; i < n; i++) {
@@ -1365,6 +1387,47 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 	int				  i				 = 0;
 
 	for (; i + MR <= n; i += MR) {
+#if defined(__ARM_FEATURE_DOTPROD)
+		float acc_lane[MR] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+		float off_lane[MR] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+		const uint8_t *row_base[MR];
+		for (int r = 0; r < MR; r++)
+			row_base[r] = (const uint8_t *)Wb + ((size_t)(i + r) * row_stride);
+
+		for (int bi = 0; bi < blocks_per_row; bi++) {
+			const int8_t *restrict xq8 = xq[bi].qs;
+			const float d_xq		   = f16_to_f32_fast(xq[bi].d);
+			const float s_xq		   = f16_to_f32_fast(xq[bi].s);
+
+			const int8x16_t xq_lo = vld1q_s8(xq8);
+			const int8x16_t xq_hi = vld1q_s8(xq8 + 16);
+
+			if (bi + 1 < blocks_per_row) {
+				for (int r = 0; r < MR; r++)
+					PREFETCH(row_base[r] + ((size_t)(bi + 1) * sizeof(q4_1_block)));
+			}
+
+			for (int r = 0; r < 8; r++) {
+				const q4_1_block *row =
+					(const q4_1_block *)(row_base[r] + (size_t)bi * sizeof(q4_1_block));
+				const uint8_t *restrict qs = row->qs;
+				const uint8x16_t q		   = vld1q_u8(qs);
+				const int8x16_t	 lo		   = vreinterpretq_s8_u8(vandq_u8(q, vdupq_n_u8(0x0F)));
+				const int8x16_t	 hi		   = vreinterpretq_s8_u8(vshrq_n_u8(q, 4));
+
+				int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, xq_lo);
+				acc			  = vdotq_s32(acc, hi, xq_hi);
+				float32_t dw  = f16_to_f32_fast(row->d);
+				float32_t mw  = f16_to_f32_fast(row->m);
+				acc_lane[r]	  = __builtin_fmaf(dw * d_xq, (float)vaddvq_s32(acc), acc_lane[r]);
+				off_lane[r]	  = __builtin_fmaf(mw, s_xq, off_lane[r]);
+			}
+		}
+
+		for (int r = 0; r < MR; r++)
+			y[i + r] = acc_lane[r] + off_lane[r];
+#else
 		float32x4_t acc0 = vdupq_n_f32(0.0f);
 		float32x4_t acc1 = vdupq_n_f32(0.0f);
 		float32x4_t off0 = vdupq_n_f32(0.0f);
@@ -1391,22 +1454,6 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 			uint16_t d_w_raw[8];
 			uint16_t m_w_raw[8];
 
-#if defined(__ARM_FEATURE_DOTPROD)
-			for (int r = 0; r < 8; r++) {
-				const q4_1_block *row =
-					(const q4_1_block *)(row_base[r] + (size_t)bi * sizeof(q4_1_block));
-				d_w_raw[r]				   = row->d;
-				m_w_raw[r]				   = row->m;
-				const uint8_t *restrict qs = row->qs;
-				const uint8x16_t q		   = vld1q_u8(qs);
-				const int8x16_t	 lo		   = vreinterpretq_s8_u8(vandq_u8(q, vdupq_n_u8(0x0F)));
-				const int8x16_t	 hi		   = vreinterpretq_s8_u8(vshrq_n_u8(q, 4));
-
-				int32x4_t acc = vdotq_s32(vdupq_n_s32(0), lo, xq_lo);
-				acc			  = vdotq_s32(acc, hi, xq_hi);
-				sumi_lane[r]  = vaddvq_s32(acc);
-			}
-#else
 			for (int r = 0; r < 8; r++) {
 				const q4_1_block *row =
 					(const q4_1_block *)(row_base[r] + ((size_t)bi * sizeof(q4_1_block)));
@@ -1426,7 +1473,6 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 				acc			  = vaddq_s32(acc, vpaddlq_s16(p3));
 				sumi_lane[r]  = vaddvq_s32(acc);
 			}
-#endif
 			int32x4_t		 sumi0	 = vld1q_s32(sumi_lane);
 			int32x4_t		 sumi1	 = vld1q_s32(sumi_lane + 4);
 			float32x4_t		 sumi0f	 = vcvtq_f32_s32(sumi0);
@@ -1455,6 +1501,7 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 			y[i + r]	 = tmp0[r];
 			y[i + 4 + r] = tmp1[r];
 		}
+#endif
 	}
 
 	for (; i < n; i++) {

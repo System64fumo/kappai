@@ -65,6 +65,8 @@ static status_code	 ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a
 static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 	if (ctx->bs)
 		return batch_slot(ctx->bs, idx);
+	if (ctx->slot_base)
+		return &ctx->slot_base[idx];
 	if (ctx->s && ctx->s->active_is_mirror)
 		return &ctx->s->mirror_slots[idx];
 	return &ctx->s->slots[idx];
@@ -116,6 +118,8 @@ status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const flo
 }
 
 static inline buffer *exec_slots(const exec_ctx *ctx) {
+	if (ctx->slot_base)
+		return ctx->slot_base;
 	if (ctx->s && ctx->s->active_is_mirror)
 		return ctx->s->mirror_slots;
 	return ctx->s->slots;
@@ -131,6 +135,8 @@ static inline backend *exec_active_backend(const exec_ctx *ctx) {
 }
 
 static inline backend *exec_layer_backend(const exec_ctx *ctx) {
+	if (ctx->layer_be)
+		return ctx->layer_be;
 	if (ctx->li >= 0 && ctx->m && ctx->m->mixed_backend_mode)
 		return model_layer_backend(ctx->m, ctx->li);
 	return exec_active_backend(ctx);
@@ -416,13 +422,11 @@ model_recipe *recipe_build(const struct model *m) {
 
 	int has_vld = m->arch_info->has_variable_layer_dims;
 
-	if (!has_vld) {
-		recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
-		if (r->per_layer_ops) {
-			for (int li = 0; li < m->n_layers; li++)
-				recipe_coalesce_matmul_runs(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
-											r->layer.n_ops);
-		}
+	recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
+	if (r->per_layer_ops) {
+		for (int li = 0; li < m->n_layers; li++)
+			recipe_coalesce_matmul_runs(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
+										r->layer.n_ops);
 	}
 
 	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
@@ -574,6 +578,20 @@ static weight_ref *resolve_weight_ref(const model *m, int li, uint8_t w_idx) {
 
 static const buffer *resolve_weight(const model *m, int li, uint8_t w_idx) {
 	return &resolve_weight_ref(m, li, w_idx)->buf;
+}
+
+static inline weight_ref *exec_weight_ref(const exec_ctx *ctx, uint8_t w_idx) {
+	if (w_idx == RECIPE_NO_WEIGHT || w_idx == WIDX_NONE)
+		return (weight_ref *)&WEIGHT_REF_NONE;
+	if (ctx->wtab_row) {
+		weight_ref *w = ctx->wtab_row[w_idx];
+		return w ? w : (weight_ref *)&WEIGHT_REF_NONE;
+	}
+	return resolve_weight_ref(ctx->m, ctx->li, w_idx);
+}
+
+static inline const buffer *exec_weight(const exec_ctx *ctx, uint8_t w_idx) {
+	return &exec_weight_ref(ctx, w_idx)->buf;
 }
 
 static status_code copy_k_to_v_buffers(backend *a, buffer *kb, buffer *vb, int kv_out,
@@ -1332,6 +1350,8 @@ static status_code op_attention_impl(const recipe_op *op, struct model *m, struc
 
 typedef status_code (*op_handler)(exec_ctx *ctx);
 
+static const op_handler g_op_dispatch[OP_KIND_COUNT];
+
 static status_code op_embd_lookup(exec_ctx *ctx) {
 	backend		 *a		= exec_layer_backend(ctx);
 	profile		 *prof	= &ctx->s->prof;
@@ -1339,7 +1359,7 @@ static status_code op_embd_lookup(exec_ctx *ctx) {
 	profile_scope ps;
 	status_code	  st;
 	const int	  dim		= ctx->m->dim;
-	weight_ref	 *embd		= resolve_weight_ref(ctx->m, ctx->li, ctx->op->w_idx);
+	weight_ref	 *embd		= exec_weight_ref(ctx, ctx->op->w_idx);
 	const buffer *embd_w	= &embd->buf;
 	uint32_t	  embd_type = embd->type;
 	backend		 *t			= OP_BACKEND(a, embd_lookup);
@@ -1386,7 +1406,7 @@ static status_code op_rmsnorm(exec_ctx *ctx) {
 	backend		 *a	   = exec_layer_backend(ctx);
 	profile		 *prof = &ctx->s->prof;
 	profile_scope ps   = profile_begin(prof, ctx->op->stage);
-	const buffer *w	   = resolve_weight(ctx->m, ctx->li, ctx->op->w_idx);
+	const buffer *w	   = exec_weight(ctx, ctx->op->w_idx);
 	status_code	  st;
 	if (exec_is_batch(ctx)) {
 		st = a->rmsnorm_batch(a, exec_slot(ctx, ctx->op->in[0]), w, exec_slot(ctx, ctx->op->out),
@@ -1409,7 +1429,7 @@ static status_code op_matmul(exec_ctx *ctx) {
 			return batch_copy_k_to_v(ctx->m, ctx->bs, li, ctx->n_rows);
 		return copy_k_to_v_slot(ctx->m, ctx->s, li);
 	}
-	weight_ref	 *wref = resolve_weight_ref(ctx->m, li, op->w_idx);
+	weight_ref	 *wref = exec_weight_ref(ctx, op->w_idx);
 	int			  n = op->u.matmul.n, k = op->u.matmul.k;
 	profile_scope ps = profile_begin(&ctx->s->prof, matmul_substage(op->w_idx));
 	status_code	  st;
@@ -1431,7 +1451,7 @@ static status_code op_matmul_residual(exec_ctx *ctx) {
 	profile		 *prof = &ctx->s->prof;
 	profile_scope ps   = profile_begin(prof, matmul_substage(ctx->op->w_idx));
 	status_code	  st;
-	weight_ref	 *wref = resolve_weight_ref(ctx->m, ctx->li, ctx->op->w_idx);
+	weight_ref	 *wref = exec_weight_ref(ctx, ctx->op->w_idx);
 	const buffer *w	   = &wref->buf;
 	uint32_t	  wt   = wref->type;
 	int			  n	   = ctx->op->u.matmul.n;
@@ -1486,7 +1506,7 @@ static status_code op_matmul_ffn_down(exec_ctx *ctx) {
 	profile		 *prof = &ctx->s->prof;
 	profile_scope ps;
 	status_code	  st;
-	weight_ref	 *wref = resolve_weight_ref(ctx->m, ctx->li, ctx->op->w_idx);
+	weight_ref	 *wref = exec_weight_ref(ctx, ctx->op->w_idx);
 	const buffer *w	   = &wref->buf;
 	uint32_t	  wt   = wref->type;
 	int			  n	   = ctx->op->u.matmul_ffn_down.n;
@@ -1615,16 +1635,21 @@ static status_code op_attention(exec_ctx *ctx) {
 	if (exec_is_batch(ctx)) {
 		int use_swa = (sliding_window > 0) && (ctx->li >= 0) &&
 					  model_layer_is_sliding(ctx->m, ctx->li) && a->attention_swa_batch != NULL;
+		profile_scope ps = profile_begin(prof, ctx->op->stage);
+		status_code	  st;
 		if (use_swa)
-			return a->attention_swa_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
-										  &ctx->cache->v, batch_slot(ctx->bs, ctx->op->out),
-										  kv_layer, ctx->pos_start, n_heads, n_kv_heads, head_dim,
-										  n_ctx, ctx->flash_attn, scale, sliding_window,
-										  n_kv_heads_active, ctx->n_rows);
-		return a->attention_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
-								  &ctx->cache->v, batch_slot(ctx->bs, ctx->op->out), kv_layer,
-								  ctx->pos_start, n_heads, n_kv_heads, head_dim, n_ctx,
-								  ctx->flash_attn, scale, n_kv_heads_active, ctx->n_rows);
+			st = a->attention_swa_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
+										&ctx->cache->v, batch_slot(ctx->bs, ctx->op->out), kv_layer,
+										ctx->pos_start, n_heads, n_kv_heads, head_dim, n_ctx,
+										ctx->flash_attn, scale, sliding_window, n_kv_heads_active,
+										ctx->n_rows);
+		else
+			st = a->attention_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
+									&ctx->cache->v, batch_slot(ctx->bs, ctx->op->out), kv_layer,
+									ctx->pos_start, n_heads, n_kv_heads, head_dim, n_ctx,
+									ctx->flash_attn, scale, n_kv_heads_active, ctx->n_rows);
+		profile_end(prof, &ps);
+		return st;
 	}
 
 	return op_attention_impl(ctx->op, ctx->m, ctx->cache, slots, ctx->li, ctx->pos, ctx->flash_attn,
@@ -1801,7 +1826,7 @@ static status_code op_rmsnorm_per_head(exec_ctx *ctx) {
 	profile_scope		   ps	= profile_begin(prof, ctx->op->stage);
 	status_code			   st	= OK;
 	const layer_ctx_entry *lc	= &ctx->m->recipe->layer_ctx[ctx->li];
-	const buffer		  *w	= resolve_weight(ctx->m, ctx->li, ctx->op->w_idx);
+	const buffer		  *w	= exec_weight(ctx, ctx->op->w_idx);
 	int n_heads	   = (ctx->op->w_idx == WIDX_ATTN_Q_NORM) ? ctx->m->n_heads : lc->n_kv_heads;
 	int row_stride = (ctx->op->w_idx == WIDX_ATTN_Q_NORM) ? lc->q_row_stride : lc->kv_row_stride;
 	backend *t	   = OP_BACKEND(a, rmsnorm_per_head);
@@ -1876,7 +1901,7 @@ static status_code op_rmsnorm_add(exec_ctx *ctx) {
 	profile		 *prof = &ctx->s->prof;
 	profile_scope ps   = profile_begin(prof, ctx->op->stage);
 	status_code	  st;
-	const buffer *w = resolve_weight(ctx->m, ctx->li, ctx->op->w_idx);
+	const buffer *w = exec_weight(ctx, ctx->op->w_idx);
 	int			  n = ctx->m->dim;
 	if (exec_is_batch(ctx)) {
 		if (a->rmsnorm_add && backend_has_cap(a, BCAP_RMSNORM_ADD) && ctx->n_rows < 4) {
@@ -1970,11 +1995,14 @@ static inline buffer *walker_slot(op_walker *w, uint8_t idx) {
 	return &w->s->slots[idx];
 }
 
-static inline status_code walker_exec_one(op_walker *w, const recipe_op *op) {
-	if (w->is_batch)
-		return exec_op_batch(op, w->m, w->cache, w->s, w->bs, w->pos_start, w->n_rows, w->li,
-							 w->flash_attn);
-	return exec_op(op, w->m, w->cache, w->s, w->token, w->pos, w->li, w->flash_attn, w->logits_out);
+static inline status_code walker_exec_one(op_walker *w, exec_ctx *ctx, const recipe_op *op) {
+	if (op->kind < 0 || op->kind >= OP_KIND_COUNT)
+		return ERR_INVALID_ARG;
+	op_handler h = g_op_dispatch[op->kind];
+	if (!h)
+		return w->is_batch ? ERR_INVALID_ARG : ERR_UNSUPPORTED;
+	ctx->op = op;
+	return h(ctx);
 }
 
 static inline int walker_exec_coalesced(op_walker *w, const recipe_op *ops, int run_len,
@@ -1993,6 +2021,40 @@ static inline int walker_exec_qonly(op_walker *w, const recipe_op *ops, int run_
 }
 
 static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops) {
+	model	*m		  = w->m;
+	int		 li		  = w->li;
+	backend *layer_be = NULL;
+	if (m->mixed_backend_mode)
+		layer_be = model_layer_backend(m, li);
+	else if (w->s->active_backend)
+		layer_be = w->s->active_backend;
+	else
+		layer_be = m->backend;
+	buffer *slot_base = NULL;
+	if (!w->is_batch)
+		slot_base = (w->s && w->s->active_is_mirror) ? w->s->mirror_slots : w->s->slots;
+	weight_ref **wtab_row = NULL;
+	if (m->wrefs_by_layer && m->n_layers > 0) {
+		int row	 = (li >= 0 && li < m->n_layers) ? li : 0;
+		wtab_row = &m->wrefs_by_layer[(size_t)row * WIDX_COUNT];
+	}
+	exec_ctx ctx = {
+		.op			= NULL,
+		.m			= m,
+		.cache		= w->cache,
+		.s			= w->s,
+		.bs			= w->is_batch ? w->bs : NULL,
+		.token		= w->token,
+		.pos		= w->pos,
+		.li			= li,
+		.flash_attn = w->flash_attn,
+		.n_rows		= w->is_batch ? w->n_rows : 1,
+		.pos_start	= w->pos_start,
+		.logits_out = w->logits_out,
+		.layer_be	= layer_be,
+		.slot_base	= slot_base,
+		.wtab_row	= wtab_row,
+	};
 	int j = 0;
 	while (j < n_ops) {
 		const recipe_op *rop = &lops[j];
@@ -2002,8 +2064,20 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 			continue;
 		}
 
-		if (rop->coalesce_run_len > 1 && !(w->mixed && !w->is_batch)) {
-			int			run_len = rop->coalesce_run_len;
+		int dyn_run = (int)rop->coalesce_run_len;
+		if (dyn_run <= 1 && rop->kind == OP_MATMUL && !(w->mixed && !w->is_batch)) {
+			dyn_run = 1;
+			while (dyn_run < RECIPE_COALESCE_MAX && j + dyn_run < n_ops) {
+				const recipe_op *nx = &lops[j + dyn_run];
+				if (nx->kind != OP_MATMUL || nx->u.matmul.n == 0 || nx->u.matmul.k == 0)
+					break;
+				if (nx->in[0] != rop->in[0] || nx->u.matmul.k != rop->u.matmul.k)
+					break;
+				dyn_run++;
+			}
+		}
+		if (dyn_run > 1 && !(w->mixed && !w->is_batch)) {
+			int			run_len = dyn_run;
 			status_code coalesced_status;
 			buffer	   *ys[RECIPE_COALESCE_MAX];
 			for (int q = 0; q < run_len; q++)
@@ -2023,7 +2097,7 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 			}
 		}
 
-		status_code st = walker_exec_one(w, rop);
+		status_code st = walker_exec_one(w, &ctx, rop);
 		if (st != OK) {
 			if (w->is_batch)
 				ERROR("batch fast-path: layer %d op[%d] kind=%d (stage=%d) "
