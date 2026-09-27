@@ -54,6 +54,15 @@ typedef enum {
 	GGML_TYPE_Q5_K_R8	= 0x48,
 	GGML_TYPE_Q6_K_R8	= 0x49,
 
+	/* Quad-major Q8_0 (CUDA-only relayout for coalesced GEMV; same
+	 * 34B/32e geometry as Q8_0, byte order differs -- see
+	 * backend/cuda/cuda_internal.h). Never appears in files. */
+	GGML_TYPE_Q8_0_QM	= 0x4A,
+	/* Quad-major Q4_0: same 18B/32e geometry, byte order differs.
+	 * Groups of 32 blocks: 2B scales x G, then 16 byte-planes x G.
+	 * Never appears in files. Q4_1 has no QM variant. */
+	GGML_TYPE_Q4_0_QM	= 0x4B,
+
 } ggml_type;
 
 typedef struct {

@@ -121,6 +121,8 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 		[GGML_TYPE_Q4_K_R8]	  = {GGML_TYPE_Q4_K_R8, "q4_k_r8", 148, 256},
 		[GGML_TYPE_Q5_K_R8]	  = {GGML_TYPE_Q5_K_R8, "q5_k_r8", 180, 256},
 		[GGML_TYPE_Q6_K_R8]	  = {GGML_TYPE_Q6_K_R8, "q6_k_r8", 210, 256},
+		[GGML_TYPE_Q8_0_QM]	  = {GGML_TYPE_Q8_0_QM, "q8_0_qm", 34, 32},
+		[GGML_TYPE_Q4_0_QM]	  = {GGML_TYPE_Q4_0_QM, "q4_0_qm", 18, 32},
 	};
 	if (t >= ARRAY_LEN(table))
 		return NULL;
