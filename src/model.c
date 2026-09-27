@@ -1,6 +1,9 @@
 #define _GNU_SOURCE
 #include "model.h"
 #include "backend/cpu/scalar/quants.h"
+#ifdef BACKEND_CUDA
+#include "backend/cuda/cuda_repack.h"
+#endif
 #include "config.h"
 #include "log.h"
 #include "memconfig.h"
@@ -725,6 +728,76 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 			*type_io = re_type;
 		return OK;
 	}
+
+#ifdef BACKEND_CUDA
+	/* Quad-major Q8_0/Q4_0 for CUDA (default ON; KAPPAI_QMAJOR=0 opts out).
+	 * Same 2-D WCLASS_MATMUL coverage as the CPU repack above, but CUDA-home
+	 * and size-preserving (any n_rows). Embeddings/output_w bypass via
+	 * upload_one; KV never reaches here, so only GEMM weights are relaid out.
+	 * Q4_1 has no QM variant (stays original).
+	 *
+	 * The relayout helpers live in the CUDA backend (cuda_repack.c) so the
+	 * CPU/Vulkan backends stay free of QM knowledge. */
+	if (!re_type) {
+		const char *qm_env = getenv("KAPPAI_QMAJOR");
+		int			want_qm	 = !(qm_env && *qm_env == '0');
+		int home_is_cuda = (home && home->name && strcmp(home->name, "cuda") == 0);
+		/* Lossless Q4_0 -> Q8_0 promotion (default ON; KAPPAI_Q4_TO_Q8=0
+		 * opts out): identical values on the fast Q8 kernels. Converted
+		 * staging flows through the QM branch below. */
+		const void *eff_host	= host_ptr;
+		uint32_t	eff_type	= type;
+		void	   *converted	= NULL;
+		const char *cvt_env		= getenv("KAPPAI_Q4_TO_Q8");
+		int			want_cvt	= !(cvt_env && *cvt_env == '0');
+		if (want_cvt && home_is_cuda && type == GGML_TYPE_Q4_0 && n_dims == 2 &&
+			wc == WCLASS_MATMUL && d0 > 0 && d1 > 0 && (d0 % 32) == 0) {
+			converted = cuda_convert_q4_0_to_q8_0(host_ptr, (int)d1, (int)d0);
+			if (converted) {
+				eff_host = converted;
+				eff_type = GGML_TYPE_Q8_0;
+			}
+		}
+		int is_qm_type = (eff_type == GGML_TYPE_Q8_0 || eff_type == GGML_TYPE_Q4_0);
+		if (want_qm && home_is_cuda && is_qm_type && n_dims == 2 && wc == WCLASS_MATMUL &&
+			d0 > 0 && d1 > 0 && (d0 % 32) == 0) {
+			int	   k		 = (int)d0;
+			int	   n_rows	 = (int)d1;
+			size_t total	 = ggml_row_size(eff_type, (size_t)k) * (size_t)n_rows;
+			size_t src_total = ggml_row_size(type, (size_t)k) * (size_t)n_rows;
+			uint32_t qm_type =
+				(eff_type == GGML_TYPE_Q8_0) ? GGML_TYPE_Q8_0_QM : GGML_TYPE_Q4_0_QM;
+
+			void *repacked = xmalloc_aligned(total, 64);
+			if (eff_type == GGML_TYPE_Q8_0)
+				cuda_repack_q8_0_qm_rows(eff_host, repacked, 0, n_rows, k);
+			else
+				cuda_repack_q4_0_qm_rows(eff_host, repacked, 0, n_rows, k);
+
+			tensor_desc desc = {
+				.type	   = qm_type,
+				.n_dims	   = n_dims,
+				.dims	   = {d0, d1, 0, 0},
+				.host_data = repacked,
+			};
+			status_code s2 = home->buffer_alloc_weight(home, &desc, out);
+			free(repacked);
+			free(converted);
+			if (s2 != OK)
+				return s2;
+
+			out->host_ptr = NULL;
+			out->size	  = total;
+
+			release_original_weight_data(m, host_ptr, src_total);
+
+			if (type_io)
+				*type_io = qm_type;
+			return OK;
+		}
+		free(converted);
+	}
+#endif /* BACKEND_CUDA */
 
 	status_code s = upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out);
 	if (s != OK)
