@@ -559,9 +559,17 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 	}
 }
 int model_should_repack(uint32_t type, const char *repack_config) {
-	if (!repack_config)
-		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
-			   type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+	if (!repack_config) {
+		if (type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
+			type == GGML_TYPE_Q5_K)
+			return 1;
+#if defined(KAI_X86_K_QUANT_SIMD)
+		/* Native x86 Q4_K/Q6_K matmuls beat their generic R8 batch kernels. */
+		return 0;
+#else
+		return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K;
+#endif
+	}
 	if (strcmp(repack_config, "all") == 0)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ||
 			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||

@@ -704,7 +704,41 @@ static void test_repack_backend_batch_parity(backend *cpu, const repack_spec *s,
 	cpu->buffer_free(cpu, &yb);
 }
 
+static void test_repack_default_policy(void) {
+#if defined(KAI_X86_K_QUANT_SIMD)
+	const int native_k_quants = 1;
+#else
+	const int native_k_quants = 0;
+#endif
+	const struct {
+		uint32_t type;
+		const char *config;
+		int expected;
+		const char *label;
+	} cases[] = {
+		{GGML_TYPE_Q4_K, NULL, !native_k_quants, "q4_K smart default"},
+		{GGML_TYPE_Q5_K, NULL, 1, "q5_K smart default"},
+		{GGML_TYPE_Q6_K, NULL, !native_k_quants, "q6_K smart default"},
+		{GGML_TYPE_Q8_0, NULL, 1, "q8_0 smart default"},
+		{GGML_TYPE_IQ3_S, NULL, 1, "iq3_s smart default"},
+		{GGML_TYPE_IQ4_NL, NULL, 1, "iq4_nl smart default"},
+		{GGML_TYPE_Q4_K, "all", 1, "q4_K explicit all"},
+		{GGML_TYPE_Q5_K, "q5_K,q6_K", 1, "q5_K explicit list"},
+		{GGML_TYPE_Q6_K, "q5_K,q6_K", 1, "q6_K explicit list"},
+		{GGML_TYPE_Q4_K, "q5_K,q6_K", 0, "q4_K excluded from list"},
+		{GGML_TYPE_Q4_K, "none", 0, "q4_K explicit none"},
+	};
+	for (size_t i = 0; i < ARRAY_LEN(cases); i++) {
+		int actual = model_should_repack(cases[i].type, cases[i].config);
+		record_result(OPFAM_REPACK_PARITY, cases[i].label,
+					  actual == cases[i].expected ? V_PASS : V_FAIL,
+					  actual == cases[i].expected ? "repack policy matches"
+											  : "unexpected repack policy");
+	}
+}
+
 void run_repack_parity_tests(backend *cpu) {
+	test_repack_default_policy();
 	int shapes[][2] = {{32, 256}, {64, 512}, {64, 2048}};
 	for (int sh = 0; sh < (int)(sizeof(shapes) / sizeof(shapes[0])); sh++) {
 		int n = shapes[sh][0];
@@ -751,6 +785,17 @@ void run_repack_parity_tests(backend *cpu) {
 				continue;
 			test_repack_backend_batch_parity(cpu, &REPACK_SPECS[s], n, k, m);
 		}
+	}
+
+	/* Exercise native K-quant vector caches across repeated K growth and partial batch tiles.
+	 * Compare each native kernel against the repacked implementation. */
+	const int batch_growth[][3] = {
+		{64, 256, 8}, {64, 512, 9}, {64, 2048, 8}, {64, 4096, 9},
+	};
+	for (int s = 3; s < N_REPACK_SPECS; s++) {
+		for (size_t sh = 0; sh < ARRAY_LEN(batch_growth); sh++)
+			test_repack_backend_batch_parity(cpu, &REPACK_SPECS[s], batch_growth[sh][0],
+											 batch_growth[sh][1], batch_growth[sh][2]);
 	}
 }
 

@@ -108,6 +108,13 @@ else
   LDFLAGS := -lm -lpthread -flto
 endif
 
+# Native x86 K-quant matmul kernels are linked only with CPU_ARCH_OPT enabled.
+ifeq ($(CPU_ARCH_OPT),1)
+  ifeq ($(HOST_ARCH),x86_64)
+    CFLAGS += -DKAI_X86_K_QUANT_SIMD=1
+  endif
+endif
+
 ifneq ($(HAS_VULKAN),)
   CFLAGS  += -DBACKEND_VULKAN -I$(OBJ_DIR)/backend/vulkan -I$(SRC_DIR)/backend/vulkan
   LDFLAGS += -lvulkan
