@@ -359,7 +359,7 @@ ifeq ($(HAS_VULKAN),)
   TIDY_SRCS := $(filter-out $(SRC_DIR)/backend/vulkan/%,$(TIDY_SRCS))
 endif
 
-tidy: | $(OUT_DIR)
+tidy: $(if $(HAS_VULKAN),$(SHADERS_H)) | $(OUT_DIR)
 	@which clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 1; }
 	@echo "  TIDY    -> $(TIDY_LOG)"
 	@: > $(TIDY_LOG)
