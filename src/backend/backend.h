@@ -5,6 +5,10 @@
 #include "gguf.h"
 #include "threadpool.h"
 
+typedef struct model model;
+typedef struct kvcache kvcache;
+typedef struct compute_scratch compute_scratch;
+
 #define BACKEND_MAX 8
 
 typedef struct backend backend;
@@ -22,6 +26,8 @@ typedef enum {
 	BCAP_MATMUL_QONLY		  = 1 << 6,
 	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
+	BCAP_RMSNORM_MATMUL_MULTI = 1 << 9,
+	BCAP_QKV_NORM_ROPE		  = 1 << 10,
 } backend_cap;
 
 typedef struct {
@@ -30,6 +36,12 @@ typedef struct {
 	const void *host_ptr;
 	size_t		offset;
 	backend	   *owner;
+	bool		is_slice;
+	bool		host_is_pinned;
+	/* Optional FP16 shadow of quant weights (CUDA prefill GEMM).
+	 * Device pointer owned by this buffer (freed with it); NULL = none.
+	 * Valid only when offset == 0 (slices fall back). */
+	void	   *fp16_shadow;
 } buffer;
 
 static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t byte_len) {
@@ -37,6 +49,7 @@ static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t 
 	s.host_ptr = parent->host_ptr ? (const char *)parent->host_ptr + byte_off : NULL;
 	s.offset   = parent->offset + byte_off;
 	s.size	   = byte_len;
+	s.is_slice = true;
 	return s;
 }
 
@@ -109,6 +122,17 @@ struct backend {
 	status_code (*matmul_multi)(backend *self, const buffer **w, const uint32_t *w_types,
 								const buffer *x, buffer **y, const int *n_list, int k,
 								int n_matmuls);
+	status_code (*rmsnorm_matmul_multi)(backend *self, const buffer *norm_w, float eps,
+										const buffer **w, const uint32_t *w_types,
+										const buffer *x, buffer **y, const int *n_list, int k,
+										int n_matmuls);
+	/* Fused Q/K per-head RMSNorm + V RMSNorm-noweight + RoPE on Q/K
+	 * (decode, in-place). Replaces 5 launches with 1. NULL = decompose. */
+	status_code (*qkv_norm_rope)(backend *self, buffer *q, buffer *k, buffer *v,
+								 const buffer *wq_norm, const buffer *wk_norm,
+								 int n_heads, int n_kv_heads, int head_dim, float eps,
+								 int pos, const float *cos_base, const float *sin_base,
+								 const float *freq_factors, int neox);
 
 	status_code (*matmul_qonly)(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
 								uint32_t q8_type, buffer *y, int n, int k, int m);
@@ -137,8 +161,21 @@ struct backend {
 	status_code (*add_inplace)(backend *self, buffer *x, const buffer *y, int n);
 	status_code (*scale_inplace)(backend *self, buffer *x, float scale, int n);
 	status_code (*copy_buffer)(backend *self, const buffer *src, buffer *dst, int n);
+	/* Async copies: enqueue without host blocking. Safe wherever consumers
+	 * are same-stream device kernels or on-demand host reads. NULL = use sync. */
+	status_code (*copy_buffer_async)(backend *self, const buffer *src, buffer *dst, int n);
+	status_code (*buffer_write_async)(backend *self, buffer *buf, const float *host_src, int n);
+	/* Strided 2D copy: height rows of width_floats from src (row stride
+	 * src_row_floats) to dst (row stride dst_row_floats). Implemented as one
+	 * call (e.g. cudaMemcpy2DAsync); used for PLE slice gather. */
+	status_code (*copy_2d)(backend *self, buffer *dst, size_t dst_row_floats,
+						   const buffer *src, size_t src_row_floats, int width_floats,
+						   int height);
 	status_code (*ple_combine)(backend *self, buffer *ple, const buffer *proj, int n,
 							   float combine_scale);
+	status_code (*ple_norm_batch)(backend *self, buffer *proj, const buffer *norm_w,
+								  int n_rows, int total_ple, int n_embd, int n_layers,
+								  float eps);
 	status_code (*ffn_activate)(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								int n);
 	status_code (*ffn_activate_ex)(backend *self, const buffer *gate, const buffer *up, buffer *out,
@@ -150,6 +187,9 @@ struct backend {
 											 int head_dim, float eps);
 	status_code (*rmsnorm_add)(backend *self, const buffer *x, const buffer *w,
 							   const buffer *residual, buffer *y, int n, float eps);
+	status_code (*rmsnorm_add_batch)(backend *self, const buffer *x, const buffer *w,
+									 const buffer *residual, buffer *y, int n, float eps,
+									 int m);
 	status_code (*rmsnorm_per_head_batch)(backend *self, const buffer *x, const buffer *w,
 										  buffer *y, int n_heads, int head_dim, float eps, int m);
 	status_code (*rmsnorm_noweight_batch)(backend *self, const buffer *x, buffer *y, int n,
@@ -162,6 +202,22 @@ struct backend {
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
+	status_code (*graph_begin_capture)(backend *self);
+	status_code (*graph_end_capture)(backend *self);
+	status_code (*graph_launch)(backend *self);
+	status_code (*graph_update_n_pos)(backend *self, int n_pos);
+	status_code (*graph_update_decode_params)(backend *self, int pos, int n_pos, int token);
+	/* Decode-graph: switch ops to params-reading _g kernels (on), pre-upload
+	 * full rope tables (sync, outside capture). NULL = unsupported. */
+	status_code (*graph_set_kernels)(backend *self, int on);
+	status_code (*graph_prepare_capture)(backend *self, const float *cos, const float *sin,
+										 int head_dim, const float *cos_swa,
+										 const float *sin_swa, int head_dim_swa,
+										 const float *freq_factors, int freq_head_dim);
+	/* Persistent decode: run the entire decode step in a single kernel. */
+	status_code (*persistent_decode)(backend *self, const model *m, struct kvcache *cache,
+									 struct compute_scratch *s, int token, int pos,
+									 int flash_attn, float *logits_out);
 	void (*synchronize)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
@@ -189,6 +245,12 @@ struct backend {
 	status_code (*matmul_multi_batch)(backend *self, const buffer **w, const uint32_t *w_types,
 									  const buffer *x, buffer **y, const int *n_list, int k,
 									  int n_matmuls, int m);
+	/* Batched multi-column matmul with fused residual (y = GEMM + resid).
+	 * NULL resid = plain multi GEMM. NULL fn = decompose (matmul + add). */
+	status_code (*matmul_multi_batch_resid)(backend *self, const buffer **w,
+											const uint32_t *w_types, const buffer *x,
+											buffer **y, const int *n_list, int k,
+											int n_matmuls, int m, const buffer *resid);
 	void *priv;
 	int	  rope_neox;
 	float rope_theta;
