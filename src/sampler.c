@@ -79,8 +79,8 @@ void sampler_set_params(sampler *s, float temp, int top_k, float top_p, float mi
 	s->top_p		  = top_p;
 	s->min_p		  = min_p;
 	s->repeat_penalty = repeat_penalty;
+	s->repeat_last_n = repeat_last_n > 0 ? repeat_last_n : 0;
 	if (repeat_last_n > 0) {
-		s->repeat_last_n = repeat_last_n;
 		if (repeat_last_n > s->recent_capacity) {
 			int32_t *grown = xmalloc((size_t)repeat_last_n * sizeof(int32_t));
 			for (int i = 0; i < s->recent_count; i++)
@@ -167,19 +167,23 @@ static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_
 	return kept;
 }
 
-#define SAMPLER_TOP_FILTER_CAP 1024
-
 static void apply_repeat_penalty(sampler *s, float *mut, int vocab) {
 	int n = MIN(s->repeat_last_n, s->recent_count);
+	if (n <= 0)
+		return;
+	// A repetition penalty is presence-based, not multiplied by the token frequency.
+	uint8_t *seen = xcalloc((size_t)vocab, sizeof(*seen));
 	for (int i = s->recent_count - n; i < s->recent_count; i++) {
 		int32_t tok = s->recent[(s->recent_head + i) % s->recent_capacity];
-		if (tok < 0 || tok >= vocab)
+		if (tok < 0 || tok >= vocab || seen[tok])
 			continue;
+		seen[tok] = 1;
 		if (mut[tok] > 0)
 			mut[tok] /= s->repeat_penalty;
 		else
 			mut[tok] *= s->repeat_penalty;
 	}
+	free(seen);
 }
 
 static int collect_candidates(sampler *s, const float *logits, int vocab,
@@ -189,12 +193,8 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 		kept = top_k_heap(s, logits, vocab, s->top_k, arr);
 		qsort(arr, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	} else {
-		int cap;
-		if (s->top_p < 1.0f || s->min_p > 0.0f)
-			cap = MIN(vocab, SAMPLER_TOP_FILTER_CAP);
-		else
-			cap = vocab;
-		kept = top_all_desc(s, logits, vocab, arr, cap);
+		// Nucleus mass and min-p support must be evaluated over the full vocabulary.
+		kept = top_all_desc(s, logits, vocab, arr, vocab);
 	}
 	return kept;
 }

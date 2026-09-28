@@ -357,7 +357,7 @@ static int bounce_read_aligned(int fd, uint64_t aligned_off, size_t aligned_len,
 	if (!bounce)
 		return -1;
 	ssize_t got = pread_full(fd, bounce, aligned_len, (off_t)aligned_off);
-	if ((size_t)got < head_slop + len)
+	if (got < 0 || (size_t)got < head_slop + len)
 		return -1;
 	memcpy(dst, (uint8_t *)bounce + head_slop, len);
 	return 0;
@@ -391,11 +391,13 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_direct_fd >= 0 && c->nomap_direct_align > 0) {
 		size_t align = c->nomap_direct_align;
 
-		if (precheck_aligned &&
-			(size_t)pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off) >= len) {
-			atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
-			return 0;
+		if (precheck_aligned) {
+			ssize_t got = pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off);
+			if (got >= 0 && (size_t)got >= len) {
+				atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
+				atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
+				return 0;
+			}
 		}
 
 		if (aligned_pread_bounce(c->nomap_direct_fd, align, file_off, len, dst, 0) == 0) {
@@ -410,7 +412,8 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_fd < 0)
 		return -1;
 	atomic_fetch_add_explicit(&c->stat_direct_fallback, 1, memory_order_relaxed);
-	if ((size_t)pread_full(c->nomap_fd, dst, len, (off_t)file_off) < len)
+	ssize_t got = pread_full(c->nomap_fd, dst, len, (off_t)file_off);
+	if (got < 0 || (size_t)got < len)
 		return -1;
 	posix_fadvise(c->nomap_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 	return 0;
@@ -423,9 +426,12 @@ static int moe_direct_io_read(moe_stream_cache *c, off_t file_off, size_t len, u
 
 	size_t align = c->direct_io_align;
 
-	if (precheck_aligned && (size_t)pread_full(c->direct_io_fd, dst, len, file_off) >= len) {
-		posix_fadvise(c->direct_io_fd, file_off, (off_t)len, POSIX_FADV_DONTNEED);
-		return 0;
+	if (precheck_aligned) {
+		ssize_t got = pread_full(c->direct_io_fd, dst, len, file_off);
+		if (got >= 0 && (size_t)got >= len) {
+			posix_fadvise(c->direct_io_fd, file_off, (off_t)len, POSIX_FADV_DONTNEED);
+			return 0;
+		}
 	}
 
 	return aligned_pread_bounce(c->direct_io_fd, align, (uint64_t)file_off, len, dst,
@@ -491,7 +497,8 @@ static int moe_fill_chunk_do_read(moe_fill_chunk *ch) {
 			atomic_fetch_add_explicit(&c->stat_fill_direct_fallback_copy, 1, memory_order_relaxed);
 		}
 		atomic_fetch_add_explicit(&c->stat_fill_bytes, ch->len, memory_order_relaxed);
-		return ok;
+		// A failed direct read is recoverable here: the mapped source supplies every byte.
+		return 1;
 	}
 	memcpy(ch->dst, ch->mmap_src, ch->len);
 	atomic_fetch_add_explicit(&c->stat_fill_memcpy, 1, memory_order_relaxed);
