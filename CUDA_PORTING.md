@@ -38,15 +38,15 @@ Port those before targeting a MoE model.
 
 Still to port from the development tree for full parity:
 
-1. **CUDA-graph replay** — the state machine + `recipe_ple_fill_host` are now
-   ported (`compute.c`, `recipe.c`), but **capture currently aborts** during
-   the decode forward ("operation failed due to a previous error during
-   capture") and cleanly falls back to eager. Graphs are therefore **opt-in**
-   here (`KAPPAI_CUDA_GRAPH=1`); the dev tree has them default-on. Next step:
-   audit the single-token forward for capture-illegal calls (sync
-   `cudaMemcpy`/`cudaMalloc`) the way the dev tree does — several async
-   variants (`buffer_write_async`, `copy_buffer_async`) exist in the ported
-   backend and the PLE upload already uses the async form.
+1. **CUDA-graph replay — now working (default ON).** The state machine +
+   `recipe_ple_fill_host` are ported, and the capture-illegal calls are
+   fixed: KV-shared K→V copy now prefers `copy_buffer_async`, and the PLE
+   projection slice copy uses an async `copy_2d` (was a sync
+   `compute_copy_buffer_cross`). Capture completes (**902 nodes**,
+   866 kernel / 36 memcpy) and replays; greedy output stays byte-identical
+   to CPU. TG 41 -> **68** (short prompt); sampled decode still runs eager
+   (no sampled-graph glue here yet, so it does not arm graphs).
+   `KAPPAI_CUDA_GRAPH_DISABLE=1` force-disables.
 2. **`--gemv` decode-GEMV rig** — ported (`test_bench.c` + dispatch + usage).
    Run: `./build/test --gemv cuda`. It runs before the arch self-test, so it
    works even in `BUILD=release` (whose `./build/test` still segfaults — item 3).

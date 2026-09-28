@@ -369,6 +369,9 @@ static status_code copy_k_to_v_slot(model *m, struct compute_scratch *s, int li)
 	buffer	*kb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_K] : &s->slots[RECIPE_SLOT_K];
 	buffer	*vb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_V] : &s->slots[RECIPE_SLOT_V];
 	if (a->copy_buffer && kb->owner == vb->owner) {
+		/* Async when available: capture-safe for graph replay. */
+		if (a->copy_buffer_async)
+			return a->copy_buffer_async(a, kb, vb, kv_out);
 		return a->copy_buffer(a, kb, vb, kv_out);
 	}
 	if (a->synchronize)
@@ -857,6 +860,8 @@ static status_code op_ple_build(exec_ctx *ctx) {
 }
 
 static status_code op_ple_proj_inject(exec_ctx *ctx) {
+	if (!ctx->m->has_per_layer_embeddings)
+		return OK;
 	if (exec_is_batch(ctx))
 		return ple_proj_inject_batch(ctx);
 	const struct layer_weights *L =
@@ -891,9 +896,16 @@ static status_code op_ple_proj_inject(exec_ctx *ctx) {
 		return st;
 
 	if (s->ple_all.handle) {
-		buffer ple_src = s->ple_all;
-		ple_src.offset += (size_t)li * n_embd_per_layer * sizeof(float);
-		st = compute_copy_buffer_cross(s, &ple_src, ple_slice_buf, n_embd_per_layer);
+		buffer ple_src = buffer_slice(&s->ple_all, (size_t)li * n_embd_per_layer * sizeof(float),
+									 (size_t)n_embd_per_layer * sizeof(float));
+		/* Single async copy instead of a sync drain per layer per token;
+		 * the slice mirror is a write-only temp (never host-read). Keeps the
+		 * call capture-safe for graph replay. */
+		if (t->copy_2d)
+			st = t->copy_2d(t, ple_slice_buf, (size_t)n_embd_per_layer, &ple_src,
+							(size_t)n_embd_per_layer, n_embd_per_layer, 1);
+		else
+			st = compute_copy_buffer_cross(s, &ple_src, ple_slice_buf, n_embd_per_layer);
 		if (st != OK)
 			return st;
 	} else {

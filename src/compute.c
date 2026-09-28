@@ -468,12 +468,11 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 	static const model *g_gr_m;
 	static backend *g_gr_b;
 	static int g_gr_steps, g_gr_armed, g_gr_off, g_gr_env = -1;
-	/* NOTE (fork): graph capture is OPT-IN here (KAPPAI_CUDA_GRAPH=1) until
-	 * the decode-forward async/alloc audit is complete; capture currently
-	 * aborts (falls back to eager, output stays correct). The development
-	 * tree has this default-on. KAPPAI_CUDA_GRAPH_DISABLE still force-offs. */
+	/* Decode graphs are ON by default (matching the development tree);
+	 * KAPPAI_CUDA_GRAPH_DISABLE=1 force-disables. Only arms for greedy
+	 * (logits_out==NULL), dense, single-backend, pos<1024. */
 	if (g_gr_env < 0)
-		g_gr_env = (getenv("KAPPAI_CUDA_GRAPH") && !getenv("KAPPAI_CUDA_GRAPH_DISABLE")) ? 1 : 0;
+		g_gr_env = getenv("KAPPAI_CUDA_GRAPH_DISABLE") ? 0 : 1;
 	backend *a = m ? m->backend : NULL;
 	if (g_gr_env && !g_gr_off && a && logits_out == NULL && m && !m->mixed_backend_mode &&
 		(!m->arch_info || !m->arch_info->is_hybrid_recurrent) && m->moe.n_experts <= 0 &&
