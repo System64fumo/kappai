@@ -293,6 +293,8 @@ void		  recipe_free(model_recipe *r);
 status_code compute_forward_recipe(struct model *m, struct kvcache *cache,
 								   struct compute_scratch *s, int token, int pos, int flash_attn,
 								   float *logits_out);
+/* Host-only PLE row fill used by the CUDA-graph replay path. */
+status_code recipe_ple_fill_host(const struct model *m, struct compute_scratch *s, int token);
 
 status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,

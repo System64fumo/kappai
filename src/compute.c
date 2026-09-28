@@ -436,7 +436,273 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
-	return compute_forward_recipe(m, cache, s, token, pos, flash_attn, logits_out);
+	/* Decode-graph prototype (KAPPAI_CUDA_GRAPH=1): capture one greedy
+	 * single-token step and replay it. Position/token flow to kernels via
+	 * device params, so no per-step node updates. Requirements: fast path
+	 * (logits_out==NULL; slow path readback can't capture), fully-lazy
+	 * mirrors (eager/pacing change the node set per step), single backend,
+	 * dense (no MoE/data-dependent routing), pos within the 1024-row rope
+	 * cap. Any failure disables graphs for the session (normal path runs).
+	 * Replay skips per-layer progress callbacks and interrupt polling
+	 * inside the forward (decode loop still checks per token). */
+	static const model *g_gr_m;
+	static backend *g_gr_b;
+	static int g_gr_steps, g_gr_armed, g_gr_off, g_gr_env = -1;
+	/* NOTE (fork): graph capture is OPT-IN here (KAPPAI_CUDA_GRAPH=1) until
+	 * the decode-forward async/alloc audit is complete; capture currently
+	 * aborts (falls back to eager, output stays correct). The development
+	 * tree has this default-on. KAPPAI_CUDA_GRAPH_DISABLE still force-offs. */
+	if (g_gr_env < 0)
+		g_gr_env = (getenv("KAPPAI_CUDA_GRAPH") && !getenv("KAPPAI_CUDA_GRAPH_DISABLE")) ? 1 : 0;
+	backend *a = m ? m->backend : NULL;
+	if (g_gr_env && !g_gr_off && a && logits_out == NULL && m && !m->mixed_backend_mode &&
+		(!m->arch_info || !m->arch_info->is_hybrid_recurrent) && m->moe.n_experts <= 0 &&
+		!getenv("KAPPAI_CUDA_EAGER_D2H") && !getenv("KAPPAI_LAZY_EVERY") &&
+		!getenv("KAPPAI_LAZY_EXCEPT") && a->graph_begin_capture && a->graph_end_capture &&
+		a->graph_launch && a->graph_update_decode_params && a->graph_set_kernels &&
+		a->graph_prepare_capture && pos >= 0 && pos < 1024) {
+		if (m != g_gr_m || a != g_gr_b) {
+			if (g_gr_armed && g_gr_b && g_gr_b->graph_set_kernels)
+				g_gr_b->graph_set_kernels(g_gr_b, 0);
+			g_gr_m = m;
+			g_gr_b = a;
+			g_gr_steps = 0;
+			g_gr_armed = 0;
+		}
+		if (g_gr_armed) {
+			/* TEMP: run the first N replays normally (post-arming). */
+			static int g_skip = -1;
+			if (g_skip < 0) {
+				const char *e = getenv("KAPPAI_GRAPH_SKIP");
+				g_skip = e ? atoi(e) : 0;
+			}
+			if (g_skip > 0) {
+				g_skip--;
+				/* Keep params fresh so _g kernels see current step. */
+				if (a->graph_update_decode_params(a, pos, pos + 1, token) != OK) {
+					g_gr_off = 1;
+					g_gr_armed = 0;
+					a->graph_set_kernels(a, 0);
+				}
+				return compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+											  logits_out);
+			}
+			if (getenv("KAPPAI_GRAPH_DBG")) {
+				fprintf(stderr, "[GRAPH] replay pos=%d tok=%d\n", pos, token);
+				if (a->synchronize) a->synchronize(a);
+				/* Drain first (argmax already did): read back what the last
+				 * launch actually saw. */
+				extern int cuda_graph_dbg_peek(backend *b, int *p0, int *p1, int *p2);
+				int v0 = -9, v1 = -9, v2 = -9;
+				if (cuda_graph_dbg_peek(a, &v0, &v1, &v2) == 0)
+					fprintf(stderr, "[GRAPH] device params now=(%d,%d,%d)\n", v0, v1, v2);
+			}
+			if (getenv("KAPPAI_GRAPH_DBG"))
+				fprintf(stderr, "[GRAPH] update be=%p\n", (void *)a);
+			int use_tok = token;
+			int use_pos = pos;
+			int ple_tok = token;
+			if (getenv("KAPPAI_GRAPH_CORRUPT"))
+				use_tok = 0; /* TEMP: force token 0, keep pos */
+			if (getenv("KAPPAI_GRAPH_CORRUPT_PLE"))
+				ple_tok = 0; /* TEMP: force ple token 0 as well */
+			static int fz_pos = -1, fz_tok = -1;
+			if (getenv("KAPPAI_GRAPH_FREEZE")) {
+				/* TEMP: replay capture-step values forever. */
+				if (fz_pos < 0) {
+					fz_pos = pos;
+					fz_tok = token;
+				}
+				use_pos = fz_pos;
+				use_tok = fz_tok;
+			}
+			if (getenv("KAPPAI_GRAPH_FREEZEPOS")) {
+				/* TEMP: freeze pos in params (token/ple advance). */
+				static int fp = -1;
+				if (fp < 0) fp = pos;
+				use_pos = fp;
+			}
+			if (getenv("KAPPAI_GRAPH_NOREPLAY")) {
+				/* TEMP BISECT: fresh params + ple, then NORMAL forward
+				 * with _g kernels (flag stays on). Tests _g path live
+				 * without graph replay. */
+				if (recipe_ple_fill_host(m, s, token) != OK ||
+					a->graph_update_decode_params(a, pos, pos + 1, token) != OK)
+					return ERR_INTERNAL;
+				return compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+											  logits_out);
+			}
+			/* TEMP: replay exactly once more, then disable + normal. */
+			static int g_once = -1;
+			if (g_once < 0)
+				g_once = getenv("KAPPAI_GRAPH_ONCE") ? 1 : 0;
+			if (getenv("KAPPAI_GRAPH_DBG")) {
+				extern int cuda_graph_dbg_capquery(backend *b);
+				int cs = cuda_graph_dbg_capquery(a);
+				if (cs >= 0)
+					fprintf(stderr, "[GRAPH] capstate=%d\n", cs);
+			}
+			if (getenv("KAPPAI_GRAPH_TOGGLEX")) {
+				/* TEMP: on odd replays, clobber X[0] to sentinel. */
+				extern int cuda_graph_dbg_togglex(backend *b, void *slotbuf, int on);
+				static int tg = 0;
+				tg++;
+				if (cuda_graph_dbg_togglex(a, (void *)&s->slots[0], tg & 1) != 0)
+					return ERR_INTERNAL;
+			}
+			{
+				extern int cuda_graph_dbg_snap(backend *b, void *slots,
+											   const char *path, int pos);
+				const char *sp = getenv("KAPPAI_GRAPH_SNAPRE");
+				if (sp) {
+					if (a->synchronize) a->synchronize(a);
+					cuda_graph_dbg_snap(a, (void *)s->slots, sp, pos);
+				}
+			}
+			if ((!getenv("KAPPAI_GRAPH_NOPLE") &&
+				 recipe_ple_fill_host(m, s, ple_tok) != OK) ||
+				(s->ple_all.host_ptr &&
+				 memcpy(s->ple_all.host_ptr, s->ple_buf, s->ple_all.size) == NULL) ||
+				a->graph_update_decode_params(a, use_pos, use_pos + 1, use_tok) != OK) {
+				g_gr_off = 1;
+				a->graph_set_kernels(a, 0);
+			} else {
+				if (getenv("KAPPAI_GRAPH_SYNCUPD"))
+					if (a->synchronize) a->synchronize(a);
+				if (a->graph_launch(a) != OK) {
+					g_gr_off = 1;
+					a->graph_set_kernels(a, 0);
+				} else {
+					{
+						extern int cuda_graph_dbg_snap(backend *b, void *slots,
+													   const char *path, int pos);
+						const char *sp = getenv("KAPPAI_GRAPH_SNAP");
+						if (sp) {
+							if (a->synchronize) a->synchronize(a);
+							cuda_graph_dbg_snap(a, (void *)s->slots, sp, pos);
+						}
+					}
+					if (getenv("KAPPAI_GRAPH_DBG")) {
+						/* TEMP: dump first 4 logits right after replay. */
+						extern int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4);
+						float lg[4] = {0, 0, 0, 0};
+						if (a->synchronize) a->synchronize(a);
+						if (cuda_graph_dbg_logits(a, (void *)&s->slots[14], lg) == 0)
+							fprintf(stderr, "[GRAPH] post-logits=%g %g %g %g\n", lg[0], lg[1],
+									lg[2], lg[3]);
+						if (getenv("KAPPAI_GRAPH_TWICE")) {
+							/* TEMP: launch a 2nd time unchanged; must be bit-identical. */
+							if (a->graph_launch(a) != OK)
+								fprintf(stderr, "[GRAPH] twice: relaunch failed\n");
+							else {
+								float lg2[4] = {0, 0, 0, 0};
+								if (a->synchronize) a->synchronize(a);
+								if (cuda_graph_dbg_logits(a, (void *)&s->slots[14], lg2) == 0)
+									fprintf(stderr, "[GRAPH] twice-logits=%g %g %g %g %s\n",
+											lg2[0], lg2[1], lg2[2], lg2[3],
+											(lg2[0] == lg[0] && lg2[1] == lg[1] &&
+											 lg2[2] == lg[2] && lg2[3] == lg[3])
+												? "IDENTICAL"
+												: "DIFFERENT");
+							}
+						}
+						{
+							extern int cuda_graph_dbg_lasterr(void);
+							int le = cuda_graph_dbg_lasterr();
+							if (le != 0)
+								fprintf(stderr, "[GRAPH] lasterr=%d\n", le);
+						}
+					}
+					if (g_once) {
+						g_once = 0;
+						g_gr_armed = 0;
+						g_gr_off = 1;
+						a->graph_set_kernels(a, 0);
+					}
+					return OK;
+				}
+			}
+		} else {
+			if (g_gr_steps < 2) {
+				g_gr_steps++;
+			} else {
+				/* Step 3: pre-upload full tables (sync, outside capture),
+				 * populate params, capture, instantiate, execute. */
+				status_code gst = a->graph_prepare_capture(
+a, s->rope_cos, s->rope_sin, m->layer_dims.head_dim_global,
+				s->rope_cos_swa, s->rope_sin_swa, m->layer_dims.head_dim_swa,
+				m->rope_freqs, m->layer_dims.head_dim_global);
+			if (gst == OK)
+				gst = a->graph_update_decode_params(a, pos, pos + 1, token);
+			if (gst == OK)
+				gst = a->graph_begin_capture(a);
+				if (getenv("KAPPAI_GRAPH_DBG"))
+					fprintf(stderr, "[GRAPH] capture pos=%d prep=%d be=%p\n", pos, (int)gst,
+							(void *)a);
+				if (gst == OK) {
+					st = compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+												logits_out);
+					status_code est = a->graph_end_capture(a);
+					if (est != OK || st != OK) {
+						a->graph_set_kernels(a, 0);
+						g_gr_off = 1;
+						/* Capture executes nothing: run this step normally. */
+						return compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+													  logits_out);
+					}
+					g_gr_armed = 1;
+					if (getenv("KAPPAI_GRAPH_ONESHOT")) {
+						/* TEMP BISECT: run the captured graph once, then
+						 * disable and continue normally. */
+						if (a->graph_launch(a) != OK) {
+							g_gr_armed = 0;
+							g_gr_off = 1;
+							a->graph_set_kernels(a, 0);
+							return compute_forward_recipe(m, cache, s, token, pos,
+														  flash_attn, logits_out);
+						}
+						g_gr_armed = 0;
+						g_gr_off = 1;
+						a->graph_set_kernels(a, 0);
+						return OK;
+					}
+					if (a->graph_launch(a) != OK) {
+						g_gr_armed = 0;
+						g_gr_off = 1;
+						a->graph_set_kernels(a, 0);
+						return compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+													  logits_out);
+					}
+					return OK;
+				}
+				a->graph_set_kernels(a, 0);
+				g_gr_off = 1;
+			}
+		}
+	} else if (g_gr_armed && (m != g_gr_m || a != g_gr_b)) {
+		if (g_gr_b && g_gr_b->graph_set_kernels)
+			g_gr_b->graph_set_kernels(g_gr_b, 0);
+		g_gr_m = m;
+		g_gr_b = a;
+		g_gr_steps = 0;
+		g_gr_armed = 0;
+	}
+	status_code out_st = compute_forward_recipe(m, cache, s, token, pos, flash_attn,
+													 logits_out);
+	if (getenv("KAPPAI_GRAPH_SNAP") && logits_out == NULL) {
+		extern int cuda_graph_dbg_snap(backend *b, void *slots, const char *path, int pos);
+		if (a->synchronize) a->synchronize(a);
+		cuda_graph_dbg_snap(a, (void *)s->slots, getenv("KAPPAI_GRAPH_SNAP"), pos);
+	}
+	if (getenv("KAPPAI_GRAPH_DBG") && logits_out == NULL) {
+		extern int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4);
+		float lg[4] = {0, 0, 0, 0};
+		if (a->synchronize) a->synchronize(a);
+		if (cuda_graph_dbg_logits(a, (void *)&s->slots[14], lg) == 0)
+			fprintf(stderr, "[GRAPH] normal-logits pos=%d tok=%d %g %g %g %g\n", pos, token,
+					lg[0], lg[1], lg[2], lg[3]);
+	}
+	return out_st;
 }
 
 status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,

@@ -38,13 +38,21 @@ Port those before targeting a MoE model.
 
 Still to port from the development tree for full parity:
 
-1. `compute.c`/`context.c`: CUDA-graph replay + sampled-path glue
-   (the fork currently runs eager decode; correct but slower).
+1. **CUDA-graph replay** — the state machine + `recipe_ple_fill_host` are now
+   ported (`compute.c`, `recipe.c`), but **capture currently aborts** during
+   the decode forward ("operation failed due to a previous error during
+   capture") and cleanly falls back to eager. Graphs are therefore **opt-in**
+   here (`KAPPAI_CUDA_GRAPH=1`); the dev tree has them default-on. Next step:
+   audit the single-token forward for capture-illegal calls (sync
+   `cudaMemcpy`/`cudaMalloc`) the way the dev tree does — several async
+   variants (`buffer_write_async`, `copy_buffer_async`) exist in the ported
+   backend and the PLE upload already uses the async form.
 2. `test_bench.c`: `--gemv` decode-GEMV rig + CUDA test cases, for the
    differential/performance harnesses.
 3. Note: the fork's `BUILD=release` `./build/test` segfault (pre-existing,
-   CUDA-independent) still blocks running the suite in release mode; use the
-   default ASan build for CPU/Vulkan suites, and e2e runs for CUDA.
+   CUDA-independent) still blocks the per-op suite in release mode; use the
+   default ASan build for CPU/Vulkan suites, and e2e runs (or `--gemv`, which
+   runs before the self-test) for CUDA.
 
 Remaining planned commits:
 

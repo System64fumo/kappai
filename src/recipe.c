@@ -680,6 +680,28 @@ static inline void backend_sync_rope(backend *t, backend *a) {
 	}
 }
 
+/* Host-only PLE row fill for graph replay: the captured ple_all upload
+ * node reads s->ple_buf, which a skipped forward no longer refreshes.
+ * Called per replay step before launch (CPU write, then stream-ordered).
+ * Bit-identical to the head of op_ple_build by construction. */
+status_code recipe_ple_fill_host(const struct model *m, struct compute_scratch *s, int token) {
+	if (!m->has_per_layer_embeddings)
+		return OK;
+	const int n_embd_per_layer = m->layer_dims.n_embd_per_layer;
+	const int total_ple		   = n_embd_per_layer * m->n_layers;
+	size_t row_stride = ggml_row_size(m->layer_dims.per_layer_tok_embd.type, total_ple);
+	const uint8_t *embd =
+		(const uint8_t *)m->layer_dims.per_layer_tok_embd.host_ptr + ((size_t)token * row_stride);
+	float *ple = s->ple_buf;
+	if (!ple || !embd)
+		return ERR_INVALID_ARG;
+	dequant_row_dispatch(m->layer_dims.per_layer_tok_embd.type, embd, total_ple, ple);
+	float scale = sqrtf((float)n_embd_per_layer);
+	for (int i = 0; i < total_ple; i++)
+		ple[i] *= scale;
+	return OK;
+}
+
 static status_code op_ple_build(exec_ctx *ctx) {
 	if (exec_is_batch(ctx))
 		return ple_build_batch(ctx);
@@ -724,7 +746,11 @@ static status_code op_ple_build(exec_ctx *ctx) {
 		if (st != OK)
 			return st;
 
-		st = a->buffer_write_f32(a, &s->ple_all, ple, total_ple);
+		/* Async when available: keeps the call capture-safe (graph replay). */
+		if (a->buffer_write_async)
+			st = a->buffer_write_async(a, &s->ple_all, ple, total_ple);
+		else
+			st = a->buffer_write_f32(a, &s->ple_all, ple, total_ple);
 		if (st != OK)
 			return st;
 
