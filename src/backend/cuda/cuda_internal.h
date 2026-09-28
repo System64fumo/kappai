@@ -286,6 +286,15 @@ void cuda_add_inplace(float *x_dev, const float *y_dev, int n, cudaStream_t stre
 /* scale_inplace: x[i] *= scale */
 void cuda_scale_inplace(float *x_dev, float scale, int n, cudaStream_t stream);
 
+/* Ops the engine dispatches via OP_BACKEND: a NULL slot silently reroutes to
+ * a host backend, which would then dereference a device pointer. Device
+ * backends must implement these natively. */
+void cuda_softcap(float *x_dev, float cap, long long n, cudaStream_t stream);
+void cuda_attn_output_gate(float *out_dev, const float *gate_dev, long long n,
+                           cudaStream_t stream);
+void cuda_split_qgate(const float *mixed_dev, float *q_dev, float *gate_dev, int n_heads,
+                      int head_dim, int n_rows, cudaStream_t stream);
+
 /* Batched attention/KV: grid over rows. sliding_window <= 0 disables window. */
 void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
                          const uint16_t *vc_dev, float *out_dev, int n_heads,

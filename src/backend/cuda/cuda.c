@@ -2194,6 +2194,45 @@ static status_code cuda_op_scale_inplace(backend *self, buffer *x, float scale, 
     return OK;
 }
 
+/* --- engine-dispatched ops that must be native on a device backend --- */
+
+static status_code cuda_op_softcap(backend *self, buffer *x, float cap, int n) {
+	struct cuda_priv *priv = cuda_priv(self);
+	if (!priv)
+		return ERR_INTERNAL;
+	if (cap <= 0.0f || n <= 0)
+		return OK;
+	cuda_softcap((float *)cuda_dev_ptr(x), cap, n, priv->stream);
+	if (!cuda_lazy_d2h_for("elem") && x->host_ptr)
+		cudaMemcpy(x->host_ptr, cuda_dev_ptr(x), (size_t)n * sizeof(float),
+				   cudaMemcpyDeviceToHost);
+	return OK;
+}
+
+static status_code cuda_op_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
+										   int n_rows) {
+	struct cuda_priv *priv = cuda_priv(self);
+	if (!priv)
+		return ERR_INTERNAL;
+	if (n <= 0 || n_rows <= 0)
+		return OK;
+	cuda_attn_output_gate((float *)cuda_dev_ptr(out), (const float *)cuda_dev_ptr(gate),
+						  (long long)n * n_rows, priv->stream);
+	return OK;
+}
+
+static status_code cuda_op_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+									  int n_heads, int head_dim, int n_rows) {
+	struct cuda_priv *priv = cuda_priv(self);
+	if (!priv)
+		return ERR_INTERNAL;
+	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
+		return OK;
+	cuda_split_qgate((const float *)cuda_dev_ptr(mixed), (float *)cuda_dev_ptr(q),
+					 (float *)cuda_dev_ptr(gate), n_heads, head_dim, n_rows, priv->stream);
+	return OK;
+}
+
 /* PLE helpers (GPU native): combine + strided per-slice norm batch. */
 static status_code cuda_op_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
                                        float scale) {
@@ -3123,6 +3162,9 @@ static status_code cuda_ctor(backend *out) {
     out->attention_batch    = cuda_attention_batch;
     out->attention_swa_batch = cuda_attention_swa_batch;
     out->scale_inplace      = cuda_op_scale_inplace;
+    out->softcap             = cuda_op_softcap;
+    out->attn_output_gate    = cuda_op_attn_output_gate;
+    out->split_qgate         = cuda_op_split_qgate;
     out->ple_combine        = cuda_op_ple_combine;
     out->ple_norm_batch     = cuda_op_ple_norm_batch;
     out->argmax             = cuda_op_argmax;

@@ -5659,6 +5659,64 @@ extern "C" void cuda_scale_inplace(float *x_dev, float scale, int n, cudaStream_
 }
 
 /* ------------------------------------------------------------------ */
+/* softcap: x[i] = cap * tanh(x[i] / cap)                               */
+/* attn_output_gate: out[i] *= sigmoid(gate[i])                        */
+/* split_qgate: per head, q=src[0:hd], gate=src[hd:2*hd]               */
+/* (host fallbacks for these dereference the buffer as host memory, so   */
+/*  a device backend must implement them natively -- OP_BACKEND only    */
+/*  reroutes, it does not stage.)                                       */
+/* ------------------------------------------------------------------ */
+
+__global__ void softcap_kernel(float *x, float cap, float inv_cap, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = cap * tanhf(x[i] * inv_cap);
+}
+
+extern "C" void cuda_softcap(float *x_dev, float cap, long long n, cudaStream_t stream) {
+    if (n <= 0) return;
+    int block = 256;
+    long long grid = (n + block - 1) / block;
+    softcap_kernel<<<(unsigned)grid, block, 0, stream>>>(x_dev, cap, 1.0f / cap, n);
+}
+
+__global__ void attn_output_gate_kernel(float *o, const float *g, long long n) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) o[i] *= 1.0f / (1.0f + expf(-g[i]));
+}
+
+extern "C" void cuda_attn_output_gate(float *out_dev, const float *gate_dev, long long n,
+                                      cudaStream_t stream) {
+    if (n <= 0) return;
+    int block = 256;
+    long long grid = (n + block - 1) / block;
+    attn_output_gate_kernel<<<(unsigned)grid, block, 0, stream>>>(out_dev, gate_dev, n);
+}
+
+__global__ void split_qgate_kernel(const float *mixed, float *q, float *gate, int head_dim,
+                                   long long q_out, long long total) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    long long row = i / q_out;
+    long long rem = i - row * q_out;
+    long long h   = rem / head_dim;
+    long long d   = rem - h * head_dim;
+    const float *src = mixed + row * 2 * q_out + h * 2 * head_dim;
+    q[row * q_out + rem]    = src[d];
+    gate[row * q_out + rem] = src[d + head_dim];
+}
+
+extern "C" void cuda_split_qgate(const float *mixed_dev, float *q_dev, float *gate_dev,
+                                int n_heads, int head_dim, int n_rows, cudaStream_t stream) {
+    if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0) return;
+    long long q_out = (long long)n_heads * head_dim;
+    long long total = q_out * n_rows;
+    int block = 256;
+    long long grid = (total + block - 1) / block;
+    split_qgate_kernel<<<(unsigned)grid, block, 0, stream>>>(mixed_dev, q_dev, gate_dev, head_dim,
+                                                             q_out, total);
+}
+
+/* ------------------------------------------------------------------ */
 /* ffn_activate: out[i] = silu(gate[i]) * up[i]  (SwiGLU)            */
 /*               out[i] = gelu(gate[i]) * up[i]  (GELU)              */
 /* ------------------------------------------------------------------ */
