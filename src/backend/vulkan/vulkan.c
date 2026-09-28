@@ -216,7 +216,6 @@ typedef struct {
 #define VK_DIRTY_TABLE_SIZE 256
 	VkBuffer dirty_table[VK_DIRTY_TABLE_SIZE];
 	int		 dirty_count;
-	/* Buffers accessed by earlier dispatches in this command buffer (WAR hazards). */
 	VkBuffer read_table[VK_DIRTY_MAX];
 	int		 read_count;
 
@@ -1609,8 +1608,6 @@ have_set:;
 	}
 
 	vk_dirty_add(p, key, n_bufs, write_mask);
-	/* Track shader reads until a later write to the same VkBuffer. Include read/write
-	 * bindings: a storage buffer marked writable can also be read by its shader. */
 	for (int i = 0; i < n_bufs; i++) {
 		int seen = 0;
 		for (int j = 0; j < p->read_count; j++)
@@ -5681,7 +5678,6 @@ static status_code vk_attention_swa_batch(backend *self, const buffer *q, const 
 										  int pos_start, int n_heads, int n_kv_heads, int head_dim,
 										  int n_ctx, int flash_attn, float scale,
 										  int sliding_window, int n_kv_heads_active, int m) {
-	/* The shader computes the window lower bound separately for each query row. */
 	return vk_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
 								   n_kv_heads, head_dim, n_ctx, flash_attn, scale,
 								   n_kv_heads_active, sliding_window, 0, m);
