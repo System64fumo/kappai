@@ -95,12 +95,14 @@ buffers to the CPU reference (which dereferenced device pointers). Added
 suite runs to completion in release, 399/0/71** (was a segfault). No CPU/Vulkan
 edits.
 
-**Known-correctness gap (not a crash):** `gemma-4-E2B-it-Q4_K_M` (Q4_K/Q6_K
-tensors, all served by the staged fallback) now loads and runs on CUDA but
-produces empty/incorrect generation (immediate EOG). The per-op suite skips
-non-native matmul types, so this fallback path is not covered by tests — it
-needs its own differential validation. Q8_0/Q4_0 (the native path) remain
-byte-identical to CPU.
+**Q4_K_M / exotic quants — now works.** `gemma-4-E2B-it-Q4_K_M` (Q4_K/Q6_K
+tensors, all served by the staged host fallback) previously produced empty
+output; the staged `matmul_ffn_down` sized gate/up from `n` instead of `k`,
+feeding garbage to the CPU reference. Fixed. It now generates coherent text
+and tracks the CPU output closely (can flip a wording choice mid-run — the
+same thin-race class as the graph path, since it goes through host math on
+GPU-produced activations). It is slow by design (host fallback), ~PP 40 /
+TG 5.5. Native-quant models (Q8_0/Q4_0) remain byte-identical to CPU.
 
 ## Note on graph replay numerics
 
