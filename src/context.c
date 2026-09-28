@@ -298,7 +298,7 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 	return pos + 1;
 }
 
-#define PREFILL_CHUNK_WS_TARGET_BYTES (8ull << 20)
+#define PREFILL_CHUNK_WS_TARGET_BYTES (64ull << 20)
 
 static size_t context_kv_bytes_per_token(const context *c) {
 	size_t head_row;
@@ -341,8 +341,8 @@ static int context_prefill_chunk_size(const context *c, int n_threads) {
 	}
 	if (chunk < 32)
 		chunk = 32;
-	if (chunk > 512)
-		chunk = 512;
+	if (chunk > 2048)
+		chunk = 2048;
 	(void)n_threads;
 	return chunk;
 }
