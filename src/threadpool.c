@@ -498,6 +498,9 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 		}
 	}
 
+	atomic_store_explicit(&pool->sync.pub_gate, 0, memory_order_release);
+	spin_wait_relax(tpool_retired_pred, pool);
+
 	atomic_store_explicit(&pool->sync.in_job, 0, memory_order_relaxed);
 
 	pthread_mutex_unlock(&pool->pub_mtx);

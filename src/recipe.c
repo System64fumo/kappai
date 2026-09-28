@@ -908,6 +908,7 @@ static inline void backend_sync_rope(backend *t, backend *a) {
 typedef struct {
 	struct model *m;
 	backend		 *host;
+	backend		 *dev;
 	int			  total_ple;
 	int			  dim;
 	int			  n_embd_per_layer;
@@ -917,9 +918,10 @@ typedef struct {
 	float		  eps;
 } ple_build_plan;
 
-static void ple_build_plan_fill(ple_build_plan *p, struct model *m) {
+static void ple_build_plan_fill(ple_build_plan *p, struct model *m, backend *dev) {
 	p->m				= m;
-	p->host				= backend_host();
+	p->host				= NULL;
+	p->dev				= dev;
 	p->n_embd_per_layer = m->layer_dims.n_embd_per_layer;
 	p->n_layers			= m->n_layers;
 	p->total_ple		= p->n_embd_per_layer * p->n_layers;
@@ -942,10 +944,17 @@ static status_code ple_host_decode_row(const ple_build_plan *p, int token, float
 	size_t row_stride	= ggml_row_size(p->m->layer_dims.per_layer_tok_embd.type, p->total_ple);
 	const uint8_t *embd = (const uint8_t *)p->m->layer_dims.per_layer_tok_embd.host_ptr +
 						  ((size_t)token * row_stride);
-	if (!p->host || !p->host->dequant_row)
+	backend		  *dq	= (p->dev && p->dev->dequant_row) ? p->dev : NULL;
+	if (!dq) {
+		ple_build_plan *mp = (ple_build_plan *)p;
+		if (!mp->host)
+			mp->host = backend_host();
+		dq = mp->host;
+	}
+	if (!dq || !dq->dequant_row)
 		return ERR_UNSUPPORTED;
-	status_code st = p->host->dequant_row(p->host, p->m->layer_dims.per_layer_tok_embd.type, embd,
-										  p->total_ple, ple_row);
+	status_code st =
+		dq->dequant_row(dq, p->m->layer_dims.per_layer_tok_embd.type, embd, p->total_ple, ple_row);
 	if (st != OK)
 		return st;
 	for (int i = 0; i < p->total_ple; i++)
@@ -960,7 +969,10 @@ static void ple_host_project_row(const ple_build_plan *p, const float *inp_row, 
 }
 
 static void ple_host_finish(const ple_build_plan *p, float *ple, float *proj, int n_rows) {
-	backend *host	 = p->host;
+	ple_build_plan *mp = (ple_build_plan *)p;
+	if (!mp->host)
+		mp->host = backend_host();
+	backend *host	 = mp->host;
 	buffer proj_view = buffer_host_view(host, proj, (size_t)n_rows * p->total_ple * sizeof(float));
 	host->scale_inplace(host, &proj_view, p->inv_sqrt_ple, n_rows * p->total_ple);
 	buffer w_view = buffer_host_view(host, (void *)p->m->layer_dims.per_layer_proj_norm_w.host_ptr,
@@ -991,7 +1003,7 @@ static status_code op_ple_build(exec_ctx *ctx) {
 	profile_scope			ps;
 	status_code				st;
 	ple_build_plan			plan;
-	ple_build_plan_fill(&plan, m);
+	ple_build_plan_fill(&plan, m, a);
 	const int	total_ple	 = plan.total_ple;
 	const int	n_layers	 = plan.n_layers;
 	const int	ple_dim		 = plan.dim;
@@ -3688,7 +3700,7 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 	struct model  *m = ctx->m;
 	backend		  *a = exec_layer_backend(ctx);
 	ple_build_plan plan;
-	ple_build_plan_fill(&plan, m);
+	ple_build_plan_fill(&plan, m, a);
 	const int	total_ple = plan.total_ple;
 	const int	n_layers  = plan.n_layers;
 	const int	dim		  = plan.dim;

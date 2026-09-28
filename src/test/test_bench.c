@@ -52,10 +52,21 @@ static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, i
 
 	tensor_desc wd = {.host_data = weight_buf, .type = qt->type, .n_dims = 2, .dims = {k, n}};
 	buffer		w = {0}, xb = {0}, yb = {0};
-	b->buffer_alloc_weight(b, &wd, &w);
-	b->buffer_alloc_scratch(b, (size_t)k * (size_t)m * sizeof(float), &xb);
-	b->buffer_alloc_scratch(b, (size_t)n * (size_t)m * sizeof(float), &yb);
-	b->buffer_write_f32(b, &xb, x, k * m);
+	if (b->buffer_alloc_weight(b, &wd, &w) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)k * (size_t)m * sizeof(float), &xb) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)n * (size_t)m * sizeof(float), &yb) != OK ||
+		b->buffer_write_f32(b, &xb, x, k * m) != OK) {
+		fprintf(stderr, "  [bench setup failed for %s]\n", qt->name);
+		if (w.owner)
+			b->buffer_free(b, &w);
+		if (xb.owner)
+			b->buffer_free(b, &xb);
+		if (yb.owner)
+			b->buffer_free(b, &yb);
+		free(x);
+		free(weight_buf);
+		return 0.0;
+	}
 
 	for (int i = 0; i < 2; i++)
 		bench_mul_batch_once(b, &w, qt->type, &xb, &yb, n, k, m);
@@ -110,10 +121,18 @@ int run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_back
 
 	printf("\n=== matmul batch GFLOPS  N=%d K=%d  best-of-%d ----\n", n, k, iters);
 
-	int do_all = wants_all(argc, argv);
+	int do_all	   = wants_all(argc, argv);
+	int has_filter = do_all;
+	for (int ai = 1; !has_filter && ai < argc; ai++) {
+		if (argv[ai][0] == '-')
+			continue;
+		for (int bi = 0; bi < n_backends; bi++)
+			if (strcmp(argv[ai], infos[bi].name) == 0)
+				has_filter = 1;
+	}
 	for (int bi = 0; bi < n_backends; bi++) {
-		int want =
-			do_all || (infos[bi].caps & BCAP_IS_HOST) || matches_name(argc, argv, infos[bi].name);
+		int want = do_all || matches_name(argc, argv, infos[bi].name) ||
+				   (!has_filter && (infos[bi].caps & BCAP_IS_HOST));
 		if (!want)
 			continue;
 		if (!infos[bi].available) {

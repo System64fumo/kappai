@@ -677,19 +677,21 @@ static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *
 								  size_t row_len, size_t n_rows) {
 	if (*type == GGML_TYPE_F32)
 		return;
-	backend_report_host_fallback(dev, "weight_dequant", HFB_WEIGHT_TYPE,
-								 "weight type '%s' (type=%u) has no native device upload path; "
-								 "dequantized to f32 on host (cpu) before upload",
-								 ggml_type_name(*type), *type);
-	backend *host = backend_host();
-	if (!host || !host->dequant_row)
+	backend *dq = (backend *)dev;
+	if (!dq || !dq->dequant_row) {
+		backend_report_host_fallback(dev, "weight_dequant", HFB_WEIGHT_TYPE,
+									 "weight type '%s' (type=%u) has no native device upload path; "
+									 "dequantized to f32 on host (cpu) before upload",
+									 ggml_type_name(*type), *type);
+		dq = backend_host();
+	}
+	if (!dq || !dq->dequant_row)
 		return;
 	size_t		   row_bytes = ggml_row_size(*type, row_len);
 	float		  *f32_buf	 = xmalloc(n_rows * row_len * sizeof(float));
 	const uint8_t *src		 = *w;
 	for (size_t r = 0; r < n_rows; r++)
-		host->dequant_row(host, *type, src + (r * row_bytes), (int)row_len,
-						  f32_buf + (r * row_len));
+		dq->dequant_row(dq, *type, src + (r * row_bytes), (int)row_len, f32_buf + (r * row_len));
 	*w	  = f32_buf;
 	*type = GGML_TYPE_F32;
 }
