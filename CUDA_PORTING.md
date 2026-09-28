@@ -85,17 +85,22 @@ Remaining planned commits:
 
 ## Remaining CUDA-suite issues (fork test suite is newer/stricter than the dev tree)
 
-With the release suite fixed, `./build/test cuda` now runs but hits a class of
-**host-fallback paths in the CUDA backend that pass device buffers to the CPU
-backends** (which then dereference a device pointer):
+**Host-fallback staging — FIXED.** With the release suite fixed, `./build/test
+cuda` used to crash because several CUDA-backend fallbacks passed device
+buffers to the CPU reference (which dereferenced device pointers). Added
+`cuda_host_stage_in/out/buf` and routed every fallback through host scratch
+(`cuda_matmul`, `cuda_matmul_residual`, `cuda_op_matmul_ffn_down` x3,
+`cuda_op_matmul_batch`; `cuda_matmul_multi` already degrades to the staged
+`cuda_matmul`; `cuda_op_embd_lookup` fixed earlier). Result: **per-op CUDA
+suite runs to completion in release, 399/0/71** (was a segfault). No CPU/Vulkan
+edits.
 
-- FIXED: `cuda_op_embd_lookup` default branch (non-native quant; this also broke
-  Q4_K_M's Q6_K token embedding) — now stages the row through host memory.
-- TODO: same pattern in `cuda_op_matmul_ffn_down` (crash seen in
-  `cpu_ffn_down_act_chunk`), and likely `cuda_op_matmul`/`matmul_batch`/
-  `matmul_multi` host fallbacks for non-native quants (Q5_K/Q6_K/IQ*). Either
-  stage through host memory like the embed fix, or return `ERR_UNSUPPORTED` so
-  the suite SKIPs (production models with such tensors need the staging form).
+**Known-correctness gap (not a crash):** `gemma-4-E2B-it-Q4_K_M` (Q4_K/Q6_K
+tensors, all served by the staged fallback) now loads and runs on CUDA but
+produces empty/incorrect generation (immediate EOG). The per-op suite skips
+non-native matmul types, so this fallback path is not covered by tests — it
+needs its own differential validation. Q8_0/Q4_0 (the native path) remain
+byte-identical to CPU.
 
 ## Note on graph replay numerics
 
