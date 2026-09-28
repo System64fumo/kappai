@@ -9,6 +9,14 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
+static inline void *grow_avx_cache(void *old, size_t count, size_t item_size) {
+	if (count > SIZE_MAX / item_size)
+		oom_abort(SIZE_MAX);
+	void *p = xmalloc_aligned(count * item_size, 32);
+	free(old);
+	return p;
+}
+
 static inline __m128 loadu_f16x4_to_ps_128(const uint16_t *p) {
 	__m128i h = _mm_loadl_epi64((const __m128i *)(p));
 	return _mm_cvtph_ps(h);
@@ -3109,7 +3117,7 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				q_ymm_cache = xrealloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
+				q_ymm_cache = grow_avx_cache(q_ymm_cache, (size_t)n_bi_tiles, sizeof(*q_ymm_cache));
 				sc_cache	= xrealloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
 				d_w_cache	= xrealloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
@@ -3200,6 +3208,84 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	}
 }
 #undef NR
+
+void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								   int n, int k, int m) {
+	if (n <= 0 || m <= 0)
+		return;
+	if (m < 8) {
+		for (int t = 0; t < m; t++)
+			matmul_q4_k_r8_q8_k_qonly_f32_rows_range(w, xq + (size_t)t * xq_row_stride_blocks,
+													 y + (size_t)t * y_row_stride, 0, n, k);
+		return;
+	}
+	const int	  blocks_per_row = k / 256;
+	const __m256i mask			 = _mm256_set1_epi8(0x0f);
+
+	for (size_t row = 0; row < (size_t)n; row += Q4_K_R8_ROWS) {
+		const uint8_t *group = (const uint8_t *)w +
+							   (row / Q4_K_R8_ROWS) * (size_t)blocks_per_row * Q4_K_R8_GROUP_BYTES;
+		int rows = n - (int)row;
+		if (rows > Q4_K_R8_ROWS)
+			rows = Q4_K_R8_ROWS;
+
+		for (int t0 = 0; t0 < m;) {
+			int	  tile					= m - t0 < 8 ? m - t0 : 8;
+			float sums[8][Q4_K_R8_ROWS] = {{0}};
+			for (int bi = 0; bi < blocks_per_row; bi++) {
+				const uint8_t  *block = group + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+				const uint16_t *ds	  = (const uint16_t *)(block + Q4_K_R8_OFF_D);
+				const uint16_t *mins  = (const uint16_t *)(block + Q4_K_R8_OFF_DMIN);
+				__m256i			xlo[8][4], xhi[8][4];
+				int				bslo[8][4], bshi[8][4];
+				float			xd[8];
+				for (int c = 0; c < tile; c++) {
+					const q8_k_block *xb = xq + (size_t)(t0 + c) * xq_row_stride_blocks + bi;
+					xd[c]				 = xb->d;
+					for (int g = 0; g < 4; g++) {
+						xlo[c][g]  = _mm256_loadu_si256((const __m256i *)(xb->qs + g * 64));
+						xhi[c][g]  = _mm256_loadu_si256((const __m256i *)(xb->qs + g * 64 + 32));
+						bslo[c][g] = xb->bsums[g * 4] + xb->bsums[g * 4 + 1];
+						bshi[c][g] = xb->bsums[g * 4 + 2] + xb->bsums[g * 4 + 3];
+					}
+				}
+				for (int r = 0; r < rows; r++) {
+					const uint8_t *se = block + Q4_K_R8_OFF_SE + (size_t)r * 16;
+					const uint8_t *qs = block + Q4_K_R8_OFF_QS + (size_t)r * 128;
+					__m256i		   acc[8];
+					int32_t		   summ[8] = {0};
+					for (int c = 0; c < tile; c++)
+						acc[c] = _mm256_setzero_si256();
+					for (int g = 0; g < 4; g++) {
+						__m256i q		 = _mm256_loadu_si256((const __m256i *)(qs + g * 32));
+						__m256i lo		 = _mm256_and_si256(q, mask);
+						__m256i hi		 = _mm256_and_si256(_mm256_srli_epi16(q, 4), mask);
+						__m256i scale_lo = _mm256_set1_epi32(se[g * 4]);
+						__m256i scale_hi = _mm256_set1_epi32(se[g * 4 + 2]);
+						for (int c = 0; c < tile; c++) {
+							__m256i d0 = dotprod_u8_s8_i32(lo, xlo[c][g]);
+							__m256i d1 = dotprod_u8_s8_i32(hi, xhi[c][g]);
+							acc[c]	   = _mm256_add_epi32(
+								acc[c], _mm256_add_epi32(_mm256_mullo_epi32(d0, scale_lo),
+															 _mm256_mullo_epi32(d1, scale_hi)));
+							summ[c] += se[g * 4 + 1] * bslo[c][g] + se[g * 4 + 3] * bshi[c][g];
+						}
+					}
+					float d	   = f16_to_f32_fast(ds[r]);
+					float dmin = f16_to_f32_fast(mins[r]);
+					for (int c = 0; c < tile; c++)
+						sums[c][r] +=
+							xd[c] * (d * (float)vreduce_add_epi32(acc[c]) - dmin * (float)summ[c]);
+				}
+			}
+			for (int c = 0; c < tile; c++)
+				for (int r = 0; r < rows; r++)
+					y[(size_t)(t0 + c) * y_row_stride + row + r] = sums[c][r];
+			t0 += tile;
+		}
+	}
+}
 
 static inline void q4k_block_dot(const q4_k_block *b, const q8_k_block *xb, int32_t *sumi_out,
 								 int32_t *summ_out) {
@@ -3298,8 +3384,8 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				wlo_cache	 = xrealloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = xrealloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
+				wlo_cache	 = grow_avx_cache(wlo_cache, (size_t)n_bi_tiles, sizeof(*wlo_cache));
+				whi_cache	 = grow_avx_cache(whi_cache, (size_t)n_bi_tiles, sizeof(*whi_cache));
 				s_lo_cache	 = xrealloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
 				s_hi_cache	 = xrealloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
 				m_lo_cache	 = xrealloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
