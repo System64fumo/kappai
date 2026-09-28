@@ -129,3 +129,27 @@ byte-identical to CPU.
   see `RUN` notes above; ASan build is the reliable one (464/0/9).
 - Development tree (source of this port): Q8 pp500 PP ~362 / TG ~42,
   Q4 pp500 PP ~337 / TG ~42, teacher-force 115/116, suite 389/0.
+
+## Known differences vs the development tree (engine-level)
+
+The CUDA *backend* is at parity with the development tree (kernels byte-identical;
+`cuda.c` = dev + the staging/robustness fixes above; identical vtable). The fork's
+*engine* (cuda-wip lineage) does not use several fused ops the dev tree emits:
+
+- `rmsnorm_matmul_multi` (fused FFN norm+gate/up), `qkv_norm_rope` (fused Q/K/V
+  norm + RoPE), `rmsnorm_add_batch`, `matmul_multi_batch_resid`.
+
+Impact: decode is unaffected in practice (CUDA graphs replay the whole step as one
+launch), but **prefill is not graphed**, so the missing *batch* fusions cost PP.
+
+**Experiment (reverted):** wiring only the FFN `rmsnorm_matmul_multi` (a delegating
+handler: `rmsnorm` into XB, then the existing `MATMUL_MULTI` path) measured
+**PP 231 -> 269 (+17%)** on Q8_0/pp500. However it destabilised the engine
+(prefill hit bad cuBLAS GEMM params / invalid launch configs), because the dev
+tree's fusion relies on its full coalesced-run machinery and slot-mask/batch
+invariants, not just an extra op kind. A minimal handler is not sufficient.
+
+Recommendation: treat engine-fusion parity as a **dedicated, carefully validated
+effort** (port the dev tree's batch fusions + their mask/batchable/coalesce
+invariants together), not a bolt-on; the measured +17% PP on the FFN piece alone
+makes it worthwhile. Current fork state is the working, correct baseline.
