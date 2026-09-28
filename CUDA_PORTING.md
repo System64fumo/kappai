@@ -72,33 +72,38 @@ Remaining planned commits:
 
 ## Pre-existing bugs found (NOT introduced by this port)
 
-1. **`BUILD=release` `./build/test cpu` segfaults** — reproduced on pristine
-   `cuda-wip` (`45f5d98`) with zero CUDA code. Backtrace (LD_PRELOAD SIGSEGV
-   handler; no gdb on this box):
-
-   ```
-   libc(+0x45cb0)
-   libkappai.so(matmul_q4_k_q8_k_qonly_f32+0x1f6e)
-   libkappai.so(+0xa0d8c)   -> cpu matmul batch
-   libkappai.so(tpool_parallel_for+0x156)
-   ```
-
-   So the fault is in the x86_64 CPU Q4_K batch matmul kernel
-   (`src/backend/cpu/x86_64/quants.c`, MR/NR tiled `_qonly` variant), hit by
-   the arch self-test's generated Q4_K models. The faulting instruction
-   (`sym+0x1f6e`) is a scaled-byte load from a weight block pointer
-   (`movzbl 0xc(%rcx),%eax`), i.e. a bad/OOB block pointer in the
-   scale-extraction loop. It is **release-only**: ASan
-   (`release-rdbg`, the default build) passes 464/0/9, and
-   `-ftrivial-auto-var-init=zero` still crashes, so it is not simple
-   uninitialised stack. Likely an out-of-bounds access inside a large arena
-   allocation (which ASan does not redzone) or an alignment assumption that
-   ASan's heap layout happens to satisfy. **Same code lineage exists in the
-   development tree**, so this is not fork-specific. Needs a debugger (gdb
-   unavailable here) or an instrumented rebuild to close.
-
+1. **FIXED** — `BUILD=release` `./build/test cpu` segfaulted. Root cause: the
+   x86_64 Q4_K tiled matmul kept AVX scratch caches (`__m256i[MR][4]`) in
+   `realloc` memory (16-byte aligned) but GCC emits 32-byte aligned
+   `vmovdqa` stores → misaligned-access fault as soon as the tiled path ran
+   (m ≥ NR). ASan's allocator masked it. Fixed by allocating all 19 AVX
+   caches 64-byte aligned (`cache_alloc`, `x86_64/quants.c`). Release CPU
+   suite now runs: **464/0/9**; `--bench cpu` completes. (Same code lineage
+   exists in the development tree.)
 2. **Flaky test**: `arch.generate[glm-dsa] decode step 2` alternates pass/fail
    between identical runs of the same binary.
+
+## Remaining CUDA-suite issues (fork test suite is newer/stricter than the dev tree)
+
+With the release suite fixed, `./build/test cuda` now runs but hits a class of
+**host-fallback paths in the CUDA backend that pass device buffers to the CPU
+backends** (which then dereference a device pointer):
+
+- FIXED: `cuda_op_embd_lookup` default branch (non-native quant; this also broke
+  Q4_K_M's Q6_K token embedding) — now stages the row through host memory.
+- TODO: same pattern in `cuda_op_matmul_ffn_down` (crash seen in
+  `cpu_ffn_down_act_chunk`), and likely `cuda_op_matmul`/`matmul_batch`/
+  `matmul_multi` host fallbacks for non-native quants (Q5_K/Q6_K/IQ*). Either
+  stage through host memory like the embed fix, or return `ERR_UNSUPPORTED` so
+  the suite SKIPs (production models with such tensors need the staging form).
+
+## Note on graph replay numerics
+
+Greedy decode with graphs ON is deterministic and coherent, but can differ
+from the CPU reference by a thin-race flip in long generations (the documented
+dev-tree S28 cascade class: the captured/replayed op ordering yields ulp-level
+differences). With `KAPPAI_CUDA_GRAPH_DISABLE=1` the eager path is
+byte-identical to CPU.
 
 3. `make` (default target) fails on the `server` target when `microhttpd` is
    absent; `make cli test` is the working subset here.
