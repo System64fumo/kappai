@@ -591,7 +591,16 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 				monitor_emit_token(&c->monitor, i, tok, c->kv.n_pos - 1, piece, pn);
 		}
 		generated++;
-		float *logits_out = fast_argmax ? NULL : c->scratch.logits_host;
+		/* Sampled-graph mode: pass NULL logits so the forward is graph-
+		 * capturable (a sync readback inside would abort capture), then
+		 * refresh the host mirror explicitly below. Values are identical
+		 * to the in-forward readback (same device buffer, same sync).
+		 * Only when the backend has graph fns (CUDA); other backends
+		 * keep the legacy in-forward readback. fast_argmax keeps NULL
+		 * with device-side sampling (no host read needed). */
+		bool graph_sampled = !fast_argmax && c->backend && c->backend->graph_launch;
+		float *logits_out =
+			(fast_argmax || !graph_sampled) ? (fast_argmax ? NULL : c->scratch.logits_host) : NULL;
 		int	   rc		  = context_feed_token_inner(c, tok, logits_out);
 		if (rc == CTX_COMPUTE_ERROR) {
 			ERROR("decode aborted: GPU compute error at token %d (pos=%d)", i, c->kv.n_pos);
@@ -609,6 +618,22 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 			c->context_limit_hit = true;
 			*out_unfed_tail		 = true;
 			break;
+		}
+		if (graph_sampled && !fast_argmax) {
+			/* Forward skipped the readback (capture compatibility);
+			 * refresh explicitly for the next iteration's sampler.
+			 * Works whether this step replayed, ran eagerly, or fell
+			 * back (device logits buffer is valid in all cases). */
+			status_code rst = c->backend->buffer_read_f32(
+				c->backend, &c->scratch.slots[RECIPE_SLOT_LOGITS], c->scratch.logits_host,
+				c->m.vocab_size);
+			if (rst != OK) {
+				ERROR("decode aborted: logits readback failed at token %d (pos=%d)", i,
+					  c->kv.n_pos);
+				c->session_poisoned = true;
+				*out_unfed_tail		= true;
+				break;
+			}
 		}
 		has_fed_tok	 = true;
 		last_fed_tok = tok;
