@@ -820,9 +820,14 @@ void run_repack_target_batch_tests(backend *tgt) {
 		return;
 	test_repack_q4_k_r8_qonly_tail(tgt);
 	const int shapes[][3] = {
-		{8, 256, 1}, {24, 512, 7}, {24, 512, 8}, {24, 512, 9}, {64, 2048, 16},
+		{8, 256, 1}, {24, 256, 8}, {24, 512, 7}, {24, 512, 8}, {24, 512, 9}, {64, 2048, 16},
 	};
 	for (int s = 0; s < N_REPACK_SPECS; s++) {
+		if (strcmp(tgt->name, "cpu_x86_64") == 0 && REPACK_SPECS[s].rtype == GGML_TYPE_Q6_K_R8) {
+			test_repack_backend_batch_parity(tgt, &REPACK_SPECS[s], 64, 256, 16);
+			test_repack_backend_batch_parity(tgt, &REPACK_SPECS[s], 64, 512, 16);
+			test_repack_backend_batch_parity(tgt, &REPACK_SPECS[s], 64, 2048, 16);
+		}
 		if (REPACK_SPECS[s].rtype != GGML_TYPE_Q4_K_R8)
 			continue;
 		for (size_t i = 0; i < ARRAY_LEN(shapes); i++)
