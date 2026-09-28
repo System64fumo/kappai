@@ -85,7 +85,10 @@ Remaining planned commits:
 
    So the fault is in the x86_64 CPU Q4_K batch matmul kernel
    (`src/backend/cpu/x86_64/quants.c`, MR/NR tiled `_qonly` variant), hit by
-   the arch self-test's generated Q4_K models. It is **release-only**: ASan
+   the arch self-test's generated Q4_K models. The faulting instruction
+   (`sym+0x1f6e`) is a scaled-byte load from a weight block pointer
+   (`movzbl 0xc(%rcx),%eax`), i.e. a bad/OOB block pointer in the
+   scale-extraction loop. It is **release-only**: ASan
    (`release-rdbg`, the default build) passes 464/0/9, and
    `-ftrivial-auto-var-init=zero` still crashes, so it is not simple
    uninitialised stack. Likely an out-of-bounds access inside a large arena
