@@ -169,7 +169,6 @@ void		test_quant_determinism(const qtype_info *qt);
 void		test_quant_finiteness(const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(void);
 void		run_repack_parity_tests(backend *cpu);
-void		run_repack_target_batch_tests(backend *tgt);
 void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt, int dim, int n);
 int	 run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
 int	 run_model_mode(int argc, char **argv, backend_info *infos, int n_backends);

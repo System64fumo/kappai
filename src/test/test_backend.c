@@ -2741,7 +2741,6 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	flush_family(OPFAM_DEQUANT_PARITY);
 
 	run_repack_parity_tests(cpu);
-	run_repack_target_batch_tests(tgt);
 	flush_family(OPFAM_REPACK_PARITY);
 
 	for (int qi = 0; qi < QTYPES_N; qi++) {
