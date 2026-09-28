@@ -31,22 +31,19 @@ produces correct output** for gemma4-E2B (Q8_0 and Q4_0): coherent responses
 and **byte-identical greedy output vs the CPU backend** (60 tokens, both
 quants, `-t 0.0 -s 42`). `--warmup 0` no longer crashes.
 
-Remaining host/device assumptions that are **latent** for gemma4-E2B (dense)
-but will break MoE / fused-activate recipes: `op_moe_experts`,
-`op_moe_shared`, `op_moe_router_batch` use `batch_buf_ptr()` in host loops.
-Port those before targeting a MoE model.
+**MoE paths:** diffed `op_moe_experts`, `op_moe_shared`, `moe_router_batch`,
+`moe_weight_view`, `moe_experts_batch` against the development tree — they are
+byte-identical, so there is nothing to port; MoE device support is exactly the
+same as in the dev tree (and untested here, no MoE model available).
 
 Still to port from the development tree for full parity:
 
-1. **CUDA-graph replay — now working (default ON).** The state machine +
-   `recipe_ple_fill_host` are ported, and the capture-illegal calls are
-   fixed: KV-shared K→V copy now prefers `copy_buffer_async`, and the PLE
-   projection slice copy uses an async `copy_2d` (was a sync
-   `compute_copy_buffer_cross`). Capture completes (**902 nodes**,
-   866 kernel / 36 memcpy) and replays; greedy output stays byte-identical
-   to CPU. TG 41 -> **68** (short prompt); sampled decode still runs eager
-   (no sampled-graph glue here yet, so it does not arm graphs).
-   `KAPPAI_CUDA_GRAPH_DISABLE=1` force-disables.
+1. **CUDA-graph replay — working (default ON).** The state machine +
+   `recipe_ple_fill_host` are ported, capture-illegal calls fixed (async
+   KV-shared copy, async PLE slice copy), and the **sampled-path glue** is
+   ported too (NULL logits + explicit host readback). Greedy AND sampled
+   decode now replay the captured graph: TG ~41 -> 67 (short prompt).
+   Capture completes (902 nodes). `KAPPAI_CUDA_GRAPH_DISABLE=1` disables.
 2. **`--gemv` decode-GEMV rig** — ported (`test_bench.c` + dispatch + usage).
    Run: `./build/test --gemv cuda`. It runs before the arch self-test, so it
    works even in `BUILD=release` (whose `./build/test` still segfaults — item 3).
