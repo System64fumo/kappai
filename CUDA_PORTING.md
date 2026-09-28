@@ -26,23 +26,25 @@ ported the device-scratch paths (`ple_proj_gpu`, `ple_inp_dev`,
 `ple_slice_dev`, `ple_norm_batch`), keeping the original host path for
 CPU/Vulkan (gated on `BCAP_IS_HOST` / op presence) so neither is affected.
 
-**Result:** the model loads and the batch prefill path now runs without the
-`-5` failure.
+**Result:** the model loads, batch prefill runs, and **CUDA generation now
+produces correct output** for gemma4-E2B (Q8_0 and Q4_0): coherent responses
+and **byte-identical greedy output vs the CPU backend** (60 tokens, both
+quants, `-t 0.0 -s 42`). `--warmup 0` no longer crashes.
 
-**Still open:** generation is not yet correct/working under CUDA —
-- with warmup on, the turn produces no tokens (immediate EOG, no error);
-- with `--warmup 0`, prefill segfaults partway (e.g. `(0/21)`).
+Remaining host/device assumptions that are **latent** for gemma4-E2B (dense)
+but will break MoE / fused-activate recipes: `op_moe_experts`,
+`op_moe_shared`, `op_moe_router_batch` use `batch_buf_ptr()` in host loops.
+Port those before targeting a MoE model.
 
-Next suspects: the single-token (m=1) decode ops, the readback/sampler glue,
-and remaining host/device buffer assumptions in `compute.c`/`context.c` on
-this tree. The `--gemv`/differential harnesses from the development tree are
-not yet ported, so this is currently debugged by inspection + CLI runs.
+Still to port from the development tree for full parity:
 
-Remaining planned commits:
-
-1. `compute.c`/`context.c`: graph replay + sampled-path glue.
-2. `test_bench.c`: `--gemv` decode-GEMV rig + CUDA test cases.
-3. Debug the decode/generation path above.
+1. `compute.c`/`context.c`: CUDA-graph replay + sampled-path glue
+   (the fork currently runs eager decode; correct but slower).
+2. `test_bench.c`: `--gemv` decode-GEMV rig + CUDA test cases, for the
+   differential/performance harnesses.
+3. Note: the fork's `BUILD=release` `./build/test` segfault (pre-existing,
+   CUDA-independent) still blocks running the suite in release mode; use the
+   default ASan build for CPU/Vulkan suites, and e2e runs for CUDA.
 
 Remaining planned commits:
 

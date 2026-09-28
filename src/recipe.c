@@ -1422,23 +1422,45 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 	status_code	  st;
 	int			  n = ctx->op->u.ffn_act.n;
 	if (exec_is_batch(ctx)) {
-		int			 act		  = ctx->op->u.ffn_act.activation;
-		const float *fused		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
-		float		*out		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
-		const int	 fused_stride = 2 * n;
-		for (int row = 0; row < ctx->n_rows; row++) {
-			const float *g = fused + (size_t)row * fused_stride;
-			const float *u = g + n;
-			float		*o = out + (size_t)row * n;
-			if (act == ACTIVATION_GELU) {
-				for (int i = 0; i < n; i++)
-					o[i] = gelu_tanh(g[i]) * u[i];
-			} else {
-				for (int i = 0; i < n; i++)
-					o[i] = silu(g[i]) * u[i];
+		int act = ctx->op->u.ffn_act.activation;
+		if (!backend_has_cap(a, BCAP_IS_HOST) && (a->ffn_activate_ex || a->ffn_activate)) {
+			/* Device-resident batch buffers have no valid host pointer
+			 * (batch_buf_ptr would be a device address). Split each fused
+			 * [gate|up] row into views and run the native per-row op. */
+			buffer *fused_b = batch_slot(ctx->bs, ctx->op->in[0]);
+			buffer *out_b	= batch_slot(ctx->bs, ctx->op->out);
+			st				= OK;
+			for (int row = 0; row < ctx->n_rows && st == OK; row++) {
+				buffer fr = batch_row_view(fused_b, row, 2 * n);
+				buffer g  = buffer_slice(&fr, 0, (size_t)n * sizeof(float));
+				buffer u  = buffer_slice(&fr, (size_t)n * sizeof(float),
+										 (size_t)n * sizeof(float));
+				buffer o  = batch_row_view(out_b, row, n);
+				if (a->ffn_activate_ex)
+					st = a->ffn_activate_ex(a, &g, &u, &o, n, act);
+				else if (act == ACTIVATION_SILU)
+					st = a->ffn_activate(a, &g, &u, &o, n);
+				else
+					st = ERR_UNSUPPORTED;
 			}
+		} else {
+			const float *fused		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
+			float		*out		  = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
+			const int	 fused_stride = 2 * n;
+			for (int row = 0; row < ctx->n_rows; row++) {
+				const float *g = fused + (size_t)row * fused_stride;
+				const float *u = g + n;
+				float		*o = out + (size_t)row * n;
+				if (act == ACTIVATION_GELU) {
+					for (int i = 0; i < n; i++)
+						o[i] = gelu_tanh(g[i]) * u[i];
+				} else {
+					for (int i = 0; i < n; i++)
+						o[i] = silu(g[i]) * u[i];
+				}
+			}
+			st = OK;
 		}
-		st = OK;
 	} else {
 		backend *t	   = OP_BACKEND(ffn_activate);
 		buffer	*slots = exec_slots(ctx);
@@ -4570,10 +4592,23 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 			if (st != OK)
 				goto done;
 			if (m->arch_info->has_scale_embeddings) {
-				float  scale = m->dim_sqrt;
-				float *xf	 = batch_buf_ptr(&xrow);
-				for (int i = 0; i < dim; i++)
-					xf[i] *= scale;
+				float scale = m->dim_sqrt;
+				if (!backend_has_cap(a, BCAP_IS_HOST) && a->scale_inplace) {
+					/* Device-resident batch buffer: scale on GPU
+					 * (batch_buf_ptr would be a device address). */
+					buffer sxrow = xrow;
+					sxrow.host_ptr = NULL; /* skip per-row D2H; device is truth */
+					st = a->scale_inplace(a, &sxrow, scale, dim);
+					if (st != OK)
+						goto done;
+				} else if (backend_has_cap(a, BCAP_IS_HOST)) {
+					float *xf = batch_buf_ptr(&xrow);
+					for (int i = 0; i < dim; i++)
+						xf[i] *= scale;
+				} else {
+					st = ERR_UNSUPPORTED;
+					goto done;
+				}
 			}
 		}
 	}
@@ -4646,11 +4681,19 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	{
 		buffer	 last_x	 = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, n_tokens - 1, dim);
 		backend *owner_x = s->slots[RECIPE_SLOT_X].owner;
-		float	*tmp	 = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
-		memcpy(tmp, batch_buf_ptr(&last_x), (size_t)dim * sizeof(float));
-		st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
-		if (st != OK)
-			goto done;
+		if (!backend_has_cap(a, BCAP_IS_HOST) && a->copy_buffer) {
+			/* Device-resident batch buffer: device-to-device copy
+			 * (batch_buf_ptr would be a device address). */
+			st = a->copy_buffer(a, &last_x, &s->slots[RECIPE_SLOT_X], dim);
+			if (st != OK)
+				goto done;
+		} else {
+			float *tmp = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
+			memcpy(tmp, batch_buf_ptr(&last_x), (size_t)dim * sizeof(float));
+			st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
+			if (st != OK)
+				goto done;
+		}
 
 		for (int i = 0; i < r->n_post_ops; i++) {
 			st = exec_op(&r->post_ops[i], m, cache, s, tokens[n_tokens - 1],
