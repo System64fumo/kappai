@@ -765,6 +765,36 @@ static void *cuda_dev_ptr(const buffer *b) {
     return (char *)b->handle + b->offset;
 }
 
+/* Host-fallback staging (S32): CUDA-owned weights/activations have no valid
+ * host mirror, so the CPU reference cannot read them directly (it would
+ * dereference a device pointer). Stage device->host, run the host op, stage
+ * the result back. Used only on the unsupported-quant fallback paths. */
+static void *cuda_host_stage_in(const buffer *b, size_t bytes) {
+    void *h = malloc(bytes ? bytes : 1);
+    if (!h) return NULL;
+    if (cudaMemcpy(h, cuda_dev_ptr((buffer *)b), bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        free(h);
+        return NULL;
+    }
+    return h;
+}
+
+static status_code cuda_host_stage_out(buffer *b, const void *h, size_t bytes) {
+    if (cudaMemcpy(cuda_dev_ptr(b), h, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+        return ERR_OUT_OF_MEMORY;
+    if (b->host_ptr) memcpy((void *)b->host_ptr, h, bytes);
+    return OK;
+}
+
+static buffer cuda_host_buf(void *p, size_t bytes, backend *owner) {
+    buffer b = {0};
+    b.handle   = p;
+    b.host_ptr = p;
+    b.size     = bytes;
+    b.owner    = owner;
+    return b;
+}
+
 static status_code cuda_copy_buffer(backend *self, const buffer *src, buffer *dst, int n) {
     (void)self;
     if (cudaMemcpy(cuda_dev_ptr(dst), cuda_dev_ptr(src), (size_t)n * sizeof(float),
@@ -924,15 +954,21 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
     if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul) {
-            status_code st = host->matmul(host, w, w_type, x, y, n, k);
-            if (st != OK) return st;
-            /* Host wrote y->host_ptr; refresh device mirror for downstream CUDA ops. */
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
+            void  *wh = cuda_host_stage_in(w, wb);
+            void  *xh = cuda_host_stage_in(x, xb);
+            void  *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && xh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer xhb = cuda_host_buf(xh, xb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul(host, &whb, w_type, &xhb, &yhb, n, k);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
             }
-            return OK;
+            free(wh); free(xh); free(yh);
+            return st;
         }
         return ERR_UNSUPPORTED;
     }
@@ -1023,15 +1059,23 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
     if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul_residual) {
-            status_code st = host->matmul_residual(host, w, w_type, x, residual, y, n, k);
-            if (st != OK) return st;
-            /* Host wrote y->host_ptr; refresh device mirror for downstream CUDA ops. */
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
+            void  *wh = cuda_host_stage_in(w, wb);
+            void  *xh = cuda_host_stage_in(x, xb);
+            void  *rh = cuda_host_stage_in(residual, yb);
+            void  *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && xh && rh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer xhb = cuda_host_buf(xh, xb, host);
+                buffer rhb = cuda_host_buf(rh, yb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul_residual(host, &whb, w_type, &xhb, &rhb, &yhb, n, k);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
             }
-            return OK;
+            free(wh); free(xh); free(rh); free(yh);
+            return st;
         }
         return ERR_UNSUPPORTED;
     }
@@ -1089,14 +1133,24 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            status_code st = host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
-            if (st != OK) return st;
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            void  *wh = cuda_host_stage_in(w, wb);
+            void  *gh = cuda_host_stage_in(gate, fb);
+            void  *uh = cuda_host_stage_in(up, fb);
+            void  *yh = malloc(fb ? fb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, fb, host);
+                buffer uhb = cuda_host_buf(uh, fb, host);
+                buffer yhb = cuda_host_buf(yh, fb, host);
+                st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                           activation);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, fb);
             }
-            return OK;
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
         }
         return ERR_UNSUPPORTED;
     }
@@ -1105,28 +1159,48 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         /* Exotic quant (Q4_K/Q6_K/...): host fallback + device refresh. */
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            status_code st = host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
-            if (st != OK) return st;
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            void  *wh = cuda_host_stage_in(w, wb);
+            void  *gh = cuda_host_stage_in(gate, fb);
+            void  *uh = cuda_host_stage_in(up, fb);
+            void  *yh = malloc(fb ? fb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, fb, host);
+                buffer uhb = cuda_host_buf(uh, fb, host);
+                buffer yhb = cuda_host_buf(yh, fb, host);
+                st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                           activation);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, fb);
             }
-            return OK;
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
         }
         return ERR_UNSUPPORTED;
     }
     if (!cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            status_code st = host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
-            if (st != OK) return st;
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            void  *wh = cuda_host_stage_in(w, wb);
+            void  *gh = cuda_host_stage_in(gate, fb);
+            void  *uh = cuda_host_stage_in(up, fb);
+            void  *yh = malloc(fb ? fb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, fb, host);
+                buffer uhb = cuda_host_buf(uh, fb, host);
+                buffer yhb = cuda_host_buf(yh, fb, host);
+                st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                           activation);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, fb);
             }
-            return OK;
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
         }
         return ERR_UNSUPPORTED;
     }
@@ -2785,30 +2859,26 @@ static status_code cuda_op_rmsnorm_batch(backend *self, const buffer *x, const b
 static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
                                           const buffer *x, buffer *y, int n, int k, int m) {
     if (!cuda_matmul_type_native(self, w_type)) {
-        /* Exotic quant: host fallback per row with offset-adjusted host views
-         * (cpu_ptr ignores offsets on CUDA-owned buffers, so rebase them). */
+        /* Exotic quant: host fallback (staged device->host, since CUDA-owned
+         * buffers have no valid host mirror). */
         backend *host = backend_host();
-        if (!host || !host->matmul) return ERR_UNSUPPORTED;
-        for (int r = 0; r < m; r++) {
-            buffer xh = *x;
-            buffer yh = *y;
-            xh.handle = NULL;
-            yh.handle = NULL;
-            xh.host_ptr = x->host_ptr ? (const char *)x->host_ptr + (size_t)r * k * sizeof(float) : NULL;
-            yh.host_ptr = y->host_ptr ? (char *)y->host_ptr + (size_t)r * n * sizeof(float) : NULL;
-            xh.offset = 0;
-            yh.offset = 0;
-            xh.owner = host;
-            yh.owner = host;
-            status_code st = host->matmul(host, w, w_type, &xh, &yh, n, k);
-            if (st != OK) return st;
+        if (!host || !host->matmul_batch) return ERR_UNSUPPORTED;
+        size_t wb = w->size, xb = (size_t)m * (size_t)k * sizeof(float),
+               yb = (size_t)m * (size_t)n * sizeof(float);
+        void *wh = cuda_host_stage_in(w, wb);
+        void *xh = cuda_host_stage_in(x, xb);
+        void *yh = malloc(yb ? yb : 1);
+        status_code st = ERR_OUT_OF_MEMORY;
+        if (wh && xh && yh) {
+            buffer whb = cuda_host_buf(wh, wb, host);
+            buffer xhb = cuda_host_buf(xh, xb, host);
+            buffer yhb = cuda_host_buf(yh, yb, host);
+            st = host->matmul_batch(host, &whb, w_type, &xhb, &yhb, n, k, m);
+            if (st == OK)
+                st = cuda_host_stage_out(y, yh, yb);
         }
-        if (y->host_ptr) {
-            if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr, (size_t)m * (size_t)n * sizeof(float),
-                           cudaMemcpyHostToDevice) != cudaSuccess)
-                return ERR_OUT_OF_MEMORY;
-        }
-        return OK;
+        free(wh); free(xh); free(yh);
+        return st;
     }
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
@@ -2860,30 +2930,27 @@ static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t
             cuda_matmul_batch_bf16((const uint16_t *)w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         default: {
-            /* Non-native (Q5_K/Q6_K/...): host fallback per row. */
+            /* Non-native (Q5_K/Q6_K/...): host fallback, staged through host
+             * memory (CUDA-owned buffers are not host-readable). */
             backend *host = backend_host();
-            if (!host || !host->matmul_batch) {
-                for (int r = 0; r < m; r++) {
-                    buffer xrow = *x;
-                    buffer yrow = *y;
-                    xrow.offset += (size_t)r * (size_t)k * sizeof(float);
-                    yrow.offset += (size_t)r * (size_t)n * sizeof(float);
-                    xrow.host_ptr = NULL;
-                    yrow.host_ptr = NULL;
-                    status_code st = cuda_matmul(self, w, w_type, &xrow, &yrow, n, k);
-                    if (st != OK) return st;
-                }
-                break;
+            if (!host || !host->matmul_batch)
+                return ERR_UNSUPPORTED;
+            size_t wb = w->size, xb = (size_t)m * (size_t)k * sizeof(float),
+                   yb = (size_t)m * (size_t)n * sizeof(float);
+            void *wh = cuda_host_stage_in(w, wb);
+            void *xh = cuda_host_stage_in(x, xb);
+            void *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && xh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer xhb = cuda_host_buf(xh, xb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul_batch(host, &whb, w_type, &xhb, &yhb, n, k, m);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
             }
-            status_code st = host->matmul_batch(host, w, w_type, x, y, n, k, m);
-            if (st != OK) return st;
-            if (y->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(y), y->host_ptr,
-                               (size_t)m * (size_t)n * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
-            }
-            return OK;
+            free(wh); free(xh); free(yh);
+            return st;
         }
     }
     }
