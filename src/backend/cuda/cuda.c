@@ -1133,21 +1133,22 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            size_t wb = w->size, gb = (size_t)k * sizeof(float),
+                   yb = (size_t)n * sizeof(float);
             void  *wh = cuda_host_stage_in(w, wb);
-            void  *gh = cuda_host_stage_in(gate, fb);
-            void  *uh = cuda_host_stage_in(up, fb);
-            void  *yh = malloc(fb ? fb : 1);
+            void  *gh = cuda_host_stage_in(gate, gb);
+            void  *uh = cuda_host_stage_in(up, gb);
+            void  *yh = malloc(yb ? yb : 1);
             status_code st = ERR_OUT_OF_MEMORY;
             if (wh && gh && uh && yh) {
                 buffer whb = cuda_host_buf(wh, wb, host);
-                buffer ghb = cuda_host_buf(gh, fb, host);
-                buffer uhb = cuda_host_buf(uh, fb, host);
-                buffer yhb = cuda_host_buf(yh, fb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
                 st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
                                            activation);
                 if (st == OK)
-                    st = cuda_host_stage_out(y, yh, fb);
+                    st = cuda_host_stage_out(y, yh, yb);
             }
             free(wh); free(gh); free(uh); free(yh);
             return st;
@@ -1159,21 +1160,22 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         /* Exotic quant (Q4_K/Q6_K/...): host fallback + device refresh. */
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            size_t wb = w->size, gb = (size_t)k * sizeof(float),
+                   yb = (size_t)n * sizeof(float);
             void  *wh = cuda_host_stage_in(w, wb);
-            void  *gh = cuda_host_stage_in(gate, fb);
-            void  *uh = cuda_host_stage_in(up, fb);
-            void  *yh = malloc(fb ? fb : 1);
+            void  *gh = cuda_host_stage_in(gate, gb);
+            void  *uh = cuda_host_stage_in(up, gb);
+            void  *yh = malloc(yb ? yb : 1);
             status_code st = ERR_OUT_OF_MEMORY;
             if (wh && gh && uh && yh) {
                 buffer whb = cuda_host_buf(wh, wb, host);
-                buffer ghb = cuda_host_buf(gh, fb, host);
-                buffer uhb = cuda_host_buf(uh, fb, host);
-                buffer yhb = cuda_host_buf(yh, fb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
                 st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
                                            activation);
                 if (st == OK)
-                    st = cuda_host_stage_out(y, yh, fb);
+                    st = cuda_host_stage_out(y, yh, yb);
             }
             free(wh); free(gh); free(uh); free(yh);
             return st;
@@ -1183,21 +1185,22 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     if (!cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
-            size_t wb = w->size, fb = (size_t)n * sizeof(float);
+            size_t wb = w->size, gb = (size_t)k * sizeof(float),
+                   yb = (size_t)n * sizeof(float);
             void  *wh = cuda_host_stage_in(w, wb);
-            void  *gh = cuda_host_stage_in(gate, fb);
-            void  *uh = cuda_host_stage_in(up, fb);
-            void  *yh = malloc(fb ? fb : 1);
+            void  *gh = cuda_host_stage_in(gate, gb);
+            void  *uh = cuda_host_stage_in(up, gb);
+            void  *yh = malloc(yb ? yb : 1);
             status_code st = ERR_OUT_OF_MEMORY;
             if (wh && gh && uh && yh) {
                 buffer whb = cuda_host_buf(wh, wb, host);
-                buffer ghb = cuda_host_buf(gh, fb, host);
-                buffer uhb = cuda_host_buf(uh, fb, host);
-                buffer yhb = cuda_host_buf(yh, fb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
                 st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
                                            activation);
                 if (st == OK)
-                    st = cuda_host_stage_out(y, yh, fb);
+                    st = cuda_host_stage_out(y, yh, yb);
             }
             free(wh); free(gh); free(uh); free(yh);
             return st;
