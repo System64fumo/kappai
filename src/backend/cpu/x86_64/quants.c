@@ -9,6 +9,14 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
+static inline void *grow_avx_cache(void *old, size_t count, size_t item_size) {
+	if (count > SIZE_MAX / item_size)
+		oom_abort(SIZE_MAX);
+	void *p = xmalloc_aligned(count * item_size, 32);
+	free(old);
+	return p;
+}
+
 static inline __m128 loadu_f16x4_to_ps_128(const uint16_t *p) {
 	__m128i h = _mm_loadl_epi64((const __m128i *)(p));
 	return _mm_cvtph_ps(h);
@@ -3109,7 +3117,7 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				q_ymm_cache = xrealloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
+				q_ymm_cache = grow_avx_cache(q_ymm_cache, (size_t)n_bi_tiles, sizeof(*q_ymm_cache));
 				sc_cache	= xrealloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
 				d_w_cache	= xrealloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
@@ -3298,8 +3306,8 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				wlo_cache	 = xrealloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = xrealloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
+				wlo_cache	 = grow_avx_cache(wlo_cache, (size_t)n_bi_tiles, sizeof(*wlo_cache));
+				whi_cache	 = grow_avx_cache(whi_cache, (size_t)n_bi_tiles, sizeof(*whi_cache));
 				s_lo_cache	 = xrealloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
 				s_hi_cache	 = xrealloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
 				m_lo_cache	 = xrealloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
