@@ -2686,25 +2686,50 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
                                       (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         default: {
-            /* Rare quant types (Q5_K, IQ*, ...): delegate to host
-             * backend, then refresh the device mirror. Embedding lookup
-             * runs once per token so host fallback cost is negligible. */
+            /* Rare quant types (Q5_K/Q6_K/IQ*, ...): the host reference
+             * dequantizes from host memory, but CUDA-owned weights have no
+             * host mirror - passing the device pointer made the host dequant
+             * read device memory (illegal access; this is what silently broke
+             * Q4_K_M's Q6_K token embedding). Stage the one row (and the
+             * output) through host memory. Runs once per token. */
             if (priv->graph_kernels)
                 return ERR_UNSUPPORTED; /* sync fallback: abort capture */
             backend *host = backend_host();
             if (!host || !host->embd_lookup)
                 return ERR_UNSUPPORTED;
-            status_code st = host->embd_lookup(host, tok_embd, tok_embd_type,
-                                               token, dim, x_out);
-            if (st != OK)
-                return st;
-            if (x_out->host_ptr) {
-                if (cudaMemcpy(cuda_dev_ptr(x_out), x_out->host_ptr,
-                               (size_t)dim * sizeof(float),
-                               cudaMemcpyHostToDevice) != cudaSuccess)
-                    return ERR_OUT_OF_MEMORY;
+            size_t row_bytes = ggml_row_size(tok_embd_type, (size_t)dim);
+            if (row_bytes == 0)
+                return ERR_UNSUPPORTED;
+            void *row_host = malloc(row_bytes);
+            float *out_host = malloc((size_t)dim * sizeof(float));
+            if (!row_host || !out_host) {
+                free(row_host);
+                free(out_host);
+                return ERR_OUT_OF_MEMORY;
             }
-            return OK;
+            const void *src =
+                (const char *)cuda_dev_ptr((buffer *)tok_embd) + (size_t)token * row_bytes;
+            if (cudaMemcpy(row_host, src, row_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                free(row_host);
+                free(out_host);
+                return ERR_OUT_OF_MEMORY;
+            }
+            buffer hb = {0}, ob = {0};
+            hb.handle = hb.host_ptr = row_host;
+            hb.size	  = row_bytes;
+            hb.owner  = host;
+            ob.handle = ob.host_ptr = out_host;
+            ob.size	  = (size_t)dim * sizeof(float);
+            ob.owner  = host;
+            status_code st = host->embd_lookup(host, &hb, tok_embd_type, 0, dim, &ob);
+            if (st == OK) {
+                if (cudaMemcpy(cuda_dev_ptr(x_out), out_host, (size_t)dim * sizeof(float),
+                               cudaMemcpyHostToDevice) != cudaSuccess)
+                    st = ERR_OUT_OF_MEMORY;
+            }
+            free(row_host);
+            free(out_host);
+            return st;
         }
     }
 
