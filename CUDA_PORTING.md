@@ -47,12 +47,19 @@ Still to port from the development tree for full parity:
    `cudaMemcpy`/`cudaMalloc`) the way the dev tree does — several async
    variants (`buffer_write_async`, `copy_buffer_async`) exist in the ported
    backend and the PLE upload already uses the async form.
-2. `test_bench.c`: `--gemv` decode-GEMV rig + CUDA test cases, for the
-   differential/performance harnesses.
+2. **`--gemv` decode-GEMV rig** — ported (`test_bench.c` + dispatch + usage).
+   Run: `./build/test --gemv cuda`. It runs before the arch self-test, so it
+   works even in `BUILD=release` (whose `./build/test` still segfaults — item 3).
+   Porting it required a small build fix: `compute.c` now provides no-op stubs
+   for the `cuda_graph_dbg_*` helpers in non-CUDA builds (they are CUDA-only;
+   this also fixes the pre-existing CPU-only `make test` link failure).
+
+   Fork `--gemv cuda` results (short-prompt machine, ~same as dev tree):
+   `ffn-up-6k 138.7us/72GB/s`, `logits 1304.9us/328GB/s`, FFN+logits ~14.4ms.
 3. Note: the fork's `BUILD=release` `./build/test` segfault (pre-existing,
    CUDA-independent) still blocks the per-op suite in release mode; use the
-   default ASan build for CPU/Vulkan suites, and e2e runs (or `--gemv`, which
-   runs before the self-test) for CUDA.
+   default ASan build for CPU/Vulkan suites (464/0/9), and e2e runs or
+   `--gemv` for CUDA.
 
 Remaining planned commits:
 

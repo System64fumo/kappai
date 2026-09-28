@@ -5,6 +5,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef BACKEND_CUDA
+/* The CUDA-graph debug helpers are only defined by the CUDA backend. All
+ * call sites are env-gated debug paths; provide no-op stubs so CPU/Vulkan-only
+ * builds link cleanly (they are never invoked there). */
+int cuda_graph_dbg_peek(backend *b, int *p0, int *p1, int *p2) {
+	(void)b; (void)p0; (void)p1; (void)p2; return -1;
+}
+int cuda_graph_dbg_capquery(backend *b) { (void)b; return -1; }
+int cuda_graph_dbg_togglex(backend *b, void *slotbuf, int on) {
+	(void)b; (void)slotbuf; (void)on; return -1;
+}
+int cuda_graph_dbg_snap(backend *b, void *slots, const char *path, int pos) {
+	(void)b; (void)slots; (void)path; (void)pos; return -1;
+}
+int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4) {
+	(void)b; (void)slotbuf; (void)out4; return -1;
+}
+int cuda_graph_dbg_lasterr(void) { return -1; }
+#endif
+
 void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
 }

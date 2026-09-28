@@ -755,6 +755,7 @@ void usage(const char *prog) {
 			"Usage:\n"
 			"  %s [--all | <backend>...]         per-op + combined-op validation vs CPU\n"
 			"  %s --bench [--all | <backend>]   per-quant matmul GFLOPS per backend\n"
+			"  %s --gemv [--all | <backend>]    decode-GEMV us/GB-s at prod shapes\n"
 			"  %s --model <path> [--all | <b>...]  real-model greedy-decode cross-check\n"
 			"\n"
 			"Modes:\n"
@@ -765,6 +766,7 @@ void usage(const char *prog) {
 			"               catches compounding errors across op chains; CPU errors or\n"
 			"               NaN/Inf at any step are always reported as a failure\n"
 			"  --bench      per-quant matmul GFLOPS, every M row count, each backend\n"
+			"  --gemv       decode-GEMV us/call + weight-GB/s at production shapes\n"
 			"  --model      load a real GGUF model and cross-validate greedy decode\n"
 			"\n"
 			"Options:\n"
@@ -774,7 +776,7 @@ void usage(const char *prog) {
 			"  -h, --help         this message\n"
 			"\n"
 			"Available backends: ",
-			prog, prog, prog, ARCH_GENERATE_N_DECODE);
+			prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
 	backend_info infos[BACKEND_MAX];
 	int			 n = backend_list(infos, BACKEND_MAX);
 	for (int i = 0; i < n; i++)

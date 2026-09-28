@@ -82,6 +82,8 @@ int main(int argc, char **argv) {
 	for (int ai = 1; ai < argc; ai++) {
 		if (strcmp(argv[ai], "--bench") == 0)
 			return run_matmul_bench_mode(argc, argv, infos, n_backends);
+		if (strcmp(argv[ai], "--gemv") == 0)
+			return run_gemv_bench_mode(argc, argv, infos, n_backends);
 	}
 	for (int ai = 1; ai < argc; ai++) {
 		if (argv[ai][0] == '-' && argv[ai][1] == '-' && argv[ai][2] != '\0' &&
