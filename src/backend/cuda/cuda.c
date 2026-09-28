@@ -2233,6 +2233,44 @@ static status_code cuda_op_split_qgate(backend *self, const buffer *mixed, buffe
 	return OK;
 }
 
+static status_code cuda_op_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
+										   int n_kv_heads, int head_dim, int rope_dim,
+										   int pos_start, const float *rope_cos_base,
+										   const float *rope_sin_base, int n_rows) {
+	struct cuda_priv *priv = cuda_priv(self);
+	if (!priv)
+		return ERR_INTERNAL;
+	if (n_rows <= 0 || rope_dim <= 0 || n_heads <= 0 || n_kv_heads <= 0)
+		return OK;
+	/* Build the tables at rope_dim granularity: the op strides them by
+	 * rope_dim/2 per position, which differs from the head_dim/2 stride the
+	 * full-rope path uses. The table cache is keyed on that width, so the two
+	 * geometries coexist. */
+	const float *cos_base = NULL, *sin_base = NULL;
+	status_code st = cuda_rope_pre_ensure(self, pos_start + n_rows, rope_dim, rope_cos_base,
+										  rope_sin_base, &cos_base, &sin_base);
+	if (st != OK)
+		return st;
+	cuda_partial_rope((float *)cuda_dev_ptr(q), n_heads, head_dim, rope_dim, pos_start, cos_base,
+					  sin_base, n_rows, priv->stream);
+	cuda_partial_rope((float *)cuda_dev_ptr(k), n_kv_heads, head_dim, rope_dim, pos_start,
+					  cos_base, sin_base, n_rows, priv->stream);
+	if (!cuda_lazy_d2h_for("rope")) {
+		if (q->host_ptr &&
+			cudaMemcpyAsync(q->host_ptr, cuda_dev_ptr(q),
+							(size_t)n_rows * (size_t)n_heads * (size_t)head_dim * sizeof(float),
+							cudaMemcpyDeviceToHost, priv->stream) != cudaSuccess)
+			return ERR_INTERNAL;
+		if (k->host_ptr &&
+			cudaMemcpyAsync(k->host_ptr, cuda_dev_ptr(k),
+							(size_t)n_rows * (size_t)n_kv_heads * (size_t)head_dim *
+								sizeof(float),
+							cudaMemcpyDeviceToHost, priv->stream) != cudaSuccess)
+			return ERR_INTERNAL;
+	}
+	return OK;
+}
+
 /* PLE helpers (GPU native): combine + strided per-slice norm batch. */
 static status_code cuda_op_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
                                        float scale) {
@@ -3165,6 +3203,7 @@ static status_code cuda_ctor(backend *out) {
     out->softcap             = cuda_op_softcap;
     out->attn_output_gate    = cuda_op_attn_output_gate;
     out->split_qgate         = cuda_op_split_qgate;
+    out->partial_rope_qk    = cuda_op_partial_rope_qk;
     out->ple_combine        = cuda_op_ple_combine;
     out->ple_norm_batch     = cuda_op_ple_norm_batch;
     out->argmax             = cuda_op_argmax;

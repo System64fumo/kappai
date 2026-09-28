@@ -5684,6 +5684,43 @@ __global__ void attn_output_gate_kernel(float *o, const float *g, long long n) {
     if (i < n) o[i] *= 1.0f / (1.0f + expf(-g[i]));
 }
 
+/* partial_rope_qk: neox rope over the first rope_dim dims only, batched.
+ * The host reference (rope_rotate_neox) indexes the tables at
+ * (pos_start + row) * (rope_dim/2), so the tables must be built with row
+ * width rope_dim/2 -- not head_dim/2. Neox unconditionally, matching the
+ * host implementation of this op. */
+__global__ void partial_rope_kernel(float *vec, int n_heads, int head_dim, int rope_dim,
+                                    const float *cos_base, const float *sin_base,
+                                    int pos_start, int n_rows) {
+    int half = rope_dim / 2;
+    int per_row = n_heads * half;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_rows * per_row) return;
+    int row = idx / per_row;
+    int within = idx - row * per_row;
+    int h = within / half;
+    int j = within - h * half;
+    float *vh = vec + ((size_t)row * n_heads + h) * head_dim;
+    float c = cos_base[(size_t)(pos_start + row) * half + j];
+    float s = sin_base[(size_t)(pos_start + row) * half + j];
+    float v0 = vh[j];
+    float v1 = vh[j + half];
+    vh[j]        = v0 * c - v1 * s;
+    vh[j + half] = v0 * s + v1 * c;
+}
+
+extern "C" void cuda_partial_rope(float *vec_dev, int n_heads, int head_dim, int rope_dim,
+                                  int pos_start, const float *cos_dev, const float *sin_dev,
+                                  int n_rows, cudaStream_t stream) {
+    int half = rope_dim / 2;
+    if (n_rows <= 0 || n_heads <= 0 || half <= 0) return;
+    int total = n_rows * n_heads * half;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    partial_rope_kernel<<<grid, block, 0, stream>>>(vec_dev, n_heads, head_dim, rope_dim,
+                                                    cos_dev, sin_dev, pos_start, n_rows);
+}
+
 extern "C" void cuda_attn_output_gate(float *out_dev, const float *gate_dev, long long n,
                                       cudaStream_t stream) {
     if (n <= 0) return;
