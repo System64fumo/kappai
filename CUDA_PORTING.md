@@ -16,10 +16,28 @@ backend into this tree **without touching CPU or Vulkan**.
 ## Not yet ported (blocking end-to-end run)
 
 `gfortran`-free build passes and the model loads, but prefill aborts with
-`status=-5` (`ERR_OUT_OF_MEMORY`) in the **`OP_PLE_BUILD` batch op**
-(`ple_build_batch`, gemma4 per-layer embeddings). This is an engine-side
-integration gap, not a kernel bug: the fork's `recipe.c`/`compute.c` predate
-the CUDA work and drive ops the backend expects to be wired differently.
+`status=-5` (`ERR_OUT_OF_MEMORY`) in the **`OP_PLE_BUILD` batch op**.
+
+**Root cause (confirmed 2026-09-27):** the fork's `ple_build_batch` aliases a
+host pointer as a device buffer:
+
+```c
+float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
+buffer proj_buf = {0};
+proj_buf.handle   = ctx->bs->ple_proj.p;   /* host pointer used as device handle */
+proj_buf.host_ptr = ctx->bs->ple_proj.p;
+```
+
+It predates device-only backends (CPU/Vulkan share host memory, so this worked
+there). The CUDA backend treats `handle` as a device pointer, so the following
+`matmul_batch(..., &proj_buf, ...)` fails and bubbles up as `-5`.
+
+**Fix:** port the development tree's `ple_build_batch` device-scratch path:
+allocate `ple_proj_gpu` via `buffer_ensure_scratch`, use the `ple_norm_batch`
+op, keep a host fallback for backends without it. Needs new scratch fields
+(`batch_scratch.ple_proj_gpu`, `compute_scratch.ple_proj_norm_w_gpu` /
+`ple_proj_norm_w_uploaded` / `ple_proj_host` / `inpL_host`). Backend-neutral
+(NULL checks), so CPU/Vulkan keep their path unchanged.
 
 Remaining planned commits:
 
