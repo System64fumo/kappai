@@ -98,15 +98,19 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	}
 }
 
-static status_code warmup_run(context *c, const char *system) {
+/* Install instructions regardless of whether speculative prefill is enabled. */
+static status_code prepare_system(context *c, const char *system, bool warmup) {
 	if (!c)
 		return ERR_INVALID_ARG;
 
 	const char *sys = (system && *system) ? system : "";
 
-	size_t prefix_bytes = chat_template_detect_static_prefix(&c->chat, sys);
-	if (prefix_bytes == 0)
+	size_t prefix_bytes = warmup ? chat_template_detect_static_prefix(&c->chat, sys) : 0;
+	if (prefix_bytes == 0) {
+		if (*sys)
+			chat_template_add_message(&c->chat, "system", sys);
 		return OK;
+	}
 
 	char *prev_render = xstrdup(c->chat.last_render);
 
@@ -171,8 +175,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	if (!c->warmup_done) {
 		context_reset(c);
-		if (a->warmup)
-			warmup_run(c, a->system);
+		prepare_system(c, a->system, a->warmup);
 	}
 	c->warmup_done = false;
 
@@ -206,11 +209,9 @@ static int run_one_shot(context *c, cli_args *a) {
 static void reset_and_warmup(context *c, cli_args *a, const char *system) {
 	context_idle_prefill_wait(c);
 	context_reset(c);
-	if (a->warmup) {
-		warmup_run(c, system);
-		if (!c->session_poisoned)
-			context_idle_prefill_start(c);
-	}
+	prepare_system(c, system, a->warmup);
+	if (a->warmup && !c->session_poisoned)
+		context_idle_prefill_start(c);
 }
 
 static int run_interactive(context *c, cli_args *a) {
@@ -219,8 +220,7 @@ static int run_interactive(context *c, cli_args *a) {
 
 	if (!c->warmup_done) {
 		context_reset(c);
-		if (a->warmup)
-			warmup_run(c, a->system);
+		prepare_system(c, a->system, a->warmup);
 	}
 	c->warmup_done = false;
 

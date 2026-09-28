@@ -872,6 +872,25 @@ int32_t *context_ids_scratch(context *c, int n) {
 	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
 }
 
+/* Only use before prefill: no KV/recurrent state has been modified yet. */
+static void rollback_unfed_turn(context *c, size_t n_messages, char *prev_render,
+							   bool prev_think_open) {
+	while (c->chat.n_messages > n_messages) {
+		chat_message *m = &c->chat.messages[--c->chat.n_messages];
+		free(m->role);
+		free(m->content);
+		free(m->reasoning_content);
+		if (m->tool_calls)
+			json_object_put(m->tool_calls);
+		free(m->tool_call_id);
+		free(m->name);
+		memset(m, 0, sizeof(*m));
+	}
+	free(c->chat.last_render);
+	c->chat.last_render = prev_render;
+	c->chat.think_open = prev_think_open;
+}
+
 int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generation_prompt,
 						  int max_tokens, const sampler_params						 *samp,
 						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
@@ -887,11 +906,13 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	char	*turn_str;
 
 	char *prev_render = xstrdup(c->chat.last_render);
+	size_t prev_n_messages = c->chat.n_messages;
+	bool prev_think_open = c->chat.think_open;
 
 	if (chat_template_add_turn_ex(&c->chat, msg, add_generation_prompt, &turn_str, errbuf,
 								  sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
-		free(prev_render);
+		rollback_unfed_turn(c, prev_n_messages, prev_render, prev_think_open);
 		return -1;
 	}
 
@@ -904,8 +925,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 										   &c->scratch.prof);
 	if (n < 0) {
 		ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
-		free(c->chat.last_render);
-		c->chat.last_render = prev_render;
+		rollback_unfed_turn(c, prev_n_messages, prev_render, prev_think_open);
 		return -1;
 	}
 
