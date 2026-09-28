@@ -1911,6 +1911,9 @@ struct batch_scratch {
 
 	float_buf ple_buf;
 	buffer	  ple_all;
+	buffer	  ple_proj_gpu;
+	buffer	  ple_inp_dev;
+	buffer	  ple_slice_dev;
 	float_buf ple_inp;
 	float_buf ple_proj;
 	float_buf ple_slice;
@@ -1981,11 +1984,28 @@ static uint32_t op_batch_slot_mask(const recipe_op *op) {
 }
 
 static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
-	bs_pair *p = &bs->pair[slot];
+	bs_pair *p	   = &bs->pair[slot];
+	size_t	bytes  = n_elems * sizeof(float);
+
+	/* Device backends (CUDA) need real device buffers: allocate through the
+	 * backend allocator so cuda_dev_ptr() yields valid device pointers. Host
+	 * backends (CPU) and host-visible ones keep the zero-copy host path. */
+	if (owner && !backend_has_cap(owner, BCAP_IS_HOST)) {
+		if (p->b.handle && p->b.size >= bytes)
+			return;
+		if (p->b.handle)
+			owner->buffer_free(owner, &p->b);
+		memset(&p->b, 0, sizeof(p->b));
+		owner->buffer_alloc_scratch(owner, bytes, &p->b);
+		/* Clear fb.p so batch_scratch_free won't double-free */
+		p->fb.p = NULL;
+		return;
+	}
+
 	float_buf_ensure_nocopy(&p->fb, n_elems, 64);
 	p->b.handle	  = p->fb.p;
 	p->b.host_ptr = p->fb.p;
-	p->b.size	  = n_elems * sizeof(float);
+	p->b.size	  = bytes;
 	p->b.offset	  = 0;
 	p->b.owner	  = owner;
 }
@@ -2036,6 +2056,9 @@ void batch_scratch_free(batch_scratch *bs) {
 	if (!bs)
 		return;
 	for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++) {
+		/* Device-allocated slots own their buffer; free via the backend. */
+		if (bs->pair[slot].b.owner)
+			bs->pair[slot].b.owner->buffer_free(bs->pair[slot].b.owner, &bs->pair[slot].b);
 		free(bs->pair[slot].fb.p);
 		memset(&bs->pair[slot], 0, sizeof(bs->pair[slot]));
 	}
@@ -2069,6 +2092,12 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->ple_buf.p);
 	if (bs->ple_all.owner)
 		bs->ple_all.owner->buffer_free(bs->ple_all.owner, &bs->ple_all);
+	if (bs->ple_proj_gpu.owner)
+		bs->ple_proj_gpu.owner->buffer_free(bs->ple_proj_gpu.owner, &bs->ple_proj_gpu);
+	if (bs->ple_inp_dev.owner)
+		bs->ple_inp_dev.owner->buffer_free(bs->ple_inp_dev.owner, &bs->ple_inp_dev);
+	if (bs->ple_slice_dev.owner)
+		bs->ple_slice_dev.owner->buffer_free(bs->ple_slice_dev.owner, &bs->ple_slice_dev);
 	free(bs->ple_inp.p);
 	free(bs->ple_proj.p);
 	free(bs->ple_slice.p);
@@ -3150,6 +3179,63 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 
 	int gpu_path_ok = (a->matmul_batch && a->scale_inplace && a->rmsnorm_batch && a->ple_combine &&
 					   m->layer_dims.per_layer_model_proj.buf.handle);
+	/* Device backends (CUDA) cannot use host float_bufs as scratch: their
+	 * matmul_batch/scale/rmsnorm need device buffers. Use the fused
+	 * ple_norm_batch op + device scratch there. Host backends (CPU) keep the
+	 * original host-aliased path; backends without ple_norm_batch (Vulkan)
+	 * keep it too, so their behaviour is unchanged. */
+	int dev_path_ok = (gpu_path_ok && a->ple_norm_batch && a->buffer_alloc_scratch &&
+					   a->buffer_write_f32 && !backend_has_cap(a, BCAP_IS_HOST));
+
+	if (dev_path_ok) {
+		status_code st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+		if (st != OK)
+			return st;
+
+		st = buffer_ensure_scratch(a, &ctx->bs->ple_proj_gpu,
+								   (size_t)n_rows * total_ple * sizeof(float));
+		if (st != OK)
+			return st;
+		buffer *proj_gpu = &ctx->bs->ple_proj_gpu;
+
+		buffer *xb = batch_slot(ctx->bs, RECIPE_SLOT_X);
+
+		st = a->matmul_batch(a, &m->layer_dims.per_layer_model_proj.buf,
+							 m->layer_dims.per_layer_model_proj.type, xb, proj_gpu, total_ple, dim,
+							 n_rows);
+		if (st != OK)
+			return st;
+
+		st = a->scale_inplace(a, proj_gpu, inv_sqrt_ple, n_rows * total_ple);
+		if (st != OK)
+			return st;
+
+		if (!ctx->s->ple_proj_norm_w_uploaded) {
+			if (ctx->s->ple_proj_norm_w_gpu.size < (size_t)n_embd_per_layer * sizeof(float)) {
+				if (ctx->s->ple_proj_norm_w_gpu.owner)
+					ctx->s->ple_proj_norm_w_gpu.owner->buffer_free(
+						ctx->s->ple_proj_norm_w_gpu.owner, &ctx->s->ple_proj_norm_w_gpu);
+				st = a->buffer_alloc_scratch(a, (size_t)n_embd_per_layer * sizeof(float),
+											 &ctx->s->ple_proj_norm_w_gpu);
+				if (st != OK)
+					return st;
+			}
+			st = a->buffer_write_f32(a, &ctx->s->ple_proj_norm_w_gpu,
+									 m->layer_dims.per_layer_proj_norm_w.host_ptr,
+									 n_embd_per_layer);
+			if (st != OK)
+				return st;
+			ctx->s->ple_proj_norm_w_uploaded = 1;
+		}
+
+		st = a->ple_norm_batch(a, proj_gpu, &ctx->s->ple_proj_norm_w_gpu, n_rows, total_ple,
+							   n_embd_per_layer, n_layers, eps);
+		if (st != OK)
+			return st;
+
+		return a->ple_combine(a, &ctx->bs->ple_all, proj_gpu, n_rows * total_ple,
+							  combine_scale);
+	}
 
 	if (gpu_path_ok) {
 		status_code st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
@@ -3284,27 +3370,53 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 	float_buf_ensure(&ctx->bs->ple_slice, (size_t)n_rows * n_embd_per_layer);
 
 	buffer ple_inp_b   = {0};
-	ple_inp_b.handle   = ctx->bs->ple_inp.p;
-	ple_inp_b.host_ptr = ctx->bs->ple_inp.p;
-	ple_inp_b.size	   = (size_t)n_rows * n_embd_per_layer * sizeof(float);
-	ple_inp_b.owner	   = a;
-
-	buffer ple_slice_b	 = {0};
-	ple_slice_b.handle	 = ctx->bs->ple_slice.p;
-	ple_slice_b.host_ptr = ctx->bs->ple_slice.p;
-	ple_slice_b.size	 = (size_t)n_rows * n_embd_per_layer * sizeof(float);
-	ple_slice_b.owner	 = a;
-
+	buffer ple_slice_b = {0};
 	status_code st;
+	if (!backend_has_cap(a, BCAP_IS_HOST)) {
+		/* Device-resident scratch: host float_bufs are not device-accessible. */
+		st = buffer_ensure_scratch(a, &ctx->bs->ple_inp_dev,
+								   (size_t)n_rows * n_embd_per_layer * sizeof(float));
+		if (st != OK)
+			return st;
+		st = buffer_ensure_scratch(a, &ctx->bs->ple_slice_dev,
+								   (size_t)n_rows * n_embd_per_layer * sizeof(float));
+		if (st != OK)
+			return st;
+		ple_inp_b	= ctx->bs->ple_inp_dev;
+		ple_slice_b = ctx->bs->ple_slice_dev;
+	} else {
+		ple_inp_b.handle   = ctx->bs->ple_inp.p;
+		ple_inp_b.host_ptr = ctx->bs->ple_inp.p;
+		ple_inp_b.size	   = (size_t)n_rows * n_embd_per_layer * sizeof(float);
+		ple_inp_b.owner	   = a;
+
+		ple_slice_b.handle	 = ctx->bs->ple_slice.p;
+		ple_slice_b.host_ptr = ctx->bs->ple_slice.p;
+		ple_slice_b.size	 = (size_t)n_rows * n_embd_per_layer * sizeof(float);
+		ple_slice_b.owner	 = a;
+	}
 	if (ctx->bs->ple_all.handle) {
-		for (int row = 0; row < n_rows; row++) {
-			buffer ple_src = ctx->bs->ple_all;
-			ple_src.offset +=
-				((size_t)row * total_ple + (size_t)ctx->li * n_embd_per_layer) * sizeof(float);
-			buffer dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
-			st = compute_copy_buffer_cross(ctx->s, &ple_src, &dst_row, n_embd_per_layer);
+		/* One strided copy beats n_rows sync copies when the backend
+		 * supports it (copy_2d); otherwise fall back to per-row. */
+		if (a->copy_2d) {
+			buffer dst_all = ple_slice_b;
+			dst_all.offset = 0;
+			buffer src_all = ctx->bs->ple_all;
+			src_all.offset = (size_t)ctx->li * n_embd_per_layer * sizeof(float);
+			st = a->copy_2d(a, &dst_all, (size_t)n_embd_per_layer, &src_all,
+							(size_t)total_ple, n_embd_per_layer, n_rows);
 			if (st != OK)
 				return st;
+		} else {
+			for (int row = 0; row < n_rows; row++) {
+				buffer ple_src = ctx->bs->ple_all;
+				ple_src.offset +=
+					((size_t)row * total_ple + (size_t)ctx->li * n_embd_per_layer) * sizeof(float);
+				buffer dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
+				st = compute_copy_buffer_cross(ctx->s, &ple_src, &dst_row, n_embd_per_layer);
+				if (st != OK)
+					return st;
+			}
 		}
 	} else {
 		for (int row = 0; row < n_rows; row++) {

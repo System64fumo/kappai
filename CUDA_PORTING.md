@@ -15,29 +15,34 @@ backend into this tree **without touching CPU or Vulkan**.
 
 ## Not yet ported (blocking end-to-end run)
 
-`gfortran`-free build passes and the model loads, but prefill aborts with
-`status=-5` (`ERR_OUT_OF_MEMORY`) in the **`OP_PLE_BUILD` batch op**.
+**Fixed:** the batch scratch was host-only. `bs_ensure_slot` allocated every
+batch slot (X, Q/K/V, gate/up, attn_out, ...) with `float_buf_ensure_nocopy`
+and set `handle = host_ptr`, so the CUDA backend received host pointers as
+device handles and the first kernel faulted (`cudaErrorIllegalAddress`,
+surfacing later as `status=-5`). Ported the device-aware allocation
+(`owner->buffer_alloc_scratch`) + matching free. `ple_build_batch` and
+`ple_proj_inject_batch` likewise aliased host float_bufs as device buffers;
+ported the device-scratch paths (`ple_proj_gpu`, `ple_inp_dev`,
+`ple_slice_dev`, `ple_norm_batch`), keeping the original host path for
+CPU/Vulkan (gated on `BCAP_IS_HOST` / op presence) so neither is affected.
 
-**Root cause (confirmed 2026-09-27):** the fork's `ple_build_batch` aliases a
-host pointer as a device buffer:
+**Result:** the model loads and the batch prefill path now runs without the
+`-5` failure.
 
-```c
-float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
-buffer proj_buf = {0};
-proj_buf.handle   = ctx->bs->ple_proj.p;   /* host pointer used as device handle */
-proj_buf.host_ptr = ctx->bs->ple_proj.p;
-```
+**Still open:** generation is not yet correct/working under CUDA —
+- with warmup on, the turn produces no tokens (immediate EOG, no error);
+- with `--warmup 0`, prefill segfaults partway (e.g. `(0/21)`).
 
-It predates device-only backends (CPU/Vulkan share host memory, so this worked
-there). The CUDA backend treats `handle` as a device pointer, so the following
-`matmul_batch(..., &proj_buf, ...)` fails and bubbles up as `-5`.
+Next suspects: the single-token (m=1) decode ops, the readback/sampler glue,
+and remaining host/device buffer assumptions in `compute.c`/`context.c` on
+this tree. The `--gemv`/differential harnesses from the development tree are
+not yet ported, so this is currently debugged by inspection + CLI runs.
 
-**Fix:** port the development tree's `ple_build_batch` device-scratch path:
-allocate `ple_proj_gpu` via `buffer_ensure_scratch`, use the `ple_norm_batch`
-op, keep a host fallback for backends without it. Needs new scratch fields
-(`batch_scratch.ple_proj_gpu`, `compute_scratch.ple_proj_norm_w_gpu` /
-`ple_proj_norm_w_uploaded` / `ple_proj_host` / `inpL_host`). Backend-neutral
-(NULL checks), so CPU/Vulkan keep their path unchanged.
+Remaining planned commits:
+
+1. `compute.c`/`context.c`: graph replay + sampled-path glue.
+2. `test_bench.c`: `--gemv` decode-GEMV rig + CUDA test cases.
+3. Debug the decode/generation path above.
 
 Remaining planned commits:
 
