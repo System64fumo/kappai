@@ -16,8 +16,8 @@ typedef void (*layer_progress_cb)(int layer_idx, int n_layers, int token_progres
 								  void *ud);
 
 typedef struct compute_scratch {
-	buffer		 router_softmax_inp_gpu;
-	buffer		 router_logits_gpu;
+	buffer		 router_softmax_inp;
+	buffer		 router_logits;
 	int			 router_ids_host[64];
 	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
@@ -26,8 +26,8 @@ typedef struct compute_scratch {
 	buffer		 ple_inp;
 	buffer		 ple_slice;
 	buffer		 ple_all;
-	buffer		 ple_proj_gpu;
-	buffer		 ple_proj_norm_w_gpu;
+	buffer		 ple_proj;
+	buffer		 ple_proj_norm_w;
 	int			 ple_proj_norm_w_uploaded;
 	float		*ple_buf;
 	backend		*backend;
@@ -64,8 +64,15 @@ typedef struct compute_scratch {
 	float_buf moe_xb_f;
 	float_buf moe_shared_y;
 	float_buf hybrid_host;
+	float_buf hybrid_host2;
+	float_buf hybrid_host3;
+	float_buf gdn_ws_host;
+	float_buf gdn_z_host;
+	float_buf gdn_alpha_host;
+	float_buf gdn_beta_host;
+	float_buf gdn_out_host;
 
-	moe_expert_slot moe_slot_buf[512];
+	moe_expert_slot *moe_slot_buf;
 
 	layer_progress_cb			 layer_cb;
 	void						*layer_cb_ud;
@@ -74,6 +81,27 @@ typedef struct compute_scratch {
 	batch_scratch *bs;
 	float_buf	   batch_logits_tmp;
 } compute_scratch;
+
+/* Decode-graph debug hooks.
+ *
+ * The real implementations live in the CUDA backend, which is a dlopen'd
+ * shared library (libkappai_cuda.so) -- the engine cannot link against it.
+ * So the engine owns these function pointers, initialized to no-op stubs, and
+ * the CUDA backend installs its implementations when it is loaded. */
+typedef int (*kgraph_dbg_peek_fn)(backend *, int *, int *, int *);
+typedef int (*kgraph_dbg_capquery_fn)(backend *);
+typedef int (*kgraph_dbg_togglex_fn)(backend *, void *, int);
+typedef int (*kgraph_dbg_snap_fn)(backend *, void *, const char *, int);
+typedef int (*kgraph_dbg_logits_fn)(backend *, void *, float *);
+typedef int (*kgraph_dbg_lasterr_fn)(void);
+
+extern kgraph_dbg_peek_fn cuda_graph_dbg_peek;
+extern kgraph_dbg_capquery_fn cuda_graph_dbg_capquery;
+extern kgraph_dbg_togglex_fn cuda_graph_dbg_togglex;
+extern kgraph_dbg_snap_fn cuda_graph_dbg_snap;
+extern kgraph_dbg_logits_fn cuda_graph_dbg_logits;
+extern kgraph_dbg_lasterr_fn cuda_graph_dbg_lasterr;
+
 
 static inline int compute_model_changed(const compute_scratch *s, const model *m, int n_ctx) {
 	return s->last_model != m || s->allocated_n_ctx < n_ctx;

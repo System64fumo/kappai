@@ -1,5 +1,6 @@
 #include "test_core.h"
 
+#include <stdarg.h>
 #include <unistd.h>
 
 static op_stat g_stats[OPFAM_COUNT];
@@ -59,6 +60,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_FFN_ACTIVATE_EX]	 = "ffn_activate_ex",
 		[OPFAM_ATTENTION]		 = "attention",
 		[OPFAM_ATTENTION_SWA]	 = "attention_swa",
+		[OPFAM_ATTENTION_MLA]	 = "attention_mla",
 		[OPFAM_KV_PUT]			 = "kv_put",
 		[OPFAM_ARGMAX]			 = "argmax",
 		[OPFAM_ARCH_LAYER]		 = "arch.single_layer",
@@ -80,6 +82,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_HYBRID_STATE]	 = "hybrid_state",
 		[OPFAM_ORCHESTRATION]	 = "orchestration",
 		[OPFAM_MOE_STREAM]		 = "moe_stream",
+		[OPFAM_TOOLCALL]		 = "toolcall",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";
@@ -275,6 +278,15 @@ void record_result(op_family fam, const char *label, verdict v, const char *deta
 	default:
 		break;
 	}
+}
+
+void record_resultf(op_family fam, const char *label, int ok, const char *fmt, ...) {
+	char	detail[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(detail, sizeof(detail), fmt, ap);
+	va_end(ap);
+	record_result(fam, label, ok ? V_PASS : V_FAIL, detail);
 }
 
 void flush_family(op_family fam) {
@@ -543,14 +555,14 @@ void fill_random_f32(float *x, int n, float scale) {
 	}
 }
 
-static void fill_random_f16(uint16_t *x, int n) {
+void fill_random_f16(uint16_t *x, int n) {
 	for (int i = 0; i < n; i++) {
 		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
 		x[i]	  = f32_to_f16((float)r / 1000.0f);
 	}
 }
 
-static void fill_random_bf16(uint16_t *x, int n) {
+void fill_random_bf16(uint16_t *x, int n) {
 	for (int i = 0; i < n; i++) {
 		int32_t	 r = (int32_t)(next_u32() % 2001) - 1000;
 		float	 f = (float)r / 1000.0f;
@@ -560,9 +572,43 @@ static void fill_random_bf16(uint16_t *x, int n) {
 	}
 }
 
-typedef void (*test_repack_fn)(const void *src, void *dst, int n_rows, int k);
+void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q8_0_to_q8_0_r8_rows(src, dst, 0, n_rows, k);
+}
 
-static test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
+void repack_q4_0_to_q4_0_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_0_to_q4_0_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq3_s_to_iq3_s_re8(const void *src, void *dst, int n_rows, int k) {
+	repack_iq3_s_to_iq3_s_re8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq4_nl_to_iq4_nl_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_iq4_nl_to_iq4_nl_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q4_k_to_q4_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q5_k_to_q5_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k) {
+	repack_q6_k_to_q6_k_r8_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq3_s(const void *src, void *dst, int n_rows, int k) {
+	repack_iq3_s_rows(src, dst, 0, n_rows, k);
+}
+
+void repack_iq4_nl_to_q8_0(const void *src, void *dst, int n_rows, int k) {
+	repack_iq4_nl_to_q8_0_rows(src, dst, 0, n_rows, k);
+}
+
+test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
 	switch (type) {
 	case GGML_TYPE_Q4_0_R8:
 		*base_type_out = GGML_TYPE_Q4_0;
@@ -753,17 +799,18 @@ int wants_all(int argc, char **argv) {
 void usage(const char *prog) {
 	fprintf(stderr,
 			"Usage:\n"
-			"  %s [--all | <backend>...]         per-op + combined-op validation vs CPU\n"
+			"  %s [--all | <target>...]        per-op validation: target(s) vs default reference\n"
+			"  %s <ref> <target>...            backend-vs-backend: <ref> is the reference\n"
 			"  %s --bench [--all | <backend>]   per-quant matmul GFLOPS per backend\n"
 			"  %s --gemv [--all | <backend>]    decode-GEMV us/GB-s at prod shapes\n"
 			"  %s --model <path> [--all | <b>...]  real-model greedy-decode cross-check\n"
 			"\n"
 			"Modes:\n"
-			"  (default)    per-op correctness (each op vs CPU) plus combined-op tests\n"
+			"  (default)    per-op correctness (each op vs reference) plus combined-op tests\n"
 			"               (single layer, multi-layer prefill, decode chains, and a full\n"
 			"               prompt-processing + %d-token generation sweep across "
 			"architectures) --\n"
-			"               catches compounding errors across op chains; CPU errors or\n"
+			"               catches compounding errors across op chains; reference errors or\n"
 			"               NaN/Inf at any step are always reported as a failure\n"
 			"  --bench      per-quant matmul GFLOPS, every M row count, each backend\n"
 			"  --gemv       decode-GEMV us/call + weight-GB/s at production shapes\n"

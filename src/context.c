@@ -83,18 +83,26 @@ status_code context_init(context *c, const config *cfg) {
 	if (mon_path) {
 		monitor_init(&c->monitor, mon_path);
 		g_monitor = &c->monitor;
-		monitor_emit_load_phase_backend(&c->monitor, cfg->backend);
+		monitor_emit_load_phase_backend(&c->monitor, cfg->device);
 	}
 
-	status_code s = (cfg->backend && strcmp(cfg->backend, "auto") != 0)
-						? backend_create(cfg->backend, cfg->gpu_device, &c->backend)
-						: backend_create_best(cfg->gpu_device, &c->backend);
+	status_code s = ERR_INVALID_ARG;
+	if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
+		s = backend_create_best(&c->backend);
+	} else {
+		char name[32];
+		int	 device_index = 0;
+		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
+			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
+			return ERR_INVALID_ARG;
+		}
+		s = backend_create(name, device_index, &c->backend);
+	}
 	if (s != OK) {
-		ERROR("failed to initialize accelerator '%s'", cfg->backend ? cfg->backend : "auto");
+		ERROR("failed to initialize device '%s'", cfg->device ? cfg->device : "auto");
 		return s;
 	}
 	backend_host_use(c->backend);
-	recipe_init();
 
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
@@ -112,11 +120,15 @@ status_code context_init(context *c, const config *cfg) {
 		c->m.fuse_config = cfg->fuse;
 
 	if (cfg->ngl >= 0) {
-		int n_gpu = cfg->ngl;
-		if (n_gpu > c->m.n_layers)
-			n_gpu = c->m.n_layers;
-		if (n_gpu < c->m.n_layers) {
-			s = model_set_layer_backend_range(&c->m, n_gpu, c->m.n_layers, backend_host());
+		int n_offload = cfg->ngl;
+		if (n_offload > c->m.n_layers)
+			n_offload = c->m.n_layers;
+		if (n_offload < c->m.n_layers) {
+			backend_report_host_fallback(c->backend, "ngl_layers", HFB_LAYER_NOT_OFFLOADED,
+										 "%d of %d layer(s) intentionally kept on the host (cpu) "
+										 "fallback (--ngl %d)",
+										 c->m.n_layers - n_offload, c->m.n_layers, cfg->ngl);
+			s = model_set_layer_backend_range(&c->m, n_offload, c->m.n_layers, backend_host());
 			if (s != OK) {
 				ERROR("failed to apply --ngl");
 				goto fail_model;
@@ -125,8 +137,43 @@ status_code context_init(context *c, const config *cfg) {
 				WARN("--ngl: MLA architectures do not yet support per-layer KV on host; "
 					 "MLA layers running on host may fall back to primary KV path");
 			}
-			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_gpu, c->backend->name,
-				 c->m.n_layers - n_gpu);
+			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_offload, c->backend->name,
+				 c->m.n_layers - n_offload);
+		}
+	}
+
+	{
+		int n_ctx_precheck = cfg->ctx_size;
+		if (n_ctx_precheck <= 0)
+			n_ctx_precheck = c->m.n_ctx;
+		if (n_ctx_precheck > c->m.n_ctx)
+			n_ctx_precheck = c->m.n_ctx;
+
+		backend *kv_owner_precheck = c->backend->kv_alloc ? c->backend : backend_host();
+		if (kv_owner_precheck != c->backend)
+			backend_report_host_fallback(
+				c->backend, "kv_alloc", HFB_CAPABILITY,
+				"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+				c->backend->name);
+		kv_quant_type kv_quant_precheck = (kv_quant_type)cfg->kv_quant;
+		size_t		  kv_bytes_precheck =
+			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck);
+		size_t avail_precheck = backend_mem_available(kv_owner_precheck);
+
+		size_t reserve_for_weights = 0;
+		if (kv_owner_precheck == c->backend)
+			reserve_for_weights = model_pending_weight_bytes(&c->m, cfg);
+
+		size_t needed_precheck = kv_bytes_precheck + reserve_for_weights;
+		if (!cfg->disable_failsafes && avail_precheck > 0 && needed_precheck > avail_precheck) {
+			ERROR("KV cache (ctx=%d, %.1f MB) + pending weights (%.1f MB) need %.1f MB but only "
+				  "%.1f MB is available on backend '%s' -- refusing to run (see "
+				  "--disable-failsafes).",
+				  n_ctx_precheck, kv_bytes_precheck / (1024.0 * 1024.0),
+				  reserve_for_weights / (1024.0 * 1024.0), needed_precheck / (1024.0 * 1024.0),
+				  avail_precheck / (1024.0 * 1024.0), kv_owner_precheck->name);
+			s = ERR_OUT_OF_MEMORY;
+			goto fail_model;
 		}
 	}
 
@@ -161,6 +208,7 @@ status_code context_init(context *c, const config *cfg) {
 		ERROR("failed to init chat template");
 		goto fail_tokenizer;
 	}
+	c->chat.keep_thinking_in_history = c->m.arch_info && c->m.arch_info->is_hybrid_recurrent;
 
 	int n_ctx = cfg->ctx_size;
 	if (n_ctx <= 0)
@@ -169,14 +217,20 @@ status_code context_init(context *c, const config *cfg) {
 		n_ctx = c->m.n_ctx;
 	c->n_ctx = n_ctx;
 
-	backend		 *kv_owner = c->backend->kv_alloc ? c->backend : backend_host();
+	backend *kv_owner = c->backend->kv_alloc ? c->backend : backend_host();
+	if (kv_owner != c->backend)
+		backend_report_host_fallback(
+			c->backend, "kv_alloc", HFB_CAPABILITY,
+			"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+			c->backend->name);
 	kv_quant_type kv_quant = (kv_quant_type)cfg->kv_quant;
 	{
 		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant);
 		size_t avail	= backend_mem_available(kv_owner);
 		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
-				  "backend '%s' -- refusing to run (see --disable-failsafes).",
+				  "backend '%s' after loading weights -- refusing to run (see "
+				  "--disable-failsafes).",
 				  n_ctx, kv_bytes / (1024.0 * 1024.0), avail / (1024.0 * 1024.0), kv_owner->name);
 			s = ERR_OUT_OF_MEMORY;
 			goto fail_chat;
@@ -208,6 +262,8 @@ status_code context_init(context *c, const config *cfg) {
 	c->scratch.backend	 = c->backend;
 	sampler_init(&c->samp, cfg->seed);
 	sampler_set_vocab(&c->samp, c->m.vocab_size);
+	c->fed_ids.p   = xmalloc((size_t)n_ctx * sizeof(int32_t));
+	c->fed_ids.cap = n_ctx;
 
 	return OK;
 
@@ -238,6 +294,7 @@ void context_free(context *c) {
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
 	backend_destroy(c->backend);
+	c->backend = NULL;
 	free(c->ids_buf.p);
 	free(c->idle_ids_buf.p);
 	free(c->fed_ids.p);
@@ -258,13 +315,7 @@ void context_reset(context *c) {
 }
 
 static void fed_ids_append(context *c, int32_t token) {
-	if (c->fed_ids.n + 1 > c->fed_ids.cap) {
-		int new_cap = c->fed_ids.cap > 0 ? c->fed_ids.cap : 256;
-		while (new_cap < c->fed_ids.n + 1)
-			new_cap *= 2;
-		c->fed_ids.p   = xrealloc(c->fed_ids.p, (size_t)new_cap * sizeof(int32_t));
-		c->fed_ids.cap = new_cap;
-	}
+	ARR_RESERVE(c->fed_ids.p, c->fed_ids.n, c->fed_ids.cap);
 	c->fed_ids.p[c->fed_ids.n++] = token;
 }
 
@@ -273,25 +324,36 @@ static void fed_ids_sync(context *c) {
 		c->fed_ids.n = c->kv.n_pos;
 }
 
+static void context_rewind(context *c, int32_t pos) {
+	if (pos < 0)
+		pos = 0;
+	if (pos > c->fed_ids.n)
+		pos = c->fed_ids.n;
+	if (pos > c->kv.n_pos)
+		pos = c->kv.n_pos;
+	c->fed_ids.n = pos;
+	c->kv.n_pos	 = pos;
+}
+
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
 	if (c->kv.n_pos >= c->n_ctx)
-		return -1;
+		return ERR_INVALID_ARG;
 	if (token < 0 || token >= c->m.vocab_size)
-		return -1;
+		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 	int			pos = c->kv.n_pos;
 	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
 	if (st != OK)
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 	status_code cst =
 		compute_forward(&c->m, &c->kv, &c->scratch, token, pos, c->flash_attn, logits_out);
 	if (cst == ERR_INTERRUPTED)
-		return CTX_INTERRUPTED;
+		return ERR_INTERRUPTED;
 	if (cst != OK) {
 		ERROR("compute_forward failed (status=%d) at pos=%d token=%d -- "
 			  "aborting feed",
 			  (int)cst, pos, (int)token);
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 	}
 	c->kv.n_pos++;
 	fed_ids_append(c, token);
@@ -331,19 +393,40 @@ static int context_prefill_chunk_size(const context *c, int n_threads) {
 		if (end != env && *end == '\0' && v >= 4 && v <= 4096)
 			return (int)v;
 	}
+	if (n_threads < 1)
+		n_threads = 1;
+	size_t ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
+#if defined(L2_SIZE_BYTES) && (L2_SIZE_BYTES > 0)
+	{
+		size_t scaled = (size_t)L2_SIZE_BYTES * (size_t)n_threads;
+		if (scaled < (1ull << 20))
+			scaled = (1ull << 20);
+		if (scaled > PREFILL_CHUNK_WS_TARGET_BYTES)
+			scaled = PREFILL_CHUNK_WS_TARGET_BYTES;
+		ws_target = scaled;
+	}
+#endif
 	size_t kv_per_tok	= context_kv_bytes_per_token(c);
-	int	   chunk		= PREFILL_CHUNK_WS_TARGET_BYTES / (kv_per_tok > 0 ? kv_per_tok : 1);
+	int	   chunk		= (int)(ws_target / (kv_per_tok > 0 ? kv_per_tok : 1));
 	size_t slot_per_tok = context_slot_bytes_per_token(c);
 	if (slot_per_tok > 0) {
-		int by_slots = PREFILL_CHUNK_WS_TARGET_BYTES / (size_t)slot_per_tok;
+		int by_slots = (int)(ws_target / slot_per_tok);
 		if (by_slots < chunk)
 			chunk = by_slots;
 	}
-	if (chunk < 32)
-		chunk = 32;
+	int floor = 4 * n_threads;
+	if (floor < 32)
+		floor = 32;
+	if (floor > 2048)
+		floor = 2048;
 	if (chunk > 2048)
 		chunk = 2048;
-	(void)n_threads;
+	if (chunk < floor)
+		chunk = floor;
+	else
+		chunk &= ~3;
+	if (chunk < floor)
+		chunk = floor;
 	return chunk;
 }
 
@@ -351,13 +434,13 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 	if (n <= 0)
 		return 0;
 	if (c->kv.n_pos + n > c->n_ctx)
-		return -1;
+		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 
 	int			pos = c->kv.n_pos;
 	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
 	if (st != OK)
-		return CTX_COMPUTE_ERROR;
+		return ERR_COMPUTE_FAIL;
 
 	int n_threads = 1;
 	if (c->backend && c->backend->get_pool) {
@@ -384,11 +467,11 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		compute_set_layer_progress_cb(&c->scratch, prefill_progress_on_layer, &pp);
 	}
 
-	int status = CTX_COMPUTE_ERROR;
+	int status = ERR_COMPUTE_FAIL;
 	int chunk_offset;
 	for (chunk_offset = 0; chunk_offset < n; chunk_offset += chunk) {
 		if (c->interrupt) {
-			status = CTX_INTERRUPTED;
+			status = ERR_INTERRUPTED;
 			goto fail;
 		}
 
@@ -399,14 +482,14 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 			&c->m, &c->kv, &c->scratch, tokens + chunk_offset, chunk_size, pos + chunk_offset,
 			c->flash_attn, (chunk_offset + chunk_size == n) ? c->scratch.logits_host : NULL);
 		if (cfb_st == ERR_INTERRUPTED) {
-			status = CTX_INTERRUPTED;
+			status = ERR_INTERRUPTED;
 			goto fail;
 		}
 		if (cfb_st != OK) {
 			ERROR("compute_forward_batch failed (status=%d) at chunk_offset=%d chunk_size=%d -- "
 				  "prompt processing aborted",
 				  (int)cfb_st, chunk_offset, chunk_size);
-			status = CTX_COMPUTE_ERROR;
+			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
 	}
@@ -435,8 +518,7 @@ fail:
 static void debug_print_logits(context *c) {
 	buffer *logits = &c->scratch.slots[RECIPE_SLOT_LOGITS];
 	if (c->backend && c->backend->argmax && !c->scratch.logits_alias) {
-		if (c->backend->synchronize)
-			c->backend->synchronize(c->backend);
+		ensure_sync(c->backend);
 		backend *owner = logits->owner ? logits->owner : c->backend;
 		if (owner->buffer_read_f32) {
 			owner->buffer_read_f32(owner, logits, c->scratch.logits_host, c->m.vocab_size);
@@ -445,21 +527,30 @@ static void debug_print_logits(context *c) {
 	int	   vocab = c->m.vocab_size;
 	float *lg	 = c->scratch.logits_host;
 
+	str_builder sb;
+	sb_init(&sb);
 	if (vocab <= 128) {
-		fprintf(stderr, "[DEBUG] full logits (vocab=%d):", vocab);
+		char head[64];
+		snprintf(head, sizeof(head), "full logits (vocab=%d):", vocab);
+		sb_puts(&sb, head);
 		for (int i = 0; i < vocab; i++) {
-			fprintf(stderr, " [%d]=%.6f", i, lg[i]);
+			char piece[48];
+			snprintf(piece, sizeof(piece), " [%d]=%.6f", i, lg[i]);
+			sb_puts(&sb, piece);
 		}
-		fprintf(stderr, "\n");
+		sb_putc(&sb, '\n');
 	}
 
 	sampler_top_k_entry top[8];
 	int					n_top = sampler_top_k(lg, vocab, 8, top);
-	fprintf(stderr, "[DEBUG] top logits:");
+	sb_puts(&sb, "top logits:");
 	for (int i = 0; i < n_top; i++) {
-		fprintf(stderr, " [%d]=%.4f", top[i].i, top[i].v);
+		char piece[48];
+		snprintf(piece, sizeof(piece), " [%d]=%.4f", top[i].i, top[i].v);
+		sb_puts(&sb, piece);
 	}
-	fprintf(stderr, "\n");
+	DEBUG("%s", sb.p);
+	sb_free(&sb);
 }
 
 int32_t context_sample_next(context *c) {
@@ -523,6 +614,10 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 	char		   *think_buf	   = NULL;
 	size_t			think_buf_len = 0, think_buf_cap = 0;
 	size_t			end_marker_len = c->chat.think_end_text ? strlen(c->chat.think_end_text) : 0;
+	if (out_think_end_pos && end_marker_len > 0) {
+		think_buf_cap = end_marker_len * 2 + 512;
+		think_buf	  = xmalloc(think_buf_cap);
+	}
 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
@@ -602,13 +697,13 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		float *logits_out =
 			(fast_argmax || !graph_sampled) ? (fast_argmax ? NULL : c->scratch.logits_host) : NULL;
 		int	   rc		  = context_feed_token_inner(c, tok, logits_out);
-		if (rc == CTX_COMPUTE_ERROR) {
-			ERROR("decode aborted: GPU compute error at token %d (pos=%d)", i, c->kv.n_pos);
+		if (rc == ERR_COMPUTE_FAIL) {
+			ERROR("decode aborted: device compute error at token %d (pos=%d)", i, c->kv.n_pos);
 			c->session_poisoned = true;
 			*out_unfed_tail		= true;
 			break;
 		}
-		if (rc == CTX_INTERRUPTED) {
+		if (rc == ERR_INTERRUPTED) {
 			if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent)
 				c->session_poisoned = true;
 			*out_unfed_tail = true;
@@ -701,8 +796,7 @@ prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_t
 	context_debug_print_feed(c, phase, tokens, n_tokens, c->kv.n_pos);
 	uint64_t t_start = time_us();
 	result.rc		 = context_feed_tokens_batch(c, tokens, n_tokens, quiet);
-	if (c->backend && c->backend->synchronize)
-		c->backend->synchronize(c->backend);
+	ensure_sync(c->backend);
 	uint64_t t_end = time_us();
 	result.us	   = t_end - t_start;
 	result.tps	   = n_tokens > 0 ? n_tokens * 1.0e6 / (double)result.us : 0.0;
@@ -773,22 +867,22 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 
 	int32_t		   n_pos_before = c->kv.n_pos;
 	prefill_result pf			= context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
-	if (pf.rc == CTX_INTERRUPTED) {
+	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",
 			  n_pos_before, n_pos_before + n_tokens);
 		c->session_poisoned = true;
 		return 0;
 	}
-	if (pf.rc == CTX_COMPUTE_ERROR) {
-		ERROR("prompt processing failed (GPU compute error at pos=%d); session poisoned",
+	if (pf.rc == ERR_COMPUTE_FAIL) {
+		ERROR("prompt processing failed (device compute error at pos=%d); session poisoned",
 			  c->kv.n_pos);
 		c->session_poisoned = true;
-		return -1;
+		return ERR_COMPUTE_FAIL;
 	}
 	if (pf.rc < 0) {
 		ERROR("prompt too long (pos=%d, ctx=%d)", c->kv.n_pos, c->n_ctx);
-		return -1;
+		return ERR_INVALID_ARG;
 	}
 	if (prof_was_on)
 		profile_print(&c->scratch.prof, "prefill", stderr);
@@ -800,8 +894,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	uint64_t ttft_us	 = 0;
 	int		 generated	 = context_decode_loop(c, max_tokens, samp, on_token, ud, t_turn_start_us,
 											   &ttft_us, out_unfed_tail, out_think_end_pos);
-	if (c->backend && c->backend->synchronize)
-		c->backend->synchronize(c->backend);
+	ensure_sync(c->backend);
 	uint64_t t_dec_end = time_us();
 
 	uint64_t decode_us	= t_dec_end - t_dec_start;
@@ -843,14 +936,7 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 }
 
 static int32_t *context_ids_buf_grow(int32_t **pp, int *cap, int n) {
-	if (n > *cap) {
-		int new_cap = *cap > 0 ? *cap : 256;
-		while (new_cap < n)
-			new_cap *= 2;
-		free(*pp);
-		*pp	 = xmalloc((size_t)new_cap * sizeof(int32_t));
-		*cap = new_cap;
-	}
+	ARR_ENSURE(*pp, n, *cap);
 	return *pp;
 }
 
@@ -858,14 +944,14 @@ int32_t *context_ids_scratch(context *c, int n) {
 	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
 }
 
-int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
-					  int max_tokens, const sampler_params						 *samp,
-					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
-					  const char *metrics_spec) {
+int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generation_prompt,
+						  int max_tokens, const sampler_params						 *samp,
+						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+						  const char *metrics_spec) {
 	if (c->session_poisoned) {
 		ERROR("session state is inconsistent after an earlier failed turn; "
 			  "context_reset() required");
-		return -1;
+		return ERR_INTERNAL;
 	}
 
 	uint64_t t_turn_start = time_us();
@@ -874,11 +960,11 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 
 	char *prev_render = xstrdup(c->chat.last_render);
 
-	if (chat_template_add_turn(&c->chat, role, content, add_generation_prompt, &turn_str, errbuf,
-							   sizeof(errbuf)) != OK) {
+	if (chat_template_add_turn_ex(&c->chat, msg, add_generation_prompt, &turn_str, errbuf,
+								  sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
 		free(prev_render);
-		return -1;
+		return ERR_FORMAT;
 	}
 
 	free(turn_str);
@@ -886,40 +972,56 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	int32_t *ids = context_ids_scratch(c, c->n_ctx + 1);
 
 	profile_reset(&c->scratch.prof);
-	int n = tokenizer_encode_with_specials(&c->tok, c->chat.last_render, 0, ids, c->n_ctx,
-										   &c->scratch.prof);
-	if (n < 0) {
-		ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
-		free(c->chat.last_render);
-		c->chat.last_render = prev_render;
-		return -1;
-	}
-
+	size_t prev_len = strlen(prev_render);
+	size_t new_len	= strlen(c->chat.last_render);
+	int	   n		= -1;
 	fed_ids_sync(c);
-	int32_t reuse	   = 0;
-	int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
-	while (reuse < common_max && c->fed_ids.p[reuse] == ids[reuse])
-		reuse++;
-	if (reuse < c->fed_ids.n) {
-		if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent) {
-			ERROR("transcript no longer extends the cached stream; recurrent "
-				  "state cannot be rewound -- session poisoned, context_reset() "
-				  "required");
-			c->session_poisoned = true;
-			free(prev_render);
-			return -1;
+	int32_t reuse = 0;
+	int		fast  = 0;
+	if (prev_len > 0 && new_len >= prev_len &&
+		memcmp(c->chat.last_render, prev_render, prev_len) == 0 &&
+		tokenizer_starts_with_special(&c->tok, c->chat.last_render + prev_len)) {
+		const char *suffix = c->chat.last_render + prev_len;
+		if (c->fed_ids.n > 0)
+			memcpy(ids, c->fed_ids.p, (size_t)c->fed_ids.n * sizeof(int32_t));
+		int suf = tokenizer_encode_with_specials(&c->tok, suffix, 0, ids + c->fed_ids.n,
+												 c->n_ctx - c->fed_ids.n, &c->scratch.prof);
+		if (suf < 0) {
+			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
+			goto restore_fail;
 		}
+		n	  = c->fed_ids.n + suf;
+		reuse = c->fed_ids.n;
+		fast  = 1;
+		DEBUG("prefix reuse: %d of %d prompt tokens already cached (incremental, no refeed)",
+			  (int)reuse, n);
+	} else {
+		n = tokenizer_encode_with_specials(&c->tok, c->chat.last_render, 0, ids, c->n_ctx,
+										   &c->scratch.prof);
+		if (n < 0) {
+			ERROR("prompt does not fit (%d tokens max)", c->n_ctx);
+			goto restore_fail;
+		}
+
+		int32_t common_max = (int32_t)MIN(c->fed_ids.n, n);
+		while (reuse < common_max && c->fed_ids.p[reuse] == ids[reuse])
+			reuse++;
+	}
+	if (reuse < c->fed_ids.n) {
 		DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
 			  (int)c->fed_ids.n);
-		c->fed_ids.n = reuse;
-		c->kv.n_pos	 = reuse;
-	} else {
+		context_rewind(c, reuse);
+	} else if (!fast) {
 		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
 	}
 
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
 	acap.ud					  = ud;
+	if (max_tokens > 0) {
+		acap.cap = (size_t)max_tokens * 32;
+		acap.buf = xmalloc(acap.cap);
+	}
 
 	bool	unfed_tail	  = false;
 	int32_t think_end_pos = -1;
@@ -939,14 +1041,45 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 		c->chat.last_render = prev_render;
 		prev_render			= NULL;
 	} else if (add_generation_prompt && generated > 0) {
-		char *discard;
-		if (chat_template_add_turn(&c->chat, "assistant", acap.buf ? acap.buf : "", 0, &discard,
-								   errbuf, sizeof(errbuf)) == OK)
+		char	   *discard;
+		char	   *rec_content	  = NULL;
+		char	   *rec_reasoning = NULL;
+		const char *raw			  = acap.buf ? acap.buf : "";
+		const char *end_txt		  = c->chat.think_end_text;
+		const char *st_txt		  = c->chat.think_start_text;
+		if (end_txt && end_txt[0]) {
+			const char *e = strstr(raw, end_txt);
+			if (e) {
+				const char *rstart = raw;
+				if (st_txt && st_txt[0] && strncmp(rstart, st_txt, strlen(st_txt)) == 0) {
+					rstart += strlen(st_txt);
+					if (*rstart == '\n')
+						rstart++;
+				}
+				size_t rlen	  = (size_t)(e - rstart);
+				rec_reasoning = xmalloc(rlen + 1);
+				memcpy(rec_reasoning, rstart, rlen);
+				rec_reasoning[rlen] = '\0';
+				const char *cstart	= e + strlen(end_txt);
+				while (*cstart == '\n')
+					cstart++;
+				rec_content = xstrdup(cstart);
+			}
+		}
+		if (!rec_content) {
+			rec_content = xstrdup(raw);
+		}
+		chat_message am = {.role			  = (char *)"assistant",
+						   .content			  = rec_content,
+						   .reasoning_content = rec_reasoning};
+		if (chat_template_add_turn_ex(&c->chat, &am, 0, &discard, errbuf, sizeof(errbuf)) == OK)
 			free(discard);
 		else if (!c->session_poisoned) {
 			ERROR("failed to record assistant turn; session poisoned");
 			c->session_poisoned = true;
 		}
+		free(rec_content);
+		free(rec_reasoning);
 	}
 
 	if (!c->session_poisoned && !c->interrupt && generated >= 0 &&
@@ -960,18 +1093,16 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 			if (m >= think_start_pos) {
 				DEBUG("dropping thinking span from cache: [%d..%d) of %d, refeeding tail",
 					  (int)think_start_pos, (int)think_end_pos, (int)c->fed_ids.n);
-				c->fed_ids.n = think_start_pos;
-				c->kv.n_pos	 = think_start_pos;
+				context_rewind(c, think_start_pos);
 				context_debug_print_feed(c, "resync", norm + think_start_pos,
 										 (int)(m - think_start_pos), think_start_pos);
 				int nrc = context_feed_tokens_batch(c, norm + think_start_pos,
 													(int)(m - think_start_pos), true);
-				if (nrc == CTX_INTERRUPTED || nrc == CTX_COMPUTE_ERROR) {
+				if (nrc == ERR_INTERRUPTED || nrc == ERR_COMPUTE_FAIL) {
 					ERROR("cache normalization failed -- session poisoned");
 					c->session_poisoned = true;
 				} else if (nrc < 0) {
-					c->fed_ids.n = think_start_pos;
-					c->kv.n_pos	 = think_start_pos;
+					context_rewind(c, think_start_pos);
 				}
 			}
 		}
@@ -980,12 +1111,27 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 	free(prev_render);
 	free(acap.buf);
 	return generated;
+
+restore_fail:
+	free(c->chat.last_render);
+	c->chat.last_render = prev_render;
+	return ERR_INVALID_ARG;
+}
+
+int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
+					  int max_tokens, const sampler_params						 *samp,
+					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+					  const char *metrics_spec) {
+	chat_message m = {.role	   = (char *)(role ? role : "user"),
+					  .content = (char *)(content ? content : "")};
+	return context_chat_turn_msg(c, &m, add_generation_prompt, max_tokens, samp, on_token, ud,
+								 metrics_spec);
 }
 
 int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,
 					   void (*on_token)(int32_t, const char *, int, void *), void *ud) {
 	if (!prompt)
-		return -1;
+		return ERR_INVALID_ARG;
 	uint64_t t_turn_start = time_us();
 
 	int		 cap = c->n_ctx;
@@ -997,20 +1143,13 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 	profile_reset(&c->scratch.prof);
 	int r = tokenizer_encode_with_specials(&c->tok, prompt, 0, ids + n, cap - n, &c->scratch.prof);
 	if (r < 0)
-		return -1;
+		return ERR_INVALID_ARG;
 	n += r;
 	c->last_prompt_tokens = n;
 
 	bool unfed_tail = false;
 	return run_generation(c, ids, n, max_tokens, samp, on_token, ud, 1, "", t_turn_start,
 						  &unfed_tail, NULL);
-}
-
-static size_t ctx_lcp_len(const char *a, const char *b) {
-	size_t i = 0;
-	while (a[i] && b[i] && a[i] == b[i])
-		i++;
-	return i;
 }
 
 static void *idle_prefill_thread(void *arg) {
@@ -1026,7 +1165,7 @@ static void *idle_prefill_thread(void *arg) {
 	if (s1 != OK || s2 != OK || c->interrupt)
 		goto out;
 
-	size_t header_bytes = ctx_lcp_len(r1, r2);
+	size_t header_bytes = str_lcp_len(r1, r2);
 	if (header_bytes == 0)
 		goto out;
 
@@ -1074,13 +1213,12 @@ static void *idle_prefill_thread(void *arg) {
 	if (reuse < c->fed_ids.n) {
 		if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent)
 			goto out;
-		c->fed_ids.n = reuse;
-		c->kv.n_pos	 = reuse;
+		context_rewind(c, reuse);
 	}
 
 	int			   to_prefill = header_count - reuse;
 	prefill_result pf		  = context_prefill_tokens(c, ids + reuse, to_prefill, "idle", true);
-	if (pf.rc == CTX_INTERRUPTED || pf.rc == CTX_COMPUTE_ERROR) {
+	if (pf.rc == ERR_INTERRUPTED || pf.rc == ERR_COMPUTE_FAIL) {
 		c->session_poisoned = true;
 		goto out;
 	}

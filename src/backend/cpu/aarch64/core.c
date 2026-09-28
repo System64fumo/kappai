@@ -10,7 +10,6 @@
 #define CPU_ELEMWISE_MIN_PER_THREAD 4096
 #define MLA_KROT_PARALLEL_MIN_POS 64
 #define ATTN_BITREV_MIN_M 8
-#define ATTN_BITREV_STACK_MAX 256
 
 static inline void neon_zero_f32(float *dst, int n) {
 	float32x4_t zero = vdupq_n_f32(0.0f);
@@ -35,6 +34,37 @@ static inline void neon_zero_f32(float *dst, int n) {
 		vst1q_f32(dst + d, zero);
 	for (; d < n; d++)
 		dst[d] = 0.0f;
+}
+
+static inline void scale_f32_vec(float *restrict x, int n, float s) {
+	float32x4_t s_v = vdupq_n_f32(s);
+	int			d	= 0;
+	for (; d + 16 <= n; d += 16) {
+		vst1q_f32(x + d, vmulq_f32(vld1q_f32(x + d), s_v));
+		vst1q_f32(x + d + 4, vmulq_f32(vld1q_f32(x + d + 4), s_v));
+		vst1q_f32(x + d + 8, vmulq_f32(vld1q_f32(x + d + 8), s_v));
+		vst1q_f32(x + d + 12, vmulq_f32(vld1q_f32(x + d + 12), s_v));
+	}
+	for (; d + 4 <= n; d += 4)
+		vst1q_f32(x + d, vmulq_f32(vld1q_f32(x + d), s_v));
+	for (; d < n; d++)
+		x[d] *= s;
+}
+
+static inline void scale_store_f32_vec(float *restrict dst, const float *restrict src, int n,
+									   float s) {
+	float32x4_t s_v = vdupq_n_f32(s);
+	int			d	= 0;
+	for (; d + 16 <= n; d += 16) {
+		vst1q_f32(dst + d, vmulq_f32(vld1q_f32(src + d), s_v));
+		vst1q_f32(dst + d + 4, vmulq_f32(vld1q_f32(src + d + 4), s_v));
+		vst1q_f32(dst + d + 8, vmulq_f32(vld1q_f32(src + d + 8), s_v));
+		vst1q_f32(dst + d + 12, vmulq_f32(vld1q_f32(src + d + 12), s_v));
+	}
+	for (; d + 4 <= n; d += 4)
+		vst1q_f32(dst + d, vmulq_f32(vld1q_f32(src + d), s_v));
+	for (; d < n; d++)
+		dst[d] = src[d] * s;
 }
 
 #define cpu_attn_job_neon cpu_attn_job
@@ -86,9 +116,9 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 		size_t	 pos_off	  = (size_t)pos * block_stride;
 		uint8_t *kd_base	  = (uint8_t *)k->handle;
 		uint8_t *vd_base	  = (uint8_t *)v->handle;
+		size_t	 layer_base =
+			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t layer_base =
-				p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 			size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
 			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 								 vf + ((size_t)kvh * head_dim), head_dim);
@@ -102,15 +132,15 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 	size_t	  kvh_stride   = (size_t)n_ctx * hd_stride;
 	size_t	  pos_off	   = (size_t)pos * hd_stride;
 
+	size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
+										: ((size_t)layer * layer_stride);
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t		 layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-												  : ((size_t)layer * layer_stride);
-		size_t		 off		= layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		uint16_t	*kd			= kd_base + off;
-		uint16_t	*vd			= vd_base + off;
-		const float *kfh		= kf + ((size_t)kvh * head_dim);
-		const float *vfh		= vf + ((size_t)kvh * head_dim);
-		int			 i			= 0;
+		size_t		 off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
+		uint16_t	*kd	 = kd_base + off;
+		uint16_t	*vd	 = vd_base + off;
+		const float *kfh = kf + ((size_t)kvh * head_dim);
+		const float *vfh = vf + ((size_t)kvh * head_dim);
+		int			 i	 = 0;
 		for (; i + 32 <= head_dim; i += 32) {
 			float32x4_t k0	= vld1q_f32(kfh + i);
 			float32x4_t k1	= vld1q_f32(kfh + i + 4);
@@ -526,10 +556,37 @@ static inline void vld1q_f16x8_to_f32x2(const uint16_t *ptr, float32x4_t *lo, fl
 	*hi			  = vcvt_f32_f16(vget_high_f16(h));
 }
 
+static inline void accum_v_f16(float *restrict out_h, const uint16_t *restrict v, float weight,
+							   int head_dim) {
+	float32x4_t w_v = vdupq_n_f32(weight);
+	int			d	= 0;
+	for (; d + 16 <= head_dim; d += 16) {
+		float32x4_t v0, v1, v2, v3;
+		vld1q_f16x8_to_f32x2(v + d, &v0, &v1);
+		vld1q_f16x8_to_f32x2(v + d + 8, &v2, &v3);
+		vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), w_v, v0));
+		vst1q_f32(out_h + d + 4, vfmaq_f32(vld1q_f32(out_h + d + 4), w_v, v1));
+		vst1q_f32(out_h + d + 8, vfmaq_f32(vld1q_f32(out_h + d + 8), w_v, v2));
+		vst1q_f32(out_h + d + 12, vfmaq_f32(vld1q_f32(out_h + d + 12), w_v, v3));
+	}
+	for (; d + 8 <= head_dim; d += 8) {
+		float32x4_t v0, v1;
+		vld1q_f16x8_to_f32x2(v + d, &v0, &v1);
+		vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), w_v, v0));
+		vst1q_f32(out_h + d + 4, vfmaq_f32(vld1q_f32(out_h + d + 4), w_v, v1));
+	}
+	for (; d + 4 <= head_dim; d += 4) {
+		float32x4_t v0 = vld1q_f16_to_f32(v + d);
+		vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), w_v, v0));
+	}
+	for (; d < head_dim; d++)
+		out_h[d] = fmaf(weight, f16_to_f32_fast(v[d]), out_h[d]);
+}
+
 static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v_slice,
 								int kv_stride, const float *qh, float *out_h, int head_dim,
 								int n_pos, float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
@@ -546,99 +603,25 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms				 = fast_expf(M_old - M);
-					float32x4_t ms_v = vdupq_n_f32(ms);
-					int			d	 = 0;
-					for (; d + 32 <= head_dim; d += 32) {
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-						vst1q_f32(VKQ + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), ms_v));
-						vst1q_f32(VKQ + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), ms_v));
-						vst1q_f32(VKQ + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), ms_v));
-						vst1q_f32(VKQ + d + 16, vmulq_f32(vld1q_f32(VKQ + d + 16), ms_v));
-						vst1q_f32(VKQ + d + 20, vmulq_f32(vld1q_f32(VKQ + d + 20), ms_v));
-						vst1q_f32(VKQ + d + 24, vmulq_f32(vld1q_f32(VKQ + d + 24), ms_v));
-						vst1q_f32(VKQ + d + 28, vmulq_f32(vld1q_f32(VKQ + d + 28), ms_v));
-					}
-					for (; d + 16 <= head_dim; d += 16) {
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-						vst1q_f32(VKQ + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), ms_v));
-						vst1q_f32(VKQ + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), ms_v));
-						vst1q_f32(VKQ + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), ms_v));
-					}
-					for (; d + 4 <= head_dim; d += 4)
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-					for (; d < head_dim; d++)
-						VKQ[d] *= ms;
+					ms = fast_expf(M_old - M);
+					scale_f32_vec(VKQ, head_dim, ms);
 				}
 				vs = 1.0f;
 			} else {
 				vs = fast_expf(ss - M);
 			}
 
-			float32x4_t vs_v = vdupq_n_f32(vs);
-			int			d	 = 0;
-			for (; d + 32 <= head_dim; d += 32) {
-				float32x4_t vt0, vt1, vt2, vt3, vt4, vt5, vt6, vt7;
-				vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-				vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-				vld1q_f16x8_to_f32x2(vt + d + 16, &vt4, &vt5);
-				vld1q_f16x8_to_f32x2(vt + d + 24, &vt6, &vt7);
-				vst1q_f32(VKQ + d, vfmaq_f32(vld1q_f32(VKQ + d), vs_v, vt0));
-				vst1q_f32(VKQ + d + 4, vfmaq_f32(vld1q_f32(VKQ + d + 4), vs_v, vt1));
-				vst1q_f32(VKQ + d + 8, vfmaq_f32(vld1q_f32(VKQ + d + 8), vs_v, vt2));
-				vst1q_f32(VKQ + d + 12, vfmaq_f32(vld1q_f32(VKQ + d + 12), vs_v, vt3));
-				vst1q_f32(VKQ + d + 16, vfmaq_f32(vld1q_f32(VKQ + d + 16), vs_v, vt4));
-				vst1q_f32(VKQ + d + 20, vfmaq_f32(vld1q_f32(VKQ + d + 20), vs_v, vt5));
-				vst1q_f32(VKQ + d + 24, vfmaq_f32(vld1q_f32(VKQ + d + 24), vs_v, vt6));
-				vst1q_f32(VKQ + d + 28, vfmaq_f32(vld1q_f32(VKQ + d + 28), vs_v, vt7));
-			}
-			for (; d + 16 <= head_dim; d += 16) {
-				float32x4_t vt0, vt1, vt2, vt3;
-				vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-				vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-				vst1q_f32(VKQ + d, vfmaq_f32(vld1q_f32(VKQ + d), vs_v, vt0));
-				vst1q_f32(VKQ + d + 4, vfmaq_f32(vld1q_f32(VKQ + d + 4), vs_v, vt1));
-				vst1q_f32(VKQ + d + 8, vfmaq_f32(vld1q_f32(VKQ + d + 8), vs_v, vt2));
-				vst1q_f32(VKQ + d + 12, vfmaq_f32(vld1q_f32(VKQ + d + 12), vs_v, vt3));
-			}
-			for (; d + 8 <= head_dim; d += 8) {
-				float32x4_t vt0, vt1;
-				vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-				vst1q_f32(VKQ + d, vfmaq_f32(vld1q_f32(VKQ + d), vs_v, vt0));
-				vst1q_f32(VKQ + d + 4, vfmaq_f32(vld1q_f32(VKQ + d + 4), vs_v, vt1));
-			}
-			for (; d + 4 <= head_dim; d += 4) {
-				float32x4_t vt0 = vld1q_f16_to_f32(vt + d);
-				vst1q_f32(VKQ + d, vfmaq_f32(vld1q_f32(VKQ + d), vs_v, vt0));
-			}
-			for (; d < head_dim; d++)
-				VKQ[d] = fmaf(vs, f16_to_f32_fast(vt[d]), VKQ[d]);
+			accum_v_f16(VKQ, vt, vs, head_dim);
 			S = (S * ms) + vs;
 		}
 
-		float		S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		float32x4_t inv_v = vdupq_n_f32(S_inv);
-		int			d	  = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-			vst1q_f32(out_h + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), inv_v));
-			vst1q_f32(out_h + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), inv_v));
-			vst1q_f32(out_h + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), inv_v));
-			vst1q_f32(out_h + d + 16, vmulq_f32(vld1q_f32(VKQ + d + 16), inv_v));
-			vst1q_f32(out_h + d + 20, vmulq_f32(vld1q_f32(VKQ + d + 20), inv_v));
-			vst1q_f32(out_h + d + 24, vmulq_f32(vld1q_f32(VKQ + d + 24), inv_v));
-			vst1q_f32(out_h + d + 28, vmulq_f32(vld1q_f32(VKQ + d + 28), inv_v));
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-			vst1q_f32(out_h + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), inv_v));
-			vst1q_f32(out_h + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), inv_v));
-			vst1q_f32(out_h + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), inv_v));
-		}
-		for (; d + 4 <= head_dim; d += 4)
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-		for (; d < head_dim; d++)
-			out_h[d] = VKQ[d] * S_inv;
+		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+		scale_store_f32_vec(out_h, VKQ, head_dim, S_inv);
+		return;
+	}
+
+	if (n_pos == 0) {
+		neon_zero_f32(out_h, head_dim);
 		return;
 	}
 
@@ -648,146 +631,10 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 	}
 	softmax_masked(scores, n_pos);
 
-	if (n_pos == 0) {
-		float32x4_t zero = vdupq_n_f32(0.0f);
-		int			d	 = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			vst1q_f32(out_h + d, zero);
-			vst1q_f32(out_h + d + 4, zero);
-			vst1q_f32(out_h + d + 8, zero);
-			vst1q_f32(out_h + d + 12, zero);
-			vst1q_f32(out_h + d + 16, zero);
-			vst1q_f32(out_h + d + 20, zero);
-			vst1q_f32(out_h + d + 24, zero);
-			vst1q_f32(out_h + d + 28, zero);
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			vst1q_f32(out_h + d, zero);
-			vst1q_f32(out_h + d + 4, zero);
-			vst1q_f32(out_h + d + 8, zero);
-			vst1q_f32(out_h + d + 12, zero);
-		}
-		for (; d + 4 <= head_dim; d += 4)
-			vst1q_f32(out_h + d, zero);
-		for (; d < head_dim; d++)
-			out_h[d] = 0.0f;
-		return;
-	}
-
-	{
-		float			sv	 = scores[0];
-		const uint16_t *vt	 = v_slice;
-		float32x4_t		sv_v = vdupq_n_f32(sv);
-		int				d	 = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			float32x4_t vt2;
-			float32x4_t vt3;
-			float32x4_t vt4;
-			float32x4_t vt5;
-			float32x4_t vt6;
-			float32x4_t vt7;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-			vld1q_f16x8_to_f32x2(vt + d + 16, &vt4, &vt5);
-			vld1q_f16x8_to_f32x2(vt + d + 24, &vt6, &vt7);
-			vst1q_f32(out_h + d, vmulq_f32(sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vmulq_f32(sv_v, vt1));
-			vst1q_f32(out_h + d + 8, vmulq_f32(sv_v, vt2));
-			vst1q_f32(out_h + d + 12, vmulq_f32(sv_v, vt3));
-			vst1q_f32(out_h + d + 16, vmulq_f32(sv_v, vt4));
-			vst1q_f32(out_h + d + 20, vmulq_f32(sv_v, vt5));
-			vst1q_f32(out_h + d + 24, vmulq_f32(sv_v, vt6));
-			vst1q_f32(out_h + d + 28, vmulq_f32(sv_v, vt7));
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			float32x4_t vt2;
-			float32x4_t vt3;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-			vst1q_f32(out_h + d, vmulq_f32(sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vmulq_f32(sv_v, vt1));
-			vst1q_f32(out_h + d + 8, vmulq_f32(sv_v, vt2));
-			vst1q_f32(out_h + d + 12, vmulq_f32(sv_v, vt3));
-		}
-		for (; d + 8 <= head_dim; d += 8) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vst1q_f32(out_h + d, vmulq_f32(sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vmulq_f32(sv_v, vt1));
-		}
-		for (; d + 4 <= head_dim; d += 4) {
-			float32x4_t vt0 = vld1q_f16_to_f32(vt + d);
-			vst1q_f32(out_h + d, vmulq_f32(sv_v, vt0));
-		}
-		for (; d < head_dim; d++)
-			out_h[d] = sv * f16_to_f32_fast(vt[d]);
-	}
-
-	for (int t = 1; t < n_pos; t++) {
-		float			sv	 = scores[t];
-		const uint16_t *vt	 = v_slice + ((size_t)t * kv_stride);
-		float32x4_t		sv_v = vdupq_n_f32(sv);
-		int				d	 = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			float32x4_t vt2;
-			float32x4_t vt3;
-			float32x4_t vt4;
-			float32x4_t vt5;
-			float32x4_t vt6;
-			float32x4_t vt7;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-			vld1q_f16x8_to_f32x2(vt + d + 16, &vt4, &vt5);
-			vld1q_f16x8_to_f32x2(vt + d + 24, &vt6, &vt7);
-			float32x4_t oh0 = vld1q_f32(out_h + d);
-			float32x4_t oh1 = vld1q_f32(out_h + d + 4);
-			float32x4_t oh2 = vld1q_f32(out_h + d + 8);
-			float32x4_t oh3 = vld1q_f32(out_h + d + 12);
-			float32x4_t oh4 = vld1q_f32(out_h + d + 16);
-			float32x4_t oh5 = vld1q_f32(out_h + d + 20);
-			float32x4_t oh6 = vld1q_f32(out_h + d + 24);
-			float32x4_t oh7 = vld1q_f32(out_h + d + 28);
-			vst1q_f32(out_h + d, vfmaq_f32(oh0, sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vfmaq_f32(oh1, sv_v, vt1));
-			vst1q_f32(out_h + d + 8, vfmaq_f32(oh2, sv_v, vt2));
-			vst1q_f32(out_h + d + 12, vfmaq_f32(oh3, sv_v, vt3));
-			vst1q_f32(out_h + d + 16, vfmaq_f32(oh4, sv_v, vt4));
-			vst1q_f32(out_h + d + 20, vfmaq_f32(oh5, sv_v, vt5));
-			vst1q_f32(out_h + d + 24, vfmaq_f32(oh6, sv_v, vt6));
-			vst1q_f32(out_h + d + 28, vfmaq_f32(oh7, sv_v, vt7));
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			float32x4_t vt2;
-			float32x4_t vt3;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vld1q_f16x8_to_f32x2(vt + d + 8, &vt2, &vt3);
-			vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vfmaq_f32(vld1q_f32(out_h + d + 4), sv_v, vt1));
-			vst1q_f32(out_h + d + 8, vfmaq_f32(vld1q_f32(out_h + d + 8), sv_v, vt2));
-			vst1q_f32(out_h + d + 12, vfmaq_f32(vld1q_f32(out_h + d + 12), sv_v, vt3));
-		}
-		for (; d + 8 <= head_dim; d += 8) {
-			float32x4_t vt0;
-			float32x4_t vt1;
-			vld1q_f16x8_to_f32x2(vt + d, &vt0, &vt1);
-			vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), sv_v, vt0));
-			vst1q_f32(out_h + d + 4, vfmaq_f32(vld1q_f32(out_h + d + 4), sv_v, vt1));
-		}
-		for (; d + 4 <= head_dim; d += 4) {
-			float32x4_t vt0 = vld1q_f16_to_f32(vt + d);
-			vst1q_f32(out_h + d, vfmaq_f32(vld1q_f32(out_h + d), sv_v, vt0));
-		}
-		for (; d < head_dim; d++)
-			out_h[d] = fmaf(sv, f16_to_f32_fast(vt[d]), out_h[d]);
+	neon_zero_f32(out_h, head_dim);
+	for (int t = 0; t < n_pos; t++) {
+		const uint16_t *vt = v_slice + ((size_t)t * kv_stride);
+		accum_v_f16(out_h, vt, scores[t], head_dim);
 	}
 }
 
@@ -818,12 +665,67 @@ static inline float32x4_t vld1_s8x4_to_f32(const int8_t *p) {
 	return vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
 }
 
-static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_ptr, int head_dim) {
+typedef struct {
+	float		 qscale;
+	int8_t		 qa[HEAD_DIM_MAX];
+	const float *qf;
+} q8_preq;
+
+static void prequantize_q8_0(const float *restrict qh, int head_dim, q8_preq *out) {
+	if (head_dim <= 0 || head_dim > HEAD_DIM_MAX) {
+		out->qf		= qh;
+		out->qscale = 0.0f;
+		return;
+	}
+	float amax = 0.0f;
+	for (int i = 0; i < head_dim; i++) {
+		float v = fabsf(qh[i]);
+		if (v > amax)
+			amax = v;
+	}
+	out->qf = qh;
+	if (amax == 0.0f) {
+		out->qscale = 0.0f;
+		memset(out->qa, 0, (size_t)head_dim);
+		return;
+	}
+	float qinv	= 127.0f / amax;
+	out->qscale = amax / 127.0f;
+	for (int i = 0; i < head_dim; i++) {
+		int q	   = (int)lrintf(qh[i] * qinv);
+		out->qa[i] = (int8_t)(q > 127 ? 127 : (q < -128 ? -128 : q));
+	}
+}
+
+static float dot8_q8_0(const q8_preq *restrict q, const uint8_t *restrict block_ptr, int head_dim) {
 	int	  n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 	float sum	   = 0.0f;
+#if defined(__ARM_FEATURE_DOTPROD)
+	if (q->qscale == 0.0f)
+		return 0.0f;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d);
+		float			  d	  = f16_to_f32_fast(blk->d);
+		int				  base = b * KV_Q8_0_BLOCK;
+		int				  n	   = head_dim - base;
+		if (n > KV_Q8_0_BLOCK)
+			n = KV_Q8_0_BLOCK;
+		const int8_t *qs  = blk->qs;
+		int32x4_t	  acc = vdupq_n_s32(0);
+		int			  j	  = 0;
+		for (; j + 16 <= n; j += 16)
+			acc = vdotq_s32(acc, vld1q_s8(qs + j), vld1q_s8(q->qa + base + j));
+		int32_t s = vaddvq_s32(acc);
+		for (; j < n; j++)
+			s += (int32_t)qs[j] * (int32_t)q->qa[base + j];
+		sum += (float)s * (d * q->qscale);
+	}
+	return sum;
+#else
+	const float *a = q->qf;
+	for (int b = 0; b < n_blocks; b++) {
+		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
+		float			  d	  = f16_to_f32_fast(blk->d);
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -890,6 +792,7 @@ static float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_pt
 			partial += av[j] * (float)qs[j];
 		sum += partial * d;
 	}
+#endif
 	return sum;
 }
 
@@ -898,7 +801,7 @@ static void accum_v_q8_0(float *restrict out_h, const uint8_t *restrict block_pt
 	int n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 	for (int b = 0; b < n_blocks; b++) {
 		const q8_0_block *blk = (const q8_0_block *)(block_ptr + ((size_t)b * KV_Q8_0_BLOCK_BYTES));
-		float			  d	  = f16_to_f32(blk->d) * weight;
+		float			  d	  = f16_to_f32_fast(blk->d) * weight;
 		int				  base = b * KV_Q8_0_BLOCK;
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
@@ -946,16 +849,17 @@ static void accum_v_q8_0(float *restrict out_h, const uint8_t *restrict block_pt
 
 static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 									 const uint8_t *restrict v_slice, int kv_stride,
-									 const float *qh, float *out_h, int head_dim, int n_pos,
-									 float scale, int flash_attn, float *restrict scores) {
-	if (flash_attn) {
+									 const q8_preq *restrict q, float *out_h, int head_dim,
+									 int n_pos, float scale, int flash_attn,
+									 float *restrict scores) {
+	if (flash_attn || scores == NULL) {
 		float M = -INFINITY;
 		float S = 0.0f;
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
 		neon_zero_f32(VKQ, head_dim);
 		for (int t = 0; t < n_pos; t++) {
 			const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
-			float		   ss = dot8_q8_0(qh, kt, head_dim) * scale;
+			float		   ss = dot8_q8_0(q, kt, head_dim) * scale;
 
 			float vs;
 			float ms = 1.0f;
@@ -963,29 +867,8 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms				 = fast_expf(M_old - M);
-					float32x4_t ms_v = vdupq_n_f32(ms);
-					int			d	 = 0;
-					for (; d + 32 <= head_dim; d += 32) {
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-						vst1q_f32(VKQ + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), ms_v));
-						vst1q_f32(VKQ + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), ms_v));
-						vst1q_f32(VKQ + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), ms_v));
-						vst1q_f32(VKQ + d + 16, vmulq_f32(vld1q_f32(VKQ + d + 16), ms_v));
-						vst1q_f32(VKQ + d + 20, vmulq_f32(vld1q_f32(VKQ + d + 20), ms_v));
-						vst1q_f32(VKQ + d + 24, vmulq_f32(vld1q_f32(VKQ + d + 24), ms_v));
-						vst1q_f32(VKQ + d + 28, vmulq_f32(vld1q_f32(VKQ + d + 28), ms_v));
-					}
-					for (; d + 16 <= head_dim; d += 16) {
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-						vst1q_f32(VKQ + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), ms_v));
-						vst1q_f32(VKQ + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), ms_v));
-						vst1q_f32(VKQ + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), ms_v));
-					}
-					for (; d + 4 <= head_dim; d += 4)
-						vst1q_f32(VKQ + d, vmulq_f32(vld1q_f32(VKQ + d), ms_v));
-					for (; d < head_dim; d++)
-						VKQ[d] *= ms;
+					ms = fast_expf(M_old - M);
+					scale_f32_vec(VKQ, head_dim, ms);
 				}
 				vs = 1.0f;
 			} else {
@@ -997,61 +880,19 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 			S = (S * ms) + vs;
 		}
 
-		float		S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		float32x4_t inv_v = vdupq_n_f32(S_inv);
-		int			d	  = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-			vst1q_f32(out_h + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), inv_v));
-			vst1q_f32(out_h + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), inv_v));
-			vst1q_f32(out_h + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), inv_v));
-			vst1q_f32(out_h + d + 16, vmulq_f32(vld1q_f32(VKQ + d + 16), inv_v));
-			vst1q_f32(out_h + d + 20, vmulq_f32(vld1q_f32(VKQ + d + 20), inv_v));
-			vst1q_f32(out_h + d + 24, vmulq_f32(vld1q_f32(VKQ + d + 24), inv_v));
-			vst1q_f32(out_h + d + 28, vmulq_f32(vld1q_f32(VKQ + d + 28), inv_v));
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-			vst1q_f32(out_h + d + 4, vmulq_f32(vld1q_f32(VKQ + d + 4), inv_v));
-			vst1q_f32(out_h + d + 8, vmulq_f32(vld1q_f32(VKQ + d + 8), inv_v));
-			vst1q_f32(out_h + d + 12, vmulq_f32(vld1q_f32(VKQ + d + 12), inv_v));
-		}
-		for (; d + 4 <= head_dim; d += 4)
-			vst1q_f32(out_h + d, vmulq_f32(vld1q_f32(VKQ + d), inv_v));
-		for (; d < head_dim; d++)
-			out_h[d] = VKQ[d] * S_inv;
+		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+		scale_store_f32_vec(out_h, VKQ, head_dim, S_inv);
 		return;
 	}
 
 	for (int t = 0; t < n_pos; t++) {
 		const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
-		scores[t]		  = dot8_q8_0(qh, kt, head_dim) * scale;
+		scores[t]		  = dot8_q8_0(q, kt, head_dim) * scale;
 	}
 	softmax_masked(scores, n_pos);
 
 	if (n_pos == 0) {
-		float32x4_t zero = vdupq_n_f32(0.0f);
-		int			d	 = 0;
-		for (; d + 32 <= head_dim; d += 32) {
-			vst1q_f32(out_h + d, zero);
-			vst1q_f32(out_h + d + 4, zero);
-			vst1q_f32(out_h + d + 8, zero);
-			vst1q_f32(out_h + d + 12, zero);
-			vst1q_f32(out_h + d + 16, zero);
-			vst1q_f32(out_h + d + 20, zero);
-			vst1q_f32(out_h + d + 24, zero);
-			vst1q_f32(out_h + d + 28, zero);
-		}
-		for (; d + 16 <= head_dim; d += 16) {
-			vst1q_f32(out_h + d, zero);
-			vst1q_f32(out_h + d + 4, zero);
-			vst1q_f32(out_h + d + 8, zero);
-			vst1q_f32(out_h + d + 12, zero);
-		}
-		for (; d + 4 <= head_dim; d += 4)
-			vst1q_f32(out_h + d, zero);
-		for (; d < head_dim; d++)
-			out_h[d] = 0.0f;
+		neon_zero_f32(out_h, head_dim);
 		return;
 	}
 
@@ -1062,34 +903,73 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 	}
 }
 
-static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_neon *j = ctx;
-	float			  *scores;
-	if (tid == 0) {
-		scores = j->p->scores;
-	} else {
-		cpu_thread_scratch *ts = &j->p->thread_scratch[tid];
-		if (ts->scores_cap < j->n_pos) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)j->n_pos * sizeof(float));
-			ts->scores_cap = j->n_pos;
-		}
-		scores = ts->scores;
+#define GQA_GROUP_SIZE 8
+
+static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_slice, int kv_stride,
+									const float *qh_base, int n_group, int head_dim, int n_pos,
+									float scale, float *out_base) {
+	float	M[GQA_GROUP_SIZE], S[GQA_GROUP_SIZE];
+	float	VKQ[GQA_GROUP_SIZE][HEAD_DIM_MAX] __attribute__((aligned(64)));
+	q8_preq qpq[GQA_GROUP_SIZE];
+	for (int g = 0; g < n_group; g++) {
+		M[g] = -INFINITY;
+		S[g] = 0.0f;
+		neon_zero_f32(VKQ[g], head_dim);
+		prequantize_q8_0(qh_base + ((size_t)g * head_dim), head_dim, &qpq[g]);
 	}
+	for (int t = 0; t < n_pos; t++) {
+		const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
+		const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
+		for (int g = 0; g < n_group; g++) {
+			float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
+			float ms = 1.0f;
+			float vs;
+			if (ss > M[g]) {
+				float Mo = M[g];
+				M[g]	 = ss;
+				if (S[g] > 0.0f) {
+					ms = fast_expf(Mo - M[g]);
+					scale_f32_vec(VKQ[g], head_dim, ms);
+				}
+				vs = 1.0f;
+			} else
+				vs = fast_expf(ss - M[g]);
+			accum_v_q8_0(VKQ[g], vt, vs, head_dim);
+			S[g] = (S[g] * ms) + vs;
+		}
+	}
+	for (int g = 0; g < n_group; g++) {
+		float Si = (S[g] == 0.0f) ? 0.0f : 1.0f / S[g];
+		scale_store_f32_vec(out_base + ((size_t)g * head_dim), VKQ[g], head_dim, Si);
+	}
+}
+
+static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
+	cpu_attn_job_neon *j	  = ctx;
+	float			  *scores = cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
-		int			 kvh   = h / j->n_groups;
-		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
-		float		*out_h = j->outf + ((size_t)h * j->head_dim);
+		int kvh = h / j->n_groups;
 		if (j->kv_quant == KV_QUANT_Q8_0) {
 			const uint8_t *k_slice = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride);
 			const uint8_t *v_slice = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride);
-			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, qh, out_h, j->head_dim,
-									 j->n_pos, j->scale, j->flash_attn, scores);
+			if (j->flash_attn) {
+				cpu_attn_gqa_flash_q8_0(k_slice, v_slice, j->hd_stride,
+										j->qf + ((size_t)h * j->head_dim), 1, j->head_dim, j->n_pos,
+										j->scale, j->outf + ((size_t)h * j->head_dim));
+			} else {
+				q8_preq qpq;
+				prequantize_q8_0(j->qf + ((size_t)h * j->head_dim), j->head_dim, &qpq);
+				cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, &qpq,
+										 j->outf + ((size_t)h * j->head_dim), j->head_dim, j->n_pos,
+										 j->scale, j->flash_attn, scores);
+			}
 		} else {
 			const uint16_t *k_slice = j->kl_base + ((size_t)kvh * j->kvh_stride);
 			const uint16_t *v_slice = j->vl_base + ((size_t)kvh * j->kvh_stride);
-			cpu_attention_inner((uint16_t *)k_slice, (uint16_t *)v_slice, j->hd_stride, qh, out_h,
-								j->head_dim, j->n_pos, j->scale, j->flash_attn, scores);
+			cpu_attention_inner((uint16_t *)k_slice, (uint16_t *)v_slice, j->hd_stride,
+								j->qf + ((size_t)h * j->head_dim),
+								j->outf + ((size_t)h * j->head_dim), j->head_dim, j->n_pos,
+								j->scale, j->flash_attn, scores);
 		}
 	}
 }
@@ -1118,6 +998,8 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		n_pos	   = sliding_window;
 	}
 
+	int can_recurse = (tpool_current_tid() < 0);
+
 	if (p->kv_quant == KV_QUANT_Q8_0) {
 		size_t n_blocks		= ((size_t)hd_stride_elems + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 		size_t elem_stride	= n_blocks * KV_Q8_0_BLOCK_BYTES;
@@ -1130,7 +1012,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		const uint8_t *vl_base =
 			(const uint8_t *)p->kv_v + layer_base + ((size_t)attn_start * elem_stride);
 
-		if (p->pool && p->thread_scratch && n_heads > 1 &&
+		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 			cpu_attn_job_neon job = {.kl_base	 = (const uint16_t *)kl_base,
 									 .vl_base	 = (const uint16_t *)vl_base,
@@ -1141,6 +1023,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 									 .hd_stride	 = (int)elem_stride,
 									 .n_pos		 = n_pos,
 									 .flash_attn = flash_attn,
+									 .n_heads	 = n_heads,
 									 .scale		 = scale,
 									 .kvh_stride = kvh_stride,
 									 .p			 = p,
@@ -1149,15 +1032,17 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 			return OK;
 		}
 
-		float *scores = p->scores;
+		float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
 			const uint8_t *v_slice = vl_base + ((size_t)kvh * kvh_stride);
 			const float	  *qh	   = qf + ((size_t)h * head_dim);
 			float		  *out_h   = outf + ((size_t)h * head_dim);
-			cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, qh, out_h, head_dim, n_pos,
-									 scale, flash_attn, scores);
+			q8_preq		   qpq;
+			prequantize_q8_0(qh, head_dim, &qpq);
+			cpu_attention_inner_q8_0(k_slice, v_slice, (int)elem_stride, &qpq, out_h, head_dim,
+									 n_pos, scale, flash_attn, scores);
 		}
 		return OK;
 	}
@@ -1173,7 +1058,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 	kl_base += (size_t)attn_start * hd_stride;
 	vl_base += (size_t)attn_start * hd_stride;
 
-	if (p->pool && p->thread_scratch && n_heads > 1 &&
+	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
 		cpu_attn_job_neon job = {.kl_base	 = kl_base,
 								 .vl_base	 = vl_base,
@@ -1184,6 +1069,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 								 .hd_stride	 = hd_stride,
 								 .n_pos		 = n_pos,
 								 .flash_attn = flash_attn,
+								 .n_heads	 = n_heads,
 								 .scale		 = scale,
 								 .kvh_stride = kvh_stride,
 								 .p			 = p,
@@ -1192,7 +1078,7 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 		return OK;
 	}
 
-	float *scores = p->scores;
+	float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1224,20 +1110,8 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 }
 
 static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job_neon *j = ctx;
-	float					*scores;
-	if (tid == 0) {
-		scores = j->p->scores;
-	} else {
-		cpu_thread_scratch *ts	 = &j->p->thread_scratch[tid];
-		int					need = j->pos_start + j->m;
-		if (ts->scores_cap < need) {
-			free(ts->scores);
-			ts->scores	   = xmalloc((size_t)need * sizeof(float));
-			ts->scores_cap = need;
-		}
-		scores = ts->scores;
-	}
+	cpu_attn_batch_job_neon *j		= ctx;
+	float					*scores = cpu_grow_scores(j->p, tid, j->pos_start + j->m);
 
 	for (int idx = begin; idx < end; idx++) {
 		int dispatch_row = idx / j->n_heads;
@@ -1263,8 +1137,10 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 									 ((size_t)attn_start * (size_t)j->hd_stride);
 			const uint8_t *v_slice = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride) +
 									 ((size_t)attn_start * (size_t)j->hd_stride);
-			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, qh, out_h, j->head_dim, n_pos,
-									 j->scale, j->flash_attn, scores);
+			q8_preq		   qpq;
+			prequantize_q8_0(qh, j->head_dim, &qpq);
+			cpu_attention_inner_q8_0(k_slice, v_slice, j->hd_stride, &qpq, out_h, j->head_dim,
+									 n_pos, j->scale, j->flash_attn, scores);
 		} else {
 			const uint16_t *k_slice =
 				j->kl_base + ((size_t)kvh * j->kvh_stride) + ((size_t)attn_start * j->hd_stride);
@@ -1276,10 +1152,11 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
-								const buffer *v_cache, buffer *out, int layer, int pos_start,
-								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
-								int flash_attn, float scale, int n_kv_heads_active, int m) {
+static status_code cpu_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
+											const buffer *v_cache, buffer *out, int layer,
+											int pos_start, int n_heads, int n_kv_heads,
+											int head_dim, int n_ctx, int flash_attn, float scale,
+											int sliding_window, int n_kv_heads_active, int m) {
 	(void)k_cache;
 	(void)v_cache;
 	cpu_priv *p		   = self->priv;
@@ -1321,22 +1198,23 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	if (use_bitrev)
 		bitrev_perm = cpu_bitrev_perm_get(p, m_pow2);
 
-	cpu_attn_batch_job_neon job = {.kl_base		= kl_base_raw,
-								   .vl_base		= vl_base_raw,
-								   .qf			= (const float *)cpu_ptr(q),
-								   .outf		= (float *)cpu_ptr(out),
-								   .n_groups	= n_groups,
-								   .head_dim	= head_dim,
-								   .hd_stride	= hd_stride,
-								   .n_heads		= n_heads,
-								   .pos_start	= pos_start,
-								   .m			= m,
-								   .flash_attn	= flash_attn,
-								   .scale		= scale,
-								   .kvh_stride	= kvh_stride,
-								   .p			= p,
-								   .bitrev_perm = bitrev_perm,
-								   .kv_quant	= p->kv_quant};
+	cpu_attn_batch_job_neon job = {.kl_base		   = kl_base_raw,
+								   .vl_base		   = vl_base_raw,
+								   .qf			   = (const float *)cpu_ptr(q),
+								   .outf		   = (float *)cpu_ptr(out),
+								   .n_groups	   = n_groups,
+								   .head_dim	   = head_dim,
+								   .hd_stride	   = hd_stride,
+								   .n_heads		   = n_heads,
+								   .pos_start	   = pos_start,
+								   .m			   = m,
+								   .flash_attn	   = flash_attn,
+								   .scale		   = scale,
+								   .sliding_window = sliding_window,
+								   .kvh_stride	   = kvh_stride,
+								   .p			   = p,
+								   .bitrev_perm	   = bitrev_perm,
+								   .kv_quant	   = p->kv_quant};
 
 	int total		= use_bitrev ? (n_heads * m_pow2) : (n_heads * m);
 	int cur_tid		= tpool_current_tid();
@@ -1348,6 +1226,25 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	}
 
 	return OK;
+}
+
+status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
+								const buffer *v_cache, buffer *out, int layer, int pos_start,
+								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+								int flash_attn, float scale, int n_kv_heads_active, int m) {
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, 0,
+									n_kv_heads_active, m);
+}
+
+status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
+									const buffer *v_cache, buffer *out, int layer, int pos_start,
+									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+									int flash_attn, float scale, int sliding_window,
+									int n_kv_heads_active, int m) {
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, sliding_window,
+									n_kv_heads_active, m);
 }
 
 static void cpu_add_inplace_chunk_neon(int begin, int end, int tid, void *ctx) {
@@ -1372,12 +1269,8 @@ static void cpu_add_inplace_chunk_neon(int begin, int end, int tid, void *ctx) {
 status_code cpu_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
 	cpu_priv *p		  = self->priv;
 	float	 *args[2] = {cpu_ptr(x), (float *)cpu_ptr(y)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_add_inplace_chunk_neon,
-						   args);
-	} else {
-		cpu_add_inplace_chunk_neon(0, n, 0, args);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_add_inplace_chunk_neon, args);
 	return OK;
 }
 
@@ -1406,48 +1299,16 @@ static void cpu_ffn_silu_chunk_neon(int begin, int end, int tid, void *ctx) {
 	const float *restrict g = a->g;
 	const float *restrict u = a->u;
 	float *restrict o		= a->o;
-	int			i			= begin;
-	int			n			= end;
-	float32x4_t one			= vdupq_n_f32(1.0f);
+	int i					= begin;
+	int n					= end;
 	for (; i + 16 <= n; i += 16) {
-		float32x4_t g0 = vld1q_f32(g + i);
-		float32x4_t g1 = vld1q_f32(g + i + 4);
-		float32x4_t g2 = vld1q_f32(g + i + 8);
-		float32x4_t g3 = vld1q_f32(g + i + 12);
-		float32x4_t e0 = vexpq_f32(vnegq_f32(g0));
-		float32x4_t e1 = vexpq_f32(vnegq_f32(g1));
-		float32x4_t e2 = vexpq_f32(vnegq_f32(g2));
-		float32x4_t e3 = vexpq_f32(vnegq_f32(g3));
-		float32x4_t d0 = vaddq_f32(one, e0);
-		float32x4_t d1 = vaddq_f32(one, e1);
-		float32x4_t d2 = vaddq_f32(one, e2);
-		float32x4_t d3 = vaddq_f32(one, e3);
-		float32x4_t s0 = vrecpeq_f32(d0);
-		float32x4_t s1 = vrecpeq_f32(d1);
-		float32x4_t s2 = vrecpeq_f32(d2);
-		float32x4_t s3 = vrecpeq_f32(d3);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s1			   = vmulq_f32(vrecpsq_f32(d1, s1), s1);
-		s2			   = vmulq_f32(vrecpsq_f32(d2, s2), s2);
-		s3			   = vmulq_f32(vrecpsq_f32(d3, s3), s3);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s1			   = vmulq_f32(vrecpsq_f32(d1, s1), s1);
-		s2			   = vmulq_f32(vrecpsq_f32(d2, s2), s2);
-		s3			   = vmulq_f32(vrecpsq_f32(d3, s3), s3);
-		vst1q_f32(o + i, vmulq_f32(vmulq_f32(g0, s0), vld1q_f32(u + i)));
-		vst1q_f32(o + i + 4, vmulq_f32(vmulq_f32(g1, s1), vld1q_f32(u + i + 4)));
-		vst1q_f32(o + i + 8, vmulq_f32(vmulq_f32(g2, s2), vld1q_f32(u + i + 8)));
-		vst1q_f32(o + i + 12, vmulq_f32(vmulq_f32(g3, s3), vld1q_f32(u + i + 12)));
+		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
+		vst1q_f32(o + i + 4, silu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
+		vst1q_f32(o + i + 8, silu_mul_vec4(vld1q_f32(g + i + 8), vld1q_f32(u + i + 8)));
+		vst1q_f32(o + i + 12, silu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 	}
-	for (; i + 4 <= n; i += 4) {
-		float32x4_t g0 = vld1q_f32(g + i);
-		float32x4_t e0 = vexpq_f32(vnegq_f32(g0));
-		float32x4_t d0 = vaddq_f32(one, e0);
-		float32x4_t s0 = vrecpeq_f32(d0);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		vst1q_f32(o + i, vmulq_f32(vmulq_f32(g0, s0), vld1q_f32(u + i)));
-	}
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 	for (; i < n; i++) {
 		float gv = g[i];
 		o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
@@ -1458,11 +1319,8 @@ status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up
 							 int n) {
 	cpu_priv		*p = self->priv;
 	cpu_ffn_act_args a = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
-	if (p->pool && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_ffn_silu_chunk_neon, &a);
-	} else {
-		cpu_ffn_silu_chunk_neon(0, n, 0, &a);
-	}
+	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
+					   cpu_ffn_silu_chunk_neon, &a);
 	return OK;
 }
 
@@ -1476,34 +1334,11 @@ static void cpu_ffn_gelu_chunk_neon(int begin, int end, int tid, void *ctx) {
 	const float c_x3		= 0.044715f;
 	int			i			= begin;
 	int			n			= end;
-	float32x4_t half		= vdupq_n_f32(0.5f);
-	float32x4_t one			= vdupq_n_f32(1.0f);
-	float32x4_t c_v			= vdupq_n_f32(c_fit);
 	for (; i + 16 <= n; i += 16) {
-		float32x4_t g0	 = vld1q_f32(g + i);
-		float32x4_t g1	 = vld1q_f32(g + i + 4);
-		float32x4_t g2	 = vld1q_f32(g + i + 8);
-		float32x4_t g3	 = vld1q_f32(g + i + 12);
-		float32x4_t g0sq = vmulq_f32(g0, g0);
-		float32x4_t g1sq = vmulq_f32(g1, g1);
-		float32x4_t g2sq = vmulq_f32(g2, g2);
-		float32x4_t g3sq = vmulq_f32(g3, g3);
-		float32x4_t g0c	 = vmulq_f32(g0, vfmaq_n_f32(one, g0sq, c_x3));
-		float32x4_t g1c	 = vmulq_f32(g1, vfmaq_n_f32(one, g1sq, c_x3));
-		float32x4_t g2c	 = vmulq_f32(g2, vfmaq_n_f32(one, g2sq, c_x3));
-		float32x4_t g3c	 = vmulq_f32(g3, vfmaq_n_f32(one, g3sq, c_x3));
-		float32x4_t in0	 = vmulq_f32(c_v, g0c);
-		float32x4_t in1	 = vmulq_f32(c_v, g1c);
-		float32x4_t in2	 = vmulq_f32(c_v, g2c);
-		float32x4_t in3	 = vmulq_f32(c_v, g3c);
-		float32x4_t t0	 = vaddq_f32(one, vtanhq_f32(in0));
-		float32x4_t t1	 = vaddq_f32(one, vtanhq_f32(in1));
-		float32x4_t t2	 = vaddq_f32(one, vtanhq_f32(in2));
-		float32x4_t t3	 = vaddq_f32(one, vtanhq_f32(in3));
-		vst1q_f32(o + i, vmulq_f32(vmulq_f32(vmulq_f32(half, g0), t0), vld1q_f32(u + i)));
-		vst1q_f32(o + i + 4, vmulq_f32(vmulq_f32(vmulq_f32(half, g1), t1), vld1q_f32(u + i + 4)));
-		vst1q_f32(o + i + 8, vmulq_f32(vmulq_f32(vmulq_f32(half, g2), t2), vld1q_f32(u + i + 8)));
-		vst1q_f32(o + i + 12, vmulq_f32(vmulq_f32(vmulq_f32(half, g3), t3), vld1q_f32(u + i + 12)));
+		vst1q_f32(o + i, gelu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
+		vst1q_f32(o + i + 4, gelu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
+		vst1q_f32(o + i + 8, gelu_mul_vec4(vld1q_f32(g + i + 8), vld1q_f32(u + i + 8)));
+		vst1q_f32(o + i + 12, gelu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 	}
 	for (; i < n; i++) {
 		float x		= g[i];
@@ -1520,42 +1355,16 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 	const float *restrict g	 = a->g;
 	const float *restrict u	 = a->u;
 	float *restrict o		 = a->o;
-	int			i			 = begin;
-	int			n			 = end;
-	float32x4_t one			 = vdupq_n_f32(1.0f);
+	int i					 = begin;
+	int n					 = end;
 	if (a->activation == 1) {
 		const float c_fit = 0.7978845608028654f;
 		const float c_x3  = 0.044715f;
-		float32x4_t half  = vdupq_n_f32(0.5f);
-		float32x4_t c_v	  = vdupq_n_f32(c_fit);
 		for (; i + 16 <= n; i += 16) {
-			float32x4_t g0	 = vld1q_f32(g + i);
-			float32x4_t g1	 = vld1q_f32(g + i + 4);
-			float32x4_t g2	 = vld1q_f32(g + i + 8);
-			float32x4_t g3	 = vld1q_f32(g + i + 12);
-			float32x4_t g0sq = vmulq_f32(g0, g0);
-			float32x4_t g1sq = vmulq_f32(g1, g1);
-			float32x4_t g2sq = vmulq_f32(g2, g2);
-			float32x4_t g3sq = vmulq_f32(g3, g3);
-			float32x4_t g0c	 = vmulq_f32(g0, vfmaq_n_f32(one, g0sq, c_x3));
-			float32x4_t g1c	 = vmulq_f32(g1, vfmaq_n_f32(one, g1sq, c_x3));
-			float32x4_t g2c	 = vmulq_f32(g2, vfmaq_n_f32(one, g2sq, c_x3));
-			float32x4_t g3c	 = vmulq_f32(g3, vfmaq_n_f32(one, g3sq, c_x3));
-			float32x4_t in0	 = vmulq_f32(c_v, g0c);
-			float32x4_t in1	 = vmulq_f32(c_v, g1c);
-			float32x4_t in2	 = vmulq_f32(c_v, g2c);
-			float32x4_t in3	 = vmulq_f32(c_v, g3c);
-			float32x4_t t0	 = vaddq_f32(one, vtanhq_f32(in0));
-			float32x4_t t1	 = vaddq_f32(one, vtanhq_f32(in1));
-			float32x4_t t2	 = vaddq_f32(one, vtanhq_f32(in2));
-			float32x4_t t3	 = vaddq_f32(one, vtanhq_f32(in3));
-			vst1q_f32(o + i, vmulq_f32(vmulq_f32(vmulq_f32(half, g0), t0), vld1q_f32(u + i)));
-			vst1q_f32(o + i + 4,
-					  vmulq_f32(vmulq_f32(vmulq_f32(half, g1), t1), vld1q_f32(u + i + 4)));
-			vst1q_f32(o + i + 8,
-					  vmulq_f32(vmulq_f32(vmulq_f32(half, g2), t2), vld1q_f32(u + i + 8)));
-			vst1q_f32(o + i + 12,
-					  vmulq_f32(vmulq_f32(vmulq_f32(half, g3), t3), vld1q_f32(u + i + 12)));
+			vst1q_f32(o + i, gelu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
+			vst1q_f32(o + i + 4, gelu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
+			vst1q_f32(o + i + 8, gelu_mul_vec4(vld1q_f32(g + i + 8), vld1q_f32(u + i + 8)));
+			vst1q_f32(o + i + 12, gelu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 		}
 		for (; i < n; i++) {
 			float x		= g[i];
@@ -1567,44 +1376,13 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 		return;
 	}
 	for (; i + 16 <= n; i += 16) {
-		float32x4_t g0 = vld1q_f32(g + i);
-		float32x4_t g1 = vld1q_f32(g + i + 4);
-		float32x4_t g2 = vld1q_f32(g + i + 8);
-		float32x4_t g3 = vld1q_f32(g + i + 12);
-		float32x4_t e0 = vexpq_f32(vnegq_f32(g0));
-		float32x4_t e1 = vexpq_f32(vnegq_f32(g1));
-		float32x4_t e2 = vexpq_f32(vnegq_f32(g2));
-		float32x4_t e3 = vexpq_f32(vnegq_f32(g3));
-		float32x4_t d0 = vaddq_f32(one, e0);
-		float32x4_t d1 = vaddq_f32(one, e1);
-		float32x4_t d2 = vaddq_f32(one, e2);
-		float32x4_t d3 = vaddq_f32(one, e3);
-		float32x4_t s0 = vrecpeq_f32(d0);
-		float32x4_t s1 = vrecpeq_f32(d1);
-		float32x4_t s2 = vrecpeq_f32(d2);
-		float32x4_t s3 = vrecpeq_f32(d3);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s1			   = vmulq_f32(vrecpsq_f32(d1, s1), s1);
-		s2			   = vmulq_f32(vrecpsq_f32(d2, s2), s2);
-		s3			   = vmulq_f32(vrecpsq_f32(d3, s3), s3);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s1			   = vmulq_f32(vrecpsq_f32(d1, s1), s1);
-		s2			   = vmulq_f32(vrecpsq_f32(d2, s2), s2);
-		s3			   = vmulq_f32(vrecpsq_f32(d3, s3), s3);
-		vst1q_f32(o + i, vmulq_f32(vmulq_f32(g0, s0), vld1q_f32(u + i)));
-		vst1q_f32(o + i + 4, vmulq_f32(vmulq_f32(g1, s1), vld1q_f32(u + i + 4)));
-		vst1q_f32(o + i + 8, vmulq_f32(vmulq_f32(g2, s2), vld1q_f32(u + i + 8)));
-		vst1q_f32(o + i + 12, vmulq_f32(vmulq_f32(g3, s3), vld1q_f32(u + i + 12)));
+		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
+		vst1q_f32(o + i + 4, silu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
+		vst1q_f32(o + i + 8, silu_mul_vec4(vld1q_f32(g + i + 8), vld1q_f32(u + i + 8)));
+		vst1q_f32(o + i + 12, silu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 	}
-	for (; i + 4 <= n; i += 4) {
-		float32x4_t g0 = vld1q_f32(g + i);
-		float32x4_t e0 = vexpq_f32(vnegq_f32(g0));
-		float32x4_t d0 = vaddq_f32(one, e0);
-		float32x4_t s0 = vrecpeq_f32(d0);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		s0			   = vmulq_f32(vrecpsq_f32(d0, s0), s0);
-		vst1q_f32(o + i, vmulq_f32(vmulq_f32(g0, s0), vld1q_f32(u + i)));
-	}
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 	for (; i < n; i++) {
 		float gv = g[i];
 		o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
@@ -1631,89 +1409,14 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 	cpu_ffn_act_args a	   = {.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out)};
 	const size_t	 total = (size_t)m * (size_t)n;
 
-	if (tpool_current_tid() < 0 && p->pool && total >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
-		tpool_parallel_for(p->pool, (int)total, CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
-		return OK;
-	}
-
-	fn(0, (int)total, 0, &a);
+	cpu_run_batch_full(p->pool, (int)total, CPU_ELEMWISE_MIN_PER_THREAD,
+					   2 * CPU_ELEMWISE_MIN_PER_THREAD, fn, &a);
 	return OK;
 }
 
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
 	(void)self;
-	const float	   *lp		= cpu_ptr(logits);
-	float32x4_t		best_v0 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v1 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v2 = vdupq_n_f32(-INFINITY);
-	float32x4_t		best_v3 = vdupq_n_f32(-INFINITY);
-	int32x4_t		best_i0 = vdupq_n_s32(0);
-	int32x4_t		best_i1 = vdupq_n_s32(0);
-	int32x4_t		best_i2 = vdupq_n_s32(0);
-	int32x4_t		best_i3 = vdupq_n_s32(0);
-	int32x4_t		idx0	= {0, 1, 2, 3};
-	int32x4_t		idx1	= {4, 5, 6, 7};
-	int32x4_t		idx2	= {8, 9, 10, 11};
-	int32x4_t		idx3	= {12, 13, 14, 15};
-	const int32x4_t stride	= vdupq_n_s32(16);
-	int				i		= 0;
-	for (; i + 16 <= n; i += 16) {
-		float32x4_t v0 = vld1q_f32(lp + i);
-		float32x4_t v1 = vld1q_f32(lp + i + 4);
-		float32x4_t v2 = vld1q_f32(lp + i + 8);
-		float32x4_t v3 = vld1q_f32(lp + i + 12);
-		uint32x4_t	m0 = vcgtq_f32(v0, best_v0);
-		uint32x4_t	m1 = vcgtq_f32(v1, best_v1);
-		uint32x4_t	m2 = vcgtq_f32(v2, best_v2);
-		uint32x4_t	m3 = vcgtq_f32(v3, best_v3);
-		best_v0		   = vbslq_f32(m0, v0, best_v0);
-		best_v1		   = vbslq_f32(m1, v1, best_v1);
-		best_v2		   = vbslq_f32(m2, v2, best_v2);
-		best_v3		   = vbslq_f32(m3, v3, best_v3);
-		best_i0		   = vbslq_s32(m0, idx0, best_i0);
-		best_i1		   = vbslq_s32(m1, idx1, best_i1);
-		best_i2		   = vbslq_s32(m2, idx2, best_i2);
-		best_i3		   = vbslq_s32(m3, idx3, best_i3);
-		idx0		   = vaddq_s32(idx0, stride);
-		idx1		   = vaddq_s32(idx1, stride);
-		idx2		   = vaddq_s32(idx2, stride);
-		idx3		   = vaddq_s32(idx3, stride);
-	}
-	uint32x4_t	m01	  = vcgtq_f32(best_v1, best_v0);
-	float32x4_t bv01  = vbslq_f32(m01, best_v1, best_v0);
-	int32x4_t	bi01  = vbslq_s32(m01, best_i1, best_i0);
-	uint32x4_t	m23	  = vcgtq_f32(best_v3, best_v2);
-	float32x4_t bv23  = vbslq_f32(m23, best_v3, best_v2);
-	int32x4_t	bi23  = vbslq_s32(m23, best_i3, best_i2);
-	uint32x4_t	m0123 = vcgtq_f32(bv23, bv01);
-	float32x4_t bv	  = vbslq_f32(m0123, bv23, bv01);
-	int32x4_t	bi	  = vbslq_s32(m0123, bi23, bi01);
-
-	float	vals[4];
-	int32_t idxs[4];
-	vst1q_f32(vals, bv);
-	vst1q_s32(idxs, bi);
-	float bestv = vals[0];
-	int	  best	= idxs[0];
-	if (vals[1] > bestv) {
-		bestv = vals[1];
-		best  = idxs[1];
-	}
-	if (vals[2] > bestv) {
-		bestv = vals[2];
-		best  = idxs[2];
-	}
-	if (vals[3] > bestv) {
-		bestv = vals[3];
-		best  = idxs[3];
-	}
-	for (; i < n; i++) {
-		if (lp[i] > bestv) {
-			bestv = lp[i];
-			best  = i;
-		}
-	}
-	*out_idx = best;
+	*out_idx = cpu_argmax_f32(cpu_ptr(logits), n);
 	return OK;
 }
 
@@ -1832,15 +1535,10 @@ static void cpu_attention_mla_head_neon(int begin, int end, int tid, void *ctx) 
 			float ms = 1.0f;
 			float vs = 1.0f;
 			if (score > M) {
-				float Mold		= M;
-				M				= score;
-				ms				= fast_expf(Mold - M);
-				float32x4_t msv = vdupq_n_f32(ms);
-				int			i2	= 0;
-				for (; i2 + 4 <= j->kv_lora; i2 += 4)
-					vst1q_f32(VKQ_latent + i2, vmulq_f32(vld1q_f32(VKQ_latent + i2), msv));
-				for (; i2 < j->kv_lora; i2++)
-					VKQ_latent[i2] *= ms;
+				float Mold = M;
+				M		   = score;
+				ms		   = fast_expf(Mold - M);
+				scale_f32_vec(VKQ_latent, j->kv_lora, ms);
 			} else {
 				vs = fast_expf(score - M);
 			}
@@ -1963,7 +1661,7 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	int half_rope = qk_rope / 2;
 
 	size_t		krot_need = (size_t)n_pos * qk_rope * sizeof(float);
-	status_code grow_st = cpu_scratch_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need);
+	status_code grow_st	  = cpu_buf_grow((void **)&p->mla_krot.buf, &p->mla_krot.cap, krot_need, 1);
 	if (grow_st != OK)
 		return grow_st;
 	float *k_pe_rot_all = p->mla_krot.buf;
@@ -2023,3 +1721,4 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
+CPU_BACKEND_REGISTER("cpu_aarch64", cpu_arch_ctor, 10, NULL)

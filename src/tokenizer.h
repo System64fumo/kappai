@@ -22,52 +22,51 @@ enum {
 typedef struct {
 	int32_t		id;
 	const char *text;
-	size_t		text_len;
+	uint32_t	text_len;
 	float		score;
-	int			type;
+	uint8_t		type;
 } vocab_token;
 
 typedef struct tok_hash_entry {
 	const char *key;
-	size_t		key_len;
+	uint32_t	key_len;
 	int32_t		id;
-	int			used;
 } tok_hash_entry;
 
 typedef struct {
 	vocab_token			  *tokens;
-	size_t				   n_tokens;
-	int32_t				   bos_id, eos_id, eot_id, pad_id, unk_id;
-	int					   add_bos, add_eos;
-	int					   is_sentencepiece;
-	int					   add_space_prefix;
-	int					   pre_type;
-	int32_t				   byte_fallback_ids[256];
-	size_t				   n_byte_fallback;
 	struct tok_hash_entry *hash;
-	size_t				   hash_capacity;
 	struct tok_hash_entry *merge_hash;
-	size_t				   merge_hash_capacity;
-	int					   has_merges;
 	char				 **merge_keys;
-	size_t				   n_merge_keys;
 	int32_t				  *special_ids;
-	size_t				   n_special_ids;
 	int32_t				  *special_by_first_byte;
-	size_t				   special_by_first_byte_off[257];
-	unsigned char		   special_first_byte_bitmap[32];
-	unsigned char		   special_first_bytes[256];
-	size_t				   n_special_first_bytes;
 	void				  *bpe_work;
-	size_t				   bpe_work_cap;
 	char				  *bpe_arena;
-	size_t				   bpe_arena_cap;
-	char				  *bpe_rank_buf;
-	size_t				   bpe_rank_cap;
-	char				  *bpe_sp_text;
-	size_t				   bpe_sp_cap;
+	str_builder			   bpe_sp;
+	str_builder			   gpt2_scratch;
 	void				  *bpe_pcs_cache;
-	size_t				   bpe_pcs_cache_cap;
+	str_arena			   merge_pool;
+	uint32_t			   n_tokens;
+	int32_t				   bos_id, eos_id, eot_id, pad_id, unk_id;
+	uint32_t			   n_byte_fallback;
+	uint32_t			   hash_capacity;
+	uint32_t			   merge_hash_capacity;
+	uint32_t			   n_merge_keys;
+	uint32_t			   n_special_ids;
+	uint32_t			   n_special_first_bytes;
+	uint32_t			   bpe_work_cap;
+	uint32_t			   bpe_arena_cap;
+	uint32_t			   bpe_pcs_cache_cap;
+	int32_t				   byte_fallback_ids[256];
+	int16_t				  *token_id_to_byte;
+	uint32_t			   special_by_first_byte_off[257];
+	bool				   add_bos, add_eos;
+	bool				   is_sentencepiece;
+	bool				   add_space_prefix;
+	uint8_t				   pre_type;
+	bool				   has_merges;
+	uint8_t				   special_first_byte_bitmap[32];
+	uint8_t				   special_first_bytes[256];
 } tokenizer;
 
 status_code tokenizer_init(tokenizer *t, const gguf_ctx *g);
@@ -83,5 +82,6 @@ int		tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int
 										size_t max_bytes);
 int		tokenizer_is_eog(const tokenizer *t, int32_t id);
 int32_t tokenizer_find_token(const tokenizer *t, const char *text);
+int		tokenizer_starts_with_special(const tokenizer *t, const char *s);
 
 #endif

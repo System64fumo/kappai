@@ -1,0 +1,4 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#define W_F16 1
+#include "matmul_dense.comp"

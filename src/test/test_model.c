@@ -5,7 +5,7 @@ static const int g_model_flash = 1;
 static int32_t tok_test_hash_lookup(const struct tok_hash_entry *ht, size_t cap, const char *key,
 									size_t klen) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0)
 			return ht[h].id;
 		h = (h + 1) & (cap - 1);
@@ -330,14 +330,14 @@ int run_model_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 		return 1;
 	}
 	backend *cpu = NULL;
-	if (backend_create("cpu", 0, &cpu) != OK) {
+	if (backend_create("cpu_scalar", 0, &cpu) != OK && backend_create("cpu", 0, &cpu) != OK) {
 		fprintf(stderr, "ERROR: cpu backend (the reference) is unavailable\n");
 		return 1;
 	}
 	int run_all = wants_all(argc, argv);
 	int any_run = 0;
 	for (int bi = 0; bi < n_backends; bi++) {
-		if (strcmp(infos[bi].name, "cpu") == 0)
+		if (strcmp(infos[bi].name, "cpu_scalar") == 0)
 			continue;
 		int want = run_all || matches_name(argc, argv, infos[bi].name);
 		if (!want)

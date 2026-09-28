@@ -109,18 +109,28 @@ static int utf8_to_cp(const char *s, int len, int *cp) {
 	return 1;
 }
 
-static char *gpt2_encode_bytes(const char *in, size_t in_len, size_t *out_len) {
-	char  *out = xmalloc((in_len * 2) + 1);
-	size_t n   = 0;
+static char	   g_byte_utf8[256][4];
+static uint8_t g_byte_utf8_len[256];
+static int	   g_byte_utf8_ready = 0;
+
+static void gpt2_byte_table_ensure(void) {
+	if (g_byte_utf8_ready)
+		return;
+	for (int i = 0; i < 256; i++)
+		g_byte_utf8_len[i] = (uint8_t)cp_to_utf8(g_byte_to_cp[i], g_byte_utf8[i]);
+	g_byte_utf8_ready = 1;
+}
+
+static const char *gpt2_encode_bytes(tokenizer *t, const char *in, size_t in_len, size_t *out_len) {
+	gpt2_byte_table_ensure();
+	sb_reset(&t->gpt2_scratch);
+	sb_reserve(&t->gpt2_scratch, in_len * 2 + 1);
 	for (size_t i = 0; i < in_len; i++) {
-		char buf[4];
-		int	 k = cp_to_utf8(g_byte_to_cp[(unsigned char)in[i]], buf);
-		memcpy(out + n, buf, k);
-		n += k;
+		unsigned char b = (unsigned char)in[i];
+		sb_putb(&t->gpt2_scratch, g_byte_utf8[b], g_byte_utf8_len[b]);
 	}
-	out[n]	 = '\0';
-	*out_len = n;
-	return out;
+	*out_len = t->gpt2_scratch.len;
+	return t->gpt2_scratch.p;
 }
 
 static size_t gpt2_decode_to_bytes_buf(const char *in, const unsigned char *byte_mark,
@@ -209,22 +219,36 @@ static int byte_token_value(const vocab_token *tok) {
 
 static void hash_insert(tok_hash_entry *ht, size_t cap, const char *key, size_t klen, int32_t id) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0) {
 			return;
 		}
 		h = (h + 1) & (cap - 1);
 	}
 	ht[h].key	  = key;
-	ht[h].key_len = klen;
+	ht[h].key_len = (uint32_t)klen;
 	ht[h].id	  = id;
-	ht[h].used	  = 1;
 }
 
 static int32_t hash_lookup(const tok_hash_entry *ht, size_t cap, const char *key, size_t klen) {
 	uint64_t h = fnv1a(key, klen) & (cap - 1);
-	while (ht[h].used) {
+	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0) {
+			return ht[h].id;
+		}
+		h = (h + 1) & (cap - 1);
+	}
+	return -1;
+}
+
+static int32_t hash_lookup_pair(const tok_hash_entry *ht, size_t cap, const char *a, size_t an,
+								const char *b, size_t bn) {
+	uint64_t h	  = fnv1a_update(fnv1a(a, an), b, bn);
+	size_t	 klen = an + bn;
+	h &= (cap - 1);
+	while (ht[h].key) {
+		if (ht[h].key_len == klen && memcmp(ht[h].key, a, an) == 0 &&
+			memcmp(ht[h].key + an, b, bn) == 0) {
 			return ht[h].id;
 		}
 		h = (h + 1) & (cap - 1);
@@ -496,9 +520,6 @@ typedef struct {
 	int32_t	 *hnode;
 	uint32_t *hver;
 	int		  hn;
-
-	char  *key;
-	size_t key_cap;
 } bpe_state;
 
 static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
@@ -506,23 +527,10 @@ static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 	const piece *b = &bs->pcs[bs->next[i]];
 	if (a->locked || b->locked)
 		return -1;
-	size_t klen = a->n + b->n;
-	if (klen > t->bpe_rank_cap) {
-		size_t cap = t->bpe_rank_cap > 0 ? t->bpe_rank_cap : 128;
-		while (cap < klen)
-			cap *= 2;
-		free(t->bpe_rank_buf);
-		t->bpe_rank_buf = xmalloc(cap);
-		t->bpe_rank_cap = cap;
-	}
-	bs->key		= t->bpe_rank_buf;
-	bs->key_cap = t->bpe_rank_cap;
-	memcpy(bs->key, a->p, a->n);
-	memcpy(bs->key + a->n, b->p, b->n);
 	if (t->has_merges)
-		return hash_lookup((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, bs->key,
-						   klen);
-	return hash_lookup(t->hash, t->hash_capacity, bs->key, klen);
+		return hash_lookup_pair((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, a->p,
+								a->n, b->p, b->n);
+	return hash_lookup_pair(t->hash, t->hash_capacity, a->p, a->n, b->p, b->n);
 }
 
 static void bpe_heap_swap(bpe_state *bs, int i, int j) {
@@ -682,7 +690,6 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 		bs.pcs	= pcs;
 		bs.npcs = npcs;
 		bs.head = 0;
-		bs.key	= t->bpe_rank_buf;
 	}
 
 	for (int i = 0; i < npcs; i++) {
@@ -697,15 +704,8 @@ int tokenizer_bpe_encode(tokenizer *t, const char *text, size_t len, int32_t *ou
 			bpe_heap_push(&bs, r, i, 0);
 	}
 
-	size_t arena_cap = t->bpe_arena_cap;
-	if (arena_cap < len) {
-		size_t cap = arena_cap > 0 ? arena_cap : 64;
-		while (cap < len)
-			cap *= 2;
-		free(t->bpe_arena);
-		t->bpe_arena	 = xmalloc(cap);
-		t->bpe_arena_cap = cap;
-	}
+	ARR_ENSURE(t->bpe_arena, len, t->bpe_arena_cap);
+	size_t arena_cap  = t->bpe_arena_cap;
 	char  *arena	  = t->bpe_arena;
 	size_t arena_used = 0;
 
@@ -787,33 +787,19 @@ fail:
 static int encode_sp_chunk(tokenizer *t, const char *text, size_t start, size_t end,
 						   int32_t *out_ids, int max_out, int *written) {
 	size_t sub_len = end - start;
-	if (t->bpe_sp_cap < (sub_len + 1) * 3 + 1) {
-		size_t cap = t->bpe_sp_cap > 0 ? t->bpe_sp_cap : 256;
-		while (cap < (sub_len + 1) * 3 + 1)
-			cap *= 2;
-		free(t->bpe_sp_text);
-		t->bpe_sp_text = xmalloc(cap);
-		t->bpe_sp_cap  = cap;
-	}
-	char  *sp_text = t->bpe_sp_text;
-	size_t sp_len  = 0;
-	if (t->add_space_prefix) {
-		sp_text[sp_len++] = '\xe2';
-		sp_text[sp_len++] = '\x96';
-		sp_text[sp_len++] = '\x81';
-	}
+	sb_reset(&t->bpe_sp);
+	sb_reserve(&t->bpe_sp, (sub_len + 1) * 3 + 1);
+	if (t->add_space_prefix)
+		sb_putb(&t->bpe_sp, "\xe2\x96\x81", 3);
 	for (size_t i = start; i < end; i++) {
-		if (text[i] == ' ') {
-			sp_text[sp_len++] = '\xe2';
-			sp_text[sp_len++] = '\x96';
-			sp_text[sp_len++] = '\x81';
-		} else {
-			sp_text[sp_len++] = text[i];
-		}
+		if (text[i] == ' ')
+			sb_putb(&t->bpe_sp, "\xe2\x96\x81", 3);
+		else
+			sb_putc(&t->bpe_sp, text[i]);
 	}
-	sp_text[sp_len] = '\0';
 	int n;
-	if (tokenizer_bpe_encode(t, sp_text, sp_len, out_ids + *written, max_out - *written, &n) < 0)
+	if (tokenizer_bpe_encode(t, t->bpe_sp.p, t->bpe_sp.len, out_ids + *written, max_out - *written,
+							 &n) < 0)
 		return -1;
 	*written += n;
 	return 0;
@@ -833,14 +819,12 @@ static int encode_gpt2_chunk(tokenizer *t, const char *text, size_t start, size_
 			plen = next_pretoken(text, end, &sub_pos);
 		if (plen == 0)
 			break;
-		size_t enc_len;
-		char  *enc = gpt2_encode_bytes(text + pstart, plen, &enc_len);
-		int	   n;
+		size_t		enc_len;
+		const char *enc = gpt2_encode_bytes(t, text + pstart, plen, &enc_len);
+		int			n;
 		if (tokenizer_bpe_encode(t, enc, enc_len, out_ids + *written, max_out - *written, &n) < 0) {
-			free(enc);
 			return -1;
 		}
-		free(enc);
 		*written += n;
 	}
 	return 0;
@@ -910,6 +894,7 @@ static bool g_warned_no_merges;
 
 status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	memset(t, 0, sizeof(*t));
+	str_arena_init(&t->merge_pool);
 
 	const char *model_name = NULL;
 	if (gguf_get_str(g, "tokenizer.ggml.model", &model_name) != OK) {
@@ -974,7 +959,12 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		}
 	}
 	if (t->n_byte_fallback > 0)
-		DEBUG("tokenizer: %zu byte-fallback pieces registered", t->n_byte_fallback);
+		DEBUG("tokenizer: %u byte-fallback pieces registered", t->n_byte_fallback);
+
+	t->token_id_to_byte = xmalloc(n_toks * sizeof(int16_t));
+	for (size_t i = 0; i < n_toks; i++)
+		t->token_id_to_byte[i] =
+			(t->tokens[i].type == TOK_TYPE_BYTE) ? (int16_t)byte_token_value(&t->tokens[i]) : -1;
 
 	const char *const *merges	= NULL;
 	size_t			   n_merges = 0;
@@ -986,6 +976,15 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		t->merge_hash		   = xcalloc(mcap, sizeof(tok_hash_entry));
 		t->merge_keys		   = (char **)xcalloc(n_merges, sizeof(char *));
 		t->n_merge_keys		   = 0;
+		size_t pool_need	   = 0;
+		for (size_t i = 0; i < n_merges; i++) {
+			const char *sp = strchr(merges[i], ' ');
+			if (!sp)
+				continue;
+			pool_need += (size_t)(sp - merges[i]) + strlen(sp + 1) + 1;
+		}
+		if (pool_need > 0)
+			str_arena_reserve(&t->merge_pool, pool_need);
 		for (size_t i = 0; i < n_merges; i++) {
 			const char *entry = merges[i];
 			const char *sp	  = strchr(entry, ' ');
@@ -994,7 +993,7 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 			size_t left_len	 = (size_t)(sp - entry);
 			size_t right_len = strlen(sp + 1);
 			size_t klen		 = left_len + right_len;
-			char  *key		 = xmalloc(klen + 1);
+			char  *key		 = str_arena_alloc(&t->merge_pool, klen + 1);
 			memcpy(key, entry, left_len);
 			memcpy(key + left_len, sp + 1, right_len);
 			key[klen]						 = '\0';
@@ -1141,18 +1140,18 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 
 void tokenizer_free(tokenizer *t) {
 	free(t->tokens);
+	free(t->token_id_to_byte);
 	free((void *)t->hash);
 	free((void *)t->merge_hash);
-	for (size_t i = 0; i < t->n_merge_keys; i++)
-		free(t->merge_keys[i]);
+	str_arena_free(&t->merge_pool);
 	free((void *)t->merge_keys);
 	free(t->special_ids);
 	free(t->special_by_first_byte);
 	free(t->bpe_pcs_cache);
 	free(t->bpe_work);
 	free(t->bpe_arena);
-	free(t->bpe_rank_buf);
-	free(t->bpe_sp_text);
+	sb_free(&t->bpe_sp);
+	sb_free(&t->gpt2_scratch);
 	memset(t, 0, sizeof(*t));
 }
 
@@ -1171,7 +1170,7 @@ size_t tokenizer_token_decoded_len(const tokenizer *t, int32_t id) {
 		return 0;
 	const vocab_token *tok = &t->tokens[id];
 	if (tok->type == TOK_TYPE_BYTE)
-		return (byte_token_value(tok) >= 0) ? 1 : tok->text_len;
+		return (t->token_id_to_byte[id] >= 0) ? 1 : tok->text_len;
 	size_t decoded = 0;
 	size_t i	   = 0;
 	while (i < tok->text_len) {
@@ -1186,6 +1185,47 @@ size_t tokenizer_token_decoded_len(const tokenizer *t, int32_t id) {
 	return decoded;
 }
 
+typedef struct {
+	char		  *acc;
+	unsigned char *mark;
+	int			  *owner;
+	size_t		   cap;
+	size_t		   len;
+	char		  *heap;
+} tok_acc;
+
+static void tok_acc_push(tok_acc *a, const char *bytes, size_t n, int is_byte, int owner_id) {
+	if (a->len + n > a->cap) {
+		size_t new_cap = a->cap;
+		while (a->len + n > new_cap)
+			new_cap <<= 1;
+		size_t ints = a->owner ? new_cap * sizeof(int) : 0;
+		char  *blk	= xmalloc(new_cap * 2 + ints);
+		memcpy(blk, a->acc, a->len);
+		memcpy(blk + new_cap, a->mark, a->len);
+		if (a->owner)
+			memcpy(blk + new_cap * 2, a->owner, a->len * sizeof(int));
+		free(a->heap);
+		a->heap	 = blk;
+		a->acc	 = blk;
+		a->mark	 = (unsigned char *)(blk + new_cap);
+		a->owner = a->owner ? (int *)(blk + new_cap * 2) : NULL;
+		a->cap	 = new_cap;
+	}
+	if (is_byte) {
+		a->acc[a->len]	= bytes[0];
+		a->mark[a->len] = 1;
+	} else {
+		memcpy(a->acc + a->len, bytes, n);
+		memset(a->mark + a->len, 0, n);
+	}
+	if (a->owner) {
+		for (size_t j = 0; j < n; j++)
+			a->owner[a->len + j] = owner_id;
+	}
+	a->len += n;
+}
+
 int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int n,
 									size_t max_bytes) {
 	char		   stack_acc[TOK_DECODE_STACK_CAP];
@@ -1196,7 +1236,8 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 	int			  *owner	= stack_owner;
 	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
 	size_t		   acc_len	= 0;
-	int			   acc_heap = 0;
+	char		  *heap_blk = NULL;
+	tok_acc		   ta		= {stack_acc, stack_mark, stack_owner, TOK_DECODE_STACK_CAP, 0, NULL};
 
 	for (int i = 0; i < n; i++) {
 		int32_t id = ids[i];
@@ -1206,41 +1247,22 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 		int				   bv  = -1;
 		size_t			   len = tok->text_len;
 		if (tok->type == TOK_TYPE_BYTE) {
-			bv	= byte_token_value(tok);
+			bv	= t->token_id_to_byte[id];
 			len = (bv >= 0) ? 1 : tok->text_len;
 		}
-		if (acc_len + len > acc_cap) {
-			size_t new_cap = acc_cap;
-			while (acc_len + len > new_cap)
-				new_cap <<= 1;
-			char		  *new_acc	 = xmalloc(new_cap);
-			unsigned char *new_mark	 = xmalloc(new_cap);
-			int			  *new_owner = xmalloc(new_cap * sizeof(int));
-			memcpy(new_acc, acc, acc_len);
-			memcpy(new_mark, mark, acc_len);
-			memcpy(new_owner, owner, acc_len * sizeof(int));
-			if (acc_heap) {
-				free(acc);
-				free(mark);
-				free(owner);
-			}
-			acc		 = new_acc;
-			mark	 = new_mark;
-			owner	 = new_owner;
-			acc_cap	 = new_cap;
-			acc_heap = 1;
-		}
 		if (bv >= 0) {
-			acc[acc_len]  = (char)bv;
-			mark[acc_len] = 1;
+			char b = (char)bv;
+			tok_acc_push(&ta, &b, 1, 1, i);
 		} else {
-			memcpy(acc + acc_len, tok->text, len);
-			memset(mark + acc_len, 0, len);
+			tok_acc_push(&ta, tok->text, len, 0, i);
 		}
-		for (size_t j = 0; j < len; j++)
-			owner[acc_len + j] = i;
-		acc_len += len;
 	}
+	acc		 = ta.acc;
+	mark	 = ta.mark;
+	owner	 = ta.owner;
+	acc_len	 = ta.len;
+	acc_cap	 = ta.cap;
+	heap_blk = ta.heap;
 
 	int result = 0;
 
@@ -1291,11 +1313,8 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 		result = cur_owner + 1;
 	}
 
-	if (acc_heap) {
-		free(acc);
-		free(mark);
-		free(owner);
-	}
+	if (heap_blk)
+		free(heap_blk);
 	return result;
 }
 
@@ -1307,14 +1326,14 @@ int32_t tokenizer_find_token(const tokenizer *t, const char *text) {
 			return id;
 	}
 
-	size_t needle_len = strlen(text);
-	for (size_t i = 0; i < t->n_tokens; i++) {
-		if (t->tokens[i].type != TOK_TYPE_CONTROL && t->tokens[i].type != TOK_TYPE_USER_DEFINED)
-			continue;
-		if (t->tokens[i].text_len == needle_len && memcmp(t->tokens[i].text, text, needle_len) == 0)
-			return (int32_t)i;
-	}
 	return -1;
+}
+
+int tokenizer_starts_with_special(const tokenizer *t, const char *s) {
+	if (!t || !s || !s[0])
+		return 0;
+	size_t at = 0;
+	return find_next_special(t, s, strlen(s), 0, &at) >= 0 && at == 0;
 }
 
 int tokenizer_encode_with_specials(tokenizer *t, const char *text, int add_specials,
@@ -1374,12 +1393,12 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 	unsigned char stack_mark[TOK_DECODE_STACK_CAP];
 	memset(stack_acc, 0, sizeof(stack_acc));
 	memset(stack_mark, 0, sizeof(stack_mark));
-	char		  *acc		 = stack_acc;
-	unsigned char *mark		 = stack_mark;
-	size_t		   acc_cap	 = TOK_DECODE_STACK_CAP;
-	size_t		   acc_len	 = 0;
-	int			   acc_heap	 = 0;
-	int			   mark_heap = 0;
+	char		  *acc		= stack_acc;
+	unsigned char *mark		= stack_mark;
+	size_t		   acc_cap	= TOK_DECODE_STACK_CAP;
+	size_t		   acc_len	= 0;
+	char		  *heap_blk = NULL;
+	tok_acc		   ta		= {stack_acc, stack_mark, NULL, TOK_DECODE_STACK_CAP, 0, NULL};
 
 	for (int i = 0; i < n_ids; i++) {
 		int32_t id = ids[i];
@@ -1389,41 +1408,21 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 		int				   bv  = -1;
 		size_t			   n   = tok->text_len;
 		if (tok->type == TOK_TYPE_BYTE) {
-			bv = byte_token_value(tok);
+			bv = t->token_id_to_byte[id];
 			n  = (bv >= 0) ? 1 : tok->text_len;
 		}
-		if (acc_len + n > acc_cap) {
-			size_t new_cap = acc_cap;
-			while (acc_len + n > new_cap)
-				new_cap <<= 1;
-			if (acc_heap) {
-				acc = xrealloc(acc, new_cap);
-			} else {
-				char *heap_acc = xmalloc(new_cap);
-				memcpy(heap_acc, acc, acc_len);
-				acc		 = heap_acc;
-				acc_heap = 1;
-			}
-			if (mark_heap) {
-				mark = xrealloc(mark, new_cap);
-			} else {
-				unsigned char *heap_mark = xmalloc(new_cap);
-				memcpy(heap_mark, mark, acc_len);
-				mark	  = heap_mark;
-				mark_heap = 1;
-			}
-			memset(mark + acc_len, 0, new_cap - acc_len);
-			acc_cap = new_cap;
-		}
 		if (bv >= 0) {
-			acc[acc_len]  = (char)bv;
-			mark[acc_len] = 1;
+			char b = (char)bv;
+			tok_acc_push(&ta, &b, 1, 1, 0);
 		} else {
-			memcpy(acc + acc_len, tok->text, n);
-			memset(mark + acc_len, 0, n);
+			tok_acc_push(&ta, tok->text, n, 0, 0);
 		}
-		acc_len += n;
 	}
+	acc		 = ta.acc;
+	mark	 = ta.mark;
+	acc_len	 = ta.len;
+	acc_cap	 = ta.cap;
+	heap_blk = ta.heap;
 
 	if (t->is_sentencepiece && acc_len >= 3) {
 		size_t rd = 0;
@@ -1462,10 +1461,8 @@ int tokenizer_decode(tokenizer *t, const int32_t *ids, int n_ids, char *out, int
 		raw_len = gpt2_decode_to_bytes_buf(acc, mark, acc_len, raw);
 	}
 
-	if (acc_heap)
-		free(acc);
-	if (mark_heap)
-		free(mark);
+	if (heap_blk)
+		free(heap_blk);
 
 	if ((int)raw_len >= max_out) {
 		if (raw_heap)

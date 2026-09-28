@@ -5,6 +5,7 @@
  * code. Keeps CPU/Vulkan backends free of QM knowledge. */
 #include "backend/cuda/cuda_repack.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -12,6 +13,74 @@
 #include "backend/cpu/scalar/quants.h"
 
 #define CUDA_QM_GROUP 32
+
+/* f16 <-> f32 helpers.
+ *
+ * This translation unit is linked into the engine (model.c calls it), while
+ * the scalar backend's f16_to_f32/f32_to_f16 now live in a dlopen'd
+ * libkappai_cpu_scalar.so, so the engine cannot link against them. Keep
+ * bit-exact local copies instead: f32_to_f16 mirrors the scalar reference
+ * algorithm verbatim, and qm_f16_to_f32 is the exact IEEE half expansion
+ * (equal to the reference lookup table for all 65536 encodings). */
+static inline uint32_t qm_f32_to_bits(float f) {
+	union {
+		float	 f;
+		uint32_t i;
+	} v;
+	v.f = f;
+	return v.i;
+}
+
+static inline float qm_f32_from_bits(uint32_t b) {
+	union {
+		uint32_t i;
+		float	 f;
+	} v;
+	v.i = b;
+	return v.f;
+}
+
+static inline float qm_f16_to_f32(uint16_t h) {
+	const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+	uint32_t	   exp	 = ((uint32_t)h >> 10) & 0x1Fu;
+	uint32_t	   mant = (uint32_t)h & 0x03FFu;
+	uint32_t	   u;
+	if (exp == 0) {
+		if (mant == 0) {
+			u = sign;
+		} else {
+			/* subnormal half: renormalize into the float normal range */
+			exp = 1;
+			while ((mant & 0x0400u) == 0) {
+				mant <<= 1;
+				exp--;
+			}
+			mant &= 0x03FFu;
+			u = sign | ((exp + 112) << 23) | (mant << 13);
+		}
+	} else if (exp == 0x1F) {
+		u = sign | 0x7F800000u | (mant << 13);
+	} else {
+		u = sign | ((exp + 112) << 23) | (mant << 13);
+	}
+	return qm_f32_from_bits(u);
+}
+
+static inline uint16_t qm_f32_to_f16(float f) {
+	const float	base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
+	const uint32_t w		= qm_f32_to_bits(f);
+	const uint32_t shl1_w = w + w;
+	const uint32_t sign	= w & 0x80000000u;
+	uint32_t		bias	= shl1_w & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	const float		rounded = qm_f32_from_bits((bias >> 1) + 0x07800000u) + base;
+	const uint32_t bits		= qm_f32_to_bits(rounded);
+	const uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
+	const uint32_t mant_bits = bits & 0x0FFFu;
+	const uint32_t nonsign   = exp_bits + mant_bits;
+	return (uint16_t)((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
+}
 
 /* ---- Quad-major Q8_0 (34B/32e blocks) ------------------------------- */
 static void repack_q8_0_qm_group(const q8_0_block *s, uint8_t *d, int G) {
@@ -84,8 +153,8 @@ void *cuda_convert_q4_0_to_q8_0(const void *src, int n_rows, int k) {
 		for (int b = 0; b < nb; b++) {
 			const q4_0_block *sb = s + (size_t)r * nb + b;
 			q8_0_block		 *db = dst + (size_t)r * nb + b;
-			float			  d	 = f16_to_f32(sb->d);
-			db->d				 = f32_to_f16(d * 0.5f);
+			float			  d	 = qm_f16_to_f32(sb->d);
+			db->d				 = qm_f32_to_f16(d * 0.5f);
 			/* Nibble order: low -> elems 0-15, high -> elems 16-31. */
 			for (int j = 0; j < 16; j++) {
 				uint8_t qb	   = sb->qs[j];

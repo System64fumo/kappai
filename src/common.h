@@ -1,6 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <ctype.h>
 #include <execinfo.h>
 #include <limits.h>
 #include <sched.h>
@@ -24,6 +25,20 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
+static inline size_t str_lcp_len(const char *a, const char *b) {
+	size_t i = 0;
+	while (a[i] && b[i] && a[i] == b[i])
+		i++;
+	return i;
+}
+
+static inline const char *path_basename(const char *path) {
+	if (!path)
+		return "";
+	const char *slash = strrchr(path, '/');
+	return slash ? slash + 1 : path;
+}
+
 #define HEAD_DIM_MAX 512
 
 typedef enum {
@@ -37,6 +52,7 @@ typedef enum {
 	ERR_INTERNAL	  = -7,
 	ERR_INTERRUPTED	  = -8,
 	ERR_FALLBACK	  = -9,
+	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
 typedef struct {
@@ -52,14 +68,22 @@ static inline void madvise_hugepage(void *ptr, size_t bytes) {
 #endif
 }
 
+static inline long page_size_cached(void) {
+	static long ps = 0;
+	if (ps <= 0) {
+		ps = sysconf(_SC_PAGESIZE);
+		if (ps <= 0)
+			ps = 4096;
+	}
+	return ps;
+}
+
 static inline void prefault(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	long ps = sysconf(_SC_PAGESIZE);
-	if (ps <= 0)
-		ps = 4096;
-	volatile char *p = (volatile char *)ptr;
-	for (size_t off = 0; off < bytes; off += (size_t)ps)
+	size_t		   ps = (size_t)page_size_cached();
+	volatile char *p  = (volatile char *)ptr;
+	for (size_t off = 0; off < bytes; off += ps)
 		p[off] = p[off];
 	p[bytes - 1] = p[bytes - 1];
 }
@@ -72,6 +96,52 @@ static inline void cpu_relax(void) {
 #else
 	sched_yield();
 #endif
+}
+
+typedef int (*spin_until_fn)(void *ud);
+
+static inline void spin_wait_relax(spin_until_fn pred, void *ud) {
+	unsigned spins = 0;
+	while (!pred(ud)) {
+		if (++spins % 1024 == 0)
+			sched_yield();
+		else
+			cpu_relax();
+	}
+}
+
+typedef struct {
+	uintptr_t start;
+	size_t	  len;
+} page_span;
+
+static inline page_span page_span_for(const void *ptr, size_t bytes, size_t page_size) {
+	page_span r = {0, 0};
+	if (!ptr || bytes == 0 || page_size == 0)
+		return r;
+	uintptr_t addr = (uintptr_t)ptr;
+	uintptr_t end  = addr + bytes;
+	if (end < addr)
+		return r;
+	uintptr_t mask	 = ~((uintptr_t)page_size - 1);
+	uintptr_t pstart = addr & mask;
+	uintptr_t pend	 = (end + page_size - 1) & mask;
+	if (pend < pstart)
+		return r;
+	r.start = pstart;
+	r.len	= pend - pstart;
+	return r;
+}
+
+static inline int page_span_clamp(page_span *r, uintptr_t base, size_t size) {
+	if (!r || r->len == 0)
+		return 0;
+	if (r->start < base || r->start + r->len < r->start)
+		return 0;
+	uintptr_t stop = base + size;
+	if (r->start + r->len > stop || stop < base)
+		return 0;
+	return 1;
 }
 
 static inline void oom_abort(size_t bytes) {
@@ -129,6 +199,48 @@ static inline char *xstrdup(const char *s) {
 	return p;
 }
 
+static inline char *xstrndup(const char *s, size_t n) {
+	char *p = xmalloc(n + 1);
+	memcpy(p, s, n);
+	p[n] = '\0';
+	return p;
+}
+
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
+
+typedef struct {
+	const char *p;
+	size_t		len;
+} str_span;
+
+static inline str_span span_trim(const char *s, size_t len) {
+	while (len > 0 && isspace((unsigned char)*s)) {
+		s++;
+		len--;
+	}
+	while (len > 0 && isspace((unsigned char)s[len - 1]))
+		len--;
+	str_span sp = {s, len};
+	return sp;
+}
+
+static inline char *span_dup(str_span sp) {
+	return xstrndup(sp.p, sp.len);
+}
+
+static inline size_t marker_tail_len(const char *s, size_t len, const char *marker) {
+	if (!marker)
+		return 0;
+	size_t mlen = strlen(marker);
+	if (mlen <= 1)
+		return 0;
+	size_t max = len < mlen - 1 ? len : mlen - 1;
+	for (size_t k = max; k > 0; k--)
+		if (memcmp(s + len - k, marker, k) == 0)
+			return k;
+	return 0;
+}
+
 static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
 	if (need > b->cap) {
 		size_t bytes = need * sizeof(float);
@@ -162,6 +274,146 @@ static inline float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t a
 
 static inline float *float_buf_ensure(float_buf *b, size_t need) {
 	return float_buf_ensure_aligned(b, need, 64);
+}
+
+typedef struct {
+	char  *p;
+	size_t len;
+	size_t cap;
+} str_builder;
+
+static inline void sb_reserve(str_builder *b, size_t extra) {
+	size_t need = b->len + extra + 1;
+	if (need <= b->cap)
+		return;
+	size_t cap = b->cap ? b->cap : 128;
+	while (cap < need)
+		cap *= 2;
+	b->p   = xrealloc(b->p, cap);
+	b->cap = cap;
+	if (b->len == 0)
+		b->p[0] = '\0';
+}
+
+static inline void sb_init(str_builder *b) {
+	b->len	= 0;
+	b->cap	= 128;
+	b->p	= xmalloc(b->cap);
+	b->p[0] = '\0';
+}
+
+static inline void sb_putb(str_builder *b, const char *s, size_t n) {
+	if (!b || !s || n == 0)
+		return;
+	sb_reserve(b, n);
+	memcpy(b->p + b->len, s, n);
+	b->len += n;
+	b->p[b->len] = '\0';
+}
+
+static inline void sb_puts(str_builder *b, const char *s) {
+	if (s)
+		sb_putb(b, s, strlen(s));
+}
+
+static inline void sb_putc(str_builder *b, char c) {
+	sb_reserve(b, 1);
+	b->p[b->len++] = c;
+	b->p[b->len]   = '\0';
+}
+
+static inline void sb_reset(str_builder *b) {
+	if (!b)
+		return;
+	b->len = 0;
+	if (b->p)
+		b->p[0] = '\0';
+}
+
+static inline char *sb_finish(str_builder *b) {
+	sb_reserve(b, 0);
+	char *p = b->p ? b->p : xstrdup("");
+	memset(b, 0, sizeof(*b));
+	return p;
+}
+
+static inline void sb_free(str_builder *b) {
+	free(b->p);
+	memset(b, 0, sizeof(*b));
+}
+
+static inline void str_replace_all(str_builder *out, const char *s, const char *from,
+								   const char *to) {
+	size_t flen = strlen(from);
+	if (flen == 0) {
+		sb_puts(out, s);
+		return;
+	}
+	const char *cur;
+	while ((cur = strstr(s, from)) != NULL) {
+		sb_putb(out, s, (size_t)(cur - s));
+		sb_puts(out, to);
+		s = cur + flen;
+	}
+	sb_puts(out, s);
+}
+
+typedef struct {
+	char **chunks;
+	size_t n_chunks;
+	char  *cur;
+	char  *end;
+	size_t next_size;
+} str_arena;
+
+static inline void str_arena_init(str_arena *a) {
+	memset(a, 0, sizeof(*a));
+	a->next_size = 1u << 16;
+}
+
+static inline char *str_arena_alloc(str_arena *a, size_t n) {
+	if (n == 0)
+		n = 1;
+	if (!a->cur || (size_t)(a->end - a->cur) < n) {
+		size_t sz = a->next_size;
+		if (sz < n)
+			sz = (n + 63u) & ~(size_t)63u;
+		a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
+		a->chunks[a->n_chunks] = (char *)xmalloc(sz);
+		a->n_chunks++;
+		a->cur		 = a->chunks[a->n_chunks - 1];
+		a->end		 = a->cur + sz;
+		a->next_size = sz < (1u << 24) ? sz * 2 : sz;
+	}
+	char *p = a->cur;
+	a->cur += n;
+	return p;
+}
+
+static inline void str_arena_reserve(str_arena *a, size_t n) {
+	if (n == 0)
+		return;
+	if (a->cur && (size_t)(a->end - a->cur) >= n)
+		return;
+	a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
+	a->chunks[a->n_chunks] = (char *)xmalloc(n);
+	a->n_chunks++;
+	a->cur = a->chunks[a->n_chunks - 1];
+	a->end = a->cur + n;
+}
+
+static inline char *str_arena_dup(str_arena *a, const char *s, size_t len) {
+	char *p = str_arena_alloc(a, len + 1);
+	memcpy(p, s, len);
+	p[len] = '\0';
+	return p;
+}
+
+static inline void str_arena_free(str_arena *a) {
+	for (size_t i = 0; i < a->n_chunks; i++)
+		free(a->chunks[i]);
+	free(a->chunks);
+	memset(a, 0, sizeof(*a));
 }
 
 static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {
@@ -213,8 +465,10 @@ static inline int topk_heap_select(const float *scores, int n_scores, int k, flo
 	return hn;
 }
 
+#define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
+
 static inline uint64_t fnv1a(const char *s, size_t n) {
-	uint64_t h = 0xcbf29ce484222325ULL;
+	uint64_t h = FNV1A_OFFSET_BASIS;
 	for (size_t i = 0; i < n; i++) {
 		h ^= (uint8_t)s[i];
 		h *= 0x100000001b3ULL;
@@ -226,11 +480,31 @@ static inline uint64_t fnv1a_str(const char *s) {
 	return fnv1a(s, strlen(s));
 }
 
+static inline uint64_t fnv1a_update(uint64_t h, const char *s, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+static inline uint64_t fnv1a_update_str(uint64_t h, const char *s) {
+	return s ? fnv1a_update(h, s, strlen(s)) : h;
+}
+
 #define ARR_RESERVE(items, n, cap)                                                                 \
 	do {                                                                                           \
 		if ((n) == (cap)) {                                                                        \
 			(cap)	= (cap) ? (cap) * 2 : 8;                                                       \
 			(items) = xrealloc((items), (cap) * sizeof(*(items)));                                 \
+		}                                                                                          \
+	} while (0)
+
+#define ARR_ENSURE(items, need, cap)                                                               \
+	do {                                                                                           \
+		if ((cap) < (need)) {                                                                      \
+			(cap)	= (need);                                                                      \
+			(items) = xrealloc((items), (size_t)(cap) * sizeof(*(items)));                         \
 		}                                                                                          \
 	} while (0)
 

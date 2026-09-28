@@ -16,14 +16,12 @@
 #define COLOR_GRAY "\033[90m"
 
 typedef struct {
-	bool	 output_stream;
-	int		*p_gen;
-	bool	 in_thinking;
-	bool	 first_token;
-	bool	 skip_label;
-	int32_t	 think_start_id;
-	int32_t	 think_end_id;
-	context *c;
+	bool		 output_stream;
+	int			*p_gen;
+	think_filter think;
+	int32_t		 think_start_id;
+	int32_t		 think_end_id;
+	context		*c;
 } on_token_ud;
 
 static int g_use_color	   = 0;
@@ -61,40 +59,32 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	if (!u->output_stream)
 		return;
 
-	if (u->first_token && u->c && u->c->chat.think_open) {
-		u->in_thinking = true;
-		print_start_thinking();
-	}
-	u->first_token = false;
-
-	if (id == u->think_start_id) {
-		u->in_thinking = true;
-		u->skip_label  = true;
-		print_start_thinking();
-		return;
-	}
-	if (id == u->think_end_id) {
-		if (u->in_thinking) {
-			u->in_thinking = false;
-			print_end_thinking();
-		}
-		return;
-	}
-
-	if (u->skip_label) {
-		const char *nl = memchr(piece, '\n', (size_t)n);
-		if (!nl)
+	think_filter_event ev;
+	{
+		int	 think_open	  = u->c && u->c->chat.think_open;
+		bool first		  = u->think.first_token;
+		bool was_thinking = u->think.in_thinking || (first && think_open);
+		ev = think_filter_feed(&u->think, id, u->think_start_id, u->think_end_id, think_open,
+							   &piece, &n);
+		if (first && think_open)
+			print_start_thinking();
+		if (ev == THINK_START) {
+			print_start_thinking();
 			return;
-		n			  = n - (int)(nl - piece) - 1;
-		piece		  = nl + 1;
-		u->skip_label = false;
+		}
+		if (ev == THINK_END) {
+			if (was_thinking)
+				print_end_thinking();
+			return;
+		}
+		if (ev != THINK_EMIT)
+			return;
 	}
 
 	if (n > 0) {
 		fwrite(piece, 1, n, stdout);
 		if (g_stdout_isatty)
 			fflush(stdout);
-		u->first_token = false;
 	}
 }
 
@@ -119,46 +109,43 @@ static status_code warmup_run(context *c, const char *system) {
 		return OK;
 	}
 
-	int		 cap = c->n_ctx;
-	int32_t *ids = context_ids_scratch(c, cap + 1);
-	int		 n	 = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
-	if (n < 0) {
-		free(render);
+	status_code ret = OK;
+	int			cap = c->n_ctx;
+	int32_t	   *ids = context_ids_scratch(c, cap + 1);
+	int			n = tokenizer_encode_with_specials(&c->tok, render, 0, ids, cap, &c->scratch.prof);
+	int			count = 0;
+	if (n >= 0)
+		count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
+	if (n < 0 || count == 0)
 		goto restore;
-	}
-
-	int count = tokenizer_token_count_for_bytes(&c->tok, ids, n, prefix_bytes);
-	if (count == 0) {
-		free(render);
-		goto restore;
-	}
 
 	context_monitor_send_start(c);
 	prefill_result pf = context_prefill_tokens(c, ids, count, "warmup", true);
 	if (pf.rc < 0) {
-		free(render);
-		free(prev_render);
 		c->session_poisoned = true;
-		return ERR_INTERNAL;
+		ret					= ERR_INTERNAL;
+		goto out;
 	}
 
 	c->warmup_done = true;
 
 	DEBUG("warmup: prefilled %d tokens", count);
-
-	free(render);
-	free(prev_render);
-	return OK;
+	goto out;
 
 restore:
 	free(c->chat.last_render);
 	c->chat.last_render = prev_render;
-	return OK;
+	prev_render			= NULL;
+
+out:
+	free(render);
+	free(prev_render);
+	return ret;
 }
 
 static int run_chat_turn(context *c, cli_args *a, const char *text) {
 	int			   gen	= 0;
-	on_token_ud	   ud	= {a->output_stream,	 &gen, false, true, false, c->chat.think_start_id,
+	on_token_ud	   ud	= {a->output_stream,	 &gen, {false, false, true}, c->chat.think_start_id,
 						   c->chat.think_end_id, c};
 	sampler_params samp = {a->temperature, a->top_k,		  a->top_p,
 						   a->min_p,	   a->repeat_penalty, a->repeat_last_n};
@@ -178,7 +165,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	if (c->session_poisoned) {
 		ERROR("startup warmup left inconsistent state; refusing to generate");
-		return -1;
+		return ERR_INTERNAL;
 	}
 
 	if (a->output_stream)
@@ -188,7 +175,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	int rc = 0;
 	if (r < 0)
-		rc = -1;
+		rc = ERR_INTERNAL;
 	if (c->context_limit_hit) {
 		c->context_limit_hit = false;
 		WARN("context window exhausted (n_ctx=%d). Shorten the prompt, lower "
@@ -198,7 +185,7 @@ static int run_one_shot(context *c, cli_args *a) {
 	}
 	if (c->session_poisoned) {
 		ERROR("generation left inconsistent cache state; session must be reset");
-		rc = -1;
+		rc = ERR_INTERNAL;
 	}
 	return rc;
 }
@@ -282,17 +269,21 @@ static int run_interactive(context *c, cli_args *a) {
 	return 0;
 }
 
-static int list_accels(void) {
+static int list_devices(void) {
 	backend_info infos[BACKEND_MAX];
 	int			 n = backend_list(infos, BACKEND_MAX);
-	printf("available accelerator backends:\n");
+	printf("available compute devices:\n");
 	for (int i = 0; i < n; i++) {
-		if (infos[i].caps & 0x0001)
+		if (!infos[i].available)
 			continue;
-		printf("  %-10s priority=%-4d %s\n", infos[i].name, infos[i].priority,
-			   infos[i].available ? "available" : "unavailable");
+		for (int d = 0; d < infos[i].n_devices; d++) {
+			if (infos[i].n_devices > 1)
+				printf("  %s:%d", infos[i].name, d);
+			else
+				printf("  %s", infos[i].name);
+			printf("\n");
+		}
 	}
-	printf("  (CPU is always available as fallback)\n");
 	return 0;
 }
 
@@ -334,7 +325,7 @@ static int grep_vocab(const char *model_path, const char *substr) {
 	return 0;
 }
 
-status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
+int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
 	mallopt(M_MMAP_MAX, 0);
 	mallopt(M_TRIM_THRESHOLD, -1);
@@ -345,12 +336,12 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 
 	config cfg;
 	if (parse_args(argc, argv, &cfg, a) < 0) {
-		usage(stderr, a->is_server);
+		config_usage(stderr, a->is_server);
 		return ERR_INVALID_ARG;
 	}
 
-	if (a->list_accels) {
-		list_accels();
+	if (a->list_devices) {
+		list_devices();
 		return ENGINE_EXIT;
 	}
 	if (a->dump_metadata) {
@@ -365,12 +356,11 @@ status_code engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	config_init(&cfg);
 	const config *ec = config_get();
 
-	const char *model_base = strrchr(ec->model, '/');
-	model_base			   = model_base ? model_base + 1 : ec->model;
+	const char *model_base = path_basename(ec->model);
 
 	DEBUG("model path: %s", ec->model);
-	DEBUG("backend=%s gpu_device=%d use_mmap=%d seed=%llu", ec->backend ? ec->backend : "auto",
-		  ec->gpu_device, ec->use_mmap, (unsigned long long)ec->seed);
+	DEBUG("device=%s use_mmap=%d seed=%llu", ec->device ? ec->device : "auto", ec->use_mmap,
+		  (unsigned long long)ec->seed);
 	uint64_t	t0 = time_ms();
 	status_code s  = context_init(ctx, ec);
 	if (s != OK) {

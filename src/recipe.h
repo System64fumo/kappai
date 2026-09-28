@@ -1,8 +1,11 @@
 #ifndef RECIPE_H
 #define RECIPE_H
 
+#include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
+#include "log.h"
+#include "model.h"
 #include "profile.h"
 
 #define RECIPE_SLOT_X 0
@@ -33,7 +36,6 @@
 struct model;
 struct kvcache;
 struct compute_scratch;
-struct buffer;
 struct layer_weights;
 
 struct batch_scratch;
@@ -54,7 +56,6 @@ typedef enum {
 	OP_MATMUL,
 	OP_MATMUL_RESIDUAL,
 	OP_MATMUL_MULTI,
-	OP_MATMUL_FUSED_GATEUP,
 	OP_MATMUL_FFN_DOWN,
 
 	OP_ROPE,
@@ -218,6 +219,27 @@ typedef struct {
 } recipe_op;
 
 typedef struct {
+	recipe_op  *ops;
+	int			cap;
+	int			count;
+	const char *arch_name;
+} op_emitter;
+
+static inline op_emitter op_emitter_make(recipe_op *ops, int cap, const char *arch_name) {
+	op_emitter e = {ops, cap, 0, arch_name};
+	return e;
+}
+
+#define OP_EMIT(e, op_expr)                                                                        \
+	do {                                                                                           \
+		if ((e)->count >= (e)->cap) {                                                              \
+			ERROR("%s: recipe op emitter overflow (capacity %d)", (e)->arch_name, (e)->cap);       \
+			abort();                                                                               \
+		}                                                                                          \
+		(e)->ops[(e)->count++] = (op_expr);                                                        \
+	} while (0)
+
+typedef struct {
 	recipe_op *ops;
 	int		   n_ops;
 } layer_recipe;
@@ -262,9 +284,15 @@ typedef struct {
 	int						n_rows;
 	int						pos_start;
 	float				   *logits_out;
+	backend				   *layer_be;
+	buffer				   *slot_base;
+	weight_ref			  **wtab_row;
 } exec_ctx;
 
-float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
+float		*recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
+const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
+float		*recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
+status_code	 recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n);
 
 int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
 					   int n_group, int topk_group, float *logits, const float *bias,
@@ -285,10 +313,9 @@ typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 void					 recipe_register(const char *arch_gguf_name, recipe_builder_fn builder);
 const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name);
 
-void recipe_init(void);
-
 model_recipe *recipe_build(const struct model *m);
 void		  recipe_free(model_recipe *r);
+int			  recipe_is_batchable(const struct model *m);
 
 status_code compute_forward_recipe(struct model *m, struct kvcache *cache,
 								   struct compute_scratch *s, int token, int pos, int flash_attn,
@@ -307,8 +334,49 @@ recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage sta
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int k);
+recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int n2, int k);
+recipe_op mk_matmul_residual(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, int n, int k);
+recipe_op mk_matmul_ffn_down(uint8_t gate_in, uint8_t up_in, uint8_t out, uint8_t widx, int n,
+							 int k, int activation);
+recipe_op mk_ffn_activate(uint8_t gate_in, uint8_t up_in, uint8_t out, int n, int activation);
+recipe_op mk_ffn_activate_fused(uint8_t in, uint8_t out, int n, int activation);
+recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads);
+recipe_op mk_rmsnorm_noweight(uint8_t in);
+recipe_op mk_split_qgate(void);
+recipe_op mk_attn_output_gate(uint8_t attn_in, uint8_t gate_in, uint8_t out);
+recipe_op mk_gated_delta_net(uint8_t proj_in, uint8_t gate_in, uint8_t alpha_in, uint8_t out);
+recipe_op mk_shortconv(uint8_t in, uint8_t out);
+recipe_op mk_mla_qkv_proj_fused(uint8_t in, uint8_t out, int n, int k);
+recipe_op mk_attention_mla(uint8_t q_in, uint8_t out, int n_heads, int head_dim, int n_ctx,
+						   float scale);
+recipe_op mk_scale(uint8_t io, uint8_t widx, float scale);
+recipe_op mk_ple_proj_inject(uint8_t in, uint8_t residual, uint8_t widx);
 recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage);
 recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage);
+recipe_op mk_kvput(uint8_t k_in, uint8_t v_in);
+recipe_op mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
+					   int n_ctx, float scale, int sliding_window);
+recipe_op mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_ctx, int sliding_window);
+recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
+recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
+recipe_op mk_rope_ext(uint8_t in, int rope_neox);
+recipe_op mk_partial_rope_qk(void);
+recipe_op mk_embd_lookup(void);
+recipe_op mk_scale_embeddings(void);
+recipe_op mk_ple_build(void);
+recipe_op mk_softcap(uint8_t in, float cap);
+recipe_op mk_logits_readback(void);
+recipe_op mk_moe_router(uint8_t in, int n_experts, int k);
+recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k);
+recipe_op mk_moe_shared(uint8_t in, int n, int k);
+
+int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
+int recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
+							   uint8_t norm_widx);
+int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
+						  uint8_t experts_in_slot, uint8_t out_slot);
 
 void recipe_build_post_ops(model_recipe *r, const struct model *m);
 void recipe_build_pre_ops(model_recipe *r, const struct model *m);

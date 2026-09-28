@@ -1,29 +1,33 @@
 #include "compute.h"
-#include "backend/cpu/scalar/quants.h"
 #include "log.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef BACKEND_CUDA
-/* The CUDA-graph debug helpers are only defined by the CUDA backend. All
- * call sites are env-gated debug paths; provide no-op stubs so CPU/Vulkan-only
- * builds link cleanly (they are never invoked there). */
-int cuda_graph_dbg_peek(backend *b, int *p0, int *p1, int *p2) {
+/* Default no-op decode-graph debug hooks. The CUDA backend overwrites these
+ * pointers with its real implementations when it is loaded (see
+ * cuda_graph_dbg_install). All call sites are env-gated debug paths. */
+static int kgraph_dbg_peek_stub(backend *b, int *p0, int *p1, int *p2) {
 	(void)b; (void)p0; (void)p1; (void)p2; return -1;
 }
-int cuda_graph_dbg_capquery(backend *b) { (void)b; return -1; }
-int cuda_graph_dbg_togglex(backend *b, void *slotbuf, int on) {
+static int kgraph_dbg_capquery_stub(backend *b) { (void)b; return -1; }
+static int kgraph_dbg_togglex_stub(backend *b, void *slotbuf, int on) {
 	(void)b; (void)slotbuf; (void)on; return -1;
 }
-int cuda_graph_dbg_snap(backend *b, void *slots, const char *path, int pos) {
+static int kgraph_dbg_snap_stub(backend *b, void *slots, const char *path, int pos) {
 	(void)b; (void)slots; (void)path; (void)pos; return -1;
 }
-int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4) {
+static int kgraph_dbg_logits_stub(backend *b, void *slotbuf, float *out4) {
 	(void)b; (void)slotbuf; (void)out4; return -1;
 }
-int cuda_graph_dbg_lasterr(void) { return -1; }
-#endif
+static int kgraph_dbg_lasterr_stub(void) { return -1; }
+
+kgraph_dbg_peek_fn cuda_graph_dbg_peek = kgraph_dbg_peek_stub;
+kgraph_dbg_capquery_fn cuda_graph_dbg_capquery = kgraph_dbg_capquery_stub;
+kgraph_dbg_togglex_fn cuda_graph_dbg_togglex = kgraph_dbg_togglex_stub;
+kgraph_dbg_snap_fn cuda_graph_dbg_snap = kgraph_dbg_snap_stub;
+kgraph_dbg_logits_fn cuda_graph_dbg_logits = kgraph_dbg_logits_stub;
+kgraph_dbg_lasterr_fn cuda_graph_dbg_lasterr = kgraph_dbg_lasterr_stub;
 
 void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
@@ -104,43 +108,25 @@ static void free_buf(buffer *b) {
 	b->owner->buffer_free(b->owner, b);
 }
 
+static void scratch_free_slot_buffers(buffer *slots) {
+	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
+		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
+			continue;
+		free_buf(&slots[i]);
+	}
+}
+
 static void scratch_free_device_buffers(compute_scratch *s) {
-	free_buf(&s->slots[RECIPE_SLOT_X]);
-	free_buf(&s->slots[RECIPE_SLOT_XB]);
-	free_buf(&s->slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->slots[RECIPE_SLOT_Q]);
-	free_buf(&s->slots[RECIPE_SLOT_K]);
-	free_buf(&s->slots[RECIPE_SLOT_V]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->slots);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
 	free_buf(&s->ple_all);
-	free_buf(&s->ple_proj_gpu);
-	free_buf(&s->ple_proj_norm_w_gpu);
-	free_buf(&s->router_softmax_inp_gpu);
-	free_buf(&s->router_logits_gpu);
+	free_buf(&s->ple_proj);
+	free_buf(&s->ple_proj_norm_w);
+	free_buf(&s->router_softmax_inp);
+	free_buf(&s->router_logits);
 
-	free_buf(&s->mirror_slots[RECIPE_SLOT_X]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_Q]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_K]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_V]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->mirror_slots);
 	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
 		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
 			continue;
@@ -193,14 +179,29 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->moe_scratch.p);
 	free(s->moe_xb_f.p);
 	free(s->moe_shared_y.p);
-	free(s->hybrid_host.p);
 	s->moe_all_scratch.p = NULL;
 	s->moe_all_outs.p	 = NULL;
 	s->moe_scratch.p	 = NULL;
 	s->moe_xb_f.p		 = NULL;
 	s->moe_shared_y.p	 = NULL;
-	s->hybrid_host.p	 = NULL;
-	s->hybrid_host.cap	 = 0;
+	free(s->moe_slot_buf);
+	s->moe_slot_buf = NULL;
+
+#define FREE_FLOAT_BUF(field)                                                                      \
+	do {                                                                                           \
+		free(s->field.p);                                                                          \
+		s->field.p	 = NULL;                                                                       \
+		s->field.cap = 0;                                                                          \
+	} while (0)
+	FREE_FLOAT_BUF(hybrid_host);
+	FREE_FLOAT_BUF(hybrid_host2);
+	FREE_FLOAT_BUF(hybrid_host3);
+	FREE_FLOAT_BUF(gdn_ws_host);
+	FREE_FLOAT_BUF(gdn_z_host);
+	FREE_FLOAT_BUF(gdn_alpha_host);
+	FREE_FLOAT_BUF(gdn_beta_host);
+	FREE_FLOAT_BUF(gdn_out_host);
+#undef FREE_FLOAT_BUF
 
 	if (s->bs) {
 		batch_scratch_free(s->bs);
@@ -319,6 +320,69 @@ static void compute_layout_init(const model *m, compute_layout *L) {
 	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
 }
 
+static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
+									   const compute_layout *L) {
+	status_code _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_X], (size_t)L->attn_buf_size * sizeof(float), "X");
+	if (_st != OK)
+		return _st;
+	if (m->arch_info->is_hybrid_recurrent) {
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_PROJ],
+							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_GATE],
+							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_ALPHA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_BETA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
+		if (_st != OK)
+			return _st;
+	}
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB], (size_t)L->attn_buf_size * sizeof(float), "XB");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB2], (size_t)L->attn_buf_size * sizeof(float), "XB2");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_ATTN_OUT], (size_t)L->attn_buf_size * sizeof(float),
+						"ATTN_OUT");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_Q], (size_t)L->q_out * sizeof(float), "Q");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_K], (size_t)L->kv_out * sizeof(float), "K");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_V], (size_t)L->kv_out * sizeof(float), "V");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_GATE_UP],
+						(size_t)L->max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
+	if (_st != OK)
+		return _st;
+	dst[RECIPE_SLOT_FFN_GATE] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L->max_intermediate * sizeof(float));
+	dst[RECIPE_SLOT_FFN_UP] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], (size_t)L->max_intermediate * sizeof(float),
+					 (size_t)L->max_intermediate * sizeof(float));
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_ACT], (size_t)L->ffn_act_size * sizeof(float),
+						"FFN_ACT");
+	if (_st != OK)
+		return _st;
+	_st =
+		scratch_alloc(a, &dst[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float), "LOGITS");
+	if (_st != OK)
+		return _st;
+	return OK;
+}
+
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
 	if (!compute_model_changed(s, m, n_ctx))
 		return OK;
@@ -332,64 +396,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)L.attn_buf_size * sizeof(float), "X");
-	if (_st != OK)
-		return _st;
-	if (m->arch_info->is_hybrid_recurrent) {
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_PROJ],
-							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_GATE],
-							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_ALPHA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_BETA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
-		if (_st != OK)
-			return _st;
-	}
-	_st =
-		scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)L.attn_buf_size * sizeof(float), "XB");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)L.attn_buf_size * sizeof(float),
-						"XB2");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)L.attn_buf_size * sizeof(float),
-						"ATTN_OUT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q], (size_t)L.q_out * sizeof(float), "Q");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K], (size_t)L.kv_out * sizeof(float), "K");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V], (size_t)L.kv_out * sizeof(float), "V");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
-						(size_t)L.max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
-	if (_st != OK)
-		return _st;
-	s->slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], 0,
-												  (size_t)L.max_intermediate * sizeof(float));
-	s->slots[RECIPE_SLOT_FFN_UP] =
-		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)L.max_intermediate * sizeof(float),
-					 (size_t)L.max_intermediate * sizeof(float));
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)L.ffn_act_size * sizeof(float),
-						"FFN_ACT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
-						"LOGITS");
+	status_code _st = scratch_alloc_slots(a, s->slots, m, &L);
 	if (_st != OK)
 		return _st;
 
@@ -403,6 +410,11 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	}
 
 	compute_scratch_set_router_bufs(s);
+
+	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
+
+	if (m->arch_info->is_moe)
+		s->moe_slot_buf = xcalloc(MOE_MAX_K, sizeof(*s->moe_slot_buf));
 
 	if (m->arch_info->has_variable_layer_dims) {
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
@@ -511,7 +523,6 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 				if (a->synchronize) a->synchronize(a);
 				/* Drain first (argmax already did): read back what the last
 				 * launch actually saw. */
-				extern int cuda_graph_dbg_peek(backend *b, int *p0, int *p1, int *p2);
 				int v0 = -9, v1 = -9, v2 = -9;
 				if (cuda_graph_dbg_peek(a, &v0, &v1, &v2) == 0)
 					fprintf(stderr, "[GRAPH] device params now=(%d,%d,%d)\n", v0, v1, v2);
@@ -556,22 +567,18 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 			if (g_once < 0)
 				g_once = getenv("KAPPAI_GRAPH_ONCE") ? 1 : 0;
 			if (getenv("KAPPAI_GRAPH_DBG")) {
-				extern int cuda_graph_dbg_capquery(backend *b);
 				int cs = cuda_graph_dbg_capquery(a);
 				if (cs >= 0)
 					fprintf(stderr, "[GRAPH] capstate=%d\n", cs);
 			}
 			if (getenv("KAPPAI_GRAPH_TOGGLEX")) {
 				/* TEMP: on odd replays, clobber X[0] to sentinel. */
-				extern int cuda_graph_dbg_togglex(backend *b, void *slotbuf, int on);
 				static int tg = 0;
 				tg++;
 				if (cuda_graph_dbg_togglex(a, (void *)&s->slots[0], tg & 1) != 0)
 					return ERR_INTERNAL;
 			}
 			{
-				extern int cuda_graph_dbg_snap(backend *b, void *slots,
-											   const char *path, int pos);
 				const char *sp = getenv("KAPPAI_GRAPH_SNAPRE");
 				if (sp) {
 					if (a->synchronize) a->synchronize(a);
@@ -593,8 +600,6 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 					a->graph_set_kernels(a, 0);
 				} else {
 					{
-						extern int cuda_graph_dbg_snap(backend *b, void *slots,
-													   const char *path, int pos);
 						const char *sp = getenv("KAPPAI_GRAPH_SNAP");
 						if (sp) {
 							if (a->synchronize) a->synchronize(a);
@@ -603,7 +608,6 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 					}
 					if (getenv("KAPPAI_GRAPH_DBG")) {
 						/* TEMP: dump first 4 logits right after replay. */
-						extern int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4);
 						float lg[4] = {0, 0, 0, 0};
 						if (a->synchronize) a->synchronize(a);
 						if (cuda_graph_dbg_logits(a, (void *)&s->slots[14], lg) == 0)
@@ -626,7 +630,6 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 							}
 						}
 						{
-							extern int cuda_graph_dbg_lasterr(void);
 							int le = cuda_graph_dbg_lasterr();
 							if (le != 0)
 								fprintf(stderr, "[GRAPH] lasterr=%d\n", le);
@@ -709,12 +712,10 @@ a, s->rope_cos, s->rope_sin, m->layer_dims.head_dim_global,
 	status_code out_st = compute_forward_recipe(m, cache, s, token, pos, flash_attn,
 													 logits_out);
 	if (getenv("KAPPAI_GRAPH_SNAP") && logits_out == NULL) {
-		extern int cuda_graph_dbg_snap(backend *b, void *slots, const char *path, int pos);
 		if (a->synchronize) a->synchronize(a);
 		cuda_graph_dbg_snap(a, (void *)s->slots, getenv("KAPPAI_GRAPH_SNAP"), pos);
 	}
 	if (getenv("KAPPAI_GRAPH_DBG") && logits_out == NULL) {
-		extern int cuda_graph_dbg_logits(backend *b, void *slotbuf, float *out4);
 		float lg[4] = {0, 0, 0, 0};
 		if (a->synchronize) a->synchronize(a);
 		if (cuda_graph_dbg_logits(a, (void *)&s->slots[14], lg) == 0)
@@ -753,6 +754,10 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 		return OK;
 	if (!m || !m->mixed_backend_mode)
 		return OK;
+	backend_report_host_fallback(
+		m->backend, "mirror_scratch", HFB_LAYER_NOT_OFFLOADED,
+		"mixed-backend mode: mirror compute slots allocated on the host (cpu) "
+		"fallback for layers not offloaded");
 	backend *host = backend_host();
 	if (!host)
 		return ERR_UNSUPPORTED;
@@ -762,36 +767,9 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code st;
-#define MIRROR_ALLOC(slot, size)                                                                   \
-	do {                                                                                           \
-		st = scratch_alloc(host, &s->mirror_slots[slot], (size), "mirror_slots[" #slot "]");       \
-		if (st != OK)                                                                              \
-			return st;                                                                             \
-	} while (0)
-
-	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)L.attn_buf_size * sizeof(float));
-	if (m->arch_info->is_hybrid_recurrent) {
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_PROJ, (size_t)model_hybrid_proj_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_GATE, (size_t)model_hybrid_gate_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_ALPHA, (size_t)m->hybrid.n_value_heads * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_BETA, (size_t)m->hybrid.n_value_heads * sizeof(float));
-	}
-	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)L.q_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)L.max_intermediate * 2 * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(
-		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L.max_intermediate * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_UP] = buffer_slice(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP],
-													   (size_t)L.max_intermediate * sizeof(float),
-													   (size_t)L.max_intermediate * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)L.ffn_act_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_LOGITS, (size_t)m->vocab_size * sizeof(float));
-#undef MIRROR_ALLOC
+	status_code st = scratch_alloc_slots(host, s->mirror_slots, m, &L);
+	if (st != OK)
+		return st;
 
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
@@ -803,6 +781,14 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].size		 = sizeof(s->router_w_host);
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].offset	 = 0;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].owner		 = NULL;
+
+	size_t xfer_need = (size_t)L.attn_buf_size;
+	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0 &&
+		(size_t)m->layer_dims.n_embd_per_layer > xfer_need)
+		xfer_need = (size_t)m->layer_dims.n_embd_per_layer;
+	st = ensure_transfer_buf(s, xfer_need);
+	if (st != OK)
+		return st;
 
 	s->mirror_slots_alloced = 1;
 	return OK;
@@ -830,8 +816,7 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, i
 		(target == s->mirror_backend) ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
 
 	backend *src_be = current;
-	if (src_be && src_be->synchronize)
-		src_be->synchronize(src_be);
+	ensure_sync(src_be);
 
 	status_code st = compute_copy_buffer_cross(s, src_x, dst_x, dim);
 	if (st != OK)
@@ -868,8 +853,7 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return ERR_UNSUPPORTED;
 	}
 
-	if (src_owner && src_owner->synchronize)
-		src_owner->synchronize(src_owner);
+	ensure_sync(src_owner);
 
 	status_code st = ensure_transfer_buf(s, (size_t)n);
 	if (st != OK)

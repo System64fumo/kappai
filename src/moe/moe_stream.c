@@ -21,8 +21,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define MOE_DEFAULT_CACHE_CAP 64
-#define MOE_DIRECT_IO_FALLBACK_ALIGN 4096
 #define MOE_CHUNK_TARGET_BYTES (8 * 1024 * 1024)
 
 #define PIN_COPY_MAX_WORKERS 8
@@ -41,6 +39,7 @@ struct moe_stream_layer {
 	uint32_t		*lru_freq;
 	uint32_t		 decay_counter;
 	int				*eid_to_lru;
+	int				*eid_to_pinned;
 
 	int *heap_idx;
 	int *heap_pos;
@@ -208,36 +207,12 @@ static void moe_direct_io_probe(moe_stream_cache *c) {
 	if (fd < 0)
 		return;
 
-	int flags = fcntl(fd, F_GETFL);
-	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
-		close(fd);
-		DEBUG("moe direct-io: O_DIRECT unsupported, using buffered reads");
+	size_t align = 0;
+	if (direct_io_probe_fd(fd, "moe direct-io", 0, 1, &align) != OK)
 		return;
-	}
-
-	long		blk = MOE_DIRECT_IO_FALLBACK_ALIGN;
-	struct stat st;
-	if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-		blk = st.st_blksize;
-
-	size_t align = (size_t)blk;
-	void  *probe_buf;
-	if (posix_memalign(&probe_buf, align, align) != 0) {
-		close(fd);
-		return;
-	}
-	ssize_t rc = pread(fd, probe_buf, align, 0);
-	free(probe_buf);
-	if (rc < 0) {
-		close(fd);
-		DEBUG("moe direct-io: O_DIRECT probe failed (%s), using buffered reads", strerror(errno));
-		return;
-	}
 
 	c->direct_io_fd	   = fd;
 	c->direct_io_align = align;
-	posix_fadvise(c->direct_io_fd, 0, 0, POSIX_FADV_RANDOM);
-	DEBUG("moe direct-io: enabled (align=%zu)", align);
 }
 
 static void moe_direct_io_close(moe_stream_cache *c) {
@@ -272,30 +247,12 @@ static void moe_nomap_open(moe_stream_cache *c, const char *path) {
 		return;
 	}
 
-	long		blk = MOE_DIRECT_IO_FALLBACK_ALIGN;
-	struct stat st;
-	if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-		blk = st.st_blksize;
-	size_t align = (size_t)blk;
-
-	void *probe_buf;
-	if (posix_memalign(&probe_buf, align, align) != 0) {
-		close(fd);
-		DEBUG("moe no-mmap: O_DIRECT probe alloc failed, using buffered reads");
+	size_t align = 0;
+	if (direct_io_probe_fd(fd, "moe no-mmap", 0, 1, &align) != OK)
 		return;
-	}
-	ssize_t rc = pread(fd, probe_buf, align, 0);
-	free(probe_buf);
-	if (rc < 0) {
-		close(fd);
-		DEBUG("moe no-mmap: O_DIRECT probe failed (%s), using buffered reads", strerror(errno));
-		return;
-	}
 
 	c->nomap_direct_fd	  = fd;
 	c->nomap_direct_align = align;
-	posix_fadvise(c->nomap_direct_fd, 0, 0, POSIX_FADV_RANDOM);
-	DEBUG("moe no-mmap: O_DIRECT enabled (align=%zu)", align);
 }
 
 static void moe_nomap_close(moe_stream_cache *c) {
@@ -617,18 +574,13 @@ static status_code moe_pin_prepare_slot(struct model *m, moe_stream_cache *c, in
 		}
 
 		if (c->map_base && c->map_size > 0) {
-			uintptr_t ps = c->page_size;
-			uintptr_t pm = ~(ps - 1);
 			for (int i = 0; i < 3; i++) {
 				if (!regions[i].src || regions[i].len == 0)
 					continue;
-				uintptr_t a = (uintptr_t)regions[i].src;
-				uintptr_t b = a + regions[i].len;
-				if (a < base || b > stop || b < a)
+				page_span r = page_span_for(regions[i].src, regions[i].len, c->page_size);
+				if (!page_span_clamp(&r, base, c->map_size) || r.len == 0)
 					continue;
-				uintptr_t pstart = a & pm;
-				uintptr_t pend	 = (b + ps - 1) & pm;
-				madvise((void *)pstart, pend - pstart, MADV_DONTNEED);
+				madvise((void *)r.start, r.len, MADV_DONTNEED);
 			}
 		}
 
@@ -693,6 +645,16 @@ static void *pin_copy_worker(void *arg) {
 	}
 	moe_stream_thread_cleanup();
 	return NULL;
+}
+
+static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
+	if (sl->dev_gate.owner)
+		sl->dev_gate.owner->buffer_free(sl->dev_gate.owner, &sl->dev_gate);
+	if (sl->dev_up.owner)
+		sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
+	if (sl->dev_down.owner)
+		sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
+	sl->dev_ready = 0;
 }
 
 status_code moe_stream_cache_init(struct model *m) {
@@ -802,6 +764,7 @@ status_code moe_stream_cache_init(struct model *m) {
 		L->lru_freq		 = xcalloc(lru_cap, sizeof(uint32_t));
 		L->decay_counter = 0;
 		L->eid_to_lru	 = xmalloc((size_t)m->moe.n_experts * sizeof(int));
+		L->eid_to_pinned = xmalloc((size_t)m->moe.n_experts * sizeof(int));
 		L->heap_idx		 = xmalloc((size_t)lru_cap * sizeof(int));
 		L->heap_pos		 = xmalloc((size_t)lru_cap * sizeof(int));
 		L->heap_n		 = 0;
@@ -809,6 +772,8 @@ status_code moe_stream_cache_init(struct model *m) {
 			L->heap_pos[s] = -1;
 		for (int e = 0; e < m->moe.n_experts; e++)
 			L->eid_to_lru[e] = -1;
+		for (int e = 0; e < m->moe.n_experts; e++)
+			L->eid_to_pinned[e] = -1;
 		for (int s = 0; s < lru_cap; s++) {
 			L->lru_slots[s].eid		  = -1;
 			L->lru_slots[s].pinned	  = 0;
@@ -829,6 +794,8 @@ status_code moe_stream_cache_init(struct model *m) {
 				if (e < 0 || e >= m->moe.n_experts)
 					continue;
 				moe_expert_slot *s = &L->pinned_slots[L->n_pinned++];
+				if (L->eid_to_pinned[e] < 0)
+					L->eid_to_pinned[e] = (int)(s - L->pinned_slots);
 				slot_from_expert_desc(s, e, &m->layers[i].experts[e]);
 				s->last_used = 0;
 				s->pinned	 = 1;
@@ -904,11 +871,7 @@ status_code moe_stream_cache_init(struct model *m) {
 			uint64_t t0 = time_us();
 
 			if (g_monitor && g_monitor->fd >= 0) {
-				monitor_send(g_monitor,
-							 "{\"type\":\"load\",\"phase\":\"pin_copy_start\","
-							 "\"n_experts\":%d,\"n_workers\":%d}",
-							 n_total, nw);
-				monitor_poll(g_monitor);
+				monitor_emit_load_pin_copy_start(g_monitor, n_total, nw);
 			}
 
 			pthread_t th[PIN_COPY_MAX_WORKERS];
@@ -936,15 +899,50 @@ status_code moe_stream_cache_init(struct model *m) {
 				 mbps);
 
 			if (g_monitor && g_monitor->fd >= 0) {
-				monitor_send(g_monitor,
-							 "{\"type\":\"load\",\"phase\":\"pin_copy_done\","
-							 "\"n_experts\":%d,\"mb\":%.1f,\"ms\":%llu}",
-							 n_copied, mb, (unsigned long long)(elapsed_us / 1000));
-				monitor_poll(g_monitor);
+				monitor_emit_load_pin_copy_done(g_monitor, n_copied, mb, elapsed_us / 1000);
 			}
 
 			free((void *)slots);
 			free((void *)layers);
+		}
+	}
+	if (full_resident && m->backend && m->backend->moe_expert_ffn &&
+		m->backend->buffer_alloc_from_host && (m->backend->caps & BCAP_MOE_EXPERT_RESIDENT)) {
+		int		 uploaded  = 0;
+		int		 failed	   = 0;
+		size_t	 dev_bytes = 0;
+		uint64_t t0		   = time_us();
+		for (int i = 0; i < m->n_layers && !failed; i++) {
+			for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
+				moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
+				moe_expert_bytes eb = moe_calc_expert_bytes(m, i, sl->eid);
+				status_code		 st = m->backend->buffer_alloc_from_host(m->backend, sl->gate_w,
+																		 eb.gate_b, &sl->dev_gate);
+				if (st == OK && !sl->gate_up_fused)
+					st = m->backend->buffer_alloc_from_host(m->backend, sl->up_w, eb.up_b,
+															&sl->dev_up);
+				if (st == OK)
+					st = m->backend->buffer_alloc_from_host(m->backend, sl->down_w, eb.down_b,
+															&sl->dev_down);
+				if (st != OK) {
+					failed = 1;
+					break;
+				}
+				dev_bytes += eb.total;
+				sl->dev_ready = 1;
+				uploaded++;
+			}
+		}
+		if (failed) {
+			for (int i = 0; i < m->n_layers; i++) {
+				for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
+					moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[pi]);
+			}
+			INFO("MoE: expert residency unavailable (allocation failed) -- keeping CPU path");
+		} else if (uploaded > 0) {
+			m->moe.experts_resident = 1;
+			INFO("MoE: %d experts resident on device (%.1f MB) in %.1f s", uploaded,
+				 (double)dev_bytes / (1024.0 * 1024.0), (double)(time_us() - t0) / 1e6);
 		}
 	}
 
@@ -956,6 +954,8 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		return;
 
 	for (int i = 0; i < c->n_layers; i++) {
+		for (int s = 0; s < c->layers[i].n_pinned; s++)
+			moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[s]);
 		for (int s = 0; s < c->layers[i].n_pinned; s++) {
 			free(c->layers[i].pinned_slots[s].heap_buf);
 		}
@@ -966,6 +966,7 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		free(c->layers[i].lru_freq);
 		free(c->layers[i].pinned_slots);
 		free(c->layers[i].eid_to_lru);
+		free(c->layers[i].eid_to_pinned);
 		free(c->layers[i].heap_idx);
 		free(c->layers[i].heap_pos);
 		pthread_mutex_destroy(&c->layers[i].mtx);
@@ -981,33 +982,18 @@ static void fault_hint(const moe_stream_cache *c, const void *ptr, size_t bytes)
 		return;
 	if (!c->map_base || c->map_size == 0 || !ptr || bytes == 0)
 		return;
-	uintptr_t addr = (uintptr_t)ptr;
-	uintptr_t end  = addr + bytes;
-	uintptr_t base = (uintptr_t)c->map_base;
-	uintptr_t stop = base + c->map_size;
-	if (addr < base || end > stop || end < addr)
+	page_span r = page_span_for(ptr, bytes, c->page_size);
+	if (!page_span_clamp(&r, (uintptr_t)c->map_base, c->map_size) || r.len == 0)
 		return;
-	uintptr_t page_mask = ~((uintptr_t)c->page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + c->page_size - 1) & page_mask;
-	size_t	  count		= pend - pstart;
-	if (count == 0)
-		return;
-
-	madvise((void *)pstart, count, MADV_WILLNEED);
+	madvise((void *)r.start, r.len, MADV_WILLNEED);
 }
 
 static void fault_wait(const void *ptr, size_t bytes, long page_size) {
-	if (!ptr || bytes == 0)
+	page_span r = page_span_for(ptr, bytes, (size_t)page_size);
+	if (r.len == 0)
 		return;
-	uintptr_t addr		= (uintptr_t)ptr;
-	uintptr_t end		= addr + bytes;
-	uintptr_t page_mask = ~((uintptr_t)page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + (uintptr_t)page_size - 1) & page_mask;
-
 	volatile uint8_t acc = 0;
-	for (uintptr_t p = pstart; p < pend; p += (uintptr_t)page_size) {
+	for (uintptr_t p = r.start; p < r.start + r.len; p += (uintptr_t)page_size) {
 		acc |= *((const volatile uint8_t *)p);
 	}
 	(void)acc;
@@ -1016,16 +1002,10 @@ static void fault_wait(const void *ptr, size_t bytes, long page_size) {
 static void drop_pages(const moe_stream_cache *c, const void *ptr, size_t bytes) {
 	if (!c->map_base || c->map_size == 0 || !ptr || bytes == 0)
 		return;
-	uintptr_t addr = (uintptr_t)ptr;
-	uintptr_t end  = addr + bytes;
-	uintptr_t base = (uintptr_t)c->map_base;
-	uintptr_t stop = base + c->map_size;
-	if (addr < base || end > stop)
+	page_span r = page_span_for(ptr, bytes, c->page_size);
+	if (!page_span_clamp(&r, (uintptr_t)c->map_base, c->map_size) || r.len == 0)
 		return;
-	uintptr_t page_mask = ~((uintptr_t)c->page_size - 1);
-	uintptr_t pstart	= addr & page_mask;
-	uintptr_t pend		= (end + c->page_size - 1) & page_mask;
-	madvise((void *)pstart, pend - pstart, MADV_DONTNEED);
+	madvise((void *)r.start, r.len, MADV_DONTNEED);
 }
 
 static inline uint64_t lfru_score(uint32_t freq, uint64_t last_used, uint64_t clock) {
@@ -1090,10 +1070,11 @@ static void heap_push(struct moe_stream_layer *sl, int idx, uint64_t now) {
 }
 
 static moe_expert_slot *layer_find(struct moe_stream_layer *sl, int eid, uint64_t now) {
-	for (int i = 0; i < sl->n_pinned; i++) {
-		if (sl->pinned_slots[i].eid == eid) {
-			sl->pinned_slots[i].last_used = now;
-			return &sl->pinned_slots[i];
+	if (eid >= 0 && sl->eid_to_pinned) {
+		int pi = sl->eid_to_pinned[eid];
+		if (pi >= 0 && pi < sl->n_pinned && sl->pinned_slots[pi].eid == eid) {
+			sl->pinned_slots[pi].last_used = now;
+			return &sl->pinned_slots[pi];
 		}
 	}
 	int i = sl->eid_to_lru[eid];
@@ -1203,6 +1184,10 @@ static void slot_zero(moe_expert_slot *s) {
 	s->gate_type	 = 0;
 	s->up_type		 = 0;
 	s->down_type	 = 0;
+	s->dev_gate		 = (buffer){0};
+	s->dev_up		 = (buffer){0};
+	s->dev_down		 = (buffer){0};
+	s->dev_ready	 = 0;
 	s->eid			 = -1;
 	s->gate_up_fused = 0;
 	s->gate_scale	 = 0.0f;
@@ -1225,6 +1210,18 @@ static void slot_take_ready(moe_expert_slot *out, moe_expert_slot *s) {
 	out->owned = 0;
 	atomic_fetch_add_explicit(&s->inuse, 1, memory_order_acq_rel);
 	atomic_store_explicit(&out->io_ready, 1, memory_order_release);
+}
+
+static int layer_take_ready_stats(moe_stream_cache *c, moe_expert_slot *s, moe_expert_slot *dst) {
+	if (!s || !atomic_load_explicit(&s->io_ready, memory_order_acquire))
+		return 0;
+	slot_take_ready(dst, s);
+	atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
+	if (s->pinned)
+		atomic_fetch_add_explicit(&c->stat_pin_hits, 1, memory_order_relaxed);
+	else
+		atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+	return 1;
 }
 
 static void miss_fill_desc(moe_miss_entry *me, int k, int eid, void *freed_buf, size_t freed_size,
@@ -1351,9 +1348,12 @@ static void miss_commit(moe_expert_slot *out_slot, moe_miss_entry *me, struct mo
 }
 
 static moe_expert_slot *live_slot_find(struct moe_stream_layer *L, const moe_expert_slot *slot) {
-	for (int i = 0; i < L->n_pinned; i++) {
-		if (L->pinned_slots[i].eid == slot->eid)
-			return &L->pinned_slots[i];
+	if (slot->eid < 0)
+		return NULL;
+	if (L->eid_to_pinned) {
+		int pi = L->eid_to_pinned[slot->eid];
+		if (pi >= 0 && pi < L->n_pinned && L->pinned_slots[pi].eid == slot->eid)
+			return &L->pinned_slots[pi];
 	}
 	int i = L->eid_to_lru[slot->eid];
 	if (i >= 0 && i < L->n_lru && L->lru_slots[i].eid == slot->eid)
@@ -1376,6 +1376,7 @@ static void *moe_fetch_worker(void *arg) {
 		j->misses[idx].st = moe_pin_copy_slot(j->model, j->cache, j->layer, &j->misses[idx].tmp,
 											  j->misses[idx].reuse_buf, j->misses[idx].reuse_size);
 	}
+	moe_stream_thread_cleanup();
 	return NULL;
 }
 
@@ -1392,22 +1393,13 @@ static void resolve_scan_hits(moe_stream_cache *c, struct moe_stream_layer *L, s
 		}
 		moe_expert_slot *s = layer_find(L, eid, now);
 		if (s) {
-			int ready = atomic_load_explicit(&s->io_ready, memory_order_acquire);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			if (s->pinned)
-				atomic_fetch_add_explicit(&c->stat_pin_hits, 1, memory_order_relaxed);
-			else
-				atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
-			if (ready) {
-				slot_take_ready(&out_slots[k], s);
+			if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			} else if (sync_wait_not_ready) {
 				pthread_mutex_unlock(&L->mtx);
 				moe_stream_wait_slot(s);
 				pthread_mutex_lock(&L->mtx);
 				s = layer_find(L, eid, now);
-				if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire))
-					slot_take_ready(&out_slots[k], s);
-				else
+				if (!layer_take_ready_stats(c, s, &out_slots[k]))
 					slot_mark_invalid(&out_slots[k]);
 			} else {
 				slot_zero(&out_slots[k]);
@@ -1437,10 +1429,8 @@ static void resolve_collect_misses(moe_stream_cache *c, struct moe_stream_layer 
 			continue;
 		}
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
+		if (layer_take_ready_stats(c, s, &out_slots[k]))
 			continue;
-		}
 		if (s) {
 			if (wait_needed) {
 				wait_needed[(*n_wait_needed)++] = k;
@@ -1466,9 +1456,7 @@ static void resolve_collect_misses(moe_stream_cache *c, struct moe_stream_layer 
 			moe_stream_wait_slot(s);
 			pthread_mutex_lock(&L->mtx);
 			s = layer_find(L, eid, now);
-			if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire))
-				slot_take_ready(&out_slots[k], s);
-			else
+			if (!layer_take_ready_stats(c, s, &out_slots[k]))
 				slot_mark_invalid(&out_slots[k]);
 			continue;
 		}
@@ -1539,10 +1527,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+		if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			pthread_mutex_unlock(&L->mtx);
 			continue;
 		}
@@ -1643,10 +1628,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		moe_expert_slot *s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
+		if (layer_take_ready_stats(c, s, &out_slots[k])) {
 			pthread_mutex_unlock(&L->mtx);
 			continue;
 		}
@@ -1658,11 +1640,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 
 		pthread_mutex_lock(&L->mtx);
 		s = layer_find(L, eid, now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(&out_slots[k], s);
-			atomic_fetch_add_explicit(&c->stat_hits, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_lru_hits, 1, memory_order_relaxed);
-		} else {
+		if (!layer_take_ready_stats(c, s, &out_slots[k])) {
 			slot_mark_invalid(&out_slots[k]);
 			if (rc == OK)
 				rc = ERR_IO;
@@ -1685,11 +1663,8 @@ static void moe_stream_op_finalize_miss(moe_stream_op *op, int mi) {
 	if (me->dep >= 0) {
 		pthread_mutex_lock(&op->slayer->mtx);
 		moe_expert_slot *s = layer_find(op->slayer, me->eid, op->now);
-		if (s && atomic_load_explicit(&s->io_ready, memory_order_acquire)) {
-			slot_take_ready(out_slot, s);
-		} else {
+		if (!layer_take_ready_stats(op->cache, s, out_slot))
 			slot_mark_invalid(out_slot);
-		}
 		pthread_mutex_unlock(&op->slayer->mtx);
 		return;
 	}
@@ -1889,18 +1864,15 @@ void moe_stream_op_free(moe_stream_op *op) {
 	free(op);
 }
 
+static int moe_slot_ready_pred(void *ud) {
+	const moe_expert_slot *slot = ud;
+	return atomic_load_explicit(&slot->io_ready, memory_order_acquire) != 0;
+}
+
 void moe_stream_wait_slot(const moe_expert_slot *slot) {
 	if (!slot)
 		return;
-	int spins = 0;
-	while (!atomic_load_explicit(&slot->io_ready, memory_order_acquire)) {
-		if (spins < 10000) {
-			cpu_relax();
-			spins++;
-		} else {
-			sched_yield();
-		}
-	}
+	spin_wait_relax(moe_slot_ready_pred, (void *)slot);
 }
 
 void moe_stream_release_slot(struct model *m, int layer, const moe_expert_slot *slot) {
@@ -1999,10 +1971,7 @@ static void moe_preload_push_region(moe_preload_region **regions, size_t *n, siz
 									const void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	if (*n == *cap) {
-		*cap *= 2;
-		*regions = xrealloc(*regions, *cap * sizeof(**regions));
-	}
+	ARR_RESERVE(*regions, *n, *cap);
 	(*regions)[*n].ptr	 = ptr;
 	(*regions)[*n].bytes = bytes;
 	(*n)++;

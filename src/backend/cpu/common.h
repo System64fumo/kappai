@@ -7,10 +7,30 @@
 #include "threadpool.h"
 #include <stdlib.h>
 
+#define CPU_BACKEND_CAPS                                                                           \
+	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
+	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0)
+
+status_code cpu_backend_fill(backend *out);
+
+#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
+	static status_code ctor_fn(backend *out) {                                                     \
+		memset(out, 0, sizeof(*out));                                                              \
+		out->name	  = name_str;                                                                  \
+		out->priority = prio;                                                                      \
+		out->caps	  = CPU_BACKEND_CAPS;                                                          \
+		out->desc	  = desc_str;                                                                  \
+		return cpu_backend_fill(out);                                                              \
+	}                                                                                              \
+	BACKEND_REGISTER(name_str, ctor_fn)                                                            \
+	void backend_autoreg_cpu_scalar_ctor(void) {}
+
+int32_t cpu_argmax_f32(const float *logits, int vocab);
+
 typedef struct {
 	quant_scratch qscratch;
 	float		 *scores;
-	int			  scores_cap;
+	size_t		  scores_cap;
 } cpu_thread_scratch;
 
 typedef struct {
@@ -30,7 +50,7 @@ typedef struct {
 	double		 theta_cached;
 	int			 head_dim_cached;
 	float		*cs;
-	int			 cs_cap;
+	size_t		 cs_cap;
 	int			 pos_cached;
 	float		 theta_cs_cached;
 	int			 head_dim_cs_cached;
@@ -43,7 +63,7 @@ typedef struct {
 	void		 *xq8_buf;
 	size_t		  xq8_buf_cap;
 	float		 *scores;
-	int			  scores_cap;
+	size_t		  scores_cap;
 	int			  kv_head_dim_max;
 	kv_quant_type kv_quant;
 
@@ -77,17 +97,46 @@ typedef struct {
 void feat_add(char *buf, size_t cap, const char *name);
 void detect_features(char *buf, size_t cap);
 
-static inline status_code cpu_scratch_grow(void **buf, size_t *cap_bytes, size_t need_bytes) {
+static inline status_code cpu_buf_grow(void **p, size_t *cap_bytes, size_t need_bytes,
+									   size_t align) {
 	if (*cap_bytes >= need_bytes)
 		return OK;
-	free(*buf);
-	*buf = malloc(need_bytes);
-	if (!*buf) {
+	free(*p);
+	*p			 = NULL;
+	size_t bytes = align > 1 ? ((need_bytes + align - 1) / align) * align : need_bytes;
+	if (align > 1)
+		*p = aligned_alloc(align, bytes);
+	else
+		*p = malloc(bytes);
+	if (!*p) {
 		*cap_bytes = 0;
 		return ERR_OUT_OF_MEMORY;
 	}
-	*cap_bytes = need_bytes;
+	*cap_bytes = bytes;
 	return OK;
+}
+
+static inline float *cpu_grow_scores(cpu_priv *p, int tid, int need) {
+	cpu_thread_scratch *ts =
+		(p->thread_scratch && tid >= 0 && tid < p->n_threads) ? &p->thread_scratch[tid] : NULL;
+	float **buf;
+	size_t *cap;
+	if (ts) {
+		buf = &ts->scores;
+		cap = &ts->scores_cap;
+	} else if (p->thread_scratch && p->n_threads > 0) {
+		buf = &p->thread_scratch[0].scores;
+		cap = &p->thread_scratch[0].scores_cap;
+	} else {
+		buf = &p->scores;
+		cap = &p->scores_cap;
+	}
+	if (*cap < (size_t)need) {
+		free(*buf);
+		*buf = xmalloc((size_t)need * sizeof(float));
+		*cap = (size_t)need;
+	}
+	return *buf;
 }
 
 static inline void *cpu_ptr(const buffer *b) {
@@ -164,6 +213,7 @@ typedef struct {
 	const float	   *qf;
 	float		   *outf;
 	int				n_groups, head_dim, hd_stride, n_pos, flash_attn;
+	int				n_heads;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;
@@ -217,11 +267,42 @@ typedef struct {
 	int			 activation;
 } cpu_ffn_act_batch_job;
 
-static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {
-	if (tpool_current_tid() < 0 && pool && m >= 2)
-		tpool_parallel_for(pool, m, 1, chunk, job);
+typedef struct {
+	float *x;
+	int	   n;
+	float  inv_cap;
+	float  cap;
+} cpu_softcap_job;
+
+typedef struct {
+	const float *mixed;
+	float		*q, *gate;
+	int			 n_heads, head_dim, n_rows;
+} cpu_split_qgate_job;
+
+typedef struct {
+	float		*out;
+	const float *gate;
+	int			 n, n_rows;
+} cpu_attn_output_gate_job;
+
+typedef struct {
+	float		*q, *k;
+	const float *cos_base, *sin_base;
+	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim;
+	int			 pos0, n_rows;
+} cpu_partial_rope_qk_job;
+
+static inline void cpu_run_batch_full(tpool *pool, int m, int grain, int min_m,
+									  tpool_chunk_fn chunk, void *job) {
+	if (tpool_current_tid() < 0 && pool && m >= min_m)
+		tpool_parallel_for(pool, m, grain, chunk, job);
 	else
 		chunk(0, m, 0, job);
+}
+
+static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void *job) {
+	cpu_run_batch_full(pool, m, 1, 2, chunk, job);
 }
 
 #endif

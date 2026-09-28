@@ -13,9 +13,6 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define CTX_INTERRUPTED (-2)
-#define CTX_COMPUTE_ERROR (-3)
-
 typedef struct {
 	model				  m;
 	tokenizer			  tok;
@@ -87,6 +84,11 @@ int context_chat_turn(context *c, const char *role, const char *content, bool ad
 					  int max_tokens, const sampler_params						 *samp,
 					  void (*on_token)(int32_t, const char *, int, void *), void *ud,
 					  const char *metrics_spec);
+
+int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generation_prompt,
+						  int max_tokens, const sampler_params						 *samp,
+						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
+						  const char *metrics_spec);
 
 int context_completion(context *c, const char *prompt, int max_tokens, const sampler_params *samp,
 					   void (*on_token)(int32_t, const char *, int, void *), void *ud);

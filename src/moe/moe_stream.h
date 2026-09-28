@@ -1,6 +1,7 @@
 #ifndef MOE_STREAM_H
 #define MOE_STREAM_H
 
+#include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
 
@@ -10,6 +11,7 @@ typedef struct moe_stream_cache moe_stream_cache;
 typedef struct moe_stream_op	moe_stream_op;
 
 #define MOE_MAX_K 512
+#define MOE_DEFAULT_CACHE_CAP 64
 
 typedef struct {
 	const void		*gate_w;
@@ -25,6 +27,10 @@ typedef struct {
 	uint32_t		 gate_type;
 	uint32_t		 up_type;
 	uint32_t		 down_type;
+	buffer			 dev_gate;
+	buffer			 dev_up;
+	buffer			 dev_down;
+	int				 dev_ready;
 	int				 eid;
 	int				 gate_up_fused;
 	float			 gate_scale;

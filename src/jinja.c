@@ -1,4 +1,5 @@
 #include "jinja.h"
+#include "json_helpers.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -6,15 +7,9 @@
 #include <time.h>
 
 typedef struct {
-	char  *p;
-	size_t len;
-	size_t cap;
-} strbuf;
-
-typedef struct {
-	char **msgs;
-	size_t n;
-	size_t cap;
+	char   **msgs;
+	uint32_t n;
+	uint32_t cap;
 } strlist;
 
 static void strlist_add(strlist *sl, char *msg) {
@@ -32,45 +27,23 @@ static void strlist_free(strlist *sl) {
 	sl->n = sl->cap = 0;
 }
 
-static void sb_init(strbuf *b) {
-	b->cap	= 64;
-	b->len	= 0;
-	b->p	= xmalloc(b->cap);
-	b->p[0] = '\0';
-}
-
-static void sb_append(strbuf *b, const char *s, size_t n) {
-	if (b->len + n + 1 > b->cap) {
-		while (b->len + n + 1 > b->cap)
-			b->cap *= 2;
-		b->p = xrealloc(b->p, b->cap);
-	}
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
-}
-
-static void sb_append_str(strbuf *b, const char *s) {
-	sb_append(b, s, strlen(s));
-}
-
 static void strlist_report(const strlist *sl, char *errbuf, size_t errbuf_len) {
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
 	for (size_t i = 0; i < sl->n; i++) {
 		if (i)
-			sb_append_str(&sb, "\n");
-		sb_append_str(&sb, sl->msgs[i]);
+			sb_puts(&sb, "\n");
+		sb_puts(&sb, sl->msgs[i]);
 	}
 	if (errbuf_len)
 		snprintf(errbuf, errbuf_len, "%s", sb.p);
-	free(sb.p);
+	sb_free(&sb);
 }
 
 typedef struct {
 	jinja_value **vals;
-	size_t		  n;
-	size_t		  cap;
+	uint32_t	  n;
+	uint32_t	  cap;
 } jinja_arena;
 
 static _Thread_local jinja_arena *g_render_arena	 = NULL;
@@ -116,10 +89,6 @@ static void arena_track(jinja_value *v) {
 	jinja_arena *a = g_render_arena;
 	if (!a)
 		return;
-	if (!a->cap) {
-		a->cap	= 64;
-		a->vals = xrealloc(a->vals, a->cap * sizeof(*a->vals));
-	}
 	ARR_RESERVE(a->vals, a->n, a->cap);
 	a->vals[a->n++] = v;
 }
@@ -158,6 +127,14 @@ jinja_value *jinja_string_n(const char *s, size_t n) {
 	return v;
 }
 
+jinja_value *jinja_string_take(char *s) {
+	jinja_value *v = xmalloc(sizeof(*v));
+	v->type		   = JV_STRING;
+	v->as.s		   = s ? s : xstrdup("");
+	arena_track(v);
+	return v;
+}
+
 jinja_value *jinja_dict(void) {
 	jinja_value *v = xmalloc(sizeof(*v));
 	v->type		   = JV_DICT;
@@ -171,26 +148,32 @@ jinja_value *jinja_list(void) {
 	v->type			 = JV_LIST;
 	v->as.list.items = NULL;
 	v->as.list.n	 = 0;
+	v->as.list.cap	 = 0;
 	arena_track(v);
 	return v;
 }
 
 void jinja_dict_set(jinja_value *d, const char *key, jinja_value *val) {
+	jinja_dict_entry *last = NULL;
 	for (jinja_dict_entry *e = d->as.dict; e; e = e->next) {
 		if (!strcmp(e->key, key)) {
 			e->val = val;
 			return;
 		}
+		last = e;
 	}
 	jinja_dict_entry *e = xmalloc(sizeof(*e));
 	e->key				= xstrdup(key);
 	e->val				= val;
-	e->next				= d->as.dict;
-	d->as.dict			= e;
+	e->next				= NULL;
+	if (last)
+		last->next = e;
+	else
+		d->as.dict = e;
 }
 
 void jinja_list_append(jinja_value *l, jinja_value *val) {
-	l->as.list.items = xrealloc(l->as.list.items, (l->as.list.n + 1) * sizeof(jinja_value *));
+	ARR_RESERVE(l->as.list.items, l->as.list.n, l->as.list.cap);
 	l->as.list.items[l->as.list.n++] = val;
 }
 
@@ -289,35 +272,32 @@ typedef enum {
 typedef struct {
 	tok_type	type;
 	const char *start;
-	size_t		len;
-	int			strip_left;
-	int			strip_right;
+	uint32_t	len;
+	bool		strip_left;
+	bool		strip_right;
 } token;
 
 typedef struct {
 	const char *src;
-	size_t		len;
-	size_t		pos;
+	uint32_t	len;
+	uint32_t	pos;
 	token	   *toks;
-	size_t		n_toks;
-	size_t		cap_toks;
+	uint32_t	n_toks;
+	uint32_t	cap_toks;
 	strlist		diagnostics;
 	char	   *errbuf;
-	size_t		errbuf_len;
-	size_t		text_start;
-	int			next_strip_left;
-	int			next_trim_nl;
-	size_t		tag_start;
-	int			tag_is_expr;
-	int			tag_strip_after;
+	uint32_t	errbuf_len;
+	uint32_t	text_start;
+	bool		next_strip_left;
+	bool		next_trim_nl;
+	uint32_t	tag_start;
+	bool		tag_is_expr;
+	bool		tag_strip_after;
 } lexer;
 
 static void lex_push(lexer *lx, tok_type type, const char *start, size_t len, int strip_left,
 					 int strip_right) {
-	if (lx->n_toks == lx->cap_toks) {
-		lx->cap_toks = lx->cap_toks ? lx->cap_toks * 2 : 64;
-		lx->toks	 = xrealloc(lx->toks, lx->cap_toks * sizeof(token));
-	}
+	ARR_RESERVE(lx->toks, lx->n_toks, lx->cap_toks);
 	token *t	   = &lx->toks[lx->n_toks++];
 	t->type		   = type;
 	t->start	   = start;
@@ -407,7 +387,7 @@ static status_code lex_tag_inner(lexer *lx, const char *src) {
 		while (lx->pos < lx->len && isspace((unsigned char)src[lx->pos]))
 			lx->pos++;
 		if (lx->pos >= lx->len) {
-			snprintf(lx->errbuf, lx->errbuf_len, "unterminated tag at offset %zu", lx->tag_start);
+			snprintf(lx->errbuf, lx->errbuf_len, "unterminated tag at offset %u", lx->tag_start);
 			return ERR_FORMAT;
 		}
 		if (src[lx->pos] == '-' && !strncmp(src + lx->pos + 1, close, 2)) {
@@ -485,7 +465,7 @@ static status_code lex_tag_inner(lexer *lx, const char *src) {
 			lx->pos++;
 		} else {
 			char msg[128];
-			snprintf(msg, sizeof(msg), "unsupported character '%c' at offset %zu", c, lx->pos);
+			snprintf(msg, sizeof(msg), "unsupported character '%c' at offset %u", c, lx->pos);
 			strlist_add(&lx->diagnostics, xstrdup(msg));
 			lex_push(lx, TOK_UNKNOWN, src + lx->pos, 1, 0, 0);
 			lx->pos++;
@@ -582,7 +562,7 @@ typedef struct expr_node {
 	expr_arg *args;
 
 	struct expr_node **items;
-	size_t			   n_items;
+	uint32_t		   n_items;
 } expr_node;
 
 typedef enum {
@@ -621,7 +601,7 @@ typedef struct stmt_node {
 	struct stmt_node *body;
 
 	struct stmt_node **items;
-	size_t			   n_items;
+	uint32_t		   n_items;
 
 	char	  *set_name;
 	char	  *set_attr;
@@ -635,14 +615,14 @@ typedef struct stmt_node {
 } stmt_node;
 
 typedef struct {
-	lexer  *lx;
-	size_t	pos;
-	char   *errbuf;
-	size_t	errbuf_len;
-	int		failed;
-	strlist diagnostics;
-	strlist features;
-	int		depth;
+	lexer	*lx;
+	uint32_t pos;
+	char	*errbuf;
+	uint32_t errbuf_len;
+	bool	 failed;
+	strlist	 diagnostics;
+	strlist	 features;
+	uint16_t depth;
 } parser;
 
 #define JINJA_MAX_BLOCK_DEPTH 100
@@ -1303,9 +1283,8 @@ static stmt_node *parse_macro_stmt(parser *p) {
 	return s;
 }
 
-static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char **end_kw) {
+static stmt_node *parse_statement_tag(parser *p, int *is_block_end) {
 	*is_block_end = 0;
-	*end_kw		  = NULL;
 
 	if (stmt_kw_is(p, "if"))
 		return parse_if_stmt(p);
@@ -1317,7 +1296,6 @@ static stmt_node *parse_statement_tag(parser *p, int *is_block_end, const char *
 		stmt_kw_is(p, "elif") || stmt_kw_is(p, "endmacro") || stmt_kw_is(p, "endset") ||
 		stmt_kw_is(p, "endgeneration")) {
 		*is_block_end = 1;
-		*end_kw		  = "end";
 		return NULL;
 	}
 
@@ -1377,6 +1355,8 @@ static stmt_node *parse_block(parser *p) {
 					start++;
 			while (t->strip_right && len > start && isspace((unsigned char)t->start[len - 1]))
 				len--;
+			if (len == start)
+				continue;
 			stmt_node *s = new_stmt(ST_TEXT);
 			s->text		 = xmalloc(len - start + 1);
 			memcpy(s->text, t->start + start, len - start);
@@ -1407,9 +1387,8 @@ static stmt_node *parse_block(parser *p) {
 		}
 		if (ptok_is(p, TOK_STMT_OPEN)) {
 			padvance(p);
-			int			is_end;
-			const char *end_kw;
-			stmt_node  *s = parse_statement_tag(p, &is_end, &end_kw);
+			int		   is_end;
+			stmt_node *s = parse_statement_tag(p, &is_end);
 			if (is_end) {
 				p->depth--;
 				return head;
@@ -1429,18 +1408,9 @@ static stmt_node *parse_block(parser *p) {
 	return head;
 }
 
-static const char *supported_filters[] = {"trim",	  "default", "length", "upper",		 "lower",
-										  "dictsort", "list",	 "map",	   "capitalize", "replace",
-										  "tojson",	  "int",	 "first",  "last",		 "join",
-										  "safe",	  "string",	 "items",  NULL};
-
-static const char *supported_methods[] = {
-	"get",	 "split",	   "strip",	  "lstrip", "rstrip",	  "trim",	  "join", "lower",
-	"upper", "capitalize", "replace", "items",	"startswith", "endswith", NULL};
-
-static const char *supported_tests[] = {"none",	   "null",	   "defined", "undefined", "string",
-										"mapping", "iterable", "number",  "integer",   "sequence",
-										"boolean", "true",	   "false",	  "dict",	   NULL};
+static const char *k_test_names[] = {
+	"none",	  "null",	 "Null",	 "defined", "undefined", "string", "mapping", "iterable",
+	"number", "integer", "sequence", "boolean", "true",		 "false",  "dict",	  NULL};
 
 static int list_has(const char **list, const char *s) {
 	for (int i = 0; list[i]; i++)
@@ -1449,46 +1419,52 @@ static int list_has(const char **list, const char *s) {
 	return 0;
 }
 
+static int filter_name_supported(const char *name);
+static int method_name_supported(const char *name);
+static int test_name_supported(const char *name);
+
+static void report_unsupported_fn(parser *p, const char *name, int (*supported)(const char *),
+								  const char *prefix, const char *suffix) {
+	if (name && !supported(name)) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "%s%s%s", prefix, name, suffix);
+		strlist_add(&p->features, xstrdup(buf));
+	}
+}
+static void report_unsupported(parser *p, const char *name, const char **table, const char *prefix,
+							   const char *suffix) {
+	if (name && !list_has(table, name)) {
+		char buf[128];
+		snprintf(buf, sizeof(buf), "%s%s%s", prefix, name, suffix);
+		strlist_add(&p->features, xstrdup(buf));
+	}
+}
+
+static const char *k_supported_ops[] = {
+	"and", "or", "+", "-", "==", "!=", ">", "<", ">=", "<=", "in", NULL};
+
 static void scan_expr(parser *p, expr_node *e) {
 	if (!e)
 		return;
 	switch (e->kind) {
 	case EX_FILTER:
-		if (e->str && !list_has(supported_filters, e->str)) {
-			char buf[128];
-			snprintf(buf, sizeof(buf), "unsupported filter '%s'", e->str);
-			strlist_add(&p->features, xstrdup(buf));
-		}
+		report_unsupported_fn(p, e->str, filter_name_supported, "unsupported filter '", "'");
 		scan_expr(p, e->a);
 		for (expr_arg *a = e->args; a; a = a->next)
 			scan_expr(p, a->val);
 		break;
 	case EX_METHODCALL:
-		if (e->str && !list_has(supported_methods, e->str)) {
-			char buf[128];
-			snprintf(buf, sizeof(buf), "unsupported method '%s()'", e->str);
-			strlist_add(&p->features, xstrdup(buf));
-		}
+		report_unsupported_fn(p, e->str, method_name_supported, "unsupported method '", "()'");
 		scan_expr(p, e->a);
 		for (expr_arg *a = e->args; a; a = a->next)
 			scan_expr(p, a->val);
 		break;
 	case EX_ISDEFINED:
-		if (e->str && !list_has(supported_tests, e->str)) {
-			char buf[128];
-			snprintf(buf, sizeof(buf), "unsupported test 'is %s'", e->str);
-			strlist_add(&p->features, xstrdup(buf));
-		}
+		report_unsupported_fn(p, e->str, test_name_supported, "unsupported test 'is ", "'");
 		scan_expr(p, e->a);
 		break;
 	case EX_BINOP: {
-		static const char *supported_ops[] = {
-			"and", "or", "+", "-", "==", "!=", ">", "<", ">=", "<=", "in", NULL};
-		if (e->op && !list_has(supported_ops, e->op)) {
-			char buf[128];
-			snprintf(buf, sizeof(buf), "unsupported operator '%s'", e->op);
-			strlist_add(&p->features, xstrdup(buf));
-		}
+		report_unsupported(p, e->op, k_supported_ops, "unsupported operator '", "'");
 		scan_expr(p, e->a);
 		scan_expr(p, e->b);
 		break;
@@ -1691,12 +1667,12 @@ static void scope_free_entries(scope *sc) {
 }
 
 typedef struct {
-	scope *sc;
-	char  *errbuf;
-	size_t errbuf_len;
-	int	   failed;
-	int	   call_depth;
-	int	   break_hit;
+	scope	*sc;
+	char	*errbuf;
+	size_t	 errbuf_len;
+	bool	 failed;
+	uint16_t call_depth;
+	bool	 break_hit;
 } eval_ctx;
 
 static void everr(eval_ctx *ctx, const char *msg) {
@@ -1705,7 +1681,7 @@ static void everr(eval_ctx *ctx, const char *msg) {
 	ctx->failed = 1;
 }
 
-static void			exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out);
+static void			exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
 static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e);
 
 static void bind_one_param(scope *call_sc, macro_param *mp, expr_arg *args, expr_arg **cur_pos,
@@ -1754,16 +1730,21 @@ static jinja_value *call_macro(eval_ctx *ctx, jinja_value *macro_val, expr_arg *
 	scope *saved = ctx->sc;
 	ctx->sc		 = &call_sc;
 	ctx->call_depth++;
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
 	exec_stmts(ctx, def->macro_body, &sb);
 	ctx->call_depth--;
 	ctx->sc = saved;
 	scope_free_entries(&call_sc);
 
-	jinja_value *out = jinja_string(sb.p);
-	free(sb.p);
+	jinja_value *out = jinja_string_take(sb_finish(&sb));
 	return out;
+}
+
+static int dictsort_cmp(const void *a, const void *b) {
+	const jinja_dict_entry *ea = *(const jinja_dict_entry *const *)a;
+	const jinja_dict_entry *eb = *(const jinja_dict_entry *const *)b;
+	return strcmp(ea->key, eb->key);
 }
 
 static jinja_value *dictsort_value(const jinja_value *base) {
@@ -1777,13 +1758,7 @@ static jinja_value *dictsort_value(const jinja_value *base) {
 	size_t			   i   = 0;
 	for (jinja_dict_entry *e = base->as.dict; e; e = e->next)
 		arr[i++] = e;
-	for (size_t a = 0; a < n; a++)
-		for (size_t b = a + 1; b < n; b++)
-			if (strcmp(arr[a]->key, arr[b]->key) > 0) {
-				jinja_dict_entry *tmp = arr[a];
-				arr[a]				  = arr[b];
-				arr[b]				  = tmp;
-			}
+	qsort(arr, n, sizeof(*arr), dictsort_cmp);
 	for (i = 0; i < n; i++) {
 		jinja_value *pair = jinja_list();
 		jinja_list_append(pair, jinja_string(arr[i]->key));
@@ -1794,70 +1769,49 @@ static jinja_value *dictsort_value(const jinja_value *base) {
 	return out;
 }
 
-static void json_append_str(strbuf *sb, const char *s) {
-	sb_append(sb, "\"", 1);
-	for (const char *c = s; *c; c++) {
-		switch (*c) {
-		case '"':
-			sb_append(sb, "\\\"", 2);
-			break;
-		case '\\':
-			sb_append(sb, "\\\\", 2);
-			break;
-		case '\n':
-			sb_append(sb, "\\n", 2);
-			break;
-		case '\r':
-			sb_append(sb, "\\r", 2);
-			break;
-		case '\t':
-			sb_append(sb, "\\t", 2);
-			break;
-		default:
-			sb_append(sb, c, 1);
-			break;
-		}
-	}
-	sb_append(sb, "\"", 1);
+static void json_append_str(str_builder *sb, const char *s) {
+	sb_putb(sb, "\"", 1);
+	json_escape_append(sb, s, strlen(s));
+	sb_putb(sb, "\"", 1);
 }
 
-static void json_to_json(strbuf *sb, const jinja_value *v) {
+static void json_to_json(str_builder *sb, const jinja_value *v) {
 	if (!v) {
-		sb_append_str(sb, "null");
+		sb_puts(sb, "null");
 		return;
 	}
 	switch (v->type) {
 	case JV_NONE:
-		sb_append_str(sb, "null");
+		sb_puts(sb, "null");
 		break;
 	case JV_BOOL:
-		sb_append_str(sb, v->as.b ? "true" : "false");
+		sb_puts(sb, v->as.b ? "true" : "false");
 		break;
 	case JV_STRING:
 		json_append_str(sb, v->as.s);
 		break;
 	case JV_DICT: {
-		sb_append(sb, "{", 1);
+		sb_putb(sb, "{", 1);
 		int first = 1;
 		for (jinja_dict_entry *e = v->as.dict; e; e = e->next) {
 			if (!first)
-				sb_append_str(sb, ", ");
+				sb_puts(sb, ", ");
 			first = 0;
 			json_append_str(sb, e->key);
-			sb_append_str(sb, ": ");
+			sb_puts(sb, ": ");
 			json_to_json(sb, e->val);
 		}
-		sb_append(sb, "}", 1);
+		sb_putb(sb, "}", 1);
 		break;
 	}
 	case JV_LIST: {
-		sb_append(sb, "[", 1);
+		sb_putb(sb, "[", 1);
 		for (size_t i = 0; i < v->as.list.n; i++) {
 			if (i)
-				sb_append_str(sb, ", ");
+				sb_puts(sb, ", ");
 			json_to_json(sb, v->as.list.items[i]);
 		}
-		sb_append(sb, "]", 1);
+		sb_putb(sb, "]", 1);
 		break;
 	}
 	case JV_MACRO:
@@ -1881,180 +1835,355 @@ static int is_int_str(const char *s) {
 }
 
 static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e);
-static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
-	jinja_value *base = eval_expr(ctx, e->a);
-	if (!strcmp(e->str, "trim")) {
-		const char *s = value_as_cstr(base);
+typedef jinja_value *(*jinja_filter_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args);
+
+static jinja_filter_fn lookup_filter(const char *name);
+
+static char *trim_dup(const char *s, int left, int right) {
+	if (left)
 		while (*s && isspace((unsigned char)*s))
 			s++;
-		char  *dup = xstrdup(s);
-		size_t n   = strlen(dup);
+	char  *dup = xstrdup(s);
+	size_t n   = strlen(dup);
+	if (right)
 		while (n > 0 && isspace((unsigned char)dup[n - 1]))
 			dup[--n] = '\0';
-		jinja_value *out = jinja_string(dup);
-		free(dup);
-		return out;
-	}
-	if (!strcmp(e->str, "default")) {
-		if (truthy(base))
-			return base;
-		return e->args ? eval_expr(ctx, e->args->val) : jinja_string("");
-	}
-	if (!strcmp(e->str, "length")) {
-		size_t n = 0;
-		if (base && base->type == JV_LIST)
-			n = base->as.list.n;
-		else if (base && base->type == JV_STRING)
-			n = strlen(base->as.s);
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%zu", n);
-		return jinja_string(buf);
-	}
-	if (!strcmp(e->str, "upper")) {
-		char *dup = xstrdup(value_as_cstr(base));
-		for (char *c = dup; *c; c++)
-			*c = toupper((unsigned char)*c);
-		jinja_value *out = jinja_string(dup);
-		free(dup);
-		return out;
-	}
-	if (!strcmp(e->str, "capitalize")) {
-		char *dup = xstrdup(value_as_cstr(base));
-		if (dup[0])
-			dup[0] = toupper((unsigned char)dup[0]);
-		for (char *c = dup + 1; *c; c++)
-			*c = tolower((unsigned char)*c);
-		jinja_value *out = jinja_string(dup);
-		free(dup);
-		return out;
-	}
-	if (!strcmp(e->str, "replace")) {
-		const char *old_s = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-		const char *new_s =
-			e->args && e->args->next ? value_as_cstr(eval_expr(ctx, e->args->next->val)) : "";
-		const char *str	  = value_as_cstr(base);
-		size_t		old_n = strlen(old_s);
-		strbuf		sb;
-		sb_init(&sb);
-		if (!old_n) {
-			sb_append_str(&sb, str);
-		} else {
-			const char *remaining = str;
-			for (;;) {
-				const char *hit = strstr(remaining, old_s);
-				if (!hit) {
-					sb_append_str(&sb, remaining);
-					break;
-				}
-				sb_append(&sb, remaining, (size_t)(hit - remaining));
-				sb_append_str(&sb, new_s);
-				remaining = hit + old_n;
-			}
-		}
-		jinja_value *out = jinja_string(sb.p);
-		free(sb.p);
-		return out;
-	}
-	if (!strcmp(e->str, "lower")) {
-		char *dup = xstrdup(value_as_cstr(base));
-		for (char *c = dup; *c; c++)
-			*c = tolower((unsigned char)*c);
-		jinja_value *out = jinja_string(dup);
-		free(dup);
-		return out;
-	}
-	if (!strcmp(e->str, "dictsort"))
-		return dictsort_value(base);
-	if (!strcmp(e->str, "int")) {
-		long v = atol(value_as_cstr(base));
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%ld", v);
-		return jinja_string(buf);
-	}
-	if (!strcmp(e->str, "first")) {
-		if (base && base->type == JV_LIST && base->as.list.n > 0)
-			return base->as.list.items[0];
-		return jinja_none();
-	}
-	if (!strcmp(e->str, "last")) {
-		if (base && base->type == JV_LIST && base->as.list.n > 0)
-			return base->as.list.items[base->as.list.n - 1];
-		return jinja_none();
-	}
-	if (!strcmp(e->str, "join")) {
-		const char *sep = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-		strbuf		sb;
-		sb_init(&sb);
-		if (base && base->type == JV_LIST) {
-			for (size_t i = 0; i < base->as.list.n; i++) {
-				if (i)
-					sb_append_str(&sb, sep);
-				sb_append_str(&sb, value_as_cstr(base->as.list.items[i]));
-			}
-		}
-		jinja_value *out = jinja_string(sb.p);
-		free(sb.p);
-		return out;
-	}
-	if (!strcmp(e->str, "tojson")) {
-		strbuf sb;
-		sb_init(&sb);
-		json_to_json(&sb, base);
-		jinja_value *out = jinja_string(sb.p);
-		free(sb.p);
-		return out;
-	}
-	if (!strcmp(e->str, "list"))
+	return dup;
+}
+
+static jinja_value *filter_trim(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	char *dup = trim_dup(value_as_cstr(base), 1, 1);
+	return jinja_string_take(dup);
+}
+
+static jinja_value *filter_default(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	if (truthy(base))
 		return base;
-	if (!strcmp(e->str, "safe"))
-		return base;
-	if (!strcmp(e->str, "string"))
-		return jinja_string(value_as_cstr(base));
-	if (!strcmp(e->str, "items")) {
-		jinja_value *out = jinja_list();
-		if (base && base->type == JV_DICT) {
-			for (jinja_dict_entry *en = base->as.dict; en; en = en->next) {
-				jinja_value *pair = jinja_list();
-				jinja_list_append(pair, jinja_string(en->key));
-				jinja_list_append(pair, en->val);
-				jinja_list_append(out, pair);
-			}
+	return args ? eval_expr(ctx, args->val) : jinja_string("");
+}
+
+static jinja_value *filter_length(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	size_t n = 0;
+	if (base && base->type == JV_LIST)
+		n = base->as.list.n;
+	else if (base && base->type == JV_STRING)
+		n = strlen(base->as.s);
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%zu", n);
+	return jinja_string(buf);
+}
+
+static jinja_value *filter_upper(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	char *dup = xstrdup(value_as_cstr(base));
+	for (char *c = dup; *c; c++)
+		*c = toupper((unsigned char)*c);
+	return jinja_string_take(dup);
+}
+
+static jinja_value *filter_capitalize(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	char *dup = xstrdup(value_as_cstr(base));
+	if (dup[0])
+		dup[0] = toupper((unsigned char)dup[0]);
+	for (char *c = dup + 1; *c; c++)
+		*c = tolower((unsigned char)*c);
+	return jinja_string_take(dup);
+}
+
+static jinja_value *filter_replace(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	const char *old_s = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
+	const char *new_s = args && args->next ? value_as_cstr(eval_expr(ctx, args->next->val)) : "";
+	const char *str	  = value_as_cstr(base);
+	str_builder sb;
+	sb_init(&sb);
+	str_replace_all(&sb, str, old_s, new_s);
+	return jinja_string_take(sb_finish(&sb));
+}
+
+static jinja_value *filter_lower(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	char *dup = xstrdup(value_as_cstr(base));
+	for (char *c = dup; *c; c++)
+		*c = tolower((unsigned char)*c);
+	return jinja_string_take(dup);
+}
+
+static jinja_value *filter_dictsort(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	return dictsort_value(base);
+}
+
+static jinja_value *filter_int(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	long v = atol(value_as_cstr(base));
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%ld", v);
+	return jinja_string(buf);
+}
+
+static jinja_value *filter_first(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	if (base && base->type == JV_LIST && base->as.list.n > 0)
+		return base->as.list.items[0];
+	return jinja_none();
+}
+
+static jinja_value *filter_last(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	if (base && base->type == JV_LIST && base->as.list.n > 0)
+		return base->as.list.items[base->as.list.n - 1];
+	return jinja_none();
+}
+
+static jinja_value *filter_join(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	const char *sep = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
+	str_builder sb;
+	sb_init(&sb);
+	if (base && base->type == JV_LIST) {
+		for (size_t i = 0; i < base->as.list.n; i++) {
+			if (i)
+				sb_puts(&sb, sep);
+			sb_puts(&sb, value_as_cstr(base->as.list.items[i]));
 		}
-		return out;
 	}
-	if (!strcmp(e->str, "map")) {
-		const char	*fname = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-		jinja_value *out   = jinja_list();
-		if (base && base->type == JV_LIST) {
-			for (size_t i = 0; i < base->as.list.n; i++) {
-				jinja_value *item = base->as.list.items[i];
-				if (!strcmp(fname, "upper")) {
-					char *dup = xstrdup(value_as_cstr(item));
-					for (char *c = dup; *c; c++)
-						*c = toupper((unsigned char)*c);
-					jinja_list_append(out, jinja_string(dup));
-					free(dup);
-				} else if (!strcmp(fname, "lower")) {
-					char *dup = xstrdup(value_as_cstr(item));
-					for (char *c = dup; *c; c++)
-						*c = tolower((unsigned char)*c);
-					jinja_list_append(out, jinja_string(dup));
-					free(dup);
-				} else {
-					jinja_list_append(out, item);
-				}
-			}
-		}
-		return out;
-	}
+	return jinja_string_take(sb_finish(&sb));
+}
+
+static jinja_value *filter_tojson(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	str_builder sb;
+	sb_init(&sb);
+	json_to_json(&sb, base);
+	return jinja_string_take(sb_finish(&sb));
+}
+
+static jinja_value *filter_passthrough(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
 	return base;
 }
 
+static jinja_value *filter_string(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	return jinja_string(value_as_cstr(base));
+}
+
+static jinja_value *filter_items(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	(void)ctx;
+	(void)args;
+	jinja_value *out = jinja_list();
+	if (base && base->type == JV_DICT) {
+		for (jinja_dict_entry *en = base->as.dict; en; en = en->next) {
+			jinja_value *pair = jinja_list();
+			jinja_list_append(pair, jinja_string(en->key));
+			jinja_list_append(pair, en->val);
+			jinja_list_append(out, pair);
+		}
+	}
+	return out;
+}
+
+static jinja_value *filter_map(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
+	const char	   *fname	= args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
+	jinja_filter_fn item_fn = lookup_filter(fname);
+	jinja_value	   *out		= jinja_list();
+	if (base && base->type == JV_LIST) {
+		for (size_t i = 0; i < base->as.list.n; i++) {
+			jinja_value *item = base->as.list.items[i];
+			jinja_list_append(out, item_fn ? item_fn(ctx, item, NULL) : item);
+		}
+	}
+	return out;
+}
+
+static const struct {
+	const char	   *name;
+	jinja_filter_fn fn;
+} k_filter_table[] = {
+	{"trim", filter_trim},
+	{"default", filter_default},
+	{"length", filter_length},
+	{"upper", filter_upper},
+	{"capitalize", filter_capitalize},
+	{"replace", filter_replace},
+	{"lower", filter_lower},
+	{"dictsort", filter_dictsort},
+	{"int", filter_int},
+	{"first", filter_first},
+	{"last", filter_last},
+	{"join", filter_join},
+	{"tojson", filter_tojson},
+	{"list", filter_passthrough},
+	{"safe", filter_passthrough},
+	{"string", filter_string},
+	{"items", filter_items},
+	{"map", filter_map},
+};
+
+static int test_name_supported(const char *name) {
+	return list_has(k_test_names, name);
+}
+
+static jinja_filter_fn lookup_filter(const char *name) {
+	if (!name)
+		return NULL;
+	for (size_t i = 0; i < sizeof(k_filter_table) / sizeof(k_filter_table[0]); i++) {
+		if (!strcmp(name, k_filter_table[i].name))
+			return k_filter_table[i].fn;
+	}
+	return NULL;
+}
+
+static int filter_name_supported(const char *name) {
+	return lookup_filter(name) != NULL;
+}
+
+static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
+	jinja_value	   *base = eval_expr(ctx, e->a);
+	jinja_filter_fn fn	 = lookup_filter(e->str);
+	if (fn)
+		return fn(ctx, base, e->args);
+	return base;
+}
+
+typedef jinja_value *(*jinja_method_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+										const char *name);
+
+static jinja_value *method_get(eval_ctx *ctx, jinja_value *base, expr_arg *args, const char *name) {
+	(void)name;
+	const char	*key = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
+	jinja_value *v	 = dict_get(base, key);
+	if (v)
+		return v;
+	if (args && args->next)
+		return eval_expr(ctx, args->next->val);
+	return jinja_none();
+}
+
+static jinja_value *method_split(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+								 const char *name) {
+	(void)ctx;
+	(void)name;
+	const char	*sep = args ? value_as_cstr(eval_expr(ctx, args->val)) : NULL;
+	const char	*s	 = value_as_cstr(base);
+	jinja_value *out = jinja_list();
+	if (!sep || !*sep) {
+		jinja_list_append(out, jinja_string(s));
+		return out;
+	}
+	size_t		seplen = strlen(sep);
+	const char *cursor = s;
+	for (;;) {
+		const char *hit = strstr(cursor, sep);
+		if (!hit) {
+			jinja_list_append(out, jinja_string(cursor));
+			break;
+		}
+		size_t partlen = (size_t)(hit - cursor);
+		jinja_list_append(out, jinja_string_n(cursor, partlen));
+		cursor = hit + seplen;
+	}
+	return out;
+}
+
+static jinja_value *method_strip(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+								 const char *name) {
+	(void)ctx;
+	(void)args;
+	int	  left	= strcmp(name, "rstrip") != 0;
+	int	  right = strcmp(name, "lstrip") != 0;
+	char *dup	= trim_dup(value_as_cstr(base), left, right);
+	return jinja_string_take(dup);
+}
+
+static jinja_value *method_startswith(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+									  const char *name) {
+	const char *prefix = args ? value_as_cstr(eval_expr(ctx, args->val)) : "";
+	const char *s	   = value_as_cstr(base);
+	size_t		n	   = strlen(prefix);
+	int res = !strcmp(name, "startswith") ? !strncmp(s, prefix, n)
+										  : (strlen(s) >= n && !strcmp(s + strlen(s) - n, prefix));
+	return jinja_bool(res);
+}
+
+static jinja_value *method_filter_alias(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+										const char *name) {
+	jinja_filter_fn fn = lookup_filter(name);
+	if (fn)
+		return fn(ctx, base, args);
+	return base;
+}
+
+static const struct {
+	const char	   *name;
+	jinja_method_fn fn;
+} k_method_table[] = {
+	{"get", method_get},
+	{"split", method_split},
+	{"replace", method_filter_alias},
+	{"strip", method_strip},
+	{"lstrip", method_strip},
+	{"rstrip", method_strip},
+	{"trim", method_strip},
+	{"items", method_filter_alias},
+	{"join", method_filter_alias},
+	{"lower", method_filter_alias},
+	{"upper", method_filter_alias},
+	{"capitalize", method_filter_alias},
+	{"startswith", method_startswith},
+	{"endswith", method_startswith},
+};
+
+static jinja_method_fn lookup_method(const char *name) {
+	if (!name)
+		return NULL;
+	for (size_t i = 0; i < sizeof(k_method_table) / sizeof(k_method_table[0]); i++) {
+		if (!strcmp(name, k_method_table[i].name))
+			return k_method_table[i].fn;
+	}
+	return NULL;
+}
+
+static int method_name_supported(const char *name) {
+	return lookup_method(name) != NULL;
+}
+
+static jinja_value *eval_methodcall(eval_ctx *ctx, expr_node *e) {
+	jinja_value	   *base = eval_expr(ctx, e->a);
+	jinja_method_fn fn	 = lookup_method(e->str);
+	if (fn)
+		return fn(ctx, base, e->args, e->str);
+	everr(ctx, "unsupported method call");
+	return jinja_none();
+}
+
 static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
-	if (!strcmp(e->op, "and"))
-		return jinja_bool(truthy(eval_expr(ctx, e->a)) && truthy(eval_expr(ctx, e->b)));
-	if (!strcmp(e->op, "or"))
-		return jinja_bool(truthy(eval_expr(ctx, e->a)) || truthy(eval_expr(ctx, e->b)));
+	if (!strcmp(e->op, "and")) {
+		jinja_value *a = eval_expr(ctx, e->a);
+		if (!truthy(a))
+			return a;
+		return eval_expr(ctx, e->b);
+	}
+	if (!strcmp(e->op, "or")) {
+		jinja_value *a = eval_expr(ctx, e->a);
+		if (truthy(a))
+			return a;
+		return eval_expr(ctx, e->b);
+	}
 	if (!strcmp(e->op, "+")) {
 		jinja_value *a		  = eval_expr(ctx, e->a);
 		jinja_value *b		  = eval_expr(ctx, e->b);
@@ -2067,13 +2196,11 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 			snprintf(buf, sizeof(buf), "%ld", atol(as) + atol(bs));
 			return jinja_string(buf);
 		}
-		strbuf sb;
+		str_builder sb;
 		sb_init(&sb);
-		sb_append_str(&sb, as);
-		sb_append_str(&sb, bs);
-		jinja_value *out = jinja_string(sb.p);
-		free(sb.p);
-		return out;
+		sb_puts(&sb, as);
+		sb_puts(&sb, bs);
+		return jinja_string_take(sb_finish(&sb));
 	}
 	if (!strcmp(e->op, "-")) {
 		jinja_value *a	= eval_expr(ctx, e->a);
@@ -2349,138 +2476,8 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 			return call_macro(ctx, macro, e->args);
 		return jinja_none();
 	}
-	case EX_METHODCALL: {
-		jinja_value *base = eval_expr(ctx, e->a);
-		if (!strcmp(e->str, "get")) {
-			const char	*key = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-			jinja_value *v	 = dict_get(base, key);
-			if (v)
-				return v;
-			if (e->args && e->args->next)
-				return eval_expr(ctx, e->args->next->val);
-			return jinja_none();
-		}
-		if (!strcmp(e->str, "split")) {
-			const char	*sep = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : NULL;
-			const char	*s	 = value_as_cstr(base);
-			jinja_value *out = jinja_list();
-			if (!sep || !*sep) {
-				jinja_list_append(out, jinja_string(s));
-				return out;
-			}
-			size_t		seplen = strlen(sep);
-			const char *cursor = s;
-			for (;;) {
-				const char *hit = strstr(cursor, sep);
-				if (!hit) {
-					jinja_list_append(out, jinja_string(cursor));
-					break;
-				}
-				size_t partlen = (size_t)(hit - cursor);
-				jinja_list_append(out, jinja_string_n(cursor, partlen));
-				cursor = hit + seplen;
-			}
-			return out;
-		}
-		if (!strcmp(e->str, "replace")) {
-			const char *old_s = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-			const char *new_s =
-				e->args && e->args->next ? value_as_cstr(eval_expr(ctx, e->args->next->val)) : "";
-			const char *str	  = value_as_cstr(base);
-			size_t		old_n = strlen(old_s);
-			strbuf		sb;
-			sb_init(&sb);
-			if (!old_n) {
-				sb_append_str(&sb, str);
-			} else {
-				const char *remaining = str;
-				for (;;) {
-					const char *hit = strstr(remaining, old_s);
-					if (!hit) {
-						sb_append_str(&sb, remaining);
-						break;
-					}
-					sb_append(&sb, remaining, (size_t)(hit - remaining));
-					sb_append_str(&sb, new_s);
-					remaining = hit + old_n;
-				}
-			}
-			jinja_value *out = jinja_string(sb.p);
-			free(sb.p);
-			return out;
-		}
-		if (!strcmp(e->str, "strip") || !strcmp(e->str, "lstrip") || !strcmp(e->str, "rstrip") ||
-			!strcmp(e->str, "trim")) {
-			const char *s = value_as_cstr(base);
-			if (strcmp(e->str, "rstrip"))
-				while (*s && isspace((unsigned char)*s))
-					s++;
-			char  *dup = xstrdup(s);
-			size_t n   = strlen(dup);
-			if (strcmp(e->str, "lstrip"))
-				while (n > 0 && isspace((unsigned char)dup[n - 1]))
-					dup[--n] = '\0';
-			jinja_value *out = jinja_string(dup);
-			free(dup);
-			return out;
-		}
-		if (!strcmp(e->str, "items")) {
-			jinja_value *out = jinja_list();
-			if (base && base->type == JV_DICT) {
-				for (jinja_dict_entry *en = base->as.dict; en; en = en->next) {
-					jinja_value *pair = jinja_list();
-					jinja_list_append(pair, jinja_string(en->key));
-					jinja_list_append(pair, en->val);
-					jinja_list_append(out, pair);
-				}
-			}
-			return out;
-		}
-		if (!strcmp(e->str, "join")) {
-			const char *sep = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-			strbuf		sb;
-			sb_init(&sb);
-			if (base && base->type == JV_LIST) {
-				for (size_t i = 0; i < base->as.list.n; i++) {
-					if (i)
-						sb_append_str(&sb, sep);
-					sb_append_str(&sb, value_as_cstr(base->as.list.items[i]));
-				}
-			}
-			jinja_value *out = jinja_string(sb.p);
-			free(sb.p);
-			return out;
-		}
-		if (!strcmp(e->str, "lower") || !strcmp(e->str, "upper") || !strcmp(e->str, "capitalize")) {
-			char *dup = xstrdup(value_as_cstr(base));
-			if (!strcmp(e->str, "lower")) {
-				for (char *c = dup; *c; c++)
-					*c = tolower((unsigned char)*c);
-			} else if (!strcmp(e->str, "upper")) {
-				for (char *c = dup; *c; c++)
-					*c = toupper((unsigned char)*c);
-			} else {
-				if (dup[0])
-					dup[0] = toupper((unsigned char)dup[0]);
-				for (char *c = dup + 1; *c; c++)
-					*c = tolower((unsigned char)*c);
-			}
-			jinja_value *out = jinja_string(dup);
-			free(dup);
-			return out;
-		}
-		if (!strcmp(e->str, "startswith") || !strcmp(e->str, "endswith")) {
-			const char *prefix = e->args ? value_as_cstr(eval_expr(ctx, e->args->val)) : "";
-			const char *s	   = value_as_cstr(base);
-			size_t		n	   = strlen(prefix);
-			int			res	   = !strcmp(e->str, "startswith")
-									 ? !strncmp(s, prefix, n)
-									 : (strlen(s) >= n && !strcmp(s + strlen(s) - n, prefix));
-			return jinja_bool(res);
-		}
-		everr(ctx, "unsupported method call");
-		return jinja_none();
-	}
+	case EX_METHODCALL:
+		return eval_methodcall(ctx, e);
 	case EX_ISDEFINED: {
 		jinja_value *v	  = eval_expr(ctx, e->a);
 		const char	*test = e->str ? e->str : "defined";
@@ -2520,18 +2517,18 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 	return jinja_none();
 }
 
-static void exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out);
+static void exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
 
-static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
+static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 	if (ctx->failed)
 		return;
 	switch (s->kind) {
 	case ST_TEXT:
-		sb_append_str(out, s->text);
+		sb_puts(out, s->text);
 		return;
 	case ST_OUTPUT: {
 		jinja_value *v = eval_expr(ctx, s->expr);
-		sb_append_str(out, value_as_cstr(v));
+		sb_puts(out, value_as_cstr(v));
 		return;
 	}
 	case ST_IF:
@@ -2542,24 +2539,47 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		return;
 	case ST_FOR: {
 		jinja_value *iter = eval_expr(ctx, s->iterable);
-		if (iter && (iter->type == JV_LIST || iter->type == JV_DICT || iter->type == JV_STRING)) {
-			if (iter->type != JV_LIST) {
-				everr(ctx, "for loop over non-list");
-				return;
-			}
-		} else if (!iter || iter->type == JV_NONE) {
+		if (!iter || iter->type == JV_NONE) {
 			return;
-		} else {
+		}
+		if (iter->type != JV_LIST && iter->type != JV_DICT && iter->type != JV_STRING) {
 			everr(ctx, "for loop over non-list");
 			return;
 		}
-		size_t n = iter->as.list.n;
-		for (size_t i = 0; i < n && !ctx->failed; i++) {
-			scope loop_sc;
-			loop_sc.entries = NULL;
-			loop_sc.parent	= ctx->sc;
 
-			jinja_value *item = iter->as.list.items[i];
+		jinja_value **items	   = NULL;
+		size_t		  n		   = 0;
+		jinja_value	 *key_list = NULL;
+		if (iter->type == JV_LIST) {
+			items = iter->as.list.items;
+			n	  = iter->as.list.n;
+		} else if (iter->type == JV_DICT) {
+			size_t dict_n = 0;
+			for (jinja_dict_entry *en = iter->as.dict; en; en = en->next)
+				dict_n++;
+			key_list = jinja_list();
+			for (jinja_dict_entry *en = iter->as.dict; en; en = en->next)
+				jinja_list_append(key_list, jinja_string(en->key));
+			items = key_list->as.list.items;
+			n	  = dict_n;
+		} else {
+			size_t slen = strlen(iter->as.s);
+			key_list	= jinja_list();
+			for (size_t k = 0; k < slen; k++) {
+				char buf[2];
+				buf[0] = iter->as.s[k];
+				buf[1] = '\0';
+				jinja_list_append(key_list, jinja_string(buf));
+			}
+			items = key_list->as.list.items;
+			n	  = slen;
+		}
+
+		scope loop_sc;
+		loop_sc.entries = NULL;
+		loop_sc.parent	= ctx->sc;
+		for (size_t i = 0; i < n && !ctx->failed; i++) {
+			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
 				scope_assign(&loop_sc, s->loop_var, item->as.list.items[0]);
 				scope_assign(&loop_sc, s->loop_var2, item->as.list.items[1]);
@@ -2575,6 +2595,8 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			jinja_dict_set(loop_obj, "index", jinja_string(buf));
 			jinja_dict_set(loop_obj, "first", jinja_bool(i == 0));
 			jinja_dict_set(loop_obj, "last", jinja_bool(i == n - 1));
+			jinja_dict_set(loop_obj, "previtem", i > 0 ? items[i - 1] : jinja_none());
+			jinja_dict_set(loop_obj, "nextitem", i + 1 < n ? items[i + 1] : jinja_none());
 			scope_assign(&loop_sc, "loop", loop_obj);
 
 			scope *saved   = ctx->sc;
@@ -2582,12 +2604,12 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 			ctx->break_hit = 0;
 			exec_stmts(ctx, s->body, out);
 			ctx->sc = saved;
-			scope_free_entries(&loop_sc);
 			if (ctx->break_hit) {
 				ctx->break_hit = 0;
 				break;
 			}
 		}
+		scope_free_entries(&loop_sc);
 		return;
 	}
 	case ST_SET: {
@@ -2595,11 +2617,10 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 		if (s->set_val) {
 			val = eval_expr(ctx, s->set_val);
 		} else {
-			strbuf sb;
+			str_builder sb;
 			sb_init(&sb);
 			exec_stmts(ctx, s->body, &sb);
-			val = jinja_string(sb.p);
-			free(sb.p);
+			val = jinja_string_take(sb_finish(&sb));
 		}
 		if (s->set_attr) {
 			jinja_value *target = scope_lookup(ctx->sc, s->set_name);
@@ -2636,7 +2657,7 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, strbuf *out) {
 	}
 }
 
-static void exec_stmts(eval_ctx *ctx, stmt_node *s, strbuf *out) {
+static void exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 	for (; s && !ctx->failed && !ctx->break_hit; s = s->next)
 		exec_stmt(ctx, s, out);
 }
@@ -2668,8 +2689,9 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	ctx.call_depth = 0;
 	ctx.break_hit  = 0;
 
-	strbuf sb;
+	str_builder sb;
 	sb_init(&sb);
+	sb_reserve(&sb, 4096);
 	exec_stmts(&ctx, prog, &sb);
 
 	scope_free_entries(&global_sc);
@@ -2678,11 +2700,11 @@ status_code jinja_render(jinja_program *prog, jinja_value *globals, char **out, 
 	g_render_arena = outer;
 
 	if (ctx.failed) {
-		free(sb.p);
+		sb_free(&sb);
 		*out = NULL;
 		return ERR_FORMAT;
 	}
 
-	*out = sb.p;
+	*out = sb_finish(&sb);
 	return OK;
 }

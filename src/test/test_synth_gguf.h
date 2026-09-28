@@ -297,18 +297,6 @@ static __attribute__((unused)) void tsg_build_vocab_file(const char *path, const
 
 #define TSG_CHAT_VOCAB 357
 
-static __attribute__((unused)) int32_t tsg_chat_char_id(int c) {
-	if (c >= 32 && c <= 126)
-		return 1 + (c - 32);
-	if (c == '\n')
-		return 96;
-	if (c == '\t')
-		return 97;
-	if (c == '\r')
-		return 98;
-	return -1;
-}
-
 static __attribute__((unused)) void tsg_build_chat_vocab_arrays(char (*storage)[8],
 																const char **toks, int32_t *types) {
 	int id = 0;
@@ -350,6 +338,8 @@ typedef struct {
 	int		 intermediate;
 	int		 ctx;
 	uint64_t seed;
+	int		 tied;
+	int		 output_copies_embd;
 } tsg_llama_spec;
 
 static __attribute__((unused)) const char *tsg_chat_template =
@@ -382,11 +372,15 @@ static __attribute__((unused)) void tsg_build_chat_llama(const char			  *path,
 	tsg_kv_i32(&w, "tokenizer.ggml.unknown_token_id", 0);
 	tsg_kv_str(&w, "tokenizer.chat_template", tsg_chat_template);
 
-	int	 V = TSG_CHAT_VOCAB;
-	char nm[128];
-	tsg_add2(&w, "token_embd.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
+	int	   V = TSG_CHAT_VOCAB;
+	char   nm[128];
+	float *embd = tsg_add2(&w, "token_embd.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
 	tsg_add1(&w, "output_norm.weight", (uint64_t)s->dim, -1.0f);
-	tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
+	if (!s->tied) {
+		float *outw = tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
+		if (s->output_copies_embd && embd && outw)
+			memcpy(outw, embd, sizeof(float) * (size_t)s->dim * (size_t)V);
+	}
 	int q_out  = s->n_heads * s->head_dim;
 	int kv_out = s->n_kv_heads * s->head_dim;
 	for (int i = 0; i < s->n_layers; i++) {

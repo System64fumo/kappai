@@ -53,6 +53,7 @@ typedef enum {
 	OPFAM_FFN_ACTIVATE_EX,
 	OPFAM_ATTENTION,
 	OPFAM_ATTENTION_SWA,
+	OPFAM_ATTENTION_MLA,
 	OPFAM_KV_PUT,
 	OPFAM_ARGMAX,
 	OPFAM_ARCH_LAYER,
@@ -74,6 +75,7 @@ typedef enum {
 	OPFAM_HYBRID_STATE,
 	OPFAM_ORCHESTRATION,
 	OPFAM_MOE_STREAM,
+	OPFAM_TOOLCALL,
 	OPFAM_COUNT
 } op_family;
 
@@ -113,6 +115,7 @@ const char *op_family_name(op_family f);
 void		stats_reset(void);
 void		compute_debug(const float *y_ref, const float *y_got, int n);
 void		record_result(op_family fam, const char *label, verdict v, const char *detail);
+void		record_resultf(op_family fam, const char *label, int ok, const char *fmt, ...);
 void		flush_family(op_family fam);
 float		max_abs_diff_at(const float *a, const float *b, int n, int *at);
 float		max_abs_val(const float *a, int n);
@@ -124,8 +127,21 @@ uint32_t next_u32(void);
 void	 seed_test_rng(uint64_t s);
 void	 fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t type);
 void	 fill_random_f32(float *x, int n, float scale);
-int		 test_type_per_row(uint32_t type);
-void	*test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes);
+void	 fill_random_f16(uint16_t *x, int n);
+void	 fill_random_bf16(uint16_t *x, int n);
+typedef void (*test_repack_fn)(const void *src, void *dst, int n_rows, int k);
+void		   repack_q8_0_to_q8_0_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_q4_0_to_q4_0_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_iq3_s_to_iq3_s_re8(const void *src, void *dst, int n_rows, int k);
+void		   repack_iq4_nl_to_iq4_nl_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k);
+void		   repack_iq3_s(const void *src, void *dst, int n_rows, int k);
+void		   repack_iq4_nl_to_q8_0(const void *src, void *dst, int n_rows, int k);
+test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out);
+int			   test_type_per_row(uint32_t type);
+void		  *test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes);
 
 void print_summary_table(void);
 void print_final_results(void);
@@ -148,6 +164,7 @@ void		run_jinja_tests(void);
 void		run_hybrid_state_tests(backend *cpu);
 void		run_orchestration_tests(void);
 void		run_moe_stream_tests(void);
+void		run_toolcall_tests(void);
 void		test_quant_determinism(const qtype_info *qt);
 void		test_quant_finiteness(const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(void);

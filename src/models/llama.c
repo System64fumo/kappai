@@ -4,8 +4,6 @@
 #include "model.h"
 #include "recipe.h"
 
-#include <math.h>
-
 static model_recipe *build_standard_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));
 
@@ -19,8 +17,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 	const int	kv_out		 = n_kv_heads * head_dim;
 	const int	n_ctx		 = m->n_ctx;
 	const float eps			 = m->norm_eps;
-	const float attn_scale	 = 1.0f / sqrtf((float)head_dim);
 	const int	rope_neox	 = m->arch_info->uses_neox_rope;
+	int			act = m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
 
 	const int has_matmul_multi	  = backend_has_cap(a, BCAP_MULTI_MATMUL);
 	const int has_matmul_residual = backend_has_cap(a, BCAP_MATMUL_RESIDUAL);
@@ -29,212 +27,89 @@ static model_recipe *build_standard_recipe(const model *m) {
 	const int can_fuse_attn_residual = has_matmul_residual && !m->arch_info->has_attn_post_norm;
 	const int can_fuse_ffn_residual	 = has_matmul_residual && !m->arch_info->has_ffn_post_norm;
 
-	r->max_intermediate = intermediate;
-	r->max_head_dim		= head_dim;
-	r->max_kv_heads		= n_kv_heads;
-
 	recipe_build_pre_ops(r, m);
 
 	{
-		int		   cap = 24;
-		recipe_op *ops = xcalloc(cap, sizeof(recipe_op));
-		int		   i   = 0;
+		enum { LLAMA_MAX_OPS = 24 };
+		recipe_op *ops = xcalloc(LLAMA_MAX_OPS, sizeof(recipe_op));
+		op_emitter e   = op_emitter_make(ops, LLAMA_MAX_OPS, "llama");
 
-		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM);
+		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM));
 
 		if (has_matmul_multi) {
-			ops[i++] = (recipe_op){
-				.kind			= OP_MATMUL_MULTI,
-				.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out			= RECIPE_SLOT_Q,
-				.w_idx			= WIDX_WQ,
-				.stage			= STAGE_MATMUL,
-				.u.matmul_multi = {.n = 3, .k = dim, .n_out = {q_out, kv_out, kv_out}},
-			};
+			OP_EMIT(&e, mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, kv_out,
+										 kv_out, dim));
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_Q,
-				.w_idx	  = WIDX_WQ,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = q_out, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_K,
-				.w_idx	  = WIDX_WK,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = kv_out, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_V,
-				.w_idx	  = WIDX_WV,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = kv_out, .k = dim},
-			};
+			OP_EMIT(&e,
+					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
+			OP_EMIT(&e,
+					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
+			OP_EMIT(&e,
+					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
 		}
 
 		if (has_rope_qk) {
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE_QK_FUSED,
-				.in		= {RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads	   = n_heads,
-						   .n_kv_heads = n_kv_heads,
-						   .head_dim   = head_dim,
-						   .rope_neox  = rope_neox},
-			};
+			OP_EMIT(&e, mk_rope_qk_fused(n_heads, n_kv_heads, head_dim, rope_neox));
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE,
-				.in		= {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads = n_heads, .head_dim = head_dim, .rope_neox = rope_neox},
-			};
-			ops[i++] = (recipe_op){
-				.kind	= OP_ROPE,
-				.in		= {RECIPE_SLOT_K, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	= RECIPE_SLOT_NONE,
-				.w_idx	= RECIPE_NO_WEIGHT,
-				.stage	= STAGE_ROPE,
-				.u.rope = {.n_heads = n_kv_heads, .head_dim = head_dim, .rope_neox = rope_neox},
-			};
+			OP_EMIT(&e, mk_rope(RECIPE_SLOT_Q, n_heads, head_dim, rope_neox));
+			OP_EMIT(&e, mk_rope(RECIPE_SLOT_K, n_kv_heads, head_dim, rope_neox));
 		}
 
-		ops[i++] = (recipe_op){
-			.kind  = OP_KV_PUT,
-			.in	   = {RECIPE_SLOT_K, RECIPE_SLOT_V, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_NONE,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_KVPUT,
-		};
+		OP_EMIT(&e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
 
-		ops[i++] = (recipe_op){
-			.kind  = OP_ATTENTION,
-			.in	   = {RECIPE_SLOT_Q, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-			.out   = RECIPE_SLOT_XB2,
-			.w_idx = RECIPE_NO_WEIGHT,
-			.stage = STAGE_ATTN,
-			.u.attention =
-				{
-					.n_heads		   = n_heads,
-					.n_kv_heads		   = n_kv_heads,
-					.head_dim		   = head_dim,
-					.n_ctx			   = n_ctx,
-					.scale			   = attn_scale,
-					.sliding_window	   = m->sliding_window,
-					.n_kv_heads_active = n_kv_heads,
-				},
-		};
+		OP_EMIT(&e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, n_heads, n_kv_heads,
+											   head_dim, n_ctx, m->sliding_window));
 
 		if (can_fuse_attn_residual) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_RESIDUAL,
-				.in		  = {RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_X,
-				.w_idx	  = WIDX_WO,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = dim, .k = q_out},
-			};
+			OP_EMIT(&e, mk_matmul_residual(RECIPE_SLOT_XB2, RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_WO,
+										   dim, q_out));
 		} else {
-			ops[i++] =
-				mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL);
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out,
+								  STAGE_MATMUL));
 			if (m->arch_info->has_attn_post_norm) {
-				ops[i++] = mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_ATTN_OUT,
-									  WIDX_POST_ATTN_NORM, eps, STAGE_RMSNORM);
+				OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_ATTN_OUT,
+									   WIDX_POST_ATTN_NORM, eps, STAGE_RMSNORM));
 			}
-			ops[i++] = mk_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, STAGE_ADD);
-			ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
+			OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD));
 		}
 
-		ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM);
+		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 
 		if (m->layers[0].gate_up_fused) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_FUSED_GATEUP,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_GATE_UP,
-				.w_idx	  = WIDX_GATE_UP,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = 2 * intermediate, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	   = OP_FFN_ACTIVATE_FUSED,
-				.in		   = {RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	   = RECIPE_SLOT_FFN_ACT,
-				.w_idx	   = RECIPE_NO_WEIGHT,
-				.stage	   = STAGE_FFN_ACT,
-				.u.ffn_act = {.n = intermediate, .activation = 0},
-			};
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP,
+								  2 * intermediate, dim, STAGE_MATMUL));
+			OP_EMIT(&e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT,
+											  intermediate, act));
 		} else if (has_matmul_multi) {
-			ops[i++] = (recipe_op){
-				.kind			= OP_MATMUL_MULTI,
-				.in				= {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out			= RECIPE_SLOT_FFN_GATE,
-				.w_idx			= WIDX_GATE,
-				.stage			= STAGE_MATMUL,
-				.u.matmul_multi = {.n = 2, .k = dim, .n_out = {intermediate, intermediate}},
-			};
+			OP_EMIT(&e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE,
+										 intermediate, intermediate, dim));
 		} else {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_GATE,
-				.w_idx	  = WIDX_GATE,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = intermediate, .k = dim},
-			};
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL,
-				.in		  = {RECIPE_SLOT_XB, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_FFN_UP,
-				.w_idx	  = WIDX_UP,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = intermediate, .k = dim},
-			};
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, intermediate,
+								  dim, STAGE_MATMUL));
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, intermediate, dim,
+								  STAGE_MATMUL));
 		}
 
 		if (!m->layers[0].gate_up_fused) {
-			ops[i++] = (recipe_op){
-				.kind	   = OP_FFN_ACTIVATE,
-				.in		   = {RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_NONE},
-				.out	   = RECIPE_SLOT_FFN_ACT,
-				.w_idx	   = RECIPE_NO_WEIGHT,
-				.stage	   = STAGE_FFN_ACT,
-				.u.ffn_act = {.n = intermediate, .activation = 0},
-			};
+			OP_EMIT(&e, mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+										RECIPE_SLOT_FFN_ACT, intermediate, act));
 		}
 
 		if (can_fuse_ffn_residual) {
-			ops[i++] = (recipe_op){
-				.kind	  = OP_MATMUL_RESIDUAL,
-				.in		  = {RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_NONE},
-				.out	  = RECIPE_SLOT_X,
-				.w_idx	  = WIDX_DOWN,
-				.stage	  = STAGE_MATMUL,
-				.u.matmul = {.n = dim, .k = intermediate},
-			};
+			OP_EMIT(&e, mk_matmul_residual(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_X,
+										   WIDX_DOWN, dim, intermediate));
 		} else {
-			ops[i++] = mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, intermediate,
-								 STAGE_MATMUL);
+			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim,
+								  intermediate, STAGE_MATMUL));
 			if (m->arch_info->has_ffn_post_norm) {
-				ops[i++] = mk_rmsnorm(RECIPE_SLOT_XB2, RECIPE_SLOT_XB2, WIDX_POST_FFN_NORM, eps,
-									  STAGE_RMSNORM);
+				OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_XB2, RECIPE_SLOT_XB2, WIDX_POST_FFN_NORM, eps,
+									   STAGE_RMSNORM));
 			}
-			ops[i++] = mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_X, STAGE_ADD);
-			ops[i++] = mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
+			OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
 		}
 
 		r->layer.ops   = ops;
-		r->layer.n_ops = i;
+		r->layer.n_ops = e.count;
 	}
 
 	recipe_build_post_ops(r, m);

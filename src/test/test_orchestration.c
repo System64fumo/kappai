@@ -1,11 +1,9 @@
 #include "test_core.h"
 #include "test_synth_gguf.h"
 
-#define usage kappai_config_usage_shim
 #include "config.h"
 #include "context.h"
 #include "engine.h"
-#undef usage
 
 #include <math.h>
 #include <stdio.h>
@@ -17,6 +15,8 @@ char synth_fixture_dir[256];
 char synth_chat_model_path[512];
 char synth_lfm2_model_path[512];
 char synth_dsa_model_path[512];
+char synth_tied_model_path[512];
+char synth_tied_twin_path[512];
 
 void synth_suite_common_init(void) {
 	static int done = 0;
@@ -25,7 +25,7 @@ void synth_suite_common_init(void) {
 	done = 1;
 
 	config cfg				  = config_defaults();
-	cfg.backend				  = "cpu";
+	cfg.device				  = "cpu";
 	cfg.model				  = synth_chat_model_path;
 	cfg.use_mmap			  = false;
 	cfg.flash_attn			  = false;
@@ -87,6 +87,17 @@ void synth_suite_common_init(void) {
 	snprintf(synth_dsa_model_path, sizeof(synth_dsa_model_path), "%s/glm_dsa_moe.gguf",
 			 synth_fixture_dir);
 	tsg_build_glm_dsa(synth_dsa_model_path, &ds);
+
+	tsg_llama_spec ts = ls;
+	ts.tied			  = 1;
+	snprintf(synth_tied_model_path, sizeof(synth_tied_model_path), "%s/chat_llama_tied.gguf",
+			 synth_fixture_dir);
+	tsg_build_chat_llama(synth_tied_model_path, &ts);
+	tsg_llama_spec tw	  = ls;
+	tw.output_copies_embd = 1;
+	snprintf(synth_tied_twin_path, sizeof(synth_tied_twin_path), "%s/chat_llama_tied_twin.gguf",
+			 synth_fixture_dir);
+	tsg_build_chat_llama(synth_tied_twin_path, &tw);
 }
 
 static void make_prompt(char *buf, int n) {
@@ -140,7 +151,7 @@ static void restore_logging(void) {
 
 static int ctx_init_for(context *c, int ctx_size) {
 	config cfg	   = config_defaults();
-	cfg.backend	   = "cpu";
+	cfg.device	   = "cpu";
 	cfg.model	   = synth_chat_model_path;
 	cfg.use_mmap   = false;
 	cfg.flash_attn = false;
@@ -628,7 +639,7 @@ static void t_interrupt_prefill_poisons(void) {
 	int healthy	  = !c.session_poisoned && recovered == 4 && c.kv.n_pos > 0;
 	restore_logging();
 
-	int ok = (r1 == 0) && poisoned && (refused == -1) && (n_pos_kept == 0) && healthy;
+	int ok = (r1 == 0) && poisoned && (refused == ERR_INTERNAL) && (n_pos_kept == 0) && healthy;
 	snprintf(detail, sizeof(detail),
 			 "interrupted prefill: turn=%d poisoned=%d next-turn-rc=%d n_pos=%d; "
 			 "after reset turn=%d healthy=%d",
@@ -738,8 +749,8 @@ static void t_context_full_unit(void) {
 		int g3 = context_chat_turn(&c, "user", "hi", true, 2, &sp, gen_capture_cb, &cap3, "");
 		int recovered_ok = (g3 == 2 && !c.session_poisoned);
 
-		int ok = (g1 == 4) && (g2 == -1) && not_poisoned && render_restored && npos_unchanged &&
-				 recovered_ok;
+		int ok = (g1 == 4) && (g2 == ERR_INVALID_ARG) && not_poisoned && render_restored &&
+				 npos_unchanged && recovered_ok;
 		snprintf(detail, sizeof(detail),
 				 "overflow: turn1=%d n_pos=%d; oversized turn2=%d poisoned=%d "
 				 "render_restored=%d n_pos_unchanged=%d; after reset turn=%d",
@@ -796,7 +807,7 @@ static void t_engine_exit_code_context_full(void) {
 	ORCH_PUSH("kappai-test");
 	ORCH_PUSH("-m");
 	ORCH_PUSH(synth_chat_model_path);
-	ORCH_PUSH("--accel");
+	ORCH_PUSH("--device");
 	ORCH_PUSH("cpu");
 	ORCH_PUSH("-c");
 	ORCH_PUSH("40");
@@ -839,6 +850,49 @@ static void t_engine_exit_code_context_full(void) {
 	restore_logging();
 }
 
+static void t_tied_embedding_flow(void) {
+	char				 detail[512];
+	static const int32_t prompt_ids[8] = {11, 92, 43, 14, 205, 76, 137, 58};
+
+	ref_eng rt;
+	ref_load(&rt, synth_tied_model_path, 400);
+	ref_eng ru;
+	ref_load(&ru, synth_tied_twin_path, 400);
+	if (rt.m.vocab_size == 0 || ru.m.vocab_size == 0) {
+		record_result(OPFAM_ORCHESTRATION, "tied_embedding.setup", V_FAIL,
+					  "failed to load tied/twin synth models");
+		return;
+	}
+
+	int32_t		chain_tied[6]  = {0};
+	int32_t		chain_twin[6]  = {0};
+	int32_t		chain_again[6] = {0};
+	status_code st			   = ref_generate(&rt, prompt_ids, 8, 6, chain_tied);
+	status_code su			   = ref_generate(&ru, prompt_ids, 8, 6, chain_twin);
+	kvcache_reset(&rt.kv);
+	status_code sv = ref_generate(&rt, prompt_ids, 8, 6, chain_again);
+
+	int finite = 1;
+	for (int i = 0; i < 6; i++)
+		if (chain_tied[i] < 0 || chain_tied[i] >= rt.m.vocab_size)
+			finite = 0;
+	int ok = (st == OK && su == OK && sv == OK) && finite &&
+			 memcmp(chain_tied, chain_twin, sizeof(chain_tied)) == 0 &&
+			 memcmp(chain_tied, chain_again, sizeof(chain_again)) == 0;
+	snprintf(detail, sizeof(detail),
+			 "tied=[%d,%d,%d,%d,%d,%d] twin=[%d,%d,%d,%d,%d,%d] repeat0=%d st=%d/%d/%d "
+			 "finite=%d vocab=%d",
+			 chain_tied[0], chain_tied[1], chain_tied[2], chain_tied[3], chain_tied[4],
+			 chain_tied[5], chain_twin[0], chain_twin[1], chain_twin[2], chain_twin[3],
+			 chain_twin[4], chain_twin[5],
+			 memcmp(chain_tied, chain_again, sizeof(chain_again)) == 0, (int)st, (int)su, (int)sv,
+			 finite, rt.m.vocab_size);
+	record_result(OPFAM_ORCHESTRATION, "tied_embeddings_llama32_flow", ok ? V_PASS : V_FAIL,
+				  detail);
+	ref_free(&rt);
+	ref_free(&ru);
+}
+
 void run_orchestration_tests(void) {
 	synth_suite_common_init();
 	t_full_turn_greedy_matches_reference();
@@ -849,4 +903,5 @@ void run_orchestration_tests(void) {
 	t_interrupt_mid_decode_continues();
 	t_context_full_unit();
 	t_engine_exit_code_context_full();
+	t_tied_embedding_flow();
 }

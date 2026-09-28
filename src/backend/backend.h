@@ -26,8 +26,9 @@ typedef enum {
 	BCAP_MATMUL_QONLY		  = 1 << 6,
 	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
-	BCAP_RMSNORM_MATMUL_MULTI = 1 << 9,
-	BCAP_QKV_NORM_ROPE		  = 1 << 10,
+	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
+	BCAP_RMSNORM_MATMUL_MULTI = 1 << 10,
+	BCAP_QKV_NORM_ROPE		  = 1 << 11,
 } backend_cap;
 
 typedef struct {
@@ -44,6 +45,20 @@ typedef struct {
 	void	   *fp16_shadow;
 } buffer;
 
+typedef struct {
+	const buffer *gate_w;
+	const buffer *up_w;
+	const buffer *down_w;
+	uint32_t	  gate_type;
+	uint32_t	  up_type;
+	uint32_t	  down_type;
+	int			  gate_up_fused;
+	int			  use_gelu;
+	float		  gate_scale;
+	float		  up_scale;
+	float		  down_scale;
+	float		  weight;
+} moe_resident_expert;
 static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t byte_len) {
 	buffer s   = *parent;
 	s.host_ptr = parent->host_ptr ? (const char *)parent->host_ptr + byte_off : NULL;
@@ -51,6 +66,15 @@ static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t 
 	s.size	   = byte_len;
 	s.is_slice = true;
 	return s;
+}
+
+static inline buffer buffer_host_view(backend *owner, void *ptr, size_t bytes) {
+	buffer b   = {0};
+	b.handle   = ptr;
+	b.host_ptr = ptr;
+	b.size	   = bytes;
+	b.owner	   = owner;
+	return b;
 }
 
 typedef enum {
@@ -88,14 +112,27 @@ typedef struct {
 	char	 name[32];
 	int		 priority;
 	int		 available;
+	int		 n_devices;
 	uint64_t caps;
 } backend_info;
+
+typedef struct {
+	int			 n_tokens, n_value_heads, n_key_heads;
+	int			 conv_dim, conv_kernel, key_dim, state_size, value_head_dim, value_dim;
+	float		 eps;
+	const float *mixed, *z, *alpha, *beta;
+	const float *conv_w, *dt, *a_vec, *norm_w;
+	float		*conv_state, *state;
+	float		*out;
+	float		*ws;
+} gdn_desc;
 
 struct backend {
 	const char *name;
 	int			priority;
 	uint64_t	caps;
 	status_code (*probe)(void);
+	int (*device_count)(void);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -160,6 +197,15 @@ struct backend {
 								 int n_kv_heads_active);
 	status_code (*add_inplace)(backend *self, buffer *x, const buffer *y, int n);
 	status_code (*scale_inplace)(backend *self, buffer *x, float scale, int n);
+	status_code (*softcap)(backend *self, buffer *x, float cap, int n);
+	status_code (*split_qgate)(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+							   int n_heads, int head_dim, int n_rows);
+	status_code (*attn_output_gate)(backend *self, buffer *out, const buffer *gate, int n,
+									int n_rows);
+	status_code (*partial_rope_qk)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+								   int head_dim, int rope_dim, int pos_start,
+								   const float *rope_cos_base, const float *rope_sin_base,
+								   int n_rows);
 	status_code (*copy_buffer)(backend *self, const buffer *src, buffer *dst, int n);
 	/* Async copies: enqueue without host blocking. Safe wherever consumers
 	 * are same-stream device kernels or on-demand host reads. NULL = use sync. */
@@ -218,7 +264,14 @@ struct backend {
 	status_code (*persistent_decode)(backend *self, const model *m, struct kvcache *cache,
 									 struct compute_scratch *s, int token, int pos,
 									 int flash_attn, float *logits_out);
+	status_code (*repack_plan)(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
+							   uint32_t *re_type_out);
+	status_code (*repack_weight)(backend *self, uint32_t type, const void *src, void *dst,
+								 int n_rows, int k);
+	status_code (*dequant_row)(backend *self, uint32_t type, const void *src, int n_elems,
+							   float *dst);
 	void (*synchronize)(backend *self);
+	void (*submit)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
 	status_code (*rmsnorm_batch)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -228,6 +281,8 @@ struct backend {
 	status_code (*add_batch)(backend *self, buffer *x, const buffer *y, int n, int m);
 	status_code (*ffn_activate_batch)(backend *self, const buffer *gate, const buffer *up,
 									  buffer *out, int n, int activation, int m);
+	status_code (*ffn_activate_fused_batch)(backend *self, const buffer *fused, buffer *out, int n,
+											int activation, int m);
 	status_code (*rope_batch)(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
 							  const float *rope_cos_base, const float *rope_sin_base, int m);
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
@@ -264,30 +319,83 @@ struct backend {
 	status_code (*kv_put_mla)(backend *self, buffer *kv_cache, int layer, int pos,
 							  const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
 							  int qk_rope, int n_ctx, float eps);
+	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
 	tpool *(*get_pool)(backend *self);
 	status_code (*matmul_thread_local)(backend *self, const void *w, uint32_t w_type,
 									   const float *x, float *y, int n, int k, int tid);
+	status_code (*buffer_alloc_from_host)(backend *self, const void *host_data, size_t size,
+										  buffer *out);
+	status_code (*moe_expert_ffn)(backend *self, const buffer *x, buffer *out,
+								  const moe_resident_expert *e, int dim, int inter);
+	status_code (*moe_experts_batch)(backend *self, const buffer *xb, buffer *out, int n_rows,
+									 int dim, int inter, int use_gelu, int n_experts,
+									 const moe_resident_expert *experts, const int *counts,
+									 const int *rows_packed, const float *weights_packed);
+	status_code (*moe_activate)(backend *self, const buffer *gate, const buffer *up, buffer *out,
+								int n, float gate_scale, float up_scale, int use_gelu);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
+	const char *desc;
 };
 
 static inline int backend_has_cap(const backend *b, uint64_t cap) {
 	return b && (b->caps & cap) != 0;
 }
 
+static inline tpool *backend_get_pool(backend *b) {
+	if (b && b->get_pool)
+		return b->get_pool(b);
+	return NULL;
+}
+
+static inline void ensure_sync(backend *a) {
+	if (a && a->synchronize)
+		a->synchronize(a);
+}
+
 void backend_register(const char *name, backend_ctor_fn ctor);
+
+void backend_load(void);
 
 int			backend_list(backend_info *out, int max);
 status_code backend_create(const char *name, int device_index, backend **out);
-status_code backend_create_best(int device_index, backend **out);
+status_code backend_create_best(backend **out);
+status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
 
+int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
+
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
+
+typedef void (*host_matmul_generic_fn)(const void *w, uint32_t w_type, const float *x, float *y,
+									   int n, int k);
+
+void host_kernels_register(int priority, host_matmul_generic_fn mm);
+
+void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);
 
 backend *backend_host(void);
 
 void backend_host_use(backend *b);
+
+typedef enum {
+	HFB_OP_NOT_NATIVE		= 0,
+	HFB_BATCH_DESIGN		= 1,
+	HFB_WEIGHT_TYPE			= 2,
+	HFB_BUF_HOST_RESIDENT	= 3,
+	HFB_CAPABILITY			= 4,
+	HFB_ERROR				= 5,
+	HFB_LAYER_NOT_OFFLOADED = 6,
+} host_fallback_reason;
+
+void backend_report_host_fallback(const backend *device, const char *op,
+								  host_fallback_reason reason, const char *detail_fmt, ...)
+	__attribute__((format(printf, 4, 5)));
+
+void backend_fallback_report(void);
+
+void backend_set_fallback_warn(int enable);
 
 backend *backend_weight_home(backend *b, weight_class wc);
 
@@ -298,7 +406,5 @@ size_t backend_mem_total(const backend *b);
 	static void __attribute__((constructor)) backend_autoreg_##ctor_fn(void) {                     \
 		backend_register(name_str, ctor_fn);                                                       \
 	}
-
-int32_t cpu_argmax_f32(const float *logits, int vocab);
 
 #endif

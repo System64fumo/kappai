@@ -70,7 +70,46 @@ static inline float32x4_t vtanhq_f32(float32x4_t x) {
 }
 
 static inline float fast_expf(float x) {
-	return vgetq_lane_f32(vexpq_f32(vdupq_n_f32(x)), 0);
+	if (x < -88.0f)
+		x = -88.0f;
+	if (x > 88.0f)
+		x = 88.0f;
+	const float inv_ln2 = 1.4426950408889634f;
+	const float ln2_hi	= 6.9314718055994529e-01f;
+	const float ln2_lo	= 1.9082149292705877e-10f;
+	float		n		= __builtin_rintf(x * inv_ln2);
+	float		r		= __builtin_fmaf(-n, ln2_hi, x);
+	r					= __builtin_fmaf(-n, ln2_lo, r);
+	float p				= 1.0f / 120.0f;
+	p					= __builtin_fmaf(r, p, 1.0f / 24.0f);
+	p					= __builtin_fmaf(r, p, 1.0f / 6.0f);
+	p					= __builtin_fmaf(r, p, 0.5f);
+	p					= __builtin_fmaf(r, p, 1.0f);
+	p					= __builtin_fmaf(r, p, 1.0f);
+	int32_t e			= (int32_t)n + 127;
+	e <<= 23;
+	float pow2n;
+	memcpy(&pow2n, &e, sizeof(pow2n));
+	return p * pow2n;
+}
+
+static inline float32x4_t silu_mul_vec4(float32x4_t g, float32x4_t u) {
+	float32x4_t e = vexpq_f32(vnegq_f32(g));
+	float32x4_t d = vaddq_f32(vdupq_n_f32(1.0f), e);
+	float32x4_t r = vrecpeq_f32(d);
+	r			  = vmulq_f32(vrecpsq_f32(d, r), r);
+	r			  = vmulq_f32(vrecpsq_f32(d, r), r);
+	return vmulq_f32(vmulq_f32(g, r), u);
+}
+
+static inline float32x4_t gelu_mul_vec4(float32x4_t g, float32x4_t u) {
+	const float c_fit = 0.7978845608028654f;
+	const float c_x3  = 0.044715f;
+	float32x4_t gsq	  = vmulq_f32(g, g);
+	float32x4_t gc	  = vmulq_f32(g, vfmaq_n_f32(vdupq_n_f32(1.0f), gsq, c_x3));
+	float32x4_t in	  = vmulq_n_f32(gc, c_fit);
+	float32x4_t t	  = vtanhq_f32(in);
+	return vmulq_f32(vmulq_f32(vmulq_n_f32(g, 0.5f), vaddq_f32(vdupq_n_f32(1.0f), t)), u);
 }
 
 #endif

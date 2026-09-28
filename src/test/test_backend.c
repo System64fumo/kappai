@@ -1119,6 +1119,121 @@ static void test_op_attention_swa(backend *cpu, backend *tgt, int n_heads, int n
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static void test_op_attention_mla(backend *cpu, backend *tgt, int n_heads, int qk_head, int qk_rope,
+								  int qk_nope, int v_head, int kv_lora, int n_ctx, int pos) {
+	if (!tgt->attention_mla || !tgt->kv_alloc_mla || !tgt->kv_put_mla) {
+		char label[128];
+		snprintf(label, sizeof(label), "attention_mla h=%d qk=%d/%d/%d v=%d lora=%d pos=%d (%s)",
+				 n_heads, qk_head, qk_nope, qk_rope, v_head, kv_lora, pos, tgt->name);
+		record_result(OPFAM_ATTENTION_MLA, label, V_SKIP, "backend has no native MLA ops");
+		return;
+	}
+
+	const int	total_dim = kv_lora + qk_rope;
+	const int	half_rope = qk_rope / 2;
+	const int	n_t		  = pos + 1;
+	const int	n_out	  = n_heads * v_head;
+	const float scale	  = 1.0f / sqrtf((float)qk_head);
+
+	seed_test_rng(0x5EED0000ULL + ((uint64_t)n_heads * 131) + ((uint64_t)qk_head * 17) +
+				  ((uint64_t)kv_lora * 7) + (uint64_t)pos);
+
+	float *q = xmalloc((size_t)n_heads * (size_t)qk_head * sizeof(float));
+	fill_random_f32(q, n_heads * qk_head, 1.0f);
+	float **kv_a_all = xmalloc((size_t)n_t * sizeof(float *));
+	for (int t = 0; t < n_t; t++) {
+		kv_a_all[t] = xmalloc((size_t)total_dim * sizeof(float));
+		fill_random_f32(kv_a_all[t], total_dim, 1.0f);
+	}
+	float *norm_w	= xmalloc((size_t)kv_lora * sizeof(float));
+	float *k_b		= xmalloc((size_t)n_heads * (size_t)qk_nope * (size_t)kv_lora * sizeof(float));
+	float *v_b		= xmalloc((size_t)n_heads * (size_t)kv_lora * (size_t)v_head * sizeof(float));
+	float *rope_cos = xmalloc((size_t)n_t * (size_t)half_rope * sizeof(float));
+	float *rope_sin = xmalloc((size_t)n_t * (size_t)half_rope * sizeof(float));
+	fill_random_f32(norm_w, kv_lora, 1.0f);
+	fill_random_f32(k_b, n_heads * qk_nope * kv_lora, 0.5f);
+	fill_random_f32(v_b, n_heads * kv_lora * v_head, 0.5f);
+	fill_random_f32(rope_cos, n_t * half_rope, 1.0f);
+	fill_random_f32(rope_sin, n_t * half_rope, 1.0f);
+
+	float *y_ref = xmalloc((size_t)n_out * sizeof(float));
+	float *y_got = xmalloc((size_t)n_out * sizeof(float));
+
+	typedef struct {
+		backend *b;
+		buffer	 kc, q_b, kb_b, vb_b, kva_b, nw_b, out_b;
+	} side;
+	side cpu_s = {.b = cpu};
+	side tgt_s = {.b = tgt};
+
+	for (int which = 0; which < 2; which++) {
+		side	*s = which ? &tgt_s : &cpu_s;
+		backend *b = s->b;
+		b->kv_alloc_mla(b, 1, n_ctx, kv_lora, qk_rope, &s->kc);
+		b->buffer_alloc_scratch(b, (size_t)total_dim * sizeof(float), &s->kva_b);
+		b->buffer_alloc_scratch(b, (size_t)kv_lora * sizeof(float), &s->nw_b);
+		b->buffer_alloc_scratch(
+			b, (size_t)n_heads * (size_t)qk_nope * (size_t)kv_lora * sizeof(float), &s->kb_b);
+		b->buffer_alloc_scratch(
+			b, (size_t)n_heads * (size_t)kv_lora * (size_t)v_head * sizeof(float), &s->vb_b);
+		b->buffer_alloc_scratch(b, (size_t)n_heads * (size_t)qk_head * sizeof(float), &s->q_b);
+		b->buffer_alloc_scratch(b, (size_t)n_out * sizeof(float), &s->out_b);
+		b->buffer_write_f32(b, &s->nw_b, norm_w, kv_lora);
+		b->buffer_write_f32(b, &s->kb_b, k_b, n_heads * qk_nope * kv_lora);
+		b->buffer_write_f32(b, &s->vb_b, v_b, n_heads * kv_lora * v_head);
+		b->buffer_write_f32(b, &s->q_b, q, n_heads * qk_head);
+		for (int t = 0; t < n_t; t++) {
+			b->buffer_write_f32(b, &s->kva_b, kv_a_all[t], total_dim);
+			b->kv_put_mla(b, &s->kc, 0, t, &s->kva_b, &s->nw_b, kv_lora, qk_rope, n_ctx, 1e-5f);
+		}
+		b->attention_mla(b, &s->q_b, &s->kc, &s->kb_b, &s->vb_b, &s->out_b, 0, pos, n_heads,
+						 qk_head, qk_rope, qk_nope, v_head, kv_lora, n_ctx, rope_cos, rope_sin,
+						 scale);
+		if (b->synchronize)
+			b->synchronize(b);
+		b->buffer_read_f32(b, &s->out_b, which ? y_got : y_ref, n_out);
+	}
+
+	char label[128];
+	char detail[256];
+	snprintf(label, sizeof(label), "attention_mla h=%d qk=%d/%d/%d v=%d lora=%d pos=%d", n_heads,
+			 qk_head, qk_nope, qk_rope, v_head, kv_lora, pos);
+	verdict v = classify_output("loose", y_ref, y_got, n_out, OK, detail, sizeof(detail));
+	record_result(OPFAM_ATTENTION_MLA, label, v, detail);
+
+	for (int t = 0; t < n_t; t++)
+		free(kv_a_all[t]);
+	free(kv_a_all);
+	free(q);
+	free(norm_w);
+	free(k_b);
+	free(v_b);
+	free(rope_cos);
+	free(rope_sin);
+	free(y_ref);
+	free(y_got);
+	{
+		backend *b = cpu;
+		b->buffer_free(b, &cpu_s.kc);
+		b->buffer_free(b, &cpu_s.q_b);
+		b->buffer_free(b, &cpu_s.kb_b);
+		b->buffer_free(b, &cpu_s.vb_b);
+		b->buffer_free(b, &cpu_s.kva_b);
+		b->buffer_free(b, &cpu_s.nw_b);
+		b->buffer_free(b, &cpu_s.out_b);
+	}
+	{
+		backend *b = tgt;
+		b->buffer_free(b, &tgt_s.kc);
+		b->buffer_free(b, &tgt_s.q_b);
+		b->buffer_free(b, &tgt_s.kb_b);
+		b->buffer_free(b, &tgt_s.vb_b);
+		b->buffer_free(b, &tgt_s.kva_b);
+		b->buffer_free(b, &tgt_s.nw_b);
+		b->buffer_free(b, &tgt_s.out_b);
+	}
+}
+
 static void test_op_kv_put(backend *cpu, backend *tgt, int n_kv_heads, int head_dim, int n_ctx,
 						   int pos) {
 	if (!tgt->kv_put) {
@@ -2487,7 +2602,7 @@ static void print_op_coverage(backend *cpu, backend *tgt) {
 }
 void run_per_op_tests(backend *cpu, backend *tgt) {
 	printf("\n========================================\n");
-	printf("Per-op validation: %s  vs  cpu (reference)\n", tgt->name);
+	printf("Per-op validation: %s  vs  %s (reference)\n", tgt->name, cpu->name);
 	printf("========================================\n");
 	print_op_coverage(cpu, tgt);
 
@@ -2594,6 +2709,11 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	test_op_attention_swa(cpu, tgt, 8, 8, 64, 1024, 20, 32, 0);
 	test_op_attention_swa(cpu, tgt, 32, 8, 128, 2048, 1000, 512, 1);
 	flush_family(OPFAM_ATTENTION_SWA);
+
+	test_op_attention_mla(cpu, tgt, 2, 16, 8, 8, 16, 16, 64, 31);
+	test_op_attention_mla(cpu, tgt, 4, 40, 16, 24, 16, 32, 128, 47);
+	test_op_attention_mla(cpu, tgt, 8, 192, 64, 128, 64, 512, 256, 63);
+	flush_family(OPFAM_ATTENTION_MLA);
 
 	test_op_kv_put(cpu, tgt, 4, 64, 1024, 0);
 	test_op_kv_put(cpu, tgt, 4, 64, 1024, 127);

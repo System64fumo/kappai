@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include "backend/backend.h"
+#include "compute.h"
 #include "recipe.h" /* ACTIVATION_GELU */
 #include "log.h"
 #include "gguf.h"
@@ -318,8 +319,10 @@ static status_code cuda_graph_set_kernels(backend *self, int on) {
     return OK;
 }
 
+static void cuda_graph_dbg_install(void);
+
 /* TEMP-DEBUG: read back decode params (caller must have drained). */
-int cuda_graph_dbg_peek(backend *self, int *p0, int *p1, int *p2) {
+static int cuda_graph_dbg_peek_impl(backend *self, int *p0, int *p1, int *p2) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv || !priv->decode_params_dev) return -1;
     int v[3] = {-9, -9, -9};
@@ -333,7 +336,7 @@ int cuda_graph_dbg_peek(backend *self, int *p0, int *p1, int *p2) {
 }
 
 /* TEMP-DEBUG: stream capture state (0=not capturing). */
-int cuda_graph_dbg_capquery(backend *self) {
+static int cuda_graph_dbg_capquery_impl(backend *self) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return -1;
     enum cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
@@ -350,7 +353,7 @@ void *cuda_graph_dbg_paramsaddr(backend *self) {
 
 /* TEMP-DEBUG: set/clear X[0] sentinel (async). Repurposed: clobber one
  * float of the current rope-cos row (read-only graph input). */
-int cuda_graph_dbg_togglex(backend *self, void *slotbuf, int on) {
+static int cuda_graph_dbg_togglex_impl(backend *self, void *slotbuf, int on) {
     struct cuda_priv *priv = cuda_priv(self);
     (void)slotbuf;
     if (!priv) return -1;
@@ -366,7 +369,7 @@ int cuda_graph_dbg_togglex(backend *self, void *slotbuf, int on) {
 /* TEMP-DEBUG: snapshot device state to a text file (caller drains first).
  * Dumps slot sums, first-4 logits, params, rope rows. Compare replay vs
  * normal runs position by position. */
-int cuda_graph_dbg_snap(backend *self, void *slots_ptr, const char *path, int pos) {
+static int cuda_graph_dbg_snap_impl(backend *self, void *slots_ptr, const char *path, int pos) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return -1;
     FILE *f = fopen(path, "a");
@@ -413,13 +416,13 @@ int cuda_graph_dbg_snap(backend *self, void *slots_ptr, const char *path, int po
 }
 
 /* TEMP-DEBUG: fetch+clear last CUDA error. */
-int cuda_graph_dbg_lasterr(void) {
+static int cuda_graph_dbg_lasterr_impl(void) {
     cudaError_t e = cudaGetLastError();
     return (int)e;
 }
 
 /* TEMP-DEBUG: sync-read first 4 floats of a device buffer. */
-int cuda_graph_dbg_logits(backend *self, void *slotbuf, float *out4) {
+static int cuda_graph_dbg_logits_impl(backend *self, void *slotbuf, float *out4) {
     struct cuda_priv *priv = cuda_priv(self);
     (void)self;
     if (!priv || !slotbuf || !out4) return -1;
@@ -3060,6 +3063,8 @@ static status_code cuda_attention_swa_batch(backend *self, const buffer *q, cons
 /* ------------------------------------------------------------------ */
 
 static status_code cuda_ctor(backend *out) {
+	cuda_graph_dbg_install();
+
     memset(out, 0, sizeof(*out));
     out->name     = "cuda";
     out->priority = 100;
@@ -3131,6 +3136,18 @@ static status_code cuda_ctor(backend *out) {
     out->persistent_decode   = cuda_persistent_decode;
 
     return OK;
+}
+
+
+/* Install the real decode-graph debug hooks into the engine-owned pointers.
+ * Called from the ctor, i.e. when the backend library is dlopen'd. */
+static void cuda_graph_dbg_install(void) {
+	cuda_graph_dbg_peek		= cuda_graph_dbg_peek_impl;
+	cuda_graph_dbg_capquery	= cuda_graph_dbg_capquery_impl;
+	cuda_graph_dbg_togglex	= cuda_graph_dbg_togglex_impl;
+	cuda_graph_dbg_snap		= cuda_graph_dbg_snap_impl;
+	cuda_graph_dbg_logits	= cuda_graph_dbg_logits_impl;
+	cuda_graph_dbg_lasterr	= cuda_graph_dbg_lasterr_impl;
 }
 
 BACKEND_REGISTER("cuda", cuda_ctor);

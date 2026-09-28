@@ -80,46 +80,70 @@ typedef struct {
 } gguf_tensor;
 
 typedef struct {
-	int			 fd;
-	void		*map;
-	size_t		 map_size;
-	int			 map_is_heap;
-	int			 owns_tensor_data;
-	int			 valid;
-	char	   **kv_keys;
-	uint32_t	*kv_types;
-	uint64_t	*kv_vals;
-	gguf_str	*kv_strs;
-	uint32_t	*kv_arr_type;
-	uint64_t	*kv_arr_len;
-	void	   **kv_arr_data;
-	size_t		 n_kv;
-	gguf_tensor *tensors;
-	size_t		 n_tensors;
-	const void	*data_start;
-	size_t		 data_size;
-	uint64_t	 data_file_offset;
-	struct {
-		const char *name;
-		size_t		idx;
-		int			used;
-	}	  *tensor_hash;
-	size_t tensor_hash_cap;
-	struct {
-		const char *key;
-		size_t		idx;
-		int			used;
-	}	  *kv_hash;
-	size_t kv_hash_cap;
+	const char *key;
+	size_t		idx;
+	int			used;
+} gguf_strtab_entry;
+
+typedef struct {
+	int				   fd;
+	void			  *map;
+	size_t			   map_size;
+	int				   map_is_heap;
+	int				   owns_tensor_data;
+	int				   valid;
+	char			 **kv_keys;
+	uint32_t		  *kv_types;
+	uint64_t		  *kv_vals;
+	gguf_str		  *kv_strs;
+	uint32_t		  *kv_arr_type;
+	uint64_t		  *kv_arr_len;
+	void			 **kv_arr_data;
+	size_t			   n_kv;
+	gguf_tensor		  *tensors;
+	size_t			   n_tensors;
+	const void		  *data_start;
+	size_t			   data_size;
+	uint64_t		   data_file_offset;
+	gguf_strtab_entry *tensor_hash;
+	size_t			   tensor_hash_cap;
+	gguf_strtab_entry *kv_hash;
+	size_t			   kv_hash_cap;
+	str_arena		   strs;
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
+size_t		ggml_row_size(uint32_t type, size_t n);
+
+extern const uint32_t ggml_iq3s_grid[512];
+
+static inline uint32_t wtype_to_q8type(uint32_t w_type) {
+	switch (w_type) {
+	case GGML_TYPE_Q4_0:
+	case GGML_TYPE_IQ4_NL:
+	case GGML_TYPE_Q8_0:
+		return GGML_TYPE_Q8_0;
+	case GGML_TYPE_Q4_1:
+		return GGML_TYPE_Q8_1;
+	case GGML_TYPE_Q4_K:
+	case GGML_TYPE_Q5_K:
+	case GGML_TYPE_Q6_K:
+	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ3_S_RE:
+		return GGML_TYPE_Q8_K;
+	default:
+		return 0;
+	}
+}
 
 status_code gguf_load(gguf_ctx *ctx, const char *path);
 
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
 
 status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path);
+
+status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
+							   size_t *out_align);
 
 void gguf_free(gguf_ctx *ctx);
 
@@ -136,9 +160,10 @@ status_code gguf_get_arr_f32(const gguf_ctx *c, const char *key, const float **o
 							 size_t *out_count);
 status_code gguf_get_arr_str(const gguf_ctx *c, const char *key, const char *const **out,
 							 size_t *out_count);
+status_code gguf_get_arr_bool(const gguf_ctx *c, const char *key, const uint8_t **out,
+							  size_t *out_count);
 
 const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name);
-size_t			   ggml_row_size(uint32_t type, size_t n);
 
 int gguf_tensor_name_is_expert(const char *name);
 
