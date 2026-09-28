@@ -6,6 +6,17 @@
 #include <stdint.h>
 #include <string.h>
 
+/* AVX scratch caches are written with 32-byte aligned stores (vmovdqa), but
+ * realloc/malloc only guarantee 16-byte alignment -> misaligned-access fault
+ * under a plain allocator (ASan's allocator happened to align, masking it).
+ * Allocate 64-byte aligned; the caches are fully rewritten before use, so
+ * drop-and-alloc is safe. */
+static void *cache_alloc(void *old, size_t size) {
+	free(old);
+	return xmalloc_aligned(size, 64);
+}
+
+
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
@@ -3065,9 +3076,9 @@ void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				q_ymm_cache = realloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
-				sc_cache	= realloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
-				d_w_cache	= realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				q_ymm_cache = cache_alloc(q_ymm_cache, sizeof(*q_ymm_cache) * n_bi_tiles);
+				sc_cache	= cache_alloc(sc_cache, sizeof(*sc_cache) * n_bi_tiles);
+				d_w_cache	= cache_alloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
 				cache_cap	= n_bi_tiles;
 				tlocal_register((void **)&q_ymm_cache);
 				tlocal_register((void **)&sc_cache);
@@ -3254,14 +3265,14 @@ void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				wlo_cache	 = realloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
-				whi_cache	 = realloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
-				s_lo_cache	 = realloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
-				s_hi_cache	 = realloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
-				m_lo_cache	 = realloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
-				m_hi_cache	 = realloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
-				d_w_cache	 = realloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
-				dmin_w_cache = realloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
+				wlo_cache	 = cache_alloc(wlo_cache, sizeof(*wlo_cache) * n_bi_tiles);
+				whi_cache	 = cache_alloc(whi_cache, sizeof(*whi_cache) * n_bi_tiles);
+				s_lo_cache	 = cache_alloc(s_lo_cache, sizeof(*s_lo_cache) * n_bi_tiles);
+				s_hi_cache	 = cache_alloc(s_hi_cache, sizeof(*s_hi_cache) * n_bi_tiles);
+				m_lo_cache	 = cache_alloc(m_lo_cache, sizeof(*m_lo_cache) * n_bi_tiles);
+				m_hi_cache	 = cache_alloc(m_hi_cache, sizeof(*m_hi_cache) * n_bi_tiles);
+				d_w_cache	 = cache_alloc(d_w_cache, sizeof(*d_w_cache) * n_bi_tiles);
+				dmin_w_cache = cache_alloc(dmin_w_cache, sizeof(*dmin_w_cache) * n_bi_tiles);
 				cache_cap	 = n_bi_tiles;
 				tlocal_register((void **)&wlo_cache);
 				tlocal_register((void **)&whi_cache);
@@ -3597,14 +3608,14 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 		if (n_bi_tiles > 0) {
 			if (cache_cap < n_bi_tiles) {
-				lo_cache   = realloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
-				hi_cache   = realloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
-				s0_cache   = realloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
-				s1_cache   = realloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
-				m0_cache   = realloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
-				m1_cache   = realloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
-				d_cache	   = realloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
-				dmin_cache = realloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
+				lo_cache   = cache_alloc(lo_cache, sizeof(*lo_cache) * n_bi_tiles);
+				hi_cache   = cache_alloc(hi_cache, sizeof(*hi_cache) * n_bi_tiles);
+				s0_cache   = cache_alloc(s0_cache, sizeof(*s0_cache) * n_bi_tiles);
+				s1_cache   = cache_alloc(s1_cache, sizeof(*s1_cache) * n_bi_tiles);
+				m0_cache   = cache_alloc(m0_cache, sizeof(*m0_cache) * n_bi_tiles);
+				m1_cache   = cache_alloc(m1_cache, sizeof(*m1_cache) * n_bi_tiles);
+				d_cache	   = cache_alloc(d_cache, sizeof(*d_cache) * n_bi_tiles);
+				dmin_cache = cache_alloc(dmin_cache, sizeof(*dmin_cache) * n_bi_tiles);
 				cache_cap  = n_bi_tiles;
 				tlocal_register((void **)&lo_cache);
 				tlocal_register((void **)&hi_cache);
