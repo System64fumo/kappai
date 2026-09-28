@@ -72,13 +72,31 @@ Remaining planned commits:
 
 ## Pre-existing bugs found (NOT introduced by this port)
 
-1. **`BUILD=release` segfaults in the arch self-test** (`run_arch_tests(cpu,
-   NULL)`, `test_arch.c`) on pristine `cuda-wip` — reproducible in a clean
-   worktree at `45f5d98` with no CUDA code present. The default `release-rdbg`
-   (ASan) build passes 464/0/9, so this looks like uninitialised-memory / UB
-   that ASan masks. Worth a dedicated hunt (MSan or code review).
+1. **`BUILD=release` `./build/test cpu` segfaults** — reproduced on pristine
+   `cuda-wip` (`45f5d98`) with zero CUDA code. Backtrace (LD_PRELOAD SIGSEGV
+   handler; no gdb on this box):
+
+   ```
+   libc(+0x45cb0)
+   libkappai.so(matmul_q4_k_q8_k_qonly_f32+0x1f6e)
+   libkappai.so(+0xa0d8c)   -> cpu matmul batch
+   libkappai.so(tpool_parallel_for+0x156)
+   ```
+
+   So the fault is in the x86_64 CPU Q4_K batch matmul kernel
+   (`src/backend/cpu/x86_64/quants.c`, MR/NR tiled `_qonly` variant), hit by
+   the arch self-test's generated Q4_K models. It is **release-only**: ASan
+   (`release-rdbg`, the default build) passes 464/0/9, and
+   `-ftrivial-auto-var-init=zero` still crashes, so it is not simple
+   uninitialised stack. Likely an out-of-bounds access inside a large arena
+   allocation (which ASan does not redzone) or an alignment assumption that
+   ASan's heap layout happens to satisfy. **Same code lineage exists in the
+   development tree**, so this is not fork-specific. Needs a debugger (gdb
+   unavailable here) or an instrumented rebuild to close.
+
 2. **Flaky test**: `arch.generate[glm-dsa] decode step 2` alternates pass/fail
    between identical runs of the same binary.
+
 3. `make` (default target) fails on the `server` target when `microhttpd` is
    absent; `make cli test` is the working subset here.
 
