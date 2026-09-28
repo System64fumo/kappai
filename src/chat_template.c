@@ -278,8 +278,6 @@ void chat_template_add_message(chat_template_state *cts, const char *role, const
 
 void chat_template_add_message_ex(chat_template_state *cts, const chat_message *msg) {
 	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
-	/* Only assistant history may contain generated reasoning to remove. User,
-	 * system and tool text can legitimately quote the same marker bytes. */
 	char *clean = msg->role && strcmp(msg->role, "assistant") == 0
 					  ? strip_thinking_spans(cts, msg->content)
 					  : xstrdup(msg->content ? msg->content : "");

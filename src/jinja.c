@@ -124,13 +124,11 @@ jinja_value *jinja_float(double n) {
 	jinja_value *v = xmalloc(sizeof(*v));
 	v->type = JV_FLOAT;
 	v->as.floating.value = n;
-	/* Shortest decimal that round-trips to this double (up to 17 digits). */
 	for (int precision = 1; precision <= 17; precision++) {
 		snprintf(v->as.floating.text, sizeof(v->as.floating.text), "%.*g", precision, n);
 		if (!isfinite(n) || strtod(v->as.floating.text, NULL) == n)
 			break;
 	}
-	/* Keep integral floating-point values floating in JSON output. */
 	if (isfinite(n) && !strchr(v->as.floating.text, '.') &&
 		!strchr(v->as.floating.text, 'e'))
 		strcat(v->as.floating.text, ".0");
