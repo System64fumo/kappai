@@ -30,7 +30,6 @@ endif
 HAS_VULKAN := $(filter vulkan,$(REQUESTED_BACKENDS))
 
 CONFIG_FILE := $(OUT_DIR)/config.mk
-FLAGS_FILE := $(OUT_DIR)/build-flags.txt
 CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help config
 BUILD_GOALS := $(filter-out $(CONFIG_AGNOSTIC_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all))
 ifneq ($(BUILD_GOALS),)
@@ -64,8 +63,11 @@ BASE_FLAGS := -std=c11 -D_DEFAULT_SOURCE
 DEP_FLAGS  := -MMD -MP
 MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros -fcx-limited-range
 
-# ISA requirements belong to the selected kernels, not the optimization level.
-ifeq ($(CPU_ARCH_OPT),1)
+ifeq ($(BUILD),release)
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
+endif
+
+ifeq ($(BUILD),release-rdbg)
   ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
 endif
 
@@ -91,10 +93,11 @@ ifeq ($(CPU_ARCH_OPT),1)
 endif
 
 ifeq ($(BUILD),debug)
+  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O0 -g3 -ggdb3 -fno-omit-frame-pointer \
 	     $(SANITIZE_FLAGS) \
 	     -Wall -Wextra -Wformat=2 -Wshadow -Wstrict-prototypes \
-	     $(ARCH_FLAGS) -DDEBUG_BUILD=1
+	     -DDEBUG_BUILD=1
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 else ifeq ($(BUILD),release-rdbg)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
@@ -290,46 +293,25 @@ ifneq ($(HAS_VULKAN),)
 	@printf '#endif\n' >> $@
 endif
 
-.PHONY: all cli test kappai-test server monitor clean print-config format tidy backends-help config FORCE
-
-FORCE:
-
-# Regenerate only on content changes, so no-op builds remain incremental.
-$(FLAGS_FILE): FORCE | $(OUT_DIR)
-	@{ printf '%s\n' 'CC=$(CC)' 'CFLAGS=$(CFLAGS)' 'LDFLAGS=$(LDFLAGS)' \
-	  'GLSLC=$(GLSLC)' 'BACKENDS=$(BACKENDS)' 'CPU_ARCH_OPT=$(CPU_ARCH_OPT)' \
-	  'LIB_SRCS=$(LIB_SRCS)'; } > $@.tmp
-	@cmp -s $@.tmp $@ || mv $@.tmp $@
-	@rm -f $@.tmp
-
-$(LIB_OBJS) $(BACKEND_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN): $(FLAGS_FILE)
-ifneq ($(HAS_VULKAN),)
-$(SHADER_SPVS): $(FLAGS_FILE)
-endif
+.PHONY: all cli kappai-test server monitor clean print-config format tidy backends-help config
 
 all: $(BACKEND_LIBS) cli kappai-test server
 
-define SAVE_CONFIG
-	@{ printf 'BUILD = %s\n' "$(BUILD)"; \
-	  printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))"; \
-	  printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)"; \
-	  printf 'TSAN = %s\n' "$(if $(filter 1,$(TSAN)),1,0)"; \
-	  printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)"; \
-	  printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)"; \
-	  printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)"; \
-	  printf 'KAI_L1D_KB = %s\n' "$(DETECTED_L1D_KB)"; \
-	  printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)"; } > $(CONFIG_FILE).tmp
-	@cmp -s $(CONFIG_FILE).tmp $(CONFIG_FILE) || mv $(CONFIG_FILE).tmp $(CONFIG_FILE)
-	@rm -f $(CONFIG_FILE).tmp
-endef
-
-config: | $(OUT_DIR)
-	$(SAVE_CONFIG)
-	@echo "Build configuration saved:"
+config: $(OUT_DIR) $(CONFIG_FILE)
+	@echo "Build configuration created:"
 	@cat $(CONFIG_FILE)
 
 $(CONFIG_FILE): | $(OUT_DIR)
-	$(SAVE_CONFIG)
+	@echo "Generating build configuration..."
+	@printf 'BUILD = %s\n' "$(BUILD)" > $@
+	@printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
+	@printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)" >> $@
+	@printf 'TSAN = %s\n' "$(if $(filter 1,$(TSAN)),1,0)" >> $@
+	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
+	@printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)" >> $@
+	@printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)" >> $@
+	@printf 'KAI_L1D_KB = %s\n' "$(DETECTED_L1D_KB)" >> $@
+	@printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)" >> $@
 
 backends-help:
 	@echo "optional backends (via BACKENDS=...): $(AVAILABLE_BACKENDS)"
@@ -356,14 +338,12 @@ $(SERVER_BIN): $(SERVER_OBJS) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(SERVER_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread $(SERVER_LIBS) -o $@
 
-test: kappai-test
-
 kappai-test: $(TEST_BIN)
 $(TEST_BIN): $(TEST_OBJS) $(TEST_QUANT_OBJ) $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) $(TEST_QUANT_OBJ) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
 
-$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c $(CONFIG_FILE) | $(TEST_OBJ_DIR)
+$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
@@ -375,20 +355,18 @@ $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
 	@$(CC) -shared -Wl,-soname,libkappai.so $(CFLAGS) $^ $(LDFLAGS) -ljson-c -ldl -o $@
 
-$(BACKEND_OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(CONFIG_FILE) | $(OUT_DIR)
+$(BACKEND_OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC(b)   $<"
 	@$(CC) $(BACKEND_CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
 
 $(SCALAR_BACKEND): $(SCALAR_BACKEND_OBJS) $(ENGINE)
-	@mkdir -p $(@D)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(SCALAR_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
 
 ifneq ($(CPU_ARCH_DIR),)
 $(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) $(ENGINE)
-	@mkdir -p $(@D)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(ARCH_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
@@ -396,13 +374,12 @@ endif
 
 ifneq ($(HAS_VULKAN),)
 $(VK_BACKEND): $(VK_BACKEND_OBJS) $(ENGINE)
-	@mkdir -p $(@D)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lvulkan -o $@
 endif
 
-$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(CONFIG_FILE) | $(OUT_DIR)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@

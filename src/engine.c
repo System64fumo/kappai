@@ -88,7 +88,6 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	}
 }
 
-/* Install instructions regardless of whether speculative prefill is enabled. */
 static status_code prepare_system(context *c, const char *system, bool warmup) {
 	if (!c)
 		return ERR_INVALID_ARG;

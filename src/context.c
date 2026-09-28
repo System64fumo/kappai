@@ -919,7 +919,6 @@ int32_t *context_ids_scratch(context *c, int n) {
 	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
 }
 
-/* Only use before prefill: no KV/recurrent state has been modified yet. */
 static void rollback_unfed_turn(context *c, size_t n_messages, char *prev_render,
 							   bool prev_think_open) {
 	while (c->chat.n_messages > n_messages) {
