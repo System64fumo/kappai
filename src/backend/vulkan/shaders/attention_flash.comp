@@ -28,6 +28,7 @@ layout(push_constant) uniform Params {
 	int	  attn_start;
 #ifdef BATCHED
 	int m;
+	int sliding_window;
 #endif
 }
 params;
@@ -67,12 +68,12 @@ void main() {
 	if (row >= uint(params.m))
 		return;
 	pos				 = params.pos + int(row);
+	if (params.sliding_window > 0)
+		attn_start = max(attn_start, pos + 1 - params.sliding_window);
 	uint q_row_off	 = row * uint(params.n_heads) * uint(HEAD_DIM);
-	uint out_row_off = row * uint(params.n_heads) * uint(HEAD_DIM);
 #else
-	const uint row		   = 0u;
-	const uint q_row_off   = 0u;
-	const uint out_row_off = 0u;
+	const uint row		 = 0u;
+	const uint q_row_off = 0u;
 #endif
 
 	int	  dpl	 = HEAD_DIM / LANES_PER_HEAD;
@@ -148,7 +149,7 @@ void main() {
 
 	if (valid) {
 		precise float inv_S = S > 0.0 ? 1.0 / S : 0.0;
-		uint		  d0	= out_row_off + q_base + uint(lane) * uint(dpl);
+		uint		  d0	= q_base + uint(lane) * uint(dpl);
 		for (int i = 0; i < dpl; i++)
 			out_[d0 + uint(i)] = vkq[i] * inv_S;
 	}

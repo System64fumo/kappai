@@ -30,6 +30,7 @@ layout(push_constant) uniform Params {
 	int	  attn_start;
 #ifdef BATCHED
 	int m;
+	int sliding_window;
 #endif
 }
 params;
@@ -79,6 +80,10 @@ void main() {
 
 	uint sc_base	= sc_row_off + h * uint(n_ctx);
 	int	 attn_start = params.attn_start;
+#ifdef BATCHED
+	if (params.sliding_window > 0)
+		attn_start = max(attn_start, pos + 1 - params.sliding_window);
+#endif
 
 	for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
 		int tile_t1	 = min(tile_t0 + TILE_T, pos + 1);

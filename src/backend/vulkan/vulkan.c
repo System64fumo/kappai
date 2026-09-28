@@ -174,6 +174,9 @@ typedef struct {
 #define VK_DIRTY_TABLE_SIZE 256
 	VkBuffer dirty_table[VK_DIRTY_TABLE_SIZE];
 	int		 dirty_count;
+	/* Buffers accessed by earlier dispatches in this command buffer (WAR hazards). */
+	VkBuffer read_table[VK_DIRTY_MAX];
+	int		 read_count;
 
 	VkQueryPool query_pool;
 	int			query_cap;
@@ -815,6 +818,7 @@ static status_code vk_ring_begin(vk_priv *p, int idx) {
 	p->cmd						= r->cmd;
 	p->cmd_recording			= 1;
 	p->pending_dispatches		= 0;
+	p->read_count				= 0;
 	p->last_pipeline			= VK_NULL_HANDLE;
 	p->last_desc_set			= VK_NULL_HANDLE;
 	p->last_desc_pipeline_match = 0;
@@ -866,6 +870,7 @@ static void vk_ring_invalidate(vk_priv *p, int idx) {
 	}
 	p->pending_dispatches = 0;
 	vk_dirty_clear(p);
+	p->read_count = 0;
 }
 
 static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
@@ -1020,6 +1025,7 @@ static status_code vk_run_cmd(vk_priv *p) {
 			return bs;
 	}
 	vk_dirty_clear(p);
+	p->read_count = 0;
 	if (wait_now == 1) {
 		p->wbatch_count			 = 0;
 		p->wbatch_off			 = 0;
@@ -1224,6 +1230,7 @@ static void vk_destroy_pipeline(vk_priv *p, vk_pipeline_set *ps) {
 	if (r->has_work) {
 		r->has_work = 0;
 		vk_dirty_clear(p);
+		p->read_count = 0;
 	}
 	vk_flush_pending_desc_frees(p);
 	vkDestroyPipeline(p->dev, ps->pipeline, NULL);
@@ -1378,15 +1385,26 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 		key_offs[i] = offs ? offs[i] : 0;
 	}
 
-	if (p->dirty_count > 0) {
+	if (p->dirty_count > 0 || p->read_count > 0) {
 		VkBufferMemoryBarrier bars[VK_MAX_BINDINGS];
 		int					  nbar = 0;
 		for (int i = 0; i < n_bufs; i++) {
-			if (!vk_dirty_lookup(p, key[i]))
+			int dirty = vk_dirty_lookup(p, key[i]);
+			int read_slot = -1;
+			if (write_mask & (1u << i)) {
+				for (int j = 0; j < p->read_count; j++) {
+					if (p->read_table[j] == key[i]) {
+						read_slot = j;
+						break;
+					}
+				}
+			}
+			if (!dirty && read_slot < 0)
 				continue;
 			bars[nbar++] = (VkBufferMemoryBarrier){
 				.sType				 = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-				.srcAccessMask		 = VK_ACCESS_SHADER_WRITE_BIT,
+				.srcAccessMask		 = (dirty ? VK_ACCESS_SHADER_WRITE_BIT : 0) |
+								   (read_slot >= 0 ? VK_ACCESS_SHADER_READ_BIT : 0),
 				.dstAccessMask		 = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
 				.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 				.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1394,7 +1412,10 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 				.offset				 = 0,
 				.size				 = VK_WHOLE_SIZE,
 			};
-			vk_dirty_remove(p, key[i]);
+			if (dirty)
+				vk_dirty_remove(p, key[i]);
+			if (read_slot >= 0)
+				p->read_table[read_slot] = p->read_table[--p->read_count];
 		}
 		if (nbar > 0) {
 			vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1566,6 +1587,30 @@ have_set:;
 	}
 
 	vk_dirty_add(p, key, n_bufs, write_mask);
+	/* Track shader reads until a later write to the same VkBuffer. Include read/write
+	 * bindings: a storage buffer marked writable can also be read by its shader. */
+	for (int i = 0; i < n_bufs; i++) {
+		int seen = 0;
+		for (int j = 0; j < p->read_count; j++)
+			if (p->read_table[j] == key[i]) {
+				seen = 1;
+				break;
+			}
+		if (seen)
+			continue;
+		if (p->read_count == VK_DIRTY_MAX) {
+			VkMemoryBarrier barrier = {
+				.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+				.srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			};
+			vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+								 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0,
+								 NULL);
+			p->read_count = 0;
+		}
+		p->read_table[p->read_count++] = key[i];
+	}
 
 	p->pending_dispatches++;
 	p->ring[p->ring_cur].has_work = 1;
@@ -3042,6 +3087,7 @@ static status_code vk_buffer_upload(backend *self, buffer *buf, const void *host
 		if (r->has_work) {
 			r->has_work = 0;
 			vk_dirty_clear(p);
+			p->read_count = 0;
 		}
 		memcpy((uint8_t *)vb->mapped + off, host_src, size);
 		return OK;
@@ -3080,6 +3126,7 @@ static status_code vk_buf_download_raw(backend *self, vk_buf *vb, size_t off, vo
 		if (r->has_work) {
 			r->has_work = 0;
 			vk_dirty_clear(p);
+			p->read_count = 0;
 		}
 		memcpy(host_dst, (uint8_t *)vb->mapped + off, size);
 		return OK;
@@ -4744,6 +4791,7 @@ static void vk_synchronize(backend *self) {
 		if (r->has_work) {
 			r->has_work = 0;
 			vk_dirty_clear(p);
+			p->read_count = 0;
 		}
 		if (!p->device_lost_warned) {
 			p->device_lost_warned = 1;
@@ -4776,6 +4824,7 @@ static void vk_end_batch(backend *self) {
 		if (r->has_work) {
 			r->has_work = 0;
 			vk_dirty_clear(p);
+			p->read_count = 0;
 		}
 		if (!p->device_lost_warned) {
 			p->device_lost_warned = 1;
@@ -5495,7 +5544,7 @@ static status_code vk_ensure_flash_pipeline_batch(vk_priv *p, int head_dim, int 
 	uint32_t	spec_data[4] = {(uint32_t)head_dim, (uint32_t)n_groups, (uint32_t)lanes_per_head,
 								(uint32_t)local_size};
 	status_code s = vk_create_pipeline_spec(p, shader_attention_flash_batch_spv,
-											shader_attention_flash_batch_spv_len, 4, 40, spec_data,
+											shader_attention_flash_batch_spv_len, 4, 44, spec_data,
 											sizeof(spec_data), &p->p_attention_flash_batch[slot]);
 	if (s != OK) {
 		p->flash_batch_head_dim[slot]	 = head_dim;
@@ -5535,7 +5584,7 @@ static status_code vk_ensure_attention_pipeline_batch(vk_priv *p, int head_dim,
 	uint32_t	spec_data[2] = {(uint32_t)head_dim, (uint32_t)tile_t};
 	status_code s =
 		vk_create_pipeline_spec(p, shader_attention_batch_spv, shader_attention_batch_spv_len, 5,
-								40, spec_data, sizeof(spec_data), &p->p_attention_batch);
+								44, spec_data, sizeof(spec_data), &p->p_attention_batch);
 	if (s != OK) {
 		WARN("attention_batch pipeline creation failed for head_dim=%d", head_dim);
 		p->attention_batch_ready = 0;
@@ -5554,7 +5603,6 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 										   int n_ctx, int flash_attn, float scale,
 										   int n_kv_heads_active, int sliding_window,
 										   int attn_start, int m) {
-	(void)sliding_window;
 	vk_priv *p		  = self->priv;
 	int		 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 
@@ -5573,7 +5621,7 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
-	int can_flash = flash_attn && p->p_attention_flash_batch[0].pipeline != VK_NULL_HANDLE &&
+	int can_flash = flash_attn &&
 					vk_ensure_flash_pipeline_batch(p, head_dim, n_groups, &flash_ps) == OK;
 
 	size_t layer_off = vk_kv_layer_off_elems(kh, layer);
@@ -5586,9 +5634,10 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 			int32_t	 stride_head_dim;
 			int32_t	 attn_start;
 			int32_t	 m;
+			int32_t	 sliding_window;
 		} push = {
 			(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-			attn_start,			 m};
+			attn_start,			 m, sliding_window};
 		uint32_t groups_x = (uint32_t)n_kv_heads;
 		vk_buf	*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		return vk_dispatch_2d(p, flash_ps, bufs, 4, &push, sizeof(push), groups_x, (uint32_t)m);
@@ -5604,8 +5653,9 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		int32_t	 stride_head_dim;
 		int32_t	 attn_start;
 		int32_t	 m;
+		int32_t	 sliding_window;
 	} push = {(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-			  attn_start,		   m};
+			  attn_start,		   m, sliding_window};
 	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
 	vk_pipeline_set *ps		 = NULL;
 	if (vk_ensure_attention_pipeline_batch(p, head_dim, &ps) != OK) {
@@ -5632,14 +5682,10 @@ static status_code vk_attention_swa_batch(backend *self, const buffer *q, const 
 										  int pos_start, int n_heads, int n_kv_heads, int head_dim,
 										  int n_ctx, int flash_attn, float scale,
 										  int sliding_window, int n_kv_heads_active, int m) {
-	int last_pos   = pos_start + m - 1;
-	int n_pos	   = last_pos + 1;
-	int attn_start = 0;
-	if (sliding_window > 0 && n_pos > sliding_window)
-		attn_start = n_pos - sliding_window;
+	/* The shader computes the window lower bound separately for each query row. */
 	return vk_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
 								   n_kv_heads, head_dim, n_ctx, flash_attn, scale,
-								   n_kv_heads_active, sliding_window, attn_start, m);
+								   n_kv_heads_active, sliding_window, 0, m);
 }
 
 static status_code vk_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
