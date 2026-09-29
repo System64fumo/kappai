@@ -246,6 +246,43 @@ chunk sizing (unchanged, single chunk for a 408-token prompt); `OP_BACKEND`
 indirection and `profile_scope` per op (CPU is at parity, so the shared engine
 dispatch is not the cost).
 
+#### How to benchmark on this machine (read before trusting any PP number)
+
+PP on this box is not reproducible from single runs, and the dominant confound is
+**position within a measurement pair**, not thermal drift. Whatever runs *first*
+in a pair is faster, because the GPU is still in a high-clock state:
+
+| design | measured wip/fork |
+| --- | --- |
+| fork always first | 0.864 (looks 13.6% behind) |
+| wip always first | 1.125 (looks 12.5% *ahead*) |
+| ABBA / BAAB, 15 blocks | **0.975** |
+
+The first two rows are the same experiment with the order flipped; the ~13%
+"regression" they disagree about is entirely the warm-up slot. Only a design
+that balances positions is meaningful. Rules that produced a usable number:
+
+- interleave the two trees and alternate the order (ABBA, then BAAB), never run
+  them in blocks;
+- average the two positions per tree within a block, then compare blocks;
+- use a long prompt so fixed overheads are a small fraction (2520 words here);
+- report a confidence interval, not a point estimate. n=15 balanced blocks gives
+  se ~0.008, enough to resolve a 2% effect; n=6 unbalanced pairs gives se ~0.02,
+  which cannot resolve anything smaller than ~5%.
+
+Residual after the PLE fix, measured this way: **wip/fork = 0.975, 95% CI
+[0.960, 0.990]**, i.e. this branch is **1-4% behind** (point estimate 2.5%), with
+wip ahead in 3 of 15 blocks. That is a real but small effect, and it is not worth
+further profiling: each measurement round costs 20-30 minutes, and the remaining
+candidate (more per-op host work of the same shape as the PLE bug) has not been
+shown to exist. Left as a known, quantified difference.
+
+Note this also revises the pre-fix numbers above: the 321 -> 338 t/s improvement
+was measured with the fork running first, i.e. biased *against* this branch, so
+the PLE fix is if anything understated. The bug was structural rather than
+statistical -- 14280 kernel launches for one 408-token prompt is a fact about
+the code, not a measurement.
+
 ### Fixes carried on this branch
 
 - `log_op_homes` snprintf overflow (`_FORTIFY_SOURCE=3` aborts any device backend
@@ -324,14 +361,14 @@ dispatch is not the cost).
   existing buffer or allocated a fresh one. Worth ~1e-6 on the 64-vocab
   synthetic test model; not yet localized to a specific op, and not reachable
   through the reset test any more now that the harness bug below is fixed.
-- Unresolved, measurement-limited: CUDA prefill is still ~5-10% behind the
-  fork's best-case runs. The thread pool is single-threaded in the test harness
-  and this machine's prompt-processing rate swings +-11% run to run (latest
-  interleaved sample: fork 332/372/365 t/s, this branch 374/311/297 t/s), so a
-  gap that size cannot be resolved from single runs. Closing it needs a
-  lower-variance methodology (median of many interleaved pairs, ideally locked
-  GPU clocks) before any further profiling; the PLE launch-per-token bug fixed
-  above was found this way and was worth ~+11%.
+  Localizing it needs the `BUILD=debug` ASan/UBSan tree, which does not compile:
+  the AVX2 objects miss their arch flags in the debug config and fail with
+  "inlining failed ... target specific option mismatch" even when `ARCH_FLAGS` is
+  passed explicitly.
+- CUDA prefill is 1-4% behind the pre-merge fork (95% CI [0.960, 0.990], point
+  estimate 2.5%, n=15 balanced ABBA/BAAB blocks). Quantified and left alone; see
+  the benchmarking note above for why the apparent 5-15% figures seen earlier
+  were position artifacts.
 
 Note: this GPU reports `maxStorageBufferRange` = 128 MB, so no real model fits
 (`gemma-4` Q8_0 needs 427 MB, `Qwen3.5-0.8B` 270 MB). The vulkan op-level tests
