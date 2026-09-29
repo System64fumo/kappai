@@ -44,8 +44,8 @@ void main() {
 		int j = int(gid) % hd2;
 		if (j >= rd2)
 			return;
-		mediump float c	   = rcos[uint(pos) * uint(hd2) + uint(j)];
-		mediump float s	   = rsin[uint(pos) * uint(hd2) + uint(j)];
+		mediump float c	   = rcos[uint(pos) * uint(rd2) + uint(j)];
+		mediump float s	   = rsin[uint(pos) * uint(rd2) + uint(j)];
 		uint		  base = q_row_off + uint(h) * uint(params.head_dim);
 		if (params.neox != 0) {
 			mediump float v0			  = q[base + uint(j)];
@@ -67,8 +67,8 @@ void main() {
 		int j = int(kid) % hd2;
 		if (j >= rd2)
 			return;
-		mediump float c	   = rcos[uint(pos) * uint(hd2) + uint(j)];
-		mediump float s	   = rsin[uint(pos) * uint(hd2) + uint(j)];
+		mediump float c	   = rcos[uint(pos) * uint(rd2) + uint(j)];
+		mediump float s	   = rsin[uint(pos) * uint(rd2) + uint(j)];
 		uint		  base = k_row_off + uint(h) * uint(params.head_dim);
 		if (params.neox != 0) {
 			mediump float v0			  = k[base + uint(j)];

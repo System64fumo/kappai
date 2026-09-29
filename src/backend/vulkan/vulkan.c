@@ -5319,8 +5319,14 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	if (!p->p_rope_qk_batch.pipeline)
 		return ERR_UNSUPPORTED;
 
+	/* Two widths: the dispatch covers head_dim/2 per head (the shader's hd2;
+	 * threads past rd2 return early), but the rope table is strided by
+	 * rope_dim/2. compute_scratch_ensure builds it with rope_dim/2 for
+	 * hybrid-recurrent archs (compute.c), so indexing it with head_dim/2
+	 * both mis-strides it and reads past its end. */
 	int			half = head_dim / 2;
-	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	int			rd2	 = rope_dim / 2;
+	status_code s	 = vk_ensure_rope_bufs(self, rd2, rope_cos_base, rope_sin_base);
 	if (s != OK)
 		return s;
 	struct {
