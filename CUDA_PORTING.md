@@ -268,12 +268,17 @@ dispatch is not the cost).
   removed). The per-head pair count also drops the `j >= rd2` early return, so
   no thread is dispatched only to exit. `test_op_partial_rope_qk` no longer
   whitelists vulkan: **8 FAIL -> 8 PASS**, Vulkan total 455/1/65 -> 463/1/57.
+- jinja did not support Python's implicit adjacent string-literal
+  concatenation, so the canonical Gemma 4 chat template failed to compile and
+  the QAT `gemma-4-E2B_q4_0-it.gguf` model could not be loaded at all.
+  `parse_primary` now joins consecutive `TOK_STRING` tokens. The pieces are
+  unescaped individually and *then* joined, so a piece ending in a backslash
+  cannot swallow the next one. Three regression tests in `test_jinja.c`
+  (plain, escape boundary, inside `{% set %}`); edge_case 19 -> 22, all pass.
+  The QAT model now runs and its CUDA and CPU greedy output agree.
 
 ### Still broken upstream, not fixed here
 
-- The QAT `gemma-4-E2B_q4_0-it.gguf` fails to load: `jinja.c` `parse_call_args`
-  does not support adjacent string-literal concatenation, which the canonical
-  Gemma 4 template uses in `raise_exception("..." "...")`.
 - `kappai-test --all` (several backends in one process) segfaults; reproduced on
   pristine `misc/improvements` with vulkan only.
 - `lfm2.kvcache_reset_virgin_state` FAIL (now the only vulkan FAIL), 2x

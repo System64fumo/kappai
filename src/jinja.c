@@ -766,6 +766,27 @@ static expr_arg *parse_call_args(parser *p) {
 	return head;
 }
 
+/* Python implicitly concatenates adjacent string literals, so "a" "b" is "ab".
+ * Concatenate the unescaped values rather than the raw source, otherwise a
+ * piece whose last character is a backslash would swallow the next one. */
+static char *parse_string_literal(parser *p) {
+	char *acc = str_unescape(pcur(p)->start, pcur(p)->len);
+	padvance(p);
+	while (ptok_is(p, TOK_STRING)) {
+		char  *next = str_unescape(pcur(p)->start, pcur(p)->len);
+		size_t la	 = strlen(acc);
+		size_t lb	 = strlen(next);
+		char  *merged = xmalloc(la + lb + 1);
+		memcpy(merged, acc, la);
+		memcpy(merged + la, next, lb + 1);
+		free(acc);
+		free(next);
+		acc = merged;
+		padvance(p);
+	}
+	return acc;
+}
+
 static expr_node *parse_primary(parser *p) {
 	if (ptok_op_is(p, "-")) {
 		padvance(p);
@@ -786,8 +807,7 @@ static expr_node *parse_primary(parser *p) {
 	memset(n, 0, sizeof(*n));
 	if (ptok_is(p, TOK_STRING)) {
 		n->kind = EX_STRING;
-		n->str	= str_unescape(pcur(p)->start, pcur(p)->len);
-		padvance(p);
+		n->str	= parse_string_literal(p);
 	} else if (ptok_is(p, TOK_NUMBER)) {
 		n->kind = EX_STRING;
 		n->str	= tok_dup(pcur(p));

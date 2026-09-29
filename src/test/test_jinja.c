@@ -197,6 +197,23 @@ static void test_for_over_empty_dict(void) {
 	record_jinja("jinja.for_over_empty_dict", match, "empty dict -> '%s'", out);
 }
 
+static void test_adjacent_string_literals(void) {
+	char out[256];
+	int	 ok = render_ok("{{ 'a' 'b' 'c' }}", mk_globals(NULL, NULL), out, sizeof(out));
+	int	 match = ok && strcmp(out, "abc") == 0;
+	record_jinja("jinja.adjacent_string_literals", match, "'a' 'b' 'c' -> '%s'", out);
+
+	/* A trailing backslash escape must not swallow the next piece: concatenating
+	 * the raw source would turn "a\\" "\n" into a single \n escape. */
+	ok	  = render_ok("{{ 'a\\\\' '\\n' }}", mk_globals(NULL, NULL), out, sizeof(out));
+	match = ok && strcmp(out, "a\\\n") == 0;
+	record_jinja("jinja.adjacent_string_escape_boundary", match, "'a\\\\' '\\n' -> '%s'", out);
+
+	ok = render_ok("{% set x = 'q' 'r' %}{{ x }}", mk_globals(NULL, NULL), out, sizeof(out));
+	match = ok && strcmp(out, "qr") == 0;
+	record_jinja("jinja.adjacent_string_in_set", match, "set from 'q' 'r' -> '%s'", out);
+}
+
 void run_jinja_tests(void) {
 	test_replace_method();
 	test_is_null();
@@ -208,5 +225,6 @@ void run_jinja_tests(void) {
 	test_set_in_for_scope();
 	test_depth_cap();
 	test_range_cap();
+	test_adjacent_string_literals();
 	flush_family(OPFAM_EDGE_CASE);
 }
