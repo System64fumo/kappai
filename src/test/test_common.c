@@ -83,6 +83,10 @@ const char *op_family_name(op_family f) {
 		[OPFAM_ORCHESTRATION]	 = "orchestration",
 		[OPFAM_MOE_STREAM]		 = "moe_stream",
 		[OPFAM_TOOLCALL]		 = "toolcall",
+		[OPFAM_SOFTCAP]			 = "softcap",
+		[OPFAM_SPLIT_QGATE]		 = "split_qgate",
+		[OPFAM_ATTN_OUTPUT_GATE] = "attn_output_gate",
+		[OPFAM_PARTIAL_ROPE_QK]	 = "partial_rope_qk",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";
