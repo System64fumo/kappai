@@ -2233,6 +2233,20 @@ static status_code cuda_op_split_qgate(backend *self, const buffer *mixed, buffe
 	return OK;
 }
 
+static status_code cuda_op_moe_activate(backend *self, const buffer *gate, const buffer *up,
+									   buffer *out, int n, float gate_scale, float up_scale,
+									   int use_gelu) {
+	struct cuda_priv *priv = cuda_priv(self);
+	if (!priv)
+		return ERR_INTERNAL;
+	if (n <= 0)
+		return OK;
+	cuda_moe_activate((const float *)cuda_dev_ptr(gate), (const float *)cuda_dev_ptr(up),
+					  (float *)cuda_dev_ptr(out), n, gate_scale, up_scale, use_gelu ? 1 : 0,
+					  priv->stream);
+	return OK;
+}
+
 static status_code cuda_op_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
 										   int n_kv_heads, int head_dim, int rope_dim,
 										   int pos_start, const float *rope_cos_base,
@@ -3204,6 +3218,7 @@ static status_code cuda_ctor(backend *out) {
     out->attn_output_gate    = cuda_op_attn_output_gate;
     out->split_qgate         = cuda_op_split_qgate;
     out->partial_rope_qk    = cuda_op_partial_rope_qk;
+    out->moe_activate       = cuda_op_moe_activate;
     out->ple_combine        = cuda_op_ple_combine;
     out->ple_norm_batch     = cuda_op_ple_norm_batch;
     out->argmax             = cuda_op_argmax;

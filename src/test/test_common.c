@@ -87,6 +87,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_SPLIT_QGATE]		 = "split_qgate",
 		[OPFAM_ATTN_OUTPUT_GATE] = "attn_output_gate",
 		[OPFAM_PARTIAL_ROPE_QK]	 = "partial_rope_qk",
+		[OPFAM_MOE_ACTIVATE]		 = "moe_activate",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";

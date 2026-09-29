@@ -5768,6 +5768,30 @@ __device__ __forceinline__ float gelu_tanh_f32(float x) {
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x3)));
 }
 
+/* moe_activate: act = act_fn(gate*gate_scale) * (up*up_scale), where
+ * act_fn is silu or the tanh gelu. Same math as the host reference
+ * (moe_activate_silu / moe_activate_gelu), so results match bit-for-bit up
+ * to the usual device/host transcendental rounding. */
+__global__ void moe_activate_kernel(const float *gate, const float *up, float *out, long long n,
+                                    float gate_scale, float up_scale, int use_gelu) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i] * gate_scale;
+    float u = up[i] * up_scale;
+    float a = use_gelu ? gelu_tanh_f32(g) : silu_f32(g);
+    out[i] = a * u;
+}
+
+extern "C" void cuda_moe_activate(const float *gate_dev, const float *up_dev, float *out_dev,
+                                  long long n, float gate_scale, float up_scale, int use_gelu,
+                                  cudaStream_t stream) {
+    if (n <= 0) return;
+    int block = 256;
+    long long grid = (n + block - 1) / block;
+    moe_activate_kernel<<<(unsigned)grid, block, 0, stream>>>(gate_dev, up_dev, out_dev, n,
+                                                              gate_scale, up_scale, use_gelu);
+}
+
 __global__ void ffn_activate_kernel(const float *gate, const float *up, float *out,
                                     int n, int activation) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

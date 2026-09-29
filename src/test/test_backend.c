@@ -2483,6 +2483,62 @@ static void test_op_partial_rope_qk(backend *cpu, backend *tgt, int n_heads, int
 	tgt->buffer_free(tgt, &k_tgt);
 }
 
+static void test_op_moe_activate(backend *cpu, backend *tgt, int n, int use_gelu, float gs,
+								  float us) {
+	char label[128];
+	snprintf(label, sizeof(label), "moe_activate n=%d act=%s gs=%.2f us=%.2f", n,
+			 use_gelu ? "gelu" : "silu", gs, us);
+	if (!cpu->moe_activate || !tgt->moe_activate) {
+		record_result(OPFAM_MOE_ACTIVATE, label, V_SKIP,
+					  !cpu->moe_activate ? "CPU reference has no moe_activate"
+										 : "backend has no native moe_activate");
+		return;
+	}
+	seed_test_rng(0x30E7ULL + (uint64_t)n + (uint64_t)use_gelu);
+	float *g = xmalloc((size_t)n * sizeof(float));
+	float *u = xmalloc((size_t)n * sizeof(float));
+	fill_random_f32(g, n, 4.0f);
+	fill_random_f32(u, n, 4.0f);
+	buffer g_cpu = {0}, u_cpu = {0}, o_cpu = {0};
+	buffer g_tgt = {0}, u_tgt = {0}, o_tgt = {0};
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &g_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &u_cpu);
+	cpu->buffer_alloc_scratch(cpu, (size_t)n * sizeof(float), &o_cpu);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &g_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &u_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &o_tgt);
+	cpu->buffer_write_f32(cpu, &g_cpu, g, n);
+	cpu->buffer_write_f32(cpu, &u_cpu, u, n);
+	tgt->buffer_write_f32(tgt, &g_tgt, g, n);
+	tgt->buffer_write_f32(tgt, &u_tgt, u, n);
+	status_code s_cpu = cpu->moe_activate(cpu, &g_cpu, &u_cpu, &o_cpu, n, gs, us, use_gelu);
+	status_code s_tgt = tgt->moe_activate(tgt, &g_tgt, &u_tgt, &o_tgt, n, gs, us, use_gelu);
+	if (cpu->synchronize)
+		cpu->synchronize(cpu);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *ref = xmalloc((size_t)n * sizeof(float));
+	float *got = xmalloc((size_t)n * sizeof(float));
+	cpu->buffer_read_f32(cpu, &o_cpu, ref, n);
+	tgt->buffer_read_f32(tgt, &o_tgt, got, n);
+	char	detail[256];
+	verdict v = classify_output("loose", ref, got, n, s_cpu != OK ? s_cpu : s_tgt, detail,
+								sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(ref, got, n);
+	record_result(OPFAM_MOE_ACTIVATE, label, v, detail);
+	free(g);
+	free(u);
+	free(ref);
+	free(got);
+	cpu->buffer_free(cpu, &g_cpu);
+	cpu->buffer_free(cpu, &u_cpu);
+	cpu->buffer_free(cpu, &o_cpu);
+	tgt->buffer_free(tgt, &g_tgt);
+	tgt->buffer_free(tgt, &u_tgt);
+	tgt->buffer_free(tgt, &o_tgt);
+}
+
 static void test_edge_rmsnorm_zeros(backend *cpu, backend *tgt) {
 	if (!tgt->rmsnorm)
 		return;
@@ -3035,6 +3091,12 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	test_op_partial_rope_qk(cpu, tgt, 16, 8, 128, 64, 127, 4);
 	test_op_partial_rope_qk(cpu, tgt, 8, 4, 64, 64, 3, 2);
 	flush_family(OPFAM_PARTIAL_ROPE_QK);
+
+	test_op_moe_activate(cpu, tgt, 4096, 0, 1.0f, 1.0f);
+	test_op_moe_activate(cpu, tgt, 4096, 1, 1.0f, 1.0f);
+	test_op_moe_activate(cpu, tgt, 2048, 0, 0.5f, 2.0f);
+	test_op_moe_activate(cpu, tgt, 2048, 1, 2.0f, 0.5f);
+	flush_family(OPFAM_MOE_ACTIVATE);
 
 	test_edge_rmsnorm_zeros(cpu, tgt);
 	test_edge_determinism(cpu, tgt);

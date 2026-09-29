@@ -297,6 +297,8 @@ void cuda_split_qgate(const float *mixed_dev, float *q_dev, float *gate_dev, int
 void cuda_partial_rope(float *vec_dev, int n_heads, int head_dim, int rope_dim, int pos_start,
                        const float *cos_dev, const float *sin_dev, int n_rows,
                        cudaStream_t stream);
+void cuda_moe_activate(const float *gate_dev, const float *up_dev, float *out_dev, long long n,
+                       float gate_scale, float up_scale, int use_gelu, cudaStream_t stream);
 
 /* Batched attention/KV: grid over rows. sliding_window <= 0 disables window. */
 void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
