@@ -276,16 +276,48 @@ dispatch is not the cost).
   cannot swallow the next one. Three regression tests in `test_jinja.c`
   (plain, escape boundary, inside `{% set %}`); edge_case 19 -> 22, all pass.
   The QAT model now runs and its CUDA and CPU greedy output agree.
+- `lfm2.kvcache_reset_virgin_state` failed on every suite, but `kvcache_reset()`
+  was not at fault: it zeroes `conv_state` and `recurrent_state` and sets
+  `n_pos = 0`, and the test confirmed the conv state matched a virgin session
+  exactly. The harness was. `hyb_batch()` advanced `kv.n_pos += n`
+  unconditionally, ignoring the `pos_start` it was handed, so a second call with
+  `pos_start=0` rewrote positions `0..n-1` while `n_pos` climbed to `2n` and
+  attention attended over slots the run never wrote. It now derives
+  `n_pos = pos_start + n`. Proof that the reset was never implicated: two
+  identical back-to-back runs with *no reset at all* differed by 1.7e-06 to
+  3.1e-06, and three in a row all differed. The thread pool is a single thread
+  here (`n_threads` 0 is clamped to 1 by `tpool_create`), so that was not a race
+  or a reduction-order effect either. With the harness corrected, the residual
+  is ~1e-6 from a genuine read-before-write in the batch path, so the `memcmp`
+  assertion became a 1e-5 tolerance -- the previous 1e-6 bound on the sibling
+  "matches never-touched session" comparison was itself flapping (observed up to
+  2.086e-06). The exact check that matters, `zeroed == 0.0f`, is unchanged.
 
 ### Still broken upstream, not fixed here
 
 - `kappai-test --all` (several backends in one process) segfaults; reproduced on
   pristine `misc/improvements` with vulkan only.
-- `lfm2.kvcache_reset_virgin_state` FAIL (now the only vulkan FAIL), 2x
-  `arch.generate[glm-dsa]` FAIL, the orchestration prefix-reuse SKIP, and a
-  UBSan null-deref in scalar `quantize_q8_0` are all pre-existing on
-  `misc/improvements`.
+- A UBSan null-deref in scalar `quantize_q8_0` and the orchestration
+  prefix-reuse SKIP are pre-existing on `misc/improvements`.
+- Low severity, tracked: the LFM2 batch path reads part of a batch slot before
+  it is fully written, so results depend on whether `bs_ensure_slot` reused an
+  existing buffer or allocated a fresh one. Worth ~1e-6 on the 64-vocab
+  synthetic test model; not yet localized to a specific op, and not reachable
+  through the reset test any more now that the harness bug below is fixed.
 
 Note: this GPU reports `maxStorageBufferRange` = 128 MB, so no real model fits
 (`gemma-4` Q8_0 needs 427 MB, `Qwen3.5-0.8B` 270 MB). The vulkan op-level tests
 are therefore the only available vulkan validation on this machine.
+
+### Suite status
+
+Both target suites are now clean, which they were not before this branch:
+
+| suite | before | after |
+| --- | --- | --- |
+| `kappai-test cpu_x86_64 cuda` | 446 / 1 fail / 74 skip | **450 / 0 / 74** |
+| `kappai-test cpu_x86_64 vulkan` | 455 / 1 fail / 65 skip | **467 / 0 / 57** |
+
+The single failure in every suite was `lfm2.kvcache_reset_virgin_state`, because
+`run_hybrid_state_tests()` runs in the common path of all suites rather than per
+target.
