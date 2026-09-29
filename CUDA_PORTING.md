@@ -149,3 +149,96 @@ port measured no gain), and decode is covered by CUDA graphs (whole step replays
 as one launch). An apparent "+17% PP" from wiring the FFN fusion was a bug
 artifact (zeroed `n_out` skipped the GEMM). Porting them is therefore low value;
 not pursued.
+
+## Port status after merging misc/improvements (2406645)
+
+`cuda-wip` now contains `misc/improvements` (and therefore `main`), so the CUDA
+backend is a dlopen'd library like the CPU and Vulkan ones. The engine dropped
+from 1.93 MB to 878 KB and has zero CUDA runtime references; the CUDA code lives
+in `build/backends/libkappai_cuda.so`.
+
+### Ops the CUDA backend implements natively
+
+All 29 pre-merge ops, plus these four that `misc/improvements` introduced and
+that the engine dispatches through `OP_BACKEND`:
+
+| Op | Why it must be native |
+| --- | --- |
+| `softcap` | gemma-4 final logit softcap; NULL slot segfaults on first prefill |
+| `split_qgate` | passes Q/K slot buffers with no staging |
+| `attn_output_gate` | in-place on the attention output slot |
+| `partial_rope_qk` | Qwen3.5; rope over the first `rope_dim` dims only |
+
+`OP_BACKEND` only *reroutes* to a host backend, it does not stage, so a NULL slot
+for an op that receives device buffers is a segfault rather than a slow path.
+All four are covered by tests, and the tests were verified to fail when the
+kernels are broken.
+
+`moe_activate` is also native now. `moe_experts_batch` stays NULL on purpose: it
+is gated on `BCAP_MOE_EXPERT_RESIDENT`, so the engine's own device-fallback path
+handles it with reporting. Wiring it up would mean keeping expert weights
+resident, which is a much larger change.
+
+`gated_delta_net` stays NULL and is correct: `op_gated_delta_net` stages its
+inputs to host and the hybrid state is plain host `float *`, so the host fallback
+is the intended path. It costs prefill bandwidth on recurrent layers, not
+correctness.
+
+### repack_plan / repack_weight are intentionally NULL
+
+`misc/improvements` moved weight repacking behind two new backend hooks.
+Implementing them on CUDA would be **dead code**: `model.c` only consults them
+when `do_repack` is set, and `do_repack` requires `home_is_cpu`.
+`backend_weight_home()` returns the device backend whenever it has a `matmul`
+op, so for CUDA `home_is_cpu` is false, `do_repack` is false, and
+`repack_plan` is never called.
+
+CUDA's quad-major relayout and the lossless Q4_0 -> Q8_0 promotion therefore
+stay in `model.c`'s `if (!re_type)` block, which is exactly the path CUDA takes.
+The hooks also cannot express the promotion: `repack_weight` takes one input
+type and allocates `ggml_row_size(re_type)`, so an 18 B/32-element Q4_0 row
+cannot become a 34 B/32-element Q8_0 row through that contract.
+
+### Performance vs the pre-merge fork (gemma-4 E2B Q8_0, RTX 2070 Max-Q)
+
+| | fork e35ba92 | merged | |
+| --- | --- | --- | --- |
+| PP, 408 tok | 321-338 t/s | 248-273 t/s | -21% |
+| PP, ~2000 tok | 246.9 t/s | 222.3 t/s | -10% |
+| TG | 47.3-47.9 t/s | 46.8-47.0 t/s | parity |
+
+Decode is at parity. Prefill is slower, and the cause is *not* the kernels: the
+`--time` breakdown shows the merged tree doing slightly *less* profiled GPU work
+(79.2 ms vs 80.6 ms) while taking more wall time, and the gap shrinks as the
+prompt grows. That points at fixed per-op host dispatch added by
+`misc/improvements` (`OP_BACKEND` indirection, `profile_scope` per op, host
+fallback reporting), amortized over prompt length. Chunk sizing is unchanged and
+not a factor: both trees process a 408-token prompt as a single chunk, and
+`-DL2_SIZE_BYTES` is not set, so the L2 clamp in `context_prefill_chunk_size` is
+compiled out.
+
+### Fixes carried on this branch
+
+- `log_op_homes` snprintf overflow (`_FORTIFY_SOURCE=3` aborts any device backend
+  reporting more than one missing op). Pre-existing on `misc/improvements`.
+- 32-byte alignment for every AVX scratch buffer in `x86_64/quants.c`.
+  `misc/improvements` aligns only `q_ymm_cache`; the other 15 per-tile caches were
+  still grown with plain `xrealloc` and indexed as `__m256i`. IQ4_NL models
+  segfaulted on CUDA because the staging path loses the allocator alignment
+  lottery; CPU-only runs happened to win it.
+- vulkan `partial_rope_qk` read the rope table past its end for hybrid-recurrent
+  archs (strided with `head_dim/2` where `compute.c` builds it with
+  `rope_dim/2`).
+
+### Still broken upstream, not fixed here
+
+- vulkan `partial_rope_qk` still disagrees with the scalar reference on hybrid
+  archs after the out-of-bounds fix; the test reports those as a known-bug SKIP.
+- The QAT `gemma-4-E2B_q4_0-it.gguf` fails to load: `jinja.c` `parse_call_args`
+  does not support adjacent string-literal concatenation, which the canonical
+  Gemma 4 template uses in `raise_exception("..." "...")`.
+- `kappai-test --all` (several backends in one process) segfaults; reproduced on
+  pristine `misc/improvements` with vulkan only.
+- `lfm2.kvcache_reset_virgin_state` FAIL, 2x `arch.generate[glm-dsa]` FAIL, the
+  orchestration prefix-reuse SKIP, and a UBSan null-deref in scalar
+  `quantize_q8_0` are all pre-existing on `misc/improvements`.
