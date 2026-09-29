@@ -5319,25 +5319,30 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	if (!p->p_rope_qk_batch.pipeline)
 		return ERR_UNSUPPORTED;
 
-	/* Two widths: the dispatch covers head_dim/2 per head (the shader's hd2;
-	 * threads past rd2 return early), but the rope table is strided by
-	 * rope_dim/2. compute_scratch_ensure builds it with rope_dim/2 for
-	 * hybrid-recurrent archs (compute.c), so indexing it with head_dim/2
-	 * both mis-strides it and reads past its end. */
-	int			half = head_dim / 2;
+	/* The shader pairs each of the rope_dim/2 pairs of a head, so the dispatch
+	 * covers rope_dim/2 threads per head and the rope table is strided by the
+	 * same width. Pairing with head_dim/2 instead would both mis-stride the
+	 * table and rotate the wrong elements when rope_dim < head_dim.
+	 * compute_scratch_ensure builds the table with rope_dim/2 for
+	 * hybrid-recurrent archs (compute.c). */
 	int			rd2	 = rope_dim / 2;
 	status_code s	 = vk_ensure_rope_bufs(self, rd2, rope_cos_base, rope_sin_base);
 	if (s != OK)
 		return s;
+	/* partial_rope_qk is Neox by contract: the scalar reference
+	 * (cpu_partial_rope_qk -> rope_rotate_neox) and the CUDA kernel both rotate
+	 * Neox unconditionally rather than branching on rope_neox. This shader is
+	 * shared with vk_rope_qk_batch, which does honor rope_neox, so pin the flag
+	 * to 1 here instead of forwarding self->rope_neox. */
 	struct {
 		int32_t n_heads, n_kv_heads, head_dim, pos, neox, m;
 		int32_t rope_dim;
-	} push = {n_heads, n_kv_heads, head_dim, pos_start, self->rope_neox, n_rows, rope_dim};
+	} push = {n_heads, n_kv_heads, head_dim, pos_start, 1, n_rows, rope_dim};
 	vk_buf		*bufs[4]  = {as_vkbuf(q), as_vkbuf(k), as_vkbuf(p->rope_cos_buf_active),
 							 as_vkbuf(p->rope_sin_buf_active)};
 	VkDeviceSize offs[4]  = {q->offset, k->offset, 0, 0};
-	uint32_t	 total_q  = (uint32_t)(n_heads * half);
-	uint32_t	 total_k  = (uint32_t)(n_kv_heads * half);
+	uint32_t	 total_q  = (uint32_t)(n_heads * rd2);
+	uint32_t	 total_k  = (uint32_t)(n_kv_heads * rd2);
 	uint32_t	 groups_x = (total_q + total_k + 63) / 64;
 	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)n_rows, 0x3);

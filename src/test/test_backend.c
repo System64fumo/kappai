@@ -2444,29 +2444,16 @@ static void test_op_partial_rope_qk(backend *cpu, backend *tgt, int n_heads, int
 	tgt->buffer_read_f32(tgt, &k_tgt, k_got, kn * n_rows);
 	char	detail[256];
 	char	label2[192];
-	/* vk_partial_rope_qk disagrees with the scalar reference on hybrid-recurrent
-	 * archs (its rope table indexing predates rope_dim), and the mismatch is
-	 * still present after fixing its out-of-bounds table stride. Scoped to
-	 * vulkan by name so a regression on any other backend still fails. */
-	const int vk_known_bug = strcmp(tgt->name, "vulkan") == 0;
 	snprintf(label2, sizeof(label2), "%s [q]", label);
 	verdict vq = classify_output("loose", q_ref, q_got, qn * n_rows, s_cpu != OK ? s_cpu : s_tgt,
 								 detail, sizeof(detail));
-	if (vq == V_FAIL && vk_known_bug) {
-		vq = V_SKIP;
-		strncat(detail, " [KNOWN BUG: vulkan partial_rope_qk mismatches the reference]",
-				sizeof(detail) - strlen(detail) - 1);
-	} else if (vq != V_PASS && vq != V_SKIP)
+	if (vq != V_PASS && vq != V_SKIP)
 		compute_debug(q_ref, q_got, qn * n_rows);
 	record_result(OPFAM_PARTIAL_ROPE_QK, label2, vq, detail);
 	snprintf(label2, sizeof(label2), "%s [k]", label);
 	verdict vk = classify_output("loose", k_ref, k_got, kn * n_rows, s_cpu != OK ? s_cpu : s_tgt,
 								 detail, sizeof(detail));
-	if (vk == V_FAIL && vk_known_bug) {
-		vk = V_SKIP;
-		strncat(detail, " [KNOWN BUG: vulkan partial_rope_qk mismatches the reference]",
-				sizeof(detail) - strlen(detail) - 1);
-	} else if (vk != V_PASS && vk != V_SKIP)
+	if (vk != V_PASS && vk != V_SKIP)
 		compute_debug(k_ref, k_got, kn * n_rows);
 	record_result(OPFAM_PARTIAL_ROPE_QK, label2, vk, detail);
 	free(q);

@@ -258,16 +258,29 @@ dispatch is not the cost).
 - vulkan `partial_rope_qk` read the rope table past its end for hybrid-recurrent
   archs (strided with `head_dim/2` where `compute.c` builds it with
   `rope_dim/2`).
+- vulkan `partial_rope_qk` also paired the wrong elements and picked the wrong
+  rope flavour. The scalar reference `rope_rotate_neox` pairs element `j` with
+  `j + rope_dim/2` and is Neox unconditionally; the shader paired with
+  `head_dim/2` and branched on `rope_neox`. So the shader now covers
+  `rope_dim/2` pairs per head and pairs with `rd2`, and `vk_partial_rope_qk`
+  pins the push-constant `neox` flag to 1 (the shader is shared with
+  `vk_rope_qk_batch`, which *does* honor `rope_neox`, so it cannot just be
+  removed). The per-head pair count also drops the `j >= rd2` early return, so
+  no thread is dispatched only to exit. `test_op_partial_rope_qk` no longer
+  whitelists vulkan: **8 FAIL -> 8 PASS**, Vulkan total 455/1/65 -> 463/1/57.
 
 ### Still broken upstream, not fixed here
 
-- vulkan `partial_rope_qk` still disagrees with the scalar reference on hybrid
-  archs after the out-of-bounds fix; the test reports those as a known-bug SKIP.
 - The QAT `gemma-4-E2B_q4_0-it.gguf` fails to load: `jinja.c` `parse_call_args`
   does not support adjacent string-literal concatenation, which the canonical
   Gemma 4 template uses in `raise_exception("..." "...")`.
 - `kappai-test --all` (several backends in one process) segfaults; reproduced on
   pristine `misc/improvements` with vulkan only.
-- `lfm2.kvcache_reset_virgin_state` FAIL, 2x `arch.generate[glm-dsa]` FAIL, the
-  orchestration prefix-reuse SKIP, and a UBSan null-deref in scalar
-  `quantize_q8_0` are all pre-existing on `misc/improvements`.
+- `lfm2.kvcache_reset_virgin_state` FAIL (now the only vulkan FAIL), 2x
+  `arch.generate[glm-dsa]` FAIL, the orchestration prefix-reuse SKIP, and a
+  UBSan null-deref in scalar `quantize_q8_0` are all pre-existing on
+  `misc/improvements`.
+
+Note: this GPU reports `maxStorageBufferRange` = 128 MB, so no real model fits
+(`gemma-4` Q8_0 needs 427 MB, `Qwen3.5-0.8B` 270 MB). The vulkan op-level tests
+are therefore the only available vulkan validation on this machine.
