@@ -56,16 +56,10 @@ static jinja_value *json_to_jinja(const json_object *jo) {
 	switch (json_object_get_type(jo)) {
 	case json_type_boolean:
 		return jinja_bool(json_object_get_boolean(jo) ? 1 : 0);
-	case json_type_int: {
-		char buf[32];
-		snprintf(buf, sizeof(buf), "%lld", (long long)json_object_get_int64(jo));
-		return jinja_string(buf);
-	}
-	case json_type_double: {
-		char buf[40];
-		snprintf(buf, sizeof(buf), "%.17g", json_object_get_double(jo));
-		return jinja_string(buf);
-	}
+	case json_type_int:
+		return jinja_int(json_object_get_int64(jo));
+	case json_type_double:
+		return jinja_float(json_object_get_double(jo));
 	case json_type_string:
 		return jinja_string(json_object_get_string((json_object *)jo));
 	case json_type_array: {
@@ -284,7 +278,9 @@ void chat_template_add_message(chat_template_state *cts, const char *role, const
 
 void chat_template_add_message_ex(chat_template_state *cts, const chat_message *msg) {
 	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
-	char		 *clean = strip_thinking_spans(cts, msg->content ? msg->content : "");
+	char *clean = msg->role && strcmp(msg->role, "assistant") == 0
+					  ? strip_thinking_spans(cts, msg->content)
+					  : xstrdup(msg->content ? msg->content : "");
 	chat_message *dst	= &cts->messages[cts->n_messages];
 	memset(dst, 0, sizeof(*dst));
 	dst->role			   = xstrdup(msg->role ? msg->role : "");
