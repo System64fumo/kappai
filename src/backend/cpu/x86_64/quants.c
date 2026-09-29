@@ -3226,7 +3226,7 @@ void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	for (size_t row = 0; row < (size_t)n; row += Q4_K_R8_ROWS) {
 		const uint8_t *group = (const uint8_t *)w +
 							   (row / Q4_K_R8_ROWS) * (size_t)blocks_per_row * Q4_K_R8_GROUP_BYTES;
-		int rows = n - (int)row;
+		int			   rows	 = n - (int)row;
 		if (rows > Q4_K_R8_ROWS)
 			rows = Q4_K_R8_ROWS;
 
@@ -3268,7 +3268,7 @@ void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 							__m256i d1 = dotprod_u8_s8_i32(hi, xhi[c][g]);
 							acc[c]	   = _mm256_add_epi32(
 								acc[c], _mm256_add_epi32(_mm256_mullo_epi32(d0, scale_lo),
-															 _mm256_mullo_epi32(d1, scale_hi)));
+														 _mm256_mullo_epi32(d1, scale_hi)));
 							summ[c] += se[g * 4 + 1] * bslo[c][g] + se[g * 4 + 3] * bshi[c][g];
 						}
 					}

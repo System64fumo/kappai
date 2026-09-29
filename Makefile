@@ -40,36 +40,37 @@ endif
 
 ifeq ($(HOST_ARCH),aarch64)
   DETECTED_CACHE_LINE := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
-  DETECTED_L1D_KB      := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
-  DETECTED_L2_KB       := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
+  DETECTED_L1D_KB     := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB      := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
                            if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
                              cat $$d/size | tr -dc '0-9'; break; fi; done)
 endif
 ifeq ($(HOST_ARCH),x86_64)
   DETECTED_CACHE_LINE := $(shell getconf LEVEL1_DCACHE_LINESIZE 2>/dev/null || echo 64)
-  DETECTED_L1D_KB      := $(shell getconf LEVEL1_DCACHE_SIZE 2>/dev/null | tr -dc '0-9')
-  DETECTED_L2_KB       := $(shell getconf LEVEL2_CACHE_SIZE 2>/dev/null | tr -dc '0-9')
+  DETECTED_L1D_KB     := $(shell getconf LEVEL1_DCACHE_SIZE 2>/dev/null | tr -dc '0-9')
+  DETECTED_L2_KB      := $(shell getconf LEVEL2_CACHE_SIZE 2>/dev/null | tr -dc '0-9')
 endif
 DETECTED_ARCH_FLAGS := $(shell $(CC) -### -E - -march=native 2>&1 | sed -rn '/cc1/!d;s/(\")|(^.* - )//g;s/ -dumpbase -//g;p')
 
+ifeq ($(origin ARCH_FLAGS),undefined)
+  ifneq ($(strip $(MACHINE_ARCH_FLAGS)),)
+    ARCH_FLAGS := $(MACHINE_ARCH_FLAGS)
+  else
+    ARCH_FLAGS := $(DETECTED_ARCH_FLAGS)
+  endif
+endif
+
 ifeq ($(wildcard $(OUT_DIR)/config.mk),)
-  KAI_CACHE_LINE      := $(DETECTED_CACHE_LINE)
-  KAI_L1D_KB          := $(DETECTED_L1D_KB)
-  KAI_L2_KB           := $(DETECTED_L2_KB)
-  MACHINE_ARCH_FLAGS  := $(DETECTED_ARCH_FLAGS)
+  KAI_CACHE_LINE     := $(DETECTED_CACHE_LINE)
+  KAI_L1D_KB         := $(DETECTED_L1D_KB)
+  KAI_L2_KB          := $(DETECTED_L2_KB)
+  MACHINE_ARCH_FLAGS := $(DETECTED_ARCH_FLAGS)
 endif
 
 BASE_FLAGS := -std=c11 -D_DEFAULT_SOURCE
 DEP_FLAGS  := -MMD -MP
 MATH_FLAGS := -fno-math-errno -fno-trapping-math -fno-signed-zeros -fcx-limited-range
-
-ifeq ($(BUILD),release)
-  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
-endif
-
-ifeq ($(BUILD),release-rdbg)
-  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
-endif
+WARN_FLAGS := -Wall -Wextra -Wformat=2
 
 ifeq ($(TSAN),1)
   SANITIZE_FLAGS := -fsanitize=thread
@@ -93,24 +94,18 @@ ifeq ($(CPU_ARCH_OPT),1)
 endif
 
 ifeq ($(BUILD),debug)
-  ARCH_FLAGS ?= $(MACHINE_ARCH_FLAGS)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O0 -g3 -ggdb3 -fno-omit-frame-pointer \
-	     $(SANITIZE_FLAGS) \
-	     -Wall -Wextra -Wformat=2 -Wshadow -Wstrict-prototypes \
-	     -DDEBUG_BUILD=1
+             $(SANITIZE_FLAGS) $(WARN_FLAGS) -Wshadow -Wstrict-prototypes -DDEBUG_BUILD=1
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 else ifeq ($(BUILD),release-rdbg)
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
-	     $(SANITIZE_FLAGS) \
-	     -Wall -Wextra -Wformat=2 \
-	     $(MATH_FLAGS) $(ARCH_FLAGS) \
-	     -DRELEASE_DBG=1
+             $(SANITIZE_FLAGS) $(WARN_FLAGS) $(MATH_FLAGS) $(ARCH_FLAGS) -DRELEASE_DBG=1
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 else
   CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -flto -funroll-loops -funroll-all-loops \
-	     -ftree-vectorize -fvect-cost-model=unlimited -fivopts -fweb \
-	     -frename-registers -fprefetch-loop-arrays \
-	     $(MATH_FLAGS) $(ARCH_FLAGS) -DNDEBUG
+             -ftree-vectorize -fvect-cost-model=unlimited -fivopts -fweb \
+             -frename-registers -fprefetch-loop-arrays \
+             $(MATH_FLAGS) $(ARCH_FLAGS) -DNDEBUG
   LDFLAGS := -lm -lpthread -flto
 endif
 
@@ -124,16 +119,15 @@ LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/moe/*.c) \
 	$(SRC_DIR)/backend/backend.c
 
-BACKEND_DIR  := $(OUT_DIR)/backends
+BACKEND_DIR     := $(OUT_DIR)/backends
 BACKEND_OBJ_DIR := $(OUT_DIR)/backend_obj
-BACKEND_CFLAGS := $(CFLAGS) -fvisibility=hidden $(VK_BACKEND_INCLUDES)
+BACKEND_CFLAGS  := $(CFLAGS) -fvisibility=hidden $(VK_BACKEND_INCLUDES)
 
 SCALAR_CORE_OBJS := \
 	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/core.o \
 	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
 
-SCALAR_BACKEND_OBJS := \
-	$(SCALAR_CORE_OBJS)
+SCALAR_BACKEND_OBJS := $(SCALAR_CORE_OBJS)
 
 CPU_ARCH_DIR :=
 ifeq ($(CPU_ARCH_OPT),1)
@@ -143,24 +137,24 @@ ifeq ($(CPU_ARCH_OPT),1)
   ifeq ($(HOST_ARCH),x86_64)
     CPU_ARCH_DIR := x86_64
   endif
-  endif
+endif
 
 SCALAR_BACKEND := $(BACKEND_DIR)/libkappai_cpu_scalar.so
-BACKEND_LIBS  := $(SCALAR_BACKEND)
-BACKEND_OBJS  := $(SCALAR_BACKEND_OBJS)
+BACKEND_LIBS   := $(SCALAR_BACKEND)
+BACKEND_OBJS   := $(SCALAR_BACKEND_OBJS)
 
 ifneq ($(CPU_ARCH_DIR),)
   ARCH_BACKEND_OBJS := $(SCALAR_CORE_OBJS) \
-		      $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/core.o \
-		      $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/quants.o
+                       $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/core.o \
+                       $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/quants.o
   ARCH_BACKEND := $(BACKEND_DIR)/libkappai_cpu_$(CPU_ARCH_DIR).so
   BACKEND_LIBS += $(ARCH_BACKEND)
   BACKEND_OBJS += $(ARCH_BACKEND_OBJS)
 endif
 
-VK_BACKEND_OBJS := $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o \
-	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
 ifneq ($(HAS_VULKAN),)
+  VK_BACKEND_OBJS := $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o \
+                     $(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
   VK_BACKEND := $(BACKEND_DIR)/libkappai_vulkan.so
   BACKEND_LIBS += $(VK_BACKEND)
   BACKEND_OBJS += $(VK_BACKEND_OBJS)
@@ -198,23 +192,23 @@ TIDY_LOG     := $(OUT_DIR)/tidy.log
 VK_SHADERS_DIR := $(SRC_DIR)/backend/vulkan/shaders
 VK_INC_FILES   := $(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc)
 
-MATMUL_BATCH	    := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16
-MATMUL_NMAT_DUAL_BATCH  := matmul_q4_0 matmul_q4_k matmul_q6_k
+MATMUL_BATCH           := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16
+MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
 
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
-	            rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
-	            rmsnorm_noweight_per_head rmsnorm_noweight_per_head_sg
+                    rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
+                    rmsnorm_noweight_per_head rmsnorm_noweight_per_head_sg
 RMSNORM_ALL := rmsnorm $(RMSNORM_VARIANTS)
 
 rmsnorm_FLAGS                      := -DHAS_WEIGHT
-rmsnorm_noweight_FLAGS              :=
-rmsnorm_sg_FLAGS                    := -DHAS_WEIGHT -DUSE_SUBGROUP
-rmsnorm_noweight_sg_FLAGS           := -DUSE_SUBGROUP
-rmsnorm_per_head_FLAGS              := -DHAS_WEIGHT -DPER_HEAD
-rmsnorm_per_head_sg_FLAGS           := -DHAS_WEIGHT -DPER_HEAD -DUSE_SUBGROUP
-rmsnorm_add_FLAGS                   := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL
-rmsnorm_noweight_per_head_FLAGS     := -DPER_HEAD
-rmsnorm_noweight_per_head_sg_FLAGS  := -DPER_HEAD -DUSE_SUBGROUP
+rmsnorm_noweight_FLAGS             :=
+rmsnorm_sg_FLAGS                   := -DHAS_WEIGHT -DUSE_SUBGROUP
+rmsnorm_noweight_sg_FLAGS          := -DUSE_SUBGROUP
+rmsnorm_per_head_FLAGS             := -DHAS_WEIGHT -DPER_HEAD
+rmsnorm_per_head_sg_FLAGS          := -DHAS_WEIGHT -DPER_HEAD -DUSE_SUBGROUP
+rmsnorm_add_FLAGS                  := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL
+rmsnorm_noweight_per_head_FLAGS    := -DPER_HEAD
+rmsnorm_noweight_per_head_sg_FLAGS := -DPER_HEAD -DUSE_SUBGROUP
 
 VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/argmax.spv \
@@ -346,7 +340,7 @@ $(TEST_BIN): $(TEST_OBJS) $(TEST_QUANT_OBJ) $(ENGINE) $(BACKEND_LIBS)
 $(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
+	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
 
 $(TEST_OBJ_DIR):
 	@mkdir -p $@
@@ -394,12 +388,13 @@ print-config:
 	@echo "BUILD              = $(BUILD)"
 	@echo "OUT_DIR            = $(OUT_DIR)"
 	@echo "CC                 = $(CC)"
+	@echo "ARCH_FLAGS         = $(ARCH_FLAGS)"
+	@echo "MACHINE_ARCH_FLAGS = $(MACHINE_ARCH_FLAGS)"
 	@echo "CFLAGS             = $(CFLAGS)"
 	@echo "LDFLAGS            = $(LDFLAGS)"
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
-	@echo "TSAN	       = $(if $(filter 1,$(TSAN)),1,0)"
+	@echo "TSAN               = $(if $(filter 1,$(TSAN)),1,0)"
 	@echo "SANITIZE_FLAGS     = $(SANITIZE_FLAGS)"
-	@echo "MACHINE_ARCH_FLAGS = $(MACHINE_ARCH_FLAGS)"
 	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"

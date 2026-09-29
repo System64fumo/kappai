@@ -162,6 +162,7 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 		cts->think_end_id	  = tokenizer_find_token(tok, think->close);
 		cts->think_start_text = think->open;
 		cts->think_end_text	  = think->close;
+		cts->think_label_line = think->label_line;
 	}
 
 	cts->tool_fmt = marker_probe_text(tmpl_src_for_probe, MARKER_TOOL_CALL);
@@ -175,6 +176,11 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 	cts->last_render	 = xstrdup("");
 	cts->enable_thinking = true;
 	return OK;
+}
+
+static void notify_render_replaced(chat_template_state *cts) {
+	if (cts->invalidate_cb)
+		cts->invalidate_cb(cts->invalidate_ud);
 }
 
 void chat_template_clear_messages(chat_template_state *cts) {
@@ -193,6 +199,7 @@ void chat_template_clear_messages(chat_template_state *cts) {
 	cts->cap_messages = 0;
 	free(cts->last_render);
 	cts->last_render = xstrdup("");
+	notify_render_replaced(cts);
 }
 
 void chat_template_set_tools(chat_template_state *cts, json_object *tools,
@@ -207,6 +214,7 @@ void chat_template_set_tools(chat_template_state *cts, json_object *tools,
 		cts->tools		 = json_object_get(tools);
 		cts->tool_choice = xstrdup(tool_choice ? tool_choice : "auto");
 	}
+	notify_render_replaced(cts);
 }
 
 void chat_template_free(chat_template_state *cts) {
@@ -252,6 +260,45 @@ static char *strip_thinking_spans(chat_template_state *cts, const char *content)
 	return out;
 }
 
+static const char *skip_newlines(const char *p) {
+	while (*p == '\n')
+		p++;
+	return p;
+}
+
+void chat_template_split_thinking(const chat_template_state *cts, const char *raw,
+								  char **out_reasoning, char **out_content) {
+	*out_reasoning = NULL;
+	*out_content   = xstrdup(raw ? raw : "");
+	if (!raw || !cts->think_start_text || !cts->think_end_text)
+		return;
+
+	const char *e = strstr(raw, cts->think_end_text);
+	if (!e)
+		return;
+
+	const char *rstart = raw;
+	if (strncmp(rstart, cts->think_start_text, strlen(cts->think_start_text)) == 0)
+		rstart += strlen(cts->think_start_text);
+	if (cts->think_label_line) {
+		const char *nl = strchr(rstart, '\n');
+		rstart		   = nl ? nl + 1 : e;
+	} else {
+		rstart = skip_newlines(rstart);
+	}
+	if (rstart > e)
+		rstart = e;
+
+	free(*out_content);
+	*out_content   = xstrdup(skip_newlines(e + strlen(cts->think_end_text)));
+	*out_reasoning = xstrndup(rstart, (size_t)(e - rstart));
+}
+
+void chat_template_set_invalidate_cb(chat_template_state *cts, void (*cb)(void *), void *ud) {
+	cts->invalidate_cb = cb;
+	cts->invalidate_ud = ud;
+}
+
 static void simple_message(chat_message *m, const char *role, const char *content) {
 	memset(m, 0, sizeof(*m));
 	m->role	   = (char *)(role ? role : "");
@@ -278,9 +325,9 @@ void chat_template_add_message(chat_template_state *cts, const char *role, const
 
 void chat_template_add_message_ex(chat_template_state *cts, const chat_message *msg) {
 	ARR_RESERVE(cts->messages, cts->n_messages, cts->cap_messages);
-	char *clean = msg->role && strcmp(msg->role, "assistant") == 0
-					  ? strip_thinking_spans(cts, msg->content)
-					  : xstrdup(msg->content ? msg->content : "");
+	char		 *clean = msg->role && strcmp(msg->role, "assistant") == 0
+							  ? strip_thinking_spans(cts, msg->content)
+							  : xstrdup(msg->content ? msg->content : "");
 	chat_message *dst	= &cts->messages[cts->n_messages];
 	memset(dst, 0, sizeof(*dst));
 	dst->role			   = xstrdup(msg->role ? msg->role : "");
@@ -457,4 +504,5 @@ void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *
 		cts->last_render = rendered;
 	}
 	cts->think_open = false;
+	notify_render_replaced(cts);
 }

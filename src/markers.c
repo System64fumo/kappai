@@ -3,18 +3,19 @@
 #include <string.h>
 
 static const marker_pair marker_pairs[] = {
-	{"<think>", "</think>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
-	{"<|channel>", "<channel|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
-	{"<|think|>", "<|/think|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
-	{"<start_of_thought>", "<|end_of_thought|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL},
+	{"<think>", "</think>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL, false},
+	{"<|channel>", "<channel|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL, true},
+	{"<|think|>", "<|/think|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL, false},
+	{"<start_of_thought>", "<|end_of_thought|>", MARKER_THINKING, PAYLOAD_NONE, NULL, NULL, false},
 
-	{"<|tool_call>", "<tool_call|>", MARKER_TOOL_CALL, PAYLOAD_CALLCOLON, "<|tool_response>", NULL},
-	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLARGS, NULL, "<arg_key>"},
-	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, NULL, NULL},
+	{"<|tool_call>", "<tool_call|>", MARKER_TOOL_CALL, PAYLOAD_CALLCOLON, "<|tool_response>", NULL,
+	 false},
+	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLARGS, NULL, "<arg_key>", false},
+	{"<tool_call>", "</tool_call>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, NULL, NULL, false},
 	{"<|tool_call_start|>", "<|tool_call_end|>", MARKER_TOOL_CALL, PAYLOAD_FUNCARGS,
-	 "<|tool_call_end|>", NULL},
-	{"<function=", "</function>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, "<|im_end|>", NULL},
-	{"", "", MARKER_TOOL_CALL, PAYLOAD_AUTO, "<|eot_id|>", NULL},
+	 "<|tool_call_end|>", NULL, false},
+	{"<function=", "</function>", MARKER_TOOL_CALL, PAYLOAD_XMLFUNC, "<|im_end|>", NULL, false},
+	{"", "", MARKER_TOOL_CALL, PAYLOAD_AUTO, "<|eot_id|>", NULL, false},
 };
 
 const marker_pair *marker_registry(size_t *n_pairs) {

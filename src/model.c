@@ -563,7 +563,8 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 int model_should_repack(uint32_t type, const char *repack_config) {
 	if (!repack_config)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
-			   type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+			   type == GGML_TYPE_Q6_K;
 	if (strcmp(repack_config, "all") == 0)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ||
 			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||

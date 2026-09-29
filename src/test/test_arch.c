@@ -36,9 +36,9 @@ static void *alloc_q4_k_weights(int rows, int cols) {
 	}
 	size_t blocks_per_row = (size_t)cols / 256;
 	size_t n_blocks		  = (size_t)rows * blocks_per_row;
-	void  *p			  = xcalloc(n_blocks, sizeof(q4_k_block));
+	void  *p			  = xcalloc(n_blocks, 144);
 	seed_test_rng(0x1234ULL + ((uint64_t)rows * 31) + ((uint64_t)cols * 7));
-	fill_random_blocks(p, (int)n_blocks, sizeof(q4_k_block), GGML_TYPE_Q4_K);
+	fill_random_blocks(p, (int)n_blocks, 144, GGML_TYPE_Q4_K);
 	return p;
 }
 
@@ -159,7 +159,7 @@ static size_t synth_q4_k_buf_size(int rows, int cols) {
 		exit(2);
 	}
 	size_t blocks_per_row = (size_t)cols / 256;
-	return (size_t)rows * blocks_per_row * sizeof(q4_k_block);
+	return (size_t)rows * blocks_per_row * 144;
 }
 
 static void *synth_alloc_q4_k(int rows, int cols) {
@@ -174,7 +174,7 @@ static void synth_fill_q4_k(void *p, int rows, int cols) {
 	size_t blocks_per_row = (size_t)cols / 256;
 	size_t n_blocks		  = (size_t)rows * blocks_per_row;
 	seed_test_rng(0x1234ULL + ((uint64_t)rows * 31) + ((uint64_t)cols * 7));
-	fill_random_blocks(p, (int)n_blocks, sizeof(q4_k_block), GGML_TYPE_Q4_K);
+	fill_random_blocks(p, (int)n_blocks, 144, GGML_TYPE_Q4_K);
 }
 
 static void synth_fill_f32(float *p, int n, float bias) {
@@ -860,11 +860,11 @@ static void synth_model_free(synth_model *sm) {
 	free(sm);
 }
 
-static void test_arch_pipeline(backend *cpu, backend *tgt, const synth_cfg *cfg, int n_prefill,
+static void test_arch_pipeline(backend *ref, backend *tgt, const synth_cfg *cfg, int n_prefill,
 							   int flash_attn) {
 	int n_ctx = n_prefill + 16;
 
-	synth_model *sm_cpu = synth_model_build(cpu, ARCH_LLAMA, cfg, n_ctx);
+	synth_model *sm_ref = synth_model_build(ref, ARCH_LLAMA, cfg, n_ctx);
 	synth_model *sm_tgt = synth_model_build(tgt, ARCH_LLAMA, cfg, n_ctx);
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
@@ -872,22 +872,22 @@ static void test_arch_pipeline(backend *cpu, backend *tgt, const synth_cfg *cfg,
 	for (int i = 0; i < n_prefill; i++)
 		prompt[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
 
-	float *logits_cpu = xmalloc((size_t)cfg->vocab * sizeof(float));
+	float *logits_ref = xmalloc((size_t)cfg->vocab * sizeof(float));
 	float *logits_tgt = xmalloc((size_t)cfg->vocab * sizeof(float));
 
 	{
 		kvcache kv;
-		kvcache_init(&kv, &sm_cpu->m, n_ctx, KV_QUANT_F16);
+		kvcache_init(&kv, &sm_ref->m, n_ctx, KV_QUANT_F16);
 		compute_scratch s;
 		compute_scratch_init(&s);
-		(void)compute_scratch_ensure(&s, &sm_cpu->m, n_ctx);
+		(void)compute_scratch_ensure(&s, &sm_ref->m, n_ctx);
 		for (int i = 0; i < n_prefill; i++) {
-			float *out = (i == n_prefill - 1) ? logits_cpu : NULL;
-			compute_forward(&sm_cpu->m, &kv, &s, prompt[i], i, flash_attn, out);
+			float *out = (i == n_prefill - 1) ? logits_ref : NULL;
+			compute_forward(&sm_ref->m, &kv, &s, prompt[i], i, flash_attn, out);
 			kv.n_pos++;
 		}
-		if (cpu->synchronize)
-			cpu->synchronize(cpu);
+		if (ref->synchronize)
+			ref->synchronize(ref);
 		compute_scratch_free(&s);
 		kvcache_free(&kv);
 	}
@@ -908,7 +908,7 @@ static void test_arch_pipeline(backend *cpu, backend *tgt, const synth_cfg *cfg,
 		kvcache_free(&kv);
 	}
 
-	int32_t am_cpu = sampler_argmax(logits_cpu, cfg->vocab);
+	int32_t am_ref = sampler_argmax(logits_ref, cfg->vocab);
 	int32_t am_tgt = sampler_argmax(logits_tgt, cfg->vocab);
 
 	char label[160];
@@ -916,43 +916,43 @@ static void test_arch_pipeline(backend *cpu, backend *tgt, const synth_cfg *cfg,
 	snprintf(label, sizeof(label), "arch.pipeline %d-layer prefill(%d) flash=%d", cfg->n_layers,
 			 n_prefill, flash_attn);
 	verdict v =
-		classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
+		classify_output("loose", logits_ref, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
 	int dl = (int)strlen(detail);
-	snprintf(detail + dl, sizeof(detail) - dl, " | argmax cpu=%d tgt=%d %s", am_cpu, am_tgt,
-			 am_cpu == am_tgt ? "(agree)" : "(DIVERGE)");
+	snprintf(detail + dl, sizeof(detail) - dl, " | argmax ref=%d tgt=%d %s", am_ref, am_tgt,
+			 am_ref == am_tgt ? "(agree)" : "(DIVERGE)");
 	if (v != V_PASS && v != V_SKIP)
-		compute_debug(logits_cpu, logits_tgt, cfg->vocab);
+		compute_debug(logits_ref, logits_tgt, cfg->vocab);
 	record_result(OPFAM_ARCH_PIPELINE, label, v, detail);
 
-	free(logits_cpu);
+	free(logits_ref);
 	free(logits_tgt);
 	free(prompt);
-	synth_model_free(sm_cpu);
+	synth_model_free(sm_ref);
 	synth_model_free(sm_tgt);
 }
 
-static void test_arch_single_layer(backend *cpu, backend *tgt, const synth_cfg *cfg,
+static void test_arch_single_layer(backend *ref, backend *tgt, const synth_cfg *cfg,
 								   int flash_attn) {
 	synth_cfg one = *cfg;
 	one.n_layers  = 1;
 	int n_ctx	  = 16;
 
-	synth_model *sm_cpu = synth_model_build(cpu, ARCH_LLAMA, &one, n_ctx);
+	synth_model *sm_ref = synth_model_build(ref, ARCH_LLAMA, &one, n_ctx);
 	synth_model *sm_tgt = synth_model_build(tgt, ARCH_LLAMA, &one, n_ctx);
 
 	int32_t tok		   = 7;
-	float  *logits_cpu = xmalloc((size_t)one.vocab * sizeof(float));
+	float  *logits_ref = xmalloc((size_t)one.vocab * sizeof(float));
 	float  *logits_tgt = xmalloc((size_t)one.vocab * sizeof(float));
 
 	{
 		kvcache kv;
-		kvcache_init(&kv, &sm_cpu->m, n_ctx, KV_QUANT_F16);
+		kvcache_init(&kv, &sm_ref->m, n_ctx, KV_QUANT_F16);
 		compute_scratch s;
 		compute_scratch_init(&s);
-		(void)compute_scratch_ensure(&s, &sm_cpu->m, n_ctx);
-		compute_forward(&sm_cpu->m, &kv, &s, tok, 0, flash_attn, logits_cpu);
-		if (cpu->synchronize)
-			cpu->synchronize(cpu);
+		(void)compute_scratch_ensure(&s, &sm_ref->m, n_ctx);
+		compute_forward(&sm_ref->m, &kv, &s, tok, 0, flash_attn, logits_ref);
+		if (ref->synchronize)
+			ref->synchronize(ref);
 		compute_scratch_free(&s);
 		kvcache_free(&kv);
 	}
@@ -973,22 +973,22 @@ static void test_arch_single_layer(backend *cpu, backend *tgt, const synth_cfg *
 	char detail[320];
 	snprintf(label, sizeof(label), "arch.single_layer flash=%d", flash_attn);
 	verdict v =
-		classify_output("loose", logits_cpu, logits_tgt, one.vocab, OK, detail, sizeof(detail));
+		classify_output("loose", logits_ref, logits_tgt, one.vocab, OK, detail, sizeof(detail));
 	if (v != V_PASS && v != V_SKIP)
-		compute_debug(logits_cpu, logits_tgt, one.vocab);
+		compute_debug(logits_ref, logits_tgt, one.vocab);
 	record_result(OPFAM_ARCH_LAYER, label, v, detail);
 
-	free(logits_cpu);
+	free(logits_ref);
 	free(logits_tgt);
-	synth_model_free(sm_cpu);
+	synth_model_free(sm_ref);
 	synth_model_free(sm_tgt);
 }
 
-static void test_arch_decode_chain(backend *cpu, backend *tgt, const synth_cfg *cfg, int n_prefill,
+static void test_arch_decode_chain(backend *ref, backend *tgt, const synth_cfg *cfg, int n_prefill,
 								   int n_decode, int flash_attn) {
 	int n_ctx = n_prefill + n_decode + 16;
 
-	synth_model *sm_cpu = synth_model_build(cpu, ARCH_LLAMA, cfg, n_ctx);
+	synth_model *sm_ref = synth_model_build(ref, ARCH_LLAMA, cfg, n_ctx);
 	synth_model *sm_tgt = synth_model_build(tgt, ARCH_LLAMA, cfg, n_ctx);
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
@@ -996,21 +996,21 @@ static void test_arch_decode_chain(backend *cpu, backend *tgt, const synth_cfg *
 	for (int i = 0; i < n_prefill; i++)
 		prompt[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
 
-	float *logits_cpu = xmalloc((size_t)cfg->vocab * sizeof(float));
+	float *logits_ref = xmalloc((size_t)cfg->vocab * sizeof(float));
 	float *logits_tgt = xmalloc((size_t)cfg->vocab * sizeof(float));
 
-	kvcache kv_cpu;
-	kvcache_init(&kv_cpu, &sm_cpu->m, n_ctx, KV_QUANT_F16);
-	compute_scratch s_cpu;
-	compute_scratch_init(&s_cpu);
-	(void)compute_scratch_ensure(&s_cpu, &sm_cpu->m, n_ctx);
+	kvcache kv_ref;
+	kvcache_init(&kv_ref, &sm_ref->m, n_ctx, KV_QUANT_F16);
+	compute_scratch s_ref;
+	compute_scratch_init(&s_ref);
+	(void)compute_scratch_ensure(&s_ref, &sm_ref->m, n_ctx);
 	for (int i = 0; i < n_prefill; i++) {
-		float *out = (i == n_prefill - 1) ? logits_cpu : NULL;
-		compute_forward(&sm_cpu->m, &kv_cpu, &s_cpu, prompt[i], i, flash_attn, out);
-		kv_cpu.n_pos++;
+		float *out = (i == n_prefill - 1) ? logits_ref : NULL;
+		compute_forward(&sm_ref->m, &kv_ref, &s_ref, prompt[i], i, flash_attn, out);
+		kv_ref.n_pos++;
 	}
-	if (cpu->synchronize)
-		cpu->synchronize(cpu);
+	if (ref->synchronize)
+		ref->synchronize(ref);
 
 	kvcache kv_tgt;
 	kvcache_init(&kv_tgt, &sm_tgt->m, n_ctx, KV_QUANT_F16);
@@ -1030,18 +1030,18 @@ static void test_arch_decode_chain(backend *cpu, backend *tgt, const synth_cfg *
 	for (int step = 0; step < n_decode; step++) {
 		int		pos = n_prefill + step;
 		int32_t tok = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
-		compute_forward(&sm_cpu->m, &kv_cpu, &s_cpu, tok, pos, flash_attn, logits_cpu);
-		if (cpu->synchronize)
-			cpu->synchronize(cpu);
+		compute_forward(&sm_ref->m, &kv_ref, &s_ref, tok, pos, flash_attn, logits_ref);
+		if (ref->synchronize)
+			ref->synchronize(ref);
 		compute_forward(&sm_tgt->m, &kv_tgt, &s_tgt, tok, pos, flash_attn, logits_tgt);
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
-		int32_t am_cpu = sampler_argmax(logits_cpu, cfg->vocab);
+		int32_t am_ref = sampler_argmax(logits_ref, cfg->vocab);
 		int32_t am_tgt = sampler_argmax(logits_tgt, cfg->vocab);
-		if (am_cpu == am_tgt)
+		if (am_ref == am_tgt)
 			n_agree++;
 
-		float step_max = max_abs_diff_at(logits_cpu, logits_tgt, cfg->vocab, NULL);
+		float step_max = max_abs_diff_at(logits_ref, logits_tgt, cfg->vocab, NULL);
 		if (step_max > max_abs_overall)
 			max_abs_overall = step_max;
 	}
@@ -1051,32 +1051,32 @@ static void test_arch_decode_chain(backend *cpu, backend *tgt, const synth_cfg *
 	snprintf(label, sizeof(label), "arch.decode_chain %d-layer prefill=%d decode=%d flash=%d",
 			 cfg->n_layers, n_prefill, n_decode, flash_attn);
 	verdict v =
-		classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
+		classify_output("loose", logits_ref, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
 	if (v != V_PASS && v != V_SKIP)
-		compute_debug(logits_cpu, logits_tgt, cfg->vocab);
+		compute_debug(logits_ref, logits_tgt, cfg->vocab);
 	int dl = (int)strlen(detail);
 	snprintf(detail + dl, sizeof(detail) - dl, " | argmax agree %d/%d  max_abs_overall=%.4e",
 			 n_agree, n_decode, max_abs_overall);
 	record_result(OPFAM_ARCH_DECODE, label, v, detail);
 
-	compute_scratch_free(&s_cpu);
+	compute_scratch_free(&s_ref);
 	compute_scratch_free(&s_tgt);
-	kvcache_free(&kv_cpu);
+	kvcache_free(&kv_ref);
 	kvcache_free(&kv_tgt);
-	free(logits_cpu);
+	free(logits_ref);
 	free(logits_tgt);
 	free(prompt);
-	synth_model_free(sm_cpu);
+	synth_model_free(sm_ref);
 	synth_model_free(sm_tgt);
 }
 
-static void test_arch_batch_vs_single(backend *cpu, model_arch arch, const synth_cfg *cfg,
+static void test_arch_batch_vs_single(backend *ref, model_arch arch, const synth_cfg *cfg,
 									  int n_prefill, int flash_attn) {
 	const char *arch_name = arch_lookup(arch)->gguf_name;
 	int			n_ctx	  = n_prefill + 16;
 
-	synth_model *sm_batch  = synth_model_build(cpu, arch, cfg, n_ctx);
-	synth_model *sm_single = synth_model_build(cpu, arch, cfg, n_ctx);
+	synth_model *sm_batch  = synth_model_build(ref, arch, cfg, n_ctx);
+	synth_model *sm_single = synth_model_build(ref, arch, cfg, n_ctx);
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
 	seed_test_rng(0xBA7C9B9ULL + (uint64_t)arch);
@@ -1155,7 +1155,7 @@ static void test_arch_batch_vs_single(backend *cpu, model_arch arch, const synth
 	synth_model_free(sm_single);
 }
 
-static void test_arch_error_compounding(backend *cpu, backend *tgt, const synth_cfg *base_cfg,
+static void test_arch_error_compounding(backend *ref, backend *tgt, const synth_cfg *base_cfg,
 										int n_prefill, int flash_attn) {
 	int layer_counts[] = {1, 2, 4, 8};
 	int n_configs	   = (int)(sizeof(layer_counts) / sizeof(layer_counts[0]));
@@ -1167,7 +1167,7 @@ static void test_arch_error_compounding(backend *cpu, backend *tgt, const synth_
 		cfg.n_layers	   = n_layers;
 		int n_ctx		   = n_prefill + 16;
 
-		synth_model *sm_cpu = synth_model_build(cpu, ARCH_LLAMA, &cfg, n_ctx);
+		synth_model *sm_ref = synth_model_build(ref, ARCH_LLAMA, &cfg, n_ctx);
 		synth_model *sm_tgt = synth_model_build(tgt, ARCH_LLAMA, &cfg, n_ctx);
 
 		int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
@@ -1175,22 +1175,22 @@ static void test_arch_error_compounding(backend *cpu, backend *tgt, const synth_
 		for (int i = 0; i < n_prefill; i++)
 			prompt[i] = (int32_t)(next_u32() % (uint32_t)cfg.vocab);
 
-		float *logits_cpu = xmalloc((size_t)cfg.vocab * sizeof(float));
+		float *logits_ref = xmalloc((size_t)cfg.vocab * sizeof(float));
 		float *logits_tgt = xmalloc((size_t)cfg.vocab * sizeof(float));
 
 		{
 			kvcache kv;
-			kvcache_init(&kv, &sm_cpu->m, n_ctx, KV_QUANT_F16);
+			kvcache_init(&kv, &sm_ref->m, n_ctx, KV_QUANT_F16);
 			compute_scratch s;
 			compute_scratch_init(&s);
-			(void)compute_scratch_ensure(&s, &sm_cpu->m, n_ctx);
+			(void)compute_scratch_ensure(&s, &sm_ref->m, n_ctx);
 			for (int i = 0; i < n_prefill; i++) {
-				float *out = (i == n_prefill - 1) ? logits_cpu : NULL;
-				compute_forward(&sm_cpu->m, &kv, &s, prompt[i], i, flash_attn, out);
+				float *out = (i == n_prefill - 1) ? logits_ref : NULL;
+				compute_forward(&sm_ref->m, &kv, &s, prompt[i], i, flash_attn, out);
 				kv.n_pos++;
 			}
-			if (cpu->synchronize)
-				cpu->synchronize(cpu);
+			if (ref->synchronize)
+				ref->synchronize(ref);
 			compute_scratch_free(&s);
 			kvcache_free(&kv);
 		}
@@ -1211,12 +1211,12 @@ static void test_arch_error_compounding(backend *cpu, backend *tgt, const synth_
 			kvcache_free(&kv);
 		}
 
-		int32_t am_cpu = sampler_argmax(logits_cpu, cfg.vocab);
+		int32_t am_ref = sampler_argmax(logits_ref, cfg.vocab);
 		int32_t am_tgt = sampler_argmax(logits_tgt, cfg.vocab);
 
 		int		at;
-		float	max_abs = max_abs_diff_at(logits_cpu, logits_tgt, cfg.vocab, &at);
-		float	ratio = max_combined_ratio_at(logits_cpu, logits_tgt, cfg.vocab, ATOL_LOOSE * 10.0f,
+		float	max_abs = max_abs_diff_at(logits_ref, logits_tgt, cfg.vocab, &at);
+		float	ratio = max_combined_ratio_at(logits_ref, logits_tgt, cfg.vocab, ATOL_LOOSE * 10.0f,
 											  RTOL_LOOSE, NULL);
 		verdict v	  = (ratio <= 1.0f) ? V_PASS : V_FAIL;
 
@@ -1227,33 +1227,33 @@ static void test_arch_error_compounding(backend *cpu, backend *tgt, const synth_
 				header_shown = 1;
 			}
 			printf("    %6d  %11.4e  %9.3f  %3s    %s\n", n_layers, max_abs, ratio,
-				   am_cpu == am_tgt ? "yes" : "NO", "FAIL");
+				   am_ref == am_tgt ? "yes" : "NO", "FAIL");
 		}
 
 		char label[160];
 		char detail[320];
 		snprintf(label, sizeof(label), "arch.error_compound %d layers prefill=%d", n_layers,
 				 n_prefill);
-		snprintf(detail, sizeof(detail), "max_abs=%.4e@%d tol_ratio=%.3f argmax cpu=%d tgt=%d %s",
-				 max_abs, at, ratio, am_cpu, am_tgt, am_cpu == am_tgt ? "(agree)" : "(DIVERGE)");
+		snprintf(detail, sizeof(detail), "max_abs=%.4e@%d tol_ratio=%.3f argmax ref=%d tgt=%d %s",
+				 max_abs, at, ratio, am_ref, am_tgt, am_ref == am_tgt ? "(agree)" : "(DIVERGE)");
 		if (v != V_PASS)
-			compute_debug(logits_cpu, logits_tgt, cfg.vocab);
+			compute_debug(logits_ref, logits_tgt, cfg.vocab);
 		record_result(OPFAM_ARCH_COMPOUND, label, v, detail);
 
-		free(logits_cpu);
+		free(logits_ref);
 		free(logits_tgt);
 		free(prompt);
-		synth_model_free(sm_cpu);
+		synth_model_free(sm_ref);
 		synth_model_free(sm_tgt);
 	}
 }
 
-static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, const synth_cfg *cfg,
+static void test_arch_generate(backend *ref, backend *tgt, model_arch arch, const synth_cfg *cfg,
 							   int n_prefill, int n_decode, int flash_attn) {
 	const char *arch_name = arch_lookup(arch)->gguf_name;
 	int			n_ctx	  = n_prefill + n_decode + 16;
 
-	synth_model *sm_cpu = synth_model_build(cpu, arch, cfg, n_ctx);
+	synth_model *sm_ref = synth_model_build(ref, arch, cfg, n_ctx);
 	synth_model *sm_tgt = tgt ? synth_model_build(tgt, arch, cfg, n_ctx) : NULL;
 
 	int32_t *prompt = xmalloc((size_t)n_prefill * sizeof(int32_t));
@@ -1261,14 +1261,14 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 	for (int i = 0; i < n_prefill; i++)
 		prompt[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
 
-	float *logits_cpu = xmalloc((size_t)cfg->vocab * sizeof(float));
+	float *logits_ref = xmalloc((size_t)cfg->vocab * sizeof(float));
 	float *logits_tgt = tgt ? xmalloc((size_t)cfg->vocab * sizeof(float)) : NULL;
 
-	kvcache			kv_cpu;
-	status_code		kv_cpu_status = kvcache_init(&kv_cpu, &sm_cpu->m, n_ctx, KV_QUANT_F16);
-	compute_scratch s_cpu;
-	compute_scratch_init(&s_cpu);
-	(void)compute_scratch_ensure(&s_cpu, &sm_cpu->m, n_ctx);
+	kvcache			kv_ref;
+	status_code		kv_ref_status = kvcache_init(&kv_ref, &sm_ref->m, n_ctx, KV_QUANT_F16);
+	compute_scratch s_ref;
+	compute_scratch_init(&s_ref);
+	(void)compute_scratch_ensure(&s_ref, &sm_ref->m, n_ctx);
 
 	kvcache			kv_tgt;
 	compute_scratch s_tgt;
@@ -1284,22 +1284,22 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 		}
 	}
 
-	if (kv_cpu_status != OK) {
+	if (kv_ref_status != OK) {
 		char label[160];
 		char detail[320];
 		snprintf(label, sizeof(label), "arch.generate[%s] prefill (%d tokens)", arch_name,
 				 n_prefill);
-		snprintf(detail, sizeof(detail), "kvcache_init failed: status=%d", kv_cpu_status);
+		snprintf(detail, sizeof(detail), "kvcache_init failed: status=%d", kv_ref_status);
 		record_result(OPFAM_ARCH_GENERATE, label, V_SKIP, detail);
-		free(logits_cpu);
+		free(logits_ref);
 		free(logits_tgt);
 		free(prompt);
-		compute_scratch_free(&s_cpu);
+		compute_scratch_free(&s_ref);
 		if (sm_tgt) {
 			compute_scratch_free(&s_tgt);
 			kvcache_free(&kv_tgt);
 		}
-		synth_model_free(sm_cpu);
+		synth_model_free(sm_ref);
 		if (sm_tgt)
 			synth_model_free(sm_tgt);
 		return;
@@ -1312,11 +1312,11 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 	char label[160];
 	char detail[320];
 
-	status_code s_cpu_status = compute_forward_batch(&sm_cpu->m, &kv_cpu, &s_cpu, prompt, n_prefill,
-													 0, flash_attn, logits_cpu);
-	kv_cpu.n_pos += n_prefill;
-	if (cpu->synchronize)
-		cpu->synchronize(cpu);
+	status_code s_ref_status = compute_forward_batch(&sm_ref->m, &kv_ref, &s_ref, prompt, n_prefill,
+													 0, flash_attn, logits_ref);
+	kv_ref.n_pos += n_prefill;
+	if (ref->synchronize)
+		ref->synchronize(ref);
 	status_code s_tgt_status = OK;
 	if (sm_tgt) {
 		s_tgt_status = compute_forward_batch(&sm_tgt->m, &kv_tgt, &s_tgt, prompt, n_prefill, 0,
@@ -1326,53 +1326,53 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 			tgt->synchronize(tgt);
 	}
 
-	if (s_cpu_status != OK) {
+	if (s_ref_status != OK) {
 		self_test_fail = 1;
 	} else {
-		int nf = count_nonfinite(logits_cpu, cfg->vocab);
+		int nf = count_nonfinite(logits_ref, cfg->vocab);
 		if (nf > 0)
 			self_test_fail = 1;
 	}
 
 	snprintf(label, sizeof(label), "arch.generate[%s] prefill (%d tokens)", arch_name, n_prefill);
 	if (self_test_fail) {
-		snprintf(detail, sizeof(detail), "CPU self-test failure: status=%d nonfinite=%d/%d",
-				 s_cpu_status, s_cpu_status == OK ? count_nonfinite(logits_cpu, cfg->vocab) : -1,
+		snprintf(detail, sizeof(detail), "REF self-test failure: status=%d nonfinite=%d/%d",
+				 s_ref_status, s_ref_status == OK ? count_nonfinite(logits_ref, cfg->vocab) : -1,
 				 cfg->vocab);
 		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
 	} else if (sm_tgt) {
-		verdict v = classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
+		verdict v = classify_output("loose", logits_ref, logits_tgt, cfg->vocab, s_tgt_status,
 									detail, sizeof(detail));
 		if (v != V_PASS && v != V_SKIP)
-			compute_debug(logits_cpu, logits_tgt, cfg->vocab);
+			compute_debug(logits_ref, logits_tgt, cfg->vocab);
 		record_result(OPFAM_ARCH_GENERATE, label, v, detail);
 		if (v != V_FAIL) {
-			int32_t am_cpu = sampler_argmax(logits_cpu, cfg->vocab);
+			int32_t am_ref = sampler_argmax(logits_ref, cfg->vocab);
 			int32_t am_tgt = sampler_argmax(logits_tgt, cfg->vocab);
-			n_agree += (am_cpu == am_tgt);
+			n_agree += (am_ref == am_tgt);
 			n_steps++;
 		}
 	} else {
-		snprintf(detail, sizeof(detail), "prefill produced finite output (CPU self-test only)");
+		snprintf(detail, sizeof(detail), "prefill produced finite output (REF self-test only)");
 		record_result(OPFAM_ARCH_GENERATE, label, V_PASS, detail);
 	}
 
-	int32_t tok_cpu = sampler_argmax(logits_cpu, cfg->vocab);
-	int32_t tok_tgt = sm_tgt ? sampler_argmax(logits_tgt, cfg->vocab) : tok_cpu;
+	int32_t tok_ref = sampler_argmax(logits_ref, cfg->vocab);
+	int32_t tok_tgt = sm_tgt ? sampler_argmax(logits_tgt, cfg->vocab) : tok_ref;
 
 	for (int step = 0; step < n_decode && !self_test_fail; step++) {
 		int pos = n_prefill + step;
 
-		s_cpu_status =
-			compute_forward(&sm_cpu->m, &kv_cpu, &s_cpu, tok_cpu, pos, flash_attn, logits_cpu);
-		kv_cpu.n_pos++;
-		if (cpu->synchronize)
-			cpu->synchronize(cpu);
-		if (s_cpu_status != OK || count_nonfinite(logits_cpu, cfg->vocab) > 0) {
+		s_ref_status =
+			compute_forward(&sm_ref->m, &kv_ref, &s_ref, tok_ref, pos, flash_attn, logits_ref);
+		kv_ref.n_pos++;
+		if (ref->synchronize)
+			ref->synchronize(ref);
+		if (s_ref_status != OK || count_nonfinite(logits_ref, cfg->vocab) > 0) {
 			snprintf(label, sizeof(label), "arch.generate[%s] decode step %d", arch_name, step);
-			snprintf(detail, sizeof(detail), "CPU self-test failure: status=%d nonfinite=%d/%d",
-					 s_cpu_status,
-					 s_cpu_status == OK ? count_nonfinite(logits_cpu, cfg->vocab) : -1, cfg->vocab);
+			snprintf(detail, sizeof(detail), "REF self-test failure: status=%d nonfinite=%d/%d",
+					 s_ref_status,
+					 s_ref_status == OK ? count_nonfinite(logits_ref, cfg->vocab) : -1, cfg->vocab);
 			record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
 			break;
 		}
@@ -1384,23 +1384,23 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 			if (tgt->synchronize)
 				tgt->synchronize(tgt);
 			snprintf(label, sizeof(label), "arch.generate[%s] decode step %d", arch_name, step);
-			verdict v = classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
+			verdict v = classify_output("loose", logits_ref, logits_tgt, cfg->vocab, s_tgt_status,
 										detail, sizeof(detail));
 			if (v != V_PASS && v != V_SKIP)
-				compute_debug(logits_cpu, logits_tgt, cfg->vocab);
+				compute_debug(logits_ref, logits_tgt, cfg->vocab);
 			record_result(OPFAM_ARCH_GENERATE, label, v, detail);
 
-			int32_t am_cpu = sampler_argmax(logits_cpu, cfg->vocab);
+			int32_t am_ref = sampler_argmax(logits_ref, cfg->vocab);
 			int32_t am_tgt = sampler_argmax(logits_tgt, cfg->vocab);
-			n_agree += (am_cpu == am_tgt);
+			n_agree += (am_ref == am_tgt);
 			n_steps++;
-			tok_cpu = am_cpu;
+			tok_ref = am_ref;
 			tok_tgt = am_tgt;
 		} else {
 			snprintf(label, sizeof(label), "arch.generate[%s] decode step %d", arch_name, step);
-			snprintf(detail, sizeof(detail), "finite output (CPU self-test only)");
+			snprintf(detail, sizeof(detail), "finite output (REF self-test only)");
 			record_result(OPFAM_ARCH_GENERATE, label, V_PASS, detail);
-			tok_cpu = sampler_argmax(logits_cpu, cfg->vocab);
+			tok_ref = sampler_argmax(logits_ref, cfg->vocab);
 		}
 	}
 
@@ -1409,45 +1409,45 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 			   n_decode, n_agree, n_steps);
 	}
 
-	free(logits_cpu);
+	free(logits_ref);
 	free(logits_tgt);
 	free(prompt);
-	compute_scratch_free(&s_cpu);
-	kvcache_free(&kv_cpu);
+	compute_scratch_free(&s_ref);
+	kvcache_free(&kv_ref);
 	if (sm_tgt) {
 		compute_scratch_free(&s_tgt);
 		kvcache_free(&kv_tgt);
 	}
-	synth_model_free(sm_cpu);
+	synth_model_free(sm_ref);
 	if (sm_tgt)
 		synth_model_free(sm_tgt);
 }
 
-void run_arch_tests(backend *cpu, backend *tgt) {
+void run_arch_tests(backend *ref, backend *tgt) {
 	printf("\n========================================\n");
 	if (tgt)
-		printf("Architecture-level tests: %s  vs  %s (reference)\n", tgt->name, cpu->name);
+		printf("Architecture-level tests: %s  vs  %s (reference)\n", tgt->name, ref->name);
 	else
-		printf("Architecture-level tests: %s (self-test)\n", cpu->name);
+		printf("Architecture-level tests: %s (self-test)\n", ref->name);
 	printf("========================================\n");
 
 	if (tgt) {
-		test_arch_single_layer(cpu, tgt, &ARCH_CFG_SMALL, 0);
-		test_arch_single_layer(cpu, tgt, &ARCH_CFG_SMALL, 1);
+		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 0);
+		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 1);
 		flush_family(OPFAM_ARCH_LAYER);
 
-		test_arch_pipeline(cpu, tgt, &ARCH_CFG_SMALL, 8, 0);
-		test_arch_pipeline(cpu, tgt, &ARCH_CFG_SMALL, 8, 1);
-		test_arch_pipeline(cpu, tgt, &ARCH_CFG_SMALL, 16, 1);
-		test_arch_pipeline(cpu, tgt, &ARCH_CFG_DEEPER, 16, 1);
-		test_arch_pipeline(cpu, tgt, &ARCH_CFG_DEEPER, 32, 1);
+		test_arch_pipeline(ref, tgt, &ARCH_CFG_SMALL, 8, 0);
+		test_arch_pipeline(ref, tgt, &ARCH_CFG_SMALL, 8, 1);
+		test_arch_pipeline(ref, tgt, &ARCH_CFG_SMALL, 16, 1);
+		test_arch_pipeline(ref, tgt, &ARCH_CFG_DEEPER, 16, 1);
+		test_arch_pipeline(ref, tgt, &ARCH_CFG_DEEPER, 32, 1);
 		flush_family(OPFAM_ARCH_PIPELINE);
 
-		test_arch_decode_chain(cpu, tgt, &ARCH_CFG_SMALL, 8, 8, 1);
-		test_arch_decode_chain(cpu, tgt, &ARCH_CFG_DEEPER, 16, 8, 1);
+		test_arch_decode_chain(ref, tgt, &ARCH_CFG_SMALL, 8, 8, 1);
+		test_arch_decode_chain(ref, tgt, &ARCH_CFG_DEEPER, 16, 8, 1);
 		flush_family(OPFAM_ARCH_DECODE);
 
-		test_arch_error_compounding(cpu, tgt, &ARCH_CFG_SMALL, 16, 1);
+		test_arch_error_compounding(ref, tgt, &ARCH_CFG_SMALL, 16, 1);
 		flush_family(OPFAM_ARCH_COMPOUND);
 	}
 
@@ -1457,17 +1457,19 @@ void run_arch_tests(backend *cpu, backend *tgt) {
 		ARCH_GLM_DSA,
 	};
 	for (size_t gi = 0; gi < ARRAY_LEN(generate_archs); gi++) {
-		test_arch_generate(cpu, tgt, generate_archs[gi], &ARCH_CFG_SMALL, 16,
+		test_arch_generate(ref, tgt, generate_archs[gi], &ARCH_CFG_SMALL, 16,
 						   ARCH_GENERATE_N_DECODE, 1);
 	}
-	test_arch_generate(cpu, tgt, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, ARCH_GENERATE_N_DECODE, 1);
-	test_arch_generate(cpu, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA, 16, ARCH_GENERATE_N_DECODE, 1);
-	test_arch_generate(cpu, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 16, ARCH_GENERATE_N_DECODE, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA, 8, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 8, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 8, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GEMMA4, &ARCH_CFG_SMALL, 8, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 8, 1);
-	test_arch_batch_vs_single(cpu, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, 1);
+	test_arch_generate(ref, tgt, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, ARCH_GENERATE_N_DECODE, 1);
+	test_arch_generate(ref, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA, 16, ARCH_GENERATE_N_DECODE, 1);
+	test_arch_generate(ref, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 16, ARCH_GENERATE_N_DECODE, 1);
+	test_arch_generate(ref, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 16,
+					   ARCH_GENERATE_N_DECODE, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA, 8, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 8, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 8, 1);
+	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL, 8, 1);
+	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 8, 1);
+	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, 1);
 	flush_family(OPFAM_ARCH_GENERATE);
 }

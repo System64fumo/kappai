@@ -86,19 +86,19 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		return 1;
 	}
 
-	backend *cpu = NULL;
-	if (backend_create(sel.ref, 0, &cpu) != OK) {
+	backend *ref = NULL;
+	if (backend_create(sel.ref, 0, &ref) != OK) {
 		fprintf(stderr, "ERROR: reference backend '%s' is unavailable\n", sel.ref);
 		return 1;
 	}
-	if (cpu->desc)
-		printf("reference backend: %s  (%s)\n", cpu->name, cpu->desc);
+	if (ref->desc)
+		printf("reference backend: %s  (%s)\n", ref->name, ref->desc);
 	else
-		printf("reference backend: %s\n", cpu->name);
+		printf("reference backend: %s\n", ref->name);
 
 	synth_suite_common_init();
 
-	run_arch_tests(cpu, NULL);
+	run_arch_tests(ref, NULL);
 
 	run_sampler_tests();
 	flush_family(OPFAM_SAMPLER);
@@ -106,7 +106,7 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	flush_family(OPFAM_TOKENIZER);
 	run_jinja_tests();
 	flush_family(OPFAM_EDGE_CASE);
-	run_hybrid_state_tests(cpu);
+	run_hybrid_state_tests(ref);
 	flush_family(OPFAM_HYBRID_STATE);
 	run_orchestration_tests();
 	flush_family(OPFAM_ORCHESTRATION);
@@ -140,18 +140,18 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 			continue;
 		}
 		any_run = 1;
-		run_per_op_tests(cpu, tgt);
-		run_arch_tests(cpu, tgt);
+		run_per_op_tests(ref, tgt);
+		run_arch_tests(ref, tgt);
 		backend_destroy(tgt);
 	}
 	if (!any_run) {
 		fprintf(stderr, "No matching/available backends were tested.\n");
 		usage(argv[0]);
-		backend_destroy(cpu);
+		backend_destroy(ref);
 		return 1;
 	}
 	print_final_results();
-	backend_destroy(cpu);
+	backend_destroy(ref);
 	return g_fail > 0 ? 1 : 0;
 }
 
@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
 	}
 	for (int ai = 1; ai < argc; ai++) {
 		if (strcmp(argv[ai], "--bench") == 0)
-			return run_matmul_bench_mode(argc, argv, infos, n_backends);
+			return run_bench_mode(argc, argv, infos, n_backends);
 	}
 	for (int ai = 1; ai < argc; ai++) {
 		if (argv[ai][0] == '-' && argv[ai][1] == '-' && argv[ai][2] != '\0' &&

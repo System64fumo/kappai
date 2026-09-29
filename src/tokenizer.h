@@ -34,18 +34,34 @@ typedef struct tok_hash_entry {
 } tok_hash_entry;
 
 typedef struct {
+	const char	  *key;
+	const int32_t *ids;
+	uint32_t	   key_len;
+	uint32_t	   n_ids;
+} tok_cache_entry;
+
+typedef struct {
 	vocab_token			  *tokens;
 	struct tok_hash_entry *hash;
 	struct tok_hash_entry *merge_hash;
 	char				 **merge_keys;
+	int32_t				  *merge_token_ids;
+	int32_t				  *token_decoded_len;
+	int32_t				  *token_char_count;
 	int32_t				  *special_ids;
 	int32_t				  *special_by_first_byte;
+	int32_t				  *decoded_off;
+	char				  *decoded_pool;
 	void				  *bpe_work;
 	char				  *bpe_arena;
 	str_builder			   bpe_sp;
 	str_builder			   gpt2_scratch;
 	void				  *bpe_pcs_cache;
 	str_arena			   merge_pool;
+	tok_cache_entry		  *chunk_cache;
+	str_arena			   chunk_cache_pool;
+	uint32_t			   chunk_cache_cap;
+	uint32_t			   chunk_cache_used;
 	uint32_t			   n_tokens;
 	int32_t				   bos_id, eos_id, eot_id, pad_id, unk_id;
 	uint32_t			   n_byte_fallback;
@@ -58,6 +74,7 @@ typedef struct {
 	uint32_t			   bpe_arena_cap;
 	uint32_t			   bpe_pcs_cache_cap;
 	int32_t				   byte_fallback_ids[256];
+	int32_t				   byte_vocab_ids[256];
 	int16_t				  *token_id_to_byte;
 	uint32_t			   special_by_first_byte_off[257];
 	bool				   add_bos, add_eos;

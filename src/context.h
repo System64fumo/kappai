@@ -52,6 +52,9 @@ typedef struct {
 		int		 cap;
 		int32_t	 n;
 	} fed_ids;
+
+	char   *sync_render;
+	int32_t sync_tok;
 } context;
 
 typedef struct {

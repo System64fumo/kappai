@@ -825,9 +825,9 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 		return;
 	}
 
-	think_filter_event tev =
-		think_filter_feed(&g->think, id, g->st->ctx->chat.think_start_id,
-						  g->st->ctx->chat.think_end_id, g->st->ctx->chat.think_open, &piece, &n);
+	think_filter_event tev = think_filter_feed(
+		&g->think, id, g->st->ctx->chat.think_start_id, g->st->ctx->chat.think_end_id,
+		g->st->ctx->chat.think_open, g->st->ctx->chat.think_label_line, &piece, &n);
 	if (tev != THINK_EMIT)
 		return;
 	if (n <= 0)

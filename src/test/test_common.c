@@ -72,6 +72,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_ARCH_GENERATE]	 = "arch.generate",
 		[OPFAM_MATMUL_RESIDUAL]	 = "matmul_residual",
 		[OPFAM_ROPE_QK]			 = "rope_qk",
+		[OPFAM_BATCH_PARITY]	 = "batch_parity",
 		[OPFAM_EDGE_CASE]		 = "edge_case",
 		[OPFAM_REPACK_PARITY]	 = "repack_parity",
 		[OPFAM_KV_QUANT_PARITY]	 = "kv_quant_parity",
@@ -189,7 +190,7 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 	const int dbg_cap = (int)sizeof(g_debug_buf);
 
 	int off = snprintf(g_debug_buf, sizeof(g_debug_buf),
-					   "CPU:  min=%+.4e  max=%+.4e  mean=%+.4e  |max|=%.4e  nf=%d/%d\n"
+					   "REF:  min=%+.4e  max=%+.4e  mean=%+.4e  |max|=%.4e  nf=%d/%d\n"
 					   "TGT:  min=%+.4e  max=%+.4e  mean=%+.4e  |max|=%.4e  nf=%d/%d\n"
 					   "err:  p50=%.3e  p90=%.3e  p99=%.3e  max=%.3e  (%d valid)",
 					   r_min, r_max, r_mean, r_maxabs, r_nf, n, g_min, g_max, g_mean, g_maxabs,
@@ -205,7 +206,7 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 				int rem = dbg_cap - off;
 				if (rem > 0)
 					off += snprintf(g_debug_buf + off, (size_t)rem,
-									"\nfirst NaN/Inf: TGT[%d]=%f (CPU=%f)", i, y_got[i],
+									"\nfirst NaN/Inf: TGT[%d]=%f (REF=%f)", i, y_got[i],
 									i < n ? y_ref[i] : 0.0f);
 				if (off > dbg_cap)
 					off = dbg_cap;
@@ -223,7 +224,7 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 		if (scale > 1e-8f && diff / scale > 0.01f) {
 			int rem = dbg_cap - off;
 			if (rem > 0)
-				off += snprintf(g_debug_buf + off, (size_t)rem, "%s[%d] CPU=%+.6f TGT=%+.6f",
+				off += snprintf(g_debug_buf + off, (size_t)rem, "%s[%d] REF=%+.6f TGT=%+.6f",
 								shown == 0 ? "\nmismatch: " : ", ", i, y_ref[i], y_got[i]);
 			if (off > dbg_cap)
 				off = dbg_cap;
@@ -242,7 +243,7 @@ void compute_debug(const float *y_ref, const float *y_got, int n) {
 			if (rem2 <= 0)
 				break;
 			off += snprintf(g_debug_buf + off, (size_t)rem2,
-							"\n  [%2d] CPU=%+.6e  TGT=%+.6e  diff=%.3e", i, y_ref[i], y_got[i],
+							"\n  [%2d] REF=%+.6e  TGT=%+.6e  diff=%.3e", i, y_ref[i], y_got[i],
 							isfinite(y_ref[i]) && isfinite(y_got[i]) ? fabsf(y_ref[i] - y_got[i])
 																	 : (float)INFINITY);
 			if (off > dbg_cap)
@@ -517,6 +518,48 @@ void seed_test_rng(uint64_t s) {
 	g_seed = s ? s : 0x9E3779B97F4A7C15ULL;
 }
 
+static inline uint32_t test_f32_to_bits(float f) {
+	uint32_t b;
+	memcpy(&b, &f, sizeof(b));
+	return b;
+}
+
+static inline float test_f32_from_bits(uint32_t b) {
+	float f;
+	memcpy(&f, &b, sizeof(f));
+	return f;
+}
+
+float test_f16_to_f32(uint16_t h) {
+	uint32_t w			  = (uint32_t)h << 16;
+	uint32_t sign		  = w & 0x80000000u;
+	uint32_t two_w		  = w + w;
+	uint32_t exp_offset	  = 0xE0u << 23;
+	float	 exp_scale	  = 0x1.0p-112f;
+	float	 normalized	  = test_f32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
+	uint32_t magic_mask	  = 126u << 23;
+	float	 denormalized = test_f32_from_bits((two_w >> 17) | magic_mask) - 0.5f;
+	uint32_t cutoff		  = 1u << 27;
+	uint32_t bits = two_w < cutoff ? test_f32_to_bits(denormalized) : test_f32_to_bits(normalized);
+	return test_f32_from_bits(sign | bits);
+}
+
+uint16_t test_f32_to_f16(float f) {
+	float	 base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
+	uint32_t w		= test_f32_to_bits(f);
+	uint32_t shl1_w = w + w;
+	uint32_t sign	= w & 0x80000000u;
+	uint32_t bias	= shl1_w & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	base			   = test_f32_from_bits((bias >> 1) + 0x07800000u) + base;
+	uint32_t bits	   = test_f32_to_bits(base);
+	uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
+	uint32_t mant_bits = bits & 0x0FFFu;
+	uint32_t nonsign   = exp_bits + mant_bits;
+	return (uint16_t)((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
+}
+
 void fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t type) {
 	uint8_t *bp = blocks;
 	for (int i = 0; i < n_blocks; i++) {
@@ -529,18 +572,18 @@ void fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t
 					bp[j] = (uint8_t)0x81;
 
 		float	 d_val = 0.0005f + (0.02f * ((next_u32() % 997) / 997.0f));
-		uint16_t d16   = f32_to_f16(d_val);
+		uint16_t d16   = test_f32_to_f16(d_val);
 		if (type == GGML_TYPE_Q6_K) {
 			memcpy(bp + 208, &d16, 2);
 		} else {
 			memcpy(bp, &d16, 2);
 			if (type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1) {
 				float	 m_val = -0.01f + (0.02f * ((next_u32() % 997) / 997.0f));
-				uint16_t m16   = f32_to_f16(m_val);
+				uint16_t m16   = test_f32_to_f16(m_val);
 				memcpy(bp + 2, &m16, 2);
 			} else if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
 				float	 dmin_val = 0.0002f + (0.005f * ((next_u32() % 997) / 997.0f));
-				uint16_t dmin16	  = f32_to_f16(dmin_val);
+				uint16_t dmin16	  = test_f32_to_f16(dmin_val);
 				memcpy(bp + 2, &dmin16, 2);
 			}
 		}
@@ -558,7 +601,7 @@ void fill_random_f32(float *x, int n, float scale) {
 void fill_random_f16(uint16_t *x, int n) {
 	for (int i = 0; i < n; i++) {
 		int32_t r = (int32_t)(next_u32() % 2001) - 1000;
-		x[i]	  = f32_to_f16((float)r / 1000.0f);
+		x[i]	  = test_f32_to_f16((float)r / 1000.0f);
 	}
 }
 
@@ -572,71 +615,54 @@ void fill_random_bf16(uint16_t *x, int n) {
 	}
 }
 
-void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_q8_0_to_q8_0_r8_rows(src, dst, 0, n_rows, k);
+status_code test_repack(backend *b, uint32_t src_type, const void *src, void *dst, int n_rows,
+						int k) {
+	if (!b || !b->repack_weight)
+		return ERR_UNSUPPORTED;
+	return b->repack_weight(b, src_type, src, dst, n_rows, k);
 }
 
-void repack_q4_0_to_q4_0_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_q4_0_to_q4_0_r8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_iq3_s_to_iq3_s_re8(const void *src, void *dst, int n_rows, int k) {
-	repack_iq3_s_to_iq3_s_re8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_iq4_nl_to_iq4_nl_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_iq4_nl_to_iq4_nl_r8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_q4_k_to_q4_k_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_q4_k_to_q4_k_r8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_q5_k_to_q5_k_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_q5_k_to_q5_k_r8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_q6_k_to_q6_k_r8(const void *src, void *dst, int n_rows, int k) {
-	repack_q6_k_to_q6_k_r8_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_iq3_s(const void *src, void *dst, int n_rows, int k) {
-	repack_iq3_s_rows(src, dst, 0, n_rows, k);
-}
-
-void repack_iq4_nl_to_q8_0(const void *src, void *dst, int n_rows, int k) {
-	repack_iq4_nl_to_q8_0_rows(src, dst, 0, n_rows, k);
-}
-
-test_repack_fn test_repack_for_type(uint32_t type, uint32_t *base_type_out) {
+int test_repack_base_type(uint32_t type, uint32_t *base_type_out) {
 	switch (type) {
 	case GGML_TYPE_Q4_0_R8:
 		*base_type_out = GGML_TYPE_Q4_0;
-		return repack_q4_0_to_q4_0_r8;
+		return 1;
 	case GGML_TYPE_Q8_0_R8:
 		*base_type_out = GGML_TYPE_Q8_0;
-		return repack_q8_0_to_q8_0_r8;
+		return 1;
 	case GGML_TYPE_IQ4_NL_R8:
 		*base_type_out = GGML_TYPE_IQ4_NL;
-		return repack_iq4_nl_to_iq4_nl_r8;
-	case GGML_TYPE_IQ3_S_RE:
-		*base_type_out = GGML_TYPE_IQ3_S;
-		return repack_iq3_s;
+		return 1;
 	case GGML_TYPE_IQ3_S_RE8:
 		*base_type_out = GGML_TYPE_IQ3_S;
-		return repack_iq3_s_to_iq3_s_re8;
+		return 1;
 	case GGML_TYPE_Q4_K_R8:
 		*base_type_out = GGML_TYPE_Q4_K;
-		return repack_q4_k_to_q4_k_r8;
+		return 1;
 	case GGML_TYPE_Q5_K_R8:
 		*base_type_out = GGML_TYPE_Q5_K;
-		return repack_q5_k_to_q5_k_r8;
+		return 1;
 	case GGML_TYPE_Q6_K_R8:
 		*base_type_out = GGML_TYPE_Q6_K;
-		return repack_q6_k_to_q6_k_r8;
+		return 1;
 	default:
 		*base_type_out = type;
-		return NULL;
+		return 0;
+	}
+}
+
+int test_repack_n_align(uint32_t type) {
+	switch (type) {
+	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_Q4_K_R8:
+	case GGML_TYPE_Q5_K_R8:
+	case GGML_TYPE_Q6_K_R8:
+		return 8;
+	default:
+		return 1;
 	}
 }
 
@@ -652,12 +678,11 @@ int test_type_per_row(uint32_t type) {
 	}
 }
 
-void *test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes) {
+void *test_make_weight(backend *b, const qtype_info *qt, int n_rows, int k, size_t *out_bytes) {
 	int bpr = k / qt->block;
 
-	uint32_t	   base_type;
-	test_repack_fn repack = test_repack_for_type(qt->type, &base_type);
-	if (repack) {
+	uint32_t base_type;
+	if (test_repack_base_type(qt->type, &base_type)) {
 		int	   n_pad	  = (n_rows + 7) & ~7;
 		size_t base_bytes = ggml_row_size(base_type, (size_t)k) / (size_t)bpr;
 		int	   n_base	  = n_pad * bpr;
@@ -666,7 +691,13 @@ void *test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_byte
 
 		size_t bytes = (size_t)n_pad * ggml_row_size(qt->type, (size_t)k);
 		void  *buf	 = xmalloc(bytes);
-		repack(base, buf, n_pad, k);
+		if (test_repack(b, base_type, base, buf, n_pad, k) != OK) {
+			free(base);
+			free(buf);
+			if (out_bytes)
+				*out_bytes = 0;
+			return NULL;
+		}
 		free(base);
 		if (out_bytes)
 			*out_bytes = bytes;
@@ -708,30 +739,53 @@ void *test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_byte
 }
 
 const qtype_info QTYPES[] = {
-	{"q4_0", GGML_TYPE_Q4_0, 32, sizeof(q4_0_block)},
-	{"q4_1", GGML_TYPE_Q4_1, 32, sizeof(q4_1_block)},
-	{"q5_0", GGML_TYPE_Q5_0, 32, sizeof(q5_0_block)},
-	{"q5_1", GGML_TYPE_Q5_1, 32, sizeof(q5_1_block)},
-	{"q8_0", GGML_TYPE_Q8_0, 32, sizeof(q8_0_block)},
-	{"q4_K", GGML_TYPE_Q4_K, 256, sizeof(q4_k_block)},
-	{"q5_K", GGML_TYPE_Q5_K, 256, sizeof(q5_k_block)},
-	{"q6_K", GGML_TYPE_Q6_K, 256, sizeof(q6_k_block)},
-	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, sizeof(iq4_nl_block)},
-	{"iq3_s", GGML_TYPE_IQ3_S, 256, sizeof(iq3_s_block)},
-	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, sizeof(q4_0_block)},
-	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, sizeof(q8_0_block)},
-	{"iq4_nl_r8", GGML_TYPE_IQ4_NL_R8, 32, sizeof(iq4_nl_block)},
-	{"iq3_s_re", GGML_TYPE_IQ3_S_RE, 256, sizeof(iq3_s_block)},
-	{"iq3_s_re8", GGML_TYPE_IQ3_S_RE8, 256, sizeof(iq3_s_block)},
-	{"q4_k_r8", GGML_TYPE_Q4_K_R8, 256, Q4_K_R8_GROUP_BYTES / Q4_K_R8_ROWS},
-	{"q5_k_r8", GGML_TYPE_Q5_K_R8, 256, Q5_K_R8_GROUP_BYTES / Q5_K_R8_ROWS},
-	{"q6_k_r8", GGML_TYPE_Q6_K_R8, 256, Q6_K_R8_GROUP_BYTES / Q6_K_R8_ROWS},
+	{"q4_0", GGML_TYPE_Q4_0, 32, 18},
+	{"q4_1", GGML_TYPE_Q4_1, 32, 20},
+	{"q5_0", GGML_TYPE_Q5_0, 32, 22},
+	{"q5_1", GGML_TYPE_Q5_1, 32, 24},
+	{"q8_0", GGML_TYPE_Q8_0, 32, 34},
+	{"q4_K", GGML_TYPE_Q4_K, 256, 144},
+	{"q5_K", GGML_TYPE_Q5_K, 256, 176},
+	{"q6_K", GGML_TYPE_Q6_K, 256, 210},
+	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, 18},
+	{"iq3_s", GGML_TYPE_IQ3_S, 256, 110},
+	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, 18},
+	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, 34},
+	{"iq4_nl_r8", GGML_TYPE_IQ4_NL_R8, 32, 18},
+	{"iq3_s_re8", GGML_TYPE_IQ3_S_RE8, 256, 134},
+	{"q4_k_r8", GGML_TYPE_Q4_K_R8, 256, 148},
+	{"q5_k_r8", GGML_TYPE_Q5_K_R8, 256, 180},
+	{"q6_k_r8", GGML_TYPE_Q6_K_R8, 256, 210},
 	{"f16", GGML_TYPE_F16, 1, sizeof(uint16_t)},
 	{"bf16", GGML_TYPE_BF16, 1, sizeof(uint16_t)},
 	{"f32", GGML_TYPE_F32, 1, sizeof(float)},
 };
 const int QTYPES_N = (int)(sizeof(QTYPES) / sizeof(QTYPES[0]));
 #define QTYPES_N ((int)(sizeof(QTYPES) / sizeof(QTYPES[0])))
+
+void test_parity_compare(op_family fam, const char *label, const float *y_ref, const float *y_got,
+						 int n, const char *tol_kind) {
+	char	detail[256];
+	verdict v = classify_output(tol_kind, y_ref, y_got, n, OK, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(y_ref, y_got, n);
+	record_result(fam, label, v, detail);
+}
+
+void test_parity_compare_status(op_family fam, const char *label, const float *y_ref,
+								const float *y_got, int n, status_code s_tgt) {
+	char detail[256];
+	if (s_tgt != OK) {
+		verdict v = (s_tgt == ERR_UNSUPPORTED) ? V_SKIP : V_FAIL;
+		if (v == V_SKIP)
+			snprintf(detail, sizeof(detail), "missing native implementation");
+		else
+			snprintf(detail, sizeof(detail), "op status=%d (returned error)", s_tgt);
+		record_result(fam, label, v, detail);
+		return;
+	}
+	test_parity_compare(fam, label, y_ref, y_got, n, "loose");
+}
 
 void print_summary_table(void) {
 	int total_pass = 0;
@@ -801,7 +855,7 @@ void usage(const char *prog) {
 			"Usage:\n"
 			"  %s [--all | <target>...]        per-op validation: target(s) vs default reference\n"
 			"  %s <ref> <target>...            backend-vs-backend: <ref> is the reference\n"
-			"  %s --bench [--all | <backend>]   per-quant matmul GFLOPS per backend\n"
+			"  %s --bench [matmul|attn|dequant|tok|e2e|all] [--all | <backend>]   benchmarks\n"
 			"  %s --model <path> [--all | <b>...]  real-model greedy-decode cross-check\n"
 			"\n"
 			"Modes:\n"
@@ -811,13 +865,15 @@ void usage(const char *prog) {
 			"architectures) --\n"
 			"               catches compounding errors across op chains; reference errors or\n"
 			"               NaN/Inf at any step are always reported as a failure\n"
-			"  --bench      per-quant matmul GFLOPS, every M row count, each backend\n"
+			"  --bench      matmul GFLOPS | attention latency | dequant throughput |\n"
+			"               tokenizer throughput | end-to-end tok/s\n"
+			"               (pick: matmul attn dequant tok e2e all)\n"
 			"  --model      load a real GGUF model and cross-validate greedy decode\n"
 			"\n"
 			"Options:\n"
 			"  --all              run against every available backend\n"
-			"  --n-prefill N      override prefill token count (model mode)\n"
-			"  --n-decode  N      override decode token count (model mode)\n"
+			"  --n-prefill N      override prefill token count (model mode, e2e bench)\n"
+			"  --n-decode  N      override decode token count (model mode, e2e bench)\n"
 			"  -h, --help         this message\n"
 			"\n"
 			"Available backends: ",

@@ -65,7 +65,7 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 		bool first		  = u->think.first_token;
 		bool was_thinking = u->think.in_thinking || (first && think_open);
 		ev = think_filter_feed(&u->think, id, u->think_start_id, u->think_end_id, think_open,
-							   &piece, &n);
+							   u->c && u->c->chat.think_label_line, &piece, &n);
 		if (first && think_open)
 			print_start_thinking();
 		if (ev == THINK_START) {

@@ -75,8 +75,8 @@ static void make_tokens(int32_t *t, int n, uint64_t seed, int vocab) {
 		t[i] = (int32_t)(tsg_rand() % (uint32_t)vocab);
 }
 
-void run_hybrid_state_tests(backend *cpu) {
-	(void)cpu;
+void run_hybrid_state_tests(backend *ref) {
+	(void)ref;
 	char detail[512];
 
 	const uint8_t is_conv[HYB_LAYERS] = {1, 1, 0, 1, 0, 1};

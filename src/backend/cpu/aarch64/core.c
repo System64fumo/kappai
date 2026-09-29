@@ -279,6 +279,45 @@ static void cpu_rope_one_neon(float *v, int n_heads, int head_dim, const float *
 			}
 		}
 	} else {
+		if (n_heads == 1) {
+			float *vh = v;
+			int	   j  = 0;
+			for (; j + 8 <= half; j += 8) {
+				float32x4_t	  c0  = vld1q_f32(rope_cos + j);
+				float32x4_t	  c1  = vld1q_f32(rope_cos + j + 4);
+				float32x4_t	  s0  = vld1q_f32(rope_sin + j);
+				float32x4_t	  s1  = vld1q_f32(rope_sin + j + 4);
+				float32x4_t	  p0  = vld1q_f32(vh + 2 * j);
+				float32x4_t	  p1  = vld1q_f32(vh + 2 * j + 4);
+				float32x4_t	  p2  = vld1q_f32(vh + 2 * j + 8);
+				float32x4_t	  p3  = vld1q_f32(vh + 2 * j + 12);
+				float32x4x2_t t0  = vuzpq_f32(p0, p1);
+				float32x4x2_t t1  = vuzpq_f32(p2, p3);
+				float32x4_t	  v0a = t0.val[0];
+				float32x4_t	  v1a = t0.val[1];
+				float32x4_t	  v0b = t1.val[0];
+				float32x4_t	  v1b = t1.val[1];
+				float32x4_t	  ra0 = vfmsq_f32(vmulq_f32(v0a, c0), v1a, s0);
+				float32x4_t	  rb0 = vfmaq_f32(vmulq_f32(v0a, s0), v1a, c0);
+				float32x4_t	  ra1 = vfmsq_f32(vmulq_f32(v0b, c1), v1b, s1);
+				float32x4_t	  rb1 = vfmaq_f32(vmulq_f32(v0b, s1), v1b, c1);
+				float32x4x2_t z0  = vzipq_f32(ra0, rb0);
+				float32x4x2_t z1  = vzipq_f32(ra1, rb1);
+				vst1q_f32(vh + 2 * j, z0.val[0]);
+				vst1q_f32(vh + 2 * j + 4, z0.val[1]);
+				vst1q_f32(vh + 2 * j + 8, z1.val[0]);
+				vst1q_f32(vh + 2 * j + 12, z1.val[1]);
+			}
+			for (; j < half; j++) {
+				float c			= rope_cos[j];
+				float s			= rope_sin[j];
+				float v0		= vh[2 * j];
+				float v1		= vh[(2 * j) + 1];
+				vh[2 * j]		= (v0 * c) - (v1 * s);
+				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+			}
+			return;
+		}
 		int j = 0;
 		for (; j + 8 <= half; j += 8) {
 			const float32x4_t c0 = vld1q_f32(rope_cos + j);
@@ -677,8 +716,25 @@ static void prequantize_q8_0(const float *restrict qh, int head_dim, q8_preq *ou
 		out->qscale = 0.0f;
 		return;
 	}
-	float amax = 0.0f;
-	for (int i = 0; i < head_dim; i++) {
+	float32x4_t m0 = vdupq_n_f32(0.0f);
+	float32x4_t m1 = vdupq_n_f32(0.0f);
+	float32x4_t m2 = vdupq_n_f32(0.0f);
+	float32x4_t m3 = vdupq_n_f32(0.0f);
+	int			i  = 0;
+	for (; i + 16 <= head_dim; i += 16) {
+		float32x4_t a0 = vld1q_f32(qh + i);
+		float32x4_t a1 = vld1q_f32(qh + i + 4);
+		float32x4_t a2 = vld1q_f32(qh + i + 8);
+		float32x4_t a3 = vld1q_f32(qh + i + 12);
+		m0			   = vmaxq_f32(m0, vabsq_f32(a0));
+		m1			   = vmaxq_f32(m1, vabsq_f32(a1));
+		m2			   = vmaxq_f32(m2, vabsq_f32(a2));
+		m3			   = vmaxq_f32(m3, vabsq_f32(a3));
+	}
+	for (; i + 4 <= head_dim; i += 4)
+		m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(qh + i)));
+	float amax = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)));
+	for (; i < head_dim; i++) {
 		float v = fabsf(qh[i]);
 		if (v > amax)
 			amax = v;
@@ -689,12 +745,32 @@ static void prequantize_q8_0(const float *restrict qh, int head_dim, q8_preq *ou
 		memset(out->qa, 0, (size_t)head_dim);
 		return;
 	}
-	float qinv	= 127.0f / amax;
-	out->qscale = amax / 127.0f;
-	for (int i = 0; i < head_dim; i++) {
+	float qinv		   = 127.0f / amax;
+	out->qscale		   = amax / 127.0f;
+	float32x4_t qinv_v = vdupq_n_f32(qinv);
+	float32x4_t hi_v   = vdupq_n_f32(127.0f);
+	float32x4_t lo_v   = vdupq_n_f32(-128.0f);
+	i				   = 0;
+	for (; i + 16 <= head_dim; i += 16) {
+		float32x4_t a0	= vmulq_f32(vld1q_f32(qh + i), qinv_v);
+		float32x4_t a1	= vmulq_f32(vld1q_f32(qh + i + 4), qinv_v);
+		float32x4_t a2	= vmulq_f32(vld1q_f32(qh + i + 8), qinv_v);
+		float32x4_t a3	= vmulq_f32(vld1q_f32(qh + i + 12), qinv_v);
+		int32x4_t	q0	= vcvtnq_s32_f32(vminq_f32(vmaxq_f32(a0, lo_v), hi_v));
+		int32x4_t	q1	= vcvtnq_s32_f32(vminq_f32(vmaxq_f32(a1, lo_v), hi_v));
+		int32x4_t	q2	= vcvtnq_s32_f32(vminq_f32(vmaxq_f32(a2, lo_v), hi_v));
+		int32x4_t	q3	= vcvtnq_s32_f32(vminq_f32(vmaxq_f32(a3, lo_v), hi_v));
+		int16x8_t	s01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+		int16x8_t	s23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+		vst1q_s8(out->qa + i, vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23)));
+	}
+	for (; i < head_dim; i++) {
 		int q	   = (int)lrintf(qh[i] * qinv);
 		out->qa[i] = (int8_t)(q > 127 ? 127 : (q < -128 ? -128 : q));
 	}
+	int pad_end = (head_dim + 15) & ~15;
+	for (; i < pad_end; i++)
+		out->qa[i] = 0;
 }
 
 static float dot8_q8_0(const q8_preq *restrict q, const uint8_t *restrict block_ptr, int head_dim) {
@@ -710,14 +786,13 @@ static float dot8_q8_0(const q8_preq *restrict q, const uint8_t *restrict block_
 		int				  n	   = head_dim - base;
 		if (n > KV_Q8_0_BLOCK)
 			n = KV_Q8_0_BLOCK;
-		const int8_t *qs  = blk->qs;
-		int32x4_t	  acc = vdupq_n_s32(0);
-		int			  j	  = 0;
-		for (; j + 16 <= n; j += 16)
+		const int8_t *qs	= blk->qs;
+		int32x4_t	  acc	= vdupq_n_s32(0);
+		int			  j		= 0;
+		int			  n_dot = (n + 15) & ~15;
+		for (; j + 16 <= n_dot; j += 16)
 			acc = vdotq_s32(acc, vld1q_s8(qs + j), vld1q_s8(q->qa + base + j));
 		int32_t s = vaddvq_s32(acc);
-		for (; j < n; j++)
-			s += (int32_t)qs[j] * (int32_t)q->qa[base + j];
 		sum += (float)s * (d * q->qscale);
 	}
 	return sum;

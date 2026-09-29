@@ -188,23 +188,32 @@ static size_t orch_rstrip_one_nl(const char *s, size_t len) {
 	return (len > 0 && s[len - 1] == '\n') ? len - 1 : len;
 }
 
-static int32_t orch_expected_delta(context *c, const char *role, const char *content, int add_gen) {
+static int32_t orch_expected_delta_full(context *c, const char *role, const char *content,
+										int add_gen, int32_t *out_full) {
 	char  errbuf[256];
 	char *full = NULL;
 	if (chat_template_preview_next_turn(&c->chat, role, content, add_gen, &full, errbuf,
 										sizeof(errbuf)) != OK ||
 		!full)
 		return -1;
-	const char *prev = c->chat.last_render;
-	size_t		pcmp = orch_rstrip_one_nl(prev, prev ? strlen(prev) : 0);
-	size_t		flen = strlen(full);
-	int32_t		res;
-	if (flen < pcmp || strncmp(full, prev, pcmp) != 0)
-		res = (int32_t)flen;
-	else
-		res = (int32_t)(flen - pcmp);
+	int32_t res = -1;
+	int32_t full_ids[2048];
+	int		n_full = tokenizer_encode_with_specials(&c->tok, full, 0, full_ids, 2048, NULL);
+	if (out_full)
+		*out_full = n_full;
+	if (n_full >= 0) {
+		int32_t common = c->fed_ids.n < n_full ? c->fed_ids.n : n_full;
+		int32_t reuse  = 0;
+		while (reuse < common && c->fed_ids.p[reuse] == full_ids[reuse])
+			reuse++;
+		res = (int32_t)n_full - reuse;
+	}
 	free(full);
 	return res;
+}
+
+static int32_t orch_expected_delta(context *c, const char *role, const char *content, int add_gen) {
+	return orch_expected_delta_full(c, role, content, add_gen, NULL);
 }
 
 static float g_prefix_fworst;
@@ -503,7 +512,9 @@ static void t_prefix_reuse_accounting(void) {
 		record_result(OPFAM_ORCHESTRATION, "prefix.setup", V_FAIL, "context_init failed");
 		return;
 	}
-	int			   ok = 0;
+	int			   ok		  = 0;
+	int			   ids_match  = 0;
+	int			   text_match = 0;
 	gen_capture	   cap1, cap2;
 	sampler_params sp;
 	greedy_params(&sp);
@@ -525,13 +536,13 @@ static void t_prefix_reuse_accounting(void) {
 			break;
 		}
 
-		int32_t delta2 = orch_expected_delta(&c, "user", content2, 1);
-		if (delta2 < 0)
+		int32_t n_full2 = -1;
+		int32_t delta2	= orch_expected_delta_full(&c, "user", content2, 1, &n_full2);
+		if (delta2 < 0 || n_full2 < 0)
 			break;
-		int32_t n_before = c.kv.n_pos;
 		memset(&cap2, 0, sizeof(cap2));
 		g2 = context_chat_turn(&c, "user", content2, true, 5, &sp, gen_capture_cb, &cap2, "");
-		int acct_ok = (g2 == 5 && c.kv.n_pos == n_before + delta2 + g2);
+		int acct_ok = (g2 == 5 && c.kv.n_pos == n_full2 + g2);
 
 		ref_eng r;
 		ref_load(&r, synth_chat_model_path, 1200);
@@ -541,6 +552,22 @@ static void t_prefix_reuse_accounting(void) {
 			snprintf(full, sizeof(full), "%s", c.chat.last_render);
 			int32_t all[1024];
 			int		na = tokenizer_encode_with_specials(&c.tok, full, 0, all, 1024, NULL);
+			{
+				int ncmp  = na < (int)c.kv.n_pos ? na : (int)c.kv.n_pos;
+				int ndiff = 0;
+				for (int i = 0; i < ncmp; i++)
+					if (all[i] != c.fed_ids.p[i])
+						ndiff++;
+				ids_match = (ndiff == 0);
+				if (!ids_match) {
+					char tx_fed[1024], tx_rep[1024];
+					tokenizer_decode(&c.tok, c.fed_ids.p, ncmp, tx_fed, sizeof(tx_fed), NULL);
+					tokenizer_decode(&c.tok, all, ncmp, tx_rep, sizeof(tx_rep), NULL);
+					text_match = (strcmp(tx_fed, tx_rep) == 0);
+				} else {
+					text_match = 1;
+				}
+			}
 			if (!(na == (int)c.kv.n_pos ||
 				  (na == (int)c.kv.n_pos + 1 && full[strlen(full) - 1] == '\n'))) {
 				cont_ok = 0;
@@ -589,21 +616,30 @@ static void t_prefix_reuse_accounting(void) {
 		ref_free(&r);
 
 		ok = acct_ok && cont_ok;
-		snprintf(detail, sizeof(detail),
-				 "turn2: LCP-delta %d tok + gen %d -> n_pos %d (identity wants %d); "
-				 "cache-equivalence vs fresh replay: worst|d|=%.3e%s",
-				 delta2, g2, c.kv.n_pos, n_before + delta2 + g2, g_prefix_fworst,
-				 g_prefix_fworst > 2e-3f
-					 ? " [KNOWN BUG: second-batch session pollution -- escalated]"
-					 : "");
+		if (ok && !ids_match && !text_match) {
+			snprintf(detail, sizeof(detail),
+					 "turn2: LCP-delta %d tok + gen %d -> n_pos %d; fed ids diverge from "
+					 "fresh-render encoding AND decode to different text",
+					 delta2, g2, c.kv.n_pos);
+			ok = 0;
+		} else {
+			snprintf(detail, sizeof(detail),
+					 "turn2: full %d tok + gen %d -> n_pos %d; "
+					 "cache-equivalence vs fresh replay: worst|d|=%.3e%s",
+					 n_full2, g2, c.kv.n_pos, g_prefix_fworst,
+					 !ids_match
+						 ? " (re-encode seam: ids differ, decoded text identical -- expected)"
+						 : "");
+		}
 	} while (0);
 
-	int cache_eq_known_bug = (g_prefix_fworst > 2e-3f);
 	int final_verdict;
 	if (!ok)
 		final_verdict = V_FAIL;
-	else if (cache_eq_known_bug)
-		final_verdict = V_SKIP;
+	else if (!ids_match)
+		final_verdict = text_match ? V_PASS : V_FAIL;
+	else if (g_prefix_fworst > 2e-3f)
+		final_verdict = V_FAIL;
 	else
 		final_verdict = V_PASS;
 
@@ -702,15 +738,16 @@ static void t_interrupt_mid_decode_continues(void) {
 
 	int32_t ids2[512];
 	(void)ids2;
-	int32_t delta2 = orch_expected_delta(&c, "user", "next question", 1);
+	int32_t full2  = -1;
+	int32_t delta2 = orch_expected_delta_full(&c, "user", "next question", 1, &full2);
 	memset(&cap, 0, sizeof(cap));
 	int g2 = context_chat_turn(&c, "user", "next question", true, 4, &sp, gen_capture_cb, &cap, "");
-	int acct = delta2 >= 0 && g2 == 4 && c.kv.n_pos == n_after_t1 + delta2 + 4;
+	int acct = delta2 >= 0 && full2 >= 0 && g2 == 4 && c.kv.n_pos == full2 + 4;
 	int ok	 = acct && !c.session_poisoned;
 	snprintf(detail, sizeof(detail),
 			 "Ctrl+C mid-decode: emitted=%d fed=%d poisoned=0; next turn generated=%d "
-			 "n_pos=%d (identity %d+%d+4)",
-			 g1, fed, g2, c.kv.n_pos, n_after_t1, delta2);
+			 "n_pos=%d (full %d+4)",
+			 g1, fed, g2, c.kv.n_pos, full2);
 	record_result(OPFAM_ORCHESTRATION, "interrupt_mid_decode_next_turn_clean", ok ? V_PASS : V_FAIL,
 				  detail);
 	context_free(&c);

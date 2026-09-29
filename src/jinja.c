@@ -112,8 +112,8 @@ jinja_value *jinja_bool(int b) {
 }
 
 jinja_value *jinja_int(int64_t n) {
-	jinja_value *v = xmalloc(sizeof(*v));
-	v->type = JV_INT;
+	jinja_value *v		= xmalloc(sizeof(*v));
+	v->type				= JV_INT;
 	v->as.integer.value = n;
 	snprintf(v->as.integer.text, sizeof(v->as.integer.text), "%" PRId64, n);
 	arena_track(v);
@@ -121,16 +121,15 @@ jinja_value *jinja_int(int64_t n) {
 }
 
 jinja_value *jinja_float(double n) {
-	jinja_value *v = xmalloc(sizeof(*v));
-	v->type = JV_FLOAT;
+	jinja_value *v		 = xmalloc(sizeof(*v));
+	v->type				 = JV_FLOAT;
 	v->as.floating.value = n;
 	for (int precision = 1; precision <= 17; precision++) {
 		snprintf(v->as.floating.text, sizeof(v->as.floating.text), "%.*g", precision, n);
 		if (!isfinite(n) || strtod(v->as.floating.text, NULL) == n)
 			break;
 	}
-	if (isfinite(n) && !strchr(v->as.floating.text, '.') &&
-		!strchr(v->as.floating.text, 'e'))
+	if (isfinite(n) && !strchr(v->as.floating.text, '.') && !strchr(v->as.floating.text, 'e'))
 		strcat(v->as.floating.text, ".0");
 	arena_track(v);
 	return v;
@@ -1451,9 +1450,10 @@ static stmt_node *parse_block(parser *p) {
 	return head;
 }
 
-static const char *k_test_names[] = {
-	"none",	  "null",	 "Null",	 "defined", "undefined", "string", "mapping", "iterable",
-	"number", "integer", "float", "sequence", "boolean", "true",		 "false",  "dict",	  NULL};
+static const char *k_test_names[] = {"none",   "null",	   "Null",	   "defined", "undefined",
+									 "string", "mapping",  "iterable", "number",  "integer",
+									 "float",  "sequence", "boolean",  "true",	  "false",
+									 "dict",   NULL};
 
 static int list_has(const char **list, const char *s) {
 	for (int i = 0; list[i]; i++)
@@ -1958,8 +1958,8 @@ static jinja_value *filter_dictsort(eval_ctx *ctx, jinja_value *base, expr_arg *
 static jinja_value *filter_int(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
 	(void)ctx;
 	(void)args;
-	return jinja_int(base && base->type == JV_INT ? base->as.integer.value :
-											  strtoll(value_as_cstr(base), NULL, 10));
+	return jinja_int(base && base->type == JV_INT ? base->as.integer.value
+												  : strtoll(value_as_cstr(base), NULL, 10));
 }
 
 static jinja_value *filter_first(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
@@ -2207,8 +2207,7 @@ static int is_numeric(const jinja_value *v) {
 }
 
 static long double numeric_value(const jinja_value *v) {
-	return v->type == JV_INT ? (long double)v->as.integer.value :
-		(long double)v->as.floating.value;
+	return v->type == JV_INT ? (long double)v->as.integer.value : (long double)v->as.floating.value;
 }
 
 static int scalar_equal(const jinja_value *a, const jinja_value *b) {
@@ -2227,10 +2226,10 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 		return eval_expr(ctx, e->b);
 	}
 	if (!strcmp(e->op, "+")) {
-		jinja_value *a		  = eval_expr(ctx, e->a);
-		jinja_value *b		  = eval_expr(ctx, e->b);
-		const char	*as		  = value_as_cstr(a);
-		const char	*bs		  = value_as_cstr(b);
+		jinja_value *a	= eval_expr(ctx, e->a);
+		jinja_value *b	= eval_expr(ctx, e->b);
+		const char	*as = value_as_cstr(a);
+		const char	*bs = value_as_cstr(b);
 		if (is_numeric(a) && is_numeric(b)) {
 			if (a->type == JV_INT && b->type == JV_INT) {
 				int64_t sum;
@@ -2246,8 +2245,8 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 		return jinja_string_take(sb_finish(&sb));
 	}
 	if (!strcmp(e->op, "-")) {
-		jinja_value *a	= eval_expr(ctx, e->a);
-		jinja_value *b	= eval_expr(ctx, e->b);
+		jinja_value *a = eval_expr(ctx, e->a);
+		jinja_value *b = eval_expr(ctx, e->b);
 		if (is_numeric(a) && is_numeric(b)) {
 			if (a->type == JV_INT && b->type == JV_INT) {
 				int64_t difference;
@@ -2265,16 +2264,16 @@ static jinja_value *eval_binop(eval_ctx *ctx, expr_node *e) {
 	if (!strcmp(e->op, "==") || !strcmp(e->op, "!=")) {
 		jinja_value *a	= eval_expr(ctx, e->a);
 		jinja_value *b	= eval_expr(ctx, e->b);
-		int eq = scalar_equal(a, b);
+		int			 eq = scalar_equal(a, b);
 		return jinja_bool(!strcmp(e->op, "==") ? eq : !eq);
 	}
 	if (!strcmp(e->op, ">") || !strcmp(e->op, "<") || !strcmp(e->op, ">=") ||
 		!strcmp(e->op, "<=")) {
 		jinja_value *a	= eval_expr(ctx, e->a);
 		jinja_value *b	= eval_expr(ctx, e->b);
-		long double la = is_numeric(a) ? numeric_value(a) : atol(value_as_cstr(a));
-		long double lb = is_numeric(b) ? numeric_value(b) : atol(value_as_cstr(b));
-		int r;
+		long double	 la = is_numeric(a) ? numeric_value(a) : atol(value_as_cstr(a));
+		long double	 lb = is_numeric(b) ? numeric_value(b) : atol(value_as_cstr(b));
+		int			 r;
 		if (!strcmp(e->op, ">"))
 			r = la > lb;
 		else if (!strcmp(e->op, "<"))
@@ -2316,7 +2315,7 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 	case EX_NUMBER: {
 		if (strchr(e->str, '.'))
 			return jinja_float(strtod(e->str, NULL));
-		errno = 0;
+		errno		= 0;
 		long long n = strtoll(e->str, NULL, 10);
 		return errno == ERANGE ? jinja_float(strtod(e->str, NULL)) : jinja_int(n);
 	}

@@ -295,7 +295,18 @@ static __attribute__((unused)) void tsg_build_vocab_file(const char *path, const
 	tsg_tensor_free_all(&w);
 }
 
-#define TSG_CHAT_VOCAB 357
+#define TSG_CHAT_VOCAB 373
+#define TSG_CHAT_N_MERGES 16
+
+static __attribute__((unused)) const char *tsg_chat_merges[TSG_CHAT_N_MERGES] = {
+	"t h", "h e", "th e", "a n", "an d", "i n", "e r", "r e",
+	"o n", "a t", "e s",  "o r", "l e",	 "m e", "i s", "i t",
+};
+
+static __attribute__((unused)) const char *tsg_chat_merged[TSG_CHAT_N_MERGES] = {
+	"th", "he", "the", "an", "and", "in", "er", "re",
+	"on", "at", "es",  "or", "le",	"me", "is", "it",
+};
 
 static __attribute__((unused)) void tsg_build_chat_vocab_arrays(char (*storage)[8],
 																const char **toks, int32_t *types) {
@@ -327,6 +338,11 @@ static __attribute__((unused)) void tsg_build_chat_vocab_arrays(char (*storage)[
 	snprintf(storage[id], 8, "<eos>");
 	toks[id]	= storage[id];
 	types[id++] = TSG_TOK_CONTROL;
+	for (int i = 0; i < TSG_CHAT_N_MERGES; i++) {
+		snprintf(storage[id], 8, "%s", tsg_chat_merged[i]);
+		toks[id]	= storage[id];
+		types[id++] = TSG_TOK_NORMAL;
+	}
 }
 
 typedef struct {
@@ -368,6 +384,7 @@ static __attribute__((unused)) void tsg_build_chat_llama(const char			  *path,
 	tsg_kv_f32(&w, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
 	tsg_kv_arr_str(&w, "tokenizer.ggml.tokens", toks, TSG_CHAT_VOCAB);
 	tsg_kv_arr_i32(&w, "tokenizer.ggml.token_type", types, TSG_CHAT_VOCAB);
+	tsg_kv_arr_str(&w, "tokenizer.ggml.merges", tsg_chat_merges, TSG_CHAT_N_MERGES);
 	tsg_kv_str(&w, "tokenizer.ggml.model", "gpt2");
 	tsg_kv_i32(&w, "tokenizer.ggml.unknown_token_id", 0);
 	tsg_kv_str(&w, "tokenizer.chat_template", tsg_chat_template);
@@ -380,6 +397,12 @@ static __attribute__((unused)) void tsg_build_chat_llama(const char			  *path,
 		float *outw = tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
 		if (s->output_copies_embd && embd && outw)
 			memcpy(outw, embd, sizeof(float) * (size_t)s->dim * (size_t)V);
+	} else {
+		float *discard = malloc((size_t)s->dim * (size_t)V * sizeof(float));
+		if (!discard)
+			abort();
+		tsg_fill_rand_f32(discard, (size_t)s->dim * (size_t)V, 0.10f);
+		free(discard);
 	}
 	int q_out  = s->n_heads * s->head_dim;
 	int kv_out = s->n_kv_heads * s->head_dim;

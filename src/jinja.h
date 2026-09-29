@@ -29,9 +29,15 @@ struct jinja_dict_entry {
 struct jinja_value {
 	jinja_value_type type;
 	union {
-		bool			  b;
-		struct { int64_t value; char text[32]; } integer;
-		struct { double value; char text[64]; } floating;
+		bool b;
+		struct {
+			int64_t value;
+			char	text[32];
+		} integer;
+		struct {
+			double value;
+			char   text[64];
+		} floating;
 		char			 *s;
 		jinja_dict_entry *dict;
 		struct {
