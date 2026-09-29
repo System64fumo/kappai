@@ -1770,7 +1770,12 @@ __attribute__((weak)) void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 }
 
 void quant_scratch_ensure(quant_scratch *qs, size_t need) {
-	if (qs->q8_buf_elems < need) {
+	/* The NULL test is load-bearing, not defensive: tlocal_cleanup() frees the
+	 * buffer and sets *tls_ptr to NULL but cannot reach the capacity field that
+	 * sits next to it in this struct, so after tlocal_free_all() the count is
+	 * stale while the pointer is NULL. Guarding on the count alone then skipped
+	 * the allocation and handed a NULL dst to quantize_q8_0. */
+	if (!qs->q8_buf || qs->q8_buf_elems < need) {
 		free(qs->q8_buf);
 		qs->q8_buf		 = xmalloc_aligned(need, 64);
 		qs->q8_buf_elems = need;

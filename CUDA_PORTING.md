@@ -295,10 +295,18 @@ dispatch is not the cost).
 
 ### Still broken upstream, not fixed here
 
-- `kappai-test --all` (several backends in one process) segfaults; reproduced on
-  pristine `misc/improvements` with vulkan only.
-- A UBSan null-deref in scalar `quantize_q8_0` and the orchestration
-  prefix-reuse SKIP are pre-existing on `misc/improvements`.
+- `arch.generate[glm-dsa]` decode steps 1 and 2 FAIL against the CUDA target
+  (tol_ratio 1.247 and 16.794). Only reachable via `kappai-test --all`; a
+  single-target run skips the case. Not a precision-mode artifact: the CUDA
+  backend forces strict F32 rather than TF32 (`cuda_kernels.cu`), and the CPU
+  and CUDA logit distributions agree closely, but the per-element error is
+  ~1e-4..1e-3 of the logit range, which is far more than f32 rounding for a
+  well-conditioned reduction. The step-2 ratio of 16.8 is an artifact of the
+  metric itself: its worst element has `|ref|` ~ 1.0, so the relative term
+  collapses while the absolute error is a modest 0.079. A tolerance scaled to
+  the logit dynamic range would be the honest expression of "close enough"
+  here, but that loosens the check for every target, so it is left alone.
+- The orchestration prefix-reuse SKIP is pre-existing on `misc/improvements`.
 - Low severity, tracked: the LFM2 batch path reads part of a batch slot before
   it is fully written, so results depend on whether `bs_ensure_slot` reused an
   existing buffer or allocated a fresh one. Worth ~1e-6 on the 64-vocab
@@ -317,7 +325,18 @@ Both target suites are now clean, which they were not before this branch:
 | --- | --- | --- |
 | `kappai-test cpu_x86_64 cuda` | 446 / 1 fail / 74 skip | **450 / 0 / 74** |
 | `kappai-test cpu_x86_64 vulkan` | 455 / 1 fail / 65 skip | **467 / 0 / 57** |
+| `kappai-test --all` | **SIGSEGV** (exit 139) | 1187 / 2 fail / 138 skip |
 
 The single failure in every suite was `lfm2.kvcache_reset_virgin_state`, because
 `run_hybrid_state_tests()` runs in the common path of all suites rather than per
 target.
+
+`--all` was segfaulting in `quantize_q8_0` via `matmul_generic_f32` in the
+repack-parity tests. `quant_scratch_ensure()` guarded only on the cached element
+count, but `tlocal_cleanup()` frees the buffer and NULLs `*tls_ptr` without being
+able to reach the `q8_buf_elems` field sitting next to it in `quant_scratch`.
+After any `tlocal_free_all()` -- i.e. after a `backend_destroy()` -- the count
+was stale while the pointer was NULL, so the next call skipped the allocation
+and passed a NULL `dst` to `quantize_q8_0`. The guard now also tests the
+pointer. This is the same defect the UBSan build had flagged as a null
+dereference in scalar `quantize_q8_0`; the two reports were one bug.
