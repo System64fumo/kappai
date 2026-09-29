@@ -3751,18 +3751,40 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 	int dev_path_ok = ple_build_dev_path_ok(a, m, 1);
 
 	if (dev_path_ok) {
-		for (int row = 0; row < n_rows; row++) {
-			int	   token	= ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
-			buffer row_view = ctx->bs->ple_all;
-			row_view.offset = (size_t)row * total_ple * sizeof(float);
-			st = a->embd_lookup(a, &m->layer_dims.per_layer_tok_embd.buf,
-								m->layer_dims.per_layer_tok_embd.type, token, total_ple, &row_view);
+		/* Gather the per-layer token embeddings. A device embd_lookup covers one
+		 * token, so a prefill row loop would cost n_rows kernel launches. For
+		 * n_rows > 1 dequantize on the host and upload the batch in one copy;
+		 * single-row decode keeps the device gather (no host round trip). */
+		int gathered_host = 0;
+		if (n_rows > 1 && a->buffer_write_f32 && !backend_has_cap(a, BCAP_IS_HOST)) {
+			float *ple = float_buf_ensure(&ctx->bs->ple_buf, (size_t)n_rows * total_ple);
+			for (int row = 0; row < n_rows; row++) {
+				int token = ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
+				st		 = ple_host_decode_row(&plan, token, ple + (size_t)row * total_ple);
+				if (st != OK)
+					return st;
+			}
+			st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+			if (st != OK)
+				return st;
+			gathered_host = 1;
+		}
+		if (!gathered_host) {
+			for (int row = 0; row < n_rows; row++) {
+				int	   token	= ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
+				buffer row_view = ctx->bs->ple_all;
+				row_view.offset = (size_t)row * total_ple * sizeof(float);
+				st = a->embd_lookup(a, &m->layer_dims.per_layer_tok_embd.buf,
+									m->layer_dims.per_layer_tok_embd.type, token, total_ple,
+									&row_view);
+				if (st != OK)
+					return st;
+			}
+			/* ple_host_decode_row already folds n_embd_sqrt into the row. */
+			st = a->scale_inplace(a, &ctx->bs->ple_all, plan.n_embd_sqrt, n_rows * total_ple);
 			if (st != OK)
 				return st;
 		}
-		st = a->scale_inplace(a, &ctx->bs->ple_all, plan.n_embd_sqrt, n_rows * total_ple);
-		if (st != OK)
-			return st;
 
 		buffer *xb = batch_slot(ctx->bs, RECIPE_SLOT_X);
 
@@ -3785,15 +3807,22 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 		if (st != OK)
 			goto ple_build_cleanup;
 
-		for (int l = 0; l < n_layers; l++) {
-			for (int row = 0; row < n_rows; row++) {
-				buffer x_slice = proj_buf;
-				x_slice.offset =
-					((size_t)row * total_ple + (size_t)l * plan.n_embd_per_layer) * sizeof(float);
-				st = a->rmsnorm(a, &x_slice, &ctx->s->ple_proj_norm_w, &x_slice,
-								plan.n_embd_per_layer, plan.eps);
-				if (st != OK)
-					goto ple_build_cleanup;
+		if (a->ple_norm_batch) {
+			st = a->ple_norm_batch(a, &proj_buf, &ctx->s->ple_proj_norm_w, n_rows, total_ple,
+								   plan.n_embd_per_layer, n_layers, plan.eps);
+			if (st != OK)
+				goto ple_build_cleanup;
+		} else {
+			for (int l = 0; l < n_layers; l++) {
+				for (int row = 0; row < n_rows; row++) {
+					buffer x_slice = proj_buf;
+					x_slice.offset =
+						((size_t)row * total_ple + (size_t)l * plan.n_embd_per_layer) * sizeof(float);
+					st = a->rmsnorm(a, &x_slice, &ctx->s->ple_proj_norm_w, &x_slice,
+									plan.n_embd_per_layer, plan.eps);
+					if (st != OK)
+						goto ple_build_cleanup;
+				}
 			}
 		}
 

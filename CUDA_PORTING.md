@@ -201,21 +201,50 @@ cannot become a 34 B/32-element Q8_0 row through that contract.
 
 ### Performance vs the pre-merge fork (gemma-4 E2B Q8_0, RTX 2070 Max-Q)
 
-| | fork e35ba92 | merged | |
-| --- | --- | --- | --- |
-| PP, 408 tok | 321-338 t/s | 248-273 t/s | -21% |
-| PP, ~2000 tok | 246.9 t/s | 222.3 t/s | -10% |
-| TG | 47.3-47.9 t/s | 46.8-47.0 t/s | parity |
+Measurement caveat: this machine's CUDA PP variance is large, so A/B runs are
+**interleaved** (fork, wip, fork, wip, ...) rather than blocked, and CPU PP varies
+by ±17% run to run. An earlier blocked comparison reported a CPU regression that
+did not survive interleaving.
 
-Decode is at parity. Prefill is slower, and the cause is *not* the kernels: the
-`--time` breakdown shows the merged tree doing slightly *less* profiled GPU work
-(79.2 ms vs 80.6 ms) while taking more wall time, and the gap shrinks as the
-prompt grows. That points at fixed per-op host dispatch added by
-`misc/improvements` (`OP_BACKEND` indirection, `profile_scope` per op, host
-fallback reporting), amortized over prompt length. Chunk sizing is unchanged and
-not a factor: both trees process a 408-token prompt as a single chunk, and
-`-DL2_SIZE_BYTES` is not set, so the L2 clamp in `context_prefill_chunk_size` is
-compiled out.
+| | fork e35ba92 | merged (before) | merged (after) |
+| --- | --- | --- | --- |
+| PP, 408 tok, CUDA (interleaved, 4 pairs) | 305-384 (mean 359) | 321 (3 runs) | 334-342 (mean 338) |
+| PP, 408 tok, CPU (3 runs) | 32.4-45.3 (mean 37.4) | 37.4-38.1 (mean 37.8) | unchanged |
+| TG, CUDA | 45.5-46.1 | 44.8-46.1 | parity |
+
+CPU and decode are at parity; the regression is **CUDA-prefill-specific**.
+
+**Root cause: one kernel launch per token in the PLE batch path.** gemma-4 has
+per-layer embeddings, and `ple_build_batch()` in the merged tree ran the
+per-layer norm as a nested `for layer { for row { a->rmsnorm(...) } }` loop —
+`n_layers * n_rows` launches (35 x 408 = 14280 for one 408-token prompt) — and
+gathered the per-layer token embeddings with a `for row { a->embd_lookup(...) }`
+loop, one launch per token. The pre-merge fork instead issued **one**
+`ple_norm_batch()` and **one** bulk `buffer_write_f32()` for the whole batch.
+
+Note the batching was already written but unreachable: `ple_norm_batch` is
+implemented in `cuda.c` (`cuda_op_ple_norm_batch`, one block per row/layer) yet
+was never called from the engine. `misc/improvements` replaced the batched call
+with the nested loop.
+
+Fix: call `a->ple_norm_batch` when the backend provides it (falling back to the
+nested loop otherwise, so CPU is unaffected), and gather the PLE rows on the host
+with a single bulk upload when `n_rows > 1` on a device backend. Single-row
+decode keeps the device `embd_lookup` (no host round trip). `ple_host_decode_row`
+already folds `n_embd_sqrt` into the row, so the host path skips the separate
+`scale_inplace`. Result: **PP 321 -> 338 t/s** on CUDA, and bit-identical
+generations to the pre-fix binary on Q8_0 / Q4_0 / Q4_K_M / IQ4_NL. The gate is
+`!backend_has_cap(a, BCAP_IS_HOST)`, so CPU provably keeps the old path (verified:
+identical output hash). Vulkan also picks up the bulk gather, but could not be
+validated end to end because gemma-4 exceeds its `maxStorageBufferRange`
+(427 MB vs 128 MB) and the suite has no PLE batch coverage.
+
+Not causes, ruled out by measurement: repack layout (`--repack none` 56.2 vs 45.4
+t/s fork-vs-merged *widens* the gap; `--repack all` 31.9 vs 37.0 favours merged;
+`model_should_repack` and the R8 row geometry are byte-identical between trees);
+chunk sizing (unchanged, single chunk for a 408-token prompt); `OP_BACKEND`
+indirection and `profile_scope` per op (CPU is at parity, so the shared engine
+dispatch is not the cost).
 
 ### Fixes carried on this branch
 
