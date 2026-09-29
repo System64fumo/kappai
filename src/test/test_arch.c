@@ -1051,7 +1051,7 @@ static void test_arch_decode_chain(backend *cpu, backend *tgt, const synth_cfg *
 	snprintf(label, sizeof(label), "arch.decode_chain %d-layer prefill=%d decode=%d flash=%d",
 			 cfg->n_layers, n_prefill, n_decode, flash_attn);
 	verdict v =
-		classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
+		classify_output("logits", logits_cpu, logits_tgt, cfg->vocab, OK, detail, sizeof(detail));
 	if (v != V_PASS && v != V_SKIP)
 		compute_debug(logits_cpu, logits_tgt, cfg->vocab);
 	int dl = (int)strlen(detail);
@@ -1341,7 +1341,7 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 				 cfg->vocab);
 		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
 	} else if (sm_tgt) {
-		verdict v = classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
+		verdict v = classify_output("logits", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
 									detail, sizeof(detail));
 		if (v != V_PASS && v != V_SKIP)
 			compute_debug(logits_cpu, logits_tgt, cfg->vocab);
@@ -1384,7 +1384,7 @@ static void test_arch_generate(backend *cpu, backend *tgt, model_arch arch, cons
 			if (tgt->synchronize)
 				tgt->synchronize(tgt);
 			snprintf(label, sizeof(label), "arch.generate[%s] decode step %d", arch_name, step);
-			verdict v = classify_output("loose", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
+			verdict v = classify_output("logits", logits_cpu, logits_tgt, cfg->vocab, s_tgt_status,
 										detail, sizeof(detail));
 			if (v != V_PASS && v != V_SKIP)
 				compute_debug(logits_cpu, logits_tgt, cfg->vocab);

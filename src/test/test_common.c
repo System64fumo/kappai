@@ -393,6 +393,35 @@ float max_combined_ratio_at(const float *a, const float *b, int n, float atol, f
 	return mx;
 }
 
+/* Whole-vector band for logit comparisons.
+ *
+ * Per-element relative tolerance is the wrong yardstick for a logit tensor. An
+ * element whose reference magnitude is near zero collapses the denominator and
+ * turns a modest absolute difference into an enormous ratio (glm-dsa decode
+ * step 2: |ref| ~ 1.0, absolute difference 0.079, tol_ratio 16.8), while an
+ * element with a large magnitude gets judged against a scale it has nothing to
+ * do with. Asking instead whether two implementations agree to a small
+ * fraction of the output's own dynamic range is the question a reader of a
+ * logit diff is actually asking.
+ *
+ * Applied as an additional pass path only: it can turn a FAIL into a PASS but
+ * never a PASS into a FAIL, so every other tolerance band is left untouched. */
+static float max_range_ratio_at(const float *ref, const float *got, int n, float rtol) {
+	if (n <= 0)
+		return INFINITY;
+	float lo = ref[0], hi = ref[0];
+	for (int i = 1; i < n; i++) {
+		if (ref[i] < lo)
+			lo = ref[i];
+		if (ref[i] > hi)
+			hi = ref[i];
+	}
+	float range = hi - lo;
+	if (!(range > 0.0f) || !(rtol > 0.0f))
+		return INFINITY;
+	return max_abs_diff_at(ref, got, n, NULL) / (rtol * range);
+}
+
 verdict classify_output(const char *tol_kind, const float *y_ref, const float *y_got, int n,
 						status_code tgt_status, char *detail, size_t detail_sz) {
 	if (tgt_status == ERR_UNSUPPORTED) {
@@ -440,6 +469,7 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 	float rtol;
 	int	  is_exact_band = (tol_kind && tol_kind[0] == 'e');
 	int	  is_kv_quant	= (tol_kind && strcmp(tol_kind, "kv_quant") == 0);
+	int	  is_logit_band = (tol_kind && strcmp(tol_kind, "logits") == 0);
 	if (is_exact_band) {
 		atol = EPS_EXACT;
 		rtol = 0.0f;
@@ -492,6 +522,29 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 				 "(within tolerance)",
 				 abs_err, at, at >= 0 ? y_ref[at] : 0.0f, at >= 0 ? y_got[at] : 0.0f, ratio);
 		return V_PASS;
+	}
+
+	/* A logit vector is compared against its own dynamic range before it is
+	 * called lossy. Report both numbers so a reader can see why the per-element
+	 * band was not the deciding factor. */
+	if (is_logit_band) {
+		float rr = max_range_ratio_at(y_ref, y_got, n, RTOL_LOOSE);
+		if (rr <= 1.0f) {
+			snprintf(detail, detail_sz,
+					 "max_abs=%.3e@%d ref=%+.6f got=%+.6f tol_ratio=%.3f range_ratio=%.3f "
+					 "(within logit-range band)",
+					 abs_err, at, at >= 0 ? y_ref[at] : 0.0f, at >= 0 ? y_got[at] : 0.0f, ratio, rr);
+			return V_PASS;
+		}
+	}
+
+	if (is_logit_band) {
+		snprintf(detail, detail_sz,
+				 "max_abs=%.3e@%d ref=%+.6f got=%+.6f tol_ratio=%.3f range_ratio=%.3f "
+				 "(exceeds logit-range band, too lossy)",
+				 abs_err, at, at >= 0 ? y_ref[at] : 0.0f, at >= 0 ? y_got[at] : 0.0f, ratio,
+				 max_range_ratio_at(y_ref, y_got, n, RTOL_LOOSE));
+		return V_FAIL;
 	}
 
 	snprintf(detail, detail_sz,

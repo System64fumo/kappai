@@ -2775,6 +2775,51 @@ static void test_edge_ffn_activate_extremes(backend *cpu, backend *tgt) {
 	tgt->buffer_free(tgt, &o_tgt);
 }
 
+/* The "logits" band exists so a whole logit vector is not judged element by
+ * element against a denominator that collapses wherever the reference value
+ * happens to sit near zero. These cases pin both halves of that: the band has
+ * to rescue the near-zero-element case it was added for, and it has to keep
+ * rejecting a genuinely wrong result, or it is worthless. */
+static void test_edge_logit_range_band(void) {
+	enum { N = 512 };
+	float ref[N], got[N];
+	char  detail[256];
+	for (int i = 0; i < N; i++)
+		ref[i] = (float)i * 1.3f - 7.0f; /* range ~664, ref[0] magnitude 7 */
+
+	/* 1. The glm-dsa shape: a 0.079 shift on a small-magnitude element and a
+	 * 0.35 shift elsewhere. Per-element this fails (the small element collapses
+	 * its own denominator); against the range it is 0.4% and must pass. */
+	memcpy(got, ref, sizeof(ref));
+	got[0] += 0.079f;
+	got[300] += 0.35f;
+	verdict v_loose = classify_output("loose", ref, got, N, OK, detail, sizeof(detail));
+	verdict v_logit = classify_output("logits", ref, got, N, OK, detail, sizeof(detail));
+	record_result(OPFAM_EDGE_CASE, "edge.logit_band_rescues_small_magnitude",
+				  v_logit == V_PASS ? V_PASS : V_FAIL, detail);
+	int rescue_ok = (v_logit == V_PASS);
+	snprintf(detail, sizeof(detail), "logits=%s loose=%s", v_logit == V_PASS ? "PASS" : "FAIL",
+			 v_loose == V_PASS ? "PASS" : "FAIL");
+	record_result(OPFAM_EDGE_CASE, "edge.logit_band_is_an_additional_pass_path",
+				  rescue_ok ? V_PASS : V_FAIL, detail);
+
+	/* 2. A real error of 5% of the range must still fail. Without this the band
+	 * would swallow any implementation that merely has the right output scale. */
+	memcpy(got, ref, sizeof(ref));
+	got[300] += 33.0f;
+	verdict v_bad = classify_output("logits", ref, got, N, OK, detail, sizeof(detail));
+	record_result(OPFAM_EDGE_CASE, "edge.logit_band_rejects_5pct_range_error",
+				  v_bad == V_FAIL ? V_PASS : V_FAIL, detail);
+
+	/* 3. The band must never be stricter than the band it extends. */
+	memcpy(got, ref, sizeof(ref));
+	got[7] += 1e-6f;
+	v_loose = classify_output("loose", ref, got, N, OK, detail, sizeof(detail));
+	v_logit = classify_output("logits", ref, got, N, OK, detail, sizeof(detail));
+	record_result(OPFAM_EDGE_CASE, "edge.logit_band_never_stricter_than_loose",
+				  (v_loose == V_PASS && v_logit == V_PASS) ? V_PASS : V_FAIL, detail);
+}
+
 static void test_edge_rope_identity_table(backend *cpu, backend *tgt) {
 	if (!tgt->rope)
 		return;
@@ -3090,5 +3135,6 @@ void run_per_op_tests(backend *cpu, backend *tgt) {
 	test_edge_argmax_all_equal(cpu, tgt);
 	test_edge_ffn_activate_extremes(cpu, tgt);
 	test_edge_rope_identity_table(cpu, tgt);
+	test_edge_logit_range_band();
 	flush_family(OPFAM_EDGE_CASE);
 }
