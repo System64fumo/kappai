@@ -1,6 +1,5 @@
 #include "backend/backend.h"
 #include "common.h"
-#include "log.h"
 #include "model.h"
 #include "recipe.h"
 

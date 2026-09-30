@@ -24,7 +24,7 @@ void profile_reset(profile *p) {
 	}
 }
 
-const char *stage_name(stage s) {
+static const char *stage_name(stage s) {
 	static const char *names[] = {
 		[STAGE_EMBD]			= "embd_lookup",
 		[STAGE_RMSNORM]			= "rmsnorm",

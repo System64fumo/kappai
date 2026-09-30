@@ -1049,10 +1049,9 @@ static void cpu_attn_head_chunk_neon(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_cache,
-							   const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
-							   int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
-							   int sliding_window, int n_kv_heads_active) {
+status_code cpu_attention_impl(backend *self, const buffer *q, buffer *out, int layer, int pos,
+							   int n_heads, int n_kv_heads, int head_dim, int n_ctx, int flash_attn,
+							   float scale, int sliding_window, int n_kv_heads_active) {
 	cpu_priv *p		   = self->priv;
 	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 	if (n_active <= 0)
@@ -1061,8 +1060,6 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 	int			 n_groups = (n_heads + n_active - 1) / n_active;
 	const float *qf		  = (const float *)cpu_ptr(q);
 	float		*outf	  = (float *)cpu_ptr(out);
-	(void)k_cache;
-	(void)v_cache;
 
 	int hd_stride_elems = head_dim;
 
@@ -1171,17 +1168,20 @@ status_code cpu_attention(backend *self, const buffer *q, const buffer *k_cache,
 						  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
 						  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
 						  int n_kv_heads_active) {
-	return cpu_attention_impl(self, q, k_cache, v_cache, out, layer, pos, n_heads, n_kv_heads,
-							  head_dim, n_ctx, flash_attn, scale, 0, n_kv_heads_active);
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_impl(self, q, out, layer, pos, n_heads, n_kv_heads, head_dim, n_ctx,
+							  flash_attn, scale, 0, n_kv_heads_active);
 }
 
 status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_cache,
 							  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
 							  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
 							  int sliding_window, int n_kv_heads_active) {
-	return cpu_attention_impl(self, q, k_cache, v_cache, out, layer, pos, n_heads, n_kv_heads,
-							  head_dim, n_ctx, flash_attn, scale, sliding_window,
-							  n_kv_heads_active);
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_impl(self, q, out, layer, pos, n_heads, n_kv_heads, head_dim, n_ctx,
+							  flash_attn, scale, sliding_window, n_kv_heads_active);
 }
 
 static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
@@ -1227,13 +1227,10 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code cpu_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
-											const buffer *v_cache, buffer *out, int layer,
+static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buffer *out, int layer,
 											int pos_start, int n_heads, int n_kv_heads,
 											int head_dim, int n_ctx, int flash_attn, float scale,
 											int sliding_window, int n_kv_heads_active, int m) {
-	(void)k_cache;
-	(void)v_cache;
 	cpu_priv *p		   = self->priv;
 	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 	if (n_active <= 0)
@@ -1307,9 +1304,10 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 								const buffer *v_cache, buffer *out, int layer, int pos_start,
 								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 								int flash_attn, float scale, int n_kv_heads_active, int m) {
-	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
-									n_kv_heads, head_dim, n_ctx, flash_attn, scale, 0,
-									n_kv_heads_active, m);
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
+									n_ctx, flash_attn, scale, 0, n_kv_heads_active, m);
 }
 
 status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
@@ -1317,9 +1315,10 @@ status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer
 									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									int flash_attn, float scale, int sliding_window,
 									int n_kv_heads_active, int m) {
-	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
-									n_kv_heads, head_dim, n_ctx, flash_attn, scale, sliding_window,
-									n_kv_heads_active, m);
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
+									n_ctx, flash_attn, scale, sliding_window, n_kv_heads_active, m);
 }
 
 static void cpu_add_inplace_chunk_neon(int begin, int end, int tid, void *ctx) {

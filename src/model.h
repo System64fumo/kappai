@@ -228,16 +228,11 @@ static inline int model_layer_backend_is_host(const model *m, int li) {
 	return b && backend_has_cap(b, BCAP_IS_HOST);
 }
 
-static inline int model_mixed_backend_mode(const model *m) {
-	return m && m->mixed_backend_mode;
-}
-
 status_code model_set_layer_backend_range(model *m, int begin, int end, backend *b);
 status_code model_build_weight_refs(model *m);
 
-static inline int model_layer_is_sliding(const model *m, int li) {
-	return m->sliding_window > 0 && m->layers[li].is_sliding;
-}
+#define model_mixed_backend_mode(m) ((m) && (m)->mixed_backend_mode)
+#define model_layer_is_sliding(m, li) ((m)->sliding_window > 0 && (m)->layers[li].is_sliding)
 
 static inline int model_layer_head_dim(const model *m, int li) {
 	if (!m->arch_info->has_variable_layer_dims)

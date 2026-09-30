@@ -72,8 +72,8 @@ typedef struct {
 	bool			producer_done;
 	bool			client_gone;
 
-	toolcall_buf content;
-	toolcall_buf reasoning;
+	str_builder content;
+	str_builder reasoning;
 
 	char  *stop_window;
 	size_t stop_window_cap;
@@ -804,7 +804,7 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	}
 
 	if (!g->chat_api) {
-		toolcall_buf_append(&g->content, piece, (size_t)n);
+		sb_putb(&g->content, piece, (size_t)n);
 		check_stop_sequences(g);
 		if (g->stopped_by_stop) {
 			g->st->ctx->interrupt = 1;
@@ -833,8 +833,8 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	if (n <= 0)
 		return;
 
-	toolcall_buf *dst = g->think.in_thinking ? &g->reasoning : &g->content;
-	toolcall_buf_append(dst, piece, (size_t)n);
+	str_builder *dst = g->think.in_thinking ? &g->reasoning : &g->content;
+	sb_putb(dst, piece, (size_t)n);
 	check_stop_sequences(g);
 	if (g->stopped_by_stop) {
 		g->st->ctx->interrupt = 1;
@@ -900,8 +900,8 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 	g->generation_done	 = false;
 	g->prompt_tokens	 = 0;
 	g->generated		 = 0;
-	toolcall_buf_reset(&g->content);
-	toolcall_buf_reset(&g->reasoning);
+	sb_reset(&g->content);
+	sb_reset(&g->reasoning);
 
 	sampler_params sp = {.temperature	 = rc->params.temperature,
 						 .top_k			 = rc->params.top_k,

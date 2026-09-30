@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>

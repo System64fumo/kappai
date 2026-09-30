@@ -1,8 +1,6 @@
 #include "backend/backend.h"
 #include "common.h"
-#include "compute.h"
 #include "kvcache.h"
-#include "log.h"
 #include "model.h"
 #include "moe/moe_common.h"
 #include "moe/moe_stream.h"
@@ -11,7 +9,6 @@
 #include <math.h>
 
 static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int has_matmul_multi) {
-	backend	   *a		   = m->backend;
 	const int	dim		   = m->dim;
 	const int	n_heads	   = m->n_heads;
 	const int	n_kv_heads = m->n_kv_heads;
@@ -58,8 +55,7 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 							  WIDX_POST_ATTN_NORM, eps, STAGE_ADD));
 }
 
-static void build_gemma4_ffn_prefix(op_emitter *e, const model *m, int dim, float eps,
-									int has_matmul_multi) {
+static void build_gemma4_ffn_prefix(op_emitter *e, int dim, float eps, int has_matmul_multi) {
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 	if (has_matmul_multi) {
 		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, 0, 0, dim));
@@ -100,7 +96,7 @@ static model_recipe *build_gemma4_recipe(const model *m) {
 		op_emitter e	  = op_emitter_make(ops, GEMMA4_MAX_OPS, "gemma4");
 		const int  has_mm = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
 		recipe_append_gemma4_attn_block(&e, m, has_mm);
-		build_gemma4_ffn_prefix(&e, m, dim, eps, has_mm);
+		build_gemma4_ffn_prefix(&e, dim, eps, has_mm);
 		build_gemma4_ffn_tail(&e, m, eps, r);
 	}
 
@@ -124,7 +120,7 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 		op_emitter e	  = op_emitter_make(ops, GEMMA4_MOE_MAX_OPS, "gemma4_moe");
 		const int  has_mm = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
 		recipe_append_gemma4_attn_block(&e, m, has_mm);
-		build_gemma4_ffn_prefix(&e, m, dim, eps, has_mm);
+		build_gemma4_ffn_prefix(&e, dim, eps, has_mm);
 
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_XB2, RECIPE_SLOT_FFN_ACT, WIDX_FFN_POST_NORM_1, eps,
 							   STAGE_RMSNORM));

@@ -46,7 +46,6 @@ typedef struct {
 } arch_info;
 
 const arch_info *arch_lookup(model_arch a);
-const arch_info *arch_lookup_by_gguf_name(const char *name);
 
 model_arch arch_detect(const gguf_ctx *g);
 

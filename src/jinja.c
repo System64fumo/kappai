@@ -1,5 +1,5 @@
 #include "jinja.h"
-#include "json_helpers.h"
+#include "json_escape.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -143,7 +143,7 @@ jinja_value *jinja_string(const char *s) {
 	return v;
 }
 
-jinja_value *jinja_string_n(const char *s, size_t n) {
+static jinja_value *jinja_string_n(const char *s, size_t n) {
 	jinja_value *v = xmalloc(sizeof(*v));
 	v->type		   = JV_STRING;
 	v->as.s		   = xmalloc(n + 1);
@@ -154,7 +154,7 @@ jinja_value *jinja_string_n(const char *s, size_t n) {
 	return v;
 }
 
-jinja_value *jinja_string_take(char *s) {
+static jinja_value *jinja_string_take(char *s) {
 	jinja_value *v = xmalloc(sizeof(*v));
 	v->type		   = JV_STRING;
 	v->as.s		   = s ? s : xstrdup("");
@@ -750,9 +750,11 @@ static char *str_unescape(const char *s, size_t len) {
 }
 
 static void perr(parser *p, const char *msg) {
-	char buf[256];
-	snprintf(buf, sizeof(buf), "parse error: %s", msg);
-	strlist_add(&p->diagnostics, xstrdup(buf));
+	str_builder sb;
+	sb_init(&sb);
+	sb_puts(&sb, "parse error: ");
+	sb_puts(&sb, msg);
+	strlist_add(&p->diagnostics, sb_finish(&sb));
 	p->failed = 1;
 }
 
@@ -2642,7 +2644,6 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 			}
 
 			jinja_value *loop_obj = jinja_dict();
-			char		 buf[32];
 			jinja_dict_set(loop_obj, "index0", jinja_int((int64_t)i));
 			jinja_dict_set(loop_obj, "index", jinja_int((int64_t)(i + 1)));
 			jinja_dict_set(loop_obj, "first", jinja_bool(i == 0));

@@ -18,7 +18,7 @@ static const marker_pair marker_pairs[] = {
 	{"", "", MARKER_TOOL_CALL, PAYLOAD_AUTO, "<|eot_id|>", NULL, false},
 };
 
-const marker_pair *marker_registry(size_t *n_pairs) {
+static const marker_pair *marker_registry(size_t *n_pairs) {
 	if (n_pairs)
 		*n_pairs = sizeof(marker_pairs) / sizeof(marker_pairs[0]);
 	return marker_pairs;

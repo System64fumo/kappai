@@ -3,9 +3,11 @@
 #include "config.h"
 #include "log.h"
 #include "memconfig.h"
+#include "model.h"
 #include "moe/moe_stream.h"
 #include "recipe.h"
 
+#include <json-c/json.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

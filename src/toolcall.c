@@ -17,7 +17,7 @@ static atomic_ullong g_call_seq = ATOMIC_VAR_INIT(0);
 struct toolcall_scanner {
 	const marker_pair *fmt;
 
-	toolcall_buf *content;
+	str_builder *content;
 
 	toolcall_content_fn on_content;
 	toolcall_call_fn	on_call;
@@ -25,7 +25,7 @@ struct toolcall_scanner {
 
 	bool		 in_call;
 	bool		 suppressed;
-	toolcall_buf buf;
+	str_builder	 buf;
 	size_t		 scan_pos;
 	size_t		 close_scan;
 	size_t		 open_len;
@@ -559,7 +559,7 @@ static int payload_xmlfunc(const char *p, size_t len, size_t pos, char **name_ou
 			size_t		clen	   = tag_slen + 3;
 			char	   *close_heap = NULL;
 			const char *close_tag;
-			if (clen > sizeof(close_stack)) {
+			if (clen + 1 > sizeof(close_stack)) {
 				close_heap = xmalloc(clen + 1);
 				snprintf(close_heap, clen + 1, "</%s>", tag);
 				close_tag = close_heap;
@@ -665,7 +665,7 @@ static int payload_parse_continuation(const marker_pair *fmt, const char *text, 
 	}
 }
 
-toolcall_scanner *toolcall_scanner_new(const marker_pair *fmt, toolcall_buf *content,
+toolcall_scanner *toolcall_scanner_new(const marker_pair *fmt, str_builder *content,
 									   toolcall_content_fn on_content, toolcall_call_fn on_call,
 									   void *ud) {
 	if (!fmt || fmt->role != MARKER_TOOL_CALL)
@@ -720,7 +720,7 @@ static void emit_content(toolcall_scanner *sc, size_t from, size_t to) {
 		sc->on_content(sc->ud, sc->content->p + from, to - from);
 }
 
-static void suppress_truncate(toolcall_scanner *sc, toolcall_buf *c, size_t emit_end) {
+static void suppress_truncate(toolcall_scanner *sc, str_builder *c, size_t emit_end) {
 	emit_content(sc, sc->scan_pos, emit_end);
 	c->len = emit_end;
 	if (c->p)
@@ -772,7 +772,7 @@ static void advance(toolcall_scanner *sc) {
 		if (sc->suppressed)
 			return;
 		if (!fmt->open[0] && !sc->in_call) {
-			toolcall_buf *c = sc->content;
+			str_builder *c = sc->content;
 			if (!c)
 				return;
 			if (c->len < sc->scan_pos) {
@@ -849,7 +849,7 @@ static void advance(toolcall_scanner *sc) {
 			return;
 		}
 		if (!sc->in_call) {
-			toolcall_buf *c = sc->content;
+			str_builder *c = sc->content;
 			if (!c)
 				return;
 			if (c->len < sc->scan_pos) {
@@ -880,7 +880,7 @@ static void advance(toolcall_scanner *sc) {
 					sc->suppressed = true;
 					return;
 				}
-				toolcall_buf_append(&sc->buf, c->p + k, c->len - (size_t)k);
+				sb_putb(&sc->buf, c->p + k, c->len - (size_t)k);
 				c->len = (size_t)k;
 				if (c->p)
 					c->p[c->len] = '\0';
@@ -938,7 +938,7 @@ static void advance(toolcall_scanner *sc) {
 					buf_consumed++;
 			}
 			if (!any_ok && sc->content)
-				toolcall_buf_append(sc->content, sc->buf.p, total);
+				sb_putb(sc->content, sc->buf.p, total);
 			memmove(sc->buf.p, sc->buf.p + total, sc->buf.len - total);
 			sc->buf.len -= total;
 			if (sc->buf.p)
@@ -947,8 +947,8 @@ static void advance(toolcall_scanner *sc) {
 			sc->close_scan = 0;
 			sc->scan_pos   = sc->content ? sc->content->len : 0;
 			if (sc->buf.len > 0 && sc->content) {
-				toolcall_buf_append(sc->content, sc->buf.p, sc->buf.len);
-				toolcall_buf_reset(&sc->buf);
+				sb_putb(sc->content, sc->buf.p, sc->buf.len);
+				sb_reset(&sc->buf);
 			}
 			continue;
 		}
@@ -962,7 +962,7 @@ static void advance(toolcall_scanner *sc) {
 void toolcall_scanner_feed_capture(toolcall_scanner *sc, const char *piece, size_t n) {
 	if (!sc || !sc->in_call)
 		return;
-	toolcall_buf_append(&sc->buf, piece, n);
+	sb_putb(&sc->buf, piece, n);
 	advance(sc);
 }
 
@@ -976,7 +976,7 @@ void toolcall_scanner_finish(toolcall_scanner *sc) {
 	if (!sc)
 		return;
 	if (sc->suppressed) {
-		toolcall_buf_reset(&sc->buf);
+		sb_reset(&sc->buf);
 		sc->in_call = false;
 		return;
 	}
@@ -996,13 +996,13 @@ void toolcall_scanner_finish(toolcall_scanner *sc) {
 			WARN("incomplete tool call at end of generation; emitting it as content");
 			size_t before = sc->content ? sc->content->len : 0;
 			if (sc->content) {
-				toolcall_buf_append(sc->content, sc->buf.p, sc->buf.len);
+				sb_putb(sc->content, sc->buf.p, sc->buf.len);
 				emit_content(sc, before, sc->content->len);
 			}
 		}
 		free(name);
 		json_object_put(args);
-		toolcall_buf_reset(&sc->buf);
+		sb_reset(&sc->buf);
 		sc->in_call = false;
 	}
 	if (!sc->in_call && sc->content) {

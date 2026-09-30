@@ -2,6 +2,7 @@
 #include "backend.h"
 #include "log.h"
 #include "memconfig.h"
+#include "model.h"
 #include <dirent.h>
 #include <dlfcn.h>
 #include <limits.h>

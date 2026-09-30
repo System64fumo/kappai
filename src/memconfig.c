@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 #include "memconfig.h"
+#include "config.h"
 #include "gguf.h"
+#include "kvcache.h"
 #include "log.h"
+#include "model.h"
 #include "moe/moe_stream.h"
 #include <string.h>
 #include <sys/sysinfo.h>
@@ -186,25 +189,12 @@ static size_t calc_non_expert_bytes(const model *m) {
 	return calc_non_expert_breakdown(m).total;
 }
 
-size_t model_total_weight_bytes(const model *m) {
+static size_t model_total_weight_bytes(const model *m) {
 	size_t non_expert	= calc_non_expert_bytes(m);
 	size_t per_expert	= calc_per_expert_size(m);
 	int	   n_layers		= moe_layer_count(m);
 	size_t total_expert = per_expert * (size_t)m->moe.n_experts * (size_t)n_layers;
 	return non_expert + total_expert;
-}
-
-size_t model_resident_weight_bytes(const model *m, const config *cfg) {
-	int full_resident = !cfg->use_mmap && cfg->moe_stream == 0;
-	if (full_resident || !m->arch_info->is_moe)
-		return model_total_weight_bytes(m);
-
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_layers	  = moe_layer_count(m);
-	int	   cache_cap  = moe_cache_cap(m, cfg);
-
-	size_t resident_expert = per_expert * (size_t)cache_cap * (size_t)n_layers;
-	return calc_non_expert_bytes(m) + resident_expert;
 }
 
 size_t model_pending_weight_bytes(const model *m, const config *cfg) {

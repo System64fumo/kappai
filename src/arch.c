@@ -94,7 +94,7 @@ const arch_info *arch_lookup(model_arch a) {
 	return NULL;
 }
 
-const arch_info *arch_lookup_by_gguf_name(const char *name) {
+static const arch_info *arch_lookup_by_gguf_name(const char *name) {
 	if (!name)
 		return NULL;
 	for (size_t i = 0; i < ARRAY_LEN(k_registry); i++) {

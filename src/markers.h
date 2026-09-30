@@ -28,8 +28,6 @@ typedef struct {
 	bool		   label_line;
 } marker_pair;
 
-const marker_pair *marker_registry(size_t *n_pairs);
-
 const marker_pair *marker_probe(const tokenizer *tok, marker_role role);
 
 const marker_pair *marker_probe_text(const char *text, marker_role role);

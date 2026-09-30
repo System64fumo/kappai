@@ -271,11 +271,6 @@ static int32_t hash_lookup_pair_h(const tok_hash_entry *ht, size_t cap, uint64_t
 	return -1;
 }
 
-static int32_t hash_lookup_pair(const tok_hash_entry *ht, size_t cap, const char *a, size_t an,
-								const char *b, size_t bn) {
-	return hash_lookup_pair_h(ht, cap, fnv1a_update(fnv1a(a, an), b, bn), a, an, b, bn);
-}
-
 static size_t next_pretoken(const char *s, size_t len, size_t *pos) {
 	size_t i = *pos;
 	if (i >= len)
@@ -1496,13 +1491,6 @@ int32_t tokenizer_find_token(const tokenizer *t, const char *text) {
 	}
 
 	return -1;
-}
-
-int tokenizer_starts_with_special(const tokenizer *t, const char *s) {
-	if (!t || !s || !s[0])
-		return 0;
-	size_t at = 0;
-	return find_next_special(t, s, strlen(s), 0, &at) >= 0 && at == 0;
 }
 
 int tokenizer_encode_with_specials(tokenizer *t, const char *text, int add_specials,

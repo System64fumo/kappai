@@ -5,6 +5,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+static inline int kvcache_kv_heads_stride(const kvcache *c) {
+	return c->n_kv_heads_max;
+}
+
+static inline int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer) {
+	if (!c->has_host_kv || !m || !m->mixed_backend_mode)
+		return 0;
+	if (layer < 0 || layer >= m->n_layer_backends)
+		return 0;
+	if (!m->layer_backends[layer])
+		return 0;
+	if (m->layer_backends[layer] == c->backend)
+		return 0;
+	if (!backend_has_cap(m->layer_backends[layer], BCAP_IS_HOST))
+		return 0;
+	return 1;
+}
+
 static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats);
 
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant) {

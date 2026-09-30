@@ -1,6 +1,9 @@
 #ifndef PROFILE_H
 #define PROFILE_H
 
+#include <stdatomic.h>
+#include <stdio.h>
+
 #include "common.h"
 
 typedef enum {
@@ -63,7 +66,5 @@ static inline void profile_end(profile *p, profile_scope *ps) {
 }
 
 void profile_print(const profile *p, const char *label, FILE *fp);
-
-const char *stage_name(stage s);
 
 #endif

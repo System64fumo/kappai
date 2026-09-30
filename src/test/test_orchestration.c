@@ -184,10 +184,6 @@ static int orch_chunk_size(const context *c) {
 	return chunk;
 }
 
-static size_t orch_rstrip_one_nl(const char *s, size_t len) {
-	return (len > 0 && s[len - 1] == '\n') ? len - 1 : len;
-}
-
 static int32_t orch_expected_delta_full(context *c, const char *role, const char *content,
 										int add_gen, int32_t *out_full) {
 	char  errbuf[256];

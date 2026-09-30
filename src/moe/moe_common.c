@@ -1,20 +1,14 @@
 #include "moe/moe_common.h"
 #include "backend/backend.h"
 #include "common.h"
-#include "compute.h"
 #include "config.h"
 #include "kvcache.h"
-#include "log.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
 #include "threadpool.h"
 
 #include <math.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #define MOE_MAX_DIM_STACK 8192
 

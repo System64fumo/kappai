@@ -23,8 +23,6 @@ void monitor_reset(monitor *mon);
 
 void monitor_send(monitor *mon, const char *json_fmt, ...) __attribute__((format(printf, 2, 3)));
 
-void monitor_emit(monitor *mon, const char *json_fmt, ...) __attribute__((format(printf, 2, 3)));
-
 void monitor_poll(monitor *mon);
 
 void monitor_free(monitor *mon);
@@ -34,8 +32,6 @@ static inline int monitor_active(const monitor *mon) {
 }
 
 extern monitor *g_monitor;
-
-int monitor_maybe_emit(void);
 
 void monitor_emit_load_phase_backend(monitor *mon, const char *backend_name);
 void monitor_emit_load_phase_model_start(monitor *mon, const char *model_path);
@@ -67,7 +63,6 @@ typedef struct {
 	int			phase_tokens;
 } monitor_layer_tracker;
 
-void monitor_layer_tracker_init(monitor_layer_tracker *t);
 void monitor_begin_phase(monitor_layer_tracker *t, const char *phase, int token_idx,
 						 int phase_tokens);
 void monitor_record_layer_event(monitor *mon, monitor_layer_tracker *t, int layer_idx, int n_layers,

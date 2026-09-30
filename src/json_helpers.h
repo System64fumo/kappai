@@ -3,55 +3,12 @@
 
 #include <json-c/json.h>
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 
 #include "common.h"
-
-static inline void json_escape_append(str_builder *sb, const char *s, size_t n) {
-	for (size_t i = 0; i < n; i++) {
-		unsigned char c = (unsigned char)s[i];
-		switch (c) {
-		case '"':
-			sb_putb(sb, "\\\"", 2);
-			break;
-		case '\\':
-			sb_putb(sb, "\\\\", 2);
-			break;
-		case '\n':
-			sb_putb(sb, "\\n", 2);
-			break;
-		case '\r':
-			sb_putb(sb, "\\r", 2);
-			break;
-		case '\t':
-			sb_putb(sb, "\\t", 2);
-			break;
-		default:
-			if (c < 0x20) {
-				char buf[8];
-				snprintf(buf, sizeof(buf), "\\u%04x", c);
-				sb_puts(sb, buf);
-			} else {
-				sb_putb(sb, (const char *)&c, 1);
-			}
-			break;
-		}
-	}
-}
-
-static inline size_t json_escape_buf(const char *in, size_t in_len, char *out, size_t out_cap) {
-	str_builder sb;
-	sb_init(&sb);
-	json_escape_append(&sb, in, in_len);
-	size_t n = MIN(sb.len, out_cap > 0 ? out_cap - 1 : 0);
-	if (out_cap > 0) {
-		memcpy(out, sb.p, n);
-		out[n] = '\0';
-	}
-	sb_free(&sb);
-	return n;
-}
+#include "json_escape.h"
 
 static inline struct json_object *json_get(struct json_object *o, const char *key) {
 	struct json_object *v = NULL;
@@ -109,14 +66,6 @@ static inline void json_set_str(struct json_object *o, const char *key, const ch
 
 static inline void json_set_int(struct json_object *o, const char *key, int32_t val) {
 	json_object_object_add(o, key, json_object_new_int(val));
-}
-
-static inline void json_set_int64(struct json_object *o, const char *key, int64_t val) {
-	json_object_object_add(o, key, json_object_new_int64(val));
-}
-
-static inline void json_set_bool(struct json_object *o, const char *key, int val) {
-	json_object_object_add(o, key, json_object_new_boolean(val ? 1 : 0));
 }
 
 static inline struct json_object *json_parse_len_ex_code(const char *s, size_t len, size_t *used,

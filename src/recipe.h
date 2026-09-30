@@ -298,9 +298,7 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 					   int n_group, int topk_group, float *logits, const float *bias,
 					   float *scores_scratch, int *ids_out, float *w_out);
 
-static inline int recipe_exec_is_batch(const exec_ctx *ctx) {
-	return ctx && ctx->bs != NULL;
-}
+#define recipe_exec_is_batch(ctx) ((ctx) && (ctx)->bs != NULL)
 
 status_code op_split_qgate(exec_ctx *ctx);
 status_code op_partial_rope_qk(exec_ctx *ctx);

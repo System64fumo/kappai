@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Development environment setup
-- Run `make config BUILD=release` to configure the project. (Default build target is release-rdbg)
+- Run `make config BUILD=release` to configure the project. (Default build target is debug)
 - Run `make -j$(nproc)` to compile, No need to run `make clean` after making changes.
 
 ## Testing

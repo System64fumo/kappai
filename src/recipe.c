@@ -576,10 +576,6 @@ static weight_ref *resolve_weight_ref(const model *m, int li, uint8_t w_idx) {
 	return w ? w : (weight_ref *)&WEIGHT_REF_NONE;
 }
 
-static const buffer *resolve_weight(const model *m, int li, uint8_t w_idx) {
-	return &resolve_weight_ref(m, li, w_idx)->buf;
-}
-
 static inline weight_ref *exec_weight_ref(const exec_ctx *ctx, uint8_t w_idx) {
 	if (w_idx == RECIPE_NO_WEIGHT || w_idx == WIDX_NONE)
 		return (weight_ref *)&WEIGHT_REF_NONE;
@@ -675,9 +671,8 @@ static status_code matmul_multi_dispatch(backend *a, const buffer *x, const buff
 	return st;
 }
 
-static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *cache,
-									   compute_scratch *s, int li, buffer *slots) {
-	(void)cache;
+static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, compute_scratch *s, int li,
+									   buffer *slots) {
 	profile				*prof = &s->prof;
 	status_code			 st;
 	backend				*a			= model_layer_backend(m, li);
@@ -700,9 +695,8 @@ static status_code op_matmul_multi_qkv(const recipe_op *op, model *m, kvcache *c
 	return st;
 }
 
-static status_code op_matmul_multi_kv(const recipe_op *op, model *m, kvcache *cache,
-									  compute_scratch *s, int li, buffer *slots) {
-	(void)cache;
+static status_code op_matmul_multi_kv(const recipe_op *op, model *m, compute_scratch *s, int li,
+									  buffer *slots) {
 	profile				  *prof = &s->prof;
 	status_code			   st;
 	backend				  *a  = model_layer_backend(m, li);
@@ -733,9 +727,8 @@ static status_code op_matmul_multi_kv(const recipe_op *op, model *m, kvcache *ca
 								 li, prof, op->stage, 0);
 }
 
-static status_code op_matmul_multi_gateup(const recipe_op *op, model *m, kvcache *cache,
-										  compute_scratch *s, int li, buffer *slots) {
-	(void)cache;
+static status_code op_matmul_multi_gateup(const recipe_op *op, model *m, compute_scratch *s, int li,
+										  buffer *slots) {
 	profile				*prof	 = &s->prof;
 	backend				*a		 = model_layer_backend(m, li);
 	const layer_weights *L		 = &m->layers[li];
@@ -1344,8 +1337,8 @@ static status_code op_attention_impl(const recipe_op *op, struct model *m, struc
 	status_code	  st;
 	if (cache->mirror_remap && kvcache_slot_on_host(cache, kv_layer))
 		kv_layer = kvcache_mirror_layer(cache, kv_layer);
-	buffer *kb = kvcache_k_for_layer(cache, m, kv_layer);
-	buffer *vb = kvcache_v_for_layer(cache, m, kv_layer);
+	buffer *kb = kvcache_k_for_layer(cache, kv_layer);
+	buffer *vb = kvcache_v_for_layer(cache, kv_layer);
 	if (use_swa) {
 		backend *t = allow_backend_fallback ? OP_BACKEND(a, attention_swa) : a;
 		st = t->attention_swa(t, &slots[op->in[0]], kb, vb, &slots[op->out], kv_layer, pos, n_heads,
@@ -1490,11 +1483,11 @@ static status_code op_matmul_multi(exec_ctx *ctx) {
 	const layer_weights *L =
 		(ctx->li >= 0 && ctx->li < ctx->m->n_layers) ? &ctx->m->layers[ctx->li] : NULL;
 	if (ctx->op->w_idx == WIDX_WQ && L)
-		return op_matmul_multi_qkv(ctx->op, ctx->m, ctx->cache, ctx->s, ctx->li, slots);
+		return op_matmul_multi_qkv(ctx->op, ctx->m, ctx->s, ctx->li, slots);
 	if (ctx->op->w_idx == WIDX_WK && L)
-		return op_matmul_multi_kv(ctx->op, ctx->m, ctx->cache, ctx->s, ctx->li, slots);
+		return op_matmul_multi_kv(ctx->op, ctx->m, ctx->s, ctx->li, slots);
 	if (ctx->op->w_idx == WIDX_GATE && L)
-		return op_matmul_multi_gateup(ctx->op, ctx->m, ctx->cache, ctx->s, ctx->li, slots);
+		return op_matmul_multi_gateup(ctx->op, ctx->m, ctx->s, ctx->li, slots);
 	return ERR_INVALID_ARG;
 }
 
@@ -2147,7 +2140,7 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 
 	const bool mixed = model_mixed_backend_mode(m);
 	if (mixed) {
-		st = compute_scratch_ensure_mirror(s, m, cache->n_ctx);
+		st = compute_scratch_ensure_mirror(s, m);
 		if (st != OK)
 			return st;
 	}
@@ -3495,7 +3488,6 @@ static status_code moe_shared_batch(exec_ctx *ctx) {
 	moe_shared_plan plan;
 	if (!moe_shared_plan_fill(&plan, ctx->m, ctx->li))
 		return OK;
-	int is_moe	 = plan.is_moe;
 	int sh_inter = plan.sh_inter;
 
 	buffer *xb = batch_slot(ctx->bs, ctx->op->in[0]);
@@ -4073,13 +4065,12 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	return OK;
 }
 
-static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, backend *a,
+static status_code moe_experts_run_sequential(model *m, int K, int dim, backend *a,
 											  moe_expert_slot *slot_buf, const int *expert_ids,
 											  const float *weights, buffer *xb, compute_scratch *s,
 											  int I, int use_gelu, int xb_q8_gate_ok,
 											  uint32_t gate_q8_type, const buffer *xb_q8_gate,
 											  size_t scratch_need, float *outf) {
-	(void)li;
 	float *scratch = float_buf_ensure(&s->moe_scratch, scratch_need / sizeof(float));
 
 	float	*xb_f	  = float_buf_ensure(&s->moe_xb_f, dim);
@@ -4272,8 +4263,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 									  xb, s, I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
 									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
 	} else {
-		st = moe_experts_run_sequential(m, li, K, dim, backend_host(), slot_buf, expert_ids,
-										weights, xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
+		st = moe_experts_run_sequential(m, K, dim, backend_host(), slot_buf, expert_ids, weights,
+										xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
 										&xb_q8_gate, scratch_need, outf);
 	}
 

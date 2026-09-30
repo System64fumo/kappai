@@ -7,7 +7,7 @@
 #include "markers.h"
 #include "tokenizer.h"
 
-#include <json-c/json.h>
+#include <json-c/json_types.h>
 
 typedef struct {
 	char		*role;
@@ -59,9 +59,6 @@ void chat_template_set_tools(chat_template_state *cts, json_object *tools, const
 
 void chat_template_add_message(chat_template_state *cts, const char *role, const char *content);
 void chat_template_add_message_ex(chat_template_state *cts, const chat_message *msg);
-
-status_code chat_template_render(chat_template_state *cts, int add_generation_prompt, char **out,
-								 char *errbuf, size_t errbuf_len);
 
 status_code chat_template_add_turn(chat_template_state *cts, const char *role, const char *content,
 								   int add_generation_prompt, char **out, char *errbuf,

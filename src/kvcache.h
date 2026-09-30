@@ -51,24 +51,6 @@ void		kvcache_reset(kvcache *c);
 
 status_code kvcache_alloc_host_mirror(kvcache *c, const model *m);
 
-static inline int kvcache_kv_heads_stride(const kvcache *c) {
-	return c->n_kv_heads_max;
-}
-
-static inline int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer) {
-	if (!c->has_host_kv || !m || !m->mixed_backend_mode)
-		return 0;
-	if (layer < 0 || layer >= m->n_layer_backends)
-		return 0;
-	if (!m->layer_backends[layer])
-		return 0;
-	if (m->layer_backends[layer] == c->backend)
-		return 0;
-	if (!backend_has_cap(m->layer_backends[layer], BCAP_IS_HOST))
-		return 0;
-	return 1;
-}
-
 static inline int kvcache_mirror_layer(const kvcache *c, int layer) {
 	if (!c->mirror_remap || layer < 0 || layer >= c->n_mirror_remap)
 		return layer;
@@ -84,20 +66,12 @@ static inline int kvcache_slot_on_host(const kvcache *c, int slot) {
 	return c->kv_slot_on_host[slot];
 }
 
-static inline buffer *kvcache_k_for_layer(kvcache *c, const model *m, int layer) {
-	(void)m;
+static inline buffer *kvcache_k_for_layer(kvcache *c, int layer) {
 	return kvcache_slot_on_host(c, layer) ? &c->k_host : &c->k;
 }
 
-static inline buffer *kvcache_v_for_layer(kvcache *c, const model *m, int layer) {
-	(void)m;
+static inline buffer *kvcache_v_for_layer(kvcache *c, int layer) {
 	return kvcache_slot_on_host(c, layer) ? &c->v_host : &c->v;
-}
-
-static inline backend *kvcache_backend_for_layer(kvcache *c, const model *m, int layer) {
-	(void)m;
-	return kvcache_slot_on_host(c, layer) ? (c->k_host.owner ? c->k_host.owner : backend_host())
-										  : (c->k.owner ? c->k.owner : c->backend);
 }
 
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,

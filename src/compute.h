@@ -82,10 +82,6 @@ typedef struct compute_scratch {
 	float_buf	   batch_logits_tmp;
 } compute_scratch;
 
-static inline int compute_model_changed(const compute_scratch *s, const model *m, int n_ctx) {
-	return s->last_model != m || s->allocated_n_ctx < n_ctx;
-}
-
 void		compute_scratch_init(compute_scratch *s);
 void		compute_scratch_free(compute_scratch *s);
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx);
@@ -101,7 +97,7 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 
-status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx);
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
 status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
 static inline backend *compute_active_backend(compute_scratch *s) {

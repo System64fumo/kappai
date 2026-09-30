@@ -3,7 +3,7 @@
 #include "json_helpers.h"
 #include "log.h"
 
-#include <ctype.h>
+#include <json-c/json.h>
 #include <string.h>
 
 static char *patch_template_source(const char *src) {
@@ -380,8 +380,8 @@ static jinja_value *build_globals(chat_template_state *cts, const chat_message *
 	return g;
 }
 
-status_code chat_template_render(chat_template_state *cts, int add_generation_prompt, char **out,
-								 char *errbuf, size_t errbuf_len) {
+static status_code chat_template_render(chat_template_state *cts, int add_generation_prompt,
+										char **out, char *errbuf, size_t errbuf_len) {
 	if (!cts || !cts->prog || !out)
 		return ERR_INVALID_ARG;
 	*out = NULL;
@@ -449,12 +449,8 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 	if (rc != OK)
 		return rc;
 
-	size_t new_len = strlen(rendered);
-	size_t common  = str_lcp_len(rendered, cts->last_render);
-
-	const char *diff	 = rendered + common;
-	size_t		diff_len = new_len - common;
-	cts->think_open		 = false;
+	const char *diff = rendered + str_lcp_len(rendered, cts->last_render);
+	cts->think_open	 = false;
 	if (add_generation_prompt && cts->think_start_text) {
 		const char *last_open = NULL, *last_close = NULL, *p;
 		p = diff;

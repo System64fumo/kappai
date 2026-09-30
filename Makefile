@@ -1,28 +1,29 @@
 CC      ?= gcc
 GLSLC   ?= glslc
+OBJCOPY ?= objcopy
+STRIP   ?= strip
 
 SRC_DIR := src
 OUT_DIR := build
 OBJ_DIR := $(OUT_DIR)/src
 
-BUILD ?= release-rdbg
+BUILD ?= debug
 CPU_ARCH_OPT ?= 1
 BACKENDS ?=
 TSAN ?= 0
 
 HOST_ARCH ?= $(shell uname -m)
-comma := ,
 
 .DEFAULT_GOAL := all
 -include $(OUT_DIR)/config.mk
 
-VALID_BUILDS := debug release-rdbg release
+VALID_BUILDS := debug release
 ifeq ($(filter $(BUILD),$(VALID_BUILDS)),)
   $(error Invalid BUILD='$(BUILD)'. Valid options: $(VALID_BUILDS))
 endif
 
 AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
-REQUESTED_BACKENDS := $(strip $(subst $(comma), ,$(BACKENDS)))
+REQUESTED_BACKENDS := $(strip $(subst $(,), ,$(BACKENDS)))
 UNKNOWN_BACKENDS := $(filter-out $(AVAILABLE_BACKENDS),$(REQUESTED_BACKENDS))
 ifneq ($(UNKNOWN_BACKENDS),)
   $(error Unknown backend(s): $(UNKNOWN_BACKENDS). Available backends: $(AVAILABLE_BACKENDS))
@@ -94,19 +95,27 @@ ifeq ($(CPU_ARCH_OPT),1)
 endif
 
 ifeq ($(BUILD),debug)
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O0 -g3 -ggdb3 -fno-omit-frame-pointer \
-             $(SANITIZE_FLAGS) $(WARN_FLAGS) -Wshadow -Wstrict-prototypes -DDEBUG_BUILD=1
-  LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
-else ifeq ($(BUILD),release-rdbg)
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g3 -ggdb3 -fno-omit-frame-pointer \
-             $(SANITIZE_FLAGS) $(WARN_FLAGS) $(MATH_FLAGS) $(ARCH_FLAGS) -DRELEASE_DBG=1
+  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g -fno-omit-frame-pointer \
+             $(SANITIZE_FLAGS) $(WARN_FLAGS) $(MATH_FLAGS) $(ARCH_FLAGS)
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 else
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -flto -funroll-loops -funroll-all-loops \
+  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O3 -funroll-loops -funroll-all-loops \
              -ftree-vectorize -fvect-cost-model=unlimited -fivopts -fweb \
-             -frename-registers -fprefetch-loop-arrays \
-             $(MATH_FLAGS) $(ARCH_FLAGS) -DNDEBUG
-  LDFLAGS := -lm -lpthread -flto
+             -frename-registers -fprefetch-loop-arrays -g \
+             $(MATH_FLAGS) $(ARCH_FLAGS)
+  LDFLAGS := -lm -lpthread
+  LTO_FLAGS := -flto=$(shell nproc)
+endif
+
+define split_debug
+	@$(OBJCOPY) --only-keep-debug $1 $1.debug
+	@$(STRIP) --strip-unneeded $1
+	@$(OBJCOPY) --add-gnu-debuglink=$1.debug $1
+	@echo "  DBG     $1.debug"
+endef
+
+ifeq ($(BUILD),release)
+  SPLIT_DEBUG = $(call split_debug,$@)
 endif
 
 ifneq ($(HAS_VULKAN),)
@@ -153,25 +162,25 @@ ifneq ($(CPU_ARCH_DIR),)
 endif
 
 ifneq ($(HAS_VULKAN),)
-  VK_BACKEND_OBJS := $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o \
-                     $(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
+  VK_BACKEND_OBJS := $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o
   VK_BACKEND := $(BACKEND_DIR)/libkappai_vulkan.so
   BACKEND_LIBS += $(VK_BACKEND)
   BACKEND_OBJS += $(VK_BACKEND_OBJS)
 endif
 
 TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
-TEST_QUANT_OBJ := $(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
-SERVER_SRCS := $(SRC_DIR)/server/main.c $(SRC_DIR)/server/openai.c
+SERVER_SRCS := $(wildcard $(SRC_DIR)/server/*.c)
 SERVER_LIBS := -ljson-c -lmicrohttpd
-HEADERS     := $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
-ALL_SRCS    := $(shell find $(SRC_DIR) -type f \( -name "*.c" -o -name "*.cpp" \))
-ALL_SHADERS := $(shell find $(SRC_DIR) -type f \( -name "*.comp" -o -name "*.glsl" -o -name "*.inc" \))
+CLI_SRCS    := $(wildcard $(SRC_DIR)/cli/*.c)
+HEADERS     = $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
+ALL_SRCS    = $(shell find $(SRC_DIR) -type f \( -name "*.c" -o -name "*.cpp" \))
+ALL_SHADERS = $(shell find $(SRC_DIR) -type f \( -name "*.comp" -o -name "*.glsl" -o -name "*.inc" \))
 
 LIB_OBJS     := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(LIB_SRCS))
 TEST_OBJ_DIR := $(OBJ_DIR)/test
 TEST_OBJS    := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS))
 SERVER_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
+CLI_OBJS     := $(patsubst $(SRC_DIR)/cli/%.c,$(OBJ_DIR)/cli/%.o,$(CLI_SRCS))
 
 ENGINE      := $(OUT_DIR)/libkappai.so
 CLI_BIN     := $(OUT_DIR)/kappai-cli
@@ -179,12 +188,13 @@ SERVER_BIN  := $(OUT_DIR)/kappai-server
 TEST_BIN    := $(OUT_DIR)/kappai-test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
-BUILD_DIRS := $(BACKEND_DIR) \
-	      $(OBJ_DIR)/backend/cpu/scalar $(OBJ_DIR)/backend/cpu/aarch64 \
-	      $(OBJ_DIR)/backend/cpu/x86_64 \
-	      $(OBJ_DIR)/backend/vulkan \
-	      $(OBJ_DIR)/cli $(OBJ_DIR)/moe $(OBJ_DIR)/monitor $(OBJ_DIR)/server \
-	      $(OBJ_DIR)/models $(OBJ_DIR)/test
+SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(ENGINE) $(BACKEND_LIBS)
+
+# The engine is resolved at load time via DT_NEEDED + RUNPATH, so this only has to
+# make the link succeed -- it must stay in LDFLAGS to keep codegen flags in sync.
+ENGINE_LDFLAGS := -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
+
+BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS)))
 
 FORMAT_FLAGS := -i -style=file
 TIDY_LOG     := $(OUT_DIR)/tidy.log
@@ -314,63 +324,63 @@ backends-help:
 	@echo "  libkappai_cpu_$(HOST_ARCH).so - $(HOST_ARCH)-optimized implementation (when CPU_ARCH_OPT=1)"
 	@echo "backend libraries are installed to $(BACKEND_DIR) and dlopen()ed at runtime;"
 	@echo "set KAPPAI_BACKEND_PATH to load backend libraries from another directory"
-	@echo "usage: make config BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(comma)$(word 2,$(AVAILABLE_BACKENDS)),)"
+	@echo "usage: make config BACKENDS=$(if $(AVAILABLE_BACKENDS),$(firstword $(AVAILABLE_BACKENDS)),vulkan)$(if $(word 2,$(AVAILABLE_BACKENDS)),$(,)$(word 2,$(AVAILABLE_BACKENDS)),)"
 
 monitor: $(MONITOR_BIN)
 $(MONITOR_BIN): $(SRC_DIR)/monitor/viewer.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
-	@$(CC) -O2 -g -Wall -Wextra -I$(SRC_DIR) $< -o $@ -lncurses -ljson-c
+	@$(CC) -O2 -g -Wall -Wextra -MMD -MP -MF $(MONITOR_BIN).d -I$(SRC_DIR) $< -o $@ -lncurses -ljson-c
 
 cli: $(CLI_BIN)
-$(CLI_BIN): $(SRC_DIR)/cli/main.c $(ENGINE) $(BACKEND_LIBS)
+$(CLI_BIN): $(CLI_OBJS) | $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $< -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
+	@$(CC) $(CFLAGS) $(CLI_OBJS) $(ENGINE_LDFLAGS) -ljson-c -o $@
+	$(SPLIT_DEBUG)
 
 server: $(SERVER_BIN)
-$(SERVER_BIN): $(SERVER_OBJS) $(ENGINE) $(BACKEND_LIBS)
+$(SERVER_BIN): $(SERVER_OBJS) | $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(SERVER_OBJS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread $(SERVER_LIBS) -o $@
+	@$(CC) $(CFLAGS) $(SERVER_OBJS) $(ENGINE_LDFLAGS) $(SERVER_LIBS) -o $@
+	$(SPLIT_DEBUG)
 
 kappai-test: $(TEST_BIN)
-$(TEST_BIN): $(TEST_OBJS) $(TEST_QUANT_OBJ) $(ENGINE) $(BACKEND_LIBS)
+$(TEST_BIN): $(TEST_OBJS) | $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
-	@$(CC) $(CFLAGS) -I$(SRC_DIR) $(TEST_OBJS) $(TEST_QUANT_OBJ) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' -lm -lpthread -ljson-c -o $@
-
-$(TEST_OBJ_DIR)/%.o: $(SRC_DIR)/test/%.c | $(TEST_OBJ_DIR) $(CONFIG_FILE)
-	@mkdir -p $(dir $@)
-	@echo "  CC      $<"
-	@$(CC) $(CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
-
-$(TEST_OBJ_DIR):
-	@mkdir -p $@
+	@$(CC) $(CFLAGS) $(TEST_OBJS) $(ENGINE_LDFLAGS) -ljson-c -o $@
+	$(SPLIT_DEBUG)
 
 $(ENGINE): $(LIB_OBJS)
 	@echo "  LD      $@"
 	@$(CC) -shared -Wl,-soname,libkappai.so $(CFLAGS) $^ $(LDFLAGS) -ljson-c -ldl -o $@
+	$(SPLIT_DEBUG)
 
 $(BACKEND_OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
 	@mkdir -p $(dir $@)
 	@echo "  CC(b)   $<"
-	@$(CC) $(BACKEND_CFLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
+	@$(CC) $(BACKEND_CFLAGS) $(LTO_FLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
 
-$(SCALAR_BACKEND): $(SCALAR_BACKEND_OBJS) $(ENGINE)
+$(SCALAR_BACKEND): $(SCALAR_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(SCALAR_BACKEND_OBJS) \
-		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) $(LTO_FLAGS) -o $@
+	$(SPLIT_DEBUG)
 
 ifneq ($(CPU_ARCH_DIR),)
-$(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) $(ENGINE)
+$(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(ARCH_BACKEND_OBJS) \
-		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -o $@
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) $(LTO_FLAGS) -o $@
+	$(SPLIT_DEBUG)
 endif
 
 ifneq ($(HAS_VULKAN),)
-$(VK_BACKEND): $(VK_BACKEND_OBJS) $(ENGINE)
+# No weak-symbol overrides here, so LTO would only grow the binary.
+$(VK_BACKEND): $(VK_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lvulkan -o $@
+	$(SPLIT_DEBUG)
 endif
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OUT_DIR) $(CONFIG_FILE)
@@ -395,6 +405,7 @@ print-config:
 	@echo "CPU_ARCH_OPT       = $(CPU_ARCH_OPT)"
 	@echo "TSAN               = $(if $(filter 1,$(TSAN)),1,0)"
 	@echo "SANITIZE_FLAGS     = $(SANITIZE_FLAGS)"
+	@echo "SPLIT_DEBUG        = $(if $(SPLIT_DEBUG),1,0) ($(if $(SPLIT_DEBUG),symbols+line info in .debug sidecars,inline -g))"
 	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
 	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
@@ -416,9 +427,8 @@ format:
 		chmod 644 {}; \
 	'
 
-NON_HOST_CPU_ARCHS := aarch64 x86_64
-NON_HOST_CPU_ARCHS := $(filter-out $(HOST_ARCH),$(NON_HOST_CPU_ARCHS))
-TIDY_SRCS := $(filter-out $(foreach a,$(NON_HOST_CPU_ARCHS),$(SRC_DIR)/backend/cpu/$(a)/%),$(ALL_SRCS))
+NON_HOST_CPU_ARCHS := $(filter-out $(HOST_ARCH),aarch64 x86_64)
+TIDY_SRCS = $(filter-out $(foreach a,$(NON_HOST_CPU_ARCHS),$(SRC_DIR)/backend/cpu/$(a)/%),$(ALL_SRCS))
 
 tidy: | $(OUT_DIR)
 	@which clang-tidy >/dev/null 2>&1 || { echo "clang-tidy not found"; exit 1; }
@@ -432,4 +442,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d)
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d) $(MONITOR_BIN).d

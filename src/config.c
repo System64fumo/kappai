@@ -228,7 +228,6 @@ static int parse_kv_quant(const char *optarg, config *cfg) {
 }
 
 static void parse_monitor(const char *optarg, int argc, char **argv, int *optind, config *cfg) {
-	(void)argc;
 	if (optarg) {
 		cfg->monitor = optarg;
 	} else if (*optind < argc && argv[*optind][0] != '-') {

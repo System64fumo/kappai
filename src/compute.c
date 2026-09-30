@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define compute_model_changed(s, m, n_ctx)                                                         \
+	((s)->last_model != (m) || (s)->allocated_n_ctx < (n_ctx))
+
 void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
 }
@@ -469,8 +472,7 @@ static status_code ensure_transfer_buf(compute_scratch *s, size_t need_floats) {
 	return OK;
 }
 
-status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx) {
-	(void)n_ctx;
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	if (s->mirror_slots_alloced && s->mirror_backend)
 		return OK;
 	if (!m || !m->mixed_backend_mode)

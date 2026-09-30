@@ -13,6 +13,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+static int	monitor_maybe_emit(void);
+static void monitor_emit(monitor *mon, const char *json_fmt, ...)
+	__attribute__((format(printf, 2, 3)));
 
 #define MONITOR_DEFAULT_PATH "/tmp/kappai.monitor"
 
@@ -287,10 +290,6 @@ void monitor_emit_start(monitor *mon, const char *arch_name, int n_layers, int d
 void monitor_emit_prefill(monitor *mon, int n_tokens, uint64_t ms, double tps) {
 	monitor_emit(mon, "{\"type\":\"prefill\",\"n_tokens\":%d,\"ms\":%llu,\"tps\":%.2f}", n_tokens,
 				 (unsigned long long)ms, tps);
-}
-
-void monitor_layer_tracker_init(monitor_layer_tracker *t) {
-	memset(t, 0, sizeof(*t));
 }
 
 void monitor_begin_phase(monitor_layer_tracker *t, const char *phase, int token_idx,

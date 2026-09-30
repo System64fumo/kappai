@@ -1,13 +1,11 @@
 #include "backend/backend.h"
 #include "common.h"
-#include "log.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include "recipe.h"
 
 #include <math.h>
 #include <stdlib.h>
-#include <string.h>
 
 static model_recipe *build_glm_dsa_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));

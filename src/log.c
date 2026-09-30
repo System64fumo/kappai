@@ -3,9 +3,7 @@
 #include "profile.h"
 #include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define COLOR_RESET "\x1b[0m"
 #define PROGRESS_BAR_WIDTH 30
@@ -80,7 +78,7 @@ static void log_locked(log_level level, const char *color, const char *tag, cons
 	pthread_mutex_unlock(&g_log_mtx);
 }
 
-void log_msgv(log_level level, const char *fmt, va_list ap) {
+static void log_msgv(log_level level, const char *fmt, va_list ap) {
 	log_locked(level, level_color(level), level_name(level), fmt, ap);
 }
 

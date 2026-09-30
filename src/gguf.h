@@ -1,6 +1,8 @@
 #ifndef GGUF_H
 #define GGUF_H
 
+#include <stdio.h>
+
 #include "common.h"
 
 #define GGUF_MAGIC 0x46554747u

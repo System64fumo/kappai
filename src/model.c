@@ -12,12 +12,10 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <unistd.h>
 
 static void madvise_access_pattern(const void *map_base, size_t map_size, const void *ptr,
 								   size_t bytes, int advice) {

@@ -1,15 +1,9 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#include <ctype.h>
-#include <execinfo.h>
-#include <limits.h>
-#include <sched.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -24,20 +18,9 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
-static inline size_t str_lcp_len(const char *a, const char *b) {
-	size_t i = 0;
-	while (a[i] && b[i] && a[i] == b[i])
-		i++;
-	return i;
-}
-
-static inline const char *path_basename(const char *path) {
-	if (!path)
-		return "";
-	const char *slash = strrchr(path, '/');
-	return slash ? slash + 1 : path;
-}
+#define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
 
 #define HEAD_DIM_MAX 512
 
@@ -55,10 +38,18 @@ typedef enum {
 	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
-typedef struct {
-	float *p;
-	size_t cap;
-} float_buf;
+void  oom_abort(size_t bytes);
+void *xmalloc(size_t n);
+void *xmalloc_aligned(size_t n, size_t align);
+void *xcalloc(size_t n, size_t sz);
+void *xrealloc(void *p, size_t n);
+char *xstrdup(const char *s);
+char *xstrndup(const char *s, size_t n);
+
+typedef int (*spin_until_fn)(void *ud);
+
+void cpu_relax(void);
+void spin_wait_relax(spin_until_fn pred, void *ud);
 
 static inline void madvise_hugepage(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
@@ -88,27 +79,8 @@ static inline void prefault(void *ptr, size_t bytes) {
 	p[bytes - 1] = p[bytes - 1];
 }
 
-static inline void cpu_relax(void) {
-#if defined(__x86_64__) || defined(__i386__)
-	__builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-	__asm__ __volatile__("isb" ::: "memory");
-#else
-	sched_yield();
-#endif
-}
-
-typedef int (*spin_until_fn)(void *ud);
-
-static inline void spin_wait_relax(spin_until_fn pred, void *ud) {
-	unsigned spins = 0;
-	while (!pred(ud)) {
-		if (++spins % 1024 == 0)
-			sched_yield();
-		else
-			cpu_relax();
-	}
-}
+size_t		str_lcp_len(const char *a, const char *b);
+const char *path_basename(const char *path);
 
 typedef struct {
 	uintptr_t start;
@@ -144,137 +116,21 @@ static inline int page_span_clamp(page_span *r, uintptr_t base, size_t size) {
 	return 1;
 }
 
-static inline void oom_abort(size_t bytes) {
-	fprintf(stderr, "fatal: out of memory (%zu bytes)\n", bytes);
-	void *frames[32];
-	int	  n = backtrace(frames, 32);
-	backtrace_symbols_fd(frames, n, 2);
-	abort();
-}
-
-static inline void *xmalloc(size_t n) {
-	if (n == 0)
-		n = 1;
-	void *p = malloc(n);
-	if (!p)
-		oom_abort(n);
-	return p;
-}
-
-static inline void *xmalloc_aligned(size_t n, size_t align) {
-	if (align < sizeof(void *))
-		align = sizeof(void *);
-	void *p = NULL;
-	if (posix_memalign(&p, align, n) != 0)
-		oom_abort(n);
-	return p;
-}
-
-static inline void *xcalloc(size_t n, size_t sz) {
-	if (n == 0 || sz == 0)
-		return NULL;
-	if (n > SIZE_MAX / sz)
-		oom_abort(n * sz);
-	void *p = calloc(n, sz);
-	if (!p)
-		oom_abort(n * sz);
-	return p;
-}
-
-static inline void *xrealloc(void *p, size_t n) {
-	if (n == 0) {
-		free(p);
-		return NULL;
-	}
-	void *q = realloc(p, n);
-	if (!q)
-		oom_abort(n);
-	return q;
-}
-
-static inline char *xstrdup(const char *s) {
-	char *p = strdup(s);
-	if (!p)
-		oom_abort(strlen(s));
-	return p;
-}
-
-static inline char *xstrndup(const char *s, size_t n) {
-	char *p = xmalloc(n + 1);
-	memcpy(p, s, n);
-	p[n] = '\0';
-	return p;
-}
-
-#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
-
 typedef struct {
 	const char *p;
 	size_t		len;
 } str_span;
 
-static inline str_span span_trim(const char *s, size_t len) {
-	while (len > 0 && isspace((unsigned char)*s)) {
-		s++;
-		len--;
-	}
-	while (len > 0 && isspace((unsigned char)s[len - 1]))
-		len--;
-	str_span sp = {s, len};
-	return sp;
-}
+str_span span_trim(const char *s, size_t len);
+size_t	 marker_tail_len(const char *s, size_t len, const char *marker);
 
-static inline char *span_dup(str_span sp) {
-	return xstrndup(sp.p, sp.len);
-}
+typedef struct {
+	float *p;
+	size_t cap;
+} float_buf;
 
-static inline size_t marker_tail_len(const char *s, size_t len, const char *marker) {
-	if (!marker)
-		return 0;
-	size_t mlen = strlen(marker);
-	if (mlen <= 1)
-		return 0;
-	size_t max = len < mlen - 1 ? len : mlen - 1;
-	for (size_t k = max; k > 0; k--)
-		if (memcmp(s + len - k, marker, k) == 0)
-			return k;
-	return 0;
-}
-
-static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
-	if (need > b->cap) {
-		size_t bytes = need * sizeof(float);
-		if (bytes >= (2u << 20))
-			align = align < 4096 ? 4096 : align;
-		float *np = xmalloc_aligned(bytes, align);
-		if (bytes >= (2u << 20))
-			madvise_hugepage(np, bytes);
-		if (b->p && b->cap > 0)
-			memcpy(np, b->p, b->cap * sizeof(float));
-		free(b->p);
-		b->p   = np;
-		b->cap = need;
-	}
-	return b->p;
-}
-
-static inline float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align) {
-	if (need > b->cap) {
-		size_t bytes = need * sizeof(float);
-		if (bytes >= (2u << 20))
-			align = align < 4096 ? 4096 : align;
-		free(b->p);
-		b->p = xmalloc_aligned(bytes, align);
-		if (bytes >= (2u << 20))
-			madvise_hugepage(b->p, bytes);
-		b->cap = need;
-	}
-	return b->p;
-}
-
-static inline float *float_buf_ensure(float_buf *b, size_t need) {
-	return float_buf_ensure_aligned(b, need, 64);
-}
+float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align);
+float *float_buf_ensure(float_buf *b, size_t need);
 
 typedef struct {
 	char  *p;
@@ -282,81 +138,15 @@ typedef struct {
 	size_t cap;
 } str_builder;
 
-static inline void sb_reserve(str_builder *b, size_t extra) {
-	size_t need = b->len + extra + 1;
-	if (need <= b->cap)
-		return;
-	size_t cap = b->cap ? b->cap : 128;
-	while (cap < need)
-		cap *= 2;
-	b->p   = xrealloc(b->p, cap);
-	b->cap = cap;
-	if (b->len == 0)
-		b->p[0] = '\0';
-}
-
-static inline void sb_init(str_builder *b) {
-	b->len	= 0;
-	b->cap	= 128;
-	b->p	= xmalloc(b->cap);
-	b->p[0] = '\0';
-}
-
-static inline void sb_putb(str_builder *b, const char *s, size_t n) {
-	if (!b || !s || n == 0)
-		return;
-	sb_reserve(b, n);
-	memcpy(b->p + b->len, s, n);
-	b->len += n;
-	b->p[b->len] = '\0';
-}
-
-static inline void sb_puts(str_builder *b, const char *s) {
-	if (s)
-		sb_putb(b, s, strlen(s));
-}
-
-static inline void sb_putc(str_builder *b, char c) {
-	sb_reserve(b, 1);
-	b->p[b->len++] = c;
-	b->p[b->len]   = '\0';
-}
-
-static inline void sb_reset(str_builder *b) {
-	if (!b)
-		return;
-	b->len = 0;
-	if (b->p)
-		b->p[0] = '\0';
-}
-
-static inline char *sb_finish(str_builder *b) {
-	sb_reserve(b, 0);
-	char *p = b->p ? b->p : xstrdup("");
-	memset(b, 0, sizeof(*b));
-	return p;
-}
-
-static inline void sb_free(str_builder *b) {
-	free(b->p);
-	memset(b, 0, sizeof(*b));
-}
-
-static inline void str_replace_all(str_builder *out, const char *s, const char *from,
-								   const char *to) {
-	size_t flen = strlen(from);
-	if (flen == 0) {
-		sb_puts(out, s);
-		return;
-	}
-	const char *cur;
-	while ((cur = strstr(s, from)) != NULL) {
-		sb_putb(out, s, (size_t)(cur - s));
-		sb_puts(out, to);
-		s = cur + flen;
-	}
-	sb_puts(out, s);
-}
+void  sb_reserve(str_builder *b, size_t extra);
+void  sb_init(str_builder *b);
+void  sb_putb(str_builder *b, const char *s, size_t n);
+void  sb_puts(str_builder *b, const char *s);
+void  sb_putc(str_builder *b, char c);
+void  sb_reset(str_builder *b);
+char *sb_finish(str_builder *b);
+void  sb_free(str_builder *b);
+void  str_replace_all(str_builder *out, const char *s, const char *from, const char *to);
 
 typedef struct {
 	char **chunks;
@@ -366,55 +156,11 @@ typedef struct {
 	size_t next_size;
 } str_arena;
 
-static inline void str_arena_init(str_arena *a) {
-	memset(a, 0, sizeof(*a));
-	a->next_size = 1u << 16;
-}
-
-static inline char *str_arena_alloc(str_arena *a, size_t n) {
-	if (n == 0)
-		n = 1;
-	if (!a->cur || (size_t)(a->end - a->cur) < n) {
-		size_t sz = a->next_size;
-		if (sz < n)
-			sz = (n + 63u) & ~(size_t)63u;
-		a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
-		a->chunks[a->n_chunks] = (char *)xmalloc(sz);
-		a->n_chunks++;
-		a->cur		 = a->chunks[a->n_chunks - 1];
-		a->end		 = a->cur + sz;
-		a->next_size = sz < (1u << 24) ? sz * 2 : sz;
-	}
-	char *p = a->cur;
-	a->cur += n;
-	return p;
-}
-
-static inline void str_arena_reserve(str_arena *a, size_t n) {
-	if (n == 0)
-		return;
-	if (a->cur && (size_t)(a->end - a->cur) >= n)
-		return;
-	a->chunks			   = (char **)xrealloc(a->chunks, (a->n_chunks + 1) * sizeof(char *));
-	a->chunks[a->n_chunks] = (char *)xmalloc(n);
-	a->n_chunks++;
-	a->cur = a->chunks[a->n_chunks - 1];
-	a->end = a->cur + n;
-}
-
-static inline char *str_arena_dup(str_arena *a, const char *s, size_t len) {
-	char *p = str_arena_alloc(a, len + 1);
-	memcpy(p, s, len);
-	p[len] = '\0';
-	return p;
-}
-
-static inline void str_arena_free(str_arena *a) {
-	for (size_t i = 0; i < a->n_chunks; i++)
-		free(a->chunks[i]);
-	free(a->chunks);
-	memset(a, 0, sizeof(*a));
-}
+void  str_arena_init(str_arena *a);
+char *str_arena_alloc(str_arena *a, size_t n);
+void  str_arena_reserve(str_arena *a, size_t n);
+char *str_arena_dup(str_arena *a, const char *s, size_t len);
+void  str_arena_free(str_arena *a);
 
 static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {
 	for (;;) {
@@ -464,8 +210,6 @@ static inline int topk_heap_select(const float *scores, int n_scores, int k, flo
 	}
 	return hn;
 }
-
-#define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
 
 static inline uint64_t fnv1a(const char *s, size_t n) {
 	uint64_t h = FNV1A_OFFSET_BASIS;
