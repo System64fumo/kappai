@@ -365,14 +365,73 @@ the code, not a measurement.
   the AVX2 objects miss their arch flags in the debug config and fail with
   "inlining failed ... target specific option mismatch" even when `ARCH_FLAGS` is
   passed explicitly.
-- CUDA prefill is 1-4% behind the pre-merge fork (95% CI [0.960, 0.990], point
-  estimate 2.5%, n=15 balanced ABBA/BAAB blocks). Quantified and left alone; see
-  the benchmarking note above for why the apparent 5-15% figures seen earlier
-  were position artifacts.
+- CUDA prefill may be ~2-4% behind the pre-merge fork, but a larger
+  rotation-balanced run (n=10 blocks, per-block ratios so drift and the warm-up
+  slot cancel) cannot distinguish any two trees in the CUDA lineage: dev
+  1.024 [0.947, 1.107], prefix 1.047 [0.972, 1.126], fork 1.031 [0.964, 1.104]
+  against current. Treat GPU prefill as parity. See the cross-branch table.
 
 Note: this GPU reports `maxStorageBufferRange` = 128 MB, so no real model fits
 (`gemma-4` Q8_0 needs 427 MB, `Qwen3.5-0.8B` 270 MB). The vulkan op-level tests
 are therefore the only available vulkan validation on this machine.
+
+### Cross-branch performance
+
+Measured across every branch that can run on this machine, using the harness in
+`bench/` (`bench.py` plus two tree lists). Those numbers are specific to the
+machine they were taken on -- an RTX 2070 Max-Q under WSL2 -- and the absolute
+t/s values will not reproduce elsewhere; only the relative ratios are meaningful.
+The raw per-run rows, each stamped with the commit and engine-lib md5 it
+actually measured, are committed alongside the harness in `bench/*.csv`.
+
+Method: model `gemma-4-E2B-it-Q8_0`, 2520-word prompt, `-c 4096 -n 8 -t 0.0
+--metrics pp,tg`, rotation-balanced blocks (block *b* rotates the tree order by
+*b* mod T, so every tree occupies every position equally often). Ratios are
+per-block, so thermal drift and the warm-up slot both cancel.
+
+| tree | commit | CUDA | CPU PP median | CPU vs current | GPU PP vs current (95% CI) |
+| --- | --- | --- | --- | --- | --- |
+| dev `master` | `80bddba` | yes | 25.5 | **-24.2%** | 1.024 [0.947, 1.107] n.s. |
+| pre-merge fork | `e35ba92` | yes | 27.0 | **-18.9%** | 1.031 [0.964, 1.104] n.s. |
+| `main` | `c7f8f05` | no | 27.9 | **-16.6%** | — |
+| `misc-wip` | `aa9eb27` | no | 27.0 | **-19.4%** | — |
+| `takanashi_hoshino_v1` | `2b36ca7` | no | 27.5 | **-18.2%** | — |
+| `misc/improvements` | `2406645` | no | 32.4 | -2.6% | — |
+| post-merge pre-fix | `e076078` | yes | 33.6 | +0.6% n.s. | 1.047 [0.972, 1.126] n.s. |
+| **current** | `8914192` | yes | **33.6** | — | 1.000 |
+
+**GPU prefill is at parity across the whole CUDA lineage.** No comparison is
+statistically significant at n=10 blocks. Confirmed on a second architecture:
+`Qwen3.5-0.8B` (hybrid-recurrent, exercising the `partial_rope_qk` and GDN
+paths) gives current/prefix = 1.0125, 95% CI [0.982, 1.044], n=8.
+
+**CPU prefill separates the trees cleanly** (sd < 0.5 t/s, every CI but
+`prefix` excludes parity). The `misc/improvements` merge is worth ~+19% CPU
+prefill over `main` and the fork; that gain is present in `e076078` too.
+
+**My 6 fix commits cost nothing on either device:** `prefix` vs `current` is
++0.55% CPU (95% CI [-1.1%, +2.2%], n=6) and not distinguishable from parity on
+GPU. They are also output-neutral, verified properly this time: with two
+genuinely distinct `libkappai.so` builds (md5 `36439ac0…` vs `fb402f52…`),
+`e076078` and `8914192` produce **byte-identical** greedy output on
+Q8_0 / Q4_0 / Q4_K_M / IQ4_NL.
+
+Two things this cannot compare:
+
+- **Qwen3.5 on the dev tree and the pre-merge fork.** Both load the model and
+  print `hybrid GDN: conv=4 …` but then exit cleanly at 0% prompt processing
+  with no metrics and no error, at both `-c 1024` and `-c 4096`. Pre-existing at
+  those commits, not a build or flag problem; the GPU Qwen3.5 row is therefore
+  prefix-vs-current only.
+- **The dev tree's Vulkan backend.** `src/backend/vulkan/shaders/common.glsl:102`
+  fails to compile (`overloaded functions must have the same parameter precision
+  qualifiers`) under this glslc, so the dev tree is built CUDA-only. Pre-existing.
+
+The large raw spread across the GPU runs (dev 146.8 vs current 133.2 median) is
+the warm-up artifact, not a real gap: position 0 averages 167 t/s and position 3
+averages 145 t/s within the same blocks. Comparing raw medians across trees
+without the per-block ratio reproduces exactly the phantom regression this
+document already warns about.
 
 ### Suite status
 

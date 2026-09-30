@@ -1,0 +1,11 @@
+# CPU-backend variant of trees.tsv: same 6 columns, same resolution rules, but
+# every tree is exercised on the CPU backend (bench.py is invoked with `all`,
+# which runs both CUDA and non-CUDA trees on whatever backend this file names).
+dev-master	dev-master	build-bench	--accel	cpu	1
+pre-merge-fork	pre-merge-fork	build	--accel	cpu	1
+post-merge-pre-fix	post-merge-pre-fix	build-bench	--device	cpu	1
+current	.	build	--device	cpu_x86_64	1
+main	main	build-bench	--device	cpu	0
+misc	misc	build	--device	cpu_x86_64	0
+misc-wip	misc-wip	build-bench	--accel	cpu	0
+takanashi	takanashi	build-bench	--accel	cpu	0

@@ -1,0 +1,26 @@
+# Trees to benchmark, one per line. Columns are tab-separated:
+#
+#   name    label used in the results CSV and in console output
+#   dir     checkout location: "." is this repo, anything else resolves
+#           against $KAPPAI_BENCH_DIR (default ~/kappai-bench)
+#   build   build output dir, relative to `dir`
+#   flag    CLI backend-selection flag for this tree's vintage
+#   dev     backend name to pass to that flag
+#   cuda    1 if this tree has a CUDA backend, else 0
+#
+# Each `dir` must be a real git checkout with that build present: bench.py
+# shells out to `git -C <dir> rev-parse HEAD` to stamp every result row with
+# the commit it actually measured, and records the engine lib md5 so a stale
+# build cannot be compared by accident.
+#
+# Usage:
+#   KAPPAI_BENCH_DIR=/path/to/dir python3 bench.py <model.gguf> <tag> <blocks> [cuda|cpu|all]
+#
+# Label changes: the recorded CSVs predate the rename and say `fork`/`prefix`/
+# `dev` where this file now says `pre-merge-fork`/`post-merge-pre-fix`/
+# `dev-master`. The CSVs were left exactly as measured; only labels changed,
+# never the numbers. CUDA_PORTING.md has the human-readable table.
+dev-master	dev-master	build-bench	--accel	cuda	1
+pre-merge-fork	pre-merge-fork	build	--accel	cuda	1
+post-merge-pre-fix	post-merge-pre-fix	build-bench	--device	cuda	1
+current	.	build	--device	cuda	1

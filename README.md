@@ -18,6 +18,7 @@ You can expect up to **800%** speedups in some scenarios. (Results vary from sys
 	  <td valign="top">
 
 - High-performance CPU inference
+- NVIDIA CUDA backend
 - Vulkan backend
 - Mixed backend / partial offloading
 - MoE streaming
@@ -63,6 +64,18 @@ With Vulkan: (W.I.P, Slower than CPU in some cases)
 make config BUILD=release BACKENDS=vulkan
 make -j$(nproc)
 ```
+
+With CUDA (NVIDIA):
+
+```bash
+make config BUILD=release BACKENDS=cuda,vulkan
+make -j$(nproc)
+```
+
+The CUDA backend is built as a separate library, `build/backends/libkappai_cuda.so`,
+and selected at runtime with `--device cuda`. Backends can be combined for
+partial offloading. Requires the CUDA toolkit (`nvcc`); the GPU architecture is
+auto-detected.
 
 ### Usage
 
