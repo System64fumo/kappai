@@ -8,6 +8,7 @@
 #include "kvcache.h"
 #include "log.h"
 #include "model.h"
+#include "moe/moe_common.h"
 #include "moe/moe_stream.h"
 #include "profile.h"
 #include "recipe.h"

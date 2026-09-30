@@ -138,7 +138,8 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 }
 
 typedef struct {
-	int heads, kv_heads, head_dim, n_ctx, pos, flash;
+	int			  heads, kv_heads, head_dim, n_ctx, pos, flash;
+	kv_quant_type kv_quant;
 } attn_bench_cfg;
 
 static double bench_attn_once(backend *b, const buffer *q, const buffer *kc, const buffer *vc,
@@ -154,78 +155,88 @@ static double bench_attn_once(backend *b, const buffer *q, const buffer *kc, con
 }
 
 static int bench_attn_one(backend *b, const char *name, void *ud) {
-	int							iters  = *(int *)ud;
-	static const attn_bench_cfg cfgs[] = {
-		{8, 4, 64, 256, 127, 0},
-		{8, 4, 64, 256, 127, 1},
-		{32, 8, 128, 2048, 511, 0},
-		{8, 1, 256, 4096, 2047, 0},
+	int							iters	 = *(int *)ud;
+	static const attn_bench_cfg shapes[] = {
+		{8, 4, 64, 256, 127, 0, KV_QUANT_F16},	   {32, 8, 128, 2048, 511, 0, KV_QUANT_F16},
+		{8, 1, 256, 4096, 2047, 0, KV_QUANT_F16},  {16, 4, 64, 1024, 255, 0, KV_QUANT_F16},
+		{32, 8, 128, 2048, 1023, 0, KV_QUANT_F16},
 	};
-	printf("\n[%s]  attention latency  best-of-%d\n", name, iters);
+	static const kv_quant_type quants[] = {KV_QUANT_F16, KV_QUANT_Q8_0};
+	printf("\n[%s]  attention latency  best-of-%d  (lower us/call is faster)\n", name, iters);
 	if (!b->attention || !b->kv_alloc || !b->kv_put) {
 		printf("  SKIPPED: backend has no attention/kv ops\n");
 		return 0;
 	}
-	printf("  %-22s %10s %10s\n", "config", "us/call", "GB/s");
-	for (unsigned ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++) {
-		const attn_bench_cfg *c	  = &cfgs[ci];
-		int					  n	  = c->heads * c->head_dim;
-		int					  nkv = c->kv_heads * c->head_dim;
-		int					  nt  = c->pos + 1;
+	printf("  %-39s %12s %12s\n", "config", "us/call", "GFLOP/s");
+	for (unsigned qi = 0; qi < sizeof(quants) / sizeof(quants[0]); qi++)
+		for (unsigned si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++)
+			for (int fl = 0; fl < 2; fl++) {
+				attn_bench_cfg c = shapes[si];
+				c.flash			 = fl;
+				c.kv_quant		 = quants[qi];
+				const char *qn	 = c.kv_quant == KV_QUANT_Q8_0 ? "q8_0" : "f16";
+				if (c.kv_quant == KV_QUANT_Q8_0 && !backend_has_cap(b, BCAP_KV_QUANT_Q8_0))
+					continue;
+				int n	= c.heads * c.head_dim;
+				int nkv = c.kv_heads * c.head_dim;
+				int nt	= c.pos + 1;
 
-		seed_test_rng(0xA77EULL + ((uint64_t)c->heads * 131) + (uint64_t)c->pos);
-		float *q = xmalloc((size_t)n * sizeof(float));
-		fill_random_f32(q, n, 1.0f);
+				seed_test_rng(0xA77EULL + ((uint64_t)c.heads * 131) + ((uint64_t)c.head_dim * 17) +
+							  ((uint64_t)c.kv_heads * 7) + (uint64_t)c.pos);
+				float *q = xmalloc((size_t)n * sizeof(float));
+				fill_random_f32(q, n, 1.0f);
 
-		kv_desc kvd = {.n_ctx		= c->n_ctx,
-					   .n_kv_heads	= c->kv_heads,
-					   .head_dim	= c->head_dim,
-					   .n_layers	= 1,
-					   .n_kv_layers = 1};
-		buffer	kc = {0}, vc = {0}, ki = {0}, vi = {0}, qb = {0}, ob = {0};
-		if (b->kv_alloc(b, &kvd, &kc, &vc) != OK ||
-			b->buffer_alloc_scratch(b, (size_t)nkv * sizeof(float), &ki) != OK ||
-			b->buffer_alloc_scratch(b, (size_t)nkv * sizeof(float), &vi) != OK ||
-			b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &qb) != OK ||
-			b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &ob) != OK) {
-			printf("  h=%d kv=%d d=%d pos=%d flash=%d  SETUP-FAIL\n", c->heads, c->kv_heads,
-				   c->head_dim, c->pos, c->flash);
-			free(q);
-			continue;
-		}
-		float *kv_one = xmalloc((size_t)nkv * sizeof(float));
-		for (int t = 0; t < nt; t++) {
-			fill_random_f32(kv_one, nkv, 1.0f);
-			b->buffer_write_f32(b, &ki, kv_one, nkv);
-			fill_random_f32(kv_one, nkv, 1.0f);
-			b->buffer_write_f32(b, &vi, kv_one, nkv);
-			b->kv_put(b, &kc, &vc, 0, t, &ki, &vi, c->kv_heads, c->head_dim, c->n_ctx, c->kv_heads);
-		}
-		free(kv_one);
-		b->buffer_write_f32(b, &qb, q, n);
-		free(q);
+				kv_desc kvd = {.n_ctx		= c.n_ctx,
+							   .n_kv_heads	= c.kv_heads,
+							   .head_dim	= c.head_dim,
+							   .n_layers	= 1,
+							   .n_kv_layers = 1,
+							   .kv_quant	= c.kv_quant};
+				buffer	kc = {0}, vc = {0}, ki = {0}, vi = {0}, qb = {0}, ob = {0};
+				if (b->kv_alloc(b, &kvd, &kc, &vc) != OK ||
+					b->buffer_alloc_scratch(b, (size_t)nkv * sizeof(float), &ki) != OK ||
+					b->buffer_alloc_scratch(b, (size_t)nkv * sizeof(float), &vi) != OK ||
+					b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &qb) != OK ||
+					b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &ob) != OK) {
+					printf("  h=%d kv=%d d=%d pos=%d %s fl=%d  SETUP-FAIL\n", c.heads, c.kv_heads,
+						   c.head_dim, c.pos, qn, c.flash);
+					free(q);
+					continue;
+				}
+				float *kv_one = xmalloc((size_t)nkv * sizeof(float));
+				for (int t = 0; t < nt; t++) {
+					fill_random_f32(kv_one, nkv, 1.0f);
+					b->buffer_write_f32(b, &ki, kv_one, nkv);
+					fill_random_f32(kv_one, nkv, 1.0f);
+					b->buffer_write_f32(b, &vi, kv_one, nkv);
+					b->kv_put(b, &kc, &vc, 0, t, &ki, &vi, c.kv_heads, c.head_dim, c.n_ctx,
+							  c.kv_heads);
+				}
+				free(kv_one);
+				b->buffer_write_f32(b, &qb, q, n);
+				free(q);
 
-		for (int i = 0; i < 2; i++)
-			bench_attn_once(b, &qb, &kc, &vc, &ob, c);
-		double best_us = 1e300;
-		for (int i = 0; i < iters; i++) {
-			double us = bench_attn_once(b, &qb, &kc, &vc, &ob, c);
-			if (us < best_us)
-				best_us = us;
-		}
-		double kv_bytes = (double)nt * (double)c->kv_heads * (double)c->head_dim * 2.0 * 2.0;
-		double gbs		= best_us > 0 ? kv_bytes / best_us / 1e3 : 0.0;
-		printf("  h=%-3d kv=%-2d d=%-4d pos=%-5d fl=%d %10.1f %10.1f\n", c->heads, c->kv_heads,
-			   c->head_dim, c->pos, c->flash, best_us, gbs);
-		fflush(stdout);
+				for (int i = 0; i < 2; i++)
+					bench_attn_once(b, &qb, &kc, &vc, &ob, &c);
+				double best_us = 1e300;
+				for (int i = 0; i < iters; i++) {
+					double us = bench_attn_once(b, &qb, &kc, &vc, &ob, &c);
+					if (us < best_us)
+						best_us = us;
+				}
+				double flops  = 4.0 * (double)c.heads * (double)nt * (double)c.head_dim;
+				double gflops = best_us > 0 ? flops / best_us / 1e3 : 0.0;
+				printf("  h=%-3d kv=%-2d d=%-4d pos=%-5d %-4s fl=%d %12.1f %12.2f\n", c.heads,
+					   c.kv_heads, c.head_dim, c.pos, qn, c.flash, best_us, gflops);
+				fflush(stdout);
 
-		b->buffer_free(b, &kc);
-		b->buffer_free(b, &vc);
-		b->buffer_free(b, &ki);
-		b->buffer_free(b, &vi);
-		b->buffer_free(b, &qb);
-		b->buffer_free(b, &ob);
-	}
+				b->buffer_free(b, &kc);
+				b->buffer_free(b, &vc);
+				b->buffer_free(b, &ki);
+				b->buffer_free(b, &vi);
+				b->buffer_free(b, &qb);
+				b->buffer_free(b, &ob);
+			}
 	return 0;
 }
 
@@ -448,6 +459,7 @@ static int bench_e2e_one(backend *b, const char *name, void *ud) {
 
 int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 	int		  n = 4096, k = 4096, iters = 5;
+	int		  attn_iters = 200;
 	int		  ms[8], n_ms = 0;
 	const int def_ms[] = {1, 32, 128};
 	for (unsigned i = 0; i < sizeof(def_ms) / sizeof(def_ms[0]); i++)
@@ -463,7 +475,7 @@ int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 		} else if (strcmp(argv[ai], "--k") == 0 && ai + 1 < argc) {
 			k = atoi(argv[++ai]);
 		} else if (strcmp(argv[ai], "--iters") == 0 && ai + 1 < argc) {
-			iters = atoi(argv[++ai]);
+			iters = attn_iters = atoi(argv[++ai]);
 		} else if (strcmp(argv[ai], "--n-prefill") == 0 && ai + 1 < argc) {
 			n_prefill = atoi(argv[++ai]);
 		} else if (strcmp(argv[ai], "--n-decode") == 0 && ai + 1 < argc) {
@@ -516,7 +528,7 @@ int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 		bench_for_each_backend(argc, argv, infos, n_backends, bench_matmul_one, &mu);
 	}
 	if (strcmp(which, "attn") == 0 || strcmp(which, "all") == 0)
-		bench_for_each_backend(argc, argv, infos, n_backends, bench_attn_one, &iters);
+		bench_for_each_backend(argc, argv, infos, n_backends, bench_attn_one, &attn_iters);
 	if (strcmp(which, "dequant") == 0 || strcmp(which, "all") == 0)
 		bench_for_each_backend(argc, argv, infos, n_backends, bench_dequant_one, &iters);
 	if (strcmp(which, "e2e") == 0 || strcmp(which, "all") == 0) {

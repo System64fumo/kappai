@@ -161,7 +161,8 @@ status_code context_init(context *c, const config *cfg) {
 				c->backend->name);
 		kv_quant_type kv_quant_precheck = (kv_quant_type)cfg->kv_quant;
 		size_t		  kv_bytes_precheck =
-			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck);
+			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck,
+									   backend_has_cap(kv_owner_precheck, BCAP_KV_POS_CAP));
 		size_t avail_precheck = backend_mem_available(kv_owner_precheck);
 
 		size_t reserve_for_weights = 0;
@@ -230,7 +231,8 @@ status_code context_init(context *c, const config *cfg) {
 			c->backend->name);
 	kv_quant_type kv_quant = (kv_quant_type)cfg->kv_quant;
 	{
-		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant);
+		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant,
+													 backend_has_cap(kv_owner, BCAP_KV_POS_CAP));
 		size_t avail	= backend_mem_available(kv_owner);
 		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
@@ -240,9 +242,6 @@ status_code context_init(context *c, const config *cfg) {
 			s = ERR_OUT_OF_MEMORY;
 			goto fail_chat;
 		}
-		DEBUG("KV cache: %.1f MB for ctx=%d on backend '%s' (quant=%s)",
-			  kv_bytes / (1024.0 * 1024.0), n_ctx, kv_owner->name,
-			  kv_quant == KV_QUANT_Q8_0 ? "q8_0" : "f16");
 	}
 
 	c->flash_attn = cfg->flash_attn ? 1 : 0;

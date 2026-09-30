@@ -23,6 +23,7 @@ typedef enum {
 	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
 	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
+	BCAP_KV_POS_CAP			  = 1 << 10,
 } backend_cap;
 
 typedef struct {

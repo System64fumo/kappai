@@ -4,6 +4,7 @@
 #include "config.h"
 #include "log.h"
 #include "model.h"
+#include "moe/moe_common.h"
 #include "monitor.h"
 #include "profile.h"
 #include "threadpool.h"
@@ -145,7 +146,7 @@ typedef struct moe_stream_op {
 	uint64_t				   now;
 	int						   n_k;
 	moe_expert_slot			  *out_slots;
-	moe_miss_entry			   misses[MOE_MAX_K];
+	moe_miss_entry			   misses[MOE_MAX_TOPK];
 	int						   n_misses;
 	moe_fill_chunk			  *chunks;
 	int						   n_chunks;
@@ -1489,8 +1490,8 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 		return ERR_INVALID_ARG;
 	}
 
-	if (n_k > MOE_MAX_K) {
-		ERROR("moe_stream_resolve: n_k=%d exceeds MOE_MAX_K=%d buffer", n_k, MOE_MAX_K);
+	if (n_k > MOE_MAX_TOPK) {
+		ERROR("moe_stream_resolve: n_k=%d exceeds MOE_MAX_TOPK=%d buffer", n_k, MOE_MAX_TOPK);
 		return ERR_INVALID_ARG;
 	}
 
@@ -1503,7 +1504,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 	uint64_t	now			   = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
 	status_code rc			   = OK;
 
-	int need_fetch[MOE_MAX_K];
+	int need_fetch[MOE_MAX_TOPK];
 	int n_need = 0;
 
 	resolve_scan_hits(c, L, m, expert_ids, n_k, now, out_slots, need_fetch, &n_need, 0);
@@ -1511,10 +1512,10 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 	if (n_need == 0)
 		return OK;
 
-	moe_miss_entry misses[MOE_MAX_K];
+	moe_miss_entry misses[MOE_MAX_TOPK];
 	int			   n_misses = 0;
 
-	int wait_needed[MOE_MAX_K];
+	int wait_needed[MOE_MAX_TOPK];
 	int n_wait_needed = 0;
 
 	resolve_collect_misses(c, L, m, layer, expert_ids, now, out_slots, need_fetch, n_need, misses,
@@ -1681,8 +1682,8 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	moe_stream_cache *c = m->moe_cache;
 	if (layer < 0 || layer >= m->n_layers || !m->layers[layer].experts)
 		return NULL;
-	if (n_k > MOE_MAX_K) {
-		ERROR("moe_stream_resolve_prep: n_k=%d exceeds MOE_MAX_K=%d buffer", n_k, MOE_MAX_K);
+	if (n_k > MOE_MAX_TOPK) {
+		ERROR("moe_stream_resolve_prep: n_k=%d exceeds MOE_MAX_TOPK=%d buffer", n_k, MOE_MAX_TOPK);
 		return NULL;
 	}
 
@@ -1691,14 +1692,24 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 		return NULL;
 	}
 
+	struct moe_stream_layer *L = &c->layers[layer];
+	uint64_t now			   = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
+	int		 need_fetch[MOE_MAX_TOPK];
+	int		 n_need = 0;
+
+	resolve_scan_hits(c, L, m, expert_ids, n_k, now, out_slots, need_fetch, &n_need, 1);
+
+	if (n_need == 0)
+		return NULL;
+
 	moe_stream_op *op  = xcalloc(1, sizeof(*op));
 	op->model		   = m;
 	op->cache		   = c;
-	op->slayer		   = &c->layers[layer];
+	op->slayer		   = L;
 	op->layer		   = layer;
 	op->n_k			   = n_k;
 	op->out_slots	   = out_slots;
-	op->now			   = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
+	op->now			   = now;
 	op->st			   = OK;
 	op->n_chunks	   = 0;
 	op->chunks		   = NULL;
@@ -1706,17 +1717,6 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	op->items		   = NULL;
 	op->n_items		   = 0;
 	op->n_misses	   = 0;
-
-	struct moe_stream_layer *L = op->slayer;
-	int						 need_fetch[MOE_MAX_K];
-	int						 n_need = 0;
-
-	resolve_scan_hits(c, L, m, expert_ids, n_k, op->now, out_slots, need_fetch, &n_need, 1);
-
-	if (n_need == 0) {
-		moe_stream_op_free(op);
-		return NULL;
-	}
 
 	resolve_collect_misses(c, L, m, layer, expert_ids, op->now, out_slots, need_fetch, n_need,
 						   op->misses, &op->n_misses, NULL, NULL);
@@ -1767,7 +1767,7 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	}
 
 	{
-		char pending[MOE_MAX_K];
+		char pending[MOE_MAX_TOPK];
 		memset(pending, 0, sizeof(pending));
 		for (int i = 0; i < op->n_misses; i++) {
 			moe_miss_entry *me = &op->misses[i];

@@ -392,7 +392,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
 
 	if (m->arch_info->is_moe)
-		s->moe_slot_buf = xcalloc(MOE_MAX_K, sizeof(*s->moe_slot_buf));
+		s->moe_slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe_slot_buf));
 
 	if (m->arch_info->has_variable_layer_dims) {
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
@@ -452,6 +452,18 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out) {
+	long w = m->sliding_window;
+	if (w > 0) {
+		long slack = w / 4 < 8 ? 8 : w / 4;
+		long cap   = w + slack;
+		if (pos_start + n_tokens > cap && n_tokens > slack + 1) {
+			ERROR("batch of %d tokens exceeds the %ld-token sliding-window slack (window %ld, "
+				  "capacity %ld): rows early in this batch would lose window history. "
+				  "Reduce the prefill chunk size to %ld.",
+				  n_tokens, slack, w, cap, slack + 1);
+			return ERR_INVALID_ARG;
+		}
+	}
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;

@@ -1,5 +1,12 @@
 #include "test_core.h"
 
+#include "arch.h"
+#include "memconfig.h"
+#include "model.h"
+
+static float *ref_softmax_attn(const float *q, const float *k, const float *v, int n_heads, int kvh,
+							   int hd, int t0, int n_pos, float scale);
+
 static void test_op_matmul(backend *ref, backend *tgt, const qtype_info *qt, int n, int k) {
 	char label[128];
 	if (!tgt->matmul || !tgt->buffer_alloc_weight) {
@@ -1129,6 +1136,311 @@ static void test_op_attention_swa(backend *ref, backend *tgt, int n_heads, int n
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static void test_op_kv_batch_put_layers(backend *b, int compacted) {
+	char label[160];
+	snprintf(label, sizeof(label), "kv batch put per-layer dims cap=%s [%s]",
+			 compacted ? "compact" : "full", b->name);
+	if (!b->kv_put_batch || !b->kv_alloc || !b->kv_free || !b->attention) {
+		record_result(OPFAM_KV_QUANT_PARITY, label, V_SKIP,
+					  "backend has no kv_put_batch/attention");
+		return;
+	}
+	if (compacted && (!b->attention_swa || !backend_has_cap(b, BCAP_KV_POS_CAP))) {
+		record_result(OPFAM_KV_QUANT_PARITY, label, V_SKIP,
+					  "backend lacks attention_swa or BCAP_KV_POS_CAP");
+		return;
+	}
+	static const int LHD[3]	  = {64, 96, 128};
+	static const int LK[3]	  = {1, 1, 1};
+	const int		 n_layers = 3, n_ctx = 64, n_heads = 4, n_pos = 32, chunk = 16, cap = 20;
+	int				 pcaps[3] = {cap, cap, cap};
+	kv_desc			 d		  = {.n_layers		   = n_layers,
+								 .n_kv_layers	   = n_layers,
+								 .n_kv_heads	   = 1,
+								 .head_dim		   = LHD[2],
+								 .n_ctx			   = n_ctx,
+								 .kv_quant		   = KV_QUANT_F16,
+								 .layer_head_dim   = LHD,
+								 .layer_n_kv_heads = LK,
+								 .layer_pos_cap	   = compacted ? pcaps : NULL};
+	buffer			 kc = {0}, vc = {0}, kb = {0}, vb = {0}, qb = {0}, ob = {0};
+	if (b->kv_alloc(b, &d, &kc, &vc) != OK) {
+		record_result(OPFAM_KV_QUANT_PARITY, label, V_SKIP, "kv_alloc failed");
+		return;
+	}
+	b->buffer_alloc_scratch(b, (size_t)LHD[2] * chunk * sizeof(float), &kb);
+	b->buffer_alloc_scratch(b, (size_t)LHD[2] * chunk * sizeof(float), &vb);
+	b->buffer_alloc_scratch(b, (size_t)n_heads * LHD[2] * sizeof(float), &qb);
+	b->buffer_alloc_scratch(b, (size_t)n_heads * LHD[2] * sizeof(float), &ob);
+
+	float *kf	= xmalloc((size_t)n_pos * LHD[2] * sizeof(float));
+	float *vf	= xmalloc((size_t)n_pos * LHD[2] * sizeof(float));
+	float *qf	= xmalloc((size_t)n_heads * LHD[2] * sizeof(float));
+	float *got	= xmalloc((size_t)n_heads * LHD[2] * sizeof(float));
+	float *krow = xmalloc((size_t)LHD[2] * sizeof(float));
+	float *vrow = xmalloc((size_t)LHD[2] * sizeof(float));
+	seed_test_rng(0x5A17ULL);
+	const int t0	 = (compacted && n_pos > cap) ? n_pos - cap : 0;
+	const int window = compacted ? cap : n_pos;
+	float	  worst	 = 0.0f;
+	for (int l = 0; l < n_layers; l++) {
+		int hd = LHD[l];
+		fill_random_f32(kf, (size_t)n_pos * hd, 1.0f);
+		fill_random_f32(vf, (size_t)n_pos * hd, 1.0f);
+		for (int start = 0; start < n_pos; start += chunk) {
+			int rows = (n_pos - start) < chunk ? (n_pos - start) : chunk;
+			for (int r = 0; r < rows; r++) {
+				memcpy(krow, kf + (size_t)(start + r) * hd, (size_t)hd * sizeof(float));
+				memcpy(vrow, vf + (size_t)(start + r) * hd, (size_t)hd * sizeof(float));
+				b->buffer_write_f32(b, &kb, krow, hd);
+				b->buffer_write_f32(b, &vb, vrow, hd);
+				b->kv_put_batch(b, &kc, &vc, l, start + r, &kb, &vb, hd, 1, hd, n_ctx, 1, 1);
+			}
+		}
+		fill_random_f32(qf, (size_t)n_heads * hd, 1.0f);
+		b->buffer_write_f32(b, &qb, qf, (size_t)n_heads * hd);
+		const float scale = 1.0f / sqrtf((float)hd);
+		if (compacted)
+			b->attention_swa(b, &qb, &kc, &vc, &ob, l, n_pos - 1, n_heads, 1, hd, n_ctx, 1, scale,
+							 window, 1);
+		else
+			b->attention(b, &qb, &kc, &vc, &ob, l, n_pos - 1, n_heads, 1, hd, n_ctx, 1, scale, 1);
+		b->buffer_read_f32(b, &ob, got, (size_t)n_heads * hd);
+		float *r  = ref_softmax_attn(qf, kf, vf, n_heads, 1, hd, t0, n_pos, scale);
+		float  lw = 0.0f;
+		for (int i = 0; i < n_heads * hd; i++) {
+			float e = fabsf(r[i] - got[i]);
+			if (e > lw)
+				lw = e;
+		}
+		if (lw > worst)
+			worst = lw;
+		free(r);
+	}
+	char detail[192];
+	snprintf(detail, sizeof(detail), "max_abs=%.3e over %d layers (hd %d/%d/%d, window %d)", worst,
+			 n_layers, LHD[0], LHD[1], LHD[2], window);
+	record_result(OPFAM_KV_QUANT_PARITY, label, worst < 2e-2f ? V_PASS : V_FAIL, detail);
+	free(kf);
+	free(vf);
+	free(qf);
+	free(got);
+	free(krow);
+	free(vrow);
+	b->buffer_free(b, &kb);
+	b->buffer_free(b, &vb);
+	b->buffer_free(b, &qb);
+	b->buffer_free(b, &ob);
+	b->kv_free(b, &kc, &vc);
+}
+
+static void test_op_attention_swa_slide(backend *b, int n_heads, int n_kv_heads, int head_dim,
+										int n_ctx, int n_steps, int sliding_window, int flash,
+										int n_prefill, int compact, kv_quant_type kq,
+										const float *ref_all, float **y_out, int record) {
+	char label[224];
+	snprintf(label, sizeof(label),
+			 "attention_swa slide h=%d/%d d=%d ctx=%d steps=%d pre=%d win=%d flash=%d "
+			 "cap=%s kv=%s [%s]",
+			 n_heads, n_kv_heads, head_dim, n_ctx, n_steps, n_prefill, sliding_window, flash,
+			 compact ? "compact" : "full", kq == KV_QUANT_Q8_0 ? "q8_0" : "f16", b->name);
+	if (!b->attention_swa || !b->attention_swa_batch) {
+		if (record)
+			record_result(OPFAM_ATTENTION_SWA, label, V_SKIP,
+						  "backend has no native attention_swa/attention_swa_batch");
+		return;
+	}
+	if (n_steps > n_ctx)
+		n_steps = n_ctx;
+	if (n_prefill > n_steps)
+		n_prefill = n_steps;
+	int	  chunk = n_prefill < 16 ? (n_prefill > 0 ? n_prefill : 1) : 16;
+	int	  n		= n_heads * head_dim;
+	int	  n_kv	= n_kv_heads * head_dim;
+	float scale = 1.0f / sqrtf((float)head_dim);
+	seed_test_rng(0x51DEULL + ((uint64_t)n_heads * 89) + ((uint64_t)n_kv_heads * 11) +
+				  ((uint64_t)head_dim * 5) + ((uint64_t)n_ctx * 3) + ((uint64_t)n_steps * 17) +
+				  ((uint64_t)n_prefill * 19) + ((uint64_t)sliding_window * 7) +
+				  ((uint64_t)flash * 23));
+
+	float *kf = xmalloc((size_t)n_steps * (size_t)n_kv * sizeof(float));
+	float *vf = xmalloc((size_t)n_steps * (size_t)n_kv * sizeof(float));
+	float *qf = xmalloc((size_t)n_steps * (size_t)n * sizeof(float));
+	for (int t = 0; t < n_steps; t++) {
+		fill_random_f32(kf + (size_t)t * n_kv, n_kv, 1.0f);
+		fill_random_f32(vf + (size_t)t * n_kv, n_kv, 1.0f);
+		fill_random_f32(qf + (size_t)t * n, n, 1.0f);
+	}
+
+	int pos_cap = n_ctx;
+	if (compact) {
+		pos_cap = sliding_window + (sliding_window / 4 < 8 ? 8 : sliding_window / 4);
+		if (pos_cap > n_ctx)
+			pos_cap = n_ctx;
+	}
+	int		layer_pos_cap[1] = {pos_cap};
+	kv_desc kvd				 = {.n_ctx		   = n_ctx,
+								.n_kv_heads	   = n_kv_heads,
+								.head_dim	   = head_dim,
+								.n_layers	   = 1,
+								.n_kv_layers   = 1,
+								.kv_quant	   = kq,
+								.layer_pos_cap = compact ? layer_pos_cap : NULL};
+	buffer	kc = {0}, vc = {0}, ki = {0}, vi = {0}, qb = {0}, ob = {0};
+	if (b->kv_alloc(b, &kvd, &kc, &vc) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)n_kv * sizeof(float), &ki) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)n_kv * sizeof(float), &vi) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)n * (size_t)chunk * sizeof(float), &qb) != OK ||
+		b->buffer_alloc_scratch(b, (size_t)n * (size_t)chunk * sizeof(float), &ob) != OK) {
+		if (record)
+			record_result(OPFAM_ATTENTION_SWA, label, V_SKIP, "kv_alloc/scratch failed");
+		goto done_alloc;
+	}
+
+	float	   *y_all	   = xmalloc((size_t)n_steps * (size_t)n * sizeof(float));
+	float	   *y_ref	   = xmalloc((size_t)n * sizeof(float));
+	float	   *y_worst	   = xmalloc((size_t)n * sizeof(float));
+	int			worst_step = -1;
+	int		   *base_at	   = xmalloc((size_t)n_steps * sizeof(int));
+	float		worst_abs  = 0.0f;
+	status_code s_worst	   = OK;
+	for (int start = 0; start < n_prefill; start += chunk) {
+		int rows = n_prefill - start;
+		if (rows > chunk)
+			rows = chunk;
+		for (int r = 0; r < rows; r++) {
+			int p = start + r;
+			b->buffer_write_f32(b, &ki, kf + (size_t)p * n_kv, n_kv);
+			b->buffer_write_f32(b, &vi, vf + (size_t)p * n_kv, n_kv);
+			b->kv_put(b, &kc, &vc, 0, p, &ki, &vi, n_kv_heads, head_dim, n_ctx, n_kv_heads);
+		}
+		b->buffer_write_f32(b, &qb, qf + (size_t)start * n, (size_t)n * (size_t)rows);
+		s_worst =
+			b->attention_swa_batch(b, &qb, &kc, &vc, &ob, 0, start, n_heads, n_kv_heads, head_dim,
+								   n_ctx, flash, scale, sliding_window, n_kv_heads, rows);
+		if (b->synchronize)
+			b->synchronize(b);
+		b->buffer_read_f32(b, &ob, y_all + (size_t)start * n, (size_t)n * (size_t)rows);
+		int cb = start + rows - pos_cap;
+		if (cb < 0)
+			cb = 0;
+		for (int r = 0; r < rows; r++)
+			base_at[start + r] = cb;
+	}
+
+	for (int p = n_prefill; p < n_steps; p++) {
+		b->buffer_write_f32(b, &ki, kf + (size_t)p * n_kv, n_kv);
+		b->buffer_write_f32(b, &vi, vf + (size_t)p * n_kv, n_kv);
+		b->kv_put(b, &kc, &vc, 0, p, &ki, &vi, n_kv_heads, head_dim, n_ctx, n_kv_heads);
+		b->buffer_write_f32(b, &qb, qf + (size_t)p * n, n);
+		if (b->synchronize)
+			b->synchronize(b);
+		status_code st =
+			b->attention_swa(b, &qb, &kc, &vc, &ob, 0, p, n_heads, n_kv_heads, head_dim, n_ctx,
+							 flash, scale, sliding_window, n_kv_heads);
+		if (b->synchronize)
+			b->synchronize(b);
+		b->buffer_read_f32(b, &ob, y_all + (size_t)p * n, n);
+		base_at[p] = (p + 1 - pos_cap) > 0 ? (p + 1 - pos_cap) : 0;
+		if (st != OK)
+			s_worst = st;
+	}
+
+	for (int p = 0; p < n_steps; p++) {
+		int t0 = (p + 1 > sliding_window) ? (p + 1 - sliding_window) : 0;
+		if (t0 < base_at[p])
+			t0 = base_at[p];
+		float *r = xmalloc((size_t)n * sizeof(float));
+		if (ref_all)
+			memcpy(r, ref_all + (size_t)p * n, (size_t)n * sizeof(float));
+		else
+			memcpy(r,
+				   ref_softmax_attn(qf + (size_t)p * n, kf, vf, n_heads, n_kv_heads, head_dim, t0,
+									p + 1, scale),
+				   (size_t)n * sizeof(float));
+		float ma = 0.0f;
+		for (int i = 0; i < n; i++) {
+			float e = fabsf(r[i] - y_all[(size_t)p * n + i]);
+			if (e > ma)
+				ma = e;
+		}
+		if (ma > worst_abs) {
+			worst_abs  = ma;
+			worst_step = p;
+			memcpy(y_ref, r, (size_t)n * sizeof(float));
+			memcpy(y_worst, y_all + (size_t)p * n, (size_t)n * sizeof(float));
+		}
+		free(r);
+	}
+
+	if (worst_step < 0) {
+		if (record)
+			record_result(OPFAM_ATTENTION_SWA, label, s_worst == OK ? V_PASS : V_FAIL,
+						  "bit-identical to the uncompacted run across all steps");
+	} else {
+		char	detail[256];
+		verdict v  = classify_output(ref_all ? "kv_quant" : "loose", y_ref, y_worst, n, s_worst,
+									 detail, sizeof(detail));
+		int		dl = (int)strlen(detail);
+		snprintf(detail + dl, sizeof(detail) - dl,
+				 " | prefill %d (batch, chunk %d) + %d decode steps, worst at pos=%d", n_prefill,
+				 chunk, n_steps - n_prefill, worst_step);
+		if (record)
+			record_result(OPFAM_ATTENTION_SWA, label, v, detail);
+	}
+
+	if (y_out)
+		*y_out = y_all;
+	else
+		free(y_all);
+	free(y_ref);
+	free(y_worst);
+	free(base_at);
+	b->buffer_free(b, &ki);
+	b->buffer_free(b, &vi);
+	b->buffer_free(b, &qb);
+	b->buffer_free(b, &ob);
+	b->buffer_free(b, &kc);
+	b->buffer_free(b, &vc);
+done_alloc:
+	free(qf);
+	free(kf);
+	free(vf);
+}
+
+static void test_op_attention_swa_compact_parity(backend *b, kv_quant_type kq, int n_heads,
+												 int n_kv_heads, int head_dim, int n_ctx,
+												 int n_steps, int sliding_window, int flash,
+												 int n_prefill) {
+	char label[192];
+	snprintf(label, sizeof(label),
+			 "attention_swa compaction parity vs full kv=%s h=%d/%d d=%d win=%d [%s]",
+			 kq == KV_QUANT_Q8_0 ? "q8_0" : "f16", n_heads, n_kv_heads, head_dim, sliding_window,
+			 b->name);
+	if (!b->attention_swa || !b->attention_swa_batch || !b->kv_alloc) {
+		record_result(OPFAM_ATTENTION_SWA, label, V_SKIP, "backend lacks swa ops or kv_alloc");
+		return;
+	}
+	if (kq == KV_QUANT_Q8_0 && !backend_has_cap(b, BCAP_KV_QUANT_Q8_0)) {
+		record_result(OPFAM_ATTENTION_SWA, label, V_SKIP,
+					  "backend does not advertise BCAP_KV_QUANT_Q8_0");
+		return;
+	}
+	if (!backend_has_cap(b, BCAP_KV_POS_CAP)) {
+		record_result(OPFAM_ATTENTION_SWA, label, V_SKIP,
+					  "backend does not advertise BCAP_KV_POS_CAP");
+		return;
+	}
+	float *y_full = NULL;
+	test_op_attention_swa_slide(b, n_heads, n_kv_heads, head_dim, n_ctx, n_steps, sliding_window,
+								flash, n_prefill, 0, kq, NULL, &y_full, 0);
+	if (!y_full)
+		return;
+	test_op_attention_swa_slide(b, n_heads, n_kv_heads, head_dim, n_ctx, n_steps, sliding_window,
+								flash, n_prefill, 1, kq, y_full, NULL, 1);
+	free(y_full);
+}
+
 static void test_op_attention_mla(backend *ref, backend *tgt, int n_heads, int qk_head, int qk_rope,
 								  int qk_nope, int v_head, int kv_lora, int n_ctx, int pos) {
 	if (!tgt->attention_mla || !tgt->kv_alloc_mla || !tgt->kv_put_mla) {
@@ -1708,12 +2020,15 @@ static void test_op_kv_quant_parity(backend *b, int n_kv_heads, int head_dim, in
 	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &q_ref_b);
 	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &out_ref);
 	b->buffer_write_f32(b, &q_ref_b, q, n);
-	b->attention(b, &q_ref_b, &kc_ref, &vc_ref, &out_ref, 0, pos, n_kv_heads, n_kv_heads, head_dim,
-				 n_ctx, 0, scale, n_kv_heads);
-	if (b && b->synchronize)
-		b->synchronize(b);
-	float *y_ref = xmalloc((size_t)n * sizeof(float));
-	b->buffer_read_f32(b, &out_ref, y_ref, n);
+	float *y_f16[2];
+	for (int fl = 0; fl < 2; fl++) {
+		b->attention(b, &q_ref_b, &kc_ref, &vc_ref, &out_ref, 0, pos, n_kv_heads, n_kv_heads,
+					 head_dim, n_ctx, fl, scale, n_kv_heads);
+		if (b->synchronize)
+			b->synchronize(b);
+		y_f16[fl] = xmalloc((size_t)n * sizeof(float));
+		b->buffer_read_f32(b, &out_ref, y_f16[fl], n);
+	}
 
 	kv_desc kvd_q8 = {.n_ctx	   = n_ctx,
 					  .n_kv_heads  = n_kv_heads,
@@ -1746,26 +2061,46 @@ static void test_op_kv_quant_parity(backend *b, int n_kv_heads, int head_dim, in
 	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &q_q8_b);
 	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &out_q8);
 	b->buffer_write_f32(b, &q_q8_b, q, n);
-	status_code s_got;
-	{
-		s_got = b->attention(b, &q_q8_b, &kc_q8, &vc_q8, &out_q8, 0, pos, n_kv_heads, n_kv_heads,
-							 head_dim, n_ctx, 0, scale, n_kv_heads);
+	float *k_flat = xmalloc((size_t)n_t * (size_t)n_kv * sizeof(float));
+	float *v_flat = xmalloc((size_t)n_t * (size_t)n_kv * sizeof(float));
+	for (int t = 0; t < n_t; t++) {
+		memcpy(k_flat + (size_t)t * n_kv, k_all[t], (size_t)n_kv * sizeof(float));
+		memcpy(v_flat + (size_t)t * n_kv, v_all[t], (size_t)n_kv * sizeof(float));
+	}
+	float *y_ref =
+		ref_softmax_attn(q, k_flat, v_flat, n_kv_heads, n_kv_heads, head_dim, 0, n_t, scale);
+	free(k_flat);
+	free(v_flat);
+
+	for (int fl = 0; fl < 2; fl++) {
+		status_code s_got = b->attention(b, &q_q8_b, &kc_q8, &vc_q8, &out_q8, 0, pos, n_kv_heads,
+										 n_kv_heads, head_dim, n_ctx, fl, scale, n_kv_heads);
 		if (b->synchronize)
 			b->synchronize(b);
+		float *y_q8 = xmalloc((size_t)n * sizeof(float));
+		b->buffer_read_f32(b, &out_q8, y_q8, n);
+
+		const char *qn[2]	= {"f16", "q8_0"};
+		float	   *ys[2]	= {y_f16[fl], y_q8};
+		status_code s_cs[2] = {OK, s_got};
+		for (int ci = 0; ci < 2; ci++) {
+			char flabel[160];
+			snprintf(flabel, sizeof(flabel), "%s %s flash=%d", label, qn[ci], fl);
+			char	detail[256];
+			verdict v =
+				classify_output("kv_quant", y_ref, ys[ci], n, s_cs[ci], detail, sizeof(detail));
+			if (v != V_PASS && v != V_SKIP)
+				compute_debug(y_ref, ys[ci], n);
+			int dl = (int)strlen(detail);
+			snprintf(detail + dl, sizeof(detail) - dl,
+					 " | kv cache quant parity: %s attention output vs f32 reference", qn[ci]);
+			record_result(OPFAM_KV_QUANT_PARITY, flabel, v, detail);
+		}
+		free(y_q8);
 	}
-	float *y_got = xmalloc((size_t)n * sizeof(float));
-	b->buffer_read_f32(b, &out_q8, y_got, n);
-
-	char	detail[256];
-	verdict v = classify_output("kv_quant", y_ref, y_got, n, s_got, detail, sizeof(detail));
-	if (v != V_PASS && v != V_SKIP)
-		compute_debug(y_ref, y_got, n);
-	int dl = (int)strlen(detail);
-	snprintf(detail + dl, sizeof(detail) - dl,
-			 " | kv cache quant parity: q8_0 attention output vs f16 reference");
-	record_result(OPFAM_KV_QUANT_PARITY, label, v, detail);
-
-	free(y_got);
+	for (int fl = 0; fl < 2; fl++)
+		free(y_f16[fl]);
+	free(y_ref);
 	b->buffer_free(b, &ki_q8);
 	b->buffer_free(b, &vi_q8);
 	b->buffer_free(b, &q_q8_b);
@@ -1787,7 +2122,6 @@ cleanup_ref:
 	free(k_all);
 	free(v_all);
 	free(q);
-	free(y_ref);
 	b->buffer_free(b, &ki_ref);
 	b->buffer_free(b, &vi_ref);
 	b->buffer_free(b, &q_ref_b);
@@ -1803,7 +2137,7 @@ cleanup_ref:
 }
 
 static float *ref_softmax_attn(const float *q, const float *k, const float *v, int n_heads, int kvh,
-							   int hd, int n_pos, float scale) {
+							   int hd, int t0, int n_pos, float scale) {
 	float *ref = xmalloc((size_t)n_heads * hd * sizeof(float));
 	memset(ref, 0, (size_t)n_heads * hd * sizeof(float));
 	int			 n_groups = n_heads / kvh;
@@ -1812,7 +2146,7 @@ static float *ref_softmax_attn(const float *q, const float *k, const float *v, i
 		int			 hh	  = h / n_groups;
 		const float *qh	  = q + (size_t)h * hd;
 		float		 maxs = -INFINITY;
-		for (int t = 0; t < n_pos; t++) {
+		for (int t = t0; t < n_pos; t++) {
 			float		 s	= 0;
 			const float *kt = k + (size_t)t * kvh * hd + (size_t)hh * hd;
 			for (int d = 0; d < hd; d++)
@@ -1822,12 +2156,12 @@ static float *ref_softmax_attn(const float *q, const float *k, const float *v, i
 				maxs = sc[t];
 		}
 		float sum = 0;
-		for (int t = 0; t < n_pos; t++) {
+		for (int t = t0; t < n_pos; t++) {
 			sc[t] = expf(sc[t] - maxs);
 			sum += sc[t];
 		}
 		float *out = ref + (size_t)h * hd;
-		for (int t = 0; t < n_pos; t++) {
+		for (int t = t0; t < n_pos; t++) {
 			float		 w	= sc[t] / sum;
 			const float *vt = v + (size_t)t * kvh * hd + (size_t)hh * hd;
 			for (int d = 0; d < hd; d++)
@@ -1837,9 +2171,131 @@ static float *ref_softmax_attn(const float *q, const float *k, const float *v, i
 	return ref;
 }
 
-static void test_op_kv_packed_layers(backend *b) {
+static void test_model_kv_size_shared(void) {
+	const int n_layers = 12, n_kv_layers = 10, n_ctx = 512, win = 64;
+	const int hd_swa = 64, hd_global = 128, kvh_swa = 4, kvh_global = 2, period = 6;
+	char	  label[160];
+	snprintf(label, sizeof(label), "kv size accounting shared+varlayers L=%d kvL=%d ctx=%d win=%d",
+			 n_layers, n_kv_layers, n_ctx, win);
+
+	arch_info ai			   = {0};
+	ai.has_variable_layer_dims = true;
+	ai.sliding_window_period   = period;
+
+	model m;
+	memset(&m, 0, sizeof(m));
+	m.arch_info						   = &ai;
+	m.n_layers						   = n_layers;
+	m.sliding_window				   = win;
+	m.layer_dims.n_layer_kv_from_start = n_kv_layers;
+	m.layers						   = xcalloc((size_t)n_layers, sizeof(*m.layers));
+	m.layer_dims.is_global_layer	   = xcalloc((size_t)n_layers, sizeof(uint8_t));
+	for (int li = 0; li < n_layers; li++) {
+		int glob						 = (li % period) == (period - 1);
+		m.layers[li].is_global_layer	 = (uint8_t)glob;
+		m.layer_dims.is_global_layer[li] = (uint8_t)glob;
+		m.layers[li].is_sliding			 = !glob;
+		m.layers[li].head_dim			 = glob ? hd_global : hd_swa;
+		m.layers[li].n_kv_heads			 = glob ? kvh_global : kvh_swa;
+	}
+
+	int	   expect_cap_swa = win + win / 4;
+	int	   n_swa_blocks = 0, n_glob_blocks = 0, cap_bad = 0;
+	size_t expect = 0;
+	for (int kvl = 0; kvl < n_kv_layers; kvl++) {
+		int pcap = model_kv_layer_pos_cap(&m, n_ctx, kvl);
+		int want = m.layers[kvl].is_sliding ? expect_cap_swa : n_ctx;
+		if (pcap != want)
+			cap_bad++;
+		if (m.layers[kvl].is_sliding)
+			n_swa_blocks++;
+		else
+			n_glob_blocks++;
+		expect += 2 * (size_t)m.layers[kvl].n_kv_heads * (size_t)m.layers[kvl].head_dim *
+				  (size_t)pcap * sizeof(uint16_t);
+	}
+
+	size_t got	= model_kv_cache_bytes_quant(&m, n_ctx, KV_QUANT_F16, 1);
+	size_t full = 0;
+	for (int kvl = 0; kvl < n_kv_layers; kvl++)
+		full += 2 * (size_t)m.layers[kvl].n_kv_heads * (size_t)m.layers[kvl].head_dim *
+				(size_t)n_ctx * sizeof(uint16_t);
+
+	char detail[256];
+	snprintf(detail, sizeof(detail),
+			 "swa_blocks=%d glob_blocks=%d | reported %.1f KB, n_ctx-equiv %.1f KB (%.0f%%) | "
+			 "cap mismatches=%d",
+			 n_swa_blocks, n_glob_blocks, got / 1024.0, full / 1024.0,
+			 full ? 100.0 * (double)got / (double)full : 0.0, cap_bad);
+	verdict v =
+		(got == expect && cap_bad == 0 && n_swa_blocks > 0 && n_glob_blocks > 0 && got < full)
+			? V_PASS
+			: V_FAIL;
+	record_result(OPFAM_KV_PUT, label, v, detail);
+
+	free(m.layer_dims.is_global_layer);
+	free(m.layers);
+}
+
+static void test_kv_size_matches_alloc(backend *b, int compacted) {
+	const int		 n_ctx	  = 256;
+	static const int LHD[]	  = {64, 128};
+	static const int LKVH[]	  = {1, 2};
+	int				 n_layers = 2, n_kv_layers = 2;
+	const int		 cap = 100;
+	char			 label[192];
+	snprintf(label, sizeof(label), "kv estimate == allocated bytes cap=%s [%s]",
+			 compacted ? "compacted" : "full", b->name);
+	if (!b->kv_alloc || !b->kv_free) {
+		record_result(OPFAM_KV_PUT, label, V_SKIP, "backend has no kv_alloc/kv_free");
+		return;
+	}
+	if (compacted && !backend_has_cap(b, BCAP_KV_POS_CAP)) {
+		record_result(OPFAM_KV_PUT, label, V_SKIP, "backend does not advertise BCAP_KV_POS_CAP");
+		return;
+	}
+	int *hd	 = xcalloc((size_t)n_layers, sizeof(int));
+	int *kvh = xcalloc((size_t)n_layers, sizeof(int));
+	for (int i = 0; i < n_layers; i++) {
+		hd[i]  = LHD[i];
+		kvh[i] = LKVH[i];
+	}
+	int			pcaps[2] = {cap, cap};
+	kv_desc		d		 = {.n_layers		  = n_layers,
+							.n_kv_layers	  = n_kv_layers,
+							.n_kv_heads		  = LKVH[1],
+							.head_dim		  = LHD[1],
+							.n_ctx			  = n_ctx,
+							.kv_quant		  = KV_QUANT_F16,
+							.layer_head_dim	  = hd,
+							.layer_n_kv_heads = kvh,
+							.layer_pos_cap	  = compacted ? pcaps : NULL};
+	buffer		k = {0}, v = {0};
+	status_code sa	   = b->kv_alloc(b, &d, &k, &v);
+	size_t		alloc  = (sa == OK) ? (k.size + v.size) : 0;
+	int			rows   = compacted ? cap : n_ctx;
+	size_t		expect = 0;
+	for (int i = 0; i < n_kv_layers; i++)
+		expect += 2 * (size_t)kvh[i] * (size_t)hd[i] * (size_t)rows * sizeof(uint16_t);
+	char detail[192];
+	snprintf(detail, sizeof(detail), "allocated %.2f MiB, expected %.2f MiB (%d rows/layer)",
+			 alloc / 1048576.0, expect / 1048576.0, rows);
+	record_result(OPFAM_KV_PUT, label, (sa == OK && alloc == expect) ? V_PASS : V_FAIL, detail);
+	if (sa == OK)
+		b->kv_free(b, &k, &v);
+	free(hd);
+	free(kvh);
+}
+
+static void test_op_kv_packed_layers(backend *b, kv_quant_type kq) {
 	char label[128];
-	snprintf(label, sizeof(label), "kv packed per-layer variable dims [%s]", b->name);
+	snprintf(label, sizeof(label), "kv packed per-layer variable dims %s [%s]",
+			 kq == KV_QUANT_Q8_0 ? "q8_0" : "f16", b->name);
+	if (kq == KV_QUANT_Q8_0 && !backend_has_cap(b, BCAP_KV_QUANT_Q8_0)) {
+		record_result(OPFAM_KV_QUANT_PARITY, label, V_SKIP,
+					  "backend does not advertise BCAP_KV_QUANT_Q8_0");
+		return;
+	}
 	static const int LHD[]	  = {32, 48, 64};
 	static const int LKVH[]	  = {1, 2, 4};
 	int				 n_layers = 3;
@@ -1858,7 +2314,7 @@ static void test_op_kv_packed_layers(backend *b) {
 					.n_kv_heads		  = LKVH[n_layers - 1],
 					.head_dim		  = hd_max,
 					.n_ctx			  = n_ctx,
-					.kv_quant		  = KV_QUANT_F16,
+					.kv_quant		  = kq,
 					.layer_head_dim	  = LHD,
 					.layer_n_kv_heads = LKVH};
 	buffer	kc = {0}, vc = {0};
@@ -1909,7 +2365,7 @@ static void test_op_kv_packed_layers(backend *b) {
 			b->synchronize(b);
 		b->buffer_read_f32(b, &ob, out, n_heads * hd);
 
-		float *ref	 = ref_softmax_attn(q, k_store, v_store, n_heads, kvh, hd, n_pos, scale);
+		float *ref	 = ref_softmax_attn(q, k_store, v_store, n_heads, kvh, hd, 0, n_pos, scale);
 		float  reld2 = 0, refn2 = 0;
 		for (int h = 0; h < n_heads; h++) {
 			for (int d = 0; d < hd; d++) {
@@ -1957,7 +2413,10 @@ static void test_op_kv_packed_layers(backend *b) {
 }
 
 static void run_kv_quant_parity_tests(backend *ref, backend *tgt) {
-	test_op_kv_packed_layers(ref);
+	test_op_kv_packed_layers(ref, KV_QUANT_F16);
+	test_op_kv_batch_put_layers(ref, 0);
+	test_op_kv_batch_put_layers(ref, 1);
+	test_op_kv_packed_layers(ref, KV_QUANT_Q8_0);
 	test_op_kv_quant_parity(ref, 4, 64, 1024, 0);
 	test_op_kv_quant_parity(ref, 4, 64, 1024, 127);
 	test_op_kv_quant_parity(ref, 8, 128, 2048, 511);
@@ -1967,7 +2426,8 @@ static void run_kv_quant_parity_tests(backend *ref, backend *tgt) {
 	test_op_kv_quant_parity(ref, 4, 80, 512, 63);
 	test_op_kv_quant_parity(ref, 2, 96, 512, 33);
 	if (tgt && tgt != ref) {
-		test_op_kv_packed_layers(tgt);
+		test_op_kv_packed_layers(tgt, KV_QUANT_F16);
+		test_op_kv_packed_layers(tgt, KV_QUANT_Q8_0);
 		test_op_kv_quant_parity(tgt, 4, 64, 1024, 0);
 		test_op_kv_quant_parity(tgt, 8, 128, 2048, 511);
 	}
@@ -2994,6 +3454,22 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_attention_swa(ref, tgt, 8, 4, 64, 1024, 511, 128, 1);
 	test_op_attention_swa(ref, tgt, 8, 8, 64, 1024, 20, 32, 0);
 	test_op_attention_swa(ref, tgt, 32, 8, 128, 2048, 1000, 512, 1);
+	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 1000, 0, 0, 0, KV_QUANT_F16, NULL, NULL,
+								1);
+	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 32, 0, 0, 0, KV_QUANT_F16, NULL, NULL, 1);
+	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 32, 1, 0, 0, KV_QUANT_F16, NULL, NULL, 1);
+	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 32, 0, 48, 0, KV_QUANT_F16, NULL, NULL, 1);
+	test_op_attention_swa_slide(ref, 8, 2, 128, 256, 200, 64, 1, 0, 0, KV_QUANT_F16, NULL, NULL, 1);
+	test_op_attention_swa_slide(ref, 8, 2, 128, 256, 200, 64, 1, 64, 0, KV_QUANT_F16, NULL, NULL,
+								1);
+	test_op_attention_swa_slide(ref, 8, 8, 64, 160, 150, 24, 1, 40, 0, KV_QUANT_F16, NULL, NULL, 1);
+	test_op_attention_swa_compact_parity(ref, KV_QUANT_F16, 8, 2, 128, 320, 240, 64, 0, 64);
+	test_op_attention_swa_compact_parity(ref, KV_QUANT_F16, 8, 2, 128, 384, 300, 128, 1, 64);
+	test_op_attention_swa_compact_parity(ref, KV_QUANT_F16, 4, 2, 64, 256, 200, 32, 1, 0);
+	test_op_attention_swa_compact_parity(ref, KV_QUANT_Q8_0, 8, 2, 128, 320, 240, 64, 0, 64);
+	test_op_attention_swa_compact_parity(tgt, KV_QUANT_F16, 8, 2, 128, 320, 240, 64, 0, 64);
+	test_op_attention_swa_slide(tgt, 8, 2, 128, 256, 200, 64, 1, 64, 1, KV_QUANT_F16, NULL, NULL,
+								1);
 	flush_family(OPFAM_ATTENTION_SWA);
 
 	test_op_attention_mla(ref, tgt, 2, 16, 8, 8, 16, 16, 64, 31);
@@ -3007,6 +3483,9 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_kv_put(ref, tgt, 8, 128, 2048, 511);
 	test_op_kv_put_batch(ref, tgt, 4, 64, 1024, 0, 7);
 	test_op_kv_put_batch(ref, tgt, 8, 128, 2048, 511, 33);
+	test_model_kv_size_shared();
+	test_kv_size_matches_alloc(ref, 0);
+	test_kv_size_matches_alloc(ref, 1);
 	flush_family(OPFAM_KV_PUT);
 
 	run_kv_quant_parity_tests(ref, tgt);

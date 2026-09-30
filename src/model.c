@@ -1515,8 +1515,9 @@ static status_code load_gemma4_metadata(model *m, const gguf_ctx *g, const char 
 				m->layer_dims.kv_layer_swa = i;
 			}
 		}
-		DEBUG("KV sharing: kv_layers=%d, swa=%d, global=%d", m->layer_dims.n_layer_kv_from_start,
-			  m->layer_dims.kv_layer_swa, m->layer_dims.kv_layer_global);
+		DEBUG("KV sharing: kv_store_layers=%d, last_swa_idx=%d, last_global_idx=%d",
+			  m->layer_dims.n_layer_kv_from_start, m->layer_dims.kv_layer_swa,
+			  m->layer_dims.kv_layer_global);
 
 		int needs_swa_target	= 0;
 		int needs_global_target = 0;
@@ -2780,7 +2781,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	int report_n_ctx = requested_n_ctx;
 	if (report_n_ctx <= 0 || report_n_ctx > m->n_ctx)
 		report_n_ctx = m->n_ctx;
-	recommend_memory_config(m, report_n_ctx, avail_before_load,
+	recommend_memory_config(m, bk->kv_alloc ? bk : backend_host(), report_n_ctx, avail_before_load,
 							(kv_quant_type)config_get()->kv_quant, is_host_backend);
 
 	return OK;

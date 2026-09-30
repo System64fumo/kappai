@@ -118,21 +118,45 @@ static size_t calc_per_expert_size(const model *m) {
 	return moe_calc_expert_bytes(m, first_moe, 0).total;
 }
 
-size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant) {
+int model_kv_layer_pos_cap(const model *m, int n_ctx, int kv_layer) {
+	if (kv_layer < 0 || kv_layer >= m->n_layers)
+		return n_ctx;
+	if (m->sliding_window <= 0 || !model_layer_is_sliding(m, kv_layer))
+		return n_ctx;
+	long w	   = m->sliding_window;
+	long slack = w / 4;
+	if (slack < 8)
+		slack = 8;
+	long cap = w + slack;
+	return cap >= (long)n_ctx ? n_ctx : (int)cap;
+}
+
+size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
+								  int compacted) {
 	size_t kv_cache = 0;
 	if (m->arch_info->is_mla) {
 		kv_cache = ((size_t)m->mla.kv_lora + (size_t)m->mla.qk_rope) * (size_t)n_ctx *
 				   (size_t)m->n_layers * sizeof(float);
 		return kv_cache;
 	}
-	for (int i = 0; i < m->n_layers; i++) {
+	int n_kv_layers =
+		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
+	if (n_kv_layers > m->n_layers)
+		n_kv_layers = m->n_layers;
+	for (int i = 0; i < n_kv_layers; i++) {
 		int kv_heads = model_layer_kv_heads(m, i);
-		int hdim	 = model_layer_head_dim(m, i);
+		if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
+			i < m->n_layers)
+			kv_heads = m->layer_dims.n_kv_heads_per_layer[i] > 0
+						   ? m->layer_dims.n_kv_heads_per_layer[i]
+						   : 0;
+		int hdim = model_layer_head_dim(m, i);
+		int pcap = compacted ? model_kv_layer_pos_cap(m, n_ctx, i) : n_ctx;
 		if (kv_quant == KV_QUANT_Q8_0) {
 			size_t n_blocks = ((size_t)hdim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-			kv_cache += (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)n_ctx * 2;
+			kv_cache += (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)pcap * 2;
 		} else {
-			kv_cache += (size_t)kv_heads * (size_t)hdim * (size_t)n_ctx * sizeof(uint16_t) * 2;
+			kv_cache += (size_t)kv_heads * (size_t)hdim * (size_t)pcap * sizeof(uint16_t) * 2;
 		}
 	}
 	return kv_cache;
@@ -209,21 +233,22 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 	return per_expert * (size_t)cache_cap * (size_t)n_layers;
 }
 
-void recommend_memory_config(const model *m, int n_ctx, size_t avail, kv_quant_type kv_quant,
-							 int is_host) {
+void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, size_t avail,
+							 kv_quant_type kv_quant, int is_host) {
 	if (n_ctx <= 0 || n_ctx > m->n_ctx)
 		n_ctx = m->n_ctx;
 	if (avail == 0)
 		return;
 
-	non_expert_breakdown bd			  = calc_non_expert_breakdown(m);
-	size_t				 non_expert	  = bd.total;
-	size_t				 per_expert	  = calc_per_expert_size(m);
-	int					 n_experts	  = m->moe.n_experts;
-	int					 n_layers	  = moe_layer_count(m);
-	int					 topk		  = m->moe.n_experts_used;
-	size_t				 kv_cache	  = model_kv_cache_bytes_quant(m, n_ctx, kv_quant);
-	size_t				 total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
+	non_expert_breakdown bd			= calc_non_expert_breakdown(m);
+	size_t				 non_expert = bd.total;
+	size_t				 per_expert = calc_per_expert_size(m);
+	int					 n_experts	= m->moe.n_experts;
+	int					 n_layers	= moe_layer_count(m);
+	int					 topk		= m->moe.n_experts_used;
+	size_t kv_cache		= model_kv_cache_bytes_quant(m, n_ctx, kv_quant,
+													 backend_has_cap(kv_backend, BCAP_KV_POS_CAP));
+	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
 
 	INFO("Available memory: %.1f GB", to_unit(avail, MEM_UNIT_GB));
 	DEBUG("memory breakdown:");
@@ -240,6 +265,18 @@ void recommend_memory_config(const model *m, int n_ctx, size_t avail, kv_quant_t
 		DEBUG("  routed experts:    %.1f GB (%.1f MB/expert, %d experts x %d layers)",
 			  to_unit(total_expert, MEM_UNIT_GB), to_unit(per_expert, MEM_UNIT_MB), n_experts,
 			  n_layers);
+	}
+	if (m->sliding_window > 0) {
+		int n_kv_layers = m->layer_dims.n_layer_kv_from_start > 0
+							  ? m->layer_dims.n_layer_kv_from_start
+							  : m->n_layers;
+		if (n_kv_layers > m->n_layers)
+			n_kv_layers = m->n_layers;
+		int n_sliding = 0;
+		for (int i = 0; i < n_kv_layers; i++)
+			n_sliding += model_layer_is_sliding(m, i) ? 1 : 0;
+		DEBUG("  sliding window:     %d (%d/%d kv layers, cap %d)", m->sliding_window, n_sliding,
+			  n_kv_layers, model_kv_layer_pos_cap(m, n_ctx, 0));
 	}
 	DEBUG("  KV cache (ctx=%d): %.0f MB (%s)", n_ctx, to_unit(kv_cache, MEM_UNIT_MB),
 		  kv_quant == KV_QUANT_Q8_0 ? "q8_0" : "f16");

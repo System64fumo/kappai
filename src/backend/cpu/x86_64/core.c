@@ -61,15 +61,17 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 		int		 hd_stride	  = head_dim;
 		size_t	 n_blocks	  = ((size_t)hd_stride + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 		size_t	 block_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-		size_t	 layer_stride = (size_t)n_kv_heads * n_ctx * block_stride;
-		size_t	 kvh_stride	  = (size_t)n_ctx * block_stride;
-		size_t	 pos_off	  = (size_t)pos * block_stride;
+		size_t	 kvh_stride	  = cpu_kv_layer_rows(p, layer, n_ctx) * block_stride;
+		size_t	 layer_stride = (size_t)n_kv_heads * kvh_stride;
 		uint8_t *kd_base	  = (uint8_t *)k->handle;
 		uint8_t *vd_base	  = (uint8_t *)v->handle;
 		for (int kvh = 0; kvh < n_active; kvh++) {
 			size_t layer_base =
 				p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
-			size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
+			size_t pos_off = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
+											 kvh_stride, block_stride, n_active) *
+							 block_stride;
+			size_t off	   = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
 			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 								 vf + ((size_t)kvh * head_dim), head_dim);
 		}
@@ -78,19 +80,23 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 	uint16_t *kd_base	   = (uint16_t *)cpu_ptr(k);
 	uint16_t *vd_base	   = (uint16_t *)cpu_ptr(v);
 	int		  hd_stride	   = head_dim;
-	size_t	  layer_stride = (size_t)n_kv_heads * n_ctx * hd_stride;
-	size_t	  kvh_stride   = (size_t)n_ctx * hd_stride;
-	size_t	  pos_off	   = (size_t)pos * hd_stride;
+	size_t	  kvh_stride   = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
+	size_t	  layer_stride = (size_t)n_kv_heads * kvh_stride;
 
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t		 layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-												  : ((size_t)layer * layer_stride);
-		size_t		 off		= layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		uint16_t	*kd			= kd_base + off;
-		uint16_t	*vd			= vd_base + off;
-		const float *kfh		= kf + ((size_t)kvh * head_dim);
-		const float *vfh		= vf + ((size_t)kvh * head_dim);
-		int			 i			= 0;
+		size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
+											: ((size_t)layer * layer_stride);
+		size_t pos_off =
+			cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base * sizeof(uint16_t),
+							kvh_stride * sizeof(uint16_t), (size_t)hd_stride * sizeof(uint16_t),
+							n_active) *
+			hd_stride;
+		size_t		 off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
+		uint16_t	*kd	 = kd_base + off;
+		uint16_t	*vd	 = vd_base + off;
+		const float *kfh = kf + ((size_t)kvh * head_dim);
+		const float *vfh = vf + ((size_t)kvh * head_dim);
+		int			 i	 = 0;
 		for (; i + 32 <= head_dim; i += 32) {
 			__m256 k0 = _mm256_loadu_ps(kfh + i);
 			__m256 k1 = _mm256_loadu_ps(kfh + i + 8);
@@ -869,7 +875,7 @@ static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		scores = cpu_grow_scores(j->p, tid, j->n_pos);
+		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	}
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
@@ -895,7 +901,7 @@ static void cpu_attn_kvh_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		scores = cpu_grow_scores(j->p, tid, j->n_pos);
+		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	}
 	for (int kvh = begin; kvh < end; kvh++) {
 		int h_start = kvh * j->n_groups;
@@ -946,14 +952,16 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 		attn_start = n_pos - sliding_window;
 		n_pos	   = sliding_window;
 	}
+	cpu_kv_window_to_slots(p, layer, &attn_start, &n_pos);
 
 	int can_recurse = (tpool_current_tid() < 0);
 
 	if (p->kv_quant == KV_QUANT_Q8_0) {
-		size_t n_blocks		= ((size_t)hd_stride_elems + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		size_t elem_stride	= n_blocks * KV_Q8_0_BLOCK_BYTES;
-		size_t layer_stride = (size_t)n_kv_heads * n_ctx * elem_stride;
-		size_t kvh_stride	= (size_t)n_ctx * elem_stride;
+		size_t n_blocks	   = ((size_t)hd_stride_elems + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+		size_t elem_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
+		size_t kvh_stride  = cpu_kv_layer_rows(p, layer, n_ctx) * elem_stride;
+
+		size_t layer_stride = (size_t)n_kv_heads * kvh_stride;
 		size_t layer_base =
 			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 		const uint8_t *kl_base =
@@ -997,9 +1005,10 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 		return OK;
 	}
 
-	int	   hd_stride	= hd_stride_elems;
-	size_t layer_stride = (size_t)n_kv_heads * n_ctx * hd_stride;
-	size_t kvh_stride	= (size_t)n_ctx * hd_stride;
+	int	   hd_stride  = hd_stride_elems;
+	size_t kvh_stride = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
+
+	size_t layer_stride = (size_t)n_kv_heads * kvh_stride;
 	size_t layer_base	= p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
 										  : ((size_t)layer * layer_stride);
 
@@ -1071,7 +1080,7 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		scores = cpu_grow_scores(j->p, tid, j->pos_start + j->m);
+		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->pos_start + j->m);
 	}
 
 	for (int idx = begin; idx < end; idx++) {
@@ -1084,6 +1093,17 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 		if (j->sliding_window > 0 && n_pos > j->sliding_window) {
 			attn_start = n_pos - j->sliding_window;
 			n_pos	   = j->sliding_window;
+		}
+		if (j->kv_base) {
+			size_t b = j->kv_base;
+			if (attn_start < (int)b) {
+				n_pos -= (int)b - attn_start;
+				attn_start = 0;
+				if (n_pos < 0)
+					n_pos = 0;
+			} else {
+				attn_start -= (int)b;
+			}
 		}
 
 		int			 kvh   = h / j->n_groups;
@@ -1124,19 +1144,21 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 	size_t		kvh_stride;
 	const void *kl_base_raw;
 	const void *vl_base_raw;
+	size_t		rows = cpu_kv_layer_rows(p, layer, n_ctx);
+	size_t		base = p->kv_base_pos ? p->kv_base_pos[layer] : 0;
 	if (p->kv_quant == KV_QUANT_Q8_0) {
 		size_t n_blocks = ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 		hd_stride		= (int)(n_blocks * KV_Q8_0_BLOCK_BYTES);
-		layer_stride	= (size_t)n_kv_heads * n_ctx * (size_t)hd_stride;
-		kvh_stride		= (size_t)n_ctx * (size_t)hd_stride;
+		layer_stride	= (size_t)n_kv_heads * rows * (size_t)hd_stride;
+		kvh_stride		= rows * (size_t)hd_stride;
 		size_t layer_base =
 			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 		kl_base_raw = (const uint8_t *)p->kv_k + layer_base;
 		vl_base_raw = (const uint8_t *)p->kv_v + layer_base;
 	} else {
 		hd_stride		  = head_dim;
-		layer_stride	  = (size_t)n_kv_heads * n_ctx * hd_stride;
-		kvh_stride		  = (size_t)n_ctx * hd_stride;
+		layer_stride	  = (size_t)n_kv_heads * rows * hd_stride;
+		kvh_stride		  = rows * hd_stride;
 		size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
 											: ((size_t)layer * layer_stride);
 		kl_base_raw		  = p->kv_k + layer_base;
@@ -1157,7 +1179,10 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 								  .scale	  = scale,
 								  .kvh_stride = kvh_stride,
 								  .p		  = p,
-								  .kv_quant	  = p->kv_quant};
+								  .kv_quant	  = p->kv_quant,
+								  .kv_layer	  = layer,
+								  .kv_rows	  = rows,
+								  .kv_base	  = base};
 
 	int total		= n_heads * m;
 	int cur_tid		= tpool_current_tid();

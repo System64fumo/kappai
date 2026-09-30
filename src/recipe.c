@@ -14,6 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+static int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
+							  int n_group, int topk_group, float *logits, const float *bias,
+							  float *scores_scratch, int *ids_out, float *w_out);
 
 #define RECIPE_MAX_ARCHES 32
 #define RECIPE_COALESCE_MAX 4
@@ -54,6 +57,7 @@ static buffer		*batch_slot(batch_scratch *bs, uint8_t slot);
 static buffer		 batch_row_view(const buffer *whole, int row, int row_elems);
 static inline float *batch_buf_ptr(const buffer *b);
 static status_code	 ple_build_batch(exec_ctx *ctx);
+static buffer		 bs_cached_view(float_buf *fb, backend *owner, size_t n_elems);
 static status_code	 ple_proj_inject_batch(exec_ctx *ctx);
 static status_code	 matmul_multi_batch_body(exec_ctx *ctx);
 static void			 moe_batch_expert_chunk(int begin, int end, int tid, void *ctx);
@@ -72,22 +76,14 @@ static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 	return &ctx->s->slots[idx];
 }
 
-float *recipe_slot_f32(const exec_ctx *ctx, uint8_t idx) {
-	buffer *b = exec_slot(ctx, idx);
-	if (!b)
-		return NULL;
-	if (b->handle)
-		return (float *)((char *)b->handle + b->offset);
-	return (float *)b->host_ptr;
-}
-
 static inline int slot_is_host_resident(const buffer *b) {
 	if (!b->handle)
 		return 1;
 	return b->owner && backend_has_cap(b->owner, BCAP_IS_HOST);
 }
 
-const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
+static const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage,
+										 int n) {
 	buffer *b = exec_slot(ctx, idx);
 	if (!b)
 		return NULL;
@@ -99,7 +95,7 @@ const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *s
 	return dst;
 }
 
-float *recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
+static float *recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
 	buffer *b = exec_slot(ctx, idx);
 	if (!b)
 		return NULL;
@@ -108,7 +104,8 @@ float *recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stag
 	return float_buf_ensure_nocopy(stage, (size_t)n, 64);
 }
 
-status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n) {
+static status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged,
+											int n) {
 	buffer *b = exec_slot(ctx, idx);
 	if (!b)
 		return ERR_INVALID_ARG;
@@ -185,7 +182,7 @@ void recipe_register(const char *arch_gguf_name, recipe_builder_fn builder) {
 	e->builder = builder;
 }
 
-const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name) {
+static const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name) {
 	if (!arch_gguf_name)
 		return NULL;
 	for (int i = 0; i < g_recipe_registry_count; i++) {
@@ -2364,9 +2361,7 @@ static uint32_t op_batch_slot_mask(const recipe_op *op) {
 	case OP_MOE_EXPERTS:
 	case OP_MOE_SHARED:
 		m |= bs_slot_bit(RECIPE_SLOT_XB) | bs_slot_bit(RECIPE_SLOT_XB2) |
-			 bs_slot_bit(RECIPE_SLOT_FFN_GATE) | bs_slot_bit(RECIPE_SLOT_FFN_UP) |
-			 bs_slot_bit(RECIPE_SLOT_FFN_ACT) | bs_slot_bit(RECIPE_SLOT_FFN_GATE_UP) |
-			 bs_slot_bit(RECIPE_SLOT_RESID_TMP);
+			 bs_slot_bit(RECIPE_SLOT_FFN_ACT) | bs_slot_bit(RECIPE_SLOT_RESID_TMP);
 		break;
 	default:
 		break;
@@ -3721,10 +3716,17 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 
 		buffer *xb = batch_slot(ctx->bs, RECIPE_SLOT_X);
 
+		size_t n_proj	= (size_t)n_rows * total_ple;
 		buffer proj_buf = {0};
-		st = a->buffer_alloc_scratch(a, (size_t)n_rows * total_ple * sizeof(float), &proj_buf);
-		if (st != OK)
-			return st;
+		int	   heap		= !backend_has_cap(a, BCAP_IS_HOST);
+		float_buf_ensure(&ctx->bs->ple_proj, n_proj);
+		if (heap) {
+			st = a->buffer_alloc_scratch(a, n_proj * sizeof(float), &proj_buf);
+			if (st != OK)
+				return st;
+		} else {
+			proj_buf = bs_cached_view(&ctx->bs->ple_proj, a, n_proj);
+		}
 
 		st = a->matmul_batch(a, &m->layer_dims.per_layer_model_proj.buf,
 							 m->layer_dims.per_layer_model_proj.type, xb, &proj_buf, total_ple, dim,
@@ -3756,7 +3758,8 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 							0.70710678118654752f);
 	ple_build_cleanup:
 		ensure_sync(a);
-		a->buffer_free(a, &proj_buf);
+		if (heap)
+			a->buffer_free(a, &proj_buf);
 		return st;
 	}
 
@@ -3822,17 +3825,21 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 	float_buf_ensure(&ctx->bs->ple_slice, (size_t)n_rows * n_embd_per_layer);
 
 	status_code st;
-	buffer		ple_inp_b = {0};
-	st = a->buffer_alloc_scratch(a, (size_t)n_rows * n_embd_per_layer * sizeof(float), &ple_inp_b);
-	if (st != OK)
-		return st;
-
-	buffer ple_slice_b = {0};
-	st =
-		a->buffer_alloc_scratch(a, (size_t)n_rows * n_embd_per_layer * sizeof(float), &ple_slice_b);
-	if (st != OK) {
-		a->buffer_free(a, &ple_inp_b);
-		return st;
+	size_t		n_ple	  = (size_t)n_rows * n_embd_per_layer;
+	buffer		ple_inp_b = {0}, ple_slice_b = {0};
+	int			heap = !backend_has_cap(a, BCAP_IS_HOST);
+	if (heap) {
+		st = a->buffer_alloc_scratch(a, n_ple * sizeof(float), &ple_inp_b);
+		if (st != OK)
+			return st;
+		st = a->buffer_alloc_scratch(a, n_ple * sizeof(float), &ple_slice_b);
+		if (st != OK) {
+			a->buffer_free(a, &ple_inp_b);
+			return st;
+		}
+	} else {
+		ple_inp_b	= bs_cached_view(&ctx->bs->ple_inp, a, n_ple);
+		ple_slice_b = bs_cached_view(&ctx->bs->ple_slice, a, n_ple);
 	}
 
 	if (ctx->bs->ple_all.handle) {
@@ -3894,8 +3901,10 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 
 ple_cleanup:
 	ensure_sync(a);
-	a->buffer_free(a, &ple_inp_b);
-	a->buffer_free(a, &ple_slice_b);
+	if (heap) {
+		a->buffer_free(a, &ple_inp_b);
+		a->buffer_free(a, &ple_slice_b);
+	}
 	return st;
 }
 
@@ -4156,7 +4165,7 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	moe_expert_slot *slot_buf = s->moe_slot_buf;
 	if (!slot_buf) {
-		slot_buf		= xcalloc(MOE_MAX_K, sizeof(*slot_buf));
+		slot_buf		= xcalloc(MOE_MAX_TOPK, sizeof(*slot_buf));
 		s->moe_slot_buf = slot_buf;
 	}
 	if (K > MOE_MAX_TOPK) {
@@ -4483,6 +4492,15 @@ static buffer mla_scratch_buf_alloc(float *stack, int stack_cap, int n, int *out
 	return buf;
 }
 
+static buffer bs_cached_view(float_buf *fb, backend *owner, size_t n_elems) {
+	buffer b   = {0};
+	b.handle   = fb->p;
+	b.host_ptr = fb->p;
+	b.size	   = n_elems * sizeof(float);
+	b.owner	   = owner;
+	return b;
+}
+
 static void mla_scratch_buf_free(buffer *buf, int heap) {
 	if (heap)
 		free(buf->handle);
@@ -4501,50 +4519,41 @@ static status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 		int			   kv_a_rows = kv_lora + qk_rope;
 		buffer		  *xb		 = batch_slot(ctx->bs, ctx->op->in[0]);
 
-		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_GATE].fb, (size_t)ctx->n_rows * q_lora);
-		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_UP].fb, (size_t)ctx->n_rows * kv_a_rows);
-
-		status_code st;
-		buffer		q_a_b = {0};
-		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * q_lora * sizeof(float), &q_a_b);
-		if (st != OK)
-			return st;
-		buffer kv_a_b = {0};
-		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * kv_a_rows * sizeof(float), &kv_a_b);
-		if (st != OK) {
-			a->buffer_free(a, &q_a_b);
-			return st;
-		}
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_GATE, (size_t)ctx->n_rows * q_lora);
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_UP, (size_t)ctx->n_rows * kv_a_rows);
+		status_code st	   = OK;
+		buffer	   *q_a_b  = &ctx->bs->pair[RECIPE_SLOT_FFN_GATE].b;
+		buffer	   *kv_a_b = &ctx->bs->pair[RECIPE_SLOT_FFN_UP].b;
 
 		if (a->matmul_multi_batch) {
 			const buffer *ws[2]	   = {&L->q_a_w.buf, &L->kv_a_w.buf};
 			uint32_t	  wts[2]   = {L->q_a_w.type, L->kv_a_w.type};
-			buffer		 *ys[2]	   = {&q_a_b, &kv_a_b};
+			buffer		 *ys[2]	   = {q_a_b, kv_a_b};
 			int			  n_out[2] = {q_lora, kv_a_rows};
 			st = a->matmul_multi_batch(a, ws, wts, xb, ys, n_out, dim, 2, ctx->n_rows);
 		} else {
-			st = a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, &q_a_b, q_lora, dim,
+			st = a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, q_a_b, q_lora, dim,
 								 ctx->n_rows);
 			if (st == OK)
-				st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, &kv_a_b, kv_a_rows, dim,
+				st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, kv_a_b, kv_a_rows, dim,
 									 ctx->n_rows);
 		}
 		if (st != OK)
 			goto mla_qkv_cleanup;
 
-		st = a->rmsnorm_batch(a, &q_a_b, &L->q_a_norm_w.buf, &q_a_b, q_lora, ctx->m->norm_eps,
+		st = a->rmsnorm_batch(a, q_a_b, &L->q_a_norm_w.buf, q_a_b, q_lora, ctx->m->norm_eps,
 							  ctx->n_rows);
 		if (st != OK)
 			goto mla_qkv_cleanup;
 
 		buffer *q_buf = batch_slot(ctx->bs, RECIPE_SLOT_Q);
-		st = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, &q_a_b, q_buf, q_b_rows, q_lora,
+		st = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, q_a_b, q_buf, q_b_rows, q_lora,
 							 ctx->n_rows);
 		if (st != OK)
 			goto mla_qkv_cleanup;
 
 		for (int row = 0; row < ctx->n_rows; row++) {
-			buffer kv_a_row = batch_row_view(&kv_a_b, row, kv_a_rows);
+			buffer kv_a_row = batch_row_view(kv_a_b, row, kv_a_rows);
 			st = a->kv_put_mla(a, &ctx->cache->mla->kv, ctx->li, ctx->pos_start + row, &kv_a_row,
 							   &L->kv_a_norm_w.buf, kv_lora, qk_rope, ctx->cache->n_ctx,
 							   ctx->m->norm_eps);
@@ -4553,8 +4562,6 @@ static status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 		}
 	mla_qkv_cleanup:
 		ensure_sync(a);
-		a->buffer_free(a, &q_a_b);
-		a->buffer_free(a, &kv_a_b);
 		return st;
 	}
 
@@ -4628,27 +4635,22 @@ static status_code op_mla_q_proj(exec_ctx *ctx) {
 		int			   q_b_rows = ctx->m->n_heads * ctx->m->mla.qk_head;
 		buffer		  *xb		= batch_slot(ctx->bs, ctx->op->in[0]);
 
-		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_GATE].fb, (size_t)ctx->n_rows * q_lora);
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_GATE, (size_t)ctx->n_rows * q_lora);
+		status_code st	  = OK;
+		buffer	   *q_a_b = &ctx->bs->pair[RECIPE_SLOT_FFN_GATE].b;
 
-		status_code st;
-		buffer		q_a_b = {0};
-		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * q_lora * sizeof(float), &q_a_b);
-		if (st != OK)
-			return st;
-
-		st = a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, &q_a_b, q_lora, dim, ctx->n_rows);
+		st = a->matmul_batch(a, &L->q_a_w.buf, L->q_a_w.type, xb, q_a_b, q_lora, dim, ctx->n_rows);
 		if (st != OK)
 			goto mla_q_cleanup;
-		st = a->rmsnorm_batch(a, &q_a_b, &L->q_a_norm_w.buf, &q_a_b, q_lora, ctx->m->norm_eps,
+		st = a->rmsnorm_batch(a, q_a_b, &L->q_a_norm_w.buf, q_a_b, q_lora, ctx->m->norm_eps,
 							  ctx->n_rows);
 		if (st != OK)
 			goto mla_q_cleanup;
 		buffer *q_buf = batch_slot(ctx->bs, RECIPE_SLOT_Q);
-		st = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, &q_a_b, q_buf, q_b_rows, q_lora,
+		st = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, q_a_b, q_buf, q_b_rows, q_lora,
 							 ctx->n_rows);
 	mla_q_cleanup:
 		ensure_sync(a);
-		a->buffer_free(a, &q_a_b);
 		return st;
 	}
 
@@ -4687,20 +4689,16 @@ static status_code op_mla_kv_proj(exec_ctx *ctx) {
 		int			   qk_rope	 = ctx->m->mla.qk_rope;
 		int			   kv_a_rows = kv_lora + qk_rope;
 		buffer		  *xb		 = batch_slot(ctx->bs, ctx->op->in[0]);
-		float_buf_ensure(&ctx->bs->pair[RECIPE_SLOT_FFN_UP].fb, (size_t)ctx->n_rows * kv_a_rows);
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_UP, (size_t)ctx->n_rows * kv_a_rows);
+		status_code st	   = OK;
+		buffer	   *kv_a_b = &ctx->bs->pair[RECIPE_SLOT_FFN_UP].b;
 
-		status_code st;
-		buffer		kv_a_b = {0};
-		st = a->buffer_alloc_scratch(a, (size_t)ctx->n_rows * kv_a_rows * sizeof(float), &kv_a_b);
-		if (st != OK)
-			return st;
-
-		st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, &kv_a_b, kv_a_rows, dim,
+		st = a->matmul_batch(a, &L->kv_a_w.buf, L->kv_a_w.type, xb, kv_a_b, kv_a_rows, dim,
 							 ctx->n_rows);
 		if (st != OK)
 			goto mla_kv_cleanup;
 		for (int row = 0; row < ctx->n_rows; row++) {
-			buffer kv_a_row = batch_row_view(&kv_a_b, row, kv_a_rows);
+			buffer kv_a_row = batch_row_view(kv_a_b, row, kv_a_rows);
 			st = a->kv_put_mla(a, &ctx->cache->mla->kv, ctx->li, ctx->pos_start + row, &kv_a_row,
 							   &L->kv_a_norm_w.buf, kv_lora, qk_rope, ctx->cache->n_ctx,
 							   ctx->m->norm_eps);
@@ -4709,7 +4707,6 @@ static status_code op_mla_kv_proj(exec_ctx *ctx) {
 		}
 	mla_kv_cleanup:
 		ensure_sync(a);
-		a->buffer_free(a, &kv_a_b);
 		return st;
 	}
 
@@ -4790,7 +4787,7 @@ static status_code op_attention_mla(exec_ctx *ctx) {
 							kv_lora, cache->n_ctx, s->rope_cos, s->rope_sin, scale);
 }
 
-status_code op_split_qgate(exec_ctx *ctx) {
+static status_code op_split_qgate(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
 	model		 *m		   = ctx->m;
@@ -4809,7 +4806,7 @@ status_code op_split_qgate(exec_ctx *ctx) {
 	return st;
 }
 
-status_code op_partial_rope_qk(exec_ctx *ctx) {
+static status_code op_partial_rope_qk(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s || ctx->pos < 0)
 		return ERR_INVALID_ARG;
 	model		 *m			 = ctx->m;
@@ -4831,7 +4828,7 @@ status_code op_partial_rope_qk(exec_ctx *ctx) {
 	return st;
 }
 
-status_code op_attn_output_gate(exec_ctx *ctx) {
+static status_code op_attn_output_gate(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
 	backend		 *a		 = exec_layer_backend(ctx);
@@ -4898,7 +4895,7 @@ static status_code gdn_run(exec_ctx *ctx, backend *t, const float *mixed, const 
 	return t->gated_delta_net(t, &desc);
 }
 
-status_code op_gated_delta_net(exec_ctx *ctx) {
+static status_code op_gated_delta_net(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->cache || !ctx->s || !ctx->cache->hybrid)
 		return ERR_INVALID_ARG;
 	profile_scope			   ps		= profile_begin(&ctx->s->prof, ctx->op->stage);
@@ -5002,7 +4999,7 @@ static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code op_shortconv(exec_ctx *ctx) {
+static status_code op_shortconv(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->cache || !ctx->cache->hybrid || !ctx->s)
 		return ERR_INVALID_ARG;
 	model					  *m	  = ctx->m;
@@ -5663,34 +5660,34 @@ recipe_op mk_partial_rope_qk(void) {
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_ROPE);
 }
 
-recipe_op mk_embd_lookup(void) {
+static recipe_op mk_embd_lookup(void) {
 	return mk_op_base(OP_EMBD_LOOKUP, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_X, WIDX_TOK_EMBD, STAGE_EMBD);
 }
 
-recipe_op mk_scale_embeddings(void) {
+static recipe_op mk_scale_embeddings(void) {
 	return mk_op_base(OP_SCALE_EMBEDDINGS, RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_X, RECIPE_NO_WEIGHT, STAGE_EMBD);
 }
 
-recipe_op mk_ple_build(void) {
+static recipe_op mk_ple_build(void) {
 	return mk_op_base(OP_PLE_BUILD, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_EMBD);
 }
 
-recipe_op mk_softcap(uint8_t in, float cap) {
+static recipe_op mk_softcap(uint8_t in, float cap) {
 	recipe_op op = mk_op_base(OP_SOFTCAP, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 							  RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
 	op.u.softcap.cap = cap;
 	return op;
 }
 
-recipe_op mk_logits_readback(void) {
+static recipe_op mk_logits_readback(void) {
 	return mk_op_base(OP_LOGITS_READBACK, RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
 }
 
-recipe_op mk_moe_router(uint8_t in, int n_experts, int k) {
+static recipe_op mk_moe_router(uint8_t in, int n_experts, int k) {
 	recipe_op op  = mk_op_base(OP_MOE_ROUTER, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 							   RECIPE_SLOT_ROUTER_IDS, WIDX_FFN_GATE_INP, STAGE_MATMUL);
 	op.u.matmul.n = n_experts;
@@ -5698,7 +5695,7 @@ recipe_op mk_moe_router(uint8_t in, int n_experts, int k) {
 	return op;
 }
 
-recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k) {
+static recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k) {
 	recipe_op op = mk_op_base(OP_MOE_EXPERTS, in, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W, out,
 							  WIDX_NONE, STAGE_MATMUL);
 	op.u.matmul.n = n;
@@ -5706,7 +5703,7 @@ recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k) {
 	return op;
 }
 
-recipe_op mk_moe_shared(uint8_t in, int n, int k) {
+static recipe_op mk_moe_shared(uint8_t in, int n, int k) {
 	recipe_op op  = mk_op_base(OP_MOE_SHARED, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 							   RECIPE_SLOT_FFN_ACT, WIDX_NONE, STAGE_MATMUL);
 	op.u.matmul.n = n;

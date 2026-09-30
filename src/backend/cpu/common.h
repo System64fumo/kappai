@@ -9,7 +9,8 @@
 
 #define CPU_BACKEND_CAPS                                                                           \
 	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
-	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0)
+	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
+	 BCAP_KV_POS_CAP)
 
 status_code cpu_backend_fill(backend *out);
 
@@ -64,10 +65,12 @@ typedef struct {
 	size_t		  xq8_buf_cap;
 	float		 *scores;
 	size_t		  scores_cap;
+	size_t		  scores_want;
 	int			  kv_head_dim_max;
 	kv_quant_type kv_quant;
 
 	size_t *kv_pos_cap;
+	size_t *kv_base_pos;
 
 	size_t kv_block_stride;
 	size_t kv_layer_stride;
@@ -77,6 +80,8 @@ typedef struct {
 	uint16_t *kv_v;
 
 	size_t *kv_layer_off;
+	size_t	kv_k_bytes;
+	int		kv_n_layers;
 
 	float *residual_tmp;
 	size_t residual_tmp_cap;
@@ -132,11 +137,92 @@ static inline float *cpu_grow_scores(cpu_priv *p, int tid, int need) {
 		cap = &p->scores_cap;
 	}
 	if (*cap < (size_t)need) {
+		size_t want = (size_t)need > p->scores_want ? (size_t)need : p->scores_want;
 		free(*buf);
-		*buf = xmalloc((size_t)need * sizeof(float));
-		*cap = (size_t)need;
+		*buf = xmalloc(want * sizeof(float));
+		*cap = want;
 	}
 	return *buf;
+}
+
+static inline size_t cpu_kv_uniform_rows(const cpu_priv *p, const kv_desc *desc) {
+	if (!p->kv_pos_cap || !desc->n_kv_layers)
+		return (size_t)desc->n_ctx;
+	size_t r = p->kv_pos_cap[0];
+	for (int i = 1; i < desc->n_kv_layers; i++)
+		if (p->kv_pos_cap[i] < r)
+			r = p->kv_pos_cap[i];
+	return r;
+}
+
+static inline void cpu_kv_layer_check(const cpu_priv *p, int layer) {
+	if (p->kv_n_layers > 0 && (layer < 0 || layer >= p->kv_n_layers)) {
+		ERROR("kv: layer %d is outside the %d allocated KV layers (shared-KV layers must be "
+			  "remapped to their store layer)",
+			  layer, p->kv_n_layers);
+		abort();
+	}
+}
+
+static inline size_t cpu_kv_layer_rows(const cpu_priv *p, int layer, int n_ctx) {
+	cpu_kv_layer_check(p, layer);
+	if (p->kv_pos_cap && p->kv_pos_cap[layer] > 0)
+		return p->kv_pos_cap[layer];
+	return (size_t)n_ctx;
+}
+
+static inline void cpu_kv_window_to_slots(const cpu_priv *p, int layer, int *attn_start,
+										  int *n_pos) {
+	if (!p->kv_base_pos)
+		return;
+	size_t bpos = p->kv_base_pos[layer];
+	if (!bpos)
+		return;
+	if (*attn_start < (int)bpos) {
+		*n_pos -= (int)bpos - *attn_start;
+		*attn_start = 0;
+		if (*n_pos < 0)
+			*n_pos = 0;
+	} else {
+		*attn_start -= (int)bpos;
+	}
+}
+
+static inline size_t cpu_kv_put_slot(cpu_priv *p, int layer, int pos, int n_ctx, void *kbase,
+									 void *vbase, size_t layer_off, size_t kvh_stride,
+									 size_t row_bytes, int n_kv_heads) {
+	if (!p->kv_base_pos || !p->kv_pos_cap)
+		return (size_t)pos;
+	cpu_kv_layer_check(p, layer);
+	size_t pcap = p->kv_pos_cap[layer];
+	if (pcap == 0 || pcap >= (size_t)n_ctx)
+		return (size_t)pos;
+	size_t bpos = p->kv_base_pos[layer];
+	if (p->kv_k_bytes) {
+		size_t need = layer_off + (size_t)n_kv_heads * kvh_stride;
+		if (need > p->kv_k_bytes) {
+			ERROR("kv compaction: layer %d needs %zu bytes (off %zu + %d heads x %zu stride) "
+				  "but the cache holds %zu -- layout does not match this buffer",
+				  layer, need, layer_off, n_kv_heads, kvh_stride, p->kv_k_bytes);
+			abort();
+		}
+	}
+	if ((size_t)pos >= bpos + pcap) {
+		size_t shift = (size_t)pos - bpos - pcap + 1;
+		if (shift > pcap)
+			shift = pcap;
+		for (int kvh = 0; kvh < n_kv_heads; kvh++) {
+			char *kr = (char *)kbase + layer_off + ((size_t)kvh * kvh_stride);
+			char *vr = (char *)vbase + layer_off + ((size_t)kvh * kvh_stride);
+			memmove(kr, kr + shift * row_bytes, (pcap - shift) * row_bytes);
+			memmove(vr, vr + shift * row_bytes, (pcap - shift) * row_bytes);
+		}
+		bpos += shift;
+		p->kv_base_pos[layer] = bpos;
+	}
+	if ((size_t)pos < bpos)
+		return 0;
+	return (size_t)pos - bpos;
 }
 
 static inline void *cpu_ptr(const buffer *b) {
@@ -231,6 +317,8 @@ typedef struct {
 	cpu_priv	   *p;
 	const int	   *bitrev_perm;
 	kv_quant_type	kv_quant;
+	int				kv_layer;
+	size_t			kv_rows, kv_base;
 } cpu_attn_batch_job;
 
 typedef struct {

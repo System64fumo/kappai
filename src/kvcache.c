@@ -1,5 +1,6 @@
 #include "kvcache.h"
 #include "log.h"
+#include "memconfig.h"
 #include "recipe.h"
 
 #include <stdlib.h>
@@ -119,6 +120,13 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		}
 	}
 
+	int *layer_pos_cap = NULL;
+	if (backend_has_cap(kv_backend, BCAP_KV_POS_CAP) && n_kv_layers > 0 && m->sliding_window > 0) {
+		layer_pos_cap = xcalloc((size_t)n_kv_layers, sizeof(int));
+		for (int i = 0; i < n_kv_layers; i++)
+			layer_pos_cap[i] = model_kv_layer_pos_cap(m, n_ctx, i);
+	}
+
 	kv_desc desc = {
 		.n_layers		  = m->n_layers,
 		.n_kv_layers	  = n_kv_layers,
@@ -128,10 +136,12 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		.kv_quant		  = kv_quant,
 		.layer_head_dim	  = layer_head_dim,
 		.layer_n_kv_heads = layer_n_kv_heads,
+		.layer_pos_cap	  = layer_pos_cap,
 	};
 	status_code s = kv_backend->kv_alloc(kv_backend, &desc, &c->k, &c->v);
 	free(layer_head_dim);
 	free(layer_n_kv_heads);
+	free(layer_pos_cap);
 	if (s != OK)
 		return s;
 	if (m->mixed_backend_mode || kv_backend != c->backend) {
@@ -269,6 +279,12 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 			layer_n_kv_heads[s] = model_layer_kv_heads(m, slot);
 		}
 
+		int *mirror_pos_cap = NULL;
+		if (backend_has_cap(host, BCAP_KV_POS_CAP) && n_mirrored > 0 && m->sliding_window > 0) {
+			mirror_pos_cap = xcalloc((size_t)n_mirrored, sizeof(int));
+			for (int i = 0; i < n_mirrored; i++)
+				mirror_pos_cap[i] = model_kv_layer_pos_cap(m, c->n_ctx, slot_list[i]);
+		}
 		kv_desc desc = {
 			.n_layers		  = n_mirrored,
 			.n_kv_layers	  = n_mirrored,
@@ -278,10 +294,12 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 			.kv_quant		  = c->kv_quant,
 			.layer_head_dim	  = layer_head_dim,
 			.layer_n_kv_heads = layer_n_kv_heads,
+			.layer_pos_cap	  = mirror_pos_cap,
 		};
 		status_code s = host->kv_alloc(host, &desc, &c->k_host, &c->v_host);
 		free(layer_head_dim);
 		free(layer_n_kv_heads);
+		free(mirror_pos_cap);
 		free(slot_list);
 		if (s != OK) {
 			free(remap);

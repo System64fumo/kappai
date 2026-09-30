@@ -289,28 +289,11 @@ typedef struct {
 	weight_ref			  **wtab_row;
 } exec_ctx;
 
-float		*recipe_slot_f32(const exec_ctx *ctx, uint8_t idx);
-const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
-float		*recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
-status_code	 recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n);
-
-int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
-					   int n_group, int topk_group, float *logits, const float *bias,
-					   float *scores_scratch, int *ids_out, float *w_out);
-
 #define recipe_exec_is_batch(ctx) ((ctx) && (ctx)->bs != NULL)
-
-status_code op_split_qgate(exec_ctx *ctx);
-status_code op_partial_rope_qk(exec_ctx *ctx);
-status_code op_attn_output_gate(exec_ctx *ctx);
-status_code op_gated_delta_net(exec_ctx *ctx);
-status_code op_shortconv(exec_ctx *ctx);
 
 typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 
-void					 recipe_register(const char *arch_gguf_name, recipe_builder_fn builder);
-const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name);
-
+void		  recipe_register(const char *arch_gguf_name, recipe_builder_fn builder);
 model_recipe *recipe_build(const struct model *m);
 void		  recipe_free(model_recipe *r);
 int			  recipe_is_batchable(const struct model *m);
@@ -359,18 +342,9 @@ recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_ext(uint8_t in, int rope_neox);
 recipe_op mk_partial_rope_qk(void);
-recipe_op mk_embd_lookup(void);
-recipe_op mk_scale_embeddings(void);
-recipe_op mk_ple_build(void);
-recipe_op mk_softcap(uint8_t in, float cap);
-recipe_op mk_logits_readback(void);
-recipe_op mk_moe_router(uint8_t in, int n_experts, int k);
-recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k);
-recipe_op mk_moe_shared(uint8_t in, int n, int k);
-
-int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
-int recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
-							   uint8_t norm_widx);
+int		  recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
+int		  recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
+									 uint8_t norm_widx);
 int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
 						  uint8_t experts_in_slot, uint8_t out_slot);
 
