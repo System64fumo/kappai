@@ -66,11 +66,13 @@ const char *op_family_name(op_family f) {
 		[OPFAM_ARCH_LAYER]		 = "arch.single_layer",
 		[OPFAM_ARCH_PIPELINE]	 = "arch.pipeline",
 		[OPFAM_QUANT]			 = "quant",
+		[OPFAM_DEQUANT_WEIGHT]	 = "dequant_weight",
 		[OPFAM_DEQUANT_PARITY]	 = "dequant_parity",
 		[OPFAM_ARCH_DECODE]		 = "arch.decode_chain",
 		[OPFAM_ARCH_COMPOUND]	 = "arch.error_compound",
 		[OPFAM_ARCH_GENERATE]	 = "arch.generate",
 		[OPFAM_MATMUL_RESIDUAL]	 = "matmul_residual",
+		[OPFAM_MATMUL_FFN_DOWN]	 = "matmul_ffn_down",
 		[OPFAM_ROPE_QK]			 = "rope_qk",
 		[OPFAM_BATCH_PARITY]	 = "batch_parity",
 		[OPFAM_EDGE_CASE]		 = "edge_case",
@@ -370,6 +372,27 @@ int count_nonfinite(const float *a, int n) {
 	return c;
 }
 
+void describe_nonfinite(const float *a, int n, int stride_hint, char *out, size_t out_sz) {
+	int	   shown = 0;
+	size_t off	 = 0;
+	off += (size_t)snprintf(out + off, out_sz - off, "non-finite at idx");
+	for (int i = 0; i < n && shown < 8; i++) {
+		if (isfinite(a[i]))
+			continue;
+		if (stride_hint > 0)
+			off += (size_t)snprintf(out + off, out_sz - off, " %d(head %d,d %d)", i,
+									i / stride_hint, i % stride_hint);
+		else
+			off += (size_t)snprintf(out + off, out_sz - off, " %d", i);
+		if (off + 16 >= out_sz)
+			break;
+		shown++;
+	}
+	int total = count_nonfinite(a, n);
+	if (total > shown)
+		snprintf(out + off, out_sz - off, " ... (+%d)", total - shown);
+}
+
 float max_combined_ratio_at(const float *a, const float *b, int n, float atol, float rtol,
 							int *at) {
 	float mx = 0.0f;
@@ -402,7 +425,9 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 
 	int nf = count_nonfinite(y_got, n);
 	if (nf > 0) {
-		snprintf(detail, detail_sz, "%d/%d non-finite (NaN/Inf) values in output", nf, n);
+		char where[192];
+		describe_nonfinite(y_got, n, 0, where, sizeof(where));
+		snprintf(detail, detail_sz, "%d/%d non-finite (NaN/Inf) values in output;%s", nf, n, where);
 		return V_FAIL;
 	}
 

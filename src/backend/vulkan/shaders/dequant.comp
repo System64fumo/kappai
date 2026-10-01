@@ -1,0 +1,273 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer SrcBuf {
+	uint src[];
+};
+layout(set = 0, binding = 1) writeonly buffer DstBuf {
+	float dst[];
+};
+#define IQ3S_GRID_BINDING 2
+#include "iq3s_grid.glsl"
+
+layout(push_constant) uniform Params {
+	int type;
+	int n_units;
+	int block_bytes;
+	int n_elems;
+}
+params;
+
+#include "common.glsl"
+#include "ggml_type.glsl"
+
+uint rd_u32(uint off) {
+	uint w	= off >> 2u;
+	uint sh = (off & 3u) * 8u;
+	uint v	= src[w] >> sh;
+	if (sh != 0u)
+		v |= src[w + 1u] << (32u - sh);
+	return v;
+}
+uint rd_u8(uint off) {
+	return rd_u32(off) & 0xFFu;
+}
+int rd_i8(uint off) {
+	int v = int(rd_u8(off));
+	return v >= 128 ? v - 256 : v;
+}
+float rd_f16(uint off) {
+	return unpackHalf2x16(rd_u32(off)).x;
+}
+
+void get_scale_min_k4(int j, uint so, out float d, out float m) {
+	if (j < 4) {
+		d = float(rd_u8(so + uint(j)) & 63u);
+		m = float(rd_u8(so + uint(j + 4)) & 63u);
+	} else {
+		uint qj4 = rd_u8(so + uint(j + 4));
+		uint qj0 = rd_u8(so + uint(j));
+		d		 = float((qj4 & 0xFu) | ((rd_u8(so + uint(j - 4)) >> 6u) << 4u));
+		m		 = float((qj4 >> 4u) | ((qj0 >> 6u) << 4u));
+	}
+}
+
+float ybuf[256];
+
+void dequant32(int type, uint b) {
+	if (type == GTYPE_Q4_0) {
+		const float d = rd_f16(b);
+		for (int l = 0; l < 16; l++) {
+			uint q		 = rd_u8(b + 2u + uint(l));
+			ybuf[l]		 = d * (float(int(q & 0xFu)) - 8.0);
+			ybuf[l + 16] = d * (float(int(q >> 4u)) - 8.0);
+		}
+	} else if (type == GTYPE_Q4_1) {
+		const float d = rd_f16(b);
+		const float m = rd_f16(b + 2u);
+		for (int l = 0; l < 16; l++) {
+			uint q		 = rd_u8(b + 4u + uint(l));
+			ybuf[l]		 = d * float(q & 0xFu) + m;
+			ybuf[l + 16] = d * float(q >> 4u) + m;
+		}
+	} else if (type == GTYPE_Q5_0) {
+		const float d  = rd_f16(b);
+		const uint	qh = rd_u32(b + 2u);
+		for (int l = 0; l < 16; l++) {
+			uint q		 = rd_u8(b + 6u + uint(l));
+			ybuf[l]		 = d * (float(int(q & 0xFu) | (int((qh >> uint(l)) & 1u) << 4)) - 16.0);
+			ybuf[l + 16] = d * (float(int(q >> 4u) | (int((qh >> uint(l + 16)) & 1u) << 4)) - 16.0);
+		}
+	} else if (type == GTYPE_Q5_1) {
+		const float d  = rd_f16(b);
+		const float m  = rd_f16(b + 2u);
+		const uint	qh = rd_u32(b + 4u);
+		for (int l = 0; l < 16; l++) {
+			uint q		 = rd_u8(b + 8u + uint(l));
+			ybuf[l]		 = d * float(int(q & 0xFu) | (int((qh >> uint(l)) & 1u) << 4)) + m;
+			ybuf[l + 16] = d * float(int(q >> 4u) | (int((qh >> uint(l + 16)) & 1u) << 4)) + m;
+		}
+	} else if (type == GTYPE_Q8_0) {
+		const float d = rd_f16(b);
+		for (int l = 0; l < 8; l++) {
+			uint base		= b + 2u + uint(l) * 4u;
+			ybuf[l * 4 + 0] = d * float(rd_i8(base));
+			ybuf[l * 4 + 1] = d * float(rd_i8(base + 1u));
+			ybuf[l * 4 + 2] = d * float(rd_i8(base + 2u));
+			ybuf[l * 4 + 3] = d * float(rd_i8(base + 3u));
+		}
+	} else {
+		const int kvalues[16] =
+			int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+		const float d = rd_f16(b);
+		for (int l = 0; l < 16; l++) {
+			uint q		 = rd_u8(b + 2u + uint(l));
+			ybuf[l]		 = d * float(kvalues[q & 0xFu]);
+			ybuf[l + 16] = d * float(kvalues[q >> 4u]);
+		}
+	}
+}
+
+void dequant256(int type, uint b) {
+	if (type == GTYPE_Q4_K) {
+		const float d  = rd_f16(b);
+		const float mn = rd_f16(b + 2u);
+		uint		q  = b + 16u;
+		int			is = 0;
+		for (int j = 0; j < 256; j += 64) {
+			float sc, sm, sc2, sm2;
+			get_scale_min_k4(is, b + 4u, sc, sm);
+			get_scale_min_k4(is + 1, b + 4u, sc2, sm2);
+			const float d1 = d * sc, m1 = mn * sm;
+			const float d2 = d * sc2, m2 = mn * sm2;
+			for (int l = 0; l < 32; l++) {
+				uint byte		 = rd_u8(q + uint(l));
+				ybuf[j + l]		 = d1 * float(byte & 0xFu) - m1;
+				ybuf[j + 32 + l] = d2 * float(byte >> 4u) - m2;
+			}
+			q += 32u;
+			is += 2;
+		}
+	} else if (type == GTYPE_Q5_K) {
+		const float d	 = rd_f16(b);
+		const float mn	 = rd_f16(b + 2u);
+		uint		ql	 = b + 48u;
+		uint		qh	 = b + 16u;
+		int			is	 = 0;
+		int			hbit = 0;
+		for (int j = 0; j < 256; j += 64) {
+			float sc, sm, sc2, sm2;
+			get_scale_min_k4(is, b + 4u, sc, sm);
+			get_scale_min_k4(is + 1, b + 4u, sc2, sm2);
+			const float d1 = d * sc, m1 = mn * sm;
+			const float d2 = d * sc2, m2 = mn * sm2;
+			for (int l = 0; l < 32; l++) {
+				uint byte = rd_u8(ql + uint(l));
+				uint hb	  = rd_u8(qh + uint(l));
+				ybuf[j + l] =
+					d1 * (float(byte & 0xFu) + float((hb >> uint(hbit)) & 1u) * 16.0) - m1;
+				ybuf[j + 32 + l] =
+					d2 * (float(byte >> 4u) + float((hb >> uint(hbit + 1)) & 1u) * 16.0) - m2;
+			}
+			ql += 32u;
+			hbit += 2;
+			is += 2;
+		}
+	} else if (type == GTYPE_Q6_K) {
+		const float d = rd_f16(b + 208u);
+		for (int n = 0; n < 256; n += 128) {
+			uint ql = b + n / 2u;
+			uint qh = b + 128u + n / 4u;
+			uint sc = b + 192u + n / 16u;
+			for (int l = 0; l < 32; l++) {
+				uint  q6		 = rd_u8(qh + uint(l));
+				int	  is		 = l / 16;
+				float s0		 = float(rd_i8(sc + uint(is)));
+				float s2		 = float(rd_i8(sc + uint(is + 2)));
+				float s4		 = float(rd_i8(sc + uint(is + 4)));
+				float s6		 = float(rd_i8(sc + uint(is + 6)));
+				uint  ql0		 = rd_u8(ql + uint(l));
+				uint  ql1		 = rd_u8(ql + 32u + uint(l));
+				float q1		 = float(int((ql0 & 0xFu) | ((q6 & 3u) << 4u)) - 32.0);
+				float q2		 = float(int((ql1 & 0xFu) | (((q6 >> 2u) & 3u) << 4u)) - 32.0);
+				float q3		 = float(int((ql0 >> 4u) | (((q6 >> 4u) & 3u) << 4u)) - 32.0);
+				float q4		 = float(int((ql1 >> 4u) | ((q6 >> 6u) << 4u)) - 32.0);
+				ybuf[n + l + 0]	 = d * s0 * q1;
+				ybuf[n + l + 32] = d * s2 * q2;
+				ybuf[n + l + 64] = d * s4 * q3;
+				ybuf[n + l + 96] = d * s6 * q4;
+			}
+		}
+	} else {
+		const float d	= rd_f16(b);
+		uint		ql	= b + 2u;
+		uint		qh	= b + 66u;
+		uint		sg	= b + 74u;
+		uint		scl = b + 106u;
+		for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+			uint  sb   = rd_u8(scl + uint(ib32 / 2));
+			float db1  = d * (1.0 + 2.0 * float(sb & 0xFu));
+			float db2  = d * (1.0 + 2.0 * float(sb >> 4u));
+			uint  qh0  = rd_u8(qh + uint(ib32));
+			uint  qh1  = rd_u8(qh + uint(ib32) + 1u);
+			uint  qb1  = ql + uint(ib32) * 8u;
+			uint  sgb1 = sg + uint(ib32) * 4u;
+			for (int l = 0; l < 4; l++) {
+				uint  g1   = rd_u8(qb1 + uint(2 * l)) | ((qh0 << uint(8 - 2 * l)) & 256u);
+				uint  g2   = rd_u8(qb1 + uint(2 * l + 1)) | ((qh0 << uint(7 - 2 * l)) & 256u);
+				uint  sign = rd_u8(sgb1 + uint(l));
+				float v[8];
+				v[0]		   = (sign & 1u) != 0u ? -db1 : db1;
+				v[1]		   = (sign & 2u) != 0u ? -db1 : db1;
+				v[2]		   = (sign & 4u) != 0u ? -db1 : db1;
+				v[3]		   = (sign & 8u) != 0u ? -db1 : db1;
+				v[4]		   = (sign & 16u) != 0u ? -db1 : db1;
+				v[5]		   = (sign & 32u) != 0u ? -db1 : db1;
+				v[6]		   = (sign & 64u) != 0u ? -db1 : db1;
+				v[7]		   = (sign & 128u) != 0u ? -db1 : db1;
+				int base	   = ib32 * 32 + l * 8;
+				ybuf[base + 0] = v[0] * float(iq3s_grid_byte(g1, 0));
+				ybuf[base + 1] = v[1] * float(iq3s_grid_byte(g1, 1));
+				ybuf[base + 2] = v[2] * float(iq3s_grid_byte(g1, 2));
+				ybuf[base + 3] = v[3] * float(iq3s_grid_byte(g1, 3));
+				ybuf[base + 4] = v[4] * float(iq3s_grid_byte(g2, 0));
+				ybuf[base + 5] = v[5] * float(iq3s_grid_byte(g2, 1));
+				ybuf[base + 6] = v[6] * float(iq3s_grid_byte(g2, 2));
+				ybuf[base + 7] = v[7] * float(iq3s_grid_byte(g2, 3));
+			}
+			uint qb2  = qb1 + 8u;
+			uint sgb2 = sgb1 + 4u;
+			for (int l = 0; l < 4; l++) {
+				uint  g1   = rd_u8(qb2 + uint(2 * l)) | ((qh1 << uint(8 - 2 * l)) & 256u);
+				uint  g2   = rd_u8(qb2 + uint(2 * l + 1)) | ((qh1 << uint(7 - 2 * l)) & 256u);
+				uint  sign = rd_u8(sgb2 + uint(l));
+				float v[8];
+				v[0]		   = (sign & 1u) != 0u ? -db2 : db2;
+				v[1]		   = (sign & 2u) != 0u ? -db2 : db2;
+				v[2]		   = (sign & 4u) != 0u ? -db2 : db2;
+				v[3]		   = (sign & 8u) != 0u ? -db2 : db2;
+				v[4]		   = (sign & 16u) != 0u ? -db2 : db2;
+				v[5]		   = (sign & 32u) != 0u ? -db2 : db2;
+				v[6]		   = (sign & 64u) != 0u ? -db2 : db2;
+				v[7]		   = (sign & 128u) != 0u ? -db2 : db2;
+				int base	   = ib32 * 32 + 32 + l * 8;
+				ybuf[base + 0] = v[0] * float(iq3s_grid_byte(g1, 0));
+				ybuf[base + 1] = v[1] * float(iq3s_grid_byte(g1, 1));
+				ybuf[base + 2] = v[2] * float(iq3s_grid_byte(g1, 2));
+				ybuf[base + 3] = v[3] * float(iq3s_grid_byte(g1, 3));
+				ybuf[base + 4] = v[4] * float(iq3s_grid_byte(g2, 0));
+				ybuf[base + 5] = v[5] * float(iq3s_grid_byte(g2, 1));
+				ybuf[base + 6] = v[6] * float(iq3s_grid_byte(g2, 2));
+				ybuf[base + 7] = v[7] * float(iq3s_grid_byte(g2, 3));
+			}
+		}
+	}
+}
+
+void main() {
+	const int unit = int(gl_GlobalInvocationID.x);
+	if (unit >= params.n_units)
+		return;
+
+	const int type = params.type;
+	if (type == GTYPE_F32) {
+		dst[uint(unit)] = uintBitsToFloat(rd_u32(uint(unit) * 4u));
+	} else if (type == GTYPE_F16) {
+		dst[uint(unit)] = unpackHalf2x16(rd_u32(uint(unit) * 2u)).x;
+	} else if (type == GTYPE_BF16) {
+		dst[uint(unit)] = uintBitsToFloat((rd_u32(uint(unit) * 2u) & 0xFFFFu) << 16u);
+	} else {
+		if (params.n_elems == 256) {
+			dequant256(type, uint(unit) * uint(params.block_bytes));
+		} else {
+			dequant32(type, uint(unit) * uint(params.block_bytes));
+		}
+		const int n = params.n_elems;
+		for (int i = 0; i < n; i++)
+			dst[uint(unit) * uint(n) + uint(i)] = ybuf[i];
+	}
+}

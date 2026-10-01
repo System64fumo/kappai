@@ -215,6 +215,9 @@ struct backend {
 								 int n_rows, int k);
 	status_code (*dequant_row)(backend *self, uint32_t type, const void *src, int n_elems,
 							   float *dst);
+	int (*dequant_type_native)(backend *self, uint32_t type, int k);
+	status_code (*dequant_weight)(backend *self, uint32_t type, const void *src, int n_rows, int k,
+								  buffer *out);
 	void (*synchronize)(backend *self);
 	void (*submit)(backend *self);
 	void (*begin_batch)(backend *self);

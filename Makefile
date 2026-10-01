@@ -200,10 +200,12 @@ FORMAT_FLAGS := -i -style=file
 TIDY_LOG     := $(OUT_DIR)/tidy.log
 
 VK_SHADERS_DIR := $(SRC_DIR)/backend/vulkan/shaders
-VK_INC_FILES   := $(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc)
+VK_INC_FILES   := $(filter %.glsl %.inc,$(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc))
+VK_COMP_DEPS  := $(wildcard $(VK_SHADERS_DIR)/*.comp)
 
 MATMUL_BATCH           := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16
 MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
+MATMUL_NMAT_TRIPLE_BATCH := matmul_q4_0
 
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
                     rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
@@ -235,12 +237,14 @@ SHADER_SPVS := \
 	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_batch.spv) \
 	$(foreach s,$(MATMUL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_residual_batch.spv) \
 	$(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_dual_batch.spv) \
+	$(foreach s,$(MATMUL_NMAT_TRIPLE_BATCH),$(OBJ_DIR)/backend/vulkan/$(s)_triple_batch.spv) \
 	$(foreach s,$(RMSNORM_ALL),$(OBJ_DIR)/backend/vulkan/$(s)_batch.spv) \
 	$(OBJ_DIR)/backend/vulkan/rope_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/dequant.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_fused_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
@@ -251,20 +255,20 @@ SHADERS_H := $(OBJ_DIR)/backend/vulkan/shaders_embedded.h
 ifneq ($(HAS_VULKAN),)
   $(BACKEND_OBJ_DIR)/backend/vulkan/vulkan.o: $(SHADERS_H)
 
-  $(OBJ_DIR)/backend/vulkan/%.spv: $(VK_SHADERS_DIR)/%.comp $(VK_INC_FILES) | $(OUT_DIR)
+  $(OBJ_DIR)/backend/vulkan/%.spv: $(VK_SHADERS_DIR)/%.comp $(VK_INC_FILES) $(VK_COMP_DEPS) | $(OUT_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  GLSLC   $@"
 	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $< -o $@
 
   define VK_VARIANT_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/$(3).comp $(VK_INC_FILES) | $(OUT_DIR)
+  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/$(3).comp $(VK_INC_FILES) $(VK_COMP_DEPS) | $(OUT_DIR)
 	@mkdir -p $$(dir $$@)
 	@echo "  GLSLC   $(1)$(2).spv"
 	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $(4) $$< -o $$@
   endef
 
   define RMSNORM_VARIANT_RULE
-  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) | $(OUT_DIR)
+  $(OBJ_DIR)/backend/vulkan/$(1)$(2).spv: $(VK_SHADERS_DIR)/rmsnorm.comp $(VK_INC_FILES) $(VK_COMP_DEPS) | $(OUT_DIR)
 	@mkdir -p $$(dir $$@)
 	@echo "  GLSLC   $(1)$(2).spv  [$$(strip $$($(1)_FLAGS) $(3))]"
 	@$(GLSLC) -O --target-env=vulkan1.1 -I$(VK_SHADERS_DIR) $$(strip $$($(1)_FLAGS) $(3)) $$< -o $$@
@@ -273,6 +277,7 @@ ifneq ($(HAS_VULKAN),)
   $(foreach s,$(MATMUL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_batch,$(s),-DBATCHED)))
   $(foreach s,$(MATMUL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_residual_batch,$(s),-DHAS_RESIDUAL -DBATCHED)))
   $(foreach s,$(MATMUL_NMAT_DUAL_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_dual_batch,$(s),-DNMAT_DUAL -DBATCHED)))
+  $(foreach s,$(MATMUL_NMAT_TRIPLE_BATCH),$(eval $(call VK_VARIANT_RULE,$(s),_triple_batch,$(s),-DNMAT_TRIPLE -DBATCHED)))
   $(foreach s,$(RMSNORM_ALL),$(eval $(call RMSNORM_VARIANT_RULE,$(s),_batch,-DBATCHED)))
   $(eval $(call VK_VARIANT_RULE,rope,_batch,rope,-DBATCHED))
   $(eval $(call VK_VARIANT_RULE,rope,_ext_batch,rope,-DHAS_FF -DBATCHED))

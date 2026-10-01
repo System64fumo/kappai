@@ -2,21 +2,21 @@
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) buffer DstBuf {
-	mediump float dst[];
+	float dst[];
 };
 layout(set = 0, binding = 1) readonly buffer Src1Buf {
-	mediump float src1[];
+	float src1[];
 };
 layout(set = 0, binding = 2) buffer Src2Buf {
-	mediump float src2[];
+	float src2[];
 };
 
 layout(push_constant) uniform Params {
-	int			  n;
-	int			  mode;
-	mediump float scale;
-	int			  _pad;
-	int			  m;
+	int	  n;
+	int	  mode;
+	float scale;
+	int	  _pad;
+	int	  m;
 }
 params;
 

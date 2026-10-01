@@ -387,7 +387,89 @@ static void test_repack_backend_batch_parity(backend *ref, const repack_spec *s,
 	ref->buffer_free(ref, &yb);
 }
 
-void run_repack_parity_tests(backend *ref) {
+static void test_matmul_multi3_parity(backend *ref, backend *tgt, int n0, int n1, int n2, int k,
+									  int m) {
+	char label[176];
+	snprintf(label, sizeof(label), "matmul_multi3_batch n=%d+%d+%d k=%d m=%d", n0, n1, n2, k, m);
+	if (!ref->matmul_multi_batch || !tgt->matmul_multi_batch) {
+		record_result(OPFAM_REPACK_PARITY, label, V_SKIP, "backend has no matmul_multi_batch");
+		return;
+	}
+
+	const int	   ns[3]  = {n0, n1, n2};
+	const uint32_t type	  = GGML_TYPE_Q4_0;
+	const size_t   row_sz = ggml_row_size(type, k);
+	const size_t   blk	  = row_sz / (size_t)(k / 32);
+	const int	   total  = (n0 + n1 + n2) * m;
+	float		  *x	  = xmalloc((size_t)k * (size_t)m * sizeof(float));
+	float		  *y_ref  = xmalloc((size_t)total * sizeof(float));
+	float		  *y_got  = xmalloc((size_t)total * sizeof(float));
+	float		  *poison = xmalloc((size_t)total * sizeof(float));
+	for (int i = 0; i < total; i++)
+		poison[i] = (float)NAN;
+	for (int t = 0; t < m; t++)
+		fill_random_f32(x + (size_t)t * k, k, 1.0f);
+
+	backend *bs[2] = {ref, tgt};
+	for (int side = 0; side < 2; side++) {
+		backend *b = bs[side];
+		void	*wraw[3];
+		buffer	 w[3] = {0}, xb = {0}, y[3] = {0};
+		for (int i = 0; i < 3; i++) {
+			wraw[i] = xmalloc((size_t)ns[i] * row_sz);
+			seed_test_rng(0xA17C0000ULL + ((uint64_t)i * 7919ULL) + ((uint64_t)k << 8) +
+						  (uint64_t)m);
+			fill_random_blocks(wraw[i], ns[i] * (k / 32), blk, type);
+			tensor_desc wd = {.host_data = wraw[i], .type = type, .n_dims = 2, .dims = {k, ns[i]}};
+			b->buffer_alloc_weight(b, &wd, &w[i]);
+		}
+		b->buffer_alloc_scratch(b, (size_t)k * (size_t)m * sizeof(float), &xb);
+		b->buffer_write_f32(b, &xb, x, k * m);
+		for (int i = 0; i < 3; i++)
+			b->buffer_alloc_scratch(b, (size_t)ns[i] * (size_t)m * sizeof(float), &y[i]);
+
+		const buffer *w_list[3] = {&w[0], &w[1], &w[2]};
+		uint32_t	  wt[3]		= {type, type, type};
+		buffer		 *y_list[3] = {&y[0], &y[1], &y[2]};
+
+		if (side == 0) {
+			b->matmul_multi_batch(b, w_list, wt, &xb, y_list, (int *)ns, k, 3, m);
+			int off = 0;
+			for (int i = 0; i < 3; i++) {
+				b->buffer_read_f32(b, &y[i], y_ref + off, ns[i] * m);
+				off += ns[i] * m;
+			}
+		} else {
+			int so = 0;
+			for (int i = 0; i < 3; i++) {
+				b->buffer_write_f32(b, &y[i], poison + so, ns[i] * m);
+				so += ns[i] * m;
+			}
+			b->matmul_multi_batch(b, w_list, wt, &xb, y_list, (int *)ns, k, 3, m);
+			int off = 0;
+			for (int i = 0; i < 3; i++) {
+				b->buffer_read_f32(b, &y[i], y_got + off, ns[i] * m);
+				off += ns[i] * m;
+			}
+		}
+
+		for (int i = 0; i < 3; i++) {
+			free(wraw[i]);
+			b->buffer_free(b, &w[i]);
+			b->buffer_free(b, &y[i]);
+		}
+		b->buffer_free(b, &xb);
+	}
+
+	test_parity_compare(OPFAM_REPACK_PARITY, label, y_ref, y_got, total, "loose");
+
+	free(x);
+	free(y_ref);
+	free(y_got);
+	free(poison);
+}
+
+void run_repack_parity_tests(backend *ref, backend *tgt) {
 	int shapes[][2] = {{32, 256}, {64, 512}, {64, 2048}, {512, 512}};
 	for (int s = 0; s < N_REPACK_SPECS; s++) {
 		for (int sh = 0; sh < (int)(sizeof(shapes) / sizeof(shapes[0])); sh++) {
@@ -425,6 +507,16 @@ void run_repack_parity_tests(backend *ref) {
 				continue;
 			test_repack_backend_batch_parity(ref, &REPACK_SPECS[s], n, k, m);
 		}
+	}
+
+	{
+		int triples[][5] = {
+			{32, 32, 32, 256, 1}, {64, 64, 64, 512, 1},	 {128, 128, 128, 2048, 1},
+			{96, 32, 64, 512, 1}, {32, 64, 96, 1024, 1}, {128, 32, 32, 2048, 4},
+		};
+		for (int sh = 0; sh < (int)(sizeof(triples) / sizeof(triples[0])); sh++)
+			test_matmul_multi3_parity(ref, tgt, triples[sh][0], triples[sh][1], triples[sh][2],
+									  triples[sh][3], triples[sh][4]);
 	}
 }
 
@@ -552,4 +644,74 @@ void test_dequant_parity_cross(backend *ref, backend *tgt, const qtype_info *qt,
 	free(blocks);
 	tgt->buffer_free(tgt, &w_tgt);
 	tgt->buffer_free(tgt, &out_tgt);
+}
+
+void test_dequant_weight_parity(backend *ref, backend *tgt, const qtype_info *qt, int k,
+								int n_rows) {
+	char label[160];
+	snprintf(label, sizeof(label), "%s dequant_weight k=%d rows=%d", qt->name, k, n_rows);
+	if (!tgt->dequant_weight) {
+		record_result(OPFAM_DEQUANT_WEIGHT, label, V_SKIP, "backend has no bulk dequant_weight");
+		return;
+	}
+	if (!ref || !ref->dequant_row) {
+		record_result(OPFAM_DEQUANT_WEIGHT, label, V_SKIP, "reference has no dequant_row");
+		return;
+	}
+	if (k % qt->block != 0)
+		return;
+
+	seed_test_rng(0xDE77ULL + qt->type + ((uint64_t)k * 31) + ((uint64_t)n_rows * 7));
+	void *blocks = test_make_weight(ref, qt, n_rows, k, NULL);
+	if (!blocks) {
+		record_result(OPFAM_DEQUANT_WEIGHT, label, V_SKIP, "reference cannot repack weight");
+		return;
+	}
+
+	const size_t row_stride = ggml_row_size(qt->type, (size_t)k);
+	float		*ref_all	= xmalloc((size_t)n_rows * k * sizeof(float));
+	for (int r = 0; r < n_rows; r++)
+		ref->dequant_row(ref, qt->type, (const uint8_t *)blocks + (size_t)r * row_stride, k,
+						 ref_all + (size_t)r * k);
+
+	buffer		out = {0};
+	status_code s	= tgt->dequant_weight(tgt, qt->type, blocks, n_rows, k, &out);
+	if (s == OK && tgt->synchronize)
+		tgt->synchronize(tgt);
+
+	char detail[256];
+	if (s != OK) {
+		verdict v = (s == ERR_UNSUPPORTED) ? V_SKIP : V_FAIL;
+		snprintf(detail, sizeof(detail), "dequant_weight status=%d", s);
+		record_result(OPFAM_DEQUANT_WEIGHT, label, v, detail);
+		free(ref_all);
+		free(blocks);
+		tgt->buffer_free(tgt, &out);
+		return;
+	}
+
+	float *tgt_all = xmalloc((size_t)n_rows * k * sizeof(float));
+	tgt->buffer_read_f32(tgt, &out, tgt_all, n_rows * k);
+
+	int	  worst_row = 0;
+	float worst_max = -1.0f;
+	for (int r = 0; r < n_rows; r++) {
+		int	  at;
+		float mx = max_abs_diff_at(ref_all + (size_t)r * k, tgt_all + (size_t)r * k, k, &at);
+		if (mx > worst_max) {
+			worst_max = mx;
+			worst_row = r;
+		}
+	}
+
+	verdict v = classify_output("loose", ref_all + (size_t)worst_row * k,
+								tgt_all + (size_t)worst_row * k, k, OK, detail, sizeof(detail));
+	if (v != V_PASS)
+		compute_debug(ref_all + (size_t)worst_row * k, tgt_all + (size_t)worst_row * k, k);
+	record_result(OPFAM_DEQUANT_WEIGHT, label, v, detail);
+
+	free(tgt_all);
+	free(ref_all);
+	free(blocks);
+	tgt->buffer_free(tgt, &out);
 }

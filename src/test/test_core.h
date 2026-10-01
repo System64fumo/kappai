@@ -60,10 +60,12 @@ typedef enum {
 	OPFAM_ARCH_PIPELINE,
 	OPFAM_QUANT,
 	OPFAM_DEQUANT_PARITY,
+	OPFAM_DEQUANT_WEIGHT,
 	OPFAM_ARCH_DECODE,
 	OPFAM_ARCH_COMPOUND,
 	OPFAM_ARCH_GENERATE,
 	OPFAM_MATMUL_RESIDUAL,
+	OPFAM_MATMUL_FFN_DOWN,
 	OPFAM_ROPE_QK,
 	OPFAM_BATCH_PARITY,
 	OPFAM_EDGE_CASE,
@@ -121,6 +123,7 @@ void		flush_family(op_family fam);
 float		max_abs_diff_at(const float *a, const float *b, int n, int *at);
 float		max_abs_val(const float *a, int n);
 int			count_nonfinite(const float *a, int n);
+void		describe_nonfinite(const float *a, int n, int stride_hint, char *out, size_t out_sz);
 float max_combined_ratio_at(const float *a, const float *b, int n, float atol, float rtol, int *at);
 verdict		classify_output(const char *tol_kind, const float *y_ref, const float *y_got, int n,
 							status_code tgt_status, char *detail, size_t detail_sz);
@@ -168,8 +171,10 @@ void		run_toolcall_tests(void);
 void		test_quant_determinism(backend *ref, const qtype_info *qt);
 void		test_quant_finiteness(backend *ref, const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(backend *ref);
-void		run_repack_parity_tests(backend *ref);
+void		run_repack_parity_tests(backend *ref, backend *tgt);
 void test_dequant_parity_cross(backend *ref, backend *tgt, const qtype_info *qt, int dim, int n);
+void test_dequant_weight_parity(backend *ref, backend *tgt, const qtype_info *qt, int k,
+								int n_rows);
 int	 run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
 int	 run_model_mode(int argc, char **argv, backend_info *infos, int n_backends);
 

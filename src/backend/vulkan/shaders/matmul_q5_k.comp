@@ -45,9 +45,14 @@ const int BLOCK							 = 256;
 const int BLOCKS_PER_TILE				 = TILE_K / BLOCK;
 
 shared float x_shared[TILE_K];
-shared int	 xq_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
 shared float xq_d[BLOCKS_PER_TILE];
-shared int	 xq_bsums[BLOCKS_PER_TILE * 16];
+
+shared int xq_bsums[BLOCKS_PER_TILE * 16];
+
+#define XQ_HAVE_BSUMS 1
+#include "quant_x8_block.glsl"
+#undef XQ_HAVE_BSUMS
 
 void main() {
 	uint i	 = gl_GlobalInvocationID.x;
@@ -80,9 +85,7 @@ void main() {
 		int block_end	= tile_end / 256;
 
 		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
-#define XQ_HAVE_BSUMS 1
-#include "quant_x8_block.glsl"
-#undef XQ_HAVE_BSUMS
+			xq8_quant_superblock(bi, block_start, tile_start);
 		}
 		barrier();
 
@@ -95,13 +98,13 @@ void main() {
 				float dmin		= half_to_float(w0_read_u16(block_off + 2u));
 
 				int	  local_bi = bi - block_start;
-				int	  x_base   = bi * 256 - tile_start;
 				float xd	   = xq_d[local_bi];
 
 				int	 sumi = 0, summ = 0;
 				uint s_off	= block_off + 4u;
 				uint qh_off = block_off + 16u;
 				uint qs_off = block_off + 48u;
+				int	 wp		= (bi * 256 - tile_start) >> 2;
 
 				uint qh_w0 = w0_read_u32(qh_off + 0u);
 				uint qh_w1 = w0_read_u32(qh_off + 4u);
@@ -126,36 +129,28 @@ void main() {
 
 #define Q5K_STEP(L, QH_W)                                                                          \
 	{                                                                                              \
-		uint qs_word  = w0_read_u32(qs_off + uint(g * 32 + (L)));                                  \
-		uint qh_word  = QH_W;                                                                      \
-		int	 qb0	  = int((qs_word) & 0xFFu);                                                    \
-		int	 qb1	  = int((qs_word >> 8u) & 0xFFu);                                              \
-		int	 qb2	  = int((qs_word >> 16u) & 0xFFu);                                             \
-		int	 qb3	  = int((qs_word >> 24u) & 0xFFu);                                             \
-		int	 qh0	  = int((qh_word) & 0xFFu);                                                    \
-		int	 qh1	  = int((qh_word >> 8u) & 0xFFu);                                              \
-		int	 qh2	  = int((qh_word >> 16u) & 0xFFu);                                             \
-		int	 qh3	  = int((qh_word >> 24u) & 0xFFu);                                             \
-		int	 lo0	  = (qb0 & 0xF) | (int((qh0 >> g_shift) & 1) << 4);                            \
-		int	 lo1	  = (qb1 & 0xF) | (int((qh1 >> g_shift) & 1) << 4);                            \
-		int	 lo2	  = (qb2 & 0xF) | (int((qh2 >> g_shift) & 1) << 4);                            \
-		int	 lo3	  = (qb3 & 0xF) | (int((qh3 >> g_shift) & 1) << 4);                            \
-		int	 w_lo	  = pack32(i8vec4(int8_t(lo0), int8_t(lo1), int8_t(lo2), int8_t(lo3)));        \
-		int	 xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + (L)]),                    \
-									  int8_t(xq_shared[x_base + g * 64 + (L) + 1]),                \
-									  int8_t(xq_shared[x_base + g * 64 + (L) + 2]),                \
-									  int8_t(xq_shared[x_base + g * 64 + (L) + 3])));              \
-		dot0 += dotPacked4x8EXT(w_lo, xq_word0);                                                   \
-		int hi0		 = (qb0 >> 4) | (int((qh0 >> (g_shift + 1)) & 1) << 4);                        \
-		int hi1		 = (qb1 >> 4) | (int((qh1 >> (g_shift + 1)) & 1) << 4);                        \
-		int hi2		 = (qb2 >> 4) | (int((qh2 >> (g_shift + 1)) & 1) << 4);                        \
-		int hi3		 = (qb3 >> 4) | (int((qh3 >> (g_shift + 1)) & 1) << 4);                        \
-		int w_hi	 = pack32(i8vec4(int8_t(hi0), int8_t(hi1), int8_t(hi2), int8_t(hi3)));         \
-		int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + (L) + 32]),                \
-									 int8_t(xq_shared[x_base + g * 64 + (L) + 33]),                \
-									 int8_t(xq_shared[x_base + g * 64 + (L) + 34]),                \
-									 int8_t(xq_shared[x_base + g * 64 + (L) + 35])));              \
-		dot1 += dotPacked4x8EXT(w_hi, xq_word1);                                                   \
+		uint qs_word = w0_read_u32(qs_off + uint(g * 32 + (L)));                                   \
+		uint qh_word = QH_W;                                                                       \
+		int	 qb0	 = int((qs_word) & 0xFFu);                                                     \
+		int	 qb1	 = int((qs_word >> 8u) & 0xFFu);                                               \
+		int	 qb2	 = int((qs_word >> 16u) & 0xFFu);                                              \
+		int	 qb3	 = int((qs_word >> 24u) & 0xFFu);                                              \
+		int	 qh0	 = int((qh_word) & 0xFFu);                                                     \
+		int	 qh1	 = int((qh_word >> 8u) & 0xFFu);                                               \
+		int	 qh2	 = int((qh_word >> 16u) & 0xFFu);                                              \
+		int	 qh3	 = int((qh_word >> 24u) & 0xFFu);                                              \
+		int	 lo0	 = (qb0 & 0xF) | (int((qh0 >> g_shift) & 1) << 4);                             \
+		int	 lo1	 = (qb1 & 0xF) | (int((qh1 >> g_shift) & 1) << 4);                             \
+		int	 lo2	 = (qb2 & 0xF) | (int((qh2 >> g_shift) & 1) << 4);                             \
+		int	 lo3	 = (qb3 & 0xF) | (int((qh3 >> g_shift) & 1) << 4);                             \
+		int	 w_lo	 = pack32(i8vec4(int8_t(lo0), int8_t(lo1), int8_t(lo2), int8_t(lo3)));         \
+		dot0 += dotPacked4x8EXT(w_lo, int(xq_packed[wp + g * 16 + (L) / 4]));                      \
+		int hi0	 = (qb0 >> 4) | (int((qh0 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi1	 = (qb1 >> 4) | (int((qh1 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi2	 = (qb2 >> 4) | (int((qh2 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi3	 = (qb3 >> 4) | (int((qh3 >> (g_shift + 1)) & 1) << 4);                            \
+		int w_hi = pack32(i8vec4(int8_t(hi0), int8_t(hi1), int8_t(hi2), int8_t(hi3)));             \
+		dot1 += dotPacked4x8EXT(w_hi, int(xq_packed[wp + g * 16 + (L) / 4 + 8]));                  \
 	}
 
 					Q5K_STEP(0, qh_w0)

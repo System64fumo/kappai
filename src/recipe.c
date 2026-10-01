@@ -2103,8 +2103,8 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 		if (st != OK) {
 			if (w->is_batch)
 				ERROR("batch fast-path: layer %d op[%d] kind=%d (stage=%d) "
-					  "w_idx=%d failed with status=%d",
-					  w->li, j, rop->kind, rop->stage, rop->w_idx, (int)st);
+					  "w_idx=%d failed: %s",
+					  w->li, j, rop->kind, rop->stage, rop->w_idx, status_str(st));
 			return st;
 		}
 		j++;
@@ -5328,8 +5328,8 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 			continue;
 		st = exec_op_batch(pop, m, cache, s, bs, pos_start, n_tokens, -1, flash_attn);
 		if (st != OK) {
-			ERROR("batch fast-path: pre_op[%d] kind=%d (stage=%d) failed with status=%d", i,
-				  pop->kind, pop->stage, (int)st);
+			ERROR("batch fast-path: pre_op[%d] kind=%d (stage=%d) failed: %s", i, pop->kind,
+				  pop->stage, status_str(st));
 			goto done;
 		}
 	}

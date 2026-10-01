@@ -32,113 +32,106 @@ layout(push_constant) uniform Params {
 }
 params;
 
-layout(constant_id = 0) const int HEAD_DIM		 = 64;
-layout(constant_id = 1) const int N_HEADS_PER_WG = 4;
-layout(constant_id = 2) const int LANES_PER_HEAD = 16;
-layout(constant_id = 3) const int LOCAL_SIZE_X	 = 64;
-
-const int MAX_DPL	   = 16;
-const int TILE_T	   = 16;
-const int MAX_HEAD_DIM = 256;
+layout(constant_id = 0) const int HEAD_DIM	   = 64;
+layout(constant_id = 1) const int HEADS_PER_WG = 1;
+layout(constant_id = 2) const int LANES		   = 16;
+layout(constant_id = 3) const int LOCAL_SIZE_X = 64;
+layout(constant_id = 4) const int TILE_T	   = 16;
+layout(constant_id = 5) const int T_SPLIT	   = 1;
 
 #include "common.glsl"
 
-shared float k_tile[TILE_T * HEAD_DIM];
+const int DPL		  = HEAD_DIM / LANES;
+const int KSTRIDE	  = HEAD_DIM + 4;
+const int MAX_DPL	  = 16;
+const int PART_STRIDE = MAX_DPL + 2;
+
+shared float k_tile[TILE_T * KSTRIDE];
 shared float v_tile[TILE_T * HEAD_DIM];
-shared float red_tile[N_HEADS_PER_WG * LANES_PER_HEAD];
+shared float s_tile[HEADS_PER_WG * TILE_T];
+shared float part[HEADS_PER_WG * T_SPLIT * LANES * PART_STRIDE];
 
 void main() {
-	uint tid = gl_LocalInvocationID.x;
+	const uint tid	 = gl_LocalInvocationID.x;
+	const int  s	 = int(tid) / LANES;
+	const int  lane	 = int(tid) % LANES;
+	const int  hslot = s % HEADS_PER_WG;
+	const int  tslot = s / HEADS_PER_WG;
+	const int  slot	 = tslot * LANES + lane;
 
-	int hg		  = int(tid) / LANES_PER_HEAD;
-	int lane	  = int(tid) % LANES_PER_HEAD;
-	int n_groups  = params.n_heads / params.n_kv_heads;
-	int kvh		  = int(gl_WorkGroupID.x);
-	int head_base = kvh * n_groups;
-
-	int	  my_head	 = head_base + hg;
-	bool  valid		 = (my_head < params.n_heads) && (hg < N_HEADS_PER_WG);
-	int	  pos		 = params.pos;
-	int	  attn_start = params.attn_start;
-	float scale		 = params.scale;
+	const int n_groups	= params.n_heads / params.n_kv_heads;
+	const int wg_per_kv = n_groups / HEADS_PER_WG;
+	const int kvh		= int(gl_WorkGroupID.x) / wg_per_kv;
+	const int my_head = kvh * n_groups + (int(gl_WorkGroupID.x) % wg_per_kv) * HEADS_PER_WG + hslot;
 
 #ifdef BATCHED
-	uint row = gl_WorkGroupID.y;
-	if (row >= uint(params.m))
-		return;
-	pos				 = params.pos + int(row);
-	uint q_row_off	 = row * uint(params.n_heads) * uint(HEAD_DIM);
-	uint out_row_off = row * uint(params.n_heads) * uint(HEAD_DIM);
+	const uint row		 = gl_WorkGroupID.y;
+	const uint q_row_off = gl_WorkGroupID.y * uint(params.n_heads) * uint(HEAD_DIM);
+	const int  pos		 = params.pos + int(gl_WorkGroupID.y);
 #else
-	const uint row		   = 0u;
-	const uint q_row_off   = 0u;
-	const uint out_row_off = 0u;
+	const uint q_row_off = 0u;
+	const int  pos		 = params.pos;
 #endif
 
-	int	  dpl	 = HEAD_DIM / LANES_PER_HEAD;
-	uint  q_base = q_row_off + uint(my_head) * uint(HEAD_DIM);
-	float qv[MAX_DPL];
-	if (valid) {
-		for (int i = 0; i < dpl; i++)
-			qv[i] = q[q_base + uint(lane) * uint(dpl) + uint(i)];
-	} else {
-		for (int i = 0; i < dpl; i++)
-			qv[i] = 0.0;
-	}
+	const int  attn_start = params.attn_start;
+	const uint kv_base =
+		params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(params.stride_head_dim);
+	const uint q_base = q_row_off + uint(my_head) * uint(HEAD_DIM);
+	const int  hs	  = hslot * TILE_T;
 
-	uint kvh_stride = uint(params.n_ctx) * uint(params.stride_head_dim);
-	uint kv_base	= params.layer_off + uint(kvh) * kvh_stride;
-
-	precise float M = uintBitsToFloat(0xFF800000u);
+	precise float M = neg_max_float();
 	precise float S = 0.0;
 	precise float vkq[MAX_DPL];
-	for (int i = 0; i < dpl; i++)
+	for (int i = 0; i < DPL; i++)
 		vkq[i] = 0.0;
 
-	int red_base = hg * LANES_PER_HEAD;
-
+	const int words_head = HEAD_DIM / 2;
 	for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
-		int tile_t1	 = min(tile_t0 + TILE_T, pos + 1);
-		int tile_len = tile_t1 - tile_t0;
+		const int tile_t1	 = min(tile_t0 + TILE_T, pos + 1);
+		const int tile_len	 = tile_t1 - tile_t0;
+		const int words_tile = tile_len * words_head;
 
-		int total_words = tile_len * (HEAD_DIM / 2);
-		for (int idx = int(tid); idx < total_words; idx += LOCAL_SIZE_X) {
-			int	 t		= idx / (HEAD_DIM / 2);
-			int	 dw		= idx % (HEAD_DIM / 2);
-			uint kv_off = kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
-			uint word	= kcache[kv_off >> 1u];
-			k_tile[t * HEAD_DIM + dw * 2]	  = half_to_float(word & 0xFFFFu);
-			k_tile[t * HEAD_DIM + dw * 2 + 1] = half_to_float(word >> 16u);
-
-			word							  = vcache[kv_off >> 1u];
-			v_tile[t * HEAD_DIM + dw * 2]	  = half_to_float(word & 0xFFFFu);
-			v_tile[t * HEAD_DIM + dw * 2 + 1] = half_to_float(word >> 16u);
+		for (int idx = int(tid); idx < words_tile; idx += LOCAL_SIZE_X) {
+			const int  t  = idx / words_head;
+			const int  dw = idx % words_head;
+			const uint ko =
+				kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
+			const vec2 kf					  = vec2(unpackHalf2x16(kcache[ko >> 1u]));
+			const vec2 vf					  = vec2(unpackHalf2x16(vcache[ko >> 1u]));
+			k_tile[t * KSTRIDE + dw * 2]	  = kf.x;
+			k_tile[t * KSTRIDE + dw * 2 + 1]  = kf.y;
+			v_tile[t * HEAD_DIM + dw * 2]	  = vf.x;
+			v_tile[t * HEAD_DIM + dw * 2 + 1] = vf.y;
 		}
 		barrier();
 
-		for (int t = 0; t < tile_len; t++) {
-			int			  kd	  = t * HEAD_DIM + lane * dpl;
-			precise float partial = 0.0;
-			for (int i = 0; i < dpl; i++)
-				partial += qv[i] * k_tile[kd + i];
+		for (int t = slot; t < tile_len; t += T_SPLIT * LANES) {
+			precise float acc = 0.0;
+			const int	  kb  = t * KSTRIDE;
+			for (int d = 0; d < HEAD_DIM; d += 4)
+				acc += dot(vec4(q[q_base + uint(d)], q[q_base + uint(d + 1)],
+								q[q_base + uint(d + 2)], q[q_base + uint(d + 3)]),
+						   vec4(k_tile[kb + d], k_tile[kb + d + 1], k_tile[kb + d + 2],
+								k_tile[kb + d + 3]));
+			s_tile[hs + t] = acc * params.scale;
+		}
+		barrier();
 
-			red_tile[red_base + lane] = partial;
-			barrier();
-			for (int stride = LANES_PER_HEAD / 2; stride > 0; stride >>= 1) {
-				if (lane < stride) {
-					red_tile[red_base + lane] += red_tile[red_base + lane + stride];
-				}
-				barrier();
+		for (int t = tslot; t < tile_len; t += T_SPLIT) {
+			const precise float score = s_tile[hs + t];
+			const precise float m_new = max(M, score);
+			const precise float ms	  = exp(M - m_new);
+			const precise float vs	  = exp(score - m_new);
+
+			const int vb = t * HEAD_DIM + lane * DPL;
+			for (int i = 0; i < DPL; i += 4) {
+				const vec4 vv = vec4(v_tile[vb + i], v_tile[vb + i + 1], v_tile[vb + i + 2],
+									 v_tile[vb + i + 3]);
+				vkq[i]		  = vkq[i] * ms + vv.x * vs;
+				vkq[i + 1]	  = vkq[i + 1] * ms + vv.y * vs;
+				vkq[i + 2]	  = vkq[i + 2] * ms + vv.z * vs;
+				vkq[i + 3]	  = vkq[i + 3] * ms + vv.w * vs;
 			}
-			precise float score = red_tile[red_base] * scale;
-			barrier();
-
-			precise float m_new = max(M, score);
-			precise float ms	= exp(M - m_new);
-			precise float vs	= exp(score - m_new);
-
-			for (int i = 0; i < dpl; i++)
-				vkq[i] = vkq[i] * ms + v_tile[kd + i] * vs;
 
 			S = S * ms + vs;
 			M = m_new;
@@ -146,10 +139,35 @@ void main() {
 		barrier();
 	}
 
-	if (valid) {
-		precise float inv_S = S > 0.0 ? 1.0 / S : 0.0;
-		uint		  d0	= out_row_off + q_base + uint(lane) * uint(dpl);
-		for (int i = 0; i < dpl; i++)
-			out_[d0 + uint(i)] = vkq[i] * inv_S;
+	const int part_lane = (hslot * T_SPLIT) * LANES + lane;
+	const int pb		= (part_lane + tslot * LANES) * PART_STRIDE;
+	for (int i = 0; i < DPL; i++)
+		part[pb + i] = vkq[i];
+	part[pb + DPL]	   = M;
+	part[pb + DPL + 1] = S;
+	barrier();
+
+	if (tslot != 0)
+		return;
+
+	precise float m_all = part[pb + DPL];
+	for (int sidx = 1; sidx < T_SPLIT; sidx++)
+		m_all = max(m_all, part[(part_lane + sidx * LANES) * PART_STRIDE + DPL]);
+
+	precise float s_all = 0.0;
+	for (int sidx = 0; sidx < T_SPLIT; sidx++) {
+		const int off = (part_lane + sidx * LANES) * PART_STRIDE;
+		s_all += part[off + DPL + 1] * exp(part[off + DPL] - m_all);
+	}
+	const precise float inv_s = s_all > 0.0 ? 1.0 / s_all : 0.0;
+
+	const uint d0 = q_base + uint(lane * DPL);
+	for (int i = 0; i < DPL; i++) {
+		precise float acc = 0.0;
+		for (int sidx = 0; sidx < T_SPLIT; sidx++) {
+			const int off = (part_lane + sidx * LANES) * PART_STRIDE;
+			acc += part[off + i] * exp(part[off + DPL] - m_all);
+		}
+		out_[d0 + uint(i)] = acc * inv_s;
 	}
 }

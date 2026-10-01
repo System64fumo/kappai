@@ -38,6 +38,8 @@ typedef enum {
 	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
+const char *status_str(status_code s);
+
 void  oom_abort(size_t bytes);
 void *xmalloc(size_t n);
 void *xmalloc_aligned(size_t n, size_t align);

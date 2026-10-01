@@ -1378,13 +1378,21 @@ static void test_op_attention_swa_slide(backend *b, int n_heads, int n_kv_heads,
 			record_result(OPFAM_ATTENTION_SWA, label, s_worst == OK ? V_PASS : V_FAIL,
 						  "bit-identical to the uncompacted run across all steps");
 	} else {
-		char	detail[256];
+		char	detail[320];
 		verdict v  = classify_output(ref_all ? "kv_quant" : "loose", y_ref, y_worst, n, s_worst,
 									 detail, sizeof(detail));
 		int		dl = (int)strlen(detail);
-		snprintf(detail + dl, sizeof(detail) - dl,
-				 " | prefill %d (batch, chunk %d) + %d decode steps, worst at pos=%d", n_prefill,
-				 chunk, n_steps - n_prefill, worst_step);
+		snprintf(detail + dl, sizeof(detail) - dl, " |prefill %d +%d dec, worst pos=%d", n_prefill,
+				 n_steps - n_prefill, worst_step);
+		if (v == V_FAIL) {
+			dl = (int)strlen(detail);
+			for (int i = 0; i < n && dl + 40 < (int)sizeof(detail); i++) {
+				if (isfinite(y_worst[i]))
+					continue;
+				dl += snprintf(detail + dl, sizeof(detail) - dl, " h%d/d%d=%g", i / head_dim,
+							   i % head_dim, y_worst[i]);
+			}
+		}
 		if (record)
 			record_result(OPFAM_ATTENTION_SWA, label, v, detail);
 	}
@@ -2775,7 +2783,7 @@ static void test_batch_matmul_parity(backend *ref, backend *tgt, const qtype_inf
 }
 
 static void test_batch_attention_parity(backend *ref, backend *tgt, int n_heads, int n_kv_heads,
-										int head_dim, int n_ctx, int pos_start, int m) {
+										int head_dim, int n_ctx, int pos_start, int m, int flash) {
 	char label[160];
 	if (!ref->attention || !ref->attention_batch || !ref->kv_put) {
 		snprintf(label, sizeof(label), "attention batch h=%d/%d d=%d pos=%d m=%d", n_heads,
@@ -2858,14 +2866,19 @@ static void test_batch_attention_parity(backend *ref, backend *tgt, int n_heads,
 		tgt->buffer_write_f32(tgt, &qb_tgt, q, n * m);
 		status_code s_tgt =
 			tgt->attention_batch(tgt, &qb_tgt, &kc_tgt, &vc_tgt, &yb_tgt, 0, pos_start, n_heads,
-								 n_kv_heads, head_dim, n_ctx, 0, scale, n_kv_heads, m);
+								 n_kv_heads, head_dim, n_ctx, flash, scale, n_kv_heads, m);
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
 		float *y_tgt = xmalloc((size_t)n * (size_t)m * sizeof(float));
 		if (s_tgt == OK)
 			tgt->buffer_read_f32(tgt, &yb_tgt, y_tgt, n * m);
-		snprintf(label, sizeof(label), "attention batch cross h=%d/%d d=%d pos=%d m=%d", n_heads,
-				 n_kv_heads, head_dim, pos_start, m);
+		snprintf(label, sizeof(label), "attention batch cross h=%d/%d d=%d pos=%d m=%d fl=%d",
+				 n_heads, n_kv_heads, head_dim, pos_start, m, flash);
+		if (getenv("KQDBG") && flash && m == 16 && head_dim == 64) {
+			for (int rr = 0; rr < 8; rr++)
+				fprintf(stderr, "[W%d] wroteBy=%.0f  val=%7.3f | ref=%7.3f\n", rr,
+						y_tgt[rr * n] - 500.0, y_tgt[rr * n + 1], y_batch[rr * n]);
+		}
 		test_parity_compare_status(OPFAM_BATCH_PARITY, label, y_batch, y_tgt, n * m, s_tgt);
 		free(y_tgt);
 		tgt->buffer_free(tgt, &kc_tgt);
@@ -3506,7 +3519,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_dequant_parity_cross(ref, tgt, &QTYPES[qi], QTYPES[qi].block * 4, 8);
 	flush_family(OPFAM_DEQUANT_PARITY);
 
-	run_repack_parity_tests(ref);
+	run_repack_parity_tests(ref, tgt);
 	flush_family(OPFAM_REPACK_PARITY);
 
 	for (int qi = 0; qi < QTYPES_N; qi++) {
@@ -3532,9 +3545,17 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 			continue;
 		test_batch_matmul_parity(ref, tgt, &QTYPES[qi], 512, 512, 2);
 	}
-	test_batch_attention_parity(ref, tgt, 8, 4, 64, 256, 60, 2);
-	test_batch_attention_parity(ref, tgt, 8, 4, 64, 256, 60, 10);
-	test_batch_attention_parity(ref, tgt, 8, 2, 128, 512, 100, 8);
+	{
+		int bat_sh[][6] = {
+			{8, 4, 64, 256, 60, 2},	 {8, 4, 64, 256, 60, 10},	{8, 2, 128, 512, 100, 8},
+			{8, 4, 64, 256, 0, 16},	 {8, 4, 64, 64, 0, 16},		{8, 2, 128, 256, 0, 16},
+			{8, 1, 256, 256, 0, 16}, {32, 8, 128, 512, 100, 8}, {8, 4, 64, 256, 40, 16},
+		};
+		for (int i = 0; i < (int)(sizeof(bat_sh) / sizeof(bat_sh[0])); i++)
+			for (int fl = 0; fl < 2; fl++)
+				test_batch_attention_parity(ref, tgt, bat_sh[i][0], bat_sh[i][1], bat_sh[i][2],
+											bat_sh[i][3], bat_sh[i][4], bat_sh[i][5], fl);
+	}
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);
 	test_batch_rope_parity(ref, tgt, 16, 128, 200, 5);

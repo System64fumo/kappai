@@ -78,8 +78,10 @@ const int BLOCK			  = 256;
 const int BLOCKS_PER_TILE = TILE_K / BLOCK;
 
 shared float x_shared[TILE_K];
-shared int	 xq_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
 shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
 
 uint byte_from_word(uint word, uint byte_idx) {
 	return (word >> (byte_idx * 8u)) & 0xFFu;
@@ -149,7 +151,7 @@ void main() {
 		int block_end	= tile_end / 256;
 
 		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
-#include "quant_x8_block.glsl"
+			xq8_quant_superblock(bi, block_start, tile_start);
 		}
 		barrier();
 
@@ -163,53 +165,36 @@ void main() {
 				float d_w		= half_to_float(w0_read_u16(block_off + 208u));
 
 				int	  local_bi = bi - block_start;
-				int	  x_base   = bi * 256 - tile_start;
 				float d		   = d_w * xq_d[local_bi];
 
+				int wp	   = (bi * 256 - tile_start) >> 2;
 				int acc0_l = 0, acc1_l = 0;
 				for (int n_iter = 0; n_iter < 2; n_iter++) {
 					uint ql_base = ql_off + uint(n_iter) * 64u;
 					uint qh_base = qh_off + uint(n_iter) * 32u;
 
-					int j_base		= n_iter * 8;
-					int xq_off_base = x_base + n_iter * 128;
+					int j_base = n_iter * 8;
 					for (int jj = 0; jj < 8; jj++) {
 						int j = j_base + jj;
 						int s = w0_read_i8(sc_off + uint(j));
 
-						int a_base	= jj * 16;
-						int xq_base = xq_off_base + jj * 16;
-
 						int av[16];
-						dequant16_q6k_w0(ql_base, qh_base, a_base, av);
+						dequant16_q6k_w0(ql_base, qh_base, jj * 16, av);
 
+						int xw	  = wp + n_iter * 32 + jj * 4;
 						int w0_lo = pack32(
 							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
-						int xq0_lo = pack32(
-							i8vec4(int8_t(xq_shared[xq_base + 0]), int8_t(xq_shared[xq_base + 1]),
-								   int8_t(xq_shared[xq_base + 2]), int8_t(xq_shared[xq_base + 3])));
-						int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
-
+						int l0	  = dotPacked4x8EXT(w0_lo, int(xq_packed[xw + 0]));
 						int w0_hi = pack32(
 							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
-						int xq0_hi = pack32(
-							i8vec4(int8_t(xq_shared[xq_base + 4]), int8_t(xq_shared[xq_base + 5]),
-								   int8_t(xq_shared[xq_base + 6]), int8_t(xq_shared[xq_base + 7])));
-						l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
+						l0 += dotPacked4x8EXT(w0_hi, int(xq_packed[xw + 1]));
 
 						int w1_lo = pack32(
 							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
-						int xq1_lo = pack32(i8vec4(
-							int8_t(xq_shared[xq_base + 8]), int8_t(xq_shared[xq_base + 9]),
-							int8_t(xq_shared[xq_base + 10]), int8_t(xq_shared[xq_base + 11])));
-						int l1	   = dotPacked4x8EXT(w1_lo, xq1_lo);
-
+						int l1	  = dotPacked4x8EXT(w1_lo, int(xq_packed[xw + 2]));
 						int w1_hi = pack32(
 							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
-						int xq1_hi = pack32(i8vec4(
-							int8_t(xq_shared[xq_base + 12]), int8_t(xq_shared[xq_base + 13]),
-							int8_t(xq_shared[xq_base + 14]), int8_t(xq_shared[xq_base + 15])));
-						l1 += dotPacked4x8EXT(w1_hi, xq1_hi);
+						l1 += dotPacked4x8EXT(w1_hi, int(xq_packed[xw + 3]));
 
 						acc0_l += s * l0;
 						acc1_l += s * l1;
@@ -230,53 +215,36 @@ void main() {
 				float d_w		= half_to_float(w1_read_u16(block_off + 208u));
 
 				int	  local_bi = bi - block_start;
-				int	  x_base   = bi * 256 - tile_start;
 				float d		   = d_w * xq_d[local_bi];
 
+				int wp	   = (bi * 256 - tile_start) >> 2;
 				int acc0_l = 0, acc1_l = 0;
 				for (int n_iter = 0; n_iter < 2; n_iter++) {
 					uint ql_base = ql_off + uint(n_iter) * 64u;
 					uint qh_base = qh_off + uint(n_iter) * 32u;
 
-					int j_base		= n_iter * 8;
-					int xq_off_base = x_base + n_iter * 128;
+					int j_base = n_iter * 8;
 					for (int jj = 0; jj < 8; jj++) {
 						int j = j_base + jj;
 						int s = w1_read_i8(sc_off + uint(j));
 
-						int a_base	= jj * 16;
-						int xq_base = xq_off_base + jj * 16;
-
 						int av[16];
-						dequant16_q6k_w1(ql_base, qh_base, a_base, av);
+						dequant16_q6k_w1(ql_base, qh_base, jj * 16, av);
 
+						int xw	  = wp + n_iter * 32 + jj * 4;
 						int w0_lo = pack32(
 							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
-						int xq0_lo = pack32(
-							i8vec4(int8_t(xq_shared[xq_base + 0]), int8_t(xq_shared[xq_base + 1]),
-								   int8_t(xq_shared[xq_base + 2]), int8_t(xq_shared[xq_base + 3])));
-						int l0 = dotPacked4x8EXT(w0_lo, xq0_lo);
-
+						int l0	  = dotPacked4x8EXT(w0_lo, int(xq_packed[xw + 0]));
 						int w0_hi = pack32(
 							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
-						int xq0_hi = pack32(
-							i8vec4(int8_t(xq_shared[xq_base + 4]), int8_t(xq_shared[xq_base + 5]),
-								   int8_t(xq_shared[xq_base + 6]), int8_t(xq_shared[xq_base + 7])));
-						l0 += dotPacked4x8EXT(w0_hi, xq0_hi);
+						l0 += dotPacked4x8EXT(w0_hi, int(xq_packed[xw + 1]));
 
 						int w1_lo = pack32(
 							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
-						int xq1_lo = pack32(i8vec4(
-							int8_t(xq_shared[xq_base + 8]), int8_t(xq_shared[xq_base + 9]),
-							int8_t(xq_shared[xq_base + 10]), int8_t(xq_shared[xq_base + 11])));
-						int l1	   = dotPacked4x8EXT(w1_lo, xq1_lo);
-
+						int l1	  = dotPacked4x8EXT(w1_lo, int(xq_packed[xw + 2]));
 						int w1_hi = pack32(
 							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
-						int xq1_hi = pack32(i8vec4(
-							int8_t(xq_shared[xq_base + 12]), int8_t(xq_shared[xq_base + 13]),
-							int8_t(xq_shared[xq_base + 14]), int8_t(xq_shared[xq_base + 15])));
-						l1 += dotPacked4x8EXT(w1_hi, xq1_hi);
+						l1 += dotPacked4x8EXT(w1_hi, int(xq_packed[xw + 3]));
 
 						acc0_l += s * l0;
 						acc1_l += s * l1;

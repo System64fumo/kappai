@@ -433,9 +433,8 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 	if (cst == ERR_INTERRUPTED)
 		return ERR_INTERRUPTED;
 	if (cst != OK) {
-		ERROR("compute_forward failed (status=%d) at pos=%d token=%d -- "
-			  "aborting feed",
-			  (int)cst, pos, (int)token);
+		ERROR("compute_forward failed: %s at pos=%d token=%d -- aborting feed", status_str(cst),
+			  pos, (int)token);
 		return ERR_COMPUTE_FAIL;
 	}
 	c->kv.n_pos++;
@@ -569,9 +568,9 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 			goto fail;
 		}
 		if (cfb_st != OK) {
-			ERROR("compute_forward_batch failed (status=%d) at chunk_offset=%d chunk_size=%d -- "
+			ERROR("compute_forward_batch failed: %s at chunk_offset=%d chunk_size=%d -- "
 				  "prompt processing aborted",
-				  (int)cfb_st, chunk_offset, chunk_size);
+				  status_str(cfb_st), chunk_offset, chunk_size);
 			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
@@ -711,7 +710,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 			if (st == OK) {
 				sampler_observe(&c->samp, tok);
 			} else {
-				WARN("device argmax failed (status=%d); falling back to host sampling", (int)st);
+				WARN("device argmax failed (%s); falling back to host sampling", status_str(st));
 				fast_argmax = false;
 				if (has_fed_tok) {
 					c->kv.n_pos--;

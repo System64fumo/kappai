@@ -98,6 +98,26 @@ typedef struct {
 	const char			 *name;
 } vk_pipeline_set;
 
+#define VK_ATTN_CACHE_CAP 6
+#define VK_ATTN_KIND_MAX 4
+
+#define VK_ATTN_FLASH_BATCH_ENABLED 1
+
+enum {
+	VK_ATTN_PLAIN = 0,
+	VK_ATTN_FLASH,
+	VK_ATTN_PLAIN_BATCH,
+	VK_ATTN_FLASH_BATCH,
+};
+
+typedef struct {
+	vk_pipeline_set set[VK_ATTN_CACHE_CAP];
+	int				head_dim[VK_ATTN_CACHE_CAP];
+	int				n_groups[VK_ATTN_CACHE_CAP];
+	int				unsupported[VK_ATTN_CACHE_CAP];
+	int				count;
+} vk_attn_cache;
+
 typedef struct {
 	VkBuffer				  buf;
 	VkDeviceMemory			  mem;
@@ -200,6 +220,7 @@ typedef struct {
 	uint64_t total_desc_allocs;
 
 	VkPipeline		last_pipeline;
+	const char	   *last_pipeline_name;
 	VkDescriptorSet last_desc_set;
 	int				last_desc_pipeline_match;
 
@@ -217,27 +238,13 @@ typedef struct {
 	VkBuffer dirty_table[VK_DIRTY_TABLE_SIZE];
 	int		 dirty_count;
 
-	VkQueryPool query_pool;
-	int			query_cap;
-	int			query_count;
-	const char *query_names[512];
-	float		timestamp_period;
-	int			profiling;
-
 	int matmul_wg_size;
 	int matmul_rows_per_thread;
+	int matmul_lanes_per_row;
 	int matmul_tile_k;
 	int matmul_m_per_wg;
 
-	vk_pipeline_set p_attention;
-	int				attention_ready;
-	int				attention_head_dim;
-#define VK_FLASH_CACHE_CAP 4
-	vk_pipeline_set p_attention_flash[VK_FLASH_CACHE_CAP];
-	int				flash_head_dim[VK_FLASH_CACHE_CAP];
-	int				flash_n_groups[VK_FLASH_CACHE_CAP];
-	int				flash_unsupported[VK_FLASH_CACHE_CAP];
-	int				flash_count;
+	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
 	vk_pipeline_set p_kv_put;
 	vk_pipeline_set p_embd_lookup;
 	vk_pipeline_set p_argmax;
@@ -248,6 +255,7 @@ typedef struct {
 	vk_pipeline_set p_matmul_q4_0_batch;
 	vk_pipeline_set p_matmul_q4_0_res_batch;
 	vk_pipeline_set p_matmul_q4_0_dual_batch;
+	vk_pipeline_set p_matmul_q4_0_triple_batch;
 	vk_pipeline_set p_matmul_q4_1_batch;
 	vk_pipeline_set p_matmul_q4_1_res_batch;
 	vk_pipeline_set p_matmul_q5_0_batch;
@@ -291,14 +299,7 @@ typedef struct {
 	vk_pipeline_set p_rope_batch;
 	vk_pipeline_set p_rope_ext_batch;
 	vk_pipeline_set p_rope_qk_batch;
-	vk_pipeline_set p_attention_batch;
-	int				attention_batch_ready;
-	int				attention_batch_head_dim;
-	vk_pipeline_set p_attention_flash_batch[VK_FLASH_CACHE_CAP];
-	int				flash_batch_head_dim[VK_FLASH_CACHE_CAP];
-	int				flash_batch_n_groups[VK_FLASH_CACHE_CAP];
-	int				flash_batch_unsupported[VK_FLASH_CACHE_CAP];
-	int				flash_batch_count;
+	vk_pipeline_set p_dequant;
 	vk_pipeline_set p_ffn_activate_batch;
 	vk_pipeline_set p_ffn_activate_fused_batch;
 	vk_pipeline_set p_elementwise_batch;
@@ -333,6 +334,9 @@ typedef struct {
 
 	buffer attn_scores_buf;
 	int	   attn_scores_cap;
+
+	buffer ffn_act_buf;
+	int	   ffn_act_cap;
 
 	vk_buf	 staging_buf;
 	size_t	 staging_cap;
@@ -397,6 +401,55 @@ static void		   vk_timeline_poll(vk_priv *p);
 static int		   vk_timeline_done(vk_priv *p, uint64_t value);
 
 static int g_probed = -1;
+
+static const char *vk_result_str(int r) {
+	switch (r) {
+	case 0:
+		return "VK_SUCCESS";
+	case 1:
+		return "VK_NOT_READY";
+	case -1:
+		return "VK_TIMEOUT";
+	case -2:
+		return "VK_EVENT_SET";
+	case -3:
+		return "VK_EVENT_RESET";
+	case -4:
+		return "VK_ERROR_DEVICE_LOST";
+	case -5:
+		return "VK_ERROR_MEMORY_MAP_FAILED";
+	case -6:
+		return "VK_ERROR_LAYER_NOT_PRESENT";
+	case -7:
+		return "VK_ERROR_EXTENSION_NOT_PRESENT";
+	case -8:
+		return "VK_ERROR_FEATURE_NOT_PRESENT";
+	case -9:
+		return "VK_ERROR_INCOMPATIBLE_DRIVER";
+	case -10:
+		return "VK_ERROR_TOO_MANY_OBJECTS";
+	case -11:
+		return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+	case -12:
+		return "VK_ERROR_FRAGMENTED_POOL";
+	case -13:
+		return "VK_ERROR_UNKNOWN";
+	case -1000069000:
+		return "VK_ERROR_OUT_OF_HOST_MEMORY";
+	case -1000069001:
+		return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+	case -1000069002:
+		return "VK_ERROR_INITIALIZATION_FAILED";
+	case -1000069003:
+		return "VK_ERROR_DEVICE_REMOVED";
+	case -1000001004:
+		return "VK_ERROR_VALIDATION_FAILED_EXT";
+	case -1000002002:
+		return "VK_ERROR_INVALID_SHADER_NV";
+	default:
+		return "VK_ERROR_UNKNOWN_RESULT";
+	}
+}
 
 static status_code vk_probe(void) {
 	if (g_probed >= 0)
@@ -654,11 +707,13 @@ static status_code vk_flush(vk_priv *p);
 static void vk_queue_desc_free(vk_priv *p, VkDescriptorSet set) {
 	if (set == VK_NULL_HANDLE)
 		return;
+	if (p->last_signal_value > p->pending_free_after)
+		p->pending_free_after = p->last_signal_value;
 	if (p->pending_free_count >=
 		(int)(sizeof(p->pending_free_sets) / sizeof(p->pending_free_sets[0]))) {
 		status_code fs = vk_flush(p);
 		if (fs != OK) {
-			ERROR("vk: queue_desc_free flush failed (status=%d), dropping %d frees", (int)fs,
+			ERROR("vk: queue_desc_free flush failed (%s), dropping %d frees", status_str(fs),
 				  p->pending_free_count);
 			p->pending_free_count = 0;
 		} else if (p->pending_free_count >=
@@ -696,11 +751,6 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 
 			&p->p_matmul_iq4_nl_batch,
 
-			&p->p_attention,
-			&p->p_attention_flash[0],
-			&p->p_attention_flash[1],
-			&p->p_attention_flash[2],
-			&p->p_attention_flash[3],
 			&p->p_kv_put,
 			&p->p_embd_lookup,
 			&p->p_argmax,
@@ -710,6 +760,7 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_matmul_q4_0_batch,
 			&p->p_matmul_q4_0_res_batch,
 			&p->p_matmul_q4_0_dual_batch,
+			&p->p_matmul_q4_0_triple_batch,
 			&p->p_matmul_q4_1_batch,
 			&p->p_matmul_q4_1_res_batch,
 			&p->p_matmul_q5_0_batch,
@@ -747,13 +798,9 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_rope_batch,
 			&p->p_rope_ext_batch,
 			&p->p_rope_qk_batch,
-			&p->p_attention_batch,
-			&p->p_attention_flash_batch[0],
-			&p->p_attention_flash_batch[1],
-			&p->p_attention_flash_batch[2],
-			&p->p_attention_flash_batch[3],
 			&p->p_ffn_activate_batch,
 			&p->p_elementwise_batch,
+			&p->p_dequant,
 		};
 		const int n_pipelines = (int)(sizeof(pipelines) / sizeof(pipelines[0]));
 		for (int i = 0; i < n_pipelines; i++) {
@@ -775,6 +822,27 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 				}
 			}
 		}
+		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++) {
+			vk_attn_cache *c = &p->attn_cache[ci];
+			for (int i = 0; i < c->count; i++) {
+				vk_pipeline_set *ps = &c->set[i];
+				if (!ps->pipeline)
+					continue;
+				for (int j = 0; j < VK_DESC_CACHE_CAP; j++) {
+					vk_desc_slot *s = &ps->desc_cache[j];
+					if (!s->valid)
+						continue;
+					for (int k = 0; k < ps->n_bindings; k++) {
+						if (s->bufs[k] == freed) {
+							vk_queue_desc_free(p, s->set);
+							s->valid = 0;
+							s->set	 = VK_NULL_HANDLE;
+							break;
+						}
+					}
+				}
+			}
+		}
 		p->dead_buf_count = 0;
 	}
 }
@@ -787,52 +855,11 @@ static int vk_buf_is_dead(vk_priv *p, VkBuffer buf) {
 	return 0;
 }
 
-static void vk_report_query_results(vk_priv *p) {
-	if (!p->profiling || p->query_count <= 0)
-		return;
-	uint64_t ts[512];
-	VkResult qr =
-		vkGetQueryPoolResults(p->dev, p->query_pool, 0, (uint32_t)p->query_count, sizeof(ts), ts,
-							  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-	if (qr != VK_SUCCESS)
-		return;
-	double		totals[256] = {0};
-	int			counts[256] = {0};
-	const char *names[256]	= {0};
-	int			n_names		= 0;
-	for (int i = 0; i < p->query_count; i += 2) {
-		double		ns	 = (double)(ts[i + 1] - ts[i]) * p->timestamp_period;
-		const char *nm	 = p->query_names[i / 2];
-		int			slot = -1;
-		for (int j = 0; j < n_names; j++)
-			if (names[j] == nm) {
-				slot = j;
-				break;
-			}
-		if (slot < 0 && n_names < 256) {
-			slot		= n_names++;
-			names[slot] = nm;
-		}
-		if (slot >= 0) {
-			totals[slot] += ns;
-			counts[slot]++;
-		}
-	}
-	fprintf(stderr, "[DEVICE_PROFILE] batch of %d dispatches:\n", p->query_count / 2);
-	for (int j = 0; j < n_names; j++) {
-		fprintf(stderr, "       %-20s calls=%-4d total=%.3fms avg=%.3fms\n", names[j], counts[j],
-				totals[j] / 1e6, totals[j] / counts[j] / 1e6);
-	}
-}
-
 static status_code vk_ring_begin(vk_priv *p, int idx) {
 	vk_ring_slot *r = &p->ring[idx];
 	vkResetCommandPool(p->dev, p->cmd_pools[idx], 0);
 	VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	VK_CHECK(vkBeginCommandBuffer(r->cmd, &bi));
-	if (p->profiling && p->query_pool) {
-		vkCmdResetQueryPool(r->cmd, p->query_pool, 0, (uint32_t)p->query_cap);
-	}
 	r->recording				= 1;
 	r->has_work					= 0;
 	r->submitted				= 0;
@@ -945,7 +972,10 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 		};
 		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, VK_NULL_HANDLE);
 		if (submit_res != VK_SUCCESS) {
-			ERROR("vk: vkQueueSubmit returned %d at %s:%d", (int)submit_res, __FILE__, __LINE__);
+			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
+				  vk_result_str((int)submit_res), __FILE__, __LINE__,
+				  p->last_pipeline_name ? "; last pipeline: " : "",
+				  p->last_pipeline_name ? p->last_pipeline_name : "");
 			if (submit_res == VK_ERROR_DEVICE_LOST)
 				p->device_lost = 1;
 			if (p && p->debug.abort_on_error)
@@ -957,13 +987,12 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 		r->recording		 = 0;
 		p->last_signal_value = r->signal_value;
 
-		if (wait_now || p->profiling) {
+		if (wait_now) {
 			status_code ws = vk_timeline_wait(p, r->signal_value);
 			if (ws != OK) {
 				vk_ring_invalidate(p, idx);
 				return ws;
 			}
-			vk_report_query_results(p);
 
 			vk_flush_pending_desc_frees(p);
 		}
@@ -979,7 +1008,10 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 	{
 		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, p->fence);
 		if (submit_res != VK_SUCCESS) {
-			ERROR("vk: vkQueueSubmit returned %d at %s:%d", (int)submit_res, __FILE__, __LINE__);
+			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
+				  vk_result_str((int)submit_res), __FILE__, __LINE__,
+				  p->last_pipeline_name ? "; last pipeline: " : "",
+				  p->last_pipeline_name ? p->last_pipeline_name : "");
 			if (submit_res == VK_ERROR_DEVICE_LOST)
 				p->device_lost = 1;
 			if (p && p->debug.abort_on_error)
@@ -1000,7 +1032,6 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 			return ERR_INTERNAL;
 		}
 	}
-	vk_report_query_results(p);
 	vk_flush_pending_desc_frees(p);
 	return OK;
 }
@@ -1242,7 +1273,7 @@ static void vk_destroy_pipeline(vk_priv *p, vk_pipeline_set *ps) {
 	if (r->has_work && !p->device_lost) {
 		status_code fs = vk_flush(p);
 		if (fs != OK) {
-			ERROR("vk: vk_destroy_pipeline: flush failed (status=%d)", (int)fs);
+			ERROR("vk: vk_destroy_pipeline: flush failed (%s)", status_str(fs));
 		}
 	}
 	if (r->has_work) {
@@ -1361,7 +1392,7 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 	}
 	int flush_limit;
 	if (p->caps.is_mali || p->caps.is_power_vr || p->caps.is_adreno) {
-		flush_limit = 256;
+		flush_limit = p->batch_active ? 4096 : 1024;
 	} else {
 		flush_limit = p->batch_active ? 4096 : 256;
 	}
@@ -1573,19 +1604,7 @@ have_set:;
 	if (push_size > 0)
 		vkCmdPushConstants(p->cmd, ps->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
 
-	int q0 = -1;
-	if (p->profiling && p->query_count + 2 <= p->query_cap) {
-		q0					   = p->query_count;
-		p->query_names[q0 / 2] = ps->name ? ps->name : "?";
-		vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, p->query_pool, q0);
-		p->query_count += 2;
-	}
-
 	vkCmdDispatch(p->cmd, groups_x, groups_y, 1);
-
-	if (q0 >= 0) {
-		vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p->query_pool, q0 + 1);
-	}
 
 	vk_dirty_add(p, key, n_bufs, write_mask);
 
@@ -1971,6 +1990,9 @@ static status_code vk_init(backend *self, int device_index) {
 			p->matmul_m_per_wg		  = 2;
 		}
 	}
+	p->matmul_lanes_per_row = 1;
+	if (p->caps.is_mali || p->caps.is_adreno || p->caps.is_amd)
+		p->matmul_lanes_per_row = 8;
 	if (p->caps.is_adreno) {
 		p->matmul_wg_size		  = 128;
 		p->matmul_rows_per_thread = 1;
@@ -2061,6 +2083,12 @@ static status_code vk_init(backend *self, int device_index) {
 		1u,
 	};
 
+	uint32_t spec_matmul_dense_narrow[6] = {
+		(uint32_t)p->matmul_wg_size,	   (uint32_t)p->matmul_rows_per_thread,
+		(uint32_t)p->matmul_tile_k,		   1u,
+		(uint32_t)p->matmul_lanes_per_row, (uint32_t)p->matmul_wg_size,
+	};
+
 	uint32_t dense_tile_k	= (uint32_t)p->matmul_tile_k;
 	uint32_t dense_m_per_wg = (uint32_t)p->matmul_m_per_wg;
 	if (p->caps.max_shared_memory > 0) {
@@ -2074,11 +2102,13 @@ static status_code vk_init(backend *self, int device_index) {
 	if (dense_m_per_wg < 1)
 		dense_m_per_wg = 1;
 	p->matmul_m_per_wg			 = (int)dense_m_per_wg;
-	uint32_t spec_matmul_wide[4] = {
+	uint32_t spec_matmul_wide[6] = {
 		(uint32_t)p->matmul_wg_size,
 		(uint32_t)p->matmul_rows_per_thread,
 		dense_tile_k,
 		dense_m_per_wg,
+		(uint32_t)p->matmul_lanes_per_row,
+		(uint32_t)p->matmul_wg_size,
 	};
 
 	uint32_t kquant_tile_k = (uint32_t)p->matmul_tile_k;
@@ -2108,9 +2138,6 @@ static status_code vk_init(backend *self, int device_index) {
 		kquant_tile_k,
 	};
 
-	p->attention_ready = 0;
-	p->flash_count	   = 0;
-	memset(p->p_attention_flash, 0, sizeof(p->p_attention_flash));
 	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 32, &p->p_kv_put);
 	if (s != OK)
 		return s;
@@ -2156,7 +2183,7 @@ static status_code vk_init(backend *self, int device_index) {
 	}
 
 	s = vk_create_pipeline_spec(p, shader_matmul_f32_batch_spv, shader_matmul_f32_batch_spv_len, 3,
-								12, spec_matmul_narrow, sizeof(spec_matmul_narrow),
+								12, spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow),
 								&p->p_matmul_f32_batch);
 	if (s != OK)
 		WARN("vulkan: failed to create matmul_f32_batch pipeline -- "
@@ -2164,9 +2191,9 @@ static status_code vk_init(backend *self, int device_index) {
 	else
 		p->p_matmul_f32_batch.name = "matmul_f32_batch";
 
-	s = vk_create_pipeline_spec(p, shader_matmul_f32_residual_batch_spv,
-								shader_matmul_f32_residual_batch_spv_len, 4, 12, spec_matmul_narrow,
-								sizeof(spec_matmul_narrow), &p->p_matmul_f32_res_batch);
+	s = vk_create_pipeline_spec(
+		p, shader_matmul_f32_residual_batch_spv, shader_matmul_f32_residual_batch_spv_len, 4, 12,
+		spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow), &p->p_matmul_f32_res_batch);
 	if (s != OK)
 		WARN("vulkan: failed to create matmul_f32_res_batch pipeline");
 	else
@@ -2194,20 +2221,25 @@ static status_code vk_init(backend *self, int device_index) {
 			p->p_matmul_##field##_res_batch.name = #spv_prefix "_res_batch";                       \
 	} while (0)
 
-#define VK_CREATE_BATCH_MATMUL_DUAL(qname, spv_prefix, n_bind, push_sz, spec_arr)                  \
+#define VK_CREATE_BATCH_MATMUL_NMAT(qname, spv_prefix, variant, n_bind, push_sz, spec_arr)         \
 	do {                                                                                           \
-		s = vk_create_pipeline_spec(                                                               \
-			p, shader_##spv_prefix##_dual_batch_spv, shader_##spv_prefix##_dual_batch_spv_len,     \
-			n_bind, push_sz, spec_arr, sizeof(spec_arr), &p->p_matmul_##qname##_dual_batch);       \
+		s = vk_create_pipeline_spec(p, shader_##spv_prefix##_##variant##_batch_spv,                \
+									shader_##spv_prefix##_##variant##_batch_spv_len, n_bind,       \
+									push_sz, spec_arr, sizeof(spec_arr),                           \
+									&p->p_matmul_##qname##_##variant##_batch);                     \
 		if (s != OK)                                                                               \
-			WARN("vulkan: failed to create " #spv_prefix "_dual_batch pipeline");                  \
+			WARN("vulkan: failed to create " #spv_prefix "_" #variant "_batch pipeline");          \
 		else                                                                                       \
-			p->p_matmul_##qname##_dual_batch.name = #spv_prefix "_dual_batch";                     \
+			p->p_matmul_##qname##_##variant##_batch.name = #spv_prefix "_" #variant "_batch";      \
 	} while (0)
+
+#define VK_CREATE_BATCH_MATMUL_DUAL(qname, spv_prefix, n_bind, push_sz, spec_arr)                  \
+	VK_CREATE_BATCH_MATMUL_NMAT(qname, spv_prefix, dual, n_bind, push_sz, spec_arr)
 
 	VK_CREATE_BATCH_MATMUL_FIELD(q4_0, matmul_q4_0, 3, 16, spec_matmul);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_0, matmul_q4_0, 4, 16, spec_matmul);
 	VK_CREATE_BATCH_MATMUL_DUAL(q4_0, matmul_q4_0, 5, 16, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_NMAT(q4_0, matmul_q4_0, triple, 7, 20, spec_matmul);
 
 	VK_CREATE_BATCH_MATMUL_FIELD(q4_1, matmul_q4_1, 3, 12, spec_matmul);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_1, matmul_q4_1, 4, 12, spec_matmul);
@@ -2235,10 +2267,10 @@ static status_code vk_init(backend *self, int device_index) {
 	VK_CREATE_BATCH_MATMUL_FIELD(iq3_s, matmul_iq3_s, 4, 16, spec_matmul_iq3s);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_s, matmul_iq3_s, 5, 16, spec_matmul_iq3s);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 3, 12, spec_matmul_narrow);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16, matmul_f16, 4, 12, spec_matmul_narrow);
-	VK_CREATE_BATCH_MATMUL_FIELD(bf16, matmul_bf16, 3, 12, spec_matmul_narrow);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16, matmul_bf16, 4, 12, spec_matmul_narrow);
+	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 3, 12, spec_matmul_dense_narrow);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16, matmul_f16, 4, 12, spec_matmul_dense_narrow);
+	VK_CREATE_BATCH_MATMUL_FIELD(bf16, matmul_bf16, 3, 12, spec_matmul_dense_narrow);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16, matmul_bf16, 4, 12, spec_matmul_dense_narrow);
 
 	VK_CREATE_BATCH_MATMUL_FIELD(f32_wide, matmul_f32, 3, 12, spec_matmul_wide);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(f32_wide, matmul_f32, 4, 12, spec_matmul_wide);
@@ -2306,6 +2338,8 @@ static status_code vk_init(backend *self, int device_index) {
 			p->p_rmsnorm_add_batch.name = "rmsnorm_add_batch";
 	}
 
+	memset(p->attn_cache, 0, sizeof(p->attn_cache));
+
 	s = vk_create_pipeline(p, shader_rope_batch_spv, shader_rope_batch_spv_len, 3, 20,
 						   &p->p_rope_batch);
 	if (s == OK)
@@ -2319,12 +2353,9 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s == OK)
 		p->p_rope_qk_batch.name = "rope_qk_batch";
 
-	p->attention_batch_ready = 0;
-	p->flash_batch_count	 = 0;
-	memset(p->p_attention_flash_batch, 0, sizeof(p->p_attention_flash_batch));
-	memset(p->flash_batch_head_dim, 0, sizeof(p->flash_batch_head_dim));
-	memset(p->flash_batch_n_groups, 0, sizeof(p->flash_batch_n_groups));
-	memset(p->flash_batch_unsupported, 1, sizeof(p->flash_batch_unsupported));
+	s = vk_create_pipeline(p, shader_dequant_spv, shader_dequant_spv_len, 3, 16, &p->p_dequant);
+	if (s == OK)
+		p->p_dequant.name = "dequant";
 
 	s = vk_create_pipeline(p, shader_ffn_activate_batch_spv, shader_ffn_activate_batch_spv_len, 3,
 						   20, &p->p_ffn_activate_batch);
@@ -2352,9 +2383,9 @@ static void vk_free(backend *self) {
 	if (p->dev) {
 		vkDeviceWaitIdle(p->dev);
 
-		vk_destroy_pipeline(p, &p->p_attention);
-		for (int fi = 0; fi < VK_FLASH_CACHE_CAP; fi++)
-			vk_destroy_pipeline(p, &p->p_attention_flash[fi]);
+		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++)
+			for (int fi = 0; fi < VK_ATTN_CACHE_CAP; fi++)
+				vk_destroy_pipeline(p, &p->attn_cache[ci].set[fi]);
 		vk_destroy_pipeline(p, &p->p_kv_put);
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
 		vk_destroy_pipeline(p, &p->p_argmax);
@@ -2365,6 +2396,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_dual_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_q4_0_triple_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_1_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_1_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q5_0_batch);
@@ -2408,9 +2440,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_rope_batch);
 		vk_destroy_pipeline(p, &p->p_rope_ext_batch);
 		vk_destroy_pipeline(p, &p->p_rope_qk_batch);
-		vk_destroy_pipeline(p, &p->p_attention_batch);
-		for (int fi = 0; fi < VK_FLASH_CACHE_CAP; fi++)
-			vk_destroy_pipeline(p, &p->p_attention_flash_batch[fi]);
+		vk_destroy_pipeline(p, &p->p_dequant);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_batch);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_fused_batch);
 		vk_destroy_pipeline(p, &p->p_elementwise_batch);
@@ -2438,6 +2468,10 @@ static void vk_free(backend *self) {
 		if (p->attn_scores_buf.handle) {
 			vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
 			free(p->attn_scores_buf.handle);
+		}
+		if (p->ffn_act_buf.handle) {
+			vk_free_buffer(p, (vk_buf *)p->ffn_act_buf.handle);
+			free(p->ffn_act_buf.handle);
 		}
 		if (p->staging_buf.buf) {
 			p->wbatch_count = 0;
@@ -2603,12 +2637,15 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 	return OK;
 }
 
+#define VK_WEIGHT_TAIL_PAD 32
+
 static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
 	vk_priv *p	  = self->priv;
 	size_t	 size = (desc->n_dims == 1) ? ggml_row_size(desc->type, desc->dims[0])
 										: ggml_row_size(desc->type, desc->dims[0]) * desc->dims[1];
+	size_t	 alloc_size = size + VK_WEIGHT_TAIL_PAD;
 
-	vk_buf *b = vk_scratch_pool_take(p, size, NULL);
+	vk_buf *b = vk_scratch_pool_take(p, alloc_size, NULL);
 	if (b) {
 		if (b->mapped) {
 			memcpy(b->mapped, desc->host_data, size);
@@ -2656,7 +2693,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 		VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
 									  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
 									  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		status_code			  s		= vk_alloc_buffer(p, size, weight_usage, flags, bnew);
+		status_code			  s		= vk_alloc_buffer(p, alloc_size, weight_usage, flags, bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
 				p, size, weight_usage,
@@ -2674,7 +2711,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 		memcpy(bnew->mapped, desc->host_data, size);
 	} else {
 		status_code s =
-			vk_alloc_buffer(p, size, weight_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bnew);
+			vk_alloc_buffer(p, alloc_size, weight_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
 				p, size, weight_usage,
@@ -2731,8 +2768,8 @@ static void vk_buffer_free(backend *self, buffer *buf) {
 		return;
 	if (vk_kv_registry_remove(p, buf->handle)) {
 		status_code fs = vk_flush(p);
-		if (fs != OK) {
-			ERROR("vk: vk_buffer_free: flush failed (status=%d)", (int)fs);
+		if (fs != OK && !p->device_lost) {
+			ERROR("vk: vk_buffer_free: flush failed (%s)", status_str(fs));
 		}
 		vk_kv_handle *kh = (vk_kv_handle *)buf->handle;
 		vk_kv_store_free(p, &kh->store);
@@ -2754,8 +2791,8 @@ static void vk_buffer_free(backend *self, buffer *buf) {
 
 	if (p->last_signal_value > p->timeline_completed || p->ring[p->ring_cur].has_work) {
 		status_code fs = vk_flush(p);
-		if (fs != OK) {
-			ERROR("vk: vk_buffer_free: flush failed (status=%d)", (int)fs);
+		if (fs != OK && !p->device_lost) {
+			ERROR("vk: vk_buffer_free: flush failed (%s)", status_str(fs));
 		}
 	}
 	vk_free_buffer(p, b);
@@ -2796,13 +2833,15 @@ static status_code vk_buffer_alloc_from_host(backend *self, const void *host_dat
 	if (p->device_lost)
 		return ERR_INTERNAL;
 
+	size_t alloc_size = size + VK_WEIGHT_TAIL_PAD;
+
 	vk_buf			  *b	 = xcalloc(1, sizeof(vk_buf));
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-	status_code		   s = vk_alloc_buffer(p, size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b);
+	status_code s = vk_alloc_buffer(p, alloc_size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b);
 	if (s != OK) {
 		s = vk_alloc_buffer(
-			p, size, usage,
+			p, alloc_size, usage,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, b);
 	}
 	if (s != OK) {
@@ -3802,6 +3841,16 @@ static status_code vk_matmul_host_fallback(backend *self, const buffer *w, uint3
 	return s;
 }
 
+static int vk_matmul_groups_x(vk_priv *p, int n, uint32_t w_type) {
+	int is_dense = (w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16);
+	int lpr		 = (is_dense && p->matmul_lanes_per_row > 0) ? p->matmul_lanes_per_row : 1;
+	int rows	 = p->matmul_rows_per_thread;
+	int per_wg	 = (p->matmul_wg_size / lpr) * rows;
+	if (per_wg < 1)
+		per_wg = 1;
+	return (n + per_wg - 1) / per_wg;
+}
+
 static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 								  const buffer *residual, buffer *y, int n, int k) {
 	vk_priv *p			  = self->priv;
@@ -3877,9 +3926,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 	if (is_kquant) {
 		groups = (uint32_t)((n + (int)p->matmul_wg_size - 1) / (int)p->matmul_wg_size);
 	} else {
-		int rows = p->matmul_rows_per_thread;
-		int wg	 = p->matmul_wg_size;
-		groups	 = (uint32_t)((n + (wg * rows) - 1) / (wg * rows));
+		groups = (uint32_t)vk_matmul_groups_x(p, n, w_type);
 	}
 	uint32_t wmask = has_residual ? 0x8 : (1u << 2);
 	if (unified_push) {
@@ -3937,74 +3984,69 @@ static status_code vk_matmul_multi(backend *self, const buffer **w, const uint32
 	return vk_matmul_multi_batch(self, w, w_types, x, y, n_list, k, n_matmuls, 1);
 }
 
+static void vk_drain_before_free(vk_priv *p) {
+	if (p->device_lost)
+		return;
+	if (p->pending_dispatches > 0 || p->ring[p->ring_cur].has_work)
+		vk_run_cmd_sync(p);
+}
+
+static status_code vk_ensure_ffn_act_buf(backend *self, int k, buffer *out) {
+	vk_priv *p = self->priv;
+	if (k <= p->ffn_act_cap) {
+		*out	  = p->ffn_act_buf;
+		out->size = (size_t)k * sizeof(float);
+		return OK;
+	}
+
+	if (p->ffn_act_buf.handle) {
+		vk_drain_before_free(p);
+		vk_free_buffer(p, (vk_buf *)p->ffn_act_buf.handle);
+		free(p->ffn_act_buf.handle);
+		p->ffn_act_buf.handle = NULL;
+		p->ffn_act_cap		  = 0;
+	}
+
+	status_code s = vk_buffer_alloc_scratch(self, (size_t)k * sizeof(float), &p->ffn_act_buf);
+	if (s != OK)
+		return s;
+	p->ffn_act_cap = k;
+	*out		   = p->ffn_act_buf;
+	out->size	   = (size_t)k * sizeof(float);
+	return OK;
+}
+
 static status_code vk_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
 									  const buffer *gate, const buffer *up, buffer *y, int n, int k,
 									  int activation) {
 	vk_priv *p = self->priv;
 
-	if (w_type == GGML_TYPE_IQ4_NL) {
-		if (p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
-			return vk_dispatch_iq4_nl_unified(p, 2, w, gate, up, y, NULL, n, 0, k, activation, 0);
-		}
+	if (w_type == GGML_TYPE_IQ4_NL && p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
+		return vk_dispatch_iq4_nl_unified(p, 2, w, gate, up, y, NULL, n, 0, k, activation, 0);
+	}
+
+	if (n <= 0 || k <= 0)
+		return ERR_INVALID_ARG;
+
+	if (!vk_matmul_type_native(self, w_type)) {
 		backend_report_host_fallback(
 			self, "ffn_down", HFB_WEIGHT_TYPE,
-			"iq4_nl ffn_down needs k%%32==0 (k=%d here) and the iq4_nl shader; "
-			"gate/up downloaded and activation + matmul executed on host (cpu)",
-			k);
-	} else {
-		backend_report_host_fallback(
-			self, "ffn_down", HFB_WEIGHT_TYPE,
-			"no fused ffn_down shader for weight type '%s'; gate/up downloaded and "
-			"activation + matmul executed on host (cpu)",
+			"no vulkan matmul for weight type '%s'; activation + matmul executed on "
+			"host (cpu)",
 			ggml_type_name(w_type));
+		return ERR_UNSUPPORTED;
 	}
 
-	float *gate_host = xmalloc((size_t)k * sizeof(float));
-	float *up_host	 = xmalloc((size_t)k * sizeof(float));
-	float *act_host	 = xmalloc((size_t)k * sizeof(float));
-	float *y_host	 = xmalloc((size_t)n * sizeof(float));
-
-	status_code s = vk_buffer_read_f32(self, gate, gate_host, k);
+	buffer		act = {0};
+	status_code s	= vk_ensure_ffn_act_buf(self, k, &act);
 	if (s != OK)
-		goto ffn_down_cleanup;
-	s = vk_buffer_read_f32(self, up, up_host, k);
+		return s;
+
+	s = vk_ffn_activate_batch_scales(self, gate, up, &act, k, activation, 1, 1.0f, 1.0f);
 	if (s != OK)
-		goto ffn_down_cleanup;
+		return s;
 
-	backend *host = backend_host();
-	if (!host || !host->ffn_activate_ex) {
-		s = ERR_UNSUPPORTED;
-		goto ffn_down_cleanup;
-	}
-	buffer gb = {0}, ub = {0}, ob = {0};
-	gb.handle = gate_host;
-	gb.owner  = host;
-	gb.size	  = (size_t)k * sizeof(float);
-	ub.handle = up_host;
-	ub.owner  = host;
-	ub.size	  = (size_t)k * sizeof(float);
-	ob.handle = act_host;
-	ob.owner  = host;
-	ob.size	  = (size_t)k * sizeof(float);
-	s		  = host->ffn_activate_ex(host, &gb, &ub, &ob, k, activation);
-	if (s != OK)
-		goto ffn_down_cleanup;
-
-	if (w->host_ptr) {
-		host_matmul_generic(w->host_ptr, w_type, act_host, y_host, n, k);
-	} else {
-		s = ERR_UNSUPPORTED;
-		goto ffn_down_cleanup;
-	}
-
-	s = vk_buffer_write_f32(self, y, y_host, n);
-
-ffn_down_cleanup:
-	free(gate_host);
-	free(up_host);
-	free(act_host);
-	free(y_host);
-	return s;
+	return vk_matmul_batch(self, w, w_type, &act, y, n, k, 1);
 }
 
 static status_code vk_alloc_rope_buf(vk_priv *p, size_t size, buffer *out) {
@@ -4144,6 +4186,7 @@ static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 		return OK;
 
 	if (p->attn_scores_buf.handle) {
+		vk_drain_before_free(p);
 		vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
 		free(p->attn_scores_buf.handle);
 		p->attn_scores_buf.handle = NULL;
@@ -4157,121 +4200,158 @@ static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 	return OK;
 }
 
-static status_code vk_ensure_flash_pipeline(vk_priv *p, int head_dim, int n_groups,
-											vk_pipeline_set **out) {
-	for (int i = 0; i < p->flash_count; i++) {
-		if (p->flash_head_dim[i] == head_dim && p->flash_n_groups[i] == n_groups) {
-			if (p->flash_unsupported[i])
-				return ERR_UNSUPPORTED;
-			*out = &p->p_attention_flash[i];
-			return OK;
-		}
-	}
-	if (p->flash_count >= VK_FLASH_CACHE_CAP)
-		return ERR_UNSUPPORTED;
+#define FLASH_MAX_DPL 16
+#define FLASH_MAX_SPLIT 64
+#define FLASH_K_PAD 4
 
-	int slot = p->flash_count;
+static int vk_flash_layout(vk_priv *p, int head_dim, int n_groups, uint32_t spec[6]) {
+	const int sg = (int)p->caps.subgroup_size;
+	if (sg < 1 || head_dim < 1 || head_dim > 256 || n_groups < 1)
+		return 0;
 
-	int lanes_per_head = 32;
-	while (lanes_per_head > 1 && head_dim % lanes_per_head != 0)
-		lanes_per_head >>= 1;
+	int lanes = 0;
+	for (int l = 1; l <= 16; l <<= 1) {
+		if (l > sg || sg % l != 0 || head_dim % l != 0 || head_dim / l > FLASH_MAX_DPL)
+			continue;
+		lanes = l;
+		break;
+	}
+	if (lanes == 0)
+		return 0;
 
-	int local_size	= lanes_per_head * n_groups;
-	int max_wg_inv	= (int)p->caps.max_workgroup_invocations;
-	int max_wg_size = (int)p->caps.max_workgroup_size[0];
-	if (max_wg_inv > 0 && local_size > max_wg_inv) {
-		p->flash_head_dim[slot]	   = head_dim;
-		p->flash_n_groups[slot]	   = n_groups;
-		p->flash_unsupported[slot] = 1;
-		p->flash_count++;
-		return ERR_UNSUPPORTED;
-	}
-	if (max_wg_size > 0 && local_size > max_wg_size) {
-		p->flash_head_dim[slot]	   = head_dim;
-		p->flash_n_groups[slot]	   = n_groups;
-		p->flash_unsupported[slot] = 1;
-		p->flash_count++;
-		return ERR_UNSUPPORTED;
-	}
-	{
-		const int TILE_T		 = 16;
-		size_t	  red_tile_bytes = (size_t)n_groups * (size_t)lanes_per_head * sizeof(float);
-		size_t	  kv_tile_bytes	 = 2 * (size_t)TILE_T * (size_t)head_dim * sizeof(float);
-		size_t	  shared_bytes	 = kv_tile_bytes + red_tile_bytes;
-		if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
-			p->flash_head_dim[slot]	   = head_dim;
-			p->flash_n_groups[slot]	   = n_groups;
-			p->flash_unsupported[slot] = 1;
-			p->flash_count++;
+	int heads = n_groups;
+	while (heads > 1 && (n_groups % heads != 0 || heads * lanes > sg))
+		heads--;
+
+	const int base	= heads * lanes;
+	int		  split = 1;
+	while (split * base < 128 && split < FLASH_MAX_SPLIT && (split * 2) * base <= 1024)
+		split *= 2;
+
+	int tile_t = 2048 / head_dim;
+	while (tile_t > 4 && (tile_t & (tile_t - 1)))
+		tile_t--;
+	if (tile_t < 4)
+		tile_t = 4;
+
+	size_t kv_bytes = ((size_t)tile_t * ((size_t)head_dim + FLASH_K_PAD) +
+					   (size_t)tile_t * (size_t)head_dim + (size_t)heads * (size_t)tile_t) *
+					  sizeof(float);
+	size_t pt_bytes =
+		(size_t)heads * (size_t)split * (size_t)lanes * (FLASH_MAX_DPL + 2) * sizeof(float);
+	if (p->caps.max_shared_memory > 0 && kv_bytes + pt_bytes > p->caps.max_shared_memory)
+		return 0;
+
+	spec[0] = (uint32_t)head_dim;
+	spec[1] = (uint32_t)heads;
+	spec[2] = (uint32_t)lanes;
+	spec[3] = (uint32_t)(base * split);
+	spec[4] = (uint32_t)tile_t;
+	spec[5] = (uint32_t)split;
+	return 1;
+}
+
+static int vk_flash_groups(vk_priv *p, int head_dim, int n_heads, int n_kv_heads) {
+	uint32_t spec[6];
+	int		 n_groups = n_kv_heads > 0 ? n_heads / n_kv_heads : 1;
+	if (!vk_flash_layout(p, head_dim, n_groups, spec))
+		return n_kv_heads;
+	return n_kv_heads * n_groups / (int)spec[1];
+}
+
+static status_code vk_ensure_attn_pipeline(vk_priv *p, int kind, int head_dim, int n_groups,
+										   const uint32_t *spec_data, uint32_t spec_size,
+										   const uint32_t *spv, size_t spv_len, int n_bindings,
+										   uint32_t push_size, const char *name,
+										   vk_pipeline_set **out) {
+	vk_attn_cache *c = &p->attn_cache[kind];
+	for (int i = 0; i < c->count; i++) {
+		if (c->head_dim[i] != head_dim || c->n_groups[i] != n_groups)
+			continue;
+		if (c->unsupported[i])
 			return ERR_UNSUPPORTED;
-		}
+		*out = &c->set[i];
+		return OK;
 	}
-
-	if (n_groups < 1 || head_dim > 256 || local_size > 1024 || head_dim % lanes_per_head != 0 ||
-		head_dim / lanes_per_head > 16) {
-		p->flash_head_dim[slot]	   = head_dim;
-		p->flash_n_groups[slot]	   = n_groups;
-		p->flash_unsupported[slot] = 1;
-		p->flash_count++;
+	if (c->count >= VK_ATTN_CACHE_CAP || !spec_data) {
+		if (spec_data)
+			WARN("attention pipeline cache full, %s head_dim=%d n_groups=%d", name, head_dim,
+				 n_groups);
+		if (c->count < VK_ATTN_CACHE_CAP) {
+			c->head_dim[c->count]	 = head_dim;
+			c->n_groups[c->count]	 = n_groups;
+			c->unsupported[c->count] = 1;
+			c->count++;
+		}
 		return ERR_UNSUPPORTED;
 	}
 
-	uint32_t	spec_data[4] = {(uint32_t)head_dim, (uint32_t)n_groups, (uint32_t)lanes_per_head,
-								(uint32_t)local_size};
-	status_code s =
-		vk_create_pipeline_spec(p, shader_attention_flash_spv, shader_attention_flash_spv_len, 4,
-								36, spec_data, sizeof(spec_data), &p->p_attention_flash[slot]);
+	int slot			 = c->count;
+	c->head_dim[slot]	 = head_dim;
+	c->n_groups[slot]	 = n_groups;
+	c->unsupported[slot] = 1;
+	c->count++;
+
+	status_code s = vk_create_pipeline_spec(p, spv, spv_len, n_bindings, push_size, spec_data,
+											spec_size, &c->set[slot]);
 	if (s != OK) {
-		WARN("flash attention pipeline creation failed for head_dim=%d "
-			 "n_groups=%d, falling back",
-			 head_dim, n_groups);
-		p->flash_head_dim[slot]	   = head_dim;
-		p->flash_n_groups[slot]	   = n_groups;
-		p->flash_unsupported[slot] = 1;
-		p->flash_count++;
+		WARN("%s pipeline creation failed for head_dim=%d n_groups=%d", name, head_dim, n_groups);
 		return s;
 	}
-	p->p_attention_flash[slot].name = "attention_flash";
-	p->flash_head_dim[slot]			= head_dim;
-	p->flash_n_groups[slot]			= n_groups;
-	p->flash_unsupported[slot]		= 0;
-	p->flash_count++;
-	*out = &p->p_attention_flash[slot];
+	c->set[slot].name	 = name;
+	c->unsupported[slot] = 0;
+	*out				 = &c->set[slot];
 	return OK;
 }
 
-static status_code vk_ensure_attention_pipeline(vk_priv *p, int head_dim, vk_pipeline_set **out) {
-	int tile_t = head_dim > 256 ? 8 : 16;
+static int vk_attn_tile_t(int head_dim) {
+	return head_dim > 256 ? 8 : 16;
+}
 
-	size_t q_bytes		 = (size_t)head_dim * sizeof(float);
-	size_t kv_tile_bytes = (size_t)tile_t * (size_t)head_dim * sizeof(float);
-	size_t shared_bytes	 = q_bytes + kv_tile_bytes;
-	if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
-		WARN("attention pipeline needs %zu bytes shared (device has %u), head_dim=%d", shared_bytes,
+static status_code vk_attn_check_shared(vk_priv *p, int head_dim) {
+	size_t q_bytes	= (size_t)head_dim * sizeof(float);
+	size_t kv_bytes = (size_t)vk_attn_tile_t(head_dim) * (size_t)head_dim * sizeof(float);
+	size_t shared	= q_bytes + kv_bytes;
+	if (p->caps.max_shared_memory > 0 && shared > p->caps.max_shared_memory) {
+		WARN("attention pipeline needs %zu bytes shared (device has %u), head_dim=%d", shared,
 			 p->caps.max_shared_memory, head_dim);
 		return ERR_UNSUPPORTED;
 	}
-
-	if (p->attention_ready && p->attention_head_dim == head_dim) {
-		*out = &p->p_attention;
-		return OK;
-	}
-	if (p->attention_ready)
-		vk_destroy_pipeline(p, &p->p_attention);
-
-	uint32_t	spec_data[2] = {(uint32_t)head_dim, (uint32_t)tile_t};
-	status_code s = vk_create_pipeline_spec(p, shader_attention_spv, shader_attention_spv_len, 5,
-											36, spec_data, sizeof(spec_data), &p->p_attention);
-	if (s != OK) {
-		WARN("attention pipeline creation failed for head_dim=%d", head_dim);
-		p->attention_ready = 0;
-		return s;
-	}
-	p->p_attention.name	  = "attention";
-	p->attention_ready	  = 1;
-	p->attention_head_dim = head_dim;
-	*out				  = &p->p_attention;
 	return OK;
+}
+
+static status_code vk_ensure_attn_spec(vk_priv *p, int kind, int head_dim, int n_groups,
+									   const uint32_t *spv, size_t spv_len, int n_bindings,
+									   uint32_t push_size, const char *name,
+									   vk_pipeline_set **out) {
+	if (vk_attn_check_shared(p, head_dim) != OK)
+		return ERR_UNSUPPORTED;
+	uint32_t spec_data[2] = {(uint32_t)head_dim, (uint32_t)vk_attn_tile_t(head_dim)};
+	return vk_ensure_attn_pipeline(p, kind, head_dim, n_groups, spec_data, sizeof(spec_data), spv,
+								   spv_len, n_bindings, push_size, name, out);
+}
+
+static status_code vk_ensure_attn_flash(vk_priv *p, int kind, int head_dim, int n_groups,
+										const uint32_t *spv, size_t spv_len, int n_bindings,
+										uint32_t push_size, const char *name,
+										vk_pipeline_set **out) {
+	uint32_t spec_data[6];
+	if (!vk_flash_layout(p, head_dim, n_groups, spec_data))
+		return vk_ensure_attn_pipeline(p, kind, head_dim, n_groups, NULL, 0, spv, spv_len,
+									   n_bindings, push_size, name, out);
+	return vk_ensure_attn_pipeline(p, kind, head_dim, n_groups, spec_data, sizeof(spec_data), spv,
+								   spv_len, n_bindings, push_size, name, out);
+}
+
+static status_code vk_ensure_flash_pipeline(vk_priv *p, int head_dim, int n_groups,
+											vk_pipeline_set **out) {
+	return vk_ensure_attn_flash(p, VK_ATTN_FLASH, head_dim, n_groups, shader_attention_flash_spv,
+								shader_attention_flash_spv_len, 4, 36, "attention_flash", out);
+}
+
+static status_code vk_ensure_attention_pipeline(vk_priv *p, int head_dim, vk_pipeline_set **out) {
+	return vk_ensure_attn_spec(p, VK_ATTN_PLAIN, head_dim, 1, shader_attention_spv,
+							   shader_attention_spv_len, 5, 36, "attention", out);
 }
 
 static status_code vk_attention_host_fallback(backend *self, const buffer *q, buffer *out,
@@ -4461,7 +4541,7 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 			int32_t	 attn_start;
 		} push = {(uint32_t)layer_off, pos, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 				  attn_start};
-		uint32_t groups	 = (uint32_t)n_kv_heads;
+		uint32_t groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf	*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		return vk_dispatch(p, flash_ps, bufs, 4, &push, sizeof(push), groups);
 	}
@@ -4649,9 +4729,9 @@ static void vk_synchronize(backend *self) {
 	if (r->has_work) {
 		status_code fs = vk_flush(p);
 		if (fs != OK) {
-			ERROR("vk: vk_synchronize: flush failed (status=%d) -- "
+			ERROR("vk: vk_synchronize: flush failed (%s) -- "
 				  "pending work was NOT executed",
-				  (int)fs);
+				  status_str(fs));
 		}
 	}
 }
@@ -4667,7 +4747,7 @@ static void vk_submit(backend *self) {
 
 	status_code s = vk_run_cmd(p);
 	if (s != OK)
-		ERROR("vk: vk_submit: submit failed (status=%d)", (int)s);
+		ERROR("vk: vk_submit: submit failed (%s)", status_str(s));
 }
 
 static void vk_begin_batch(backend *self) {
@@ -4693,7 +4773,7 @@ static void vk_end_batch(backend *self) {
 	if (r->has_work) {
 		status_code fs = vk_flush(p);
 		if (fs != OK) {
-			ERROR("vk: vk_end_batch: flush failed (status=%d) -- "
+			ERROR("vk: vk_end_batch: flush failed (%s) -- "
 				  "batch was NOT submitted to the device",
 				  (int)fs);
 		}
@@ -4910,9 +4990,7 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	if (is_kquant) {
 		groups_x = (uint32_t)((n + p->matmul_wg_size - 1) / p->matmul_wg_size);
 	} else {
-		int rows = p->matmul_rows_per_thread;
-		int wg	 = p->matmul_wg_size;
-		groups_x = (uint32_t)((n + (wg * rows) - 1) / (wg * rows));
+		groups_x = (uint32_t)vk_matmul_groups_x(p, n, w_type);
 	}
 
 	int is_dense = (w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16);
@@ -4988,6 +5066,26 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 		return st;
 	}
 
+	if (n_matmuls == 3 && w_types[0] == w_types[1] && w_types[1] == w_types[2] &&
+		w_types[0] == GGML_TYPE_Q4_0 && p->p_matmul_q4_0_triple_batch.pipeline && k > 0) {
+		int n0 = n_list[0], n1 = n_list[1], n2 = n_list[2];
+		int n_max = n0 > n1 ? n0 : n1;
+		n_max	  = n_max > n2 ? n_max : n2;
+		struct {
+			int32_t n0, n1, n2, k, m;
+		} push				  = {n0, n1, n2, k, m};
+		vk_buf		*bufs[7]  = {as_vkbuf(w[0]), as_vkbuf(w[1]), as_vkbuf(w[2]), as_vkbuf(x),
+								 as_vkbuf(y[0]), as_vkbuf(y[1]), as_vkbuf(y[2])};
+		VkDeviceSize offs[7]  = {w[0]->offset, w[1]->offset, w[2]->offset, x->offset,
+								 y[0]->offset, y[1]->offset, y[2]->offset};
+		int			 rows	  = p->matmul_rows_per_thread;
+		int			 wg		  = p->matmul_wg_size;
+		uint32_t	 groups_x = (uint32_t)((n_max + (wg * rows) - 1) / (wg * rows));
+		uint32_t	 wmask	  = (1u << 4) | (1u << 5) | (1u << 6);
+		return vk_dispatch_2d_ex(p, &p->p_matmul_q4_0_triple_batch, bufs, offs, NULL, 7, &push,
+								 sizeof(push), groups_x, (uint32_t)m, wmask);
+	}
+
 	if (n_matmuls == 2 && w_types[0] == w_types[1]) {
 		uint32_t wt = w_types[0];
 
@@ -5055,9 +5153,8 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 	}
 
 	status_code st = OK;
-	for (int i = 0; i < n_matmuls && st == OK; i++) {
+	for (int i = 0; i < n_matmuls && st == OK; i++)
 		st = vk_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
-	}
 	return st;
 }
 
@@ -5230,6 +5327,116 @@ static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n
 							 groups_x, (uint32_t)m, 0x1);
 }
 
+static int vk_dequant_block_elems(uint32_t type, int *out_elems, int *out_block_bytes) {
+	switch (type) {
+	case GGML_TYPE_F32:
+		*out_elems = 1, *out_block_bytes = 4;
+		return 1;
+	case GGML_TYPE_F16:
+	case GGML_TYPE_BF16:
+		*out_elems = 1, *out_block_bytes = 2;
+		return 1;
+	case GGML_TYPE_Q4_0:
+	case GGML_TYPE_IQ4_NL:
+		*out_elems = 32, *out_block_bytes = 18;
+		return 1;
+	case GGML_TYPE_Q4_1:
+		*out_elems = 32, *out_block_bytes = 20;
+		return 1;
+	case GGML_TYPE_Q5_0:
+		*out_elems = 32, *out_block_bytes = 22;
+		return 1;
+	case GGML_TYPE_Q5_1:
+		*out_elems = 32, *out_block_bytes = 24;
+		return 1;
+	case GGML_TYPE_Q8_0:
+		*out_elems = 32, *out_block_bytes = 34;
+		return 1;
+	case GGML_TYPE_Q4_K:
+		*out_elems = 256, *out_block_bytes = 144;
+		return 1;
+	case GGML_TYPE_Q5_K:
+		*out_elems = 256, *out_block_bytes = 176;
+		return 1;
+	case GGML_TYPE_Q6_K:
+		*out_elems = 256, *out_block_bytes = 210;
+		return 1;
+	case GGML_TYPE_IQ3_S:
+		*out_elems = 256, *out_block_bytes = 110;
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int vk_dequant_type_native(backend *self, uint32_t type, int k) {
+	vk_priv *p = self->priv;
+	int		 unit_elems, block_bytes;
+	if (!p->p_dequant.pipeline || !vk_dequant_block_elems(type, &unit_elems, &block_bytes))
+		return 0;
+	if (k <= 0 || k % unit_elems != 0)
+		return 0;
+	return type != GGML_TYPE_IQ3_S || p->iq3s_grid_buf.buf != VK_NULL_HANDLE;
+}
+
+static status_code vk_dequant_weight(backend *self, uint32_t type, const void *src, int n_rows,
+									 int k, buffer *out) {
+	vk_priv *p = self->priv;
+	if (!p->p_dequant.pipeline || k <= 0 || n_rows <= 0)
+		return ERR_UNSUPPORTED;
+	int unit_elems = 0, block_bytes = 0;
+	if (!vk_dequant_block_elems(type, &unit_elems, &block_bytes) || k % unit_elems != 0)
+		return ERR_UNSUPPORTED;
+	if (type == GGML_TYPE_IQ3_S && !p->iq3s_grid_buf.buf)
+		return ERR_UNSUPPORTED;
+
+	const size_t src_bytes = ggml_row_size(type, (size_t)k) * (size_t)n_rows;
+	const size_t dst_bytes = (size_t)k * (size_t)n_rows * sizeof(float);
+	const int	 n_units   = ((n_rows * k) / unit_elems);
+
+	VkMemoryPropertyFlags mem_flags =
+		p->caps.unified_memory
+			? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+			   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+			: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+	buffer		sbuf = {0};
+	status_code s	 = vk_buffer_alloc_scratch(self, src_bytes, &sbuf);
+	vk_buf	   *dst	 = xcalloc(1, sizeof(vk_buf));
+	if (s == OK)
+		s = vk_alloc_buffer(p, dst_bytes, usage, mem_flags, dst);
+	if (s == OK)
+		s = vk_buffer_upload(self, &sbuf, src, src_bytes);
+	if (s == OK) {
+		struct {
+			int32_t type, n_units, block_bytes, n_elems;
+		} push				 = {(int32_t)type, n_units, block_bytes, unit_elems};
+		vk_buf		*grid	 = (type == GGML_TYPE_IQ3_S) ? &p->iq3s_grid_buf : vk_dummy_buf(p);
+		vk_buf		*bufs[3] = {as_vkbuf(&sbuf), dst, grid};
+		VkDeviceSize offs[3] = {0, 0, 0};
+		s = vk_dispatch_2d_ex(p, &p->p_dequant, bufs, offs, NULL, 3, &push, sizeof(push),
+							  (uint32_t)((n_units + 63) / 64), 1, 1u << 1);
+	}
+	if (s == OK)
+		s = vk_run_cmd_sync(p);
+
+	vk_buffer_free(self, &sbuf);
+	if (s != OK) {
+		if (dst->buf)
+			vk_free_buffer(p, dst);
+		free(dst);
+		return s;
+	}
+
+	out->handle	  = dst;
+	out->size	  = dst_bytes;
+	out->host_ptr = dst->mapped;
+	out->owner	  = self;
+	return OK;
+}
+
 static status_code vk_ffn_activate_batch_scales(backend *self, const buffer *gate, const buffer *up,
 												buffer *out, int n, int activation, int m, float gs,
 												float us) {
@@ -5355,8 +5562,10 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 						   p->rope_ff_head_dim != head_dim || p->rope_ff_theta != self->rope_theta);
 		if (table_stale) {
 			if (need > (size_t)p->rope_ff_cap) {
-				if (p->rope_ff_buf.handle)
+				if (p->rope_ff_buf.handle) {
+					vk_drain_before_free(p);
 					vk_buffer_free(self, &p->rope_ff_buf);
+				}
 				status_code s = vk_buffer_alloc_scratch(self, need, &p->rope_ff_buf);
 				if (s != OK)
 					return s;
@@ -5425,10 +5634,12 @@ static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_
 	if (needed <= p->attn_scores_cap)
 		return OK;
 	if (p->attn_scores_buf.handle) {
+		vk_drain_before_free(p);
 		vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
 		free(p->attn_scores_buf.handle);
 		p->attn_scores_buf.handle = NULL;
 	}
+
 	status_code s =
 		vk_buffer_alloc_scratch(self, (size_t)needed * sizeof(float), &p->attn_scores_buf);
 	if (s != OK)
@@ -5439,113 +5650,15 @@ static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_
 
 static status_code vk_ensure_flash_pipeline_batch(vk_priv *p, int head_dim, int n_groups,
 												  vk_pipeline_set **out) {
-	for (int i = 0; i < p->flash_batch_count; i++) {
-		if (p->flash_batch_head_dim[i] == head_dim && p->flash_batch_n_groups[i] == n_groups) {
-			if (p->flash_batch_unsupported[i])
-				return ERR_UNSUPPORTED;
-			*out = &p->p_attention_flash_batch[i];
-			return OK;
-		}
-	}
-	if (p->flash_batch_count >= VK_FLASH_CACHE_CAP)
-		return ERR_UNSUPPORTED;
-
-	int slot		   = p->flash_batch_count;
-	int lanes_per_head = 32;
-	while (lanes_per_head > 1 && head_dim % lanes_per_head != 0)
-		lanes_per_head >>= 1;
-	int local_size	= lanes_per_head * n_groups;
-	int max_wg_inv	= (int)p->caps.max_workgroup_invocations;
-	int max_wg_size = (int)p->caps.max_workgroup_size[0];
-	if (max_wg_inv > 0 && local_size > max_wg_inv) {
-		p->flash_batch_head_dim[slot]	 = head_dim;
-		p->flash_batch_n_groups[slot]	 = n_groups;
-		p->flash_batch_unsupported[slot] = 1;
-		p->flash_batch_count++;
-		return ERR_UNSUPPORTED;
-	}
-	if (max_wg_size > 0 && local_size > max_wg_size) {
-		p->flash_batch_head_dim[slot]	 = head_dim;
-		p->flash_batch_n_groups[slot]	 = n_groups;
-		p->flash_batch_unsupported[slot] = 1;
-		p->flash_batch_count++;
-		return ERR_UNSUPPORTED;
-	}
-	{
-		const int TILE_T		 = 16;
-		size_t	  red_tile_bytes = (size_t)n_groups * (size_t)lanes_per_head * sizeof(float);
-		size_t	  kv_tile_bytes	 = 2 * (size_t)TILE_T * (size_t)head_dim * sizeof(float);
-		size_t	  shared_bytes	 = kv_tile_bytes + red_tile_bytes;
-		if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
-			p->flash_batch_head_dim[slot]	 = head_dim;
-			p->flash_batch_n_groups[slot]	 = n_groups;
-			p->flash_batch_unsupported[slot] = 1;
-			p->flash_batch_count++;
-			return ERR_UNSUPPORTED;
-		}
-	}
-	if (n_groups < 1 || head_dim > 256 || local_size > 1024 || head_dim % lanes_per_head != 0 ||
-		head_dim / lanes_per_head > 16) {
-		p->flash_batch_head_dim[slot]	 = head_dim;
-		p->flash_batch_n_groups[slot]	 = n_groups;
-		p->flash_batch_unsupported[slot] = 1;
-		p->flash_batch_count++;
-		return ERR_UNSUPPORTED;
-	}
-	uint32_t	spec_data[4] = {(uint32_t)head_dim, (uint32_t)n_groups, (uint32_t)lanes_per_head,
-								(uint32_t)local_size};
-	status_code s = vk_create_pipeline_spec(p, shader_attention_flash_batch_spv,
-											shader_attention_flash_batch_spv_len, 4, 40, spec_data,
-											sizeof(spec_data), &p->p_attention_flash_batch[slot]);
-	if (s != OK) {
-		p->flash_batch_head_dim[slot]	 = head_dim;
-		p->flash_batch_n_groups[slot]	 = n_groups;
-		p->flash_batch_unsupported[slot] = 1;
-		p->flash_batch_count++;
-		return s;
-	}
-	p->p_attention_flash_batch[slot].name = "attention_flash_batch";
-	p->flash_batch_head_dim[slot]		  = head_dim;
-	p->flash_batch_n_groups[slot]		  = n_groups;
-	p->flash_batch_unsupported[slot]	  = 0;
-	p->flash_batch_count++;
-	*out = &p->p_attention_flash_batch[slot];
-	return OK;
+	return vk_ensure_attn_flash(
+		p, VK_ATTN_FLASH_BATCH, head_dim, n_groups, shader_attention_flash_batch_spv,
+		shader_attention_flash_batch_spv_len, 4, 40, "attention_flash_batch", out);
 }
 
 static status_code vk_ensure_attention_pipeline_batch(vk_priv *p, int head_dim,
 													  vk_pipeline_set **out) {
-	int	   tile_t		 = head_dim > 256 ? 8 : 16;
-	size_t q_bytes		 = (size_t)head_dim * sizeof(float);
-	size_t kv_tile_bytes = (size_t)tile_t * (size_t)head_dim * sizeof(float);
-	size_t shared_bytes	 = q_bytes + kv_tile_bytes;
-	if (p->caps.max_shared_memory > 0 && shared_bytes > p->caps.max_shared_memory) {
-		WARN("attention_batch pipeline needs %zu bytes shared (device has %u), head_dim=%d",
-			 shared_bytes, p->caps.max_shared_memory, head_dim);
-		return ERR_UNSUPPORTED;
-	}
-
-	if (p->attention_batch_ready && p->attention_batch_head_dim == head_dim) {
-		*out = &p->p_attention_batch;
-		return OK;
-	}
-	if (p->attention_batch_ready)
-		vk_destroy_pipeline(p, &p->p_attention_batch);
-
-	uint32_t	spec_data[2] = {(uint32_t)head_dim, (uint32_t)tile_t};
-	status_code s =
-		vk_create_pipeline_spec(p, shader_attention_batch_spv, shader_attention_batch_spv_len, 5,
-								40, spec_data, sizeof(spec_data), &p->p_attention_batch);
-	if (s != OK) {
-		WARN("attention_batch pipeline creation failed for head_dim=%d", head_dim);
-		p->attention_batch_ready = 0;
-		return s;
-	}
-	p->p_attention_batch.name	= "attention_batch";
-	p->attention_batch_ready	= 1;
-	p->attention_batch_head_dim = head_dim;
-	*out						= &p->p_attention_batch;
-	return OK;
+	return vk_ensure_attn_spec(p, VK_ATTN_PLAIN_BATCH, head_dim, 1, shader_attention_batch_spv,
+							   shader_attention_batch_spv_len, 5, 40, "attention_batch", out);
 }
 
 static status_code vk_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
@@ -5572,7 +5685,7 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
-	int can_flash = flash_attn && p->p_attention_flash_batch[0].pipeline != VK_NULL_HANDLE &&
+	int can_flash = flash_attn && VK_ATTN_FLASH_BATCH_ENABLED &&
 					vk_ensure_flash_pipeline_batch(p, head_dim, n_groups, &flash_ps) == OK;
 
 	size_t layer_off = vk_kv_layer_off_elems(kh, layer);
@@ -5588,7 +5701,7 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		} push = {
 			(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			attn_start,			 m};
-		uint32_t groups_x = (uint32_t)n_kv_heads;
+		uint32_t groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf	*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		return vk_dispatch_2d(p, flash_ps, bufs, 4, &push, sizeof(push), groups_x, (uint32_t)m);
 	}
@@ -5677,6 +5790,8 @@ static status_code vk_ctor(backend *out) {
 	out->rmsnorm						 = vk_rmsnorm;
 	out->matmul							 = vk_matmul;
 	out->matmul_type_native				 = vk_matmul_type_native;
+	out->dequant_type_native			 = vk_dequant_type_native;
+	out->dequant_weight					 = vk_dequant_weight;
 	out->matmul_residual				 = vk_matmul_residual;
 	out->matmul_multi					 = vk_matmul_multi;
 	out->matmul_ffn_down				 = vk_matmul_ffn_down;

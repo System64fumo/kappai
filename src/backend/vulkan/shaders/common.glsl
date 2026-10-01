@@ -79,6 +79,10 @@ uint float_to_half(float f) {
 	return sign | h_exp | h_mant;
 }
 
+float neg_max_float() {
+	return uintBitsToFloat(0xFF7FFFFFu);
+}
+
 int round_away(float f) {
 	return f >= 0.0 ? int(floor(f + 0.5)) : int(ceil(f - 0.5));
 }

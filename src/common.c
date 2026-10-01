@@ -1,5 +1,34 @@
 #include "common.h"
 
+const char *status_str(status_code s) {
+	switch (s) {
+	case OK:
+		return "ok";
+	case ERR_IO:
+		return "io error";
+	case ERR_FORMAT:
+		return "bad format";
+	case ERR_NOT_FOUND:
+		return "not found";
+	case ERR_UNSUPPORTED:
+		return "unsupported";
+	case ERR_OUT_OF_MEMORY:
+		return "out of memory";
+	case ERR_INVALID_ARG:
+		return "invalid argument";
+	case ERR_INTERNAL:
+		return "internal error";
+	case ERR_INTERRUPTED:
+		return "interrupted";
+	case ERR_FALLBACK:
+		return "fallback";
+	case ERR_COMPUTE_FAIL:
+		return "compute failed";
+	default:
+		return "unknown";
+	}
+}
+
 #include <ctype.h>
 #include <execinfo.h>
 #include <sched.h>

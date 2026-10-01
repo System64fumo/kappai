@@ -1,4 +1,3 @@
-#extension GL_GOOGLE_include_directive : enable
 layout(local_size_x_id = 0) in;
 
 #if defined(W_F32)
@@ -36,6 +35,8 @@ params;
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
 layout(constant_id = 2) const int TILE_K		  = 2048;
 layout(constant_id = 3) const int M_PER_WG		  = 4;
+layout(constant_id = 4) const int LANES_PER_ROW	  = 1;
+layout(constant_id = 5) const int LOCAL_SIZE_X	  = 64;
 
 #include "common.glsl"
 
@@ -49,17 +50,38 @@ layout(constant_id = 3) const int M_PER_WG		  = 4;
 
 #if defined(W_F32)
 #define W_ROW_SCALE uint(k)
+#define W_WPW 1
+#define W_VEC_LEN 4
+#elif defined(W_F16)
+#define W_ROW_SCALE uint(k) / 2u
+#define W_WPW 2
+#define W_VEC_LEN 8
+#define W_CONV2(a) vec2(unpackHalf2x16(a))
+#define W_CONV(a) unpackHalf2x16(a).x
 #else
-#define W_ROW_SCALE uint(k) * 2u
+#define W_ROW_SCALE uint(k) / 2u
+#define W_WPW 2
+#define W_VEC_LEN 8
+#define W_CONV2(a) vec2(uintBitsToFloat((a) << 16u), uintBitsToFloat((a) & 0xFFFF0000u))
+#define W_CONV(a) bf16_to_float(a)
 #endif
 
-#if defined(W_F16)
-#define W_CONV(x) half_to_float(x)
-#elif defined(W_BF16)
-#define W_CONV(x) bf16_to_float(x)
+#if defined(W_F32)
+float w_step(uint p, vec4 xv) {
+	return w[p] * xv.x + w[p + 1u] * xv.y + w[p + 2u] * xv.z + w[p + 3u] * xv.w;
+}
+#else
+float w_step(uint p, vec4 xv0, vec4 xv1) {
+	return dot(W_CONV2(w[p]), xv0.xy) + dot(W_CONV2(w[p + 1u]), xv0.zw) +
+		   dot(W_CONV2(w[p + 2u]), xv1.xy) + dot(W_CONV2(w[p + 3u]), xv1.zw);
+}
 #endif
+
+const int VBLK		= W_VEC_LEN * LANES_PER_ROW;
+const int RED_SLOTS = LOCAL_SIZE_X * M_PER_WG * ROWS_PER_THREAD;
 
 shared float x_shared[M_PER_WG][TILE_K];
+shared float red[RED_SLOTS];
 
 void main() {
 	const int n = params.n;
@@ -70,17 +92,23 @@ void main() {
 
 	const uint tid	  = gl_LocalInvocationID.x;
 	const uint wgsize = gl_WorkGroupSize.x;
-	const uint base_i = gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+
+	const int lane	 = int(tid) % LANES_PER_ROW;
+	const int sub	 = int(tid) / LANES_PER_ROW;
+	const int n_sub	 = int(wgsize) / LANES_PER_ROW;
+	const int base_i = (int(gl_WorkGroupID.x) * n_sub + sub) * ROWS_PER_THREAD;
 
 	const int row_start = int(gl_WorkGroupID.y) * M_PER_WG;
 	const int rows_here = min(M_PER_WG, m - row_start);
 
+	const bool vec_ok = (k % VBLK) == 0;
+
 	uint row_off[ROWS_PER_THREAD];
 	bool valid[ROWS_PER_THREAD];
 	for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-		const uint idx = base_i + uint(r);
-		valid[r]	   = idx < uint(n);
-		row_off[r]	   = min(idx, uint(n) - 1u) * W_ROW_SCALE;
+		const int idx = base_i + r;
+		valid[r]	  = idx < n;
+		row_off[r]	  = min(idx, n - 1) * W_ROW_SCALE;
 	}
 
 	float acc[M_PER_WG][ROWS_PER_THREAD];
@@ -100,81 +128,74 @@ void main() {
 		}
 		barrier();
 
-		int j = 0;
-#if defined(W_F32)
-		for (; j + 4 <= tile_len; j += 4) {
-			float wv0[ROWS_PER_THREAD];
-			float wv1[ROWS_PER_THREAD];
-			float wv2[ROWS_PER_THREAD];
-			float wv3[ROWS_PER_THREAD];
-			for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-				const uint off = row_off[r] + tile_off + uint(j);
-				wv0[r]		   = w[off + 0u];
-				wv1[r]		   = w[off + 1u];
-				wv2[r]		   = w[off + 2u];
-				wv3[r]		   = w[off + 3u];
-			}
-			for (int mr = 0; mr < rows_here; ++mr) {
-				const float x0 = x_shared[mr][j + 0];
-				const float x1 = x_shared[mr][j + 1];
-				const float x2 = x_shared[mr][j + 2];
-				const float x3 = x_shared[mr][j + 3];
-				for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-					acc[mr][r] += wv0[r] * x0;
-					acc[mr][r] += wv1[r] * x1;
-					acc[mr][r] += wv2[r] * x2;
-					acc[mr][r] += wv3[r] * x3;
-				}
-			}
-		}
-		for (; j < tile_len; ++j) {
-			float wv[ROWS_PER_THREAD];
-			for (int r = 0; r < ROWS_PER_THREAD; ++r)
-				wv[r] = w[row_off[r] + tile_off + uint(j)];
-			for (int mr = 0; mr < rows_here; ++mr) {
-				const float xv = x_shared[mr][j];
-				for (int r = 0; r < ROWS_PER_THREAD; ++r)
-					acc[mr][r] += wv[r] * xv;
-			}
-		}
-#else
-		for (; j + 2 <= tile_len; j += 2) {
-			float wv0[ROWS_PER_THREAD];
-			float wv1[ROWS_PER_THREAD];
-			for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-				const uint word = w_read_u32(row_off[r] + uint(tile_off + j) * 2u);
-				wv0[r]			= W_CONV(word & 0xFFFFu);
-				wv1[r]			= W_CONV(word >> 16u);
-			}
-			for (int mr = 0; mr < rows_here; ++mr) {
-				const float x0 = x_shared[mr][j + 0];
-				const float x1 = x_shared[mr][j + 1];
-				for (int r = 0; r < ROWS_PER_THREAD; ++r) {
-					acc[mr][r] += wv0[r] * x0;
-					acc[mr][r] += wv1[r] * x1;
-				}
-			}
-		}
-		for (; j < tile_len; ++j) {
-			float wv[ROWS_PER_THREAD];
-			for (int r = 0; r < ROWS_PER_THREAD; ++r)
-				wv[r] = W_CONV(w_read_u16(row_off[r] + uint(tile_off + j) * 2u));
-			for (int mr = 0; mr < rows_here; ++mr) {
-				const float xv = x_shared[mr][j];
-				for (int r = 0; r < ROWS_PER_THREAD; ++r)
-					acc[mr][r] += wv[r] * xv;
-			}
-		}
+		if (vec_ok) {
+			for (int jb = lane * W_VEC_LEN; jb < tile_len; jb += VBLK) {
+				for (int mr = 0; mr < rows_here; ++mr) {
+					const vec4 xv0 = vec4(x_shared[mr][jb], x_shared[mr][jb + 1],
+										  x_shared[mr][jb + 2], x_shared[mr][jb + 3]);
+#if !defined(W_F32)
+					const vec4 xv1 = vec4(x_shared[mr][jb + 4], x_shared[mr][jb + 5],
+										  x_shared[mr][jb + 6], x_shared[mr][jb + 7]);
 #endif
+					for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+						const uint p = row_off[r] + uint((tile_off + jb) / W_WPW);
+#if defined(W_F32)
+						acc[mr][r] += w_step(p, xv0);
+#else
+						acc[mr][r] += w_step(p, xv0, xv1);
+#endif
+					}
+				}
+			}
+		} else {
+			for (int jj = lane; jj < tile_len; jj += LANES_PER_ROW) {
+				float wv[ROWS_PER_THREAD];
+				for (int r = 0; r < ROWS_PER_THREAD; ++r) {
+					const int eo = int(row_off[r]) * W_WPW + int(tile_off) + jj;
+#if defined(W_F32)
+					wv[r] = w[eo];
+#else
+					wv[r] = W_CONV(w_read_u16(uint(2 * eo)));
+#endif
+				}
+				for (int mr = 0; mr < rows_here; ++mr) {
+					const float xv = x_shared[mr][jj];
+					for (int r = 0; r < ROWS_PER_THREAD; ++r)
+						acc[mr][r] += wv[r] * xv;
+				}
+			}
+		}
 		barrier();
 	}
 
+	if (LANES_PER_ROW > 1) {
+		const int rb = (sub * LANES_PER_ROW + lane) * (M_PER_WG * ROWS_PER_THREAD);
+		for (int mr = 0; mr < M_PER_WG; ++mr)
+			for (int r = 0; r < ROWS_PER_THREAD; ++r)
+				red[rb + mr * ROWS_PER_THREAD + r] = acc[mr][r];
+		barrier();
+		for (int s = LANES_PER_ROW / 2; s > 0; s >>= 1) {
+			if (lane < s) {
+				for (int mr = 0; mr < M_PER_WG; ++mr)
+					for (int r = 0; r < ROWS_PER_THREAD; ++r)
+						red[rb + mr * ROWS_PER_THREAD + r] +=
+							red[rb + s * (M_PER_WG * ROWS_PER_THREAD) + mr * ROWS_PER_THREAD + r];
+			}
+			barrier();
+		}
+		if (lane != 0)
+			return;
+		for (int mr = 0; mr < M_PER_WG; ++mr)
+			for (int r = 0; r < ROWS_PER_THREAD; ++r)
+				acc[mr][r] = red[rb + mr * ROWS_PER_THREAD + r];
+	}
+
 	for (int mr = 0; mr < rows_here; ++mr) {
-		const uint y_off = uint(row_start + mr) * uint(n);
+		const int y_off = (row_start + mr) * n;
 		for (int r = 0; r < ROWS_PER_THREAD; ++r) {
 			if (!valid[r])
 				continue;
-			const uint o = y_off + base_i + uint(r);
+			const int o = y_off + base_i + r;
 #ifdef HAS_RESIDUAL
 			y[o] = acc[mr][r] + residual[o];
 #else

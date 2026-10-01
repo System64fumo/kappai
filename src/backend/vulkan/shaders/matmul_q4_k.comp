@@ -78,9 +78,13 @@ const int BLOCK			  = 256;
 const int BLOCKS_PER_TILE = TILE_K / BLOCK;
 
 shared float x_shared[TILE_K];
-shared int	 xq_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
 shared float xq_d[BLOCKS_PER_TILE];
 shared int	 xq_bsums[BLOCKS_PER_TILE * 16];
+
+#define XQ_HAVE_BSUMS 1
+#include "quant_x8_block.glsl"
+#undef XQ_HAVE_BSUMS
 
 void main() {
 	uint i	 = gl_GlobalInvocationID.x;
@@ -120,9 +124,7 @@ void main() {
 		int block_end	= tile_end / 256;
 
 		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
-#define XQ_HAVE_BSUMS 1
-#include "quant_x8_block.glsl"
-#undef XQ_HAVE_BSUMS
+			xq8_quant_superblock(bi, block_start, tile_start);
 		}
 		barrier();
 
@@ -135,13 +137,13 @@ void main() {
 				float dmin		= half_to_float(w0_read_u16(block_off + 2u));
 
 				int	  local_bi = bi - block_start;
-				int	  x_base   = bi * 256 - tile_start;
 				float xd	   = xq_d[local_bi];
 
 				int	 sumi = 0, summ = 0;
 				uint s_off = block_off + 4u;
 				uint q_off = block_off + 16u;
 				int	 ib	   = local_bi * 16;
+				int	 wp	   = (bi * 256 - tile_start) >> 2;
 
 				uint sc_d[8], sc_m[8];
 				w0_get_all_scale_min_k4(s_off, sc_d, sc_m);
@@ -157,17 +159,9 @@ void main() {
 						int	 lo_nibbles = int(word & 0x0F0F0F0Fu);
 						int	 hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
 
-						int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + l]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 1]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 2]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 3])));
-						int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + l + 32]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 33]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 34]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 35])));
-
-						dot0 += dotPacked4x8EXT(lo_nibbles, xq_word0);
-						dot1 += dotPacked4x8EXT(hi_nibbles, xq_word1);
+						dot0 += dotPacked4x8EXT(lo_nibbles, int(xq_packed[wp + g * 16 + l / 4]));
+						dot1 +=
+							dotPacked4x8EXT(hi_nibbles, int(xq_packed[wp + g * 16 + l / 4 + 8]));
 					}
 					sumi += s0 * dot0 + s1 * dot1;
 					summ += m0 * (xq_bsums[ib] + xq_bsums[ib + 1]);
@@ -188,13 +182,13 @@ void main() {
 				float dmin		= half_to_float(w1_read_u16(block_off + 2u));
 
 				int	  local_bi = bi - block_start;
-				int	  x_base   = bi * 256 - tile_start;
 				float xd	   = xq_d[local_bi];
 
 				int	 sumi = 0, summ = 0;
 				uint s_off = block_off + 4u;
 				uint q_off = block_off + 16u;
 				int	 ib	   = local_bi * 16;
+				int	 wp	   = (bi * 256 - tile_start) >> 2;
 
 				uint sc_d[8], sc_m[8];
 				w1_get_all_scale_min_k4(s_off, sc_d, sc_m);
@@ -210,17 +204,9 @@ void main() {
 						int	 lo_nibbles = int(word & 0x0F0F0F0Fu);
 						int	 hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
 
-						int xq_word0 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + l]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 1]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 2]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 3])));
-						int xq_word1 = pack32(i8vec4(int8_t(xq_shared[x_base + g * 64 + l + 32]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 33]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 34]),
-													 int8_t(xq_shared[x_base + g * 64 + l + 35])));
-
-						dot0 += dotPacked4x8EXT(lo_nibbles, xq_word0);
-						dot1 += dotPacked4x8EXT(hi_nibbles, xq_word1);
+						dot0 += dotPacked4x8EXT(lo_nibbles, int(xq_packed[wp + g * 16 + l / 4]));
+						dot1 +=
+							dotPacked4x8EXT(hi_nibbles, int(xq_packed[wp + g * 16 + l / 4 + 8]));
 					}
 					sumi += s0 * dot0 + s1 * dot1;
 					summ += m0 * (xq_bsums[ib] + xq_bsums[ib + 1]);

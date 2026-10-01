@@ -238,9 +238,8 @@ static int layer_max_intermediate(const model *m) {
 static status_code scratch_alloc(backend *a, buffer *dst, size_t size, const char *name) {
 	status_code st = a->buffer_alloc_scratch(a, size, dst);
 	if (st != OK) {
-		ERROR(
-			"compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes, status=%d)",
-			name, size, st);
+		ERROR("compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes): %s",
+			  name, size, status_str(st));
 	}
 	return st;
 }

@@ -12,6 +12,8 @@ typedef struct model_recipe model_recipe;
 typedef struct weight_ref {
 	const void *host_ptr;
 	uint32_t	type;
+	int			dequant_native;
+	uint64_t	dequant_rows, dequant_cols;
 	buffer		buf;
 } weight_ref;
 

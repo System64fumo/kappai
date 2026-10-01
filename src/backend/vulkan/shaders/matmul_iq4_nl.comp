@@ -83,23 +83,16 @@ uint w1_read_u32(uint byte_offset) {
 #undef W_NAME
 #undef W_PFX
 
-float erf_precise(float x) {
-	float sign = x >= 0.0 ? 1.0 : -1.0;
-	float ax   = abs(x);
-	float p	   = 0.3275911;
-	float t	   = 1.0 / (1.0 + p * ax);
-	float a1   = 0.254829592;
-	float a2   = -0.284496736;
-	float a3   = 1.421413741;
-	float a4   = -1.453152027;
-	float a5   = 1.061405429;
-	float poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
-	return sign * (1.0 - poly * exp(-ax * ax));
+float gelu_tanh(float x) {
+	const float c	  = 0.7978845608028654;
+	float		x3	  = x * x * x;
+	float		inner = c * (x + 0.044715 * x3);
+	return 0.5 * x * (1.0 + tanh(inner));
 }
 
 float activate(float g, float u) {
 	if (params.activation == 1) {
-		return 0.5 * g * (1.0 + erf_precise(g * 0.7071067811865475)) * u;
+		return gelu_tanh(g) * u;
 	} else {
 		return g / (1.0 + exp(-g)) * u;
 	}

@@ -698,6 +698,14 @@ static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *
 static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t n_rows) {
 	if (ref->type == GGML_TYPE_F32)
 		return 0;
+	backend *dev = m->backend;
+	if (dev && dev->dequant_type_native && dev->dequant_weight &&
+		dev->dequant_type_native(dev, ref->type, (int)row_len)) {
+		ref->dequant_native = 1;
+		ref->dequant_cols	= row_len;
+		ref->dequant_rows	= n_rows;
+		return 0;
+	}
 	const void *orig  = ref->host_ptr;
 	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
 	dequant_weight_to_f32(m->backend, &ref->host_ptr, &ref->type, row_len, n_rows);
@@ -896,6 +904,24 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
 								 uint64_t d1, weight_class wc, backend *target) {
 	ref->type = wtype;
+	if (ref->dequant_native) {
+		backend *home		 = backend_weight_home(target, wc);
+		ref->dequant_native	 = 0;
+		const uint32_t qtype = ref->type;
+		size_t bytes = ggml_row_size(qtype, (size_t)ref->dequant_cols) * (size_t)ref->dequant_rows;
+		status_code ds =
+			home->dequant_weight
+				? home->dequant_weight(home, qtype, ref->host_ptr, (int)ref->dequant_rows,
+									   (int)ref->dequant_cols, &ref->buf)
+				: ERR_UNSUPPORTED;
+		if (ds == OK) {
+			release_original_weight_data(m, ref->host_ptr, bytes);
+			ref->type		  = GGML_TYPE_F32;
+			ref->buf.host_ptr = NULL;
+			ref->host_ptr	  = NULL;
+			return OK;
+		}
+	}
 	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
 }
 
