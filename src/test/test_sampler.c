@@ -238,6 +238,80 @@ static void test_repeat_penalty_flip(void) {
 				  detail);
 }
 
+static void test_repeat_once_and_disable(void) {
+	sampler s;
+	sampler_init(&s, 11ULL);
+	sampler_set_vocab(&s, 3);
+	sampler_set_params(&s, 0.0f, 0, 1.0f, 0.0f, 1.2f, 64);
+	const float positive[3] = {10.0f, 8.0f, -2.0f};
+	const float negative[3] = {-1.0f, -2.0f, -3.0f};
+	sampler_observe(&s, 0);
+	int one = sampler_sample(&s, positive, 3);
+	float once = s.logits_buf[0];
+	sampler_observe(&s, 0);
+	int twice = sampler_sample(&s, positive, 3);
+	float twice_value = s.logits_buf[0];
+	sampler_sample(&s, negative, 3);
+	float neg = s.logits_buf[0];
+	sampler_observe(&s, -1);
+	sampler_observe(&s, 99);
+	sampler_sample(&s, positive, 3);
+	float invalid_ignored = s.logits_buf[0];
+	sampler_set_params(&s, 0.0f, 0, 1.0f, 0.0f, 1.2f, 0);
+	int disabled = sampler_sample(&s, positive, 3);
+	int ok = one == 0 && twice == 0 && fabsf(once - 10.0f / 1.2f) < 1e-5f &&
+			 fabsf(twice_value - once) < 1e-5f && fabsf(neg + 1.2f) < 1e-5f &&
+			 fabsf(invalid_ignored - once) < 1e-5f && s.repeat_last_n == 0 &&
+			 disabled == 0 && positive[0] == 10.0f;
+	char detail[256];
+	snprintf(detail, sizeof(detail),
+			 "once=%g twice=%g negative=%g invalid=%g disable_window=%d choices=%d,%d,%d",
+			 once, twice_value, neg, invalid_ignored, s.repeat_last_n, one, twice, disabled);
+	record_result(OPFAM_SAMPLER, "repeat_penalty_once_per_valid_id", ok ? V_PASS : V_FAIL,
+				  detail);
+	sampler_free(&s);
+}
+
+static void test_filter_full_vocab(void) {
+	const int vocab = 4096;
+	float *lg = xmalloc((size_t)vocab * sizeof(*lg));
+	for (int i = 0; i < vocab; i++)
+		lg[i] = -0.00001f * i;
+	int top_p_support = 0;
+	double total = 0, cumulative = 0;
+	for (int i = 0; i < vocab; i++)
+		total += exp((double)lg[i]);
+	for (int i = 0; i < vocab; i++) {
+		cumulative += exp((double)lg[i]);
+		top_p_support++;
+		if (cumulative / total > 0.9)
+			break;
+	}
+	int ok = top_p_support > 1024;
+	char detail[256];
+	for (int mode = 0; mode < 2; mode++) {
+		sampler s;
+		sampler_init(&s, 7788ULL);
+		sampler_set_vocab(&s, vocab);
+		sampler_set_params(&s, 1.0f, 0, mode ? 1.0f : 0.9f,
+					   mode ? 0.5f : 0.0f, 1.0f, 64);
+		int beyond_cap = 0, beyond_support = 0, max_id = -1;
+		for (int j = 0; j < 512; j++) {
+			int id = sampler_sample(&s, lg, vocab);
+			if (id > max_id) max_id = id;
+			beyond_cap += id >= 1024;
+			beyond_support += id >= top_p_support;
+		}
+		ok &= beyond_cap > 0 && (mode || beyond_support == 0);
+		snprintf(detail, sizeof(detail), "mode=%s full_top_p_support=%d max=%d above1023=%d/512 outside_top_p=%d",
+				 mode ? "min_p" : "top_p", top_p_support, max_id, beyond_cap, beyond_support);
+		record_result(OPFAM_SAMPLER, mode ? "min_p_full_vocab_support" : "top_p_full_vocab_mass",
+					  ok ? V_PASS : V_FAIL, detail);
+		sampler_free(&s);
+	}
+	free(lg);
+}
+
 static void test_topk_helper_exact(void) {
 	float lg[8];
 	logits_from_probs(lg, PROBS8, 8);
@@ -266,5 +340,7 @@ void run_sampler_tests(void) {
 	test_seed_reproducibility();
 	test_nofilter_fastpath_agreement();
 	test_repeat_penalty_flip();
+	test_repeat_once_and_disable();
+	test_filter_full_vocab();
 	test_topk_helper_exact();
 }
