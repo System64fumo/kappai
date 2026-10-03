@@ -67,6 +67,9 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_message *msg,
 									  int add_generation_prompt, char **out, char *errbuf,
 									  size_t errbuf_len);
+status_code chat_template_add_turn_ex_steal(chat_template_state *cts, const chat_message *msg,
+											int add_generation_prompt, char **out, char **prev_out,
+											char *errbuf, size_t errbuf_len);
 
 void chat_template_rewrite_last_assistant(chat_template_state *cts, const char *content,
 										  const char *reasoning, json_object *tool_calls);

@@ -623,6 +623,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			goto bad_kv_ts;
 		if (gguf_reader_u64(&r, &ts[i].offset))
 			goto bad_kv_ts;
+		if (gguf_tensor_byte_size(&ts[i], &ts[i].byte_size) != 0)
+			ts[i].byte_size = 0;
 	}
 
 	size_t align = 32;
@@ -650,8 +652,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			ts[i].data = NULL;
 			continue;
 		}
-		size_t tsize;
-		if (gguf_tensor_byte_size(&ts[i], &tsize) != 0) {
+		size_t tsize = ts[i].byte_size;
+		if (!tsize) {
 			ERROR("gguf: cannot size tensor '%s' (unknown type or bad dims)", ts[i].name);
 			goto bad_kv_ts;
 		}
@@ -980,8 +982,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		if (gguf_tensor_name_is_expert(t->name))
 			continue;
 
-		size_t tbytes;
-		if (gguf_tensor_byte_size(t, &tbytes) != OK) {
+		size_t tbytes = t->byte_size;
+		if (!tbytes) {
 			ERROR("gguf_load_sparse: cannot compute size of tensor '%s'", t->name);
 			ret = ERR_FORMAT;
 			break;
@@ -1028,8 +1030,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			gguf_tensor *t = &ctx->tensors[i];
 			if (!t->data)
 				continue;
-			size_t tbytes;
-			if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+			size_t tbytes = t->byte_size;
+			if (!tbytes)
 				continue;
 			n_chunks_cap += (tbytes / chunk_bytes) + (align > 0 ? 2 : 1);
 		}
@@ -1050,8 +1052,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			gguf_tensor *t = &ctx->tensors[i];
 			if (!t->data)
 				continue;
-			size_t tbytes;
-			if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+			size_t tbytes = t->byte_size;
+			if (!tbytes)
 				continue;
 
 			uint64_t base_off		 = ctx->data_file_offset + t->offset;
@@ -1162,8 +1164,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 				gguf_tensor *t = &ctx->tensors[i];
 				if (!t->data)
 					continue;
-				size_t tbytes;
-				if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+				size_t tbytes = t->byte_size;
+				if (!tbytes)
 					continue;
 				uint64_t off64 = ctx->data_file_offset + t->offset;
 				size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));

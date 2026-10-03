@@ -1080,7 +1080,10 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	if (tid == 0) {
 		scores = j->p->scores;
 	} else {
-		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->pos_start + j->m);
+		int need_scores = j->pos_start + j->m;
+		if (j->kv_rows && (size_t)need_scores > j->kv_rows)
+			need_scores = (int)j->kv_rows;
+		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, need_scores);
 	}
 
 	for (int idx = begin; idx < end; idx++) {
@@ -1094,17 +1097,7 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 			attn_start = n_pos - j->sliding_window;
 			n_pos	   = j->sliding_window;
 		}
-		if (j->kv_base) {
-			size_t b = j->kv_base;
-			if (attn_start < (int)b) {
-				n_pos -= (int)b - attn_start;
-				attn_start = 0;
-				if (n_pos < 0)
-					n_pos = 0;
-			} else {
-				attn_start -= (int)b;
-			}
-		}
+		cpu_kv_window_to_slots_base(j->kv_base, &attn_start, &n_pos);
 
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((((size_t)row * j->n_heads) + h) * j->head_dim);
@@ -1180,7 +1173,6 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 								  .kvh_stride = kvh_stride,
 								  .p		  = p,
 								  .kv_quant	  = p->kv_quant,
-								  .kv_layer	  = layer,
 								  .kv_rows	  = rows,
 								  .kv_base	  = base};
 

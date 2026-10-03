@@ -160,6 +160,11 @@ void dequant_bf16_row(const void *src, int n, float *dst);
 
 void dequant_row_dispatch(uint32_t type, const void *src, int n_elems, float *dst);
 
+typedef void (*dequant_blocks_fn)(const void *src, size_t n_blocks, float *dst);
+void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out);
+
+float rmsnorm_sum_sq(const float *x, int n);
+
 float bf16_to_f32(uint16_t h);
 
 void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);
@@ -347,6 +352,35 @@ static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rop
 			float v1	 = vh[j + half];
 			vh[j]		 = (v0 * c) - (v1 * s);
 			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+	}
+}
+
+static inline void rope_rotate_rows(float *v, int n_heads, int row_stride, int half,
+									const float *cs, int neox) {
+	if (neox) {
+		for (int h = 0; h < n_heads; h++) {
+			float *vh = v + ((size_t)h * row_stride);
+			for (int j = 0; j < half; j++) {
+				float c		 = cs[2 * j];
+				float s		 = cs[(2 * j) + 1];
+				float v0	 = vh[j];
+				float v1	 = vh[j + half];
+				vh[j]		 = (v0 * c) - (v1 * s);
+				vh[j + half] = (v0 * s) + (v1 * c);
+			}
+		}
+		return;
+	}
+	for (int h = 0; h < n_heads; h++) {
+		float *vh = v + ((size_t)h * row_stride);
+		for (int j = 0; j < half; j++) {
+			float c			= cs[2 * j];
+			float s			= cs[(2 * j) + 1];
+			float v0		= vh[2 * j];
+			float v1		= vh[(2 * j) + 1];
+			vh[2 * j]		= (v0 * c) - (v1 * s);
+			vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
 		}
 	}
 }

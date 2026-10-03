@@ -26,6 +26,8 @@ typedef struct compute_scratch {
 	float		*rope_cos_swa, *rope_sin_swa;
 	buffer		 ple_inp;
 	buffer		 ple_slice;
+	buffer		 ple_inp_mirror;
+	buffer		 ple_slice_mirror;
 	buffer		 ple_all;
 	buffer		 ple_proj;
 	buffer		 ple_proj_norm_w;

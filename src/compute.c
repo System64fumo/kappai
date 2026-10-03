@@ -98,6 +98,8 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	scratch_free_slot_buffers(s->slots);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
+	free_buf(&s->ple_inp_mirror);
+	free_buf(&s->ple_slice_mirror);
 	free_buf(&s->ple_all);
 	free_buf(&s->ple_proj);
 	free_buf(&s->ple_proj_norm_w);
@@ -504,6 +506,16 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	status_code st = scratch_alloc_slots(host, s->mirror_slots, m, &L);
 	if (st != OK)
 		return st;
+
+	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0) {
+		size_t ple_bytes = (size_t)m->layer_dims.n_embd_per_layer * sizeof(float);
+		st				 = scratch_alloc(host, &s->ple_slice_mirror, ple_bytes, "ple_slice mirror");
+		if (st != OK)
+			return st;
+		st = scratch_alloc(host, &s->ple_inp_mirror, ple_bytes, "ple_inp mirror");
+		if (st != OK)
+			return st;
+	}
 
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;

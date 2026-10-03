@@ -23,10 +23,12 @@ size_t get_available_memory(void) {
 	size_t mem_cached	 = 0;
 	size_t mem_buffers	 = 0;
 	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == 'M' && strncmp(line, "MemAvailable:", 13) == 0) {
+			mem_available = strtoull(line + 13, NULL, 10) * 1024;
+			break;
+		}
 		if (strncmp(line, "MemFree:", 8) == 0)
 			mem_free = strtoull(line + 8, NULL, 10) * 1024;
-		else if (strncmp(line, "MemAvailable:", 13) == 0)
-			mem_available = strtoull(line + 13, NULL, 10) * 1024;
 		else if (strncmp(line, "Cached:", 7) == 0)
 			mem_cached = strtoull(line + 7, NULL, 10) * 1024;
 		else if (strncmp(line, "Buffers:", 8) == 0)
@@ -210,12 +212,28 @@ static non_expert_breakdown calc_non_expert_breakdown(const model *m) {
 }
 
 static size_t calc_non_expert_bytes(const model *m) {
+	if (m->mem_estimates_valid)
+		return m->mem_non_expert_bytes;
 	return calc_non_expert_breakdown(m).total;
+}
+
+static size_t model_cached_per_expert_size(const model *m) {
+	if (m->mem_estimates_valid)
+		return m->mem_per_expert_bytes;
+	return calc_per_expert_size(m);
+}
+
+void model_mem_estimates_ensure(model *m) {
+	if (m->mem_estimates_valid)
+		return;
+	m->mem_non_expert_bytes = calc_non_expert_breakdown(m).total;
+	m->mem_per_expert_bytes = calc_per_expert_size(m);
+	m->mem_estimates_valid	= true;
 }
 
 static size_t model_total_weight_bytes(const model *m) {
 	size_t non_expert	= calc_non_expert_bytes(m);
-	size_t per_expert	= calc_per_expert_size(m);
+	size_t per_expert	= model_cached_per_expert_size(m);
 	int	   n_layers		= moe_layer_count(m);
 	size_t total_expert = per_expert * (size_t)m->moe.n_experts * (size_t)n_layers;
 	return non_expert + total_expert;
@@ -226,7 +244,7 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 	if (full_resident || !m->arch_info->is_moe)
 		return cfg->use_mmap ? model_total_weight_bytes(m) : 0;
 
-	size_t per_expert = calc_per_expert_size(m);
+	size_t per_expert = model_cached_per_expert_size(m);
 	int	   n_layers	  = moe_layer_count(m);
 	int	   cache_cap  = moe_cache_cap(m, cfg);
 
@@ -242,7 +260,7 @@ void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, siz
 
 	non_expert_breakdown bd			= calc_non_expert_breakdown(m);
 	size_t				 non_expert = bd.total;
-	size_t				 per_expert = calc_per_expert_size(m);
+	size_t				 per_expert = model_cached_per_expert_size(m);
 	int					 n_experts	= m->moe.n_experts;
 	int					 n_layers	= moe_layer_count(m);
 	int					 topk		= m->moe.n_experts_used;

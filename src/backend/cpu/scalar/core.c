@@ -38,7 +38,6 @@ typedef struct {
 	size_t				 xq_row_stride;
 	const float			*bias;
 	const float			*residual;
-	int					 aliases_residual;
 	int					 group_rows;
 	const matmul_kernel *kernel;
 	size_t				 xq_row_stride_blocks;
@@ -51,12 +50,11 @@ typedef struct {
 } grouped_matmul_kernel;
 
 typedef struct {
-	quant_scratch *qs;
-	int			   q8_class;
-	const float	  *xf;
-	int			   k;
-	size_t		   row_stride;
-	uint8_t		  *xq;
+	int			 q8_class;
+	const float *xf;
+	int			 k;
+	size_t		 row_stride;
+	uint8_t		*xq;
 } cpu_quantize_x_rows_job;
 
 typedef struct {
@@ -83,7 +81,6 @@ typedef struct {
 	const float *k_pe_rot_all;
 	const float *rope_cos_base;
 	const float *rope_sin_base;
-	int			 n_heads;
 	int			 qk_head;
 	int			 qk_rope;
 	int			 qk_nope;
@@ -94,9 +91,9 @@ typedef struct {
 	float		 scale;
 } cpu_attn_mla_job;
 
-#define MATMUL_KERNEL(wt, fn, q8) {(qonly_fn)fn, wt, q8}
+#define MATMUL_KERNEL(wt, fn, q8) [(wt)] = {(qonly_fn)fn, wt, q8}
 
-static const matmul_kernel k_kernels[] = {
+static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_R8 + 1] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_0, matmul_q4_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL, matmul_iq4_nl_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q8_0, matmul_q8_0_q8_qonly_f32, 1),
@@ -123,16 +120,16 @@ static inline quant_scratch *cpu_scratch_for_tid(cpu_priv *p, int tid) {
 	return &p->qscratch;
 }
 
-static status_code cpu_probe(void) {
+__attribute__((weak)) status_code cpu_probe(void) {
 	return OK;
 }
 
-static size_t cpu_mem_available(backend *self) {
+__attribute__((weak)) size_t cpu_mem_available(backend *self) {
 	(void)self;
 	return get_available_memory();
 }
 
-static size_t cpu_mem_total(backend *self) {
+__attribute__((weak)) size_t cpu_mem_total(backend *self) {
 	(void)self;
 	return get_total_memory();
 }
@@ -141,7 +138,7 @@ __attribute__((weak)) void detect_features(char *buf, size_t cap) {
 	snprintf(buf, cap, "generic");
 }
 
-static status_code cpu_init(backend *self, int device_index) {
+__attribute__((weak)) status_code cpu_init(backend *self, int device_index) {
 	(void)device_index;
 	cpu_priv *p = xcalloc(1, sizeof(cpu_priv));
 	self->priv	= p;
@@ -171,7 +168,7 @@ void feat_add(char *buf, size_t cap, const char *name) {
 		buf[used] = '\0';
 }
 
-static void cpu_free(backend *self) {
+__attribute__((weak)) void cpu_free(backend *self) {
 	cpu_priv *p = self->priv;
 	if (!p)
 		return;
@@ -203,7 +200,8 @@ static void cpu_free(backend *self) {
 	self->priv = NULL;
 }
 
-static status_code cpu_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
+__attribute__((weak)) status_code cpu_buffer_alloc_weight(backend *self, const tensor_desc *desc,
+														  buffer *out) {
 	out->handle	  = (void *)desc->host_data;
 	out->size	  = 0;
 	out->offset	  = 0;
@@ -212,7 +210,8 @@ static status_code cpu_buffer_alloc_weight(backend *self, const tensor_desc *des
 	return OK;
 }
 
-static status_code cpu_buffer_alloc_scratch(backend *self, size_t size, buffer *out) {
+__attribute__((weak)) status_code cpu_buffer_alloc_scratch(backend *self, size_t size,
+														   buffer *out) {
 	out->handle	  = xmalloc(size);
 	out->size	  = size;
 	out->offset	  = 0;
@@ -221,7 +220,7 @@ static status_code cpu_buffer_alloc_scratch(backend *self, size_t size, buffer *
 	return OK;
 }
 
-static void cpu_buffer_free(backend *self, buffer *buf) {
+__attribute__((weak)) void cpu_buffer_free(backend *self, buffer *buf) {
 	(void)self;
 
 	if (!buf || !buf->handle)
@@ -234,26 +233,30 @@ static void cpu_buffer_free(backend *self, buffer *buf) {
 	buf->offset = 0;
 }
 
-static status_code cpu_buffer_read_f32(backend *self, const buffer *buf, float *host_dst, int n) {
+__attribute__((weak)) status_code cpu_buffer_read_f32(backend *self, const buffer *buf,
+													  float *host_dst, int n) {
 	(void)self;
 	memcpy(host_dst, cpu_ptr(buf), (size_t)n * sizeof(float));
 	return OK;
 }
 
-static status_code cpu_buffer_write_f32(backend *self, buffer *buf, const float *host_src, int n) {
+__attribute__((weak)) status_code cpu_buffer_write_f32(backend *self, buffer *buf,
+													   const float *host_src, int n) {
 	(void)self;
 	memcpy(cpu_ptr(buf), host_src, (size_t)n * sizeof(float));
 	return OK;
 }
 
-static status_code cpu_copy_buffer(backend *self, const buffer *src, buffer *dst, int n) {
+__attribute__((weak)) status_code cpu_copy_buffer(backend *self, const buffer *src, buffer *dst,
+												  int n) {
 	(void)self;
 
 	memcpy(cpu_ptr(dst), cpu_ptr(src), (size_t)n * sizeof(float));
 	return OK;
 }
 
-static status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
+__attribute__((weak)) status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out,
+											   buffer *v_out) {
 	cpu_priv *p		   = self->priv;
 	p->kv_head_dim_max = desc->head_dim;
 	p->kv_quant		   = desc->kv_quant;
@@ -422,8 +425,6 @@ __attribute__((weak)) status_code cpu_kv_put(backend *self, buffer *k, buffer *v
 }
 
 typedef struct {
-	cpu_priv	*p;
-	int			 pos_start;
 	const float *kf_base;
 	const float *vf_base;
 	uint8_t		*kd_u8;
@@ -461,10 +462,11 @@ static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
-									const buffer *k_in, const buffer *v_in, int in_row_stride,
-									int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
-									int m) {
+__attribute__((weak)) status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer,
+												   int pos_start, const buffer *k_in,
+												   const buffer *v_in, int in_row_stride,
+												   int n_kv_heads, int head_dim, int n_ctx,
+												   int n_kv_heads_active, int m) {
 	cpu_priv *p		   = self->priv;
 	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 	int		  total	   = m * n_active;
@@ -493,9 +495,7 @@ static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 		slot_start = b ? (size_t)pos_start - b : (size_t)pos_start;
 	}
 
-	cpu_kv_put_batch_job job = {.p			= p,
-								.pos_start	= pos_start,
-								.kf_base	= (const float *)cpu_ptr(k_in),
+	cpu_kv_put_batch_job job = {.kf_base	= (const float *)cpu_ptr(k_in),
 								.vf_base	= (const float *)cpu_ptr(v_in),
 								.kd_u8		= (uint8_t *)k->handle,
 								.vd_u8		= (uint8_t *)v->handle,
@@ -510,7 +510,7 @@ static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 								.n_active	   = n_active,
 								.is_q80		   = is_q80};
 
-	if (p->pool && tpool_current_tid() < 0 && total >= 2) {
+	if (p->pool && total >= 2) {
 		tpool_parallel_for(p->pool, total, 1, cpu_kv_put_batch_chunk, &job);
 		return OK;
 	}
@@ -518,12 +518,13 @@ static status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 	return OK;
 }
 
-static void cpu_synchronize(backend *self) {
+__attribute__((weak)) void cpu_synchronize(backend *self) {
 	(void)self;
 }
 
-static status_code cpu_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
-								   int token, int dim, buffer *x_out) {
+__attribute__((weak)) status_code cpu_embd_lookup(backend *self, const buffer *tok_embd,
+												  uint32_t tok_embd_type, int token, int dim,
+												  buffer *x_out) {
 	(void)self;
 	size_t		   row_stride = ggml_row_size(tok_embd_type, dim);
 	const uint8_t *embd		  = (const uint8_t *)cpu_ptr(tok_embd) + ((size_t)token * row_stride);
@@ -532,18 +533,26 @@ static status_code cpu_embd_lookup(backend *self, const buffer *tok_embd, uint32
 	return OK;
 }
 
-static status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
-									 int n, float eps, int m);
-static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
-									const buffer *x, buffer *y, int n, int k, int m);
+__attribute__((weak)) status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w,
+													buffer *y, int n, float eps, int m);
+__attribute__((weak)) status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
+												   const buffer *x, buffer *y, int n, int k, int m);
 __attribute__((weak)) status_code cpu_add_batch(backend *self, buffer *x, const buffer *y, int n,
 												int m);
 __attribute__((weak)) status_code cpu_ffn_activate_batch(backend *self, const buffer *gate,
 														 const buffer *up, buffer *out, int n,
 														 int activation, int m);
+__attribute__((weak)) status_code cpu_rmsnorm_add_batch(backend *self, const buffer *x,
+														const buffer *w, const buffer *residual,
+														buffer *y, int n, float eps,
+														float out_scale, int m);
+__attribute__((weak)) status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w,
+															uint32_t w_type, const buffer *gate,
+															const buffer *up, buffer *y, int n,
+															int k, int activation, int m);
 
-static status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
-							   float eps) {
+__attribute__((weak)) status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w,
+											  buffer *y, int n, float eps) {
 	return cpu_rmsnorm_batch(self, x, w, y, n, eps, 1);
 }
 
@@ -564,11 +573,10 @@ static inline void cpu_matmul_add_bias_residual(float *restrict y, const float *
 }
 
 static const matmul_kernel *matmul_kernel_lookup(uint32_t w_type) {
-	for (size_t i = 0; i < (sizeof(k_kernels) / sizeof(k_kernels[0])); i++) {
-		if (k_kernels[i].w_type == w_type)
-			return &k_kernels[i];
-	}
-	return NULL;
+	if (w_type >= ARRAY_LEN(k_kernel_by_type))
+		return NULL;
+	const matmul_kernel *k = &k_kernel_by_type[w_type];
+	return k->qonly ? k : NULL;
 }
 
 static size_t cpu_matmul_q8_block_size(int q8_class) {
@@ -651,22 +659,25 @@ static void cpu_matmul_groups_worker(int begin, int end, int tid, void *ctx) {
 	cpu_matmul_rows_worker(row_begin, row_end, tid, ctx);
 }
 
-static const grouped_matmul_kernel k_grouped_kernels[] = {
-	{GGML_TYPE_Q8_0_R8, Q8_0_R8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_Q5_K_R8, Q5_K_R8_ROWS, cpu_matmul_groups_worker},
-	{GGML_TYPE_Q6_K_R8, Q6_K_R8_ROWS, cpu_matmul_groups_worker},
+#define GROUPED_KERNEL(wt, rows, fn) [(wt) - GGML_TYPE_Q8_0_R8] = {wt, rows, fn}
+
+static const grouped_matmul_kernel k_grouped_by_type[] = {
+	GROUPED_KERNEL(GGML_TYPE_Q8_0_R8, Q8_0_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q5_K_R8, Q5_K_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q6_K_R8, Q6_K_R8_ROWS, cpu_matmul_groups_worker),
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
-	for (size_t i = 0; i < (sizeof(k_grouped_kernels) / sizeof(k_grouped_kernels[0])); i++) {
-		if (k_grouped_kernels[i].w_type == w_type)
-			return &k_grouped_kernels[i];
-	}
-	return NULL;
+	if (w_type < GGML_TYPE_Q8_0_R8)
+		return NULL;
+	size_t idx = (size_t)w_type - GGML_TYPE_Q8_0_R8;
+	if (idx >= ARRAY_LEN(k_grouped_by_type))
+		return NULL;
+	return &k_grouped_by_type[idx];
 }
 
 static void cpu_matmul_dispatch_rows(tpool *pool, uint32_t w_type, int n_rows, void *job,
@@ -757,13 +768,11 @@ static void *cpu_matmul_quantize_x_rows(backend *self, quant_scratch *qs, int q8
 	quant_scratch_ensure(qs, (size_t)m * row_stride);
 	uint8_t *xq = qs->q8_buf;
 
-	cpu_priv *p			  = self->priv;
-	int		  cur_tid	  = tpool_current_tid();
-	int		  can_recurse = (cur_tid < 0);
+	cpu_priv *p = self->priv;
 
-	if (can_recurse && p->pool && m >= 2 * CPU_QUANTIZE_MIN_ROWS_PER_THREAD) {
+	if (p->pool && m >= 2 * CPU_QUANTIZE_MIN_ROWS_PER_THREAD) {
 		cpu_quantize_x_rows_job job = {
-			.qs = qs, .q8_class = q8_class, .xf = xf, .k = k, .row_stride = row_stride, .xq = xq};
+			.q8_class = q8_class, .xf = xf, .k = k, .row_stride = row_stride, .xq = xq};
 		tpool_parallel_for(p->pool, m, CPU_QUANTIZE_MIN_ROWS_PER_THREAD, cpu_quantize_x_rows_chunk,
 						   &job);
 		return xq;
@@ -785,8 +794,9 @@ static void *cpu_matmul_quantize_x(quant_scratch *qs, int q8_class, const float 
 	return qs->q8_buf;
 }
 
-void cpu_matmul_one(const void *restrict W, uint32_t w_type, const float *restrict x,
-					float *restrict y, int n, int k, quant_scratch *qs) {
+__attribute__((weak)) void cpu_matmul_one(const void *restrict W, uint32_t w_type,
+										  const float *restrict x, float *restrict y, int n, int k,
+										  quant_scratch *qs) {
 	const matmul_kernel *entry = matmul_kernel_lookup(w_type);
 	if (entry && entry->q8_class) {
 		void *xq = cpu_matmul_quantize_x(qs, entry->q8_class, x, k);
@@ -819,10 +829,9 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	cpu_priv *p = self->priv;
 
 	int cur_tid			 = tpool_current_tid();
-	int can_recurse		 = (cur_tid < 0);
 	int aliases_residual = (residual != NULL && residual == y);
 
-	if (!can_recurse || !p->pool || n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
+	if (!p->pool || n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		const float *res = residual;
 		if (aliases_residual) {
 			status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
@@ -838,16 +847,15 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 		return;
 	}
 
-	cpu_matmul_job job = {.W				= W,
-						  .w_type			= w_type,
-						  .n				= n,
-						  .k				= k,
-						  .m				= 1,
-						  .y				= y,
-						  .xf				= x,
-						  .bias				= bias,
-						  .residual			= residual,
-						  .aliases_residual = 0};
+	cpu_matmul_job job = {.W		= W,
+						  .w_type	= w_type,
+						  .n		= n,
+						  .k		= k,
+						  .m		= 1,
+						  .y		= y,
+						  .xf		= x,
+						  .bias		= bias,
+						  .residual = residual};
 	cpu_matmul_job_prepare_kernel(&job);
 
 	int q8_class = job.kernel ? job.kernel->q8_class : 0;
@@ -877,7 +885,6 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 		memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
 		job.residual = p->residual_tmp;
 	}
-	job.aliases_residual = 0;
 
 	cpu_matmul_dispatch_rows(p->pool, w_type, n, &job, cpu_matmul_rows_worker);
 }
@@ -921,9 +928,10 @@ static void cpu_matmul_multi_groups_worker(int begin, int end, int tid, void *ct
 	}
 }
 
-static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
-									const buffer *x, buffer **y, const int *n_list, int k,
-									int n_matmuls) {
+__attribute__((weak)) status_code cpu_matmul_multi(backend *self, const buffer **w,
+												   const uint32_t *w_types, const buffer *x,
+												   buffer **y, const int *n_list, int k,
+												   int n_matmuls) {
 	cpu_priv	*p	= self->priv;
 	const float *xf = cpu_ptr(x);
 
@@ -931,15 +939,14 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 	for (int i = 0; i < n_matmuls; i++)
 		total_rows += n_list[i];
 
-	int cur_tid		= tpool_current_tid();
-	int can_recurse = (cur_tid < 0);
+	int cur_tid = tpool_current_tid();
 
 	int has_grouped = 0;
 	for (int i = 0; i < n_matmuls; i++)
 		if (grouped_matmul_kernel_lookup(w_types[i]))
 			has_grouped = 1;
 
-	if (!can_recurse || !p->pool || n_matmuls > CPU_MATMUL_MULTI_MAX ||
+	if (!p->pool || n_matmuls > CPU_MATMUL_MULTI_MAX ||
 		total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 
 		quant_scratch *qs = cpu_scratch_for_tid(p, cur_tid);
@@ -1044,9 +1051,10 @@ static status_code cpu_matmul_multi(backend *self, const buffer **w, const uint3
 	return OK;
 }
 
-static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
-										  const buffer *x, buffer **y, const int *n_list, int k,
-										  int n_matmuls, int m) {
+__attribute__((weak)) status_code cpu_matmul_multi_batch(backend *self, const buffer **w,
+														 const uint32_t *w_types, const buffer *x,
+														 buffer **y, const int *n_list, int k,
+														 int n_matmuls, int m) {
 	if (m <= 1) {
 		buffer *y1[CPU_MATMUL_MULTI_MAX];
 		for (int i = 0; i < n_matmuls; i++)
@@ -1103,12 +1111,10 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 			has_grouped = 1;
 	}
 
-	int cur_tid		= tpool_current_tid();
-	int can_recurse = (cur_tid < 0);
-	int total_rows	= mj.row_offset[n_matmuls];
+	int cur_tid	   = tpool_current_tid();
+	int total_rows = mj.row_offset[n_matmuls];
 
-	if (!can_recurse || !p->pool ||
-		(size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
+	if (!p->pool || (size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		for (int i = 0; i < n_matmuls; i++) {
 			cpu_matmul_job *j = &mj.jobs[i];
 			if (j->n == 0)
@@ -1168,13 +1174,14 @@ static status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const
 	return OK;
 }
 
-static status_code cpu_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
-							  buffer *y, int n, int k) {
+__attribute__((weak)) status_code cpu_matmul(backend *self, const buffer *w, uint32_t w_type,
+											 const buffer *x, buffer *y, int n, int k) {
 	return cpu_matmul_batch(self, w, w_type, x, y, n, k, 1);
 }
-static status_code cpu_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
-									   const buffer *x, const buffer *residual, buffer *y, int n,
-									   int k) {
+__attribute__((weak)) status_code cpu_matmul_residual(backend *self, const buffer *w,
+													  uint32_t w_type, const buffer *x,
+													  const buffer *residual, buffer *y, int n,
+													  int k) {
 	const void	*W	= cpu_ptr(w);
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
@@ -1184,17 +1191,48 @@ static status_code cpu_matmul_residual(backend *self, const buffer *w, uint32_t 
 	return OK;
 }
 
-static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
-									const buffer *x, buffer *y, int n, int k, int m) {
+__attribute__((weak)) status_code cpu_matmul_batch_prequant(backend *self, const void *W,
+															uint32_t w_type, const void *xq,
+															size_t xq_row_stride, float *yf, int n,
+															int k, int m) {
+	cpu_priv	   *p = self->priv;
+	cpu_matmul_job	job_storage;
+	cpu_matmul_job *job = &job_storage;
+	memset(job, 0, sizeof(*job));
+	job->W		= W;
+	job->w_type = w_type;
+	job->y		= yf;
+	job->n		= n;
+	job->k		= k;
+	job->m		= m;
+	cpu_matmul_job_prepare_kernel(job);
+	int q8_class = job->kernel ? job->kernel->q8_class : 0;
+	if (!q8_class)
+		return ERR_UNSUPPORTED;
+	job->xq					  = (void *)xq;
+	job->xq_row_stride		  = xq_row_stride;
+	job->xq_row_stride_blocks = xq_row_stride / cpu_matmul_q8_block_size(q8_class);
+	job->row_stride			  = cpu_matmul_w_row_stride(w_type, k);
+	if (!p->pool || !p->thread_scratch ||
+		(size_t)m * (size_t)n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
+		cpu_matmul_rows_worker(0, n, 0, job);
+		return OK;
+	}
+	cpu_matmul_dispatch_rows(p->pool, w_type, n, job, cpu_matmul_rows_worker);
+	return OK;
+}
+
+__attribute__((weak)) status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
+												   const buffer *x, buffer *y, int n, int k,
+												   int m) {
 	cpu_priv	*p	= self->priv;
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
 	const void	*W	= cpu_ptr(w);
 
-	int cur_tid		= tpool_current_tid();
-	int can_recurse = (cur_tid < 0);
+	int cur_tid = tpool_current_tid();
 
-	if (!can_recurse || !p->pool || !p->thread_scratch ||
+	if (!p->pool || !p->thread_scratch ||
 		(size_t)m * (size_t)n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		quant_scratch *qs = cpu_scratch_for_tid(p, cur_tid);
 		for (int i = 0; i < m; i++)
@@ -1216,11 +1254,9 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 
 	int q8_class = job->kernel ? job->kernel->q8_class : 0;
 	if (q8_class) {
-		job->xq_row_stride = cpu_matmul_xq_row_stride(q8_class, k);
-		job->xq_row_stride_blocks =
-			job->xq_row_stride / cpu_matmul_q8_block_size(job->kernel->q8_class);
-		job->xq =
-			cpu_matmul_quantize_x_rows(self, &p->qscratch, q8_class, xf, k, m, job->xq_row_stride);
+		size_t stride = cpu_matmul_xq_row_stride(q8_class, k);
+		void  *xq	  = cpu_matmul_quantize_x_rows(self, &p->qscratch, q8_class, xf, k, m, stride);
+		return cpu_matmul_batch_prequant(self, W, w_type, xq, stride, yf, n, k, m);
 	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
 		for (int i = 0; i < m; i++)
 			cpu_matmul_one(W, w_type, xf + ((size_t)i * k), yf + ((size_t)i * n), n, k,
@@ -1233,8 +1269,8 @@ static status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_t
 	return OK;
 }
 
-static status_code cpu_prequantize_x(backend *self, const buffer *x, int k, uint32_t q8_type,
-									 buffer *x_q8_out) {
+__attribute__((weak)) status_code cpu_prequantize_x(backend *self, const buffer *x, int k,
+													uint32_t q8_type, buffer *x_q8_out) {
 	cpu_priv *p = self->priv;
 
 	int q8_class;
@@ -1264,9 +1300,9 @@ static status_code cpu_prequantize_x(backend *self, const buffer *x, int k, uint
 	return OK;
 }
 
-static status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
-									const buffer *x_q8, uint32_t q8_type, buffer *y, int n, int k,
-									int m) {
+__attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
+												   const buffer *x_q8, uint32_t q8_type, buffer *y,
+												   int n, int k, int m) {
 	(void)self;
 	const matmul_kernel *entry = matmul_kernel_lookup(w_type);
 	if (!entry)
@@ -1364,24 +1400,7 @@ static status_code cpu_rope_one_factored(cpu_priv *p, float *v, int n_heads, int
 		p->rope_cs.freq_factors_cached = freq_factors;
 	}
 
-	for (int h = 0; h < n_heads; h++) {
-		float *vh = v + ((size_t)h * head_dim);
-		for (int j = 0; j < half; j++) {
-			float c = cs[2 * j];
-			float s = cs[(2 * j) + 1];
-			if (neox) {
-				float v0	 = vh[j];
-				float v1	 = vh[j + half];
-				vh[j]		 = (v0 * c) - (v1 * s);
-				vh[j + half] = (v0 * s) + (v1 * c);
-			} else {
-				float v0		= vh[2 * j];
-				float v1		= vh[(2 * j) + 1];
-				vh[2 * j]		= (v0 * c) - (v1 * s);
-				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
-			}
-		}
-	}
+	rope_rotate_rows(v, n_heads, head_dim, half, cs, neox);
 	return OK;
 }
 
@@ -1461,9 +1480,10 @@ __attribute__((weak)) status_code cpu_rope_qk_batch(backend *self, buffer *q, bu
 	return OK;
 }
 
-static status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
-								const float *rope_cos_base, const float *rope_sin_base,
-								const float *freq_factors) {
+__attribute__((weak)) status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads,
+											   int head_dim, int pos, const float *rope_cos_base,
+											   const float *rope_sin_base,
+											   const float *freq_factors) {
 	cpu_priv *p = self->priv;
 	if (freq_factors) {
 		status_code err = cpu_rope_one_factored(p, (float *)cpu_ptr(vec), n_heads, head_dim, pos,
@@ -1489,24 +1509,7 @@ typedef struct {
 } cpu_rope_ext_batch_job;
 
 static void cpu_rope_ext_batch_row(float *v, int n_heads, int half, const float *cs, int neox) {
-	for (int h = 0; h < n_heads; h++) {
-		float *vh = v + ((size_t)h * half * 2);
-		for (int j = 0; j < half; j++) {
-			float c = cs[2 * j];
-			float s = cs[(2 * j) + 1];
-			if (neox) {
-				float v0	 = vh[j];
-				float v1	 = vh[j + half];
-				vh[j]		 = (v0 * c) - (v1 * s);
-				vh[j + half] = (v0 * s) + (v1 * c);
-			} else {
-				float v0		= vh[2 * j];
-				float v1		= vh[(2 * j) + 1];
-				vh[2 * j]		= (v0 * c) - (v1 * s);
-				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
-			}
-		}
-	}
+	rope_rotate_rows(v, n_heads, half * 2, half, cs, neox);
 }
 
 static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
@@ -1568,10 +1571,11 @@ static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
-									  int pos_start, const float *rope_cos_base,
-									  const float *rope_sin_base, const float *freq_factors,
-									  int m) {
+__attribute__((weak)) status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads,
+													 int head_dim, int pos_start,
+													 const float *rope_cos_base,
+													 const float *rope_sin_base,
+													 const float *freq_factors, int m) {
 	cpu_priv *p = self->priv;
 	if (m <= 1)
 		return cpu_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
@@ -1588,7 +1592,7 @@ static status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, i
 								  .cos_base		= rope_cos_base,
 								  .sin_base		= rope_sin_base};
 
-	if (p->pool && tpool_current_tid() < 0) {
+	if (p->pool) {
 		tpool_parallel_for(p->pool, m, 1, cpu_rope_ext_batch_chunk, &job);
 		return OK;
 	}
@@ -1992,17 +1996,7 @@ static void cpu_attn_batch_chunk(int begin, int end, int tid, void *ctx) {
 			attn_start = n_pos - j->sliding_window;
 			n_pos	   = j->sliding_window;
 		}
-		if (j->kv_base) {
-			size_t b = j->kv_base;
-			if (attn_start < (int)b) {
-				n_pos -= (int)b - attn_start;
-				attn_start = 0;
-				if (n_pos < 0)
-					n_pos = 0;
-			} else {
-				attn_start -= (int)b;
-			}
-		}
+		cpu_kv_window_to_slots_base(j->kv_base, &attn_start, &n_pos);
 
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((((size_t)row * j->n_heads) + h) * j->head_dim);
@@ -2085,7 +2079,6 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buff
 							  .p			  = p,
 							  .bitrev_perm	  = bitrev_perm,
 							  .kv_quant		  = p->kv_quant,
-							  .kv_layer		  = layer,
 							  .kv_rows		  = rows,
 							  .kv_base		  = base};
 
@@ -2146,8 +2139,8 @@ static void cpu_rmsnorm_batch_chunk(int begin, int end, int tid, void *ctx) {
 		rmsnorm(j->x + ((size_t)row * j->n), j->w, j->y + ((size_t)row * j->n), j->n, j->eps);
 }
 
-static status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
-									 int n, float eps, int m) {
+__attribute__((weak)) status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w,
+													buffer *y, int n, float eps, int m) {
 	cpu_priv			 *p	  = self->priv;
 	cpu_rmsnorm_batch_job job = {
 		.x = cpu_ptr(x), .w = cpu_ptr(w), .y = cpu_ptr(y), .n = n, .eps = eps};
@@ -2203,8 +2196,9 @@ __attribute__((weak)) status_code cpu_ffn_activate_batch(backend *self, const bu
 	return OK;
 }
 
-static status_code cpu_rmsnorm_per_head(backend *self, const buffer *x, const buffer *w, buffer *y,
-										int n_heads, int head_dim, float eps) {
+__attribute__((weak)) status_code cpu_rmsnorm_per_head(backend *self, const buffer *x,
+													   const buffer *w, buffer *y, int n_heads,
+													   int head_dim, float eps) {
 	(void)self;
 	const float *xf = cpu_ptr(x);
 	const float *wf = cpu_ptr(w);
@@ -2213,8 +2207,8 @@ static status_code cpu_rmsnorm_per_head(backend *self, const buffer *x, const bu
 	return OK;
 }
 
-static status_code cpu_rmsnorm_noweight(backend *self, const buffer *x, buffer *y, int n,
-										float eps) {
+__attribute__((weak)) status_code cpu_rmsnorm_noweight(backend *self, const buffer *x, buffer *y,
+													   int n, float eps) {
 	(void)self;
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
@@ -2222,8 +2216,9 @@ static status_code cpu_rmsnorm_noweight(backend *self, const buffer *x, buffer *
 	return OK;
 }
 
-static status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x, buffer *y,
-												 int n_heads, int head_dim, float eps) {
+__attribute__((weak)) status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x,
+																buffer *y, int n_heads,
+																int head_dim, float eps) {
 	(void)self;
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
@@ -2279,21 +2274,23 @@ static status_code cpu_rmsnorm_row_batch(backend *self, const buffer *x, const b
 	return OK;
 }
 
-static status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w,
-											  buffer *y, int n_heads, int head_dim, float eps,
-											  int m) {
+__attribute__((weak)) status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x,
+															 const buffer *w, buffer *y,
+															 int n_heads, int head_dim, float eps,
+															 int m) {
 	int row_stride = n_heads * head_dim;
 	return cpu_rmsnorm_row_batch(self, x, w, y, n_heads, head_dim, row_stride, eps, m, 0);
 }
 
-static status_code cpu_rmsnorm_noweight_batch(backend *self, const buffer *x, buffer *y, int n,
-											  float eps, int m) {
+__attribute__((weak)) status_code cpu_rmsnorm_noweight_batch(backend *self, const buffer *x,
+															 buffer *y, int n, float eps, int m) {
 	return cpu_rmsnorm_row_batch(self, x, NULL, y, 0, 0, n, eps, m, 1);
 }
 
-static status_code cpu_rmsnorm_noweight_per_head_batch(backend *self, const buffer *x, buffer *y,
-													   int n_heads, int head_dim, float eps,
-													   int m) {
+__attribute__((weak)) status_code cpu_rmsnorm_noweight_per_head_batch(backend	   *self,
+																	  const buffer *x, buffer *y,
+																	  int n_heads, int head_dim,
+																	  float eps, int m) {
 	return cpu_rmsnorm_row_batch(self, x, NULL, y, n_heads, head_dim, n_heads * head_dim, eps, m,
 								 1);
 }
@@ -2305,8 +2302,8 @@ __attribute__((weak)) status_code cpu_argmax(backend *self, const buffer *logits
 	return OK;
 }
 
-status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
-							 buffer *kv_out) {
+__attribute__((weak)) status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx,
+												   int kv_lora, int qk_rope, buffer *kv_out) {
 	cpu_priv *p			= self->priv;
 	size_t	  per_layer = (size_t)(kv_lora + qk_rope) * (size_t)n_ctx * sizeof(float);
 	size_t	  total		= per_layer * (size_t)n_layers;
@@ -2328,9 +2325,10 @@ status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora
 	return OK;
 }
 
-status_code cpu_kv_put_mla(backend *self, buffer *kv_cache, int layer, int pos,
-						   const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
-						   int qk_rope, int n_ctx, float eps) {
+__attribute__((weak)) status_code cpu_kv_put_mla(backend *self, buffer *kv_cache, int layer,
+												 int pos, const buffer *kv_a_in,
+												 const buffer *kv_a_norm_w, int kv_lora,
+												 int qk_rope, int n_ctx, float eps) {
 	(void)self;
 	int			 total_dim	  = kv_lora + qk_rope;
 	const float *kv_a		  = (const float *)cpu_ptr(kv_a_in);
@@ -2520,7 +2518,6 @@ __attribute__((weak)) status_code cpu_attention_mla(backend *self, const buffer 
 		.k_pe_rot_all  = k_pe_rot_all,
 		.rope_cos_base = rope_cos_base,
 		.rope_sin_base = rope_sin_base,
-		.n_heads	   = n_heads,
 		.qk_head	   = qk_head,
 		.qk_rope	   = qk_rope,
 		.qk_nope	   = qk_nope,
@@ -2531,10 +2528,7 @@ __attribute__((weak)) status_code cpu_attention_mla(backend *self, const buffer 
 		.scale		   = scale,
 	};
 
-	int cur_tid		= tpool_current_tid();
-	int can_recurse = (cur_tid < 0);
-
-	if (can_recurse && p->pool && p->thread_scratch && n_heads >= 2) {
+	if (p->pool && p->thread_scratch && n_heads >= 2) {
 		tpool_parallel_for(p->pool, n_heads, 1, cpu_attn_mla_head_chunk, &job);
 		return OK;
 	}
@@ -2545,13 +2539,14 @@ __attribute__((weak)) status_code cpu_attention_mla(backend *self, const buffer 
 	return OK;
 }
 
-static tpool *cpu_get_pool(backend *self) {
+__attribute__((weak)) tpool *cpu_get_pool(backend *self) {
 	cpu_priv *p = self->priv;
 	return p ? p->pool : NULL;
 }
 
-static status_code cpu_matmul_thread_local(backend *self, const void *W, uint32_t w_type,
-										   const float *x, float *y, int n, int k, int tid) {
+__attribute__((weak)) status_code cpu_matmul_thread_local(backend *self, const void *W,
+														  uint32_t w_type, const float *x, float *y,
+														  int n, int k, int tid) {
 	cpu_priv *p = self->priv;
 	if (!p)
 		return ERR_INVALID_ARG;
@@ -2560,18 +2555,46 @@ static status_code cpu_matmul_thread_local(backend *self, const void *W, uint32_
 	return OK;
 }
 
-static status_code cpu_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
-								   const buffer *residual, buffer *y, int n, float eps) {
-	(void)self;
-	rmsnorm(cpu_ptr(x), cpu_ptr(w), cpu_ptr(y), n, eps);
-	const float *rf = cpu_ptr(residual);
-	float		*yf = cpu_ptr(y);
-	for (int i = 0; i < n; i++)
-		yf[i] += rf[i];
+__attribute__((weak)) status_code cpu_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
+												  const buffer *residual, buffer *y, int n,
+												  float eps, float out_scale) {
+	return cpu_rmsnorm_add_batch(self, x, w, residual, y, n, eps, out_scale, 1);
+}
+
+static void cpu_rmsnorm_add_batch_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rmsnorm_add_batch_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *xr	   = j->x + ((size_t)row * j->n);
+		const float *rr	   = j->residual + ((size_t)row * j->n);
+		float		*yr	   = j->y + ((size_t)row * j->n);
+		float		 ss	   = rmsnorm_sum_sq(xr, j->n);
+		float		 scale = 1.0f / sqrtf((ss / (float)j->n) + j->eps);
+		float		 t;
+		for (int i = 0; i < j->n; i++) {
+			t	  = xr[i] * scale * j->w[i] + rr[i];
+			yr[i] = t * j->out_scale;
+		}
+	}
+}
+
+__attribute__((weak)) status_code cpu_rmsnorm_add_batch(backend *self, const buffer *x,
+														const buffer *w, const buffer *residual,
+														buffer *y, int n, float eps,
+														float out_scale, int m) {
+	cpu_priv				 *p	  = self->priv;
+	cpu_rmsnorm_add_batch_job job = {.x			= cpu_ptr(x),
+									 .w			= cpu_ptr(w),
+									 .residual	= cpu_ptr(residual),
+									 .y			= cpu_ptr(y),
+									 .n			= n,
+									 .eps		= eps,
+									 .out_scale = out_scale};
+	cpu_run_batch(p->pool, m, cpu_rmsnorm_add_batch_chunk, &job);
 	return OK;
 }
 
-static status_code cpu_scale_inplace(backend *self, buffer *x, float scale, int n) {
+__attribute__((weak)) status_code cpu_scale_inplace(backend *self, buffer *x, float scale, int n) {
 	(void)self;
 	float *xf = cpu_ptr(x);
 	for (int i = 0; i < n; i++)
@@ -2589,16 +2612,16 @@ __attribute__((weak)) void cpu_softcap_chunk(int begin, int end, int tid, void *
 		x[i] = cap * tanhf(x[i] * inv_cap);
 }
 
-static status_code cpu_softcap(backend *self, buffer *x, float cap, int n) {
+__attribute__((weak)) status_code cpu_softcap(backend *self, buffer *x, float cap, int n) {
 	if (cap <= 0.0f || n <= 0)
 		return OK;
 	cpu_priv	   *p		= self->priv;
 	float		   *xf		= cpu_ptr(x);
 	float			inv_cap = 1.0f / cap;
-	cpu_softcap_job job		= {.x = xf, .n = n, .inv_cap = inv_cap, .cap = cap};
+	cpu_softcap_job job		= {.x = xf, .inv_cap = inv_cap, .cap = cap};
 	tpool		   *pool	= p ? p->pool : NULL;
 	int				cur_tid = tpool_current_tid();
-	if (pool && cur_tid < 0 && tpool_n_threads(pool) > 1 && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
+	if (pool && tpool_n_threads(pool) > 1 && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
 		tpool_parallel_for(pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_softcap_chunk, &job);
 	} else {
 		cpu_softcap_chunk(0, n, cur_tid, &job);
@@ -2626,8 +2649,9 @@ __attribute__((weak)) void cpu_split_qgate_chunk(int begin, int end, int tid, vo
 	}
 }
 
-static status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
-								   int n_heads, int head_dim, int n_rows) {
+__attribute__((weak)) status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q,
+												  buffer *gate, int n_heads, int head_dim,
+												  int n_rows) {
 	(void)self;
 	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
 		return OK;
@@ -2635,8 +2659,7 @@ static status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q
 							   .q		 = cpu_ptr(q),
 							   .gate	 = cpu_ptr(gate),
 							   .n_heads	 = n_heads,
-							   .head_dim = head_dim,
-							   .n_rows	 = n_rows};
+							   .head_dim = head_dim};
 	cpu_priv		   *p	= self->priv;
 	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_split_qgate_chunk, &job);
 	return OK;
@@ -2654,14 +2677,13 @@ __attribute__((weak)) void cpu_attn_output_gate_chunk(int begin, int end, int ti
 	}
 }
 
-static status_code cpu_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
-										int n_rows) {
+__attribute__((weak)) status_code cpu_attn_output_gate(backend *self, buffer *out,
+													   const buffer *gate, int n, int n_rows) {
 	(void)self;
 	if (n <= 0 || n_rows <= 0)
 		return OK;
-	cpu_attn_output_gate_job job = {
-		.out = cpu_ptr(out), .gate = cpu_ptr(gate), .n = n, .n_rows = n_rows};
-	cpu_priv *p = self->priv;
+	cpu_attn_output_gate_job job = {.out = cpu_ptr(out), .gate = cpu_ptr(gate), .n = n};
+	cpu_priv				*p	 = self->priv;
 	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_attn_output_gate_chunk, &job);
 	return OK;
 }
@@ -2679,10 +2701,11 @@ __attribute__((weak)) void cpu_partial_rope_qk_chunk(int begin, int end, int tid
 	}
 }
 
-static status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
-									   int n_kv_heads, int head_dim, int rope_dim, int pos_start,
-									   const float *rope_cos_base, const float *rope_sin_base,
-									   int n_rows) {
+__attribute__((weak)) status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k,
+													  int n_heads, int n_kv_heads, int head_dim,
+													  int rope_dim, int pos_start,
+													  const float *rope_cos_base,
+													  const float *rope_sin_base, int n_rows) {
 	(void)self;
 	if (n_rows <= 0 || rope_dim <= 0)
 		return OK;
@@ -2700,15 +2723,14 @@ static status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int 
 									.n_heads	= n_heads,
 									.n_kv_heads = n_kv_heads,
 									.head_dim	= head_dim,
-									.pos0		= pos_start,
-									.n_rows		= n_rows};
+									.pos0		= pos_start};
 	cpu_priv			   *p	 = self->priv;
 	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_partial_rope_qk_chunk, &job);
 	return OK;
 }
 
-static status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
-								   float combine_scale) {
+__attribute__((weak)) status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj,
+												  int n, float combine_scale) {
 	(void)self;
 	float		*pf = cpu_ptr(ple);
 	const float *pr = cpu_ptr(proj);
@@ -2734,9 +2756,10 @@ __attribute__((weak)) void cpu_ffn_down_act_chunk(int begin, int end, int tid, v
 	}
 }
 
-static status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
-									   const buffer *gate, const buffer *up, buffer *y, int n,
-									   int k, int activation) {
+__attribute__((weak)) status_code cpu_matmul_ffn_down(backend *self, const buffer *w,
+													  uint32_t w_type, const buffer *gate,
+													  const buffer *up, buffer *y, int n, int k,
+													  int activation) {
 	cpu_priv	*p		= self->priv;
 	const void	*W		= cpu_ptr(w);
 	const float *gate_f = cpu_ptr(gate);
@@ -2751,7 +2774,7 @@ static status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t 
 
 	cpu_ffn_down_act_args a		  = {.g = gate_f, .u = up_f, .o = act, .activation = activation};
 	int					  cur_tid = tpool_current_tid();
-	if (p->pool && cur_tid < 0 && k >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
+	if (p->pool && k >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
 		tpool_parallel_for(p->pool, k, CPU_ELEMWISE_MIN_PER_THREAD, cpu_ffn_down_act_chunk, &a);
 	} else {
 		cpu_ffn_down_act_chunk(0, k, cur_tid, &a);
@@ -2761,7 +2784,110 @@ static status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t 
 	return OK;
 }
 
-static void cpu_kv_free(backend *self, buffer *k, buffer *v) {
+enum { FFN_ACTQ_TILE = 256 };
+
+typedef struct {
+	const float *g, *u;
+	uint8_t		*xq;
+	int			 k;
+	size_t		 stride;
+	int			 activation;
+	int			 q8_class;
+} cpu_ffn_actq_job;
+
+static void ffn_actq_row(const float *g, const float *u, uint8_t *xq, int k, int activation,
+						 int q8_class) {
+	float tmp[FFN_ACTQ_TILE];
+	for (int b = 0; b < k; b += FFN_ACTQ_TILE) {
+		int					  n = k - b < FFN_ACTQ_TILE ? k - b : FFN_ACTQ_TILE;
+		cpu_ffn_down_act_args a = {.g = g + b, .u = u + b, .o = tmp, .activation = activation};
+		cpu_ffn_down_act_chunk(0, n, 0, &a);
+		if (q8_class == 3) {
+			quantize_q8_k(tmp, (q8_k_block *)(xq + (size_t)(b / 256) * sizeof(q8_k_block)), 256);
+			continue;
+		}
+		size_t esz = (q8_class == 1) ? sizeof(q8_0_block) : sizeof(q8_1_block);
+		for (int j = 0; j < n; j += 32) {
+			void *dst = xq + (size_t)((b + j) / 32) * esz;
+			if (q8_class == 1)
+				quantize_q8_0(tmp + j, (q8_0_block *)dst, 32);
+			else
+				quantize_q8_1(tmp + j, dst, 32);
+		}
+	}
+}
+
+static void cpu_ffn_actq_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_ffn_actq_job *j = ctx;
+	for (int i = begin; i < end; i++)
+		ffn_actq_row(j->g + (size_t)i * j->k, j->u + (size_t)i * j->k,
+					 j->xq + (size_t)i * j->stride, j->k, j->activation, j->q8_class);
+}
+
+__attribute__((weak)) status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w,
+															uint32_t w_type, const buffer *gate,
+															const buffer *up, buffer *y, int n,
+															int k, int activation, int m) {
+	cpu_priv *p = self->priv;
+	if (m <= 0)
+		return ERR_INVALID_ARG;
+	if (m == 1)
+		return cpu_matmul_ffn_down(self, w, w_type, gate, up, y, n, k, activation);
+	const float *gate_f = cpu_ptr(gate);
+	const float *up_f	= cpu_ptr(up);
+	const void	*W		= cpu_ptr(w);
+	float		*yf		= cpu_ptr(y);
+
+	const matmul_kernel *entry	  = matmul_kernel_lookup(w_type);
+	int					 q8_class = entry ? entry->q8_class : 0;
+	if (q8_class) {
+		size_t stride = cpu_matmul_xq_row_stride(q8_class, k);
+		quant_scratch_ensure(&p->qscratch, (size_t)m * stride);
+		uint8_t *xq		 = p->qscratch.q8_buf;
+		int		 cur_tid = tpool_current_tid();
+		if (p->pool && m >= 2 * CPU_QUANTIZE_MIN_ROWS_PER_THREAD) {
+			cpu_ffn_actq_job job = {.g			= gate_f,
+									.u			= up_f,
+									.xq			= xq,
+									.k			= k,
+									.stride		= stride,
+									.activation = activation,
+									.q8_class	= q8_class};
+			tpool_parallel_for(p->pool, m, CPU_QUANTIZE_MIN_ROWS_PER_THREAD, cpu_ffn_actq_chunk,
+							   &job);
+		} else {
+			for (int i = 0; i < m; i++)
+				ffn_actq_row(gate_f + (size_t)i * k, up_f + (size_t)i * k, xq + (size_t)i * stride,
+							 k, activation, q8_class);
+		}
+		(void)cur_tid;
+		return cpu_matmul_batch_prequant(self, W, w_type, xq, stride, yf, n, k, m);
+	}
+
+	status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
+									   (size_t)m * (size_t)k * sizeof(float), 64);
+	if (grow_st != OK)
+		return grow_st;
+	float *act = p->residual_tmp;
+
+	cpu_ffn_down_act_args a		  = {.g = gate_f, .u = up_f, .o = act, .activation = activation};
+	int					  cur_tid = tpool_current_tid();
+	int					  total	  = m * k;
+	if (p->pool && total >= 2 * CPU_ELEMWISE_MIN_PER_THREAD) {
+		tpool_parallel_for(p->pool, total, CPU_ELEMWISE_MIN_PER_THREAD, cpu_ffn_down_act_chunk, &a);
+	} else {
+		cpu_ffn_down_act_chunk(0, total, cur_tid, &a);
+	}
+
+	buffer act_b = {0};
+	act_b.handle = act;
+	act_b.owner	 = self;
+	act_b.size	 = (size_t)m * (size_t)k * sizeof(float);
+	return cpu_matmul_batch(self, w, w_type, &act_b, y, n, k, m);
+}
+
+__attribute__((weak)) void cpu_kv_free(backend *self, buffer *k, buffer *v) {
 	cpu_buffer_free(self, k);
 	cpu_buffer_free(self, v);
 }
@@ -2795,8 +2921,8 @@ static void cpu_repack_chunk(int begin, int end, int tid, void *ctx) {
 	job->repack_fn(job->src, job->dst, row_begin, row_end, job->k);
 }
 
-static status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
-								   uint32_t *re_type_out) {
+__attribute__((weak)) status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0,
+												  uint64_t d1, uint32_t *re_type_out) {
 	(void)self;
 	uint32_t re_type = 0;
 	if (type == GGML_TYPE_IQ3_S && (d0 % 256) == 0 && (d1 % IQ3_S_RE8_ROWS) == 0) {
@@ -2820,8 +2946,8 @@ static status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, ui
 	return OK;
 }
 
-static status_code cpu_repack_weight(backend *self, uint32_t type, const void *src, void *dst,
-									 int n_rows, int k) {
+__attribute__((weak)) status_code cpu_repack_weight(backend *self, uint32_t type, const void *src,
+													void *dst, int n_rows, int k) {
 	cpu_repack_job job = {.src = src, .dst = dst, .k = k};
 	if (type == GGML_TYPE_Q8_0) {
 		job.rows_per_group = Q8_0_R8_ROWS;
@@ -2854,16 +2980,16 @@ static status_code cpu_repack_weight(backend *self, uint32_t type, const void *s
 	return OK;
 }
 
-static status_code cpu_dequant_row(backend *self, uint32_t type, const void *src, int n_elems,
-								   float *dst) {
+__attribute__((weak)) status_code cpu_dequant_row(backend *self, uint32_t type, const void *src,
+												  int n_elems, float *dst) {
 	(void)self;
 	dequant_row_dispatch(type, src, n_elems, dst);
 	return OK;
 }
 
-static status_code cpu_moe_activate(backend *self, const buffer *gate, const buffer *up,
-									buffer *out, int n, float gate_scale, float up_scale,
-									int use_gelu) {
+__attribute__((weak)) status_code cpu_moe_activate(backend *self, const buffer *gate,
+												   const buffer *up, buffer *out, int n,
+												   float gate_scale, float up_scale, int use_gelu) {
 	(void)self;
 	if (use_gelu)
 		moe_activate_gelu(cpu_ptr(out), cpu_ptr(gate), cpu_ptr(up), n, gate_scale, up_scale);
@@ -2929,7 +3055,7 @@ static void gdn_conv_tokens(tpool *pool, float *conv_out, float *conv_state, con
 						.n_tokens	  = n_tokens,
 						.mixed_stride = mixed_stride,
 						.history	  = conv_kernel - 1};
-	if (pool && conv_dim > 8 && tpool_current_tid() < 0) {
+	if (pool && conv_dim > 8) {
 		tpool_parallel_for(pool, conv_dim, 8, gdn_conv_chunk, &job);
 		return;
 	}
@@ -3037,7 +3163,7 @@ static void gdn_chunk(int begin, int end, int tid, void *ctx) {
 	gdn_heads(begin, end, j, j->scratch + (size_t)tid * j->scratch_stride);
 }
 
-static status_code cpu_gated_delta_net(backend *self, const gdn_desc *d) {
+__attribute__((weak)) status_code cpu_gated_delta_net(backend *self, const gdn_desc *d) {
 	tpool *pool			  = (self && self->get_pool) ? self->get_pool(self) : NULL;
 	int	   scratch_stride = 2 * d->state_size + 2 * d->value_head_dim;
 	float *conv			  = d->ws;
@@ -3136,6 +3262,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->attention_batch				 = cpu_attention_batch;
 	out->attention_swa_batch			 = cpu_attention_swa_batch;
 	out->rmsnorm_add					 = cpu_rmsnorm_add;
+	out->rmsnorm_add_batch				 = cpu_rmsnorm_add_batch;
 	out->scale_inplace					 = cpu_scale_inplace;
 	out->softcap						 = cpu_softcap;
 	out->split_qgate					 = cpu_split_qgate;
@@ -3143,6 +3270,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->partial_rope_qk				 = cpu_partial_rope_qk;
 	out->ple_combine					 = cpu_ple_combine;
 	out->matmul_ffn_down				 = cpu_matmul_ffn_down;
+	out->matmul_ffn_down_batch			 = cpu_matmul_ffn_down_batch;
 	out->kv_free						 = cpu_kv_free;
 	return OK;
 }

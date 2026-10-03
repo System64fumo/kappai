@@ -171,21 +171,24 @@ static inline size_t cpu_kv_layer_rows(const cpu_priv *p, int layer, int n_ctx) 
 	return (size_t)n_ctx;
 }
 
-static inline void cpu_kv_window_to_slots(const cpu_priv *p, int layer, int *attn_start,
-										  int *n_pos) {
-	if (!p->kv_base_pos)
+static inline void cpu_kv_window_to_slots_base(size_t b, int *attn_start, int *n_pos) {
+	if (!b)
 		return;
-	size_t bpos = p->kv_base_pos[layer];
-	if (!bpos)
-		return;
-	if (*attn_start < (int)bpos) {
-		*n_pos -= (int)bpos - *attn_start;
+	if (*attn_start < (int)b) {
+		*n_pos -= (int)b - *attn_start;
 		*attn_start = 0;
 		if (*n_pos < 0)
 			*n_pos = 0;
 	} else {
-		*attn_start -= (int)bpos;
+		*attn_start -= (int)b;
 	}
+}
+
+static inline void cpu_kv_window_to_slots(const cpu_priv *p, int layer, int *attn_start,
+										  int *n_pos) {
+	if (!p->kv_base_pos)
+		return;
+	cpu_kv_window_to_slots_base(p->kv_base_pos[layer], attn_start, n_pos);
 }
 
 static inline size_t cpu_kv_put_slot(cpu_priv *p, int layer, int pos, int n_ctx, void *kbase,
@@ -317,7 +320,6 @@ typedef struct {
 	cpu_priv	   *p;
 	const int	   *bitrev_perm;
 	kv_quant_type	kv_quant;
-	int				kv_layer;
 	size_t			kv_rows, kv_base;
 } cpu_attn_batch_job;
 
@@ -349,6 +351,14 @@ typedef struct {
 } cpu_add_batch_job;
 
 typedef struct {
+	const float *x, *w, *residual;
+	float		*y;
+	int			 n;
+	float		 eps;
+	float		 out_scale;
+} cpu_rmsnorm_add_batch_job;
+
+typedef struct {
 	const float *g, *u;
 	float		*o;
 	int			 n;
@@ -357,7 +367,6 @@ typedef struct {
 
 typedef struct {
 	float *x;
-	int	   n;
 	float  inv_cap;
 	float  cap;
 } cpu_softcap_job;
@@ -365,20 +374,20 @@ typedef struct {
 typedef struct {
 	const float *mixed;
 	float		*q, *gate;
-	int			 n_heads, head_dim, n_rows;
+	int			 n_heads, head_dim;
 } cpu_split_qgate_job;
 
 typedef struct {
 	float		*out;
 	const float *gate;
-	int			 n, n_rows;
+	int			 n;
 } cpu_attn_output_gate_job;
 
 typedef struct {
 	float		*q, *k;
 	const float *cos_base, *sin_base;
 	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim;
-	int			 pos0, n_rows;
+	int			 pos0;
 } cpu_partial_rope_qk_job;
 
 static inline void cpu_run_batch_full(tpool *pool, int m, int grain, int min_m,

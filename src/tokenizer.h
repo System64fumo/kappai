@@ -20,10 +20,8 @@ enum {
 };
 
 typedef struct {
-	int32_t		id;
 	const char *text;
 	uint32_t	text_len;
-	float		score;
 	uint8_t		type;
 } vocab_token;
 
@@ -44,10 +42,8 @@ typedef struct {
 	vocab_token			  *tokens;
 	struct tok_hash_entry *hash;
 	struct tok_hash_entry *merge_hash;
-	char				 **merge_keys;
 	int32_t				  *merge_token_ids;
 	int32_t				  *token_decoded_len;
-	int32_t				  *token_char_count;
 	int32_t				  *special_ids;
 	int32_t				  *special_by_first_byte;
 	int32_t				  *decoded_off;
@@ -57,7 +53,6 @@ typedef struct {
 	str_builder			   bpe_sp;
 	str_builder			   gpt2_scratch;
 	void				  *bpe_pcs_cache;
-	str_arena			   merge_pool;
 	tok_cache_entry		  *chunk_cache;
 	str_arena			   chunk_cache_pool;
 	uint32_t			   chunk_cache_cap;
@@ -67,7 +62,6 @@ typedef struct {
 	uint32_t			   n_byte_fallback;
 	uint32_t			   hash_capacity;
 	uint32_t			   merge_hash_capacity;
-	uint32_t			   n_merge_keys;
 	uint32_t			   n_special_ids;
 	uint32_t			   n_special_first_bytes;
 	uint32_t			   bpe_work_cap;

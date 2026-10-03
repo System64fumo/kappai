@@ -167,7 +167,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	if (c->session_poisoned) {
 		ERROR("startup warmup left inconsistent state; refusing to generate");
-		return ERR_INTERNAL;
+		return 1;
 	}
 
 	if (a->output_stream)
@@ -177,7 +177,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	int rc = 0;
 	if (r < 0)
-		rc = ERR_INTERNAL;
+		rc = 1;
 	if (c->context_limit_hit) {
 		c->context_limit_hit = false;
 		WARN("context window exhausted (n_ctx=%d). Shorten the prompt, lower "
@@ -187,7 +187,7 @@ static int run_one_shot(context *c, cli_args *a) {
 	}
 	if (c->session_poisoned) {
 		ERROR("generation left inconsistent cache state; session must be reset");
-		rc = ERR_INTERNAL;
+		rc = 1;
 	}
 	return rc;
 }

@@ -33,6 +33,7 @@ struct jinja_value {
 		struct {
 			int64_t value;
 			char	text[32];
+			bool	text_ready;
 		} integer;
 		struct {
 			double value;

@@ -441,6 +441,13 @@ status_code chat_template_add_turn(chat_template_state *cts, const char *role, c
 status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_message *msg,
 									  int add_generation_prompt, char **out, char *errbuf,
 									  size_t errbuf_len) {
+	return chat_template_add_turn_ex_steal(cts, msg, add_generation_prompt, out, NULL, errbuf,
+										   errbuf_len);
+}
+
+status_code chat_template_add_turn_ex_steal(chat_template_state *cts, const chat_message *msg,
+											int add_generation_prompt, char **out, char **prev_out,
+											char *errbuf, size_t errbuf_len) {
 	chat_template_add_message_ex(cts, msg);
 
 	char	   *rendered;
@@ -470,7 +477,11 @@ status_code chat_template_add_turn_ex(chat_template_state *cts, const chat_messa
 
 	*out = xstrdup(diff);
 
-	free(cts->last_render);
+	if (prev_out) {
+		*prev_out = cts->last_render;
+	} else {
+		free(cts->last_render);
+	}
 	cts->last_render = rendered;
 	return OK;
 }

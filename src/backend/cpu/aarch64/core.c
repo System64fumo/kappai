@@ -68,6 +68,23 @@ static inline void scale_store_f32_vec(float *restrict dst, const float *restric
 		dst[d] = src[d] * s;
 }
 
+/* Online-softmax step, branchless. fast_expf(0.0f) is exactly 1.0f (n=0, e=127 ->
+   0x3f800000), so the rescale factor collapses to 1.0f on the no-new-max path and the
+   head_dim-wide VKQ rescale can be skipped. Matches the branchy form exactly: the only
+   case the original guarded was ss > M, which is precisely where alpha != 1.0f. */
+static inline float attn_softmax_step(float ss, float *M, float *S, float *restrict vkq,
+									  int head_dim) {
+	const float M_old = *M;
+	const float M_new = fmaxf(ss, M_old);
+	const float alpha = (*S > 0.0f) ? fast_expf(M_old - M_new) : 1.0f;
+	const float vs	  = fast_expf(ss - M_new);
+
+	if (alpha != 1.0f)
+		scale_f32_vec(vkq, head_dim, alpha);
+	*M = M_new;
+	*S = *S * alpha + vs;
+	return vs;
+}
 #define cpu_attn_job_neon cpu_attn_job
 #define cpu_attn_batch_job_neon cpu_attn_batch_job
 
@@ -445,6 +462,191 @@ status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, 
 	return OK;
 }
 
+static void rope_rotate_neox_dim_neon(float *v, int n_heads, int head_dim, int half,
+									  const float *rope_cos, const float *rope_sin) {
+	int j = 0;
+	for (; j + 8 <= half; j += 8) {
+		const float32x4_t c0 = vld1q_f32(rope_cos + j);
+		const float32x4_t c1 = vld1q_f32(rope_cos + j + 4);
+		const float32x4_t s0 = vld1q_f32(rope_sin + j);
+		const float32x4_t s1 = vld1q_f32(rope_sin + j + 4);
+		for (int h = 0; h < n_heads; h++) {
+			float	   *vh	= v + ((size_t)h * head_dim);
+			float32x4_t v0a = vld1q_f32(vh + j);
+			float32x4_t v0b = vld1q_f32(vh + j + 4);
+			float32x4_t v1a = vld1q_f32(vh + j + half);
+			float32x4_t v1b = vld1q_f32(vh + j + half + 4);
+			vst1q_f32(vh + j, vmlsq_f32(vmulq_f32(v0a, c0), v1a, s0));
+			vst1q_f32(vh + j + 4, vmlsq_f32(vmulq_f32(v0b, c1), v1b, s1));
+			vst1q_f32(vh + j + half, vmlaq_f32(vmulq_f32(v0a, s0), v1a, c0));
+			vst1q_f32(vh + j + half + 4, vmlaq_f32(vmulq_f32(v0b, s1), v1b, c1));
+		}
+	}
+	for (; j + 4 <= half; j += 4) {
+		const float32x4_t c0 = vld1q_f32(rope_cos + j);
+		const float32x4_t s0 = vld1q_f32(rope_sin + j);
+		for (int h = 0; h < n_heads; h++) {
+			float	   *vh	= v + ((size_t)h * head_dim);
+			float32x4_t v0a = vld1q_f32(vh + j);
+			float32x4_t v1a = vld1q_f32(vh + j + half);
+			vst1q_f32(vh + j, vmlsq_f32(vmulq_f32(v0a, c0), v1a, s0));
+			vst1q_f32(vh + j + half, vmlaq_f32(vmulq_f32(v0a, s0), v1a, c0));
+		}
+	}
+	for (; j < half; j++) {
+		const float c = rope_cos[j];
+		const float s = rope_sin[j];
+		for (int h = 0; h < n_heads; h++) {
+			float *vh	 = v + ((size_t)h * head_dim);
+			float  v0	 = vh[j];
+			float  v1	 = vh[j + half];
+			vh[j]		 = (v0 * c) - (v1 * s);
+			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+	}
+}
+
+static void cpu_partial_rope_qk_chunk_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_partial_rope_qk_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
+		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
+		rope_rotate_neox_dim_neon(j->q + (size_t)row * j->qn, j->n_heads, j->head_dim, j->half,
+								  cosv, sinv);
+		rope_rotate_neox_dim_neon(j->k + (size_t)row * j->kn, j->n_kv_heads, j->head_dim, j->half,
+								  cosv, sinv);
+	}
+}
+
+status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+								int head_dim, int rope_dim, int pos_start,
+								const float *rope_cos_base, const float *rope_sin_base,
+								int n_rows) {
+	cpu_priv *p = self->priv;
+	if (n_rows <= 0 || rope_dim <= 0)
+		return OK;
+	int						qn	= n_heads * head_dim;
+	int						kn	= n_kv_heads * head_dim;
+	cpu_partial_rope_qk_job job = {.q		   = cpu_ptr(q),
+								   .k		   = cpu_ptr(k),
+								   .cos_base   = rope_cos_base,
+								   .sin_base   = rope_sin_base,
+								   .qn		   = qn,
+								   .kn		   = kn,
+								   .half	   = rope_dim / 2,
+								   .rope_dim   = rope_dim,
+								   .n_heads	   = n_heads,
+								   .n_kv_heads = n_kv_heads,
+								   .head_dim   = head_dim,
+								   .pos0	   = pos_start};
+	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_partial_rope_qk_chunk_neon, &job);
+	return OK;
+}
+
+static void cpu_split_qgate_chunk_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_split_qgate_job *j			  = ctx;
+	const int			 hd			  = j->head_dim;
+	int					 q_out		  = j->n_heads * hd;
+	int					 mixed_stride = 2 * q_out;
+	for (int row = begin; row < end; row++) {
+		const float *src = j->mixed + (size_t)row * mixed_stride;
+		float		*qd	 = j->q + (size_t)row * q_out;
+		float		*gd	 = j->gate + (size_t)row * q_out;
+		for (int h = 0; h < j->n_heads; h++, src += 2 * hd) {
+			int jj = 0;
+			for (; jj + 4 <= hd; jj += 4) {
+				vst1q_f32(qd + jj, vld1q_f32(src + jj));
+				vst1q_f32(gd + jj, vld1q_f32(src + hd + jj));
+			}
+			for (; jj < hd; jj++) {
+				qd[jj] = src[jj];
+				gd[jj] = src[hd + jj];
+			}
+			qd += hd;
+			gd += hd;
+		}
+	}
+}
+
+status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+							int n_heads, int head_dim, int n_rows) {
+	cpu_priv *p = self->priv;
+	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
+		return OK;
+	cpu_split_qgate_job job = {.mixed	 = cpu_ptr(mixed),
+							   .q		 = cpu_ptr(q),
+							   .gate	 = cpu_ptr(gate),
+							   .n_heads	 = n_heads,
+							   .head_dim = head_dim};
+	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_split_qgate_chunk_neon, &job);
+	return OK;
+}
+
+static float32x4_t sigmoid_mul_vec4(float32x4_t g, float32x4_t u) {
+	float32x4_t t	= vexpq_f32(vnegq_f32(vabsq_f32(g)));
+	float32x4_t den = vaddq_f32(vdupq_n_f32(1.0f), t);
+	float32x4_t num = vbslq_f32(vcgeq_f32(g, vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f), t);
+	float32x4_t r	= vrecpeq_f32(den);
+	r				= vmulq_f32(vrecpsq_f32(den, r), r);
+	r				= vmulq_f32(vrecpsq_f32(den, r), r);
+	return vmulq_f32(u, vmulq_f32(num, r));
+}
+
+static void cpu_attn_output_gate_chunk_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_attn_output_gate_job *j = ctx;
+	int						  n = j->n;
+	for (int row = begin; row < end; row++) {
+		float		*o = j->out + (size_t)row * n;
+		const float *g = j->gate + (size_t)row * n;
+		int			 i = 0;
+		for (; i + 4 <= n; i += 4)
+			vst1q_f32(o + i, sigmoid_mul_vec4(vld1q_f32(g + i), vld1q_f32(o + i)));
+		for (; i < n; i++)
+			o[i] *= sigmoidf(g[i]);
+	}
+}
+
+status_code cpu_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
+								 int n_rows) {
+	cpu_priv *p = self->priv;
+	if (n <= 0 || n_rows <= 0)
+		return OK;
+	cpu_attn_output_gate_job job = {.out = cpu_ptr(out), .gate = cpu_ptr(gate), .n = n};
+	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_attn_output_gate_chunk_neon, &job);
+	return OK;
+}
+
+void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_softcap_job *j		 = ctx;
+	const float		 inv_cap = j->inv_cap;
+	const float		 cap	 = j->cap;
+	int				 i		 = begin;
+	for (; i + 4 <= end; i += 4) {
+		float32x4_t x = vmulq_n_f32(vld1q_f32(j->x + i), inv_cap);
+		vst1q_f32(j->x + i, vmulq_n_f32(vtanhq_f32(x), cap));
+	}
+	for (; i < end; i++)
+		j->x[i] = cap * tanhf(j->x[i] * inv_cap);
+}
+
+status_code cpu_softcap(backend *self, buffer *x, float cap, int n) {
+	if (cap <= 0.0f || n <= 0)
+		return OK;
+	cpu_priv	   *p		= self->priv;
+	cpu_softcap_job job		= {.x = cpu_ptr(x), .inv_cap = 1.0f / cap, .cap = cap};
+	tpool		   *pool	= p ? p->pool : NULL;
+	int				cur_tid = tpool_current_tid();
+	if (pool && tpool_n_threads(pool) > 1 && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD)
+		tpool_parallel_for(pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_softcap_chunk, &job);
+	else
+		cpu_softcap_chunk(0, n, cur_tid, &job);
+	return OK;
+}
+
 float dot8(const float *restrict a, const float *restrict b, int head_dim) {
 	float32x4_t acc0 = vdupq_n_f32(0.0f);
 	float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -714,22 +916,9 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 			const uint16_t *vt = v_slice + ((size_t)t * kv_stride);
 			float			ss = dot8_f16(qh, kt, head_dim) * scale;
 
-			float vs;
-			float ms = 1.0f;
-			if (ss > M) {
-				float M_old = M;
-				M			= ss;
-				if (S > 0.0f) {
-					ms = fast_expf(M_old - M);
-					scale_f32_vec(VKQ, head_dim, ms);
-				}
-				vs = 1.0f;
-			} else {
-				vs = fast_expf(ss - M);
-			}
+			float vs = attn_softmax_step(ss, &M, &S, VKQ, head_dim);
 
 			accum_v_f16(VKQ, vt, vs, head_dim);
-			S = (S * ms) + vs;
 		}
 
 		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
@@ -1014,23 +1203,9 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 			const uint8_t *kt = k_slice + ((size_t)t * kv_stride);
 			float		   ss = dot8_q8_0(q, kt, head_dim) * scale;
 
-			float vs;
-			float ms = 1.0f;
-			if (ss > M) {
-				float M_old = M;
-				M			= ss;
-				if (S > 0.0f) {
-					ms = fast_expf(M_old - M);
-					scale_f32_vec(VKQ, head_dim, ms);
-				}
-				vs = 1.0f;
-			} else {
-				vs = fast_expf(ss - M);
-			}
-
 			const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
+			const float	   vs = attn_softmax_step(ss, &M, &S, VKQ, head_dim);
 			accum_v_q8_0(VKQ, vt, vs, head_dim);
-			S = (S * ms) + vs;
 		}
 
 		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
@@ -1110,20 +1285,11 @@ static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_sli
 		const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
 		for (int g = 0; g < n_group; g++) {
 			float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
-			float ms = 1.0f;
-			float vs;
-			if (ss > M[g]) {
-				float Mo = M[g];
-				M[g]	 = ss;
-				if (S[g] > 0.0f) {
-					ms = fast_expf(Mo - M[g]);
-					scale_f32_vec(VKQ[g], head_dim, ms);
-				}
-				vs = 1.0f;
-			} else
-				vs = fast_expf(ss - M[g]);
-			accum_v_q8_0(VKQ[g], vt, vs, head_dim);
-			S[g] = (S[g] * ms) + vs;
+			for (int g = 0; g < n_group; g++) {
+				float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
+				float vs = attn_softmax_step(ss, &M[g], &S[g], VKQ[g], head_dim);
+				accum_v_q8_0(VKQ[g], vt, vs, head_dim);
+			}
 		}
 	}
 	for (int g = 0; g < n_group; g++) {
@@ -1301,8 +1467,11 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 }
 
 static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job_neon *j = ctx;
-	float *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->pos_start + j->m);
+	cpu_attn_batch_job_neon *j			 = ctx;
+	int						 need_scores = j->pos_start + j->m;
+	if (j->kv_rows && (size_t)need_scores > j->kv_rows)
+		need_scores = (int)j->kv_rows;
+	float *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, need_scores);
 
 	for (int idx = begin; idx < end; idx++) {
 		int dispatch_row = idx / j->n_heads;
@@ -1319,17 +1488,7 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 			attn_start = n_pos - j->sliding_window;
 			n_pos	   = j->sliding_window;
 		}
-		if (j->kv_base) {
-			size_t b = j->kv_base;
-			if (attn_start < (int)b) {
-				n_pos -= (int)b - attn_start;
-				attn_start = 0;
-				if (n_pos < 0)
-					n_pos = 0;
-			} else {
-				attn_start -= (int)b;
-			}
-		}
+		cpu_kv_window_to_slots_base(j->kv_base, &attn_start, &n_pos);
 
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((((size_t)row * j->n_heads) + h) * j->head_dim);
@@ -1416,7 +1575,6 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buff
 								   .p			   = p,
 								   .bitrev_perm	   = bitrev_perm,
 								   .kv_quant	   = p->kv_quant,
-								   .kv_layer	   = layer,
 								   .kv_rows		   = rows,
 								   .kv_base		   = base};
 
@@ -1496,6 +1654,62 @@ status_code cpu_add_batch(backend *self, buffer *x, const buffer *y, int n, int 
 	cpu_priv		 *p	  = self->priv;
 	cpu_add_batch_job job = {.x = cpu_ptr(x), .y = cpu_ptr(y), .n = n};
 	cpu_run_batch(p->pool, m, cpu_add_batch_chunk_neon, &job);
+	return OK;
+}
+
+static void cpu_rmsnorm_add_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rmsnorm_add_batch_job *j	  = ctx;
+	const int				   n	  = j->n;
+	const float				  *w	  = j->w;
+	const float				   oscale = j->out_scale;
+	for (int row = begin; row < end; row++) {
+		const float *xr = j->x + ((size_t)row * n);
+		const float *rr = j->residual + ((size_t)row * n);
+		float		*yr = j->y + ((size_t)row * n);
+
+		float		ss		 = rmsnorm_sum_sq(xr, n);
+		float		scale	 = 1.0f / sqrtf((ss / (float)n) + j->eps);
+		float32x4_t scale_v	 = vdupq_n_f32(scale);
+		float32x4_t oscale_v = vdupq_n_f32(oscale);
+
+		int i = 0;
+		for (; i + 16 <= n; i += 16) {
+			float32x4_t t0 = vmulq_f32(vld1q_f32(xr + i), scale_v);
+			float32x4_t t1 = vmulq_f32(vld1q_f32(xr + i + 4), scale_v);
+			float32x4_t t2 = vmulq_f32(vld1q_f32(xr + i + 8), scale_v);
+			float32x4_t t3 = vmulq_f32(vld1q_f32(xr + i + 12), scale_v);
+			t0 = vmulq_f32(vfmaq_f32(vld1q_f32(rr + i), t0, vld1q_f32(w + i)), oscale_v);
+			t1 = vmulq_f32(vfmaq_f32(vld1q_f32(rr + i + 4), t1, vld1q_f32(w + i + 4)), oscale_v);
+			t2 = vmulq_f32(vfmaq_f32(vld1q_f32(rr + i + 8), t2, vld1q_f32(w + i + 8)), oscale_v);
+			t3 = vmulq_f32(vfmaq_f32(vld1q_f32(rr + i + 12), t3, vld1q_f32(w + i + 12)), oscale_v);
+			vst1q_f32(yr + i, t0);
+			vst1q_f32(yr + i + 4, t1);
+			vst1q_f32(yr + i + 8, t2);
+			vst1q_f32(yr + i + 12, t3);
+		}
+		for (; i + 4 <= n; i += 4) {
+			float32x4_t t = vmulq_f32(vld1q_f32(xr + i), scale_v);
+			vst1q_f32(yr + i,
+					  vmulq_f32(vfmaq_f32(vld1q_f32(rr + i), t, vld1q_f32(w + i)), oscale_v));
+		}
+		for (; i < n; i++)
+			yr[i] = (xr[i] * scale * w[i] + rr[i]) * oscale;
+	}
+}
+
+status_code cpu_rmsnorm_add_batch(backend *self, const buffer *x, const buffer *w,
+								  const buffer *residual, buffer *y, int n, float eps,
+								  float out_scale, int m) {
+	cpu_priv				 *p	  = self->priv;
+	cpu_rmsnorm_add_batch_job job = {.x			= cpu_ptr(x),
+									 .w			= cpu_ptr(w),
+									 .residual	= cpu_ptr(residual),
+									 .y			= cpu_ptr(y),
+									 .n			= n,
+									 .eps		= eps,
+									 .out_scale = out_scale};
+	cpu_run_batch(p->pool, m, cpu_rmsnorm_add_batch_chunk_neon, &job);
 	return OK;
 }
 

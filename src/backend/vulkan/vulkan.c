@@ -1392,7 +1392,7 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 	}
 	int flush_limit;
 	if (p->caps.is_mali || p->caps.is_power_vr || p->caps.is_adreno) {
-		flush_limit = p->batch_active ? 4096 : 1024;
+		flush_limit = 256;
 	} else {
 		flush_limit = p->batch_active ? 4096 : 256;
 	}
@@ -2333,7 +2333,7 @@ static status_code vk_init(backend *self, int device_index) {
 		if (s == OK)
 			p->p_rmsnorm_noweight_per_head_sg_batch.name = "rmsnorm_noweight_per_head_sg_batch";
 		s = vk_create_pipeline(p, shader_rmsnorm_add_batch_spv, shader_rmsnorm_add_batch_spv_len, 4,
-							   12, &p->p_rmsnorm_add_batch);
+							   16, &p->p_rmsnorm_add_batch);
 		if (s == OK)
 			p->p_rmsnorm_add_batch.name = "rmsnorm_add_batch";
 	}
@@ -2348,7 +2348,7 @@ static status_code vk_init(backend *self, int device_index) {
 						   &p->p_rope_ext_batch);
 	if (s == OK)
 		p->p_rope_ext_batch.name = "rope_ext_batch";
-	s = vk_create_pipeline(p, shader_rope_qk_batch_spv, shader_rope_qk_batch_spv_len, 4, 24,
+	s = vk_create_pipeline(p, shader_rope_qk_batch_spv, shader_rope_qk_batch_spv_len, 4, 28,
 						   &p->p_rope_qk_batch);
 	if (s == OK)
 		p->p_rope_qk_batch.name = "rope_qk_batch";
@@ -4018,6 +4018,42 @@ static status_code vk_ensure_ffn_act_buf(backend *self, int k, buffer *out) {
 
 static status_code vk_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
 									  const buffer *gate, const buffer *up, buffer *y, int n, int k,
+									  int activation);
+
+static status_code vk_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
+											const buffer *gate, const buffer *up, buffer *y, int n,
+											int k, int activation, int m) {
+	if (m <= 0)
+		return ERR_INVALID_ARG;
+	if (m == 1)
+		return vk_matmul_ffn_down(self, w, w_type, gate, up, y, n, k, activation);
+
+	if (n <= 0 || k <= 0)
+		return ERR_INVALID_ARG;
+
+	if (!vk_matmul_type_native(self, w_type)) {
+		backend_report_host_fallback(
+			self, "ffn_down", HFB_WEIGHT_TYPE,
+			"no vulkan matmul for weight type '%s'; activation + matmul executed on "
+			"host (cpu)",
+			ggml_type_name(w_type));
+		return ERR_UNSUPPORTED;
+	}
+
+	buffer		act = {0};
+	status_code s	= vk_ensure_ffn_act_buf(self, m * k, &act);
+	if (s != OK)
+		return s;
+
+	s = vk_ffn_activate_batch_scales(self, gate, up, &act, k, activation, m, 1.0f, 1.0f);
+	if (s != OK)
+		return s;
+
+	return vk_matmul_batch(self, w, w_type, &act, y, n, k, m);
+}
+
+static status_code vk_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
+									  const buffer *gate, const buffer *up, buffer *y, int n, int k,
 									  int activation) {
 	vk_priv *p = self->priv;
 
@@ -4856,32 +4892,47 @@ static status_code vk_rmsnorm_noweight(backend *self, const buffer *x, buffer *y
 	return vk_rmsnorm_noweight_batch(self, x, y, n, eps, 1);
 }
 
-static status_code vk_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
-								  const buffer *residual, buffer *y, int n, float eps) {
+static status_code vk_rmsnorm_add_batch(backend *self, const buffer *x, const buffer *w,
+										const buffer *residual, buffer *y, int n, float eps,
+										float out_scale, int m) {
 	vk_priv *p = self->priv;
 
-	if (!w->handle && w->host_ptr) {
-		status_code s = vk_rmsnorm(self, x, w, y, n, eps);
-		if (s != OK)
-			return s;
-		return vk_add_inplace(self, y, residual, n);
-	}
-
-	if (!p->p_rmsnorm_add_batch.pipeline) {
-		status_code s = vk_rmsnorm(self, x, w, y, n, eps);
-		if (s != OK)
-			return s;
-		return vk_add_inplace(self, y, residual, n);
+	if ((!w->handle && w->host_ptr) || !p->p_rmsnorm_add_batch.pipeline) {
+		for (int row = 0; row < m; row++) {
+			buffer xr = *x, rr = *residual, yr = *y;
+			xr.offset += (size_t)row * (size_t)n * sizeof(float);
+			rr.offset += (size_t)row * (size_t)n * sizeof(float);
+			yr.offset += (size_t)row * (size_t)n * sizeof(float);
+			status_code s = vk_rmsnorm(self, &xr, w, &yr, n, eps);
+			if (s != OK)
+				return s;
+			s = vk_add_inplace(self, &yr, &rr, n);
+			if (s != OK)
+				return s;
+			if (out_scale != 1.0f) {
+				s = vk_scale_inplace(self, &yr, out_scale, n);
+				if (s != OK)
+					return s;
+			}
+		}
+		return OK;
 	}
 	struct {
 		int32_t n;
 		float	eps;
 		int32_t m;
-	} push				 = {n, eps, 1};
+		float	os;
+	} push				 = {n, eps, m, out_scale};
 	vk_buf		*bufs[4] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(residual), as_vkbuf(y)};
 	VkDeviceSize offs[4] = {x->offset, w->offset, residual->offset, y->offset};
 	return vk_dispatch_2d_ex(p, &p->p_rmsnorm_add_batch, bufs, offs, NULL, 4, &push, sizeof(push),
-							 1, 1, 1u << 3);
+							 (uint32_t)1, (uint32_t)m, 1u << 3);
+}
+
+static status_code vk_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
+								  const buffer *residual, buffer *y, int n, float eps,
+								  float out_scale) {
+	return vk_rmsnorm_add_batch(self, x, w, residual, y, n, eps, out_scale, 1);
 }
 
 static status_code vk_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up,
@@ -5795,6 +5846,7 @@ static status_code vk_ctor(backend *out) {
 	out->matmul_residual				 = vk_matmul_residual;
 	out->matmul_multi					 = vk_matmul_multi;
 	out->matmul_ffn_down				 = vk_matmul_ffn_down;
+	out->matmul_ffn_down_batch			 = vk_matmul_ffn_down_batch;
 	out->rope							 = vk_rope;
 	out->rope_qk						 = vk_rope_qk;
 	out->attention						 = vk_attention;
@@ -5820,6 +5872,7 @@ static status_code vk_ctor(backend *out) {
 	out->rmsnorm_noweight				 = vk_rmsnorm_noweight;
 	out->rmsnorm_noweight_per_head		 = vk_rmsnorm_noweight_per_head;
 	out->rmsnorm_add					 = vk_rmsnorm_add;
+	out->rmsnorm_add_batch				 = vk_rmsnorm_add_batch;
 	out->ffn_activate_ex				 = vk_ffn_activate_ex;
 	out->rope_ext						 = vk_rope_ext;
 	out->attention_swa					 = vk_attention_swa;

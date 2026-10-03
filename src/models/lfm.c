@@ -50,6 +50,7 @@ static model_recipe *build_lfm2_recipe(const model *m) {
 	r->layer.ops	 = xcalloc(LFM_MAX_OPS_PER_LAYER, sizeof(recipe_op));
 	r->layer.n_ops	 = LFM_MAX_OPS_PER_LAYER;
 	r->per_layer_ops = xcalloc((size_t)m->n_layers * LFM_MAX_OPS_PER_LAYER, sizeof(recipe_op));
+	int max_ops		 = 0;
 	for (int li = 0; li < m->n_layers; li++) {
 		recipe_op *ops = r->per_layer_ops + (size_t)li * LFM_MAX_OPS_PER_LAYER;
 		op_emitter e   = op_emitter_make(ops, LFM_MAX_OPS_PER_LAYER, "lfm2");
@@ -57,6 +58,19 @@ static model_recipe *build_lfm2_recipe(const model *m) {
 			lfm_append_conv_block(&e, m, li);
 		else
 			lfm_append_attention_block(&e, m, li);
+		if (e.count > max_ops)
+			max_ops = e.count;
+	}
+	if (max_ops > 0 && max_ops < LFM_MAX_OPS_PER_LAYER) {
+		for (int li = 0; li < m->n_layers; li++) {
+			recipe_op *src = r->per_layer_ops + (size_t)li * LFM_MAX_OPS_PER_LAYER;
+			recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
+			if (dst != src)
+				memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
+		}
+		r->per_layer_ops =
+			xrealloc(r->per_layer_ops, (size_t)m->n_layers * (size_t)max_ops * sizeof(recipe_op));
+		r->layer.n_ops = max_ops;
 	}
 	recipe_build_post_ops(r, m);
 	return r;

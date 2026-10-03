@@ -861,7 +861,8 @@ MATMUL_QONLY_DISPATCH(iq3_s_re8_q8_k, q8_k_block, 256, IQ3_S_RE8_ROWS,
 
 MATMUL_Q8_F32(iq3_s_re8_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq3_s_re8_q8_k_qonly_f32)
 
-void dequant_iq3_s_re_row(const void *repacked_buf, size_t n_blocks, float *dst) {
+__attribute__((weak)) void dequant_iq3_s_re_row(const void *repacked_buf, size_t n_blocks,
+												float *dst) {
 	const uint8_t *blk = repacked_buf;
 
 	for (size_t bi = 0; bi < n_blocks; bi++) {
@@ -883,7 +884,8 @@ void dequant_iq3_s_re_row(const void *repacked_buf, size_t n_blocks, float *dst)
 	}
 }
 
-void dequant_q8_0_r8_row(const void *repacked_buf, size_t n_blocks, float *dst) {
+__attribute__((weak)) void dequant_q8_0_r8_row(const void *repacked_buf, size_t n_blocks,
+											   float *dst) {
 	const uint8_t *blk		   = repacked_buf;
 	const size_t   group_bytes = (size_t)Q8_0_R8_ROWS * sizeof(q8_0_block);
 
@@ -1535,60 +1537,101 @@ __attribute__((weak)) void dequant_bf16_row(const void *src, int n, float *dst) 
 		dst[i] = bf16_to_f32(s[i]);
 }
 
-void dequant_row_dispatch(uint32_t type, const void *src, int n_elems, float *dst) {
+static void dequant_f32_cells(const void *src, size_t n, float *dst) {
+	memcpy(dst, src, n * sizeof(float));
+}
+
+static void dequant_f16_cells(const void *src, size_t n, float *dst) {
+	dequant_f16_row(src, (int)n, dst);
+}
+
+static void dequant_bf16_cells(const void *src, size_t n, float *dst) {
+	dequant_bf16_row(src, (int)n, dst);
+}
+
+static void dequant_zero_cells(const void *src, size_t n, float *dst) {
+	(void)src;
+	memset(dst, 0, n * sizeof(float));
+}
+
+void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out) {
 	switch (type) {
 	case GGML_TYPE_F32:
-		memcpy(dst, src, (size_t)n_elems * sizeof(float));
-		break;
+		*fn_out		 = dequant_f32_cells;
+		*divisor_out = 1;
+		return;
 	case GGML_TYPE_F16:
-		dequant_f16_row(src, n_elems, dst);
-		break;
+		*fn_out		 = dequant_f16_cells;
+		*divisor_out = 1;
+		return;
 	case GGML_TYPE_BF16:
-		dequant_bf16_row(src, n_elems, dst);
-		break;
+		*fn_out		 = dequant_bf16_cells;
+		*divisor_out = 1;
+		return;
 	case GGML_TYPE_Q4_0:
-		dequant_q4_0_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q4_0_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q4_1:
-		dequant_q4_1_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q4_1_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q5_0:
-		dequant_q5_0_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q5_0_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q5_1:
-		dequant_q5_1_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q5_1_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q8_0:
-		dequant_q8_0_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q8_0_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q8_0_R8:
-		dequant_q8_0_r8_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_q8_0_r8_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_Q3_K:
-		dequant_q3_k_row(src, n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_q3_k_row;
+		*divisor_out = 256;
+		return;
 	case GGML_TYPE_Q4_K:
-		dequant_q4_k_row(src, n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_q4_k_row;
+		*divisor_out = 256;
+		return;
 	case GGML_TYPE_Q5_K:
-		dequant_q5_k_row(src, n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_q5_k_row;
+		*divisor_out = 256;
+		return;
 	case GGML_TYPE_Q6_K:
-		dequant_q6_k_row(src, n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_q6_k_row;
+		*divisor_out = 256;
+		return;
 	case GGML_TYPE_IQ4_NL:
-		dequant_iq4_nl_row(src, n_elems / 32, dst);
-		break;
+		*fn_out		 = dequant_iq4_nl_row;
+		*divisor_out = 32;
+		return;
 	case GGML_TYPE_IQ3_S:
-		dequant_iq3_s_row(src, n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_iq3_s_row;
+		*divisor_out = 256;
+		return;
 	case GGML_TYPE_IQ3_S_RE:
-		dequant_iq3_s_re_row(src, (size_t)n_elems / 256, dst);
-		break;
+		*fn_out		 = dequant_iq3_s_re_row;
+		*divisor_out = 256;
+		return;
 	default:
-		memset(dst, 0, (size_t)n_elems * sizeof(float));
-		break;
+		*fn_out		 = dequant_zero_cells;
+		*divisor_out = 1;
+		return;
 	}
+}
+
+void dequant_row_dispatch(uint32_t type, const void *src, int n_elems, float *dst) {
+	dequant_blocks_fn fn	  = NULL;
+	int				  divisor = 1;
+	dequant_row_plan(type, &fn, &divisor);
+	fn(src, (size_t)(n_elems / divisor), dst);
 }
 
 __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, const float *x,
@@ -1769,7 +1812,7 @@ __attribute__((weak)) void quantize_q8_k(const float *x, q8_k_block *y, int n) {
 	}
 }
 
-void quant_scratch_ensure(quant_scratch *qs, size_t need) {
+__attribute__((weak)) void quant_scratch_ensure(quant_scratch *qs, size_t need) {
 	if (qs->q8_buf_elems < need) {
 		free(qs->q8_buf);
 		qs->q8_buf		 = xmalloc_aligned(need, 64);
@@ -2363,7 +2406,7 @@ __attribute__((weak)) float dot_f32(const float *restrict a, const float *restri
 	return acc;
 }
 
-static inline float rmsnorm_sum_sq(const float *x, int n) {
+__attribute__((weak)) float rmsnorm_sum_sq(const float *x, int n) {
 	float ss0	 = 0;
 	float ss1	 = 0;
 	float ss2	 = 0;

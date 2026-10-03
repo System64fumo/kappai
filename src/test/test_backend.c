@@ -734,7 +734,7 @@ static void test_op_rmsnorm_add(backend *ref, backend *tgt, int n) {
 	ref->buffer_write_f32(ref, &x_ref, x, n);
 	ref->buffer_write_f32(ref, &w_ref, w, n);
 	ref->buffer_write_f32(ref, &r_ref_b, residual, n);
-	ref->rmsnorm_add(ref, &x_ref, &w_ref, &r_ref_b, &y_ref_b, n, eps);
+	ref->rmsnorm_add(ref, &x_ref, &w_ref, &r_ref_b, &y_ref_b, n, eps, 1.0f);
 	if (ref->synchronize)
 		ref->synchronize(ref);
 	float *r_ref = xmalloc((size_t)n * sizeof(float));
@@ -748,7 +748,7 @@ static void test_op_rmsnorm_add(backend *ref, backend *tgt, int n) {
 	tgt->buffer_write_f32(tgt, &x_tgt, x, n);
 	tgt->buffer_write_f32(tgt, &w_tgt, w, n);
 	tgt->buffer_write_f32(tgt, &r_tgt, residual, n);
-	status_code s_tgt = tgt->rmsnorm_add(tgt, &x_tgt, &w_tgt, &r_tgt, &y_tgt, n, eps);
+	status_code s_tgt = tgt->rmsnorm_add(tgt, &x_tgt, &w_tgt, &r_tgt, &y_tgt, n, eps, 1.0f);
 	if (tgt->synchronize)
 		tgt->synchronize(tgt);
 	float *r_got = xmalloc((size_t)n * sizeof(float));
@@ -763,7 +763,6 @@ static void test_op_rmsnorm_add(backend *ref, backend *tgt, int n) {
 	record_result(OPFAM_RMSNORM_ADD, label, v, detail);
 
 	free(x);
-	free(w);
 	free(residual);
 	free(r_ref);
 	free(r_got);
@@ -774,6 +773,158 @@ static void test_op_rmsnorm_add(backend *ref, backend *tgt, int n) {
 	tgt->buffer_free(tgt, &x_tgt);
 	tgt->buffer_free(tgt, &w_tgt);
 	tgt->buffer_free(tgt, &r_tgt);
+	tgt->buffer_free(tgt, &y_tgt);
+
+	if (tgt->rmsnorm_add_batch) {
+		const int	m		  = 3;
+		const float scales[2] = {1.0f, 0.5f};
+		for (int si = 0; si < 2; si++) {
+			float  out_scale = scales[si];
+			float *xb		 = xmalloc((size_t)m * (size_t)n * sizeof(float));
+			float *rb		 = xmalloc((size_t)m * (size_t)n * sizeof(float));
+			seed_test_rng(0xADD3ULL + (uint64_t)n + (uint64_t)si);
+			fill_random_f32(xb, m * n, 1.0f);
+			fill_random_f32(rb, m * n, 1.0f);
+
+			buffer x_br = {0}, w_br = {0}, r_br = {0}, y_br = {0};
+			ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)n * sizeof(float), &x_br);
+			ref->buffer_alloc_scratch(ref, (size_t)n * sizeof(float), &w_br);
+			ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)n * sizeof(float), &r_br);
+			ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)n * sizeof(float), &y_br);
+			ref->buffer_write_f32(ref, &x_br, xb, m * n);
+			ref->buffer_write_f32(ref, &w_br, w, n);
+			ref->buffer_write_f32(ref, &r_br, rb, m * n);
+			if (ref->rmsnorm_add_batch)
+				ref->rmsnorm_add_batch(ref, &x_br, &w_br, &r_br, &y_br, n, eps, out_scale, m);
+			else {
+				for (int row = 0; row < m; row++) {
+					buffer xr = x_br, rr = r_br, yr = y_br;
+					xr.offset += (size_t)row * (size_t)n * sizeof(float);
+					rr.offset += (size_t)row * (size_t)n * sizeof(float);
+					yr.offset += (size_t)row * (size_t)n * sizeof(float);
+					ref->rmsnorm_add(ref, &xr, &w_br, &rr, &yr, n, eps, out_scale);
+				}
+			}
+			if (ref->synchronize)
+				ref->synchronize(ref);
+			float *r_bref = xmalloc((size_t)m * (size_t)n * sizeof(float));
+			ref->buffer_read_f32(ref, &y_br, r_bref, m * n);
+
+			buffer x_bt = {0}, w_bt = {0}, r_bt = {0}, y_bt = {0};
+			tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)n * sizeof(float), &x_bt);
+			tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &w_bt);
+			tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)n * sizeof(float), &r_bt);
+			tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)n * sizeof(float), &y_bt);
+			tgt->buffer_write_f32(tgt, &x_bt, xb, m * n);
+			tgt->buffer_write_f32(tgt, &w_bt, w, n);
+			tgt->buffer_write_f32(tgt, &r_bt, rb, m * n);
+			status_code s_bt =
+				tgt->rmsnorm_add_batch(tgt, &x_bt, &w_bt, &r_bt, &y_bt, n, eps, out_scale, m);
+			if (tgt->synchronize)
+				tgt->synchronize(tgt);
+			float *r_bgot = xmalloc((size_t)m * (size_t)n * sizeof(float));
+			tgt->buffer_read_f32(tgt, &y_bt, r_bgot, m * n);
+
+			char blabel[96];
+			char bdetail[256];
+			snprintf(blabel, sizeof(blabel), "rmsnorm_add_batch N=%d M=%d os=%.1f", n, m,
+					 out_scale);
+			verdict bv =
+				classify_output("loose", r_bref, r_bgot, m * n, s_bt, bdetail, sizeof(bdetail));
+			if (bv != V_PASS && bv != V_SKIP)
+				compute_debug(r_bref, r_bgot, m * n);
+			record_result(OPFAM_RMSNORM_ADD, blabel, bv, bdetail);
+
+			free(xb);
+			free(rb);
+			free(r_bref);
+			free(r_bgot);
+			ref->buffer_free(ref, &x_br);
+			ref->buffer_free(ref, &w_br);
+			ref->buffer_free(ref, &r_br);
+			ref->buffer_free(ref, &y_br);
+			tgt->buffer_free(tgt, &x_bt);
+			tgt->buffer_free(tgt, &w_bt);
+			tgt->buffer_free(tgt, &r_bt);
+			tgt->buffer_free(tgt, &y_bt);
+		}
+	}
+	free(w);
+}
+
+static void test_op_matmul_ffn_down_batch(backend *ref, backend *tgt, int n, int k) {
+	if (!tgt->matmul_ffn_down_batch) {
+		char label[96];
+		snprintf(label, sizeof(label), "matmul_ffn_down_batch N=%d K=%d (%s)", n, k, tgt->name);
+		record_result(OPFAM_MATMUL_FFN_DOWN, label, V_SKIP,
+					  "backend has no native matmul_ffn_down_batch");
+		return;
+	}
+	const int m			 = 3;
+	const int activation = 1;
+	float	 *w			 = xmalloc((size_t)n * (size_t)k * sizeof(float));
+	float	 *g			 = xmalloc((size_t)m * (size_t)k * sizeof(float));
+	float	 *u			 = xmalloc((size_t)m * (size_t)k * sizeof(float));
+	seed_test_rng(0xD090ULL + (uint64_t)n * 131 + (uint64_t)k);
+	fill_random_f32(w, n * k, 1.0f);
+	fill_random_f32(g, m * k, 2.0f);
+	fill_random_f32(u, m * k, 2.0f);
+
+	buffer w_ref = {0}, g_ref = {0}, u_ref = {0}, y_ref = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)n * (size_t)k * sizeof(float), &w_ref);
+	ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)k * sizeof(float), &g_ref);
+	ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)k * sizeof(float), &u_ref);
+	ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)n * sizeof(float), &y_ref);
+	ref->buffer_write_f32(ref, &w_ref, w, n * k);
+	ref->buffer_write_f32(ref, &g_ref, g, m * k);
+	ref->buffer_write_f32(ref, &u_ref, u, m * k);
+	for (int row = 0; row < m; row++) {
+		buffer gr = g_ref, ur = u_ref, yr = y_ref;
+		gr.offset += (size_t)row * (size_t)k * sizeof(float);
+		ur.offset += (size_t)row * (size_t)k * sizeof(float);
+		yr.offset += (size_t)row * (size_t)n * sizeof(float);
+		ref->matmul_ffn_down(ref, &w_ref, GGML_TYPE_F32, &gr, &ur, &yr, n, k, activation);
+	}
+	if (ref->synchronize)
+		ref->synchronize(ref);
+	float *r_ref = xmalloc((size_t)m * (size_t)n * sizeof(float));
+	ref->buffer_read_f32(ref, &y_ref, r_ref, m * n);
+
+	buffer w_tgt = {0}, g_tgt = {0}, u_tgt = {0}, y_tgt = {0};
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * (size_t)k * sizeof(float), &w_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)k * sizeof(float), &g_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)k * sizeof(float), &u_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)n * sizeof(float), &y_tgt);
+	tgt->buffer_write_f32(tgt, &w_tgt, w, n * k);
+	tgt->buffer_write_f32(tgt, &g_tgt, g, m * k);
+	tgt->buffer_write_f32(tgt, &u_tgt, u, m * k);
+	status_code s_tgt = tgt->matmul_ffn_down_batch(tgt, &w_tgt, GGML_TYPE_F32, &g_tgt, &u_tgt,
+												   &y_tgt, n, k, activation, m);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *r_got = xmalloc((size_t)m * (size_t)n * sizeof(float));
+	tgt->buffer_read_f32(tgt, &y_tgt, r_got, m * n);
+
+	char label[96];
+	char detail[256];
+	snprintf(label, sizeof(label), "matmul_ffn_down_batch N=%d K=%d M=%d", n, k, m);
+	verdict v = classify_output("loose", r_ref, r_got, m * n, s_tgt, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(r_ref, r_got, m * n);
+	record_result(OPFAM_MATMUL_FFN_DOWN, label, v, detail);
+
+	free(w);
+	free(g);
+	free(u);
+	free(r_ref);
+	free(r_got);
+	ref->buffer_free(ref, &w_ref);
+	ref->buffer_free(ref, &g_ref);
+	ref->buffer_free(ref, &u_ref);
+	ref->buffer_free(ref, &y_ref);
+	tgt->buffer_free(tgt, &w_tgt);
+	tgt->buffer_free(tgt, &g_tgt);
+	tgt->buffer_free(tgt, &u_tgt);
 	tgt->buffer_free(tgt, &y_tgt);
 }
 
@@ -3421,6 +3572,9 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rmsnorm_add(ref, tgt, 256);
 	test_op_rmsnorm_add(ref, tgt, 4096);
 	flush_family(OPFAM_RMSNORM_ADD);
+
+	test_op_matmul_ffn_down_batch(ref, tgt, 128, 64);
+	flush_family(OPFAM_MATMUL_FFN_DOWN);
 
 	test_op_ffn_activate(ref, tgt, 256);
 	test_op_ffn_activate(ref, tgt, 4096);

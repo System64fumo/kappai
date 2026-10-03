@@ -56,6 +56,7 @@ static model_recipe *build_qwen35_recipe(const model *m) {
 	r->layer.ops	 = xcalloc(QWEN35_MAX_OPS_PER_LAYER, sizeof(recipe_op));
 	r->layer.n_ops	 = QWEN35_MAX_OPS_PER_LAYER;
 	r->per_layer_ops = xcalloc((size_t)m->n_layers * QWEN35_MAX_OPS_PER_LAYER, sizeof(recipe_op));
+	int max_ops		 = 0;
 	for (int li = 0; li < m->n_layers; li++) {
 		recipe_op *ops = r->per_layer_ops + (size_t)li * QWEN35_MAX_OPS_PER_LAYER;
 		op_emitter e   = op_emitter_make(ops, QWEN35_MAX_OPS_PER_LAYER, "qwen35");
@@ -63,6 +64,19 @@ static model_recipe *build_qwen35_recipe(const model *m) {
 			qwen_append_recurrent(&e, m, li);
 		else
 			qwen_append_full_attention(&e, m, li);
+		if (e.count > max_ops)
+			max_ops = e.count;
+	}
+	if (max_ops > 0 && max_ops < QWEN35_MAX_OPS_PER_LAYER) {
+		for (int li = 0; li < m->n_layers; li++) {
+			recipe_op *src = r->per_layer_ops + (size_t)li * QWEN35_MAX_OPS_PER_LAYER;
+			recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
+			if (dst != src)
+				memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
+		}
+		r->per_layer_ops =
+			xrealloc(r->per_layer_ops, (size_t)m->n_layers * (size_t)max_ops * sizeof(recipe_op));
+		r->layer.n_ops = max_ops;
 	}
 	recipe_build_post_ops(r, m);
 	return r;

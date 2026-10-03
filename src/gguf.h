@@ -70,6 +70,7 @@ typedef struct {
 	uint32_t	type;
 	uint64_t	offset;
 	const void *data;
+	size_t		byte_size;
 } gguf_tensor;
 
 typedef struct {

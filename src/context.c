@@ -16,6 +16,7 @@
 #define MONITOR_POLL_INTERVAL_US 50000ull
 
 static void sync_invalidate_cb(void *ud);
+static void sync_set(context *c, const char *render, size_t len, int32_t tok);
 
 typedef struct {
 	progress		 *prog;
@@ -312,6 +313,7 @@ void context_reset(context *c) {
 	c->samp.recent_count = 0;
 	c->samp.recent_head	 = 0;
 	chat_template_clear_messages(&c->chat);
+	sync_set(c, NULL, 0, 0);
 	c->fed_ids.n		 = 0;
 	c->warmup_done		 = false;
 	c->interrupt		 = 0;
@@ -365,17 +367,20 @@ static bool tail_boundary_is_clean(context *c, const char *suffix, const int32_t
 	last_text[lt] = '\0';
 
 	size_t n_last = strlen(last_text), n_suf = strlen(suffix);
-	char  *joined = xmalloc(n_last + n_suf + 1);
+	size_t joined_len = n_last + n_suf + 1;
+	size_t probe_off  = (joined_len + _Alignof(int32_t) - 1) & ~(_Alignof(int32_t) - 1);
+	size_t probe_len  = (size_t)(n_suffix + 8) * sizeof(int32_t);
+	char  *block	  = xmalloc(probe_off + probe_len);
+	char  *joined	  = block;
 	memcpy(joined, last_text, n_last);
 	memcpy(joined + n_last, suffix, n_suf);
 	joined[n_last + n_suf] = '\0';
 
-	int32_t *probe = xmalloc((size_t)(n_suffix + 8) * sizeof(int32_t));
+	int32_t *probe = (int32_t *)(block + probe_off);
 	int	 n_probe   = tokenizer_encode_with_specials(&c->tok, joined, 0, probe, n_suffix + 8, NULL);
 	bool ok		   = n_probe == n_suffix + 1 && probe[0] == last_id &&
 					 memcmp(probe + 1, suffix_ids, (size_t)n_suffix * sizeof(int32_t)) == 0;
-	free(probe);
-	free(joined);
+	free(block);
 	return ok;
 }
 
@@ -425,9 +430,6 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 	int			pos = c->kv.n_pos;
-	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
-	if (st != OK)
-		return ERR_COMPUTE_FAIL;
 	status_code cst =
 		compute_forward(&c->m, &c->kv, &c->scratch, token, pos, c->flash_attn, logits_out);
 	if (cst == ERR_INTERRUPTED)
@@ -468,13 +470,6 @@ static size_t context_slot_bytes_per_token(const context *c) {
 }
 
 static int context_prefill_chunk_size(const context *c, int n_threads) {
-	const char *env = getenv("KAPPAI_PREFILL_CHUNK");
-	if (env && *env) {
-		char *end = NULL;
-		long  v	  = strtol(env, &end, 10);
-		if (end != env && *end == '\0' && v >= 4 && v <= 4096)
-			return (int)v;
-	}
 	if (n_threads < 1)
 		n_threads = 1;
 	size_t ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
@@ -519,10 +514,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 
-	int			pos = c->kv.n_pos;
-	status_code st	= compute_scratch_ensure(&c->scratch, &c->m, c->n_ctx);
-	if (st != OK)
-		return ERR_COMPUTE_FAIL;
+	int pos = c->kv.n_pos;
 
 	int n_threads = 1;
 	if (c->backend && c->backend->get_pool) {
@@ -696,10 +688,12 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
 			break;
-		uint64_t now_us = time_us();
-		if (now_us - last_poll_us >= MONITOR_POLL_INTERVAL_US) {
-			monitor_poll(&c->monitor);
-			last_poll_us = now_us;
+		if (monitor_active(&c->monitor)) {
+			uint64_t now_us = time_us();
+			if (now_us - last_poll_us >= MONITOR_POLL_INTERVAL_US) {
+				monitor_poll(&c->monitor);
+				last_poll_us = now_us;
+			}
 		}
 		monitor_setup_cb(c, &cb, "decode", i, i + 1);
 
@@ -911,8 +905,11 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 		ERROR("prompt too long (pos=%d, ctx=%d)", c->kv.n_pos, c->n_ctx);
 		return ERR_INVALID_ARG;
 	}
-	if (prof_was_on)
+	if (prof_was_on) {
+		profile_set_wall(&c->scratch.prof, pf.us);
 		profile_print(&c->scratch.prof, "prefill", stderr);
+		profile_reset(&c->scratch.prof);
+	}
 
 	sampler_set_params(&c->samp, samp->temperature, samp->top_k, samp->top_p, samp->min_p,
 					   samp->repeat_penalty, samp->repeat_last_n);
@@ -931,8 +928,10 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 		fputc('\n', stderr);
 	if (show_pp_tg && metrics_spec && metrics_spec[0])
 		print_metrics(metrics_spec, pf.tps, decode_tps, ttft_us > 0 ? ttft_ms : -1);
-	if (prof_was_on)
+	if (prof_was_on) {
+		profile_set_wall(&c->scratch.prof, decode_us);
 		profile_print(&c->scratch.prof, "decode", stderr);
+	}
 
 	send_generation_end(c, generated, pf.tps, decode_tps, ttft_ms);
 	return generated;
@@ -985,9 +984,11 @@ static void rollback_unfed_turn(context *c, size_t n_messages, char *prev_render
 		free(m->name);
 		memset(m, 0, sizeof(*m));
 	}
-	free(c->chat.last_render);
-	c->chat.last_render = prev_render;
-	c->chat.think_open	= prev_think_open;
+	if (prev_render) {
+		free(c->chat.last_render);
+		c->chat.last_render = prev_render;
+	}
+	c->chat.think_open = prev_think_open;
 }
 
 int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generation_prompt,
@@ -1004,12 +1005,12 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	char	 errbuf[512];
 	char	*turn_str;
 
-	char  *prev_render	   = xstrdup(c->chat.last_render);
+	char  *prev_render	   = NULL;
 	size_t prev_n_messages = c->chat.n_messages;
 	bool   prev_think_open = c->chat.think_open;
 
-	if (chat_template_add_turn_ex(&c->chat, msg, add_generation_prompt, &turn_str, errbuf,
-								  sizeof(errbuf)) != OK) {
+	if (chat_template_add_turn_ex_steal(&c->chat, msg, add_generation_prompt, &turn_str,
+										&prev_render, errbuf, sizeof(errbuf)) != OK) {
 		ERROR("chat template render failed: %s", errbuf);
 		rollback_unfed_turn(c, prev_n_messages, prev_render, prev_think_open);
 		return ERR_FORMAT;
@@ -1038,7 +1039,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	acap.on_token			  = on_token;
 	acap.ud					  = ud;
 	if (max_tokens > 0) {
-		acap.cap = (size_t)max_tokens * 32;
+		acap.cap = 1024;
 		acap.buf = xmalloc(acap.cap);
 	}
 

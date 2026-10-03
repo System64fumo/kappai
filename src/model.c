@@ -586,6 +586,37 @@ int model_should_repack(uint32_t type, const char *repack_config) {
 	return 0;
 }
 
+void model_repack_table_build(model *m) {
+	memset(m->repack_table, 0, sizeof(m->repack_table));
+	const char *cfg = m->repack_config;
+	if (!cfg || strcmp(cfg, "all") == 0) {
+		for (uint32_t t = 0; t < MODEL_REPACK_TABLE_SIZE; t++)
+			m->repack_table[t] = model_should_repack(t, cfg) ? 1 : 0;
+	} else if (strcmp(cfg, "none") == 0) {
+	} else {
+		const char *p = cfg;
+		while (*p) {
+			while (*p == ' ' || *p == '\t')
+				p++;
+			const char *comma = strchr(p, ',');
+			size_t		len	  = comma ? (size_t)(comma - p) : strlen(p);
+			while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t'))
+				len--;
+			if (len > 0) {
+				for (uint32_t t = 0; t < MODEL_REPACK_TABLE_SIZE; t++) {
+					const char *name = ggml_type_name(t);
+					if (name && strlen(name) == len && strncmp(p, name, len) == 0)
+						m->repack_table[t] = 1;
+				}
+			}
+			if (!comma)
+				break;
+			p = comma + 1;
+		}
+	}
+	m->repack_table_valid = true;
+}
+
 static status_code repack_weight(backend *home, const void *src, void *dst, uint32_t type,
 								 int n_rows, int k) {
 	if (!home || !home->repack_weight)
@@ -621,7 +652,7 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 	int home_is_cpu = backend_has_cap(home, BCAP_IS_HOST);
 
 	int do_repack = home_is_cpu && n_dims == 2 && wc == WCLASS_MATMUL && d0 > 0 && d1 > 0 &&
-					model_should_repack(type, m->repack_config);
+					model_should_repack_cached(m, type);
 
 	uint32_t re_type = 0;
 	if (do_repack && home->repack_plan)
@@ -776,7 +807,7 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 	if (home->repack_plan)
 		home->repack_plan(home, type, dim, intermediate, &re_type);
 
-	if (!re_type || !model_should_repack(type, m->repack_config))
+	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
@@ -842,7 +873,7 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 	if (home->repack_plan)
 		home->repack_plan(home, type, dim, total_rows, &re_type);
 
-	if (!re_type || !model_should_repack(type, m->repack_config))
+	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
@@ -1148,30 +1179,10 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	}
 	if (m->has_per_layer_embeddings) {
 		UPLOAD(&L->ple_post_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
-		int gate_owned = 0;
-		if (L->ple_inp_gate_w.type != GGML_TYPE_F32) {
-			gate_owned = dequant_ref_to_f32(m, &L->ple_inp_gate_w,
-											(size_t)m->layer_dims.n_embd_per_layer, (size_t)m->dim);
-		}
 		UPLOAD(&L->ple_inp_gate_w, L->ple_inp_gate_w.type, 2, m->dim,
 			   m->layer_dims.n_embd_per_layer, WCLASS_MATMUL);
-		if (gate_owned) {
-			if (L->ple_inp_gate_w.buf.host_ptr != L->ple_inp_gate_w.host_ptr)
-				free((void *)L->ple_inp_gate_w.host_ptr);
-			L->ple_inp_gate_w.buf.host_ptr = NULL;
-		}
-		int proj_owned = 0;
-		if (L->ple_proj_w.type != GGML_TYPE_F32) {
-			proj_owned = dequant_ref_to_f32(m, &L->ple_proj_w, (size_t)m->dim,
-											(size_t)m->layer_dims.n_embd_per_layer);
-		}
 		UPLOAD(&L->ple_proj_w, L->ple_proj_w.type, 2, m->layer_dims.n_embd_per_layer, m->dim,
 			   WCLASS_MATMUL);
-		if (proj_owned) {
-			if (L->ple_proj_w.buf.host_ptr != L->ple_proj_w.host_ptr)
-				free((void *)L->ple_proj_w.host_ptr);
-			L->ple_proj_w.buf.host_ptr = NULL;
-		}
 	}
 	if (m->arch_info->has_layer_output_scale) {
 		UPLOAD(&L->layer_out_scale_w, GGML_TYPE_F32, 1, 1, 0, WCLASS_MISC);
@@ -1826,7 +1837,8 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 	m->use_mmap		 = use_mmap;
 	m->model_path	 = xstrdup(path);
 	m->repack_config = repack_config ? xstrdup(repack_config) : NULL;
-	status_code s	 = use_mmap ? gguf_load(&m->gctx, path) : gguf_load_metadata(&m->gctx, path);
+	model_repack_table_build(m);
+	status_code s = use_mmap ? gguf_load(&m->gctx, path) : gguf_load_metadata(&m->gctx, path);
 	if (s != OK) {
 		free(m->model_path);
 		free((char *)m->repack_config);
@@ -2807,6 +2819,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	int report_n_ctx = requested_n_ctx;
 	if (report_n_ctx <= 0 || report_n_ctx > m->n_ctx)
 		report_n_ctx = m->n_ctx;
+	model_mem_estimates_ensure(m);
 	recommend_memory_config(m, bk->kv_alloc ? bk : backend_host(), report_n_ctx, avail_before_load,
 							(kv_quant_type)config_get()->kv_quant, is_host_backend);
 

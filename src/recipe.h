@@ -64,7 +64,6 @@ typedef enum {
 
 	OP_KV_PUT,
 	OP_ATTENTION,
-	OP_ATTENTION_SWA,
 
 	OP_ADD,
 	OP_SWAP,
@@ -159,6 +158,7 @@ typedef union {
 	struct {
 		float eps;
 		int	  n_heads;
+		float out_scale;
 	} rmsnorm;
 	struct {
 		int n;
@@ -272,6 +272,10 @@ typedef struct model_recipe {
 	int max_kv_heads;
 
 	uint32_t bs_slot_mask;
+
+	int has_sliding_layers;
+	int ple_build_dev_ok;
+	int ple_build_dev_ok_batch;
 } model_recipe;
 
 typedef struct {

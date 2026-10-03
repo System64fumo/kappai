@@ -228,8 +228,9 @@ static int byte_token_value(const vocab_token *tok) {
 	return (hi << 4) | lo;
 }
 
-static void hash_insert(tok_hash_entry *ht, size_t cap, const char *key, size_t klen, int32_t id) {
-	uint64_t h = fnv1a(key, klen) & (cap - 1);
+static void hash_insert_h(tok_hash_entry *ht, size_t cap, uint64_t hash, const char *key,
+						  size_t klen, int32_t id) {
+	uint64_t h = hash & (cap - 1);
 	while (ht[h].key) {
 		if (ht[h].key_len == klen && memcmp(ht[h].key, key, klen) == 0) {
 			return;
@@ -239,6 +240,39 @@ static void hash_insert(tok_hash_entry *ht, size_t cap, const char *key, size_t 
 	ht[h].key	  = key;
 	ht[h].key_len = (uint32_t)klen;
 	ht[h].id	  = id;
+}
+
+static void hash_insert(tok_hash_entry *ht, size_t cap, const char *key, size_t klen, int32_t id) {
+	hash_insert_h(ht, cap, fnv1a(key, klen), key, klen, id);
+}
+
+static void merge_hash_insert(tok_hash_entry *ht, size_t cap, const char *entry, size_t left_len,
+							  int32_t id) {
+	uint64_t h =
+		fnv1a_update(fnv1a(entry, left_len), entry + left_len + 1, strlen(entry + left_len + 1)) &
+		(cap - 1);
+	while (ht[h].key) {
+		if (ht[h].key_len == left_len && memcmp(ht[h].key, entry, left_len) == 0 &&
+			ht[h].key[ht[h].key_len] == ' ' &&
+			strcmp(ht[h].key + ht[h].key_len + 1, entry + left_len + 1) == 0)
+			return;
+		h = (h + 1) & (cap - 1);
+	}
+	ht[h].key	  = entry;
+	ht[h].key_len = (uint32_t)left_len;
+	ht[h].id	  = id;
+}
+
+static int32_t merge_hash_lookup_h(const tok_hash_entry *ht, size_t cap, uint64_t h, const char *a,
+								   size_t an, const char *b, size_t bn) {
+	h &= (cap - 1);
+	while (ht[h].key) {
+		if (ht[h].key_len == an && memcmp(ht[h].key, a, an) == 0 && ht[h].key[an] == ' ' &&
+			memcmp(ht[h].key + an + 1, b, bn) == 0)
+			return ht[h].id;
+		h = (h + 1) & (cap - 1);
+	}
+	return -1;
 }
 
 static int32_t hash_lookup_h(const tok_hash_entry *ht, size_t cap, uint64_t h, const char *key,
@@ -544,8 +578,8 @@ static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 		return -1;
 	uint64_t h = fnv1a_update(a->h, b->p, b->n);
 	if (t->has_merges)
-		return hash_lookup_pair_h((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, h,
-								  a->p, a->n, b->p, b->n);
+		return merge_hash_lookup_h((const tok_hash_entry *)t->merge_hash, t->merge_hash_capacity, h,
+								   a->p, a->n, b->p, b->n);
 	return hash_lookup_pair_h(t->hash, t->hash_capacity, h, a->p, a->n, b->p, b->n);
 }
 
@@ -1018,42 +1052,6 @@ static int32_t find_next_special(const tokenizer *t, const char *text, size_t le
 	return -1;
 }
 
-static size_t decoded_token_len(const tokenizer *t, int32_t id) {
-	const vocab_token *tok = &t->tokens[id];
-	if (tok->type == TOK_TYPE_BYTE) {
-		int bv = t->token_id_to_byte[id];
-		if (bv >= 0)
-			return 1;
-	}
-	const char *src = tok->text;
-	size_t		n	= tok->text_len;
-	size_t		k	= 0;
-	size_t		out = 0;
-	if (t->is_sentencepiece) {
-		while (k < n) {
-			if (k + 2 < n && (unsigned char)src[k] == 0xE2 && (unsigned char)src[k + 1] == 0x96 &&
-				(unsigned char)src[k + 2] == 0x81) {
-				out++;
-				k += 3;
-			} else {
-				out++;
-				k++;
-			}
-		}
-		return out;
-	}
-	while (k < n) {
-		int cp;
-		int kl = utf8_to_cp(src + k, (int)(n - k), &cp);
-		if (kl <= 0)
-			break;
-		int b = (cp < 512) ? g_cp_to_byte[cp] : -1;
-		out += (b >= 0) ? 1 : (size_t)kl;
-		k += (size_t)kl;
-	}
-	return out;
-}
-
 static size_t decode_token_text_into(const tokenizer *t, int32_t id, char *out) {
 	const vocab_token *tok = &t->tokens[id];
 	if (tok->type == TOK_TYPE_BYTE) {
@@ -1100,7 +1098,6 @@ static bool g_warned_no_merges;
 
 status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	memset(t, 0, sizeof(*t));
-	str_arena_init(&t->merge_pool);
 	str_arena_init(&t->chunk_cache_pool);
 	t->chunk_cache_cap = TOK_CHUNK_CACHE_SLOTS;
 	t->chunk_cache	   = xcalloc(t->chunk_cache_cap, sizeof(tok_cache_entry));
@@ -1121,10 +1118,6 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		return ERR_FORMAT;
 	}
 
-	const float *scores	  = NULL;
-	size_t		 n_scores = 0;
-	gguf_get_arr_f32(g, "tokenizer.ggml.scores", &scores, &n_scores);
-
 	const int32_t *types;
 	size_t		   n_types;
 	if (gguf_get_arr_i32(g, "tokenizer.ggml.token_type", &types, &n_types) != OK) {
@@ -1136,15 +1129,11 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 		ERROR("tokenizer: vocab array size mismatch");
 		return ERR_FORMAT;
 	}
-	(void)n_scores;
-
 	t->n_tokens = n_toks;
 	t->tokens	= xcalloc(n_toks, sizeof(vocab_token));
 	for (size_t i = 0; i < n_toks; i++) {
-		t->tokens[i].id		  = (int32_t)i;
 		t->tokens[i].text	  = toks[i];
 		t->tokens[i].text_len = strlen(toks[i]);
-		t->tokens[i].score	  = scores ? scores[i] : (float)i;
 		t->tokens[i].type	  = types[i];
 	}
 
@@ -1188,27 +1177,6 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 			(t->tokens[i].type == TOK_TYPE_BYTE) ? (int16_t)byte_token_value(&t->tokens[i]) : -1;
 
 	t->token_decoded_len = xmalloc(n_toks * sizeof(int32_t));
-	t->token_char_count	 = xmalloc(n_toks * sizeof(int32_t));
-	for (size_t i = 0; i < n_toks; i++) {
-		const vocab_token *tok = &t->tokens[i];
-		if (tok->type == TOK_TYPE_BYTE && t->token_id_to_byte[i] >= 0) {
-			t->token_char_count[i] = 1;
-			continue;
-		}
-		int32_t chars = 0;
-		size_t	k	  = 0;
-		while (k < tok->text_len) {
-			int cp;
-			int kl = utf8_to_cp(tok->text + k, (int)(tok->text_len - k), &cp);
-			if (kl <= 0)
-				break;
-			chars++;
-			k += (size_t)kl;
-		}
-		t->token_char_count[i] = chars;
-	}
-	for (size_t i = 0; i < n_toks; i++)
-		t->token_decoded_len[i] = 0;
 
 	const char *const *merges	= NULL;
 	size_t			   n_merges = 0;
@@ -1218,20 +1186,9 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 			mcap <<= 1;
 		t->merge_hash_capacity = mcap;
 		t->merge_hash		   = xcalloc(mcap, sizeof(tok_hash_entry));
-		t->merge_keys		   = (char **)xcalloc(n_merges, sizeof(char *));
 		t->merge_token_ids	   = xmalloc(n_merges * sizeof(int32_t));
-		t->n_merge_keys		   = 0;
 		for (size_t i = 0; i < n_merges; i++)
 			t->merge_token_ids[i] = -1;
-		size_t pool_need = 0;
-		for (size_t i = 0; i < n_merges; i++) {
-			const char *sp = strchr(merges[i], ' ');
-			if (!sp)
-				continue;
-			pool_need += (size_t)(sp - merges[i]) + strlen(sp + 1) + 1;
-		}
-		if (pool_need > 0)
-			str_arena_reserve(&t->merge_pool, pool_need);
 		for (size_t i = 0; i < n_merges; i++) {
 			const char *entry = merges[i];
 			const char *sp	  = strchr(entry, ' ');
@@ -1239,15 +1196,11 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 				continue;
 			size_t left_len	 = (size_t)(sp - entry);
 			size_t right_len = strlen(sp + 1);
-			size_t klen		 = left_len + right_len;
-			char  *key		 = str_arena_alloc(&t->merge_pool, klen + 1);
-			memcpy(key, entry, left_len);
-			memcpy(key + left_len, sp + 1, right_len);
-			key[klen]						 = '\0';
-			t->merge_keys[t->n_merge_keys++] = key;
-			hash_insert((tok_hash_entry *)t->merge_hash, mcap, key, klen, (int32_t)i);
+			merge_hash_insert((tok_hash_entry *)t->merge_hash, mcap, entry, left_len, (int32_t)i);
 			t->merge_token_ids[i] =
-				hash_lookup((const tok_hash_entry *)t->hash, t->hash_capacity, key, klen);
+				hash_lookup_pair_h((const tok_hash_entry *)t->hash, t->hash_capacity,
+								   fnv1a_update(fnv1a(entry, left_len), sp + 1, right_len), entry,
+								   left_len, sp + 1, right_len);
 		}
 		t->has_merges = 1;
 		DEBUG("tokenizer: loaded %zu BPE merge rules", n_merges);
@@ -1320,18 +1273,23 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	}
 
 	{
-		size_t total = 0;
-		for (size_t i = 0; i < n_toks; i++)
-			total += decoded_token_len(t, (int32_t)i);
-		t->decoded_pool = xmalloc(total ? total : 1);
-		t->decoded_off	= xmalloc(n_toks * sizeof(int32_t));
-		size_t off		= 0;
+		size_t cap = 0, off = 0;
+		char  *pool	   = NULL;
+		t->decoded_off = xmalloc(n_toks * sizeof(int32_t));
 		for (size_t i = 0; i < n_toks; i++) {
 			t->decoded_off[i] = (int32_t)off;
-			size_t dlen		  = decode_token_text_into(t, (int32_t)i, t->decoded_pool + off);
-			off += dlen;
+			size_t bound	  = t->tokens[i].text_len + 1;
+			if (!pool || off + bound > cap) {
+				do {
+					cap = cap ? cap * 2 : 1024;
+				} while (cap < off + bound);
+				pool = xrealloc(pool, cap);
+			}
+			size_t dlen				= decode_token_text_into(t, (int32_t)i, pool + off);
 			t->token_decoded_len[i] = (int32_t)dlen;
+			off += dlen;
 		}
+		t->decoded_pool = pool ? xrealloc(pool, off ? off : 1) : xmalloc(1);
 	}
 
 	t->add_space_prefix = 0;
@@ -1425,16 +1383,13 @@ void tokenizer_free(tokenizer *t) {
 	free(t->tokens);
 	free(t->token_id_to_byte);
 	free(t->token_decoded_len);
-	free(t->token_char_count);
 	free(t->decoded_off);
 	free(t->decoded_pool);
 	free((void *)t->hash);
 	free((void *)t->merge_hash);
 	free(t->merge_token_ids);
-	str_arena_free(&t->merge_pool);
 	str_arena_free(&t->chunk_cache_pool);
 	free(t->chunk_cache);
-	free((void *)t->merge_keys);
 	free(t->special_ids);
 	free(t->special_by_first_byte);
 	free(t->bpe_pcs_cache);
@@ -1471,7 +1426,23 @@ int tokenizer_token_count_for_bytes(const tokenizer *t, const int32_t *ids, int 
 			break;
 		if (out >= max_bytes)
 			break;
-		size_t c	   = (size_t)t->token_char_count[id];
+		size_t c;
+		if (t->tokens[id].type == TOK_TYPE_BYTE && t->token_id_to_byte[id] >= 0) {
+			c = 1;
+		} else {
+			c					 = 0;
+			size_t		k		 = 0;
+			size_t		text_len = t->tokens[id].text_len;
+			const char *text	 = t->tokens[id].text;
+			while (k < text_len) {
+				int cp;
+				int kl = utf8_to_cp(text + k, (int)(text_len - k), &cp);
+				if (kl <= 0)
+					break;
+				c++;
+				k += (size_t)kl;
+			}
+		}
 		size_t can_add = max_bytes - out;
 		size_t add	   = c < can_add ? c : can_add;
 		out += add;

@@ -270,6 +270,7 @@ static void log_op_homes(backend *b) {
 		{"ffn_activate_ex", b->ffn_activate_ex != NULL},
 		{"argmax", b->argmax != NULL},
 		{"rmsnorm_add", b->rmsnorm_add != NULL},
+		{"rmsnorm_add_batch", b->rmsnorm_add_batch != NULL},
 		{"matmul_residual", b->matmul_residual != NULL},
 		{"matmul_multi", b->matmul_multi != NULL},
 		{"kv_put_batch", b->kv_put_batch != NULL},
@@ -279,6 +280,7 @@ static void log_op_homes(backend *b) {
 		{"attention_batch", b->attention_batch != NULL},
 		{"attention_swa_batch", b->attention_swa_batch != NULL},
 		{"ffn_activate_batch", b->ffn_activate_batch != NULL},
+		{"matmul_ffn_down_batch", b->matmul_ffn_down_batch != NULL},
 		{"matmul_multi_batch", b->matmul_multi_batch != NULL},
 		{"moe_activate", b->moe_activate != NULL},
 		{"moe_experts_batch", b->moe_experts_batch != NULL},
@@ -626,12 +628,13 @@ void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {
 	if (!a || !a->buffer_alloc_scratch)
 		return ERR_UNSUPPORTED;
-	if (b->owner == a && b->size >= bytes)
+	size_t need = bytes > 0 ? ((bytes + (size_t)65535) & ~((size_t)65535)) : 0;
+	if (b->owner == a && b->size >= need)
 		return OK;
 	if (b->owner)
 		b->owner->buffer_free(b->owner, b);
 	memset(b, 0, sizeof(*b));
-	return a->buffer_alloc_scratch(a, bytes, b);
+	return a->buffer_alloc_scratch(a, need, b);
 }
 
 size_t backend_mem_available(const backend *b) {

@@ -196,7 +196,11 @@ struct backend {
 	status_code (*rmsnorm_noweight_per_head)(backend *self, const buffer *x, buffer *y, int n_heads,
 											 int head_dim, float eps);
 	status_code (*rmsnorm_add)(backend *self, const buffer *x, const buffer *w,
-							   const buffer *residual, buffer *y, int n, float eps);
+							   const buffer *residual, buffer *y, int n, float eps,
+							   float out_scale);
+	status_code (*rmsnorm_add_batch)(backend *self, const buffer *x, const buffer *w,
+									 const buffer *residual, buffer *y, int n, float eps,
+									 float out_scale, int m);
 	status_code (*rmsnorm_per_head_batch)(backend *self, const buffer *x, const buffer *w,
 										  buffer *y, int n_heads, int head_dim, float eps, int m);
 	status_code (*rmsnorm_noweight_batch)(backend *self, const buffer *x, buffer *y, int n,
@@ -206,6 +210,9 @@ struct backend {
 	status_code (*matmul_ffn_down)(backend *self, const buffer *w, uint32_t w_type,
 								   const buffer *gate, const buffer *up, buffer *y, int n, int k,
 								   int activation);
+	status_code (*matmul_ffn_down_batch)(backend *self, const buffer *w, uint32_t w_type,
+										 const buffer *gate, const buffer *up, buffer *y, int n,
+										 int k, int activation, int m);
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);

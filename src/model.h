@@ -10,11 +10,11 @@ struct model_recipe;
 typedef struct model_recipe model_recipe;
 
 typedef struct weight_ref {
-	const void *host_ptr;
+	buffer		buf;
 	uint32_t	type;
+	const void *host_ptr;
 	int			dequant_native;
 	uint64_t	dequant_rows, dequant_cols;
-	buffer		buf;
 } weight_ref;
 
 struct expert_desc {
@@ -204,6 +204,14 @@ typedef struct model {
 	bool use_mmap;
 	bool batchable;
 	bool mixed_backend_mode;
+
+	size_t mem_non_expert_bytes;
+	size_t mem_per_expert_bytes;
+	bool   mem_estimates_valid;
+
+#define MODEL_REPACK_TABLE_SIZE 128
+	uint8_t repack_table[MODEL_REPACK_TABLE_SIZE];
+	bool	repack_table_valid;
 } model;
 
 status_code model_load(model *m, const char *path);
@@ -216,7 +224,14 @@ status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);
 void		model_free(model *m);
 
-int model_should_repack(uint32_t type, const char *repack_config);
+int	 model_should_repack(uint32_t type, const char *repack_config);
+void model_repack_table_build(model *m);
+
+static inline int model_should_repack_cached(const model *m, uint32_t type) {
+	if (m->repack_table_valid && type < MODEL_REPACK_TABLE_SIZE)
+		return m->repack_table[type];
+	return model_should_repack(type, m->repack_config);
+}
 
 static inline backend *model_layer_backend(const model *m, int li) {
 	if (!m || !m->layer_backends || li < 0 || li >= m->n_layer_backends)

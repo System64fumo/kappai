@@ -112,12 +112,28 @@ jinja_value *jinja_bool(int b) {
 }
 
 jinja_value *jinja_int(int64_t n) {
-	jinja_value *v		= xmalloc(sizeof(*v));
-	v->type				= JV_INT;
-	v->as.integer.value = n;
-	snprintf(v->as.integer.text, sizeof(v->as.integer.text), "%" PRId64, n);
+	jinja_value *v			 = xmalloc(sizeof(*v));
+	v->type					 = JV_INT;
+	v->as.integer.value		 = n;
+	v->as.integer.text_ready = false;
 	arena_track(v);
 	return v;
+}
+
+static const char *jinja_int_text(const jinja_value *v) {
+	jinja_value *m = (jinja_value *)v;
+	if (!m->as.integer.text_ready) {
+		snprintf(m->as.integer.text, sizeof(m->as.integer.text), "%" PRId64, m->as.integer.value);
+		m->as.integer.text_ready = true;
+	}
+	return m->as.integer.text;
+}
+
+static jinja_dict_entry *jinja_dict_find(jinja_value *d, const char *key) {
+	for (jinja_dict_entry *e = d ? d->as.dict : NULL; e; e = e->next)
+		if (!strcmp(e->key, key))
+			return e;
+	return NULL;
 }
 
 jinja_value *jinja_float(double n) {
@@ -272,7 +288,7 @@ static const char *value_as_cstr(const jinja_value *v) {
 	if (v->type == JV_STRING)
 		return v->as.s;
 	if (v->type == JV_INT)
-		return v->as.integer.text;
+		return jinja_int_text(v);
 	if (v->type == JV_FLOAT)
 		return v->as.floating.text;
 	if (v->type == JV_NONE)
@@ -1833,7 +1849,7 @@ static void json_to_json(str_builder *sb, const jinja_value *v) {
 		sb_puts(sb, v->as.b ? "true" : "false");
 		break;
 	case JV_INT:
-		sb_puts(sb, v->as.integer.text);
+		sb_puts(sb, jinja_int_text(v));
 		break;
 	case JV_FLOAT:
 		sb_puts(sb, isfinite(v->as.floating.value) ? v->as.floating.text : "null");
@@ -2634,6 +2650,27 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 		scope loop_sc;
 		loop_sc.entries = NULL;
 		loop_sc.parent	= ctx->sc;
+
+		jinja_value *loop_obj = jinja_dict();
+		jinja_dict_set(loop_obj, "index0", jinja_int(0));
+		jinja_dict_set(loop_obj, "index", jinja_int(1));
+		jinja_dict_set(loop_obj, "first", jinja_bool(1));
+		jinja_dict_set(loop_obj, "last", jinja_bool(0));
+		jinja_dict_set(loop_obj, "previtem", jinja_none());
+		jinja_dict_set(loop_obj, "nextitem", jinja_none());
+		scope_assign(&loop_sc, "loop", loop_obj);
+
+		jinja_dict_entry *le_index0	 = jinja_dict_find(loop_obj, "index0");
+		jinja_dict_entry *le_index	 = jinja_dict_find(loop_obj, "index");
+		jinja_dict_entry *le_first	 = jinja_dict_find(loop_obj, "first");
+		jinja_dict_entry *le_last	 = jinja_dict_find(loop_obj, "last");
+		jinja_dict_entry *le_prev	 = jinja_dict_find(loop_obj, "previtem");
+		jinja_dict_entry *le_next	 = jinja_dict_find(loop_obj, "nextitem");
+		jinja_value		 *idx0_val	 = le_index0->val;
+		jinja_value		 *idx_val	 = le_index->val;
+		jinja_value		 *bool_true	 = jinja_bool(1);
+		jinja_value		 *bool_false = jinja_bool(0);
+		jinja_value		 *none_val	 = jinja_none();
 		for (size_t i = 0; i < n && !ctx->failed; i++) {
 			jinja_value *item = items[i];
 			if (s->loop_var2 && item && item->type == JV_LIST && item->as.list.n >= 2) {
@@ -2643,14 +2680,14 @@ static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 				scope_assign(&loop_sc, s->loop_var, item);
 			}
 
-			jinja_value *loop_obj = jinja_dict();
-			jinja_dict_set(loop_obj, "index0", jinja_int((int64_t)i));
-			jinja_dict_set(loop_obj, "index", jinja_int((int64_t)(i + 1)));
-			jinja_dict_set(loop_obj, "first", jinja_bool(i == 0));
-			jinja_dict_set(loop_obj, "last", jinja_bool(i == n - 1));
-			jinja_dict_set(loop_obj, "previtem", i > 0 ? items[i - 1] : jinja_none());
-			jinja_dict_set(loop_obj, "nextitem", i + 1 < n ? items[i + 1] : jinja_none());
-			scope_assign(&loop_sc, "loop", loop_obj);
+			idx0_val->as.integer.value		= (int64_t)i;
+			idx0_val->as.integer.text_ready = false;
+			idx_val->as.integer.value		= (int64_t)(i + 1);
+			idx_val->as.integer.text_ready	= false;
+			le_first->val					= (i == 0) ? bool_true : bool_false;
+			le_last->val					= (i == n - 1) ? bool_true : bool_false;
+			le_prev->val					= (i > 0) ? items[i - 1] : none_val;
+			le_next->val					= (i + 1 < n) ? items[i + 1] : none_val;
 
 			scope *saved   = ctx->sc;
 			ctx->sc		   = &loop_sc;

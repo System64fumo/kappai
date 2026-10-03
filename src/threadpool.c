@@ -23,6 +23,7 @@
 #define TPOOL_SPIN_BUDGET_INITIAL_NS 50000
 #define TPOOL_WAIT_EPOCH_SPIN_BUDGET_NS 20000
 #define TPOOL_SPIN_CHECK_EVERY 128
+#define TPOOL_MIN_CHUNKS_PER_THREAD 8
 #define TPOOL_MAX_THREADS 256
 #define TPOOL_SPIN_EMA_NUM 1
 #define TPOOL_SPIN_EMA_DEN 4
@@ -242,7 +243,7 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 		if (atomic_compare_exchange_weak_explicit(&pool->job.cursor_ep, &snap, claimed,
 												  memory_order_acq_rel, memory_order_relaxed)) {
 			tpool_run_timed(s, fn, cur, next, tid, ctx, pool->stats_enabled);
-			atomic_fetch_add_explicit(&pool->job.executed, 1, memory_order_release);
+			atomic_fetch_add_explicit(&pool->job.executed, 1, memory_order_relaxed);
 		}
 	}
 }
@@ -446,18 +447,15 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 
 	pthread_mutex_lock(&pool->pub_mtx);
 
-	int chunk_size			  = min_items_per_thread;
-	int min_chunks_per_thread = 4;
-	while (chunk_size > 1 && n_items / chunk_size < usable * min_chunks_per_thread)
-		chunk_size /= 2;
+	int chunk_size = n_items / (usable * TPOOL_MIN_CHUNKS_PER_THREAD);
 	if (chunk_size < 1)
 		chunk_size = 1;
 
 	int new_epoch = atomic_load_explicit(&pool->sync.epoch, memory_order_relaxed) + 1;
 
 	atomic_store_explicit(&pool->sync.pub_gate, new_epoch, memory_order_release);
-	spin_wait_relax(tpool_retired_pred, pool);
 	atomic_store_explicit(&pool->sync.in_job, 1, memory_order_relaxed);
+	spin_wait_relax(tpool_retired_pred, pool);
 
 	atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.chunk_size, chunk_size, memory_order_relaxed);

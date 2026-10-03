@@ -19,7 +19,7 @@ static void monitor_emit(monitor *mon, const char *json_fmt, ...)
 
 #define MONITOR_DEFAULT_PATH "/tmp/kappai.monitor"
 
-void monitor_emit(monitor *mon, const char *json_fmt, ...) {
+static void monitor_emit(monitor *mon, const char *json_fmt, ...) {
 	va_list ap;
 	va_start(ap, json_fmt);
 	char buf[4096];
@@ -34,7 +34,7 @@ monitor *g_monitor = NULL;
 static _Atomic int	g_monitors_listening;
 static _Atomic long g_moe_emit_count;
 
-int monitor_maybe_emit(void) {
+static int monitor_maybe_emit(void) {
 	if (atomic_load_explicit(&g_monitors_listening, memory_order_relaxed) <= 0)
 		return 0;
 	long n = atomic_fetch_add_explicit(&g_moe_emit_count, 1, memory_order_relaxed);
