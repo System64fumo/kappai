@@ -7,14 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void record_tc(const char *label, int ok, const char *fmt, ...) {
-	char	detail[512];
-	va_list ap;
-	va_start(ap, fmt);
-	vsnprintf(detail, sizeof(detail), fmt, ap);
-	va_end(ap);
-	record_result(OPFAM_TOOLCALL, label, ok ? V_PASS : V_FAIL, detail);
-}
+#define record_tc(label, ok, ...) record_resultf(OPFAM_TOOLCALL, (label), (ok), __VA_ARGS__)
 
 static int parse_str(const marker_pair *fmt, const char *text, char **out_name,
 					 json_object **out_args) {
@@ -297,10 +290,10 @@ static void test_scanner_single_call(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf	  content = {0};
+	str_builder		  content = {0};
 	const char		 *text = "prelude\n<|tool_call>call: foo\n{k: <|\"|>v<|\"|>}<tool_call|>tail";
 	toolcall_scanner *sc   = toolcall_scanner_new(&fmt, &content, NULL, NULL, NULL);
-	toolcall_buf_append(&content, text, strlen(text));
+	sb_putb(&content, text, strlen(text));
 	toolcall_scanner_feed(sc);
 	toolcall_scanner_finish(sc);
 
@@ -339,12 +332,12 @@ static void test_scanner_multiple_calls(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf	  content = {0};
+	str_builder		  content = {0};
 	const char		 *text	  = "<|tool_call>call: a\n{x: <|\"|>1<|\"|>}<tool_call|>"
 								"middle text"
 								"<|tool_call>call: b\n{y: <|\"|>2<|\"|>}<tool_call|>";
 	toolcall_scanner *sc	  = toolcall_scanner_new(&fmt, &content, NULL, NULL, NULL);
-	toolcall_buf_append(&content, text, strlen(text));
+	sb_putb(&content, text, strlen(text));
 	toolcall_scanner_feed(sc);
 	toolcall_scanner_finish(sc);
 
@@ -388,10 +381,10 @@ static void test_scanner_truncated_salvage(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf	  content = {0};
+	str_builder		  content = {0};
 	const char		 *text	  = "<|tool_call>call: salvaged\n{k: <|\"|>v<|\"|>}";
 	toolcall_scanner *sc	  = toolcall_scanner_new(&fmt, &content, NULL, NULL, NULL);
-	toolcall_buf_append(&content, text, strlen(text));
+	sb_putb(&content, text, strlen(text));
 	toolcall_scanner_feed(sc);
 	toolcall_scanner_finish(sc);
 
@@ -428,10 +421,10 @@ static void test_scanner_suppressed_by_stop(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf content = {0};
-	const char	*text = "<|tool_call>call: foo\n{k: <|\"|>v<|\"|>}<tool_call|><|tool_response>fake";
+	str_builder content = {0};
+	const char *text = "<|tool_call>call: foo\n{k: <|\"|>v<|\"|>}<tool_call|><|tool_response>fake";
 	toolcall_scanner *sc = toolcall_scanner_new(&fmt, &content, NULL, NULL, NULL);
-	toolcall_buf_append(&content, text, strlen(text));
+	sb_putb(&content, text, strlen(text));
 	toolcall_scanner_feed(sc);
 	toolcall_scanner_finish(sc);
 
@@ -478,11 +471,11 @@ static void test_scanner_content_callback(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf		   content = {0};
+	str_builder			   content = {0};
 	struct content_capture cap	   = {0};
 	const char			  *text = "BEFORE<|tool_call>call: x\n{a: <|\"|>b<|\"|>}<tool_call|>AFTER";
 	toolcall_scanner *sc = toolcall_scanner_new(&fmt, &content, on_content_capture, NULL, &cap);
-	toolcall_buf_append(&content, text, strlen(text));
+	sb_putb(&content, text, strlen(text));
 	toolcall_scanner_feed(sc);
 	toolcall_scanner_finish(sc);
 
@@ -504,15 +497,15 @@ static void test_scanner_id_uniqueness(void) {
 	};
 	const char *text = "<|tool_call>call: x\n{k: <|\"|>v<|\"|>}<tool_call|>";
 
-	toolcall_buf	  c1  = {0};
+	str_builder		  c1  = {0};
 	toolcall_scanner *sc1 = toolcall_scanner_new(&fmt, &c1, NULL, NULL, NULL);
-	toolcall_buf_append(&c1, text, strlen(text));
+	sb_putb(&c1, text, strlen(text));
 	toolcall_scanner_feed(sc1);
 	toolcall_scanner_finish(sc1);
 
-	toolcall_buf	  c2  = {0};
+	str_builder		  c2  = {0};
 	toolcall_scanner *sc2 = toolcall_scanner_new(&fmt, &c2, NULL, NULL, NULL);
-	toolcall_buf_append(&c2, text, strlen(text));
+	sb_putb(&c2, text, strlen(text));
 	toolcall_scanner_feed(sc2);
 	toolcall_scanner_finish(sc2);
 
@@ -552,12 +545,12 @@ static void test_scanner_streamed_capture(void) {
 		.stop		= "<|tool_response>",
 		.probe_hint = NULL,
 	};
-	toolcall_buf content_streamed = {0};
-	toolcall_buf content_oneshot  = {0};
-	const char	*text			  = "<|tool_call>call: streamed\n{k: <|\"|>v<|\"|>}<tool_call|>";
+	str_builder content_streamed = {0};
+	str_builder content_oneshot	 = {0};
+	const char *text			 = "<|tool_call>call: streamed\n{k: <|\"|>v<|\"|>}<tool_call|>";
 
 	toolcall_scanner *sc_oneshot = toolcall_scanner_new(&fmt, &content_oneshot, NULL, NULL, NULL);
-	toolcall_buf_append(&content_oneshot, text, strlen(text));
+	sb_putb(&content_oneshot, text, strlen(text));
 	toolcall_scanner_feed(sc_oneshot);
 	toolcall_scanner_finish(sc_oneshot);
 
@@ -567,7 +560,7 @@ static void test_scanner_streamed_capture(void) {
 		if (toolcall_scanner_in_capture(sc_streamed))
 			toolcall_scanner_feed_capture(sc_streamed, text + i, 1);
 		else {
-			toolcall_buf_append(&content_streamed, text + i, 1);
+			sb_putb(&content_streamed, text + i, 1);
 			toolcall_scanner_feed(sc_streamed);
 		}
 	}

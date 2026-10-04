@@ -25,9 +25,8 @@ typedef struct {
 	marker_payload payload;
 	const char	  *stop;
 	const char	  *probe_hint;
+	bool		   label_line;
 } marker_pair;
-
-const marker_pair *marker_registry(size_t *n_pairs);
 
 const marker_pair *marker_probe(const tokenizer *tok, marker_role role);
 

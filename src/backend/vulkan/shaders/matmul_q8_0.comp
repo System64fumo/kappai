@@ -1,5 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
 layout(local_size_x_id = 0) in;
 
 layout(set = 0, binding = 0) readonly buffer W0Buf {
@@ -41,7 +45,9 @@ layout(constant_id = 2) const int TILE_K		  = 2048;
 
 shared float x_shared[TILE_K];
 shared float dx_scale_shared[TILE_K / 32];
-shared int	 xq_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+
+#include "xq8_block.glsl"
 
 void main() {
 	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
@@ -74,44 +80,17 @@ void main() {
 		int local_blocks = tile_len / 32;
 		for (int local_bi = int(tid); local_bi < local_blocks;
 			 local_bi += int(gl_WorkGroupSize.x)) {
-			int	  x_base = local_bi * 32;
-			float xv[32];
-			for (int j = 0; j < 32; j++)
-				xv[j] = x_shared[x_base + j];
-
-			float amax = 0.0;
-			for (int j = 0; j < 32; j++) {
-				float ax = abs(xv[j]);
-				if (ax > amax)
-					amax = ax;
-			}
-			float dx				  = amax / 127.0;
-			float idx_				  = dx > 0.0 ? 1.0 / dx : 0.0;
-			float dx_scale			  = half_to_float(float_to_half(dx));
-			dx_scale_shared[local_bi] = dx_scale;
-
-			for (int j = 0; j < 32; j++) {
-				float scaled  = xv[j] * idx_;
-				float rounded = scaled >= 0.0 ? floor(scaled + 0.5) : ceil(scaled - 0.5);
-				int	  v		  = int(rounded);
-				if (v > 127)
-					v = 127;
-				if (v < -127)
-					v = -127;
-				xq_shared[x_base + j] = v;
-			}
+			float dx;
+			xq8_quant_block(local_bi * 32, dx);
+			dx_scale_shared[local_bi] = half_to_float(float_to_half(dx));
 		}
 		barrier();
 
 		for (int local_bi = 0; local_bi < local_blocks; local_bi++) {
 			int	  bi	   = tile_start / 32 + local_bi;
-			int	  x_base   = local_bi * 32;
 			float dx_scale = dx_scale_shared[local_bi];
 
-			int xq[32];
-			for (int j = 0; j < 32; j++)
-				xq[j] = xq_shared[x_base + j];
-
+			int wp = local_bi * 8;
 			for (int r = 0; r < ROWS_PER_THREAD; r++) {
 				if (!valid[r])
 					continue;
@@ -123,17 +102,8 @@ void main() {
 
 				int sumi = 0;
 				for (int w4 = 0; w4 < 8; w4++) {
-					uint word = w0_read_u32(qs_off + uint(w4 * 4));
-					int	 b0	  = int((word) & 0xFFu);
-					int	 b1	  = int((word >> 8u) & 0xFFu);
-					int	 b2	  = int((word >> 16u) & 0xFFu);
-					int	 b3	  = int((word >> 24u) & 0xFFu);
-					int	 q0	  = b0 >= 128 ? b0 - 256 : b0;
-					int	 q1	  = b1 >= 128 ? b1 - 256 : b1;
-					int	 q2	  = b2 >= 128 ? b2 - 256 : b2;
-					int	 q3	  = b3 >= 128 ? b3 - 256 : b3;
-					int	 j	  = w4 * 4;
-					sumi += q0 * xq[j] + q1 * xq[j + 1] + q2 * xq[j + 2] + q3 * xq[j + 3];
+					int qv = int(w0_read_u32(qs_off + uint(w4 * 4)));
+					sumi += dotPacked4x8EXT(qv, int(xq_packed[wp + w4]));
 				}
 				acc[r] = fma(d * dx_scale, float(sumi), acc[r]);
 			}

@@ -25,7 +25,6 @@ typedef struct {
 
 	bool has_scale_embeddings;
 	bool has_qk_norm;
-	bool has_per_layer_embeddings;
 	bool has_post_norm_ple;
 	bool uses_gelu_activation;
 	bool uses_norm_v_without_weight;
@@ -47,7 +46,6 @@ typedef struct {
 } arch_info;
 
 const arch_info *arch_lookup(model_arch a);
-const arch_info *arch_lookup_by_gguf_name(const char *name);
 
 model_arch arch_detect(const gguf_ctx *g);
 

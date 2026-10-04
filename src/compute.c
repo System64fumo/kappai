@@ -1,9 +1,11 @@
 #include "compute.h"
-#include "backend/cpu/scalar/quants.h"
 #include "log.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define compute_model_changed(s, m, n_ctx)                                                         \
+	((s)->last_model != (m) || (s)->allocated_n_ctx < (n_ctx))
 
 void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
@@ -84,43 +86,27 @@ static void free_buf(buffer *b) {
 	b->owner->buffer_free(b->owner, b);
 }
 
+static void scratch_free_slot_buffers(buffer *slots) {
+	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
+		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
+			continue;
+		free_buf(&slots[i]);
+	}
+}
+
 static void scratch_free_device_buffers(compute_scratch *s) {
-	free_buf(&s->slots[RECIPE_SLOT_X]);
-	free_buf(&s->slots[RECIPE_SLOT_XB]);
-	free_buf(&s->slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->slots[RECIPE_SLOT_Q]);
-	free_buf(&s->slots[RECIPE_SLOT_K]);
-	free_buf(&s->slots[RECIPE_SLOT_V]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->slots);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
+	free_buf(&s->ple_inp_mirror);
+	free_buf(&s->ple_slice_mirror);
 	free_buf(&s->ple_all);
 	free_buf(&s->ple_proj);
 	free_buf(&s->ple_proj_norm_w);
 	free_buf(&s->router_softmax_inp);
 	free_buf(&s->router_logits);
 
-	free_buf(&s->mirror_slots[RECIPE_SLOT_X]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_XB2]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_ATTN_OUT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_Q]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_K]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_V]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_FFN_ACT]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_LOGITS]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_PROJ]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_GATE]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_ALPHA]);
-	free_buf(&s->mirror_slots[RECIPE_SLOT_HYB_BETA]);
+	scratch_free_slot_buffers(s->mirror_slots);
 	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
 		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
 			continue;
@@ -178,6 +164,8 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	s->moe_scratch.p	 = NULL;
 	s->moe_xb_f.p		 = NULL;
 	s->moe_shared_y.p	 = NULL;
+	free(s->moe_slot_buf);
+	s->moe_slot_buf = NULL;
 
 #define FREE_FLOAT_BUF(field)                                                                      \
 	do {                                                                                           \
@@ -252,9 +240,8 @@ static int layer_max_intermediate(const model *m) {
 static status_code scratch_alloc(backend *a, buffer *dst, size_t size, const char *name) {
 	status_code st = a->buffer_alloc_scratch(a, size, dst);
 	if (st != OK) {
-		ERROR(
-			"compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes, status=%d)",
-			name, size, st);
+		ERROR("compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes): %s",
+			  name, size, status_str(st));
 	}
 	return st;
 }
@@ -312,6 +299,69 @@ static void compute_layout_init(const model *m, compute_layout *L) {
 	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
 }
 
+static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
+									   const compute_layout *L) {
+	status_code _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_X], (size_t)L->attn_buf_size * sizeof(float), "X");
+	if (_st != OK)
+		return _st;
+	if (m->arch_info->is_hybrid_recurrent) {
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_PROJ],
+							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_GATE],
+							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_ALPHA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_BETA],
+							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
+		if (_st != OK)
+			return _st;
+	}
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB], (size_t)L->attn_buf_size * sizeof(float), "XB");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB2], (size_t)L->attn_buf_size * sizeof(float), "XB2");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_ATTN_OUT], (size_t)L->attn_buf_size * sizeof(float),
+						"ATTN_OUT");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_Q], (size_t)L->q_out * sizeof(float), "Q");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_K], (size_t)L->kv_out * sizeof(float), "K");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_V], (size_t)L->kv_out * sizeof(float), "V");
+	if (_st != OK)
+		return _st;
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_GATE_UP],
+						(size_t)L->max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
+	if (_st != OK)
+		return _st;
+	dst[RECIPE_SLOT_FFN_GATE] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L->max_intermediate * sizeof(float));
+	dst[RECIPE_SLOT_FFN_UP] =
+		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], (size_t)L->max_intermediate * sizeof(float),
+					 (size_t)L->max_intermediate * sizeof(float));
+	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_ACT], (size_t)L->ffn_act_size * sizeof(float),
+						"FFN_ACT");
+	if (_st != OK)
+		return _st;
+	_st =
+		scratch_alloc(a, &dst[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float), "LOGITS");
+	if (_st != OK)
+		return _st;
+	return OK;
+}
+
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
 	if (!compute_model_changed(s, m, n_ctx))
 		return OK;
@@ -325,64 +375,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_X], (size_t)L.attn_buf_size * sizeof(float), "X");
-	if (_st != OK)
-		return _st;
-	if (m->arch_info->is_hybrid_recurrent) {
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_PROJ],
-							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_GATE],
-							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_ALPHA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_HYB_BETA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
-		if (_st != OK)
-			return _st;
-	}
-	_st =
-		scratch_alloc(a, &s->slots[RECIPE_SLOT_XB], (size_t)L.attn_buf_size * sizeof(float), "XB");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_XB2], (size_t)L.attn_buf_size * sizeof(float),
-						"XB2");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_ATTN_OUT], (size_t)L.attn_buf_size * sizeof(float),
-						"ATTN_OUT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_Q], (size_t)L.q_out * sizeof(float), "Q");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_K], (size_t)L.kv_out * sizeof(float), "K");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_V], (size_t)L.kv_out * sizeof(float), "V");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_GATE_UP],
-						(size_t)L.max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
-	if (_st != OK)
-		return _st;
-	s->slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], 0,
-												  (size_t)L.max_intermediate * sizeof(float));
-	s->slots[RECIPE_SLOT_FFN_UP] =
-		buffer_slice(&s->slots[RECIPE_SLOT_FFN_GATE_UP], (size_t)L.max_intermediate * sizeof(float),
-					 (size_t)L.max_intermediate * sizeof(float));
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_FFN_ACT], (size_t)L.ffn_act_size * sizeof(float),
-						"FFN_ACT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &s->slots[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float),
-						"LOGITS");
+	status_code _st = scratch_alloc_slots(a, s->slots, m, &L);
 	if (_st != OK)
 		return _st;
 
@@ -396,6 +389,11 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	}
 
 	compute_scratch_set_router_bufs(s);
+
+	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
+
+	if (m->arch_info->is_moe)
+		s->moe_slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe_slot_buf));
 
 	if (m->arch_info->has_variable_layer_dims) {
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
@@ -455,6 +453,18 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out) {
+	long w = m->sliding_window;
+	if (w > 0) {
+		long slack = w / 4 < 8 ? 8 : w / 4;
+		long cap   = w + slack;
+		if (pos_start + n_tokens > cap && n_tokens > slack + 1) {
+			ERROR("batch of %d tokens exceeds the %ld-token sliding-window slack (window %ld, "
+				  "capacity %ld): rows early in this batch would lose window history. "
+				  "Reduce the prefill chunk size to %ld.",
+				  n_tokens, slack, w, cap, slack + 1);
+			return ERR_INVALID_ARG;
+		}
+	}
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
@@ -475,12 +485,15 @@ static status_code ensure_transfer_buf(compute_scratch *s, size_t need_floats) {
 	return OK;
 }
 
-status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx) {
-	(void)n_ctx;
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	if (s->mirror_slots_alloced && s->mirror_backend)
 		return OK;
 	if (!m || !m->mixed_backend_mode)
 		return OK;
+	backend_report_host_fallback(
+		m->backend, "mirror_scratch", HFB_LAYER_NOT_OFFLOADED,
+		"mixed-backend mode: mirror compute slots allocated on the host (cpu) "
+		"fallback for layers not offloaded");
 	backend *host = backend_host();
 	if (!host)
 		return ERR_UNSUPPORTED;
@@ -490,36 +503,19 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code st;
-#define MIRROR_ALLOC(slot, size)                                                                   \
-	do {                                                                                           \
-		st = scratch_alloc(host, &s->mirror_slots[slot], (size), "mirror_slots[" #slot "]");       \
-		if (st != OK)                                                                              \
-			return st;                                                                             \
-	} while (0)
+	status_code st = scratch_alloc_slots(host, s->mirror_slots, m, &L);
+	if (st != OK)
+		return st;
 
-	MIRROR_ALLOC(RECIPE_SLOT_X, (size_t)L.attn_buf_size * sizeof(float));
-	if (m->arch_info->is_hybrid_recurrent) {
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_PROJ, (size_t)model_hybrid_proj_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_GATE, (size_t)model_hybrid_gate_size(m) * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_ALPHA, (size_t)m->hybrid.n_value_heads * sizeof(float));
-		MIRROR_ALLOC(RECIPE_SLOT_HYB_BETA, (size_t)m->hybrid.n_value_heads * sizeof(float));
+	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0) {
+		size_t ple_bytes = (size_t)m->layer_dims.n_embd_per_layer * sizeof(float);
+		st				 = scratch_alloc(host, &s->ple_slice_mirror, ple_bytes, "ple_slice mirror");
+		if (st != OK)
+			return st;
+		st = scratch_alloc(host, &s->ple_inp_mirror, ple_bytes, "ple_inp mirror");
+		if (st != OK)
+			return st;
 	}
-	MIRROR_ALLOC(RECIPE_SLOT_XB, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_XB2, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_ATTN_OUT, (size_t)L.attn_buf_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_Q, (size_t)L.q_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_K, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_V, (size_t)L.kv_out * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_GATE_UP, (size_t)L.max_intermediate * 2 * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_GATE] = buffer_slice(
-		&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L.max_intermediate * sizeof(float));
-	s->mirror_slots[RECIPE_SLOT_FFN_UP] = buffer_slice(&s->mirror_slots[RECIPE_SLOT_FFN_GATE_UP],
-													   (size_t)L.max_intermediate * sizeof(float),
-													   (size_t)L.max_intermediate * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_FFN_ACT, (size_t)L.ffn_act_size * sizeof(float));
-	MIRROR_ALLOC(RECIPE_SLOT_LOGITS, (size_t)m->vocab_size * sizeof(float));
-#undef MIRROR_ALLOC
 
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
@@ -531,6 +527,14 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, in
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].size		 = sizeof(s->router_w_host);
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].offset	 = 0;
 	s->mirror_slots[RECIPE_SLOT_ROUTER_W].owner		 = NULL;
+
+	size_t xfer_need = (size_t)L.attn_buf_size;
+	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0 &&
+		(size_t)m->layer_dims.n_embd_per_layer > xfer_need)
+		xfer_need = (size_t)m->layer_dims.n_embd_per_layer;
+	st = ensure_transfer_buf(s, xfer_need);
+	if (st != OK)
+		return st;
 
 	s->mirror_slots_alloced = 1;
 	return OK;
@@ -558,8 +562,7 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, i
 		(target == s->mirror_backend) ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
 
 	backend *src_be = current;
-	if (src_be && src_be->synchronize)
-		src_be->synchronize(src_be);
+	ensure_sync(src_be);
 
 	status_code st = compute_copy_buffer_cross(s, src_x, dst_x, dim);
 	if (st != OK)
@@ -596,8 +599,7 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return ERR_UNSUPPORTED;
 	}
 
-	if (src_owner && src_owner->synchronize)
-		src_owner->synchronize(src_owner);
+	ensure_sync(src_owner);
 
 	status_code st = ensure_transfer_buf(s, (size_t)n);
 	if (st != OK)

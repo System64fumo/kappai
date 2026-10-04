@@ -4,13 +4,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void grow_buf(void **buf, int *cur_count, int need_count, size_t elem_size) {
-	if (*cur_count >= need_count)
-		return;
-	*buf	   = xrealloc(*buf, (size_t)need_count * elem_size);
-	*cur_count = need_count;
-}
-
 static inline uint64_t rotl64(uint64_t x, int k) {
 	return (x << k) | (x >> (64 - k));
 }
@@ -69,7 +62,7 @@ void sampler_free(sampler *s) {
 }
 
 void sampler_set_vocab(sampler *s, int vocab_size) {
-	grow_buf((void **)&s->logits_buf, &s->buf_vocab, vocab_size, sizeof(float));
+	ARR_ENSURE(s->logits_buf, vocab_size, s->buf_vocab);
 }
 
 void sampler_set_params(sampler *s, float temp, int top_k, float top_p, float min_p,
@@ -103,33 +96,47 @@ void sampler_observe(sampler *s, int32_t token) {
 	}
 }
 
+static int32_t sampler_argmax_f32(const float *logits, int vocab) {
+	if (vocab <= 0)
+		return 0;
+	int32_t best  = 0;
+	float	bestv = logits[0];
+	for (int i = 1; i < vocab; i++)
+		if (logits[i] > bestv) {
+			bestv = logits[i];
+			best  = i;
+		}
+	return best;
+}
+
 int32_t sampler_argmax(const float *logits, int vocab) {
-	return cpu_argmax_f32(logits, vocab);
+	return sampler_argmax_f32(logits, vocab);
 }
 
 static int top_k_heap(sampler *s, const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	float	*hs = NULL;
-	int32_t *hi = NULL;
+	float						**hs_p;
+	int32_t						**hi_p;
+	int							 *cap_p;
+	static _Thread_local float	 *tls_h;
+	static _Thread_local int32_t *tls_i;
+	static _Thread_local int	  tls_cap;
 	if (s) {
-		if (s->heap_cap < k) {
-			s->heap_scores = xrealloc(s->heap_scores, (size_t)k * sizeof(float));
-			s->heap_idx	   = xrealloc(s->heap_idx, (size_t)k * sizeof(int32_t));
-			s->heap_cap	   = k;
-		}
-		hs = s->heap_scores;
-		hi = s->heap_idx;
+		hs_p  = &s->heap_scores;
+		hi_p  = &s->heap_idx;
+		cap_p = &s->heap_cap;
 	} else {
-		static _Thread_local float	 *tls_h;
-		static _Thread_local int32_t *tls_i;
-		static _Thread_local int	  tls_cap;
-		if (tls_cap < k) {
-			tls_h	= xrealloc(tls_h, (size_t)k * sizeof(float));
-			tls_i	= xrealloc(tls_i, (size_t)k * sizeof(int32_t));
-			tls_cap = k;
-		}
-		hs = tls_h;
-		hi = tls_i;
+		hs_p  = &tls_h;
+		hi_p  = &tls_i;
+		cap_p = &tls_cap;
 	}
+	if (*cap_p < k) {
+		*hs_p  = xrealloc(*hs_p, (size_t)k * sizeof(float));
+		*hi_p  = xrealloc(*hi_p, (size_t)k * sizeof(int32_t));
+		*cap_p = k;
+	}
+
+	float	*hs = *hs_p;
+	int32_t *hi = *hi_p;
 
 	if (k > vocab)
 		k = vocab;
@@ -149,10 +156,15 @@ static int cmp_desc(const void *a, const void *b) {
 	return va < vb ? 1 : va > vb ? -1 : 0;
 }
 
-int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
-	int kept = top_k_heap(NULL, logits, vocab, k, out);
+static int top_k_sorted(sampler *s, const float *logits, int vocab, int k,
+						sampler_top_k_entry *out) {
+	int kept = top_k_heap(s, logits, vocab, k, out);
 	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
 	return kept;
+}
+
+int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out) {
+	return top_k_sorted(NULL, logits, vocab, k, out);
 }
 
 static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_k_entry *out,
@@ -161,10 +173,7 @@ static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_
 		max_keep = vocab;
 	if (max_keep <= 0)
 		return 0;
-
-	int kept = top_k_heap(s, logits, vocab, max_keep, out);
-	qsort(out, kept, sizeof(sampler_top_k_entry), cmp_desc);
-	return kept;
+	return top_k_sorted(s, logits, vocab, max_keep, out);
 }
 
 #define SAMPLER_TOP_FILTER_CAP 1024
@@ -186,8 +195,7 @@ static int collect_candidates(sampler *s, const float *logits, int vocab,
 							  sampler_top_k_entry *arr) {
 	int kept;
 	if (s->top_k > 0 && s->top_k < vocab) {
-		kept = top_k_heap(s, logits, vocab, s->top_k, arr);
-		qsort(arr, kept, sizeof(sampler_top_k_entry), cmp_desc);
+		kept = top_k_sorted(s, logits, vocab, s->top_k, arr);
 	} else {
 		int cap;
 		if (s->top_p < 1.0f || s->min_p > 0.0f)
@@ -206,25 +214,34 @@ static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
 		if (logits[i] * inv_temp > mx)
 			mx = logits[i] * inv_temp;
 
+	ARR_ENSURE(s->logits_buf, vocab, s->buf_vocab);
+	float *exp = s->logits_buf;
 	double sum = 0.0;
-	for (int i = 0; i < vocab; i++)
-		sum += expf(logits[i] * inv_temp - mx);
+	for (int i = 0; i < vocab; i++) {
+		float e = expf(logits[i] * inv_temp - mx);
+		exp[i]	= e;
+		sum += e;
+	}
 
 	double rnd = (double)rng_uniform(&s->rng) * sum;
 	double acc = 0.0;
 	for (int i = 0; i < vocab; i++) {
-		acc += expf(logits[i] * inv_temp - mx);
+		acc += exp[i];
 		if (rnd < acc)
 			return (int32_t)i;
 	}
 	return (int32_t)(vocab - 1);
 }
 
-static void apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float temperature) {
+static float apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float temperature) {
 	float inv_temp = 1.0f / temperature;
 	float mx	   = arr[0].v * inv_temp;
-	for (int i = 0; i < kept; i++)
+	float sum	   = 0.0f;
+	for (int i = 0; i < kept; i++) {
 		arr[i].v = expf((arr[i].v * inv_temp) - mx);
+		sum += arr[i].v;
+	}
+	return sum;
 }
 
 static int apply_top_p(sampler_top_k_entry *arr, int kept, float top_p, float sum) {
@@ -268,6 +285,28 @@ static int32_t sample_from_candidates(sampler_top_k_entry *arr, int kept, rng *r
 	return arr[picked_i].i;
 }
 
+static int32_t sample_greedy(const float *logits, int vocab) {
+	return sampler_argmax(logits, vocab);
+}
+
+static int32_t sample_filtered(sampler *s, const float *logits, int vocab) {
+	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
+	ARR_ENSURE(s->cand_buf, need_cands, s->cand_vocab);
+	sampler_top_k_entry *arr  = s->cand_buf;
+	int					 kept = collect_candidates(s, logits, vocab, arr);
+	if (kept <= 0)
+		return -1;
+
+	float sum = apply_temperature_softmax(arr, kept, s->temperature);
+
+	kept = apply_top_p(arr, kept, s->top_p, sum);
+	kept = apply_min_p(arr, kept, s->min_p, sum);
+	if (kept <= 0)
+		kept = 1;
+
+	return sample_from_candidates(arr, kept, &s->rng);
+}
+
 int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 	const float *logits	   = logits_in;
 	int			 penalized = s->repeat_penalty != 1.0f && s->recent_count > 0;
@@ -280,28 +319,10 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 	}
 
 	if (s->temperature <= 0.0f || s->top_k == 1)
-		return sampler_argmax(logits, vocab);
+		return sample_greedy(logits, vocab);
 
 	if ((s->top_k <= 0 || s->top_k >= vocab) && s->top_p >= 1.0f && s->min_p <= 0.0f)
 		return sample_full_vocab(s, logits, vocab);
 
-	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
-	grow_buf(&s->cand_buf, &s->cand_vocab, need_cands, sizeof(sampler_top_k_entry));
-	sampler_top_k_entry *arr  = s->cand_buf;
-	int					 kept = collect_candidates(s, logits, vocab, arr);
-	if (kept <= 0)
-		return -1;
-
-	apply_temperature_softmax(arr, kept, s->temperature);
-
-	float sum = 0.0f;
-	for (int i = 0; i < kept; i++)
-		sum += arr[i].v;
-
-	kept = apply_top_p(arr, kept, s->top_p, sum);
-	kept = apply_min_p(arr, kept, s->min_p, sum);
-	if (kept <= 0)
-		kept = 1;
-
-	return sample_from_candidates(arr, kept, &s->rng);
+	return sample_filtered(s, logits, vocab);
 }

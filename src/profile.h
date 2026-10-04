@@ -1,6 +1,9 @@
 #ifndef PROFILE_H
 #define PROFILE_H
 
+#include <stdatomic.h>
+#include <stdio.h>
+
 #include "common.h"
 
 typedef enum {
@@ -9,10 +12,13 @@ typedef enum {
 	STAGE_MATMUL,
 	STAGE_MATMUL_QKV,
 	STAGE_MATMUL_ATTN_OUT,
-	STAGE_MATMUL_FFN,
+	STAGE_MATMUL_FFN_GATE_UP,
+	STAGE_MATMUL_FFN_DOWN,
+	STAGE_PLE,
 	STAGE_MOE_ROUTER,
 	STAGE_MOE_IO_WAIT,
 	STAGE_MOE_SHARED,
+	STAGE_MOE_EXPERT,
 	STAGE_ROPE,
 	STAGE_KVPUT,
 	STAGE_ATTN,
@@ -29,6 +35,8 @@ typedef enum {
 typedef struct {
 	_Atomic uint64_t total_us[STAGE_COUNT];
 	_Atomic uint64_t calls[STAGE_COUNT];
+	_Atomic uint64_t bytes[STAGE_COUNT];
+	uint64_t		 wall_us;
 	bool			 enabled;
 } profile;
 
@@ -42,11 +50,22 @@ uint64_t time_us(void);
 uint64_t time_ms(void);
 void	 profile_reset(profile *p);
 
+static inline void profile_set_wall(profile *p, uint64_t us) {
+	if (p)
+		p->wall_us = us;
+}
+
 static inline void profile_add(profile *p, stage s, uint64_t us) {
 	if (!p || !p->enabled || s >= STAGE_COUNT)
 		return;
 	atomic_fetch_add_explicit(&p->total_us[s], us, memory_order_relaxed);
 	atomic_fetch_add_explicit(&p->calls[s], 1, memory_order_relaxed);
+}
+
+static inline void profile_add_bytes(profile *p, stage s, uint64_t bytes) {
+	if (!p || !p->enabled || s >= STAGE_COUNT)
+		return;
+	atomic_fetch_add_explicit(&p->bytes[s], bytes, memory_order_relaxed);
 }
 
 static inline profile_scope profile_begin(profile *p, stage s) {
@@ -63,7 +82,5 @@ static inline void profile_end(profile *p, profile_scope *ps) {
 }
 
 void profile_print(const profile *p, const char *label, FILE *fp);
-
-const char *stage_name(stage s);
 
 #endif

@@ -1,7 +1,10 @@
 #define _GNU_SOURCE
 #include "memconfig.h"
+#include "config.h"
 #include "gguf.h"
+#include "kvcache.h"
 #include "log.h"
+#include "model.h"
 #include "moe/moe_stream.h"
 #include <string.h>
 #include <sys/sysinfo.h>
@@ -20,10 +23,12 @@ size_t get_available_memory(void) {
 	size_t mem_cached	 = 0;
 	size_t mem_buffers	 = 0;
 	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == 'M' && strncmp(line, "MemAvailable:", 13) == 0) {
+			mem_available = strtoull(line + 13, NULL, 10) * 1024;
+			break;
+		}
 		if (strncmp(line, "MemFree:", 8) == 0)
 			mem_free = strtoull(line + 8, NULL, 10) * 1024;
-		else if (strncmp(line, "MemAvailable:", 13) == 0)
-			mem_available = strtoull(line + 13, NULL, 10) * 1024;
 		else if (strncmp(line, "Cached:", 7) == 0)
 			mem_cached = strtoull(line + 7, NULL, 10) * 1024;
 		else if (strncmp(line, "Buffers:", 8) == 0)
@@ -115,21 +120,45 @@ static size_t calc_per_expert_size(const model *m) {
 	return moe_calc_expert_bytes(m, first_moe, 0).total;
 }
 
-size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant) {
+int model_kv_layer_pos_cap(const model *m, int n_ctx, int kv_layer) {
+	if (kv_layer < 0 || kv_layer >= m->n_layers)
+		return n_ctx;
+	if (m->sliding_window <= 0 || !model_layer_is_sliding(m, kv_layer))
+		return n_ctx;
+	long w	   = m->sliding_window;
+	long slack = w / 4;
+	if (slack < 8)
+		slack = 8;
+	long cap = w + slack;
+	return cap >= (long)n_ctx ? n_ctx : (int)cap;
+}
+
+size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
+								  int compacted) {
 	size_t kv_cache = 0;
 	if (m->arch_info->is_mla) {
 		kv_cache = ((size_t)m->mla.kv_lora + (size_t)m->mla.qk_rope) * (size_t)n_ctx *
 				   (size_t)m->n_layers * sizeof(float);
 		return kv_cache;
 	}
-	for (int i = 0; i < m->n_layers; i++) {
+	int n_kv_layers =
+		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
+	if (n_kv_layers > m->n_layers)
+		n_kv_layers = m->n_layers;
+	for (int i = 0; i < n_kv_layers; i++) {
 		int kv_heads = model_layer_kv_heads(m, i);
-		int hdim	 = model_layer_head_dim(m, i);
+		if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
+			i < m->n_layers)
+			kv_heads = m->layer_dims.n_kv_heads_per_layer[i] > 0
+						   ? m->layer_dims.n_kv_heads_per_layer[i]
+						   : 0;
+		int hdim = model_layer_head_dim(m, i);
+		int pcap = compacted ? model_kv_layer_pos_cap(m, n_ctx, i) : n_ctx;
 		if (kv_quant == KV_QUANT_Q8_0) {
 			size_t n_blocks = ((size_t)hdim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-			kv_cache += (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)n_ctx * 2;
+			kv_cache += (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)pcap * 2;
 		} else {
-			kv_cache += (size_t)kv_heads * (size_t)hdim * (size_t)n_ctx * sizeof(uint16_t) * 2;
+			kv_cache += (size_t)kv_heads * (size_t)hdim * (size_t)pcap * sizeof(uint16_t) * 2;
 		}
 	}
 	return kv_cache;
@@ -146,52 +175,68 @@ static double to_unit(size_t bytes, mem_unit unit) {
 	return bytes / divisor;
 }
 
-static size_t calc_non_expert_bytes(const model *m) {
-	size_t embd_bytes	   = calc_embeddings_bytes(m);
-	size_t attn_bytes	   = 0;
-	size_t dense_ffn_bytes = 0;
-	size_t shexp_bytes	   = 0;
-	size_t router_bytes	   = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		attn_bytes += calc_attn_bytes(m, i);
-		dense_ffn_bytes += calc_dense_ffn_bytes(m, i);
-		shexp_bytes += calc_shared_expert_bytes(m, i);
-		router_bytes += calc_router_bytes(m, i);
-	}
-	return embd_bytes + m->dim * sizeof(float) + attn_bytes + dense_ffn_bytes + shexp_bytes +
-		   router_bytes;
+static int moe_layer_count(const model *m) {
+	int n_layers = m->n_layers - m->moe.first_dense_layer;
+	return n_layers < 0 ? 0 : n_layers;
 }
 
-size_t model_total_weight_bytes(const model *m) {
-	size_t non_expert = calc_non_expert_bytes(m);
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
-	return non_expert + total_expert;
-}
-
-size_t model_resident_weight_bytes(const model *m, const config *cfg) {
-	int full_resident = !cfg->use_mmap && cfg->moe_stream == 0;
-	if (full_resident || !m->arch_info->is_moe)
-		return model_total_weight_bytes(m);
-
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-
+static int moe_cache_cap(const model *m, const config *cfg) {
 	int cache_cap = cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
 	if (cache_cap > 1024)
 		cache_cap = 1024;
-	if (cache_cap > n_experts)
-		cache_cap = n_experts;
+	if (cache_cap > m->moe.n_experts)
+		cache_cap = m->moe.n_experts;
+	return cache_cap;
+}
 
-	size_t resident_expert = per_expert * (size_t)cache_cap * (size_t)n_layers;
-	return calc_non_expert_bytes(m) + resident_expert;
+typedef struct {
+	size_t embd;
+	size_t attn;
+	size_t dense_ffn;
+	size_t shexp;
+	size_t router;
+	size_t total;
+} non_expert_breakdown;
+
+static non_expert_breakdown calc_non_expert_breakdown(const model *m) {
+	non_expert_breakdown b = {0};
+	b.embd				   = calc_embeddings_bytes(m);
+	for (int i = 0; i < m->n_layers; i++) {
+		b.attn += calc_attn_bytes(m, i);
+		b.dense_ffn += calc_dense_ffn_bytes(m, i);
+		b.shexp += calc_shared_expert_bytes(m, i);
+		b.router += calc_router_bytes(m, i);
+	}
+	b.total = b.embd + m->dim * sizeof(float) + b.attn + b.dense_ffn + b.shexp + b.router;
+	return b;
+}
+
+static size_t calc_non_expert_bytes(const model *m) {
+	if (m->mem_estimates_valid)
+		return m->mem_non_expert_bytes;
+	return calc_non_expert_breakdown(m).total;
+}
+
+static size_t model_cached_per_expert_size(const model *m) {
+	if (m->mem_estimates_valid)
+		return m->mem_per_expert_bytes;
+	return calc_per_expert_size(m);
+}
+
+void model_mem_estimates_ensure(model *m) {
+	if (m->mem_estimates_valid)
+		return;
+	m->mem_non_expert_bytes = calc_non_expert_breakdown(m).total;
+	m->mem_per_expert_bytes = calc_per_expert_size(m);
+	m->mem_estimates_valid	= true;
+}
+
+static size_t model_total_weight_bytes(const model *m) {
+	size_t non_expert	= calc_non_expert_bytes(m);
+	size_t per_expert	= model_cached_per_expert_size(m);
+	int	   n_layers		= moe_layer_count(m);
+	size_t total_expert = per_expert * (size_t)m->moe.n_experts * (size_t)n_layers;
+	return non_expert + total_expert;
 }
 
 size_t model_pending_weight_bytes(const model *m, const config *cfg) {
@@ -199,65 +244,57 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 	if (full_resident || !m->arch_info->is_moe)
 		return cfg->use_mmap ? model_total_weight_bytes(m) : 0;
 
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-
-	int cache_cap = cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
-	if (cache_cap > 1024)
-		cache_cap = 1024;
-	if (cache_cap > n_experts)
-		cache_cap = n_experts;
+	size_t per_expert = model_cached_per_expert_size(m);
+	int	   n_layers	  = moe_layer_count(m);
+	int	   cache_cap  = moe_cache_cap(m, cfg);
 
 	return per_expert * (size_t)cache_cap * (size_t)n_layers;
 }
 
-void recommend_memory_config(const model *m, int n_ctx, size_t avail, kv_quant_type kv_quant,
-							 int is_host) {
+void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, size_t avail,
+							 kv_quant_type kv_quant, int is_host) {
 	if (n_ctx <= 0 || n_ctx > m->n_ctx)
 		n_ctx = m->n_ctx;
 	if (avail == 0)
 		return;
 
-	size_t embd_bytes	   = calc_embeddings_bytes(m);
-	size_t attn_bytes	   = 0;
-	size_t dense_ffn_bytes = 0;
-	size_t shexp_bytes	   = 0;
-	size_t router_bytes	   = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		attn_bytes += calc_attn_bytes(m, i);
-		dense_ffn_bytes += calc_dense_ffn_bytes(m, i);
-		shexp_bytes += calc_shared_expert_bytes(m, i);
-		router_bytes += calc_router_bytes(m, i);
-	}
-	size_t non_expert = embd_bytes + m->dim * sizeof(float) + attn_bytes + dense_ffn_bytes +
-						shexp_bytes + router_bytes;
-	size_t per_expert = calc_per_expert_size(m);
-	int	   n_experts  = m->moe.n_experts;
-	int	   n_layers	  = m->n_layers - m->moe.first_dense_layer;
-	if (n_layers < 0)
-		n_layers = 0;
-	int	   topk			= m->moe.n_experts_used;
-	size_t kv_cache		= model_kv_cache_bytes_quant(m, n_ctx, kv_quant);
+	non_expert_breakdown bd			= calc_non_expert_breakdown(m);
+	size_t				 non_expert = bd.total;
+	size_t				 per_expert = model_cached_per_expert_size(m);
+	int					 n_experts	= m->moe.n_experts;
+	int					 n_layers	= moe_layer_count(m);
+	int					 topk		= m->moe.n_experts_used;
+	size_t kv_cache		= model_kv_cache_bytes_quant(m, n_ctx, kv_quant,
+													 backend_has_cap(kv_backend, BCAP_KV_POS_CAP));
 	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
 
 	INFO("Available memory: %.1f GB", to_unit(avail, MEM_UNIT_GB));
 	DEBUG("memory breakdown:");
-	DEBUG("  embeddings:        %.1f MB", to_unit(embd_bytes, MEM_UNIT_MB));
-	DEBUG("  attention weights: %.1f MB", to_unit(attn_bytes, MEM_UNIT_MB));
-	if (dense_ffn_bytes > 0)
-		DEBUG("  dense FFN weights: %.1f MB", to_unit(dense_ffn_bytes, MEM_UNIT_MB));
-	if (shexp_bytes > 0)
-		DEBUG("  shared experts:    %.1f MB", to_unit(shexp_bytes, MEM_UNIT_MB));
-	if (router_bytes > 0)
-		DEBUG("  MoE routers:       %.1f MB", to_unit(router_bytes, MEM_UNIT_MB));
+	DEBUG("  embeddings:        %.1f MB", to_unit(bd.embd, MEM_UNIT_MB));
+	DEBUG("  attention weights: %.1f MB", to_unit(bd.attn, MEM_UNIT_MB));
+	if (bd.dense_ffn > 0)
+		DEBUG("  dense FFN weights: %.1f MB", to_unit(bd.dense_ffn, MEM_UNIT_MB));
+	if (bd.shexp > 0)
+		DEBUG("  shared experts:    %.1f MB", to_unit(bd.shexp, MEM_UNIT_MB));
+	if (bd.router > 0)
+		DEBUG("  MoE routers:       %.1f MB", to_unit(bd.router, MEM_UNIT_MB));
 	DEBUG("  non-expert total:  %.1f GB", to_unit(non_expert, MEM_UNIT_GB));
 	if (per_expert > 0 && n_experts > 0) {
 		DEBUG("  routed experts:    %.1f GB (%.1f MB/expert, %d experts x %d layers)",
 			  to_unit(total_expert, MEM_UNIT_GB), to_unit(per_expert, MEM_UNIT_MB), n_experts,
 			  n_layers);
+	}
+	if (m->sliding_window > 0) {
+		int n_kv_layers = m->layer_dims.n_layer_kv_from_start > 0
+							  ? m->layer_dims.n_layer_kv_from_start
+							  : m->n_layers;
+		if (n_kv_layers > m->n_layers)
+			n_kv_layers = m->n_layers;
+		int n_sliding = 0;
+		for (int i = 0; i < n_kv_layers; i++)
+			n_sliding += model_layer_is_sliding(m, i) ? 1 : 0;
+		DEBUG("  sliding window:     %d (%d/%d kv layers, cap %d)", m->sliding_window, n_sliding,
+			  n_kv_layers, model_kv_layer_pos_cap(m, n_ctx, 0));
 	}
 	DEBUG("  KV cache (ctx=%d): %.0f MB (%s)", n_ctx, to_unit(kv_cache, MEM_UNIT_MB),
 		  kv_quant == KV_QUANT_Q8_0 ? "q8_0" : "f16");

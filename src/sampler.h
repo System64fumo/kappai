@@ -9,24 +9,29 @@ typedef struct {
 } rng;
 
 typedef struct {
-	float	 temperature;
-	int		 top_k;
-	float	 top_p;
-	float	 min_p;
-	float	 repeat_penalty;
-	int		 repeat_last_n;
-	rng		 rng;
-	int32_t *recent;
-	int		 recent_count;
-	int		 recent_capacity;
-	int		 recent_head;
-	float	*logits_buf;
-	void	*cand_buf;
-	int		 buf_vocab;
-	int		 cand_vocab;
-	float	*heap_scores;
-	int32_t *heap_idx;
-	int		 heap_cap;
+	float v;
+	int	  i;
+} sampler_top_k_entry;
+
+typedef struct {
+	float				 temperature;
+	int					 top_k;
+	float				 top_p;
+	float				 min_p;
+	float				 repeat_penalty;
+	int					 repeat_last_n;
+	rng					 rng;
+	int32_t				*recent;
+	int					 recent_count;
+	int					 recent_capacity;
+	int					 recent_head;
+	float				*logits_buf;
+	sampler_top_k_entry *cand_buf;
+	int					 buf_vocab;
+	int					 cand_vocab;
+	float				*heap_scores;
+	int32_t				*heap_idx;
+	int					 heap_cap;
 } sampler;
 
 void	sampler_init(sampler *s, uint64_t seed);
@@ -37,11 +42,6 @@ void	sampler_set_vocab(sampler *s, int vocab_size);
 void	sampler_observe(sampler *s, int32_t token);
 int32_t sampler_sample(sampler *s, const float *logits, int vocab);
 int32_t sampler_argmax(const float *logits, int vocab);
-
-typedef struct {
-	float v;
-	int	  i;
-} sampler_top_k_entry;
 
 int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out);
 

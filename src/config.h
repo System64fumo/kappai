@@ -68,7 +68,7 @@ typedef struct {
 	bool is_server;
 } cli_args;
 
-void usage(FILE *fp, bool is_server);
+void config_usage(FILE *fp, bool is_server);
 
 int parse_args(int argc, char **argv, config *cfg, cli_args *a);
 

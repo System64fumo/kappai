@@ -2,7 +2,6 @@
 #define TEST_CORE_H
 
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
 #include "common.h"
 #include "compute.h"
 #include "kvcache.h"
@@ -13,6 +12,7 @@
 #include "recipe.h"
 #include "sampler.h"
 #include "tokenizer.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,17 +53,21 @@ typedef enum {
 	OPFAM_FFN_ACTIVATE_EX,
 	OPFAM_ATTENTION,
 	OPFAM_ATTENTION_SWA,
+	OPFAM_ATTENTION_MLA,
 	OPFAM_KV_PUT,
 	OPFAM_ARGMAX,
 	OPFAM_ARCH_LAYER,
 	OPFAM_ARCH_PIPELINE,
 	OPFAM_QUANT,
 	OPFAM_DEQUANT_PARITY,
+	OPFAM_DEQUANT_WEIGHT,
 	OPFAM_ARCH_DECODE,
 	OPFAM_ARCH_COMPOUND,
 	OPFAM_ARCH_GENERATE,
 	OPFAM_MATMUL_RESIDUAL,
+	OPFAM_MATMUL_FFN_DOWN,
 	OPFAM_ROPE_QK,
+	OPFAM_BATCH_PARITY,
 	OPFAM_EDGE_CASE,
 	OPFAM_REPACK_PARITY,
 	OPFAM_KV_QUANT_PARITY,
@@ -114,20 +118,34 @@ const char *op_family_name(op_family f);
 void		stats_reset(void);
 void		compute_debug(const float *y_ref, const float *y_got, int n);
 void		record_result(op_family fam, const char *label, verdict v, const char *detail);
+void		record_resultf(op_family fam, const char *label, int ok, const char *fmt, ...);
 void		flush_family(op_family fam);
 float		max_abs_diff_at(const float *a, const float *b, int n, int *at);
 float		max_abs_val(const float *a, int n);
 int			count_nonfinite(const float *a, int n);
+void		describe_nonfinite(const float *a, int n, int stride_hint, char *out, size_t out_sz);
 float max_combined_ratio_at(const float *a, const float *b, int n, float atol, float rtol, int *at);
-verdict	 classify_output(const char *tol_kind, const float *y_ref, const float *y_got, int n,
-						 status_code tgt_status, char *detail, size_t detail_sz);
-uint32_t next_u32(void);
-void	 seed_test_rng(uint64_t s);
-void	 fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t type);
-void	 fill_random_f32(float *x, int n, float scale);
-int		 test_type_per_row(uint32_t type);
-void	*test_make_weight(const qtype_info *qt, int n_rows, int k, size_t *out_bytes);
+verdict		classify_output(const char *tol_kind, const float *y_ref, const float *y_got, int n,
+							status_code tgt_status, char *detail, size_t detail_sz);
+uint32_t	next_u32(void);
+void		seed_test_rng(uint64_t s);
+void		fill_random_blocks(void *blocks, int n_blocks, size_t block_bytes, uint32_t type);
+void		fill_random_f32(float *x, int n, float scale);
+void		fill_random_f16(uint16_t *x, int n);
+void		fill_random_bf16(uint16_t *x, int n);
+float		test_f16_to_f32(uint16_t h);
+uint16_t	test_f32_to_f16(float f);
+status_code test_repack(backend *b, uint32_t src_type, const void *src, void *dst, int n_rows,
+						int k);
+int			test_repack_base_type(uint32_t type, uint32_t *base_type_out);
+int			test_repack_n_align(uint32_t type);
+int			test_type_per_row(uint32_t type);
+void *test_make_weight(backend *b, const qtype_info *qt, int n_rows, int k, size_t *out_bytes);
 
+void test_parity_compare(op_family fam, const char *label, const float *y_ref, const float *y_got,
+						 int n, const char *tol_kind);
+void test_parity_compare_status(op_family fam, const char *label, const float *y_ref,
+								const float *y_got, int n, status_code s_tgt);
 void print_summary_table(void);
 void print_final_results(void);
 int	 matches_name(int argc, char **argv, const char *name);
@@ -135,8 +153,8 @@ int	 wants_all(int argc, char **argv);
 void usage(const char *prog);
 
 int	 run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends);
-void run_per_op_tests(backend *cpu, backend *tgt);
-void run_arch_tests(backend *cpu, backend *tgt);
+void run_per_op_tests(backend *ref, backend *tgt);
+void run_arch_tests(backend *ref, backend *tgt);
 
 void		synth_suite_common_init(void);
 extern char synth_fixture_dir[256];
@@ -146,16 +164,18 @@ extern char synth_dsa_model_path[512];
 void		run_sampler_tests(void);
 void		run_tokenizer_tests(void);
 void		run_jinja_tests(void);
-void		run_hybrid_state_tests(backend *cpu);
+void		run_hybrid_state_tests(backend *ref);
 void		run_orchestration_tests(void);
 void		run_moe_stream_tests(void);
 void		run_toolcall_tests(void);
-void		test_quant_determinism(const qtype_info *qt);
-void		test_quant_finiteness(const qtype_info *qt);
-void		test_quant_q8_0_roundtrip(void);
-void		run_repack_parity_tests(backend *cpu);
-void test_dequant_parity_cross(backend *cpu, backend *tgt, const qtype_info *qt, int dim, int n);
-int	 run_matmul_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
+void		test_quant_determinism(backend *ref, const qtype_info *qt);
+void		test_quant_finiteness(backend *ref, const qtype_info *qt);
+void		test_quant_q8_0_roundtrip(backend *ref);
+void		run_repack_parity_tests(backend *ref, backend *tgt);
+void test_dequant_parity_cross(backend *ref, backend *tgt, const qtype_info *qt, int dim, int n);
+void test_dequant_weight_parity(backend *ref, backend *tgt, const qtype_info *qt, int k,
+								int n_rows);
+int	 run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
 int	 run_model_mode(int argc, char **argv, backend_info *infos, int n_backends);
 
 #endif

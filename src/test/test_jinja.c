@@ -37,14 +37,7 @@ static int render_ok(const char *tmpl, jinja_value *globals, char *out, size_t o
 	return 1;
 }
 
-static void record_jinja(const char *label, int ok, const char *detail_fmt, ...) {
-	char	detail[256];
-	va_list ap;
-	va_start(ap, detail_fmt);
-	vsnprintf(detail, sizeof(detail), detail_fmt, ap);
-	va_end(ap);
-	record_result(OPFAM_EDGE_CASE, label, ok ? V_PASS : V_FAIL, detail);
-}
+#define record_jinja(label, ok, ...) record_resultf(OPFAM_EDGE_CASE, (label), (ok), __VA_ARGS__)
 
 static void test_replace_method(void) {
 	char out[256];
@@ -168,7 +161,7 @@ static void test_for_over_dict(void) {
 
 	char out[256];
 	int	 ok	   = render_ok("{% for k in d %}{{ k }},{% endfor %}", g, out, sizeof(out));
-	int	 match = ok && strcmp(out, "three,two,one,") == 0;
+	int	 match = ok && strcmp(out, "one,two,three,") == 0;
 	record_jinja("jinja.for_over_dict_keys", match, "dict keys -> '%s'", out);
 }
 

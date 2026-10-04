@@ -13,9 +13,6 @@
 #include <pthread.h>
 #include <signal.h>
 
-#define CTX_INTERRUPTED (-2)
-#define CTX_COMPUTE_ERROR (-3)
-
 typedef struct {
 	model				  m;
 	tokenizer			  tok;
@@ -55,6 +52,9 @@ typedef struct {
 		int		 cap;
 		int32_t	 n;
 	} fed_ids;
+
+	char   *sync_render;
+	int32_t sync_tok;
 } context;
 
 typedef struct {

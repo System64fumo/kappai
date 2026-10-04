@@ -8,6 +8,7 @@
 #include "kvcache.h"
 #include "log.h"
 #include "model.h"
+#include "moe/moe_common.h"
 #include "moe/moe_stream.h"
 #include "profile.h"
 #include "recipe.h"
@@ -25,6 +26,8 @@ typedef struct compute_scratch {
 	float		*rope_cos_swa, *rope_sin_swa;
 	buffer		 ple_inp;
 	buffer		 ple_slice;
+	buffer		 ple_inp_mirror;
+	buffer		 ple_slice_mirror;
 	buffer		 ple_all;
 	buffer		 ple_proj;
 	buffer		 ple_proj_norm_w;
@@ -72,7 +75,7 @@ typedef struct compute_scratch {
 	float_buf gdn_beta_host;
 	float_buf gdn_out_host;
 
-	moe_expert_slot moe_slot_buf[512];
+	moe_expert_slot *moe_slot_buf;
 
 	layer_progress_cb			 layer_cb;
 	void						*layer_cb_ud;
@@ -81,10 +84,6 @@ typedef struct compute_scratch {
 	batch_scratch *bs;
 	float_buf	   batch_logits_tmp;
 } compute_scratch;
-
-static inline int compute_model_changed(const compute_scratch *s, const model *m, int n_ctx) {
-	return s->last_model != m || s->allocated_n_ctx < n_ctx;
-}
 
 void		compute_scratch_init(compute_scratch *s);
 void		compute_scratch_free(compute_scratch *s);
@@ -101,7 +100,7 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 
-status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m, int n_ctx);
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
 status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
 static inline backend *compute_active_backend(compute_scratch *s) {

@@ -19,8 +19,6 @@ void openai_install_signals(void);
 
 void openai_wait_for_signal(void);
 
-void openai_stop(openai_state *st);
-
 void openai_free(openai_state *st);
 
 #endif

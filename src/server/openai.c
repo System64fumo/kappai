@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "json-c/json.h"
+#include "json_helpers.h"
 #include "log.h"
 #include "microhttpd.h"
 #include "sampler.h"
@@ -22,15 +23,6 @@
 #define SSE_POLL_SEC 1
 
 typedef struct {
-	char		*role;
-	char		*content;
-	char		*reasoning_content;
-	json_object *tool_calls;
-	const char	*tool_call_id;
-	const char	*name;
-} oa_message;
-
-typedef struct {
 	bool	 stream;
 	bool	 include_usage;
 	float	 temperature;
@@ -41,11 +33,13 @@ typedef struct {
 	bool	 has_seed;
 	uint64_t seed;
 
-	json_object *stop;
 	size_t		 n_stop;
+	const char **stop_needles;
+	size_t		*stop_lens;
+	size_t		 stop_max;
 
-	oa_message *messages;
-	size_t		n_messages;
+	chat_message *messages;
+	size_t		  n_messages;
 
 	json_object *tools;
 	char		*tool_choice;
@@ -53,6 +47,11 @@ typedef struct {
 
 	char *prompt;
 } oa_req_params;
+
+typedef struct {
+	char  *data;
+	size_t len;
+} sse_frame;
 
 typedef struct {
 	openai_state  *st;
@@ -66,20 +65,20 @@ typedef struct {
 
 	pthread_mutex_t q_mtx;
 	pthread_cond_t	q_cv;
-	char		  **queue;
-	size_t		   *frame_lens;
+	sse_frame	   *queue;
 	size_t			q_len;
 	size_t			q_cap;
 	size_t			q_off;
 	bool			producer_done;
 	bool			client_gone;
 
-	toolcall_buf content;
-	toolcall_buf reasoning;
+	str_builder content;
+	str_builder reasoning;
 
-	bool in_thinking;
-	bool first_token;
-	bool skip_label;
+	char  *stop_window;
+	size_t stop_window_cap;
+
+	think_filter think;
 
 	bool stopped_by_stop;
 	bool sent_any_chunk;
@@ -98,10 +97,8 @@ struct req_ctx {
 	openai_state *st;
 	atomic_int	  refs;
 
-	char  *body;
-	size_t body_len;
-	size_t body_cap;
-	bool   too_large;
+	str_builder body;
+	bool		too_large;
 
 	oa_req_params params;
 	json_object	 *body_json;
@@ -137,9 +134,8 @@ struct openai_state {
 static sigset_t g_signal_mask;
 
 static char *derive_model_id(const char *model_path) {
-	const char *base = strrchr(model_path, '/');
-	base			 = base ? base + 1 : model_path;
-	size_t len		 = strlen(base);
+	const char *base = path_basename(model_path);
+	size_t		len	 = strlen(base);
 	if (len > 5 && !strcasecmp(base + len - 5, ".gguf"))
 		len -= 5;
 	char *id = xmalloc(len + 1);
@@ -175,8 +171,8 @@ static enum MHD_Result respond_json(struct MHD_Connection *conn, unsigned int st
 static json_object *error_body(const char *message, const char *type) {
 	json_object *root = json_object_new_object();
 	json_object *err  = json_object_new_object();
-	json_object_object_add(err, "message", json_object_new_string(message));
-	json_object_object_add(err, "type", json_object_new_string(type));
+	json_set_str(err, "message", message);
+	json_set_str(err, "type", type);
 	json_object_object_add(err, "param", NULL);
 	json_object_object_add(err, "code", NULL);
 	json_object_object_add(root, "error", err);
@@ -194,186 +190,156 @@ static bool shutting_down(openai_state *st) {
 	return atomic_load_explicit(&st->shutting_down, memory_order_relaxed);
 }
 
+static inline bool gen_dead(const oa_gen *g) {
+	return g->client_gone || shutting_down(g->st);
+}
+
 static char *extract_message_content(json_object *msg) {
-	json_object *c;
-	if (!json_object_object_get_ex(msg, "content", &c) || json_object_is_type(c, json_type_null))
+	json_object *c = json_get(msg, "content");
+	if (!c || json_object_is_type(c, json_type_null))
 		return xstrdup("");
 	if (json_object_is_type(c, json_type_string))
 		return xstrdup(json_object_get_string(c));
 	if (json_object_is_type(c, json_type_array)) {
-		char  *out = NULL;
-		size_t len = 0, cap = 0;
-		size_t n = json_object_array_length(c);
-		for (size_t i = 0; i < n; i++) {
-			json_object *part = json_object_array_get_idx(c, i);
+		str_builder sb;
+		sb_init(&sb);
+		json_arr_iter it = json_arr_begin(c);
+		json_object	 *part;
+		while (json_arr_next(&it, &part)) {
 			if (!json_object_is_type(part, json_type_object))
 				continue;
-			json_object *type, *text;
-			const char	*ts = "";
-			if (json_object_object_get_ex(part, "type", &type) &&
-				json_object_is_type(type, json_type_string))
-				ts = json_object_get_string(type);
+			const char *ts = json_get_str(part, "type", "");
 			if (*ts && strcmp(ts, "text") != 0)
 				continue;
-			if (!json_object_object_get_ex(part, "text", &text) ||
-				!json_object_is_type(text, json_type_string))
-				continue;
-			const char *t	 = json_object_get_string(text);
-			size_t		tlen = strlen(t);
-			if (len + tlen + 1 > cap) {
-				cap = (len + tlen + 1) * 2;
-				out = xrealloc(out, cap);
-			}
-			memcpy(out + len, t, tlen);
-			len += tlen;
-			out[len] = '\0';
+			sb_puts(&sb, json_get_str(part, "text", NULL));
 		}
-		return out ? out : xstrdup("");
+		return sb_finish(&sb);
 	}
 	return xstrdup("");
 }
 
-static double get_num_or(json_object *root, const char *key, double fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v))
-		return fallback;
-	return json_object_get_double(v);
-}
-
-static bool get_bool_or(json_object *root, const char *key, bool fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v) || !json_object_is_type(v, json_type_boolean))
-		return fallback;
-	return json_object_get_boolean(v);
-}
-
-static int64_t get_int_or(json_object *root, const char *key, int64_t fallback) {
-	json_object *v;
-	if (!json_object_object_get_ex(root, key, &v))
-		return fallback;
-	return json_object_get_int64(v);
-}
-
 static const char *parse_stop(json_object *root, oa_req_params *p) {
-	json_object *stop;
-	if (!json_object_object_get_ex(root, "stop", &stop))
+	json_object *stop = json_get(root, "stop");
+	if (!stop)
 		return NULL;
 	if (json_object_is_type(stop, json_type_string)) {
-		p->stop	  = stop;
-		p->n_stop = json_object_get_string_len(stop) ? 1 : 0;
+		size_t l = (size_t)json_object_get_string_len(stop);
+		if (l == 0)
+			return NULL;
+		p->stop_needles	   = xmalloc(sizeof(*p->stop_needles));
+		p->stop_lens	   = xmalloc(sizeof(*p->stop_lens));
+		p->stop_needles[0] = json_object_get_string(stop);
+		p->stop_lens[0]	   = l;
+		p->stop_max		   = l;
+		p->n_stop		   = 1;
 		return NULL;
 	}
 	if (json_object_is_type(stop, json_type_array)) {
-		p->stop	 = stop;
-		size_t n = json_object_array_length(stop);
-		for (size_t i = 0; i < n; i++) {
-			json_object *item = json_object_array_get_idx(stop, i);
+		json_arr_iter it = json_arr_begin(stop);
+		json_object	 *item;
+		size_t		  cap = 0;
+		size_t		  n	  = 0;
+		while (json_arr_next(&it, &item)) {
 			if (!json_object_is_type(item, json_type_string))
 				continue;
-			if (json_object_get_string_len(item) == 0)
+			size_t l = (size_t)json_object_get_string_len(item);
+			if (l == 0)
 				continue;
-			p->n_stop++;
+			if (n >= cap) {
+				cap				= cap ? cap * 2 : 4;
+				p->stop_needles = xrealloc(p->stop_needles, cap * sizeof(*p->stop_needles));
+				p->stop_lens	= xrealloc(p->stop_lens, cap * sizeof(*p->stop_lens));
+			}
+			p->stop_needles[n] = json_object_get_string(item);
+			p->stop_lens[n]	   = l;
+			if (l > p->stop_max)
+				p->stop_max = l;
+			n++;
 		}
+		p->n_stop = n;
 		return NULL;
 	}
 	return "'stop' must be a string or an array of strings";
 }
 
 static void parse_sampling_params(json_object *root, oa_req_params *p) {
-	p->stream		 = get_bool_or(root, "stream", false);
+	p->stream		 = json_get_bool(root, "stream", false);
 	p->include_usage = false;
-	json_object *so;
-	if (json_object_object_get_ex(root, "stream_options", &so) &&
-		json_object_is_type(so, json_type_object))
-		p->include_usage = get_bool_or(so, "include_usage", false);
+	json_object *so	 = json_get_obj(root, "stream_options");
+	if (so)
+		p->include_usage = json_get_bool(so, "include_usage", false);
 
-	double d	   = get_num_or(root, "temperature", 0.80);
+	double d	   = json_get_num(root, "temperature", 0.80);
 	p->temperature = d < 0 ? 0 : (d > 2 ? 2 : (float)d);
-	d			   = get_num_or(root, "top_p", 0.90);
+	d			   = json_get_num(root, "top_p", 0.90);
 	p->top_p	   = d <= 0 ? 1e-3f : (d > 1 ? 1 : (float)d);
-	d			   = get_num_or(root, "min_p", 0.10);
+	d			   = json_get_num(root, "min_p", 0.10);
 	p->min_p	   = d < 0 ? 0 : (d > 1 ? 1 : (float)d);
 
-	int64_t k = get_int_or(root, "top_k", 40);
+	int64_t k = json_get_int(root, "top_k", 40);
 	p->top_k  = k < 0 ? 0 : (int)(k > INT_MAX ? INT_MAX : k);
 
 	int64_t mt = -1;
-	mt		   = get_int_or(root, "max_completion_tokens", mt);
+	mt		   = json_get_int(root, "max_completion_tokens", mt);
 	if (mt < 0)
-		mt = get_int_or(root, "max_tokens", -1);
+		mt = json_get_int(root, "max_tokens", -1);
 	p->max_tokens = (int)(mt > 100000000 ? 100000000 : mt);
 
 	p->has_seed = false;
-	json_object *seed;
-	if (json_object_object_get_ex(root, "seed", &seed) &&
-		json_object_is_type(seed, json_type_int)) {
-		int64_t s = json_object_get_int64(seed);
-		if (s >= 0) {
-			p->has_seed = true;
-			p->seed		= (uint64_t)s;
-		}
+	int64_t s	= json_get_int(root, "seed", -1);
+	if (s >= 0) {
+		p->has_seed = true;
+		p->seed		= (uint64_t)s;
 	}
 
 	parse_stop(root, p);
 }
 
-static uint64_t fnv1a_update(uint64_t h, const char *s) {
-	if (!s)
-		return h;
-	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-		h ^= *p;
-		h *= 1099511628211ULL;
-	}
+static uint64_t oa_message_hash(uint64_t h, const chat_message *m) {
+	h = fnv1a_update_str(h, m->role);
+	h = fnv1a_update_str(h, "\x1f");
+	h = fnv1a_update_str(h, m->content);
+	h = fnv1a_update_str(h, m->reasoning_content ? m->reasoning_content : "");
+	if (m->tool_calls)
+		h = fnv1a_update_str(h, json_object_to_json_string(m->tool_calls));
+	h = fnv1a_update_str(h, "\x1f");
+	h = fnv1a_update_str(h, m->tool_call_id ? m->tool_call_id : "");
+	h = fnv1a_update_str(h, "\x1f");
+	h = fnv1a_update_str(h, m->name ? m->name : "");
+	h = fnv1a_update_str(h, "\x1e");
 	return h;
 }
 
 static uint64_t *session_prefix_hash_chain(const oa_req_params *p, size_t *out_len) {
 	size_t	  len	= p->n_messages > 0 ? p->n_messages - 1 : 0;
 	uint64_t *chain = xmalloc((len + 1) * sizeof(uint64_t));
-	uint64_t  h		= 1469598103934665603ULL;
+	uint64_t  h		= FNV1A_OFFSET_BASIS;
 	if (p->tools)
-		h = fnv1a_update(h, json_object_to_json_string(p->tools));
-	h		 = fnv1a_update(h, "\x1f");
-	h		 = fnv1a_update(h, p->tool_choice ? p->tool_choice : "");
-	h		 = fnv1a_update(h, p->forced_function ? p->forced_function : "");
-	h		 = fnv1a_update(h, "\x1e");
+		h = fnv1a_update_str(h, json_object_to_json_string(p->tools));
+	h		 = fnv1a_update_str(h, "\x1f");
+	h		 = fnv1a_update_str(h, p->tool_choice ? p->tool_choice : "");
+	h		 = fnv1a_update_str(h, p->forced_function ? p->forced_function : "");
+	h		 = fnv1a_update_str(h, "\x1e");
 	chain[0] = h;
 	for (size_t i = 0; i < len; i++) {
-		h = chain[i];
-		h = fnv1a_update(h, p->messages[i].role);
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].content);
-		h = fnv1a_update(h,
-						 p->messages[i].reasoning_content ? p->messages[i].reasoning_content : "");
-		if (p->messages[i].tool_calls)
-			h = fnv1a_update(h, json_object_to_json_string(p->messages[i].tool_calls));
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].tool_call_id ? p->messages[i].tool_call_id : "");
-		h = fnv1a_update(h, "\x1f");
-		h = fnv1a_update(h, p->messages[i].name ? p->messages[i].name : "");
-		h = fnv1a_update(h, "\x1e");
-		chain[i + 1] = h;
+		chain[i + 1] = oa_message_hash(chain[i], &p->messages[i]);
 	}
 	*out_len = len;
 	return chain;
 }
 
 static const char *parse_tools_array(json_object *root, oa_req_params *p) {
-	json_object *tools;
-	if (!json_object_object_get_ex(root, "tools", &tools) ||
-		json_object_is_type(tools, json_type_null))
+	json_object *tools = json_get(root, "tools");
+	if (!tools || json_object_is_type(tools, json_type_null))
 		return NULL;
 	if (!json_object_is_type(tools, json_type_array))
 		return "'tools' must be an array";
-	size_t n = json_object_array_length(tools);
-	for (size_t i = 0; i < n; i++) {
-		json_object *t	= json_object_array_get_idx(tools, i);
-		json_object *fn = NULL, *nm = NULL;
-		if (!json_object_is_type(t, json_type_object) ||
-			!json_object_object_get_ex(t, "function", &fn) ||
-			!json_object_is_type(fn, json_type_object) ||
-			!json_object_object_get_ex(fn, "name", &nm) ||
-			!json_object_is_type(nm, json_type_string) || !json_object_get_string_len(nm))
+	json_arr_iter it = json_arr_begin(tools);
+	json_object	 *t;
+	while (json_arr_next(&it, &t)) {
+		json_object *fn = json_get_obj(t, "function");
+		const char	*nm = fn ? json_get_str(fn, "name", "") : "";
+		if (!json_object_is_type(t, json_type_object) || !fn || !*nm)
 			return "'tools[]' must be {type:'function', function:{name:'<non-empty>', ...}}";
 	}
 	p->tools = tools;
@@ -381,10 +347,9 @@ static const char *parse_tools_array(json_object *root, oa_req_params *p) {
 }
 
 static const char *parse_tool_choice(json_object *root, oa_req_params *p) {
-	p->tool_choice = xstrdup("auto");
-	json_object *tc;
-	if (!json_object_object_get_ex(root, "tool_choice", &tc) ||
-		json_object_is_type(tc, json_type_null))
+	p->tool_choice	= xstrdup("auto");
+	json_object *tc = json_get(root, "tool_choice");
+	if (!tc || json_object_is_type(tc, json_type_null))
 		return NULL;
 
 	if (json_object_is_type(tc, json_type_string)) {
@@ -397,18 +362,14 @@ static const char *parse_tool_choice(json_object *root, oa_req_params *p) {
 	}
 
 	if (json_object_is_type(tc, json_type_object)) {
-		json_object *t2, *f2, *n2;
-		if (!json_object_object_get_ex(tc, "type", &t2) ||
-			!json_object_is_type(t2, json_type_string) ||
-			strcmp(json_object_get_string(t2), "function") ||
-			!json_object_object_get_ex(tc, "function", &f2) ||
-			!json_object_is_type(f2, json_type_object) ||
-			!json_object_object_get_ex(f2, "name", &n2) ||
-			!json_object_is_type(n2, json_type_string))
+		const char	*t2 = json_get_str(tc, "type", "");
+		json_object *f2 = json_get_obj(tc, "function");
+		const char	*n2 = f2 ? json_get_str(f2, "name", NULL) : NULL;
+		if (strcmp(t2, "function") || !f2 || !n2)
 			return "'tool_choice' object must be {type:'function', function:{name:...}}";
 		free(p->tool_choice);
 		p->tool_choice	   = xstrdup("required");
-		p->forced_function = xstrdup(json_object_get_string(n2));
+		p->forced_function = xstrdup(n2);
 		return NULL;
 	}
 
@@ -431,9 +392,8 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 	if (terr)
 		return terr;
 
-	json_object *msgs;
-	if (!json_object_object_get_ex(root, "messages", &msgs) ||
-		!json_object_is_type(msgs, json_type_array))
+	json_object *msgs = json_get_arr(root, "messages");
+	if (!msgs)
 		return "'messages' must be a non-empty array";
 	size_t n = json_object_array_length(msgs);
 	if (n == 0)
@@ -444,32 +404,21 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 		json_object *m = json_object_array_get_idx(msgs, i);
 		if (!json_object_is_type(m, json_type_object))
 			return "every element of 'messages' must be an object";
-		json_object *role;
-		const char	*r = "user";
-		if (json_object_object_get_ex(m, "role", &role) &&
-			json_object_is_type(role, json_type_string))
-			r = json_object_get_string(role);
-		p->messages[i].role	   = xstrdup(r);
+		p->messages[i].role	   = xstrdup(json_get_str(m, "role", "user"));
 		p->messages[i].content = extract_message_content(m);
 
-		json_object *rc;
-		if (json_object_object_get_ex(m, "reasoning_content", &rc) &&
-			json_object_is_type(rc, json_type_string))
-			p->messages[i].reasoning_content = xstrdup(json_object_get_string(rc));
+		const char *rc = json_get_str(m, "reasoning_content", NULL);
+		if (rc)
+			p->messages[i].reasoning_content = xstrdup(rc);
 
-		json_object *tcs;
-		if (json_object_object_get_ex(m, "tool_calls", &tcs) &&
-			json_object_is_type(tcs, json_type_array))
+		json_object *tcs = json_get_arr(m, "tool_calls");
+		if (tcs)
 			p->messages[i].tool_calls = tcs;
 
-		json_object *tcid;
-		if (json_object_object_get_ex(m, "tool_call_id", &tcid) &&
-			json_object_is_type(tcid, json_type_string))
-			p->messages[i].tool_call_id = json_object_get_string(tcid);
-
-		json_object *nm;
-		if (json_object_object_get_ex(m, "name", &nm) && json_object_is_type(nm, json_type_string))
-			p->messages[i].name = json_object_get_string(nm);
+		const char *tcid			= json_get_str(m, "tool_call_id", NULL);
+		const char *nm				= json_get_str(m, "name", NULL);
+		p->messages[i].tool_call_id = tcid ? xstrdup(tcid) : NULL;
+		p->messages[i].name			= nm ? xstrdup(nm) : NULL;
 	}
 	p->n_messages = n;
 	return NULL;
@@ -478,8 +427,8 @@ static const char *parse_chat_request(json_object *root, oa_req_params *p) {
 static const char *parse_completion_request(json_object *root, oa_req_params *p) {
 	parse_sampling_params(root, p);
 
-	json_object *prompt;
-	if (!json_object_object_get_ex(root, "prompt", &prompt))
+	json_object *prompt = json_get(root, "prompt");
+	if (!prompt)
 		return "'prompt' is required";
 	if (json_object_is_type(prompt, json_type_string)) {
 		p->prompt = xstrdup(json_object_get_string(prompt));
@@ -490,23 +439,14 @@ static const char *parse_completion_request(json_object *root, oa_req_params *p)
 		for (size_t i = 0; i < n; i++)
 			if (!json_object_is_type(json_object_array_get_idx(prompt, i), json_type_string))
 				return "'prompt' array elements must be strings";
-		size_t cap = 256, len = 0;
-		char  *out = xmalloc(cap);
-		out[0]	   = '\0';
+		str_builder sb;
+		sb_init(&sb);
 		for (size_t i = 0; i < n; i++) {
-			const char *s  = json_object_get_string(json_object_array_get_idx(prompt, i));
-			size_t		sl = strlen(s);
-			while (len + sl + 2 > cap) {
-				cap *= 2;
-				out = xrealloc(out, cap);
-			}
 			if (i)
-				out[len++] = '\n';
-			memcpy(out + len, s, sl);
-			len += sl;
-			out[len] = '\0';
+				sb_putc(&sb, '\n');
+			sb_puts(&sb, json_object_get_string(json_object_array_get_idx(prompt, i)));
 		}
-		p->prompt = out;
+		p->prompt = sb_finish(&sb);
 		return NULL;
 	}
 	return "'prompt' must be a string";
@@ -517,11 +457,15 @@ static void free_req_params(oa_req_params *p) {
 		free(p->messages[i].role);
 		free(p->messages[i].content);
 		free(p->messages[i].reasoning_content);
+		free(p->messages[i].tool_call_id);
+		free(p->messages[i].name);
 	}
 	free(p->messages);
 	free(p->prompt);
 	free(p->tool_choice);
 	free(p->forced_function);
+	free(p->stop_needles);
+	free(p->stop_lens);
 	memset(p, 0, sizeof(*p));
 }
 
@@ -532,14 +476,14 @@ static void rc_ref(req_ctx *rc) {
 static void rc_unref(req_ctx *rc) {
 	if (!rc || atomic_fetch_sub_explicit(&rc->refs, 1, memory_order_acq_rel) != 1)
 		return;
-	free(rc->body);
+	sb_free(&rc->body);
 	json_object_put(rc->body_json);
 	for (size_t i = 0; i < rc->gen.q_len; i++)
-		free(rc->gen.queue[i]);
+		free(rc->gen.queue[i].data);
 	free(rc->gen.queue);
-	free(rc->gen.frame_lens);
 	free(rc->gen.content.p);
 	free(rc->gen.reasoning.p);
+	free(rc->gen.stop_window);
 	toolcall_scanner_free(rc->gen.tsc);
 	pthread_mutex_destroy(&rc->gen.q_mtx);
 	pthread_cond_destroy(&rc->gen.q_cv);
@@ -560,19 +504,15 @@ static req_ctx *rc_new(openai_state *st) {
 
 static void gen_queue_push(oa_gen *g, const char *payload, size_t len) {
 	pthread_mutex_lock(&g->q_mtx);
-	if (!g->client_gone && !shutting_down(g->st)) {
+	if (!gen_dead(g)) {
 		ARR_RESERVE(g->queue, g->q_len, g->q_cap);
-		if (g->q_cap && !g->frame_lens)
-			g->frame_lens = xmalloc(g->q_cap * sizeof(*g->frame_lens));
-		else if (g->frame_lens && g->q_len == g->q_cap)
-			g->frame_lens = xrealloc(g->frame_lens, g->q_cap * sizeof(*g->frame_lens));
 		char *frame = xmalloc(6 + len + 2);
 		memcpy(frame, "data: ", 6);
 		memcpy(frame + 6, payload, len);
 		frame[6 + len]			= '\n';
 		frame[6 + len + 1]		= '\n';
-		g->queue[g->q_len]		= frame;
-		g->frame_lens[g->q_len] = len + 8;
+		g->queue[g->q_len].data = frame;
+		g->queue[g->q_len].len	= len + 8;
 		g->q_len++;
 	}
 	pthread_cond_broadcast(&g->q_cv);
@@ -614,74 +554,68 @@ static const char *compute_finish_reason(const oa_gen *g) {
 
 static json_object *chunk_head(oa_gen *g, const char *object) {
 	json_object *chunk = json_object_new_object();
-	json_object_object_add(chunk, "id", json_object_new_string(g->id));
-	json_object_object_add(chunk, "object", json_object_new_string(object));
+	json_set_str(chunk, "id", g->id);
+	json_set_str(chunk, "object", object);
 	json_object_object_add(chunk, "created", json_object_new_int64((int64_t)time(NULL)));
-	json_object_object_add(chunk, "model", json_object_new_string(g->st->model_id));
+	json_set_str(chunk, "model", g->st->model_id);
 	return chunk;
 }
 
 static void append_usage(json_object *root, int prompt_tokens, int completion_tokens) {
 	json_object *usage = json_object_new_object();
-	json_object_object_add(usage, "prompt_tokens", json_object_new_int(prompt_tokens));
-	json_object_object_add(usage, "completion_tokens", json_object_new_int(completion_tokens));
-	json_object_object_add(usage, "total_tokens",
-						   json_object_new_int(prompt_tokens + completion_tokens));
+	json_set_int(usage, "prompt_tokens", prompt_tokens);
+	json_set_int(usage, "completion_tokens", completion_tokens);
+	json_set_int(usage, "total_tokens", prompt_tokens + completion_tokens);
 	json_object_object_add(root, "usage", usage);
 }
 
-static json_object *chat_choice_delta(json_object *delta, const char *finish_reason) {
+static json_object *stream_choice(const char *payload_key, json_object *payload,
+								  const char *finish_reason) {
 	json_object *choice = json_object_new_object();
-	json_object_object_add(choice, "index", json_object_new_int(0));
-	json_object_object_add(choice, "delta", delta ? delta : json_object_new_object());
+	json_set_int(choice, "index", 0);
+	json_object_object_add(choice, payload_key, payload ? payload : json_object_new_object());
 	json_object_object_add(choice, "logprobs", NULL);
 	json_object_object_add(choice, "finish_reason",
 						   finish_reason ? json_object_new_string(finish_reason) : NULL);
 	return choice;
 }
 
+static json_object *chat_choice_delta(json_object *delta, const char *finish_reason) {
+	return stream_choice("delta", delta, finish_reason);
+}
+
 static json_object *text_choice_delta(const char *piece, size_t n, const char *finish_reason) {
-	json_object *choice = json_object_new_object();
-	json_object_object_add(choice, "text", json_object_new_string_len(piece ? piece : "", (int)n));
-	json_object_object_add(choice, "index", json_object_new_int(0));
-	json_object_object_add(choice, "logprobs", NULL);
-	json_object_object_add(choice, "finish_reason",
-						   finish_reason ? json_object_new_string(finish_reason) : NULL);
-	return choice;
+	return stream_choice("text", json_object_new_string_len(piece ? piece : "", (int)n),
+						 finish_reason);
 }
 
 static json_object *build_completion_body(req_ctx *rc, bool chat_api) {
 	oa_gen		 *g	   = &rc->gen;
 	openai_state *st   = rc->st;
 	json_object	 *root = json_object_new_object();
-	json_object_object_add(root, "id", json_object_new_string(g->id));
-	json_object_object_add(
-		root, "object", json_object_new_string(chat_api ? "chat.completion" : "text_completion"));
+	json_set_str(root, "id", g->id);
+	json_set_str(root, "object", chat_api ? "chat.completion" : "text_completion");
 	json_object_object_add(root, "created", json_object_new_int64((int64_t)time(NULL)));
-	json_object_object_add(root, "model", json_object_new_string(st->model_id));
+	json_set_str(root, "model", st->model_id);
 
 	json_object *choices = json_object_new_array();
 	json_object *choice	 = json_object_new_object();
-	json_object_object_add(choice, "index", json_object_new_int(0));
+	json_set_int(choice, "index", 0);
 	if (chat_api) {
 		json_object *msg = json_object_new_object();
-		json_object_object_add(msg, "role", json_object_new_string("assistant"));
-		json_object_object_add(msg, "content",
-							   json_object_new_string(g->content.p ? g->content.p : ""));
+		json_set_str(msg, "role", "assistant");
+		json_set_str(msg, "content", g->content.p ? g->content.p : "");
 		if (g->reasoning.len > 0)
-			json_object_object_add(msg, "reasoning_content",
-								   json_object_new_string(g->reasoning.p));
+			json_set_str(msg, "reasoning_content", g->reasoning.p);
 		json_object *calls = g->tsc ? toolcall_scanner_calls(g->tsc) : NULL;
 		if (calls && json_object_array_length(calls) > 0)
 			json_object_object_add(msg, "tool_calls", json_object_get(calls));
 		json_object_object_add(choice, "message", msg);
 	} else {
-		json_object_object_add(choice, "text",
-							   json_object_new_string(g->content.p ? g->content.p : ""));
+		json_set_str(choice, "text", g->content.p ? g->content.p : "");
 	}
 	json_object_object_add(choice, "logprobs", NULL);
-	json_object_object_add(choice, "finish_reason",
-						   json_object_new_string(compute_finish_reason(g)));
+	json_set_str(choice, "finish_reason", compute_finish_reason(g));
 	json_object_array_add(choices, choice);
 	json_object_object_add(root, "choices", choices);
 	append_usage(root, g->prompt_tokens, g->generated);
@@ -690,14 +624,14 @@ static json_object *build_completion_body(req_ctx *rc, bool chat_api) {
 
 static json_object *health_body(void) {
 	json_object *root = json_object_new_object();
-	json_object_object_add(root, "status", json_object_new_string("ok"));
+	json_set_str(root, "status", "ok");
 	return root;
 }
 
 static json_object *root_body(openai_state *st) {
 	json_object *root = json_object_new_object();
-	json_object_object_add(root, "status", json_object_new_string("ok"));
-	json_object_object_add(root, "model", json_object_new_string(st->model_id));
+	json_set_str(root, "status", "ok");
+	json_set_str(root, "model", st->model_id);
 	json_object *eps = json_object_new_array();
 	json_object_array_add(eps, json_object_new_string("GET /health"));
 	json_object_array_add(eps, json_object_new_string("GET /v1/models"));
@@ -709,13 +643,13 @@ static json_object *root_body(openai_state *st) {
 
 static json_object *models_body(openai_state *st) {
 	json_object *root = json_object_new_object();
-	json_object_object_add(root, "object", json_object_new_string("list"));
+	json_set_str(root, "object", "list");
 	json_object *list = json_object_new_array();
 	json_object *m	  = json_object_new_object();
-	json_object_object_add(m, "id", json_object_new_string(st->model_id));
-	json_object_object_add(m, "object", json_object_new_string("model"));
+	json_set_str(m, "id", st->model_id);
+	json_set_str(m, "object", "model");
 	json_object_object_add(m, "created", json_object_new_int64((int64_t)st->created_at));
-	json_object_object_add(m, "owned_by", json_object_new_string("kappai"));
+	json_set_str(m, "owned_by", "kappai");
 	json_object_array_add(list, m);
 	json_object_object_add(root, "data", list);
 	return root;
@@ -747,20 +681,24 @@ static void sse_text_delta(oa_gen *g, const char *piece, size_t n, const char *f
 
 static void sse_send_role_chunk(oa_gen *g) {
 	json_object *delta = json_object_new_object();
-	json_object_object_add(delta, "role", json_object_new_string("assistant"));
-	json_object_object_add(delta, "content", json_object_new_string(""));
+	json_set_str(delta, "role", "assistant");
+	json_set_str(delta, "content", "");
 	sse_chat_delta(g, delta, NULL);
 }
 
+static void sse_ensure_preamble(oa_gen *g) {
+	if (g->sent_any_chunk)
+		return;
+	g->sent_any_chunk = true;
+	if (g->chat_api)
+		sse_send_role_chunk(g);
+	else
+		sse_text_delta(g, "", 0, NULL);
+}
+
 static void sse_send_delta(oa_gen *g, bool reasoning, const char *piece, size_t n) {
-	if (!g->sent_any_chunk) {
-		g->sent_any_chunk = true;
-		if (g->chat_api)
-			sse_send_role_chunk(g);
-		else
-			sse_text_delta(g, "", 0, NULL);
-	}
-	if (g->client_gone || shutting_down(g->st))
+	sse_ensure_preamble(g);
+	if (gen_dead(g))
 		return;
 	if (g->chat_api) {
 		json_object *delta = json_object_new_object();
@@ -774,23 +712,17 @@ static void sse_send_delta(oa_gen *g, bool reasoning, const char *piece, size_t 
 
 static void sse_send_tool_call(oa_gen *g, int index, const char *id, const char *name,
 							   const char *args_json) {
-	if (!g->sent_any_chunk) {
-		g->sent_any_chunk = true;
-		if (g->chat_api)
-			sse_send_role_chunk(g);
-		else
-			sse_text_delta(g, "", 0, NULL);
-	}
-	if (g->client_gone || shutting_down(g->st))
+	sse_ensure_preamble(g);
+	if (gen_dead(g))
 		return;
 
 	json_object *tcd = json_object_new_object();
-	json_object_object_add(tcd, "index", json_object_new_int(index));
-	json_object_object_add(tcd, "id", json_object_new_string(id));
-	json_object_object_add(tcd, "type", json_object_new_string("function"));
+	json_set_int(tcd, "index", index);
+	json_set_str(tcd, "id", id);
+	json_set_str(tcd, "type", "function");
 	json_object *fn = json_object_new_object();
-	json_object_object_add(fn, "name", json_object_new_string(name));
-	json_object_object_add(fn, "arguments", json_object_new_string(args_json));
+	json_set_str(fn, "name", name);
+	json_set_str(fn, "arguments", args_json);
 	json_object_object_add(tcd, "function", fn);
 
 	json_object *arr = json_object_new_array();
@@ -812,26 +744,15 @@ static void check_stop_sequences(oa_gen *g) {
 	if (total == 0)
 		return;
 
-	bool   is_string	= json_object_is_type(g->params->stop, json_type_string);
-	size_t needle_count = is_string ? 1 : json_object_array_length(g->params->stop);
-	size_t max_needle	= 0;
-
-	for (size_t i = 0; i < needle_count; i++) {
-		json_object *item =
-			is_string ? g->params->stop : json_object_array_get_idx(g->params->stop, i);
-		if (!json_object_is_type(item, json_type_string))
-			continue;
-		size_t l = (size_t)json_object_get_string_len(item);
-		if (l > max_needle)
-			max_needle = l;
-	}
+	size_t max_needle = g->params->stop_max;
 	if (max_needle == 0 || total < max_needle)
 		return;
 
 	size_t window_len	= 2 * max_needle - 1;
 	size_t window_start = total > window_len ? total - window_len : 0;
 	size_t wlen			= total - window_start;
-	char  *window		= xmalloc(wlen + 1);
+	ARR_ENSURE(g->stop_window, wlen + 1, g->stop_window_cap);
+	char *window = g->stop_window;
 	if (window_start < rlen) {
 		memcpy(window, g->reasoning.p + window_start, rlen - window_start);
 		memcpy(window + (rlen - window_start), g->content.p, clen);
@@ -840,15 +761,9 @@ static void check_stop_sequences(oa_gen *g) {
 	}
 	window[wlen] = '\0';
 
-	for (size_t i = 0; i < needle_count && !g->stopped_by_stop; i++) {
-		json_object *item =
-			is_string ? g->params->stop : json_object_array_get_idx(g->params->stop, i);
-		if (!json_object_is_type(item, json_type_string))
-			continue;
-		const char *needle = json_object_get_string(item);
-		if (!needle[0])
-			continue;
-		const char *hit = strstr(window, needle);
+	for (size_t i = 0; i < g->params->n_stop && !g->stopped_by_stop; i++) {
+		const char *needle = g->params->stop_needles[i];
+		const char *hit	   = strstr(window, needle);
 		if (!hit)
 			continue;
 
@@ -865,12 +780,11 @@ static void check_stop_sequences(oa_gen *g) {
 		if (g->content.p)
 			g->content.p[g->content.len] = '\0';
 	}
-	free(window);
 }
 
 static void tool_on_content(void *ud, const char *piece, size_t n) {
 	oa_gen *g = (oa_gen *)ud;
-	if (g->streaming && !g->client_gone && !shutting_down(g->st))
+	if (g->streaming && !gen_dead(g))
 		sse_send_delta(g, false, piece, n);
 }
 
@@ -884,13 +798,13 @@ static void tool_on_call(void *ud, int index, const char *id, const char *name,
 static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 	oa_gen *g = (oa_gen *)ud;
 
-	if (g->client_gone || shutting_down(g->st)) {
+	if (gen_dead(g)) {
 		g->st->ctx->interrupt = 1;
 		return;
 	}
 
 	if (!g->chat_api) {
-		toolcall_buf_append(&g->content, piece, (size_t)n);
+		sb_putb(&g->content, piece, (size_t)n);
 		check_stop_sequences(g);
 		if (g->stopped_by_stop) {
 			g->st->ctx->interrupt = 1;
@@ -911,33 +825,16 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 		return;
 	}
 
-	if (g->first_token && g->st->ctx->chat.think_open)
-		g->in_thinking = true;
-	g->first_token = false;
-
-	if (id == g->st->ctx->chat.think_start_id) {
-		g->in_thinking = true;
-		g->skip_label  = true;
+	think_filter_event tev = think_filter_feed(
+		&g->think, id, g->st->ctx->chat.think_start_id, g->st->ctx->chat.think_end_id,
+		g->st->ctx->chat.think_open, g->st->ctx->chat.think_label_line, &piece, &n);
+	if (tev != THINK_EMIT)
 		return;
-	}
-	if (id == g->st->ctx->chat.think_end_id) {
-		g->in_thinking = false;
-		return;
-	}
-
-	if (g->skip_label) {
-		const char *nl = memchr(piece, '\n', (size_t)n);
-		if (!nl)
-			return;
-		n			  = n - (int)(nl - piece) - 1;
-		piece		  = nl + 1;
-		g->skip_label = false;
-	}
 	if (n <= 0)
 		return;
 
-	toolcall_buf *dst = g->in_thinking ? &g->reasoning : &g->content;
-	toolcall_buf_append(dst, piece, (size_t)n);
+	str_builder *dst = g->think.in_thinking ? &g->reasoning : &g->content;
+	sb_putb(dst, piece, (size_t)n);
 	check_stop_sequences(g);
 	if (g->stopped_by_stop) {
 		g->st->ctx->interrupt = 1;
@@ -956,21 +853,19 @@ static void gen_on_token(int32_t id, const char *piece, int n, void *ud) {
 			return;
 		}
 	} else if (g->streaming) {
-		sse_send_delta(g, g->in_thinking, piece, (size_t)n);
+		sse_send_delta(g, g->think.in_thinking, piece, (size_t)n);
 	}
 }
 
 static void sse_finish_stream(oa_gen *g) {
 	const char *finish = compute_finish_reason(g);
 
-	if (!g->client_gone && !shutting_down(g->st)) {
+	if (!gen_dead(g)) {
 		if (g->chat_api) {
-			if (!g->sent_any_chunk)
-				sse_send_role_chunk(g);
+			sse_ensure_preamble(g);
 			sse_chat_delta(g, NULL, finish);
 		} else {
-			if (!g->sent_any_chunk)
-				sse_text_delta(g, "", 0, NULL);
+			sse_ensure_preamble(g);
 			sse_text_delta(g, "", 0, finish);
 		}
 
@@ -987,18 +882,6 @@ static void sse_finish_stream(oa_gen *g) {
 	gen_queue_done(g);
 }
 
-static chat_message oa_message_to_view(const oa_message *m) {
-	chat_message cm = {
-		.role			   = m->role,
-		.content		   = m->content,
-		.reasoning_content = m->reasoning_content,
-		.tool_calls		   = m->tool_calls,
-		.tool_call_id	   = (char *)m->tool_call_id,
-		.name			   = (char *)m->name,
-	};
-	return cm;
-}
-
 static void run_generation(req_ctx *rc, bool chat_api) {
 	openai_state *st = rc->st;
 	oa_gen		 *g	 = &rc->gen;
@@ -1008,17 +891,17 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 	g->chat_api	 = chat_api;
 	make_id(g);
 
-	g->in_thinking		= false;
-	g->first_token		= true;
-	g->skip_label		= false;
-	g->stopped_by_stop	= false;
-	g->sent_any_chunk	= false;
-	g->tool_fill_logged = false;
-	g->generation_done	= false;
-	g->prompt_tokens	= 0;
-	g->generated		= 0;
-	toolcall_buf_reset(&g->content);
-	toolcall_buf_reset(&g->reasoning);
+	g->think.in_thinking = false;
+	g->think.first_token = true;
+	g->think.skip_label	 = false;
+	g->stopped_by_stop	 = false;
+	g->sent_any_chunk	 = false;
+	g->tool_fill_logged	 = false;
+	g->generation_done	 = false;
+	g->prompt_tokens	 = 0;
+	g->generated		 = 0;
+	sb_reset(&g->content);
+	sb_reset(&g->reasoning);
 
 	sampler_params sp = {.temperature	 = rc->params.temperature,
 						 .top_k			 = rc->params.top_k,
@@ -1051,14 +934,12 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 
 			size_t start = c->chat.n_messages;
 			for (size_t i = start; i + 1 < rc->params.n_messages; i++) {
-				chat_message cm = oa_message_to_view(&rc->params.messages[i]);
-				chat_template_add_message_ex(&c->chat, &cm);
+				chat_template_add_message_ex(&c->chat, &rc->params.messages[i]);
 			}
 			{
-				chat_message cm =
-					oa_message_to_view(&rc->params.messages[rc->params.n_messages - 1]);
-				g->generated = context_chat_turn_msg(c, &cm, true, rc->params.max_tokens, &sp,
-													 gen_on_token, g, "");
+				g->generated =
+					context_chat_turn_msg(c, &rc->params.messages[rc->params.n_messages - 1], true,
+										  rc->params.max_tokens, &sp, gen_on_token, g, "");
 			}
 
 			if (g->tsc)
@@ -1091,7 +972,7 @@ static ssize_t sse_read_cb(void *cls, uint64_t pos, char *buf, size_t max) {
 	(void)pos;
 
 	pthread_mutex_lock(&g->q_mtx);
-	while (g->q_len == 0 && !g->producer_done && !g->client_gone && !shutting_down(g->st)) {
+	while (g->q_len == 0 && !g->producer_done && !gen_dead(g)) {
 		struct timespec ts;
 		clock_gettime(CLOCK_REALTIME, &ts);
 		ts.tv_sec += SSE_POLL_SEC;
@@ -1100,15 +981,14 @@ static ssize_t sse_read_cb(void *cls, uint64_t pos, char *buf, size_t max) {
 
 	ssize_t out;
 	if (g->q_len > 0) {
-		char  *f	  = g->queue[0];
-		size_t remain = g->frame_lens[0] - g->q_off;
+		char  *f	  = g->queue[0].data;
+		size_t remain = g->queue[0].len - g->q_off;
 		size_t n	  = remain < max ? remain : max;
 		memcpy(buf, f + g->q_off, n);
 		g->q_off += n;
-		if (g->q_off == g->frame_lens[0]) {
+		if (g->q_off == g->queue[0].len) {
 			free(f);
 			memmove(g->queue, g->queue + 1, (g->q_len - 1) * sizeof(*g->queue));
-			memmove(g->frame_lens, g->frame_lens + 1, (g->q_len - 1) * sizeof(*g->frame_lens));
 			g->q_len--;
 			g->q_off = 0;
 		}
@@ -1156,15 +1036,22 @@ static void *gen_thread_main(void *arg) {
 	return NULL;
 }
 
+static enum MHD_Result respond_auth_failure(openai_state *st, struct MHD_Connection *conn) {
+	(void)st;
+	return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
+						error_body("Invalid API key", "authentication_error"));
+}
+
 static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
-								   const char *url) {
+								   bool chat_api) {
 	if (!check_auth(st, conn))
-		return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
-							error_body("Invalid API key", "authentication_error"));
+		return respond_auth_failure(st, conn);
 
-	DEBUG("request body [%s]: %s", url, rc->body ? rc->body : "(empty)");
+	DEBUG("request body [%s] (%zu bytes): %.4096s",
+		  chat_api ? "/v1/chat/completions" : "/v1/completions", rc->body.len,
+		  rc->body.p ? rc->body.p : "(empty)");
 
-	json_object *body = json_tokener_parse(rc->body ? rc->body : "");
+	json_object *body = json_tokener_parse(rc->body.p ? rc->body.p : "");
 	if (!body)
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST,
 							error_body("Invalid JSON in request body", "invalid_request_error"));
@@ -1175,9 +1062,8 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 			error_body("Request body must be a JSON object", "invalid_request_error"));
 	}
 
-	bool		chat_api = strcmp(url, "/v1/chat/completions") == 0;
-	const char *err		 = chat_api ? parse_chat_request(body, &rc->params)
-									: parse_completion_request(body, &rc->params);
+	const char *err = chat_api ? parse_chat_request(body, &rc->params)
+							   : parse_completion_request(body, &rc->params);
 	if (err) {
 		json_object_put(body);
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST, error_body(err, "invalid_request_error"));
@@ -1224,6 +1110,7 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 			return respond_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
 								error_body("server overloaded", "server_error"));
 		}
+		pthread_detach(tid);
 		rc_ref(rc);
 		struct MHD_Response *resp =
 			MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4096, sse_read_cb, rc, sse_free_cb);
@@ -1257,6 +1144,71 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 	return respond_json(conn, MHD_HTTP_OK, build_completion_body(rc, chat_api));
 }
 
+static enum MHD_Result route_health(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method) {
+	(void)st;
+	(void)rc;
+	(void)url;
+	(void)method;
+	return respond_json(conn, MHD_HTTP_OK, health_body());
+}
+
+static enum MHD_Result route_root(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+								  const char *url, const char *method) {
+	(void)rc;
+	(void)url;
+	(void)method;
+	return respond_json(conn, MHD_HTTP_OK, root_body(st));
+}
+
+static enum MHD_Result route_completions(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+										 const char *url, const char *method, bool chat_api) {
+	if (rc->too_large)
+		return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
+							error_body("request body too large", "invalid_request_error"));
+	uint64_t		t0 = time_us();
+	enum MHD_Result r  = handle_post(st, conn, rc, chat_api);
+	INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
+	return r;
+}
+
+static enum MHD_Result route_chat_completions(openai_state *st, struct MHD_Connection *conn,
+											  req_ctx *rc, const char *url, const char *method) {
+	return route_completions(st, conn, rc, url, method, true);
+}
+
+static enum MHD_Result route_text_completions(openai_state *st, struct MHD_Connection *conn,
+											  req_ctx *rc, const char *url, const char *method) {
+	return route_completions(st, conn, rc, url, method, false);
+}
+
+static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method) {
+	(void)rc;
+	(void)url;
+	(void)method;
+	if (!check_auth(st, conn))
+		return respond_auth_failure(st, conn);
+	return respond_json(conn, MHD_HTTP_OK, models_body(st));
+}
+
+typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method);
+
+typedef struct {
+	const char *method;
+	const char *path;
+	route_fn	fn;
+} route;
+
+static const route routes[] = {
+	{"GET", "/health", route_health},
+	{"GET", "/", route_root},
+	{"POST", "/v1/chat/completions", route_chat_completions},
+	{"POST", "/v1/completions", route_text_completions},
+	{"GET", "/v1/models", route_models},
+};
+
 static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, const char *url,
 									  const char *method, const char *version,
 									  const char *upload_data, size_t *upload_data_size,
@@ -1272,16 +1224,10 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 	req_ctx *rc = *(req_ctx **)con_cls;
 
 	if (*upload_data_size > 0) {
-		if (rc->body_len + *upload_data_size > MAX_BODY_BYTES) {
+		if (rc->body.len + *upload_data_size > MAX_BODY_BYTES) {
 			rc->too_large = true;
 		} else {
-			if (rc->body_len + *upload_data_size + 1 > rc->body_cap) {
-				rc->body_cap = (rc->body_len + *upload_data_size + 1) * 2;
-				rc->body	 = xrealloc(rc->body, rc->body_cap);
-			}
-			memcpy(rc->body + rc->body_len, upload_data, *upload_data_size);
-			rc->body_len += *upload_data_size;
-			rc->body[rc->body_len] = '\0';
+			sb_putb(&rc->body, upload_data, *upload_data_size);
 		}
 		*upload_data_size = 0;
 		return MHD_YES;
@@ -1290,7 +1236,7 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 	if (strcmp(method, "OPTIONS") == 0) {
 		struct MHD_Response *resp =
 			MHD_create_response_from_buffer(0, (void *)"", MHD_RESPMEM_PERSISTENT);
-		MHD_add_response_header(resp, "Access-Control-Allow-Origin", "*");
+		add_cors(resp);
 		MHD_add_response_header(resp, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 		MHD_add_response_header(resp, "Access-Control-Allow-Headers",
 								"Content-Type, Authorization");
@@ -1300,38 +1246,17 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 		return r;
 	}
 
-	if (strcmp(url, "/health") == 0 && strcmp(method, "GET") == 0)
-		return respond_json(conn, MHD_HTTP_OK, health_body());
-
-	if (strcmp(url, "/") == 0 && strcmp(method, "GET") == 0)
-		return respond_json(conn, MHD_HTTP_OK, root_body(st));
-
-	if ((strcmp(url, "/v1/chat/completions") == 0 || strcmp(url, "/v1/completions") == 0) &&
-		strcmp(method, "POST") == 0) {
-		if (rc->too_large)
-			return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
-								error_body("request body too large", "invalid_request_error"));
-		uint64_t		t0 = time_us();
-		enum MHD_Result r  = handle_post(st, conn, rc, url);
-		INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
-		return r;
-	}
-
-	if (strcmp(url, "/v1/models") == 0) {
-		if (strcmp(method, "GET") != 0)
-			return respond_json(conn, MHD_HTTP_METHOD_NOT_ALLOWED,
-								error_body("Method not allowed", "invalid_request_error"));
-		if (!check_auth(st, conn))
-			return respond_json(conn, MHD_HTTP_UNAUTHORIZED,
-								error_body("Invalid API key", "authentication_error"));
-		return respond_json(conn, MHD_HTTP_OK, models_body(st));
+	for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+		if (strcmp(method, routes[i].method) != 0)
+			continue;
+		if (strcmp(url, routes[i].path) != 0)
+			continue;
+		return routes[i].fn(st, conn, rc, url, method);
 	}
 
 	char msgbuf[192];
 	snprintf(msgbuf, sizeof(msgbuf), "Unknown endpoint: %s %s", method, url);
-	json_object *root = json_object_new_object();
-	json_object_object_add(root, "error", error_body(msgbuf, "invalid_request_error"));
-	return respond_json(conn, MHD_HTTP_NOT_FOUND, root);
+	return respond_json(conn, MHD_HTTP_NOT_FOUND, error_body(msgbuf, "invalid_request_error"));
 }
 
 openai_state *openai_init(context *ctx, const cli_args *args) {

@@ -9,10 +9,23 @@ enum { TK_NORMAL = 1, TK_UNKNOWN = 2, TK_CONTROL = 3, TK_BYTE = 6 };
 
 static char tok_dir[300];
 
+static log_level g_tok_saved_level;
+static void		 tok_silence(void) {
+	g_tok_saved_level = log_get_level();
+	log_set_level((log_level)(LOG_ERROR + 1));
+}
+static void tok_restore(void) {
+	log_set_level(g_tok_saved_level);
+}
+
 static tokenizer load_vocab(tokenizer *t, gguf_ctx *g, const char *path) {
 	memset(t, 0, sizeof(*t));
 	memset(g, 0, sizeof(*g));
-	if (gguf_load(g, path) != OK || tokenizer_init(t, g) != OK)
+	tok_silence();
+	status_code lrs = gguf_load(g, path);
+	status_code tis = (lrs == OK) ? tokenizer_init(t, g) : lrs;
+	tok_restore();
+	if (lrs != OK || tis != OK)
 		abort();
 	return *t;
 }

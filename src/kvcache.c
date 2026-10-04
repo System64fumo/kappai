@@ -1,9 +1,30 @@
 #include "kvcache.h"
 #include "log.h"
+#include "memconfig.h"
 #include "recipe.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+static inline int kvcache_kv_heads_stride(const kvcache *c) {
+	return c->n_kv_heads_max;
+}
+
+static inline int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer) {
+	if (!c->has_host_kv || !m || !m->mixed_backend_mode)
+		return 0;
+	if (layer < 0 || layer >= m->n_layer_backends)
+		return 0;
+	if (!m->layer_backends[layer])
+		return 0;
+	if (m->layer_backends[layer] == c->backend)
+		return 0;
+	if (!backend_has_cap(m->layer_backends[layer], BCAP_IS_HOST))
+		return 0;
+	return 1;
+}
+
+static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats);
 
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant) {
 	memset(c, 0, sizeof(*c));
@@ -68,6 +89,11 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
+	if (kv_backend != c->backend)
+		backend_report_host_fallback(
+			c->backend, "kv_alloc", HFB_CAPABILITY,
+			"backend '%s' has no kv_alloc; kv cache allocated in host (cpu) memory",
+			c->backend->name);
 
 	if (kv_quant == KV_QUANT_Q8_0 && !backend_has_cap(kv_backend, BCAP_KV_QUANT_Q8_0)) {
 		ERROR("kvcache: backend '%s' does not support Q8_0 quantized KV cache; "
@@ -94,6 +120,13 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		}
 	}
 
+	int *layer_pos_cap = NULL;
+	if (backend_has_cap(kv_backend, BCAP_KV_POS_CAP) && n_kv_layers > 0 && m->sliding_window > 0) {
+		layer_pos_cap = xcalloc((size_t)n_kv_layers, sizeof(int));
+		for (int i = 0; i < n_kv_layers; i++)
+			layer_pos_cap[i] = model_kv_layer_pos_cap(m, n_ctx, i);
+	}
+
 	kv_desc desc = {
 		.n_layers		  = m->n_layers,
 		.n_kv_layers	  = n_kv_layers,
@@ -103,11 +136,21 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		.kv_quant		  = kv_quant,
 		.layer_head_dim	  = layer_head_dim,
 		.layer_n_kv_heads = layer_n_kv_heads,
+		.layer_pos_cap	  = layer_pos_cap,
 	};
 	status_code s = kv_backend->kv_alloc(kv_backend, &desc, &c->k, &c->v);
 	free(layer_head_dim);
 	free(layer_n_kv_heads);
-	return s;
+	free(layer_pos_cap);
+	if (s != OK)
+		return s;
+	if (m->mixed_backend_mode || kv_backend != c->backend) {
+		s = kvcache_ensure_transfer_buf(c, (size_t)2 * (size_t)c->n_kv_heads_max *
+											   (size_t)c->head_dim_max);
+		if (s != OK)
+			return s;
+	}
+	return OK;
 }
 
 static void kv_buffer_free(buffer *b) {
@@ -236,6 +279,12 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 			layer_n_kv_heads[s] = model_layer_kv_heads(m, slot);
 		}
 
+		int *mirror_pos_cap = NULL;
+		if (backend_has_cap(host, BCAP_KV_POS_CAP) && n_mirrored > 0 && m->sliding_window > 0) {
+			mirror_pos_cap = xcalloc((size_t)n_mirrored, sizeof(int));
+			for (int i = 0; i < n_mirrored; i++)
+				mirror_pos_cap[i] = model_kv_layer_pos_cap(m, c->n_ctx, slot_list[i]);
+		}
 		kv_desc desc = {
 			.n_layers		  = n_mirrored,
 			.n_kv_layers	  = n_mirrored,
@@ -245,10 +294,12 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 			.kv_quant		  = c->kv_quant,
 			.layer_head_dim	  = layer_head_dim,
 			.layer_n_kv_heads = layer_n_kv_heads,
+			.layer_pos_cap	  = mirror_pos_cap,
 		};
 		status_code s = host->kv_alloc(host, &desc, &c->k_host, &c->v_host);
 		free(layer_head_dim);
 		free(layer_n_kv_heads);
+		free(mirror_pos_cap);
 		free(slot_list);
 		if (s != OK) {
 			free(remap);
@@ -260,6 +311,10 @@ status_code kvcache_alloc_host_mirror(kvcache *c, const model *m) {
 		c->has_host_kv	  = 1;
 
 		INFO("mixed backend KV mirror: %d of %d KV slot(s) on host", n_mirrored, m->n_layers);
+		s = kvcache_ensure_transfer_buf(c, (size_t)2 * (size_t)c->n_kv_heads_max *
+											   (size_t)c->head_dim_max);
+		if (s != OK)
+			return s;
 		return OK;
 	}
 	return OK;
@@ -316,10 +371,9 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 	backend *v_in_owner = v_in->owner ? v_in->owner : kv_backend;
 
 	if (k_in_owner != kv_backend || v_in_owner != kv_backend) {
-		if (k_in_owner && k_in_owner->synchronize)
-			k_in_owner->synchronize(k_in_owner);
-		if (v_in_owner && v_in_owner != k_in_owner && v_in_owner->synchronize)
-			v_in_owner->synchronize(v_in_owner);
+		ensure_sync(k_in_owner);
+		if (v_in_owner != k_in_owner)
+			ensure_sync(v_in_owner);
 
 		int			k_floats = kvh_active * hd;
 		status_code st		 = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
@@ -352,8 +406,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 								  &k_host_buf, &v_host_buf, kvh_stride, hd, c->n_ctx, kvh_active);
 	}
 
-	if (kv_backend != c->backend && kv_backend->synchronize)
-		kv_backend->synchronize(kv_backend);
+	if (kv_backend != c->backend)
+		ensure_sync(kv_backend);
 	int put_layer  = (layer_on_host || slot_needs_host) ? kvcache_mirror_layer(c, layer) : layer;
 	status_code st = kv_backend->kv_put(kv_backend, kb, vb, put_layer, pos, k_in, v_in, kvh_stride,
 										hd, c->n_ctx, kvh_active);

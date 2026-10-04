@@ -62,7 +62,6 @@ void	  log_set_level(log_level level);
 log_level log_get_level(void);
 
 void log_msg(log_level level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
-void log_msgv(log_level level, const char *fmt, va_list ap);
 
 void log_tag(const char *tag, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 bool log_color_enabled(void);

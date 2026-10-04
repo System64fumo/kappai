@@ -12,7 +12,7 @@ int main(int argc, char **argv) {
 
 	openai_install_signals();
 
-	status_code s = engine_init(&ctx, &a, argc, argv);
+	int s = engine_init(&ctx, &a, argc, argv);
 	if (s == ENGINE_EXIT)
 		return 0;
 	if (s != OK)
@@ -23,21 +23,16 @@ int main(int argc, char **argv) {
 	openai_state *oa = openai_init(&ctx, &a);
 	if (!oa) {
 		ERROR("out of memory");
-		engine_shutdown(&ctx);
-		return 1;
+		goto shutdown_engine;
 	}
 
-	if (!openai_bind(oa, a.server_host, a.server_port)) {
-		engine_shutdown(&ctx);
-		return 1;
-	}
+	if (!openai_bind(oa, a.server_host, a.server_port))
+		goto shutdown_server;
 
 	char errbuf[256];
 	if (!openai_serve(oa, errbuf, sizeof(errbuf))) {
 		ERROR("failed to start server on %s:%d: %s", a.server_host, a.server_port, errbuf);
-		openai_free(oa);
-		engine_shutdown(&ctx);
-		return 1;
+		goto shutdown_server;
 	}
 
 	INFO("listening on http://%s:%d", a.server_host, a.server_port);
@@ -52,4 +47,10 @@ int main(int argc, char **argv) {
 
 	engine_shutdown(&ctx);
 	return 0;
+
+shutdown_server:
+	openai_free(oa);
+shutdown_engine:
+	engine_shutdown(&ctx);
+	return 1;
 }

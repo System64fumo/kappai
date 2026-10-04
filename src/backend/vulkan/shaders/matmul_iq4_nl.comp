@@ -51,25 +51,11 @@ layout(constant_id = 2) const int TILE_K		  = 2048;
 #define MODE_FFN_DOWN 2
 #define MODE_QKV 3
 
-uint w0_read_u16(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b0[word_idx];
-	if (shift + 8u <= 32u)
-		return (lo >> shift) & 0xFFFFu;
-	uint hi = b0[word_idx + 1u];
-	return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
-}
-
-uint w0_read_u32(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b0[word_idx];
-	if (shift == 0u)
-		return lo;
-	uint hi = b0[word_idx + 1u];
-	return (lo >> shift) | (hi << (32u - shift));
-}
+#define W_NAME b0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
 
 uint w1_read_u16(uint byte_offset) {
 	uint word_idx = byte_offset >> 2u;
@@ -91,43 +77,22 @@ uint w1_read_u32(uint byte_offset) {
 	return (lo >> shift) | (hi << (32u - shift));
 }
 
-uint w2_read_u16(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b5[word_idx];
-	if (shift + 8u <= 32u)
-		return (lo >> shift) & 0xFFFFu;
-	uint hi = b5[word_idx + 1u];
-	return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
-}
+#define W_NAME b5
+#define W_PFX w2_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
 
-uint w2_read_u32(uint byte_offset) {
-	uint word_idx = byte_offset >> 2u;
-	uint shift	  = (byte_offset & 3u) * 8u;
-	uint lo		  = b5[word_idx];
-	if (shift == 0u)
-		return lo;
-	uint hi = b5[word_idx + 1u];
-	return (lo >> shift) | (hi << (32u - shift));
-}
-
-float erf_precise(float x) {
-	float sign = x >= 0.0 ? 1.0 : -1.0;
-	float ax   = abs(x);
-	float p	   = 0.3275911;
-	float t	   = 1.0 / (1.0 + p * ax);
-	float a1   = 0.254829592;
-	float a2   = -0.284496736;
-	float a3   = 1.421413741;
-	float a4   = -1.453152027;
-	float a5   = 1.061405429;
-	float poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
-	return sign * (1.0 - poly * exp(-ax * ax));
+float gelu_tanh(float x) {
+	const float c	  = 0.7978845608028654;
+	float		x3	  = x * x * x;
+	float		inner = c * (x + 0.044715 * x3);
+	return 0.5 * x * (1.0 + tanh(inner));
 }
 
 float activate(float g, float u) {
 	if (params.activation == 1) {
-		return 0.5 * g * (1.0 + erf_precise(g * 0.7071067811865475)) * u;
+		return gelu_tanh(g) * u;
 	} else {
 		return g / (1.0 + exp(-g)) * u;
 	}
@@ -155,83 +120,36 @@ void load_x_tile(int tile_start, int tile_len, uint x_off) {
 	}
 }
 
-float dot_block_w0(uint block_off, int xp_base, float d_xq, float acc) {
-	float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
-	uint  qs_off = block_off + 2u;
-
-	int sumi = 0;
-	for (int w4 = 0; w4 < 4; w4++) {
-		uint word = w0_read_u32(qs_off + uint(w4 * 4));
-
-		int w_lo = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[word & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 8u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 16u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 24u) & 0xFu])));
-		int w_hi = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[(word >> 4u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 12u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 20u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 28u) & 0xFu])));
-
-		int x_lo = xq_packed[xp_base + w4];
-		int x_hi = xq_packed[xp_base + w4 + 4];
-
-		sumi += dotPacked4x8EXT(w_lo, x_lo);
-		sumi += dotPacked4x8EXT(w_hi, x_hi);
+#define DEFINE_DOT_BLOCK(SUFFIX)                                                                   \
+	float dot_block_##SUFFIX(uint block_off, int xp_base, float d_xq, float acc) {                 \
+		float d		 = half_to_float(SUFFIX##_read_u16(block_off)) * d_xq;                         \
+		uint  qs_off = block_off + 2u;                                                             \
+                                                                                                   \
+		int sumi = 0;                                                                              \
+		for (int w4 = 0; w4 < 4; w4++) {                                                           \
+			uint word = SUFFIX##_read_u32(qs_off + uint(w4 * 4));                                  \
+                                                                                                   \
+			int w_lo = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[word & 0xFu]),                        \
+									 int8_t(kvalue_iq4nl_lut[(word >> 8u) & 0xFu]),                \
+									 int8_t(kvalue_iq4nl_lut[(word >> 16u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 24u) & 0xFu])));             \
+			int w_hi = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[(word >> 4u) & 0xFu]),                \
+									 int8_t(kvalue_iq4nl_lut[(word >> 12u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 20u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 28u) & 0xFu])));             \
+                                                                                                   \
+			int x_lo = xq_packed[xp_base + w4];                                                    \
+			int x_hi = xq_packed[xp_base + w4 + 4];                                                \
+                                                                                                   \
+			sumi += dotPacked4x8EXT(w_lo, x_lo);                                                   \
+			sumi += dotPacked4x8EXT(w_hi, x_hi);                                                   \
+		}                                                                                          \
+		return fma(d, float(sumi), acc);                                                           \
 	}
-	return fma(d, float(sumi), acc);
-}
 
-float dot_block_w1(uint block_off, int xp_base, float d_xq, float acc) {
-	float d		 = half_to_float(w1_read_u16(block_off)) * d_xq;
-	uint  qs_off = block_off + 2u;
-
-	int sumi = 0;
-	for (int w4 = 0; w4 < 4; w4++) {
-		uint word = w1_read_u32(qs_off + uint(w4 * 4));
-
-		int w_lo = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[word & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 8u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 16u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 24u) & 0xFu])));
-		int w_hi = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[(word >> 4u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 12u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 20u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 28u) & 0xFu])));
-
-		int x_lo = xq_packed[xp_base + w4];
-		int x_hi = xq_packed[xp_base + w4 + 4];
-
-		sumi += dotPacked4x8EXT(w_lo, x_lo);
-		sumi += dotPacked4x8EXT(w_hi, x_hi);
-	}
-	return fma(d, float(sumi), acc);
-}
-
-float dot_block_w2(uint block_off, int xp_base, float d_xq, float acc) {
-	float d		 = half_to_float(w2_read_u16(block_off)) * d_xq;
-	uint  qs_off = block_off + 2u;
-
-	int sumi = 0;
-	for (int w4 = 0; w4 < 4; w4++) {
-		uint word = w2_read_u32(qs_off + uint(w4 * 4));
-
-		int w_lo = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[word & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 8u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 16u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 24u) & 0xFu])));
-		int w_hi = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[(word >> 4u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 12u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 20u) & 0xFu]),
-								 int8_t(kvalue_iq4nl_lut[(word >> 28u) & 0xFu])));
-
-		int x_lo = xq_packed[xp_base + w4];
-		int x_hi = xq_packed[xp_base + w4 + 4];
-
-		sumi += dotPacked4x8EXT(w_lo, x_lo);
-		sumi += dotPacked4x8EXT(w_hi, x_hi);
-	}
-	return fma(d, float(sumi), acc);
-}
+DEFINE_DOT_BLOCK(w0)
+DEFINE_DOT_BLOCK(w1)
+DEFINE_DOT_BLOCK(w2)
 
 void main() {
 	uint tid = gl_LocalInvocationID.x;

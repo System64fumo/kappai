@@ -33,13 +33,20 @@ static inline int monitor_active(const monitor *mon) {
 
 extern monitor *g_monitor;
 
-int monitor_maybe_emit(void);
-
 void monitor_emit_load_phase_backend(monitor *mon, const char *backend_name);
 void monitor_emit_load_phase_model_start(monitor *mon, const char *model_path);
 void monitor_emit_load_phase_model_done(monitor *mon, uint64_t ms, int n_layers, int dim,
 										int vocab_size);
 void monitor_emit_load_phase_model_failed(monitor *mon, status_code err);
+
+void monitor_emit_load_readahead_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_weights_progress(monitor *mon, int layer, int n_layers, double pct);
+void monitor_emit_load_prefetch_mmap(monitor *mon, const char *path);
+void monitor_emit_load_prefetch_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_upload_start(monitor *mon);
+void monitor_emit_load_upload_done(monitor *mon, uint64_t ms);
+void monitor_emit_load_pin_copy_start(monitor *mon, int n_experts, int n_workers);
+void monitor_emit_load_pin_copy_done(monitor *mon, int n_experts, double mb, uint64_t ms);
 
 void monitor_emit_start(monitor *mon, const char *arch_name, int n_layers, int dim, int n_ctx,
 						int vocab_size, int is_moe, int n_experts, int n_experts_used);
@@ -56,7 +63,6 @@ typedef struct {
 	int			phase_tokens;
 } monitor_layer_tracker;
 
-void monitor_layer_tracker_init(monitor_layer_tracker *t);
 void monitor_begin_phase(monitor_layer_tracker *t, const char *phase, int token_idx,
 						 int phase_tokens);
 void monitor_record_layer_event(monitor *mon, monitor_layer_tracker *t, int layer_idx, int n_layers,

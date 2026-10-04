@@ -55,6 +55,9 @@ layout(push_constant) uniform Params {
 	int	  n;
 	float eps;
 	int	  m;
+#ifdef ADD_RESIDUAL
+	float os;
+#endif
 }
 params;
 #endif
@@ -139,6 +142,7 @@ void main() {
 #endif
 #ifdef ADD_RESIDUAL
 		result += residual[x_off + uint(i)];
+		result *= params.os;
 #endif
 		y[y_off + uint(i)] = result;
 	}

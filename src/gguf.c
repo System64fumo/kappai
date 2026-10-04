@@ -7,7 +7,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <sched.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,7 +221,7 @@ static int gguf_arr_len_ok(const gguf_reader *r, uint64_t n, size_t elem_size) {
 	return n * (uint64_t)elem_size <= (uint64_t)gguf_reader_left(r);
 }
 
-static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
+static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena *sa) {
 	e->type = type;
 	switch (type) {
 	case GGUF_TYPE_U8: {
@@ -307,11 +306,9 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 		gguf_str s;
 		if (gguf_reader_str(r, &s))
 			return -1;
-		char *owned = xmalloc(s.len + 1);
-		memcpy(owned, s.data, s.len);
-		owned[s.len] = '\0';
-		e->str.len	 = s.len;
-		e->str.data	 = owned;
+		char *owned = str_arena_dup(sa, s.data, s.len);
+		e->str.len	= s.len;
+		e->str.data = owned;
 		return 0;
 	}
 	case GGUF_TYPE_ARRAY: {
@@ -382,14 +379,10 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 			for (uint64_t i = 0; i < n; i++) {
 				gguf_str s;
 				if (gguf_reader_str(r, &s)) {
-					for (uint64_t j = 0; j < i; j++)
-						free(arr[j]);
 					free(arr);
 					return -1;
 				}
-				arr[i] = xmalloc(s.len + 1);
-				memcpy(arr[i], s.data, s.len);
-				arr[i][s.len] = '\0';
+				arr[i] = str_arena_dup(sa, s.data, s.len);
 			}
 			e->arr_data = (void *)arr;
 			break;
@@ -406,21 +399,78 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type) {
 
 static void free_kv(kv_entry *e, size_t n) {
 	for (size_t i = 0; i < n; i++) {
-		free(e[i].key);
-		if (e[i].type == GGUF_TYPE_STRING) {
-			free((void *)e[i].str.data);
-		}
-		if (e[i].type == GGUF_TYPE_ARRAY) {
-			if (e[i].arr_type == GGUF_TYPE_STRING && e[i].arr_data) {
-				char **arr = (char **)e[i].arr_data;
-				for (uint64_t j = 0; j < e[i].arr_len; j++)
-					free(arr[j]);
-			}
+		if (e[i].type == GGUF_TYPE_ARRAY)
 			free(e[i].arr_data);
-		}
 	}
 	free(e);
 }
+
+const uint32_t ggml_iq3s_grid[512] = {
+	0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
+	0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
+	0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,
+	0x01010f0f, 0x01030101, 0x01030103, 0x01030105, 0x01030109, 0x01030301, 0x01030303, 0x0103030b,
+	0x01030501, 0x01030507, 0x0103050f, 0x01030703, 0x0103070b, 0x01030909, 0x01030d03, 0x01030d0b,
+	0x01030f05, 0x01050101, 0x01050103, 0x0105010b, 0x0105010f, 0x01050301, 0x01050307, 0x0105030d,
+	0x01050503, 0x0105050b, 0x01050701, 0x01050709, 0x01050905, 0x0105090b, 0x0105090f, 0x01050b03,
+	0x01050b07, 0x01050f01, 0x01050f07, 0x01070107, 0x01070303, 0x0107030b, 0x01070501, 0x01070505,
+	0x01070703, 0x01070707, 0x0107070d, 0x01070909, 0x01070b01, 0x01070b05, 0x01070d0f, 0x01070f03,
+	0x01070f0b, 0x01090101, 0x01090307, 0x0109030f, 0x01090503, 0x01090509, 0x01090705, 0x01090901,
+	0x01090907, 0x01090b03, 0x01090f01, 0x010b0105, 0x010b0109, 0x010b0501, 0x010b0505, 0x010b050d,
+	0x010b0707, 0x010b0903, 0x010b090b, 0x010b090f, 0x010b0d0d, 0x010b0f07, 0x010d010d, 0x010d0303,
+	0x010d0307, 0x010d0703, 0x010d0b05, 0x010d0f03, 0x010f0101, 0x010f0105, 0x010f0109, 0x010f0501,
+	0x010f0505, 0x010f050d, 0x010f0707, 0x010f0b01, 0x010f0b09, 0x03010101, 0x03010103, 0x03010105,
+	0x03010109, 0x03010301, 0x03010303, 0x03010307, 0x0301030b, 0x0301030f, 0x03010501, 0x03010505,
+	0x03010703, 0x03010709, 0x0301070d, 0x03010b09, 0x03010b0d, 0x03010d03, 0x03010f05, 0x03030101,
+	0x03030103, 0x03030107, 0x0303010d, 0x03030301, 0x03030309, 0x03030503, 0x03030701, 0x03030707,
+	0x03030903, 0x03030b01, 0x03030b05, 0x03030f01, 0x03030f0d, 0x03050101, 0x03050305, 0x0305030b,
+	0x0305030f, 0x03050501, 0x03050509, 0x03050705, 0x03050901, 0x03050907, 0x03050b0b, 0x03050d01,
+	0x03050f05, 0x03070103, 0x03070109, 0x0307010f, 0x03070301, 0x03070307, 0x03070503, 0x0307050f,
+	0x03070701, 0x03070709, 0x03070903, 0x03070d05, 0x03070f01, 0x03090107, 0x0309010b, 0x03090305,
+	0x03090309, 0x03090703, 0x03090707, 0x03090905, 0x0309090d, 0x03090b01, 0x03090b09, 0x030b0103,
+	0x030b0301, 0x030b0307, 0x030b0503, 0x030b0701, 0x030b0705, 0x030b0b03, 0x030d0501, 0x030d0509,
+	0x030d050f, 0x030d0909, 0x030d090d, 0x030f0103, 0x030f0107, 0x030f0301, 0x030f0305, 0x030f0503,
+	0x030f070b, 0x030f0903, 0x030f0d05, 0x030f0f01, 0x05010101, 0x05010103, 0x05010107, 0x0501010b,
+	0x0501010f, 0x05010301, 0x05010305, 0x05010309, 0x0501030d, 0x05010503, 0x05010507, 0x0501050f,
+	0x05010701, 0x05010705, 0x05010903, 0x05010907, 0x0501090b, 0x05010b01, 0x05010b05, 0x05010d0f,
+	0x05010f01, 0x05010f07, 0x05010f0b, 0x05030101, 0x05030105, 0x05030301, 0x05030307, 0x0503030f,
+	0x05030505, 0x0503050b, 0x05030703, 0x05030709, 0x05030905, 0x05030b03, 0x05050103, 0x05050109,
+	0x0505010f, 0x05050503, 0x05050507, 0x05050701, 0x0505070f, 0x05050903, 0x05050b07, 0x05050b0f,
+	0x05050f03, 0x05050f09, 0x05070101, 0x05070105, 0x0507010b, 0x05070303, 0x05070505, 0x05070509,
+	0x05070703, 0x05070707, 0x05070905, 0x05070b01, 0x05070d0d, 0x05090103, 0x0509010f, 0x05090501,
+	0x05090507, 0x05090705, 0x0509070b, 0x05090903, 0x05090f05, 0x05090f0b, 0x050b0109, 0x050b0303,
+	0x050b0505, 0x050b070f, 0x050b0901, 0x050b0b07, 0x050b0f01, 0x050d0101, 0x050d0105, 0x050d010f,
+	0x050d0503, 0x050d0b0b, 0x050d0d03, 0x050f010b, 0x050f0303, 0x050f050d, 0x050f0701, 0x050f0907,
+	0x050f0b01, 0x07010105, 0x07010303, 0x07010307, 0x0701030b, 0x0701030f, 0x07010505, 0x07010703,
+	0x07010707, 0x0701070b, 0x07010905, 0x07010909, 0x0701090f, 0x07010b03, 0x07010d07, 0x07010f03,
+	0x07030103, 0x07030107, 0x0703010b, 0x07030309, 0x07030503, 0x07030507, 0x07030901, 0x07030d01,
+	0x07030f05, 0x07030f0d, 0x07050101, 0x07050305, 0x07050501, 0x07050705, 0x07050709, 0x07050b01,
+	0x07070103, 0x07070301, 0x07070309, 0x07070503, 0x07070507, 0x0707050f, 0x07070701, 0x07070903,
+	0x07070907, 0x0707090f, 0x07070b0b, 0x07070f07, 0x07090107, 0x07090303, 0x0709030d, 0x07090505,
+	0x07090703, 0x07090b05, 0x07090d01, 0x07090d09, 0x070b0103, 0x070b0301, 0x070b0305, 0x070b050b,
+	0x070b0705, 0x070b0909, 0x070b0b0d, 0x070b0f07, 0x070d030d, 0x070d0903, 0x070f0103, 0x070f0107,
+	0x070f0501, 0x070f0505, 0x070f070b, 0x09010101, 0x09010109, 0x09010305, 0x09010501, 0x09010509,
+	0x0901050f, 0x09010705, 0x09010903, 0x09010b01, 0x09010f01, 0x09030105, 0x0903010f, 0x09030303,
+	0x09030307, 0x09030505, 0x09030701, 0x0903070b, 0x09030907, 0x09030b03, 0x09030b0b, 0x09050103,
+	0x09050107, 0x09050301, 0x0905030b, 0x09050503, 0x09050707, 0x09050901, 0x09050b0f, 0x09050d05,
+	0x09050f01, 0x09070109, 0x09070303, 0x09070307, 0x09070501, 0x09070505, 0x09070703, 0x0907070b,
+	0x09090101, 0x09090105, 0x09090509, 0x0909070f, 0x09090901, 0x09090f03, 0x090b010b, 0x090b010f,
+	0x090b0503, 0x090b0d05, 0x090d0307, 0x090d0709, 0x090d0d01, 0x090f0301, 0x090f030b, 0x090f0701,
+	0x090f0907, 0x090f0b03, 0x0b010105, 0x0b010301, 0x0b010309, 0x0b010505, 0x0b010901, 0x0b010909,
+	0x0b01090f, 0x0b010b05, 0x0b010d0d, 0x0b010f09, 0x0b030103, 0x0b030107, 0x0b03010b, 0x0b030305,
+	0x0b030503, 0x0b030705, 0x0b030f05, 0x0b050101, 0x0b050303, 0x0b050507, 0x0b050701, 0x0b05070d,
+	0x0b050b07, 0x0b070105, 0x0b07010f, 0x0b070301, 0x0b07050f, 0x0b070909, 0x0b070b03, 0x0b070d0b,
+	0x0b070f07, 0x0b090103, 0x0b090109, 0x0b090501, 0x0b090705, 0x0b09090d, 0x0b0b0305, 0x0b0b050d,
+	0x0b0b0b03, 0x0b0b0b07, 0x0b0d0905, 0x0b0f0105, 0x0b0f0109, 0x0b0f0505, 0x0d010303, 0x0d010307,
+	0x0d01030b, 0x0d010703, 0x0d010707, 0x0d010d01, 0x0d030101, 0x0d030501, 0x0d03050f, 0x0d030d09,
+	0x0d050305, 0x0d050709, 0x0d050905, 0x0d050b0b, 0x0d050d05, 0x0d050f01, 0x0d070101, 0x0d070309,
+	0x0d070503, 0x0d070901, 0x0d09050b, 0x0d090907, 0x0d090d05, 0x0d0b0101, 0x0d0b0107, 0x0d0b0709,
+	0x0d0b0d01, 0x0d0d010b, 0x0d0d0901, 0x0d0f0303, 0x0d0f0307, 0x0f010101, 0x0f010109, 0x0f01010f,
+	0x0f010501, 0x0f010505, 0x0f01070d, 0x0f010901, 0x0f010b09, 0x0f010d05, 0x0f030105, 0x0f030303,
+	0x0f030509, 0x0f030907, 0x0f03090b, 0x0f050103, 0x0f050109, 0x0f050301, 0x0f05030d, 0x0f050503,
+	0x0f050701, 0x0f050b03, 0x0f070105, 0x0f070705, 0x0f07070b, 0x0f070b07, 0x0f090103, 0x0f09010b,
+	0x0f090307, 0x0f090501, 0x0f090b01, 0x0f0b0505, 0x0f0b0905, 0x0f0d0105, 0x0f0d0703, 0x0f0f0101,
+};
 
 size_t ggml_row_size(uint32_t t, size_t n) {
 	const ggml_type_info *info = ggml_type_lookup(t);
@@ -504,6 +554,7 @@ static const char *kv_key_at(const void *ctx, size_t i) {
 static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, int fd, void *map_ptr,
 									 int header_only) {
 	gguf_reader r = {(const uint8_t *)data, (const uint8_t *)data + fsize};
+	str_arena_init(&ctx->strs);
 
 	uint32_t magic;
 	uint32_t version;
@@ -537,15 +588,13 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			free_kv(kv, i);
 			goto bad;
 		}
-		kv[i].key = xmalloc(key.len + 1);
-		memcpy(kv[i].key, key.data, key.len);
-		kv[i].key[key.len] = '\0';
+		kv[i].key = str_arena_dup(&ctx->strs, key.data, key.len);
 		uint32_t t;
 		if (gguf_reader_u32(&r, &t)) {
 			free_kv(kv, i + 1);
 			goto bad;
 		}
-		if (parse_kv_value(&r, &kv[i], t)) {
+		if (parse_kv_value(&r, &kv[i], t, &ctx->strs)) {
 			free_kv(kv, i + 1);
 			goto bad;
 		}
@@ -574,6 +623,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			goto bad_kv_ts;
 		if (gguf_reader_u64(&r, &ts[i].offset))
 			goto bad_kv_ts;
+		if (gguf_tensor_byte_size(&ts[i], &ts[i].byte_size) != 0)
+			ts[i].byte_size = 0;
 	}
 
 	size_t align = 32;
@@ -601,8 +652,8 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 			ts[i].data = NULL;
 			continue;
 		}
-		size_t tsize;
-		if (gguf_tensor_byte_size(&ts[i], &tsize) != 0) {
+		size_t tsize = ts[i].byte_size;
+		if (!tsize) {
 			ERROR("gguf: cannot size tensor '%s' (unknown type or bad dims)", ts[i].name);
 			goto bad_kv_ts;
 		}
@@ -646,6 +697,7 @@ bad_kv_ts:
 	free_kv(kv, ctx->n_kv);
 	free(ts);
 bad:
+	str_arena_free(&ctx->strs);
 	free(ctx->tensor_hash);
 	free(ctx->kv_hash);
 	if (map_ptr) {
@@ -682,6 +734,22 @@ status_code gguf_load(gguf_ctx *ctx, const char *path) {
 	return gguf_parse_common(ctx, map, fsize, fd, map, 0);
 }
 
+static ssize_t pread_full(int fd, void *dst, size_t len, uint64_t file_off) {
+	size_t total = 0;
+	while (total < len) {
+		ssize_t n = pread(fd, (char *)dst + total, len - total, (off_t)(file_off + total));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			break;
+		total += (size_t)n;
+	}
+	return (ssize_t)total;
+}
+
 static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t file_off, size_t len,
 						   void *dst) {
 	if (len == 0)
@@ -693,20 +761,10 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 		int len_aligned = ((len & (align - 1)) == 0);
 
 		if (dst_aligned && off_aligned && len_aligned) {
-			size_t total = 0;
-			while (total < len) {
-				ssize_t n =
-					pread(direct_fd, (char *)dst + total, len - total, (off_t)(file_off + total));
-				if (n < 0) {
-					if (errno == EINTR)
-						continue;
-					goto bounce_fallback;
-				}
-				if (n == 0)
-					break;
-				total += (size_t)n;
-			}
-			if (total >= len) {
+			ssize_t total = pread_full(direct_fd, dst, len, file_off);
+			if (total < 0)
+				goto bounce_fallback;
+			if ((size_t)total >= len) {
 				posix_fadvise(direct_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 				return 0;
 			}
@@ -720,23 +778,9 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 
 		void *bounce = NULL;
 		if (posix_memalign(&bounce, align, aligned_len) == 0 && bounce) {
-			size_t	 total	   = 0;
-			int		 io_failed = 0;
-			uint8_t *bp		   = bounce;
-			while (total < aligned_len) {
-				ssize_t n =
-					pread(direct_fd, bp + total, aligned_len - total, (off_t)(aligned_off + total));
-				if (n < 0) {
-					if (errno == EINTR)
-						continue;
-					io_failed = 1;
-					break;
-				}
-				if (n == 0)
-					break;
-				total += (size_t)n;
-			}
-			if (!io_failed && total >= head_slop + len) {
+			uint8_t *bp	   = bounce;
+			ssize_t	 total = pread_full(direct_fd, bp, aligned_len, aligned_off);
+			if (total >= 0 && (size_t)total >= head_slop + len) {
 				memcpy(dst, bp + head_slop, len);
 				free(bounce);
 				posix_fadvise(direct_fd, (off_t)aligned_off, (off_t)aligned_len,
@@ -750,18 +794,8 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 
 	if (plain_fd < 0)
 		return -1;
-	size_t total = 0;
-	while (total < len) {
-		ssize_t n = pread(plain_fd, (char *)dst + total, len - total, (off_t)(file_off + total));
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (n == 0)
-			return -1;
-		total += (size_t)n;
-	}
+	if (pread_full(plain_fd, dst, len, file_off) != (ssize_t)len)
+		return -1;
 	posix_fadvise(plain_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 	return 0;
 }
@@ -809,20 +843,13 @@ static int gguf_affinity_thread_count(void) {
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	gguf_ctx_init(ctx);
 
-	int fd = open(path, O_RDONLY);
+	size_t real_fsize = 0;
+	int	   fd		  = gguf_open_ro(path, &real_fsize);
 	if (fd < 0)
 		return ERR_IO;
-
-	struct stat st;
-	if (fstat(fd, &st) < 0) {
-		close(fd);
-		return ERR_IO;
-	}
-	size_t real_fsize = (size_t)st.st_size;
-	if (real_fsize == 0) {
-		close(fd);
-		return ERR_IO;
-	}
+	status_code rc = ERR_IO;
+	if (real_fsize == 0)
+		goto fail;
 
 	size_t		cap	 = MIN(GGUF_METADATA_INITIAL_CHUNK, real_fsize);
 	void	   *buf	 = xmalloc(cap);
@@ -833,9 +860,8 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 		while (have < cap) {
 			ssize_t n = pread(fd, (char *)buf + have, cap - have, (off_t)have);
 			if (n < 0) {
-				free(buf);
-				close(fd);
-				return ERR_IO;
+				rc = ERR_IO;
+				goto fail_buf;
 			}
 			if (n == 0)
 				break;
@@ -852,26 +878,19 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 		gguf_free(&trial);
 
 		if (have >= real_fsize) {
-			free(buf);
-			close(fd);
-			return ERR_FORMAT;
+			rc = ERR_FORMAT;
+			goto fail_buf;
 		}
 
 		size_t grow	   = MIN(cap, GGUF_METADATA_MAX_CHUNK);
 		size_t new_cap = MIN(cap + grow, real_fsize);
 		if (new_cap <= cap) {
-			free(buf);
-			close(fd);
-			return ERR_FORMAT;
+			rc = ERR_FORMAT;
+			goto fail_buf;
 		}
-		void *nbuf = realloc(buf, new_cap);
-		if (!nbuf) {
-			free(buf);
-			close(fd);
-			return ERR_OUT_OF_MEMORY;
-		}
-		buf = nbuf;
-		cap = new_cap;
+		void *nbuf = xrealloc(buf, new_cap);
+		buf		   = nbuf;
+		cap		   = new_cap;
 	}
 
 	for (size_t i = 0; i < ctx->n_tensors; i++)
@@ -890,6 +909,48 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	ctx->map_size	 = 0;
 	ctx->map_is_heap = 0;
 	return OK;
+
+fail_buf:
+	free(buf);
+fail:
+	close(fd);
+	return rc;
+}
+
+status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
+							   size_t *out_align) {
+	int flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
+		close(fd);
+		DEBUG("%s: O_DIRECT unsupported, using buffered reads", tag);
+		return ERR_IO;
+	}
+	long		blk = 4096;
+	struct stat pst;
+	if (fstat(fd, &pst) == 0 && pst.st_blksize > 0)
+		blk = pst.st_blksize;
+	size_t align = (size_t)blk;
+	if (max_align > 0 && align > max_align)
+		align = max_align;
+	void *probe_buf;
+	if (posix_memalign(&probe_buf, align, align) != 0 || !probe_buf) {
+		close(fd);
+		DEBUG("%s: O_DIRECT probe alloc failed, using buffered reads", tag);
+		return ERR_OUT_OF_MEMORY;
+	}
+	ssize_t rc = pread(fd, probe_buf, align, 0);
+	free(probe_buf);
+	if (rc < 0) {
+		close(fd);
+		DEBUG("%s: O_DIRECT probe failed (%s), using buffered reads", tag, strerror(errno));
+		return ERR_IO;
+	}
+	if (advise_random)
+		posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+	if (out_align)
+		*out_align = align;
+	DEBUG("%s: O_DIRECT enabled (align=%zu)", tag, align);
+	return OK;
 }
 
 status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
@@ -902,33 +963,12 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 	int	   direct_fd = -1;
 	size_t align	 = 0;
 	{
-		int fd = open(path, O_RDONLY | O_DIRECT);
+		int fd = open(path, O_RDONLY);
 		if (fd < 0) {
 			DEBUG("gguf sparse-load: O_DIRECT unavailable (%s), using buffered reads",
 				  strerror(errno));
-		} else {
-			struct stat st;
-			long		blk = 4096;
-			if (fstat(fd, &st) == 0 && st.st_blksize > 0)
-				blk = st.st_blksize < 4096 ? st.st_blksize : 4096;
-			void  *probe;
-			size_t a = (size_t)blk;
-			if (posix_memalign(&probe, a, a) != 0 || !probe) {
-				close(fd);
-				DEBUG("gguf sparse-load: O_DIRECT probe alloc failed, using buffered reads");
-			} else {
-				ssize_t rc = pread(fd, probe, a, 0);
-				free(probe);
-				if (rc < 0) {
-					close(fd);
-					DEBUG("gguf sparse-load: O_DIRECT probe failed (%s), using buffered reads",
-						  strerror(errno));
-				} else {
-					direct_fd = fd;
-					align	  = a;
-					DEBUG("gguf sparse-load: O_DIRECT enabled (align=%zu)", align);
-				}
-			}
+		} else if (direct_io_probe_fd(fd, "gguf sparse-load", 4096, 0, &align) == OK) {
+			direct_fd = fd;
 		}
 	}
 
@@ -942,8 +982,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 		if (gguf_tensor_name_is_expert(t->name))
 			continue;
 
-		size_t tbytes;
-		if (gguf_tensor_byte_size(t, &tbytes) != OK) {
+		size_t tbytes = t->byte_size;
+		if (!tbytes) {
 			ERROR("gguf_load_sparse: cannot compute size of tensor '%s'", t->name);
 			ret = ERR_FORMAT;
 			break;
@@ -990,8 +1030,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			gguf_tensor *t = &ctx->tensors[i];
 			if (!t->data)
 				continue;
-			size_t tbytes;
-			if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+			size_t tbytes = t->byte_size;
+			if (!tbytes)
 				continue;
 			n_chunks_cap += (tbytes / chunk_bytes) + (align > 0 ? 2 : 1);
 		}
@@ -1012,8 +1052,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 			gguf_tensor *t = &ctx->tensors[i];
 			if (!t->data)
 				continue;
-			size_t tbytes;
-			if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+			size_t tbytes = t->byte_size;
+			if (!tbytes)
 				continue;
 
 			uint64_t base_off		 = ctx->data_file_offset + t->offset;
@@ -1124,8 +1164,8 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 				gguf_tensor *t = &ctx->tensors[i];
 				if (!t->data)
 					continue;
-				size_t tbytes;
-				if (gguf_tensor_byte_size(t, &tbytes) != OK || tbytes == 0)
+				size_t tbytes = t->byte_size;
+				if (!tbytes)
 					continue;
 				uint64_t off64 = ctx->data_file_offset + t->offset;
 				size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
@@ -1169,19 +1209,10 @@ void gguf_free(gguf_ctx *ctx) {
 	if (!ctx || !ctx->valid)
 		return;
 	for (size_t i = 0; i < ctx->n_kv; i++) {
-		free(ctx->kv_keys[i]);
-		if (ctx->kv_types[i] == GGUF_TYPE_STRING) {
-			free((void *)ctx->kv_strs[i].data);
-		}
-		if (ctx->kv_types[i] == GGUF_TYPE_ARRAY) {
-			if (ctx->kv_arr_type[i] == GGUF_TYPE_STRING && ctx->kv_arr_data[i]) {
-				char **arr = (char **)ctx->kv_arr_data[i];
-				for (uint64_t j = 0; j < ctx->kv_arr_len[i]; j++)
-					free(arr[j]);
-			}
+		if (ctx->kv_types[i] == GGUF_TYPE_ARRAY)
 			free(ctx->kv_arr_data[i]);
-		}
 	}
+	str_arena_free(&ctx->strs);
 	free((void *)ctx->kv_keys);
 	free(ctx->kv_types);
 	free(ctx->kv_vals);
@@ -1208,63 +1239,66 @@ static ptrdiff_t find_kv(const gguf_ctx *c, const char *key) {
 	return strtab_find(c->kv_hash, c->kv_hash_cap, key);
 }
 
-status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
-	ptrdiff_t i = find_kv(c, k);
+static status_code gguf_find_checked(const gguf_ctx *c, const char *key, uint32_t want,
+									 ptrdiff_t *out_i) {
+	ptrdiff_t i = find_kv(c, key);
 	if (i < 0)
 		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_I32) {
-		*o = (int32_t)c->kv_vals[i];
-		return OK;
-	}
-	if (c->kv_types[i] == GGUF_TYPE_U32) {
+	if (c->kv_types[i] != want)
+		return ERR_INVALID_ARG;
+	if (out_i)
+		*out_i = i;
+	return OK;
+}
+
+status_code gguf_get_i32(const gguf_ctx *c, const char *k, int32_t *o) {
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_I32, &i);
+	if (st == OK) {
 		*o = (int32_t)(uint32_t)c->kv_vals[i];
 		return OK;
 	}
-	return ERR_INVALID_ARG;
+	status_code st2 = gguf_find_checked(c, k, GGUF_TYPE_U32, &i);
+	if (st2 == OK) {
+		*o = (int32_t)(uint32_t)c->kv_vals[i];
+		return OK;
+	}
+	return st == ERR_NOT_FOUND && st2 == ERR_NOT_FOUND ? ERR_NOT_FOUND : ERR_INVALID_ARG;
 }
 
 status_code gguf_get_f32(const gguf_ctx *c, const char *k, float *o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_F32) {
-		float v;
-		memcpy(&v, &c->kv_vals[i], 4);
-		*o = v;
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_F32, &i);
+	if (st != OK)
+		return st;
+	memcpy(o, &c->kv_vals[i], 4);
+	return OK;
 }
 
 status_code gguf_get_bool(const gguf_ctx *c, const char *k, int *o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_BOOL) {
-		*o = (int)c->kv_vals[i];
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_BOOL, &i);
+	if (st != OK)
+		return st;
+	*o = (int)c->kv_vals[i];
+	return OK;
 }
 
 status_code gguf_get_str(const gguf_ctx *c, const char *k, const char **o) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] == GGUF_TYPE_STRING) {
-		*o = c->kv_strs[i].data;
-		return OK;
-	}
-	return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_STRING, &i);
+	if (st != OK)
+		return st;
+	*o = c->kv_strs[i].data;
+	return OK;
 }
 
 static status_code gguf_get_arr_raw(const gguf_ctx *c, const char *k, uint32_t elem_type,
 									const void **o, size_t *out_count) {
-	ptrdiff_t i = find_kv(c, k);
-	if (i < 0)
-		return ERR_NOT_FOUND;
-	if (c->kv_types[i] != GGUF_TYPE_ARRAY)
-		return ERR_INVALID_ARG;
+	ptrdiff_t	i;
+	status_code st = gguf_find_checked(c, k, GGUF_TYPE_ARRAY, &i);
+	if (st != OK)
+		return st;
 	if (c->kv_arr_type[i] != elem_type)
 		return ERR_INVALID_ARG;
 	*o = c->kv_arr_data[i];
@@ -1296,6 +1330,15 @@ status_code gguf_get_arr_str(const gguf_ctx *c, const char *k, const char *const
 	status_code st	= gguf_get_arr_raw(c, k, GGUF_TYPE_STRING, &raw, out_count);
 	if (st == OK)
 		*o = (const char *const *)raw;
+	return st;
+}
+
+status_code gguf_get_arr_bool(const gguf_ctx *c, const char *k, const uint8_t **o,
+							  size_t *out_count) {
+	const void *raw = NULL;
+	status_code st	= gguf_get_arr_raw(c, k, GGUF_TYPE_BOOL, &raw, out_count);
+	if (st == OK)
+		*o = (const uint8_t *)raw;
 	return st;
 }
 

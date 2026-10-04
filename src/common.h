@@ -1,14 +1,9 @@
 #ifndef COMMON_H
 #define COMMON_H
 
-#include <execinfo.h>
-#include <limits.h>
-#include <sched.h>
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -23,13 +18,9 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((a) - 1))
 
-static inline size_t str_lcp_len(const char *a, const char *b) {
-	size_t i = 0;
-	while (a[i] && b[i] && a[i] == b[i])
-		i++;
-	return i;
-}
+#define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
 
 #define HEAD_DIM_MAX 512
 
@@ -44,12 +35,23 @@ typedef enum {
 	ERR_INTERNAL	  = -7,
 	ERR_INTERRUPTED	  = -8,
 	ERR_FALLBACK	  = -9,
+	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
-typedef struct {
-	float *p;
-	size_t cap;
-} float_buf;
+const char *status_str(status_code s);
+
+void  oom_abort(size_t bytes);
+void *xmalloc(size_t n);
+void *xmalloc_aligned(size_t n, size_t align);
+void *xcalloc(size_t n, size_t sz);
+void *xrealloc(void *p, size_t n);
+char *xstrdup(const char *s);
+char *xstrndup(const char *s, size_t n);
+
+typedef int (*spin_until_fn)(void *ud);
+
+void cpu_relax(void);
+void spin_wait_relax(spin_until_fn pred, void *ud);
 
 static inline void madvise_hugepage(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
@@ -59,117 +61,108 @@ static inline void madvise_hugepage(void *ptr, size_t bytes) {
 #endif
 }
 
+static inline long page_size_cached(void) {
+	static long ps = 0;
+	if (ps <= 0) {
+		ps = sysconf(_SC_PAGESIZE);
+		if (ps <= 0)
+			ps = 4096;
+	}
+	return ps;
+}
+
 static inline void prefault(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	long ps = sysconf(_SC_PAGESIZE);
-	if (ps <= 0)
-		ps = 4096;
-	volatile char *p = (volatile char *)ptr;
-	for (size_t off = 0; off < bytes; off += (size_t)ps)
+	size_t		   ps = (size_t)page_size_cached();
+	volatile char *p  = (volatile char *)ptr;
+	for (size_t off = 0; off < bytes; off += ps)
 		p[off] = p[off];
 	p[bytes - 1] = p[bytes - 1];
 }
 
-static inline void cpu_relax(void) {
-#if defined(__x86_64__) || defined(__i386__)
-	__builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-	__asm__ __volatile__("isb" ::: "memory");
-#else
-	sched_yield();
-#endif
+size_t		str_lcp_len(const char *a, const char *b);
+const char *path_basename(const char *path);
+
+typedef struct {
+	uintptr_t start;
+	size_t	  len;
+} page_span;
+
+static inline page_span page_span_for(const void *ptr, size_t bytes, size_t page_size) {
+	page_span r = {0, 0};
+	if (!ptr || bytes == 0 || page_size == 0)
+		return r;
+	uintptr_t addr = (uintptr_t)ptr;
+	uintptr_t end  = addr + bytes;
+	if (end < addr)
+		return r;
+	uintptr_t mask	 = ~((uintptr_t)page_size - 1);
+	uintptr_t pstart = addr & mask;
+	uintptr_t pend	 = (end + page_size - 1) & mask;
+	if (pend < pstart)
+		return r;
+	r.start = pstart;
+	r.len	= pend - pstart;
+	return r;
 }
 
-static inline void oom_abort(size_t bytes) {
-	fprintf(stderr, "fatal: out of memory (%zu bytes)\n", bytes);
-	void *frames[32];
-	int	  n = backtrace(frames, 32);
-	backtrace_symbols_fd(frames, n, 2);
-	abort();
+static inline int page_span_clamp(page_span *r, uintptr_t base, size_t size) {
+	if (!r || r->len == 0)
+		return 0;
+	if (r->start < base || r->start + r->len < r->start)
+		return 0;
+	uintptr_t stop = base + size;
+	if (r->start + r->len > stop || stop < base)
+		return 0;
+	return 1;
 }
 
-static inline void *xmalloc(size_t n) {
-	if (n == 0)
-		n = 1;
-	void *p = malloc(n);
-	if (!p)
-		oom_abort(n);
-	return p;
-}
+typedef struct {
+	const char *p;
+	size_t		len;
+} str_span;
 
-static inline void *xmalloc_aligned(size_t n, size_t align) {
-	if (align < sizeof(void *))
-		align = sizeof(void *);
-	void *p = NULL;
-	if (posix_memalign(&p, align, n) != 0)
-		oom_abort(n);
-	return p;
-}
+str_span span_trim(const char *s, size_t len);
+size_t	 marker_tail_len(const char *s, size_t len, const char *marker);
 
-static inline void *xcalloc(size_t n, size_t sz) {
-	if (n == 0 || sz == 0)
-		return NULL;
-	if (n > SIZE_MAX / sz)
-		oom_abort(n * sz);
-	void *p = calloc(n, sz);
-	if (!p)
-		oom_abort(n * sz);
-	return p;
-}
+typedef struct {
+	float *p;
+	size_t cap;
+} float_buf;
 
-static inline void *xrealloc(void *p, size_t n) {
-	if (n == 0) {
-		free(p);
-		return NULL;
-	}
-	void *q = realloc(p, n);
-	if (!q)
-		oom_abort(n);
-	return q;
-}
+float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align);
+float *float_buf_ensure(float_buf *b, size_t need);
 
-static inline char *xstrdup(const char *s) {
-	char *p = strdup(s);
-	if (!p)
-		oom_abort(strlen(s));
-	return p;
-}
+typedef struct {
+	char  *p;
+	size_t len;
+	size_t cap;
+} str_builder;
 
-static inline float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
-	if (need > b->cap) {
-		size_t bytes = need * sizeof(float);
-		if (bytes >= (2u << 20))
-			align = align < 4096 ? 4096 : align;
-		float *np = xmalloc_aligned(bytes, align);
-		if (bytes >= (2u << 20))
-			madvise_hugepage(np, bytes);
-		if (b->p && b->cap > 0)
-			memcpy(np, b->p, b->cap * sizeof(float));
-		free(b->p);
-		b->p   = np;
-		b->cap = need;
-	}
-	return b->p;
-}
+void  sb_reserve(str_builder *b, size_t extra);
+void  sb_init(str_builder *b);
+void  sb_putb(str_builder *b, const char *s, size_t n);
+void  sb_puts(str_builder *b, const char *s);
+void  sb_putc(str_builder *b, char c);
+void  sb_reset(str_builder *b);
+char *sb_finish(str_builder *b);
+void  sb_free(str_builder *b);
+void  str_replace_all(str_builder *out, const char *s, const char *from, const char *to);
 
-static inline float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align) {
-	if (need > b->cap) {
-		size_t bytes = need * sizeof(float);
-		if (bytes >= (2u << 20))
-			align = align < 4096 ? 4096 : align;
-		free(b->p);
-		b->p = xmalloc_aligned(bytes, align);
-		if (bytes >= (2u << 20))
-			madvise_hugepage(b->p, bytes);
-		b->cap = need;
-	}
-	return b->p;
-}
+typedef struct {
+	char **chunks;
+	size_t n_chunks;
+	char  *cur;
+	char  *end;
+	size_t next_size;
+} str_arena;
 
-static inline float *float_buf_ensure(float_buf *b, size_t need) {
-	return float_buf_ensure_aligned(b, need, 64);
-}
+void  str_arena_init(str_arena *a);
+char *str_arena_alloc(str_arena *a, size_t n);
+void  str_arena_reserve(str_arena *a, size_t n);
+char *str_arena_dup(str_arena *a, const char *s, size_t len);
+void  str_arena_free(str_arena *a);
 
 static inline void topk_heap_sift_down(float *score, int *idx, int n, int pos) {
 	for (;;) {
@@ -221,7 +214,7 @@ static inline int topk_heap_select(const float *scores, int n_scores, int k, flo
 }
 
 static inline uint64_t fnv1a(const char *s, size_t n) {
-	uint64_t h = 0xcbf29ce484222325ULL;
+	uint64_t h = FNV1A_OFFSET_BASIS;
 	for (size_t i = 0; i < n; i++) {
 		h ^= (uint8_t)s[i];
 		h *= 0x100000001b3ULL;
@@ -233,11 +226,31 @@ static inline uint64_t fnv1a_str(const char *s) {
 	return fnv1a(s, strlen(s));
 }
 
+static inline uint64_t fnv1a_update(uint64_t h, const char *s, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+static inline uint64_t fnv1a_update_str(uint64_t h, const char *s) {
+	return s ? fnv1a_update(h, s, strlen(s)) : h;
+}
+
 #define ARR_RESERVE(items, n, cap)                                                                 \
 	do {                                                                                           \
 		if ((n) == (cap)) {                                                                        \
 			(cap)	= (cap) ? (cap) * 2 : 8;                                                       \
 			(items) = xrealloc((items), (cap) * sizeof(*(items)));                                 \
+		}                                                                                          \
+	} while (0)
+
+#define ARR_ENSURE(items, need, cap)                                                               \
+	do {                                                                                           \
+		if ((cap) < (need)) {                                                                      \
+			(cap)	= (need);                                                                      \
+			(items) = xrealloc((items), (size_t)(cap) * sizeof(*(items)));                         \
 		}                                                                                          \
 	} while (0)
 

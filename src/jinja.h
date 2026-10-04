@@ -8,6 +8,8 @@
 typedef enum {
 	JV_NONE = 0,
 	JV_BOOL,
+	JV_INT,
+	JV_FLOAT,
 	JV_STRING,
 	JV_DICT,
 	JV_LIST,
@@ -27,12 +29,22 @@ struct jinja_dict_entry {
 struct jinja_value {
 	jinja_value_type type;
 	union {
-		int				  b;
+		bool b;
+		struct {
+			int64_t value;
+			char	text[32];
+			bool	text_ready;
+		} integer;
+		struct {
+			double value;
+			char   text[64];
+		} floating;
 		char			 *s;
 		jinja_dict_entry *dict;
 		struct {
 			jinja_value **items;
-			size_t		  n;
+			uint32_t	  n;
+			uint32_t	  cap;
 		} list;
 		stmt_node *macro;
 	} as;
@@ -40,8 +52,9 @@ struct jinja_value {
 
 jinja_value *jinja_none(void);
 jinja_value *jinja_bool(int b);
+jinja_value *jinja_int(int64_t n);
+jinja_value *jinja_float(double n);
 jinja_value *jinja_string(const char *s);
-jinja_value *jinja_string_n(const char *s, size_t n);
 jinja_value *jinja_dict(void);
 jinja_value *jinja_list(void);
 void		 jinja_dict_set(jinja_value *d, const char *key, jinja_value *val);

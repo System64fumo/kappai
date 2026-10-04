@@ -4,17 +4,8 @@
 #include "common.h"
 #include "markers.h"
 
-#include <json-c/json.h>
+#include <json-c/json_types.h>
 #include <stddef.h>
-
-typedef struct {
-	char  *p;
-	size_t len;
-	size_t cap;
-} toolcall_buf;
-
-void toolcall_buf_append(toolcall_buf *b, const char *s, size_t n);
-void toolcall_buf_reset(toolcall_buf *b);
 
 typedef void (*toolcall_content_fn)(void *ud, const char *piece, size_t n);
 typedef void (*toolcall_call_fn)(void *ud, int index, const char *id, const char *name,
@@ -22,7 +13,7 @@ typedef void (*toolcall_call_fn)(void *ud, int index, const char *id, const char
 
 typedef struct toolcall_scanner toolcall_scanner;
 
-toolcall_scanner *toolcall_scanner_new(const marker_pair *fmt, toolcall_buf *content,
+toolcall_scanner *toolcall_scanner_new(const marker_pair *fmt, str_builder *content,
 									   toolcall_content_fn on_content, toolcall_call_fn on_call,
 									   void *ud);
 
