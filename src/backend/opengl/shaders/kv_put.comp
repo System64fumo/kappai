@@ -1,0 +1,102 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer KInBuf {
+	float k_in[];
+};
+layout(std430, binding = 1) readonly buffer VInBuf {
+	float v_in[];
+};
+layout(std430, binding = 2) buffer KCacheBuf {
+	uint k_cache[];
+};
+layout(std430, binding = 3) buffer VCacheBuf {
+	uint v_cache[];
+};
+
+layout(location = 0) uniform int u_layer_off;
+layout(location = 1) uniform int u_pos_start;
+layout(location = 2) uniform int u_kvh_stride;
+layout(location = 3) uniform int u_row_stride;
+layout(location = 4) uniform int u_head_dim;
+layout(location = 5) uniform int u_kv_q8;
+layout(location = 6) uniform int u_in_row_stride;
+
+void store_byte(uint byte_off, uint val, bool is_v) {
+	uint word_idx = byte_off >> 2u;
+	uint shift	  = (byte_off & 3u) << 3u;
+	uint mask	  = 0xFFu << shift;
+	uint shifted  = (val & 0xFFu) << shift;
+	if (is_v) {
+		atomicAnd(v_cache[word_idx], ~mask);
+		atomicOr(v_cache[word_idx], shifted);
+	} else {
+		atomicAnd(k_cache[word_idx], ~mask);
+		atomicOr(k_cache[word_idx], shifted);
+	}
+}
+
+void main() {
+	int row		 = int(gl_WorkGroupID.x);
+	int kvh		 = int(gl_WorkGroupID.y);
+	int tid		 = int(gl_LocalInvocationID.x);
+	int head_dim = u_head_dim;
+
+	int in_off = row * u_in_row_stride + kvh * head_dim;
+
+	uint row_base = uint(u_layer_off) + uint(kvh) * uint(u_kvh_stride) +
+					uint(u_pos_start + row) * uint(u_row_stride);
+
+	if (u_kv_q8 == 0) {
+		for (int e = tid * 2; e < head_dim; e += 128) {
+			float kf0		  = k_in[in_off + e];
+			float kf1		  = (e + 1 < head_dim) ? k_in[in_off + e + 1] : 0.0;
+			float vf0		  = v_in[in_off + e];
+			float vf1		  = (e + 1 < head_dim) ? v_in[in_off + e + 1] : 0.0;
+			uint  kw		  = packHalf2x16(vec2(kf0, kf1));
+			uint  vw		  = packHalf2x16(vec2(vf0, vf1));
+			uint  word_idx	  = (row_base + uint(e)) >> 1u;
+			k_cache[word_idx] = kw;
+			v_cache[word_idx] = vw;
+		}
+	} else {
+		int n_blocks = (head_dim + 31) / 32;
+		int total	 = n_blocks * 2;
+		for (int job = tid; job < total; job += 64) {
+			bool is_v	   = (job >= n_blocks);
+			int	 b		   = is_v ? (job - n_blocks) : job;
+			int	 elem_base = b * 32;
+
+			float amax = 0.0;
+			for (int j = 0; j < 32; j++) {
+				int e = elem_base + j;
+				if (e < head_dim) {
+					float v = is_v ? v_in[in_off + e] : k_in[in_off + e];
+					amax	= max(amax, abs(v));
+				}
+			}
+			float d	 = amax / 127.0;
+			float id = d > 0.0 ? 1.0 / d : 0.0;
+
+			uint d16 = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+
+			uint blk_off = row_base + uint(b) * 34u;
+
+			store_byte(blk_off + 0u, (d16 >> 0u) & 0xFFu, is_v);
+			store_byte(blk_off + 1u, (d16 >> 8u) & 0xFFu, is_v);
+
+			for (int j = 0; j < 32; j++) {
+				int	  e = elem_base + j;
+				float v = 0.0;
+				if (e < head_dim)
+					v = is_v ? v_in[in_off + e] : k_in[in_off + e];
+				float qf = clamp(v * id, -127.0, 127.0);
+				int	  q	 = int(round(qf));
+				store_byte(blk_off + 2u + uint(j), uint(q) & 0xFFu, is_v);
+			}
+		}
+	}
+}

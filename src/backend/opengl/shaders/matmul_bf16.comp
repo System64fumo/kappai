@@ -1,0 +1,56 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[32];
+
+void main(void) {
+	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint tid   = gl_LocalInvocationID.x;
+	bool valid = int(row) < u_n;
+
+	float acc = 0.0;
+	if (valid) {
+		uint base = row * uint(u_k);
+		for (int ki = int(tid); ki < u_k; ki += 32) {
+			uint e	= base + uint(ki);
+			uint wd = w[e >> 1u];
+			uint h	= (e & 1u) == 0u ? (wd & 0xFFFFu) : (wd >> 16u);
+			acc += uintBitsToFloat(h << 16u) * x[uint(ki)];
+		}
+	}
+	s_acc[tid] = acc;
+	barrier();
+	for (uint s = 16u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_acc[tid] += s_acc[tid + s];
+		barrier();
+	}
+	if (valid && tid == 0u) {
+		if (u_add_residual == 1)
+			y[row] = s_acc[0] + res[row];
+		else if (u_add_residual == 2)
+			y[row] += s_acc[0];
+		else
+			y[row] = s_acc[0];
+	}
+}

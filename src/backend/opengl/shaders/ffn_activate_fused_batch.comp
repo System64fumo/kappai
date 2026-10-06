@@ -1,0 +1,31 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer FusedBuf {
+	float fused[];
+};
+layout(std430, binding = 1) writeonly buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_m;
+layout(location = 2) uniform int u_act;
+void main(void) {
+	int total = u_n * u_m;
+	int g	  = int(gl_GlobalInvocationID.x);
+	if (g >= total)
+		return;
+	int	  row = g / u_n;
+	int	  col = g - row * u_n;
+	int	  gi  = row * 2 * u_n + col;
+	float gv  = fused[gi];
+	float u	  = fused[gi + u_n];
+	float act;
+	if (u_act == 1) {
+		float t = 0.7978845608 * (gv + 0.044715 * gv * gv * gv);
+		act		= 0.5 * gv * (1.0 + tanh(t));
+	} else {
+		act = gv / (1.0 + exp(-gv));
+	}
+	out_[row * u_n + col] = act * u;
+}

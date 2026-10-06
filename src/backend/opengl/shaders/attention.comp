@@ -1,0 +1,180 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 1) readonly buffer KBuf {
+	uint kcache[];
+};
+layout(std430, binding = 2) readonly buffer VBuf {
+	uint vcache[];
+};
+layout(std430, binding = 4) buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_layer_off;
+layout(location = 1) uniform int u_pos;
+layout(location = 2) uniform int u_n_heads;
+layout(location = 3) uniform int u_n_kv_heads;
+layout(location = 4) uniform int u_head_dim;
+layout(location = 5) uniform int u_n_ctx;
+layout(location = 6) uniform float u_scale;
+layout(location = 7) uniform int u_stride_head_dim;
+layout(location = 8) uniform int u_attn_start;
+layout(location = 9) uniform int u_kv_q8;
+#define MAX_HEAD_DIM 512
+#ifndef TILE_T
+#define TILE_T 14
+#endif
+shared float q_shared[MAX_HEAD_DIM];
+shared float kv_tile[TILE_T * MAX_HEAD_DIM];
+shared float s_tile[TILE_T];
+shared float e_tile[TILE_T];
+float		 half_to_float(uint h) {
+	uint  w_bits			  = h << 16u;
+	uint  sign				  = w_bits & 0x80000000u;
+	uint  two_w				  = w_bits + w_bits;
+	uint  exp_offset		  = 0xE0u << 23u;
+	float exp_scale			  = uintBitsToFloat(0x07800000u);
+	float normalized_value	  = uintBitsToFloat((two_w >> 4u) + exp_offset) * exp_scale;
+	uint  magic_mask		  = 126u << 23u;
+	float denormalized_value  = uintBitsToFloat((two_w >> 17u) | magic_mask) - 0.5;
+	uint  denormalized_cutoff = 1u << 27u;
+	uint  bits				  = two_w < denormalized_cutoff ? floatBitsToUint(denormalized_value)
+															: floatBitsToUint(normalized_value);
+	return uintBitsToFloat(sign | bits);
+}
+uint rb8(uint byte_off, uint which) {
+	uint wd = which == 0u ? kcache[byte_off >> 2u] : vcache[byte_off >> 2u];
+	return (wd >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+void main(void) {
+	uint h			= gl_WorkGroupID.x;
+	uint tid		= gl_LocalInvocationID.x;
+	int	 n_groups	= u_n_heads / u_n_kv_heads;
+	int	 kvh		= int(h) / n_groups;
+	int	 head_dim	= u_head_dim;
+	int	 pos		= u_pos;
+	int	 attn_start = u_attn_start;
+	uint q_base		= h * uint(head_dim);
+
+	for (int d = int(tid); d < head_dim; d += 64)
+		q_shared[d] = q[q_base + uint(d)];
+	for (int d = int(tid); d < head_dim; d += 64)
+		out_[h * uint(head_dim) + uint(d)] = 0.0;
+	barrier();
+
+	uint kvh_stride = uint(u_n_ctx) * uint(u_stride_head_dim);
+	uint kv_base	= uint(u_layer_off) + uint(kvh) * kvh_stride;
+
+	float m_run = uintBitsToFloat(0xFF800000u);
+	float l_run = 0.0;
+
+	for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
+		int tile_t1	 = min(tile_t0 + TILE_T, pos + 1);
+		int tile_len = tile_t1 - tile_t0;
+
+		if (u_kv_q8 == 0) {
+			int total_words = tile_len * (head_dim / 2);
+			for (int idx = int(tid); idx < total_words; idx += 64) {
+				int	 t	= idx / (head_dim / 2);
+				int	 dw = idx % (head_dim / 2);
+				uint elem_idx =
+					kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim) + uint(dw * 2);
+				uint word						   = kcache[elem_idx >> 1u];
+				kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
+				kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+			}
+		} else {
+			int total_elems = tile_len * head_dim;
+			for (int idx = int(tid); idx < total_elems; idx += 64) {
+				int	 t					  = idx / head_dim;
+				int	 e					  = idx - t * head_dim;
+				uint row_byte			  = kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim);
+				uint boff				  = row_byte + (uint(e) >> 5u) * 34u;
+				uint d16				  = rb8(boff, 0u) | (rb8(boff + 1u, 0u) << 8u);
+				int	 code				  = int(rb8(boff + 2u + (uint(e) & 31u), 0u) ^ 128u) - 128;
+				kv_tile[t * head_dim + e] = half_to_float(d16) * float(code);
+			}
+		}
+		barrier();
+
+		if (int(tid) < tile_len) {
+			int	  t	 = int(tid);
+			float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+			int	  d		  = 0;
+			int	  hd_main = head_dim - (head_dim % 8);
+			for (; d < hd_main; d += 8) {
+				a0 += q_shared[d] * kv_tile[t * head_dim + d] +
+					  q_shared[d + 4] * kv_tile[t * head_dim + d + 4];
+				a1 += q_shared[d + 1] * kv_tile[t * head_dim + d + 1] +
+					  q_shared[d + 5] * kv_tile[t * head_dim + d + 5];
+				a2 += q_shared[d + 2] * kv_tile[t * head_dim + d + 2] +
+					  q_shared[d + 6] * kv_tile[t * head_dim + d + 6];
+				a3 += q_shared[d + 3] * kv_tile[t * head_dim + d + 3] +
+					  q_shared[d + 7] * kv_tile[t * head_dim + d + 7];
+			}
+			for (; d < head_dim; d++)
+				a0 += q_shared[d] * kv_tile[t * head_dim + d];
+			float dot = (a0 + a1) + (a2 + a3);
+			s_tile[t] = dot * u_scale;
+		}
+		barrier();
+
+		float m_tile = uintBitsToFloat(0xFF800000u);
+		for (int t = 0; t < tile_len; t++)
+			m_tile = max(m_tile, s_tile[t]);
+		float m_new = max(m_run, m_tile);
+
+		if (int(tid) < tile_len)
+			e_tile[int(tid)] = exp(s_tile[int(tid)] - m_new);
+		barrier();
+
+		float alpha	 = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		float l_tile = 0.0;
+		for (int t = 0; t < tile_len; t++)
+			l_tile += e_tile[t];
+		l_run = l_run * alpha + l_tile;
+		for (int d = int(tid); d < head_dim; d += 64)
+			out_[h * uint(head_dim) + uint(d)] *= alpha;
+
+		if (u_kv_q8 == 0) {
+			int total_words = tile_len * (head_dim / 2);
+			for (int idx = int(tid); idx < total_words; idx += 64) {
+				int	 t	= idx / (head_dim / 2);
+				int	 dw = idx % (head_dim / 2);
+				uint elem_idx =
+					kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim) + uint(dw * 2);
+				uint word						   = vcache[elem_idx >> 1u];
+				kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
+				kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+			}
+		} else {
+			int total_elems = tile_len * head_dim;
+			for (int idx = int(tid); idx < total_elems; idx += 64) {
+				int	 t					  = idx / head_dim;
+				int	 e					  = idx - t * head_dim;
+				uint row_byte			  = kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim);
+				uint boff				  = row_byte + (uint(e) >> 5u) * 34u;
+				uint d16				  = rb8(boff, 1u) | (rb8(boff + 1u, 1u) << 8u);
+				int	 code				  = int(rb8(boff + 2u + (uint(e) & 31u), 1u) ^ 128u) - 128;
+				kv_tile[t * head_dim + e] = half_to_float(d16) * float(code);
+			}
+		}
+		barrier();
+
+		for (int d = int(tid); d < head_dim; d += 64) {
+			float acc = 0.0;
+			for (int t = 0; t < tile_len; t++)
+				acc += e_tile[t] * kv_tile[t * head_dim + d];
+			out_[h * uint(head_dim) + uint(d)] += acc;
+		}
+		m_run = m_new;
+		barrier();
+	}
+
+	float inv_l = l_run > 0.0 ? 1.0 / l_run : 0.0;
+	for (int d = int(tid); d < head_dim; d += 64)
+		out_[h * uint(head_dim) + uint(d)] *= inv_l;
+}

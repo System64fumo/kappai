@@ -1,0 +1,138 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[32];
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+float round_f16(float f) {
+	return unpackHalf2x16(packHalf2x16(vec2(f, 0.0))).x;
+}
+
+uint rb(uint off) {
+	uint wd = w[off >> 2u];
+	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+uint f32_bits(float f) {
+	return floatBitsToUint(f);
+}
+float bits_f32(uint b) {
+	return uintBitsToFloat(b);
+}
+
+uint exact_div(uint nb, uint db) {
+	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
+	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
+	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
+	uint M24 = 0u;
+	uint rem;
+	int	 me;
+	if (Nn >= Dd) {
+		me	= eq;
+		rem = Nn - Dd;
+	} else {
+		me	= eq - 1;
+		rem = (Nn << 1u) - Dd;
+	}
+	for (int i = 0; i < 23; i++) {
+		rem <<= 1u;
+		M24 <<= 1u;
+		if (rem >= Dd) {
+			rem -= Dd;
+			M24 |= 1u;
+		}
+	}
+	uint r2 = rem << 1u;
+	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
+		M24++;
+	if (M24 >= (1u << 23)) {
+		M24 = 0u;
+		me++;
+	}
+	int fe = me + 127;
+	if (fe >= 255)
+		return 0x7F800000u;
+	if (fe <= 0)
+		return 0u;
+	return (uint(fe) << 23u) | M24;
+}
+
+int round_away(float f) {
+	float af = abs(f);
+	float tr = trunc(af);
+	float fr = af - tr;
+	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
+	return (f < 0.0) ? -int(r) : int(r);
+}
+
+void main(void) {
+	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint tid   = gl_LocalInvocationID.x;
+	bool valid = int(row) < u_n;
+
+	float acc = 0.0;
+	if (valid) {
+		uint row_off = row * uint(u_k_blocks) * 34u;
+		for (int bi = int(tid); bi < u_k_blocks; bi += 32) {
+			uint  bo   = row_off + uint(bi) * 34u;
+			int	  xb   = bi * 32;
+			float amax = 0.0;
+			for (int j = 0; j < 32; j++) {
+				float ax = abs(x[xb + j]);
+				if (ax > amax)
+					amax = ax;
+			}
+			uint  db   = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
+			float d	   = bits_f32(db);
+			float id   = (db != 0u) ? bits_f32(exact_div(f32_bits(1.0), db)) : 0.0;
+			float dxq  = round_f16(d);
+			float wd   = h2f(rb(bo) | (rb(bo + 1u) << 8u));
+			int	  sumi = 0;
+			for (int j = 0; j < 32; j++) {
+				uint bv = rb(bo + 2u + uint(j));
+				int	 wq = int(bv ^ 128u) - 128;
+				int	 v	= round_away(x[xb + j] * id);
+				v		= v > 127 ? 127 : (v < -127 ? -127 : v);
+				sumi += wq * v;
+			}
+			acc += wd * dxq * float(sumi);
+		}
+	}
+	s_acc[tid] = acc;
+	barrier();
+	for (uint s = 16u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_acc[tid] += s_acc[tid + s];
+		barrier();
+	}
+	if (valid && tid == 0u) {
+		if (u_add_residual == 1)
+			y[row] = s_acc[0] + res[row];
+		else if (u_add_residual == 2)
+			y[row] += s_acc[0];
+		else
+			y[row] = s_acc[0];
+	}
+}
