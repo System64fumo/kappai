@@ -27,7 +27,19 @@ float h2f(uint h) {
 }
 
 float round_f16(float f) {
-	return unpackHalf2x16(packHalf2x16(vec2(f, 0.0))).x;
+	float base = abs(f) * 4.0;
+	uint  w	   = floatBitsToUint(f);
+	uint  shl1 = w + w;
+	uint  sign = w & 0x80000000u;
+	uint  bias = shl1 & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	base		   = uintBitsToFloat((bias >> 1u) + 0x07800000u) + base;
+	uint bits	   = floatBitsToUint(base);
+	uint exp_bits  = (bits >> 13u) & 0x7C00u;
+	uint mant_bits = bits & 0x0FFFu;
+	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
+	return h2f(hbits);
 }
 
 uint rb(uint off) {
@@ -106,7 +118,7 @@ void main(void) {
 			}
 			uint  db   = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
 			float d	   = bits_f32(db);
-			float id   = (db != 0u) ? bits_f32(exact_div(f32_bits(1.0), db)) : 0.0;
+			float id   = (db != 0u) ? 1.0 / d : 0.0;
 			float dxq  = round_f16(d);
 			float wd   = h2f(rb(bo) | (rb(bo + 1u) << 8u));
 			int	  sumi = 0;
