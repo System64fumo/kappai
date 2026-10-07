@@ -281,18 +281,41 @@ void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
 #ifdef __cplusplus
 extern "C" {
 #endif
-void cuda_matmul_ffn_down_batch(const void *w_dev, const float *gate_dev,
-                                const float *up_dev, float *y_dev, int n, int k,
-                                int m, cudaStream_t stream, int qmajor);
-void cuda_matmul_ffn_down_q4_batch(const void *w_dev, const float *gate_dev,
-                                   const float *up_dev, float *y_dev, int n, int k,
-                                   int m, cudaStream_t stream, int qmajor);
-void cuda_matmul_ffn_down_q4_1_batch(const void *w_dev, const float *gate_dev,
-                                     const float *up_dev, float *y_dev, int n, int k,
-                                     int m, cudaStream_t stream);
+void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
+                                       const float *up_dev, float *y_dev, int n, int k,
+                                       int m, cudaStream_t stream, int qmajor);
+void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
+                                          const float *up_dev, float *y_dev, int n, int k,
+                                          int m, cudaStream_t stream, int qmajor);
+void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
+                                            const float *up_dev, float *y_dev, int n, int k,
+                                            int m, cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif
+
+/* MoE experts batch: grouped expert execution with fused activation. */
+status_code cuda_moe_experts_batch(backend *self, const buffer *xb, buffer *out,
+                                    int n_rows, int dim, int inter, int use_gelu,
+                                    int n_experts, const moe_resident_expert *experts,
+                                    const int *counts, const int *rows_packed,
+                                    const float *weights_packed, cudaStream_t stream);
+
+/* MoE expert activation (SiLU/GELU) - already exists as cuda_moe_activate */
+/* MoE expert matmul for gate/up/down projections */
+status_code cuda_moe_gate_proj(const void *w_dev, uint32_t w_type, const float *x_dev,
+                                float *gate_dev, int n_rows, int dim, int inter,
+                                cudaStream_t stream);
+status_code cuda_moe_up_proj(const void *w_dev, uint32_t w_type, const float *x_dev,
+                              float *up_dev, int n_rows, int dim, int inter,
+                              cudaStream_t stream);
+status_code cuda_moe_down_proj(const void *w_dev, uint32_t w_type, const float *act_dev,
+                                float *y_dev, int n_rows, int inter, int dim,
+                                cudaStream_t stream);
+status_code cuda_moe_scale_accum(float *out, const float *src, int n_rows, int dim,
+                                  float weight, float down_scale, cudaStream_t stream);
+
+
 
 /* Q4_K weight matmul: quantizes x internally (Q8_K), then y = W * x. */
 void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
