@@ -318,11 +318,18 @@ static void log_op_homes(backend *b) {
 		char native[256], nonnative[256];
 		native[0] = nonnative[0] = '\0';
 		for (size_t i = 0; i < ARRAY_LEN(types); i++) {
-			int	   is_native = b->matmul_type_native((backend *)b, types[i].t);
+			int    is_native = b->matmul_type_native((backend *)b, types[i].t);
 			char  *dst		 = is_native ? native : nonnative;
 			size_t len		 = strlen(dst);
-			snprintf(dst + len, is_native ? sizeof(native) : sizeof(nonnative), "%s%s",
-					 len ? ", " : "", types[i].n);
+			/* Pass the *remaining* space in the chosen buffer, not the whole
+			 * buffer: glibc's _FORTIFY_SOURCE=3 check rejects a maxlen larger
+			 * than the space left at dst. native and nonnative are distinct
+			 * arrays, so the bound must be derived from dst's own buffer --
+			 * subtracting one array's base from the other's pointer is not
+			 * defined and leaves fortify unable to bound the write. */
+			size_t cap	 = is_native ? sizeof(native) : sizeof(nonnative);
+			size_t room = len < cap ? cap - len : 0;
+			snprintf(dst + len, room, "%s%s", len ? ", " : "", types[i].n);
 		}
 		DEBUG("backend '%s': matmul native types: %s", b->name, native[0] ? native : "(none)");
 		if (nonnative[0])
