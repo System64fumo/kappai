@@ -180,15 +180,14 @@ LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/moe/*.c) \
 	$(SRC_DIR)/backend/backend.c
 
-# CUDA sources: host-side .c plus device .cu (nvcc). cuda_repack.c is a plain
-# host-C translation unit (no CUDA runtime headers) that the engine calls
-# directly, so it stays in the engine; the rest become a dlopen'd library.
+# CUDA sources: host-side .c plus device .cu (nvcc). Every one of them becomes
+# part of the dlopen'd backend library -- nothing under backend/cuda is linked
+# into the engine, so the backend is a self-contained drop-in.
 CUDA_C_SRCS  :=
 CUDA_CU_SRCS :=
 ifneq ($(HAS_CUDA),)
   CUDA_C_SRCS  := $(wildcard $(SRC_DIR)/backend/cuda/*.c)
   CUDA_CU_SRCS := $(wildcard $(SRC_DIR)/backend/cuda/*.cu)
-  LIB_SRCS += $(SRC_DIR)/backend/cuda/cuda_repack.c
 endif
 
 BACKEND_DIR     := $(OUT_DIR)/backends
@@ -232,10 +231,8 @@ ifneq ($(HAS_VULKAN),)
 endif
 
 ifneq ($(HAS_CUDA),)
-  # cuda_repack.c is linked into the engine (LIB_SRCS), not the backend library.
-  CUDA_BACKEND_C_SRCS := $(filter-out $(SRC_DIR)/backend/cuda/cuda_repack.c,$(CUDA_C_SRCS))
   CUDA_BACKEND_OBJS := \
-	$(patsubst $(SRC_DIR)/backend/cuda/%.c,$(BACKEND_OBJ_DIR)/backend/cuda/%.o,$(CUDA_BACKEND_C_SRCS)) \
+	$(patsubst $(SRC_DIR)/backend/cuda/%.c,$(BACKEND_OBJ_DIR)/backend/cuda/%.o,$(CUDA_C_SRCS)) \
 	$(patsubst $(SRC_DIR)/backend/cuda/%.cu,$(BACKEND_OBJ_DIR)/backend/cuda/%.o,$(CUDA_CU_SRCS))
   CUDA_BACKEND := $(BACKEND_DIR)/libkappai_cuda.so
   BACKEND_LIBS += $(CUDA_BACKEND)
