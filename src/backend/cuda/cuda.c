@@ -1022,6 +1022,28 @@ static int cuda_w_is_qmajor(uint32_t w_type) {
     return w_type == GGML_TYPE_Q8_0_QM || w_type == GGML_TYPE_Q4_0_QM;
 }
 
+/* Safe IQ4_NL matmul fallback: simple non-vectorized implementation that avoids
+ * the CPU kernel crash for small n (e.g., n=8). Uses the same dequantization
+ * as the CPU but with bounds-safe loops. */
+status_code cuda_matmul_iq4_nl_safe(backend *self, const buffer *w, const buffer *x,
+                                     buffer *y, int n, int k) {
+    struct cuda_priv *priv = cuda_priv(self);
+    if (!priv) return ERR_INTERNAL;
+    cudaStream_t stream = priv->stream;
+
+cuda_matmul_iq4_nl_fast_launch((const uint8_t *)cuda_dev_ptr(w),
+                                    (const float *)cuda_dev_ptr(x),
+                                    (float *)cuda_dev_ptr(y), n, k,
+                                    priv->stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA ERROR] IQ4_NL fast matmul: %s\n", cudaGetErrorString(err));
+        return ERR_UNSUPPORTED;
+    }
+    return OK;
+}
+
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
                                 const buffer *x, buffer *y, int n, int k) {
@@ -1030,6 +1052,15 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
         return ERR_UNSUPPORTED;
     }
     if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+        /* Safe CUDA-side fallback for types that crash the CPU implementation.
+         * CPU's IQ4_NL kernel crashes for n=8 (see matmul_iq4_nl_q8_qonly_f32_row).
+         * We implement a simple, correct CUDA fallback instead of calling CPU. */
+        if (w_type == GGML_TYPE_IQ4_NL) {
+            status_code st = cuda_matmul_iq4_nl_safe(self, w, x, y, n, k);
+            if (st != ERR_UNSUPPORTED)
+                return st;
+            /* Fall through to CPU if CUDA safe fallback fails */
+        }
         backend *host = backend_host();
         if (host && host->matmul) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -1315,6 +1346,118 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     if (!cuda_lazy_d2h_for("ffndown") && y->host_ptr) {
         if (cudaMemcpy((void *)y->host_ptr, y_dev, (size_t)n * sizeof(float), cudaMemcpyDeviceToHost) !=
             cudaSuccess)
+            return ERR_INTERNAL;
+    }
+    return OK;
+}
+
+/* Batched FFN down: processes m rows of gate/up in parallel. */
+static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
+                                                 const buffer *gate, const buffer *up, buffer *y,
+                                                 int n, int k, int activation, int m) {
+    uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
+    if (stored != (uint32_t)-1)
+        w_type = stored;
+
+    if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
+        backend *host = backend_host();
+        if (host && host->matmul_ffn_down_batch) {
+            size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
+                   yb = (size_t)m * (size_t)n * sizeof(float);
+            void *wh = cuda_host_stage_in(w, wb);
+            void *gh = cuda_host_stage_in(gate, gb);
+            void *uh = cuda_host_stage_in(up, gb);
+            void *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul_ffn_down_batch(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                                 activation, m);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
+            }
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
+        }
+        return ERR_UNSUPPORTED;
+    }
+    if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q8_0_QM && w_type != GGML_TYPE_Q4_0 &&
+        w_type != GGML_TYPE_Q4_0_QM && w_type != GGML_TYPE_Q4_1) {
+        backend *host = backend_host();
+        if (host && host->matmul_ffn_down_batch) {
+            size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
+                   yb = (size_t)m * (size_t)n * sizeof(float);
+            void *wh = cuda_host_stage_in(w, wb);
+            void *gh = cuda_host_stage_in(gate, gb);
+            void *uh = cuda_host_stage_in(up, gb);
+            void *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul_ffn_down_batch(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                                 activation, m);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
+            }
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
+        }
+        return ERR_UNSUPPORTED;
+    }
+    if (!cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
+        backend *host = backend_host();
+        if (host && host->matmul_ffn_down_batch) {
+            size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
+                   yb = (size_t)m * (size_t)n * sizeof(float);
+            void *wh = cuda_host_stage_in(w, wb);
+            void *gh = cuda_host_stage_in(gate, gb);
+            void *uh = cuda_host_stage_in(up, gb);
+            void *yh = malloc(yb ? yb : 1);
+            status_code st = ERR_OUT_OF_MEMORY;
+            if (wh && gh && uh && yh) {
+                buffer whb = cuda_host_buf(wh, wb, host);
+                buffer ghb = cuda_host_buf(gh, gb, host);
+                buffer uhb = cuda_host_buf(uh, gb, host);
+                buffer yhb = cuda_host_buf(yh, yb, host);
+                st = host->matmul_ffn_down_batch(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
+                                                 activation, m);
+                if (st == OK)
+                    st = cuda_host_stage_out(y, yh, yb);
+            }
+            free(wh); free(gh); free(uh); free(yh);
+            return st;
+        }
+        return ERR_UNSUPPORTED;
+    }
+
+    struct cuda_priv *priv = cuda_priv(self);
+    cudaStream_t stream = priv ? priv->stream : 0;
+
+    int qmajor = cuda_w_is_qmajor(w_type);
+
+    const void *w_dev = cuda_dev_ptr((buffer *)w);
+    const float *gate_dev = (const float *)cuda_dev_ptr((buffer *)gate);
+    const float *up_dev = (const float *)cuda_dev_ptr((buffer *)up);
+    float *y_dev = (float *)cuda_dev_ptr(y);
+
+    if (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_0_QM) {
+        cuda_matmul_ffn_down_q4_batch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream, qmajor);
+    } else if (w_type == GGML_TYPE_Q4_1) {
+        cuda_matmul_ffn_down_q4_1_batch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream);
+    } else {
+        cuda_matmul_ffn_down_batch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream,
+                                   w_type == GGML_TYPE_Q8_0_QM);
+    }
+
+    if (!cuda_lazy_d2h_for("ffndown") && y->host_ptr) {
+        if (cudaMemcpy((void *)y->host_ptr, y_dev, (size_t)m * (size_t)n * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
             return ERR_INTERNAL;
     }
     return OK;
@@ -3285,6 +3428,7 @@ static status_code cuda_ctor(backend *out) {
     out->matmul             = cuda_matmul;
     out->matmul_residual    = cuda_matmul_residual;
     out->matmul_ffn_down    = cuda_op_matmul_ffn_down;
+    out->matmul_ffn_down_batch = cuda_op_matmul_ffn_down_batch;
     out->matmul_multi       = cuda_matmul_multi;
     out->matmul_type_native = cuda_matmul_type_native;
     out->rmsnorm            = cuda_op_rmsnorm;

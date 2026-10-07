@@ -2859,6 +2859,46 @@ __device__ __forceinline__ float act_gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x3)));
 }
 
+
+/* Batched version: processes m rows of gate/up in parallel.
+ * Grid: (m, (k/32 + 255)/256), Block: 256 */
+__global__ void act_gelu_quant_batch_kernel(const float *__restrict__ gate,
+                                            const float *__restrict__ up,
+                                            cuda_q8_0_block *__restrict__ xq,
+                                            int k, int m) {
+    int row = blockIdx.y;
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= k / 32 || row >= m)
+        return;
+
+    const float *g = gate + (size_t)row * k + 32 * b;
+    const float *u = up + (size_t)row * k + 32 * b;
+    float vals[32];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const float a = act_gelu_tanh(g[j]) * u[j];
+        vals[j]       = a;
+        const float va = fabsf(a);
+        if (va > amax)
+            amax = va;
+    }
+    cuda_q8_0_block *out = &xq[(size_t)row * (k / 32) + b];
+    if (amax < 1e-30f) {
+        out->d = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++)
+            out->qs[j] = 0;
+        return;
+    }
+    const float d = amax / 127.0f;
+    store_half(&out->d, d);
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        out->qs[j] = (int8_t)cuda_xq8_val(vals[j], d);
+    }
+}
+
 __global__ void act_gelu_quant_kernel(const float *__restrict__ gate,
                                       const float *__restrict__ up,
                                       cuda_q8_0_block *__restrict__ xq, int k) {
@@ -4094,6 +4134,86 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
                 (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
     }
 }
+
+/* IQ4_NL dequantization lookup table (matches CPU kvalues_iq4nl).
+ * 16 non-uniform quantization levels for 4-bit IQ4_NL. */
+__constant__ float kvalues_iq4nl[16] = {
+    -1.0f, -0.75f, -0.5f, -0.375f, -0.25f, -0.125f, 0.0f, 0.125f,
+    0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.125f
+};
+
+/* IQ4_NL safe matmul kernel: non-vectorized, bounds-safe implementation.
+ * Each thread computes one output row. Dequantizes IQ4_NL weights on the fly. */
+__global__ void matmul_iq4_nl_safe_kernel(const uint8_t *__restrict__ w,
+                                          const float *__restrict__ x,
+                                          float *__restrict__ y, int n, int k) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+
+    const int blocks_per_row = k / 32;
+    const uint8_t *w_row = w + row * (k / 32) * 18;  // 18 bytes per 32-element block
+
+    float acc = 0.0f;
+    for (int b = 0; b < k / 32; b++) {
+        const uint8_t *block = w_row + b * 18;
+        // Scale is first 2 bytes (fp16)
+        uint16_t scale_bits = block[0] | (block[1] << 8);
+        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+
+        // 16 bytes of 4-bit quants (32 values, 4 bits each)
+        const uint8_t *quants = block + 2;
+        for (int j = 0; j < 32; j++) {
+            uint8_t byte = quants[j / 2];
+            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
+            acc += kvalues_iq4nl[idx] * scale * x[b * 32 + j];
+        }
+    }
+    y[row] = acc;
+}
+
+/* Optimized version: parallelize across blocks within a row using block-level reduction. */
+__global__ void matmul_iq4_nl_fast_kernel(const uint8_t *__restrict__ w,
+                                          const float *__restrict__ x,
+                                          float *__restrict__ y, int n, int k) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    int tid = threadIdx.x;
+    const int blocks_per_row = k / 32;
+    const uint8_t *w_row = w + row * (k / 32) * 18;  // 18 bytes per 32-element block
+
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < k / 32; b += blockDim.x) {
+        const uint8_t *block = w_row + b * 18;
+        uint16_t scale_bits = block[0] | (block[1] << 8);
+        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+
+        const uint8_t *quants = block + 2;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            uint8_t byte = quants[j / 2];
+            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
+            block_sum += kvalues_iq4nl[idx] * scale * x[b * 32 + j];
+        }
+        acc += block_sum;
+    }
+
+    /* Block-level reduction using shared memory */
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = sdata[0];
+}
+
 
 extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
@@ -9143,3 +9263,76 @@ extern "C" void cuda_embd_lookup_q8_0_g(const cuda_q8_0_block *embd_dev, float *
     embd_lookup_q8_0_g_kernel<<<grid, block, 0, stream>>>(embd_dev, out_dev, dim,
                                                           (const cuda_decode_params *)params_dev);
 }
+
+
+
+extern "C" void cuda_matmul_iq4_nl_safe_launch(const uint8_t *w, const float *x,
+                                                float *y, int n, int k,
+                                                cudaStream_t stream) {
+    int blocks = (n + 255) / 256;
+    matmul_iq4_nl_safe_kernel<<<blocks, 256, 0, stream>>>(w, x, y, n, k);
+}
+
+extern "C" void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
+                                                float *y, int n, int k,
+                                                cudaStream_t stream) {
+    dim3 grid(n);
+    dim3 block(256);
+    matmul_iq4_nl_fast_kernel<<<grid, block, 0, stream>>>(w, x, y, n, k);
+}
+
+
+/* Batched FFN down kernel launchers. */
+extern "C" void cuda_matmul_ffn_down_batch(const void *w_dev, const float *gate_dev,
+                                           const float *up_dev, float *y_dev, int n, int k,
+                                           int m, cudaStream_t stream, int qmajor) {
+    cuda_q8_0_block *act_q = xq_scratch_for(k);
+    if (!act_q) return;
+    const int nb = k / 32;
+    dim3 grid((k / 32 + 255) / 256, m);
+    act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
+        gate_dev, up_dev, act_q, k, m);
+
+    matmul_q8_0_dp4a_batch_kernel<<<(m + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
+                                     MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m, 0);
+}
+
+extern "C" void cuda_matmul_ffn_down_q4_batch(const void *w_dev, const float *gate_dev,
+                                              const float *up_dev, float *y_dev, int n, int k,
+                                              int m, cudaStream_t stream, int qmajor) {
+    cuda_q8_0_block *act_q = xq_scratch_for(k);
+    if (!act_q) return;
+    const int nb = k / 32;
+    dim3 grid((k / 32 + 255) / 256, m);
+    act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
+        (const float *)gate_dev, (const float *)up_dev, act_q, k, m);
+
+    matmul_q4_0_dp4a_batch_kernel<<<(m + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
+                                     MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q4_0_block *)w_dev, (const cuda_q8_0_block *)act_q,
+        y_dev, n, k, m, 0);
+}
+
+extern "C" void cuda_matmul_ffn_down_q4_1_batch(const void *w_dev, const float *gate_dev,
+                                                const float *up_dev, float *y_dev, int n, int k,
+                                                int m, cudaStream_t stream) {
+    cuda_q8_0_block *act_q = xq_scratch_for(k);
+    if (!act_q) return;
+    const int nb = k / 32;
+    dim3 grid((k / 32 + 255) / 256, m);
+    act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
+        (const float *)gate_dev, (const float *)up_dev, act_q, k, m);
+
+    if (m == 1) {
+        matmul_q4_1_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_1_block *)w_dev, act_q, y_dev, n, k);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
+        matmul_q4_1_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
+            (const cuda_q4_1_block *)w_dev, (const cuda_q8_0_block *)xq_scratch_for(k),
+            y_dev, n, k);
+    }
+}
+
