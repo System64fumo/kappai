@@ -2118,6 +2118,64 @@ __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restri
 }
 
 /* ------------------------------------------------------------------ */
+/* MMVQ: MatMul-Vec-Q for M=1 decode (Q4_K weights)                   */
+/* ------------------------------------------------------------------ */
+
+#define Q4K_MMVQ_NTHREADS 128
+#define Q4K_MMVQ_NWARPS   4
+
+__global__ void matmul_q4_k_mmvq_kernel(const cuda_q4_k_block *__restrict__ w,
+                                         const cuda_q8_k_block *__restrict__ xq,
+                                         float *__restrict__ y, int n, int k,
+                                         int qmajor) {
+    const int nb = k / 256;
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const cuda_q4_k_block *wrow = w + (size_t)row * nb;
+
+    float acc = 0.0f;
+    if (qmajor) {
+        /* QM path not yet implemented for Q4_K */
+    } else {
+        for (int b = tid; b < nb; b += Q4K_MMVQ_NTHREADS) {
+            const cuda_q4_k_block *wb = wrow + b;
+            const cuda_q8_k_block *xb = xq + b;
+
+            int32_t sumi = q4_k_dot(wb, xb->qs, xb->bsums, 0, 0);
+            float xd = xb->d;
+            acc = fmaf(xd, (float)sumi, acc);
+        }
+    }
+
+    /* Warp reduction */
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+
+    /* Shared memory reduction across warps */
+    __shared__ float smem[4];
+    if (threadIdx.x < 4) smem[threadIdx.x] = 0.0f;
+    __syncthreads();
+
+    int warp_lane = warp_id;
+    if (lane == 0) {
+        atomicAdd(&smem[warp_lane], acc);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = 0; i < 4; i++)
+            total += smem[i];
+        y[row] = total;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* MMVQ: MatMul-Vec-Q for M=1 decode (Q4_1 weights)                   */
 /* dot = wb.d * xb.d * sum(q*xq) + wb.m * xb.d * sum(xq)              */
 /* ------------------------------------------------------------------ */
@@ -4135,12 +4193,19 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
     }
 }
 
-/* IQ4_NL dequantization lookup table (matches CPU kvalues_iq4nl).
- * 16 non-uniform quantization levels for 4-bit IQ4_NL. */
-__constant__ float kvalues_iq4nl[16] = {
-    -1.0f, -0.75f, -0.5f, -0.375f, -0.25f, -0.125f, 0.0f, 0.125f,
-    0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.125f
+/* IQ4_NL uses the same quantization as Q4_K but with 4-bit values and 16-level lookup.
+ * We implement an efficient kernel using integer arithmetic like the CPU. */
+
+__constant__ int8_t kvalues_iq4nl_i8[16] = {
+    -8, -6, -4, -3, -2, -1, 0, 1,
+    2, 3, 4, 5, 6, 7, 8, 9
 };
+
+/* IQ4_NL block format (18 bytes per 32 elements):
+ * bytes 0-1: fp16 scale (d)
+ * bytes 2-17: 16 bytes of 4-bit quants (32 values, 4 bits each)
+ * No offset (m=0), unlike Q4_K
+ */
 
 /* IQ4_NL safe matmul kernel: non-vectorized, bounds-safe implementation.
  * Each thread computes one output row. Dequantizes IQ4_NL weights on the fly. */
@@ -4151,21 +4216,19 @@ __global__ void matmul_iq4_nl_safe_kernel(const uint8_t *__restrict__ w,
     if (row >= n) return;
 
     const int blocks_per_row = k / 32;
-    const uint8_t *w_row = w + row * (k / 32) * 18;  // 18 bytes per 32-element block
+    const uint8_t *w_row = w + row * (k / 32) * 18;
 
     float acc = 0.0f;
     for (int b = 0; b < k / 32; b++) {
         const uint8_t *block = w_row + b * 18;
-        // Scale is first 2 bytes (fp16)
         uint16_t scale_bits = block[0] | (block[1] << 8);
         float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
 
-        // 16 bytes of 4-bit quants (32 values, 4 bits each)
         const uint8_t *quants = block + 2;
         for (int j = 0; j < 32; j++) {
             uint8_t byte = quants[j / 2];
             int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            acc += kvalues_iq4nl[idx] * scale * x[b * 32 + j];
+            acc += (float)kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
         }
     }
     y[row] = acc;
@@ -4180,7 +4243,7 @@ __global__ void matmul_iq4_nl_fast_kernel(const uint8_t *__restrict__ w,
 
     int tid = threadIdx.x;
     const int blocks_per_row = k / 32;
-    const uint8_t *w_row = w + row * (k / 32) * 18;  // 18 bytes per 32-element block
+    const uint8_t *w_row = w + row * (k / 32) * 18;
 
     float acc = 0.0f;
     for (int b = threadIdx.x; b < k / 32; b += blockDim.x) {
@@ -4193,7 +4256,7 @@ __global__ void matmul_iq4_nl_fast_kernel(const uint8_t *__restrict__ w,
         for (int j = 0; j < 32; j++) {
             uint8_t byte = quants[j / 2];
             int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            block_sum += kvalues_iq4nl[idx] * scale * x[b * 32 + j];
+            block_sum += (float)kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
         }
         acc += block_sum;
     }
@@ -4315,10 +4378,16 @@ extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y
     if (!xq_dev)
         return;
     q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
-    /* 32 rows/block (8 warps x 4 row-groups). */
-    dim3 grid((n + MM_ROWS_PER_BLOCK * 4 - 1) / (MM_ROWS_PER_BLOCK * 4));
-    matmul_q4_k_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k);
+    if (n == 1) {
+        /* Use MMVQ kernel for M=1 decode. */
+        matmul_q4_k_mmvq_kernel<<<n, Q4K_MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k, 0);
+    } else {
+        /* 32 rows/block (8 warps x 4 row-groups). */
+        dim3 grid((n + MM_ROWS_PER_BLOCK * 4 - 1) / (MM_ROWS_PER_BLOCK * 4));
+        matmul_q4_k_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+            (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k);
+    }
 }
 
 extern "C" void cuda_matmul_f32(const float *w_dev, const float *x_dev, float *y_dev, int n, int k,
