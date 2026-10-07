@@ -1929,7 +1929,14 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
                                       int n_heads, int n_kv_heads, int head_dim, int n_ctx,
                                       int flash_attn, float scale, int n_kv_heads_active) {
     (void)flash_attn;
-    (void)n_kv_heads_active;
+    /* The cache may be allocated for more KV heads than a given layer
+     * actually uses (packed per-layer caches size every layer by the widest
+     * one). n_kv_heads_active says how many heads in THIS layer are live, and
+     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
+     * the kernels index kv heads the layer never wrote. Matches the CPU
+     * backends, which derive n_groups from n_active. */
+    if (n_kv_heads_active > 0)
+        n_kv_heads = n_kv_heads_active;
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
 
@@ -2015,7 +2022,14 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
                                           int flash_attn, float scale, int sliding_window,
                                           int n_kv_heads_active) {
     (void)flash_attn;
-    (void)n_kv_heads_active;
+    /* The cache may be allocated for more KV heads than a given layer
+     * actually uses (packed per-layer caches size every layer by the widest
+     * one). n_kv_heads_active says how many heads in THIS layer are live, and
+     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
+     * the kernels index kv heads the layer never wrote. Matches the CPU
+     * backends, which derive n_groups from n_active. */
+    if (n_kv_heads_active > 0)
+        n_kv_heads = n_kv_heads_active;
     // For SWA, we use the same kernel but with adjusted n_pos
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
@@ -3151,7 +3165,14 @@ static status_code cuda_attention_batch(backend *self, const buffer *q, const bu
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
     (void)flash_attn;
-    (void)n_kv_heads_active;
+    /* The cache may be allocated for more KV heads than a given layer
+     * actually uses (packed per-layer caches size every layer by the widest
+     * one). n_kv_heads_active says how many heads in THIS layer are live, and
+     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
+     * the kernels index kv heads the layer never wrote. Matches the CPU
+     * backends, which derive n_groups from n_active. */
+    if (n_kv_heads_active > 0)
+        n_kv_heads = n_kv_heads_active;
     int row_elems = n_heads * head_dim;
     if (priv->kv_quant_q8) {
         int nb = (int)cuda_kv_q8_nblocks(head_dim);
@@ -3196,7 +3217,14 @@ static status_code cuda_attention_swa_batch(backend *self, const buffer *q, cons
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
     (void)flash_attn;
-    (void)n_kv_heads_active;
+    /* The cache may be allocated for more KV heads than a given layer
+     * actually uses (packed per-layer caches size every layer by the widest
+     * one). n_kv_heads_active says how many heads in THIS layer are live, and
+     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
+     * the kernels index kv heads the layer never wrote. Matches the CPU
+     * backends, which derive n_groups from n_active. */
+    if (n_kv_heads_active > 0)
+        n_kv_heads = n_kv_heads_active;
     int row_elems = n_heads * head_dim;
     if (priv->kv_quant_q8) {
         int nb = (int)cuda_kv_q8_nblocks(head_dim);
