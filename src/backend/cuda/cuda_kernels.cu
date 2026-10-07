@@ -9352,7 +9352,7 @@ extern "C" void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
 
 
 /* Batched FFN down kernel launchers. */
-extern "C" void cuda_matmul_ffn_down_batch(const void *w_dev, const float *gate_dev,
+extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
                                            const float *up_dev, float *y_dev, int n, int k,
                                            int m, cudaStream_t stream, int qmajor) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
@@ -9367,7 +9367,7 @@ extern "C" void cuda_matmul_ffn_down_batch(const void *w_dev, const float *gate_
         (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m, 0);
 }
 
-extern "C" void cuda_matmul_ffn_down_q4_batch(const void *w_dev, const float *gate_dev,
+extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
                                               const float *up_dev, float *y_dev, int n, int k,
                                               int m, cudaStream_t stream, int qmajor) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
@@ -9383,7 +9383,7 @@ extern "C" void cuda_matmul_ffn_down_q4_batch(const void *w_dev, const float *ga
         y_dev, n, k, m, 0);
 }
 
-extern "C" void cuda_matmul_ffn_down_q4_1_batch(const void *w_dev, const float *gate_dev,
+extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
                                                 const float *up_dev, float *y_dev, int n, int k,
                                                 int m, cudaStream_t stream) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
@@ -9403,5 +9403,164 @@ extern "C" void cuda_matmul_ffn_down_q4_1_batch(const void *w_dev, const float *
             (const cuda_q4_1_block *)w_dev, (const cuda_q8_0_block *)xq_scratch_for(k),
             y_dev, n, k);
     }
+}
+
+
+/* ===================================================================== */
+/* MoE Experts Batch Kernels                                             */
+/* ===================================================================== */
+
+/* Fused activation kernel for MoE: act = act_fn(gate*gate_scale) * (up*up_scale) */
+__global__ void moe_activate_fused_kernel(const float *gate, const float *up, float *out,
+                                           long long n, float gate_scale, float up_scale,
+                                           int use_gelu) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i] * gate_scale;
+    float u = up[i] * up_scale;
+    float a = use_gelu ? gelu_tanh_f32(g) : silu_f32(g);
+    out[i] = a * u;
+}
+
+/* Weighted accumulation: out += weight * down_scale * src */
+__global__ void moe_scale_accum_kernel(float *out, const float *src, int n_rows, int dim,
+                                        float weight, float down_scale) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_rows * dim;
+    if (idx >= total) return;
+    float w = weight * down_scale;
+    out[idx] = fmaf(w, src[idx], out[idx]);
+}
+
+/* Batched scale-accumulate for multiple experts */
+__global__ void moe_scale_accum_batched_kernel(float *out, const float *src,
+                                                int n_rows, int dim,
+                                                const float *weights, const float *down_scales,
+                                                int n_experts, int rows_per_expert) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_rows * dim;
+    if (idx >= total) return;
+    int row = idx / dim;
+    int expert_idx = row / rows_per_expert;
+    if (expert_idx >= n_experts) return;
+    float w = weights[expert_idx] * down_scales[expert_idx];
+    out[idx] = fmaf(w, src[idx], out[idx]);
+}
+
+/* Batched MoE gate/up projection using existing matmul infrastructure */
+__global__ void moe_gate_proj_kernel(const cuda_q8_0_block *__restrict__ w,
+                                      const float *__restrict__ x,
+                                      float *__restrict__ gate,
+                                      int n_rows, int dim, int inter,
+                                      int qmajor) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows || col >= dim) return;
+    /* Not implemented yet - placeholder for future optimization */
+}
+
+/* ===================================================================== */
+/* MoE Expert Host Launchers                                             */
+/* ===================================================================== */
+
+extern "C" status_code cuda_moe_experts_batch_launch(backend *self, const buffer *xb, buffer *out,
+                                        int n_rows, int dim, int inter, int use_gelu,
+                                        int n_experts, const moe_resident_expert *experts,
+                                        const int *counts, const int *rows_packed,
+                                        const float *weights_packed, cudaStream_t stream) {
+    /* This is a complex operation that orchestrates multiple kernels.
+     * For now, we implement a basic version that falls back to CPU.
+     * TODO: Implement full CUDA kernel for MoE experts batch.
+     */
+    (void)self; (void)xb; (void)out; (void)n_rows; (void)dim; (void)inter;
+    (void)use_gelu; (void)n_experts; (void)experts; (void)counts;
+    (void)rows_packed; (void)weights_packed; (void)stream;
+    /* TODO: Implement full CUDA MoE experts batch */
+    /* For now, return ERR_UNSUPPORTED to trigger host fallback */
+    return ERR_UNSUPPORTED;
+}
+
+/* ===================================================================== */
+/* MLA (Multi-head Latent Attention) Kernels                             */
+/* ===================================================================== */
+
+extern "C" void cuda_attention_mla(const float *q_dev, const uint16_t *kc_dev,
+                                    const uint16_t *vc_dev, float *out_dev,
+                                    int n_heads, int n_kv_heads, int head_dim,
+                                    size_t layer_base_bytes, size_t kvh_stride,
+                                    int pos_start, int n_pos, float scale,
+                                    int sliding_window, cudaStream_t stream) {
+    (void)q_dev; (void)kc_dev; (void)vc_dev; (void)out_dev;
+    (void)n_heads; (void)n_kv_heads; (void)head_dim;
+    (void)layer_base_bytes; (void)kvh_stride; (void)pos_start;
+    (void)n_pos; (void)scale; (void)sliding_window; (void)stream;
+    /* TODO: Implement MLA attention kernel */
+}
+
+extern "C" void cuda_kv_alloc_mla(int n_layers, int n_ctx, int kv_lora, int qk_rope,
+                                   int qk_nope, int v_head, int n_ctx_kv,
+                                   int kv_quant, int qk_lora_rank,
+                                   cudaStream_t stream, buffer *k_out, buffer *v_out) {
+    (void)n_layers; (void)n_ctx; (void)kv_lora; (void)qk_rope;
+    (void)qk_nope; (void)v_head; (void)n_ctx_kv; (void)kv_quant;
+    (void)qk_lora_rank; (void)stream; (void)k_out; (void)v_out;
+    /* TODO: Implement MLA KV allocation */
+}
+
+extern "C" void cuda_kv_put_mla(const float *k_in, const float *v_in,
+                                 uint8_t *k_dev, uint8_t *v_dev,
+                                 int n_kv_heads, int head_dim,
+                                 size_t layer_base_bytes, size_t kvh_stride_bytes,
+                                 int pos, int n_blocks, cudaStream_t stream) {
+    (void)k_in; (void)v_in; (void)k_dev; (void)v_dev;
+    (void)n_kv_heads; (void)head_dim; (void)layer_base_bytes;
+    (void)kvh_stride_bytes; (void)pos; (void)n_blocks; (void)stream;
+    /* TODO: Implement MLA KV put */
+}
+
+/* ===================================================================== */
+/* IQ4_NL Optimized Kernel (Revisited)                                   */
+/* ===================================================================== */
+
+__global__ void matmul_iq4_nl_opt_kernel(const uint8_t *__restrict__ w,
+                                          const float *__restrict__ x,
+                                          float *__restrict__ y, int n, int k) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    int tid = threadIdx.x;
+    const int blocks_per_row = k / 32;
+    const uint8_t *w_row = w + row * (k / 32) * 18;
+
+    float acc = 0.0f;
+    for (int b = threadIdx.x; b < k / 32; b += blockDim.x) {
+        const uint8_t *block = w_row + b * 18;
+        uint16_t scale_bits = block[0] | (block[1] << 8);
+        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+
+        const uint8_t *quants = block + 2;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            uint8_t byte = quants[j / 2];
+            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
+            block_sum += kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
+        }
+        acc += block_sum;
+    }
+
+    /* Block-level reduction using shared memory */
+    __shared__ float sdata[256];
+    sdata[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0)
+        y[row] = sdata[0];
 }
 
