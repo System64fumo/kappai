@@ -222,3 +222,56 @@ void cuda_host_alloc_forget(void *host_ptr) {
 		link = &(*link)->next;
 	}
 }
+
+/* ------------------------------------------------------------------ */
+/* Weight-type side table (see cuda_internal.h for why this exists)     */
+/* ------------------------------------------------------------------ */
+
+typedef struct cuda_weight_type {
+	void					*dev_ptr;
+	uint32_t				type;
+	struct cuda_weight_type *next;
+} cuda_weight_type;
+
+static cuda_weight_type *g_type_buckets[CUDA_HOST_ALLOC_BUCKETS];
+
+static unsigned cuda_type_bucket(const void *p) {
+	return (unsigned)(((uintptr_t)p >> 4) % CUDA_HOST_ALLOC_BUCKETS);
+}
+
+void cuda_weight_type_note(void *dev_ptr, uint32_t type) {
+	if (!dev_ptr)
+		return;
+	cuda_weight_type_forget(dev_ptr);
+	unsigned               b = cuda_type_bucket(dev_ptr);
+	cuda_weight_type *e = xmalloc(sizeof(*e));
+	e->dev_ptr         = dev_ptr;
+	e->type            = type;
+	e->next            = g_type_buckets[b];
+	g_type_buckets[b]  = e;
+}
+
+uint32_t cuda_weight_type_of(const void *dev_ptr) {
+	if (!dev_ptr)
+		return (uint32_t)-1;
+	for (cuda_weight_type *e = g_type_buckets[cuda_type_bucket(dev_ptr)]; e; e = e->next)
+		if (e->dev_ptr == dev_ptr)
+			return e->type;
+	return (uint32_t)-1;
+}
+
+void cuda_weight_type_forget(void *dev_ptr) {
+	if (!dev_ptr)
+		return;
+	unsigned                b = cuda_type_bucket(dev_ptr);
+	cuda_weight_type **link = &g_type_buckets[b];
+	while (*link) {
+		if ((*link)->dev_ptr == dev_ptr) {
+			cuda_weight_type *dead = *link;
+			*link                 = dead->next;
+			free(dead);
+			return;
+		}
+		link = &(*link)->next;
+	}
+}
