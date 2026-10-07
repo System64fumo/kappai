@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "gguf.h"
+#include "backend/backend.h"
 
 /* Quad-major relayout types, engine-internal and CUDA-only: they exist solely
  * to give the Q4_0/Q8_0 GEMV kernels a coalesced byte order, and never appear in
@@ -257,6 +258,41 @@ void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
 void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
                                int n, int k, cudaStream_t stream);
+
+/* Safe fallback for types that crash the CPU implementation (e.g., IQ4_NL). */
+status_code cuda_matmul_iq4_nl_safe(backend *self, const buffer *w, const buffer *x,
+                                     buffer *y, int n, int k);
+
+/* Launch wrappers for the IQ4_NL matmul kernels. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_iq4_nl_safe_launch(const uint8_t *w, const float *x,
+                                     float *y, int n, int k,
+                                     cudaStream_t stream);
+void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
+                                     float *y, int n, int k,
+                                     cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
+
+/* Batched FFN down kernel launchers (low-level, take device pointers). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_ffn_down_batch(const void *w_dev, const float *gate_dev,
+                                const float *up_dev, float *y_dev, int n, int k,
+                                int m, cudaStream_t stream, int qmajor);
+void cuda_matmul_ffn_down_q4_batch(const void *w_dev, const float *gate_dev,
+                                   const float *up_dev, float *y_dev, int n, int k,
+                                   int m, cudaStream_t stream, int qmajor);
+void cuda_matmul_ffn_down_q4_1_batch(const void *w_dev, const float *gate_dev,
+                                     const float *up_dev, float *y_dev, int n, int k,
+                                     int m, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
 
 /* Q4_K weight matmul: quantizes x internally (Q8_K), then y = W * x. */
 void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
