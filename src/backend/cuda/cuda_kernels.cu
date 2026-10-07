@@ -38,6 +38,26 @@ static __device__ __forceinline__ void store_half(uint16_t *dst, float val) {
 /* Quantization                                                        */
 /* ------------------------------------------------------------------ */
 
+/* Quantize one fp32 value to a Q8_0-style int8, matching the CPU backends and
+ * the Vulkan shader byte for byte.
+ *
+ * Both references compute v = x * (1/d) and round half AWAY FROM ZERO (C's
+ * roundf, GLSL's round_away). This kernel used a true divide plus
+ * floorf(v + 0.5f), which (a) rounds differently from multiplying by the
+ * reciprocal and (b) breaks ties toward +infinity, so for negative values
+ * that land on a .5 boundary it produced a different int8 than the reference.
+ *
+ * Those q deltas are individually ~1/d of an output element, but a 512-wide
+ * row hits enough of them to push matmul parity past the cross-backend band:
+ * q4_1 N=512 K=512 sat at 3.4x the loose tolerance almost entirely from this.
+ */
+static __device__ __forceinline__ int cuda_xq8_val(float x, float d) {
+    const float inv = 1.0f / d;
+    const float t   = x * inv;
+    const int   q   = (int)(t >= 0.0f ? floorf(t + 0.5f) : ceilf(t - 0.5f));
+    return q > 127 ? 127 : (q < -127 ? -127 : q);
+}
+
 __global__ void q8_0_quant_kernel(const float *x, cuda_q8_0_block *xq, int k) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= k / 32)
@@ -66,10 +86,7 @@ __global__ void q8_0_quant_kernel(const float *x, cuda_q8_0_block *xq, int k) {
 
     #pragma unroll
     for (int j = 0; j < 32; j++) {
-        int q = (int)floorf(xb[j] / d + 0.5f);
-        if (q > 127) q = 127;
-        if (q < -127) q = -127;
-        out->qs[j] = (int8_t)q;
+        out->qs[j] = (int8_t)cuda_xq8_val(xb[j], d);
     }
 }
 
@@ -91,9 +108,7 @@ __global__ void q8_0_quant_qm_kernel(const float *x, uint8_t *xq8, int k) {
         a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
 
     float d = a / 127.0f;
-    int q = (a < 1e-30f) ? 0 : (int)floorf(v / d + 0.5f);
-    if (q > 127) q = 127;
-    if (q < -127) q = -127;
+    int q = (a < 1e-30f) ? 0 : cuda_xq8_val(v, d);
 
     /* QM scatter (see cuda_internal.h spec). */
     int g = b >> 5, r = b & 31;
@@ -177,13 +192,12 @@ __global__ void q8_1_quant_kernel(const float *x, cuda_q8_1_block *xq, int k) {
 
     #pragma unroll
     for (int j = 0; j < 32; j++) {
-        int q = (int)floorf(xb[j] / d + 0.5f);
-        if (q > 127) q = 127;
-        if (q < -127) q = -127;
+        int q = cuda_xq8_val(xb[j], d);
         out->qs[j] = (int8_t)q;
         sum += q;
     }
-    store_half(&out->s, (float)sum);
+    /* CPU quantize_q8_1 stores the offset as fp16(d * sum), not the raw sum. */
+    store_half(&out->s, d * (float)sum);
 }
 
 /* Q8_K Quantization: 256 elements with block sums */
@@ -495,6 +509,19 @@ __global__ void matmul_q4_0_residual_kernel(const cuda_q4_0_block *__restrict__ 
  * sum_x reuses dp4a against a +1 pattern (0x01010101). xb bytes come
  * from global memory at struct offset 2: byte-granular loads only
  * (misaligned 4B __ldg is UB and returns garbage). */
+/* Per-block x offset for the offset-carrying weight types (Q4_1, Q5_1).
+ *
+ * The CPU backends store this as an fp16 field holding fp16(d * sum_of_quants)
+ * and the Vulkan shader reproduces that round-trip explicitly. Computing
+ * d*sum in fp32 instead is *more* accurate but no longer matches the
+ * reference numerics, and on dot products with cancellation the two differ by
+ * more than the cross-backend tolerance band -- Q4_1 matmul N=512 K=512 came
+ * out at 3.4x the loose band purely because of this. Reproduce the round-trip
+ * so parity is exact. */
+static __device__ __forceinline__ float cuda_q81_s(float d, int sum) {
+    return __half2float(__float2half_rn(d * (float)sum));
+}
+
 static __device__ __forceinline__ void dot_q4_1_block(
     const cuda_q4_1_block *wb, const cuda_q8_0_block *xb,
     int *sum_qx, int *sum_x) {
@@ -579,8 +606,7 @@ __global__ void matmul_q4_1_dp4a_kernel(const cuda_q4_1_block *__restrict__ w,
         float dw = __half2float(__ushort_as_half(wb->d));
         float mw = __half2float(__ushort_as_half(wb->m));
         float dx = __half2float(__ushort_as_half(xb->d));
-        acc = fmaf(dw * dx, (float)qx, acc);
-        acc = fmaf(mw * dx, (float)xs, acc);
+        acc = fmaf(dw * dx, (float)qx, mw * cuda_q81_s(dx, xs) + acc);
     }
 
     #pragma unroll
@@ -616,8 +642,7 @@ __global__ void matmul_q4_1_residual_kernel(const cuda_q4_1_block *__restrict__ 
         float dw = __half2float(__ushort_as_half(wb->d));
         float mw = __half2float(__ushort_as_half(wb->m));
         float dx = __half2float(__ushort_as_half(xb->d));
-        acc = fmaf(dw * dx, (float)sum_qx, acc);
-        acc = fmaf(mw * dx, (float)sum_x, acc);
+        acc = fmaf(dw * dx, (float)sum_qx, mw * cuda_q81_s(dx, sum_x) + acc);
     }
 
     #pragma unroll
@@ -2137,8 +2162,7 @@ __global__ void matmul_q4_1_mmvq_kernel(const cuda_q4_1_block *__restrict__ w,
         float dw = __half2float(__ushort_as_half(wb->d));
         float mw = __half2float(__ushort_as_half(wb->m));
         float dx = __half2float(__ushort_as_half(xb->d));
-        acc = fmaf(dw * dx, (float)dp_acc, acc);
-        acc = fmaf(mw * dx, (float)x_sum, acc);
+        acc = fmaf(dw * dx, (float)dp_acc, mw * cuda_q81_s(dx, x_sum) + acc);
     }
 
     /* Warp reduction */
@@ -2207,8 +2231,7 @@ __global__ void matmul_q4_1_residual_mmvq_kernel(const cuda_q4_1_block *__restri
         float dw = __half2float(__ushort_as_half(wb->d));
         float mw = __half2float(__ushort_as_half(wb->m));
         float dx = __half2float(__ushort_as_half(xb->d));
-        acc = fmaf(dw * dx, (float)dp_acc, acc);
-        acc = fmaf(mw * dx, (float)x_sum, acc);
+        acc = fmaf(dw * dx, (float)dp_acc, mw * cuda_q81_s(dx, x_sum) + acc);
     }
 
     /* Warp reduction */
@@ -2866,10 +2889,7 @@ __global__ void act_gelu_quant_kernel(const float *__restrict__ gate,
     store_half(&out->d, d);
     #pragma unroll
     for (int j = 0; j < 32; j++) {
-        int q = (int)floorf(vals[j] / d + 0.5f); /* round-half-up, matches q8_0 quant */
-        if (q > 127) q = 127;
-        if (q < -127) q = -127;
-        out->qs[j] = (int8_t)q;
+        out->qs[j] = (int8_t)cuda_xq8_val(vals[j], d);
     }
 }
 
@@ -3476,8 +3496,7 @@ __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
         float dw = __half2float(__ushort_as_half(wb->d));
         float mw = __half2float(__ushort_as_half(wb->m));
         float dx = __half2float(__ushort_as_half(xb->d));
-        acc = fmaf(dw * dx, (float)sum_qx, acc);
-        acc = fmaf(mw * dx, (float)sum_x, acc);
+        acc = fmaf(dw * dx, (float)sum_qx, mw * cuda_q81_s(dx, sum_x) + acc);
     }
     #pragma unroll
     for (int off = MM_LANES >> 1; off > 0; off >>= 1)
@@ -6223,10 +6242,7 @@ __global__ void q8_0_quant_batch_kernel(const float *__restrict__ x,
 
     #pragma unroll
     for (int j = 0; j < 32; j++) {
-        int q = (int)floorf(xb[j] / d + 0.5f);
-        if (q > 127) q = 127;
-        if (q < -127) q = -127;
-        out->qs[j] = (int8_t)q;
+        out->qs[j] = (int8_t)cuda_xq8_val(xb[j], d);
     }
 }
 
@@ -6411,8 +6427,7 @@ __global__ void matmul_q4_1_dp4a_batch_kernel(const cuda_q4_1_block *__restrict_
                     xs = __dp4a(bval, 0x01010101, xs);
                 }
                 float dx = __half2float(__ushort_as_half(xb->d));
-                acc[t] = fmaf(dw * dx, (float)qx, acc[t]);
-                acc[t] = fmaf(mw * dx, (float)xs, acc[t]);
+                acc[t] = fmaf(dw * dx, (float)qx, mw * cuda_q81_s(dx, xs) + acc[t]);
             }
         }
         #pragma unroll
