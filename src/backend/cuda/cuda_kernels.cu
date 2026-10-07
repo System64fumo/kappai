@@ -5125,8 +5125,15 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
                     int j = lane * 8 + e;
                     score += q_h[j] * __half2float(s_k[(size_t)t * head_dim + j]);
                 }
+                /* Butterfly, not shfl_down: every lane owns O[] for output
+                 * elements [8*lane, 8*lane+8), so all lanes need the SAME
+                 * full dot product to derive the same softmax weights.
+                 * shfl_down leaves the total in lane 0 only, which made each
+                 * lane weight its own slice of head_dim by a softmax over a
+                 * partial sum, and produced garbage whenever a lane's partial
+                 * sum ranked the KV positions differently from the total. */
                 for (int off = 16; off > 0; off >>= 1)
-                    score += __shfl_down_sync(0xffffffff, score, off);
+                    score += __shfl_xor_sync(0xffffffff, score, off);
                 float raw = score * scale;
                 float old_M = M;
                 float m_new = raw > old_M ? raw : old_M;
