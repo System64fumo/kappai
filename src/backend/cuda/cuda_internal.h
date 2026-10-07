@@ -53,6 +53,25 @@ void  cuda_host_alloc_note(void *host_ptr, int pinned);
 int   cuda_host_alloc_pinned(void *host_ptr); /* -1 if unknown */
 void  cuda_host_alloc_forget(void *host_ptr);
 
+/*
+ * Per-weight-buffer type override.
+ *
+ * The engine decides which matmul kernel runs by passing the *model's* declared
+ * type to matmul()/matmul_batch(). That is correct for weights the backend
+ * uploads verbatim, but this backend also relayouts some weights at upload
+ * time (Q4_0 -> Q8_0 promotion, then the quad-major byte order). The engine
+ * never learns about that, so it would hand the matmul a Q8_0 tag for data that
+ * is actually Q8_0_QM and the wrong kernel would read it.
+ *
+ * Upstream avoids this by rewriting the type in model.c, which the engine here
+ * does not do. Instead the backend records what it actually stored and the
+ * matmul entry points prefer that record over the engine's tag. Keyed by the
+ * device pointer, same lifetime as the buffer.
+ */
+void cuda_weight_type_note(void *dev_ptr, uint32_t type);
+uint32_t cuda_weight_type_of(const void *dev_ptr); /* returns type unchanged if unknown */
+void cuda_weight_type_forget(void *dev_ptr);
+
 /* Forward declaration for CUDA stream type when not compiling with nvcc */
 #ifndef __CUDACC__
 typedef struct CUstream_st *cudaStream_t;

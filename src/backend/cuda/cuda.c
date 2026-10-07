@@ -32,6 +32,7 @@
 #include "log.h"
 #include "gguf.h"
 #include "backend/cuda/cuda_internal.h"
+#include "backend/cuda/cuda_repack.h"
 
 /* The quad-major relayout types are declared in cuda_internal.h rather than the
  * shared ggml.h enum, so they stay private to this backend. Alias them to the
@@ -634,14 +635,80 @@ static void cuda_synchronize(backend *self) {
 /* Buffer management (cudaMalloc + host copy for CPU fallback)       */
 /* ------------------------------------------------------------------ */
 
+static status_code cuda_upload_weight(backend *self, const void *host_data, uint32_t type, int k,
+                                      int n_rows, buffer *out);
+
 static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
     int k = (int)desc->dims[0];
     int n_rows = (int)desc->dims[1];
     if (n_rows <= 0)
         n_rows = 1; /* 1-D tensors (rmsnorm weights etc.) upload with d1 == 0 */
 
+    /* Quad-major relayout, and the lossless Q4_0 -> Q8_0 promotion that feeds
+     * it, used to live in the engine's model.c. The engine here does not call
+     * into the CUDA backend, so it can happen at weight-upload time instead:
+     * this is the one place that sees both the declared type and the bytes.
+     *
+     * BOTH ARE OFF BY DEFAULT here, unlike on cuda-wip, and deliberately so.
+     * Relaying changes the bytes of a weight without changing the type the
+     * engine recorded for it, and this engine still has host-fallback paths
+     * that trust that recorded type: matmul_ffn_down_batch is not implemented
+     * by this backend, so OP_BACKEND routes the batched FFN-down to the CPU,
+     * which then reads a promoted/relayed weight with plain Q8_0/Q4_0 kernels
+     * and produces garbage (generation collapses to <pad>). The per-weight type
+     * side table below keeps this backend's own dispatch honest, but it cannot
+     * reach a fallback inside the engine.
+     *
+     * So the correct default on main is to upload weights verbatim and let the
+     * CUDA kernels dequantize them. Enabling either transform is a deliberate
+     * performance experiment that requires every consumer of the weight to stay
+     * on this backend:
+     *   KAPPAI_Q4_TO_Q8=1   lossless Q4_0 -> Q8_0 promotion
+     *   KAPPAI_QMAJOR=1     quad-major byte order for Q8_0 / Q4_0
+     */
+    const char *q4q8_env = getenv("KAPPAI_Q4_TO_Q8");
+    const char *qm_env    = getenv("KAPPAI_QMAJOR");
+    int         want_conv = q4q8_env && *q4q8_env == '1';
+    int         want_qm   = qm_env && *qm_env == '1';
+
+    void       *converted = NULL;
+    const void *host_data = desc->host_data;
+    uint32_t    type      = desc->type;
+
+    if (want_conv && desc->n_dims == 2 && desc->type == GGML_TYPE_Q4_0 && k > 0 &&
+        (k % 32) == 0) {
+        converted = cuda_convert_q4_0_to_q8_0(desc->host_data, n_rows, k);
+        if (converted) {
+            host_data = converted;
+            type      = GGML_TYPE_Q8_0;
+        }
+    }
+
+    void *qm_data = NULL;
+    if (want_qm && desc->n_dims == 2 && k > 0 && (k % 32) == 0 &&
+        (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0)) {
+        size_t total = (size_t)n_rows * (k / 32) * ((type == GGML_TYPE_Q8_0) ? 34 : 18);
+        qm_data      = xmalloc_aligned(total, 64);
+        if (qm_data) {
+            if (type == GGML_TYPE_Q8_0)
+                cuda_repack_q8_0_qm_rows(host_data, qm_data, 0, n_rows, k);
+            else
+                cuda_repack_q4_0_qm_rows(host_data, qm_data, 0, n_rows, k);
+            host_data = qm_data;
+            type      = (type == GGML_TYPE_Q8_0) ? GGML_TYPE_Q8_0_QM : GGML_TYPE_Q4_0_QM;
+        }
+    }
+
+    status_code st = cuda_upload_weight(self, host_data, type, k, n_rows, out);
+    free(qm_data);
+    free(converted);
+    return st;
+}
+
+static status_code cuda_upload_weight(backend *self, const void *host_data, uint32_t type, int k,
+                                      int n_rows, buffer *out) {
     size_t row_bytes;
-    switch (desc->type) {
+    switch (type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_0_QM: row_bytes = (size_t)(k / 32) * 34; break;
         case GGML_TYPE_Q4_0:
@@ -650,7 +717,7 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
         case GGML_TYPE_F32:  row_bytes = (size_t)k * 4;         break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16: row_bytes = (size_t)k * 2;         break;
-        default:             row_bytes = ggml_row_size(desc->type, k); break;
+        default:             row_bytes = ggml_row_size(type, k); break;
     }
 
     size_t w_bytes = (size_t)n_rows * row_bytes;
@@ -658,16 +725,23 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
     void *w_dev = NULL;
     cudaError_t e = cudaMalloc(&w_dev, w_bytes);
     if (e == cudaSuccess) {
-        e = cudaMemcpy(w_dev, desc->host_data, w_bytes, cudaMemcpyHostToDevice);
+        e = cudaMemcpy(w_dev, host_data, w_bytes, cudaMemcpyHostToDevice);
         if (e == cudaSuccess) {
             void *w_host = malloc(w_bytes);
             if (w_host) {
-                memcpy(w_host, desc->host_data, w_bytes);
+                memcpy(w_host, host_data, w_bytes);
                 out->handle  = w_dev;
                 out->size    = w_bytes;
                 out->offset  = 0;
                 out->host_ptr = w_host;
                 out->owner   = self;
+                cuda_host_alloc_note(w_host, 0);
+                /* Record what was actually stored: if this upload relaid the
+                 * bytes (Q4_0->Q8_0, quad-major), the engine still tags the
+                 * weight with the model's declared type, so the matmul entry
+                 * points must prefer this record. */
+                if (type == GGML_TYPE_Q8_0_QM || type == GGML_TYPE_Q4_0_QM)
+                    cuda_weight_type_note(w_dev, type);
                 return OK;
             }
         }
@@ -677,13 +751,15 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
     void *w_managed = NULL;
     e = cudaMallocManaged(&w_managed, w_bytes, cudaMemAttachGlobal);
     if (e != cudaSuccess) return ERR_OUT_OF_MEMORY;
-    e = cudaMemcpy(w_managed, desc->host_data, w_bytes, cudaMemcpyHostToDevice);
+    e = cudaMemcpy(w_managed, host_data, w_bytes, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) { cudaFree(w_managed); return ERR_OUT_OF_MEMORY; }
     out->handle  = w_managed;
     out->size    = w_bytes;
     out->offset  = 0;
     out->host_ptr = NULL;
     out->owner   = self;
+    if (type == GGML_TYPE_Q8_0_QM || type == GGML_TYPE_Q4_0_QM)
+        cuda_weight_type_note(w_managed, type);
     return OK;
 }
 
@@ -1130,6 +1206,12 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
 static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
                                         const buffer *gate, const buffer *up, buffer *y, int n,
                                         int k, int activation) {
+    /* Same weight-type override as cuda_op_matmul_batch: the engine tags the
+     * weight with the model's declared type, but a relaid weight is stored in
+     * a layout only the QM kernels can read. */
+    uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
+    if (stored != (uint32_t)-1)
+        w_type = stored;
     /* Quad-major: native CUDA only -- CPU has no QM readers, so every
      * host path below is skipped for QM (routed to the native Q8 branch). */
     if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
@@ -1421,6 +1503,18 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
                                      int n_matmuls) {
     if (n_matmuls <= 0 || n_matmuls > 8)
         return ERR_UNSUPPORTED;
+
+    /* The engine tags each weight with the model's declared type, but this
+     * backend may have relaid it at upload time (Q4_0 -> Q8_0, then
+     * quad-major). Substitute the stored type so the right kernel is chosen;
+     * w_types is const on the ABI, so shadow it locally. */
+    uint32_t eff_types[8];
+    for (int c = 0; c < n_matmuls; c++) {
+        uint32_t stored = cuda_weight_type_of(cuda_dev_ptr(w[c]));
+        eff_types[c]     = (stored != (uint32_t)-1) ? stored : w_types[c];
+    }
+    w_types = eff_types;
+
     for (int c = 0; c < n_matmuls; c++)
         if (cuda_w_is_qmajor(w_types[c]) && getenv("KAPPAI_CUDA_HOST_MULTI")) {
             fprintf(stderr, "cuda: Q8_0_QM weight reached host multi fallback (unsupported)\n");
@@ -1574,6 +1668,17 @@ static status_code cuda_matmul_multi_batch(backend *self, const buffer **w, cons
                                            int n_matmuls, int m) {
     if (n_matmuls <= 0 || n_matmuls > 8 || m <= 0)
         return ERR_UNSUPPORTED;
+
+    /* Substitute the type each weight was actually stored as (see
+     * cuda_matmul_multi): the engine only knows the model's declared type, so
+     * a relaid weight would otherwise be read with the wrong kernel. */
+    uint32_t eff_types[8];
+    for (int c = 0; c < n_matmuls; c++) {
+        uint32_t stored = cuda_weight_type_of(cuda_dev_ptr(w[c]));
+        eff_types[c]     = (stored != (uint32_t)-1) ? stored : w_types[c];
+    }
+    w_types = eff_types;
+
     uint32_t first = w_types[0];
     for (int c = 0; c < n_matmuls; c++)
         if (w_types[c] != first)
@@ -2948,6 +3053,11 @@ static status_code cuda_op_rmsnorm_batch(backend *self, const buffer *x, const b
 
 static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
                                           const buffer *x, buffer *y, int n, int k, int m) {
+    /* Prefer the type this backend actually stored (see the weight-type side
+     * table): a relaid weight must not be read with the engine's kernel. */
+    uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
+    if (stored != (uint32_t)-1)
+        w_type = stored;
     if (!cuda_matmul_type_native(self, w_type)) {
         /* Exotic quant: host fallback (staged device->host, since CUDA-owned
          * buffers have no valid host mirror). */
