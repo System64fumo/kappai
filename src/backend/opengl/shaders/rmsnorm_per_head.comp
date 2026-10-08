@@ -1,0 +1,86 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) readonly buffer WBuf {
+	float w[];
+};
+layout(std430, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer RBuf {
+	float r[];
+};
+layout(location = 0) uniform int u_n_heads;
+layout(location = 1) uniform int u_head_dim;
+layout(location = 2) uniform float u_eps;
+layout(location = 3) uniform int u_has_weight;
+layout(location = 4) uniform int u_rows;
+layout(location = 5) uniform int u_has_residual;
+layout(location = 6) uniform float u_out_scale;
+
+shared float s_ss[64];
+void		 main(void) {
+	uint h	 = gl_WorkGroupID.x;
+	uint row = gl_WorkGroupID.y;
+	if (int(h) >= u_n_heads || int(row) >= u_rows)
+		return;
+	uint  tid		 = gl_LocalInvocationID.x;
+	uint  row_stride = uint(u_n_heads) * uint(u_head_dim);
+	uint  base		 = row * row_stride + h * uint(u_head_dim);
+	int	  head_dim	 = u_head_dim;
+	float my_sum	 = 0.0;
+	for (int i = int(tid); i < head_dim; i += 64)
+		my_sum += x[base + uint(i)] * x[base + uint(i)];
+	s_ss[tid] = my_sum;
+	barrier();
+	if (tid < 32u) {
+		s_ss[tid] += s_ss[tid + 32u];
+	}
+	barrier();
+	if (tid < 16u) {
+		s_ss[tid] += s_ss[tid + 16u];
+	}
+	barrier();
+	if (tid < 8u) {
+		s_ss[tid] += s_ss[tid + 8u];
+	}
+	barrier();
+	if (tid < 4u) {
+		s_ss[tid] += s_ss[tid + 4u];
+	}
+	barrier();
+	if (tid < 2u) {
+		s_ss[tid] += s_ss[tid + 2u];
+	}
+	barrier();
+	if (tid < 1u) {
+		s_ss[tid] += s_ss[tid + 1u];
+	}
+	barrier();
+	float ss  = s_ss[0];
+	float inv = 1.0 / sqrt(ss / float(head_dim) + u_eps);
+	if (u_has_weight != 0) {
+		if (u_has_residual != 0) {
+			for (int i = int(tid); i < head_dim; i += 64) {
+				float t			  = x[base + uint(i)] * inv * w[i] + r[base + uint(i)];
+				y[base + uint(i)] = t * u_out_scale;
+			}
+		} else {
+			for (int i = int(tid); i < head_dim; i += 64)
+				y[base + uint(i)] = x[base + uint(i)] * inv * w[i] * u_out_scale;
+		}
+	} else {
+		if (u_has_residual != 0) {
+			for (int i = int(tid); i < head_dim; i += 64) {
+				float t			  = x[base + uint(i)] * inv + r[base + uint(i)];
+				y[base + uint(i)] = t * u_out_scale;
+			}
+		} else {
+			for (int i = int(tid); i < head_dim; i += 64)
+				y[base + uint(i)] = x[base + uint(i)] * inv * u_out_scale;
+		}
+	}
+}

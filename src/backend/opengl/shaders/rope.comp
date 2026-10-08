@@ -1,0 +1,41 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer VecBuf {
+	float vec[];
+};
+layout(std430, binding = 1) readonly buffer CosBuf {
+	float rcos[];
+};
+layout(std430, binding = 2) readonly buffer SinBuf {
+	float rsin[];
+};
+layout(location = 0) uniform int u_n_heads;
+layout(location = 1) uniform int u_head_dim;
+layout(location = 2) uniform int u_pos;
+layout(location = 3) uniform int u_neox;
+void main(void) {
+	uint g		  = gl_GlobalInvocationID.x;
+	int	 half_dim = u_head_dim / 2;
+	int	 total	  = u_n_heads * half_dim;
+	if (int(g) >= total)
+		return;
+	int	  h	   = int(g) / half_dim;
+	int	  j	   = int(g) % half_dim;
+	int	  base = h * u_head_dim;
+	float c	   = rcos[j];
+	float s	   = rsin[j];
+	if (u_neox != 0) {
+		float a					 = vec[base + j];
+		float b					 = vec[base + j + half_dim];
+		vec[base + j]			 = a * c - b * s;
+		vec[base + j + half_dim] = a * s + b * c;
+	} else {
+		int	  idx0		 = 2 * j;
+		int	  idx1		 = 2 * j + 1;
+		float a			 = vec[base + idx0];
+		float b			 = vec[base + idx1];
+		vec[base + idx0] = a * c - b * s;
+		vec[base + idx1] = a * s + b * c;
+	}
+}

@@ -1,0 +1,74 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) writeonly buffer XQBuf {
+	uint xq[];
+};
+layout(location = 0) uniform int u_k_blocks;
+layout(location = 1) uniform int u_k;
+layout(location = 2) uniform int u_row_words;
+
+shared float s_amax[32];
+shared float s_maxv[32];
+
+int round_away(float f) {
+	float af = abs(f);
+	float tr = trunc(af);
+	float fr = af - tr;
+	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
+	return (f < 0.0) ? -int(r) : int(r);
+}
+
+void main(void) {
+	int bi	= int(gl_WorkGroupID.x);
+	int row = int(gl_WorkGroupID.y);
+	if (bi >= u_k_blocks)
+		return;
+	uint  tid  = gl_LocalInvocationID.x;
+	int	  xb   = row * u_k + bi * 256 + int(tid) * 8;
+	float amax = 0.0;
+	float maxv = 0.0;
+	for (int j = 0; j < 8; j++) {
+		float v	 = x[xb + j];
+		float ax = abs(v);
+		if (ax > amax) {
+			amax = ax;
+			maxv = v;
+		}
+	}
+	s_amax[tid] = amax;
+	s_maxv[tid] = maxv;
+	barrier();
+	float gmax = 0.0;
+	float gval = 0.0;
+	for (int t = 0; t < 32; t++) {
+		if (s_amax[t] > gmax) {
+			gmax = s_amax[t];
+			gval = s_maxv[t];
+		}
+	}
+	float iscale = 0.0;
+	float d		 = 0.0;
+	if (gmax != 0.0) {
+		iscale = -127.0 / gval;
+		d	   = 1.0 / iscale;
+	}
+	uint base = uint(row * u_row_words + bi * 65);
+	for (int w = 0; w < 2; w++) {
+		uint word = 0u;
+		for (int b = 0; b < 4; b++) {
+			int v = (gmax == 0.0) ? 0 : round_away(iscale * x[xb + w * 4 + b]);
+			v	  = v > 127 ? 127 : (v < -127 ? -127 : v);
+			word |= (uint(v) & 0xFFu) << uint(b * 8);
+		}
+		xq[base + uint(tid) * 2u + uint(w)] = word;
+	}
+	if (tid == 0u)
+		xq[base + 64u] = floatBitsToUint(d);
+}

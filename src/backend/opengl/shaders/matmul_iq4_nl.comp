@@ -1,0 +1,92 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+#ifndef WG
+#define WG 32
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uvec4 xq4[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+const uint IQ4NL_A0 = 0x3F2D1801u;
+const uint IQ4NL_A1 = 0x766A5D4Fu;
+const uint IQ4NL_A2 = 0xA6998D81u;
+const uint IQ4NL_A3 = 0xF1D9C5B5u;
+
+int iq4nl(uint i) {
+	uint g = i >> 2u;
+	uint v = (g == 0u) ? IQ4NL_A0 : (g == 1u) ? IQ4NL_A1 : (g == 2u) ? IQ4NL_A2 : IQ4NL_A3;
+	return int((v >> ((i & 3u) * 8u)) & 0xFFu) - 128;
+}
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+uint sh2(uint a, uint b, uint odd) {
+	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
+}
+
+int dot4_iq4(uint qw, uint xl, uint xh) {
+	int s = 0;
+	for (int t = 0; t < 4; t++) {
+		int sh = t * 8;
+		s += iq4nl(bitfieldExtract(qw, sh, 4)) * bitfieldExtract(int(xl), sh, 8) +
+			 iq4nl(bitfieldExtract(qw, sh + 4, 4)) * bitfieldExtract(int(xh), sh, 8);
+	}
+	return s;
+}
+
+void store_row(uint idx, float acc) {
+	if (u_add_residual == 1)
+		y[idx] = acc + res[idx];
+	else if (u_add_residual == 2)
+		y[idx] += acc;
+	else
+		y[idx] = acc;
+}
+
+void main(void) {
+	uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * uint(WG) + gl_LocalInvocationID.x;
+	if (int(row) >= u_n)
+		return;
+	uint row_bytes = uint(u_k_blocks) * 18u;
+	uint rw		   = row * row_bytes;
+
+	float acc = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  bo  = rw + uint(bi) * 18u;
+		uint  wi  = bo >> 2u;
+		uint  odd = (bo >> 1u) & 1u;
+		uint  xi  = uint(bi) * 3u;
+		uvec4 xlo = xq4[xi];
+		uvec4 xhi = xq4[xi + 1u];
+		uvec4 xs  = xq4[xi + 2u];
+		uint  w0  = w[wi];
+		uint  w1  = w[wi + 1u];
+		uint  w2  = w[wi + 2u];
+		uint  w3  = w[wi + 3u];
+		uint  w4  = w[wi + 4u];
+		int	  sumi =
+			dot4_iq4(sh2(w0, w1, odd), xlo.x, xhi.x) + dot4_iq4(sh2(w1, w2, odd), xlo.y, xhi.y) +
+			dot4_iq4(sh2(w2, w3, odd), xlo.z, xhi.z) + dot4_iq4(sh2(w3, w4, odd), xlo.w, xhi.w);
+		acc += h2f(odd != 0u ? w0 >> 16u : w0) * uintBitsToFloat(xs.x) * float(sumi);
+	}
+	store_row(row, acc);
+}

@@ -614,6 +614,27 @@ static uint32_t cpu_matmul_q8_expected_type(int q8_class) {
 	}
 }
 
+static void cpu_matmul_generic_block(const cpu_matmul_job *j, const uint8_t *restrict W_sub,
+									 float *restrict y_sub, int n_sub) {
+	static _Thread_local float *row_buf;
+	static _Thread_local size_t row_buf_cap;
+	if (row_buf_cap < (size_t)j->k) {
+		row_buf = xrealloc(row_buf, (size_t)j->k * sizeof(float));
+		if (!row_buf_cap)
+			tlocal_register((void **)&row_buf);
+		row_buf_cap = (size_t)j->k;
+	}
+	dequant_blocks_fn dequant_fn;
+	int				  divisor;
+	dequant_row_plan(j->w_type, &dequant_fn, &divisor);
+	size_t n_blocks = (size_t)(j->k / divisor);
+	for (int r = 0; r < n_sub; r++) {
+		dequant_fn(W_sub + ((size_t)r * j->row_stride), n_blocks, row_buf);
+		for (int t = 0; t < j->m; t++)
+			y_sub[((size_t)t * j->n) + r] = dot_f32(row_buf, j->xf + ((size_t)t * j->k), j->k);
+	}
+}
+
 static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_matmul_job *j			  = ctx;
@@ -634,10 +655,7 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	} else if (j->w_type == GGML_TYPE_BF16) {
 		matmul_bf16_f32_batch(W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
 	} else {
-		for (int row = 0; row < j->m; row++) {
-			float *y = j->y + ((size_t)row * j->n) + begin;
-			matmul_generic_f32(W_sub, j->w_type, j->xf + ((size_t)row * j->k), y, n_sub, j->k);
-		}
+		cpu_matmul_generic_block(j, W_sub, y_sub, n_sub);
 	}
 
 	if (j->m == 1)
@@ -861,19 +879,6 @@ static void cpu_matmul_threaded_bias_residual(backend *self, const void *restric
 	int q8_class = job.kernel ? job.kernel->q8_class : 0;
 	if (q8_class) {
 		job.xq = cpu_matmul_quantize_x(&p->qscratch, q8_class, x, k);
-	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
-		const float *res = residual;
-		if (aliases_residual) {
-			status_code grow_st = cpu_buf_grow((void **)&p->residual_tmp, &p->residual_tmp_cap,
-											   (size_t)n * sizeof(float), 64);
-			if (grow_st != OK)
-				return;
-			memcpy(p->residual_tmp, residual, (size_t)n * sizeof(float));
-			res = p->residual_tmp;
-		}
-		cpu_matmul_one(W, w_type, x, y, n, k, &p->qscratch);
-		cpu_matmul_add_bias_residual(y, bias, res, n);
-		return;
 	}
 	job.row_stride = cpu_matmul_w_row_stride(w_type, k);
 
@@ -994,12 +999,6 @@ __attribute__((weak)) status_code cpu_matmul_multi(backend *self, const buffer *
 				xq_by_class[q8_class] =
 					cpu_matmul_quantize_x(&local_scratch[q8_class], q8_class, xf, k);
 			j->xq = xq_by_class[q8_class];
-		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16 &&
-				   w_types[i] != GGML_TYPE_F16) {
-			for (int ii = 0; ii < n_matmuls; ii++)
-				cpu_matmul_one(cpu_ptr(w[ii]), w_types[ii], xf, cpu_ptr(y[ii]), n_list[ii], k,
-							   &p->qscratch);
-			return OK;
 		}
 		j->row_stride = cpu_matmul_w_row_stride(w_types[i], k);
 	}
@@ -1093,15 +1092,6 @@ __attribute__((weak)) status_code cpu_matmul_multi_batch(backend *self, const bu
 			j->xq					= xq_by_class[q8_class];
 			j->xq_row_stride		= cpu_matmul_xq_row_stride(q8_class, k);
 			j->xq_row_stride_blocks = j->xq_row_stride / cpu_matmul_q8_block_size(q8_class);
-		} else if (w_types[i] != GGML_TYPE_F32 && w_types[i] != GGML_TYPE_BF16 &&
-				   w_types[i] != GGML_TYPE_F16) {
-			for (int row = 0; row < m; row++)
-				cpu_matmul_one(j->W, w_types[i], xf + ((size_t)row * k),
-							   cpu_ptr(y[i]) + ((size_t)row * n_list[i]), n_list[i], k,
-							   &p->qscratch);
-			j->n				 = 0;
-			mj.row_offset[i + 1] = mj.row_offset[i];
-			continue;
 		}
 		j->n				 = n_list[i];
 		j->m				 = m;
@@ -1257,11 +1247,6 @@ __attribute__((weak)) status_code cpu_matmul_batch(backend *self, const buffer *
 		size_t stride = cpu_matmul_xq_row_stride(q8_class, k);
 		void  *xq	  = cpu_matmul_quantize_x_rows(self, &p->qscratch, q8_class, xf, k, m, stride);
 		return cpu_matmul_batch_prequant(self, W, w_type, xq, stride, yf, n, k, m);
-	} else if (w_type != GGML_TYPE_F32 && w_type != GGML_TYPE_BF16 && w_type != GGML_TYPE_F16) {
-		for (int i = 0; i < m; i++)
-			cpu_matmul_one(W, w_type, xf + ((size_t)i * k), yf + ((size_t)i * n), n, k,
-						   &p->qscratch);
-		return OK;
 	}
 	job->row_stride = cpu_matmul_w_row_stride(w_type, k);
 

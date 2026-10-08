@@ -68,10 +68,6 @@ static inline void scale_store_f32_vec(float *restrict dst, const float *restric
 		dst[d] = src[d] * s;
 }
 
-/* Online-softmax step, branchless. fast_expf(0.0f) is exactly 1.0f (n=0, e=127 ->
-   0x3f800000), so the rescale factor collapses to 1.0f on the no-new-max path and the
-   head_dim-wide VKQ rescale can be skipped. Matches the branchy form exactly: the only
-   case the original guarded was ss > M, which is precisely where alpha != 1.0f. */
 static inline float attn_softmax_step(float ss, float *M, float *S, float *restrict vkq,
 									  int head_dim) {
 	const float M_old = *M;

@@ -1,0 +1,147 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uint xq[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(std430, binding = 4) readonly buffer GridBuf {
+	uint grid[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+#define ROWS 32
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+uint rb(uint off) {
+	uint wd = w[off >> 2u];
+	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+int xq8(uint bb, int e) {
+	return bitfieldExtract(int(xq[bb + uint(e >> 2)]), (e & 3) * 8, 8);
+}
+
+void store_row(uint idx, float acc) {
+	if (u_add_residual == 1)
+		y[idx] = acc + res[idx];
+	else if (u_add_residual == 2)
+		y[idx] += acc;
+	else
+		y[idx] = acc;
+}
+
+void main(void) {
+	uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * uint(ROWS) + gl_LocalInvocationID.x;
+	if (int(row) >= u_n)
+		return;
+	uint row_bytes = uint(u_k_blocks) * 110u;
+	uint rw		   = row * row_bytes;
+
+	float acc = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  xbq	 = uint(bi) * 65u;
+		float xd	 = uintBitsToFloat(xq[xbq + 64u]);
+		uint  bo	 = uint(bi) * 110u;
+		float dw	 = h2f(rb(bo + rw) | (rb(bo + 1u + rw) << 8u));
+		float scaled = dw * xd;
+		int	  total	 = 0;
+		for (int step = 0; step < 4; step++) {
+			uint qs_step	= bo + 2u + uint(step) * 16u + rw;
+			uint qh_step	= bo + 66u + uint(step) * 2u + rw;
+			uint signs_step = bo + 74u + uint(step) * 8u + rw;
+			uint scale_byte = rb(bo + 106u + uint(step) + rw);
+			int	 sc1		= 1 + 2 * int(scale_byte & 0xFu);
+			int	 sc2		= 1 + 2 * int(scale_byte >> 4u);
+			uint qh0		= rb(qh_step);
+			uint qh1		= rb(qh_step + 1u);
+			int	 group_sum1 = 0;
+			int	 group_sum2 = 0;
+			for (int l = 0; l < 4; l++) {
+				uint q2l   = rb(qs_step + uint(2 * l));
+				uint q2l1  = rb(qs_step + uint(2 * l + 1));
+				uint gidx1 = q2l | ((qh0 << uint(8 - 2 * l)) & 256u);
+				uint gidx2 = q2l1 | ((qh0 << uint(7 - 2 * l)) & 256u);
+				uint gw1   = grid[gidx1];
+				uint gw2   = grid[gidx2];
+				uint sb	   = rb(signs_step + uint(l));
+				int	 xbase = step * 64 + l * 8;
+				group_sum1 +=
+					(((sb & 1u) != 0u ? -int((gw1 >> 0u) & 0xFFu) : int((gw1 >> 0u) & 0xFFu)) *
+					 xq8(xbq, xbase + 0));
+				group_sum1 +=
+					(((sb & 2u) != 0u ? -int((gw1 >> 8u) & 0xFFu) : int((gw1 >> 8u) & 0xFFu)) *
+					 xq8(xbq, xbase + 1));
+				group_sum1 +=
+					(((sb & 4u) != 0u ? -int((gw1 >> 16u) & 0xFFu) : int((gw1 >> 16u) & 0xFFu)) *
+					 xq8(xbq, xbase + 2));
+				group_sum1 +=
+					(((sb & 8u) != 0u ? -int((gw1 >> 24u) & 0xFFu) : int((gw1 >> 24u) & 0xFFu)) *
+					 xq8(xbq, xbase + 3));
+				group_sum1 +=
+					(((sb & 16u) != 0u ? -int((gw2 >> 0u) & 0xFFu) : int((gw2 >> 0u) & 0xFFu)) *
+					 xq8(xbq, xbase + 4));
+				group_sum1 +=
+					(((sb & 32u) != 0u ? -int((gw2 >> 8u) & 0xFFu) : int((gw2 >> 8u) & 0xFFu)) *
+					 xq8(xbq, xbase + 5));
+				group_sum1 +=
+					(((sb & 64u) != 0u ? -int((gw2 >> 16u) & 0xFFu) : int((gw2 >> 16u) & 0xFFu)) *
+					 xq8(xbq, xbase + 6));
+				group_sum1 +=
+					(((sb & 128u) != 0u ? -int((gw2 >> 24u) & 0xFFu) : int((gw2 >> 24u) & 0xFFu)) *
+					 xq8(xbq, xbase + 7));
+				uint q2l_b	 = rb(qs_step + 8u + uint(2 * l));
+				uint q2l1_b	 = rb(qs_step + 8u + uint(2 * l + 1));
+				uint gidx1_b = q2l_b | ((qh1 << uint(8 - 2 * l)) & 256u);
+				uint gidx2_b = q2l1_b | ((qh1 << uint(7 - 2 * l)) & 256u);
+				uint gw1_b	 = grid[gidx1_b];
+				uint gw2_b	 = grid[gidx2_b];
+				uint sb_b	 = rb(signs_step + 4u + uint(l));
+				int	 xbase_b = xbase + 32;
+				group_sum2 += (((sb_b & 1u) != 0u ? -int((gw1_b >> 0u) & 0xFFu)
+												  : int((gw1_b >> 0u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 0));
+				group_sum2 += (((sb_b & 2u) != 0u ? -int((gw1_b >> 8u) & 0xFFu)
+												  : int((gw1_b >> 8u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 1));
+				group_sum2 += (((sb_b & 4u) != 0u ? -int((gw1_b >> 16u) & 0xFFu)
+												  : int((gw1_b >> 16u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 2));
+				group_sum2 += (((sb_b & 8u) != 0u ? -int((gw1_b >> 24u) & 0xFFu)
+												  : int((gw1_b >> 24u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 3));
+				group_sum2 += (((sb_b & 16u) != 0u ? -int((gw2_b >> 0u) & 0xFFu)
+												   : int((gw2_b >> 0u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 4));
+				group_sum2 += (((sb_b & 32u) != 0u ? -int((gw2_b >> 8u) & 0xFFu)
+												   : int((gw2_b >> 8u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 5));
+				group_sum2 += (((sb_b & 64u) != 0u ? -int((gw2_b >> 16u) & 0xFFu)
+												   : int((gw2_b >> 16u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 6));
+				group_sum2 += (((sb_b & 128u) != 0u ? -int((gw2_b >> 24u) & 0xFFu)
+													: int((gw2_b >> 24u) & 0xFFu)) *
+							   xq8(xbq, xbase_b + 7));
+			}
+			total += sc1 * group_sum1 + sc2 * group_sum2;
+		}
+		acc += scaled * float(total);
+	}
+	store_row(row, acc);
+}

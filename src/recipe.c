@@ -5517,7 +5517,8 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		bs_ensure_slot(bs, a, RECIPE_SLOT_HYB_BETA, (size_t)n_tokens * m->hybrid.n_value_heads);
 	}
 
-	status_code st = OK;
+	status_code st		   = OK;
+	int			batch_open = 0;
 
 	st = embd_fill_rows(a, &m->tok_embd.buf, m->tok_embd.type, tokens, &bs->pair[RECIPE_SLOT_X].b,
 						n_tokens, dim, m->arch_info->has_scale_embeddings ? m->dim_sqrt : 1.0f);
@@ -5536,8 +5537,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		}
 	}
 
-	if (a->begin_batch)
+	if (a->begin_batch) {
 		a->begin_batch(a);
+		batch_open = 1;
+	}
 
 	const recipe_op *ops_base	= r->per_layer_ops ? r->per_layer_ops : r->layer.ops;
 	int				 ops_stride = r->per_layer_ops ? r->layer.n_ops : 0;
@@ -5562,8 +5565,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 			goto done;
 	}
 
-	if (a->end_batch)
+	if (a->end_batch) {
 		a->end_batch(a);
+		batch_open = 0;
+	}
 
 	ensure_sync(a);
 
@@ -5587,6 +5592,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	}
 
 done:
+	if (batch_open && a->end_batch) {
+		a->end_batch(a);
+		batch_open = 0;
+	}
 	if (st != OK && logits_out)
 		memset(logits_out, 0, (size_t)m->vocab_size * sizeof(float));
 	return st;

@@ -1,0 +1,95 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+#ifndef WG
+#define WG 32
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uvec4 xq4[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[WG];
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+uint sh2(uint a, uint b, uint odd) {
+	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
+}
+
+int dot4_q5_0(uint qw, uint xl, uint xh, uint hb_lo, uint hb_hi) {
+	int s = 0;
+	for (int t = 0; t < 4; t++) {
+		int sh = t * 8;
+		int lo = int(bitfieldExtract(qw, sh, 4) | (((hb_lo >> uint(t)) & 1u) << 4u)) - 16;
+		int hi = int(bitfieldExtract(qw, sh + 4, 4) | (((hb_hi >> uint(t)) & 1u) << 4u)) - 16;
+		s += lo * bitfieldExtract(int(xl), sh, 8) + hi * bitfieldExtract(int(xh), sh, 8);
+	}
+	return s;
+}
+
+void main(void) {
+	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint tid   = gl_LocalInvocationID.x;
+	bool valid = int(row) < u_n;
+
+	float acc = 0.0;
+	if (valid) {
+		uint row_off = row * uint(u_k_blocks) * 22u;
+		for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
+			uint  bo   = row_off + uint(bi) * 22u;
+			uint  wi   = bo >> 2u;
+			uint  odd  = (bo >> 1u) & 1u;
+			uint  xi   = uint(bi) * 3u;
+			uvec4 xlo  = xq4[xi];
+			uvec4 xhi  = xq4[xi + 1u];
+			uvec4 xs   = xq4[xi + 2u];
+			float dxq  = uintBitsToFloat(xs.x);
+			uint  w0   = w[wi];
+			uint  w1   = w[wi + 1u];
+			uint  w2   = w[wi + 2u];
+			uint  w3   = w[wi + 3u];
+			uint  w4   = w[wi + 4u];
+			uint  w5   = w[wi + 5u];
+			uint  qh   = sh2(w0, w1, odd);
+			float wd   = h2f(odd != 0u ? w0 >> 16u : w0);
+			int	  sumi = dot4_q5_0(sh2(w1, w2, odd), xlo.x, xhi.x, qh, qh >> 16u) +
+						 dot4_q5_0(sh2(w2, w3, odd), xlo.y, xhi.y, qh >> 4u, qh >> 20u) +
+						 dot4_q5_0(sh2(w3, w4, odd), xlo.z, xhi.z, qh >> 8u, qh >> 24u) +
+						 dot4_q5_0(sh2(w4, w5, odd), xlo.w, xhi.w, qh >> 12u, qh >> 28u);
+			acc += wd * dxq * float(sumi);
+		}
+	}
+	s_acc[tid] = acc;
+	barrier();
+	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_acc[tid] += s_acc[tid + s];
+		barrier();
+	}
+	if (valid && tid == 0u) {
+		if (u_add_residual == 1)
+			y[row] = s_acc[0] + res[row];
+		else if (u_add_residual == 2)
+			y[row] += s_acc[0];
+		else
+			y[row] = s_acc[0];
+	}
+}

@@ -1,0 +1,109 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+#ifndef WG
+#define WG 32
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uvec4 xq4[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[WG];
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+float round_f16(float f) {
+	float base = abs(f) * 4.0;
+	uint  w	   = floatBitsToUint(f);
+	uint  shl1 = w + w;
+	uint  sign = w & 0x80000000u;
+	uint  bias = shl1 & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	base		   = uintBitsToFloat((bias >> 1u) + 0x07800000u) + base;
+	uint bits	   = floatBitsToUint(base);
+	uint exp_bits  = (bits >> 13u) & 0x7C00u;
+	uint mant_bits = bits & 0x0FFFu;
+	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
+	return h2f(hbits);
+}
+
+ivec2 dot4_q5_1(uint qw, uint xl, uint xh, uint hb_lo, uint hb_hi) {
+	ivec2 r = ivec2(0);
+	for (int t = 0; t < 4; t++) {
+		int sh = t * 8;
+		int lo = int(bitfieldExtract(qw, sh, 4) | (((hb_lo >> uint(t)) & 1u) << 4u));
+		int hi = int(bitfieldExtract(qw, sh + 4, 4) | (((hb_hi >> uint(t)) & 1u) << 4u));
+		int vl = bitfieldExtract(int(xl), sh, 8);
+		int vh = bitfieldExtract(int(xh), sh, 8);
+		r.x += lo * vl + hi * vh;
+		r.y += vl + vh;
+	}
+	return r;
+}
+
+void main(void) {
+	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint tid   = gl_LocalInvocationID.x;
+	bool valid = int(row) < u_n;
+
+	float acc = 0.0;
+	if (valid) {
+		uint row_off = row * uint(u_k_blocks) * 24u;
+		for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
+			uint  bo  = row_off + uint(bi) * 24u;
+			uint  wi  = bo >> 2u;
+			uint  odd = (bo >> 1u) & 1u;
+			uint  xi  = uint(bi) * 3u;
+			uvec4 xlo = xq4[xi];
+			uvec4 xhi = xq4[xi + 1u];
+			uvec4 xs  = xq4[xi + 2u];
+			float dxq = uintBitsToFloat(xs.x);
+			uint  w0  = w[wi];
+			uint  qh  = w[wi + 1u];
+			uint  w2  = w[wi + 2u];
+			uint  w3  = w[wi + 3u];
+			uint  w4  = w[wi + 4u];
+			uint  w5  = w[wi + 5u];
+			ivec2 s	  = dot4_q5_1(w2, xlo.x, xhi.x, qh, qh >> 16u) +
+						dot4_q5_1(w3, xlo.y, xhi.y, qh >> 4u, qh >> 20u) +
+						dot4_q5_1(w4, xlo.z, xhi.z, qh >> 8u, qh >> 24u) +
+						dot4_q5_1(w5, xlo.w, xhi.w, qh >> 12u, qh >> 28u);
+			float sxq = round_f16(uintBitsToFloat(xs.y) * float(s.y));
+			acc += h2f(w0) * dxq * float(s.x) + h2f(w0 >> 16u) * sxq;
+		}
+	}
+	s_acc[tid] = acc;
+	barrier();
+	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_acc[tid] += s_acc[tid + s];
+		barrier();
+	}
+	if (valid && tid == 0u) {
+		if (u_add_residual == 1)
+			y[row] = s_acc[0] + res[row];
+		else if (u_add_residual == 2)
+			y[row] += s_acc[0];
+		else
+			y[row] = s_acc[0];
+	}
+}

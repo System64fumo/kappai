@@ -1,0 +1,42 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer EmbdBuf {
+	uint embd[];
+};
+layout(std430, binding = 1) writeonly buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_token;
+layout(location = 1) uniform int u_dim;
+layout(location = 2) uniform int u_row_stride;
+float f16_to_f32(uint h);
+float f16_to_f32(uint h) {
+	uint sgn  = (h >> 15u) & 1u;
+	uint ev	  = (h >> 10u) & 0x1Fu;
+	uint mant = h & 0x3FFu;
+	uint e;
+	uint m;
+	if (ev == 0u) {
+		e = 0u;
+		m = 0u;
+	} else if (ev == 31u) {
+		e = 255u;
+		m = mant << 13u;
+	} else {
+		e = ev + 112u;
+		m = mant << 13u;
+	}
+	uint bits = (sgn << 31u) | (e << 23u) | m;
+	return uintBitsToFloat(bits);
+}
+void main(void) {
+	uint d = gl_GlobalInvocationID.x;
+	if (int(d) >= u_dim)
+		return;
+	uint byte_off = uint(u_token) * uint(u_row_stride) + d * 2u;
+	uint word	  = embd[byte_off >> 2u];
+	uint shift	  = (byte_off & 3u) * 8u;
+	uint h		  = (word >> shift) & 0xFFFFu;
+	out_[d]		  = f16_to_f32(h);
+}

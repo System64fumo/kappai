@@ -1,0 +1,55 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 1) buffer KBuf {
+	float k[];
+};
+layout(std430, binding = 2) readonly buffer CosBuf {
+	float rcos[];
+};
+layout(std430, binding = 3) readonly buffer SinBuf {
+	float rsin[];
+};
+layout(location = 0) uniform int u_n_heads;
+layout(location = 1) uniform int u_n_kv_heads;
+layout(location = 2) uniform int u_head_dim;
+layout(location = 3) uniform int u_rope_dim;
+layout(location = 4) uniform int u_pos0;
+layout(location = 5) uniform int u_n_rows;
+
+void main(void) {
+	int half_rd		= u_rope_dim / 2;
+	int total_heads = u_n_heads + u_n_kv_heads;
+	if (half_rd <= 0 || total_heads <= 0)
+		return;
+	int hs	= int(gl_GlobalInvocationID.x);
+	int row = int(gl_WorkGroupID.y) + 65535 * int(gl_WorkGroupID.z);
+	if (hs >= total_heads || row >= u_n_rows)
+		return;
+
+	int is_q = hs < u_n_heads ? 1 : 0;
+	int h	 = is_q != 0 ? hs : hs - u_n_heads;
+	int qn	 = u_n_heads * u_head_dim;
+	int kn	 = u_n_kv_heads * u_head_dim;
+	int base = row * (is_q != 0 ? qn : kn) + h * u_head_dim;
+	int coff = (u_pos0 + row) * half_rd;
+
+	for (int j = 0; j < half_rd; j++) {
+		float c = rcos[coff + j];
+		float s = rsin[coff + j];
+		if (is_q != 0) {
+			float v0			  = q[base + j];
+			float v1			  = q[base + j + half_rd];
+			q[base + j]			  = v0 * c - v1 * s;
+			q[base + j + half_rd] = v0 * s + v1 * c;
+		} else {
+			float v0			  = k[base + j];
+			float v1			  = k[base + j + half_rd];
+			k[base + j]			  = v0 * c - v1 * s;
+			k[base + j + half_rd] = v0 * s + v1 * c;
+		}
+	}
+}

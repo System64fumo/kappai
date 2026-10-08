@@ -23,12 +23,14 @@ ifeq ($(filter $(BUILD),$(VALID_BUILDS)),)
 endif
 
 AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
-REQUESTED_BACKENDS := $(strip $(subst $(,), ,$(BACKENDS)))
+BACKENDS_TOKENS := $(subst ",,$(BACKENDS))
+REQUESTED_BACKENDS := $(strip $(shell echo '$(BACKENDS_TOKENS)' | tr ',' ' '))
 UNKNOWN_BACKENDS := $(filter-out $(AVAILABLE_BACKENDS),$(REQUESTED_BACKENDS))
 ifneq ($(UNKNOWN_BACKENDS),)
   $(error Unknown backend(s): $(UNKNOWN_BACKENDS). Available backends: $(AVAILABLE_BACKENDS))
 endif
-HAS_VULKAN := $(filter vulkan,$(REQUESTED_BACKENDS))
+HAS_VULKAN  := $(filter vulkan,$(REQUESTED_BACKENDS))
+HAS_OPENGL := $(filter opengl,$(REQUESTED_BACKENDS))
 
 CONFIG_FILE := $(OUT_DIR)/config.mk
 CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help config
@@ -122,6 +124,10 @@ ifneq ($(HAS_VULKAN),)
   VK_BACKEND_INCLUDES := -I$(OBJ_DIR)/backend/vulkan -I$(SRC_DIR)/backend/vulkan
 endif
 
+ifneq ($(HAS_OPENGL),)
+  GL_BACKEND_INCLUDES := -I$(OBJ_DIR)/backend/opengl -I$(SRC_DIR)/backend/opengl
+endif
+
 LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/*.c) \
 	$(wildcard $(SRC_DIR)/models/*.c) \
@@ -130,7 +136,7 @@ LIB_SRCS := \
 
 BACKEND_DIR     := $(OUT_DIR)/backends
 BACKEND_OBJ_DIR := $(OUT_DIR)/backend_obj
-BACKEND_CFLAGS  := $(CFLAGS) -fvisibility=hidden $(VK_BACKEND_INCLUDES)
+BACKEND_CFLAGS  := $(CFLAGS) -fvisibility=hidden
 
 SCALAR_CORE_OBJS := \
 	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/core.o \
@@ -168,6 +174,25 @@ ifneq ($(HAS_VULKAN),)
   BACKEND_OBJS += $(VK_BACKEND_OBJS)
 endif
 
+ifneq ($(HAS_OPENGL),)
+  GL_BACKEND_OBJS := \
+	$(BACKEND_OBJ_DIR)/backend/opengl/opengl.o \
+	$(BACKEND_OBJ_DIR)/backend/opengl/gl_context.o
+  GL_BACKEND := $(BACKEND_DIR)/libkappai_opengl.so
+  BACKEND_LIBS += $(GL_BACKEND)
+  BACKEND_OBJS += $(GL_BACKEND_OBJS)
+endif
+
+ifneq ($(HAS_VULKAN),)
+  BACKEND_CFLAGS_VULKAN := $(BACKEND_CFLAGS) $(VK_BACKEND_INCLUDES)
+  $(VK_BACKEND_OBJS): BACKEND_CFLAGS := $(BACKEND_CFLAGS_VULKAN)
+endif
+
+ifneq ($(HAS_OPENGL),)
+  BACKEND_CFLAGS_OPENGL := $(BACKEND_CFLAGS) $(GL_BACKEND_INCLUDES)
+  $(GL_BACKEND_OBJS): BACKEND_CFLAGS := $(BACKEND_CFLAGS_OPENGL)
+endif
+
 TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
 SERVER_SRCS := $(wildcard $(SRC_DIR)/server/*.c)
 SERVER_LIBS := -ljson-c -lmicrohttpd
@@ -190,8 +215,6 @@ MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
 SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(ENGINE) $(BACKEND_LIBS)
 
-# The engine is resolved at load time via DT_NEEDED + RUNPATH, so this only has to
-# make the link succeed -- it must stay in LDFLAGS to keep codegen flags in sync.
 ENGINE_LDFLAGS := -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
 BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS)))
@@ -302,6 +325,27 @@ ifneq ($(HAS_VULKAN),)
 	@printf '#endif\n' >> $@
 endif
 
+GL_SHADERS_DIR := $(SRC_DIR)/backend/opengl/shaders
+GL_COMP_FILES  := $(sort $(wildcard $(GL_SHADERS_DIR)/*.comp))
+GL_SHADERS_H   := $(OBJ_DIR)/backend/opengl/shaders_embedded.h
+
+ifneq ($(HAS_OPENGL),)
+  $(BACKEND_OBJ_DIR)/backend/opengl/opengl.o: $(GL_SHADERS_H)
+
+  $(GL_SHADERS_H): $(GL_COMP_FILES)
+	@mkdir -p $(dir $@)
+	@echo "  GEN     $@"
+	@printf '#ifndef SHADERS_H\n#define SHADERS_H\n\n' > $@
+	@for comp in $^; do \
+	        name=$$(basename $$comp .comp); \
+	        varname="gl_shader_$${name}_src"; \
+	        printf 'static const char %s[] = {\n' "$$varname" >> $@; \
+	        od -v -An -tu1 "$$comp" | tr -s ' ' '\n' | grep -v '^$$' | sed 's/$$/,/' | tr '\n' ' ' >> $@; \
+	        printf '0x00\n};\n\n' >> $@; \
+	done
+	@printf '#endif\n' >> $@
+endif
+
 .PHONY: all cli kappai-test server monitor clean print-config format tidy backends-help config
 
 all: $(BACKEND_LIBS) cli kappai-test server
@@ -313,7 +357,7 @@ config: $(OUT_DIR) $(CONFIG_FILE)
 $(CONFIG_FILE): | $(OUT_DIR)
 	@echo "Generating build configuration..."
 	@printf 'BUILD = %s\n' "$(BUILD)" > $@
-	@printf 'BACKENDS = %s\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
+	@printf 'BACKENDS = "%s"\n' "$(sort $(REQUESTED_BACKENDS))" >> $@
 	@printf 'CPU_ARCH_OPT = %s\n' "$(CPU_ARCH_OPT)" >> $@
 	@printf 'TSAN = %s\n' "$(if $(filter 1,$(TSAN)),1,0)" >> $@
 	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
@@ -380,11 +424,18 @@ $(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) | $(ENGINE)
 endif
 
 ifneq ($(HAS_VULKAN),)
-# No weak-symbol overrides here, so LTO would only grow the binary.
 $(VK_BACKEND): $(VK_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lvulkan -o $@
+	$(SPLIT_DEBUG)
+endif
+
+ifneq ($(HAS_OPENGL),)
+$(GL_BACKEND): $(GL_BACKEND_OBJS) | $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) -shared $(BACKEND_CFLAGS) $(GL_BACKEND_OBJS) \
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lEGL -lGLESv2 -lgbm -o $@
 	$(SPLIT_DEBUG)
 endif
 
