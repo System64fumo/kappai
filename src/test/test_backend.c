@@ -7,25 +7,26 @@
 static float *ref_softmax_attn(const float *q, const float *k, const float *v, int n_heads, int kvh,
 							   int hd, int t0, int n_pos, float scale);
 
-static void test_op_matmul(backend *ref, backend *tgt, const qtype_info *qt, int n, int k) {
+static void test_op_matmul(backend *ref, backend *tgt, op_family fam, const qtype_info *qt, int n,
+						   int k) {
 	char label[128];
 	if (!tgt->matmul || !tgt->buffer_alloc_weight) {
 		snprintf(label, sizeof(label), "%s matmul N=%d K=%d (%s)", qt->name, n, k, tgt->name);
-		record_result(OPFAM_MATMUL, label, V_SKIP, "backend has no native matmul");
+		record_result(fam, label, V_SKIP, "backend has no native matmul");
 		return;
 	}
 	if (k % qt->block != 0)
 		return;
 	if (tgt->matmul_type_native && !tgt->matmul_type_native(tgt, qt->type)) {
 		snprintf(label, sizeof(label), "%s matmul N=%d K=%d (%s)", qt->name, n, k, tgt->name);
-		record_result(OPFAM_MATMUL, label, V_SKIP, "missing native implementation");
+		record_result(fam, label, V_SKIP, "missing native implementation");
 		return;
 	}
 
 	seed_test_rng((0xA5A5ULL * (qt->type + 1) * 1000003ULL) + ((uint64_t)n * 31) + (uint64_t)k);
 	void *blocks = test_make_weight(ref, qt, n, k, NULL);
 	if (!blocks) {
-		record_result(OPFAM_MATMUL, label, V_SKIP, "reference cannot repack weight");
+		record_result(fam, label, V_SKIP, "reference cannot repack weight");
 		return;
 	}
 
@@ -74,7 +75,7 @@ static void test_op_matmul(backend *ref, backend *tgt, const qtype_info *qt, int
 	verdict v = classify_output("loose", y_ref, y_got, n, s_tgt, detail, sizeof(detail));
 	if (v != V_PASS && v != V_SKIP)
 		compute_debug(y_ref, y_got, n);
-	record_result(OPFAM_MATMUL, label, v, detail);
+	record_result(fam, label, v, detail);
 
 	free(y_ref);
 	free(y_got);
@@ -3510,6 +3511,540 @@ static void print_op_coverage(backend *ref, backend *tgt) {
 			   rows[i].has_tgt ? '+' : '-');
 	}
 }
+#define RS_FAM OPFAM_REAL_SHAPE
+#define RS_DIM 1536
+#define RS_PLE 256
+
+static const uint32_t RS_MATMUL_TYPES[] = {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+										   GGML_TYPE_F32, GGML_TYPE_BF16};
+#define RS_MATMUL_TYPES_N ((int)(sizeof(RS_MATMUL_TYPES) / sizeof(RS_MATMUL_TYPES[0])))
+
+static const int RS_MATMUL_SHAPES[][2] = {
+	{256, 1536},   {512, 1536},	 {2048, 1536}, {4096, 1536}, {8960, 1536},	{6144, 1536},
+	{12288, 1536}, {1536, 2048}, {1536, 4096}, {1536, 6144}, {1536, 12288},
+};
+#define RS_MATMUL_SHAPES_N ((int)(sizeof(RS_MATMUL_SHAPES) / sizeof(RS_MATMUL_SHAPES[0])))
+
+static const int RS_ROW_SPLIT_ROWS[] = {65540, 262148};
+
+static const qtype_info *rs_qtype(uint32_t type) {
+	for (int i = 0; i < QTYPES_N; i++)
+		if (QTYPES[i].type == type)
+			return &QTYPES[i];
+	return NULL;
+}
+
+static buffer rs_scratch(backend *b, const float *src, int n) {
+	buffer buf = {0};
+	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &buf);
+	if (src)
+		b->buffer_write_f32(b, &buf, src, n);
+	return buf;
+}
+
+static buffer rs_weight(backend *b, const qtype_info *qt, const void *blocks, int n, int k) {
+	tensor_desc wd = {.host_data = blocks, .type = qt->type, .n_dims = 2, .dims = {k, n}};
+	buffer		w  = {0};
+	b->buffer_alloc_weight(b, &wd, &w);
+	return w;
+}
+
+static void rs_read(backend *b, const buffer *buf, float *dst, int n) {
+	if (b->synchronize)
+		b->synchronize(b);
+	b->buffer_read_f32(b, buf, dst, n);
+}
+
+static void rs_free(backend *b, buffer **bufs, int n) {
+	for (int i = 0; i < n; i++)
+		b->buffer_free(b, bufs[i]);
+}
+
+static void rs_skip(const char *label, const char *why) {
+	record_result(RS_FAM, label, V_SKIP, why);
+}
+
+static void run_rs_matmul_tests(backend *ref, backend *tgt) {
+	for (int t = 0; t < RS_MATMUL_TYPES_N; t++) {
+		const qtype_info *qt = rs_qtype(RS_MATMUL_TYPES[t]);
+		if (!qt)
+			continue;
+		for (int sh = 0; sh < RS_MATMUL_SHAPES_N; sh++)
+			test_op_matmul(ref, tgt, RS_FAM, qt, RS_MATMUL_SHAPES[sh][0], RS_MATMUL_SHAPES[sh][1]);
+		int k_split = qt->block >= 256 ? 256 : 32;
+		for (int i = 0; i < (int)(sizeof(RS_ROW_SPLIT_ROWS) / sizeof(RS_ROW_SPLIT_ROWS[0])); i++)
+			test_op_matmul(ref, tgt, RS_FAM, qt, RS_ROW_SPLIT_ROWS[i], k_split);
+	}
+}
+
+static status_code rs_embd_fill_rows(backend *b, const qtype_info *qt, const void *blocks,
+									 int vocab, int dim, const int *tokens, int n_rows, float scale,
+									 const float *junk, float *out) {
+	int			n  = n_rows * dim;
+	buffer		w  = rs_weight(b, qt, blocks, vocab, dim);
+	buffer		xs = rs_scratch(b, junk, n);
+	status_code s  = b->scale_inplace(b, &xs, 2.0f, n);
+	for (int row = 0; row < n_rows && s == OK; row++) {
+		buffer xrow =
+			buffer_slice(&xs, (size_t)row * dim * sizeof(float), (size_t)dim * sizeof(float));
+		s = b->embd_lookup(b, &w, qt->type, tokens[row], dim, &xrow);
+	}
+	if (s == OK)
+		s = b->scale_inplace(b, &xs, scale, n);
+	rs_read(b, &xs, out, n);
+	buffer *all[] = {&w, &xs};
+	rs_free(b, all, 2);
+	return s;
+}
+
+static void test_rs_embd_fill_rows(backend *ref, backend *tgt, uint32_t type, int dim, int n_rows,
+								   float scale) {
+	const qtype_info *qt = rs_qtype(type);
+	char			  label[128];
+	snprintf(label, sizeof(label), "embd rows into slices then scale %s dim=%d rows=%d", qt->name,
+			 dim, n_rows);
+	if (!tgt->embd_lookup || !tgt->scale_inplace || dim % qt->block != 0) {
+		rs_skip(label, "backend lacks embd_lookup/scale_inplace");
+		return;
+	}
+	const int vocab = 64;
+	int		  n		= n_rows * dim;
+	seed_test_rng(0xE3BDULL + (uint64_t)type * 131 + (uint64_t)dim);
+	void  *blocks = test_make_weight(ref, qt, vocab, dim, NULL);
+	float *junk	  = xmalloc((size_t)n * sizeof(float));
+	float *y_ref  = xmalloc((size_t)n * sizeof(float));
+	float *y_got  = xmalloc((size_t)n * sizeof(float));
+	int	   tokens[16];
+	fill_random_f32(junk, n, 1.0f);
+	for (int i = 0; i < n_rows; i++)
+		tokens[i] = (int)(next_u32() % (uint32_t)vocab);
+	rs_embd_fill_rows(ref, qt, blocks, vocab, dim, tokens, n_rows, scale, junk, y_ref);
+	status_code s =
+		rs_embd_fill_rows(tgt, qt, blocks, vocab, dim, tokens, n_rows, scale, junk, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, n, s);
+	free(blocks);
+	free(junk);
+	free(y_ref);
+	free(y_got);
+}
+
+static void test_rs_ffn_inplace(backend *ref, backend *tgt, int n, int activation) {
+	char label[128];
+	snprintf(label, sizeof(label), "ffn_activate_ex in-place gate==out %s N=%d",
+			 activation == 1 ? "GELU" : "SiLU", n);
+	if (!tgt->ffn_activate_ex) {
+		rs_skip(label, "backend has no native ffn_activate_ex");
+		return;
+	}
+	float *g	 = xmalloc((size_t)n * sizeof(float));
+	float *u	 = xmalloc((size_t)n * sizeof(float));
+	float *y_ref = xmalloc((size_t)n * sizeof(float));
+	float *y_got = xmalloc((size_t)n * sizeof(float));
+	seed_test_rng(0x1A9ULL + (uint64_t)n * 7 + (uint64_t)activation);
+	fill_random_f32(g, n, 4.0f);
+	fill_random_f32(u, n, 4.0f);
+
+	buffer g_ref = rs_scratch(ref, g, n);
+	buffer u_ref = rs_scratch(ref, u, n);
+	buffer o_ref = rs_scratch(ref, NULL, n);
+	ref->ffn_activate_ex(ref, &g_ref, &u_ref, &o_ref, n, activation);
+	rs_read(ref, &o_ref, y_ref, n);
+
+	buffer		g_tgt = rs_scratch(tgt, g, n);
+	buffer		u_tgt = rs_scratch(tgt, u, n);
+	status_code s	  = tgt->ffn_activate_ex(tgt, &g_tgt, &u_tgt, &g_tgt, n, activation);
+	rs_read(tgt, &g_tgt, y_got, n);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, n, s);
+
+	buffer *rb[] = {&g_ref, &u_ref, &o_ref};
+	buffer *tb[] = {&g_tgt, &u_tgt};
+	rs_free(ref, rb, 3);
+	rs_free(tgt, tb, 2);
+	free(g);
+	free(u);
+	free(y_ref);
+	free(y_got);
+}
+
+static status_code rs_ple_chain(backend *b, const qtype_info *qt, const void *gate_blocks,
+								const void *proj_blocks, const float *norm_w, const float *x,
+								const float *slice, float *out) {
+	buffer gate_w	= rs_weight(b, qt, gate_blocks, RS_PLE, RS_DIM);
+	buffer proj_w	= rs_weight(b, qt, proj_blocks, RS_DIM, RS_PLE);
+	buffer xb		= rs_scratch(b, x, RS_DIM);
+	buffer slice_b	= rs_scratch(b, slice, RS_PLE);
+	buffer inp		= rs_scratch(b, NULL, RS_PLE);
+	buffer proj_out = rs_scratch(b, NULL, RS_DIM);
+	buffer norm_b	= rs_scratch(b, norm_w, RS_DIM);
+
+	status_code s = b->matmul(b, &gate_w, qt->type, &xb, &inp, RS_PLE, RS_DIM);
+	if (s == OK)
+		s = b->ffn_activate_ex(b, &inp, &slice_b, &inp, RS_PLE, 1);
+	if (s == OK)
+		s = b->matmul(b, &proj_w, qt->type, &inp, &proj_out, RS_DIM, RS_PLE);
+	if (s == OK)
+		s = b->rmsnorm_add(b, &proj_out, &norm_b, &xb, &xb, RS_DIM, 1e-6f, 0.37f);
+	rs_read(b, &xb, out, RS_DIM);
+	buffer *all[] = {&gate_w, &proj_w, &xb, &slice_b, &inp, &proj_out, &norm_b};
+	rs_free(b, all, 7);
+	return s;
+}
+
+static void test_rs_ple_chain(backend *ref, backend *tgt) {
+	const char label[] = "ple inject chain f32 gate/proj + in-place GELU + rmsnorm_add scale";
+	if (!tgt->matmul || !tgt->ffn_activate_ex || !tgt->rmsnorm_add ||
+		!backend_has_cap(tgt, BCAP_RMSNORM_ADD)) {
+		rs_skip(label, "backend lacks matmul/ffn_activate_ex/rmsnorm_add");
+		return;
+	}
+	const qtype_info *qt = rs_qtype(GGML_TYPE_F32);
+	seed_test_rng(0x9133ULL);
+	void  *gate_blocks = test_make_weight(ref, qt, RS_PLE, RS_DIM, NULL);
+	void  *proj_blocks = test_make_weight(ref, qt, RS_DIM, RS_PLE, NULL);
+	float *norm_w	   = xmalloc(RS_DIM * sizeof(float));
+	float *x		   = xmalloc(RS_DIM * sizeof(float));
+	float *slice	   = xmalloc(RS_PLE * sizeof(float));
+	float *y_ref	   = xmalloc(RS_DIM * sizeof(float));
+	float *y_got	   = xmalloc(RS_DIM * sizeof(float));
+	fill_random_f32(norm_w, RS_DIM, 1.0f);
+	fill_random_f32(x, RS_DIM, 1.0f);
+	fill_random_f32(slice, RS_PLE, 1.0f);
+	rs_ple_chain(ref, qt, gate_blocks, proj_blocks, norm_w, x, slice, y_ref);
+	status_code s = rs_ple_chain(tgt, qt, gate_blocks, proj_blocks, norm_w, x, slice, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, RS_DIM, s);
+	free(gate_blocks);
+	free(proj_blocks);
+	free(norm_w);
+	free(x);
+	free(slice);
+	free(y_ref);
+	free(y_got);
+}
+
+static status_code rs_ffn_chain(backend *b, const qtype_info *qt, const void *gate_blocks,
+								const void *up_blocks, const void *down_blocks, int inter, int m,
+								const float *x, float *out) {
+	size_t inter_bytes = (size_t)inter * m * sizeof(float);
+	buffer gate_w	   = rs_weight(b, qt, gate_blocks, inter, RS_DIM);
+	buffer up_w		   = rs_weight(b, qt, up_blocks, inter, RS_DIM);
+	buffer down_w	   = rs_weight(b, qt, down_blocks, RS_DIM, inter);
+	buffer xb		   = rs_scratch(b, x, m * RS_DIM);
+	buffer fused	   = rs_scratch(b, NULL, 2 * inter * m);
+	buffer act		   = rs_scratch(b, NULL, inter * m);
+	buffer y		   = rs_scratch(b, NULL, RS_DIM * m);
+	buffer gate		   = buffer_slice(&fused, 0, inter_bytes);
+	buffer up		   = buffer_slice(&fused, inter_bytes, inter_bytes);
+
+	status_code s = OK;
+	if (m > 1) {
+		s = b->matmul_batch(b, &gate_w, qt->type, &xb, &gate, inter, RS_DIM, m);
+		if (s == OK)
+			s = b->matmul_batch(b, &up_w, qt->type, &xb, &up, inter, RS_DIM, m);
+		if (s == OK)
+			s = b->ffn_activate_batch(b, &gate, &up, &act, inter, 1, m);
+		if (s == OK)
+			s = b->matmul_batch(b, &down_w, qt->type, &act, &y, RS_DIM, inter, m);
+	} else {
+		if (b->matmul_multi && backend_has_cap(b, BCAP_MULTI_MATMUL)) {
+			const buffer *ws[2]	   = {&gate_w, &up_w};
+			uint32_t	  types[2] = {qt->type, qt->type};
+			buffer		 *ys[2]	   = {&gate, &up};
+			int			  ns[2]	   = {inter, inter};
+			s					   = b->matmul_multi(b, ws, types, &xb, ys, ns, RS_DIM, 2);
+		} else {
+			s = b->matmul(b, &gate_w, qt->type, &xb, &gate, inter, RS_DIM);
+			if (s == OK)
+				s = b->matmul(b, &up_w, qt->type, &xb, &up, inter, RS_DIM);
+		}
+		if (s == OK)
+			s = b->ffn_activate_ex(b, &gate, &up, &act, inter, 1);
+		if (s == OK)
+			s = b->matmul(b, &down_w, qt->type, &act, &y, RS_DIM, inter);
+	}
+	rs_read(b, &y, out, RS_DIM * m);
+	buffer *all[] = {&gate_w, &up_w, &down_w, &xb, &fused, &act, &y};
+	rs_free(b, all, 7);
+	return s;
+}
+
+static void test_rs_ffn_chain(backend *ref, backend *tgt, int inter, int m) {
+	char label[128];
+	snprintf(label, sizeof(label),
+			 "ffn chain iq4_nl gate/up fused slot + GELU + down inter=%d m=%d", inter, m);
+	const qtype_info *qt = rs_qtype(GGML_TYPE_IQ4_NL);
+	if (!tgt->matmul || !tgt->ffn_activate_ex ||
+		(m > 1 && (!tgt->matmul_batch || !tgt->ffn_activate_batch)) ||
+		(tgt->matmul_type_native && !tgt->matmul_type_native(tgt, qt->type))) {
+		rs_skip(label, "backend lacks required native ops");
+		return;
+	}
+	seed_test_rng(0xF1F1ULL + (uint64_t)inter * 13 + (uint64_t)m);
+	void  *gate_blocks = test_make_weight(ref, qt, inter, RS_DIM, NULL);
+	void  *up_blocks   = test_make_weight(ref, qt, inter, RS_DIM, NULL);
+	void  *down_blocks = test_make_weight(ref, qt, RS_DIM, inter, NULL);
+	float *x		   = xmalloc((size_t)m * RS_DIM * sizeof(float));
+	float *y_ref	   = xmalloc((size_t)m * RS_DIM * sizeof(float));
+	float *y_got	   = xmalloc((size_t)m * RS_DIM * sizeof(float));
+	fill_random_f32(x, m * RS_DIM, 1.0f);
+	rs_ffn_chain(ref, qt, gate_blocks, up_blocks, down_blocks, inter, m, x, y_ref);
+	status_code s = rs_ffn_chain(tgt, qt, gate_blocks, up_blocks, down_blocks, inter, m, x, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, m * RS_DIM, s);
+	free(gate_blocks);
+	free(up_blocks);
+	free(down_blocks);
+	free(x);
+	free(y_ref);
+	free(y_got);
+}
+
+static status_code rs_qkv(backend *b, int fused, const qtype_info *const qt[3],
+						  const void *const blocks[3], const int n[3], int k, const float *x,
+						  float *out) {
+	buffer		  w[3], y[3];
+	const buffer *wp[3];
+	buffer		 *yp[3];
+	uint32_t	  types[3];
+	for (int i = 0; i < 3; i++) {
+		w[i]	 = rs_weight(b, qt[i], blocks[i], n[i], k);
+		y[i]	 = rs_scratch(b, NULL, n[i]);
+		wp[i]	 = &w[i];
+		yp[i]	 = &y[i];
+		types[i] = qt[i]->type;
+	}
+	buffer		xb = rs_scratch(b, x, k);
+	status_code s  = OK;
+	if (fused)
+		s = b->matmul_multi(b, wp, types, &xb, yp, n, k, 3);
+	for (int i = 0; i < 3 && !fused && s == OK; i++)
+		s = b->matmul(b, &w[i], types[i], &xb, &y[i], n[i], k);
+	int off = 0;
+	for (int i = 0; i < 3; i++) {
+		rs_read(b, &y[i], out + off, n[i]);
+		off += n[i];
+	}
+	for (int i = 0; i < 3; i++) {
+		buffer *pair[] = {&w[i], &y[i]};
+		rs_free(b, pair, 2);
+	}
+	b->buffer_free(b, &xb);
+	return s;
+}
+
+static void test_rs_qkv_multi(backend *ref, backend *tgt, int n_q, int n_kv, int k) {
+	char label[160];
+	snprintf(label, sizeof(label), "matmul_multi q=iq4_nl k=iq4_nl v=q5_K N=%d/%d/%d K=%d", n_q,
+			 n_kv, n_kv, k);
+	const qtype_info *iq = rs_qtype(GGML_TYPE_IQ4_NL);
+	const qtype_info *q5 = rs_qtype(GGML_TYPE_Q5_K);
+	if (!tgt->matmul_multi || !backend_has_cap(tgt, BCAP_MULTI_MATMUL) ||
+		(tgt->matmul_type_native &&
+		 (!tgt->matmul_type_native(tgt, iq->type) || !tgt->matmul_type_native(tgt, q5->type)))) {
+		rs_skip(label, "backend lacks native matmul_multi for these types");
+		return;
+	}
+	const qtype_info *qt[3] = {iq, iq, q5};
+	const int		  n[3]	= {n_q, n_kv, n_kv};
+	int				  total = n_q + 2 * n_kv;
+	seed_test_rng(0x9C7ULL + (uint64_t)n_q * 3 + (uint64_t)k);
+	void *blocks[3];
+	for (int i = 0; i < 3; i++)
+		blocks[i] = test_make_weight(ref, qt[i], n[i], k, NULL);
+	float *x	 = xmalloc((size_t)k * sizeof(float));
+	float *y_ref = xmalloc((size_t)total * sizeof(float));
+	float *y_got = xmalloc((size_t)total * sizeof(float));
+	fill_random_f32(x, k, 1.0f);
+	rs_qkv(ref, 0, qt, (const void *const *)blocks, n, k, x, y_ref);
+	status_code s = rs_qkv(tgt, 1, qt, (const void *const *)blocks, n, k, x, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, total, s);
+	for (int i = 0; i < 3; i++)
+		free(blocks[i]);
+	free(x);
+	free(y_ref);
+	free(y_got);
+}
+
+static status_code rs_unary(backend *b, int softcap, int n, float param, const float *x,
+							float *out) {
+	buffer		buf = rs_scratch(b, x, n);
+	status_code s	= softcap ? b->softcap(b, &buf, param, n) : b->scale_inplace(b, &buf, param, n);
+	rs_read(b, &buf, out, n);
+	b->buffer_free(b, &buf);
+	return s;
+}
+
+static void test_rs_unary(backend *ref, backend *tgt, int softcap, int n, float param,
+						  float magnitude) {
+	char label[128];
+	snprintf(label, sizeof(label), "%s param=%g N=%d", softcap ? "softcap" : "scale_inplace", param,
+			 n);
+	if ((softcap && !tgt->softcap) || (!softcap && !tgt->scale_inplace)) {
+		rs_skip(label, "backend lacks native op");
+		return;
+	}
+	seed_test_rng(0x50F7ULL + (uint64_t)n + (uint64_t)softcap);
+	float *x	 = xmalloc((size_t)n * sizeof(float));
+	float *y_ref = xmalloc((size_t)n * sizeof(float));
+	float *y_got = xmalloc((size_t)n * sizeof(float));
+	fill_random_f32(x, n, magnitude);
+	rs_unary(ref, softcap, n, param, x, y_ref);
+	status_code s = rs_unary(tgt, softcap, n, param, x, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, n, s);
+	free(x);
+	free(y_ref);
+	free(y_got);
+}
+
+static status_code rs_copy_slices(backend *b, const float *dst_init, const float *src_init,
+								  int total, int dst_off, int src_off, int len, float *out) {
+	buffer		dst = rs_scratch(b, dst_init, total);
+	buffer		src = rs_scratch(b, src_init, total);
+	status_code s	= b->scale_inplace(b, &dst, 2.0f, total);
+	if (s == OK)
+		s = b->scale_inplace(b, &src, 3.0f, total);
+	buffer dv = buffer_slice(&dst, (size_t)dst_off * sizeof(float), (size_t)len * sizeof(float));
+	buffer sv = buffer_slice(&src, (size_t)src_off * sizeof(float), (size_t)len * sizeof(float));
+	if (s == OK)
+		s = b->copy_buffer(b, &sv, &dv, len);
+	if (s == OK)
+		s = b->scale_inplace(b, &dst, 0.5f, total);
+	rs_read(b, &dst, out, total);
+	buffer *all[] = {&dst, &src};
+	rs_free(b, all, 2);
+	return s;
+}
+
+static void test_rs_copy_slices(backend *ref, backend *tgt, int total, int dst_off, int src_off,
+								int len) {
+	char label[128];
+	snprintf(label, sizeof(label),
+			 "copy_buffer slice into device-dirty buffer total=%d dst_off=%d src_off=%d len=%d",
+			 total, dst_off, src_off, len);
+	if (!tgt->copy_buffer || !tgt->scale_inplace) {
+		rs_skip(label, "backend lacks copy_buffer/scale_inplace");
+		return;
+	}
+	seed_test_rng(0xC0B7ULL + (uint64_t)total + (uint64_t)dst_off);
+	float *d	 = xmalloc((size_t)total * sizeof(float));
+	float *s	 = xmalloc((size_t)total * sizeof(float));
+	float *y_ref = xmalloc((size_t)total * sizeof(float));
+	float *y_got = xmalloc((size_t)total * sizeof(float));
+	fill_random_f32(d, total, 1.0f);
+	fill_random_f32(s, total, 1.0f);
+	rs_copy_slices(ref, d, s, total, dst_off, src_off, len, y_ref);
+	status_code st = rs_copy_slices(tgt, d, s, total, dst_off, src_off, len, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, total, st);
+	free(d);
+	free(s);
+	free(y_ref);
+	free(y_got);
+}
+
+enum { RS_KV_LAYERS = 2, RS_KV_HEADS_Q = 8, RS_KV_CTX = 64, RS_KV_HD_MAX = 512 };
+static const int RS_KV_HD[RS_KV_LAYERS] = {256, 512};
+
+static status_code rs_kv_mixed(backend *b, int n_kv, int n_steps, const float *kf, const float *vf,
+							   const float *qf, float *out) {
+	int			layer_hd[RS_KV_LAYERS]	= {RS_KV_HD[0], RS_KV_HD[1]};
+	int			layer_kvh[RS_KV_LAYERS] = {n_kv, n_kv};
+	int			host					= backend_has_cap(b, BCAP_IS_HOST);
+	kv_desc		kvd						= {.n_layers		 = RS_KV_LAYERS,
+										   .n_kv_layers		 = RS_KV_LAYERS,
+										   .n_kv_heads		 = n_kv,
+										   .head_dim		 = RS_KV_HD_MAX,
+										   .n_ctx			 = RS_KV_CTX,
+										   .kv_quant		 = KV_QUANT_F16,
+										   .layer_head_dim	 = host ? layer_hd : NULL,
+										   .layer_n_kv_heads = host ? layer_kvh : NULL};
+	buffer		kc = {0}, vc = {0};
+	status_code s	   = b->kv_alloc(b, &kvd, &kc, &vc);
+	int			kv_row = n_kv * RS_KV_HD_MAX;
+	int			q_row  = RS_KV_HEADS_Q * RS_KV_HD_MAX;
+	buffer		ki	   = rs_scratch(b, NULL, kv_row);
+	buffer		vi	   = rs_scratch(b, NULL, kv_row);
+	buffer		qb	   = rs_scratch(b, NULL, q_row);
+	buffer		ob	   = rs_scratch(b, NULL, q_row);
+	for (int p = 0; p < n_steps && s == OK; p++) {
+		for (int l = 0; l < RS_KV_LAYERS && s == OK; l++) {
+			int	   hd  = RS_KV_HD[l];
+			size_t row = (size_t)p * RS_KV_LAYERS + l;
+			b->buffer_write_f32(b, &ki, kf + row * kv_row, n_kv * hd);
+			b->buffer_write_f32(b, &vi, vf + row * kv_row, n_kv * hd);
+			b->buffer_write_f32(b, &qb, qf + row * q_row, RS_KV_HEADS_Q * hd);
+			s = b->kv_put(b, &kc, &vc, l, p, &ki, &vi, n_kv, hd, RS_KV_CTX, n_kv);
+			if (s == OK && b->synchronize)
+				b->synchronize(b);
+			if (s == OK)
+				s = b->attention(b, &qb, &kc, &vc, &ob, l, p, RS_KV_HEADS_Q, n_kv, hd, RS_KV_CTX, 1,
+								 1.0f, n_kv);
+			rs_read(b, &ob, out + row * q_row, RS_KV_HEADS_Q * hd);
+		}
+	}
+	buffer *all[] = {&ki, &vi, &qb, &ob};
+	rs_free(b, all, 4);
+	b->kv_free(b, &kc, &vc);
+	return s;
+}
+
+static void test_rs_kv_mixed(backend *ref, backend *tgt, int n_kv) {
+	char label[128];
+	snprintf(label, sizeof(label), "kv_put+attention mixed head_dim 256/512 layers n_kv=%d", n_kv);
+	if (!tgt->kv_alloc || !tgt->kv_put || !tgt->attention) {
+		rs_skip(label, "backend lacks kv_alloc/kv_put/attention");
+		return;
+	}
+	const int n_steps = 6;
+	size_t	  rows	  = (size_t)n_steps * RS_KV_LAYERS;
+	size_t	  kv_n	  = rows * n_kv * RS_KV_HD_MAX;
+	size_t	  q_n	  = rows * RS_KV_HEADS_Q * RS_KV_HD_MAX;
+	seed_test_rng(0x4E55ULL + (uint64_t)n_kv);
+	float *kf	 = xmalloc(kv_n * sizeof(float));
+	float *vf	 = xmalloc(kv_n * sizeof(float));
+	float *qf	 = xmalloc(q_n * sizeof(float));
+	float *y_ref = xcalloc(q_n, sizeof(float));
+	float *y_got = xcalloc(q_n, sizeof(float));
+	fill_random_f32(kf, (int)kv_n, 1.0f);
+	fill_random_f32(vf, (int)kv_n, 1.0f);
+	fill_random_f32(qf, (int)q_n, 1.0f);
+	rs_kv_mixed(ref, n_kv, n_steps, kf, vf, qf, y_ref);
+	status_code s = rs_kv_mixed(tgt, n_kv, n_steps, kf, vf, qf, y_got);
+	test_parity_compare_status(RS_FAM, label, y_ref, y_got, (int)q_n, s);
+	free(kf);
+	free(vf);
+	free(qf);
+	free(y_ref);
+	free(y_got);
+}
+
+static void run_real_shape_tests(backend *ref, backend *tgt) {
+	run_rs_matmul_tests(ref, tgt);
+
+	test_rs_embd_fill_rows(ref, tgt, GGML_TYPE_Q4_K, 1536, 8, sqrtf(1536.0f));
+	test_rs_embd_fill_rows(ref, tgt, GGML_TYPE_Q5_K, 8960, 4, 16.0f);
+	test_rs_embd_fill_rows(ref, tgt, GGML_TYPE_IQ4_NL, 1536, 3, 1.0f);
+
+	test_rs_ffn_inplace(ref, tgt, 256, 1);
+	test_rs_ffn_inplace(ref, tgt, 12288, 1);
+	test_rs_ple_chain(ref, tgt);
+
+	test_rs_ffn_chain(ref, tgt, 6144, 1);
+	test_rs_ffn_chain(ref, tgt, 12288, 1);
+	test_rs_ffn_chain(ref, tgt, 6144, 8);
+	test_rs_ffn_chain(ref, tgt, 12288, 8);
+
+	test_rs_qkv_multi(ref, tgt, 2048, 256, RS_DIM);
+	test_rs_qkv_multi(ref, tgt, 4096, 512, RS_DIM);
+
+	test_rs_unary(ref, tgt, 1, 262144, 30.0f, 300.0f);
+	test_rs_unary(ref, tgt, 1, 4096, 30.0f, 300.0f);
+	test_rs_unary(ref, tgt, 0, 8 * RS_DIM, sqrtf(1536.0f), 1.0f);
+
+	test_rs_copy_slices(ref, tgt, 4096, 1024, 2048, 1024);
+	test_rs_copy_slices(ref, tgt, 8960, 256, 0, 256);
+
+	test_rs_kv_mixed(ref, tgt, 1);
+	test_rs_kv_mixed(ref, tgt, 2);
+}
+
 void run_per_op_tests(backend *ref, backend *tgt) {
 	printf("\n========================================\n");
 	printf("Per-op validation: %s  vs  %s (reference)\n", tgt->name, ref->name);
@@ -3523,17 +4058,20 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		for (int qi = 0; qi < QTYPES_N; qi++) {
 			if (K % QTYPES[qi].block != 0)
 				continue;
-			test_op_matmul(ref, tgt, &QTYPES[qi], N, K);
+			test_op_matmul(ref, tgt, OPFAM_MATMUL, &QTYPES[qi], N, K);
 		}
 	}
 	flush_family(OPFAM_MATMUL);
 
 	for (int qi = 0; qi < QTYPES_N; qi++)
 		test_op_embd_lookup(ref, tgt, &QTYPES[qi], QTYPES[qi].block * 4, 32);
+	test_op_embd_lookup(ref, tgt, rs_qtype(GGML_TYPE_Q4_K), 1536, 64);
+	test_op_embd_lookup(ref, tgt, rs_qtype(GGML_TYPE_Q5_K), 8960, 64);
 	test_op_embd_lookup_f32(ref, tgt);
 	flush_family(OPFAM_EMBD_LOOKUP);
 
 	test_op_rmsnorm(ref, tgt, 256);
+	test_op_rmsnorm(ref, tgt, 1536);
 	test_op_rmsnorm(ref, tgt, 2048);
 	test_op_rmsnorm(ref, tgt, 4096);
 	flush_family(OPFAM_RMSNORM);
@@ -3541,10 +4079,16 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rmsnorm_per_head(ref, tgt, 8, 64);
 	test_op_rmsnorm_per_head(ref, tgt, 4, 64);
 	test_op_rmsnorm_per_head(ref, tgt, 32, 128);
+	test_op_rmsnorm_per_head(ref, tgt, 8, 256);
+	test_op_rmsnorm_per_head(ref, tgt, 8, 512);
+	test_op_rmsnorm_per_head(ref, tgt, 1, 256);
+	test_op_rmsnorm_per_head(ref, tgt, 1, 512);
 	flush_family(OPFAM_RMSNORM_PER_HEAD);
 
 	test_op_rmsnorm_noweight(ref, tgt, 64);
 	test_op_rmsnorm_noweight(ref, tgt, 128);
+	test_op_rmsnorm_noweight(ref, tgt, 256);
+	test_op_rmsnorm_noweight(ref, tgt, 512);
 	flush_family(OPFAM_RMSNORM_NOWEIGHT);
 
 	test_op_rope(ref, tgt, 16, 64, 0);
@@ -3559,17 +4103,25 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rope_ext(ref, tgt, 8, 64, 0, 1);
 	test_op_rope_ext(ref, tgt, 8, 64, 127, 1);
 	test_op_rope_ext(ref, tgt, 32, 128, 511, 1);
+	test_op_rope_ext(ref, tgt, 8, 512, 0, 1);
+	test_op_rope_ext(ref, tgt, 8, 512, 777, 1);
+	test_op_rope_ext(ref, tgt, 1, 512, 300, 1);
+	test_op_rope_ext(ref, tgt, 8, 256, 300, 0);
+	test_op_rope_ext(ref, tgt, 1, 256, 1000, 0);
 	flush_family(OPFAM_ROPE_EXT);
 
 	test_op_add_inplace(ref, tgt, 256);
+	test_op_add_inplace(ref, tgt, 1536);
 	test_op_add_inplace(ref, tgt, 4096);
 	flush_family(OPFAM_ADD_INPLACE);
 
 	test_op_ple_combine(ref, tgt, 256);
 	test_op_ple_combine(ref, tgt, 4096);
+	test_op_ple_combine(ref, tgt, 8960);
 	flush_family(OPFAM_PLE_COMBINE);
 
 	test_op_rmsnorm_add(ref, tgt, 256);
+	test_op_rmsnorm_add(ref, tgt, 1536);
 	test_op_rmsnorm_add(ref, tgt, 4096);
 	flush_family(OPFAM_RMSNORM_ADD);
 
@@ -3584,6 +4136,8 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_ffn_activate_ex(ref, tgt, 4096, 1);
 	test_op_ffn_activate_ex(ref, tgt, 256, 0);
 	test_op_ffn_activate_ex(ref, tgt, 4096, 0);
+	test_op_ffn_activate_ex(ref, tgt, 6144, 1);
+	test_op_ffn_activate_ex(ref, tgt, 12288, 1);
 	flush_family(OPFAM_FFN_ACTIVATE_EX);
 
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 0, 0);
@@ -3621,6 +4175,10 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_attention_swa(ref, tgt, 8, 4, 64, 1024, 511, 128, 1);
 	test_op_attention_swa(ref, tgt, 8, 8, 64, 1024, 20, 32, 0);
 	test_op_attention_swa(ref, tgt, 32, 8, 128, 2048, 1000, 512, 1);
+	test_op_attention_swa(ref, tgt, 8, 1, 256, 2048, 511, 512, 1);
+	test_op_attention_swa(ref, tgt, 8, 1, 256, 2048, 512, 512, 1);
+	test_op_attention_swa(ref, tgt, 8, 1, 256, 2048, 1000, 512, 1);
+	test_op_attention_swa(ref, tgt, 8, 1, 256, 2048, 1000, 512, 0);
 	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 1000, 0, 0, 0, KV_QUANT_F16, NULL, NULL,
 								1);
 	test_op_attention_swa_slide(ref, 4, 2, 64, 192, 160, 32, 0, 0, 0, KV_QUANT_F16, NULL, NULL, 1);
@@ -3660,6 +4218,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_argmax(ref, tgt, 256);
 	test_op_argmax(ref, tgt, 4096);
 	test_op_argmax(ref, tgt, 32000);
+	test_op_argmax(ref, tgt, 262144);
 	flush_family(OPFAM_ARGMAX);
 
 	for (int qi = 0; qi < QTYPES_N; qi++) {
@@ -3704,11 +4263,20 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 			{8, 4, 64, 256, 60, 2},	 {8, 4, 64, 256, 60, 10},	{8, 2, 128, 512, 100, 8},
 			{8, 4, 64, 256, 0, 16},	 {8, 4, 64, 64, 0, 16},		{8, 2, 128, 256, 0, 16},
 			{8, 1, 256, 256, 0, 16}, {32, 8, 128, 512, 100, 8}, {8, 4, 64, 256, 40, 16},
+			{8, 1, 512, 256, 0, 16}, {8, 1, 512, 256, 100, 8},	{8, 1, 256, 600, 520, 8},
 		};
 		for (int i = 0; i < (int)(sizeof(bat_sh) / sizeof(bat_sh[0])); i++)
 			for (int fl = 0; fl < 2; fl++)
 				test_batch_attention_parity(ref, tgt, bat_sh[i][0], bat_sh[i][1], bat_sh[i][2],
 											bat_sh[i][3], bat_sh[i][4], bat_sh[i][5], fl);
+	}
+	for (int t = 0; t < RS_MATMUL_TYPES_N; t++) {
+		const qtype_info *qt = rs_qtype(RS_MATMUL_TYPES[t]);
+		if (!qt)
+			continue;
+		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 8);
+		test_batch_matmul_parity(ref, tgt, qt, 1536, 6144, 8);
+		test_batch_matmul_parity(ref, tgt, qt, 1536, 12288, 8);
 	}
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);
@@ -3721,4 +4289,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_edge_ffn_activate_extremes(ref, tgt);
 	test_edge_rope_identity_table(ref, tgt);
 	flush_family(OPFAM_EDGE_CASE);
+
+	run_real_shape_tests(ref, tgt);
+	flush_family(OPFAM_REAL_SHAPE);
 }

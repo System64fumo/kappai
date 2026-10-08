@@ -2,25 +2,17 @@
 precision highp float;
 precision highp int;
 
-layout(local_size_x = 32) in;
+layout(local_size_x = 64) in;
 
-layout(std430, binding = 0) readonly buffer WBuf {
-	uint w[];
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
 };
-layout(std430, binding = 1) readonly buffer XQBuf {
+layout(std430, binding = 1) writeonly buffer XQBuf {
 	uint xq[];
 };
-layout(std430, binding = 2) buffer YBuf {
-	float y[];
-};
-layout(std430, binding = 3) readonly buffer ResBuf {
-	float res[];
-};
-layout(location = 0) uniform int u_n;
-layout(location = 1) uniform int u_k_blocks;
-layout(location = 2) uniform int u_add_residual;
-
-shared float s_acc[32];
+layout(location = 0) uniform int u_k_blocks;
+layout(location = 1) uniform int u_k;
+layout(location = 2) uniform int u_row_words;
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -40,15 +32,6 @@ float round_f16(float f) {
 	uint mant_bits = bits & 0x0FFFu;
 	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
 	return h2f(hbits);
-}
-
-int xqv(uint bb, int j) {
-	return bitfieldExtract(int(xq[bb + uint(j >> 2)]), (j & 3) * 8, 8);
-}
-
-uint rb(uint off) {
-	uint wd = w[off >> 2u];
-	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
 }
 
 uint f32_bits(float f) {
@@ -106,45 +89,32 @@ int round_away(float f) {
 	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
 	return (f < 0.0) ? -int(r) : int(r);
 }
-
 void main(void) {
-	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
-	uint tid   = gl_LocalInvocationID.x;
-	bool valid = int(row) < u_n;
-
-	float acc = 0.0;
-	if (valid) {
-		uint row_off = row * uint(u_k_blocks) * 34u;
-		for (int bi = int(tid); bi < u_k_blocks; bi += 32) {
-			uint  bo   = row_off + uint(bi) * 34u;
-			int	  xb   = bi * 32;
-			uint  xbq  = uint(bi) * 12u;
-			float d	   = uintBitsToFloat(xq[xbq + 9u]);
-			float dxq  = uintBitsToFloat(xq[xbq + 8u]);
-			float wd   = h2f(rb(bo) | (rb(bo + 1u) << 8u));
-			int	  sumi = 0;
-			for (int j = 0; j < 32; j++) {
-				uint bv = rb(bo + 2u + uint(j));
-				int	 wq = int(bv ^ 128u) - 128;
-				int	 v	= xqv(xbq, j);
-				sumi += wq * v;
-			}
-			acc += wd * dxq * float(sumi);
+	int bi	= int(gl_GlobalInvocationID.x);
+	int row = int(gl_WorkGroupID.y);
+	if (bi >= u_k_blocks)
+		return;
+	int	  xb   = row * u_k + bi * 32;
+	float amax = 0.0;
+	for (int j = 0; j < 32; j++) {
+		float ax = abs(x[xb + j]);
+		if (ax > amax)
+			amax = ax;
+	}
+	uint  db   = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
+	float d	   = bits_f32(db);
+	float id   = (db != 0u) ? div_r(1.0, d) : 0.0;
+	float dxq  = round_f16(d);
+	uint  base = uint(row * u_row_words + bi * 12);
+	for (int w = 0; w < 8; w++) {
+		uint word = 0u;
+		for (int b = 0; b < 4; b++) {
+			int v = round_away(x[xb + w * 4 + b] * id);
+			v	  = v > 127 ? 127 : (v < -127 ? -127 : v);
+			word |= (uint(v) & 0xFFu) << uint(b * 8);
 		}
+		xq[base + uint(w)] = word;
 	}
-	s_acc[tid] = acc;
-	barrier();
-	for (uint s = 16u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			s_acc[tid] += s_acc[tid + s];
-		barrier();
-	}
-	if (valid && tid == 0u) {
-		if (u_add_residual == 1)
-			y[row] = s_acc[0] + res[row];
-		else if (u_add_residual == 2)
-			y[row] += s_acc[0];
-		else
-			y[row] = s_acc[0];
-	}
+	xq[base + 8u] = f32_bits(dxq);
+	xq[base + 9u] = f32_bits(d);
 }

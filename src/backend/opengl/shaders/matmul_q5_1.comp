@@ -7,8 +7,8 @@ layout(local_size_x = 32) in;
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
-layout(std430, binding = 1) readonly buffer XBuf {
-	float x[];
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uint xq[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -40,6 +40,10 @@ float round_f16(float f) {
 	uint mant_bits = bits & 0x0FFFu;
 	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
 	return h2f(hbits);
+}
+
+int xqv(uint bb, int j) {
+	return bitfieldExtract(int(xq[bb + uint(j >> 2)]), (j & 3) * 8, 8);
 }
 
 uint rb(uint off) {
@@ -91,6 +95,10 @@ uint exact_div(uint nb, uint db) {
 	return (uint(fe) << 23u) | M24;
 }
 
+float div_r(float a, float b) {
+	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
+}
+
 int round_away(float f) {
 	float af = abs(f);
 	float tr = trunc(af);
@@ -108,18 +116,11 @@ void main(void) {
 	if (valid) {
 		uint row_off = row * uint(u_k_blocks) * 24u;
 		for (int bi = int(tid); bi < u_k_blocks; bi += 32) {
-			uint  bo   = row_off + uint(bi) * 24u;
-			int	  xb   = bi * 32;
-			float amax = 0.0;
-			for (int j = 0; j < 32; j++) {
-				float ax = abs(x[xb + j]);
-				if (ax > amax)
-					amax = ax;
-			}
-			uint  db  = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
-			float d	  = bits_f32(db);
-			float id  = (db != 0u) ? 1.0 / d : 0.0;
-			float dxq = round_f16(d);
+			uint  bo  = row_off + uint(bi) * 24u;
+			int	  xb  = bi * 32;
+			uint  xbq = uint(bi) * 12u;
+			float d	  = uintBitsToFloat(xq[xbq + 9u]);
+			float dxq = uintBitsToFloat(xq[xbq + 8u]);
 			float wd  = h2f(rb(bo) | (rb(bo + 1u) << 8u));
 			float md  = h2f(rb(bo + 2u) | (rb(bo + 3u) << 8u));
 			uint  qh =
@@ -131,10 +132,8 @@ void main(void) {
 				uint bv = rb(qo + uint(j));
 				int	 lo = int((bv & 0xFu) | (((qh >> uint(j)) & 1u) << 4u));
 				int	 hi = int((bv >> 4) | (((qh >> uint(j + 16)) & 1u) << 4u));
-				int	 v0 = round_away(x[xb + j] * id);
-				v0		= v0 > 127 ? 127 : (v0 < -127 ? -127 : v0);
-				int v1	= round_away(x[xb + j + 16] * id);
-				v1		= v1 > 127 ? 127 : (v1 < -127 ? -127 : v1);
+				int	 v0 = xqv(xbq, j);
+				int	 v1 = xqv(xbq, j + 16);
 				sumv += v0 + v1;
 				sumi += lo * v0 + hi * v1;
 			}

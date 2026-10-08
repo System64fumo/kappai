@@ -82,6 +82,10 @@ uint exact_div(uint nb, uint db) {
 	return (uint(fe) << 23u) | M24;
 }
 
+float div_r(float a, float b) {
+	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
+}
+
 int round_away(float f) {
 	float af = abs(f);
 	float tr = trunc(af);
@@ -131,8 +135,8 @@ void main(void) {
 				}
 				if (amax != 0.0) {
 					uint  bo	 = row_off + uint(bi) * 210u;
-					float iscale = -127.0 / maxv;
-					float dxq	 = 1.0 / iscale;
+					float iscale = div_r(-127.0, maxv);
+					float dxq	 = div_r(1.0, iscale);
 					float dw	 = h2f(rb(bo + 208u) | (rb(bo + 209u) << 8u));
 					int	  sumi	 = 0;
 					for (int sub = ch * 4; sub < ch * 4 + 4; sub++) {
