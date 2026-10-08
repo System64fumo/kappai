@@ -502,6 +502,7 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 
 	if (initial_data && keep_host_mirror)
 		memcpy(b->host_mirror, initial_data, size);
+	b->host_dirty = (keep_host_mirror && !initial_data) ? 1 : 0;
 
 	gl_buf_register(p, b);
 	p->device_local_allocated += size;
@@ -534,6 +535,9 @@ static void gl_buf_sync_to_device(gl_buf *b) {
 		b->host_dirty = 0;
 		return;
 	}
+
+	if (!b->host_dirty)
+		return;
 
 	if (gl_ensure_context(b->owner) != OK)
 		return;
@@ -656,7 +660,6 @@ static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int
 		return ERR_INTERNAL;
 	}
 	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
-	glFlush();
 	return OK;
 }
 
@@ -892,7 +895,7 @@ static status_code gl_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 		out->owner		= self;
 		return OK;
 	}
-	b = gl_buf_alloc(p, size, GL_DYNAMIC_DRAW, NULL);
+	b = gl_buf_alloc(p, size, GL_DYNAMIC_COPY, NULL);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
 	out->handle	  = b->host_mirror;
@@ -1003,8 +1006,6 @@ static void gl_synchronize(backend *self) {
 		p->device_lost = 1;
 		return;
 	}
-	for (int i = 0; i < p->all_bufs_count; i++)
-		gl_buf_sync_to_host(p->all_bufs[i]);
 }
 
 static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {

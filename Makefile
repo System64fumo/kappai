@@ -23,9 +23,8 @@ ifeq ($(filter $(BUILD),$(VALID_BUILDS)),)
 endif
 
 AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
-# config.mk quotes BACKENDS so multi-backend values survive re-reading; drop the quotes.
 BACKENDS_TOKENS := $(subst ",,$(BACKENDS))
-REQUESTED_BACKENDS := $(strip $(subst $(,), ,$(BACKENDS_TOKENS)))
+REQUESTED_BACKENDS := $(strip $(shell echo '$(BACKENDS_TOKENS)' | tr ',' ' '))
 UNKNOWN_BACKENDS := $(filter-out $(AVAILABLE_BACKENDS),$(REQUESTED_BACKENDS))
 ifneq ($(UNKNOWN_BACKENDS),)
   $(error Unknown backend(s): $(UNKNOWN_BACKENDS). Available backends: $(AVAILABLE_BACKENDS))
@@ -184,8 +183,6 @@ ifneq ($(HAS_OPENGL),)
   BACKEND_OBJS += $(GL_BACKEND_OBJS)
 endif
 
-# Both backends generate a shaders_embedded.h with different symbol shapes, so each
-# backend's objects must be compiled against its own include path, not a merged one.
 ifneq ($(HAS_VULKAN),)
   BACKEND_CFLAGS_VULKAN := $(BACKEND_CFLAGS) $(VK_BACKEND_INCLUDES)
   $(VK_BACKEND_OBJS): BACKEND_CFLAGS := $(BACKEND_CFLAGS_VULKAN)
@@ -218,8 +215,6 @@ MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 
 SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(ENGINE) $(BACKEND_LIBS)
 
-# The engine is resolved at load time via DT_NEEDED + RUNPATH, so this only has to
-# make the link succeed -- it must stay in LDFLAGS to keep codegen flags in sync.
 ENGINE_LDFLAGS := -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
 BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS)))
@@ -429,7 +424,6 @@ $(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) | $(ENGINE)
 endif
 
 ifneq ($(HAS_VULKAN),)
-# No weak-symbol overrides here, so LTO would only grow the binary.
 $(VK_BACKEND): $(VK_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \

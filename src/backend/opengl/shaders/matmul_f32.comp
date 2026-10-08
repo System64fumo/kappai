@@ -16,15 +16,8 @@ layout(std430, binding = 3) readonly buffer ResBuf {
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k;
 layout(location = 2) uniform int u_add_residual;
+
 shared float s_acc[4][32];
-void		 store_row(uint idx, float acc) {
-	if (u_add_residual == 1)
-		y[idx] = acc + res[idx];
-	else if (u_add_residual == 2)
-		y[idx] += acc;
-	else
-		y[idx] = acc;
-}
 
 void main(void) {
 	uint base_row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * 4u;
@@ -55,23 +48,18 @@ void main(void) {
 	s_acc[2][tid] = acc2.x + acc2.y + acc2.z + acc2.w;
 	s_acc[3][tid] = acc3.x + acc3.y + acc3.z + acc3.w;
 	barrier();
-	for (uint s = 16u; s > 0u; s >>= 1u) {
-		if (tid < s) {
-			s_acc[0][tid] += s_acc[0][tid + s];
-			s_acc[1][tid] += s_acc[1][tid + s];
-			s_acc[2][tid] += s_acc[2][tid + s];
-			s_acc[3][tid] += s_acc[3][tid + s];
+	if (tid < 4u) {
+		float s = 0.0;
+		for (int j = 0; j < 32; j++)
+			s += s_acc[tid][j];
+		uint target = base_row + tid;
+		if (int(target) < u_n) {
+			if (u_add_residual == 1)
+				y[target] = s + res[target];
+			else if (u_add_residual == 2)
+				y[target] += s;
+			else
+				y[target] = s;
 		}
-		barrier();
-	}
-	if (tid == 0u) {
-		if (r0)
-			store_row(base_row + 0u, s_acc[0][0]);
-		if (r1)
-			store_row(base_row + 1u, s_acc[1][0]);
-		if (r2)
-			store_row(base_row + 2u, s_acc[2][0]);
-		if (r3)
-			store_row(base_row + 3u, s_acc[3][0]);
 	}
 }
