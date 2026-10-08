@@ -1,0 +1,200 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[32];
+shared float s_amax[32];
+shared float s_maxv[32];
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+uint rb(uint off) {
+	uint wd = w[off >> 2u];
+	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+void gsm(int j, uint sc_off, out uint sc, out uint mn) {
+	if (j < 4) {
+		sc = rb(sc_off + uint(j)) & 63u;
+		mn = rb(sc_off + uint(j + 4)) & 63u;
+	} else {
+		sc = (rb(sc_off + uint(j + 4)) & 0xFu) | ((rb(sc_off + uint(j - 4)) >> 6) << 4);
+		mn = (rb(sc_off + uint(j + 4)) >> 4) | ((rb(sc_off + uint(j)) >> 6) << 4);
+	}
+}
+
+uint f32_bits(float f) {
+	return floatBitsToUint(f);
+}
+float bits_f32(uint b) {
+	return uintBitsToFloat(b);
+}
+
+uint exact_div(uint nb, uint db) {
+	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
+	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
+	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
+	uint M24 = 0u;
+	uint rem;
+	int	 me;
+	if (Nn >= Dd) {
+		me	= eq;
+		rem = Nn - Dd;
+	} else {
+		me	= eq - 1;
+		rem = (Nn << 1u) - Dd;
+	}
+	for (int i = 0; i < 23; i++) {
+		rem <<= 1u;
+		M24 <<= 1u;
+		if (rem >= Dd) {
+			rem -= Dd;
+			M24 |= 1u;
+		}
+	}
+	uint r2 = rem << 1u;
+	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
+		M24++;
+	if (M24 >= (1u << 23)) {
+		M24 = 0u;
+		me++;
+	}
+	int fe = me + 127;
+	if (fe >= 255)
+		return 0x7F800000u;
+	if (fe <= 0)
+		return 0u;
+	return (uint(fe) << 23u) | M24;
+}
+
+float div_r(float a, float b) {
+	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
+}
+
+int round_away(float f) {
+	float af = abs(f);
+	float tr = trunc(af);
+	float fr = af - tr;
+	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
+	return (f < 0.0) ? -int(r) : int(r);
+}
+
+void main(void) {
+	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint tid   = gl_LocalInvocationID.x;
+	bool valid = int(row) < u_n;
+
+	float acc = 0.0;
+	if (valid) {
+		uint row_off = row * uint(u_k_blocks) * 144u;
+		int	 nch	 = u_k_blocks * 4;
+		int	 iters	 = (nch + 31) / 32;
+		for (int it = 0; it < iters; it++) {
+			int	  c	   = it * 32 + int(tid);
+			int	  bi   = c >> 2;
+			int	  g	   = c & 3;
+			int	  xsb  = bi * 256;
+			int	  xb   = xsb + g * 64;
+			float amax = 0.0;
+			float maxv = 0.0;
+			if (c < nch) {
+				for (int j = 0; j < 64; j++) {
+					float v	 = x[xb + j];
+					float ax = abs(v);
+					if (ax > amax) {
+						amax = ax;
+						maxv = v;
+					}
+				}
+			}
+			s_amax[tid] = amax;
+			s_maxv[tid] = maxv;
+			barrier();
+			if (c < nch) {
+				int t0 = int(tid) & ~3;
+				for (int q = 0; q < 4; q++) {
+					if (s_amax[t0 + q] > amax) {
+						amax = s_amax[t0 + q];
+						maxv = s_maxv[t0 + q];
+					}
+				}
+				if (amax != 0.0) {
+					uint  bo	 = row_off + uint(bi) * 144u;
+					float iscale = div_r(-127.0, maxv);
+					float xd	 = div_r(1.0, iscale);
+					float d		 = h2f(rb(bo) | (rb(bo + 1u) << 8u));
+					float dm	 = h2f(rb(bo + 2u) | (rb(bo + 3u) << 8u));
+					uint  sc_off = bo + 4u;
+					uint  qs_off = bo + 16u;
+					int	  sumi	 = 0;
+					int	  summ	 = 0;
+					uint  sc0, mn0;
+					gsm(2 * g, sc_off, sc0, mn0);
+					uint sc1, mn1;
+					gsm(2 * g + 1, sc_off, sc1, mn1);
+					int dot0 = 0;
+					int dot1 = 0;
+					int bs0	 = 0;
+					int bs1	 = 0;
+					int bs2	 = 0;
+					int bs3	 = 0;
+					for (int l = 0; l < 32; l++) {
+						uint qlb = rb(qs_off + uint(g * 32 + l));
+						int	 v0	 = round_away(iscale * x[xb + l]);
+						v0		 = v0 > 127 ? 127 : (v0 < -127 ? -127 : v0);
+						int v1	 = round_away(iscale * x[xb + l + 32]);
+						v1		 = v1 > 127 ? 127 : (v1 < -127 ? -127 : v1);
+						dot0 += int(qlb & 0xFu) * v0;
+						dot1 += int(qlb >> 4) * v1;
+						if (l < 16) {
+							bs0 += v0;
+							bs2 += v1;
+						} else {
+							bs1 += v0;
+							bs3 += v1;
+						}
+					}
+					sumi = int(sc0) * dot0 + int(sc1) * dot1;
+					summ = int(mn0) * (bs0 + bs1) + int(mn1) * (bs2 + bs3);
+					acc += xd * (d * float(sumi) - dm * float(summ));
+				}
+			}
+			barrier();
+		}
+	}
+	s_acc[tid] = acc;
+	barrier();
+	for (uint s = 16u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_acc[tid] += s_acc[tid + s];
+		barrier();
+	}
+	if (valid && tid == 0u) {
+		if (u_add_residual == 1)
+			y[row] = s_acc[0] + res[row];
+		else if (u_add_residual == 2)
+			y[row] += s_acc[0];
+		else
+			y[row] = s_acc[0];
+	}
+}

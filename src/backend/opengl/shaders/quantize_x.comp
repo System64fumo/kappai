@@ -1,0 +1,120 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) writeonly buffer XQBuf {
+	uint xq[];
+};
+layout(location = 0) uniform int u_k_blocks;
+layout(location = 1) uniform int u_k;
+layout(location = 2) uniform int u_row_words;
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+float round_f16(float f) {
+	float base = abs(f) * 4.0;
+	uint  w	   = floatBitsToUint(f);
+	uint  shl1 = w + w;
+	uint  sign = w & 0x80000000u;
+	uint  bias = shl1 & 0xFF000000u;
+	if (bias < 0x71000000u)
+		bias = 0x71000000u;
+	base		   = uintBitsToFloat((bias >> 1u) + 0x07800000u) + base;
+	uint bits	   = floatBitsToUint(base);
+	uint exp_bits  = (bits >> 13u) & 0x7C00u;
+	uint mant_bits = bits & 0x0FFFu;
+	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
+	return h2f(hbits);
+}
+
+uint f32_bits(float f) {
+	return floatBitsToUint(f);
+}
+float bits_f32(uint b) {
+	return uintBitsToFloat(b);
+}
+
+uint exact_div(uint nb, uint db) {
+	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
+	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
+	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
+	uint M24 = 0u;
+	uint rem;
+	int	 me;
+	if (Nn >= Dd) {
+		me	= eq;
+		rem = Nn - Dd;
+	} else {
+		me	= eq - 1;
+		rem = (Nn << 1u) - Dd;
+	}
+	for (int i = 0; i < 23; i++) {
+		rem <<= 1u;
+		M24 <<= 1u;
+		if (rem >= Dd) {
+			rem -= Dd;
+			M24 |= 1u;
+		}
+	}
+	uint r2 = rem << 1u;
+	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
+		M24++;
+	if (M24 >= (1u << 23)) {
+		M24 = 0u;
+		me++;
+	}
+	int fe = me + 127;
+	if (fe >= 255)
+		return 0x7F800000u;
+	if (fe <= 0)
+		return 0u;
+	return (uint(fe) << 23u) | M24;
+}
+
+float div_r(float a, float b) {
+	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
+}
+
+int round_away(float f) {
+	float af = abs(f);
+	float tr = trunc(af);
+	float fr = af - tr;
+	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
+	return (f < 0.0) ? -int(r) : int(r);
+}
+void main(void) {
+	int bi	= int(gl_GlobalInvocationID.x);
+	int row = int(gl_WorkGroupID.y);
+	if (bi >= u_k_blocks)
+		return;
+	int	  xb   = row * u_k + bi * 32;
+	float amax = 0.0;
+	for (int j = 0; j < 32; j++) {
+		float ax = abs(x[xb + j]);
+		if (ax > amax)
+			amax = ax;
+	}
+	uint  db   = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
+	float d	   = bits_f32(db);
+	float id   = (db != 0u) ? div_r(1.0, d) : 0.0;
+	float dxq  = round_f16(d);
+	uint  base = uint(row * u_row_words + bi * 12);
+	for (int w = 0; w < 8; w++) {
+		uint word = 0u;
+		for (int b = 0; b < 4; b++) {
+			int v = round_away(x[xb + w * 4 + b] * id);
+			v	  = v > 127 ? 127 : (v < -127 ? -127 : v);
+			word |= (uint(v) & 0xFFu) << uint(b * 8);
+		}
+		xq[base + uint(w)] = word;
+	}
+	xq[base + 8u] = f32_bits(dxq);
+	xq[base + 9u] = f32_bits(d);
+}

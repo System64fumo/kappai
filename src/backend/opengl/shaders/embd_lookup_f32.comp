@@ -1,0 +1,19 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer EmbdBuf {
+	float embd[];
+};
+layout(std430, binding = 1) writeonly buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_token;
+layout(location = 1) uniform int u_dim;
+layout(location = 2) uniform int u_row_stride;
+void main(void) {
+	uint d = gl_GlobalInvocationID.x;
+	if (int(d) >= u_dim)
+		return;
+	uint off = uint(u_token) * uint(u_row_stride) + d * 4u;
+	out_[d]	 = embd[off / 4u];
+}

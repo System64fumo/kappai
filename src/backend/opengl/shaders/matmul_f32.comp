@@ -1,0 +1,65 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) readonly buffer WBuf {
+	vec4 w[];
+};
+layout(std430, binding = 1) readonly buffer XBuf {
+	vec4 x[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k;
+layout(location = 2) uniform int u_add_residual;
+
+shared float s_acc[4][32];
+
+void main(void) {
+	uint base_row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * 4u;
+	uint tid	  = gl_LocalInvocationID.x;
+	int	 k4		  = u_k >> 2;
+	uint w_stride = uint(k4);
+	vec4 acc0	  = vec4(0.0);
+	vec4 acc1	  = vec4(0.0);
+	vec4 acc2	  = vec4(0.0);
+	vec4 acc3	  = vec4(0.0);
+	bool r0		  = int(base_row + 0u) < u_n;
+	bool r1		  = int(base_row + 1u) < u_n;
+	bool r2		  = int(base_row + 2u) < u_n;
+	bool r3		  = int(base_row + 3u) < u_n;
+	for (int k = int(tid); k < k4; k += 32) {
+		vec4 xv = x[uint(k)];
+		if (r0)
+			acc0 += w[(base_row + 0u) * w_stride + uint(k)] * xv;
+		if (r1)
+			acc1 += w[(base_row + 1u) * w_stride + uint(k)] * xv;
+		if (r2)
+			acc2 += w[(base_row + 2u) * w_stride + uint(k)] * xv;
+		if (r3)
+			acc3 += w[(base_row + 3u) * w_stride + uint(k)] * xv;
+	}
+	s_acc[0][tid] = acc0.x + acc0.y + acc0.z + acc0.w;
+	s_acc[1][tid] = acc1.x + acc1.y + acc1.z + acc1.w;
+	s_acc[2][tid] = acc2.x + acc2.y + acc2.z + acc2.w;
+	s_acc[3][tid] = acc3.x + acc3.y + acc3.z + acc3.w;
+	barrier();
+	if (tid < 4u) {
+		float s = 0.0;
+		for (int j = 0; j < 32; j++)
+			s += s_acc[tid][j];
+		uint target = base_row + tid;
+		if (int(target) < u_n) {
+			if (u_add_residual == 1)
+				y[target] = s + res[target];
+			else if (u_add_residual == 2)
+				y[target] += s;
+			else
+				y[target] = s;
+		}
+	}
+}

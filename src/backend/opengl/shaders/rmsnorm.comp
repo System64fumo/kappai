@@ -1,0 +1,53 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) readonly buffer WBuf {
+	float w[];
+};
+layout(std430, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform float u_eps;
+shared float s_ss[64];
+void		 main(void) {
+	uint  tid	 = gl_LocalInvocationID.x;
+	int	  n		 = u_n;
+	float my_sum = 0.0;
+	for (int i = int(tid); i < n; i += 64)
+		my_sum += x[i] * x[i];
+	s_ss[tid] = my_sum;
+	barrier();
+	if (tid < 32u) {
+		s_ss[tid] += s_ss[tid + 32u];
+	}
+	barrier();
+	if (tid < 16u) {
+		s_ss[tid] += s_ss[tid + 16u];
+	}
+	barrier();
+	if (tid < 8u) {
+		s_ss[tid] += s_ss[tid + 8u];
+	}
+	barrier();
+	if (tid < 4u) {
+		s_ss[tid] += s_ss[tid + 4u];
+	}
+	barrier();
+	if (tid < 2u) {
+		s_ss[tid] += s_ss[tid + 2u];
+	}
+	barrier();
+	if (tid < 1u) {
+		s_ss[tid] += s_ss[tid + 1u];
+	}
+	barrier();
+	float ss  = s_ss[0];
+	float inv = 1.0 / sqrt(ss / float(n) + u_eps);
+	for (int i = int(tid); i < n; i += 64) {
+		y[i] = x[i] * inv * w[i];
+	}
+}

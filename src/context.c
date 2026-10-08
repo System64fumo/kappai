@@ -1207,6 +1207,7 @@ static void *idle_prefill_thread(void *arg) {
 	DEBUG("idle-prefill: %d tokens [%d..%d)", to_prefill, reuse, header_count);
 
 out:
+	backend_release_thread(c->backend);
 	free(header);
 	free(r1);
 	free(r2);
@@ -1217,6 +1218,7 @@ void context_idle_prefill_start(context *c) {
 	if (!c || c->idle.active)
 		return;
 	c->idle.active = true;
+	backend_release_thread(c->backend);
 	if (pthread_create(&c->idle.thread, NULL, idle_prefill_thread, c) != 0)
 		c->idle.active = false;
 }

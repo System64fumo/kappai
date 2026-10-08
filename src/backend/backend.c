@@ -127,8 +127,8 @@ void backend_report_host_fallback(const backend *device, const char *op,
 		e->count++;
 		if (first && !e->printed && (g_hfb_reported || reason == HFB_ERROR)) {
 			if (g_hfb_warn)
-				log_msg(LOG_WARN, "host fallback: %s on '%s': %s", op_key, dev,
-						hfb_reason_str(reason));
+				log_msg(LOG_WARN, "host fallback: %s on '%s': %s%s%s", op_key, dev,
+						hfb_reason_str(reason), e->detail[0] ? " -- " : "", e->detail);
 			e->printed = 1;
 		}
 	}
@@ -152,7 +152,8 @@ void backend_fallback_report(void) {
 		e->printed = 1;
 		n_new++;
 		if (g_hfb_warn)
-			log_msg(LOG_WARN, "%s on '%s': %s", e->op, e->device, hfb_reason_str(e->reason));
+			log_msg(LOG_WARN, "%s on '%s': %s%s%s", e->op, e->device, hfb_reason_str(e->reason),
+					e->detail[0] ? " -- " : "", e->detail);
 	}
 	pthread_mutex_unlock(&g_hfb_mtx);
 	if (n_new == 0)
