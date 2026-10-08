@@ -19,6 +19,7 @@ You can expect up to **800%** speedups in some scenarios. (Results vary from sys
 
 - High-performance CPU inference
 - Vulkan backend
+- OpenGL backend
 - Mixed backend / partial offloading
 - MoE streaming
 - OpenAI-compatible server
