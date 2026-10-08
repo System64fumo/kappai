@@ -284,11 +284,17 @@ struct backend {
 								int n, float gate_scale, float up_scale, int use_gelu);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
+	void (*release_thread)(backend *self);
 	const char *desc;
 };
 
 static inline int backend_has_cap(const backend *b, uint64_t cap) {
 	return b && (b->caps & cap) != 0;
+}
+
+static inline void backend_release_thread(backend *b) {
+	if (b && b->release_thread)
+		b->release_thread(b);
 }
 
 static inline tpool *backend_get_pool(backend *b) {

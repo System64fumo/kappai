@@ -2,13 +2,17 @@
 precision highp float;
 precision highp int;
 
-layout(local_size_x = 32) in;
+#ifndef WG
+#define WG 32
+#endif
+
+layout(local_size_x = WG) in;
 
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
 layout(std430, binding = 1) readonly buffer XQBuf {
-	uint xq[];
+	uvec4 xq4[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -19,8 +23,6 @@ layout(std430, binding = 3) readonly buffer ResBuf {
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
-
-#define ROWS 32
 
 const uint IQ4NL_A0 = 0x3F2D1801u;
 const uint IQ4NL_A1 = 0x766A5D4Fu;
@@ -37,85 +39,18 @@ float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
 }
 
-float round_f16(float f) {
-	float base = abs(f) * 4.0;
-	uint  w	   = floatBitsToUint(f);
-	uint  shl1 = w + w;
-	uint  sign = w & 0x80000000u;
-	uint  bias = shl1 & 0xFF000000u;
-	if (bias < 0x71000000u)
-		bias = 0x71000000u;
-	base		   = uintBitsToFloat((bias >> 1u) + 0x07800000u) + base;
-	uint bits	   = floatBitsToUint(base);
-	uint exp_bits  = (bits >> 13u) & 0x7C00u;
-	uint mant_bits = bits & 0x0FFFu;
-	uint hbits	   = (sign >> 16u) | (shl1 > 0xFF000000u ? 0x7E00u : exp_bits + mant_bits);
-	return h2f(hbits);
+uint sh2(uint a, uint b, uint odd) {
+	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
 }
 
-int xqv(uint bb, int j) {
-	return bitfieldExtract(int(xq[bb + uint(j >> 2)]), (j & 3) * 8, 8);
-}
-
-uint rb(uint off) {
-	uint wd = w[off >> 2u];
-	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
-}
-
-uint f32_bits(float f) {
-	return floatBitsToUint(f);
-}
-float bits_f32(uint b) {
-	return uintBitsToFloat(b);
-}
-
-uint exact_div(uint nb, uint db) {
-	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
-	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
-	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
-	uint M24 = 0u;
-	uint rem;
-	int	 me;
-	if (Nn >= Dd) {
-		me	= eq;
-		rem = Nn - Dd;
-	} else {
-		me	= eq - 1;
-		rem = (Nn << 1u) - Dd;
+int dot4_iq4(uint qw, uint xl, uint xh) {
+	int s = 0;
+	for (int t = 0; t < 4; t++) {
+		int sh = t * 8;
+		s += iq4nl(bitfieldExtract(qw, sh, 4)) * bitfieldExtract(int(xl), sh, 8) +
+			 iq4nl(bitfieldExtract(qw, sh + 4, 4)) * bitfieldExtract(int(xh), sh, 8);
 	}
-	for (int i = 0; i < 23; i++) {
-		rem <<= 1u;
-		M24 <<= 1u;
-		if (rem >= Dd) {
-			rem -= Dd;
-			M24 |= 1u;
-		}
-	}
-	uint r2 = rem << 1u;
-	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
-		M24++;
-	if (M24 >= (1u << 23)) {
-		M24 = 0u;
-		me++;
-	}
-	int fe = me + 127;
-	if (fe >= 255)
-		return 0x7F800000u;
-	if (fe <= 0)
-		return 0u;
-	return (uint(fe) << 23u) | M24;
-}
-
-float div_r(float a, float b) {
-	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
-}
-
-int round_away(float f) {
-	float af = abs(f);
-	float tr = trunc(af);
-	float fr = af - tr;
-	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
-	return (f < 0.0) ? -int(r) : int(r);
+	return s;
 }
 
 void store_row(uint idx, float acc) {
@@ -128,7 +63,7 @@ void store_row(uint idx, float acc) {
 }
 
 void main(void) {
-	uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * uint(ROWS) + gl_LocalInvocationID.x;
+	uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * uint(WG) + gl_LocalInvocationID.x;
 	if (int(row) >= u_n)
 		return;
 	uint row_bytes = uint(u_k_blocks) * 18u;
@@ -136,18 +71,22 @@ void main(void) {
 
 	float acc = 0.0;
 	for (int bi = 0; bi < u_k_blocks; bi++) {
-		uint  xbq  = uint(bi) * 12u;
-		float dxq  = uintBitsToFloat(xq[xbq + 8u]);
-		uint  bo   = uint(bi) * 18u;
-		int	  sumi = 0;
-		for (int j = 0; j < 16; j++) {
-			int	 v0 = xqv(xbq, j);
-			int	 v1 = xqv(xbq, j + 16);
-			uint b	= rb(bo + 2u + uint(j) + rw);
-			sumi += v0 * iq4nl(b & 0xFu) + v1 * iq4nl(b >> 4);
-		}
-		float scaled = h2f(rb(bo + rw) | (rb(bo + 1u + rw) << 8u)) * dxq;
-		acc += scaled * float(sumi);
+		uint  bo  = rw + uint(bi) * 18u;
+		uint  wi  = bo >> 2u;
+		uint  odd = (bo >> 1u) & 1u;
+		uint  xi  = uint(bi) * 3u;
+		uvec4 xlo = xq4[xi];
+		uvec4 xhi = xq4[xi + 1u];
+		uvec4 xs  = xq4[xi + 2u];
+		uint  w0  = w[wi];
+		uint  w1  = w[wi + 1u];
+		uint  w2  = w[wi + 2u];
+		uint  w3  = w[wi + 3u];
+		uint  w4  = w[wi + 4u];
+		int	  sumi =
+			dot4_iq4(sh2(w0, w1, odd), xlo.x, xhi.x) + dot4_iq4(sh2(w1, w2, odd), xlo.y, xhi.y) +
+			dot4_iq4(sh2(w2, w3, odd), xlo.z, xhi.z) + dot4_iq4(sh2(w3, w4, odd), xlo.w, xhi.w);
+		acc += h2f(odd != 0u ? w0 >> 16u : w0) * uintBitsToFloat(xs.x) * float(sumi);
 	}
 	store_row(row, acc);
 }

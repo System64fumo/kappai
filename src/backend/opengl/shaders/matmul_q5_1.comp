@@ -2,13 +2,17 @@
 precision highp float;
 precision highp int;
 
-layout(local_size_x = 32) in;
+#ifndef WG
+#define WG 32
+#endif
+
+layout(local_size_x = WG) in;
 
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
 layout(std430, binding = 1) readonly buffer XQBuf {
-	uint xq[];
+	uvec4 xq4[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -20,7 +24,7 @@ layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
 
-shared float s_acc[32];
+shared float s_acc[WG];
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -42,69 +46,18 @@ float round_f16(float f) {
 	return h2f(hbits);
 }
 
-int xqv(uint bb, int j) {
-	return bitfieldExtract(int(xq[bb + uint(j >> 2)]), (j & 3) * 8, 8);
-}
-
-uint rb(uint off) {
-	uint wd = w[off >> 2u];
-	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
-}
-
-uint f32_bits(float f) {
-	return floatBitsToUint(f);
-}
-float bits_f32(uint b) {
-	return uintBitsToFloat(b);
-}
-
-uint exact_div(uint nb, uint db) {
-	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
-	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
-	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
-	uint M24 = 0u;
-	uint rem;
-	int	 me;
-	if (Nn >= Dd) {
-		me	= eq;
-		rem = Nn - Dd;
-	} else {
-		me	= eq - 1;
-		rem = (Nn << 1u) - Dd;
+ivec2 dot4_q5_1(uint qw, uint xl, uint xh, uint hb_lo, uint hb_hi) {
+	ivec2 r = ivec2(0);
+	for (int t = 0; t < 4; t++) {
+		int sh = t * 8;
+		int lo = int(bitfieldExtract(qw, sh, 4) | (((hb_lo >> uint(t)) & 1u) << 4u));
+		int hi = int(bitfieldExtract(qw, sh + 4, 4) | (((hb_hi >> uint(t)) & 1u) << 4u));
+		int vl = bitfieldExtract(int(xl), sh, 8);
+		int vh = bitfieldExtract(int(xh), sh, 8);
+		r.x += lo * vl + hi * vh;
+		r.y += vl + vh;
 	}
-	for (int i = 0; i < 23; i++) {
-		rem <<= 1u;
-		M24 <<= 1u;
-		if (rem >= Dd) {
-			rem -= Dd;
-			M24 |= 1u;
-		}
-	}
-	uint r2 = rem << 1u;
-	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
-		M24++;
-	if (M24 >= (1u << 23)) {
-		M24 = 0u;
-		me++;
-	}
-	int fe = me + 127;
-	if (fe >= 255)
-		return 0x7F800000u;
-	if (fe <= 0)
-		return 0u;
-	return (uint(fe) << 23u) | M24;
-}
-
-float div_r(float a, float b) {
-	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
-}
-
-int round_away(float f) {
-	float af = abs(f);
-	float tr = trunc(af);
-	float fr = af - tr;
-	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
-	return (f < 0.0) ? -int(r) : int(r);
+	return r;
 }
 
 void main(void) {
@@ -115,35 +68,32 @@ void main(void) {
 	float acc = 0.0;
 	if (valid) {
 		uint row_off = row * uint(u_k_blocks) * 24u;
-		for (int bi = int(tid); bi < u_k_blocks; bi += 32) {
+		for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
 			uint  bo  = row_off + uint(bi) * 24u;
-			int	  xb  = bi * 32;
-			uint  xbq = uint(bi) * 12u;
-			float d	  = uintBitsToFloat(xq[xbq + 9u]);
-			float dxq = uintBitsToFloat(xq[xbq + 8u]);
-			float wd  = h2f(rb(bo) | (rb(bo + 1u) << 8u));
-			float md  = h2f(rb(bo + 2u) | (rb(bo + 3u) << 8u));
-			uint  qh =
-				rb(bo + 4u) | (rb(bo + 5u) << 8u) | (rb(bo + 6u) << 16u) | (rb(bo + 7u) << 24u);
-			uint qo	  = bo + 8u;
-			int	 sumi = 0;
-			int	 sumv = 0;
-			for (int j = 0; j < 16; j++) {
-				uint bv = rb(qo + uint(j));
-				int	 lo = int((bv & 0xFu) | (((qh >> uint(j)) & 1u) << 4u));
-				int	 hi = int((bv >> 4) | (((qh >> uint(j + 16)) & 1u) << 4u));
-				int	 v0 = xqv(xbq, j);
-				int	 v1 = xqv(xbq, j + 16);
-				sumv += v0 + v1;
-				sumi += lo * v0 + hi * v1;
-			}
-			float sxq = round_f16(d * float(sumv));
-			acc += wd * dxq * float(sumi) + md * sxq;
+			uint  wi  = bo >> 2u;
+			uint  odd = (bo >> 1u) & 1u;
+			uint  xi  = uint(bi) * 3u;
+			uvec4 xlo = xq4[xi];
+			uvec4 xhi = xq4[xi + 1u];
+			uvec4 xs  = xq4[xi + 2u];
+			float dxq = uintBitsToFloat(xs.x);
+			uint  w0  = w[wi];
+			uint  qh  = w[wi + 1u];
+			uint  w2  = w[wi + 2u];
+			uint  w3  = w[wi + 3u];
+			uint  w4  = w[wi + 4u];
+			uint  w5  = w[wi + 5u];
+			ivec2 s	  = dot4_q5_1(w2, xlo.x, xhi.x, qh, qh >> 16u) +
+						dot4_q5_1(w3, xlo.y, xhi.y, qh >> 4u, qh >> 20u) +
+						dot4_q5_1(w4, xlo.z, xhi.z, qh >> 8u, qh >> 24u) +
+						dot4_q5_1(w5, xlo.w, xhi.w, qh >> 12u, qh >> 28u);
+			float sxq = round_f16(uintBitsToFloat(xs.y) * float(s.y));
+			acc += h2f(w0) * dxq * float(s.x) + h2f(w0 >> 16u) * sxq;
 		}
 	}
 	s_acc[tid] = acc;
 	barrier();
-	for (uint s = 16u; s > 0u; s >>= 1u) {
+	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
 		if (tid < s)
 			s_acc[tid] += s_acc[tid + s];
 		barrier();

@@ -94,7 +94,7 @@ void profile_print(const profile *p, const char *label, FILE *fp) {
 		uint64_t by	   = atomic_load_explicit(&p->bytes[i], memory_order_relaxed);
 		double	 share = total > 0 ? 100.0 * (double)totals[i] / (double)total : 0.0;
 		double	 per   = calls[i] > 0 ? (double)totals[i] / (double)calls[i] : 0.0;
-		double mbps = totals[i] ? (double)by / 1000.0 / (double)totals[i] : 0.0;
+		double	 mbps  = totals[i] ? (double)by / 1000.0 / (double)totals[i] : 0.0;
 		fprintf(fp, "  %-18s %12llu %8llu %10.2f %7.2f%% %9.1f %8.2f\n", stage_name((stage)i),
 				(unsigned long long)totals[i], (unsigned long long)calls[i], per, share,
 				(double)by / 1e6, mbps);
