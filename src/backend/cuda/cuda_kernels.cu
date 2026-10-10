@@ -4196,9 +4196,8 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
 /* IQ4_NL uses the same quantization as Q4_K but with 4-bit values and 16-level lookup.
  * We implement an efficient kernel using integer arithmetic like the CPU. */
 
-__constant__ int8_t kvalues_iq4nl_i8[16] = {
-    -8, -6, -4, -3, -2, -1, 0, 1,
-    2, 3, 4, 5, 6, 7, 8, 9
+__constant__ int8_t cuda_kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
 /* IQ4_NL block format (18 bytes per 32 elements):
@@ -4228,7 +4227,7 @@ __global__ void matmul_iq4_nl_safe_kernel(const uint8_t *__restrict__ w,
         for (int j = 0; j < 32; j++) {
             uint8_t byte = quants[j / 2];
             int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            acc += (float)kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
+            acc += (float)cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
         }
     }
     y[row] = acc;
@@ -4256,7 +4255,7 @@ __global__ void matmul_iq4_nl_fast_kernel(const uint8_t *__restrict__ w,
         for (int j = 0; j < 32; j++) {
             uint8_t byte = quants[j / 2];
             int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            block_sum += (float)kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
+            block_sum += (float)cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
         }
         acc += block_sum;
     }
@@ -9543,7 +9542,7 @@ __global__ void matmul_iq4_nl_opt_kernel(const uint8_t *__restrict__ w,
         for (int j = 0; j < 32; j++) {
             uint8_t byte = quants[j / 2];
             int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            block_sum += kvalues_iq4nl_i8[idx] * scale * x[b * 32 + j];
+            block_sum += cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
         }
         acc += block_sum;
     }
