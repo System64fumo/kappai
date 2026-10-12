@@ -394,6 +394,8 @@ int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 
 	malloc_trim(0);
 
+	backend_release_thread(ctx->backend);
+
 	return OK;
 }
 

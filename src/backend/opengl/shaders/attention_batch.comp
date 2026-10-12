@@ -28,6 +28,7 @@ layout(location = 11) uniform int u_window;
 layout(location = 12) uniform int u_kvh_stride;
 #define MAX_HEAD_DIM 512
 #define Q_CHUNK 4
+#define OUT_PER_THREAD (MAX_HEAD_DIM / 64)
 #ifndef TILE_T
 #define TILE_T 11
 #endif
@@ -60,9 +61,15 @@ void main(void) {
 			break;
 		uint rb = uint((int(m_base) + qi) * row_stride) + q_base;
 		for (int d = int(tid); d < head_dim; d += 64) {
-			q_shared[qi][d]	   = q[rb + uint(d)];
-			out_[rb + uint(d)] = 0.0;
+			q_shared[qi][d] = q[rb + uint(d)];
 		}
+	}
+	float o_acc[Q_CHUNK][OUT_PER_THREAD];
+	float alpha_q[Q_CHUNK];
+	for (int qi = 0; qi < Q_CHUNK; qi++) {
+		alpha_q[qi] = 1.0;
+		for (int j = 0; j < OUT_PER_THREAD; j++)
+			o_acc[qi][j] = 0.0;
 	}
 	barrier();
 
@@ -159,12 +166,9 @@ void main(void) {
 					e_tile[qi][t] = 0.0;
 			}
 			barrier();
-			l_run[qi] = l_run[qi] * alpha + l_tile;
-			for (int d = int(tid); d < head_dim; d += 64) {
-				uint ob = uint((int(m_base) + qi) * row_stride) + q_base + uint(d);
-				out_[ob] *= alpha;
-			}
-			m_run[qi] = m_new;
+			l_run[qi]	= l_run[qi] * alpha + l_tile;
+			alpha_q[qi] = alpha;
+			m_run[qi]	= m_new;
 		}
 
 		if (u_kv_q8 == 0) {
@@ -192,15 +196,17 @@ void main(void) {
 		}
 		barrier();
 
-		for (int d = int(tid); d < head_dim; d += 64) {
+		for (int j = 0; j < OUT_PER_THREAD; j++) {
+			int d = int(tid) + j * 64;
+			if (d >= head_dim)
+				break;
 			for (int qi = 0; qi < Q_CHUNK; qi++) {
 				if (qi >= rows_here)
 					continue;
 				float acc = 0.0;
 				for (int t = 0; t < tile_len; t++)
 					acc += e_tile[qi][t] * kv_tile[t * head_dim + d];
-				uint ob = uint((int(m_base) + qi) * row_stride) + q_base + uint(d);
-				out_[ob] += acc;
+				o_acc[qi][j] = o_acc[qi][j] * alpha_q[qi] + acc;
 			}
 		}
 		barrier();
@@ -210,9 +216,12 @@ void main(void) {
 		if (qi >= rows_here)
 			continue;
 		float inv_l = l_run[qi] > 0.0 ? 1.0 / l_run[qi] : 0.0;
-		for (int d = int(tid); d < head_dim; d += 64) {
-			uint ob = uint((int(m_base) + qi) * row_stride) + q_base + uint(d);
-			out_[ob] *= inv_l;
+		for (int j = 0; j < OUT_PER_THREAD; j++) {
+			int d = int(tid) + j * 64;
+			if (d >= head_dim)
+				break;
+			uint ob	 = uint((int(m_base) + qi) * row_stride) + q_base + uint(d);
+			out_[ob] = o_acc[qi][j] * inv_l;
 		}
 	}
 }

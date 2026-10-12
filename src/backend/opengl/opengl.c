@@ -10,6 +10,7 @@
 #include <GLES3/gl31.h>
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,11 @@
 #define GL_MAX_DISPATCH_PER_DIM 65535u
 #define GL_PIPELINE_MAX_UNIFORMS 16
 #define GL_UNIFORM_NAME_CAP 32
+#define GL_MAX_PENDING_ACCESSES 256
+#define GL_ROPE_CACHE_SLOTS 4
+#define GL_ROPE_CACHE_MIN_POSITIONS 1024
+#define GL_WHOLE_BUFFER ((size_t)1 << 62)
+#define GL_COMPUTE_BARRIER_BITS (GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
 
 typedef struct gl_priv gl_priv;
 
@@ -56,13 +62,44 @@ typedef enum {
 	GL_PIPE_PARTIAL_ROPE_QK,
 	GL_PIPE_KV_PUT,
 	GL_PIPE_QUANTIZE_X,
+	GL_PIPE_ROPE_QK,
+	GL_PIPE_QUANTIZE_X_ACT,
+	GL_PIPE_QUANTIZE_Q8_K_ACT,
+	GL_PIPE_MATMUL_Q4_0_TILED,
+	GL_PIPE_MATMUL_Q4_1_TILED,
+	GL_PIPE_MATMUL_Q5_0_TILED,
+	GL_PIPE_MATMUL_Q5_1_TILED,
+	GL_PIPE_MATMUL_Q4_0_R8,
+	GL_PIPE_MATMUL_Q8_0_R8,
+	GL_PIPE_MATMUL_IQ4_NL_R8,
+	GL_PIPE_MATMUL_Q4_K_R8,
+	GL_PIPE_MATMUL_Q5_K_R8,
+	GL_PIPE_MATMUL_Q6_K_R8,
+	GL_PIPE_MATMUL_Q4_0_R8_TILED,
+	GL_PIPE_MATMUL_Q8_0_R8_TILED,
+	GL_PIPE_MATMUL_IQ4_NL_R8_TILED,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
 typedef struct {
 	const char *name;
 	const char *src;
+	uint32_t	flags;
+	uint32_t	w_type;
+	int			rows_per_wg;
+	int			block_size;
 } gl_pipeline_def;
+
+enum {
+	GL_PIPE_F_FUSED_ACT = 1u << 0,
+	GL_PIPE_F_TILED		= 1u << 1,
+	GL_PIPE_F_R8_LANE	= 1u << 2,
+	GL_PIPE_F_R8		= 1u << 3,
+	GL_PIPE_F_MATMUL_WG = 1u << 4,
+	GL_PIPE_F_USES_XQ	= 1u << 5,
+	GL_PIPE_F_USES_XQK	= 1u << 6,
+	GL_PIPE_F_IQ4NL_LUT = 1u << 7,
+};
 
 typedef struct gl_buf {
 	gl_priv *owner;
@@ -78,23 +115,65 @@ typedef struct gl_buf {
 typedef struct {
 	GLuint		program;
 	const char *name;
+	const char *src;
+	uint32_t	flags;
+	uint32_t	w_type;
+	int			rows_per_wg;
+	int			block_size;
 	int			n_uni;
+	uint32_t	uvalid;
+	uint32_t	uval[GL_PIPELINE_MAX_UNIFORMS];
 	GLint		uloc[GL_PIPELINE_MAX_UNIFORMS];
 	char		uname[GL_PIPELINE_MAX_UNIFORMS][GL_UNIFORM_NAME_CAP];
 } gl_pipeline;
+
+typedef struct {
+	const float *cos_base;
+	const float *sin_base;
+	int			 half;
+	float		 theta;
+	int			 capacity;
+	gl_buf		*cos_buf;
+	gl_buf		*sin_buf;
+	uint8_t		*valid;
+} gl_rope_cache;
+
+typedef struct {
+	GLuint name;
+	size_t offset;
+	size_t size;
+} gl_binding;
+
+typedef struct {
+	GLuint name;
+	size_t offset;
+	size_t length;
+	int	   write;
+} gl_access;
 
 struct gl_priv {
 	gl_context ctx;
 
 	gl_pipeline pipes[GL_PIPE_COUNT];
 
+	GLuint		  current_program;
+	gl_binding	  bound[GL_MAX_BINDINGS];
+	gl_access	  access[GL_MAX_BINDINGS];
+	unsigned	  access_mask;
+	gl_access	  pending[GL_MAX_PENDING_ACCESSES];
+	int			  n_pending;
+	size_t		  ssbo_align;
+	gl_rope_cache rope_cache[GL_ROPE_CACHE_SLOTS];
+	int			  rope_cache_next;
+
 	gl_buf *qx;
-	size_t	qx_row_bytes;
+	size_t	qx_row_words;
 
 	gl_buf *qxk;
 	size_t	qxk_row_words;
 
 	gl_buf *iq3s_grid;
+	gl_buf *iq4nl_pairs;
 
 	gl_buf *argmax_partial;
 	size_t	argmax_partial_bytes;
@@ -123,11 +202,7 @@ struct gl_priv {
 	int device_lost;
 	int matmul_wg;
 
-	buffer rope_cos_tbl;
-	buffer rope_sin_tbl;
-
 	char *attention_src;
-	int	  attention_tile_t;
 	int	  attention_batch_tile_t;
 	char *attention_batch_src;
 
@@ -186,17 +261,24 @@ static void gl_softmax_masked(float *scores, int n_valid) {
 		scores[i] *= inv;
 }
 
+static _Thread_local const gl_priv *gl_thread_current;
+
 static status_code gl_ensure_context(gl_priv *p) {
 	if (!p || !p->ctx.dpy || p->device_lost)
 		return ERR_INTERNAL;
-	if (eglGetCurrentContext() == p->ctx.ctx)
+	if (gl_thread_current == p)
 		return OK;
+	if (eglGetCurrentContext() == p->ctx.ctx) {
+		gl_thread_current = p;
+		return OK;
+	}
 	if (!eglMakeCurrent(p->ctx.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, p->ctx.ctx)) {
 		ERROR("gl: eglMakeCurrent failed on the calling thread (eglErr=0x%04x); "
 			  "EGL display/context unusable or device lost",
 			  (unsigned)eglGetError());
 		return ERR_INTERNAL;
 	}
+	gl_thread_current = p;
 	return OK;
 }
 
@@ -262,21 +344,12 @@ static status_code gl_link_program_from_shader(GLuint shader, GLuint *out_progra
 #define GL_ATTENTION_MAX_HEAD_DIM 512
 #define GL_ATTENTION_TILE_T_MAX 16
 #define GL_ATTENTION_Q_CHUNK 4
+#define GL_ATTENTION_WG 64
+#define GL_MATMUL_COLS 4
 #define GL_ATTENTION_KV_ROW_BYTES (GL_ATTENTION_MAX_HEAD_DIM * 4)
 #define GL_ATTENTION_FIXED_SHARED_BYTES (GL_ATTENTION_Q_CHUNK * GL_ATTENTION_MAX_HEAD_DIM * 4)
 
 static int gl_attention_batch_tile_t(const gl_context *ctx) {
-	int shared_budget = ctx->max_shared_bytes > 0 ? ctx->max_shared_bytes : 16384;
-	int per_t		  = GL_ATTENTION_KV_ROW_BYTES + GL_ATTENTION_Q_CHUNK * 2 * sizeof(float);
-	int tile_t		  = (shared_budget - GL_ATTENTION_FIXED_SHARED_BYTES) / per_t;
-	if (tile_t > GL_ATTENTION_TILE_T_MAX)
-		tile_t = GL_ATTENTION_TILE_T_MAX;
-	if (tile_t < 1)
-		tile_t = 1;
-	return tile_t;
-}
-
-static int gl_attention_tile_t(const gl_context *ctx) {
 	int shared_budget = ctx->max_shared_bytes > 0 ? ctx->max_shared_bytes : 16384;
 	int per_t		  = GL_ATTENTION_KV_ROW_BYTES + GL_ATTENTION_Q_CHUNK * 2 * sizeof(float);
 	int tile_t		  = (shared_budget - GL_ATTENTION_FIXED_SHARED_BYTES) / per_t;
@@ -297,14 +370,8 @@ static int gl_matmul_wg(const gl_context *ctx) {
 			 ctx->max_wg_size);
 	}
 	if (strstr(ctx->renderer, "Mali") || strstr(ctx->renderer, "Panfrost"))
-		return 16;
+		return 4;
 	return 32;
-}
-
-static bool gl_pipe_uses_matmul_wg(int pipe_id) {
-	return pipe_id == GL_PIPE_MATMUL_IQ4_NL || pipe_id == GL_PIPE_MATMUL_Q4_0 ||
-		   pipe_id == GL_PIPE_MATMUL_Q4_1 || pipe_id == GL_PIPE_MATMUL_Q5_0 ||
-		   pipe_id == GL_PIPE_MATMUL_Q5_1 || pipe_id == GL_PIPE_MATMUL_Q8_0;
 }
 
 static char *gl_shader_with_define(const char *src, const char *name, int value) {
@@ -355,10 +422,10 @@ static void gl_pipeline_cache_uniforms(gl_pipeline *p) {
 	}
 }
 
-static GLint gl_pipeline_loc(const gl_pipeline *p, const char *name) {
+static int gl_pipeline_index(const gl_pipeline *p, const char *name) {
 	for (int i = 0; i < p->n_uni; i++)
 		if (strcmp(p->uname[i], name) == 0)
-			return p->uloc[i];
+			return i;
 	return -1;
 }
 
@@ -377,25 +444,33 @@ static void gl_pipeline_warn_missing(const gl_pipeline *p, const char *name) {
 	}
 }
 
-static void gl_pu(const gl_pipeline *p, const char *name, int v) {
-	GLint loc = gl_pipeline_loc(p, name);
-	if (loc < 0) {
+static GLint gl_pipeline_stage_uniform(gl_pipeline *p, const char *name, uint32_t bits) {
+	int i = gl_pipeline_index(p, name);
+	if (i < 0) {
 		gl_pipeline_warn_missing(p, name);
-		return;
+		return -1;
 	}
-	glUniform1i(loc, v);
+	uint32_t bit = 1u << i;
+	if ((p->uvalid & bit) && p->uval[i] == bits)
+		return -1;
+	p->uval[i] = bits;
+	p->uvalid |= bit;
+	return p->uloc[i];
 }
 
-static void gl_puf(const gl_pipeline *p, const char *name, float v) {
-	GLint loc = gl_pipeline_loc(p, name);
-	if (loc < 0) {
-		gl_pipeline_warn_missing(p, name);
-		return;
-	}
-	glUniform1f(loc, (GLfloat)v);
+static void gl_pu(gl_pipeline *p, const char *name, int v) {
+	GLint loc = gl_pipeline_stage_uniform(p, name, (uint32_t)v);
+	if (loc >= 0)
+		glUniform1i(loc, v);
 }
 
-static void gl_pui(const gl_pipeline *p, const char *const *names, const int *vals, int count) {
+static void gl_puf(gl_pipeline *p, const char *name, float v) {
+	GLint loc = gl_pipeline_stage_uniform(p, name, gl_f32_to_bits(v));
+	if (loc >= 0)
+		glUniform1f(loc, (GLfloat)v);
+}
+
+static void gl_pui(gl_pipeline *p, const char *const *names, const int *vals, int count) {
 	for (int i = 0; i < count; i++)
 		gl_pu(p, names[i], vals[i]);
 }
@@ -412,7 +487,8 @@ static status_code gl_build_pipeline(const char *src, const char *name, gl_pipel
 		ERROR("gl: failed to link program for pipeline '%s'", name);
 		return s;
 	}
-	out->name = name;
+	out->name	= name;
+	out->uvalid = 0;
 	gl_pipeline_cache_uniforms(out);
 	return OK;
 }
@@ -427,14 +503,117 @@ static inline float gl_u32_as_float(uint32_t u) {
 	return f;
 }
 
-static inline void gl_bind_ssbo(int binding, const buffer *b) {
-	gl_buf *gb = as_glbuf(b);
-	if (b->offset == 0) {
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, gb->name);
-	} else {
-		glBindBufferRange(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, gb->name, (GLintptr)b->offset,
-						  (GLsizeiptr)b->size);
+static size_t gl_ssbo_align(gl_priv *p) {
+	if (!p->ssbo_align) {
+		GLint align = 0;
+		glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &align);
+		p->ssbo_align = align > 0 ? (size_t)align : 1;
 	}
+	return p->ssbo_align;
+}
+
+static void gl_use_pipeline(gl_priv *p, const gl_pipeline *pipe) {
+	if (p->current_program == pipe->program)
+		return;
+	p->current_program = pipe->program;
+	glUseProgram(pipe->program);
+}
+
+static void gl_bind_range(gl_priv *p, int binding, GLuint name, size_t offset, size_t size,
+						  size_t access_length, int write) {
+	p->access[binding] =
+		(gl_access){name, offset, access_length ? access_length : GL_WHOLE_BUFFER, write};
+	p->access_mask |= 1u << binding;
+	gl_binding *current = &p->bound[binding];
+	if (current->name == name && current->offset == offset && current->size == size)
+		return;
+	*current = (gl_binding){name, offset, size};
+	if (offset == 0 && size == 0)
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, name);
+	else
+		glBindBufferRange(GL_SHADER_STORAGE_BUFFER, (GLuint)binding, name, (GLintptr)offset,
+						  (GLsizeiptr)size);
+}
+
+static void gl_bind_raw(gl_priv *p, int binding, GLuint name, size_t offset, size_t size,
+						int write) {
+	gl_bind_range(p, binding, name, offset, size, size, write);
+}
+
+static void gl_bind_ssbo_access(int binding, const buffer *b, int write) {
+	gl_buf *gb = as_glbuf(b);
+	gl_bind_range(gb->owner, binding, gb->name, b->offset, b->offset ? b->size : 0, b->size, write);
+}
+
+static void gl_bind_ssbo(int binding, const buffer *b) {
+	gl_bind_ssbo_access(binding, b, 0);
+}
+
+static void gl_bind_ssbo_out(int binding, const buffer *b) {
+	gl_bind_ssbo_access(binding, b, 1);
+}
+
+static void gl_barrier(gl_priv *p) {
+	glMemoryBarrier(GL_COMPUTE_BARRIER_BITS);
+	p->n_pending = 0;
+}
+
+static void gl_barrier_if_pending(gl_priv *p) {
+	if (p->n_pending)
+		gl_barrier(p);
+}
+
+static int gl_access_overlaps(const gl_access *a, const gl_access *b) {
+	return a->name == b->name && a->offset < b->offset + b->length &&
+		   b->offset < a->offset + a->length;
+}
+
+static int gl_access_conflicts_with_pending(const gl_priv *p, const gl_access *a) {
+	for (int i = 0; i < p->n_pending; i++)
+		if ((a->write || p->pending[i].write) && gl_access_overlaps(a, &p->pending[i]))
+			return 1;
+	return 0;
+}
+
+static void gl_record_pending(gl_priv *p, const gl_access *a) {
+	for (int i = 0; i < p->n_pending; i++) {
+		gl_access *known = &p->pending[i];
+		if (known->name == a->name && known->offset == a->offset && known->length == a->length) {
+			known->write |= a->write;
+			return;
+		}
+	}
+	p->pending[p->n_pending++] = *a;
+}
+
+static void gl_launch(gl_priv *p, GLuint groups_x, GLuint groups_y, GLuint groups_z) {
+	unsigned mask = p->access_mask;
+	for (int i = 0; i < GL_MAX_BINDINGS && p->n_pending; i++) {
+		if (!(mask & (1u << i)) || !gl_access_conflicts_with_pending(p, &p->access[i]))
+			continue;
+		gl_barrier(p);
+		break;
+	}
+	glDispatchCompute(groups_x, groups_y, groups_z);
+	p->access_mask = 0;
+	if (p->n_pending + GL_MAX_BINDINGS > GL_MAX_PENDING_ACCESSES) {
+		gl_barrier(p);
+		return;
+	}
+	for (int i = 0; i < GL_MAX_BINDINGS; i++)
+		if (mask & (1u << i))
+			gl_record_pending(p, &p->access[i]);
+}
+
+static void gl_forget_buffer_name(gl_priv *p, GLuint name) {
+	for (int i = 0; i < GL_MAX_BINDINGS; i++)
+		if (p->bound[i].name == name)
+			p->bound[i] = (gl_binding){0};
+	int kept = 0;
+	for (int i = 0; i < p->n_pending; i++)
+		if (p->pending[i].name != name)
+			p->pending[kept++] = p->pending[i];
+	p->n_pending = kept;
 }
 
 static void gl_buf_register(gl_priv *p, gl_buf *b) {
@@ -542,6 +721,7 @@ static void gl_buf_sync_to_device(gl_buf *b) {
 	if (gl_ensure_context(b->owner) != OK)
 		return;
 
+	gl_barrier_if_pending(b->owner);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
 	size_t alloc_size = (b->size_bytes + 3u) & ~(size_t)3u;
 	if (alloc_size != b->store_bytes) {
@@ -564,7 +744,7 @@ static void gl_buf_sync_to_host(gl_buf *b) {
 		return;
 	glFinish();
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_barrier(b->owner);
 	void *ptr =
 		glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)b->size_bytes, GL_MAP_READ_BIT);
 	if (!ptr) {
@@ -593,6 +773,7 @@ static void gl_buf_free(gl_priv *p, gl_buf *b) {
 		return;
 	gl_buf_unregister(p, b);
 	if (b->name) {
+		gl_forget_buffer_name(p, b->name);
 		glDeleteBuffers(1, &b->name);
 		b->name = 0;
 	}
@@ -631,7 +812,8 @@ static void gl_scratch_pool_release(gl_priv *p, gl_buf *b) {
 
 static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int n_bufs,
 							   const char *const *uniform_names, const int *uniforms,
-							   int n_uniforms, GLuint groups_x, GLuint groups_y, GLuint groups_z) {
+							   int n_uniforms, GLuint groups_x, GLuint groups_y, GLuint groups_z,
+							   int n_outputs) {
 	if (!pipe->program) {
 		ERROR("gl: dispatch on '%s' with no compiled program", pipe->name);
 		return ERR_INTERNAL;
@@ -643,23 +825,15 @@ static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int
 	for (int i = 0; i < n_bufs && i < GL_MAX_BINDINGS; i++)
 		gl_buf_sync_to_device(bufs[i]);
 
-	glUseProgram(pipe->program);
+	gl_use_pipeline(p, pipe);
 	for (int i = 0; i < n_bufs && i < GL_MAX_BINDINGS; i++) {
 		if (!bufs[i])
 			continue;
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)i, bufs[i]->name);
+		gl_bind_raw(p, i, bufs[i]->name, 0, 0, i >= n_bufs - n_outputs);
 	}
 	gl_pui(pipe, uniform_names, uniforms, n_uniforms);
 
-	glDispatchCompute(groups_x, groups_y, groups_z);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: glDispatchCompute('%s') failed (glErr=0x%04x, dim=%ux%ux%u)", pipe->name,
-			  (unsigned)err, groups_x, groups_y, groups_z);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+	gl_launch(p, groups_x, groups_y, groups_z);
 	return OK;
 }
 
@@ -667,8 +841,8 @@ static status_code gl_dispatch_all_dirty(gl_priv *p, gl_pipeline *pipe, gl_buf *
 										 const char *const *uniform_names, const int *uniforms,
 										 int n_uniforms, GLuint gx, GLuint gy, GLuint gz,
 										 int n_outputs) {
-	status_code s =
-		gl_dispatch(p, pipe, bufs, n_bufs, uniform_names, uniforms, n_uniforms, gx, gy, gz);
+	status_code s = gl_dispatch(p, pipe, bufs, n_bufs, uniform_names, uniforms, n_uniforms, gx, gy,
+								gz, n_outputs);
 	if (s != OK)
 		return s;
 	if (n_outputs > n_bufs)
@@ -706,10 +880,8 @@ static status_code gl_init(backend *self, int device_index) {
 		return ERR_UNSUPPORTED;
 	}
 
-	p->matmul_wg		= gl_matmul_wg(&p->ctx);
-	p->attention_tile_t = gl_attention_tile_t(&p->ctx);
-	p->attention_src =
-		gl_shader_with_define(gl_shader_attention_src, "TILE_T", p->attention_tile_t);
+	p->matmul_wg	 = gl_matmul_wg(&p->ctx);
+	p->attention_src = gl_shader_with_define(gl_shader_attention_src, "ATTN_WG", GL_ATTENTION_WG);
 	p->attention_batch_tile_t = gl_attention_batch_tile_t(&p->ctx);
 	p->attention_batch_src =
 		gl_shader_with_define(gl_shader_attention_batch_src, "TILE_T", p->attention_batch_tile_t);
@@ -723,49 +895,178 @@ static status_code gl_init(backend *self, int device_index) {
 	}
 
 	gl_pipeline_def defs[GL_PIPE_COUNT] = {
-		[GL_PIPE_ARGMAX_STAGE1]			   = {"argmax_stage1", gl_shader_argmax_stage1_src},
-		[GL_PIPE_ARGMAX_STAGE2]			   = {"argmax_stage2", gl_shader_argmax_stage2_src},
-		[GL_PIPE_RMSNORM]				   = {"rmsnorm", gl_shader_rmsnorm_src},
-		[GL_PIPE_RMSNORM_PER_HEAD]		   = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src},
-		[GL_PIPE_ELEMENTWISE]			   = {"elementwise", gl_shader_elementwise_src},
-		[GL_PIPE_EMBD_LOOKUP_F16]		   = {"embd_lookup_f16", gl_shader_embd_lookup_f16_src},
-		[GL_PIPE_EMBD_LOOKUP_F32]		   = {"embd_lookup_f32", gl_shader_embd_lookup_f32_src},
-		[GL_PIPE_EMBD_LOOKUP_BF16]		   = {"embd_lookup_bf16", gl_shader_embd_lookup_bf16_src},
-		[GL_PIPE_EMBD_LOOKUP_QUANT]		   = {"embd_lookup_quant", gl_shader_embd_lookup_quant_src},
-		[GL_PIPE_MATMUL_F32]			   = {"matmul_f32", gl_shader_matmul_f32_src},
-		[GL_PIPE_MATMUL_IQ4_NL]			   = {"matmul_iq4_nl", gl_shader_matmul_iq4_nl_src},
-		[GL_PIPE_MATMUL_Q4_0]			   = {"matmul_q4_0", gl_shader_matmul_q4_0_src},
-		[GL_PIPE_MATMUL_Q4_1]			   = {"matmul_q4_1", gl_shader_matmul_q4_1_src},
-		[GL_PIPE_MATMUL_Q5_0]			   = {"matmul_q5_0", gl_shader_matmul_q5_0_src},
-		[GL_PIPE_MATMUL_Q5_1]			   = {"matmul_q5_1", gl_shader_matmul_q5_1_src},
-		[GL_PIPE_MATMUL_Q8_0]			   = {"matmul_q8_0", gl_shader_matmul_q8_0_src},
-		[GL_PIPE_MATMUL_Q4_K]			   = {"matmul_q4_k", gl_shader_matmul_q4_k_src},
-		[GL_PIPE_MATMUL_F16]			   = {"matmul_f16", gl_shader_matmul_f16_src},
-		[GL_PIPE_MATMUL_BF16]			   = {"matmul_bf16", gl_shader_matmul_bf16_src},
-		[GL_PIPE_MATMUL_Q5_K]			   = {"matmul_q5_k", gl_shader_matmul_q5_k_src},
-		[GL_PIPE_MATMUL_Q6_K]			   = {"matmul_q6_k", gl_shader_matmul_q6_k_src},
-		[GL_PIPE_MATMUL_IQ3_S]			   = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src},
-		[GL_PIPE_QUANTIZE_Q8_K]			   = {"quantize_q8_k", gl_shader_quantize_q8_k_src},
-		[GL_PIPE_QUANTIZE_X]			   = {"quantize_x", gl_shader_quantize_x_src},
-		[GL_PIPE_ROPE]					   = {"rope", gl_shader_rope_src},
-		[GL_PIPE_ROPE_BATCH]			   = {"rope_batch", gl_shader_rope_batch_src},
-		[GL_PIPE_FFN_ACTIVATE]			   = {"ffn_activate", gl_shader_ffn_activate_src},
+		[GL_PIPE_ARGMAX_STAGE1] = {"argmax_stage1", gl_shader_argmax_stage1_src, 0, UINT32_MAX, 1,
+								   0},
+		[GL_PIPE_ARGMAX_STAGE2] = {"argmax_stage2", gl_shader_argmax_stage2_src, 0, UINT32_MAX, 1,
+								   0},
+		[GL_PIPE_RMSNORM]		= {"rmsnorm", gl_shader_rmsnorm_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_RMSNORM_PER_HEAD] = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src, 0,
+									  UINT32_MAX, 1, 0},
+		[GL_PIPE_ELEMENTWISE]	  = {"elementwise", gl_shader_elementwise_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_F16] = {"embd_lookup_f16", gl_shader_embd_lookup_f16_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_F32] = {"embd_lookup_f32", gl_shader_embd_lookup_f32_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_BF16]	= {"embd_lookup_bf16", gl_shader_embd_lookup_bf16_src, 0,
+									   UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_QUANT] = {"embd_lookup_quant", gl_shader_embd_lookup_quant_src, 0,
+									   UINT32_MAX, 1, 0},
+		[GL_PIPE_MATMUL_F32]	= {"matmul_f32", gl_shader_matmul_f32_src, 0, GGML_TYPE_F32, 4, 0},
+		[GL_PIPE_MATMUL_IQ4_NL] = {"matmul_iq4_nl", gl_shader_matmul_iq4_nl_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ | GL_PIPE_F_IQ4NL_LUT,
+								   GGML_TYPE_IQ4_NL, 4, 32},
+		[GL_PIPE_MATMUL_Q4_0]	= {"matmul_q4_0", gl_shader_matmul_q4_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_0, 4, 32},
+		[GL_PIPE_MATMUL_Q4_1]	= {"matmul_q4_1", gl_shader_matmul_q4_1_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_1, 4, 32},
+		[GL_PIPE_MATMUL_Q5_0]	= {"matmul_q5_0", gl_shader_matmul_q5_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q5_0, 4, 32},
+		[GL_PIPE_MATMUL_Q5_1]	= {"matmul_q5_1", gl_shader_matmul_q5_1_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q5_1, 4, 32},
+		[GL_PIPE_MATMUL_Q8_0]	= {"matmul_q8_0", gl_shader_matmul_q8_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0, 4, 32},
+		[GL_PIPE_MATMUL_Q4_K]  = {"matmul_q4_k", gl_shader_matmul_q4_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q4_K, 4, 256},
+		[GL_PIPE_MATMUL_F16]   = {"matmul_f16", gl_shader_matmul_f16_src, 0, GGML_TYPE_F16, 4, 0},
+		[GL_PIPE_MATMUL_BF16]  = {"matmul_bf16", gl_shader_matmul_f16_src, 0, GGML_TYPE_BF16, 4, 0},
+		[GL_PIPE_MATMUL_Q5_K]  = {"matmul_q5_k", gl_shader_matmul_q4_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q5_K, 4, 256},
+		[GL_PIPE_MATMUL_Q6_K]  = {"matmul_q6_k", gl_shader_matmul_q6_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q6_K, 4, 256},
+		[GL_PIPE_MATMUL_IQ3_S] = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src, GL_PIPE_F_USES_XQK,
+								  GGML_TYPE_IQ3_S, 32, 256},
+		[GL_PIPE_MATMUL_Q4_0_TILED] = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_1_TILED] = {"matmul_q4_1_tiled", gl_shader_matmul_q4_1_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_0_TILED] = {"matmul_q5_0_tiled", gl_shader_matmul_q5_0_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_1_TILED] = {"matmul_q5_1_tiled", gl_shader_matmul_q5_1_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_0_R8]	= {"matmul_q4_0_r8", gl_shader_matmul_q4_0_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_0_R8, 8,
+									   32},
+		[GL_PIPE_MATMUL_Q8_0_R8]	= {"matmul_q8_0_r8", gl_shader_matmul_q8_0_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0_R8, 8,
+									   32},
+		[GL_PIPE_MATMUL_IQ4_NL_R8]	= {"matmul_iq4_nl_r8", gl_shader_matmul_iq4_nl_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ | GL_PIPE_F_IQ4NL_LUT,
+									   GGML_TYPE_IQ4_NL_R8, 8, 32},
+		[GL_PIPE_MATMUL_Q4_K_R8]	= {"matmul_q4_k_r8", gl_shader_matmul_q4_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q4_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q5_K_R8]	= {"matmul_q5_k_r8", gl_shader_matmul_q4_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q5_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q6_K_R8]	= {"matmul_q6_k_r8", gl_shader_matmul_q6_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q6_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q4_0_R8_TILED]	 = {"matmul_q4_0_r8_tiled", gl_shader_matmul_q4_0_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_Q8_0_R8_TILED]	 = {"matmul_q8_0_r8_tiled", gl_shader_matmul_q8_0_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_IQ4_NL_R8_TILED] = {"matmul_iq4_nl_r8_tiled", gl_shader_matmul_iq4_nl_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ |
+												GL_PIPE_F_IQ4NL_LUT,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_QUANTIZE_Q8_K]	 = {"quantize_q8_k", gl_shader_quantize_q8_k_src, 0, UINT32_MAX, 1,
+									0},
+		[GL_PIPE_QUANTIZE_X]	 = {"quantize_x", gl_shader_quantize_x_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE_QK]		 = {"rope_qk", gl_shader_rope_qk_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_QUANTIZE_X_ACT] = {"quantize_x_act", gl_shader_quantize_x_src, GL_PIPE_F_FUSED_ACT,
+									UINT32_MAX, 1, 0},
+		[GL_PIPE_QUANTIZE_Q8_K_ACT] = {"quantize_q8_k_act", gl_shader_quantize_q8_k_src,
+									   GL_PIPE_F_FUSED_ACT, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE]				= {"rope", gl_shader_rope_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE_BATCH]		= {"rope_batch", gl_shader_rope_batch_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_FFN_ACTIVATE] = {"ffn_activate", gl_shader_ffn_activate_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH] = {"ffn_activate_fused_batch",
-											  gl_shader_ffn_activate_fused_batch_src},
-		[GL_PIPE_ATTENTION]				   = {"attention", p->attention_src},
-		[GL_PIPE_ATTENTION_BATCH]		   = {"attention_batch", p->attention_batch_src},
-		[GL_PIPE_PARTIAL_ROPE_QK]		   = {"partial_rope_qk", gl_shader_partial_rope_qk_src},
-		[GL_PIPE_KV_PUT]				   = {"kv_put", gl_shader_kv_put_src},
+											  gl_shader_ffn_activate_fused_batch_src, 0, UINT32_MAX,
+											  1, 0},
+		[GL_PIPE_ATTENTION]				   = {"attention", p->attention_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ATTENTION_BATCH] = {"attention_batch", p->attention_batch_src, 0, UINT32_MAX, 1,
+									 0},
+		[GL_PIPE_PARTIAL_ROPE_QK] = {"partial_rope_qk", gl_shader_partial_rope_qk_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_KV_PUT]		  = {"kv_put", gl_shader_kv_put_src, 0, UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
+	static const struct {
+		int			pipe;
+		const char *define;
+	} variant_defs[] = {
+		{GL_PIPE_MATMUL_BF16, "BF16"},
+		{GL_PIPE_MATMUL_Q5_K, "Q5K"},
+		{GL_PIPE_MATMUL_Q5_K_R8, "Q5K"},
+	};
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
-		bool  tuned		= gl_pipe_uses_matmul_wg(i);
-		char *tuned_src = tuned ? gl_shader_with_define(defs[i].src, "WG", p->matmul_wg) : NULL;
-		if (tuned && !tuned_src)
-			s = ERR_INTERNAL;
-		else
-			s = gl_build_pipeline(tuned_src ? tuned_src : defs[i].src, defs[i].name, &p->pipes[i]);
+		char *tuned_src = NULL;
+		if (defs[i].flags & GL_PIPE_F_MATMUL_WG) {
+			tuned_src = gl_shader_with_define(defs[i].src, "WG", p->matmul_wg);
+			if (!tuned_src) {
+				s = ERR_INTERNAL;
+				break;
+			}
+		}
+		if (defs[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) {
+			char *with_r8 = gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "R8", 1);
+			if (!with_r8) {
+				free(tuned_src);
+				s = ERR_INTERNAL;
+				break;
+			}
+			free(tuned_src);
+			tuned_src = with_r8;
+		}
+		if (defs[i].flags & GL_PIPE_F_TILED) {
+			char *with_cols =
+				gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "MT", GL_MATMUL_COLS);
+			if (!with_cols) {
+				free(tuned_src);
+				s = ERR_INTERNAL;
+				break;
+			}
+			free(tuned_src);
+			tuned_src = with_cols;
+		}
+		if ((defs[i].flags & GL_PIPE_F_FUSED_ACT) && !tuned_src) {
+			tuned_src = gl_shader_with_define(defs[i].src, "FUSED_ACT", 1);
+			if (!tuned_src) {
+				s = ERR_INTERNAL;
+				break;
+			}
+		}
+		for (size_t vi = 0; vi < ARRAY_LEN(variant_defs); vi++) {
+			if (variant_defs[vi].pipe != i)
+				continue;
+			char *with_var = gl_shader_with_define(tuned_src ? tuned_src : defs[i].src,
+												   variant_defs[vi].define, 1);
+			if (!with_var) {
+				free(tuned_src);
+				s = ERR_INTERNAL;
+				break;
+			}
+			free(tuned_src);
+			tuned_src = with_var;
+		}
+		if (s != OK)
+			break;
+		s = gl_build_pipeline(tuned_src ? tuned_src : defs[i].src, defs[i].name, &p->pipes[i]);
+		p->pipes[i].src			= defs[i].src;
+		p->pipes[i].flags		= defs[i].flags;
+		p->pipes[i].w_type		= defs[i].w_type;
+		p->pipes[i].rows_per_wg = defs[i].rows_per_wg;
+		p->pipes[i].block_size	= defs[i].block_size;
 		free(tuned_src);
 		if (s != OK) {
 			for (int j = 0; j < i; j++)
@@ -779,8 +1080,20 @@ static status_code gl_init(backend *self, int device_index) {
 		}
 	}
 
-	p->iq3s_grid = gl_buf_alloc(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid);
-	if (!p->iq3s_grid) {
+	static const int8_t iq4nl_values[16] = {
+		-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+	};
+	uint32_t iq4nl_pairs[256];
+	for (int b = 0; b < 256; b++)
+		iq4nl_pairs[b] =
+			(uint32_t)((int32_t)iq4nl_values[b & 15] + (int32_t)iq4nl_values[b >> 4] * 65536);
+	p->iq3s_grid   = gl_buf_alloc(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid);
+	p->iq4nl_pairs = gl_buf_alloc(p, sizeof(iq4nl_pairs), GL_STATIC_DRAW, iq4nl_pairs);
+	if (!p->iq3s_grid || !p->iq4nl_pairs) {
+		if (p->iq3s_grid)
+			gl_buf_free(p, p->iq3s_grid);
+		if (p->iq4nl_pairs)
+			gl_buf_free(p, p->iq4nl_pairs);
 		for (int i = 0; i < GL_PIPE_COUNT; i++)
 			glDeleteProgram(p->pipes[i].program);
 		free(p->attention_src);
@@ -793,9 +1106,9 @@ static status_code gl_init(backend *self, int device_index) {
 
 	p->device_local_total_estimate = get_total_memory();
 
-	log_tag("OGL", "%s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_tile=%d, matmul_wg=%d)",
+	log_tag("OGL", "%s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
 			p->ctx.renderer, p->ctx.max_wg_size, p->ctx.max_shared_bytes / 1024,
-			p->ctx.max_ssbo_bindings, p->attention_tile_t, p->matmul_wg);
+			p->ctx.max_ssbo_bindings, GL_ATTENTION_WG, p->matmul_wg);
 
 	return OK;
 }
@@ -804,6 +1117,7 @@ static void gl_free(backend *self) {
 	gl_priv *p = self->priv;
 	if (!p)
 		return;
+	gl_thread_current = NULL;
 
 	if (gl_ensure_context(p) != OK) {
 		WARN("gl: free could not make the GL context current; leaking GL objects");
@@ -811,6 +1125,7 @@ static void gl_free(backend *self) {
 		free(p->attention_src);
 		free(p->attention_batch_src);
 		gl_context_free(&p->ctx);
+		gl_thread_current = NULL;
 		free(p);
 		self->priv = NULL;
 		return;
@@ -820,10 +1135,9 @@ static void gl_free(backend *self) {
 		glDeleteProgram(p->pipes[i].program);
 
 	gl_buf_free(p, p->iq3s_grid);
-	if (p->rope_cos_tbl.handle)
-		gl_buf_free(p, as_glbuf(&p->rope_cos_tbl));
-	if (p->rope_sin_tbl.handle)
-		gl_buf_free(p, as_glbuf(&p->rope_sin_tbl));
+	gl_buf_free(p, p->iq4nl_pairs);
+	for (int i = 0; i < GL_ROPE_CACHE_SLOTS; i++)
+		free(p->rope_cache[i].valid);
 	free(p->attention_src);
 	free(p->attention_batch_src);
 	free(p->fb_scores);
@@ -839,6 +1153,7 @@ static void gl_free(backend *self) {
 
 	gl_context_free(&p->ctx);
 
+	gl_thread_current = NULL;
 	free(p);
 	self->priv = NULL;
 }
@@ -855,17 +1170,30 @@ static bool gl_weight_is_device_only(uint32_t type) {
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_Q4_K_R8:
+	case GGML_TYPE_Q5_K_R8:
+	case GGML_TYPE_Q6_K_R8:
 		return true;
 	default:
 		return false;
 	}
 }
 
+static int gl_type_is_r8(uint32_t type) {
+	return type == GGML_TYPE_Q4_0_R8 || type == GGML_TYPE_Q8_0_R8 || type == GGML_TYPE_IQ4_NL_R8 ||
+		   type == GGML_TYPE_Q4_K_R8 || type == GGML_TYPE_Q5_K_R8 || type == GGML_TYPE_Q6_K_R8;
+}
+
 static status_code gl_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
-	size_t size = (desc->n_dims == 1) ? ggml_row_size(desc->type, desc->dims[0])
-									  : ggml_row_size(desc->type, desc->dims[0]) * desc->dims[1];
+	uint64_t d1 = (desc->n_dims == 1) ? 1 : desc->dims[1];
+	if (gl_type_is_r8(desc->type))
+		d1 = (d1 + 7) & ~(uint64_t)7;
+	size_t size = ggml_row_size(desc->type, desc->dims[0]) * (size_t)d1;
 
 	bool	keep_host_mirror = desc->n_dims == 1 || !gl_weight_is_device_only(desc->type);
 	gl_buf *b = gl_buf_alloc_ex(p, size, GL_STATIC_DRAW, desc->host_data, keep_host_mirror);
@@ -989,7 +1317,8 @@ static size_t gl_mem_total(backend *self) {
 }
 
 static void gl_release_thread(backend *self) {
-	gl_priv *p = self->priv;
+	gl_priv *p		  = self->priv;
+	gl_thread_current = NULL;
 	if (!p || !p->ctx.dpy || eglGetCurrentContext() != p->ctx.ctx)
 		return;
 	glFinish();
@@ -1085,6 +1414,14 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_IQ3_S:
 		pipe = &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT];
 		break;
+	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_Q4_K_R8:
+	case GGML_TYPE_Q5_K_R8:
+	case GGML_TYPE_Q6_K_R8:
+		return ERR_UNSUPPORTED;
 	default: {
 		gl_buf *eb = as_glbuf(tok_embd);
 		gl_buf *ob = as_glbuf(x_out);
@@ -1120,23 +1457,16 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	if (pipe == &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT]) {
 		int				   uniforms[4] = {token, dim, (int)tok_embd_type, (int)row_stride};
 		static const char *unames[4]   = {"u_token", "u_dim", "u_type", "u_row_stride"};
-		glUseProgram(pipe->program);
+		gl_use_pipeline(p, pipe);
 		gl_bind_ssbo(0, tok_embd);
-		gl_bind_ssbo(1, x_out);
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, p->iq3s_grid->name);
+		gl_bind_ssbo_out(1, x_out);
+		gl_bind_raw(p, 2, p->iq3s_grid->name, 0, 0, 0);
 		gl_pu(pipe, unames[0], uniforms[0]);
 		gl_pu(pipe, unames[1], uniforms[1]);
 		gl_pu(pipe, unames[2], uniforms[2]);
 		gl_pu(pipe, unames[3], uniforms[3]);
 		GLuint groups = (GLuint)((dim + 63) / 64);
-		glDispatchCompute(groups, 1, 1);
-		GLenum err = glGetError();
-		if (err != GL_NO_ERROR) {
-			ERROR("gl: embd_lookup_quant dispatch failed (glErr=0x%04x)", (unsigned)err);
-			p->device_lost = 1;
-			return ERR_INTERNAL;
-		}
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+		gl_launch(p, groups, 1, 1);
 		bufs[1]->device_dirty = 1;
 		return OK;
 	}
@@ -1144,7 +1474,7 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	int				   uniforms[3] = {token, dim, (int)row_stride};
 	static const char *unames[3]   = {"u_token", "u_dim", "u_row_stride"};
 	GLuint			   groups	   = (GLuint)((dim + 63) / 64);
-	status_code		   s = gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 3, groups, 1, 1);
+	status_code		   s = gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 3, groups, 1, 1, 1);
 	if (s == OK)
 		bufs[1]->device_dirty = 1;
 	return s;
@@ -1162,22 +1492,15 @@ static status_code gl_rmsnorm(backend *self, const buffer *x, const buffer *w, b
 	if (n <= 0)
 		return OK;
 
-	glUseProgram(p->pipes[GL_PIPE_RMSNORM].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_RMSNORM]);
 	gl_bind_ssbo(0, x);
 	gl_bind_ssbo(1, w);
-	gl_bind_ssbo(2, y);
+	gl_bind_ssbo_out(2, y);
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM], "u_n", n);
 	gl_puf(&p->pipes[GL_PIPE_RMSNORM], "u_eps", eps);
 
 	GLuint groups = 1;
-	glDispatchCompute(groups, 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: rmsnorm dispatch failed (glErr=0x%04x)", (unsigned)err);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, groups, 1, 1);
 	bufs[2]->device_dirty = 1;
 	return OK;
 }
@@ -1217,17 +1540,17 @@ static status_code gl_rmsnorm_ph_impl(gl_priv *p, const buffer *x, const buffer 
 	if (rb)
 		gl_buf_sync_to_device(rb);
 
-	glUseProgram(p->pipes[GL_PIPE_RMSNORM_PER_HEAD].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_RMSNORM_PER_HEAD]);
 	gl_bind_ssbo(0, x);
 	if (wb)
 		gl_bind_ssbo(1, w);
 	else
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, p->dummy->name);
-	gl_bind_ssbo(2, y);
+		gl_bind_raw(p, 1, p->dummy->name, 0, 0, 0);
+	gl_bind_ssbo_out(2, y);
 	if (rb)
 		gl_bind_ssbo(3, residual);
 	else
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, p->dummy->name);
+		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_n_heads", n_heads);
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_head_dim", head_dim);
 	gl_puf(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_eps", eps);
@@ -1236,15 +1559,7 @@ static status_code gl_rmsnorm_ph_impl(gl_priv *p, const buffer *x, const buffer 
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_has_residual", rb ? 1 : 0);
 	gl_puf(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_out_scale", out_scale);
 
-	glDispatchCompute((GLuint)n_heads, (GLuint)rows, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: rmsnorm_per_head dispatch failed (glErr=0x%04x, heads=%d, hd=%d, rows=%d)",
-			  (unsigned)err, n_heads, head_dim, rows);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, (GLuint)n_heads, (GLuint)rows, 1);
 	yb->device_dirty = 1;
 	return OK;
 }
@@ -1350,16 +1665,16 @@ static status_code gl_elementwise(gl_priv *p, buffer *x, const buffer *y, const 
 		return OK;
 	}
 
-	glUseProgram(p->pipes[GL_PIPE_ELEMENTWISE].program);
-	gl_bind_ssbo(0, x);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_ELEMENTWISE]);
+	gl_bind_ssbo_out(0, x);
 	if (y)
 		gl_bind_ssbo(1, y);
 	else
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, dummy->name);
+		gl_bind_raw(p, 1, dummy->name, 0, 0, 0);
 	if (z)
-		gl_bind_ssbo(2, z);
+		gl_bind_ssbo_out(2, z);
 	else
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, dummy->name);
+		gl_bind_raw(p, 2, dummy->name, 0, 0, 0);
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_n", n);
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_mode", mode);
 	gl_puf(&p->pipes[GL_PIPE_ELEMENTWISE], "u_scale", scale);
@@ -1369,15 +1684,7 @@ static status_code gl_elementwise(gl_priv *p, buffer *x, const buffer *y, const 
 	GLuint groups = (GLuint)((n + 127) / 128);
 	GLuint gy	  = (GLuint)MIN(rows, 65535);
 	GLuint gz	  = (GLuint)((rows + 65534) / 65535);
-	glDispatchCompute(groups, gy, gz);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: elementwise dispatch failed (glErr=0x%04x, n=%d, groups=%u, mode=%d)",
-			  (unsigned)err, n, groups, mode);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, groups, gy, gz);
 	bufs[0]->device_dirty = 1;
 	if (z)
 		bufs[2]->device_dirty = 1;
@@ -1497,21 +1804,14 @@ static status_code gl_ffn_activate(backend *self, const buffer *gate, const buff
 	if (n <= 0)
 		return OK;
 
-	glUseProgram(p->pipes[GL_PIPE_FFN_ACTIVATE].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_FFN_ACTIVATE]);
 	gl_bind_ssbo(0, gate);
 	gl_bind_ssbo(1, up);
-	gl_bind_ssbo(2, out);
+	gl_bind_ssbo_out(2, out);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_n", n);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_act", 0);
 	GLuint groups = (GLuint)((n + 127) / 128);
-	glDispatchCompute(groups, 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: ffn_activate dispatch failed (glErr=0x%04x)", (unsigned)err);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, groups, 1, 1);
 	bufs[2]->device_dirty = 1;
 	return OK;
 }
@@ -1541,22 +1841,16 @@ static status_code gl_ffn_activate_ex(backend *self, const buffer *gate, const b
 	if (n <= 0)
 		return OK;
 
-	glUseProgram(p->pipes[GL_PIPE_FFN_ACTIVATE].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_FFN_ACTIVATE]);
 	gl_bind_ssbo(0, gate);
 	gl_bind_ssbo(1, up);
-	gl_bind_ssbo(2, out);
+	gl_bind_ssbo_out(2, out);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_n", n);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_act", activation);
-	GLuint groups = (GLuint)((n + 127) / 128);
-	glDispatchCompute(groups, 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: ffn_activate_ex dispatch failed (glErr=0x%04x, act=%d)", (unsigned)err,
-			  activation);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	size_t fgroups = ((size_t)n + 127) / 128;
+	GLuint fgx	   = fgroups > GL_MAX_DISPATCH_PER_DIM ? GL_MAX_DISPATCH_PER_DIM : (GLuint)fgroups;
+	GLuint fgy	   = (GLuint)((fgroups + fgx - 1) / fgx);
+	gl_launch(p, fgx, fgy, 1);
 	bufs[2]->device_dirty = 1;
 	return OK;
 }
@@ -1587,30 +1881,111 @@ static status_code gl_rope_apply(backend *self, buffer *vec, int n_heads, int he
 
 	int total = n_heads * half;
 
-	glUseProgram(p->pipes[GL_PIPE_ROPE].program);
-	gl_bind_ssbo(0, vec);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_ROPE]);
+	gl_bind_ssbo_out(0, vec);
 	gl_bind_ssbo(1, &cos_b);
 	gl_bind_ssbo(2, &sin_b);
 	gl_pu(&p->pipes[GL_PIPE_ROPE], "u_n_heads", n_heads);
 	gl_pu(&p->pipes[GL_PIPE_ROPE], "u_head_dim", head_dim);
 	gl_pu(&p->pipes[GL_PIPE_ROPE], "u_neox", self->rope_neox);
+	gl_pu(&p->pipes[GL_PIPE_ROPE], "u_pos", 0);
 
 	GLuint groups = (GLuint)((total + 127) / 128);
-	glDispatchCompute(groups, 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: rope dispatch failed (glErr=0x%04x)", (unsigned)err);
-		p->device_lost = 1;
-		self->buffer_free(self, &cos_b);
-		self->buffer_free(self, &sin_b);
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, groups, 1, 1);
 	bufs[0]->device_dirty = 1;
 
 	self->buffer_free(self, &cos_b);
 	self->buffer_free(self, &sin_b);
 	return OK;
+}
+
+static void gl_rope_cache_release(gl_priv *p, gl_rope_cache *slot) {
+	if (slot->cos_buf)
+		gl_buf_free(p, slot->cos_buf);
+	if (slot->sin_buf)
+		gl_buf_free(p, slot->sin_buf);
+	free(slot->valid);
+	*slot = (gl_rope_cache){0};
+}
+
+static void gl_upload_row(const gl_buf *b, size_t float_offset, const float *src, int count) {
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)(float_offset * sizeof(float)),
+					(GLsizeiptr)((size_t)count * sizeof(float)), src);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+static gl_rope_cache *gl_rope_cache_slot(gl_priv *p, const float *cos_base, const float *sin_base,
+										 int half, float theta) {
+	for (int i = 0; i < GL_ROPE_CACHE_SLOTS; i++) {
+		gl_rope_cache *slot = &p->rope_cache[i];
+		if (slot->cos_base == cos_base && slot->sin_base == sin_base && slot->half == half &&
+			slot->theta == theta)
+			return slot;
+	}
+	gl_rope_cache *slot = &p->rope_cache[p->rope_cache_next++ % GL_ROPE_CACHE_SLOTS];
+	gl_rope_cache_release(p, slot);
+	slot->cos_base = cos_base;
+	slot->sin_base = sin_base;
+	slot->half	   = half;
+	slot->theta	   = theta;
+	return slot;
+}
+
+static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, const float *sin_base,
+										  int half, float theta, int pos, int count) {
+	if (pos < 0 || count <= 0)
+		return NULL;
+	int			   last = pos + count - 1;
+	gl_rope_cache *slot = gl_rope_cache_slot(p, cos_base, sin_base, half, theta);
+	if (last >= slot->capacity) {
+		int capacity = GL_ROPE_CACHE_MIN_POSITIONS;
+		while (capacity <= last)
+			capacity *= 2;
+		size_t	 bytes	 = (size_t)capacity * (size_t)half * sizeof(float);
+		gl_buf	*cos_buf = gl_buf_alloc(p, bytes, GL_DYNAMIC_COPY, NULL);
+		gl_buf	*sin_buf = gl_buf_alloc(p, bytes, GL_DYNAMIC_COPY, NULL);
+		uint8_t *valid	 = xcalloc((size_t)capacity, 1);
+		if (!cos_buf || !sin_buf || !valid) {
+			if (cos_buf)
+				gl_buf_free(p, cos_buf);
+			if (sin_buf)
+				gl_buf_free(p, sin_buf);
+			free(valid);
+			return NULL;
+		}
+		if (slot->cos_buf)
+			gl_buf_free(p, slot->cos_buf);
+		if (slot->sin_buf)
+			gl_buf_free(p, slot->sin_buf);
+		free(slot->valid);
+		slot->cos_buf  = cos_buf;
+		slot->sin_buf  = sin_buf;
+		slot->valid	   = valid;
+		slot->capacity = capacity;
+	}
+	int first_missing = -1;
+	int last_missing  = -1;
+	for (int i = pos; i <= last; i++) {
+		if (slot->valid[i])
+			continue;
+		if (first_missing < 0)
+			first_missing = i;
+		last_missing = i;
+	}
+	if (first_missing >= 0) {
+		size_t offset = (size_t)first_missing * (size_t)half;
+		int	   floats = (last_missing - first_missing + 1) * half;
+		gl_upload_row(slot->cos_buf, offset, cos_base + offset, floats);
+		gl_upload_row(slot->sin_buf, offset, sin_base + offset, floats);
+		memset(slot->valid + first_missing, 1, (size_t)(last_missing - first_missing + 1));
+	}
+	return slot;
+}
+
+static gl_rope_cache *gl_rope_cache_row(gl_priv *p, const float *cos_base, const float *sin_base,
+										int half, float theta, int pos) {
+	return gl_rope_cache_range(p, cos_base, sin_base, half, theta, pos, 1);
 }
 
 static status_code gl_rope(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
@@ -1620,8 +1995,26 @@ static status_code gl_rope(backend *self, buffer *vec, int n_heads, int head_dim
 	int half = head_dim / 2;
 	if (n_heads <= 0 || half <= 0)
 		return OK;
-	return gl_rope_apply(self, vec, n_heads, head_dim, rope_cos_base + (size_t)pos * half,
-						 rope_sin_base + (size_t)pos * half);
+	gl_rope_cache *slot =
+		gl_rope_cache_row(p, rope_cos_base, rope_sin_base, half, self->rope_theta, pos);
+	if (!slot || !p->pipes[GL_PIPE_ROPE].program)
+		return gl_rope_apply(self, vec, n_heads, head_dim, rope_cos_base + (size_t)pos * half,
+							 rope_sin_base + (size_t)pos * half);
+
+	gl_buf *vgb = as_glbuf(vec);
+	gl_buf_sync_to_device(vgb);
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_ROPE];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo_out(0, vec);
+	gl_bind_raw(p, 1, slot->cos_buf->name, 0, 0, 0);
+	gl_bind_raw(p, 2, slot->sin_buf->name, 0, 0, 0);
+	gl_pu(pipe, "u_n_heads", n_heads);
+	gl_pu(pipe, "u_head_dim", head_dim);
+	gl_pu(pipe, "u_neox", self->rope_neox);
+	gl_pu(pipe, "u_pos", pos);
+	gl_launch(p, (GLuint)((n_heads * half + 127) / 128), 1, 1);
+	vgb->device_dirty = 1;
+	return OK;
 }
 
 static status_code gl_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
@@ -1629,10 +2022,40 @@ static status_code gl_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, 
 							  const float *rope_sin_base) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
+	int half = head_dim / 2;
+	if (n_heads <= 0 || n_kv_heads <= 0 || half <= 0 || !p->pipes[GL_PIPE_ROPE_QK].program)
+		goto separate;
+	{
+		gl_rope_cache *slot =
+			gl_rope_cache_row(p, rope_cos_base, rope_sin_base, half, self->rope_theta, pos);
+		if (!slot)
+			goto separate;
+		gl_buf *qgb = as_glbuf(q);
+		gl_buf *kgb = as_glbuf(k);
+		gl_buf_sync_to_device(qgb);
+		gl_buf_sync_to_device(kgb);
+		gl_pipeline *pipe = &p->pipes[GL_PIPE_ROPE_QK];
+		gl_use_pipeline(p, pipe);
+		gl_bind_ssbo_out(0, q);
+		gl_bind_ssbo_out(1, k);
+		gl_bind_raw(p, 2, slot->cos_buf->name, 0, 0, 0);
+		gl_bind_raw(p, 3, slot->sin_buf->name, 0, 0, 0);
+		gl_pu(pipe, "u_n_heads", n_heads);
+		gl_pu(pipe, "u_n_kv_heads", n_kv_heads);
+		gl_pu(pipe, "u_head_dim", head_dim);
+		gl_pu(pipe, "u_pos", pos);
+		gl_pu(pipe, "u_neox", self->rope_neox);
+		gl_launch(p, (GLuint)(((n_heads + n_kv_heads) * half + 127) / 128), 1, 1);
+		qgb->device_dirty = 1;
+		kgb->device_dirty = 1;
+		return OK;
+	}
+separate: {
 	status_code s = gl_rope(self, q, n_heads, head_dim, pos, rope_cos_base, rope_sin_base);
 	if (s != OK)
 		return s;
 	return gl_rope(self, k, n_kv_heads, head_dim, pos, rope_cos_base, rope_sin_base);
+}
 }
 
 static status_code gl_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
@@ -1710,9 +2133,9 @@ static status_code gl_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	gl_buf_sync_to_device(as_glbuf(&cos_b));
 	gl_buf_sync_to_device(as_glbuf(&sin_b));
 
-	glUseProgram(p->pipes[GL_PIPE_PARTIAL_ROPE_QK].program);
-	gl_bind_ssbo(0, q);
-	gl_bind_ssbo(1, k);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_PARTIAL_ROPE_QK]);
+	gl_bind_ssbo_out(0, q);
+	gl_bind_ssbo_out(1, k);
 	gl_bind_ssbo(2, &cos_b);
 	gl_bind_ssbo(3, &sin_b);
 	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_n_heads", n_heads);
@@ -1726,18 +2149,7 @@ static status_code gl_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	GLuint gx		   = (GLuint)((total_heads + 63) / 64);
 	GLuint gy		   = (GLuint)MIN(n_rows, 65535);
 	GLuint gz		   = (GLuint)((n_rows + 65534) / 65535);
-	glDispatchCompute(gx, gy, gz);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: partial_rope_qk dispatch failed (glErr=0x%04x, rows=%d, heads=%d, "
-			  "head_dim=%d, rope_dim=%d)",
-			  (unsigned)err, n_rows, total_heads, head_dim, rope_dim);
-		p->device_lost = 1;
-		self->buffer_free(self, &cos_b);
-		self->buffer_free(self, &sin_b);
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, gx, gy, gz);
 	qb->device_dirty = 1;
 	kb->device_dirty = 1;
 
@@ -1746,77 +2158,65 @@ static status_code gl_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	return OK;
 }
 
-static int gl_matmul_type_native(backend *self, uint32_t w_type) {
+static status_code gl_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
+								  uint32_t *re_type_out) {
 	(void)self;
-	return w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16 ||
-		   w_type == GGML_TYPE_IQ4_NL || w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_1 ||
-		   w_type == GGML_TYPE_Q5_0 || w_type == GGML_TYPE_Q5_1 || w_type == GGML_TYPE_Q8_0 ||
-		   w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_Q6_K ||
-		   w_type == GGML_TYPE_IQ3_S;
+	const uint64_t rows_group = 8;
+	uint32_t	   re_type	  = 0;
+	if (d1 % rows_group == 0) {
+		if (type == GGML_TYPE_Q4_0 && d0 % 32 == 0)
+			re_type = GGML_TYPE_Q4_0_R8;
+		else if (type == GGML_TYPE_Q8_0 && d0 % 32 == 0)
+			re_type = GGML_TYPE_Q8_0_R8;
+		else if (type == GGML_TYPE_IQ4_NL && d0 % 32 == 0)
+			re_type = GGML_TYPE_IQ4_NL_R8;
+		else if (type == GGML_TYPE_Q4_K && d0 % 256 == 0)
+			re_type = GGML_TYPE_Q4_K_R8;
+		else if (type == GGML_TYPE_Q5_K && d0 % 256 == 0)
+			re_type = GGML_TYPE_Q5_K_R8;
+		else if (type == GGML_TYPE_Q6_K && d0 % 256 == 0)
+			re_type = GGML_TYPE_Q6_K_R8;
+	}
+	if (!re_type)
+		return ERR_UNSUPPORTED;
+	*re_type_out = re_type;
+	return OK;
+}
+
+static status_code gl_repack_weight(backend *self, uint32_t type, const void *src, void *dst,
+									int n_rows, int k) {
+	uint32_t	re_type = 0;
+	status_code ps		= gl_repack_plan(self, type, (uint64_t)k, (uint64_t)n_rows, &re_type);
+	if (ps != OK)
+		return ps;
+	if (!src || !dst || n_rows <= 0 || k <= 0)
+		return ERR_INVALID_ARG;
+	backend *host = backend_host();
+	if (!host || !host->repack_weight)
+		return ERR_UNSUPPORTED;
+	return host->repack_weight(host, type, src, dst, n_rows, k);
+}
+
+static int gl_matmul_type_native(backend *self, uint32_t w_type) {
+	const gl_priv *p = self->priv;
+	for (int i = 0; i < GL_PIPE_COUNT; i++)
+		if (p->pipes[i].w_type == w_type)
+			return 1;
+	return 0;
 }
 
 static int gl_matmul_pipe_for_type(gl_priv *p, uint32_t w_type, gl_pipeline **out_pipe,
 								   int *out_block_size) {
-	gl_pipeline *pipe		= NULL;
-	int			 block_size = 0;
-	switch (w_type) {
-	case GGML_TYPE_F32:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F32];
-		break;
-	case GGML_TYPE_F16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F16];
-		break;
-	case GGML_TYPE_BF16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_BF16];
-		break;
-	case GGML_TYPE_IQ4_NL:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ4_NL];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q8_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q8_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q5_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q6_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q6_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_IQ3_S:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ3_S];
-		block_size = 256;
-		break;
-	default:
-		return 0;
+	for (int i = 0; i < GL_PIPE_COUNT; i++) {
+		if (p->pipes[i].w_type == UINT32_MAX || p->pipes[i].w_type != w_type)
+			continue;
+		if (!p->pipes[i].program)
+			return 0;
+		*out_pipe		= &p->pipes[i];
+		*out_block_size = p->pipes[i].block_size;
+		return 1;
 	}
-	if (!pipe->program)
-		return 0;
-	*out_pipe		= pipe;
-	*out_block_size = block_size;
-	return 1;
+	return 0;
 }
 
 static int gl_matmul_buf_ok(const buffer *b) {
@@ -1832,100 +2232,152 @@ static int gl_matmul_f32_align_ok(const buffer *x, const buffer *y, const buffer
 	return 1;
 }
 
-#define GL_XQ_BLOCK_WORDS 12u
+#define GL_XQ_BLOCK_WORDS 44u
 
 static int gl_pipe_uses_xq(const gl_priv *p, const gl_pipeline *pipe) {
-	return pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0] || pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL];
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_USES_XQ) != 0;
 }
 
-static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m) {
-	if (!p->pipes[GL_PIPE_QUANTIZE_X].program || m > (int)GL_MAX_DISPATCH_PER_DIM)
+static int gl_pipe_uses_iq4nl_lut(const gl_priv *p, const gl_pipeline *pipe) {
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_IQ4NL_LUT) != 0;
+}
+
+static int gl_pipe_uses_xqk(const gl_priv *p, const gl_pipeline *pipe) {
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_USES_XQK) != 0;
+}
+
+typedef struct {
+	int		 plain_pipe;
+	int		 act_pipe;
+	int		 block;
+	int		 check_block;
+	unsigned words_per_block;
+	unsigned gx_div;
+} gl_quantize_spec;
+
+static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_buf **slot,
+								   size_t *row_words, const buffer *x, int k, int m,
+								   const buffer *up, int activation) {
+	gl_pipeline *pipe = &p->pipes[up ? spec->act_pipe : spec->plain_pipe];
+	if (!pipe->program || m > (int)GL_MAX_DISPATCH_PER_DIM)
 		return ERR_UNSUPPORTED;
-	int	  k_blocks	 = k / 32;
-	GLint ssbo_align = 0;
-	glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &ssbo_align);
-	size_t align	 = ssbo_align > 4 ? (size_t)ssbo_align : 4;
-	size_t row_bytes = ALIGN_UP((size_t)k_blocks * GL_XQ_BLOCK_WORDS * sizeof(uint32_t), align);
+	if (spec->check_block && (k <= 0 || (k % spec->block) != 0))
+		return ERR_UNSUPPORTED;
+	int	   k_blocks	 = k / spec->block;
+	size_t align	 = MAX(gl_ssbo_align(p), (size_t)4);
+	size_t row_bytes = ALIGN_UP((size_t)k_blocks * spec->words_per_block * sizeof(uint32_t), align);
 	size_t need		 = row_bytes * (size_t)m;
-	if (!p->qx || p->qx->size_bytes < need) {
-		if (p->qx)
-			gl_buf_free(p, p->qx);
-		p->qx = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
-		if (!p->qx)
+	if (!*slot || (*slot)->size_bytes < need) {
+		if (*slot)
+			gl_buf_free(p, *slot);
+		*slot = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
+		if (!*slot)
 			return ERR_OUT_OF_MEMORY;
 	}
-	p->qx_row_bytes = row_bytes;
+	*row_words = row_bytes / sizeof(uint32_t);
 
-	glUseProgram(p->pipes[GL_PIPE_QUANTIZE_X].program);
+	gl_use_pipeline(p, pipe);
 	gl_bind_ssbo(0, x);
-	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, p->qx->name);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_X], "u_k_blocks", k_blocks);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_X], "u_k", k);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_X], "u_row_words", (int)(row_bytes / sizeof(uint32_t)));
-	glDispatchCompute((GLuint)((k_blocks + 63) / 64), (GLuint)m, 1);
-	if (glGetError() != GL_NO_ERROR) {
-		p->device_lost = 1;
-		return ERR_INTERNAL;
+	if (up) {
+		gl_bind_ssbo(2, up);
+		gl_pu(pipe, "u_act", activation);
 	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_bind_raw(p, 1, (*slot)->name, 0, 0, 1);
+	gl_pu(pipe, "u_k_blocks", k_blocks);
+	gl_pu(pipe, "u_k", k);
+	gl_pu(pipe, "u_row_words", (int)*row_words);
+	GLuint gx		 = (GLuint)(((unsigned)k_blocks + spec->gx_div - 1u) / spec->gx_div);
+	int	   row_chunk = 65536 / (k_blocks > 0 ? k_blocks : 1);
+	if (row_chunk < 1)
+		row_chunk = 1;
+	for (int r0 = 0; r0 < m; r0 += row_chunk) {
+		int rows = m - r0;
+		if (rows > row_chunk)
+			rows = row_chunk;
+		gl_pu(pipe, "u_row0", r0);
+		gl_launch(p, gx, (GLuint)rows, 1);
+	}
 	return OK;
 }
 
-#define GL_XQK_WORDS_PER_BLOCK 65u
+static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
+								 int activation) {
+	static const gl_quantize_spec spec = {
+		GL_PIPE_QUANTIZE_X, GL_PIPE_QUANTIZE_X_ACT, 32, 0, GL_XQ_BLOCK_WORDS, 64};
+	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation);
+}
 
-static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m) {
-	if (!p->pipes[GL_PIPE_QUANTIZE_Q8_K].program || m > (int)GL_MAX_DISPATCH_PER_DIM)
-		return ERR_UNSUPPORTED;
-	if (k <= 0 || (k % 256) != 0)
-		return ERR_UNSUPPORTED;
-	int	  k_blocks	 = k / 256;
-	GLint ssbo_align = 0;
-	glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &ssbo_align);
-	size_t align = ssbo_align > 4 ? (size_t)ssbo_align : 4;
-	size_t row_bytes =
-		ALIGN_UP((size_t)k_blocks * GL_XQK_WORDS_PER_BLOCK * sizeof(uint32_t), align);
-	size_t need = row_bytes * (size_t)m;
-	if (!p->qxk || p->qxk->size_bytes < need) {
-		if (p->qxk)
-			gl_buf_free(p, p->qxk);
-		p->qxk = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
-		if (!p->qxk)
-			return ERR_OUT_OF_MEMORY;
-	}
-	p->qxk_row_words = row_bytes / sizeof(uint32_t);
+#define GL_XQK_WORDS_PER_BLOCK 209u
 
-	glUseProgram(p->pipes[GL_PIPE_QUANTIZE_Q8_K].program);
-	gl_bind_ssbo(0, x);
-	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, p->qxk->name);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_Q8_K], "u_k_blocks", k_blocks);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_Q8_K], "u_k", k);
-	gl_pu(&p->pipes[GL_PIPE_QUANTIZE_Q8_K], "u_row_words", (int)p->qxk_row_words);
-	glDispatchCompute((GLuint)k_blocks, (GLuint)m, 1);
-	if (glGetError() != GL_NO_ERROR) {
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-	return OK;
+static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
+									int activation) {
+	static const gl_quantize_spec spec = {
+		GL_PIPE_QUANTIZE_Q8_K, GL_PIPE_QUANTIZE_Q8_K_ACT, 256, 1, GL_XQK_WORDS_PER_BLOCK, 1};
+	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation);
 }
 
 static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_F32])
-		return 4;
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL])
-		return p->matmul_wg;
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S])
-		return 32;
-	return 1;
+	(void)p;
+	return pipe->rows_per_wg;
+}
+
+static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
+	if (m < 2 || (pipe->flags & GL_PIPE_F_TILED))
+		return pipe;
+	for (int i = 0; i < GL_PIPE_COUNT; i++) {
+		if (!(p->pipes[i].flags & GL_PIPE_F_TILED) || p->pipes[i].src != pipe->src)
+			continue;
+		if ((p->pipes[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) !=
+			(pipe->flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)))
+			continue;
+		return &p->pipes[i];
+	}
+	return pipe;
+}
+
+static long gl_matmul_chunk_wg(gl_priv *p, const gl_pipeline *pipe, int k_blocks_eff) {
+	const char *override = getenv("KAPPAI_GL_CHUNK_WG");
+	if (override) {
+		long c = atol(override);
+		if (c >= 1 && c <= (long)GL_MAX_DISPATCH_PER_DIM)
+			return c;
+	}
+	int	 threads = (pipe->flags & GL_PIPE_F_MATMUL_WG) ? p->matmul_wg : 32;
+	long units	 = (long)threads * (long)(k_blocks_eff > 0 ? k_blocks_eff : 1);
+	long c		 = (long)3145728 / (units > 0 ? units : 1);
+	if (c < 64)
+		c = 64;
+	if (c > (long)GL_MAX_DISPATCH_PER_DIM)
+		c = (long)GL_MAX_DISPATCH_PER_DIM;
+	return c;
+}
+
+static status_code gl_matmul_launch_chunked(gl_priv *p, gl_pipeline *pipe, long total_wg,
+											int k_blocks_eff) {
+	if (total_wg <= 0)
+		return OK;
+	long chunk_max = gl_matmul_chunk_wg(p, pipe, k_blocks_eff);
+	long done	   = 0;
+	while (done < total_wg) {
+		long chunk = total_wg - done;
+		if (chunk > chunk_max)
+			chunk = chunk_max;
+		gl_pu(pipe, "u_wg_base", (int)done);
+		gl_launch(p, (GLuint)chunk, 1, 1);
+		done += chunk;
+	}
+	return OK;
 }
 
 static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_size,
 									  const buffer *w, const buffer *x, buffer *y,
-									  const buffer *residual, int n, int k, int xq_ready) {
-	if (n <= 0 || k <= 0)
+									  const buffer *residual, int n, int k, int m, int xq_ready) {
+	if (n <= 0 || k <= 0 || m <= 0)
 		return OK;
+	pipe = gl_matmul_tiled_pipe(p, pipe, m);
 
 	gl_buf *bufs[3] = {as_glbuf(w), as_glbuf(x), as_glbuf(y)};
 	for (int i = 0; i < 3; i++) {
@@ -1961,33 +2413,35 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 
 	const int use_xq = gl_pipe_uses_xq(p, pipe);
 	if (use_xq && !xq_ready) {
-		status_code qs = gl_quantize_x(p, x, k, 1);
+		status_code qs = gl_quantize_x(p, x, k, m, NULL, 0);
 		if (qs != OK)
 			return qs;
 	}
 
-	const int use_xqk = (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S]);
-	if (use_xqk) {
-		status_code qs = gl_quantize_q8_k(p, x, k, 1);
+	const int use_xqk = gl_pipe_uses_xqk(p, pipe);
+	if (use_xqk && !xq_ready) {
+		status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0);
 		if (qs != OK)
 			return qs == ERR_UNSUPPORTED ? ERR_UNSUPPORTED : qs;
 	}
 
-	glUseProgram(pipe->program);
+	gl_use_pipeline(p, pipe);
 	gl_bind_ssbo(0, w);
 	if (use_xq)
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, p->qx->name);
+		gl_bind_raw(p, 1, p->qx->name, 0, 0, 0);
 	else if (use_xqk)
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, p->qxk->name);
+		gl_bind_raw(p, 1, p->qxk->name, 0, 0, 0);
 	else
 		gl_bind_ssbo(1, x);
-	gl_bind_ssbo(2, y);
+	gl_bind_ssbo_out(2, y);
 	if (mode == 1)
 		gl_bind_ssbo(3, residual);
 	else
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, p->dummy->name);
+		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
 	if (use_xqk)
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, p->iq3s_grid->name);
+		gl_bind_raw(p, 4, p->iq3s_grid->name, 0, 0, 0);
+	else if (gl_pipe_uses_iq4nl_lut(p, pipe))
+		gl_bind_raw(p, 4, p->iq4nl_pairs->name, 0, 0, 0);
 	gl_pu(pipe, "u_n", n);
 
 	if (block_size == 0) {
@@ -1996,29 +2450,21 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		int k_blocks = k / block_size;
 		gl_pu(pipe, "u_k_blocks", k_blocks);
 	}
+	gl_pu(pipe, "u_m", m);
+	if (use_xq)
+		gl_pu(pipe, "u_x_stride", (int)(p->qx_row_words / 4));
+	else if (use_xqk)
+		gl_pu(pipe, "u_x_stride", (int)p->qxk_row_words);
 	gl_pu(pipe, "u_add_residual", mode);
 
-	int	   rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
-	int	   total_wg	   = (n + rows_per_wg - 1) / rows_per_wg;
-	GLuint gx, gy;
-	if ((GLuint)total_wg <= GL_MAX_DISPATCH_PER_DIM) {
-		gx = (GLuint)total_wg;
-		gy = 1;
-	} else {
-		gx = GL_MAX_DISPATCH_PER_DIM;
-		gy = ((GLuint)total_wg + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM;
-	}
-	glDispatchCompute(gx, gy, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: matmul dispatch failed (glErr=0x%04x, n=%d, k=%d, mode=%d)", (unsigned)err, n, k,
-			  mode);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	int	 rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
+	int	 cols_per_wg = (pipe->flags & GL_PIPE_F_TILED) ? GL_MATMUL_COLS : 1;
+	long total_wg =
+		(long)((n + rows_per_wg - 1) / rows_per_wg) * (long)((m + cols_per_wg - 1) / cols_per_wg);
+	int			k_eff	  = block_size > 0 ? k / block_size : (k + 31) / 32;
+	status_code ls		  = gl_matmul_launch_chunked(p, pipe, total_wg, k_eff);
 	bufs[2]->device_dirty = 1;
-	return OK;
+	return ls;
 }
 
 static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
@@ -2038,7 +2484,7 @@ static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, co
 		goto host_fallback;
 
 	{
-		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 0);
+		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 1, 0);
 		if (s == ERR_UNSUPPORTED)
 			goto host_fallback;
 		return s;
@@ -2071,60 +2517,7 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 
 	gl_pipeline *pipe		= NULL;
 	int			 block_size = 0;
-	switch (w_type) {
-	case GGML_TYPE_F32:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F32];
-		break;
-	case GGML_TYPE_F16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F16];
-		break;
-	case GGML_TYPE_BF16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_BF16];
-		break;
-	case GGML_TYPE_IQ4_NL:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ4_NL];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q8_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q8_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q5_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q6_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q6_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_IQ3_S:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ3_S];
-		block_size = 256;
-		break;
-	default:
-		goto host_fallback;
-	}
-	if (!pipe->program)
+	if (!gl_matmul_pipe_for_type(p, w_type, &pipe, &block_size))
 		goto host_fallback;
 	if (block_size > 0 && (k % block_size) != 0)
 		goto host_fallback;
@@ -2134,103 +2527,17 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	if (w_type == GGML_TYPE_F32 && (k & 3) != 0)
 		goto host_fallback;
 	{
-		GLint ssbo_align = 0;
-		glGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &ssbo_align);
-		size_t align = (size_t)(ssbo_align > 0 ? ssbo_align : 1);
+		size_t align = gl_ssbo_align(p);
 		if ((x->offset % align) != 0 || (y->offset % align) != 0 ||
 			((size_t)k * sizeof(float)) % align != 0 || ((size_t)n * sizeof(float)) % align != 0)
 			goto host_fallback;
 	}
 
 	{
-		gl_buf *wgb		= as_glbuf(w);
-		gl_buf *xgb		= as_glbuf(x);
-		gl_buf *ygb		= as_glbuf(y);
-		gl_buf *bufs[3] = {wgb, xgb, ygb};
-
-		for (int i = 0; i < 3; i++) {
-			if (!bufs[i] || bufs[i]->size_bytes == 0 || bufs[i]->size_bytes > (size_t)(1ull << 40))
-				goto host_fallback;
-		}
-
-		gl_buf_sync_to_device(bufs[0]);
-		gl_buf_sync_to_device(bufs[1]);
-		gl_buf_sync_to_device(bufs[2]);
-
-		const int use_xq = gl_pipe_uses_xq(p, pipe);
-		if (use_xq) {
-			status_code qs = gl_quantize_x(p, x, k, m);
-			if (qs == ERR_UNSUPPORTED)
-				goto host_fallback;
-			if (qs != OK)
-				return qs;
-		}
-
-		const int use_xqk = (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S]);
-		if (use_xqk) {
-			status_code qs = gl_quantize_q8_k(p, x, k, m);
-			if (qs == ERR_UNSUPPORTED)
-				goto host_fallback;
-			if (qs != OK)
-				return qs;
-		}
-
-		glUseProgram(pipe->program);
-		gl_bind_ssbo(0, w);
-		glUniform1i(0, n);
-
-		if (block_size == 0) {
-			glUniform1i(1, k);
-		} else {
-			int k_blocks = k / block_size;
-			glUniform1i(1, k_blocks);
-		}
-		glUniform1i(2, 0);
-		if (gl_ensure_dummy(p) != OK)
+		status_code ds = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, m, 0);
+		if (ds == ERR_UNSUPPORTED)
 			goto host_fallback;
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, p->dummy->name);
-		if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S])
-			glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, p->iq3s_grid->name);
-
-		int	   rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
-		int	   total_wg	   = (n + rows_per_wg - 1) / rows_per_wg;
-		GLuint gx, gy;
-		if ((GLuint)total_wg <= GL_MAX_DISPATCH_PER_DIM) {
-			gx = (GLuint)total_wg;
-			gy = 1;
-		} else {
-			gx = GL_MAX_DISPATCH_PER_DIM;
-			gy = ((GLuint)total_wg + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM;
-		}
-		for (int i = 0; i < m; i++) {
-			buffer yv =
-				buffer_slice(y, (size_t)i * (size_t)n * sizeof(float), (size_t)n * sizeof(float));
-			if (use_xq) {
-				glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, p->qx->name,
-								  (GLintptr)((size_t)i * p->qx_row_bytes),
-								  (GLsizeiptr)p->qx_row_bytes);
-			} else if (use_xqk) {
-				glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, p->qxk->name,
-								  (GLintptr)((size_t)i * p->qxk_row_words * sizeof(uint32_t)),
-								  (GLsizeiptr)((size_t)p->qxk_row_words * sizeof(uint32_t)));
-			} else {
-				buffer xv = buffer_slice(x, (size_t)i * (size_t)k * sizeof(float),
-										 (size_t)k * sizeof(float));
-				gl_bind_ssbo(1, &xv);
-			}
-			gl_bind_ssbo(2, &yv);
-			glDispatchCompute(gx, gy, 1);
-		}
-		GLenum err = glGetError();
-		if (err != GL_NO_ERROR) {
-			ERROR("gl: matmul_batch dispatch failed (glErr=0x%04x, type=%u, m=%d)", (unsigned)err,
-				  w_type, m);
-			p->device_lost = 1;
-			return ERR_INTERNAL;
-		}
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-		ygb->device_dirty = 1;
-		return OK;
+		return ds;
 	}
 
 host_fallback:
@@ -2264,7 +2571,7 @@ static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w
 		gl_matmul_buf_ok(x) && gl_matmul_buf_ok(y) && gl_matmul_buf_ok(residual) &&
 		(w_type != GGML_TYPE_F32 || gl_matmul_f32_align_ok(x, y, residual, k)) &&
 		(block_size == 0 || (k % block_size) == 0))
-		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 0);
+		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 1, 0);
 
 	if (s != ERR_UNSUPPORTED)
 		return s;
@@ -2321,24 +2628,33 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 		if (gl_ensure_dummy(p) != OK)
 			return ERR_OUT_OF_MEMORY;
 
-		int xq_ready = 0;
-		for (int i = 0; i < n_matmuls && !xq_ready; i++) {
-			if (n_list[i] <= 0 || !gl_pipe_uses_xq(p, pipes[i]))
+		int xq_ready  = 0;
+		int xqk_ready = 0;
+		for (int i = 0; i < n_matmuls; i++) {
+			if (n_list[i] <= 0)
+				continue;
+			int use_xqk = gl_pipe_uses_xqk(p, pipes[i]);
+			if (use_xqk ? xqk_ready : (xq_ready || !gl_pipe_uses_xq(p, pipes[i])))
 				continue;
 			gl_buf_sync_to_device(as_glbuf(x));
-			status_code qs = gl_quantize_x(p, x, k, 1);
+			status_code qs = use_xqk ? gl_quantize_q8_k(p, x, k, 1, NULL, 0)
+									 : gl_quantize_x(p, x, k, 1, NULL, 0);
 			if (qs == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (qs != OK)
 				return qs;
-			xq_ready = 1;
+			if (use_xqk)
+				xqk_ready = 1;
+			else
+				xq_ready = 1;
 		}
 
 		for (int i = 0; i < n_matmuls; i++) {
 			if (n_list[i] <= 0)
 				continue;
-			status_code s = gl_matmul_dispatch(p, pipes[i], block_sizes[i], w[i], x, y[i], NULL,
-											   n_list[i], k, xq_ready);
+			status_code s =
+				gl_matmul_dispatch(p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k,
+								   1, gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready);
 			if (s == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (s != OK)
@@ -2484,11 +2800,11 @@ static status_code gl_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	int	   row_stride_u = kv_q8 ? (int)p->kv_row_bytes : head_dim;
 	int	   layer_off	= (int)((size_t)layer * layer_stride);
 
-	glUseProgram(p->pipes[GL_PIPE_KV_PUT].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_KV_PUT]);
 	gl_bind_ssbo(0, k_in);
 	gl_bind_ssbo(1, v_in);
-	gl_bind_ssbo(2, k);
-	gl_bind_ssbo(3, v);
+	gl_bind_ssbo_out(2, k);
+	gl_bind_ssbo_out(3, v);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_layer_off", layer_off);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_pos_start", pos_start);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_kvh_stride", (int)kvh_stride);
@@ -2497,15 +2813,7 @@ static status_code gl_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_kv_q8", kv_q8 ? 1 : 0);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_in_row_stride", in_row_stride);
 
-	glDispatchCompute((GLuint)m, (GLuint)n_active, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: kv_put dispatch failed (glErr=0x%04x, m=%d, n_active=%d, layer=%d)",
-			  (unsigned)err, m, n_active, layer);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, (GLuint)m, (GLuint)n_active, 1);
 	kb->device_dirty = 1;
 	vb->device_dirty = 1;
 	kb->host_dirty	 = 0;
@@ -2698,12 +3006,12 @@ static status_code gl_attention_impl(backend *self, const buffer *q, const buffe
 	gl_buf_sync_to_device(obuf);
 	p->attn_scores->host_dirty = 0;
 
-	glUseProgram(p->pipes[GL_PIPE_ATTENTION].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_ATTENTION]);
 	gl_bind_ssbo(0, q);
 	gl_bind_ssbo(1, k_cache);
 	gl_bind_ssbo(2, v_cache);
-	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, p->attn_scores->name);
-	gl_bind_ssbo(4, out);
+	gl_bind_raw(p, 3, p->attn_scores->name, 0, 0, 1);
+	gl_bind_ssbo_out(4, out);
 
 	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_layer_off", (int)layer_off);
 	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_pos", pos);
@@ -2719,16 +3027,7 @@ static status_code gl_attention_impl(backend *self, const buffer *q, const buffe
 		  p->kv_kvh_stride ? (int)p->kv_kvh_stride : n_ctx * row_stride_u);
 
 	GLuint groups = (GLuint)n_heads;
-	glDispatchCompute(groups, 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: attention dispatch failed (glErr=0x%04x, layer=%d, pos=%d, "
-			  "attn_start=%d, n_heads=%d, head_dim=%d)",
-			  (unsigned)err, layer, pos, attn_start, n_heads, head_dim);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, groups, 1, 1);
 	obuf->device_dirty = 1;
 	return OK;
 }
@@ -2783,12 +3082,12 @@ static status_code gl_attention_batch_impl(backend *self, const buffer *q, const
 	gl_buf_sync_to_device(vbuf);
 	gl_buf_sync_to_device(obuf);
 
-	glUseProgram(p->pipes[GL_PIPE_ATTENTION_BATCH].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_ATTENTION_BATCH]);
 	gl_bind_ssbo(0, q);
 	gl_bind_ssbo(1, k_cache);
 	gl_bind_ssbo(2, v_cache);
 	gl_bind_ssbo(3, k_cache);
-	gl_bind_ssbo(4, out);
+	gl_bind_ssbo_out(4, out);
 
 	gl_pu(&p->pipes[GL_PIPE_ATTENTION_BATCH], "u_layer_off", (int)layer_off);
 	gl_pu(&p->pipes[GL_PIPE_ATTENTION_BATCH], "u_pos_start", pos_start);
@@ -2806,16 +3105,7 @@ static status_code gl_attention_batch_impl(backend *self, const buffer *q, const
 		  p->kv_kvh_stride ? (int)p->kv_kvh_stride : n_ctx * row_stride_u);
 
 	GLuint groups_y = (GLuint)((m + GL_ATTENTION_Q_CHUNK - 1) / GL_ATTENTION_Q_CHUNK);
-	glDispatchCompute((GLuint)n_heads, groups_y, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: attention_batch dispatch failed (glErr=0x%04x, layer=%d, pos_start=%d, "
-			  "attn_start=%d, n_heads=%d, head_dim=%d, m=%d)",
-			  (unsigned)err, layer, pos_start, attn_start, n_heads, head_dim, m);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, (GLuint)n_heads, groups_y, 1);
 	obuf->device_dirty = 1;
 	return OK;
 }
@@ -2902,53 +3192,29 @@ static status_code gl_rope_batch_dispatch(backend *self, buffer *vec, int n_head
 	if (n_heads <= 0 || half <= 0 || m <= 0)
 		return OK;
 
-	size_t		tbl = (size_t)m * (size_t)half * sizeof(float);
-	status_code s	= buffer_ensure_scratch(self, &p->rope_cos_tbl, tbl);
-	if (s != OK)
-		return s;
-	s = buffer_ensure_scratch(self, &p->rope_sin_tbl, tbl);
-	if (s != OK)
-		return s;
-	for (int i = 0; i < m; i++) {
-		buffer c  = buffer_slice(&p->rope_cos_tbl, (size_t)i * (size_t)half * sizeof(float),
-								 (size_t)half * sizeof(float));
-		buffer si = buffer_slice(&p->rope_sin_tbl, (size_t)i * (size_t)half * sizeof(float),
-								 (size_t)half * sizeof(float));
-		s = self->buffer_write_f32(self, &c, rope_cos_base + (size_t)(pos_start + i) * half, half);
-		if (s != OK)
-			return s;
-		s = self->buffer_write_f32(self, &si, rope_sin_base + (size_t)(pos_start + i) * half, half);
-		if (s != OK)
-			return s;
-	}
+	gl_rope_cache *slot =
+		gl_rope_cache_range(p, rope_cos_base, rope_sin_base, half, self->rope_theta, pos_start, m);
+	if (!slot)
+		return ERR_OUT_OF_MEMORY;
 
 	gl_buf *vb = as_glbuf(vec);
 	if (!vb || vb->size_bytes == 0)
 		return ERR_INVALID_ARG;
 	gl_buf_sync_to_device(vb);
-	gl_buf_sync_to_device(as_glbuf(&p->rope_cos_tbl));
-	gl_buf_sync_to_device(as_glbuf(&p->rope_sin_tbl));
 
-	glUseProgram(p->pipes[GL_PIPE_ROPE_BATCH].program);
-	gl_bind_ssbo(0, vec);
-	gl_bind_ssbo(1, &p->rope_cos_tbl);
-	gl_bind_ssbo(2, &p->rope_sin_tbl);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_ROPE_BATCH]);
+	gl_bind_ssbo_out(0, vec);
+	gl_bind_raw(p, 1, slot->cos_buf->name, 0, 0, 0);
+	gl_bind_raw(p, 2, slot->sin_buf->name, 0, 0, 0);
 	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_n_heads", n_heads);
 	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_head_dim", head_dim);
 	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_m", m);
 	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_neox", self->rope_neox);
 	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_row_stride", n_heads * head_dim);
+	gl_pu(&p->pipes[GL_PIPE_ROPE_BATCH], "u_pos0", pos_start);
 
 	int total = m * n_heads * half;
-	glDispatchCompute((GLuint)((total + 127) / 128), 1, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: rope_batch dispatch failed (glErr=0x%04x, heads=%d, hd=%d, m=%d)", (unsigned)err,
-			  n_heads, head_dim, m);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	gl_launch(p, (GLuint)((total + 127) / 128), 1, 1);
 	vb->device_dirty = 1;
 	return OK;
 }
@@ -3109,21 +3375,16 @@ static status_code gl_ffn_activate_batch(backend *self, const buffer *gate, cons
 		gl_buf *bufs[3] = {as_glbuf(gate), as_glbuf(up), as_glbuf(out)};
 		for (int i = 0; i < 3; i++)
 			gl_buf_sync_to_device(bufs[i]);
-		glUseProgram(p->pipes[GL_PIPE_FFN_ACTIVATE].program);
+		gl_use_pipeline(p, &p->pipes[GL_PIPE_FFN_ACTIVATE]);
 		gl_bind_ssbo(0, gate);
 		gl_bind_ssbo(1, up);
-		gl_bind_ssbo(2, out);
+		gl_bind_ssbo_out(2, out);
 		gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_n", (int)total);
 		gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE], "u_act", activation);
-		GLuint groups = (GLuint)((total + 127) / 128);
-		glDispatchCompute(groups, 1, 1);
-		GLenum err = glGetError();
-		if (err != GL_NO_ERROR) {
-			ERROR("gl: ffn_activate_batch dispatch failed (glErr=0x%04x)", (unsigned)err);
-			p->device_lost = 1;
-			return ERR_INTERNAL;
-		}
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+		size_t bgroups = (total + 127) / 128;
+		GLuint bgx = bgroups > GL_MAX_DISPATCH_PER_DIM ? GL_MAX_DISPATCH_PER_DIM : (GLuint)bgroups;
+		GLuint bgy = (GLuint)((bgroups + bgx - 1) / bgx);
+		gl_launch(p, bgx, bgy, 1);
 		bufs[2]->device_dirty = 1;
 		return OK;
 	}
@@ -3160,6 +3421,26 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 		if (host && host->matmul_ffn_down)
 			return host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
 		return ERR_UNSUPPORTED;
+	}
+	{
+		gl_pipeline *pipe		= NULL;
+		int			 block_size = 0;
+		if (gl_matmul_pipe_for_type(p, w_type, &pipe, &block_size) && block_size > 0 &&
+			(k % block_size) == 0 && gl_matmul_buf_ok(gate) && gl_matmul_buf_ok(up) &&
+			(gl_pipe_uses_xq(p, pipe) || gl_pipe_uses_xqk(p, pipe))) {
+			gl_buf_sync_to_device(as_glbuf(gate));
+			gl_buf_sync_to_device(as_glbuf(up));
+			status_code qs = gl_pipe_uses_xqk(p, pipe)
+								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation)
+								 : gl_quantize_x(p, gate, k, 1, up, activation);
+			if (qs == OK) {
+				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 1);
+				if (qs != ERR_UNSUPPORTED)
+					return qs;
+			} else if (qs != ERR_UNSUPPORTED) {
+				return qs;
+			}
+		}
 	}
 	buffer		act = {0};
 	status_code s	= self->buffer_alloc_scratch(self, (size_t)k * sizeof(float), &act);
@@ -3220,29 +3501,18 @@ static status_code gl_ffn_activate_fused_batch(backend *self, const buffer *fuse
 	gl_buf_sync_to_device(fb);
 	gl_buf_sync_to_device(ob);
 
-	glUseProgram(p->pipes[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH].program);
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH]);
 	gl_bind_ssbo(0, fused);
-	gl_bind_ssbo(1, out);
+	gl_bind_ssbo_out(1, out);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH], "u_n", n);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH], "u_m", m);
 	gl_pu(&p->pipes[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH], "u_act", activation);
 
-	size_t total = (size_t)n * (size_t)m;
-	GLuint gx	 = (GLuint)((total + 127) / 128);
-	GLuint gy	 = 1;
-	if (gx > GL_MAX_DISPATCH_PER_DIM) {
-		gy = (GLuint)((total / 128 + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM);
-		gx = GL_MAX_DISPATCH_PER_DIM;
-	}
-	glDispatchCompute(gx, gy, 1);
-	GLenum err = glGetError();
-	if (err != GL_NO_ERROR) {
-		ERROR("gl: ffn_activate_fused_batch dispatch failed (glErr=0x%04x, n=%d, m=%d)",
-			  (unsigned)err, n, m);
-		p->device_lost = 1;
-		return ERR_INTERNAL;
-	}
-	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	size_t total  = (size_t)n * (size_t)m;
+	size_t groups = (total + 127) / 128;
+	GLuint gx	  = groups > GL_MAX_DISPATCH_PER_DIM ? GL_MAX_DISPATCH_PER_DIM : (GLuint)groups;
+	GLuint gy	  = (GLuint)((groups + gx - 1) / gx);
+	gl_launch(p, gx, gy, 1);
 	ob->device_dirty = 1;
 	return OK;
 }
@@ -3372,7 +3642,8 @@ static status_code gl_ctor(backend *out) {
 	out->name	  = "opengl";
 	out->priority = 80;
 	out->caps	  = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
-					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN;
+					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
+					BCAP_ROPE_QK_FUSED;
 
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
@@ -3400,6 +3671,8 @@ static status_code gl_ctor(backend *out) {
 	out->rmsnorm_add_batch				 = gl_rmsnorm_add_batch;
 	out->matmul							 = gl_matmul;
 	out->matmul_type_native				 = gl_matmul_type_native;
+	out->repack_plan					 = gl_repack_plan;
+	out->repack_weight					 = gl_repack_weight;
 	out->matmul_residual				 = gl_matmul_residual;
 	out->matmul_multi					 = gl_matmul_multi;
 	out->matmul_batch					 = gl_matmul_batch;

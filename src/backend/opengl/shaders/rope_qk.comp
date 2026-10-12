@@ -1,0 +1,47 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 1) buffer KBuf {
+	float k[];
+};
+layout(std430, binding = 2) readonly buffer CosBuf {
+	float rcos[];
+};
+layout(std430, binding = 3) readonly buffer SinBuf {
+	float rsin[];
+};
+layout(location = 0) uniform int u_n_heads;
+layout(location = 1) uniform int u_n_kv_heads;
+layout(location = 2) uniform int u_head_dim;
+layout(location = 3) uniform int u_pos;
+layout(location = 4) uniform int u_neox;
+void main(void) {
+	uint g		  = gl_GlobalInvocationID.x;
+	int	 half_dim = u_head_dim / 2;
+	int	 total	  = (u_n_heads + u_n_kv_heads) * half_dim;
+	if (int(g) >= total)
+		return;
+	int	  h	   = int(g) / half_dim;
+	int	  j	   = int(g) % half_dim;
+	bool  is_q = h < u_n_heads;
+	int	  base = (is_q ? h : h - u_n_heads) * u_head_dim;
+	uint  co   = uint(u_pos) * uint(half_dim) + uint(j);
+	float c	   = rcos[co];
+	float s	   = rsin[co];
+	int	  idx0 = u_neox != 0 ? base + j : base + 2 * j;
+	int	  idx1 = u_neox != 0 ? base + j + half_dim : base + 2 * j + 1;
+	if (is_q) {
+		float a = q[idx0];
+		float b = q[idx1];
+		q[idx0] = a * c - b * s;
+		q[idx1] = a * s + b * c;
+	} else {
+		float a = k[idx0];
+		float b = k[idx1];
+		k[idx0] = a * c - b * s;
+		k[idx1] = a * s + b * c;
+	}
+}

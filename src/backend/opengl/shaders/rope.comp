@@ -23,8 +23,9 @@ void main(void) {
 	int	  h	   = int(g) / half_dim;
 	int	  j	   = int(g) % half_dim;
 	int	  base = h * u_head_dim;
-	float c	   = rcos[j];
-	float s	   = rsin[j];
+	uint  co   = uint(u_pos) * uint(half_dim) + uint(j);
+	float c	   = rcos[co];
+	float s	   = rsin[co];
 	if (u_neox != 0) {
 		float a					 = vec[base + j];
 		float b					 = vec[base + j + half_dim];

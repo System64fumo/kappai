@@ -4,15 +4,43 @@ precision highp int;
 
 layout(local_size_x = 64) in;
 
+#ifdef FUSED_ACT
+layout(std430, binding = 0) readonly buffer GateBuf {
+	float gate[];
+};
+layout(std430, binding = 2) readonly buffer UpBuf {
+	float up[];
+};
+layout(location = 8) uniform int u_act;
+
+float xin(uint i) {
+	float g = gate[i];
+	float u = up[i];
+	float gv;
+	if (u_act == 1) {
+		float t = 0.7978845608 * (g + 0.044715 * g * g * g);
+		gv		= 0.5 * g * (1.0 + tanh(t));
+	} else {
+		gv = g / (1.0 + exp(-g));
+	}
+	return gv * u;
+}
+#else
 layout(std430, binding = 0) readonly buffer XBuf {
 	float x[];
 };
+
+float xin(uint i) {
+	return x[i];
+}
+#endif
 layout(std430, binding = 1) writeonly buffer XQBuf {
 	uint xq[];
 };
 layout(location = 0) uniform int u_k_blocks;
 layout(location = 1) uniform int u_k;
 layout(location = 2) uniform int u_row_words;
+layout(location = 3) uniform int u_row0;
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -91,30 +119,49 @@ int round_away(float f) {
 }
 void main(void) {
 	int bi	= int(gl_GlobalInvocationID.x);
-	int row = int(gl_WorkGroupID.y);
+	int row = int(gl_WorkGroupID.y) + u_row0;
 	if (bi >= u_k_blocks)
 		return;
-	int	  xb   = row * u_k + bi * 32;
+	int	  xb = row * u_k + bi * 32;
+	float xv[32];
+	for (int j = 0; j < 32; j++)
+		xv[j] = xin(uint(xb + j));
 	float amax = 0.0;
 	for (int j = 0; j < 32; j++) {
-		float ax = abs(x[xb + j]);
+		float ax = abs(xv[j]);
 		if (ax > amax)
 			amax = ax;
 	}
-	uint  db   = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
-	float d	   = bits_f32(db);
-	float id   = (db != 0u) ? div_r(1.0, d) : 0.0;
-	float dxq  = round_f16(d);
-	uint  base = uint(row * u_row_words + bi * 12);
+	uint  db  = (amax > 0.0) ? exact_div(f32_bits(amax), f32_bits(127.0)) : 0u;
+	float d	  = bits_f32(db);
+	float id  = (db != 0u) ? div_r(1.0, d) : 0.0;
+	float dxq = round_f16(d);
+	int	  qv[32];
+	int	  qsum = 0;
+	for (int j = 0; j < 32; j++) {
+		int v = round_away(xv[j] * id);
+		v	  = v > 127 ? 127 : (v < -127 ? -127 : v);
+		qv[j] = v;
+		qsum += v;
+	}
+	uint base = uint(row * u_row_words + bi * 44);
 	for (int w = 0; w < 8; w++) {
 		uint word = 0u;
-		for (int b = 0; b < 4; b++) {
-			int v = round_away(x[xb + w * 4 + b] * id);
-			v	  = v > 127 ? 127 : (v < -127 ? -127 : v);
-			word |= (uint(v) & 0xFFu) << uint(b * 8);
-		}
+		for (int b = 0; b < 4; b++)
+			word |= (uint(qv[w * 4 + b]) & 0xFFu) << uint(b * 8);
 		xq[base + uint(w)] = word;
 	}
-	xq[base + 8u] = f32_bits(dxq);
-	xq[base + 9u] = f32_bits(d);
+	xq[base + 8u]  = f32_bits(dxq);
+	xq[base + 9u]  = f32_bits(d);
+	xq[base + 10u] = uint(qsum);
+	for (int i = 0; i < 4; i++) {
+		for (int h = 0; h < 2; h++) {
+			int	 e		 = h * 16 + i * 4;
+			uint dst	 = base + uint(12 + i * 4 + h * 2);
+			xq[dst]		 = uint(qv[e + 2] + (qv[e] << 16));
+			xq[dst + 1u] = uint(qv[e + 3] + (qv[e + 1] << 16));
+		}
+	}
+	for (int j = 0; j < 16; j++)
+		xq[base + 28u + uint(j)] = uint(qv[j + 16] + (qv[j] << 16));
 }

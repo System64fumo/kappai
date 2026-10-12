@@ -6,11 +6,21 @@ precision highp int;
 #define WG 32
 #endif
 
+#ifdef R8
+layout(local_size_x = 8) in;
+#else
 layout(local_size_x = WG) in;
+#endif
 
+#ifdef R8
+layout(std430, binding = 0) readonly buffer WBuf {
+	uvec4 w[];
+};
+#else
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
+#endif
 layout(std430, binding = 1) readonly buffer XQBuf {
 	uvec4 xq4[];
 };
@@ -20,73 +30,163 @@ layout(std430, binding = 2) buffer YBuf {
 layout(std430, binding = 3) readonly buffer ResBuf {
 	float res[];
 };
+layout(std430, binding = 4) readonly buffer LutBuf {
+	uint lut[];
+};
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
+layout(location = 9) uniform int u_m;
+layout(location = 10) uniform int u_x_stride;
+layout(location = 11) uniform int u_wg_base;
 
-const uint IQ4NL_A0 = 0x3F2D1801u;
-const uint IQ4NL_A1 = 0x766A5D4Fu;
-const uint IQ4NL_A2 = 0xA6998D81u;
-const uint IQ4NL_A3 = 0xF1D9C5B5u;
+#ifndef R8
+uint g_mi;
+#endif
 
-int iq4nl(uint i) {
-	uint g = i >> 2u;
-	uint v = (g == 0u) ? IQ4NL_A0 : (g == 1u) ? IQ4NL_A1 : (g == 2u) ? IQ4NL_A2 : IQ4NL_A3;
-	return int((v >> ((i & 3u) * 8u)) & 0xFFu) - 128;
-}
+#ifndef MT
+#define MT 1
+#endif
 
+#ifdef R8
+#define ROWS 8
+#else
+#define ROWS 4
+#endif
+
+#ifndef R8
+shared float s_acc[ROWS][WG];
+
+#endif
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
 }
 
+int pair_field_sum(uint acc) {
+	uint low = uint(bitfieldExtract(int(acc), 0, 16));
+	return int(acc - low) >> 16;
+}
+
+int dot_word(uint qw, uvec4 yv) {
+	return pair_field_sum(lut[qw & 0xFFu] * yv.x) + pair_field_sum(lut[(qw >> 8u) & 0xFFu] * yv.y) +
+		   pair_field_sum(lut[(qw >> 16u) & 0xFFu] * yv.z) + pair_field_sum(lut[qw >> 24u] * yv.w);
+}
+
+#ifndef R8
 uint sh2(uint a, uint b, uint odd) {
 	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
 }
 
-int dot4_iq4(uint qw, uint xl, uint xh) {
-	int s = 0;
-	for (int t = 0; t < 4; t++) {
-		int sh = t * 8;
-		s += iq4nl(bitfieldExtract(qw, sh, 4)) * bitfieldExtract(int(xl), sh, 8) +
-			 iq4nl(bitfieldExtract(qw, sh + 4, 4)) * bitfieldExtract(int(xh), sh, 8);
-	}
-	return s;
+void load_block(uint rowg, int bi, out float wd, out uint q0, out uint q1, out uint q2,
+				out uint q3) {
+	uint bo	 = rowg * uint(u_k_blocks) * 18u + uint(bi) * 18u;
+	uint wi	 = bo >> 2u;
+	uint odd = (bo >> 1u) & 1u;
+	uint w0	 = w[wi];
+	uint w1	 = w[wi + 1u];
+	uint w2	 = w[wi + 2u];
+	uint w3	 = w[wi + 3u];
+	uint w4	 = w[wi + 4u];
+	wd		 = h2f(odd != 0u ? w0 >> 16u : w0);
+	q0		 = sh2(w0, w1, odd);
+	q1		 = sh2(w1, w2, odd);
+	q2		 = sh2(w2, w3, odd);
+	q3		 = sh2(w3, w4, odd);
 }
+#endif
 
-void store_row(uint idx, float acc) {
-	if (u_add_residual == 1)
-		y[idx] = acc + res[idx];
-	else if (u_add_residual == 2)
-		y[idx] += acc;
-	else
-		y[idx] = acc;
-}
-
+#ifdef R8
 void main(void) {
-	uint row = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * uint(WG) + gl_LocalInvocationID.x;
+	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	   = uint(max(u_m, 1));
+	uint mt	   = (mb + uint(MT) - 1u) / uint(MT);
+	uint col0  = (wgid % mt) * uint(MT);
+	uint ncols = min(uint(MT), mb - col0);
+	uint grp   = wgid / mt;
+	uint lane  = gl_LocalInvocationID.x;
+	uint row   = grp * 8u + lane;
+	uint gbase = grp * uint(u_k_blocks) * 9u;
+
+	float acc[MT];
+	for (int c = 0; c < MT; c++)
+		acc[c] = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  base = gbase + uint(bi) * 9u;
+		uint  sw   = w[base][lane >> 1u];
+		float wd   = h2f((lane & 1u) != 0u ? sw >> 16u : sw);
+		uvec4 qv   = w[base + 1u + lane];
+		for (int c = 0; c < MT; c++) {
+			if (uint(c) >= ncols)
+				break;
+			uint xi	  = (col0 + uint(c)) * uint(u_x_stride) + uint(bi) * 11u;
+			int	 sumi = dot_word(qv.x, xq4[xi + 7u]) + dot_word(qv.y, xq4[xi + 8u]) +
+						dot_word(qv.z, xq4[xi + 9u]) + dot_word(qv.w, xq4[xi + 10u]);
+			acc[c] += wd * uintBitsToFloat(xq4[xi + 2u].x) * float(sumi);
+		}
+	}
 	if (int(row) >= u_n)
 		return;
-	uint row_bytes = uint(u_k_blocks) * 18u;
-	uint rw		   = row * row_bytes;
-
-	float acc = 0.0;
-	for (int bi = 0; bi < u_k_blocks; bi++) {
-		uint  bo  = rw + uint(bi) * 18u;
-		uint  wi  = bo >> 2u;
-		uint  odd = (bo >> 1u) & 1u;
-		uint  xi  = uint(bi) * 3u;
-		uvec4 xlo = xq4[xi];
-		uvec4 xhi = xq4[xi + 1u];
-		uvec4 xs  = xq4[xi + 2u];
-		uint  w0  = w[wi];
-		uint  w1  = w[wi + 1u];
-		uint  w2  = w[wi + 2u];
-		uint  w3  = w[wi + 3u];
-		uint  w4  = w[wi + 4u];
-		int	  sumi =
-			dot4_iq4(sh2(w0, w1, odd), xlo.x, xhi.x) + dot4_iq4(sh2(w1, w2, odd), xlo.y, xhi.y) +
-			dot4_iq4(sh2(w2, w3, odd), xlo.z, xhi.z) + dot4_iq4(sh2(w3, w4, odd), xlo.w, xhi.w);
-		acc += h2f(odd != 0u ? w0 >> 16u : w0) * uintBitsToFloat(xs.x) * float(sumi);
+	for (int c = 0; c < MT; c++) {
+		if (uint(c) >= ncols)
+			break;
+		uint yi = (col0 + uint(c)) * uint(u_n) + row;
+		if (u_add_residual == 1)
+			y[yi] = acc[c] + res[row];
+		else if (u_add_residual == 2)
+			y[yi] += acc[c];
+		else
+			y[yi] = acc[c];
 	}
-	store_row(row, acc);
 }
+#else
+void main(void) {
+	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	  = uint(max(u_m, 1));
+	g_mi	  = wgid % mb;
+	wgid	  = wgid / mb;
+	uint row0 = wgid * uint(ROWS);
+	uint tid  = gl_LocalInvocationID.x;
+	uint last = uint(max(u_n - 1, 0));
+
+	float acc[ROWS];
+	for (int r = 0; r < ROWS; r++)
+		acc[r] = 0.0;
+	for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
+		uint  xi  = g_mi * uint(u_x_stride) + uint(bi) * 11u;
+		float dxq = uintBitsToFloat(xq4[xi + 2u].x);
+		uvec4 y0  = xq4[xi + 7u];
+		uvec4 y1  = xq4[xi + 8u];
+		uvec4 y2  = xq4[xi + 9u];
+		uvec4 y3  = xq4[xi + 10u];
+		for (int r = 0; r < ROWS; r++) {
+			float wd;
+			uint  r0w, r1w, r2w, r3w;
+			load_block(min(row0 + uint(r), last), bi, wd, r0w, r1w, r2w, r3w);
+			int sumi =
+				dot_word(r0w, y0) + dot_word(r1w, y1) + dot_word(r2w, y2) + dot_word(r3w, y3);
+			acc[r] += wd * dxq * float(sumi);
+		}
+	}
+	for (int r = 0; r < ROWS; r++)
+		s_acc[r][tid] = acc[r];
+	barrier();
+	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			for (int r = 0; r < ROWS; r++)
+				s_acc[r][tid] += s_acc[r][tid + s];
+		barrier();
+	}
+	if (tid < uint(ROWS)) {
+		uint row = row0 + tid;
+		if (int(row) < u_n) {
+			float v = s_acc[tid][0];
+			if (u_add_residual == 1)
+				y[g_mi * uint(u_n) + row] = v + res[row];
+			else if (u_add_residual == 2)
+				y[g_mi * uint(u_n) + row] += v;
+			else
+				y[g_mi * uint(u_n) + row] = v;
+		}
+	}
+}
+#endif

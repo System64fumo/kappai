@@ -2,13 +2,16 @@
 precision highp float;
 precision highp int;
 
-layout(local_size_x = 32) in;
+#ifndef WG
+#define WG 32
+#endif
+layout(local_size_x = WG) in;
 
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
-layout(std430, binding = 1) readonly buffer XBuf {
-	float x[];
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uint xq[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -19,182 +22,235 @@ layout(std430, binding = 3) readonly buffer ResBuf {
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
+layout(location = 9) uniform int u_m;
+layout(location = 10) uniform int u_x_stride;
+layout(location = 11) uniform int u_wg_base;
 
-shared float s_acc[32];
-shared float s_amax[32];
-shared float s_maxv[32];
+uint g_mi;
+
+#define ROWS 4
+#define NIB 0x000F000Fu
+#ifdef Q5K
+#define HBIT 0x00100010u
+#define QB 44u
+#define QBOFF 12u
+#define R8B 360u
+#define R8O 104u
+#else
+#define QB 36u
+#define QBOFF 4u
+#define R8B 296u
+#define R8O 40u
+#endif
+
+shared float s_acc[ROWS][WG];
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
 }
 
-uint rb(uint off) {
-	uint wd = w[off >> 2u];
-	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
+int pair_field_sum(uint acc) {
+	uint low = uint(bitfieldExtract(int(acc), 0, 16));
+	return int(acc - low) >> 16;
 }
 
-void gsm(int j, uint sc_off, out uint sc, out uint mn) {
+void scale_min(uvec3 sw, int j, out uint sc, out uint mn) {
 	if (j < 4) {
-		sc = rb(sc_off + uint(j)) & 63u;
-		mn = rb(sc_off + uint(j + 4)) & 63u;
-	} else {
-		sc = (rb(sc_off + uint(j + 4)) & 0xFu) | ((rb(sc_off + uint(j - 4)) >> 6) << 4);
-		mn = (rb(sc_off + uint(j + 4)) >> 4) | ((rb(sc_off + uint(j)) >> 6) << 4);
+		uint sh = uint(j) * 8u;
+		sc		= (sw.x >> sh) & 63u;
+		mn		= (sw.y >> sh) & 63u;
+		return;
 	}
+	uint sh = uint(j - 4) * 8u;
+	uint hi = sw.z >> sh;
+	sc		= (hi & 0xFu) | (((sw.x >> sh) >> 6u & 3u) << 4u);
+	mn		= ((hi >> 4u) & 0xFu) | (((sw.y >> sh) >> 6u & 3u) << 4u);
 }
 
-uint f32_bits(float f) {
-	return floatBitsToUint(f);
-}
-float bits_f32(uint b) {
-	return uintBitsToFloat(b);
-}
-
-uint exact_div(uint nb, uint db) {
-	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
-	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
-	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
-	uint M24 = 0u;
-	uint rem;
-	int	 me;
-	if (Nn >= Dd) {
-		me	= eq;
-		rem = Nn - Dd;
-	} else {
-		me	= eq - 1;
-		rem = (Nn << 1u) - Dd;
-	}
-	for (int i = 0; i < 23; i++) {
-		rem <<= 1u;
-		M24 <<= 1u;
-		if (rem >= Dd) {
-			rem -= Dd;
-			M24 |= 1u;
-		}
-	}
-	uint r2 = rem << 1u;
-	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
-		M24++;
-	if (M24 >= (1u << 23)) {
-		M24 = 0u;
-		me++;
-	}
-	int fe = me + 127;
-	if (fe >= 255)
-		return 0x7F800000u;
-	if (fe <= 0)
-		return 0u;
-	return (uint(fe) << 23u) | M24;
+#ifdef R8
+uint qs_base(uint rowg, int bi, int g) {
+	return (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B + R8O + (rowg & 7u) * 32u +
+		   uint(g) * 8u;
 }
 
-float div_r(float a, float b) {
-	return bits_f32(exact_div(f32_bits(a), f32_bits(b)));
+#ifdef Q5K
+uint qh_base(uint rowg, int bi) {
+	return (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B + 40u + (rowg & 7u) * 8u;
+}
+#endif
+
+void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
+				out uint sc1, out uint mn1) {
+	uint gw	 = (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B;
+	uint rin = rowg & 7u;
+	uint dw	 = w[gw + (rin >> 1u)];
+	uint mw	 = w[gw + 4u + (rin >> 1u)];
+	d		 = h2f((rin & 1u) != 0u ? dw >> 16u : dw);
+	dm		 = h2f((rin & 1u) != 0u ? mw >> 16u : mw);
+	uint sw	 = w[gw + 8u + rin * 4u + uint(g)];
+	sc0		 = sw & 0xFFu;
+	mn0		 = (sw >> 8u) & 0xFFu;
+	sc1		 = (sw >> 16u) & 0xFFu;
+	mn1		 = sw >> 24u;
+}
+#else
+uint qs_base(uint rowg, int bi, int g) {
+	return (rowg * uint(u_k_blocks) + uint(bi)) * QB + QBOFF + uint(g) * 8u;
 }
 
-int round_away(float f) {
-	float af = abs(f);
-	float tr = trunc(af);
-	float fr = af - tr;
-	float r	 = (fr >= 0.5) ? (tr + 1.0) : tr;
-	return (f < 0.0) ? -int(r) : int(r);
+#ifdef Q5K
+uint qh_base(uint rowg, int bi) {
+	return (rowg * uint(u_k_blocks) + uint(bi)) * QB + 4u;
 }
+#endif
+
+void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
+				out uint sc1, out uint mn1) {
+	uint  bw = (rowg * uint(u_k_blocks) + uint(bi)) * QB;
+	uint  hw = w[bw];
+	uvec3 sw = uvec3(w[bw + 1u], w[bw + 2u], w[bw + 3u]);
+	d		 = h2f(hw);
+	dm		 = h2f(hw >> 16u);
+	scale_min(sw, 2 * g, sc0, mn0);
+	scale_min(sw, 2 * g + 1, sc1, mn1);
+}
+#endif
 
 void main(void) {
-	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
-	uint tid   = gl_LocalInvocationID.x;
-	bool valid = int(row) < u_n;
+	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	  = uint(max(u_m, 1));
+	g_mi	  = wgid % mb;
+	wgid	  = wgid / mb;
+	uint row0 = wgid * uint(ROWS);
+	uint tid  = gl_LocalInvocationID.x;
+	uint last = uint(max(u_n - 1, 0));
 
-	float acc = 0.0;
-	if (valid) {
-		uint row_off = row * uint(u_k_blocks) * 144u;
-		int	 nch	 = u_k_blocks * 4;
-		int	 iters	 = (nch + 31) / 32;
-		for (int it = 0; it < iters; it++) {
-			int	  c	   = it * 32 + int(tid);
-			int	  bi   = c >> 2;
-			int	  g	   = c & 3;
-			int	  xsb  = bi * 256;
-			int	  xb   = xsb + g * 64;
-			float amax = 0.0;
-			float maxv = 0.0;
-			if (c < nch) {
-				for (int j = 0; j < 64; j++) {
-					float v	 = x[xb + j];
-					float ax = abs(v);
-					if (ax > amax) {
-						amax = ax;
-						maxv = v;
-					}
+	float acc[ROWS];
+	for (int r = 0; r < ROWS; r++)
+		acc[r] = 0.0;
+	int nch	  = u_k_blocks * 4;
+	int iters = (nch + WG - 1) / WG;
+	for (int it = 0; it < iters; it++) {
+		int c  = it * WG + int(tid);
+		int bi = c >> 2;
+		int g  = c & 3;
+		if (c >= nch)
+			continue;
+		uint  xbq = g_mi * uint(u_x_stride) + uint(bi) * 209u;
+		float xd  = uintBitsToFloat(xq[xbq + 64u]);
+		if (xd == 0.0)
+			continue;
+		uint xp	   = xbq + 81u + uint(g) * 32u;
+		uint sb	   = xbq + 65u + uint(g) * 4u;
+		int	 sx_lo = int(xq[sb]) + int(xq[sb + 1u]);
+		int	 sx_hi = int(xq[sb + 2u]) + int(xq[sb + 3u]);
+
+#ifdef Q5K
+		uint sh_lo_l = uint(max(4 - 2 * g, 0));
+		uint sh_lo_r = uint(max(2 * g - 4, 0));
+		uint sh_hi_l = uint(max(3 - 2 * g, 0));
+		uint sh_hi_r = uint(max(2 * g - 3, 0));
+		uint sh_b_lo = uint(2 * g + 4);
+		uint sh_b_hi = uint(2 * g + 5);
+		uint qbase[ROWS];
+		uint hbase[ROWS];
+		int	 dot0[ROWS];
+		int	 dot1[ROWS];
+		for (int r = 0; r < ROWS; r++) {
+			qbase[r] = qs_base(min(row0 + uint(r), last), bi, g);
+			hbase[r] = qh_base(min(row0 + uint(r), last), bi);
+			dot0[r]	 = 0;
+			dot1[r]	 = 0;
+		}
+		for (int half_i = 0; half_i < 4; half_i++) {
+			uint la[ROWS];
+			uint ha[ROWS];
+			for (int r = 0; r < ROWS; r++) {
+				la[r] = 0u;
+				ha[r] = 0u;
+			}
+			for (int i = half_i * 2; i < half_i * 2 + 2; i++) {
+				uint xa0 = xq[xp + uint(2 * i)];
+				uint xa1 = xq[xp + uint(2 * i) + 1u];
+				uint xb0 = xq[xp + 16u + uint(2 * i)];
+				uint xb1 = xq[xp + 16u + uint(2 * i) + 1u];
+				for (int r = 0; r < ROWS; r++) {
+					uint qw = w[qbase[r] + uint(i)];
+					uint hq = w[hbase[r] + uint(i)];
+					uint h0 = (g < 2 ? (hq << sh_lo_l) : (hq >> sh_lo_r)) & HBIT;
+					uint h1 = (hq >> (sh_b_lo)) & HBIT;
+					uint h2 = (g < 2 ? (hq << sh_hi_l) : (hq >> sh_hi_r)) & HBIT;
+					uint h3 = (hq >> (sh_b_hi)) & HBIT;
+					la[r] += ((qw & NIB) | h0) * xa0 + (((qw >> 8u) & NIB) | h1) * xa1;
+					ha[r] += (((qw >> 4u) & NIB) | h2) * xb0 + (((qw >> 12u) & NIB) | h3) * xb1;
 				}
 			}
-			s_amax[tid] = amax;
-			s_maxv[tid] = maxv;
-			barrier();
-			if (c < nch) {
-				int t0 = int(tid) & ~3;
-				for (int q = 0; q < 4; q++) {
-					if (s_amax[t0 + q] > amax) {
-						amax = s_amax[t0 + q];
-						maxv = s_maxv[t0 + q];
-					}
-				}
-				if (amax != 0.0) {
-					uint  bo	 = row_off + uint(bi) * 144u;
-					float iscale = div_r(-127.0, maxv);
-					float xd	 = div_r(1.0, iscale);
-					float d		 = h2f(rb(bo) | (rb(bo + 1u) << 8u));
-					float dm	 = h2f(rb(bo + 2u) | (rb(bo + 3u) << 8u));
-					uint  sc_off = bo + 4u;
-					uint  qs_off = bo + 16u;
-					int	  sumi	 = 0;
-					int	  summ	 = 0;
-					uint  sc0, mn0;
-					gsm(2 * g, sc_off, sc0, mn0);
-					uint sc1, mn1;
-					gsm(2 * g + 1, sc_off, sc1, mn1);
-					int dot0 = 0;
-					int dot1 = 0;
-					int bs0	 = 0;
-					int bs1	 = 0;
-					int bs2	 = 0;
-					int bs3	 = 0;
-					for (int l = 0; l < 32; l++) {
-						uint qlb = rb(qs_off + uint(g * 32 + l));
-						int	 v0	 = round_away(iscale * x[xb + l]);
-						v0		 = v0 > 127 ? 127 : (v0 < -127 ? -127 : v0);
-						int v1	 = round_away(iscale * x[xb + l + 32]);
-						v1		 = v1 > 127 ? 127 : (v1 < -127 ? -127 : v1);
-						dot0 += int(qlb & 0xFu) * v0;
-						dot1 += int(qlb >> 4) * v1;
-						if (l < 16) {
-							bs0 += v0;
-							bs2 += v1;
-						} else {
-							bs1 += v0;
-							bs3 += v1;
-						}
-					}
-					sumi = int(sc0) * dot0 + int(sc1) * dot1;
-					summ = int(mn0) * (bs0 + bs1) + int(mn1) * (bs2 + bs3);
-					acc += xd * (d * float(sumi) - dm * float(summ));
+			for (int r = 0; r < ROWS; r++) {
+				dot0[r] += pair_field_sum(la[r]);
+				dot1[r] += pair_field_sum(ha[r]);
+			}
+		}
+#else
+		uint qbase[ROWS];
+		int	 dot0[ROWS];
+		int	 dot1[ROWS];
+		for (int r = 0; r < ROWS; r++) {
+			qbase[r] = qs_base(min(row0 + uint(r), last), bi, g);
+			dot0[r]	 = 0;
+			dot1[r]	 = 0;
+		}
+		for (int half_i = 0; half_i < 2; half_i++) {
+			uint la[ROWS];
+			uint ha[ROWS];
+			for (int r = 0; r < ROWS; r++) {
+				la[r] = 0u;
+				ha[r] = 0u;
+			}
+			for (int i = half_i * 4; i < half_i * 4 + 4; i++) {
+				uint xa0 = xq[xp + uint(2 * i)];
+				uint xa1 = xq[xp + uint(2 * i) + 1u];
+				uint xb0 = xq[xp + 16u + uint(2 * i)];
+				uint xb1 = xq[xp + 16u + uint(2 * i) + 1u];
+				for (int r = 0; r < ROWS; r++) {
+					uint qw = w[qbase[r] + uint(i)];
+					la[r] += (qw & NIB) * xa0 + ((qw >> 8u) & NIB) * xa1;
+					ha[r] += ((qw >> 4u) & NIB) * xb0 + ((qw >> 12u) & NIB) * xb1;
 				}
 			}
-			barrier();
+			for (int r = 0; r < ROWS; r++) {
+				dot0[r] += pair_field_sum(la[r]);
+				dot1[r] += pair_field_sum(ha[r]);
+			}
+		}
+#endif
+		for (int r = 0; r < ROWS; r++) {
+			float d, dm;
+			uint  sc0, mn0, sc1, mn1;
+			row_header(min(row0 + uint(r), last), bi, g, d, dm, sc0, mn0, sc1, mn1);
+			int sumi = int(sc0) * dot0[r] + int(sc1) * dot1[r];
+			int summ = int(mn0) * sx_lo + int(mn1) * sx_hi;
+			acc[r] += xd * (d * float(sumi) - dm * float(summ));
 		}
 	}
-	s_acc[tid] = acc;
+	for (int r = 0; r < ROWS; r++)
+		s_acc[r][tid] = acc[r];
 	barrier();
-	for (uint s = 16u; s > 0u; s >>= 1u) {
+	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
 		if (tid < s)
-			s_acc[tid] += s_acc[tid + s];
+			for (int r = 0; r < ROWS; r++)
+				s_acc[r][tid] += s_acc[r][tid + s];
 		barrier();
 	}
-	if (valid && tid == 0u) {
-		if (u_add_residual == 1)
-			y[row] = s_acc[0] + res[row];
-		else if (u_add_residual == 2)
-			y[row] += s_acc[0];
-		else
-			y[row] = s_acc[0];
+	if (tid < uint(ROWS)) {
+		uint row = row0 + tid;
+		if (int(row) < u_n) {
+			float v = s_acc[tid][0];
+			if (u_add_residual == 1)
+				y[g_mi * uint(u_n) + row] = v + res[row];
+			else if (u_add_residual == 2)
+				y[g_mi * uint(u_n) + row] += v;
+			else
+				y[g_mi * uint(u_n) + row] = v;
+		}
 	}
 }

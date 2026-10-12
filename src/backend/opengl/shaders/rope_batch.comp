@@ -15,6 +15,7 @@ layout(location = 1) uniform int u_head_dim;
 layout(location = 2) uniform int u_m;
 layout(location = 3) uniform int u_neox;
 layout(location = 4) uniform int u_row_stride;
+layout(location = 5) uniform int u_pos0;
 void main(void) {
 	int half_dim = u_head_dim / 2;
 	int per_row	 = u_n_heads * half_dim;
@@ -26,7 +27,7 @@ void main(void) {
 	int	  h		= t / half_dim;
 	int	  j		= t - h * half_dim;
 	int	  base	= row * u_row_stride + h * u_head_dim;
-	int	  cbase = row * half_dim + j;
+	int	  cbase = (u_pos0 + row) * half_dim + j;
 	float c		= rcos[cbase];
 	float s		= rsin[cbase];
 	if (u_neox != 0) {
