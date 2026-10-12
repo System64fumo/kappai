@@ -56,6 +56,51 @@ void scale_min(uvec3 sw, int j, out uint sc, out uint mn) {
 	mn		= ((hi >> 4u) & 0xFu) | (((sw.y >> sh) >> 6u & 3u) << 4u);
 }
 
+#ifdef R8
+uint qs_base(uint rowg, int bi, int g) {
+	return (rowg >> 3u) * uint(u_k_blocks) * 360u + uint(bi) * 360u + 104u + (rowg & 7u) * 32u +
+		   uint(g) * 8u;
+}
+
+uint qh_base(uint rowg, int bi) {
+	return (rowg >> 3u) * uint(u_k_blocks) * 360u + uint(bi) * 360u + 40u + (rowg & 7u) * 8u;
+}
+
+void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
+				out uint sc1, out uint mn1) {
+	uint gw	 = (rowg >> 3u) * uint(u_k_blocks) * 360u + uint(bi) * 360u;
+	uint rin = rowg & 7u;
+	uint dw	 = w[gw + (rin >> 1u)];
+	uint mw	 = w[gw + 4u + (rin >> 1u)];
+	d		 = h2f((rin & 1u) != 0u ? dw >> 16u : dw);
+	dm		 = h2f((rin & 1u) != 0u ? mw >> 16u : mw);
+	uint sw	 = w[gw + 8u + rin * 4u + uint(g)];
+	sc0		 = sw & 0xFFu;
+	mn0		 = (sw >> 8u) & 0xFFu;
+	sc1		 = (sw >> 16u) & 0xFFu;
+	mn1		 = sw >> 24u;
+}
+#else
+uint qs_base(uint rowg, int bi, int g) {
+	return (rowg * uint(u_k_blocks) + uint(bi)) * 44u + 12u + uint(g) * 8u;
+}
+
+uint qh_base(uint rowg, int bi) {
+	return (rowg * uint(u_k_blocks) + uint(bi)) * 44u + 4u;
+}
+
+void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
+				out uint sc1, out uint mn1) {
+	uint  bw = (rowg * uint(u_k_blocks) + uint(bi)) * 44u;
+	uint  hw = w[bw];
+	uvec3 sw = uvec3(w[bw + 1u], w[bw + 2u], w[bw + 3u]);
+	d		 = h2f(hw);
+	dm		 = h2f(hw >> 16u);
+	scale_min(sw, 2 * g, sc0, mn0);
+	scale_min(sw, 2 * g + 1, sc1, mn1);
+}
+#endif
+
 void main(void) {
 	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	  = uint(max(u_m, 1));
@@ -91,13 +136,15 @@ void main(void) {
 		uint sh_hi_r = uint(max(2 * g - 3, 0));
 		uint sh_b_lo = uint(2 * g + 4);
 		uint sh_b_hi = uint(2 * g + 5);
-		uint blockw[ROWS];
+		uint qbase[ROWS];
+		uint hbase[ROWS];
 		int	 dot0[ROWS];
 		int	 dot1[ROWS];
 		for (int r = 0; r < ROWS; r++) {
-			blockw[r] = (min(row0 + uint(r), last) * uint(u_k_blocks) + uint(bi)) * 44u;
-			dot0[r]	  = 0;
-			dot1[r]	  = 0;
+			qbase[r] = qs_base(min(row0 + uint(r), last), bi, g);
+			hbase[r] = qh_base(min(row0 + uint(r), last), bi);
+			dot0[r]	 = 0;
+			dot1[r]	 = 0;
 		}
 		for (int half_i = 0; half_i < 4; half_i++) {
 			uint la[ROWS];
@@ -112,8 +159,8 @@ void main(void) {
 				uint xb0 = xq[xp + 16u + uint(2 * i)];
 				uint xb1 = xq[xp + 16u + uint(2 * i) + 1u];
 				for (int r = 0; r < ROWS; r++) {
-					uint qw = w[blockw[r] + 12u + uint(g) * 8u + uint(i)];
-					uint hq = w[blockw[r] + 4u + uint(i)];
+					uint qw = w[qbase[r] + uint(i)];
+					uint hq = w[hbase[r] + uint(i)];
 					uint h0 = (g < 2 ? (hq << sh_lo_l) : (hq >> sh_lo_r)) & HBIT;
 					uint h1 = (hq >> (sh_b_lo)) & HBIT;
 					uint h2 = (g < 2 ? (hq << sh_hi_l) : (hq >> sh_hi_r)) & HBIT;
@@ -128,13 +175,9 @@ void main(void) {
 			}
 		}
 		for (int r = 0; r < ROWS; r++) {
-			uint  hw = w[blockw[r]];
-			float d	 = h2f(hw);
-			float dm = h2f(hw >> 16u);
-			uvec3 sw = uvec3(w[blockw[r] + 1u], w[blockw[r] + 2u], w[blockw[r] + 3u]);
+			float d, dm;
 			uint  sc0, mn0, sc1, mn1;
-			scale_min(sw, 2 * g, sc0, mn0);
-			scale_min(sw, 2 * g + 1, sc1, mn1);
+			row_header(min(row0 + uint(r), last), bi, g, d, dm, sc0, mn0, sc1, mn1);
 			int sumi = int(sc0) * dot0[r] + int(sc1) * dot1[r];
 			int summ = int(mn0) * sx_lo + int(mn1) * sx_hi;
 			acc[r] += xd * (d * float(sumi) - dm * float(summ));

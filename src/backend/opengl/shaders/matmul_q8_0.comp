@@ -6,11 +6,21 @@ precision highp int;
 #define WG 32
 #endif
 
+#ifdef R8
+layout(local_size_x = 8) in;
+#else
 layout(local_size_x = WG) in;
+#endif
 
+#ifdef R8
+layout(std430, binding = 0) readonly buffer WBuf {
+	uvec4 w[];
+};
+#else
 layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
+#endif
 layout(std430, binding = 1) readonly buffer XQBuf {
 	uvec4 xq4[];
 };
@@ -27,18 +37,26 @@ layout(location = 9) uniform int u_m;
 layout(location = 10) uniform int u_x_stride;
 layout(location = 11) uniform int u_wg_base;
 
+#ifndef R8
 uint g_mi;
+#endif
 
+#ifndef MT
+#define MT 1
+#endif
+
+#ifdef R8
+#define ROWS 8
+#else
 #define ROWS 4
+#endif
 
+#ifndef R8
 shared float s_acc[ROWS][WG];
 
+#endif
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
-}
-
-uint sh2(uint a, uint b, uint odd) {
-	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
 }
 
 int dot4_s8(uint qw, uint xw) {
@@ -48,6 +66,84 @@ int dot4_s8(uint qw, uint xw) {
 	return s;
 }
 
+#ifndef R8
+uint sh2(uint a, uint b, uint odd) {
+	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
+}
+
+void load_block(uint rowg, int bi, out float wd, out uint q[8]) {
+	uint bo	 = rowg * uint(u_k_blocks) * 34u + uint(bi) * 34u;
+	uint wi	 = bo >> 2u;
+	uint odd = (bo >> 1u) & 1u;
+	uint w0	 = w[wi];
+	uint w1	 = w[wi + 1u];
+	uint w2	 = w[wi + 2u];
+	uint w3	 = w[wi + 3u];
+	uint w4	 = w[wi + 4u];
+	uint w5	 = w[wi + 5u];
+	uint w6	 = w[wi + 6u];
+	uint w7	 = w[wi + 7u];
+	uint w8	 = w[wi + 8u];
+	wd		 = h2f(odd != 0u ? w0 >> 16u : w0);
+	q[0]	 = sh2(w0, w1, odd);
+	q[1]	 = sh2(w1, w2, odd);
+	q[2]	 = sh2(w2, w3, odd);
+	q[3]	 = sh2(w3, w4, odd);
+	q[4]	 = sh2(w4, w5, odd);
+	q[5]	 = sh2(w5, w6, odd);
+	q[6]	 = sh2(w6, w7, odd);
+	q[7]	 = sh2(w7, w8, odd);
+}
+#endif
+
+#ifdef R8
+void main(void) {
+	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	   = uint(max(u_m, 1));
+	uint mt	   = (mb + uint(MT) - 1u) / uint(MT);
+	uint col0  = (wgid % mt) * uint(MT);
+	uint ncols = min(uint(MT), mb - col0);
+	uint grp   = wgid / mt;
+	uint lane  = gl_LocalInvocationID.x;
+	uint row   = grp * 8u + lane;
+	uint gbase = grp * uint(u_k_blocks) * 17u;
+
+	float acc[MT];
+	for (int c = 0; c < MT; c++)
+		acc[c] = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  base = gbase + uint(bi) * 17u;
+		uint  sw   = w[base][lane >> 1u];
+		float wd   = h2f((lane & 1u) != 0u ? sw >> 16u : sw);
+		uvec4 qa   = w[base + 1u + lane * 2u];
+		uvec4 qb   = w[base + 2u + lane * 2u];
+		for (int c = 0; c < MT; c++) {
+			if (uint(c) >= ncols)
+				break;
+			uint  xi   = (col0 + uint(c)) * uint(u_x_stride) + uint(bi) * 11u;
+			uvec4 xlo  = xq4[xi];
+			uvec4 xhi  = xq4[xi + 1u];
+			int	  sumi = dot4_s8(qa.x, xlo.x) + dot4_s8(qa.y, xlo.y) + dot4_s8(qa.z, xlo.z) +
+						 dot4_s8(qa.w, xlo.w) + dot4_s8(qb.x, xhi.x) + dot4_s8(qb.y, xhi.y) +
+						 dot4_s8(qb.z, xhi.z) + dot4_s8(qb.w, xhi.w);
+			acc[c] += wd * uintBitsToFloat(xq4[xi + 2u].x) * float(sumi);
+		}
+	}
+	if (int(row) >= u_n)
+		return;
+	for (int c = 0; c < MT; c++) {
+		if (uint(c) >= ncols)
+			break;
+		uint yi = (col0 + uint(c)) * uint(u_n) + row;
+		if (u_add_residual == 1)
+			y[yi] = acc[c] + res[row];
+		else if (u_add_residual == 2)
+			y[yi] += acc[c];
+		else
+			y[yi] = acc[c];
+	}
+}
+#else
 void main(void) {
 	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	  = uint(max(u_m, 1));
@@ -57,35 +153,21 @@ void main(void) {
 	uint tid  = gl_LocalInvocationID.x;
 	uint last = uint(max(u_n - 1, 0));
 
-	uint  row_off[ROWS];
 	float acc[ROWS];
-	for (int r = 0; r < ROWS; r++) {
-		row_off[r] = min(row0 + uint(r), last) * uint(u_k_blocks) * 34u;
-		acc[r]	   = 0.0;
-	}
+	for (int r = 0; r < ROWS; r++)
+		acc[r] = 0.0;
 	for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
 		uint  xi  = g_mi * uint(u_x_stride) + uint(bi) * 11u;
 		uvec4 xlo = xq4[xi];
 		uvec4 xhi = xq4[xi + 1u];
 		float dxq = uintBitsToFloat(xq4[xi + 2u].x);
 		for (int r = 0; r < ROWS; r++) {
-			uint  bo   = row_off[r] + uint(bi) * 34u;
-			uint  wi   = bo >> 2u;
-			uint  odd  = (bo >> 1u) & 1u;
-			uint  w0   = w[wi];
-			uint  w1   = w[wi + 1u];
-			uint  w2   = w[wi + 2u];
-			uint  w3   = w[wi + 3u];
-			uint  w4   = w[wi + 4u];
-			uint  w5   = w[wi + 5u];
-			uint  w6   = w[wi + 6u];
-			uint  w7   = w[wi + 7u];
-			uint  w8   = w[wi + 8u];
-			float wd   = h2f(odd != 0u ? w0 >> 16u : w0);
-			int	  sumi = dot4_s8(sh2(w0, w1, odd), xlo.x) + dot4_s8(sh2(w1, w2, odd), xlo.y) +
-						 dot4_s8(sh2(w2, w3, odd), xlo.z) + dot4_s8(sh2(w3, w4, odd), xlo.w) +
-						 dot4_s8(sh2(w4, w5, odd), xhi.x) + dot4_s8(sh2(w5, w6, odd), xhi.y) +
-						 dot4_s8(sh2(w6, w7, odd), xhi.z) + dot4_s8(sh2(w7, w8, odd), xhi.w);
+			float wd;
+			uint  q[8];
+			load_block(min(row0 + uint(r), last), bi, wd, q);
+			int sumi = dot4_s8(q[0], xlo.x) + dot4_s8(q[1], xlo.y) + dot4_s8(q[2], xlo.z) +
+					   dot4_s8(q[3], xlo.w) + dot4_s8(q[4], xhi.x) + dot4_s8(q[5], xhi.y) +
+					   dot4_s8(q[6], xhi.z) + dot4_s8(q[7], xhi.w);
 			acc[r] += wd * dxq * float(sumi);
 		}
 	}
@@ -111,3 +193,4 @@ void main(void) {
 		}
 	}
 }
+#endif
