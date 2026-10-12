@@ -10,6 +10,7 @@
 #include <GLES3/gl31.h>
 #include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,7 +84,22 @@ typedef enum {
 typedef struct {
 	const char *name;
 	const char *src;
+	uint32_t	flags;
+	uint32_t	w_type;
+	int			rows_per_wg;
+	int			block_size;
 } gl_pipeline_def;
+
+enum {
+	GL_PIPE_F_FUSED_ACT = 1u << 0,
+	GL_PIPE_F_TILED		= 1u << 1,
+	GL_PIPE_F_R8_LANE	= 1u << 2,
+	GL_PIPE_F_R8		= 1u << 3,
+	GL_PIPE_F_MATMUL_WG = 1u << 4,
+	GL_PIPE_F_USES_XQ	= 1u << 5,
+	GL_PIPE_F_USES_XQK	= 1u << 6,
+	GL_PIPE_F_IQ4NL_LUT = 1u << 7,
+};
 
 typedef struct gl_buf {
 	gl_priv *owner;
@@ -99,6 +115,11 @@ typedef struct gl_buf {
 typedef struct {
 	GLuint		program;
 	const char *name;
+	const char *src;
+	uint32_t	flags;
+	uint32_t	w_type;
+	int			rows_per_wg;
+	int			block_size;
 	int			n_uni;
 	uint32_t	uvalid;
 	uint32_t	uval[GL_PIPELINE_MAX_UNIFORMS];
@@ -146,7 +167,7 @@ struct gl_priv {
 	int			  rope_cache_next;
 
 	gl_buf *qx;
-	size_t	qx_row_bytes;
+	size_t	qx_row_words;
 
 	gl_buf *qxk;
 	size_t	qxk_row_words;
@@ -351,36 +372,6 @@ static int gl_matmul_wg(const gl_context *ctx) {
 	if (strstr(ctx->renderer, "Mali") || strstr(ctx->renderer, "Panfrost"))
 		return 4;
 	return 32;
-}
-
-static bool gl_pipe_is_fused_act(int pipe_id) {
-	return pipe_id == GL_PIPE_QUANTIZE_X_ACT || pipe_id == GL_PIPE_QUANTIZE_Q8_K_ACT;
-}
-
-static bool gl_pipe_is_tiled(int pipe_id) {
-	return pipe_id == GL_PIPE_MATMUL_Q4_0_TILED || pipe_id == GL_PIPE_MATMUL_Q4_1_TILED ||
-		   pipe_id == GL_PIPE_MATMUL_Q5_0_TILED || pipe_id == GL_PIPE_MATMUL_Q5_1_TILED ||
-		   pipe_id == GL_PIPE_MATMUL_Q4_0_R8_TILED || pipe_id == GL_PIPE_MATMUL_Q8_0_R8_TILED ||
-		   pipe_id == GL_PIPE_MATMUL_IQ4_NL_R8_TILED;
-}
-
-static bool gl_pipe_is_r8_lane(int pipe_id) {
-	return pipe_id == GL_PIPE_MATMUL_Q4_0_R8 || pipe_id == GL_PIPE_MATMUL_Q8_0_R8 ||
-		   pipe_id == GL_PIPE_MATMUL_IQ4_NL_R8 || pipe_id == GL_PIPE_MATMUL_Q4_0_R8_TILED ||
-		   pipe_id == GL_PIPE_MATMUL_Q8_0_R8_TILED || pipe_id == GL_PIPE_MATMUL_IQ4_NL_R8_TILED;
-}
-
-static bool gl_pipe_is_r8(int pipe_id) {
-	return pipe_id == GL_PIPE_MATMUL_Q4_K_R8 || pipe_id == GL_PIPE_MATMUL_Q5_K_R8 ||
-		   pipe_id == GL_PIPE_MATMUL_Q6_K_R8;
-}
-
-static bool gl_pipe_uses_matmul_wg(int pipe_id) {
-	return pipe_id == GL_PIPE_MATMUL_IQ4_NL || pipe_id == GL_PIPE_MATMUL_Q4_0 ||
-		   pipe_id == GL_PIPE_MATMUL_Q4_1 || pipe_id == GL_PIPE_MATMUL_Q5_0 ||
-		   pipe_id == GL_PIPE_MATMUL_Q5_1 || pipe_id == GL_PIPE_MATMUL_Q8_0 ||
-		   pipe_id == GL_PIPE_MATMUL_Q4_K || pipe_id == GL_PIPE_MATMUL_Q5_K ||
-		   pipe_id == GL_PIPE_MATMUL_Q6_K || gl_pipe_is_tiled(pipe_id) || gl_pipe_is_r8(pipe_id);
 }
 
 static char *gl_shader_with_define(const char *src, const char *name, int value) {
@@ -904,68 +895,130 @@ static status_code gl_init(backend *self, int device_index) {
 	}
 
 	gl_pipeline_def defs[GL_PIPE_COUNT] = {
-		[GL_PIPE_ARGMAX_STAGE1]			 = {"argmax_stage1", gl_shader_argmax_stage1_src},
-		[GL_PIPE_ARGMAX_STAGE2]			 = {"argmax_stage2", gl_shader_argmax_stage2_src},
-		[GL_PIPE_RMSNORM]				 = {"rmsnorm", gl_shader_rmsnorm_src},
-		[GL_PIPE_RMSNORM_PER_HEAD]		 = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src},
-		[GL_PIPE_ELEMENTWISE]			 = {"elementwise", gl_shader_elementwise_src},
-		[GL_PIPE_EMBD_LOOKUP_F16]		 = {"embd_lookup_f16", gl_shader_embd_lookup_f16_src},
-		[GL_PIPE_EMBD_LOOKUP_F32]		 = {"embd_lookup_f32", gl_shader_embd_lookup_f32_src},
-		[GL_PIPE_EMBD_LOOKUP_BF16]		 = {"embd_lookup_bf16", gl_shader_embd_lookup_bf16_src},
-		[GL_PIPE_EMBD_LOOKUP_QUANT]		 = {"embd_lookup_quant", gl_shader_embd_lookup_quant_src},
-		[GL_PIPE_MATMUL_F32]			 = {"matmul_f32", gl_shader_matmul_f32_src},
-		[GL_PIPE_MATMUL_IQ4_NL]			 = {"matmul_iq4_nl", gl_shader_matmul_iq4_nl_src},
-		[GL_PIPE_MATMUL_Q4_0]			 = {"matmul_q4_0", gl_shader_matmul_q4_0_src},
-		[GL_PIPE_MATMUL_Q4_1]			 = {"matmul_q4_1", gl_shader_matmul_q4_1_src},
-		[GL_PIPE_MATMUL_Q5_0]			 = {"matmul_q5_0", gl_shader_matmul_q5_0_src},
-		[GL_PIPE_MATMUL_Q5_1]			 = {"matmul_q5_1", gl_shader_matmul_q5_1_src},
-		[GL_PIPE_MATMUL_Q8_0]			 = {"matmul_q8_0", gl_shader_matmul_q8_0_src},
-		[GL_PIPE_MATMUL_Q4_K]			 = {"matmul_q4_k", gl_shader_matmul_q4_k_src},
-		[GL_PIPE_MATMUL_F16]			 = {"matmul_f16", gl_shader_matmul_f16_src},
-		[GL_PIPE_MATMUL_BF16]			 = {"matmul_bf16", gl_shader_matmul_bf16_src},
-		[GL_PIPE_MATMUL_Q5_K]			 = {"matmul_q5_k", gl_shader_matmul_q5_k_src},
-		[GL_PIPE_MATMUL_Q6_K]			 = {"matmul_q6_k", gl_shader_matmul_q6_k_src},
-		[GL_PIPE_MATMUL_IQ3_S]			 = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src},
-		[GL_PIPE_MATMUL_Q4_0_TILED]		 = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src},
-		[GL_PIPE_MATMUL_Q4_1_TILED]		 = {"matmul_q4_1_tiled", gl_shader_matmul_q4_1_src},
-		[GL_PIPE_MATMUL_Q5_0_TILED]		 = {"matmul_q5_0_tiled", gl_shader_matmul_q5_0_src},
-		[GL_PIPE_MATMUL_Q5_1_TILED]		 = {"matmul_q5_1_tiled", gl_shader_matmul_q5_1_src},
-		[GL_PIPE_MATMUL_Q4_0_R8]		 = {"matmul_q4_0_r8", gl_shader_matmul_q4_0_src},
-		[GL_PIPE_MATMUL_Q8_0_R8]		 = {"matmul_q8_0_r8", gl_shader_matmul_q8_0_src},
-		[GL_PIPE_MATMUL_IQ4_NL_R8]		 = {"matmul_iq4_nl_r8", gl_shader_matmul_iq4_nl_src},
-		[GL_PIPE_MATMUL_Q4_K_R8]		 = {"matmul_q4_k_r8", gl_shader_matmul_q4_k_src},
-		[GL_PIPE_MATMUL_Q5_K_R8]		 = {"matmul_q5_k_r8", gl_shader_matmul_q5_k_src},
-		[GL_PIPE_MATMUL_Q6_K_R8]		 = {"matmul_q6_k_r8", gl_shader_matmul_q6_k_src},
-		[GL_PIPE_MATMUL_Q4_0_R8_TILED]	 = {"matmul_q4_0_r8_tiled", gl_shader_matmul_q4_0_src},
-		[GL_PIPE_MATMUL_Q8_0_R8_TILED]	 = {"matmul_q8_0_r8_tiled", gl_shader_matmul_q8_0_src},
-		[GL_PIPE_MATMUL_IQ4_NL_R8_TILED] = {"matmul_iq4_nl_r8_tiled", gl_shader_matmul_iq4_nl_src},
-		[GL_PIPE_QUANTIZE_Q8_K]			 = {"quantize_q8_k", gl_shader_quantize_q8_k_src},
-		[GL_PIPE_QUANTIZE_X]			 = {"quantize_x", gl_shader_quantize_x_src},
-		[GL_PIPE_ROPE_QK]				 = {"rope_qk", gl_shader_rope_qk_src},
-		[GL_PIPE_QUANTIZE_X_ACT]		 = {"quantize_x_act", gl_shader_quantize_x_src},
-		[GL_PIPE_QUANTIZE_Q8_K_ACT]		 = {"quantize_q8_k_act", gl_shader_quantize_q8_k_src},
-		[GL_PIPE_ROPE]					 = {"rope", gl_shader_rope_src},
-		[GL_PIPE_ROPE_BATCH]			 = {"rope_batch", gl_shader_rope_batch_src},
-		[GL_PIPE_FFN_ACTIVATE]			 = {"ffn_activate", gl_shader_ffn_activate_src},
+		[GL_PIPE_ARGMAX_STAGE1] = {"argmax_stage1", gl_shader_argmax_stage1_src, 0, UINT32_MAX, 1,
+								   0},
+		[GL_PIPE_ARGMAX_STAGE2] = {"argmax_stage2", gl_shader_argmax_stage2_src, 0, UINT32_MAX, 1,
+								   0},
+		[GL_PIPE_RMSNORM]		= {"rmsnorm", gl_shader_rmsnorm_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_RMSNORM_PER_HEAD] = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src, 0,
+									  UINT32_MAX, 1, 0},
+		[GL_PIPE_ELEMENTWISE]	  = {"elementwise", gl_shader_elementwise_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_F16] = {"embd_lookup_f16", gl_shader_embd_lookup_f16_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_F32] = {"embd_lookup_f32", gl_shader_embd_lookup_f32_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_BF16]	= {"embd_lookup_bf16", gl_shader_embd_lookup_bf16_src, 0,
+									   UINT32_MAX, 1, 0},
+		[GL_PIPE_EMBD_LOOKUP_QUANT] = {"embd_lookup_quant", gl_shader_embd_lookup_quant_src, 0,
+									   UINT32_MAX, 1, 0},
+		[GL_PIPE_MATMUL_F32]	= {"matmul_f32", gl_shader_matmul_f32_src, 0, GGML_TYPE_F32, 4, 0},
+		[GL_PIPE_MATMUL_IQ4_NL] = {"matmul_iq4_nl", gl_shader_matmul_iq4_nl_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ | GL_PIPE_F_IQ4NL_LUT,
+								   GGML_TYPE_IQ4_NL, 4, 32},
+		[GL_PIPE_MATMUL_Q4_0]	= {"matmul_q4_0", gl_shader_matmul_q4_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_0, 4, 32},
+		[GL_PIPE_MATMUL_Q4_1]	= {"matmul_q4_1", gl_shader_matmul_q4_1_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_1, 4, 32},
+		[GL_PIPE_MATMUL_Q5_0]	= {"matmul_q5_0", gl_shader_matmul_q5_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q5_0, 4, 32},
+		[GL_PIPE_MATMUL_Q5_1]	= {"matmul_q5_1", gl_shader_matmul_q5_1_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q5_1, 4, 32},
+		[GL_PIPE_MATMUL_Q8_0]	= {"matmul_q8_0", gl_shader_matmul_q8_0_src,
+								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0, 4, 32},
+		[GL_PIPE_MATMUL_Q4_K]  = {"matmul_q4_k", gl_shader_matmul_q4_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q4_K, 4, 256},
+		[GL_PIPE_MATMUL_F16]   = {"matmul_f16", gl_shader_matmul_f16_src, 0, GGML_TYPE_F16, 4, 0},
+		[GL_PIPE_MATMUL_BF16]  = {"matmul_bf16", gl_shader_matmul_f16_src, 0, GGML_TYPE_BF16, 4, 0},
+		[GL_PIPE_MATMUL_Q5_K]  = {"matmul_q5_k", gl_shader_matmul_q4_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q5_K, 4, 256},
+		[GL_PIPE_MATMUL_Q6_K]  = {"matmul_q6_k", gl_shader_matmul_q6_k_src,
+								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q6_K, 4, 256},
+		[GL_PIPE_MATMUL_IQ3_S] = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src, GL_PIPE_F_USES_XQK,
+								  GGML_TYPE_IQ3_S, 32, 256},
+		[GL_PIPE_MATMUL_Q4_0_TILED] = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_1_TILED] = {"matmul_q4_1_tiled", gl_shader_matmul_q4_1_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_0_TILED] = {"matmul_q5_0_tiled", gl_shader_matmul_q5_0_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_1_TILED] = {"matmul_q5_1_tiled", gl_shader_matmul_q5_1_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+									   UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_0_R8]	= {"matmul_q4_0_r8", gl_shader_matmul_q4_0_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_0_R8, 8,
+									   32},
+		[GL_PIPE_MATMUL_Q8_0_R8]	= {"matmul_q8_0_r8", gl_shader_matmul_q8_0_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0_R8, 8,
+									   32},
+		[GL_PIPE_MATMUL_IQ4_NL_R8]	= {"matmul_iq4_nl_r8", gl_shader_matmul_iq4_nl_src,
+									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ | GL_PIPE_F_IQ4NL_LUT,
+									   GGML_TYPE_IQ4_NL_R8, 8, 32},
+		[GL_PIPE_MATMUL_Q4_K_R8]	= {"matmul_q4_k_r8", gl_shader_matmul_q4_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q4_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q5_K_R8]	= {"matmul_q5_k_r8", gl_shader_matmul_q4_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q5_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q6_K_R8]	= {"matmul_q6_k_r8", gl_shader_matmul_q6_k_src,
+									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
+									   GGML_TYPE_Q6_K_R8, 4, 256},
+		[GL_PIPE_MATMUL_Q4_0_R8_TILED]	 = {"matmul_q4_0_r8_tiled", gl_shader_matmul_q4_0_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_Q8_0_R8_TILED]	 = {"matmul_q8_0_r8_tiled", gl_shader_matmul_q8_0_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_IQ4_NL_R8_TILED] = {"matmul_iq4_nl_r8_tiled", gl_shader_matmul_iq4_nl_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ |
+												GL_PIPE_F_IQ4NL_LUT,
+											UINT32_MAX, 8, 32},
+		[GL_PIPE_QUANTIZE_Q8_K]	 = {"quantize_q8_k", gl_shader_quantize_q8_k_src, 0, UINT32_MAX, 1,
+									0},
+		[GL_PIPE_QUANTIZE_X]	 = {"quantize_x", gl_shader_quantize_x_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE_QK]		 = {"rope_qk", gl_shader_rope_qk_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_QUANTIZE_X_ACT] = {"quantize_x_act", gl_shader_quantize_x_src, GL_PIPE_F_FUSED_ACT,
+									UINT32_MAX, 1, 0},
+		[GL_PIPE_QUANTIZE_Q8_K_ACT] = {"quantize_q8_k_act", gl_shader_quantize_q8_k_src,
+									   GL_PIPE_F_FUSED_ACT, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE]				= {"rope", gl_shader_rope_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE_BATCH]		= {"rope_batch", gl_shader_rope_batch_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_FFN_ACTIVATE] = {"ffn_activate", gl_shader_ffn_activate_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_FFN_ACTIVATE_FUSED_BATCH] = {"ffn_activate_fused_batch",
-											  gl_shader_ffn_activate_fused_batch_src},
-		[GL_PIPE_ATTENTION]				   = {"attention", p->attention_src},
-		[GL_PIPE_ATTENTION_BATCH]		   = {"attention_batch", p->attention_batch_src},
-		[GL_PIPE_PARTIAL_ROPE_QK]		   = {"partial_rope_qk", gl_shader_partial_rope_qk_src},
-		[GL_PIPE_KV_PUT]				   = {"kv_put", gl_shader_kv_put_src},
+											  gl_shader_ffn_activate_fused_batch_src, 0, UINT32_MAX,
+											  1, 0},
+		[GL_PIPE_ATTENTION]				   = {"attention", p->attention_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ATTENTION_BATCH] = {"attention_batch", p->attention_batch_src, 0, UINT32_MAX, 1,
+									 0},
+		[GL_PIPE_PARTIAL_ROPE_QK] = {"partial_rope_qk", gl_shader_partial_rope_qk_src, 0,
+									 UINT32_MAX, 1, 0},
+		[GL_PIPE_KV_PUT]		  = {"kv_put", gl_shader_kv_put_src, 0, UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
+	static const struct {
+		int			pipe;
+		const char *define;
+	} variant_defs[] = {
+		{GL_PIPE_MATMUL_BF16, "BF16"},
+		{GL_PIPE_MATMUL_Q5_K, "Q5K"},
+		{GL_PIPE_MATMUL_Q5_K_R8, "Q5K"},
+	};
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		char *tuned_src = NULL;
-		if (gl_pipe_uses_matmul_wg(i)) {
+		if (defs[i].flags & GL_PIPE_F_MATMUL_WG) {
 			tuned_src = gl_shader_with_define(defs[i].src, "WG", p->matmul_wg);
 			if (!tuned_src) {
 				s = ERR_INTERNAL;
 				break;
 			}
 		}
-		if (gl_pipe_is_r8(i) || gl_pipe_is_r8_lane(i)) {
+		if (defs[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) {
 			char *with_r8 = gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "R8", 1);
 			if (!with_r8) {
 				free(tuned_src);
@@ -975,7 +1028,7 @@ static status_code gl_init(backend *self, int device_index) {
 			free(tuned_src);
 			tuned_src = with_r8;
 		}
-		if (gl_pipe_is_tiled(i)) {
+		if (defs[i].flags & GL_PIPE_F_TILED) {
 			char *with_cols =
 				gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "MT", GL_MATMUL_COLS);
 			if (!with_cols) {
@@ -986,14 +1039,34 @@ static status_code gl_init(backend *self, int device_index) {
 			free(tuned_src);
 			tuned_src = with_cols;
 		}
-		if (gl_pipe_is_fused_act(i) && !tuned_src) {
+		if ((defs[i].flags & GL_PIPE_F_FUSED_ACT) && !tuned_src) {
 			tuned_src = gl_shader_with_define(defs[i].src, "FUSED_ACT", 1);
 			if (!tuned_src) {
 				s = ERR_INTERNAL;
 				break;
 			}
 		}
+		for (size_t vi = 0; vi < ARRAY_LEN(variant_defs); vi++) {
+			if (variant_defs[vi].pipe != i)
+				continue;
+			char *with_var = gl_shader_with_define(tuned_src ? tuned_src : defs[i].src,
+												   variant_defs[vi].define, 1);
+			if (!with_var) {
+				free(tuned_src);
+				s = ERR_INTERNAL;
+				break;
+			}
+			free(tuned_src);
+			tuned_src = with_var;
+		}
+		if (s != OK)
+			break;
 		s = gl_build_pipeline(tuned_src ? tuned_src : defs[i].src, defs[i].name, &p->pipes[i]);
+		p->pipes[i].src			= defs[i].src;
+		p->pipes[i].flags		= defs[i].flags;
+		p->pipes[i].w_type		= defs[i].w_type;
+		p->pipes[i].rows_per_wg = defs[i].rows_per_wg;
+		p->pipes[i].block_size	= defs[i].block_size;
 		free(tuned_src);
 		if (s != OK) {
 			for (int j = 0; j < i; j++)
@@ -1341,6 +1414,14 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_IQ3_S:
 		pipe = &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT];
 		break;
+	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_Q4_K_R8:
+	case GGML_TYPE_Q5_K_R8:
+	case GGML_TYPE_Q6_K_R8:
+		return ERR_UNSUPPORTED;
 	default: {
 		gl_buf *eb = as_glbuf(tok_embd);
 		gl_buf *ob = as_glbuf(x_out);
@@ -2117,103 +2198,25 @@ static status_code gl_repack_weight(backend *self, uint32_t type, const void *sr
 }
 
 static int gl_matmul_type_native(backend *self, uint32_t w_type) {
-	(void)self;
-	return w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16 ||
-		   w_type == GGML_TYPE_IQ4_NL || w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_1 ||
-		   w_type == GGML_TYPE_Q5_0 || w_type == GGML_TYPE_Q5_1 || w_type == GGML_TYPE_Q8_0 ||
-		   w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_Q6_K ||
-		   w_type == GGML_TYPE_IQ3_S || w_type == GGML_TYPE_Q4_0_R8 ||
-		   w_type == GGML_TYPE_Q8_0_R8 || w_type == GGML_TYPE_IQ4_NL_R8 ||
-		   w_type == GGML_TYPE_Q4_K_R8 || w_type == GGML_TYPE_Q5_K_R8 ||
-		   w_type == GGML_TYPE_Q6_K_R8;
+	const gl_priv *p = self->priv;
+	for (int i = 0; i < GL_PIPE_COUNT; i++)
+		if (p->pipes[i].w_type == w_type)
+			return 1;
+	return 0;
 }
 
 static int gl_matmul_pipe_for_type(gl_priv *p, uint32_t w_type, gl_pipeline **out_pipe,
 								   int *out_block_size) {
-	gl_pipeline *pipe		= NULL;
-	int			 block_size = 0;
-	switch (w_type) {
-	case GGML_TYPE_F32:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F32];
-		break;
-	case GGML_TYPE_F16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_F16];
-		break;
-	case GGML_TYPE_BF16:
-		pipe = &p->pipes[GL_PIPE_MATMUL_BF16];
-		break;
-	case GGML_TYPE_IQ4_NL:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ4_NL];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q5_1:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_1];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q8_0:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q8_0];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q5_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q6_K:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q6_K];
-		block_size = 256;
-		break;
-	case GGML_TYPE_IQ3_S:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ3_S];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q4_0_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_0_R8];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q8_0_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q8_0_R8];
-		block_size = 32;
-		break;
-	case GGML_TYPE_IQ4_NL_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8];
-		block_size = 32;
-		break;
-	case GGML_TYPE_Q4_K_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q4_K_R8];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q5_K_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q5_K_R8];
-		block_size = 256;
-		break;
-	case GGML_TYPE_Q6_K_R8:
-		pipe	   = &p->pipes[GL_PIPE_MATMUL_Q6_K_R8];
-		block_size = 256;
-		break;
-	default:
-		return 0;
+	for (int i = 0; i < GL_PIPE_COUNT; i++) {
+		if (p->pipes[i].w_type == UINT32_MAX || p->pipes[i].w_type != w_type)
+			continue;
+		if (!p->pipes[i].program)
+			return 0;
+		*out_pipe		= &p->pipes[i];
+		*out_block_size = p->pipes[i].block_size;
+		return 1;
 	}
-	if (!pipe->program)
-		return 0;
-	*out_pipe		= pipe;
-	*out_block_size = block_size;
-	return 1;
+	return 0;
 }
 
 static int gl_matmul_buf_ok(const buffer *b) {
@@ -2232,50 +2235,49 @@ static int gl_matmul_f32_align_ok(const buffer *x, const buffer *y, const buffer
 #define GL_XQ_BLOCK_WORDS 44u
 
 static int gl_pipe_uses_xq(const gl_priv *p, const gl_pipeline *pipe) {
-	return pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0] || pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0_R8] || pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0_R8] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0_R8_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0_R8_TILED] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8_TILED];
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_USES_XQ) != 0;
 }
 
 static int gl_pipe_uses_iq4nl_lut(const gl_priv *p, const gl_pipeline *pipe) {
-	return pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8_TILED];
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_IQ4NL_LUT) != 0;
 }
 
 static int gl_pipe_uses_xqk(const gl_priv *p, const gl_pipeline *pipe) {
-	return pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_K] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q5_K] || pipe == &p->pipes[GL_PIPE_MATMUL_Q6_K] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q4_K_R8] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_K_R8] ||
-		   pipe == &p->pipes[GL_PIPE_MATMUL_Q6_K_R8];
+	(void)p;
+	return (pipe->flags & GL_PIPE_F_USES_XQK) != 0;
 }
 
-static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
-								 int activation) {
-	gl_pipeline *pipe = &p->pipes[up ? GL_PIPE_QUANTIZE_X_ACT : GL_PIPE_QUANTIZE_X];
+typedef struct {
+	int		 plain_pipe;
+	int		 act_pipe;
+	int		 block;
+	int		 check_block;
+	unsigned words_per_block;
+	unsigned gx_div;
+} gl_quantize_spec;
+
+static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_buf **slot,
+								   size_t *row_words, const buffer *x, int k, int m,
+								   const buffer *up, int activation) {
+	gl_pipeline *pipe = &p->pipes[up ? spec->act_pipe : spec->plain_pipe];
 	if (!pipe->program || m > (int)GL_MAX_DISPATCH_PER_DIM)
 		return ERR_UNSUPPORTED;
-	int	   k_blocks	 = k / 32;
+	if (spec->check_block && (k <= 0 || (k % spec->block) != 0))
+		return ERR_UNSUPPORTED;
+	int	   k_blocks	 = k / spec->block;
 	size_t align	 = MAX(gl_ssbo_align(p), (size_t)4);
-	size_t row_bytes = ALIGN_UP((size_t)k_blocks * GL_XQ_BLOCK_WORDS * sizeof(uint32_t), align);
+	size_t row_bytes = ALIGN_UP((size_t)k_blocks * spec->words_per_block * sizeof(uint32_t), align);
 	size_t need		 = row_bytes * (size_t)m;
-	if (!p->qx || p->qx->size_bytes < need) {
-		if (p->qx)
-			gl_buf_free(p, p->qx);
-		p->qx = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
-		if (!p->qx)
+	if (!*slot || (*slot)->size_bytes < need) {
+		if (*slot)
+			gl_buf_free(p, *slot);
+		*slot = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
+		if (!*slot)
 			return ERR_OUT_OF_MEMORY;
 	}
-	p->qx_row_bytes = row_bytes;
+	*row_words = row_bytes / sizeof(uint32_t);
 
 	gl_use_pipeline(p, pipe);
 	gl_bind_ssbo(0, x);
@@ -2283,11 +2285,11 @@ static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, cons
 		gl_bind_ssbo(2, up);
 		gl_pu(pipe, "u_act", activation);
 	}
-	gl_bind_raw(p, 1, p->qx->name, 0, 0, 1);
+	gl_bind_raw(p, 1, (*slot)->name, 0, 0, 1);
 	gl_pu(pipe, "u_k_blocks", k_blocks);
 	gl_pu(pipe, "u_k", k);
-	gl_pu(pipe, "u_row_words", (int)(row_bytes / sizeof(uint32_t)));
-	GLuint gx		 = (GLuint)((k_blocks + 63) / 64);
+	gl_pu(pipe, "u_row_words", (int)*row_words);
+	GLuint gx		 = (GLuint)(((unsigned)k_blocks + spec->gx_div - 1u) / spec->gx_div);
 	int	   row_chunk = 65536 / (k_blocks > 0 ? k_blocks : 1);
 	if (row_chunk < 1)
 		row_chunk = 1;
@@ -2301,90 +2303,38 @@ static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, cons
 	return OK;
 }
 
+static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
+								 int activation) {
+	static const gl_quantize_spec spec = {
+		GL_PIPE_QUANTIZE_X, GL_PIPE_QUANTIZE_X_ACT, 32, 0, GL_XQ_BLOCK_WORDS, 64};
+	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation);
+}
+
 #define GL_XQK_WORDS_PER_BLOCK 209u
 
 static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
 									int activation) {
-	gl_pipeline *pipe = &p->pipes[up ? GL_PIPE_QUANTIZE_Q8_K_ACT : GL_PIPE_QUANTIZE_Q8_K];
-	if (!pipe->program || m > (int)GL_MAX_DISPATCH_PER_DIM)
-		return ERR_UNSUPPORTED;
-	if (k <= 0 || (k % 256) != 0)
-		return ERR_UNSUPPORTED;
-	int	   k_blocks = k / 256;
-	size_t align	= MAX(gl_ssbo_align(p), (size_t)4);
-	size_t row_bytes =
-		ALIGN_UP((size_t)k_blocks * GL_XQK_WORDS_PER_BLOCK * sizeof(uint32_t), align);
-	size_t need = row_bytes * (size_t)m;
-	if (!p->qxk || p->qxk->size_bytes < need) {
-		if (p->qxk)
-			gl_buf_free(p, p->qxk);
-		p->qxk = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
-		if (!p->qxk)
-			return ERR_OUT_OF_MEMORY;
-	}
-	p->qxk_row_words = row_bytes / sizeof(uint32_t);
-
-	gl_use_pipeline(p, pipe);
-	gl_bind_ssbo(0, x);
-	if (up) {
-		gl_bind_ssbo(2, up);
-		gl_pu(pipe, "u_act", activation);
-	}
-	gl_bind_raw(p, 1, p->qxk->name, 0, 0, 1);
-	gl_pu(pipe, "u_k_blocks", k_blocks);
-	gl_pu(pipe, "u_k", k);
-	gl_pu(pipe, "u_row_words", (int)p->qxk_row_words);
-	int row_chunk = 65536 / (k_blocks > 0 ? k_blocks : 1);
-	if (row_chunk < 1)
-		row_chunk = 1;
-	for (int r0 = 0; r0 < m; r0 += row_chunk) {
-		int rows = m - r0;
-		if (rows > row_chunk)
-			rows = row_chunk;
-		gl_pu(pipe, "u_row0", r0);
-		gl_launch(p, (GLuint)k_blocks, (GLuint)rows, 1);
-	}
-	return OK;
+	static const gl_quantize_spec spec = {
+		GL_PIPE_QUANTIZE_Q8_K, GL_PIPE_QUANTIZE_Q8_K_ACT, 256, 1, GL_XQK_WORDS_PER_BLOCK, 1};
+	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation);
 }
 
 static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
-	if (gl_pipe_is_r8_lane((int)(pipe - p->pipes)))
-		return 8;
-	if (gl_pipe_is_tiled((int)(pipe - p->pipes)) || gl_pipe_is_r8((int)(pipe - p->pipes)))
-		return 4;
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_F32] || pipe == &p->pipes[GL_PIPE_MATMUL_F16] ||
-		pipe == &p->pipes[GL_PIPE_MATMUL_BF16] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0] ||
-		pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1] ||
-		pipe == &p->pipes[GL_PIPE_MATMUL_Q4_K] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0] ||
-		pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_K] ||
-		pipe == &p->pipes[GL_PIPE_MATMUL_Q6_K] || pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL])
-		return 4;
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S])
-		return 32;
-	return 1;
-}
-
-static int gl_matmul_cols_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
-	return gl_pipe_is_tiled((int)(pipe - p->pipes)) ? GL_MATMUL_COLS : 1;
+	(void)p;
+	return pipe->rows_per_wg;
 }
 
 static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
-	if (m < 2)
+	if (m < 2 || (pipe->flags & GL_PIPE_F_TILED))
 		return pipe;
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0])
-		return &p->pipes[GL_PIPE_MATMUL_Q4_0_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1])
-		return &p->pipes[GL_PIPE_MATMUL_Q4_1_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0])
-		return &p->pipes[GL_PIPE_MATMUL_Q5_0_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1])
-		return &p->pipes[GL_PIPE_MATMUL_Q5_1_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0_R8])
-		return &p->pipes[GL_PIPE_MATMUL_Q4_0_R8_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0_R8])
-		return &p->pipes[GL_PIPE_MATMUL_Q8_0_R8_TILED];
-	if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8])
-		return &p->pipes[GL_PIPE_MATMUL_IQ4_NL_R8_TILED];
+	for (int i = 0; i < GL_PIPE_COUNT; i++) {
+		if (!(p->pipes[i].flags & GL_PIPE_F_TILED) || p->pipes[i].src != pipe->src)
+			continue;
+		if ((p->pipes[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) !=
+			(pipe->flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)))
+			continue;
+		return &p->pipes[i];
+	}
 	return pipe;
 }
 
@@ -2395,17 +2345,9 @@ static long gl_matmul_chunk_wg(gl_priv *p, const gl_pipeline *pipe, int k_blocks
 		if (c >= 1 && c <= (long)GL_MAX_DISPATCH_PER_DIM)
 			return c;
 	}
-	int threads =
-		(pipe == &p->pipes[GL_PIPE_MATMUL_IQ4_NL] || pipe == &p->pipes[GL_PIPE_MATMUL_Q4_0] ||
-		 pipe == &p->pipes[GL_PIPE_MATMUL_Q4_1] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_0] ||
-		 pipe == &p->pipes[GL_PIPE_MATMUL_Q5_1] || pipe == &p->pipes[GL_PIPE_MATMUL_Q8_0] ||
-		 pipe == &p->pipes[GL_PIPE_MATMUL_Q4_K] || pipe == &p->pipes[GL_PIPE_MATMUL_Q5_K] ||
-		 pipe == &p->pipes[GL_PIPE_MATMUL_Q6_K] || gl_pipe_is_tiled((int)(pipe - p->pipes)) ||
-		 gl_pipe_is_r8((int)(pipe - p->pipes)))
-			? p->matmul_wg
-			: 32;
-	long units = (long)threads * (long)(k_blocks_eff > 0 ? k_blocks_eff : 1);
-	long c	   = (long)3145728 / (units > 0 ? units : 1);
+	int	 threads = (pipe->flags & GL_PIPE_F_MATMUL_WG) ? p->matmul_wg : 32;
+	long units	 = (long)threads * (long)(k_blocks_eff > 0 ? k_blocks_eff : 1);
+	long c		 = (long)3145728 / (units > 0 ? units : 1);
 	if (c < 64)
 		c = 64;
 	if (c > (long)GL_MAX_DISPATCH_PER_DIM)
@@ -2432,9 +2374,10 @@ static status_code gl_matmul_launch_chunked(gl_priv *p, gl_pipeline *pipe, long 
 
 static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_size,
 									  const buffer *w, const buffer *x, buffer *y,
-									  const buffer *residual, int n, int k, int xq_ready) {
-	if (n <= 0 || k <= 0)
+									  const buffer *residual, int n, int k, int m, int xq_ready) {
+	if (n <= 0 || k <= 0 || m <= 0)
 		return OK;
+	pipe = gl_matmul_tiled_pipe(p, pipe, m);
 
 	gl_buf *bufs[3] = {as_glbuf(w), as_glbuf(x), as_glbuf(y)};
 	for (int i = 0; i < 3; i++) {
@@ -2470,14 +2413,14 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 
 	const int use_xq = gl_pipe_uses_xq(p, pipe);
 	if (use_xq && !xq_ready) {
-		status_code qs = gl_quantize_x(p, x, k, 1, NULL, 0);
+		status_code qs = gl_quantize_x(p, x, k, m, NULL, 0);
 		if (qs != OK)
 			return qs;
 	}
 
 	const int use_xqk = gl_pipe_uses_xqk(p, pipe);
 	if (use_xqk && !xq_ready) {
-		status_code qs = gl_quantize_q8_k(p, x, k, 1, NULL, 0);
+		status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0);
 		if (qs != OK)
 			return qs == ERR_UNSUPPORTED ? ERR_UNSUPPORTED : qs;
 	}
@@ -2507,16 +2450,20 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		int k_blocks = k / block_size;
 		gl_pu(pipe, "u_k_blocks", k_blocks);
 	}
-	gl_pu(pipe, "u_m", 1);
-	if (gl_pipe_uses_xq(p, pipe) || gl_pipe_uses_xqk(p, pipe))
-		gl_pu(pipe, "u_x_stride", 0);
+	gl_pu(pipe, "u_m", m);
+	if (use_xq)
+		gl_pu(pipe, "u_x_stride", (int)(p->qx_row_words / 4));
+	else if (use_xqk)
+		gl_pu(pipe, "u_x_stride", (int)p->qxk_row_words);
 	gl_pu(pipe, "u_add_residual", mode);
 
-	int			rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
-	long		total_wg	= (long)(n + rows_per_wg - 1) / rows_per_wg;
-	int			k_eff		= block_size > 0 ? k / block_size : (k + 31) / 32;
-	status_code ls			= gl_matmul_launch_chunked(p, pipe, total_wg, k_eff);
-	bufs[2]->device_dirty	= 1;
+	int	 rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
+	int	 cols_per_wg = (pipe->flags & GL_PIPE_F_TILED) ? GL_MATMUL_COLS : 1;
+	long total_wg =
+		(long)((n + rows_per_wg - 1) / rows_per_wg) * (long)((m + cols_per_wg - 1) / cols_per_wg);
+	int			k_eff	  = block_size > 0 ? k / block_size : (k + 31) / 32;
+	status_code ls		  = gl_matmul_launch_chunked(p, pipe, total_wg, k_eff);
+	bufs[2]->device_dirty = 1;
 	return ls;
 }
 
@@ -2537,7 +2484,7 @@ static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, co
 		goto host_fallback;
 
 	{
-		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 0);
+		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 1, 0);
 		if (s == ERR_UNSUPPORTED)
 			goto host_fallback;
 		return s;
@@ -2586,81 +2533,11 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 			goto host_fallback;
 	}
 
-	pipe = gl_matmul_tiled_pipe(p, pipe, m);
 	{
-		gl_buf *wgb		= as_glbuf(w);
-		gl_buf *xgb		= as_glbuf(x);
-		gl_buf *ygb		= as_glbuf(y);
-		gl_buf *bufs[3] = {wgb, xgb, ygb};
-
-		for (int i = 0; i < 3; i++) {
-			if (!bufs[i] || bufs[i]->size_bytes == 0 || bufs[i]->size_bytes > (size_t)(1ull << 40))
-				goto host_fallback;
-		}
-
-		gl_buf_sync_to_device(bufs[0]);
-		gl_buf_sync_to_device(bufs[1]);
-		gl_buf_sync_to_device(bufs[2]);
-
-		const int use_xq = gl_pipe_uses_xq(p, pipe);
-		if (use_xq) {
-			status_code qs = gl_quantize_x(p, x, k, m, NULL, 0);
-			if (qs == ERR_UNSUPPORTED)
-				goto host_fallback;
-			if (qs != OK)
-				return qs;
-		}
-
-		const int use_xqk = gl_pipe_uses_xqk(p, pipe);
-		if (use_xqk) {
-			status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0);
-			if (qs == ERR_UNSUPPORTED)
-				goto host_fallback;
-			if (qs != OK)
-				return qs;
-		}
-
-		gl_use_pipeline(p, pipe);
-		gl_bind_ssbo(0, w);
-		gl_pu(pipe, "u_n", n);
-
-		if (block_size == 0) {
-			gl_pu(pipe, "u_k", k);
-		} else {
-			int k_blocks = k / block_size;
-			gl_pu(pipe, "u_k_blocks", k_blocks);
-		}
-		gl_pu(pipe, "u_add_residual", 0);
-		if (gl_ensure_dummy(p) != OK)
+		status_code ds = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, m, 0);
+		if (ds == ERR_UNSUPPORTED)
 			goto host_fallback;
-		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
-		if (pipe == &p->pipes[GL_PIPE_MATMUL_IQ3_S])
-			gl_bind_raw(p, 4, p->iq3s_grid->name, 0, 0, 0);
-		else if (gl_pipe_uses_iq4nl_lut(p, pipe))
-			gl_bind_raw(p, 4, p->iq4nl_pairs->name, 0, 0, 0);
-
-		int	   rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
-		int	   cols_per_wg = gl_matmul_cols_per_wg(p, pipe);
-		size_t total_wg	   = (size_t)((n + rows_per_wg - 1) / rows_per_wg) *
-							 (size_t)((m + cols_per_wg - 1) / cols_per_wg);
-		int	   x_stride	   = 0;
-		if (use_xq) {
-			x_stride = (int)(p->qx_row_bytes / 16);
-			gl_bind_raw(p, 1, p->qx->name, 0, 0, 0);
-		} else if (use_xqk) {
-			x_stride = (int)p->qxk_row_words;
-			gl_bind_raw(p, 1, p->qxk->name, 0, 0, 0);
-		} else {
-			gl_bind_ssbo(1, x);
-		}
-		gl_bind_ssbo_out(2, y);
-		gl_pu(pipe, "u_m", m);
-		if (use_xq || use_xqk)
-			gl_pu(pipe, "u_x_stride", x_stride);
-		int			k_eff = block_size > 0 ? k / block_size : (k + 31) / 32;
-		status_code ls	  = gl_matmul_launch_chunked(p, pipe, (long)total_wg, k_eff);
-		ygb->device_dirty = 1;
-		return ls;
+		return ds;
 	}
 
 host_fallback:
@@ -2694,7 +2571,7 @@ static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w
 		gl_matmul_buf_ok(x) && gl_matmul_buf_ok(y) && gl_matmul_buf_ok(residual) &&
 		(w_type != GGML_TYPE_F32 || gl_matmul_f32_align_ok(x, y, residual, k)) &&
 		(block_size == 0 || (k % block_size) == 0))
-		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 0);
+		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 1, 0);
 
 	if (s != ERR_UNSUPPORTED)
 		return s;
@@ -2777,7 +2654,7 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 				continue;
 			status_code s =
 				gl_matmul_dispatch(p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k,
-								   gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready);
+								   1, gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready);
 			if (s == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (s != OK)
@@ -3557,7 +3434,7 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation)
 								 : gl_quantize_x(p, gate, k, 1, up, activation);
 			if (qs == OK) {
-				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1);
+				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 1);
 				if (qs != ERR_UNSUPPORTED)
 					return qs;
 			} else if (qs != ERR_UNSUPPORTED) {

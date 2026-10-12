@@ -33,9 +33,11 @@ uint g_mi;
 
 shared float s_acc[ROWS][WG];
 
+#ifndef BF16
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
 }
+#endif
 
 void main(void) {
 	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
@@ -61,8 +63,13 @@ void main(void) {
 			float x0 = x[xrow + 2u * kp];
 			float x1 = x[xrow + 2u * kp + 1u];
 			for (int r = 0; r < ROWS; r++) {
+#ifdef BF16
+				uint wd = w[wb[r] + kp];
+				acc[r] += uintBitsToFloat(wd << 16u) * x0 + uintBitsToFloat(wd & 0xFFFF0000u) * x1;
+#else
 				vec2 hv = unpackHalf2x16(w[wb[r] + kp]);
 				acc[r] += hv.x * x0 + hv.y * x1;
+#endif
 			}
 		}
 	} else {
@@ -72,7 +79,11 @@ void main(void) {
 				uint e	= rows[r] * uint(u_k) + uint(ki);
 				uint wd = w[e >> 1u];
 				uint h	= (e & 1u) == 0u ? (wd & 0xFFFFu) : (wd >> 16u);
+#ifdef BF16
+				acc[r] += uintBitsToFloat(h << 16u) * xv;
+#else
 				acc[r] += h2f(h) * xv;
+#endif
 			}
 		}
 	}
