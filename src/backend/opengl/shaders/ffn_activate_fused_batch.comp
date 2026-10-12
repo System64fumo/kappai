@@ -11,12 +11,12 @@ layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_m;
 layout(location = 2) uniform int u_act;
 void main(void) {
-	int total = u_n * u_m;
-	int g	  = int(gl_GlobalInvocationID.x);
-	if (g >= total)
+	uint wgx = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint g	 = wgx * 128u + gl_LocalInvocationID.x;
+	if (g >= uint(u_n) * uint(u_m))
 		return;
-	int	  row = g / u_n;
-	int	  col = g - row * u_n;
+	int	  row = int(g) / u_n;
+	int	  col = int(g) - row * u_n;
 	int	  gi  = row * 2 * u_n + col;
 	float gv  = fused[gi];
 	float u	  = fused[gi + u_n];

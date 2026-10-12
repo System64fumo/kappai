@@ -23,8 +23,15 @@ layout(std430, binding = 3) readonly buffer ResBuf {
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
+layout(location = 9) uniform int u_m;
+layout(location = 10) uniform int u_x_stride;
+layout(location = 11) uniform int u_wg_base;
 
-shared float s_acc[WG];
+uint g_mi;
+
+#define ROWS 4
+
+shared float s_acc[ROWS][WG];
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -42,22 +49,29 @@ int dot4_s8(uint qw, uint xw) {
 }
 
 void main(void) {
-	uint row   = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
-	uint tid   = gl_LocalInvocationID.x;
-	bool valid = int(row) < u_n;
+	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	  = uint(max(u_m, 1));
+	g_mi	  = wgid % mb;
+	wgid	  = wgid / mb;
+	uint row0 = wgid * uint(ROWS);
+	uint tid  = gl_LocalInvocationID.x;
+	uint last = uint(max(u_n - 1, 0));
 
-	float acc = 0.0;
-	if (valid) {
-		uint row_off = row * uint(u_k_blocks) * 34u;
-		for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
-			uint  bo   = row_off + uint(bi) * 34u;
+	uint  row_off[ROWS];
+	float acc[ROWS];
+	for (int r = 0; r < ROWS; r++) {
+		row_off[r] = min(row0 + uint(r), last) * uint(u_k_blocks) * 34u;
+		acc[r]	   = 0.0;
+	}
+	for (int bi = int(tid); bi < u_k_blocks; bi += WG) {
+		uint  xi  = g_mi * uint(u_x_stride) + uint(bi) * 11u;
+		uvec4 xlo = xq4[xi];
+		uvec4 xhi = xq4[xi + 1u];
+		float dxq = uintBitsToFloat(xq4[xi + 2u].x);
+		for (int r = 0; r < ROWS; r++) {
+			uint  bo   = row_off[r] + uint(bi) * 34u;
 			uint  wi   = bo >> 2u;
 			uint  odd  = (bo >> 1u) & 1u;
-			uint  xi   = uint(bi) * 3u;
-			uvec4 xlo  = xq4[xi];
-			uvec4 xhi  = xq4[xi + 1u];
-			uvec4 xs   = xq4[xi + 2u];
-			float dxq  = uintBitsToFloat(xs.x);
 			uint  w0   = w[wi];
 			uint  w1   = w[wi + 1u];
 			uint  w2   = w[wi + 2u];
@@ -72,22 +86,28 @@ void main(void) {
 						 dot4_s8(sh2(w2, w3, odd), xlo.z) + dot4_s8(sh2(w3, w4, odd), xlo.w) +
 						 dot4_s8(sh2(w4, w5, odd), xhi.x) + dot4_s8(sh2(w5, w6, odd), xhi.y) +
 						 dot4_s8(sh2(w6, w7, odd), xhi.z) + dot4_s8(sh2(w7, w8, odd), xhi.w);
-			acc += wd * dxq * float(sumi);
+			acc[r] += wd * dxq * float(sumi);
 		}
 	}
-	s_acc[tid] = acc;
+	for (int r = 0; r < ROWS; r++)
+		s_acc[r][tid] = acc[r];
 	barrier();
 	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
 		if (tid < s)
-			s_acc[tid] += s_acc[tid + s];
+			for (int r = 0; r < ROWS; r++)
+				s_acc[r][tid] += s_acc[r][tid + s];
 		barrier();
 	}
-	if (valid && tid == 0u) {
-		if (u_add_residual == 1)
-			y[row] = s_acc[0] + res[row];
-		else if (u_add_residual == 2)
-			y[row] += s_acc[0];
-		else
-			y[row] = s_acc[0];
+	if (tid < uint(ROWS)) {
+		uint row = row0 + tid;
+		if (int(row) < u_n) {
+			float v = s_acc[tid][0];
+			if (u_add_residual == 1)
+				y[g_mi * uint(u_n) + row] = v + res[row];
+			else if (u_add_residual == 2)
+				y[g_mi * uint(u_n) + row] += v;
+			else
+				y[g_mi * uint(u_n) + row] = v;
+		}
 	}
 }

@@ -960,6 +960,7 @@ static void run_generation(req_ctx *rc, bool chat_api) {
 		g->generation_done = true;
 		pthread_mutex_unlock(&g->q_mtx);
 	}
+	backend_release_thread(c->backend);
 	pthread_mutex_unlock(&st->gen_mtx);
 
 	if (g->streaming)

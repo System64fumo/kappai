@@ -1,6 +1,14 @@
 #version 310 es
 precision highp float;
-layout(local_size_x = 64) in;
+precision highp int;
+#ifndef ATTN_WG
+#define ATTN_WG 64
+#endif
+#define LANES 16
+#define PASS_TOKENS (ATTN_WG / LANES)
+#define MAX_HEAD_DIM 512
+#define MAX_PAIR_SLOTS (MAX_HEAD_DIM / 2 / ATTN_WG)
+layout(local_size_x = ATTN_WG) in;
 layout(std430, binding = 0) readonly buffer QBuf {
 	float q[];
 };
@@ -24,148 +32,164 @@ layout(location = 7) uniform int u_stride_head_dim;
 layout(location = 8) uniform int u_attn_start;
 layout(location = 9) uniform int u_kv_q8;
 layout(location = 10) uniform int u_kvh_stride;
-#define MAX_HEAD_DIM 512
-#ifndef TILE_T
-#define TILE_T 14
-#endif
-shared float q_shared[MAX_HEAD_DIM];
-shared float kv_tile[TILE_T * MAX_HEAD_DIM];
-shared float s_tile[TILE_T];
-shared float e_tile[TILE_T];
-float		 half_to_float(uint h) {
-	return unpackHalf2x16(h & 0xFFFFu).x;
-}
-uint rb8(uint byte_off, uint which) {
-	uint wd = which == 0u ? kcache[byte_off >> 2u] : vcache[byte_off >> 2u];
-	return (wd >> ((byte_off & 3u) * 8u)) & 0xFFu;
-}
-void main(void) {
-	uint h			= gl_WorkGroupID.x;
-	uint tid		= gl_LocalInvocationID.x;
-	int	 n_groups	= u_n_heads / u_n_kv_heads;
-	int	 kvh		= int(h) / n_groups;
-	int	 head_dim	= u_head_dim;
-	int	 pos		= u_pos;
-	int	 attn_start = u_attn_start;
-	uint q_base		= h * uint(head_dim);
+shared vec2	 q2[MAX_HEAD_DIM / 2];
+shared float partial[ATTN_WG * LANES];
+shared float e_tile[ATTN_WG];
+shared float s_tile[ATTN_WG];
+shared float m_part[ATTN_WG / 4];
+shared vec2	 red[ATTN_WG];
+shared float l_red[ATTN_WG];
 
-	for (int d = int(tid); d < head_dim; d += 64)
-		q_shared[d] = q[q_base + uint(d)];
-	for (int d = int(tid); d < head_dim; d += 64)
-		out_[h * uint(head_dim) + uint(d)] = 0.0;
+uint ld16k(uint byte_off) {
+	return (kcache[byte_off >> 2u] >> ((byte_off & 2u) * 8u)) & 0xFFFFu;
+}
+
+uint ld16v(uint byte_off) {
+	return (vcache[byte_off >> 2u] >> ((byte_off & 2u) * 8u)) & 0xFFFFu;
+}
+
+float k_partial(uint row, int lane, int pairs) {
+	float a = 0.0;
+	if (u_kv_q8 == 0) {
+		uint wb = row >> 1u;
+		for (int p = lane; p < pairs; p += LANES)
+			a += dot(unpackHalf2x16(kcache[wb + uint(p)]), q2[p]);
+		return a;
+	}
+	for (int p = lane; p < pairs; p += LANES) {
+		uint  boff = row + uint(p >> 4) * 34u;
+		float d	   = unpackHalf2x16(ld16k(boff)).x;
+		int	  hv   = int(ld16k(boff + 2u + uint((p & 15) * 2)));
+		vec2  qq   = q2[p];
+		a +=
+			d * (qq.x * float(bitfieldExtract(hv, 0, 8)) + qq.y * float(bitfieldExtract(hv, 8, 8)));
+	}
+	return a;
+}
+
+vec2 v_pair(uint row, int p) {
+	if (u_kv_q8 == 0)
+		return unpackHalf2x16(vcache[(row >> 1u) + uint(p)]);
+	uint  boff = row + uint(p >> 4) * 34u;
+	float d	   = unpackHalf2x16(ld16v(boff)).x;
+	int	  hv   = int(ld16v(boff + 2u + uint((p & 15) * 2)));
+	return d * vec2(float(bitfieldExtract(hv, 0, 8)), float(bitfieldExtract(hv, 8, 8)));
+}
+
+void main(void) {
+	uint h		  = gl_WorkGroupID.x;
+	uint tid	  = gl_LocalInvocationID.x;
+	int	 n_groups = u_n_heads / u_n_kv_heads;
+	int	 kvh	  = int(h) / n_groups;
+	int	 head_dim = u_head_dim;
+	int	 pairs	  = head_dim >> 1;
+	int	 pos	  = u_pos;
+	uint q_base	  = h * uint(head_dim);
+
+	for (int p = int(tid); p < pairs; p += ATTN_WG)
+		q2[p] = vec2(q[q_base + uint(p * 2)], q[q_base + uint(p * 2) + 1u]);
 	barrier();
 
 	uint kvh_stride =
 		u_kvh_stride > 0 ? uint(u_kvh_stride) : uint(u_n_ctx) * uint(u_stride_head_dim);
-	uint kv_base = uint(u_layer_off) + uint(kvh) * kvh_stride;
+	uint kv_base	= uint(u_layer_off) + uint(kvh) * kvh_stride;
+	uint row_stride = uint(u_stride_head_dim);
 
-	float m_run = uintBitsToFloat(0xFF800000u);
-	float l_run = 0.0;
+	int	 split_groups = pairs > ATTN_WG / 2 ? 1 : ATTN_WG / pairs;
+	int	 slot_group	  = split_groups == 1 ? 0 : int(tid) / pairs;
+	int	 slot_pair	  = split_groups == 1 ? int(tid) : int(tid) % pairs;
+	bool v_active	  = split_groups == 1 || int(tid) < split_groups * pairs;
+	int	 lane		  = int(tid) % LANES;
+	int	 tok_in_pass  = int(tid) / LANES;
 
-	for (int tile_t0 = attn_start; tile_t0 <= pos; tile_t0 += TILE_T) {
-		int tile_t1	 = min(tile_t0 + TILE_T, pos + 1);
-		int tile_len = tile_t1 - tile_t0;
+	vec2 o_acc[MAX_PAIR_SLOTS];
+	for (int j = 0; j < MAX_PAIR_SLOTS; j++)
+		o_acc[j] = vec2(0.0);
 
-		if (u_kv_q8 == 0) {
-			int total_words = tile_len * (head_dim / 2);
-			for (int idx = int(tid); idx < total_words; idx += 64) {
-				int	 t	= idx / (head_dim / 2);
-				int	 dw = idx % (head_dim / 2);
-				uint elem_idx =
-					kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim) + uint(dw * 2);
-				uint word						   = kcache[elem_idx >> 1u];
-				kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
-				kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
-			}
-		} else {
-			int total_elems = tile_len * head_dim;
-			for (int idx = int(tid); idx < total_elems; idx += 64) {
-				int	 t					  = idx / head_dim;
-				int	 e					  = idx - t * head_dim;
-				uint row_byte			  = kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim);
-				uint boff				  = row_byte + (uint(e) >> 5u) * 34u;
-				uint d16				  = rb8(boff, 0u) | (rb8(boff + 1u, 0u) << 8u);
-				int	 code				  = int(rb8(boff + 2u + (uint(e) & 31u), 0u) ^ 128u) - 128;
-				kv_tile[t * head_dim + e] = half_to_float(d16) * float(code);
-			}
+	float neg_inf = uintBitsToFloat(0xFF800000u);
+	float m_run	  = neg_inf;
+	float l_part  = 0.0;
+
+	for (int t0 = u_attn_start; t0 <= pos; t0 += ATTN_WG) {
+		int len = min(ATTN_WG, pos + 1 - t0);
+		for (int base = 0; base < len; base += PASS_TOKENS) {
+			int	  tl = base + tok_in_pass;
+			float a	 = 0.0;
+			if (t0 + tl <= pos)
+				a = k_partial(kv_base + uint(t0 + tl) * row_stride, lane, pairs);
+			partial[tl * LANES + lane] = a;
 		}
 		barrier();
 
-		if (int(tid) < tile_len) {
-			int	  t	 = int(tid);
-			float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
-			int	  d		  = 0;
-			int	  hd_main = head_dim - (head_dim % 8);
-			for (; d < hd_main; d += 8) {
-				a0 += q_shared[d] * kv_tile[t * head_dim + d] +
-					  q_shared[d + 4] * kv_tile[t * head_dim + d + 4];
-				a1 += q_shared[d + 1] * kv_tile[t * head_dim + d + 1] +
-					  q_shared[d + 5] * kv_tile[t * head_dim + d + 5];
-				a2 += q_shared[d + 2] * kv_tile[t * head_dim + d + 2] +
-					  q_shared[d + 6] * kv_tile[t * head_dim + d + 6];
-				a3 += q_shared[d + 3] * kv_tile[t * head_dim + d + 3] +
-					  q_shared[d + 7] * kv_tile[t * head_dim + d + 7];
-			}
-			for (; d < head_dim; d++)
-				a0 += q_shared[d] * kv_tile[t * head_dim + d];
-			float dot = (a0 + a1) + (a2 + a3);
-			s_tile[t] = dot * u_scale;
+		int	  tok	= t0 + int(tid);
+		float score = neg_inf;
+		if (tok <= pos) {
+			float s = 0.0;
+			for (int l = 0; l < LANES; l++)
+				s += partial[int(tid) * LANES + l];
+			score = s * u_scale;
 		}
+		s_tile[tid] = score;
 		barrier();
 
-		float m_tile = uintBitsToFloat(0xFF800000u);
-		for (int t = 0; t < tile_len; t++)
-			m_tile = max(m_tile, s_tile[t]);
+		if (tid < uint(ATTN_WG / 4)) {
+			uint b		= tid * 4u;
+			m_part[tid] = max(max(s_tile[b], s_tile[b + 1u]), max(s_tile[b + 2u], s_tile[b + 3u]));
+		}
+		barrier();
+		float m_tile = neg_inf;
+		for (int t = 0; t < ATTN_WG / 4; t++)
+			m_tile = max(m_tile, m_part[t]);
 		float m_new = max(m_run, m_tile);
-
-		if (int(tid) < tile_len)
-			e_tile[int(tid)] = exp(s_tile[int(tid)] - m_new);
+		e_tile[tid] = tok <= pos ? exp(score - m_new) : 0.0;
+		float alpha = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		m_run		= m_new;
 		barrier();
 
-		float alpha	 = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
-		float l_tile = 0.0;
-		for (int t = 0; t < tile_len; t++)
-			l_tile += e_tile[t];
-		l_run = l_run * alpha + l_tile;
-		for (int d = int(tid); d < head_dim; d += 64)
-			out_[h * uint(head_dim) + uint(d)] *= alpha;
-
-		if (u_kv_q8 == 0) {
-			int total_words = tile_len * (head_dim / 2);
-			for (int idx = int(tid); idx < total_words; idx += 64) {
-				int	 t	= idx / (head_dim / 2);
-				int	 dw = idx % (head_dim / 2);
-				uint elem_idx =
-					kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim) + uint(dw * 2);
-				uint word						   = vcache[elem_idx >> 1u];
-				kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
-				kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
-			}
-		} else {
-			int total_elems = tile_len * head_dim;
-			for (int idx = int(tid); idx < total_elems; idx += 64) {
-				int	 t					  = idx / head_dim;
-				int	 e					  = idx - t * head_dim;
-				uint row_byte			  = kv_base + uint(tile_t0 + t) * uint(u_stride_head_dim);
-				uint boff				  = row_byte + (uint(e) >> 5u) * 34u;
-				uint d16				  = rb8(boff, 1u) | (rb8(boff + 1u, 1u) << 8u);
-				int	 code				  = int(rb8(boff + 2u + (uint(e) & 31u), 1u) ^ 128u) - 128;
-				kv_tile[t * head_dim + e] = half_to_float(d16) * float(code);
+		l_part *= alpha;
+		if (v_active) {
+			for (int j = 0; j < MAX_PAIR_SLOTS; j++)
+				o_acc[j] *= alpha;
+			for (int t = slot_group; t < len; t += split_groups) {
+				float e	  = e_tile[t];
+				uint  row = kv_base + uint(t0 + t) * row_stride;
+				for (int j = 0; j < MAX_PAIR_SLOTS; j++) {
+					int p = slot_pair + j * ATTN_WG;
+					if (p >= pairs)
+						break;
+					o_acc[j] += e * v_pair(row, p);
+				}
+				l_part += e;
 			}
 		}
-		barrier();
-
-		for (int d = int(tid); d < head_dim; d += 64) {
-			float acc = 0.0;
-			for (int t = 0; t < tile_len; t++)
-				acc += e_tile[t] * kv_tile[t * head_dim + d];
-			out_[h * uint(head_dim) + uint(d)] += acc;
-		}
-		m_run = m_new;
 		barrier();
 	}
 
-	float inv_l = l_run > 0.0 ? 1.0 / l_run : 0.0;
-	for (int d = int(tid); d < head_dim; d += 64)
-		out_[h * uint(head_dim) + uint(d)] *= inv_l;
+	if (split_groups > 1) {
+		red[tid]   = o_acc[0];
+		l_red[tid] = l_part;
+		barrier();
+		if (v_active && slot_group == 0) {
+			vec2  o = o_acc[0];
+			float l = l_part;
+			for (int g = 1; g < split_groups; g++) {
+				o += red[g * pairs + slot_pair];
+				l += l_red[g * pairs + slot_pair];
+			}
+			float inv_l	  = l > 0.0 ? 1.0 / l : 0.0;
+			uint  ob	  = h * uint(head_dim) + uint(slot_pair * 2);
+			out_[ob]	  = o.x * inv_l;
+			out_[ob + 1u] = o.y * inv_l;
+		}
+		return;
+	}
+	float inv_l = l_part > 0.0 ? 1.0 / l_part : 0.0;
+	for (int j = 0; j < MAX_PAIR_SLOTS; j++) {
+		int p = int(tid) + j * ATTN_WG;
+		if (p >= pairs)
+			break;
+		uint ob		  = h * uint(head_dim) + uint(p * 2);
+		out_[ob]	  = o_acc[j].x * inv_l;
+		out_[ob + 1u] = o_acc[j].y * inv_l;
+	}
 }
