@@ -6060,6 +6060,34 @@ extern "C" void cuda_ffn_activate_batch(const float *gate_dev, const float *up_d
     ffn_activate_batch_kernel<<<grid, block, 0, stream>>>(gate_dev, up_dev, out_dev, n, activation, m);
 }
 
+/* Fused batched FFN activation over a pre-interleaved buffer: the engine
+ * stages gate and up side by side with stride 2n per row, so this reads
+ * fused[r*2n + j] and fused[r*2n + n + j] and writes out[r*n + j].
+ * Matches ffn_activate_ex_rows() in src/recipe.c and the OpenGL shader. */
+__global__ void ffn_activate_fused_batch_kernel(const float *fused, float *out, int n,
+                                                 int activation, int m) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * m)
+        return;
+    const int row = idx / n;
+    const int col = idx - row * n;
+    const float *g = fused + (size_t)row * 2 * n + col;
+    const float *u = g + n;
+    const float  gv = *g;
+    const float  uv = *u;
+    out[idx] = (activation == 1) ? gelu_tanh_f32(gv) * uv : silu_f32(gv) * uv;
+}
+
+extern "C" void cuda_ffn_activate_fused_batch(const float *fused_dev, float *out_dev, int n,
+                                               int activation, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0)
+        return;
+    const int total = n * m;
+    const int block = 256;
+    ffn_activate_fused_batch_kernel<<<(total + block - 1) / block, block, 0, stream>>>(
+        fused_dev, out_dev, n, activation, m);
+}
+
 __global__ void add_batch_kernel(float *x, const float *y, int n, int m) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= m * n) return;

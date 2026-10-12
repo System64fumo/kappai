@@ -2625,6 +2625,21 @@ static status_code cuda_op_ffn_activate_ex(backend *self, const buffer *gate, co
     return OK;
 }
 
+static status_code cuda_op_ffn_activate_fused_batch(backend *self, const buffer *fused,
+                                                    buffer *out, int n, int activation, int m) {
+    struct cuda_priv *priv = cuda_priv(self);
+    if (!priv) return ERR_INTERNAL;
+    cuda_ffn_activate_fused_batch((const float *)cuda_dev_ptr((buffer *)fused),
+                                  (float *)cuda_dev_ptr(out), n, activation, m, priv->stream);
+    if (out->host_ptr) {
+        if (cudaMemcpyAsync((void *)out->host_ptr, cuda_dev_ptr(out),
+                            (size_t)m * (size_t)n * sizeof(float), cudaMemcpyDeviceToHost,
+                            priv->stream) != cudaSuccess)
+            return ERR_INTERNAL;
+    }
+    return OK;
+}
+
 static status_code cuda_op_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
                                                 buffer *out, int n, int activation, int m) {
     struct cuda_priv *priv = cuda_priv(self);
@@ -3484,6 +3499,7 @@ static status_code cuda_ctor(backend *out) {
     out->matmul_multi_batch = cuda_matmul_multi_batch;
     out->add_batch          = cuda_op_add_batch;
     out->ffn_activate_batch = cuda_op_ffn_activate_batch;
+    out->ffn_activate_fused_batch = cuda_op_ffn_activate_fused_batch;
     out->rope_batch         = cuda_op_rope_batch;
     out->rope_qk_batch      = cuda_op_rope_qk_batch;
     out->attention_batch    = cuda_attention_batch;

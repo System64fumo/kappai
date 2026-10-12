@@ -441,6 +441,8 @@ void cuda_kv_put_batch_q8(const float *k_in, const float *v_in,
 void cuda_rmsnorm_batch(const float *x_dev, const float *w_dev, float *y_dev,
                         int n, float eps, int m, cudaStream_t stream);
 void cuda_add_batch(float *x_dev, const float *y_dev, int n, int m, cudaStream_t stream);
+void cuda_ffn_activate_fused_batch(const float *fused_dev, float *out_dev, int n,
+                                   int activation, int m, cudaStream_t stream);
 void cuda_ffn_activate_batch(const float *gate_dev, const float *up_dev, float *out_dev,
                              int n, int activation, int m, cudaStream_t stream);
 void cuda_rope_batch(float *vec_dev, int n_heads, int head_dim, int pos_start,
