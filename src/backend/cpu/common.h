@@ -102,6 +102,10 @@ typedef struct {
 void feat_add(char *buf, size_t cap, const char *name);
 void detect_features(char *buf, size_t cap);
 
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
+							   const float *freq_factors, float **cs_out);
+
 static inline status_code cpu_buf_grow(void **p, size_t *cap_bytes, size_t need_bytes,
 									   size_t align) {
 	if (*cap_bytes >= need_bytes)
@@ -389,6 +393,15 @@ typedef struct {
 	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim;
 	int			 pos0;
 } cpu_partial_rope_qk_job;
+
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
 
 static inline void cpu_run_batch_full(tpool *pool, int m, int grain, int min_m,
 									  tpool_chunk_fn chunk, void *job) {
