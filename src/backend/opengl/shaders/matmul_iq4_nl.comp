@@ -55,7 +55,14 @@ uint g_mi;
 #endif
 
 #ifndef R8
-shared float s_acc[ROWS][WG];
+shared float s_acc[ROWS][WG + 1];
+
+float reduce_row(uint i) {
+	float v = 0.0;
+	for (int j = 0; j < WG; j++)
+		v += s_acc[i][j];
+	return v;
+}
 
 #endif
 float h2f(uint h) {
@@ -116,9 +123,7 @@ void main(void) {
 		float wd   = h2f((lane & 1u) != 0u ? sw >> 16u : sw);
 		uvec4 qv   = w[base + 1u + lane];
 		for (int c = 0; c < MT; c++) {
-			if (uint(c) >= ncols)
-				break;
-			uint xi	  = (col0 + uint(c)) * uint(u_x_stride) + uint(bi) * 11u;
+			uint xi	  = min(col0 + uint(c), mb - 1u) * uint(u_x_stride) + uint(bi) * 11u;
 			int	 sumi = dot_word(qv.x, xq4[xi + 7u]) + dot_word(qv.y, xq4[xi + 8u]) +
 						dot_word(qv.z, xq4[xi + 9u]) + dot_word(qv.w, xq4[xi + 10u]);
 			acc[c] += wd * uintBitsToFloat(xq4[xi + 2u].x) * float(sumi);
@@ -170,16 +175,10 @@ void main(void) {
 	for (int r = 0; r < ROWS; r++)
 		s_acc[r][tid] = acc[r];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int r = 0; r < ROWS; r++)
-				s_acc[r][tid] += s_acc[r][tid + s];
-		barrier();
-	}
 	if (tid < uint(ROWS)) {
 		uint row = row0 + tid;
 		if (int(row) < u_n) {
-			float v = s_acc[tid][0];
+			float v = reduce_row(tid);
 			if (u_add_residual == 1)
 				y[g_mi * uint(u_n) + row] = v + res[row];
 			else if (u_add_residual == 2)

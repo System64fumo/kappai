@@ -8,10 +8,10 @@ precision highp int;
 layout(local_size_x = WG) in;
 
 layout(std430, binding = 0) readonly buffer WBuf {
-	uint w[];
+	uvec4 w[];
 };
 layout(std430, binding = 1) readonly buffer XQBuf {
-	uint xq[];
+	uvec4 xq4[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -43,7 +43,18 @@ uint g_mi;
 #define R8O 40u
 #endif
 
-shared float s_acc[ROWS][WG];
+shared float s_acc[ROWS][WG + 1];
+
+float reduce_row(uint i) {
+	float v = 0.0;
+	for (int j = 0; j < WG; j++)
+		v += s_acc[i][j];
+	return v;
+}
+
+uint wu(uint i) {
+	return w[i >> 2u][i & 3u];
+}
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -83,11 +94,11 @@ void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc
 				out uint sc1, out uint mn1) {
 	uint gw	 = (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B;
 	uint rin = rowg & 7u;
-	uint dw	 = w[gw + (rin >> 1u)];
-	uint mw	 = w[gw + 4u + (rin >> 1u)];
+	uint dw	 = wu(gw + (rin >> 1u));
+	uint mw	 = wu(gw + 4u + (rin >> 1u));
 	d		 = h2f((rin & 1u) != 0u ? dw >> 16u : dw);
 	dm		 = h2f((rin & 1u) != 0u ? mw >> 16u : mw);
-	uint sw	 = w[gw + 8u + rin * 4u + uint(g)];
+	uint sw	 = wu(gw + 8u + rin * 4u + uint(g));
 	sc0		 = sw & 0xFFu;
 	mn0		 = (sw >> 8u) & 0xFFu;
 	sc1		 = (sw >> 16u) & 0xFFu;
@@ -107,8 +118,8 @@ uint qh_base(uint rowg, int bi) {
 void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
 				out uint sc1, out uint mn1) {
 	uint  bw = (rowg * uint(u_k_blocks) + uint(bi)) * QB;
-	uint  hw = w[bw];
-	uvec3 sw = uvec3(w[bw + 1u], w[bw + 2u], w[bw + 3u]);
+	uint  hw = wu(bw);
+	uvec3 sw = uvec3(w[(bw >> 2u)].yzw);
 	d		 = h2f(hw);
 	dm		 = h2f(hw >> 16u);
 	scale_min(sw, 2 * g, sc0, mn0);
@@ -136,28 +147,34 @@ void main(void) {
 		int g  = c & 3;
 		if (c >= nch)
 			continue;
-		uint  xbq = g_mi * uint(u_x_stride) + uint(bi) * 209u;
-		float xd  = uintBitsToFloat(xq[xbq + 64u]);
+		uint  xbq = (g_mi * uint(u_x_stride) + uint(bi) * 212u) >> 2u;
+		float xd  = uintBitsToFloat(xq4[xbq + 20u].x);
 		if (xd == 0.0)
 			continue;
-		uint xp	   = xbq + 81u + uint(g) * 32u;
-		uint sb	   = xbq + 65u + uint(g) * 4u;
-		int	 sx_lo = int(xq[sb]) + int(xq[sb + 1u]);
-		int	 sx_hi = int(xq[sb + 2u]) + int(xq[sb + 3u]);
+		uint  xp	= xbq + 21u + uint(g) * 8u;
+		uvec4 sx	= xq4[xbq + 16u + uint(g)];
+		int	  sx_lo = int(sx.x) + int(sx.y);
+		int	  sx_hi = int(sx.z) + int(sx.w);
+		uvec4 xv[8];
+		for (int j = 0; j < 8; j++)
+			xv[j] = xq4[xp + uint(j)];
 
 #ifdef Q5K
-		uint sh_lo_l = uint(max(4 - 2 * g, 0));
-		uint sh_lo_r = uint(max(2 * g - 4, 0));
-		uint sh_hi_l = uint(max(3 - 2 * g, 0));
-		uint sh_hi_r = uint(max(2 * g - 3, 0));
-		uint sh_b_lo = uint(2 * g + 4);
-		uint sh_b_hi = uint(2 * g + 5);
-		uint qbase[ROWS];
-		uint hbase[ROWS];
-		int	 dot0[ROWS];
-		int	 dot1[ROWS];
+		uint  sh_lo_l = uint(max(4 - 2 * g, 0));
+		uint  sh_lo_r = uint(max(2 * g - 4, 0));
+		uint  sh_hi_l = uint(max(3 - 2 * g, 0));
+		uint  sh_hi_r = uint(max(2 * g - 3, 0));
+		uint  sh_b_lo = uint(2 * g + 4);
+		uint  sh_b_hi = uint(2 * g + 5);
+		uint  qbase[ROWS];
+		uint  hbase[ROWS];
+		int	  dot0[ROWS];
+		int	  dot1[ROWS];
+		uvec4 wq[ROWS][2];
 		for (int r = 0; r < ROWS; r++) {
 			qbase[r] = qs_base(min(row0 + uint(r), last), bi, g);
+			wq[r][0] = w[qbase[r] >> 2u];
+			wq[r][1] = w[(qbase[r] >> 2u) + 1u];
 			hbase[r] = qh_base(min(row0 + uint(r), last), bi);
 			dot0[r]	 = 0;
 			dot1[r]	 = 0;
@@ -170,13 +187,13 @@ void main(void) {
 				ha[r] = 0u;
 			}
 			for (int i = half_i * 2; i < half_i * 2 + 2; i++) {
-				uint xa0 = xq[xp + uint(2 * i)];
-				uint xa1 = xq[xp + uint(2 * i) + 1u];
-				uint xb0 = xq[xp + 16u + uint(2 * i)];
-				uint xb1 = xq[xp + 16u + uint(2 * i) + 1u];
+				uint xa0 = xv[i >> 1][(i & 1) * 2];
+				uint xa1 = xv[i >> 1][(i & 1) * 2 + 1];
+				uint xb0 = xv[4 + (i >> 1)][(i & 1) * 2];
+				uint xb1 = xv[4 + (i >> 1)][(i & 1) * 2 + 1];
 				for (int r = 0; r < ROWS; r++) {
-					uint qw = w[qbase[r] + uint(i)];
-					uint hq = w[hbase[r] + uint(i)];
+					uint qw = wq[r][i >> 2][i & 3];
+					uint hq = wu(hbase[r] + uint(i));
 					uint h0 = (g < 2 ? (hq << sh_lo_l) : (hq >> sh_lo_r)) & HBIT;
 					uint h1 = (hq >> (sh_b_lo)) & HBIT;
 					uint h2 = (g < 2 ? (hq << sh_hi_l) : (hq >> sh_hi_r)) & HBIT;
@@ -191,11 +208,14 @@ void main(void) {
 			}
 		}
 #else
-		uint qbase[ROWS];
-		int	 dot0[ROWS];
-		int	 dot1[ROWS];
+		uint  qbase[ROWS];
+		int	  dot0[ROWS];
+		int	  dot1[ROWS];
+		uvec4 wq[ROWS][2];
 		for (int r = 0; r < ROWS; r++) {
 			qbase[r] = qs_base(min(row0 + uint(r), last), bi, g);
+			wq[r][0] = w[qbase[r] >> 2u];
+			wq[r][1] = w[(qbase[r] >> 2u) + 1u];
 			dot0[r]	 = 0;
 			dot1[r]	 = 0;
 		}
@@ -207,12 +227,12 @@ void main(void) {
 				ha[r] = 0u;
 			}
 			for (int i = half_i * 4; i < half_i * 4 + 4; i++) {
-				uint xa0 = xq[xp + uint(2 * i)];
-				uint xa1 = xq[xp + uint(2 * i) + 1u];
-				uint xb0 = xq[xp + 16u + uint(2 * i)];
-				uint xb1 = xq[xp + 16u + uint(2 * i) + 1u];
+				uint xa0 = xv[i >> 1][(i & 1) * 2];
+				uint xa1 = xv[i >> 1][(i & 1) * 2 + 1];
+				uint xb0 = xv[4 + (i >> 1)][(i & 1) * 2];
+				uint xb1 = xv[4 + (i >> 1)][(i & 1) * 2 + 1];
 				for (int r = 0; r < ROWS; r++) {
-					uint qw = w[qbase[r] + uint(i)];
+					uint qw = wq[r][i >> 2][i & 3];
 					la[r] += (qw & NIB) * xa0 + ((qw >> 8u) & NIB) * xa1;
 					ha[r] += ((qw >> 4u) & NIB) * xb0 + ((qw >> 12u) & NIB) * xb1;
 				}
@@ -235,16 +255,10 @@ void main(void) {
 	for (int r = 0; r < ROWS; r++)
 		s_acc[r][tid] = acc[r];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int r = 0; r < ROWS; r++)
-				s_acc[r][tid] += s_acc[r][tid + s];
-		barrier();
-	}
 	if (tid < uint(ROWS)) {
 		uint row = row0 + tid;
 		if (int(row) < u_n) {
-			float v = s_acc[tid][0];
+			float v = reduce_row(tid);
 			if (u_add_residual == 1)
 				y[g_mi * uint(u_n) + row] = v + res[row];
 			else if (u_add_residual == 2)

@@ -82,6 +82,9 @@ typedef enum {
 	GL_PIPE_MATMUL_Q4_0_R8_TILED,
 	GL_PIPE_MATMUL_Q8_0_R8_TILED,
 	GL_PIPE_MATMUL_IQ4_NL_R8_TILED,
+	GL_PIPE_MATMUL_F32_TILED,
+	GL_PIPE_MATMUL_F16_TILED,
+	GL_PIPE_MATMUL_BF16_TILED,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -103,6 +106,7 @@ enum {
 	GL_PIPE_F_USES_XQ	= 1u << 5,
 	GL_PIPE_F_USES_XQK	= 1u << 6,
 	GL_PIPE_F_IQ4NL_LUT = 1u << 7,
+	GL_PIPE_F_BF16		= 1u << 8,
 };
 
 typedef struct gl_buf {
@@ -978,10 +982,17 @@ static status_code gl_init(backend *self, int device_index) {
 								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q5_1, 4, 32},
 		[GL_PIPE_MATMUL_Q8_0]	= {"matmul_q8_0", gl_shader_matmul_q8_0_src,
 								   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0, 4, 32},
-		[GL_PIPE_MATMUL_Q4_K]  = {"matmul_q4_k", gl_shader_matmul_q4_k_src,
-								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q4_K, 4, 256},
-		[GL_PIPE_MATMUL_F16]   = {"matmul_f16", gl_shader_matmul_f16_src, 0, GGML_TYPE_F16, 4, 0},
-		[GL_PIPE_MATMUL_BF16]  = {"matmul_bf16", gl_shader_matmul_f16_src, 0, GGML_TYPE_BF16, 4, 0},
+		[GL_PIPE_MATMUL_Q4_K] = {"matmul_q4_k", gl_shader_matmul_q4_k_src,
+								 GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q4_K, 4, 256},
+		[GL_PIPE_MATMUL_F16]  = {"matmul_f16", gl_shader_matmul_f16_src, 0, GGML_TYPE_F16, 4, 0},
+		[GL_PIPE_MATMUL_BF16] = {"matmul_bf16", gl_shader_matmul_f16_src, GL_PIPE_F_BF16,
+								 GGML_TYPE_BF16, 4, 0},
+		[GL_PIPE_MATMUL_F32_TILED] = {"matmul_f32_tiled", gl_shader_matmul_f32_src, GL_PIPE_F_TILED,
+									  UINT32_MAX, 4, 0},
+		[GL_PIPE_MATMUL_F16_TILED] = {"matmul_f16_tiled", gl_shader_matmul_f16_src, GL_PIPE_F_TILED,
+									  UINT32_MAX, 4, 0},
+		[GL_PIPE_MATMUL_BF16_TILED] = {"matmul_bf16_tiled", gl_shader_matmul_f16_src,
+									   GL_PIPE_F_TILED | GL_PIPE_F_BF16, UINT32_MAX, 4, 0},
 		[GL_PIPE_MATMUL_Q5_K]  = {"matmul_q5_k", gl_shader_matmul_q4_k_src,
 								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q5_K, 4, 256},
 		[GL_PIPE_MATMUL_Q6_K]  = {"matmul_q6_k", gl_shader_matmul_q6_k_src,
@@ -1059,6 +1070,7 @@ static status_code gl_init(backend *self, int device_index) {
 		const char *define;
 	} variant_defs[] = {
 		{GL_PIPE_MATMUL_BF16, "BF16"},
+		{GL_PIPE_MATMUL_BF16_TILED, "BF16"},
 		{GL_PIPE_MATMUL_Q5_K, "Q5K"},
 		{GL_PIPE_MATMUL_Q5_K_R8, "Q5K"},
 	};
@@ -2367,7 +2379,7 @@ static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, cons
 	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation);
 }
 
-#define GL_XQK_WORDS_PER_BLOCK 209u
+#define GL_XQK_WORDS_PER_BLOCK 212u
 
 static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
 									int activation) {
@@ -2387,8 +2399,8 @@ static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		if (!(p->pipes[i].flags & GL_PIPE_F_TILED) || p->pipes[i].src != pipe->src)
 			continue;
-		if ((p->pipes[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) !=
-			(pipe->flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)))
+		const uint32_t variant_mask = GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE | GL_PIPE_F_BF16;
+		if ((p->pipes[i].flags & variant_mask) != (pipe->flags & variant_mask))
 			continue;
 		return &p->pipes[i];
 	}
