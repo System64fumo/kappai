@@ -155,6 +155,28 @@ typedef struct {
 	int16_t  bsums[16];
 } cuda_q8_k_block;
 
+/* Q5_0 block: 32 elements. d (F16), qh[4] (the 5th bit, one per element),
+ * qs[16] (low/high nibbles). Total 22 bytes. The 5-bit value is
+ * (nibble | ((qh>>j & 1) << 4)) with a -16 bias for Q5_0. */
+typedef struct {
+	uint16_t d;
+	uint8_t  qh[4];
+	uint8_t  qs[16];
+} cuda_q5_0_block;
+
+/* Q5_1 block: 32 elements. Same packing as Q5_0 plus m (F16 offset).
+ * Total 24 bytes. No -16 bias; the m field absorbs the offset instead. */
+typedef struct {
+	uint16_t d;
+	uint16_t m;
+	uint8_t  qh[4];
+	uint8_t  qs[16];
+} cuda_q5_1_block;
+
+
+
+
+
 /* Host-side helpers (resolved from the scalar backend's weak definitions so
  * that dequant scales match the CPU reference bit-for-bit). */
 #ifdef __cplusplus
@@ -258,6 +280,14 @@ void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
 void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
                                int n, int k, cudaStream_t stream);
+
+void cuda_matmul_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q5_0_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+
+void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
 
 /* Safe fallback for types that crash the CPU implementation (e.g., IQ4_NL). */
 status_code cuda_matmul_iq4_nl_safe(backend *self, const buffer *w, const buffer *x,
