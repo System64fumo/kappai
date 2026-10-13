@@ -3298,9 +3298,8 @@ void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	}
 }
 
-void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+static void q5_k_r8_q8_k_rows(const void *w, const q8_k_block *restrict xq, float *restrict y,
+							  int row_begin, int row_end, int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 	const __m256i  mask			  = _mm256_set1_epi8(0x0f);
@@ -3373,16 +3372,16 @@ void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	int n_full = n - (n % Q5_K_R8_ROWS);
 	if (n_full < n) {
 		for (int t = 0; t < m; t++)
-			matmul_q5_k_r8_q8_k_qonly_f32_rows_range(w, xq + (size_t)t * xq_row_stride_blocks,
-													 y + (size_t)t * y_row_stride, n_full, n, k);
+			q5_k_r8_q8_k_rows(w, xq + (size_t)t * xq_row_stride_blocks,
+							  y + (size_t)t * y_row_stride, n_full, n, k);
 		n = n_full;
 	}
 	if (n <= 0)
 		return;
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
-			matmul_q5_k_r8_q8_k_qonly_f32_rows_range(w, xq + (size_t)t * xq_row_stride_blocks,
-													 y + (size_t)t * y_row_stride, 0, n, k);
+			q5_k_r8_q8_k_rows(w, xq + (size_t)t * xq_row_stride_blocks,
+							  y + (size_t)t * y_row_stride, 0, n, k);
 		return;
 	}
 	const int	  blocks_per_row = k / 256;
@@ -3457,9 +3456,8 @@ void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	}
 }
 
-void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+static void q6_k_r8_q8_k_rows(const void *w, const q8_k_block *restrict xq, float *restrict y,
+							  int row_begin, int row_end, int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
@@ -3503,16 +3501,16 @@ void matmul_q6_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 	int n_full = n - (n % Q6_K_R8_ROWS);
 	if (n_full < n) {
 		for (int t = 0; t < m; t++)
-			matmul_q6_k_r8_q8_k_qonly_f32_rows_range(w, xq + (size_t)t * xq_row_stride_blocks,
-													 y + (size_t)t * y_row_stride, n_full, n, k);
+			q6_k_r8_q8_k_rows(w, xq + (size_t)t * xq_row_stride_blocks,
+							  y + (size_t)t * y_row_stride, n_full, n, k);
 		n = n_full;
 	}
 	if (n <= 0)
 		return;
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
-			matmul_q6_k_r8_q8_k_qonly_f32_rows_range(w, xq + (size_t)t * xq_row_stride_blocks,
-													 y + (size_t)t * y_row_stride, 0, n, k);
+			q6_k_r8_q8_k_rows(w, xq + (size_t)t * xq_row_stride_blocks,
+							  y + (size_t)t * y_row_stride, 0, n, k);
 		return;
 	}
 	const int blocks_per_row = k / 256;

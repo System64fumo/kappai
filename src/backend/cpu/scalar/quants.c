@@ -1433,9 +1433,9 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *r
 MATMUL_QONLY_DISPATCH(q4_k_r8_q8_k, q8_k_block, 256, Q4_K_R8_ROWS,
 					  ((size_t)k / 256) * Q4_K_R8_ROW_BYTES)
 
-__attribute__((weak)) void
-matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-										 float *restrict y, int row_begin, int row_end, int k) {
+void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end,
+											  int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
@@ -1534,9 +1534,9 @@ static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc,
 	return acc + d * (float)total;
 }
 
-__attribute__((weak)) void
-matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-										 float *restrict y, int row_begin, int row_end, int k) {
+void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int row_begin, int row_end,
+											  int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
