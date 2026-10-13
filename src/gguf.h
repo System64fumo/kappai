@@ -25,26 +25,29 @@ typedef enum {
 } gguf_type;
 
 typedef enum {
-	GGML_TYPE_F32			= 0,
-	GGML_TYPE_F16			= 1,
-	GGML_TYPE_Q4_0			= 2,
-	GGML_TYPE_Q4_1			= 3,
-	GGML_TYPE_Q4_2			= 4,
-	GGML_TYPE_Q4_3			= 5,
-	GGML_TYPE_Q5_0			= 6,
-	GGML_TYPE_Q5_1			= 7,
-	GGML_TYPE_Q8_0			= 8,
-	GGML_TYPE_Q8_1			= 9,
-	GGML_TYPE_Q2_K			= 10,
-	GGML_TYPE_Q3_K			= 11,
-	GGML_TYPE_Q4_K			= 12,
-	GGML_TYPE_Q5_K			= 13,
-	GGML_TYPE_Q6_K			= 14,
-	GGML_TYPE_Q8_K			= 15,
-	GGML_TYPE_IQ4_XS_LEGACY = 18,
-	GGML_TYPE_IQ4_NL		= 20,
-	GGML_TYPE_IQ3_S			= 21,
-	GGML_TYPE_BF16			= 30,
+	GGML_TYPE_F32	  = 0,
+	GGML_TYPE_F16	  = 1,
+	GGML_TYPE_Q4_0	  = 2,
+	GGML_TYPE_Q4_1	  = 3,
+	GGML_TYPE_Q4_2	  = 4,
+	GGML_TYPE_Q4_3	  = 5,
+	GGML_TYPE_Q5_0	  = 6,
+	GGML_TYPE_Q5_1	  = 7,
+	GGML_TYPE_Q8_0	  = 8,
+	GGML_TYPE_Q8_1	  = 9,
+	GGML_TYPE_Q2_K	  = 10,
+	GGML_TYPE_Q3_K	  = 11,
+	GGML_TYPE_Q4_K	  = 12,
+	GGML_TYPE_Q5_K	  = 13,
+	GGML_TYPE_Q6_K	  = 14,
+	GGML_TYPE_Q8_K	  = 15,
+	GGML_TYPE_IQ2_XXS = 16,
+	GGML_TYPE_IQ3_XXS = 18,
+	GGML_TYPE_IQ4_NL  = 20,
+	GGML_TYPE_IQ3_S	  = 21,
+	GGML_TYPE_IQ2_S	  = 22,
+	GGML_TYPE_IQ4_XS  = 23,
+	GGML_TYPE_BF16	  = 30,
 
 	/* 0x40+ = engine-internal repacked types */
 	GGML_TYPE_IQ3_S_RE	= 0x42,
@@ -110,6 +113,10 @@ const char *ggml_type_name(uint32_t t);
 size_t		ggml_row_size(uint32_t type, size_t n);
 
 extern const uint32_t ggml_iq3s_grid[512];
+extern const uint64_t ggml_iq2xxs_grid[256];
+extern const uint64_t ggml_iq2s_grid[1024];
+extern const uint32_t ggml_iq3xxs_grid[256];
+extern const uint8_t  ggml_ksigns_iq2xs[128];
 
 static inline uint32_t wtype_to_q8type(uint32_t w_type) {
 	switch (w_type) {

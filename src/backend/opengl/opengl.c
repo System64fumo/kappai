@@ -444,23 +444,6 @@ static void gl_pipeline_cache_uniforms(gl_pipeline *p) {
 	}
 }
 
-static int gl_pipeline_index(gl_pipeline *p, const char *name) {
-	for (int i = 0; i < p->n_name_ptrs; i++)
-		if (p->name_ptr[i] == name)
-			return p->name_ptr_index[i];
-	for (int i = 0; i < p->n_uni; i++) {
-		if (strcmp(p->uname[i], name) != 0)
-			continue;
-		if (p->n_name_ptrs < GL_PIPELINE_NAME_PTR_CAP) {
-			p->name_ptr[p->n_name_ptrs]		  = name;
-			p->name_ptr_index[p->n_name_ptrs] = i;
-			p->n_name_ptrs++;
-		}
-		return i;
-	}
-	return -1;
-}
-
 static void gl_pipeline_warn_missing(const gl_pipeline *p, const char *name) {
 	static const gl_pipeline *warned[32];
 	static char				  names[32][GL_UNIFORM_NAME_CAP];
@@ -476,12 +459,28 @@ static void gl_pipeline_warn_missing(const gl_pipeline *p, const char *name) {
 	}
 }
 
+static int gl_pipeline_index(gl_pipeline *p, const char *name) {
+	for (int i = 0; i < p->n_name_ptrs; i++)
+		if (p->name_ptr[i] == name)
+			return p->name_ptr_index[i];
+	int index = -1;
+	for (int i = 0; i < p->n_uni && index < 0; i++)
+		if (strcmp(p->uname[i], name) == 0)
+			index = i;
+	if (index < 0)
+		gl_pipeline_warn_missing(p, name);
+	if (p->n_name_ptrs < GL_PIPELINE_NAME_PTR_CAP) {
+		p->name_ptr[p->n_name_ptrs]		  = name;
+		p->name_ptr_index[p->n_name_ptrs] = index;
+		p->n_name_ptrs++;
+	}
+	return index;
+}
+
 static GLint gl_pipeline_stage_uniform(gl_pipeline *p, const char *name, uint32_t bits) {
 	int i = gl_pipeline_index(p, name);
-	if (i < 0) {
-		gl_pipeline_warn_missing(p, name);
+	if (i < 0)
 		return -1;
-	}
 	uint32_t bit = 1u << i;
 	if ((p->uvalid & bit) && p->uval[i] == bits)
 		return -1;
@@ -2397,12 +2396,14 @@ static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
 }
 
 static long gl_matmul_chunk_wg(gl_priv *p, const gl_pipeline *pipe, int k_blocks_eff) {
-	const char *override = getenv("KAPPAI_GL_CHUNK_WG");
-	if (override) {
-		long c = atol(override);
-		if (c >= 1 && c <= (long)GL_MAX_DISPATCH_PER_DIM)
-			return c;
+	static long override = -1;
+	if (override < 0) {
+		const char *env = getenv("KAPPAI_GL_CHUNK_WG");
+		long		c	= env ? atol(env) : 0;
+		override		= (c >= 1 && c <= (long)GL_MAX_DISPATCH_PER_DIM) ? c : 0;
 	}
+	if (override > 0)
+		return override;
 	int	 threads = (pipe->flags & GL_PIPE_F_MATMUL_WG) ? p->matmul_wg : 32;
 	long units	 = (long)threads * (long)(k_blocks_eff > 0 ? k_blocks_eff : 1);
 	long c		 = (long)3145728 / (units > 0 ? units : 1);

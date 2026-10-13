@@ -547,6 +547,109 @@ __attribute__((weak)) void dequant_iq3_s_row(const void *blocks, size_t n_blocks
 	}
 }
 
+__attribute__((weak)) void dequant_iq2_xxs_row(const void *blocks, size_t n_blocks, float *dst) {
+	const iq2_xxs_block *b = blocks;
+
+	uint32_t	   aux32[2];
+	const uint8_t *aux8 = (const uint8_t *)aux32;
+
+	for (size_t bi = 0; bi < n_blocks; bi++) {
+		const float d = f16_to_f32(b[bi].d);
+		float	   *y = dst + (bi * 256);
+
+		for (int ib32 = 0; ib32 < 8; ++ib32) {
+			memcpy(aux32, b[bi].qs + 4 * ib32, 8);
+			const float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
+			for (int l = 0; l < 4; ++l) {
+				const uint8_t *grid	 = (const uint8_t *)&ggml_iq2xxs_grid[aux8[l]];
+				const uint8_t  signs = ggml_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+				for (int j = 0; j < 8; ++j)
+					y[j] = db * (float)grid[j] * ((signs & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+				y += 8;
+			}
+		}
+	}
+}
+
+__attribute__((weak)) void dequant_iq3_xxs_row(const void *blocks, size_t n_blocks, float *dst) {
+	const iq3_xxs_block *b = blocks;
+
+	uint32_t aux32;
+
+	for (size_t bi = 0; bi < n_blocks; bi++) {
+		const float	   d				= f16_to_f32(b[bi].d);
+		const uint8_t *qs				= b[bi].qs;
+		const uint8_t *scales_and_signs = qs + 64;
+		float		  *y				= dst + (bi * 256);
+
+		for (int ib32 = 0; ib32 < 8; ++ib32) {
+			memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
+			const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+			for (int l = 0; l < 4; ++l) {
+				const uint8_t  signs = ggml_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+				const uint8_t *grid1 = (const uint8_t *)&ggml_iq3xxs_grid[qs[2 * l + 0]];
+				const uint8_t *grid2 = (const uint8_t *)&ggml_iq3xxs_grid[qs[2 * l + 1]];
+				for (int j = 0; j < 4; ++j) {
+					y[j + 0] = db * (float)grid1[j] * ((signs & kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+					y[j + 4] = db * (float)grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+				}
+				y += 8;
+			}
+			qs += 8;
+		}
+	}
+}
+
+__attribute__((weak)) void dequant_iq2_s_row(const void *blocks, size_t n_blocks, float *dst) {
+	const iq2_s_block *b = blocks;
+
+	for (size_t bi = 0; bi < n_blocks; bi++) {
+		const float	   d	 = f16_to_f32(b[bi].d);
+		const uint8_t *qs	 = b[bi].qs;
+		const uint8_t *qh	 = b[bi].qh;
+		const uint8_t *signs = qs + 32;
+		float		  *y	 = dst + (bi * 256);
+
+		float db[2];
+		for (int ib32 = 0; ib32 < 8; ++ib32) {
+			db[0] = d * (0.5f + (float)(b[bi].scales[ib32] & 0xf)) * 0.25f;
+			db[1] = d * (0.5f + (float)(b[bi].scales[ib32] >> 4)) * 0.25f;
+			for (int l = 0; l < 4; ++l) {
+				const float	   dl = db[l / 2];
+				const uint8_t *grid =
+					(const uint8_t *)&ggml_iq2s_grid[qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300)];
+				for (int j = 0; j < 8; ++j)
+					y[j] = dl * (float)grid[j] * ((signs[l] & kmask_iq2xs[j]) ? -1.0f : 1.0f);
+				y += 8;
+			}
+			qs += 4;
+			signs += 4;
+		}
+	}
+}
+
+__attribute__((weak)) void dequant_iq4_xs_row(const void *blocks, size_t n_blocks, float *dst) {
+	const iq4_xs_block *b = blocks;
+
+	for (size_t bi = 0; bi < n_blocks; bi++) {
+		const float	   d  = f16_to_f32(b[bi].d);
+		const uint8_t *qs = b[bi].qs;
+		float		  *y  = dst + (bi * 256);
+
+		for (int ib = 0; ib < 8; ++ib) {
+			const int	sl = (b[bi].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf;
+			const int	sh = (b[bi].scales_h >> 2 * ib) & 3;
+			const float dl = d * ((sl | (sh << 4)) - 32);
+			for (int j = 0; j < 16; ++j) {
+				y[j]	  = dl * kvalues_iq4nl[qs[j] & 0xf];
+				y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+			}
+			y += 32;
+			qs += 16;
+		}
+	}
+}
+
 static inline void iq3s_unpack_i8_generic(const iq3s_block *b, int8_t *a) {
 	const uint8_t *qs	 = b->qs;
 	const uint8_t *qh	 = b->qh;
@@ -1614,6 +1717,22 @@ void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out
 		return;
 	case GGML_TYPE_IQ3_S:
 		*fn_out		 = dequant_iq3_s_row;
+		*divisor_out = 256;
+		return;
+	case GGML_TYPE_IQ2_XXS:
+		*fn_out		 = dequant_iq2_xxs_row;
+		*divisor_out = 256;
+		return;
+	case GGML_TYPE_IQ3_XXS:
+		*fn_out		 = dequant_iq3_xxs_row;
+		*divisor_out = 256;
+		return;
+	case GGML_TYPE_IQ2_S:
+		*fn_out		 = dequant_iq2_s_row;
+		*divisor_out = 256;
+		return;
+	case GGML_TYPE_IQ4_XS:
+		*fn_out		 = dequant_iq4_xs_row;
 		*divisor_out = 256;
 		return;
 	case GGML_TYPE_IQ3_S_RE:

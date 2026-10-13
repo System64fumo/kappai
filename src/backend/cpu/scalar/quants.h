@@ -84,6 +84,34 @@ typedef struct {
 _Static_assert(sizeof(iq3_s_block) == 110, "wrong iq3s block size");
 
 typedef struct {
+	uint16_t d;
+	uint16_t qs[32];
+} iq2_xxs_block;
+_Static_assert(sizeof(iq2_xxs_block) == 66, "wrong iq2_xxs block size");
+
+typedef struct {
+	uint16_t d;
+	uint8_t	 qs[96];
+} iq3_xxs_block;
+_Static_assert(sizeof(iq3_xxs_block) == 98, "wrong iq3_xxs block size");
+
+typedef struct {
+	uint16_t d;
+	uint8_t	 qs[64];
+	uint8_t	 qh[8];
+	uint8_t	 scales[8];
+} iq2_s_block;
+_Static_assert(sizeof(iq2_s_block) == 82, "wrong iq2_s block size");
+
+typedef struct {
+	uint16_t d;
+	uint16_t scales_h;
+	uint8_t	 scales_l[4];
+	uint8_t	 qs[128];
+} iq4_xs_block;
+_Static_assert(sizeof(iq4_xs_block) == 136, "wrong iq4_xs block size");
+
+typedef struct {
 	uint8_t	 hmask[32];
 	uint8_t	 qs[64];
 	uint8_t	 scales[12];
@@ -155,6 +183,10 @@ void dequant_q5_k_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_q6_k_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_iq4_nl_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_iq3_s_row(const void *blocks, size_t n_blocks, float *dst);
+void dequant_iq2_xxs_row(const void *blocks, size_t n_blocks, float *dst);
+void dequant_iq3_xxs_row(const void *blocks, size_t n_blocks, float *dst);
+void dequant_iq2_s_row(const void *blocks, size_t n_blocks, float *dst);
+void dequant_iq4_xs_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_f16_row(const void *src, int n, float *dst);
 void dequant_bf16_row(const void *src, int n, float *dst);
 

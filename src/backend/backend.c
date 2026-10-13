@@ -310,11 +310,15 @@ static void log_op_homes(backend *b) {
 			uint32_t	t;
 			const char *n;
 		} types[] = {
-			{GGML_TYPE_F32, "f32"},		{GGML_TYPE_F16, "f16"},	  {GGML_TYPE_BF16, "bf16"},
-			{GGML_TYPE_Q4_0, "q4_0"},	{GGML_TYPE_Q4_1, "q4_1"}, {GGML_TYPE_Q5_0, "q5_0"},
-			{GGML_TYPE_Q5_1, "q5_1"},	{GGML_TYPE_Q8_0, "q8_0"}, {GGML_TYPE_Q4_K, "q4_k"},
-			{GGML_TYPE_Q5_K, "q5_k"},	{GGML_TYPE_Q6_K, "q6_k"}, {GGML_TYPE_IQ4_NL, "iq4_nl"},
-			{GGML_TYPE_IQ3_S, "iq3_s"},
+			{GGML_TYPE_F32, "f32"},			{GGML_TYPE_F16, "f16"},
+			{GGML_TYPE_BF16, "bf16"},		{GGML_TYPE_Q4_0, "q4_0"},
+			{GGML_TYPE_Q4_1, "q4_1"},		{GGML_TYPE_Q5_0, "q5_0"},
+			{GGML_TYPE_Q5_1, "q5_1"},		{GGML_TYPE_Q8_0, "q8_0"},
+			{GGML_TYPE_Q4_K, "q4_k"},		{GGML_TYPE_Q5_K, "q5_k"},
+			{GGML_TYPE_Q6_K, "q6_k"},		{GGML_TYPE_IQ4_NL, "iq4_nl"},
+			{GGML_TYPE_IQ3_S, "iq3_s"},		{GGML_TYPE_IQ2_XXS, "iq2_xxs"},
+			{GGML_TYPE_IQ3_XXS, "iq3_xxs"}, {GGML_TYPE_IQ2_S, "iq2_s"},
+			{GGML_TYPE_IQ4_XS, "iq4_xs"},
 		};
 		char native[256], nonnative[256];
 		native[0] = nonnative[0] = '\0';
