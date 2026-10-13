@@ -34,6 +34,8 @@ typedef struct config {
 
 config config_defaults(void);
 
+int parse_bool_token(const char *s);
+
 void config_init(const config *cfg);
 
 const config *config_get(void);
@@ -69,6 +71,8 @@ typedef struct {
 } cli_args;
 
 void config_usage(FILE *fp, bool is_server);
+
+void cli_args_defaults(cli_args *a);
 
 int parse_args(int argc, char **argv, config *cfg, cli_args *a);
 

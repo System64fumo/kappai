@@ -29,9 +29,6 @@ config config_defaults(void) {
 }
 
 void config_init(const config *cfg) {
-	if (g_cfg_initialized) {
-		return;
-	}
 	g_cfg			  = cfg ? *cfg : config_defaults();
 	g_cfg_initialized = 1;
 
@@ -126,20 +123,43 @@ static const struct {
 	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
 };
 
+void cli_args_defaults(cli_args *a) {
+	memset(a, 0, sizeof(*a));
+
+	a->n_predict	  = -1;
+	a->temperature	  = 0.80f;
+	a->top_k		  = 40;
+	a->top_p		  = 0.90f;
+	a->min_p		  = 0.10f;
+	a->repeat_penalty = 1.0f;
+	a->repeat_last_n  = 64;
+	a->output_stream  = true;
+	snprintf(a->metrics, sizeof(a->metrics), "pp,tg");
+	a->warmup	   = true;
+	a->server_host = "127.0.0.1";
+	a->server_port = 8080;
+}
+
+int parse_bool_token(const char *s) {
+	for (size_t i = 0; i < ARRAY_LEN(bool_tokens); i++)
+		if (strcmp(s, bool_tokens[i].token) == 0)
+			return bool_tokens[i].value;
+	return -1;
+}
+
 static int parse_bool_flag(const char *flag, const char *optarg, int default_if_bare, int *out) {
 	if (!optarg) {
 		*out = default_if_bare;
 		return 0;
 	}
-	for (size_t i = 0; i < ARRAY_LEN(bool_tokens); i++) {
-		if (strcmp(optarg, bool_tokens[i].token) == 0) {
-			*out = bool_tokens[i].value;
-			return 0;
-		}
+	int v = parse_bool_token(optarg);
+	if (v < 0) {
+		ERROR("invalid %s value '%s' (expected one of: yes, on, true, 1, no, off, false, 0)", flag,
+			  optarg);
+		return -1;
 	}
-	ERROR("invalid %s value '%s' (expected one of: yes, on, true, 1, no, off, false, 0)", flag,
-		  optarg);
-	return -1;
+	*out = v;
+	return 0;
 }
 
 static int parse_int_arg(const char *optarg, const char *flag, long minv, long maxv, int *out) {
@@ -195,20 +215,13 @@ static int parse_float_arg(const char *optarg, const char *flag, float minv, flo
 	return 0;
 }
 
-static int bool_token_is_valid(const char *s) {
-	for (size_t i = 0; i < ARRAY_LEN(bool_tokens); i++)
-		if (strcmp(s, bool_tokens[i].token) == 0)
-			return 1;
-	return 0;
-}
-
 static const char *peek_optional_bool_arg(const char *optarg, int argc, char **argv, int *optind) {
 	if (optarg)
 		return optarg;
 	if (*optind >= argc)
 		return NULL;
 	const char *candidate = argv[*optind];
-	if (bool_token_is_valid(candidate)) {
+	if (parse_bool_token(candidate) >= 0) {
 		(*optind)++;
 		return candidate;
 	}
@@ -339,24 +352,11 @@ static const cli_option_desc *find_cli_option(const cli_option_desc *opts, size_
 
 int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 	*cfg = config_defaults();
-	memset(a, 0, sizeof(*a));
+	cli_args_defaults(a);
 
 	const char *prog	= (argc > 0 && argv[0]) ? argv[0] : "";
 	const char *prog_bn = path_basename(prog);
 	a->is_server		= strstr(prog_bn, "server") != NULL;
-
-	a->n_predict	  = -1;
-	a->temperature	  = 0.80f;
-	a->top_k		  = 40;
-	a->top_p		  = 0.90f;
-	a->min_p		  = 0.10f;
-	a->repeat_penalty = 1.0f;
-	a->repeat_last_n  = 64;
-	a->output_stream  = true;
-	snprintf(a->metrics, sizeof(a->metrics), "pp,tg");
-	a->warmup	   = true;
-	a->server_host = "127.0.0.1";
-	a->server_port = 8080;
 
 	enum {
 		OPT_SYSTEM = 256,

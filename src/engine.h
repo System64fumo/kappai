@@ -10,6 +10,7 @@ typedef enum {
 } engine_status;
 
 int	 engine_init(context *ctx, cli_args *a, int argc, char **argv);
+int	 engine_init_config(context *ctx, cli_args *a, const config *cfg);
 int	 engine_run(context *ctx, cli_args *a);
 void engine_shutdown(context *ctx);
 

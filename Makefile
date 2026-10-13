@@ -197,6 +197,8 @@ TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
 SERVER_SRCS := $(wildcard $(SRC_DIR)/server/*.c)
 SERVER_LIBS := -ljson-c -lmicrohttpd
 CLI_SRCS    := $(wildcard $(SRC_DIR)/cli/*.c)
+TUI_SRCS    := $(wildcard $(SRC_DIR)/tui/*.c)
+TUI_LIBS    := -lncurses -lmicrohttpd
 HEADERS     = $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
 ALL_SRCS    = $(shell find $(SRC_DIR) -type f \( -name "*.c" -o -name "*.cpp" \))
 ALL_SHADERS = $(shell find $(SRC_DIR) -type f \( -name "*.comp" -o -name "*.glsl" -o -name "*.inc" \))
@@ -206,18 +208,20 @@ TEST_OBJ_DIR := $(OBJ_DIR)/test
 TEST_OBJS    := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS))
 SERVER_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
 CLI_OBJS     := $(patsubst $(SRC_DIR)/cli/%.c,$(OBJ_DIR)/cli/%.o,$(CLI_SRCS))
+TUI_OBJS     := $(patsubst $(SRC_DIR)/tui/%.c,$(OBJ_DIR)/tui/%.o,$(TUI_SRCS)) $(OBJ_DIR)/server/openai.o
 
 ENGINE      := $(OUT_DIR)/libkappai.so
 CLI_BIN     := $(OUT_DIR)/kappai-cli
 SERVER_BIN  := $(OUT_DIR)/kappai-server
 TEST_BIN    := $(OUT_DIR)/kappai-test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
+TUI_BIN     := $(OUT_DIR)/kappai
 
-SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(ENGINE) $(BACKEND_LIBS)
+SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(TUI_BIN) $(ENGINE) $(BACKEND_LIBS)
 
 ENGINE_LDFLAGS := -L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN' $(LDFLAGS)
 
-BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS)))
+BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS) $(TUI_OBJS)))
 
 FORMAT_FLAGS := -i -style=file
 TIDY_LOG     := $(OUT_DIR)/tidy.log
@@ -346,9 +350,9 @@ ifneq ($(HAS_OPENGL),)
 	@printf '#endif\n' >> $@
 endif
 
-.PHONY: all cli kappai-test server monitor clean print-config format tidy backends-help config
+.PHONY: all cli kappai kappai-test server monitor clean print-config format tidy backends-help config
 
-all: $(BACKEND_LIBS) cli kappai-test server
+all: $(BACKEND_LIBS) cli kappai kappai-test server
 
 config: $(OUT_DIR) $(CONFIG_FILE)
 	@echo "Build configuration created:"
@@ -391,6 +395,12 @@ server: $(SERVER_BIN)
 $(SERVER_BIN): $(SERVER_OBJS) | $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) $(SERVER_OBJS) $(ENGINE_LDFLAGS) $(SERVER_LIBS) -o $@
+	$(SPLIT_DEBUG)
+
+kappai: $(TUI_BIN)
+$(TUI_BIN): $(TUI_OBJS) | $(ENGINE) $(BACKEND_LIBS)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) $(TUI_OBJS) $(ENGINE_LDFLAGS) -ljson-c $(TUI_LIBS) -o $@
 	$(SPLIT_DEBUG)
 
 kappai-test: $(TEST_BIN)
@@ -498,4 +508,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d) $(MONITOR_BIN).d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d) $(MONITOR_BIN).d
