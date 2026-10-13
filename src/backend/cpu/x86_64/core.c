@@ -870,13 +870,8 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 }
 
 static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_avx *j = ctx;
-	float			 *scores;
-	if (tid == 0) {
-		scores = j->p->scores;
-	} else {
-		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
-	}
+	cpu_attn_job_avx *j		 = ctx;
+	float			 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
@@ -896,13 +891,8 @@ static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 }
 
 static void cpu_attn_kvh_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_avx *j = ctx;
-	float			 *scores;
-	if (tid == 0) {
-		scores = j->p->scores;
-	} else {
-		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
-	}
+	cpu_attn_job_avx *j		 = ctx;
+	float			 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int kvh = begin; kvh < end; kvh++) {
 		int h_start = kvh * j->n_groups;
 		int h_end	= h_start + j->n_groups;
@@ -992,7 +982,7 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 			return OK;
 		}
 
-		float *scores = p->scores;
+		float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 		for (int h = 0; h < n_heads; h++) {
 			int			   kvh	   = h / n_groups;
 			const uint8_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1040,7 +1030,7 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 		return OK;
 	}
 
-	float *scores = p->scores;
+	float *scores = flash_attn ? NULL : cpu_grow_scores(p, -1, n_pos);
 	for (int h = 0; h < n_heads; h++) {
 		int		  kvh	  = h / n_groups;
 		uint16_t *k_slice = kl_base + ((size_t)kvh * kvh_stride);
@@ -1075,16 +1065,11 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 }
 
 static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job_avx *j = ctx;
-	float				   *scores;
-	if (tid == 0) {
-		scores = j->p->scores;
-	} else {
-		int need_scores = j->pos_start + j->m;
-		if (j->kv_rows && (size_t)need_scores > j->kv_rows)
-			need_scores = (int)j->kv_rows;
-		scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, need_scores);
-	}
+	cpu_attn_batch_job_avx *j			= ctx;
+	int						need_scores = j->pos_start + j->m;
+	if (j->kv_rows && (size_t)need_scores > j->kv_rows)
+		need_scores = (int)j->kv_rows;
+	float *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, need_scores);
 
 	for (int idx = begin; idx < end; idx++) {
 		int row = idx / j->n_heads;

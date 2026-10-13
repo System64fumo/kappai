@@ -1229,15 +1229,16 @@ static void miss_fill_desc(moe_miss_entry *me, int k, int eid, void *freed_buf, 
 	moe_expert_slot tmp;
 	slot_zero(&tmp);
 	slot_from_expert_desc(&tmp, eid, desc);
-	tmp.heap_buf   = NULL;
-	tmp.heap_size  = 0;
-	me->k		   = k;
-	me->eid		   = eid;
-	me->dep		   = -1;
-	me->slot	   = NULL;
-	me->gen		   = 0;
-	me->tmp		   = tmp;
-	me->st		   = OK;
+	tmp.heap_buf  = NULL;
+	tmp.heap_size = 0;
+	me->k		  = k;
+	me->eid		  = eid;
+	me->dep		  = -1;
+	me->slot	  = NULL;
+	me->gen		  = 0;
+	me->tmp		  = tmp;
+	me->st		  = OK;
+	atomic_store_explicit(&me->io_err, 0, memory_order_relaxed);
 	me->reuse_buf  = freed_buf;
 	me->reuse_size = freed_size;
 }
@@ -1253,8 +1254,9 @@ static void miss_fill_slot(moe_miss_entry *me, int k, int eid, moe_expert_slot *
 	me->tmp.heap_buf  = NULL;
 	me->tmp.heap_size = 0;
 	me->st			  = OK;
-	me->reuse_buf	  = freed_buf;
-	me->reuse_size	  = freed_size;
+	atomic_store_explicit(&me->io_err, 0, memory_order_relaxed);
+	me->reuse_buf  = freed_buf;
+	me->reuse_size = freed_size;
 }
 
 static void moe_resolve_no_cache(const struct model *m, const struct layer_weights *Lw,

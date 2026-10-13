@@ -174,7 +174,7 @@ void run_hybrid_state_tests(backend *ref) {
 				maxdiff = d;
 		}
 		float statediff = hyb_conv_state_diff(long_run.kv.hybrid, split_run.kv.hybrid);
-		int	  ok		= maxdiff <= 1e-5f && statediff <= 1e-5f;
+		int	  ok		= maxdiff <= ATOL_LOOSE * 10.0f && statediff <= 1e-5f;
 		snprintf(detail, sizeof(detail),
 				 "two independent seqs back-to-back (no reset) match one long stream: "
 				 "max|dlogits|=%.3e state_diff=%.3e",

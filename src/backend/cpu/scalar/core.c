@@ -2067,13 +2067,13 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buff
 							  .kv_rows		  = rows,
 							  .kv_base		  = base};
 
+	int total		= use_bitrev ? (n_heads * m_pow2) : (n_heads * m);
 	int cur_tid		= tpool_current_tid();
 	int can_recurse = (cur_tid < 0);
-	if (can_recurse && p->pool && p->thread_scratch && n_heads * m >= 2) {
-		int total = use_bitrev ? (n_heads * m_pow2) : (n_heads * m);
+	if (can_recurse && p->pool && p->thread_scratch && total >= 2) {
 		tpool_parallel_for(p->pool, total, 1, cpu_attn_batch_chunk, &job);
 	} else {
-		cpu_attn_batch_chunk(0, n_heads * m, 0, &job);
+		cpu_attn_batch_chunk(0, total, 0, &job);
 	}
 
 	return OK;

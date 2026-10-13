@@ -2254,14 +2254,15 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 	__m256i *xq32 = xq32_stack;
 
 	if (blocks_per_row > 256) {
-		size_t need = (size_t)blocks_per_row * (sizeof(float) + sizeof(__m256i));
+		size_t need = (size_t)blocks_per_row * (sizeof(float) + sizeof(__m256i)) + sizeof(__m256i);
 		if (need > xq_prepack_cap) {
 			xq_prepack	   = xrealloc(xq_prepack, need);
 			xq_prepack_cap = need;
 			tlocal_register((void **)&xq_prepack);
 		}
-		xq_d = xq_prepack;
-		xq32 = (__m256i *)(xq_d + blocks_per_row);
+		xq32 = (__m256i *)(((uintptr_t)xq_prepack + sizeof(__m256i) - 1) &
+						   ~(uintptr_t)(sizeof(__m256i) - 1));
+		xq_d = (float *)(xq32 + blocks_per_row);
 	}
 
 	for (int bi = 0; bi < blocks_per_row; bi++) {

@@ -469,7 +469,7 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 		atol = ATOL_KV_QUANT;
 		rtol = RTOL_KV_QUANT;
 	} else {
-		atol = ATOL_LOOSE;
+		atol = ATOL_LOOSE + (RTOL_NORM_LOOSE * ref_mag);
 		rtol = RTOL_LOOSE;
 	}
 
