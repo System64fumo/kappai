@@ -287,6 +287,16 @@ void cuda_matmul_q5_0_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev, int n, int k,
                                cudaStream_t stream);
 
+void cuda_matmul_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+
+void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
+
+void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
+
 void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
 
 /* Safe fallback for types that crash the CPU implementation (e.g., IQ4_NL). */
