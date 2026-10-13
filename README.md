@@ -67,14 +67,19 @@ make -j$(nproc)
 
 ### Usage
 
-Interactive mode:
+The easiest way to use kappai is to just run:
+```bash
+./build/kappai
+```
+
+For a less interactive manual cli use run:
 ```bash
 ./build/kappai-cli -m model.gguf
 ```
 
-One-shot:
+For server use run:
 ```bash
-./build/kappai-cli -m model.gguf -p "Hello"
+./build/kappai-server -m model.gguf
 ```
 
 ---

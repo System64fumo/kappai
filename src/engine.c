@@ -324,35 +324,19 @@ static int grep_vocab(const char *model_path, const char *substr) {
 	return 0;
 }
 
-int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
+static void engine_tune_allocator(void) {
 	mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
 	mallopt(M_MMAP_MAX, 0);
 	mallopt(M_TRIM_THRESHOLD, -1);
+}
 
+static void engine_init_logging(void) {
 	log_level saved_log_level = log_get_level();
 	log_init(log_default_config());
 	log_set_level(saved_log_level);
+}
 
-	config cfg;
-	if (parse_args(argc, argv, &cfg, a) < 0) {
-		config_usage(stderr, a->is_server);
-		return ERR_INVALID_ARG;
-	}
-
-	if (a->list_devices) {
-		list_devices();
-		return ENGINE_EXIT;
-	}
-	if (a->dump_metadata) {
-		int rc = dump_metadata(cfg.model);
-		return rc == 0 ? ENGINE_EXIT : ERR_NOT_FOUND;
-	}
-	if (a->grep_vocab) {
-		int rc = grep_vocab(cfg.model, a->grep_vocab);
-		return rc == 0 ? ENGINE_EXIT : ERR_NOT_FOUND;
-	}
-
-	config_init(&cfg);
+static int engine_load(context *ctx, cli_args *a) {
 	const config *ec = config_get();
 
 	const char *model_base = path_basename(ec->model);
@@ -397,6 +381,46 @@ int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
 	backend_release_thread(ctx->backend);
 
 	return OK;
+}
+
+int engine_init(context *ctx, cli_args *a, int argc, char **argv) {
+	engine_tune_allocator();
+	engine_init_logging();
+
+	config cfg;
+	if (parse_args(argc, argv, &cfg, a) < 0) {
+		config_usage(stderr, a->is_server);
+		return ERR_INVALID_ARG;
+	}
+
+	if (a->list_devices) {
+		list_devices();
+		return ENGINE_EXIT;
+	}
+	if (a->dump_metadata) {
+		int rc = dump_metadata(cfg.model);
+		return rc == 0 ? ENGINE_EXIT : ERR_NOT_FOUND;
+	}
+	if (a->grep_vocab) {
+		int rc = grep_vocab(cfg.model, a->grep_vocab);
+		return rc == 0 ? ENGINE_EXIT : ERR_NOT_FOUND;
+	}
+
+	config_init(&cfg);
+	return engine_load(ctx, a);
+}
+
+int engine_init_config(context *ctx, cli_args *a, const config *cfg) {
+	engine_tune_allocator();
+	engine_init_logging();
+
+	if (!cfg->model || !cfg->model[0]) {
+		ERROR("no model configured");
+		return ERR_INVALID_ARG;
+	}
+
+	config_init(cfg);
+	return engine_load(ctx, a);
 }
 
 int engine_run(context *ctx, cli_args *a) {
