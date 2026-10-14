@@ -1026,13 +1026,21 @@ static void ple_build_plan_fill(ple_build_plan *p, struct model *m, backend *dev
 	p->eps				= m->norm_eps;
 }
 
-static int ple_build_dev_path_ok(backend *a, const struct model *m, int batched) {
+static int ple_build_dev_caps_ok(backend *a, const struct model *m, int batched) {
 	int has_proj = batched ? (a->matmul_batch != NULL) : (a->matmul != NULL);
 	int has_norm = batched ? (a->rmsnorm_batch != NULL) : (a->rmsnorm != NULL);
 	return a->embd_lookup && has_proj && a->scale_inplace && has_norm && a->ple_combine &&
-		   matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type) &&
-		   m->layer_dims.per_layer_model_proj.buf.handle &&
+		   matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type);
+}
+
+static int ple_build_dev_path_ok(backend *a, const struct model *m, int batched) {
+	return ple_build_dev_caps_ok(a, m, batched) && m->layer_dims.per_layer_model_proj.buf.handle &&
 		   m->layer_dims.per_layer_tok_embd.buf.handle;
+}
+
+int ple_device_path_possible(const struct model *m) {
+	return !m->mixed_backend_mode && m->backend && ple_build_dev_caps_ok(m->backend, m, 0) &&
+		   ple_build_dev_caps_ok(m->backend, m, 1);
 }
 
 static status_code ple_host_decode_row(const ple_build_plan *p, int token, float *ple_row) {
@@ -5635,7 +5643,6 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 done:
 	if (batch_open && a->end_batch) {
 		a->end_batch(a);
-		batch_open = 0;
 	}
 	if (st != OK && logits_out)
 		memset(logits_out, 0, (size_t)m->vocab_size * sizeof(float));

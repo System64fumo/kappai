@@ -770,3 +770,20 @@ static void backends_init(void) {
 void backend_load(void) {
 	pthread_once(&g_backends_once, backends_init);
 }
+
+#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
+
+status_code tensor_desc_read(const tensor_desc *desc, size_t off, void *dst, size_t len) {
+	if (!desc->read_fn) {
+		copy_weight_chunked(dst, (const char *)desc->host_data + off, len,
+							desc->release_host_source);
+		return OK;
+	}
+	for (size_t done = 0; done < len; done += TENSOR_READ_PIECE_BYTES) {
+		size_t		piece = MIN(len - done, TENSOR_READ_PIECE_BYTES);
+		status_code s	  = desc->read_fn(desc->read_ctx, off + done, (char *)dst + done, piece);
+		if (s != OK)
+			return s;
+	}
+	return OK;
+}

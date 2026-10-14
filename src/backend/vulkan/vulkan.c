@@ -2703,8 +2703,7 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 #define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
 #define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
 
-static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const void *src, size_t size,
-								   int release_src) {
+static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const tensor_desc *desc, size_t size) {
 	for (size_t off = 0; off < size; off += VK_WEIGHT_STAGE_CHUNK_BYTES) {
 		size_t len		  = MIN(size - off, VK_WEIGHT_STAGE_CHUNK_BYTES);
 		bool   batch_full = p->wbatch_off + len > p->staging_cap;
@@ -2720,8 +2719,9 @@ static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const void *src, siz
 				return s;
 		}
 
-		copy_weight_chunked(p->staging_buf.mapped + p->wbatch_off, (const char *)src + off, len,
-							release_src);
+		status_code rs = tensor_desc_read(desc, off, p->staging_buf.mapped + p->wbatch_off, len);
+		if (rs != OK)
+			return rs;
 		VkBufferCopy copy = {.srcOffset = p->wbatch_off, .dstOffset = off, .size = len};
 		vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, dst->buf, 1, &copy);
 		VkMemoryBarrier wbar = {
@@ -2747,9 +2747,11 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 	vk_buf *b = vk_scratch_pool_take(p, alloc_size, NULL);
 	if (b) {
 		if (b->mapped) {
-			copy_weight_chunked(b->mapped, desc->host_data, size, desc->release_host_source);
+			status_code s = tensor_desc_read(desc, 0, b->mapped, size);
+			if (s != OK)
+				return s;
 		} else {
-			status_code s = vk_stage_upload(p, b, desc->host_data, size, desc->release_host_source);
+			status_code s = vk_stage_upload(p, b, desc, size);
 			if (s != OK)
 				return s;
 		}
@@ -2786,7 +2788,12 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 			return s;
 		}
 
-		copy_weight_chunked(bnew->mapped, desc->host_data, size, desc->release_host_source);
+		status_code rs = tensor_desc_read(desc, 0, bnew->mapped, size);
+		if (rs != OK) {
+			vk_free_buffer(p, bnew);
+			free(bnew);
+			return rs;
+		}
 	} else {
 		status_code s =
 			vk_alloc_buffer(p, alloc_size, weight_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bnew);
@@ -2800,7 +2807,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 			return s;
 		}
 
-		s = vk_stage_upload(p, bnew, desc->host_data, size, desc->release_host_source);
+		s = vk_stage_upload(p, bnew, desc, size);
 		if (s != OK) {
 			vk_free_buffer(p, bnew);
 			free(bnew);

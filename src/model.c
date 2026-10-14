@@ -546,32 +546,6 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	return 0;
 }
 
-static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes);
-
-static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
-									uint64_t d0, uint64_t d1, weight_class wc,
-									backend *target_backend, buffer *out) {
-	tensor_desc desc = {
-		.type	   = type,
-		.n_dims	   = n_dims,
-		.dims	   = {d0, d1, 0, 0},
-		.host_data = host_ptr,
-	};
-	backend *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
-	desc.release_host_source = !backend_has_cap(home, BCAP_IS_HOST) && host_ptr_in_map(m, host_ptr);
-	status_code s			 = home->buffer_alloc_weight(home, &desc, out);
-	if (s != OK)
-		return s;
-
-	if (!backend_has_cap(home, BCAP_IS_HOST)) {
-		size_t bytes = (n_dims == 1) ? ggml_row_size(type, d0) : ggml_row_size(type, d0) * d1;
-		release_original_weight_data(m, host_ptr, bytes);
-		out->host_ptr = NULL;
-	}
-
-	return OK;
-}
-
 static int cmp_tensor_slot(const void *a, const void *b) {
 	const model_tensor_slot *x = (const model_tensor_slot *)a;
 	const model_tensor_slot *y = (const model_tensor_slot *)b;
@@ -602,37 +576,104 @@ static void tensor_release_index_ensure(model *m) {
 	m->tensor_data_order_n = live;
 }
 
+static gguf_tensor *owned_tensor_for_ptr(model *m, const void *ptr) {
+	if (!ptr || mapped_pages_live(m) || !m->gctx.owns_tensor_data)
+		return NULL;
+	tensor_release_index_ensure(m);
+	uintptr_t key = (uintptr_t)ptr;
+	size_t	  lo = 0, hi = m->tensor_data_order_n;
+	while (lo < hi) {
+		size_t	  mid = lo + (hi - lo) / 2;
+		uintptr_t d	  = (uintptr_t)m->tensor_data_order[mid].data;
+		if (d < key)
+			lo = mid + 1;
+		else if (d > key)
+			hi = mid;
+		else {
+			gguf_tensor *t = &m->gctx.tensors[m->tensor_data_order[mid].tensor_idx];
+			return t->data == ptr ? t : NULL;
+		}
+	}
+	return NULL;
+}
+
+static int weight_retains_host_copy(const model *m, const gguf_tensor *t) {
+	if (gguf_tensor_is_eager(t))
+		return 1;
+	if (m->tie_embeddings && t->data == m->tok_embd.host_ptr)
+		return 1;
+	if (!m->has_per_layer_embeddings)
+		return 0;
+	int is_ple_host = t->data == m->layer_dims.per_layer_tok_embd.host_ptr ||
+					  t->data == m->layer_dims.per_layer_model_proj.host_ptr;
+	return is_ple_host && !ple_device_path_possible(m);
+}
+
+static status_code ensure_tensor_loaded(model *m, const void *host_ptr) {
+	gguf_tensor *t = owned_tensor_for_ptr(m, host_ptr);
+	if (!t || t->loaded)
+		return OK;
+	status_code s = gguf_sparse_read_tensor(&m->gctx, t);
+	if (s != OK)
+		return s;
+	return t->loaded ? OK : ERR_IO;
+}
+
+static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes);
+
+static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
+									uint64_t d0, uint64_t d1, weight_class wc,
+									backend *target_backend, buffer *out) {
+	tensor_desc desc = {
+		.type	   = type,
+		.n_dims	   = n_dims,
+		.dims	   = {d0, d1, 0, 0},
+		.host_data = host_ptr,
+	};
+	backend			  *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
+	int				   home_host = backend_has_cap(home, BCAP_IS_HOST);
+	gguf_tensor		  *owned	 = owned_tensor_for_ptr(m, host_ptr);
+	gguf_tensor_source source	 = {&m->gctx, owned};
+	if (!home_host && owned && !owned->loaded && !weight_retains_host_copy(m, owned)) {
+		desc.read_fn  = gguf_tensor_read;
+		desc.read_ctx = &source;
+	} else {
+		status_code ls = ensure_tensor_loaded(m, host_ptr);
+		if (ls != OK)
+			return ls;
+	}
+	desc.release_host_source = !home_host && host_ptr_in_map(m, host_ptr);
+	status_code s			 = home->buffer_alloc_weight(home, &desc, out);
+	if (s != OK)
+		return s;
+
+	if (!backend_has_cap(home, BCAP_IS_HOST)) {
+		size_t bytes = (n_dims == 1) ? ggml_row_size(type, d0) : ggml_row_size(type, d0) * d1;
+		release_original_weight_data(m, host_ptr, bytes);
+		out->host_ptr = NULL;
+	}
+
+	return OK;
+}
+
 static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes) {
 	if (!host_ptr || bytes == 0)
 		return;
-
 	if (m->tie_embeddings && host_ptr == m->tok_embd.host_ptr)
 		return;
-	if (mapped_pages_live(m)) {
 
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, host_ptr, bytes);
-	} else if (m->gctx.owns_tensor_data) {
-		tensor_release_index_ensure(m);
-		uintptr_t key = (uintptr_t)host_ptr;
-		size_t	  lo = 0, hi = m->tensor_data_order_n;
-		while (lo < hi) {
-			size_t	  mid = lo + (hi - lo) / 2;
-			uintptr_t d	  = (uintptr_t)m->tensor_data_order[mid].data;
-			if (d < key)
-				lo = mid + 1;
-			else if (d > key)
-				hi = mid;
-			else {
-				size_t i = m->tensor_data_order[mid].tensor_idx;
-				if (i < m->gctx.n_tensors && m->gctx.tensors[i].data == host_ptr) {
-					free((void *)m->gctx.tensors[i].data);
-					m->gctx.tensors[i].data = NULL;
-				}
-				return;
-			}
-		}
+		return;
 	}
+	gguf_tensor *t = owned_tensor_for_ptr(m, host_ptr);
+	if (!t || weight_retains_host_copy(m, t))
+		return;
+	free((void *)t->data);
+	t->data	  = NULL;
+	t->loaded = 0;
 }
+
 int model_should_repack(uint32_t type, const char *repack_config) {
 	if (!repack_config)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
@@ -734,6 +775,9 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 		home->repack_plan(home, type, d0, d1, &re_type);
 
 	if (re_type) {
+		status_code ls = ensure_tensor_loaded(m, host_ptr);
+		if (ls != OK)
+			return ls;
 		int	   k			 = (int)d0;
 		int	   n_rows		 = (int)d1;
 		size_t src_row_bytes = ggml_row_size(type, (size_t)k);
@@ -812,6 +856,8 @@ static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t 
 		ref->dequant_rows	= n_rows;
 		return 0;
 	}
+	if (ensure_tensor_loaded(m, ref->host_ptr) != OK)
+		return 0;
 	const void *orig  = ref->host_ptr;
 	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
 	dequant_weight_to_f32(m->backend, &ref->host_ptr, &ref->type, row_len, n_rows);
@@ -821,6 +867,8 @@ static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t 
 
 static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w, uint32_t type,
 								 uint64_t dim, uint64_t intermediate) {
+	if (ensure_tensor_loaded(m, gate_w) != OK || ensure_tensor_loaded(m, up_w) != OK)
+		return NULL;
 	size_t	 row_stride = ggml_row_size(type, dim);
 	size_t	 half_bytes = row_stride * intermediate;
 	uint8_t *buf		= xmalloc(half_bytes * 2);
@@ -841,6 +889,10 @@ static void *build_fused_qkv(model *m, const layer_weights *L, int has_kv, int h
 	if (!has_kv || !L->wk.host_ptr)
 		return NULL;
 	if (has_own_v && !L->wv.host_ptr)
+		return NULL;
+	if (ensure_tensor_loaded(m, L->wq.host_ptr) != OK ||
+		ensure_tensor_loaded(m, L->wk.host_ptr) != OK ||
+		(has_own_v && ensure_tensor_loaded(m, L->wv.host_ptr) != OK))
 		return NULL;
 	size_t	 row_stride = ggml_row_size(type, dim);
 	size_t	 q_bytes	= row_stride * q_rows;
@@ -884,6 +936,11 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 
 	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
+	status_code ls = ensure_tensor_loaded(m, gate_w);
+	if (ls == OK)
+		ls = ensure_tensor_loaded(m, up_w);
+	if (ls != OK)
+		return ls;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
 	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
@@ -950,6 +1007,13 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 
 	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
+	status_code ls = ensure_tensor_loaded(m, L->wq.host_ptr);
+	if (ls == OK)
+		ls = ensure_tensor_loaded(m, L->wk.host_ptr);
+	if (ls == OK && has_own_v)
+		ls = ensure_tensor_loaded(m, L->wv.host_ptr);
+	if (ls != OK)
+		return ls;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
 	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
@@ -1015,6 +1079,9 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 		ref->dequant_native	 = 0;
 		const uint32_t qtype = ref->type;
 		size_t bytes = ggml_row_size(qtype, (size_t)ref->dequant_cols) * (size_t)ref->dequant_rows;
+		status_code ls = ensure_tensor_loaded(m, ref->host_ptr);
+		if (ls != OK)
+			return ls;
 		status_code ds =
 			home->dequant_weight
 				? home->dequant_weight(home, qtype, ref->host_ptr, (int)ref->dequant_rows,
@@ -1460,7 +1527,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	return OK;
 }
 
-static void advise_layer_pages(const model *m, int layer, int drop) {
+static void prefetch_layer_pages(const model *m, int layer) {
 	const gguf_ctx *g = &m->gctx;
 	if (g->fd < 0 || !g->map || g->map_is_heap)
 		return;
@@ -1473,24 +1540,31 @@ static void advise_layer_pages(const model *m, int layer, int drop) {
 		page_span r = page_span_for(gt->data, gt->byte_size, ps);
 		if (!page_span_clamp(&r, base, g->map_size) || r.len == 0)
 			continue;
-		if (drop)
-			posix_fadvise(g->fd, (off_t)(r.start - base), (off_t)r.len, POSIX_FADV_DONTNEED);
-		else
-			readahead(g->fd, (off_t)(r.start - base), r.len);
+		readahead(g->fd, (off_t)(r.start - base), r.len);
 	}
 }
 
 static status_code upload_all_weights(model *m) {
 	status_code s;
 
+	bool bulk_read = !m->use_mmap && backend_has_cap(m->backend, BCAP_IS_HOST);
+
 	progress prog;
 	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers + embedding_upload_steps(m));
 
+	if (bulk_read) {
+		s = gguf_sparse_read_tensors(&m->gctx, GGUF_LAYER_GLOBAL);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
+		}
+	}
+
 	uint64_t ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
 	if (backend_has_cap(m->backend, BCAP_IS_HOST))
-		advise_layer_pages(m, -1, 0);
+		prefetch_layer_pages(m, -1);
 	for (int i = 0; i < MODEL_READAHEAD_LAYERS && i < m->n_layers; i++)
-		advise_layer_pages(m, i, 0);
+		prefetch_layer_pages(m, i);
 	if (g_monitor && g_monitor->fd >= 0)
 		monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
 
@@ -1507,9 +1581,9 @@ static status_code upload_all_weights(model *m) {
 		}
 
 		if (i + MODEL_READAHEAD_LAYERS < m->n_layers)
-			advise_layer_pages(m, i + MODEL_READAHEAD_LAYERS, 0);
+			prefetch_layer_pages(m, i + MODEL_READAHEAD_LAYERS);
 
-		if (!m->use_mmap) {
+		if (bulk_read) {
 			s = gguf_sparse_read_tensors(&m->gctx, i);
 			if (s != OK) {
 				progress_finish(&prog);
@@ -1522,7 +1596,6 @@ static status_code upload_all_weights(model *m) {
 			progress_finish(&prog);
 			return s;
 		}
-		advise_layer_pages(m, i, 1);
 	}
 
 	progress_finish(&prog);
@@ -3103,9 +3176,6 @@ status_code model_upload_weights(model *m) {
 		ERROR("model_upload: weight upload failed (%d)", up_s);
 		return up_s;
 	}
-
-	if (m->gctx.map && m->gctx.map_size > 0)
-		madvise(m->gctx.map, m->gctx.map_size, MADV_RANDOM);
 
 	INFO("weights uploaded in %llu ms", (unsigned long long)((time_us() - up_t0) / 1000));
 #ifdef __GLIBC__

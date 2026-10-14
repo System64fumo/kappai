@@ -384,4 +384,6 @@ void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 		recipe_register(arch_name_str, builder_fn);                                                \
 	}
 
+int ple_device_path_possible(const struct model *m);
+
 #endif

@@ -1104,7 +1104,6 @@ __attribute__((weak)) status_code cpu_matmul_multi_batch(backend *self, const bu
 			has_grouped = 1;
 	}
 
-	int cur_tid	   = tpool_current_tid();
 	int total_rows = mj.row_offset[n_matmuls];
 
 	if (!p->pool || (size_t)m * (size_t)total_rows < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {

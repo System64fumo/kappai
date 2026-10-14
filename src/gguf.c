@@ -1095,7 +1095,6 @@ status_code gguf_load(gguf_ctx *ctx, const char *path) {
 		close(fd);
 		return ERR_IO;
 	}
-	madvise(map, fsize, MADV_SEQUENTIAL);
 #ifdef MADV_DONTDUMP
 	madvise(map, fsize, MADV_DONTDUMP);
 #endif
@@ -1226,12 +1225,16 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	}
 
 	void *map = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
-	close(fd);
-	if (map == MAP_FAILED)
+	if (map == MAP_FAILED) {
+		close(fd);
 		return ERR_IO;
+	}
 
 	status_code s = gguf_parse_common(ctx, map, fsize, -1, NULL, 1);
 	munmap(map, fsize);
+	if (s == OK)
+		posix_fadvise(fd, 0, (off_t)ctx->data_file_offset, POSIX_FADV_DONTNEED);
+	close(fd);
 	if (s != OK)
 		return s;
 
@@ -1294,9 +1297,7 @@ int gguf_tensor_layer_index(const char *name) {
 	return (int)idx;
 }
 
-static int gguf_tensor_needed_at_layout(const gguf_tensor *t) {
-	if (gguf_tensor_layer_index(t->name) < 0)
-		return 1;
+int gguf_tensor_is_eager(const gguf_tensor *t) {
 	if (t->type == GGML_TYPE_F32 && t->byte_size <= GGUF_EAGER_F32_MAX_BYTES)
 		return 1;
 	return strstr(t->name, "attn_k_b") || strstr(t->name, "attn_v_b");
@@ -1306,8 +1307,17 @@ static int gguf_sparse_selected(const gguf_tensor *t, int layer) {
 	if (gguf_tensor_name_is_expert(t->name))
 		return 0;
 	if (layer == GGUF_LAYER_EAGER)
-		return gguf_tensor_needed_at_layout(t);
-	return gguf_tensor_layer_index(t->name) == layer && !gguf_tensor_needed_at_layout(t);
+		return gguf_tensor_is_eager(t);
+	if (gguf_tensor_is_eager(t))
+		return 0;
+	int idx = gguf_tensor_layer_index(t->name);
+	return layer == GGUF_LAYER_GLOBAL ? idx < 0 : idx == layer;
+}
+
+static int gguf_sparse_wanted(const gguf_tensor *t, int layer, const gguf_tensor *only) {
+	if (!t->data || t->loaded)
+		return 0;
+	return only ? t == only : gguf_sparse_selected(t, layer);
 }
 
 status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path) {
@@ -1389,7 +1399,7 @@ static void gguf_chunk_tensor(gguf_load_chunk *chunks, size_t *n_chunks, const g
 	}
 }
 
-status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
+static status_code gguf_sparse_read_matching(gguf_ctx *ctx, int layer, const gguf_tensor *only) {
 	size_t align	   = ctx->sparse_align;
 	size_t chunk_bytes = GGUF_LOAD_CHUNK_TARGET_BYTES;
 	if (align > 0)
@@ -1399,7 +1409,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
 	size_t n_chunks_cap = 0;
 	for (size_t i = 0; i < ctx->n_tensors; i++) {
 		const gguf_tensor *t = &ctx->tensors[i];
-		if (!t->data || !gguf_sparse_selected(t, layer))
+		if (!gguf_sparse_wanted(t, layer, only))
 			continue;
 		n_sel++;
 		n_chunks_cap += (t->byte_size / chunk_bytes) + 2;
@@ -1417,7 +1427,7 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
 	size_t			 load_idx		 = 0;
 	for (size_t i = 0; i < ctx->n_tensors; i++) {
 		gguf_tensor *t = &ctx->tensors[i];
-		if (!t->data || !gguf_sparse_selected(t, layer))
+		if (!gguf_sparse_wanted(t, layer, only))
 			continue;
 		size_t first = n_chunks;
 		gguf_chunk_tensor(chunks, &n_chunks, ctx, t, load_idx, chunk_bytes, file_end);
@@ -1453,7 +1463,32 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
 
 	free(chunks);
 	free(chunk_remaining);
-	return (status_code)atomic_load(&job.first_err);
+
+	status_code err = (status_code)atomic_load(&job.first_err);
+	if (err != OK)
+		return err;
+	for (size_t i = 0; i < ctx->n_tensors; i++)
+		if (gguf_sparse_wanted(&ctx->tensors[i], layer, only))
+			ctx->tensors[i].loaded = 1;
+	return OK;
+}
+
+status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
+	return gguf_sparse_read_matching(ctx, layer, NULL);
+}
+
+status_code gguf_sparse_read_tensor(gguf_ctx *ctx, gguf_tensor *t) {
+	return gguf_sparse_read_matching(ctx, 0, t);
+}
+
+status_code gguf_tensor_read(void *source, size_t off, void *dst, size_t len) {
+	const gguf_tensor_source *src = source;
+	const gguf_ctx			 *ctx = src->ctx;
+	uint64_t				  pos = ctx->data_file_offset + src->t->offset + off;
+	if (gguf_range_read(ctx->sparse_fd, ctx->sparse_direct_fd, ctx->sparse_align, pos, len, dst) !=
+		0)
+		return ERR_IO;
+	return OK;
 }
 
 void gguf_free(gguf_ctx *ctx) {

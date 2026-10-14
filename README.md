@@ -40,6 +40,14 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `glm-dsa`    | GLM 5.2, GLM 5.3             |
 | `glm5-next`  | GLM 5.3 Flash                |
 
+| Backend       | State                                            |
+|---------------|--------------------------------------------------|
+| `cpu_scalar`  | Fully working, Reference for all other backends  |
+| `cpu_aarch64` | Fully working                                    |
+| `cpu_x86_64`  | Works, Requires modern CPUs, Lacks some features |
+| `vulkan`      | Works, Requires modern GPUs, Lacks some features |
+| `opengl`      | Works, Lacks some features                       |
+
 | OS    | Architecture                   |
 |-------|--------------------------------|
 | Linux | `aarch64`, `riscv64`, `x86_64` |
@@ -51,10 +59,10 @@ make config BUILD=release
 make -j$(nproc)
 ```
 
-With Vulkan (W.I.P, slower than CPU in some cases):
+With some backends enabled:
 
 ```bash
-make config BUILD=release BACKENDS=vulkan
+make config BUILD=release BACKENDS=vulkan,opengl
 make -j$(nproc)
 ```
 

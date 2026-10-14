@@ -9,7 +9,8 @@
 #define GGUF_MAGIC 0x46554747u
 #define GGUF_VERSION 3u
 #define GGUF_LAYER_EAGER (-1)
-#define GGUF_EAGER_F32_MAX_BYTES ((size_t)(64 * 1024))
+#define GGUF_LAYER_GLOBAL (-2)
+#define GGUF_EAGER_F32_MAX_BYTES ((size_t)(16 << 20))
 
 typedef enum {
 	GGUF_TYPE_U8 = 0,
@@ -76,6 +77,7 @@ typedef struct {
 	uint64_t	offset;
 	const void *data;
 	size_t		byte_size;
+	uint8_t		loaded;
 } gguf_tensor;
 
 typedef struct {
@@ -150,6 +152,17 @@ ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);
 status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path);
 
 status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer);
+
+status_code gguf_sparse_read_tensor(gguf_ctx *ctx, gguf_tensor *t);
+
+int gguf_tensor_is_eager(const gguf_tensor *t);
+
+typedef struct {
+	gguf_ctx		  *ctx;
+	const gguf_tensor *t;
+} gguf_tensor_source;
+
+status_code gguf_tensor_read(void *source, size_t off, void *dst, size_t len);
 
 int gguf_tensor_layer_index(const char *name);
 
