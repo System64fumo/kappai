@@ -31,6 +31,13 @@ static status_code moe_matmul_maybe_qonly(moe_expert_ctx *cx, const float *w, ui
 	return cx->a->matmul_thread_local(cx->a, w, wt, xb, out, n_out, cx->dim, tid);
 }
 
+void moe_swiglu_clamp(float *gate, float *up, int n, float limit) {
+	for (int i = 0; i < n; i++) {
+		gate[i] = fminf(gate[i], limit);
+		up[i]	= fmaxf(-limit, fminf(up[i], limit));
+	}
+}
+
 status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const float *xb,
 							float weight, int tid) {
 	moe_stream_wait_slot(es);
@@ -49,6 +56,8 @@ status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const
 		st = moe_matmul_maybe_qonly(cx, es->gate_w, es->gate_type, xb, gu_h, cx->inter * 2, tid);
 		if (st != OK)
 			return st;
+		if (cx->clamp > 0.0f)
+			moe_swiglu_clamp(gu_h, gu_h + cx->inter, cx->inter, cx->clamp);
 		st = moe_activate(cx->a, act_h, gu_h, gu_h + cx->inter, cx->inter, es->gate_scale,
 						  es->up_scale, cx->use_gelu);
 		if (st != OK)
@@ -60,6 +69,8 @@ status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const
 		st = moe_matmul_maybe_qonly(cx, es->up_w, es->up_type, xb, up_h, cx->inter, tid);
 		if (st != OK)
 			return st;
+		if (cx->clamp > 0.0f)
+			moe_swiglu_clamp(gate_h, up_h, cx->inter, cx->clamp);
 		st = moe_activate(cx->a, act_h, gate_h, up_h, cx->inter, es->gate_scale, es->up_scale,
 						  cx->use_gelu);
 		if (st != OK)

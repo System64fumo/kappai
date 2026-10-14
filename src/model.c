@@ -165,6 +165,65 @@ static int check_expert_tensor_dims(const gguf_ctx *g, const char *name, uint64_
 	return 0;
 }
 
+static int validate_hc_layer(const model *m, const gguf_ctx *g, int i, char *tname,
+							 size_t tname_sz) {
+	const uint64_t			 hc_dim = (uint64_t)m->kda.hc_count * (uint64_t)m->dim;
+	const uint64_t			 hc_mix = (uint64_t)(2 + m->kda.hc_count) * (uint64_t)m->kda.hc_count;
+	static const char *const sub[]	= {"attn", "ffn"};
+	for (int k = 0; k < 2; k++) {
+		char fmt[64];
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_fn.weight", sub[k]);
+		if (require_layer_dims_2d(g, tname, tname_sz, fmt, i, hc_dim, hc_mix))
+			return -1;
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_base.weight", sub[k]);
+		if (require_layer_dims_1d(g, tname, tname_sz, fmt, i, hc_mix) ||
+			require_tensor_f32_if_present(g, tname))
+			return -1;
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_scale.weight", sub[k]);
+		if (require_layer_dims_1d(g, tname, tname_sz, fmt, i, 3) ||
+			require_tensor_f32_if_present(g, tname))
+			return -1;
+	}
+	return 0;
+}
+
+static int validate_kda_layer(const model *m, const gguf_ctx *g, int i, char *tname,
+							  size_t tname_sz) {
+	const uint64_t d_inner = (uint64_t)m->hybrid.value_dim;
+	const uint64_t hd	   = (uint64_t)m->kda.head_dim;
+	const uint64_t dim	   = (uint64_t)m->dim;
+	if (require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_q.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_k.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_v.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_output.weight", i, d_inner, dim) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_f_a.weight", i, dim, hd) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_f_b.weight", i, hd, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_g_a.weight", i, dim, hd) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_g_b.weight", i, hd, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_beta.weight", i, dim,
+							  (uint64_t)m->n_heads) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_a", i, (uint64_t)m->n_heads) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_dt.bias", i, d_inner) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_norm.weight", i, hd))
+		return -1;
+	static const char *const f32_names[] = {"blk.%d.ssm_a",
+											"blk.%d.ssm_dt.bias",
+											"blk.%d.ssm_norm.weight",
+											"blk.%d.ssm_conv1d_q.weight",
+											"blk.%d.ssm_conv1d_k.weight",
+											"blk.%d.ssm_conv1d_v.weight"};
+	for (size_t k = 0; k < ARRAY_LEN(f32_names); k++) {
+		snprintf(tname, tname_sz, f32_names[k], i);
+		if (!gguf_find_tensor(g, tname)) {
+			ERROR("model: missing required tensor '%s'", tname);
+			return -1;
+		}
+		if (require_tensor_f32_if_present(g, tname))
+			return -1;
+	}
+	return 0;
+}
+
 static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	char tname[128];
 
@@ -220,7 +279,12 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_norm.weight", i, m->dim) ||
 			require_tensor_f32_if_present(g, tname))
 			return -1;
-		if (model_layer_is_recurrent(m, i)) {
+		if (m->arch_info->has_hyper_connections && validate_hc_layer(m, g, i, tname, sizeof(tname)))
+			return -1;
+		if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+			if (validate_kda_layer(m, g, i, tname, sizeof(tname)))
+				return -1;
+		} else if (model_layer_is_recurrent(m, i)) {
 			const model_hybrid_params *q = &m->hybrid;
 			if (m->arch_info->hybrid_shortconv) {
 				if (require_layer_dims_2d(g, tname, sizeof(tname),
@@ -1058,7 +1122,39 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 	UPLOAD(&L->attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
-	if (model_layer_is_recurrent(m, i)) {
+	if (m->arch_info->has_hyper_connections) {
+		UPLOAD_REP(&L->hc_attn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD_REP(&L->hc_ffn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD(&L->hc_attn_base_w, GGML_TYPE_F32, 1,
+			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_ffn_base_w, GGML_TYPE_F32, 1,
+			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_attn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_ffn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+	}
+
+	if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+		const uint64_t d_inner = (uint64_t)m->hybrid.value_dim;
+		const uint64_t hd	   = (uint64_t)m->kda.head_dim;
+		const uint64_t conv_k  = (uint64_t)m->hybrid.conv_kernel;
+		UPLOAD_REP(&L->wq, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wk, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wv, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wo, 2, d_inner, m->dim, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_f_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_f_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_g_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_g_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->n_heads, WCLASS_MATMUL);
+		UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->n_heads, 0, WCLASS_MISC);
+		UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, d_inner, 0, WCLASS_MISC);
+		UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, hd, 0, WCLASS_NORM);
+		UPLOAD(&L->kda_conv_q_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD(&L->kda_conv_k_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD(&L->kda_conv_v_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+	} else if (model_layer_is_recurrent(m, i)) {
 		if (m->arch_info->hybrid_shortconv) {
 			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
 			UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
@@ -1084,10 +1180,12 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		UPLOAD_REP(&L->q_b_w, 2, q_lora, q_b_rows, WCLASS_MATMUL);
 		UPLOAD(&L->q_a_norm_w, GGML_TYPE_F32, 1, q_lora, 0, WCLASS_NORM);
 		UPLOAD_REP(&L->kv_a_w, 2, m->dim, kv_a_rows, WCLASS_MATMUL);
-		UPLOAD_REP(&L->k_b_w, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads,
-				   WCLASS_MATMUL);
-		UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
-				   WCLASS_MATMUL);
+		if (!m->arch_info->is_kda) {
+			UPLOAD_REP(&L->k_b_w, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads,
+					   WCLASS_MATMUL);
+			UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
+					   WCLASS_MATMUL);
+		}
 		UPLOAD(&L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
 		int wo_in = m->n_heads * m->mla.v_head;
 		UPLOAD_REP(&L->wo, 2, wo_in, m->dim, WCLASS_MATMUL);
@@ -1717,12 +1815,15 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 		qk_head = v32;
 	if (akey_i32(g, prefix, "attention.value_length_mla", &v32) == OK)
 		v_head = v32;
+	bool rope_key = false;
 	if (akey_i32(g, prefix, "rope.dimension_count", &v32) == OK ||
-		akey_i32(g, prefix, "attention.qk_rope_head_dim", &v32) == OK)
-		qk_rope = v32;
+		akey_i32(g, prefix, "attention.qk_rope_head_dim", &v32) == OK) {
+		qk_rope	 = v32;
+		rope_key = true;
+	}
 	if (akey_i32(g, prefix, "attention.qk_nope_head_dim", &v32) == OK)
 		qk_nope = v32;
-	else if (qk_head > 0 && qk_rope > 0)
+	else if (qk_head > 0 && (qk_rope > 0 || rope_key))
 		qk_nope = qk_head - qk_rope;
 	if (qk_head == 0)
 		qk_head = qk_nope + qk_rope;
@@ -1734,12 +1835,14 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 		q_lora = 2048;
 	if (kv_lora <= 0)
 		kv_lora = 512;
-	if (qk_rope <= 0)
+	if (qk_rope <= 0 && !rope_key)
 		qk_rope = 64;
-	if (qk_nope <= 0)
+	if (qk_nope <= 0 && !(rope_key && qk_head > 0))
 		qk_nope = 192;
 	if (qk_head <= 0)
 		qk_head = 256;
+	if (qk_nope <= 0 && qk_head > 0)
+		qk_nope = qk_head - qk_rope;
 	if (v_head <= 0)
 		v_head = 256;
 	m->mla.q_lora  = q_lora;
@@ -1832,6 +1935,67 @@ static status_code load_hybrid_metadata(model *m, const gguf_ctx *g, const char 
 	return OK;
 }
 
+static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *prefix) {
+	int32_t				 v32;
+	float				 vf;
+	model_hybrid_params *q = &m->hybrid;
+	model_kda_params	*k = &m->kda;
+
+	if (req_i32(g, prefix, "ssm.conv_kernel", &v32) != OK)
+		return ERR_FORMAT;
+	q->conv_kernel = v32;
+	if (req_i32(g, prefix, "kda.head_dim", &v32) != OK)
+		return ERR_FORMAT;
+	k->head_dim = v32;
+	if (req_i32(g, prefix, "hyper_connection.count", &k->hc_count) != OK ||
+		req_i32(g, prefix, "hyper_connection.sinkhorn_iterations", &k->hc_sinkhorn_iters) != OK)
+		return ERR_FORMAT;
+	if (req_f32(g, prefix, "hyper_connection.epsilon", &vf) != OK)
+		return ERR_FORMAT;
+	k->hc_eps			= vf;
+	k->gate_lower_bound = -INFINITY;
+	akey_f32(g, prefix, "kda.gate_lower_bound", &k->gate_lower_bound);
+
+	if (q->conv_kernel < 2 || k->head_dim < 1 || k->hc_count != 4 || k->hc_sinkhorn_iters < 1) {
+		ERROR("glm5-next: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
+			  "only hc_count=4 is supported",
+			  q->conv_kernel, k->head_dim, k->hc_count, k->hc_sinkhorn_iters);
+		return ERR_FORMAT;
+	}
+
+	char		 key[160];
+	const float *arr = NULL;
+	size_t		 n	 = 0;
+	snprintf(key, sizeof(key), "%s.swiglu_clamp_exp", prefix);
+	if (gguf_get_arr_f32(g, key, &arr, &n) == OK && n >= (size_t)m->n_layers) {
+		k->swiglu_clamp_exp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_exp, arr, (size_t)m->n_layers * sizeof(float));
+	}
+	snprintf(key, sizeof(key), "%s.swiglu_clamp_shexp", prefix);
+	if (gguf_get_arr_f32(g, key, &arr, &n) == OK && n >= (size_t)m->n_layers) {
+		k->swiglu_clamp_shexp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_shexp, arr, (size_t)m->n_layers * sizeof(float));
+	} else if (k->swiglu_clamp_exp) {
+		k->swiglu_clamp_shexp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_shexp, k->swiglu_clamp_exp, (size_t)m->n_layers * sizeof(float));
+	}
+
+	int d_inner		  = k->head_dim * m->n_heads;
+	q->n_value_heads  = m->n_heads;
+	q->n_key_heads	  = m->n_heads;
+	q->state_size	  = k->head_dim;
+	q->value_head_dim = k->head_dim;
+	q->value_dim	  = d_inner;
+	q->key_dim		  = d_inner;
+	q->inner_size	  = d_inner;
+	q->conv_channels  = 3 * d_inner;
+	q->conv_dim		  = 3 * d_inner;
+	DEBUG("glm5-next: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
+		  m->n_heads, k->head_dim, q->conv_kernel, (double)k->gate_lower_bound, k->hc_count,
+		  k->hc_sinkhorn_iters, k->swiglu_clamp_exp ? "yes" : "no");
+	return OK;
+}
+
 static status_code model_load_open(model *m, const char *path, int use_mmap,
 								   const char *repack_config) {
 	m->use_mmap		 = use_mmap;
@@ -1920,16 +2084,17 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 	}
 	m->n_heads			   = v32;
 	int kv_from_lfm2_array = 0;
-	if (m->arch_info->is_hybrid_recurrent && m->arch_info->hybrid_shortconv) {
+	if (m->arch_info->is_hybrid_recurrent &&
+		(m->arch_info->hybrid_shortconv || m->arch_info->is_kda)) {
 		char key[128];
 		snprintf(key, sizeof(key), "%s.attention.head_count_kv", prefix);
 		const int32_t *kv_arr = NULL;
 		size_t		   kv_n	  = 0;
 		if (gguf_get_arr_i32(g, key, &kv_arr, &kv_n) != OK || !kv_arr ||
-			kv_n != (size_t)m->n_layers) {
-			ERROR("model_load: '%s' must be an i32 array of length %d for lfm2 "
-				  "(0 marks shortconv layers)",
-				  key, m->n_layers);
+			kv_n < (size_t)m->n_layers || (!m->arch_info->is_kda && kv_n != (size_t)m->n_layers)) {
+			ERROR("model_load: '%s' must be an i32 array of length %d for %s "
+				  "(0 marks recurrent layers)",
+				  key, m->n_layers, m->arch_info->gguf_name);
 			return ERR_FORMAT;
 		}
 		m->n_kv_heads = 0;
@@ -1948,8 +2113,8 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 			n_recurrent += (kv_arr[i] == 0);
 		}
 		kv_from_lfm2_array = 1;
-		DEBUG("lfm2: %d shortconv layers, %d attention layers (kv_heads=%d)", n_recurrent,
-			  m->n_layers - n_recurrent, m->n_kv_heads);
+		DEBUG("%s: %d recurrent layers, %d attention layers (kv_heads=%d)", m->arch_info->gguf_name,
+			  n_recurrent, m->n_layers - n_recurrent, m->n_kv_heads);
 	}
 	if (!kv_from_lfm2_array) {
 		if (akey_i32(g, prefix, "attention.head_count_kv", &v32) == OK) {
@@ -2069,6 +2234,9 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 			q->value_head_dim		   = m->dim;
 			q->key_dim				   = 1;
 			q->full_attention_interval = 1;
+		} else if (m->arch_info->is_kda) {
+			if (load_kda_metadata(m, g, prefix) != OK)
+				return ERR_FORMAT;
 		} else if (load_hybrid_metadata(m, g, prefix) != OK) {
 			return ERR_FORMAT;
 		}
@@ -2191,7 +2359,55 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 							  "blk.%d.attn_norm.weight", 0) != OK)
 			return ERR_FORMAT;
 
-		if (model_layer_is_recurrent(m, i)) {
+		if (m->arch_info->has_hyper_connections) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_fn_w,
+								  "blk.%d.hc_attn_fn.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_base_w,
+								  "blk.%d.hc_attn_base.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_scale_w,
+								  "blk.%d.hc_attn_scale.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_fn_w,
+								  "blk.%d.hc_ffn_fn.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_base_w,
+								  "blk.%d.hc_ffn_base.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_scale_w,
+								  "blk.%d.hc_ffn_scale.weight", 0) != OK)
+				return ERR_FORMAT;
+		}
+
+		if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->wq, "blk.%d.attn_q.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wk, "blk.%d.attn_k.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wv, "blk.%d.attn_v.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wo, "blk.%d.attn_output.weight",
+								  1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_f_a_w,
+								  "blk.%d.ssm_f_a.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_f_b_w,
+								  "blk.%d.ssm_f_b.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_g_a_w,
+								  "blk.%d.ssm_g_a.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_g_b_w,
+								  "blk.%d.ssm_g_b.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_beta_w,
+								  "blk.%d.ssm_beta.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_a, "blk.%d.ssm_a", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_dt_b, "blk.%d.ssm_dt.bias",
+								  0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_norm_w,
+								  "blk.%d.ssm_norm.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_q_w,
+								  "blk.%d.ssm_conv1d_q.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_k_w,
+								  "blk.%d.ssm_conv1d_k.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_v_w,
+								  "blk.%d.ssm_conv1d_v.weight", 0) != OK)
+				return ERR_FORMAT;
+			L->has_own_v = 0;
+		} else if (model_layer_is_recurrent(m, i)) {
 			int is_conv = m->arch_info->hybrid_shortconv;
 			if (is_conv) {
 				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_qkv_w,
@@ -2747,6 +2963,12 @@ status_code model_build_weight_refs(model *m) {
 		row[WIDX_SSM_ALPHA]			   = &L->ssm_alpha_w;
 		row[WIDX_SSM_NORM]			   = &L->ssm_norm_w;
 		row[WIDX_SSM_OUT]			   = &L->ssm_out_w;
+		row[WIDX_SSM_F_A]			   = &L->kda_f_a_w;
+		row[WIDX_SSM_F_B]			   = &L->kda_f_b_w;
+		row[WIDX_SSM_G_A]			   = &L->kda_g_a_w;
+		row[WIDX_SSM_G_B]			   = &L->kda_g_b_w;
+		row[WIDX_HC_ATTN_FN]		   = &L->hc_attn_fn_w;
+		row[WIDX_HC_FFN_FN]			   = &L->hc_ffn_fn_w;
 	}
 
 	return OK;
@@ -3002,6 +3224,9 @@ void model_free(model *m) {
 		m->layer_backends	= NULL;
 		m->n_layer_backends = 0;
 	}
+
+	free(m->kda.swiglu_clamp_exp);
+	free(m->kda.swiglu_clamp_shexp);
 
 	if (m->owns_backend)
 		backend_destroy(m->backend);

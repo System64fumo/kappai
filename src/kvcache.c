@@ -58,7 +58,7 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
 	c->n_kv_layers = n_kv_layers;
 
-	if (is_mla) {
+	if (is_mla && !m->arch_info->is_kda) {
 		if (!m->backend->kv_alloc_mla) {
 			ERROR("kvcache: model is MLA but backend has no kv_alloc_mla");
 			return ERR_UNSUPPORTED;
@@ -86,6 +86,11 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		if (q->recurrent_stride > 0)
 			q->recurrent_state = xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
 		c->hybrid = q;
+		if (m->arch_info->is_kda) {
+			q->mla_latent_stride = (size_t)n_ctx * (size_t)m->mla.kv_lora;
+			q->mla_latent = xcalloc((size_t)m->n_layers, q->mla_latent_stride * sizeof(float));
+			return OK;
+		}
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
@@ -166,7 +171,7 @@ void kvcache_free(kvcache *c) {
 		if (c->mla->host_alloced)
 			kv_buffer_free(&c->mla->kv_host);
 		free(c->mla);
-	} else {
+	} else if (!(c->hybrid && c->hybrid->mla_latent)) {
 		if (c->backend->kv_free) {
 			c->backend->kv_free(c->backend, &c->k, &c->v);
 		} else {
@@ -187,6 +192,7 @@ void kvcache_free(kvcache *c) {
 	if (c->hybrid) {
 		free(c->hybrid->conv_state);
 		free(c->hybrid->recurrent_state);
+		free(c->hybrid->mla_latent);
 		free(c->hybrid);
 		c->hybrid = NULL;
 	}

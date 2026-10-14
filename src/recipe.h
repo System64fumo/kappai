@@ -27,7 +27,9 @@
 #define RECIPE_SLOT_HYB_GATE 18
 #define RECIPE_SLOT_HYB_ALPHA 19
 #define RECIPE_SLOT_HYB_BETA 20
-#define RECIPE_SLOT_MAX 21
+#define RECIPE_SLOT_HC 21
+#define RECIPE_SLOT_HC_COEF 22
+#define RECIPE_SLOT_MAX 23
 
 #define RECIPE_SLOT_NONE 0xFF
 
@@ -91,6 +93,13 @@ typedef enum {
 	OP_GATED_DELTA_NET,
 	OP_SHORTCONV,
 
+	OP_GLM_HC_INIT,
+	OP_GLM_HC_PRE,
+	OP_GLM_HC_POST,
+	OP_GLM_HC_FINAL,
+	OP_GLM_KDA,
+	OP_GLM_MLA,
+
 	OP_KIND_COUNT
 } op_kind;
 
@@ -151,6 +160,12 @@ typedef enum {
 	WIDX_SSM_ALPHA,
 	WIDX_SSM_NORM,
 	WIDX_SSM_OUT,
+	WIDX_SSM_F_A,
+	WIDX_SSM_F_B,
+	WIDX_SSM_G_A,
+	WIDX_SSM_G_B,
+	WIDX_HC_ATTN_FN,
+	WIDX_HC_FFN_FN,
 	WIDX_COUNT
 } weight_idx;
 
@@ -329,26 +344,35 @@ recipe_op mk_rmsnorm_noweight(uint8_t in);
 recipe_op mk_split_qgate(void);
 recipe_op mk_attn_output_gate(uint8_t attn_in, uint8_t gate_in, uint8_t out);
 recipe_op mk_gated_delta_net(uint8_t proj_in, uint8_t gate_in, uint8_t alpha_in, uint8_t out);
-recipe_op mk_shortconv(uint8_t in, uint8_t out);
-recipe_op mk_mla_qkv_proj_fused(uint8_t in, uint8_t out, int n, int k);
-recipe_op mk_attention_mla(uint8_t q_in, uint8_t out, int n_heads, int head_dim, int n_ctx,
-						   float scale);
-recipe_op mk_scale(uint8_t io, uint8_t widx, float scale);
-recipe_op mk_ple_proj_inject(uint8_t in, uint8_t residual, uint8_t widx);
-recipe_op mk_add(uint8_t in0, uint8_t in1, stage stage);
-recipe_op mk_swap(uint8_t in0, uint8_t in1, stage stage);
-recipe_op mk_kvput(uint8_t k_in, uint8_t v_in);
-recipe_op mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
-					   int n_ctx, float scale, int sliding_window);
-recipe_op mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads,
-									 int head_dim, int n_ctx, int sliding_window);
-recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
-recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
-recipe_op mk_rope_ext(uint8_t in, int rope_neox);
-recipe_op mk_partial_rope_qk(void);
-int		  recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
-int		  recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
-									 uint8_t norm_widx);
+recipe_op mk_host_op(op_kind kind, uint8_t in, uint8_t out, uint8_t widx, stage stage);
+float	 *recipe_exec_slot_host(const exec_ctx *ctx, uint8_t idx);
+weight_ref *recipe_exec_weight(const exec_ctx *ctx, uint8_t widx);
+status_code glm5_next_op_hc_init(exec_ctx *ctx);
+status_code glm5_next_op_hc_pre(exec_ctx *ctx);
+status_code glm5_next_op_hc_post(exec_ctx *ctx);
+status_code glm5_next_op_hc_final(exec_ctx *ctx);
+status_code glm5_next_op_kda(exec_ctx *ctx);
+status_code glm5_next_op_mla(exec_ctx *ctx);
+recipe_op	mk_shortconv(uint8_t in, uint8_t out);
+recipe_op	mk_mla_qkv_proj_fused(uint8_t in, uint8_t out, int n, int k);
+recipe_op	mk_attention_mla(uint8_t q_in, uint8_t out, int n_heads, int head_dim, int n_ctx,
+							 float scale);
+recipe_op	mk_scale(uint8_t io, uint8_t widx, float scale);
+recipe_op	mk_ple_proj_inject(uint8_t in, uint8_t residual, uint8_t widx);
+recipe_op	mk_add(uint8_t in0, uint8_t in1, stage stage);
+recipe_op	mk_swap(uint8_t in0, uint8_t in1, stage stage);
+recipe_op	mk_kvput(uint8_t k_in, uint8_t v_in);
+recipe_op	mk_attention(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads, int head_dim,
+						 int n_ctx, float scale, int sliding_window);
+recipe_op	mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int n_kv_heads,
+									   int head_dim, int n_ctx, int sliding_window);
+recipe_op	mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
+recipe_op	mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
+recipe_op	mk_rope_ext(uint8_t in, int rope_neox);
+recipe_op	mk_partial_rope_qk(void);
+int			recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
+int			recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
+									   uint8_t norm_widx);
 int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
 						  uint8_t experts_in_slot, uint8_t out_slot);
 

@@ -4213,6 +4213,11 @@ static status_code op_moe_router(exec_ctx *ctx) {
 								slots);
 }
 
+static float moe_layer_clamp(const model *m, int li, int shared) {
+	const float *arr = shared ? m->kda.swiglu_clamp_shexp : m->kda.swiglu_clamp_exp;
+	return arr ? arr[li] : 0.0f;
+}
+
 static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
 	moe_par_job *j	 = ctx;
 	int			 dim = j->dim;
@@ -4222,6 +4227,7 @@ static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
 		.inter		  = j->inter,
 		.dim		  = dim,
 		.use_gelu	  = j->use_gelu,
+		.clamp		  = moe_layer_clamp(j->m, j->li, 0),
 		.q8_gate_ok	  = j->xb_q8_gate_ok,
 		.q8_gate_type = j->gate_q8_type,
 		.xb_q8_gate	  = j->xb_q8_gate,
@@ -4338,7 +4344,7 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	return OK;
 }
 
-static status_code moe_experts_run_sequential(model *m, int K, int dim, backend *a,
+static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, backend *a,
 											  moe_expert_slot *slot_buf, const int *expert_ids,
 											  const float *weights, buffer *xb, compute_scratch *s,
 											  int I, int use_gelu, int xb_q8_gate_ok,
@@ -4360,6 +4366,7 @@ static status_code moe_experts_run_sequential(model *m, int K, int dim, backend 
 		.inter		  = I,
 		.dim		  = dim,
 		.use_gelu	  = use_gelu,
+		.clamp		  = moe_layer_clamp(m, li, 0),
 		.q8_gate_ok	  = xb_q8_gate_ok,
 		.q8_gate_type = gate_q8_type,
 		.xb_q8_gate	  = xb_q8_gate,
@@ -4536,8 +4543,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 									  xb, s, I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
 									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
 	} else {
-		st = moe_experts_run_sequential(m, K, dim, backend_host(), slot_buf, expert_ids, weights,
-										xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
+		st = moe_experts_run_sequential(m, li, K, dim, backend_host(), slot_buf, expert_ids,
+										weights, xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
 										&xb_q8_gate, scratch_need, outf);
 	}
 
@@ -4683,6 +4690,16 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 		 !backend_has_cap(a, BCAP_HOST_VISIBLE_BUFFERS))) {
 		st = ERR_UNSUPPORTED;
 		goto done;
+	}
+	{
+		float clamp = moe_layer_clamp(ctx->m, li, 1);
+		if (clamp > 0.0f && backend_has_cap(h, BCAP_IS_HOST))
+			moe_swiglu_clamp((float *)(gate_buf->handle
+										   ? (char *)gate_buf->handle + gate_buf->offset
+										   : gate_buf->host_ptr),
+							 (float *)(up_buf->handle ? (char *)up_buf->handle + up_buf->offset
+													  : up_buf->host_ptr),
+							 sh_inter, clamp);
 	}
 	st = h->moe_activate(h, gate_buf, up_buf, act_buf, sh_inter, 1.0f, 1.0f, plan.use_gelu);
 	if (st != OK)
@@ -5352,6 +5369,12 @@ static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
 	[OP_ATTN_OUTPUT_GATE]	= op_attn_output_gate,
 	[OP_GATED_DELTA_NET]	= op_gated_delta_net,
 	[OP_SHORTCONV]			= op_shortconv,
+	[OP_GLM_HC_INIT]		= glm5_next_op_hc_init,
+	[OP_GLM_HC_PRE]			= glm5_next_op_hc_pre,
+	[OP_GLM_HC_POST]		= glm5_next_op_hc_post,
+	[OP_GLM_HC_FINAL]		= glm5_next_op_hc_final,
+	[OP_GLM_KDA]			= glm5_next_op_kda,
+	[OP_GLM_MLA]			= glm5_next_op_mla,
 };
 
 static int recipe_ops_are_batchable(const recipe_op *ops, int n) {
@@ -5368,7 +5391,7 @@ static int recipe_ops_are_batchable(const recipe_op *ops, int n) {
 
 int recipe_is_batchable(const model *m) {
 	const model_recipe *r = m->recipe;
-	if (!r)
+	if (!r || m->arch_info->has_hyper_connections)
 		return 0;
 	if (r->per_layer_ops) {
 		if (r->layer.n_ops <= 0)
@@ -5396,6 +5419,24 @@ int recipe_is_batchable(const model *m) {
 			return 0;
 	}
 	return 1;
+}
+
+static recipe_op mk_op_base(op_kind kind, uint8_t in0, uint8_t in1, uint8_t in2, uint8_t out,
+							uint8_t widx, stage stg);
+
+recipe_op mk_host_op(op_kind kind, uint8_t in, uint8_t out, uint8_t widx, stage stage) {
+	return mk_op_base(kind, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, widx, stage);
+}
+
+float *recipe_exec_slot_host(const exec_ctx *ctx, uint8_t idx) {
+	buffer *b = exec_slot(ctx, idx);
+	if (!b || !slot_is_host_resident(b))
+		return NULL;
+	return (float *)(b->handle ? (char *)b->handle + b->offset : b->host_ptr);
+}
+
+weight_ref *recipe_exec_weight(const exec_ctx *ctx, uint8_t widx) {
+	return exec_weight_ref(ctx, widx);
 }
 
 static status_code exec_op(const recipe_op *op, struct model *m, struct kvcache *cache,

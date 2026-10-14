@@ -38,6 +38,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `lfm`        | LFM 2.5                      |
 | `qwen35`     | Qwen 3.5, Qwen 3.6, Qwen 3.8 |
 | `glm-dsa`    | GLM 5.2, GLM 5.3             |
+| `glm-next`   | GLM 5.3 Flash                |
 
 | OS    | Architecture                   |
 |-------|--------------------------------|
