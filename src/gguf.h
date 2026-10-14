@@ -53,14 +53,13 @@ typedef enum {
 	GGML_TYPE_BF16	  = 30,
 
 	/* 0x40+ = engine-internal repacked types */
-	GGML_TYPE_IQ3_S_RE	= 0x42,
-	GGML_TYPE_Q8_0_R8	= 0x43,
-	GGML_TYPE_Q4_0_R8	= 0x44,
-	GGML_TYPE_IQ3_S_RE8 = 0x45,
-	GGML_TYPE_IQ4_NL_R8 = 0x46,
-	GGML_TYPE_Q4_K_R8	= 0x47,
-	GGML_TYPE_Q5_K_R8	= 0x48,
-	GGML_TYPE_Q6_K_R8	= 0x49,
+	GGML_TYPE_Q8_0_REPACKED	  = 0x43,
+	GGML_TYPE_Q4_0_REPACKED	  = 0x44,
+	GGML_TYPE_IQ3_S_REPACKED  = 0x45,
+	GGML_TYPE_IQ4_NL_REPACKED = 0x46,
+	GGML_TYPE_Q4_K_REPACKED	  = 0x47,
+	GGML_TYPE_Q5_K_REPACKED	  = 0x48,
+	GGML_TYPE_Q6_K_REPACKED	  = 0x49,
 
 } ggml_type;
 
@@ -136,7 +135,6 @@ static inline uint32_t wtype_to_q8type(uint32_t w_type) {
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE:
 		return GGML_TYPE_Q8_K;
 	default:
 		return 0;

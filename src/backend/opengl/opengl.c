@@ -77,15 +77,15 @@ typedef enum {
 	GL_PIPE_MATMUL_Q4_1_TILED,
 	GL_PIPE_MATMUL_Q5_0_TILED,
 	GL_PIPE_MATMUL_Q5_1_TILED,
-	GL_PIPE_MATMUL_Q4_0_R8,
-	GL_PIPE_MATMUL_Q8_0_R8,
-	GL_PIPE_MATMUL_IQ4_NL_R8,
-	GL_PIPE_MATMUL_Q4_K_R8,
-	GL_PIPE_MATMUL_Q5_K_R8,
-	GL_PIPE_MATMUL_Q6_K_R8,
-	GL_PIPE_MATMUL_Q4_0_R8_TILED,
-	GL_PIPE_MATMUL_Q8_0_R8_TILED,
-	GL_PIPE_MATMUL_IQ4_NL_R8_TILED,
+	GL_PIPE_MATMUL_Q4_0_REPACKED,
+	GL_PIPE_MATMUL_Q8_0_REPACKED,
+	GL_PIPE_MATMUL_IQ4_NL_REPACKED,
+	GL_PIPE_MATMUL_Q4_K_REPACKED,
+	GL_PIPE_MATMUL_Q5_K_REPACKED,
+	GL_PIPE_MATMUL_Q6_K_REPACKED,
+	GL_PIPE_MATMUL_Q4_0_REPACKED_TILED,
+	GL_PIPE_MATMUL_Q8_0_REPACKED_TILED,
+	GL_PIPE_MATMUL_IQ4_NL_REPACKED_TILED,
 	GL_PIPE_MATMUL_F32_TILED,
 	GL_PIPE_MATMUL_F16_TILED,
 	GL_PIPE_MATMUL_BF16_TILED,
@@ -102,16 +102,16 @@ typedef struct {
 } gl_pipeline_def;
 
 enum {
-	GL_PIPE_F_FUSED_ACT = 1u << 0,
-	GL_PIPE_F_TILED		= 1u << 1,
-	GL_PIPE_F_R8_LANE	= 1u << 2,
-	GL_PIPE_F_R8		= 1u << 3,
-	GL_PIPE_F_MATMUL_WG = 1u << 4,
-	GL_PIPE_F_USES_XQ	= 1u << 5,
-	GL_PIPE_F_USES_XQK	= 1u << 6,
-	GL_PIPE_F_IQ4NL_LUT = 1u << 7,
-	GL_PIPE_F_BF16		= 1u << 8,
-	GL_PIPE_F_IQX_GRID	= 1u << 9,
+	GL_PIPE_F_FUSED_ACT		= 1u << 0,
+	GL_PIPE_F_TILED			= 1u << 1,
+	GL_PIPE_F_REPACKED_LANE = 1u << 2,
+	GL_PIPE_F_REPACKED		= 1u << 3,
+	GL_PIPE_F_MATMUL_WG		= 1u << 4,
+	GL_PIPE_F_USES_XQ		= 1u << 5,
+	GL_PIPE_F_USES_XQK		= 1u << 6,
+	GL_PIPE_F_IQ4NL_LUT		= 1u << 7,
+	GL_PIPE_F_BF16			= 1u << 8,
+	GL_PIPE_F_IQX_GRID		= 1u << 9,
 };
 
 typedef struct gl_buf {
@@ -1035,49 +1035,58 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_MATMUL_IQ4_XS]	 = {"matmul_iq4_xs", gl_shader_matmul_iq4_xs_src,
 									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ4_XS, 32,
 									256},
-		[GL_PIPE_MATMUL_Q4_0_TILED] = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
-									   UINT32_MAX, 4, 32},
-		[GL_PIPE_MATMUL_Q4_1_TILED] = {"matmul_q4_1_tiled", gl_shader_matmul_q4_1_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
-									   UINT32_MAX, 4, 32},
-		[GL_PIPE_MATMUL_Q5_0_TILED] = {"matmul_q5_0_tiled", gl_shader_matmul_q5_0_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
-									   UINT32_MAX, 4, 32},
-		[GL_PIPE_MATMUL_Q5_1_TILED] = {"matmul_q5_1_tiled", gl_shader_matmul_q5_1_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
-									   UINT32_MAX, 4, 32},
-		[GL_PIPE_MATMUL_Q4_0_R8]	= {"matmul_q4_0_r8", gl_shader_matmul_q4_0_src,
-									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q4_0_R8, 8,
-									   32},
-		[GL_PIPE_MATMUL_Q8_0_R8]	= {"matmul_q8_0_r8", gl_shader_matmul_q8_0_src,
-									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ, GGML_TYPE_Q8_0_R8, 8,
-									   32},
-		[GL_PIPE_MATMUL_IQ4_NL_R8]	= {"matmul_iq4_nl_r8", gl_shader_matmul_iq4_nl_src,
-									   GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ | GL_PIPE_F_IQ4NL_LUT,
-									   GGML_TYPE_IQ4_NL_R8, 8, 32},
-		[GL_PIPE_MATMUL_Q4_K_R8]	= {"matmul_q4_k_r8", gl_shader_matmul_q4_k_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
-									   GGML_TYPE_Q4_K_R8, 4, 256},
-		[GL_PIPE_MATMUL_Q5_K_R8]	= {"matmul_q5_k_r8", gl_shader_matmul_q4_k_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
-									   GGML_TYPE_Q5_K_R8, 4, 256},
-		[GL_PIPE_MATMUL_Q6_K_R8]	= {"matmul_q6_k_r8", gl_shader_matmul_q6_k_src,
-									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_R8 | GL_PIPE_F_USES_XQK,
-									   GGML_TYPE_Q6_K_R8, 4, 256},
-		[GL_PIPE_MATMUL_Q4_0_R8_TILED]	 = {"matmul_q4_0_r8_tiled", gl_shader_matmul_q4_0_src,
-											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
-												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
-											UINT32_MAX, 8, 32},
-		[GL_PIPE_MATMUL_Q8_0_R8_TILED]	 = {"matmul_q8_0_r8_tiled", gl_shader_matmul_q8_0_src,
-											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
-												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ,
-											UINT32_MAX, 8, 32},
-		[GL_PIPE_MATMUL_IQ4_NL_R8_TILED] = {"matmul_iq4_nl_r8_tiled", gl_shader_matmul_iq4_nl_src,
-											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
-												GL_PIPE_F_R8_LANE | GL_PIPE_F_USES_XQ |
+		[GL_PIPE_MATMUL_Q4_0_TILED]	   = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src,
+										  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+										  UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_1_TILED]	   = {"matmul_q4_1_tiled", gl_shader_matmul_q4_1_src,
+										  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+										  UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_0_TILED]	   = {"matmul_q5_0_tiled", gl_shader_matmul_q5_0_src,
+										  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+										  UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q5_1_TILED]	   = {"matmul_q5_1_tiled", gl_shader_matmul_q5_1_src,
+										  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
+										  UINT32_MAX, 4, 32},
+		[GL_PIPE_MATMUL_Q4_0_REPACKED] = {"matmul_q4_0_repacked", gl_shader_matmul_q4_0_src,
+										  GL_PIPE_F_REPACKED_LANE | GL_PIPE_F_USES_XQ,
+										  GGML_TYPE_Q4_0_REPACKED, 8, 32},
+		[GL_PIPE_MATMUL_Q8_0_REPACKED] = {"matmul_q8_0_repacked", gl_shader_matmul_q8_0_src,
+										  GL_PIPE_F_REPACKED_LANE | GL_PIPE_F_USES_XQ,
+										  GGML_TYPE_Q8_0_REPACKED, 8, 32},
+		[GL_PIPE_MATMUL_IQ4_NL_REPACKED] = {"matmul_iq4_nl_repacked", gl_shader_matmul_iq4_nl_src,
+											GL_PIPE_F_REPACKED_LANE | GL_PIPE_F_USES_XQ |
 												GL_PIPE_F_IQ4NL_LUT,
-											UINT32_MAX, 8, 32},
+											GGML_TYPE_IQ4_NL_REPACKED, 8, 32},
+		[GL_PIPE_MATMUL_Q4_K_REPACKED]	 = {"matmul_q4_k_repacked", gl_shader_matmul_q4_k_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_REPACKED |
+												GL_PIPE_F_USES_XQK,
+											GGML_TYPE_Q4_K_REPACKED, 4, 256},
+		[GL_PIPE_MATMUL_Q5_K_REPACKED]	 = {"matmul_q5_k_repacked", gl_shader_matmul_q4_k_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_REPACKED |
+												GL_PIPE_F_USES_XQK,
+											GGML_TYPE_Q5_K_REPACKED, 4, 256},
+		[GL_PIPE_MATMUL_Q6_K_REPACKED]	 = {"matmul_q6_k_repacked", gl_shader_matmul_q6_k_src,
+											GL_PIPE_F_MATMUL_WG | GL_PIPE_F_REPACKED |
+												GL_PIPE_F_USES_XQK,
+											GGML_TYPE_Q6_K_REPACKED, 4, 256},
+		[GL_PIPE_MATMUL_Q4_0_REPACKED_TILED]   = {"matmul_q4_0_repacked_tiled",
+												  gl_shader_matmul_q4_0_src,
+												  GL_PIPE_F_MATMUL_WG |
+													  GL_PIPE_F_TILED | GL_PIPE_F_REPACKED_LANE |
+													  GL_PIPE_F_USES_XQ,
+												  UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_Q8_0_REPACKED_TILED]   = {"matmul_q8_0_repacked_tiled",
+												  gl_shader_matmul_q8_0_src,
+												  GL_PIPE_F_MATMUL_WG |
+													  GL_PIPE_F_TILED | GL_PIPE_F_REPACKED_LANE |
+													  GL_PIPE_F_USES_XQ,
+												  UINT32_MAX, 8, 32},
+		[GL_PIPE_MATMUL_IQ4_NL_REPACKED_TILED] = {"matmul_iq4_nl_repacked_tiled",
+												  gl_shader_matmul_iq4_nl_src,
+												  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED |
+													  GL_PIPE_F_REPACKED_LANE | GL_PIPE_F_USES_XQ |
+													  GL_PIPE_F_IQ4NL_LUT,
+												  UINT32_MAX, 8, 32},
 		[GL_PIPE_QUANTIZE_Q8_K]	 = {"quantize_q8_k", gl_shader_quantize_q8_k_src, 0, UINT32_MAX, 1,
 									0},
 		[GL_PIPE_QUANTIZE_X]	 = {"quantize_x", gl_shader_quantize_x_src, 0, UINT32_MAX, 1, 0},
@@ -1108,7 +1117,7 @@ static status_code gl_init(backend *self, int device_index) {
 		{GL_PIPE_MATMUL_BF16, "BF16"},
 		{GL_PIPE_MATMUL_BF16_TILED, "BF16"},
 		{GL_PIPE_MATMUL_Q5_K, "Q5K"},
-		{GL_PIPE_MATMUL_Q5_K_R8, "Q5K"},
+		{GL_PIPE_MATMUL_Q5_K_REPACKED, "Q5K"},
 	};
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		char *tuned_src = NULL;
@@ -1119,15 +1128,16 @@ static status_code gl_init(backend *self, int device_index) {
 				break;
 			}
 		}
-		if (defs[i].flags & (GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE)) {
-			char *with_r8 = gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "R8", 1);
-			if (!with_r8) {
+		if (defs[i].flags & (GL_PIPE_F_REPACKED | GL_PIPE_F_REPACKED_LANE)) {
+			char *with_repacked =
+				gl_shader_with_define(tuned_src ? tuned_src : defs[i].src, "REPACKED", 1);
+			if (!with_repacked) {
 				free(tuned_src);
 				s = ERR_INTERNAL;
 				break;
 			}
 			free(tuned_src);
-			tuned_src = with_r8;
+			tuned_src = with_repacked;
 		}
 		if (defs[i].flags & GL_PIPE_F_TILED) {
 			char *with_cols =
@@ -1291,28 +1301,29 @@ static bool gl_weight_is_device_only(uint32_t type) {
 	case GGML_TYPE_IQ2_XXS:
 	case GGML_TYPE_IQ3_XXS:
 	case GGML_TYPE_IQ4_XS:
-	case GGML_TYPE_Q4_0_R8:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_IQ4_NL_R8:
-	case GGML_TYPE_Q4_K_R8:
-	case GGML_TYPE_Q5_K_R8:
-	case GGML_TYPE_Q6_K_R8:
+	case GGML_TYPE_Q4_0_REPACKED:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_IQ4_NL_REPACKED:
+	case GGML_TYPE_Q4_K_REPACKED:
+	case GGML_TYPE_Q5_K_REPACKED:
+	case GGML_TYPE_Q6_K_REPACKED:
 		return true;
 	default:
 		return false;
 	}
 }
 
-static int gl_type_is_r8(uint32_t type) {
-	return type == GGML_TYPE_Q4_0_R8 || type == GGML_TYPE_Q8_0_R8 || type == GGML_TYPE_IQ4_NL_R8 ||
-		   type == GGML_TYPE_Q4_K_R8 || type == GGML_TYPE_Q5_K_R8 || type == GGML_TYPE_Q6_K_R8;
+static int gl_type_is_repacked(uint32_t type) {
+	return type == GGML_TYPE_Q4_0_REPACKED || type == GGML_TYPE_Q8_0_REPACKED ||
+		   type == GGML_TYPE_IQ4_NL_REPACKED || type == GGML_TYPE_Q4_K_REPACKED ||
+		   type == GGML_TYPE_Q5_K_REPACKED || type == GGML_TYPE_Q6_K_REPACKED;
 }
 
 static status_code gl_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
 	uint64_t d1 = (desc->n_dims == 1) ? 1 : desc->dims[1];
-	if (gl_type_is_r8(desc->type))
+	if (gl_type_is_repacked(desc->type))
 		d1 = (d1 + 7) & ~(uint64_t)7;
 	size_t size = ggml_row_size(desc->type, desc->dims[0]) * (size_t)d1;
 
@@ -1544,13 +1555,13 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_IQ4_XS:
 		pipe = &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT];
 		break;
-	case GGML_TYPE_Q4_0_R8:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_IQ4_NL_R8:
-	case GGML_TYPE_IQ3_S_RE8:
-	case GGML_TYPE_Q4_K_R8:
-	case GGML_TYPE_Q5_K_R8:
-	case GGML_TYPE_Q6_K_R8:
+	case GGML_TYPE_Q4_0_REPACKED:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_IQ4_NL_REPACKED:
+	case GGML_TYPE_IQ3_S_REPACKED:
+	case GGML_TYPE_Q4_K_REPACKED:
+	case GGML_TYPE_Q5_K_REPACKED:
+	case GGML_TYPE_Q6_K_REPACKED:
 		return ERR_UNSUPPORTED;
 	default: {
 		gl_buf *eb = as_glbuf(tok_embd);
@@ -2300,17 +2311,17 @@ static status_code gl_repack_plan(backend *self, uint32_t type, uint64_t d0, uin
 	uint32_t	   re_type	  = 0;
 	if (d1 % rows_group == 0) {
 		if (type == GGML_TYPE_Q4_0 && d0 % 32 == 0)
-			re_type = GGML_TYPE_Q4_0_R8;
+			re_type = GGML_TYPE_Q4_0_REPACKED;
 		else if (type == GGML_TYPE_Q8_0 && d0 % 32 == 0)
-			re_type = GGML_TYPE_Q8_0_R8;
+			re_type = GGML_TYPE_Q8_0_REPACKED;
 		else if (type == GGML_TYPE_IQ4_NL && d0 % 32 == 0)
-			re_type = GGML_TYPE_IQ4_NL_R8;
+			re_type = GGML_TYPE_IQ4_NL_REPACKED;
 		else if (type == GGML_TYPE_Q4_K && d0 % 256 == 0)
-			re_type = GGML_TYPE_Q4_K_R8;
+			re_type = GGML_TYPE_Q4_K_REPACKED;
 		else if (type == GGML_TYPE_Q5_K && d0 % 256 == 0)
-			re_type = GGML_TYPE_Q5_K_R8;
+			re_type = GGML_TYPE_Q5_K_REPACKED;
 		else if (type == GGML_TYPE_Q6_K && d0 % 256 == 0)
-			re_type = GGML_TYPE_Q6_K_R8;
+			re_type = GGML_TYPE_Q6_K_REPACKED;
 	}
 	if (!re_type)
 		return ERR_UNSUPPORTED;
@@ -2465,7 +2476,7 @@ static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		if (!(p->pipes[i].flags & GL_PIPE_F_TILED) || p->pipes[i].src != pipe->src)
 			continue;
-		const uint32_t variant_mask = GL_PIPE_F_R8 | GL_PIPE_F_R8_LANE | GL_PIPE_F_BF16;
+		const uint32_t variant_mask = GL_PIPE_F_REPACKED | GL_PIPE_F_REPACKED_LANE | GL_PIPE_F_BF16;
 		if ((p->pipes[i].flags & variant_mask) != (pipe->flags & variant_mask))
 			continue;
 		return &p->pipes[i];

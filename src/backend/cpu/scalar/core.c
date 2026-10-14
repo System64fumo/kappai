@@ -93,7 +93,7 @@ typedef struct {
 
 #define MATMUL_KERNEL(wt, fn, q8) [(wt)] = {(qonly_fn)fn, wt, q8}
 
-static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_R8 + 1] = {
+static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_REPACKED + 1] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_0, matmul_q4_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL, matmul_iq4_nl_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q8_0, matmul_q8_0_q8_qonly_f32, 1),
@@ -104,18 +104,17 @@ static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_R8 + 1] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_K, matmul_q4_k_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_Q5_K, matmul_q5_k_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ3_S, matmul_iq3_s_q8_k_qonly_f32, 3),
-	MATMUL_KERNEL(GGML_TYPE_IQ3_S_RE, matmul_iq3_s_re_q8_k_qonly_f32, 3),
-	MATMUL_KERNEL(GGML_TYPE_IQ3_S_RE8, matmul_iq3_s_re8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_IQ3_S_REPACKED, matmul_iq3_s_repacked_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ2_S, matmul_iq2_s_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ2_XXS, matmul_iq2_xxs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ3_XXS, matmul_iq3_xxs_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_XS, matmul_iq4_xs_q8_k_qonly_f32, 3),
-	MATMUL_KERNEL(GGML_TYPE_Q8_0_R8, matmul_q8_0_r8_q8_qonly_f32, 1),
-	MATMUL_KERNEL(GGML_TYPE_Q4_0_R8, matmul_q4_0_r8_q8_qonly_f32, 1),
-	MATMUL_KERNEL(GGML_TYPE_IQ4_NL_R8, matmul_iq4_nl_r8_q8_qonly_f32, 1),
-	MATMUL_KERNEL(GGML_TYPE_Q4_K_R8, matmul_q4_k_r8_q8_k_qonly_f32, 3),
-	MATMUL_KERNEL(GGML_TYPE_Q5_K_R8, matmul_q5_k_r8_q8_k_qonly_f32, 3),
-	MATMUL_KERNEL(GGML_TYPE_Q6_K_R8, matmul_q6_k_r8_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q8_0_REPACKED, matmul_q8_0_repacked_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q4_0_REPACKED, matmul_q4_0_repacked_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_IQ4_NL_REPACKED, matmul_iq4_nl_repacked_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q4_K_REPACKED, matmul_q4_k_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q5_K_REPACKED, matmul_q5_k_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q6_K_REPACKED, matmul_q6_k_repacked_q8_k_qonly_f32, 3),
 };
 
 static inline quant_scratch *cpu_scratch_for_tid(cpu_priv *p, int tid) {
@@ -681,22 +680,22 @@ static void cpu_matmul_groups_worker(int begin, int end, int tid, void *ctx) {
 	cpu_matmul_rows_worker(row_begin, row_end, tid, ctx);
 }
 
-#define GROUPED_KERNEL(wt, rows, fn) [(wt) - GGML_TYPE_Q8_0_R8] = {wt, rows, fn}
+#define GROUPED_KERNEL(wt, rows, fn) [(wt) - GGML_TYPE_Q8_0_REPACKED] = {wt, rows, fn}
 
 static const grouped_matmul_kernel k_grouped_by_type[] = {
-	GROUPED_KERNEL(GGML_TYPE_Q8_0_R8, Q8_0_R8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_Q4_0_R8, Q4_0_R8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_IQ3_S_RE8, IQ3_S_RE8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_IQ4_NL_R8, IQ4_NL_R8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_Q4_K_R8, Q4_K_R8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_Q5_K_R8, Q5_K_R8_ROWS, cpu_matmul_groups_worker),
-	GROUPED_KERNEL(GGML_TYPE_Q6_K_R8, Q6_K_R8_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q8_0_REPACKED, Q8_0_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q4_0_REPACKED, Q4_0_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ3_S_REPACKED, IQ3_S_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ4_NL_REPACKED, IQ4_NL_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q4_K_REPACKED, Q4_K_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q5_K_REPACKED, Q5_K_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q6_K_REPACKED, Q6_K_REPACKED_ROWS, cpu_matmul_groups_worker),
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
-	if (w_type < GGML_TYPE_Q8_0_R8)
+	if (w_type < GGML_TYPE_Q8_0_REPACKED)
 		return NULL;
-	size_t idx = (size_t)w_type - GGML_TYPE_Q8_0_R8;
+	size_t idx = (size_t)w_type - GGML_TYPE_Q8_0_REPACKED;
 	if (idx >= ARRAY_LEN(k_grouped_by_type))
 		return NULL;
 	return &k_grouped_by_type[idx];
@@ -720,13 +719,13 @@ static void cpu_matmul_dispatch_rows(tpool *pool, uint32_t w_type, int n_rows, v
 static size_t cpu_matmul_w_row_stride(uint32_t w_type, int k) {
 	switch (w_type) {
 	case GGML_TYPE_Q4_0:
-	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q4_0_REPACKED:
 		return (size_t)(k / 32) * sizeof(q4_0_block);
 	case GGML_TYPE_IQ4_NL:
-	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ4_NL_REPACKED:
 		return (size_t)(k / 32) * sizeof(iq4_nl_block);
 	case GGML_TYPE_Q8_0:
-	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_Q8_0_REPACKED:
 		return (size_t)(k / 32) * sizeof(q8_0_block);
 	case GGML_TYPE_Q4_1:
 		return (size_t)(k / 32) * sizeof(q4_1_block);
@@ -2914,20 +2913,20 @@ __attribute__((weak)) status_code cpu_repack_plan(backend *self, uint32_t type, 
 												  uint64_t d1, uint32_t *re_type_out) {
 	(void)self;
 	uint32_t re_type = 0;
-	if (type == GGML_TYPE_IQ3_S && (d0 % 256) == 0 && (d1 % IQ3_S_RE8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ3_S_RE8;
-	} else if (type == GGML_TYPE_IQ4_NL && (d0 % 32) == 0 && (d1 % IQ4_NL_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_IQ4_NL_R8;
-	} else if (type == GGML_TYPE_Q8_0 && (d0 % 32) == 0 && (d1 % Q8_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q8_0_R8;
-	} else if (type == GGML_TYPE_Q4_0 && (d0 % 32) == 0 && (d1 % Q4_0_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_0_R8;
-	} else if (type == GGML_TYPE_Q4_K && (d0 % 256) == 0 && (d1 % Q4_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q4_K_R8;
-	} else if (type == GGML_TYPE_Q5_K && (d0 % 256) == 0 && (d1 % Q5_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q5_K_R8;
-	} else if (type == GGML_TYPE_Q6_K && (d0 % 256) == 0 && (d1 % Q6_K_R8_ROWS) == 0) {
-		re_type = GGML_TYPE_Q6_K_R8;
+	if (type == GGML_TYPE_IQ3_S && (d0 % 256) == 0 && (d1 % IQ3_S_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ3_S_REPACKED;
+	} else if (type == GGML_TYPE_IQ4_NL && (d0 % 32) == 0 && (d1 % IQ4_NL_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_IQ4_NL_REPACKED;
+	} else if (type == GGML_TYPE_Q8_0 && (d0 % 32) == 0 && (d1 % Q8_0_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_Q8_0_REPACKED;
+	} else if (type == GGML_TYPE_Q4_0 && (d0 % 32) == 0 && (d1 % Q4_0_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_0_REPACKED;
+	} else if (type == GGML_TYPE_Q4_K && (d0 % 256) == 0 && (d1 % Q4_K_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_Q4_K_REPACKED;
+	} else if (type == GGML_TYPE_Q5_K && (d0 % 256) == 0 && (d1 % Q5_K_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_Q5_K_REPACKED;
+	} else if (type == GGML_TYPE_Q6_K && (d0 % 256) == 0 && (d1 % Q6_K_REPACKED_ROWS) == 0) {
+		re_type = GGML_TYPE_Q6_K_REPACKED;
 	}
 	if (!re_type)
 		return ERR_UNSUPPORTED;
@@ -2939,26 +2938,26 @@ __attribute__((weak)) status_code cpu_repack_weight(backend *self, uint32_t type
 													void *dst, int n_rows, int k) {
 	cpu_repack_job job = {.src = src, .dst = dst, .k = k};
 	if (type == GGML_TYPE_Q8_0) {
-		job.rows_per_group = Q8_0_R8_ROWS;
-		job.repack_fn	   = repack_q8_0_to_q8_0_r8_rows;
+		job.rows_per_group = Q8_0_REPACKED_ROWS;
+		job.repack_fn	   = repack_q8_0_to_q8_0_repacked_rows;
 	} else if (type == GGML_TYPE_Q4_0) {
-		job.rows_per_group = Q4_0_R8_ROWS;
-		job.repack_fn	   = repack_q4_0_to_q4_0_r8_rows;
+		job.rows_per_group = Q4_0_REPACKED_ROWS;
+		job.repack_fn	   = repack_q4_0_to_q4_0_repacked_rows;
 	} else if (type == GGML_TYPE_IQ3_S) {
-		job.rows_per_group = IQ3_S_RE8_ROWS;
-		job.repack_fn	   = repack_iq3_s_to_iq3_s_re8_rows;
+		job.rows_per_group = IQ3_S_REPACKED_ROWS;
+		job.repack_fn	   = repack_iq3_s_to_iq3_s_repacked_rows;
 	} else if (type == GGML_TYPE_IQ4_NL) {
-		job.rows_per_group = IQ4_NL_R8_ROWS;
-		job.repack_fn	   = repack_iq4_nl_to_iq4_nl_r8_rows;
+		job.rows_per_group = IQ4_NL_REPACKED_ROWS;
+		job.repack_fn	   = repack_iq4_nl_to_iq4_nl_repacked_rows;
 	} else if (type == GGML_TYPE_Q4_K) {
-		job.rows_per_group = Q4_K_R8_ROWS;
-		job.repack_fn	   = repack_q4_k_to_q4_k_r8_rows;
+		job.rows_per_group = Q4_K_REPACKED_ROWS;
+		job.repack_fn	   = repack_q4_k_to_q4_k_repacked_rows;
 	} else if (type == GGML_TYPE_Q5_K) {
-		job.rows_per_group = Q5_K_R8_ROWS;
-		job.repack_fn	   = repack_q5_k_to_q5_k_r8_rows;
+		job.rows_per_group = Q5_K_REPACKED_ROWS;
+		job.repack_fn	   = repack_q5_k_to_q5_k_repacked_rows;
 	} else if (type == GGML_TYPE_Q6_K) {
-		job.rows_per_group = Q6_K_R8_ROWS;
-		job.repack_fn	   = repack_q6_k_to_q6_k_r8_rows;
+		job.rows_per_group = Q6_K_REPACKED_ROWS;
+		job.repack_fn	   = repack_q6_k_to_q6_k_repacked_rows;
 	} else {
 		job.rows_per_group = 1;
 		job.repack_fn	   = repack_iq4_nl_to_q8_0_rows;

@@ -6,13 +6,13 @@ precision highp int;
 #define WG 32
 #endif
 
-#ifdef R8
+#ifdef REPACKED
 layout(local_size_x = 8) in;
 #else
 layout(local_size_x = WG) in;
 #endif
 
-#ifdef R8
+#ifdef REPACKED
 layout(std430, binding = 0) readonly buffer WBuf {
 	uvec4 w[];
 };
@@ -37,7 +37,7 @@ layout(location = 9) uniform int u_m;
 layout(location = 10) uniform int u_x_stride;
 layout(location = 11) uniform int u_wg_base;
 
-#ifndef R8
+#ifndef REPACKED
 uint g_mi;
 #endif
 
@@ -45,13 +45,13 @@ uint g_mi;
 #define MT 1
 #endif
 
-#ifdef R8
+#ifdef REPACKED
 #define ROWS 8
 #else
 #define ROWS 4
 #endif
 
-#ifndef R8
+#ifndef REPACKED
 shared float s_acc[ROWS][WG + 1];
 
 float reduce_row(uint i) {
@@ -73,7 +73,7 @@ int dot4_s8(uint qw, uint xw) {
 	return s;
 }
 
-#ifndef R8
+#ifndef REPACKED
 uint sh2(uint a, uint b, uint odd) {
 	return odd != 0u ? b : ((a >> 16u) | (b << 16u));
 }
@@ -103,7 +103,7 @@ void load_block(uint rowg, int bi, out float wd, out uint q[8]) {
 }
 #endif
 
-#ifdef R8
+#ifdef REPACKED
 void main(void) {
 	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	   = uint(max(u_m, 1));

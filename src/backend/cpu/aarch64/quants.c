@@ -672,9 +672,9 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	switch (w_type) {
 	case GGML_TYPE_Q4_0:
 	case GGML_TYPE_Q8_0:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_Q4_0_R8:
-	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_Q4_0_REPACKED:
+	case GGML_TYPE_IQ4_NL_REPACKED:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_Q6_K:
@@ -683,8 +683,7 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 	case GGML_TYPE_Q5_1:
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE:
-	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_IQ3_S_REPACKED:
 	case GGML_TYPE_IQ2_S:
 	case GGML_TYPE_IQ2_XXS:
 	case GGML_TYPE_IQ3_XXS:
@@ -699,14 +698,14 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 		case GGML_TYPE_Q8_0:
 			matmul_q8_0_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_Q8_0_R8:
-			matmul_q8_0_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_Q8_0_REPACKED:
+			matmul_q8_0_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_Q4_0_R8:
-			matmul_q4_0_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_Q4_0_REPACKED:
+			matmul_q4_0_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_IQ4_NL_R8:
-			matmul_iq4_nl_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_IQ4_NL_REPACKED:
+			matmul_iq4_nl_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q4_1:
 			matmul_q4_1_q8_f32(w, x, y, n, k, &qs);
@@ -732,11 +731,9 @@ void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y
 		case GGML_TYPE_IQ3_S:
 			matmul_iq3_s_q8_k_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_IQ3_S_RE:
-			matmul_iq3_s_re_q8_k_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_IQ3_S_RE8:
-			matmul_iq3_s_re8_q8_k_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_IQ3_S_REPACKED:
+			matmul_iq3_s_repacked_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_IQ2_S:
 			matmul_iq2_s_q8_k_f32(w, x, y, n, k, &qs);
@@ -5419,13 +5416,13 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 #undef NR
 
-static inline void q4_0_r8_block_accum(const uint8_t *blk, float d_xq, const int8_t *xq_qs,
-									   float32x4_t *acc_lo, float32x4_t *acc_hi) {
+static inline void q4_0_repacked_block_accum(const uint8_t *blk, float d_xq, const int8_t *xq_qs,
+											 float32x4_t *acc_lo, float32x4_t *acc_hi) {
 	const int8x16_t xl = vld1q_s8(xq_qs);
 	const int8x16_t xh = vld1q_s8(xq_qs + 16);
 
 	const uint16_t *d_ptr  = (const uint16_t *)blk;
-	const uint8_t  *qs_ptr = blk + Q4_0_R8_ROWS * sizeof(uint16_t);
+	const uint8_t  *qs_ptr = blk + Q4_0_REPACKED_ROWS * sizeof(uint16_t);
 
 	int32x4_t acc[8];
 	for (int r = 0; r < 8; r++) {
@@ -5470,8 +5467,8 @@ static inline void q4_0_r8_block_accum(const uint8_t *blk, float d_xq, const int
 	*acc_hi = vfmaq_f32(*acc_hi, vmulq_f32(d_w1, d_xq_v), vcvtq_f32_s32(sumi_hi));
 }
 
-static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int n, int k) {
+static void matmul_q4_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 32;
 	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(q4_0_block);
 	const uint8_t *Wb			  = w;
@@ -5485,19 +5482,19 @@ static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 
 		int bi = 0;
 		for (; bi + 1 < blocks_per_row; bi += 2) {
-			const uint8_t *blk0 = group + (size_t)bi * Q4_0_R8_GROUP_BYTES;
-			const uint8_t *blk1 = blk0 + Q4_0_R8_GROUP_BYTES;
+			const uint8_t *blk0 = group + (size_t)bi * Q4_0_REPACKED_GROUP_BYTES;
+			const uint8_t *blk1 = blk0 + Q4_0_REPACKED_GROUP_BYTES;
 
-			PREFETCH(blk0 + 2 * Q4_0_R8_GROUP_BYTES);
+			PREFETCH(blk0 + 2 * Q4_0_REPACKED_GROUP_BYTES);
 
-			q4_0_r8_block_accum(blk0, f16_to_f32_fast(xq[bi].d), xq[bi].qs, &acc_lo, &acc_hi);
-			q4_0_r8_block_accum(blk1, f16_to_f32_fast(xq[bi + 1].d), xq[bi + 1].qs, &acc_lo,
-								&acc_hi);
+			q4_0_repacked_block_accum(blk0, f16_to_f32_fast(xq[bi].d), xq[bi].qs, &acc_lo, &acc_hi);
+			q4_0_repacked_block_accum(blk1, f16_to_f32_fast(xq[bi + 1].d), xq[bi + 1].qs, &acc_lo,
+									  &acc_hi);
 		}
 		for (; bi < blocks_per_row; bi++) {
-			const uint8_t *blk = group + (size_t)bi * Q4_0_R8_GROUP_BYTES;
+			const uint8_t *blk = group + (size_t)bi * Q4_0_REPACKED_GROUP_BYTES;
 
-			q4_0_r8_block_accum(blk, f16_to_f32_fast(xq[bi].d), xq[bi].qs, &acc_lo, &acc_hi);
+			q4_0_repacked_block_accum(blk, f16_to_f32_fast(xq[bi].d), xq[bi].qs, &acc_lo, &acc_hi);
 		}
 		vst1q_f32(y + i, acc_lo);
 		vst1q_f32(y + i + 4, acc_hi);
@@ -5505,9 +5502,9 @@ static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
-											 size_t		 xq_row_stride_blocks, float *restrict y,
-											 int y_row_stride, int n, int k, int m) {
+static void matmul_q4_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
+												   size_t xq_row_stride_blocks, float *restrict y,
+												   int y_row_stride, int n, int k, int m) {
 	const int	   blocks_per_row = k / 32;
 	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(q4_0_block);
 	const uint8_t *Wb			  = w;
@@ -5528,9 +5525,9 @@ static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * Q4_0_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * Q4_0_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + Q4_0_R8_GROUP_BYTES);
+				PREFETCH(blk + Q4_0_REPACKED_GROUP_BYTES);
 
 				int8x16_t xq_lo[I8MM_NR];
 				int8x16_t xq_hi[I8MM_NR];
@@ -5552,7 +5549,7 @@ static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 				}
 
 				const uint16_t *d_ptr  = (const uint16_t *)blk;
-				const uint8_t  *qs_ptr = blk + Q4_0_R8_ROWS * sizeof(uint16_t);
+				const uint8_t  *qs_ptr = blk + Q4_0_REPACKED_ROWS * sizeof(uint16_t);
 
 				for (int p = 0; p < MR / 2; p++) {
 					const float dwa = f16_to_f32_fast(d_ptr[2 * p]);
@@ -5606,8 +5603,8 @@ static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 		}
 
 		for (; t < m; t++) {
-			matmul_q4_0_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_q4_0_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+												  y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
@@ -5615,21 +5612,21 @@ static void matmul_q4_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 
 #define NR 4
 
-void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								 int n, int k, int m) {
+void matmul_q4_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % Q4_0_R8_ROWS);
+		int n_full = n - (n % Q4_0_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_q4_0_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-													   y + ((size_t)t * y_row_stride), n_full, n,
-													   k);
+				matmul_q4_0_repacked_q8_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-	matmul_q4_0_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_q4_0_repacked_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
 #endif
 	const int	   blocks_per_row = k / 32;
@@ -5651,9 +5648,9 @@ void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * Q4_0_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * Q4_0_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + Q4_0_R8_GROUP_BYTES);
+				PREFETCH(blk + Q4_0_REPACKED_GROUP_BYTES);
 
 				float	  xd[NR];
 				int8x16_t xq_lo[NR];
@@ -5666,7 +5663,7 @@ void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				const float32x4_t xd_vec = vld1q_f32(xd);
 
 				const uint16_t	 *d_ptr	 = (const uint16_t *)blk;
-				const uint8_t	 *qs_ptr = blk + Q4_0_R8_ROWS * sizeof(uint16_t);
+				const uint8_t	 *qs_ptr = blk + Q4_0_REPACKED_ROWS * sizeof(uint16_t);
 				const uint16x8_t  dw_all = vld1q_u16(d_ptr);
 				const float32x4_t dw_vec0 =
 					vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(dw_all)));
@@ -5691,16 +5688,16 @@ void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		}
 
 		for (; t < m; t++) {
-			matmul_q4_0_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_q4_0_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+												  y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
 
 #undef NR
 
-static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int n, int k) {
+static void matmul_q8_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 32;
 	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(q8_0_block);
 	const uint8_t *Wb			  = w;
@@ -5714,10 +5711,10 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 
 		int bi = 0;
 		for (; bi + 1 < blocks_per_row; bi += 2) {
-			const uint8_t *blk0 = group + (size_t)bi * Q8_0_R8_GROUP_BYTES;
-			const uint8_t *blk1 = group + (size_t)(bi + 1) * Q8_0_R8_GROUP_BYTES;
+			const uint8_t *blk0 = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
+			const uint8_t *blk1 = group + (size_t)(bi + 1) * Q8_0_REPACKED_GROUP_BYTES;
 
-			PREFETCH(group + (size_t)(bi + 2) * Q8_0_R8_GROUP_BYTES);
+			PREFETCH(group + (size_t)(bi + 2) * Q8_0_REPACKED_GROUP_BYTES);
 
 			const float		d_xq0 = f16_to_f32_fast(xq[bi].d);
 			const float		d_xq1 = f16_to_f32_fast(xq[bi + 1].d);
@@ -5728,8 +5725,8 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 
 			const uint16_t *d_ptr0 = (const uint16_t *)blk0;
 			const uint16_t *d_ptr1 = (const uint16_t *)blk1;
-			const int8_t   *qs0	   = (const int8_t *)(blk0 + Q8_0_R8_ROWS * sizeof(uint16_t));
-			const int8_t   *qs1	   = (const int8_t *)(blk1 + Q8_0_R8_ROWS * sizeof(uint16_t));
+			const int8_t   *qs0	   = (const int8_t *)(blk0 + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
+			const int8_t   *qs1	   = (const int8_t *)(blk1 + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
 			int32x4_t p0a =
 				dotprod2_s8(vld1q_s8(qs0 + 0 * 32), xl0, vld1q_s8(qs0 + 0 * 32 + 16), xh0);
@@ -5807,14 +5804,14 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 		}
 
 		for (; bi < blocks_per_row; bi++) {
-			const uint8_t *blk = group + (size_t)bi * Q8_0_R8_GROUP_BYTES;
+			const uint8_t *blk = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
 
 			const float		d_xq = f16_to_f32_fast(xq[bi].d);
 			const int8x16_t xl	 = vld1q_s8(xq[bi].qs);
 			const int8x16_t xh	 = vld1q_s8(xq[bi].qs + 16);
 
 			const uint16_t *d_ptr  = (const uint16_t *)blk;
-			const int8_t   *qs_ptr = (const int8_t *)(blk + Q8_0_R8_ROWS * sizeof(uint16_t));
+			const int8_t   *qs_ptr = (const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
 			int32x4_t p0 =
 				dotprod2_s8(vld1q_s8(qs_ptr + 0 * 32), xl, vld1q_s8(qs_ptr + 0 * 32 + 16), xh);
@@ -5864,9 +5861,9 @@ static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *res
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
-											 size_t		 xq_row_stride_blocks, float *restrict y,
-											 int y_row_stride, int n, int k, int m) {
+static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
+												   size_t xq_row_stride_blocks, float *restrict y,
+												   int y_row_stride, int n, int k, int m) {
 	const int	   blocks_per_row = k / 32;
 	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(q8_0_block);
 	const uint8_t *Wb			  = w;
@@ -5887,9 +5884,9 @@ static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * Q8_0_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + Q8_0_R8_GROUP_BYTES);
+				PREFETCH(blk + Q8_0_REPACKED_GROUP_BYTES);
 
 				int8x16_t xq_lo[I8MM_NR];
 				int8x16_t xq_hi[I8MM_NR];
@@ -5910,8 +5907,9 @@ static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 					bvec[cp][3]	 = vcombine_s8(vget_high_s8(xq_hi[ca]), vget_high_s8(xq_hi[cb]));
 				}
 
-				const uint16_t *d_ptr  = (const uint16_t *)blk;
-				const int8_t   *qs_ptr = (const int8_t *)(blk + Q8_0_R8_ROWS * sizeof(uint16_t));
+				const uint16_t *d_ptr = (const uint16_t *)blk;
+				const int8_t   *qs_ptr =
+					(const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
 				for (int p = 0; p < MR / 2; p++) {
 					const float dwa = f16_to_f32_fast(d_ptr[2 * p]);
@@ -5957,8 +5955,8 @@ static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 		}
 
 		for (; t < m; t++) {
-			matmul_q8_0_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_q8_0_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+												  y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
@@ -5966,21 +5964,21 @@ static void matmul_q8_0_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *re
 
 #define NR 4
 
-void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								 int n, int k, int m) {
+void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % Q8_0_R8_ROWS);
+		int n_full = n - (n % Q8_0_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_q8_0_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-													   y + ((size_t)t * y_row_stride), n_full, n,
-													   k);
+				matmul_q8_0_repacked_q8_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-	matmul_q8_0_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_q8_0_repacked_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
 #endif
 	const int	   blocks_per_row = k / 32;
@@ -6002,9 +6000,9 @@ void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * Q8_0_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + Q8_0_R8_GROUP_BYTES);
+				PREFETCH(blk + Q8_0_REPACKED_GROUP_BYTES);
 
 				float	  xd[NR];
 				int8x16_t xq_lo[NR];
@@ -6016,8 +6014,9 @@ void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				}
 				const float32x4_t xd_vec = vld1q_f32(xd);
 
-				const uint16_t *d_ptr  = (const uint16_t *)blk;
-				const int8_t   *qs_ptr = (const int8_t *)(blk + Q8_0_R8_ROWS * sizeof(uint16_t));
+				const uint16_t *d_ptr = (const uint16_t *)blk;
+				const int8_t   *qs_ptr =
+					(const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
 				for (int r = 0; r < MR; r++) {
 					const float		d_w = f16_to_f32_fast(d_ptr[r]);
@@ -6034,24 +6033,26 @@ void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		}
 
 		for (; t < m; t++) {
-			matmul_q8_0_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_q8_0_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+												  y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
 
 #undef NR
 
-#define IQ4_NL_R8_GROUP_BYTES (IQ4_NL_R8_ROWS * sizeof(uint16_t) + IQ4_NL_R8_ROWS * 16)
+#define IQ4_NL_REPACKED_GROUP_BYTES                                                                \
+	(IQ4_NL_REPACKED_ROWS * sizeof(uint16_t) + IQ4_NL_REPACKED_ROWS * 16)
 
-static inline void iq4_nl_r8_block_accum(const uint8_t *blk, const uint8x16_t kvalues_u,
-										 const uint8x16_t lo_mask, float d_xq, const int8_t *xq_qs,
-										 float32x4_t *acc_lo, float32x4_t *acc_hi) {
+static inline void iq4_nl_repacked_block_accum(const uint8_t *blk, const uint8x16_t kvalues_u,
+											   const uint8x16_t lo_mask, float d_xq,
+											   const int8_t *xq_qs, float32x4_t *acc_lo,
+											   float32x4_t *acc_hi) {
 	const int8x16_t xl = vld1q_s8(xq_qs);
 	const int8x16_t xh = vld1q_s8(xq_qs + 16);
 
 	const uint16_t *d_ptr  = (const uint16_t *)blk;
-	const uint8_t  *qs_ptr = blk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+	const uint8_t  *qs_ptr = blk + IQ4_NL_REPACKED_ROWS * sizeof(uint16_t);
 
 	int32x4_t acc[8];
 	for (int r = 0; r < 8; r++) {
@@ -6091,8 +6092,8 @@ static inline void iq4_nl_r8_block_accum(const uint8_t *blk, const uint8x16_t kv
 	*acc_hi = vfmaq_f32(*acc_hi, vmulq_f32(d_w1, d_xq_v), vcvtq_f32_s32(sumi_hi));
 }
 
-static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											  float *restrict y, int n, int k) {
+static void matmul_iq4_nl_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+													float *restrict y, int n, int k) {
 	const int		 blocks_per_row = k / 32;
 	const size_t	 row_stride		= (size_t)blocks_per_row * sizeof(iq4_nl_block);
 	const uint8_t	*Wb				= w;
@@ -6108,21 +6109,21 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *r
 
 		int bi = 0;
 		for (; bi + 1 < blocks_per_row; bi += 2) {
-			const uint8_t *blk0 = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
-			const uint8_t *blk1 = blk0 + IQ4_NL_R8_GROUP_BYTES;
+			const uint8_t *blk0 = group + (size_t)bi * IQ4_NL_REPACKED_GROUP_BYTES;
+			const uint8_t *blk1 = blk0 + IQ4_NL_REPACKED_GROUP_BYTES;
 
-			PREFETCH(blk0 + 2 * IQ4_NL_R8_GROUP_BYTES);
+			PREFETCH(blk0 + 2 * IQ4_NL_REPACKED_GROUP_BYTES);
 
-			iq4_nl_r8_block_accum(blk0, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi].d), xq[bi].qs,
-								  &acc_lo, &acc_hi);
-			iq4_nl_r8_block_accum(blk1, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi + 1].d),
-								  xq[bi + 1].qs, &acc_lo, &acc_hi);
+			iq4_nl_repacked_block_accum(blk0, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi].d),
+										xq[bi].qs, &acc_lo, &acc_hi);
+			iq4_nl_repacked_block_accum(blk1, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi + 1].d),
+										xq[bi + 1].qs, &acc_lo, &acc_hi);
 		}
 		for (; bi < blocks_per_row; bi++) {
-			const uint8_t *blk = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
+			const uint8_t *blk = group + (size_t)bi * IQ4_NL_REPACKED_GROUP_BYTES;
 
-			iq4_nl_r8_block_accum(blk, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi].d), xq[bi].qs,
-								  &acc_lo, &acc_hi);
+			iq4_nl_repacked_block_accum(blk, kvalues_u, lo_mask, f16_to_f32_fast(xq[bi].d),
+										xq[bi].qs, &acc_lo, &acc_hi);
 		}
 		vst1q_f32(y + i, acc_lo);
 		vst1q_f32(y + i + 4, acc_hi);
@@ -6130,9 +6131,9 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *r
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
-											   size_t	   xq_row_stride_blocks, float *restrict y,
-											   int y_row_stride, int n, int k, int m) {
+static void matmul_iq4_nl_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
+													 size_t xq_row_stride_blocks, float *restrict y,
+													 int y_row_stride, int n, int k, int m) {
 	const int		 blocks_per_row = k / 32;
 	const size_t	 row_stride		= (size_t)blocks_per_row * sizeof(iq4_nl_block);
 	const uint8_t	*Wb				= w;
@@ -6155,9 +6156,9 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * IQ4_NL_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + IQ4_NL_R8_GROUP_BYTES);
+				PREFETCH(blk + IQ4_NL_REPACKED_GROUP_BYTES);
 
 				int8x16_t xq_lo[I8MM_NR];
 				int8x16_t xq_hi[I8MM_NR];
@@ -6179,7 +6180,7 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *
 				}
 
 				const uint16_t *d_ptr  = (const uint16_t *)blk;
-				const uint8_t  *qs_ptr = blk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+				const uint8_t  *qs_ptr = blk + IQ4_NL_REPACKED_ROWS * sizeof(uint16_t);
 
 				for (int p = 0; p < MR / 2; p++) {
 					const float dwa = f16_to_f32_fast(d_ptr[2 * p]);
@@ -6231,8 +6232,8 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *
 		}
 
 		for (; t < m; t++) {
-			matmul_iq4_nl_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											  y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_iq4_nl_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+													y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
@@ -6240,21 +6241,21 @@ static void matmul_iq4_nl_r8_q8_qonly_f32_i8mm(const void *w, const q8_0_block *
 
 #define NR 4
 
-void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m) {
+void matmul_iq4_nl_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % IQ4_NL_R8_ROWS);
+		int n_full = n - (n % IQ4_NL_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_iq4_nl_r8_q8_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-														 y + ((size_t)t * y_row_stride), n_full, n,
-														 k);
+				matmul_iq4_nl_repacked_q8_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-	matmul_iq4_nl_r8_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_iq4_nl_repacked_q8_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 	return;
 #endif
 	const int		 blocks_per_row = k / 32;
@@ -6278,9 +6279,9 @@ void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk = group + (size_t)bi * IQ4_NL_R8_GROUP_BYTES;
+				const uint8_t *blk = group + (size_t)bi * IQ4_NL_REPACKED_GROUP_BYTES;
 
-				PREFETCH(blk + IQ4_NL_R8_GROUP_BYTES);
+				PREFETCH(blk + IQ4_NL_REPACKED_GROUP_BYTES);
 
 				float	  xd[NR];
 				int8x16_t xq_lo[NR];
@@ -6293,7 +6294,7 @@ void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 				const float32x4_t xd_vec = vld1q_f32(xd);
 
 				const uint16_t *d_ptr  = (const uint16_t *)blk;
-				const uint8_t  *qs_ptr = blk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+				const uint8_t  *qs_ptr = blk + IQ4_NL_REPACKED_ROWS * sizeof(uint16_t);
 
 				for (int r = 0; r < MR; r++) {
 					const float		 d_w = f16_to_f32_fast(d_ptr[r]);
@@ -6313,16 +6314,16 @@ void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 		}
 
 		for (; t < m; t++) {
-			matmul_iq4_nl_r8_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-											  y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_iq4_nl_repacked_q8_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+													y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 }
 
 #undef NR
 
-static inline void iq3s_re_unpack_group(const uint8_t *idx_ptr, uint8x16_t tbl, int8x16_t *out0,
-										int8x16_t *out1) {
+static inline void iq3_s_repacked_unpack_group(const uint8_t *idx_ptr, uint8x16_t tbl,
+											   int8x16_t *out0, int8x16_t *out1) {
 	uint8x16_t packed = vld1q_u8(idx_ptr);
 	uint8x16_t lo	  = vandq_u8(packed, vdupq_n_u8(0x0F));
 	uint8x16_t hi	  = vshrq_n_u8(packed, 4);
@@ -6331,616 +6332,18 @@ static inline void iq3s_re_unpack_group(const uint8_t *idx_ptr, uint8x16_t tbl, 
 	*out1 = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, hi));
 }
 
-static void matmul_iq3_s_re_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-											   float *restrict y, int n, int k) {
+#define IQ3_S_REPACKED_OFF_D 0
+
+#define IQ3_S_REPACKED_OFF_SCALES (IQ3_S_REPACKED_ROWS * sizeof(uint16_t))
+
+#define IQ3_S_REPACKED_OFF_IDX (IQ3_S_REPACKED_OFF_SCALES + IQ3_S_REPACKED_ROWS * 4)
+
+static void matmul_iq3_s_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+													 float *restrict y, int n, int k) {
 	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
+	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_REPACKED_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-
-	uint8x16_t tbl = vld1q_u8((const uint8_t *)iq3s_re_decode);
-	int		   i   = 0;
-
-	for (; i + 8 <= n; i += 8) {
-		float32x4_t acc0 = vdupq_n_f32(0.0f);
-		float32x4_t acc1 = vdupq_n_f32(0.0f);
-
-		const uint8_t *row_base[8];
-		for (int r = 0; r < 8; r++)
-			row_base[r] = Wb + (size_t)(i + r) * row_stride;
-
-		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const q8_k_block *restrict yb = &xq[bi];
-			const float d_xq			  = yb->d;
-			const int8_t *restrict q8	  = yb->qs;
-
-			for (int r = 0; r < 8; r++)
-				PREFETCH(row_base[r] + (size_t)(bi + 2) * IQ3_S_RE_BLOCK_BYTES);
-
-			int32_t		sumi_lane[8];
-			float32x4_t d_wv[2];
-
-			for (int r = 0; r < 8; r += 4) {
-				const uint8_t *b0 = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				const uint8_t *b1 = row_base[r + 1] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				const uint8_t *b2 = row_base[r + 2] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				const uint8_t *b3 = row_base[r + 3] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				uint16x8_t	   dv = {*(const uint16_t *)(b0 + IQ3S_RE_OFF_D),
-									 *(const uint16_t *)(b1 + IQ3S_RE_OFF_D),
-									 *(const uint16_t *)(b2 + IQ3S_RE_OFF_D),
-									 *(const uint16_t *)(b3 + IQ3S_RE_OFF_D),
-									 0,
-									 0,
-									 0,
-									 0};
-				d_wv[r >> 2]	  = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(dv)));
-			}
-
-			for (int r = 0; r < 8; r++) {
-				const uint8_t *blk	  = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
-				const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
-
-				int32x4_t acc = vdupq_n_s32(0);
-				for (int g = 0; g < 8; g += 2) {
-					uint8_t sb	= scales[g / 2];
-					int		sc0 = 1 + 2 * (sb & 0xf);
-					int		sc1 = 1 + 2 * (sb >> 4);
-
-					int8x16_t d00, d01, d10, d11;
-					iq3s_re_unpack_group(idx + g * 16, tbl, &d00, &d01);
-					iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &d10, &d11);
-
-					const int8_t *restrict qg0 = q8 + g * 32;
-					const int8_t *restrict qg1 = q8 + (g + 1) * 32;
-
-					int32x4_t a0, a1;
-					iq3s_pair_dot(d00, d01, d10, d11, qg0, qg1, &a0, &a1);
-					acc = vmlaq_s32(acc, a0, vdupq_n_s32(sc0));
-					acc = vmlaq_s32(acc, a1, vdupq_n_s32(sc1));
-				}
-				sumi_lane[r] = vaddvq_s32(acc);
-			}
-
-			int32x4_t	sumi0  = vld1q_s32(sumi_lane);
-			int32x4_t	sumi1  = vld1q_s32(sumi_lane + 4);
-			float32x4_t sumi0f = vcvtq_f32_s32(sumi0);
-			float32x4_t sumi1f = vcvtq_f32_s32(sumi1);
-			float32x4_t d_w0   = d_wv[0];
-			float32x4_t d_w1   = d_wv[1];
-			float32x4_t d_xq_v = vdupq_n_f32(d_xq);
-
-			acc0 = vfmaq_f32(acc0, vmulq_f32(d_w0, d_xq_v), sumi0f);
-			acc1 = vfmaq_f32(acc1, vmulq_f32(d_w1, d_xq_v), sumi1f);
-		}
-
-		vst1q_f32(y + i, acc0);
-		vst1q_f32(y + i + 4, acc1);
-	}
-
-	for (; i < n; i++) {
-		const uint8_t *row	= Wb + (size_t)i * row_stride;
-		float		   sumf = 0.0f;
-		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t *blk	  = row + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-			float		   d_w	  = f16_to_f32_fast(*(const uint16_t *)(blk + IQ3S_RE_OFF_D));
-			const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
-			const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
-
-			const q8_k_block *restrict yb = &xq[bi];
-			const int8_t *restrict q8	  = yb->qs;
-			int32x4_t acc				  = vdupq_n_s32(0);
-
-			for (int g = 0; g < 8; g += 2) {
-				uint8_t sb	= scales[g / 2];
-				int		sc0 = 1 + 2 * (sb & 0xf);
-				int		sc1 = 1 + 2 * (sb >> 4);
-
-				int8x16_t d00, d01, d10, d11;
-				iq3s_re_unpack_group(idx + g * 16, tbl, &d00, &d01);
-				iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &d10, &d11);
-
-				const int8_t *restrict qg0 = q8 + g * 32;
-				const int8_t *restrict qg1 = q8 + (g + 1) * 32;
-
-				int32x4_t a0, a1;
-				iq3s_pair_dot(d00, d01, d10, d11, qg0, qg1, &a0, &a1);
-				acc = vmlaq_s32(acc, a0, vdupq_n_s32(sc0));
-				acc = vmlaq_s32(acc, a1, vdupq_n_s32(sc1));
-			}
-			sumf += d_w * yb->d * (float)vaddvq_s32(acc);
-		}
-		y[i] = sumf;
-	}
-}
-
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_iq3_s_re_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block *restrict xq,
-												size_t		xq_row_stride_blocks, float *restrict y,
-												int y_row_stride, int n, int k, int m) {
-	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
-	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
-	int			   i			  = 0;
-
-	int8x16_t(*decoded_cache)[MR][16]	 = NULL;
-	int8x16_t(*pdec_cache)[MR / 2][8][4] = NULL;
-	int32_t (*sc0_cache)[MR][4]			 = NULL;
-	int32_t (*sc1_cache)[MR][4]			 = NULL;
-	int32x4_t(*sv_cache)[MR / 2][4][2]	 = NULL;
-	float (*d_w_cache)[MR]				 = NULL;
-
-	if (blocks_per_row > 0 && m >= I8MM_NR) {
-		decoded_cache = malloc(sizeof(*decoded_cache) * blocks_per_row);
-		pdec_cache	  = malloc(sizeof(*pdec_cache) * blocks_per_row);
-		sc0_cache	  = malloc(sizeof(*sc0_cache) * blocks_per_row);
-		sc1_cache	  = malloc(sizeof(*sc1_cache) * blocks_per_row);
-		sv_cache	  = malloc(sizeof(*sv_cache) * blocks_per_row);
-		d_w_cache	  = malloc(sizeof(*d_w_cache) * blocks_per_row);
-		if (!decoded_cache || !pdec_cache || !sc0_cache || !sc1_cache || !sv_cache || !d_w_cache) {
-			free(decoded_cache);
-			free(pdec_cache);
-			free(sc0_cache);
-			free(sc1_cache);
-			free(sv_cache);
-			free(d_w_cache);
-			decoded_cache = NULL;
-		}
-	}
-
-	for (; i + MR <= n; i += MR) {
-		const uint8_t *row_base[MR];
-		for (int r = 0; r < MR; r++)
-			row_base[r] = Wb + (size_t)(i + r) * row_stride;
-
-		const int n_bi_tiles = decoded_cache ? blocks_per_row : 0;
-
-		if (decoded_cache) {
-			for (int bi = 0; bi < n_bi_tiles; bi++) {
-				for (int r = 0; r < MR; r++) {
-					const uint8_t *blk = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-					d_w_cache[bi][r]   = f16_to_f32_fast(*(const uint16_t *)(blk + IQ3S_RE_OFF_D));
-					const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
-					const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
-
-					for (int g = 0; g < 8; g += 2) {
-						uint8_t sb				= scales[g / 2];
-						sc0_cache[bi][r][g / 2] = 1 + 2 * (sb & 0xf);
-						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
-
-						const int vi = g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
-											 &decoded_cache[bi][r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
-											 &decoded_cache[bi][r][vi + 3]);
-					}
-				}
-
-				for (int p = 0; p < MR / 2; p++) {
-					const int8x16_t *da = decoded_cache[bi][2 * p];
-					const int8x16_t *db = decoded_cache[bi][2 * p + 1];
-					for (int s = 0; s < 8; s++) {
-						pdec_cache[bi][p][s][0] =
-							vcombine_s8(vget_low_s8(da[2 * s]), vget_low_s8(db[2 * s]));
-						pdec_cache[bi][p][s][1] =
-							vcombine_s8(vget_high_s8(da[2 * s]), vget_high_s8(db[2 * s]));
-						pdec_cache[bi][p][s][2] =
-							vcombine_s8(vget_low_s8(da[2 * s + 1]), vget_low_s8(db[2 * s + 1]));
-						pdec_cache[bi][p][s][3] =
-							vcombine_s8(vget_high_s8(da[2 * s + 1]), vget_high_s8(db[2 * s + 1]));
-					}
-					for (int gi = 0; gi < 4; gi++) {
-						sv_cache[bi][p][gi][0] =
-							vcombine_s32(vdup_n_s32(sc0_cache[bi][2 * p][gi]),
-										 vdup_n_s32(sc0_cache[bi][2 * p + 1][gi]));
-						sv_cache[bi][p][gi][1] =
-							vcombine_s32(vdup_n_s32(sc1_cache[bi][2 * p][gi]),
-										 vdup_n_s32(sc1_cache[bi][2 * p + 1][gi]));
-					}
-				}
-			}
-		}
-
-		int t = 0;
-		if (decoded_cache) {
-			for (; t + I8MM_NR <= m; t += I8MM_NR) {
-				float32x4_t facc[MR / 2][I8MM_NR / 2];
-				for (int p = 0; p < MR / 2; p++)
-					for (int c = 0; c < I8MM_NR / 2; c++)
-						facc[p][c] = vdupq_n_f32(0.0f);
-
-				const q8_k_block *xrow[I8MM_NR];
-				for (int c = 0; c < I8MM_NR; c++)
-					xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
-
-				for (int bi = 0; bi < blocks_per_row; bi++) {
-					const int8_t *restrict q8p[I8MM_NR];
-					for (int c = 0; c < I8MM_NR; c++)
-						q8p[c] = xrow[c][bi].qs;
-
-					float32x4_t dcol[I8MM_NR / 2];
-					float32x4_t drowv[MR / 2];
-					for (int cp = 0; cp < I8MM_NR / 2; cp++)
-						dcol[cp] = vzip1q_f32(vdupq_n_f32(xrow[2 * cp][bi].d),
-											  vdupq_n_f32(xrow[2 * cp + 1][bi].d));
-					for (int p = 0; p < MR / 2; p++)
-						drowv[p] = vcombine_f32(vdup_n_f32(d_w_cache[bi][2 * p]),
-												vdup_n_f32(d_w_cache[bi][2 * p + 1]));
-
-					for (int gi = 0; gi < 4; gi++) {
-						for (int cp = 0; cp < I8MM_NR / 2; cp++) {
-							const int8_t *ea = q8p[2 * cp] + (2 * gi) * 32;
-							const int8_t *eb = q8p[2 * cp + 1] + (2 * gi) * 32;
-							const int8_t *oa = ea + 32;
-							const int8_t *ob = eb + 32;
-
-							const int8x16_t eal = vld1q_s8(ea);
-							const int8x16_t eah = vld1q_s8(ea + 16);
-							const int8x16_t ebl = vld1q_s8(eb);
-							const int8x16_t ebh = vld1q_s8(eb + 16);
-							int8x16_t		BE[4];
-							BE[0] = vcombine_s8(vget_low_s8(eal), vget_low_s8(ebl));
-							BE[1] = vcombine_s8(vget_high_s8(eal), vget_high_s8(ebl));
-							BE[2] = vcombine_s8(vget_low_s8(eah), vget_low_s8(ebh));
-							BE[3] = vcombine_s8(vget_high_s8(eah), vget_high_s8(ebh));
-
-							const int8x16_t oal = vld1q_s8(oa);
-							const int8x16_t oah = vld1q_s8(oa + 16);
-							const int8x16_t obl = vld1q_s8(ob);
-							const int8x16_t obh = vld1q_s8(ob + 16);
-							int8x16_t		BO[4];
-							BO[0] = vcombine_s8(vget_low_s8(oal), vget_low_s8(obl));
-							BO[1] = vcombine_s8(vget_high_s8(oal), vget_high_s8(obl));
-							BO[2] = vcombine_s8(vget_low_s8(oah), vget_low_s8(obh));
-							BO[3] = vcombine_s8(vget_high_s8(oah), vget_high_s8(obh));
-
-							for (int p = 0; p < MR / 2; p++) {
-								const int8x16_t *pe = pdec_cache[bi][p][2 * gi];
-								const int8x16_t *po = pdec_cache[bi][p][2 * gi + 1];
-
-								int32x4_t tE = vmmlaq_s32(
-									vmmlaq_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0), pe[0], BE[0]),
-														  pe[1], BE[1]),
-											   pe[2], BE[2]),
-									pe[3], BE[3]);
-								int32x4_t tO = vmmlaq_s32(
-									vmmlaq_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0), po[0], BO[0]),
-														  po[1], BO[1]),
-											   po[2], BO[2]),
-									po[3], BO[3]);
-
-								const int32x4_t sumi =
-									vmlaq_s32(vmulq_s32(tE, sv_cache[bi][p][gi][0]), tO,
-											  sv_cache[bi][p][gi][1]);
-
-								facc[p][cp] = vfmaq_f32(facc[p][cp], vcvtq_f32_s32(sumi),
-														vmulq_f32(drowv[p], dcol[cp]));
-							}
-						}
-					}
-				}
-
-				for (int p = 0; p < MR / 2; p++) {
-					for (int cp = 0; cp < I8MM_NR / 2; cp++) {
-						float tmp[4];
-						vst1q_f32(tmp, facc[p][cp]);
-						y[((size_t)(t + 2 * cp + 0) * y_row_stride) + (i + 2 * p + 0)] = tmp[0];
-						y[((size_t)(t + 2 * cp + 1) * y_row_stride) + (i + 2 * p + 0)] = tmp[1];
-						y[((size_t)(t + 2 * cp + 0) * y_row_stride) + (i + 2 * p + 1)] = tmp[2];
-						y[((size_t)(t + 2 * cp + 1) * y_row_stride) + (i + 2 * p + 1)] = tmp[3];
-					}
-				}
-			}
-		}
-
-		for (; t < m; t++) {
-			matmul_iq3_s_re_q8_k_qonly_f32_row(Wb + (size_t)i * row_stride,
-											   xq + ((size_t)t * xq_row_stride_blocks),
-											   y + ((size_t)t * y_row_stride) + i, MR, k);
-		}
-	}
-
-	for (; i < n; i++) {
-		for (int t = 0; t < m; t++) {
-			matmul_iq3_s_re_q8_k_qonly_f32_row(Wb + (size_t)i * row_stride,
-											   xq + ((size_t)t * xq_row_stride_blocks),
-											   y + ((size_t)t * y_row_stride) + i, 1, k);
-		}
-	}
-
-	free(decoded_cache);
-	free(pdec_cache);
-	free(sc0_cache);
-	free(sc1_cache);
-	free(sv_cache);
-	free(d_w_cache);
-}
-#endif
-
-#define NR_IQ3S_RE 4
-
-void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-									size_t		xq_row_stride_blocks, float *restrict y,
-									int y_row_stride, int n, int k, int m) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-	matmul_iq3_s_re_q8_k_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
-	return;
-#endif
-	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
-	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
-	int			   i			  = 0;
-
-	for (; i + MR <= n; i += MR) {
-		const uint8_t *row_base[MR];
-		for (int r = 0; r < MR; r++)
-			row_base[r] = Wb + (size_t)(i + r) * row_stride;
-
-		const int n_bi_tiles = (m / NR_IQ3S_RE) > 1 ? blocks_per_row : 0;
-
-		static _Thread_local int8x16_t(*decoded_cache)[MR][16] = NULL;
-		static _Thread_local int32_t (*sc0_cache)[MR][4]	   = NULL;
-		static _Thread_local int32_t (*sc1_cache)[MR][4]	   = NULL;
-		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
-		static _Thread_local int cache_cap					   = 0;
-
-		int tile_ok = 1;
-		if (n_bi_tiles > 0) {
-			if (cache_cap < n_bi_tiles || !d_w_cache) {
-				int grew =
-					tls_realloc((void **)&decoded_cache, sizeof(*decoded_cache), n_bi_tiles) &&
-					tls_realloc((void **)&sc0_cache, sizeof(*sc0_cache), n_bi_tiles) &&
-					tls_realloc((void **)&sc1_cache, sizeof(*sc1_cache), n_bi_tiles) &&
-					tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), n_bi_tiles);
-				if (!grew)
-					tile_ok = 0;
-				else {
-					cache_cap = n_bi_tiles;
-					tlocal_register((void **)&decoded_cache);
-					tlocal_register((void **)&sc0_cache);
-					tlocal_register((void **)&sc1_cache);
-					tlocal_register((void **)&d_w_cache);
-				}
-			}
-
-			for (int bi = 0; tile_ok && bi < n_bi_tiles; bi++) {
-				for (int r = 0; r < MR; r++) {
-					const uint8_t *blk = row_base[r] + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-					d_w_cache[bi][r]   = f16_to_f32_fast(*(const uint16_t *)(blk + IQ3S_RE_OFF_D));
-					const uint8_t *scales = blk + IQ3S_RE_OFF_SCALES;
-					const uint8_t *idx	  = blk + IQ3S_RE_OFF_IDX;
-
-					for (int g = 0; g < 8; g += 2) {
-						uint8_t sb				= scales[g / 2];
-						sc0_cache[bi][r][g / 2] = 1 + 2 * (sb & 0xf);
-						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
-
-						const int vi = g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi + 0],
-											 &decoded_cache[bi][r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
-											 &decoded_cache[bi][r][vi + 3]);
-					}
-				}
-			}
-		}
-
-		int t = 0;
-		for (; tile_ok && n_bi_tiles > 0 && t + NR_IQ3S_RE <= m; t += NR_IQ3S_RE) {
-			float32x4_t acc_row[MR];
-			for (int r = 0; r < MR; r++)
-				acc_row[r] = vdupq_n_f32(0.0f);
-
-			const q8_k_block *xrow[NR_IQ3S_RE];
-			for (int c = 0; c < NR_IQ3S_RE; c++)
-				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
-
-			for (int bi = 0; bi < blocks_per_row; bi++) {
-
-				float(*d_w)				= d_w_cache[bi];
-				int8x16_t(*decoded)[16] = decoded_cache[bi];
-				int32_t (*sc0)[4]		= sc0_cache[bi];
-				int32_t (*sc1)[4]		= sc1_cache[bi];
-
-				float xd[NR_IQ3S_RE];
-				const int8_t *restrict q8p[NR_IQ3S_RE];
-				for (int c = 0; c < NR_IQ3S_RE; c++) {
-					xd[c]  = xrow[c][bi].d;
-					q8p[c] = xrow[c][bi].qs;
-				}
-				const float32x4_t xd_vec = vld1q_f32(xd);
-
-				for (int r = 0; r < MR; r++) {
-					int32x4_t total4 = vdupq_n_s32(0);
-
-					for (int g = 0; g < 8; g += 2) {
-						const int		vi	= g * 2;
-						const int8x16_t c00 = decoded[r][vi + 0];
-						const int8x16_t c01 = decoded[r][vi + 1];
-						const int8x16_t c10 = decoded[r][vi + 2];
-						const int8x16_t c11 = decoded[r][vi + 3];
-
-						const int8_t *restrict qg0_0 = q8p[0] + g * 32;
-						const int8_t *restrict qg0_1 = q8p[1] + g * 32;
-						const int8_t *restrict qg0_2 = q8p[2] + g * 32;
-						const int8_t *restrict qg0_3 = q8p[3] + g * 32;
-
-						const int8_t *restrict qg1_0 = q8p[0] + (g + 1) * 32;
-						const int8_t *restrict qg1_1 = q8p[1] + (g + 1) * 32;
-						const int8_t *restrict qg1_2 = q8p[2] + (g + 1) * 32;
-						const int8_t *restrict qg1_3 = q8p[3] + (g + 1) * 32;
-
-#if defined(__ARM_FEATURE_DOTPROD)
-						int32x4_t a0_c0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c00, vld1q_s8(qg0_0)),
-													c01, vld1q_s8(qg0_0 + 16));
-						int32x4_t a0_c1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c00, vld1q_s8(qg0_1)),
-													c01, vld1q_s8(qg0_1 + 16));
-						int32x4_t a0_c2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c00, vld1q_s8(qg0_2)),
-													c01, vld1q_s8(qg0_2 + 16));
-						int32x4_t a0_c3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c00, vld1q_s8(qg0_3)),
-													c01, vld1q_s8(qg0_3 + 16));
-
-						int32x4_t a1_c0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c10, vld1q_s8(qg1_0)),
-													c11, vld1q_s8(qg1_0 + 16));
-						int32x4_t a1_c1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c10, vld1q_s8(qg1_1)),
-													c11, vld1q_s8(qg1_1 + 16));
-						int32x4_t a1_c2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c10, vld1q_s8(qg1_2)),
-													c11, vld1q_s8(qg1_2 + 16));
-						int32x4_t a1_c3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), c10, vld1q_s8(qg1_3)),
-													c11, vld1q_s8(qg1_3 + 16));
-#else
-						int16x8_t p00_0 = vmull_s8(vget_low_s8(c00), vget_low_s8(vld1q_s8(qg0_0)));
-						int16x8_t p01_0 =
-							vmull_s8(vget_high_s8(c00), vget_high_s8(vld1q_s8(qg0_0)));
-						int16x8_t p02_0 =
-							vmull_s8(vget_low_s8(c01), vget_low_s8(vld1q_s8(qg0_0 + 16)));
-						int16x8_t p03_0 =
-							vmull_s8(vget_high_s8(c01), vget_high_s8(vld1q_s8(qg0_0 + 16)));
-						int32x4_t a0_c0 = vpaddlq_s16(p00_0);
-						a0_c0			= vpadalq_s16(a0_c0, p01_0);
-						a0_c0			= vpadalq_s16(a0_c0, p02_0);
-						a0_c0			= vpadalq_s16(a0_c0, p03_0);
-
-						int16x8_t p00_1 = vmull_s8(vget_low_s8(c00), vget_low_s8(vld1q_s8(qg0_1)));
-						int16x8_t p01_1 =
-							vmull_s8(vget_high_s8(c00), vget_high_s8(vld1q_s8(qg0_1)));
-						int16x8_t p02_1 =
-							vmull_s8(vget_low_s8(c01), vget_low_s8(vld1q_s8(qg0_1 + 16)));
-						int16x8_t p03_1 =
-							vmull_s8(vget_high_s8(c01), vget_high_s8(vld1q_s8(qg0_1 + 16)));
-						int32x4_t a0_c1 = vpaddlq_s16(p00_1);
-						a0_c1			= vpadalq_s16(a0_c1, p01_1);
-						a0_c1			= vpadalq_s16(a0_c1, p02_1);
-						a0_c1			= vpadalq_s16(a0_c1, p03_1);
-
-						int16x8_t p00_2 = vmull_s8(vget_low_s8(c00), vget_low_s8(vld1q_s8(qg0_2)));
-						int16x8_t p01_2 =
-							vmull_s8(vget_high_s8(c00), vget_high_s8(vld1q_s8(qg0_2)));
-						int16x8_t p02_2 =
-							vmull_s8(vget_low_s8(c01), vget_low_s8(vld1q_s8(qg0_2 + 16)));
-						int16x8_t p03_2 =
-							vmull_s8(vget_high_s8(c01), vget_high_s8(vld1q_s8(qg0_2 + 16)));
-						int32x4_t a0_c2 = vpaddlq_s16(p00_2);
-						a0_c2			= vpadalq_s16(a0_c2, p01_2);
-						a0_c2			= vpadalq_s16(a0_c2, p02_2);
-						a0_c2			= vpadalq_s16(a0_c2, p03_2);
-
-						int16x8_t p00_3 = vmull_s8(vget_low_s8(c00), vget_low_s8(vld1q_s8(qg0_3)));
-						int16x8_t p01_3 =
-							vmull_s8(vget_high_s8(c00), vget_high_s8(vld1q_s8(qg0_3)));
-						int16x8_t p02_3 =
-							vmull_s8(vget_low_s8(c01), vget_low_s8(vld1q_s8(qg0_3 + 16)));
-						int16x8_t p03_3 =
-							vmull_s8(vget_high_s8(c01), vget_high_s8(vld1q_s8(qg0_3 + 16)));
-						int32x4_t a0_c3 = vpaddlq_s16(p00_3);
-						a0_c3			= vpadalq_s16(a0_c3, p01_3);
-						a0_c3			= vpadalq_s16(a0_c3, p02_3);
-						a0_c3			= vpadalq_s16(a0_c3, p03_3);
-
-						int16x8_t p10_0 = vmull_s8(vget_low_s8(c10), vget_low_s8(vld1q_s8(qg1_0)));
-						int16x8_t p11_0 =
-							vmull_s8(vget_high_s8(c10), vget_high_s8(vld1q_s8(qg1_0)));
-						int16x8_t p12_0 =
-							vmull_s8(vget_low_s8(c11), vget_low_s8(vld1q_s8(qg1_0 + 16)));
-						int16x8_t p13_0 =
-							vmull_s8(vget_high_s8(c11), vget_high_s8(vld1q_s8(qg1_0 + 16)));
-						int32x4_t a1_c0 = vpaddlq_s16(p10_0);
-						a1_c0			= vpadalq_s16(a1_c0, p11_0);
-						a1_c0			= vpadalq_s16(a1_c0, p12_0);
-						a1_c0			= vpadalq_s16(a1_c0, p13_0);
-
-						int16x8_t p10_1 = vmull_s8(vget_low_s8(c10), vget_low_s8(vld1q_s8(qg1_1)));
-						int16x8_t p11_1 =
-							vmull_s8(vget_high_s8(c10), vget_high_s8(vld1q_s8(qg1_1)));
-						int16x8_t p12_1 =
-							vmull_s8(vget_low_s8(c11), vget_low_s8(vld1q_s8(qg1_1 + 16)));
-						int16x8_t p13_1 =
-							vmull_s8(vget_high_s8(c11), vget_high_s8(vld1q_s8(qg1_1 + 16)));
-						int32x4_t a1_c1 = vpaddlq_s16(p10_1);
-						a1_c1			= vpadalq_s16(a1_c1, p11_1);
-						a1_c1			= vpadalq_s16(a1_c1, p12_1);
-						a1_c1			= vpadalq_s16(a1_c1, p13_1);
-
-						int16x8_t p10_2 = vmull_s8(vget_low_s8(c10), vget_low_s8(vld1q_s8(qg1_2)));
-						int16x8_t p11_2 =
-							vmull_s8(vget_high_s8(c10), vget_high_s8(vld1q_s8(qg1_2)));
-						int16x8_t p12_2 =
-							vmull_s8(vget_low_s8(c11), vget_low_s8(vld1q_s8(qg1_2 + 16)));
-						int16x8_t p13_2 =
-							vmull_s8(vget_high_s8(c11), vget_high_s8(vld1q_s8(qg1_2 + 16)));
-						int32x4_t a1_c2 = vpaddlq_s16(p10_2);
-						a1_c2			= vpadalq_s16(a1_c2, p11_2);
-						a1_c2			= vpadalq_s16(a1_c2, p12_2);
-						a1_c2			= vpadalq_s16(a1_c2, p13_2);
-
-						int16x8_t p10_3 = vmull_s8(vget_low_s8(c10), vget_low_s8(vld1q_s8(qg1_3)));
-						int16x8_t p11_3 =
-							vmull_s8(vget_high_s8(c10), vget_high_s8(vld1q_s8(qg1_3)));
-						int16x8_t p12_3 =
-							vmull_s8(vget_low_s8(c11), vget_low_s8(vld1q_s8(qg1_3 + 16)));
-						int16x8_t p13_3 =
-							vmull_s8(vget_high_s8(c11), vget_high_s8(vld1q_s8(qg1_3 + 16)));
-						int32x4_t a1_c3 = vpaddlq_s16(p10_3);
-						a1_c3			= vpadalq_s16(a1_c3, p11_3);
-						a1_c3			= vpadalq_s16(a1_c3, p12_3);
-						a1_c3			= vpadalq_s16(a1_c3, p13_3);
-#endif
-						int32x4_t a0_s01	= vpaddq_s32(a0_c0, a0_c1);
-						int32x4_t a0_s23	= vpaddq_s32(a0_c2, a0_c3);
-						int32x4_t a0_packed = vpaddq_s32(a0_s01, a0_s23);
-
-						int32x4_t a1_s01	= vpaddq_s32(a1_c0, a1_c1);
-						int32x4_t a1_s23	= vpaddq_s32(a1_c2, a1_c3);
-						int32x4_t a1_packed = vpaddq_s32(a1_s01, a1_s23);
-
-						total4 = vmlaq_n_s32(total4, a0_packed, sc0[r][g / 2]);
-						total4 = vmlaq_n_s32(total4, a1_packed, sc1[r][g / 2]);
-					}
-
-					float32x4_t total4f = vcvtq_f32_s32(total4);
-					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, vmulq_n_f32(total4f, d_w[r]));
-				}
-			}
-
-			for (int r = 0; r < MR; r++) {
-				float tmp[4];
-				vst1q_f32(tmp, acc_row[r]);
-				for (int c = 0; c < NR_IQ3S_RE; c++)
-					y[((size_t)(t + c) * y_row_stride) + (i + r)] = tmp[c];
-			}
-		}
-
-		for (; t < m; t++) {
-			const q8_k_block *xrow = xq + ((size_t)t * xq_row_stride_blocks);
-			float			 *yrow = y + ((size_t)t * y_row_stride) + i;
-			matmul_iq3_s_re_q8_k_qonly_f32_row(Wb + (size_t)i * row_stride, xrow, yrow, MR, k);
-		}
-	}
-
-	for (; i < n; i++) {
-		for (int t = 0; t < m; t++) {
-			const q8_k_block *xrow = xq + ((size_t)t * xq_row_stride_blocks);
-			float			 *yrow = y + ((size_t)t * y_row_stride) + i;
-			matmul_iq3_s_re_q8_k_qonly_f32_row(Wb + (size_t)i * row_stride, xrow, yrow, 1, k);
-		}
-	}
-}
-
-#undef NR_IQ3S_RE
-
-#define IQ3S_RE8_OFF_D 0
-
-#define IQ3S_RE8_OFF_SCALES (IQ3_S_RE8_ROWS * sizeof(uint16_t))
-
-#define IQ3S_RE8_OFF_IDX (IQ3S_RE8_OFF_SCALES + IQ3_S_RE8_ROWS * 4)
-
-static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-												float *restrict y, int n, int k) {
-	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
-	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3_s_repacked_decode);
 	int			   i			  = 0;
 
 	const uint8x16_t mask_0F = vdupq_n_u8(0x0F);
@@ -6956,13 +6359,13 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 			const float d_xq			  = yb->d;
 			const int8_t *restrict q8	  = yb->qs;
 
-			const uint8_t *blk = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
+			const uint8_t *blk = group + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
 
-			PREFETCH(blk + IQ3_S_RE8_GROUP_BYTES);
+			PREFETCH(blk + IQ3_S_REPACKED_GROUP_BYTES);
 
-			const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
-			const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
-			const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
+			const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3_S_REPACKED_OFF_D);
+			const uint8_t  *scales_all = blk + IQ3_S_REPACKED_OFF_SCALES;
+			const uint8_t  *idx_all	   = blk + IQ3_S_REPACKED_OFF_IDX;
 
 			int32_t		sumi_lane[8];
 			uint16x8_t	dv_all = vld1q_u16(d_ptr);
@@ -7034,10 +6437,10 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 			const float d_xq			  = yb->d;
 			const int8_t *restrict q8	  = yb->qs;
 
-			const uint8_t  *blk		   = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
-			const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
-			const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
-			const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
+			const uint8_t  *blk		   = group + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
+			const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3_S_REPACKED_OFF_D);
+			const uint8_t  *scales_all = blk + IQ3_S_REPACKED_OFF_SCALES;
+			const uint8_t  *idx_all	   = blk + IQ3_S_REPACKED_OFF_IDX;
 
 			float		   d_w	  = f16_to_f32_fast(d_ptr[i % 8]);
 			const uint8_t *scales = scales_all + (size_t)(i % 8) * 4;
@@ -7083,13 +6486,14 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block 
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block *restrict xq,
-												 size_t xq_row_stride_blocks, float *restrict y,
-												 int y_row_stride, int n, int k, int m) {
+static void matmul_iq3_s_repacked_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block *restrict xq,
+													  size_t	  xq_row_stride_blocks,
+													  float *restrict y, int y_row_stride, int n,
+													  int k, int m) {
 	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
+	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_REPACKED_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3_s_repacked_decode);
 	int			   i			  = 0;
 
 	int8x16_t(*decoded_cache)[MR][16]	 = NULL;
@@ -7124,12 +6528,12 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 
 		if (decoded_cache) {
 			for (int bi = 0; bi < n_bi_tiles; bi++) {
-				const uint8_t *blk = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
-				PREFETCH(blk + IQ3_S_RE8_GROUP_BYTES);
+				const uint8_t *blk = group + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
+				PREFETCH(blk + IQ3_S_REPACKED_GROUP_BYTES);
 
-				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
-				const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
-				const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
+				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3_S_REPACKED_OFF_D);
+				const uint8_t  *scales_all = blk + IQ3_S_REPACKED_OFF_SCALES;
+				const uint8_t  *idx_all	   = blk + IQ3_S_REPACKED_OFF_IDX;
 
 				for (int r = 0; r < MR; r++) {
 					d_w_cache[bi][r]	  = f16_to_f32_fast(d_ptr[r]);
@@ -7142,10 +6546,11 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
 
 						const int vi = g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
-											 &decoded_cache[bi][r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
-											 &decoded_cache[bi][r][vi + 3]);
+						iq3_s_repacked_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
+													&decoded_cache[bi][r][vi + 1]);
+						iq3_s_repacked_unpack_group(idx + (g + 1) * 16, tbl,
+													&decoded_cache[bi][r][vi + 2],
+													&decoded_cache[bi][r][vi + 3]);
 					}
 				}
 
@@ -7266,8 +6671,8 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 		}
 
 		for (; t < m; t++) {
-			matmul_iq3_s_re8_q8_k_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
-												y + ((size_t)t * y_row_stride) + i, MR, k);
+			matmul_iq3_s_repacked_q8_k_qonly_f32_row(group, xq + ((size_t)t * xq_row_stride_blocks),
+													 y + ((size_t)t * y_row_stride) + i, MR, k);
 		}
 	}
 
@@ -7275,8 +6680,9 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 		const int	   nr	  = n - i < 8 ? n - i : 8;
 		const uint8_t *igroup = Wb + (size_t)(i / 8) * row_stride;
 		for (int t = 0; t < m; t++) {
-			matmul_iq3_s_re8_q8_k_qonly_f32_row(igroup, xq + ((size_t)t * xq_row_stride_blocks),
-												y + ((size_t)t * y_row_stride) + i, nr, k);
+			matmul_iq3_s_repacked_q8_k_qonly_f32_row(igroup,
+													 xq + ((size_t)t * xq_row_stride_blocks),
+													 y + ((size_t)t * y_row_stride) + i, nr, k);
 		}
 	}
 
@@ -7289,36 +6695,37 @@ static void matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(const void *w, const q8_k_block
 }
 #endif
 
-#define NR_IQ3S_RE8 4
+#define NR_IQ3S_REPACKED 4
 
-void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-									 size_t		 xq_row_stride_blocks, float *restrict y,
-									 int y_row_stride, int n, int k, int m) {
+void matmul_iq3_s_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										  size_t	  xq_row_stride_blocks, float *restrict y,
+										  int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % IQ3_S_RE8_ROWS);
+		int n_full = n - (n % IQ3_S_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(
+				matmul_iq3_s_repacked_q8_k_qonly_f32_rows_range(
 					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
 					n_full, n, k);
 		}
 		n = n_full;
 	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-	matmul_iq3_s_re8_q8_k_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_iq3_s_repacked_q8_k_qonly_f32_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k,
+											  m);
 	return;
 #endif
 	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
+	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_REPACKED_GROUP_BYTES;
 	const uint8_t *Wb			  = w;
-	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3s_re_decode);
+	uint8x16_t	   tbl			  = vld1q_u8((const uint8_t *)iq3_s_repacked_decode);
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {
 		const uint8_t *group = Wb + (size_t)(i / 8) * row_stride;
 		int			   t	 = 0;
 
-		const int n_bi_tiles = (m / NR_IQ3S_RE8) > 1 ? blocks_per_row : 0;
+		const int n_bi_tiles = (m / NR_IQ3S_REPACKED) > 1 ? blocks_per_row : 0;
 
 		static _Thread_local int8x16_t(*decoded_cache)[MR][16] = NULL;
 		static _Thread_local int32_t (*sc0_cache)[MR][4]	   = NULL;
@@ -7346,12 +6753,12 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 			}
 
 			for (int bi = 0; tile_ok && bi < n_bi_tiles; bi++) {
-				const uint8_t *blk = group + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
-				PREFETCH(blk + IQ3_S_RE8_GROUP_BYTES);
+				const uint8_t *blk = group + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
+				PREFETCH(blk + IQ3_S_REPACKED_GROUP_BYTES);
 
-				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3S_RE8_OFF_D);
-				const uint8_t  *scales_all = blk + IQ3S_RE8_OFF_SCALES;
-				const uint8_t  *idx_all	   = blk + IQ3S_RE8_OFF_IDX;
+				const uint16_t *d_ptr	   = (const uint16_t *)(blk + IQ3_S_REPACKED_OFF_D);
+				const uint8_t  *scales_all = blk + IQ3_S_REPACKED_OFF_SCALES;
+				const uint8_t  *idx_all	   = blk + IQ3_S_REPACKED_OFF_IDX;
 
 				for (int r = 0; r < MR; r++) {
 					d_w_cache[bi][r]	  = f16_to_f32_fast(d_ptr[r]);
@@ -7363,23 +6770,24 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 						sc0_cache[bi][r][g / 2] = 1 + 2 * (sb & 0xf);
 						sc1_cache[bi][r][g / 2] = 1 + 2 * (sb >> 4);
 						const int vi			= g * 2;
-						iq3s_re_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
-											 &decoded_cache[bi][r][vi + 1]);
-						iq3s_re_unpack_group(idx + (g + 1) * 16, tbl, &decoded_cache[bi][r][vi + 2],
-											 &decoded_cache[bi][r][vi + 3]);
+						iq3_s_repacked_unpack_group(idx + g * 16, tbl, &decoded_cache[bi][r][vi],
+													&decoded_cache[bi][r][vi + 1]);
+						iq3_s_repacked_unpack_group(idx + (g + 1) * 16, tbl,
+													&decoded_cache[bi][r][vi + 2],
+													&decoded_cache[bi][r][vi + 3]);
 					}
 				}
 			}
 		}
 
-		for (; tile_ok && n_bi_tiles > 0 && t + NR_IQ3S_RE8 <= m; t += NR_IQ3S_RE8) {
+		for (; tile_ok && n_bi_tiles > 0 && t + NR_IQ3S_REPACKED <= m; t += NR_IQ3S_REPACKED) {
 			float32x4_t acc_row[MR];
 			for (int r = 0; r < MR; r++)
 				acc_row[r] = vdupq_n_f32(0.0f);
 
-			const q8_k_block *xrow[NR_IQ3S_RE8];
+			const q8_k_block *xrow[NR_IQ3S_REPACKED];
 
-			for (int c = 0; c < NR_IQ3S_RE8; c++)
+			for (int c = 0; c < NR_IQ3S_REPACKED; c++)
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
@@ -7388,9 +6796,9 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 				int32_t (*sc0)[4]		= sc0_cache[bi];
 				int32_t (*sc1)[4]		= sc1_cache[bi];
 
-				float xd[NR_IQ3S_RE8];
-				const int8_t *restrict q8p[NR_IQ3S_RE8];
-				for (int c = 0; c < NR_IQ3S_RE8; c++) {
+				float xd[NR_IQ3S_REPACKED];
+				const int8_t *restrict q8p[NR_IQ3S_REPACKED];
+				for (int c = 0; c < NR_IQ3S_REPACKED; c++) {
 					xd[c]  = xrow[c][bi].d;
 					q8p[c] = xrow[c][bi].qs;
 				}
@@ -7551,7 +6959,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 			for (int r = 0; r < MR; r++) {
 				float tmp[4];
 				vst1q_f32(tmp, acc_row[r]);
-				for (int c = 0; c < NR_IQ3S_RE8; c++)
+				for (int c = 0; c < NR_IQ3S_REPACKED; c++)
 					y[((size_t)(t + c) * y_row_stride) + (i + r)] = tmp[c];
 			}
 		}
@@ -7559,7 +6967,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 		for (; t < m; t++) {
 			const q8_k_block *xrow = xq + ((size_t)t * xq_row_stride_blocks);
 			float			 *yrow = y + ((size_t)t * y_row_stride) + i;
-			matmul_iq3_s_re8_q8_k_qonly_f32_row(group, xrow, yrow, MR, k);
+			matmul_iq3_s_repacked_q8_k_qonly_f32_row(group, xrow, yrow, MR, k);
 		}
 	}
 
@@ -7569,12 +6977,12 @@ void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict x
 		for (int t = 0; t < m; t++) {
 			const q8_k_block *xrow = xq + ((size_t)t * xq_row_stride_blocks);
 			float			 *yrow = y + ((size_t)t * y_row_stride) + i;
-			matmul_iq3_s_re8_q8_k_qonly_f32_row(group, xrow, yrow, nr, k);
+			matmul_iq3_s_repacked_q8_k_qonly_f32_row(group, xrow, yrow, nr, k);
 		}
 	}
 }
 
-#undef NR_IQ3S_RE8
+#undef NR_IQ3S_REPACKED
 
 void matmul_f16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {
@@ -8394,16 +7802,18 @@ void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int r
 	}
 }
 
-static void matmul_q4_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_block *restrict xq,
-													 float *restrict y, int n, int k) {
+static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
+														   const q8_k_block *restrict xq,
+														   float *restrict y, int n, int k) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
 
 	for (; i + MR <= n;) {
 		int			   ng	  = (i + 2 * MR <= n) ? 2 : 1;
-		const uint8_t *group0 = (const uint8_t *)Wb +
-								((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
+		const uint8_t *group0 = (const uint8_t *)Wb + ((size_t)(i / Q4_K_REPACKED_ROWS)) *
+														  blocks_per_row *
+														  Q4_K_REPACKED_GROUP_BYTES;
 		float32x4_t	   acc[2][2];
 		acc[0][0] = vdupq_n_f32(0.0f);
 		acc[0][1] = vdupq_n_f32(0.0f);
@@ -8435,14 +7845,15 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 			}
 
 			for (int gg = 0; gg < ng; gg++) {
-				const uint8_t *restrict dblk = group0 +
-											   ((size_t)gg * blocks_per_row * Q4_K_R8_GROUP_BYTES) +
-											   ((size_t)bi * Q4_K_R8_GROUP_BYTES);
+				const uint8_t *restrict dblk =
+					group0 + ((size_t)gg * blocks_per_row * Q4_K_REPACKED_GROUP_BYTES) +
+					((size_t)bi * Q4_K_REPACKED_GROUP_BYTES);
 				if (gg + 1 < ng)
-					PREFETCH(group0 + ((size_t)(gg + 1) * blocks_per_row * Q4_K_R8_GROUP_BYTES) +
-							 ((size_t)bi * Q4_K_R8_GROUP_BYTES));
-				const uint16_t *restrict ds = (const uint16_t *)(dblk + Q4_K_R8_OFF_D);
-				const uint16_t *restrict ms = (const uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
+					PREFETCH(group0 +
+							 ((size_t)(gg + 1) * blocks_per_row * Q4_K_REPACKED_GROUP_BYTES) +
+							 ((size_t)bi * Q4_K_REPACKED_GROUP_BYTES));
+				const uint16_t *restrict ds = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_D);
+				const uint16_t *restrict ms = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN);
 
 				int32_t		sumi_lane[MR];
 				int32_t		summ_lane[MR];
@@ -8456,8 +7867,9 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 				dm_wv[1] = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(dm_all)));
 
 				for (int r = 0; r < MR; r++) {
-					const uint8_t *restrict qbytes = dblk + Q4_K_R8_OFF_QS + ((size_t)r * 128);
-					const uint8_t *restrict sc	   = dblk + Q4_K_R8_OFF_SE + ((size_t)r * 16);
+					const uint8_t *restrict qbytes =
+						dblk + Q4_K_REPACKED_OFF_QS + ((size_t)r * 128);
+					const uint8_t *restrict sc = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 16);
 
 					int32x4_t sumi_vec0 = vdupq_n_s32(0);
 					int32x4_t sumi_vec1 = vdupq_n_s32(0);
@@ -8539,19 +7951,19 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 	}
 
 	for (; i < n; i++) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
-		const int	   slot	 = i % Q4_K_R8_ROWS;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q4_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q4_K_REPACKED_GROUP_BYTES;
+		const int	   slot	 = i % Q4_K_REPACKED_ROWS;
 		float		   sumf	 = 0.0f;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t *dblk = group + ((size_t)bi * Q4_K_R8_GROUP_BYTES);
+			const uint8_t *dblk = group + ((size_t)bi * Q4_K_REPACKED_GROUP_BYTES);
 			const float	   d =
-				f16_to_f32_fast(*(const uint16_t *)(dblk + Q4_K_R8_OFF_D + (size_t)slot * 2));
-			const float dmin =
-				f16_to_f32_fast(*(const uint16_t *)(dblk + Q4_K_R8_OFF_DMIN + (size_t)slot * 2));
-			const uint8_t *restrict qbytes = dblk + Q4_K_R8_OFF_QS + ((size_t)slot * 128);
-			const uint8_t *restrict sc	   = dblk + Q4_K_R8_OFF_SE + ((size_t)slot * 16);
+				f16_to_f32_fast(*(const uint16_t *)(dblk + Q4_K_REPACKED_OFF_D + (size_t)slot * 2));
+			const float dmin = f16_to_f32_fast(
+				*(const uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN + (size_t)slot * 2));
+			const uint8_t *restrict qbytes = dblk + Q4_K_REPACKED_OFF_QS + ((size_t)slot * 128);
+			const uint8_t *restrict sc	   = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)slot * 16);
 
 			const q8_k_block *restrict xb = &xq[bi];
 			const int8_t *restrict xq8	  = xb->qs;
@@ -8582,16 +7994,16 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 }
 
 #define NR 4
-static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
-											  size_t	  xq_row_stride_blocks, float *restrict y,
-											  int y_row_stride, int n, int k, int m) {
+static void matmul_q4_k_repacked_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
+													size_t xq_row_stride_blocks, float *restrict y,
+													int y_row_stride, int n, int k, int m) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q4_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q4_K_REPACKED_GROUP_BYTES;
 
 		static _Thread_local int32_t (*m_lo_cache)[MR][4] = NULL;
 		static _Thread_local int32_t (*m_hi_cache)[MR][4] = NULL;
@@ -8610,9 +8022,9 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 					   tls_realloc((void **)&dmin_w_cache, sizeof(*dmin_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
-					matmul_q4_k_r8_q8_k_qonly_f32_vec_single(
+					matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(
 						group, xq + ((size_t)t * xq_row_stride_blocks),
-						y + ((size_t)t * y_row_stride) + i, Q4_K_R8_ROWS, k);
+						y + ((size_t)t * y_row_stride) + i, Q4_K_REPACKED_ROWS, k);
 				continue;
 			}
 			cache_cap = blocks_per_row;
@@ -8625,11 +8037,11 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		}
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q4_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q4_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q4_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_D);
-			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q4_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_D);
+			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN);
 
 			uint16x8_t	dv_all = vld1q_u16(ds);
 			uint16x8_t	dm_all = vld1q_u16(ms);
@@ -8642,7 +8054,7 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 			vst1q_f32(&dmin_w_cache[bi][0], dm_lo);
 			vst1q_f32(&dmin_w_cache[bi][4], dm_hi);
 			for (int r = 0; r < MR; r++) {
-				const uint8_t *restrict se = dblk + Q4_K_R8_OFF_SE + ((size_t)r * 16);
+				const uint8_t *restrict se = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 16);
 
 				int is = 0;
 				for (int g = 0; g < 4; g++) {
@@ -8667,7 +8079,7 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				const uint8_t *restrict qbase =
-					group + ((size_t)bi * Q4_K_R8_GROUP_BYTES) + Q4_K_R8_OFF_QS;
+					group + ((size_t)bi * Q4_K_REPACKED_GROUP_BYTES) + Q4_K_REPACKED_OFF_QS;
 				int32_t (*m_lo)[4] = m_lo_cache[bi];
 				int32_t (*m_hi)[4] = m_hi_cache[bi];
 				float *d_w		   = d_w_cache[bi];
@@ -8781,7 +8193,7 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				const uint8_t *restrict qbase =
-					group + ((size_t)bi * Q4_K_R8_GROUP_BYTES) + Q4_K_R8_OFF_QS;
+					group + ((size_t)bi * Q4_K_REPACKED_GROUP_BYTES) + Q4_K_REPACKED_OFF_QS;
 				float *d_w	  = d_w_cache[bi];
 				float *dmin_w = dmin_w_cache[bi];
 
@@ -8859,37 +8271,38 @@ static void matmul_q4_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 	}
 
 	if (i < n)
-		matmul_q4_k_r8_q8_k_qonly_f32_vec_single((const uint8_t *)Wb +
-													 ((size_t)(i / Q4_K_R8_ROWS)) * blocks_per_row *
-														 Q4_K_R8_GROUP_BYTES,
-												 xq, y + (size_t)i, n - i, k);
+		matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(
+			(const uint8_t *)Wb +
+				((size_t)(i / Q4_K_REPACKED_ROWS)) * blocks_per_row * Q4_K_REPACKED_GROUP_BYTES,
+			xq, y + (size_t)i, n - i, k);
 }
 #undef NR
 
-void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m) {
+void matmul_q4_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % Q4_K_R8_ROWS);
+		int n_full = n - (n % Q4_K_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_q4_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-														 y + ((size_t)t * y_row_stride), n_full, n,
-														 k);
+				matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
-			matmul_q4_k_r8_q8_k_qonly_f32_vec_single(w, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride), n, k);
+			matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(
+				w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride), n, k);
 		return;
 	}
-	matmul_q4_k_r8_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_q4_k_repacked_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 }
 
-static void matmul_q5_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_block *restrict xq,
-													 float *restrict y, int n, int k) {
+static void matmul_q5_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
+														   const q8_k_block *restrict xq,
+														   float *restrict y, int n, int k) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
@@ -8899,17 +8312,17 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 	const uint8x16_t zero_vec = vdupq_n_u8(0);
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q5_K_R8_ROWS)) * blocks_per_row * Q5_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q5_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q5_K_REPACKED_GROUP_BYTES;
 		float32x4_t	   acc0	 = vdupq_n_f32(0.0f);
 		float32x4_t	   acc1	 = vdupq_n_f32(0.0f);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q5_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q5_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q5_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_D);
-			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q5_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_D);
+			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_DMIN);
 
 			const q8_k_block *restrict xb = &xq[bi];
 			const float xd				  = xb->d;
@@ -8945,9 +8358,9 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 			dm_wv[1] = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(dm_all)));
 
 			for (int r = 0; r < MR; r++) {
-				const uint8_t *restrict qbytes = dblk + Q5_K_R8_OFF_QS + ((size_t)r * 128);
-				const uint8_t *restrict qh	   = dblk + Q5_K_R8_OFF_QH + ((size_t)r * 32);
-				const uint8_t *restrict sc	   = dblk + Q5_K_R8_OFF_SE + ((size_t)r * 16);
+				const uint8_t *restrict qbytes = dblk + Q5_K_REPACKED_OFF_QS + ((size_t)r * 128);
+				const uint8_t *restrict qh	   = dblk + Q5_K_REPACKED_OFF_QH + ((size_t)r * 32);
+				const uint8_t *restrict sc	   = dblk + Q5_K_REPACKED_OFF_SE + ((size_t)r * 16);
 
 				int32x4_t sumi_vec0 = vdupq_n_s32(0);
 				int32x4_t sumi_vec1 = vdupq_n_s32(0);
@@ -9047,20 +8460,20 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 	}
 
 	for (; i < n; i++) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q5_K_R8_ROWS)) * blocks_per_row * Q5_K_R8_GROUP_BYTES;
-		const int	   slot	 = i % Q5_K_R8_ROWS;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q5_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q5_K_REPACKED_GROUP_BYTES;
+		const int	   slot	 = i % Q5_K_REPACKED_ROWS;
 		float		   sumf	 = 0.0f;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t *dblk = group + ((size_t)bi * Q5_K_R8_GROUP_BYTES);
+			const uint8_t *dblk = group + ((size_t)bi * Q5_K_REPACKED_GROUP_BYTES);
 			const float	   d =
-				f16_to_f32_fast(*(const uint16_t *)(dblk + Q5_K_R8_OFF_D + (size_t)slot * 2));
-			const float dmin =
-				f16_to_f32_fast(*(const uint16_t *)(dblk + Q5_K_R8_OFF_DMIN + (size_t)slot * 2));
-			const uint8_t *restrict sc = dblk + Q5_K_R8_OFF_SE + ((size_t)slot * 16);
-			const uint8_t *restrict qh = dblk + Q5_K_R8_OFF_QH + ((size_t)slot * 32);
-			const uint8_t *restrict qb = dblk + Q5_K_R8_OFF_QS + ((size_t)slot * 128);
+				f16_to_f32_fast(*(const uint16_t *)(dblk + Q5_K_REPACKED_OFF_D + (size_t)slot * 2));
+			const float dmin = f16_to_f32_fast(
+				*(const uint16_t *)(dblk + Q5_K_REPACKED_OFF_DMIN + (size_t)slot * 2));
+			const uint8_t *restrict sc = dblk + Q5_K_REPACKED_OFF_SE + ((size_t)slot * 16);
+			const uint8_t *restrict qh = dblk + Q5_K_REPACKED_OFF_QH + ((size_t)slot * 32);
+			const uint8_t *restrict qb = dblk + Q5_K_REPACKED_OFF_QS + ((size_t)slot * 128);
 
 			const q8_k_block *xb   = &xq[bi];
 			int32_t			  sumi = 0, summ = 0;
@@ -9092,9 +8505,9 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 }
 
 #define NR 4
-static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
-											  size_t	  xq_row_stride_blocks, float *restrict y,
-											  int y_row_stride, int n, int k, int m) {
+static void matmul_q5_k_repacked_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
+													size_t xq_row_stride_blocks, float *restrict y,
+													int y_row_stride, int n, int k, int m) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
@@ -9104,8 +8517,8 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 	const uint8x16_t zero_vec = vdupq_n_u8(0);
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q5_K_R8_ROWS)) * blocks_per_row * Q5_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q5_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q5_K_REPACKED_GROUP_BYTES;
 
 		static _Thread_local int8x16_t(*lo_cache)[MR][4][2] = NULL;
 		static _Thread_local int8x16_t(*hi_cache)[MR][4][2] = NULL;
@@ -9128,9 +8541,9 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 					   tls_realloc((void **)&dmin_cache, sizeof(*dmin_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
-					matmul_q5_k_r8_q8_k_qonly_f32_vec_single(
+					matmul_q5_k_repacked_q8_k_qonly_f32_vec_single(
 						group, xq + ((size_t)t * xq_row_stride_blocks),
-						y + ((size_t)t * y_row_stride) + i, Q5_K_R8_ROWS, k);
+						y + ((size_t)t * y_row_stride) + i, Q5_K_REPACKED_ROWS, k);
 				continue;
 			}
 			cache_cap = blocks_per_row;
@@ -9145,18 +8558,18 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		}
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q5_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q5_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q5_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_D);
-			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q5_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_D);
+			const uint16_t *restrict ms	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_DMIN);
 
 			for (int r = 0; r < MR; r++) {
 				d_cache[bi][r]				   = f16_to_f32_fast(ds[r]);
 				dmin_cache[bi][r]			   = f16_to_f32_fast(ms[r]);
-				const uint8_t *restrict qbytes = dblk + Q5_K_R8_OFF_QS + ((size_t)r * 128);
-				const uint8_t *restrict qh	   = dblk + Q5_K_R8_OFF_QH + ((size_t)r * 32);
-				const uint8_t *restrict se	   = dblk + Q5_K_R8_OFF_SE + ((size_t)r * 16);
+				const uint8_t *restrict qbytes = dblk + Q5_K_REPACKED_OFF_QS + ((size_t)r * 128);
+				const uint8_t *restrict qh	   = dblk + Q5_K_REPACKED_OFF_QH + ((size_t)r * 32);
+				const uint8_t *restrict se	   = dblk + Q5_K_REPACKED_OFF_SE + ((size_t)r * 16);
 
 				int		   is	  = 0;
 				uint8x16_t u1_vec = vdupq_n_u8(1);
@@ -9307,43 +8720,44 @@ static void matmul_q5_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		}
 
 		for (; t < m; t++)
-			matmul_q5_k_r8_q8_k_qonly_f32_vec_single(group, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride) + i,
-													 Q5_K_R8_ROWS, k);
+			matmul_q5_k_repacked_q8_k_qonly_f32_vec_single(
+				group, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride) + i,
+				Q5_K_REPACKED_ROWS, k);
 	}
 
 	if (i < n)
-		matmul_q5_k_r8_q8_k_qonly_f32_vec_single((const uint8_t *)Wb +
-													 ((size_t)(i / Q5_K_R8_ROWS)) * blocks_per_row *
-														 Q5_K_R8_GROUP_BYTES,
-												 xq, y + (size_t)i, n - i, k);
+		matmul_q5_k_repacked_q8_k_qonly_f32_vec_single(
+			(const uint8_t *)Wb +
+				((size_t)(i / Q5_K_REPACKED_ROWS)) * blocks_per_row * Q5_K_REPACKED_GROUP_BYTES,
+			xq, y + (size_t)i, n - i, k);
 }
 #undef NR
 
-void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m) {
+void matmul_q5_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % Q5_K_R8_ROWS);
+		int n_full = n - (n % Q5_K_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_q5_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-														 y + ((size_t)t * y_row_stride), n_full, n,
-														 k);
+				matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
-			matmul_q5_k_r8_q8_k_qonly_f32_vec_single(w, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride), n, k);
+			matmul_q5_k_repacked_q8_k_qonly_f32_vec_single(
+				w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride), n, k);
 		return;
 	}
-	matmul_q5_k_r8_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_q5_k_repacked_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 }
 
-static void matmul_q6_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_block *restrict xq,
-													 float *restrict y, int n, int k) {
+static void matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
+														   const q8_k_block *restrict xq,
+														   float *restrict y, int n, int k) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
@@ -9356,16 +8770,16 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 	const int8x16_t	 bias_32 = vdupq_n_s8(32);
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q6_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q6_K_REPACKED_GROUP_BYTES;
 		float32x4_t	   acc0	 = vdupq_n_f32(0.0f);
 		float32x4_t	   acc1	 = vdupq_n_f32(0.0f);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_R8_OFF_D);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_REPACKED_OFF_D);
 
 			const q8_k_block *restrict yb = &xq[bi];
 			const float d_xq			  = yb->d;
@@ -9373,10 +8787,10 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 			int32_t sumi_lane[MR];
 
 			for (int r = 0; r < MR; r++) {
-				const uint8_t *restrict ql = dblk + Q6_K_R8_OFF_QL + ((size_t)r * 128);
-				const uint8_t *restrict qh = dblk + Q6_K_R8_OFF_QH + ((size_t)r * 64);
+				const uint8_t *restrict ql = dblk + Q6_K_REPACKED_OFF_QL + ((size_t)r * 128);
+				const uint8_t *restrict qh = dblk + Q6_K_REPACKED_OFF_QH + ((size_t)r * 64);
 				const int8_t *restrict sc =
-					(const int8_t *)(dblk + Q6_K_R8_OFF_SCALES + ((size_t)r * 16));
+					(const int8_t *)(dblk + Q6_K_REPACKED_OFF_SCALES + ((size_t)r * 16));
 				const int8_t *restrict xq8r = yb->qs;
 
 				int8x16_t  wvec[16];
@@ -9468,18 +8882,18 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 	}
 
 	for (; i < n; i++) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
-		const int	   slot	 = i % Q6_K_R8_ROWS;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q6_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q6_K_REPACKED_GROUP_BYTES;
+		const int	   slot	 = i % Q6_K_REPACKED_ROWS;
 		float		   sumf	 = 0.0f;
 		q6_k_block	   tmp;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t *dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
-			memcpy(tmp.ql, dblk + Q6_K_R8_OFF_QL + (size_t)slot * 128, 128);
-			memcpy(tmp.qh, dblk + Q6_K_R8_OFF_QH + (size_t)slot * 64, 64);
-			memcpy(tmp.scales, dblk + Q6_K_R8_OFF_SCALES + (size_t)slot * 16, 16);
-			tmp.d = *(const uint16_t *)(dblk + Q6_K_R8_OFF_D + (size_t)slot * 2);
+			const uint8_t *dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
+			memcpy(tmp.ql, dblk + Q6_K_REPACKED_OFF_QL + (size_t)slot * 128, 128);
+			memcpy(tmp.qh, dblk + Q6_K_REPACKED_OFF_QH + (size_t)slot * 64, 64);
+			memcpy(tmp.scales, dblk + Q6_K_REPACKED_OFF_SCALES + (size_t)slot * 16, 16);
+			tmp.d = *(const uint16_t *)(dblk + Q6_K_REPACKED_OFF_D + (size_t)slot * 2);
 
 			const q8_k_block *yb = &xq[bi];
 			const float		  d	 = f16_to_f32_fast(tmp.d) * yb->d;
@@ -9514,16 +8928,18 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_single(const void *w, const q8_k_b
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_block *restrict xq,
-												   size_t xq_row_stride_blocks, float *restrict y,
-												   int y_row_stride, int n, int k, int m) {
+static void matmul_q6_k_repacked_q8_k_qonly_f32_vec_i8mm(const void *w,
+														 const q8_k_block *restrict xq,
+														 size_t xq_row_stride_blocks,
+														 float *restrict y, int y_row_stride, int n,
+														 int k, int m) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q6_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q6_K_REPACKED_GROUP_BYTES;
 
 		static _Thread_local int8_t (*q_unpack_cache)[MR][256] = NULL;
 		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
@@ -9535,9 +8951,9 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 				tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
-					matmul_q6_k_r8_q8_k_qonly_f32_vec_single(
+					matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
 						group, xq + ((size_t)t * xq_row_stride_blocks),
-						y + ((size_t)t * y_row_stride) + i, Q6_K_R8_ROWS, k);
+						y + ((size_t)t * y_row_stride) + i, Q6_K_REPACKED_ROWS, k);
 				continue;
 			}
 			cache_cap = blocks_per_row;
@@ -9546,15 +8962,15 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 		}
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_R8_OFF_D);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_REPACKED_OFF_D);
 
 			for (int r = 0; r < MR; r++) {
 				d_w_cache[bi][r]		   = f16_to_f32_fast(ds[r]);
-				const uint8_t *restrict ql = dblk + Q6_K_R8_OFF_QL + ((size_t)r * 128);
-				const uint8_t *restrict qh = dblk + Q6_K_R8_OFF_QH + ((size_t)r * 64);
+				const uint8_t *restrict ql = dblk + Q6_K_REPACKED_OFF_QL + ((size_t)r * 128);
+				const uint8_t *restrict qh = dblk + Q6_K_REPACKED_OFF_QH + ((size_t)r * 64);
 				int8_t *restrict a		   = q_unpack_cache[bi][r];
 				q6_k_unpack_2blk(ql, qh, a);
 			}
@@ -9572,8 +8988,8 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
-				const int8_t *restrict scs	 = (const int8_t *)(dblk + Q6_K_R8_OFF_SCALES);
+				const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
+				const int8_t *restrict scs	 = (const int8_t *)(dblk + Q6_K_REPACKED_OFF_SCALES);
 
 				float d_xq_arr[I8MM_NR];
 				const int8_t *restrict q8p[I8MM_NR];
@@ -9643,30 +9059,30 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(const void *w, const q8_k_blo
 		}
 
 		for (; t < m; t++)
-			matmul_q6_k_r8_q8_k_qonly_f32_vec_single(group, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride) + i,
-													 Q6_K_R8_ROWS, k);
+			matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
+				group, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride) + i,
+				Q6_K_REPACKED_ROWS, k);
 	}
 
 	if (i < n)
-		matmul_q6_k_r8_q8_k_qonly_f32_vec_single((const uint8_t *)Wb +
-													 ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row *
-														 Q6_K_R8_GROUP_BYTES,
-												 xq, y + (size_t)i, n - i, k);
+		matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
+			(const uint8_t *)Wb +
+				((size_t)(i / Q6_K_REPACKED_ROWS)) * blocks_per_row * Q6_K_REPACKED_GROUP_BYTES,
+			xq, y + (size_t)i, n - i, k);
 }
 #endif
 
 #define NR 4
-static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
-											  size_t	  xq_row_stride_blocks, float *restrict y,
-											  int y_row_stride, int n, int k, int m) {
+static void matmul_q6_k_repacked_q8_k_qonly_f32_vec(const void *w, const q8_k_block *restrict xq,
+													size_t xq_row_stride_blocks, float *restrict y,
+													int y_row_stride, int n, int k, int m) {
 	int			   blocks_per_row = k / 256;
 	const uint8_t *Wb			  = w;
 	int			   i			  = 0;
 
 	for (; i + MR <= n; i += MR) {
-		const uint8_t *group = (const uint8_t *)Wb +
-							   ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
+		const uint8_t *group = (const uint8_t *)Wb + ((size_t)(i / Q6_K_REPACKED_ROWS)) *
+														 blocks_per_row * Q6_K_REPACKED_GROUP_BYTES;
 
 		static _Thread_local int8_t (*q_unpack_cache)[MR][256] = NULL;
 		static _Thread_local float (*d_w_cache)[MR]			   = NULL;
@@ -9678,9 +9094,9 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 				tls_realloc((void **)&d_w_cache, sizeof(*d_w_cache), blocks_per_row);
 			if (!grew) {
 				for (int t = 0; t < m; t++)
-					matmul_q6_k_r8_q8_k_qonly_f32_vec_single(
+					matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
 						group, xq + ((size_t)t * xq_row_stride_blocks),
-						y + ((size_t)t * y_row_stride) + i, Q6_K_R8_ROWS, k);
+						y + ((size_t)t * y_row_stride) + i, Q6_K_REPACKED_ROWS, k);
 				continue;
 			}
 			cache_cap = blocks_per_row;
@@ -9689,15 +9105,15 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		}
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_R8_GROUP_BYTES);
+			PREFETCH(group + ((size_t)(bi + 1)) * Q6_K_REPACKED_GROUP_BYTES);
 
-			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
-			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_R8_OFF_D);
+			const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
+			const uint16_t *restrict ds	 = (const uint16_t *)(dblk + Q6_K_REPACKED_OFF_D);
 
 			for (int r = 0; r < MR; r++) {
 				d_w_cache[bi][r]		   = f16_to_f32_fast(ds[r]);
-				const uint8_t *restrict ql = dblk + Q6_K_R8_OFF_QL + ((size_t)r * 128);
-				const uint8_t *restrict qh = dblk + Q6_K_R8_OFF_QH + ((size_t)r * 64);
+				const uint8_t *restrict ql = dblk + Q6_K_REPACKED_OFF_QL + ((size_t)r * 128);
+				const uint8_t *restrict qh = dblk + Q6_K_REPACKED_OFF_QH + ((size_t)r * 64);
 				int8_t *restrict a		   = q_unpack_cache[bi][r];
 				q6_k_unpack_2blk(ql, qh, a);
 			}
@@ -9714,7 +9130,7 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_R8_GROUP_BYTES);
+				const uint8_t *restrict dblk = group + ((size_t)bi * Q6_K_REPACKED_GROUP_BYTES);
 				float *d_w					 = d_w_cache[bi];
 
 				float xd_arr[NR];
@@ -9726,7 +9142,7 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 
 				for (int r = 0; r < MR; r++) {
 					const int8_t *restrict sc =
-						(const int8_t *)(dblk + Q6_K_R8_OFF_SCALES + ((size_t)r * 16));
+						(const int8_t *)(dblk + Q6_K_REPACKED_OFF_SCALES + ((size_t)r * 16));
 					const int8_t *restrict a = q_unpack_cache[bi][r];
 
 					const int8_t *restrict q8p[NR];
@@ -9798,46 +9214,46 @@ static void matmul_q6_k_r8_q8_k_qonly_f32_vec(const void *w, const q8_k_block *r
 		}
 
 		for (; t < m; t++)
-			matmul_q6_k_r8_q8_k_qonly_f32_vec_single(group, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride) + i,
-													 Q6_K_R8_ROWS, k);
+			matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
+				group, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride) + i,
+				Q6_K_REPACKED_ROWS, k);
 	}
 
 	if (i < n)
-		matmul_q6_k_r8_q8_k_qonly_f32_vec_single((const uint8_t *)Wb +
-													 ((size_t)(i / Q6_K_R8_ROWS)) * blocks_per_row *
-														 Q6_K_R8_GROUP_BYTES,
-												 xq, y + (size_t)i, n - i, k);
+		matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
+			(const uint8_t *)Wb +
+				((size_t)(i / Q6_K_REPACKED_ROWS)) * blocks_per_row * Q6_K_REPACKED_GROUP_BYTES,
+			xq, y + (size_t)i, n - i, k);
 }
 #undef NR
 
-void matmul_q6_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m) {
+void matmul_q6_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
 	{
-		int n_full = n - (n % Q6_K_R8_ROWS);
+		int n_full = n - (n % Q6_K_REPACKED_ROWS);
 		if (n_full < n) {
 			for (int t = 0; t < m; t++)
-				matmul_q6_k_r8_q8_k_qonly_f32_rows_range(w, xq + ((size_t)t * xq_row_stride_blocks),
-														 y + ((size_t)t * y_row_stride), n_full, n,
-														 k);
+				matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(
+					w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride),
+					n_full, n, k);
 		}
 		n = n_full;
 	}
 #if defined(__ARM_FEATURE_MATMUL_INT8)
 	if (m >= I8MM_NR) {
-		matmul_q6_k_r8_q8_k_qonly_f32_vec_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k,
-											   m);
+		matmul_q6_k_repacked_q8_k_qonly_f32_vec_i8mm(w, xq, xq_row_stride_blocks, y, y_row_stride,
+													 n, k, m);
 		return;
 	}
 #endif
 	if (m < 4) {
 		for (int t = 0; t < m; t++)
-			matmul_q6_k_r8_q8_k_qonly_f32_vec_single(w, xq + ((size_t)t * xq_row_stride_blocks),
-													 y + ((size_t)t * y_row_stride), n, k);
+			matmul_q6_k_repacked_q8_k_qonly_f32_vec_single(
+				w, xq + ((size_t)t * xq_row_stride_blocks), y + ((size_t)t * y_row_stride), n, k);
 		return;
 	}
-	matmul_q6_k_r8_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
+	matmul_q6_k_repacked_q8_k_qonly_f32_vec(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m);
 }
 static inline int32_t neon_dot16(const int8_t *a, const int8_t *b) {
 	int8x16_t av = vld1q_s8(a);

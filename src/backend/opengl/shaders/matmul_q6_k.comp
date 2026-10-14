@@ -81,7 +81,7 @@ uvec4 load_span(uint wbase, uint par) {
 				 (d >> 16u) | (e << 16u));
 }
 
-#ifdef R8
+#ifdef REPACKED
 void q6_spans(uint rowg, int bi, int sbit, int lhalf, out uvec4 qa, out uvec4 qb, out uvec4 qh) {
 	uint gw = (rowg >> 3u) * uint(u_k_blocks) * 420u + uint(bi) * 420u;
 	uint lb = gw + (rowg & 7u) * 32u + uint(sbit * 16 + lhalf * 4);

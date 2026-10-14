@@ -34,13 +34,13 @@ uint g_mi;
 #define HBIT 0x00100010u
 #define QB 44u
 #define QBOFF 12u
-#define R8B 360u
-#define R8O 104u
+#define REPACKED_BLOCK_BYTES 360u
+#define REPACKED_DATA_OFFSET 104u
 #else
 #define QB 36u
 #define QBOFF 4u
-#define R8B 296u
-#define R8O 40u
+#define REPACKED_BLOCK_BYTES 296u
+#define REPACKED_DATA_OFFSET 40u
 #endif
 
 shared float s_acc[ROWS][WG + 1];
@@ -78,21 +78,24 @@ void scale_min(uvec3 sw, int j, out uint sc, out uint mn) {
 	mn		= ((hi >> 4u) & 0xFu) | (((sw.y >> sh) >> 6u & 3u) << 4u);
 }
 
-#ifdef R8
+#ifdef REPACKED
 uint qs_base(uint rowg, int bi, int g) {
-	return (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B + R8O + (rowg & 7u) * 32u +
+	return (rowg >> 3u) * uint(u_k_blocks) * REPACKED_BLOCK_BYTES +
+		   uint(bi) * REPACKED_BLOCK_BYTES + REPACKED_DATA_OFFSET + (rowg & 7u) * 32u +
 		   uint(g) * 8u;
 }
 
 #ifdef Q5K
 uint qh_base(uint rowg, int bi) {
-	return (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B + 40u + (rowg & 7u) * 8u;
+	return (rowg >> 3u) * uint(u_k_blocks) * REPACKED_BLOCK_BYTES +
+		   uint(bi) * REPACKED_BLOCK_BYTES + 40u + (rowg & 7u) * 8u;
 }
 #endif
 
 void row_header(uint rowg, int bi, int g, out float d, out float dm, out uint sc0, out uint mn0,
 				out uint sc1, out uint mn1) {
-	uint gw	 = (rowg >> 3u) * uint(u_k_blocks) * R8B + uint(bi) * R8B;
+	uint gw =
+		(rowg >> 3u) * uint(u_k_blocks) * REPACKED_BLOCK_BYTES + uint(bi) * REPACKED_BLOCK_BYTES;
 	uint rin = rowg & 7u;
 	uint dw	 = wu(gw + (rin >> 1u));
 	uint mw	 = wu(gw + 4u + (rin >> 1u));
