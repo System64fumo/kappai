@@ -197,6 +197,17 @@ typedef struct {
 	uint8_t  qs[128];
 } cuda_q5_k_block;
 
+/* Q6_K block: 256 elements, 4 groups of 64 elements each.
+ * Structure: ql[128] (low 4 bits), qh[64] (high 2 bits), scales[16] (int8,
+ * one per 16-element sub-group), d (F16). Total 210 bytes -- field order must
+ * match the CPU q6_k_block exactly. */
+typedef struct {
+	uint8_t  ql[128];
+	uint8_t  qh[64];
+	int8_t   scales[16];
+	uint16_t d;
+} cuda_q6_k_block;
+
 /* Host-side helpers (resolved from the scalar backend's weak definitions so
  * that dequant scales match the CPU reference bit-for-bit). */
 #ifdef __cplusplus
@@ -360,6 +371,22 @@ status_code cuda_moe_scale_accum(float *out, const float *src, int n_rows, int d
 /* Q4_K weight matmul: quantizes x internally (Q8_K), then y = W * x. */
 void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                       cudaStream_t stream);
+
+/* Q6_K weight matmul: quantizes x internally (Q8_K), then y = W * x.
+ * Mirrors q6_k_r8_dot() in backend/cpu/scalar/quants.c. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_q6_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q6_k_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+void cuda_matmul_batch_q6_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                            int m, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
 
 /* Fused multi-column matmul.  All columns share x (quantized once);
  * w_dev/y_dev are device pointer arrays of length nm, n_host holds the

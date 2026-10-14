@@ -4432,6 +4432,157 @@ extern "C" void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
 }
 
 /* ------------------------------------------------------------------ */
+/* Q6_K: 256 elements/block = 4 groups of 64.                           */
+/*                                                                   */
+/* Layout (matches CPU q6_k_block exactly):                           */
+/*   ql[128]  low 4 bits of each quant, 4 sub-groups of 32           */
+/*   qh[64]   high 2 bits of each quant                               */
+/*   scales[16] one int8 per 16-element sub-group (16 per block)     */
+/*   d (F16)   block scale                                            */
+/*                                                                   */
+/* x is quantized to Q8_K first, so the dot product is exact integer  */
+/* math (q6_k_r8_dot in backend/cpu/scalar/quants.c). Quant unpack    */
+/* order and the scale-grouping loop are load-bearing: the reference  */
+/* accumulates per 16-element sub-group and multiplies by that        */
+/* sub-group's scale before summing, so a plain flat dot product      */
+/* drifts outside the cross-backend tolerance band.                   */
+/* ------------------------------------------------------------------ */
+
+/* Unpack 256 six-bit quants for one block into a[256] (-32 offset),
+ * following q6_k_r8_dot()'s exact sub-group order:
+ *   ap[0..31]    <- ql[l]     low nibble  + qh bits 0..1
+ *   ap[32..63]   <- ql[l+32]  low nibble  + qh bits 2..3
+ *   ap[64..95]   <- ql[l]     high nibble + qh bits 4..5
+ *   ap[96..127]  <- ql[l+32]  high nibble + qh bits 6..7
+ * repeated for the second 128 (ql += 64, qh += 32). */
+static __device__ __forceinline__ void q6_k_unpack(const cuda_q6_k_block *blk, int8_t *a) {
+    const uint8_t *ql = blk->ql;
+    const uint8_t *qh = blk->qh;
+    for (int half = 0; half < 2; half++) {
+        for (int l = 0; l < 32; l++) {
+            const uint8_t qhl = qh[l];
+            const uint8_t q0  = ql[l];
+            const uint8_t q1  = ql[l + 32];
+            a[half * 128 + l]      = (int8_t)(((q0 & 0xF) | ((qhl >> 0) & 3) << 4) - 32);
+            a[half * 128 + l + 32] = (int8_t)(((q1 & 0xF) | ((qhl >> 2) & 3) << 4) - 32);
+            a[half * 128 + l + 64] = (int8_t)(((q0 >> 4) | ((qhl >> 4) & 3) << 4) - 32);
+            a[half * 128 + l + 96] = (int8_t)(((q1 >> 4) | ((qhl >> 6) & 3) << 4) - 32);
+        }
+        ql += 64;
+        qh += 32;
+    }
+}
+
+/* One Q6_K block dot product against Q8_K activation blocks.
+ * xq8 points at this block's 256 int8 values, bsums at its 16 int16 sums. */
+static __device__ __forceinline__ float q6_k_dot(const cuda_q6_k_block *blk, const int8_t *xq8,
+                                                 const int16_t *bsums, float d_xq, float acc) {
+    int8_t a[256];
+    q6_k_unpack(blk, a);
+
+    int32_t total = 0;
+    /* 16 sub-groups of 16 elements; each is scaled by scales[j]. */
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        int32_t l0 = 0;
+        int32_t l1 = 0;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) {
+            l0 += (int)xq8[l] * (int)a[j * 16 + l];
+            l1 += (int)xq8[l + 8] * (int)a[j * 16 + l + 8];
+        }
+        total += (int)blk->scales[j] * (l0 + l1);
+        xq8 += 16;
+    }
+    const float d = __half2float(__ushort_as_half(blk->d));
+    return acc + (d * d_xq) * (float)total;
+}
+
+__global__ void matmul_q6_k_kernel(const cuda_q6_k_block *__restrict__ w,
+                                   const cuda_q8_k_block *__restrict__ xq,
+                                   float *__restrict__ y, int n, int k) {
+    const int nb  = k >> 8; /* 256 elements per block */
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_q6_k_block *wrow = w + (size_t)row * nb;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += MM_LANES) {
+        const cuda_q8_k_block *xb = xq + b;
+        acc = q6_k_dot(wrow + b, xb->qs, xb->bsums, xb->d, acc);
+    }
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc;
+}
+
+__global__ void matmul_q6_k_residual_kernel(const cuda_q6_k_block *__restrict__ w,
+                                            const cuda_q8_k_block *__restrict__ xq,
+                                            const float *__restrict__ residual,
+                                            float *__restrict__ y, int n, int k) {
+    const int nb  = k >> 8;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_q6_k_block *wrow = w + (size_t)row * nb;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += MM_LANES) {
+        const cuda_q8_k_block *xb = xq + b;
+        acc = q6_k_dot(wrow + b, xb->qs, xb->bsums, xb->d, acc);
+    }
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc + residual[row];
+}
+
+__global__ void matmul_q6_k_batch_kernel(const cuda_q6_k_block *__restrict__ w,
+                                         const cuda_q8_k_block *__restrict__ xq,
+                                         float *__restrict__ y, int n, int k, int m) {
+    const int nb  = k >> 8;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_q6_k_block *wrow = w + (size_t)row * nb;
+
+    for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
+        const int nt = min(MM_TOK_TILE, m - t0);
+        float acc[MM_TOK_TILE];
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++)
+            acc[t] = 0.0f;
+        for (int b = lane; b < nb; b += MM_LANES) {
+            const cuda_q6_k_block *wb = wrow + b;
+            #pragma unroll
+            for (int t = 0; t < MM_TOK_TILE; t++) {
+                if (t >= nt)
+                    break;
+                const cuda_q8_k_block *xb = xq + ((size_t)(t0 + t) * nb + b);
+                acc[t] = q6_k_dot(wb, xb->qs, xb->bsums, xb->d, acc[t]);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) {
+            if (t >= nt)
+                break;
+            float v = acc[t];
+            #pragma unroll
+            for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            if ((threadIdx.x & (MM_LANES - 1)) == 0)
+                y[(size_t)(t0 + t) * n + row] = v;
+        }
+    }
+}
+/* ------------------------------------------------------------------ */
 /* MMVQ: MatMul-Vec-Q for M=1 decode.                                  */
 /*                                                                     */
 /* Decode is bandwidth-bound, so the batched row-per-warp layout wastes */
@@ -4444,6 +4595,70 @@ extern "C" void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
 /* ------------------------------------------------------------------ */
 
 #define MMVQ_WARPS 4
+
+/* Decode one Q6_K element without staging the whole 256-entry block in local
+ * memory. Element e selects half (e>>7), 64-wide group (e>>5)&3 and offset
+ * e&31; the four groups consume the low/high nibble of ql and the matching
+ * 2 bits of qh, which is exactly the order q6_k_unpack() writes them in. */
+static __device__ __forceinline__ int8_t q6_k_elem(const cuda_q6_k_block *blk, int e) {
+    const int      half   = e >> 7;
+    const int      within = e & 127;
+    const int      grp    = within >> 5; /* 0..3 */
+    const int      l      = within & 31;
+    const uint8_t *ql     = blk->ql + half * 64;
+    const uint8_t *qh     = blk->qh + half * 32;
+    const uint8_t  q0     = ql[l];
+    const uint8_t  q1     = ql[l + 32];
+    const uint8_t  qhl    = qh[l];
+    int v;
+    if (grp == 0)      v = ((q0 & 0xF) | (((qhl >> 0) & 3) << 4)) - 32;
+    else if (grp == 1) v = ((q1 & 0xF) | (((qhl >> 2) & 3) << 4)) - 32;
+    else if (grp == 2) v = ((q0 >> 4)  | (((qhl >> 4) & 3) << 4)) - 32;
+    else               v = ((q1 >> 4)  | (((qhl >> 6) & 3) << 4)) - 32;
+    return (int8_t)v;
+}
+
+/* One warp per row, and within a block each lane owns 8 of the 256 elements.
+ * A 16-element scale sub-group spans exactly 2 lanes, so every lane's partial
+ * carries a single sub-group scale and the warp tree sums them directly. */
+__global__ void matmul_q6_k_mmvq_kernel(const cuda_q6_k_block *__restrict__ w,
+                                        const cuda_q8_k_block *__restrict__ xq,
+                                        float *__restrict__ y, int n, int k) {
+    const int nb   = k >> 8;
+    const int lane = threadIdx.x & 31;
+    const int wid  = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int row = blockIdx.x * nwarps + wid;
+    if (row >= n) return;
+
+    const cuda_q6_k_block *wrow = w + (size_t)row * nb;
+    float acc = 0.0f;
+
+    for (int b = wid; b < nb; b += nwarps) {
+        const cuda_q6_k_block *blk = wrow + b;
+        const cuda_q8_k_block *xb  = xq + b;
+
+        /* Each lane owns 8 of the block's 256 elements. lane*8..lane*8+7 never
+         * crosses a 16-element scale sub-group, so the partial carries exactly
+         * one scale and the warp tree sums the 16 sub-groups directly. */
+        int32_t local = 0;
+        #pragma unroll
+        for (int t = 0; t < 8; t++) {
+            const int e = lane * 8 + t;
+            local += (int)xb->qs[e] * (int)q6_k_elem(blk, e);
+        }
+        int32_t part = (int)blk->scales[lane >> 1] * local;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            part += __shfl_xor_sync(0xffffffff, part, off);
+
+        if (lane == 0)
+            acc = fmaf(__half2float(__ushort_as_half(blk->d)) * xb->d, (float)part, acc);
+    }
+
+    if (lane == 0)
+        y[row] = acc;
+}
 
 __global__ void matmul_iq4_nl_mmvq_kernel(const cuda_iq4_nl_block *__restrict__ w,
                                           const cuda_q8_0_block *__restrict__ xq,
@@ -4476,6 +4691,39 @@ __global__ void matmul_iq4_nl_mmvq_kernel(const cuda_iq4_nl_block *__restrict__ 
             total += smem[i];
         y[row] = total;
     }
+}
+extern "C" void cuda_matmul_q6_k(const void *w_dev, const float *x_dev, float *y_dev, int n,
+                                  int k, cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 255))
+        return;
+    cuda_q8_k_block *xq_dev = q8k_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        /* Decode: one row, so spread the k-blocks across all threads. */
+        matmul_q6_k_mmvq_kernel<<<(n + MMVQ_NWARPS - 1) / MMVQ_NWARPS,
+                                  MMVQ_NWARPS * 32, 0, stream>>>(
+            (const cuda_q6_k_block *)w_dev, xq_dev, y_dev, n, k);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        matmul_q6_k_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+            (const cuda_q6_k_block *)w_dev, xq_dev, y_dev, n, k);
+    }
+}
+
+extern "C" void cuda_matmul_q6_k_residual(const void *w_dev, const float *x_dev,
+                                          const float *residual_dev, float *y_dev, int n, int k,
+                                          cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 255))
+        return;
+    cuda_q8_k_block *xq_dev = q8k_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q6_k_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q6_k_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
 }
 /* ------------------------------------------------------------------ */
 /* Q5_0 / Q5_1: 32 elements/block, 5-bit values.                        */
@@ -4876,6 +5124,12 @@ extern "C" void cuda_matmul_q5_k_residual(const void *w_dev, const float *x_dev,
     matmul_q5_k_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q5_k_block *)w_dev, xq, residual_dev, y_dev, n, k);
 }
+
+/* ------------------------------------------------------------------ */
+/* Q6_K host-side launchers                                            */
+/* ------------------------------------------------------------------ */
+
+
 
 extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
@@ -10142,6 +10396,20 @@ extern "C" void cuda_matmul_batch_iq4_nl(const void *w_dev, const float *x_dev, 
     dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     matmul_iq4_nl_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_iq4_nl_block *)w_dev, xq, y_dev, n, k, m);
+}
+
+extern "C" void cuda_matmul_batch_q6_k(const void *w_dev, const float *x_dev, float *y_dev,
+                                       int n, int k, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0 || k <= 0 || (k & 255))
+        return;
+    const int nb = k / 256;
+    cuda_q8_k_block *xq = q8k_scratch_for_batch(k, m);
+    if (!xq)
+        return;
+    q8_k_quant_batch_kernel<<<(((size_t)m * nb) + 255) / 256, 256, 0, stream>>>(x_dev, xq, k, m);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q6_k_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q6_k_block *)w_dev, xq, y_dev, n, k, m);
 }
 
 /* Batched Q5_0 / Q5_1 / Q5_K / IQ3_S launchers. At the end of the file so they
