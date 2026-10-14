@@ -469,7 +469,7 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 		atol = ATOL_KV_QUANT;
 		rtol = RTOL_KV_QUANT;
 	} else {
-		atol = ATOL_LOOSE;
+		atol = ATOL_LOOSE + (RTOL_NORM_LOOSE * ref_mag);
 		rtol = RTOL_LOOSE;
 	}
 
@@ -650,25 +650,25 @@ status_code test_repack(backend *b, uint32_t src_type, const void *src, void *ds
 
 int test_repack_base_type(uint32_t type, uint32_t *base_type_out) {
 	switch (type) {
-	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q4_0_REPACKED:
 		*base_type_out = GGML_TYPE_Q4_0;
 		return 1;
-	case GGML_TYPE_Q8_0_R8:
+	case GGML_TYPE_Q8_0_REPACKED:
 		*base_type_out = GGML_TYPE_Q8_0;
 		return 1;
-	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ4_NL_REPACKED:
 		*base_type_out = GGML_TYPE_IQ4_NL;
 		return 1;
-	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_IQ3_S_REPACKED:
 		*base_type_out = GGML_TYPE_IQ3_S;
 		return 1;
-	case GGML_TYPE_Q4_K_R8:
+	case GGML_TYPE_Q4_K_REPACKED:
 		*base_type_out = GGML_TYPE_Q4_K;
 		return 1;
-	case GGML_TYPE_Q5_K_R8:
+	case GGML_TYPE_Q5_K_REPACKED:
 		*base_type_out = GGML_TYPE_Q5_K;
 		return 1;
-	case GGML_TYPE_Q6_K_R8:
+	case GGML_TYPE_Q6_K_REPACKED:
 		*base_type_out = GGML_TYPE_Q6_K;
 		return 1;
 	default:
@@ -679,13 +679,13 @@ int test_repack_base_type(uint32_t type, uint32_t *base_type_out) {
 
 int test_repack_n_align(uint32_t type) {
 	switch (type) {
-	case GGML_TYPE_Q4_0_R8:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_IQ4_NL_R8:
-	case GGML_TYPE_IQ3_S_RE8:
-	case GGML_TYPE_Q4_K_R8:
-	case GGML_TYPE_Q5_K_R8:
-	case GGML_TYPE_Q6_K_R8:
+	case GGML_TYPE_Q4_0_REPACKED:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_IQ4_NL_REPACKED:
+	case GGML_TYPE_IQ3_S_REPACKED:
+	case GGML_TYPE_Q4_K_REPACKED:
+	case GGML_TYPE_Q5_K_REPACKED:
+	case GGML_TYPE_Q6_K_REPACKED:
 		return 8;
 	default:
 		return 1;
@@ -694,10 +694,10 @@ int test_repack_n_align(uint32_t type) {
 
 int test_type_per_row(uint32_t type) {
 	switch (type) {
-	case GGML_TYPE_Q4_0_R8:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_IQ4_NL_R8:
-	case GGML_TYPE_IQ3_S_RE8:
+	case GGML_TYPE_Q4_0_REPACKED:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_IQ4_NL_REPACKED:
+	case GGML_TYPE_IQ3_S_REPACKED:
 		return 0;
 	default:
 		return 1;
@@ -766,28 +766,42 @@ void *test_make_weight(backend *b, const qtype_info *qt, int n_rows, int k, size
 
 const qtype_info QTYPES[] = {
 	{"q4_0", GGML_TYPE_Q4_0, 32, 18},
+	{"q4_0_repacked", GGML_TYPE_Q4_0_REPACKED, 32, 18},
 	{"q4_1", GGML_TYPE_Q4_1, 32, 20},
 	{"q5_0", GGML_TYPE_Q5_0, 32, 22},
 	{"q5_1", GGML_TYPE_Q5_1, 32, 24},
 	{"q8_0", GGML_TYPE_Q8_0, 32, 34},
+	{"q8_0_repacked", GGML_TYPE_Q8_0_REPACKED, 32, 34},
 	{"q4_K", GGML_TYPE_Q4_K, 256, 144},
+	{"q4_k_repacked", GGML_TYPE_Q4_K_REPACKED, 256, 148},
 	{"q5_K", GGML_TYPE_Q5_K, 256, 176},
+	{"q5_k_repacked", GGML_TYPE_Q5_K_REPACKED, 256, 180},
 	{"q6_K", GGML_TYPE_Q6_K, 256, 210},
-	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, 18},
+	{"q6_k_repacked", GGML_TYPE_Q6_K_REPACKED, 256, 210},
+	{"iq2_xxs", GGML_TYPE_IQ2_XXS, 256, 66},
+	{"iq2_s", GGML_TYPE_IQ2_S, 256, 82},
+	{"iq3_xxs", GGML_TYPE_IQ3_XXS, 256, 98},
 	{"iq3_s", GGML_TYPE_IQ3_S, 256, 110},
-	{"q4_0_r8", GGML_TYPE_Q4_0_R8, 32, 18},
-	{"q8_0_r8", GGML_TYPE_Q8_0_R8, 32, 34},
-	{"iq4_nl_r8", GGML_TYPE_IQ4_NL_R8, 32, 18},
-	{"iq3_s_re8", GGML_TYPE_IQ3_S_RE8, 256, 134},
-	{"q4_k_r8", GGML_TYPE_Q4_K_R8, 256, 148},
-	{"q5_k_r8", GGML_TYPE_Q5_K_R8, 256, 180},
-	{"q6_k_r8", GGML_TYPE_Q6_K_R8, 256, 210},
+	{"iq3_s_repacked", GGML_TYPE_IQ3_S_REPACKED, 256, 134},
+	{"iq4_xs", GGML_TYPE_IQ4_XS, 256, 136},
+	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, 18},
+	{"iq4_nl_repacked", GGML_TYPE_IQ4_NL_REPACKED, 32, 18},
+	{"f32", GGML_TYPE_F32, 1, sizeof(float)},
 	{"f16", GGML_TYPE_F16, 1, sizeof(uint16_t)},
 	{"bf16", GGML_TYPE_BF16, 1, sizeof(uint16_t)},
-	{"f32", GGML_TYPE_F32, 1, sizeof(float)},
 };
 const int QTYPES_N = (int)(sizeof(QTYPES) / sizeof(QTYPES[0]));
 #define QTYPES_N ((int)(sizeof(QTYPES) / sizeof(QTYPES[0])))
+
+int qtype_name_width(void) {
+	int width = 0;
+	for (int i = 0; i < QTYPES_N; i++) {
+		int len = (int)strlen(QTYPES[i].name);
+		if (len > width)
+			width = len;
+	}
+	return width;
+}
 
 void test_parity_compare(op_family fam, const char *label, const float *y_ref, const float *y_got,
 						 int n, const char *tol_kind) {

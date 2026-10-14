@@ -112,9 +112,13 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		printf("  SKIPPED: backend has no matmul_batch\n");
 		return 0;
 	}
-	printf("  %-10s", "quant");
-	for (int mi = 0; mi < u->n_ms; mi++)
-		printf("   M=%-6d", u->ms[mi]);
+	int name_width = qtype_name_width();
+	printf("  %-*s", name_width, "quant");
+	for (int mi = 0; mi < u->n_ms; mi++) {
+		char label[16];
+		snprintf(label, sizeof(label), "M=%d", u->ms[mi]);
+		printf("   %7s", label);
+	}
 	printf("\n");
 	for (int qi = 0; qi < QTYPES_N; qi++) {
 		if (u->k % QTYPES[qi].block != 0)
@@ -124,7 +128,7 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		uint32_t repack_base;
 		if (test_repack_base_type(QTYPES[qi].type, &repack_base) && u->n % 8 != 0)
 			continue;
-		printf("  %-10s", QTYPES[qi].name);
+		printf("  %-*s", name_width, QTYPES[qi].name);
 		fflush(stdout);
 		for (int mi = 0; mi < u->n_ms; mi++) {
 			double g = bench_mul_gflops(b, &QTYPES[qi], u->n, u->k, u->ms[mi], u->iters);
@@ -247,7 +251,8 @@ static int bench_dequant_one(backend *b, const char *name, void *ud) {
 		printf("  SKIPPED: backend has no dequant_row\n");
 		return 0;
 	}
-	printf("  %-10s %10s %10s\n", "quant", "GB/s", "Gelem/s");
+	int name_width = qtype_name_width();
+	printf("  %-*s %10s %10s\n", name_width, "quant", "GB/s", "Gelem/s");
 	for (int qi = 0; qi < QTYPES_N; qi++) {
 		const qtype_info *qt = &QTYPES[qi];
 		if (qt->type == GGML_TYPE_F32 || qt->type == GGML_TYPE_F16 || qt->type == GGML_TYPE_BF16)
@@ -259,7 +264,7 @@ static int bench_dequant_one(backend *b, const char *name, void *ud) {
 		seed_test_rng(0xDE9ULL + qt->type);
 		fill_random_blocks(blocks, n_blocks, qt->bytes, qt->type);
 		if (b->dequant_row(b, qt->type, blocks, n_elems, dst) != OK) {
-			printf("  %-10s  SKIPPED (no native dequant)\n", qt->name);
+			printf("  %-*s  SKIPPED (no native dequant)\n", name_width, qt->name);
 			free(blocks);
 			free(dst);
 			continue;
@@ -281,7 +286,7 @@ static int bench_dequant_one(backend *b, const char *name, void *ud) {
 		size_t in_bytes = (size_t)n_blocks * qt->bytes;
 		double gbs		= best_us > 0 ? (double)in_bytes / (double)best_us / 1e3 : 0.0;
 		double gels		= best_us > 0 ? (double)n_elems / (double)best_us / 1e3 : 0.0;
-		printf("  %-10s %10.1f %10.1f\n", qt->name, gbs, gels);
+		printf("  %-*s %10.1f %10.1f\n", name_width, qt->name, gbs, gels);
 		fflush(stdout);
 		free(blocks);
 		free(dst);

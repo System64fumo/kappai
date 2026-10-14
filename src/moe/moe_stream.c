@@ -293,28 +293,12 @@ void moe_stream_thread_cleanup(void) {
 	tl_bounce_align = 0;
 }
 
-static ssize_t pread_full(int fd, uint8_t *dst, size_t len, off_t off) {
-	size_t total = 0;
-	while (total < len) {
-		ssize_t n = pread(fd, dst + total, len - total, off + (off_t)total);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -1;
-		}
-		if (n == 0)
-			break;
-		total += (size_t)n;
-	}
-	return (ssize_t)total;
-}
-
 static int bounce_read_aligned(int fd, uint64_t aligned_off, size_t aligned_len, size_t head_slop,
 							   size_t len, uint8_t *dst, size_t align) {
 	void *bounce = bounce_buf_get(align, aligned_len);
 	if (!bounce)
 		return -1;
-	ssize_t got = pread_full(fd, bounce, aligned_len, (off_t)aligned_off);
+	ssize_t got = gguf_pread_full(fd, bounce, aligned_len, (off_t)aligned_off);
 	if ((size_t)got < head_slop + len)
 		return -1;
 	memcpy(dst, (uint8_t *)bounce + head_slop, len);
@@ -335,10 +319,7 @@ static int aligned_pread_bounce(int fd, size_t align, uint64_t file_off, size_t 
 	if (aligned_len < head_slop + len)
 		return -1;
 
-	if (bounce_read_aligned(fd, aligned_off, aligned_len, head_slop, len, dst, align) != 0)
-		return -1;
-	posix_fadvise(fd, (off_t)aligned_off, (off_t)aligned_len, POSIX_FADV_DONTNEED);
-	return 0;
+	return bounce_read_aligned(fd, aligned_off, aligned_len, head_slop, len, dst, align);
 }
 
 static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, uint8_t *dst,
@@ -350,7 +331,7 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 		size_t align = c->nomap_direct_align;
 
 		if (precheck_aligned &&
-			(size_t)pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off) >= len) {
+			(size_t)gguf_pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off) >= len) {
 			atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
 			atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
 			return 0;
@@ -368,7 +349,7 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_fd < 0)
 		return -1;
 	atomic_fetch_add_explicit(&c->stat_direct_fallback, 1, memory_order_relaxed);
-	if ((size_t)pread_full(c->nomap_fd, dst, len, (off_t)file_off) < len)
+	if ((size_t)gguf_pread_full(c->nomap_fd, dst, len, (off_t)file_off) < len)
 		return -1;
 	posix_fadvise(c->nomap_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 	return 0;
@@ -381,10 +362,8 @@ static int moe_direct_io_read(moe_stream_cache *c, off_t file_off, size_t len, u
 
 	size_t align = c->direct_io_align;
 
-	if (precheck_aligned && (size_t)pread_full(c->direct_io_fd, dst, len, file_off) >= len) {
-		posix_fadvise(c->direct_io_fd, file_off, (off_t)len, POSIX_FADV_DONTNEED);
+	if (precheck_aligned && (size_t)gguf_pread_full(c->direct_io_fd, dst, len, file_off) >= len)
 		return 0;
-	}
 
 	return aligned_pread_bounce(c->direct_io_fd, align, (uint64_t)file_off, len, dst,
 								c->backing_file_size);
@@ -1229,15 +1208,16 @@ static void miss_fill_desc(moe_miss_entry *me, int k, int eid, void *freed_buf, 
 	moe_expert_slot tmp;
 	slot_zero(&tmp);
 	slot_from_expert_desc(&tmp, eid, desc);
-	tmp.heap_buf   = NULL;
-	tmp.heap_size  = 0;
-	me->k		   = k;
-	me->eid		   = eid;
-	me->dep		   = -1;
-	me->slot	   = NULL;
-	me->gen		   = 0;
-	me->tmp		   = tmp;
-	me->st		   = OK;
+	tmp.heap_buf  = NULL;
+	tmp.heap_size = 0;
+	me->k		  = k;
+	me->eid		  = eid;
+	me->dep		  = -1;
+	me->slot	  = NULL;
+	me->gen		  = 0;
+	me->tmp		  = tmp;
+	me->st		  = OK;
+	atomic_store_explicit(&me->io_err, 0, memory_order_relaxed);
 	me->reuse_buf  = freed_buf;
 	me->reuse_size = freed_size;
 }
@@ -1253,8 +1233,9 @@ static void miss_fill_slot(moe_miss_entry *me, int k, int eid, moe_expert_slot *
 	me->tmp.heap_buf  = NULL;
 	me->tmp.heap_size = 0;
 	me->st			  = OK;
-	me->reuse_buf	  = freed_buf;
-	me->reuse_size	  = freed_size;
+	atomic_store_explicit(&me->io_err, 0, memory_order_relaxed);
+	me->reuse_buf  = freed_buf;
+	me->reuse_size = freed_size;
 }
 
 static void moe_resolve_no_cache(const struct model *m, const struct layer_weights *Lw,

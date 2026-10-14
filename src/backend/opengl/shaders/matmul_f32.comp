@@ -1,6 +1,14 @@
 #version 310 es
 precision highp float;
-layout(local_size_x = 32) in;
+
+#ifndef WG
+#define WG 32
+#endif
+#ifndef MT
+#define MT 1
+#endif
+layout(local_size_x = WG) in;
+
 layout(std430, binding = 0) readonly buffer WBuf {
 	vec4 w[];
 };
@@ -20,55 +28,59 @@ layout(location = 9) uniform int u_m;
 layout(location = 10) uniform int u_x_stride;
 layout(location = 11) uniform int u_wg_base;
 
-uint g_mi;
+#define ROWS 4
 
-shared float s_acc[4][32];
+shared float s_acc[ROWS * MT][WG + 1];
 
 void main(void) {
-	uint wgid	  = gl_WorkGroupID.x + uint(u_wg_base);
-	uint mb		  = uint(max(u_m, 1));
-	g_mi		  = wgid % mb;
-	wgid		  = wgid / mb;
-	uint base_row = wgid * 4u;
-	uint tid	  = gl_LocalInvocationID.x;
-	int	 k4		  = u_k >> 2;
-	uint w_stride = uint(k4);
-	vec4 acc0	  = vec4(0.0);
-	vec4 acc1	  = vec4(0.0);
-	vec4 acc2	  = vec4(0.0);
-	vec4 acc3	  = vec4(0.0);
-	bool r0		  = int(base_row + 0u) < u_n;
-	bool r1		  = int(base_row + 1u) < u_n;
-	bool r2		  = int(base_row + 2u) < u_n;
-	bool r3		  = int(base_row + 3u) < u_n;
-	for (int k = int(tid); k < k4; k += 32) {
-		vec4 xv = x[g_mi * uint(k4) + uint(k)];
-		if (r0)
-			acc0 += w[(base_row + 0u) * w_stride + uint(k)] * xv;
-		if (r1)
-			acc1 += w[(base_row + 1u) * w_stride + uint(k)] * xv;
-		if (r2)
-			acc2 += w[(base_row + 2u) * w_stride + uint(k)] * xv;
-		if (r3)
-			acc3 += w[(base_row + 3u) * w_stride + uint(k)] * xv;
-	}
-	s_acc[0][tid] = acc0.x + acc0.y + acc0.z + acc0.w;
-	s_acc[1][tid] = acc1.x + acc1.y + acc1.z + acc1.w;
-	s_acc[2][tid] = acc2.x + acc2.y + acc2.z + acc2.w;
-	s_acc[3][tid] = acc3.x + acc3.y + acc3.z + acc3.w;
-	barrier();
-	if (tid < 4u) {
-		float s = 0.0;
-		for (int j = 0; j < 32; j++)
-			s += s_acc[tid][j];
-		uint target = base_row + tid;
-		if (int(target) < u_n) {
-			if (u_add_residual == 1)
-				y[g_mi * uint(u_n) + target] = s + res[target];
-			else if (u_add_residual == 2)
-				y[g_mi * uint(u_n) + target] += s;
-			else
-				y[g_mi * uint(u_n) + target] = s;
+	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	   = uint(max(u_m, 1));
+	uint mt	   = (mb + uint(MT) - 1u) / uint(MT);
+	uint col0  = (wgid % mt) * uint(MT);
+	uint ncols = min(uint(MT), mb - col0);
+	uint row0  = (wgid / mt) * uint(ROWS);
+	uint tid   = gl_LocalInvocationID.x;
+	uint last  = uint(max(u_n - 1, 0));
+	uint k4	   = uint(u_k >> 2);
+
+	uint wrow[ROWS];
+	uint xrow[MT];
+	vec4 acc[ROWS * MT];
+	for (int r = 0; r < ROWS; r++)
+		wrow[r] = min(row0 + uint(r), last) * k4;
+	for (int c = 0; c < MT; c++)
+		xrow[c] = min(col0 + uint(c), mb - 1u) * k4;
+	for (int i = 0; i < ROWS * MT; i++)
+		acc[i] = vec4(0.0);
+
+	for (uint k = tid; k < k4; k += uint(WG)) {
+		vec4 xv[MT];
+		for (int c = 0; c < MT; c++)
+			xv[c] = x[xrow[c] + k];
+		for (int r = 0; r < ROWS; r++) {
+			vec4 wv = w[wrow[r] + k];
+			for (int c = 0; c < MT; c++)
+				acc[r * MT + c] += wv * xv[c];
 		}
+	}
+	for (int i = 0; i < ROWS * MT; i++)
+		s_acc[i][tid] = acc[i].x + acc[i].y + acc[i].z + acc[i].w;
+	barrier();
+	for (uint i = tid; i < uint(ROWS * MT); i += uint(WG)) {
+		uint r	 = i / uint(MT);
+		uint c	 = i % uint(MT);
+		uint row = row0 + r;
+		if (int(row) >= u_n || c >= ncols)
+			continue;
+		float v = 0.0;
+		for (int j = 0; j < WG; j++)
+			v += s_acc[i][j];
+		uint yi = (col0 + c) * uint(u_n) + row;
+		if (u_add_residual == 1)
+			y[yi] = v + res[row];
+		else if (u_add_residual == 2)
+			y[yi] += v;
+		else
+			y[yi] = v;
 	}
 }

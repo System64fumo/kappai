@@ -20,6 +20,8 @@ typedef struct kvcache_hybrid {
 	size_t recurrent_stride;
 	size_t conv_total;
 	size_t recurrent_total;
+	float *mla_latent;
+	size_t mla_latent_stride;
 } kvcache_hybrid;
 
 typedef struct kvcache {

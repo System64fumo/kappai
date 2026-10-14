@@ -23,6 +23,7 @@
 #define RTOL_LOOSE 4e-3f
 #define ATOL_EXACT 1e-4f
 #define ATOL_LOOSE 4e-4f
+#define RTOL_NORM_LOOSE 1e-6f
 
 #define ATOL_KV_QUANT 6e-3f
 #define RTOL_KV_QUANT 3e-2f
@@ -108,6 +109,7 @@ extern int g_pass, g_fail, g_skip;
 
 extern const qtype_info QTYPES[];
 extern const int		QTYPES_N;
+int						qtype_name_width(void);
 
 void		color_init(void);
 const char *verdict_str(verdict v);

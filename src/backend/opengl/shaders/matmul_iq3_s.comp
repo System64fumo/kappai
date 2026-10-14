@@ -65,8 +65,8 @@ void main(void) {
 
 	float acc = 0.0;
 	for (int bi = 0; bi < u_k_blocks; bi++) {
-		uint  xbq	 = g_mi * uint(u_x_stride) + uint(bi) * 209u;
-		float xd	 = uintBitsToFloat(xq[xbq + 64u]);
+		uint  xbq	 = g_mi * uint(u_x_stride) + uint(bi) * 212u;
+		float xd	 = uintBitsToFloat(xq[xbq + 80u]);
 		uint  bo	 = uint(bi) * 110u;
 		float dw	 = h2f(rb(bo + rw) | (rb(bo + 1u + rw) << 8u));
 		float scaled = dw * xd;

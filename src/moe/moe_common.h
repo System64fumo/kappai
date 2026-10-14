@@ -21,7 +21,10 @@ typedef struct {
 	const buffer *xb_q8_gate;
 	float		 *scratch;
 	float		 *out;
+	float		  clamp;
 } moe_expert_ctx;
+
+void moe_swiglu_clamp(float *gate, float *up, int n, float limit);
 
 status_code moe_expert_exec(moe_expert_ctx *cx, const moe_expert_slot *es, const float *xb,
 							float weight, int tid);

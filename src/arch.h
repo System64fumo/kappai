@@ -12,6 +12,7 @@ typedef enum {
 	ARCH_GLM_DSA,
 	ARCH_QWEN35,
 	ARCH_LFM2,
+	ARCH_GLM5_NEXT,
 } model_arch;
 
 typedef struct {
@@ -39,6 +40,8 @@ typedef struct {
 	bool uses_moe_shared_dense_ffn;
 	bool is_mla;
 	bool is_hybrid_recurrent;
+	bool is_kda;
+	bool has_hyper_connections;
 	bool hybrid_shortconv;
 	bool has_attn_output_gate;
 	bool uses_post_attn_norm_for_ffn;

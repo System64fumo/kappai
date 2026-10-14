@@ -125,6 +125,8 @@ static jinja_value *tool_calls_to_jinja(const json_object *tool_calls) {
 
 status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, const tokenizer *tok) {
 	memset(cts, 0, sizeof(*cts));
+	cts->think_start_id = -1;
+	cts->think_end_id	= -1;
 
 	const char *tmpl_src = NULL;
 	status_code s		 = gguf_get_str(g, "tokenizer.chat_template", &tmpl_src);

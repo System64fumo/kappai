@@ -5,6 +5,9 @@ precision highp int;
 #ifndef WG
 #define WG 32
 #endif
+#ifndef MT
+#define MT 1
+#endif
 layout(local_size_x = WG) in;
 
 layout(std430, binding = 0) readonly buffer WBuf {
@@ -27,11 +30,9 @@ layout(location = 9) uniform int u_m;
 layout(location = 10) uniform int u_x_stride;
 layout(location = 11) uniform int u_wg_base;
 
-uint g_mi;
-
 #define ROWS 4
 
-shared float s_acc[ROWS][WG];
+shared float s_acc[ROWS * MT][WG + 1];
 
 #ifndef BF16
 float h2f(uint h) {
@@ -40,72 +41,75 @@ float h2f(uint h) {
 #endif
 
 void main(void) {
-	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
-	uint mb	  = uint(max(u_m, 1));
-	g_mi	  = wgid % mb;
-	wgid	  = wgid / mb;
-	uint row0 = wgid * uint(ROWS);
-	uint tid  = gl_LocalInvocationID.x;
-	uint last = uint(max(u_n - 1, 0));
-	uint xrow = g_mi * uint(u_k);
+	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	   = uint(max(u_m, 1));
+	uint mt	   = (mb + uint(MT) - 1u) / uint(MT);
+	uint col0  = (wgid % mt) * uint(MT);
+	uint ncols = min(uint(MT), mb - col0);
+	uint row0  = (wgid / mt) * uint(ROWS);
+	uint tid   = gl_LocalInvocationID.x;
+	uint last  = uint(max(u_n - 1, 0));
 
 	uint  rows[ROWS];
-	float acc[ROWS];
-	for (int r = 0; r < ROWS; r++) {
-		rows[r] = min(row0 + uint(r), last);
-		acc[r]	= 0.0;
-	}
+	uint  xrow[MT];
+	float acc[ROWS * MT];
+	for (int r = 0; r < ROWS; r++)
+		rows[r] = min(row0 + uint(r), last) * uint(u_k);
+	for (int c = 0; c < MT; c++)
+		xrow[c] = min(col0 + uint(c), mb - 1u) * uint(u_k);
+	for (int i = 0; i < ROWS * MT; i++)
+		acc[i] = 0.0;
+
 	if ((u_k & 1) == 0) {
-		uint wb[ROWS];
-		for (int r = 0; r < ROWS; r++)
-			wb[r] = (rows[r] * uint(u_k)) >> 1u;
 		for (uint kp = tid; kp < uint(u_k >> 1); kp += uint(WG)) {
-			float x0 = x[xrow + 2u * kp];
-			float x1 = x[xrow + 2u * kp + 1u];
+			vec2 xv[MT];
+			for (int c = 0; c < MT; c++)
+				xv[c] = vec2(x[xrow[c] + 2u * kp], x[xrow[c] + 2u * kp + 1u]);
 			for (int r = 0; r < ROWS; r++) {
+				uint wd = w[(rows[r] >> 1u) + kp];
 #ifdef BF16
-				uint wd = w[wb[r] + kp];
-				acc[r] += uintBitsToFloat(wd << 16u) * x0 + uintBitsToFloat(wd & 0xFFFF0000u) * x1;
+				vec2 hv = vec2(uintBitsToFloat(wd << 16u), uintBitsToFloat(wd & 0xFFFF0000u));
 #else
-				vec2 hv = unpackHalf2x16(w[wb[r] + kp]);
-				acc[r] += hv.x * x0 + hv.y * x1;
+				vec2 hv = unpackHalf2x16(wd);
 #endif
+				for (int c = 0; c < MT; c++)
+					acc[r * MT + c] += hv.x * xv[c].x + hv.y * xv[c].y;
 			}
 		}
 	} else {
 		for (int ki = int(tid); ki < u_k; ki += WG) {
-			float xv = x[xrow + uint(ki)];
 			for (int r = 0; r < ROWS; r++) {
-				uint e	= rows[r] * uint(u_k) + uint(ki);
+				uint e	= rows[r] + uint(ki);
 				uint wd = w[e >> 1u];
 				uint h	= (e & 1u) == 0u ? (wd & 0xFFFFu) : (wd >> 16u);
 #ifdef BF16
-				acc[r] += uintBitsToFloat(h << 16u) * xv;
+				float wf = uintBitsToFloat(h << 16u);
 #else
-				acc[r] += h2f(h) * xv;
+				float wf = h2f(h);
 #endif
+				for (int c = 0; c < MT; c++)
+					acc[r * MT + c] += wf * x[xrow[c] + uint(ki)];
 			}
 		}
 	}
-	for (int r = 0; r < ROWS; r++)
-		s_acc[r][tid] = acc[r];
+	for (int i = 0; i < ROWS * MT; i++)
+		s_acc[i][tid] = acc[i];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int r = 0; r < ROWS; r++)
-				s_acc[r][tid] += s_acc[r][tid + s];
-		barrier();
-	}
-	if (tid < uint(ROWS)) {
-		uint row = row0 + tid;
-		if (int(row) < u_n) {
-			float v = s_acc[tid][0];
-			if (u_add_residual == 1)
-				y[g_mi * uint(u_n) + row] = v + res[row];
-			else if (u_add_residual == 2)
-				y[g_mi * uint(u_n) + row] += v;
-			else
-				y[g_mi * uint(u_n) + row] = v;
-		}
+	for (uint i = tid; i < uint(ROWS * MT); i += uint(WG)) {
+		uint r	 = i / uint(MT);
+		uint c	 = i % uint(MT);
+		uint row = row0 + r;
+		if (int(row) >= u_n || c >= ncols)
+			continue;
+		float v = 0.0;
+		for (int j = 0; j < WG; j++)
+			v += s_acc[i][j];
+		uint yi = (col0 + c) * uint(u_n) + row;
+		if (u_add_residual == 1)
+			y[yi] = v + res[row];
+		else if (u_add_residual == 2)
+			y[yi] += v;
+		else
+			y[yi] = v;
 	}
 }

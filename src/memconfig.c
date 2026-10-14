@@ -57,7 +57,13 @@ static size_t calc_embeddings_bytes(const model *m) {
 static size_t calc_attn_bytes(const model *m, int i) {
 	const layer_weights *L	   = &m->layers[i];
 	size_t				 total = 0;
-	if (m->arch_info->is_mla) {
+	if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+		const size_t d_inner = (size_t)m->hybrid.value_dim;
+		total += 3 * ggml_row_size(L->wq.type, m->dim) * d_inner;
+		total += ggml_row_size(L->wo.type, d_inner) * m->dim;
+		total += 2 * ggml_row_size(L->kda_f_a_w.type, m->dim) * m->kda.head_dim;
+		total += 2 * ggml_row_size(L->kda_f_b_w.type, m->kda.head_dim) * d_inner;
+	} else if (m->arch_info->is_mla) {
 		total += ggml_row_size(L->q_a_w.type, m->dim) * m->mla.q_lora;
 		total += ggml_row_size(L->q_b_w.type, m->mla.q_lora) * (m->n_heads * m->mla.qk_head);
 		total += m->mla.q_lora * sizeof(float);

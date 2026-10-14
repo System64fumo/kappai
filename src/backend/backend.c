@@ -310,11 +310,15 @@ static void log_op_homes(backend *b) {
 			uint32_t	t;
 			const char *n;
 		} types[] = {
-			{GGML_TYPE_F32, "f32"},		{GGML_TYPE_F16, "f16"},	  {GGML_TYPE_BF16, "bf16"},
-			{GGML_TYPE_Q4_0, "q4_0"},	{GGML_TYPE_Q4_1, "q4_1"}, {GGML_TYPE_Q5_0, "q5_0"},
-			{GGML_TYPE_Q5_1, "q5_1"},	{GGML_TYPE_Q8_0, "q8_0"}, {GGML_TYPE_Q4_K, "q4_k"},
-			{GGML_TYPE_Q5_K, "q5_k"},	{GGML_TYPE_Q6_K, "q6_k"}, {GGML_TYPE_IQ4_NL, "iq4_nl"},
-			{GGML_TYPE_IQ3_S, "iq3_s"},
+			{GGML_TYPE_F32, "f32"},			{GGML_TYPE_F16, "f16"},
+			{GGML_TYPE_BF16, "bf16"},		{GGML_TYPE_Q4_0, "q4_0"},
+			{GGML_TYPE_Q4_1, "q4_1"},		{GGML_TYPE_Q5_0, "q5_0"},
+			{GGML_TYPE_Q5_1, "q5_1"},		{GGML_TYPE_Q8_0, "q8_0"},
+			{GGML_TYPE_Q4_K, "q4_k"},		{GGML_TYPE_Q5_K, "q5_k"},
+			{GGML_TYPE_Q6_K, "q6_k"},		{GGML_TYPE_IQ4_NL, "iq4_nl"},
+			{GGML_TYPE_IQ3_S, "iq3_s"},		{GGML_TYPE_IQ2_XXS, "iq2_xxs"},
+			{GGML_TYPE_IQ3_XXS, "iq3_xxs"}, {GGML_TYPE_IQ2_S, "iq2_s"},
+			{GGML_TYPE_IQ4_XS, "iq4_xs"},
 		};
 		char native[256], nonnative[256];
 		native[0] = nonnative[0] = '\0';
@@ -765,4 +769,21 @@ static void backends_init(void) {
 
 void backend_load(void) {
 	pthread_once(&g_backends_once, backends_init);
+}
+
+#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
+
+status_code tensor_desc_read(const tensor_desc *desc, size_t off, void *dst, size_t len) {
+	if (!desc->read_fn) {
+		copy_weight_chunked(dst, (const char *)desc->host_data + off, len,
+							desc->release_host_source);
+		return OK;
+	}
+	for (size_t done = 0; done < len; done += TENSOR_READ_PIECE_BYTES) {
+		size_t		piece = MIN(len - done, TENSOR_READ_PIECE_BYTES);
+		status_code s	  = desc->read_fn(desc->read_ctx, off + done, (char *)dst + done, piece);
+		if (s != OK)
+			return s;
+	}
+	return OK;
 }

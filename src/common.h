@@ -81,6 +81,12 @@ static inline void prefault(void *ptr, size_t bytes) {
 	p[bytes - 1] = p[bytes - 1];
 }
 
+#define WEIGHT_COPY_CHUNK_BYTES ((size_t)(8 << 20))
+
+void weight_source_prefetch(const void *ptr, size_t bytes);
+void weight_source_release(const void *ptr, size_t bytes);
+void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_src);
+
 size_t		str_lcp_len(const char *a, const char *b);
 const char *path_basename(const char *path);
 

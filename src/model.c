@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#define MODEL_READAHEAD_LAYERS 2
+
 static void madvise_access_pattern(const void *map_base, size_t map_size, const void *ptr,
 								   size_t bytes, int advice) {
 	if (!map_base || map_size == 0 || !ptr || bytes == 0)
@@ -29,6 +31,18 @@ static void madvise_access_pattern(const void *map_base, size_t map_size, const 
 
 static void madvise_dontneed(const void *map_base, size_t map_size, const void *ptr, size_t bytes) {
 	madvise_access_pattern(map_base, map_size, ptr, bytes, MADV_DONTNEED);
+}
+
+static int mapped_pages_live(const model *m) {
+	return m->gctx.map && m->gctx.map_size > 0 && !m->gctx.map_is_heap;
+}
+
+static int host_ptr_in_map(const model *m, const void *ptr) {
+	if (!mapped_pages_live(m))
+		return 0;
+	uintptr_t base = (uintptr_t)m->gctx.map;
+	uintptr_t addr = (uintptr_t)ptr;
+	return addr >= base && addr < base + m->gctx.map_size;
 }
 
 static status_code akey_i32(const gguf_ctx *g, const char *prefix, const char *suffix,
@@ -165,6 +179,65 @@ static int check_expert_tensor_dims(const gguf_ctx *g, const char *name, uint64_
 	return 0;
 }
 
+static int validate_hc_layer(const model *m, const gguf_ctx *g, int i, char *tname,
+							 size_t tname_sz) {
+	const uint64_t			 hc_dim = (uint64_t)m->kda.hc_count * (uint64_t)m->dim;
+	const uint64_t			 hc_mix = (uint64_t)(2 + m->kda.hc_count) * (uint64_t)m->kda.hc_count;
+	static const char *const sub[]	= {"attn", "ffn"};
+	for (int k = 0; k < 2; k++) {
+		char fmt[64];
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_fn.weight", sub[k]);
+		if (require_layer_dims_2d(g, tname, tname_sz, fmt, i, hc_dim, hc_mix))
+			return -1;
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_base.weight", sub[k]);
+		if (require_layer_dims_1d(g, tname, tname_sz, fmt, i, hc_mix) ||
+			require_tensor_f32_if_present(g, tname))
+			return -1;
+		snprintf(fmt, sizeof(fmt), "blk.%%d.hc_%s_scale.weight", sub[k]);
+		if (require_layer_dims_1d(g, tname, tname_sz, fmt, i, 3) ||
+			require_tensor_f32_if_present(g, tname))
+			return -1;
+	}
+	return 0;
+}
+
+static int validate_kda_layer(const model *m, const gguf_ctx *g, int i, char *tname,
+							  size_t tname_sz) {
+	const uint64_t d_inner = (uint64_t)m->hybrid.value_dim;
+	const uint64_t hd	   = (uint64_t)m->kda.head_dim;
+	const uint64_t dim	   = (uint64_t)m->dim;
+	if (require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_q.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_k.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_v.weight", i, dim, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.attn_output.weight", i, d_inner, dim) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_f_a.weight", i, dim, hd) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_f_b.weight", i, hd, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_g_a.weight", i, dim, hd) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_g_b.weight", i, hd, d_inner) ||
+		require_layer_dims_2d(g, tname, tname_sz, "blk.%d.ssm_beta.weight", i, dim,
+							  (uint64_t)m->n_heads) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_a", i, (uint64_t)m->n_heads) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_dt.bias", i, d_inner) ||
+		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_norm.weight", i, hd))
+		return -1;
+	static const char *const f32_names[] = {"blk.%d.ssm_a",
+											"blk.%d.ssm_dt.bias",
+											"blk.%d.ssm_norm.weight",
+											"blk.%d.ssm_conv1d_q.weight",
+											"blk.%d.ssm_conv1d_k.weight",
+											"blk.%d.ssm_conv1d_v.weight"};
+	for (size_t k = 0; k < ARRAY_LEN(f32_names); k++) {
+		snprintf(tname, tname_sz, f32_names[k], i);
+		if (!gguf_find_tensor(g, tname)) {
+			ERROR("model: missing required tensor '%s'", tname);
+			return -1;
+		}
+		if (require_tensor_f32_if_present(g, tname))
+			return -1;
+	}
+	return 0;
+}
+
 static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	char tname[128];
 
@@ -220,7 +293,12 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 		if (require_layer_dims_1d(g, tname, sizeof(tname), "blk.%d.attn_norm.weight", i, m->dim) ||
 			require_tensor_f32_if_present(g, tname))
 			return -1;
-		if (model_layer_is_recurrent(m, i)) {
+		if (m->arch_info->has_hyper_connections && validate_hc_layer(m, g, i, tname, sizeof(tname)))
+			return -1;
+		if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+			if (validate_kda_layer(m, g, i, tname, sizeof(tname)))
+				return -1;
+		} else if (model_layer_is_recurrent(m, i)) {
 			const model_hybrid_params *q = &m->hybrid;
 			if (m->arch_info->hybrid_shortconv) {
 				if (require_layer_dims_2d(g, tname, sizeof(tname),
@@ -468,31 +546,6 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	return 0;
 }
 
-static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes);
-
-static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
-									uint64_t d0, uint64_t d1, weight_class wc,
-									backend *target_backend, buffer *out) {
-	tensor_desc desc = {
-		.type	   = type,
-		.n_dims	   = n_dims,
-		.dims	   = {d0, d1, 0, 0},
-		.host_data = host_ptr,
-	};
-	backend	   *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
-	status_code s	 = home->buffer_alloc_weight(home, &desc, out);
-	if (s != OK)
-		return s;
-
-	if (!backend_has_cap(home, BCAP_IS_HOST)) {
-		size_t bytes = (n_dims == 1) ? ggml_row_size(type, d0) : ggml_row_size(type, d0) * d1;
-		release_original_weight_data(m, host_ptr, bytes);
-		out->host_ptr = NULL;
-	}
-
-	return OK;
-}
-
 static int cmp_tensor_slot(const void *a, const void *b) {
 	const model_tensor_slot *x = (const model_tensor_slot *)a;
 	const model_tensor_slot *y = (const model_tensor_slot *)b;
@@ -523,41 +576,104 @@ static void tensor_release_index_ensure(model *m) {
 	m->tensor_data_order_n = live;
 }
 
-static int mapped_pages_live(const model *m) {
-	return m->gctx.map && m->gctx.map_size > 0 && !m->gctx.map_is_heap;
+static gguf_tensor *owned_tensor_for_ptr(model *m, const void *ptr) {
+	if (!ptr || mapped_pages_live(m) || !m->gctx.owns_tensor_data)
+		return NULL;
+	tensor_release_index_ensure(m);
+	uintptr_t key = (uintptr_t)ptr;
+	size_t	  lo = 0, hi = m->tensor_data_order_n;
+	while (lo < hi) {
+		size_t	  mid = lo + (hi - lo) / 2;
+		uintptr_t d	  = (uintptr_t)m->tensor_data_order[mid].data;
+		if (d < key)
+			lo = mid + 1;
+		else if (d > key)
+			hi = mid;
+		else {
+			gguf_tensor *t = &m->gctx.tensors[m->tensor_data_order[mid].tensor_idx];
+			return t->data == ptr ? t : NULL;
+		}
+	}
+	return NULL;
+}
+
+static int weight_retains_host_copy(const model *m, const gguf_tensor *t) {
+	if (gguf_tensor_is_eager(t))
+		return 1;
+	if (m->tie_embeddings && t->data == m->tok_embd.host_ptr)
+		return 1;
+	if (!m->has_per_layer_embeddings)
+		return 0;
+	int is_ple_host = t->data == m->layer_dims.per_layer_tok_embd.host_ptr ||
+					  t->data == m->layer_dims.per_layer_model_proj.host_ptr;
+	return is_ple_host && !ple_device_path_possible(m);
+}
+
+static status_code ensure_tensor_loaded(model *m, const void *host_ptr) {
+	gguf_tensor *t = owned_tensor_for_ptr(m, host_ptr);
+	if (!t || t->loaded)
+		return OK;
+	status_code s = gguf_sparse_read_tensor(&m->gctx, t);
+	if (s != OK)
+		return s;
+	return t->loaded ? OK : ERR_IO;
+}
+
+static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes);
+
+static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
+									uint64_t d0, uint64_t d1, weight_class wc,
+									backend *target_backend, buffer *out) {
+	tensor_desc desc = {
+		.type	   = type,
+		.n_dims	   = n_dims,
+		.dims	   = {d0, d1, 0, 0},
+		.host_data = host_ptr,
+	};
+	backend			  *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
+	int				   home_host = backend_has_cap(home, BCAP_IS_HOST);
+	gguf_tensor		  *owned	 = owned_tensor_for_ptr(m, host_ptr);
+	gguf_tensor_source source	 = {&m->gctx, owned};
+	if (!home_host && owned && !owned->loaded && !weight_retains_host_copy(m, owned)) {
+		desc.read_fn  = gguf_tensor_read;
+		desc.read_ctx = &source;
+	} else {
+		status_code ls = ensure_tensor_loaded(m, host_ptr);
+		if (ls != OK)
+			return ls;
+	}
+	desc.release_host_source = !home_host && host_ptr_in_map(m, host_ptr);
+	status_code s			 = home->buffer_alloc_weight(home, &desc, out);
+	if (s != OK)
+		return s;
+
+	if (!backend_has_cap(home, BCAP_IS_HOST)) {
+		size_t bytes = (n_dims == 1) ? ggml_row_size(type, d0) : ggml_row_size(type, d0) * d1;
+		release_original_weight_data(m, host_ptr, bytes);
+		out->host_ptr = NULL;
+	}
+
+	return OK;
 }
 
 static void release_original_weight_data(model *m, const void *host_ptr, size_t bytes) {
 	if (!host_ptr || bytes == 0)
 		return;
-
 	if (m->tie_embeddings && host_ptr == m->tok_embd.host_ptr)
 		return;
-	if (mapped_pages_live(m)) {
 
+	if (mapped_pages_live(m)) {
 		madvise_dontneed(m->gctx.map, m->gctx.map_size, host_ptr, bytes);
-	} else if (m->gctx.owns_tensor_data) {
-		tensor_release_index_ensure(m);
-		uintptr_t key = (uintptr_t)host_ptr;
-		size_t	  lo = 0, hi = m->tensor_data_order_n;
-		while (lo < hi) {
-			size_t	  mid = lo + (hi - lo) / 2;
-			uintptr_t d	  = (uintptr_t)m->tensor_data_order[mid].data;
-			if (d < key)
-				lo = mid + 1;
-			else if (d > key)
-				hi = mid;
-			else {
-				size_t i = m->tensor_data_order[mid].tensor_idx;
-				if (i < m->gctx.n_tensors && m->gctx.tensors[i].data == host_ptr) {
-					free((void *)m->gctx.tensors[i].data);
-					m->gctx.tensors[i].data = NULL;
-				}
-				return;
-			}
-		}
+		return;
 	}
+	gguf_tensor *t = owned_tensor_for_ptr(m, host_ptr);
+	if (!t || weight_retains_host_copy(m, t))
+		return;
+	free((void *)t->data);
+	t->data	  = NULL;
+	t->loaded = 0;
 }
+
 int model_should_repack(uint32_t type, const char *repack_config) {
 	if (!repack_config)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
@@ -659,6 +775,9 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 		home->repack_plan(home, type, d0, d1, &re_type);
 
 	if (re_type) {
+		status_code ls = ensure_tensor_loaded(m, host_ptr);
+		if (ls != OK)
+			return ls;
 		int	   k			 = (int)d0;
 		int	   n_rows		 = (int)d1;
 		size_t src_row_bytes = ggml_row_size(type, (size_t)k);
@@ -737,6 +856,8 @@ static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t 
 		ref->dequant_rows	= n_rows;
 		return 0;
 	}
+	if (ensure_tensor_loaded(m, ref->host_ptr) != OK)
+		return 0;
 	const void *orig  = ref->host_ptr;
 	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
 	dequant_weight_to_f32(m->backend, &ref->host_ptr, &ref->type, row_len, n_rows);
@@ -746,6 +867,8 @@ static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t 
 
 static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w, uint32_t type,
 								 uint64_t dim, uint64_t intermediate) {
+	if (ensure_tensor_loaded(m, gate_w) != OK || ensure_tensor_loaded(m, up_w) != OK)
+		return NULL;
 	size_t	 row_stride = ggml_row_size(type, dim);
 	size_t	 half_bytes = row_stride * intermediate;
 	uint8_t *buf		= xmalloc(half_bytes * 2);
@@ -766,6 +889,10 @@ static void *build_fused_qkv(model *m, const layer_weights *L, int has_kv, int h
 	if (!has_kv || !L->wk.host_ptr)
 		return NULL;
 	if (has_own_v && !L->wv.host_ptr)
+		return NULL;
+	if (ensure_tensor_loaded(m, L->wq.host_ptr) != OK ||
+		ensure_tensor_loaded(m, L->wk.host_ptr) != OK ||
+		(has_own_v && ensure_tensor_loaded(m, L->wv.host_ptr) != OK))
 		return NULL;
 	size_t	 row_stride = ggml_row_size(type, dim);
 	size_t	 q_bytes	= row_stride * q_rows;
@@ -809,6 +936,11 @@ static status_code upload_fused_gate_up_repack(model *m, const void *gate_w, con
 
 	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
+	status_code ls = ensure_tensor_loaded(m, gate_w);
+	if (ls == OK)
+		ls = ensure_tensor_loaded(m, up_w);
+	if (ls != OK)
+		return ls;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
 	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
@@ -875,6 +1007,13 @@ static status_code upload_fused_qkv_repack(model *m, const layer_weights *L, int
 
 	if (!re_type || !model_should_repack_cached(m, type))
 		return ERR_FALLBACK;
+	status_code ls = ensure_tensor_loaded(m, L->wq.host_ptr);
+	if (ls == OK)
+		ls = ensure_tensor_loaded(m, L->wk.host_ptr);
+	if (ls == OK && has_own_v)
+		ls = ensure_tensor_loaded(m, L->wv.host_ptr);
+	if (ls != OK)
+		return ls;
 
 	size_t src_row_bytes = ggml_row_size(type, (size_t)dim);
 	size_t dst_row_bytes = ggml_row_size(re_type, (size_t)dim);
@@ -940,6 +1079,9 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 		ref->dequant_native	 = 0;
 		const uint32_t qtype = ref->type;
 		size_t bytes = ggml_row_size(qtype, (size_t)ref->dequant_cols) * (size_t)ref->dequant_rows;
+		status_code ls = ensure_tensor_loaded(m, ref->host_ptr);
+		if (ls != OK)
+			return ls;
 		status_code ds =
 			home->dequant_weight
 				? home->dequant_weight(home, qtype, ref->host_ptr, (int)ref->dequant_rows,
@@ -972,7 +1114,23 @@ static status_code upload_one_repack(model *m, weight_ref *ref, int ndims, uint6
 	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, m->backend);
 }
 
-static status_code upload_embeddings(model *m) {
+static int tied_output_shares_buffer(const model *m) {
+	if (!m->tie_embeddings || !m->tok_embd.buf.owner)
+		return 0;
+	backend *home = backend_weight_home(m->backend, WCLASS_EMBEDDING);
+	return !backend_has_cap(home, BCAP_IS_HOST) &&
+		   home == backend_weight_home(m->backend, WCLASS_MATMUL);
+}
+
+static uint64_t embedding_upload_steps(const model *m) {
+	return 3 + (m->has_per_layer_embeddings ? 3 : 0) + (m->rope_freqs_count > 0 ? 1 : 0);
+}
+
+static void progress_step(progress *prog) {
+	progress_update(prog, prog->current + 1);
+}
+
+static status_code upload_embeddings(model *m, progress *prog) {
 	status_code s;
 
 	s = upload_one(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING);
@@ -980,6 +1138,7 @@ static status_code upload_embeddings(model *m) {
 		ERROR("model_upload: token_embd upload failed (%d)", s);
 		return s;
 	}
+	progress_step(prog);
 	if (!m->tie_embeddings && mapped_pages_live(m)) {
 		size_t embd_bytes = ggml_row_size(m->tok_embd.type, (size_t)m->dim) * (size_t)m->vocab_size;
 		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
@@ -990,12 +1149,18 @@ static status_code upload_embeddings(model *m) {
 		ERROR("model_upload: output_norm upload failed (%d)", s);
 		return s;
 	}
+	progress_step(prog);
 
-	s = upload_one_repack(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL);
-	if (s != OK) {
-		ERROR("model_upload: output head upload failed (%d)", s);
-		return s;
+	if (tied_output_shares_buffer(m)) {
+		m->output_w.buf = m->tok_embd.buf;
+	} else {
+		s = upload_one_repack(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL);
+		if (s != OK) {
+			ERROR("model_upload: output head upload failed (%d)", s);
+			return s;
+		}
 	}
+	progress_step(prog);
 
 	if (m->has_per_layer_embeddings) {
 		s = upload_one(m, &m->layer_dims.per_layer_tok_embd, m->layer_dims.per_layer_tok_embd.type,
@@ -1005,6 +1170,7 @@ static status_code upload_embeddings(model *m) {
 			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
 			return s;
 		}
+		progress_step(prog);
 		s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
 							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
 							  WCLASS_MATMUL);
@@ -1012,12 +1178,14 @@ static status_code upload_embeddings(model *m) {
 			ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
 			return s;
 		}
+		progress_step(prog);
 		s = upload_one(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
 					   m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_proj_norm upload failed (%d)", s);
 			return s;
 		}
+		progress_step(prog);
 	}
 	if (m->rope_freqs_count > 0) {
 		m->rope_freqs_w.host_ptr = m->rope_freqs;
@@ -1026,6 +1194,7 @@ static status_code upload_embeddings(model *m) {
 			ERROR("model_upload: rope_freqs upload failed (%d)", s);
 			return s;
 		}
+		progress_step(prog);
 	}
 	return OK;
 }
@@ -1058,7 +1227,39 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 	UPLOAD(&L->attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
-	if (model_layer_is_recurrent(m, i)) {
+	if (m->arch_info->has_hyper_connections) {
+		UPLOAD_REP(&L->hc_attn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD_REP(&L->hc_ffn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD(&L->hc_attn_base_w, GGML_TYPE_F32, 1,
+			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_ffn_base_w, GGML_TYPE_F32, 1,
+			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_attn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+		UPLOAD(&L->hc_ffn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+	}
+
+	if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+		const uint64_t d_inner = (uint64_t)m->hybrid.value_dim;
+		const uint64_t hd	   = (uint64_t)m->kda.head_dim;
+		const uint64_t conv_k  = (uint64_t)m->hybrid.conv_kernel;
+		UPLOAD_REP(&L->wq, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wk, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wv, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->wo, 2, d_inner, m->dim, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_f_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_f_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_g_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP(&L->kda_g_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->n_heads, WCLASS_MATMUL);
+		UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->n_heads, 0, WCLASS_MISC);
+		UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, d_inner, 0, WCLASS_MISC);
+		UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, hd, 0, WCLASS_NORM);
+		UPLOAD(&L->kda_conv_q_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD(&L->kda_conv_k_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD(&L->kda_conv_v_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+	} else if (model_layer_is_recurrent(m, i)) {
 		if (m->arch_info->hybrid_shortconv) {
 			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
 			UPLOAD_REP(&L->ssm_out_w, 2, m->hybrid.value_dim, m->dim, WCLASS_MATMUL);
@@ -1084,10 +1285,12 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		UPLOAD_REP(&L->q_b_w, 2, q_lora, q_b_rows, WCLASS_MATMUL);
 		UPLOAD(&L->q_a_norm_w, GGML_TYPE_F32, 1, q_lora, 0, WCLASS_NORM);
 		UPLOAD_REP(&L->kv_a_w, 2, m->dim, kv_a_rows, WCLASS_MATMUL);
-		UPLOAD_REP(&L->k_b_w, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads,
-				   WCLASS_MATMUL);
-		UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
-				   WCLASS_MATMUL);
+		if (!m->arch_info->is_kda) {
+			UPLOAD_REP(&L->k_b_w, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads,
+					   WCLASS_MATMUL);
+			UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
+					   WCLASS_MATMUL);
+		}
 		UPLOAD(&L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
 		int wo_in = m->n_heads * m->mla.v_head;
 		UPLOAD_REP(&L->wo, 2, wo_in, m->dim, WCLASS_MATMUL);
@@ -1320,45 +1523,72 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 #undef UPLOAD
 #undef UPLOAD_REP
-	progress_update(prog, (uint64_t)i + 1);
+	progress_update(prog, prog->current + 1);
 	return OK;
+}
+
+static void prefetch_layer_pages(const model *m, int layer) {
+	const gguf_ctx *g = &m->gctx;
+	if (g->fd < 0 || !g->map || g->map_is_heap)
+		return;
+	size_t	  ps   = (size_t)page_size_cached();
+	uintptr_t base = (uintptr_t)g->map;
+	for (size_t ti = 0; ti < g->n_tensors; ti++) {
+		const gguf_tensor *gt = &g->tensors[ti];
+		if (gguf_tensor_layer_index(gt->name) != layer || gguf_tensor_name_is_expert(gt->name))
+			continue;
+		page_span r = page_span_for(gt->data, gt->byte_size, ps);
+		if (!page_span_clamp(&r, base, g->map_size) || r.len == 0)
+			continue;
+		readahead(g->fd, (off_t)(r.start - base), r.len);
+	}
 }
 
 static status_code upload_all_weights(model *m) {
 	status_code s;
 
-	s = upload_embeddings(m);
-	if (s != OK)
-		return s;
+	bool bulk_read = !m->use_mmap && backend_has_cap(m->backend, BCAP_IS_HOST);
 
 	progress prog;
-	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers);
+	progress_start(&prog, "Preparing weights", (uint64_t)m->n_layers + embedding_upload_steps(m));
 
-	if (m->gctx.fd >= 0 && m->gctx.map && m->gctx.n_tensors > 0) {
-		uint64_t  ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
-		size_t	  ps	= (size_t)page_size_cached();
-		uintptr_t base	= (uintptr_t)m->gctx.map;
-		for (size_t ti = 0; ti < m->gctx.n_tensors; ti++) {
-			const gguf_tensor *gt = &m->gctx.tensors[ti];
-			if (gguf_tensor_name_is_expert(gt->name))
-				continue;
-			size_t tbytes;
-			if (gguf_tensor_byte_size(gt, &tbytes) != OK || tbytes == 0)
-				continue;
-			page_span r = page_span_for(gt->data, tbytes, ps);
-			if (!page_span_clamp(&r, base, m->gctx.map_size) || r.len == 0)
-				continue;
-			readahead(m->gctx.fd, (off_t)(r.start - base), r.len);
+	if (bulk_read) {
+		s = gguf_sparse_read_tensors(&m->gctx, GGUF_LAYER_GLOBAL);
+		if (s != OK) {
+			progress_finish(&prog);
+			return s;
 		}
-		if (g_monitor && g_monitor->fd >= 0) {
-			monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
-		}
+	}
+
+	uint64_t ra_t0 = (g_monitor && g_monitor->fd >= 0) ? time_us() : 0;
+	if (backend_has_cap(m->backend, BCAP_IS_HOST))
+		prefetch_layer_pages(m, -1);
+	for (int i = 0; i < MODEL_READAHEAD_LAYERS && i < m->n_layers; i++)
+		prefetch_layer_pages(m, i);
+	if (g_monitor && g_monitor->fd >= 0)
+		monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
+
+	s = upload_embeddings(m, &prog);
+	if (s != OK) {
+		progress_finish(&prog);
+		return s;
 	}
 
 	for (int i = 0; i < m->n_layers; i++) {
 		if (g_monitor && g_monitor->fd >= 0) {
 			monitor_emit_load_weights_progress(g_monitor, i, m->n_layers,
 											   100.0 * (double)i / (double)m->n_layers);
+		}
+
+		if (i + MODEL_READAHEAD_LAYERS < m->n_layers)
+			prefetch_layer_pages(m, i + MODEL_READAHEAD_LAYERS);
+
+		if (bulk_read) {
+			s = gguf_sparse_read_tensors(&m->gctx, i);
+			if (s != OK) {
+				progress_finish(&prog);
+				return s;
+			}
 		}
 
 		s = upload_layer_weights(m, i, &prog);
@@ -1604,12 +1834,6 @@ status_code model_load(model *m, const char *path) {
 	return OK;
 }
 
-static void model_prefetch_mmap(gguf_ctx *g) {
-	if (!g || g->fd < 0 || !g->map || g->map_size == 0 || g->map_is_heap)
-		return;
-	readahead(g->fd, 0, (off_t)g->map_size);
-}
-
 static status_code load_moe_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 	int32_t v32;
 	if (m->arch_info->is_moe || akey_i32(g, prefix, "expert_count", &v32) == OK) {
@@ -1717,12 +1941,15 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 		qk_head = v32;
 	if (akey_i32(g, prefix, "attention.value_length_mla", &v32) == OK)
 		v_head = v32;
+	bool rope_key = false;
 	if (akey_i32(g, prefix, "rope.dimension_count", &v32) == OK ||
-		akey_i32(g, prefix, "attention.qk_rope_head_dim", &v32) == OK)
-		qk_rope = v32;
+		akey_i32(g, prefix, "attention.qk_rope_head_dim", &v32) == OK) {
+		qk_rope	 = v32;
+		rope_key = true;
+	}
 	if (akey_i32(g, prefix, "attention.qk_nope_head_dim", &v32) == OK)
 		qk_nope = v32;
-	else if (qk_head > 0 && qk_rope > 0)
+	else if (qk_head > 0 && (qk_rope > 0 || rope_key))
 		qk_nope = qk_head - qk_rope;
 	if (qk_head == 0)
 		qk_head = qk_nope + qk_rope;
@@ -1734,12 +1961,14 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 		q_lora = 2048;
 	if (kv_lora <= 0)
 		kv_lora = 512;
-	if (qk_rope <= 0)
+	if (qk_rope <= 0 && !rope_key)
 		qk_rope = 64;
-	if (qk_nope <= 0)
+	if (qk_nope <= 0 && !(rope_key && qk_head > 0))
 		qk_nope = 192;
 	if (qk_head <= 0)
 		qk_head = 256;
+	if (qk_nope <= 0 && qk_head > 0)
+		qk_nope = qk_head - qk_rope;
 	if (v_head <= 0)
 		v_head = 256;
 	m->mla.q_lora  = q_lora;
@@ -1832,6 +2061,67 @@ static status_code load_hybrid_metadata(model *m, const gguf_ctx *g, const char 
 	return OK;
 }
 
+static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *prefix) {
+	int32_t				 v32;
+	float				 vf;
+	model_hybrid_params *q = &m->hybrid;
+	model_kda_params	*k = &m->kda;
+
+	if (req_i32(g, prefix, "ssm.conv_kernel", &v32) != OK)
+		return ERR_FORMAT;
+	q->conv_kernel = v32;
+	if (req_i32(g, prefix, "kda.head_dim", &v32) != OK)
+		return ERR_FORMAT;
+	k->head_dim = v32;
+	if (req_i32(g, prefix, "hyper_connection.count", &k->hc_count) != OK ||
+		req_i32(g, prefix, "hyper_connection.sinkhorn_iterations", &k->hc_sinkhorn_iters) != OK)
+		return ERR_FORMAT;
+	if (req_f32(g, prefix, "hyper_connection.epsilon", &vf) != OK)
+		return ERR_FORMAT;
+	k->hc_eps			= vf;
+	k->gate_lower_bound = -INFINITY;
+	akey_f32(g, prefix, "kda.gate_lower_bound", &k->gate_lower_bound);
+
+	if (q->conv_kernel < 2 || k->head_dim < 1 || k->hc_count != 4 || k->hc_sinkhorn_iters < 1) {
+		ERROR("glm5-next: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
+			  "only hc_count=4 is supported",
+			  q->conv_kernel, k->head_dim, k->hc_count, k->hc_sinkhorn_iters);
+		return ERR_FORMAT;
+	}
+
+	char		 key[160];
+	const float *arr = NULL;
+	size_t		 n	 = 0;
+	snprintf(key, sizeof(key), "%s.swiglu_clamp_exp", prefix);
+	if (gguf_get_arr_f32(g, key, &arr, &n) == OK && n >= (size_t)m->n_layers) {
+		k->swiglu_clamp_exp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_exp, arr, (size_t)m->n_layers * sizeof(float));
+	}
+	snprintf(key, sizeof(key), "%s.swiglu_clamp_shexp", prefix);
+	if (gguf_get_arr_f32(g, key, &arr, &n) == OK && n >= (size_t)m->n_layers) {
+		k->swiglu_clamp_shexp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_shexp, arr, (size_t)m->n_layers * sizeof(float));
+	} else if (k->swiglu_clamp_exp) {
+		k->swiglu_clamp_shexp = xmalloc((size_t)m->n_layers * sizeof(float));
+		memcpy(k->swiglu_clamp_shexp, k->swiglu_clamp_exp, (size_t)m->n_layers * sizeof(float));
+	}
+
+	int d_inner		  = k->head_dim * m->n_heads;
+	q->n_value_heads  = m->n_heads;
+	q->n_key_heads	  = m->n_heads;
+	q->state_size	  = k->head_dim;
+	q->value_head_dim = k->head_dim;
+	q->value_dim	  = d_inner;
+	q->key_dim		  = d_inner;
+	q->inner_size	  = d_inner;
+	q->conv_channels  = 3 * d_inner;
+	q->conv_dim		  = 3 * d_inner;
+	DEBUG("glm5-next: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
+		  m->n_heads, k->head_dim, q->conv_kernel, (double)k->gate_lower_bound, k->hc_count,
+		  k->hc_sinkhorn_iters, k->swiglu_clamp_exp ? "yes" : "no");
+	return OK;
+}
+
 static status_code model_load_open(model *m, const char *path, int use_mmap,
 								   const char *repack_config) {
 	m->use_mmap		 = use_mmap;
@@ -1839,24 +2129,16 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 	m->repack_config = repack_config ? xstrdup(repack_config) : NULL;
 	model_repack_table_build(m);
 	status_code s = use_mmap ? gguf_load(&m->gctx, path) : gguf_load_metadata(&m->gctx, path);
+	if (s == OK && !use_mmap)
+		s = gguf_sparse_alloc_tensors(&m->gctx, path);
+	if (s == OK && !use_mmap)
+		s = gguf_sparse_read_tensors(&m->gctx, GGUF_LAYER_EAGER);
 	if (s != OK) {
 		free(m->model_path);
 		free((char *)m->repack_config);
 		m->model_path	 = NULL;
 		m->repack_config = NULL;
 		return s;
-	}
-
-	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_emit_load_prefetch_mmap(g_monitor, path);
-	}
-	uint64_t pf_t0 = time_us();
-
-	if (use_mmap)
-		model_prefetch_mmap(&m->gctx);
-
-	if (g_monitor && g_monitor->fd >= 0) {
-		monitor_emit_load_prefetch_done(g_monitor, (time_us() - pf_t0) / 1000);
 	}
 
 	return OK;
@@ -1920,16 +2202,17 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 	}
 	m->n_heads			   = v32;
 	int kv_from_lfm2_array = 0;
-	if (m->arch_info->is_hybrid_recurrent && m->arch_info->hybrid_shortconv) {
+	if (m->arch_info->is_hybrid_recurrent &&
+		(m->arch_info->hybrid_shortconv || m->arch_info->is_kda)) {
 		char key[128];
 		snprintf(key, sizeof(key), "%s.attention.head_count_kv", prefix);
 		const int32_t *kv_arr = NULL;
 		size_t		   kv_n	  = 0;
 		if (gguf_get_arr_i32(g, key, &kv_arr, &kv_n) != OK || !kv_arr ||
-			kv_n != (size_t)m->n_layers) {
-			ERROR("model_load: '%s' must be an i32 array of length %d for lfm2 "
-				  "(0 marks shortconv layers)",
-				  key, m->n_layers);
+			kv_n < (size_t)m->n_layers || (!m->arch_info->is_kda && kv_n != (size_t)m->n_layers)) {
+			ERROR("model_load: '%s' must be an i32 array of length %d for %s "
+				  "(0 marks recurrent layers)",
+				  key, m->n_layers, m->arch_info->gguf_name);
 			return ERR_FORMAT;
 		}
 		m->n_kv_heads = 0;
@@ -1948,8 +2231,8 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 			n_recurrent += (kv_arr[i] == 0);
 		}
 		kv_from_lfm2_array = 1;
-		DEBUG("lfm2: %d shortconv layers, %d attention layers (kv_heads=%d)", n_recurrent,
-			  m->n_layers - n_recurrent, m->n_kv_heads);
+		DEBUG("%s: %d recurrent layers, %d attention layers (kv_heads=%d)", m->arch_info->gguf_name,
+			  n_recurrent, m->n_layers - n_recurrent, m->n_kv_heads);
 	}
 	if (!kv_from_lfm2_array) {
 		if (akey_i32(g, prefix, "attention.head_count_kv", &v32) == OK) {
@@ -2069,6 +2352,9 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 			q->value_head_dim		   = m->dim;
 			q->key_dim				   = 1;
 			q->full_attention_interval = 1;
+		} else if (m->arch_info->is_kda) {
+			if (load_kda_metadata(m, g, prefix) != OK)
+				return ERR_FORMAT;
 		} else if (load_hybrid_metadata(m, g, prefix) != OK) {
 			return ERR_FORMAT;
 		}
@@ -2094,12 +2380,6 @@ static status_code load_layer_tensor(const gguf_ctx *g, char *tname, size_t tnam
 }
 
 static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
-	if (!m->use_mmap) {
-		status_code rs = gguf_sparse_read_tensors(&m->gctx, m->model_path);
-		if (rs != OK)
-			return rs;
-	}
-
 	{
 		const gguf_tensor *t = gguf_find_tensor(g, "token_embd.weight");
 		if (!t) {
@@ -2191,7 +2471,55 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 							  "blk.%d.attn_norm.weight", 0) != OK)
 			return ERR_FORMAT;
 
-		if (model_layer_is_recurrent(m, i)) {
+		if (m->arch_info->has_hyper_connections) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_fn_w,
+								  "blk.%d.hc_attn_fn.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_base_w,
+								  "blk.%d.hc_attn_base.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_attn_scale_w,
+								  "blk.%d.hc_attn_scale.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_fn_w,
+								  "blk.%d.hc_ffn_fn.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_base_w,
+								  "blk.%d.hc_ffn_base.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->hc_ffn_scale_w,
+								  "blk.%d.hc_ffn_scale.weight", 0) != OK)
+				return ERR_FORMAT;
+		}
+
+		if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
+			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->wq, "blk.%d.attn_q.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wk, "blk.%d.attn_k.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wv, "blk.%d.attn_v.weight", 1) !=
+					OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->wo, "blk.%d.attn_output.weight",
+								  1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_f_a_w,
+								  "blk.%d.ssm_f_a.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_f_b_w,
+								  "blk.%d.ssm_f_b.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_g_a_w,
+								  "blk.%d.ssm_g_a.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_g_b_w,
+								  "blk.%d.ssm_g_b.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_beta_w,
+								  "blk.%d.ssm_beta.weight", 1) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_a, "blk.%d.ssm_a", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_dt_b, "blk.%d.ssm_dt.bias",
+								  0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->ssm_norm_w,
+								  "blk.%d.ssm_norm.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_q_w,
+								  "blk.%d.ssm_conv1d_q.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_k_w,
+								  "blk.%d.ssm_conv1d_k.weight", 0) != OK ||
+				load_layer_tensor(g, tname, sizeof(tname), i, &L->kda_conv_v_w,
+								  "blk.%d.ssm_conv1d_v.weight", 0) != OK)
+				return ERR_FORMAT;
+			L->has_own_v = 0;
+		} else if (model_layer_is_recurrent(m, i)) {
 			int is_conv = m->arch_info->hybrid_shortconv;
 			if (is_conv) {
 				if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_qkv_w,
@@ -2747,6 +3075,12 @@ status_code model_build_weight_refs(model *m) {
 		row[WIDX_SSM_ALPHA]			   = &L->ssm_alpha_w;
 		row[WIDX_SSM_NORM]			   = &L->ssm_norm_w;
 		row[WIDX_SSM_OUT]			   = &L->ssm_out_w;
+		row[WIDX_SSM_F_A]			   = &L->kda_f_a_w;
+		row[WIDX_SSM_F_B]			   = &L->kda_f_b_w;
+		row[WIDX_SSM_G_A]			   = &L->kda_g_a_w;
+		row[WIDX_SSM_G_B]			   = &L->kda_g_b_w;
+		row[WIDX_HC_ATTN_FN]		   = &L->hc_attn_fn_w;
+		row[WIDX_HC_FFN_FN]			   = &L->hc_ffn_fn_w;
 	}
 
 	return OK;
@@ -2842,9 +3176,6 @@ status_code model_upload_weights(model *m) {
 		ERROR("model_upload: weight upload failed (%d)", up_s);
 		return up_s;
 	}
-
-	if (m->gctx.map && m->gctx.map_size > 0)
-		madvise(m->gctx.map, m->gctx.map_size, MADV_RANDOM);
 
 	INFO("weights uploaded in %llu ms", (unsigned long long)((time_us() - up_t0) / 1000));
 #ifdef __GLIBC__
@@ -2958,9 +3289,11 @@ void model_free(model *m) {
 			free(L->gate_up_fused_host);
 			L->gate_up_fused_host = NULL;
 		}
+		bool output_shares_embd = m->output_w.buf.handle == m->tok_embd.buf.handle;
 		free_weight_buf(&m->tok_embd.buf);
 		free_weight_buf(&m->output_norm_w.buf);
-		free_weight_buf(&m->output_w.buf);
+		if (!output_shares_embd)
+			free_weight_buf(&m->output_w.buf);
 		free_weight_buf(&m->layer_dims.per_layer_tok_embd.buf);
 		free_weight_buf(&m->layer_dims.per_layer_model_proj.buf);
 		free_weight_buf(&m->layer_dims.per_layer_proj_norm_w.buf);
@@ -3002,6 +3335,9 @@ void model_free(model *m) {
 		m->layer_backends	= NULL;
 		m->n_layer_backends = 0;
 	}
+
+	free(m->kda.swiglu_clamp_exp);
+	free(m->kda.swiglu_clamp_shexp);
 
 	if (m->owns_backend)
 		backend_destroy(m->backend);
