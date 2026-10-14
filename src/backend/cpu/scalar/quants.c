@@ -2595,3 +2595,54 @@ __attribute__((weak)) void moe_activate_gelu(float *restrict act, const float *r
 	for (int i = 0; i < n; i++)
 		act[i] = gelu_tanh(gate[i] * gs) * (up[i] * us);
 }
+
+__attribute__((weak)) void iq_qonly_via_dequant(const void *w, uint32_t				  wtype,
+												const q8_k_block *restrict xq, size_t xs,
+												float *restrict y, int ys, int n, int k, int m) {
+	dequant_blocks_fn dq  = NULL;
+	int				  div = 256;
+	dequant_row_plan(wtype, &dq, &div);
+	size_t wb  = ggml_row_size(wtype, k);
+	int	   bpr = k / 256;
+	float *xf  = malloc((size_t)k * sizeof(float));
+	float *wf  = malloc((size_t)k * sizeof(float));
+	for (int t = 0; t < m; t++) {
+		const q8_k_block *xb = xq + (size_t)t * xs;
+		for (int bi = 0; bi < bpr; bi++) {
+			float	d  = xb[bi].d;
+			int8_t *qs = (int8_t *)xb[bi].qs;
+			for (int j = 0; j < 256; j++)
+				xf[bi * 256 + j] = d * (float)qs[j];
+		}
+		for (int i = 0; i < n; i++) {
+			const uint8_t *row = (const uint8_t *)w + (size_t)i * wb;
+			dq(row, (size_t)(k / div), wf);
+			double acc = 0;
+			for (int j = 0; j < k; j++)
+				acc += (double)wf[j] * (double)xf[j];
+			y[(size_t)t * ys + i] = (float)acc;
+		}
+	}
+	free(xf);
+	free(wf);
+}
+__attribute__((weak)) void matmul_iq2_s_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+													   size_t xs, float *y, int ys, int n, int k,
+													   int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_S, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq2_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														 size_t xs, float *y, int ys, int n, int k,
+														 int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq3_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														 size_t xs, float *y, int ys, int n, int k,
+														 int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ3_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq4_xs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														size_t xs, float *y, int ys, int n, int k,
+														int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ4_XS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}

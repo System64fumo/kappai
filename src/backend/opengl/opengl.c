@@ -56,6 +56,10 @@ typedef enum {
 	GL_PIPE_MATMUL_Q5_K,
 	GL_PIPE_MATMUL_Q6_K,
 	GL_PIPE_MATMUL_IQ3_S,
+	GL_PIPE_MATMUL_IQ2_S,
+	GL_PIPE_MATMUL_IQ2_XXS,
+	GL_PIPE_MATMUL_IQ3_XXS,
+	GL_PIPE_MATMUL_IQ4_XS,
 	GL_PIPE_QUANTIZE_Q8_K,
 	GL_PIPE_ROPE,
 	GL_PIPE_ROPE_BATCH,
@@ -107,6 +111,7 @@ enum {
 	GL_PIPE_F_USES_XQK	= 1u << 6,
 	GL_PIPE_F_IQ4NL_LUT = 1u << 7,
 	GL_PIPE_F_BF16		= 1u << 8,
+	GL_PIPE_F_IQX_GRID	= 1u << 9,
 };
 
 typedef struct gl_buf {
@@ -199,6 +204,7 @@ struct gl_priv {
 
 	gl_buf *iq3s_grid;
 	gl_buf *iq4nl_pairs;
+	gl_buf *iqx_grid;
 
 	gl_buf *argmax_partial;
 	size_t	argmax_partial_bytes;
@@ -1017,6 +1023,18 @@ static status_code gl_init(backend *self, int device_index) {
 								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q6_K, 4, 256},
 		[GL_PIPE_MATMUL_IQ3_S] = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src, GL_PIPE_F_USES_XQK,
 								  GGML_TYPE_IQ3_S, 32, 256},
+		[GL_PIPE_MATMUL_IQ2_S] = {"matmul_iq2_s", gl_shader_matmul_iq2_s_src,
+								  GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ2_S, 32,
+								  256},
+		[GL_PIPE_MATMUL_IQ2_XXS] = {"matmul_iq2_xxs", gl_shader_matmul_iq2_xxs_src,
+									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ2_XXS, 32,
+									256},
+		[GL_PIPE_MATMUL_IQ3_XXS] = {"matmul_iq3_xxs", gl_shader_matmul_iq3_xxs_src,
+									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ3_XXS, 32,
+									256},
+		[GL_PIPE_MATMUL_IQ4_XS]	 = {"matmul_iq4_xs", gl_shader_matmul_iq4_xs_src,
+									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ4_XS, 32,
+									256},
 		[GL_PIPE_MATMUL_Q4_0_TILED] = {"matmul_q4_0_tiled", gl_shader_matmul_q4_0_src,
 									   GL_PIPE_F_MATMUL_WG | GL_PIPE_F_TILED | GL_PIPE_F_USES_XQ,
 									   UINT32_MAX, 4, 32},
@@ -1170,11 +1188,26 @@ static status_code gl_init(backend *self, int device_index) {
 	for (int b = 0; b < 256; b++)
 		iq4nl_pairs[b] =
 			(uint32_t)((int32_t)iq4nl_values[b & 15] + (int32_t)iq4nl_values[b >> 4] * 65536);
-	p->iq3s_grid   = gl_buf_alloc(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid);
+	p->iq3s_grid = gl_buf_alloc(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid);
+	{
+		static uint8_t iqx_data[sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
+								sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs)];
+		uint8_t		  *dp = iqx_data;
+		memcpy(dp, ggml_iq2s_grid, sizeof(ggml_iq2s_grid));
+		dp += sizeof(ggml_iq2s_grid);
+		memcpy(dp, ggml_iq2xxs_grid, sizeof(ggml_iq2xxs_grid));
+		dp += sizeof(ggml_iq2xxs_grid);
+		memcpy(dp, ggml_iq3xxs_grid, sizeof(ggml_iq3xxs_grid));
+		dp += sizeof(ggml_iq3xxs_grid);
+		memcpy(dp, ggml_ksigns_iq2xs, sizeof(ggml_ksigns_iq2xs));
+		p->iqx_grid = gl_buf_alloc(p, sizeof(iqx_data), GL_STATIC_DRAW, iqx_data);
+	}
 	p->iq4nl_pairs = gl_buf_alloc(p, sizeof(iq4nl_pairs), GL_STATIC_DRAW, iq4nl_pairs);
-	if (!p->iq3s_grid || !p->iq4nl_pairs) {
+	if (!p->iq3s_grid || !p->iq4nl_pairs || !p->iqx_grid) {
 		if (p->iq3s_grid)
 			gl_buf_free(p, p->iq3s_grid);
+		if (p->iqx_grid)
+			gl_buf_free(p, p->iqx_grid);
 		if (p->iq4nl_pairs)
 			gl_buf_free(p, p->iq4nl_pairs);
 		for (int i = 0; i < GL_PIPE_COUNT; i++)
@@ -1219,6 +1252,7 @@ static void gl_free(backend *self) {
 
 	gl_buf_free(p, p->iq3s_grid);
 	gl_buf_free(p, p->iq4nl_pairs);
+	gl_buf_free(p, p->iqx_grid);
 	for (int i = 0; i < GL_ROPE_CACHE_SLOTS; i++)
 		free(p->rope_cache[i].valid);
 	free(p->attention_src);
@@ -1253,6 +1287,10 @@ static bool gl_weight_is_device_only(uint32_t type) {
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ2_S:
+	case GGML_TYPE_IQ2_XXS:
+	case GGML_TYPE_IQ3_XXS:
+	case GGML_TYPE_IQ4_XS:
 	case GGML_TYPE_Q4_0_R8:
 	case GGML_TYPE_Q8_0_R8:
 	case GGML_TYPE_IQ4_NL_R8:
@@ -1500,6 +1538,10 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ4_NL:
 	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ2_S:
+	case GGML_TYPE_IQ2_XXS:
+	case GGML_TYPE_IQ3_XXS:
+	case GGML_TYPE_IQ4_XS:
 		pipe = &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT];
 		break;
 	case GGML_TYPE_Q4_0_R8:
@@ -1548,7 +1590,12 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 		gl_use_pipeline(p, pipe);
 		gl_bind_ssbo(0, tok_embd);
 		gl_bind_ssbo_out(1, x_out);
-		gl_bind_raw(p, 2, p->iq3s_grid->name, 0, 0, 0);
+		if ((tok_embd_type == GGML_TYPE_IQ2_S || tok_embd_type == GGML_TYPE_IQ2_XXS ||
+			 tok_embd_type == GGML_TYPE_IQ3_XXS || tok_embd_type == GGML_TYPE_IQ4_XS) &&
+			p->iqx_grid)
+			gl_bind_raw(p, 2, p->iqx_grid->name, 0, 0, 0);
+		else
+			gl_bind_raw(p, 2, p->iq3s_grid->name, 0, 0, 0);
 		gl_pu(pipe, unames[0], uniforms[0]);
 		gl_pu(pipe, unames[1], uniforms[1]);
 		gl_pu(pipe, unames[2], uniforms[2]);
@@ -2528,7 +2575,9 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		gl_bind_ssbo(3, residual);
 	else
 		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
-	if (use_xqk)
+	if ((pipe->flags & GL_PIPE_F_IQX_GRID) != 0 && p->iqx_grid)
+		gl_bind_raw(p, 4, p->iqx_grid->name, 0, 0, 0);
+	else if (use_xqk)
 		gl_bind_raw(p, 4, p->iq3s_grid->name, 0, 0, 0);
 	else if (gl_pipe_uses_iq4nl_lut(p, pipe))
 		gl_bind_raw(p, 4, p->iq4nl_pairs->name, 0, 0, 0);

@@ -1,0 +1,161 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+#ifdef HAS_RESIDUAL
+layout(set = 0, binding = 2) readonly buffer RBuf {
+	float residual[];
+};
+layout(set = 0, binding = 3) writeonly buffer Y0Buf {
+	float y0[];
+};
+#define IQX_GRID_BINDING 4
+#else
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+#define IQX_GRID_BINDING 3
+#endif
+
+layout(push_constant) uniform Params {
+	int n0;
+	int n1;
+	int k;
+	int m;
+}
+params;
+
+#include "common.glsl"
+#include "iqx_grids.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			   = 256;
+const int  BLOCKS_PER_TILE	   = TILE_K / BLOCK;
+const uint IQ3_XXS_BLOCK_BYTES = 98u;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ3_XXS_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+#ifdef HAS_RESIDUAL
+	uint r_off = y0_off;
+#endif
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ3_XXS_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+
+				uint qs_off	  = block_off + 2u;
+				uint saux_off = block_off + 66u;
+
+				for (int ib32 = 0; ib32 < 8; ib32++) {
+					uint  saux = w0_read_u32(saux_off + uint(ib32) * 4u);
+					float db   = d_w * (0.5 + float(saux >> 28u)) * 0.5;
+					uint  qs_b = qs_off + uint(ib32) * 8u;
+
+					for (int l = 0; l < 4; l++) {
+						uint q1	  = w0_read_u8(qs_b + uint(2 * l));
+						uint q2	  = w0_read_u8(qs_b + uint(2 * l + 1));
+						uint gw1  = iqx_iq3xxs_grid(q1);
+						uint gw2  = iqx_iq3xxs_grid(q2);
+						int	 g1_0 = int((gw1 >> 0u) & 0xFFu);
+						int	 g1_1 = int((gw1 >> 8u) & 0xFFu);
+						int	 g1_2 = int((gw1 >> 16u) & 0xFFu);
+						int	 g1_3 = int((gw1 >> 24u) & 0xFFu);
+						int	 g2_0 = int((gw2 >> 0u) & 0xFFu);
+						int	 g2_1 = int((gw2 >> 8u) & 0xFFu);
+						int	 g2_2 = int((gw2 >> 16u) & 0xFFu);
+						int	 g2_3 = int((gw2 >> 24u) & 0xFFu);
+
+						uint signs = iqx_ksign((saux >> uint(7 * l)) & 127u);
+						int	 s0	   = (signs & 1u) != 0u ? -g1_0 : g1_0;
+						int	 s1	   = (signs & 2u) != 0u ? -g1_1 : g1_1;
+						int	 s2	   = (signs & 4u) != 0u ? -g1_2 : g1_2;
+						int	 s3	   = (signs & 8u) != 0u ? -g1_3 : g1_3;
+						int	 s4	   = (signs & 16u) != 0u ? -g2_0 : g2_0;
+						int	 s5	   = (signs & 32u) != 0u ? -g2_1 : g2_1;
+						int	 s6	   = (signs & 64u) != 0u ? -g2_2 : g2_2;
+						int	 s7	   = (signs & 128u) != 0u ? -g2_3 : g2_3;
+
+						int xw0 = (x_base + ib32 * 32 + l * 8) >> 2;
+						int sum =
+							dotPacked4x8EXT(
+								pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+								int(xq_packed[xw0])) +
+							dotPacked4x8EXT(
+								pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+								int(xq_packed[xw0 + 1]));
+
+						acc0 = fma(db * xd, float(sum), acc0);
+					}
+				}
+			}
+		}
+		barrier();
+	}
+
+#if defined(HAS_RESIDUAL)
+	if (valid0)
+		y0[y0_off + i] = acc0 + residual[r_off + i];
+#else
+	if (valid0)
+		y0[y0_off + i] = acc0;
+#endif
+}

@@ -13,6 +13,8 @@ layout(set = 0, binding = 1) writeonly buffer DstBuf {
 };
 #define IQ3S_GRID_BINDING 2
 #include "iq3s_grid.glsl"
+#define IQX_GRID_BINDING 2
+#include "iqx_grids.glsl"
 
 layout(push_constant) uniform Params {
 	int type;
@@ -182,7 +184,7 @@ void dequant256(int type, uint b) {
 				ybuf[n + l + 96] = d * s6 * q4;
 			}
 		}
-	} else {
+	} else if (type == GTYPE_IQ3_S) {
 		const float d	= rd_f16(b);
 		uint		ql	= b + 2u;
 		uint		qh	= b + 66u;
@@ -243,6 +245,80 @@ void dequant256(int type, uint b) {
 				ybuf[base + 5] = v[5] * float(iq3s_grid_byte(g2, 1));
 				ybuf[base + 6] = v[6] * float(iq3s_grid_byte(g2, 2));
 				ybuf[base + 7] = v[7] * float(iq3s_grid_byte(g2, 3));
+			}
+		}
+	} else if (type == GTYPE_IQ2_XXS) {
+		const float d = rd_f16(b);
+		for (int ib = 0; ib < 8; ib++) {
+			uint  aux0 = rd_u32(b + 2u + uint(ib) * 8u);
+			uint  aux1 = rd_u32(b + 6u + uint(ib) * 8u);
+			float db   = d * (0.5 + float(aux1 >> 28u)) * 0.25;
+			for (int l = 0; l < 4; l++) {
+				uint  abyte = (aux0 >> uint(l * 8)) & 0xFFu;
+				uvec2 gw	= iqx_iq2xxs_grid(abyte);
+				uint  sign	= iqx_ksign((aux1 >> uint(7 * l)) & 127u);
+				for (int j = 0; j < 8; j++) {
+					uint gb = (j < 4) ? ((gw.x >> uint(j * 8)) & 0xFFu)
+									  : ((gw.y >> uint((j - 4) * 8)) & 0xFFu);
+					ybuf[ib * 32 + l * 8 + j] =
+						db * float(gb) * (((sign & (1u << uint(j))) != 0u) ? -1.0 : 1.0);
+				}
+			}
+		}
+	} else if (type == GTYPE_IQ3_XXS) {
+		const float d = rd_f16(b);
+		for (int ib = 0; ib < 8; ib++) {
+			uint  saux = rd_u32(b + 66u + uint(ib) * 4u);
+			float db   = d * (0.5 + float(saux >> 28u)) * 0.5;
+			for (int l = 0; l < 4; l++) {
+				uint g1	  = iqx_iq3xxs_grid(rd_u8(b + 2u + uint(ib) * 8u + uint(2 * l)));
+				uint g2	  = iqx_iq3xxs_grid(rd_u8(b + 2u + uint(ib) * 8u + uint(2 * l + 1)));
+				uint sign = iqx_ksign((saux >> uint(7 * l)) & 127u);
+				for (int j = 0; j < 4; j++) {
+					uint gb1 = (g1 >> uint(j * 8)) & 0xFFu;
+					uint gb2 = (g2 >> uint(j * 8)) & 0xFFu;
+					ybuf[ib * 32 + l * 8 + j] =
+						db * float(gb1) * (((sign & (1u << uint(j))) != 0u) ? -1.0 : 1.0);
+					ybuf[ib * 32 + l * 8 + 4 + j] =
+						db * float(gb2) * (((sign & (1u << uint(j + 4))) != 0u) ? -1.0 : 1.0);
+				}
+			}
+		}
+	} else if (type == GTYPE_IQ2_S) {
+		const float d = rd_f16(b);
+		for (int ib = 0; ib < 8; ib++) {
+			uint  sb  = rd_u8(b + 74u + uint(ib));
+			float db0 = d * (0.5 + float(sb & 0xFu)) * 0.25;
+			float db1 = d * (0.5 + float(sb >> 4u)) * 0.25;
+			uint  qh  = rd_u8(b + 66u + uint(ib));
+			for (int l = 0; l < 4; l++) {
+				uint idx =
+					rd_u8(b + 2u + uint(ib) * 4u + uint(l)) | ((qh << uint(8 - 2 * l)) & 0x300u);
+				uvec2 gw	= iqx_iq2s_grid(idx);
+				uint  sbyte = rd_u8(b + 34u + uint(ib) * 4u + uint(l));
+				float db	= (l < 2) ? db0 : db1;
+				for (int j = 0; j < 8; j++) {
+					uint gb = (j < 4) ? ((gw.x >> uint(j * 8)) & 0xFFu)
+									  : ((gw.y >> uint((j - 4) * 8)) & 0xFFu);
+					ybuf[ib * 32 + l * 8 + j] =
+						db * float(gb) * (((sbyte & (1u << uint(j))) != 0u) ? -1.0 : 1.0);
+				}
+			}
+		}
+	} else if (type == GTYPE_IQ4_XS) {
+		const int kvalues[16] =
+			int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+		const float d = rd_f16(b);
+		for (int ib = 0; ib < 8; ib++) {
+			uint  slb = rd_u8(b + 4u + uint(ib / 2));
+			int	  sl  = int((slb >> uint(4 * (ib % 2))) & 0xFu);
+			uint  shw = rd_u8(b + 2u) | (rd_u8(b + 3u) << 8u);
+			int	  sh  = int((shw >> uint(2 * ib)) & 3u);
+			float dl  = d * float((sl | (sh << 4)) - 32);
+			for (int j = 0; j < 16; j++) {
+				uint byte			   = rd_u8(b + 8u + uint(ib) * 16u + uint(j));
+				ybuf[ib * 32 + j]	   = dl * float(kvalues[byte & 0xFu]);
+				ybuf[ib * 32 + 16 + j] = dl * float(kvalues[byte >> 4u]);
 			}
 		}
 	}

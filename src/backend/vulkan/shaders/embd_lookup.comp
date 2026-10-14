@@ -22,6 +22,8 @@ params;
 
 #define IQ3S_GRID_BINDING 2
 #include "iq3s_grid.glsl"
+#define IQX_GRID_BINDING 2
+#include "iqx_grids.glsl"
 
 uint embd_read_u8(uint byte_offset) {
 	uint word  = embd[byte_offset >> 2];
@@ -240,6 +242,95 @@ void main() {
 		bool  neg  = (sign_byte & (1u << uint(pos8))) != 0u;
 		float sval = neg ? -float(sc) : float(sc);
 		val		   = d_w * sval * float(g);
+		break;
+	}
+	case 16: {
+		int	  block_idx = int(d) / 256;
+		int	  in_block	= int(d) % 256;
+		int	  ib		= in_block / 32;
+		int	  rem		= in_block % 32;
+		int	  l			= rem / 8;
+		int	  pos		= rem % 8;
+		uint  block_off = row_off + uint(block_idx) * 66u;
+		float d_w		= half_to_float(embd_read_u16(block_off));
+		uint  aux0		= embd_read_u8(block_off + 2u + uint(ib) * 8u) |
+						  (embd_read_u8(block_off + 3u + uint(ib) * 8u) << 8u) |
+						  (embd_read_u8(block_off + 4u + uint(ib) * 8u) << 16u) |
+						  (embd_read_u8(block_off + 5u + uint(ib) * 8u) << 24u);
+		uint  aux1		= embd_read_u8(block_off + 6u + uint(ib) * 8u) |
+						  (embd_read_u8(block_off + 7u + uint(ib) * 8u) << 8u) |
+						  (embd_read_u8(block_off + 8u + uint(ib) * 8u) << 16u) |
+						  (embd_read_u8(block_off + 9u + uint(ib) * 8u) << 24u);
+		float db		= d_w * (0.5 + float(aux1 >> 28u)) * 0.25;
+		uint  abyte		= (aux0 >> uint(l * 8)) & 0xFFu;
+		uvec2 gw		= iqx_iq2xxs_grid(abyte);
+		uint  sign		= iqx_ksign((aux1 >> uint(7 * l)) & 127u);
+		uint  gb =
+			(pos < 4) ? ((gw.x >> uint(pos * 8)) & 0xFFu) : ((gw.y >> uint((pos - 4) * 8)) & 0xFFu);
+		val = db * float(gb) * (((sign & (1u << uint(pos))) != 0u) ? -1.0 : 1.0);
+		break;
+	}
+	case 18: {
+		int	  block_idx = int(d) / 256;
+		int	  in_block	= int(d) % 256;
+		int	  ib		= in_block / 32;
+		int	  rem		= in_block % 32;
+		int	  l			= rem / 8;
+		int	  pos		= rem % 8;
+		uint  block_off = row_off + uint(block_idx) * 98u;
+		float d_w		= half_to_float(embd_read_u16(block_off));
+		uint  saux		= embd_read_u8(block_off + 66u + uint(ib) * 4u) |
+						  (embd_read_u8(block_off + 67u + uint(ib) * 4u) << 8u) |
+						  (embd_read_u8(block_off + 68u + uint(ib) * 4u) << 16u) |
+						  (embd_read_u8(block_off + 69u + uint(ib) * 4u) << 24u);
+		float db		= d_w * (0.5 + float(saux >> 28u)) * 0.5;
+		uint  gidx =
+			embd_read_u8(block_off + 2u + uint(ib) * 8u + uint(pos < 4 ? 2 * l : 2 * l + 1));
+		uint gw	  = iqx_iq3xxs_grid(gidx);
+		uint gpos = uint(pos < 4 ? pos : pos - 4);
+		uint gb	  = (gw >> (gpos * 8u)) & 0xFFu;
+		uint sign = iqx_ksign((saux >> uint(7 * l)) & 127u);
+		val		  = db * float(gb) * (((sign & (1u << uint(pos))) != 0u) ? -1.0 : 1.0);
+		break;
+	}
+	case 22: {
+		int	  block_idx = int(d) / 256;
+		int	  in_block	= int(d) % 256;
+		int	  ib		= in_block / 32;
+		int	  rem		= in_block % 32;
+		int	  l			= rem / 8;
+		int	  pos		= rem % 8;
+		uint  block_off = row_off + uint(block_idx) * 82u;
+		float d_w		= half_to_float(embd_read_u16(block_off));
+		uint  sb		= embd_read_u8(block_off + 74u + uint(ib));
+		float db		= d_w * (0.5 + float((l < 2 ? (sb & 0xFu) : (sb >> 4u)))) * 0.25;
+		uint  qh		= embd_read_u8(block_off + 66u + uint(ib));
+		uint  idx		= embd_read_u8(block_off + 2u + uint(ib) * 4u + uint(l)) |
+						  ((qh << uint(8 - 2 * l)) & 0x300u);
+		uvec2 gw		= iqx_iq2s_grid(idx);
+		uint  sbyte		= embd_read_u8(block_off + 34u + uint(ib) * 4u + uint(l));
+		uint  gb =
+			(pos < 4) ? ((gw.x >> uint(pos * 8)) & 0xFFu) : ((gw.y >> uint((pos - 4) * 8)) & 0xFFu);
+		val = db * float(gb) * (((sbyte & (1u << uint(pos))) != 0u) ? -1.0 : 1.0);
+		break;
+	}
+	case 23: {
+		const int kvalues[16] =
+			int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+		int	  block_idx = int(d) / 256;
+		int	  in_block	= int(d) % 256;
+		int	  ib		= in_block / 32;
+		int	  j			= in_block % 32;
+		uint  block_off = row_off + uint(block_idx) * 136u;
+		float d_w		= half_to_float(embd_read_u16(block_off));
+		uint  slb		= embd_read_u8(block_off + 4u + uint(ib / 2));
+		int	  sl		= int((slb >> uint(4 * (ib % 2))) & 0xFu);
+		uint  shw		= embd_read_u8(block_off + 2u) | (embd_read_u8(block_off + 3u) << 8u);
+		int	  sh		= int((shw >> uint(2 * ib)) & 3u);
+		float dl		= d_w * float((sl | (sh << 4)) - 32);
+		uint  byte		= embd_read_u8(block_off + 8u + uint(ib) * 16u + uint(j % 16));
+		int	  q			= (j < 16) ? kvalues[byte & 0xFu] : kvalues[byte >> 4u];
+		val				= dl * float(q);
 		break;
 	}
 	case 30:

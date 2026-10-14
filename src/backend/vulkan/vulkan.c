@@ -274,6 +274,14 @@ typedef struct {
 	vk_pipeline_set p_matmul_q6_k_dual_batch;
 	vk_pipeline_set p_matmul_iq3_s_batch;
 	vk_pipeline_set p_matmul_iq3_s_res_batch;
+	vk_pipeline_set p_matmul_iq2_s_batch;
+	vk_pipeline_set p_matmul_iq2_s_res_batch;
+	vk_pipeline_set p_matmul_iq2_xxs_batch;
+	vk_pipeline_set p_matmul_iq2_xxs_res_batch;
+	vk_pipeline_set p_matmul_iq3_xxs_batch;
+	vk_pipeline_set p_matmul_iq3_xxs_res_batch;
+	vk_pipeline_set p_matmul_iq4_xs_batch;
+	vk_pipeline_set p_matmul_iq4_xs_res_batch;
 	vk_pipeline_set p_matmul_f32_batch;
 	vk_pipeline_set p_matmul_f32_res_batch;
 	vk_pipeline_set p_matmul_f16_batch;
@@ -365,6 +373,7 @@ typedef struct {
 	vk_buf dummy_buf;
 
 	vk_buf iq3s_grid_buf;
+	vk_buf iqx_grid_buf;
 
 	void **kv_handles;
 	int	   kv_handle_count;
@@ -779,6 +788,14 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_matmul_q6_k_dual_batch,
 			&p->p_matmul_iq3_s_batch,
 			&p->p_matmul_iq3_s_res_batch,
+			&p->p_matmul_iq2_s_batch,
+			&p->p_matmul_iq2_s_res_batch,
+			&p->p_matmul_iq2_xxs_batch,
+			&p->p_matmul_iq2_xxs_res_batch,
+			&p->p_matmul_iq3_xxs_batch,
+			&p->p_matmul_iq3_xxs_res_batch,
+			&p->p_matmul_iq4_xs_batch,
+			&p->p_matmul_iq4_xs_res_batch,
 			&p->p_matmul_f32_batch,
 			&p->p_matmul_f32_res_batch,
 			&p->p_matmul_f16_batch,
@@ -2181,6 +2198,31 @@ static status_code vk_init(backend *self, int device_index) {
 			memcpy(p->iq3s_grid_buf.mapped, ggml_iq3s_grid, sizeof(ggml_iq3s_grid));
 		}
 	}
+	{
+		uint8_t				 *iqx		= NULL;
+		size_t				  iqx_bytes = sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
+										  sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs);
+		VkBufferUsageFlags	  iqx_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		VkMemoryPropertyFlags iqx_flags =
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		if (p->caps.unified_memory)
+			iqx_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		s = vk_alloc_buffer(p, iqx_bytes, iqx_usage, iqx_flags, &p->iqx_grid_buf);
+		if (s != OK) {
+			WARN("vulkan: failed to allocate IQX grid buffer -- "
+				 "IQ2_S/IQ2_XXS/IQ3_XXS grid paths will be disabled");
+			p->iqx_grid_buf.buf = VK_NULL_HANDLE;
+		} else {
+			iqx = (uint8_t *)p->iqx_grid_buf.mapped;
+			memcpy(iqx, ggml_iq2s_grid, sizeof(ggml_iq2s_grid));
+			iqx += sizeof(ggml_iq2s_grid);
+			memcpy(iqx, ggml_iq2xxs_grid, sizeof(ggml_iq2xxs_grid));
+			iqx += sizeof(ggml_iq2xxs_grid);
+			memcpy(iqx, ggml_iq3xxs_grid, sizeof(ggml_iq3xxs_grid));
+			iqx += sizeof(ggml_iq3xxs_grid);
+			memcpy(iqx, ggml_ksigns_iq2xs, sizeof(ggml_ksigns_iq2xs));
+		}
+	}
 
 	s = vk_create_pipeline_spec(p, shader_matmul_f32_batch_spv, shader_matmul_f32_batch_spv_len, 3,
 								12, spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow),
@@ -2266,6 +2308,14 @@ static status_code vk_init(backend *self, int device_index) {
 
 	VK_CREATE_BATCH_MATMUL_FIELD(iq3_s, matmul_iq3_s, 4, 16, spec_matmul_iq3s);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_s, matmul_iq3_s, 5, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq2_s, matmul_iq2_s, 4, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq2_s, matmul_iq2_s, 5, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq2_xxs, matmul_iq2_xxs, 4, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq2_xxs, matmul_iq2_xxs, 5, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq3_xxs, matmul_iq3_xxs, 4, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_xxs, matmul_iq3_xxs, 5, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq4_xs, matmul_iq4_xs, 3, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq4_xs, matmul_iq4_xs, 4, 16, spec_matmul_iq3s);
 
 	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 3, 12, spec_matmul_dense_narrow);
 	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16, matmul_f16, 4, 12, spec_matmul_dense_narrow);
@@ -2415,6 +2465,14 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_matmul_q6_k_dual_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq3_s_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq3_s_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq2_s_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq2_s_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq2_xxs_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq2_xxs_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq3_xxs_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq3_xxs_res_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq4_xs_batch);
+		vk_destroy_pipeline(p, &p->p_matmul_iq4_xs_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f32_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f32_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f16_batch);
@@ -2501,6 +2559,9 @@ static void vk_free(backend *self) {
 		}
 		if (p->iq3s_grid_buf.buf) {
 			vk_free_buffer(p, &p->iq3s_grid_buf);
+		}
+		if (p->iqx_grid_buf.buf) {
+			vk_free_buffer(p, &p->iqx_grid_buf);
 		}
 
 		for (int i = 0; i < p->scratch_pool_count; i++) {
@@ -3692,6 +3753,18 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_IQ3_S:
 		shader_type = 21;
 		break;
+	case GGML_TYPE_IQ2_XXS:
+		shader_type = 16;
+		break;
+	case GGML_TYPE_IQ3_XXS:
+		shader_type = 18;
+		break;
+	case GGML_TYPE_IQ2_S:
+		shader_type = 22;
+		break;
+	case GGML_TYPE_IQ4_XS:
+		shader_type = 23;
+		break;
 	case GGML_TYPE_BF16:
 		shader_type = 30;
 		break;
@@ -3706,11 +3779,16 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 			int32_t token, dim, type, row_stride;
 		} push		  = {token, dim, shader_type, (int)row_stride};
 		vk_buf *dummy = vk_dummy_buf(p);
-		vk_buf *grid_buf =
-			(tok_embd_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf) ? &p->iq3s_grid_buf : dummy;
-		vk_buf		*bufs[3] = {as_vkbuf(tok_embd), as_vkbuf(x_out), grid_buf};
-		VkDeviceSize offs[3] = {tok_embd->offset, x_out->offset, 0};
-		uint32_t	 groups	 = (uint32_t)((dim + 63) / 64);
+		int		embd_needs_iqx =
+			(tok_embd_type == GGML_TYPE_IQ2_S || tok_embd_type == GGML_TYPE_IQ2_XXS ||
+			 tok_embd_type == GGML_TYPE_IQ3_XXS);
+		vk_buf		*grid_buf = (tok_embd_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf)
+									? &p->iq3s_grid_buf
+								: (embd_needs_iqx && p->iqx_grid_buf.buf) ? &p->iqx_grid_buf
+																		  : dummy;
+		vk_buf		*bufs[3]  = {as_vkbuf(tok_embd), as_vkbuf(x_out), grid_buf};
+		VkDeviceSize offs[3]  = {tok_embd->offset, x_out->offset, 0};
+		uint32_t	 groups	  = (uint32_t)((dim + 63) / 64);
 		return vk_dispatch_ex(p, &p->p_embd_lookup, bufs, offs, NULL, 3, &push, sizeof(push),
 							  groups, 1, 0x2);
 	}
@@ -3732,7 +3810,9 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	backend *host = backend_host();
 	if ((!host || !host->dequant_row) ||
 		(tok_embd_type != GGML_TYPE_F32 && tok_embd_type != GGML_TYPE_F16 &&
-		 tok_embd_type != GGML_TYPE_IQ3_S)) {
+		 tok_embd_type != GGML_TYPE_IQ3_S && tok_embd_type != GGML_TYPE_IQ2_S &&
+		 tok_embd_type != GGML_TYPE_IQ2_XXS && tok_embd_type != GGML_TYPE_IQ3_XXS &&
+		 tok_embd_type != GGML_TYPE_IQ4_XS)) {
 		free(dst_host);
 		return ERR_UNSUPPORTED;
 	}
@@ -3882,10 +3962,12 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 	}
 
 	int is_iq3_s	 = (w_type == GGML_TYPE_IQ3_S);
+	int is_iqx		 = (w_type == GGML_TYPE_IQ2_S || w_type == GGML_TYPE_IQ2_XXS ||
+						w_type == GGML_TYPE_IQ3_XXS || w_type == GGML_TYPE_IQ4_XS);
 	int is_kquant	 = (w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S);
+						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S || is_iqx);
 	int unified_push = (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S);
+						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S || is_iqx);
 
 	vk_buf		*bufs[5];
 	VkDeviceSize offs[5];
@@ -3911,6 +3993,11 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 	}
 	if (is_iq3_s && p->iq3s_grid_buf.buf) {
 		bufs[n_bufs] = &p->iq3s_grid_buf;
+		offs[n_bufs] = 0;
+		n_bufs++;
+	}
+	if (is_iqx && w_type != GGML_TYPE_IQ4_XS && p->iqx_grid_buf.buf) {
+		bufs[n_bufs] = &p->iqx_grid_buf;
 		offs[n_bufs] = 0;
 		n_bufs++;
 	}
@@ -4986,6 +5073,14 @@ static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, in
 		return residual ? &p->p_matmul_q6_k_res_batch : &p->p_matmul_q6_k_batch;
 	case GGML_TYPE_IQ3_S:
 		return residual ? &p->p_matmul_iq3_s_res_batch : &p->p_matmul_iq3_s_batch;
+	case GGML_TYPE_IQ2_S:
+		return residual ? &p->p_matmul_iq2_s_res_batch : &p->p_matmul_iq2_s_batch;
+	case GGML_TYPE_IQ2_XXS:
+		return residual ? &p->p_matmul_iq2_xxs_res_batch : &p->p_matmul_iq2_xxs_batch;
+	case GGML_TYPE_IQ3_XXS:
+		return residual ? &p->p_matmul_iq3_xxs_res_batch : &p->p_matmul_iq3_xxs_batch;
+	case GGML_TYPE_IQ4_XS:
+		return residual ? &p->p_matmul_iq4_xs_res_batch : &p->p_matmul_iq4_xs_batch;
 	default:
 		return NULL;
 	}
@@ -5024,10 +5119,14 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 								 sizeof(push), groups_x, (uint32_t)m, 1u << 3);
 	}
 
-	int is_kquant	 = (w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S);
-	int unified_push = (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S);
+	int is_iqx_grid =
+		(w_type == GGML_TYPE_IQ2_S || w_type == GGML_TYPE_IQ2_XXS || w_type == GGML_TYPE_IQ3_XXS);
+	int is_kquant =
+		(w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_Q6_K ||
+		 w_type == GGML_TYPE_IQ3_S || is_iqx_grid || w_type == GGML_TYPE_IQ4_XS);
+	int unified_push =
+		(w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q6_K ||
+		 w_type == GGML_TYPE_IQ3_S || is_iqx_grid || w_type == GGML_TYPE_IQ4_XS);
 
 	uint32_t groups_x;
 	if (is_kquant) {
@@ -5055,6 +5154,11 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	int			 n_bufs	 = 3;
 	if (w_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf) {
 		bufs[n_bufs] = &p->iq3s_grid_buf;
+		offs[n_bufs] = 0;
+		n_bufs++;
+	}
+	if (is_iqx_grid && p->iqx_grid_buf.buf) {
+		bufs[n_bufs] = &p->iqx_grid_buf;
 		offs[n_bufs] = 0;
 		n_bufs++;
 	}
@@ -5407,6 +5511,18 @@ static int vk_dequant_block_elems(uint32_t type, int *out_elems, int *out_block_
 	case GGML_TYPE_IQ3_S:
 		*out_elems = 256, *out_block_bytes = 110;
 		return 1;
+	case GGML_TYPE_IQ2_XXS:
+		*out_elems = 256, *out_block_bytes = 66;
+		return 1;
+	case GGML_TYPE_IQ3_XXS:
+		*out_elems = 256, *out_block_bytes = 98;
+		return 1;
+	case GGML_TYPE_IQ2_S:
+		*out_elems = 256, *out_block_bytes = 82;
+		return 1;
+	case GGML_TYPE_IQ4_XS:
+		*out_elems = 256, *out_block_bytes = 136;
+		return 1;
 	default:
 		return 0;
 	}
@@ -5419,6 +5535,8 @@ static int vk_dequant_type_native(backend *self, uint32_t type, int k) {
 		return 0;
 	if (k <= 0 || k % unit_elems != 0)
 		return 0;
+	if (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS)
+		return p->iqx_grid_buf.buf != VK_NULL_HANDLE;
 	return type != GGML_TYPE_IQ3_S || p->iq3s_grid_buf.buf != VK_NULL_HANDLE;
 }
 
@@ -5431,6 +5549,9 @@ static status_code vk_dequant_weight(backend *self, uint32_t type, const void *s
 	if (!vk_dequant_block_elems(type, &unit_elems, &block_bytes) || k % unit_elems != 0)
 		return ERR_UNSUPPORTED;
 	if (type == GGML_TYPE_IQ3_S && !p->iq3s_grid_buf.buf)
+		return ERR_UNSUPPORTED;
+	if ((type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS) &&
+		!p->iqx_grid_buf.buf)
 		return ERR_UNSUPPORTED;
 
 	const size_t src_bytes = ggml_row_size(type, (size_t)k) * (size_t)n_rows;
@@ -5455,8 +5576,12 @@ static status_code vk_dequant_weight(backend *self, uint32_t type, const void *s
 	if (s == OK) {
 		struct {
 			int32_t type, n_units, block_bytes, n_elems;
-		} push				 = {(int32_t)type, n_units, block_bytes, unit_elems};
-		vk_buf		*grid	 = (type == GGML_TYPE_IQ3_S) ? &p->iq3s_grid_buf : vk_dummy_buf(p);
+		} push = {(int32_t)type, n_units, block_bytes, unit_elems};
+		vk_buf *grid =
+			(type == GGML_TYPE_IQ3_S) ? &p->iq3s_grid_buf
+			: (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS)
+				? &p->iqx_grid_buf
+				: vk_dummy_buf(p);
 		vk_buf		*bufs[3] = {as_vkbuf(&sbuf), dst, grid};
 		VkDeviceSize offs[3] = {0, 0, 0};
 		s = vk_dispatch_2d_ex(p, &p->p_dequant, bufs, offs, NULL, 3, &push, sizeof(push),
