@@ -78,6 +78,7 @@ typedef struct {
 	uint64_t	dims[4];
 	const void *host_data;
 	const char *name;
+	int			release_host_source;
 } tensor_desc;
 
 typedef enum {

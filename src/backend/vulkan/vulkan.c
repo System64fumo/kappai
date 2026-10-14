@@ -2639,6 +2639,44 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 
 #define VK_WEIGHT_TAIL_PAD 32
 
+#define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
+#define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
+
+static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const void *src, size_t size,
+								   int release_src) {
+	for (size_t off = 0; off < size; off += VK_WEIGHT_STAGE_CHUNK_BYTES) {
+		size_t len		  = MIN(size - off, VK_WEIGHT_STAGE_CHUNK_BYTES);
+		bool   batch_full = p->wbatch_off + len > p->staging_cap;
+		if (!p->staging_buf.buf || (p->wbatch_count && batch_full) ||
+			!vk_timeline_done(p, p->staging_pending_value)) {
+			status_code fs = vk_wbatch_flush(p);
+			if (fs != OK)
+				return fs;
+		}
+		if (!p->wbatch_count) {
+			status_code s = vk_ensure_staging_cap(p, MAX(len, VK_WEIGHT_STAGE_BATCH_BYTES));
+			if (s != OK)
+				return s;
+		}
+
+		copy_weight_chunked(p->staging_buf.mapped + p->wbatch_off, (const char *)src + off, len,
+							release_src);
+		VkBufferCopy copy = {.srcOffset = p->wbatch_off, .dstOffset = off, .size = len};
+		vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, dst->buf, 1, &copy);
+		VkMemoryBarrier wbar = {
+			.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		};
+		vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+							 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wbar, 0, NULL, 0, NULL);
+		p->wbatch_off += len;
+		p->wbatch_count++;
+		p->ring[p->ring_cur].has_work = 1;
+	}
+	return OK;
+}
+
 static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
 	vk_priv *p	  = self->priv;
 	size_t	 size = (desc->n_dims == 1) ? ggml_row_size(desc->type, desc->dims[0])
@@ -2648,32 +2686,11 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 	vk_buf *b = vk_scratch_pool_take(p, alloc_size, NULL);
 	if (b) {
 		if (b->mapped) {
-			memcpy(b->mapped, desc->host_data, size);
+			copy_weight_chunked(b->mapped, desc->host_data, size, desc->release_host_source);
 		} else {
-			if (p->wbatch_count || !p->staging_buf.buf || p->wbatch_off + size > p->staging_cap ||
-				!vk_timeline_done(p, p->staging_pending_value)) {
-				status_code fs = vk_wbatch_flush(p);
-				if (fs != OK)
-					return fs;
-			}
-			status_code s = vk_ensure_staging_cap(p, size);
-			if (s != OK) {
+			status_code s = vk_stage_upload(p, b, desc->host_data, size, desc->release_host_source);
+			if (s != OK)
 				return s;
-			}
-			memcpy(p->staging_buf.mapped + p->wbatch_off, desc->host_data, size);
-			VkBufferCopy copy = {.srcOffset = p->wbatch_off, .dstOffset = 0, .size = size};
-			vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, b->buf, 1, &copy);
-			VkMemoryBarrier wbar = {
-				.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-				.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-			};
-			vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-								 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wbar, 0, NULL, 0,
-								 NULL);
-			p->wbatch_off += size;
-			p->wbatch_count++;
-			p->ring[p->ring_cur].has_work = 1;
 		}
 
 		out->handle	  = b;
@@ -2708,7 +2725,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 			return s;
 		}
 
-		memcpy(bnew->mapped, desc->host_data, size);
+		copy_weight_chunked(bnew->mapped, desc->host_data, size, desc->release_host_source);
 	} else {
 		status_code s =
 			vk_alloc_buffer(p, alloc_size, weight_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bnew);
@@ -2722,37 +2739,12 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 			return s;
 		}
 
-		if (p->wbatch_count || !p->staging_buf.buf || p->wbatch_off + size > p->staging_cap ||
-			!vk_timeline_done(p, p->staging_pending_value)) {
-			status_code fs = vk_wbatch_flush(p);
-			if (fs != OK) {
-				vk_free_buffer(p, bnew);
-				free(bnew);
-				return fs;
-			}
-		}
-
-		s = vk_ensure_staging_cap(p, size);
+		s = vk_stage_upload(p, bnew, desc->host_data, size, desc->release_host_source);
 		if (s != OK) {
 			vk_free_buffer(p, bnew);
 			free(bnew);
 			return s;
 		}
-
-		memcpy(p->staging_buf.mapped + p->wbatch_off, desc->host_data, size);
-
-		VkBufferCopy copy = {.srcOffset = p->wbatch_off, .dstOffset = 0, .size = size};
-		vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, bnew->buf, 1, &copy);
-		VkMemoryBarrier wbar = {
-			.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		};
-		vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-							 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &wbar, 0, NULL, 0, NULL);
-		p->wbatch_off += size;
-		p->wbatch_count++;
-		p->ring[p->ring_cur].has_work = 1;
 	}
 
 	out->handle	  = bnew;

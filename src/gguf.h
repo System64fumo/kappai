@@ -2,11 +2,14 @@
 #define GGUF_H
 
 #include <stdio.h>
+#include <sys/types.h>
 
 #include "common.h"
 
 #define GGUF_MAGIC 0x46554747u
 #define GGUF_VERSION 3u
+#define GGUF_LAYER_EAGER (-1)
+#define GGUF_EAGER_F32_MAX_BYTES ((size_t)(64 * 1024))
 
 typedef enum {
 	GGUF_TYPE_U8 = 0,
@@ -107,6 +110,9 @@ typedef struct {
 	gguf_strtab_entry *kv_hash;
 	size_t			   kv_hash_cap;
 	str_arena		   strs;
+	int				   sparse_fd;
+	int				   sparse_direct_fd;
+	size_t			   sparse_align;
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
@@ -141,7 +147,13 @@ status_code gguf_load(gguf_ctx *ctx, const char *path);
 
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
 
-status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path);
+ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);
+
+status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path);
+
+status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer);
+
+int gguf_tensor_layer_index(const char *name);
 
 status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
 							   size_t *out_align);

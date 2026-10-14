@@ -692,8 +692,22 @@ static void gl_buf_unregister(gl_priv *p, gl_buf *b) {
 	}
 }
 
+static void gl_buf_fill_chunked(gl_buf *b, const void *src, size_t size) {
+	weight_source_prefetch(src, MIN(size, WEIGHT_COPY_CHUNK_BYTES));
+	for (size_t off = 0; off < size; off += WEIGHT_COPY_CHUNK_BYTES) {
+		const char *chunk = (const char *)src + off;
+		size_t		len	  = MIN(size - off, WEIGHT_COPY_CHUNK_BYTES);
+		if (off + len < size)
+			weight_source_prefetch(chunk + len, MIN(size - off - len, WEIGHT_COPY_CHUNK_BYTES));
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)off, (GLsizeiptr)len, chunk);
+		if (b->host_mirror)
+			memcpy(b->host_mirror + off, chunk, len);
+		weight_source_release(chunk, len);
+	}
+}
+
 static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void *initial_data,
-							   bool keep_host_mirror) {
+							   bool keep_host_mirror, bool release_source) {
 	if (size == 0)
 		size = 1;
 
@@ -720,7 +734,11 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 	}
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
 	size_t alloc_size = (size + 3u) & ~(size_t)3u;
-	if (initial_data && alloc_size != size) {
+	bool   chunked	  = initial_data && release_source;
+	if (chunked) {
+		glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)alloc_size, NULL, usage);
+		gl_buf_fill_chunked(b, initial_data, size);
+	} else if (initial_data && alloc_size != size) {
 		glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)alloc_size, NULL, usage);
 		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)size, initial_data);
 	} else {
@@ -736,7 +754,7 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	b->store_bytes = alloc_size;
 
-	if (initial_data && keep_host_mirror)
+	if (initial_data && keep_host_mirror && !chunked)
 		memcpy(b->host_mirror, initial_data, size);
 	b->host_dirty = (keep_host_mirror && !initial_data) ? 1 : 0;
 
@@ -746,7 +764,7 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 }
 
 static gl_buf *gl_buf_alloc(gl_priv *p, size_t size, GLenum usage, const void *initial_data) {
-	return gl_buf_alloc_ex(p, size, usage, initial_data, true);
+	return gl_buf_alloc_ex(p, size, usage, initial_data, true, false);
 }
 
 static inline void *gl_buf_handle(gl_buf *b) {
@@ -1261,7 +1279,8 @@ static status_code gl_buffer_alloc_weight(backend *self, const tensor_desc *desc
 	size_t size = ggml_row_size(desc->type, desc->dims[0]) * (size_t)d1;
 
 	bool	keep_host_mirror = desc->n_dims == 1 || !gl_weight_is_device_only(desc->type);
-	gl_buf *b = gl_buf_alloc_ex(p, size, GL_STATIC_DRAW, desc->host_data, keep_host_mirror);
+	gl_buf *b = gl_buf_alloc_ex(p, size, GL_STATIC_DRAW, desc->host_data, keep_host_mirror,
+								desc->release_host_source);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
 
@@ -2782,7 +2801,7 @@ static status_code gl_kv_store_alloc(gl_priv *p, gl_kv_store *st, int n_layers,
 									 size_t layer_bytes) {
 	st->layers = xcalloc((size_t)n_layers, sizeof(gl_buf *));
 	for (int i = 0; i < n_layers; i++) {
-		st->layers[i] = gl_buf_alloc_ex(p, layer_bytes, GL_DYNAMIC_COPY, NULL, false);
+		st->layers[i] = gl_buf_alloc_ex(p, layer_bytes, GL_DYNAMIC_COPY, NULL, false, false);
 		if (!st->layers[i])
 			return ERR_OUT_OF_MEMORY;
 		st->n_layers = i + 1;

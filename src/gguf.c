@@ -15,9 +15,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define GGUF_METADATA_INITIAL_CHUNK ((size_t)(4 << 20))
-#define GGUF_METADATA_MAX_CHUNK ((size_t)(256 << 20))
-
 #define GGUF_LOAD_CHUNK_TARGET_BYTES ((size_t)(8 * 1024 * 1024))
 #define GGUF_LOAD_MAX_THREADS 64
 
@@ -41,7 +38,6 @@ typedef struct {
 	char	*key;
 	uint32_t type;
 	uint64_t ival;
-	double	 fval;
 	gguf_str str;
 	uint32_t arr_type;
 	uint64_t arr_len;
@@ -72,14 +68,14 @@ typedef struct {
 	gguf_load_chunk *chunks;
 	size_t			 n_chunks;
 	_Atomic int		 first_err;
-	_Atomic size_t	 bytes_read;
-	_Atomic size_t	 tensors_done;
 	_Atomic size_t	*chunk_remaining;
 } gguf_load_job;
 
 static inline void gguf_ctx_init(gguf_ctx *ctx) {
 	memset(ctx, 0, sizeof(*ctx));
-	ctx->fd = -1;
+	ctx->fd				  = -1;
+	ctx->sparse_fd		  = -1;
+	ctx->sparse_direct_fd = -1;
 }
 
 static int gguf_open_ro(const char *path, size_t *fsize) {
@@ -296,7 +292,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena 
 		double v;
 		if (gguf_reader_f64(r, &v))
 			return -1;
-		e->fval = v;
+		e->ival = 0;
+		memcpy(&e->ival, &v, 8);
 		return 0;
 	}
 	case GGUF_TYPE_BOOL: {
@@ -1025,8 +1022,10 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		}
 		size_t tsize = ts[i].byte_size;
 		if (!tsize) {
-			ERROR("gguf: cannot size tensor '%s' (unknown type or bad dims)", ts[i].name);
-			goto bad_kv_ts;
+			WARN("gguf: ignoring tensor '%s' (unsupported type %u or bad dims)", ts[i].name,
+				 ts[i].type);
+			ts[i].data = NULL;
+			continue;
 		}
 		if (ts[i].offset > ctx->data_size || tsize > ctx->data_size - ts[i].offset)
 			goto bad_kv_ts;
@@ -1105,7 +1104,7 @@ status_code gguf_load(gguf_ctx *ctx, const char *path) {
 	return gguf_parse_common(ctx, map, fsize, fd, map, 0);
 }
 
-static ssize_t pread_full(int fd, void *dst, size_t len, uint64_t file_off) {
+ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off) {
 	size_t total = 0;
 	while (total < len) {
 		ssize_t n = pread(fd, (char *)dst + total, len - total, (off_t)(file_off + total));
@@ -1132,13 +1131,11 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 		int len_aligned = ((len & (align - 1)) == 0);
 
 		if (dst_aligned && off_aligned && len_aligned) {
-			ssize_t total = pread_full(direct_fd, dst, len, file_off);
+			ssize_t total = gguf_pread_full(direct_fd, dst, len, file_off);
 			if (total < 0)
 				goto bounce_fallback;
-			if ((size_t)total >= len) {
-				posix_fadvise(direct_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
+			if ((size_t)total >= len)
 				return 0;
-			}
 		}
 
 	bounce_fallback: {
@@ -1150,12 +1147,10 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 		void *bounce = NULL;
 		if (posix_memalign(&bounce, align, aligned_len) == 0 && bounce) {
 			uint8_t *bp	   = bounce;
-			ssize_t	 total = pread_full(direct_fd, bp, aligned_len, aligned_off);
+			ssize_t	 total = gguf_pread_full(direct_fd, bp, aligned_len, aligned_off);
 			if (total >= 0 && (size_t)total >= head_slop + len) {
 				memcpy(dst, bp + head_slop, len);
 				free(bounce);
-				posix_fadvise(direct_fd, (off_t)aligned_off, (off_t)aligned_len,
-							  POSIX_FADV_DONTNEED);
 				return 0;
 			}
 			free(bounce);
@@ -1165,10 +1160,16 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 
 	if (plain_fd < 0)
 		return -1;
-	if (pread_full(plain_fd, dst, len, file_off) != (ssize_t)len)
+	if (gguf_pread_full(plain_fd, dst, len, file_off) != (ssize_t)len)
 		return -1;
 	posix_fadvise(plain_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
 	return 0;
+}
+
+static size_t gguf_tensor_slop(const gguf_ctx *ctx, const gguf_tensor *t, size_t align) {
+	if (align == 0)
+		return 0;
+	return (size_t)((ctx->data_file_offset + t->offset) & (uint64_t)(align - 1));
 }
 
 static void *gguf_load_worker(void *arg) {
@@ -1188,9 +1189,11 @@ static void *gguf_load_worker(void *arg) {
 			atomic_store(&j->first_err, ERR_IO);
 			break;
 		}
-		atomic_fetch_add_explicit(&j->bytes_read, ch->len, memory_order_relaxed);
-		if (atomic_fetch_sub_explicit(&j->chunk_remaining[ch->tidx], 1, memory_order_acq_rel) == 1)
-			atomic_fetch_add_explicit(&j->tensors_done, 1, memory_order_relaxed);
+		if (atomic_fetch_sub_explicit(&j->chunk_remaining[ch->tidx], 1, memory_order_acq_rel) != 1)
+			continue;
+		size_t slop = gguf_tensor_slop(j->ctx, ch->t, j->align);
+		if (slop)
+			memmove((void *)ch->t->data, (const char *)ch->t->data + slop, ch->t->byte_size);
 	}
 	return NULL;
 }
@@ -1214,78 +1217,40 @@ static int gguf_affinity_thread_count(void) {
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	gguf_ctx_init(ctx);
 
-	size_t real_fsize = 0;
-	int	   fd		  = gguf_open_ro(path, &real_fsize);
+	size_t fsize;
+	int	   fd = gguf_open_ro(path, &fsize);
 	if (fd < 0)
 		return ERR_IO;
-	status_code rc = ERR_IO;
-	if (real_fsize == 0)
-		goto fail;
-
-	size_t		cap	 = MIN(GGUF_METADATA_INITIAL_CHUNK, real_fsize);
-	void	   *buf	 = xmalloc(cap);
-	size_t		have = 0;
-	status_code s	 = ERR_FORMAT;
-
-	for (;;) {
-		while (have < cap) {
-			ssize_t n = pread(fd, (char *)buf + have, cap - have, (off_t)have);
-			if (n < 0) {
-				rc = ERR_IO;
-				goto fail_buf;
-			}
-			if (n == 0)
-				break;
-			have += (size_t)n;
-		}
-
-		gguf_ctx trial;
-		memset(&trial, 0, sizeof(trial));
-		s = gguf_parse_common(&trial, buf, have, -1, NULL, 1);
-		if (s == OK) {
-			*ctx = trial;
-			break;
-		}
-		gguf_free(&trial);
-
-		if (have >= real_fsize) {
-			rc = ERR_FORMAT;
-			goto fail_buf;
-		}
-
-		size_t grow	   = MIN(cap, GGUF_METADATA_MAX_CHUNK);
-		size_t new_cap = MIN(cap + grow, real_fsize);
-		if (new_cap <= cap) {
-			rc = ERR_FORMAT;
-			goto fail_buf;
-		}
-		void *nbuf = xrealloc(buf, new_cap);
-		buf		   = nbuf;
-		cap		   = new_cap;
+	if (fsize == 0) {
+		close(fd);
+		return ERR_IO;
 	}
 
-	for (size_t i = 0; i < ctx->n_tensors; i++)
-		ctx->tensors[i].data = NULL;
+	void *map = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED)
+		return ERR_IO;
+
+	status_code s = gguf_parse_common(ctx, map, fsize, -1, NULL, 1);
+	munmap(map, fsize);
+	if (s != OK)
+		return s;
 
 	ctx->data_start = NULL;
-	ctx->data_size	= real_fsize >= (size_t)ctx->data_file_offset
-						  ? real_fsize - (size_t)ctx->data_file_offset
-						  : 0;
-
-	posix_fadvise(fd, 0, (off_t)have, POSIX_FADV_DONTNEED);
-	close(fd);
-	ctx->fd = -1;
-	free(buf);
-	ctx->map		 = NULL;
-	ctx->map_size	 = 0;
-	ctx->map_is_heap = 0;
 	return OK;
+}
 
-fail_buf:
-	free(buf);
-fail:
-	close(fd);
-	return rc;
+static size_t direct_io_alignment(int fd) {
+#ifdef STATX_DIOALIGN
+	struct statx sx;
+	if (statx(fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) &&
+		sx.stx_dio_offset_align > 0)
+		return MAX(sx.stx_dio_offset_align, sx.stx_dio_mem_align);
+#endif
+	struct stat st;
+	if (fstat(fd, &st) == 0 && st.st_blksize > 0)
+		return (size_t)st.st_blksize;
+	return 4096;
 }
 
 status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
@@ -1296,11 +1261,7 @@ status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int ad
 		DEBUG("%s: O_DIRECT unsupported, using buffered reads", tag);
 		return ERR_IO;
 	}
-	long		blk = 4096;
-	struct stat pst;
-	if (fstat(fd, &pst) == 0 && pst.st_blksize > 0)
-		blk = pst.st_blksize;
-	size_t align = (size_t)blk;
+	size_t align = direct_io_alignment(fd);
 	if (max_align > 0 && align > max_align)
 		align = max_align;
 	void *probe_buf;
@@ -1324,29 +1285,45 @@ status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int ad
 	return OK;
 }
 
-status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
-	int plain_fd = open(path, O_RDONLY);
-	if (plain_fd < 0) {
-		gguf_free(ctx);
+int gguf_tensor_layer_index(const char *name) {
+	if (strncmp(name, "blk.", 4) != 0)
+		return -1;
+	char *end;
+	long  idx = strtol(name + 4, &end, 10);
+	if (end == name + 4 || *end != '.')
+		return -1;
+	return (int)idx;
+}
+
+static int gguf_tensor_needed_at_layout(const gguf_tensor *t) {
+	if (gguf_tensor_layer_index(t->name) < 0)
+		return 1;
+	if (t->type == GGML_TYPE_F32 && t->byte_size <= GGUF_EAGER_F32_MAX_BYTES)
+		return 1;
+	return strstr(t->name, "attn_k_b") || strstr(t->name, "attn_v_b");
+}
+
+static int gguf_sparse_selected(const gguf_tensor *t, int layer) {
+	if (gguf_tensor_name_is_expert(t->name))
+		return 0;
+	if (layer == GGUF_LAYER_EAGER)
+		return gguf_tensor_needed_at_layout(t);
+	return gguf_tensor_layer_index(t->name) == layer && !gguf_tensor_needed_at_layout(t);
+}
+
+status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path) {
+	ctx->sparse_fd = open(path, O_RDONLY);
+	if (ctx->sparse_fd < 0)
 		return ERR_IO;
-	}
 
-	int	   direct_fd = -1;
-	size_t align	 = 0;
-	{
-		int fd = open(path, O_RDONLY);
-		if (fd < 0) {
-			DEBUG("gguf sparse-load: O_DIRECT unavailable (%s), using buffered reads",
-				  strerror(errno));
-		} else if (direct_io_probe_fd(fd, "gguf sparse-load", 4096, 0, &align) == OK) {
-			direct_fd = fd;
-		}
-	}
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		DEBUG("gguf sparse-load: O_DIRECT unavailable (%s), using buffered reads", strerror(errno));
+	else if (direct_io_probe_fd(fd, "gguf sparse-load", 4096, 0, &ctx->sparse_align) == OK)
+		ctx->sparse_direct_fd = fd;
 
-	status_code ret = OK;
-
-	size_t n_load			= 0;
-	size_t total_load_bytes = 0;
+	size_t		align = ctx->sparse_align;
+	status_code ret	  = OK;
 	for (size_t i = 0; i < ctx->n_tensors; i++) {
 		gguf_tensor *t = &ctx->tensors[i];
 		t->data		   = NULL;
@@ -1355,221 +1332,129 @@ status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path) {
 
 		size_t tbytes = t->byte_size;
 		if (!tbytes) {
-			ERROR("gguf_load_sparse: cannot compute size of tensor '%s'", t->name);
-			ret = ERR_FORMAT;
-			break;
-		}
-		if (tbytes == 0)
+			WARN("gguf: ignoring tensor '%s' (unsupported type %u or bad dims)", t->name, t->type);
 			continue;
+		}
 		if (t->offset > ctx->data_size || tbytes > ctx->data_size - t->offset) {
 			ERROR("gguf_load_sparse: tensor '%s' extends past end of data section", t->name);
 			ret = ERR_FORMAT;
 			break;
 		}
 
-		size_t alloc_align = align > 0 ? align : sizeof(void *);
-		size_t pad		   = 0;
-		if (align > 0) {
-			uint64_t off64 = ctx->data_file_offset + t->offset;
-			size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
-			pad			   = align_up_bytes(slop + tbytes, align) - tbytes;
-		}
+		size_t pad = 0;
+		if (align > 0)
+			pad = align_up_bytes(gguf_tensor_slop(ctx, t, align) + tbytes, align) - tbytes;
 		void *buf = NULL;
-		if (posix_memalign(&buf, alloc_align, tbytes + pad) != 0) {
+		if (posix_memalign(&buf, align > 0 ? align : sizeof(void *), tbytes + pad) != 0) {
 			ERROR("gguf_load_sparse: OOM allocating %zu bytes for tensor '%s'", tbytes, t->name);
 			ret = ERR_OUT_OF_MEMORY;
 			break;
 		}
 		t->data = buf;
-		n_load++;
-		total_load_bytes += tbytes;
 	}
-
-	if (ret == OK && n_load > 0) {
-		DEBUG("gguf sparse-load: reading %zu non-expert tensors (%.1f MB)", n_load,
-			  total_load_bytes / (1024.0 * 1024.0));
-		uint64_t read_t0	 = time_us();
-		size_t	 chunk_bytes = GGUF_LOAD_CHUNK_TARGET_BYTES;
-		if (align > 0) {
-			chunk_bytes = (chunk_bytes / align) * align;
-			if (chunk_bytes == 0)
-				chunk_bytes = align;
-		}
-
-		size_t n_chunks_cap = 0;
-		for (size_t i = 0; i < ctx->n_tensors; i++) {
-			gguf_tensor *t = &ctx->tensors[i];
-			if (!t->data)
-				continue;
-			size_t tbytes = t->byte_size;
-			if (!tbytes)
-				continue;
-			n_chunks_cap += (tbytes / chunk_bytes) + (align > 0 ? 2 : 1);
-		}
-
-		int has_experts = 0;
-		for (size_t i = 0; i < ctx->n_tensors && !has_experts; i++)
-			if (gguf_tensor_name_is_expert(ctx->tensors[i].name))
-				has_experts = 1;
-
-		gguf_load_chunk *chunks			 = xmalloc(n_chunks_cap * sizeof(*chunks));
-		_Atomic size_t	*chunk_remaining = xcalloc(n_load, sizeof(*chunk_remaining));
-		size_t			 n_chunks		 = 0;
-		size_t			 load_idx		 = 0;
-		struct stat		 fst;
-		uint64_t file_end = fstat(plain_fd, &fst) == 0 ? (uint64_t)fst.st_size
-													   : (ctx->data_file_offset + ctx->data_size);
-		for (size_t i = 0; i < ctx->n_tensors; i++) {
-			gguf_tensor *t = &ctx->tensors[i];
-			if (!t->data)
-				continue;
-			size_t tbytes = t->byte_size;
-			if (!tbytes)
-				continue;
-
-			uint64_t base_off		 = ctx->data_file_offset + t->offset;
-			size_t	 off			 = 0;
-			size_t	 n_tensor_chunks = 0;
-			if (align > 0) {
-				uint64_t a_base = base_off & ~(uint64_t)(align - 1);
-				size_t	 slop	= (size_t)(base_off - a_base);
-				size_t	 need	= align_up_bytes(slop + tbytes, align);
-				uint64_t limit	= file_end - a_base;
-				if (need > limit)
-					need = (size_t)limit;
-				size_t roff = 0;
-				while (roff < need) {
-					size_t piece = need - roff;
-					if (piece > chunk_bytes)
-						piece = chunk_bytes;
-					int plain				  = (piece & (align - 1)) != 0;
-					chunks[n_chunks].t		  = t;
-					chunks[n_chunks].file_off = a_base + roff;
-					chunks[n_chunks].len	  = piece;
-					chunks[n_chunks].dst	  = (char *)t->data + roff;
-					chunks[n_chunks].tidx	  = load_idx;
-					chunks[n_chunks].plain	  = plain;
-					n_chunks++;
-					n_tensor_chunks++;
-					roff += piece;
-				}
-				chunk_remaining[load_idx] = n_tensor_chunks;
-				load_idx++;
-				continue;
-			}
-			while (off < tbytes) {
-				size_t piece = tbytes - off;
-				if (piece > chunk_bytes)
-					piece = chunk_bytes;
-				chunks[n_chunks].t		  = t;
-				chunks[n_chunks].file_off = base_off + off;
-				chunks[n_chunks].len	  = piece;
-				chunks[n_chunks].dst	  = (char *)t->data + off;
-				chunks[n_chunks].tidx	  = load_idx;
-				chunks[n_chunks].plain	  = 0;
-				n_chunks++;
-				n_tensor_chunks++;
-				off += piece;
-			}
-			chunk_remaining[load_idx] = n_tensor_chunks;
-			load_idx++;
-		}
-
-		gguf_load_job job = {
-			.ctx			 = ctx,
-			.plain_fd		 = plain_fd,
-			.direct_fd		 = direct_fd,
-			.align			 = align,
-			.chunks			 = chunks,
-			.n_chunks		 = n_chunks,
-			.chunk_remaining = chunk_remaining,
-		};
-		atomic_store(&job.next, 0);
-		atomic_store(&job.first_err, OK);
-		atomic_store(&job.bytes_read, 0);
-		atomic_store(&job.tensors_done, 0);
-
-		int n_threads = gguf_affinity_thread_count();
-		if (n_threads > GGUF_LOAD_MAX_THREADS)
-			n_threads = GGUF_LOAD_MAX_THREADS;
-		if ((size_t)n_threads > n_chunks)
-			n_threads = n_chunks > 0 ? (int)n_chunks : 1;
-		if (n_threads < 1)
-			n_threads = 1;
-
-		pthread_t threads[GGUF_LOAD_MAX_THREADS];
-		for (int t = 0; t < n_threads; t++) {
-			if (pthread_create(&threads[t], NULL, gguf_load_worker, &job) != 0) {
-				threads[t] = 0;
-				n_threads  = t;
-				break;
-			}
-		}
-
-		const char *load_label = has_experts ? "Loading non expert weights" : "Loading weights";
-		progress	prog;
-		progress_start(&prog, load_label, (uint64_t)n_load);
-		for (;;) {
-			size_t done = atomic_load(&job.tensors_done);
-			progress_update(&prog, (uint64_t)done);
-			if (done >= n_load)
-				break;
-			if (atomic_load(&job.first_err) != OK)
-				break;
-			struct timespec ts = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
-			nanosleep(&ts, NULL);
-		}
-
-		for (int t = 0; t < n_threads; t++) {
-			if (threads[t])
-				pthread_join(threads[t], NULL);
-		}
-		progress_finish(&prog);
-
-		int err = atomic_load(&job.first_err);
-		if (err != OK)
-			ret = err;
-
-		if (err == OK && align > 0) {
-			for (size_t i = 0; i < ctx->n_tensors; i++) {
-				gguf_tensor *t = &ctx->tensors[i];
-				if (!t->data)
-					continue;
-				size_t tbytes = t->byte_size;
-				if (!tbytes)
-					continue;
-				uint64_t off64 = ctx->data_file_offset + t->offset;
-				size_t	 slop  = (size_t)(off64 & (uint64_t)(align - 1));
-				if (slop)
-					memmove((void *)t->data, (const char *)t->data + slop, tbytes);
-			}
-		}
-
-		if (err == OK) {
-			double elapsed_ms = (time_us() - read_t0) / 1000.0;
-			double mb		  = total_load_bytes / (1024.0 * 1024.0);
-			INFO("gguf sparse-load: %zu tensors, %.1f MB in %.0f ms (%.0f MB/s)", n_load, mb,
-				 elapsed_ms, elapsed_ms > 0 ? mb / (elapsed_ms / 1000.0) : 0.0);
-		}
-
-		free(chunks);
-		free(chunk_remaining);
-	}
-
-	if (direct_fd >= 0)
-		close(direct_fd);
-	close(plain_fd);
 
 	if (ret != OK) {
-		for (size_t i = 0; i < ctx->n_tensors; i++)
+		for (size_t i = 0; i < ctx->n_tensors; i++) {
 			free((void *)ctx->tensors[i].data);
-		ctx->n_tensors = 0;
-		gguf_free(ctx);
+			ctx->tensors[i].data = NULL;
+		}
 		return ret;
 	}
 
 	ctx->owns_tensor_data = 1;
 	return OK;
+}
+
+static void gguf_chunk_tensor(gguf_load_chunk *chunks, size_t *n_chunks, const gguf_ctx *ctx,
+							  gguf_tensor *t, size_t tidx, size_t chunk_bytes, uint64_t file_end) {
+	size_t	 align	  = ctx->sparse_align;
+	size_t	 slop	  = gguf_tensor_slop(ctx, t, align);
+	uint64_t base_off = ctx->data_file_offset + t->offset - slop;
+	size_t	 need	  = t->byte_size + slop;
+	if (align > 0) {
+		need = align_up_bytes(need, align);
+		if (need > file_end - base_off)
+			need = (size_t)(file_end - base_off);
+	}
+	for (size_t off = 0; off < need;) {
+		size_t piece		  = MIN(need - off, chunk_bytes);
+		chunks[(*n_chunks)++] = (gguf_load_chunk){
+			.t		  = t,
+			.file_off = base_off + off,
+			.len	  = piece,
+			.dst	  = (char *)t->data + off,
+			.tidx	  = tidx,
+			.plain	  = align > 0 && (piece & (align - 1)) != 0,
+		};
+		off += piece;
+	}
+}
+
+status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer) {
+	size_t align	   = ctx->sparse_align;
+	size_t chunk_bytes = GGUF_LOAD_CHUNK_TARGET_BYTES;
+	if (align > 0)
+		chunk_bytes = MAX((chunk_bytes / align) * align, align);
+
+	size_t n_sel		= 0;
+	size_t n_chunks_cap = 0;
+	for (size_t i = 0; i < ctx->n_tensors; i++) {
+		const gguf_tensor *t = &ctx->tensors[i];
+		if (!t->data || !gguf_sparse_selected(t, layer))
+			continue;
+		n_sel++;
+		n_chunks_cap += (t->byte_size / chunk_bytes) + 2;
+	}
+	if (n_sel == 0)
+		return OK;
+
+	struct stat fst;
+	uint64_t file_end = fstat(ctx->sparse_fd, &fst) == 0 ? (uint64_t)fst.st_size
+														 : (ctx->data_file_offset + ctx->data_size);
+
+	gguf_load_chunk *chunks			 = xmalloc(n_chunks_cap * sizeof(*chunks));
+	_Atomic size_t	*chunk_remaining = xcalloc(n_sel, sizeof(*chunk_remaining));
+	size_t			 n_chunks		 = 0;
+	size_t			 load_idx		 = 0;
+	for (size_t i = 0; i < ctx->n_tensors; i++) {
+		gguf_tensor *t = &ctx->tensors[i];
+		if (!t->data || !gguf_sparse_selected(t, layer))
+			continue;
+		size_t first = n_chunks;
+		gguf_chunk_tensor(chunks, &n_chunks, ctx, t, load_idx, chunk_bytes, file_end);
+		chunk_remaining[load_idx++] = n_chunks - first;
+	}
+
+	gguf_load_job job = {
+		.ctx			 = ctx,
+		.plain_fd		 = ctx->sparse_fd,
+		.direct_fd		 = ctx->sparse_direct_fd,
+		.align			 = align,
+		.chunks			 = chunks,
+		.n_chunks		 = n_chunks,
+		.chunk_remaining = chunk_remaining,
+	};
+	atomic_store(&job.next, 0);
+	atomic_store(&job.first_err, OK);
+
+	int n_threads = MIN(gguf_affinity_thread_count(), GGUF_LOAD_MAX_THREADS);
+	if ((size_t)n_threads > n_chunks)
+		n_threads = n_chunks > 0 ? (int)n_chunks : 1;
+
+	pthread_t threads[GGUF_LOAD_MAX_THREADS];
+	int		  n_started = 0;
+	for (int t = 1; t < n_threads; t++) {
+		if (pthread_create(&threads[n_started], NULL, gguf_load_worker, &job) != 0)
+			break;
+		n_started++;
+	}
+	gguf_load_worker(&job);
+	for (int t = 0; t < n_started; t++)
+		pthread_join(threads[t], NULL);
+
+	free(chunks);
+	free(chunk_remaining);
+	return (status_code)atomic_load(&job.first_err);
 }
 
 void gguf_free(gguf_ctx *ctx) {
@@ -1600,10 +1485,13 @@ void gguf_free(gguf_ctx *ctx) {
 		else if (ctx->map != MAP_FAILED)
 			munmap(ctx->map, ctx->map_size);
 	}
+	if (ctx->sparse_fd >= 0)
+		close(ctx->sparse_fd);
+	if (ctx->sparse_direct_fd >= 0)
+		close(ctx->sparse_direct_fd);
 	if (ctx->fd >= 0)
 		close(ctx->fd);
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->fd = -1;
+	gguf_ctx_init(ctx);
 }
 
 static ptrdiff_t find_kv(const gguf_ctx *c, const char *key) {
@@ -1715,7 +1603,9 @@ status_code gguf_get_arr_bool(const gguf_ctx *c, const char *k, const uint8_t **
 
 const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name) {
 	ptrdiff_t i = strtab_find(c->tensor_hash, c->tensor_hash_cap, name);
-	return i < 0 ? NULL : &c->tensors[i];
+	if (i < 0 || c->tensors[i].byte_size == 0)
+		return NULL;
+	return &c->tensors[i];
 }
 
 static const char *type_name(uint32_t t) {
