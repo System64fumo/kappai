@@ -5052,6 +5052,216 @@ __global__ void matmul_q5_k_batch_kernel(const cuda_q5_k_block *__restrict__ w,
     }
 }
 
+__constant__ uint32_t cuda_iq3s_grid[512] = {
+    0x01010101u, 0x01010103u, 0x01010105u, 0x0101010bu, 0x0101010fu, 0x01010301u, 0x01010303u, 0x01010305u,
+    0x01010309u, 0x0101030du, 0x01010501u, 0x01010503u, 0x0101050bu, 0x01010707u, 0x01010901u, 0x01010905u,
+    0x0101090bu, 0x0101090fu, 0x01010b03u, 0x01010b07u, 0x01010d01u, 0x01010d05u, 0x01010f03u, 0x01010f09u,
+    0x01010f0fu, 0x01030101u, 0x01030103u, 0x01030105u, 0x01030109u, 0x01030301u, 0x01030303u, 0x0103030bu,
+    0x01030501u, 0x01030507u, 0x0103050fu, 0x01030703u, 0x0103070bu, 0x01030909u, 0x01030d03u, 0x01030d0bu,
+    0x01030f05u, 0x01050101u, 0x01050103u, 0x0105010bu, 0x0105010fu, 0x01050301u, 0x01050307u, 0x0105030du,
+    0x01050503u, 0x0105050bu, 0x01050701u, 0x01050709u, 0x01050905u, 0x0105090bu, 0x0105090fu, 0x01050b03u,
+    0x01050b07u, 0x01050f01u, 0x01050f07u, 0x01070107u, 0x01070303u, 0x0107030bu, 0x01070501u, 0x01070505u,
+    0x01070703u, 0x01070707u, 0x0107070du, 0x01070909u, 0x01070b01u, 0x01070b05u, 0x01070d0fu, 0x01070f03u,
+    0x01070f0bu, 0x01090101u, 0x01090307u, 0x0109030fu, 0x01090503u, 0x01090509u, 0x01090705u, 0x01090901u,
+    0x01090907u, 0x01090b03u, 0x01090f01u, 0x010b0105u, 0x010b0109u, 0x010b0501u, 0x010b0505u, 0x010b050du,
+    0x010b0707u, 0x010b0903u, 0x010b090bu, 0x010b090fu, 0x010b0d0du, 0x010b0f07u, 0x010d010du, 0x010d0303u,
+    0x010d0307u, 0x010d0703u, 0x010d0b05u, 0x010d0f03u, 0x010f0101u, 0x010f0105u, 0x010f0109u, 0x010f0501u,
+    0x010f0505u, 0x010f050du, 0x010f0707u, 0x010f0b01u, 0x010f0b09u, 0x03010101u, 0x03010103u, 0x03010105u,
+    0x03010109u, 0x03010301u, 0x03010303u, 0x03010307u, 0x0301030bu, 0x0301030fu, 0x03010501u, 0x03010505u,
+    0x03010703u, 0x03010709u, 0x0301070du, 0x03010b09u, 0x03010b0du, 0x03010d03u, 0x03010f05u, 0x03030101u,
+    0x03030103u, 0x03030107u, 0x0303010du, 0x03030301u, 0x03030309u, 0x03030503u, 0x03030701u, 0x03030707u,
+    0x03030903u, 0x03030b01u, 0x03030b05u, 0x03030f01u, 0x03030f0du, 0x03050101u, 0x03050305u, 0x0305030bu,
+    0x0305030fu, 0x03050501u, 0x03050509u, 0x03050705u, 0x03050901u, 0x03050907u, 0x03050b0bu, 0x03050d01u,
+    0x03050f05u, 0x03070103u, 0x03070109u, 0x0307010fu, 0x03070301u, 0x03070307u, 0x03070503u, 0x0307050fu,
+    0x03070701u, 0x03070709u, 0x03070903u, 0x03070d05u, 0x03070f01u, 0x03090107u, 0x0309010bu, 0x03090305u,
+    0x03090309u, 0x03090703u, 0x03090707u, 0x03090905u, 0x0309090du, 0x03090b01u, 0x03090b09u, 0x030b0103u,
+    0x030b0301u, 0x030b0307u, 0x030b0503u, 0x030b0701u, 0x030b0705u, 0x030b0b03u, 0x030d0501u, 0x030d0509u,
+    0x030d050fu, 0x030d0909u, 0x030d090du, 0x030f0103u, 0x030f0107u, 0x030f0301u, 0x030f0305u, 0x030f0503u,
+    0x030f070bu, 0x030f0903u, 0x030f0d05u, 0x030f0f01u, 0x05010101u, 0x05010103u, 0x05010107u, 0x0501010bu,
+    0x0501010fu, 0x05010301u, 0x05010305u, 0x05010309u, 0x0501030du, 0x05010503u, 0x05010507u, 0x0501050fu,
+    0x05010701u, 0x05010705u, 0x05010903u, 0x05010907u, 0x0501090bu, 0x05010b01u, 0x05010b05u, 0x05010d0fu,
+    0x05010f01u, 0x05010f07u, 0x05010f0bu, 0x05030101u, 0x05030105u, 0x05030301u, 0x05030307u, 0x0503030fu,
+    0x05030505u, 0x0503050bu, 0x05030703u, 0x05030709u, 0x05030905u, 0x05030b03u, 0x05050103u, 0x05050109u,
+    0x0505010fu, 0x05050503u, 0x05050507u, 0x05050701u, 0x0505070fu, 0x05050903u, 0x05050b07u, 0x05050b0fu,
+    0x05050f03u, 0x05050f09u, 0x05070101u, 0x05070105u, 0x0507010bu, 0x05070303u, 0x05070505u, 0x05070509u,
+    0x05070703u, 0x05070707u, 0x05070905u, 0x05070b01u, 0x05070d0du, 0x05090103u, 0x0509010fu, 0x05090501u,
+    0x05090507u, 0x05090705u, 0x0509070bu, 0x05090903u, 0x05090f05u, 0x05090f0bu, 0x050b0109u, 0x050b0303u,
+    0x050b0505u, 0x050b070fu, 0x050b0901u, 0x050b0b07u, 0x050b0f01u, 0x050d0101u, 0x050d0105u, 0x050d010fu,
+    0x050d0503u, 0x050d0b0bu, 0x050d0d03u, 0x050f010bu, 0x050f0303u, 0x050f050du, 0x050f0701u, 0x050f0907u,
+    0x050f0b01u, 0x07010105u, 0x07010303u, 0x07010307u, 0x0701030bu, 0x0701030fu, 0x07010505u, 0x07010703u,
+    0x07010707u, 0x0701070bu, 0x07010905u, 0x07010909u, 0x0701090fu, 0x07010b03u, 0x07010d07u, 0x07010f03u,
+    0x07030103u, 0x07030107u, 0x0703010bu, 0x07030309u, 0x07030503u, 0x07030507u, 0x07030901u, 0x07030d01u,
+    0x07030f05u, 0x07030f0du, 0x07050101u, 0x07050305u, 0x07050501u, 0x07050705u, 0x07050709u, 0x07050b01u,
+    0x07070103u, 0x07070301u, 0x07070309u, 0x07070503u, 0x07070507u, 0x0707050fu, 0x07070701u, 0x07070903u,
+    0x07070907u, 0x0707090fu, 0x07070b0bu, 0x07070f07u, 0x07090107u, 0x07090303u, 0x0709030du, 0x07090505u,
+    0x07090703u, 0x07090b05u, 0x07090d01u, 0x07090d09u, 0x070b0103u, 0x070b0301u, 0x070b0305u, 0x070b050bu,
+    0x070b0705u, 0x070b0909u, 0x070b0b0du, 0x070b0f07u, 0x070d030du, 0x070d0903u, 0x070f0103u, 0x070f0107u,
+    0x070f0501u, 0x070f0505u, 0x070f070bu, 0x09010101u, 0x09010109u, 0x09010305u, 0x09010501u, 0x09010509u,
+    0x0901050fu, 0x09010705u, 0x09010903u, 0x09010b01u, 0x09010f01u, 0x09030105u, 0x0903010fu, 0x09030303u,
+    0x09030307u, 0x09030505u, 0x09030701u, 0x0903070bu, 0x09030907u, 0x09030b03u, 0x09030b0bu, 0x09050103u,
+    0x09050107u, 0x09050301u, 0x0905030bu, 0x09050503u, 0x09050707u, 0x09050901u, 0x09050b0fu, 0x09050d05u,
+    0x09050f01u, 0x09070109u, 0x09070303u, 0x09070307u, 0x09070501u, 0x09070505u, 0x09070703u, 0x0907070bu,
+    0x09090101u, 0x09090105u, 0x09090509u, 0x0909070fu, 0x09090901u, 0x09090f03u, 0x090b010bu, 0x090b010fu,
+    0x090b0503u, 0x090b0d05u, 0x090d0307u, 0x090d0709u, 0x090d0d01u, 0x090f0301u, 0x090f030bu, 0x090f0701u,
+    0x090f0907u, 0x090f0b03u, 0x0b010105u, 0x0b010301u, 0x0b010309u, 0x0b010505u, 0x0b010901u, 0x0b010909u,
+    0x0b01090fu, 0x0b010b05u, 0x0b010d0du, 0x0b010f09u, 0x0b030103u, 0x0b030107u, 0x0b03010bu, 0x0b030305u,
+    0x0b030503u, 0x0b030705u, 0x0b030f05u, 0x0b050101u, 0x0b050303u, 0x0b050507u, 0x0b050701u, 0x0b05070du,
+    0x0b050b07u, 0x0b070105u, 0x0b07010fu, 0x0b070301u, 0x0b07050fu, 0x0b070909u, 0x0b070b03u, 0x0b070d0bu,
+    0x0b070f07u, 0x0b090103u, 0x0b090109u, 0x0b090501u, 0x0b090705u, 0x0b09090du, 0x0b0b0305u, 0x0b0b050du,
+    0x0b0b0b03u, 0x0b0b0b07u, 0x0b0d0905u, 0x0b0f0105u, 0x0b0f0109u, 0x0b0f0505u, 0x0d010303u, 0x0d010307u,
+    0x0d01030bu, 0x0d010703u, 0x0d010707u, 0x0d010d01u, 0x0d030101u, 0x0d030501u, 0x0d03050fu, 0x0d030d09u,
+    0x0d050305u, 0x0d050709u, 0x0d050905u, 0x0d050b0bu, 0x0d050d05u, 0x0d050f01u, 0x0d070101u, 0x0d070309u,
+    0x0d070503u, 0x0d070901u, 0x0d09050bu, 0x0d090907u, 0x0d090d05u, 0x0d0b0101u, 0x0d0b0107u, 0x0d0b0709u,
+    0x0d0b0d01u, 0x0d0d010bu, 0x0d0d0901u, 0x0d0f0303u, 0x0d0f0307u, 0x0f010101u, 0x0f010109u, 0x0f01010fu,
+    0x0f010501u, 0x0f010505u, 0x0f01070du, 0x0f010901u, 0x0f010b09u, 0x0f010d05u, 0x0f030105u, 0x0f030303u,
+    0x0f030509u, 0x0f030907u, 0x0f03090bu, 0x0f050103u, 0x0f050109u, 0x0f050301u, 0x0f05030du, 0x0f050503u,
+    0x0f050701u, 0x0f050b03u, 0x0f070105u, 0x0f070705u, 0x0f07070bu, 0x0f070b07u, 0x0f090103u, 0x0f09010bu,
+    0x0f090307u, 0x0f090501u, 0x0f090b01u, 0x0f0b0505u, 0x0f0b0905u, 0x0f0d0105u, 0x0f0d0703u, 0x0f0f0101u,
+};
+
+__constant__ uint8_t cuda_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+/* Unpack one IQ3_S block's 256 signed 3-bit magnitudes.
+ * Mirrors iq3s_unpack_i8_generic(): 8 groups of 32, each built from two
+ * interleaved 4-byte ggml_iq3s_grid lookups whose index carries the high bit
+ * from qh, then negated per the sign bit. */
+static __device__ __forceinline__ void iq3s_unpack(const cuda_iq3_s_block *b, int8_t *a) {
+    const uint8_t *qs    = b->qs;
+    const uint8_t *qh    = b->qh;
+    const uint8_t *signs = b->signs;
+    int8_t       *ap    = a;
+
+    for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+        for (int l = 0; l < 4; l++) {
+            const uint32_t g1 = cuda_iq3s_grid[qs[2 * l] | ((qh[0] << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = cuda_iq3s_grid[qs[2 * l + 1] | ((qh[0] << (7 - 2 * l)) & 256)];
+            const uint8_t sb = signs[l];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int8_t v1 = (int8_t)((g1 >> (8 * j)) & 0xFF);
+                const int8_t v2 = (int8_t)((g2 >> (8 * j)) & 0xFF);
+                ap[j]     = (sb & cuda_kmask_iq2xs[j])     ? (int8_t)-v1 : v1;
+                ap[j + 4] = (sb & cuda_kmask_iq2xs[j + 4]) ? (int8_t)-v2 : v2;
+            }
+            ap += 8;
+        }
+        qs += 8;
+        signs += 4;
+
+        for (int l = 0; l < 4; l++) {
+            const uint32_t g1 = cuda_iq3s_grid[qs[2 * l] | ((qh[1] << (8 - 2 * l)) & 256)];
+            const uint32_t g2 = cuda_iq3s_grid[qs[2 * l + 1] | ((qh[1] << (7 - 2 * l)) & 256)];
+            const uint8_t sb = signs[l];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const int8_t v1 = (int8_t)((g1 >> (8 * j)) & 0xFF);
+                const int8_t v2 = (int8_t)((g2 >> (8 * j)) & 0xFF);
+                ap[j]     = (sb & cuda_kmask_iq2xs[j])     ? (int8_t)-v1 : v1;
+                ap[j + 4] = (sb & cuda_kmask_iq2xs[j + 4]) ? (int8_t)-v2 : v2;
+            }
+            ap += 8;
+        }
+        qh += 2;
+        qs += 8;
+        signs += 4;
+    }
+}
+
+/* One block dot: 8 groups of 32, each scaled by its 4-bit scale packed two
+ * per byte in scales[4] (sc = 1 + 2*nibble). Mirrors the CPU reference. */
+static __device__ __forceinline__ float iq3_s_dot(const cuda_iq3_s_block *blk,
+                                                  const cuda_q8_k_block *xb, float acc) {
+    int8_t a[256];
+    iq3s_unpack(blk, a);
+
+    const int8_t *q8 = xb->qs;
+    int32_t total = 0;
+    #pragma unroll
+    for (int g = 0; g < 8; g++) {
+        const uint8_t sb  = blk->scales[g / 2];
+        const int      sc = (g & 1) ? (1 + 2 * (sb >> 4)) : (1 + 2 * (sb & 0xF));
+        int32_t gs = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++)
+            gs += (int)a[g * 32 + j] * (int)q8[g * 32 + j];
+        total += sc * gs;
+    }
+    const float d = __half2float(__ushort_as_half(blk->d));
+    return fmaf(d * xb->d, (float)total, acc);
+}
+
+__global__ void matmul_iq3_s_kernel(const cuda_iq3_s_block *__restrict__ w,
+                                    const cuda_q8_k_block *__restrict__ xq,
+                                    float *__restrict__ y, int n, int k) {
+    const int nb = k >> 8;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq3_s_block *wrow = w + (size_t)row * nb;
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += MM_LANES)
+        acc = iq3_s_dot(wrow + b, xq + b, acc);
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc;
+}
+
+__global__ void matmul_iq3_s_residual_kernel(const cuda_iq3_s_block *__restrict__ w,
+                                             const cuda_q8_k_block *__restrict__ xq,
+                                             const float *__restrict__ residual,
+                                             float *__restrict__ y, int n, int k) {
+    const int nb = k >> 8;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq3_s_block *wrow = w + (size_t)row * nb;
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += MM_LANES)
+        acc = iq3_s_dot(wrow + b, xq + b, acc);
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc + residual[row];
+}
+
+__global__ void matmul_iq3_s_batch_kernel(const cuda_iq3_s_block *__restrict__ w,
+                                          const cuda_q8_k_block *__restrict__ xq,
+                                          float *__restrict__ y, int n, int k, int m) {
+    const int nb = k >> 8;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq3_s_block *wrow = w + (size_t)row * nb;
+    for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
+        const int nt = min(MM_TOK_TILE, m - t0);
+        float acc[MM_TOK_TILE];
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) acc[t] = 0.0f;
+        for (int b = lane; b < nb; b += MM_LANES) {
+            const cuda_iq3_s_block *wb = wrow + b;
+            #pragma unroll
+            for (int t = 0; t < MM_TOK_TILE; t++) {
+                if (t >= nt) break;
+                acc[t] = iq3_s_dot(wb, xq + ((size_t)(t0 + t) * nb + b), acc[t]);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) {
+            if (t >= nt) break;
+            float v = acc[t];
+            #pragma unroll
+            for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            if ((threadIdx.x & (MM_LANES - 1)) == 0)
+                y[(size_t)(t0 + t) * n + row] = v;
+        }
+    }
+}
+
+
 /* ------------------------------------------------------------------ */
 /* Q5_0 / Q5_1 / Q5_K / IQ3_S host-side launchers                       */
 /* ------------------------------------------------------------------ */
@@ -5123,6 +5333,29 @@ extern "C" void cuda_matmul_q5_k_residual(const void *w_dev, const float *x_dev,
     dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     matmul_q5_k_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q5_k_block *)w_dev, xq, residual_dev, y_dev, n, k);
+}
+
+extern "C" void cuda_matmul_iq3_s(const void *w_dev, const float *x_dev, float *y_dev, int n,
+                                  int k, cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 255)) return;
+    cuda_q8_k_block *xq = q8k_scratch_for(k);
+    if (!xq) return;
+    q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_iq3_s_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_iq3_s_block *)w_dev, xq, y_dev, n, k);
+}
+
+extern "C" void cuda_matmul_iq3_s_residual(const void *w_dev, const float *x_dev,
+                                           const float *residual_dev, float *y_dev, int n, int k,
+                                           cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 255)) return;
+    cuda_q8_k_block *xq = q8k_scratch_for(k);
+    if (!xq) return;
+    q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_iq3_s_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_iq3_s_block *)w_dev, xq, residual_dev, y_dev, n, k);
 }
 
 /* ------------------------------------------------------------------ */
@@ -10451,4 +10684,16 @@ extern "C" void cuda_matmul_batch_q5_k(const void *w_dev, const float *x_dev, fl
     dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     matmul_q5_k_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q5_k_block *)w_dev, xq, y_dev, n, k, m);
+}
+
+extern "C" void cuda_matmul_batch_iq3_s(const void *w_dev, const float *x_dev, float *y_dev,
+                                         int n, int k, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0 || k <= 0 || (k & 255)) return;
+    const int nb = k / 256;
+    cuda_q8_k_block *xq = q8k_scratch_for_batch(k, m);
+    if (!xq) return;
+    q8_k_quant_batch_kernel<<<(((size_t)m * nb) + 255) / 256, 256, 0, stream>>>(x_dev, xq, k, m);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_iq3_s_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_iq3_s_block *)w_dev, xq, y_dev, n, k, m);
 }

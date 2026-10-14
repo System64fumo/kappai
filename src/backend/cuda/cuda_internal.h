@@ -197,6 +197,18 @@ typedef struct {
 	uint8_t  qs[128];
 } cuda_q5_k_block;
 
+/* IQ3_S block: 256 elements. d (F16), qs[64], qh[8], signs[32], scales[4].
+ * Total 110 bytes -- field order must match CPU iq3_s_block exactly.
+ * Element values come from the shared ggml_iq3s_grid lookup indexed by
+ * (nibble | high bit), then negated per the sign bit. */
+typedef struct {
+	uint16_t d;
+	uint8_t  qs[64];
+	uint8_t  qh[8];
+	uint8_t  signs[32];
+	uint8_t  scales[4];
+} cuda_iq3_s_block;
+
 /* Q6_K block: 256 elements, 4 groups of 64 elements each.
  * Structure: ql[128] (low 4 bits), qh[64] (high 2 bits), scales[16] (int8,
  * one per 16-element sub-group), d (F16). Total 210 bytes -- field order must
@@ -546,6 +558,21 @@ void cuda_matmul_q5_k_residual(const void *w_dev, const float *x_dev,
                                cudaStream_t stream);
 void cuda_matmul_batch_q5_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                             int m, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
+
+/* IQ3_S: x quantized to Q8_K; mirrors matmul_iq3_s_q8_k_qonly_f32_row(). */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_iq3_s(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                       cudaStream_t stream);
+void cuda_matmul_iq3_s_residual(const void *w_dev, const float *x_dev,
+                                const float *residual_dev, float *y_dev, int n, int k,
+                                cudaStream_t stream);
+void cuda_matmul_batch_iq3_s(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                             int m, cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif

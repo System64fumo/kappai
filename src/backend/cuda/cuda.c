@@ -1012,6 +1012,7 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ3_S:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -1093,6 +1094,9 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
             break;
         case GGML_TYPE_Q5_1:
             cuda_matmul_q5_1(w_dev, x_dev, y_dev, n, k, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            cuda_matmul_iq3_s(w_dev, x_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             cuda_matmul_iq4_nl(w_dev, x_dev, y_dev, n, k, stream);
@@ -1216,6 +1220,9 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
             break;
         case GGML_TYPE_Q5_1:
             cuda_matmul_q5_1_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            cuda_matmul_iq3_s_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
             break;
         default: {
             /* No fused residual kernel for this type (Q4_K/F32/F16/BF16):
@@ -3322,6 +3329,9 @@ static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t
             break;
         case GGML_TYPE_Q5_1:
             cuda_matmul_batch_q5_1(w_dev, x_dev, y_dev, n, k, m, priv->stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            cuda_matmul_batch_iq3_s(w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         case GGML_TYPE_IQ4_NL:
             cuda_matmul_batch_iq4_nl(w_dev, x_dev, y_dev, n, k, m, priv->stream);
