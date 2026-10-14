@@ -324,6 +324,7 @@ status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
 
+int backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
 int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);

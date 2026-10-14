@@ -462,80 +462,33 @@ status_code backend_create_best(backend **out) {
 	return make_backend(&g_registry[best_idx], 0, out);
 }
 
+int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
+	return snprintf(out, out_cap, "%s_%d", name, device_index);
+}
+
 int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index) {
 	if (!spec || !*spec)
 		return -1;
 
-	backend_load();
-
-	for (int i = 0; i < g_registry_count; i++) {
-		if (strcmp(g_registry[i].name, spec) == 0) {
-			snprintf(name, name_cap, "%s", spec);
-			*device_index = 0;
-			return 0;
-		}
-	}
-
-	const char *colon = strchr(spec, ':');
-	if (colon && colon != spec) {
-		size_t name_len = (size_t)(colon - spec);
-		if (name_len >= name_cap)
-			return -1;
-		char *tail = NULL;
-		long  v	   = strtol(colon + 1, &tail, 10);
-		if (*tail != '\0' || v < 0 || v > INT_MAX)
-			return -1;
-		memcpy(name, spec, name_len);
-		name[name_len] = '\0';
-		*device_index  = (int)v;
-		return 0;
-	}
-
-	int best_len = -1;
-	int best_idx = 0;
-	for (int i = 0; i < g_registry_count; i++) {
-		size_t len = strlen(g_registry[i].name);
-		if ((int)len <= best_len)
-			continue;
-		if (strncmp(spec, g_registry[i].name, len) != 0)
-			continue;
-		const char *rem		   = spec + len;
-		int			all_digits = 1;
-		for (const char *p = rem; *p; p++) {
-			if (*p < '0' || *p > '9') {
-				all_digits = 0;
-				break;
-			}
-		}
-		if (!all_digits)
-			continue;
-		best_len = (int)len;
-		best_idx = (*rem) ? (int)strtol(rem, NULL, 10) : 0;
-	}
-	if (best_len > 0) {
-		snprintf(name, name_cap, "%.*s", best_len, spec);
-		*device_index = best_idx;
-		return 0;
-	}
-
-	const char *end_all = spec + strlen(spec);
-	const char *digits	= end_all;
+	const char *end	   = spec + strlen(spec);
+	const char *digits = end;
 	while (digits > spec && digits[-1] >= '0' && digits[-1] <= '9')
 		digits--;
-	size_t name_len = (size_t)(digits - spec);
+	if (digits == end || digits == spec || digits[-1] != '_')
+		return -1;
+
+	size_t name_len = (size_t)(digits - 1 - spec);
 	if (name_len == 0 || name_len >= name_cap)
 		return -1;
+
+	char *tail = NULL;
+	long  v	   = strtol(digits, &tail, 10);
+	if (*tail != '\0' || v > INT_MAX)
+		return -1;
+
 	memcpy(name, spec, name_len);
 	name[name_len] = '\0';
-	int idx		   = 0;
-	if (*digits) {
-		char *tail = NULL;
-		long  v	   = strtol(digits, &tail, 10);
-		if (*tail != '\0' || v < 0 || v > INT_MAX)
-			return -1;
-		idx = (int)v;
-	}
-	*device_index = idx;
+	*device_index  = (int)v;
 	return 0;
 }
 

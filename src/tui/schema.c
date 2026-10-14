@@ -782,10 +782,7 @@ int sc_enum_devices(char out[][SC_TEXT_MAX], int max) {
 			continue;
 		int nd = MIN(infos[i].n_devices, 8);
 		for (int d = 0; d < nd && n < max; d++) {
-			if (infos[i].n_devices > 1)
-				snprintf(out[n], SC_TEXT_MAX, "%s:%d", infos[i].name, d);
-			else
-				snprintf(out[n], SC_TEXT_MAX, "%s", infos[i].name);
+			backend_format_device(infos[i].name, d, out[n], SC_TEXT_MAX);
 			n++;
 		}
 	}

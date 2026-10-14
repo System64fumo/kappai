@@ -276,11 +276,9 @@ static int list_devices(void) {
 		if (!infos[i].available)
 			continue;
 		for (int d = 0; d < infos[i].n_devices; d++) {
-			if (infos[i].n_devices > 1)
-				printf("  %s:%d", infos[i].name, d);
-			else
-				printf("  %s", infos[i].name);
-			printf("\n");
+			char device[64];
+			backend_format_device(infos[i].name, d, device, sizeof(device));
+			printf("  %s\n", device);
 		}
 	}
 	return 0;

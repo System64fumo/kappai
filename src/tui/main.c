@@ -55,6 +55,29 @@ static void wait_for_keypress(void) {
 		;
 }
 
+static int run_saved_config(const saved_config *sc, bool server_mode) {
+	config	 cfg;
+	cli_args a;
+	sc_materialize(sc, &cfg, &a);
+	a.interactive = true;
+	a.is_server	  = server_mode;
+
+	if (server_mode)
+		openai_install_signals();
+	else
+		signal(SIGINT, SIG_DFL);
+
+	context ctx;
+	if (engine_init_config(&ctx, &a, &cfg) != OK)
+		return 1;
+	if (server_mode)
+		return run_server(&ctx, &a);
+
+	int rc = engine_run(&ctx, &a);
+	engine_shutdown(&ctx);
+	return rc;
+}
+
 static void tui_run_config(const sc_entry *entry, bool server_mode) {
 	saved_config sc;
 	char		 err[SC_ERR_MAX];
@@ -63,34 +86,10 @@ static void tui_run_config(const sc_entry *entry, bool server_mode) {
 		return;
 	}
 
-	config	 cfg;
-	cli_args a;
-	sc_materialize(&sc, &cfg, &a);
-	a.interactive = true;
-	a.is_server	  = server_mode;
-
-	context ctx;
-	int		rc;
-
 	def_prog_mode();
 	endwin();
 
-	if (server_mode) {
-		openai_install_signals();
-	} else {
-		signal(SIGINT, SIG_DFL);
-	}
-
-	int s = engine_init_config(&ctx, &a, &cfg);
-	if (s != OK) {
-		rc = 1;
-	} else if (server_mode) {
-		rc = run_server(&ctx, &a);
-	} else {
-		rc = engine_run(&ctx, &a);
-		engine_shutdown(&ctx);
-	}
-
+	int rc = run_saved_config(&sc, server_mode);
 	if (rc != 0)
 		wait_for_keypress();
 
@@ -104,12 +103,41 @@ static void tui_run_config(const sc_entry *entry, bool server_mode) {
 	ui_after_resume();
 }
 
-int main(int argc, char **argv) {
-	if (argc > 1) {
-		fprintf(stderr, "kappai takes no launch flags\n");
-		fprintf(stderr, "run it without arguments to pick a saved configuration\n");
+static int launch_config(const char *name, const char *mode) {
+	bool server_mode = strcmp(mode, "server") == 0;
+	if (!server_mode && strcmp(mode, "chat") != 0) {
+		fprintf(stderr, "kappai: unknown run type '%s' (expected chat or server)\n", mode);
 		return 1;
 	}
+
+	const char *dir = sc_configs_dir();
+	char		path[SC_PATH_MAX];
+	if (!dir || strchr(name, '/') ||
+		snprintf(path, sizeof(path), "%s/%s.conf", dir, name) >= (int)sizeof(path)) {
+		fprintf(stderr, "kappai: unknown config '%s'\n", name);
+		return 1;
+	}
+
+	saved_config sc;
+	char		 err[SC_ERR_MAX];
+	if (sc_load(path, &sc, err, sizeof(err)) < 0) {
+		fprintf(stderr, "kappai: %s\n", err);
+		return 1;
+	}
+	return run_saved_config(&sc, server_mode);
+}
+
+int main(int argc, char **argv) {
+	if (argc == 2) {
+		fprintf(stderr, "kappai: missing run type for config '%s' (chat or server)\n", argv[1]);
+		return 1;
+	}
+	if (argc > 3) {
+		fprintf(stderr, "usage: %s [config_name chat|server]\n", argv[0]);
+		return 1;
+	}
+	if (argc == 3)
+		return launch_config(argv[1], argv[2]);
 
 	setlocale(LC_ALL, "");
 	if (ui_init() < 0) {

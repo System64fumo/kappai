@@ -25,7 +25,7 @@ void synth_suite_common_init(void) {
 	done = 1;
 
 	config cfg				  = config_defaults();
-	cfg.device				  = "cpu";
+	cfg.device				  = "cpu_0";
 	cfg.model				  = synth_chat_model_path;
 	cfg.use_mmap			  = false;
 	cfg.flash_attn			  = false;
@@ -151,7 +151,7 @@ static void restore_logging(void) {
 
 static int ctx_init_for(context *c, int ctx_size) {
 	config cfg	   = config_defaults();
-	cfg.device	   = "cpu";
+	cfg.device	   = "cpu_0";
 	cfg.model	   = synth_chat_model_path;
 	cfg.use_mmap   = false;
 	cfg.flash_attn = false;
@@ -841,7 +841,7 @@ static void t_engine_exit_code_context_full(void) {
 	ORCH_PUSH("-m");
 	ORCH_PUSH(synth_chat_model_path);
 	ORCH_PUSH("--device");
-	ORCH_PUSH("cpu");
+	ORCH_PUSH("cpu_0");
 	ORCH_PUSH("-c");
 	ORCH_PUSH("40");
 	ORCH_PUSH("-p");

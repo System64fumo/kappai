@@ -98,7 +98,7 @@ status_code context_init(context *c, const config *cfg) {
 		char name[32];
 		int	 device_index = 0;
 		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
-			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
+			ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", cfg->device);
 			return ERR_INVALID_ARG;
 		}
 		s = backend_create(name, device_index, &c->backend);
