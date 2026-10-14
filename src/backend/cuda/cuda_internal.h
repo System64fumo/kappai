@@ -185,6 +185,18 @@ typedef struct {
 	uint8_t  qs[16];
 } cuda_q5_1_block;
 
+/* Q5_K block: 256 elements, 4 groups of 64.
+ * d (F16), dmin (F16), scales[12] (16 6-bit scale/min), qh[32] (6th bit,
+ * 2 bits per element pair), qs[128] (5-bit values packed 2/byte).
+ * Total 176 bytes -- field order must match CPU q5_k_block exactly. */
+typedef struct {
+	uint16_t d;
+	uint16_t dmin;
+	uint8_t  scales[12];
+	uint8_t  qh[32];
+	uint8_t  qs[128];
+} cuda_q5_k_block;
+
 /* Host-side helpers (resolved from the scalar backend's weak definitions so
  * that dequant scales match the CPU reference bit-for-bit). */
 #ifdef __cplusplus
@@ -491,6 +503,21 @@ void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev, int n, int k,
                                cudaStream_t stream);
 void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                            int m, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
+
+/* Q5_K: x quantized to Q8_K; mirrors q5_k_dot() in backend/cpu/scalar/quants.c. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_q5_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q5_k_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+void cuda_matmul_batch_q5_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                             int m, cudaStream_t stream);
 #ifdef __cplusplus
 }
