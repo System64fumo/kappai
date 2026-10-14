@@ -1009,6 +1009,7 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -1024,28 +1025,6 @@ static int cuda_w_is_qmajor(uint32_t w_type) {
     return w_type == GGML_TYPE_Q8_0_QM || w_type == GGML_TYPE_Q4_0_QM;
 }
 
-/* Safe IQ4_NL matmul fallback: simple non-vectorized implementation that avoids
- * the CPU kernel crash for small n (e.g., n=8). Uses the same dequantization
- * as the CPU but with bounds-safe loops. */
-status_code cuda_matmul_iq4_nl_safe(backend *self, const buffer *w, const buffer *x,
-                                     buffer *y, int n, int k) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    cudaStream_t stream = priv->stream;
-
-cuda_matmul_iq4_nl_fast_launch((const uint8_t *)cuda_dev_ptr(w),
-                                    (const float *)cuda_dev_ptr(x),
-                                    (float *)cuda_dev_ptr(y), n, k,
-                                    priv->stream);
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] IQ4_NL fast matmul: %s\n", cudaGetErrorString(err));
-        return ERR_UNSUPPORTED;
-    }
-    return OK;
-}
-
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
                                 const buffer *x, buffer *y, int n, int k) {
@@ -1054,15 +1033,6 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
         return ERR_UNSUPPORTED;
     }
     if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
-        /* Safe CUDA-side fallback for types that crash the CPU implementation.
-         * CPU's IQ4_NL kernel crashes for n=8 (see matmul_iq4_nl_q8_qonly_f32_row).
-         * We implement a simple, correct CUDA fallback instead of calling CPU. */
-        if (w_type == GGML_TYPE_IQ4_NL) {
-            status_code st = cuda_matmul_iq4_nl_safe(self, w, x, y, n, k);
-            if (st != ERR_UNSUPPORTED)
-                return st;
-            /* Fall through to CPU if CUDA safe fallback fails */
-        }
         backend *host = backend_host();
         if (host && host->matmul) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -1115,6 +1085,9 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
             break;
         case GGML_TYPE_Q5_1:
             cuda_matmul_q5_1(w_dev, x_dev, y_dev, n, k, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            cuda_matmul_iq4_nl(w_dev, x_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_F32:
             cuda_matmul_f32((const float *)w_dev, x_dev, y_dev, n, k, stream);
@@ -1220,6 +1193,9 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
             break;
         case GGML_TYPE_Q4_1:
             cuda_matmul_q4_1_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            cuda_matmul_iq4_nl_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_Q5_0:
             cuda_matmul_q5_0_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
@@ -2639,21 +2615,6 @@ static status_code cuda_op_ffn_activate_ex(backend *self, const buffer *gate, co
     return OK;
 }
 
-static status_code cuda_op_ffn_activate_fused_batch(backend *self, const buffer *fused,
-                                                    buffer *out, int n, int activation, int m) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    cuda_ffn_activate_fused_batch((const float *)cuda_dev_ptr((buffer *)fused),
-                                  (float *)cuda_dev_ptr(out), n, activation, m, priv->stream);
-    if (out->host_ptr) {
-        if (cudaMemcpyAsync((void *)out->host_ptr, cuda_dev_ptr(out),
-                            (size_t)m * (size_t)n * sizeof(float), cudaMemcpyDeviceToHost,
-                            priv->stream) != cudaSuccess)
-            return ERR_INTERNAL;
-    }
-    return OK;
-}
-
 static status_code cuda_op_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
                                                 buffer *out, int n, int activation, int m) {
     struct cuda_priv *priv = cuda_priv(self);
@@ -2664,6 +2625,25 @@ static status_code cuda_op_ffn_activate_batch(backend *self, const buffer *gate,
     if (out->host_ptr) {
         if (cudaMemcpyAsync((void *)out->host_ptr, cuda_dev_ptr(out), (size_t)m * (size_t)n * sizeof(float),
                             cudaMemcpyDeviceToHost, priv->stream) != cudaSuccess)
+            return ERR_INTERNAL;
+    }
+    return OK;
+}
+
+/* Fused batched FFN activation over a pre-interleaved gate/up buffer.
+ * Without this the engine stages the activation through host memory on every
+ * batched FFN (HFB_BATCH_DESIGN), which costs two full-tensor D2H/H2D copies
+ * per layer during prompt processing. */
+static status_code cuda_op_ffn_activate_fused_batch(backend *self, const buffer *fused,
+                                                    buffer *out, int n, int activation, int m) {
+    struct cuda_priv *priv = cuda_priv(self);
+    if (!priv) return ERR_INTERNAL;
+    cuda_ffn_activate_fused_batch((const float *)cuda_dev_ptr((buffer *)fused),
+                                  (float *)cuda_dev_ptr(out), n, activation, m, priv->stream);
+    if (out->host_ptr) {
+        if (cudaMemcpyAsync((void *)out->host_ptr, cuda_dev_ptr(out),
+                            (size_t)m * (size_t)n * sizeof(float), cudaMemcpyDeviceToHost,
+                            priv->stream) != cudaSuccess)
             return ERR_INTERNAL;
     }
     return OK;
@@ -3322,6 +3302,9 @@ static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t
             break;
         case GGML_TYPE_Q5_1:
             cuda_matmul_batch_q5_1(w_dev, x_dev, y_dev, n, k, m, priv->stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            cuda_matmul_batch_iq4_nl(w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         case GGML_TYPE_F16:
             cuda_matmul_batch_f16((const uint16_t *)w_dev, x_dev, y_dev, n, k, m, priv->stream);

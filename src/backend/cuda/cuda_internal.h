@@ -155,6 +155,18 @@ typedef struct {
 	int16_t  bsums[16];
 } cuda_q8_k_block;
 
+/* IQ4_NL block: 32 elements. Structure: d (F16), qs[16] (32 4-bit values
+ * packed 2/byte). Total 18 bytes -- field order and size must match the CPU
+ * iq4_nl_block exactly.
+ *
+ * Nibble order is NOT interleaved: qs[j] & 0xF holds element j (j in 0..15)
+ * and qs[j] >> 4 holds element j+16. See iq4_nl_dot() in
+ * backend/cpu/scalar/quants.c. */
+typedef struct {
+	uint16_t d;
+	uint8_t  qs[16];
+} cuda_iq4_nl_block;
+
 /* Q5_0 block: 32 elements. d (F16), qh[4] (the 5th bit, one per element),
  * qs[16] (low/high nibbles). Total 22 bytes. The 5-bit value is
  * (nibble | ((qh>>j & 1) << 4)) with a -16 bias for Q5_0. */
@@ -172,10 +184,6 @@ typedef struct {
 	uint8_t  qh[4];
 	uint8_t  qs[16];
 } cuda_q5_1_block;
-
-
-
-
 
 /* Host-side helpers (resolved from the scalar backend's weak definitions so
  * that dequant scales match the CPU reference bit-for-bit). */
@@ -281,38 +289,18 @@ void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
                                int n, int k, cudaStream_t stream);
 
-void cuda_matmul_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                      cudaStream_t stream);
-void cuda_matmul_q5_0_residual(const void *w_dev, const float *x_dev,
-                               const float *residual_dev, float *y_dev, int n, int k,
-                               cudaStream_t stream);
-
-void cuda_matmul_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                      cudaStream_t stream);
-void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
-                               const float *residual_dev, float *y_dev, int n, int k,
-                               cudaStream_t stream);
-
-void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
-
-void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
-
-void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k, int m, cudaStream_t stream);
-
-/* Safe fallback for types that crash the CPU implementation (e.g., IQ4_NL). */
-status_code cuda_matmul_iq4_nl_safe(backend *self, const buffer *w, const buffer *x,
-                                     buffer *y, int n, int k);
-
-/* Launch wrappers for the IQ4_NL matmul kernels. */
+/* IQ4_NL: x is quantized to Q8_0 on device, then y = W * x with the reference
+ * iq4_nl_dot semantics (LUT lookup, not a plain nibble scale). */
 #ifdef __cplusplus
 extern "C" {
 #endif
-void cuda_matmul_iq4_nl_safe_launch(const uint8_t *w, const float *x,
-                                     float *y, int n, int k,
-                                     cudaStream_t stream);
-void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
-                                     float *y, int n, int k,
-                                     cudaStream_t stream);
+void cuda_matmul_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                        cudaStream_t stream);
+void cuda_matmul_iq4_nl_residual(const void *w_dev, const float *x_dev,
+                                 const float *residual_dev, float *y_dev, int n, int k,
+                                 cudaStream_t stream);
+void cuda_matmul_batch_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                              int m, cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif
@@ -481,10 +469,37 @@ void cuda_kv_put_batch_q8(const float *k_in, const float *v_in,
 void cuda_rmsnorm_batch(const float *x_dev, const float *w_dev, float *y_dev,
                         int n, float eps, int m, cudaStream_t stream);
 void cuda_add_batch(float *x_dev, const float *y_dev, int n, int m, cudaStream_t stream);
-void cuda_ffn_activate_fused_batch(const float *fused_dev, float *out_dev, int n,
-                                   int activation, int m, cudaStream_t stream);
 void cuda_ffn_activate_batch(const float *gate_dev, const float *up_dev, float *out_dev,
                              int n, int activation, int m, cudaStream_t stream);
+/* Q5_0 / Q5_1: x is quantized to Q8_0 on device, then y = W * x with the
+ * reference q5_0_dot / q5_1_dot semantics (5-bit values, -16 bias for Q5_0,
+ * m-offset for Q5_1). Q5_1 needs the per-block sum of quantized activations,
+ * which the Q8_0 block carries implicitly; the batch kernel accumulates it. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void cuda_matmul_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q5_0_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                            int m, cudaStream_t stream);
+void cuda_matmul_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                      cudaStream_t stream);
+void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
+                               const float *residual_dev, float *y_dev, int n, int k,
+                               cudaStream_t stream);
+void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                            int m, cudaStream_t stream);
+#ifdef __cplusplus
+}
+#endif
+
+/* Fused batched FFN activation: gate/up arrive pre-interleaved with stride 2n
+ * per row, so this stays on device instead of staging through host memory. */
+void cuda_ffn_activate_fused_batch(const float *fused_dev, float *out_dev, int n,
+                                   int activation, int m, cudaStream_t stream);
 void cuda_rope_batch(float *vec_dev, int n_heads, int head_dim, int pos_start,
                      const float *rope_cos_dev, const float *rope_sin_dev,
                      int m, int neox, cudaStream_t stream);

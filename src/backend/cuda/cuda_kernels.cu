@@ -1727,6 +1727,8 @@ static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, con
 /* Q4_K MatMul kernel (M>=1 batched, K multiple of 256)              */
 /* ------------------------------------------------------------------ */
 
+
+
 __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
                                     const cuda_q8_k_block *__restrict__ xq,
                                     float *__restrict__ y, int n, int k) {
@@ -4032,25 +4034,27 @@ static cuda_q8_k_block *q8k_scratch_for(int k) {
     return g_q8k_scratch;
 }
 
-static cuda_q8_0_block *xq_scratch_for(int k) {
-    size_t need = (size_t)(k / 32) * sizeof(cuda_q8_0_block);
-    if (need <= g_xq_cap)
-        return g_xq_scratch;
-    if (g_xq_scratch)
-        cudaFree(g_xq_scratch);
-    g_xq_scratch = nullptr;
-    g_xq_cap     = 0;
-    if (cudaMalloc((void **)&g_xq_scratch, need) != cudaSuccess)
+/* Q8_1 scratch for Q5_1 (see q5_1_dot): the activation block needs its `s`
+ * offset field, so it cannot share the Q8_0 scratch. Grow-only, same policy. */
+static cuda_q8_1_block *g_q81_scratch = nullptr;
+static size_t          g_q81_cap     = 0;
+
+static cuda_q8_1_block *q81_scratch_for(size_t nelem) {
+    size_t need = (nelem / 32) * sizeof(cuda_q8_1_block);
+    if (need <= g_q81_cap)
+        return g_q81_scratch;
+    if (g_q81_scratch)
+        cudaFree(g_q81_scratch);
+    g_q81_scratch = nullptr;
+    g_q81_cap     = 0;
+    if (cudaMalloc((void **)&g_q81_scratch, need) != cudaSuccess)
         return nullptr;
-    g_xq_cap = need;
-    return g_xq_scratch;
+    g_q81_cap = need;
+    return g_q81_scratch;
 }
 
-/* Batched activation scratch: a batch of m rows needs m * (k/32) blocks, not
- * just (k/32). Sizing by one row left the quantize kernel writing (m-1)*nb
- * blocks past the end of the allocation, which corrupted the FFN-down input. */
-static cuda_q8_0_block *xq_scratch_for_batch(int k, int m) {
-    size_t need = (size_t)m * (size_t)(k / 32) * sizeof(cuda_q8_0_block);
+static cuda_q8_0_block *xq_scratch_for(int k) {
+    size_t need = (size_t)(k / 32) * sizeof(cuda_q8_0_block);
     if (need <= g_xq_cap)
         return g_xq_scratch;
     if (g_xq_scratch)
@@ -4211,90 +4215,276 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
     }
 }
 
-/* IQ4_NL uses the same quantization as Q4_K but with 4-bit values and 16-level lookup.
- * We implement an efficient kernel using integer arithmetic like the CPU. */
+/* ------------------------------------------------------------------ */
+/* IQ4_NL: 32 elements/block, d (F16) + 16 packed 4-bit values.         */
+/*                                                                   */
+/* Nibble layout is NOT interleaved: qs[j] & 0xF is element j,       */
+/* qs[j] >> 4 is element j+16. Weights are NOT a linear nibble        */
+/* scale -- the 4-bit index feeds a 16-entry non-uniform LUT, exactly  */
+/* as iq4_nl_dot() in backend/cpu/scalar/quants.c does. x is          */
+/* quantized to Q8_0 first (MATMUL_Q8_F32(iq4_nl_q8, ...)), so the    */
+/* whole dot product is integer and exact.                            */
+/* ------------------------------------------------------------------ */
 
 __constant__ int8_t cuda_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
-/* IQ4_NL block format (18 bytes per 32 elements):
- * bytes 0-1: fp16 scale (d)
- * bytes 2-17: 16 bytes of 4-bit quants (32 values, 4 bits each)
- * No offset (m=0), unlike Q4_K
- */
-
-/* IQ4_NL safe matmul kernel: non-vectorized, bounds-safe implementation.
- * Each thread computes one output row. Dequantizes IQ4_NL weights on the fly. */
-__global__ void matmul_iq4_nl_safe_kernel(const uint8_t *__restrict__ w,
-                                          const float *__restrict__ x,
-                                          float *__restrict__ y, int n, int k) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n) return;
-
-    const int blocks_per_row = k / 32;
-    const uint8_t *w_row = w + row * (k / 32) * 18;
-
-    float acc = 0.0f;
-    for (int b = 0; b < k / 32; b++) {
-        const uint8_t *block = w_row + b * 18;
-        uint16_t scale_bits = block[0] | (block[1] << 8);
-        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-
-        const uint8_t *quants = block + 2;
-        for (int j = 0; j < 32; j++) {
-            uint8_t byte = quants[j / 2];
-            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            acc += (float)cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
-        }
+/* One IQ4_NL block dot product against a Q8_0 activation block.
+ * Mirrors iq4_nl_dot() bit-for-bit in accumulation order. */
+static __device__ __forceinline__ float iq4_nl_dot(const cuda_iq4_nl_block *blk,
+                                                   const int8_t *xq8, float d_xq, float acc) {
+    const uint8_t *qs = blk->qs;
+    int32_t        sumi0 = 0;
+    int32_t        sumi1 = 0;
+    /* Low nibble -> elements [0,16), high nibble -> elements [16,32).
+     * __dp4a over 4 int8 lanes at a time; the LUT values exceed int8
+     * range in magnitude (-127) so they cannot be packed into the dp4a
+     * operand directly -- accumulate scalar int32 products instead,
+     * which is what the reference does too. */
+    #pragma unroll
+    for (int j = 0; j < 16; j++) {
+        sumi0 += (int)xq8[j] * (int)cuda_kvalues_iq4nl[qs[j] & 0xF];
+        sumi1 += (int)xq8[j + 16] * (int)cuda_kvalues_iq4nl[qs[j] >> 4];
     }
-    y[row] = acc;
+    const float d = __half2float(__ushort_as_half(blk->d));
+    return fmaf(d * d_xq, (float)(sumi0 + sumi1), acc);
 }
 
-/* Optimized version: parallelize across blocks within a row using block-level reduction. */
-__global__ void matmul_iq4_nl_fast_kernel(const uint8_t *__restrict__ w,
-                                          const float *__restrict__ x,
-                                          float *__restrict__ y, int n, int k) {
-    int row = blockIdx.x;
-    if (row >= n) return;
-
-    int tid = threadIdx.x;
-    const int blocks_per_row = k / 32;
-    const uint8_t *w_row = w + row * (k / 32) * 18;
+__global__ void matmul_iq4_nl_kernel(const cuda_iq4_nl_block *__restrict__ w,
+                                     const cuda_q8_0_block *__restrict__ xq,
+                                     float *__restrict__ y, int n, int k) {
+    const int nb  = k >> 5;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq4_nl_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    for (int b = threadIdx.x; b < k / 32; b += blockDim.x) {
-        const uint8_t *block = w_row + b * 18;
-        uint16_t scale_bits = block[0] | (block[1] << 8);
-        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-
-        const uint8_t *quants = block + 2;
-        float block_sum = 0.0f;
-        for (int j = 0; j < 32; j++) {
-            uint8_t byte = quants[j / 2];
-            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            block_sum += (float)cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
-        }
-        acc += block_sum;
+    for (int b = lane; b < nb; b += MM_LANES) {
+        const cuda_q8_0_block *xb = xq + b;
+        acc = iq4_nl_dot(wrow + b, xb->qs, __half2float(__ushort_as_half(xb->d)), acc);
     }
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc;
+}
 
-    /* Block-level reduction using shared memory */
-    __shared__ float sdata[256];
-    sdata[threadIdx.x] = acc;
+__global__ void matmul_iq4_nl_residual_kernel(const cuda_iq4_nl_block *__restrict__ w,
+                                              const cuda_q8_0_block *__restrict__ xq,
+                                              const float *__restrict__ residual,
+                                              float *__restrict__ y, int n, int k) {
+    const int nb  = k >> 5;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq4_nl_block *wrow = w + (size_t)row * nb;
+
+    float acc = 0.0f;
+    for (int b = lane; b < nb; b += MM_LANES) {
+        const cuda_q8_0_block *xb = xq + b;
+        acc = iq4_nl_dot(wrow + b, xb->qs, __half2float(__ushort_as_half(xb->d)), acc);
+    }
+    #pragma unroll
+    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+        acc += __shfl_xor_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & (MM_LANES - 1)) == 0)
+        y[row] = acc + residual[row];
+}
+
+/* Batched (m tokens share the weight). */
+__global__ void matmul_iq4_nl_batch_kernel(const cuda_iq4_nl_block *__restrict__ w,
+                                           const cuda_q8_0_block *__restrict__ xq,
+                                           float *__restrict__ y, int n, int k, int m) {
+    const int nb  = k >> 5;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n)
+        return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_iq4_nl_block *wrow = w + (size_t)row * nb;
+
+    for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
+        const int nt = min(MM_TOK_TILE, m - t0);
+        float acc[MM_TOK_TILE];
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++)
+            acc[t] = 0.0f;
+        for (int b = lane; b < nb; b += MM_LANES) {
+            const cuda_iq4_nl_block *wb = wrow + b;
+            #pragma unroll
+            for (int t = 0; t < MM_TOK_TILE; t++) {
+                if (t >= nt)
+                    break;
+                const cuda_q8_0_block *xb = xq + ((size_t)(t0 + t) * nb + b);
+                acc[t] = iq4_nl_dot(wb, xb->qs, __half2float(__ushort_as_half(xb->d)), acc[t]);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) {
+            if (t >= nt)
+                break;
+            float v = acc[t];
+            #pragma unroll
+            for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            if ((threadIdx.x & (MM_LANES - 1)) == 0)
+                y[(size_t)(t0 + t) * n + row] = v;
+        }
+    }
+}
+
+
+extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
+                                 cudaStream_t stream) {
+    /* Quantize x on the device (Q8_0 internally), then run Q4_1 matmul. */
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        matmul_q4_1_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_1_block *)w_dev, xq_dev, y_dev, n, k);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
+        matmul_q4_1_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
+            (const cuda_q4_1_block *)w_dev, xq_dev, y_dev, n, k);
+    }
+}
+
+/* Fused residual matmuls: y = W*x + residual. Quantize x once, dispatch
+ * MMVQ (M=1 decode) or DP4A residual kernels (M>1). */
+extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
+                                         const float *residual_dev, float *y_dev,
+                                         int n, int k, cudaStream_t stream,
+                                         int qmajor) {
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    /* XQ_QM follows the kernel: res-v2 only (MMVQ/v1 read original). */
+    const char *v2r = getenv("KAPPAI_DP4A_V2");
+    int use_v2r = !(v2r && *v2r == '0');
+    const char *xqmr = getenv("KAPPAI_XQ_QM");
+    int use_xqmr = (!(xqmr && *xqmr == '0') && n != 1 && use_v2r) ? 1 : 0;
+    if (use_xqmr)
+        q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
+            x_dev, (uint8_t *)xq_dev, k);
+    else
+        q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        matmul_q8_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        if (use_v2r)
+            matmul_q8_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor,
+                use_xqmr);
+        else
+            matmul_q8_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+    }
+}
+
+extern "C" void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
+                                         const float *residual_dev, float *y_dev,
+                                         int n, int k, cudaStream_t stream,
+                                         int qmajor) {
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        matmul_q4_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+    } else {
+        const char *v2 = getenv("KAPPAI_DP4A_V2");
+        int use_v2 = !(v2 && *v2 == '0');
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        if (use_v2)
+            matmul_q4_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+        else
+            matmul_q4_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+    }
+}
+
+extern "C" void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
+                                         const float *residual_dev, float *y_dev,
+                                         int n, int k, cudaStream_t stream) {
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        matmul_q4_1_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_1_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        matmul_q4_1_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+            (const cuda_q4_1_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* MMVQ: MatMul-Vec-Q for M=1 decode.                                  */
+/*                                                                     */
+/* Decode is bandwidth-bound, so the batched row-per-warp layout wastes */
+/* most of the machine: it assigns one row to 32 lanes, but M=1 means    */
+/* there is only one row to spread. These kernels keep the identical    */
+/* arithmetic (q6_k_dot / iq4_nl_dot) and only change the work           */
+/* decomposition: every thread strides over the k-blocks, then a warp    */
+/* tree reduction plus a small shared-memory cross-warp sum combines    */
+/* the partials. Same reduction shape as the existing MMVQ kernels.     */
+/* ------------------------------------------------------------------ */
+
+#define MMVQ_WARPS 4
+
+__global__ void matmul_iq4_nl_mmvq_kernel(const cuda_iq4_nl_block *__restrict__ w,
+                                          const cuda_q8_0_block *__restrict__ xq,
+                                          float *__restrict__ y, int n, int k) {
+    const int nb = k >> 5;
+    const int row = blockIdx.x;
+    if (row >= n) return;
+
+    const int tid = threadIdx.x;
+    const cuda_iq4_nl_block *wrow = w + (size_t)row * nb;
+
+    float acc = 0.0f;
+    for (int b = tid; b < nb; b += blockDim.x)
+        acc = iq4_nl_dot(wrow + b, xq[b].qs, __half2float(__ushort_as_half(xq[b].d)), acc);
+
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+
+    __shared__ float smem[MMVQ_WARPS];
+    const int lane = tid & 31;
+    const int wid = tid >> 5;
+    if (lane == 0)
+        smem[wid] = acc;
     __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        }
-        __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < MMVQ_WARPS; i++)
+            total += smem[i];
+        y[row] = total;
     }
-
-    if (threadIdx.x == 0)
-        y[row] = sdata[0];
 }
-
-
+/* ------------------------------------------------------------------ */
+/* Q5_0 / Q5_1: 32 elements/block, 5-bit values.                        */
+/*                                                                     */
+/* The 5th bit lives in qh: element j's bit is (qh>>j)&1 and element    */
+/* j+16's is (qh>>(j+16))&1. Q5_0 subtracts a -16 bias inside the dot;   */
+/* Q5_1 has no bias and folds the offset into the m field, so it also    */
+/* needs sum(xq8) per activation block. We compute that inline rather   */
+/* than storing it, matching the existing Q4_1 CUDA path.                */
 /* ------------------------------------------------------------------ */
 
 static __device__ __forceinline__ float q5_0_dot(const cuda_q5_0_block *wb,
@@ -4378,6 +4568,41 @@ __global__ void matmul_q5_0_residual_kernel(const cuda_q5_0_block *__restrict__ 
         y[row] = acc + residual[row];
 }
 
+__global__ void matmul_q5_0_batch_kernel(const cuda_q5_0_block *__restrict__ w,
+                                         const cuda_q8_0_block *__restrict__ xq,
+                                         float *__restrict__ y, int n, int k, int m) {
+    const int nb = k >> 5;
+    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
+    if (row >= n) return;
+    const int lane = threadIdx.x & (MM_LANES - 1);
+    const cuda_q5_0_block *wrow = w + (size_t)row * nb;
+    for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
+        const int nt = min(MM_TOK_TILE, m - t0);
+        float acc[MM_TOK_TILE];
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) acc[t] = 0.0f;
+        for (int b = lane; b < nb; b += MM_LANES) {
+            const cuda_q5_0_block *wb = wrow + b;
+            #pragma unroll
+            for (int t = 0; t < MM_TOK_TILE; t++) {
+                if (t >= nt) break;
+                acc[t] = q5_0_dot(wb, xq + ((size_t)(t0 + t) * nb + b), acc[t]);
+            }
+        }
+        #pragma unroll
+        for (int t = 0; t < MM_TOK_TILE; t++) {
+            if (t >= nt) break;
+            float v = acc[t];
+            #pragma unroll
+            for (int off = MM_LANES >> 1; off > 0; off >>= 1)
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            if ((threadIdx.x & (MM_LANES - 1)) == 0)
+                y[(size_t)(t0 + t) * n + row] = v;
+        }
+    }
+}
+
+/* ---- Q5_1 ---- */
 __global__ void matmul_q5_1_kernel(const cuda_q5_1_block *__restrict__ w,
                                    const cuda_q8_1_block *__restrict__ xq,
                                    float *__restrict__ y, int n, int k) {
@@ -4449,26 +4674,9 @@ __global__ void matmul_q5_1_batch_kernel(const cuda_q5_1_block *__restrict__ w,
     }
 }
 
-
-
-
-static cuda_q8_1_block *g_q81_scratch = nullptr;
-static size_t          g_q81_cap     = 0;
-static cuda_q8_1_block *q81_scratch_for(size_t nelem) {
-    size_t need = (nelem / 32) * sizeof(cuda_q8_1_block);
-    if (need <= g_q81_cap)
-        return g_q81_scratch;
-    if (g_q81_scratch)
-        cudaFree(g_q81_scratch);
-    g_q81_scratch = nullptr;
-    g_q81_cap     = 0;
-    if (cudaMalloc((void **)&g_q81_scratch, need) != cudaSuccess)
-        return nullptr;
-    g_q81_cap = need;
-    return g_q81_scratch;
-}
-
-
+/* ------------------------------------------------------------------ */
+/* Q5_0 / Q5_1 / Q5_K / IQ3_S host-side launchers                       */
+/* ------------------------------------------------------------------ */
 
 extern "C" void cuda_matmul_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n,
                                  int k, cudaStream_t stream) {
@@ -4493,133 +4701,27 @@ extern "C" void cuda_matmul_q5_0_residual(const void *w_dev, const float *x_dev,
         (const cuda_q5_0_block *)w_dev, xq, residual_dev, y_dev, n, k);
 }
 
-extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                                 cudaStream_t stream) {
-    /* Quantize x on the device (Q8_0 internally), then run Q4_1 matmul. */
-    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
-    if (!xq_dev)
-        return;
-    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
-    if (n == 1) {
-        matmul_q4_1_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q4_1_block *)w_dev, xq_dev, y_dev, n, k);
-    } else {
-        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-        size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
-        matmul_q4_1_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q4_1_block *)w_dev, xq_dev, y_dev, n, k);
-    }
+extern "C" void cuda_matmul_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n,
+                                 int k, cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 31)) return;
+    cuda_q8_1_block *xq = q81_scratch_for(k);
+    if (!xq) return;
+    q8_1_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q5_1_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q5_1_block *)w_dev, xq, y_dev, n, k);
 }
 
-
-__global__ void matmul_q5_0_batch_kernel(const cuda_q5_0_block *__restrict__ w,
-                                         const cuda_q8_0_block *__restrict__ xq,
-                                         float *__restrict__ y, int n, int k, int m) {
-    const int nb = k >> 5;
-    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= n) return;
-    const int lane = threadIdx.x & (MM_LANES - 1);
-    const cuda_q5_0_block *wrow = w + (size_t)row * nb;
-    for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
-        const int nt = min(MM_TOK_TILE, m - t0);
-        float acc[MM_TOK_TILE];
-        #pragma unroll
-        for (int t = 0; t < MM_TOK_TILE; t++) acc[t] = 0.0f;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q5_0_block *wb = wrow + b;
-            #pragma unroll
-            for (int t = 0; t < MM_TOK_TILE; t++) {
-                if (t >= nt) break;
-                acc[t] = q5_0_dot(wb, xq + ((size_t)(t0 + t) * nb + b), acc[t]);
-            }
-        }
-        #pragma unroll
-        for (int t = 0; t < MM_TOK_TILE; t++) {
-            if (t >= nt) break;
-            float v = acc[t];
-            #pragma unroll
-            for (int off = MM_LANES >> 1; off > 0; off >>= 1)
-                v += __shfl_xor_sync(0xffffffff, v, off);
-            if ((threadIdx.x & (MM_LANES - 1)) == 0)
-                y[(size_t)(t0 + t) * n + row] = v;
-        }
-    }
-}
-
-
-/* Fused residual matmuls: y = W*x + residual. Quantize x once, dispatch
- * MMVQ (M=1 decode) or DP4A residual kernels (M>1). */
-extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
-                                         const float *residual_dev, float *y_dev,
-                                         int n, int k, cudaStream_t stream,
-                                         int qmajor) {
-    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
-    if (!xq_dev)
-        return;
-    /* XQ_QM follows the kernel: res-v2 only (MMVQ/v1 read original). */
-    const char *v2r = getenv("KAPPAI_DP4A_V2");
-    int use_v2r = !(v2r && *v2r == '0');
-    const char *xqmr = getenv("KAPPAI_XQ_QM");
-    int use_xqmr = (!(xqmr && *xqmr == '0') && n != 1 && use_v2r) ? 1 : 0;
-    if (use_xqmr)
-        q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
-            x_dev, (uint8_t *)xq_dev, k);
-    else
-        q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
-    if (n == 1) {
-        matmul_q8_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
-    } else {
-        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-        if (use_v2r)
-            matmul_q8_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor,
-                use_xqmr);
-        else
-            matmul_q8_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
-    }
-}
-
-extern "C" void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
-                                         const float *residual_dev, float *y_dev,
-                                         int n, int k, cudaStream_t stream,
-                                         int qmajor) {
-    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
-    if (!xq_dev)
-        return;
-    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
-    if (n == 1) {
-        matmul_q4_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
-    } else {
-        const char *v2 = getenv("KAPPAI_DP4A_V2");
-        int use_v2 = !(v2 && *v2 == '0');
-        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-        if (use_v2)
-            matmul_q4_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
-        else
-            matmul_q4_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
-    }
-}
-
-extern "C" void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
-                                         const float *residual_dev, float *y_dev,
-                                         int n, int k, cudaStream_t stream) {
-    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
-    if (!xq_dev)
-        return;
-    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
-    if (n == 1) {
-        matmul_q4_1_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q4_1_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
-    } else {
-        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-        matmul_q4_1_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q4_1_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
-    }
+extern "C" void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
+                                          const float *residual_dev, float *y_dev, int n, int k,
+                                          cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 31)) return;
+    cuda_q8_1_block *xq = q81_scratch_for(k);
+    if (!xq) return;
+    q8_1_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q5_1_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q5_1_block *)w_dev, xq, residual_dev, y_dev, n, k);
 }
 
 extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
@@ -6295,6 +6397,12 @@ extern "C" void cuda_ffn_activate_batch(const float *gate_dev, const float *up_d
     ffn_activate_batch_kernel<<<grid, block, 0, stream>>>(gate_dev, up_dev, out_dev, n, activation, m);
 }
 
+__global__ void add_batch_kernel(float *x, const float *y, int n, int m) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m * n) return;
+    x[idx] += y[idx];
+}
+
 /* Fused batched FFN activation over a pre-interleaved buffer: the engine
  * stages gate and up side by side with stride 2n per row, so this reads
  * fused[r*2n + j] and fused[r*2n + n + j] and writes out[r*n + j].
@@ -6321,12 +6429,6 @@ extern "C" void cuda_ffn_activate_fused_batch(const float *fused_dev, float *out
     const int block = 256;
     ffn_activate_fused_batch_kernel<<<(total + block - 1) / block, block, 0, stream>>>(
         fused_dev, out_dev, n, activation, m);
-}
-
-__global__ void add_batch_kernel(float *x, const float *y, int n, int m) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= m * n) return;
-    x[idx] += y[idx];
 }
 
 extern "C" void cuda_add_batch(float *x_dev, const float *y_dev, int n, int m, cudaStream_t stream) {
@@ -6677,6 +6779,44 @@ extern "C" void cuda_argmax(const float *logits_dev, int n, int32_t *out_idx_dev
 /* bit-for-bit (same lane loop + warp reduction order).               */
 /* ================================================================== */
 
+/* Batched Q8_1 quantization: Q5_1 needs the per-block `s` offset, so it
+ * cannot reuse the Q8_0 batch quantizer. Mirrors q8_0_quant_batch_kernel's
+ * row/flat-block indexing, and stores s = fp16(d * sum) like quantize_q8_1. */
+__global__ void q8_1_quant_rows_kernel(const float *__restrict__ x,
+                                       cuda_q8_1_block *__restrict__ xq,
+                                       int k, int m) {
+    const int nb = k / 32;
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= m * nb) return;
+    const int tok = b / nb;
+    const int blk = b - tok * nb;
+
+    const float *xb = x + (size_t)tok * k + (size_t)blk * 32;
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 32; j++)
+        amax = fmaxf(amax, fabsf(xb[j]));
+
+    cuda_q8_1_block *out = &xq[(size_t)tok * nb + blk];
+    if (amax < 1e-30f) {
+        out->d = 0;
+        out->s = 0;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) out->qs[j] = 0;
+        return;
+    }
+    const float d = amax / 127.0f;
+    store_half(&out->d, d);
+    int32_t sum = 0;
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        const int q = cuda_xq8_val(xb[j], d);
+        out->qs[j] = (int8_t)q;
+        sum += q;
+    }
+    store_half(&out->s, d * (float)sum);
+}
+
 __global__ void q8_0_quant_batch_kernel(const float *__restrict__ x,
                                         cuda_q8_0_block *__restrict__ xq,
                                         int k, int m) {
@@ -6712,41 +6852,6 @@ __global__ void q8_0_quant_batch_kernel(const float *__restrict__ x,
     for (int j = 0; j < 32; j++) {
         out->qs[j] = (int8_t)cuda_xq8_val(xb[j], d);
     }
-}
-
-__global__ void q8_1_quant_rows_kernel(const float *__restrict__ x,
-                                       cuda_q8_1_block *__restrict__ xq,
-                                       int k, int m) {
-    const int nb = k / 32;
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
-    if (b >= m * nb) return;
-    const int tok = b / nb;
-    const int blk = b - tok * nb;
-
-    const float *xb = x + (size_t)tok * k + (size_t)blk * 32;
-    float amax = 0.0f;
-    #pragma unroll
-    for (int j = 0; j < 32; j++)
-        amax = fmaxf(amax, fabsf(xb[j]));
-
-    cuda_q8_1_block *out = &xq[(size_t)tok * nb + blk];
-    if (amax < 1e-30f) {
-        out->d = 0;
-        out->s = 0;
-        #pragma unroll
-        for (int j = 0; j < 32; j++) out->qs[j] = 0;
-        return;
-    }
-    const float d = amax / 127.0f;
-    store_half(&out->d, d);
-    int32_t sum = 0;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        const int q = cuda_xq8_val(xb[j], d);
-        out->qs[j] = (int8_t)q;
-        sum += q;
-    }
-    store_half(&out->s, d * (float)sum);
 }
 
 
@@ -6979,6 +7084,20 @@ __global__ void matmul_f32_batch_kernel(const float *__restrict__ w, const float
     }
 }
 
+static cuda_q8_0_block *xq_scratch_for_batch(int k, int m) {
+    size_t need = (size_t)m * (size_t)(k / 32) * sizeof(cuda_q8_0_block);
+    if (need <= g_xq_cap)
+        return g_xq_scratch;
+    if (g_xq_scratch)
+        cudaFree(g_xq_scratch);
+    g_xq_scratch = nullptr;
+    g_xq_cap     = 0;
+    if (cudaMalloc((void **)&g_xq_scratch, need) != cudaSuccess)
+        return nullptr;
+    g_xq_cap = need;
+    return g_xq_scratch;
+}
+
 /* FP16 x scratch for the shadow path (grow-only, like xq scratch). */
 static __half *g_xf_scratch = nullptr;
 static size_t g_xf_cap = 0;
@@ -7115,69 +7234,6 @@ static void matmul_batch_fp16_impl(const __half *w_fp16, const float *x_dev, flo
 extern "C" void cuda_matmul_batch_fp16(const void *w_in, const float *x_dev, float *y_dev,
                                        int n, int k, int m, cudaStream_t stream) {
     matmul_batch_fp16_impl((const __half *)w_in, x_dev, y_dev, n, k, m, stream);
-}
-
-extern "C" void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev,
-                                        int n, int k, int m, cudaStream_t stream) {
-    if (n <= 0 || m <= 0 || k <= 0 || (k & 31)) return;
-    const int nb = k / 32;
-    cuda_q8_0_block *xq = xq_scratch_for_batch(k, m);
-    if (!xq) return;
-    q8_0_quant_batch_kernel<<<(((size_t)m * nb) + 255) / 256, 256, 0, stream>>>(x_dev, xq, k, m);
-    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_q5_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q5_0_block *)w_dev, xq, y_dev, n, k, m);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-extern "C" void cuda_matmul_q5_1(const void *w_dev, const float *x_dev, float *y_dev, int n,
-                                 int k, cudaStream_t stream) {
-    if (n <= 0 || k <= 0 || (k & 31)) return;
-    cuda_q8_1_block *xq = q81_scratch_for(k);
-    if (!xq) return;
-    q8_1_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
-    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_q5_1_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q5_1_block *)w_dev, xq, y_dev, n, k);
-}
-
-extern "C" void cuda_matmul_q5_1_residual(const void *w_dev, const float *x_dev,
-                                          const float *residual_dev, float *y_dev, int n, int k,
-                                          cudaStream_t stream) {
-    if (n <= 0 || k <= 0 || (k & 31)) return;
-    cuda_q8_1_block *xq = q81_scratch_for(k);
-    if (!xq) return;
-    q8_1_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
-    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_q5_1_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q5_1_block *)w_dev, xq, residual_dev, y_dev, n, k);
-}
-
-extern "C" void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev,
-                                        int n, int k, int m, cudaStream_t stream) {
-    if (n <= 0 || m <= 0 || k <= 0 || (k & 31)) return;
-    const int nb = k / 32;
-    cuda_q8_1_block *xq = q81_scratch_for((size_t)m * (size_t)k);
-    if (!xq) return;
-    /* Quantize each row of the m x k activation matrix into its own block run. */
-    const int total = (int)(((size_t)m * nb + 255) / 256) * 256;
-    dim3 g(total / 256);
-    q8_1_quant_rows_kernel<<<g, 256, 0, stream>>>(x_dev, xq, k, m);
-    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_q5_1_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q5_1_block *)w_dev, xq, y_dev, n, k, m);
 }
 
 extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, float *y_dev,
@@ -9697,26 +9753,53 @@ extern "C" void cuda_embd_lookup_q8_0_g(const cuda_q8_0_block *embd_dev, float *
 
 
 
-extern "C" void cuda_matmul_iq4_nl_safe_launch(const uint8_t *w, const float *x,
-                                                float *y, int n, int k,
-                                                cudaStream_t stream) {
-    int blocks = (n + 255) / 256;
-    matmul_iq4_nl_safe_kernel<<<blocks, 256, 0, stream>>>(w, x, y, n, k);
+/* ------------------------------------------------------------------ */
+/* IQ4_NL host-side launchers                                          */
+/* ------------------------------------------------------------------ */
+
+extern "C" void cuda_matmul_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev, int n,
+                                   int k, cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 31))
+        return;
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    if (n == 1) {
+        /* Decode: one row, so spread the k-blocks across all threads. */
+        matmul_iq4_nl_mmvq_kernel<<<1, MMVQ_NWARPS * 32, 0, stream>>>(
+            (const cuda_iq4_nl_block *)w_dev, xq_dev, y_dev, n, k);
+    } else {
+        dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+        matmul_iq4_nl_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+            (const cuda_iq4_nl_block *)w_dev, xq_dev, y_dev, n, k);
+    }
 }
 
-extern "C" void cuda_matmul_iq4_nl_fast_launch(const uint8_t *w, const float *x,
-                                                float *y, int n, int k,
-                                                cudaStream_t stream) {
-    dim3 grid(n);
-    dim3 block(256);
-    matmul_iq4_nl_fast_kernel<<<grid, block, 0, stream>>>(w, x, y, n, k);
+extern "C" void cuda_matmul_iq4_nl_residual(const void *w_dev, const float *x_dev,
+                                            const float *residual_dev, float *y_dev, int n, int k,
+                                            cudaStream_t stream) {
+    if (n <= 0 || k <= 0 || (k & 31))
+        return;
+    cuda_q8_0_block *xq_dev = xq_scratch_for(k);
+    if (!xq_dev)
+        return;
+    q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_iq4_nl_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_iq4_nl_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
 }
+
 
 
 /* Batched FFN down kernel launchers. */
 extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
                                            const float *up_dev, float *y_dev, int n, int k,
                                            int m, cudaStream_t stream, int qmajor) {
+    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
+     * per token -- so this scratch must cover all m rows. Sizing it for a single
+     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
+     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9724,6 +9807,10 @@ extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float
     act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
         gate_dev, up_dev, act_q, k, m);
 
+    /* Grid is over output ROWS (n), not tokens (m): each warp owns one row and a
+     * block covers MM_ROWS_PER_BLOCK rows. Sizing it with m left rows >= 8*m
+     * unwritten (they stayed zero), which produced garbage on every model whose
+     * FFN down-projection has more output rows than prompt tokens. */
     matmul_q8_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m, 0);
@@ -9732,6 +9819,10 @@ extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float
 extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
                                               const float *up_dev, float *y_dev, int n, int k,
                                               int m, cudaStream_t stream, int qmajor) {
+    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
+     * per token -- so this scratch must cover all m rows. Sizing it for a single
+     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
+     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9739,6 +9830,7 @@ extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const fl
     act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
         (const float *)gate_dev, (const float *)up_dev, act_q, k, m);
 
+    /* Grid over output rows (n), not tokens -- see cuda_matmul_ffn_down_batch_launch. */
     matmul_q4_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q4_0_block *)w_dev, (const cuda_q8_0_block *)act_q,
@@ -9748,6 +9840,10 @@ extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const fl
 extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
                                                 const float *up_dev, float *y_dev, int n, int k,
                                                 int m, cudaStream_t stream) {
+    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
+     * per token -- so this scratch must cover all m rows. Sizing it for a single
+     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
+     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9757,9 +9853,8 @@ extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const 
 
     /* m>1 must use the *batched* Q4_1 kernel: matmul_q4_1_dp4a_kernel takes no
      * token count, so calling it here dropped every row past the first. It also
-     * had to read the batched activation scratch, not xq_scratch_for(k). The
-     * MMVQ branch that used to handle m==1 here read that single-row scratch and
-     * so missed the activation's per-row scaling factor. */
+     * had to read the batched activation scratch, not xq_scratch_for(k). */
+    /* Grid over output rows (n), not tokens -- see cuda_matmul_ffn_down_batch_launch. */
     matmul_q4_1_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                     MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q4_1_block *)w_dev, act_q, y_dev, n, k, m);
@@ -9878,49 +9973,49 @@ extern "C" void cuda_kv_put_mla(const float *k_in, const float *v_in,
     /* TODO: Implement MLA KV put */
 }
 
-/* ===================================================================== */
-/* IQ4_NL Optimized Kernel (Revisited)                                   */
-/* ===================================================================== */
 
-__global__ void matmul_iq4_nl_opt_kernel(const uint8_t *__restrict__ w,
-                                          const float *__restrict__ x,
-                                          float *__restrict__ y, int n, int k) {
-    int row = blockIdx.x;
-    if (row >= n) return;
+/* Batched IQ4_NL / Q6_K launchers. Placed at the end of the file so they can
+ * see the batched Q8_0 / Q8_K quantizers and their scratch allocators. */
 
-    int tid = threadIdx.x;
-    const int blocks_per_row = k / 32;
-    const uint8_t *w_row = w + row * (k / 32) * 18;
-
-    float acc = 0.0f;
-    for (int b = threadIdx.x; b < k / 32; b += blockDim.x) {
-        const uint8_t *block = w_row + b * 18;
-        uint16_t scale_bits = block[0] | (block[1] << 8);
-        float scale = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-
-        const uint8_t *quants = block + 2;
-        float block_sum = 0.0f;
-        for (int j = 0; j < 32; j++) {
-            uint8_t byte = quants[j / 2];
-            int idx = (j & 1) == 0 ? (byte & 0xF) : (byte >> 4);
-            block_sum += cuda_kvalues_iq4nl[idx] * scale * x[b * 32 + j];
-        }
-        acc += block_sum;
-    }
-
-    /* Block-level reduction using shared memory */
-    __shared__ float sdata[256];
-    sdata[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            sdata[threadIdx.x] += sdata[threadIdx.x + s];
-        }
-        __syncthreads();
-    }
-
-    if (threadIdx.x == 0)
-        y[row] = sdata[0];
+extern "C" void cuda_matmul_batch_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev,
+                                         int n, int k, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0 || k <= 0 || (k & 31))
+        return;
+    const int nb = k / 32;
+    cuda_q8_0_block *xq = xq_scratch_for_batch(k, m);
+    if (!xq)
+        return;
+    q8_0_quant_batch_kernel<<<(((size_t)m * nb) + 255) / 256, 256, 0, stream>>>(x_dev, xq, k, m);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_iq4_nl_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_iq4_nl_block *)w_dev, xq, y_dev, n, k, m);
 }
 
+/* Batched Q5_0 / Q5_1 / Q5_K / IQ3_S launchers. At the end of the file so they
+ * can see the batched quantizers and their scratch allocators. */
+extern "C" void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev,
+                                        int n, int k, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0 || k <= 0 || (k & 31)) return;
+    const int nb = k / 32;
+    cuda_q8_0_block *xq = xq_scratch_for_batch(k, m);
+    if (!xq) return;
+    q8_0_quant_batch_kernel<<<(((size_t)m * nb) + 255) / 256, 256, 0, stream>>>(x_dev, xq, k, m);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q5_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q5_0_block *)w_dev, xq, y_dev, n, k, m);
+}
+
+extern "C" void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, float *y_dev,
+                                        int n, int k, int m, cudaStream_t stream) {
+    if (n <= 0 || m <= 0 || k <= 0 || (k & 31)) return;
+    const int nb = k / 32;
+    cuda_q8_1_block *xq = q81_scratch_for((size_t)m * (size_t)k);
+    if (!xq) return;
+    /* Quantize each row of the m x k activation matrix into its own block run. */
+    const int total = (int)(((size_t)m * nb + 255) / 256) * 256;
+    dim3 g(total / 256);
+    q8_1_quant_rows_kernel<<<g, 256, 0, stream>>>(x_dev, xq, k, m);
+    dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
+    matmul_q5_1_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
+        (const cuda_q5_1_block *)w_dev, xq, y_dev, n, k, m);
+}
