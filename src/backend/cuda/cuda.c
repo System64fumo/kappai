@@ -37,8 +37,6 @@
 /* The quad-major relayout types are declared in cuda_internal.h rather than the
  * shared ggml.h enum, so they stay private to this backend. Alias them to the
  * names the rest of this file uses. */
-#define GGML_TYPE_Q8_0_QM CUDA_GGML_TYPE_Q8_0_QM
-#define GGML_TYPE_Q4_0_QM CUDA_GGML_TYPE_Q4_0_QM
 
 /* Lazy D2H is always enabled; env vars removed per review. */
 static int cuda_lazy_d2h(void) {
@@ -248,16 +246,13 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
      * reach a fallback inside the engine.
      *
      * So the correct default on main is to upload weights verbatim and let the
-     * CUDA kernels dequantize them. Enabling either transform is a deliberate
+     * CUDA kernels dequantize them. Enabling the promotion is a deliberate
      * performance experiment that requires every consumer of the weight to stay
      * on this backend:
      *   KAPPAI_Q4_TO_Q8=1   lossless Q4_0 -> Q8_0 promotion
-     *   KAPPAI_QMAJOR=1     quad-major byte order for Q8_0 / Q4_0
      */
     const char *q4q8_env = getenv("KAPPAI_Q4_TO_Q8");
-    const char *qm_env    = getenv("KAPPAI_QMAJOR");
     int         want_conv = q4q8_env && *q4q8_env == '1';
-    int         want_qm   = qm_env && *qm_env == '1';
 
     void       *converted = NULL;
     const void *host_data = desc->host_data;
@@ -272,23 +267,7 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
         }
     }
 
-    void *qm_data = NULL;
-    if (want_qm && desc->n_dims == 2 && k > 0 && (k % 32) == 0 &&
-        (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0)) {
-        size_t total = (size_t)n_rows * (k / 32) * ((type == GGML_TYPE_Q8_0) ? 34 : 18);
-        qm_data      = xmalloc_aligned(total, 64);
-        if (qm_data) {
-            if (type == GGML_TYPE_Q8_0)
-                cuda_repack_q8_0_qm_rows(host_data, qm_data, 0, n_rows, k);
-            else
-                cuda_repack_q4_0_qm_rows(host_data, qm_data, 0, n_rows, k);
-            host_data = qm_data;
-            type      = (type == GGML_TYPE_Q8_0) ? GGML_TYPE_Q8_0_QM : GGML_TYPE_Q4_0_QM;
-        }
-    }
-
     status_code st = cuda_upload_weight(self, host_data, type, k, n_rows, out);
-    free(qm_data);
     free(converted);
     return st;
 }
@@ -297,10 +276,8 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
                                       int n_rows, buffer *out) {
     size_t row_bytes;
     switch (type) {
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_0_QM: row_bytes = (size_t)(k / 32) * 34; break;
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_QM: row_bytes = (size_t)(k / 32) * 18; break;
+        case GGML_TYPE_Q8_0: row_bytes = (size_t)(k / 32) * 34; break;
+        case GGML_TYPE_Q4_0: row_bytes = (size_t)(k / 32) * 18; break;
         case GGML_TYPE_Q4_1: row_bytes = (size_t)(k / 32) * 20; break;
         case GGML_TYPE_F32:  row_bytes = (size_t)k * 4;         break;
         case GGML_TYPE_F16:
@@ -325,10 +302,10 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
                 out->owner   = self;
                 cuda_host_alloc_note(w_host, 0);
                 /* Record what was actually stored: if this upload relaid the
-                 * bytes (Q4_0->Q8_0, quad-major), the engine still tags the
-                 * weight with the model's declared type, so the matmul entry
-                 * points must prefer this record. */
-                if (type == GGML_TYPE_Q8_0_QM || type == GGML_TYPE_Q4_0_QM)
+                 * bytes (Q4_0->Q8_0), the engine still tags the weight with the
+                 * model's declared type, so the matmul entry points must
+                 * prefer this record. */
+                if (0 )
                     cuda_weight_type_note(w_dev, type);
                 return OK;
             }
@@ -346,7 +323,7 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
     out->offset  = 0;
     out->host_ptr = NULL;
     out->owner   = self;
-    if (type == GGML_TYPE_Q8_0_QM || type == GGML_TYPE_Q4_0_QM)
+    if (0 )
         cuda_weight_type_note(w_managed, type);
     return OK;
 }
@@ -590,9 +567,7 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
     (void)self;
     switch (w_type) {
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_0_QM:
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_QM:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
@@ -610,20 +585,9 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
     }
 }
 
-/* QM guard: quad-major buffers must never reach host fallback (CPU has no
- * QM readers; its dequant/matmul defaults would silently emit wrong data). */
-static int cuda_w_is_qmajor(uint32_t w_type) {
-    return w_type == GGML_TYPE_Q8_0_QM || w_type == GGML_TYPE_Q4_0_QM;
-}
-
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
-                                const buffer *x, buffer *y, int n, int k) {
-    if (cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_MATMUL")) {
-        fprintf(stderr, "cuda: Q8_0_QM weight reached host matmul fallback (unsupported)\n");
-        return ERR_UNSUPPORTED;
-    }
-    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+                                const buffer *x, buffer *y, int n, int k) {    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -656,14 +620,10 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
 
     switch (w_type) {
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_0_QM:
-            cuda_matmul_q8_0(w_dev, x_dev, y_dev, n, k, stream,
-                             w_type == GGML_TYPE_Q8_0_QM);
+            cuda_matmul_q8_0(w_dev, x_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_QM:
-            cuda_matmul_q4_0(w_dev, x_dev, y_dev, n, k, stream,
-                             w_type == GGML_TYPE_Q4_0_QM);
+            cuda_matmul_q4_0(w_dev, x_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_Q4_1:
             cuda_matmul_q4_1(w_dev, x_dev, y_dev, n, k, stream);
@@ -741,12 +701,7 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
  * add_inplace kernel launch + global memory round-trip per layer. */
 static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
                                         const buffer *x, const buffer *residual, buffer *y,
-                                        int n, int k) {
-    if (cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_MATMUL")) {
-        fprintf(stderr, "cuda: Q8_0_QM weight reached host residual fallback (unsupported)\n");
-        return ERR_UNSUPPORTED;
-    }
-    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+                                        int n, int k) {    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul_residual) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -782,14 +737,10 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
 
     switch (w_type) {
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_0_QM:
-            cuda_matmul_q8_0_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream,
-                                      w_type == GGML_TYPE_Q8_0_QM);
+            cuda_matmul_q8_0_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_QM:
-            cuda_matmul_q4_0_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream,
-                                      w_type == GGML_TYPE_Q4_0_QM);
+            cuda_matmul_q4_0_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
             break;
         case GGML_TYPE_Q4_1:
             cuda_matmul_q4_1_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
@@ -838,13 +789,11 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
                                         int k, int activation) {
     /* Same weight-type override as cuda_op_matmul_batch: the engine tags the
      * weight with the model's declared type, but a relaid weight is stored in
-     * a layout only the QM kernels can read. */
+     * a layout only the promoted-Q8_0 kernels can read. */
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
-    /* Quad-major: native CUDA only -- CPU has no QM readers, so every
-     * host path below is skipped for QM (routed to the native Q8 branch). */
-    if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
+    if (activation != ACTIVATION_GELU) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
             size_t wb = w->size, gb = (size_t)k * sizeof(float),
@@ -869,8 +818,7 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         }
         return ERR_UNSUPPORTED;
     }
-    if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q8_0_QM && w_type != GGML_TYPE_Q4_0 &&
-        w_type != GGML_TYPE_Q4_0_QM && w_type != GGML_TYPE_Q4_1) {
+    if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q4_0 && w_type != GGML_TYPE_Q4_1) {
         /* Exotic quant (Q4_K/Q6_K/...): host fallback + device refresh. */
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
@@ -896,7 +844,7 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         }
         return ERR_UNSUPPORTED;
     }
-    if (!cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
+    if (getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
             size_t wb = w->size, gb = (size_t)k * sizeof(float),
@@ -932,14 +880,12 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     const float *up_dev = (const float *)cuda_dev_ptr((buffer *)up);
     float *y_dev = (float *)cuda_dev_ptr(y);
 
-    if (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_0_QM) {
-        cuda_matmul_ffn_down_q4(w_dev, gate_dev, up_dev, y_dev, n, k, stream,
-                                w_type == GGML_TYPE_Q4_0_QM);
+    if (w_type == GGML_TYPE_Q4_0 ) {
+        cuda_matmul_ffn_down_q4(w_dev, gate_dev, up_dev, y_dev, n, k, stream);
     } else if (w_type == GGML_TYPE_Q4_1) {
         cuda_matmul_ffn_down_q4_1(w_dev, gate_dev, up_dev, y_dev, n, k, stream);
     } else {
-        cuda_matmul_ffn_down(w_dev, gate_dev, up_dev, y_dev, n, k, stream,
-                             w_type == GGML_TYPE_Q8_0_QM);
+        cuda_matmul_ffn_down(w_dev, gate_dev, up_dev, y_dev, n, k, stream);
     }
 
     if (!cuda_lazy_d2h_for("ffndown") && y->host_ptr) {
@@ -958,7 +904,7 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
     if (stored != (uint32_t)-1)
         w_type = stored;
 
-    if (!cuda_w_is_qmajor(w_type) && activation != ACTIVATION_GELU) {
+    if (activation != ACTIVATION_GELU) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down_batch) {
             size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
@@ -983,8 +929,7 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
         }
         return ERR_UNSUPPORTED;
     }
-    if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q8_0_QM && w_type != GGML_TYPE_Q4_0 &&
-        w_type != GGML_TYPE_Q4_0_QM && w_type != GGML_TYPE_Q4_1) {
+    if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q4_0 && w_type != GGML_TYPE_Q4_1) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down_batch) {
             size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
@@ -1009,7 +954,7 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
         }
         return ERR_UNSUPPORTED;
     }
-    if (!cuda_w_is_qmajor(w_type) && getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
+    if (getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
         backend *host = backend_host();
         if (host && host->matmul_ffn_down_batch) {
             size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
@@ -1038,20 +983,17 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
-    int qmajor = cuda_w_is_qmajor(w_type);
-
     const void *w_dev = cuda_dev_ptr((buffer *)w);
     const float *gate_dev = (const float *)cuda_dev_ptr((buffer *)gate);
     const float *up_dev = (const float *)cuda_dev_ptr((buffer *)up);
     float *y_dev = (float *)cuda_dev_ptr(y);
 
-    if (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_0_QM) {
-        cuda_matmul_ffn_down_q4_batch_launch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream, qmajor);
+    if (w_type == GGML_TYPE_Q4_0 ) {
+        cuda_matmul_ffn_down_q4_batch_launch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream);
     } else if (w_type == GGML_TYPE_Q4_1) {
         cuda_matmul_ffn_down_q4_1_batch_launch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream);
     } else {
-        cuda_matmul_ffn_down_batch_launch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream,
-                                   w_type == GGML_TYPE_Q8_0_QM);
+        cuda_matmul_ffn_down_batch_launch(w_dev, gate_dev, up_dev, y_dev, n, k, m, stream);
     }
 
     if (!cuda_lazy_d2h_for("ffndown") && y->host_ptr) {
@@ -1249,12 +1191,7 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     }
     w_types = eff_types;
 
-    for (int c = 0; c < n_matmuls; c++)
-        if (cuda_w_is_qmajor(w_types[c]) && getenv("KAPPAI_CUDA_HOST_MULTI")) {
-            fprintf(stderr, "cuda: Q8_0_QM weight reached host multi fallback (unsupported)\n");
-            return ERR_UNSUPPORTED;
-        }
-    if (getenv("KAPPAI_CUDA_HOST_MULTI")) {
+    for (int c = 0; c < n_matmuls; c++)    if (getenv("KAPPAI_CUDA_HOST_MULTI")) {
         backend *host = backend_host();
         if (host && host->matmul_multi) {
             status_code st = host->matmul_multi(host, w, w_types, x, y, n_list, k, n_matmuls);
@@ -1316,12 +1253,10 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
     if (getenv("KAPPAI_CUDA_MULTI_SINGLE")) {
         for (int c = 0; c < n_matmuls; c++) {
-            if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
-                cuda_matmul_q8_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream,
-                                 first == GGML_TYPE_Q8_0_QM);
-            else if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
-                cuda_matmul_q4_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream,
-                                 first == GGML_TYPE_Q4_0_QM);
+            if (first == GGML_TYPE_Q8_0 )
+                cuda_matmul_q8_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream);
+            else if (first == GGML_TYPE_Q4_0 )
+                cuda_matmul_q4_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream);
             else
                 return ERR_UNSUPPORTED;
         }
@@ -1334,12 +1269,10 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
         }
         return OK;
     }
-    if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
-        cuda_matmul_multi_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream,
-                               first == GGML_TYPE_Q8_0_QM);
-    else if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
-        cuda_matmul_multi_q4_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream,
-                               first == GGML_TYPE_Q4_0_QM);
+    if (first == GGML_TYPE_Q8_0 )
+        cuda_matmul_multi_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream);
+    else if (first == GGML_TYPE_Q4_0 )
+        cuda_matmul_multi_q4_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream);
     else {
         /* Uniform but unfused type (Q4_K/Q4_1/F32/F16/BF16): degrade to
          * per-column singles, mirroring the mixed-type path above. */
@@ -1360,12 +1293,10 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
                 free(ref_host);
                 continue;
             }
-            if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
-                cuda_matmul_q8_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream,
-                                 first == GGML_TYPE_Q8_0_QM);
-            else if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
-                cuda_matmul_q4_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream,
-                                 first == GGML_TYPE_Q4_0_QM);
+            if (first == GGML_TYPE_Q8_0 )
+                cuda_matmul_q8_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream);
+            else if (first == GGML_TYPE_Q4_0 )
+                cuda_matmul_q4_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream);
             cudaMemcpy(ref_host, ref_dev, (size_t)n_list[c] * sizeof(float), cudaMemcpyDeviceToHost);
             cudaFree(ref_dev);
             if (y[c]->host_ptr) {
@@ -1428,12 +1359,12 @@ static status_code cuda_matmul_multi_batch(backend *self, const buffer **w, cons
         n_list_copy[c] = n_list[c];
     }
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
-    if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
+    if (first == GGML_TYPE_Q4_0 )
         cuda_matmul_multi_batch_q4_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, m, NULL,
-                                     stream, first == GGML_TYPE_Q4_0_QM);
-    else if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
+                                     stream);
+    else if (first == GGML_TYPE_Q8_0 )
         cuda_matmul_multi_batch_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, m, NULL,
-                                     stream, first == GGML_TYPE_Q8_0_QM);
+                                     stream);
     else {
         for (int c = 0; c < n_matmuls; c++) {
             status_code st = cuda_op_matmul_batch(self, w[c], w_types[c], x, y[c], n_list[c], k, m);
@@ -1481,12 +1412,12 @@ static status_code cuda_matmul_multi_batch_resid(backend *self, const buffer **w
     }
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
     const float *resid_dev = resid ? (const float *)cuda_dev_ptr((buffer *)resid) : NULL;
-    if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
+    if (first == GGML_TYPE_Q4_0 )
         cuda_matmul_multi_batch_q4_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, m, resid_dev,
-                                     stream, first == GGML_TYPE_Q4_0_QM);
-    else if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
+                                     stream);
+    else if (first == GGML_TYPE_Q8_0 )
         cuda_matmul_multi_batch_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, m, resid_dev,
-                                     stream, first == GGML_TYPE_Q8_0_QM);
+                                     stream);
     else {
         /* Degrade: stash resid aside (it may alias y), then per-column. */
         const float *rd = NULL;
@@ -1554,8 +1485,7 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
     /* Non-native or mixed types: degrade to separate rmsnorm + per-column
      * singles, which have host fallback + refresh. */
     uint32_t first = w_types[0];
-    if (first != GGML_TYPE_Q8_0 && first != GGML_TYPE_Q8_0_QM && first != GGML_TYPE_Q4_0 &&
-        first != GGML_TYPE_Q4_0_QM && first != GGML_TYPE_Q4_1)
+    if (first != GGML_TYPE_Q8_0 && first != GGML_TYPE_Q4_0 && first != GGML_TYPE_Q4_1)
         return ERR_UNSUPPORTED;
     for (int c = 0; c < n_matmuls; c++)
         if (w_types[c] != first)
@@ -1612,14 +1542,12 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
     const float *nw_dev = norm_w ? (const float *)cuda_dev_ptr((buffer *)norm_w) : NULL;
 
-    if (first == GGML_TYPE_Q8_0 || first == GGML_TYPE_Q8_0_QM)
+    if (first == GGML_TYPE_Q8_0 )
         cuda_rmsnorm_matmul_multi_q8_0(w_dev, y_dev, n_list_copy, x_dev, nw_dev,
-                                       n_matmuls, k, eps, stream,
-                                       first == GGML_TYPE_Q8_0_QM);
-    else if (first == GGML_TYPE_Q4_0 || first == GGML_TYPE_Q4_0_QM)
+                                       n_matmuls, k, eps, stream);
+    else if (first == GGML_TYPE_Q4_0 )
         cuda_rmsnorm_matmul_multi_q4_0(w_dev, y_dev, n_list_copy, x_dev, nw_dev,
-                                       n_matmuls, k, eps, stream,
-                                       first == GGML_TYPE_Q4_0_QM);
+                                       n_matmuls, k, eps, stream);
     else if (first == GGML_TYPE_Q4_1)
         cuda_rmsnorm_matmul_multi_q4_1(w_dev, y_dev, n_list_copy, x_dev, nw_dev,
                                        n_matmuls, k, eps, stream);
@@ -2748,14 +2676,10 @@ static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t
     float *y_dev = (float *)cuda_dev_ptr(y);
     switch (w_type) {
         case GGML_TYPE_Q8_0:
-        case GGML_TYPE_Q8_0_QM:
-            cuda_matmul_batch_q8_0(w_dev, x_dev, y_dev, n, k, m, priv->stream,
-                                   w_type == GGML_TYPE_Q8_0_QM);
+            cuda_matmul_batch_q8_0(w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_0_QM:
-            cuda_matmul_batch_q4_0(w_dev, x_dev, y_dev, n, k, m, priv->stream,
-                                   w_type == GGML_TYPE_Q4_0_QM);
+            cuda_matmul_batch_q4_0(w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         case GGML_TYPE_Q4_1:
             cuda_matmul_batch_q4_1(w_dev, x_dev, y_dev, n, k, m, priv->stream);

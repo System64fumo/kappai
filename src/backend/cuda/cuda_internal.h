@@ -21,13 +21,6 @@
  * to give the Q4_0/Q8_0 GEMV kernels a coalesced byte order, and never appear in
  * a GGUF file. Upstream keeps them in the shared gguf.h enum; they are declared
  * here instead so the CUDA backend does not have to widen the shared type list.
- * The numeric values continue the 0x40+ internal-repack range (Q8_0_QM 0x4A,
- * Q4_0_QM 0x4B) and must not collide with a type the engine can actually see. */
-enum {
-	CUDA_GGML_TYPE_Q8_0_QM = 0x4A,
-	CUDA_GGML_TYPE_Q4_0_QM = 0x4B,
-};
-
 /*
  * Per-buffer bookkeeping that the shared `buffer` struct does not carry.
  *
@@ -62,7 +55,7 @@ void  cuda_host_alloc_forget(void *host_ptr);
  * uploads verbatim, but this backend also relayouts some weights at upload
  * time (Q4_0 -> Q8_0 promotion, then the quad-major byte order). The engine
  * never learns about that, so it would hand the matmul a Q8_0 tag for data that
- * is actually Q8_0_QM and the wrong kernel would read it.
+ * is actually Q8_0 and the wrong kernel would read it.
  *
  * Upstream avoids this by rewriting the type in model.c, which the engine here
  * does not do. Instead the backend records what it actually stored and the
@@ -84,12 +77,10 @@ typedef struct {
 	int8_t   qs[32];
 } cuda_q8_0_block;
 
-/* Q8_0 quad-major (QM) relayout -- GGML_TYPE_Q8_0_QM. THE layout spec.
+/* Q8_0 quad-major (QM) layout, used only for the quantized x operand.
  *
- * Same 34B/32e geometry as Q8_0 (nb*34 row stride shared, so buffer sizes,
- * row_bytes, and VRAM estimates are IDENTICAL; only byte ORDER differs).
- * Writer: repack_q8_0_row_qmajor (src/model.c). Readers: all Q8_0 CUDA
- * kernels take `int qmajor` (0 = original, 1 = QM).
+ * Same 34B/32e geometry as Q8_0 (nb*34 row stride, so buffer sizes and
+ * VRAM estimates are IDENTICAL; only byte ORDER differs).
  *
  * A row of nb = k/32 blocks is stored as nb groups of 34 bytes. Group g
  * covers blocks [g*G, g*G+G) with G = 32 (tail group may be shorter).
@@ -105,14 +96,7 @@ typedef struct {
  * Tail group (nb % 32 != 0): same pattern with G' = nb % 32.
  * Dequant identity: qval(b,i) == qval_qm(b,i) for every element.
  *
- * Invariants: embeddings/KV/x-quant scratch are NEVER repacked (class and
- * system separation in model.c upload); CPU must never see QM buffers
- * (host-fallback sites reject loudly); files never contain QM.
- *
- * Q4_0 quad-major (GGML_TYPE_Q4_0_QM) follows the same pattern with
- * 18B blocks: group of G blocks -> 2*G scale bytes, then 16 byte
- * planes of G bytes (qs byte j of block r at 2*G + j*G + r).
- * Nibble unpacking is unchanged (kernel-specific). Same 2B rule. */
+ * Weights are never repacked: only the x scratch buffer uses this order. */
 #define Q8_0_QM_GROUP 32
 
 /* Q8_1 block: one dequant scale (F16) + one sum (F16) + 32 signed-quantized values.
@@ -246,18 +230,13 @@ void cuda_quantize_f32_to_q4_0(const float *x_dev, cuda_q4_0_block *xq_dev, int 
 /* Quantize an F32 buffer of length k into Q8_K blocks on the device. */
 void cuda_quantize_f32_to_q8_k(const float *x_dev, cuda_q8_k_block *xq_dev, int k);
 
-/* Q8_0 weight matmul: quantizes x internally (Q8_0), then y = W * x.
- * qmajor: 1 = weight buffer is quad-major relayout (GGML_TYPE_Q8_0_QM),
- * 0 = original Q8_0 order. Readers land in A2; A0 threads the flag. */
+/* Q8_0 weight matmul: quantizes x internally (Q8_0), then y = W * x. */
 void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                      cudaStream_t stream, int qmajor);
+                      cudaStream_t stream);
 
-
-
-/* Q4_0 weight matmul: quantizes x internally (Q8_0), then y = W * x.
- * qmajor: 1 = quad-major relayout (GGML_TYPE_Q4_0_QM), 0 = original. */
+/* Q4_0 weight matmul: quantizes x internally (Q8_0), then y = W * x. */
 void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                      cudaStream_t stream, int qmajor);
+                      cudaStream_t stream);
 
 /* F32 weight matmul. */
 void cuda_matmul_f32(const float *w_dev, const float *x_dev, float *y_dev, int n, int k,
@@ -296,13 +275,11 @@ void cuda_rmsnorm_rope(const float *x_dev, const float *w_dev, float *y_dev,
  * y = W * (gelu_tanh(gate) * up).  The activation is folded into the Q8_0
  * quantization of the input so no host round-trip is needed. */
 void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, const float *up_dev,
-                          float *y_dev, int n, int k, cudaStream_t stream,
-                          int qmajor);
+                          float *y_dev, int n, int k, cudaStream_t stream);
 
 /* Same fused GELU down-projection with Q4_0 down-weights. */
 void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev, const float *up_dev,
-                             float *y_dev, int n, int k, cudaStream_t stream,
-                             int qmajor);
+                             float *y_dev, int n, int k, cudaStream_t stream);
 
 /* Same fused GELU down-projection with Q4_1 down-weights. */
 void cuda_matmul_ffn_down_q4_1(const void *w_dev, const float *gate_dev, const float *up_dev,
@@ -316,10 +293,10 @@ void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y_dev, int n
  * MMVQ (M=1) or DP4A residual kernels (M>1). */
 void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
-                               int n, int k, cudaStream_t stream, int qmajor);
+                               int n, int k, cudaStream_t stream);
 void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
-                               int n, int k, cudaStream_t stream, int qmajor);
+                               int n, int k, cudaStream_t stream);
 void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
                                const float *residual_dev, float *y_dev,
                                int n, int k, cudaStream_t stream);
@@ -346,10 +323,10 @@ extern "C" {
 #endif
 void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
                                        const float *up_dev, float *y_dev, int n, int k,
-                                       int m, cudaStream_t stream, int qmajor);
+                                       int m, cudaStream_t stream);
 void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
                                           const float *up_dev, float *y_dev, int n, int k,
-                                          int m, cudaStream_t stream, int qmajor);
+                                          int m, cudaStream_t stream);
 void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
                                             const float *up_dev, float *y_dev, int n, int k,
                                             int m, cudaStream_t stream);
@@ -378,8 +355,6 @@ status_code cuda_moe_down_proj(const void *w_dev, uint32_t w_type, const float *
 status_code cuda_moe_scale_accum(float *out, const float *src, int n_rows, int dim,
                                   float weight, float down_scale, cudaStream_t stream);
 
-
-
 /* Q4_K weight matmul: quantizes x internally (Q8_K), then y = W * x. */
 void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                       cudaStream_t stream);
@@ -404,22 +379,20 @@ void cuda_matmul_batch_q6_k(const void *w_dev, const float *x_dev, float *y_dev,
  * w_dev/y_dev are device pointer arrays of length nm, n_host holds the
  * number of output rows per column, k is the shared input width. */
 void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev, const int *n_host,
-                             const float *x_dev, int nm, int k, cudaStream_t stream,
-                             int qmajor);
+                             const float *x_dev, int nm, int k, cudaStream_t stream);
 void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y_dev, const int *n_host,
-                             const float *x_dev, int nm, int k, cudaStream_t stream,
-                             int qmajor);
+                             const float *x_dev, int nm, int k, cudaStream_t stream);
 
 /* Fused RMSNorm + Multi-MatMul: single kernel does RMSNorm(x), quantize
  * to Q8_0 in shared memory, then multi-column matmul. */
 void cuda_rmsnorm_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev,
                                     const int *n_host, const float *x_dev,
                                     const float *norm_w_dev, int nm, int k,
-                                    float eps, cudaStream_t stream, int qmajor);
+                                    float eps, cudaStream_t stream);
 void cuda_rmsnorm_matmul_multi_q4_0(const void *const *w_dev, float *const *y_dev,
                                     const int *n_host, const float *x_dev,
                                     const float *norm_w_dev, int nm, int k,
-                                    float eps, cudaStream_t stream, int qmajor);
+                                    float eps, cudaStream_t stream);
 void cuda_rmsnorm_matmul_multi_q4_1(const void *const *w_dev, float *const *y_dev,
                                     const int *n_host, const float *x_dev,
                                     const float *norm_w_dev, int nm, int k,
@@ -591,13 +564,13 @@ void cuda_rope_qk_batch(float *q_dev, float *k_dev, int n_heads, int n_kv_heads,
 
 /* True batched matmul (prefill): M rows in one launch. */
 void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, float *y_dev,
-                             int n, int k, int m, cudaStream_t stream, int qmajor);
+                             int n, int k, int m, cudaStream_t stream);
 /* Pure-FP16 WMMA batch GEMM over an fp16_shadow (prefill). No dequant;
  * arithmetic differs from the quant path (exactness gated). */
 void cuda_matmul_batch_fp16(const void *w_dev, const float *x_dev, float *y_dev,
                             int n, int k, int m, cudaStream_t stream);
 void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, float *y_dev,
-                             int n, int k, int m, cudaStream_t stream, int qmajor);
+                             int n, int k, int m, cudaStream_t stream);
 void cuda_matmul_batch_q4_1(const void *w_dev, const float *x_dev, float *y_dev,
                              int n, int k, int m, cudaStream_t stream);
 void cuda_matmul_batch_f32(const float *w_dev, const float *x_dev, float *y_dev,
@@ -652,12 +625,10 @@ void cuda_rmsnorm_add_batch(const float *x_dev, const float *w_dev,
  * resid_dev adds a fused residual (NULL = none). */
 void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *const *y_dev,
                                   const int *n_host, const float *x_dev, int nm, int k,
-                                  int m, const float *resid_dev, cudaStream_t stream,
-                                  int qmajor);
+                                  int m, const float *resid_dev, cudaStream_t stream);
 void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *const *y_dev,
                                   const int *n_host, const float *x_dev, int nm, int k,
-                                  int m, const float *resid_dev, cudaStream_t stream,
-                                  int qmajor);
+                                  int m, const float *resid_dev, cudaStream_t stream);
 
 /* Decode-graph (_g) variants: pos/token/n_pos from device params struct.
  * Bodies mirror the base kernels exactly; only index sources differ. */

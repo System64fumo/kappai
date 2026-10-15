@@ -270,8 +270,6 @@ static __device__ __forceinline__ uint16_t qm_q8_scale(const uint8_t *wrow8, int
 static __device__ __forceinline__ int32_t qm_q8_quad(const uint8_t *wrow8, int nb, int b, int t);
 static __device__ __forceinline__ int qm_q8_val(const uint8_t *wrow8, int nb, int b, int j);
 /* Quad-major Q4_0 readers (defined below; used by Q4 v1 kernels above). */
-static __device__ __forceinline__ uint16_t qm_q4_scale(const uint8_t *wrow8, int nb, int b);
-static __device__ __forceinline__ uint8_t qm_q4_byte(const uint8_t *wrow8, int nb, int b, int j);
 
 /* ------------------------------------------------------------------ */
 /* Q8_0 MatMul DP4A (M>=1 batched, K multiple of 32)                 */
@@ -279,8 +277,7 @@ static __device__ __forceinline__ uint8_t qm_q4_byte(const uint8_t *wrow8, int n
 
 __global__ void matmul_q8_0_dp4a_kernel(const cuda_q8_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -289,22 +286,7 @@ __global__ void matmul_q8_0_dp4a_kernel(const cuda_q8_0_block *__restrict__ w,
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q8_scale(wrow8, nb, b);
-
-            int sumi = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j++)
-                sumi += qm_q8_val(wrow8, nb, b, j) * (int)xb->qs[j];
-
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)sumi, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -336,8 +318,7 @@ __global__ void matmul_q8_0_dp4a_kernel(const cuda_q8_0_block *__restrict__ w,
 __global__ void matmul_q8_0_residual_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             const float *__restrict__ residual,
-                                            float *__restrict__ y, int n, int k,
-                                        int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -346,22 +327,7 @@ __global__ void matmul_q8_0_residual_kernel(const cuda_q8_0_block *__restrict__ 
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q8_scale(wrow8, nb, b);
-
-            int sumi = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j++)
-                sumi += qm_q8_val(wrow8, nb, b, j) * (int)xb->qs[j];
-
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)sumi, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -391,8 +357,7 @@ __global__ void matmul_q8_0_residual_kernel(const cuda_q8_0_block *__restrict__ 
 
 __global__ void matmul_q4_0_dp4a_kernel(const cuda_q4_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
-                                        float *__restrict__ y, int n, int k,
-                                        int qmajor) {
+                                        float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -401,24 +366,7 @@ __global__ void matmul_q4_0_dp4a_kernel(const cuda_q4_0_block *__restrict__ w,
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-
-            int sumi0 = 0, sumi1 = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t qb = qm_q4_byte(wrow8, nb, b, j);
-                sumi0 += ((int)(qb & 0xF) - 8) * (int)xb->qs[j];
-                sumi1 += ((int)(qb >> 4) - 8) * (int)xb->qs[j + 16];
-            }
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)(sumi0 + sumi1), acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -451,8 +399,7 @@ __global__ void matmul_q4_0_dp4a_kernel(const cuda_q4_0_block *__restrict__ w,
 __global__ void matmul_q4_0_residual_kernel(const cuda_q4_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             const float *__restrict__ residual,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n)
@@ -460,23 +407,7 @@ __global__ void matmul_q4_0_residual_kernel(const cuda_q4_0_block *__restrict__ 
     const int lane = threadIdx.x & (MM_LANES - 1);
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-            int sumi0 = 0, sumi1 = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t qb = qm_q4_byte(wrow8, nb, b, j);
-                sumi0 += ((int)(qb & 0xF) - 8) * (int)xb->qs[j];
-                sumi1 += ((int)(qb >> 4) - 8) * (int)xb->qs[j + 16];
-            }
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)(sumi0 + sumi1), acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -679,7 +610,7 @@ static __device__ __forceinline__ int32_t q8_block_quad_wide(const cuda_q8_0_blo
     return (int32_t)__ldg((const uint32_t *)((const uint8_t *)wb + 2 + (t << 2)));
 }
 
-/* Quad-major Q8_0 readers (GGML_TYPE_Q8_0_QM). wrow8 = row byte base
+/* Quad-major Q8_0 readers, used for the x-side buffer only. wrow8 = row byte base
  * (same nb*34 stride as original), nb = blocks/row, b = block index.
  * Scale: u16 at group_base + 2*r. Quad t: u32 at group_base + 2*G' +
  * (t*G'+r)*4. All loads naturally aligned; consecutive lanes reading
@@ -722,25 +653,10 @@ static __device__ __forceinline__ int32_t qm_q8_quad_wide(const uint8_t *wrow8, 
     return (int32_t)__ldg((const uint32_t *)qb);
 }
 
-/* Quad-major Q4_0 readers (GGML_TYPE_Q4_0_QM). 18B blocks: 2*G scale
- * bytes then 16 byte-planes of G bytes. u8/u16 loads only (2B rule:
- * rows are nb*18 bytes, 2B-aligned for all nb). Bit-exact vs the
- * original-layout reads (same nibbles -> same words). */
-static __device__ __forceinline__ uint16_t qm_q4_scale(const uint8_t *wrow8, int nb, int b) {
-    (void)nb;
-    int g = b >> 5, r = b & 31;
-    return __ldg((const uint16_t *)(wrow8 + (size_t)g * 32 * 18 + (size_t)2 * r));
-}
-static __device__ __forceinline__ uint8_t qm_q4_byte(const uint8_t *wrow8, int nb, int b, int j) {
-    int g = b >> 5, r = b & 31;
-    int Gfull = nb - g * 32, G = Gfull > 32 ? 32 : Gfull;
-    return __ldg(wrow8 + (size_t)g * 32 * 18 + (size_t)2 * G + (size_t)j * G + r);
-}
-
 __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
                                         float *__restrict__ y, int n, int k,
-                                        int use_stage, int qmajor, int xq_qm) {
+                                        int use_stage, int xq_qm) {
     const int nb = k >> 5;
     /* Stage xq in shared: re-read by every row while streaming weights
      * evict it from L2. Same values/order -> bit-exact. xb below is
@@ -762,84 +678,7 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        /* Quad-major: consecutive lanes read consecutive blocks in the
-         * same 32-group -> consecutive u16 scales / u32 quads.
-         * nb even (all production shapes) unlocks single-u32 quad loads
-         * on both sides (bit-identical words, ~half the load/pack
-         * instructions); odd-nb tails keep the u16 path. */
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        if ((nb & 1) == 0) {
-            /* Wide w-side quads (safe: even nb -> even tails -> 2G%4==0).
-             * x-side stays narrow unless xq itself is QM (KAPPAI_XQ_QM):
-             * xq blocks are 34B-strided, so odd b is only 2B-aligned
-             * (u32 would fault). */
-            const uint8_t *xq8 = (const uint8_t *)xq;
-            int xwide = (xq_qm && !use_stage);
-            for (int b = lane; b < nb; b += MM_LANES) {
-                const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
-                uint16_t dwb = qm_q8_scale(wrow8, nb, b);
-
-                int32_t dp_acc = 0;
-                #pragma unroll
-                for (int t = 0; t < 8; t++) {
-                    int j = t << 2;
-                    int32_t a = qm_q8_quad_wide(wrow8, nb, b, t);
-                    int32_t bval;
-                    if (xwide) {
-                        bval = qm_q8_quad_wide(xq8, nb, b, t);
-                    } else if (use_stage) {
-                        uint8_t b0 = xb->qs[j];
-                        uint8_t b1 = xb->qs[j + 1];
-                        uint8_t b2 = xb->qs[j + 2];
-                        uint8_t b3 = xb->qs[j + 3];
-                        bval = (int32_t)b0 | ((int32_t)b1 << 8) |
-                               ((int32_t)b2 << 16) | ((int32_t)b3 << 24);
-                    } else {
-                        bval = q8_block_quad(xb, t);
-                    }
-                    dp_acc = __dp4a(a, bval, dp_acc);
-                }
-                float dw = __half2float(__ushort_as_half(dwb));
-                uint16_t dxb = xwide ? qm_q8_scale(xq8, nb, b) : xb->d;
-                float dx = __half2float(__ushort_as_half(dxb));
-                acc = fmaf(dw * dx, (float)dp_acc, acc);
-            }
-        } else {
-        /* Odd nb: narrow QM readers (u16 pairs, alignment-safe). */
-        const uint8_t *xq8n = (const uint8_t *)xq;
-        int xwide_n = (xq_qm && !use_stage);
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
-            uint16_t dwb = qm_q8_scale(wrow8, nb, b);
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int j = t << 2;
-                int32_t a = qm_q8_quad(wrow8, nb, b, t);
-                int32_t bval;
-                if (xwide_n) {
-                    bval = qm_q8_quad(xq8n, nb, b, t);
-                } else if (use_stage) {
-                    uint8_t b0 = xb->qs[j];
-                    uint8_t b1 = xb->qs[j + 1];
-                    uint8_t b2 = xb->qs[j + 2];
-                    uint8_t b3 = xb->qs[j + 3];
-                    bval = (int32_t)b0 | ((int32_t)b1 << 8) |
-                           ((int32_t)b2 << 16) | ((int32_t)b3 << 24);
-                } else {
-                    bval = q8_block_quad(xb, t);
-                }
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-            float dw = __half2float(__ushort_as_half(dwb));
-            uint16_t dxb = xwide_n ? qm_q8_scale(xq8n, nb, b) : xb->d;
-            float dx = __half2float(__ushort_as_half(dxb));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-        }
-    } else {
+    {
     /* Original-layout weights; x-side still QM when xq_qm (orthogonal).
      * Odd nb uses the narrow (u16) QM reader (alignment-safe). */
     const uint8_t *xq8o = (const uint8_t *)xq;
@@ -888,7 +727,7 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
         y[row] = acc;
 }
 
-/* Specialized production-config GEMV (G1.3): qmajor=1, QM x-side,
+/* Specialized production-config GEMV (G1.3): QM x-side,
  * no staging, even nb. Same addresses, same dp4a order, same fmaf
  * order as the v2 even-nb/xwide path -> bit-exact. Compile-time-only
  * differences: per-b address hoisting (the helpers recompute full
@@ -896,55 +735,10 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
  * overhead in SASS) and zero runtime branches in the loop (v2 keeps
  * predicated dual x-paths per iteration, blocking straight-line
  * unrolling: SASS shows 8 chained single-IDP blocks). */
-__global__ void matmul_q8_0_dp4a_v2_qm_kernel(const cuda_q8_0_block *__restrict__ w,
-                                              const cuda_q8_0_block *__restrict__ xq,
-                                              float *__restrict__ y, int n, int k) {
-    const int nb = k >> 5;
-    const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
-    if (row >= n) return;
-
-    const int lane = threadIdx.x & (MM_LANES - 1);
-    const uint8_t *wrow8 = (const uint8_t *)(w + (size_t)row * nb);
-    const uint8_t *xq8 = (const uint8_t *)xq;
-
-    float acc = 0.0f;
-    for (int b = lane; b < nb; b += MM_LANES) {
-        /* Hoisted once per block (was: per quad via helpers). */
-        int g = b >> 5, r = b & 31;
-        int Gfull = nb - g * 32, G = Gfull > 32 ? 32 : Gfull;
-        size_t gbase = (size_t)g * 32 * 34;
-        const uint32_t *wq = (const uint32_t *)(wrow8 + gbase + (size_t)2 * G +
-                                                (size_t)r * 4);
-        const uint32_t *xq32 = (const uint32_t *)(xq8 + gbase + (size_t)2 * G +
-                                                  (size_t)r * 4);
-        uint16_t dwb = __ldg((const uint16_t *)(wrow8 + gbase + (size_t)2 * r));
-        uint16_t dxb = __ldg((const uint16_t *)(xq8 + gbase + (size_t)2 * r));
-
-        int32_t dp_acc = 0;
-        #pragma unroll
-        for (int t = 0; t < 8; t++) {
-            int32_t a = (int32_t)__ldg(wq + (size_t)t * G);
-            int32_t bval = (int32_t)__ldg(xq32 + (size_t)t * G);
-            dp_acc = __dp4a(a, bval, dp_acc);
-        }
-        float dw = __half2float(__ushort_as_half(dwb));
-        float dx = __half2float(__ushort_as_half(dxb));
-        acc = fmaf(dw * dx, (float)dp_acc, acc);
-    }
-
-    #pragma unroll
-    for (int off = MM_LANES >> 1; off > 0; off >>= 1)
-        acc += __shfl_xor_sync(0xffffffff, acc, off);
-
-    if (lane == 0)
-        y[row] = acc;
-}
-
 __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict__ w,
                                            const cuda_q8_0_block *__restrict__ xq,
                                            const float *__restrict__ residual,
-                                           float *__restrict__ y, int n, int k,
-                                           int qmajor, int xq_qm) {
+                                           float *__restrict__ y, int n, int k, int xq_qm) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -957,28 +751,7 @@ __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict
     const uint8_t *xq8r = (const uint8_t *)xq;
     int xr_wide = (xq_qm && ((nb & 1) == 0));
     int xr_qm = xq_qm;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int32_t a = qm_q8_quad(wrow8, nb, b, t);
-                int32_t bval = xr_qm ? (xr_wide ? qm_q8_quad_wide(xq8r, nb, b, t)
-                                                : qm_q8_quad(xq8r, nb, b, t))
-                                     : q8_block_quad(xb, t);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            uint16_t dwb = qm_q8_scale(wrow8, nb, b);
-            uint16_t dxb = xr_qm ? qm_q8_scale(xq8r, nb, b) : __ldg(&xb->d);
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(dxb));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -1012,8 +785,7 @@ __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict
 
 __global__ void matmul_q4_0_dp4a_v2_kernel(const cuda_q4_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
-                                        float *__restrict__ y, int n, int k,
-                                        int use_stage, int qmajor) {
+                                        float *__restrict__ y, int n, int k, int use_stage) {
     const int nb = k >> 5;
     /* Stage xq in shared (see Q8_0 v2 kernel). use_stage=0 skips it. */
     extern __shared__ char smem_gemv[];
@@ -1031,48 +803,7 @@ __global__ void matmul_q4_0_dp4a_v2_kernel(const cuda_q4_0_block *__restrict__ w
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-
-            int32_t raw = 0, xs = 0;
-            #pragma unroll
-            for (int t = 0; t < 4; t++) {
-                int jt = t << 2;
-                uint8_t w0 = qm_q4_byte(wrow8, nb, b, jt);
-                uint8_t w1 = qm_q4_byte(wrow8, nb, b, jt + 1);
-                uint8_t w2 = qm_q4_byte(wrow8, nb, b, jt + 2);
-                uint8_t w3 = qm_q4_byte(wrow8, nb, b, jt + 3);
-                uint8_t x0 = xb->qs[jt];
-                uint8_t x1 = xb->qs[jt + 1];
-                uint8_t x2 = xb->qs[jt + 2];
-                uint8_t x3 = xb->qs[jt + 3];
-                int32_t alo = (int32_t)(w0 & 0xF) | ((int32_t)(w1 & 0xF) << 8) |
-                              ((int32_t)(w2 & 0xF) << 16) | ((int32_t)(w3 & 0xF) << 24);
-                int32_t vlo = (int32_t)x0 | ((int32_t)x1 << 8) |
-                              ((int32_t)x2 << 16) | ((int32_t)x3 << 24);
-                raw = __dp4a(alo, vlo, raw);
-                xs = __dp4a(vlo, 0x01010101, xs);
-                uint8_t c0 = xb->qs[jt + 16];
-                uint8_t c1 = xb->qs[jt + 17];
-                uint8_t c2 = xb->qs[jt + 18];
-                uint8_t c3 = xb->qs[jt + 19];
-                int32_t ahi = (int32_t)(w0 >> 4) | ((int32_t)(w1 >> 4) << 8) |
-                              ((int32_t)(w2 >> 4) << 16) | ((int32_t)(w3 >> 4) << 24);
-                int32_t vhi = (int32_t)c0 | ((int32_t)c1 << 8) |
-                              ((int32_t)c2 << 16) | ((int32_t)c3 << 24);
-                raw = __dp4a(ahi, vhi, raw);
-                xs = __dp4a(vhi, 0x01010101, xs);
-            }
-            int32_t dp_acc = raw - 8 * xs;
-
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
@@ -1129,8 +860,7 @@ __global__ void matmul_q4_0_dp4a_v2_kernel(const cuda_q4_0_block *__restrict__ w
 __global__ void matmul_q4_0_residual_v2_kernel(const cuda_q4_0_block *__restrict__ w,
                                            const cuda_q8_0_block *__restrict__ xq,
                                            const float *__restrict__ residual,
-                                           float *__restrict__ y, int n, int k,
-                                           int qmajor) {
+                                           float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n)
@@ -1138,41 +868,7 @@ __global__ void matmul_q4_0_residual_v2_kernel(const cuda_q4_0_block *__restrict
     const int lane = threadIdx.x & (MM_LANES - 1);
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int8_t wdeq[32];
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t qb = qm_q4_byte(wrow8, nb, b, j);
-                wdeq[j] = (int8_t)((qb & 0xF) - 8);
-                wdeq[j + 16] = (int8_t)((qb >> 4) - 8);
-            }
-
-            const int32_t *aw = reinterpret_cast<const int32_t *>(wdeq);
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int jt = t << 2;
-                int32_t a = aw[t];
-                uint8_t b0 = xb->qs[jt];
-                uint8_t b1 = xb->qs[jt + 1];
-                uint8_t b2 = xb->qs[jt + 2];
-                uint8_t b3 = xb->qs[jt + 3];
-                int32_t bval = (int32_t)b0 | ((int32_t)b1 << 8) |
-                               ((int32_t)b2 << 16) | ((int32_t)b3 << 24);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-            uint16_t dxb = __ldg(&xb->d);
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(dxb));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -1240,8 +936,7 @@ __global__ void matmul_q4_0_residual_v2_kernel(const cuda_q4_0_block *__restrict
  * Each Q8_0 block: 32 int8 + 1 FP16 scale -> 32 FP16 values */
 __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict__ w,
                                                const cuda_q8_0_block *__restrict__ xq,
-                                               float *__restrict__ y, int n, int k, int m,
-                                               int qmajor) {
+                                               float *__restrict__ y, int n, int k, int m) {
     const int nb = k >> 5;  /* K / 32 */
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -1291,11 +986,7 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
             int row = row_tile + r;
             if (row < n) {
                 float scale, val;
-                if (qmajor) {
-                    const uint8_t *wrow8 = (const uint8_t *)(w + (size_t)row * nb);
-                    scale = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, kb)));
-                    val = (float)qm_q8_val(wrow8, nb, kb, j) * scale;
-                } else {
+                {
                     const cuda_q8_0_block *wb = w + (size_t)row * nb + kb;
                     scale = __half2float(__ushort_as_half(wb->d));
                     val = (int)wb->qs[j] * scale;
@@ -1355,8 +1046,7 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
 /* Q4_0 version: dequantize Q4_0 nibbles to FP16 */
 __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict__ w,
                                                const cuda_q8_0_block *__restrict__ xq,
-                                               float *__restrict__ y, int n, int k, int m,
-                                               int qmajor) {
+                                               float *__restrict__ y, int n, int k, int m) {
     const int nb = k >> 5;
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
@@ -1402,12 +1092,7 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
             if (row < n) {
                 float scale;
                 int q;
-                if (qmajor) {
-                    const uint8_t *wrow8 = (const uint8_t *)(w + (size_t)row * nb);
-                    scale = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, kb)));
-                    uint8_t qb = qm_q4_byte(wrow8, nb, kb, (j < 16) ? j : j - 16);
-                    q = ((j < 16) ? (qb & 0xF) : (qb >> 4)) - 8;
-                } else {
+                {
                     const cuda_q4_0_block *wb = w + (size_t)row * nb + kb;
                     scale = __half2float(__ushort_as_half(wb->d));
                     q = (j < 16) ? ((wb->qs[j] & 0xF) - 8) : ((wb->qs[j - 16] >> 4) - 8);
@@ -1477,19 +1162,14 @@ __global__ void fp16_copy_batch_kernel(const float *__restrict__ x, __half *__re
  * Consecutive threads read consecutive bytes (coalesced); scales
  * broadcast within a warp. QM variants use the byte-plane accessors. */
 __global__ void dequant_q8_0_to_fp16_kernel(const void *__restrict__ w_in, __half *__restrict__ out,
-                                            int n, int k, int qmajor) {
+                                            int n, int k) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n * k;
     if (i >= total) return;
     int row = i / k, col = i % k;
     int blk = col >> 5, j = col & 31;
     float scale, v;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)w_in + (size_t)row * (k >> 5) * 34;
-        int nb = k >> 5;
-        scale = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, blk)));
-        v = (float)qm_q8_val(wrow8, nb, blk, j);
-    } else {
+    {
         const cuda_q8_0_block *wb =
             (const cuda_q8_0_block *)w_in + (size_t)row * (k >> 5) + blk;
         scale = __half2float(__ushort_as_half(__ldg(&wb->d)));
@@ -1499,7 +1179,7 @@ __global__ void dequant_q8_0_to_fp16_kernel(const void *__restrict__ w_in, __hal
 }
 
 __global__ void dequant_q4_0_to_fp16_kernel(const void *__restrict__ w_in, __half *__restrict__ out,
-                                            int n, int k, int qmajor) {
+                                            int n, int k) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int total = n * k;
     if (i >= total) return;
@@ -1507,13 +1187,7 @@ __global__ void dequant_q4_0_to_fp16_kernel(const void *__restrict__ w_in, __hal
     int blk = col >> 5, j = col & 31;
     float scale;
     int q;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)w_in + (size_t)row * (k >> 5) * 18;
-        int nb = k >> 5;
-        scale = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, blk)));
-        uint8_t qb = qm_q4_byte(wrow8, nb, blk, (j < 16) ? j : j - 16);
-        q = ((j < 16) ? (qb & 0xF) : (qb >> 4)) - 8;
-    } else {
+    {
         const cuda_q4_0_block *wb =
             (const cuda_q4_0_block *)w_in + (size_t)row * (k >> 5) + blk;
         scale = __half2float(__ushort_as_half(__ldg(&wb->d)));
@@ -1736,7 +1410,6 @@ static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, con
 /* ------------------------------------------------------------------ */
 
 
-
 __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
                                     const cuda_q8_k_block *__restrict__ xq,
                                     float *__restrict__ y, int n, int k) {
@@ -1783,8 +1456,7 @@ __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
 
 __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
                                          const cuda_q8_0_block *__restrict__ xq,
-                                         float *__restrict__ y, int n, int k,
-                                         int qmajor) {
+                                         float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -1796,25 +1468,7 @@ __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j += 4) {
-                int32_t a = qm_q8_quad(wrow8, nb, b, j >> 2);
-                int32_t bval = (int32_t)((uint8_t)xb->qs[j] | ((uint8_t)xb->qs[j+1] << 8) |
-                                         ((uint8_t)xb->qs[j+2] << 16) | ((uint8_t)xb->qs[j+3] << 24));
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            float dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, b)));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -1863,8 +1517,7 @@ __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
 __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
                                                 const cuda_q8_0_block *__restrict__ xq,
                                                 const float *__restrict__ residual,
-                                                float *__restrict__ y, int n, int k,
-                                                int qmajor) {
+                                                float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -1876,25 +1529,7 @@ __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restri
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j += 4) {
-                int32_t a = qm_q8_quad(wrow8, nb, b, j >> 2);
-                int32_t bval = (int32_t)((uint8_t)xb->qs[j] | ((uint8_t)xb->qs[j+1] << 8) |
-                                         ((uint8_t)xb->qs[j+2] << 16) | ((uint8_t)xb->qs[j+3] << 24));
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            float dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, b)));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -1941,8 +1576,7 @@ __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restri
 
 __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
                                          const cuda_q8_0_block *__restrict__ xq,
-                                         float *__restrict__ y, int n, int k,
-                                         int qmajor) {
+                                         float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -1954,34 +1588,7 @@ __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int8_t wdeq[32];
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t qb = qm_q4_byte(wrow8, nb, b, j);
-                wdeq[j]      = (int8_t)((qb & 0xF) - 8);
-                wdeq[j + 16] = (int8_t)((qb >> 4) - 8);
-            }
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j += 4) {
-                int32_t a = (int32_t)((uint8_t)wdeq[j] | ((uint8_t)wdeq[j+1] << 8) |
-                                      ((uint8_t)wdeq[j+2] << 16) | ((uint8_t)wdeq[j+3] << 24));
-                int32_t bval = (int32_t)((uint8_t)xb->qs[j] | ((uint8_t)xb->qs[j+1] << 8) |
-                                         ((uint8_t)xb->qs[j+2] << 16) | ((uint8_t)xb->qs[j+3] << 24));
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            float dw = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, b)));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -2040,8 +1647,7 @@ __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
 __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
                                                 const cuda_q8_0_block *__restrict__ xq,
                                                 const float *__restrict__ residual,
-                                                float *__restrict__ y, int n, int k,
-                                                int qmajor) {
+                                                float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -2053,34 +1659,7 @@ __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restri
     const cuda_q4_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
-            const cuda_q8_0_block *xb = xq + b;
-
-            int8_t wdeq[32];
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                uint8_t qb = qm_q4_byte(wrow8, nb, b, j);
-                wdeq[j]      = (int8_t)((qb & 0xF) - 8);
-                wdeq[j + 16] = (int8_t)((qb >> 4) - 8);
-            }
-
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int j = 0; j < 32; j += 4) {
-                int32_t a = (int32_t)((uint8_t)wdeq[j] | ((uint8_t)wdeq[j+1] << 8) |
-                                      ((uint8_t)wdeq[j+2] << 16) | ((uint8_t)wdeq[j+3] << 24));
-                int32_t bval = (int32_t)((uint8_t)xb->qs[j] | ((uint8_t)xb->qs[j+1] << 8) |
-                                         ((uint8_t)xb->qs[j+2] << 16) | ((uint8_t)xb->qs[j+3] << 24));
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-
-            float dw = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, b)));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = tid; b < nb; b += MMVQ_NTHREADS) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -2137,8 +1716,7 @@ __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restri
 
 __global__ void matmul_q4_k_mmvq_kernel(const cuda_q4_k_block *__restrict__ w,
                                          const cuda_q8_k_block *__restrict__ xq,
-                                         float *__restrict__ y, int n, int k,
-                                         int qmajor) {
+                                         float *__restrict__ y, int n, int k) {
     const int nb = k / 256;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -2150,9 +1728,7 @@ __global__ void matmul_q4_k_mmvq_kernel(const cuda_q4_k_block *__restrict__ w,
     const cuda_q4_k_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    if (qmajor) {
-        /* QM path not yet implemented for Q4_K */
-    } else {
+    {
         for (int b = tid; b < nb; b += Q4K_MMVQ_NTHREADS) {
             const cuda_q4_k_block *wb = wrow + b;
             const cuda_q8_k_block *xb = xq + b;
@@ -2335,8 +1911,7 @@ __global__ void matmul_q4_1_residual_mmvq_kernel(const cuda_q4_1_block *__restri
 
 __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;  // number of Q8_0 blocks in K dimension
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
@@ -2382,12 +1957,7 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
             int row_idx = out_start + r;
             if (row_idx < n) {
                 float scale, val;
-                if (qmajor) {
-                    const uint8_t *wrow8 = (const uint8_t *)wrows[r];
-                    int b = kb + kb_local;
-                    scale = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, b)));
-                    val = (float)qm_q8_val(wrow8, nb, b, j) * scale;
-                } else {
+                {
                     const cuda_q8_0_block *wb = wrows[r] + kb + kb_local;
                     scale = __half2float(__ushort_as_half(wb->d));
                     val = (int)wb->qs[j] * scale;
@@ -2450,8 +2020,7 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
 /* Q4_0 version: dequantize Q4_0 nibbles to FP16 */
 __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
@@ -2495,13 +2064,7 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
             if (row_idx < n) {
                 float scale;
                 int q;
-                if (qmajor) {
-                    const uint8_t *wrow8 = (const uint8_t *)wrows[r];
-                    int b = kb + kb_local;
-                    scale = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, b)));
-                    uint8_t qb = qm_q4_byte(wrow8, nb, b, (j < 16) ? j : j - 16);
-                    q = ((j < 16) ? (qb & 0xF) : (qb >> 4)) - 8;
-                } else {
+                {
                     const cuda_q4_0_block *wb = wrows[r] + kb + kb_local;
                     scale = __half2float(__ushort_as_half(wb->d));
                     q = (j < 16) ? ((wb->qs[j] & 0xF) - 8) : ((wb->qs[j - 16] >> 4) - 8);
@@ -2568,8 +2131,7 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
 
 __global__ void matmul_q8_0_mmvq_ws_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -2595,14 +2157,7 @@ __global__ void matmul_q8_0_mmvq_ws_kernel(const cuda_q8_0_block *__restrict__ w
             for (int b = lane; b < tiles_this_round; b += 32) {
                 const int global_b = tile_base + b;
                 float scale;
-                if (qmajor) {
-                    scale = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, global_b)));
-                    #pragma unroll
-                    for (int j = 0; j < 32; j++) {
-                        ws_w_tiles[tile_idx][b][j] =
-                            (float)qm_q8_val(wrow8, nb, global_b, j) * scale;
-                    }
-                } else {
+                {
                     const cuda_q8_0_block *wb = wrow + global_b;
                     scale = __half2float(__ushort_as_half(wb->d));
                     #pragma unroll
@@ -2671,8 +2226,7 @@ __global__ void matmul_q8_0_mmvq_ws_kernel(const cuda_q8_0_block *__restrict__ w
 
 __global__ void matmul_q4_0_mmvq_ws_kernel(const cuda_q4_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
-                                            float *__restrict__ y, int n, int k,
-                                            int qmajor) {
+                                            float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
     const int row = blockIdx.x;
     if (row >= n) return;
@@ -2698,15 +2252,7 @@ __global__ void matmul_q4_0_mmvq_ws_kernel(const cuda_q4_0_block *__restrict__ w
             for (int b = lane; b < tiles_this_round; b += 32) {
                 const int global_b = tile_base + b;
                 float scale;
-                if (qmajor) {
-                    scale = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, global_b)));
-                    #pragma unroll
-                    for (int j = 0; j < 16; j++) {
-                        uint8_t qb = qm_q4_byte(wrow8, nb, global_b, j);
-                        ws_w_tiles[tile_idx][b][j]      = ((qb & 0xF) - 8) * scale;
-                        ws_w_tiles[tile_idx][b][j + 16] = ((qb >> 4) - 8) * scale;
-                    }
-                } else {
+                {
                     const cuda_q4_0_block *wb = wrow + global_b;
                     scale = __half2float(__ushort_as_half(wb->d));
                     #pragma unroll
@@ -2940,8 +2486,7 @@ struct mm_multi_desc {
 };
 
 __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
-                                         const cuda_q8_0_block *__restrict__ xq,
-                                         int qmajor, int xq_qm) {
+                                         const cuda_q8_0_block *__restrict__ xq, int xq_qm) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & (MM_LANES - 1);
     const int g    = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -2962,43 +2507,7 @@ __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
     const uint8_t *xq8m = (const uint8_t *)xq;
     int xw = (xq_qm && ((nb & 1) == 0));
     int xn = (xq_qm && ((nb & 1) != 0));
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        /* Wide w-side quads when nb even (see v2 note). */
-        if ((nb & 1) == 0) {
-            for (int j = lane; j < nb; j += MM_LANES) {
-                const cuda_q8_0_block *xb = &xq[j];
-                int32_t dp_acc = 0;
-                #pragma unroll
-                for (int t = 0; t < 8; t++) {
-                    int32_t a = qm_q8_quad_wide(wrow8, nb, j, t);
-                    int32_t bval = xw ? qm_q8_quad_wide(xq8m, nb, j, t)
-                                      : q8_block_quad(xb, t);
-                    dp_acc = __dp4a(a, bval, dp_acc);
-                }
-                float dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, j)));
-                uint16_t dxb = xw ? qm_q8_scale(xq8m, nb, j) : xb->d;
-                float dx = __half2float(__ushort_as_half(dxb));
-                acc = fmaf(dw * dx, (float)dp_acc, acc);
-            }
-        } else {
-        for (int j = lane; j < nb; j += MM_LANES) {
-            const cuda_q8_0_block *xb = &xq[j];
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int32_t a = qm_q8_quad(wrow8, nb, j, t);
-                int32_t bval = xn ? qm_q8_quad(xq8m, nb, j, t)
-                                  : q8_block_quad(xb, t);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-            float dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, j)));
-            uint16_t dxb = xn ? qm_q8_scale(xq8m, nb, j) : xb->d;
-            float dx = __half2float(__ushort_as_half(dxb));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-        }
-    } else {
+    {
     for (int j = lane; j < nb; j += MM_LANES) {
         const cuda_q8_0_block *xb = &xq[j];
         const cuda_q8_0_block *wb = &wrow[j];
@@ -3027,8 +2536,7 @@ __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
 }
 
 __global__ void matmul_multi_q4_0_kernel(const mm_multi_desc d,
-                                         const cuda_q8_0_block *__restrict__ xq,
-                                         int qmajor) {
+                                         const cuda_q8_0_block *__restrict__ xq) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & (MM_LANES - 1);
     const int g    = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -3045,44 +2553,7 @@ __global__ void matmul_multi_q4_0_kernel(const mm_multi_desc d,
     const int nb = d.k / 32;
     const cuda_q4_0_block *wrow = (const cuda_q4_0_block *)d.w[col] + (size_t)row * nb;
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int jt = (t < 4) ? (t << 2) : ((t - 4) << 2);
-                uint8_t w0 = qm_q4_byte(wrow8, nb, b, jt);
-                uint8_t w1 = qm_q4_byte(wrow8, nb, b, jt + 1);
-                uint8_t w2 = qm_q4_byte(wrow8, nb, b, jt + 2);
-                uint8_t w3 = qm_q4_byte(wrow8, nb, b, jt + 3);
-                uint8_t x0 = xb->qs[(t < 4) ? jt : jt + 16];
-                uint8_t x1 = xb->qs[(t < 4) ? jt + 1 : jt + 17];
-                uint8_t x2 = xb->qs[(t < 4) ? jt + 2 : jt + 18];
-                uint8_t x3 = xb->qs[(t < 4) ? jt + 3 : jt + 19];
-                int32_t a, bval;
-                if (t < 4) {
-                    a = (((int)(w0 & 0xF) - 8) & 0xFF) |
-                        ((((int)(w1 & 0xF) - 8) & 0xFF) << 8) |
-                        ((((int)(w2 & 0xF) - 8) & 0xFF) << 16) |
-                        ((((int)(w3 & 0xF) - 8) & 0xFF) << 24);
-                } else {
-                    a = (((int)(w0 >> 4) - 8) & 0xFF) |
-                        ((((int)(w1 >> 4) - 8) & 0xFF) << 8) |
-                        ((((int)(w2 >> 4) - 8) & 0xFF) << 16) |
-                        ((((int)(w3 >> 4) - 8) & 0xFF) << 24);
-                }
-                bval = (int32_t)x0 | ((int32_t)x1 << 8) |
-                       ((int32_t)x2 << 16) | ((int32_t)x3 << 24);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -3140,7 +2611,7 @@ __global__ void matmul_multi_q4_0_kernel(const mm_multi_desc d,
 __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
                                                  const float *__restrict__ x,
                                                  const float *__restrict__ norm_w,
-                                                 float eps, int qmajor) {
+                                                 float eps) {
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
     const int k = d.k;
@@ -3214,41 +2685,7 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
 
     const cuda_q4_0_block *wrow = (const cuda_q4_0_block *)d.w[col] + (size_t)row * nb;
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int b = lane; b < nb; b += MM_LANES) {
-            const cuda_q8_0_block *xb = xq + b;
-            uint16_t dwb = qm_q4_scale(wrow8, nb, b);
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int jt = t << 2;
-                uint8_t x0 = xb->qs[jt];
-                uint8_t x1 = xb->qs[jt + 1];
-                uint8_t x2 = xb->qs[jt + 2];
-                uint8_t x3 = xb->qs[jt + 3];
-                int jb = (t < 4) ? jt : jt - 16;
-                uint8_t w0 = qm_q4_byte(wrow8, nb, b, jb);
-                uint8_t w1 = qm_q4_byte(wrow8, nb, b, jb + 1);
-                uint8_t w2 = qm_q4_byte(wrow8, nb, b, jb + 2);
-                uint8_t w3 = qm_q4_byte(wrow8, nb, b, jb + 3);
-                int32_t a, bval;
-                if (t < 4) {
-                    a = (((int)(w0 & 0xF) - 8) & 0xFF) | ((((int)(w1 & 0xF) - 8) & 0xFF) << 8) |
-                        ((((int)(w2 & 0xF) - 8) & 0xFF) << 16) | ((((int)(w3 & 0xF) - 8) & 0xFF) << 24);
-                } else {
-                    a = (((int)(w0 >> 4) - 8) & 0xFF) | ((((int)(w1 >> 4) - 8) & 0xFF) << 8) |
-                        ((((int)(w2 >> 4) - 8) & 0xFF) << 16) | ((((int)(w3 >> 4) - 8) & 0xFF) << 24);
-                }
-                bval = (int32_t)x0 | ((int32_t)x1 << 8) |
-                       ((int32_t)x2 << 16) | ((int32_t)x3 << 24);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-            float dw = __half2float(__ushort_as_half(dwb));
-            float dx = __half2float(__ushort_as_half(xb->d));
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
@@ -3304,7 +2741,7 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
 __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
                                                  const float *__restrict__ x,
                                                  const float *__restrict__ norm_w,
-                                                 float eps, int qmajor) {
+                                                 float eps) {
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
     const int k = d.k;
@@ -3378,28 +2815,7 @@ __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
 
     const cuda_q8_0_block *wrow = (const cuda_q8_0_block *)d.w[col] + (size_t)row * nb;
     float acc = 0.0f;
-    if (qmajor) {
-        const uint8_t *wrow8 = (const uint8_t *)wrow;
-        for (int j = lane; j < nb; j += MM_LANES) {
-            const cuda_q8_0_block *xb = &xq[j];
-            int32_t dp_acc = 0;
-            #pragma unroll
-            for (int t = 0; t < 8; t++) {
-                int jt = t << 2;
-                int32_t a = qm_q8_quad(wrow8, nb, j, t);
-                uint8_t b0 = xb->qs[jt];
-                uint8_t b1 = xb->qs[jt + 1];
-                uint8_t b2 = xb->qs[jt + 2];
-                uint8_t b3 = xb->qs[jt + 3];
-                int32_t bval = (int32_t)b0 | ((int32_t)b1 << 8) |
-                               ((int32_t)b2 << 16) | ((int32_t)b3 << 24);
-                dp_acc = __dp4a(a, bval, dp_acc);
-            }
-            float dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, j)));
-            float dx = d_from_half(&xb->d);
-            acc = fmaf(dw * dx, (float)dp_acc, acc);
-        }
-    } else {
+    {
     for (int j = lane; j < nb; j += MM_LANES) {
         const cuda_q8_0_block *xb = &xq[j];
         const cuda_q8_0_block *wb = &wrow[j];
@@ -4016,7 +3432,7 @@ extern "C" void cuda_quantize_f32_to_q8_k(const float *x_dev, cuda_q8_k_block *x
 }
 
 extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                                 cudaStream_t stream, int qmajor) {
+                                 cudaStream_t stream) {
     /* Quantize x on the device (Q8_0), then run the Q8_0 matmul.
      * Default on (opt-out KAPPAI_XQ_QM=0): quantize into QM order so GEMV
      * x-side reads are wide/coalesced (v2 kernel, use_stage=0 only). */
@@ -4052,15 +3468,15 @@ extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y
             if (getenv("KAPPAI_TC_DEBUG"))
                 fprintf(stderr, "[TC] Q8_0 MMVQ-TC n=%d k=%d grid=%d shmem=%zu\n", n, k, grid.x, shmem);
             matmul_q8_0_mmvq_tc_kernel<<<grid, MMVQ_TC_THREADS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
         } else if (ws && *ws && *ws != '0') {
             /* Warp-specialized DP4A MMVQ (experimental) */
             size_t shmem = 2 * MMVQ_WS_TILE_B * 33 * sizeof(float) + MMVQ_WS_TILE_B * 32 * sizeof(int8_t);
             matmul_q8_0_mmvq_ws_kernel<<<1, MMVQ_WS_THREADS, shmem, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
         } else {
             matmul_q8_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
         }
     } else {
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
@@ -4070,33 +3486,21 @@ extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y
              * KAPPAI_XQ_STAGE=1 forces staging back on. */
             const char *xs = getenv("KAPPAI_XQ_STAGE");
             /* Staging copies xq to shared and reads it as original
-             * layout: incompatible with QM xq, force off (staging is
-             * pure overhead by default anyway). */
+             * layout: incompatible with the QM x buffer, force off
+             * (staging is pure overhead by default anyway). */
             int use_stage = (xs && *xs != '0' && !use_xqm) ? 1 : 0;
-            /* G1.3 specialized production path (QM weights + QM x +
-             * even nb, the only config production decode uses):
-             * hoisted addressing, branch-free loop. Bit-exact vs v2;
-             * KAPPAI_GEMV_QM_SPEC=0 forces the legacy kernel. */
-            const char *qspec = getenv("KAPPAI_GEMV_QM_SPEC");
-            int use_spec = !(qspec && *qspec == '0');
-            if (use_spec && qmajor && use_xqm && !use_stage && (((k >> 5) & 1) == 0)) {
-                matmul_q8_0_dp4a_v2_qm_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0,
-                                                 stream>>>(
-                    (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
-                return;
-            }
             size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
             matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage, qmajor,
+                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage,
                 use_xqm);
         } else
             matmul_q8_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
     }
 }
 
 extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
-                                 cudaStream_t stream, int qmajor) {
+                                 cudaStream_t stream) {
     /* Quantize x on the device (Q8_0 internally), then run Q4_0 matmul. */
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
@@ -4115,14 +3519,14 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
             if (getenv("KAPPAI_TC_DEBUG"))
                 fprintf(stderr, "[TC] Q4_0 MMVQ-TC n=%d k=%d grid=%d shmem=%zu\n", n, k, grid.x, shmem);
             matmul_q4_0_mmvq_tc_kernel<<<grid, MMVQ_TC_THREADS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
         } else if (ws && *ws && *ws != '0') {
             size_t shmem = 2 * MMVQ_WS_TILE_B * 33 * sizeof(float) + MMVQ_WS_TILE_B * 32 * sizeof(int8_t);
             matmul_q4_0_mmvq_ws_kernel<<<1, MMVQ_WS_THREADS, shmem, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
         } else {
             matmul_q4_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
         }
     } else {
         const char *v2 = getenv("KAPPAI_DP4A_V2");
@@ -4135,10 +3539,10 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
             int use_stage = (xs && *xs != '0') ? 1 : 0;
             size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
             matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage);
         } else
             matmul_q4_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
     }
 }
 
@@ -4287,8 +3691,7 @@ extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y
  * MMVQ (M=1 decode) or DP4A residual kernels (M>1). */
 extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
                                          const float *residual_dev, float *y_dev,
-                                         int n, int k, cudaStream_t stream,
-                                         int qmajor) {
+                                         int n, int k, cudaStream_t stream) {
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
@@ -4304,40 +3707,39 @@ extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
         q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
     if (n == 1) {
         matmul_q8_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+            (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
     } else {
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2r)
             matmul_q8_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor,
+                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k,
                 use_xqmr);
         else
             matmul_q8_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+                (const cuda_q8_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
     }
 }
 
 extern "C" void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
                                          const float *residual_dev, float *y_dev,
-                                         int n, int k, cudaStream_t stream,
-                                         int qmajor) {
+                                         int n, int k, cudaStream_t stream) {
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
     q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
     if (n == 1) {
         matmul_q4_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+            (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
     } else {
         const char *v2 = getenv("KAPPAI_DP4A_V2");
         int use_v2 = !(v2 && *v2 == '0');
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2)
             matmul_q4_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
         else
             matmul_q4_0_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k, qmajor);
+                (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
     }
 }
 
@@ -5290,7 +4692,6 @@ extern "C" void cuda_matmul_iq3_s_residual(const void *w_dev, const float *x_dev
 /* ------------------------------------------------------------------ */
 
 
-
 extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
     /* Quantize x on the device (Q8_K internally), then run Q4_K matmul. */
@@ -5301,7 +4702,7 @@ extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y
     if (n == 1) {
         /* Use MMVQ kernel for M=1 decode. */
         matmul_q4_k_mmvq_kernel<<<n, Q4K_MMVQ_NTHREADS, 0, stream>>>(
-            (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k, 0);
+            (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
         /* 32 rows/block (8 warps x 4 row-groups). */
         dim3 grid((n + MM_ROWS_PER_BLOCK * 4 - 1) / (MM_ROWS_PER_BLOCK * 4));
@@ -5330,8 +4731,7 @@ extern "C" void cuda_matmul_bf16(const uint16_t *w_dev, const float *x_dev, floa
 
 /* Fused down-projection: y = W (Q8_0) * act(gate, up), act = gelu_tanh(gate)*up. */
 extern "C" void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, const float *up_dev,
-                                     float *y_dev, int n, int k, cudaStream_t stream,
-                                     int qmajor) {
+                                     float *y_dev, int n, int k, cudaStream_t stream) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
     if (!act_q)
         return;
@@ -5342,20 +4742,20 @@ extern "C" void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, c
     const char *v2 = getenv("KAPPAI_DP4A_V2");
     if (v2 && *v2 == '0') {
         matmul_q8_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, qmajor);
+            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k);
     } else {
         const char *xs = getenv("KAPPAI_XQ_STAGE");
         int use_stage = (xs && *xs != '0') ? 1 : 0;
         size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
         matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, use_stage, qmajor, 0);
+            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, use_stage, 0);
     }
 }
 
 /* Same, for Q4_0 down-weights. */
 extern "C" void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev,
                                         const float *up_dev, float *y_dev, int n, int k,
-                                        cudaStream_t stream, int qmajor) {
+                                        cudaStream_t stream) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
     if (!act_q)
         return;
@@ -5365,13 +4765,13 @@ extern "C" void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev
     const char *v2 = getenv("KAPPAI_DP4A_V2");
     if (v2 && *v2 == '0') {
         matmul_q4_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, qmajor);
+            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k);
     } else {
         const char *xsv = getenv("KAPPAI_XQ_STAGE");
         int use_stage = (xsv && *xsv != '0') ? 1 : 0;
         size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
         matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, use_stage, qmajor);
+            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, use_stage);
     }
 }
 
@@ -5403,7 +4803,7 @@ extern "C" void cuda_matmul_ffn_down_q4_1(const void *w_dev, const float *gate_d
  * kernel over sum(n_list) rows.  w_dev/y_dev are arrays of device pointers. */
 extern "C" void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev,
                                        const int *n_host, const float *x_dev, int nm, int k,
-                                       cudaStream_t stream, int qmajor) {
+                                       cudaStream_t stream) {
     cuda_q8_0_block *xq = xq_scratch_for(k);
     if (!xq)
         return;
@@ -5436,12 +4836,12 @@ extern "C" void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y
 
     dim3 grid((total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     matmul_multi_q8_0_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        desc, xq, qmajor, use_xqm);
+        desc, xq, use_xqm);
 }
 
 extern "C" void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y_dev,
                                        const int *n_host, const float *x_dev, int nm, int k,
-                                       cudaStream_t stream, int qmajor) {
+                                       cudaStream_t stream) {
     cuda_q8_0_block *xq = xq_scratch_for(k);
     if (!xq)
         return;
@@ -5466,7 +4866,7 @@ extern "C" void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y
     desc.k  = k;
 
     dim3 grid((total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_multi_q4_0_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq, qmajor);
+    matmul_multi_q4_0_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq);
 }
 
 /* Fused RMSNorm + Multi-MatMul launchers. Single kernel does RMSNorm,
@@ -5475,8 +4875,7 @@ extern "C" void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y
 extern "C" void cuda_rmsnorm_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev,
                                                const int *n_host, const float *x_dev,
                                                const float *norm_w_dev, int nm, int k,
-                                               float eps, cudaStream_t stream,
-                                               int qmajor) {
+                                               float eps, cudaStream_t stream) {
     /* By-value descriptor: no shared staging, no async copy. The old
      * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
      * deep queue the copy executed after the host had already refilled
@@ -5500,14 +4899,13 @@ extern "C" void cuda_rmsnorm_matmul_multi_q8_0(const void *const *w_dev, float *
     size_t shmem = (size_t)nt * sizeof(float) + (size_t)nb * sizeof(cuda_q8_0_block);
     dim3 grid((total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     rmsnorm_matmul_multi_q8_0_kernel<<<grid, nt, shmem, stream>>>(
-        desc, x_dev, norm_w_dev, eps, qmajor);
+        desc, x_dev, norm_w_dev, eps);
 }
 
 extern "C" void cuda_rmsnorm_matmul_multi_q4_0(const void *const *w_dev, float *const *y_dev,
                                                const int *n_host, const float *x_dev,
                                                const float *norm_w_dev, int nm, int k,
-                                               float eps, cudaStream_t stream,
-                                               int qmajor) {
+                                               float eps, cudaStream_t stream) {
     /* By-value descriptor: no shared staging, no async copy. The old
      * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
      * deep queue the copy executed after the host had already refilled
@@ -5531,7 +4929,7 @@ extern "C" void cuda_rmsnorm_matmul_multi_q4_0(const void *const *w_dev, float *
     size_t shmem = (size_t)nt * sizeof(float) + (size_t)nb * sizeof(cuda_q8_0_block);
     dim3 grid((total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
     rmsnorm_matmul_multi_q4_0_kernel<<<grid, nt, shmem, stream>>>(
-        desc, x_dev, norm_w_dev, eps, qmajor);
+        desc, x_dev, norm_w_dev, eps);
 }
 
 extern "C" void cuda_rmsnorm_matmul_multi_q4_1(const void *const *w_dev, float *const *y_dev,
@@ -7424,8 +6822,7 @@ __global__ void q8_0_quant_batch_kernel(const float *__restrict__ x,
 
 __global__ void matmul_q8_0_dp4a_batch_kernel(const cuda_q8_0_block *__restrict__ w,
                                               const cuda_q8_0_block *__restrict__ xq,
-                                              float *__restrict__ y, int n, int k, int m,
-                                              int qmajor) {
+                                              float *__restrict__ y, int n, int k, int m) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -7446,12 +6843,7 @@ __global__ void matmul_q8_0_dp4a_batch_kernel(const cuda_q8_0_block *__restrict_
         for (int b = lane; b < nb; b += MM_LANES) {
             float dw;
             int wqs[32];
-            if (qmajor) {
-                dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, b)));
-                #pragma unroll
-                for (int j = 0; j < 32; j++)
-                    wqs[j] = qm_q8_val(wrow8, nb, b, j);
-            } else {
+            {
                 const cuda_q8_0_block *wb = wrow + b;
                 dw = __half2float(__ushort_as_half(wb->d));
                 #pragma unroll
@@ -7485,8 +6877,7 @@ __global__ void matmul_q8_0_dp4a_batch_kernel(const cuda_q8_0_block *__restrict_
 
 __global__ void matmul_q4_0_dp4a_batch_kernel(const cuda_q4_0_block *__restrict__ w,
                                               const cuda_q8_0_block *__restrict__ xq,
-                                              float *__restrict__ y, int n, int k, int m,
-                                              int qmajor) {
+                                              float *__restrict__ y, int n, int k, int m) {
     const int nb = k >> 5;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n) return;
@@ -7504,12 +6895,7 @@ __global__ void matmul_q4_0_dp4a_batch_kernel(const cuda_q4_0_block *__restrict_
         for (int b = lane; b < nb; b += MM_LANES) {
             float dw;
             uint8_t wqb[16];
-            if (qmajor) {
-                dw = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, b)));
-                #pragma unroll
-                for (int j = 0; j < 16; j++)
-                    wqb[j] = qm_q4_byte(wrow8, nb, b, j);
-            } else {
+            {
                 const cuda_q4_0_block *wb = wrow + b;
                 dw = __half2float(__ushort_as_half(wb->d));
                 #pragma unroll
@@ -7804,8 +7190,7 @@ extern "C" void cuda_matmul_batch_fp16(const void *w_in, const float *x_dev, flo
 }
 
 extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, float *y_dev,
-                                        int n, int k, int m, cudaStream_t stream,
-                                        int qmajor) {
+                                        int n, int k, int m, cudaStream_t stream) {
     const int nb = k / 32;
     /* On-demand FP16 path (KAPPAI_BATCH_FP16=1): dequant W once to
      * scratch, then pure WMMA (no in-loop dequant). Inexact arithmetic
@@ -7815,7 +7200,7 @@ extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, fl
         if (!wf) return;
         int total = n * k;
         dequant_q8_0_to_fp16_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-            w_dev, wf, n, k, qmajor);
+            w_dev, wf, n, k);
         matmul_batch_fp16_impl(wf, x_dev, y_dev, n, k, m, stream);
         return;
     }
@@ -7834,17 +7219,16 @@ extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, fl
         size_t shmem = ((size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS +
                         (size_t)WMMA_K_ELEMS * WMMA_COLS_PER_BLOCK) * sizeof(__half);
         matmul_q8_0_wmma_batch_kernel<<<grid, WMMA_THREADS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q8_0_block *)w_dev, xq, y_dev, n, k, m, qmajor);
+            (const cuda_q8_0_block *)w_dev, xq, y_dev, n, k, m);
     } else {
         dim3 grid(((size_t)n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         matmul_q8_0_dp4a_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q8_0_block *)w_dev, xq, y_dev, n, k, m, qmajor);
+            (const cuda_q8_0_block *)w_dev, xq, y_dev, n, k, m);
     }
 }
 
 extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, float *y_dev,
-                                        int n, int k, int m, cudaStream_t stream,
-                                        int qmajor) {
+                                        int n, int k, int m, cudaStream_t stream) {
     const int nb = k / 32;
     /* On-demand FP16 path (see Q8_0 launcher). */
     if (batch_fp16_enabled() && m >= 16 && n >= 32) {
@@ -7852,7 +7236,7 @@ extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, fl
         if (!wf) return;
         int total = n * k;
         dequant_q4_0_to_fp16_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-            w_dev, wf, n, k, qmajor);
+            w_dev, wf, n, k);
         matmul_batch_fp16_impl(wf, x_dev, y_dev, n, k, m, stream);
         return;
     }
@@ -7871,11 +7255,11 @@ extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, fl
         size_t shmem = ((size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS +
                         (size_t)WMMA_K_ELEMS * WMMA_COLS_PER_BLOCK) * sizeof(__half);
         matmul_q4_0_wmma_batch_kernel<<<grid, WMMA_THREADS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q4_0_block *)w_dev, xq, y_dev, n, k, m, qmajor);
+            (const cuda_q4_0_block *)w_dev, xq, y_dev, n, k, m);
     } else {
         dim3 grid(((size_t)n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         matmul_q4_0_dp4a_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q4_0_block *)w_dev, xq, y_dev, n, k, m, qmajor);
+            (const cuda_q4_0_block *)w_dev, xq, y_dev, n, k, m);
     }
 }
 
@@ -8102,7 +7486,7 @@ extern "C" void cuda_matmul_batch_q4_k(const void *w_dev, const float *x_dev, fl
 
 __global__ void matmul_multi_q4_0_batch_kernel(const mm_multi_desc d,
                                                const cuda_q8_0_block *__restrict__ xq,
-                                               int m, int qmajor) {
+                                               int m) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & (MM_LANES - 1);
     const int g    = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -8131,12 +7515,7 @@ __global__ void matmul_multi_q4_0_batch_kernel(const mm_multi_desc d,
         for (int b = lane; b < nb; b += MM_LANES) {
             float dw;
             uint8_t wqb[16];
-            if (qmajor) {
-                dw = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, b)));
-                #pragma unroll
-                for (int j = 0; j < 16; j++)
-                    wqb[j] = qm_q4_byte(wrow8, nb, b, j);
-            } else {
+            {
                 const cuda_q4_0_block *wb = wrow + b;
                 dw = __half2float(__ushort_as_half(wb->d));
                 #pragma unroll
@@ -8174,7 +7553,7 @@ __global__ void matmul_multi_q4_0_batch_kernel(const mm_multi_desc d,
 
 __global__ void matmul_multi_q8_0_batch_kernel(const mm_multi_desc d,
                                                const cuda_q8_0_block *__restrict__ xq,
-                                               int m, int qmajor) {
+                                               int m) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & (MM_LANES - 1);
     const int g    = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -8203,12 +7582,7 @@ __global__ void matmul_multi_q8_0_batch_kernel(const mm_multi_desc d,
         for (int b = lane; b < nb; b += MM_LANES) {
             float dw;
             int8_t wqs[32];
-            if (qmajor) {
-                dw = __half2float(__ushort_as_half(qm_q8_scale(wrow8, nb, b)));
-                #pragma unroll
-                for (int j = 0; j < 32; j++)
-                    wqs[j] = (int8_t)qm_q8_val(wrow8, nb, b, j);
-            } else {
+            {
                 const cuda_q8_0_block *wb = wrow + b;
                 dw = d_from_half(&wb->d);
                 #pragma unroll
@@ -8244,8 +7618,7 @@ __global__ void matmul_multi_q8_0_batch_kernel(const mm_multi_desc d,
 
 extern "C" void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *const *y_dev,
                                              const int *n_host, const float *x_dev, int nm, int k,
-                                             int m, const float *resid_dev, cudaStream_t stream,
-                                             int qmajor) {
+                                             int m, const float *resid_dev, cudaStream_t stream) {
     const int nb = k / 32;
     /* On-demand FP16 path (see Q8_0 launcher). */
     if (batch_fp16_enabled() && !resid_dev && m >= 16) {
@@ -8259,7 +7632,7 @@ extern "C" void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *co
                 __half *wf = (__half *)(base + off);
                 int total = n_host[c] * k;
                 dequant_q4_0_to_fp16_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-                    w_dev[c], wf, n_host[c], k, qmajor);
+                    w_dev[c], wf, n_host[c], k);
                 matmul_batch_fp16_impl(wf, x_dev, y_dev[c], n_host[c], k, m, stream);
                 off += (size_t)n_host[c] * k * sizeof(__half);
             }
@@ -8289,13 +7662,12 @@ extern "C" void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *co
     desc.resid = resid_dev;
 
     dim3 grid(((size_t)total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_multi_q4_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq, m, qmajor);
+    matmul_multi_q4_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq, m);
 }
 
 extern "C" void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *const *y_dev,
                                              const int *n_host, const float *x_dev, int nm, int k,
-                                             int m, const float *resid_dev, cudaStream_t stream,
-                                             int qmajor) {
+                                             int m, const float *resid_dev, cudaStream_t stream) {
     const int nb = k / 32;
     /* On-demand FP16 path: dequant each column to scratch segments,
      * then per-column pure WMMA (xf converted once inside impl).
@@ -8313,7 +7685,7 @@ extern "C" void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *co
                 __half *wf = (__half *)(base + off);
                 int total = n_host[c] * k;
                 dequant_q8_0_to_fp16_kernel<<<(total + 255) / 256, 256, 0, stream>>>(
-                    w_dev[c], wf, n_host[c], k, qmajor);
+                    w_dev[c], wf, n_host[c], k);
                 matmul_batch_fp16_impl(wf, x_dev, y_dev[c], n_host[c], k, m, stream);
                 off += (size_t)n_host[c] * k * sizeof(__half);
             }
@@ -8343,7 +7715,7 @@ extern "C" void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *co
     desc.resid = resid_dev;
 
     dim3 grid(((size_t)total + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    matmul_multi_q8_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq, m, qmajor);
+    matmul_multi_q8_0_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq, m);
 }
 
 extern "C" void cuda_matmul_batch_f16(const uint16_t *w_dev, const float *x_dev, float *y_dev,
@@ -10319,7 +9691,6 @@ extern "C" void cuda_embd_lookup_q8_0_g(const cuda_q8_0_block *embd_dev, float *
 }
 
 
-
 /* ------------------------------------------------------------------ */
 /* IQ4_NL host-side launchers                                          */
 /* ------------------------------------------------------------------ */
@@ -10358,11 +9729,10 @@ extern "C" void cuda_matmul_iq4_nl_residual(const void *w_dev, const float *x_de
 }
 
 
-
 /* Batched FFN down kernel launchers. */
 extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
                                            const float *up_dev, float *y_dev, int n, int k,
-                                           int m, cudaStream_t stream, int qmajor) {
+                                           int m, cudaStream_t stream) {
     /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
      * per token -- so this scratch must cover all m rows. Sizing it for a single
      * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
@@ -10380,12 +9750,12 @@ extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float
      * FFN down-projection has more output rows than prompt tokens. */
     matmul_q8_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-        (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m, 0);
+        (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m);
 }
 
 extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
                                               const float *up_dev, float *y_dev, int n, int k,
-                                              int m, cudaStream_t stream, int qmajor) {
+                                              int m, cudaStream_t stream) {
     /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
      * per token -- so this scratch must cover all m rows. Sizing it for a single
      * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
@@ -10401,7 +9771,7 @@ extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const fl
     matmul_q4_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q4_0_block *)w_dev, (const cuda_q8_0_block *)act_q,
-        y_dev, n, k, m, 0);
+        y_dev, n, k, m);
 }
 
 extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
@@ -10473,8 +9843,7 @@ __global__ void moe_scale_accum_batched_kernel(float *out, const float *src,
 __global__ void moe_gate_proj_kernel(const cuda_q8_0_block *__restrict__ w,
                                       const float *__restrict__ x,
                                       float *__restrict__ gate,
-                                      int n_rows, int dim, int inter,
-                                      int qmajor) {
+                                      int n_rows, int dim, int inter) {
     int row = blockIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows || col >= dim) return;
