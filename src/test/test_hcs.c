@@ -71,6 +71,41 @@ static void test_loader(void) {
 	record_hcs("loader.unlisted_section", ok, "err='%s'", err);
 }
 
+static void test_split(void) {
+	int n_layers = 0, n_experts = 0;
+	int probe_rc = model_probe_shape(synth_chat_model_path, &n_layers, &n_experts);
+
+	hcs_config h = single_device("cpu_scalar_0", HCS_TASKS_ALL, 1, HCS_COUNT_UNSET);
+	h.n_devices	 = 2;
+	h.devices[1] =
+		single_device("opengl_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET).devices[0];
+	int held[HCS_MAX_DEVICES];
+	int assigned = hcs_resolve_layers(&h, n_layers, held);
+	int ok		 = assigned == n_layers && held[0] == 1 && held[1] == n_layers - 1;
+	record_hcs("split.resolve_star_takes_remainder", ok, "assigned=%d probe=%d n=%d", assigned,
+			   probe_rc, n_layers);
+
+	config cfg = config_defaults();
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
+	ok = strcmp(cfg.device, "opengl_0") == 0 && cfg.ngl == n_layers - 1;
+	record_hcs("split.order_irrelevant_host_listed_first", ok, "device=%s ngl=%d", cfg.device,
+			   cfg.ngl);
+
+	h			 = single_device("opengl_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
+	h.n_devices	 = 2;
+	h.devices[1] = single_device("cpu_scalar_0", HCS_TASKS_ALL, 1, HCS_COUNT_UNSET).devices[0];
+	cfg			 = config_defaults();
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
+	ok = strcmp(cfg.device, "opengl_0") == 0 && cfg.ngl == n_layers - 1;
+	record_hcs("split.order_irrelevant_host_listed_last", ok, "device=%s ngl=%d", cfg.device,
+			   cfg.ngl);
+
+	h.devices[1].layers = 0;
+	cfg					= config_defaults();
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
+	record_hcs("split.host_holds_no_layers", cfg.ngl == n_layers, "ngl=%d", cfg.ngl);
+}
+
 static void test_enabled_flag(void) {
 	char	   err[256];
 	hcs_loader l;
@@ -96,7 +131,7 @@ static void test_enabled_flag(void) {
 	h		   = single_device("cpu_0", HCS_TASK_DECODE, 1, 99);
 	h.enabled  = false;
 	config cfg = config_defaults();
-	hcs_materialize(&h, &cfg);
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
 	ok = hcs_validate(&h, "/nonexistent/model.gguf", err, sizeof(err)) == 0 &&
 		 strcmp(cfg.device, "cpu_0") == 0 && cfg.ngl == -1 && cfg.moe_cache_cap == 0;
 	record_hcs("enabled.disabled_maps_to_single_device", ok, "err='%s' cap=%d", err,
@@ -153,12 +188,17 @@ static void test_validate(void) {
 	h = single_device("cpu", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
 	record_hcs("validate.bare_name_rejected", validate_has(&h, "<backend>_<n>"), "");
 
-	h			 = single_device("cpu_0", HCS_TASKS_ALL, 1, HCS_COUNT_UNSET);
+	h			 = single_device("cpu_scalar_0", HCS_TASKS_ALL, 1, 8);
 	h.n_devices	 = 2;
-	h.devices[1] = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET).devices[0];
-	ok			 = validate_has(&h, "not supported in this version") &&
-				   validate_has(&h, "listed more than once");
-	record_hcs("validate.multi_device_rejected", ok, "ok=%d", ok);
+	h.devices[1] = single_device("cpu_x86_64_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4).devices[0];
+	ok			 = validate_has(&h, "2 host (cpu) devices") && validate_has(&h, "differs from");
+	record_hcs("validate.two_hosts_rejected", ok, "ok=%d", ok);
+
+	h			= single_device("opengl_0", HCS_TASKS_ALL, 1, HCS_COUNT_UNSET);
+	h.n_devices = 2;
+	h.devices[1] =
+		single_device("vulkan_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET).devices[0];
+	record_hcs("validate.two_accelerators_rejected", validate_has(&h, "2 non-host devices"), "");
 
 	h  = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
 	ok = hcs_validate(&h, "/nonexistent/model.gguf", err, sizeof(err)) < 0 &&
@@ -167,7 +207,7 @@ static void test_validate(void) {
 
 	config cfg = config_defaults();
 	h		   = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 10);
-	hcs_materialize(&h, &cfg);
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
 	ok = strcmp(cfg.device, "cpu_0") == 0 && cfg.ngl == -1 && cfg.moe_cache_cap == 10;
 	record_hcs("materialize.v1", ok, "device=%s ngl=%d cap=%d", cfg.device, cfg.ngl,
 			   cfg.moe_cache_cap);
@@ -176,6 +216,7 @@ static void test_validate(void) {
 void run_hcs_tests(void) {
 	test_count_and_tasks();
 	test_loader();
+	test_split();
 	test_enabled_flag();
 	test_legacy();
 	test_validate();

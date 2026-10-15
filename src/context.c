@@ -79,6 +79,18 @@ void context_set_debug_prompt(context *c, bool enabled) {
 	c->debug_prompt = enabled;
 }
 
+static status_code apply_layer_split(context *c, const config *cfg) {
+	int n_layers = c->m.n_layers;
+	int host	 = cfg->ngl >= 0 ? n_layers - MIN(cfg->ngl, n_layers) : 0;
+	if (host == 0)
+		return OK;
+	if (model_set_layer_backend_range(&c->m, n_layers - host, n_layers, backend_host()) != OK)
+		return ERR_INVALID_ARG;
+	INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_layers - host, c->backend->name,
+		 host);
+	return OK;
+}
+
 status_code context_init(context *c, const config *cfg) {
 	memset(c, 0, sizeof(*c));
 	monitor_reset(&c->monitor);
@@ -124,28 +136,9 @@ status_code context_init(context *c, const config *cfg) {
 	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
 		c->m.fuse_config = cfg->fuse;
 
-	if (cfg->ngl >= 0) {
-		int n_offload = cfg->ngl;
-		if (n_offload > c->m.n_layers)
-			n_offload = c->m.n_layers;
-		if (n_offload < c->m.n_layers) {
-			backend_report_host_fallback(c->backend, "ngl_layers", HFB_LAYER_NOT_OFFLOADED,
-										 "%d of %d layer(s) intentionally kept on the host (cpu) "
-										 "fallback (--ngl %d)",
-										 c->m.n_layers - n_offload, c->m.n_layers, cfg->ngl);
-			s = model_set_layer_backend_range(&c->m, n_offload, c->m.n_layers, backend_host());
-			if (s != OK) {
-				ERROR("failed to apply --ngl");
-				goto fail_model;
-			}
-			if (c->m.arch_info->is_mla) {
-				WARN("--ngl: MLA architectures do not yet support per-layer KV on host; "
-					 "MLA layers running on host may fall back to primary KV path");
-			}
-			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_offload, c->backend->name,
-				 c->m.n_layers - n_offload);
-		}
-	}
+	s = apply_layer_split(c, cfg);
+	if (s != OK)
+		goto fail_model;
 
 	{
 		int n_ctx_precheck = cfg->ctx_size;

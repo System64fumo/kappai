@@ -363,6 +363,26 @@ static void check_device_fields(violations *v, const hcs_config *h, int idx, int
 		*star_owner = idx;
 }
 
+static void check_device_mix(violations *v, const hcs_config *h) {
+	int n_host = 0, n_accel = 0;
+	for (int i = 0; i < h->n_devices; i++) {
+		if (backend_device_is_host(h->devices[i].name))
+			n_host++;
+		else
+			n_accel++;
+	}
+	if (n_host > 1)
+		add_violation(v, NULL, "devices",
+					  "%d host (cpu) devices listed; not supported in this version (the host is "
+					  "one device)",
+					  n_host);
+	if (n_accel > 1)
+		add_violation(v, NULL, "devices",
+					  "%d non-host devices listed; not supported in this version (at most one "
+					  "non-host device plus the host)",
+					  n_accel);
+}
+
 static void check_experts_star(violations *v, const hcs_config *h) {
 	int owner = -1;
 	for (int i = 0; i < h->n_devices; i++) {
@@ -375,41 +395,58 @@ static void check_experts_star(violations *v, const hcs_config *h) {
 		else
 			owner = i;
 	}
+
+	int first = -1;
+	for (int i = 0; i < h->n_devices; i++) {
+		if (h->devices[i].experts == HCS_COUNT_UNSET)
+			continue;
+		if (first < 0)
+			first = i;
+		else if (h->devices[i].experts != h->devices[first].experts)
+			add_violation(v, h->devices[i].name, "experts",
+						  "differs from [hcs.%s]; not supported in this version (one expert "
+						  "cache size for the model)",
+						  h->devices[first].name);
+	}
+}
+
+int hcs_resolve_layers(const hcs_config *h, int n_layers, int *held) {
+	long numeric = 0;
+	int	 star	 = -1;
+	for (int i = 0; i < h->n_devices; i++) {
+		held[i] = h->devices[i].layers >= 0 ? h->devices[i].layers : 0;
+		numeric += held[i];
+		if (h->devices[i].layers == HCS_COUNT_ALL && star < 0)
+			star = i;
+	}
+	if (star >= 0 && numeric < n_layers) {
+		held[star] = n_layers - (int)numeric;
+		numeric	   = n_layers;
+	}
+	return (int)MIN(numeric, INT_MAX);
 }
 
 static bool check_layer_coverage(violations *v, const hcs_config *h, int n_layers, int star_owner,
 								 int *held) {
-	long assigned = 0;
-	for (int i = 0; i < h->n_devices; i++)
-		if (h->devices[i].layers >= 0)
-			assigned += h->devices[i].layers;
+	int			assigned = hcs_resolve_layers(h, n_layers, held);
+	int			report	 = star_owner >= 0 ? star_owner : h->n_devices - 1;
+	const char *name	 = h->devices[report].name;
 
-	int			report = star_owner >= 0 ? star_owner : h->n_devices - 1;
-	const char *name   = h->devices[report].name;
-	long		remain = n_layers - assigned;
-
-	for (int i = 0; i < h->n_devices; i++)
-		held[i] = h->devices[i].layers >= 0 ? h->devices[i].layers : 0;
-
-	if (remain < 0) {
-		add_violation(v, name, "layers", "%ld layer(s) assigned, model has %d; remove %ld",
-					  assigned, n_layers, -remain);
+	if (assigned > n_layers) {
+		add_violation(v, name, "layers", "%d layer(s) assigned, model has %d; remove %d", assigned,
+					  n_layers, assigned - n_layers);
 		return false;
 	}
-	if (star_owner >= 0 && remain == 0) {
+	if (star_owner >= 0 && held[star_owner] == 0) {
 		add_violation(v, name, "layers", "'*' has no layers remaining; all %d are already assigned",
 					  n_layers);
 		return false;
 	}
-	if (star_owner >= 0) {
-		held[star_owner] = (int)remain;
-		return true;
-	}
-	if (remain > 0) {
+	if (assigned < n_layers) {
 		add_violation(v, name, "layers",
-					  "%ld layer(s) assigned, model has %d; add 'layers = *' to a device or "
-					  "assign %ld more",
-					  assigned, n_layers, remain);
+					  "%d layer(s) assigned, model has %d; add 'layers = *' to a device or "
+					  "assign %d more",
+					  assigned, n_layers, n_layers - assigned);
 		return false;
 	}
 	return true;
@@ -417,8 +454,8 @@ static bool check_layer_coverage(violations *v, const hcs_config *h, int n_layer
 
 static void check_model_rules(violations *v, const hcs_config *h, int n_layers, int n_experts,
 							  int star_owner) {
-	int	 held[HCS_MAX_DEVICES];
-	bool covered = check_layer_coverage(v, h, n_layers, star_owner, held);
+	int held[HCS_MAX_DEVICES];
+	check_layer_coverage(v, h, n_layers, star_owner, held);
 
 	for (int i = 0; i < h->n_devices; i++) {
 		const hcs_device *d = &h->devices[i];
@@ -431,15 +468,10 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 		bool no_experts = d->experts == 0 || d->experts == HCS_COUNT_UNSET;
 		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "device", "holds nothing; remove it from 'devices'");
-		if (covered && held[i] != n_layers)
-			add_violation(v, d->name, "layers",
-						  "holds %d of %d layers; not supported in this version (the device must "
-						  "hold all layers)",
-						  held[i], n_layers);
 	}
 }
 
-static int probe_model(const char *path, int *n_layers, int *n_experts) {
+int hcs_probe_model(const char *path, int *n_layers, int *n_experts) {
 	if (!path || !*path)
 		return -1;
 	log_level saved = log_get_level();
@@ -463,10 +495,7 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 		backend_best_device(best, sizeof(best));
 		add_violation(&v, NULL, "devices", "no devices listed; e.g. 'devices = %s'", best);
 	}
-	if (h->n_devices > 1)
-		add_violation(&v, NULL, "devices",
-					  "%d devices listed; not supported in this version (exactly one device)",
-					  h->n_devices);
+	check_device_mix(&v, h);
 
 	int star_owner = -1;
 	for (int i = 0; i < h->n_devices; i++) {
@@ -479,7 +508,7 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 	if (h->n_devices > 0) {
 		if (!config->enabled)
 			return err[0] ? -1 : 0;
-		if (probe_model(model_path, &n_layers, &n_experts) == 0)
+		if (hcs_probe_model(model_path, &n_layers, &n_experts) == 0)
 			check_model_rules(&v, h, n_layers, n_experts, star_owner);
 		else
 			v.len += snprintf(err + v.len, v.len < errlen ? errlen - v.len : 0,
@@ -489,13 +518,37 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 	return err[0] ? -1 : 0;
 }
 
-void hcs_materialize(const hcs_config *h, config *cfg) {
-	hcs_config		  eff = hcs_effective(h);
-	const hcs_device *d	  = &eff.devices[0];
-	cfg->device			  = h->devices[0].name;
-	cfg->ngl			  = -1;
-	if (d->experts == HCS_COUNT_ALL)
+static int first_set_experts(const hcs_config *h) {
+	for (int i = 0; i < h->n_devices; i++)
+		if (h->devices[i].experts != HCS_COUNT_UNSET)
+			return h->devices[i].experts;
+	return HCS_COUNT_UNSET;
+}
+
+static int materialize_split(const hcs_config *h, const char *model_path, config *cfg) {
+	int primary = backend_device_is_host(h->devices[0].name) ? 1 : 0;
+
+	int n_layers = 0, n_experts = 0;
+	if (hcs_probe_model(model_path, &n_layers, &n_experts) != 0)
+		return primary;
+
+	int held[HCS_MAX_DEVICES];
+	hcs_resolve_layers(h, n_layers, held);
+	cfg->ngl = held[primary];
+	return primary;
+}
+
+void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
+	hcs_config eff	   = hcs_effective(h);
+	int		   primary = 0;
+	cfg->ngl		   = -1;
+	if (eff.n_devices == 2)
+		primary = materialize_split(&eff, model_path, cfg);
+	cfg->device = h->devices[primary].name;
+
+	int experts = first_set_experts(&eff);
+	if (experts == HCS_COUNT_ALL)
 		cfg->moe_cache_cap = INT_MAX;
-	else if (d->experts != HCS_COUNT_UNSET)
-		cfg->moe_cache_cap = d->experts;
+	else if (experts != HCS_COUNT_UNSET)
+		cfg->moe_cache_cap = experts;
 }

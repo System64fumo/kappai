@@ -70,8 +70,6 @@ static const char *hfb_reason_str(host_fallback_reason r) {
 		return "missing capability";
 	case HFB_ERROR:
 		return "device error, retried on host";
-	case HFB_LAYER_NOT_OFFLOADED:
-		return "layer not offloaded";
 	default:
 		return "unknown";
 	}
@@ -448,6 +446,22 @@ int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max) {
 			backend_format_device(infos[i].name, d, out[n++], BACKEND_DEVICE_NAME_MAX);
 	}
 	return n;
+}
+
+bool backend_device_is_host(const char *spec) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return false;
+	if (strcmp(name, "cpu") == 0)
+		return true;
+
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n_backends; i++)
+		if (strcmp(infos[i].name, name) == 0)
+			return (infos[i].caps & BCAP_IS_HOST) != 0;
+	return false;
 }
 
 int backend_best_device(char *out, size_t out_cap) {

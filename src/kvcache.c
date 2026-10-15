@@ -10,7 +10,7 @@ static inline int kvcache_kv_heads_stride(const kvcache *c) {
 	return c->n_kv_heads_max;
 }
 
-static inline int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer) {
+int kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer) {
 	if (!c->has_host_kv || !m || !m->mixed_backend_mode)
 		return 0;
 	if (layer < 0 || layer >= m->n_layer_backends)
@@ -414,7 +414,7 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 
 	if (kv_backend != c->backend)
 		ensure_sync(kv_backend);
-	int put_layer  = (layer_on_host || slot_needs_host) ? kvcache_mirror_layer(c, layer) : layer;
+	int			put_layer = layer_on_host ? kvcache_mirror_layer(c, layer) : layer;
 	status_code st = kv_backend->kv_put(kv_backend, kb, vb, put_layer, pos, k_in, v_in, kvh_stride,
 										hd, c->n_ctx, kvh_active);
 
@@ -436,8 +436,8 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 				if (ts != OK)
 					return ts;
 			}
-			return host->kv_put(host, &c->k_host, &c->v_host, put_layer, pos, &k_host_buf,
-								&v_host_buf, kvh_stride, hd, c->n_ctx, kvh_active);
+			return host->kv_put(host, &c->k_host, &c->v_host, kvcache_mirror_layer(c, layer), pos,
+								&k_host_buf, &v_host_buf, kvh_stride, hd, c->n_ctx, kvh_active);
 		}
 	}
 	return st;

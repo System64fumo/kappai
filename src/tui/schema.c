@@ -775,7 +775,7 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	cfg->ctx_size	  = sc->ctx_size;
 	cfg->kv_quant	  = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
 	cfg->moe_pin	  = sc->moe_pin;
-	hcs_materialize(&sc->hcs, cfg);
+	hcs_materialize(&sc->hcs, sc->model, cfg);
 	cfg->debug			   = sc->debug;
 	cfg->use_mmap		   = sc->use_mmap;
 	cfg->flash_attn		   = sc->flash_attn;

@@ -326,10 +326,11 @@ void		backend_destroyed(backend *b);
 
 #define BACKEND_DEVICE_NAME_MAX 64
 
-int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
-int backend_best_device(char *out, size_t out_cap);
-int backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
-int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
+int	 backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
+bool backend_device_is_host(const char *spec);
+int	 backend_best_device(char *out, size_t out_cap);
+int	 backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
+int	 backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
 
@@ -345,13 +346,12 @@ backend *backend_host(void);
 void backend_host_use(backend *b);
 
 typedef enum {
-	HFB_OP_NOT_NATIVE		= 0,
-	HFB_BATCH_DESIGN		= 1,
-	HFB_WEIGHT_TYPE			= 2,
-	HFB_BUF_HOST_RESIDENT	= 3,
-	HFB_CAPABILITY			= 4,
-	HFB_ERROR				= 5,
-	HFB_LAYER_NOT_OFFLOADED = 6,
+	HFB_OP_NOT_NATIVE	  = 0,
+	HFB_BATCH_DESIGN	  = 1,
+	HFB_WEIGHT_TYPE		  = 2,
+	HFB_BUF_HOST_RESIDENT = 3,
+	HFB_CAPABILITY		  = 4,
+	HFB_ERROR			  = 5,
 } host_fallback_reason;
 
 void backend_report_host_fallback(const backend *device, const char *op,

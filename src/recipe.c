@@ -1474,10 +1474,13 @@ static status_code op_attention_impl(const recipe_op *op, struct model *m, struc
 	int use_swa = (sliding_window > 0) && (li >= 0) && model_layer_is_sliding(m, li) && has_swa;
 	profile_scope ps = profile_begin(prof, op->stage);
 	status_code	  st;
-	if (cache->mirror_remap && kvcache_slot_on_host(cache, kv_layer))
+	buffer		 *kb = &cache->k;
+	buffer		 *vb = &cache->v;
+	if (kvcache_layer_uses_host_kv(cache, m, li)) {
 		kv_layer = kvcache_mirror_layer(cache, kv_layer);
-	buffer *kb = kvcache_k_for_layer(cache, kv_layer);
-	buffer *vb = kvcache_v_for_layer(cache, kv_layer);
+		kb		 = &cache->k_host;
+		vb		 = &cache->v_host;
+	}
 	if (use_swa) {
 		backend *t = allow_backend_fallback ? OP_BACKEND(a, attention_swa) : a;
 		st = t->attention_swa(t, &slots[op->in[0]], kb, vb, &slots[op->out], kv_layer, pos, n_heads,

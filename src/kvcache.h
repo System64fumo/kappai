@@ -52,6 +52,7 @@ void		kvcache_free(kvcache *c);
 void		kvcache_reset(kvcache *c);
 
 status_code kvcache_alloc_host_mirror(kvcache *c, const model *m);
+int			kvcache_layer_uses_host_kv(const kvcache *c, const model *m, int layer);
 
 static inline int kvcache_mirror_layer(const kvcache *c, int layer) {
 	if (!c->mirror_remap || layer < 0 || layer >= c->n_mirror_remap)
@@ -66,14 +67,6 @@ static inline int kvcache_slot_on_host(const kvcache *c, int slot) {
 	if (slot < 0 || slot >= c->n_kv_slot_flags)
 		return 0;
 	return c->kv_slot_on_host[slot];
-}
-
-static inline buffer *kvcache_k_for_layer(kvcache *c, int layer) {
-	return kvcache_slot_on_host(c, layer) ? &c->k_host : &c->k;
-}
-
-static inline buffer *kvcache_v_for_layer(kvcache *c, int layer) {
-	return kvcache_slot_on_host(c, layer) ? &c->v_host : &c->v;
 }
 
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
