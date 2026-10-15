@@ -2,6 +2,7 @@
 #include "dialog.h"
 #include "editor.h"
 #include "engine.h"
+#include "hcs.h"
 #include "menu.h"
 #include "schema.h"
 #include "server/openai.h"
@@ -56,6 +57,12 @@ static void wait_for_keypress(void) {
 }
 
 static int run_saved_config(const saved_config *sc, bool server_mode) {
+	char hcs_err[HCS_ERR_MAX];
+	if (hcs_validate(&sc->hcs, sc->model, hcs_err, sizeof(hcs_err)) < 0) {
+		fprintf(stderr, "kappai: malformed/misconfigured config '%s':\n%s", sc->name, hcs_err);
+		return 1;
+	}
+
 	config	 cfg;
 	cli_args a;
 	sc_materialize(sc, &cfg, &a);

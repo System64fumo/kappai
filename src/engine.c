@@ -269,18 +269,11 @@ static int run_interactive(context *c, cli_args *a) {
 }
 
 static int list_devices(void) {
-	backend_info infos[BACKEND_MAX];
-	int			 n = backend_list(infos, BACKEND_MAX);
+	char devices[BACKEND_MAX * 8][BACKEND_DEVICE_NAME_MAX];
+	int	 n = backend_enum_devices(devices, BACKEND_MAX * 8);
 	printf("available compute devices:\n");
-	for (int i = 0; i < n; i++) {
-		if (!infos[i].available)
-			continue;
-		for (int d = 0; d < infos[i].n_devices; d++) {
-			char device[64];
-			backend_format_device(infos[i].name, d, device, sizeof(device));
-			printf("  %s\n", device);
-		}
-	}
+	for (int i = 0; i < n; i++)
+		printf("  %s\n", devices[i]);
 	return 0;
 }
 

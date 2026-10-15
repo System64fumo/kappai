@@ -2144,23 +2144,58 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 	return OK;
 }
 
+static status_code metadata_layer_counts(const gguf_ctx *g, const char *prefix, int *n_all,
+										 int *n_nextn) {
+	int32_t v32;
+	if (req_i32(g, prefix, "block_count", &v32) != OK)
+		return ERR_FORMAT;
+	*n_all	 = v32;
+	*n_nextn = 0;
+	if (akey_i32(g, prefix, "nextn_predict_layers", &v32) == OK)
+		*n_nextn = v32;
+	if (*n_nextn < 0 || *n_nextn >= *n_all) {
+		WARN("model_load: '%s.nextn_predict_layers'=%d is out of range for "
+			 "block_count=%d; ignoring (treating as 0)",
+			 prefix, *n_nextn, *n_all);
+		*n_nextn = 0;
+	}
+	return OK;
+}
+
+status_code model_probe_shape(const char *path, int *n_layers, int *n_experts) {
+	gguf_ctx	g;
+	status_code s = gguf_load_metadata(&g, path);
+	if (s != OK)
+		return s;
+
+	const char *prefix = NULL;
+	int			n_all = 0, n_nextn = 0;
+	model_arch	arch = arch_detect(&g);
+	if (arch == ARCH_UNKNOWN || gguf_get_str(&g, "general.architecture", &prefix) != OK ||
+		metadata_layer_counts(&g, prefix, &n_all, &n_nextn) != OK) {
+		gguf_free(&g);
+		return ERR_FORMAT;
+	}
+
+	int32_t experts = 0;
+	if (akey_i32(&g, prefix, "expert_count", &experts) != OK) {
+		experts = 0;
+		if (arch_lookup(arch)->is_moe)
+			s = ERR_FORMAT;
+	}
+
+	*n_layers  = n_all - n_nextn;
+	*n_experts = experts;
+	gguf_free(&g);
+	return s;
+}
+
 static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 	int32_t v32;
 	float	vf;
-	if (req_i32(g, prefix, "block_count", &v32) != OK) {
+	int		n_layer_all, n_layer_nextn;
+	if (metadata_layer_counts(g, prefix, &n_layer_all, &n_layer_nextn) != OK)
 		return ERR_FORMAT;
-	}
-	int n_layer_all	  = v32;
-	int n_layer_nextn = 0;
-	if (akey_i32(g, prefix, "nextn_predict_layers", &v32) == OK) {
-		n_layer_nextn = v32;
-	}
-	if (n_layer_nextn < 0 || n_layer_nextn >= n_layer_all) {
-		WARN("model_load: '%s.nextn_predict_layers'=%d is out of range for "
-			 "block_count=%d; ignoring (treating as 0)",
-			 prefix, n_layer_nextn, n_layer_all);
-		n_layer_nextn = 0;
-	}
 	m->n_layers = n_layer_all - n_layer_nextn;
 	if (n_layer_nextn > 0) {
 		DEBUG("skipping %d NextN/MTP layers (n_layers=%d of %d)", n_layer_nextn, m->n_layers,

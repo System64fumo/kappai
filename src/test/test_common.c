@@ -87,6 +87,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_MOE_STREAM]		 = "moe_stream",
 		[OPFAM_TOOLCALL]		 = "toolcall",
 		[OPFAM_REAL_SHAPE]		 = "real_shape",
+		[OPFAM_HCS]				 = "hcs",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";

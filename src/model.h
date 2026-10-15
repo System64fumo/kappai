@@ -236,6 +236,7 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
 							 const char *repack_config, int requested_n_ctx);
+status_code model_probe_shape(const char *path, int *n_layers, int *n_experts);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);
 void		model_free(model *m);

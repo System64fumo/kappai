@@ -1,7 +1,9 @@
 #include "editor.h"
 
+#include "backend/backend.h"
 #include "common.h"
 #include "dialog.h"
+#include "hcs.h"
 #include "ui.h"
 
 #include <string.h>
@@ -10,6 +12,8 @@
 #define EDITOR_NAME_LABEL "Name"
 #define EDITOR_NAME_HINT "config file name, invalid characters are replaced with '_'"
 #define EDITOR_DEV_MAX 16
+#define EDITOR_HCS_HEADER_LINES 2
+#define EDITOR_HCS_TAG "[W.I.P]"
 #define EDITOR_MULTI_MAX 32
 
 typedef struct {
@@ -27,12 +31,98 @@ typedef struct {
 	const field_desc *f;
 } field_validate_ud;
 
-static int editor_tab_rows(int tab) {
-	return SCHEMA_TABS[tab].n_fields + (tab == 0 ? 1 : 0);
+typedef enum {
+	HCS_ROW_DEVICE,
+	HCS_ROW_TASKS,
+	HCS_ROW_LAYERS,
+	HCS_ROW_EXPERTS,
+	HCS_ROW_COUNT,
+} hcs_row;
+
+static const char EDITOR_HCS_ENABLE_HINT[] =
+	"off: the model tab device runs everything; on: place layers and experts per device here";
+static const char EDITOR_MODEL_DEVICE_HINT[] =
+	"compute device to run on; with HCS enabled it is set in the hcs tab";
+
+static const char *const HCS_ROW_HINTS[HCS_ROW_COUNT] = {
+	"compute device, <backend>_<n>",
+	"phases this device runs for the weights it holds",
+	"transformer layers held, number or '*' (v1: all layers)",
+	"per-layer expert cache size, number, '*' or empty for the default",
+};
+
+static int editor_tab_count(void) {
+	return SCHEMA_TAB_COUNT + 1;
+}
+
+static bool editor_tab_is_hcs(int tab) {
+	return tab == SCHEMA_TAB_COUNT;
+}
+
+static const schema_tab *editor_schema_tab(int tab) {
+	return &SCHEMA_TABS[tab];
+}
+
+static int editor_header_lines(int tab) {
+	return editor_tab_is_hcs(tab) ? EDITOR_HCS_HEADER_LINES : 0;
+}
+
+static int editor_tab_rows(const editor_state *st, int tab) {
+	if (editor_tab_is_hcs(tab))
+		return 1 + (st->sc.hcs.enabled ? st->sc.hcs.n_devices * HCS_ROW_COUNT : 0);
+	return editor_schema_tab(tab)->n_fields + (tab == 0 ? 1 : 0) +
+		   (tab == 0 && !st->sc.hcs.enabled ? 1 : 0);
+}
+
+static int editor_last_row(const editor_state *st, int tab) {
+	return MAX(editor_tab_rows(st, tab) - 1, 0);
+}
+
+static bool editor_is_name_row(int tab, int row) {
+	return tab == 0 && row == 0;
+}
+
+static bool editor_is_model_device_row(const editor_state *st, int tab, int row) {
+	return tab == 0 && !st->sc.hcs.enabled && row == editor_schema_tab(0)->n_fields + 1;
 }
 
 static const field_desc *editor_field_at(int tab, int row) {
-	return &SCHEMA_TABS[tab].fields[row - (tab == 0 ? 1 : 0)];
+	return &editor_schema_tab(tab)->fields[row - (tab == 0 ? 1 : 0)];
+}
+
+static void editor_hcs_row_text(const hcs_config *h, int row, char *label, size_t label_cap,
+								char *val, size_t val_cap) {
+	if (row == 0) {
+		snprintf(label, label_cap, "Enable HCS");
+		snprintf(val, val_cap, "%s", h->enabled ? "on" : "off");
+		return;
+	}
+	int				  block = row - 1;
+	const hcs_device *d		= &h->devices[block / HCS_ROW_COUNT];
+	char			  count[16];
+	switch (block % HCS_ROW_COUNT) {
+	case HCS_ROW_DEVICE:
+		snprintf(label, label_cap, "Device %d", block / HCS_ROW_COUNT + 1);
+		snprintf(val, val_cap, "%s", d->name);
+		break;
+	case HCS_ROW_TASKS:
+		snprintf(label, label_cap, "  Tasks");
+		hcs_format_tasks(d->tasks, val, val_cap);
+		break;
+	case HCS_ROW_LAYERS:
+		snprintf(label, label_cap, "  Layers");
+		snprintf(val, val_cap, "%s",
+				 d->layers == HCS_COUNT_UNSET ? "(not set)"
+											  : hcs_format_count(d->layers, count, sizeof(count)));
+		break;
+	default:
+		snprintf(label, label_cap, "  Experts");
+		snprintf(val, val_cap, "%s",
+				 d->experts == HCS_COUNT_UNSET
+					 ? "(default)"
+					 : hcs_format_count(d->experts, count, sizeof(count)));
+		break;
+	}
 }
 
 static int editor_validate_field(const char *value, char *err, size_t errlen, void *ud) {
@@ -41,21 +131,28 @@ static int editor_validate_field(const char *value, char *err, size_t errlen, vo
 	return sc_parse_value(&probe, vu->f, value, err, errlen);
 }
 
-static int editor_rows(void) {
-	int rows = LINES - 5;
+static int editor_rows(int tab) {
+	int rows = LINES - 5 - editor_header_lines(tab);
 	if (rows < 1)
 		rows = 1;
 	return rows;
 }
 
 static void editor_scroll(editor_state *st) {
-	int rows = editor_rows();
+	int rows = editor_rows(st->tab);
 	if (st->row < st->scroll)
 		st->scroll = st->row;
 	if (st->row >= st->scroll + rows)
 		st->scroll = st->row - rows + 1;
 	if (st->scroll < 0)
 		st->scroll = 0;
+}
+
+static void editor_switch_tab(editor_state *st, int tab) {
+	st->tab		  = tab;
+	st->row		  = MIN(st->row, editor_last_row(st, tab));
+	st->scroll	  = 0;
+	st->status[0] = '\0';
 }
 
 static void editor_set_status(editor_state *st, int kind, const char *msg) {
@@ -78,13 +175,12 @@ static void editor_draw_value(int y, int x, int w, const char *val, bool selecte
 	}
 }
 
-static void editor_draw(const editor_state *st) {
-	erase();
-
+static void editor_draw_tabs(const editor_state *st) {
 	int tx = 2;
-	for (int t = 0; t < SCHEMA_TAB_COUNT; t++) {
-		char label[32];
-		snprintf(label, sizeof(label), " %s ", SCHEMA_TABS[t].name);
+	for (int t = 0; t < editor_tab_count(); t++) {
+		char label[48];
+		snprintf(label, sizeof(label), " %s ",
+				 editor_tab_is_hcs(t) ? "hcs" : editor_schema_tab(t)->name);
 		int	   w	= (int)strlen(label);
 		chtype attr = (t == st->tab) ? (A_REVERSE | A_BOLD) : ui_attr(UI_DIM);
 		ui_putn(0, tx, label, w, attr);
@@ -96,30 +192,63 @@ static void editor_draw(const editor_state *st) {
 	for (int i = 1; i < COLS - 1; i++)
 		addch(ACS_HLINE);
 	attroff(ui_attr(UI_DIM));
+}
 
+static void editor_draw_rows(const editor_state *st) {
 	int value_x	 = 3 + EDITOR_LABEL_W + 2;
 	int value_w	 = COLS - value_x - 2;
-	int rows	 = editor_rows();
-	int tab_rows = editor_tab_rows(st->tab);
+	int rows	 = editor_rows(st->tab);
+	int tab_rows = editor_tab_rows(st, st->tab);
 	int shown	 = MIN(rows, tab_rows - st->scroll);
+	int top		 = 2 + editor_header_lines(st->tab);
 
 	for (int i = 0; i < shown; i++) {
 		int				  row		  = st->scroll + i;
-		int				  y			  = 2 + i;
-		bool			  is_name_row = (st->tab == 0 && row == 0);
-		const field_desc *f			  = is_name_row ? NULL : editor_field_at(st->tab, row);
-		const char		 *label		  = is_name_row ? EDITOR_NAME_LABEL : f->label;
+		int				  y			  = top + i;
+		bool			  is_name_row = editor_is_name_row(st->tab, row);
 		bool			  selected	  = (row == st->row);
+		const field_desc *f			  = NULL;
+		char			  label[EDITOR_LABEL_W + 8];
+		char			  vbuf[SC_SYSTEM_MAX + 16];
+		const char		 *val;
+
+		if (editor_tab_is_hcs(st->tab)) {
+			editor_hcs_row_text(&st->sc.hcs, row, label, sizeof(label), vbuf, sizeof(vbuf));
+			val = vbuf;
+		} else if (is_name_row) {
+			snprintf(label, sizeof(label), "%s", EDITOR_NAME_LABEL);
+			val = st->sc.name;
+		} else if (editor_is_model_device_row(st, st->tab, row)) {
+			snprintf(label, sizeof(label), "Device");
+			val = st->sc.hcs.devices[0].name;
+		} else {
+			f = editor_field_at(st->tab, row);
+			snprintf(label, sizeof(label), "%s", f->label);
+			val = sc_format_value(&st->sc, f, vbuf, sizeof(vbuf));
+		}
 
 		if (selected)
 			ui_putn(y, 1, ">", 1, A_BOLD);
 		ui_putn(y, 3, label, EDITOR_LABEL_W, selected ? A_BOLD : ui_attr(UI_DIM));
-
-		char		vbuf[SC_SYSTEM_MAX + 16];
-		const char *val =
-			is_name_row ? st->sc.name : sc_format_value(&st->sc, f, vbuf, sizeof(vbuf));
 		editor_draw_value(y, value_x, value_w, val, selected);
 	}
+}
+
+static void editor_draw_hcs_banner(const editor_state *st) {
+	static const char warn[] = EDITOR_HCS_TAG " experimental, advanced users only";
+	static const char on[]	 = "v1: one device, prefill + decode, all layers";
+	static const char off[]	 = "disabled: the device selected in the model tab runs everything";
+	ui_putn(2, 3, warn, COLS - 6, A_BOLD | ui_attr(UI_ERR));
+	ui_putn(3, 3, st->sc.hcs.enabled ? on : off, COLS - 6, ui_attr(UI_DIM));
+}
+
+static void editor_draw(const editor_state *st) {
+	erase();
+	editor_draw_tabs(st);
+
+	if (editor_tab_is_hcs(st->tab))
+		editor_draw_hcs_banner(st);
+	editor_draw_rows(st);
 
 	if (st->status[0])
 		ui_putn(LINES - 2, 2, st->status, COLS - 4, ui_attr(st->status_kind));
@@ -175,23 +304,20 @@ static void editor_edit_select(editor_state *st, const field_desc *f) {
 	st->status[0] = '\0';
 }
 
-static void editor_edit_device(editor_state *st, const field_desc *f) {
-	char		specs[EDITOR_DEV_MAX][SC_TEXT_MAX];
+static void editor_edit_device(editor_state *st, const char *title, char *cur, size_t cap) {
+	char		specs[EDITOR_DEV_MAX][BACKEND_DEVICE_NAME_MAX];
 	const char *choices[EDITOR_DEV_MAX + 2];
-	int			n	  = sc_enum_devices(specs, EDITOR_DEV_MAX);
-	char	   *cur	  = (char *)sc_field_ptr(&st->sc, f);
+	int			n	  = backend_enum_devices(specs, EDITOR_DEV_MAX);
 	int			extra = 0;
 
 	for (int i = 0; i < n; i++)
 		choices[i] = specs[i];
-	if (cur[0]) {
-		bool found = false;
-		for (int i = 0; i < n; i++)
-			if (strcmp(specs[i], cur) == 0)
-				found = true;
-		if (!found)
-			choices[n + extra++] = cur;
-	}
+	bool found = false;
+	for (int i = 0; i < n; i++)
+		if (strcmp(specs[i], cur) == 0)
+			found = true;
+	if (cur[0] && !found)
+		choices[n + extra++] = cur;
 	int cur_idx = 0;
 	for (int i = 0; i < n + extra; i++)
 		if (strcmp(choices[i], cur) == 0)
@@ -200,26 +326,21 @@ static void editor_edit_device(editor_state *st, const field_desc *f) {
 	choices[n + extra]		   = custom;
 	int total				   = n + extra + 1;
 
-	int idx = ui_select(f->label, choices, total, cur[0] ? cur_idx : 0);
-	if (idx < 0) {
-		st->status[0] = '\0';
+	int idx		  = ui_select(title, choices, total, cur_idx);
+	st->status[0] = '\0';
+	if (idx < 0)
 		return;
-	}
 
 	if (idx == total - 1) {
-		char buf[SC_TEXT_MAX];
-		int	 r = ui_input(f->label, cur, buf, sizeof(buf), NULL, NULL, NULL);
-		if (r <= 0) {
-			st->status[0] = '\0';
+		char buf[BACKEND_DEVICE_NAME_MAX];
+		if (ui_input(title, cur, buf, sizeof(buf), NULL, NULL, NULL) <= 0)
 			return;
-		}
-		snprintf(cur, f->max_len, "%s", buf);
+		snprintf(cur, cap, "%s", buf);
 		st->dirty = true;
 	} else if (strcmp(cur, choices[idx]) != 0) {
-		snprintf(cur, f->max_len, "%s", choices[idx]);
+		snprintf(cur, cap, "%s", choices[idx]);
 		st->dirty = true;
 	}
-	st->status[0] = '\0';
 }
 
 static void editor_edit_multi(editor_state *st, const field_desc *f) {
@@ -243,9 +364,6 @@ static void editor_edit_field(editor_state *st, const field_desc *f) {
 	switch (f->uik) {
 	case UIK_SELECT:
 		editor_edit_select(st, f);
-		return;
-	case UIK_DEVICE:
-		editor_edit_device(st, f);
 		return;
 	case UIK_MULTI:
 		editor_edit_multi(st, f);
@@ -285,7 +403,92 @@ static void editor_edit_field(editor_state *st, const field_desc *f) {
 	st->status[0] = '\0';
 }
 
+static int editor_validate_count(const char *value, char *err, size_t errlen, void *ud) {
+	bool allow_unset = *(bool *)ud;
+	int	 parsed;
+	if (!value[0] && allow_unset)
+		return 0;
+	if (hcs_parse_count(value, &parsed) == 0)
+		return 0;
+	snprintf(err, errlen, "expected a non-negative integer or '*'%s",
+			 allow_unset ? ", or empty for the default" : "");
+	return -1;
+}
+
+static void editor_edit_count(editor_state *st, const char *title, int *value, bool allow_unset) {
+	char count[16];
+	char initial[16];
+	char buf[16];
+	snprintf(initial, sizeof(initial), "%s", hcs_format_count(*value, count, sizeof(count)));
+
+	int r = ui_input(title, initial, buf, sizeof(buf), editor_validate_count, &allow_unset, NULL);
+	st->status[0] = '\0';
+	if (r <= 0)
+		return;
+	int parsed = HCS_COUNT_UNSET;
+	if (buf[0])
+		hcs_parse_count(buf, &parsed);
+	if (parsed == *value)
+		return;
+	*value	  = parsed;
+	st->dirty = true;
+}
+
+static void editor_edit_tasks(editor_state *st, hcs_device *d) {
+	static const char *const choices[] = {"prefill", "decode"};
+	bool sel[]	  = {(d->tasks & HCS_TASK_PREFILL) != 0, (d->tasks & HCS_TASK_DECODE) != 0};
+	st->status[0] = '\0';
+	if (!ui_toggle("Tasks", choices, 2, sel))
+		return;
+	d->tasks  = (sel[0] ? HCS_TASK_PREFILL : 0) | (sel[1] ? HCS_TASK_DECODE : 0);
+	st->dirty = true;
+}
+
+static void editor_toggle_hcs(editor_state *st) {
+	hcs_config *h = &st->sc.hcs;
+	st->status[0] = '\0';
+	if (!h->enabled &&
+		!ui_confirm("Enable HCS?", "HCS (Heterogeneous Compute Scheduler) is a work in progress "
+								   "and intended for advanced users only.\n\n"
+								   "Misconfiguration can prevent the model from loading."))
+		return;
+	h->enabled = !h->enabled;
+	if (h->enabled && h->n_devices == 0)
+		hcs_set_simple(h, h->devices[0].name);
+	st->dirty = true;
+}
+
+static void editor_edit_hcs_row(editor_state *st, int row) {
+	if (row == 0) {
+		editor_toggle_hcs(st);
+		return;
+	}
+	int			block = row - 1;
+	hcs_device *d	  = &st->sc.hcs.devices[block / HCS_ROW_COUNT];
+	switch (block % HCS_ROW_COUNT) {
+	case HCS_ROW_DEVICE:
+		editor_edit_device(st, "Device", d->name, sizeof(d->name));
+		return;
+	case HCS_ROW_TASKS:
+		editor_edit_tasks(st, d);
+		return;
+	case HCS_ROW_LAYERS:
+		editor_edit_count(st, "Layers", &d->layers, false);
+		return;
+	default:
+		editor_edit_count(st, "Experts", &d->experts, true);
+		return;
+	}
+}
+
 static void editor_save(editor_state *st) {
+	char hcs_err[HCS_ERR_MAX];
+	if (hcs_validate(&st->sc.hcs, st->sc.model, hcs_err, sizeof(hcs_err)) < 0) {
+		ui_message("Cannot save: invalid HCS configuration", hcs_err, true);
+		editor_set_status(st, UI_ERR, "not saved: HCS validation failed");
+		beep();
+		return;
+	}
 	char err[SC_ERR_MAX];
 	if (sc_save(&st->sc, st->orig_name, err, sizeof(err)) < 0) {
 		editor_set_status(st, UI_ERR, err);
@@ -307,10 +510,26 @@ static bool editor_confirm_exit(editor_state *st) {
 }
 
 static void editor_help(const editor_state *st) {
-	bool			  is_name_row = (st->tab == 0 && st->row == 0);
-	const field_desc *f			  = is_name_row ? NULL : editor_field_at(st->tab, st->row);
-	const char		 *label		  = is_name_row ? EDITOR_NAME_LABEL : f->label;
-	const char		 *hint		  = is_name_row ? EDITOR_NAME_HINT : sc_field_hint(f);
+	const char *label;
+	const char *hint;
+	char		label_buf[EDITOR_LABEL_W + 8];
+	char		value_buf[SC_SYSTEM_MAX + 16];
+	if (editor_tab_is_hcs(st->tab)) {
+		editor_hcs_row_text(&st->sc.hcs, st->row, label_buf, sizeof(label_buf), value_buf,
+							sizeof(value_buf));
+		label = label_buf;
+		hint = st->row == 0 ? EDITOR_HCS_ENABLE_HINT : HCS_ROW_HINTS[(st->row - 1) % HCS_ROW_COUNT];
+	} else if (editor_is_model_device_row(st, st->tab, st->row)) {
+		label = "Device";
+		hint  = EDITOR_MODEL_DEVICE_HINT;
+	} else if (editor_is_name_row(st->tab, st->row)) {
+		label = EDITOR_NAME_LABEL;
+		hint  = EDITOR_NAME_HINT;
+	} else {
+		const field_desc *f = editor_field_at(st->tab, st->row);
+		label				= f->label;
+		hint				= sc_field_hint(f);
+	}
 
 	char body[SC_SYSTEM_MAX + 192];
 	snprintf(body, sizeof(body),
@@ -356,20 +575,16 @@ int editor_run(const sc_entry *entry) {
 			st.status[0] = '\0';
 			break;
 		case KEY_DOWN:
-			if (st.row < editor_tab_rows(st.tab) - 1)
+			if (st.row < editor_last_row(&st, st.tab))
 				st.row++;
 			st.status[0] = '\0';
 			break;
 		case KEY_PPAGE:
-			st.row -= editor_rows();
-			if (st.row < 0)
-				st.row = 0;
+			st.row		 = MAX(st.row - editor_rows(st.tab), 0);
 			st.status[0] = '\0';
 			break;
 		case KEY_NPAGE:
-			st.row += editor_rows();
-			if (st.row > editor_tab_rows(st.tab) - 1)
-				st.row = editor_tab_rows(st.tab) - 1;
+			st.row		 = MIN(st.row + editor_rows(st.tab), editor_last_row(&st, st.tab));
 			st.status[0] = '\0';
 			break;
 		case KEY_HOME:
@@ -377,29 +592,24 @@ int editor_run(const sc_entry *entry) {
 			st.status[0] = '\0';
 			break;
 		case KEY_END:
-			st.row		 = editor_tab_rows(st.tab) - 1;
+			st.row		 = editor_last_row(&st, st.tab);
 			st.status[0] = '\0';
 			break;
 		case '\t':
-			st.tab++;
-			if (st.tab >= SCHEMA_TAB_COUNT)
-				st.tab = 0;
-			st.row		 = MIN(st.row, editor_tab_rows(st.tab) - 1);
-			st.scroll	 = 0;
-			st.status[0] = '\0';
+			editor_switch_tab(&st, (st.tab + 1) % editor_tab_count());
 			break;
 		case KEY_BTAB:
-			st.tab--;
-			if (st.tab < 0)
-				st.tab = SCHEMA_TAB_COUNT - 1;
-			st.row		 = MIN(st.row, editor_tab_rows(st.tab) - 1);
-			st.scroll	 = 0;
-			st.status[0] = '\0';
+			editor_switch_tab(&st, (st.tab + editor_tab_count() - 1) % editor_tab_count());
 			break;
 		case '\n':
 		case KEY_ENTER:
-			if (st.tab == 0 && st.row == 0)
+			if (editor_tab_is_hcs(st.tab))
+				editor_edit_hcs_row(&st, st.row);
+			else if (editor_is_name_row(st.tab, st.row))
 				editor_edit_name(&st);
+			else if (editor_is_model_device_row(&st, st.tab, st.row))
+				editor_edit_device(&st, "Device", st.sc.hcs.devices[0].name,
+								   sizeof(st.sc.hcs.devices[0].name));
 			else
 				editor_edit_field(&st, editor_field_at(st.tab, st.row));
 			break;

@@ -324,6 +324,10 @@ status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
 
+#define BACKEND_DEVICE_NAME_MAX 64
+
+int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
+int backend_best_device(char *out, size_t out_cap);
 int backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
 int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 

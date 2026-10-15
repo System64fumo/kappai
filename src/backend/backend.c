@@ -437,29 +437,44 @@ status_code backend_create_host(backend **out) {
 	return OK;
 }
 
-status_code backend_create_best(backend **out) {
-	backend_load();
-	int best_priority = -1;
-	int best_idx	  = -1;
+int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max) {
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	int			 n			= 0;
+	for (int i = 0; i < n_backends; i++) {
+		if (!infos[i].available)
+			continue;
+		for (int d = 0; d < infos[i].n_devices && n < max; d++)
+			backend_format_device(infos[i].name, d, out[n++], BACKEND_DEVICE_NAME_MAX);
+	}
+	return n;
+}
 
-	for (int i = 0; i < g_registry_count; i++) {
-		backend probe;
-		memset(&probe, 0, sizeof(probe));
-		if (g_registry[i].ctor(&probe) != OK)
+int backend_best_device(char *out, size_t out_cap) {
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends	   = backend_list(infos, BACKEND_MAX);
+	int			 best_priority = -1;
+	int			 best_idx	   = -1;
+	for (int i = 0; i < n_backends; i++) {
+		if (!infos[i].available || (infos[i].caps & BCAP_IS_HOST))
 			continue;
-		if (probe.probe && probe.probe() != OK)
+		if (infos[i].priority <= best_priority)
 			continue;
-		if (probe.caps & BCAP_IS_HOST)
-			continue;
-		if (probe.priority <= best_priority)
-			continue;
-		best_priority = probe.priority;
+		best_priority = infos[i].priority;
 		best_idx	  = i;
 	}
-
 	if (best_idx < 0)
-		return backend_create_host(out);
-	return make_backend(&g_registry[best_idx], 0, out);
+		return backend_format_device("cpu", 0, out, out_cap);
+	return backend_format_device(infos[best_idx].name, 0, out, out_cap);
+}
+
+status_code backend_create_best(backend **out) {
+	char spec[BACKEND_DEVICE_NAME_MAX];
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	backend_best_device(spec, sizeof(spec));
+	backend_parse_device(spec, name, sizeof(name), &device_index);
+	return backend_create(name, device_index, out);
 }
 
 int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
