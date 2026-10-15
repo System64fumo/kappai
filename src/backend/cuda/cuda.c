@@ -364,9 +364,6 @@ static void cuda_buffer_free(backend *self, buffer *buf) {
      * cuda_internal.h): cudaHostAlloc() must go back through cudaFreeHost(). */
     int   pinned = cuda_host_alloc_pinned(host_ptr);
     
-    if (getenv("CUDA_DBG_FREE"))
-        fprintf(stderr, "[F] h=%p hp=%p sz=%zu off=%zu\n", handle, host_ptr, buf->size, buf->offset);
-    
     buf->handle = NULL;
     buf->host_ptr = NULL;
     buf->size   = 0;
@@ -580,7 +577,7 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
-    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+    if (!cuda_matmul_type_native(self, w_type)) {
         backend *host = backend_host();
         if (host && host->matmul) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -655,33 +652,7 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
             return ERR_UNSUPPORTED;
     }
 
-    if (getenv("CUDA_DBG_MATMUL")) {
-        static int dbg_calls = 0;
-        if (dbg_calls < 12) {
-            (void)cudaGetLastError();
-            float ydev[6] = {0,0,0,0,0,0};
-            int yr = n > 6 ? 6 : n;
-            cudaMemcpy(ydev, cuda_dev_ptr(y), (size_t)yr * sizeof(float), cudaMemcpyDeviceToHost);
-            const float *xh = (const float *)x->host_ptr;
-            const float *yh = (const float *)y->host_ptr;
-            float xmin = 1e30f, xmax = -1e30f, xsum = 0;
-            int xi = k > 6000 ? 6000 : k;
-            for (int i = 0; i < xi; i++) {
-                if (xh[i] < xmin) xmin = xh[i];
-                if (xh[i] > xmax) xmax = xh[i];
-                xsum += xh[i];
-            }
-            float ymax = 0; int yn = n > 6000 ? 6000 : n;
-            float ybh[6]; int ybn = n > 6 ? 6 : n; for (int i=0;i<ybn;i++) ybh[i]=yh?yh[i]:0;
-            for (int i = 0; i < yn; i++) { float a = yh ? yh[i] : 0; if (a < 0) a = -a; if (a > ymax) ymax = a; }
-            fprintf(stderr, "[CUDA-MM %d] wt=%u n=%d k=%d hy=%d x:min=%.4g max=%.4g | ydev0=%g devmax=%g host0=%g hostmax=%.4g\n",
-                    dbg_calls, w_type, n, k, y->host_ptr != NULL, xmin, xmax,
-                    ydev[0], (double)ydev[1], ybh[0], ymax);
-            dbg_calls++;
-        }
-    }
-
-    if (!cuda_lazy_d2h_for("mm") && y->host_ptr) {
+        if (!cuda_lazy_d2h_for("mm") && y->host_ptr) {
         if (cudaMemcpy((void *)y->host_ptr, y_dev, (size_t)n * sizeof(float), cudaMemcpyDeviceToHost) !=
             cudaSuccess)
             return ERR_INTERNAL;
@@ -699,7 +670,7 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
-    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+    if (!cuda_matmul_type_native(self, w_type)) {
         backend *host = backend_host();
         if (host && host->matmul_residual) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -842,33 +813,7 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         }
         return ERR_UNSUPPORTED;
     }
-    if (getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
-        backend *host = backend_host();
-        if (host && host->matmul_ffn_down) {
-            size_t wb = w->size, gb = (size_t)k * sizeof(float),
-                   yb = (size_t)n * sizeof(float);
-            void  *wh = cuda_host_stage_in(w, wb);
-            void  *gh = cuda_host_stage_in(gate, gb);
-            void  *uh = cuda_host_stage_in(up, gb);
-            void  *yh = malloc(yb ? yb : 1);
-            status_code st = ERR_OUT_OF_MEMORY;
-            if (wh && gh && uh && yh) {
-                buffer whb = cuda_host_buf(wh, wb, host);
-                buffer ghb = cuda_host_buf(gh, gb, host);
-                buffer uhb = cuda_host_buf(uh, gb, host);
-                buffer yhb = cuda_host_buf(yh, yb, host);
-                st = host->matmul_ffn_down(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
-                                           activation);
-                if (st == OK)
-                    st = cuda_host_stage_out(y, yh, yb);
-            }
-            free(wh); free(gh); free(uh); free(yh);
-            return st;
-        }
-        return ERR_UNSUPPORTED;
-    }
-
-    struct cuda_priv *priv = cuda_priv(self);
+        struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
     /* NO H2D: device buffers are source of truth. */
@@ -952,33 +897,7 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
         }
         return ERR_UNSUPPORTED;
     }
-    if (getenv("KAPPAI_CUDA_HOST_FFN_DOWN")) {
-        backend *host = backend_host();
-        if (host && host->matmul_ffn_down_batch) {
-            size_t wb = w->size, gb = (size_t)m * (size_t)k * sizeof(float),
-                   yb = (size_t)m * (size_t)n * sizeof(float);
-            void *wh = cuda_host_stage_in(w, wb);
-            void *gh = cuda_host_stage_in(gate, gb);
-            void *uh = cuda_host_stage_in(up, gb);
-            void *yh = malloc(yb ? yb : 1);
-            status_code st = ERR_OUT_OF_MEMORY;
-            if (wh && gh && uh && yh) {
-                buffer whb = cuda_host_buf(wh, wb, host);
-                buffer ghb = cuda_host_buf(gh, gb, host);
-                buffer uhb = cuda_host_buf(uh, gb, host);
-                buffer yhb = cuda_host_buf(yh, yb, host);
-                st = host->matmul_ffn_down_batch(host, &whb, w_type, &ghb, &uhb, &yhb, n, k,
-                                                 activation, m);
-                if (st == OK)
-                    st = cuda_host_stage_out(y, yh, yb);
-            }
-            free(wh); free(gh); free(uh); free(yh);
-            return st;
-        }
-        return ERR_UNSUPPORTED;
-    }
-
-    struct cuda_priv *priv = cuda_priv(self);
+        struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
     const void *w_dev = cuda_dev_ptr((buffer *)w);
@@ -1189,26 +1108,6 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     }
     w_types = eff_types;
 
-    for (int c = 0; c < n_matmuls; c++)    if (getenv("KAPPAI_CUDA_HOST_MULTI")) {
-        backend *host = backend_host();
-        if (host && host->matmul_multi) {
-            status_code st = host->matmul_multi(host, w, w_types, x, y, n_list, k, n_matmuls);
-            if (st != OK) return st;
-            for (int c = 0; c < n_matmuls; c++) {
-                if (y[c]->host_ptr) {
-                    if (cudaMemcpy(cuda_dev_ptr(y[c]), y[c]->host_ptr,
-                                   (size_t)n_list[c] * sizeof(float),
-                                   cudaMemcpyHostToDevice) != cudaSuccess)
-                        return ERR_OUT_OF_MEMORY;
-                }
-            }
-            return OK;
-        }
-        return ERR_UNSUPPORTED;
-    }
-    if (getenv("KAPPAI_CUDA_DISABLE_MULTI"))
-        return ERR_UNSUPPORTED;
-
     /* Non-native or mixed types (e.g. Q4_K/Q6_K, or mixed columns):
      * degrade to per-column singles, which have host fallback + refresh. */
     uint32_t first = w_types[0];
@@ -1231,12 +1130,6 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
-    if (getenv("KAPPAI_CUDA_DBG_MULTI")) {
-        fprintf(stderr, "[multi] nm=%d k=%d n=", n_matmuls, k);
-        for (int c = 0; c < n_matmuls; c++) fprintf(stderr, "%d,", n_list[c]);
-        fprintf(stderr, " x=%p\n", (void *)cuda_dev_ptr((buffer *)x));
-    }
-
     /* NO H2D for x: device buffer is source of truth. */
 
     const void *w_dev[8];
@@ -1249,24 +1142,6 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     }
 
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
-    if (getenv("KAPPAI_CUDA_MULTI_SINGLE")) {
-        for (int c = 0; c < n_matmuls; c++) {
-            if (first == GGML_TYPE_Q8_0 )
-                cuda_matmul_q8_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream);
-            else if (first == GGML_TYPE_Q4_0 )
-                cuda_matmul_q4_0(w_dev[c], x_dev, y_dev[c], n_list_copy[c], k, stream);
-            else
-                return ERR_UNSUPPORTED;
-        }
-        for (int c = 0; c < n_matmuls; c++) {
-            if (!cuda_lazy_d2h_for("multi") && y[c]->host_ptr) {
-                if (cudaMemcpy((void *)y[c]->host_ptr, y_dev[c], (size_t)n_list[c] * sizeof(float),
-                                cudaMemcpyDeviceToHost) != cudaSuccess)
-                    return ERR_INTERNAL;
-            }
-        }
-        return OK;
-    }
     if (first == GGML_TYPE_Q8_0 )
         cuda_matmul_multi_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream);
     else if (first == GGML_TYPE_Q4_0 )
@@ -1281,40 +1156,7 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
         return OK;
     }
 
-    if (getenv("KAPPAI_CUDA_DBG_MULTI2")) {
-        cudaStreamSynchronize(stream);
         for (int c = 0; c < n_matmuls; c++) {
-            float *ref_host = malloc((size_t)n_list[c] * sizeof(float));
-            void *ref_dev  = NULL;
-            if (!ref_host) continue;
-            if (cudaMalloc(&ref_dev, (size_t)n_list[c] * sizeof(float)) != cudaSuccess) {
-                free(ref_host);
-                continue;
-            }
-            if (first == GGML_TYPE_Q8_0 )
-                cuda_matmul_q8_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream);
-            else if (first == GGML_TYPE_Q4_0 )
-                cuda_matmul_q4_0(w_dev[c], x_dev, ref_dev, n_list_copy[c], k, stream);
-            cudaMemcpy(ref_host, ref_dev, (size_t)n_list[c] * sizeof(float), cudaMemcpyDeviceToHost);
-            cudaFree(ref_dev);
-            if (y[c]->host_ptr) {
-                cudaMemcpy((void *)y[c]->host_ptr, y_dev[c], (size_t)n_list[c] * sizeof(float),
-                           cudaMemcpyDeviceToHost);
-                float maxd = 0.0f; int maxdrow = -1;
-                for (int r = 0; r < n_list[c]; r++) {
-                    float d = fabsf(((float *)y[c]->host_ptr)[r] - ref_host[r]);
-                    if (d > maxd) { maxd = d; maxdrow = r; }
-                }
-                fprintf(stderr,
-                        "[multi2] col=%d n=%d maxdiff=%g row=%d fused[0]=%g ref[0]=%g\n",
-                        c, n_list[c], maxd, maxdrow, ((float *)y[c]->host_ptr)[0], ref_host[0]);
-            }
-            free(ref_host);
-        }
-        return OK; /* don't double-D2H */
-    }
-
-    for (int c = 0; c < n_matmuls; c++) {
         if (!cuda_lazy_d2h_for("multi") && y[c]->host_ptr) {
             if (cudaMemcpy((void *)y[c]->host_ptr, y_dev[c], (size_t)n_list[c] * sizeof(float),
                             cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -1476,10 +1318,6 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
                                              int k, int n_matmuls) {
     if (n_matmuls <= 0 || n_matmuls > 8)
         return ERR_UNSUPPORTED;
-    if (getenv("KAPPAI_CUDA_HOST_RMSNORM_MULTI")) {
-        return ERR_UNSUPPORTED;
-    }
-
     /* Non-native or mixed types: degrade to separate rmsnorm + per-column
      * singles, which have host fallback + refresh. */
     uint32_t first = w_types[0];
@@ -1501,8 +1339,9 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
     int total_rows = 0;
     for (int c = 0; c < n_matmuls; c++)
         total_rows += n_list[c];
-    const char *fmaxe = getenv("KAPPAI_RMM_FUSED_MAX");
-    int fused_max = fmaxe ? atoi(fmaxe) : 512;
+    /* Above this many output rows the fused rmsnorm+multi GEMM stops paying
+     * for its scratch traffic and the per-column path wins. */
+    const int fused_max = 512;
     if (total_rows > fused_max) {
         size_t need = (size_t)k * sizeof(float);
         if (!priv || need == 0)
@@ -1571,16 +1410,12 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
  * neutral-or-better vs per-head at all ctx lengths, up to 2.6x at 512+);
  * KAPPAI_ATTN_GQA_MINPOS gates by context length if ever needed. */
 static int cuda_attn_gqa_q(int n_heads, int n_kv_heads, int n_pos) {
-    const char *e = getenv("KAPPAI_ATTN_GQA_Q");
-    int q = e ? atoi(e) : 2;
+    int q = 2;
     if (q < 2) return 1;
     int g = n_kv_heads > 0 ? n_heads / n_kv_heads : 1;
     if (g < 2) return 1;
     if (q > g) q = g;
     if (q > 8) q = 8;
-    const char *m = getenv("KAPPAI_ATTN_GQA_MINPOS");
-    int minpos = m ? atoi(m) : 0;
-    if (n_pos < minpos) return 1;
     return q;
 }
 

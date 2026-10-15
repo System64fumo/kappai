@@ -3442,11 +3442,9 @@ extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y
     /* XQ_QM layout follows the dispatched kernel: MMVQ/v1 (n==1 and
      * V2=0 fallback) only read original xq, so QM quant applies to
      * the v2 path only. Each launcher rewrites xq per call. */
-    const char *v2e = getenv("KAPPAI_DP4A_V2");
-    int use_v2e = !(v2e && *v2e == '0');
+    const int use_v2e = 1;
     /* Default ON (opt-out KAPPAI_XQ_QM=0): bit-exact, +6-7% TG. */
-    const char *xqm = getenv("KAPPAI_XQ_QM");
-    int use_xqm = (!(xqm && *xqm == '0') && n != 1 && use_v2e) ? 1 : 0;
+    const int use_xqm = (n != 1 && use_v2e) ? 1 : 0;
     if (use_xqm)
         /* One 32-thread block per Q-block. */
         q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
@@ -3455,40 +3453,19 @@ extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y
         q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
 
     if (n == 1) {
-        /* M=1, single-output path: default to proven MMVQ kernel.
-         * TC/WS variants are experimental (KAPPAI_MMVQ_TC / KAPPAI_MMVQ_WS=1). */
-        const char *tc = getenv("KAPPAI_MMVQ_TC");
-        const char *ws = getenv("KAPPAI_MMVQ_WS");
-        if (tc && *tc && *tc != '0') {
-            /* Tensor core MMVQ: 16 outputs per warp, 4 warps = 64 outputs per block */
-            dim3 grid((n + MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP - 1) /
-                      (MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP));
-            size_t shmem = (MMVQ_TC_OUT_PER_WARP * WMMA_K + WMMA_K * WMMA_N) * sizeof(__half)
-                         + MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP * WMMA_N * sizeof(float);
-            if (getenv("KAPPAI_TC_DEBUG"))
-                fprintf(stderr, "[TC] Q8_0 MMVQ-TC n=%d k=%d grid=%d shmem=%zu\n", n, k, grid.x, shmem);
-            matmul_q8_0_mmvq_tc_kernel<<<grid, MMVQ_TC_THREADS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
-        } else if (ws && *ws && *ws != '0') {
-            /* Warp-specialized DP4A MMVQ (experimental) */
-            size_t shmem = 2 * MMVQ_WS_TILE_B * 33 * sizeof(float) + MMVQ_WS_TILE_B * 32 * sizeof(int8_t);
-            matmul_q8_0_mmvq_ws_kernel<<<1, MMVQ_WS_THREADS, shmem, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
-        } else {
-            matmul_q8_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-                (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
-        }
+        /* M=1, single-output path: the proven plain MMVQ kernel. */
+        matmul_q8_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2e) {
             /* v2 xq staging measured pure overhead at all grids (xq
              * stays L2-resident across blocks); default off, escape hatch
-             * KAPPAI_XQ_STAGE=1 forces staging back on. */
-            const char *xs = getenv("KAPPAI_XQ_STAGE");
+             * Staging stays off while x is in QM order. */
             /* Staging copies xq to shared and reads it as original
              * layout: incompatible with the QM x buffer, force off
              * (staging is pure overhead by default anyway). */
-            int use_stage = (xs && *xs != '0' && !use_xqm) ? 1 : 0;
+            const int use_stage = !use_xqm ? 1 : 0;
             size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
             matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
                 (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage,
@@ -3508,35 +3485,16 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
     q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
 
     if (n == 1) {
-        /* M=1, single-output path: default to proven MMVQ kernel. */
-        const char *tc = getenv("KAPPAI_MMVQ_TC");
-        const char *ws = getenv("KAPPAI_MMVQ_WS");
-        if (tc && *tc && *tc != '0') {
-            dim3 grid((n + MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP - 1) /
-                      (MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP));
-            size_t shmem = (MMVQ_TC_OUT_PER_WARP * WMMA_K + WMMA_K * WMMA_N) * sizeof(__half)
-                         + MMVQ_TC_WARPS_PER_BLOCK * MMVQ_TC_OUT_PER_WARP * WMMA_N * sizeof(float);
-            if (getenv("KAPPAI_TC_DEBUG"))
-                fprintf(stderr, "[TC] Q4_0 MMVQ-TC n=%d k=%d grid=%d shmem=%zu\n", n, k, grid.x, shmem);
-            matmul_q4_0_mmvq_tc_kernel<<<grid, MMVQ_TC_THREADS_PER_BLOCK, shmem, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
-        } else if (ws && *ws && *ws != '0') {
-            size_t shmem = 2 * MMVQ_WS_TILE_B * 33 * sizeof(float) + MMVQ_WS_TILE_B * 32 * sizeof(int8_t);
-            matmul_q4_0_mmvq_ws_kernel<<<1, MMVQ_WS_THREADS, shmem, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
-        } else {
-            matmul_q4_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
-                (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
-        }
+        /* M=1, single-output path: the proven plain MMVQ kernel. */
+        matmul_q4_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
+            (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
-        const char *v2 = getenv("KAPPAI_DP4A_V2");
-        int use_v2 = !(v2 && *v2 == '0');
+        const int use_v2 = 1;
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2) {
             /* v2 xq staging default off (L2-resident); KAPPAI_XQ_STAGE=1
              * forces it back on. */
-            const char *xs = getenv("KAPPAI_XQ_STAGE");
-            int use_stage = (xs && *xs != '0') ? 1 : 0;
+            const int use_stage = 1;
             size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
             matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
                 (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k, use_stage);
@@ -3696,10 +3654,8 @@ extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
     if (!xq_dev)
         return;
     /* XQ_QM follows the kernel: res-v2 only (MMVQ/v1 read original). */
-    const char *v2r = getenv("KAPPAI_DP4A_V2");
-    int use_v2r = !(v2r && *v2r == '0');
-    const char *xqmr = getenv("KAPPAI_XQ_QM");
-    int use_xqmr = (!(xqmr && *xqmr == '0') && n != 1 && use_v2r) ? 1 : 0;
+    const int use_v2r = 1;
+    const int use_xqmr = (n != 1 && use_v2r) ? 1 : 0;
     if (use_xqmr)
         q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
             x_dev, (uint8_t *)xq_dev, k);
@@ -3731,8 +3687,7 @@ extern "C" void cuda_matmul_q4_0_residual(const void *w_dev, const float *x_dev,
         matmul_q4_0_residual_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
             (const cuda_q4_0_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
     } else {
-        const char *v2 = getenv("KAPPAI_DP4A_V2");
-        int use_v2 = !(v2 && *v2 == '0');
+        const int use_v2 = 1;
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2)
             matmul_q4_0_residual_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
@@ -4738,18 +4693,9 @@ extern "C" void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, c
     const int nb = k / 32;
     act_gelu_quant_kernel<<<(nb + 255) / 256, 256, 0, stream>>>(gate_dev, up_dev, act_q, k);
     dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    /* v2 (xq in shared + dp4a) is bit-exact vs v1; KAPPAI_DP4A_V2=0 keeps v1. */
-    const char *v2 = getenv("KAPPAI_DP4A_V2");
-    if (v2 && *v2 == '0') {
-        matmul_q8_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k);
-    } else {
-        const char *xs = getenv("KAPPAI_XQ_STAGE");
-        int use_stage = (xs && *xs != '0') ? 1 : 0;
-        size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
-        matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, use_stage, 0);
-    }
+    size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
+    matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
+        (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, 0, 0);
 }
 
 /* Same, for Q4_0 down-weights. */
@@ -4762,17 +4708,9 @@ extern "C" void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev
     const int nb = k / 32;
     act_gelu_quant_kernel<<<(nb + 255) / 256, 256, 0, stream>>>(gate_dev, up_dev, act_q, k);
     dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
-    const char *v2 = getenv("KAPPAI_DP4A_V2");
-    if (v2 && *v2 == '0') {
-        matmul_q4_0_dp4a_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
-            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k);
-    } else {
-        const char *xsv = getenv("KAPPAI_XQ_STAGE");
-        int use_stage = (xsv && *xsv != '0') ? 1 : 0;
-        size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
-        matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
-            (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, use_stage);
-    }
+    size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
+    matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
+        (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, 0);
 }
 
 /* Same, for Q4_1 down-weights. */
@@ -4808,8 +4746,7 @@ extern "C" void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y
     if (!xq)
         return;
     /* XQ_QM: multi kernel reads QM x-side (converted below). */
-    const char *xqmm = getenv("KAPPAI_XQ_QM");
-    int use_xqm = !(xqmm && *xqmm == '0') ? 1 : 0;
+    const int use_xqm = 1;
     if (use_xqm)
         q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
             x_dev, (uint8_t *)xq, k);
@@ -5230,18 +5167,17 @@ extern "C" void cuda_attn_f16(const float *q_dev, const uint16_t *kc_dev,
     dim3 grid(n_heads);
     /* Split decode path for longer contexts (fewer barriers, bulk loads).
      * The tiled kernel handles any n_pos (small sizes = one partial tile).
-     * KAPPAI_ATTN_NOTILED=1 forces the reference kernel (bisection). */
-    const char *notiled = getenv("KAPPAI_ATTN_NOTILED");
-    /* Split path (FlashDecoding-lite, 8 splits x 8 warps): cures the
+     * The reference kernel below is the fallback for other geometries. */
+        /* Split path (FlashDecoding-lite, 8 splits x 8 warps): cures the
      * long-ctx TG collapse (tiled = 1 warp/row, ~216x off roof).
-     * Default on for pos>=256 (hd==256); NOTILED=1 forces reference. */
-    if ((!notiled || *notiled == '0') && n_pos_total >= 256 && head_dim == 256) {
+     * Enabled for pos>=256 at head_dim 256. */
+    if (n_pos_total >= 256 && head_dim == 256) {
         cuda_attn_f16_decode_split(q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads,
                                    head_dim, layer_base_bytes, kvh_stride, n_pos_total,
                                    scale, stream);
         return;
     }
-    if ((!notiled || *notiled == '0') && n_pos_total >= 256) {
+    if (n_pos_total >= 256) {
         int tile_size = attn_tile_size(head_dim);
         /* s_k/s_v removed from tiled kernel (were unused). */
         size_t shmem_tiled = (1 * head_dim + 2 * tile_size * head_dim) * sizeof(float);
@@ -5540,8 +5476,7 @@ extern "C" void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
      * opts out): single-pass, KV shared across rows via smem tiles.
      * hd=256 + global attention only; SWA and other geometries keep
      * the reference path. 100% greedy agreement 230+ words. */
-    const char *flash = getenv("KAPPAI_ATTN_FLASH_BATCH");
-    if (!(flash && *flash == '0') && head_dim == 256 && sliding_window == 0) {
+    if (head_dim == 256 && sliding_window == 0) {
         dim3 grid(((unsigned)m + FLASH_QTILE - 1) / FLASH_QTILE, (unsigned)n_heads);
         size_t shmem = 2 * (size_t)FLASH_KTILE * head_dim * sizeof(__half);
         attn_f16_batch_flash_kernel<<<grid, 256, shmem, stream>>>(
@@ -5553,17 +5488,10 @@ extern "C" void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
                     cudaGetErrorString(flash_err));
         return;
     }
-    const char *tiled = getenv("KAPPAI_ATTN_TILED_BATCH");
-    int n_pos_est = pos_start + m;
+        int n_pos_est = pos_start + m;
     if (sliding_window > 0 && n_pos_est > sliding_window)
         n_pos_est = sliding_window;
-    if (tiled && *tiled != '0' && n_pos_est >= 256) {
-        int tile_size = attn_tile_size(head_dim);
-        size_t shmem = (3 * head_dim + 2 * tile_size * head_dim) * sizeof(float);
-        attn_f16_batch_tiled_kernel<<<grid, 32, shmem, stream>>>(
-            q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads, head_dim,
-            layer_base_bytes, kvh_stride, pos_start, m, sliding_window, scale, tile_size);
-    } else {
+ else {
         size_t shmem = 3 * head_dim * sizeof(float);
         attn_f16_batch_kernel<<<grid, 32, shmem, stream>>>(
             q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads, head_dim,
@@ -5944,10 +5872,8 @@ extern "C" void cuda_attn_q8(const float *q_dev, const uint8_t *kc_dev,
                               size_t kvh_stride_bytes, int attn_start, int n_pos_total,
                               float scale, int n_blocks, cudaStream_t stream) {
     dim3 grid(n_heads);
-    /* Same tiling policy as cuda_attn_f16 (KAPPAI_ATTN_NOTILED=1 forces
-     * the reference kernel). */
-    const char *notiled = getenv("KAPPAI_ATTN_NOTILED");
-    if ((!notiled || *notiled == '0') && n_pos_total >= 256) {
+    /* Same tiling policy as cuda_attn_f16. */
+    if (n_pos_total >= 256) {
         int tile_size = attn_tile_size(head_dim);
         /* s_q + raw Q8 staging (2 x tile x row_bytes) + float tiles. */
         size_t row_bytes_q = (size_t)n_blocks * KV_Q8_0_ATTN_BLK_BYTES;
@@ -6093,7 +6019,7 @@ extern "C" void cuda_attn_batch_q8(const float *q_dev, const uint8_t *kc_dev,
                                     cudaStream_t stream) {
     dim3 grid((unsigned)m * (unsigned)n_heads);
     /* Reference kernel only: mirrors the default cuda_attn_batch_f16 path
-     * (the tiled-batch opt-in stays F16-only; it is slower on prefill). */
+     * (it is slower on prefill). */
     size_t shmem = 3 * head_dim * sizeof(float);
     attn_q8_batch_kernel<<<grid, 32, shmem, stream>>>(
         q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads, head_dim,
@@ -7088,8 +7014,7 @@ static void *wf_scratch_for(size_t need) {
  * 100% greedy agreement over 300+ words both quants, suite + model-mode
  * green; ~2x prefill PP. */
 static int batch_fp16_enabled(void) {
-    const char *e = getenv("KAPPAI_BATCH_FP16");
-    return !(e && *e == '0');
+    return 1;
 }
 
 /* Pure-FP16 batch GEMM impl: x F32->F16 once, then WMMA (no dequant).
@@ -7107,12 +7032,7 @@ static size_t g_cublas_ws_cap = 0;
 static cublasHandle_t cublas_for(cudaStream_t stream) {
     if (g_cublas_state < 0)
         return nullptr;
-    const char *off = getenv("KAPPAI_NO_CUBLAS");
-    if (off && *off != '0') {
-        g_cublas_state = -1;
-        return nullptr;
-    }
-    if (!g_cublas_h) {
+        if (!g_cublas_h) {
         if (cublasCreate(&g_cublas_h) != CUBLAS_STATUS_SUCCESS) {
             g_cublas_state = -1;
             return nullptr;
@@ -7159,8 +7079,7 @@ static void matmul_batch_fp16_impl(const __half *w_fp16, const float *x_dev, flo
      * F16 rounding class (same as WMMA path) -> agreement-gated, not
      * bit-exact. KAPPAI_CUBLAS_GEMM=0 forces the WMMA kernel. Falls
      * through to WMMA on any cuBLAS error. */
-    const char *cbg = getenv("KAPPAI_CUBLAS_GEMM");
-    if (!(cbg && *cbg == '0')) {
+    if (1) {
         cublasHandle_t ch = cublas_for(stream);
         if (ch) {
             float alpha = 1.0f, beta = 0.0f;
@@ -7168,8 +7087,6 @@ static void matmul_batch_fp16_impl(const __half *w_fp16, const float *x_dev, flo
                 ch, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w_fp16, CUDA_R_16F, k,
                 xf, CUDA_R_16F, k, &beta, y_dev, CUDA_R_32F, n, CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-            if (getenv("KAPPAI_CUBLAS_DBG"))
-                fprintf(stderr, "[cublas] n=%d k=%d m=%d status=%d\n", n, k, m, (int)cst);
             if (cst == CUBLAS_STATUS_SUCCESS)
                 return;
         }
@@ -7212,8 +7129,7 @@ extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, fl
 
     /* Use tensor cores for larger batch sizes (M >= 16).
      * KAPPAI_BATCH_NO_WMMA=1 forces the DP4A path (tuning/debug). */
-    const char *no_wmma = getenv("KAPPAI_BATCH_NO_WMMA");
-    if (m >= 16 && n >= 32 && !(no_wmma && *no_wmma == '1')) {
+    if (m >= 16 && n >= 32) {
         dim3 grid((m + WMMA_COLS_PER_BLOCK - 1) / WMMA_COLS_PER_BLOCK,
                   (n + WMMA_ROWS_PER_BLOCK - 1) / WMMA_ROWS_PER_BLOCK);
         size_t shmem = ((size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS +
@@ -7248,8 +7164,7 @@ extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, fl
 
     /* Use tensor cores for larger batch sizes (M >= 16).
      * KAPPAI_BATCH_NO_WMMA=1 forces the DP4A path (tuning/debug). */
-    const char *no_wmma = getenv("KAPPAI_BATCH_NO_WMMA");
-    if (m >= 16 && n >= 32 && !(no_wmma && *no_wmma == '1')) {
+    if (m >= 16 && n >= 32) {
         dim3 grid((m + WMMA_COLS_PER_BLOCK - 1) / WMMA_COLS_PER_BLOCK,
                   (n + WMMA_ROWS_PER_BLOCK - 1) / WMMA_ROWS_PER_BLOCK);
         size_t shmem = ((size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS +
@@ -8662,8 +8577,7 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
      * on-device in the kernel. 8 warps share the row (vs 1 warp
      * starving in the tiled kernel). n_queries is heads/block (Qq),
      * irrelevant (own grid). */
-    const char *coop = getenv("KAPPAI_ATTN_COOP");
-    if (coop && *coop != '0' && head_dim == 256) {
+    if (0) {
         dim3 grid((unsigned)n_heads);
         size_t shmem = 2 * (size_t)COOP_QTILE * head_dim * sizeof(__half);
         attn_f16_decode_coop_kernel<<<grid, 256, shmem, stream>>>(
@@ -8677,10 +8591,8 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
     }
     /* Split decode path (default for hd==256; validated S25): cures the
      * long-ctx collapse in replayed graphs too. n_pos threshold lives
-     * in-kernel (launch params frozen at capture). NOTILED=1 escapes
-     * to the tiled kernel (bisection). */
-    const char *notiled = getenv("KAPPAI_ATTN_NOTILED");
-    if ((!notiled || *notiled == '0') && head_dim == 256) {
+     * in-kernel (launch params frozen at capture). */
+    if (head_dim == 256) {
         cuda_attn_f16_decode_split_g(q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads,
                                      head_dim, layer_base_bytes, kvh_stride, scale,
                                      params_dev, sliding_window, stream);
