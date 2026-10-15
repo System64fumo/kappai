@@ -40,56 +40,15 @@
 #define GGML_TYPE_Q8_0_QM CUDA_GGML_TYPE_Q8_0_QM
 #define GGML_TYPE_Q4_0_QM CUDA_GGML_TYPE_Q4_0_QM
 
-/* When set, skip redundant H2D mirror copies.  Safe in the fully-native
- * decode path where device buffers are already up-to-date from prior native ops.
- * D2H copies are kept so buffer_read_f32 works for test harness / argmax. */
-static int g_skip_h2d = -1; /* -1 = unset, 0/1 = cached */
-static int skip_h2d(void) {
-    if (g_skip_h2d < 0)
-        g_skip_h2d = getenv("KAPPAI_CUDA_SKIP_H2D") != NULL;
-    return g_skip_h2d;
-}
-
-/* Lazy device-to-host mirrors: per-op trailing D2H syncs (~200us each on
- * WSL2) dominate decode. Skip them; cuda_buffer_read_f32 refreshes the
- * mirror on demand (stream-sync + D2H) for the only true host consumers
- * (logits readback, debug prints, host-fallback paths). Escape hatch:
- * KAPPAI_CUDA_EAGER_D2H=1 restores per-op syncs. */
-static int g_lazy_d2h = -1;
+/* Lazy D2H is always enabled; env vars removed per review. */
 static int cuda_lazy_d2h(void) {
-    if (g_lazy_d2h < 0)
-        g_lazy_d2h = getenv("KAPPAI_CUDA_EAGER_D2H") == NULL;
-    return g_lazy_d2h;
-}
-/* Per-family opt-out via KAPPAI_LAZY_EXCEPT=comma-list of family tags
- * (mm, mmres, ffndown, multi, rmm, norm, rope, attn, elem, embd). Listed
- * families keep eager per-op D2H syncs; others stay lazy. Unset (or empty)
- * = fully lazy. Debug aid (exact token match). */
-static int cuda_lazy_d2h_for(const char *tag) {
-    if (!cuda_lazy_d2h()) return 0;
-    const char *ex = getenv("KAPPAI_LAZY_EXCEPT");
-    if (ex) {
-        size_t tl = strlen(tag);
-        for (const char *p = ex; *p;) {
-            while (*p == ',' || *p == ' ') p++;
-            if (!*p) break;
-            const char *e = p;
-            while (*e && *e != ',') e++;
-            if ((size_t)(e - p) == tl && !memcmp(p, tag, tl)) return 0;
-            p = e;
-        }
-    }
-    /* Decimation (debug aid): KAPPAI_LAZY_EVERY=N syncs only every Nth
-     * gated site, bounding the number of pacing syncs per token. */
-    const char *ev = getenv("KAPPAI_LAZY_EVERY");
-    if (ev && *ev) {
-        static unsigned long ctr = 0;
-        long every = atol(ev);
-        if (every > 1)
-            return ((++ctr % (unsigned long)every) == 0) ? 0 : 1;
-    }
     return 1;
 }
+static int cuda_lazy_d2h_for(const char *tag) {
+    (void)tag;
+    return 1;
+}
+
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static void *cuda_dev_ptr(const buffer *b);
 static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
@@ -105,10 +64,6 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
 /* Per-backend private state (stream for async kernel/memcpy ordering). */
 struct cuda_priv {
     cudaStream_t stream;
-    cudaGraph_t graph;
-    cudaGraphExec_t graph_exec;
-    bool graph_captured;
-    int capture_warmup;
     size_t *kv_layer_off;
     int kv_n_layers;
     int kv_n_kv_heads;
@@ -137,8 +92,6 @@ struct cuda_priv {
     /* Persistent scratch for argmax */
     int32_t *argmax_idx_dev;
     /* Device-side n_pos + decode params for CUDA Graph compatibility */
-    int *n_pos_dev;
-    int *decode_params_dev;  /* [0]=pos, [1]=n_pos, [2]=token */
     /* Persistent host staging for freq-factor rope tables. Written regions
      * are immutable once uploaded, so async uploads never race reuse. */
     float *rope_cs_host;
@@ -162,354 +115,10 @@ struct cuda_priv {
      * so no D2H fires). */
     float *rmm_tmp_dev;
     size_t rmm_tmp_cap; /* in floats */
-    /* Decode-graph mode: ops launch _g kernel variants that read
-     * (pos, n_pos, token) from decode_params_dev instead of baked
-     * launch args, so one capture replays for every step. Set only
-     * around capture; cleared on any fallback. */
-    int graph_kernels;
 };
 
 static struct cuda_priv *cuda_priv(backend *self) {
     return (struct cuda_priv *)self->priv;
-}
-
-
-/* CUDA Graph capture for decode loop. Orchestration (warmup counting,
- * pre-uploads) lives in compute.c; these just execute. graph_begin_capture
- * always begins (no internal warmup counter). */
-static status_code cuda_graph_begin_capture(backend *self) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    if (priv->graph_captured) return ERR_UNSUPPORTED;
-    enum cudaStreamCaptureMode mode = getenv("KAPPAI_GRAPH_LOCAL") ?
-                                         cudaStreamCaptureModeThreadLocal :
-                                         cudaStreamCaptureModeGlobal;
-    cudaError_t e = cudaStreamBeginCapture(priv->stream, mode);
-    return e == cudaSuccess ? OK : ERR_INTERNAL;
-}
-
-static status_code cuda_graph_end_capture(backend *self) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv || priv->graph_captured) return OK;
-    cudaError_t e = cudaStreamEndCapture(priv->stream, &priv->graph);
-    if (e != cudaSuccess) return ERR_INTERNAL;
-    if (getenv("KAPPAI_GRAPH_DBG")) {
-        size_t nn = 0;
-        cudaGraphNode_t *nodes = NULL;
-        if (cudaGraphGetNodes(priv->graph, NULL, &nn) == cudaSuccess && nn > 0) {
-            nodes = (cudaGraphNode_t *)malloc(nn * sizeof(cudaGraphNode_t));
-            if (nodes && cudaGraphGetNodes(priv->graph, nodes, &nn) == cudaSuccess) {
-                size_t nk = 0, nm = 0, no = 0;
-                for (size_t i = 0; i < nn; i++) {
-                    enum cudaGraphNodeType ty;
-                    if (cudaGraphNodeGetType(nodes[i], &ty) != cudaSuccess) {
-                        no++;
-                        continue;
-                    }
-                    if (ty == cudaGraphNodeTypeKernel)
-                        nk++;
-                    else if (ty == cudaGraphNodeTypeMemcpy)
-                        nm++;
-                    else
-                        no++;
-                }
-                fprintf(stderr, "[GRAPH] captured nodes=%zu kernel=%zu memcpy=%zu other=%zu\n",
-                        nn, nk, nm, no);
-                /* Group kernel nodes by function handle. */
-                {
-                    struct {
-                        void *f;
-                        int n;
-                        unsigned gx, bx, sh;
-                    } groups[128];
-                    int ng = 0;
-                    for (size_t i = 0; i < nn; i++) {
-                        struct cudaKernelNodeParams kp;
-                        memset(&kp, 0, sizeof(kp));
-                        if (cudaGraphKernelNodeGetParams(nodes[i], &kp) != cudaSuccess)
-                            continue;
-                        int g;
-                        for (g = 0; g < ng; g++)
-                            if (groups[g].f == (void *)kp.func) break;
-                        if (g == ng && ng < 128) {
-                            groups[ng].f = (void *)kp.func;
-                            groups[ng].n = 0;
-                            groups[ng].gx = kp.gridDim.x;
-                            groups[ng].bx = kp.blockDim.x;
-                            groups[ng].sh = (unsigned)kp.sharedMemBytes;
-                            ng++;
-                        }
-                        if (g < 128) groups[g].n++;
-                    }
-                    for (int g = 0; g < ng; g++) {
-                        const char *kname = "?";
-                        {
-                            typedef int (*pfnGetName)(const char **, void *);
-                            static pfnGetName pGetName;
-                            if (!pGetName)
-                                pGetName = (pfnGetName)dlsym(RTLD_DEFAULT, "cuFuncGetName");
-                            if (pGetName) {
-                                const char *nm = NULL;
-                                if (pGetName(&nm, groups[g].f) == 0 && nm)
-                                    kname = nm;
-                            }
-                        }
-                        fprintf(stderr, "[GRAPH] funcgroup %p x%d grid=%u block=%u sh=%u %s\n",
-                                groups[g].f, groups[g].n, groups[g].gx, groups[g].bx,
-                                groups[g].sh, kname);
-                    }
-                    /* Linearity check: single-stream capture must chain. */
-                    {
-                        size_t ndep0 = 0, ndep1 = 0, ndepN = 0;
-                        for (size_t i = 0; i < nn; i++) {
-                            size_t nd = 0;
-                            if (cudaGraphNodeGetDependencies(nodes[i], NULL, &nd) != cudaSuccess)
-                                continue;
-                            if (nd == 0)
-                                ndep0++;
-                            else if (nd == 1)
-                                ndep1++;
-                            else
-                                ndepN++;
-                        }
-                        fprintf(stderr, "[GRAPH] deps: indeg0=%zu indeg1=%zu indegN=%zu\n", ndep0,
-                                ndep1, ndepN);
-                    }
-                }
-            }
-            free(nodes);
-        } else {
-            fprintf(stderr, "[GRAPH] captured nodes query failed or zero\n");
-        }
-    }
-    e = cudaGraphInstantiate(&priv->graph_exec, priv->graph, 0);
-    if (e != cudaSuccess) {
-        cudaGraphDestroy(priv->graph);
-        return ERR_INTERNAL;
-    }
-    priv->graph_captured = true;
-    cudaGraphDestroy(priv->graph);
-    return OK;
-}
-
-static status_code cuda_graph_launch(backend *self) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv || !priv->graph_captured) return ERR_INTERNAL;
-    cudaError_t e = cudaGraphLaunch(priv->graph_exec, priv->stream);
-    return e == cudaSuccess ? OK : ERR_INTERNAL;
-}
-
-static status_code cuda_graph_update_decode_params(backend *self, int pos, int n_pos, int token) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv || !priv->decode_params_dev) return ERR_INTERNAL;
-    /* Persistent staging: the async copy may execute after return, so host
-     * stack memory is unsafe here (single-threaded CLI assumed). */
-    static int params[3];
-    params[0] = pos;
-    params[1] = n_pos;
-    params[2] = token;
-    if (getenv("KAPPAI_GRAPH_SYNCUPD2")) {
-        /* TEMP: synchronous params upload (rules out async-copy issues). */
-        cudaError_t e = cudaMemcpy(priv->decode_params_dev, params, 3 * sizeof(int),
-                                   cudaMemcpyHostToDevice);
-        return e == cudaSuccess ? OK : ERR_INTERNAL;
-    }
-    cudaError_t e = cudaMemcpyAsync(priv->decode_params_dev, params, 3 * sizeof(int),
-                                    cudaMemcpyHostToDevice, priv->stream);
-    return e == cudaSuccess ? OK : ERR_INTERNAL;
-}
-
-static status_code cuda_graph_set_kernels(backend *self, int on) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    priv->graph_kernels = on ? 1 : 0;
-    return OK;
-}
-
-
-/* TEMP-DEBUG: read back decode params (caller must have drained). */
-static int cuda_graph_dbg_peek_impl(backend *self, int *p0, int *p1, int *p2) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv || !priv->decode_params_dev) return -1;
-    int v[3] = {-9, -9, -9};
-    if (cudaMemcpy(v, priv->decode_params_dev, 3 * sizeof(int),
-                   cudaMemcpyDeviceToHost) != cudaSuccess)
-        return -1;
-    *p0 = v[0];
-    *p1 = v[1];
-    *p2 = v[2];
-    return 0;
-}
-
-/* TEMP-DEBUG: stream capture state (0=not capturing). */
-static int cuda_graph_dbg_capquery_impl(backend *self) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return -1;
-    enum cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
-    if (cudaStreamIsCapturing(priv->stream, &st) != cudaSuccess) return -2;
-    return (int)st;
-}
-
-/* TEMP-DEBUG: expose decode_params_dev address. */
-void *cuda_graph_dbg_paramsaddr(backend *self) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return NULL;
-    return (void *)priv->decode_params_dev;
-}
-
-/* TEMP-DEBUG: set/clear X[0] sentinel (async). Repurposed: clobber one
- * float of the current rope-cos row (read-only graph input). */
-static int cuda_graph_dbg_togglex_impl(backend *self, void *slotbuf, int on) {
-    struct cuda_priv *priv = cuda_priv(self);
-    (void)slotbuf;
-    if (!priv) return -1;
-    if (priv->rope_tbl[1].cos_dev == NULL) return -1;
-    static float one = 12345.0f, zero = 0.0f;
-    /* NOTE: deliberately racy w.r.t. content (test only). */
-    if (cudaMemcpyAsync(priv->rope_tbl[1].cos_dev, on ? &one : &zero, sizeof(float),
-                        cudaMemcpyHostToDevice, priv->stream) != cudaSuccess)
-        return -1;
-    return 0;
-}
-
-/* TEMP-DEBUG: snapshot device state to a text file (caller drains first).
- * Dumps slot sums, first-4 logits, params, rope rows. Compare replay vs
- * normal runs position by position. */
-static int cuda_graph_dbg_snap_impl(backend *self, void *slots_ptr, const char *path, int pos) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return -1;
-    FILE *f = fopen(path, "a");
-    if (!f) return -1;
-    fprintf(f, "=== pos %d ===\n", pos);
-    buffer *slots = (buffer *)slots_ptr;
-    int ids[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14};
-    for (int k = 0; k < 13; k++) {
-        int sidx = ids[k];
-        float h[1536];
-        if (cudaMemcpy(h, cuda_dev_ptr(&slots[sidx]), sizeof(h),
-                       cudaMemcpyDeviceToHost) == cudaSuccess) {
-            double sum = 0;
-            int bad = 0;
-            for (int i = 0; i < 1536; i++) {
-                sum += h[i];
-                if (h[i] != h[i]) bad = 1;
-            }
-            fprintf(f, "slot%d sum=%.9g x0=%.6g x1=%.6g%s\n", sidx, sum, h[0], h[1],
-                    bad ? " NAN" : "");
-        } else {
-            fprintf(f, "slot%d READFAIL\n", sidx);
-        }
-    }
-    for (int si = 0; si < 2; si++) {
-        if (priv->rope_tbl[si].half > 0 && priv->rope_tbl[si].cos_dev) {
-            float v[2] = {0, 0};
-            size_t off = (size_t)(pos < 1024 ? pos : 1023) * (size_t)priv->rope_tbl[si].half;
-            cudaMemcpy(v, priv->rope_tbl[si].cos_dev + off, sizeof(float),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(v + 1, priv->rope_tbl[si].sin_dev + off, sizeof(float),
-                       cudaMemcpyDeviceToHost);
-            fprintf(f, "rope%d cos=%g sin=%g\n", si, v[0], v[1]);
-        }
-    }
-    {
-        int v[3] = {0, 0, 0};
-        if (priv->decode_params_dev &&
-            cudaMemcpy(v, priv->decode_params_dev, 12, cudaMemcpyDeviceToHost) == cudaSuccess)
-            fprintf(f, "params=(%d,%d,%d)\n", v[0], v[1], v[2]);
-    }
-    fclose(f);
-    return 0;
-}
-
-/* TEMP-DEBUG: fetch+clear last CUDA error. */
-static int cuda_graph_dbg_lasterr_impl(void) {
-    cudaError_t e = cudaGetLastError();
-    return (int)e;
-}
-
-/* TEMP-DEBUG: sync-read first 4 floats of a device buffer. */
-static int cuda_graph_dbg_logits_impl(backend *self, void *slotbuf, float *out4) {
-    struct cuda_priv *priv = cuda_priv(self);
-    (void)self;
-    if (!priv || !slotbuf || !out4) return -1;
-    buffer *b = (buffer *)slotbuf;
-    if (cudaMemcpy(out4, cuda_dev_ptr(b), 4 * sizeof(float),
-                   cudaMemcpyDeviceToHost) != cudaSuccess)
-        return -1;
-    return 0;
-}
-
-/* Pre-upload full rope tables (both geometries + freq path) and switch ops
- * to _g kernels. After this returns, rope ops enqueue no uploads (all rows
- * present), so a capture contains kernels only. Synchronous: call outside
- * any capture. Idempotent. */
-static status_code cuda_graph_prepare_capture(backend *self, const float *cos, const float *sin,
-                                              int head_dim, const float *cos_swa,
-                                              const float *sin_swa, int head_dim_swa,
-                                              const float *freq_factors, int freq_head_dim) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    if (getenv("KAPPAI_GRAPH_DBG"))
-        fprintf(stderr, "[GRAPH-PREPARE] cos=%p sin=%p hd=%d swa=%p/%p/%d ff=%p fhd=%d\n",
-                (const void *)cos, (const void *)sin, head_dim, (const void *)cos_swa,
-                (const void *)sin_swa, head_dim_swa, (const void *)freq_factors, freq_head_dim);
-    const float *cos_base = NULL, *sin_base = NULL;
-    if (cos && sin && head_dim > 0) {
-        status_code st = cuda_rope_pre_ensure(self, 1024, head_dim, cos, sin, &cos_base, &sin_base);
-        if (st != OK) return st;
-    }
-    if (cos_swa && sin_swa && head_dim_swa > 0) {
-        status_code st = cuda_rope_pre_ensure(self, 1024, head_dim_swa, cos_swa, sin_swa, &cos_base,
-                                              &sin_base);
-        if (st != OK) return st;
-    }
-    if (freq_factors && freq_head_dim > 0) {
-        status_code st = cuda_rope_ensure_cs(self, 1023, freq_head_dim, freq_factors);
-        if (st != OK) return st;
-    }
-    /* Pre-grow split-attention scratch (cudaMalloc aborts capture;
-     * reuse path inside the captured graph issues no CUDA API). */
-    cuda_attn_dec_split_ensure();
-    if (getenv("KAPPAI_GRAPH_DBG")) {
-        fprintf(stderr, "[GRAPH-PREPARE] done\n");
-        /* TEMP: verify a late row actually landed on device. */
-        cudaStreamSynchronize(priv->stream);
-        for (int si = 0; si < 2; si++) {
-            if (priv->rope_tbl[si].half > 0 && priv->rope_tbl[si].cos_dev) {
-                float v[2] = {0, 0};
-                size_t off = (size_t)900 * (size_t)priv->rope_tbl[si].half;
-                cudaMemcpy(v, priv->rope_tbl[si].cos_dev + off, sizeof(float),
-                           cudaMemcpyDeviceToHost);
-                cudaMemcpy(v + 1, priv->rope_tbl[si].sin_dev + off, sizeof(float),
-                           cudaMemcpyDeviceToHost);
-                fprintf(stderr, "[GRAPH] slot%d half=%d row900 cos=%g sin=%g up=%d\n", si,
-                        priv->rope_tbl[si].half, v[0], v[1], priv->rope_tbl[si].up_pos);
-            }
-        }
-        fprintf(stderr, "[GRAPH] freq cs_pos=%d\n", priv->rope_cs_pos);
-    }
-    priv->graph_kernels = 1;
-    return OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* Persistent decode: uses CUDA Graph to eliminate launch overhead.  */
-/* The graph captures all kernel launches and replays them in one go. */
-/* ------------------------------------------------------------------ */
-
-static status_code cuda_persistent_decode(backend *self, const model *m, struct kvcache *cache,
-                                           struct compute_scratch *s, int token, int pos,
-                                           int flash_attn, float *logits_out) {
-    struct cuda_priv *priv = cuda_priv(self);
-    if (!priv) return ERR_INTERNAL;
-    
-    // Use the existing CUDA Graph path which captures all kernel launches
-    // and replays them with minimal overhead
-    // The graph is already captured and replayed in compute.c
-    
-    // For now, use the regular decode path which will trigger graph capture/replay
-    // when KAPPAI_CUDA_GRAPH=1 (now default)
-    return compute_forward_recipe(m, cache, s, token, pos, flash_attn, logits_out);
 }
 
 /* ------------------------------------------------------------------ */
@@ -568,19 +177,6 @@ static status_code cuda_init(backend *self, int device_index) {
         free(priv);
         return ERR_OUT_OF_MEMORY;
     }
-    if (cudaMalloc((void **)&priv->n_pos_dev, sizeof(int)) != cudaSuccess) {
-        cudaFree(priv->argmax_idx_dev);
-        cudaStreamDestroy(priv->stream);
-        free(priv);
-        return ERR_OUT_OF_MEMORY;
-    }
-    if (cudaMalloc((void **)&priv->decode_params_dev, 3 * sizeof(int)) != cudaSuccess) {
-        cudaFree(priv->argmax_idx_dev);
-        cudaFree(priv->n_pos_dev);
-        cudaStreamDestroy(priv->stream);
-        free(priv);
-        return ERR_OUT_OF_MEMORY;
-    }
     for (int i = 0; i < ROPE_TBL_SLOTS; i++) {
         priv->rope_tbl[i].half = -1;
         priv->rope_tbl[i].up_pos = -1;
@@ -594,10 +190,6 @@ static void cuda_free(backend *self) {
     if (priv) {
         if (priv->argmax_idx_dev)
             cudaFree(priv->argmax_idx_dev);
-        if (priv->n_pos_dev)
-            cudaFree(priv->n_pos_dev);
-        if (priv->decode_params_dev)
-            cudaFree(priv->decode_params_dev);
         if (priv->rope_cs_host)
             free(priv->rope_cs_host);
         if (priv->rope_cs_cos_dev)
@@ -614,10 +206,6 @@ static void cuda_free(backend *self) {
             if (priv->rope_tbl[i].sin_dev)
                 cudaFree(priv->rope_tbl[i].sin_dev);
         }
-        if (priv->graph_exec)
-            cudaGraphExecDestroy(priv->graph_exec);
-        if (priv->graph)
-            cudaGraphDestroy(priv->graph);
         if (priv->stream)
             cudaStreamDestroy(priv->stream);
         free(priv);
@@ -1501,15 +1089,9 @@ static status_code cuda_op_rmsnorm_per_head(backend *self, const buffer *x, cons
 
     /* NO H2D: device buffers are source of truth. */
 
-    if (priv && priv->graph_kernels)
-        cuda_rmsnorm_per_head_g(cuda_dev_ptr((buffer *)x),
-                                w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
-                                (float *)cuda_dev_ptr(y), n_heads, head_dim, eps,
-                                priv->decode_params_dev, stream);
-    else
-        cuda_rmsnorm_per_head(cuda_dev_ptr((buffer *)x),
-                              w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
-                              (float *)cuda_dev_ptr(y), n_heads, head_dim, eps, stream);
+    cuda_rmsnorm_per_head(cuda_dev_ptr((buffer *)x),
+                          w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
+                          (float *)cuda_dev_ptr(y), n_heads, head_dim, eps, stream);
 
     if (!cuda_lazy_d2h_for("norm") && y->host_ptr)
         cudaMemcpy(y->host_ptr, cuda_dev_ptr(y), (size_t)n * sizeof(float),
@@ -1617,8 +1199,6 @@ static status_code cuda_op_rmsnorm_rope(backend *self, const buffer *x, const bu
                                          const float *freq_factors, float eps) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
-    if (priv->graph_kernels)
-        return ERR_UNSUPPORTED; /* no _g variant (unused by gemma4): abort capture */
     int neox = self->rope_neox;
     int n = n_heads * head_dim;
     int half = head_dim / 2;
@@ -2102,20 +1682,7 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
         int nb = (int)cuda_kv_q8_nblocks(head_dim);
         size_t lay = cuda_kv_layer_base_bytes(priv, layer);
         size_t stride = (size_t)n_ctx * (size_t)nb * KV_Q8_0_BLOCK_BYTES;
-        if (priv->graph_kernels) {
-            int gqa = cuda_attn_gqa_q(n_heads, n_kv_heads, n_pos);
-            if (gqa > 1)
-                cuda_attn_q8_gqa_g((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
-                                   (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                   n_heads, n_kv_heads, head_dim, lay, stride, 0, scale, nb, gqa,
-                                   priv->decode_params_dev, stream);
-            else
-                cuda_attn_q8_g((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
-                               (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                               n_heads, n_kv_heads, head_dim, lay, stride, 0, scale, nb,
-                               priv->decode_params_dev, stream);
-        }
-        else
+        
             cuda_attn_q8((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
                          (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
                          n_heads, n_kv_heads, head_dim, lay, stride, 0, n_pos, scale, nb, stream);
@@ -2132,33 +1699,6 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
     /* NO H2D for q: device buffer is source of truth.
      * Previous ops (rope, rmsnorm) write directly to device. */
 
-    if (getenv("KAPPAI_GRAPH_DBG"))
-        fprintf(stderr, "[GRAPH] attn be=%p flag=%d\n", (void *)self, priv->graph_kernels);
-    if (priv->graph_kernels) {
-        int gqa = cuda_attn_gqa_q(n_heads, n_kv_heads, n_pos);
-        /* Fixed split count (graph-static: the captured grid bakes T in,
-         * so T must not vary per token; adaptive policies would need
-         * recapture). SPLITK=1 forces off. Default off until validated. */
-        const char *spe = getenv("KAPPAI_ATTN_SPLITK");
-        int nsplits = spe ? atoi(spe) : 0;
-        if (nsplits >= 2 && n_pos >= 2)
-            cuda_attn_f16_split_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                                  (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                  n_heads, n_kv_heads, head_dim, lay, stride, 0, scale,
-                                  gqa > 1 ? gqa : 1, nsplits,
-                                  priv->decode_params_dev, stream);
-        else if (gqa > 1)
-            cuda_attn_f16_gqa_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                                (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                n_heads, n_kv_heads, head_dim, lay, stride, 0, scale, gqa,
-                                priv->decode_params_dev, stream);
-        else
-            cuda_attn_f16_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                            (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                            n_heads, n_kv_heads, head_dim, lay, stride, 0, scale,
-                            priv->decode_params_dev, stream);
-    }
-    else
         cuda_attn_f16((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
                       (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
                       n_heads, n_kv_heads, head_dim, lay, stride, 0, n_pos, scale, stream);
@@ -2204,20 +1744,7 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
         size_t stride = (size_t)n_ctx * row_bytes;
         /* Kernel reads [attn_start, attn_start+n_pos) by offsetting the layer base. */
         size_t lay_off = lay + (size_t)attn_start * row_bytes;
-        if (priv->graph_kernels) {
-            int gqa = cuda_attn_gqa_q(n_heads, n_kv_heads, n_pos_total);
-            if (gqa > 1)
-                cuda_attn_q8_gqa_g((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
-                                   (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                   n_heads, n_kv_heads, head_dim, lay, stride, sliding_window, scale,
-                                   nb, gqa, priv->decode_params_dev, priv->stream);
-            else
-                cuda_attn_q8_g((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
-                               (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                               n_heads, n_kv_heads, head_dim, lay, stride, sliding_window, scale, nb,
-                               priv->decode_params_dev, priv->stream);
-        }
-        else
+        
             cuda_attn_q8((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
                          (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
                          n_heads, n_kv_heads, head_dim, lay_off, stride, 0, n_pos_total, scale,
@@ -2237,32 +1764,10 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
 
     /* NO H2D for q: device buffer is source of truth. */
 
-    if (priv->graph_kernels) {
-        int gqa = cuda_attn_gqa_q(n_heads, n_kv_heads, n_pos_total);
-        const char *spe = getenv("KAPPAI_ATTN_SPLITK");
-        int nsplits = spe ? atoi(spe) : 0;
-        if (nsplits >= 2 && n_pos_total >= 2)
-            cuda_attn_f16_split_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                                  (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                  n_heads, n_kv_heads, head_dim, lay, stride, sliding_window, scale,
-                                  gqa > 1 ? gqa : 1, nsplits,
-                                  priv->decode_params_dev, priv->stream);
-        else if (gqa > 1)
-            cuda_attn_f16_gqa_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                                (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                                n_heads, n_kv_heads, head_dim, lay, stride, sliding_window, scale,
-                                gqa, priv->decode_params_dev, priv->stream);
-        else
-            cuda_attn_f16_g((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                            (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                            n_heads, n_kv_heads, head_dim, lay, stride, sliding_window, scale,
-                            priv->decode_params_dev, priv->stream);
-    }
-    else
-        cuda_attn_f16((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
-                      (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
-                      n_heads, n_kv_heads, head_dim, lay_off, stride, 0, n_pos_total, scale,
-                      priv->stream);
+    cuda_attn_f16((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
+                  (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
+                  n_heads, n_kv_heads, head_dim, lay_off, stride, 0, n_pos_total, scale,
+                  priv->stream);
 
     if (!cuda_lazy_d2h_for("attn") && out->host_ptr) {
         cudaMemcpy(out->host_ptr, cuda_dev_ptr(out), (size_t)n * sizeof(float),
@@ -2362,32 +1867,18 @@ static status_code cuda_kv_put(backend *self, buffer *k, buffer *v, int layer, i
         int nb = (int)cuda_kv_q8_nblocks(head_dim);
         size_t lay = cuda_kv_layer_base_bytes(priv, layer);
         size_t stride = (size_t)n_ctx * (size_t)nb * KV_Q8_0_BLOCK_BYTES;
-        if (priv->graph_kernels)
-            cuda_kv_put_q8_g((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
-                             (uint8_t *)cuda_dev_ptr(k), (uint8_t *)cuda_dev_ptr(v),
-                             n_active, head_dim, lay, stride, nb,
-                             priv->decode_params_dev, priv->stream);
-        else
-            cuda_kv_put_q8((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
-                           (uint8_t *)cuda_dev_ptr(k), (uint8_t *)cuda_dev_ptr(v),
-                           n_active, head_dim, lay, stride, pos, nb, priv->stream);
+        cuda_kv_put_q8((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
+                       (uint8_t *)cuda_dev_ptr(k), (uint8_t *)cuda_dev_ptr(v),
+                       n_active, head_dim, lay, stride, pos, nb, priv->stream);
         return OK;
     }
 
     size_t lay = cuda_kv_layer_base(priv, layer) * sizeof(uint16_t);
     size_t stride = (size_t)n_ctx * (size_t)head_dim;
 
-    if (getenv("KAPPAI_GRAPH_DBG"))
-        fprintf(stderr, "[GRAPH] kvput be=%p flag=%d\n", (void *)self, priv->graph_kernels);
-    if (priv->graph_kernels)
-        cuda_kv_put_f16_g((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
-                          (uint16_t *)cuda_dev_ptr(k), (uint16_t *)cuda_dev_ptr(v),
-                          n_active, head_dim, lay, stride, n_ctx,
-                          priv->decode_params_dev, priv->stream);
-    else
-        cuda_kv_put_f16((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
-                        (uint16_t *)cuda_dev_ptr(k), (uint16_t *)cuda_dev_ptr(v),
-                        n_active, head_dim, lay, stride, pos, n_ctx, priv->stream);
+    cuda_kv_put_f16((const float *)cuda_dev_ptr(k_in), (const float *)cuda_dev_ptr(v_in),
+                    (uint16_t *)cuda_dev_ptr(k), (uint16_t *)cuda_dev_ptr(v),
+                    n_active, head_dim, lay, stride, pos, n_ctx, priv->stream);
     return OK;
 }
 
@@ -2573,8 +2064,6 @@ static status_code cuda_op_partial_rope_qk(backend *self, buffer *q, buffer *k, 
 	}
 	return OK;
 }
-
-
 
 /* PLE helpers (GPU native): combine + strided per-slice norm batch. */
 
@@ -2887,13 +2376,7 @@ static status_code cuda_op_rope_ext(backend *self, buffer *vec, int n_heads, int
     }
 
     /* Graph mode: params-reading variant (pos from device struct). */
-    if (getenv("KAPPAI_GRAPH_DBG"))
-        fprintf(stderr, "[GRAPH] rope_ext be=%p flag=%d\n", (void *)self, priv->graph_kernels);
-    if (priv->graph_kernels)
-        cuda_rope_ext_g((float *)cuda_dev_ptr(vec), n_heads, head_dim, cos_base, sin_base,
-                        priv->decode_params_dev, neox, priv->stream);
-    else
-        cuda_rope_ext((float *)cuda_dev_ptr(vec), n_heads, head_dim, pos,
+    cuda_rope_ext((float *)cuda_dev_ptr(vec), n_heads, head_dim, pos,
                       cos_base, sin_base, neox, priv->stream);
 
     if (!cuda_lazy_d2h_for("rope") && vec->host_ptr) {
@@ -2940,12 +2423,7 @@ static status_code cuda_op_rope_qk(backend *self, buffer *q, buffer *k, int n_he
 
     /* NO H2D: device buffers are source of truth. */
 
-    if (priv->graph_kernels) {
-        cuda_rope_ext_g((float *)cuda_dev_ptr(q), n_heads, head_dim, cos_base, sin_base,
-                        priv->decode_params_dev, neox, priv->stream);
-        cuda_rope_ext_g((float *)cuda_dev_ptr(k), n_kv_heads, head_dim, cos_base, sin_base,
-                        priv->decode_params_dev, neox, priv->stream);
-    } else {
+    {
         cuda_rope_ext((float *)cuda_dev_ptr(q), n_heads, head_dim, pos,
                       cos_base, sin_base, neox, priv->stream);
         cuda_rope_ext((float *)cuda_dev_ptr(k), n_kv_heads, head_dim, pos,
@@ -2991,14 +2469,7 @@ static status_code cuda_op_qkv_norm_rope(backend *self, buffer *q, buffer *k, bu
 
     /* NO H2D: device buffers are source of truth. */
 
-    if (priv->graph_kernels)
-        cuda_qkv_norm_rope_g((float *)cuda_dev_ptr(q), (float *)cuda_dev_ptr(k),
-                             (float *)cuda_dev_ptr(v),
-                             wq_norm ? (const float *)cuda_dev_ptr((buffer *)wq_norm) : NULL,
-                             wk_norm ? (const float *)cuda_dev_ptr((buffer *)wk_norm) : NULL,
-                             n_heads, n_kv_heads, head_dim, eps, cos_base, sin_base,
-                             priv->decode_params_dev, neox, priv->stream);
-    else {
+    {
         const float *cos_tbl = cos_base + (size_t)pos * half;
         const float *sin_tbl = sin_base + (size_t)pos * half;
         cuda_qkv_norm_rope((float *)cuda_dev_ptr(q), (float *)cuda_dev_ptr(k),
@@ -3123,49 +2594,28 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
 
     switch (tok_embd_type) {
         case GGML_TYPE_F32:
-            if (priv->graph_kernels)
-                return ERR_UNSUPPORTED; /* no _g variant: abort capture */
             cuda_embd_lookup_f32((const float *)cuda_dev_ptr(tok_embd),
-                                  (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         case GGML_TYPE_F16:
-            if (priv->graph_kernels)
-                return ERR_UNSUPPORTED;
             cuda_embd_lookup_f16((const uint16_t *)cuda_dev_ptr(tok_embd),
-                                  (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         case GGML_TYPE_BF16:
-            if (priv->graph_kernels)
-                return ERR_UNSUPPORTED;
             cuda_embd_lookup_bf16((const uint16_t *)cuda_dev_ptr(tok_embd),
-                                   (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         case GGML_TYPE_Q8_0:
-            if (priv->graph_kernels)
-                cuda_embd_lookup_q8_0_g((const cuda_q8_0_block *)cuda_dev_ptr(tok_embd),
-                                        (float *)cuda_dev_ptr(x_out), dim,
-                                        priv->decode_params_dev, priv->stream);
-            else
-                cuda_embd_lookup_q8_0((const cuda_q8_0_block *)cuda_dev_ptr(tok_embd),
-                                      (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+            cuda_embd_lookup_q8_0((const cuda_q8_0_block *)cuda_dev_ptr(tok_embd),
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         case GGML_TYPE_Q4_0:
-            if (priv->graph_kernels)
-                cuda_embd_lookup_q4_0_g((const cuda_q4_0_block *)cuda_dev_ptr(tok_embd),
-                                        (float *)cuda_dev_ptr(x_out), dim,
-                                        priv->decode_params_dev, priv->stream);
-            else
-                cuda_embd_lookup_q4_0((const cuda_q4_0_block *)cuda_dev_ptr(tok_embd),
-                                      (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+            cuda_embd_lookup_q4_0((const cuda_q4_0_block *)cuda_dev_ptr(tok_embd),
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         case GGML_TYPE_Q4_K:
-            if (priv->graph_kernels)
-                cuda_embd_lookup_q4_k_g((const cuda_q4_k_block *)cuda_dev_ptr(tok_embd),
-                                        (float *)cuda_dev_ptr(x_out), dim,
-                                        priv->decode_params_dev, priv->stream);
-            else
-                cuda_embd_lookup_q4_k((const cuda_q4_k_block *)cuda_dev_ptr(tok_embd),
-                                      (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
+            cuda_embd_lookup_q4_k((const cuda_q4_k_block *)cuda_dev_ptr(tok_embd),
+                                 (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         default: {
             /* Rare quant types (Q5_K/Q6_K/IQ*, ...): the host reference
@@ -3174,8 +2624,6 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
              * read device memory (illegal access; this is what silently broke
              * Q4_K_M's Q6_K token embedding). Stage the one row (and the
              * output) through host memory. Runs once per token. */
-            if (priv->graph_kernels)
-                return ERR_UNSUPPORTED; /* sync fallback: abort capture */
             backend *host = backend_host();
             if (!host || !host->embd_lookup)
                 return ERR_UNSUPPORTED;
@@ -3551,7 +2999,4 @@ static status_code cuda_ctor(backend *out) {
     return OK;
 }
 
-
-/* Install the real decode-graph debug hooks into the engine-owned pointers.
- * Called from the ctor, i.e. when the backend library is dlopen'd. */
 BACKEND_REGISTER("cuda", cuda_ctor);
