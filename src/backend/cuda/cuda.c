@@ -222,7 +222,7 @@ static void cuda_synchronize(backend *self) {
 /* ------------------------------------------------------------------ */
 
 static status_code cuda_upload_weight(backend *self, const void *host_data, uint32_t type, int k,
-                                      int n_rows, buffer *out);
+                                      int n_rows, buffer *out, uint32_t declared_type);
 
 static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
     int k = (int)desc->dims[0];
@@ -230,36 +230,18 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
     if (n_rows <= 0)
         n_rows = 1; /* 1-D tensors (rmsnorm weights etc.) upload with d1 == 0 */
 
-    /* Quad-major relayout, and the lossless Q4_0 -> Q8_0 promotion that feeds
-     * it, used to live in the engine's model.c. The engine here does not call
-     * into the CUDA backend, so it can happen at weight-upload time instead:
-     * this is the one place that sees both the declared type and the bytes.
-     *
-     * BOTH ARE OFF BY DEFAULT here, unlike on cuda-wip, and deliberately so.
-     * Relaying changes the bytes of a weight without changing the type the
-     * engine recorded for it, and this engine still has host-fallback paths
-     * that trust that recorded type: matmul_ffn_down_batch is not implemented
-     * by this backend, so OP_BACKEND routes the batched FFN-down to the CPU,
-     * which then reads a promoted/relayed weight with plain Q8_0/Q4_0 kernels
-     * and produces garbage (generation collapses to <pad>). The per-weight type
-     * side table below keeps this backend's own dispatch honest, but it cannot
-     * reach a fallback inside the engine.
-     *
-     * So the correct default on main is to upload weights verbatim and let the
-     * CUDA kernels dequantize them. Enabling the promotion is a deliberate
-     * performance experiment that requires every consumer of the weight to stay
-     * on this backend:
-     *   KAPPAI_Q4_TO_Q8=1   lossless Q4_0 -> Q8_0 promotion
-     */
-    const char *q4q8_env = getenv("KAPPAI_Q4_TO_Q8");
-    int         want_conv = q4q8_env && *q4q8_env == '1';
-
+    /* Lossless Q4_0 -> Q8_0 promotion. Q8_0 GEMV is the faster inner loop and
+     * the mapping is exact (qs = (nib - 8) * 2, s = d / 2), so promoting buys
+     * speed with identical numerics. Every consumer of the weight must stay on
+     * this backend, because the engine keeps tagging the weight with the
+     * model's declared Q4_0: the per-buffer type side table below records what
+     * we actually stored, and every matmul entry point (including the host
+     * fallbacks) prefers that record over the engine's tag. */
     void       *converted = NULL;
     const void *host_data = desc->host_data;
     uint32_t    type      = desc->type;
 
-    if (want_conv && desc->n_dims == 2 && desc->type == GGML_TYPE_Q4_0 && k > 0 &&
-        (k % 32) == 0) {
+    if (desc->n_dims == 2 && desc->type == GGML_TYPE_Q4_0 && k > 0 && (k % 32) == 0) {
         converted = cuda_convert_q4_0_to_q8_0(desc->host_data, n_rows, k);
         if (converted) {
             host_data = converted;
@@ -267,13 +249,14 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
         }
     }
 
-    status_code st = cuda_upload_weight(self, host_data, type, k, n_rows, out);
+    status_code st = cuda_upload_weight(self, host_data, type, k, n_rows, out,
+                                      desc->type);
     free(converted);
     return st;
 }
 
 static status_code cuda_upload_weight(backend *self, const void *host_data, uint32_t type, int k,
-                                      int n_rows, buffer *out) {
+                                      int n_rows, buffer *out, uint32_t declared_type) {
     size_t row_bytes;
     switch (type) {
         case GGML_TYPE_Q8_0: row_bytes = (size_t)(k / 32) * 34; break;
@@ -301,11 +284,11 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
                 out->host_ptr = w_host;
                 out->owner   = self;
                 cuda_host_alloc_note(w_host, 0);
-                /* Record what was actually stored: if this upload relaid the
-                 * bytes (Q4_0->Q8_0), the engine still tags the weight with the
-                 * model's declared type, so the matmul entry points must
+                /* Record what was actually stored: the Q4_0->Q8_0 promotion
+                 * relaid the bytes, and the engine still tags the weight with
+                 * the model's declared Q4_0, so the matmul entry points must
                  * prefer this record. */
-                if (0 )
+                if (type != declared_type)
                     cuda_weight_type_note(w_dev, type);
                 return OK;
             }
@@ -323,7 +306,7 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
     out->offset  = 0;
     out->host_ptr = NULL;
     out->owner   = self;
-    if (0 )
+    if (type != declared_type)
         cuda_weight_type_note(w_managed, type);
     return OK;
 }
@@ -374,6 +357,9 @@ static void cuda_buffer_free(backend *self, buffer *buf) {
 
     void *handle = buf->handle;
     void *host_ptr = (void *)buf->host_ptr;
+    /* Drop any recorded weight type: CUDA recycles device addresses, so a
+     * stale entry would mislabel whatever weight lands here next. */
+    cuda_weight_type_forget(handle);
     /* How the host side was allocated, recorded at alloc time (see
      * cuda_internal.h): cudaHostAlloc() must go back through cudaFreeHost(). */
     int   pinned = cuda_host_alloc_pinned(host_ptr);
@@ -587,7 +573,14 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
 
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
-                                const buffer *x, buffer *y, int n, int k) {    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+                                const buffer *x, buffer *y, int n, int k) {
+    /* Prefer the type this backend actually stored (see the weight-type side
+     * table): a promoted weight must not be read with the engine's tag, by
+     * the native kernels or by the host fallback below. */
+    uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
+    if (stored != (uint32_t)-1)
+        w_type = stored;
+    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -701,7 +694,12 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
  * add_inplace kernel launch + global memory round-trip per layer. */
 static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
                                         const buffer *x, const buffer *residual, buffer *y,
-                                        int n, int k) {    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
+                                        int n, int k) {
+    /* Same weight-type override as cuda_matmul: see cuda_weight_type_of. */
+    uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
+    if (stored != (uint32_t)-1)
+        w_type = stored;
+    if (!cuda_matmul_type_native(self, w_type) || getenv("KAPPAI_CUDA_HOST_MATMUL")) {
         backend *host = backend_host();
         if (host && host->matmul_residual) {
             size_t wb = w->size, xb = (size_t)k * sizeof(float), yb = (size_t)n * sizeof(float);
@@ -2519,6 +2517,12 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
                                         int token, int dim, buffer *x_out) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
+
+    /* A promoted Q4_0 embedding is stored as Q8_0; read the recorded type,
+     * not the engine's tag. */
+    uint32_t stored = cuda_weight_type_of(tok_embd ? cuda_dev_ptr((buffer *)tok_embd) : NULL);
+    if (stored != (uint32_t)-1)
+        tok_embd_type = stored;
 
     switch (tok_embd_type) {
         case GGML_TYPE_F32:
