@@ -1259,10 +1259,14 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
     const int row_start = row_tile + warp_row * WMMA_M;
     const int col_start = col_tile + warp_col * WMMA_N;
     
-    if (row_start >= n || col_start >= m) return;
+    /* Do NOT return here: every thread of this block must reach the
+     * __syncthreads() calls below, and the threadIdx.x-strided shared-memory
+     * fill loops need all threads to cover their stride range. Out-of-range
+     * warps simply contribute no rows/cols. */
+    const bool warp_active = (row_start < n) && (col_start < m);
     
-    const int rows_this_warp = min(WMMA_M, n - row_start);
-    const int cols_this_warp = min(WMMA_N, m - col_start);
+    const int rows_this_warp = warp_active ? min(WMMA_M, n - row_start) : 0;
+    const int cols_this_warp = warp_active ? min(WMMA_N, m - col_start) : 0;
     
     /* Shared memory: w tile [32 rows x 32 K] FP16, x tile [32 K x 32 cols] FP16.
      * One Q-block (32 elems) per K-iteration; inner loop does 2 WMMA K-steps. */
@@ -1368,10 +1372,14 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
     const int row_start = row_tile + warp_row * WMMA_M;
     const int col_start = col_tile + warp_col * WMMA_N;
     
-    if (row_start >= n || col_start >= m) return;
+    /* Do NOT return here: every thread of this block must reach the
+     * __syncthreads() calls below, and the threadIdx.x-strided shared-memory
+     * fill loops need all threads to cover their stride range. Out-of-range
+     * warps simply contribute no rows/cols. */
+    const bool warp_active = (row_start < n) && (col_start < m);
     
-    const int rows_this_warp = min(WMMA_M, n - row_start);
-    const int cols_this_warp = min(WMMA_N, m - col_start);
+    const int rows_this_warp = warp_active ? min(WMMA_M, n - row_start) : 0;
+    const int cols_this_warp = warp_active ? min(WMMA_N, m - col_start) : 0;
     
     extern __shared__ char smem_wmma[];
     __half *w_smem = reinterpret_cast<__half *>(smem_wmma);
@@ -1503,14 +1511,14 @@ __global__ void dequant_q4_0_to_fp16_kernel(const void *__restrict__ w_in, __hal
         const uint8_t *wrow8 = (const uint8_t *)w_in + (size_t)row * (k >> 5) * 18;
         int nb = k >> 5;
         scale = __half2float(__ushort_as_half(qm_q4_scale(wrow8, nb, blk)));
-        uint8_t qb = qm_q4_byte(wrow8, nb, blk, j >> 1);
-        q = ((j & 1) ? (qb >> 4) : (qb & 0xF)) - 8;
+        uint8_t qb = qm_q4_byte(wrow8, nb, blk, (j < 16) ? j : j - 16);
+        q = ((j < 16) ? (qb & 0xF) : (qb >> 4)) - 8;
     } else {
         const cuda_q4_0_block *wb =
             (const cuda_q4_0_block *)w_in + (size_t)row * (k >> 5) + blk;
         scale = __half2float(__ushort_as_half(__ldg(&wb->d)));
-        uint8_t qb = wb->qs[j >> 1];
-        q = ((j & 1) ? (qb >> 4) : (qb & 0xF)) - 8;
+        uint8_t qb = wb->qs[(j < 16) ? j : j - 16];
+        q = ((j < 16) ? (qb & 0xF) : (qb >> 4)) - 8;
     }
     out[i] = __float2half((float)q * scale);
 }
