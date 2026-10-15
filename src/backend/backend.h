@@ -341,7 +341,8 @@ void host_kernels_register(int priority, host_matmul_generic_fn mm);
 
 void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);
 
-backend *backend_host(void);
+backend *backend_host_at(const char *file, int line, const char *func);
+#define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
 

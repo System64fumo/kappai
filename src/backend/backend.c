@@ -530,9 +530,12 @@ void backend_destroy(backend *b) {
 	free(b);
 }
 
-static backend			 *g_host_backend  = NULL;
-static pthread_once_t	  g_host_once	  = PTHREAD_ONCE_INIT;
-static _Atomic(backend *) g_host_override = NULL;
+static backend			 *g_host_backend	= NULL;
+static pthread_once_t	  g_host_once		= PTHREAD_ONCE_INIT;
+static _Atomic(backend *) g_host_override	= NULL;
+static const char		 *g_host_first_file = "?";
+static int				  g_host_first_line = 0;
+static const char		 *g_host_first_func = "?";
 
 void backend_host_use(backend *b) {
 	if (!b || !backend_has_cap(b, BCAP_IS_HOST))
@@ -558,12 +561,17 @@ static void host_backend_init(void) {
 	}
 	if (atomic_load(&g_host_override) == NULL)
 		atomic_store(&g_host_override, g_host_backend);
+	INFO("host (cpu) fallback backend '%s' created; first needed by %s() at %s:%d",
+		 g_host_backend->name, g_host_first_func, g_host_first_file, g_host_first_line);
 }
 
-backend *backend_host(void) {
+backend *backend_host_at(const char *file, int line, const char *func) {
 	backend *o = atomic_load(&g_host_override);
 	if (o)
 		return o;
+	g_host_first_file = file;
+	g_host_first_line = line;
+	g_host_first_func = func;
 	pthread_once(&g_host_once, host_backend_init);
 	return g_host_backend;
 }

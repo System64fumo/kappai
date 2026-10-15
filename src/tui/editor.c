@@ -344,15 +344,6 @@ static void editor_draw_rows(const editor_state *st) {
 	}
 }
 
-static int editor_hcs_layout_order(const hcs_config *h, int *order) {
-	int n = 0;
-	for (int pass = 0; pass < 2; pass++)
-		for (int d = 0; d < h->n_devices; d++)
-			if (backend_device_is_host(h->devices[d].name) == (pass == 1))
-				order[n++] = d;
-	return n;
-}
-
 static void editor_hcs_summary(const editor_state *st, int assigned, char *out, size_t cap) {
 	int n = st->n_layers;
 	if (assigned == n)
@@ -439,7 +430,7 @@ static void editor_draw_hcs_panel(const editor_state *st) {
 	ui_putn(6, px, summary, pw, ok ? ui_attr(UI_OK) : ui_attr(UI_ERR));
 
 	int order[HCS_MAX_DEVICES];
-	int n_order	  = editor_hcs_layout_order(h, order);
+	int n_order	  = hcs_layout_order(h, order);
 	int grid_y	  = 8;
 	int grid_rows = MAX(MIN((n + pw - 1) / pw, last - grid_y - n_order - 3), 1);
 	editor_draw_hcs_layer_grid(held, order, n_order, n, px, grid_y, pw, grid_rows);

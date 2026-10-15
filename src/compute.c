@@ -98,28 +98,32 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	scratch_free_slot_buffers(s->slots);
 	free_buf(&s->ple_inp);
 	free_buf(&s->ple_slice);
-	free_buf(&s->ple_inp_mirror);
-	free_buf(&s->ple_slice_mirror);
 	free_buf(&s->ple_all);
 	free_buf(&s->ple_proj);
 	free_buf(&s->ple_proj_norm_w);
 	free_buf(&s->router_softmax_inp);
 	free_buf(&s->router_logits);
 
-	scratch_free_slot_buffers(s->mirror_slots);
-	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
-		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
-			continue;
-		s->mirror_slots[i].owner	= NULL;
-		s->mirror_slots[i].handle	= NULL;
-		s->mirror_slots[i].host_ptr = NULL;
-		s->mirror_slots[i].size		= 0;
-		s->mirror_slots[i].offset	= 0;
+	for (int d = 0; d < s->n_mirrors; d++) {
+		scratch_mirror *mir = &s->mirror[d];
+		scratch_free_slot_buffers(mir->slots);
+		free_buf(&mir->ple_inp);
+		free_buf(&mir->ple_slice);
+		for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
+			if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
+				continue;
+			mir->slots[i].owner	   = NULL;
+			mir->slots[i].handle   = NULL;
+			mir->slots[i].host_ptr = NULL;
+			mir->slots[i].size	   = 0;
+			mir->slots[i].offset   = 0;
+		}
+		mir->be = NULL;
 	}
-	s->mirror_slots_alloced = 0;
-	s->mirror_backend		= NULL;
-	s->active_backend		= NULL;
-	s->active_is_mirror		= 0;
+	s->n_mirrors	   = 0;
+	s->mirrors_alloced = 0;
+	s->active_backend  = NULL;
+	s->active_dev	   = 0;
 	free(s->transfer_buf);
 	s->transfer_buf		= NULL;
 	s->transfer_buf_cap = 0;
@@ -497,54 +501,80 @@ static status_code ensure_transfer_buf(compute_scratch *s, size_t need_floats) {
 	return OK;
 }
 
-status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
-	if (s->mirror_slots_alloced && s->mirror_backend)
-		return OK;
-	if (!m || !m->mixed_backend_mode)
-		return OK;
-	backend *host = backend_host();
-	if (!host)
-		return ERR_UNSUPPORTED;
+int compute_device_index(const compute_scratch *s, const backend *b) {
+	if (b == s->backend)
+		return 0;
+	for (int i = 0; i < s->n_mirrors; i++)
+		if (s->mirror[i].be == b)
+			return i + 1;
+	return -1;
+}
 
-	s->mirror_backend = host;
+static void scratch_bind_router_slots(compute_scratch *s, buffer *slots) {
+	slots[RECIPE_SLOT_ROUTER_IDS].handle   = s->router_ids_host;
+	slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
+	slots[RECIPE_SLOT_ROUTER_IDS].size	   = sizeof(s->router_ids_host);
+	slots[RECIPE_SLOT_ROUTER_IDS].offset   = 0;
+	slots[RECIPE_SLOT_ROUTER_IDS].owner	   = NULL;
+	slots[RECIPE_SLOT_ROUTER_W].handle	   = s->router_w_host;
+	slots[RECIPE_SLOT_ROUTER_W].host_ptr   = s->router_w_host;
+	slots[RECIPE_SLOT_ROUTER_W].size	   = sizeof(s->router_w_host);
+	slots[RECIPE_SLOT_ROUTER_W].offset	   = 0;
+	slots[RECIPE_SLOT_ROUTER_W].owner	   = NULL;
+}
 
-	compute_layout L;
-	compute_layout_init(m, &L);
-
-	status_code st = scratch_alloc_slots(host, s->mirror_slots, m, &L);
+static status_code scratch_alloc_mirror(compute_scratch *s, const model *m, const compute_layout *L,
+										scratch_mirror *mir) {
+	status_code st = scratch_alloc_slots(mir->be, mir->slots, m, L);
 	if (st != OK)
 		return st;
-
 	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0) {
 		size_t ple_bytes = (size_t)m->layer_dims.n_embd_per_layer * sizeof(float);
-		st				 = scratch_alloc(host, &s->ple_slice_mirror, ple_bytes, "ple_slice mirror");
+		st				 = scratch_alloc(mir->be, &mir->ple_slice, ple_bytes, "ple_slice mirror");
 		if (st != OK)
 			return st;
-		st = scratch_alloc(host, &s->ple_inp_mirror, ple_bytes, "ple_inp mirror");
+		st = scratch_alloc(mir->be, &mir->ple_inp, ple_bytes, "ple_inp mirror");
 		if (st != OK)
 			return st;
 	}
+	scratch_bind_router_slots(s, mir->slots);
+	return OK;
+}
 
-	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].handle	 = s->router_ids_host;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].size	 = sizeof(s->router_ids_host);
-	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].offset	 = 0;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_IDS].owner	 = NULL;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_W].handle	 = s->router_w_host;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_W].host_ptr	 = s->router_w_host;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_W].size		 = sizeof(s->router_w_host);
-	s->mirror_slots[RECIPE_SLOT_ROUTER_W].offset	 = 0;
-	s->mirror_slots[RECIPE_SLOT_ROUTER_W].owner		 = NULL;
+status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
+	if (s->mirrors_alloced)
+		return OK;
+	if (!m || !m->mixed_backend_mode)
+		return OK;
+
+	for (int i = 0; i < m->n_layers; i++) {
+		backend *lb = model_layer_backend(m, i);
+		if (!lb || compute_device_index(s, lb) >= 0)
+			continue;
+		if (s->n_mirrors >= SCRATCH_MAX_MIRRORS) {
+			ERROR("compute: more than %d devices hold layers", SCRATCH_MAX_MIRRORS + 1);
+			return ERR_UNSUPPORTED;
+		}
+		s->mirror[s->n_mirrors++].be = lb;
+	}
+
+	compute_layout L;
+	compute_layout_init(m, &L);
+	for (int d = 0; d < s->n_mirrors; d++) {
+		status_code st = scratch_alloc_mirror(s, m, &L, &s->mirror[d]);
+		if (st != OK)
+			return st;
+	}
 
 	size_t xfer_need = (size_t)L.attn_buf_size;
 	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0 &&
 		(size_t)m->layer_dims.n_embd_per_layer > xfer_need)
 		xfer_need = (size_t)m->layer_dims.n_embd_per_layer;
-	st = ensure_transfer_buf(s, xfer_need);
+	status_code st = ensure_transfer_buf(s, xfer_need);
 	if (st != OK)
 		return st;
 
-	s->mirror_slots_alloced = 1;
+	s->mirrors_alloced = 1;
 	return OK;
 }
 
@@ -553,31 +583,29 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, i
 		target = s->backend;
 	backend *current = compute_active_backend(s);
 	if (target == current) {
-		s->active_backend	= current;
-		s->active_is_mirror = (current == s->mirror_backend);
+		s->active_backend = current;
+		s->active_dev	  = compute_device_index(s, current);
+		if (s->active_dev < 0)
+			s->active_dev = 0;
 		return OK;
 	}
 
-	if (target != s->backend && target != s->mirror_backend) {
-		ERROR("compute_switch_active_backend: target backend '%s' is neither primary nor mirror",
+	int target_dev = compute_device_index(s, target);
+	if (target_dev < 0) {
+		ERROR("compute_switch_active_backend: target backend '%s' is not a device of this model",
 			  target->name);
 		return ERR_UNSUPPORTED;
 	}
 
-	buffer *src_x =
-		s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
-	buffer *dst_x =
-		(target == s->mirror_backend) ? &s->mirror_slots[RECIPE_SLOT_X] : &s->slots[RECIPE_SLOT_X];
-
-	backend *src_be = current;
-	ensure_sync(src_be);
-
-	status_code st = compute_copy_buffer_cross(s, src_x, dst_x, dim);
+	buffer *src = &compute_slots_array(s)[RECIPE_SLOT_X];
+	buffer *dst = &compute_dev_slots(s, target_dev)[RECIPE_SLOT_X];
+	ensure_sync(current);
+	status_code st = compute_copy_buffer_cross(s, src, dst, dim);
 	if (st != OK)
 		return st;
 
-	s->active_backend	= target;
-	s->active_is_mirror = (target == s->mirror_backend);
+	s->active_backend = target;
+	s->active_dev	  = target_dev;
 	return OK;
 }
 

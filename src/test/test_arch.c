@@ -1160,7 +1160,7 @@ static status_code run_decode_steps(synth_model *sm, const int32_t *tokens, int 
 	kvcache		kv;
 	status_code st = kvcache_init(&kv, &sm->m, n_ctx, KV_QUANT_F16);
 	if (st == OK && sm->m.mixed_backend_mode)
-		st = kvcache_alloc_host_mirror(&kv, &sm->m);
+		st = kvcache_alloc_mirrors(&kv, &sm->m);
 	compute_scratch s;
 	compute_scratch_init(&s);
 	if (st == OK)
@@ -1181,11 +1181,12 @@ static status_code run_decode_steps(synth_model *sm, const int32_t *tokens, int 
 }
 
 static void test_arch_mixed_split(backend *ref, model_arch arch, const synth_cfg *cfg,
-								  int split_begin, int n_prefill, int n_decode) {
+								  int split_begin, bool host_leads, int n_prefill, int n_decode) {
 	const char *arch_name = arch_lookup(arch)->gguf_name;
 	char		label[160];
 	char		detail[320];
-	snprintf(label, sizeof(label), "mixed_split[%s split=%d]", arch_name, split_begin);
+	snprintf(label, sizeof(label), "mixed_split[%s %s split=%d]", arch_name,
+			 host_leads ? "host_first" : "host_last", split_begin);
 
 	if (backend_host() == ref) {
 		record_result(OPFAM_ARCH_GENERATE, label, V_SKIP, "host backend is the reference backend");
@@ -1207,7 +1208,9 @@ static void test_arch_mixed_split(backend *ref, model_arch arch, const synth_cfg
 	status_code st =
 		run_decode_steps(sm, tokens, n_prefill, n_decode, n_ctx, cfg->vocab, logits_ref);
 	if (st == OK)
-		st = model_set_layer_backend_range(&sm->m, split_begin, cfg->n_layers, backend_host());
+		st = host_leads ? model_set_layer_backend_range(&sm->m, 0, split_begin, backend_host())
+						: model_set_layer_backend_range(&sm->m, split_begin, cfg->n_layers,
+														backend_host());
 	if (st == OK) {
 		recipe_free(sm->m.recipe);
 		sm->m.recipe = NULL;
@@ -1243,6 +1246,77 @@ static void test_arch_mixed_split(backend *ref, model_arch arch, const synth_cfg
 	free(logits_mix);
 	free(tokens);
 	synth_model_free(sm);
+}
+
+static void test_arch_multi_device(backend *ref, model_arch arch, const synth_cfg *cfg,
+								   int n_prefill, int n_decode) {
+	char label[160];
+	char detail[320];
+	snprintf(label, sizeof(label), "multi_device[%s 3 devices]", arch_lookup(arch)->gguf_name);
+
+	backend *extra_a = NULL;
+	backend *extra_b = NULL;
+	if (backend_create(ref->name, 0, &extra_a) != OK ||
+		backend_create(ref->name, 0, &extra_b) != OK) {
+		backend_destroy(extra_a);
+		record_result(OPFAM_ARCH_GENERATE, label, V_SKIP, "cannot create extra backend instances");
+		return;
+	}
+
+	int			 n_ctx = n_prefill + n_decode + 8;
+	synth_model *sm	   = synth_model_build(ref, arch, cfg, n_ctx);
+
+	int32_t *tokens = xmalloc((size_t)(n_prefill + n_decode) * sizeof(int32_t));
+	seed_test_rng(0x3DE71CEULL + (uint64_t)arch);
+	for (int i = 0; i < n_prefill + n_decode; i++)
+		tokens[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
+
+	size_t per_run	  = (size_t)(n_decode + 1) * (size_t)cfg->vocab;
+	float *logits_ref = xcalloc(per_run, sizeof(float));
+	float *logits_mix = xcalloc(per_run, sizeof(float));
+
+	status_code st =
+		run_decode_steps(sm, tokens, n_prefill, n_decode, n_ctx, cfg->vocab, logits_ref);
+	backend *assign[] = {ref, extra_a, extra_b, extra_a};
+	for (int l = 1; st == OK && l < cfg->n_layers; l++)
+		st = model_set_layer_backend_range(&sm->m, l, l + 1, assign[l % 4]);
+	if (st == OK) {
+		recipe_free(sm->m.recipe);
+		sm->m.recipe = NULL;
+		st			 = model_build_recipe(&sm->m);
+	}
+	if (st == OK)
+		st = run_decode_steps(sm, tokens, n_prefill, n_decode, n_ctx, cfg->vocab, logits_mix);
+
+	float ref_max = 0, worst = 0;
+	int	  worst_step = -1;
+	for (size_t i = 0; st == OK && i < per_run; i++) {
+		ref_max = fmaxf(ref_max, fabsf(logits_ref[i]));
+		float d = fabsf(logits_ref[i] - logits_mix[i]);
+		if (isnan(d) || d > worst) {
+			worst	   = isnan(d) ? INFINITY : d;
+			worst_step = (int)(i / (size_t)cfg->vocab);
+		}
+	}
+
+	if (st != OK) {
+		snprintf(detail, sizeof(detail), "status=%d", st);
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
+	} else if (ref_max == 0.0f || worst > 0.02f * ref_max) {
+		snprintf(detail, sizeof(detail), "max_diff=%.4f ref_max=%.4f first_bad_step=%d", worst,
+				 ref_max, worst_step);
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
+	} else {
+		snprintf(detail, sizeof(detail), "max_diff=%.6f ref_max=%.2f", worst, ref_max);
+		record_result(OPFAM_ARCH_GENERATE, label, V_PASS, detail);
+	}
+
+	free(logits_ref);
+	free(logits_mix);
+	free(tokens);
+	synth_model_free(sm);
+	backend_destroy(extra_a);
+	backend_destroy(extra_b);
 }
 
 static void test_arch_error_compounding(backend *ref, backend *tgt, const synth_cfg *base_cfg,
@@ -1561,7 +1635,9 @@ void run_arch_tests(backend *ref, backend *tgt) {
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, 1);
-	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, 8, 4);
-	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 0, 8, 4);
+	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, false, 8, 4);
+	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 0, false, 8, 4);
+	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, true, 8, 4);
+	test_arch_multi_device(ref, ARCH_LLAMA, &ARCH_CFG_DEEPER, 8, 4);
 	flush_family(OPFAM_ARCH_GENERATE);
 }

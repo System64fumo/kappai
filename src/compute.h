@@ -16,6 +16,15 @@
 typedef void (*layer_progress_cb)(int layer_idx, int n_layers, int token_progress, int batched,
 								  void *ud);
 
+#define SCRATCH_MAX_MIRRORS 7
+
+typedef struct {
+	backend *be;
+	buffer	 slots[RECIPE_SLOT_MAX];
+	buffer	 ple_inp;
+	buffer	 ple_slice;
+} scratch_mirror;
+
 typedef struct compute_scratch {
 	buffer		 router_softmax_inp;
 	buffer		 router_logits;
@@ -26,8 +35,6 @@ typedef struct compute_scratch {
 	float		*rope_cos_swa, *rope_sin_swa;
 	buffer		 ple_inp;
 	buffer		 ple_slice;
-	buffer		 ple_inp_mirror;
-	buffer		 ple_slice_mirror;
 	buffer		 ple_all;
 	buffer		 ple_proj;
 	buffer		 ple_proj_norm_w;
@@ -41,13 +48,13 @@ typedef struct compute_scratch {
 
 	buffer slots[RECIPE_SLOT_MAX];
 
-	buffer	 mirror_slots[RECIPE_SLOT_MAX];
-	int		 mirror_slots_alloced;
-	backend *mirror_backend;
-	backend *active_backend;
-	int		 active_is_mirror;
-	float	*transfer_buf;
-	size_t	 transfer_buf_cap;
+	scratch_mirror mirror[SCRATCH_MAX_MIRRORS];
+	int			   n_mirrors;
+	int			   mirrors_alloced;
+	backend		  *active_backend;
+	int			   active_dev;
+	float		  *transfer_buf;
+	size_t		   transfer_buf_cap;
 
 	float *ple_inp_host;
 	float *cur_host;
@@ -108,8 +115,14 @@ static inline backend *compute_active_backend(compute_scratch *s) {
 	return s->active_backend ? s->active_backend : s->backend;
 }
 
+int compute_device_index(const compute_scratch *s, const backend *b);
+
+static inline buffer *compute_dev_slots(compute_scratch *s, int dev) {
+	return dev > 0 ? s->mirror[dev - 1].slots : s->slots;
+}
+
 static inline buffer *compute_slots_array(compute_scratch *s) {
-	return s->active_is_mirror ? s->mirror_slots : s->slots;
+	return compute_dev_slots(s, s->active_dev);
 }
 
 #endif

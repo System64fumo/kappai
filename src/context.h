@@ -30,6 +30,8 @@ typedef struct {
 	bool				  quiet_progress;
 	int					  last_prompt_tokens;
 	backend				 *backend;
+	backend				 *extra_backends[CONFIG_MAX_LAYER_DEVICES];
+	int					  n_extra_backends;
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;
 	bool				  warmup_done;

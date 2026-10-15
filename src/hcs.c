@@ -363,26 +363,6 @@ static void check_device_fields(violations *v, const hcs_config *h, int idx, int
 		*star_owner = idx;
 }
 
-static void check_device_mix(violations *v, const hcs_config *h) {
-	int n_host = 0, n_accel = 0;
-	for (int i = 0; i < h->n_devices; i++) {
-		if (backend_device_is_host(h->devices[i].name))
-			n_host++;
-		else
-			n_accel++;
-	}
-	if (n_host > 1)
-		add_violation(v, NULL, "devices",
-					  "%d host (cpu) devices listed; not supported in this version (the host is "
-					  "one device)",
-					  n_host);
-	if (n_accel > 1)
-		add_violation(v, NULL, "devices",
-					  "%d non-host devices listed; not supported in this version (at most one "
-					  "non-host device plus the host)",
-					  n_accel);
-}
-
 static void check_experts_star(violations *v, const hcs_config *h) {
 	int owner = -1;
 	for (int i = 0; i < h->n_devices; i++) {
@@ -495,7 +475,6 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 		backend_best_device(best, sizeof(best));
 		add_violation(&v, NULL, "devices", "no devices listed; e.g. 'devices = %s'", best);
 	}
-	check_device_mix(&v, h);
 
 	int star_owner = -1;
 	for (int i = 0; i < h->n_devices; i++) {
@@ -525,26 +504,42 @@ static int first_set_experts(const hcs_config *h) {
 	return HCS_COUNT_UNSET;
 }
 
-static int materialize_split(const hcs_config *h, const char *model_path, config *cfg) {
-	int primary = backend_device_is_host(h->devices[0].name) ? 1 : 0;
+int hcs_layout_order(const hcs_config *h, int *order) {
+	int n = 0;
+	for (int pass = 0; pass < 2; pass++)
+		for (int d = 0; d < h->n_devices; d++)
+			if (backend_device_is_host(h->devices[d].name) == (pass == 1))
+				order[n++] = d;
+	return n;
+}
 
+static void materialize_layer_map(const hcs_config *h, const char *model_path, config *cfg) {
 	int n_layers = 0, n_experts = 0;
 	if (hcs_probe_model(model_path, &n_layers, &n_experts) != 0)
-		return primary;
+		return;
 
 	int held[HCS_MAX_DEVICES];
+	int order[HCS_MAX_DEVICES];
 	hcs_resolve_layers(h, n_layers, held);
-	cfg->ngl = held[primary];
-	return primary;
+	int n = hcs_layout_order(h, order);
+	for (int i = 0; i < n && cfg->n_layer_devices < CONFIG_MAX_LAYER_DEVICES; i++) {
+		int d = order[i];
+		if (held[d] == 0)
+			continue;
+		cfg->layer_devices[cfg->n_layer_devices] = h->devices[d].name;
+		cfg->layer_counts[cfg->n_layer_devices]	 = held[d];
+		cfg->n_layer_devices++;
+	}
+	if (cfg->n_layer_devices > 0)
+		cfg->device = cfg->layer_devices[0];
 }
 
 void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
-	hcs_config eff	   = hcs_effective(h);
-	int		   primary = 0;
-	cfg->ngl		   = -1;
-	if (eff.n_devices == 2)
-		primary = materialize_split(&eff, model_path, cfg);
-	cfg->device = h->devices[primary].name;
+	hcs_config eff = hcs_effective(h);
+	cfg->ngl	   = -1;
+	cfg->device	   = h->devices[0].name;
+	if (eff.n_devices >= 2)
+		materialize_layer_map(h, model_path, cfg);
 
 	int experts = first_set_experts(&eff);
 	if (experts == HCS_COUNT_ALL)

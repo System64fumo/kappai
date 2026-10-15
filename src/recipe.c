@@ -76,9 +76,7 @@ static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 		return batch_slot(ctx->bs, idx);
 	if (ctx->slot_base)
 		return &ctx->slot_base[idx];
-	if (ctx->s && ctx->s->active_is_mirror)
-		return &ctx->s->mirror_slots[idx];
-	return &ctx->s->slots[idx];
+	return &compute_slots_array(ctx->s)[idx];
 }
 
 static inline int slot_is_host_resident(const buffer *b) {
@@ -122,9 +120,7 @@ static status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, co
 static inline buffer *exec_slots(const exec_ctx *ctx) {
 	if (ctx->slot_base)
 		return ctx->slot_base;
-	if (ctx->s && ctx->s->active_is_mirror)
-		return ctx->s->mirror_slots;
-	return ctx->s->slots;
+	return compute_slots_array(ctx->s);
 }
 static inline int exec_is_batch(const exec_ctx *ctx) {
 	return recipe_exec_is_batch(ctx);
@@ -705,8 +701,8 @@ static status_code copy_k_to_v_buffers(backend *a, buffer *kb, buffer *vb, int k
 static status_code copy_k_to_v_slot(model *m, struct compute_scratch *s, int li) {
 	int		 kv_out = m->recipe->layer_ctx[li].kv_row_stride;
 	backend *a		= model_layer_backend(m, li);
-	buffer	*kb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_K] : &s->slots[RECIPE_SLOT_K];
-	buffer	*vb = s->active_is_mirror ? &s->mirror_slots[RECIPE_SLOT_V] : &s->slots[RECIPE_SLOT_V];
+	buffer	*kb		= &compute_slots_array(s)[RECIPE_SLOT_K];
+	buffer	*vb		= &compute_slots_array(s)[RECIPE_SLOT_V];
 	return copy_k_to_v_buffers(a, kb, vb, kv_out, kv_out, 1);
 }
 
@@ -1265,9 +1261,9 @@ static status_code op_ple_proj_inject(exec_ctx *ctx) {
 
 	backend *t = a;
 
-	const int is_mirror		= (s->mirror_backend && t == s->mirror_backend);
-	buffer	 *ple_slice_buf = is_mirror ? &s->ple_slice_mirror : &s->ple_slice;
-	buffer	 *ple_inp_buf	= is_mirror ? &s->ple_inp_mirror : &s->ple_inp;
+	const int ple_dev		= compute_device_index(s, t);
+	buffer	 *ple_slice_buf = ple_dev > 0 ? &s->mirror[ple_dev - 1].ple_slice : &s->ple_slice;
+	buffer	 *ple_inp_buf	= ple_dev > 0 ? &s->mirror[ple_dev - 1].ple_inp : &s->ple_inp;
 
 	ps = profile_begin(prof, op->stage);
 	profile_weight_bytes(prof, op->stage, plan.gate_type, inj_dim, n_embd_per_layer);
@@ -1474,13 +1470,9 @@ static status_code op_attention_impl(const recipe_op *op, struct model *m, struc
 	int use_swa = (sliding_window > 0) && (li >= 0) && model_layer_is_sliding(m, li) && has_swa;
 	profile_scope ps = profile_begin(prof, op->stage);
 	status_code	  st;
-	buffer		 *kb = &cache->k;
-	buffer		 *vb = &cache->v;
-	if (kvcache_layer_uses_host_kv(cache, m, li)) {
-		kv_layer = kvcache_mirror_layer(cache, kv_layer);
-		kb		 = &cache->k_host;
-		vb		 = &cache->v_host;
-	}
+	buffer		 *kb;
+	buffer		 *vb;
+	kvcache_attn_view(cache, m, li, kv_layer, &kb, &vb, &kv_layer);
 	if (use_swa) {
 		backend *t = allow_backend_fallback ? OP_BACKEND(a, attention_swa) : a;
 		st = t->attention_swa(t, &slots[op->in[0]], kb, vb, &slots[op->out], kv_layer, pos, n_heads,
@@ -1793,17 +1785,20 @@ static status_code op_attention(exec_ctx *ctx) {
 					  model_layer_is_sliding(ctx->m, ctx->li) && a->attention_swa_batch != NULL;
 		profile_scope ps = profile_begin(prof, ctx->op->stage);
 		status_code	  st;
+		buffer		 *kb;
+		buffer		 *vb;
+		int			  kv_slot;
+		kvcache_attn_view(ctx->cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
 		if (use_swa)
-			st = a->attention_swa_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
-										&ctx->cache->v, batch_slot(ctx->bs, ctx->op->out), kv_layer,
-										ctx->pos_start, n_heads, n_kv_heads, head_dim, n_ctx,
-										ctx->flash_attn, scale, sliding_window, n_kv_heads_active,
-										ctx->n_rows);
+			st = a->attention_swa_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), kb, vb,
+										batch_slot(ctx->bs, ctx->op->out), kv_slot, ctx->pos_start,
+										n_heads, n_kv_heads, head_dim, n_ctx, ctx->flash_attn,
+										scale, sliding_window, n_kv_heads_active, ctx->n_rows);
 		else
-			st = a->attention_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), &ctx->cache->k,
-									&ctx->cache->v, batch_slot(ctx->bs, ctx->op->out), kv_layer,
-									ctx->pos_start, n_heads, n_kv_heads, head_dim, n_ctx,
-									ctx->flash_attn, scale, n_kv_heads_active, ctx->n_rows);
+			st = a->attention_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), kb, vb,
+									batch_slot(ctx->bs, ctx->op->out), kv_slot, ctx->pos_start,
+									n_heads, n_kv_heads, head_dim, n_ctx, ctx->flash_attn, scale,
+									n_kv_heads_active, ctx->n_rows);
 		profile_end(prof, &ps);
 		return st;
 	}
@@ -2166,9 +2161,7 @@ typedef struct {
 static inline buffer *walker_slot(op_walker *w, uint8_t idx) {
 	if (w->is_batch)
 		return batch_slot(w->bs, idx);
-	if (w->s && w->s->active_is_mirror)
-		return &w->s->mirror_slots[idx];
-	return &w->s->slots[idx];
+	return &compute_slots_array(w->s)[idx];
 }
 
 static inline status_code walker_exec_one(op_walker *w, exec_ctx *ctx, const recipe_op *op) {
@@ -2208,7 +2201,7 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 		layer_be = m->backend;
 	buffer *slot_base = NULL;
 	if (!w->is_batch)
-		slot_base = (w->s && w->s->active_is_mirror) ? w->s->mirror_slots : w->s->slots;
+		slot_base = compute_slots_array(w->s);
 	weight_ref **wtab_row = NULL;
 	if (m->wrefs_by_layer && m->n_layers > 0) {
 		int row	 = (li >= 0 && li < m->n_layers) ? li : 0;
@@ -2259,8 +2252,7 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 			for (int q = 0; q < run_len; q++)
 				ys[q] = walker_slot(w, lops[j + q].out);
 			int consumed = walker_exec_coalesced(w, &lops[j], run_len, ys, &coalesced_status);
-			if (consumed == 0 && coalesced_status == OK &&
-				(w->is_batch || !w->s->active_is_mirror)) {
+			if (consumed == 0 && coalesced_status == OK && (w->is_batch || w->s->active_dev == 0)) {
 				consumed = walker_exec_qonly(w, &lops[j], run_len, ys, &coalesced_status);
 			}
 			if (consumed < 0)
@@ -2315,8 +2307,8 @@ static status_code compute_forward_recipe_one(struct model *m, struct kvcache *c
 		if (st != OK)
 			return st;
 	}
-	s->active_backend	= NULL;
-	s->active_is_mirror = 0;
+	s->active_backend = NULL;
+	s->active_dev	  = 0;
 
 	if (has_begin) {
 		bk->begin_batch(bk);

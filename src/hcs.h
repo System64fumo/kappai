@@ -72,6 +72,7 @@ int	 hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t e
 
 int hcs_migrate_legacy(hcs_config *h, const hcs_legacy *legacy, char *err, size_t errlen);
 
+int hcs_layout_order(const hcs_config *h, int *order);
 int hcs_resolve_layers(const hcs_config *h, int n_layers, int *held);
 int hcs_probe_model(const char *path, int *n_layers, int *n_experts);
 

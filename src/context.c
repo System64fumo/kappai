@@ -79,7 +79,65 @@ void context_set_debug_prompt(context *c, bool enabled) {
 	c->debug_prompt = enabled;
 }
 
+static void context_destroy_extra_backends(context *c) {
+	for (int i = 0; i < c->n_extra_backends; i++)
+		backend_destroy(c->extra_backends[i]);
+	c->n_extra_backends = 0;
+}
+
+static status_code context_open_device(context *c, const char *spec, backend **out) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0) {
+		ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", spec);
+		return ERR_INVALID_ARG;
+	}
+	if (strcmp(name, "cpu") == 0) {
+		*out = backend_host();
+		return OK;
+	}
+	status_code s = backend_create(name, device_index, out);
+	if (s != OK) {
+		ERROR("failed to initialize device '%s'", spec);
+		return s;
+	}
+	c->extra_backends[c->n_extra_backends++] = *out;
+	backend_host_use(*out);
+	return OK;
+}
+
+static status_code apply_layer_map(context *c, const config *cfg) {
+	int n_layers = c->m.n_layers;
+	int total	 = 0;
+	for (int i = 0; i < cfg->n_layer_devices; i++)
+		total += cfg->layer_counts[i];
+	if (total != n_layers) {
+		ERROR("layer map assigns %d layer(s) but the model has %d", total, n_layers);
+		return ERR_INVALID_ARG;
+	}
+
+	int begin = 0;
+	for (int i = 0; i < cfg->n_layer_devices; i++) {
+		int		 end = begin + cfg->layer_counts[i];
+		backend *be	 = c->backend;
+		if (i > 0 || strcmp(cfg->layer_devices[i], cfg->device) != 0) {
+			status_code s = context_open_device(c, cfg->layer_devices[i], &be);
+			if (s != OK)
+				return s;
+			be->rope_neox = c->m.arch_info->uses_neox_rope;
+		}
+		if (be != c->backend && model_set_layer_backend_range(&c->m, begin, end, be) != OK)
+			return ERR_INVALID_ARG;
+		INFO("layers %d-%d on '%s' (%s)", begin, end - 1, be->name, cfg->layer_devices[i]);
+		begin = end;
+	}
+	return OK;
+}
+
 static status_code apply_layer_split(context *c, const config *cfg) {
+	if (cfg->n_layer_devices > 1)
+		return apply_layer_map(c, cfg);
+
 	int n_layers = c->m.n_layers;
 	int host	 = cfg->ngl >= 0 ? n_layers - MIN(cfg->ngl, n_layers) : 0;
 	if (host == 0)
@@ -247,7 +305,7 @@ status_code context_init(context *c, const config *cfg) {
 	}
 
 	if (c->m.mixed_backend_mode) {
-		s = kvcache_alloc_host_mirror(&c->kv, &c->m);
+		s = kvcache_alloc_mirrors(&c->kv, &c->m);
 		if (s != OK) {
 			ERROR("failed to allocate host-side KV cache mirror for mixed backend mode");
 			goto fail_chat;
@@ -272,6 +330,7 @@ fail_tokenizer:
 fail_model:
 	model_free(&c->m);
 fail_backend:
+	context_destroy_extra_backends(c);
 	monitor_free(&c->monitor);
 	g_monitor = NULL;
 	backend_destroy(c->backend);
@@ -291,6 +350,7 @@ void context_free(context *c) {
 	chat_template_free(&c->chat);
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
+	context_destroy_extra_backends(c);
 	backend_destroy(c->backend);
 	c->backend = NULL;
 	free(c->ids_buf.p);

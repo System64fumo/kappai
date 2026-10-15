@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define CONFIG_MAX_LAYER_DEVICES 8
+
 typedef struct config {
 	const char *device;
 	const char *model;
@@ -14,12 +16,15 @@ typedef struct config {
 	const char *fuse;
 	uint64_t	seed;
 
-	int n_threads;
-	int ctx_size;
-	int kv_quant;
-	int moe_cache_cap;
-	int moe_pin;
-	int ngl;
+	int			n_threads;
+	int			ctx_size;
+	int			kv_quant;
+	int			moe_cache_cap;
+	int			moe_pin;
+	int			ngl;
+	int			n_layer_devices;
+	const char *layer_devices[CONFIG_MAX_LAYER_DEVICES];
+	int			layer_counts[CONFIG_MAX_LAYER_DEVICES];
 
 	bool debug;
 	bool use_mmap;
