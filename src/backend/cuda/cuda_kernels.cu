@@ -24,6 +24,14 @@ using namespace nvcuda;
 #include <stdlib.h>
 
 #include "backend/cuda/cuda_internal.h"
+/* log.h declares its entry points without extern "C". Every other user is a
+ * C translation unit, so that works there; this one is C++ and the backend is
+ * dlopen'd, so the C++-mangled names would be unresolvable at load time.
+ * Including it inside extern "C" gives the definitions C linkage, matching the
+ * engine's exports, without widening the shared header for one backend. */
+extern "C" {
+#include "log.h"
+}
 
 /* ------------------------------------------------------------------ */
 /* CUDA 12+ compatibility helpers                                       */
@@ -5195,7 +5203,7 @@ extern "C" void cuda_attn_f16(const float *q_dev, const uint16_t *kc_dev,
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_f16_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_f16_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -5484,8 +5492,7 @@ extern "C" void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
             layer_base_bytes, kvh_stride, pos_start, m, scale);
         cudaError_t flash_err = cudaGetLastError();
         if (flash_err != cudaSuccess)
-            fprintf(stderr, "[CUDA ERROR] flash attn launch failed: %s\n",
-                    cudaGetErrorString(flash_err));
+            ERROR("cuda: flash attn launch failed: %s", cudaGetErrorString(flash_err));
         return;
     }
         int n_pos_est = pos_start + m;
@@ -5894,7 +5901,7 @@ extern "C" void cuda_attn_q8(const float *q_dev, const uint8_t *kc_dev,
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_q8_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_q8_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -6026,7 +6033,7 @@ extern "C" void cuda_attn_batch_q8(const float *q_dev, const uint8_t *kc_dev,
         layer_base_bytes, kvh_stride_bytes, pos_start, m, sliding_window, scale, n_blocks);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_q8_batch_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_q8_batch_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -6077,7 +6084,7 @@ extern "C" void cuda_kv_put_f16(const float *k_in, const float *v_in,
                                                    layer_base_bytes, kvh_stride, pos, n_ctx);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] kv_put_f16_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: kv_put_f16_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -8426,8 +8433,7 @@ extern "C" void cuda_attn_f16_decode_split(const float *q_dev, const uint16_t *k
     attn_f16_combine_kernel<<<n_heads, 256, 0, stream>>>(partials, out_dev, n_heads, head_dim, S);
     cudaError_t cerr = cudaGetLastError();
     if (cerr != cudaSuccess)
-        fprintf(stderr, "[CUDA ERROR] decode-split attn launch failed: %s\n",
-                cudaGetErrorString(cerr));
+        ERROR("cuda: decode-split attn launch failed: %s", cudaGetErrorString(cerr));
 }
 
 /* Capture-safe pre-grow for the split scratch (cudaMalloc aborts graph
@@ -8562,8 +8568,7 @@ extern "C" void cuda_attn_f16_decode_split_g(const float *q_dev, const uint16_t 
     attn_f16_combine_kernel<<<n_heads, 256, 0, stream>>>(partials, out_dev, n_heads, head_dim, S);
     cudaError_t cerr = cudaGetLastError();
     if (cerr != cudaSuccess)
-        fprintf(stderr, "[CUDA ERROR] decode-split-g attn launch failed: %s\n",
-                cudaGetErrorString(cerr));
+        ERROR("cuda: decode-split-g attn launch failed: %s", cudaGetErrorString(cerr));
 }
 
 extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
@@ -8585,8 +8590,7 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
             layer_base_bytes, kvh_stride, scale, params_dev, sliding_window);
         cudaError_t cerr = cudaGetLastError();
         if (cerr != cudaSuccess)
-            fprintf(stderr, "[CUDA ERROR] coop attn launch failed: %s\n",
-                    cudaGetErrorString(cerr));
+            ERROR("cuda: coop attn launch failed: %s", cudaGetErrorString(cerr));
         return;
     }
     /* Split decode path (default for hd==256; validated S25): cures the
@@ -8609,7 +8613,7 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
         (const cuda_decode_params *)params_dev, tile_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_f16_gqa_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_f16_gqa_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -8895,7 +8899,7 @@ extern "C" void cuda_attn_f16_split_g(const float *q_dev, const uint16_t *kc_dev
         partials, out_dev, n_heads, n_kv_heads, head_dim, n_queries, n_splits);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_f16_split_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_f16_split_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -8914,7 +8918,7 @@ extern "C" void cuda_attn_f16_g(const float *q_dev, const uint16_t *kc_dev,
         (const cuda_decode_params *)params_dev, tile_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_f16_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_f16_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9321,7 +9325,7 @@ extern "C" void cuda_attn_q8_gqa_g(const float *q_dev, const uint8_t *kc_dev,
         (const cuda_decode_params *)params_dev, tile_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_q8_gqa_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_q8_gqa_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9344,7 +9348,7 @@ extern "C" void cuda_attn_q8_g(const float *q_dev, const uint8_t *kc_dev,
         (const cuda_decode_params *)params_dev, tile_size);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] attn_q8_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: attn_q8_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9380,7 +9384,7 @@ extern "C" void cuda_kv_put_f16_g(const float *k_in, const float *v_in,
         (const cuda_decode_params *)params_dev);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] kv_put_f16_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: kv_put_f16_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9455,7 +9459,7 @@ extern "C" void cuda_kv_put_q8(const float *k_in, const float *v_in,
         layer_base_bytes, kvh_stride_bytes, pos, n_blocks);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] kv_put_q8_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: kv_put_q8_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9501,7 +9505,7 @@ extern "C" void cuda_kv_put_batch_q8(const float *k_in, const float *v_in,
         layer_base_bytes, kvh_stride_bytes, pos_start, n_seq, n_blocks, in_row_stride);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] kv_put_batch_q8_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: kv_put_batch_q8_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
@@ -9542,7 +9546,7 @@ extern "C" void cuda_kv_put_q8_g(const float *k_in, const float *v_in,
         (const cuda_decode_params *)params_dev);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA ERROR] kv_put_q8_g_kernel launch failed: %s\n", cudaGetErrorString(err));
+        ERROR("cuda: kv_put_q8_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
 
