@@ -1,21 +1,3 @@
-/*
- * CUDA backend for the Kappai runtime.
- *
- * This file is compiled with the C compiler (gcc/clang) and links the CUDA
- * runtime library (libcudart).  The heavy compute lives in cuda_kernels.cu,
- * which is compiled by nvcc; the two are stitched together through the
- * extern "C" launchers declared in cuda_internal.h.
- *
- * KEY DESIGN: We use cudaMalloc() for device memory and maintain a separate
- * host copy via malloc() so that CPU fallback ops can access data without
- * requiring cudaMallocManaged (which fails in WSL2 with default flags).
- * For WSL2 we use cudaMallocManaged with cudaMemAttachGlobal as fallback
- * when available; otherwise we use explicit host copies.  The host copy
- * ensures that non-native ops (rmsnorm, rope, attention, etc.) that fall
- * back to the CPU path can read/write valid memory via cpu_ptr() which
- * checks BCAP_HOST_VISIBLE_BUFFERS.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

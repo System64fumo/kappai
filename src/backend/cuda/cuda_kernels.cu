@@ -1,16 +1,3 @@
-/*
- * CUDA kernels for the Kappai backend.
- *
- * Compiled with nvcc and linked into libkappai.so alongside the gcc-compiled
- * cuda.c (which uses the CUDA runtime API).  The kernels intentionally mirror
- * the exact arithmetic of the CPU scalar backend in src/backend/cpu/scalar/
- * so that results are bit-for-bit comparable (within the test's loose
- * tolerance).
- *
- * Compatible with CUDA 12.x+ (__half::x is private; use reinterpret_cast or
- * __float2half / device-side intrinsics instead of direct member access).
- */
-
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -19,11 +6,11 @@
 #include <cublas_v2.h>
 #endif
 
-using namespace nvcuda;
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "backend/cuda/cuda_internal.h"
+using namespace nvcuda;
 /* log.h declares its entry points without extern "C". Every other user is a
  * C translation unit, so that works there; this one is C++ and the backend is
  * dlopen'd, so the C++-mangled names would be unresolvable at load time.
