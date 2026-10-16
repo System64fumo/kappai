@@ -10,17 +10,12 @@
 
 #include "backend/backend.h"
 #include "compute.h"
-#include "recipe.h" /* ACTIVATION_GELU */
+#include "recipe.h"
 #include "log.h"
 #include "gguf.h"
 #include "backend/cuda/cuda_internal.h"
 #include "backend/cuda/cuda_repack.h"
 
-/* The quad-major relayout types are declared in cuda_internal.h rather than the
- * shared ggml.h enum, so they stay private to this backend. Alias them to the
- * names the rest of this file uses. */
-
-/* Lazy D2H is always enabled; env vars removed per review. */
 static int cuda_lazy_d2h(void) {
     return 1;
 }
@@ -41,7 +36,6 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
                                         const float *rope_sin_base,
                                         const float **cos_dev, const float **sin_dev);
 
-/* Per-backend private state (stream for async kernel/memcpy ordering). */
 struct cuda_priv {
     cudaStream_t stream;
     size_t *kv_layer_off;
@@ -49,61 +43,44 @@ struct cuda_priv {
     int kv_n_kv_heads;
     int kv_n_ctx;
     int kv_head_dim;
-    /* KV cache element type: 0 = F16 (kv_layer_off in half elements),
-     * 1 = Q8_0 (kv_layer_off in bytes). Set by cuda_kv_alloc. */
+
     int kv_quant_q8;
-    /* Immutable-prefix rope table cache (precomputed/model tables): one
-     * device slot per row width (global vs SWA heads differ, so a single
-     * shared buffer cannot carry one watermark). Each row uploads once
-     * ever; up_pos records how far each slot is filled. */
+
 #define ROPE_TBL_SLOTS 2
     struct {
         float *cos_dev;
         float *sin_dev;
-        size_t cap; /* floats per table */
-        int half;   /* row width, -1 = empty */
-        int up_pos; /* max pos uploaded, -1 = none */
-        /* Source identity: rows are immutable per source, but different
-         * callers (notably unit tests) may pass different tables for the
-         * same geometry. A source change invalidates the watermark. */
+        size_t cap;
+        int half;
+        int up_pos;
+
         const float *cos_src;
         const float *sin_src;
     } rope_tbl[ROPE_TBL_SLOTS];
-    /* Persistent scratch for argmax */
+
     int32_t *argmax_idx_dev;
-    /* Device-side n_pos + decode params for CUDA Graph compatibility */
-    /* Persistent host staging for freq-factor rope tables. Written regions
-     * are immutable once uploaded, so async uploads never race reuse. */
+
     float *rope_cs_host;
-    size_t rope_cs_cap;   /* in floats */
-    int rope_cs_pos;      /* max pos on device, -1 = none */
+    size_t rope_cs_cap;
+    int rope_cs_pos;
     float rope_cs_theta;
     const float *rope_cs_ff;
     int rope_cs_hd;
-    /* Dedicated device tables for the freq-factor path (kept separate from
-     * the precomputed slots above: different source, own watermark). */
+
     float *rope_cs_cos_dev;
     float *rope_cs_sin_dev;
-    size_t rope_cs_dev_cap; /* floats per table */
-    /* Cached staging for the degrade path of fused residual multi GEMM
-     * (stashes resid when it aliases an output). Grow-only. */
+    size_t rope_cs_dev_cap;
+
     float *resid_tmp_dev;
-    size_t resid_tmp_cap; /* in floats */
-    /* Normed-x staging for the split path of rmsnorm_matmul_multi
-     * (used when the fused kernel's per-block norm+quant redundancy
-     * outweighs launch savings). Grow-only, device-only (host_ptr NULL
-     * so no D2H fires). */
+    size_t resid_tmp_cap;
+
     float *rmm_tmp_dev;
-    size_t rmm_tmp_cap; /* in floats */
+    size_t rmm_tmp_cap;
 };
 
 static struct cuda_priv *cuda_priv(backend *self) {
     return (struct cuda_priv *)self->priv;
 }
-
-/* ------------------------------------------------------------------ */
-/* Backend life-cycle                                                  */
-/* ------------------------------------------------------------------ */
 
 static size_t cuda_kv_layer_base(struct cuda_priv *priv, int layer) {
     if (priv->kv_layer_off)
@@ -112,24 +89,16 @@ static size_t cuda_kv_layer_base(struct cuda_priv *priv, int layer) {
            (size_t)priv->kv_head_dim;
 }
 
-/* Q8_0 KV geometry helpers (KV_Q8_0_BLOCK[_BYTES] from backend.h).
- * NOTE: kv_layer_off units are half-elements for F16 and raw bytes
- * for Q8_0; the two paths use different base helpers. */
 static size_t cuda_kv_q8_nblocks(int head_dim) {
     return ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
 }
 
-/* Layer base in bytes (Q8 path). F16 path keeps using cuda_kv_layer_base. */
 static size_t cuda_kv_layer_base_bytes(struct cuda_priv *priv, int layer) {
     if (priv->kv_layer_off)
         return priv->kv_layer_off[layer];
     return (size_t)layer * (size_t)priv->kv_n_kv_heads * (size_t)priv->kv_n_ctx *
            cuda_kv_q8_nblocks(priv->kv_head_dim) * KV_Q8_0_BLOCK_BYTES;
 }
-
-/* ------------------------------------------------------------------ */
-/* Backend life-cycle                                                  */
-/* ------------------------------------------------------------------ */
 
 static status_code cuda_probe(void) {
     int device_count = 0;
@@ -199,10 +168,6 @@ static void cuda_synchronize(backend *self) {
     cudaDeviceSynchronize();
 }
 
-/* ------------------------------------------------------------------ */
-/* Buffer management (cudaMalloc + host copy for CPU fallback)       */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_upload_weight(backend *self, const void *host_data, uint32_t type, int k,
                                       int n_rows, buffer *out, uint32_t declared_type);
 
@@ -210,15 +175,8 @@ static status_code cuda_buffer_alloc_weight(backend *self, const tensor_desc *de
     int k = (int)desc->dims[0];
     int n_rows = (int)desc->dims[1];
     if (n_rows <= 0)
-        n_rows = 1; /* 1-D tensors (rmsnorm weights etc.) upload with d1 == 0 */
+        n_rows = 1;
 
-    /* Lossless Q4_0 -> Q8_0 promotion. Q8_0 GEMV is the faster inner loop and
-     * the mapping is exact (qs = (nib - 8) * 2, s = d / 2), so promoting buys
-     * speed with identical numerics. Every consumer of the weight must stay on
-     * this backend, because the engine keeps tagging the weight with the
-     * model's declared Q4_0: the per-buffer type side table below records what
-     * we actually stored, and every matmul entry point (including the host
-     * fallbacks) prefers that record over the engine's tag. */
     void       *converted = NULL;
     const void *host_data = desc->host_data;
     uint32_t    type      = desc->type;
@@ -266,10 +224,7 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
                 out->host_ptr = w_host;
                 out->owner   = self;
                 cuda_host_alloc_note(w_host, 0);
-                /* Record what was actually stored: the Q4_0->Q8_0 promotion
-                 * relaid the bytes, and the engine still tags the weight with
-                 * the model's declared Q4_0, so the matmul entry points must
-                 * prefer this record. */
+
                 if (type != declared_type)
                     cuda_weight_type_note(w_dev, type);
                 return OK;
@@ -277,7 +232,7 @@ static status_code cuda_upload_weight(backend *self, const void *host_data, uint
         }
         cudaFree(w_dev);
     }
-    /* Fallback to managed (WSL2) */
+
     void *w_managed = NULL;
     e = cudaMallocManaged(&w_managed, w_bytes, cudaMemAttachGlobal);
     if (e != cudaSuccess) return ERR_OUT_OF_MEMORY;
@@ -309,7 +264,7 @@ static status_code cuda_buffer_alloc_scratch(backend *self, size_t size, buffer 
             return OK;
         }
         if (host) cudaFreeHost(host);
-        /* Fallback to pageable memory */
+
         host = malloc(size);
         if (host) {
             out->handle        = dev;
@@ -339,13 +294,11 @@ static void cuda_buffer_free(backend *self, buffer *buf) {
 
     void *handle = buf->handle;
     void *host_ptr = (void *)buf->host_ptr;
-    /* Drop any recorded weight type: CUDA recycles device addresses, so a
-     * stale entry would mislabel whatever weight lands here next. */
+
     cuda_weight_type_forget(handle);
-    /* How the host side was allocated, recorded at alloc time (see
-     * cuda_internal.h): cudaHostAlloc() must go back through cudaFreeHost(). */
+
     int   pinned = cuda_host_alloc_pinned(host_ptr);
-    
+
     buf->handle = NULL;
     buf->host_ptr = NULL;
     buf->size   = 0;
@@ -355,12 +308,10 @@ static void cuda_buffer_free(backend *self, buffer *buf) {
         if (pinned == 1) {
             cudaError_t e = cudaFreeHost(host_ptr);
             if (e != cudaSuccess) {
-                /* Pinned memory allocated by cudaHostAlloc cannot be freed with free().
-                 * During shutdown, CUDA runtime may already be torn down; just skip.
-                 */
+
             }
         } else {
-            /* Unknown host pointers are malloc'd by this backend. */
+
             free(host_ptr);
         }
         cuda_host_alloc_forget(host_ptr);
@@ -373,10 +324,6 @@ static void *cuda_dev_ptr(const buffer *b) {
     return (char *)b->handle + b->offset;
 }
 
-/* Host-fallback staging (S32): CUDA-owned weights/activations have no valid
- * host mirror, so the CPU reference cannot read them directly (it would
- * dereference a device pointer). Stage device->host, run the host op, stage
- * the result back. Used only on the unsupported-quant fallback paths. */
 static void *cuda_host_stage_in(const buffer *b, size_t bytes) {
     void *h = malloc(bytes ? bytes : 1);
     if (!h) return NULL;
@@ -417,11 +364,6 @@ static status_code cuda_copy_buffer(backend *self, const buffer *src, buffer *ds
     return OK;
 }
 
-/* Stream-ordered async copies with the same mirror updates as above.
- * Device consumers on priv->stream observe identical ordering; the host
- * never blocks, so deep queues don't stall per-layer per-token traffic
- * (PLE gather, shared-KV copies). Host readers must go through
- * buffer_read_f32 (which syncs) — direct host_ptr reads would race. */
 static status_code cuda_copy_buffer_async(backend *self, const buffer *src, buffer *dst, int n) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv || n <= 0) return ERR_INVALID_ARG;
@@ -453,8 +395,6 @@ static status_code cuda_buffer_write_async(backend *self, buffer *buf, const flo
     return OK;
 }
 
-/* Strided 2D copy in one call (e.g. PLE slice gather). Stream-ordered async
- * when both sides are device-resident; falls back to row copies otherwise. */
 static status_code cuda_op_copy_2d(backend *self, buffer *dst, size_t dst_row_floats,
                                    const buffer *src, size_t src_row_floats, int width_floats,
                                    int height) {
@@ -483,9 +423,7 @@ static status_code cuda_op_copy_2d(backend *self, buffer *dst, size_t dst_row_fl
 }
 
 static status_code cuda_buffer_read_f32(backend *self, const buffer *buf, float *host_dst, int n) {
-    /* On-demand host sync point: device is source of truth (per-op mirror
-     * syncs are skipped for speed). Drain the stream, refresh the mirror,
-     * then serve from it. Pure-host buffers copy directly. */
+
     struct cuda_priv *priv = cuda_priv(self);
     if (priv && priv->stream)
         cudaStreamSynchronize(priv->stream);
@@ -524,10 +462,6 @@ static status_code cuda_buffer_write_f32(backend *self, buffer *buf, const float
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* matmul                                                              */
-/* ------------------------------------------------------------------ */
-
 static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
     (void)self;
     switch (w_type) {
@@ -553,9 +487,7 @@ static int cuda_matmul_type_native(backend *self, uint32_t w_type) {
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n);
 static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
                                 const buffer *x, buffer *y, int n, int k) {
-    /* Prefer the type this backend actually stored (see the weight-type side
-     * table): a promoted weight must not be read with the engine's tag, by
-     * the native kernels or by the host fallback below. */
+
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
@@ -580,11 +512,9 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
         }
         return ERR_UNSUPPORTED;
     }
-    
+
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
-
-    /* NO H2D for x: device buffer is source of truth. */
 
     const void *w_dev = cuda_dev_ptr((buffer *)w);
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
@@ -639,16 +569,14 @@ static status_code cuda_matmul(backend *self, const buffer *w, uint32_t w_type,
             cudaSuccess)
             return ERR_INTERNAL;
     }
-    
+
     return OK;
 }
 
-/* Fused matmul + residual add: y = W*x + residual.  Eliminates a separate
- * add_inplace kernel launch + global memory round-trip per layer. */
 static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
                                         const buffer *x, const buffer *residual, buffer *y,
                                         int n, int k) {
-    /* Same weight-type override as cuda_matmul: see cuda_weight_type_of. */
+
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
@@ -678,8 +606,6 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
 
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
-
-    /* NO H2D for x/residual: device buffers are source of truth. */
 
     const void *w_dev = cuda_dev_ptr((buffer *)w);
     const float *x_dev = (const float *)cuda_dev_ptr((buffer *)x);
@@ -715,8 +641,7 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
             cuda_matmul_iq3_s_residual(w_dev, x_dev, r_dev, y_dev, n, k, stream);
             break;
         default: {
-            /* No fused residual kernel for this type (Q4_K/F32/F16/BF16):
-             * degrade to separate matmul + add, mirroring op_rmsnorm_add. */
+
             status_code st = cuda_matmul(self, w, w_type, x, y, n, k);
             if (st != OK) return st;
             return cuda_op_add_inplace(self, y, residual, n);
@@ -732,15 +657,10 @@ static status_code cuda_matmul_residual(backend *self, const buffer *w, uint32_t
     return OK;
 }
 
-/* Fused Q8_0/Q4_0 down-projection with GELU activation.  The activation
- * (act = gelu_tanh(gate) * up) is folded into the on-device quantization so
- * no host round-trip is needed for the FFN middle. */
 static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
                                         const buffer *gate, const buffer *up, buffer *y, int n,
                                         int k, int activation) {
-    /* Same weight-type override as cuda_op_matmul_batch: the engine tags the
-     * weight with the model's declared type, but a relaid weight is stored in
-     * a layout only the promoted-Q8_0 kernels can read. */
+
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
@@ -770,7 +690,7 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         return ERR_UNSUPPORTED;
     }
     if (w_type != GGML_TYPE_Q8_0 && w_type != GGML_TYPE_Q4_0 && w_type != GGML_TYPE_Q4_1) {
-        /* Exotic quant (Q4_K/Q6_K/...): host fallback + device refresh. */
+
         backend *host = backend_host();
         if (host && host->matmul_ffn_down) {
             size_t wb = w->size, gb = (size_t)k * sizeof(float),
@@ -798,8 +718,6 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
         struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
-    /* NO H2D: device buffers are source of truth. */
-
     const void *w_dev = cuda_dev_ptr((buffer *)w);
     const float *gate_dev = (const float *)cuda_dev_ptr((buffer *)gate);
     const float *up_dev = (const float *)cuda_dev_ptr((buffer *)up);
@@ -821,7 +739,6 @@ static status_code cuda_op_matmul_ffn_down(backend *self, const buffer *w, uint3
     return OK;
 }
 
-/* Batched FFN down: processes m rows of gate/up in parallel. */
 static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
                                                  const buffer *gate, const buffer *up, buffer *y,
                                                  int n, int k, int activation, int m) {
@@ -903,13 +820,10 @@ static status_code cuda_op_matmul_ffn_down_batch(backend *self, const buffer *w,
     return OK;
 }
 
-/* RMSNorm family.  w may be NULL for noweight variants. */
 static status_code cuda_op_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
                                     float eps) {
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
-
-    /* NO H2D: device buffers are source of truth. */
 
     cuda_rmsnorm(cuda_dev_ptr((buffer *)x),
                  w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
@@ -928,8 +842,6 @@ static status_code cuda_op_rmsnorm_per_head(backend *self, const buffer *x, cons
     cudaStream_t stream = priv ? priv->stream : 0;
     int n = n_heads * head_dim;
 
-    /* NO H2D: device buffers are source of truth. */
-
     cuda_rmsnorm_per_head(cuda_dev_ptr((buffer *)x),
                           w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
                           (float *)cuda_dev_ptr(y), n_heads, head_dim, eps, stream);
@@ -940,10 +852,6 @@ static status_code cuda_op_rmsnorm_per_head(backend *self, const buffer *x, cons
     return OK;
 }
 
-/* Batched per-head RMSNorm: batch rows are (n_heads x head_dim) contiguous
- * (row_stride == n_heads*head_dim), and the single kernel broadcasts one
- * head_dim weight vector across heads — so this is exactly rmsnorm_batch
- * over m*n_heads rows of head_dim. One kernel instead of m singles. */
 static status_code cuda_op_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w,
                                                   buffer *y, int n_heads, int head_dim, float eps,
                                                   int m) {
@@ -966,9 +874,6 @@ static status_code cuda_op_rmsnorm_noweight(backend *self, const buffer *x, buff
     return cuda_op_rmsnorm(self, x, NULL, y, n, eps);
 }
 
-/* Batched per-head noweight norm: reshape (m rows x H heads) into m*H
- * rows of head_dim and run the proven batch kernel with w=NULL.
- * Kills the 522-launch per-row fallback in prefill. */
 static status_code cuda_op_rmsnorm_noweight_per_head_batch(backend *self, const buffer *x,
                                                            buffer *y, int n_heads, int head_dim,
                                                            float eps, int m) {
@@ -990,15 +895,12 @@ static status_code cuda_op_rmsnorm_noweight_per_head(backend *self, const buffer
     return cuda_op_rmsnorm_per_head(self, x, NULL, y, n_heads, head_dim, eps);
 }
 
-/* Fused RMSNorm + Residual Add: y = (x + residual) * scale * w */
 static status_code cuda_op_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
                                         const buffer *residual, buffer *y, int n, float eps,
                                         float out_scale) {
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
     int n_total = n;
-
-    /* NO H2D: device buffers are source of truth. */
 
     cuda_rmsnorm_add(cuda_dev_ptr((buffer *)x),
                      w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
@@ -1011,10 +913,6 @@ static status_code cuda_op_rmsnorm_add(backend *self, const buffer *x, const buf
     return OK;
 }
 
-/* Batched RMSNorm + residual add: one block per row. Replaces
- * rmsnorm_batch + add_batch (one launch and one round-trip saved).
- * Note: keeps the addend in a register, so one fewer rounding than the
- * decomposed path (ulp-level, same class as the PLE reorderings). */
 static status_code cuda_op_rmsnorm_add_batch(backend *self, const buffer *x, const buffer *w,
                                              const buffer *residual, buffer *y, int n, float eps,
                                              float out_scale, int m) {
@@ -1033,7 +931,6 @@ static status_code cuda_op_rmsnorm_add_batch(backend *self, const buffer *x, con
     return OK;
 }
 
-/* Fused RMSNorm + RoPE: y = rmsnorm(x, w), then apply RoPE rotation */
 static status_code cuda_op_rmsnorm_rope(backend *self, const buffer *x, const buffer *w,
                                          buffer *y, int n_heads, int head_dim, int pos,
                                          const float *rope_cos_base, const float *rope_sin_base,
@@ -1044,7 +941,6 @@ static status_code cuda_op_rmsnorm_rope(backend *self, const buffer *x, const bu
     int n = n_heads * head_dim;
     int half = head_dim / 2;
 
-    /* Upload cos/sin table rows [0..pos] (incremental: each row once). */
     const float *cos_dev = NULL, *sin_dev = NULL;
     if (freq_factors) {
         status_code cs_st = cuda_rope_ensure_cs(self, pos, head_dim, freq_factors);
@@ -1071,18 +967,12 @@ static status_code cuda_op_rmsnorm_rope(backend *self, const buffer *x, const bu
     return OK;
 }
 
-/* Fused multi-column matmul.  When every column uses the same native quant
- * type we quantize x once and run all columns in a single kernel. */
 static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
                                      const buffer *x, buffer **y, const int *n_list, int k,
                                      int n_matmuls) {
     if (n_matmuls <= 0 || n_matmuls > 8)
         return ERR_UNSUPPORTED;
 
-    /* The engine tags each weight with the model's declared type, but this
-     * backend may have relaid it at upload time (Q4_0 -> Q8_0, then
-     * quad-major). Substitute the stored type so the right kernel is chosen;
-     * w_types is const on the ABI, so shadow it locally. */
     uint32_t eff_types[8];
     for (int c = 0; c < n_matmuls; c++) {
         uint32_t stored = cuda_weight_type_of(cuda_dev_ptr(w[c]));
@@ -1090,8 +980,6 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     }
     w_types = eff_types;
 
-    /* Non-native or mixed types (e.g. Q4_K/Q6_K, or mixed columns):
-     * degrade to per-column singles, which have host fallback + refresh. */
     uint32_t first = w_types[0];
     if (!cuda_matmul_type_native(self, first)) {
         for (int c = 0; c < n_matmuls; c++) {
@@ -1112,8 +1000,6 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
-    /* NO H2D for x: device buffer is source of truth. */
-
     const void *w_dev[8];
     float *y_dev[8];
     int n_list_copy[8];
@@ -1129,8 +1015,7 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     else if (first == GGML_TYPE_Q4_0 )
         cuda_matmul_multi_q4_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, stream);
     else {
-        /* Uniform but unfused type (Q4_K/Q4_1/F32/F16/BF16): degrade to
-         * per-column singles, mirroring the mixed-type path above. */
+
         for (int c = 0; c < n_matmuls; c++) {
             status_code st = cuda_matmul(self, w[c], w_types[c], x, y[c], n_list[c], k);
             if (st != OK) return st;
@@ -1148,17 +1033,12 @@ static status_code cuda_matmul_multi(backend *self, const buffer **w, const uint
     return OK;
 }
 
-/* Batched multi-column matmul: one x-quantize + one GEMM for all columns
- * (Q4_0/Q8_0). Other types degrade to per-column matmul_batch calls. */
 static status_code cuda_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
                                            const buffer *x, buffer **y, const int *n_list, int k,
                                            int n_matmuls, int m) {
     if (n_matmuls <= 0 || n_matmuls > 8 || m <= 0)
         return ERR_UNSUPPORTED;
 
-    /* Substitute the type each weight was actually stored as (see
-     * cuda_matmul_multi): the engine only knows the model's declared type, so
-     * a relaid weight would otherwise be read with the wrong kernel. */
     uint32_t eff_types[8];
     for (int c = 0; c < n_matmuls; c++) {
         uint32_t stored = cuda_weight_type_of(cuda_dev_ptr(w[c]));
@@ -1169,7 +1049,7 @@ static status_code cuda_matmul_multi_batch(backend *self, const buffer **w, cons
     uint32_t first = w_types[0];
     for (int c = 0; c < n_matmuls; c++)
         if (w_types[c] != first)
-            first = UINT32_MAX; /* force degrade below */
+            first = UINT32_MAX;
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
     const void *w_dev[8];
@@ -1205,11 +1085,6 @@ static status_code cuda_matmul_multi_batch(backend *self, const buffer **w, cons
     return OK;
 }
 
-/* Batched multi-column matmul with fused residual (y = GEMM + resid).
- * resid applies to column 0 only in practice (nm==1 residual ops); other
- * types degrade to matmul_batch + add. y may alias resid (llama-style
- * in-place residual): the fused kernel reads before writing per element;
- * the degrade path stashes resid aside first. */
 static status_code cuda_matmul_multi_batch_resid(backend *self, const buffer **w,
                                                  const uint32_t *w_types, const buffer *x,
                                                  buffer **y, const int *n_list, int k,
@@ -1221,7 +1096,7 @@ static status_code cuda_matmul_multi_batch_resid(backend *self, const buffer **w
     uint32_t first = w_types[0];
     for (int c = 0; c < n_matmuls; c++)
         if (w_types[c] != first)
-            first = UINT32_MAX; /* force degrade below */
+            first = UINT32_MAX;
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
     const void *w_dev[8];
@@ -1241,7 +1116,7 @@ static status_code cuda_matmul_multi_batch_resid(backend *self, const buffer **w
         cuda_matmul_multi_batch_q8_0(w_dev, y_dev, n_list_copy, x_dev, n_matmuls, k, m, resid_dev,
                                      stream);
     else {
-        /* Degrade: stash resid aside (it may alias y), then per-column. */
+
         const float *rd = NULL;
         if (resid) {
             size_t need = (size_t)m * (size_t)n_list[0] * sizeof(float);
@@ -1288,20 +1163,13 @@ static status_code cuda_matmul_multi_batch_resid(backend *self, const buffer **w
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + Multi-MatMul: y[c] = W[c] * rmsnorm(x). Single     */
-/* kernel does RMSNorm, quantize, and multi-column matmul. Falls back */
-/* to separate rmsnorm + matmuls for non-native or mixed types.       */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w, float eps,
                                              const buffer **w, const uint32_t *w_types,
                                              const buffer *x, buffer **y, const int *n_list,
                                              int k, int n_matmuls) {
     if (n_matmuls <= 0 || n_matmuls > 8)
         return ERR_UNSUPPORTED;
-    /* Non-native or mixed types: degrade to separate rmsnorm + per-column
-     * singles, which have host fallback + refresh. */
+
     uint32_t first = w_types[0];
     if (first != GGML_TYPE_Q8_0 && first != GGML_TYPE_Q4_0 && first != GGML_TYPE_Q4_1)
         return ERR_UNSUPPORTED;
@@ -1312,17 +1180,10 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
     struct cuda_priv *priv = cuda_priv(self);
     cudaStream_t stream = priv ? priv->stream : 0;
 
-    /* NO H2D for x/norm_w: device buffers are source of truth. */
-
-    /* Large grids: the fused kernel redundantly norms+quantizes x in
-     * EVERY block (grid x k traffic), dwarfing launch savings. Split
-     * into native rmsnorm + multi above the threshold (bit-exact:
-     * same norm, same quant, same GEMM). KAPPAI_RMM_FUSED_MAX sets it. */
     int total_rows = 0;
     for (int c = 0; c < n_matmuls; c++)
         total_rows += n_list[c];
-    /* Above this many output rows the fused rmsnorm+multi GEMM stops paying
-     * for its scratch traffic and the per-column path wins. */
+
     const int fused_max = 512;
     if (total_rows > fused_max) {
         size_t need = (size_t)k * sizeof(float);
@@ -1383,14 +1244,6 @@ static status_code cuda_rmsnorm_matmul_multi(backend *self, const buffer *norm_w
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* Native Attention (F16 + Q8_0 KV Cache)                              */
-/* ------------------------------------------------------------------ */
-
-/* GQA-grouped decode attention selection. Returns queries-per-block
- * (1 = per-head kernel). KAPPAI_ATTN_GQA_Q sets Qq (default 2: measured
- * neutral-or-better vs per-head at all ctx lengths, up to 2.6x at 512+);
- * KAPPAI_ATTN_GQA_MINPOS gates by context length if ever needed. */
 static int cuda_attn_gqa_q(int n_heads, int n_kv_heads, int n_pos) {
     int q = 2;
     if (q < 2) return 1;
@@ -1406,12 +1259,7 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
                                       int n_heads, int n_kv_heads, int head_dim, int n_ctx,
                                       int flash_attn, float scale, int n_kv_heads_active) {
     (void)flash_attn;
-    /* The cache may be allocated for more KV heads than a given layer
-     * actually uses (packed per-layer caches size every layer by the widest
-     * one). n_kv_heads_active says how many heads in THIS layer are live, and
-     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
-     * the kernels index kv heads the layer never wrote. Matches the CPU
-     * backends, which derive n_groups from n_active. */
+
     if (n_kv_heads_active > 0)
         n_kv_heads = n_kv_heads_active;
     struct cuda_priv *priv = cuda_priv(self);
@@ -1425,7 +1273,7 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
         int nb = (int)cuda_kv_q8_nblocks(head_dim);
         size_t lay = cuda_kv_layer_base_bytes(priv, layer);
         size_t stride = (size_t)n_ctx * (size_t)nb * KV_Q8_0_BLOCK_BYTES;
-        
+
             cuda_attn_q8((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
                          (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
                          n_heads, n_kv_heads, head_dim, lay, stride, 0, n_pos, scale, nb, stream);
@@ -1438,9 +1286,6 @@ static status_code cuda_op_attention(backend *self, const buffer *q, const buffe
 
     size_t lay = cuda_kv_layer_base(priv, layer) * sizeof(uint16_t);
     size_t stride = (size_t)n_ctx * (size_t)head_dim;
-
-    /* NO H2D for q: device buffer is source of truth.
-     * Previous ops (rope, rmsnorm) write directly to device. */
 
         cuda_attn_f16((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
                       (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
@@ -1459,15 +1304,10 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
                                           int flash_attn, float scale, int sliding_window,
                                           int n_kv_heads_active) {
     (void)flash_attn;
-    /* The cache may be allocated for more KV heads than a given layer
-     * actually uses (packed per-layer caches size every layer by the widest
-     * one). n_kv_heads_active says how many heads in THIS layer are live, and
-     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
-     * the kernels index kv heads the layer never wrote. Matches the CPU
-     * backends, which derive n_groups from n_active. */
+
     if (n_kv_heads_active > 0)
         n_kv_heads = n_kv_heads_active;
-    // For SWA, we use the same kernel but with adjusted n_pos
+
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
 
@@ -1485,9 +1325,9 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
         size_t row_bytes = (size_t)nb * KV_Q8_0_BLOCK_BYTES;
         size_t lay = cuda_kv_layer_base_bytes(priv, layer);
         size_t stride = (size_t)n_ctx * row_bytes;
-        /* Kernel reads [attn_start, attn_start+n_pos) by offsetting the layer base. */
+
         size_t lay_off = lay + (size_t)attn_start * row_bytes;
-        
+
             cuda_attn_q8((const float *)cuda_dev_ptr(q), (const uint8_t *)cuda_dev_ptr(k_cache),
                          (const uint8_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
                          n_heads, n_kv_heads, head_dim, lay_off, stride, 0, n_pos_total, scale,
@@ -1502,10 +1342,7 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
     size_t lay = cuda_kv_layer_base(priv, layer) * sizeof(uint16_t);
     size_t stride = (size_t)n_ctx * (size_t)head_dim;
 
-    /* Kernel reads [attn_start, attn_start+n_pos) by offsetting the layer base. */
     size_t lay_off = lay + (size_t)attn_start * (size_t)head_dim * sizeof(uint16_t);
-
-    /* NO H2D for q: device buffer is source of truth. */
 
     cuda_attn_f16((const float *)cuda_dev_ptr(q), (const uint16_t *)cuda_dev_ptr(k_cache),
                   (const uint16_t *)cuda_dev_ptr(v_cache), (float *)cuda_dev_ptr(out),
@@ -1519,10 +1356,6 @@ static status_code cuda_op_attention_swa(backend *self, const buffer *q, const b
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* KV Cache Allocation (F16 + Q8_0)                                    */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!desc || !k_out || !v_out) return ERR_INVALID_ARG;
@@ -1534,11 +1367,11 @@ static status_code cuda_kv_alloc(backend *self, const kv_desc *desc, buffer *k_o
     int n_heads = desc->n_kv_heads;
     int n_ctx = desc->n_ctx;
     int has_var = desc->layer_head_dim && desc->n_kv_layers > 0;
-    
+
     free(priv->kv_layer_off);
     priv->kv_layer_off = NULL;
     size_t total = 0;
-    
+
     if (has_var) {
         priv->kv_layer_off = (size_t *)calloc((size_t)n_kv_layers + 1, sizeof(size_t));
         if (!priv->kv_layer_off) return ERR_OUT_OF_MEMORY;
@@ -1561,19 +1394,18 @@ static status_code cuda_kv_alloc(backend *self, const kv_desc *desc, buffer *k_o
             total = (size_t)n_heads * (size_t)n_ctx * (size_t)desc->head_dim *
                     (size_t)n_kv_layers;
     }
-    /* NOTE: kv_layer_off units are half-elements for F16 (callers multiply
-     * by sizeof(uint16_t)) and raw bytes for Q8_0 (used directly). */
+
     if (!is_q8)
         total *= sizeof(uint16_t);
     priv->kv_quant_q8 = is_q8 ? 1 : 0;
     priv->kv_n_layers = n_kv_layers;
     priv->kv_n_kv_heads = n_heads;
     priv->kv_n_ctx = n_ctx;
-    
+
     void *kd, *vd;
     if (cudaMalloc(&kd, total) != cudaSuccess) return ERR_OUT_OF_MEMORY;
     if (cudaMalloc(&vd, total) != cudaSuccess) { cudaFree(kd); return ERR_OUT_OF_MEMORY; }
-    
+
     k_out->handle = kd;
     k_out->size = total;
     k_out->host_ptr = NULL;
@@ -1594,10 +1426,6 @@ static void cuda_kv_free(backend *self, buffer *k, buffer *v) {
     if (k && k->handle) { cudaFree(k->handle); k->handle = NULL; }
     if (v && v->handle) { cudaFree(v->handle); v->handle = NULL; }
 }
-
-/* ------------------------------------------------------------------ */
-/* Native KV Put (F16 + Q8_0)                                          */
-/* ------------------------------------------------------------------ */
 
 static status_code cuda_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos,
                                 const buffer *k_in, const buffer *v_in, int n_kv_heads,
@@ -1651,16 +1479,9 @@ static status_code cuda_kv_put_batch(backend *self, buffer *k, buffer *v, int la
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* add_inplace (GPU native)                                          */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_op_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
-
-    /* NO H2D for y: device buffer is source of truth.
-     * H2D would overwrite correct device data with stale host data. */
 
     cuda_add_inplace((float *)cuda_dev_ptr(x), (const float *)cuda_dev_ptr(y), n, priv->stream);
 
@@ -1693,8 +1514,6 @@ static status_code cuda_op_scale_inplace(backend *self, buffer *x, float scale, 
     }
     return OK;
 }
-
-/* --- engine-dispatched ops that must be native on a device backend --- */
 
 static status_code cuda_op_softcap(backend *self, buffer *x, float cap, int n) {
 	struct cuda_priv *priv = cuda_priv(self);
@@ -1747,24 +1566,12 @@ static status_code cuda_op_moe_activate(backend *self, const buffer *gate, const
 	return OK;
 }
 
-/* MoE Experts Batch: grouped expert execution with fused activation.
- * This is a complex operation that performs:
- * 1. For each expert with assigned tokens:
- *    a. Gather input rows for this expert
- *    b. Gate projection: x * gate_w^T
- *    c. Up projection (if not fused): x * up_w^T
- *    d. Activation: act = SiLU/GELU(gate * gate_scale) * (up * up_scale)
- *    e. Down projection: act * down_w^T
- *    f. Scale by expert weight and accumulate to output
- * This is a complex multi-kernel operation. We implement a basic version
- * that handles the common case (non-fused gate/up, SiLU activation). */
 static status_code cuda_op_moe_experts_batch(backend *self, const buffer *xb, buffer *out,
                                              int n_rows, int dim, int inter, int use_gelu,
                                              int n_experts, const moe_resident_expert *experts,
                                              const int *counts, const int *rows_packed,
                                              const float *weights_packed) {
-    /* For now, fall back to host implementation */
-    /* TODO: Implement full CUDA MoE experts batch with native kernels */
+
     (void)xb; (void)out; (void)n_rows; (void)dim; (void)inter; (void)use_gelu;
     (void)n_experts; (void)experts; (void)counts; (void)rows_packed; (void)weights_packed;
     return ERR_UNSUPPORTED;
@@ -1779,10 +1586,7 @@ static status_code cuda_op_partial_rope_qk(backend *self, buffer *q, buffer *k, 
 		return ERR_INTERNAL;
 	if (n_rows <= 0 || rope_dim <= 0 || n_heads <= 0 || n_kv_heads <= 0)
 		return OK;
-	/* Build the tables at rope_dim granularity: the op strides them by
-	 * rope_dim/2 per position, which differs from the head_dim/2 stride the
-	 * full-rope path uses. The table cache is keyed on that width, so the two
-	 * geometries coexist. */
+
 	const float *cos_base = NULL, *sin_base = NULL;
 	status_code st = cuda_rope_pre_ensure(self, pos_start + n_rows, rope_dim, rope_cos_base,
 										  rope_sin_base, &cos_base, &sin_base);
@@ -1808,8 +1612,6 @@ static status_code cuda_op_partial_rope_qk(backend *self, buffer *q, buffer *k, 
 	return OK;
 }
 
-/* PLE helpers (GPU native): combine + strided per-slice norm batch. */
-
 static status_code cuda_op_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
                                        float scale) {
     struct cuda_priv *priv = cuda_priv(self);
@@ -1830,16 +1632,10 @@ static status_code cuda_op_ple_norm_batch(backend *self, buffer *proj, const buf
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* ffn_activate (GPU native)                                         */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_op_ffn_activate(backend *self, const buffer *gate, const buffer *up,
                                          buffer *out, int n) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
-
-    /* NO H2D: device buffers are source of truth. */
 
     cuda_ffn_activate((const float *)cuda_dev_ptr(gate), (const float *)cuda_dev_ptr(up),
                       (float *)cuda_dev_ptr(out), n, 0, priv->stream);
@@ -1855,8 +1651,6 @@ static status_code cuda_op_ffn_activate_ex(backend *self, const buffer *gate, co
                                             buffer *out, int n, int activation) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
-
-    /* NO H2D: device buffers are source of truth. */
 
     cuda_ffn_activate((const float *)cuda_dev_ptr(gate), (const float *)cuda_dev_ptr(up),
                       (float *)cuda_dev_ptr(out), n, activation, priv->stream);
@@ -1883,10 +1677,6 @@ static status_code cuda_op_ffn_activate_batch(backend *self, const buffer *gate,
     return OK;
 }
 
-/* Fused batched FFN activation over a pre-interleaved gate/up buffer.
- * Without this the engine stages the activation through host memory on every
- * batched FFN (HFB_BATCH_DESIGN), which costs two full-tensor D2H/H2D copies
- * per layer during prompt processing. */
 static status_code cuda_op_ffn_activate_fused_batch(backend *self, const buffer *fused,
                                                     buffer *out, int n, int activation, int m) {
     struct cuda_priv *priv = cuda_priv(self);
@@ -1902,17 +1692,6 @@ static status_code cuda_op_ffn_activate_fused_batch(backend *self, const buffer 
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* rope_ext (GPU native)                                              */
-/* ------------------------------------------------------------------ */
-
-/* Unified immutable-prefix upload for precomputed (model) rope tables.
- * Selects the device slot matching head_dim, allocates on first use, and
- * uploads only rows (up_pos, pos_end] — tables never change, so each row
- * crosses the bus once ever. Returns the slot base pointers; kernels index
- * rows [0, pos_end) with stride head_dim/2 as before. Callers in both the
- * single-token and batch paths share this (previously each call re-sent
- * the full [0..pos] prefix: ~500MB per 512-token prefill on WSL2). */
 static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim,
                                         const float *rope_cos_base,
                                         const float *rope_sin_base,
@@ -1922,7 +1701,7 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
         return ERR_INTERNAL;
     int half = head_dim / 2;
     if (half <= 0 || pos_end <= 0) {
-        /* Degenerate: still return a valid base for the kernel launch. */
+
         *cos_dev = priv->rope_tbl[0].cos_dev;
         *sin_dev = priv->rope_tbl[0].sin_dev;
         return OK;
@@ -1943,14 +1722,12 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
         }
     }
     if (slot < 0) {
-        /* More geometries than slots (unseen: gemma4 has two). Evict slot 0
-         * and refill; correct, just re-uploads. */
+
         slot = 0;
         priv->rope_tbl[slot].half = -1;
         priv->rope_tbl[slot].up_pos = -1;
     }
-    /* Grow past the initial 1024-row cap when long-context prefill
-     * chunks need more (same bug class as the CS-table overflow). */
+
     size_t needed_rows = (size_t)pos_end > 0 ? (size_t)pos_end : 0;
     size_t unit = (size_t)1024 * (size_t)half;
     size_t want_cap = unit;
@@ -1959,9 +1736,7 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
     if (priv->rope_tbl[slot].half != half || priv->rope_tbl[slot].cap < want_cap ||
         priv->rope_tbl[slot].cos_src != rope_cos_base ||
         priv->rope_tbl[slot].sin_src != rope_sin_base) {
-        /* New geometry or new source (unit tests pass fresh random tables
-         * per call): refill from scratch. Production passes the same model
-         * tables every call, so this fires once per geometry. */
+
         if (priv->rope_tbl[slot].cos_dev)
             cudaFree(priv->rope_tbl[slot].cos_dev);
         if (priv->rope_tbl[slot].sin_dev)
@@ -2004,10 +1779,6 @@ static status_code cuda_rope_pre_ensure(backend *self, int pos_end, int head_dim
     return OK;
 }
 
-/* Freq-factor rope tables for [0..pos] with immutable-prefix caching.
- * Tables are a deterministic function of (theta, freq_factors, pos); once a
- * row is uploaded it never changes, so async uploads never race reuse.
- * Beyond the device cap, falls back to a synchronous full upload. */
 static status_code cuda_rope_ensure_cs(backend *self, int pos, int head_dim,
                                        const float *freq_factors) {
     struct cuda_priv *priv = cuda_priv(self);
@@ -2026,10 +1797,7 @@ static status_code cuda_rope_ensure_cs(backend *self, int pos, int head_dim,
         priv->rope_cs_dev_cap = table_cap;
     }
     if (needed > table_cap) {
-        /* Beyond the initial 1024-row cap (long-context prefill chunks):
-         * grow device tables to fit instead of overflowing them (the old
-         * fallback memcpied `needed` bytes into a `table_cap` buffer:
-         * heap overflow + spurious OOM). Rare; full recompute below. */
+
         size_t unit = (size_t)1024 * (size_t)half;
         size_t new_cap = ((needed + unit - 1) / unit) * unit;
         if (priv->rope_cs_cos_dev) cudaFree(priv->rope_cs_cos_dev);
@@ -2045,13 +1813,12 @@ static status_code cuda_rope_ensure_cs(backend *self, int pos, int head_dim,
         }
         priv->rope_cs_dev_cap = new_cap;
         table_cap = new_cap;
-        priv->rope_cs_pos = -1; /* recompute all rows into fresh staging */
+        priv->rope_cs_pos = -1;
     }
     if (!priv->rope_cs_host || priv->rope_cs_hd != head_dim ||
         priv->rope_cs_theta != theta || priv->rope_cs_ff != freq_factors ||
         priv->rope_cs_cap < table_cap * 2) {
-        /* (Re)allocate staging; quiesce first since old buffer may still
-         * source in-flight copies. Resets happen ~never (fixed per model). */
+
         cudaStreamSynchronize(priv->stream);
         free(priv->rope_cs_host);
         priv->rope_cs_host = (float *)malloc(table_cap * 2 * sizeof(float));
@@ -2063,8 +1830,8 @@ static status_code cuda_rope_ensure_cs(backend *self, int pos, int head_dim,
         priv->rope_cs_pos = -1;
     }
     if (pos <= priv->rope_cs_pos)
-        return OK; /* already on device */
-    /* Compute only new rows; old rows are immutable on both sides. */
+        return OK;
+
     float *cos_tbl = priv->rope_cs_host;
     float *sin_tbl = priv->rope_cs_host + table_cap;
     double theta_scale = pow((double)theta, -2.0 / (double)head_dim);
@@ -2105,7 +1872,6 @@ static status_code cuda_op_rope_ext(backend *self, buffer *vec, int n_heads, int
     int n = n_heads * head_dim;
     int half = head_dim / 2;
 
-    /* Cached device tables, uploaded incrementally (each row once). */
     const float *cos_base = NULL, *sin_base = NULL;
     if (freq_factors) {
         status_code cs_st = cuda_rope_ensure_cs(self, pos, head_dim, freq_factors);
@@ -2118,7 +1884,6 @@ static status_code cuda_op_rope_ext(backend *self, buffer *vec, int n_heads, int
         if (st != OK) return st;
     }
 
-    /* Graph mode: params-reading variant (pos from device struct). */
     cuda_rope_ext((float *)cuda_dev_ptr(vec), n_heads, head_dim, pos,
                       cos_base, sin_base, neox, priv->stream);
 
@@ -2129,17 +1894,11 @@ static status_code cuda_op_rope_ext(backend *self, buffer *vec, int n_heads, int
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* rope (GPU native, delegates to rope_ext)                          */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_op_rope(backend *self, buffer *vec, int n_heads, int head_dim,
                                  int pos, const float *rope_cos_base, const float *rope_sin_base) {
     return cuda_op_rope_ext(self, vec, n_heads, head_dim, pos, rope_cos_base, rope_sin_base, NULL);
 }
 
-/* Ensure device rope tables cover [0, pos_end); upload host tables.
- * Thin wrapper over the incremental slot cache (each row uploads once). */
 static status_code cuda_rope_tables_ensure(backend *self, int pos_end, int head_dim,
                                            const float *rope_cos_base,
                                            const float *rope_sin_base,
@@ -2158,13 +1917,10 @@ static status_code cuda_op_rope_qk(backend *self, buffer *q, buffer *k, int n_he
     int q_n = n_heads * head_dim;
     int k_n = n_kv_heads * head_dim;
 
-    /* Cached device tables, uploaded incrementally (each row once). */
     const float *cos_base = NULL, *sin_base = NULL;
     status_code tbl_st = cuda_rope_pre_ensure(self, pos + 1, head_dim, rope_cos_base,
                                               rope_sin_base, &cos_base, &sin_base);
     if (tbl_st != OK) return tbl_st;
-
-    /* NO H2D: device buffers are source of truth. */
 
     {
         cuda_rope_ext((float *)cuda_dev_ptr(q), n_heads, head_dim, pos,
@@ -2184,8 +1940,6 @@ static status_code cuda_op_rope_qk(backend *self, buffer *q, buffer *k, int n_he
     return OK;
 }
 
-/* Fused Q/K per-head RMSNorm + V RMSNorm-noweight + RoPE on Q/K.
- * Decode M=1, in-place. Bit-exact vs the 5-kernel sequence. */
 static status_code cuda_op_qkv_norm_rope(backend *self, buffer *q, buffer *k, buffer *v,
                                          const buffer *wq_norm, const buffer *wk_norm,
                                          int n_heads, int n_kv_heads, int head_dim, float eps,
@@ -2196,8 +1950,6 @@ static status_code cuda_op_qkv_norm_rope(backend *self, buffer *q, buffer *k, bu
     if (!priv) return ERR_INTERNAL;
     int half = head_dim / 2;
 
-    /* Cached device tables, uploaded incrementally (each row once).
-     * Mirrors cuda_op_rope_ext exactly. */
     const float *cos_base = NULL, *sin_base = NULL;
     if (freq_factors) {
         status_code cs_st = cuda_rope_ensure_cs(self, pos, head_dim, freq_factors);
@@ -2210,8 +1962,6 @@ static status_code cuda_op_qkv_norm_rope(backend *self, buffer *q, buffer *k, bu
         if (st != OK) return st;
     }
 
-    /* NO H2D: device buffers are source of truth. */
-
     {
         const float *cos_tbl = cos_base + (size_t)pos * half;
         const float *sin_tbl = sin_base + (size_t)pos * half;
@@ -2223,8 +1973,6 @@ static status_code cuda_op_qkv_norm_rope(backend *self, buffer *q, buffer *k, bu
                            neox, priv->stream);
     }
 
-    /* Mirror updates mirror the decomposed sequence: norms ("norm" tag)
-     * then rope ("rope" tag) for Q/K; norm only for V. */
     int q_n = n_heads * head_dim, k_n = n_kv_heads * head_dim;
     if (!cuda_lazy_d2h_for("norm") && q->host_ptr)
         cudaMemcpy(q->host_ptr, cuda_dev_ptr(q), (size_t)q_n * sizeof(float),
@@ -2326,17 +2074,11 @@ static status_code cuda_op_rope_qk_batch(backend *self, buffer *q, buffer *k, in
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* embd_lookup (GPU native)                                           */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
                                         int token, int dim, buffer *x_out) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
 
-    /* A promoted Q4_0 embedding is stored as Q8_0; read the recorded type,
-     * not the engine's tag. */
     uint32_t stored = cuda_weight_type_of(tok_embd ? cuda_dev_ptr((buffer *)tok_embd) : NULL);
     if (stored != (uint32_t)-1)
         tok_embd_type = stored;
@@ -2367,12 +2109,7 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
                                  (float *)cuda_dev_ptr(x_out), token, dim, priv->stream);
             break;
         default: {
-            /* Rare quant types (Q5_K/Q6_K/IQ*, ...): the host reference
-             * dequantizes from host memory, but CUDA-owned weights have no
-             * host mirror - passing the device pointer made the host dequant
-             * read device memory (illegal access; this is what silently broke
-             * Q4_K_M's Q6_K token embedding). Stage the one row (and the
-             * output) through host memory. Runs once per token. */
+
             backend *host = backend_host();
             if (!host || !host->embd_lookup)
                 return ERR_UNSUPPORTED;
@@ -2419,28 +2156,15 @@ static status_code cuda_op_embd_lookup(backend *self, const buffer *tok_embd, ui
     return OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* argmax (GPU native)                                                */
-/* ------------------------------------------------------------------ */
-
 static status_code cuda_op_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv || !priv->argmax_idx_dev) return ERR_INTERNAL;
 
-    /* Device buffer is source of truth - no H2D copy needed.
-     * cuda_matmul keeps host_ptr in sync via D2H after compute. */
     cuda_argmax((const float *)cuda_dev_ptr(logits), n, priv->argmax_idx_dev, priv->stream);
 
-    /* Sync result back to host */
     cudaMemcpy(out_idx, priv->argmax_idx_dev, sizeof(int32_t), cudaMemcpyDeviceToHost);
     return OK;
 }
-
-/* ------------------------------------------------------------------ */
-/* Batch ops (prefill fast path): row-loop over single-token natives. */
-/* Buffers are m×n row-major; each row is processed by the proven      */
-/* single-token op. Correctness first; true batched kernels later.     */
-/* ------------------------------------------------------------------ */
 
 static status_code cuda_op_rmsnorm_batch(backend *self, const buffer *x, const buffer *w,
                                            buffer *y, int n, float eps, int m) {
@@ -2449,10 +2173,7 @@ static status_code cuda_op_rmsnorm_batch(backend *self, const buffer *x, const b
     cuda_rmsnorm_batch((const float *)cuda_dev_ptr((buffer *)x),
                        w ? (const float *)cuda_dev_ptr((buffer *)w) : NULL,
                        (float *)cuda_dev_ptr(y), n, eps, m, priv->stream);
-    /* Prefill mirrors are write-only staging: no host consumer reads batch
-     * outputs mid-prefill (device is source of truth; logits read back at
-     * the end via a sync point). Skipping the D2H avoids per-call pageable
-     * staging stalls on WSL2. */
+
     if (!cuda_lazy_d2h_for("norm") && y->host_ptr) {
         if (cudaMemcpyAsync((void *)y->host_ptr, cuda_dev_ptr(y), (size_t)m * (size_t)n * sizeof(float),
                             cudaMemcpyDeviceToHost, priv->stream) != cudaSuccess)
@@ -2463,14 +2184,12 @@ static status_code cuda_op_rmsnorm_batch(backend *self, const buffer *x, const b
 
 static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t w_type,
                                           const buffer *x, buffer *y, int n, int k, int m) {
-    /* Prefer the type this backend actually stored (see the weight-type side
-     * table): a relaid weight must not be read with the engine's kernel. */
+
     uint32_t stored = cuda_weight_type_of(w ? cuda_dev_ptr(w) : NULL);
     if (stored != (uint32_t)-1)
         w_type = stored;
     if (!cuda_matmul_type_native(self, w_type)) {
-        /* Exotic quant: host fallback (staged device->host, since CUDA-owned
-         * buffers have no valid host mirror). */
+
         backend *host = backend_host();
         if (!host || !host->matmul_batch) return ERR_UNSUPPORTED;
         size_t wb = w->size, xb = (size_t)m * (size_t)k * sizeof(float),
@@ -2536,8 +2255,7 @@ static status_code cuda_op_matmul_batch(backend *self, const buffer *w, uint32_t
             cuda_matmul_batch_bf16((const uint16_t *)w_dev, x_dev, y_dev, n, k, m, priv->stream);
             break;
         default: {
-            /* Non-native (Q5_K/Q6_K/...): host fallback, staged through host
-             * memory (CUDA-owned buffers are not host-readable). */
+
             backend *host = backend_host();
             if (!host || !host->matmul_batch)
                 return ERR_UNSUPPORTED;
@@ -2575,12 +2293,7 @@ static status_code cuda_attention_batch(backend *self, const buffer *q, const bu
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
     (void)flash_attn;
-    /* The cache may be allocated for more KV heads than a given layer
-     * actually uses (packed per-layer caches size every layer by the widest
-     * one). n_kv_heads_active says how many heads in THIS layer are live, and
-     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
-     * the kernels index kv heads the layer never wrote. Matches the CPU
-     * backends, which derive n_groups from n_active. */
+
     if (n_kv_heads_active > 0)
         n_kv_heads = n_kv_heads_active;
     int row_elems = n_heads * head_dim;
@@ -2627,12 +2340,7 @@ static status_code cuda_attention_swa_batch(backend *self, const buffer *q, cons
     struct cuda_priv *priv = cuda_priv(self);
     if (!priv) return ERR_INTERNAL;
     (void)flash_attn;
-    /* The cache may be allocated for more KV heads than a given layer
-     * actually uses (packed per-layer caches size every layer by the widest
-     * one). n_kv_heads_active says how many heads in THIS layer are live, and
-     * it -- not n_kv_heads -- determines the GQA grouping. Ignoring it makes
-     * the kernels index kv heads the layer never wrote. Matches the CPU
-     * backends, which derive n_groups from n_active. */
+
     if (n_kv_heads_active > 0)
         n_kv_heads = n_kv_heads_active;
     int row_elems = n_heads * head_dim;
@@ -2670,10 +2378,6 @@ static status_code cuda_attention_swa_batch(backend *self, const buffer *q, cons
     }
     return OK;
 }
-
-/* ------------------------------------------------------------------ */
-/* Registration                                                        */
-/* ------------------------------------------------------------------ */
 
 static status_code cuda_ctor(backend *out) {
 

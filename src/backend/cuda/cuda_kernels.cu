@@ -11,41 +11,15 @@
 
 #include "backend/cuda/cuda_internal.h"
 using namespace nvcuda;
-/* log.h declares its entry points without extern "C". Every other user is a
- * C translation unit, so that works there; this one is C++ and the backend is
- * dlopen'd, so the C++-mangled names would be unresolvable at load time.
- * Including it inside extern "C" gives the definitions C linkage, matching the
- * engine's exports, without widening the shared header for one backend. */
+
 extern "C" {
 #include "log.h"
 }
 
-/* ------------------------------------------------------------------ */
-/* CUDA 12+ compatibility helpers                                       */
-/* __half::x is private since CUDA 12; use reinterpret_cast to write    */
-/* raw half bit-patterns (identical ABI, no performance penalty).       */
-/* ------------------------------------------------------------------ */
 static __device__ __forceinline__ void store_half(uint16_t *dst, float val) {
     reinterpret_cast<__half &>(*dst) = __float2half(val);
 }
 
-/* ------------------------------------------------------------------ */
-/* Quantization                                                        */
-/* ------------------------------------------------------------------ */
-
-/* Quantize one fp32 value to a Q8_0-style int8, matching the CPU backends and
- * the Vulkan shader byte for byte.
- *
- * Both references compute v = x * (1/d) and round half AWAY FROM ZERO (C's
- * roundf, GLSL's round_away). This kernel used a true divide plus
- * floorf(v + 0.5f), which (a) rounds differently from multiplying by the
- * reciprocal and (b) breaks ties toward +infinity, so for negative values
- * that land on a .5 boundary it produced a different int8 than the reference.
- *
- * Those q deltas are individually ~1/d of an output element, but a 512-wide
- * row hits enough of them to push matmul parity past the cross-backend band:
- * q4_1 N=512 K=512 sat at 3.4x the loose tolerance almost entirely from this.
- */
 static __device__ __forceinline__ int cuda_xq8_val(float x, float d) {
     const float inv = 1.0f / d;
     const float t   = x * inv;
@@ -85,11 +59,6 @@ __global__ void q8_0_quant_kernel(const float *x, cuda_q8_0_block *xq, int k) {
     }
 }
 
-/* QM-writing x-quant (default on; opt-out KAPPAI_XQ_QM=0): quantizes x into
- * quad-major order (scales then quad planes, 32-groups) so GEMV
- * x-side reads are consecutive u16/u32 per lane. One block of 32
- * threads per Q-block; amax via shuffle, then direct QM scatter.
- * Same values as q8_0_quant_kernel (agreement-gated). */
 __global__ void q8_0_quant_qm_kernel(const float *x, uint8_t *xq8, int k) {
     const int nb = k / 32;
     const int b = blockIdx.x;
@@ -105,7 +74,6 @@ __global__ void q8_0_quant_qm_kernel(const float *x, uint8_t *xq8, int k) {
     float d = a / 127.0f;
     int q = (a < 1e-30f) ? 0 : cuda_xq8_val(v, d);
 
-    /* QM scatter (see cuda_internal.h spec). */
     int g = b >> 5, r = b & 31;
     int Gfull = nb - g * 32, G = Gfull > 32 ? 32 : Gfull;
     uint8_t *gb = xq8 + (size_t)g * 32 * 34;
@@ -115,7 +83,7 @@ __global__ void q8_0_quant_qm_kernel(const float *x, uint8_t *xq8, int k) {
         gb[2 * r] = (uint8_t)dbits;
         gb[2 * r + 1] = (uint8_t)(dbits >> 8);
     }
-    /* Quad t holds elements [4t, 4t+4): lane j contributes byte j. */
+
     uint8_t *qb = gb + (size_t)2 * G;
     int t = lane >> 2, j = lane & 3;
     qb[((size_t)t * G + r) * 4 + j] = (uint8_t)(int8_t)q;
@@ -156,7 +124,6 @@ __global__ void q4_0_quant_kernel(const float *x, cuda_q4_0_block *xq, int k) {
     }
 }
 
-/* Q8_1 Quantization: packs scale + sum for dp4a without multiplication */
 __global__ void q8_1_quant_kernel(const float *x, cuda_q8_1_block *xq, int k) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= k / 32)
@@ -191,11 +158,10 @@ __global__ void q8_1_quant_kernel(const float *x, cuda_q8_1_block *xq, int k) {
         out->qs[j] = (int8_t)q;
         sum += q;
     }
-    /* CPU quantize_q8_1 stores the offset as fp16(d * sum), not the raw sum. */
+
     store_half(&out->s, d * (float)sum);
 }
 
-/* Q8_K Quantization: 256 elements with block sums */
 __global__ void q8_k_quant_kernel(const float *x, cuda_q8_k_block *xq, int k) {
     int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= k / 256)
@@ -241,34 +207,22 @@ __global__ void q8_k_quant_kernel(const float *x, cuda_q8_k_block *xq, int k) {
         out->bsums[j] = bsums[j];
 }
 
-/* ------------------------------------------------------------------ */
-/* matmul kernels                                                      */
-/* ------------------------------------------------------------------ */
-
 #define MM_LANES          32
 #define MM_ROWS_PER_BLOCK 8
-#define MM_TOK_TILE       8  /* token rows per pass in batched matmul */
-#define ATTN_TILE_SIZE    32  /* Default tile; see attn_tile_size() for per-head_dim fit */
-/* Tile size selector: largest power-of-two tile with total shared
- * (3*hd + 2*tile*hd)*4 <= 48KB. hd<=183 -> 32, hd<=341 -> 16, else 8. */
+#define MM_TOK_TILE       8
+#define ATTN_TILE_SIZE    32
+
 static inline int attn_tile_size(int head_dim) {
     if (head_dim <= 183) return 32;
     if (head_dim <= 341) return 16;
     return 8;
 }
-#define MMVQ_NTHREADS   (MMVQ_NWARPS * 32)  /* 128 threads */
-#define MMVQ_VDR        2   /* vec dot ratio: 2 x 32-bit ints per thread per iteration */
+#define MMVQ_NTHREADS   (MMVQ_NWARPS * 32)
+#define MMVQ_VDR        2
 
-/* Quad-major Q8_0 readers (defined with q8_block_quad below; used by the
- * v1 kernels above that point). See cuda_internal.h layout spec. */
 static __device__ __forceinline__ uint16_t qm_q8_scale(const uint8_t *wrow8, int nb, int b);
 static __device__ __forceinline__ int32_t qm_q8_quad(const uint8_t *wrow8, int nb, int b, int t);
 static __device__ __forceinline__ int qm_q8_val(const uint8_t *wrow8, int nb, int b, int j);
-/* Quad-major Q4_0 readers (defined below; used by Q4 v1 kernels above). */
-
-/* ------------------------------------------------------------------ */
-/* Q8_0 MatMul DP4A (M>=1 batched, K multiple of 32)                 */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q8_0_dp4a_kernel(const cuda_q8_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
@@ -304,11 +258,6 @@ __global__ void matmul_q8_0_dp4a_kernel(const cuda_q8_0_block *__restrict__ w,
     if (lane == 0)
         y[row] = acc;
 }
-
-/* ------------------------------------------------------------------ */
-/* Q8_0 MatMul DP4A + Residual (M>=1 batched, K multiple of 32)      */
-/* y = W*x + residual. Mirrors matmul_q8_0_dp4a_kernel.              */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q8_0_residual_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
@@ -346,10 +295,6 @@ __global__ void matmul_q8_0_residual_kernel(const cuda_q8_0_block *__restrict__ 
         y[row] = acc + residual[row];
 }
 
-/* ------------------------------------------------------------------ */
-/* Q4_0 MatMul DP4A (M>=1 batched, K multiple of 32)                 */
-/* ------------------------------------------------------------------ */
-
 __global__ void matmul_q4_0_dp4a_kernel(const cuda_q4_0_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
                                         float *__restrict__ y, int n, int k) {
@@ -386,11 +331,6 @@ __global__ void matmul_q4_0_dp4a_kernel(const cuda_q4_0_block *__restrict__ w,
         y[row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Q4_0 MatMul DP4A + Residual (M>=1 batched, K multiple of 32)      */
-/* y = W*x + residual. Mirrors matmul_q4_0_dp4a_kernel.              */
-/* ------------------------------------------------------------------ */
-
 __global__ void matmul_q4_0_residual_kernel(const cuda_q4_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             const float *__restrict__ residual,
@@ -424,27 +364,6 @@ __global__ void matmul_q4_0_residual_kernel(const cuda_q4_0_block *__restrict__ 
         y[row] = acc + residual[row];
 }
 
-/* ------------------------------------------------------------------ */
-/* Q4_1 MatMul (M>=1 batched). Dequant: v = q * d + m, same nibble    */
-/* layout as Q4_0 (low nibbles -> 0..15, high nibbles -> 16..31).     */
-/* dot = wb.d * xb.d * sum(q*xq) + wb.m * xb.d * sum(xq)              */
-/* ------------------------------------------------------------------ */
-
-/* Q4_1 integer dots via __dp4a (bit-exact vs the scalar-IMAD reference:
- * integer arithmetic is exact either way; fmaf order unchanged).
- * sum_qx uses unsigned nibbles q in [0,15] (fit signed bytes as-is);
- * sum_x reuses dp4a against a +1 pattern (0x01010101). xb bytes come
- * from global memory at struct offset 2: byte-granular loads only
- * (misaligned 4B __ldg is UB and returns garbage). */
-/* Per-block x offset for the offset-carrying weight types (Q4_1, Q5_1).
- *
- * The CPU backends store this as an fp16 field holding fp16(d * sum_of_quants)
- * and the Vulkan shader reproduces that round-trip explicitly. Computing
- * d*sum in fp32 instead is *more* accurate but no longer matches the
- * reference numerics, and on dot products with cancellation the two differ by
- * more than the cross-backend tolerance band -- Q4_1 matmul N=512 K=512 came
- * out at 3.4x the loose band purely because of this. Reproduce the round-trip
- * so parity is exact. */
 static __device__ __forceinline__ float cuda_q81_s(float d, int sum) {
     return __half2float(__float2half_rn(d * (float)sum));
 }
@@ -485,10 +404,7 @@ __global__ void matmul_q4_1_dp4a_kernel(const cuda_q4_1_block *__restrict__ w,
                                         const cuda_q8_0_block *__restrict__ xq,
                                         float *__restrict__ y, int n, int k) {
     const int nb = k >> 5;
-    /* Stage xq in shared: it is re-read by every row (n x nb x 34B traffic)
-     * while streaming weights (n x nb x 18B) evict it from L2. Staging cuts
-     * xq DRAM traffic to one cooperative load per threadblock. Same values,
-     * same accumulation order -> bit-exact. */
+
     extern __shared__ char smem_gemv[];
     cuda_q8_0_block *xq_s = reinterpret_cast<cuda_q8_0_block *>(smem_gemv);
     for (int b = threadIdx.x; b < nb; b += blockDim.x)
@@ -544,11 +460,6 @@ if (threadIdx.x % MM_LANES == 0)
         y[row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Q4_1 MatMul DP4A + Residual (M>=1 batched). y = W*x + residual.    */
-/* Mirrors matmul_q4_1_dp4a_kernel.                                  */
-/* ------------------------------------------------------------------ */
-
 __global__ void matmul_q4_1_residual_kernel(const cuda_q4_1_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             const float *__restrict__ residual,
@@ -580,17 +491,6 @@ if (threadIdx.x % MM_LANES == 0)
         y[row] = acc + residual[row];
 }
 
-/* ------------------------------------------------------------------ */
-/* Tuned DP4A kernels (v2): same loop order as v1 (bit-exact fmaf     */
-/* order), but integer dot uses __dp4a + __ldg instead of 32 scalar   */
-/* IMADs. Gate via KAPPAI_DP4A_V2=0 to fall back to v1.               */
-/* ------------------------------------------------------------------ */
-
-/* Q8_0 block quad loader: quad t (bytes 4t..4t+3) via two 2B __ldg.
- * qs[] starts at struct offset 2 and blocks are 34B, so half offsets are
- * always 2B-aligned (__ldg faults on misaligned word loads, hence no 4B
- * loads). On-the-fly (no 32B local array) to avoid register spill.
- * Produces the identical dp4a input word as scalar byte loads. */
 static __device__ __forceinline__ int32_t q8_block_quad(const cuda_q8_0_block *wb, int t) {
     const uint8_t *pb = (const uint8_t *)wb;
     int j = t << 2;
@@ -599,28 +499,18 @@ static __device__ __forceinline__ int32_t q8_block_quad(const cuda_q8_0_block *w
     return (int32_t)(hw0 & 0xFF) | ((int32_t)(hw0 >> 8) << 8) |
            ((int32_t)(hw1 & 0xFF) << 16) | ((int32_t)(hw1 >> 8) << 24);
 }
-/* Wide variant: single u32 load, bit-identical word. Caller guarantees
- * 4B alignment (nb even); see qm_q8_quad_wide note. */
+
 static __device__ __forceinline__ int32_t q8_block_quad_wide(const cuda_q8_0_block *wb, int t) {
     return (int32_t)__ldg((const uint32_t *)((const uint8_t *)wb + 2 + (t << 2)));
 }
 
-/* Quad-major Q8_0 readers, used for the x-side buffer only. wrow8 = row byte base
- * (same nb*34 stride as original), nb = blocks/row, b = block index.
- * Scale: u16 at group_base + 2*r. Quad t: u32 at group_base + 2*G' +
- * (t*G'+r)*4. All loads naturally aligned; consecutive lanes reading
- * consecutive blocks hit consecutive words (coalesced). Bit-exact vs
- * the original-layout loads (same bytes -> same dp4a words). */
 static __device__ __forceinline__ uint16_t qm_q8_scale(const uint8_t *wrow8, int nb, int b) {
     int g = b >> 5, r = b & 31;
     int Gfull = nb - g * 32, G = Gfull > 32 ? 32 : Gfull;
     (void)G;
     return __ldg((const uint16_t *)(wrow8 + (size_t)g * 32 * 34 + (size_t)2 * r));
 }
-/* NOTE: rows are nb*34 bytes, i.e. only 2B-aligned for odd nb, so
- * quads MUST be read as 2x u16 (like q8_block_quad) -- a u32 __ldg
- * faults with misaligned address on odd rows and poisons the context
- * for subsequent launches. Same bytes -> same dp4a word, bit-exact. */
+
 static __device__ __forceinline__ int32_t qm_q8_quad(const uint8_t *wrow8, int nb, int b, int t) {
     int g = b >> 5, r = b & 31;
     int Gfull = nb - g * 32, G = Gfull > 32 ? 32 : Gfull;
@@ -630,16 +520,12 @@ static __device__ __forceinline__ int32_t qm_q8_quad(const uint8_t *wrow8, int n
     return (int32_t)(hw0 & 0xFF) | ((int32_t)(hw0 >> 8) << 8) |
            ((int32_t)(hw1 & 0xFF) << 16) | ((int32_t)(hw1 >> 8) << 24);
 }
-/* Scalar element accessor for non-dp4a loops. */
+
 static __device__ __forceinline__ int qm_q8_val(const uint8_t *wrow8, int nb, int b, int j) {
     int32_t q = qm_q8_quad(wrow8, nb, b, j >> 2);
     return (int)(int8_t)(q >> ((j & 3) << 3));
 }
-/* Wide quad load: a single u32 LE load equals the u16-pair-assembled
- * dp4a word bit-for-bit (same bytes). SAFE ONLY when the row is
- * 4B-aligned, i.e. nb even (nb*34 % 4 == 0); all production shapes
- * qualify, odd-nb tails keep the u16 path. Callers branch on
- * (nb & 1) once per launch (uniform). */
+
 static __device__ __forceinline__ int32_t qm_q8_quad_wide(const uint8_t *wrow8, int nb, int b,
                                                           int t) {
     int g = b >> 5, r = b & 31;
@@ -653,11 +539,7 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
                                         float *__restrict__ y, int n, int k,
                                         int use_stage, int xq_qm) {
     const int nb = k >> 5;
-    /* Stage xq in shared: re-read by every row while streaming weights
-     * evict it from L2. Same values/order -> bit-exact. xb below is
-     * shared: plain loads only (__ldg is global-only). use_stage=0
-     * skips staging (huge-n case: xq stays L2-resident; saves the
-     * per-block redundant copy); xq then read via __ldg quads. */
+
     extern __shared__ char smem_gemv[];
     cuda_q8_0_block *xq_s = reinterpret_cast<cuda_q8_0_block *>(smem_gemv);
     if (use_stage) {
@@ -674,8 +556,7 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
 
     float acc = 0.0f;
     {
-    /* Original-layout weights; x-side still QM when xq_qm (orthogonal).
-     * Odd nb uses the narrow (u16) QM reader (alignment-safe). */
+
     const uint8_t *xq8o = (const uint8_t *)xq;
     int xqm_o = (xq_qm && !use_stage);
     int xwide_o = (xqm_o && ((nb & 1) == 0));
@@ -684,7 +565,6 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
         const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
         uint16_t dwb = __ldg(&wb->d);
 
-        /* 2B-granular w-side loads, quads on the fly (bit-exact). */
         int32_t dp_acc = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -722,14 +602,6 @@ __global__ void matmul_q8_0_dp4a_v2_kernel(const cuda_q8_0_block *__restrict__ w
         y[row] = acc;
 }
 
-/* Specialized production-config GEMV (G1.3): QM x-side,
- * no staging, even nb. Same addresses, same dp4a order, same fmaf
- * order as the v2 even-nb/xwide path -> bit-exact. Compile-time-only
- * differences: per-b address hoisting (the helpers recompute full
- * 64-bit QM offsets per quad: ~6 addr instrs per load, 6x issue
- * overhead in SASS) and zero runtime branches in the loop (v2 keeps
- * predicated dual x-paths per iteration, blocking straight-line
- * unrolling: SASS shows 8 chained single-IDP blocks). */
 __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict__ w,
                                            const cuda_q8_0_block *__restrict__ xq,
                                            const float *__restrict__ residual,
@@ -742,7 +614,7 @@ __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
 
     float acc = 0.0f;
-    /* QM x-side (orthogonal to w-side); wide only when nb even. */
+
     const uint8_t *xq8r = (const uint8_t *)xq;
     int xr_wide = (xq_qm && ((nb & 1) == 0));
     int xr_qm = xq_qm;
@@ -751,7 +623,6 @@ __global__ void matmul_q8_0_residual_v2_kernel(const cuda_q8_0_block *__restrict
         const cuda_q8_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
 
-        /* NOTE: byte-granular __ldg (see non-residual v2 kernel). */
         int32_t dp_acc = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -782,7 +653,7 @@ __global__ void matmul_q4_0_dp4a_v2_kernel(const cuda_q4_0_block *__restrict__ w
                                         const cuda_q8_0_block *__restrict__ xq,
                                         float *__restrict__ y, int n, int k, int use_stage) {
     const int nb = k >> 5;
-    /* Stage xq in shared (see Q8_0 v2 kernel). use_stage=0 skips it. */
+
     extern __shared__ char smem_gemv[];
     cuda_q8_0_block *xq_s = reinterpret_cast<cuda_q8_0_block *>(smem_gemv);
     if (use_stage) {
@@ -803,9 +674,6 @@ __global__ void matmul_q4_0_dp4a_v2_kernel(const cuda_q4_0_block *__restrict__ w
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = use_stage ? xq_s + b : xq + b;
 
-        /* Bias-corrected raw-nibble dot (no wdeq[32] array):
-         * sum((q-8)*x) = sum(q*x) - 8*sum(x), all integer-exact.
-         * Plain byte loads (validated pattern); masked packing (S9). */
         int32_t raw = 0, xs = 0;
         #pragma unroll
         for (int t = 0; t < 4; t++) {
@@ -880,8 +748,6 @@ __global__ void matmul_q4_0_residual_v2_kernel(const cuda_q4_0_block *__restrict
             wdeq[16 + (h2 << 1) + 1] = (int8_t)((q1 >> 4) - 8);
         }
 
-        /* wdeq lives in registers/local mem (plain loads fine);
-         * xb->qs is global: masked byte packing (masking REQUIRED). */
         const int32_t *aw = reinterpret_cast<const int32_t *>(wdeq);
         int32_t dp_acc = 0;
         #pragma unroll
@@ -911,70 +777,51 @@ __global__ void matmul_q4_0_residual_v2_kernel(const cuda_q4_0_block *__restrict
         y[row] = acc + residual[row];
 }
 
-/* ------------------------------------------------------------------ */
-/* Tensor Core Batch MatMul (WMMA FP16 m16n8k16) for prefill M>=16   */
-/* Dequantizes Q8_0/Q4_0 weights to FP16 on-the-fly in shared memory. */
-/* Each warp computes a 16x8 WMMA tile.                              */
-/* ------------------------------------------------------------------ */
-
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
-#define WMMA_WARPS_PER_BLOCK 4  /* 4 warps = 128 threads */
+#define WMMA_WARPS_PER_BLOCK 4
 #define WMMA_THREADS_PER_BLOCK (WMMA_WARPS_PER_BLOCK * 32)
-#define WMMA_ROWS_PER_BLOCK (WMMA_M * 2)  /* 32 rows per block (2 M-tiles) */
-#define WMMA_COLS_PER_BLOCK (WMMA_N * 2)  /* 32 cols per block (2 N-tiles) */
-/* K-tile in elements: one Q8_0/Q4_0 block = 32 elems = 2 WMMA K-steps */
+#define WMMA_ROWS_PER_BLOCK (WMMA_M * 2)
+#define WMMA_COLS_PER_BLOCK (WMMA_N * 2)
+
 #define WMMA_K_ELEMS 32
 
-/* Q8_0 weight dequantization to FP16 in shared memory.
- * Each Q8_0 block: 32 int8 + 1 FP16 scale -> 32 FP16 values */
 __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict__ w,
                                                const cuda_q8_0_block *__restrict__ xq,
                                                float *__restrict__ y, int n, int k, int m) {
-    const int nb = k >> 5;  /* K / 32 */
+    const int nb = k >> 5;
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    
-    /* Each block handles WMMA_ROWS_PER_BLOCK rows and WMMA_COLS_PER_BLOCK cols */
+
     const int row_tile = blockIdx.y * WMMA_ROWS_PER_BLOCK;
     const int col_tile = blockIdx.x * WMMA_COLS_PER_BLOCK;
-    
+
     if (row_tile >= n || col_tile >= m) return;
-    
-    /* Warp assignment: 2x2 warp grid per block */
-    const int warp_row = warp_id / 2;  /* 0 or 1 */
-    const int warp_col = warp_id % 2;  /* 0 or 1 */
-    
+
+    const int warp_row = warp_id / 2;
+    const int warp_col = warp_id % 2;
+
     const int row_start = row_tile + warp_row * WMMA_M;
     const int col_start = col_tile + warp_col * WMMA_N;
-    
-    /* Do NOT return here: every thread of this block must reach the
-     * __syncthreads() calls below, and the threadIdx.x-strided shared-memory
-     * fill loops need all threads to cover their stride range. Out-of-range
-     * warps simply contribute no rows/cols. */
+
     const bool warp_active = (row_start < n) && (col_start < m);
-    
+
     const int rows_this_warp = warp_active ? min(WMMA_M, n - row_start) : 0;
     const int cols_this_warp = warp_active ? min(WMMA_N, m - col_start) : 0;
-    
-    /* Shared memory: w tile [32 rows x 32 K] FP16, x tile [32 K x 32 cols] FP16.
-     * One Q-block (32 elems) per K-iteration; inner loop does 2 WMMA K-steps. */
+
     extern __shared__ char smem_wmma[];
     __half *w_smem = reinterpret_cast<__half *>(smem_wmma);
     __half *x_smem = &w_smem[(size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS];
 
-    /* WMMA fragments - use explicit values for template params (m16n16k16) */
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
 
     wmma::fill_fragment(acc_frag, 0.0f);
 
-    /* K-tiling loop: one Q-block (32 elems) per iteration */
     for (int kb = 0; kb < nb; kb++) {
 
-        /* Load weight tile: 32 rows x 32 elems, row-major */
         for (int i = threadIdx.x; i < WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS; i += WMMA_THREADS_PER_BLOCK) {
             int r = i / WMMA_K_ELEMS;
             int j = i % WMMA_K_ELEMS;
@@ -992,7 +839,6 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
             }
         }
 
-        /* Load input tile: 32 K-elems x 32 cols, row-major [k][col] */
         for (int i = threadIdx.x; i < WMMA_K_ELEMS * WMMA_COLS_PER_BLOCK; i += WMMA_THREADS_PER_BLOCK) {
             int kk_elem = i / WMMA_COLS_PER_BLOCK;
             int c = i % WMMA_COLS_PER_BLOCK;
@@ -1008,27 +854,23 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
         }
         __syncthreads();
 
-        /* WMMA compute: 2 K-steps of 16 over the 32-elem tile */
         for (int kk = 0; kk < WMMA_K_ELEMS; kk += WMMA_K) {
-            /* Load A fragment (row_major 16x16) from our warp's 16-row slice */
+
             wmma::load_matrix_sync(a_frag,
                 &w_smem[(size_t)warp_row * WMMA_M * WMMA_K_ELEMS + kk], WMMA_K_ELEMS);
 
-            /* Load B fragment (row_major 16x16) from our warp's 16-col slice */
             wmma::load_matrix_sync(b_frag,
                 &x_smem[(size_t)kk * WMMA_COLS_PER_BLOCK + warp_col * WMMA_N], WMMA_COLS_PER_BLOCK);
 
-            /* MMA: D = A * B + C */
             wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
         __syncthreads();
     }
-    
-    /* Store results - use shared memory for WMMA store (cannot use local memory) */
+
     __shared__ float smem_results[WMMA_WARPS_PER_BLOCK][WMMA_M][WMMA_N];
     wmma::store_matrix_sync(&smem_results[warp_id][0][0], acc_frag, WMMA_N, wmma::mem_row_major);
     __syncthreads();
-    
+
     for (int i = 0; i < rows_this_warp; i++) {
         for (int j = 0; j < cols_this_warp; j++) {
             if (lane == 0) {
@@ -1038,34 +880,29 @@ __global__ void matmul_q8_0_wmma_batch_kernel(const cuda_q8_0_block *__restrict_
     }
 }
 
-/* Q4_0 version: dequantize Q4_0 nibbles to FP16 */
 __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict__ w,
                                                const cuda_q8_0_block *__restrict__ xq,
                                                float *__restrict__ y, int n, int k, int m) {
     const int nb = k >> 5;
     const int warp_id = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    
+
     const int row_tile = blockIdx.y * WMMA_ROWS_PER_BLOCK;
     const int col_tile = blockIdx.x * WMMA_COLS_PER_BLOCK;
-    
+
     if (row_tile >= n || col_tile >= m) return;
-    
+
     const int warp_row = warp_id / 2;
     const int warp_col = warp_id % 2;
-    
+
     const int row_start = row_tile + warp_row * WMMA_M;
     const int col_start = col_tile + warp_col * WMMA_N;
-    
-    /* Do NOT return here: every thread of this block must reach the
-     * __syncthreads() calls below, and the threadIdx.x-strided shared-memory
-     * fill loops need all threads to cover their stride range. Out-of-range
-     * warps simply contribute no rows/cols. */
+
     const bool warp_active = (row_start < n) && (col_start < m);
-    
+
     const int rows_this_warp = warp_active ? min(WMMA_M, n - row_start) : 0;
     const int cols_this_warp = warp_active ? min(WMMA_N, m - col_start) : 0;
-    
+
     extern __shared__ char smem_wmma[];
     __half *w_smem = reinterpret_cast<__half *>(smem_wmma);
     __half *x_smem = &w_smem[(size_t)WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS];
@@ -1076,10 +913,8 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
 
     wmma::fill_fragment(acc_frag, 0.0f);
 
-    /* K-tiling loop: one Q-block (32 elems) per iteration */
     for (int kb = 0; kb < nb; kb++) {
 
-        /* Load Q4_0 weight tile: dequantize nibbles to FP16, row-major [r][j] */
         for (int i = threadIdx.x; i < WMMA_ROWS_PER_BLOCK * WMMA_K_ELEMS; i += WMMA_THREADS_PER_BLOCK) {
             int r = i / WMMA_K_ELEMS;
             int j = i % WMMA_K_ELEMS;
@@ -1098,7 +933,6 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
             }
         }
 
-        /* Load input tile (same as Q8_0 since xq is Q8_0), row-major [k][c] */
         for (int i = threadIdx.x; i < WMMA_K_ELEMS * WMMA_COLS_PER_BLOCK; i += WMMA_THREADS_PER_BLOCK) {
             int kk_elem = i / WMMA_COLS_PER_BLOCK;
             int c = i % WMMA_COLS_PER_BLOCK;
@@ -1123,12 +957,11 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
         }
         __syncthreads();
     }
-    
-    /* Store results - use shared memory for WMMA store (cannot use local memory) */
+
     __shared__ float smem_results[WMMA_WARPS_PER_BLOCK][WMMA_M][WMMA_N];
     wmma::store_matrix_sync(&smem_results[warp_id][0][0], acc_frag, WMMA_N, wmma::mem_row_major);
     __syncthreads();
-    
+
     for (int i = 0; i < rows_this_warp; i++) {
         for (int j = 0; j < cols_this_warp; j++) {
             if (lane == 0) {
@@ -1138,13 +971,6 @@ __global__ void matmul_q4_0_wmma_batch_kernel(const cuda_q4_0_block *__restrict_
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Pure-FP16 WMMA batch GEMM (FP16 shadow path, prefill). No dequant
- * in the loop: A = FP16 shadow (n x k row-major), B = FP16 x (m x k
- * row-major). Same tiling/compute/store as the Q8 WMMA kernel, so
- * shapes/layouts match; arithmetic differs (exactness gated). */
-/* ------------------------------------------------------------------ */
-
 __global__ void fp16_copy_batch_kernel(const float *__restrict__ x, __half *__restrict__ xf,
                                        int k, int m) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1153,9 +979,6 @@ __global__ void fp16_copy_batch_kernel(const float *__restrict__ x, __half *__re
     xf[i] = __float2half(x[i]);
 }
 
-/* On-demand weight dequant to FP16 (prefill): one thread per element.
- * Consecutive threads read consecutive bytes (coalesced); scales
- * broadcast within a warp. QM variants use the byte-plane accessors. */
 __global__ void dequant_q8_0_to_fp16_kernel(const void *__restrict__ w_in, __half *__restrict__ out,
                                             int n, int k) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1192,16 +1015,11 @@ __global__ void dequant_q4_0_to_fp16_kernel(const void *__restrict__ w_in, __hal
     out[i] = __float2half((float)q * scale);
 }
 
-/* 64x64 variant: 8 warps (256 threads) in a 4x2 arrangement, each
- * warp 2x2 MMA tiles. 4x fewer blocks, 4 MMAs per K-iter (half the
- * barriers per output). smem: 2x 64x32 halves = 8KB. */
 #define F16_TILE_M 64
 #define F16_TILE_N 64
 #define F16_WARPS 8
 #define F16_THREADS (F16_WARPS * 32)
-/* The 64-row tile needs only 4 warps (warp_row 0..1); launching 8 left
- * half the warps computing-but-skipping (S24 race) and halved block
- * occupancy. Dedicated 4-warp config for this kernel. */
+
 #define F16_TILE_WARPS 4
 #define F16_TILE_THREADS (F16_TILE_WARPS * 32)
 
@@ -1216,20 +1034,12 @@ __global__ void matmul_fp16_wmma64_batch_kernel(const __half *__restrict__ w,
 
     if (row_tile >= n || col_tile >= m) return;
 
-    const int warp_row = warp_id / 2;   /* 0..3 */
-    const int warp_col = warp_id % 2;   /* 0..1 */
+    const int warp_row = warp_id / 2;
+    const int warp_col = warp_id % 2;
 
-    /* 32-row stride (2 MMA tiles); stride-16 overlapped rows and raced. */
     const int row_start = row_tile + warp_row * 2 * WMMA_M;
     const int col_start = col_tile + warp_col * (2 * WMMA_N);
 
-    /* NOTE: no early return for edge warps (would diverge across the
-     * block and break the __syncthreads below = UB). Out-of-range
-     * warps load zeros (guarded) and skip writes (guarded). */
-    /* NOTE: 8 warps are launched (F16_WARPS) but each 64-row tile needs
-     * only 4 (warp_row 0..1). Upper warps (warp_row 2..3) address rows
-     * of the NEXT tile and must not write (they raced with the next
-     * block: odd rows zeroed for n>64). */
     const int warp_valid = (row_start < n && col_start < m &&
                             row_start < row_tile + F16_TILE_M);
 
@@ -1285,9 +1095,7 @@ __global__ void matmul_fp16_wmma64_batch_kernel(const __half *__restrict__ w,
     }
 
     __shared__ float smem_res64[F16_TILE_WARPS][2 * WMMA_M][2 * WMMA_N];
-    /* NOTE: store ldm must equal the smem ROW WIDTH (2*WMMA_N = 32),
-     * not the fragment width (16): rows 8-15 silently land in the
-     * wrong place otherwise. */
+
     wmma::store_matrix_sync(&smem_res64[warp_id][0][0], acc00, 2 * WMMA_N,
                             wmma::mem_row_major);
     wmma::store_matrix_sync(&smem_res64[warp_id][0][WMMA_N], acc01, 2 * WMMA_N,
@@ -1298,7 +1106,6 @@ __global__ void matmul_fp16_wmma64_batch_kernel(const __half *__restrict__ w,
                             wmma::mem_row_major);
     __syncthreads();
 
-    /* Each warp writes its own 32x32 patch (32 lanes x 32 elems). */
     for (int i = lane; i < 2 * WMMA_M * 2 * WMMA_N; i += MM_LANES) {
         int r = i / (2 * WMMA_N);
         int c = i % (2 * WMMA_N);
@@ -1309,12 +1116,6 @@ __global__ void matmul_fp16_wmma64_batch_kernel(const __half *__restrict__ w,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Q4_K MatMul (M>=1 batched). Input x is quantized to Q8_K (256 elements). */
-/* Dequant: v = q * d - qh * dmin, with per-group scales and mins.    */
-/* ------------------------------------------------------------------ */
-
-/* Extract scale and min from packed byte: 6 bits each, packed as d|m|d|m... */
 static __device__ __forceinline__ void get_scale_min_k4(int idx, const uint8_t *scales, uint8_t *scu8, uint8_t *mu8) {
     if (idx < 4) {
         *scu8 = scales[idx] & 63;
@@ -1325,24 +1126,20 @@ static __device__ __forceinline__ void get_scale_min_k4(int idx, const uint8_t *
     }
 }
 
-/* Q4_K dot product for one block (256 elements). Input x is Q8_K (256 int8 + bsums). */
 static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, const int8_t *xq8, const int16_t *bs, float xd, float acc) {
     float d     = __half2float(__ushort_as_half(blk->d));
     float dmin  = __half2float(__ushort_as_half(blk->dmin));
-    /* Guard against invalid half-precision values from randomly generated test weights */
+
     if (!isfinite(d) || d <= 0.0f) d = 1.0f;
     if (!isfinite(dmin)) dmin = 0.0f;
-    /* xd (Q8_K scale) can be negative - do not clamp */
+
     if (!isfinite(xd)) xd = 1.0f;
     const uint8_t *qbytes = blk->qs;
     const uint8_t *sc   = blk->scales;
     int32_t sumi = 0;
     int32_t summ = 0;
     int ib = 0;
-    /* Branchless scale/min hoist: 12 scale bytes via 3 u32 loads
-     * (scales offset 4 in the 144B block: 4-aligned), all 8 (s,m)
-     * pairs extracted once with pure arithmetic. Identical values,
-     * no calls, no divergent branches. */
+
     uint32_t scw0 = __ldg((const uint32_t *)(sc + 0));
     uint32_t scw1 = __ldg((const uint32_t *)(sc + 4));
     uint32_t scw2 = __ldg((const uint32_t *)(sc + 8));
@@ -1359,7 +1156,7 @@ static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, con
     int m23[4] = {(int)((b8 >> 4) | ((b4 >> 6) << 4)), (int)((b9 >> 4) | ((b5 >> 6) << 4)),
                   (int)((b10 >> 4) | ((b6 >> 6) << 4)), (int)((b11 >> 4) | ((b7 >> 6) << 4))};
     for (int g = 0; g < 4; g++) {
-        /* g = 0,1 -> pairs (0,1),(2,3); g = 2,3 -> pairs (4,5),(6,7). */
+
         int pi = (g < 2) ? 2 * g : 2 * g - 4;
         int s0 = (g < 2) ? s01[pi] : s23[pi];
         int m0 = (g < 2) ? m01[pi] : m23[pi];
@@ -1368,16 +1165,10 @@ static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, con
         const uint8_t *qg  = qbytes + (ptrdiff_t)(g * 32);
         const int8_t  *xq0 = xq8 + (ptrdiff_t)(g * 64);
         const int8_t  *xq1 = xq8 + (ptrdiff_t)(g * 64) + 32;
-        /* dp4a quads (was 64 scalar IMADs): uint8_t temps keep packing
-         * clean (S9 masking rule); integer dot exact -> bit-exact.
-         * u32 loads for the 4-byte groups (Q4_K blocks are 144B:
-         * always 4-aligned; LE byte order = identical words). */
+
         int32_t dot0 = 0;
         int32_t dot1 = 0;
-        /* Bit-trick packing: LE bytes already sit in position, so one
-         * AND isolates the low nibbles and (shift+AND) the high nibbles
-         * -- identical words to the byte-extract version, ~6 fewer
-         * instructions per quad. */
+
         #pragma unroll
         for (int t = 0; t < 8; t++) {
             int jt = t << 2;
@@ -1399,24 +1190,15 @@ static __device__ __forceinline__ float q4_k_dot(const cuda_q4_k_block *blk, con
     return result;
 }
 
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/* Q4_K MatMul kernel (M>=1 batched, K multiple of 256)              */
-/* ------------------------------------------------------------------ */
-
-
 __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
                                     const cuda_q8_k_block *__restrict__ xq,
                                     float *__restrict__ y, int n, int k) {
     const int nb = k / 256;
-    /* 4 row-groups x 8 lanes per warp: Q4_K nb is tiny (6 for k=1536),
-     * so the classic lane-per-block mapping leaves 26/32 lanes idle.
-     * Groups share the x blocks (L2) and reduce within their 8 lanes.
-     * Summation order differs from the 32-lane tree (agreement-gated). */
+
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & (MM_LANES - 1);
-    const int gr = lane >> 3;      /* row group 0..3 */
-    const int lane8 = lane & 7;    /* lane within group */
+    const int gr = lane >> 3;
+    const int lane8 = lane & 7;
     const unsigned mask8 = 0xFFu << (gr << 3);
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK * 4 + warp * 4 + gr;
 
@@ -1432,7 +1214,6 @@ __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
         }
     }
 
-    /*xor stays within the aligned 8-lane group for off=4,2,1. */
     #pragma unroll
     for (int off = 4; off > 0; off >>= 1)
         acc += __shfl_xor_sync(mask8, acc, off);
@@ -1441,13 +1222,9 @@ __global__ void matmul_q4_k_kernel(const cuda_q4_k_block *__restrict__ w,
         y[row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* MMVQ: MatMul-Vec-Q for M=1 decode (Q8_0 weights)                   */
-/* ------------------------------------------------------------------ */
-
 #define MMVQ_NWARPS     4
-#define MMVQ_NTHREADS   (MMVQ_NWARPS * 32)  /* 128 threads */
-#define MMVQ_VDR        2   /* vec dot ratio: 2 x 32-bit ints per thread per iteration */
+#define MMVQ_NTHREADS   (MMVQ_NWARPS * 32)
+#define MMVQ_VDR        2
 
 __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
                                          const cuda_q8_0_block *__restrict__ xq,
@@ -1484,11 +1261,9 @@ __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
     }
     }
 
-    /* Warp reduction */
     for (int off = MM_LANES >> 1; off > 0; off >>= 1)
         acc += __shfl_xor_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction across warps */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (lane == 0)
@@ -1503,11 +1278,6 @@ __global__ void matmul_q8_0_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
             y[row] = val;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ + Residual for M=1 decode (Q8_0 weights). y = W*x + residual. */
-/* Mirrors matmul_q8_0_mmvq_kernel.                                  */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restrict__ w,
                                                 const cuda_q8_0_block *__restrict__ xq,
@@ -1545,11 +1315,9 @@ __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restri
     }
     }
 
-    /* Warp reduction */
     for (int off = MM_LANES >> 1; off > 0; off >>= 1)
         acc += __shfl_xor_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (lane == 0)
@@ -1564,10 +1332,6 @@ __global__ void matmul_q8_0_residual_mmvq_kernel(const cuda_q8_0_block *__restri
             y[row] = val + residual[row];
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ: MatMul-Vec-Q for M=1 decode (Q4_0 weights)                   */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
                                          const cuda_q8_0_block *__restrict__ xq,
@@ -1588,9 +1352,6 @@ __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
 
-        /* Dequantize Q4_0 nibbles to INT8 matching scalar kernel order:
-         * indices 0-15: low nibbles (wb->qs[j] & 0xF)
-         * indices 16-31: high nibbles (wb->qs[j] >> 4) */
         int8_t wdeq[32];
         #pragma unroll
         for (int j = 0; j < 16; j++) {
@@ -1614,11 +1375,9 @@ __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
     }
     }
 
-    /* Warp reduction */
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (threadIdx.x % 32 == 0)
@@ -1633,11 +1392,6 @@ __global__ void matmul_q4_0_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
             y[row] = val;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ + Residual for M=1 decode (Q4_0 weights). y = W*x + residual. */
-/* Mirrors matmul_q4_0_mmvq_kernel.                                  */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restrict__ w,
                                                 const cuda_q8_0_block *__restrict__ xq,
@@ -1682,11 +1436,9 @@ __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restri
     }
     }
 
-    /* Warp reduction */
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (threadIdx.x % 32 == 0)
@@ -1701,10 +1453,6 @@ __global__ void matmul_q4_0_residual_mmvq_kernel(const cuda_q4_0_block *__restri
             y[row] = val + residual[row];
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ: MatMul-Vec-Q for M=1 decode (Q4_K weights)                   */
-/* ------------------------------------------------------------------ */
 
 #define Q4K_MMVQ_NTHREADS 128
 #define Q4K_MMVQ_NWARPS   4
@@ -1734,11 +1482,9 @@ __global__ void matmul_q4_k_mmvq_kernel(const cuda_q4_k_block *__restrict__ w,
         }
     }
 
-    /* Warp reduction */
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction across warps */
     __shared__ float smem[4];
     if (threadIdx.x < 4) smem[threadIdx.x] = 0.0f;
     __syncthreads();
@@ -1756,11 +1502,6 @@ __global__ void matmul_q4_k_mmvq_kernel(const cuda_q4_k_block *__restrict__ w,
         y[row] = total;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ: MatMul-Vec-Q for M=1 decode (Q4_1 weights)                   */
-/* dot = wb.d * xb.d * sum(q*xq) + wb.m * xb.d * sum(xq)              */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q4_1_mmvq_kernel(const cuda_q4_1_block *__restrict__ w,
                                          const cuda_q8_0_block *__restrict__ xq,
@@ -1805,11 +1546,9 @@ __global__ void matmul_q4_1_mmvq_kernel(const cuda_q4_1_block *__restrict__ w,
         acc = fmaf(dw * dx, (float)dp_acc, mw * cuda_q81_s(dx, x_sum) + acc);
     }
 
-    /* Warp reduction */
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (threadIdx.x % 32 == 0)
@@ -1824,11 +1563,6 @@ __global__ void matmul_q4_1_mmvq_kernel(const cuda_q4_1_block *__restrict__ w,
             y[row] = val;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* MMVQ + Residual for M=1 decode (Q4_1 weights). y = W*x + residual. */
-/* Mirrors matmul_q4_1_mmvq_kernel.                                  */
-/* ------------------------------------------------------------------ */
 
 __global__ void matmul_q4_1_residual_mmvq_kernel(const cuda_q4_1_block *__restrict__ w,
                                                 const cuda_q8_0_block *__restrict__ xq,
@@ -1874,11 +1608,9 @@ __global__ void matmul_q4_1_residual_mmvq_kernel(const cuda_q4_1_block *__restri
         acc = fmaf(dw * dx, (float)dp_acc, mw * cuda_q81_s(dx, x_sum) + acc);
     }
 
-    /* Warp reduction */
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, off);
 
-    /* Shared memory reduction */
     __shared__ float smem[MMVQ_NWARPS];
 
     if (threadIdx.x % 32 == 0)
@@ -1894,27 +1626,20 @@ __global__ void matmul_q4_1_residual_mmvq_kernel(const cuda_q4_1_block *__restri
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Tensor Core MMVQ for M=1 decode                                   */
-/* Each warp computes 16 output elements using WMMA FP16 tensor cores. */
-/* Input x is broadcast across 16 columns to match WMMA 16x16x16 shape. */
-/* ------------------------------------------------------------------ */
-
 #define MMVQ_TC_WARPS_PER_BLOCK 4
 #define MMVQ_TC_THREADS_PER_BLOCK (MMVQ_TC_WARPS_PER_BLOCK * 32)
-#define MMVQ_TC_OUT_PER_WARP 16  /* Each warp computes 16 output elements */
+#define MMVQ_TC_OUT_PER_WARP 16
 
 __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             float *__restrict__ y, int n, int k) {
-    const int nb = k >> 5;  // number of Q8_0 blocks in K dimension
+    const int nb = k >> 5;
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;
     const int lane = tid & 31;
 
     if (warp_id >= MMVQ_TC_WARPS_PER_BLOCK) return;
 
-    /* Each warp computes MMVQ_TC_OUT_PER_WARP = 16 consecutive output rows */
     const int out_start = (blockIdx.x * MMVQ_TC_WARPS_PER_BLOCK + warp_id) * MMVQ_TC_OUT_PER_WARP;
     if (out_start >= n) return;
     const int out_len = min(MMVQ_TC_OUT_PER_WARP, n - out_start);
@@ -1925,12 +1650,11 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
     }
 
     extern __shared__ char smem_mmvq_tc[];
-    /* w_smem: [out_len][WMMA_K] in FP16 */
+
     __half *w_smem = reinterpret_cast<__half *>(smem_mmvq_tc);
-    /* x_smem: [WMMA_K][WMMA_N] in FP16 - input x broadcast across WMMA_N columns */
+
     __half *x_smem = &w_smem[MMVQ_TC_OUT_PER_WARP * WMMA_K];
 
-    /* WMMA fragments - per-warp accumulators for each output row */
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag[MMVQ_TC_OUT_PER_WARP];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag[MMVQ_TC_OUT_PER_WARP];
@@ -1939,11 +1663,9 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
         wmma::fill_fragment(acc_frag[r], 0.0f);
     }
 
-    /* K-tiling loop: process K dimension in tiles of WMMA_K (16) */
     for (int kb = 0; kb < nb; kb += max(1, WMMA_K / 32)) {
         const int k_blocks_this_tile = min(max(1, WMMA_K / 32), nb - kb);
 
-        /* Load weight tile for our output rows: dequantize Q8_0 to FP16 */
         for (int i = lane; i < out_len * k_blocks_this_tile * 32; i += 32) {
             int r = i / (k_blocks_this_tile * 32);
             int idx_in_tile = i % (k_blocks_this_tile * 32);
@@ -1963,7 +1685,6 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
             }
         }
 
-        /* Load input tile and broadcast across 16 columns (WMMA_N) */
         for (int i = lane; i < k_blocks_this_tile * 32 * WMMA_N; i += 32) {
             int kb_local = i / (32 * WMMA_N);
             int idx_in_kb = i % (32 * WMMA_N);
@@ -1980,25 +1701,21 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
         }
         __syncthreads();
 
-        /* WMMA compute: for each output row, compute 16x16 tile */
         for (int r = 0; r < out_len; r++) {
             for (int kk = 0; kk < k_blocks_this_tile * 32; kk += WMMA_K) {
-                /* Load A fragment (row_major: 16x16) for this output row */
+
                 wmma::load_matrix_sync(a_frag[r],
                     &w_smem[(size_t)r * WMMA_K + kk], WMMA_K);
 
-                /* Load B fragment (row_major 16x16) - x is broadcast across columns */
                 wmma::load_matrix_sync(b_frag,
                     &x_smem[(size_t)kk * WMMA_N], WMMA_N);
 
-                /* MMA: D = A * B + C */
                 wmma::mma_sync(acc_frag[r], a_frag[r], b_frag, acc_frag[r]);
             }
         }
         __syncthreads();
     }
 
-    /* Store results: each row's result is in first column of accumulator */
     __shared__ float smem_results[MMVQ_TC_WARPS_PER_BLOCK][MMVQ_TC_OUT_PER_WARP][WMMA_N];
     for (int r = 0; r < out_len; r++) {
         wmma::store_matrix_sync(&smem_results[warp_id][r][0], acc_frag[r], WMMA_N, wmma::mem_row_major);
@@ -2012,7 +1729,6 @@ __global__ void matmul_q8_0_mmvq_tc_kernel(const cuda_q8_0_block *__restrict__ w
     }
 }
 
-/* Q4_0 version: dequantize Q4_0 nibbles to FP16 */
 __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
                                             float *__restrict__ y, int n, int k) {
@@ -2036,7 +1752,6 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
     __half *w_smem = reinterpret_cast<__half *>(smem_mmvq_tc);
     __half *x_smem = &w_smem[MMVQ_TC_OUT_PER_WARP * WMMA_K];
 
-    /* WMMA fragments - per-row accumulators */
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag[MMVQ_TC_OUT_PER_WARP];
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag[MMVQ_TC_OUT_PER_WARP];
@@ -2045,11 +1760,9 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
         wmma::fill_fragment(acc_frag[r], 0.0f);
     }
 
-    /* K-tiling loop: process K dimension in tiles of WMMA_K (16) */
     for (int kb = 0; kb < nb; kb += max(1, WMMA_K / 32)) {
         const int k_blocks_this_tile = min(max(1, WMMA_K / 32), nb - kb);
 
-        /* Load Q4_0 weight tile: dequantize nibbles to FP16 */
         for (int i = lane; i < out_len * k_blocks_this_tile * 32; i += 32) {
             int r = i / (k_blocks_this_tile * 32);
             int idx_in_tile = i % (k_blocks_this_tile * 32);
@@ -2070,7 +1783,6 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
             }
         }
 
-        /* Load input tile (same as Q8_0 since xq is Q8_0) */
         for (int i = lane; i < k_blocks_this_tile * 32 * WMMA_N; i += 32) {
             int kb_local = i / (32 * WMMA_N);
             int idx_in_kb = i % (32 * WMMA_N);
@@ -2087,7 +1799,6 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
         }
         __syncthreads();
 
-        /* WMMA compute: for each output row, compute 16x16 tile */
         for (int r = 0; r < out_len; r++) {
             for (int kk = 0; kk < k_blocks_this_tile * 32; kk += WMMA_K) {
                 wmma::load_matrix_sync(a_frag[r],
@@ -2100,7 +1811,6 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
         __syncthreads();
     }
 
-    /* Store results */
     __shared__ float smem_results[MMVQ_TC_WARPS_PER_BLOCK][MMVQ_TC_OUT_PER_WARP][WMMA_N];
     for (int r = 0; r < out_len; r++) {
         wmma::store_matrix_sync(&smem_results[warp_id][r][0], acc_frag[r], WMMA_N, wmma::mem_row_major);
@@ -2113,16 +1823,10 @@ __global__ void matmul_q4_0_mmvq_tc_kernel(const cuda_q4_0_block *__restrict__ w
         }
     }
 }
- 
-/* ------------------------------------------------------------------ */
-/* Warp-Specialized MMVQ for M=1 Decode (Q8_0)                       */
-/* 4 warps: W0=Load weights, W1-3=Compute DP4A, reduce+store         */
-/* Double-buffered shared memory for weight tiles to overlap load/compute. */
-/* ------------------------------------------------------------------ */
 
 #define MMVQ_WS_NWARPS     4
-#define MMVQ_WS_THREADS    (MMVQ_WS_NWARPS * 32)  /* 128 threads */
-#define MMVQ_WS_TILE_B     16   /* Weight blocks per tile (16 x 32 = 512 elements) */
+#define MMVQ_WS_THREADS    (MMVQ_WS_NWARPS * 32)
+#define MMVQ_WS_TILE_B     16
 
 __global__ void matmul_q8_0_mmvq_ws_kernel(const cuda_q8_0_block *__restrict__ w,
                                             const cuda_q8_0_block *__restrict__ xq,
@@ -2316,11 +2020,6 @@ __global__ void matmul_q4_0_mmvq_ws_kernel(const cuda_q4_0_block *__restrict__ w
         }
     }
 }
- 
-/* WMMA placeholder: For M=1 decode, DP4A MMVQ is optimal.
- * Full WMMA tensor cores (PTX mma.sync.aligned) would only help
- * for M>=16 prefill where weight tiles are shared across rows.
- * The current MMVQ kernel already provides the best decode performance. */
 
 __global__ void matmul_f32_kernel(const float *__restrict__ w, const float *__restrict__ x,
                                    float *__restrict__ y, int n, int k) {
@@ -2367,7 +2066,7 @@ __global__ void matmul_bf16_kernel(const uint16_t *__restrict__ w, const float *
     const uint16_t *wrow = w + (size_t)row * k;
     float acc = 0.0f;
     for (int j = lane; j < k; j += MM_LANES) {
-        /* Convert raw BF16 bits to __nv_bfloat16, then to float. */
+
         __nv_bfloat16 bf = __ushort_as_bfloat16(wrow[j]);
         acc = fmaf((float)bf, x[j], acc);
     }
@@ -2378,19 +2077,12 @@ __global__ void matmul_bf16_kernel(const uint16_t *__restrict__ w, const float *
         y[row] = acc;
 }
 
-/* Fused FFN activation + Q8_0 quantization.
- * xq[b] = quantize( act[32b .. 32b+31] )  where act[i] = gelu_tanh(gate[i]) * up[i].
- * Mirrors quants.h gelu_tanh() exactly and the cpu_ffn_act / moe_activate_gelu
- * activation ordering (activation == ACTIVATION_GELU). */
 __device__ __forceinline__ float act_gelu_tanh(float x) {
-    const float c   = 0.7978845608028654f; /* sqrt(2/pi) */
+    const float c   = 0.7978845608028654f;
     const float x3  = x * x * x;
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x3)));
 }
 
-
-/* Batched version: processes m rows of gate/up in parallel.
- * Grid: (m, (k/32 + 255)/256), Block: 256 */
 __global__ void act_gelu_quant_batch_kernel(const float *__restrict__ gate,
                                             const float *__restrict__ up,
                                             cuda_q8_0_block *__restrict__ xq,
@@ -2466,18 +2158,13 @@ static __device__ __forceinline__ float d_from_half(const uint16_t *h) {
     return __half2float(reinterpret_cast<const __half &>(*h));
 }
 
-/* Fused multi-column matmul: all columns share x (quantized once as Q8_0),
- * so the GPU reads each 32-block of x exactly once instead of per-column.
- * Layout: total rows = sum(n_list[0..nm)); global row g maps to
- * (col c, row r).  Weights/Q8_0 and (for Q4_0) read like the single
- * kernels, but the output row is selected via the per-column offset. */
 struct mm_multi_desc {
     const char *w[8];
     float      *y[8];
     int         n[8];
     int         nm;
     int         k;
-    const float *resid; /* optional fused residual (NULL = none) */
+    const float *resid;
 };
 
 __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
@@ -2498,7 +2185,7 @@ __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
     const int nb = d.k / 32;
     const cuda_q8_0_block *wrow = (const cuda_q8_0_block *)d.w[col] + (size_t)row * nb;
     float acc = 0.0f;
-    /* QM x-side (orthogonal); wide iff nb even (u32 alignment). */
+
     const uint8_t *xq8m = (const uint8_t *)xq;
     int xw = (xq_qm && ((nb & 1) == 0));
     int xn = (xq_qm && ((nb & 1) != 0));
@@ -2506,8 +2193,7 @@ __global__ void matmul_multi_q8_0_kernel(const mm_multi_desc d,
     for (int j = lane; j < nb; j += MM_LANES) {
         const cuda_q8_0_block *xb = &xq[j];
         const cuda_q8_0_block *wb = &wrow[j];
-        /* dp4a + 2B-vector loads. Integer dot is exact regardless of
-         * summation order; float fmaf order unchanged -> bit-exact. */
+
         int32_t dp_acc = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -2552,9 +2238,7 @@ __global__ void matmul_multi_q4_0_kernel(const mm_multi_desc d,
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
-        /* dp4a over nibble quads. uint8_t temps zero-extend so packed
-         * words are clean (S9 masking rule: never shift sign-extended
-         * values); integer dot exact -> bit-exact vs scalar. */
+
         int32_t dp_acc = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -2595,14 +2279,6 @@ __global__ void matmul_multi_q4_0_kernel(const mm_multi_desc d,
         d.y[col][row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + Multi-MatMul (Q4_0 weights).                       */
-/* Phase 1: all threads cooperate to compute RMSNorm(x) and quantize  */
-/* to Q8_0 in shared memory. Phase 2: warp-per-(col,row) matmul       */
-/* reading quantized x from shared memory. Eliminates the global      */
-/* memory round-trip for normalized x between RMSNorm and MatMul.     */
-/* ------------------------------------------------------------------ */
-
 __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
                                                  const float *__restrict__ x,
                                                  const float *__restrict__ norm_w,
@@ -2616,7 +2292,6 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
     float *reduce = (float *)sh;
     cuda_q8_0_block *xq = (cuda_q8_0_block *)(reduce + nt);
 
-    /* Phase 1: RMSNorm sum-of-squares reduction */
     float s = 0.0f;
     for (int i = tid; i < k; i += nt)
         s += x[i] * x[i];
@@ -2631,7 +2306,6 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
     __syncthreads();
     const float scale = reduce[0];
 
-    /* Phase 1b: normalize + quantize to Q8_0 in shared memory */
     for (int b = tid; b < nb; b += nt) {
         float vals[32];
         float amax = 0.0f;
@@ -2664,7 +2338,6 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
     }
     __syncthreads();
 
-    /* Phase 2: warp-per-(col,row) matmul reading xq from shared memory */
     const int warp = tid >> 5;
     const int lane = tid & (MM_LANES - 1);
     const int g = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -2684,9 +2357,7 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
     for (int b = lane; b < nb; b += MM_LANES) {
         const cuda_q4_0_block *wb = wrow + b;
         const cuda_q8_0_block *xb = xq + b;
-        /* dp4a over nibble quads. uint8_t temps zero-extend, so packed
-         * words are clean (cf. sign-extension pollution); integer dot
-         * exact -> bit-exact vs scalar. */
+
         int32_t dp_acc = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -2728,11 +2399,6 @@ __global__ void rmsnorm_matmul_multi_q4_0_kernel(const mm_multi_desc d,
         d.y[col][row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + Multi-MatMul (Q8_0 weights). Same two-phase design */
-/* as the Q4_0 variant with Q8_0 dequant in the matmul phase.         */
-/* ------------------------------------------------------------------ */
-
 __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
                                                  const float *__restrict__ x,
                                                  const float *__restrict__ norm_w,
@@ -2746,7 +2412,6 @@ __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
     float *reduce = (float *)sh;
     cuda_q8_0_block *xq = (cuda_q8_0_block *)(reduce + nt);
 
-    /* Phase 1: RMSNorm sum-of-squares reduction */
     float s = 0.0f;
     for (int i = tid; i < k; i += nt)
         s += x[i] * x[i];
@@ -2761,7 +2426,6 @@ __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
     __syncthreads();
     const float scale = reduce[0];
 
-    /* Phase 1b: normalize + quantize to Q8_0 in shared memory */
     for (int b = tid; b < nb; b += nt) {
         float vals[32];
         float amax = 0.0f;
@@ -2794,7 +2458,6 @@ __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
     }
     __syncthreads();
 
-    /* Phase 2: warp-per-(col,row) matmul reading xq from shared memory */
     const int warp = tid >> 5;
     const int lane = tid & (MM_LANES - 1);
     const int g = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -2839,11 +2502,6 @@ __global__ void rmsnorm_matmul_multi_q8_0_kernel(const mm_multi_desc d,
         d.y[col][row] = acc;
 }
 
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + Multi-MatMul (Q4_1 weights). Same two-phase design */
-/* with Q4_1 dequant (v = q*d + m) in the matmul phase.               */
-/* ------------------------------------------------------------------ */
-
 __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
                                                  const float *__restrict__ x,
                                                  const float *__restrict__ norm_w,
@@ -2857,7 +2515,6 @@ __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
     float *reduce = (float *)sh;
     cuda_q8_0_block *xq = (cuda_q8_0_block *)(reduce + nt);
 
-    /* Phase 1: RMSNorm sum-of-squares reduction */
     float s = 0.0f;
     for (int i = tid; i < k; i += nt)
         s += x[i] * x[i];
@@ -2872,7 +2529,6 @@ __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
     __syncthreads();
     const float scale = reduce[0];
 
-    /* Phase 1b: normalize + quantize to Q8_0 in shared memory */
     for (int b = tid; b < nb; b += nt) {
         float vals[32];
         float amax = 0.0f;
@@ -2905,7 +2561,6 @@ __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
     }
     __syncthreads();
 
-    /* Phase 2: warp-per-(col,row) matmul reading xq from shared memory */
     const int warp = tid >> 5;
     const int lane = tid & (MM_LANES - 1);
     const int g = blockIdx.x * MM_ROWS_PER_BLOCK + warp;
@@ -2943,10 +2598,6 @@ __global__ void rmsnorm_matmul_multi_q4_1_kernel(const mm_multi_desc d,
     if (lane == 0)
         d.y[col][row] = acc;
 }
-
-/* ------------------------------------------------------------------ */
-/* RMSNorm                                                             */
-/* ------------------------------------------------------------------ */
 
 __global__ void rmsnorm_kernel(const float *__restrict__ x, const float *__restrict__ w,
                                float *__restrict__ y, int n, float eps) {
@@ -2997,7 +2648,7 @@ __global__ void rmsnorm_per_head_kernel(const float *__restrict__ x, const float
 
 __global__ void rmsnorm_batch_kernel(const float *__restrict__ x, const float *__restrict__ w,
                                        float *__restrict__ y, int n, float eps, int m) {
-    /* One block per row; identical math to rmsnorm_kernel per row. */
+
     const int r = blockIdx.x;
     if (r >= m) return;
     extern __shared__ float sm[];
@@ -3024,7 +2675,7 @@ __global__ void rmsnorm_batch_kernel(const float *__restrict__ x, const float *_
 
 extern "C" void cuda_rmsnorm(const float *x_dev, const float *w_dev, float *y_dev, int n, float eps,
                              cudaStream_t stream) {
-    const int nt = n < 256 ? 32 : 256; /* enough lanes for the tree */
+    const int nt = n < 256 ? 32 : 256;
     rmsnorm_kernel<<<1, nt, nt * sizeof(float), stream>>>(x_dev, w_dev, y_dev, n, eps);
 }
 
@@ -3042,11 +2693,6 @@ extern "C" void cuda_rmsnorm_per_head(const float *x_dev, const float *w_dev, fl
     rmsnorm_per_head_kernel<<<n_heads, nt, nt * sizeof(float), stream>>>(x_dev, w_dev, y_dev,
                                                                         head_dim, eps);
 }
-
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + Residual Add: y = rmsnorm(x, w) + residual         */
-/* Matches CPU: rmsnorm first, then add residual.                      */
-/* ------------------------------------------------------------------ */
 
 __global__ void rmsnorm_add_kernel(const float *__restrict__ x, const float *__restrict__ w,
                                    const float *__restrict__ residual, float *__restrict__ y,
@@ -3069,8 +2715,7 @@ __global__ void rmsnorm_add_kernel(const float *__restrict__ x, const float *__r
     const float scale = sm[0];
     for (int i = t; i < n; i += nt) {
         float normed = (w ? x[i] * scale * w[i] : x[i] * scale);
-        /* out_scale is an output-side gain folded in here, as the CPU reference
-         * does, rather than costing a separate scaling kernel. */
+
         y[i] = (normed + residual[i]) * out_scale;
     }
 }
@@ -3083,8 +2728,6 @@ extern "C" void cuda_rmsnorm_add(const float *x_dev, const float *w_dev, const f
                                                               n, eps, out_scale);
 }
 
-/* Graph-capture launchers (_g suffix): same kernel, takes decode_params for
- * capture compatibility (params unused by kernel itself). */
 extern "C" void cuda_rmsnorm_per_head_g(const float *x_dev, const float *w_dev, float *y_dev,
                                         int n_heads, int head_dim, float eps,
                                         const int *params_dev, cudaStream_t stream) {
@@ -3093,18 +2736,11 @@ extern "C" void cuda_rmsnorm_per_head_g(const float *x_dev, const float *w_dev, 
         x_dev, w_dev, y_dev, head_dim, eps);
 }
 
-/* ------------------------------------------------------------------ */
-/* Fused Q/K per-head RMSNorm + V RMSNorm-noweight + RoPE on Q/K      */
-/* Decode M=1, in-place. Bit-exact vs the decomposed 5-kernel        */
-/* sequence: per-head norm reduction mirrors rmsnorm_per_head_kernel, */
-/* RoPE mirrors rope_ext_kernel. One block per head slot.             */
-/* ------------------------------------------------------------------ */
-
 __device__ __forceinline__ void qkv_norm_rope_head(float *vh, const float *wh,
                                                    int head_dim, float eps,
                                                    const float *cos_tbl, const float *sin_tbl,
                                                    int neox, float *sm, int t, int nt) {
-    /* RMSNorm (w may be NULL). Identical to rmsnorm_per_head_kernel. */
+
     float s = 0.0f;
     for (int i = t; i < head_dim; i += nt)
         s += vh[i] * vh[i];
@@ -3121,7 +2757,7 @@ __device__ __forceinline__ void qkv_norm_rope_head(float *vh, const float *wh,
     for (int i = t; i < head_dim; i += nt)
         vh[i] = (wh ? vh[i] * scale * wh[i] : vh[i] * scale);
     __syncthreads();
-    /* RoPE in place. Identical to rope_ext_kernel. */
+
     if (cos_tbl && sin_tbl) {
         const int half = head_dim / 2;
         for (int j = t; j < half; j += nt) {
@@ -3158,7 +2794,7 @@ __global__ void qkv_norm_rope_kernel(float *q, float *k, float *v,
         qkv_norm_rope_head(k + (size_t)h * head_dim, wk_norm, head_dim, eps,
                            cos_tbl, sin_tbl, neox, sm, t, nt);
         __syncthreads();
-        /* V: norm without weight, no rope. */
+
         float *vh = v + (size_t)h * head_dim;
         float s = 0.0f;
         for (int i = t; i < head_dim; i += nt)
@@ -3242,10 +2878,6 @@ extern "C" void cuda_qkv_norm_rope_g(float *q_dev, float *k_dev, float *v_dev,
         (const cuda_decode_params *)params_dev, neox);
 }
 
-/* Batched RMSNorm + residual add: one block per row, identical math to
- * rmsnorm_add_kernel per row. Replaces rmsnorm_batch + add_batch (one
- * launch and one memory round-trip saved). Note: keeps the addend in a
- * register, so one fewer rounding than the decomposed path (ulp-level). */
 __global__ void rmsnorm_add_batch_kernel(const float *__restrict__ x, const float *__restrict__ w,
                                          const float *__restrict__ residual, float *__restrict__ y,
                                          int n, float eps, int m, float out_scale) {
@@ -3272,8 +2904,7 @@ __global__ void rmsnorm_add_batch_kernel(const float *__restrict__ x, const floa
     const float scale = sm[0];
     for (int i = t; i < n; i += nt) {
         float normed = (w ? xr[i] * scale * w[i] : xr[i] * scale);
-        /* out_scale is an output-side gain the engine folds in here rather than
-         * issuing a separate scaling op (matches the CPU reference). */
+
         yr[i] = (normed + rr[i]) * out_scale;
     }
 }
@@ -3286,11 +2917,6 @@ extern "C" void cuda_rmsnorm_add_batch(const float *x_dev, const float *w_dev,
     rmsnorm_add_batch_kernel<<<grid, nt, (size_t)nt * sizeof(float), stream>>>(
         x_dev, w_dev, residual_dev, y_dev, n, eps, m, out_scale);
 }
-
-/* ------------------------------------------------------------------ */
-/* Fused RMSNorm + RoPE                                                */
-/*   For each head: y = rmsnorm(x, w), then apply RoPE rotation.      */
-/* ------------------------------------------------------------------ */
 
 __global__ void rmsnorm_rope_kernel(const float *__restrict__ x, const float *__restrict__ w,
                                     float *__restrict__ y, int n_heads, int head_dim,
@@ -3350,9 +2976,7 @@ extern "C" void cuda_rmsnorm_rope(const float *x_dev, const float *w_dev, float 
                                                                      n_heads, head_dim,
                                                                      cos_dev, sin_dev, eps, neox);
 }
-/* Cached device scratch for the quantized input (avoids per-call
- * cudaMalloc/cudaFree, which synchronize the device and would defeat
- * stream-based pipelining of consecutive matmuls). */
+
 static cuda_q8_0_block *g_xq_scratch = nullptr;
 static size_t           g_xq_cap      = 0;
 static cuda_q8_k_block *g_q8k_scratch = nullptr;
@@ -3372,8 +2996,6 @@ static cuda_q8_k_block *q8k_scratch_for(int k) {
     return g_q8k_scratch;
 }
 
-/* Q8_1 scratch for Q5_1 (see q5_1_dot): the activation block needs its `s`
- * offset field, so it cannot share the Q8_0 scratch. Grow-only, same policy. */
 static cuda_q8_1_block *g_q81_scratch = nullptr;
 static size_t          g_q81_cap     = 0;
 
@@ -3428,38 +3050,29 @@ extern "C" void cuda_quantize_f32_to_q8_k(const float *x_dev, cuda_q8_k_block *x
 
 extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
-    /* Quantize x on the device (Q8_0), then run the Q8_0 matmul.
-     * Default on (opt-out KAPPAI_XQ_QM=0): quantize into QM order so GEMV
-     * x-side reads are wide/coalesced (v2 kernel, use_stage=0 only). */
+
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
-    /* XQ_QM layout follows the dispatched kernel: MMVQ/v1 (n==1 and
-     * V2=0 fallback) only read original xq, so QM quant applies to
-     * the v2 path only. Each launcher rewrites xq per call. */
+
     const int use_v2e = 1;
-    /* Default ON (opt-out KAPPAI_XQ_QM=0): bit-exact, +6-7% TG. */
+
     const int use_xqm = (n != 1 && use_v2e) ? 1 : 0;
     if (use_xqm)
-        /* One 32-thread block per Q-block. */
+
         q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
             x_dev, (uint8_t *)xq_dev, k);
     else
         q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
 
     if (n == 1) {
-        /* M=1, single-output path: the proven plain MMVQ kernel. */
+
         matmul_q8_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
             (const cuda_q8_0_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2e) {
-            /* v2 xq staging measured pure overhead at all grids (xq
-             * stays L2-resident across blocks); default off, escape hatch
-             * Staging stays off while x is in QM order. */
-            /* Staging copies xq to shared and reads it as original
-             * layout: incompatible with the QM x buffer, force off
-             * (staging is pure overhead by default anyway). */
+
             const int use_stage = !use_xqm ? 1 : 0;
             size_t shmem = (size_t)(k >> 5) * sizeof(cuda_q8_0_block);
             matmul_q8_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
@@ -3473,22 +3086,21 @@ extern "C" void cuda_matmul_q8_0(const void *w_dev, const float *x_dev, float *y
 
 extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
-    /* Quantize x on the device (Q8_0 internally), then run Q4_0 matmul. */
+
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
     q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
 
     if (n == 1) {
-        /* M=1, single-output path: the proven plain MMVQ kernel. */
+
         matmul_q4_0_mmvq_kernel<<<1, MMVQ_NTHREADS, 0, stream>>>(
             (const cuda_q4_0_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
         const int use_v2 = 1;
         dim3 grid((n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK);
         if (use_v2) {
-            /* v2 xq staging default off (L2-resident); KAPPAI_XQ_STAGE=1
-             * forces it back on. */
+
             const int use_stage = 1;
             size_t shmem = (size_t)(k >> 5) * (sizeof(cuda_q8_0_block) + sizeof(int));
             matmul_q4_0_dp4a_v2_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, shmem, stream>>>(
@@ -3499,33 +3111,16 @@ extern "C" void cuda_matmul_q4_0(const void *w_dev, const float *x_dev, float *y
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* IQ4_NL: 32 elements/block, d (F16) + 16 packed 4-bit values.         */
-/*                                                                   */
-/* Nibble layout is NOT interleaved: qs[j] & 0xF is element j,       */
-/* qs[j] >> 4 is element j+16. Weights are NOT a linear nibble        */
-/* scale -- the 4-bit index feeds a 16-entry non-uniform LUT, exactly  */
-/* as iq4_nl_dot() in backend/cpu/scalar/quants.c does. x is          */
-/* quantized to Q8_0 first (MATMUL_Q8_F32(iq4_nl_q8, ...)), so the    */
-/* whole dot product is integer and exact.                            */
-/* ------------------------------------------------------------------ */
-
 __constant__ int8_t cuda_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
 
-/* One IQ4_NL block dot product against a Q8_0 activation block.
- * Mirrors iq4_nl_dot() bit-for-bit in accumulation order. */
 static __device__ __forceinline__ float iq4_nl_dot(const cuda_iq4_nl_block *blk,
                                                    const int8_t *xq8, float d_xq, float acc) {
     const uint8_t *qs = blk->qs;
     int32_t        sumi0 = 0;
     int32_t        sumi1 = 0;
-    /* Low nibble -> elements [0,16), high nibble -> elements [16,32).
-     * __dp4a over 4 int8 lanes at a time; the LUT values exceed int8
-     * range in magnitude (-127) so they cannot be packed into the dp4a
-     * operand directly -- accumulate scalar int32 products instead,
-     * which is what the reference does too. */
+
     #pragma unroll
     for (int j = 0; j < 16; j++) {
         sumi0 += (int)xq8[j] * (int)cuda_kvalues_iq4nl[qs[j] & 0xF];
@@ -3580,7 +3175,6 @@ __global__ void matmul_iq4_nl_residual_kernel(const cuda_iq4_nl_block *__restric
         y[row] = acc + residual[row];
 }
 
-/* Batched (m tokens share the weight). */
 __global__ void matmul_iq4_nl_batch_kernel(const cuda_iq4_nl_block *__restrict__ w,
                                            const cuda_q8_0_block *__restrict__ xq,
                                            float *__restrict__ y, int n, int k, int m) {
@@ -3621,10 +3215,9 @@ __global__ void matmul_iq4_nl_batch_kernel(const cuda_iq4_nl_block *__restrict__
     }
 }
 
-
 extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
-    /* Quantize x on the device (Q8_0 internally), then run Q4_1 matmul. */
+
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
@@ -3640,15 +3233,13 @@ extern "C" void cuda_matmul_q4_1(const void *w_dev, const float *x_dev, float *y
     }
 }
 
-/* Fused residual matmuls: y = W*x + residual. Quantize x once, dispatch
- * MMVQ (M=1 decode) or DP4A residual kernels (M>1). */
 extern "C" void cuda_matmul_q8_0_residual(const void *w_dev, const float *x_dev,
                                          const float *residual_dev, float *y_dev,
                                          int n, int k, cudaStream_t stream) {
     cuda_q8_0_block *xq_dev = xq_scratch_for(k);
     if (!xq_dev)
         return;
-    /* XQ_QM follows the kernel: res-v2 only (MMVQ/v1 read original). */
+
     const int use_v2r = 1;
     const int use_xqmr = (n != 1 && use_v2r) ? 1 : 0;
     if (use_xqmr)
@@ -3710,30 +3301,6 @@ extern "C" void cuda_matmul_q4_1_residual(const void *w_dev, const float *x_dev,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Q6_K: 256 elements/block = 4 groups of 64.                           */
-/*                                                                   */
-/* Layout (matches CPU q6_k_block exactly):                           */
-/*   ql[128]  low 4 bits of each quant, 4 sub-groups of 32           */
-/*   qh[64]   high 2 bits of each quant                               */
-/*   scales[16] one int8 per 16-element sub-group (16 per block)     */
-/*   d (F16)   block scale                                            */
-/*                                                                   */
-/* x is quantized to Q8_K first, so the dot product is exact integer  */
-/* math (q6_k_r8_dot in backend/cpu/scalar/quants.c). Quant unpack    */
-/* order and the scale-grouping loop are load-bearing: the reference  */
-/* accumulates per 16-element sub-group and multiplies by that        */
-/* sub-group's scale before summing, so a plain flat dot product      */
-/* drifts outside the cross-backend tolerance band.                   */
-/* ------------------------------------------------------------------ */
-
-/* Unpack 256 six-bit quants for one block into a[256] (-32 offset),
- * following q6_k_r8_dot()'s exact sub-group order:
- *   ap[0..31]    <- ql[l]     low nibble  + qh bits 0..1
- *   ap[32..63]   <- ql[l+32]  low nibble  + qh bits 2..3
- *   ap[64..95]   <- ql[l]     high nibble + qh bits 4..5
- *   ap[96..127]  <- ql[l+32]  high nibble + qh bits 6..7
- * repeated for the second 128 (ql += 64, qh += 32). */
 static __device__ __forceinline__ void q6_k_unpack(const cuda_q6_k_block *blk, int8_t *a) {
     const uint8_t *ql = blk->ql;
     const uint8_t *qh = blk->qh;
@@ -3752,15 +3319,13 @@ static __device__ __forceinline__ void q6_k_unpack(const cuda_q6_k_block *blk, i
     }
 }
 
-/* One Q6_K block dot product against Q8_K activation blocks.
- * xq8 points at this block's 256 int8 values, bsums at its 16 int16 sums. */
 static __device__ __forceinline__ float q6_k_dot(const cuda_q6_k_block *blk, const int8_t *xq8,
                                                  const int16_t *bsums, float d_xq, float acc) {
     int8_t a[256];
     q6_k_unpack(blk, a);
 
     int32_t total = 0;
-    /* 16 sub-groups of 16 elements; each is scaled by scales[j]. */
+
     #pragma unroll
     for (int j = 0; j < 16; j++) {
         int32_t l0 = 0;
@@ -3780,7 +3345,7 @@ static __device__ __forceinline__ float q6_k_dot(const cuda_q6_k_block *blk, con
 __global__ void matmul_q6_k_kernel(const cuda_q6_k_block *__restrict__ w,
                                    const cuda_q8_k_block *__restrict__ xq,
                                    float *__restrict__ y, int n, int k) {
-    const int nb  = k >> 8; /* 256 elements per block */
+    const int nb  = k >> 8;
     const int row = blockIdx.x * MM_ROWS_PER_BLOCK + (threadIdx.x >> 5);
     if (row >= n)
         return;
@@ -3861,28 +3426,13 @@ __global__ void matmul_q6_k_batch_kernel(const cuda_q6_k_block *__restrict__ w,
         }
     }
 }
-/* ------------------------------------------------------------------ */
-/* MMVQ: MatMul-Vec-Q for M=1 decode.                                  */
-/*                                                                     */
-/* Decode is bandwidth-bound, so the batched row-per-warp layout wastes */
-/* most of the machine: it assigns one row to 32 lanes, but M=1 means    */
-/* there is only one row to spread. These kernels keep the identical    */
-/* arithmetic (q6_k_dot / iq4_nl_dot) and only change the work           */
-/* decomposition: every thread strides over the k-blocks, then a warp    */
-/* tree reduction plus a small shared-memory cross-warp sum combines    */
-/* the partials. Same reduction shape as the existing MMVQ kernels.     */
-/* ------------------------------------------------------------------ */
 
 #define MMVQ_WARPS 4
 
-/* Decode one Q6_K element without staging the whole 256-entry block in local
- * memory. Element e selects half (e>>7), 64-wide group (e>>5)&3 and offset
- * e&31; the four groups consume the low/high nibble of ql and the matching
- * 2 bits of qh, which is exactly the order q6_k_unpack() writes them in. */
 static __device__ __forceinline__ int8_t q6_k_elem(const cuda_q6_k_block *blk, int e) {
     const int      half   = e >> 7;
     const int      within = e & 127;
-    const int      grp    = within >> 5; /* 0..3 */
+    const int      grp    = within >> 5;
     const int      l      = within & 31;
     const uint8_t *ql     = blk->ql + half * 64;
     const uint8_t *qh     = blk->qh + half * 32;
@@ -3897,9 +3447,6 @@ static __device__ __forceinline__ int8_t q6_k_elem(const cuda_q6_k_block *blk, i
     return (int8_t)v;
 }
 
-/* One warp per row, and within a block each lane owns 8 of the 256 elements.
- * A 16-element scale sub-group spans exactly 2 lanes, so every lane's partial
- * carries a single sub-group scale and the warp tree sums them directly. */
 __global__ void matmul_q6_k_mmvq_kernel(const cuda_q6_k_block *__restrict__ w,
                                         const cuda_q8_k_block *__restrict__ xq,
                                         float *__restrict__ y, int n, int k) {
@@ -3917,9 +3464,6 @@ __global__ void matmul_q6_k_mmvq_kernel(const cuda_q6_k_block *__restrict__ w,
         const cuda_q6_k_block *blk = wrow + b;
         const cuda_q8_k_block *xb  = xq + b;
 
-        /* Each lane owns 8 of the block's 256 elements. lane*8..lane*8+7 never
-         * crosses a 16-element scale sub-group, so the partial carries exactly
-         * one scale and the warp tree sums the 16 sub-groups directly. */
         int32_t local = 0;
         #pragma unroll
         for (int t = 0; t < 8; t++) {
@@ -3980,7 +3524,7 @@ extern "C" void cuda_matmul_q6_k(const void *w_dev, const float *x_dev, float *y
         return;
     q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
     if (n == 1) {
-        /* Decode: one row, so spread the k-blocks across all threads. */
+
         matmul_q6_k_mmvq_kernel<<<(n + MMVQ_NWARPS - 1) / MMVQ_NWARPS,
                                   MMVQ_NWARPS * 32, 0, stream>>>(
             (const cuda_q6_k_block *)w_dev, xq_dev, y_dev, n, k);
@@ -4004,15 +3548,6 @@ extern "C" void cuda_matmul_q6_k_residual(const void *w_dev, const float *x_dev,
     matmul_q6_k_residual_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q6_k_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
 }
-/* ------------------------------------------------------------------ */
-/* Q5_0 / Q5_1: 32 elements/block, 5-bit values.                        */
-/*                                                                     */
-/* The 5th bit lives in qh: element j's bit is (qh>>j)&1 and element    */
-/* j+16's is (qh>>(j+16))&1. Q5_0 subtracts a -16 bias inside the dot;   */
-/* Q5_1 has no bias and folds the offset into the m field, so it also    */
-/* needs sum(xq8) per activation block. We compute that inline rather   */
-/* than storing it, matching the existing Q4_1 CUDA path.                */
-/* ------------------------------------------------------------------ */
 
 static __device__ __forceinline__ float q5_0_dot(const cuda_q5_0_block *wb,
                                                   const cuda_q8_0_block *xb, float acc) {
@@ -4032,11 +3567,6 @@ static __device__ __forceinline__ float q5_0_dot(const cuda_q5_0_block *wb,
     return fmaf(dw * dx, (float)(sumi0 + sumi1), acc);
 }
 
-/* Q5_1 pairs with Q8_1 (not Q8_0): the activation block carries `s`, the fp16
- * offset fp16(d * sum_of_quants), which the m-field term needs. Using Q8_0
- * here would have to re-derive that sum and lose the fp16 round-trip, which
- * is exactly where Q4_1 parity was won. See MATMUL_Q8_F32(q5_1_q8, ...) in
- * backend/cpu/scalar/quants.c. */
 static __device__ __forceinline__ float q5_1_dot(const cuda_q5_1_block *wb,
                                                   const cuda_q8_1_block *xb, float acc) {
     const uint8_t *qs = wb->qs;
@@ -4057,7 +3587,6 @@ static __device__ __forceinline__ float q5_1_dot(const cuda_q5_1_block *wb,
     return fmaf(dw * dx, (float)(sumi0 + sumi1), mw * sx + acc);
 }
 
-/* ---- Q5_0 ---- */
 __global__ void matmul_q5_0_kernel(const cuda_q5_0_block *__restrict__ w,
                                    const cuda_q8_0_block *__restrict__ xq,
                                    float *__restrict__ y, int n, int k) {
@@ -4129,7 +3658,6 @@ __global__ void matmul_q5_0_batch_kernel(const cuda_q5_0_block *__restrict__ w,
     }
 }
 
-/* ---- Q5_1 ---- */
 __global__ void matmul_q5_1_kernel(const cuda_q5_1_block *__restrict__ w,
                                    const cuda_q8_1_block *__restrict__ xq,
                                    float *__restrict__ y, int n, int k) {
@@ -4201,13 +3729,6 @@ __global__ void matmul_q5_1_batch_kernel(const cuda_q5_1_block *__restrict__ w,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Q5_K: 256 elements, 4 groups of 64, 5-bit values with a 6th bit.    */
-/* Mirrors q5_k_dot() in backend/cpu/scalar/quants.c: per group of 64   */
-/* there are two 32-element halves, each with its own 6-bit scale and   */
-/* min; the min multiplies the Q8_K block sums for that half.           */
-/* ------------------------------------------------------------------ */
-
 static __device__ __forceinline__ void get_scale_min_k4_dev(int j, const uint8_t *q,
                                                              uint8_t *sc, uint8_t *m) {
     if (j < 4) {
@@ -4256,7 +3777,7 @@ static __device__ __forceinline__ float q5_k_dot(const cuda_q5_k_block *blk,
         u1 = (uint8_t)(u1 << 2);
         u2 = (uint8_t)(u2 << 2);
     }
-    /* xd is the Q8_K scale and may legitimately be negative -- do not clamp. */
+
     return fmaf(xb->d, (d * (float)sumi) - (dmin * (float)summ), acc);
 }
 
@@ -4400,10 +3921,6 @@ __constant__ uint32_t cuda_iq3s_grid[512] = {
 
 __constant__ uint8_t cuda_kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
-/* Unpack one IQ3_S block's 256 signed 3-bit magnitudes.
- * Mirrors iq3s_unpack_i8_generic(): 8 groups of 32, each built from two
- * interleaved 4-byte ggml_iq3s_grid lookups whose index carries the high bit
- * from qh, then negated per the sign bit. */
 static __device__ __forceinline__ void iq3s_unpack(const cuda_iq3_s_block *b, int8_t *a) {
     const uint8_t *qs    = b->qs;
     const uint8_t *qh    = b->qh;
@@ -4446,8 +3963,6 @@ static __device__ __forceinline__ void iq3s_unpack(const cuda_iq3_s_block *b, in
     }
 }
 
-/* One block dot: 8 groups of 32, each scaled by its 4-bit scale packed two
- * per byte in scales[4] (sc = 1 + 2*nibble). Mirrors the CPU reference. */
 static __device__ __forceinline__ float iq3_s_dot(const cuda_iq3_s_block *blk,
                                                   const cuda_q8_k_block *xb, float acc) {
     int8_t a[256];
@@ -4539,11 +4054,6 @@ __global__ void matmul_iq3_s_batch_kernel(const cuda_iq3_s_block *__restrict__ w
         }
     }
 }
-
-
-/* ------------------------------------------------------------------ */
-/* Q5_0 / Q5_1 / Q5_K / IQ3_S host-side launchers                       */
-/* ------------------------------------------------------------------ */
 
 extern "C" void cuda_matmul_q5_0(const void *w_dev, const float *x_dev, float *y_dev, int n,
                                  int k, cudaStream_t stream) {
@@ -4637,24 +4147,19 @@ extern "C" void cuda_matmul_iq3_s_residual(const void *w_dev, const float *x_dev
         (const cuda_iq3_s_block *)w_dev, xq, residual_dev, y_dev, n, k);
 }
 
-/* ------------------------------------------------------------------ */
-/* Q6_K host-side launchers                                            */
-/* ------------------------------------------------------------------ */
-
-
 extern "C" void cuda_matmul_q4_k(const void *w_dev, const float *x_dev, float *y_dev, int n, int k,
                                  cudaStream_t stream) {
-    /* Quantize x on the device (Q8_K internally), then run Q4_K matmul. */
+
     cuda_q8_k_block *xq_dev = q8k_scratch_for(k);
     if (!xq_dev)
         return;
     q8_k_quant_kernel<<<(k / 256 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
     if (n == 1) {
-        /* Use MMVQ kernel for M=1 decode. */
+
         matmul_q4_k_mmvq_kernel<<<n, Q4K_MMVQ_NTHREADS, 0, stream>>>(
             (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
-        /* 32 rows/block (8 warps x 4 row-groups). */
+
         dim3 grid((n + MM_ROWS_PER_BLOCK * 4 - 1) / (MM_ROWS_PER_BLOCK * 4));
         matmul_q4_k_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
             (const cuda_q4_k_block *)w_dev, xq_dev, y_dev, n, k);
@@ -4679,7 +4184,6 @@ extern "C" void cuda_matmul_bf16(const uint16_t *w_dev, const float *x_dev, floa
     matmul_bf16_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(w_dev, x_dev, y_dev, n, k);
 }
 
-/* Fused down-projection: y = W (Q8_0) * act(gate, up), act = gelu_tanh(gate)*up. */
 extern "C" void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, const float *up_dev,
                                      float *y_dev, int n, int k, cudaStream_t stream) {
     cuda_q8_0_block *act_q = xq_scratch_for(k);
@@ -4693,7 +4197,6 @@ extern "C" void cuda_matmul_ffn_down(const void *w_dev, const float *gate_dev, c
         (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, 0, 0);
 }
 
-/* Same, for Q4_0 down-weights. */
 extern "C" void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev,
                                         const float *up_dev, float *y_dev, int n, int k,
                                         cudaStream_t stream) {
@@ -4708,7 +4211,6 @@ extern "C" void cuda_matmul_ffn_down_q4(const void *w_dev, const float *gate_dev
         (const cuda_q4_0_block *)w_dev, act_q, y_dev, n, k, 0);
 }
 
-/* Same, for Q4_1 down-weights. */
 extern "C" void cuda_matmul_ffn_down_q4_1(const void *w_dev, const float *gate_dev,
                                           const float *up_dev, float *y_dev, int n, int k,
                                           cudaStream_t stream) {
@@ -4728,19 +4230,13 @@ extern "C" void cuda_matmul_ffn_down_q4_1(const void *w_dev, const float *gate_d
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Multi-column fused matmul                                           */
-/* ------------------------------------------------------------------ */
-
-/* Fused n-column Q8_0 matmul: x is quantized once, all columns run in one
- * kernel over sum(n_list) rows.  w_dev/y_dev are arrays of device pointers. */
 extern "C" void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev,
                                        const int *n_host, const float *x_dev, int nm, int k,
                                        cudaStream_t stream) {
     cuda_q8_0_block *xq = xq_scratch_for(k);
     if (!xq)
         return;
-    /* XQ_QM: multi kernel reads QM x-side (converted below). */
+
     const int use_xqm = 1;
     if (use_xqm)
         q8_0_quant_qm_kernel<<<(unsigned)(k / 32), 32, 0, stream>>>(
@@ -4748,11 +4244,6 @@ extern "C" void cuda_matmul_multi_q8_0(const void *const *w_dev, float *const *y
     else
         q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
 
-    /* By-value descriptor: no shared staging, no async copy. The old
-     * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
-     * deep queue the copy executed after the host had already refilled
-     * the staging for a later call, so kernels intermittently read a
-     * newer/torn descriptor (wrong w/y/n/k -> OOB -> NaN). */
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -4779,11 +4270,6 @@ extern "C" void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y
         return;
     q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq, k);
 
-    /* By-value descriptor: no shared staging, no async copy. The old
-     * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
-     * deep queue the copy executed after the host had already refilled
-     * the staging for a later call, so kernels intermittently read a
-     * newer/torn descriptor (wrong w/y/n/k -> OOB -> NaN). */
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -4801,18 +4287,11 @@ extern "C" void cuda_matmul_multi_q4_0(const void *const *w_dev, float *const *y
     matmul_multi_q4_0_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(desc, xq);
 }
 
-/* Fused RMSNorm + Multi-MatMul launchers. Single kernel does RMSNorm,
- * quantize, and multi-column matmul. Shared memory holds reduction
- * scratch (nt floats) + Q8_0 quantized x (nb blocks). */
 extern "C" void cuda_rmsnorm_matmul_multi_q8_0(const void *const *w_dev, float *const *y_dev,
                                                const int *n_host, const float *x_dev,
                                                const float *norm_w_dev, int nm, int k,
                                                float eps, cudaStream_t stream) {
-    /* By-value descriptor: no shared staging, no async copy. The old
-     * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
-     * deep queue the copy executed after the host had already refilled
-     * the staging for a later call, so kernels intermittently read a
-     * newer/torn descriptor (wrong w/y/n/k -> OOB -> NaN). */
+
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -4838,11 +4317,7 @@ extern "C" void cuda_rmsnorm_matmul_multi_q4_0(const void *const *w_dev, float *
                                                const int *n_host, const float *x_dev,
                                                const float *norm_w_dev, int nm, int k,
                                                float eps, cudaStream_t stream) {
-    /* By-value descriptor: no shared staging, no async copy. The old
-     * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
-     * deep queue the copy executed after the host had already refilled
-     * the staging for a later call, so kernels intermittently read a
-     * newer/torn descriptor (wrong w/y/n/k -> OOB -> NaN). */
+
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -4868,11 +4343,7 @@ extern "C" void cuda_rmsnorm_matmul_multi_q4_1(const void *const *w_dev, float *
                                                const int *n_host, const float *x_dev,
                                                const float *norm_w_dev, int nm, int k,
                                                float eps, cudaStream_t stream) {
-    /* By-value descriptor: no shared staging, no async copy. The old
-     * singleton (g_mm_desc_host + cudaMemcpyAsync) raced the host: with a
-     * deep queue the copy executed after the host had already refilled
-     * the staging for a later call, so kernels intermittently read a
-     * newer/torn descriptor (wrong w/y/n/k -> OOB -> NaN). */
+
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -4893,12 +4364,6 @@ extern "C" void cuda_rmsnorm_matmul_multi_q4_1(const void *const *w_dev, float *
     rmsnorm_matmul_multi_q4_1_kernel<<<grid, nt, shmem, stream>>>(
         desc, x_dev, norm_w_dev, eps);
 }
-
-/* ------------------------------------------------------------------ */
-/* F16 KV Cache Attention (M=1, single query per head)                */
-/* Online softmax matching cpu_attention_inner flash path:            */
-/* ms rescales previous numerator, vs weights current V.              */
-/* ------------------------------------------------------------------ */
 
 __global__ void attn_f16_kernel(const float *__restrict__ q,
                                 const uint16_t *__restrict__ kc,
@@ -4997,12 +4462,6 @@ __global__ void attn_f16_kernel(const float *__restrict__ q,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Tiled Attention for Single-Token Decode                           */
-/* Loads K/V cache in tiles to reduce global memory bandwidth.       */
-/* Uses online softmax (M/S) to accumulate across tiles.             */
-/* ------------------------------------------------------------------ */
-
 __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
                                        const uint16_t *__restrict__ kc,
                                        const uint16_t *__restrict__ vc,
@@ -5018,7 +4477,7 @@ __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
 
     extern __shared__ float smem[];
     float *s_q = smem;
-    /* s_k/s_v were unused; tiles start at 1 * head_dim. */
+
     float *s_k_tile = &smem[1 * head_dim];
     float *s_v_tile = &smem[1 * head_dim + tile_size * head_dim];
 
@@ -5048,13 +4507,10 @@ __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Process K/V cache in tiles */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
 
-        /* Flat half2 vectorized loads (see _g kernel): coalesced,
-         * bit-identical tile contents. */
         {
             int tile_pairs = (tile_len * head_dim) >> 1;
             const __half2 *k2 = (const __half2 *)(kc_head + (size_t)tile_start * head_dim);
@@ -5077,7 +4533,6 @@ __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
         }
         __syncthreads();
 
-        /* Compute attention scores for this tile */
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float *k_tile_row = &s_k_tile[t_local * head_dim];
             const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -5107,7 +4562,6 @@ __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
                 S += vs;
             }
 
-            /* Broadcast M, S, ms, vs across warp */
             {
                 double tmp_M = M, tmp_S = S, tmp_ms = ms, tmp_vs = vs;
                 tmp_M = __shfl_sync(0xffffffff, tmp_M, 0);
@@ -5135,7 +4589,6 @@ __global__ void attn_f16_tiled_kernel(const float *__restrict__ q,
     }
 }
 
-/* F16 KV Cache write for one position */
 __global__ void kv_put_f16_kernel(const float *k_in, const float *v_in,
                                   uint16_t *kd, uint16_t *vd,
                                   int n_kv_heads, int head_dim,
@@ -5160,12 +4613,7 @@ extern "C" void cuda_attn_f16(const float *q_dev, const uint16_t *kc_dev,
                               int n_kv_heads, int head_dim, size_t layer_base_bytes, size_t kvh_stride,
                               int attn_start, int n_pos_total, float scale, cudaStream_t stream) {
     dim3 grid(n_heads);
-    /* Split decode path for longer contexts (fewer barriers, bulk loads).
-     * The tiled kernel handles any n_pos (small sizes = one partial tile).
-     * The reference kernel below is the fallback for other geometries. */
-        /* Split path (FlashDecoding-lite, 8 splits x 8 warps): cures the
-     * long-ctx TG collapse (tiled = 1 warp/row, ~216x off roof).
-     * Enabled for pos>=256 at head_dim 256. */
+
     if (n_pos_total >= 256 && head_dim == 256) {
         cuda_attn_f16_decode_split(q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads,
                                    head_dim, layer_base_bytes, kvh_stride, n_pos_total,
@@ -5174,7 +4622,7 @@ extern "C" void cuda_attn_f16(const float *q_dev, const uint16_t *kc_dev,
     }
     if (n_pos_total >= 256) {
         int tile_size = attn_tile_size(head_dim);
-        /* s_k/s_v removed from tiled kernel (were unused). */
+
         size_t shmem_tiled = (1 * head_dim + 2 * tile_size * head_dim) * sizeof(float);
         size_t layer_base_offset =
             layer_base_bytes + (size_t)attn_start * head_dim * sizeof(uint16_t);
@@ -5194,9 +4642,6 @@ extern "C" void cuda_attn_f16(const float *q_dev, const uint16_t *kc_dev,
     }
 }
 
-/* Batched F16 attention: grid over (row, head). Per-(row,head) math mirrors
- * attn_f16_kernel bit-for-bit (same loop order + warp reductions).
- * sliding_window <= 0 disables the window (full causal prefix). */
 __global__ void attn_f16_batch_kernel(const float *__restrict__ q,
                                       const uint16_t *__restrict__ kc,
                                       const uint16_t *__restrict__ vc,
@@ -5305,13 +4750,6 @@ __global__ void attn_f16_batch_kernel(const float *__restrict__ q,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Tiled Attention with Shared Memory KV Cache                       */
-/* Loads K/V cache in tiles to reduce global memory bandwidth.       */
-/* Uses online softmax (M/S) to accumulate across tiles.             */
-/* ------------------------------------------------------------------ */
-
-
 __global__ void attn_f16_batch_tiled_kernel(const float *__restrict__ q,
                                              const uint16_t *__restrict__ kc,
                                              const uint16_t *__restrict__ vc,
@@ -5364,12 +4802,10 @@ __global__ void attn_f16_batch_tiled_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Process K/V cache in tiles */
     for (int tile_start = 0; tile_start < n_pos_r; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos_r);
         int tile_len = tile_end - tile_start;
 
-        /* Load K tile into shared memory (row-major: s_k_tile[b * head_dim + i] = position b, element i) */
         for (int b = 0; b < tile_len; b++) {
             const int global_b = tile_start + b;
             const uint16_t *k_t = kc_head + (size_t)global_b * head_dim;
@@ -5378,7 +4814,6 @@ __global__ void attn_f16_batch_tiled_kernel(const float *__restrict__ q,
             }
         }
 
-        /* Load V tile into shared memory (row-major: s_v_tile[b * head_dim + i] = position b, element i) */
         for (int b = 0; b < tile_len; b++) {
             const int global_b = tile_start + b;
             const uint16_t *v_t = vc_head + (size_t)global_b * head_dim;
@@ -5388,7 +4823,6 @@ __global__ void attn_f16_batch_tiled_kernel(const float *__restrict__ q,
         }
         __syncthreads();
 
-        /* Compute attention scores for this tile */
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float *k_tile_row = &s_k_tile[t_local * head_dim];
             const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -5418,7 +4852,6 @@ __global__ void attn_f16_batch_tiled_kernel(const float *__restrict__ q,
                 S += vs;
             }
 
-            /* Broadcast M, S, ms, vs across warp */
             {
                 double tmp_M = M, tmp_S = S, tmp_ms = ms, tmp_vs = vs;
                 tmp_M = __shfl_sync(0xffffffff, tmp_M, 0);
@@ -5462,15 +4895,7 @@ extern "C" void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
                                     size_t kvh_stride, int pos_start, int m,
                                     int sliding_window, float scale, cudaStream_t stream) {
     dim3 grid((unsigned)m * (unsigned)n_heads);
-    /* NOTE (measured 2026-09-10): the tiled batch kernel is ~35% SLOWER on
-     * prefill (61 vs 96 t/s) — its ~39KB/block shared footprint caps
-     * occupancy at 1 block/SM vs the lean reference kernel. Keep reference
-     * as default; KAPPAI_ATTN_TILED_BATCH=1 opts into the tiled kernel
-     * (validated correct; platform for future tensor-core attention). */
-    /* Flash Q-tiled kernel (default on; KAPPAI_ATTN_FLASH_BATCH=0
-     * opts out): single-pass, KV shared across rows via smem tiles.
-     * hd=256 + global attention only; SWA and other geometries keep
-     * the reference path. 100% greedy agreement 230+ words. */
+
     if (head_dim == 256 && sliding_window == 0) {
         dim3 grid(((unsigned)m + FLASH_QTILE - 1) / FLASH_QTILE, (unsigned)n_heads);
         size_t shmem = 2 * (size_t)FLASH_KTILE * head_dim * sizeof(__half);
@@ -5493,15 +4918,6 @@ extern "C" void cuda_attn_batch_f16(const float *q_dev, const uint16_t *kc_dev,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Flash prefill attention (F16 KV, global): Q-tile 8 rows x 1 head
- * per block (256 threads = 8 warps, warp-per-row), KV streamed in
- * 16-pos F16 tiles (16KB smem -> 3 blocks/SM). Online softmax per
- * row in regs; Q re-read from global per tile (L2-resident). SWA and
- * Q8KV delegate to the reference kernels. Reordered vs reference
- * (agreement-gated, not bit-exact). */
-/* ------------------------------------------------------------------ */
-
 __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
                                             const uint16_t *__restrict__ kc,
                                             const uint16_t *__restrict__ vc,
@@ -5519,7 +4935,7 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
     int n_kv_groups = n_heads / n_kv_heads;
     int kv_head = h / n_kv_groups;
 
-    int row = qr + warp; /* global query row in batch */
+    int row = qr + warp;
     int row_active = (row < m);
     int n_pos_r = row_active ? pos_start + row + 1 : 0;
 
@@ -5530,8 +4946,6 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
     __half *s_k = smem_flash;
     __half *s_v = smem_flash + (size_t)FLASH_KTILE * head_dim;
 
-    /* Per-row online softmax state + output accumulators (regs).
-     * Fixed 8 elems/lane: launcher restricts this kernel to hd=256. */
     float M = -INFINITY, S = 0.0f;
     float O[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
@@ -5539,16 +4953,13 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Block-max positions for the cooperative load (per-warp bounds
-     * would zero-fill slots longer rows need). Per-row causal bound
-     * stays in the compute loop below. */
     int rmax = qr + FLASH_QTILE - 1;
     if (rmax >= m) rmax = m - 1;
     int n_pos_max = pos_start + rmax + 1;
     int tiles_max = (n_pos_max + FLASH_KTILE - 1) / FLASH_KTILE;
 
     for (int tile = 0; tile < tiles_max; tile++) {
-        /* Cooperative KV tile load (F16). */
+
         for (int i = threadIdx.x; i < FLASH_KTILE * head_dim; i += blockDim.x) {
             int t = i / head_dim, j = i % head_dim;
             int pos = tile * FLASH_KTILE + t;
@@ -5573,13 +4984,7 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
                     int j = lane * 8 + e;
                     score += q_h[j] * __half2float(s_k[(size_t)t * head_dim + j]);
                 }
-                /* Butterfly, not shfl_down: every lane owns O[] for output
-                 * elements [8*lane, 8*lane+8), so all lanes need the SAME
-                 * full dot product to derive the same softmax weights.
-                 * shfl_down leaves the total in lane 0 only, which made each
-                 * lane weight its own slice of head_dim by a softmax over a
-                 * partial sum, and produced garbage whenever a lane's partial
-                 * sum ranked the KV positions differently from the total. */
+
                 for (int off = 16; off > 0; off >>= 1)
                     score += __shfl_xor_sync(0xffffffff, score, off);
                 float raw = score * scale;
@@ -5610,13 +5015,6 @@ __global__ void attn_f16_batch_flash_kernel(const float *__restrict__ q,
             out_h[lane * 8 + e] = O[e] * inv_S;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Q8_0 KV attention: mirrors the F16 kernels (same loop order, warp  */
-/* reductions, FP32/FP64 online softmax) with Q8_0 dequant on load    */
-/* (d * int8, matching CPU dequantize_q8_0_row). kc/vc are byte       */
-/* buffers; kvh_stride/row pitch are in bytes.                        */
-/* ------------------------------------------------------------------ */
 
 #define KV_Q8_0_ATTN_BLK_BYTES 34
 
@@ -5743,7 +5141,7 @@ __global__ void attn_q8_tiled_kernel(const float *__restrict__ q,
 
     extern __shared__ float smem[];
     float *s_q = smem;
-    /* Raw staging (2 x tile_size x row_bytes) then float tiles. */
+
     uint8_t *s_raw_k = (uint8_t *)&smem[1 * head_dim];
     uint8_t *s_raw_v = (uint8_t *)&smem[1 * head_dim] + (size_t)tile_size * row_bytes;
     float *s_k_tile = (float *)((uint8_t *)&smem[1 * head_dim] +
@@ -5775,13 +5173,10 @@ __global__ void attn_q8_tiled_kernel(const float *__restrict__ q,
     const uint8_t *kc_head = kc + layer_base_offset_bytes + (size_t)kv_head * kvh_stride_bytes;
     const uint8_t *vc_head = vc + layer_base_offset_bytes + (size_t)kv_head * kvh_stride_bytes;
 
-    /* Process K/V cache in tiles */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
 
-        /* Stage raw Q8 tile bytes coalesced, then dequantize from shared
-         * (same function/values -> bit-identical tiles). */
         {
             size_t tile_raw = (size_t)tile_len * row_bytes;
             const uint8_t *kbase = kc_head + (size_t)tile_start * row_bytes;
@@ -5802,7 +5197,6 @@ __global__ void attn_q8_tiled_kernel(const float *__restrict__ q,
         }
         __syncthreads();
 
-        /* Compute attention scores for this tile */
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float *k_tile_row = &s_k_tile[t_local * head_dim];
             const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -5832,7 +5226,6 @@ __global__ void attn_q8_tiled_kernel(const float *__restrict__ q,
                 S += vs;
             }
 
-            /* Broadcast M, S, ms, vs across warp */
             {
                 double tmp_M = M, tmp_S = S, tmp_ms = ms, tmp_vs = vs;
                 tmp_M = __shfl_sync(0xffffffff, tmp_M, 0);
@@ -5866,10 +5259,10 @@ extern "C" void cuda_attn_q8(const float *q_dev, const uint8_t *kc_dev,
                               size_t kvh_stride_bytes, int attn_start, int n_pos_total,
                               float scale, int n_blocks, cudaStream_t stream) {
     dim3 grid(n_heads);
-    /* Same tiling policy as cuda_attn_f16. */
+
     if (n_pos_total >= 256) {
         int tile_size = attn_tile_size(head_dim);
-        /* s_q + raw Q8 staging (2 x tile x row_bytes) + float tiles. */
+
         size_t row_bytes_q = (size_t)n_blocks * KV_Q8_0_ATTN_BLK_BYTES;
         size_t shmem = (size_t)head_dim * sizeof(float) +
                        2 * (size_t)tile_size * row_bytes_q +
@@ -5892,9 +5285,6 @@ extern "C" void cuda_attn_q8(const float *q_dev, const uint8_t *kc_dev,
     }
 }
 
-/* Batched Q8_0 attention: grid over (row, head). Per-(row,head) math
- * mirrors attn_q8_kernel (same loop order + warp reductions).
- * sliding_window <= 0 disables the window (full causal prefix). */
 __global__ void attn_q8_batch_kernel(const float *__restrict__ q,
                                       const uint8_t *__restrict__ kc,
                                       const uint8_t *__restrict__ vc,
@@ -6012,8 +5402,7 @@ extern "C" void cuda_attn_batch_q8(const float *q_dev, const uint8_t *kc_dev,
                                     int sliding_window, float scale, int n_blocks,
                                     cudaStream_t stream) {
     dim3 grid((unsigned)m * (unsigned)n_heads);
-    /* Reference kernel only: mirrors the default cuda_attn_batch_f16 path
-     * (it is slower on prefill). */
+
     size_t shmem = 3 * head_dim * sizeof(float);
     attn_q8_batch_kernel<<<grid, 32, shmem, stream>>>(
         q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads, head_dim,
@@ -6081,10 +5470,6 @@ extern "C" void cuda_kv_alloc_f16(uint16_t **kd_out, uint16_t **vd_out, size_t s
     cudaMallocAsync((void**)vd_out, bytes, stream);
 }
 
-/* ------------------------------------------------------------------ */
-/* add_inplace: x[i] += y[i]                                         */
-/* ------------------------------------------------------------------ */
-
 __global__ void add_inplace_kernel(float *x, const float *y, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n)
@@ -6108,15 +5493,6 @@ extern "C" void cuda_scale_inplace(float *x_dev, float scale, int n, cudaStream_
     scale_inplace_kernel<<<grid, block, 0, stream>>>(x_dev, scale, n);
 }
 
-/* ------------------------------------------------------------------ */
-/* softcap: x[i] = cap * tanh(x[i] / cap)                               */
-/* attn_output_gate: out[i] *= sigmoid(gate[i])                        */
-/* split_qgate: per head, q=src[0:hd], gate=src[hd:2*hd]               */
-/* (host fallbacks for these dereference the buffer as host memory, so   */
-/*  a device backend must implement them natively -- OP_BACKEND only    */
-/*  reroutes, it does not stage.)                                       */
-/* ------------------------------------------------------------------ */
-
 __global__ void softcap_kernel(float *x, float cap, float inv_cap, long long n) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = cap * tanhf(x[i] * inv_cap);
@@ -6134,11 +5510,6 @@ __global__ void attn_output_gate_kernel(float *o, const float *g, long long n) {
     if (i < n) o[i] *= 1.0f / (1.0f + expf(-g[i]));
 }
 
-/* partial_rope_qk: neox rope over the first rope_dim dims only, batched.
- * The host reference (rope_rotate_neox) indexes the tables at
- * (pos_start + row) * (rope_dim/2), so the tables must be built with row
- * width rope_dim/2 -- not head_dim/2. Neox unconditionally, matching the
- * host implementation of this op. */
 __global__ void partial_rope_kernel(float *vec, int n_heads, int head_dim, int rope_dim,
                                     const float *cos_base, const float *sin_base,
                                     int pos_start, int n_rows) {
@@ -6203,25 +5574,16 @@ extern "C" void cuda_split_qgate(const float *mixed_dev, float *q_dev, float *ga
                                                              q_out, total);
 }
 
-/* ------------------------------------------------------------------ */
-/* ffn_activate: out[i] = silu(gate[i]) * up[i]  (SwiGLU)            */
-/*               out[i] = gelu(gate[i]) * up[i]  (GELU)              */
-/* ------------------------------------------------------------------ */
-
 __device__ __forceinline__ float silu_f32(float x) {
     return x / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ float gelu_tanh_f32(float x) {
-    const float c  = 0.7978845608028654f; /* sqrt(2/pi) */
+    const float c  = 0.7978845608028654f;
     const float x3 = x * x * x;
     return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x3)));
 }
 
-/* moe_activate: act = act_fn(gate*gate_scale) * (up*up_scale), where
- * act_fn is silu or the tanh gelu. Same math as the host reference
- * (moe_activate_silu / moe_activate_gelu), so results match bit-for-bit up
- * to the usual device/host transcendental rounding. */
 __global__ void moe_activate_kernel(const float *gate, const float *up, float *out, long long n,
                                     float gate_scale, float up_scale, int use_gelu) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -6288,10 +5650,6 @@ __global__ void add_batch_kernel(float *x, const float *y, int n, int m) {
     x[idx] += y[idx];
 }
 
-/* Fused batched FFN activation over a pre-interleaved buffer: the engine
- * stages gate and up side by side with stride 2n per row, so this reads
- * fused[r*2n + j] and fused[r*2n + n + j] and writes out[r*n + j].
- * Matches ffn_activate_ex_rows() in src/recipe.c and the OpenGL shader. */
 __global__ void ffn_activate_fused_batch_kernel(const float *fused, float *out, int n,
                                                  int activation, int m) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6322,13 +5680,6 @@ extern "C" void cuda_add_batch(float *x_dev, const float *y_dev, int n, int m, c
     int grid = (total + block - 1) / block;
     add_batch_kernel<<<grid, block, 0, stream>>>(x_dev, y_dev, n, m);
 }
-
-/* ------------------------------------------------------------------ */
-/* rope_ext: RoPE rotation using precomputed cos/sin tables           */
-/*   Standard: vh[2j], vh[2j+1] = v0*c - v1*s, v0*s + v1*c         */
-/*   NEOX:    vh[j], vh[j+half] = v0*c - v1*s, v0*s + v1*c          */
-/* cos_tbl/sin_tbl are DEVICE pointers to this position's tables.    */
-/* ------------------------------------------------------------------ */
 
 __global__ void rope_ext_kernel(float *vec, int n_heads, int head_dim,
                                 const float *cos_tbl, const float *sin_tbl,
@@ -6364,7 +5715,7 @@ extern "C" void cuda_rope_ext(float *vec_dev, int n_heads, int head_dim, int pos
     int total = n_heads * half;
     int block = 256;
     int grid = (total + block - 1) / block;
-    /* cos/sin tables are already on device (cached in cuda_priv). */
+
     const float *cos_tbl = rope_cos_dev + (size_t)pos * half;
     const float *sin_tbl = rope_sin_dev + (size_t)pos * half;
     rope_ext_kernel<<<grid, block, 0, stream>>>(vec_dev, n_heads, head_dim,
@@ -6428,16 +5779,6 @@ extern "C" void cuda_rope_qk_batch(float *q_dev, float *k_dev, int n_heads, int 
                                                         rope_cos_base, rope_sin_base,
                                                         pos_start, m, neox);
 }
-
-/* ------------------------------------------------------------------ */
-/* embd_lookup: dequantize one row from embedding table               */
-/*   F32:  out[i] = embd[token*dim + i]                              */
-/*   F16:  out[i] = half2float(embd[token*dim + i])                  */
-/*   BF16: out[i] = bf16_to_f32(embd[token*dim + i])                 */
-/*   Q8_0: dequant block-wise: out[i] = scale * quant[i]             */
-/*   Q4_0: dequant block-wise, matching CPU low-nibble-first order:  */
-/*         out[0..15] from low nibbles, out[16..31] from high nibbles */
-/* ------------------------------------------------------------------ */
 
 __global__ void embd_lookup_f32_kernel(const float *embd, float *out, int token, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6528,9 +5869,6 @@ extern "C" void cuda_embd_lookup_q4_0(const cuda_q4_0_block *embd_dev, float *ou
     embd_lookup_q4_0_kernel<<<grid, block, 0, stream>>>(embd_dev, out_dev, token, dim);
 }
 
-/* Q4_K embedding lookup: dequantize one row (dim floats) on device.
- * Element order mirrors CPU dequant_q4_k_row (same op order per element)
- * so device output matches the host fallback bit-exactly. */
 __global__ void embd_lookup_q4_k_kernel(const cuda_q4_k_block *embd, float *out,
                                         int token, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6574,7 +5912,7 @@ __global__ void embd_lookup_q4_k_g_kernel(const cuda_q4_k_block *embd, float *ou
 
 extern "C" void cuda_embd_lookup_q4_k_g(const cuda_q4_k_block *embd_dev, float *out_dev,
                                         int dim, const int *params_dev, cudaStream_t stream) {
-    
+
     int block = 256;
     int grid = (dim + block - 1) / block;
     embd_lookup_q4_k_g_kernel<<<grid, block, 0, stream>>>(
@@ -6588,11 +5926,6 @@ extern "C" void cuda_embd_lookup_q4_k(const cuda_q4_k_block *embd_dev, float *ou
     embd_lookup_q4_k_kernel<<<grid, block, 0, stream>>>(embd_dev, out_dev, token, dim);
 }
 
-/* ------------------------------------------------------------------ */
-/* argmax: find index of maximum value in float array                  */
-/* Uses warp reduction for efficient parallel reduction.               */
-/* ------------------------------------------------------------------ */
-
 __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *out_idx) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -6600,7 +5933,6 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *
     float local_max = -INFINITY;
     int32_t local_idx = 0;
 
-    /* Each thread scans elements with stride */
     for (int i = tid; i < n; i += stride) {
         float val = logits[i];
         if (val > local_max) {
@@ -6609,7 +5941,6 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *
         }
     }
 
-    /* Warp reduction: find max and index within each warp */
     for (int off = 16; off > 0; off >>= 1) {
         float other_max = __shfl_down_sync(0xffffffff, local_max, off);
         int32_t other_idx = __shfl_down_sync(0xffffffff, local_idx, off);
@@ -6619,7 +5950,6 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *
         }
     }
 
-    /* Shared memory for cross-warp reduction */
     __shared__ float smax[32];
     __shared__ int32_t sidx[32];
     int warp_id = tid >> 5;
@@ -6631,7 +5961,6 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *
     }
     __syncthreads();
 
-    /* Final reduction in first warp */
     if (warp_id == 0) {
         int nw = (blockDim.x + 31) / 32;
         float val = (lane < nw) ? smax[lane] : -INFINITY;
@@ -6651,22 +5980,12 @@ __global__ void argmax_kernel(const float *__restrict__ logits, int n, int32_t *
 
 extern "C" void cuda_argmax(const float *logits_dev, int n, int32_t *out_idx_dev,
                              cudaStream_t stream) {
-    /* Use single block with enough threads to cover vocab size.
-     * 1024 threads covers vocab up to ~1M elements. */
+
     int block = 1024;
     if (n < block) block = n;
     argmax_kernel<<<1, block, 0, stream>>>(logits_dev, n, out_idx_dev);
 }
 
-/* ================================================================== */
-/* True batched matmul (prefill): M input rows x N outputs in ONE     */
-/* launch. Per (tok,row) math mirrors the single-row DP4A kernels     */
-/* bit-for-bit (same lane loop + warp reduction order).               */
-/* ================================================================== */
-
-/* Batched Q8_1 quantization: Q5_1 needs the per-block `s` offset, so it
- * cannot reuse the Q8_0 batch quantizer. Mirrors q8_0_quant_batch_kernel's
- * row/flat-block indexing, and stores s = fp16(d * sum) like quantize_q8_1. */
 __global__ void q8_1_quant_rows_kernel(const float *__restrict__ x,
                                        cuda_q8_1_block *__restrict__ xq,
                                        int k, int m) {
@@ -6739,7 +6058,6 @@ __global__ void q8_0_quant_batch_kernel(const float *__restrict__ x,
     }
 }
 
-
 __global__ void matmul_q8_0_dp4a_batch_kernel(const cuda_q8_0_block *__restrict__ w,
                                               const cuda_q8_0_block *__restrict__ xq,
                                               float *__restrict__ y, int n, int k, int m) {
@@ -6751,9 +6069,6 @@ __global__ void matmul_q8_0_dp4a_batch_kernel(const cuda_q8_0_block *__restrict_
     const cuda_q8_0_block *wrow = w + (size_t)row * nb;
     const uint8_t *wrow8 = (const uint8_t *)wrow;
 
-    /* Token tiling: each weight block is loaded once and reused across
-     * a tile of tokens. Per-(tok,row) fmaf order matches the single-row
-     * kernel bit-for-bit. */
     for (int t0 = 0; t0 < m; t0 += MM_TOK_TILE) {
         const int nt = min(MM_TOK_TILE, m - t0);
         float acc[MM_TOK_TILE];
@@ -6873,7 +6188,7 @@ __global__ void matmul_q4_1_dp4a_batch_kernel(const cuda_q4_1_block *__restrict_
             #pragma unroll
             for (int j = 0; j < 16; j++)
                 wqb[j] = wb->qs[j];
-            /* Weight dequant is token-independent: hoist out of t-loop. */
+
             int8_t wdeq[32];
             #pragma unroll
             for (int j = 0; j < 16; j++) {
@@ -6971,7 +6286,6 @@ static cuda_q8_0_block *xq_scratch_for_batch(int k, int m) {
     return g_xq_scratch;
 }
 
-/* FP16 x scratch for the shadow path (grow-only, like xq scratch). */
 static __half *g_xf_scratch = nullptr;
 static size_t g_xf_cap = 0;
 static __half *xf_scratch_for_batch(int k, int m) {
@@ -6988,7 +6302,6 @@ static __half *xf_scratch_for_batch(int k, int m) {
     return g_xf_scratch;
 }
 
-/* FP16 W scratch for on-demand dequant (grow-only, bytes). */
 static void *g_wf_scratch = nullptr;
 static size_t g_wf_cap = 0;
 static void *wf_scratch_for(size_t need) {
@@ -7004,22 +6317,14 @@ static void *wf_scratch_for(size_t need) {
     return g_wf_scratch;
 }
 
-/* On-demand FP16 batch GEMM: default ON (opt-out KAPPAI_BATCH_FP16=0).
- * 100% greedy agreement over 300+ words both quants, suite + model-mode
- * green; ~2x prefill PP. */
 static int batch_fp16_enabled(void) {
     return 1;
 }
 
-/* Pure-FP16 batch GEMM impl: x F32->F16 once, then WMMA (no dequant).
- * Shared by the shadow entry and the on-demand dequant path. */
 #ifdef HAVE_CUBLAS
-/* Lazy cuBLAS handle (S31): created on first batch-GEMM use. Requires
- * the WSL libcuda bind fix at link time (Makefile); without it
- * cublasCreate fails and we stay on the WMMA path. KAPPAI_NO_CUBLAS=1
- * disables. Single-stream use (matches priv->stream lifetime). */
+
 static cublasHandle_t g_cublas_h = nullptr;
-static int g_cublas_state = 0; /* 0=uninit, 1=ready, -1=dead */
+static int g_cublas_state = 0;
 static void *g_cublas_ws = nullptr;
 static size_t g_cublas_ws_cap = 0;
 
@@ -7031,16 +6336,9 @@ static cublasHandle_t cublas_for(cudaStream_t stream) {
             g_cublas_state = -1;
             return nullptr;
         }
-        /* Strict F32 math (NOT TF32): our inputs are F16 with F32
-         * accumulate (HMMA); TF32 mode lets heuristics pick TF32
-         * kernels (10-bit mantissa) on large-k shapes, breaking
-         * agreement. llama uses TF32 because ITS cublas path serves
-         * F32 weights; ours never does. */
+
         cublasSetMathMode(g_cublas_h, CUBLAS_DEFAULT_MATH);
-        /* Heuristic workspace (mirrors llama: 4MB pre-Hopper). Some
-         * shapes select workspace-needing kernels; without it they
-         * silently misbehave. Grew on demand; never inside capture
-         * (prefill/decode-batch callers are capture-free). */
+
         size_t need = (size_t)4 * 1024 * 1024;
         if (cudaMalloc(&g_cublas_ws, need) != cudaSuccess) {
             g_cublas_state = -1;
@@ -7067,12 +6365,7 @@ static void matmul_batch_fp16_impl(const __half *w_fp16, const float *x_dev, flo
     fp16_copy_batch_kernel<<<(total + 255) / 256, 256, 0, stream>>>(x_dev, xf, k, m);
 
 #ifdef HAVE_CUBLAS
-    /* cuBLAS HMMA path (S31, default when linked): Y[m][n] row-major is
-     * C(n x m) col-major = W^T(n x k) . X^T(k x m), with Wf(n x k RM) /
-     * Xf(m x k RM) read as col-major (k x n)/(k x m), LDA=k/LDB=k/LDC=n.
-     * F16 rounding class (same as WMMA path) -> agreement-gated, not
-     * bit-exact. KAPPAI_CUBLAS_GEMM=0 forces the WMMA kernel. Falls
-     * through to WMMA on any cuBLAS error. */
+
     if (1) {
         cublasHandle_t ch = cublas_for(stream);
         if (ch) {
@@ -7103,9 +6396,7 @@ extern "C" void cuda_matmul_batch_fp16(const void *w_in, const float *x_dev, flo
 extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, float *y_dev,
                                         int n, int k, int m, cudaStream_t stream) {
     const int nb = k / 32;
-    /* On-demand FP16 path (KAPPAI_BATCH_FP16=1): dequant W once to
-     * scratch, then pure WMMA (no in-loop dequant). Inexact arithmetic
-     * (agreement-gated). */
+
     if (batch_fp16_enabled() && m >= 16 && n >= 32) {
         __half *wf = (__half *)wf_scratch_for((size_t)n * k * sizeof(__half));
         if (!wf) return;
@@ -7121,8 +6412,6 @@ extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, fl
     int qgrid = (m * nb + qblock - 1) / qblock;
     q8_0_quant_batch_kernel<<<qgrid, qblock, 0, stream>>>(x_dev, xq, k, m);
 
-    /* Use tensor cores for larger batch sizes (M >= 16).
-     * KAPPAI_BATCH_NO_WMMA=1 forces the DP4A path (tuning/debug). */
     if (m >= 16 && n >= 32) {
         dim3 grid((m + WMMA_COLS_PER_BLOCK - 1) / WMMA_COLS_PER_BLOCK,
                   (n + WMMA_ROWS_PER_BLOCK - 1) / WMMA_ROWS_PER_BLOCK);
@@ -7140,7 +6429,7 @@ extern "C" void cuda_matmul_batch_q8_0(const void *w_dev, const float *x_dev, fl
 extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, float *y_dev,
                                         int n, int k, int m, cudaStream_t stream) {
     const int nb = k / 32;
-    /* On-demand FP16 path (see Q8_0 launcher). */
+
     if (batch_fp16_enabled() && m >= 16 && n >= 32) {
         __half *wf = (__half *)wf_scratch_for((size_t)n * k * sizeof(__half));
         if (!wf) return;
@@ -7156,8 +6445,6 @@ extern "C" void cuda_matmul_batch_q4_0(const void *w_dev, const float *x_dev, fl
     int qgrid = (m * nb + qblock - 1) / qblock;
     q8_0_quant_batch_kernel<<<qgrid, qblock, 0, stream>>>(x_dev, xq, k, m);
 
-    /* Use tensor cores for larger batch sizes (M >= 16).
-     * KAPPAI_BATCH_NO_WMMA=1 forces the DP4A path (tuning/debug). */
     if (m >= 16 && n >= 32) {
         dim3 grid((m + WMMA_COLS_PER_BLOCK - 1) / WMMA_COLS_PER_BLOCK,
                   (n + WMMA_ROWS_PER_BLOCK - 1) / WMMA_ROWS_PER_BLOCK);
@@ -7191,12 +6478,6 @@ extern "C" void cuda_matmul_batch_f32(const float *w_dev, const float *x_dev, fl
     matmul_f32_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         w_dev, x_dev, y_dev, n, k, m);
 }
-
-/* ================================================================== */
-/* True batched Q4_K / F16 / BF16 matmul. Same token-tiling + warp    */
-/* reduction order as the Q8_0/Q4_0/Q4_1/F32 batch kernels above, so  */
-/* per-(tok,row) math matches the single-row kernels bit-for-bit.    */
-/* ================================================================== */
 
 __global__ void q8_k_quant_batch_kernel(const float *__restrict__ x,
                                         cuda_q8_k_block *__restrict__ xq,
@@ -7384,15 +6665,6 @@ extern "C" void cuda_matmul_batch_q4_k(const void *w_dev, const float *x_dev, fl
         (const cuda_q4_k_block *)w_dev, xq, y_dev, n, k, m);
 }
 
-/* ------------------------------------------------------------------ */
-/* Multi-column batched matmul (Q4_0/Q8_0 weights, Q8_0 activations).  */
-/* Merges the warp-per-(col,row) mapping of the single multi kernels  */
-/* with the MM_TOK_TILE token loop of the dp4a batch kernels: one x   */
-/* quantize + one GEMM launch for all columns instead of one pair     */
-/* per column. Element order mirrors the per-column batch kernels,    */
-/* so output is bit-identical to the decomposed path.                 */
-/* ------------------------------------------------------------------ */
-
 __global__ void matmul_multi_q4_0_batch_kernel(const mm_multi_desc d,
                                                const cuda_q8_0_block *__restrict__ xq,
                                                int m) {
@@ -7529,7 +6801,7 @@ extern "C" void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *co
                                              const int *n_host, const float *x_dev, int nm, int k,
                                              int m, const float *resid_dev, cudaStream_t stream) {
     const int nb = k / 32;
-    /* On-demand FP16 path (see Q8_0 launcher). */
+
     if (batch_fp16_enabled() && !resid_dev && m >= 16) {
         size_t total_need = 0;
         for (int c = 0; c < nm; c++)
@@ -7555,7 +6827,6 @@ extern "C" void cuda_matmul_multi_batch_q4_0(const void *const *w_dev, float *co
     int qgrid = (m * nb + qblock - 1) / qblock;
     q8_0_quant_batch_kernel<<<qgrid, qblock, 0, stream>>>(x_dev, xq, k, m);
 
-    /* By-value descriptor (see single-path launchers): no shared staging. */
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -7578,12 +6849,9 @@ extern "C" void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *co
                                              const int *n_host, const float *x_dev, int nm, int k,
                                              int m, const float *resid_dev, cudaStream_t stream) {
     const int nb = k / 32;
-    /* On-demand FP16 path: dequant each column to scratch segments,
-     * then per-column pure WMMA (xf converted once inside impl).
-     * resid unsupported on this path (falls through below). */
+
     if (batch_fp16_enabled() && !resid_dev && m >= 16) {
-        /* Pre-grow once: realloc between column launches would free
-         * memory still referenced by queued kernels. */
+
         size_t total_need = 0;
         for (int c = 0; c < nm; c++)
             total_need += (size_t)n_host[c] * k * sizeof(__half);
@@ -7608,7 +6876,6 @@ extern "C" void cuda_matmul_multi_batch_q8_0(const void *const *w_dev, float *co
     int qgrid = (m * nb + qblock - 1) / qblock;
     q8_0_quant_batch_kernel<<<qgrid, qblock, 0, stream>>>(x_dev, xq, k, m);
 
-    /* By-value descriptor (see single-path launchers): no shared staging. */
     mm_multi_desc desc;
     if (nm < 1 || nm > 8)
         return;
@@ -7640,15 +6907,6 @@ extern "C" void cuda_matmul_batch_bf16(const uint16_t *w_dev, const float *x_dev
     matmul_bf16_batch_kernel<<<grid, MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         w_dev, x_dev, y_dev, n, k, m);
 }
-
-/* ------------------------------------------------------------------ */
-/* ple_combine: ple[i] = (ple[i] + proj[i]) * scale (matches CPU)     */
-/* ple_norm_batch: RMSNorm over strided slices for PLE build.         */
-/*   proj layout is [n_rows][n_layers][n_embd] packed with stride      */
-/*   total_ple = n_layers * n_embd; one block per (row, layer) slice  */
-/*   normalizes n_embd elems at row*total_ple + l*n_embd with a        */
-/*   shared n_embd weight vector (broadcast, like per-head norm).     */
-/* ------------------------------------------------------------------ */
 
 __global__ void ple_combine_kernel(float *__restrict__ ple, const float *__restrict__ proj,
                                    int n, float scale) {
@@ -7702,13 +6960,6 @@ extern "C" void cuda_ple_norm_batch(float *proj_dev, const float *norm_w_dev, in
         proj_dev, norm_w_dev, n_rows, total_ple, n_embd, n_layers, eps);
 }
 
-/* ------------------------------------------------------------------ */
-/* Decode-graph (_g) kernel variants: pos/token/n_pos come from a     */
-/* device-resident params struct, so a captured decode graph replays  */
-/* without per-step node updates. Bodies mirror the base kernels      */
-/* exactly (same op order); only index sources differ.                */
-/* ------------------------------------------------------------------ */
-
 __global__ void rope_ext_g_kernel(float *vec, int n_heads, int head_dim,
                                   const float *cos_base, const float *sin_base,
                                   const cuda_decode_params *dp, int neox) {
@@ -7741,7 +6992,7 @@ __global__ void rope_ext_g_kernel(float *vec, int n_heads, int head_dim,
 extern "C" void cuda_rope_ext_g(float *vec_dev, int n_heads, int head_dim,
                                 const float *cos_base, const float *sin_base,
                                 const int *params_dev, int neox, cudaStream_t stream) {
-    
+
     int half = head_dim / 2;
     int total = n_heads * half;
     int block = 256;
@@ -7765,7 +7016,6 @@ __global__ void attn_f16_g_kernel(const float *__restrict__ q,
 
     if (h >= n_heads) return;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -7860,9 +7110,6 @@ __global__ void attn_f16_g_kernel(const float *__restrict__ q,
     }
 }
 
-/* Tiled graph attention: params-based n_pos/window (mirrors _g window
- * math) + FP64 tiled online softmax (mirrors tiled kernel). Handles any
- * n_pos (small sizes run as a single partial tile). */
 __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
                                         const uint16_t *__restrict__ kc,
                                         const uint16_t *__restrict__ vc,
@@ -7877,7 +7124,6 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
 
     if (h >= n_heads) return;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -7890,16 +7136,13 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
 
     extern __shared__ float smem[];
     float *s_q = smem;
-    /* s_k/s_v were unused; tiles start at 1 * head_dim (launcher shmem
-     * reduced accordingly). */
+
     float *s_k_tile = &smem[1 * head_dim];
     float *s_v_tile = &smem[1 * head_dim + tile_size * head_dim];
 
     int n_kv_groups = n_heads / n_kv_heads;
     int kv_head = h / n_kv_groups;
 
-    /* Chunked (not strided) partitioning: consecutive threads read
-     * consecutive elements -> coalesced global loads. Same values. */
     const float *q_h = q + (size_t)h * head_dim;
     {
         int chunk = (head_dim + blockDim.x - 1) / blockDim.x;
@@ -7922,15 +7165,10 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Process K/V cache in tiles */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
 
-        /* Load K/V tiles into shared memory (row-major). Flat half2
-         * vectorized loads: consecutive threads read consecutive pairs ->
-         * fully coalesced. head_dim is even in practice (guarded); pairs
-         * never cross rows, so tile contents are bit-identical. */
         {
             int tile_pairs = (tile_len * head_dim) >> 1;
             const __half2 *k2 = (const __half2 *)(kc_head + (size_t)tile_start * head_dim);
@@ -7955,7 +7193,6 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
         }
         __syncthreads();
 
-        /* Compute attention scores for this tile */
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float *k_tile_row = &s_k_tile[t_local * head_dim];
             const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -7985,7 +7222,6 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
                 S += vs;
             }
 
-            /* Broadcast M, S, ms, vs across warp */
             {
                 double tmp_M = M, tmp_S = S, tmp_ms = ms, tmp_vs = vs;
                 tmp_M = __shfl_sync(0xffffffff, tmp_M, 0);
@@ -8013,13 +7249,6 @@ __global__ void attn_f16_tiled_g_kernel(const float *__restrict__ q,
     }
 }
 
-/* GQA-grouped tiled graph attention: one block handles Qq queries sharing
- * a KV head, loading each K/V tile ONCE (vs once per query head). Per-warp
- * math mirrors attn_f16_tiled_g_kernel exactly (same loop order, same
- * warp-relative partitioning) -> bit-identical outputs. Warp count =
- * 32 * Qq threads; inactive warps (tail qb) still join tile loads/syncs.
- * Traffic saving = Qq x on K/V (up to G = n_heads / n_kv_heads); parallelism
- * drops by the same factor, so this wins where DRAM-bound (long ctx). */
 __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
                                             const uint16_t *__restrict__ kc,
                                             const uint16_t *__restrict__ vc,
@@ -8033,7 +7262,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
     const int lane = tid & 31;
     const int w = tid >> 5;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -8057,7 +7285,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
     float *s_k_tile = &smem[(size_t)n_queries * head_dim];
     float *s_v_tile = &smem[(size_t)n_queries * head_dim + tile_size * head_dim];
 
-    /* Each warp loads its own query row (chunked, as in _g kernel). */
     float *s_qw = s_q + (size_t)w * head_dim;
     if (active) {
         const float *q_h = q + (size_t)h * head_dim;
@@ -8070,8 +7297,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
     }
     __syncthreads();
 
-    /* Float (not double) softmax state: matches reference precision;
-     * double exp() costs ~2x here. */
     float M = -INFINITY;
     float S = 0.0f;
 
@@ -8083,7 +7308,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Process K/V cache in tiles (loaded once per block, shared by group) */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
@@ -8111,7 +7335,7 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
         __syncthreads();
 
         if (active) {
-            /* Compute attention scores for this tile */
+
             for (int t_local = 0; t_local < tile_len; t_local++) {
                 const float *k_tile_row = &s_k_tile[t_local * head_dim];
                 const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -8141,7 +7365,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
                     S += vs;
                 }
 
-                /* Broadcast M, S, ms, vs across warp */
                 M = __shfl_sync(0xffffffff, M, 0);
                 S = __shfl_sync(0xffffffff, S, 0);
                 ms = __shfl_sync(0xffffffff, ms, 0);
@@ -8166,14 +7389,6 @@ __global__ void attn_f16_tiled_gqa_g_kernel(const float *__restrict__ q,
     }
 }
 
-/* Cooperative decode attention (F16 KV, global, hd=256): 8 warps share
- * ONE query row (warp w owns dims [32w, 32w+32)), KV streamed in 16-pos
- * F16 tiles. Per-row M/S replicated per thread (no sharing); only the
- * 8 warp-partial dots reduce through smem (1 sync/position). Fixes the
- * 1-warp-per-row starvation (0.3% occupancy) of the tiled kernel at a
- * cost of 8x dot replication... no: dots SPLIT across warps (each warp
- * 32 dims), reductions shared. Reordered vs reference (agreement-gated).
- * SWA delegates (sliding_window != 0 falls through to tiled kernel). */
 #define COOP_QTILE 16
 
 __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
@@ -8187,7 +7402,7 @@ __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
     const int h = blockIdx.x;
     if (h >= n_heads) return;
     int n_pos = params_dev ? params_dev[1] : 0;
-    /* SWA windowing on-device (mirrors cuda_op_attention_swa). */
+
     size_t layer_base = layer_base_bytes / sizeof(uint16_t);
     if (sliding_window > 0 && n_pos > sliding_window) {
         layer_base += (size_t)(n_pos - sliding_window) * head_dim;
@@ -8200,7 +7415,6 @@ __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
     int n_kv_groups = n_heads / n_kv_heads;
     int kv_head = h / n_kv_groups;
 
-    /* One query row (decode): Q shared by all warps (L2). */
     const float *q_h = q + (size_t)h * head_dim;
 
     extern __shared__ char smem_coop[];
@@ -8209,7 +7423,7 @@ __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
     __shared__ float s_sum[8];
 
     float M = -INFINITY, S = 0.0f, O = 0.0f;
-    /* This thread's single dim. */
+
     int j = warp * 32 + lane;
     float qv = (j < head_dim) ? q_h[j] : 0.0f;
 
@@ -8231,13 +7445,13 @@ __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
             float score = qv * __half2float(s_k[(size_t)t * head_dim + j]);
             for (int off = 16; off > 0; off >>= 1)
                 score += __shfl_down_sync(0xffffffff, score, off);
-            /* Warp partials -> smem -> sum (8 values). */
+
             if (lane == 0) s_sum[warp] = score;
             __syncthreads();
             float tot = 0.0f;
             #pragma unroll
             for (int w = 0; w < 8; w++) tot += s_sum[w];
-            /* Softmax state in lane 0, broadcast (saves 31/32 exps). */
+
             float a = 1.0f, b = 1.0f;
             if (lane == 0) {
                 float raw = tot * scale;
@@ -8263,14 +7477,6 @@ __global__ void attn_f16_decode_coop_kernel(const float *__restrict__ q,
         out[(size_t)h * head_dim + j] = O * inv_S;
 }
 
-/* Split decode attention (F16 KV, eager path): FlashDecoding-lite for the
- * long-context TG collapse (eager tiled kernel = 1 block x 1 warp per
- * head: ~3.7ms/layer at 1k pos = 216x off roof; 35 layers x 2.5us/pos
- * = ~87ms/token). Grid = n_heads x S splits; each block streams its
- * position chunk with the same float online-softmax order as the coop
- * kernel, writes (M, S, O_row) partials; combiner rescales. Reordered
- * across chunks (ulp-level, tolerance-gated like split-K). Caller
- * pre-offsets SWA into layer_base (mirrors cuda_attn_f16 eager use). */
 #define DEC_SPLIT_S 8
 
 static float *g_attn_dec_split = nullptr;
@@ -8321,7 +7527,6 @@ __global__ void attn_f16_decode_split_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* This split's chunk (empty splits write identity partials). */
     int c0 = (int)((int64_t)s * n_pos / n_splits);
     int c1 = (int)((int64_t)(s + 1) * n_pos / n_splits);
 
@@ -8365,7 +7570,6 @@ __global__ void attn_f16_decode_split_kernel(const float *__restrict__ q,
         __syncthreads();
     }
 
-    /* Partial layout per (h, s): [M, S, O(head_dim)]. */
     float *p = partials + ((size_t)h * n_splits + s) * (head_dim + 2);
     if (tid == 0) {
         p[0] = M;
@@ -8383,14 +7587,13 @@ __global__ void attn_f16_combine_kernel(const float *__restrict__ partials,
     const int lane = tid & 31;
     const int warp = tid >> 5;
 
-    /* Global max over splits (8 values, lane 0 of each warp reads). */
     float gM = -INFINITY;
     for (int s = 0; s < n_splits; s++) {
         const float *p = partials + ((size_t)h * n_splits + s) * (head_dim + 2);
         float m = p[0];
         gM = m > gM ? m : gM;
     }
-    /* Combine: sum_s exp(M_s - gM) * (S_s, O_s). */
+
     int j = warp * 32 + lane;
     float accS = 0.0f, accO = 0.0f;
     for (int s = 0; s < n_splits; s++) {
@@ -8423,16 +7626,10 @@ extern "C" void cuda_attn_f16_decode_split(const float *q_dev, const uint16_t *k
         ERROR("cuda: decode-split attn launch failed: %s", cudaGetErrorString(cerr));
 }
 
-/* Capture-safe pre-grow for the split scratch (cudaMalloc aborts graph
- * capture; called from graph_prepare_capture, outside any capture). */
 extern "C" void cuda_attn_dec_split_ensure(void) {
     attn_dec_split_for((size_t)64 * DEC_SPLIT_S * (256 + 2) * sizeof(float));
 }
 
-/* Graph (_g) variant: n_pos + SWA windowing from device params (launch
- * params are frozen at capture; per-replay pos flows via dp). Small-pos
- * (n_pos < 256): split 0 covers the full range, others write identity
- * (combiner already treats M=-inf/S=0 as empty). */
 __global__ void attn_f16_decode_split_g_kernel(const float *__restrict__ q,
                                                const uint16_t *__restrict__ kc,
                                                const uint16_t *__restrict__ vc,
@@ -8473,7 +7670,6 @@ __global__ void attn_f16_decode_split_g_kernel(const float *__restrict__ q,
     const uint16_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride;
     const uint16_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride;
 
-    /* Small-pos: split 0 takes the full range (single-pass order). */
     int c0, c1;
     if (n_pos < 256) {
         c0 = 0;
@@ -8528,8 +7724,7 @@ __global__ void attn_f16_decode_split_g_kernel(const float *__restrict__ q,
         p[0] = M;
         p[1] = S;
     }
-    /* Idle splits (small-pos s>0, or empty chunks) must still write a
-     * clean identity: combiner computes 0*O, and 0*NaN garbage = NaN. */
+
     if (j < head_dim)
         p[2 + j] = (c1 > c0) ? O : 0.0f;
 }
@@ -8541,9 +7736,7 @@ extern "C" void cuda_attn_f16_decode_split_g(const float *q_dev, const uint16_t 
                                              float scale, const int *params_dev,
                                              int sliding_window, cudaStream_t stream) {
     int S = DEC_SPLIT_S;
-    /* Scratch must be pre-grown (prepare_capture); reuse path issues
-     * no CUDA API and is capture-safe. If somehow ungrown (debug
-     * no-replay path), grow here (outside capture). */
+
     float *partials = attn_dec_split_for((size_t)n_heads * S * (head_dim + 2) * sizeof(float));
     if (!partials) return;
     dim3 grid((unsigned)n_heads * (unsigned)S);
@@ -8564,11 +7757,7 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
                                     size_t kvh_stride, int sliding_window, float scale,
                                     int n_queries, const int *params_dev,
                                     cudaStream_t stream) {
-    /* Cooperative decode path (opt-in KAPPAI_ATTN_COOP=1): _g launchers
-     * are decode-only (single query row); hd=256. SWA windowing handled
-     * on-device in the kernel. 8 warps share the row (vs 1 warp
-     * starving in the tiled kernel). n_queries is heads/block (Qq),
-     * irrelevant (own grid). */
+
     if (0) {
         dim3 grid((unsigned)n_heads);
         size_t shmem = 2 * (size_t)COOP_QTILE * head_dim * sizeof(__half);
@@ -8580,9 +7769,7 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
             ERROR("cuda: coop attn launch failed: %s", cudaGetErrorString(cerr));
         return;
     }
-    /* Split decode path (default for hd==256; validated S25): cures the
-     * long-ctx collapse in replayed graphs too. n_pos threshold lives
-     * in-kernel (launch params frozen at capture). */
+
     if (head_dim == 256) {
         cuda_attn_f16_decode_split_g(q_dev, kc_dev, vc_dev, out_dev, n_heads, n_kv_heads,
                                      head_dim, layer_base_bytes, kvh_stride, scale,
@@ -8604,12 +7791,6 @@ extern "C" void cuda_attn_f16_gqa_g(const float *q_dev, const uint16_t *kc_dev,
     }
 }
 
-/* Split-K decode attention (FlashDecoding-lite): T splits over positions.
- * Kernel A computes per-(qb-block, split) partials with the same tiled
- * online math (FP64 M/S internally, stored float; O fp32); kernel B
- * combines with rescaling. NOT bit-exact vs single-pass (different
- * summation order) -- ulp-level, tolerance-gated; empty splits contribute
- * exactly nothing (M=-inf/S=0/O=0). */
 static float *g_attn_split = nullptr;
 static size_t g_attn_split_cap = 0;
 
@@ -8646,7 +7827,6 @@ __global__ void attn_f16_split_g_kernel(const float *__restrict__ q,
     int b = bx % nqb;
     int s = bx / nqb;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -8663,7 +7843,6 @@ __global__ void attn_f16_split_g_kernel(const float *__restrict__ q,
     int active = (w < nq) ? 1 : 0;
     int h = kv_head * n_kv_groups + qslot0 + w;
 
-    /* This split's chunk (empty splits write identity partials). */
     int c0 = (int)((int64_t)s * n_pos / n_splits);
     int c1 = (int)((int64_t)(s + 1) * n_pos / n_splits);
 
@@ -8771,8 +7950,6 @@ __global__ void attn_f16_split_g_kernel(const float *__restrict__ q,
         __syncthreads();
     }
 
-    /* Write partials: [s][b][w] x (M, S, O[hd]). Inactive warps write
-     * identity (M=-inf, S=0, O=0) so the combiner needs no mask. */
     {
         size_t stride = (size_t)n_queries * (2 + head_dim);
         float *dst = partials + ((size_t)s * nqb + b) * stride + (size_t)w * (2 + head_dim);
@@ -8793,7 +7970,6 @@ __global__ void attn_f16_split_g_kernel(const float *__restrict__ q,
     }
 }
 
-/* Combine T split partials per query with rescaling (FP64). */
 __global__ void attn_f16_combine_kernel(const float *__restrict__ partials,
                                         float *__restrict__ out,
                                         int n_heads, int n_kv_heads, int head_dim,
@@ -8858,10 +8034,7 @@ extern "C" void cuda_attn_f16_split_g(const float *q_dev, const uint16_t *kc_dev
     dim3 grid((unsigned)nqb * (unsigned)n_splits);
     int tile_size = attn_tile_size(head_dim);
     size_t shmem = ((size_t)n_queries * head_dim + 2 * tile_size * head_dim) * sizeof(float);
-    /* Never cudaMalloc inside graph capture (aborts the capture):
-     * fall back to the GQA kernel (capture-safe: no allocation, fixed
-     * grid) when capturing. The normal path allocates grow-only on the
-     * first eager call (warmup), before any capture begins. */
+
     float *partials = nullptr;
     {
         cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
@@ -8909,8 +8082,6 @@ extern "C" void cuda_attn_f16_g(const float *q_dev, const uint16_t *kc_dev,
     }
 }
 
-/* Tiled graph Q8_0 attention: params-based n_pos/window (mirrors _g
- * window math) + FP64 tiled online softmax (mirrors tiled kernel). */
 __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
                                        const uint8_t *__restrict__ kc,
                                        const uint8_t *__restrict__ vc,
@@ -8925,7 +8096,6 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
 
     if (h >= n_heads) return;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -8938,8 +8108,7 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
 
     extern __shared__ float smem[];
     float *s_q = smem;
-    /* Raw Q8 staging reuses the unused s_k/s_v slots: 2 * tile_size *
-     * row_bytes bytes. Float tiles follow. */
+
     uint8_t *s_raw_k = (uint8_t *)&smem[1 * head_dim];
     uint8_t *s_raw_v = (uint8_t *)&smem[1 * head_dim] + (size_t)tile_size * row_bytes;
     float *s_k_tile = (float *)((uint8_t *)&smem[1 * head_dim] +
@@ -8971,13 +8140,10 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
     const uint8_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride_bytes;
     const uint8_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride_bytes;
 
-    /* Process K/V cache in tiles */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
 
-        /* Stage raw Q8 tile bytes coalesced, then dequantize from shared.
-         * Same dequant function/values -> bit-identical tiles. */
         {
             size_t tile_raw = (size_t)tile_len * row_bytes;
             const uint8_t *kbase = kc_head + (size_t)tile_start * row_bytes;
@@ -8988,9 +8154,7 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
             }
         }
         __syncthreads();
-        /* Dequantize tile from raw staging, quad-major: consecutive threads
-         * handle consecutive quads -> 2B-aligned conflict-free smem reads
-         * (scale broadcast within quad-group). Identical values. */
+
         {
             int nq = tile_len * n_blocks * 8;
             for (int qq = tid; qq < nq; qq += blockDim.x) {
@@ -9007,8 +8171,7 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
                 uint16_t vh1 = *(const uint16_t *)(vb + 2 + (q << 2) + 2);
                 float *ok = s_k_tile + (size_t)brow * head_dim + blk * 32 + (q << 2);
                 float *ov = s_v_tile + (size_t)brow * head_dim + blk * 32 + (q << 2);
-                /* Tail blocks (head_dim % 32 != 0): never write past the
-                 * row (old code bounded stores by head_dim). */
+
                 int base = blk * 32 + (q << 2);
                 if (base + 4 <= head_dim) {
                     ok[0] = kd * (float)(int8_t)(kh0 & 0xFF);
@@ -9038,7 +8201,6 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
         }
         __syncthreads();
 
-        /* Compute attention scores for this tile */
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float *k_tile_row = &s_k_tile[t_local * head_dim];
             const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -9068,7 +8230,6 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
                 S += vs;
             }
 
-            /* Broadcast M, S, ms, vs across warp */
             {
                 double tmp_M = M, tmp_S = S, tmp_ms = ms, tmp_vs = vs;
                 tmp_M = __shfl_sync(0xffffffff, tmp_M, 0);
@@ -9096,12 +8257,6 @@ __global__ void attn_q8_tiled_g_kernel(const float *__restrict__ q,
     }
 }
 
-/* GQA-grouped tiled graph Q8_0 attention: one block handles Qq queries
- * sharing a KV head. Raw tile bytes are staged ONCE and dequantized ONCE
- * into shared float tiles (vs once per query head); all Qq warps then run
- * the identical per-warp online-softmax math (warp-relative partitioning,
- * same order) -> bit-identical outputs. Inactive tail warps still join
- * loads/dequant/syncs. Traffic + dequant saving = Qq x. */
 __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
                                            const uint8_t *__restrict__ kc,
                                            const uint8_t *__restrict__ vc,
@@ -9116,7 +8271,6 @@ __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
     const int lane = tid & 31;
     const int w = tid >> 5;
 
-    /* Window math mirrors cuda_op_attention_swa exactly. */
     int n_pos_total = dp->n_pos;
     int attn_start = 0;
     if (sliding_window > 0 && n_pos_total > sliding_window) {
@@ -9144,7 +8298,6 @@ __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
                                 2 * (size_t)tile_size * row_bytes);
     float *s_v_tile = s_k_tile + (size_t)tile_size * head_dim;
 
-    /* Each warp loads its own query row (chunked, as in _g kernel). */
     float *s_qw = s_q + (size_t)w * head_dim;
     if (active) {
         const float *q_h = q + (size_t)h * head_dim;
@@ -9168,7 +8321,6 @@ __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
     const uint8_t *kc_head = kc + layer_base + (size_t)kv_head * kvh_stride_bytes;
     const uint8_t *vc_head = vc + layer_base + (size_t)kv_head * kvh_stride_bytes;
 
-    /* Process K/V cache in tiles (staged + dequantized once per block) */
     for (int tile_start = 0; tile_start < n_pos; tile_start += tile_size) {
         int tile_end = min(tile_start + tile_size, n_pos);
         int tile_len = tile_end - tile_start;
@@ -9229,7 +8381,7 @@ __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
         __syncthreads();
 
         if (active) {
-            /* Compute attention scores for this tile */
+
             for (int t_local = 0; t_local < tile_len; t_local++) {
                 const float *k_tile_row = &s_k_tile[t_local * head_dim];
                 const float *v_tile_row = &s_v_tile[t_local * head_dim];
@@ -9259,7 +8411,6 @@ __global__ void attn_q8_tiled_gqa_g_kernel(const float *__restrict__ q,
                     S += vs;
                 }
 
-                /* Broadcast M, S, ms, vs across warp */
                 M = __shfl_sync(0xffffffff, M, 0);
                 S = __shfl_sync(0xffffffff, S, 0);
                 ms = __shfl_sync(0xffffffff, ms, 0);
@@ -9294,7 +8445,7 @@ extern "C" void cuda_attn_q8_gqa_g(const float *q_dev, const uint8_t *kc_dev,
     int qb = (n_kv_groups + n_queries - 1) / n_queries;
     dim3 grid((unsigned)n_kv_heads * (unsigned)qb);
     size_t row_bytes = (size_t)n_blocks * KV_Q8_0_ATTN_BLK_BYTES;
-    /* Shrink tile until the layout fits in 46KB (s_q + raw + tiles). */
+
     int tile_size = attn_tile_size(head_dim);
     size_t shmem = 0;
     for (; tile_size >= 1; tile_size /= 2) {
@@ -9324,7 +8475,7 @@ extern "C" void cuda_attn_q8_g(const float *q_dev, const uint8_t *kc_dev,
 
     dim3 grid(n_heads);
     int tile_size = attn_tile_size(head_dim);
-    /* s_q + raw Q8 staging (2 x tile x row_bytes) + float tiles. */
+
     size_t row_bytes = (size_t)n_blocks * KV_Q8_0_ATTN_BLK_BYTES;
     size_t shmem = (size_t)head_dim * sizeof(float) +
                    2 * (size_t)tile_size * row_bytes +
@@ -9362,7 +8513,7 @@ extern "C" void cuda_kv_put_f16_g(const float *k_in, const float *v_in,
                                   uint16_t *kd, uint16_t *vd, int n_kv_heads, int head_dim,
                                   size_t layer_base_bytes, size_t kvh_stride, int n_ctx,
                                   const int *params_dev, cudaStream_t stream) {
-    
+
     int total = n_kv_heads * head_dim;
     int block = 256;
     dim3 grid((total + block - 1) / block);
@@ -9374,12 +8525,6 @@ extern "C" void cuda_kv_put_f16_g(const float *k_in, const float *v_in,
         ERROR("cuda: kv_put_f16_g_kernel launch failed: %s", cudaGetErrorString(err));
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Q8_0 KV put: quantize FP32 K/V rows into Q8_0 blocks. Mirrors CPU  */
-/* quantize_q8_0 (roundf, clamp [-127,127], zero-padded tail blocks). */
-/* Layout per (head, pos): n_blocks x 34B (fp16 scale + 32 int8).     */
-/* ------------------------------------------------------------------ */
 
 #define KV_Q8_0_PUT_BLK 32
 #define KV_Q8_0_PUT_BLK_BYTES 34
@@ -9560,7 +8705,7 @@ __global__ void embd_lookup_q4_0_g_kernel(const cuda_q4_0_block *embd, float *ou
 
 extern "C" void cuda_embd_lookup_q4_0_g(const cuda_q4_0_block *embd_dev, float *out_dev,
                                         int dim, const int *params_dev, cudaStream_t stream) {
-    
+
     int nb = (dim + 31) / 32;
     int block = 256;
     int grid = (nb + block - 1) / block;
@@ -9585,18 +8730,13 @@ __global__ void embd_lookup_q8_0_g_kernel(const cuda_q8_0_block *embd, float *ou
 
 extern "C" void cuda_embd_lookup_q8_0_g(const cuda_q8_0_block *embd_dev, float *out_dev,
                                         int dim, const int *params_dev, cudaStream_t stream) {
-    
+
     int nb = (dim + 31) / 32;
     int block = 256;
     int grid = (nb + block - 1) / block;
     embd_lookup_q8_0_g_kernel<<<grid, block, 0, stream>>>(embd_dev, out_dev, dim,
                                                           (const cuda_decode_params *)params_dev);
 }
-
-
-/* ------------------------------------------------------------------ */
-/* IQ4_NL host-side launchers                                          */
-/* ------------------------------------------------------------------ */
 
 extern "C" void cuda_matmul_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev, int n,
                                    int k, cudaStream_t stream) {
@@ -9607,7 +8747,7 @@ extern "C" void cuda_matmul_iq4_nl(const void *w_dev, const float *x_dev, float 
         return;
     q8_0_quant_kernel<<<(k / 32 + 255) / 256, 256, 0, stream>>>(x_dev, xq_dev, k);
     if (n == 1) {
-        /* Decode: one row, so spread the k-blocks across all threads. */
+
         matmul_iq4_nl_mmvq_kernel<<<1, MMVQ_NWARPS * 32, 0, stream>>>(
             (const cuda_iq4_nl_block *)w_dev, xq_dev, y_dev, n, k);
     } else {
@@ -9631,15 +8771,10 @@ extern "C" void cuda_matmul_iq4_nl_residual(const void *w_dev, const float *x_de
         (const cuda_iq4_nl_block *)w_dev, xq_dev, residual_dev, y_dev, n, k);
 }
 
-
-/* Batched FFN down kernel launchers. */
 extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float *gate_dev,
                                            const float *up_dev, float *y_dev, int n, int k,
                                            int m, cudaStream_t stream) {
-    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
-     * per token -- so this scratch must cover all m rows. Sizing it for a single
-     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
-     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
+
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9647,10 +8782,6 @@ extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float
     act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
         gate_dev, up_dev, act_q, k, m);
 
-    /* Grid is over output ROWS (n), not tokens (m): each warp owns one row and a
-     * block covers MM_ROWS_PER_BLOCK rows. Sizing it with m left rows >= 8*m
-     * unwritten (they stayed zero), which produced garbage on every model whose
-     * FFN down-projection has more output rows than prompt tokens. */
     matmul_q8_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q8_0_block *)w_dev, act_q, y_dev, n, k, m);
@@ -9659,10 +8790,7 @@ extern "C" void cuda_matmul_ffn_down_batch_launch(const void *w_dev, const float
 extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const float *gate_dev,
                                               const float *up_dev, float *y_dev, int n, int k,
                                               int m, cudaStream_t stream) {
-    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
-     * per token -- so this scratch must cover all m rows. Sizing it for a single
-     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
-     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
+
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9670,7 +8798,6 @@ extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const fl
     act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
         (const float *)gate_dev, (const float *)up_dev, act_q, k, m);
 
-    /* Grid over output rows (n), not tokens -- see cuda_matmul_ffn_down_batch_launch. */
     matmul_q4_0_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                      MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q4_0_block *)w_dev, (const cuda_q8_0_block *)act_q,
@@ -9680,10 +8807,7 @@ extern "C" void cuda_matmul_ffn_down_q4_batch_launch(const void *w_dev, const fl
 extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const float *gate_dev,
                                                 const float *up_dev, float *y_dev, int n, int k,
                                                 int m, cudaStream_t stream) {
-    /* act_gelu_quant_batch_kernel writes xq[row * (k/32) + b] -- one block run
-     * per token -- so this scratch must cover all m rows. Sizing it for a single
-     * row (xq_scratch_for(k)) overflowed by (m-1)*nb blocks, corrupting the FFN
-     * down-projection and yielding <pad> tokens on Q8_0/Q4_0 gemma-4. */
+
     cuda_q8_0_block *act_q = xq_scratch_for_batch(k, m);
     if (!act_q) return;
     const int nb = k / 32;
@@ -9691,21 +8815,11 @@ extern "C" void cuda_matmul_ffn_down_q4_1_batch_launch(const void *w_dev, const 
     act_gelu_quant_batch_kernel<<<grid, 256, 0, stream>>>(
         (const float *)gate_dev, (const float *)up_dev, act_q, k, m);
 
-    /* m>1 must use the *batched* Q4_1 kernel: matmul_q4_1_dp4a_kernel takes no
-     * token count, so calling it here dropped every row past the first. It also
-     * had to read the batched activation scratch, not xq_scratch_for(k). */
-    /* Grid over output rows (n), not tokens -- see cuda_matmul_ffn_down_batch_launch. */
     matmul_q4_1_dp4a_batch_kernel<<<(n + MM_ROWS_PER_BLOCK - 1) / MM_ROWS_PER_BLOCK,
                                     MM_LANES * MM_ROWS_PER_BLOCK, 0, stream>>>(
         (const cuda_q4_1_block *)w_dev, act_q, y_dev, n, k, m);
 }
 
-
-/* ===================================================================== */
-/* MoE Experts Batch Kernels                                             */
-/* ===================================================================== */
-
-/* Fused activation kernel for MoE: act = act_fn(gate*gate_scale) * (up*up_scale) */
 __global__ void moe_activate_fused_kernel(const float *gate, const float *up, float *out,
                                            long long n, float gate_scale, float up_scale,
                                            int use_gelu) {
@@ -9717,7 +8831,6 @@ __global__ void moe_activate_fused_kernel(const float *gate, const float *up, fl
     out[i] = a * u;
 }
 
-/* Weighted accumulation: out += weight * down_scale * src */
 __global__ void moe_scale_accum_kernel(float *out, const float *src, int n_rows, int dim,
                                         float weight, float down_scale) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -9727,7 +8840,6 @@ __global__ void moe_scale_accum_kernel(float *out, const float *src, int n_rows,
     out[idx] = fmaf(w, src[idx], out[idx]);
 }
 
-/* Batched scale-accumulate for multiple experts */
 __global__ void moe_scale_accum_batched_kernel(float *out, const float *src,
                                                 int n_rows, int dim,
                                                 const float *weights, const float *down_scales,
@@ -9742,7 +8854,6 @@ __global__ void moe_scale_accum_batched_kernel(float *out, const float *src,
     out[idx] = fmaf(w, src[idx], out[idx]);
 }
 
-/* Batched MoE gate/up projection using existing matmul infrastructure */
 __global__ void moe_gate_proj_kernel(const cuda_q8_0_block *__restrict__ w,
                                       const float *__restrict__ x,
                                       float *__restrict__ gate,
@@ -9750,33 +8861,21 @@ __global__ void moe_gate_proj_kernel(const cuda_q8_0_block *__restrict__ w,
     int row = blockIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= n_rows || col >= dim) return;
-    /* Not implemented yet - placeholder for future optimization */
-}
 
-/* ===================================================================== */
-/* MoE Expert Host Launchers                                             */
-/* ===================================================================== */
+}
 
 extern "C" status_code cuda_moe_experts_batch_launch(backend *self, const buffer *xb, buffer *out,
                                         int n_rows, int dim, int inter, int use_gelu,
                                         int n_experts, const moe_resident_expert *experts,
                                         const int *counts, const int *rows_packed,
                                         const float *weights_packed, cudaStream_t stream) {
-    /* This is a complex operation that orchestrates multiple kernels.
-     * For now, we implement a basic version that falls back to CPU.
-     * TODO: Implement full CUDA kernel for MoE experts batch.
-     */
+
     (void)self; (void)xb; (void)out; (void)n_rows; (void)dim; (void)inter;
     (void)use_gelu; (void)n_experts; (void)experts; (void)counts;
     (void)rows_packed; (void)weights_packed; (void)stream;
-    /* TODO: Implement full CUDA MoE experts batch */
-    /* For now, return ERR_UNSUPPORTED to trigger host fallback */
+
     return ERR_UNSUPPORTED;
 }
-
-/* ===================================================================== */
-/* MLA (Multi-head Latent Attention) Kernels                             */
-/* ===================================================================== */
 
 extern "C" void cuda_attention_mla(const float *q_dev, const uint16_t *kc_dev,
                                     const uint16_t *vc_dev, float *out_dev,
@@ -9788,7 +8887,7 @@ extern "C" void cuda_attention_mla(const float *q_dev, const uint16_t *kc_dev,
     (void)n_heads; (void)n_kv_heads; (void)head_dim;
     (void)layer_base_bytes; (void)kvh_stride; (void)pos_start;
     (void)n_pos; (void)scale; (void)sliding_window; (void)stream;
-    /* TODO: Implement MLA attention kernel */
+
 }
 
 extern "C" void cuda_kv_alloc_mla(int n_layers, int n_ctx, int kv_lora, int qk_rope,
@@ -9798,7 +8897,7 @@ extern "C" void cuda_kv_alloc_mla(int n_layers, int n_ctx, int kv_lora, int qk_r
     (void)n_layers; (void)n_ctx; (void)kv_lora; (void)qk_rope;
     (void)qk_nope; (void)v_head; (void)n_ctx_kv; (void)kv_quant;
     (void)qk_lora_rank; (void)stream; (void)k_out; (void)v_out;
-    /* TODO: Implement MLA KV allocation */
+
 }
 
 extern "C" void cuda_kv_put_mla(const float *k_in, const float *v_in,
@@ -9809,12 +8908,8 @@ extern "C" void cuda_kv_put_mla(const float *k_in, const float *v_in,
     (void)k_in; (void)v_in; (void)k_dev; (void)v_dev;
     (void)n_kv_heads; (void)head_dim; (void)layer_base_bytes;
     (void)kvh_stride_bytes; (void)pos; (void)n_blocks; (void)stream;
-    /* TODO: Implement MLA KV put */
+
 }
-
-
-/* Batched IQ4_NL / Q6_K launchers. Placed at the end of the file so they can
- * see the batched Q8_0 / Q8_K quantizers and their scratch allocators. */
 
 extern "C" void cuda_matmul_batch_iq4_nl(const void *w_dev, const float *x_dev, float *y_dev,
                                          int n, int k, int m, cudaStream_t stream) {
@@ -9844,8 +8939,6 @@ extern "C" void cuda_matmul_batch_q6_k(const void *w_dev, const float *x_dev, fl
         (const cuda_q6_k_block *)w_dev, xq, y_dev, n, k, m);
 }
 
-/* Batched Q5_0 / Q5_1 / Q5_K / IQ3_S launchers. At the end of the file so they
- * can see the batched quantizers and their scratch allocators. */
 extern "C" void cuda_matmul_batch_q5_0(const void *w_dev, const float *x_dev, float *y_dev,
                                         int n, int k, int m, cudaStream_t stream) {
     if (n <= 0 || m <= 0 || k <= 0 || (k & 31)) return;
@@ -9864,7 +8957,7 @@ extern "C" void cuda_matmul_batch_q5_1(const void *w_dev, const float *x_dev, fl
     const int nb = k / 32;
     cuda_q8_1_block *xq = q81_scratch_for((size_t)m * (size_t)k);
     if (!xq) return;
-    /* Quantize each row of the m x k activation matrix into its own block run. */
+
     const int total = (int)(((size_t)m * nb + 255) / 256) * 256;
     dim3 g(total / 256);
     q8_1_quant_rows_kernel<<<g, 256, 0, stream>>>(x_dev, xq, k, m);

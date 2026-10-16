@@ -1,8 +1,4 @@
-/* CUDA backend host-side weight relayouts (see cuda_repack.h).
- *
- * Deliberately a plain C translation unit: no CUDA runtime headers, so it is
- * compiled by the ordinary host compiler rule and can be called from shared
- * code. Keeps the CPU/Vulkan backends free of CUDA-only layout knowledge. */
+
 #include "backend/cuda/cuda_repack.h"
 
 #include <math.h>
@@ -13,14 +9,6 @@
 #include "backend/cpu/scalar/quants.h"
 #include "backend/cuda/cuda_internal.h"
 
-/* f16 <-> f32 helpers.
- *
- * This translation unit is linked into the engine (model.c calls it), while
- * the scalar backend's cvt_f16_to_f32/cvt_f32_to_f16 now live in a dlopen'd
- * libkappai_cpu_scalar.so, so the engine cannot link against them. Keep
- * bit-exact local copies instead: cvt_f32_to_f16 mirrors the scalar reference
- * algorithm verbatim, and cvt_f16_to_f32 is the exact IEEE half expansion
- * (equal to the reference lookup table for all 65536 encodings). */
 static inline uint32_t cvt_f32_to_bits(float f) {
 	union {
 		float	 f;
@@ -48,7 +36,7 @@ static inline float cvt_f16_to_f32(uint16_t h) {
 		if (mant == 0) {
 			u = sign;
 		} else {
-			/* subnormal half: renormalize into the float normal range */
+
 			exp = 1;
 			while ((mant & 0x0400u) == 0) {
 				mant <<= 1;
@@ -81,9 +69,6 @@ static inline uint16_t cvt_f32_to_f16(float f) {
 	return (uint16_t)((sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign));
 }
 
-/* ---- Quad-major Q8_0 (34B/32e blocks) ------------------------------- */
-/* ---- Quad-major Q4_0 (18B/32e blocks) ------------------------------- */
-/* ---- Lossless Q4_0 -> Q8_0 promotion -------------------------------- */
 void *cuda_convert_q4_0_to_q8_0(const void *src, int n_rows, int k) {
 	const int	 nb	 = k / 32;
 	q8_0_block	*dst = xmalloc_aligned((size_t)n_rows * nb * sizeof(q8_0_block), 64);
@@ -96,7 +81,7 @@ void *cuda_convert_q4_0_to_q8_0(const void *src, int n_rows, int k) {
 			q8_0_block		 *db = dst + (size_t)r * nb + b;
 			float			  d	 = cvt_f16_to_f32(sb->d);
 			db->d				 = cvt_f32_to_f16(d * 0.5f);
-			/* Nibble order: low -> elems 0-15, high -> elems 16-31. */
+
 			for (int j = 0; j < 16; j++) {
 				uint8_t qb	   = sb->qs[j];
 				db->qs[j]	   = (int8_t)(((qb & 0xF) << 1) - 16);
@@ -107,19 +92,6 @@ void *cuda_convert_q4_0_to_q8_0(const void *src, int n_rows, int k) {
 	return dst;
 }
 
-/* ------------------------------------------------------------------ */
-/* Host-allocation side table (see cuda_internal.h for why this exists) */
-/* ------------------------------------------------------------------ */
-
-/*
- * `buffer.host_ptr` may be cudaHostAlloc() memory, which must be released with
- * cudaFreeHost(), or malloc() memory, which must be released with free(). The
- * shared `buffer` struct carries no flag saying which, and this backend does not
- * edit that struct, so the answer is recorded here keyed by host pointer.
- *
- * cudaHostAlloc'd blocks are 64-byte aligned, so the low 6 bits of the pointer
- * are free and give a cheap bucket index without a modulo.
- */
 static cuda_host_alloc *g_host_buckets[CUDA_HOST_ALLOC_BUCKETS];
 
 static unsigned cuda_host_bucket(void *p) {
@@ -162,10 +134,6 @@ void cuda_host_alloc_forget(void *host_ptr) {
 		link = &(*link)->next;
 	}
 }
-
-/* ------------------------------------------------------------------ */
-/* Weight-type side table (see cuda_internal.h for why this exists)     */
-/* ------------------------------------------------------------------ */
 
 typedef struct cuda_weight_type {
 	void					*dev_ptr;
