@@ -156,50 +156,107 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 	return OK;
 }
 
+static void cpu_rope_neox_one_avx(float *vh, int half, const float *rope_cos,
+								  const float *rope_sin) {
+	int j = 0;
+	for (; j + 8 <= half; j += 8) {
+		__m256 c0 = _mm256_loadu_ps(rope_cos + j);
+		__m256 s0 = _mm256_loadu_ps(rope_sin + j);
+		__m256 v0 = _mm256_loadu_ps(vh + j);
+		__m256 v1 = _mm256_loadu_ps(vh + j + half);
+		_mm256_storeu_ps(vh + j, _mm256_fnmadd_ps(v1, s0, _mm256_mul_ps(v0, c0)));
+		_mm256_storeu_ps(vh + j + half, _mm256_fmadd_ps(v1, c0, _mm256_mul_ps(v0, s0)));
+	}
+	for (; j < half; j++) {
+		float c		 = rope_cos[j];
+		float s		 = rope_sin[j];
+		float v0	 = vh[j];
+		float v1	 = vh[j + half];
+		vh[j]		 = (v0 * c) - (v1 * s);
+		vh[j + half] = (v0 * s) + (v1 * c);
+	}
+}
+
+static void cpu_rope_interleave_one_avx(float *vh, int half, const float *rope_cos,
+										const float *rope_sin) {
+	int j = 0;
+	for (; j + 2 <= half; j += 2) {
+		float *base = vh + 2 * j;
+		__m128 p	= _mm_loadu_ps(base);
+		__m128 c	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_cos + j)));
+		__m128 s	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_sin + j)));
+		__m128 ev	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
+		__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
+		__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
+		__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
+	}
+	for (; j < half; j++) {
+		float c			= rope_cos[j];
+		float s			= rope_sin[j];
+		float v0		= vh[2 * j];
+		float v1		= vh[(2 * j) + 1];
+		vh[2 * j]		= (v0 * c) - (v1 * s);
+		vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+	}
+}
+
+static void cpu_rope_cs_one_avx(float *vh, int half, const float *cs, int neox) {
+	int j = 0;
+	if (neox) {
+		const __m256i idx_lo = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+		for (; j + 8 <= half; j += 8) {
+			__m256 v0  = _mm256_loadu_ps(vh + j);
+			__m256 v1  = _mm256_loadu_ps(vh + j + half);
+			__m256 c_a = _mm256_loadu_ps(cs + (2 * j));
+			__m256 c_b = _mm256_loadu_ps(cs + (2 * j) + 8);
+			__m256 c   = _mm256_permutevar8x32_ps(
+				_mm256_shuffle_ps(c_a, c_b, _MM_SHUFFLE(2, 0, 2, 0)), idx_lo);
+			__m256 s = _mm256_permutevar8x32_ps(
+				_mm256_shuffle_ps(c_a, c_b, _MM_SHUFFLE(3, 1, 3, 1)), idx_lo);
+			_mm256_storeu_ps(vh + j, _mm256_fnmadd_ps(v1, s, _mm256_mul_ps(v0, c)));
+			_mm256_storeu_ps(vh + j + half, _mm256_fmadd_ps(v1, c, _mm256_mul_ps(v0, s)));
+		}
+		for (; j < half; j++) {
+			float c		 = cs[2 * j];
+			float s		 = cs[(2 * j) + 1];
+			float v0	 = vh[j];
+			float v1	 = vh[j + half];
+			vh[j]		 = (v0 * c) - (v1 * s);
+			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+		return;
+	}
+	for (; j + 2 <= half; j += 2) {
+		float *base = vh + 2 * j;
+		__m128 p	= _mm_loadu_ps(base);
+		__m128 cs_v = _mm_loadu_ps(cs + (2 * j));
+		__m128 ev	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
+		__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
+		__m128 c	= _mm_shuffle_ps(cs_v, cs_v, _MM_SHUFFLE(2, 0, 2, 0));
+		__m128 s	= _mm_shuffle_ps(cs_v, cs_v, _MM_SHUFFLE(3, 1, 3, 1));
+		__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
+		__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
+	}
+	for (; j < half; j++) {
+		float c			= cs[2 * j];
+		float s			= cs[(2 * j) + 1];
+		float v0		= vh[2 * j];
+		float v1		= vh[(2 * j) + 1];
+		vh[2 * j]		= (v0 * c) - (v1 * s);
+		vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+	}
+}
+
 static void cpu_rope_one_avx(float *v, int n_heads, int head_dim, const float *rope_cos,
 							 const float *rope_sin, int neox) {
-	int half = head_dim / 2;
 	for (int h = 0; h < n_heads; h++) {
 		float *vh = v + ((size_t)h * head_dim);
-		int	   j  = 0;
-		if (neox) {
-			for (; j + 8 <= half; j += 8) {
-				__m256 c0 = _mm256_loadu_ps(rope_cos + j);
-				__m256 s0 = _mm256_loadu_ps(rope_sin + j);
-				__m256 v0 = _mm256_loadu_ps(vh + j);
-				__m256 v1 = _mm256_loadu_ps(vh + j + half);
-				_mm256_storeu_ps(vh + j, _mm256_fnmadd_ps(v1, s0, _mm256_mul_ps(v0, c0)));
-				_mm256_storeu_ps(vh + j + half, _mm256_fmadd_ps(v1, c0, _mm256_mul_ps(v0, s0)));
-			}
-			for (; j < half; j++) {
-				float c		 = rope_cos[j];
-				float s		 = rope_sin[j];
-				float v0	 = vh[j];
-				float v1	 = vh[j + half];
-				vh[j]		 = (v0 * c) - (v1 * s);
-				vh[j + half] = (v0 * s) + (v1 * c);
-			}
-		} else {
-			for (; j + 2 <= half; j += 2) {
-				float *base = vh + 2 * j;
-				__m128 p	= _mm_loadu_ps(base);
-				__m128 c	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_cos + j)));
-				__m128 s	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_sin + j)));
-				__m128 ev	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
-				__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
-				__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-				__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
-				_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
-			}
-			for (; j < half; j++) {
-				float c			= rope_cos[j];
-				float s			= rope_sin[j];
-				float v0		= vh[2 * j];
-				float v1		= vh[(2 * j) + 1];
-				vh[2 * j]		= (v0 * c) - (v1 * s);
-				vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
-			}
-		}
+		if (neox)
+			cpu_rope_neox_one_avx(vh, head_dim / 2, rope_cos, rope_sin);
+		else
+			cpu_rope_interleave_one_avx(vh, head_dim / 2, rope_cos, rope_sin);
 	}
 }
 
@@ -222,6 +279,151 @@ status_code cpu_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_
 	cpu_rope_one_avx((float *)cpu_ptr(q), n_heads, head_dim, rope_cos, rope_sin, neox);
 	cpu_rope_one_avx((float *)cpu_ptr(k), n_kv_heads, head_dim, rope_cos, rope_sin, neox);
 	return OK;
+}
+
+static void cpu_rope_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rope_batch_job *j	 = ctx;
+	int					half = j->head_dim / 2;
+	for (int row = begin; row < end; row++) {
+		int			 pos = j->pos_start + row;
+		const float *rc	 = j->rope_cos_base + ((size_t)pos * half);
+		const float *rs	 = j->rope_sin_base + ((size_t)pos * half);
+		cpu_rope_one_avx(j->vec + ((size_t)row * j->n_heads * j->head_dim), j->n_heads, j->head_dim,
+						 rc, rs, j->rope_neox);
+	}
+}
+
+status_code cpu_rope_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
+						   const float *rope_cos_base, const float *rope_sin_base, int m) {
+	cpu_priv		  *p   = self->priv;
+	cpu_rope_batch_job job = {.vec			 = (float *)cpu_ptr(vec),
+							  .n_heads		 = n_heads,
+							  .head_dim		 = head_dim,
+							  .pos_start	 = pos_start,
+							  .rope_cos_base = rope_cos_base,
+							  .rope_sin_base = rope_sin_base,
+							  .rope_neox	 = self->rope_neox};
+	cpu_run_batch(p->pool, m, cpu_rope_batch_chunk_avx, &job);
+	return OK;
+}
+
+static void cpu_rope_qk_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rope_qk_batch_job *j	= ctx;
+	int					   half = j->head_dim / 2;
+	for (int row = begin; row < end; row++) {
+		int			 pos = j->pos_start + row;
+		const float *rc	 = j->rope_cos_base + ((size_t)pos * half);
+		const float *rs	 = j->rope_sin_base + ((size_t)pos * half);
+		cpu_rope_one_avx(j->q + ((size_t)row * j->n_heads * j->head_dim), j->n_heads, j->head_dim,
+						 rc, rs, j->rope_neox);
+		cpu_rope_one_avx(j->k + ((size_t)row * j->n_kv_heads * j->head_dim), j->n_kv_heads,
+						 j->head_dim, rc, rs, j->rope_neox);
+	}
+}
+
+status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+							  int head_dim, int pos_start, const float *rope_cos_base,
+							  const float *rope_sin_base, int m) {
+	cpu_priv			 *p	  = self->priv;
+	cpu_rope_qk_batch_job job = {.q				= (float *)cpu_ptr(q),
+								 .k				= (float *)cpu_ptr(k),
+								 .n_heads		= n_heads,
+								 .n_kv_heads	= n_kv_heads,
+								 .head_dim		= head_dim,
+								 .pos_start		= pos_start,
+								 .rope_cos_base = rope_cos_base,
+								 .rope_sin_base = rope_sin_base,
+								 .rope_neox		= self->rope_neox};
+	cpu_run_batch(p->pool, m, cpu_rope_qk_batch_chunk_avx, &job);
+	return OK;
+}
+
+status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
+						 const float *rope_cos_base, const float *rope_sin_base,
+						 const float *freq_factors) {
+	float *v = cpu_ptr(vec);
+	if (freq_factors) {
+		float	   *cs;
+		status_code st =
+			cpu_rope_cs_cached(self->priv, head_dim, pos, self->rope_theta, freq_factors, &cs);
+		if (st != OK)
+			return st;
+		for (int h = 0; h < n_heads; h++)
+			cpu_rope_cs_one_avx(v + ((size_t)h * head_dim), head_dim / 2, cs, self->rope_neox);
+	} else {
+		int			 half	  = head_dim / 2;
+		const float *rope_cos = rope_cos_base + ((size_t)pos * half);
+		const float *rope_sin = rope_sin_base + ((size_t)pos * half);
+		cpu_rope_one_avx(v, n_heads, head_dim, rope_cos, rope_sin, self->rope_neox);
+	}
+	return OK;
+}
+
+static void cpu_rope_ext_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rope_ext_batch_job *j			= ctx;
+	int						half		= j->head_dim / 2;
+	double					theta_scale = pow((double)j->theta, -2.0 / (double)j->head_dim);
+
+	for (int r = begin; r < end; r++) {
+		int	   pos = j->pos_start + r;
+		float  cs_stack[512];
+		float *csp = cs_stack;
+		if (j->freq_factors) {
+			if (half > 256)
+				csp = xmalloc((size_t)half * 2 * sizeof(float));
+			rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
+			float *v = j->base + (size_t)r * j->row_stride;
+			for (int h = 0; h < j->n_heads; h++)
+				cpu_rope_cs_one_avx(v + ((size_t)h * j->head_dim), half, csp, j->neox);
+			if (csp != cs_stack)
+				free(csp);
+		} else {
+			const float *rc = j->cos_base + ((size_t)pos * half);
+			const float *rs = j->sin_base + ((size_t)pos * half);
+			cpu_rope_one_avx(j->base + ((size_t)r * j->row_stride), j->n_heads, j->head_dim, rc, rs,
+							 j->neox);
+		}
+	}
+}
+
+status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
+							   const float *rope_cos_base, const float *rope_sin_base,
+							   const float *freq_factors, int m) {
+	cpu_priv *p = self->priv;
+	if (m <= 1)
+		return cpu_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
+							freq_factors);
+
+	cpu_rope_ext_batch_job job = {.base			= (float *)cpu_ptr(vec),
+								  .n_heads		= n_heads,
+								  .head_dim		= head_dim,
+								  .row_stride	= n_heads * head_dim,
+								  .pos_start	= pos_start,
+								  .theta		= self->rope_theta,
+								  .neox			= self->rope_neox,
+								  .freq_factors = freq_factors,
+								  .cos_base		= rope_cos_base,
+								  .sin_base		= rope_sin_base};
+	cpu_run_batch(p->pool, m, cpu_rope_ext_batch_chunk_avx, &job);
+	return OK;
+}
+
+void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_partial_rope_qk_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float *cosv = j->cos_base + (size_t)(j->pos0 + row) * j->half;
+		const float *sinv = j->sin_base + (size_t)(j->pos0 + row) * j->half;
+		float		*qr	  = j->q + (size_t)row * j->qn;
+		float		*kr	  = j->k + (size_t)row * j->kn;
+		for (int h = 0; h < j->n_heads; h++)
+			cpu_rope_neox_one_avx(qr + ((size_t)h * j->head_dim), j->half, cosv, sinv);
+		for (int h = 0; h < j->n_kv_heads; h++)
+			cpu_rope_neox_one_avx(kr + ((size_t)h * j->head_dim), j->half, cosv, sinv);
+	}
 }
 
 float dot8(const float *restrict a, const float *restrict b, int head_dim) {
@@ -1105,12 +1307,10 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
-								const buffer *v_cache, buffer *out, int layer, int pos_start,
-								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
-								int flash_attn, float scale, int n_kv_heads_active, int m) {
-	(void)k_cache;
-	(void)v_cache;
+static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buffer *out, int layer,
+											int pos_start, int n_heads, int n_kv_heads,
+											int head_dim, int n_ctx, int flash_attn, float scale,
+											int sliding_window, int n_kv_heads_active, int m) {
 	cpu_priv *p		   = self->priv;
 	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 	if (n_active <= 0)
@@ -1143,23 +1343,24 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 		vl_base_raw		  = p->kv_v + layer_base;
 	}
 
-	cpu_attn_batch_job_avx job = {.kl_base	  = kl_base_raw,
-								  .vl_base	  = vl_base_raw,
-								  .qf		  = (const float *)cpu_ptr(q),
-								  .outf		  = (float *)cpu_ptr(out),
-								  .n_groups	  = n_groups,
-								  .head_dim	  = head_dim,
-								  .hd_stride  = hd_stride,
-								  .n_heads	  = n_heads,
-								  .pos_start  = pos_start,
-								  .m		  = m,
-								  .flash_attn = flash_attn,
-								  .scale	  = scale,
-								  .kvh_stride = kvh_stride,
-								  .p		  = p,
-								  .kv_quant	  = p->kv_quant,
-								  .kv_rows	  = rows,
-								  .kv_base	  = base};
+	cpu_attn_batch_job_avx job = {.kl_base		  = kl_base_raw,
+								  .vl_base		  = vl_base_raw,
+								  .qf			  = (const float *)cpu_ptr(q),
+								  .outf			  = (float *)cpu_ptr(out),
+								  .n_groups		  = n_groups,
+								  .head_dim		  = head_dim,
+								  .hd_stride	  = hd_stride,
+								  .n_heads		  = n_heads,
+								  .pos_start	  = pos_start,
+								  .m			  = m,
+								  .sliding_window = sliding_window,
+								  .flash_attn	  = flash_attn,
+								  .scale		  = scale,
+								  .kvh_stride	  = kvh_stride,
+								  .p			  = p,
+								  .kv_quant		  = p->kv_quant,
+								  .kv_rows		  = rows,
+								  .kv_base		  = base};
 
 	int total		= n_heads * m;
 	int cur_tid		= tpool_current_tid();
@@ -1170,6 +1371,27 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 		cpu_attn_batch_chunk_avx(0, total, 0, &job);
 	}
 	return OK;
+}
+
+status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
+								const buffer *v_cache, buffer *out, int layer, int pos_start,
+								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+								int flash_attn, float scale, int n_kv_heads_active, int m) {
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
+									n_ctx, flash_attn, scale, 0, n_kv_heads_active, m);
+}
+
+status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
+									const buffer *v_cache, buffer *out, int layer, int pos_start,
+									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+									int flash_attn, float scale, int sliding_window,
+									int n_kv_heads_active, int m) {
+	(void)k_cache;
+	(void)v_cache;
+	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
+									n_ctx, flash_attn, scale, sliding_window, n_kv_heads_active, m);
 }
 
 static void cpu_add_inplace_chunk_avx(int begin, int end, int tid, void *ctx) {
@@ -1199,6 +1421,25 @@ status_code cpu_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
 	float	 *args[2] = {cpu_ptr(x), (float *)cpu_ptr(y)};
 	cpu_run_batch_full(p->pool, n, CPU_ELEMWISE_MIN_PER_THREAD, 2 * CPU_ELEMWISE_MIN_PER_THREAD,
 					   cpu_add_inplace_chunk_avx, args);
+	return OK;
+}
+
+static void cpu_add_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_add_batch_job *j = ctx;
+	int				   n = j->n;
+	for (int row = begin; row < end; row++) {
+		float		*xr		 = j->x + ((size_t)row * n);
+		const float *yr		 = j->y + ((size_t)row * n);
+		float		*args[2] = {xr, (float *)yr};
+		cpu_add_inplace_chunk_avx(0, n, 0, args);
+	}
+}
+
+status_code cpu_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
+	cpu_priv		 *p	  = self->priv;
+	cpu_add_batch_job job = {.x = cpu_ptr(x), .y = cpu_ptr(y), .n = n};
+	cpu_run_batch(p->pool, m, cpu_add_batch_chunk_avx, &job);
 	return OK;
 }
 
@@ -1344,6 +1585,144 @@ status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buff
 	cpu_ffn_act_batch_args job = {
 		.g = cpu_ptr(gate), .u = cpu_ptr(up), .o = cpu_ptr(out), .n = n, .activation = activation};
 	cpu_run_batch(p->pool, m, cpu_ffn_act_batch_chunk_avx, &job);
+	return OK;
+}
+
+void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
+	cpu_ffn_down_act_args *a   = ctx;
+	cpu_ffn_act_args	   sub = {.g = a->g, .u = a->u, .o = a->o};
+	if (a->activation == 1)
+		cpu_ffn_gelu_chunk_avx(begin, end, tid, &sub);
+	else
+		cpu_ffn_silu_chunk_avx(begin, end, tid, &sub);
+}
+
+void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_softcap_job *j		 = ctx;
+	float			 inv_cap = j->inv_cap;
+	float			 cap	 = j->cap;
+	__m256			 vinv	 = _mm256_set1_ps(inv_cap);
+	__m256			 vcap	 = _mm256_set1_ps(cap);
+	int				 i		 = begin;
+	for (; i + 8 <= end; i += 8) {
+		__m256 x = _mm256_mul_ps(_mm256_loadu_ps(j->x + i), vinv);
+		_mm256_storeu_ps(j->x + i, _mm256_mul_ps(vtanh_ps(x), vcap));
+	}
+	for (; i < end; i++)
+		j->x[i] = cap * tanhf(j->x[i] * inv_cap);
+}
+
+void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_split_qgate_job *j			  = ctx;
+	const int			 hd			  = j->head_dim;
+	int					 q_out		  = j->n_heads * hd;
+	int					 mixed_stride = 2 * q_out;
+	for (int row = begin; row < end; row++) {
+		const float *src = j->mixed + (size_t)row * mixed_stride;
+		float		*qd	 = j->q + (size_t)row * q_out;
+		float		*gd	 = j->gate + (size_t)row * q_out;
+		for (int h = 0; h < j->n_heads; h++, src += 2 * hd) {
+			int jj = 0;
+			for (; jj + 8 <= hd; jj += 8) {
+				_mm256_storeu_ps(qd + jj, _mm256_loadu_ps(src + jj));
+				_mm256_storeu_ps(gd + jj, _mm256_loadu_ps(src + hd + jj));
+			}
+			for (; jj + 4 <= hd; jj += 4) {
+				_mm_storeu_ps(qd + jj, _mm_loadu_ps(src + jj));
+				_mm_storeu_ps(gd + jj, _mm_loadu_ps(src + hd + jj));
+			}
+			for (; jj < hd; jj++) {
+				qd[jj] = src[jj];
+				gd[jj] = src[hd + jj];
+			}
+			qd += hd;
+			gd += hd;
+		}
+	}
+}
+
+void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_attn_output_gate_job *j = ctx;
+	int						  n = j->n;
+	for (int row = begin; row < end; row++) {
+		float		*o = j->out + (size_t)row * n;
+		const float *g = j->gate + (size_t)row * n;
+		int			 i = 0;
+		for (; i + 8 <= n; i += 8) {
+			__m256 gv = _mm256_loadu_ps(g + i);
+			__m256 sig =
+				_mm256_div_ps(_mm256_set1_ps(1.0f),
+							  _mm256_add_ps(_mm256_set1_ps(1.0f),
+											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), gv))));
+			_mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_loadu_ps(o + i), sig));
+		}
+		for (; i < n; i++)
+			o[i] *= sigmoidf(g[i]);
+	}
+}
+
+static void cpu_rmsnorm_add_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rmsnorm_add_batch_job *j	  = ctx;
+	const int				   n	  = j->n;
+	const float				  *w	  = j->w;
+	const float				   oscale = j->out_scale;
+	for (int row = begin; row < end; row++) {
+		const float *xr		  = j->x + ((size_t)row * n);
+		const float *rr		  = j->residual + ((size_t)row * n);
+		float		*yr		  = j->y + ((size_t)row * n);
+		float		 ss		  = rmsnorm_sum_sq(xr, n);
+		float		 scale	  = 1.0f / sqrtf((ss / (float)n) + j->eps);
+		__m256		 scale_v  = _mm256_set1_ps(scale);
+		__m256		 oscale_v = _mm256_set1_ps(oscale);
+		int			 i		  = 0;
+		for (; i + 32 <= n; i += 32) {
+			__m256 t0 = _mm256_mul_ps(_mm256_loadu_ps(xr + i), scale_v);
+			__m256 t1 = _mm256_mul_ps(_mm256_loadu_ps(xr + i + 8), scale_v);
+			__m256 t2 = _mm256_mul_ps(_mm256_loadu_ps(xr + i + 16), scale_v);
+			__m256 t3 = _mm256_mul_ps(_mm256_loadu_ps(xr + i + 24), scale_v);
+			_mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_fmadd_ps(t0, _mm256_loadu_ps(w + i),
+																   _mm256_loadu_ps(rr + i)),
+												   oscale_v));
+			_mm256_storeu_ps(yr + i + 8,
+							 _mm256_mul_ps(_mm256_fmadd_ps(t1, _mm256_loadu_ps(w + i + 8),
+														   _mm256_loadu_ps(rr + i + 8)),
+										   oscale_v));
+			_mm256_storeu_ps(yr + i + 16,
+							 _mm256_mul_ps(_mm256_fmadd_ps(t2, _mm256_loadu_ps(w + i + 16),
+														   _mm256_loadu_ps(rr + i + 16)),
+										   oscale_v));
+			_mm256_storeu_ps(yr + i + 24,
+							 _mm256_mul_ps(_mm256_fmadd_ps(t3, _mm256_loadu_ps(w + i + 24),
+														   _mm256_loadu_ps(rr + i + 24)),
+										   oscale_v));
+		}
+		for (; i + 8 <= n; i += 8) {
+			__m256 t = _mm256_mul_ps(_mm256_loadu_ps(xr + i), scale_v);
+			_mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_fmadd_ps(t, _mm256_loadu_ps(w + i),
+																   _mm256_loadu_ps(rr + i)),
+												   oscale_v));
+		}
+		for (; i < n; i++)
+			yr[i] = (xr[i] * scale * w[i] + rr[i]) * oscale;
+	}
+}
+
+status_code cpu_rmsnorm_add_batch(backend *self, const buffer *x, const buffer *w,
+								  const buffer *residual, buffer *y, int n, float eps,
+								  float out_scale, int m) {
+	cpu_priv				 *p	  = self->priv;
+	cpu_rmsnorm_add_batch_job job = {.x			= cpu_ptr(x),
+									 .w			= cpu_ptr(w),
+									 .residual	= cpu_ptr(residual),
+									 .y			= cpu_ptr(y),
+									 .n			= n,
+									 .eps		= eps,
+									 .out_scale = out_scale};
+	cpu_run_batch(p->pool, m, cpu_rmsnorm_add_batch_chunk_avx, &job);
 	return OK;
 }
 
@@ -1632,6 +2011,65 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	}
 
 	return OK;
+}
+
+static qonly_fn x86_qonly_lookup(uint32_t w_type, uint32_t *want_q8) {
+	switch (w_type) {
+	case GGML_TYPE_IQ3_S:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_s_q8_k_qonly_f32;
+	case GGML_TYPE_IQ3_S_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_IQ2_S:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq2_s_q8_k_qonly_f32;
+	case GGML_TYPE_IQ2_XXS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32;
+	case GGML_TYPE_IQ3_XXS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32;
+	case GGML_TYPE_IQ4_XS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq4_xs_q8_k_qonly_f32;
+	case GGML_TYPE_Q8_0_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_q8_0_repacked_q8_qonly_f32;
+	case GGML_TYPE_Q4_0_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_q4_0_repacked_q8_qonly_f32;
+	case GGML_TYPE_IQ4_NL_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_iq4_nl_repacked_q8_qonly_f32;
+	case GGML_TYPE_Q4_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_Q5_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_Q6_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32;
+	default:
+		*want_q8 = 0;
+		return NULL;
+	}
+}
+
+status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
+							 uint32_t q8_type, buffer *y, int n, int k, int m) {
+	uint32_t want_q8 = 0;
+	qonly_fn fn		 = x86_qonly_lookup(w_type, &want_q8);
+	if (fn) {
+		if (q8_type != want_q8)
+			return ERR_INVALID_ARG;
+		if (m <= 0)
+			m = 1;
+		fn(cpu_ptr(w), x_q8->handle, (size_t)(k / 32), cpu_ptr(y), n, n, k, m);
+		return OK;
+	}
+	return cpu_matmul_qonly_shared(self, w, w_type, x_q8, q8_type, y, n, k, m);
 }
 
 void detect_features(char *buf, size_t cap) {

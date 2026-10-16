@@ -12,7 +12,15 @@
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
 	 BCAP_KV_POS_CAP)
 
+typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
+
 status_code cpu_backend_fill(backend *out);
+
+status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
+							 uint32_t q8_type, buffer *y, int n, int k, int m);
+status_code cpu_matmul_qonly_shared(backend *self, const buffer *w, uint32_t w_type,
+									const buffer *x_q8, uint32_t q8_type, buffer *y, int n, int k,
+									int m);
 
 #define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
 	static status_code ctor_fn(backend *out) {                                                     \
@@ -101,6 +109,10 @@ typedef struct {
 
 void feat_add(char *buf, size_t cap, const char *name);
 void detect_features(char *buf, size_t cap);
+
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
+							   const float *freq_factors, float **cs_out);
 
 static inline status_code cpu_buf_grow(void **p, size_t *cap_bytes, size_t need_bytes,
 									   size_t align) {
@@ -389,6 +401,15 @@ typedef struct {
 	int			 qn, kn, half, rope_dim, n_heads, n_kv_heads, head_dim;
 	int			 pos0;
 } cpu_partial_rope_qk_job;
+
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
 
 static inline void cpu_run_batch_full(tpool *pool, int m, int grain, int min_m,
 									  tpool_chunk_fn chunk, void *job) {
