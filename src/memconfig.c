@@ -139,6 +139,23 @@ int model_kv_layer_pos_cap(const model *m, int n_ctx, int kv_layer) {
 	return cap >= (long)n_ctx ? n_ctx : (int)cap;
 }
 
+size_t model_kv_slot_bytes(const model *m, int n_ctx, kv_quant_type kv_quant, int compacted,
+						   int slot) {
+	int kv_heads = model_layer_kv_heads(m, slot);
+	if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
+		slot < m->n_layers)
+		kv_heads = m->layer_dims.n_kv_heads_per_layer[slot] > 0
+					   ? m->layer_dims.n_kv_heads_per_layer[slot]
+					   : 0;
+	int hdim = model_layer_head_dim(m, slot);
+	int pcap = compacted ? model_kv_layer_pos_cap(m, n_ctx, slot) : n_ctx;
+	if (kv_quant == KV_QUANT_Q8_0) {
+		size_t n_blocks = ((size_t)hdim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+		return (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)pcap * 2;
+	}
+	return (size_t)kv_heads * (size_t)hdim * (size_t)pcap * sizeof(uint16_t) * 2;
+}
+
 size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
 								  int compacted) {
 	size_t kv_cache = 0;
@@ -151,22 +168,8 @@ size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_qu
 		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
 	if (n_kv_layers > m->n_layers)
 		n_kv_layers = m->n_layers;
-	for (int i = 0; i < n_kv_layers; i++) {
-		int kv_heads = model_layer_kv_heads(m, i);
-		if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
-			i < m->n_layers)
-			kv_heads = m->layer_dims.n_kv_heads_per_layer[i] > 0
-						   ? m->layer_dims.n_kv_heads_per_layer[i]
-						   : 0;
-		int hdim = model_layer_head_dim(m, i);
-		int pcap = compacted ? model_kv_layer_pos_cap(m, n_ctx, i) : n_ctx;
-		if (kv_quant == KV_QUANT_Q8_0) {
-			size_t n_blocks = ((size_t)hdim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-			kv_cache += (size_t)kv_heads * n_blocks * KV_Q8_0_BLOCK_BYTES * (size_t)pcap * 2;
-		} else {
-			kv_cache += (size_t)kv_heads * (size_t)hdim * (size_t)pcap * sizeof(uint16_t) * 2;
-		}
-	}
+	for (int i = 0; i < n_kv_layers; i++)
+		kv_cache += model_kv_slot_bytes(m, n_ctx, kv_quant, compacted, i);
 	return kv_cache;
 }
 
@@ -235,6 +238,19 @@ void model_mem_estimates_ensure(model *m) {
 	m->mem_non_expert_bytes = calc_non_expert_breakdown(m).total;
 	m->mem_per_expert_bytes = calc_per_expert_size(m);
 	m->mem_estimates_valid	= true;
+}
+
+size_t model_device_weight_bytes(const model *m, const backend *b) {
+	size_t total = 0;
+	for (int i = 0; i < m->n_layers; i++) {
+		if (model_layer_backend(m, i) != b)
+			continue;
+		total += calc_attn_bytes(m, i) + calc_dense_ffn_bytes(m, i) +
+				 calc_shared_expert_bytes(m, i) + calc_router_bytes(m, i);
+	}
+	if (b == m->backend)
+		total += calc_embeddings_bytes(m) + m->dim * sizeof(float);
+	return total;
 }
 
 static size_t model_total_weight_bytes(const model *m) {

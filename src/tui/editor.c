@@ -30,6 +30,7 @@ typedef struct {
 	bool		 probe_ok;
 	int			 n_layers;
 	int			 n_experts;
+	int			 n_kv_layers;
 	char		 status[160];
 	int			 status_kind;
 } editor_state;
@@ -224,8 +225,9 @@ static void editor_refresh_probe(editor_state *st) {
 	if (st->probed && strcmp(st->probe_path, st->sc.model) == 0)
 		return;
 	snprintf(st->probe_path, sizeof(st->probe_path), "%s", st->sc.model);
-	st->probed	 = true;
-	st->probe_ok = hcs_probe_model(st->sc.model, &st->n_layers, &st->n_experts) == 0;
+	st->probed = true;
+	st->probe_ok =
+		hcs_probe_model(st->sc.model, &st->n_layers, &st->n_experts, &st->n_kv_layers) == 0;
 	if (!editor_model_is_dense(st))
 		return;
 	for (int i = 0; i < st->sc.hcs.n_devices; i++) {
@@ -446,13 +448,20 @@ static int editor_draw_hcs_section(const editor_state *st, hcs_field field, int 
 	editor_draw_hcs_layer_grid(held, order, n_order, total, px, y, pw, grid_rows);
 	y += (MIN(total, pw * grid_rows) + pw - 1) / pw + 1;
 
+	int layer_start = 0;
 	for (int i = 0; i < n_order && y <= last; i++, y++) {
 		int	 d = order[i];
 		char name[HCS_NAME_MAX + 4];
-		char value[16];
+		char value[32];
 		snprintf(name, sizeof(name), "%c %s", symbols[d % 4], h->devices[d].name);
-		snprintf(value, sizeof(value), "%d", held[d]);
-		ui_putn(y, px, name, pw - 5, 0);
+		if (experts) {
+			snprintf(value, sizeof(value), "%d", held[d]);
+		} else {
+			int kv_layers = MAX(MIN(layer_start + held[d], st->n_kv_layers) - layer_start, 0);
+			snprintf(value, sizeof(value), "%d  kv %d", held[d], kv_layers);
+			layer_start += held[d];
+		}
+		ui_putn(y, px, name, pw - (int)strlen(value) - 1, 0);
 		ui_putn(y, px + pw - (int)strlen(value), value, pw, 0);
 	}
 	if (assigned < total && y <= last)
@@ -480,7 +489,20 @@ static void editor_draw_hcs_panel(const editor_state *st) {
 	bool moe = editor_model_is_moe(st);
 	int	 y	 = editor_draw_hcs_section(st, HCS_FIELD_LAYERS, st->n_layers, 2, last, moe ? 2 : 1);
 	if (moe)
-		editor_draw_hcs_section(st, HCS_FIELD_EXPERTS, st->n_experts, y, last, 1);
+		y = editor_draw_hcs_section(st, HCS_FIELD_EXPERTS, st->n_experts, y, last, 1);
+
+	int held[HCS_MAX_DEVICES];
+	int order[HCS_MAX_DEVICES];
+	hcs_resolve_counts(&st->sc.hcs, HCS_FIELD_LAYERS, st->n_layers, held);
+	int n_order = hcs_layout_order(&st->sc.hcs, order);
+	for (int i = 0; i < n_order && y <= last; i++) {
+		if (held[order[i]] == 0)
+			continue;
+		char primary[HCS_NAME_MAX + 16];
+		snprintf(primary, sizeof(primary), "primary: %s", st->sc.hcs.devices[order[i]].name);
+		ui_putn(y, px, primary, pw, ui_attr(UI_DIM));
+		break;
+	}
 }
 
 static void editor_draw_hcs_banner(const editor_state *st) {

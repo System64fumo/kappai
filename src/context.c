@@ -149,6 +149,31 @@ static status_code apply_layer_split(context *c, const config *cfg) {
 	return OK;
 }
 
+static void context_log_devices(context *c) {
+	for (int d = 0; d < kvcache_device_count(&c->kv); d++) {
+		backend *be	   = kvcache_device_backend(&c->kv, d);
+		int		 first = -1;
+		int		 last  = -1;
+		int		 n	   = 0;
+		for (int i = 0; i < c->m.n_layers; i++) {
+			if (model_layer_backend(&c->m, i) != be)
+				continue;
+			first = first < 0 ? i : first;
+			last  = i;
+			n++;
+		}
+		size_t weights = model_device_weight_bytes(&c->m, be);
+		size_t kv	   = kvcache_device_bytes(&c->kv, &c->m, d);
+		size_t avail   = backend_mem_available(be);
+		INFO("device '%s': %d layer(s)%s, weights %.0f MB, KV %.0f MB (%d slot(s)), %.1f GB free",
+			 be->name, n, n > 0 ? "" : " (none)", weights / (1024.0 * 1024.0),
+			 kv / (1024.0 * 1024.0), kvcache_device_slots(&c->kv, d),
+			 avail / (1024.0 * 1024.0 * 1024.0));
+		if (n > 0 && last - first + 1 == n)
+			DEBUG("device '%s' holds layers %d-%d", be->name, first, last);
+	}
+}
+
 status_code context_init(context *c, const config *cfg) {
 	memset(c, 0, sizeof(*c));
 	monitor_reset(&c->monitor);
@@ -312,6 +337,7 @@ status_code context_init(context *c, const config *cfg) {
 		}
 		DEBUG("mixed backend mode: allocated host KV cache mirror");
 	}
+	context_log_devices(c);
 
 	compute_scratch_init(&c->scratch);
 	c->scratch.interrupt = &c->interrupt;

@@ -459,12 +459,12 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 	}
 }
 
-int hcs_probe_model(const char *path, int *n_layers, int *n_experts) {
+int hcs_probe_model(const char *path, int *n_layers, int *n_experts, int *n_kv_layers) {
 	if (!path || !*path)
 		return -1;
 	log_level saved = log_get_level();
 	log_set_level((log_level)(LOG_ERROR + 1));
-	status_code s = model_probe_shape(path, n_layers, n_experts);
+	status_code s = model_probe_shape(path, n_layers, n_experts, n_kv_layers);
 	log_set_level(saved);
 	return s == OK ? 0 : -1;
 }
@@ -491,11 +491,11 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 	}
 	int experts_star_owner = check_experts_star(&v, h);
 
-	int n_layers = 0, n_experts = 0;
+	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
 	if (h->n_devices > 0) {
 		if (!config->enabled)
 			return err[0] ? -1 : 0;
-		if (hcs_probe_model(model_path, &n_layers, &n_experts) == 0)
+		if (hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) == 0)
 			check_model_rules(&v, h, n_layers, n_experts, star_owner, experts_star_owner);
 		else
 			v.len += snprintf(err + v.len, v.len < errlen ? errlen - v.len : 0,
@@ -515,8 +515,8 @@ int hcs_layout_order(const hcs_config *h, int *order) {
 }
 
 static void materialize_layer_map(const hcs_config *h, const char *model_path, config *cfg) {
-	int n_layers = 0, n_experts = 0;
-	if (hcs_probe_model(model_path, &n_layers, &n_experts) != 0)
+	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
+	if (hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) != 0)
 		return;
 
 	int held[HCS_MAX_DEVICES];

@@ -983,8 +983,33 @@ static int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buff
 	return n;
 }
 
+#define OP_FALLBACK_SEEN_MAX 64
+
+typedef struct {
+	const backend *be;
+	const char	  *op;
+} op_fallback_seen;
+
+static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
+static _Atomic int		g_op_fallback_n_seen;
+
+static void op_fallback_note(backend *a, const char *op_name) {
+	int n = atomic_load(&g_op_fallback_n_seen);
+	for (int i = 0; i < n && i < OP_FALLBACK_SEEN_MAX; i++)
+		if (g_op_fallback_seen[i].be == a && strcmp(g_op_fallback_seen[i].op, op_name) == 0)
+			return;
+	if (n >= OP_FALLBACK_SEEN_MAX)
+		return;
+	g_op_fallback_seen[n].be = a;
+	g_op_fallback_seen[n].op = op_name;
+	atomic_store(&g_op_fallback_n_seen, n + 1);
+	backend_report_host_fallback(a, op_name, HFB_OP_NOT_NATIVE,
+								 "backend has no native '%s'; running on the host fallback",
+								 op_name);
+}
+
 static inline backend *op_backend_fallback(backend *a, const char *op_name) {
-	(void)op_name;
+	op_fallback_note(a, op_name);
 	ensure_sync(a);
 	return op_host_backend();
 }

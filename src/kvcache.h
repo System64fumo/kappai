@@ -41,6 +41,9 @@ typedef struct kvcache {
 	int			  has_host_kv;
 	kv_mirror	  mirror[KV_MAX_MIRRORS];
 	int			  n_mirrors;
+	int			 *primary_remap;
+	int			  n_primary_remap;
+	int			  n_primary_slots;
 	unsigned	 *slot_devices;
 	int			  n_slot_devices;
 	float		 *kv_transfer_buf;
@@ -64,6 +67,10 @@ void		kvcache_reset(kvcache *c);
 
 status_code kvcache_alloc_mirrors(kvcache *c, const model *m);
 int			kvcache_layer_device(const kvcache *c, const model *m, int layer);
+int			kvcache_device_count(const kvcache *c);
+backend	   *kvcache_device_backend(const kvcache *c, int dev);
+int			kvcache_device_slots(const kvcache *c, int dev);
+size_t		kvcache_device_bytes(const kvcache *c, const model *m, int dev);
 void kvcache_attn_view(const kvcache *c, const model *m, int exec_layer, int kv_layer, buffer **k,
 					   buffer **v, int *slot);
 

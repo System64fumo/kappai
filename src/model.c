@@ -2162,7 +2162,7 @@ static status_code metadata_layer_counts(const gguf_ctx *g, const char *prefix, 
 	return OK;
 }
 
-status_code model_probe_shape(const char *path, int *n_layers, int *n_experts) {
+status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers) {
 	gguf_ctx	g;
 	status_code s = gguf_load_metadata(&g, path);
 	if (s != OK)
@@ -2184,8 +2184,11 @@ status_code model_probe_shape(const char *path, int *n_layers, int *n_experts) {
 			s = ERR_FORMAT;
 	}
 
-	*n_layers  = n_all - n_nextn;
-	*n_experts = experts;
+	int32_t kv_shared = 0;
+	akey_i32(&g, prefix, "attention.shared_kv_layers", &kv_shared);
+	*n_layers	 = n_all - n_nextn;
+	*n_experts	 = experts;
+	*n_kv_layers = kv_shared > 0 && kv_shared < *n_layers ? *n_layers - kv_shared : *n_layers;
 	gguf_free(&g);
 	return s;
 }

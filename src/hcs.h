@@ -79,7 +79,7 @@ int hcs_migrate_legacy(hcs_config *h, const hcs_legacy *legacy, char *err, size_
 
 int hcs_layout_order(const hcs_config *h, int *order);
 int hcs_resolve_counts(const hcs_config *h, hcs_field field, int total, int *held);
-int hcs_probe_model(const char *path, int *n_layers, int *n_experts);
+int hcs_probe_model(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 
 int hcs_validate(const hcs_config *h, const char *model_path, char *err, size_t errlen);
 

@@ -80,8 +80,8 @@ static hcs_config two_devices(const char *a, int layers_a, const char *b, int la
 }
 
 static void test_layer_map(void) {
-	int n_layers = 0, n_experts = 0;
-	int probe_rc = model_probe_shape(synth_chat_model_path, &n_layers, &n_experts);
+	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
+	int probe_rc = model_probe_shape(synth_chat_model_path, &n_layers, &n_experts, &n_kv_layers);
 
 	hcs_config h = two_devices("cpu_scalar_0", 1, "opengl_0", HCS_COUNT_ALL);
 	int		   held[HCS_MAX_DEVICES];
@@ -169,8 +169,8 @@ static void test_legacy(void) {
 }
 
 static void test_validate(void) {
-	int n_layers = 0, n_experts = 0;
-	if (model_probe_shape(synth_chat_model_path, &n_layers, &n_experts) != OK) {
+	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
+	if (model_probe_shape(synth_chat_model_path, &n_layers, &n_experts, &n_kv_layers) != OK) {
 		record_hcs("validate.setup", 0, "cannot probe synthetic model");
 		return;
 	}
