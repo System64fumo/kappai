@@ -30,6 +30,7 @@ ifneq ($(UNKNOWN_BACKENDS),)
   $(error Unknown backend(s): $(UNKNOWN_BACKENDS). Available backends: $(AVAILABLE_BACKENDS))
 endif
 HAS_VULKAN  := $(filter vulkan,$(REQUESTED_BACKENDS))
+HAS_CUDA    := $(filter cuda,$(REQUESTED_BACKENDS))
 HAS_OPENGL := $(filter opengl,$(REQUESTED_BACKENDS))
 
 CONFIG_FILE := $(OUT_DIR)/config.mk
@@ -128,6 +129,67 @@ ifneq ($(HAS_OPENGL),)
   GL_BACKEND_INCLUDES := -I$(OBJ_DIR)/backend/opengl -I$(SRC_DIR)/backend/opengl
 endif
 
+# CUDA toolchain discovery, GPU arch detection and link flags. Guarded so a
+# build without BACKENDS=cuda never needs nvcc.
+ifneq ($(HAS_CUDA),)
+  NVCC ?= nvcc
+  ifeq ($(strip $(shell command -v $(NVCC) 2>/dev/null)),)
+    $(error CUDA backend requested (BACKENDS=cuda) but 'nvcc' was not found on PATH. \
+            Install the CUDA Toolkit (which provides nvcc and libcudart), or build without BACKENDS=cuda.)
+  endif
+  # Derive CUDA_HOME from where nvcc lives: $CUDA_HOME/bin/nvcc
+  CUDA_HOME := $(patsubst %/bin/nvcc,%,$(firstword $(shell which $(NVCC))))
+  ifeq ($(strip $(CUDA_HOME)),)
+    CUDA_HOME ?= /usr/local/cuda
+  endif
+
+  # Auto-detect GPU compute capability (nvidia-smi, else nvcc, else a default).
+  DETECTED_GPU := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)
+  ifneq ($(strip $(DETECTED_GPU)),)
+    DETECTED_ARCH := compute_$(subst .,$(empty),$(DETECTED_GPU))
+  else
+    NVCC_SUPPORTED := $(shell $(NVCC) --list-gpu-code 2>/dev/null | head -1)
+    ifneq ($(strip $(NVCC_SUPPORTED)),)
+      DETECTED_ARCH := compute_$(word 1,$(subst _, ,$(NVCC_SUPPORTED)))
+    else
+      DETECTED_ARCH := compute_86
+    endif
+  endif
+  override NVCC_ARCH ?= $(DETECTED_ARCH)
+
+  CFLAGS += -DBACKEND_CUDA -I$(CUDA_HOME)/include
+  CUDA_LDFLAGS := -L$(CUDA_HOME)/lib64 -lcudart
+  # WSL2 libcuda bind fix: a conflicting libcuda.so.1 visible to the loader
+  # (a stale native-driver copy in /usr/lib/x86_64-linux-gnu) makes libcublas
+  # poison device enumeration (CUDA error 100) or segfault at load. Forcing
+  # the WSL stub as a direct dependency (RUNPATH-scoped) binds the right
+  # libcuda first. Guarded: no-op where the WSL stub is absent.
+  ifneq ($(wildcard /usr/lib/wsl/lib/libcuda.so.1),)
+    CUDA_LDFLAGS += -Wl,--no-as-needed /usr/lib/wsl/lib/libcuda.so.1 -Wl,--as-needed \
+                    -Wl,-rpath,/usr/lib/wsl/lib
+  endif
+  # cuBLAS HMMA prefill (optional): guarded so CUDA builds without cuBLAS dev
+  # files still compile (the code is behind HAVE_CUBLAS). NVCC_CUBLAS_DEF must
+  # be passed to nvcc explicitly: the plain CFLAGS do not reach the .cu rule.
+  ifneq ($(wildcard /usr/include/cublas_api.h /usr/local/cuda*/targets/x86_64-linux/include/cublas_api.h $(CUDA_HOME)/include/cublas_api.h),)
+    CFLAGS += -DHAVE_CUBLAS
+    NVCC_CUBLAS_DEF := -DHAVE_CUBLAS
+    CUDA_LDFLAGS += -lcublas
+  endif
+  NVCC_CUBLAS_DEF ?=
+  LDFLAGS += $(CUDA_LDFLAGS)
+endif
+
+# CUDA sources: host-side .c plus device .cu (nvcc). Every one of them becomes
+# part of the dlopen'd backend library -- nothing under backend/cuda is linked
+# into the engine, so the backend is a self-contained drop-in.
+CUDA_C_SRCS  :=
+CUDA_CU_SRCS :=
+ifneq ($(HAS_CUDA),)
+  CUDA_C_SRCS  := $(wildcard $(SRC_DIR)/backend/cuda/*.c)
+  CUDA_CU_SRCS := $(wildcard $(SRC_DIR)/backend/cuda/*.cu)
+endif
+
 LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/*.c) \
 	$(wildcard $(SRC_DIR)/models/*.c) \
@@ -172,6 +234,15 @@ ifneq ($(HAS_VULKAN),)
   VK_BACKEND := $(BACKEND_DIR)/libkappai_vulkan.so
   BACKEND_LIBS += $(VK_BACKEND)
   BACKEND_OBJS += $(VK_BACKEND_OBJS)
+endif
+
+ifneq ($(HAS_CUDA),)
+  CUDA_BACKEND_OBJS := \
+	$(patsubst $(SRC_DIR)/backend/cuda/%.c,$(BACKEND_OBJ_DIR)/backend/cuda/%.o,$(CUDA_C_SRCS)) \
+	$(patsubst $(SRC_DIR)/backend/cuda/%.cu,$(BACKEND_OBJ_DIR)/backend/cuda/%.o,$(CUDA_CU_SRCS))
+  CUDA_BACKEND := $(BACKEND_DIR)/libkappai_cuda.so
+  BACKEND_LIBS += $(CUDA_BACKEND)
+  BACKEND_OBJS += $(CUDA_BACKEND_OBJS)
 endif
 
 ifneq ($(HAS_OPENGL),)
@@ -438,6 +509,26 @@ $(VK_BACKEND): $(VK_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) -shared $(BACKEND_CFLAGS) $(VK_BACKEND_OBJS) \
 		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(LDFLAGS) -lvulkan -o $@
+	$(SPLIT_DEBUG)
+endif
+
+# CUDA device kernels: compiled by nvcc. Host-side flags go through
+# -Xcompiler because plain CFLAGS do not reach the .cu rule.
+# NVCC_ARCH may be overridden, e.g. make NVCC_ARCH=compute_75 BACKENDS=cuda.
+ifneq ($(HAS_CUDA),)
+$(BACKEND_OBJ_DIR)/backend/cuda/%.o: $(SRC_DIR)/backend/cuda/%.cu | $(OUT_DIR) $(CONFIG_FILE)
+	@mkdir -p $(dir $@)
+	@echo "  NVCC    $@"
+	@$(NVCC) -x cu -c \
+		-Xcompiler -fPIC,-O3 \
+		-std=c++14 -arch=$(NVCC_ARCH) $(NVCC_CUBLAS_DEF) \
+		-I$(CUDA_HOME)/include -I$(SRC_DIR) -I$(OBJ_DIR) \
+		$< -o $@
+
+$(CUDA_BACKEND): $(CUDA_BACKEND_OBJS) | $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) -shared $(BACKEND_CFLAGS) $(CUDA_BACKEND_OBJS) \
+		-L$(OUT_DIR) -lkappai -Wl,-rpath,'$$ORIGIN/..' $(CUDA_LDFLAGS) -o $@
 	$(SPLIT_DEBUG)
 endif
 
