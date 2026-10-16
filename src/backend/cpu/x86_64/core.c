@@ -2013,6 +2013,65 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	return OK;
 }
 
+static qonly_fn x86_qonly_lookup(uint32_t w_type, uint32_t *want_q8) {
+	switch (w_type) {
+	case GGML_TYPE_IQ3_S:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_s_q8_k_qonly_f32;
+	case GGML_TYPE_IQ3_S_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_IQ2_S:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq2_s_q8_k_qonly_f32;
+	case GGML_TYPE_IQ2_XXS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32;
+	case GGML_TYPE_IQ3_XXS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32;
+	case GGML_TYPE_IQ4_XS:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_iq4_xs_q8_k_qonly_f32;
+	case GGML_TYPE_Q8_0_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_q8_0_repacked_q8_qonly_f32;
+	case GGML_TYPE_Q4_0_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_q4_0_repacked_q8_qonly_f32;
+	case GGML_TYPE_IQ4_NL_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_0;
+		return (qonly_fn)matmul_iq4_nl_repacked_q8_qonly_f32;
+	case GGML_TYPE_Q4_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_Q5_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32;
+	case GGML_TYPE_Q6_K_REPACKED:
+		*want_q8 = GGML_TYPE_Q8_K;
+		return (qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32;
+	default:
+		*want_q8 = 0;
+		return NULL;
+	}
+}
+
+status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
+							 uint32_t q8_type, buffer *y, int n, int k, int m) {
+	uint32_t want_q8 = 0;
+	qonly_fn fn		 = x86_qonly_lookup(w_type, &want_q8);
+	if (fn) {
+		if (q8_type != want_q8)
+			return ERR_INVALID_ARG;
+		if (m <= 0)
+			m = 1;
+		fn(cpu_ptr(w), x_q8->handle, (size_t)(k / 32), cpu_ptr(y), n, n, k, m);
+		return OK;
+	}
+	return cpu_matmul_qonly_shared(self, w, w_type, x_q8, q8_type, y, n, k, m);
+}
+
 void detect_features(char *buf, size_t cap) {
 	buf[0] = '\0';
 	feat_add(buf, cap, "x86_64");

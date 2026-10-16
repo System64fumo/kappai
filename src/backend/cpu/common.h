@@ -12,7 +12,15 @@
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
 	 BCAP_KV_POS_CAP)
 
+typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
+
 status_code cpu_backend_fill(backend *out);
+
+status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
+							 uint32_t q8_type, buffer *y, int n, int k, int m);
+status_code cpu_matmul_qonly_shared(backend *self, const buffer *w, uint32_t w_type,
+									const buffer *x_q8, uint32_t q8_type, buffer *y, int n, int k,
+									int m);
 
 #define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
 	static status_code ctor_fn(backend *out) {                                                     \

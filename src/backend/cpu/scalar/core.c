@@ -19,8 +19,6 @@
 #define CPU_QUANTIZE_MIN_ROWS_PER_THREAD 8
 #define CPU_ELEMWISE_MIN_PER_THREAD 4096
 
-typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
-
 typedef struct {
 	qonly_fn qonly;
 	uint32_t w_type;
@@ -1287,9 +1285,9 @@ __attribute__((weak)) status_code cpu_prequantize_x(backend *self, const buffer 
 	return OK;
 }
 
-__attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
-												   const buffer *x_q8, uint32_t q8_type, buffer *y,
-												   int n, int k, int m) {
+status_code cpu_matmul_qonly_shared(backend *self, const buffer *w, uint32_t w_type,
+									const buffer *x_q8, uint32_t q8_type, buffer *y, int n, int k,
+									int m) {
 	(void)self;
 	const matmul_kernel *entry = matmul_kernel_lookup(w_type);
 	if (!entry)
@@ -1303,6 +1301,12 @@ __attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *
 	int	   y_row_stride			= n;
 	entry->qonly(cpu_ptr(w), x_q8->handle, xq_row_stride_blocks, cpu_ptr(y), y_row_stride, n, k, m);
 	return OK;
+}
+
+__attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
+												   const buffer *x_q8, uint32_t q8_type, buffer *y,
+												   int n, int k, int m) {
+	return cpu_matmul_qonly_shared(self, w, w_type, x_q8, q8_type, y, n, k, m);
 }
 
 __attribute__((weak)) status_code cpu_rope_batch(backend *self, buffer *vec, int n_heads,
