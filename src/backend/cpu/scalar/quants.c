@@ -2315,6 +2315,191 @@ MATMUL_Q8_F32(q5_k_q8_k, q8_k_block, 256, quantize_q8_k, matmul_q5_k_q8_k_qonly_
 #undef MATMUL_Q8_F32
 
 MATMUL_QONLY_DISPATCH(q5_k_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(q5_k_block))
+
+static inline int32_t iq_vals_dot(const int8_t *vals, const int32_t *iscale, const int8_t *q8) {
+	int32_t tot = 0;
+	for (int g = 0; g < 16; g++) {
+		const int8_t *v	 = vals + (g * 16);
+		const int8_t *q	 = q8 + (g * 16);
+		int32_t		  gd = 0;
+		for (int j = 0; j < 16; j++)
+			gd += (int32_t)v[j] * (int32_t)q[j];
+		tot += iscale[g] * gd;
+	}
+	return tot;
+}
+
+static inline void iq2_xxs_unpack_scalar(const iq2_xxs_block *b, int8_t *vals, int32_t *iscale) {
+	uint32_t	   aux[2];
+	const uint8_t *a = (const uint8_t *)aux;
+	for (int ib = 0; ib < 8; ib++) {
+		memcpy(aux, b->qs + (4 * ib), 8);
+		uint8_t m			 = (uint8_t)(1 + 2 * (aux[1] >> 28));
+		iscale[2 * ib]		 = m;
+		iscale[(2 * ib) + 1] = m;
+		for (int l = 0; l < 4; l++) {
+			const uint8_t *grid	 = (const uint8_t *)&ggml_iq2xxs_grid[a[l]];
+			uint8_t		   signs = ggml_ksigns_iq2xs[(aux[1] >> (7 * l)) & 127];
+			int8_t		  *v	 = vals + (ib * 32) + (l * 8);
+			for (int j = 0; j < 8; j++)
+				v[j] = (signs & kmask_iq2xs[j]) ? -(int8_t)grid[j] : (int8_t)grid[j];
+		}
+	}
+}
+
+static inline void iq3_xxs_unpack_scalar(const iq3_xxs_block *b, int8_t *vals, int32_t *iscale) {
+	const uint8_t *qs = b->qs;
+	const uint8_t *ss = b->qs + 64;
+	for (int ib = 0; ib < 8; ib++) {
+		uint32_t aux;
+		memcpy(&aux, ss + (4 * ib), 4);
+		uint8_t m			 = (uint8_t)(1 + 2 * (aux >> 28));
+		iscale[2 * ib]		 = m;
+		iscale[(2 * ib) + 1] = m;
+		for (int l = 0; l < 4; l++) {
+			uint8_t signs = ggml_ksigns_iq2xs[(aux >> (7 * l)) & 127];
+			uint8_t tmp[8];
+			memcpy(tmp, &ggml_iq3xxs_grid[qs[2 * l]], 4);
+			memcpy(tmp + 4, &ggml_iq3xxs_grid[qs[(2 * l) + 1]], 4);
+			int8_t *v = vals + (ib * 32) + (l * 8);
+			for (int j = 0; j < 8; j++)
+				v[j] = (signs & kmask_iq2xs[j]) ? -(int8_t)tmp[j] : (int8_t)tmp[j];
+		}
+		qs += 8;
+	}
+}
+
+static inline int32_t iq2_s_dot_scalar(const iq2_s_block *b, const int8_t *q8) {
+	const uint8_t *qs	 = b->qs;
+	const uint8_t *qh	 = b->qh;
+	const uint8_t *signs = b->qs + 32;
+	int32_t		   tot	 = 0;
+	for (int ib = 0; ib < 8; ib++) {
+		uint8_t		  sb = b->scales[ib];
+		const int8_t *qg = q8 + (ib * 32);
+		int32_t		  gd0 = 0, gd1 = 0;
+		for (int l = 0; l < 4; l++) {
+			const uint8_t *grid =
+				(const uint8_t *)&ggml_iq2s_grid[qs[l] | ((qh[ib] << (8 - (2 * l))) & 0x300)];
+			uint8_t sg = signs[l];
+			int8_t	w[8];
+			for (int j = 0; j < 8; j++)
+				w[j] = (sg & kmask_iq2xs[j]) ? -(int8_t)grid[j] : (int8_t)grid[j];
+			int32_t gd = 0;
+			for (int j = 0; j < 8; j++)
+				gd += (int32_t)w[j] * (int32_t)qg[(l * 8) + j];
+			if (l < 2)
+				gd0 += gd;
+			else
+				gd1 += gd;
+		}
+		tot += (1 + 2 * (sb & 0xf)) * gd0 + (1 + 2 * (sb >> 4)) * gd1;
+		qs += 4;
+		signs += 4;
+	}
+	return tot;
+}
+
+static void matmul_iq2_xxs_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	int			   bpr = k / 256;
+	size_t		   rs  = (size_t)bpr * sizeof(iq2_xxs_block);
+	const uint8_t *wb  = w;
+	for (int i = 0; i < n; i++) {
+		const uint8_t *row	= wb + ((size_t)i * rs);
+		float		   sumf = 0.0f;
+		for (int bi = 0; bi < bpr; bi++) {
+			const iq2_xxs_block *b =
+				(const iq2_xxs_block *)(row + ((size_t)bi * sizeof(iq2_xxs_block)));
+			int8_t	vals[256];
+			int32_t iscale[16];
+			iq2_xxs_unpack_scalar(b, vals, iscale);
+			int32_t tot = iq_vals_dot(vals, iscale, xq[bi].qs);
+			sumf += 0.125f * f16_to_f32(b->d) * xq[bi].d * (float)tot;
+		}
+		y[i] = sumf;
+	}
+}
+
+static void matmul_iq3_xxs_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											  float *restrict y, int n, int k) {
+	int			   bpr = k / 256;
+	size_t		   rs  = (size_t)bpr * sizeof(iq3_xxs_block);
+	const uint8_t *wb  = w;
+	for (int i = 0; i < n; i++) {
+		const uint8_t *row	= wb + ((size_t)i * rs);
+		float		   sumf = 0.0f;
+		for (int bi = 0; bi < bpr; bi++) {
+			const iq3_xxs_block *b =
+				(const iq3_xxs_block *)(row + ((size_t)bi * sizeof(iq3_xxs_block)));
+			int8_t	vals[256];
+			int32_t iscale[16];
+			iq3_xxs_unpack_scalar(b, vals, iscale);
+			int32_t tot = iq_vals_dot(vals, iscale, xq[bi].qs);
+			sumf += 0.25f * f16_to_f32(b->d) * xq[bi].d * (float)tot;
+		}
+		y[i] = sumf;
+	}
+}
+
+static void matmul_iq2_s_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											float *restrict y, int n, int k) {
+	int			   bpr = k / 256;
+	size_t		   rs  = (size_t)bpr * sizeof(iq2_s_block);
+	const uint8_t *wb  = w;
+	for (int i = 0; i < n; i++) {
+		const uint8_t *row	= wb + ((size_t)i * rs);
+		float		   sumf = 0.0f;
+		for (int bi = 0; bi < bpr; bi++) {
+			const iq2_s_block *b = (const iq2_s_block *)(row + ((size_t)bi * sizeof(iq2_s_block)));
+			int32_t			   tot = iq2_s_dot_scalar(b, xq[bi].qs);
+			sumf += 0.125f * f16_to_f32(b->d) * xq[bi].d * (float)tot;
+		}
+		y[i] = sumf;
+	}
+}
+
+static inline int32_t iq4_xs_dot_scalar(const iq4_xs_block *b, const int8_t *q8) {
+	const uint8_t *qs  = b->qs;
+	int32_t		   tot = 0;
+	for (int ib = 0; ib < 8; ib++) {
+		int			  sl = (b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+		int			  sh = (b->scales_h >> (2 * ib)) & 3;
+		int			  dl = (sl | (sh << 4)) - 32;
+		const int8_t *qg = q8 + (ib * 32);
+		int32_t		  gd = 0;
+		for (int j = 0; j < 16; j++) {
+			gd += (int32_t)kvalues_iq4nl[qs[j] & 0xf] * (int32_t)qg[j];
+			gd += (int32_t)kvalues_iq4nl[qs[j] >> 4] * (int32_t)qg[j + 16];
+		}
+		tot += dl * gd;
+		qs += 16;
+	}
+	return tot;
+}
+
+static void matmul_iq4_xs_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+											 float *restrict y, int n, int k) {
+	int			   bpr = k / 256;
+	size_t		   rs  = (size_t)bpr * sizeof(iq4_xs_block);
+	const uint8_t *wb  = w;
+	for (int i = 0; i < n; i++) {
+		const uint8_t *row	= wb + ((size_t)i * rs);
+		float		   sumf = 0.0f;
+		for (int bi = 0; bi < bpr; bi++) {
+			const iq4_xs_block *b =
+				(const iq4_xs_block *)(row + ((size_t)bi * sizeof(iq4_xs_block)));
+			int32_t tot = iq4_xs_dot_scalar(b, xq[bi].qs);
+			sumf += f16_to_f32(b->d) * xq[bi].d * (float)tot;
+		}
+		y[i] = sumf;
+	}
+}
+
+MATMUL_QONLY_DISPATCH(iq2_s_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq2_s_block))
+MATMUL_QONLY_DISPATCH(iq2_xxs_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq2_xxs_block))
+MATMUL_QONLY_DISPATCH(iq3_xxs_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq3_xxs_block))
+MATMUL_QONLY_DISPATCH(iq4_xs_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq4_xs_block))
 #undef MATMUL_QONLY_DISPATCH
 
 __attribute__((weak)) void matmul_f32_f32(const float *restrict w, const float *restrict x,
@@ -2511,55 +2696,4 @@ __attribute__((weak)) void moe_activate_gelu(float *restrict act, const float *r
 											 const float *restrict up, int n, float gs, float us) {
 	for (int i = 0; i < n; i++)
 		act[i] = gelu_tanh(gate[i] * gs) * (up[i] * us);
-}
-
-__attribute__((weak)) void iq_qonly_via_dequant(const void *w, uint32_t				  wtype,
-												const q8_k_block *restrict xq, size_t xs,
-												float *restrict y, int ys, int n, int k, int m) {
-	dequant_blocks_fn dq  = NULL;
-	int				  div = 256;
-	dequant_row_plan(wtype, &dq, &div);
-	size_t wb  = ggml_row_size(wtype, k);
-	int	   bpr = k / 256;
-	float *xf  = malloc((size_t)k * sizeof(float));
-	float *wf  = malloc((size_t)k * sizeof(float));
-	for (int t = 0; t < m; t++) {
-		const q8_k_block *xb = xq + (size_t)t * xs;
-		for (int bi = 0; bi < bpr; bi++) {
-			float	d  = xb[bi].d;
-			int8_t *qs = (int8_t *)xb[bi].qs;
-			for (int j = 0; j < 256; j++)
-				xf[bi * 256 + j] = d * (float)qs[j];
-		}
-		for (int i = 0; i < n; i++) {
-			const uint8_t *row = (const uint8_t *)w + (size_t)i * wb;
-			dq(row, (size_t)(k / div), wf);
-			double acc = 0;
-			for (int j = 0; j < k; j++)
-				acc += (double)wf[j] * (double)xf[j];
-			y[(size_t)t * ys + i] = (float)acc;
-		}
-	}
-	free(xf);
-	free(wf);
-}
-__attribute__((weak)) void matmul_iq2_s_q8_k_qonly_f32(const void *w, const q8_k_block *x,
-													   size_t xs, float *y, int ys, int n, int k,
-													   int m) {
-	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_S, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
-}
-__attribute__((weak)) void matmul_iq2_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
-														 size_t xs, float *y, int ys, int n, int k,
-														 int m) {
-	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
-}
-__attribute__((weak)) void matmul_iq3_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
-														 size_t xs, float *y, int ys, int n, int k,
-														 int m) {
-	iq_qonly_via_dequant(w, GGML_TYPE_IQ3_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
-}
-__attribute__((weak)) void matmul_iq4_xs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
-														size_t xs, float *y, int ys, int n, int k,
-														int m) {
-	iq_qonly_via_dequant(w, GGML_TYPE_IQ4_XS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
 }
