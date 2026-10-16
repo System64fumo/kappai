@@ -85,7 +85,7 @@ static void test_layer_map(void) {
 
 	hcs_config h = two_devices("cpu_scalar_0", 1, "opengl_0", HCS_COUNT_ALL);
 	int		   held[HCS_MAX_DEVICES];
-	int		   assigned = hcs_resolve_layers(&h, n_layers, held);
+	int		   assigned = hcs_resolve_counts(&h, HCS_FIELD_LAYERS, n_layers, held);
 	int		   ok		= assigned == n_layers && held[0] == 1 && held[1] == n_layers - 1;
 	record_hcs("map.resolve_star_takes_remainder", ok, "assigned=%d probe=%d n=%d", assigned,
 			   probe_rc, n_layers);
@@ -203,10 +203,15 @@ static void test_validate(void) {
 	h = single_device("cpu", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
 	record_hcs("validate.bare_name_rejected", validate_has(&h, "<backend>_<n>"), "");
 
-	h			 = single_device("cpu_scalar_0", HCS_TASKS_ALL, 1, 8);
-	h.n_devices	 = 2;
-	h.devices[1] = single_device("cpu_x86_64_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4).devices[0];
-	record_hcs("validate.experts_must_match", validate_has(&h, "differs from"), "");
+	h			= single_device("cpu_scalar_0", HCS_TASKS_ALL, 1, 8);
+	h.n_devices = 2;
+	h.devices[1] =
+		single_device("cpu_x86_64_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_ALL).devices[0];
+	int expert_held[HCS_MAX_DEVICES];
+	int expert_total = hcs_resolve_counts(&h, HCS_FIELD_EXPERTS, 64, expert_held);
+	record_hcs("map.experts_star_takes_remainder",
+			   expert_total == 64 && expert_held[0] == 8 && expert_held[1] == 56, "total=%d",
+			   expert_total);
 
 	char available[4][BACKEND_DEVICE_NAME_MAX];
 	if (backend_enum_devices(available, 4) >= 2 && n_layers >= 2) {

@@ -17,6 +17,11 @@
 #define HCS_COUNT_ALL (-1)
 #define HCS_COUNT_UNSET (-2)
 
+typedef enum {
+	HCS_FIELD_LAYERS,
+	HCS_FIELD_EXPERTS,
+} hcs_field;
+
 typedef struct {
 	char	 name[HCS_NAME_MAX];
 	unsigned tasks;
@@ -73,7 +78,7 @@ int	 hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t e
 int hcs_migrate_legacy(hcs_config *h, const hcs_legacy *legacy, char *err, size_t errlen);
 
 int hcs_layout_order(const hcs_config *h, int *order);
-int hcs_resolve_layers(const hcs_config *h, int n_layers, int *held);
+int hcs_resolve_counts(const hcs_config *h, hcs_field field, int total, int *held);
 int hcs_probe_model(const char *path, int *n_layers, int *n_experts);
 
 int hcs_validate(const hcs_config *h, const char *model_path, char *err, size_t errlen);

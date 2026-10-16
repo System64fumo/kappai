@@ -60,11 +60,16 @@ static const char EDITOR_HCS_ENABLE_HINT[] =
 static const char EDITOR_MODEL_DEVICE_HINT[] =
 	"compute device to run on; with HCS enabled it is set in the hcs tab";
 
+static const char EDITOR_HCS_MOE_LAYERS_HINT[] =
+	"non-expert layers held (attention, norms, shared weights), a number or '*' for the "
+	"remainder (one '*' per config)";
+
 static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"compute device, <backend>_<n>",
 	"phases this device runs for the weights it holds",
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
-	"per-layer expert cache size, number, '*' or empty for the default",
+	"experts of every layer stored on this device, a number, '*' for the remainder (one '*' per "
+	"config) or empty for the default",
 };
 
 static int editor_tab_count(void) {
@@ -79,14 +84,22 @@ static const schema_tab *editor_schema_tab(int tab) {
 	return &SCHEMA_TABS[tab];
 }
 
+static bool editor_model_is_dense(const editor_state *st) {
+	return st->probe_ok && st->n_experts == 0;
+}
+
+static bool editor_model_is_moe(const editor_state *st) {
+	return st->probe_ok && st->n_experts > 0;
+}
+
+static bool editor_hcs_compact(const editor_state *st) {
+	return st->sc.hcs.enabled && COLS < EDITOR_HCS_PANEL_MIN_COLS;
+}
+
 static int editor_header_lines(const editor_state *st, int tab) {
 	if (!editor_tab_is_hcs(tab))
 		return 0;
-	return EDITOR_HCS_BANNER_LINES;
-}
-
-static bool editor_model_is_dense(const editor_state *st) {
-	return st->probe_ok && st->n_experts == 0;
+	return EDITOR_HCS_BANNER_LINES + (editor_hcs_compact(st) && editor_model_is_moe(st) ? 1 : 0);
 }
 
 static int editor_hcs_fields_per_device(const editor_state *st) {
@@ -298,7 +311,7 @@ static void editor_draw_tabs(const editor_state *st) {
 }
 
 static bool editor_hcs_panel_visible(const editor_state *st) {
-	return editor_tab_is_hcs(st->tab) && st->sc.hcs.enabled && COLS >= EDITOR_HCS_PANEL_MIN_COLS;
+	return editor_tab_is_hcs(st->tab) && st->sc.hcs.enabled && !editor_hcs_compact(st);
 }
 
 static void editor_draw_rows(const editor_state *st) {
@@ -344,8 +357,7 @@ static void editor_draw_rows(const editor_state *st) {
 	}
 }
 
-static void editor_hcs_summary(const editor_state *st, int assigned, char *out, size_t cap) {
-	int n = st->n_layers;
+static void editor_hcs_summary(int n, int assigned, char *out, size_t cap) {
 	if (assigned == n)
 		snprintf(out, cap, "all satisfied");
 	else if (assigned < n)
@@ -354,19 +366,27 @@ static void editor_hcs_summary(const editor_state *st, int assigned, char *out, 
 		snprintf(out, cap, "%d over-assigned", assigned - n);
 }
 
+static void editor_draw_hcs_compact_line(const editor_state *st, int y, hcs_field field,
+										 int total) {
+	const char *name = field == HCS_FIELD_EXPERTS ? "experts" : "layers";
+	int			held[HCS_MAX_DEVICES];
+	int			assigned = hcs_resolve_counts(&st->sc.hcs, field, total, held);
+	char		summary[48];
+	char		line[128];
+	editor_hcs_summary(total, assigned, summary, sizeof(summary));
+	snprintf(line, sizeof(line), "%s: %d total, %d assigned, %s", name, total, MIN(assigned, total),
+			 summary);
+	ui_putn(y, 3, line, COLS - 6, assigned == total ? ui_attr(UI_OK) : ui_attr(UI_ERR));
+}
+
 static void editor_draw_hcs_compact(const editor_state *st) {
 	if (!st->probe_ok || st->n_layers <= 0) {
 		ui_putn(3, 3, "layers: unknown (model unreadable)", COLS - 6, ui_attr(UI_DIM));
 		return;
 	}
-	int	 held[HCS_MAX_DEVICES];
-	int	 assigned = hcs_resolve_layers(&st->sc.hcs, st->n_layers, held);
-	char summary[48];
-	char line[128];
-	editor_hcs_summary(st, assigned, summary, sizeof(summary));
-	snprintf(line, sizeof(line), "layers: %d total, %d assigned, %s", st->n_layers,
-			 MIN(assigned, st->n_layers), summary);
-	ui_putn(3, 3, line, COLS - 6, assigned == st->n_layers ? ui_attr(UI_OK) : ui_attr(UI_ERR));
+	editor_draw_hcs_compact_line(st, 3, HCS_FIELD_LAYERS, st->n_layers);
+	if (editor_model_is_moe(st))
+		editor_draw_hcs_compact_line(st, 4, HCS_FIELD_EXPERTS, st->n_experts);
 }
 
 static void editor_draw_hcs_layer_grid(const int *held, const int *order, int n_order, int n_layers,
@@ -394,58 +414,73 @@ static void editor_draw_hcs_layer_grid(const int *held, const int *order, int n_
 	}
 }
 
-static void editor_draw_hcs_panel(const editor_state *st) {
+static void editor_draw_hcs_value(int y, int px, int pw, const char *label, int value) {
+	char text[16];
+	snprintf(text, sizeof(text), "%d", value);
+	ui_putn(y, px, label, pw, ui_attr(UI_DIM));
+	ui_putn(y, px + pw - (int)strlen(text), text, pw, 0);
+}
+
+static int editor_draw_hcs_section(const editor_state *st, hcs_field field, int total, int y,
+								   int last, int sections_left) {
 	static const char symbols[] = "#=+~";
 	const hcs_config *h			= &st->sc.hcs;
+	bool			  experts	= field == HCS_FIELD_EXPERTS;
 	int				  px		= COLS - EDITOR_HCS_PANEL_W;
 	int				  pw		= EDITOR_HCS_PANEL_W - 2;
-	int				  last		= LINES - 3;
+	int				  held[HCS_MAX_DEVICES];
+	int				  assigned = hcs_resolve_counts(h, field, total, held);
+	int				  order[HCS_MAX_DEVICES];
+	int				  n_order = hcs_layout_order(h, order);
+	char			  summary[48];
+	editor_hcs_summary(total, assigned, summary, sizeof(summary));
+
+	ui_putn(y++, px, experts ? "Expert status" : "Layer status", pw, A_BOLD);
+	editor_draw_hcs_value(y++, px, pw, experts ? "Experts per layer" : "Model layers", total);
+	editor_draw_hcs_value(y++, px, pw, "Assigned", MIN(assigned, total));
+	ui_putn(y++, px, summary, pw, assigned == total ? ui_attr(UI_OK) : ui_attr(UI_ERR));
+	y++;
+
+	int budget	  = (last - y + 1) / sections_left;
+	int grid_rows = MAX(MIN((total + pw - 1) / pw, budget - n_order - 2), 1);
+	editor_draw_hcs_layer_grid(held, order, n_order, total, px, y, pw, grid_rows);
+	y += (MIN(total, pw * grid_rows) + pw - 1) / pw + 1;
+
+	for (int i = 0; i < n_order && y <= last; i++, y++) {
+		int	 d = order[i];
+		char name[HCS_NAME_MAX + 4];
+		char value[16];
+		snprintf(name, sizeof(name), "%c %s", symbols[d % 4], h->devices[d].name);
+		snprintf(value, sizeof(value), "%d", held[d]);
+		ui_putn(y, px, name, pw - 5, 0);
+		ui_putn(y, px + pw - (int)strlen(value), value, pw, 0);
+	}
+	if (assigned < total && y <= last)
+		ui_putn(y++, px, ". unassigned", pw, ui_attr(UI_DIM));
+	return y + 1;
+}
+
+static void editor_draw_hcs_panel(const editor_state *st) {
+	int px	 = COLS - EDITOR_HCS_PANEL_W;
+	int pw	 = EDITOR_HCS_PANEL_W - 2;
+	int last = LINES - 3;
 
 	attron(ui_attr(UI_DIM));
 	for (int y = 2; y <= last; y++)
 		mvaddch(y, px - 2, ACS_VLINE);
 	attroff(ui_attr(UI_DIM));
 
-	ui_putn(2, px, "Layer status", pw, A_BOLD);
 	if (!st->probe_ok || st->n_layers <= 0) {
+		ui_putn(2, px, "Layer status", pw, A_BOLD);
 		ui_putn(4, px, "model unreadable", pw, ui_attr(UI_DIM));
 		ui_putn(5, px, "set a valid model path", pw, ui_attr(UI_DIM));
 		return;
 	}
 
-	int	 n = st->n_layers;
-	int	 held[HCS_MAX_DEVICES];
-	int	 assigned = hcs_resolve_layers(h, n, held);
-	char summary[48];
-	editor_hcs_summary(st, assigned, summary, sizeof(summary));
-	bool ok = assigned == n;
-
-	char value[16];
-	snprintf(value, sizeof(value), "%d", n);
-	ui_putn(4, px, "Model layers", pw, ui_attr(UI_DIM));
-	ui_putn(4, px + pw - (int)strlen(value), value, pw, 0);
-	snprintf(value, sizeof(value), "%d", MIN(assigned, n));
-	ui_putn(5, px, "Assigned", pw, ui_attr(UI_DIM));
-	ui_putn(5, px + pw - (int)strlen(value), value, pw, 0);
-	ui_putn(6, px, summary, pw, ok ? ui_attr(UI_OK) : ui_attr(UI_ERR));
-
-	int order[HCS_MAX_DEVICES];
-	int n_order	  = hcs_layout_order(h, order);
-	int grid_y	  = 8;
-	int grid_rows = MAX(MIN((n + pw - 1) / pw, last - grid_y - n_order - 3), 1);
-	editor_draw_hcs_layer_grid(held, order, n_order, n, px, grid_y, pw, grid_rows);
-
-	int y = grid_y + (MIN(n, pw * grid_rows) + pw - 1) / pw + 1;
-	for (int i = 0; i < n_order && y <= last; i++, y++) {
-		int	 d = order[i];
-		char name[HCS_NAME_MAX + 4];
-		snprintf(name, sizeof(name), "%c %s", symbols[d % 4], h->devices[d].name);
-		snprintf(value, sizeof(value), "%d", held[d]);
-		ui_putn(y, px, name, pw - 5, 0);
-		ui_putn(y, px + pw - (int)strlen(value), value, pw, 0);
-	}
-	if (assigned < n && y <= last)
-		ui_putn(y, px, ". unassigned", pw, ui_attr(UI_DIM));
+	bool moe = editor_model_is_moe(st);
+	int	 y	 = editor_draw_hcs_section(st, HCS_FIELD_LAYERS, st->n_layers, 2, last, moe ? 2 : 1);
+	if (moe)
+		editor_draw_hcs_section(st, HCS_FIELD_EXPERTS, st->n_experts, y, last, 1);
 }
 
 static void editor_draw_hcs_banner(const editor_state *st) {
@@ -818,7 +853,9 @@ static void editor_help(const editor_state *st) {
 		label = label_buf;
 		hint  = ref.kind == HCS_REF_ENABLE ? EDITOR_HCS_ENABLE_HINT
 				: ref.kind == HCS_REF_ADD  ? "add another device; it takes '*' (the remainder)"
-										   : HCS_FIELD_HINTS[ref.kind - HCS_REF_DEVICE];
+				: ref.kind == HCS_REF_LAYERS && editor_model_is_moe(st)
+					? EDITOR_HCS_MOE_LAYERS_HINT
+					: HCS_FIELD_HINTS[ref.kind - HCS_REF_DEVICE];
 	} else if (editor_is_model_device_row(st, st->tab, st->row)) {
 		label = "Device";
 		hint  = EDITOR_MODEL_DEVICE_HINT;
