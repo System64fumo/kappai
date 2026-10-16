@@ -78,7 +78,12 @@ typedef struct {
 	uint64_t	dims[4];
 	const void *host_data;
 	const char *name;
+	int			release_host_source;
+	status_code (*read_fn)(void *ctx, size_t off, void *dst, size_t len);
+	void *read_ctx;
 } tensor_desc;
+
+status_code tensor_desc_read(const tensor_desc *desc, size_t off, void *dst, size_t len);
 
 typedef enum {
 	KV_QUANT_F16 = 0,

@@ -35,7 +35,14 @@ uint g_mi;
 #define MT 1
 #endif
 
-shared float s_acc[ROWS * MT][WG];
+shared float s_acc[ROWS * MT][WG + 1];
+
+float reduce_row(uint i) {
+	float v = 0.0;
+	for (int j = 0; j < WG; j++)
+		v += s_acc[i][j];
+	return v;
+}
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -108,9 +115,7 @@ void main(void) {
 			uvec4 q2 = unpack_w(w[wi + 4u]);
 			uvec4 q3 = unpack_w(w[wi + 5u]);
 			for (int c = 0; c < MT; c++) {
-				if (uint(c) >= ncols)
-					break;
-				uint  xi  = (col0 + uint(c)) * uint(u_x_stride) + uint(bi) * 11u;
+				uint  xi  = min(col0 + uint(c), mb - 1u) * uint(u_x_stride) + uint(bi) * 11u;
 				uvec4 xs  = xq4[xi + 2u];
 				int	  nib = pair_field_sum(dot_w(q0, xq4[xi + 3u]) + dot_w(q1, xq4[xi + 4u])) +
 							pair_field_sum(dot_w(q2, xq4[xi + 5u]) + dot_w(q3, xq4[xi + 6u]));
@@ -126,19 +131,13 @@ void main(void) {
 	for (int i = 0; i < ROWS * MT; i++)
 		s_acc[i][tid] = acc[i];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int i = 0; i < ROWS * MT; i++)
-				s_acc[i][tid] += s_acc[i][tid + s];
-		barrier();
-	}
 	for (uint i = tid; i < uint(ROWS * MT); i += uint(WG)) {
 		uint r	 = i / uint(MT);
 		uint c	 = i % uint(MT);
 		uint row = row0 + r;
 		if (int(row) < u_n && c < ncols) {
 			uint  yi = (col0 + c) * uint(u_n) + row;
-			float v	 = s_acc[i][0];
+			float v	 = reduce_row(i);
 			if (u_add_residual == 1)
 				y[yi] = v + res[row];
 			else if (u_add_residual == 2)
@@ -190,16 +189,10 @@ void main(void) {
 	for (int r = 0; r < ROWS; r++)
 		s_acc[r][tid] = acc[r];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int r = 0; r < ROWS; r++)
-				s_acc[r][tid] += s_acc[r][tid + s];
-		barrier();
-	}
 	if (tid < uint(ROWS)) {
 		uint row = row0 + tid;
 		if (int(row) < u_n) {
-			float v = s_acc[tid][0];
+			float v = reduce_row(tid);
 			if (u_add_residual == 1)
 				y[g_mi * uint(u_n) + row] = v + res[row];
 			else if (u_add_residual == 2)

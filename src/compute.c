@@ -177,6 +177,7 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	FREE_FLOAT_BUF(hybrid_host2);
 	FREE_FLOAT_BUF(hybrid_host3);
 	FREE_FLOAT_BUF(gdn_ws_host);
+	FREE_FLOAT_BUF(glm_ws);
 	FREE_FLOAT_BUF(gdn_z_host);
 	FREE_FLOAT_BUF(gdn_alpha_host);
 	FREE_FLOAT_BUF(gdn_beta_host);
@@ -323,6 +324,15 @@ static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
 		if (_st != OK)
 			return _st;
 	}
+	if (m->arch_info->has_hyper_connections) {
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC],
+							(size_t)m->kda.hc_count * m->dim * sizeof(float), "HC");
+		if (_st != OK)
+			return _st;
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC_COEF], 32 * sizeof(float), "HC_COEF");
+		if (_st != OK)
+			return _st;
+	}
 	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB], (size_t)L->attn_buf_size * sizeof(float), "XB");
 	if (_st != OK)
 		return _st;
@@ -431,9 +441,11 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 			m->arch_info->is_mla ? m->mla.qk_rope
 								 : (m->arch_info->is_hybrid_recurrent ? m->rope_dim : m->head_dim);
 		const int half = rope_head_dim / 2;
-		s->rope_cos	   = xmalloc((size_t)n_ctx * half * sizeof(float));
-		s->rope_sin	   = xmalloc((size_t)n_ctx * half * sizeof(float));
-		build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+		if (half > 0) {
+			s->rope_cos = xmalloc((size_t)n_ctx * half * sizeof(float));
+			s->rope_sin = xmalloc((size_t)n_ctx * half * sizeof(float));
+			build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+		}
 	}
 
 	s->allocated_n_ctx = n_ctx;

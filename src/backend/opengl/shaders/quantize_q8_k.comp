@@ -139,7 +139,7 @@ void main(void) {
 		iscale = div_r(-127.0, gval);
 		d	   = div_r(1.0, iscale);
 	}
-	uint base = uint(row * u_row_words + bi * 209);
+	uint base = uint(row * u_row_words + bi * 212);
 	int	 qv[8];
 	int	 qsum = 0;
 	for (int j = 0; j < 8; j++) {
@@ -155,14 +155,14 @@ void main(void) {
 		xq[base + uint(tid) * 2u + uint(w)] = word;
 	}
 	for (int g = 0; g < 2; g++) {
-		uint dst	 = base + 81u + uint(tid) * 4u + uint(g * 2);
+		uint dst	 = base + 84u + uint(tid) * 4u + uint(g * 2);
 		xq[dst]		 = uint(qv[g * 4 + 2] + (qv[g * 4] << 16));
 		xq[dst + 1u] = uint(qv[g * 4 + 3] + (qv[g * 4 + 1] << 16));
 	}
 	s_sum[tid] = qsum;
 	barrier();
 	if (tid < 16u)
-		xq[base + 65u + tid] = uint(s_sum[tid * 2u] + s_sum[tid * 2u + 1u]);
+		xq[base + 64u + tid] = uint(s_sum[tid * 2u] + s_sum[tid * 2u + 1u]);
 	if (tid == 0u)
-		xq[base + 64u] = floatBitsToUint(d);
+		xq[base + 80u] = floatBitsToUint(d);
 }

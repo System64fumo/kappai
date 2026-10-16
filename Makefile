@@ -230,7 +230,7 @@ VK_SHADERS_DIR := $(SRC_DIR)/backend/vulkan/shaders
 VK_INC_FILES   := $(filter %.glsl %.inc,$(wildcard $(VK_SHADERS_DIR)/*.glsl) $(wildcard $(VK_SHADERS_DIR)/*.inc))
 VK_COMP_DEPS  := $(wildcard $(VK_SHADERS_DIR)/*.comp)
 
-MATMUL_BATCH           := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16
+MATMUL_BATCH           := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16 matmul_iq2_s matmul_iq2_xxs matmul_iq3_xxs matmul_iq4_xs
 MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
 MATMUL_NMAT_TRIPLE_BATCH := matmul_q4_0
 

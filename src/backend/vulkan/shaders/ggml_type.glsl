@@ -14,6 +14,10 @@
 #define GTYPE_Q6_K 14
 #define GTYPE_IQ4_NL 20
 #define GTYPE_IQ3_S 21
+#define GTYPE_IQ2_XXS 16
+#define GTYPE_IQ3_XXS 18
+#define GTYPE_IQ2_S 22
+#define GTYPE_IQ4_XS 23
 #define GTYPE_BF16 30
 
 #endif

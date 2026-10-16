@@ -926,6 +926,51 @@ static void t_tied_embedding_flow(void) {
 	ref_free(&ru);
 }
 
+static int range_read_matches(const gguf_ctx *ctx, const gguf_tensor *t, const gguf_tensor *ref,
+							  size_t off, size_t len) {
+	uint8_t			  *buf = xmalloc(len + 1);
+	gguf_tensor_source src = {(gguf_ctx *)ctx, t};
+	int				   ok  = gguf_tensor_read(&src, off, buf + 1, len) == OK &&
+							 memcmp(buf + 1, (const uint8_t *)ref->data + off, len) == 0;
+	free(buf);
+	return ok;
+}
+
+static void t_no_mmap_tensor_range_reads(void) {
+	backend *be = NULL;
+	model	 m;
+	gguf_ctx ref;
+	memset(&m, 0, sizeof(m));
+	if (backend_create("cpu", 0, &be) != OK ||
+		model_load_backend_ex_repack(&m, synth_chat_model_path, be, 0, NULL, 0) != OK ||
+		gguf_load(&ref, synth_chat_model_path) != OK) {
+		record_result(OPFAM_ORCHESTRATION, "no_mmap_tensor_range_reads", V_FAIL, "load failed");
+		return;
+	}
+
+	int checked = 0;
+	int ok		= 1;
+	for (size_t i = 0; i < m.gctx.n_tensors; i++) {
+		const gguf_tensor *t  = &m.gctx.tensors[i];
+		const gguf_tensor *rt = gguf_find_tensor(&ref, t->name);
+		if (!rt || t->byte_size < 16)
+			continue;
+		size_t partial = t->byte_size - 7 < 33 ? t->byte_size - 7 : 33;
+		ok			   = ok && range_read_matches(&m.gctx, t, rt, 0, t->byte_size) &&
+						 range_read_matches(&m.gctx, t, rt, 7, partial);
+		checked++;
+	}
+
+	char detail[96];
+	snprintf(detail, sizeof(detail), "%d tensors read by range match mmap data", checked);
+	record_result(OPFAM_ORCHESTRATION, "no_mmap_tensor_range_reads",
+				  ok && checked > 0 ? V_PASS : V_FAIL, detail);
+
+	gguf_free(&ref);
+	model_free(&m);
+	backend_destroy(be);
+}
+
 void run_orchestration_tests(void) {
 	synth_suite_common_init();
 	t_full_turn_greedy_matches_reference();
@@ -937,4 +982,5 @@ void run_orchestration_tests(void) {
 	t_context_full_unit();
 	t_engine_exit_code_context_full();
 	t_tied_embedding_flow();
+	t_no_mmap_tensor_range_reads();
 }

@@ -109,6 +109,7 @@ extern int g_pass, g_fail, g_skip;
 
 extern const qtype_info QTYPES[];
 extern const int		QTYPES_N;
+int						qtype_name_width(void);
 
 void		color_init(void);
 const char *verdict_str(verdict v);

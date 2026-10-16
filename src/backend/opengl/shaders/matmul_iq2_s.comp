@@ -1,0 +1,116 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uint xq[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(std430, binding = 4) readonly buffer GridBuf {
+	uint grid[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+layout(location = 9) uniform int u_m;
+layout(location = 10) uniform int u_x_stride;
+layout(location = 11) uniform int u_wg_base;
+
+uint g_mi;
+
+#define ROWS 32
+
+float h2f(uint h) {
+	return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+uint rb(uint off) {
+	uint wd = w[off >> 2u];
+	return (wd >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+int xq8(uint bb, int e) {
+	return bitfieldExtract(int(xq[bb + uint(e >> 2)]), (e & 3) * 8, 8);
+}
+
+void store_row(uint idx, float acc) {
+	if (u_add_residual == 1)
+		y[g_mi * uint(u_n) + idx] = acc + res[idx];
+	else if (u_add_residual == 2)
+		y[g_mi * uint(u_n) + idx] += acc;
+	else
+		y[g_mi * uint(u_n) + idx] = acc;
+}
+
+void main(void) {
+	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	  = uint(max(u_m, 1));
+	g_mi	  = wgid % mb;
+	wgid	  = wgid / mb;
+	uint row  = wgid * uint(ROWS) + gl_LocalInvocationID.x;
+	if (int(row) >= u_n)
+		return;
+	uint row_bytes = uint(u_k_blocks) * 82u;
+	uint rw		   = row * row_bytes;
+
+	float acc = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  xbq	 = g_mi * uint(u_x_stride) + uint(bi) * 212u;
+		float xd	 = uintBitsToFloat(xq[xbq + 80u]);
+		uint  bo	 = uint(bi) * 82u;
+		float dw	 = h2f(rb(bo + rw) | (rb(bo + 1u + rw) << 8u));
+		float scaled = dw * xd * 0.125;
+		int	  total	 = 0;
+		for (int ib = 0; ib < 8; ib++) {
+			uint qs_ib	  = bo + 2u + uint(ib) * 4u + rw;
+			uint signs_ib = qs_ib + 32u;
+			uint qh		  = rb(bo + 66u + uint(ib) + rw);
+			uint sc		  = rb(bo + 74u + uint(ib) + rw);
+			int	 sc0	  = 1 + 2 * int(sc & 0xFu);
+			int	 sc1	  = 1 + 2 * int(sc >> 4u);
+			int	 sum0	  = 0;
+			int	 sum1	  = 0;
+			for (int l = 0; l < 4; l++) {
+				uint gidx = rb(qs_ib + uint(l)) | ((qh << uint(8u - uint(2 * l))) & 0x300u);
+				uint gw0  = grid[gidx * 2u];
+				uint gw1  = grid[gidx * 2u + 1u];
+				uint sb	  = rb(signs_ib + uint(l));
+				int	 xb	  = ib * 32 + l * 8;
+				int	 s	  = 0;
+				s += (((sb & 1u) != 0u ? -int((gw0 >> 0u) & 0xFFu) : int((gw0 >> 0u) & 0xFFu)) *
+					  xq8(xbq, xb + 0));
+				s += (((sb & 2u) != 0u ? -int((gw0 >> 8u) & 0xFFu) : int((gw0 >> 8u) & 0xFFu)) *
+					  xq8(xbq, xb + 1));
+				s += (((sb & 4u) != 0u ? -int((gw0 >> 16u) & 0xFFu) : int((gw0 >> 16u) & 0xFFu)) *
+					  xq8(xbq, xb + 2));
+				s += (((sb & 8u) != 0u ? -int((gw0 >> 24u) & 0xFFu) : int((gw0 >> 24u) & 0xFFu)) *
+					  xq8(xbq, xb + 3));
+				s += (((sb & 16u) != 0u ? -int((gw1 >> 0u) & 0xFFu) : int((gw1 >> 0u) & 0xFFu)) *
+					  xq8(xbq, xb + 4));
+				s += (((sb & 32u) != 0u ? -int((gw1 >> 8u) & 0xFFu) : int((gw1 >> 8u) & 0xFFu)) *
+					  xq8(xbq, xb + 5));
+				s += (((sb & 64u) != 0u ? -int((gw1 >> 16u) & 0xFFu) : int((gw1 >> 16u) & 0xFFu)) *
+					  xq8(xbq, xb + 6));
+				s += (((sb & 128u) != 0u ? -int((gw1 >> 24u) & 0xFFu) : int((gw1 >> 24u) & 0xFFu)) *
+					  xq8(xbq, xb + 7));
+				if (l < 2)
+					sum0 += s;
+				else
+					sum1 += s;
+			}
+			total += sc0 * sum0 + sc1 * sum1;
+		}
+		acc += scaled * float(total);
+	}
+	store_row(row, acc);
+}

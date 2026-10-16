@@ -2,11 +2,15 @@
 #define GGUF_H
 
 #include <stdio.h>
+#include <sys/types.h>
 
 #include "common.h"
 
 #define GGUF_MAGIC 0x46554747u
 #define GGUF_VERSION 3u
+#define GGUF_LAYER_EAGER (-1)
+#define GGUF_LAYER_GLOBAL (-2)
+#define GGUF_EAGER_F32_MAX_BYTES ((size_t)(16 << 20))
 
 typedef enum {
 	GGUF_TYPE_U8 = 0,
@@ -50,14 +54,13 @@ typedef enum {
 	GGML_TYPE_BF16	  = 30,
 
 	/* 0x40+ = engine-internal repacked types */
-	GGML_TYPE_IQ3_S_RE	= 0x42,
-	GGML_TYPE_Q8_0_R8	= 0x43,
-	GGML_TYPE_Q4_0_R8	= 0x44,
-	GGML_TYPE_IQ3_S_RE8 = 0x45,
-	GGML_TYPE_IQ4_NL_R8 = 0x46,
-	GGML_TYPE_Q4_K_R8	= 0x47,
-	GGML_TYPE_Q5_K_R8	= 0x48,
-	GGML_TYPE_Q6_K_R8	= 0x49,
+	GGML_TYPE_Q8_0_REPACKED	  = 0x43,
+	GGML_TYPE_Q4_0_REPACKED	  = 0x44,
+	GGML_TYPE_IQ3_S_REPACKED  = 0x45,
+	GGML_TYPE_IQ4_NL_REPACKED = 0x46,
+	GGML_TYPE_Q4_K_REPACKED	  = 0x47,
+	GGML_TYPE_Q5_K_REPACKED	  = 0x48,
+	GGML_TYPE_Q6_K_REPACKED	  = 0x49,
 
 } ggml_type;
 
@@ -74,6 +77,7 @@ typedef struct {
 	uint64_t	offset;
 	const void *data;
 	size_t		byte_size;
+	uint8_t		loaded;
 } gguf_tensor;
 
 typedef struct {
@@ -107,6 +111,9 @@ typedef struct {
 	gguf_strtab_entry *kv_hash;
 	size_t			   kv_hash_cap;
 	str_arena		   strs;
+	int				   sparse_fd;
+	int				   sparse_direct_fd;
+	size_t			   sparse_align;
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
@@ -130,7 +137,6 @@ static inline uint32_t wtype_to_q8type(uint32_t w_type) {
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE:
 		return GGML_TYPE_Q8_K;
 	default:
 		return 0;
@@ -141,7 +147,24 @@ status_code gguf_load(gguf_ctx *ctx, const char *path);
 
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
 
-status_code gguf_sparse_read_tensors(gguf_ctx *ctx, const char *path);
+ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);
+
+status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path);
+
+status_code gguf_sparse_read_tensors(gguf_ctx *ctx, int layer);
+
+status_code gguf_sparse_read_tensor(gguf_ctx *ctx, gguf_tensor *t);
+
+int gguf_tensor_is_eager(const gguf_tensor *t);
+
+typedef struct {
+	gguf_ctx		  *ctx;
+	const gguf_tensor *t;
+} gguf_tensor_source;
+
+status_code gguf_tensor_read(void *source, size_t off, void *dst, size_t len);
+
+int gguf_tensor_layer_index(const char *name);
 
 status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
 							   size_t *out_align);

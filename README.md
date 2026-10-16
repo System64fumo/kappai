@@ -24,12 +24,12 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 
 ## Support matrix
 
-| Family   | Quants                                          |
-|----------|-------------------------------------------------|
-| Legacy   | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`          |
-| K-quants | `Q4_K`, `Q5_K`, `Q6_K`                          |
-| I-quants | `IQ2_S`, `IQ2_XXS`, `IQ3_S`, `IQ4_XS`, `IQ4_NL` |
-| Float    | `F32`, `F16`, `BF16`                            |
+| Family   | Quants                                                     |
+|----------|------------------------------------------------------------|
+| Legacy   | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`                     |
+| K-quants | `Q4_K`, `Q5_K`, `Q6_K`                                     |
+| I-quants | `IQ2_S`, `IQ2_XXS`, `IQ3_S`, `IQ3_XXS`, `IQ4_XS`, `IQ4_NL` |
+| Float    | `F32`, `F16`, `BF16`                                       |
 
 | Architecture | Models                       |
 |--------------|------------------------------|
@@ -38,6 +38,15 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `lfm`        | LFM 2.5                      |
 | `qwen35`     | Qwen 3.5, Qwen 3.6, Qwen 3.8 |
 | `glm-dsa`    | GLM 5.2, GLM 5.3             |
+| `glm5-next`  | GLM 5.3 Flash                |
+
+| Backend       | State                                            |
+|---------------|--------------------------------------------------|
+| `cpu_scalar`  | Fully working, Reference for all other backends  |
+| `cpu_aarch64` | Fully working                                    |
+| `cpu_x86_64`  | Works, Requires modern CPUs, Lacks some features |
+| `vulkan`      | Works, Requires modern GPUs, Lacks some features |
+| `opengl`      | Works, Lacks some features                       |
 
 | OS    | Architecture                   |
 |-------|--------------------------------|
@@ -50,10 +59,10 @@ make config BUILD=release
 make -j$(nproc)
 ```
 
-With Vulkan (W.I.P, slower than CPU in some cases):
+With some backends enabled:
 
 ```bash
-make config BUILD=release BACKENDS=vulkan
+make config BUILD=release BACKENDS=vulkan,opengl
 make -j$(nproc)
 ```
 

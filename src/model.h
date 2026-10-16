@@ -65,6 +65,11 @@ typedef struct layer_weights {
 	weight_ref ple_proj_w;
 	weight_ref layer_out_scale_w;
 
+	weight_ref kda_f_a_w, kda_f_b_w, kda_g_a_w, kda_g_b_w;
+	weight_ref kda_conv_q_w, kda_conv_k_w, kda_conv_v_w;
+	weight_ref hc_attn_fn_w, hc_attn_base_w, hc_attn_scale_w;
+	weight_ref hc_ffn_fn_w, hc_ffn_base_w, hc_ffn_scale_w;
+
 	weight_ref q_a_w, q_b_w, q_a_norm_w;
 	weight_ref kv_a_w, k_b_w, v_b_w, kv_a_norm_w;
 
@@ -106,6 +111,16 @@ typedef struct model_mla_params {
 	int32_t qk_head;
 	int32_t v_head;
 } model_mla_params;
+
+typedef struct model_kda_params {
+	int32_t head_dim;
+	int32_t hc_count;
+	int32_t hc_sinkhorn_iters;
+	float	gate_lower_bound;
+	float	hc_eps;
+	float  *swiglu_clamp_exp;
+	float  *swiglu_clamp_shexp;
+} model_kda_params;
 
 typedef struct model_moe_params {
 	int32_t n_experts;
@@ -184,6 +199,7 @@ typedef struct model {
 	gguf_ctx				gctx;
 
 	model_mla_params mla;
+	model_kda_params kda;
 	model_moe_params moe;
 
 	model_arch arch;

@@ -314,3 +314,34 @@ void str_arena_free(str_arena *a) {
 	free(a->chunks);
 	memset(a, 0, sizeof(*a));
 }
+
+static void advise_source(const void *ptr, size_t bytes, int advice) {
+	page_span r = page_span_for(ptr, bytes, (size_t)page_size_cached());
+	if (r.len > 0)
+		madvise((void *)r.start, r.len, advice);
+}
+
+void weight_source_prefetch(const void *ptr, size_t bytes) {
+	advise_source(ptr, bytes, MADV_WILLNEED);
+}
+
+void weight_source_release(const void *ptr, size_t bytes) {
+	advise_source(ptr, bytes, MADV_DONTNEED);
+}
+
+void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_src) {
+	if (!release_src) {
+		memcpy(dst, src, bytes);
+		return;
+	}
+	weight_source_prefetch(src, MIN(bytes, WEIGHT_COPY_CHUNK_BYTES));
+	for (size_t off = 0; off < bytes; off += WEIGHT_COPY_CHUNK_BYTES) {
+		size_t len	= MIN(bytes - off, WEIGHT_COPY_CHUNK_BYTES);
+		size_t next = off + len;
+		if (next < bytes)
+			weight_source_prefetch((const char *)src + next,
+								   MIN(bytes - next, WEIGHT_COPY_CHUNK_BYTES));
+		memcpy((char *)dst + off, (const char *)src + off, len);
+		weight_source_release((const char *)src + off, len);
+	}
+}

@@ -5,40 +5,40 @@
 #include "gguf.h"
 #include <math.h>
 
-#define Q8_0_R8_ROWS 8
-#define Q4_0_R8_ROWS 8
-#define Q8_0_R8_GROUP_BYTES (Q8_0_R8_ROWS * sizeof(uint16_t) + Q8_0_R8_ROWS * 32)
-#define Q4_0_R8_GROUP_BYTES (Q4_0_R8_ROWS * sizeof(uint16_t) + Q4_0_R8_ROWS * 16)
-#define IQ4_NL_R8_ROWS 8
-#define IQ3_S_RE_BLOCK_BYTES 134
-#define IQ3_S_RE8_ROWS 8
-#define IQ3_S_RE8_GROUP_BYTES                                                                      \
-	(IQ3_S_RE8_ROWS * sizeof(uint16_t) + IQ3_S_RE8_ROWS * 4 + IQ3_S_RE8_ROWS * 128)
+#define Q8_0_REPACKED_ROWS 8
+#define Q4_0_REPACKED_ROWS 8
+#define Q8_0_REPACKED_GROUP_BYTES (Q8_0_REPACKED_ROWS * sizeof(uint16_t) + Q8_0_REPACKED_ROWS * 32)
+#define Q4_0_REPACKED_GROUP_BYTES (Q4_0_REPACKED_ROWS * sizeof(uint16_t) + Q4_0_REPACKED_ROWS * 16)
+#define IQ4_NL_REPACKED_ROWS 8
+#define IQ3_S_REPACKED_BLOCK_BYTES 134
+#define IQ3_S_REPACKED_ROWS 8
+#define IQ3_S_REPACKED_GROUP_BYTES                                                                 \
+	(IQ3_S_REPACKED_ROWS * sizeof(uint16_t) + IQ3_S_REPACKED_ROWS * 4 + IQ3_S_REPACKED_ROWS * 128)
 
-#define Q4_K_R8_ROWS 8
-#define Q4_K_R8_OFF_D 0
-#define Q4_K_R8_OFF_DMIN 16
-#define Q4_K_R8_OFF_SCALES 32
-#define Q4_K_R8_OFF_SE 32
+#define Q4_K_REPACKED_ROWS 8
+#define Q4_K_REPACKED_OFF_D 0
+#define Q4_K_REPACKED_OFF_DMIN 16
+#define Q4_K_REPACKED_OFF_SCALES 32
+#define Q4_K_REPACKED_OFF_SE 32
 
-#define Q4_K_R8_OFF_QS 160
-#define Q4_K_R8_GROUP_BYTES (Q4_K_R8_OFF_QS + Q4_K_R8_ROWS * 128)
+#define Q4_K_REPACKED_OFF_QS 160
+#define Q4_K_REPACKED_GROUP_BYTES (Q4_K_REPACKED_OFF_QS + Q4_K_REPACKED_ROWS * 128)
 
-#define Q5_K_R8_ROWS 8
-#define Q5_K_R8_OFF_D 0
-#define Q5_K_R8_OFF_DMIN 16
-#define Q5_K_R8_OFF_SCALES 32
-#define Q5_K_R8_OFF_SE 32
-#define Q5_K_R8_OFF_QH 160
-#define Q5_K_R8_OFF_QS 416
-#define Q5_K_R8_GROUP_BYTES (Q5_K_R8_OFF_QS + Q5_K_R8_ROWS * 128)
+#define Q5_K_REPACKED_ROWS 8
+#define Q5_K_REPACKED_OFF_D 0
+#define Q5_K_REPACKED_OFF_DMIN 16
+#define Q5_K_REPACKED_OFF_SCALES 32
+#define Q5_K_REPACKED_OFF_SE 32
+#define Q5_K_REPACKED_OFF_QH 160
+#define Q5_K_REPACKED_OFF_QS 416
+#define Q5_K_REPACKED_GROUP_BYTES (Q5_K_REPACKED_OFF_QS + Q5_K_REPACKED_ROWS * 128)
 
-#define Q6_K_R8_ROWS 8
-#define Q6_K_R8_OFF_QL 0
-#define Q6_K_R8_OFF_QH (Q6_K_R8_OFF_QL + Q6_K_R8_ROWS * 128)
-#define Q6_K_R8_OFF_SCALES (Q6_K_R8_OFF_QH + Q6_K_R8_ROWS * 64)
-#define Q6_K_R8_OFF_D (Q6_K_R8_OFF_SCALES + Q6_K_R8_ROWS * 16)
-#define Q6_K_R8_GROUP_BYTES (Q6_K_R8_OFF_D + Q6_K_R8_ROWS * 2)
+#define Q6_K_REPACKED_ROWS 8
+#define Q6_K_REPACKED_OFF_QL 0
+#define Q6_K_REPACKED_OFF_QH (Q6_K_REPACKED_OFF_QL + Q6_K_REPACKED_ROWS * 128)
+#define Q6_K_REPACKED_OFF_SCALES (Q6_K_REPACKED_OFF_QH + Q6_K_REPACKED_ROWS * 64)
+#define Q6_K_REPACKED_OFF_D (Q6_K_REPACKED_OFF_SCALES + Q6_K_REPACKED_ROWS * 16)
+#define Q6_K_REPACKED_GROUP_BYTES (Q6_K_REPACKED_OFF_D + Q6_K_REPACKED_ROWS * 2)
 
 typedef struct {
 	uint16_t d;
@@ -219,77 +219,81 @@ void matmul_q4_k_q8_k_f32(const void *w, const float *restrict x, float *restric
 						  quant_scratch *qs);
 void matmul_q5_k_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
 						  quant_scratch *qs);
-void matmul_q8_0_r8_q8_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
-						   quant_scratch *qs);
-void matmul_q4_0_r8_q8_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
-						   quant_scratch *qs);
-void matmul_iq3_s_re8_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n,
-							   int k, quant_scratch *qs);
+void matmul_q8_0_repacked_q8_f32(const void *w, const float *restrict x, float *restrict y, int n,
+								 int k, quant_scratch *qs);
+void matmul_q4_0_repacked_q8_f32(const void *w, const float *restrict x, float *restrict y, int n,
+								 int k, quant_scratch *qs);
+void matmul_iq3_s_repacked_q8_k_f32(const void *w, const float *restrict x, float *restrict y,
+									int n, int k, quant_scratch *qs);
 
 void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int row_end, int k);
 
-void repack_iq4_nl_to_iq4_nl_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_iq4_nl_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m);
-void matmul_iq4_nl_r8_q8_f32(const void *w, const float *restrict x, float *restrict y, int n,
-							 int k, quant_scratch *qs);
+void repack_iq4_nl_to_iq4_nl_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										   int k);
+void matmul_iq4_nl_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m);
+void matmul_iq4_nl_repacked_q8_f32(const void *w, const float *restrict x, float *restrict y, int n,
+								   int k, quant_scratch *qs);
 
-void repack_q8_0_to_q8_0_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_q8_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								 int n, int k, int m);
+void repack_q8_0_to_q8_0_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k);
+void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m);
 
-void repack_q4_0_to_q4_0_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_q4_0_r8_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
-								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								 int n, int k, int m);
+void repack_q4_0_to_q4_0_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k);
+void matmul_q4_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m);
 
-void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_q4_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m);
+void repack_q4_k_to_q4_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k);
+void matmul_q4_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m);
 
-void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_q5_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m);
+void repack_q5_k_to_q5_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k);
+void matmul_q5_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m);
 
-void repack_q6_k_to_q6_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
-void matmul_q6_k_r8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-								   size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
-								   int n, int k, int m);
+void repack_q6_k_to_q6_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k);
+void matmul_q6_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m);
 
-void repack_iq3_s_rows(const void *src, void *dst, int row_begin, int row_end, int k);
+void repack_iq3_s_to_iq3_s_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										 int k);
 
-void repack_iq3_s_to_iq3_s_re8_rows(const void *src, void *dst, int row_begin, int row_end, int k);
+void matmul_iq3_s_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													 float *restrict y, int row_begin, int row_end,
+													 int k);
+void matmul_iq4_nl_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k);
+void matmul_q8_0_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int row_begin, int row_end,
+												  int k);
+void matmul_q4_0_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int row_begin, int row_end,
+												  int k);
+void matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k);
+void matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k);
+void matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k);
 
-void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-												float *restrict y, int row_begin, int row_end,
-												int k);
-void matmul_iq4_nl_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end, int k);
-void matmul_q8_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int row_begin, int row_end, int k);
-void matmul_q4_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int row_begin, int row_end, int k);
-void matmul_q4_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end, int k);
-void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end, int k);
-void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end, int k);
-
-void matmul_iq3_s_re8_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-									 size_t		 xq_row_stride_blocks, float *restrict y,
-									 int y_row_stride, int n, int k, int m);
-
-void matmul_iq3_s_re_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n,
-							  int k, quant_scratch *qs);
-void matmul_iq3_s_re_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
-									size_t		xq_row_stride_blocks, float *restrict y,
-									int y_row_stride, int n, int k, int m);
-void dequant_iq3_s_re_row(const void *repacked_buf, size_t n_blocks, float *dst);
+void matmul_iq3_s_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										  size_t	  xq_row_stride_blocks, float *restrict y,
+										  int y_row_stride, int n, int k, int m);
 
 void matmul_iq3_s_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
 						   quant_scratch *qs);
@@ -329,6 +333,14 @@ void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
 								 int n, int k, int m);
 
+void matmul_iq2_s_q8_k_qonly_f32(const void *w, const q8_k_block *x, size_t xs, float *y, int ys,
+								 int n, int k, int m);
+void matmul_iq2_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x, size_t xs, float *y, int ys,
+								   int n, int k, int m);
+void matmul_iq3_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x, size_t xs, float *y, int ys,
+								   int n, int k, int m);
+void matmul_iq4_xs_q8_k_qonly_f32(const void *w, const q8_k_block *x, size_t xs, float *y, int ys,
+								  int n, int k, int m);
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k);
 void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, float *restrict y,
@@ -447,12 +459,8 @@ typedef iq3_s_block iq3s_block;
 
 static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 
-static const int8_t iq3s_re_decode[16] = {
+static const int8_t iq3_s_repacked_decode[16] = {
 	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
 };
-
-#define IQ3S_RE_OFF_D 0
-#define IQ3S_RE_OFF_SCALES 2
-#define IQ3S_RE_OFF_IDX 6
 
 #endif

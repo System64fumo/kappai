@@ -202,10 +202,6 @@ static inline float q5_k_dot(const q5_k_block *blk, const int8_t *xq8, const int
 	return fmaf(xd, (d * (float)sumi) - (dmin * (float)summ), acc);
 }
 
-#define IQ3_S_RE_OFF_D 0
-#define IQ3_S_RE_OFF_SCALES 2
-#define IQ3_S_RE_OFF_IDX 6
-
 #define MATMUL_K_BLOCK 64
 
 static inline uint32_t f32_to_bits(float f) {
@@ -851,47 +847,28 @@ static inline void iq3s_encode_block(const iq3_s_block *b, uint16_t *d_out, uint
 	}
 }
 
-void repack_iq3_s_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
-	const int	 blocks_per_row = k / 256;
-	const size_t src_stride		= (size_t)blocks_per_row * sizeof(iq3_s_block);
-	const size_t dst_stride		= (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
-
-	const uint8_t *sp = src;
-	uint8_t		  *dp = dst;
-
-	for (int r = row_begin; r < row_end; r++) {
-		const iq3_s_block *srow = (const iq3_s_block *)(sp + (size_t)r * src_stride);
-		uint8_t			  *drow = dp + (size_t)r * dst_stride;
-
-		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *blk = drow + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-			iq3s_encode_block(&srow[bi], (uint16_t *)(blk + IQ3_S_RE_OFF_D),
-							  blk + IQ3_S_RE_OFF_SCALES, blk + IQ3_S_RE_OFF_IDX);
-		}
-	}
-}
-
-void repack_iq3_s_to_iq3_s_re8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_iq3_s_to_iq3_s_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										 int k) {
 	const int	 blocks_per_row = k / 256;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(iq3_s_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % IQ3_S_RE8_ROWS);
-	for (int g = group_begin; g < row_end; g += IQ3_S_RE8_ROWS) {
-		const iq3_s_block *srow[IQ3_S_RE8_ROWS];
-		for (int r = 0; r < IQ3_S_RE8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % IQ3_S_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ3_S_REPACKED_ROWS) {
+		const iq3_s_block *srow[IQ3_S_REPACKED_ROWS];
+		for (int r = 0; r < IQ3_S_REPACKED_ROWS; r++)
 			srow[r] = (const iq3_s_block *)(sp + (size_t)(g + r) * src_stride);
 
-		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * IQ3_S_REPACKED_BLOCK_BYTES;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
+			uint8_t *dblk = dgroup + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
 
 			uint16_t *dst_d		 = (uint16_t *)dblk;
-			uint8_t	 *dst_scales = dblk + IQ3_S_RE8_ROWS * sizeof(uint16_t);
-			uint8_t	 *dst_idx	 = dst_scales + IQ3_S_RE8_ROWS * 4;
+			uint8_t	 *dst_scales = dblk + IQ3_S_REPACKED_ROWS * sizeof(uint16_t);
+			uint8_t	 *dst_idx	 = dst_scales + IQ3_S_REPACKED_ROWS * 4;
 
 			iq3s_encode_block(&srow[0][bi], dst_d + 0, dst_scales + 0, dst_idx + 0);
 			iq3s_encode_block(&srow[1][bi], dst_d + 1, dst_scales + 4, dst_idx + 128);
@@ -905,27 +882,28 @@ void repack_iq3_s_to_iq3_s_re8_rows(const void *src, void *dst, int row_begin, i
 	}
 }
 
-void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-												float *restrict y, int row_begin, int row_end,
-												int k) {
+void matmul_iq3_s_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													 float *restrict y, int row_begin, int row_end,
+													 int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % IQ3_S_RE8_ROWS); g < row_end; g += IQ3_S_RE8_ROWS) {
+	for (int g = row_begin - (row_begin % IQ3_S_REPACKED_ROWS); g < row_end;
+		 g += IQ3_S_REPACKED_ROWS) {
 		const uint8_t *dgroup =
-			wb + ((size_t)g / IQ3_S_RE8_ROWS) * blocks_per_row * IQ3_S_RE8_GROUP_BYTES;
-		float sumf[IQ3_S_RE8_ROWS] = {0};
+			wb + ((size_t)g / IQ3_S_REPACKED_ROWS) * blocks_per_row * IQ3_S_REPACKED_GROUP_BYTES;
+		float sumf[IQ3_S_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t  *dblk	   = dgroup + (size_t)bi * IQ3_S_RE8_GROUP_BYTES;
+			const uint8_t  *dblk	   = dgroup + (size_t)bi * IQ3_S_REPACKED_GROUP_BYTES;
 			const uint16_t *dst_d	   = (const uint16_t *)dblk;
-			const uint8_t  *dst_scales = dblk + IQ3_S_RE8_ROWS * sizeof(uint16_t);
-			const uint8_t  *dst_idx	   = dst_scales + IQ3_S_RE8_ROWS * 4;
+			const uint8_t  *dst_scales = dblk + IQ3_S_REPACKED_ROWS * sizeof(uint16_t);
+			const uint8_t  *dst_idx	   = dst_scales + IQ3_S_REPACKED_ROWS * 4;
 
 			const q8_k_block *yb = &xq[bi];
 			const int8_t	 *q8 = yb->qs;
 
-			for (int r = 0; r < IQ3_S_RE8_ROWS; r++) {
+			for (int r = 0; r < IQ3_S_REPACKED_ROWS; r++) {
 				const uint8_t *scales = dst_scales + (size_t)r * 4;
 				const uint8_t *idx	  = dst_idx + (size_t)r * 128;
 
@@ -938,7 +916,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block 
 					int32_t		   group_sum = 0;
 					for (int j = 0; j < 32; j++) {
 						uint8_t code = (j < 16) ? (idx_g[j] & 0xF) : (idx_g[j - 16] >> 4);
-						int8_t	val	 = iq3s_re_decode[code];
+						int8_t	val	 = iq3_s_repacked_decode[code];
 						group_sum += (int32_t)val * (int32_t)q8[gr * 32 + j];
 					}
 					total += sc * group_sum;
@@ -946,7 +924,7 @@ void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block 
 				sumf[r] = fmaf(f16_to_f32(dst_d[r]) * yb->d, (float)total, sumf[r]);
 			}
 		}
-		for (int r = 0; r < IQ3_S_RE8_ROWS; r++) {
+		for (int r = 0; r < IQ3_S_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -954,101 +932,34 @@ void matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block 
 	}
 }
 
-static void matmul_iq3_s_re8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-												float *restrict y, int n, int k) {
-	matmul_iq3_s_re8_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_iq3_s_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+													 float *restrict y, int n, int k) {
+	matmul_iq3_s_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(iq3_s_re8_q8_k, q8_k_block, 256, IQ3_S_RE8_ROWS,
-					  ((size_t)k / 256) * IQ3_S_RE_BLOCK_BYTES)
+MATMUL_QONLY_DISPATCH(iq3_s_repacked_q8_k, q8_k_block, 256, IQ3_S_REPACKED_ROWS,
+					  ((size_t)k / 256) * IQ3_S_REPACKED_BLOCK_BYTES)
 
-MATMUL_Q8_F32(iq3_s_re8_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq3_s_re8_q8_k_qonly_f32)
+MATMUL_Q8_F32(iq3_s_repacked_q8_k, q8_k_block, 256, quantize_q8_k,
+			  matmul_iq3_s_repacked_q8_k_qonly_f32)
 
-__attribute__((weak)) void dequant_iq3_s_re_row(const void *repacked_buf, size_t n_blocks,
-												float *dst) {
-	const uint8_t *blk = repacked_buf;
-
-	for (size_t bi = 0; bi < n_blocks; bi++) {
-		const uint8_t *b	  = blk + bi * IQ3_S_RE_BLOCK_BYTES;
-		float		   d	  = f16_to_f32(*(const uint16_t *)(b + IQ3_S_RE_OFF_D));
-		const uint8_t *scales = b + IQ3_S_RE_OFF_SCALES;
-		const uint8_t *idx	  = b + IQ3_S_RE_OFF_IDX;
-		float		  *y	  = dst + (bi * 256);
-
-		for (int g = 0; g < 8; g++) {
-			uint8_t		   sb	 = scales[g / 2];
-			int			   sc	 = (g & 1) ? (1 + 2 * (sb >> 4)) : (1 + 2 * (sb & 0xf));
-			const uint8_t *idx_g = idx + g * 16;
-			for (int j = 0; j < 32; j++) {
-				uint8_t code	= (j < 16) ? (idx_g[j] & 0xF) : (idx_g[j - 16] >> 4);
-				y[(g * 32) + j] = d * (float)sc * (float)iq3s_re_decode[code];
-			}
-		}
-	}
-}
-
-__attribute__((weak)) void dequant_q8_0_r8_row(const void *repacked_buf, size_t n_blocks,
-											   float *dst) {
+__attribute__((weak)) void dequant_q8_0_repacked_row(const void *repacked_buf, size_t n_blocks,
+													 float *dst) {
 	const uint8_t *blk		   = repacked_buf;
-	const size_t   group_bytes = (size_t)Q8_0_R8_ROWS * sizeof(q8_0_block);
+	const size_t   group_bytes = (size_t)Q8_0_REPACKED_ROWS * sizeof(q8_0_block);
 
 	for (size_t bi = 0; bi < n_blocks; bi++) {
 		const uint8_t  *b	   = blk + bi * group_bytes;
 		const uint16_t *d8	   = (const uint16_t *)b;
-		const int8_t   *qs_all = (const int8_t *)(b + Q8_0_R8_ROWS * sizeof(uint16_t));
+		const int8_t   *qs_all = (const int8_t *)(b + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
-		for (int r = 0; r < Q8_0_R8_ROWS; r++) {
+		for (int r = 0; r < Q8_0_REPACKED_ROWS; r++) {
 			float d = f16_to_f32(d8[r]);
 			for (int j = 0; j < 32; j++)
 				dst[(r * 32) + j] = d * (float)qs_all[(size_t)r * 32 + j];
 		}
 	}
 }
-
-__attribute__((weak)) void matmul_iq3_s_re_q8_k_qonly_f32(const void *w,
-														  const q8_k_block *restrict xq,
-														  size_t xq_row_stride_blocks,
-														  float *restrict y, int y_row_stride,
-														  int n, int k, int m) {
-	const int	   blocks_per_row = k / 256;
-	const size_t   row_stride	  = (size_t)blocks_per_row * IQ3_S_RE_BLOCK_BYTES;
-	const uint8_t *wb			  = w;
-
-	for (int i = 0; i < n; i++) {
-		const uint8_t *row = wb + (size_t)i * row_stride;
-
-		for (int t = 0; t < m; t++) {
-			const q8_k_block *restrict xb = xq + ((size_t)t * xq_row_stride_blocks);
-			float sumf					  = 0.0f;
-
-			for (int bi = 0; bi < blocks_per_row; bi++) {
-				const uint8_t *blk		  = row + (size_t)bi * IQ3_S_RE_BLOCK_BYTES;
-				float		   d_w		  = f16_to_f32(*(const uint16_t *)(blk + IQ3_S_RE_OFF_D));
-				const uint8_t *scales	  = blk + IQ3_S_RE_OFF_SCALES;
-				const uint8_t *idx		  = blk + IQ3_S_RE_OFF_IDX;
-				const int8_t *restrict q8 = xb[bi].qs;
-
-				int32_t total = 0;
-				for (int g = 0; g < 8; g++) {
-					uint8_t		   sb		 = scales[g / 2];
-					int			   sc		 = (g & 1) ? (1 + 2 * (sb >> 4)) : (1 + 2 * (sb & 0xf));
-					const uint8_t *idx_g	 = idx + g * 16;
-					int32_t		   group_sum = 0;
-					for (int j = 0; j < 32; j++) {
-						uint8_t code = (j < 16) ? (idx_g[j] & 0xF) : (idx_g[j - 16] >> 4);
-						int8_t	val	 = iq3s_re_decode[code];
-						group_sum += (int32_t)val * (int32_t)q8[g * 32 + j];
-					}
-					total += sc * group_sum;
-				}
-				sumf += d_w * xb[bi].d * (float)total;
-			}
-			y[((size_t)t * y_row_stride) + i] = sumf;
-		}
-	}
-}
-
-MATMUL_Q8_F32(iq3_s_re_q8_k, q8_k_block, 256, quantize_q8_k, matmul_iq3_s_re_q8_k_qonly_f32)
 
 __attribute__((weak)) void dequant_iq4_nl_row(const void *blocks, size_t n_blocks, float *dst) {
 	const iq4_nl_block *b = blocks;
@@ -1086,55 +997,56 @@ __attribute__((weak)) void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst
 	}
 }
 
-void repack_iq4_nl_to_iq4_nl_r8_rows(const void *src, void *dst, int row_begin, int row_end,
-									 int k) {
+void repack_iq4_nl_to_iq4_nl_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										   int k) {
 	const int	 blocks_per_row = k / 32;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(iq4_nl_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % IQ4_NL_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += IQ4_NL_R8_ROWS) {
-		const iq4_nl_block *srow[IQ4_NL_R8_ROWS];
-		for (int r = 0; r < IQ4_NL_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % IQ4_NL_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ4_NL_REPACKED_ROWS) {
+		const iq4_nl_block *srow[IQ4_NL_REPACKED_ROWS];
+		for (int r = 0; r < IQ4_NL_REPACKED_ROWS; r++)
 			srow[r] = (const iq4_nl_block *)(sp + (size_t)(g + r) * src_stride);
 
 		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(iq4_nl_block);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * IQ4_NL_R8_ROWS * sizeof(iq4_nl_block);
+			uint8_t *dblk = dgroup + (size_t)bi * IQ4_NL_REPACKED_ROWS * sizeof(iq4_nl_block);
 
 			uint16_t *dst_d = (uint16_t *)dblk;
-			for (int r = 0; r < IQ4_NL_R8_ROWS; r++)
+			for (int r = 0; r < IQ4_NL_REPACKED_ROWS; r++)
 				dst_d[r] = srow[r][bi].d;
 
-			uint8_t *dst_qs = dblk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
-			for (int r = 0; r < IQ4_NL_R8_ROWS; r++)
+			uint8_t *dst_qs = dblk + IQ4_NL_REPACKED_ROWS * sizeof(uint16_t);
+			for (int r = 0; r < IQ4_NL_REPACKED_ROWS; r++)
 				memcpy(dst_qs + (size_t)r * 16, srow[r][bi].qs, 16);
 		}
 	}
 }
 
-void matmul_iq4_nl_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+void matmul_iq4_nl_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k) {
 	const int	   blocks_per_row = k / 32;
-	const size_t   group_bytes	  = (size_t)IQ4_NL_R8_ROWS * sizeof(iq4_nl_block);
+	const size_t   group_bytes	  = (size_t)IQ4_NL_REPACKED_ROWS * sizeof(iq4_nl_block);
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % IQ4_NL_R8_ROWS); g < row_end; g += IQ4_NL_R8_ROWS) {
+	for (int g = row_begin - (row_begin % IQ4_NL_REPACKED_ROWS); g < row_end;
+		 g += IQ4_NL_REPACKED_ROWS) {
 		const uint8_t *dgroup = wb + (size_t)g * blocks_per_row * sizeof(iq4_nl_block);
-		float		   sumf[IQ4_NL_R8_ROWS] = {0};
+		float		   sumf[IQ4_NL_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const uint8_t  *dblk	   = dgroup + (size_t)bi * group_bytes;
 			const uint16_t *d_w		   = (const uint16_t *)dblk;
-			const uint8_t  *qs_w	   = dblk + IQ4_NL_R8_ROWS * sizeof(uint16_t);
+			const uint8_t  *qs_w	   = dblk + IQ4_NL_REPACKED_ROWS * sizeof(uint16_t);
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
 
-			for (int r = 0; r < IQ4_NL_R8_ROWS; r++) {
+			for (int r = 0; r < IQ4_NL_REPACKED_ROWS; r++) {
 				const uint8_t *row_qs = qs_w + (size_t)r * 16;
 				int32_t		   sumi	  = 0;
 				for (int j = 0; j < 16; j++) {
@@ -1144,7 +1056,7 @@ void matmul_iq4_nl_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *r
 				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < IQ4_NL_R8_ROWS; r++) {
+		for (int r = 0; r < IQ4_NL_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1152,63 +1064,67 @@ void matmul_iq4_nl_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *r
 	}
 }
 
-static void matmul_iq4_nl_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											  float *restrict y, int n, int k) {
-	matmul_iq4_nl_r8_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_iq4_nl_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+													float *restrict y, int n, int k) {
+	matmul_iq4_nl_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(iq4_nl_r8_q8, q8_0_block, 32, IQ4_NL_R8_ROWS,
+MATMUL_QONLY_DISPATCH(iq4_nl_repacked_q8, q8_0_block, 32, IQ4_NL_REPACKED_ROWS,
 					  ((size_t)k / 32) * sizeof(iq4_nl_block))
 
-MATMUL_Q8_F32(iq4_nl_r8_q8, q8_0_block, 32, quantize_q8_0, matmul_iq4_nl_r8_q8_qonly_f32)
+MATMUL_Q8_F32(iq4_nl_repacked_q8, q8_0_block, 32, quantize_q8_0,
+			  matmul_iq4_nl_repacked_q8_qonly_f32)
 
-void repack_q8_0_to_q8_0_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_q8_0_to_q8_0_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
 	const int	 blocks_per_row = k / 32;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q8_0_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % Q8_0_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += Q8_0_R8_ROWS) {
-		const q8_0_block *srow[Q8_0_R8_ROWS];
-		for (int r = 0; r < Q8_0_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % Q8_0_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += Q8_0_REPACKED_ROWS) {
+		const q8_0_block *srow[Q8_0_REPACKED_ROWS];
+		for (int r = 0; r < Q8_0_REPACKED_ROWS; r++)
 			srow[r] = (const q8_0_block *)(sp + (size_t)(g + r) * src_stride);
 
 		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(q8_0_block);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * Q8_0_R8_ROWS * sizeof(q8_0_block);
+			uint8_t *dblk = dgroup + (size_t)bi * Q8_0_REPACKED_ROWS * sizeof(q8_0_block);
 
 			uint16_t *dst_d = (uint16_t *)dblk;
-			for (int r = 0; r < Q8_0_R8_ROWS; r++)
+			for (int r = 0; r < Q8_0_REPACKED_ROWS; r++)
 				dst_d[r] = srow[r][bi].d;
 
-			int8_t *dst_qs = (int8_t *)(dblk + Q8_0_R8_ROWS * sizeof(uint16_t));
-			for (int r = 0; r < Q8_0_R8_ROWS; r++)
+			int8_t *dst_qs = (int8_t *)(dblk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
+			for (int r = 0; r < Q8_0_REPACKED_ROWS; r++)
 				memcpy(dst_qs + (size_t)r * 32, srow[r][bi].qs, 32);
 		}
 	}
 }
 
-void matmul_q8_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int row_begin, int row_end, int k) {
+void matmul_q8_0_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int row_begin, int row_end,
+												  int k) {
 	const int	   blocks_per_row = k / 32;
-	const size_t   group_bytes	  = (size_t)Q8_0_R8_ROWS * sizeof(q8_0_block);
+	const size_t   group_bytes	  = (size_t)Q8_0_REPACKED_ROWS * sizeof(q8_0_block);
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % Q8_0_R8_ROWS); g < row_end; g += Q8_0_R8_ROWS) {
-		const uint8_t *dgroup			  = wb + (size_t)g * blocks_per_row * sizeof(q8_0_block);
-		float		   sumf[Q8_0_R8_ROWS] = {0};
+	for (int g = row_begin - (row_begin % Q8_0_REPACKED_ROWS); g < row_end;
+		 g += Q8_0_REPACKED_ROWS) {
+		const uint8_t *dgroup = wb + (size_t)g * blocks_per_row * sizeof(q8_0_block);
+		float		   sumf[Q8_0_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t  *dblk	   = dgroup + (size_t)bi * group_bytes;
-			const uint16_t *d_w		   = (const uint16_t *)dblk;
-			const int8_t   *qs_w	   = (const int8_t *)(dblk + Q8_0_R8_ROWS * sizeof(uint16_t));
+			const uint8_t  *dblk = dgroup + (size_t)bi * group_bytes;
+			const uint16_t *d_w	 = (const uint16_t *)dblk;
+			const int8_t   *qs_w = (const int8_t *)(dblk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
 
-			for (int r = 0; r < Q8_0_R8_ROWS; r++) {
+			for (int r = 0; r < Q8_0_REPACKED_ROWS; r++) {
 				const int8_t *row_qs = qs_w + (size_t)r * 32;
 				int32_t		  sumi	 = 0;
 				for (int j = 0; j < 32; j++)
@@ -1216,7 +1132,7 @@ void matmul_q8_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *res
 				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < Q8_0_R8_ROWS; r++) {
+		for (int r = 0; r < Q8_0_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1224,47 +1140,48 @@ void matmul_q8_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *res
 	}
 }
 
-static void matmul_q8_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int n, int k) {
-	matmul_q8_0_r8_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_q8_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int n, int k) {
+	matmul_q8_0_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q8_0_r8_q8, q8_0_block, 32, Q8_0_R8_ROWS,
+MATMUL_QONLY_DISPATCH(q8_0_repacked_q8, q8_0_block, 32, Q8_0_REPACKED_ROWS,
 					  ((size_t)k / 32) * sizeof(q8_0_block))
 
-MATMUL_Q8_F32(q8_0_r8_q8, q8_0_block, 32, quantize_q8_0, matmul_q8_0_r8_q8_qonly_f32)
+MATMUL_Q8_F32(q8_0_repacked_q8, q8_0_block, 32, quantize_q8_0, matmul_q8_0_repacked_q8_qonly_f32)
 
-void repack_q4_0_to_q4_0_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_q4_0_to_q4_0_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
 	const int	 blocks_per_row = k / 32;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q4_0_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % Q4_0_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += Q4_0_R8_ROWS) {
-		const q4_0_block *srow[Q4_0_R8_ROWS];
-		for (int r = 0; r < Q4_0_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % Q4_0_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += Q4_0_REPACKED_ROWS) {
+		const q4_0_block *srow[Q4_0_REPACKED_ROWS];
+		for (int r = 0; r < Q4_0_REPACKED_ROWS; r++)
 			srow[r] = (const q4_0_block *)(sp + (size_t)(g + r) * src_stride);
 
 		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(q4_0_block);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * Q4_0_R8_ROWS * sizeof(q4_0_block);
+			uint8_t *dblk = dgroup + (size_t)bi * Q4_0_REPACKED_ROWS * sizeof(q4_0_block);
 
 			uint16_t *dst_d = (uint16_t *)dblk;
-			for (int r = 0; r < Q4_0_R8_ROWS; r++)
+			for (int r = 0; r < Q4_0_REPACKED_ROWS; r++)
 				dst_d[r] = srow[r][bi].d;
 
-			uint8_t *dst_qs = dblk + Q4_0_R8_ROWS * sizeof(uint16_t);
-			for (int r = 0; r < Q4_0_R8_ROWS; r++)
+			uint8_t *dst_qs = dblk + Q4_0_REPACKED_ROWS * sizeof(uint16_t);
+			for (int r = 0; r < Q4_0_REPACKED_ROWS; r++)
 				memcpy(dst_qs + (size_t)r * 16, srow[r][bi].qs, 16);
 		}
 	}
 }
 
-#define Q4_K_R8_ROW_BYTES (Q4_K_R8_GROUP_BYTES / Q4_K_R8_ROWS)
-#define Q5_K_R8_ROW_BYTES (Q5_K_R8_GROUP_BYTES / Q5_K_R8_ROWS)
+#define Q4_K_REPACKED_ROW_BYTES (Q4_K_REPACKED_GROUP_BYTES / Q4_K_REPACKED_ROWS)
+#define Q5_K_REPACKED_ROW_BYTES (Q5_K_REPACKED_GROUP_BYTES / Q5_K_REPACKED_ROWS)
 
 static void q4_k_expand_scales(const uint8_t *restrict sc, uint8_t *restrict se) {
 	for (int is = 0; is < 8; is++) {
@@ -1275,29 +1192,30 @@ static void q4_k_expand_scales(const uint8_t *restrict sc, uint8_t *restrict se)
 	}
 }
 
-void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_q4_k_to_q4_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
 	const int	 blocks_per_row = k / 256;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q4_k_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % Q4_K_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += Q4_K_R8_ROWS) {
-		const q4_k_block *srow[Q4_K_R8_ROWS];
-		for (int r = 0; r < Q4_K_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % Q4_K_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += Q4_K_REPACKED_ROWS) {
+		const q4_k_block *srow[Q4_K_REPACKED_ROWS];
+		for (int r = 0; r < Q4_K_REPACKED_ROWS; r++)
 			srow[r] = (const q4_k_block *)(sp + (size_t)(g + r) * src_stride);
 
-		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q4_K_R8_ROW_BYTES;
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q4_K_REPACKED_ROW_BYTES;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
+			uint8_t *dblk = dgroup + (size_t)bi * Q4_K_REPACKED_GROUP_BYTES;
 
-			uint16_t *dst_d	 = (uint16_t *)(dblk + Q4_K_R8_OFF_D);
-			uint16_t *dst_m	 = (uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
-			uint8_t	 *dst_se = dblk + Q4_K_R8_OFF_SE;
-			uint8_t	 *dst_q	 = dblk + Q4_K_R8_OFF_QS;
-			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q4_K_REPACKED_OFF_D);
+			uint16_t *dst_m	 = (uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN);
+			uint8_t	 *dst_se = dblk + Q4_K_REPACKED_OFF_SE;
+			uint8_t	 *dst_q	 = dblk + Q4_K_REPACKED_OFF_QS;
+			for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
 				dst_d[r] = srow[r][bi].d;
 				dst_m[r] = srow[r][bi].dmin;
 				q4_k_expand_scales(srow[r][bi].scales, dst_se + (size_t)r * 16);
@@ -1307,30 +1225,31 @@ void repack_q4_k_to_q4_k_r8_rows(const void *src, void *dst, int row_begin, int 
 	}
 }
 
-void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_q5_k_to_q5_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
 	const int	 blocks_per_row = k / 256;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q5_k_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % Q5_K_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += Q5_K_R8_ROWS) {
-		const q5_k_block *srow[Q5_K_R8_ROWS];
-		for (int r = 0; r < Q5_K_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % Q5_K_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += Q5_K_REPACKED_ROWS) {
+		const q5_k_block *srow[Q5_K_REPACKED_ROWS];
+		for (int r = 0; r < Q5_K_REPACKED_ROWS; r++)
 			srow[r] = (const q5_k_block *)(sp + (size_t)(g + r) * src_stride);
 
-		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q5_K_R8_ROW_BYTES;
+		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * Q5_K_REPACKED_ROW_BYTES;
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * Q5_K_R8_GROUP_BYTES;
+			uint8_t *dblk = dgroup + (size_t)bi * Q5_K_REPACKED_GROUP_BYTES;
 
-			uint16_t *dst_d	 = (uint16_t *)(dblk + Q5_K_R8_OFF_D);
-			uint16_t *dst_m	 = (uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
-			uint8_t	 *dst_se = dblk + Q5_K_R8_OFF_SE;
-			uint8_t	 *dst_qh = dblk + Q5_K_R8_OFF_QH;
-			uint8_t	 *dst_qs = dblk + Q5_K_R8_OFF_QS;
-			for (int r = 0; r < Q5_K_R8_ROWS; r++) {
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q5_K_REPACKED_OFF_D);
+			uint16_t *dst_m	 = (uint16_t *)(dblk + Q5_K_REPACKED_OFF_DMIN);
+			uint8_t	 *dst_se = dblk + Q5_K_REPACKED_OFF_SE;
+			uint8_t	 *dst_qh = dblk + Q5_K_REPACKED_OFF_QH;
+			uint8_t	 *dst_qs = dblk + Q5_K_REPACKED_OFF_QS;
+			for (int r = 0; r < Q5_K_REPACKED_ROWS; r++) {
 				dst_d[r] = srow[r][bi].d;
 				dst_m[r] = srow[r][bi].dmin;
 				q4_k_expand_scales(srow[r][bi].scales, dst_se + (size_t)r * 16);
@@ -1341,29 +1260,30 @@ void repack_q5_k_to_q5_k_r8_rows(const void *src, void *dst, int row_begin, int 
 	}
 }
 
-void repack_q6_k_to_q6_k_r8_rows(const void *src, void *dst, int row_begin, int row_end, int k) {
+void repack_q6_k_to_q6_k_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
 	const int	 blocks_per_row = k / 256;
 	const size_t src_stride		= (size_t)blocks_per_row * sizeof(q6_k_block);
 
 	const uint8_t *sp = src;
 	uint8_t		  *dp = dst;
 
-	int group_begin = row_begin - (row_begin % Q6_K_R8_ROWS);
-	for (int g = group_begin; g < row_end; g += Q6_K_R8_ROWS) {
-		const q6_k_block *srow[Q6_K_R8_ROWS];
-		for (int r = 0; r < Q6_K_R8_ROWS; r++)
+	int group_begin = row_begin - (row_begin % Q6_K_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += Q6_K_REPACKED_ROWS) {
+		const q6_k_block *srow[Q6_K_REPACKED_ROWS];
+		for (int r = 0; r < Q6_K_REPACKED_ROWS; r++)
 			srow[r] = (const q6_k_block *)(sp + (size_t)(g + r) * src_stride);
 
 		uint8_t *dgroup = dp + (size_t)g * blocks_per_row * sizeof(q6_k_block);
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			uint8_t *dblk = dgroup + (size_t)bi * Q6_K_R8_GROUP_BYTES;
+			uint8_t *dblk = dgroup + (size_t)bi * Q6_K_REPACKED_GROUP_BYTES;
 
-			uint8_t	 *dst_ql = dblk + Q6_K_R8_OFF_QL;
-			uint8_t	 *dst_qh = dblk + Q6_K_R8_OFF_QH;
-			int8_t	 *dst_sc = (int8_t *)(dblk + Q6_K_R8_OFF_SCALES);
-			uint16_t *dst_d	 = (uint16_t *)(dblk + Q6_K_R8_OFF_D);
-			for (int r = 0; r < Q6_K_R8_ROWS; r++) {
+			uint8_t	 *dst_ql = dblk + Q6_K_REPACKED_OFF_QL;
+			uint8_t	 *dst_qh = dblk + Q6_K_REPACKED_OFF_QH;
+			int8_t	 *dst_sc = (int8_t *)(dblk + Q6_K_REPACKED_OFF_SCALES);
+			uint16_t *dst_d	 = (uint16_t *)(dblk + Q6_K_REPACKED_OFF_D);
+			for (int r = 0; r < Q6_K_REPACKED_ROWS; r++) {
 				memcpy(dst_ql + (size_t)r * 128, srow[r][bi].ql, 128);
 				memcpy(dst_qh + (size_t)r * 64, srow[r][bi].qh, 64);
 				memcpy(dst_sc + (size_t)r * 16, srow[r][bi].scales, 16);
@@ -1373,26 +1293,27 @@ void repack_q6_k_to_q6_k_r8_rows(const void *src, void *dst, int row_begin, int 
 	}
 }
 
-void matmul_q4_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+void matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % Q4_K_R8_ROWS); g < row_end; g += Q4_K_R8_ROWS) {
+	for (int g = row_begin - (row_begin % Q4_K_REPACKED_ROWS); g < row_end;
+		 g += Q4_K_REPACKED_ROWS) {
 		const uint8_t *dgroup =
-			wb + ((size_t)g / Q4_K_R8_ROWS) * blocks_per_row * Q4_K_R8_GROUP_BYTES;
-		float sumf[Q4_K_R8_ROWS] = {0};
+			wb + ((size_t)g / Q4_K_REPACKED_ROWS) * blocks_per_row * Q4_K_REPACKED_GROUP_BYTES;
+		float sumf[Q4_K_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t  *dblk = dgroup + (size_t)bi * Q4_K_R8_GROUP_BYTES;
-			const uint16_t *ds	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_D);
-			const uint16_t *ms	 = (const uint16_t *)(dblk + Q4_K_R8_OFF_DMIN);
-			const uint8_t  *qss	 = dblk + Q4_K_R8_OFF_QS;
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q4_K_REPACKED_GROUP_BYTES;
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_D);
+			const uint16_t *ms	 = (const uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN);
+			const uint8_t  *qss	 = dblk + Q4_K_REPACKED_OFF_QS;
 
 			const q8_k_block *restrict xb = &xq[bi];
-			for (int r = 0; r < Q4_K_R8_ROWS; r++) {
-				const uint8_t *se	= dblk + Q4_K_R8_OFF_SE + (size_t)r * 16;
+			for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
+				const uint8_t *se	= dblk + Q4_K_REPACKED_OFF_SE + (size_t)r * 16;
 				const uint8_t *qb	= qss + (size_t)r * 128;
 				float		   d	= f16_to_f32(ds[r]);
 				float		   dmin = f16_to_f32(ms[r]);
@@ -1417,7 +1338,7 @@ void matmul_q4_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *r
 				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
 			}
 		}
-		for (int r = 0; r < Q4_K_R8_ROWS; r++) {
+		for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1425,35 +1346,36 @@ void matmul_q4_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *r
 	}
 }
 
-static void matmul_q4_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int n, int k) {
-	matmul_q4_k_r8_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_q4_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int n, int k) {
+	matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q4_k_r8_q8_k, q8_k_block, 256, Q4_K_R8_ROWS,
-					  ((size_t)k / 256) * Q4_K_R8_ROW_BYTES)
+MATMUL_QONLY_DISPATCH(q4_k_repacked_q8_k, q8_k_block, 256, Q4_K_REPACKED_ROWS,
+					  ((size_t)k / 256) * Q4_K_REPACKED_ROW_BYTES)
 
-void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+void matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % Q5_K_R8_ROWS); g < row_end; g += Q5_K_R8_ROWS) {
+	for (int g = row_begin - (row_begin % Q5_K_REPACKED_ROWS); g < row_end;
+		 g += Q5_K_REPACKED_ROWS) {
 		const uint8_t *dgroup =
-			wb + ((size_t)g / Q5_K_R8_ROWS) * blocks_per_row * Q5_K_R8_GROUP_BYTES;
-		float sumf[Q5_K_R8_ROWS] = {0};
+			wb + ((size_t)g / Q5_K_REPACKED_ROWS) * blocks_per_row * Q5_K_REPACKED_GROUP_BYTES;
+		float sumf[Q5_K_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t  *dblk = dgroup + (size_t)bi * Q5_K_R8_GROUP_BYTES;
-			const uint16_t *ds	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_D);
-			const uint16_t *ms	 = (const uint16_t *)(dblk + Q5_K_R8_OFF_DMIN);
-			const uint8_t  *qhs	 = dblk + Q5_K_R8_OFF_QH;
-			const uint8_t  *qss	 = dblk + Q5_K_R8_OFF_QS;
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q5_K_REPACKED_GROUP_BYTES;
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_D);
+			const uint16_t *ms	 = (const uint16_t *)(dblk + Q5_K_REPACKED_OFF_DMIN);
+			const uint8_t  *qhs	 = dblk + Q5_K_REPACKED_OFF_QH;
+			const uint8_t  *qss	 = dblk + Q5_K_REPACKED_OFF_QS;
 
 			const q8_k_block *restrict xb = &xq[bi];
-			for (int r = 0; r < Q5_K_R8_ROWS; r++) {
-				const uint8_t *se	= dblk + Q5_K_R8_OFF_SE + (size_t)r * 16;
+			for (int r = 0; r < Q5_K_REPACKED_ROWS; r++) {
+				const uint8_t *se	= dblk + Q5_K_REPACKED_OFF_SE + (size_t)r * 16;
 				const uint8_t *qh	= qhs + (size_t)r * 32;
 				const uint8_t *qb	= qss + (size_t)r * 128;
 				float		   d	= f16_to_f32(ds[r]);
@@ -1484,7 +1406,7 @@ void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *r
 				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
 			}
 		}
-		for (int r = 0; r < Q5_K_R8_ROWS; r++) {
+		for (int r = 0; r < Q5_K_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1492,16 +1414,16 @@ void matmul_q5_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *r
 	}
 }
 
-static void matmul_q5_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int n, int k) {
-	matmul_q5_k_r8_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_q5_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int n, int k) {
+	matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q5_k_r8_q8_k, q8_k_block, 256, Q5_K_R8_ROWS,
-					  ((size_t)k / 256) * Q5_K_R8_ROW_BYTES)
+MATMUL_QONLY_DISPATCH(q5_k_repacked_q8_k, q8_k_block, 256, Q5_K_REPACKED_ROWS,
+					  ((size_t)k / 256) * Q5_K_REPACKED_ROW_BYTES)
 
-static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc, uint16_t d_raw,
-						 const int8_t *xq8, float xd, float acc) {
+static float q6_k_repacked_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc,
+							   uint16_t d_raw, const int8_t *xq8, float xd, float acc) {
 	float  d = f16_to_f32(d_raw) * xd;
 	int8_t a[256];
 	int8_t *restrict ap = a;
@@ -1534,31 +1456,32 @@ static float q6_k_r8_dot(const uint8_t *ql, const uint8_t *qh, const int8_t *sc,
 	return acc + d * (float)total;
 }
 
-void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int row_begin, int row_end,
-											  int k) {
+void matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int row_begin, int row_end,
+													int k) {
 	const int	   blocks_per_row = k / 256;
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % Q6_K_R8_ROWS); g < row_end; g += Q6_K_R8_ROWS) {
+	for (int g = row_begin - (row_begin % Q6_K_REPACKED_ROWS); g < row_end;
+		 g += Q6_K_REPACKED_ROWS) {
 		const uint8_t *dgroup =
-			wb + ((size_t)g / Q6_K_R8_ROWS) * blocks_per_row * Q6_K_R8_GROUP_BYTES;
-		float sumf[Q6_K_R8_ROWS] = {0};
+			wb + ((size_t)g / Q6_K_REPACKED_ROWS) * blocks_per_row * Q6_K_REPACKED_GROUP_BYTES;
+		float sumf[Q6_K_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
-			const uint8_t  *dblk = dgroup + (size_t)bi * Q6_K_R8_GROUP_BYTES;
-			const uint8_t  *qls	 = dblk + Q6_K_R8_OFF_QL;
-			const uint8_t  *qhs	 = dblk + Q6_K_R8_OFF_QH;
-			const int8_t   *scs	 = (const int8_t *)(dblk + Q6_K_R8_OFF_SCALES);
-			const uint16_t *ds	 = (const uint16_t *)(dblk + Q6_K_R8_OFF_D);
+			const uint8_t  *dblk = dgroup + (size_t)bi * Q6_K_REPACKED_GROUP_BYTES;
+			const uint8_t  *qls	 = dblk + Q6_K_REPACKED_OFF_QL;
+			const uint8_t  *qhs	 = dblk + Q6_K_REPACKED_OFF_QH;
+			const int8_t   *scs	 = (const int8_t *)(dblk + Q6_K_REPACKED_OFF_SCALES);
+			const uint16_t *ds	 = (const uint16_t *)(dblk + Q6_K_REPACKED_OFF_D);
 
 			const q8_k_block *restrict xb = &xq[bi];
-			for (int r = 0; r < Q6_K_R8_ROWS; r++) {
-				sumf[r] = q6_k_r8_dot(qls + (size_t)r * 128, qhs + (size_t)r * 64,
-									  scs + (size_t)r * 16, ds[r], xb->qs, xb->d, sumf[r]);
+			for (int r = 0; r < Q6_K_REPACKED_ROWS; r++) {
+				sumf[r] = q6_k_repacked_dot(qls + (size_t)r * 128, qhs + (size_t)r * 64,
+											scs + (size_t)r * 16, ds[r], xb->qs, xb->d, sumf[r]);
 			}
 		}
-		for (int r = 0; r < Q6_K_R8_ROWS; r++) {
+		for (int r = 0; r < Q6_K_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1566,32 +1489,34 @@ void matmul_q6_k_r8_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *r
 	}
 }
 
-static void matmul_q6_k_r8_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
-											  float *restrict y, int n, int k) {
-	matmul_q6_k_r8_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_q6_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
+													float *restrict y, int n, int k) {
+	matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q6_k_r8_q8_k, q8_k_block, 256, Q6_K_R8_ROWS,
-					  ((size_t)k / 256) * (Q6_K_R8_GROUP_BYTES / Q6_K_R8_ROWS))
+MATMUL_QONLY_DISPATCH(q6_k_repacked_q8_k, q8_k_block, 256, Q6_K_REPACKED_ROWS,
+					  ((size_t)k / 256) * (Q6_K_REPACKED_GROUP_BYTES / Q6_K_REPACKED_ROWS))
 
-void matmul_q4_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int row_begin, int row_end, int k) {
+void matmul_q4_0_repacked_q8_qonly_f32_rows_range(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int row_begin, int row_end,
+												  int k) {
 	const int	   blocks_per_row = k / 32;
-	const size_t   group_bytes	  = (size_t)Q4_0_R8_ROWS * sizeof(q4_0_block);
+	const size_t   group_bytes	  = (size_t)Q4_0_REPACKED_ROWS * sizeof(q4_0_block);
 	const uint8_t *wb			  = w;
 
-	for (int g = row_begin - (row_begin % Q4_0_R8_ROWS); g < row_end; g += Q4_0_R8_ROWS) {
-		const uint8_t *dgroup			  = wb + (size_t)g * blocks_per_row * sizeof(q4_0_block);
-		float		   sumf[Q4_0_R8_ROWS] = {0};
+	for (int g = row_begin - (row_begin % Q4_0_REPACKED_ROWS); g < row_end;
+		 g += Q4_0_REPACKED_ROWS) {
+		const uint8_t *dgroup = wb + (size_t)g * blocks_per_row * sizeof(q4_0_block);
+		float		   sumf[Q4_0_REPACKED_ROWS] = {0};
 
 		for (int bi = 0; bi < blocks_per_row; bi++) {
 			const uint8_t  *dblk	   = dgroup + (size_t)bi * group_bytes;
 			const uint16_t *d_w		   = (const uint16_t *)dblk;
-			const uint8_t  *qs_w	   = dblk + Q4_0_R8_ROWS * sizeof(uint16_t);
+			const uint8_t  *qs_w	   = dblk + Q4_0_REPACKED_ROWS * sizeof(uint16_t);
 			const int8_t *restrict xq8 = xq[bi].qs;
 			const float d_xq		   = f16_to_f32(xq[bi].d);
 
-			for (int r = 0; r < Q4_0_R8_ROWS; r++) {
+			for (int r = 0; r < Q4_0_REPACKED_ROWS; r++) {
 				const uint8_t *row_qs = qs_w + (size_t)r * 16;
 				int32_t		   sumi	  = 0;
 				for (int j = 0; j < 16; j++) {
@@ -1601,7 +1526,7 @@ void matmul_q4_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *res
 				sumf[r] = fmaf(f16_to_f32(d_w[r]) * d_xq, (float)sumi, sumf[r]);
 			}
 		}
-		for (int r = 0; r < Q4_0_R8_ROWS; r++) {
+		for (int r = 0; r < Q4_0_REPACKED_ROWS; r++) {
 			int row = g + r;
 			if (row >= row_begin && row < row_end)
 				y[row] = sumf[r];
@@ -1609,15 +1534,15 @@ void matmul_q4_0_r8_q8_qonly_f32_rows_range(const void *w, const q8_0_block *res
 	}
 }
 
-static void matmul_q4_0_r8_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
-											float *restrict y, int n, int k) {
-	matmul_q4_0_r8_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
+static void matmul_q4_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
+												  float *restrict y, int n, int k) {
+	matmul_q4_0_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q4_0_r8_q8, q8_0_block, 32, Q4_0_R8_ROWS,
+MATMUL_QONLY_DISPATCH(q4_0_repacked_q8, q8_0_block, 32, Q4_0_REPACKED_ROWS,
 					  ((size_t)k / 32) * sizeof(q4_0_block))
 
-MATMUL_Q8_F32(q4_0_r8_q8, q8_0_block, 32, quantize_q8_0, matmul_q4_0_r8_q8_qonly_f32)
+MATMUL_Q8_F32(q4_0_repacked_q8, q8_0_block, 32, quantize_q8_0, matmul_q4_0_repacked_q8_qonly_f32)
 
 __attribute__((weak)) void dequant_f16_row(const void *src, int n, float *dst) {
 	const uint16_t *s = src;
@@ -1691,8 +1616,8 @@ void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out
 		*fn_out		 = dequant_q8_0_row;
 		*divisor_out = 32;
 		return;
-	case GGML_TYPE_Q8_0_R8:
-		*fn_out		 = dequant_q8_0_r8_row;
+	case GGML_TYPE_Q8_0_REPACKED:
+		*fn_out		 = dequant_q8_0_repacked_row;
 		*divisor_out = 32;
 		return;
 	case GGML_TYPE_Q3_K:
@@ -1735,10 +1660,6 @@ void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out
 		*fn_out		 = dequant_iq4_xs_row;
 		*divisor_out = 256;
 		return;
-	case GGML_TYPE_IQ3_S_RE:
-		*fn_out		 = dequant_iq3_s_re_row;
-		*divisor_out = 256;
-		return;
 	default:
 		*fn_out		 = dequant_zero_cells;
 		*divisor_out = 1;
@@ -1758,19 +1679,18 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 	switch (w_type) {
 	case GGML_TYPE_Q4_0:
 	case GGML_TYPE_Q8_0:
-	case GGML_TYPE_Q8_0_R8:
-	case GGML_TYPE_Q4_0_R8:
+	case GGML_TYPE_Q8_0_REPACKED:
+	case GGML_TYPE_Q4_0_REPACKED:
 	case GGML_TYPE_Q4_1:
 	case GGML_TYPE_Q5_0:
 	case GGML_TYPE_Q5_1:
 	case GGML_TYPE_IQ4_NL:
-	case GGML_TYPE_IQ4_NL_R8:
+	case GGML_TYPE_IQ4_NL_REPACKED:
 	case GGML_TYPE_Q6_K:
 	case GGML_TYPE_Q4_K:
 	case GGML_TYPE_Q5_K:
 	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ3_S_RE:
-	case GGML_TYPE_IQ3_S_RE8: {
+	case GGML_TYPE_IQ3_S_REPACKED: {
 		static _Thread_local quant_scratch qs = {NULL, 0};
 		if (!qs.q8_buf)
 			tlocal_register((void **)&qs.q8_buf);
@@ -1781,14 +1701,14 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 		case GGML_TYPE_Q8_0:
 			matmul_q8_0_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_Q8_0_R8:
-			matmul_q8_0_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_Q8_0_REPACKED:
+			matmul_q8_0_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_Q4_0_R8:
-			matmul_q4_0_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_Q4_0_REPACKED:
+			matmul_q4_0_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_IQ4_NL_R8:
-			matmul_iq4_nl_r8_q8_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_IQ4_NL_REPACKED:
+			matmul_iq4_nl_repacked_q8_f32(w, x, y, n, k, &qs);
 			break;
 		case GGML_TYPE_Q4_1:
 			matmul_q4_1_q8_f32(w, x, y, n, k, &qs);
@@ -1814,11 +1734,8 @@ __attribute__((weak)) void matmul_generic_f32(const void *w, uint32_t w_type, co
 		case GGML_TYPE_IQ3_S:
 			matmul_iq3_s_q8_k_f32(w, x, y, n, k, &qs);
 			break;
-		case GGML_TYPE_IQ3_S_RE:
-			matmul_iq3_s_re_q8_k_f32(w, x, y, n, k, &qs);
-			break;
-		case GGML_TYPE_IQ3_S_RE8:
-			matmul_iq3_s_re8_q8_k_f32(w, x, y, n, k, &qs);
+		case GGML_TYPE_IQ3_S_REPACKED:
+			matmul_iq3_s_repacked_q8_k_f32(w, x, y, n, k, &qs);
 			break;
 		default:
 			break;
@@ -2594,4 +2511,55 @@ __attribute__((weak)) void moe_activate_gelu(float *restrict act, const float *r
 											 const float *restrict up, int n, float gs, float us) {
 	for (int i = 0; i < n; i++)
 		act[i] = gelu_tanh(gate[i] * gs) * (up[i] * us);
+}
+
+__attribute__((weak)) void iq_qonly_via_dequant(const void *w, uint32_t				  wtype,
+												const q8_k_block *restrict xq, size_t xs,
+												float *restrict y, int ys, int n, int k, int m) {
+	dequant_blocks_fn dq  = NULL;
+	int				  div = 256;
+	dequant_row_plan(wtype, &dq, &div);
+	size_t wb  = ggml_row_size(wtype, k);
+	int	   bpr = k / 256;
+	float *xf  = malloc((size_t)k * sizeof(float));
+	float *wf  = malloc((size_t)k * sizeof(float));
+	for (int t = 0; t < m; t++) {
+		const q8_k_block *xb = xq + (size_t)t * xs;
+		for (int bi = 0; bi < bpr; bi++) {
+			float	d  = xb[bi].d;
+			int8_t *qs = (int8_t *)xb[bi].qs;
+			for (int j = 0; j < 256; j++)
+				xf[bi * 256 + j] = d * (float)qs[j];
+		}
+		for (int i = 0; i < n; i++) {
+			const uint8_t *row = (const uint8_t *)w + (size_t)i * wb;
+			dq(row, (size_t)(k / div), wf);
+			double acc = 0;
+			for (int j = 0; j < k; j++)
+				acc += (double)wf[j] * (double)xf[j];
+			y[(size_t)t * ys + i] = (float)acc;
+		}
+	}
+	free(xf);
+	free(wf);
+}
+__attribute__((weak)) void matmul_iq2_s_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+													   size_t xs, float *y, int ys, int n, int k,
+													   int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_S, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq2_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														 size_t xs, float *y, int ys, int n, int k,
+														 int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ2_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq3_xxs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														 size_t xs, float *y, int ys, int n, int k,
+														 int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ3_XXS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
+}
+__attribute__((weak)) void matmul_iq4_xs_q8_k_qonly_f32(const void *w, const q8_k_block *x,
+														size_t xs, float *y, int ys, int n, int k,
+														int m) {
+	iq_qonly_via_dequant(w, GGML_TYPE_IQ4_XS, x, xs ? xs : (size_t)(k / 256), y, ys, n, k, m);
 }

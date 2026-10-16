@@ -11,7 +11,7 @@ layout(std430, binding = 0) readonly buffer WBuf {
 	uint w[];
 };
 layout(std430, binding = 1) readonly buffer XQBuf {
-	uint xq[];
+	uvec4 xq4[];
 };
 layout(std430, binding = 2) buffer YBuf {
 	float y[];
@@ -31,7 +31,14 @@ uint g_mi;
 #define ROWS 4
 #define NIB 0x000F000Fu
 
-shared float s_acc[ROWS][WG];
+shared float s_acc[ROWS][WG + 1];
+
+float reduce_row(uint i) {
+	float v = 0.0;
+	for (int j = 0; j < WG; j++)
+		v += s_acc[i][j];
+	return v;
+}
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -74,7 +81,7 @@ uvec4 load_span(uint wbase, uint par) {
 				 (d >> 16u) | (e << 16u));
 }
 
-#ifdef R8
+#ifdef REPACKED
 void q6_spans(uint rowg, int bi, int sbit, int lhalf, out uvec4 qa, out uvec4 qb, out uvec4 qh) {
 	uint gw = (rowg >> 3u) * uint(u_k_blocks) * 420u + uint(bi) * 420u;
 	uint lb = gw + (rowg & 7u) * 32u + uint(sbit * 16 + lhalf * 4);
@@ -138,8 +145,8 @@ void main(void) {
 		int it4 = c & 3;
 		if (c >= nch)
 			continue;
-		uint  xbq = g_mi * uint(u_x_stride) + uint(bi) * 209u;
-		float xd  = uintBitsToFloat(xq[xbq + 64u]);
+		uint  xbq = g_mi * uint(u_x_stride) + uint(bi) * 212u;
+		float xd  = uintBitsToFloat(xq4[(xbq >> 2u) + 20u].x);
 		if (xd == 0.0)
 			continue;
 		int sbit  = it4 >> 1;
@@ -150,11 +157,13 @@ void main(void) {
 			q6_spans(rowg, bi, sbit, lhalf, qa, qb, qh);
 			int sumi = 0;
 			for (int grp = 0; grp < 4; grp++) {
-				int	 sub  = sbit * 8 + grp * 2 + lhalf;
-				uint xp	  = xbq + 81u + uint(sub) * 8u;
-				uint ls	  = uint((grp >> 1) * 4);
-				uint hs	  = uint(grp * 2);
-				int	 ssum = 0;
+				int	  sub  = sbit * 8 + grp * 2 + lhalf;
+				uint  xp   = (xbq >> 2u) + 21u + uint(sub) * 2u;
+				uvec4 xv0  = xq4[xp];
+				uvec4 xv1  = xq4[xp + 1u];
+				uint  ls   = uint((grp >> 1) * 4);
+				uint  hs   = uint(grp * 2);
+				int	  ssum = 0;
 				for (int half_i = 0; half_i < 2; half_i++) {
 					uint a = 0u;
 					for (int jw = half_i * 2; jw < half_i * 2 + 2; jw++) {
@@ -164,7 +173,8 @@ void main(void) {
 						uint hi_b = (hq >> (hs + 4u)) & 0x00300030u;
 						uint wa	  = (((ql >> ls) & NIB) | hi_a) - CENTER32;
 						uint wb	  = (((ql >> (ls + 8u)) & NIB) | hi_b) - CENTER32;
-						a += wa * xq[xp + uint(jw * 2)] + wb * xq[xp + uint(jw * 2) + 1u];
+						uvec4 xv  = jw < 2 ? xv0 : xv1;
+						a += wa * xv[(jw & 1) * 2] + wb * xv[(jw & 1) * 2 + 1];
 					}
 					ssum += pair_field_sum(a);
 				}
@@ -177,16 +187,10 @@ void main(void) {
 	for (int r = 0; r < ROWS; r++)
 		s_acc[r][tid] = acc[r];
 	barrier();
-	for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
-		if (tid < s)
-			for (int r = 0; r < ROWS; r++)
-				s_acc[r][tid] += s_acc[r][tid + s];
-		barrier();
-	}
 	if (tid < uint(ROWS)) {
 		uint row = row0 + tid;
 		if (int(row) < u_n) {
-			float v = s_acc[tid][0];
+			float v = reduce_row(tid);
 			if (u_add_residual == 1)
 				y[g_mi * uint(u_n) + row] = v + res[row];
 			else if (u_add_residual == 2)
