@@ -6,11 +6,8 @@
 #include "model.h"
 
 typedef struct kvcache_mla {
-	buffer kv;
-	buffer kv_host;
-	int	   lora_dim;
-	int	   qk_rope_dim;
-	int	   host_alloced;
+	int lora_dim;
+	int qk_rope_dim;
 } kvcache_mla;
 
 typedef struct kvcache_hybrid {
@@ -38,7 +35,6 @@ typedef struct kvcache {
 	int			  n_ctx, n_pos;
 	int			  n_kv_layers;
 	buffer		  k, v;
-	int			  has_host_kv;
 	kv_mirror	  mirror[KV_MAX_MIRRORS];
 	int			  n_mirrors;
 	int			 *primary_remap;

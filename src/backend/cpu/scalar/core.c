@@ -2419,13 +2419,11 @@ static void cpu_attn_mla_head_chunk(int begin, int end, int tid, void *ctx) {
 		cpu_attn_mla_head_compute(j, h);
 }
 
-__attribute__((weak)) status_code cpu_attention_mla(backend *self, const buffer *q,
-													const buffer *kv_cache, const buffer *k_b_w,
-													const buffer *v_b_w, buffer *out, int layer,
-													int pos, int n_heads, int qk_head, int qk_rope,
-													int qk_nope, int v_head, int kv_lora, int n_ctx,
-													const float *rope_cos_base,
-													const float *rope_sin_base, float scale) {
+__attribute__((weak)) status_code cpu_attention_mla(
+	backend *self, const buffer *q, const buffer *kv_cache, const buffer *k_b_w,
+	const buffer *v_b_w, buffer *out, int layer, int pos, int n_heads, int qk_head, int qk_rope,
+	int qk_nope, int v_head, int kv_lora, int n_ctx, const float *rope_cos_base,
+	const float *rope_sin_base, uint32_t k_b_type, uint32_t v_b_type, float scale) {
 	cpu_priv	*p			  = self->priv;
 	int			 total_dim	  = kv_lora + qk_rope;
 	const float *qf			  = (const float *)cpu_ptr(q);
@@ -3190,6 +3188,372 @@ __attribute__((weak)) status_code cpu_gated_delta_net(backend *self, const gdn_d
 	return OK;
 }
 
+enum {
+	HC_SUPPORTED = 4,
+};
+
+static const float KDA_L2_EPS = 1e-6f;
+
+static status_code matmul_vec(backend *self, const backend_weight *w, const float *x, float *y,
+							  int n, int k) {
+	buffer		xb = buffer_host_view(self, (void *)x, (size_t)k * sizeof(float));
+	buffer		yb = buffer_host_view(self, y, (size_t)n * sizeof(float));
+	status_code st = self->matmul(self, w->buf, w->type, &xb, &yb, n, k);
+	ensure_sync(self);
+	return st;
+}
+
+static void rmsnorm_inplace(float *x, const float *w, int n, float eps) {
+	float ss = 0.0f;
+	for (int i = 0; i < n; i++)
+		ss += x[i] * x[i];
+	float inv = 1.0f / sqrtf(ss / (float)n + eps);
+	for (int i = 0; i < n; i++)
+		x[i] = x[i] * inv * (w ? w[i] : 1.0f);
+}
+
+__attribute__((weak)) status_code cpu_hc_init(backend *self, const hc_init_desc *d) {
+	(void)self;
+	for (int h = 0; h < d->n_hc; h++)
+		memcpy(d->hc + (size_t)h * d->dim, d->x, (size_t)d->dim * sizeof(float));
+	return OK;
+}
+
+__attribute__((weak)) status_code cpu_hc_final(backend *self, const hc_final_desc *d) {
+	(void)self;
+	for (int i = 0; i < d->dim; i++) {
+		float acc = 0.0f;
+		for (int h = 0; h < d->n_hc; h++)
+			acc += d->hc[(size_t)h * d->dim + i];
+		d->x[i] = acc / (float)d->n_hc;
+	}
+	return OK;
+}
+
+static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, float eps) {
+	enum { HC = HC_SUPPORTED };
+	for (int src = 0; src < HC; src++) {
+		float *col = comb + src * HC;
+		float  mx  = col[0];
+		for (int d = 1; d < HC; d++)
+			mx = fmaxf(mx, col[d]);
+		float sum = 0.0f;
+		for (int d = 0; d < HC; d++) {
+			col[d] = expf(col[d] - mx);
+			sum += col[d];
+		}
+		for (int d = 0; d < HC; d++)
+			col[d] = col[d] / sum + eps;
+	}
+	for (int it = 0; it < iters; it++) {
+		if (it > 0) {
+			for (int src = 0; src < HC; src++) {
+				float sum = eps;
+				for (int d = 0; d < HC; d++)
+					sum += comb[src * HC + d];
+				for (int d = 0; d < HC; d++)
+					comb[src * HC + d] /= sum;
+			}
+		}
+		for (int d = 0; d < HC; d++) {
+			float sum = eps;
+			for (int src = 0; src < HC; src++)
+				sum += comb[src * HC + d];
+			for (int src = 0; src < HC; src++)
+				comb[src * HC + d] /= sum;
+		}
+	}
+}
+
+__attribute__((weak)) status_code cpu_hc_pre(backend *self, const hc_pre_desc *d) {
+	const int hc = d->n_hc, dim = d->dim, flat = hc * dim;
+	if (hc != HC_SUPPORTED)
+		return ERR_UNSUPPORTED;
+
+	float *normed = d->ws;
+	float *mixes  = normed + flat;
+	memcpy(normed, d->stream, (size_t)flat * sizeof(float));
+	rmsnorm_inplace(normed, NULL, flat, d->norm_eps);
+
+	status_code st = matmul_vec(self, &d->fn, normed, mixes, hc_mix_dim(hc), flat);
+	if (st != OK)
+		return st;
+
+	float pre[HC_SUPPORTED];
+	for (int h = 0; h < hc; h++) {
+		pre[h]	   = sigmoidf(mixes[h] * d->scale[0] + d->base[h]) + d->eps;
+		d->coef[h] = 2.0f * sigmoidf(mixes[hc + h] * d->scale[1] + d->base[hc + h]);
+	}
+	float *comb = d->coef + hc;
+	for (int j = 0; j < hc * hc; j++)
+		comb[j] = mixes[2 * hc + j] * d->scale[2] + d->base[2 * hc + j];
+	hc_sinkhorn(comb, d->sinkhorn_iters, d->eps);
+
+	for (int i = 0; i < dim; i++) {
+		float acc = 0.0f;
+		for (int h = 0; h < hc; h++)
+			acc += pre[h] * d->stream[(size_t)h * dim + i];
+		d->x[i] = acc;
+	}
+	return OK;
+}
+
+__attribute__((weak)) status_code cpu_hc_post(backend *self, const hc_post_desc *d) {
+	(void)self;
+	const int	 hc	  = d->n_hc;
+	const int	 dim  = d->dim;
+	const float *post = d->coef;
+	const float *comb = d->coef + hc;
+	for (int dst_h = 0; dst_h < hc; dst_h++) {
+		float *dst = d->hc_next + (size_t)dst_h * dim;
+		for (int i = 0; i < dim; i++) {
+			float acc = d->sub[i] * post[dst_h];
+			for (int src_h = 0; src_h < hc; src_h++)
+				acc += d->hc_cur[(size_t)src_h * dim + i] * comb[dst_h + src_h * hc];
+			dst[i] = acc;
+		}
+	}
+	return OK;
+}
+
+static void l2_normalize_heads(float *x, int n_heads, int head_dim) {
+	for (int h = 0; h < n_heads; h++) {
+		float *v  = x + (size_t)h * head_dim;
+		float  ss = 0.0f;
+		for (int i = 0; i < head_dim; i++)
+			ss += v[i] * v[i];
+		float inv = 1.0f / sqrtf(ss + KDA_L2_EPS);
+		for (int i = 0; i < head_dim; i++)
+			v[i] *= inv;
+	}
+}
+
+static void causal_conv_silu(float *state, const float *w, float *x, int channels, int kernel) {
+	const int hist = kernel - 1;
+	for (int c = 0; c < channels; c++) {
+		float		*h	 = state + (size_t)c * hist;
+		const float *wc	 = w + (size_t)c * kernel;
+		float		 sum = x[c] * wc[kernel - 1];
+		for (int k = 0; k < hist; k++)
+			sum += h[k] * wc[k];
+		memmove(h, h + 1, (size_t)(hist - 1) * sizeof(float));
+		h[hist - 1] = x[c];
+		x[c]		= silu(sum);
+	}
+}
+
+typedef struct {
+	float		*state;
+	const float *q, *k, *v, *g, *beta;
+	float		*out;
+	int			 head_dim;
+} kda_job;
+
+static void kda_heads(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	kda_job	   *j	  = arg;
+	const int	S	  = j->head_dim;
+	const float scale = 1.0f / sqrtf((float)S);
+	float		delta[512];
+	for (int h = begin; h < end; h++) {
+		float		*M = j->state + (size_t)h * S * S;
+		const float *q = j->q + (size_t)h * S;
+		const float *k = j->k + (size_t)h * S;
+		const float *v = j->v + (size_t)h * S;
+		const float *g = j->g + (size_t)h * S;
+		float		*o = j->out + (size_t)h * S;
+		float		 b = j->beta[h];
+		float		 decay[512];
+		for (int i = 0; i < S; i++)
+			decay[i] = expf(g[i]);
+		for (int r = 0; r < S; r++) {
+			float *row = M + (size_t)r * S;
+			float  dot = 0.0f;
+			for (int i = 0; i < S; i++) {
+				row[i] *= decay[i];
+				dot += row[i] * k[i];
+			}
+			delta[r] = (v[r] - dot) * b;
+		}
+		for (int r = 0; r < S; r++) {
+			float *row = M + (size_t)r * S;
+			float  dot = 0.0f;
+			for (int i = 0; i < S; i++) {
+				row[i] += delta[r] * k[i];
+				dot += row[i] * q[i];
+			}
+			o[r] = dot * scale;
+		}
+	}
+}
+
+__attribute__((weak)) status_code cpu_kda(backend *self, const kda_desc *d) {
+	const int dim = d->dim, H = d->n_heads, S = d->head_dim, D = H * S;
+	const int K = d->conv_kernel, hist = K - 1;
+
+	float *q	= d->ws;
+	float *k	= q + D;
+	float *v	= k + D;
+	float *g	= v + D;
+	float *o	= g + D;
+	float *g2	= o + D;
+	float *tmp	= g2 + D;
+	float *beta = tmp + S;
+
+	status_code st = matmul_vec(self, &d->wq, d->x, q, D, dim);
+	if (st == OK)
+		st = matmul_vec(self, &d->wk, d->x, k, D, dim);
+	if (st == OK)
+		st = matmul_vec(self, &d->wv, d->x, v, D, dim);
+	if (st != OK)
+		return st;
+	causal_conv_silu(d->conv_state, d->conv_q, q, D, K);
+	causal_conv_silu(d->conv_state + (size_t)D * hist, d->conv_k, k, D, K);
+	causal_conv_silu(d->conv_state + (size_t)2 * D * hist, d->conv_v, v, D, K);
+	l2_normalize_heads(q, H, S);
+	l2_normalize_heads(k, H, S);
+
+	st = matmul_vec(self, &d->f_a, d->x, tmp, S, dim);
+	if (st == OK)
+		st = matmul_vec(self, &d->f_b, tmp, g, D, S);
+	if (st == OK)
+		st = matmul_vec(self, &d->beta, d->x, beta, H, dim);
+	if (st != OK)
+		return st;
+	const float lb = d->gate_lower_bound;
+	for (int h = 0; h < H; h++) {
+		for (int i = 0; i < S; i++) {
+			int	  idx = h * S + i;
+			float t	  = g[idx] + d->dt_bias[idx];
+			if (lb > -INFINITY) {
+				g[idx] = lb * sigmoidf(-(t * d->ssm_a[h]));
+			} else {
+				float sp = t > 20.0f ? t : log1pf(expf(t));
+				g[idx]	 = sp * d->ssm_a[h];
+			}
+		}
+		beta[h] = sigmoidf(beta[h]);
+	}
+
+	kda_job job	 = {d->state, q, k, v, g, beta, o, S};
+	tpool  *pool = self->get_pool ? self->get_pool(self) : NULL;
+	if (pool && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, H, 1, kda_heads, &job);
+	else
+		kda_heads(0, H, -1, &job);
+
+	st = matmul_vec(self, &d->g_a, d->x, tmp, S, dim);
+	if (st == OK)
+		st = matmul_vec(self, &d->g_b, tmp, g2, D, S);
+	if (st != OK)
+		return st;
+	for (int h = 0; h < H; h++) {
+		float *oh = o + (size_t)h * S;
+		rmsnorm_inplace(oh, d->out_norm, S, d->norm_eps);
+		for (int i = 0; i < S; i++)
+			oh[i] *= sigmoidf(g2[h * S + i]);
+	}
+	return matmul_vec(self, &d->wo, o, d->out, dim, D);
+}
+
+typedef struct {
+	const float *q_abs;
+	const float *cache;
+	const float *v_b;
+	float		*out;
+	float		*scratch;
+	int			 n_pos, kv_lora, v_head, scratch_stride;
+	float		 scale;
+} mla_job;
+
+static void mla_heads(int begin, int end, int tid, void *arg) {
+	mla_job	 *j	  = arg;
+	float	 *sc  = j->scratch + (size_t)(tid < 0 ? 0 : tid) * j->scratch_stride;
+	float	 *lat = sc + j->n_pos;
+	const int R	  = j->kv_lora;
+	for (int h = begin; h < end; h++) {
+		const float *qa = j->q_abs + (size_t)h * R;
+		float		 mx = -INFINITY;
+		for (int t = 0; t < j->n_pos; t++) {
+			const float *kv = j->cache + (size_t)t * R;
+			float		 s	= 0.0f;
+			for (int r = 0; r < R; r++)
+				s += qa[r] * kv[r];
+			sc[t] = s * j->scale;
+			mx	  = fmaxf(mx, sc[t]);
+		}
+		float sum = 0.0f;
+		for (int t = 0; t < j->n_pos; t++) {
+			sc[t] = expf(sc[t] - mx);
+			sum += sc[t];
+		}
+		memset(lat, 0, (size_t)R * sizeof(float));
+		for (int t = 0; t < j->n_pos; t++) {
+			const float *kv = j->cache + (size_t)t * R;
+			float		 p	= sc[t] / sum;
+			for (int r = 0; r < R; r++)
+				lat[r] += p * kv[r];
+		}
+		const float *vb = j->v_b + (size_t)h * j->v_head * R;
+		float		*o	= j->out + (size_t)h * j->v_head;
+		for (int d = 0; d < j->v_head; d++) {
+			const float *row = vb + (size_t)d * R;
+			float		 s	 = 0.0f;
+			for (int r = 0; r < R; r++)
+				s += row[r] * lat[r];
+			o[d] = s;
+		}
+	}
+}
+
+__attribute__((weak)) status_code cpu_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
+	const int dim = d->dim, H = d->n_heads, R = d->kv_lora;
+	const int qk = d->qk_head, vh = d->v_head, ql = d->q_lora;
+	const int n_pos			 = d->pos + 1;
+	const int scratch_stride = n_pos + R;
+
+	float *qa	 = d->ws;
+	float *q	 = qa + ql;
+	float *q_abs = q + (size_t)H * qk;
+	float *kv	 = q_abs + (size_t)H * R;
+	float *ho	 = kv + R;
+	float *scr	 = ho + (size_t)H * vh;
+
+	status_code st = matmul_vec(self, &d->q_a, d->x, qa, ql, dim);
+	if (st != OK)
+		return st;
+	rmsnorm_inplace(qa, d->q_a_norm, ql, d->norm_eps);
+	st = matmul_vec(self, &d->q_b, qa, q, H * qk, ql);
+	if (st == OK)
+		st = matmul_vec(self, &d->kv_a, d->x, kv, R, dim);
+	if (st != OK)
+		return st;
+	rmsnorm_inplace(kv, d->kv_a_norm, R, d->norm_eps);
+	memcpy(d->latent_cache + (size_t)d->pos * R, kv, (size_t)R * sizeof(float));
+
+	for (int h = 0; h < H; h++) {
+		const float *qh = q + (size_t)h * qk;
+		const float *kh = d->k_b + (size_t)h * R * qk;
+		for (int r = 0; r < R; r++) {
+			const float *row = kh + (size_t)r * qk;
+			float		 s	 = 0.0f;
+			for (int i = 0; i < qk; i++)
+				s += row[i] * qh[i];
+			q_abs[(size_t)h * R + r] = s;
+		}
+	}
+
+	mla_job job	 = {q_abs,			d->latent_cache,		d->v_b, ho, scr, n_pos, R, vh,
+					scratch_stride, 1.0f / sqrtf((float)qk)};
+	tpool  *pool = self->get_pool ? self->get_pool(self) : NULL;
+	if (pool && tpool_current_tid() < 0)
+		tpool_parallel_for(pool, H, 1, mla_heads, &job);
+	else
+		mla_heads(0, H, -1, &job);
+
+	return matmul_vec(self, &d->wo, ho, d->out, dim, H * vh);
+}
+
 status_code cpu_backend_fill(backend *out) {
 	out->probe							 = cpu_probe;
 	out->init							 = cpu_init;
@@ -3259,6 +3623,12 @@ status_code cpu_backend_fill(backend *out) {
 	out->matmul_ffn_down				 = cpu_matmul_ffn_down;
 	out->matmul_ffn_down_batch			 = cpu_matmul_ffn_down_batch;
 	out->kv_free						 = cpu_kv_free;
+	out->hc_init						 = cpu_hc_init;
+	out->hc_pre							 = cpu_hc_pre;
+	out->hc_post						 = cpu_hc_post;
+	out->hc_final						 = cpu_hc_final;
+	out->kda							 = cpu_kda;
+	out->mla_absorbed					 = cpu_mla_absorbed;
 	return OK;
 }
 

@@ -88,6 +88,12 @@ const char *op_family_name(op_family f) {
 		[OPFAM_TOOLCALL]		 = "toolcall",
 		[OPFAM_REAL_SHAPE]		 = "real_shape",
 		[OPFAM_HCS]				 = "hcs",
+		[OPFAM_HC_INIT]			 = "hc_init",
+		[OPFAM_HC_PRE]			 = "hc_pre",
+		[OPFAM_HC_POST]			 = "hc_post",
+		[OPFAM_HC_FINAL]		 = "hc_final",
+		[OPFAM_KDA]				 = "kda",
+		[OPFAM_MLA_ABSORBED]	 = "mla_absorbed",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";

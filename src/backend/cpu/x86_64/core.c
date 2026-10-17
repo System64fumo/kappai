@@ -1581,7 +1581,10 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 							  const buffer *k_b_w, const buffer *v_b_w, buffer *out, int layer,
 							  int pos, int n_heads, int qk_head, int qk_rope, int qk_nope,
 							  int v_head, int kv_lora, int n_ctx, const float *rope_cos_base,
-							  const float *rope_sin_base, float scale) {
+							  const float *rope_sin_base, uint32_t k_b_type, uint32_t v_b_type,
+							  float scale) {
+	(void)k_b_type;
+	(void)v_b_type;
 	cpu_priv	*p			  = self->priv;
 	int			 total_dim	  = kv_lora + qk_rope;
 	const float *qf			  = (const float *)cpu_ptr(q);

@@ -120,6 +120,80 @@ typedef struct {
 	float		*ws;
 } gdn_desc;
 
+typedef struct {
+	const buffer *buf;
+	uint32_t	  type;
+} backend_weight;
+
+typedef struct {
+	int			 dim, n_hc;
+	const float *x;
+	float		*hc;
+} hc_init_desc;
+
+typedef struct {
+	int			 dim, n_hc;
+	const float *hc;
+	float		*x;
+} hc_final_desc;
+
+typedef struct {
+	int			   dim, n_hc, sinkhorn_iters;
+	float		   norm_eps, eps;
+	const float	  *stream;
+	backend_weight fn;
+	const float	  *base, *scale;
+	float		  *x, *coef;
+	float		  *ws;
+} hc_pre_desc;
+
+typedef struct {
+	int			 dim, n_hc;
+	const float *sub, *coef, *hc_cur;
+	float		*hc_next;
+} hc_post_desc;
+
+typedef struct {
+	int			   dim, n_heads, head_dim, conv_kernel;
+	float		   gate_lower_bound, norm_eps;
+	const float	  *x;
+	backend_weight wq, wk, wv, wo, f_a, f_b, g_a, g_b, beta;
+	const float	  *conv_q, *conv_k, *conv_v, *dt_bias, *ssm_a, *out_norm;
+	float		  *conv_state, *state;
+	float		  *out;
+	float		  *ws;
+} kda_desc;
+
+typedef struct {
+	int			   dim, n_heads, kv_lora, qk_head, v_head, q_lora, pos, n_threads;
+	float		   norm_eps;
+	const float	  *x;
+	backend_weight q_a, q_b, kv_a, wo;
+	const float	  *q_a_norm, *kv_a_norm, *k_b, *v_b;
+	float		  *latent_cache;
+	float		  *out;
+	float		  *ws;
+} mla_absorbed_desc;
+
+static inline int hc_mix_dim(int n_hc) {
+	return (2 + n_hc) * n_hc;
+}
+
+static inline size_t hc_pre_ws_floats(const hc_pre_desc *d) {
+	return (size_t)d->n_hc * d->dim + hc_mix_dim(d->n_hc);
+}
+
+static inline size_t kda_ws_floats(const kda_desc *d) {
+	size_t inner = (size_t)d->n_heads * d->head_dim;
+	return 6 * inner + 2 * (size_t)d->head_dim + d->n_heads;
+}
+
+static inline size_t mla_absorbed_ws_floats(const mla_absorbed_desc *d) {
+	size_t stride = (size_t)d->pos + 1 + d->kv_lora;
+	return (size_t)d->q_lora + (size_t)d->n_heads * d->qk_head + (size_t)d->n_heads * d->kv_lora +
+		   d->kv_lora + (size_t)d->n_heads * d->v_head + (size_t)(d->n_threads + 1) * stride;
+}
+
 struct backend {
 	const char *name;
 	int			priority;
@@ -267,13 +341,20 @@ struct backend {
 								 const buffer *k_b_w, const buffer *v_b_w, buffer *out, int layer,
 								 int pos, int n_heads, int qk_head, int qk_rope, int qk_nope,
 								 int v_head, int kv_lora, int n_ctx, const float *rope_cos_base,
-								 const float *rope_sin_base, float scale);
+								 const float *rope_sin_base, uint32_t k_b_type, uint32_t v_b_type,
+								 float scale);
 	status_code (*kv_alloc_mla)(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
 								buffer *kv_out);
 	status_code (*kv_put_mla)(backend *self, buffer *kv_cache, int layer, int pos,
 							  const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
 							  int qk_rope, int n_ctx, float eps);
 	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
+	status_code (*hc_init)(backend *self, const hc_init_desc *d);
+	status_code (*hc_pre)(backend *self, const hc_pre_desc *d);
+	status_code (*hc_post)(backend *self, const hc_post_desc *d);
+	status_code (*hc_final)(backend *self, const hc_final_desc *d);
+	status_code (*kda)(backend *self, const kda_desc *d);
+	status_code (*mla_absorbed)(backend *self, const mla_absorbed_desc *d);
 	tpool *(*get_pool)(backend *self);
 	status_code (*matmul_thread_local)(backend *self, const void *w, uint32_t w_type,
 									   const float *x, float *y, int n, int k, int tid);

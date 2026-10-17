@@ -1979,10 +1979,10 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 	m->mla.v_head  = v_head;
 	m->head_dim	   = m->mla.qk_head;
 	m->rope_dim	   = m->mla.qk_rope;
-	DEBUG("glm-dsa: MLA q_lora=%d kv_lora=%d qk_nope=%d qk_rope=%d "
+	DEBUG("%s: MLA q_lora=%d kv_lora=%d qk_nope=%d qk_rope=%d "
 		  "qk_head=%d v_head=%d (head_dim=%d, rope_dim=%d)",
-		  m->mla.q_lora, m->mla.kv_lora, m->mla.qk_nope, m->mla.qk_rope, m->mla.qk_head,
-		  m->mla.v_head, m->head_dim, m->rope_dim);
+		  m->arch_info->gguf_name, m->mla.q_lora, m->mla.kv_lora, m->mla.qk_nope, m->mla.qk_rope,
+		  m->mla.qk_head, m->mla.v_head, m->head_dim, m->rope_dim);
 }
 
 static int hybrid_count_full_attention(const model *m) {
@@ -2082,10 +2082,12 @@ static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *pr
 	k->gate_lower_bound = -INFINITY;
 	akey_f32(g, prefix, "kda.gate_lower_bound", &k->gate_lower_bound);
 
-	if (q->conv_kernel < 2 || k->head_dim < 1 || k->hc_count != 4 || k->hc_sinkhorn_iters < 1) {
-		ERROR("glm5-next: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
-			  "only hc_count=4 is supported",
-			  q->conv_kernel, k->head_dim, k->hc_count, k->hc_sinkhorn_iters);
+	if (q->conv_kernel < 2 || k->head_dim < 1 || k->head_dim > HEAD_DIM_MAX || k->hc_count != 4 ||
+		k->hc_sinkhorn_iters < 1) {
+		ERROR("%s: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
+			  "head_dim must be <= %d and only hc_count=4 is supported",
+			  m->arch_info->gguf_name, q->conv_kernel, k->head_dim, k->hc_count,
+			  k->hc_sinkhorn_iters, HEAD_DIM_MAX);
 		return ERR_FORMAT;
 	}
 
@@ -2116,9 +2118,10 @@ static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *pr
 	q->inner_size	  = d_inner;
 	q->conv_channels  = 3 * d_inner;
 	q->conv_dim		  = 3 * d_inner;
-	DEBUG("glm5-next: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
-		  m->n_heads, k->head_dim, q->conv_kernel, (double)k->gate_lower_bound, k->hc_count,
-		  k->hc_sinkhorn_iters, k->swiglu_clamp_exp ? "yes" : "no");
+	DEBUG("%s: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
+		  m->arch_info->gguf_name, m->n_heads, k->head_dim, q->conv_kernel,
+		  (double)k->gate_lower_bound, k->hc_count, k->hc_sinkhorn_iters,
+		  k->swiglu_clamp_exp ? "yes" : "no");
 	return OK;
 }
 
@@ -2624,7 +2627,8 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->v_b_w, "blk.%d.attn_v_b.weight",
 								  1) != OK)
 				return ERR_FORMAT;
-			if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
+			if (m->backend && (m->arch_info->has_hyper_connections ||
+							   backend_has_cap(m->backend, BCAP_IS_HOST))) {
 				if (L->k_b_w.type != GGML_TYPE_F32) {
 					dequant_ref_to_f32(m, &L->k_b_w, (size_t)m->mla.qk_nope * m->mla.kv_lora,
 									   (size_t)m->n_heads);

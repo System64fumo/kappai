@@ -151,13 +151,32 @@ static const synth_cfg ARCH_CFG_MLA_WIDE = {
 	.v_head			   = 96,
 };
 
+static const synth_cfg ARCH_CFG_GLM5 = {
+	.n_layers		   = 4,
+	.dim			   = 256,
+	.n_heads		   = 8,
+	.n_kv_heads		   = 8,
+	.head_dim		   = 32,
+	.intermediate	   = 256,
+	.vocab			   = 512,
+	.n_experts		   = 8,
+	.n_experts_used	   = 2,
+	.n_shared_experts  = 1,
+	.moe_intermediate  = 128,
+	.routed_scale	   = 1.0f,
+	.norm_topk_prob	   = 1,
+	.first_dense_layer = 2,
+	.q_lora			   = 64,
+	.kv_lora		   = 32,
+	.qk_head		   = 32,
+	.qk_rope		   = 0,
+	.qk_nope		   = 32,
+	.v_head			   = 32,
+};
+
 static const synth_cfg *g_synth_build_cfg = NULL;
 
 static size_t synth_q4_k_buf_size(int rows, int cols) {
-	if (cols % 256 != 0) {
-		fprintf(stderr, "synth_q4_k_buf_size: cols=%d not multiple of 256\n", cols);
-		exit(2);
-	}
 	size_t blocks_per_row = (size_t)cols / 256;
 	return (size_t)rows * blocks_per_row * 144;
 }
@@ -198,6 +217,8 @@ static void synth_alloc_layer(layer_weights *L, int li, const synth_cfg *cfg, mo
 		L->n_kv_heads	   = cfg->n_kv_heads;
 	}
 	L->has_own_v = 1;
+	if (m->arch_info->is_kda && m->hybrid.recurrent_layers)
+		L->is_recurrent = m->hybrid.recurrent_layers[li];
 
 	int				 q_out		  = cfg->n_heads * L->head_dim;
 	int				 kv_out		  = L->n_kv_heads * L->head_dim;
@@ -289,6 +310,35 @@ static void synth_alloc_layer(layer_weights *L, int li, const synth_cfg *cfg, mo
 		L->k_b_w.host_ptr		= synth_alloc_f32(kv_lora * wo_in);
 		L->v_b_w.host_ptr		= synth_alloc_f32(kv_lora * wo_in);
 	}
+
+	if (ai->is_kda) {
+		const int	 hc		 = m->kda.hc_count;
+		const size_t hc_dim	 = (size_t)hc * m->dim;
+		const size_t hc_mix	 = (size_t)(2 + hc) * hc;
+		const int	 S		 = m->kda.head_dim;
+		const int	 d_inner = m->hybrid.value_dim;
+		const int	 K		 = m->hybrid.conv_kernel;
+		const int	 H		 = m->n_heads;
+
+		L->hc_attn_fn_w.host_ptr	= synth_alloc_f32((int)(hc_dim * hc_mix));
+		L->hc_ffn_fn_w.host_ptr		= synth_alloc_f32((int)(hc_dim * hc_mix));
+		L->hc_attn_base_w.host_ptr	= synth_alloc_f32((int)hc_mix);
+		L->hc_ffn_base_w.host_ptr	= synth_alloc_f32((int)hc_mix);
+		L->hc_attn_scale_w.host_ptr = synth_alloc_f32(3);
+		L->hc_ffn_scale_w.host_ptr	= synth_alloc_f32(3);
+
+		L->kda_f_a_w.host_ptr	 = synth_alloc_f32(m->dim * S);
+		L->kda_f_b_w.host_ptr	 = synth_alloc_f32(S * d_inner);
+		L->kda_g_a_w.host_ptr	 = synth_alloc_f32(m->dim * S);
+		L->kda_g_b_w.host_ptr	 = synth_alloc_f32(S * d_inner);
+		L->ssm_beta_w.host_ptr	 = synth_alloc_f32(m->dim * H);
+		L->ssm_a.host_ptr		 = synth_alloc_f32(H);
+		L->ssm_dt_b.host_ptr	 = synth_alloc_f32(d_inner);
+		L->ssm_norm_w.host_ptr	 = synth_alloc_f32(S);
+		L->kda_conv_q_w.host_ptr = synth_alloc_f32(K * d_inner);
+		L->kda_conv_k_w.host_ptr = synth_alloc_f32(K * d_inner);
+		L->kda_conv_v_w.host_ptr = synth_alloc_f32(K * d_inner);
+	}
 }
 
 static void synth_fill_layer_rng(layer_weights *L, int li, uint64_t *seed) {
@@ -360,6 +410,40 @@ static void synth_fill_layer_rng(layer_weights *L, int li, uint64_t *seed) {
 		synth_fill_f32((float *)L->kv_a_norm_w.host_ptr, kv_lora, 1.0f);
 		synth_fill_f32((float *)L->k_b_w.host_ptr, kv_lora * wo_in, 0.0f);
 		synth_fill_f32((float *)L->v_b_w.host_ptr, kv_lora * wo_in, 0.0f);
+	}
+
+	if (L->hc_attn_fn_w.host_ptr) {
+		const int	 hc		 = 4;
+		const size_t hc_mix	 = (size_t)(2 + hc) * hc;
+		const size_t hc_dim	 = (size_t)hc * cfg->dim;
+		const int	 S		 = cfg->head_dim;
+		const int	 d_inner = cfg->n_heads * S;
+		const int	 K		 = 4;
+		const int	 H		 = cfg->n_heads;
+
+		synth_fill_f32((float *)L->hc_attn_fn_w.host_ptr, (int)(hc_dim * hc_mix), 0.0f);
+		synth_fill_f32((float *)L->hc_ffn_fn_w.host_ptr, (int)(hc_dim * hc_mix), 0.0f);
+		synth_fill_f32((float *)L->hc_attn_base_w.host_ptr, (int)hc_mix, 0.0f);
+		synth_fill_f32((float *)L->hc_ffn_base_w.host_ptr, (int)hc_mix, 0.0f);
+		synth_fill_f32((float *)L->hc_attn_scale_w.host_ptr, 3, 1.0f);
+		synth_fill_f32((float *)L->hc_ffn_scale_w.host_ptr, 3, 1.0f);
+
+		synth_fill_f32((float *)L->kda_f_a_w.host_ptr, cfg->dim * S, 0.0f);
+		synth_fill_f32((float *)L->kda_f_b_w.host_ptr, S * d_inner, 0.0f);
+		synth_fill_f32((float *)L->kda_g_a_w.host_ptr, cfg->dim * S, 0.0f);
+		synth_fill_f32((float *)L->kda_g_b_w.host_ptr, S * d_inner, 0.0f);
+		synth_fill_f32((float *)L->ssm_beta_w.host_ptr, cfg->dim * H, 0.0f);
+		{
+			float *a_p = (float *)L->ssm_a.host_ptr;
+			synth_fill_f32(a_p, H, 0.0f);
+			for (int h = 0; h < H; h++)
+				a_p[h] = -fabsf(a_p[h]) - 0.5f;
+		}
+		synth_fill_f32((float *)L->ssm_dt_b.host_ptr, d_inner, 0.0f);
+		synth_fill_f32((float *)L->ssm_norm_w.host_ptr, S, 1.0f);
+		synth_fill_f32((float *)L->kda_conv_q_w.host_ptr, K * d_inner, 0.0f);
+		synth_fill_f32((float *)L->kda_conv_k_w.host_ptr, K * d_inner, 0.0f);
+		synth_fill_f32((float *)L->kda_conv_v_w.host_ptr, K * d_inner, 0.0f);
 	}
 }
 
@@ -631,6 +715,152 @@ static void synth_upload_layer(model *m, int li) {
 						   .name	  = tname};
 		a->buffer_alloc_weight(a, &dvb, &L->v_b_w.buf);
 	}
+
+	if (ai->is_kda) {
+		const int	   hc	   = m->kda.hc_count;
+		const uint64_t hc_dim  = (uint64_t)hc * m->dim;
+		const uint64_t hc_mix  = (uint64_t)(2 + hc) * hc;
+		const int	   S	   = m->kda.head_dim;
+		const int	   d_inner = m->hybrid.value_dim;
+		const int	   K	   = m->hybrid.conv_kernel;
+		const int	   H	   = m->n_heads;
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_attn_fn.weight", li);
+		tensor_desc d_haf = {.host_data = L->hc_attn_fn_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 2,
+							 .dims		= {hc_dim, hc_mix},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_haf, &L->hc_attn_fn_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_fn.weight", li);
+		tensor_desc d_hff = {.host_data = L->hc_ffn_fn_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 2,
+							 .dims		= {hc_dim, hc_mix},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_hff, &L->hc_ffn_fn_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_attn_base.weight", li);
+		tensor_desc d_hab = {.host_data = L->hc_attn_base_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 1,
+							 .dims		= {hc_mix},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_hab, &L->hc_attn_base_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_base.weight", li);
+		tensor_desc d_hfb = {.host_data = L->hc_ffn_base_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 1,
+							 .dims		= {hc_mix},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_hfb, &L->hc_ffn_base_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_attn_scale.weight", li);
+		tensor_desc d_has = {.host_data = L->hc_attn_scale_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 1,
+							 .dims		= {3},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_has, &L->hc_attn_scale_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_scale.weight", li);
+		tensor_desc d_hfs = {.host_data = L->hc_ffn_scale_w.host_ptr,
+							 .type		= GGML_TYPE_F32,
+							 .n_dims	= 1,
+							 .dims		= {3},
+							 .name		= tname};
+		a->buffer_alloc_weight(a, &d_hfs, &L->hc_ffn_scale_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_f_a.weight", li);
+		tensor_desc d_fa = {.host_data = L->kda_f_a_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)m->dim, (uint64_t)S},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_fa, &L->kda_f_a_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_f_b.weight", li);
+		tensor_desc d_fb = {.host_data = L->kda_f_b_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)S, (uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_fb, &L->kda_f_b_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_g_a.weight", li);
+		tensor_desc d_ga = {.host_data = L->kda_g_a_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)m->dim, (uint64_t)S},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_ga, &L->kda_g_a_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_g_b.weight", li);
+		tensor_desc d_gb = {.host_data = L->kda_g_b_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)S, (uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_gb, &L->kda_g_b_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_beta.weight", li);
+		tensor_desc d_sb = {.host_data = L->ssm_beta_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)m->dim, (uint64_t)H},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_sb, &L->ssm_beta_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_a", li);
+		tensor_desc d_sa = {.host_data = L->ssm_a.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 1,
+							.dims	   = {(uint64_t)H},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_sa, &L->ssm_a.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", li);
+		tensor_desc d_dt = {.host_data = L->ssm_dt_b.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 1,
+							.dims	   = {(uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_dt, &L->ssm_dt_b.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", li);
+		tensor_desc d_sn = {.host_data = L->ssm_norm_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 1,
+							.dims	   = {(uint64_t)S},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_sn, &L->ssm_norm_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_q.weight", li);
+		tensor_desc d_cq = {.host_data = L->kda_conv_q_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_cq, &L->kda_conv_q_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_k.weight", li);
+		tensor_desc d_ck = {.host_data = L->kda_conv_k_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_ck, &L->kda_conv_k_w.buf);
+
+		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_v.weight", li);
+		tensor_desc d_cv = {.host_data = L->kda_conv_v_w.host_ptr,
+							.type	   = GGML_TYPE_F32,
+							.n_dims	   = 2,
+							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
+							.name	   = tname};
+		a->buffer_alloc_weight(a, &d_cv, &L->kda_conv_v_w.buf);
+	}
 }
 
 static synth_model *synth_model_build(backend *a, model_arch arch, const synth_cfg *cfg,
@@ -673,6 +903,30 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 	m->mla.qk_rope = cfg->qk_rope;
 	m->mla.qk_nope = cfg->qk_nope;
 	m->mla.v_head  = cfg->v_head;
+
+	if (m->arch_info->is_kda) {
+		const int S						  = cfg->head_dim;
+		const int d_inner				  = m->n_heads * S;
+		m->kda.head_dim					  = S;
+		m->kda.hc_count					  = 4;
+		m->kda.hc_sinkhorn_iters		  = 3;
+		m->kda.hc_eps					  = 1e-3f;
+		m->kda.gate_lower_bound			  = 0.01f;
+		m->hybrid.conv_kernel			  = 4;
+		m->hybrid.conv_dim				  = 3 * d_inner;
+		m->hybrid.conv_channels			  = 3 * d_inner;
+		m->hybrid.state_size			  = S;
+		m->hybrid.value_head_dim		  = S;
+		m->hybrid.value_dim				  = d_inner;
+		m->hybrid.key_dim				  = d_inner;
+		m->hybrid.inner_size			  = d_inner;
+		m->hybrid.n_key_heads			  = m->n_heads;
+		m->hybrid.n_value_heads			  = m->n_heads;
+		m->hybrid.full_attention_interval = 4;
+		m->hybrid.recurrent_layers		  = xmalloc((size_t)cfg->n_layers);
+		for (int li = 0; li < cfg->n_layers; li++)
+			m->hybrid.recurrent_layers[li] = ((li + 1) % 4) != 0;
+	}
 
 	if (m->arch_info->has_variable_layer_dims) {
 		int hd_swa						   = cfg->head_dim;
@@ -793,6 +1047,25 @@ static void synth_free_layer(layer_weights *L, int li) {
 			a->buffer_free(a, &L->k_b_w.buf);
 			a->buffer_free(a, &L->v_b_w.buf);
 		}
+		if (L->hc_attn_fn_w.host_ptr) {
+			a->buffer_free(a, &L->hc_attn_fn_w.buf);
+			a->buffer_free(a, &L->hc_ffn_fn_w.buf);
+			a->buffer_free(a, &L->hc_attn_base_w.buf);
+			a->buffer_free(a, &L->hc_ffn_base_w.buf);
+			a->buffer_free(a, &L->hc_attn_scale_w.buf);
+			a->buffer_free(a, &L->hc_ffn_scale_w.buf);
+			a->buffer_free(a, &L->kda_f_a_w.buf);
+			a->buffer_free(a, &L->kda_f_b_w.buf);
+			a->buffer_free(a, &L->kda_g_a_w.buf);
+			a->buffer_free(a, &L->kda_g_b_w.buf);
+			a->buffer_free(a, &L->ssm_beta_w.buf);
+			a->buffer_free(a, &L->ssm_a.buf);
+			a->buffer_free(a, &L->ssm_dt_b.buf);
+			a->buffer_free(a, &L->ssm_norm_w.buf);
+			a->buffer_free(a, &L->kda_conv_q_w.buf);
+			a->buffer_free(a, &L->kda_conv_k_w.buf);
+			a->buffer_free(a, &L->kda_conv_v_w.buf);
+		}
 	}
 
 	free((void *)L->attn_norm_w.host_ptr);
@@ -833,6 +1106,26 @@ static void synth_free_layer(layer_weights *L, int li) {
 		free((void *)L->k_b_w.host_ptr);
 		free((void *)L->v_b_w.host_ptr);
 	}
+
+	if (L->hc_attn_fn_w.host_ptr) {
+		free((void *)L->hc_attn_fn_w.host_ptr);
+		free((void *)L->hc_ffn_fn_w.host_ptr);
+		free((void *)L->hc_attn_base_w.host_ptr);
+		free((void *)L->hc_ffn_base_w.host_ptr);
+		free((void *)L->hc_attn_scale_w.host_ptr);
+		free((void *)L->hc_ffn_scale_w.host_ptr);
+		free((void *)L->kda_f_a_w.host_ptr);
+		free((void *)L->kda_f_b_w.host_ptr);
+		free((void *)L->kda_g_a_w.host_ptr);
+		free((void *)L->kda_g_b_w.host_ptr);
+		free((void *)L->ssm_beta_w.host_ptr);
+		free((void *)L->ssm_a.host_ptr);
+		free((void *)L->ssm_dt_b.host_ptr);
+		free((void *)L->ssm_norm_w.host_ptr);
+		free((void *)L->kda_conv_q_w.host_ptr);
+		free((void *)L->kda_conv_k_w.host_ptr);
+		free((void *)L->kda_conv_v_w.host_ptr);
+	}
 }
 
 static void synth_model_free(synth_model *sm) {
@@ -853,6 +1146,7 @@ static void synth_model_free(synth_model *sm) {
 	free(sm->m.layer_dims.is_global_layer);
 	free(sm->m.layer_dims.ffn_lengths);
 	free(sm->m.layer_dims.n_kv_heads_per_layer);
+	free(sm->m.hybrid.recurrent_layers);
 	if (sm->m.recipe)
 		recipe_free(sm->m.recipe);
 	if (sm->m.moe_cache)
@@ -1267,7 +1561,7 @@ static void test_arch_multi_device(backend *ref, model_arch arch, const synth_cf
 	synth_model *sm	   = synth_model_build(ref, arch, cfg, n_ctx);
 
 	int32_t *tokens = xmalloc((size_t)(n_prefill + n_decode) * sizeof(int32_t));
-	seed_test_rng(0x3DE71CEULL + (uint64_t)arch);
+	seed_test_rng(0x5A117ULL + (uint64_t)arch);
 	for (int i = 0; i < n_prefill + n_decode; i++)
 		tokens[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
 
@@ -1412,10 +1706,42 @@ static void test_arch_error_compounding(backend *ref, backend *tgt, const synth_
 	}
 }
 
+static void missing_native_ops(const backend *b, const arch_info *ai, char *out, size_t cap) {
+	const struct {
+		const char *name;
+		bool		has;
+	} ops[] = {
+		{"hc_init", b->hc_init != NULL}, {"hc_pre", b->hc_pre != NULL},
+		{"hc_post", b->hc_post != NULL}, {"hc_final", b->hc_final != NULL},
+		{"kda", b->kda != NULL},		 {"mla_absorbed", b->mla_absorbed != NULL},
+	};
+	out[0] = '\0';
+	if (!ai->is_kda)
+		return;
+	for (size_t i = 0; i < ARRAY_LEN(ops); i++) {
+		if (ops[i].has)
+			continue;
+		size_t len = strlen(out);
+		snprintf(out + len, cap - len, "%s%s", len ? ", " : "", ops[i].name);
+	}
+}
+
 static void test_arch_generate(backend *ref, backend *tgt, model_arch arch, const synth_cfg *cfg,
 							   int n_prefill, int n_decode, int flash_attn) {
 	const char *arch_name = arch_lookup(arch)->gguf_name;
 	int			n_ctx	  = n_prefill + n_decode + 16;
+
+	char missing[128] = "";
+	if (tgt)
+		missing_native_ops(tgt, arch_lookup(arch), missing, sizeof(missing));
+	if (missing[0]) {
+		char skip_label[160];
+		char skip_detail[256];
+		snprintf(skip_label, sizeof(skip_label), "arch.generate[%s] (%s)", arch_name, tgt->name);
+		snprintf(skip_detail, sizeof(skip_detail), "missing native implementation: %s", missing);
+		record_result(OPFAM_ARCH_GENERATE, skip_label, V_SKIP, skip_detail);
+		tgt = NULL;
+	}
 
 	synth_model *sm_ref = synth_model_build(ref, arch, cfg, n_ctx);
 	synth_model *sm_tgt = tgt ? synth_model_build(tgt, arch, cfg, n_ctx) : NULL;
@@ -1629,6 +1955,7 @@ void run_arch_tests(backend *ref, backend *tgt) {
 	test_arch_generate(ref, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 16, ARCH_GENERATE_N_DECODE, 1);
 	test_arch_generate(ref, tgt, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 16,
 					   ARCH_GENERATE_N_DECODE, 1);
+	test_arch_generate(ref, tgt, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 16, ARCH_GENERATE_N_DECODE, 1);
 	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA_DENSE_FIRST, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA_WIDE, 8, 1);
@@ -1638,6 +1965,8 @@ void run_arch_tests(backend *ref, backend *tgt) {
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, false, 8, 4);
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 0, false, 8, 4);
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, true, 8, 4);
+	test_arch_mixed_split(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 1, false, 8, 4);
+	test_arch_mixed_split(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 2, true, 8, 4);
 	test_arch_multi_device(ref, ARCH_LLAMA, &ARCH_CFG_DEEPER, 8, 4);
 	flush_family(OPFAM_ARCH_GENERATE);
 }

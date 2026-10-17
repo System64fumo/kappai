@@ -283,6 +283,12 @@ static void log_op_homes(backend *b) {
 		{"matmul_multi_batch", b->matmul_multi_batch != NULL},
 		{"moe_activate", b->moe_activate != NULL},
 		{"moe_experts_batch", b->moe_experts_batch != NULL},
+		{"hc_init", b->hc_init != NULL},
+		{"hc_pre", b->hc_pre != NULL},
+		{"hc_post", b->hc_post != NULL},
+		{"hc_final", b->hc_final != NULL},
+		{"kda", b->kda != NULL},
+		{"mla_absorbed", b->mla_absorbed != NULL},
 	};
 	int	 n_native = 0;
 	int	 n_total  = (int)ARRAY_LEN(ops);

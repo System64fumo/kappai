@@ -103,6 +103,7 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->ple_proj_norm_w);
 	free_buf(&s->router_softmax_inp);
 	free_buf(&s->router_logits);
+	free_buf(&s->moe_shared_y_dev);
 
 	for (int d = 0; d < s->n_mirrors; d++) {
 		scratch_mirror *mir = &s->mirror[d];
@@ -181,11 +182,15 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	FREE_FLOAT_BUF(hybrid_host2);
 	FREE_FLOAT_BUF(hybrid_host3);
 	FREE_FLOAT_BUF(gdn_ws_host);
-	FREE_FLOAT_BUF(glm_ws);
+	FREE_FLOAT_BUF(op_ws);
 	FREE_FLOAT_BUF(gdn_z_host);
 	FREE_FLOAT_BUF(gdn_alpha_host);
 	FREE_FLOAT_BUF(gdn_beta_host);
 	FREE_FLOAT_BUF(gdn_out_host);
+	FREE_FLOAT_BUF(op_st_in);
+	FREE_FLOAT_BUF(op_st_out);
+	FREE_FLOAT_BUF(op_st_cur);
+	FREE_FLOAT_BUF(op_st_coef);
 #undef FREE_FLOAT_BUF
 
 	if (s->bs) {
@@ -578,7 +583,12 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	return OK;
 }
 
-status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim) {
+static status_code carry_slot_to_device(compute_scratch *s, int target_dev, uint8_t slot, int n) {
+	return compute_copy_buffer_cross(s, &compute_slots_array(s)[slot],
+									 &compute_dev_slots(s, target_dev)[slot], n);
+}
+
+status_code compute_switch_active_backend(compute_scratch *s, backend *target, const model *m) {
 	if (!target)
 		target = s->backend;
 	backend *current = compute_active_backend(s);
@@ -597,10 +607,10 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, i
 		return ERR_UNSUPPORTED;
 	}
 
-	buffer *src = &compute_slots_array(s)[RECIPE_SLOT_X];
-	buffer *dst = &compute_dev_slots(s, target_dev)[RECIPE_SLOT_X];
 	ensure_sync(current);
-	status_code st = compute_copy_buffer_cross(s, src, dst, dim);
+	status_code st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_X, m->dim);
+	if (st == OK && m->arch_info->has_hyper_connections)
+		st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_HC, m->kda.hc_count * m->dim);
 	if (st != OK)
 		return st;
 

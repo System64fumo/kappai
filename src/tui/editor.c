@@ -69,8 +69,8 @@ static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"compute device, <backend>_<n>",
 	"phases this device runs for the weights it holds",
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
-	"experts of every layer stored on this device, a number, '*' for the remainder (one '*' per "
-	"config) or empty for the default",
+	"experts of every layer cached (LRU) on this device, a number, '*' for the remainder (one '*' "
+	"per config) or empty for the default",
 };
 
 static int editor_tab_count(void) {

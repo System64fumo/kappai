@@ -69,6 +69,8 @@ typedef enum {
 	GL_PIPE_ATTENTION_BATCH,
 	GL_PIPE_PARTIAL_ROPE_QK,
 	GL_PIPE_KV_PUT,
+	GL_PIPE_MLA_KV_PUT,
+	GL_PIPE_MLA_ATTENTION,
 	GL_PIPE_QUANTIZE_X,
 	GL_PIPE_ROPE_QK,
 	GL_PIPE_QUANTIZE_X_ACT,
@@ -373,6 +375,9 @@ static status_code gl_link_program_from_shader(GLuint shader, GLuint *out_progra
 }
 
 #define GL_ATTENTION_MAX_HEAD_DIM 512
+
+#define GL_MLA_MAX_QK_HEAD 512
+#define GL_MLA_MAX_KV_LORA 512
 #define GL_ATTENTION_TILE_T_MAX 16
 #define GL_ATTENTION_Q_CHUNK 4
 #define GL_ATTENTION_WG 64
@@ -867,6 +872,24 @@ static void gl_buf_sync_to_host(gl_buf *b) {
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 }
 
+static void gl_buffer_mark_host_written(const buffer *b) {
+	if (!b || !b->owner || !b->handle)
+		return;
+	gl_buf *gb		 = as_glbuf(b);
+	gb->host_dirty	 = 1;
+	gb->device_dirty = 0;
+}
+
+static void gl_buffer_sync_to_host(const buffer *b) {
+	if (b && b->owner && b->handle)
+		gl_buf_sync_to_host(as_glbuf(b));
+}
+
+static void gl_buffer_sync_to_device(const buffer *b) {
+	if (b && b->owner && b->handle && strcmp(b->owner->name, "opengl") == 0)
+		gl_buf_sync_to_device(as_glbuf(b));
+}
+
 static void gl_buf_free(gl_priv *p, gl_buf *b) {
 	if (!b)
 		return;
@@ -1125,6 +1148,9 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_PARTIAL_ROPE_QK] = {"partial_rope_qk", gl_shader_partial_rope_qk_src, 0,
 									 UINT32_MAX, 1, 0},
 		[GL_PIPE_KV_PUT]		  = {"kv_put", gl_shader_kv_put_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_MLA_KV_PUT]	  = {"mla_kv_put", gl_shader_mla_kv_put_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_MLA_ATTENTION]	  = {"mla_attention", gl_shader_mla_attention_src, 0, UINT32_MAX, 1,
+									 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -1303,34 +1329,6 @@ static void gl_free(backend *self) {
 	self->priv = NULL;
 }
 
-static bool gl_weight_is_device_only(uint32_t type) {
-	switch (type) {
-	case GGML_TYPE_IQ4_NL:
-	case GGML_TYPE_Q4_0:
-	case GGML_TYPE_Q4_1:
-	case GGML_TYPE_Q5_0:
-	case GGML_TYPE_Q5_1:
-	case GGML_TYPE_Q8_0:
-	case GGML_TYPE_Q4_K:
-	case GGML_TYPE_Q5_K:
-	case GGML_TYPE_Q6_K:
-	case GGML_TYPE_IQ3_S:
-	case GGML_TYPE_IQ2_S:
-	case GGML_TYPE_IQ2_XXS:
-	case GGML_TYPE_IQ3_XXS:
-	case GGML_TYPE_IQ4_XS:
-	case GGML_TYPE_Q4_0_REPACKED:
-	case GGML_TYPE_Q8_0_REPACKED:
-	case GGML_TYPE_IQ4_NL_REPACKED:
-	case GGML_TYPE_Q4_K_REPACKED:
-	case GGML_TYPE_Q5_K_REPACKED:
-	case GGML_TYPE_Q6_K_REPACKED:
-		return true;
-	default:
-		return false;
-	}
-}
-
 static int gl_type_is_repacked(uint32_t type) {
 	return type == GGML_TYPE_Q4_0_REPACKED || type == GGML_TYPE_Q8_0_REPACKED ||
 		   type == GGML_TYPE_IQ4_NL_REPACKED || type == GGML_TYPE_Q4_K_REPACKED ||
@@ -1345,7 +1343,7 @@ static status_code gl_buffer_alloc_weight(backend *self, const tensor_desc *desc
 		d1 = (d1 + 7) & ~(uint64_t)7;
 	size_t size = ggml_row_size(desc->type, desc->dims[0]) * (size_t)d1;
 
-	bool	keep_host_mirror = desc->n_dims == 1 || !gl_weight_is_device_only(desc->type);
+	bool	keep_host_mirror = true;
 	gl_buf *b = gl_buf_alloc_ex(p, size, GL_STATIC_DRAW, desc->host_data, keep_host_mirror, desc);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
@@ -2658,18 +2656,20 @@ static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, co
 	}
 
 host_fallback:
-	gl_buf_sync_to_host(as_glbuf(w));
-	gl_buf_sync_to_host(as_glbuf(x));
-	gl_buf_sync_to_host(as_glbuf(y));
+	gl_buffer_sync_to_host(w);
+	gl_buffer_sync_to_host(x);
+	gl_buffer_sync_to_host(y);
 	{
 		backend_report_host_fallback(self, "matmul",
 									 gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE
 																		 : HFB_WEIGHT_TYPE,
 									 "weight type '%s' (type=%u)", ggml_type_name(w_type), w_type);
 		backend *host = backend_host();
-		if (host && host->matmul)
-			return host->matmul(host, w, w_type, x, y, n, k);
-		return ERR_UNSUPPORTED;
+		if (!host || !host->matmul)
+			return ERR_UNSUPPORTED;
+		status_code hs = host->matmul(host, w, w_type, x, y, n, k);
+		gl_buffer_mark_host_written(y);
+		return hs;
 	}
 }
 
@@ -2708,18 +2708,20 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	}
 
 host_fallback:
-	gl_buf_sync_to_host(as_glbuf(w));
-	gl_buf_sync_to_host(as_glbuf(x));
-	gl_buf_sync_to_host(as_glbuf(y));
+	gl_buffer_sync_to_host(w);
+	gl_buffer_sync_to_host(x);
+	gl_buffer_sync_to_host(y);
 	{
 		backend_report_host_fallback(
 			self, "matmul_batch",
 			gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE : HFB_WEIGHT_TYPE,
 			"weight type '%s' (type=%u) m=%d", ggml_type_name(w_type), w_type, m);
 		backend *host = backend_host();
-		if (host && host->matmul_batch)
-			return host->matmul_batch(host, w, w_type, x, y, n, k, m);
-		return ERR_UNSUPPORTED;
+		if (!host || !host->matmul_batch)
+			return ERR_UNSUPPORTED;
+		status_code hs = host->matmul_batch(host, w, w_type, x, y, n, k, m);
+		gl_buffer_mark_host_written(y);
+		return hs;
 	}
 }
 
@@ -2743,18 +2745,20 @@ static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w
 	if (s != ERR_UNSUPPORTED)
 		return s;
 
-	gl_buf_sync_to_host(as_glbuf(w));
-	gl_buf_sync_to_host(as_glbuf(x));
-	gl_buf_sync_to_host(as_glbuf(residual));
-	gl_buf_sync_to_host(as_glbuf(y));
+	gl_buffer_sync_to_host(w);
+	gl_buffer_sync_to_host(x);
+	gl_buffer_sync_to_host(residual);
+	gl_buffer_sync_to_host(y);
 	backend_report_host_fallback(self, "matmul_residual",
 								 gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE
 																	 : HFB_WEIGHT_TYPE,
 								 "weight type '%s' (type=%u)", ggml_type_name(w_type), w_type);
 	backend *host = backend_host();
-	if (host && host->matmul_residual)
-		return host->matmul_residual(host, w, w_type, x, residual, y, n, k);
-	return ERR_UNSUPPORTED;
+	if (!host || !host->matmul_residual)
+		return ERR_UNSUPPORTED;
+	status_code hs = host->matmul_residual(host, w, w_type, x, residual, y, n, k);
+	gl_buffer_mark_host_written(y);
+	return hs;
 }
 
 #define GL_MATMUL_MULTI_MAX 8
@@ -2832,17 +2836,20 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 
 host_fallback:
 	for (int i = 0; i < n_matmuls; i++) {
-		gl_buf_sync_to_host(as_glbuf(w[i]));
-		gl_buf_sync_to_host(as_glbuf(y[i]));
+		gl_buffer_sync_to_host(w[i]);
+		gl_buffer_sync_to_host(y[i]);
 	}
-	gl_buf_sync_to_host(as_glbuf(x));
+	gl_buffer_sync_to_host(x);
 	{
 		backend_report_host_fallback(self, "matmul_multi", HFB_OP_NOT_NATIVE, "n_matmuls=%d k=%d",
 									 n_matmuls, k);
 		backend *host = backend_host();
-		if (host && host->matmul_multi)
-			return host->matmul_multi(host, w, w_types, x, y, n_list, k, n_matmuls);
-		return ERR_UNSUPPORTED;
+		if (!host || !host->matmul_multi)
+			return ERR_UNSUPPORTED;
+		status_code hs = host->matmul_multi(host, w, w_types, x, y, n_list, k, n_matmuls);
+		for (int i = 0; i < n_matmuls; i++)
+			gl_buffer_mark_host_written(y[i]);
+		return hs;
 	}
 }
 
@@ -3062,6 +3069,148 @@ static status_code gl_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 						  head_dim, n_ctx, n_kv_heads_active, m);
 }
 
+static uint32_t gl_mla_wtype_code(uint32_t type) {
+	if (type == GGML_TYPE_F32)
+		return 0;
+	if (type == GGML_TYPE_F16)
+		return 1;
+	if (type == GGML_TYPE_BF16)
+		return 2;
+	return UINT32_MAX;
+}
+
+static status_code gl_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
+								   buffer *kv_out) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	size_t		 layer_bytes = (size_t)(kv_lora + qk_rope) * (size_t)n_ctx * sizeof(float);
+	gl_kv_store *ks			 = gl_kv_store_new(p);
+	if (gl_kv_store_alloc(p, ks, n_layers, layer_bytes) != OK) {
+		ERROR("gl: kv_alloc_mla: failed to allocate %d MLA layer buffers of %zu bytes", n_layers,
+			  layer_bytes);
+		gl_kv_store_free(p, ks);
+		return ERR_OUT_OF_MEMORY;
+	}
+	kv_out->handle	 = ks;
+	kv_out->size	 = layer_bytes * (size_t)n_layers;
+	kv_out->host_ptr = NULL;
+	kv_out->offset	 = 0;
+	kv_out->owner	 = self;
+	return OK;
+}
+
+static status_code gl_kv_put_mla(backend *self, buffer *kv_cache, int layer, int pos,
+								 const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
+								 int qk_rope, int n_ctx, float eps) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	(void)n_ctx;
+	if (kv_lora <= 0 && qk_rope <= 0)
+		return OK;
+	if (!p->pipes[GL_PIPE_MLA_KV_PUT].program)
+		return ERR_UNSUPPORTED;
+	gl_buf *cb = gl_kv_layer_buf(kv_cache, layer);
+	gl_buf_sync_to_device(as_glbuf(kv_a_in));
+
+	bool   norm_device = kv_lora > 0 && kv_a_norm_w->owner == self && kv_a_norm_w->handle;
+	buffer norm_staged = {0};
+	if (kv_lora > 0) {
+		if (norm_device) {
+			gl_buf_sync_to_device(as_glbuf(kv_a_norm_w));
+		} else {
+			const float *nd = kv_a_norm_w->host_ptr ? (const float *)kv_a_norm_w->host_ptr
+													: (const float *)kv_a_norm_w->handle;
+			if (!nd)
+				return ERR_INVALID_ARG;
+			status_code s =
+				self->buffer_alloc_scratch(self, (size_t)kv_lora * sizeof(float), &norm_staged);
+			if (s != OK)
+				return s;
+			s = self->buffer_write_f32(self, &norm_staged, nd, kv_lora);
+			if (s != OK) {
+				self->buffer_free(self, &norm_staged);
+				return s;
+			}
+		}
+	}
+
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_MLA_KV_PUT]);
+	gl_bind_ssbo(0, kv_a_in);
+	if (kv_lora > 0)
+		gl_bind_ssbo(1, norm_device ? kv_a_norm_w : &norm_staged);
+	gl_bind_raw(p, 2, cb->name, 0, 0, 1);
+	gl_pu(&p->pipes[GL_PIPE_MLA_KV_PUT], "u_kv_lora", kv_lora);
+	gl_pu(&p->pipes[GL_PIPE_MLA_KV_PUT], "u_qk_rope", qk_rope);
+	gl_pu(&p->pipes[GL_PIPE_MLA_KV_PUT], "u_pos", pos);
+	gl_puf(&p->pipes[GL_PIPE_MLA_KV_PUT], "u_eps", eps);
+	gl_launch(p, 1, 1, 1);
+	if (!norm_device)
+		self->buffer_free(self, &norm_staged);
+	return OK;
+}
+
+static status_code gl_attention_mla(backend *self, const buffer *q, const buffer *kv_cache,
+									const buffer *k_b_w, const buffer *v_b_w, buffer *out,
+									int layer, int pos, int n_heads, int qk_head, int qk_rope,
+									int qk_nope, int v_head, int kv_lora, int n_ctx,
+									const float *rope_cos_base, const float *rope_sin_base,
+									uint32_t k_b_type, uint32_t v_b_type, float scale) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	(void)n_ctx;
+	if (qk_nope < 0 || kv_lora < 0 || kv_lora > GL_MLA_MAX_KV_LORA || (qk_rope & 1) ||
+		qk_head != qk_nope + qk_rope || qk_head > GL_MLA_MAX_QK_HEAD || pos < 0 || n_heads <= 0 ||
+		qk_head < 0) {
+		return ERR_INVALID_ARG;
+	}
+	uint32_t kw = gl_mla_wtype_code(k_b_type);
+	uint32_t vw = gl_mla_wtype_code(v_b_type);
+	if (kw == UINT32_MAX || vw == UINT32_MAX) {
+		ERROR("gl: attention_mla: unsupported k_b/v_b weight type %s/%s", ggml_type_name(k_b_type),
+			  ggml_type_name(v_b_type));
+		return ERR_UNSUPPORTED;
+	}
+	int			   half_rope = qk_rope / 2;
+	gl_rope_cache *rsp		 = NULL;
+	if (half_rope > 0 && rope_cos_base && rope_sin_base) {
+		rsp = gl_rope_cache_range(p, rope_cos_base, rope_sin_base, half_rope, self->rope_theta, 0,
+								  pos + 1);
+		if (!rsp)
+			return ERR_OUT_OF_MEMORY;
+	}
+
+	gl_buf *kb = gl_kv_layer_buf(kv_cache, layer);
+	gl_buf_sync_to_device(as_glbuf(q));
+	gl_buf_sync_to_device(as_glbuf(out));
+	gl_buffer_sync_to_device(k_b_w);
+	gl_buffer_sync_to_device(v_b_w);
+
+	gl_use_pipeline(p, &p->pipes[GL_PIPE_MLA_ATTENTION]);
+	if (qk_head > 0)
+		gl_bind_ssbo(0, q);
+	gl_bind_raw(p, 1, kb->name, 0, 0, 0);
+	if (qk_nope > 0 && kv_lora > 0)
+		gl_bind_ssbo(2, k_b_w);
+	if (kv_lora > 0 && v_head > 0)
+		gl_bind_ssbo(3, v_b_w);
+	gl_bind_raw(p, 4, rsp ? rsp->cos_buf->name : kb->name, 0, 0, 0);
+	gl_bind_raw(p, 5, rsp ? rsp->sin_buf->name : kb->name, 0, 0, 0);
+	if (v_head > 0)
+		gl_bind_ssbo_out(6, out);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_pos", pos);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_qk_head", qk_head);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_qk_nope", qk_nope);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_qk_rope", qk_rope);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_v_head", v_head);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_kv_lora", kv_lora);
+	gl_puf(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_scale", scale);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_kwtype", (int)kw);
+	gl_pu(&p->pipes[GL_PIPE_MLA_ATTENTION], "u_vwtype", (int)vw);
+	gl_launch(p, (GLuint)n_heads, 1, 1);
+	as_glbuf(out)->device_dirty = 1;
+	return OK;
+}
+
 static status_code gl_attention_host_fallback(backend *self, const buffer *q, const buffer *k_cache,
 											  const buffer *v_cache, buffer *out, int layer,
 											  int pos, int n_heads, int n_kv_heads, int n_active,
@@ -3069,7 +3218,7 @@ static status_code gl_attention_host_fallback(backend *self, const buffer *q, co
 											  int attn_start) {
 	gl_priv *p = self->priv;
 
-	gl_buf_sync_to_host(as_glbuf(q));
+	gl_buffer_sync_to_host(q);
 
 	int n_pos = pos + 1 - attn_start;
 	if (n_pos <= 0)
@@ -3614,16 +3763,18 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 	if (n <= 0 || k <= 0)
 		return OK;
 	if (!gl_matmul_type_native(self, w_type)) {
-		gl_buf_sync_to_host(as_glbuf(w));
-		gl_buf_sync_to_host(as_glbuf(gate));
-		gl_buf_sync_to_host(as_glbuf(up));
-		gl_buf_sync_to_host(as_glbuf(y));
+		gl_buffer_sync_to_host(w);
+		gl_buffer_sync_to_host(gate);
+		gl_buffer_sync_to_host(up);
+		gl_buffer_sync_to_host(y);
 		backend_report_host_fallback(self, "matmul_ffn_down", HFB_WEIGHT_TYPE,
 									 "weight type '%s' (type=%u)", ggml_type_name(w_type), w_type);
 		backend *host = backend_host();
-		if (host && host->matmul_ffn_down)
-			return host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
-		return ERR_UNSUPPORTED;
+		if (!host || !host->matmul_ffn_down)
+			return ERR_UNSUPPORTED;
+		status_code hs = host->matmul_ffn_down(host, w, w_type, gate, up, y, n, k, activation);
+		gl_buffer_mark_host_written(y);
+		return hs;
 	}
 	{
 		gl_pipeline *pipe		= NULL;
@@ -3667,17 +3818,20 @@ static status_code gl_matmul_ffn_down_batch(backend *self, const buffer *w, uint
 	if (m == 1)
 		return gl_matmul_ffn_down(self, w, w_type, gate, up, y, n, k, activation);
 	if (!gl_matmul_type_native(self, w_type)) {
-		gl_buf_sync_to_host(as_glbuf(w));
-		gl_buf_sync_to_host(as_glbuf(gate));
-		gl_buf_sync_to_host(as_glbuf(up));
-		gl_buf_sync_to_host(as_glbuf(y));
+		gl_buffer_sync_to_host(w);
+		gl_buffer_sync_to_host(gate);
+		gl_buffer_sync_to_host(up);
+		gl_buffer_sync_to_host(y);
 		backend_report_host_fallback(self, "matmul_ffn_down_batch", HFB_WEIGHT_TYPE,
 									 "weight type '%s' (type=%u) m=%d", ggml_type_name(w_type),
 									 w_type, m);
 		backend *host = backend_host();
-		if (host && host->matmul_ffn_down_batch)
-			return host->matmul_ffn_down_batch(host, w, w_type, gate, up, y, n, k, activation, m);
-		return ERR_UNSUPPORTED;
+		if (!host || !host->matmul_ffn_down_batch)
+			return ERR_UNSUPPORTED;
+		status_code hs =
+			host->matmul_ffn_down_batch(host, w, w_type, gate, up, y, n, k, activation, m);
+		gl_buffer_mark_host_written(y);
+		return hs;
 	}
 	buffer		act = {0};
 	status_code s	= self->buffer_alloc_scratch(self, (size_t)m * (size_t)k * sizeof(float), &act);
@@ -3798,20 +3952,62 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 									 const moe_resident_expert *e, int dim, int inter) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
-	if (!e || !e->gate_w || !e->down_w)
+	if (!e || !e->gate_w || !e->down_w || dim <= 0 || inter <= 0)
 		return ERR_INVALID_ARG;
-	gl_buf_sync_to_host(as_glbuf(x));
-	gl_buf_sync_to_host(as_glbuf(out));
-	gl_buf_sync_to_host(as_glbuf(e->gate_w));
-	if (e->up_w)
-		gl_buf_sync_to_host(as_glbuf(e->up_w));
-	gl_buf_sync_to_host(as_glbuf(e->down_w));
-	backend_report_host_fallback(self, "moe_expert_ffn", HFB_OP_NOT_NATIVE,
-								 "MoE expert FFN has no opengl kernel; executed on host (cpu)");
-	backend *host = backend_host();
-	if (host && host->moe_expert_ffn)
-		return host->moe_expert_ffn(host, x, out, e, dim, inter);
-	return ERR_UNSUPPORTED;
+	if (e->up_w == NULL && !e->gate_up_fused)
+		return ERR_INVALID_ARG;
+	if (e->up_w && !gl_matmul_type_native(self, e->up_type))
+		return ERR_UNSUPPORTED;
+	if (!gl_matmul_type_native(self, e->gate_type) || !gl_matmul_type_native(self, e->down_type))
+		return ERR_UNSUPPORTED;
+
+	buffer		gu = {0}, act = {0}, y = {0};
+	buffer		gate_buf = {0}, up_buf = {0};
+	bool		fused = e->gate_up_fused;
+	status_code s	  = self->buffer_alloc_scratch(self, (size_t)inter * sizeof(float), &act);
+	if (s == OK)
+		s = self->buffer_alloc_scratch(self, (size_t)dim * sizeof(float), &y);
+	if (s == OK && fused) {
+		s = self->buffer_alloc_scratch(self, (size_t)inter * 2 * sizeof(float), &gu);
+		if (s == OK) {
+			gate_buf = buffer_slice(&gu, 0, (size_t)inter * sizeof(float));
+			up_buf =
+				buffer_slice(&gu, (size_t)inter * sizeof(float), (size_t)inter * sizeof(float));
+		}
+	} else if (s == OK) {
+		s = self->buffer_alloc_scratch(self, (size_t)inter * sizeof(float), &gate_buf);
+		if (s == OK)
+			s = self->buffer_alloc_scratch(self, (size_t)inter * sizeof(float), &up_buf);
+	}
+	if (s == OK) {
+		if (fused)
+			s = self->matmul(self, e->gate_w, e->gate_type, x, &gu, inter * 2, dim);
+		else
+			s = self->matmul(self, e->gate_w, e->gate_type, x, &gate_buf, inter, dim);
+	}
+	if (s == OK && !fused)
+		s = self->matmul(self, e->up_w, e->up_type, x, &up_buf, inter, dim);
+	if (s == OK)
+		s = gl_moe_activate(self, &gate_buf, &up_buf, &act, inter, e->gate_scale, e->up_scale,
+							e->use_gelu);
+	if (s == OK)
+		s = self->matmul(self, e->down_w, e->down_type, &act, &y, dim, inter);
+	if (s == OK) {
+		float ws = e->weight * e->down_scale;
+		if (ws != 1.0f) {
+			s = gl_scale_inplace(self, &y, ws, dim);
+		}
+		if (s == OK)
+			s = gl_add_inplace(self, out, &y, dim);
+	}
+	self->buffer_free(self, &act);
+	self->buffer_free(self, &y);
+	self->buffer_free(self, &gu);
+	if (!fused) {
+		self->buffer_free(self, &gate_buf);
+		self->buffer_free(self, &up_buf);
+	}
+	return s;
 }
 
 static status_code gl_moe_experts_batch(backend *self, const buffer *xb, buffer *out, int n_rows,
@@ -3820,24 +4016,45 @@ static status_code gl_moe_experts_batch(backend *self, const buffer *xb, buffer 
 										const int *rows_packed, const float *weights_packed) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
-	gl_buf_sync_to_host(as_glbuf(xb));
-	gl_buf_sync_to_host(as_glbuf(out));
-	for (int i = 0; i < n_experts; i++) {
-		if (experts[i].gate_w)
-			gl_buf_sync_to_host(as_glbuf(experts[i].gate_w));
-		if (experts[i].up_w)
-			gl_buf_sync_to_host(as_glbuf(experts[i].up_w));
-		if (experts[i].down_w)
-			gl_buf_sync_to_host(as_glbuf(experts[i].down_w));
+	if (!xb || !out || n_rows <= 0 || dim <= 0 || inter <= 0 || n_experts < 0)
+		return ERR_INVALID_ARG;
+	if (n_experts > 0 && (!counts || !rows_packed || !weights_packed || !experts))
+		return ERR_INVALID_ARG;
+	int			offset = 0;
+	status_code st	   = OK;
+	for (int i = 0; st == OK && i < n_experts; i++) {
+		if (counts[i] <= 0)
+			continue;
+		const moe_resident_expert *e = &experts[i];
+		if (!e->gate_w || !e->down_w) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		if (!gl_matmul_type_native(self, e->gate_type) ||
+			!gl_matmul_type_native(self, e->down_type)) {
+			st = ERR_UNSUPPORTED;
+			break;
+		}
+		moe_resident_expert one = *e;
+		one.use_gelu			= use_gelu;
+		for (int c = 0; c < counts[i]; c++) {
+			int row = rows_packed[offset + c];
+			if (row < 0 || row >= n_rows) {
+				st = ERR_INVALID_ARG;
+				break;
+			}
+			buffer xv  = buffer_slice(xb, (size_t)row * (size_t)dim * sizeof(float),
+									  (size_t)dim * sizeof(float));
+			buffer ov  = buffer_slice(out, (size_t)row * (size_t)dim * sizeof(float),
+									  (size_t)dim * sizeof(float));
+			one.weight = weights_packed[offset + c];
+			st		   = gl_moe_expert_ffn(self, &xv, &ov, &one, dim, inter);
+			if (st != OK)
+				break;
+		}
+		offset += counts[i];
 	}
-	backend_report_host_fallback(
-		self, "moe_experts_batch", HFB_OP_NOT_NATIVE,
-		"batched MoE experts have no opengl kernel; executed on host (cpu)");
-	backend *host = backend_host();
-	if (host && host->moe_experts_batch)
-		return host->moe_experts_batch(host, xb, out, n_rows, dim, inter, use_gelu, n_experts,
-									   experts, counts, rows_packed, weights_packed);
-	return ERR_UNSUPPORTED;
+	return st;
 }
 
 static status_code gl_ctor(backend *out) {
@@ -3846,7 +4063,7 @@ static status_code gl_ctor(backend *out) {
 	out->priority = 80;
 	out->caps	  = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
 					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
-					BCAP_ROPE_QK_FUSED;
+					BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT;
 
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
@@ -3894,6 +4111,9 @@ static status_code gl_ctor(backend *out) {
 	out->kv_free						 = gl_kv_free;
 	out->kv_put							 = gl_kv_put;
 	out->kv_put_batch					 = gl_kv_put_batch;
+	out->attention_mla					 = gl_attention_mla;
+	out->kv_alloc_mla					 = gl_kv_alloc_mla;
+	out->kv_put_mla						 = gl_kv_put_mla;
 	out->attention						 = gl_attention;
 	out->attention_swa					 = gl_attention_swa;
 	out->rmsnorm_batch					 = gl_rmsnorm_batch;

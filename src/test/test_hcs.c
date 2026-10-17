@@ -2,6 +2,7 @@
 #include "hcs.h"
 #include "model.h"
 #include "test_core.h"
+#include <limits.h>
 
 #include <string.h>
 
@@ -231,6 +232,27 @@ static void test_validate(void) {
 	ok = strcmp(cfg.device, "cpu_0") == 0 && cfg.ngl == -1 && cfg.moe_cache_cap == 10;
 	record_hcs("materialize.v1", ok, "device=%s ngl=%d cap=%d", cfg.device, cfg.ngl,
 			   cfg.moe_cache_cap);
+
+	if (model_probe_shape(synth_dsa_model_path, &n_layers, &n_experts, &n_kv_layers) == OK &&
+		n_experts > 4) {
+		config cfg2			 = config_defaults();
+		int	   experts_total = n_experts;
+
+		h  = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4);
+		ok = hcs_validate(&h, synth_dsa_model_path, err, sizeof(err)) == 0;
+		record_hcs("validate.experts_partial_streams", ok, "err='%s' total=%d", err, experts_total);
+
+		hcs_materialize(&h, synth_dsa_model_path, &cfg2);
+		ok = cfg2.moe_pin == 0 && cfg2.moe_cache_cap == 4;
+		record_hcs("materialize.experts_lru_partial", ok, "pin=%d cap=%d", cfg2.moe_pin,
+				   cfg2.moe_cache_cap);
+
+		h = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_ALL);
+		hcs_materialize(&h, synth_dsa_model_path, &cfg2);
+		ok = cfg2.moe_pin == 0 && cfg2.moe_cache_cap == INT_MAX;
+		record_hcs("materialize.experts_star_all_cached", ok, "pin=%d cap=%d", cfg2.moe_pin,
+				   cfg2.moe_cache_cap);
+	}
 }
 
 void run_hcs_tests(void) {

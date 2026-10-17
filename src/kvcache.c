@@ -85,6 +85,8 @@ static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats);
 static status_code kvcache_map_slots(kvcache *c, const model *m);
 static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, backend *be, buffer *k,
 									   buffer *v, int **remap_out, int *n_slots_out);
+static status_code kvcache_alloc_mla_buffer(kvcache *c, backend *be, int n_layers, buffer *kv);
+static status_code kvcache_alloc_primary_slots(kvcache *c, const model *m, backend *be, bool *held);
 
 status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv_quant) {
 	memset(c, 0, sizeof(*c));
@@ -119,15 +121,13 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	c->n_kv_layers = n_kv_layers;
 
 	if (is_mla && !m->arch_info->is_kda) {
-		if (!m->backend->kv_alloc_mla) {
-			ERROR("kvcache: model is MLA but backend has no kv_alloc_mla");
-			return ERR_UNSUPPORTED;
-		}
 		c->mla				= xcalloc(1, sizeof(kvcache_mla));
 		c->mla->lora_dim	= m->mla.kv_lora;
 		c->mla->qk_rope_dim = m->mla.qk_rope;
-		return m->backend->kv_alloc_mla(m->backend, m->n_layers, n_ctx, c->mla->lora_dim,
-										c->mla->qk_rope_dim, &c->mla->kv);
+		if (!m->mixed_backend_mode)
+			return kvcache_alloc_mla_buffer(c, m->backend, m->n_layers, &c->k);
+		bool held;
+		return kvcache_alloc_primary_slots(c, m, m->backend, &held);
 	}
 
 	if (is_hybrid) {
@@ -168,16 +168,9 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	}
 
 	if (m->mixed_backend_mode && !is_hybrid) {
-		status_code s = kvcache_map_slots(c, m);
-		if (s != OK)
-			return s;
-		bool primary_holds_slots = false;
-		for (int i = 0; i < m->n_layers; i++)
-			primary_holds_slots |= (c->slot_devices[i] & 1u) != 0;
-		if (primary_holds_slots) {
-			s = kvcache_alloc_slots(c, m, 0, kv_backend, &c->k, &c->v, &c->primary_remap,
-									&c->n_primary_slots);
-			c->n_primary_remap = m->n_layers;
+		bool		held;
+		status_code s = kvcache_alloc_primary_slots(c, m, kv_backend, &held);
+		if (s != OK || held) {
 			if (s == OK)
 				s = kvcache_ensure_transfer_buf(c, (size_t)2 * (size_t)c->n_kv_heads_max *
 													   (size_t)c->head_dim_max);
@@ -241,33 +234,30 @@ static void kv_buffer_free(buffer *b) {
 		b->owner->buffer_free(b->owner, b);
 }
 
+static void kv_pair_free(backend *be, buffer *k, buffer *v, bool mla) {
+	if (!mla && be && be->kv_free) {
+		be->kv_free(be, k, v);
+		return;
+	}
+	kv_buffer_free(k);
+	kv_buffer_free(v);
+}
+
 void kvcache_free(kvcache *c) {
 	if (!c->backend)
 		return;
-	if (c->mla) {
-		kv_buffer_free(&c->mla->kv);
-		if (c->mla->host_alloced)
-			kv_buffer_free(&c->mla->kv_host);
-		free(c->mla);
-	} else if (!(c->hybrid && c->hybrid->mla_latent)) {
-		if (c->backend->kv_free) {
-			c->backend->kv_free(c->backend, &c->k, &c->v);
-		} else {
-			kv_buffer_free(&c->k);
-			kv_buffer_free(&c->v);
-		}
+	if (!(c->hybrid && c->hybrid->mla_latent)) {
+		bool mla = c->mla != NULL;
+		kv_pair_free(c->backend, &c->k, &c->v, mla);
 		for (int i = 0; i < c->n_mirrors; i++) {
 			kv_mirror *mir = &c->mirror[i];
-			if (mir->be && mir->be->kv_free) {
-				mir->be->kv_free(mir->be, &mir->k, &mir->v);
-			} else {
-				kv_buffer_free(&mir->k);
-				kv_buffer_free(&mir->v);
-			}
+			kv_pair_free(mir->be, &mir->k, &mir->v, mla);
 			free(mir->remap);
 		}
 		c->n_mirrors = 0;
 	}
+	free(c->mla);
+	c->mla = NULL;
 	if (c->hybrid) {
 		free(c->hybrid->conv_state);
 		free(c->hybrid->recurrent_state);
@@ -285,27 +275,6 @@ void kvcache_free(kvcache *c) {
 	c->kv_transfer_buf = NULL;
 	c->kv_transfer_cap = 0;
 	memset(c, 0, sizeof(*c));
-}
-
-static status_code kvcache_alloc_mla_host_mirror(kvcache *c, const model *m) {
-	backend *host = backend_host();
-	if (!host)
-		return ERR_UNSUPPORTED;
-	if (!host->kv_alloc_mla) {
-		ERROR("kvcache: host backend has no kv_alloc_mla; cannot mirror MLA KV");
-		return ERR_UNSUPPORTED;
-	}
-	if (!c->mla) {
-		ERROR("kvcache: MLA state missing; cannot mirror KV");
-		return ERR_INVALID_ARG;
-	}
-	status_code s = host->kv_alloc_mla(host, m->n_layers, c->n_ctx, c->mla->lora_dim,
-									   c->mla->qk_rope_dim, &c->mla->kv_host);
-	if (s != OK)
-		return s;
-	c->mla->host_alloced = 1;
-	c->has_host_kv		 = 1;
-	return OK;
 }
 
 static int kvcache_register_device(kvcache *c, backend *b) {
@@ -341,42 +310,89 @@ static status_code kvcache_map_slots(kvcache *c, const model *m) {
 	return OK;
 }
 
+static int kvcache_slot_remap(const kvcache *c, const model *m, unsigned bit, int *remap) {
+	int next = 0;
+	for (int i = 0; i < m->n_layers; i++)
+		remap[i] = (c->slot_devices[i] & bit) ? next++ : -1;
+	return next;
+}
+
+static status_code kvcache_alloc_mla_buffer(kvcache *c, backend *be, int n_layers, buffer *kv) {
+	bool	 native = be->kv_alloc_mla && be->attention_mla && be->kv_put_mla;
+	backend *owner	= native ? be : backend_host();
+	if (!owner || !owner->kv_alloc_mla) {
+		ERROR("kvcache: model is MLA but no backend can allocate its KV cache");
+		return ERR_UNSUPPORTED;
+	}
+	if (!native)
+		backend_report_host_fallback(
+			be, "kv_alloc_mla", HFB_CAPABILITY,
+			"backend '%s' has no native MLA; MLA kv cache allocated in host (cpu) memory",
+			be->name);
+	return owner->kv_alloc_mla(owner, n_layers, c->n_ctx, c->mla->lora_dim, c->mla->qk_rope_dim,
+							   kv);
+}
+
+static status_code kvcache_alloc_primary_slots(kvcache *c, const model *m, backend *be,
+											   bool *held) {
+	*held		  = false;
+	status_code s = kvcache_map_slots(c, m);
+	if (s != OK)
+		return s;
+	for (int i = 0; i < m->n_layers; i++)
+		*held |= (c->slot_devices[i] & 1u) != 0;
+	if (!*held)
+		return OK;
+	s = kvcache_alloc_slots(c, m, 0, be, &c->k, &c->v, &c->primary_remap, &c->n_primary_slots);
+	c->n_primary_remap = m->n_layers;
+	return s;
+}
+
 static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, backend *be, buffer *k,
 									   buffer *v, int **remap_out, int *n_slots_out) {
-	unsigned bit = 1u << dev;
+	unsigned bit	 = 1u << dev;
+	int		*remap	 = xcalloc((size_t)m->n_layers, sizeof(int));
+	int		 n_slots = kvcache_slot_remap(c, m, bit, remap);
+	if (n_slots == 0) {
+		free(remap);
+		ERROR("kvcache: backend '%s' holds no KV slots", be->name);
+		return ERR_INVALID_ARG;
+	}
+
+	if (c->mla) {
+		status_code s = kvcache_alloc_mla_buffer(c, be, n_slots, k);
+		if (s != OK) {
+			free(remap);
+			return s;
+		}
+		*remap_out	 = remap;
+		*n_slots_out = n_slots;
+		return OK;
+	}
 
 	if (!be->kv_alloc) {
+		free(remap);
 		ERROR("kvcache: backend '%s' has no kv_alloc; cannot hold KV for its layers", be->name);
 		return ERR_UNSUPPORTED;
 	}
 	if (c->kv_quant == KV_QUANT_Q8_0 && !backend_has_cap(be, BCAP_KV_QUANT_Q8_0)) {
+		free(remap);
 		ERROR("kvcache: backend '%s' does not support Q8_0 quantized KV cache; "
 			  "use --kv-quant f16",
 			  be->name);
 		return ERR_UNSUPPORTED;
 	}
 
-	int n_slots = 0;
-	for (int i = 0; i < m->n_layers; i++)
-		if (c->slot_devices[i] & bit)
-			n_slots++;
-	if (n_slots == 0) {
-		ERROR("kvcache: backend '%s' holds no KV slots", be->name);
-		return ERR_INVALID_ARG;
-	}
-
 	bool per_layer_dims =
 		(m->arch_info->has_variable_layer_dims || m->arch_info->is_hybrid_recurrent) &&
 		backend_has_cap(be, BCAP_IS_HOST);
-	int *remap			= xcalloc((size_t)m->n_layers, sizeof(int));
 	int *slot_list		= xcalloc((size_t)n_slots, sizeof(int));
 	int *layer_head_dim = per_layer_dims ? xcalloc((size_t)n_slots, sizeof(int)) : NULL;
 	int *layer_n_kv		= per_layer_dims ? xcalloc((size_t)n_slots, sizeof(int)) : NULL;
-	int	 next			= 0;
 	for (int i = 0; i < m->n_layers; i++) {
-		remap[i] = -1;
-		if (!(c->slot_devices[i] & bit))
+		if (remap[i] < 0)
 			continue;
+		int next		= remap[i];
 		slot_list[next] = i;
 		if (per_layer_dims) {
 			int kvh = model_layer_kv_heads(m, i);
@@ -387,7 +403,6 @@ static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, back
 			layer_head_dim[next] = model_layer_head_dim(m, i);
 			layer_n_kv[next]	 = kvh;
 		}
-		remap[i] = next++;
 	}
 
 	int *pos_cap = NULL;
@@ -423,11 +438,8 @@ static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, back
 }
 
 status_code kvcache_alloc_mirrors(kvcache *c, const model *m) {
-	if (!c || !m || !m->mixed_backend_mode)
+	if (!c || !m || !m->mixed_backend_mode || (c->hybrid && c->hybrid->mla_latent))
 		return OK;
-	if (m->arch_info->is_mla)
-		return c->has_host_kv ? OK : kvcache_alloc_mla_host_mirror(c, m);
-
 	status_code s = kvcache_map_slots(c, m);
 	for (int i = 0; s == OK && i < c->n_mirrors; i++) {
 		kv_mirror *mir = &c->mirror[i];

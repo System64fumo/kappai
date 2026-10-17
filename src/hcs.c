@@ -421,6 +421,8 @@ static bool check_coverage(violations *v, const hcs_config *h, hcs_field field, 
 		return false;
 	}
 	if (assigned < total) {
+		if (experts)
+			return true;
 		add_violation(v, name, key,
 					  "%d %s assigned, model has %d%s; add '%s = *' to a device or assign %d more",
 					  assigned, unit, total, scope, key, total - assigned);
@@ -542,9 +544,17 @@ void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
 	if (eff.n_devices >= 2)
 		materialize_layer_map(h, model_path, cfg);
 
+	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
+	hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers);
+
+	int expert_held[HCS_MAX_DEVICES];
+	hcs_resolve_counts(&eff, HCS_FIELD_EXPERTS, n_experts > 0 ? n_experts : 0, expert_held);
+	int cached = 0;
+	for (int d = 0; d < eff.n_devices; d++)
+		cached += expert_held[d];
 	int experts = first_set_experts(&eff);
 	if (experts == HCS_COUNT_ALL)
 		cfg->moe_cache_cap = INT_MAX;
 	else if (experts != HCS_COUNT_UNSET)
-		cfg->moe_cache_cap = experts;
+		cfg->moe_cache_cap = cached > 0 ? cached : experts;
 }

@@ -1670,7 +1670,7 @@ static void test_op_attention_mla(backend *ref, backend *tgt, int n_heads, int q
 		}
 		b->attention_mla(b, &s->q_b, &s->kc, &s->kb_b, &s->vb_b, &s->out_b, 0, pos, n_heads,
 						 qk_head, qk_rope, qk_nope, v_head, kv_lora, n_ctx, rope_cos, rope_sin,
-						 scale);
+						 GGML_TYPE_F32, GGML_TYPE_F32, scale);
 		if (b->synchronize)
 			b->synchronize(b);
 		b->buffer_read_f32(b, &s->out_b, which ? y_got : y_ref, n_out);
@@ -4045,6 +4045,346 @@ static void run_real_shape_tests(backend *ref, backend *tgt) {
 	test_rs_kv_mixed(ref, tgt, 2);
 }
 
+static buffer nop_weight(backend *b, const float *data, int n, int k) {
+	tensor_desc wd = {.host_data = data, .type = GGML_TYPE_F32, .n_dims = 2, .dims = {k, n}};
+	buffer		w  = {0};
+	b->buffer_alloc_weight(b, &wd, &w);
+	return w;
+}
+
+static int nop_gate(op_family fam, const char *op, const char *shape, const backend *tgt,
+					int has_ref, int has_tgt, char *label, size_t label_sz) {
+	snprintf(label, label_sz, "%s %s (%s)", op, shape, tgt->name);
+	if (!has_ref) {
+		record_result(fam, label, V_SKIP, "reference has no native implementation");
+		return 0;
+	}
+	if (!has_tgt) {
+		record_result(fam, label, V_SKIP, "missing native implementation");
+		return 0;
+	}
+	return 1;
+}
+
+static void nop_compare(op_family fam, const char *label, const float *y_ref, const float *y_tgt,
+						int n, status_code st) {
+	char	detail[256];
+	verdict v = classify_output("loose", y_ref, y_tgt, n, st, detail, sizeof(detail));
+	record_result(fam, label, v, detail);
+}
+
+static void test_op_hc_init(backend *ref, backend *tgt) {
+	enum { DIM = 64, HC = 4 };
+	char label[160];
+	if (!nop_gate(OPFAM_HC_INIT, "hc_init", "dim=64 hc=4", tgt, ref->hc_init != NULL,
+				  tgt->hc_init != NULL, label, sizeof(label)))
+		return;
+	float x[DIM], y_ref[HC * DIM], y_tgt[HC * DIM];
+	seed_test_rng(0x4801);
+	fill_random_f32(x, DIM, 1.0f);
+	hc_init_desc d = {.dim = DIM, .n_hc = HC, .x = x, .hc = y_ref};
+	ref->hc_init(ref, &d);
+	ensure_sync(ref);
+	d.hc		   = y_tgt;
+	status_code st = tgt->hc_init(tgt, &d);
+	ensure_sync(tgt);
+	nop_compare(OPFAM_HC_INIT, label, y_ref, y_tgt, HC * DIM, st);
+}
+
+static void test_op_hc_final(backend *ref, backend *tgt) {
+	enum { DIM = 64, HC = 4 };
+	char label[160];
+	if (!nop_gate(OPFAM_HC_FINAL, "hc_final", "dim=64 hc=4", tgt, ref->hc_final != NULL,
+				  tgt->hc_final != NULL, label, sizeof(label)))
+		return;
+	float hc[HC * DIM], y_ref[DIM], y_tgt[DIM];
+	seed_test_rng(0x4802);
+	fill_random_f32(hc, HC * DIM, 1.0f);
+	hc_final_desc d = {.dim = DIM, .n_hc = HC, .hc = hc, .x = y_ref};
+	ref->hc_final(ref, &d);
+	ensure_sync(ref);
+	d.x			   = y_tgt;
+	status_code st = tgt->hc_final(tgt, &d);
+	ensure_sync(tgt);
+	nop_compare(OPFAM_HC_FINAL, label, y_ref, y_tgt, DIM, st);
+}
+
+static void test_op_hc_post(backend *ref, backend *tgt) {
+	enum { DIM = 64, HC = 4, COEF = HC + HC * HC };
+	char label[160];
+	if (!nop_gate(OPFAM_HC_POST, "hc_post", "dim=64 hc=4", tgt, ref->hc_post != NULL,
+				  tgt->hc_post != NULL, label, sizeof(label)))
+		return;
+	float sub[DIM], coef[COEF], hc_cur[HC * DIM], y_ref[HC * DIM], y_tgt[HC * DIM];
+	seed_test_rng(0x4803);
+	fill_random_f32(sub, DIM, 1.0f);
+	fill_random_f32(coef, COEF, 1.0f);
+	fill_random_f32(hc_cur, HC * DIM, 1.0f);
+	hc_post_desc d = {
+		.dim = DIM, .n_hc = HC, .sub = sub, .coef = coef, .hc_cur = hc_cur, .hc_next = y_ref};
+	ref->hc_post(ref, &d);
+	ensure_sync(ref);
+	d.hc_next	   = y_tgt;
+	status_code st = tgt->hc_post(tgt, &d);
+	ensure_sync(tgt);
+	nop_compare(OPFAM_HC_POST, label, y_ref, y_tgt, HC * DIM, st);
+}
+
+enum { HCP_DIM = 64, HCP_HC = 4, HCP_MIX = 24, HCP_FLAT = 256, HCP_COEF = 20 };
+
+typedef struct {
+	float stream[HCP_FLAT];
+	float fn[HCP_MIX * HCP_FLAT];
+	float base[HCP_MIX];
+	float scale[3];
+} nop_hc_pre_data;
+
+static status_code nop_hc_pre_run(backend *b, const nop_hc_pre_data *dt, float *out) {
+	buffer		w = nop_weight(b, dt->fn, HCP_MIX, HCP_FLAT);
+	hc_pre_desc d = {
+		.dim			= HCP_DIM,
+		.n_hc			= HCP_HC,
+		.sinkhorn_iters = 3,
+		.norm_eps		= 1e-6f,
+		.eps			= 1e-3f,
+		.stream			= dt->stream,
+		.fn				= {&w, GGML_TYPE_F32},
+		.base			= dt->base,
+		.scale			= dt->scale,
+		.x				= out,
+		.coef			= out + HCP_DIM,
+	};
+	d.ws		   = xmalloc(hc_pre_ws_floats(&d) * sizeof(float));
+	status_code st = b->hc_pre(b, &d);
+	ensure_sync(b);
+	free(d.ws);
+	b->buffer_free(b, &w);
+	return st;
+}
+
+static void test_op_hc_pre(backend *ref, backend *tgt) {
+	char label[160];
+	if (!nop_gate(OPFAM_HC_PRE, "hc_pre", "dim=64 hc=4", tgt, ref->hc_pre != NULL,
+				  tgt->hc_pre != NULL, label, sizeof(label)))
+		return;
+	nop_hc_pre_data *dt = xmalloc(sizeof(*dt));
+	seed_test_rng(0x4804);
+	fill_random_f32(dt->stream, HCP_FLAT, 1.0f);
+	fill_random_f32(dt->fn, HCP_MIX * HCP_FLAT, 0.1f);
+	fill_random_f32(dt->base, HCP_MIX, 0.5f);
+	fill_random_f32(dt->scale, 3, 0.5f);
+	float y_ref[HCP_DIM + HCP_COEF], y_tgt[HCP_DIM + HCP_COEF];
+	nop_hc_pre_run(ref, dt, y_ref);
+	status_code st = nop_hc_pre_run(tgt, dt, y_tgt);
+	nop_compare(OPFAM_HC_PRE, label, y_ref, y_tgt, HCP_DIM + HCP_COEF, st);
+	free(dt);
+}
+
+enum {
+	KDA_DIM	  = 64,
+	KDA_H	  = 4,
+	KDA_S	  = 16,
+	KDA_D	  = KDA_H * KDA_S,
+	KDA_K	  = 4,
+	KDA_STEPS = 2,
+};
+
+typedef struct {
+	float wq[KDA_D * KDA_DIM], wk[KDA_D * KDA_DIM], wv[KDA_D * KDA_DIM], wo[KDA_DIM * KDA_D];
+	float f_a[KDA_S * KDA_DIM], f_b[KDA_D * KDA_S], g_a[KDA_S * KDA_DIM], g_b[KDA_D * KDA_S];
+	float beta[KDA_H * KDA_DIM];
+	float conv_q[KDA_K * KDA_D], conv_k[KDA_K * KDA_D], conv_v[KDA_K * KDA_D];
+	float dt_bias[KDA_D], ssm_a[KDA_H], out_norm[KDA_S];
+	float x[KDA_STEPS][KDA_DIM];
+} nop_kda_data;
+
+#define NOP_FILL(arr, scale)                                                                       \
+	fill_random_f32((float *)(arr), (int)(sizeof(arr) / sizeof(float)), (scale))
+
+static status_code nop_kda_run(backend *b, const nop_kda_data *dt, float *out) {
+	const int	 hist = KDA_K - 1;
+	buffer		 w[9];
+	const float *src[9]	 = {dt->wq,	 dt->wk,  dt->wv,  dt->wo,	dt->f_a,
+							dt->f_b, dt->g_a, dt->g_b, dt->beta};
+	const int	 rows[9] = {KDA_D, KDA_D, KDA_D, KDA_DIM, KDA_S, KDA_D, KDA_S, KDA_D, KDA_H};
+	const int cols[9] = {KDA_DIM, KDA_DIM, KDA_DIM, KDA_D, KDA_DIM, KDA_S, KDA_DIM, KDA_S, KDA_DIM};
+	for (int i = 0; i < 9; i++)
+		w[i] = nop_weight(b, src[i], rows[i], cols[i]);
+
+	float	*conv_state = xcalloc((size_t)3 * KDA_D * hist, sizeof(float));
+	float	*state		= xcalloc((size_t)KDA_H * KDA_S * KDA_S, sizeof(float));
+	kda_desc d			= {
+		.dim			  = KDA_DIM,
+		.n_heads		  = KDA_H,
+		.head_dim		  = KDA_S,
+		.conv_kernel	  = KDA_K,
+		.gate_lower_bound = 0.01f,
+		.norm_eps		  = 1e-6f,
+		.wq				  = {&w[0], GGML_TYPE_F32},
+		.wk				  = {&w[1], GGML_TYPE_F32},
+		.wv				  = {&w[2], GGML_TYPE_F32},
+		.wo				  = {&w[3], GGML_TYPE_F32},
+		.f_a			  = {&w[4], GGML_TYPE_F32},
+		.f_b			  = {&w[5], GGML_TYPE_F32},
+		.g_a			  = {&w[6], GGML_TYPE_F32},
+		.g_b			  = {&w[7], GGML_TYPE_F32},
+		.beta			  = {&w[8], GGML_TYPE_F32},
+		.conv_q			  = dt->conv_q,
+		.conv_k			  = dt->conv_k,
+		.conv_v			  = dt->conv_v,
+		.dt_bias		  = dt->dt_bias,
+		.ssm_a			  = dt->ssm_a,
+		.out_norm		  = dt->out_norm,
+		.conv_state		  = conv_state,
+		.state			  = state,
+	};
+	d.ws		   = xmalloc(kda_ws_floats(&d) * sizeof(float));
+	status_code st = OK;
+	for (int step = 0; step < KDA_STEPS && st == OK; step++) {
+		d.x	  = dt->x[step];
+		d.out = out + (size_t)step * KDA_DIM;
+		st	  = b->kda(b, &d);
+		ensure_sync(b);
+	}
+	free(d.ws);
+	free(conv_state);
+	free(state);
+	for (int i = 0; i < 9; i++)
+		b->buffer_free(b, &w[i]);
+	return st;
+}
+
+static void test_op_kda(backend *ref, backend *tgt) {
+	char label[160];
+	if (!nop_gate(OPFAM_KDA, "kda", "dim=64 heads=4 head_dim=16", tgt, ref->kda != NULL,
+				  tgt->kda != NULL, label, sizeof(label)))
+		return;
+	nop_kda_data *dt = xmalloc(sizeof(*dt));
+	seed_test_rng(0x4805);
+	NOP_FILL(dt->wq, 0.2f);
+	NOP_FILL(dt->wk, 0.2f);
+	NOP_FILL(dt->wv, 0.2f);
+	NOP_FILL(dt->wo, 0.2f);
+	NOP_FILL(dt->f_a, 0.2f);
+	NOP_FILL(dt->f_b, 0.2f);
+	NOP_FILL(dt->g_a, 0.2f);
+	NOP_FILL(dt->g_b, 0.2f);
+	NOP_FILL(dt->beta, 0.2f);
+	NOP_FILL(dt->conv_q, 0.5f);
+	NOP_FILL(dt->conv_k, 0.5f);
+	NOP_FILL(dt->conv_v, 0.5f);
+	NOP_FILL(dt->dt_bias, 0.5f);
+	NOP_FILL(dt->ssm_a, 0.5f);
+	NOP_FILL(dt->out_norm, 1.0f);
+	NOP_FILL(dt->x, 1.0f);
+	float y_ref[KDA_STEPS * KDA_DIM], y_tgt[KDA_STEPS * KDA_DIM];
+	nop_kda_run(ref, dt, y_ref);
+	status_code st = nop_kda_run(tgt, dt, y_tgt);
+	nop_compare(OPFAM_KDA, label, y_ref, y_tgt, KDA_STEPS * KDA_DIM, st);
+	free(dt);
+}
+
+enum {
+	MLA_DIM	  = 64,
+	MLA_H	  = 4,
+	MLA_R	  = 16,
+	MLA_QK	  = 24,
+	MLA_VH	  = 16,
+	MLA_QL	  = 32,
+	MLA_STEPS = 3,
+};
+
+typedef struct {
+	float q_a[MLA_QL * MLA_DIM], q_b[MLA_H * MLA_QK * MLA_QL], kv_a[MLA_R * MLA_DIM];
+	float wo[MLA_DIM * MLA_H * MLA_VH];
+	float q_a_norm[MLA_QL], kv_a_norm[MLA_R];
+	float k_b[MLA_H * MLA_R * MLA_QK], v_b[MLA_H * MLA_VH * MLA_R];
+	float x[MLA_STEPS][MLA_DIM];
+} nop_mla_data;
+
+static status_code nop_mla_run(backend *b, const nop_mla_data *dt, float *out) {
+	buffer		 w[4];
+	const float *src[4]	 = {dt->q_a, dt->q_b, dt->kv_a, dt->wo};
+	const int	 rows[4] = {MLA_QL, MLA_H * MLA_QK, MLA_R, MLA_DIM};
+	const int	 cols[4] = {MLA_DIM, MLA_QL, MLA_DIM, MLA_H * MLA_VH};
+	for (int i = 0; i < 4; i++)
+		w[i] = nop_weight(b, src[i], rows[i], cols[i]);
+
+	float			 *cache = xcalloc((size_t)MLA_STEPS * MLA_R, sizeof(float));
+	mla_absorbed_desc d		= {
+		.dim		  = MLA_DIM,
+		.n_heads	  = MLA_H,
+		.kv_lora	  = MLA_R,
+		.qk_head	  = MLA_QK,
+		.v_head		  = MLA_VH,
+		.q_lora		  = MLA_QL,
+		.pos		  = MLA_STEPS - 1,
+		.n_threads	  = 1,
+		.norm_eps	  = 1e-6f,
+		.q_a		  = {&w[0], GGML_TYPE_F32},
+		.q_b		  = {&w[1], GGML_TYPE_F32},
+		.kv_a		  = {&w[2], GGML_TYPE_F32},
+		.wo			  = {&w[3], GGML_TYPE_F32},
+		.q_a_norm	  = dt->q_a_norm,
+		.kv_a_norm	  = dt->kv_a_norm,
+		.k_b		  = dt->k_b,
+		.v_b		  = dt->v_b,
+		.latent_cache = cache,
+	};
+	d.ws		   = xmalloc(mla_absorbed_ws_floats(&d) * sizeof(float));
+	status_code st = OK;
+	for (int step = 0; step < MLA_STEPS && st == OK; step++) {
+		d.pos = step;
+		d.x	  = dt->x[step];
+		d.out = out + (size_t)step * MLA_DIM;
+		st	  = b->mla_absorbed(b, &d);
+		ensure_sync(b);
+	}
+	free(d.ws);
+	free(cache);
+	for (int i = 0; i < 4; i++)
+		b->buffer_free(b, &w[i]);
+	return st;
+}
+
+static void test_op_mla_absorbed(backend *ref, backend *tgt) {
+	char label[160];
+	if (!nop_gate(OPFAM_MLA_ABSORBED, "mla_absorbed", "dim=64 heads=4 kv_lora=16", tgt,
+				  ref->mla_absorbed != NULL, tgt->mla_absorbed != NULL, label, sizeof(label)))
+		return;
+	nop_mla_data *dt = xmalloc(sizeof(*dt));
+	seed_test_rng(0x4806);
+	NOP_FILL(dt->q_a, 0.2f);
+	NOP_FILL(dt->q_b, 0.2f);
+	NOP_FILL(dt->kv_a, 0.2f);
+	NOP_FILL(dt->wo, 0.2f);
+	NOP_FILL(dt->q_a_norm, 1.0f);
+	NOP_FILL(dt->kv_a_norm, 1.0f);
+	NOP_FILL(dt->k_b, 0.2f);
+	NOP_FILL(dt->v_b, 0.2f);
+	NOP_FILL(dt->x, 1.0f);
+	float y_ref[MLA_STEPS * MLA_DIM], y_tgt[MLA_STEPS * MLA_DIM];
+	nop_mla_run(ref, dt, y_ref);
+	status_code st = nop_mla_run(tgt, dt, y_tgt);
+	nop_compare(OPFAM_MLA_ABSORBED, label, y_ref, y_tgt, MLA_STEPS * MLA_DIM, st);
+	free(dt);
+}
+
+static void run_native_exec_op_tests(backend *ref, backend *tgt) {
+	test_op_hc_init(ref, tgt);
+	flush_family(OPFAM_HC_INIT);
+	test_op_hc_pre(ref, tgt);
+	flush_family(OPFAM_HC_PRE);
+	test_op_hc_post(ref, tgt);
+	flush_family(OPFAM_HC_POST);
+	test_op_hc_final(ref, tgt);
+	flush_family(OPFAM_HC_FINAL);
+	test_op_kda(ref, tgt);
+	flush_family(OPFAM_KDA);
+	test_op_mla_absorbed(ref, tgt);
+	flush_family(OPFAM_MLA_ABSORBED);
+}
+
 void run_per_op_tests(backend *ref, backend *tgt) {
 	printf("\n========================================\n");
 	printf("Per-op validation: %s  vs  %s (reference)\n", tgt->name, ref->name);
@@ -4289,6 +4629,8 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_edge_ffn_activate_extremes(ref, tgt);
 	test_edge_rope_identity_table(ref, tgt);
 	flush_family(OPFAM_EDGE_CASE);
+
+	run_native_exec_op_tests(ref, tgt);
 
 	run_real_shape_tests(ref, tgt);
 	flush_family(OPFAM_REAL_SHAPE);

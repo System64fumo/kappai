@@ -28,6 +28,7 @@ typedef struct {
 typedef struct compute_scratch {
 	buffer		 router_softmax_inp;
 	buffer		 router_logits;
+	buffer		 moe_shared_y_dev;
 	int			 router_ids_host[64];
 	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
@@ -77,11 +78,15 @@ typedef struct compute_scratch {
 	float_buf hybrid_host2;
 	float_buf hybrid_host3;
 	float_buf gdn_ws_host;
-	float_buf glm_ws;
+	float_buf op_ws;
 	float_buf gdn_z_host;
 	float_buf gdn_alpha_host;
 	float_buf gdn_beta_host;
 	float_buf gdn_out_host;
+	float_buf op_st_in;
+	float_buf op_st_out;
+	float_buf op_st_cur;
+	float_buf op_st_coef;
 
 	moe_expert_slot *moe_slot_buf;
 
@@ -109,7 +114,7 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
-status_code compute_switch_active_backend(compute_scratch *s, backend *target, int dim);
+status_code compute_switch_active_backend(compute_scratch *s, backend *target, const model *m);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
 static inline backend *compute_active_backend(compute_scratch *s) {
 	return s->active_backend ? s->active_backend : s->backend;
