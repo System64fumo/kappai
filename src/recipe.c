@@ -3480,9 +3480,15 @@ static status_code moe_experts_resident_grouped(exec_ctx *ctx, backend *a, int d
 		const int		*rows = bs->moe_union_rows + bs->moe_union_offsets[u];
 		const int		*kidx = bs->moe_union_kidx + bs->moe_union_offsets[u];
 		moe_expert_slot *es	  = &bs->moe_union_slots[i];
-		if (cnt <= 0 || es->eid < 0 || !es->gate_w || !es->dev_ready) {
+		if (cnt <= 0) {
 			counts[i] = 0;
 			continue;
+		}
+		if (es->eid < 0 || !es->gate_w || !es->dev_ready || es->dev_gate.owner != a) {
+			free(experts);
+			free(rows_packed);
+			free(weights_packed);
+			return ERR_UNSUPPORTED;
 		}
 		counts[i]				 = cnt;
 		experts[i].gate_w		 = &es->dev_gate;
@@ -3606,7 +3612,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 	status_code st = OK;
 	if (ctx->n_rows > 1 && a->matmul_batch) {
 		if (backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_experts_batch &&
-			ctx->m->moe.experts_resident) {
+			ctx->m->layers[ctx->li].experts_resident) {
 			st = moe_experts_resident_grouped(ctx, a, dim, K, I, use_gelu);
 			if (st == OK) {
 				moe_release_batch_slots(ctx->m, ctx->li, ctx->bs, ctx->n_rows, K, n_union);
@@ -4549,11 +4555,11 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	buffer *xb_dev = &slots[op->in[0]];
 	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_expert_ffn &&
-		m->moe.experts_resident && xb_dev->owner == a && out_buf->owner == a) {
+		m->layers[li].experts_resident && xb_dev->owner == a && out_buf->owner == a) {
 		status_code gst	   = moe_stream_resolve(m, li, expert_ids, K, slot_buf);
 		int			dev_ok = (gst == OK);
 		for (int k = 0; dev_ok && k < K; k++)
-			if (!slot_buf[k].dev_ready)
+			if (!slot_buf[k].dev_ready || slot_buf[k].dev_gate.owner != a)
 				dev_ok = 0;
 		if (dev_ok) {
 			int use_gelu = plan.use_gelu;

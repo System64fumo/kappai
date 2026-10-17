@@ -633,6 +633,9 @@ static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
 		sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
 	if (sl->dev_down.owner)
 		sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
+	sl->dev_gate  = (buffer){0};
+	sl->dev_up	  = (buffer){0};
+	sl->dev_down  = (buffer){0};
 	sl->dev_ready = 0;
 }
 
@@ -885,43 +888,78 @@ status_code moe_stream_cache_init(struct model *m) {
 			free((void *)layers);
 		}
 	}
-	if (full_resident && m->backend && m->backend->moe_expert_ffn &&
-		m->backend->buffer_alloc_from_host && (m->backend->caps & BCAP_MOE_EXPERT_RESIDENT)) {
-		int		 uploaded  = 0;
-		int		 failed	   = 0;
-		size_t	 dev_bytes = 0;
-		uint64_t t0		   = time_us();
-		for (int i = 0; i < m->n_layers && !failed; i++) {
-			for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
-				moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
+	if (full_resident && m->backend) {
+		int			   uploaded		   = 0;
+		int			   moe_layers	   = 0;
+		int			   resident_layers = 0;
+		int			   partial		   = 0;
+		size_t		   dev_bytes	   = 0;
+		uint64_t	   t0			   = time_us();
+		const backend *failed_be	   = NULL;
+		for (int i = 0; i < m->n_layers; i++) {
+			moe_expert_slot *pins	= c->layers[i].pinned_slots;
+			int				 n_pins = c->layers[i].n_pinned;
+			if (n_pins <= 0 || !pins)
+				continue;
+			moe_layers++;
+
+			backend *lb = model_layer_backend(m, i);
+			if (lb && lb == failed_be) {
+				partial = 1;
+				continue;
+			}
+			if (!lb || !lb->moe_expert_ffn || !lb->buffer_alloc_from_host ||
+				!(lb->caps & BCAP_MOE_EXPERT_RESIDENT)) {
+				DEBUG("MoE: layer %d backend '%s' lacks expert residency support -- "
+					  "layer will stream from host",
+					  i, lb && lb->name ? lb->name : "?");
+				partial = 1;
+				continue;
+			}
+
+			int layer_ok = 1;
+			for (int pi = 0; pi < n_pins; pi++) {
+				moe_expert_slot *sl = &pins[pi];
 				moe_expert_bytes eb = moe_calc_expert_bytes(m, i, sl->eid);
-				status_code		 st = m->backend->buffer_alloc_from_host(m->backend, sl->gate_w,
-																		 eb.gate_b, &sl->dev_gate);
+				status_code		 st =
+					lb->buffer_alloc_from_host(lb, sl->gate_w, eb.gate_b, &sl->dev_gate);
 				if (st == OK && !sl->gate_up_fused)
-					st = m->backend->buffer_alloc_from_host(m->backend, sl->up_w, eb.up_b,
-															&sl->dev_up);
+					st = lb->buffer_alloc_from_host(lb, sl->up_w, eb.up_b, &sl->dev_up);
 				if (st == OK)
-					st = m->backend->buffer_alloc_from_host(m->backend, sl->down_w, eb.down_b,
-															&sl->dev_down);
+					st = lb->buffer_alloc_from_host(lb, sl->down_w, eb.down_b, &sl->dev_down);
 				if (st != OK) {
-					failed = 1;
+					ERROR("MoE: expert residency upload failed for layer %d on '%s' "
+						  "(st=%d) -- layer will stream from host",
+						  i, lb->name ? lb->name : "?", (int)st);
+					layer_ok = 0;
 					break;
 				}
 				dev_bytes += eb.total;
-				sl->dev_ready = 1;
-				uploaded++;
 			}
+			if (!layer_ok) {
+				for (int pi = 0; pi < n_pins; pi++)
+					moe_slot_free_dev_buffers(&pins[pi]);
+				failed_be = lb;
+				partial	  = 1;
+				continue;
+			}
+			for (int pi = 0; pi < n_pins; pi++)
+				pins[pi].dev_ready = 1;
+			m->layers[i].experts_resident = 1;
+			uploaded += n_pins;
+			resident_layers++;
 		}
-		if (failed) {
-			for (int i = 0; i < m->n_layers; i++) {
-				for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
-					moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[pi]);
+		if (uploaded > 0) {
+			if (partial) {
+				WARN("MoE: %d/%d MoE layer(s) device-resident (%.1f MB) in %.1f s -- "
+					 "remaining layer(s) keep the host streaming path",
+					 resident_layers, moe_layers, (double)dev_bytes / (1024.0 * 1024.0),
+					 (double)(time_us() - t0) / 1e6);
+			} else {
+				INFO("MoE: %d experts resident on device (%.1f MB) in %.1f s", uploaded,
+					 (double)dev_bytes / (1024.0 * 1024.0), (double)(time_us() - t0) / 1e6);
 			}
-			INFO("MoE: expert residency unavailable (allocation failed) -- keeping CPU path");
-		} else if (uploaded > 0) {
-			m->moe.experts_resident = 1;
-			INFO("MoE: %d experts resident on device (%.1f MB) in %.1f s", uploaded,
-				 (double)dev_bytes / (1024.0 * 1024.0), (double)(time_us() - t0) / 1e6);
+			m->moe.experts_resident = (resident_layers == moe_layers);
 		}
 	}
 

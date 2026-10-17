@@ -2994,6 +2994,10 @@ static status_code vk_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 		return ERR_INTERNAL;
 	if (!x || !out || !e || !e->gate_w || !e->down_w || (!e->up_w && !e->gate_up_fused))
 		return ERR_INVALID_ARG;
+	if ((e->gate_w->owner && e->gate_w->owner != self) ||
+		(e->down_w->owner && e->down_w->owner != self) ||
+		(e->up_w && e->up_w->owner && e->up_w->owner != self))
+		return ERR_UNSUPPORTED;
 	if (p->moe_arena.buf && (p->moe_arena_inter != inter || p->moe_arena_dim != dim)) {
 		vk_free_buffer(p, &p->moe_arena);
 		p->moe_arena.buf = VK_NULL_HANDLE;
@@ -3041,6 +3045,15 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 		return ERR_INTERNAL;
 	if (!p->p_moe_gather.pipeline || !p->p_moe_combine.pipeline)
 		return ERR_UNSUPPORTED;
+	for (int i = 0; i < n_experts; i++) {
+		const moe_resident_expert *ex = &experts[i];
+		if (counts[i] <= 0 || !ex->gate_w)
+			continue;
+		if ((ex->gate_w->owner && ex->gate_w->owner != self) ||
+			(ex->down_w && ex->down_w->owner && ex->down_w->owner != self) ||
+			(ex->up_w && ex->up_w->owner && ex->up_w->owner != self))
+			return ERR_UNSUPPORTED;
+	}
 
 	size_t align = p->caps.storage_buffer_offset_alignment > 0
 					   ? (size_t)p->caps.storage_buffer_offset_alignment

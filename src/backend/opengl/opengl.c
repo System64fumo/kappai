@@ -3960,6 +3960,10 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 		return ERR_UNSUPPORTED;
 	if (!gl_matmul_type_native(self, e->gate_type) || !gl_matmul_type_native(self, e->down_type))
 		return ERR_UNSUPPORTED;
+	if ((e->gate_w->owner && e->gate_w->owner != self) ||
+		(e->down_w->owner && e->down_w->owner != self) ||
+		(e->up_w && e->up_w->owner && e->up_w->owner != self))
+		return ERR_UNSUPPORTED;
 
 	buffer		gu = {0}, act = {0}, y = {0};
 	buffer		gate_buf = {0}, up_buf = {0};

@@ -101,6 +101,7 @@ typedef struct layer_weights {
 	bool	mla_vb_f32;
 	bool	is_moe_layer;
 	bool	any_fused_experts;
+	bool	experts_resident;
 } layer_weights;
 
 typedef struct model_mla_params {
