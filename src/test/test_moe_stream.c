@@ -134,6 +134,63 @@ void run_moe_stream_tests(void) {
 	record_result(OPFAM_MOE_STREAM, "streamed_eviction_equals_fully_resident", ok ? V_PASS : V_FAIL,
 				  detail);
 
+	{
+		int last_moe_layer = -1;
+		for (int li = streamed.m.n_layers - 1; li >= 0; li--) {
+			if (streamed.m.layers[li].experts) {
+				last_moe_layer = li;
+				break;
+			}
+		}
+		if (last_moe_layer < 0) {
+			record_result(OPFAM_MOE_STREAM, "moe_stream.union_over_max_topk", V_SKIP,
+						  "no MoE layer in synthetic model");
+		} else {
+			int				 n_k   = MOE_MAX_TOPK + 36;
+			int				*ids   = xmalloc((size_t)n_k * sizeof(int));
+			moe_expert_slot *slots = xcalloc((size_t)n_k, sizeof(*slots));
+			int				 n_e   = streamed.m.moe.n_experts > 0 ? streamed.m.moe.n_experts : 1;
+			for (int k = 0; k < n_k; k++)
+				ids[k] = k % n_e;
+
+			int ok_union = moe_stream_resolve(&streamed.m, last_moe_layer, ids, n_k, slots) == OK;
+			if (ok_union) {
+				for (int k = 0; k < n_k; k++) {
+					if (slots[k].eid != ids[k] ||
+						atomic_load_explicit(&slots[k].io_ready, memory_order_acquire) == 0) {
+						ok_union = 0;
+						break;
+					}
+				}
+			}
+			snprintf(detail, sizeof(detail),
+					 "streamed cache: n_k=%d (> MOE_MAX_TOPK=%d) resolved ok=%d", n_k, MOE_MAX_TOPK,
+					 ok_union);
+			record_result(OPFAM_MOE_STREAM, "moe_stream.union_over_max_topk",
+						  ok_union ? V_PASS : V_FAIL, detail);
+
+			memset(slots, 0, (size_t)n_k * sizeof(*slots));
+			int ok_nocache = moe_stream_resolve(&resident.m, last_moe_layer, ids, n_k, slots) == OK;
+			if (ok_nocache) {
+				for (int k = 0; k < n_k; k++) {
+					if (slots[k].eid != ids[k] ||
+						atomic_load_explicit(&slots[k].io_ready, memory_order_acquire) == 0) {
+						ok_nocache = 0;
+						break;
+					}
+				}
+			}
+			snprintf(detail, sizeof(detail),
+					 "no-cache path: n_k=%d (> MOE_MAX_TOPK=%d) resolved ok=%d", n_k, MOE_MAX_TOPK,
+					 ok_nocache);
+			record_result(OPFAM_MOE_STREAM, "moe_stream.union_over_max_topk_nocache",
+						  ok_nocache ? V_PASS : V_FAIL, detail);
+
+			free(ids);
+			free(slots);
+		}
+	}
+
 	moe_free(&streamed);
 	moe_free(&resident);
 }

@@ -61,8 +61,7 @@ static void rope_table_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static void build_rope_table(backend *a, float *cos_out, float *sin_out, int n_ctx, int head_dim,
-							 float theta) {
+static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head_dim, float theta) {
 	const int	   half		   = head_dim / 2;
 	const double   theta_scale = pow(theta, -2.0 / (double)head_dim);
 	rope_table_job job		   = {.cos_out	   = cos_out,
@@ -71,7 +70,7 @@ static void build_rope_table(backend *a, float *cos_out, float *sin_out, int n_c
 								  .half		   = half,
 								  .theta_scale = theta_scale};
 
-	tpool *pool = (a && a->get_pool) ? a->get_pool(a) : NULL;
+	tpool *pool = tpool_fetch_pool();
 	if (pool && tpool_n_threads(pool) > 1 && half >= tpool_n_threads(pool) &&
 		tpool_current_tid() < 0) {
 		tpool_parallel_for(pool, half, 1, rope_table_chunk, &job);
@@ -460,13 +459,13 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		const int half_swa = m->layer_dims.head_dim_swa / 2;
 		s->rope_cos_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
 		s->rope_sin_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		build_rope_table(a, s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
+		build_rope_table(s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
 						 m->layer_dims.rope_theta_swa);
 
 		const int half_global = m->layer_dims.head_dim_global / 2;
 		s->rope_cos			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
 		s->rope_sin			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
+		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
 						 m->layer_dims.rope_theta_global);
 
 		if (m->has_per_layer_embeddings) {
@@ -495,7 +494,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		if (half > 0) {
 			s->rope_cos = xmalloc((size_t)n_ctx * half * sizeof(float));
 			s->rope_sin = xmalloc((size_t)n_ctx * half * sizeof(float));
-			build_rope_table(a, s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+			build_rope_table(s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
 		}
 	}
 

@@ -34,8 +34,8 @@ static bool sysfs_read_u64(int fd, const char *link, uint64_t *out) {
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return false;
-	unsigned long long v = 0;
-	bool ok				 = fscanf(f, "%llu", &v) == 1;
+	unsigned long long v  = 0;
+	bool			   ok = fscanf(f, "%llu", &v) == 1;
 	fclose(f);
 	if (ok)
 		*out = (uint64_t)v;

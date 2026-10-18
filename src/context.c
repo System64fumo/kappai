@@ -189,9 +189,8 @@ static status_code apply_layer_split(context *c, const config *cfg) {
 }
 
 static void context_build_topology(context *c) {
-	backend *all[CONFIG_MAX_LAYER_DEVICES + 2];
+	backend *all[CONFIG_MAX_LAYER_DEVICES + 1];
 	int		 n = 0;
-	all[n++]   = backend_host();
 	all[n++]   = c->backend;
 	for (int i = 0; i < c->n_extra_backends; i++)
 		all[n++] = c->extra_backends[i];
@@ -653,13 +652,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 
 	int pos = c->kv.n_pos;
 
-	int n_threads = 1;
-	if (c->backend && c->backend->get_pool) {
-		tpool *pool = c->backend->get_pool(c->backend);
-		if (pool)
-			n_threads = tpool_n_threads(pool);
-	}
-	int chunk = context_prefill_chunk_size(c, n_threads);
+	int chunk = context_prefill_chunk_size(c, tpool_n_threads(tpool_fetch_pool()));
 	if (chunk > n)
 		chunk = n;
 	progress prog;

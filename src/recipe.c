@@ -3766,7 +3766,7 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 
 		moe_batch_job job;
 		job.m		 = ctx->m;
-		job.a		 = ctx->m->backend;
+		job.a		 = backend_host();
 		job.bs		 = ctx->bs;
 		job.slot_buf = ctx->bs->moe_per_token_slots;
 		job.li		 = ctx->li;
@@ -4421,10 +4421,9 @@ static status_code op_moe_router(exec_ctx *ctx) {
 	buffer *inp = &slots[op->in[0]];
 
 	if (uses_softmax) {
-		float *router_input = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
-		a->synchronize(a);
-		backend	   *ib = inp->owner ? inp->owner : a;
-		status_code rs = ib->buffer_read_f32(ib, inp, router_input, dim);
+		float	   *router_input = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
+		backend	   *ib			 = inp->owner ? inp->owner : a;
+		status_code rs			 = ib->buffer_read_f32(ib, inp, router_input, dim);
 		if (rs != OK)
 			return rs;
 

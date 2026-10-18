@@ -1,0 +1,25 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer IdxBuf {
+	int idx[];
+};
+layout(std430, binding = 1) readonly buffer SrcBuf {
+	float src[];
+};
+layout(std430, binding = 2) writeonly buffer DstBuf {
+	float dst[];
+};
+layout(location = 0) uniform int u_cnt;
+layout(location = 1) uniform int u_dim;
+layout(location = 2) uniform int u_idx_off;
+void main(void) {
+	uint wgx = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	uint g	 = wgx * 128u + gl_LocalInvocationID.x;
+	if (int(g) >= u_cnt * u_dim)
+		return;
+	int c			   = int(g) / u_dim;
+	int d			   = int(g) - c * u_dim;
+	int row			   = idx[u_idx_off + c];
+	dst[c * u_dim + d] = src[row * u_dim + d];
+}
