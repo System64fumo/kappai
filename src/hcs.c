@@ -537,6 +537,20 @@ static void materialize_layer_map(const hcs_config *h, const char *model_path, c
 		cfg->device = cfg->layer_devices[0];
 }
 
+static void materialize_expert_parts(const hcs_config *h, int n_experts, config *cfg) {
+	if (!h->enabled || n_experts <= 0 || first_set_experts(h) == HCS_COUNT_UNSET)
+		return;
+	int expert_held[HCS_MAX_DEVICES];
+	hcs_resolve_counts(h, HCS_FIELD_EXPERTS, n_experts, expert_held);
+	for (int d = 0; d < h->n_devices && cfg->n_expert_devices < CONFIG_MAX_LAYER_DEVICES; d++) {
+		if (expert_held[d] <= 0)
+			continue;
+		cfg->expert_devices[cfg->n_expert_devices] = h->devices[d].name;
+		cfg->expert_counts[cfg->n_expert_devices]  = expert_held[d];
+		cfg->n_expert_devices++;
+	}
+}
+
 void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
 	hcs_config eff = hcs_effective(h);
 	cfg->ngl	   = -1;
@@ -546,6 +560,7 @@ void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
 
 	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
 	hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers);
+	materialize_expert_parts(h, n_experts, cfg);
 
 	int expert_held[HCS_MAX_DEVICES];
 	hcs_resolve_counts(&eff, HCS_FIELD_EXPERTS, n_experts > 0 ? n_experts : 0, expert_held);

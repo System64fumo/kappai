@@ -25,6 +25,9 @@ typedef struct config {
 	int			n_layer_devices;
 	const char *layer_devices[CONFIG_MAX_LAYER_DEVICES];
 	int			layer_counts[CONFIG_MAX_LAYER_DEVICES];
+	int			n_expert_devices;
+	const char *expert_devices[CONFIG_MAX_LAYER_DEVICES];
+	int			expert_counts[CONFIG_MAX_LAYER_DEVICES];
 
 	bool debug;
 	bool use_mmap;

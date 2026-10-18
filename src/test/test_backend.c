@@ -4310,8 +4310,10 @@ static status_code nop_mla_run(backend *b, const nop_mla_data *dt, float *out) {
 	for (int i = 0; i < 4; i++)
 		w[i] = nop_weight(b, src[i], rows[i], cols[i]);
 
-	float			 *cache = xcalloc((size_t)MLA_STEPS * MLA_R, sizeof(float));
-	mla_absorbed_desc d		= {
+	float			 *cache	   = xcalloc((size_t)MLA_STEPS * MLA_R, sizeof(float));
+	tpool			 *mla_pool = backend_get_pool(b);
+	const int		  mla_nt   = mla_pool ? tpool_n_threads(mla_pool) : 1;
+	mla_absorbed_desc d		   = {
 		.dim		  = MLA_DIM,
 		.n_heads	  = MLA_H,
 		.kv_lora	  = MLA_R,
@@ -4319,7 +4321,7 @@ static status_code nop_mla_run(backend *b, const nop_mla_data *dt, float *out) {
 		.v_head		  = MLA_VH,
 		.q_lora		  = MLA_QL,
 		.pos		  = MLA_STEPS - 1,
-		.n_threads	  = 1,
+		.n_threads	  = mla_nt,
 		.norm_eps	  = 1e-6f,
 		.q_a		  = {&w[0], GGML_TYPE_F32},
 		.q_b		  = {&w[1], GGML_TYPE_F32},

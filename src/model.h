@@ -104,6 +104,13 @@ typedef struct layer_weights {
 	bool	experts_resident;
 } layer_weights;
 
+#define MODEL_MAX_EXPERT_PARTS 8
+
+typedef struct {
+	struct backend *be;
+	int				count;
+} model_expert_part;
+
 typedef struct model_mla_params {
 	int32_t q_lora;
 	int32_t kv_lora;
@@ -192,6 +199,8 @@ typedef struct model {
 	model_recipe			*recipe;
 	weight_ref			   **wrefs_by_layer;
 	backend				   **layer_backends;
+	model_expert_part		 expert_parts[MODEL_MAX_EXPERT_PARTS];
+	int						 n_expert_parts;
 	model_tensor_slot		*tensor_data_order;
 	size_t					 tensor_data_order_n;
 
@@ -256,6 +265,18 @@ static inline backend *model_layer_backend(const model *m, int li) {
 		return m ? m->backend : NULL;
 	backend *b = m->layer_backends[li];
 	return b ? b : m->backend;
+}
+
+static inline backend *model_pin_backend(const model *m, int li, int pin_index) {
+	if (!m || m->n_expert_parts == 0)
+		return model_layer_backend(m, li);
+	int end = 0;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		end += m->expert_parts[i].count;
+		if (pin_index < end)
+			return m->expert_parts[i].be;
+	}
+	return NULL;
 }
 
 static inline int model_layer_backend_is_host(const model *m, int li) {

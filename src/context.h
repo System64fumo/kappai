@@ -32,6 +32,7 @@ typedef struct {
 	backend				 *backend;
 	backend				 *extra_backends[CONFIG_MAX_LAYER_DEVICES];
 	int					  n_extra_backends;
+	char				  extra_specs[CONFIG_MAX_LAYER_DEVICES][64];
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;
 	bool				  warmup_done;

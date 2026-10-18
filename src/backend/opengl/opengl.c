@@ -1386,12 +1386,12 @@ static status_code gl_buffer_alloc_from_host(backend *self, const void *host_dat
 											 buffer *out) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
-	gl_buf *b = gl_buf_alloc(p, size, GL_DYNAMIC_COPY, host_data);
+	gl_buf *b = gl_buf_alloc_ex(p, size, GL_DYNAMIC_COPY, host_data, false, NULL);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
-	out->handle	  = b->host_mirror;
+	out->handle	  = gl_buf_handle(b);
 	out->size	  = size;
-	out->host_ptr = host_data;
+	out->host_ptr = NULL;
 	out->offset	  = 0;
 	out->owner	  = self;
 	return OK;

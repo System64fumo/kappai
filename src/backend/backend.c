@@ -616,14 +616,14 @@ void host_kernels_register(int priority, host_matmul_generic_fn mm) {
 }
 
 void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *y, int n, int k) {
-	host_matmul_generic_fn fn = atomic_load(&g_hk_matmul);
-	if (fn) {
-		fn(w, w_type, x, y, n, k);
+	backend *host = backend_host();
+	if (host && host->matmul_thread_local) {
+		host->matmul_thread_local(host, w, w_type, x, y, n, k, tpool_current_tid());
 		return;
 	}
-	backend *host = backend_host();
-	if (host && host->matmul_thread_local)
-		host->matmul_thread_local(host, w, w_type, x, y, n, k, 0);
+	host_matmul_generic_fn fn = atomic_load(&g_hk_matmul);
+	if (fn)
+		fn(w, w_type, x, y, n, k);
 }
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {

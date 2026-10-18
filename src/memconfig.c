@@ -261,7 +261,31 @@ static size_t model_total_weight_bytes(const model *m) {
 	return non_expert + total_expert;
 }
 
+static size_t hcs_pending_expert_bytes(const model *m, const config *cfg) {
+	size_t per_expert	= model_cached_per_expert_size(m);
+	int	   n_layers		= moe_layer_count(m);
+	int	   n_experts	= m->moe.n_experts;
+	bool   primary_host = cfg->device && backend_device_is_host(cfg->device);
+	int	   on_primary	= 0;
+	int	   assigned		= 0;
+	for (int i = 0; i < cfg->n_expert_devices; i++) {
+		int cnt = MIN(cfg->expert_counts[i], n_experts - assigned);
+		assigned += cnt;
+		bool is_host = backend_device_is_host(cfg->expert_devices[i]);
+		if (is_host ? primary_host
+					: (cfg->device && strcmp(cfg->expert_devices[i], cfg->device) == 0))
+			on_primary += cnt;
+	}
+	if (primary_host) {
+		int host_experts = on_primary + (n_experts - assigned);
+		on_primary = cfg->moe_stream ? MIN(host_experts, MOE_DEFAULT_CACHE_CAP) : host_experts;
+	}
+	return per_expert * (size_t)on_primary * (size_t)n_layers;
+}
+
 size_t model_pending_weight_bytes(const model *m, const config *cfg) {
+	if (m->arch_info->is_moe && cfg->n_expert_devices > 0)
+		return hcs_pending_expert_bytes(m, cfg);
 	int full_resident = !cfg->use_mmap && cfg->moe_stream == 0;
 	if (full_resident || !m->arch_info->is_moe)
 		return cfg->use_mmap ? model_total_weight_bytes(m) : 0;

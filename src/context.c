@@ -96,11 +96,22 @@ static status_code context_open_device(context *c, const char *spec, backend **o
 		*out = backend_host();
 		return OK;
 	}
+	for (int i = 0; i < c->n_extra_backends; i++) {
+		if (strcmp(c->extra_specs[i], spec) == 0) {
+			*out = c->extra_backends[i];
+			return OK;
+		}
+	}
+	if (c->n_extra_backends >= CONFIG_MAX_LAYER_DEVICES) {
+		ERROR("too many devices opened (max %d)", CONFIG_MAX_LAYER_DEVICES);
+		return ERR_INVALID_ARG;
+	}
 	status_code s = backend_create(name, device_index, out);
 	if (s != OK) {
 		ERROR("failed to initialize device '%s'", spec);
 		return s;
 	}
+	snprintf(c->extra_specs[c->n_extra_backends], sizeof(c->extra_specs[0]), "%s", spec);
 	c->extra_backends[c->n_extra_backends++] = *out;
 	backend_host_use(*out);
 	return OK;
@@ -131,6 +142,32 @@ static status_code apply_layer_map(context *c, const config *cfg) {
 		INFO("layers %d-%d on '%s' (%s)", begin, end - 1, be->name, cfg->layer_devices[i]);
 		begin = end;
 	}
+	return OK;
+}
+
+static status_code apply_expert_parts(context *c, const config *cfg) {
+	if (cfg->n_expert_devices <= 0 || c->m.moe.n_experts <= 0)
+		return OK;
+	if (cfg->n_expert_devices > MODEL_MAX_EXPERT_PARTS) {
+		ERROR("too many expert devices (max %d)", MODEL_MAX_EXPERT_PARTS);
+		return ERR_INVALID_ARG;
+	}
+	for (int i = 0; i < cfg->n_expert_devices; i++) {
+		backend	   *be = c->backend;
+		status_code s  = OK;
+		if (!cfg->device || strcmp(cfg->expert_devices[i], cfg->device) != 0)
+			s = context_open_device(c, cfg->expert_devices[i], &be);
+		if (s != OK)
+			return s;
+		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
+		if (!is_host && be != c->backend)
+			be->rope_neox = c->m.arch_info->uses_neox_rope;
+		c->m.expert_parts[i].be	   = is_host ? NULL : be;
+		c->m.expert_parts[i].count = cfg->expert_counts[i];
+		INFO("experts: %d/layer on '%s' (%s)", cfg->expert_counts[i], is_host ? "cpu" : be->name,
+			 cfg->expert_devices[i]);
+	}
+	c->m.n_expert_parts = cfg->n_expert_devices;
 	return OK;
 }
 
@@ -220,6 +257,10 @@ status_code context_init(context *c, const config *cfg) {
 		c->m.fuse_config = cfg->fuse;
 
 	s = apply_layer_split(c, cfg);
+	if (s != OK)
+		goto fail_model;
+
+	s = apply_expert_parts(c, cfg);
 	if (s != OK)
 		goto fail_model;
 

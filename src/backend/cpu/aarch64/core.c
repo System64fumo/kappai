@@ -2759,7 +2759,7 @@ status_code cpu_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
 	memcpy(d->latent_cache + (size_t)d->pos * R, kv, (size_t)R * sizeof(float));
 
 	tpool *pool		= cpu_pool_of(self);
-	bool   parallel = pool && tpool_current_tid() < 0;
+	bool   parallel = pool && tpool_current_tid() < 0 && tpool_n_threads(pool) <= d->n_threads + 1;
 
 	mla_qabs_job qabs_job = {q, d->k_b, q_abs, R, qk};
 	if (parallel)

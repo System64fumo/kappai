@@ -18,6 +18,20 @@ typedef void (*layer_progress_cb)(int layer_idx, int n_layers, int token_progres
 
 #define SCRATCH_MAX_MIRRORS 7
 
+#define EXPERT_DEV_MAX 8
+
+typedef struct {
+	buffer x;
+	buffer out;
+	size_t cap;
+} expert_dev_entry;
+
+typedef struct {
+	expert_dev_entry entries[EXPERT_DEV_MAX];
+	float_buf		 acc;
+	float_buf		 tmp;
+} expert_dev_scratch;
+
 typedef struct {
 	backend *be;
 	buffer	 slots[RECIPE_SLOT_MAX];
@@ -88,7 +102,8 @@ typedef struct compute_scratch {
 	float_buf op_st_cur;
 	float_buf op_st_coef;
 
-	moe_expert_slot *moe_slot_buf;
+	moe_expert_slot	  *moe_slot_buf;
+	expert_dev_scratch expert_dev;
 
 	layer_progress_cb			 layer_cb;
 	void						*layer_cb_ud;
@@ -98,9 +113,11 @@ typedef struct compute_scratch {
 	float_buf	   batch_logits_tmp;
 } compute_scratch;
 
-void		compute_scratch_init(compute_scratch *s);
-void		compute_scratch_free(compute_scratch *s);
-status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx);
+void			  compute_scratch_init(compute_scratch *s);
+void			  compute_scratch_free(compute_scratch *s);
+void			  expert_dev_scratch_release(expert_dev_scratch *ds);
+expert_dev_entry *expert_dev_scratch_get(expert_dev_scratch *ds, backend *eb, size_t floats);
+status_code		  compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx);
 
 void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, int kv_out);
 

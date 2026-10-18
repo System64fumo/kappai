@@ -171,6 +171,7 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	s->moe_shared_y.p	 = NULL;
 	free(s->moe_slot_buf);
 	s->moe_slot_buf = NULL;
+	expert_dev_scratch_release(&s->expert_dev);
 
 #define FREE_FLOAT_BUF(field)                                                                      \
 	do {                                                                                           \
@@ -200,6 +201,47 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	}
 	free(s->batch_logits_tmp.p);
 	s->batch_logits_tmp.cap = 0;
+}
+
+static void expert_dev_entry_release(expert_dev_entry *e) {
+	if (e->x.owner)
+		e->x.owner->buffer_free(e->x.owner, &e->x);
+	if (e->out.owner)
+		e->out.owner->buffer_free(e->out.owner, &e->out);
+	memset(e, 0, sizeof(*e));
+}
+
+void expert_dev_scratch_release(expert_dev_scratch *ds) {
+	for (int i = 0; i < EXPERT_DEV_MAX; i++)
+		expert_dev_entry_release(&ds->entries[i]);
+	free(ds->acc.p);
+	free(ds->tmp.p);
+	memset(ds, 0, sizeof(*ds));
+}
+
+expert_dev_entry *expert_dev_scratch_get(expert_dev_scratch *ds, backend *eb, size_t floats) {
+	expert_dev_entry *slot = NULL;
+	for (int i = 0; i < EXPERT_DEV_MAX; i++) {
+		if (ds->entries[i].x.owner == eb) {
+			slot = &ds->entries[i];
+			break;
+		}
+		if (!slot && !ds->entries[i].x.owner)
+			slot = &ds->entries[i];
+	}
+	if (!slot)
+		return NULL;
+	if (slot->x.owner == eb && slot->cap >= floats)
+		return slot;
+	expert_dev_entry_release(slot);
+	size_t bytes = floats * sizeof(float);
+	if (eb->buffer_alloc_scratch(eb, bytes, &slot->x) != OK ||
+		eb->buffer_alloc_scratch(eb, bytes, &slot->out) != OK) {
+		expert_dev_entry_release(slot);
+		return NULL;
+	}
+	slot->cap = floats;
+	return slot;
 }
 
 void compute_scratch_free(compute_scratch *s) {

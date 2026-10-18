@@ -2864,7 +2864,7 @@ typedef struct {
 	float				  *all_scratch;
 	size_t				   per_thread_scratch;
 	float				  *all_outs;
-	size_t				   per_thread_out;
+	size_t				   per_expert_out;
 	_Atomic int			   first_err;
 	_Atomic int			   n_err;
 } moe_par_job;
@@ -3387,6 +3387,8 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 	float_buf_ensure(&bs->moe_gather_x, (size_t)n_rows * dim);
 	float_buf_ensure(&bs->moe_exp_act, (size_t)n_rows * I);
 	float_buf_ensure(&bs->moe_exp_y, (size_t)n_rows * dim);
+	float *contrib = float_buf_ensure(&bs->moe_expert_out, (size_t)n_rows * K * dim);
+	memset(contrib, 0, (size_t)n_rows * K * dim * sizeof(float));
 
 	for (int i = 0; i < n_union; i++) {
 		int				 u	  = bs->moe_union_order[i];
@@ -3442,14 +3444,22 @@ static status_code moe_experts_grouped(exec_ctx *ctx, backend *a, int dim, int K
 		for (int c = 0; c < cnt; c++) {
 			float		 w = bs->moe_router_w[(size_t)rows[c] * K + kidx[c]];
 			const float *y = Y + (size_t)c * dim;
-			float		*o = out + (size_t)rows[c] * dim;
+			float		*o = contrib + ((size_t)rows[c] * K + kidx[c]) * dim;
 			if (ds == 1.0f) {
 				for (int d = 0; d < dim; d++)
-					o[d] += w * y[d];
+					o[d] = w * y[d];
 			} else {
 				for (int d = 0; d < dim; d++)
-					o[d] += w * (ds * y[d]);
+					o[d] = w * (ds * y[d]);
 			}
+		}
+	}
+	for (int row = 0; row < n_rows; row++) {
+		float *o = out + (size_t)row * dim;
+		for (int k = 0; k < K; k++) {
+			const float *c = contrib + ((size_t)row * K + k) * dim;
+			for (int d = 0; d < dim; d++)
+				o[d] += c[d];
 		}
 	}
 	return OK;
@@ -3484,7 +3494,7 @@ static status_code moe_experts_resident_grouped(exec_ctx *ctx, backend *a, int d
 			counts[i] = 0;
 			continue;
 		}
-		if (es->eid < 0 || !es->gate_w || !es->dev_ready || es->dev_gate.owner != a) {
+		if (es->eid < 0 || !es->dev_ready || es->dev_gate.owner != a) {
 			free(experts);
 			free(rows_packed);
 			free(weights_packed);
@@ -3518,6 +3528,112 @@ static status_code moe_experts_resident_grouped(exec_ctx *ctx, backend *a, int d
 	free(rows_packed);
 	free(weights_packed);
 	return st;
+}
+
+static void moe_experts_batch_split(exec_ctx *ctx, backend *a, int dim, int K, int I,
+									int use_gelu) {
+	batch_scratch *bs	   = ctx->bs;
+	int			   n_rows  = ctx->n_rows;
+	int			   n_union = bs->moe_n_union;
+	if (n_union <= 0)
+		return;
+
+	backend **owners = xcalloc((size_t)n_union, sizeof(*owners));
+	int		  any	 = 0;
+	for (int i = 0; i < n_union; i++) {
+		int				 u	= bs->moe_union_order[i];
+		moe_expert_slot *es = &bs->moe_union_slots[i];
+		if (bs->moe_union_count[u] > 0 && es->eid >= 0 && es->dev_ready) {
+			owners[i] = es->dev_gate.owner;
+			any |= owners[i] != NULL;
+		}
+	}
+	size_t total = (size_t)n_rows * dim;
+	float *xh	 = float_buf_ensure(&bs->moe_xb_f, total);
+	if (!any || a->buffer_read_f32(a, batch_slot(bs, ctx->op->in[0]), xh, (int)total) != OK) {
+		free(owners);
+		return;
+	}
+
+	moe_resident_expert *experts		= xcalloc((size_t)n_union, sizeof(*experts));
+	int					*counts			= xcalloc((size_t)n_union, sizeof(int));
+	int					*idx			= xcalloc((size_t)n_union, sizeof(int));
+	int					*rows_packed	= xcalloc((size_t)n_rows * K, sizeof(int));
+	float				*weights_packed = xcalloc((size_t)n_rows * K, sizeof(float));
+
+	for (int i0 = 0; i0 < n_union; i0++) {
+		backend *eb = owners[i0];
+		if (!eb)
+			continue;
+		int n_e	   = 0;
+		int packed = 0;
+		for (int i = i0; i < n_union; i++) {
+			if (owners[i] != eb)
+				continue;
+			int				 u		   = bs->moe_union_order[i];
+			int				 cnt	   = bs->moe_union_count[u];
+			const int		*rows	   = bs->moe_union_rows + bs->moe_union_offsets[u];
+			const int		*kidx	   = bs->moe_union_kidx + bs->moe_union_offsets[u];
+			moe_expert_slot *es		   = &bs->moe_union_slots[i];
+			idx[n_e]				   = i;
+			counts[n_e]				   = cnt;
+			experts[n_e].gate_w		   = &es->dev_gate;
+			experts[n_e].up_w		   = &es->dev_up;
+			experts[n_e].down_w		   = &es->dev_down;
+			experts[n_e].gate_type	   = es->gate_type;
+			experts[n_e].up_type	   = es->up_type;
+			experts[n_e].down_type	   = es->down_type;
+			experts[n_e].gate_up_fused = es->gate_up_fused;
+			experts[n_e].use_gelu	   = use_gelu;
+			experts[n_e].gate_scale	   = es->gate_scale;
+			experts[n_e].up_scale	   = es->up_scale;
+			experts[n_e].down_scale	   = es->down_scale;
+			for (int c = 0; c < cnt; c++) {
+				rows_packed[packed]	   = rows[c];
+				weights_packed[packed] = bs->moe_router_w[(size_t)rows[c] * K + kidx[c]];
+				packed++;
+			}
+			n_e++;
+		}
+
+		status_code		  st = OK;
+		expert_dev_entry *e	 = NULL;
+		if (!eb->moe_experts_batch || n_e > MOE_MAX_TOPK * 8)
+			st = ERR_UNSUPPORTED;
+		else if (!(e = expert_dev_scratch_get(&ctx->s->expert_dev, eb, total)))
+			st = ERR_OUT_OF_MEMORY;
+		if (st == OK)
+			st = eb->buffer_write_f32(eb, &e->x, xh, (int)total);
+		if (st == OK)
+			st = eb->scale_inplace(eb, &e->out, 0.0f, (int)total);
+		if (st == OK)
+			st = eb->moe_experts_batch(eb, &e->x, &e->out, n_rows, dim, I, use_gelu, n_e, experts,
+									   counts, rows_packed, weights_packed);
+		if (st == OK) {
+			float *tmp = float_buf_ensure(&ctx->s->expert_dev.tmp, total);
+			st		   = eb->buffer_read_f32(eb, &e->out, tmp, (int)total);
+			if (st == OK)
+				for (size_t j = 0; j < total; j++)
+					bs->moe_out.p[j] += tmp[j];
+		}
+		if (st == OK) {
+			for (int j = 0; j < n_e; j++)
+				bs->moe_union_count[bs->moe_union_order[idx[j]]] = 0;
+		} else {
+			WARN("moe expert batch on '%s' failed (st=%d) -- falling back to cpu",
+				 eb->name ? eb->name : "?", (int)st);
+		}
+		for (int i = i0; i < n_union; i++)
+			if (owners[i] == eb)
+				owners[i] = NULL;
+	}
+
+	free(experts);
+	free(counts);
+	free(idx);
+	free(rows_packed);
+	free(weights_packed);
+	free(owners);
 }
 
 static void moe_release_batch_slots(model *m, int li, batch_scratch *bs, int n_rows, int K,
@@ -3618,8 +3734,11 @@ static status_code moe_experts_batch(exec_ctx *ctx) {
 				moe_release_batch_slots(ctx->m, ctx->li, ctx->bs, ctx->n_rows, K, n_union);
 				return OK;
 			}
-			WARN("moe resident expert batch failed (st=%d) -- falling back to cpu", (int)st);
+			if (st != ERR_UNSUPPORTED)
+				WARN("moe resident expert batch failed (st=%d) -- falling back to cpu", (int)st);
 		}
+		if (ctx->m->layers[ctx->li].experts_resident)
+			moe_experts_batch_split(ctx, a, dim, K, I, use_gelu);
 		moe_experts_grouped(ctx, a, dim, K, I, use_gelu);
 		goto finish;
 	}
@@ -4337,7 +4456,6 @@ static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
 		.q8_gate_ok	  = j->xb_q8_gate_ok,
 		.q8_gate_type = j->gate_q8_type,
 		.xb_q8_gate	  = j->xb_q8_gate,
-		.out		  = (float *)((char *)j->all_outs + ((size_t)tid * j->per_thread_out)),
 	};
 	cx.scratch = (float *)((char *)j->all_scratch + ((size_t)tid * j->per_thread_scratch));
 
@@ -4345,6 +4463,7 @@ static void moe_expert_chunk(int begin, int end, int tid, void *ctx) {
 		int eid = j->expert_ids[k];
 		if (eid < 0 || eid >= j->m->moe.n_experts)
 			continue;
+		cx.out				 = (float *)((char *)j->all_outs + ((size_t)k * j->per_expert_out));
 		status_code local_st = moe_expert_exec(&cx, &j->slot_buf[k], j->xb_f, j->weights[k], tid);
 		if (local_st != OK) {
 			if (atomic_fetch_add(&j->n_err, 1) == 0)
@@ -4386,11 +4505,10 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	size_t total_scratch	  = (size_t)n_threads * per_thread_scratch;
 	float *all_scratch = float_buf_ensure(&s->moe_all_scratch, total_scratch / sizeof(float));
 
-	size_t per_thread_out = (size_t)dim * sizeof(float);
-	size_t total_out	  = (size_t)n_threads * per_thread_out;
-	float *all_outs		  = float_buf_ensure(&s->moe_all_outs, total_out / sizeof(float));
-	for (int t = 0; t < n_threads; t++) {
-		float *o = (float *)((char *)all_outs + ((size_t)t * per_thread_out));
+	size_t per_expert_out = (size_t)dim * sizeof(float);
+	float *all_outs		  = float_buf_ensure(&s->moe_all_outs, (size_t)K * dim);
+	for (int k = 0; k < K; k++) {
+		float *o = (float *)((char *)all_outs + ((size_t)k * per_expert_out));
 		for (int d = 0; d < dim; d++)
 			o[d] = 0.0f;
 	}
@@ -4423,7 +4541,7 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 					   .all_scratch		   = all_scratch,
 					   .per_thread_scratch = per_thread_scratch,
 					   .all_outs		   = all_outs,
-					   .per_thread_out	   = per_thread_out};
+					   .per_expert_out	   = per_expert_out};
 	atomic_store(&job.first_err, OK);
 	atomic_store(&job.n_err, 0);
 
@@ -4435,8 +4553,8 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 		tpool_parallel_for(pool, K, 1, moe_expert_chunk, &job);
 	}
 
-	for (int t = 0; t < n_threads; t++) {
-		float *o = (float *)((char *)all_outs + ((size_t)t * per_thread_out));
+	for (int k = 0; k < K; k++) {
+		float *o = (float *)((char *)all_outs + ((size_t)k * per_expert_out));
 		for (int d = 0; d < dim; d++)
 			outf[d] += o[d];
 	}
@@ -4491,6 +4609,106 @@ static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, 
 	return OK;
 }
 
+static status_code moe_run_on_device(struct model *m, int li, backend *eb,
+									 struct compute_scratch *s, const float *xh, const int *ids_dev,
+									 const float *weights, moe_expert_slot *slot_buf,
+									 const moe_exec_plan *plan, float *out_host) {
+	int			dim = plan->dim;
+	int			K	= plan->K;
+	status_code st	= moe_stream_resolve(m, li, ids_dev, K, slot_buf);
+	if (st != OK)
+		return st;
+	expert_dev_entry *e = expert_dev_scratch_get(&s->expert_dev, eb, (size_t)dim);
+	if (!e) {
+		moe_stream_release_slots(m, li, slot_buf, K);
+		return ERR_OUT_OF_MEMORY;
+	}
+	st = eb->buffer_write_f32(eb, &e->x, xh, dim);
+	if (st == OK)
+		st = eb->scale_inplace(eb, &e->out, 0.0f, dim);
+	for (int k = 0; st == OK && k < K; k++) {
+		if (slot_buf[k].eid < 0 || !moe_slot_present(&slot_buf[k]))
+			continue;
+		if (!slot_buf[k].dev_ready || slot_buf[k].dev_gate.owner != eb) {
+			st = ERR_UNSUPPORTED;
+			break;
+		}
+		moe_resident_expert ge = {
+			.gate_w		   = &slot_buf[k].dev_gate,
+			.up_w		   = &slot_buf[k].dev_up,
+			.down_w		   = &slot_buf[k].dev_down,
+			.gate_type	   = slot_buf[k].gate_type,
+			.up_type	   = slot_buf[k].up_type,
+			.down_type	   = slot_buf[k].down_type,
+			.gate_up_fused = slot_buf[k].gate_up_fused,
+			.use_gelu	   = plan->use_gelu,
+			.gate_scale	   = slot_buf[k].gate_scale,
+			.up_scale	   = slot_buf[k].up_scale,
+			.down_scale	   = slot_buf[k].down_scale,
+			.weight		   = weights[k],
+		};
+		st = eb->moe_expert_ffn(eb, &e->x, &e->out, &ge, dim, plan->I);
+	}
+	if (st == OK)
+		st = eb->buffer_read_f32(eb, &e->out, out_host, dim);
+	moe_stream_release_slots(m, li, slot_buf, K);
+	return st;
+}
+
+static int moe_experts_split(struct model *m, int li, backend *a, struct compute_scratch *s,
+							 const buffer *xb, const int *expert_ids, const float *weights,
+							 moe_expert_slot *slot_buf, const moe_exec_plan *plan, int *host_ids) {
+	int		 dim = plan->dim;
+	int		 K	 = plan->K;
+	backend *owners[MOE_MAX_TOPK];
+	int		 any = 0;
+	for (int k = 0; k < K; k++) {
+		owners[k]	= moe_stream_expert_owner(m, li, expert_ids[k]);
+		host_ids[k] = owners[k] ? -1 : expert_ids[k];
+		any |= owners[k] != NULL;
+	}
+	if (!any)
+		return 0;
+
+	expert_dev_scratch *ds	= &s->expert_dev;
+	float			   *acc = float_buf_ensure(&ds->acc, (size_t)dim);
+	float			   *tmp = float_buf_ensure(&ds->tmp, (size_t)dim);
+	float			   *xh	= float_buf_ensure(&s->moe_xb_f, (size_t)dim);
+	memset(acc, 0, (size_t)dim * sizeof(float));
+	if (a->buffer_read_f32(a, xb, xh, dim) != OK) {
+		for (int k = 0; k < K; k++)
+			host_ids[k] = expert_ids[k];
+		return 0;
+	}
+
+	int n_dev = 0;
+	for (int k0 = 0; k0 < K; k0++) {
+		backend *eb = owners[k0];
+		if (!eb)
+			continue;
+		int ids_dev[MOE_MAX_TOPK];
+		for (int k = 0; k < K; k++)
+			ids_dev[k] = owners[k] == eb ? expert_ids[k] : -1;
+		status_code st = moe_run_on_device(m, li, eb, s, xh, ids_dev, weights, slot_buf, plan, tmp);
+		for (int k = 0; k < K; k++) {
+			if (owners[k] != eb)
+				continue;
+			owners[k] = NULL;
+			if (st == OK)
+				n_dev++;
+			else
+				host_ids[k] = expert_ids[k];
+		}
+		if (st == OK)
+			for (int d = 0; d < dim; d++)
+				acc[d] += tmp[d];
+		else
+			WARN("moe expert ffn on '%s' failed (st=%d) -- falling back to cpu",
+				 eb->name ? eb->name : "?", (int)st);
+	}
+	return n_dev;
+}
+
 static status_code op_moe_experts(exec_ctx *ctx) {
 	if (exec_is_batch(ctx))
 		return moe_experts_batch(ctx);
@@ -4508,6 +4726,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 						 backend_has_cap(out_buf->owner, BCAP_IS_HOST);
 	float  local_outf[MOE_MAX_DIM_STACK];
 	float *heap_outf = NULL;
+	float *dev_acc	 = NULL;
+	int	   host_ids[MOE_MAX_TOPK];
 	float *outf;
 	if (out_is_host) {
 		outf = (float *)(out_buf->host_ptr ? out_buf->host_ptr : out_buf->handle);
@@ -4565,7 +4785,7 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 			int use_gelu = plan.use_gelu;
 			gst			 = a->scale_inplace(a, out_buf, 0.0f, dim);
 			for (int k = 0; gst == OK && k < K; k++) {
-				if (slot_buf[k].eid < 0 || !slot_buf[k].gate_w)
+				if (slot_buf[k].eid < 0 || !moe_slot_present(&slot_buf[k]))
 					continue;
 				moe_resident_expert ge = {
 					.gate_w		   = &slot_buf[k].dev_gate,
@@ -4590,6 +4810,21 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 			}
 			WARN("moe resident expert ffn failed (st=%d) -- falling back to cpu", (int)gst);
 			moe_stream_release_slots(m, li, slot_buf, K);
+		}
+	}
+
+	if (m->layers[li].experts_resident &&
+		moe_experts_split(m, li, a, s, xb_dev, expert_ids, weights, slot_buf, &plan, host_ids) >
+			0) {
+		dev_acc	   = s->expert_dev.acc.p;
+		expert_ids = host_ids;
+		int n_host = 0;
+		for (int k = 0; k < K; k++)
+			n_host += host_ids[k] >= 0;
+		if (n_host == 0) {
+			memcpy(outf, dev_acc, (size_t)dim * sizeof(float));
+			st = OK;
+			goto writeback;
 		}
 	}
 
@@ -4676,6 +4911,10 @@ cleanup:
 		}
 	}
 	moe_stream_release_slots(m, li, slot_buf, K);
+
+	if (dev_acc && st == OK)
+		for (int d = 0; d < dim; d++)
+			outf[d] += dev_acc[d];
 
 	goto writeback;
 

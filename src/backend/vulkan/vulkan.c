@@ -3656,11 +3656,11 @@ static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int
 		int32_t	 in_row_stride, m_tokens;
 	} push					 = {(uint32_t)vk_kv_layer_off_elems(kh, layer),
 								pos,
-								n_kv_heads,
+								n_active,
 								head_dim,
 								n_ctx,
 								head_dim,
-								n_kv_heads * head_dim,
+								n_active * head_dim,
 								1};
 	vk_buf		*bufs[4]	 = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
@@ -3688,11 +3688,11 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 		int32_t	 in_row_stride, m_tokens;
 	} push					 = {(uint32_t)vk_kv_layer_off_elems(kh, layer),
 								pos_start,
-								n_kv_heads,
+								n_active,
 								head_dim,
 								n_ctx,
 								head_dim,
-								in_row_stride > 0 ? in_row_stride : n_kv_heads * head_dim,
+								in_row_stride > 0 ? in_row_stride : n_active * head_dim,
 								m};
 	vk_buf		*bufs[4]	 = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};

@@ -3546,7 +3546,7 @@ __attribute__((weak)) status_code cpu_mla_absorbed(backend *self, const mla_abso
 	mla_job job	 = {q_abs,			d->latent_cache,		d->v_b, ho, scr, n_pos, R, vh,
 					scratch_stride, 1.0f / sqrtf((float)qk)};
 	tpool  *pool = self->get_pool ? self->get_pool(self) : NULL;
-	if (pool && tpool_current_tid() < 0)
+	if (pool && tpool_current_tid() < 0 && tpool_n_threads(pool) <= d->n_threads + 1)
 		tpool_parallel_for(pool, H, 1, mla_heads, &job);
 	else
 		mla_heads(0, H, -1, &job);
