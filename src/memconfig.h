@@ -3,6 +3,7 @@
 
 #include "backend/backend.h"
 #include "common.h"
+#include "mempool.h"
 
 typedef struct model  model;
 typedef struct config config;
@@ -19,7 +20,7 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg);
 
 void model_mem_estimates_ensure(model *m);
 
-void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, size_t avail,
-							 kv_quant_type kv_quant, int is_host);
+void report_memory(const model *m, const mem_topology *t, backend *kv_backend, int n_ctx,
+				   kv_quant_type kv_quant);
 
 #endif

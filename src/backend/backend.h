@@ -24,6 +24,7 @@ typedef enum {
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
 	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
 	BCAP_KV_POS_CAP			  = 1 << 10,
+	BCAP_UNIFIED_MEMORY		  = 1 << 11,
 } backend_cap;
 
 typedef struct {
@@ -197,6 +198,7 @@ static inline size_t mla_absorbed_ws_floats(const mla_absorbed_desc *d) {
 struct backend {
 	const char *name;
 	int			priority;
+	int			device_index;
 	uint64_t	caps;
 	status_code (*probe)(void);
 	int (*device_count)(void);

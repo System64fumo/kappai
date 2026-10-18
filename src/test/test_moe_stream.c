@@ -21,7 +21,7 @@ static void moe_load(moe_sess *r, const char *path, int n_ctx) {
 	memset(r, 0, sizeof(*r));
 	if (backend_create("cpu", 0, &r->be) != OK)
 		abort();
-	if (model_load_backend_ex_repack(&r->m, path, r->be, 1, NULL, 0) != OK)
+	if (model_load_backend_ex_repack(&r->m, path, r->be, 1, NULL) != OK)
 		abort();
 	r->vocab  = r->m.vocab_size;
 	r->logits = xmalloc((size_t)r->vocab * sizeof(float));

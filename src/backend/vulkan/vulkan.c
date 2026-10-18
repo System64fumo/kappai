@@ -1968,18 +1968,10 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.supports_subgroup_ballot	 = (sf & VK_SUBGROUP_FEATURE_BALLOT_BIT) != 0;
 #endif
 
-	p->caps.unified_memory = 0;
-	VkMemoryPropertyFlags uma_wanted =
-		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-	for (uint32_t i = 0; i < p->mem_props.memoryTypeCount && !p->caps.unified_memory; i++) {
-		if (!(p->mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
-			continue;
-		uint32_t heap = p->mem_props.memoryTypes[i].heapIndex;
-		if (heap >= p->mem_props.memoryHeapCount)
-			continue;
-		if ((p->mem_props.memoryHeaps[heap].flags & uma_wanted) == uma_wanted)
-			p->caps.unified_memory = 1;
-	}
+	p->caps.unified_memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+							 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+	if (p->caps.unified_memory)
+		self->caps |= BCAP_UNIFIED_MEMORY;
 
 	log_tag("VLK", "device: %s", props.deviceName);
 

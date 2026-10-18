@@ -6,6 +6,7 @@
 #include "compute.h"
 #include "config.h"
 #include "kvcache.h"
+#include "mempool.h"
 #include "model.h"
 #include "monitor.h"
 #include "sampler.h"
@@ -32,6 +33,7 @@ typedef struct {
 	backend				 *backend;
 	backend				 *extra_backends[CONFIG_MAX_LAYER_DEVICES];
 	int					  n_extra_backends;
+	mem_topology		  topo;
 	char				  extra_specs[CONFIG_MAX_LAYER_DEVICES][64];
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;

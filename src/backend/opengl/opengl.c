@@ -1274,7 +1274,10 @@ static status_code gl_init(backend *self, int device_index) {
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	p->device_local_total_estimate = get_total_memory();
+	if (p->ctx.unified_memory)
+		self->caps |= BCAP_UNIFIED_MEMORY;
+	p->device_local_total_estimate =
+		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes : get_total_memory();
 
 	log_tag("OGL", "%s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
 			p->ctx.renderer, p->ctx.max_wg_size, p->ctx.max_shared_bytes / 1024,

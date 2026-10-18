@@ -116,6 +116,10 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	flush_family(OPFAM_TOOLCALL);
 	run_hcs_tests();
 	flush_family(OPFAM_HCS);
+	run_mempool_tests();
+	flush_family(OPFAM_MEMPOOL);
+	run_moe_tier_tests();
+	flush_family(OPFAM_MOE_TIER);
 
 	int run_all = wants_all(argc, argv);
 	int any_run = 0;

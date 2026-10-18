@@ -69,6 +69,16 @@ const char *hcs_format_count(int value, char *buf, size_t cap) {
 	return buf;
 }
 
+int hcs_parse_priority(const char *text, int *out) {
+	str_span trim = span_trim(text, strlen(text));
+	char	 buf[32];
+	if (trim.len == 0 || trim.len >= sizeof(buf))
+		return -1;
+	memcpy(buf, trim.p, trim.len);
+	buf[trim.len] = '\0';
+	return parse_bounded_int(buf, out);
+}
+
 int hcs_parse_tasks(const char *text, unsigned *out) {
 	unsigned	mask = 0;
 	char		tok[HCS_NAME_MAX];
@@ -199,7 +209,7 @@ static int set_root_key(hcs_loader *l, const char *key, const char *value, char 
 
 static int set_section_key(hcs_section *s, const char *key, const char *value, char *err,
 						   size_t errlen) {
-	enum { SEEN_TASKS = 1, SEEN_LAYERS = 2, SEEN_EXPERTS = 4 };
+	enum { SEEN_TASKS = 1, SEEN_LAYERS = 2, SEEN_EXPERTS = 4, SEEN_PRIORITY = 8 };
 	unsigned bit = 0;
 	int		 rc	 = 0;
 	if (strcasecmp(key, "tasks") == 0) {
@@ -211,6 +221,9 @@ static int set_section_key(hcs_section *s, const char *key, const char *value, c
 	} else if (strcasecmp(key, "experts") == 0) {
 		bit = SEEN_EXPERTS;
 		rc	= s->seen & bit ? 0 : hcs_parse_count(value, &s->dev.experts);
+	} else if (strcasecmp(key, "priority") == 0) {
+		bit = SEEN_PRIORITY;
+		rc	= s->seen & bit ? 0 : hcs_parse_priority(value, &s->dev.priority);
 	} else {
 		snprintf(err, errlen, "unknown key '%s' in section [hcs.%s]", key, s->name);
 		return -1;
@@ -223,12 +236,16 @@ static int set_section_key(hcs_section *s, const char *key, const char *value, c
 		if (bit == SEEN_TASKS)
 			snprintf(err, errlen, "'tasks' expects a comma list of prefill, decode, got '%s'",
 					 value);
+		else if (bit == SEEN_PRIORITY)
+			snprintf(err, errlen, "'priority' expects a non-negative integer, got '%s'", value);
 		else
 			snprintf(err, errlen, "'%s' expects a non-negative integer or '*', got '%s'", key,
 					 value);
 		return -1;
 	}
 	s->seen |= bit;
+	if (bit == SEEN_PRIORITY)
+		s->dev.has_priority = true;
 	return 0;
 }
 
@@ -455,6 +472,8 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 						  (d->tasks & HCS_TASK_PREFILL) ? "decode" : "prefill");
 		if (n_experts == 0 && d->experts != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "experts", "model is not a MoE model; remove this key");
+		if (n_experts == 0 && d->has_priority)
+			add_violation(v, d->name, "priority", "model is not a MoE model; remove this key");
 		bool no_experts = d->experts == 0 || d->experts == HCS_COUNT_UNSET;
 		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "device", "holds nothing; remove it from 'devices'");
@@ -547,7 +566,15 @@ static void materialize_expert_parts(const hcs_config *h, int n_experts, config 
 			continue;
 		cfg->expert_devices[cfg->n_expert_devices] = h->devices[d].name;
 		cfg->expert_counts[cfg->n_expert_devices]  = expert_held[d];
+		cfg->expert_priorities[cfg->n_expert_devices] =
+			h->devices[d].has_priority ? h->devices[d].priority : CONFIG_PRIORITY_UNSET;
 		cfg->n_expert_devices++;
+	}
+	for (int d = 0; d < h->n_devices; d++) {
+		if (backend_device_is_host(h->devices[d].name) && h->devices[d].has_priority) {
+			cfg->host_priority = h->devices[d].priority;
+			break;
+		}
 	}
 }
 

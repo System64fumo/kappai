@@ -358,6 +358,7 @@ static status_code make_backend(backend_reg_entry *e, int device_index, backend 
 		return s;
 	}
 
+	b->device_index = device_index;
 	log_op_homes(b);
 
 	*out = b;

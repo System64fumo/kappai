@@ -255,8 +255,42 @@ static void test_validate(void) {
 	}
 }
 
+static void test_priority(void) {
+	int		   n;
+	char	   err[256];
+	hcs_loader l;
+	hcs_config h;
+	int ok = hcs_parse_priority(" 3 ", &n) == 0 && n == 3 && hcs_parse_priority("0", &n) == 0 &&
+			 n == 0 && hcs_parse_priority("*", &n) != 0 && hcs_parse_priority("-1", &n) != 0 &&
+			 hcs_parse_priority("", &n) != 0;
+	record_hcs("priority.parse", ok, "ok=%d", ok);
+
+	hcs_loader_init(&l);
+	int a = hcs_loader_open_section(&l, "cpu_0", err, sizeof(err));
+	int b = hcs_loader_open_section(&l, "cpu_1", err, sizeof(err));
+	ok	  = hcs_loader_set(&l, -1, "devices", "cpu_0, cpu_1", err, sizeof(err)) == 0 &&
+			hcs_loader_set(&l, a, "tasks", "decode", err, sizeof(err)) == 0 &&
+			hcs_loader_set(&l, a, "layers", "*", err, sizeof(err)) == 0 &&
+			hcs_loader_set(&l, a, "priority", "2", err, sizeof(err)) == 0 &&
+			hcs_loader_set(&l, b, "tasks", "decode", err, sizeof(err)) == 0 &&
+			hcs_loader_set(&l, b, "layers", "0", err, sizeof(err)) == 0 &&
+			hcs_loader_finish(&l, &h, err, sizeof(err)) == 0;
+	ok &=
+		ok && h.devices[0].has_priority && h.devices[0].priority == 2 && !h.devices[1].has_priority;
+	ok &= hcs_loader_set(&l, a, "priority", "3", err, sizeof(err)) < 0 &&
+		  strstr(err, "duplicate") != NULL;
+	record_hcs("priority.loader", ok, "err='%s'", err);
+
+	h = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
+	h.devices[0].has_priority = true;
+	h.devices[0].priority	  = 1;
+	ok						  = validate_has(&h, "priority");
+	record_hcs("priority.rejected_for_dense", ok, "ok=%d", ok);
+}
+
 void run_hcs_tests(void) {
 	test_count_and_tasks();
+	test_priority();
 	test_loader();
 	test_layer_map();
 	test_enabled_flag();

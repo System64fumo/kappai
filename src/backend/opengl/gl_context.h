@@ -24,6 +24,9 @@ typedef struct {
 	int max_ssbo_bindings;
 	int max_dispatch[3];
 
+	int	   unified_memory;
+	size_t video_memory_bytes;
+
 	char renderer[128];
 } gl_context;
 

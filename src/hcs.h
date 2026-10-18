@@ -27,6 +27,8 @@ typedef struct {
 	unsigned tasks;
 	int		 layers;
 	int		 experts;
+	bool	 has_priority;
+	int		 priority;
 } hcs_device;
 
 typedef struct {
@@ -65,6 +67,7 @@ void hcs_set_simple(hcs_config *h, const char *device);
 
 int			hcs_parse_count(const char *text, int *out);
 const char *hcs_format_count(int value, char *buf, size_t cap);
+int			hcs_parse_priority(const char *text, int *out);
 int			hcs_parse_tasks(const char *text, unsigned *out);
 void		hcs_format_tasks(unsigned tasks, char *buf, size_t cap);
 void		hcs_format_devices(const hcs_config *h, char *buf, size_t cap);

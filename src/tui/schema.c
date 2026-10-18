@@ -687,6 +687,8 @@ static void write_hcs(FILE *fp, const hcs_config *h) {
 			fprintf(fp, "layers = %s\n", hcs_format_count(d->layers, count, sizeof(count)));
 		if (d->experts != HCS_COUNT_UNSET)
 			fprintf(fp, "experts = %s\n", hcs_format_count(d->experts, count, sizeof(count)));
+		if (d->has_priority)
+			fprintf(fp, "priority = %d\n", d->priority);
 		fputc('\n', fp);
 	}
 }

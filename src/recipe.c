@@ -4809,8 +4809,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 				return OK;
 			}
 			WARN("moe resident expert ffn failed (st=%d) -- falling back to cpu", (int)gst);
-			moe_stream_release_slots(m, li, slot_buf, K);
 		}
+		moe_stream_release_slots(m, li, slot_buf, K);
 	}
 
 	if (m->layers[li].experts_resident &&

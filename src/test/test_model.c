@@ -184,12 +184,12 @@ static void run_model_cross(const char *path, backend *ref, backend *tgt, int n_
 
 	model m_ref = {0};
 	model m_tgt = {0};
-	if (model_load_backend_ex_repack(&m_ref, path, ref, 1, NULL, 0) != OK) {
+	if (model_load_backend_ex_repack(&m_ref, path, ref, 1, NULL) != OK) {
 		fprintf(stderr, "ERROR: failed to load model on ref backend\n");
 		g_fail++;
 		return;
 	}
-	if (model_load_backend_ex_repack(&m_tgt, path, tgt, 1, NULL, 0) != OK) {
+	if (model_load_backend_ex_repack(&m_tgt, path, tgt, 1, NULL) != OK) {
 		fprintf(stderr, "ERROR: failed to load model on %s backend\n", tgt->name);
 		model_free(&m_ref);
 		g_fail++;

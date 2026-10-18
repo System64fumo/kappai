@@ -1825,7 +1825,7 @@ status_code model_load(model *m, const char *path) {
 	if (s != OK)
 		return s;
 
-	s = model_load_backend_ex_repack(m, path, cpu, 1, NULL, 0);
+	s = model_load_backend_ex_repack(m, path, cpu, 1, NULL);
 	if (s != OK) {
 		backend_destroy(cpu);
 		return s;
@@ -3147,12 +3147,9 @@ status_code model_set_layer_backend_range(model *m, int begin, int end, backend 
 }
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config, int requested_n_ctx) {
+							 const char *repack_config) {
 	memset(m, 0, sizeof(*m));
 	m->backend = bk;
-
-	int	   is_host_backend	 = backend_has_cap(bk, BCAP_IS_HOST) ? 1 : 0;
-	size_t avail_before_load = is_host_backend ? get_available_memory() : backend_mem_available(bk);
 
 	status_code s = model_load_open(m, path, use_mmap, repack_config);
 	if (s != OK) {
@@ -3192,12 +3189,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 		goto fail;
 	}
 
-	int report_n_ctx = requested_n_ctx;
-	if (report_n_ctx <= 0 || report_n_ctx > m->n_ctx)
-		report_n_ctx = m->n_ctx;
 	model_mem_estimates_ensure(m);
-	recommend_memory_config(m, bk->kv_alloc ? bk : backend_host(), report_n_ctx, avail_before_load,
-							(kv_quant_type)config_get()->kv_quant, is_host_backend);
 
 	return OK;
 
@@ -3244,8 +3236,8 @@ status_code model_build_recipe(model *m) {
 }
 
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
-										 const char *repack_config, int requested_n_ctx) {
-	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config, requested_n_ctx);
+										 const char *repack_config) {
+	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config);
 	if (s != OK)
 		return s;
 

@@ -47,6 +47,7 @@ typedef enum {
 	HCS_REF_TASKS,
 	HCS_REF_LAYERS,
 	HCS_REF_EXPERTS,
+	HCS_REF_PRIORITY,
 } hcs_ref_kind;
 
 typedef struct {
@@ -54,7 +55,7 @@ typedef struct {
 	int			 device;
 } hcs_ref;
 
-#define HCS_REF_FIELD_COUNT 4
+#define HCS_REF_FIELD_COUNT 5
 
 static const char EDITOR_HCS_ENABLE_HINT[] =
 	"off: the model tab device runs everything; on: place layers and experts per device here";
@@ -71,6 +72,8 @@ static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
 	"experts of every layer cached (LRU) on this device, a number, '*' for the remainder (one '*' "
 	"per config) or empty for the default",
+	"moe cache priority of this device's memory pool; the pool with the highest level above the "
+	"host's gets the promoted experts (defaults: host 0, then 1, 2 by pool order)",
 };
 
 static int editor_tab_count(void) {
@@ -104,7 +107,7 @@ static int editor_header_lines(const editor_state *st, int tab) {
 }
 
 static int editor_hcs_fields_per_device(const editor_state *st) {
-	return editor_model_is_dense(st) ? 3 : 4;
+	return editor_model_is_dense(st) ? 3 : 5;
 }
 
 static bool editor_hcs_can_add(const editor_state *st) {
@@ -198,6 +201,13 @@ static void editor_hcs_row_text(const editor_state *st, int row, char *label, si
 				 d->layers == HCS_COUNT_UNSET ? "(not set)"
 											  : hcs_format_count(d->layers, count, sizeof(count)));
 		break;
+	case HCS_REF_PRIORITY:
+		snprintf(label, label_cap, "  Priority");
+		if (d->has_priority)
+			snprintf(val, val_cap, "%d", d->priority);
+		else
+			snprintf(val, val_cap, "(default)");
+		break;
 	default:
 		snprintf(label, label_cap, "  Experts");
 		snprintf(val, val_cap, "%s",
@@ -231,10 +241,12 @@ static void editor_refresh_probe(editor_state *st) {
 	if (!editor_model_is_dense(st))
 		return;
 	for (int i = 0; i < st->sc.hcs.n_devices; i++) {
-		if (st->sc.hcs.devices[i].experts == HCS_COUNT_UNSET)
+		hcs_device *d = &st->sc.hcs.devices[i];
+		if (d->experts == HCS_COUNT_UNSET && !d->has_priority)
 			continue;
-		st->sc.hcs.devices[i].experts = HCS_COUNT_UNSET;
-		st->dirty					  = true;
+		d->experts		= HCS_COUNT_UNSET;
+		d->has_priority = false;
+		st->dirty		= true;
 	}
 }
 
@@ -736,6 +748,35 @@ static void editor_edit_count(editor_state *st, const char *title, int device, s
 	st->dirty = true;
 }
 
+static int editor_validate_priority(const char *value, char *err, size_t errlen, void *ud) {
+	(void)ud;
+	int parsed;
+	if (!value[0] || hcs_parse_priority(value, &parsed) == 0)
+		return 0;
+	snprintf(err, errlen, "expected a non-negative integer, or empty for the default");
+	return -1;
+}
+
+static void editor_edit_priority(editor_state *st, hcs_device *d) {
+	char initial[16] = "";
+	char buf[16];
+	if (d->has_priority)
+		snprintf(initial, sizeof(initial), "%d", d->priority);
+	int r = ui_input("Priority", initial, buf, sizeof(buf), editor_validate_priority, NULL, NULL);
+	st->status[0] = '\0';
+	if (r <= 0)
+		return;
+	bool has   = buf[0] != '\0';
+	int	 value = 0;
+	if (has)
+		hcs_parse_priority(buf, &value);
+	if (has == d->has_priority && (!has || value == d->priority))
+		return;
+	d->has_priority = has;
+	d->priority		= value;
+	st->dirty		= true;
+}
+
 static void editor_edit_tasks(editor_state *st, hcs_device *d) {
 	static const char *const choices[] = {"prefill", "decode"};
 	bool sel[]	  = {(d->tasks & HCS_TASK_PREFILL) != 0, (d->tasks & HCS_TASK_DECODE) != 0};
@@ -783,11 +824,13 @@ static void editor_add_hcs_device(editor_state *st) {
 			h->devices[i].layers = st->probe_ok ? (st->n_layers + 1) / 2 : 0;
 	hcs_device *d = &h->devices[h->n_devices++];
 	snprintf(d->name, sizeof(d->name), "%s", pick);
-	d->tasks	  = HCS_TASKS_ALL;
-	d->layers	  = HCS_COUNT_ALL;
-	d->experts	  = HCS_COUNT_UNSET;
-	st->dirty	  = true;
-	st->status[0] = '\0';
+	d->tasks		= HCS_TASKS_ALL;
+	d->layers		= HCS_COUNT_ALL;
+	d->experts		= HCS_COUNT_UNSET;
+	d->has_priority = false;
+	d->priority		= 0;
+	st->dirty		= true;
+	st->status[0]	= '\0';
 }
 
 static void editor_remove_hcs_device(editor_state *st) {
@@ -829,6 +872,9 @@ static void editor_edit_hcs_row(editor_state *st, int row) {
 		return;
 	case HCS_REF_EXPERTS:
 		editor_edit_count(st, "Experts", ref.device, offsetof(hcs_device, experts), true);
+		return;
+	case HCS_REF_PRIORITY:
+		editor_edit_priority(st, &st->sc.hcs.devices[ref.device]);
 		return;
 	default:
 		return;

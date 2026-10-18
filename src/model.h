@@ -5,6 +5,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
+#include "mempool.h"
 
 struct model_recipe;
 typedef struct model_recipe model_recipe;
@@ -109,6 +110,7 @@ typedef struct layer_weights {
 typedef struct {
 	struct backend *be;
 	int				count;
+	int				priority;
 } model_expert_part;
 
 typedef struct model_mla_params {
@@ -199,8 +201,10 @@ typedef struct model {
 	model_recipe			*recipe;
 	weight_ref			   **wrefs_by_layer;
 	backend				   **layer_backends;
+	const mem_topology		*topo;
 	model_expert_part		 expert_parts[MODEL_MAX_EXPERT_PARTS];
 	int						 n_expert_parts;
+	int						 host_priority;
 	model_tensor_slot		*tensor_data_order;
 	size_t					 tensor_data_order_n;
 
@@ -242,10 +246,10 @@ typedef struct model {
 
 status_code model_load(model *m, const char *path);
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
-										 const char *repack_config, int requested_n_ctx);
+										 const char *repack_config);
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config, int requested_n_ctx);
+							 const char *repack_config);
 status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);

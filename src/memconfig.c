@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "kvcache.h"
 #include "log.h"
+#include "mempool.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include <string.h>
@@ -297,24 +298,44 @@ size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 	return per_expert * (size_t)cache_cap * (size_t)n_layers;
 }
 
-void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, size_t avail,
-							 kv_quant_type kv_quant, int is_host) {
+static void format_pool_users(const mem_pool *p, char *out, size_t cap) {
+	size_t len = 0;
+	out[0]	   = '\0';
+	for (int i = 0; i < p->n_members && len < cap; i++) {
+		char name[BACKEND_DEVICE_NAME_MAX];
+		backend_format_device(p->members[i]->name, p->members[i]->device_index, name, sizeof(name));
+		len += (size_t)snprintf(out + len, cap - len, "%s%s", i ? ", " : "", name);
+	}
+}
+
+static void log_pools(const mem_topology *t) {
+	char   pool_names[BACKEND_MAX * 8];
+	size_t names_len = 0;
+	pool_names[0]	 = '\0';
+	for (int i = 0; i < t->n_pools; i++) {
+		char users[256];
+		format_pool_users(&t->pools[i], users, sizeof(users));
+		log_tag("MEM", "pool%d: %.4g GB | Users: %s", i,
+				to_unit(mem_pool_available(&t->pools[i]), MEM_UNIT_GB), users);
+		names_len += (size_t)snprintf(pool_names + names_len, sizeof(pool_names) - names_len,
+									  "%spool%d", i ? ", " : "", i);
+	}
+	log_tag("MEM", "Available memory: %.4g GB (%s)",
+			to_unit(mem_topology_available(t), MEM_UNIT_GB), pool_names);
+}
+
+void report_memory(const model *m, const mem_topology *t, backend *kv_backend, int n_ctx,
+				   kv_quant_type kv_quant) {
 	if (n_ctx <= 0 || n_ctx > m->n_ctx)
 		n_ctx = m->n_ctx;
-	if (avail == 0)
-		return;
 
 	non_expert_breakdown bd			= calc_non_expert_breakdown(m);
-	size_t				 non_expert = bd.total;
 	size_t				 per_expert = model_cached_per_expert_size(m);
-	int					 n_experts	= m->moe.n_experts;
-	int					 n_layers	= moe_layer_count(m);
-	int					 topk		= m->moe.n_experts_used;
+	size_t expert_total = per_expert * (size_t)m->moe.n_experts * (size_t)moe_layer_count(m);
 	size_t kv_cache		= model_kv_cache_bytes_quant(m, n_ctx, kv_quant,
 													 backend_has_cap(kv_backend, BCAP_KV_POS_CAP));
-	size_t total_expert = per_expert * (size_t)n_experts * (size_t)n_layers;
 
-	INFO("Available memory: %.1f GB", to_unit(avail, MEM_UNIT_GB));
+	log_pools(t);
 	DEBUG("memory breakdown:");
 	DEBUG("  embeddings:        %.1f MB", to_unit(bd.embd, MEM_UNIT_MB));
 	DEBUG("  attention weights: %.1f MB", to_unit(bd.attn, MEM_UNIT_MB));
@@ -324,83 +345,9 @@ void recommend_memory_config(const model *m, backend *kv_backend, int n_ctx, siz
 		DEBUG("  shared experts:    %.1f MB", to_unit(bd.shexp, MEM_UNIT_MB));
 	if (bd.router > 0)
 		DEBUG("  MoE routers:       %.1f MB", to_unit(bd.router, MEM_UNIT_MB));
-	DEBUG("  non-expert total:  %.1f GB", to_unit(non_expert, MEM_UNIT_GB));
-	if (per_expert > 0 && n_experts > 0) {
-		DEBUG("  routed experts:    %.1f GB (%.1f MB/expert, %d experts x %d layers)",
-			  to_unit(total_expert, MEM_UNIT_GB), to_unit(per_expert, MEM_UNIT_MB), n_experts,
-			  n_layers);
-	}
-	if (m->sliding_window > 0) {
-		int n_kv_layers = m->layer_dims.n_layer_kv_from_start > 0
-							  ? m->layer_dims.n_layer_kv_from_start
-							  : m->n_layers;
-		if (n_kv_layers > m->n_layers)
-			n_kv_layers = m->n_layers;
-		int n_sliding = 0;
-		for (int i = 0; i < n_kv_layers; i++)
-			n_sliding += model_layer_is_sliding(m, i) ? 1 : 0;
-		DEBUG("  sliding window:     %d (%d/%d kv layers, cap %d)", m->sliding_window, n_sliding,
-			  n_kv_layers, model_kv_layer_pos_cap(m, n_ctx, 0));
-	}
-	DEBUG("  KV cache (ctx=%d): %.0f MB (%s)", n_ctx, to_unit(kv_cache, MEM_UNIT_MB),
-		  kv_quant == KV_QUANT_Q8_0 ? "q8_0" : "f16");
-	INFO("model total: %.1f GB", to_unit(non_expert + total_expert, MEM_UNIT_GB));
-
-	if (per_expert == 0 || n_experts == 0) {
-		if (non_expert > avail) {
-			if (is_host) {
-				WARN("Available memory: model doesn't fit (%.1f MB > %.1f GB available), will "
-					 "stream from disk",
-					 to_unit(non_expert, MEM_UNIT_MB), to_unit(avail, MEM_UNIT_GB));
-			} else {
-				WARN("Available memory: model doesn't fit on device (%.1f MB > %.1f GB "
-					 "available)",
-					 to_unit(non_expert, MEM_UNIT_MB), to_unit(avail, MEM_UNIT_GB));
-			}
-		}
-		return;
-	}
-
-	size_t overhead = (size_t)1 * 1024 * 1024 * 1024;
-	if (avail < non_expert + kv_cache + overhead) {
-		if (is_host) {
-			WARN("Available memory: not enough for non-expert weights (%.1f GB) + KV (%.0f MB) "
-				 "+ overhead (1 GB)",
-				 to_unit(non_expert, MEM_UNIT_GB), to_unit(kv_cache, MEM_UNIT_MB));
-			INFO("  Suggested: --mmap --moe-cache %d (let kernel manage page cache)", topk);
-		} else {
-			WARN("Available memory: not enough on device for non-expert weights (%.1f GB) + KV "
-				 "(%.0f MB) + overhead (1 GB)",
-				 to_unit(non_expert, MEM_UNIT_GB), to_unit(kv_cache, MEM_UNIT_MB));
-		}
-		return;
-	}
-
-	size_t expert_budget		= avail - non_expert - kv_cache - overhead;
-	int	   affordable_experts	= (int)(expert_budget / per_expert);
-	int	   affordable_per_layer = affordable_experts / n_layers;
-	if (affordable_per_layer < 1)
-		affordable_per_layer = 1;
-	if (affordable_per_layer > n_experts)
-		affordable_per_layer = n_experts;
-
-	int suggested_cache = affordable_per_layer;
-	if (suggested_cache < topk)
-		suggested_cache = topk;
-
-	double resident_gb =
-		to_unit(per_expert * (size_t)affordable_per_layer * (size_t)n_layers, MEM_UNIT_GB);
-
-	if (affordable_per_layer >= n_experts) {
-		INFO("  All experts fit in RAM (%.1f GB)", resident_gb);
-		INFO("  Suggested: --moe-stream off --moe-cache %d", n_experts);
-	} else if (affordable_per_layer >= topk) {
-		INFO("  Partial fit: %d/%d experts/layer (%.1f GB)", affordable_per_layer, n_experts,
-			 resident_gb);
-		INFO("  Suggested: --moe-cache %d", suggested_cache);
-	} else {
-		INFO("  Tight: %d experts/layer fit (%.1f GB), topk=%d", affordable_per_layer, resident_gb,
-			 topk);
-		INFO("  Suggested: --moe-cache %d", affordable_per_layer);
-	}
+	log_tag("MEM", "Non expert weights: %.4g GB", to_unit(bd.total, MEM_UNIT_GB));
+	if (expert_total > 0)
+		log_tag("MEM", "Expert weights: %.4g GB", to_unit(expert_total, MEM_UNIT_GB));
+	log_tag("MEM", "KV cache: %.4g GB", to_unit(kv_cache, MEM_UNIT_GB));
+	log_tag("MEM", "Required: %.4g GB", to_unit(bd.total + expert_total + kv_cache, MEM_UNIT_GB));
 }

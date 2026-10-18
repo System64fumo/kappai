@@ -228,7 +228,7 @@ static void ref_load(ref_eng *r, const char *path, int n_ctx) {
 	memset(r, 0, sizeof(*r));
 	if (backend_create("cpu", 0, &r->be) != OK)
 		abort();
-	if (model_load_backend_ex_repack(&r->m, path, r->be, 0, NULL, 0) != OK)
+	if (model_load_backend_ex_repack(&r->m, path, r->be, 0, NULL) != OK)
 		abort();
 	r->vocab  = r->m.vocab_size;
 	r->logits = xmalloc((size_t)r->vocab * sizeof(float));
@@ -942,7 +942,7 @@ static void t_no_mmap_tensor_range_reads(void) {
 	gguf_ctx ref;
 	memset(&m, 0, sizeof(m));
 	if (backend_create("cpu", 0, &be) != OK ||
-		model_load_backend_ex_repack(&m, synth_chat_model_path, be, 0, NULL, 0) != OK ||
+		model_load_backend_ex_repack(&m, synth_chat_model_path, be, 0, NULL) != OK ||
 		gguf_load(&ref, synth_chat_model_path) != OK) {
 		record_result(OPFAM_ORCHESTRATION, "no_mmap_tensor_range_reads", V_FAIL, "load failed");
 		return;

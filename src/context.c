@@ -146,6 +146,7 @@ static status_code apply_layer_map(context *c, const config *cfg) {
 }
 
 static status_code apply_expert_parts(context *c, const config *cfg) {
+	c->m.host_priority = cfg->host_priority;
 	if (cfg->n_expert_devices <= 0 || c->m.moe.n_experts <= 0)
 		return OK;
 	if (cfg->n_expert_devices > MODEL_MAX_EXPERT_PARTS) {
@@ -162,8 +163,9 @@ static status_code apply_expert_parts(context *c, const config *cfg) {
 		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
 		if (!is_host && be != c->backend)
 			be->rope_neox = c->m.arch_info->uses_neox_rope;
-		c->m.expert_parts[i].be	   = is_host ? NULL : be;
-		c->m.expert_parts[i].count = cfg->expert_counts[i];
+		c->m.expert_parts[i].be		  = is_host ? NULL : be;
+		c->m.expert_parts[i].count	  = cfg->expert_counts[i];
+		c->m.expert_parts[i].priority = cfg->expert_priorities[i];
 		INFO("experts: %d/layer on '%s' (%s)", cfg->expert_counts[i], is_host ? "cpu" : be->name,
 			 cfg->expert_devices[i]);
 	}
@@ -186,6 +188,17 @@ static status_code apply_layer_split(context *c, const config *cfg) {
 	return OK;
 }
 
+static void context_build_topology(context *c) {
+	backend *all[CONFIG_MAX_LAYER_DEVICES + 2];
+	int		 n = 0;
+	all[n++]   = backend_host();
+	all[n++]   = c->backend;
+	for (int i = 0; i < c->n_extra_backends; i++)
+		all[n++] = c->extra_backends[i];
+	mem_topology_build(&c->topo, all, n);
+	c->m.topo = &c->topo;
+}
+
 static void context_log_devices(context *c) {
 	for (int d = 0; d < kvcache_device_count(&c->kv); d++) {
 		backend *be	   = kvcache_device_backend(&c->kv, d);
@@ -201,7 +214,7 @@ static void context_log_devices(context *c) {
 		}
 		size_t weights = model_device_weight_bytes(&c->m, be);
 		size_t kv	   = kvcache_device_bytes(&c->kv, &c->m, d);
-		size_t avail   = backend_mem_available(be);
+		size_t avail   = mem_topology_pool_available(&c->topo, be);
 		INFO("device '%s': %d layer(s)%s, weights %.0f MB, KV %.0f MB (%d slot(s)), %.1f GB free",
 			 be->name, n, n > 0 ? "" : " (none)", weights / (1024.0 * 1024.0),
 			 kv / (1024.0 * 1024.0), kvcache_device_slots(&c->kv, d),
@@ -244,7 +257,7 @@ status_code context_init(context *c, const config *cfg) {
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
 	uint64_t load_t0 = time_us();
-	s = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack, cfg->ctx_size);
+	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack);
 	if (s != OK) {
 		ERROR("failed to parse model '%s'", cfg->model);
 		monitor_emit_load_phase_model_failed(&c->monitor, s);
@@ -264,6 +277,10 @@ status_code context_init(context *c, const config *cfg) {
 	if (s != OK)
 		goto fail_model;
 
+	context_build_topology(c);
+	report_memory(&c->m, &c->topo, c->backend->kv_alloc ? c->backend : backend_host(),
+				  cfg->ctx_size, (kv_quant_type)cfg->kv_quant);
+
 	{
 		int n_ctx_precheck = cfg->ctx_size;
 		if (n_ctx_precheck <= 0)
@@ -281,7 +298,7 @@ status_code context_init(context *c, const config *cfg) {
 		size_t		  kv_bytes_precheck =
 			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck,
 									   backend_has_cap(kv_owner_precheck, BCAP_KV_POS_CAP));
-		size_t avail_precheck = backend_mem_available(kv_owner_precheck);
+		size_t avail_precheck = mem_topology_pool_available(&c->topo, kv_owner_precheck);
 
 		size_t reserve_for_weights = 0;
 		if (kv_owner_precheck == c->backend)
@@ -351,7 +368,7 @@ status_code context_init(context *c, const config *cfg) {
 	{
 		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant,
 													 backend_has_cap(kv_owner, BCAP_KV_POS_CAP));
-		size_t avail	= backend_mem_available(kv_owner);
+		size_t avail	= mem_topology_pool_available(&c->topo, kv_owner);
 		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
 				  "backend '%s' after loading weights -- refusing to run (see "
