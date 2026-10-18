@@ -97,12 +97,9 @@ typedef struct compute_scratch {
 	float_buf gdn_alpha_host;
 	float_buf gdn_beta_host;
 	float_buf gdn_out_host;
-	float_buf op_st_in;
-	float_buf op_st_out;
-	float_buf op_st_cur;
-	float_buf op_st_coef;
 
 	moe_expert_slot	  *moe_slot_buf;
+	moe_expert_slot	  *moe_slot_dev;
 	expert_dev_scratch expert_dev;
 
 	layer_progress_cb			 layer_cb;

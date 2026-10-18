@@ -127,54 +127,58 @@ typedef struct {
 } backend_weight;
 
 typedef struct {
-	int			 dim, n_hc;
-	const float *x;
-	float		*hc;
+	int			  dim, n_hc;
+	const buffer *x;
+	buffer		 *hc;
 } hc_init_desc;
 
 typedef struct {
-	int			 dim, n_hc;
-	const float *hc;
-	float		*x;
+	int			  dim, n_hc;
+	const buffer *hc;
+	buffer		 *x;
 } hc_final_desc;
 
 typedef struct {
 	int			   dim, n_hc, sinkhorn_iters;
 	float		   norm_eps, eps;
-	const float	  *stream;
+	const buffer  *stream;
 	backend_weight fn;
-	const float	  *base, *scale;
-	float		  *x, *coef;
+	const buffer  *base, *scale;
+	buffer		  *x, *coef;
 	float		  *ws;
 } hc_pre_desc;
 
 typedef struct {
-	int			 dim, n_hc;
-	const float *sub, *coef, *hc_cur;
-	float		*hc_next;
+	int			  dim, n_hc;
+	const buffer *sub, *coef;
+	buffer		 *hc;
 } hc_post_desc;
 
 typedef struct {
-	int			   dim, n_heads, head_dim, conv_kernel;
+	int			   dim, n_heads, head_dim, conv_kernel, reset;
 	float		   gate_lower_bound, norm_eps;
-	const float	  *x;
+	const buffer  *x;
 	backend_weight wq, wk, wv, wo, f_a, f_b, g_a, g_b, beta;
-	const float	  *conv_q, *conv_k, *conv_v, *dt_bias, *ssm_a, *out_norm;
-	float		  *conv_state, *state;
-	float		  *out;
+	const buffer  *conv_q, *conv_k, *conv_v, *dt_bias, *ssm_a, *out_norm;
+	buffer		  *conv_state, *state;
+	buffer		  *out;
 	float		  *ws;
 } kda_desc;
 
 typedef struct {
 	int			   dim, n_heads, kv_lora, qk_head, v_head, q_lora, pos, n_threads;
 	float		   norm_eps;
-	const float	  *x;
+	const buffer  *x;
 	backend_weight q_a, q_b, kv_a, wo;
-	const float	  *q_a_norm, *kv_a_norm, *k_b, *v_b;
-	float		  *latent_cache;
-	float		  *out;
+	const buffer  *q_a_norm, *kv_a_norm, *k_b, *v_b;
+	buffer		  *latent_cache;
+	buffer		  *out;
 	float		  *ws;
 } mla_absorbed_desc;
+
+static inline float *buffer_f32(const buffer *b) {
+	return (float *)(b->handle ? (char *)b->handle + b->offset : (char *)b->host_ptr);
+}
 
 static inline int hc_mix_dim(int n_hc) {
 	return (2 + n_hc) * n_hc;

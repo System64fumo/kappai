@@ -2260,14 +2260,14 @@ static inline void dot_rows4_f32(const float *x, const float *rows, size_t ld, i
 	}
 }
 
-status_code cpu_hc_init(backend *self, const hc_init_desc *d) {
+status_code cpu_hc_init(backend *self, const hc_init_host_desc *d) {
 	(void)self;
 	for (int h = 0; h < d->n_hc; h++)
 		memcpy(d->hc + (size_t)h * d->dim, d->x, (size_t)d->dim * sizeof(float));
 	return OK;
 }
 
-status_code cpu_hc_final(backend *self, const hc_final_desc *d) {
+status_code cpu_hc_final(backend *self, const hc_final_host_desc *d) {
 	(void)self;
 	const float32x4_t n_v = vdupq_n_f32((float)d->n_hc);
 	int				  i	  = 0;
@@ -2286,7 +2286,7 @@ status_code cpu_hc_final(backend *self, const hc_final_desc *d) {
 	return OK;
 }
 
-status_code cpu_hc_post(backend *self, const hc_post_desc *d) {
+status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 	(void)self;
 	const int	 hc	  = d->n_hc;
 	const int	 dim  = d->dim;
@@ -2336,7 +2336,7 @@ static void hc_sinkhorn_neon(float comb[16], int iters, float eps) {
 		vst1q_f32(comb + src * 4, row[src]);
 }
 
-status_code cpu_hc_pre(backend *self, const hc_pre_desc *d) {
+status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 	const int hc = d->n_hc, dim = d->dim, flat = hc * dim;
 	if (hc != 4)
 		return ERR_UNSUPPORTED;
@@ -2541,7 +2541,7 @@ static void kda_heads_neon(int begin, int end, int tid, void *arg) {
 	}
 }
 
-status_code cpu_kda(backend *self, const kda_desc *d) {
+status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	const int dim = d->dim, H = d->n_heads, S = d->head_dim, D = H * S;
 	const int K = d->conv_kernel, hist = K - 1;
 
@@ -2732,7 +2732,7 @@ static void mla_attn_heads_neon(int begin, int end, int tid, void *arg) {
 	}
 }
 
-status_code cpu_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
+status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
 	const int dim = d->dim, H = d->n_heads, R = d->kv_lora;
 	const int qk = d->qk_head, vh = d->v_head, ql = d->q_lora;
 	const int n_pos			 = d->pos + 1;

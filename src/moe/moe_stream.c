@@ -2714,6 +2714,13 @@ status_code moe_stream_preload_all(struct model *m) {
 	return OK;
 }
 
+void moe_stream_tier_maintain(struct model *m, int layer) {
+	moe_stream_cache *c = m ? m->moe_cache : NULL;
+	if (!c || !m->moe_stream_enabled || layer < 0 || layer >= m->n_layers)
+		return;
+	tier_maintain(m, c, layer, &c->layers[layer]);
+}
+
 backend *moe_stream_expert_owner(const struct model *m, int layer, int eid) {
 	if (!m || !m->moe_cache || layer < 0 || layer >= m->n_layers || eid < 0 ||
 		eid >= m->moe.n_experts)

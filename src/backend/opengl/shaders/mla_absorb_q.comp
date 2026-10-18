@@ -1,0 +1,28 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer KbBuf {
+	float k_b[];
+};
+layout(std430, binding = 1) readonly buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 2) writeonly buffer QAbsBuf {
+	float q_abs[];
+};
+layout(location = 0) uniform int u_total;
+layout(location = 1) uniform int u_kv_lora;
+layout(location = 2) uniform int u_qk_head;
+
+void main(void) {
+	int idx = int(gl_GlobalInvocationID.x);
+	if (idx >= u_total)
+		return;
+	int	  h	  = idx / u_kv_lora;
+	int	  row = idx * u_qk_head;
+	int	  qh  = h * u_qk_head;
+	float s	  = 0.0;
+	for (int i = 0; i < u_qk_head; i++)
+		s += k_b[row + i] * q[qh + i];
+	q_abs[idx] = s;
+}

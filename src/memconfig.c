@@ -157,9 +157,24 @@ size_t model_kv_slot_bytes(const model *m, int n_ctx, kv_quant_type kv_quant, in
 	return (size_t)kv_heads * (size_t)hdim * (size_t)pcap * sizeof(uint16_t) * 2;
 }
 
+static size_t model_kda_state_bytes(const model *m, int n_ctx) {
+	const size_t conv_floats =
+		(size_t)m->hybrid.conv_channels * (size_t)(m->hybrid.conv_kernel - 1);
+	const size_t recurrent_floats = (size_t)m->hybrid.n_value_heads * (size_t)m->hybrid.state_size *
+									(size_t)m->hybrid.value_head_dim;
+	const size_t latent_floats	  = (size_t)n_ctx * (size_t)m->mla.kv_lora;
+	size_t		 total			  = 0;
+	for (int i = 0; i < m->n_layers; i++)
+		total += (model_layer_is_recurrent(m, i) ? conv_floats + recurrent_floats : latent_floats) *
+				 sizeof(float);
+	return total;
+}
+
 size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
 								  int compacted) {
 	size_t kv_cache = 0;
+	if (m->arch_info->is_kda)
+		return model_kda_state_bytes(m, n_ctx);
 	if (m->arch_info->is_mla) {
 		kv_cache = ((size_t)m->mla.kv_lora + (size_t)m->mla.qk_rope) * (size_t)n_ctx *
 				   (size_t)m->n_layers * sizeof(float);

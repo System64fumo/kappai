@@ -1,0 +1,28 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer XBuf {
+	float x[];
+};
+layout(location = 0) uniform int u_head_dim;
+layout(location = 1) uniform float u_eps;
+
+shared float s_ss[64];
+
+void main(void) {
+	int	  tid  = int(gl_LocalInvocationID.x);
+	int	  base = int(gl_WorkGroupID.x) * u_head_dim;
+	float my   = 0.0;
+	for (int i = tid; i < u_head_dim; i += 64)
+		my += x[base + i] * x[base + i];
+	s_ss[tid] = my;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_ss[tid] += s_ss[tid + s];
+		barrier();
+	}
+	float inv = 1.0 / sqrt(s_ss[0] + u_eps);
+	for (int i = tid; i < u_head_dim; i += 64)
+		x[base + i] *= inv;
+}

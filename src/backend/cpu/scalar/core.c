@@ -3212,14 +3212,14 @@ static void rmsnorm_inplace(float *x, const float *w, int n, float eps) {
 		x[i] = x[i] * inv * (w ? w[i] : 1.0f);
 }
 
-__attribute__((weak)) status_code cpu_hc_init(backend *self, const hc_init_desc *d) {
+__attribute__((weak)) status_code cpu_hc_init(backend *self, const hc_init_host_desc *d) {
 	(void)self;
 	for (int h = 0; h < d->n_hc; h++)
 		memcpy(d->hc + (size_t)h * d->dim, d->x, (size_t)d->dim * sizeof(float));
 	return OK;
 }
 
-__attribute__((weak)) status_code cpu_hc_final(backend *self, const hc_final_desc *d) {
+__attribute__((weak)) status_code cpu_hc_final(backend *self, const hc_final_host_desc *d) {
 	(void)self;
 	for (int i = 0; i < d->dim; i++) {
 		float acc = 0.0f;
@@ -3265,7 +3265,7 @@ static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, floa
 	}
 }
 
-__attribute__((weak)) status_code cpu_hc_pre(backend *self, const hc_pre_desc *d) {
+__attribute__((weak)) status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 	const int hc = d->n_hc, dim = d->dim, flat = hc * dim;
 	if (hc != HC_SUPPORTED)
 		return ERR_UNSUPPORTED;
@@ -3298,7 +3298,7 @@ __attribute__((weak)) status_code cpu_hc_pre(backend *self, const hc_pre_desc *d
 	return OK;
 }
 
-__attribute__((weak)) status_code cpu_hc_post(backend *self, const hc_post_desc *d) {
+__attribute__((weak)) status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 	(void)self;
 	const int	 hc	  = d->n_hc;
 	const int	 dim  = d->dim;
@@ -3387,7 +3387,7 @@ static void kda_heads(int begin, int end, int tid, void *arg) {
 	}
 }
 
-__attribute__((weak)) status_code cpu_kda(backend *self, const kda_desc *d) {
+__attribute__((weak)) status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	const int dim = d->dim, H = d->n_heads, S = d->head_dim, D = H * S;
 	const int K = d->conv_kernel, hist = K - 1;
 
@@ -3506,7 +3506,7 @@ static void mla_heads(int begin, int end, int tid, void *arg) {
 	}
 }
 
-__attribute__((weak)) status_code cpu_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
+__attribute__((weak)) status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
 	const int dim = d->dim, H = d->n_heads, R = d->kv_lora;
 	const int qk = d->qk_head, vh = d->v_head, ql = d->q_lora;
 	const int n_pos			 = d->pos + 1;
@@ -3552,6 +3552,118 @@ __attribute__((weak)) status_code cpu_mla_absorbed(backend *self, const mla_abso
 		mla_heads(0, H, -1, &job);
 
 	return matmul_vec(self, &d->wo, ho, d->out, dim, H * vh);
+}
+
+static status_code cpu_hc_init_buf(backend *self, const hc_init_desc *d) {
+	hc_init_host_desc h = {d->dim, d->n_hc, buffer_f32(d->x), buffer_f32(d->hc)};
+	return cpu_hc_init(self, &h);
+}
+
+static status_code cpu_hc_final_buf(backend *self, const hc_final_desc *d) {
+	hc_final_host_desc h = {d->dim, d->n_hc, buffer_f32(d->hc), buffer_f32(d->x)};
+	return cpu_hc_final(self, &h);
+}
+
+static status_code cpu_hc_pre_buf(backend *self, const hc_pre_desc *d) {
+	float			*ws = d->ws ? d->ws : xmalloc(hc_pre_ws_floats(d) * sizeof(float));
+	hc_pre_host_desc h	= {.dim			   = d->dim,
+						   .n_hc		   = d->n_hc,
+						   .sinkhorn_iters = d->sinkhorn_iters,
+						   .norm_eps	   = d->norm_eps,
+						   .eps			   = d->eps,
+						   .stream		   = buffer_f32(d->stream),
+						   .fn			   = d->fn,
+						   .base		   = buffer_f32(d->base),
+						   .scale		   = buffer_f32(d->scale),
+						   .x			   = buffer_f32(d->x),
+						   .coef		   = buffer_f32(d->coef),
+						   .ws			   = ws};
+	status_code		 st = cpu_hc_pre(self, &h);
+	if (!d->ws)
+		free(ws);
+	return st;
+}
+
+static status_code cpu_hc_post_buf(backend *self, const hc_post_desc *d) {
+	const size_t	  n	   = (size_t)d->n_hc * d->dim;
+	float			 *cur  = buffer_f32(d->hc);
+	float			 *next = xmalloc(n * sizeof(float));
+	hc_post_host_desc h	   = {d->dim, d->n_hc, buffer_f32(d->sub), buffer_f32(d->coef), cur, next};
+	status_code		  st   = cpu_hc_post(self, &h);
+	if (st == OK)
+		memcpy(cur, next, n * sizeof(float));
+	free(next);
+	return st;
+}
+
+static status_code cpu_kda_buf(backend *self, const kda_desc *d) {
+	const size_t D	   = (size_t)d->n_heads * d->head_dim;
+	float		*conv  = buffer_f32(d->conv_state);
+	float		*state = buffer_f32(d->state);
+	if (d->reset) {
+		memset(conv, 0, 3 * D * (size_t)(d->conv_kernel - 1) * sizeof(float));
+		memset(state, 0, (size_t)d->n_heads * d->head_dim * d->head_dim * sizeof(float));
+	}
+	float		 *ws = d->ws ? d->ws : xmalloc(kda_ws_floats(d) * sizeof(float));
+	kda_host_desc h	 = {.dim			  = d->dim,
+						.n_heads		  = d->n_heads,
+						.head_dim		  = d->head_dim,
+						.conv_kernel	  = d->conv_kernel,
+						.gate_lower_bound = d->gate_lower_bound,
+						.norm_eps		  = d->norm_eps,
+						.x				  = buffer_f32(d->x),
+						.wq				  = d->wq,
+						.wk				  = d->wk,
+						.wv				  = d->wv,
+						.wo				  = d->wo,
+						.f_a			  = d->f_a,
+						.f_b			  = d->f_b,
+						.g_a			  = d->g_a,
+						.g_b			  = d->g_b,
+						.beta			  = d->beta,
+						.conv_q			  = buffer_f32(d->conv_q),
+						.conv_k			  = buffer_f32(d->conv_k),
+						.conv_v			  = buffer_f32(d->conv_v),
+						.dt_bias		  = buffer_f32(d->dt_bias),
+						.ssm_a			  = buffer_f32(d->ssm_a),
+						.out_norm		  = buffer_f32(d->out_norm),
+						.conv_state		  = conv,
+						.state			  = state,
+						.out			  = buffer_f32(d->out),
+						.ws				  = ws};
+	status_code	  st = cpu_kda(self, &h);
+	if (!d->ws)
+		free(ws);
+	return st;
+}
+
+static status_code cpu_mla_absorbed_buf(backend *self, const mla_absorbed_desc *d) {
+	float				  *ws = d->ws ? d->ws : xmalloc(mla_absorbed_ws_floats(d) * sizeof(float));
+	mla_absorbed_host_desc h  = {.dim		   = d->dim,
+								 .n_heads	   = d->n_heads,
+								 .kv_lora	   = d->kv_lora,
+								 .qk_head	   = d->qk_head,
+								 .v_head	   = d->v_head,
+								 .q_lora	   = d->q_lora,
+								 .pos		   = d->pos,
+								 .n_threads	   = d->n_threads,
+								 .norm_eps	   = d->norm_eps,
+								 .x			   = buffer_f32(d->x),
+								 .q_a		   = d->q_a,
+								 .q_b		   = d->q_b,
+								 .kv_a		   = d->kv_a,
+								 .wo		   = d->wo,
+								 .q_a_norm	   = buffer_f32(d->q_a_norm),
+								 .kv_a_norm	   = buffer_f32(d->kv_a_norm),
+								 .k_b		   = buffer_f32(d->k_b),
+								 .v_b		   = buffer_f32(d->v_b),
+								 .latent_cache = buffer_f32(d->latent_cache),
+								 .out		   = buffer_f32(d->out),
+								 .ws		   = ws};
+	status_code			   st = cpu_mla_absorbed(self, &h);
+	if (!d->ws)
+		free(ws);
+	return st;
 }
 
 status_code cpu_backend_fill(backend *out) {
@@ -3623,12 +3735,12 @@ status_code cpu_backend_fill(backend *out) {
 	out->matmul_ffn_down				 = cpu_matmul_ffn_down;
 	out->matmul_ffn_down_batch			 = cpu_matmul_ffn_down_batch;
 	out->kv_free						 = cpu_kv_free;
-	out->hc_init						 = cpu_hc_init;
-	out->hc_pre							 = cpu_hc_pre;
-	out->hc_post						 = cpu_hc_post;
-	out->hc_final						 = cpu_hc_final;
-	out->kda							 = cpu_kda;
-	out->mla_absorbed					 = cpu_mla_absorbed;
+	out->hc_init						 = cpu_hc_init_buf;
+	out->hc_pre							 = cpu_hc_pre_buf;
+	out->hc_post						 = cpu_hc_post_buf;
+	out->hc_final						 = cpu_hc_final_buf;
+	out->kda							 = cpu_kda_buf;
+	out->mla_absorbed					 = cpu_mla_absorbed_buf;
 	return OK;
 }
 

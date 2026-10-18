@@ -1,0 +1,69 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer StateBuf {
+	float state[];
+};
+layout(std430, binding = 1) readonly buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 2) readonly buffer KBuf {
+	float k[];
+};
+layout(std430, binding = 3) readonly buffer VBuf {
+	float v[];
+};
+layout(std430, binding = 4) readonly buffer GBuf {
+	float g[];
+};
+layout(std430, binding = 5) readonly buffer BetaBuf {
+	float beta[];
+};
+layout(std430, binding = 6) writeonly buffer OBuf {
+	float o[];
+};
+layout(location = 0) uniform int u_head_dim;
+layout(location = 1) uniform int u_reset;
+
+shared float s_red[64];
+
+float reduce_sum(int tid, float v_in) {
+	s_red[tid] = v_in;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_red[tid] += s_red[tid + s];
+		barrier();
+	}
+	float r = s_red[0];
+	barrier();
+	return r;
+}
+
+void main(void) {
+	int tid = int(gl_LocalInvocationID.x);
+	int S	= u_head_dim;
+	int h	= int(gl_WorkGroupID.x) / S;
+	int r	= int(gl_WorkGroupID.x) % S;
+	int row = (h * S + r) * S;
+	int hv	= h * S;
+
+	float dot_k = 0.0;
+	for (int i = tid; i < S; i += 64) {
+		float cur = u_reset != 0 ? 0.0 : state[row + i] * exp(g[hv + i]);
+		dot_k += cur * k[hv + i];
+	}
+	float dot	= reduce_sum(tid, dot_k);
+	float delta = (v[hv + r] - dot) * beta[h];
+
+	float dot_q = 0.0;
+	for (int i = tid; i < S; i += 64) {
+		float cur = u_reset != 0 ? 0.0 : state[row + i] * exp(g[hv + i]);
+		cur += delta * k[hv + i];
+		state[row + i] = cur;
+		dot_q += cur * q[hv + i];
+	}
+	float out_dot = reduce_sum(tid, dot_q);
+	if (tid == 0)
+		o[hv + r] = out_dot * inversesqrt(float(S));
+}

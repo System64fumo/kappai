@@ -170,6 +170,8 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	s->moe_shared_y.p	 = NULL;
 	free(s->moe_slot_buf);
 	s->moe_slot_buf = NULL;
+	free(s->moe_slot_dev);
+	s->moe_slot_dev = NULL;
 	expert_dev_scratch_release(&s->expert_dev);
 
 #define FREE_FLOAT_BUF(field)                                                                      \
@@ -187,10 +189,6 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	FREE_FLOAT_BUF(gdn_alpha_host);
 	FREE_FLOAT_BUF(gdn_beta_host);
 	FREE_FLOAT_BUF(gdn_out_host);
-	FREE_FLOAT_BUF(op_st_in);
-	FREE_FLOAT_BUF(op_st_out);
-	FREE_FLOAT_BUF(op_st_cur);
-	FREE_FLOAT_BUF(op_st_coef);
 #undef FREE_FLOAT_BUF
 
 	if (s->bs) {

@@ -11,14 +11,17 @@ typedef struct kvcache_mla {
 } kvcache_mla;
 
 typedef struct kvcache_hybrid {
-	float *conv_state;
-	float *recurrent_state;
-	size_t conv_stride;
-	size_t recurrent_stride;
-	size_t conv_total;
-	size_t recurrent_total;
-	float *mla_latent;
-	size_t mla_latent_stride;
+	float  *conv_state;
+	float  *recurrent_state;
+	size_t	conv_stride;
+	size_t	recurrent_stride;
+	size_t	conv_total;
+	size_t	recurrent_total;
+	size_t	mla_latent_stride;
+	int		n_layers;
+	buffer *conv_buf;
+	buffer *state_buf;
+	buffer *latent_buf;
 } kvcache_hybrid;
 
 #define KV_MAX_MIRRORS 7

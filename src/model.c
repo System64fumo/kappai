@@ -1094,6 +1094,10 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 			ref->host_ptr	  = NULL;
 			return OK;
 		}
+		const void *orig = ref->host_ptr;
+		dequant_weight_to_f32(target, &ref->host_ptr, &ref->type, ref->dequant_cols,
+							  ref->dequant_rows);
+		release_original_weight_data(m, orig, bytes);
 	}
 	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
 }
@@ -1290,6 +1294,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 					   WCLASS_MATMUL);
 			UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
 					   WCLASS_MATMUL);
+		} else {
+			UPLOAD(&L->k_b_w, L->k_b_w.type, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora,
+				   m->n_heads, WCLASS_MATMUL);
+			UPLOAD(&L->v_b_w, L->v_b_w.type, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head,
+				   m->n_heads, WCLASS_MATMUL);
 		}
 		UPLOAD(&L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
 		int wo_in = m->n_heads * m->mla.v_head;

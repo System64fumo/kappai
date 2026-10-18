@@ -285,17 +285,12 @@ static status_code recipe_require_capability(const struct model *m, const backen
 
 static const char *recipe_op_missing_fn(const backend *a, op_kind k);
 
-static status_code recipe_require_host_fallback(const model_recipe *r, const struct model *m,
-												op_kind kind) {
+static status_code recipe_require_native(const model_recipe *r, const struct model *m,
+										 op_kind kind) {
 	if (!recipe_uses_op(r, m, kind))
 		return OK;
-	const backend *a	   = m->backend;
-	const char	  *missing = recipe_op_missing_fn(a, kind);
-	if (!missing)
-		return OK;
-	backend *host = backend_host();
-	return recipe_require_capability(m, a, missing, 0,
-									 host && host != a && !recipe_op_missing_fn(host, kind), 1);
+	const char *missing = recipe_op_missing_fn(m->backend, kind);
+	return missing ? recipe_require_capability(m, m->backend, missing, 0, 0, 0) : OK;
 }
 
 static status_code recipe_check_backend_capabilities(const model_recipe *r, const struct model *m) {
@@ -316,10 +311,10 @@ static status_code recipe_check_backend_capabilities(const model_recipe *r, cons
 		if (s != OK)
 			return s;
 	}
-	static const op_kind HOST_FALLBACK_OPS[] = {OP_HC_INIT,	 OP_HC_PRE, OP_HC_POST,
-												OP_HC_FINAL, OP_KDA,	OP_MLA_ABSORBED};
-	for (size_t i = 0; i < ARRAY_LEN(HOST_FALLBACK_OPS); i++) {
-		s = recipe_require_host_fallback(r, m, HOST_FALLBACK_OPS[i]);
+	static const op_kind NATIVE_REQUIRED_OPS[] = {OP_HC_INIT,  OP_HC_PRE, OP_HC_POST,
+												  OP_HC_FINAL, OP_KDA,	  OP_MLA_ABSORBED};
+	for (size_t i = 0; i < ARRAY_LEN(NATIVE_REQUIRED_OPS); i++) {
+		s = recipe_require_native(r, m, NATIVE_REQUIRED_OPS[i]);
 		if (s != OK)
 			return s;
 	}
@@ -4608,10 +4603,21 @@ static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, 
 	return OK;
 }
 
-static status_code moe_run_on_device(struct model *m, int li, backend *eb,
-									 struct compute_scratch *s, const float *xh, const int *ids_dev,
-									 const float *weights, moe_expert_slot *slot_buf,
-									 const moe_exec_plan *plan, float *out_host) {
+#define MOE_MAX_DEV_GROUPS 4
+
+typedef struct {
+	backend			*eb;
+	moe_expert_slot *slots;
+} moe_dev_group;
+
+typedef struct {
+	moe_dev_group groups[MOE_MAX_DEV_GROUPS];
+	int			  n;
+} moe_dev_pending;
+
+static status_code moe_dev_submit(struct model *m, int li, backend *eb, struct compute_scratch *s,
+								  const float *xh, const int *ids_dev, const float *weights,
+								  moe_expert_slot *slot_buf, const moe_exec_plan *plan) {
 	int			dim = plan->dim;
 	int			K	= plan->K;
 	status_code st	= moe_stream_resolve(m, li, ids_dev, K, slot_buf);
@@ -4629,6 +4635,11 @@ static status_code moe_run_on_device(struct model *m, int li, backend *eb,
 		if (slot_buf[k].eid < 0 || !moe_slot_present(&slot_buf[k]))
 			continue;
 		if (!slot_buf[k].dev_ready || slot_buf[k].dev_gate.owner != eb) {
+			backend_report_host_fallback(
+				eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
+				"layer %d expert %d slot %s (dev_ready=%d)", li, slot_buf[k].eid,
+				slot_buf[k].dev_ready ? "owned by another backend" : "not resident on device",
+				(int)slot_buf[k].dev_ready);
 			st = ERR_UNSUPPORTED;
 			break;
 		}
@@ -4648,19 +4659,58 @@ static status_code moe_run_on_device(struct model *m, int li, backend *eb,
 		};
 		st = eb->moe_expert_ffn(eb, &e->x, &e->out, &ge, dim, plan->I);
 	}
+	if (st != OK) {
+		moe_stream_release_slots(m, li, slot_buf, K);
+		return st;
+	}
+	if (eb->submit)
+		eb->submit(eb);
+	return OK;
+}
+
+static status_code moe_dev_collect(struct model *m, int li, backend *eb, struct compute_scratch *s,
+								   moe_expert_slot *slot_buf, int K, int dim, float *out_host) {
+	expert_dev_entry *e	 = expert_dev_scratch_get(&s->expert_dev, eb, (size_t)dim);
+	status_code		  st = e ? OK : ERR_OUT_OF_MEMORY;
 	if (st == OK)
 		st = eb->buffer_read_f32(eb, &e->out, out_host, dim);
 	moe_stream_release_slots(m, li, slot_buf, K);
 	return st;
 }
 
-static int moe_experts_split(struct model *m, int li, backend *a, struct compute_scratch *s,
-							 const buffer *xb, const int *expert_ids, const float *weights,
-							 moe_expert_slot *slot_buf, const moe_exec_plan *plan, int *host_ids) {
+static status_code moe_dev_finish(moe_dev_pending *pend, struct model *m, int li,
+								  struct compute_scratch *s, int K, int dim, int discard) {
+	float	   *acc = float_buf_ensure(&s->expert_dev.acc, (size_t)dim);
+	float	   *tmp = float_buf_ensure(&s->expert_dev.tmp, (size_t)dim);
+	status_code st	= OK;
+	memset(acc, 0, (size_t)dim * sizeof(float));
+	for (int g = 0; g < pend->n; g++) {
+		backend	   *eb = pend->groups[g].eb;
+		status_code gs = moe_dev_collect(m, li, eb, s, pend->groups[g].slots, K, dim, tmp);
+		if (gs != OK) {
+			ERROR("moe expert ffn readback on '%s' layer %d failed (%s)", eb->name ? eb->name : "?",
+				  li, status_str(gs));
+			if (st == OK)
+				st = gs;
+			continue;
+		}
+		if (!discard)
+			for (int d = 0; d < dim; d++)
+				acc[d] += tmp[d];
+	}
+	pend->n = 0;
+	return st;
+}
+
+static int moe_experts_split_begin(struct model *m, int li, backend *a, struct compute_scratch *s,
+								   const buffer *xb, const int *expert_ids, const float *weights,
+								   const moe_exec_plan *plan, int *host_ids,
+								   moe_dev_pending *pend) {
 	int		 dim = plan->dim;
 	int		 K	 = plan->K;
 	backend *owners[MOE_MAX_TOPK];
 	int		 any = 0;
+	moe_stream_tier_maintain(m, li);
 	for (int k = 0; k < K; k++) {
 		owners[k]	= moe_stream_expert_owner(m, li, expert_ids[k]);
 		host_ids[k] = owners[k] ? -1 : expert_ids[k];
@@ -4669,16 +4719,15 @@ static int moe_experts_split(struct model *m, int li, backend *a, struct compute
 	if (!any)
 		return 0;
 
-	expert_dev_scratch *ds	= &s->expert_dev;
-	float			   *acc = float_buf_ensure(&ds->acc, (size_t)dim);
-	float			   *tmp = float_buf_ensure(&ds->tmp, (size_t)dim);
-	float			   *xh	= float_buf_ensure(&s->moe_xb_f, (size_t)dim);
-	memset(acc, 0, (size_t)dim * sizeof(float));
+	float *xh = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
 	if (a->buffer_read_f32(a, xb, xh, dim) != OK) {
 		for (int k = 0; k < K; k++)
 			host_ids[k] = expert_ids[k];
 		return 0;
 	}
+	if (!s->moe_slot_dev)
+		s->moe_slot_dev =
+			xcalloc((size_t)MOE_MAX_TOPK * MOE_MAX_DEV_GROUPS, sizeof(moe_expert_slot));
 
 	int n_dev = 0;
 	for (int k0 = 0; k0 < K; k0++) {
@@ -4688,7 +4737,13 @@ static int moe_experts_split(struct model *m, int li, backend *a, struct compute
 		int ids_dev[MOE_MAX_TOPK];
 		for (int k = 0; k < K; k++)
 			ids_dev[k] = owners[k] == eb ? expert_ids[k] : -1;
-		status_code st = moe_run_on_device(m, li, eb, s, xh, ids_dev, weights, slot_buf, plan, tmp);
+
+		status_code		 st	   = ERR_UNSUPPORTED;
+		moe_expert_slot *slots = NULL;
+		if (pend->n < MOE_MAX_DEV_GROUPS) {
+			slots = s->moe_slot_dev + (size_t)pend->n * MOE_MAX_TOPK;
+			st	  = moe_dev_submit(m, li, eb, s, xh, ids_dev, weights, slots, plan);
+		}
 		for (int k = 0; k < K; k++) {
 			if (owners[k] != eb)
 				continue;
@@ -4698,14 +4753,22 @@ static int moe_experts_split(struct model *m, int li, backend *a, struct compute
 			else
 				host_ids[k] = expert_ids[k];
 		}
-		if (st == OK)
-			for (int d = 0; d < dim; d++)
-				acc[d] += tmp[d];
-		else
-			WARN("moe expert ffn on '%s' failed (st=%d) -- falling back to cpu",
-				 eb->name ? eb->name : "?", (int)st);
+		if (st == OK) {
+			pend->groups[pend->n++] = (moe_dev_group){.eb = eb, .slots = slots};
+		} else {
+			WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
+				 eb->name ? eb->name : "?", li, status_str(st));
+		}
 	}
 	return n_dev;
+}
+
+static int moe_all_experts_on(struct model *m, int li, backend *a, const int *expert_ids, int K) {
+	moe_stream_tier_maintain(m, li);
+	for (int k = 0; k < K; k++)
+		if (expert_ids[k] < 0 || moe_stream_expert_owner(m, li, expert_ids[k]) != a)
+			return 0;
+	return 1;
 }
 
 static status_code op_moe_experts(exec_ctx *ctx) {
@@ -4721,13 +4784,14 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	status_code st = OK;
 
-	int	   out_is_host = out_buf->host_ptr != NULL || !out_buf->owner ||
-						 backend_has_cap(out_buf->owner, BCAP_IS_HOST);
-	float  local_outf[MOE_MAX_DIM_STACK];
-	float *heap_outf = NULL;
-	float *dev_acc	 = NULL;
-	int	   host_ids[MOE_MAX_TOPK];
-	float *outf;
+	int				out_is_host = out_buf->host_ptr != NULL || !out_buf->owner ||
+								  backend_has_cap(out_buf->owner, BCAP_IS_HOST);
+	float			local_outf[MOE_MAX_DIM_STACK];
+	float		   *heap_outf = NULL;
+	float		   *dev_acc	  = NULL;
+	int				host_ids[MOE_MAX_TOPK];
+	moe_dev_pending dev_pend = {0};
+	float		   *outf;
 	if (out_is_host) {
 		outf = (float *)(out_buf->host_ptr ? out_buf->host_ptr : out_buf->handle);
 		if (!outf) {
@@ -4774,7 +4838,8 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	buffer *xb_dev = &slots[op->in[0]];
 	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_expert_ffn &&
-		m->layers[li].experts_resident && xb_dev->owner == a && out_buf->owner == a) {
+		m->layers[li].experts_resident && xb_dev->owner == a && out_buf->owner == a &&
+		moe_all_experts_on(m, li, a, expert_ids, K)) {
 		status_code gst	   = moe_stream_resolve(m, li, expert_ids, K, slot_buf);
 		int			dev_ok = (gst == OK);
 		for (int k = 0; dev_ok && k < K; k++)
@@ -4813,18 +4878,19 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	if (m->layers[li].experts_resident &&
-		moe_experts_split(m, li, a, s, xb_dev, expert_ids, weights, slot_buf, &plan, host_ids) >
-			0) {
-		dev_acc	   = s->expert_dev.acc.p;
+		moe_experts_split_begin(m, li, a, s, xb_dev, expert_ids, weights, &plan, host_ids,
+								&dev_pend) > 0) {
 		expert_ids = host_ids;
 		int n_host = 0;
 		for (int k = 0; k < K; k++)
 			n_host += host_ids[k] >= 0;
 		if (n_host == 0) {
-			memcpy(outf, dev_acc, (size_t)dim * sizeof(float));
-			st = OK;
+			st = moe_dev_finish(&dev_pend, m, li, s, K, dim, 0);
+			if (st == OK)
+				memcpy(outf, s->expert_dev.acc.p, (size_t)dim * sizeof(float));
 			goto writeback;
 		}
+		dev_acc = s->expert_dev.acc.p;
 	}
 
 	monitor_emit_moe_experts(g_monitor, li, -1, expert_ids, weights, K);
@@ -4911,6 +4977,12 @@ cleanup:
 	}
 	moe_stream_release_slots(m, li, slot_buf, K);
 
+	if (dev_pend.n > 0) {
+		status_code dst = moe_dev_finish(&dev_pend, m, li, s, K, dim, st != OK);
+		if (st == OK)
+			st = dst;
+		dev_acc = s->expert_dev.acc.p;
+	}
 	if (dev_acc && st == OK)
 		for (int d = 0; d < dim; d++)
 			outf[d] += dev_acc[d];
@@ -4918,6 +4990,8 @@ cleanup:
 	goto writeback;
 
 zero_fail:
+	if (dev_pend.n > 0)
+		(void)moe_dev_finish(&dev_pend, m, li, s, K, dim, 1);
 	for (int d = 0; d < dim; d++)
 		outf[d] = 0.0f;
 
@@ -4980,11 +5054,10 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 		}
 		if (st != OK)
 			goto done;
-		buffer up_w_buf = buffer_slice(plan.up_w, 0, plan.up_w->size - plan.up_w->offset);
 		if (share_q8) {
-			st = a->matmul_qonly(a, &up_w_buf, up_type, &xb_q8, up_q8, up_buf, sh_inter, dim, 1);
+			st = a->matmul_qonly(a, plan.up_w, up_type, &xb_q8, up_q8, up_buf, sh_inter, dim, 1);
 		} else {
-			st = a->matmul(a, &up_w_buf, plan.up_type, xb, up_buf, sh_inter, dim);
+			st = a->matmul(a, plan.up_w, plan.up_type, xb, up_buf, sh_inter, dim);
 		}
 		if (st != OK)
 			goto done;
@@ -5744,131 +5817,83 @@ static backend_weight weight_view(const weight_ref *w) {
 
 static status_code op_hc_init(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
-	backend *t = OP_BACKEND(a, hc_init);
-	if (!t->hc_init)
+	if (!a->hc_init)
 		return ERR_UNSUPPORTED;
-	const int	 dim  = ctx->m->dim;
-	const int	 n_hc = ctx->m->kda.hc_count;
-	const float *x	  = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, dim);
-	float		*hc	  = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->op_st_out, n_hc * dim);
-	if (!x || !hc)
-		return ERR_UNSUPPORTED;
-	hc_init_desc d	= {.dim = dim, .n_hc = n_hc, .x = x, .hc = hc};
-	status_code	 st = t->hc_init(t, &d);
-	return st == OK ? recipe_slot_write_commit(ctx, ctx->op->out, hc, n_hc * dim) : st;
+	hc_init_desc d = {.dim	= ctx->m->dim,
+					  .n_hc = ctx->m->kda.hc_count,
+					  .x	= exec_slot(ctx, ctx->op->in[0]),
+					  .hc	= exec_slot(ctx, ctx->op->out)};
+	return a->hc_init(a, &d);
 }
 
 static status_code op_hc_final(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
-	backend *t = OP_BACKEND(a, hc_final);
-	if (!t->hc_final)
+	if (!a->hc_final)
 		return ERR_UNSUPPORTED;
-	const int	 dim  = ctx->m->dim;
-	const int	 n_hc = ctx->m->kda.hc_count;
-	const float *hc	  = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, n_hc * dim);
-	float		*x	  = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->op_st_out, dim);
-	if (!x || !hc)
-		return ERR_UNSUPPORTED;
-	hc_final_desc d	 = {.dim = dim, .n_hc = n_hc, .hc = hc, .x = x};
-	status_code	  st = t->hc_final(t, &d);
-	return st == OK ? recipe_slot_write_commit(ctx, ctx->op->out, x, dim) : st;
+	hc_final_desc d = {.dim	 = ctx->m->dim,
+					   .n_hc = ctx->m->kda.hc_count,
+					   .hc	 = exec_slot(ctx, ctx->op->in[0]),
+					   .x	 = exec_slot(ctx, ctx->op->out)};
+	return a->hc_final(a, &d);
 }
 
 static status_code op_hc_pre(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
-	backend *t = OP_BACKEND(a, hc_pre);
-	if (!t->hc_pre)
+	if (!a->hc_pre)
 		return ERR_UNSUPPORTED;
-	const model			*m		= ctx->m;
-	const layer_weights *L		= &m->layers[ctx->li];
-	const bool			 attn	= ctx->op->w_idx == WIDX_HC_ATTN_FN;
-	const int			 dim	= m->dim;
-	const int			 n_hc	= m->kda.hc_count;
-	const int			 coef_n = n_hc + n_hc * n_hc;
-	const float *stream = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, n_hc * dim);
-	float		*x		= recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->op_st_out, dim);
-	float *coef = recipe_slot_write_stage(ctx, RECIPE_SLOT_HC_COEF, &ctx->s->op_st_coef, coef_n);
-	if (!stream || !x || !coef)
-		return ERR_UNSUPPORTED;
-
-	const float *base =
-		(const float *)(attn ? L->hc_attn_base_w.host_ptr : L->hc_ffn_base_w.host_ptr);
-	const float *scale =
-		(const float *)(attn ? L->hc_attn_scale_w.host_ptr : L->hc_ffn_scale_w.host_ptr);
-	if (!base || !scale)
-		return ERR_UNSUPPORTED;
-
-	hc_pre_desc d = {
-		.dim			= dim,
-		.n_hc			= n_hc,
+	const model			*m	   = ctx->m;
+	const layer_weights *L	   = &m->layers[ctx->li];
+	const bool			 attn  = ctx->op->w_idx == WIDX_HC_ATTN_FN;
+	const weight_ref	*fn	   = attn ? &L->hc_attn_fn_w : &L->hc_ffn_fn_w;
+	const weight_ref	*base  = attn ? &L->hc_attn_base_w : &L->hc_ffn_base_w;
+	const weight_ref	*scale = attn ? &L->hc_attn_scale_w : &L->hc_ffn_scale_w;
+	hc_pre_desc			 d	   = {
+		.dim			= m->dim,
+		.n_hc			= m->kda.hc_count,
 		.sinkhorn_iters = m->kda.hc_sinkhorn_iters,
 		.norm_eps		= m->norm_eps,
 		.eps			= m->kda.hc_eps,
-		.stream			= stream,
-		.fn				= weight_view(attn ? &L->hc_attn_fn_w : &L->hc_ffn_fn_w),
-		.base			= base,
-		.scale			= scale,
-		.x				= x,
-		.coef			= coef,
+		.stream			= exec_slot(ctx, ctx->op->in[0]),
+		.fn				= weight_view(fn),
+		.base			= &base->buf,
+		.scale			= &scale->buf,
+		.x				= exec_slot(ctx, ctx->op->out),
+		.coef			= exec_slot(ctx, RECIPE_SLOT_HC_COEF),
 	};
-	d.ws		   = float_buf_ensure_nocopy(&ctx->s->op_ws, hc_pre_ws_floats(&d), 64);
-	status_code st = t->hc_pre(t, &d);
-	if (st == OK)
-		st = recipe_slot_write_commit(ctx, ctx->op->out, x, dim);
-	if (st == OK)
-		st = recipe_slot_write_commit(ctx, RECIPE_SLOT_HC_COEF, coef, coef_n);
-	return st;
+	if (backend_has_cap(a, BCAP_IS_HOST))
+		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, hc_pre_ws_floats(&d), 64);
+	return a->hc_pre(a, &d);
 }
 
 static status_code op_hc_post(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
-	backend *t = OP_BACKEND(a, hc_post);
-	if (!t->hc_post)
+	if (!a->hc_post)
 		return ERR_UNSUPPORTED;
-	const int	 dim	= ctx->m->dim;
-	const int	 n_hc	= ctx->m->kda.hc_count;
-	const int	 coef_n = n_hc + n_hc * n_hc;
-	const float *sub	= recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, dim);
-	const float *coef = recipe_slot_read_f32(ctx, RECIPE_SLOT_HC_COEF, &ctx->s->op_st_coef, coef_n);
-	const float *hc_cur	 = recipe_slot_read_f32(ctx, ctx->op->out, &ctx->s->op_st_cur, n_hc * dim);
-	float		*hc_next = float_buf_ensure_nocopy(&ctx->s->op_ws, (size_t)n_hc * dim, 64);
-	if (!sub || !coef || !hc_cur || !hc_next)
-		return ERR_UNSUPPORTED;
-	hc_post_desc d = {
-		.dim = dim, .n_hc = n_hc, .sub = sub, .coef = coef, .hc_cur = hc_cur, .hc_next = hc_next};
-	status_code st = t->hc_post(t, &d);
-	return st == OK ? recipe_slot_write_commit(ctx, ctx->op->out, hc_next, n_hc * dim) : st;
+	hc_post_desc d = {.dim	= ctx->m->dim,
+					  .n_hc = ctx->m->kda.hc_count,
+					  .sub	= exec_slot(ctx, ctx->op->in[0]),
+					  .coef = exec_slot(ctx, RECIPE_SLOT_HC_COEF),
+					  .hc	= exec_slot(ctx, ctx->op->out)};
+	return a->hc_post(a, &d);
 }
 
 static status_code op_kda(exec_ctx *ctx) {
 	backend		   *a = exec_layer_backend(ctx);
-	backend		   *t = OP_BACKEND(a, kda);
 	kvcache_hybrid *c = ctx->cache ? ctx->cache->hybrid : NULL;
-	if (!t->kda || !c)
+	if (!a->kda || !c || !c->conv_buf || !c->state_buf)
 		return ERR_UNSUPPORTED;
-	const model			*m	 = ctx->m;
-	const layer_weights *L	 = &m->layers[ctx->li];
-	const int			 dim = m->dim;
-	const float			*x	 = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, dim);
-	float				*out = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->op_st_out, dim);
-	if (!x || !out)
-		return ERR_UNSUPPORTED;
-
-	float *conv_state = c->conv_state + (size_t)ctx->li * c->conv_stride;
-	float *state	  = c->recurrent_state + (size_t)ctx->li * c->recurrent_stride;
-	if (ctx->pos_start == 0) {
-		memset(conv_state, 0, c->conv_stride * sizeof(float));
-		memset(state, 0, c->recurrent_stride * sizeof(float));
-	}
+	const model			*m = ctx->m;
+	const layer_weights *L = &m->layers[ctx->li];
 
 	kda_desc d = {
-		.dim			  = dim,
+		.dim			  = m->dim,
 		.n_heads		  = m->n_heads,
 		.head_dim		  = m->kda.head_dim,
 		.conv_kernel	  = m->hybrid.conv_kernel,
+		.reset			  = ctx->pos_start == 0,
 		.gate_lower_bound = m->kda.gate_lower_bound,
 		.norm_eps		  = m->norm_eps,
-		.x				  = x,
+		.x				  = exec_slot(ctx, ctx->op->in[0]),
 		.wq				  = weight_view(&L->wq),
 		.wk				  = weight_view(&L->wk),
 		.wv				  = weight_view(&L->wv),
@@ -5878,40 +5903,36 @@ static status_code op_kda(exec_ctx *ctx) {
 		.g_a			  = weight_view(&L->kda_g_a_w),
 		.g_b			  = weight_view(&L->kda_g_b_w),
 		.beta			  = weight_view(&L->ssm_beta_w),
-		.conv_q			  = (const float *)L->kda_conv_q_w.host_ptr,
-		.conv_k			  = (const float *)L->kda_conv_k_w.host_ptr,
-		.conv_v			  = (const float *)L->kda_conv_v_w.host_ptr,
-		.dt_bias		  = (const float *)L->ssm_dt_b.host_ptr,
-		.ssm_a			  = (const float *)L->ssm_a.host_ptr,
-		.out_norm		  = (const float *)L->ssm_norm_w.host_ptr,
-		.conv_state		  = conv_state,
-		.state			  = state,
-		.out			  = out,
+		.conv_q			  = &L->kda_conv_q_w.buf,
+		.conv_k			  = &L->kda_conv_k_w.buf,
+		.conv_v			  = &L->kda_conv_v_w.buf,
+		.dt_bias		  = &L->ssm_dt_b.buf,
+		.ssm_a			  = &L->ssm_a.buf,
+		.out_norm		  = &L->ssm_norm_w.buf,
+		.conv_state		  = &c->conv_buf[ctx->li],
+		.state			  = &c->state_buf[ctx->li],
+		.out			  = exec_slot(ctx, ctx->op->out),
 	};
-	d.ws		   = float_buf_ensure_nocopy(&ctx->s->op_ws, kda_ws_floats(&d), 64);
-	status_code st = t->kda(t, &d);
-	return st == OK ? recipe_slot_write_commit(ctx, ctx->op->out, out, dim) : st;
+	if (backend_has_cap(a, BCAP_IS_HOST))
+		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, kda_ws_floats(&d), 64);
+	return a->kda(a, &d);
 }
 
 static status_code op_mla_absorbed(exec_ctx *ctx) {
 	backend		   *a = exec_layer_backend(ctx);
-	backend		   *t = OP_BACKEND(a, mla_absorbed);
 	kvcache_hybrid *c = ctx->cache ? ctx->cache->hybrid : NULL;
-	if (!t->mla_absorbed || !c)
+	if (!a->mla_absorbed || !c || !c->latent_buf)
 		return ERR_UNSUPPORTED;
-	const model			*m	 = ctx->m;
-	const layer_weights *L	 = &m->layers[ctx->li];
-	const int			 dim = m->dim;
-	const float			*x	 = recipe_slot_read_f32(ctx, ctx->op->in[0], &ctx->s->op_st_in, dim);
-	float				*out = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->op_st_out, dim);
-	if (!x || !out || L->k_b_w.type != GGML_TYPE_F32 || L->v_b_w.type != GGML_TYPE_F32)
+	const model			*m = ctx->m;
+	const layer_weights *L = &m->layers[ctx->li];
+	if (L->k_b_w.type != GGML_TYPE_F32 || L->v_b_w.type != GGML_TYPE_F32)
 		return ERR_UNSUPPORTED;
 
-	tpool *pool		 = backend_get_pool(t);
+	tpool *pool		 = backend_get_pool(a);
 	int	   n_threads = pool ? tpool_n_threads(pool) : 1;
 
 	mla_absorbed_desc d = {
-		.dim		  = dim,
+		.dim		  = m->dim,
 		.n_heads	  = m->n_heads,
 		.kv_lora	  = m->mla.kv_lora,
 		.qk_head	  = m->mla.qk_head,
@@ -5920,21 +5941,21 @@ static status_code op_mla_absorbed(exec_ctx *ctx) {
 		.pos		  = ctx->pos,
 		.n_threads	  = n_threads < 1 ? 1 : n_threads,
 		.norm_eps	  = m->norm_eps,
-		.x			  = x,
+		.x			  = exec_slot(ctx, ctx->op->in[0]),
 		.q_a		  = weight_view(&L->q_a_w),
 		.q_b		  = weight_view(&L->q_b_w),
 		.kv_a		  = weight_view(&L->kv_a_w),
 		.wo			  = weight_view(&L->wo),
-		.q_a_norm	  = (const float *)L->q_a_norm_w.host_ptr,
-		.kv_a_norm	  = (const float *)L->kv_a_norm_w.host_ptr,
-		.k_b		  = (const float *)L->k_b_w.host_ptr,
-		.v_b		  = (const float *)L->v_b_w.host_ptr,
-		.latent_cache = c->mla_latent + (size_t)ctx->li * c->mla_latent_stride,
-		.out		  = out,
+		.q_a_norm	  = &L->q_a_norm_w.buf,
+		.kv_a_norm	  = &L->kv_a_norm_w.buf,
+		.k_b		  = &L->k_b_w.buf,
+		.v_b		  = &L->v_b_w.buf,
+		.latent_cache = &c->latent_buf[ctx->li],
+		.out		  = exec_slot(ctx, ctx->op->out),
 	};
-	d.ws		   = float_buf_ensure_nocopy(&ctx->s->op_ws, mla_absorbed_ws_floats(&d), 64);
-	status_code st = t->mla_absorbed(t, &d);
-	return st == OK ? recipe_slot_write_commit(ctx, ctx->op->out, out, dim) : st;
+	if (backend_has_cap(a, BCAP_IS_HOST))
+		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, mla_absorbed_ws_floats(&d), 64);
+	return a->mla_absorbed(a, &d);
 }
 
 static const op_handler g_op_dispatch[OP_KIND_COUNT] = {

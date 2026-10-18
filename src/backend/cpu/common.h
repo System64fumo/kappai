@@ -402,4 +402,61 @@ static inline void cpu_run_batch(tpool *pool, int m, tpool_chunk_fn chunk, void 
 	cpu_run_batch_full(pool, m, 1, 2, chunk, job);
 }
 
+typedef struct {
+	int			 dim, n_hc;
+	const float *x;
+	float		*hc;
+} hc_init_host_desc;
+
+typedef struct {
+	int			 dim, n_hc;
+	const float *hc;
+	float		*x;
+} hc_final_host_desc;
+
+typedef struct {
+	int			   dim, n_hc, sinkhorn_iters;
+	float		   norm_eps, eps;
+	const float	  *stream;
+	backend_weight fn;
+	const float	  *base, *scale;
+	float		  *x, *coef;
+	float		  *ws;
+} hc_pre_host_desc;
+
+typedef struct {
+	int			 dim, n_hc;
+	const float *sub, *coef, *hc_cur;
+	float		*hc_next;
+} hc_post_host_desc;
+
+typedef struct {
+	int			   dim, n_heads, head_dim, conv_kernel;
+	float		   gate_lower_bound, norm_eps;
+	const float	  *x;
+	backend_weight wq, wk, wv, wo, f_a, f_b, g_a, g_b, beta;
+	const float	  *conv_q, *conv_k, *conv_v, *dt_bias, *ssm_a, *out_norm;
+	float		  *conv_state, *state;
+	float		  *out;
+	float		  *ws;
+} kda_host_desc;
+
+typedef struct {
+	int			   dim, n_heads, kv_lora, qk_head, v_head, q_lora, pos, n_threads;
+	float		   norm_eps;
+	const float	  *x;
+	backend_weight q_a, q_b, kv_a, wo;
+	const float	  *q_a_norm, *kv_a_norm, *k_b, *v_b;
+	float		  *latent_cache;
+	float		  *out;
+	float		  *ws;
+} mla_absorbed_host_desc;
+
+status_code cpu_hc_init(backend *self, const hc_init_host_desc *d);
+status_code cpu_hc_final(backend *self, const hc_final_host_desc *d);
+status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d);
+status_code cpu_hc_post(backend *self, const hc_post_host_desc *d);
+status_code cpu_kda(backend *self, const kda_host_desc *d);
+status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d);
+
 #endif
