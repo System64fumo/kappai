@@ -340,6 +340,76 @@ status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, 
 	return OK;
 }
 
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} x86_rope_ext_batch_job;
+
+static void x86_rope_cs_fill(float *cs, int half, int pos, double theta_scale,
+							 const float *freq_factors) {
+	double base_freq = 1.0;
+	for (int j = 0; j < half; j++) {
+		double ff;
+		if (freq_factors) {
+			float fv = freq_factors[j];
+			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+		} else {
+			ff = 1.0;
+		}
+		if (ff > 0.0) {
+			double angle	= base_freq * ff * (double)pos;
+			cs[2 * j]		= (float)cos(angle);
+			cs[(2 * j) + 1] = (float)sin(angle);
+		} else {
+			cs[2 * j]		= 1.0f;
+			cs[(2 * j) + 1] = 0.0f;
+		}
+		base_freq *= theta_scale;
+	}
+}
+
+static status_code x86_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
+									  const float *freq_factors, float **cs_out) {
+	int half = head_dim / 2;
+
+	double theta_scale;
+	if (p->rope_cs.theta_cached == theta && p->rope_cs.head_dim_cached == head_dim) {
+		theta_scale = p->rope_cs.theta_scale;
+	} else {
+		theta_scale				   = pow((double)theta, -2.0 / (double)head_dim);
+		p->rope_cs.theta_scale	   = theta_scale;
+		p->rope_cs.theta_cached	   = theta;
+		p->rope_cs.head_dim_cached = head_dim;
+	}
+
+	int cache_valid =
+		p->rope_cs.cs && p->rope_cs.pos_cached == pos && p->rope_cs.theta_cs_cached == theta &&
+		p->rope_cs.head_dim_cs_cached == head_dim && p->rope_cs.freq_factors_cached == freq_factors;
+
+	if ((size_t)p->rope_cs.cs_cap < (size_t)half * 2 * sizeof(float)) {
+		status_code grow_st = cpu_buf_grow((void **)&p->rope_cs.cs, &p->rope_cs.cs_cap,
+										   (size_t)half * 2 * sizeof(float), 1);
+		if (grow_st != OK)
+			return grow_st;
+		cache_valid = 0;
+	}
+
+	if (!cache_valid) {
+		x86_rope_cs_fill(p->rope_cs.cs, half, pos, theta_scale, freq_factors);
+		p->rope_cs.pos_cached		   = pos;
+		p->rope_cs.theta_cs_cached	   = theta;
+		p->rope_cs.head_dim_cs_cached  = head_dim;
+		p->rope_cs.freq_factors_cached = freq_factors;
+	}
+
+	*cs_out = p->rope_cs.cs;
+	return OK;
+}
+
 status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
 						 const float *rope_cos_base, const float *rope_sin_base,
 						 const float *freq_factors) {
@@ -347,7 +417,7 @@ status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, 
 	if (freq_factors) {
 		float	   *cs;
 		status_code st =
-			cpu_rope_cs_cached(self->priv, head_dim, pos, self->rope_theta, freq_factors, &cs);
+			x86_rope_cs_cached(self->priv, head_dim, pos, self->rope_theta, freq_factors, &cs);
 		if (st != OK)
 			return st;
 		for (int h = 0; h < n_heads; h++)
@@ -363,7 +433,7 @@ status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, 
 
 static void cpu_rope_ext_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	(void)tid;
-	cpu_rope_ext_batch_job *j			= ctx;
+	x86_rope_ext_batch_job *j			= ctx;
 	int						half		= j->head_dim / 2;
 	double					theta_scale = pow((double)j->theta, -2.0 / (double)j->head_dim);
 
@@ -374,7 +444,7 @@ static void cpu_rope_ext_batch_chunk_avx(int begin, int end, int tid, void *ctx)
 		if (j->freq_factors) {
 			if (half > 256)
 				csp = xmalloc((size_t)half * 2 * sizeof(float));
-			rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
+			x86_rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
 			float *v = j->base + (size_t)r * j->row_stride;
 			for (int h = 0; h < j->n_heads; h++)
 				cpu_rope_cs_one_avx(v + ((size_t)h * j->head_dim), half, csp, j->neox);
@@ -397,7 +467,7 @@ status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head
 		return cpu_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
 							freq_factors);
 
-	cpu_rope_ext_batch_job job = {.base			= (float *)cpu_ptr(vec),
+	x86_rope_ext_batch_job job = {.base			= (float *)cpu_ptr(vec),
 								  .n_heads		= n_heads,
 								  .head_dim		= head_dim,
 								  .row_stride	= n_heads * head_dim,
@@ -2013,63 +2083,56 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	return OK;
 }
 
-static qonly_fn x86_qonly_lookup(uint32_t w_type, uint32_t *want_q8) {
-	switch (w_type) {
-	case GGML_TYPE_IQ3_S:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq3_s_q8_k_qonly_f32;
-	case GGML_TYPE_IQ3_S_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32;
-	case GGML_TYPE_IQ2_S:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq2_s_q8_k_qonly_f32;
-	case GGML_TYPE_IQ2_XXS:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32;
-	case GGML_TYPE_IQ3_XXS:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32;
-	case GGML_TYPE_IQ4_XS:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_iq4_xs_q8_k_qonly_f32;
-	case GGML_TYPE_Q8_0_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_0;
-		return (qonly_fn)matmul_q8_0_repacked_q8_qonly_f32;
-	case GGML_TYPE_Q4_0_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_0;
-		return (qonly_fn)matmul_q4_0_repacked_q8_qonly_f32;
-	case GGML_TYPE_IQ4_NL_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_0;
-		return (qonly_fn)matmul_iq4_nl_repacked_q8_qonly_f32;
-	case GGML_TYPE_Q4_K_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32;
-	case GGML_TYPE_Q5_K_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32;
-	case GGML_TYPE_Q6_K_REPACKED:
-		*want_q8 = GGML_TYPE_Q8_K;
-		return (qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32;
-	default:
-		*want_q8 = 0;
-		return NULL;
-	}
-}
+typedef void (*x86_qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
+
+typedef struct {
+	x86_qonly_fn qonly;
+	uint32_t	 expected_q8;
+} x86_matmul_kernel;
+
+static const x86_matmul_kernel x86_kernel_by_type[GGML_TYPE_Q6_K_REPACKED + 1] = {
+	[GGML_TYPE_Q4_0] = {(x86_qonly_fn)matmul_q4_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_IQ4_NL] = {(x86_qonly_fn)matmul_iq4_nl_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q8_0] = {(x86_qonly_fn)matmul_q8_0_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q4_1] = {(x86_qonly_fn)matmul_q4_1_q8_qonly_f32, GGML_TYPE_Q8_1},
+	[GGML_TYPE_Q5_0] = {(x86_qonly_fn)matmul_q5_0_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q5_1] = {(x86_qonly_fn)matmul_q5_1_q8_qonly_f32, GGML_TYPE_Q8_1},
+	[GGML_TYPE_Q6_K] = {(x86_qonly_fn)matmul_q6_k_q8_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q4_K] = {(x86_qonly_fn)matmul_q4_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q5_K] = {(x86_qonly_fn)matmul_q5_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_S] = {(x86_qonly_fn)matmul_iq3_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_S_REPACKED] = {(x86_qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32,
+								   GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ2_S] = {(x86_qonly_fn)matmul_iq2_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ2_XXS] = {(x86_qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_XXS] = {(x86_qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ4_XS] = {(x86_qonly_fn)matmul_iq4_xs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q8_0_REPACKED] = {(x86_qonly_fn)matmul_q8_0_repacked_q8_qonly_f32,
+								 GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q4_0_REPACKED] = {(x86_qonly_fn)matmul_q4_0_repacked_q8_qonly_f32,
+								 GGML_TYPE_Q8_0},
+	[GGML_TYPE_IQ4_NL_REPACKED] = {(x86_qonly_fn)matmul_iq4_nl_repacked_q8_qonly_f32,
+								   GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q4_K_REPACKED] = {(x86_qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32,
+								 GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q5_K_REPACKED] = {(x86_qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32,
+								 GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q6_K_REPACKED] = {(x86_qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32,
+								 GGML_TYPE_Q8_K},
+};
 
 status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
 							 uint32_t q8_type, buffer *y, int n, int k, int m) {
-	uint32_t want_q8 = 0;
-	qonly_fn fn		 = x86_qonly_lookup(w_type, &want_q8);
-	if (fn) {
-		if (q8_type != want_q8)
-			return ERR_INVALID_ARG;
-		if (m <= 0)
-			m = 1;
-		fn(cpu_ptr(w), x_q8->handle, (size_t)(k / 32), cpu_ptr(y), n, n, k, m);
-		return OK;
-	}
-	return cpu_matmul_qonly_shared(self, w, w_type, x_q8, q8_type, y, n, k, m);
+	(void)self;
+	if (w_type > GGML_TYPE_Q6_K_REPACKED || !x86_kernel_by_type[w_type].qonly)
+		return ERR_UNSUPPORTED;
+	const x86_matmul_kernel *entry = &x86_kernel_by_type[w_type];
+	if (q8_type != entry->expected_q8)
+		return ERR_INVALID_ARG;
+	if (m <= 0)
+		m = 1;
+	entry->qonly(cpu_ptr(w), x_q8->handle, (size_t)(k / 32), cpu_ptr(y), n, n, k, m);
+	return OK;
 }
 
 void detect_features(char *buf, size_t cap) {

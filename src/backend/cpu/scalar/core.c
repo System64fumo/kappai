@@ -19,6 +19,8 @@
 #define CPU_QUANTIZE_MIN_ROWS_PER_THREAD 8
 #define CPU_ELEMWISE_MIN_PER_THREAD 4096
 
+typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
+
 typedef struct {
 	qonly_fn qonly;
 	uint32_t w_type;
@@ -1285,9 +1287,9 @@ __attribute__((weak)) status_code cpu_prequantize_x(backend *self, const buffer 
 	return OK;
 }
 
-status_code cpu_matmul_qonly_shared(backend *self, const buffer *w, uint32_t w_type,
-									const buffer *x_q8, uint32_t q8_type, buffer *y, int n, int k,
-									int m) {
+__attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
+												   const buffer *x_q8, uint32_t q8_type, buffer *y,
+												   int n, int k, int m) {
 	(void)self;
 	const matmul_kernel *entry = matmul_kernel_lookup(w_type);
 	if (!entry)
@@ -1301,12 +1303,6 @@ status_code cpu_matmul_qonly_shared(backend *self, const buffer *w, uint32_t w_t
 	int	   y_row_stride			= n;
 	entry->qonly(cpu_ptr(w), x_q8->handle, xq_row_stride_blocks, cpu_ptr(y), y_row_stride, n, k, m);
 	return OK;
-}
-
-__attribute__((weak)) status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type,
-												   const buffer *x_q8, uint32_t q8_type, buffer *y,
-												   int n, int k, int m) {
-	return cpu_matmul_qonly_shared(self, w, w_type, x_q8, q8_type, y, n, k, m);
 }
 
 __attribute__((weak)) status_code cpu_rope_batch(backend *self, buffer *vec, int n_heads,
@@ -1338,30 +1334,8 @@ static void cpu_rope_one(float *v, int n_heads, int head_dim, const float *rope_
 	}
 }
 
-void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
-	double base_freq = 1.0;
-	for (int j = 0; j < half; j++) {
-		double ff;
-		if (freq_factors) {
-			float fv = freq_factors[j];
-			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
-		} else {
-			ff = 1.0;
-		}
-		if (ff > 0.0) {
-			double angle	= base_freq * ff * (double)pos;
-			cs[2 * j]		= (float)cos(angle);
-			cs[(2 * j) + 1] = (float)sin(angle);
-		} else {
-			cs[2 * j]		= 1.0f;
-			cs[(2 * j) + 1] = 0.0f;
-		}
-		base_freq *= theta_scale;
-	}
-}
-
-status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
-							   const float *freq_factors, float **cs_out) {
+static status_code cpu_rope_one_factored(cpu_priv *p, float *v, int n_heads, int head_dim, int pos,
+										 float theta, const float *freq_factors, int neox) {
 	int half = head_dim / 2;
 
 	double theta_scale;
@@ -1386,25 +1360,34 @@ status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 		cache_valid = 0;
 	}
 
+	float *cs = p->rope_cs.cs;
 	if (!cache_valid) {
-		rope_cs_fill(p->rope_cs.cs, half, pos, theta_scale, freq_factors);
+		double base_freq = 1.0;
+		for (int j = 0; j < half; j++) {
+			double ff;
+			if (freq_factors) {
+				float fv = freq_factors[j];
+				ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+			} else {
+				ff = 1.0;
+			}
+			if (ff > 0.0) {
+				double angle	= base_freq * ff * (double)pos;
+				cs[2 * j]		= (float)cos(angle);
+				cs[(2 * j) + 1] = (float)sin(angle);
+			} else {
+				cs[2 * j]		= 1.0f;
+				cs[(2 * j) + 1] = 0.0f;
+			}
+			base_freq *= theta_scale;
+		}
 		p->rope_cs.pos_cached		   = pos;
 		p->rope_cs.theta_cs_cached	   = theta;
 		p->rope_cs.head_dim_cs_cached  = head_dim;
 		p->rope_cs.freq_factors_cached = freq_factors;
 	}
 
-	*cs_out = p->rope_cs.cs;
-	return OK;
-}
-
-static status_code cpu_rope_one_factored(cpu_priv *p, float *v, int n_heads, int head_dim, int pos,
-										 float theta, const float *freq_factors, int neox) {
-	float	   *cs;
-	status_code st = cpu_rope_cs_cached(p, head_dim, pos, theta, freq_factors, &cs);
-	if (st != OK)
-		return st;
-	rope_rotate_rows(v, n_heads, head_dim, head_dim / 2, cs, neox);
+	rope_rotate_rows(v, n_heads, head_dim, half, cs, neox);
 	return OK;
 }
 
@@ -1503,6 +1486,15 @@ __attribute__((weak)) status_code cpu_rope_ext(backend *self, buffer *vec, int n
 	return OK;
 }
 
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
+
 static void cpu_rope_ext_batch_row(float *v, int n_heads, int half, const float *cs, int neox) {
 	rope_rotate_rows(v, n_heads, half * 2, half, cs, neox);
 }
@@ -1519,8 +1511,23 @@ static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
 		float *csp = cs;
 		if (half > 256)
 			csp = xmalloc((size_t)half * 2 * sizeof(float));
-		if (j->freq_factors)
-			rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
+		if (j->freq_factors) {
+			double base_freq = 1.0;
+			for (int jj = 0; jj < half; jj++) {
+				double ff;
+				float  fv = j->freq_factors[jj];
+				ff		  = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+				if (ff > 0.0) {
+					double angle	  = base_freq * ff * (double)pos;
+					csp[2 * jj]		  = (float)cos(angle);
+					csp[(2 * jj) + 1] = (float)sin(angle);
+				} else {
+					csp[2 * jj]		  = 1.0f;
+					csp[(2 * jj) + 1] = 0.0f;
+				}
+				base_freq *= theta_scale;
+			}
+		}
 		float *v = j->base + (size_t)r * j->row_stride;
 		if (j->freq_factors) {
 			cpu_rope_ext_batch_row(v, j->n_heads, half, csp, j->neox);
