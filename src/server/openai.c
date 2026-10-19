@@ -18,7 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
 
 #define MAX_BODY_BYTES (32 * 1024 * 1024)
 #define SSE_POLL_SEC 1
@@ -129,6 +132,15 @@ struct oa_slot {
 	uint64_t last_ns;
 };
 
+typedef struct {
+	openai_state *st;
+	oa_job		 *job;
+	oa_slot		 *slot;
+	ucontext_t	  uc;
+	void		 *stack;
+	bool		  done;
+} oa_task;
+
 struct openai_state {
 	context *ctx;
 
@@ -149,6 +161,10 @@ struct openai_state {
 	oa_job *q_tail;
 
 	pthread_t worker;
+
+	ucontext_t sched_uc;
+	oa_task	 **tasks;
+	int		   n_tasks;
 
 	struct MHD_Daemon *daemon;
 	struct sockaddr	  *bind_addr;
@@ -1179,76 +1195,164 @@ static void slot_adopt_chat_chain(oa_slot *s, oa_job *j) {
 	s->n_msgs = cts->n_messages;
 }
 
+#define TASK_STACK_BYTES ((size_t)16 << 20)
+
+static oa_task *task_entering;
+
+static void fail_job(openai_state *st, oa_job *j) {
+	oa_gen *g	 = &j->rc->gen;
+	g->generated = -1;
+	pthread_mutex_lock(&g->q_mtx);
+	g->generation_done = true;
+	pthread_cond_broadcast(&g->q_cv);
+	pthread_mutex_unlock(&g->q_mtx);
+	sse_finish_stream(g);
+	job_free(st, j);
+}
+
+static oa_slot *job_pick_slot(openai_state *st, oa_job *j, bool *matched) {
+	req_ctx *rc = j->rc;
+	if (j->chat_api)
+		return slot_pick_chat(st, j->chain, j->chain_len, matched);
+
+	int		 cap = st->ctx->n_ctx;
+	int32_t *ids = xmalloc(sizeof(int32_t) * (size_t)(cap + 2));
+	int		 n	 = 0;
+	if (st->ctx->tok.add_bos && st->ctx->tok.bos_id >= 0)
+		ids[n++] = st->ctx->tok.bos_id;
+	int r = tokenizer_encode_with_specials(&st->ctx->tok, rc->params.prompt, 0, ids + n, cap - n,
+										   &st->ctx->scratch.prof);
+	if (r > 0)
+		n += r;
+	oa_slot *slot = slot_pick_text(st, ids, n, matched);
+	free(ids);
+	return slot;
+}
+
+static void task_yield(void *ud) {
+	oa_task *t = ud;
+	swapcontext(&t->uc, &t->st->sched_uc);
+}
+
+static void task_main(void) {
+	oa_task		 *t	 = task_entering;
+	openai_state *st = t->st;
+	oa_job		 *j	 = t->job;
+	oa_gen		 *g	 = &j->rc->gen;
+
+	run_generation(j->rc, t->slot);
+	if (j->chat_api)
+		slot_adopt_chat_chain(t->slot, j);
+	j->chain = NULL;
+	slot_record_catalog(st, t->slot);
+	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)", j->chat_api ? "chat" : "completion",
+		 g->prompt_tokens, g->generated, (double)(time_us() - j->t_start_us) / 1e6,
+		 g->client_gone ? "client disconnected" : "completed");
+	job_free(st, j);
+	t->done = true;
+}
+
+static bool task_start(openai_state *st, oa_job *j) {
+	bool	 matched = false;
+	oa_slot *slot	 = job_pick_slot(st, j, &matched);
+	if (!slot) {
+		if (st->n_tasks > 0)
+			return false;
+		ERROR("server: no session slot available");
+		fail_job(st, j);
+		return true;
+	}
+
+	oa_gen *g				= &j->rc->gen;
+	g->session_key_at_start = j->session_key;
+	g->same_session			= matched;
+	INFO("session=%016llx slot=%d %s; n_messages=%zu", (unsigned long long)j->session_key,
+		 (int)(slot - st->slots), matched ? "continuing existing session" : "fresh start",
+		 j->rc->params.n_messages);
+
+	void *stack = mmap(NULL, TASK_STACK_BYTES, PROT_READ | PROT_WRITE,
+					   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
+	if (stack == MAP_FAILED) {
+		ERROR("server: failed to allocate task stack");
+		fail_job(st, j);
+		return true;
+	}
+	mprotect(stack, (size_t)sysconf(_SC_PAGESIZE), PROT_NONE);
+
+	oa_task *t = xcalloc(1, sizeof(*t));
+	t->st	   = st;
+	t->job	   = j;
+	t->slot	   = slot;
+	t->stack   = stack;
+	getcontext(&t->uc);
+	t->uc.uc_stack.ss_sp   = stack;
+	t->uc.uc_stack.ss_size = TASK_STACK_BYTES;
+	t->uc.uc_link		   = &st->sched_uc;
+	makecontext(&t->uc, task_main, 0);
+
+	slot->busy				 = true;
+	slot->sess.yield		 = task_yield;
+	slot->sess.yield_ud		 = t;
+	st->tasks[st->n_tasks++] = t;
+	return true;
+}
+
+static void task_finish(openai_state *st, int idx) {
+	oa_task *t			   = st->tasks[idx];
+	t->slot->sess.yield	   = NULL;
+	t->slot->sess.yield_ud = NULL;
+	munmap(t->stack, TASK_STACK_BYTES);
+	free(t);
+	st->tasks[idx] = st->tasks[--st->n_tasks];
+}
+
+static void admit_jobs(openai_state *st) {
+	while (st->n_tasks < st->slots_cap && !shutting_down(st)) {
+		pthread_mutex_lock(&st->sch_mtx);
+		oa_job *j = st->q_head;
+		if (j) {
+			st->q_head = j->next;
+			if (!st->q_head)
+				st->q_tail = NULL;
+		}
+		pthread_mutex_unlock(&st->sch_mtx);
+		if (!j)
+			return;
+		if (task_start(st, j))
+			continue;
+		pthread_mutex_lock(&st->sch_mtx);
+		j->next	   = st->q_head;
+		st->q_head = j;
+		if (!st->q_tail)
+			st->q_tail = j;
+		pthread_mutex_unlock(&st->sch_mtx);
+		return;
+	}
+}
+
 static void *worker_main(void *arg) {
 	openai_state *st = (openai_state *)arg;
 	for (;;) {
 		pthread_mutex_lock(&st->sch_mtx);
-		while (!st->q_head && !shutting_down(st))
+		while (!st->q_head && st->n_tasks == 0 && !shutting_down(st))
 			pthread_cond_wait(&st->sch_cv, &st->sch_mtx);
-		if (!st->q_head && shutting_down(st)) {
-			pthread_mutex_unlock(&st->sch_mtx);
-			break;
-		}
-		oa_job *j  = st->q_head;
-		st->q_head = j->next;
-		if (!st->q_head)
-			st->q_tail = NULL;
 		pthread_mutex_unlock(&st->sch_mtx);
+		if (st->n_tasks == 0 && shutting_down(st))
+			break;
 
-		req_ctx *rc				= j->rc;
-		oa_gen	*g				= &rc->gen;
-		g->session_key_at_start = j->session_key;
+		admit_jobs(st);
 
-		oa_slot *slot	  = NULL;
-		bool	 matched  = false;
-		int32_t *text_ids = NULL;
-		if (j->chat_api) {
-			slot = slot_pick_chat(st, j->chain, j->chain_len, &matched);
-			INFO("session=%016llx slot=%d %s; n_messages=%zu", (unsigned long long)j->session_key,
-				 slot ? (int)(slot - st->slots) : -1,
-				 matched ? "continuing existing session" : "fresh start", rc->params.n_messages);
-		} else {
-			int cap	 = st->ctx->n_ctx;
-			text_ids = xmalloc(sizeof(int32_t) * (size_t)(cap + 2));
-			int r	 = 0;
-			int tn	 = 0;
-			if (st->ctx->tok.add_bos && st->ctx->tok.bos_id >= 0)
-				text_ids[tn++] = st->ctx->tok.bos_id;
-			r = tokenizer_encode_with_specials(&st->ctx->tok, rc->params.prompt, 0, text_ids + tn,
-											   cap - tn, &st->ctx->scratch.prof);
-			if (r > 0)
-				tn += r;
-			slot = slot_pick_text(st, text_ids, tn, &matched);
-			free(text_ids);
-			text_ids = NULL;
+		for (int i = 0; i < st->n_tasks;) {
+			oa_task *t	  = st->tasks[i];
+			task_entering = t;
+			swapcontext(&st->sched_uc, &t->uc);
+			if (t->done)
+				task_finish(st, i);
+			else
+				i++;
 		}
-
-		rc->gen.same_session = matched;
-		if (!slot) {
-			ERROR("server: no session slot available");
-			g->generated = -1;
-			pthread_mutex_lock(&g->q_mtx);
-			g->generation_done = true;
-			pthread_cond_broadcast(&g->q_cv);
-			pthread_mutex_unlock(&g->q_mtx);
-			sse_finish_stream(g);
-			job_free(st, j);
-			continue;
-		}
-		if (slot) {
-			slot->busy = true;
-			run_generation(rc, slot);
-			if (j->chat_api)
-				slot_adopt_chat_chain(slot, j);
-			j->chain = NULL;
-			slot_record_catalog(st, slot);
-		}
-		INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)",
-			 j->chat_api ? "chat" : "completion", g->prompt_tokens, g->generated,
-			 (double)(time_us() - j->t_start_us) / 1e6,
-			 g->client_gone ? "client disconnected" : "completed");
-		job_free(st, j);
 	}
+	backend_release_thread(st->ctx->backend);
 	return NULL;
 }
 
@@ -1499,10 +1603,12 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 
 	st->slots_cap = args->server_slots > 0 ? args->server_slots : 1;
 	st->slots	  = xcalloc((size_t)st->slots_cap, sizeof(oa_slot));
+	st->tasks	  = xcalloc((size_t)st->slots_cap, sizeof(oa_task *));
 	st->n_slots	  = 1;
 	if (context_slot_init(&st->slots[0].sess, st->ctx) != OK) {
 		ERROR("openai: failed to allocate base session slot");
 		free(st->slots);
+		free(st->tasks);
 		free(st->model_id);
 		free(st->api_key);
 		pthread_mutex_destroy(&st->sch_mtx);
@@ -1514,10 +1620,12 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	st->slots[0].busy	 = false;
 	st->slots[0].owns	 = true;
 	st->slots[0].last_ns = time_us();
+	backend_release_thread(st->ctx->backend);
 
 	if (pthread_create(&st->worker, NULL, worker_main, st) != 0) {
 		ERROR("openai: failed to start scheduler worker");
 		free(st->slots);
+		free(st->tasks);
 		free(st->model_id);
 		free(st->api_key);
 		pthread_mutex_destroy(&st->sch_mtx);
@@ -1606,6 +1714,7 @@ void openai_free(openai_state *st) {
 		if (st->slots[i].owns)
 			context_slot_free(&st->slots[i].sess);
 	free(st->slots);
+	free(st->tasks);
 	jobs_cancel(st);
 	free(st->bind_addr);
 	free(st->model_id);

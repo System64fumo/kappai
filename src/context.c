@@ -511,6 +511,8 @@ status_code context_slot_init(context *s, const context *e) {
 	s->last_prompt_tokens = 0;
 	s->sync_render		  = e->sync_render ? xstrdup(e->sync_render) : NULL;
 	s->idle.active		  = false;
+	s->yield			  = NULL;
+	s->yield_ud			  = NULL;
 
 	s->fed_ids.p   = xmalloc((size_t)e->fed_ids.cap * sizeof(int32_t));
 	s->fed_ids.n   = e->fed_ids.n;
@@ -817,6 +819,8 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
+		if (c->yield && chunk_offset + chunk_size < n)
+			c->yield(c->yield_ud);
 	}
 
 	if (show_progress) {
@@ -1011,6 +1015,8 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		}
 		has_fed_tok	 = true;
 		last_fed_tok = tok;
+		if (c->yield)
+			c->yield(c->yield_ud);
 	}
 
 	compute_set_layer_progress_cb(&c->scratch, NULL, NULL);

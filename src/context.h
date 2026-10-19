@@ -60,6 +60,9 @@ typedef struct {
 
 	char   *sync_render;
 	int32_t sync_tok;
+
+	void (*yield)(void *ud);
+	void *yield_ud;
 } context;
 
 typedef struct {
