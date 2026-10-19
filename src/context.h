@@ -63,6 +63,10 @@ typedef struct {
 
 	void (*yield)(void *ud);
 	void *yield_ud;
+
+	status_code (*decode_step)(void *ud, int32_t token, int pos, float *logits_out);
+	void *decode_step_ud;
+	bool  logits_on_host;
 } context;
 
 typedef struct {

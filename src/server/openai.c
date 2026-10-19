@@ -139,7 +139,23 @@ typedef struct {
 	ucontext_t	  uc;
 	void		 *stack;
 	bool		  done;
+
+	bool		decode_pending;
+	int32_t		decode_token;
+	int			decode_pos;
+	float	   *decode_logits;
+	status_code decode_status;
 } oa_task;
+
+typedef struct {
+	oa_task **tasks;
+	int32_t	 *tokens;
+	int		 *positions;
+	kvcache **caches;
+	float	 *logits;
+	size_t	  logits_cap;
+	int		  n;
+} oa_decode_batch;
 
 struct openai_state {
 	context *ctx;
@@ -162,9 +178,10 @@ struct openai_state {
 
 	pthread_t worker;
 
-	ucontext_t sched_uc;
-	oa_task	 **tasks;
-	int		   n_tasks;
+	ucontext_t		sched_uc;
+	oa_task		  **tasks;
+	int				n_tasks;
+	oa_decode_batch decode;
 
 	struct MHD_Daemon *daemon;
 	struct sockaddr	  *bind_addr;
@@ -1234,6 +1251,87 @@ static void task_yield(void *ud) {
 	swapcontext(&t->uc, &t->st->sched_uc);
 }
 
+static status_code task_decode_step(void *ud, int32_t token, int pos, float *logits_out) {
+	oa_task *t		  = ud;
+	t->decode_token	  = token;
+	t->decode_pos	  = pos;
+	t->decode_logits  = logits_out;
+	t->decode_pending = true;
+	swapcontext(&t->uc, &t->st->sched_uc);
+	return t->decode_status;
+}
+
+static void decode_batch_reserve(openai_state *st) {
+	oa_decode_batch *b = &st->decode;
+	if (!b->tasks) {
+		b->tasks	 = xcalloc((size_t)st->slots_cap, sizeof(*b->tasks));
+		b->tokens	 = xcalloc((size_t)st->slots_cap, sizeof(*b->tokens));
+		b->positions = xcalloc((size_t)st->slots_cap, sizeof(*b->positions));
+		b->caches	 = xcalloc((size_t)st->slots_cap, sizeof(*b->caches));
+	}
+	size_t need = (size_t)st->slots_cap * (size_t)st->ctx->m.vocab_size;
+	if (b->logits_cap < need) {
+		b->logits	  = xrealloc(b->logits, need * sizeof(float));
+		b->logits_cap = need;
+	}
+}
+
+static void decode_batch_collect(openai_state *st) {
+	oa_decode_batch *b = &st->decode;
+	b->n			   = 0;
+	for (int i = 0; i < st->n_tasks; i++) {
+		oa_task *t = st->tasks[i];
+		if (!t->decode_pending)
+			continue;
+		t->decode_pending = false;
+		context *c		  = &t->slot->sess;
+		if (c->interrupt) {
+			t->decode_status = ERR_INTERRUPTED;
+			continue;
+		}
+		b->tasks[b->n]	   = t;
+		b->tokens[b->n]	   = t->decode_token;
+		b->positions[b->n] = t->decode_pos;
+		b->caches[b->n]	   = &c->kv;
+		b->n++;
+	}
+}
+
+static void run_decode_step(openai_state *st) {
+	oa_decode_batch *b = &st->decode;
+	decode_batch_reserve(st);
+	decode_batch_collect(st);
+	if (b->n == 0)
+		return;
+
+	status_code batch_status = ERR_FALLBACK;
+	if (b->n > 1) {
+		context *lead = &st->slots[0].sess;
+		batch_status =
+			compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens,
+										 b->positions, b->n, lead->flash_attn, b->logits);
+	}
+	bool fall_back = batch_status == ERR_FALLBACK || batch_status == ERR_UNSUPPORTED;
+
+	const size_t vocab = (size_t)st->ctx->m.vocab_size;
+	for (int i = 0; i < b->n; i++) {
+		oa_task *t = b->tasks[i];
+		context *c = &t->slot->sess;
+		if (fall_back) {
+			c->logits_on_host = false;
+			t->decode_status  = compute_forward(&c->m, &c->kv, &c->scratch, t->decode_token,
+												t->decode_pos, c->flash_attn, t->decode_logits);
+			continue;
+		}
+		t->decode_status = batch_status;
+		if (batch_status != OK)
+			continue;
+		memcpy(t->decode_logits ? t->decode_logits : c->scratch.logits_host,
+			   b->logits + (size_t)i * vocab, vocab * sizeof(float));
+		c->logits_on_host = true;
+	}
+}
+
 static void task_main(void) {
 	oa_task		 *t	 = task_entering;
 	openai_state *st = t->st;
@@ -1290,17 +1388,22 @@ static bool task_start(openai_state *st, oa_job *j) {
 	t->uc.uc_link		   = &st->sched_uc;
 	makecontext(&t->uc, task_main, 0);
 
-	slot->busy				 = true;
-	slot->sess.yield		 = task_yield;
-	slot->sess.yield_ud		 = t;
-	st->tasks[st->n_tasks++] = t;
+	slot->busy				  = true;
+	slot->sess.logits_on_host = false;
+	slot->sess.yield		  = task_yield;
+	slot->sess.yield_ud		  = t;
+	slot->sess.decode_step	  = task_decode_step;
+	slot->sess.decode_step_ud = t;
+	st->tasks[st->n_tasks++]  = t;
 	return true;
 }
 
 static void task_finish(openai_state *st, int idx) {
-	oa_task *t			   = st->tasks[idx];
-	t->slot->sess.yield	   = NULL;
-	t->slot->sess.yield_ud = NULL;
+	oa_task *t					 = st->tasks[idx];
+	t->slot->sess.yield			 = NULL;
+	t->slot->sess.yield_ud		 = NULL;
+	t->slot->sess.decode_step	 = NULL;
+	t->slot->sess.decode_step_ud = NULL;
 	munmap(t->stack, TASK_STACK_BYTES);
 	free(t);
 	st->tasks[idx] = st->tasks[--st->n_tasks];
@@ -1351,6 +1454,7 @@ static void *worker_main(void *arg) {
 			else
 				i++;
 		}
+		run_decode_step(st);
 	}
 	backend_release_thread(st->ctx->backend);
 	return NULL;
@@ -1715,6 +1819,11 @@ void openai_free(openai_state *st) {
 			context_slot_free(&st->slots[i].sess);
 	free(st->slots);
 	free(st->tasks);
+	free(st->decode.tasks);
+	free(st->decode.tokens);
+	free(st->decode.positions);
+	free(st->decode.caches);
+	free(st->decode.logits);
 	jobs_cancel(st);
 	free(st->bind_addr);
 	free(st->model_id);

@@ -513,6 +513,8 @@ status_code context_slot_init(context *s, const context *e) {
 	s->idle.active		  = false;
 	s->yield			  = NULL;
 	s->yield_ud			  = NULL;
+	s->decode_step		  = NULL;
+	s->decode_step_ud	  = NULL;
 
 	s->fed_ids.p   = xmalloc((size_t)e->fed_ids.cap * sizeof(int32_t));
 	s->fed_ids.n   = e->fed_ids.n;
@@ -689,8 +691,9 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 	int			pos = c->kv.n_pos;
-	status_code cst =
-		compute_forward(&c->m, &c->kv, &c->scratch, token, pos, c->flash_attn, logits_out);
+	status_code cst = c->decode_step ? c->decode_step(c->decode_step_ud, token, pos, logits_out)
+									 : compute_forward(&c->m, &c->kv, &c->scratch, token, pos,
+													   c->flash_attn, logits_out);
 	if (cst == ERR_INTERRUPTED)
 		return ERR_INTERRUPTED;
 	if (cst != OK) {
@@ -953,7 +956,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		monitor_setup_cb(c, &cb, "decode", i, i + 1);
 
 		int32_t tok;
-		if (fast_argmax) {
+		if (fast_argmax && !c->logits_on_host) {
 			status_code st = c->backend->argmax(c->backend, &c->scratch.slots[RECIPE_SLOT_LOGITS],
 												c->m.vocab_size, &tok);
 			if (st == OK) {
@@ -1015,7 +1018,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		}
 		has_fed_tok	 = true;
 		last_fed_tok = tok;
-		if (c->yield)
+		if (c->yield && !c->decode_step)
 			c->yield(c->yield_ud);
 	}
 

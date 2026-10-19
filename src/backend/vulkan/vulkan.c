@@ -5969,9 +5969,11 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		} push = {
 			(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			attn_start,			 m};
-		uint32_t groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
-		vk_buf	*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
-		return vk_dispatch_2d(p, flash_ps, bufs, 4, &push, sizeof(push), groups_x, (uint32_t)m);
+		uint32_t	 groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
+		vk_buf		*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
+		VkDeviceSize offs[4]  = {q->offset, 0, 0, out->offset};
+		return vk_dispatch_2d_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups_x,
+								 (uint32_t)m, 0x8);
 	}
 
 	status_code s = vk_ensure_scores_buf_batch(self, n_heads, n_ctx, m);
@@ -5987,6 +5989,7 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 	} push = {(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			  attn_start,		   m};
 	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
+	VkDeviceSize	 offs[5] = {q->offset, 0, 0, 0, out->offset};
 	vk_pipeline_set *ps		 = NULL;
 	if (vk_ensure_attention_pipeline_batch(p, head_dim, &ps) != OK) {
 		DEBUG(
@@ -5994,8 +5997,8 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 			head_dim, layer);
 		return ERR_UNSUPPORTED;
 	}
-	return vk_dispatch_2d_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads,
-								 (uint32_t)m, 0x18);
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 5, &push, sizeof(push), (uint32_t)n_heads,
+							 (uint32_t)m, 0x18);
 }
 
 static status_code vk_attention_batch(backend *self, const buffer *q, const buffer *k_cache,

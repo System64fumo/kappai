@@ -76,9 +76,6 @@ typedef struct {
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
 
-	uint16_t *kv_k;
-	uint16_t *kv_v;
-
 	size_t *kv_layer_off;
 	size_t	kv_k_bytes;
 	int		kv_n_layers;

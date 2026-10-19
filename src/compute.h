@@ -132,6 +132,10 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out);
 
+status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,
+										 const int32_t *tokens, const int *positions, int n_seqs,
+										 int flash_attn, float *logits_out);
+
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);

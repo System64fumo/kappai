@@ -131,6 +131,25 @@ static inline int exec_is_batch(const exec_ctx *ctx) {
 	return recipe_exec_is_batch(ctx);
 }
 
+typedef struct {
+	int n_calls;
+	int rows;
+} exec_segments;
+
+static inline exec_segments exec_segments_of(const exec_ctx *ctx) {
+	if (ctx->row_pos)
+		return (exec_segments){ctx->n_rows, 1};
+	return (exec_segments){1, ctx->n_rows};
+}
+
+static inline int exec_segment_pos(const exec_ctx *ctx, int call) {
+	return ctx->row_pos ? ctx->row_pos[call] : ctx->pos_start;
+}
+
+static inline kvcache *exec_segment_cache(const exec_ctx *ctx, int call) {
+	return ctx->row_caches ? ctx->row_caches[call] : ctx->cache;
+}
+
 static inline backend *exec_active_backend(const exec_ctx *ctx) {
 	if (ctx->s && ctx->s->active_backend)
 		return ctx->s->active_backend;
@@ -1779,8 +1798,14 @@ static status_code op_rope(exec_ctx *ctx) {
 	int			  head_dim = ctx->op->u.rope.head_dim;
 	a->rope_neox		   = ctx->op->u.rope.rope_neox;
 	if (exec_is_batch(ctx)) {
-		st = a->rope_batch(a, exec_slot(ctx, ctx->op->in[0]), n_heads, head_dim, ctx->pos_start,
-						   ctx->s->rope_cos, ctx->s->rope_sin, ctx->n_rows);
+		exec_segments seg	= exec_segments_of(ctx);
+		buffer		 *whole = exec_slot(ctx, ctx->op->in[0]);
+		st					= OK;
+		for (int c = 0; c < seg.n_calls && st == OK; c++) {
+			buffer view = batch_row_view(whole, c * seg.rows, n_heads * head_dim);
+			st			= a->rope_batch(a, &view, n_heads, head_dim, exec_segment_pos(ctx, c),
+										ctx->s->rope_cos, ctx->s->rope_sin, seg.rows);
+		}
 	} else {
 		backend *t = OP_BACKEND(a, rope);
 		backend_sync_rope(t, a);
@@ -1801,9 +1826,17 @@ static status_code op_rope_qk_fused(exec_ctx *ctx) {
 	int			  head_dim	 = ctx->op->u.rope.head_dim;
 	a->rope_neox			 = ctx->op->u.rope.rope_neox;
 	if (exec_is_batch(ctx)) {
-		st = a->rope_qk_batch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
-							  n_heads, n_kv_heads, head_dim, ctx->pos_start, ctx->s->rope_cos,
-							  ctx->s->rope_sin, ctx->n_rows);
+		exec_segments seg	= exec_segments_of(ctx);
+		buffer		 *q_all = exec_slot(ctx, ctx->op->in[0]);
+		buffer		 *k_all = exec_slot(ctx, ctx->op->in[1]);
+		st					= OK;
+		for (int c = 0; c < seg.n_calls && st == OK; c++) {
+			buffer q_view = batch_row_view(q_all, c * seg.rows, n_heads * head_dim);
+			buffer k_view = batch_row_view(k_all, c * seg.rows, n_kv_heads * head_dim);
+			st = a->rope_qk_batch(a, &q_view, &k_view, n_heads, n_kv_heads, head_dim,
+								  exec_segment_pos(ctx, c), ctx->s->rope_cos, ctx->s->rope_sin,
+								  seg.rows);
+		}
 	} else {
 		backend *t = a->rope_qk ? a : OP_BACKEND(a, rope);
 		backend_sync_rope(t, a);
@@ -1827,10 +1860,20 @@ static status_code op_kv_put(exec_ctx *ctx) {
 	profile_scope ps = profile_begin(&ctx->s->prof, ctx->op->stage);
 	status_code	  st;
 	if (exec_is_batch(ctx)) {
-		int kv_row_stride = ctx->m->recipe->layer_ctx[ctx->li].kv_row_stride;
-		return kvcache_put_batch(ctx->cache, ctx->m, ctx->li, ctx->pos_start,
-								 batch_slot(ctx->bs, ctx->op->in[0]),
-								 batch_slot(ctx->bs, ctx->op->in[1]), kv_row_stride, ctx->n_rows);
+		int			  kv_row_stride = ctx->m->recipe->layer_ctx[ctx->li].kv_row_stride;
+		exec_segments seg			= exec_segments_of(ctx);
+		buffer		 *k_all			= batch_slot(ctx->bs, ctx->op->in[0]);
+		buffer		 *v_all			= batch_slot(ctx->bs, ctx->op->in[1]);
+		for (int c = 0; c < seg.n_calls; c++) {
+			buffer k_view = batch_row_view(k_all, c * seg.rows, kv_row_stride);
+			buffer v_view = batch_row_view(v_all, c * seg.rows, kv_row_stride);
+			st = kvcache_put_batch(exec_segment_cache(ctx, c), ctx->m, ctx->li,
+								   exec_segment_pos(ctx, c), &k_view, &v_view, kv_row_stride,
+								   seg.rows);
+			if (st != OK)
+				return st;
+		}
+		return OK;
 	}
 	st = kvcache_put(ctx->cache, ctx->m, ctx->li, ctx->pos, exec_slot(ctx, ctx->op->in[0]),
 					 exec_slot(ctx, ctx->op->in[1]));
@@ -1855,22 +1898,29 @@ static status_code op_attention(exec_ctx *ctx) {
 	if (exec_is_batch(ctx)) {
 		int use_swa = (sliding_window > 0) && (ctx->li >= 0) &&
 					  model_layer_is_sliding(ctx->m, ctx->li) && a->attention_swa_batch != NULL;
-		profile_scope ps = profile_begin(prof, ctx->op->stage);
-		status_code	  st;
-		buffer		 *kb;
-		buffer		 *vb;
-		int			  kv_slot;
-		kvcache_attn_view(ctx->cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
-		if (use_swa)
-			st = a->attention_swa_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), kb, vb,
-										batch_slot(ctx->bs, ctx->op->out), kv_slot, ctx->pos_start,
-										n_heads, n_kv_heads, head_dim, n_ctx, ctx->flash_attn,
-										scale, sliding_window, n_kv_heads_active, ctx->n_rows);
-		else
-			st = a->attention_batch(a, batch_slot(ctx->bs, ctx->op->in[0]), kb, vb,
-									batch_slot(ctx->bs, ctx->op->out), kv_slot, ctx->pos_start,
-									n_heads, n_kv_heads, head_dim, n_ctx, ctx->flash_attn, scale,
-									n_kv_heads_active, ctx->n_rows);
+		profile_scope ps	= profile_begin(prof, ctx->op->stage);
+		exec_segments seg	= exec_segments_of(ctx);
+		buffer		 *q_all = batch_slot(ctx->bs, ctx->op->in[0]);
+		buffer		 *o_all = batch_slot(ctx->bs, ctx->op->out);
+		status_code	  st	= OK;
+		for (int c = 0; c < seg.n_calls && st == OK; c++) {
+			buffer	q_view = batch_row_view(q_all, c * seg.rows, n_heads * head_dim);
+			buffer	o_view = batch_row_view(o_all, c * seg.rows, n_heads * head_dim);
+			buffer *kb;
+			buffer *vb;
+			int		kv_slot;
+			kvcache_attn_view(exec_segment_cache(ctx, c), ctx->m, ctx->li, kv_layer, &kb, &vb,
+							  &kv_slot);
+			if (use_swa)
+				st = a->attention_swa_batch(a, &q_view, kb, vb, &o_view, kv_slot,
+											exec_segment_pos(ctx, c), n_heads, n_kv_heads, head_dim,
+											n_ctx, ctx->flash_attn, scale, sliding_window,
+											n_kv_heads_active, seg.rows);
+			else
+				st = a->attention_batch(a, &q_view, kb, vb, &o_view, kv_slot,
+										exec_segment_pos(ctx, c), n_heads, n_kv_heads, head_dim,
+										n_ctx, ctx->flash_attn, scale, n_kv_heads_active, seg.rows);
+		}
 		profile_end(prof, &ps);
 		return st;
 	}
@@ -2228,6 +2278,8 @@ typedef struct {
 	int						flash_attn;
 	float				   *logits_out;
 	int						mixed;
+	struct kvcache		  **row_caches;
+	const int			   *row_pos;
 } op_walker;
 
 static inline buffer *walker_slot(op_walker *w, uint8_t idx) {
@@ -2295,6 +2347,8 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 		.layer_be	= layer_be,
 		.slot_base	= slot_base,
 		.wtab_row	= wtab_row,
+		.row_caches = w->row_caches,
+		.row_pos	= w->row_pos,
 	};
 	int j = 0;
 	while (j < n_ops) {
@@ -2725,8 +2779,11 @@ static buffer *batch_slot(batch_scratch *bs, uint8_t slot) {
 }
 
 static buffer batch_row_view(const buffer *whole, int row, int row_elems) {
-	buffer v = *whole;
-	v.offset = whole->offset + ((size_t)row * row_elems * sizeof(float));
+	buffer v	 = *whole;
+	size_t delta = (size_t)row * row_elems * sizeof(float);
+	v.offset	 = whole->offset + delta;
+	if (whole->size >= delta)
+		v.size = whole->size - delta;
 	return v;
 }
 
@@ -6035,7 +6092,8 @@ static status_code exec_op_batch(const recipe_op *op, model *m, kvcache *cache, 
 }
 
 static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvcache *cache,
-													 struct compute_scratch *s,
+													 struct kvcache **row_caches,
+													 const int *row_pos, struct compute_scratch *s,
 													 const int32_t *tokens, int n_tokens,
 													 int pos_start, int flash_attn,
 													 float *logits_out) {
@@ -6048,9 +6106,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	if (!m->batchable)
 		return ERR_FALLBACK;
 
-	backend			   *a	= m->backend;
-	const model_recipe *r	= m->recipe;
-	const int			dim = m->dim;
+	backend			   *a	  = m->backend;
+	const model_recipe *r	  = m->recipe;
+	const int			dim	  = m->dim;
+	const int			n_out = row_pos ? n_tokens : 1;
 
 	const int max_head_dim = r->max_head_dim;
 	const int max_kv_heads = r->max_kv_heads;
@@ -6127,7 +6186,9 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 								.n_rows		= n_tokens,
 								.flash_attn = flash_attn,
 								.logits_out = NULL,
-								.mixed		= 0};
+								.mixed		= 0,
+								.row_caches = row_caches,
+								.row_pos	= row_pos};
 		st					 = walk_layer_ops(&w, ops, r->layer.n_ops);
 		if (st != OK)
 			goto done;
@@ -6140,20 +6201,23 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 
 	ensure_sync(a);
 
-	{
-		buffer	 last_x	 = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, n_tokens - 1, dim);
-		backend *owner_x = s->slots[RECIPE_SLOT_X].owner;
-		float	*tmp	 = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
-		st				 = a->buffer_read_f32(a, &last_x, tmp, dim);
+	for (int out_row = 0; out_row < n_out; out_row++) {
+		const int src_row = row_pos ? out_row : n_tokens - 1;
+		const int pos	  = row_pos ? row_pos[out_row] : pos_start + n_tokens - 1;
+		buffer	  last_x  = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, src_row, dim);
+		backend	 *owner_x = s->slots[RECIPE_SLOT_X].owner;
+		float	 *tmp	  = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
+		st				  = a->buffer_read_f32(a, &last_x, tmp, dim);
 		if (st != OK)
 			goto done;
 		st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
 		if (st != OK)
 			goto done;
 
+		float *row_logits = logits_out ? logits_out + (size_t)out_row * m->vocab_size : NULL;
 		for (int i = 0; i < r->n_post_ops; i++) {
-			st = exec_op(&r->post_ops[i], m, cache, s, tokens[n_tokens - 1],
-						 pos_start + n_tokens - 1, -1, flash_attn, logits_out);
+			st = exec_op(&r->post_ops[i], m, row_caches ? row_caches[out_row] : cache, s,
+						 tokens[src_row], pos, -1, flash_attn, row_logits);
 			if (st != OK)
 				goto done;
 		}
@@ -6164,16 +6228,83 @@ done:
 		a->end_batch(a);
 	}
 	if (st != OK && logits_out)
-		memset(logits_out, 0, (size_t)m->vocab_size * sizeof(float));
+		memset(logits_out, 0, (size_t)n_out * m->vocab_size * sizeof(float));
 	return st;
+}
+
+static int op_kind_is_decode_batchable(op_kind kind) {
+	switch (kind) {
+	case OP_NONE:
+	case OP_EMBD_LOOKUP:
+	case OP_SCALE_EMBEDDINGS:
+	case OP_RMSNORM:
+	case OP_RMSNORM_PER_HEAD:
+	case OP_RMSNORM_NOWEIGHT:
+	case OP_RMSNORM_ADD:
+	case OP_MATMUL:
+	case OP_MATMUL_RESIDUAL:
+	case OP_MATMUL_MULTI:
+	case OP_MATMUL_FFN_DOWN:
+	case OP_ROPE:
+	case OP_ROPE_QK_FUSED:
+	case OP_KV_PUT:
+	case OP_ATTENTION:
+	case OP_ADD:
+	case OP_SWAP:
+	case OP_FFN_ACTIVATE:
+	case OP_FFN_ACTIVATE_EX:
+	case OP_FFN_ACTIVATE_FUSED:
+	case OP_SCALE:
+	case OP_SOFTCAP:
+	case OP_LOGITS_READBACK:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int recipe_ops_are_decode_batchable(const recipe_op *ops, int n) {
+	for (int i = 0; i < n; i++)
+		if (!op_kind_is_decode_batchable(ops[i].kind))
+			return 0;
+	return 1;
+}
+
+int recipe_is_decode_batchable(const model *m) {
+	const model_recipe *r = m->recipe;
+	if (!r || !m->batchable || m->sliding_window > 0 || model_mixed_backend_mode(m) ||
+		m->arch_info->is_moe || m->arch_info->is_mla || m->arch_info->is_hybrid_recurrent)
+		return 0;
+	if (!backend_supports_batch_ops(m))
+		return 0;
+	if (!recipe_ops_are_decode_batchable(r->pre_ops, r->n_pre_ops) ||
+		!recipe_ops_are_decode_batchable(r->post_ops, r->n_post_ops))
+		return 0;
+	if (!r->per_layer_ops)
+		return recipe_ops_are_decode_batchable(r->layer.ops, r->layer.n_ops);
+	for (int li = 0; li < m->n_layers; li++)
+		if (!recipe_ops_are_decode_batchable(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
+											 r->layer.n_ops))
+			return 0;
+	return 1;
+}
+
+status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
+												struct compute_scratch *s, const int32_t *tokens,
+												const int *positions, int n_seqs, int flash_attn,
+												float *logits_out) {
+	if (!recipe_is_decode_batchable(m))
+		return ERR_FALLBACK;
+	return compute_forward_batch_recipe_fast(m, caches[0], caches, positions, s, tokens, n_seqs,
+											 positions[0], flash_attn, logits_out);
 }
 
 status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,
 										 int n_tokens, int pos_start, int flash_attn,
 										 float *logits_out) {
-	status_code fast_status = compute_forward_batch_recipe_fast(m, cache, s, tokens, n_tokens,
-																pos_start, flash_attn, logits_out);
+	status_code fast_status = compute_forward_batch_recipe_fast(
+		m, cache, NULL, NULL, s, tokens, n_tokens, pos_start, flash_attn, logits_out);
 	if (fast_status != ERR_FALLBACK && fast_status != ERR_UNSUPPORTED)
 		return fast_status;
 
