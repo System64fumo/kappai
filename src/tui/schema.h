@@ -39,7 +39,6 @@ typedef struct {
 	int ctx_size;
 	int n_threads;
 	int kv_quant;
-	int moe_pin;
 	int n_predict;
 	int top_k;
 	int repeat_last_n;

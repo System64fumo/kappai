@@ -30,6 +30,7 @@ typedef struct config {
 	const char *expert_devices[CONFIG_MAX_LAYER_DEVICES];
 	int			expert_counts[CONFIG_MAX_LAYER_DEVICES];
 	int			expert_priorities[CONFIG_MAX_LAYER_DEVICES];
+	const char *expert_pins[CONFIG_MAX_LAYER_DEVICES];
 	int			host_priority;
 
 	bool debug;

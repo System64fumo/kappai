@@ -67,7 +67,6 @@ static const field_desc ENGINE_FIELDS[] = {
 static const field_desc MOE_FIELDS[] = {
 	S_BOOL("stream", "Expert streaming", "streaming expert cache for MoE models", moe_stream),
 	S_BOOL("preload", "Preload experts", "load all expert weights at startup", moe_preload),
-	S_INT("pin", "Pin first n", "first n experts per layer never evicted", moe_pin, 0, INT_MAX),
 	S_STR("pin_list", "Pin list", "comma-separated expert ids, e.g. 3,17,42", moe_pin_list,
 		  SC_PINLIST_MAX),
 };
@@ -465,6 +464,15 @@ static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char
 						   const char *value, char *err, size_t errlen) {
 	bool is_model = strcasecmp(tab->name, "model") == 0;
 	bool is_moe	  = strcasecmp(tab->name, "moe") == 0;
+	if (is_moe && strcasecmp(key, "pin") == 0) {
+		char *end = NULL;
+		(void)strtol(value, &end, 10);
+		if (!*value || *end != '\0') {
+			snprintf(err, errlen, "'pin' expects an integer, got '%s'", value);
+			return -1;
+		}
+		return 1;
+	}
 	if (is_model && strcasecmp(key, "device") == 0) {
 		if (strlen(value) >= sizeof(legacy->device)) {
 			snprintf(err, errlen, "value too long for 'device'");
@@ -687,6 +695,8 @@ static void write_hcs(FILE *fp, const hcs_config *h) {
 			fprintf(fp, "layers = %s\n", hcs_format_count(d->layers, count, sizeof(count)));
 		if (d->experts != HCS_COUNT_UNSET)
 			fprintf(fp, "experts = %s\n", hcs_format_count(d->experts, count, sizeof(count)));
+		if (d->pins[0])
+			fprintf(fp, "pins = %s\n", d->pins);
 		if (d->has_priority)
 			fprintf(fp, "priority = %d\n", d->priority);
 		fputc('\n', fp);
@@ -776,7 +786,6 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	cfg->n_threads	  = sc->n_threads;
 	cfg->ctx_size	  = sc->ctx_size;
 	cfg->kv_quant	  = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
-	cfg->moe_pin	  = sc->moe_pin;
 	hcs_materialize(&sc->hcs, sc->model, cfg);
 	cfg->debug			   = sc->debug;
 	cfg->use_mmap		   = sc->use_mmap;

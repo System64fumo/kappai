@@ -79,6 +79,41 @@ int hcs_parse_priority(const char *text, int *out) {
 	return parse_bounded_int(buf, out);
 }
 
+int hcs_parse_pinlist(const char *text, char *out, size_t cap) {
+	out[0]			= '\0';
+	size_t		len = 0;
+	const char *p	= text;
+	while (*p == ' ' || *p == '\t')
+		p++;
+	if (*p == '\0')
+		return 0;
+	for (;;) {
+		while (*p == ' ' || *p == '\t')
+			p++;
+		char *tail = NULL;
+		long  v	   = strtol(p, &tail, 10);
+		if (tail == p)
+			return -1;
+		char piece[24];
+		snprintf(piece, sizeof(piece), "%s%ld", len ? "," : "", v);
+		size_t plen = strlen(piece);
+		if (len + plen + 1 > cap)
+			return -1;
+		memcpy(out + len, piece, plen + 1);
+		len += plen;
+		p = tail;
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (*p == ',') {
+			p++;
+			continue;
+		}
+		if (*p == '\0')
+			return 0;
+		return -1;
+	}
+}
+
 int hcs_parse_tasks(const char *text, unsigned *out) {
 	unsigned	mask = 0;
 	char		tok[HCS_NAME_MAX];
@@ -217,7 +252,7 @@ static int set_root_key(hcs_loader *l, const char *key, const char *value, char 
 
 static int set_section_key(hcs_section *s, const char *key, const char *value, char *err,
 						   size_t errlen) {
-	enum { SEEN_TASKS = 1, SEEN_LAYERS = 2, SEEN_EXPERTS = 4, SEEN_PRIORITY = 8 };
+	enum { SEEN_TASKS = 1, SEEN_LAYERS = 2, SEEN_EXPERTS = 4, SEEN_PRIORITY = 8, SEEN_PINS = 16 };
 	unsigned bit = 0;
 	int		 rc	 = 0;
 	if (strcasecmp(key, "tasks") == 0) {
@@ -232,6 +267,15 @@ static int set_section_key(hcs_section *s, const char *key, const char *value, c
 	} else if (strcasecmp(key, "priority") == 0) {
 		bit = SEEN_PRIORITY;
 		rc	= s->seen & bit ? 0 : hcs_parse_priority(value, &s->dev.priority);
+	} else if (strcasecmp(key, "pins") == 0) {
+		bit = SEEN_PINS;
+		rc	= 0;
+		if (s->seen & bit)
+			rc = -1;
+		else {
+			str_span trim = span_trim(value, strlen(value));
+			rc = trim.len == 0 ? 0 : hcs_parse_pinlist(value, s->dev.pins, sizeof(s->dev.pins));
+		}
 	} else {
 		snprintf(err, errlen, "unknown key '%s' in section [hcs.%s]", key, s->name);
 		return -1;
@@ -246,6 +290,9 @@ static int set_section_key(hcs_section *s, const char *key, const char *value, c
 					 value);
 		else if (bit == SEEN_PRIORITY)
 			snprintf(err, errlen, "'priority' expects a non-negative integer, got '%s'", value);
+		else if (bit == SEEN_PINS)
+			snprintf(err, errlen, "'pins' expects a comma-separated expert id list, got '%s'",
+					 value);
 		else
 			snprintf(err, errlen, "'%s' expects a non-negative integer or '*', got '%s'", key,
 					 value);
@@ -412,8 +459,9 @@ static int device_count(const hcs_device *d, hcs_field field) {
 }
 
 int hcs_resolve_counts(const hcs_config *h, hcs_field field, int total, int *held) {
-	long numeric = 0;
-	int	 star	 = -1;
+	long numeric				= 0;
+	int	 star					= -1;
+	int	 pin_n[HCS_MAX_DEVICES] = {0};
 	for (int i = 0; i < h->n_devices; i++) {
 		int count = device_count(&h->devices[i], field);
 		held[i]	  = count >= 0 ? count : 0;
@@ -421,15 +469,27 @@ int hcs_resolve_counts(const hcs_config *h, hcs_field field, int total, int *hel
 		if (count == HCS_COUNT_ALL && star < 0)
 			star = i;
 	}
+	if (field == HCS_FIELD_EXPERTS) {
+		int ids[128];
+		for (int i = 0; i < h->n_devices; i++) {
+			if (!h->devices[i].pins[0])
+				continue;
+			pin_n[i] = hcs_pin_list_ids(h->devices[i].pins, ids, 128);
+			numeric += pin_n[i];
+		}
+	}
 	if (star >= 0 && numeric < total) {
-		held[star] = total - (int)numeric;
+		held[star] = total - (int)numeric + pin_n[star];
 		numeric	   = total;
+	} else if (field == HCS_FIELD_EXPERTS) {
+		for (int i = 0; i < h->n_devices; i++)
+			held[i] += pin_n[i];
 	}
 	return (int)MIN(numeric, INT_MAX);
 }
 
 static bool check_coverage(violations *v, const hcs_config *h, hcs_field field, int total,
-						   int star_owner, int *held) {
+						   int star_owner, bool moe_stream, int *held) {
 	bool		experts	 = field == HCS_FIELD_EXPERTS;
 	const char *key		 = experts ? "experts" : "layers";
 	const char *unit	 = experts ? "expert(s)" : "layer(s)";
@@ -449,7 +509,7 @@ static bool check_coverage(violations *v, const hcs_config *h, hcs_field field, 
 		return false;
 	}
 	if (assigned < total) {
-		if (experts)
+		if (experts && moe_stream)
 			return true;
 		add_violation(v, name, key,
 					  "%d %s assigned, model has %d%s; add '%s = *' to a device or assign %d more",
@@ -466,22 +526,64 @@ static int first_set_experts(const hcs_config *h) {
 	return HCS_COUNT_UNSET;
 }
 
+int hcs_pin_list_ids(const char *pins, int *out, int cap) {
+	char canon[HCS_PINLIST_MAX];
+	if (!pins[0] || hcs_parse_pinlist(pins, canon, sizeof(canon)) < 0)
+		return 0;
+	int	  n	   = 0;
+	char *save = NULL;
+	for (char *tok = strtok_r(canon, ",", &save); tok && n < cap; tok = strtok_r(NULL, ",", &save))
+		out[n++] = atoi(tok);
+	return n;
+}
+
+static void check_pin_rules(violations *v, const hcs_config *h, int n_experts) {
+	int list[HCS_MAX_DEVICES][128];
+	int len[HCS_MAX_DEVICES];
+	for (int i = 0; i < h->n_devices; i++)
+		len[i] = hcs_pin_list_ids(h->devices[i].pins, list[i], 128);
+	for (int i = 0; i < h->n_devices; i++) {
+		for (int k = 0; k < len[i]; k++) {
+			for (int t = 0; t < k; t++)
+				if (list[i][t] == list[i][k])
+					add_violation(v, h->devices[i].name, "pins",
+								  "expert %d is listed more than once", list[i][k]);
+			if (n_experts > 0 && list[i][k] >= n_experts) {
+				add_violation(v, h->devices[i].name, "pins",
+							  "expert id %d out of range; the model has %d expert(s) per layer",
+							  list[i][k], n_experts);
+				continue;
+			}
+			for (int j = 0; j < i; j++)
+				for (int t = 0; t < len[j]; t++)
+					if (list[j][t] == list[i][k])
+						add_violation(v, h->devices[i].name, "pins",
+									  "expert %d is already pinned on '%s'; an expert can only "
+									  "be pinned once",
+									  list[i][k], h->devices[j].name);
+		}
+	}
+}
+
 static void check_model_rules(violations *v, const hcs_config *h, int n_layers, int n_experts,
-							  int star_owner, int experts_star_owner) {
+							  int star_owner, int experts_star_owner, bool moe_stream) {
 	int held[HCS_MAX_DEVICES];
-	check_coverage(v, h, HCS_FIELD_LAYERS, n_layers, star_owner, held);
+	check_coverage(v, h, HCS_FIELD_LAYERS, n_layers, star_owner, false, held);
 	if (n_experts > 0 && first_set_experts(h) != HCS_COUNT_UNSET) {
 		int expert_held[HCS_MAX_DEVICES];
-		check_coverage(v, h, HCS_FIELD_EXPERTS, n_experts, experts_star_owner, expert_held);
+		check_coverage(v, h, HCS_FIELD_EXPERTS, n_experts, experts_star_owner, moe_stream,
+					   expert_held);
 	}
 
+	if (n_experts > 0)
+		check_pin_rules(v, h, n_experts);
 	for (int i = 0; i < h->n_devices; i++) {
 		const hcs_device *d = &h->devices[i];
 		if (n_experts == 0 && d->experts != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "experts", "model is not a MoE model; remove this key");
 		if (n_experts == 0 && d->has_priority)
 			add_violation(v, d->name, "priority", "model is not a MoE model; remove this key");
-		bool no_experts = d->experts == 0 || d->experts == HCS_COUNT_UNSET;
+		bool no_experts = (d->experts == 0 || d->experts == HCS_COUNT_UNSET) && !d->pins[0];
 		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "device", "holds nothing; remove it from 'devices'");
 	}
@@ -497,7 +599,8 @@ int hcs_probe_model(const char *path, int *n_layers, int *n_experts, int *n_kv_l
 	return s == OK ? 0 : -1;
 }
 
-int hcs_validate(const hcs_config *config, const char *model_path, char *err, size_t errlen) {
+int hcs_validate(const hcs_config *config, const char *model_path, bool moe_stream, char *err,
+				 size_t errlen) {
 	hcs_config		  eff = hcs_effective(config);
 	const hcs_config *h	  = &eff;
 	violations		  v	  = {err, errlen, 0};
@@ -524,7 +627,8 @@ int hcs_validate(const hcs_config *config, const char *model_path, char *err, si
 		if (!config->enabled)
 			return err[0] ? -1 : 0;
 		if (hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) == 0)
-			check_model_rules(&v, h, n_layers, n_experts, star_owner, experts_star_owner);
+			check_model_rules(&v, h, n_layers, n_experts, star_owner, experts_star_owner,
+							  moe_stream);
 		else
 			v.len += snprintf(err + v.len, v.len < errlen ? errlen - v.len : 0,
 							  "  cannot validate HCS: model '%s' unreadable\n",
@@ -564,17 +668,23 @@ static void materialize_layer_map(const hcs_config *h, const char *model_path, c
 }
 
 static void materialize_expert_parts(const hcs_config *h, int n_experts, config *cfg) {
-	if (!h->enabled || n_experts <= 0 || first_set_experts(h) == HCS_COUNT_UNSET)
+	bool any_pins = false;
+	for (int d = 0; d < h->n_devices; d++)
+		any_pins |= h->devices[d].pins[0] != '\0';
+	if (!h->enabled || n_experts <= 0 || (first_set_experts(h) == HCS_COUNT_UNSET && !any_pins))
 		return;
 	int expert_held[HCS_MAX_DEVICES];
 	hcs_resolve_counts(h, HCS_FIELD_EXPERTS, n_experts, expert_held);
 	for (int d = 0; d < h->n_devices && cfg->n_expert_devices < CONFIG_MAX_LAYER_DEVICES; d++) {
-		if (expert_held[d] <= 0)
+		int	 held	  = expert_held[d];
+		bool has_pins = h->devices[d].pins[0] != '\0';
+		if (held <= 0 && !has_pins)
 			continue;
 		cfg->expert_devices[cfg->n_expert_devices] = h->devices[d].name;
-		cfg->expert_counts[cfg->n_expert_devices]  = expert_held[d];
+		cfg->expert_counts[cfg->n_expert_devices]  = held;
 		cfg->expert_priorities[cfg->n_expert_devices] =
 			h->devices[d].has_priority ? h->devices[d].priority : CONFIG_PRIORITY_UNSET;
+		cfg->expert_pins[cfg->n_expert_devices] = has_pins ? h->devices[d].pins : NULL;
 		cfg->n_expert_devices++;
 	}
 	for (int d = 0; d < h->n_devices; d++) {

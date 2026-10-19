@@ -15,6 +15,7 @@ enum {
 	UI_PAIR_TITLE = 1,
 	UI_PAIR_ERR,
 	UI_PAIR_OK,
+	UI_PAIR_WARN,
 };
 
 static void on_sigint(int sig) {
@@ -35,6 +36,8 @@ chtype ui_attr(int kind) {
 		return g_colors ? COLOR_PAIR(UI_PAIR_ERR) : A_REVERSE;
 	case UI_OK:
 		return g_colors ? COLOR_PAIR(UI_PAIR_OK) : A_BOLD;
+	case UI_WARN:
+		return g_colors ? COLOR_PAIR(UI_PAIR_WARN) : A_BOLD;
 	default:
 		return A_DIM;
 	}
@@ -59,6 +62,7 @@ int ui_init(void) {
 			init_pair(UI_PAIR_TITLE, COLOR_CYAN, -1);
 			init_pair(UI_PAIR_ERR, COLOR_RED, -1);
 			init_pair(UI_PAIR_OK, COLOR_GREEN, -1);
+			init_pair(UI_PAIR_WARN, COLOR_YELLOW, -1);
 		}
 	}
 	ui_install_interrupt();

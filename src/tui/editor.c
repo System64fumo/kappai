@@ -54,9 +54,12 @@ typedef enum {
 	HCS_REF_TASKS,
 	HCS_REF_LAYERS,
 	HCS_REF_EXPERTS,
+	HCS_REF_PINLIST,
 	HCS_REF_SEP,
 	HCS_REF_POOL_TITLE,
 	HCS_REF_POOL_PRIORITY,
+	HCS_REF_STREAM,
+	HCS_REF_PRELOAD,
 } hcs_ref_kind;
 
 typedef struct {
@@ -73,7 +76,7 @@ static const char EDITOR_HCS_MOE_LAYERS_HINT[] =
 	"non-expert layers held (attention, norms, shared weights), a number or '*' for the "
 	"remainder (one '*' per config)";
 
-#define HCS_REF_FIELD_COUNT 4
+#define HCS_REF_FIELD_COUNT 5
 
 static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"compute device, <backend>_<n>",
@@ -81,6 +84,7 @@ static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
 	"experts of every layer cached (LRU) on this device, a number, '*' for the remainder (one '*' "
 	"per config) or empty for the default",
+	"comma-separated expert ids pinned in this device's cache, e.g. 3,17,42",
 };
 
 static const char EDITOR_HCS_POOL_HINT[] =
@@ -107,6 +111,23 @@ static bool editor_model_is_moe(const editor_state *st) {
 	return st->probe_ok && st->n_experts > 0;
 }
 
+static bool editor_tab_visible(const editor_state *st, int tab) {
+	if (editor_tab_is_hcs(tab))
+		return true;
+	if (strcmp(editor_schema_tab(tab)->name, "moe") != 0)
+		return true;
+	return editor_model_is_moe(st) && !st->sc.hcs.enabled;
+}
+
+static int editor_tab_next_visible(const editor_state *st, int from, int dir) {
+	int n = editor_tab_count();
+	int t = from;
+	do {
+		t = (t + dir + n) % n;
+	} while (!editor_tab_visible(st, t));
+	return t;
+}
+
 static bool editor_hcs_compact(const editor_state *st) {
 	return st->sc.hcs.enabled && COLS < EDITOR_HCS_PANEL_MIN_COLS;
 }
@@ -118,7 +139,13 @@ static int editor_header_lines(const editor_state *st, int tab) {
 }
 
 static int editor_hcs_fields_per_device(const editor_state *st) {
-	return editor_model_is_dense(st) ? 3 : 4;
+	if (editor_model_is_dense(st))
+		return 3;
+	return st->sc.moe_stream ? 5 : 4;
+}
+
+static int editor_hcs_stream_rows(const editor_state *st) {
+	return editor_model_is_moe(st) ? 2 : 0;
 }
 
 static bool editor_hcs_can_add(const editor_state *st) {
@@ -223,8 +250,9 @@ static bool editor_pools_visible(const editor_state *st) {
 static int editor_hcs_total_rows(const editor_state *st) {
 	if (!st->sc.hcs.enabled)
 		return 1;
-	int stride = editor_hcs_fields_per_device(st) + 1;
-	int rows   = 2 + st->sc.hcs.n_devices * stride + (editor_hcs_can_add(st) ? 1 : 0);
+	int stride	= editor_hcs_fields_per_device(st) + 1;
+	int streams = editor_hcs_stream_rows(st);
+	int rows	= 2 + streams + st->sc.hcs.n_devices * stride + (editor_hcs_can_add(st) ? 1 : 0);
 	if (editor_pools_visible(st)) {
 		rows += st->n_pools * 3 + 2;
 	} else if (!editor_hcs_can_add(st)) {
@@ -241,6 +269,16 @@ static hcs_ref editor_hcs_ref(const editor_state *st, int row) {
 	int r	   = row - 2;
 	if (r < 0)
 		return (hcs_ref){HCS_REF_SPACER, -1};
+	int streams = editor_hcs_stream_rows(st);
+	if (streams) {
+		if (r == 0)
+			return (hcs_ref){HCS_REF_STREAM, -1};
+		if (r == 1)
+			return (hcs_ref){HCS_REF_PRELOAD, -1};
+		if (r == 2)
+			return (hcs_ref){HCS_REF_SPACER, -1};
+		r -= 3;
+	}
 	if (r < st->sc.hcs.n_devices * stride) {
 		int k = r % stride;
 		if (k == per)
@@ -321,6 +359,16 @@ static void editor_hcs_row_text(const editor_state *st, int row, char *label, si
 	}
 	if (ref.kind == HCS_REF_SPACER)
 		return;
+	if (ref.kind == HCS_REF_STREAM) {
+		snprintf(label, label_cap, "Expert streaming");
+		snprintf(val, val_cap, "%s", st->sc.moe_stream ? "on" : "off");
+		return;
+	}
+	if (ref.kind == HCS_REF_PRELOAD) {
+		snprintf(label, label_cap, "Preload experts");
+		snprintf(val, val_cap, "%s", st->sc.moe_preload ? "on" : "off");
+		return;
+	}
 
 	const hcs_device *d = &h->devices[ref.device];
 	char			  count[16];
@@ -338,6 +386,10 @@ static void editor_hcs_row_text(const editor_state *st, int row, char *label, si
 		snprintf(val, val_cap, "%s",
 				 d->layers == HCS_COUNT_UNSET ? "(not set)"
 											  : hcs_format_count(d->layers, count, sizeof(count)));
+		break;
+	case HCS_REF_PINLIST:
+		snprintf(label, label_cap, "  Pins");
+		snprintf(val, val_cap, "%s", d->pins[0] ? d->pins : "(none)");
 		break;
 	case HCS_REF_POOL_TITLE: {
 		char devices[128];
@@ -397,6 +449,12 @@ static void editor_refresh_probe(editor_state *st) {
 		d->experts		= HCS_COUNT_UNSET;
 		d->has_priority = false;
 		st->dirty		= true;
+	}
+	for (int i = 0; i < st->sc.hcs.n_devices; i++) {
+		if (!st->sc.hcs.devices[i].pins[0])
+			continue;
+		st->sc.hcs.devices[i].pins[0] = '\0';
+		st->dirty					  = true;
 	}
 }
 
@@ -458,6 +516,8 @@ static void editor_draw_value(int y, int x, int w, const char *val, bool selecte
 static void editor_draw_tabs(const editor_state *st) {
 	int tx = 2;
 	for (int t = 0; t < editor_tab_count(); t++) {
+		if (!editor_tab_visible(st, t))
+			continue;
 		char label[48];
 		snprintf(label, sizeof(label), " %s ",
 				 editor_tab_is_hcs(t) ? "hcs" : editor_schema_tab(t)->name);
@@ -530,13 +590,17 @@ static void editor_draw_rows(const editor_state *st) {
 	}
 }
 
-static void editor_hcs_summary(int n, int assigned, char *out, size_t cap) {
+static void editor_hcs_summary(int n, int assigned, bool stream, char *out, size_t cap) {
 	if (assigned == n)
 		snprintf(out, cap, "all satisfied");
 	else if (assigned < n)
-		snprintf(out, cap, "%d unassigned", n - assigned);
+		snprintf(out, cap, "%d %s", n - assigned, stream ? "streamed" : "unassigned");
 	else
 		snprintf(out, cap, "%d over-assigned", assigned - n);
+}
+
+static chtype editor_hcs_summary_attr(int assigned, int total, bool streamed) {
+	return assigned == total ? ui_attr(UI_OK) : streamed ? ui_attr(UI_WARN) : ui_attr(UI_ERR);
 }
 
 static void editor_draw_hcs_compact_line(const editor_state *st, int y, hcs_field field,
@@ -544,12 +608,13 @@ static void editor_draw_hcs_compact_line(const editor_state *st, int y, hcs_fiel
 	const char *name = field == HCS_FIELD_EXPERTS ? "experts" : "layers";
 	int			held[HCS_MAX_DEVICES];
 	int			assigned = hcs_resolve_counts(&st->sc.hcs, field, total, held);
+	bool		stream	 = field == HCS_FIELD_EXPERTS && st->sc.moe_stream;
 	char		summary[48];
 	char		line[128];
-	editor_hcs_summary(total, assigned, summary, sizeof(summary));
+	editor_hcs_summary(total, assigned, stream, summary, sizeof(summary));
 	snprintf(line, sizeof(line), "%s: %d total, %d assigned, %s", name, total, MIN(assigned, total),
 			 summary);
-	ui_putn(y, 3, line, COLS - 6, assigned == total ? ui_attr(UI_OK) : ui_attr(UI_ERR));
+	ui_putn(y, 3, line, COLS - 6, editor_hcs_summary_attr(assigned, total, stream));
 }
 
 static void editor_draw_hcs_compact(const editor_state *st) {
@@ -602,13 +667,14 @@ static int editor_draw_hcs_section(const editor_state *st, hcs_field field, int 
 	bool			  experts	= field == HCS_FIELD_EXPERTS;
 	int				  px		= COLS - EDITOR_HCS_PANEL_W;
 	int				  pw		= EDITOR_HCS_PANEL_W - 2;
+	bool			  streamed	= experts && st->sc.moe_stream;
 	char			  summary[48];
-	editor_hcs_summary(total, assigned, summary, sizeof(summary));
+	editor_hcs_summary(total, assigned, streamed, summary, sizeof(summary));
 
 	ui_putn(y++, px, experts ? "Expert status" : "Layer status", pw, A_BOLD);
 	editor_draw_hcs_value(y++, px, pw, experts ? "Experts per layer" : "Model layers", total);
 	editor_draw_hcs_value(y++, px, pw, "Assigned", MIN(assigned, total));
-	ui_putn(y++, px, summary, pw, assigned == total ? ui_attr(UI_OK) : ui_attr(UI_ERR));
+	ui_putn(y++, px, summary, pw, editor_hcs_summary_attr(assigned, total, streamed));
 	y++;
 
 	int budget	  = (last - y + 1) / sections_left;
@@ -632,8 +698,11 @@ static int editor_draw_hcs_section(const editor_state *st, hcs_field field, int 
 		ui_putn(y, px, name, pw - (int)strlen(value) - 1, 0);
 		ui_putn(y, px + pw - (int)strlen(value), value, pw, 0);
 	}
-	if (assigned < total && y <= last)
-		ui_putn(y++, px, ". unassigned", pw, ui_attr(UI_DIM));
+	if (assigned < total && y <= last) {
+		bool streamed = experts && st->sc.moe_stream;
+		ui_putn(y++, px, streamed ? ". streamed" : ". unassigned", pw,
+				streamed ? ui_attr(UI_WARN) : ui_attr(UI_DIM));
+	}
 	return y + 1;
 }
 
@@ -963,6 +1032,68 @@ static void editor_edit_tasks(editor_state *st, hcs_device *d) {
 	st->dirty = true;
 }
 
+static void editor_toggle_bool(editor_state *st, const char *title, bool *value) {
+	*value	  = !*value;
+	st->dirty = true;
+	char msg[64];
+	snprintf(msg, sizeof(msg), "%s: %s", title, *value ? "on" : "off");
+	editor_set_status(st, UI_OK, msg);
+}
+
+typedef struct {
+	int max_id;
+} pinlist_validate_ud;
+
+static int editor_validate_pinlist(const char *value, char *err, size_t errlen, void *ud) {
+	pinlist_validate_ud *pv = ud;
+	char				 canon[HCS_PINLIST_MAX];
+	if (hcs_parse_pinlist(value, canon, sizeof(canon)) != 0) {
+		snprintf(err, errlen, "expected a comma-separated expert id list, e.g. 3,17,42");
+		return -1;
+	}
+	long  ids[128];
+	int	  n	   = 0;
+	char *save = NULL;
+	for (char *tok = strtok_r(canon, ",", &save); tok && n < 128;
+		 tok	   = strtok_r(NULL, ",", &save)) {
+		ids[n++] = strtol(tok, NULL, 10);
+		long id	 = ids[n - 1];
+		if (id < 0) {
+			snprintf(err, errlen, "expert ids must be non-negative, got %ld", id);
+			return -1;
+		}
+		if (pv->max_id > 0 && id >= pv->max_id) {
+			snprintf(err, errlen,
+					 "expert id %ld out of range; the model has %d expert(s) "
+					 "per layer",
+					 id, pv->max_id);
+			return -1;
+		}
+	}
+	for (int i = 0; i < n; i++)
+		for (int j = 0; j < i; j++)
+			if (ids[i] == ids[j]) {
+				snprintf(err, errlen, "expert %ld is listed more than once", ids[i]);
+				return -1;
+			}
+	return 0;
+}
+
+static void editor_edit_pins(editor_state *st, hcs_device *d) {
+	pinlist_validate_ud pv = {st->probe_ok ? st->n_experts : 0};
+	char				buf[HCS_PINLIST_MAX];
+	int r		  = ui_input("Pins", d->pins, buf, sizeof(buf), editor_validate_pinlist, &pv, NULL);
+	st->status[0] = '\0';
+	if (r <= 0)
+		return;
+	char canon[HCS_PINLIST_MAX];
+	hcs_parse_pinlist(buf, canon, sizeof(canon));
+	if (strcmp(canon, d->pins) == 0)
+		return;
+	snprintf(d->pins, sizeof(d->pins), "%s", canon);
+	st->dirty = true;
+}
+
 static void editor_toggle_hcs(editor_state *st) {
 	hcs_config *h = &st->sc.hcs;
 	st->status[0] = '\0';
@@ -1059,6 +1190,15 @@ static void editor_edit_hcs_row(editor_state *st, int row) {
 						  st->n_experts, "experts");
 		editor_pools_build(st);
 		return;
+	case HCS_REF_PINLIST:
+		editor_edit_pins(st, &st->sc.hcs.devices[ref.device]);
+		return;
+	case HCS_REF_STREAM:
+		editor_toggle_bool(st, "Expert streaming", &st->sc.moe_stream);
+		return;
+	case HCS_REF_PRELOAD:
+		editor_toggle_bool(st, "Preload experts", &st->sc.moe_preload);
+		return;
 	case HCS_REF_POOL_PRIORITY:
 		editor_edit_pool_priority(st, ref.device);
 		return;
@@ -1074,7 +1214,7 @@ static void editor_save(editor_state *st) {
 			st->sc.hcs.devices[i].experts	   = HCS_COUNT_UNSET;
 			st->sc.hcs.devices[i].has_priority = false;
 		}
-	if (hcs_validate(&st->sc.hcs, st->sc.model, hcs_err, sizeof(hcs_err)) < 0) {
+	if (hcs_validate(&st->sc.hcs, st->sc.model, st->sc.moe_stream, hcs_err, sizeof(hcs_err)) < 0) {
 		ui_message("Cannot save: invalid HCS configuration", hcs_err, true);
 		editor_set_status(st, UI_ERR, "not saved: HCS validation failed");
 		beep();
@@ -1110,8 +1250,11 @@ static void editor_help(const editor_state *st) {
 		editor_hcs_row_text(st, st->row, label_buf, sizeof(label_buf), value_buf,
 							sizeof(value_buf));
 		label = label_buf;
-		hint  = ref.kind == HCS_REF_ENABLE ? EDITOR_HCS_ENABLE_HINT
-				: ref.kind == HCS_REF_ADD  ? "add another device; it takes '*' (the remainder)"
+		hint  = ref.kind == HCS_REF_ENABLE	  ? EDITOR_HCS_ENABLE_HINT
+				: ref.kind == HCS_REF_ADD	  ? "add another device; it takes '*' (the remainder)"
+				: ref.kind == HCS_REF_STREAM  ? "stream experts between devices instead of holding "
+												"them all in memory"
+				: ref.kind == HCS_REF_PRELOAD ? "load all expert weights at startup"
 				: ref.kind == HCS_REF_POOL_TITLE
 					? "devices that share the same memory for expert streaming; they carry one "
 					  "priority together"
@@ -1159,8 +1302,9 @@ int editor_run(const sc_entry *entry) {
 	}
 
 	for (;;) {
-		if (editor_tab_is_hcs(st.tab) && st.sc.hcs.enabled)
-			editor_refresh_probe(&st);
+		editor_refresh_probe(&st);
+		if (!editor_tab_visible(&st, st.tab))
+			editor_switch_tab(&st, editor_tab_next_visible(&st, st.tab, 1));
 		editor_snap_row(&st);
 		editor_scroll(&st);
 		editor_draw(&st);
@@ -1197,10 +1341,10 @@ int editor_run(const sc_entry *entry) {
 			st.status[0] = '\0';
 			break;
 		case '\t':
-			editor_switch_tab(&st, (st.tab + 1) % editor_tab_count());
+			editor_switch_tab(&st, editor_tab_next_visible(&st, st.tab, 1));
 			break;
 		case KEY_BTAB:
-			editor_switch_tab(&st, (st.tab + editor_tab_count() - 1) % editor_tab_count());
+			editor_switch_tab(&st, editor_tab_next_visible(&st, st.tab, -1));
 			break;
 		case 'a':
 		case 'A':

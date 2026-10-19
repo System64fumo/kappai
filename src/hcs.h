@@ -17,6 +17,8 @@
 #define HCS_COUNT_ALL (-1)
 #define HCS_COUNT_UNSET (-2)
 
+#define HCS_PINLIST_MAX 256
+
 typedef enum {
 	HCS_FIELD_LAYERS,
 	HCS_FIELD_EXPERTS,
@@ -27,6 +29,7 @@ typedef struct {
 	unsigned tasks;
 	int		 layers;
 	int		 experts;
+	char	 pins[HCS_PINLIST_MAX];
 	bool	 has_priority;
 	int		 priority;
 } hcs_device;
@@ -68,6 +71,8 @@ void hcs_set_simple(hcs_config *h, const char *device);
 int			hcs_parse_count(const char *text, int *out);
 const char *hcs_format_count(int value, char *buf, size_t cap);
 int			hcs_parse_priority(const char *text, int *out);
+int			hcs_parse_pinlist(const char *text, char *out, size_t cap);
+int			hcs_pin_list_ids(const char *pins, int *out, int cap);
 int			hcs_parse_tasks(const char *text, unsigned *out);
 void		hcs_format_tasks(unsigned tasks, char *buf, size_t cap);
 void		hcs_format_devices(const hcs_config *h, char *buf, size_t cap);
@@ -85,7 +90,8 @@ int hcs_layout_order(const hcs_config *h, int *order);
 int hcs_resolve_counts(const hcs_config *h, hcs_field field, int total, int *held);
 int hcs_probe_model(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 
-int hcs_validate(const hcs_config *h, const char *model_path, char *err, size_t errlen);
+int hcs_validate(const hcs_config *h, const char *model_path, bool moe_stream, char *err,
+				 size_t errlen);
 
 void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg);
 

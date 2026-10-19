@@ -58,7 +58,11 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 
 	recipe_build_post_ops(r, m);
 
-	moe_stream_cache_init((struct model *)m);
+	if (moe_stream_cache_init((struct model *)m) != OK) {
+		ERROR("recipe: failed to init MoE expert cache");
+		recipe_free(r);
+		return NULL;
+	}
 	return r;
 }
 

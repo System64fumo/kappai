@@ -58,7 +58,7 @@ static void wait_for_keypress(void) {
 
 static int run_saved_config(const saved_config *sc, bool server_mode) {
 	char hcs_err[HCS_ERR_MAX];
-	if (hcs_validate(&sc->hcs, sc->model, hcs_err, sizeof(hcs_err)) < 0) {
+	if (hcs_validate(&sc->hcs, sc->model, sc->moe_stream, hcs_err, sizeof(hcs_err)) < 0) {
 		fprintf(stderr, "kappai: malformed/misconfigured config '%s':\n%s", sc->name, hcs_err);
 		return 1;
 	}

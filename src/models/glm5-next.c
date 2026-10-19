@@ -92,7 +92,11 @@ static model_recipe *build_glm5_next_recipe(const model *m) {
 		mk_backend_op(OP_HC_FINAL, RECIPE_SLOT_HC, RECIPE_SLOT_X, WIDX_NONE, STAGE_ADD);
 	r->n_post_ops++;
 
-	moe_stream_cache_init((struct model *)m);
+	if (moe_stream_cache_init((struct model *)m) != OK) {
+		ERROR("recipe: failed to init MoE expert cache");
+		recipe_free(r);
+		return NULL;
+	}
 	return r;
 }
 

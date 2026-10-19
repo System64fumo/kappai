@@ -19,7 +19,7 @@ static hcs_config single_device(const char *name, unsigned tasks, int layers, in
 
 static int validate_has(const hcs_config *h, const char *needle) {
 	char err[HCS_ERR_MAX];
-	int	 rc = hcs_validate(h, synth_chat_model_path, err, sizeof(err));
+	int	 rc = hcs_validate(h, synth_chat_model_path, true, err, sizeof(err));
 	return rc < 0 && strstr(err, needle) != NULL;
 }
 
@@ -148,7 +148,7 @@ static void test_enabled_flag(void) {
 	h.enabled  = false;
 	config cfg = config_defaults();
 	hcs_materialize(&h, synth_chat_model_path, &cfg);
-	ok = hcs_validate(&h, "/nonexistent/model.gguf", err, sizeof(err)) == 0 &&
+	ok = hcs_validate(&h, "/nonexistent/model.gguf", true, err, sizeof(err)) == 0 &&
 		 strcmp(cfg.device, "cpu_0") == 0 && cfg.ngl == -1 && cfg.moe_cache_cap == 0;
 	record_hcs("enabled.disabled_maps_to_single_device", ok, "err='%s' cap=%d", err,
 			   cfg.moe_cache_cap);
@@ -178,11 +178,11 @@ static void test_validate(void) {
 
 	hcs_config h = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
 	char	   err[HCS_ERR_MAX];
-	int		   ok = hcs_validate(&h, synth_chat_model_path, err, sizeof(err)) == 0;
+	int		   ok = hcs_validate(&h, synth_chat_model_path, true, err, sizeof(err)) == 0;
 	record_hcs("validate.v1_baseline", ok, "err='%s'", err);
 
 	h  = single_device("cpu_0", HCS_TASKS_ALL, n_layers, HCS_COUNT_UNSET);
-	ok = hcs_validate(&h, synth_chat_model_path, err, sizeof(err)) == 0;
+	ok = hcs_validate(&h, synth_chat_model_path, true, err, sizeof(err)) == 0;
 	record_hcs("validate.explicit_all_layers", ok, "err='%s'", err);
 
 	h  = single_device("cpu_0", HCS_TASKS_ALL, 1, HCS_COUNT_UNSET);
@@ -218,12 +218,12 @@ static void test_validate(void) {
 	char available[4][BACKEND_DEVICE_NAME_MAX];
 	if (backend_enum_devices(available, 4) >= 2 && n_layers >= 2) {
 		h  = two_devices(available[0], 1, available[1], HCS_COUNT_ALL);
-		ok = hcs_validate(&h, synth_chat_model_path, err, sizeof(err)) == 0;
+		ok = hcs_validate(&h, synth_chat_model_path, true, err, sizeof(err)) == 0;
 		record_hcs("validate.two_devices_accepted", ok, "err='%s'", err);
 	}
 
 	h  = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
-	ok = hcs_validate(&h, "/nonexistent/model.gguf", err, sizeof(err)) < 0 &&
+	ok = hcs_validate(&h, "/nonexistent/model.gguf", true, err, sizeof(err)) < 0 &&
 		 strstr(err, "cannot validate HCS: model '/nonexistent/model.gguf' unreadable") != NULL;
 	record_hcs("validate.unreadable_model", ok, "err='%s'", err);
 
@@ -240,7 +240,7 @@ static void test_validate(void) {
 		int	   experts_total = n_experts;
 
 		h  = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4);
-		ok = hcs_validate(&h, synth_dsa_model_path, err, sizeof(err)) == 0;
+		ok = hcs_validate(&h, synth_dsa_model_path, true, err, sizeof(err)) == 0;
 		record_hcs("validate.experts_partial_streams", ok, "err='%s' total=%d", err, experts_total);
 
 		hcs_materialize(&h, synth_dsa_model_path, &cfg2);

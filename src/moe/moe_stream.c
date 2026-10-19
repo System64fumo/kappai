@@ -2,6 +2,7 @@
 #include "moe/moe_stream.h"
 #include "common.h"
 #include "config.h"
+#include "hcs.h"
 #include "log.h"
 #include "memconfig.h"
 #include "model.h"
@@ -68,6 +69,7 @@ struct moe_stream_cache {
 	_Atomic uint64_t		 stat_lru_hits;
 	int						 n_pinned;
 	backend				   **pin_be;
+	int						*pin_ids;
 	backend					*tier_be;
 	moe_tier_policy			 tier_policy;
 	const void				*map_base;
@@ -659,10 +661,14 @@ typedef struct {
 	int		  n_pinned;
 	int		  lru_cap;
 	backend **pin_be;
+	int		 *pin_ids;
 	backend	 *tier_be;
 	int		  tier_cap;
 	int		  tier_pool;
 } moe_hcs_plan;
+
+static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_part, int n_dev,
+						  int pin_host, moe_hcs_plan *p);
 
 static int moe_backend_resident_capable(backend *b) {
 	return b && !backend_has_cap(b, BCAP_IS_HOST) && b->moe_expert_ffn &&
@@ -717,6 +723,12 @@ static status_code moe_plan_hcs(const struct model *m, const config *cfg, moe_hc
 		p->tier_cap =
 			moe_tier_pool_capacity(&m->topo->pools[p->tier_pool], per_expert * (size_t)moe_layers,
 								   m->expert_parts[tier_part].count);
+		if (tier_part < cfg->n_expert_devices && cfg->expert_pins[tier_part]) {
+			int tier_pins[128];
+			int n_tier_pins = hcs_pin_list_ids(cfg->expert_pins[tier_part], tier_pins, 128);
+			p->tier_cap		= p->tier_cap > n_tier_pins ? p->tier_cap - n_tier_pins : n_tier_pins;
+			DEBUG("MoE: %d tier pool slot(s)/layer reserved for pins", n_tier_pins);
+		}
 		if (p->tier_cap > 0)
 			p->tier_be = m->expert_parts[tier_part].be;
 		else
@@ -791,7 +803,125 @@ static status_code moe_plan_hcs(const struct model *m, const config *cfg, moe_hc
 	if (p->tier_be)
 		INFO("MoE tiering: pool0 -> pool%d ('%s'), %d expert slot(s)/layer", p->tier_pool,
 			 p->tier_be->name ? p->tier_be->name : "?", p->tier_cap);
+	if (!moe_plan_pins(m, cfg, tier_part, n_dev, pin_host, p))
+		return ERR_INVALID_ARG;
 	return OK;
+}
+
+static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_part, int n_dev,
+						  int pin_host, moe_hcs_plan *p) {
+	int	 n_exp = m->moe.n_experts;
+	int	 listed[MODEL_MAX_EXPERT_PARTS][128];
+	int	 listed_len[MODEL_MAX_EXPERT_PARTS] = {0};
+	int	 listed_total						= 0;
+	bool have_pins							= false;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		const char *text = i < cfg->n_expert_devices ? cfg->expert_pins[i] : NULL;
+		listed_len[i]	 = text ? hcs_pin_list_ids(text, listed[i], 128) : 0;
+		have_pins |= listed_len[i] > 0;
+		listed_total += listed_len[i];
+	}
+	if (!have_pins)
+		return true;
+
+	int		 share[MODEL_MAX_EXPERT_PARTS]	 = {0};
+	backend *part_be[MODEL_MAX_EXPERT_PARTS] = {NULL};
+	int		 host_listed					 = 0;
+	int		 left							 = n_dev;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		bool tier = i == tier_part;
+		if (!tier && !moe_backend_resident_capable(m->expert_parts[i].be))
+			continue;
+		part_be[i] =
+			moe_backend_resident_capable(m->expert_parts[i].be) ? m->expert_parts[i].be : NULL;
+		share[i] = tier ? 0 : MIN(m->expert_parts[i].count, left);
+		if (!tier)
+			left -= share[i];
+	}
+	int host_part = -1;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		if (m->expert_parts[i].be != NULL)
+			continue;
+		host_listed += listed_len[i];
+		if (host_part < 0)
+			host_part = i;
+	}
+	if (host_part >= 0)
+		part_be[host_part] = NULL;
+
+	int cap		 = n_dev + pin_host + listed_total;
+	p->pin_be	 = xcalloc((size_t)(cap > 0 ? cap : 1), sizeof(backend *));
+	p->pin_ids	 = xcalloc((size_t)(cap > 0 ? cap : 1), sizeof(int));
+	char *used	 = xcalloc((size_t)n_exp, 1);
+	int	  n_head = 0;
+
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		backend *be = part_be[i];
+		for (int k = 0; k < listed_len[i]; k++) {
+			int e = listed[i][k];
+			if (e < 0 || e >= n_exp) {
+				ERROR("MoE: pinned expert id %d is out of range; the model has %d expert(s) "
+					  "per layer",
+					  e, n_exp);
+				free(used);
+				free(p->pin_be);
+				free(p->pin_ids);
+				p->pin_be	= NULL;
+				p->pin_ids	= NULL;
+				p->n_pinned = 0;
+				return false;
+			}
+			if (used[e]) {
+				ERROR("MoE: expert %d is pinned more than once; remove the duplicate pin "
+					  "and re-save the config",
+					  e);
+				free(used);
+				free(p->pin_be);
+				free(p->pin_ids);
+				p->pin_be	= NULL;
+				p->pin_ids	= NULL;
+				p->n_pinned = 0;
+				return false;
+			}
+			used[e]				= 1;
+			p->pin_ids[n_head]	= e;
+			p->pin_be[n_head++] = be;
+		}
+	}
+	int seq = 0;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		int fill = share[i] > listed_len[i] ? share[i] - listed_len[i] : 0;
+		for (int k = 0; k < fill; k++) {
+			while (seq < n_exp && used[seq])
+				seq++;
+			if (seq >= n_exp)
+				break;
+			used[seq]			= 1;
+			p->pin_ids[n_head]	= seq++;
+			p->pin_be[n_head++] = part_be[i];
+		}
+	}
+	int host_fill = pin_host > host_listed ? pin_host - host_listed : 0;
+	for (int k = 0; k < host_fill; k++) {
+		while (seq < n_exp && used[seq])
+			seq++;
+		if (seq >= n_exp)
+			break;
+		used[seq]			= 1;
+		p->pin_ids[n_head]	= seq++;
+		p->pin_be[n_head++] = NULL;
+	}
+	free(used);
+	p->n_pinned = n_head;
+	if (n_head == 0) {
+		free(p->pin_be);
+		free(p->pin_ids);
+		p->pin_be  = NULL;
+		p->pin_ids = NULL;
+		return true;
+	}
+	DEBUG("MoE pins: %d listed id(s), %d pinned slot(s)/layer", listed_total, p->n_pinned);
+	return true;
 }
 
 typedef struct {
@@ -1066,6 +1196,7 @@ status_code moe_stream_cache_init(struct model *m) {
 
 	c->n_pinned = hcs_parts ? plan.n_pinned : (full_resident ? m->moe.n_experts : cfg->moe_pin);
 	c->pin_be	= plan.pin_be;
+	c->pin_ids	= plan.pin_ids;
 	c->tier_be	= plan.tier_be;
 	if (c->tier_be)
 		c->tier_policy = moe_tier_policy_default();
@@ -1187,7 +1318,7 @@ status_code moe_stream_cache_init(struct model *m) {
 		if (n_pin_this_layer > 0 && m->layers[i].experts) {
 			L->pinned_slots = xcalloc(n_pin_this_layer, sizeof(moe_expert_slot));
 			for (int pi = 0; pi < n_pin_this_layer; pi++) {
-				int e = (n_pin_list > 0) ? pin_list[pi] : pi;
+				int e = n_pin_list > 0 ? pin_list[pi] : c->pin_ids ? c->pin_ids[pi] : pi;
 				if (e < 0 || e >= m->moe.n_experts)
 					continue;
 				moe_expert_slot *s = &L->pinned_slots[L->n_pinned++];
@@ -1354,6 +1485,7 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 	}
 	free(c->layers);
 	free(c->pin_be);
+	free(c->pin_ids);
 	moe_direct_io_close(c);
 	moe_nomap_close(c);
 	free(c);

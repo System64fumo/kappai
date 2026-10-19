@@ -21,7 +21,7 @@ config config_defaults(void) {
 	c.use_mmap		= true;
 	c.flash_attn	= true;
 	c.reasoning		= true;
-	c.moe_stream	= true;
+	c.moe_stream	= false;
 	c.moe_cache_cap = 0;
 	c.ngl			= -1;
 

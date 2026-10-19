@@ -13,6 +13,7 @@ enum {
 	UI_ERR,
 	UI_OK,
 	UI_DIM,
+	UI_WARN,
 };
 
 chtype ui_attr(int kind);
