@@ -501,6 +501,83 @@ void context_reset(context *c) {
 	c->session_poisoned	 = false;
 }
 
+status_code context_slot_init(context *s, const context *e) {
+	memset(s, 0, sizeof(*s));
+	*s = *e;
+
+	s->interrupt		  = 0;
+	s->context_limit_hit  = false;
+	s->session_poisoned	  = false;
+	s->last_prompt_tokens = 0;
+	s->sync_render		  = e->sync_render ? xstrdup(e->sync_render) : NULL;
+	s->idle.active		  = false;
+
+	s->fed_ids.p   = xmalloc((size_t)e->fed_ids.cap * sizeof(int32_t));
+	s->fed_ids.n   = e->fed_ids.n;
+	s->fed_ids.cap = e->fed_ids.cap;
+	memcpy(s->fed_ids.p, e->fed_ids.p, (size_t)e->fed_ids.n * sizeof(int32_t));
+
+	s->ids_buf.p		= NULL;
+	s->ids_buf.cap		= 0;
+	s->idle_ids_buf.p	= NULL;
+	s->idle_ids_buf.cap = 0;
+
+	sampler_clone(&s->samp, &e->samp);
+	chat_template_clone(&s->chat, &e->chat);
+	chat_template_set_invalidate_cb(&s->chat, sync_invalidate_cb, s);
+
+	context_idle_prefill_wait(s);
+	memset(&s->scratch, 0, sizeof(s->scratch));
+	s->scratch.prof		 = e->scratch.prof;
+	s->scratch.interrupt = &s->interrupt;
+
+	s->tok.bpe_work			 = NULL;
+	s->tok.bpe_work_cap		 = 0;
+	s->tok.bpe_arena		 = NULL;
+	s->tok.bpe_arena_cap	 = 0;
+	s->tok.bpe_pcs_cache	 = NULL;
+	s->tok.bpe_pcs_cache_cap = 0;
+	s->tok.chunk_cache		 = xcalloc((size_t)e->tok.chunk_cache_cap, sizeof(tok_cache_entry));
+	s->tok.chunk_cache_used	 = 0;
+	memset(&s->tok.chunk_cache_pool, 0, sizeof(s->tok.chunk_cache_pool));
+	memset(&s->tok.bpe_sp, 0, sizeof(s->tok.bpe_sp));
+	memset(&s->tok.gpt2_scratch, 0, sizeof(s->tok.gpt2_scratch));
+
+	status_code s_st = kvcache_init(&s->kv, &s->m, s->n_ctx, s->kv.kv_quant);
+	if (s_st != OK)
+		return s_st;
+	if (e->kv.n_mirrors > 0) {
+		s_st = kvcache_alloc_mirrors(&s->kv, &s->m);
+		if (s_st != OK) {
+			kvcache_free(&s->kv);
+			return s_st;
+		}
+	}
+	return OK;
+}
+
+void context_slot_free(context *s) {
+	if (!s)
+		return;
+	context_idle_prefill_wait(s);
+	kvcache_free(&s->kv);
+	sampler_free(&s->samp);
+	chat_template_free(&s->chat);
+	compute_scratch_free(&s->scratch);
+	str_arena_free(&s->tok.chunk_cache_pool);
+	free(s->tok.chunk_cache);
+	free(s->tok.bpe_work);
+	free(s->tok.bpe_arena);
+	free(s->tok.bpe_pcs_cache);
+	sb_free(&s->tok.bpe_sp);
+	sb_free(&s->tok.gpt2_scratch);
+	free(s->fed_ids.p);
+	free(s->ids_buf.p);
+	free(s->idle_ids_buf.p);
+	free(s->sync_render);
+	memset(s, 0, sizeof(*s));
+}
+
 static void fed_ids_append(context *c, int32_t token) {
 	ARR_RESERVE(c->fed_ids.p, c->fed_ids.n, c->fed_ids.cap);
 	c->fed_ids.p[c->fed_ids.n++] = token;
@@ -1292,9 +1369,14 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 	n += r;
 	c->last_prompt_tokens = n;
 
+	fed_ids_sync(c);
+	int32_t reuse = fed_ids_common_prefix(c, ids, n);
+	if (reuse < c->fed_ids.n)
+		context_rewind(c, reuse);
+
 	bool unfed_tail = false;
-	return run_generation(c, ids, n, max_tokens, samp, on_token, ud, 1, "", t_turn_start,
-						  &unfed_tail);
+	return run_generation(c, ids + reuse, n - reuse, max_tokens, samp, on_token, ud, 1, "",
+						  t_turn_start, &unfed_tail);
 }
 
 static void *idle_prefill_thread(void *arg) {

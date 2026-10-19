@@ -35,6 +35,7 @@ typedef struct {
 } sampler;
 
 void	sampler_init(sampler *s, uint64_t seed);
+void	sampler_clone(sampler *dst, const sampler *src);
 void	sampler_free(sampler *s);
 void	sampler_set_params(sampler *s, float temp, int top_k, float top_p, float min_p,
 						   float repeat_penalty, int repeat_last_n);

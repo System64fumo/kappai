@@ -83,6 +83,9 @@ status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);
 void		context_reset(context *c);
 
+status_code context_slot_init(context *s, const context *e);
+void		context_slot_free(context *s);
+
 void context_monitor_send_start(context *c);
 
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,

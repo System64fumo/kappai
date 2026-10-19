@@ -43,6 +43,7 @@ typedef struct {
 	int top_k;
 	int repeat_last_n;
 	int server_port;
+	int server_slots;
 
 	float temperature;
 	float top_p;

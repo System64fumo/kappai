@@ -78,6 +78,7 @@ typedef struct {
 	const char *server_host;
 	int			server_port;
 	const char *server_api_key;
+	int			server_slots;
 
 	bool is_server;
 } cli_args;

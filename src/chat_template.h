@@ -20,6 +20,7 @@ typedef struct {
 
 typedef struct {
 	jinja_program *prog;
+	bool		   owns_prog;
 	char		  *bos_token;
 	char		  *eos_token;
 
@@ -52,6 +53,7 @@ typedef struct {
 void chat_template_set_invalidate_cb(chat_template_state *cts, void (*cb)(void *), void *ud);
 
 status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, const tokenizer *tok);
+void		chat_template_clone(chat_template_state *dst, const chat_template_state *src);
 void		chat_template_free(chat_template_state *cts);
 void		chat_template_clear_messages(chat_template_state *cts);
 
