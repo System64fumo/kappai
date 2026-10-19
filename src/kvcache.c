@@ -646,3 +646,92 @@ status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_sta
 	}
 	return OK;
 }
+
+status_code kvcache_snapshot_prefix(kv_prefix_snapshot *out, const kvcache *src, const model *m,
+									int n_pos) {
+	if (!out || !src || !m || n_pos <= 0 || n_pos > src->n_ctx)
+		return ERR_INVALID_ARG;
+	if (src->mla || src->hybrid)
+		return ERR_UNSUPPORTED;
+	memset(out, 0, sizeof(*out));
+	out->n_layers = m->n_layers;
+	out->n_pos	  = n_pos;
+	out->k		  = xcalloc((size_t)m->n_layers, sizeof(float *));
+	out->v		  = xcalloc((size_t)m->n_layers, sizeof(float *));
+
+	status_code st = OK;
+	for (int layer = 0; layer < m->n_layers && st == OK; layer++) {
+		if (!model_layer_has_kv(m, layer))
+			continue;
+		int kvh = model_layer_kv_heads(m, layer);
+		int hd	= model_layer_head_dim(m, layer);
+		if (kvh <= 0 || hd <= 0)
+			continue;
+
+		int owner = kvcache_layer_device(src, m, layer);
+		if (owner < 0 || owner > src->n_mirrors)
+			owner = 0;
+		buffer *kb, *vb;
+		int		slot;
+		kvcache_device_view(src, owner, layer, &kb, &vb, &slot);
+		backend *be = kvcache_device_backend(src, owner);
+		if (!be || !be->kv_get_range) {
+			st = ERR_UNSUPPORTED;
+			break;
+		}
+
+		size_t floats = (size_t)n_pos * (size_t)kvh * (size_t)hd;
+		out->k[layer] = xmalloc(floats * sizeof(float));
+		out->v[layer] = xmalloc(floats * sizeof(float));
+		buffer k_out  = buffer_host_view(backend_host(), out->k[layer], floats * sizeof(float));
+		buffer v_out  = buffer_host_view(backend_host(), out->v[layer], floats * sizeof(float));
+		st = be->kv_get_range(be, kb, vb, slot, 0, n_pos, &k_out, &v_out, src->n_kv_heads_max, hd,
+							  src->n_ctx, kvh);
+	}
+
+	if (st != OK) {
+		kvcache_snapshot_free(out);
+		return st;
+	}
+	return OK;
+}
+
+status_code kvcache_seed_prefix(kvcache *dst, const model *m, const kv_prefix_snapshot *snap) {
+	if (!dst || !m || !snap || !snap->k || !snap->v)
+		return ERR_INVALID_ARG;
+	if (snap->n_pos <= 0 || snap->n_pos > dst->n_ctx || snap->n_layers != m->n_layers)
+		return ERR_INVALID_ARG;
+	if (dst->n_pos != 0 || dst->mla || dst->hybrid)
+		return ERR_UNSUPPORTED;
+
+	status_code st = OK;
+	for (int layer = 0; layer < m->n_layers && st == OK; layer++) {
+		if (!snap->k[layer])
+			continue;
+		int kvh = model_layer_kv_heads(m, layer);
+		int hd	= model_layer_head_dim(m, layer);
+		if (kvh <= 0 || hd <= 0)
+			continue;
+		size_t floats = (size_t)snap->n_pos * (size_t)kvh * (size_t)hd;
+		buffer k_in	  = buffer_host_view(backend_host(), snap->k[layer], floats * sizeof(float));
+		buffer v_in	  = buffer_host_view(backend_host(), snap->v[layer], floats * sizeof(float));
+		st			  = kvcache_put_batch(dst, m, layer, 0, &k_in, &v_in, kvh * hd, snap->n_pos);
+	}
+	if (st == OK)
+		dst->n_pos = snap->n_pos;
+	return st;
+}
+
+void kvcache_snapshot_free(kv_prefix_snapshot *s) {
+	if (!s)
+		return;
+	for (int side = 0; side < 2; side++) {
+		float **arr = side ? s->v : s->k;
+		if (!arr)
+			continue;
+		for (int i = 0; i < s->n_layers; i++)
+			free(arr[i]);
+		free(arr);
+	}
+	memset(s, 0, sizeof(*s));
+}

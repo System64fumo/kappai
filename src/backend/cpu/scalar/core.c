@@ -518,6 +518,79 @@ __attribute__((weak)) status_code cpu_kv_put_batch(backend *self, buffer *k, buf
 	return OK;
 }
 
+static void cpu_kv_get_q8_0_row(const uint8_t *kd, const uint8_t *vd, float *kf, float *vf,
+								int head_dim) {
+	int n_full = head_dim / KV_Q8_0_BLOCK;
+	if (n_full > 0) {
+		dequant_q8_0_row(kd, (size_t)n_full, kf);
+		dequant_q8_0_row(vd, (size_t)n_full, vf);
+	}
+	int tail = head_dim % KV_Q8_0_BLOCK;
+	if (tail) {
+		float  tmp[KV_Q8_0_BLOCK];
+		size_t off = (size_t)n_full * KV_Q8_0_BLOCK_BYTES;
+		dequant_q8_0_row(kd + off, 1, tmp);
+		memcpy(kf + n_full * KV_Q8_0_BLOCK, tmp, (size_t)tail * sizeof(float));
+		dequant_q8_0_row(vd + off, 1, tmp);
+		memcpy(vf + n_full * KV_Q8_0_BLOCK, tmp, (size_t)tail * sizeof(float));
+	}
+}
+
+__attribute__((weak)) status_code cpu_kv_get_range(backend *self, const buffer *k, const buffer *v,
+												   int layer, int pos_start, int n_rows,
+												   buffer *k_out, buffer *v_out, int n_kv_heads,
+												   int head_dim, int n_ctx, int n_kv_heads_active) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	if (n_rows <= 0 || n_active <= 0 || head_dim <= 0 || !k_out->host_ptr || !v_out->host_ptr)
+		return ERR_INVALID_ARG;
+
+	size_t b =
+		(p->kv_base_pos && p->kv_pos_cap && p->kv_pos_cap[layer]) ? p->kv_base_pos[layer] : 0;
+	size_t slot_start = (size_t)pos_start;
+	if (b) {
+		if ((size_t)pos_start < b)
+			return ERR_INVALID_ARG;
+		slot_start -= b;
+	}
+	size_t rows = cpu_kv_layer_rows(p, layer, n_ctx);
+	if (slot_start + (size_t)n_rows > rows)
+		return ERR_INVALID_ARG;
+
+	float *kd	  = (float *)k_out->host_ptr;
+	float *vd	  = (float *)v_out->host_ptr;
+	int	   is_q80 = (p->kv_quant == KV_QUANT_Q8_0);
+	size_t blk_stride =
+		is_q80 ? (((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
+			   : ((size_t)head_dim * sizeof(uint16_t));
+	size_t layer_base = p->kv_layer_off ? (is_q80 ? p->kv_layer_off[layer]
+												  : p->kv_layer_off[layer] / sizeof(uint16_t))
+										: ((size_t)layer * (size_t)n_kv_heads * rows *
+										   (is_q80 ? blk_stride : (size_t)head_dim));
+	size_t kvh_stride = is_q80 ? rows * blk_stride : rows * (size_t)head_dim;
+
+	for (int row = 0; row < n_rows; row++) {
+		for (int kvh = 0; kvh < n_active; kvh++) {
+			float *kdst = kd + ((size_t)row * n_active + kvh) * head_dim;
+			float *vdst = vd + ((size_t)row * n_active + kvh) * head_dim;
+			size_t off	= layer_base + (size_t)kvh * kvh_stride +
+						  (slot_start + (size_t)row) * (is_q80 ? blk_stride : (size_t)head_dim);
+			if (is_q80) {
+				cpu_kv_get_q8_0_row((const uint8_t *)k->handle + off,
+									(const uint8_t *)v->handle + off, kdst, vdst, head_dim);
+			} else {
+				const uint16_t *ksrc = (const uint16_t *)cpu_ptr(k) + off;
+				const uint16_t *vsrc = (const uint16_t *)cpu_ptr(v) + off;
+				for (int d = 0; d < head_dim; d++) {
+					kdst[d] = f16_to_f32(ksrc[d]);
+					vdst[d] = f16_to_f32(vsrc[d]);
+				}
+			}
+		}
+	}
+	return OK;
+}
+
 __attribute__((weak)) void cpu_synchronize(backend *self) {
 	(void)self;
 }
@@ -3675,6 +3748,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->kv_alloc						 = cpu_kv_alloc;
 	out->kv_put							 = cpu_kv_put;
 	out->kv_put_batch					 = cpu_kv_put_batch;
+	out->kv_get_range					 = cpu_kv_get_range;
 	out->embd_lookup					 = cpu_embd_lookup;
 	out->rmsnorm						 = cpu_rmsnorm;
 	out->matmul							 = cpu_matmul;

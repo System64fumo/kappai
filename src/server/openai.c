@@ -133,6 +133,13 @@ struct oa_slot {
 };
 
 typedef struct {
+	bool			   ready;
+	int32_t			  *ids;
+	int				   n_ids;
+	kv_prefix_snapshot snap;
+} oa_warmup;
+
+typedef struct {
 	openai_state *st;
 	oa_job		 *job;
 	oa_slot		 *slot;
@@ -166,9 +173,10 @@ struct openai_state {
 	long		  created_at;
 	atomic_ullong req_counter;
 
-	int		 slots_cap;
-	int		 n_slots;
-	oa_slot *slots;
+	int		  slots_cap;
+	int		  n_slots;
+	oa_slot	 *slots;
+	oa_warmup warm;
 
 	pthread_mutex_t sch_mtx;
 	pthread_cond_t	sch_cv;
@@ -188,6 +196,8 @@ struct openai_state {
 	socklen_t		   bind_len;
 	atomic_bool		   shutting_down;
 };
+
+static void openai_warm_seed(openai_state *st, context *c);
 
 static sigset_t g_signal_mask;
 
@@ -984,8 +994,11 @@ static void run_generation(req_ctx *rc, oa_slot *slot) {
 			sampler_init(&c->samp, rc->params.seed);
 			sampler_set_vocab(&c->samp, c->m.vocab_size);
 		}
-		if (!g->same_session || c->session_poisoned)
+		if (!g->same_session || c->session_poisoned) {
 			context_reset(c);
+			if (chat_api)
+				openai_warm_seed(g->st, c);
+		}
 
 		if (chat_api) {
 			chat_template_set_tools(&c->chat, rc->params.tools, rc->params.tool_choice);
@@ -1694,6 +1707,117 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 	return respond_json(conn, MHD_HTTP_NOT_FOUND, error_body(msgbuf, "invalid_request_error"));
 }
 
+static void openai_warm_free(oa_warmup *w) {
+	kvcache_snapshot_free(&w->snap);
+	free(w->ids);
+	w->ids	 = NULL;
+	w->n_ids = 0;
+	w->ready = false;
+}
+
+static void openai_warm_seed(openai_state *st, context *c) {
+	if (!st->warm.ready)
+		return;
+	if (c->kv.n_pos != 0 || c->fed_ids.n != 0 || c->session_poisoned ||
+		st->warm.n_ids > c->fed_ids.cap)
+		return;
+	status_code s = kvcache_seed_prefix(&c->kv, &c->m, &st->warm.snap);
+	if (s != OK) {
+		if (s != ERR_OUT_OF_MEMORY) {
+			INFO("server: warmup prefix seeding unavailable (%s); new sessions will prefill the "
+				 "chat template from scratch",
+				 status_str(s));
+			st->warm.ready = false;
+		}
+		return;
+	}
+	memcpy(c->fed_ids.p, st->warm.ids, (size_t)st->warm.n_ids * sizeof(int32_t));
+	c->fed_ids.n = st->warm.n_ids;
+	for (int i = 0; i < st->warm.n_ids; i++)
+		sampler_observe(&c->samp, st->warm.ids[i]);
+	DEBUG("server: warmup seeded %d template prefix tokens into session", st->warm.n_ids);
+}
+
+static void openai_warmup_run(openai_state *st, const cli_args *args) {
+	memset(&st->warm, 0, sizeof(st->warm));
+	if (!args->warmup)
+		return;
+
+	context warm;
+	if (context_slot_init(&warm, st->ctx) != OK) {
+		ERROR("server: failed to allocate warmup session; skipping warmup");
+		context_slot_free(&warm);
+		return;
+	}
+
+	char	   *ra = NULL, *rb = NULL;
+	char		errbuf[512];
+	int32_t	   *ids	 = NULL;
+	const char *role = "system";
+	jinja_set_time_shift(0);
+	status_code s =
+		chat_template_preview_next_turn(&warm.chat, role, "a", 0, &ra, errbuf, sizeof(errbuf));
+	if (s != OK) {
+		role = "user";
+		s = chat_template_preview_next_turn(&warm.chat, role, "a", 0, &ra, errbuf, sizeof(errbuf));
+	}
+	if (s == OK) {
+		jinja_set_time_shift(86400);
+		s = chat_template_preview_next_turn(&warm.chat, role, "b", 0, &rb, errbuf, sizeof(errbuf));
+		jinja_set_time_shift(0);
+	}
+	size_t prefix_bytes = (s == OK && ra && rb) ? str_lcp_len(ra, rb) : 0;
+	if (prefix_bytes == 0) {
+		INFO("server: warmup found no static chat template prefix; nothing to preheat");
+		goto out;
+	}
+
+	{
+		int		 cap = warm.n_ctx;
+		int32_t *buf = context_ids_scratch(&warm, cap + 1);
+		int		 n = tokenizer_encode_with_specials(&warm.tok, ra, 0, buf, cap, &warm.scratch.prof);
+		int count  = n > 0 ? tokenizer_token_count_for_bytes(&warm.tok, buf, n, prefix_bytes) : 0;
+		if (count <= 0) {
+			INFO("server: warmup static prefix tokenized to 0 tokens; nothing to preheat");
+			goto out;
+		}
+		context_monitor_send_start(&warm);
+		prefill_result pf = context_prefill_tokens(&warm, buf, count, "warmup", true);
+		if (pf.rc < 0) {
+			WARN("server: warmup prefill failed (%s); skipping warmup",
+				 status_str((status_code)pf.rc));
+			goto out;
+		}
+		ids = xmalloc((size_t)count * sizeof(int32_t));
+		if (!ids)
+			goto out;
+		memcpy(ids, buf, (size_t)count * sizeof(int32_t));
+		if (kvcache_snapshot_prefix(&st->warm.snap, &warm.kv, &warm.m, count) != OK) {
+			free(ids);
+			ids = NULL;
+			INFO("server: warmup prefill done (%d tokens) but KV cloning is not supported for "
+				 "this model/backend; sessions will prefill the template from scratch",
+				 count);
+			goto out;
+		}
+		st->warm.ids   = ids;
+		st->warm.n_ids = count;
+		st->warm.ready = true;
+		ids			   = NULL;
+		INFO(
+			"server: warmup complete; %d-token static chat template prefix cached for new sessions",
+			count);
+	}
+
+out:
+	free(ids);
+	free(ra);
+	free(rb);
+	context_slot_free(&warm);
+	if (!st->warm.ready)
+		openai_warm_free(&st->warm);
+}
+
 openai_state *openai_init(context *ctx, const cli_args *args) {
 	openai_state *st = xcalloc(1, sizeof(*st));
 	st->ctx			 = ctx;
@@ -1708,26 +1832,15 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	st->slots_cap = args->server_slots > 0 ? args->server_slots : 1;
 	st->slots	  = xcalloc((size_t)st->slots_cap, sizeof(oa_slot));
 	st->tasks	  = xcalloc((size_t)st->slots_cap, sizeof(oa_task *));
-	st->n_slots	  = 1;
-	if (context_slot_init(&st->slots[0].sess, st->ctx) != OK) {
-		ERROR("openai: failed to allocate base session slot");
-		free(st->slots);
-		free(st->tasks);
-		free(st->model_id);
-		free(st->api_key);
-		pthread_mutex_destroy(&st->sch_mtx);
-		pthread_cond_destroy(&st->sch_cv);
-		free(st);
-		return NULL;
-	}
-	st->slots[0].used	 = true;
-	st->slots[0].busy	 = false;
-	st->slots[0].owns	 = true;
-	st->slots[0].last_ns = time_us();
+	st->n_slots	  = 0;
+
+	openai_warmup_run(st, args);
+
 	backend_release_thread(st->ctx->backend);
 
 	if (pthread_create(&st->worker, NULL, worker_main, st) != 0) {
 		ERROR("openai: failed to start scheduler worker");
+		openai_warm_free(&st->warm);
 		free(st->slots);
 		free(st->tasks);
 		free(st->model_id);
@@ -1817,6 +1930,7 @@ void openai_free(openai_state *st) {
 	for (int i = 0; i < st->n_slots; i++)
 		if (st->slots[i].owns)
 			context_slot_free(&st->slots[i].sess);
+	openai_warm_free(&st->warm);
 	free(st->slots);
 	free(st->tasks);
 	free(st->decode.tasks);
