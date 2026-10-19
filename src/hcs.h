@@ -71,6 +71,7 @@ int			hcs_parse_priority(const char *text, int *out);
 int			hcs_parse_tasks(const char *text, unsigned *out);
 void		hcs_format_tasks(unsigned tasks, char *buf, size_t cap);
 void		hcs_format_devices(const hcs_config *h, char *buf, size_t cap);
+void hcs_format_devices_subset(const hcs_config *h, const int *idx, int n, char *buf, size_t cap);
 
 void hcs_loader_init(hcs_loader *l);
 int	 hcs_loader_open_section(hcs_loader *l, const char *device, char *err, size_t errlen);

@@ -20,6 +20,8 @@ typedef void (*layer_progress_cb)(int layer_idx, int n_layers, int token_progres
 
 #define EXPERT_DEV_MAX 8
 
+#define MOE_STAGE_RING 3
+
 typedef struct {
 	buffer x;
 	buffer out;
@@ -83,20 +85,25 @@ typedef struct compute_scratch {
 	float_buf ple_proj_host;
 	float_buf inpL_host;
 
-	float_buf moe_all_scratch;
-	float_buf moe_all_outs;
-	float_buf moe_scratch;
-	float_buf moe_xb_f;
-	float_buf moe_shared_y;
-	float_buf hybrid_host;
-	float_buf hybrid_host2;
-	float_buf hybrid_host3;
-	float_buf gdn_ws_host;
-	float_buf op_ws;
-	float_buf gdn_z_host;
-	float_buf gdn_alpha_host;
-	float_buf gdn_beta_host;
-	float_buf gdn_out_host;
+	float_buf	moe_all_scratch;
+	float_buf	moe_all_outs;
+	float_buf	moe_scratch;
+	float_buf	moe_xb_f;
+	buffer		moe_stage[MOE_STAGE_RING];
+	int			moe_stage_next;
+	const void *moe_xb_cache_handle;
+	size_t		moe_xb_cache_offset;
+	int			moe_xb_cache_dim;
+	float_buf	moe_shared_y;
+	float_buf	hybrid_host;
+	float_buf	hybrid_host2;
+	float_buf	hybrid_host3;
+	float_buf	gdn_ws_host;
+	float_buf	op_ws;
+	float_buf	gdn_z_host;
+	float_buf	gdn_alpha_host;
+	float_buf	gdn_beta_host;
+	float_buf	gdn_out_host;
 
 	moe_expert_slot	  *moe_slot_buf;
 	moe_expert_slot	  *moe_slot_dev;

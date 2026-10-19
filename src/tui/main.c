@@ -93,6 +93,11 @@ static void tui_run_config(const sc_entry *entry, bool server_mode) {
 		return;
 	}
 
+	sigset_t mask;
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGWINCH);
+	pthread_sigmask(SIG_BLOCK, &mask, NULL);
+
 	def_prog_mode();
 	endwin();
 
@@ -100,13 +105,13 @@ static void tui_run_config(const sc_entry *entry, bool server_mode) {
 	if (rc != 0)
 		wait_for_keypress();
 
-	sigset_t mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTERM);
 	pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
 
 	reset_prog_mode();
+	pthread_sigmask(SIG_UNBLOCK, &mask, NULL);
 	ui_after_resume();
 }
 

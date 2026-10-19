@@ -496,6 +496,93 @@ static int vk_device_count(void) {
 	return (int)count;
 }
 
+static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap);
+
+static status_code vk_device_identity(int device_index, char *out, size_t cap) {
+	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
+								.apiVersion = VK_API_VERSION_1_1};
+	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+								.pApplicationInfo = &app};
+	VkInstance			 inst;
+	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
+		return ERR_UNSUPPORTED;
+
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	if (count == 0) {
+		vkDestroyInstance(inst, NULL);
+		return ERR_UNSUPPORTED;
+	}
+	if (device_index < 0 || (uint32_t)device_index >= count) {
+		vkDestroyInstance(inst, NULL);
+		return ERR_INVALID_ARG;
+	}
+	VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
+	vkEnumeratePhysicalDevices(inst, &count, devs);
+	VkPhysicalDevice phys = devs[device_index];
+	free(devs);
+
+	status_code rc = vk_device_identity_query(phys, out, cap);
+	vkDestroyInstance(inst, NULL);
+	return rc;
+}
+
+static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap) {
+	int has_pci_ext = 0;
+	{
+		uint32_t ext_count = 0;
+		vkEnumerateDeviceExtensionProperties(phys, NULL, &ext_count, NULL);
+		if (ext_count > 0) {
+			VkExtensionProperties *exts = xmalloc(ext_count * sizeof(VkExtensionProperties));
+			vkEnumerateDeviceExtensionProperties(phys, NULL, &ext_count, exts);
+			for (uint32_t i = 0; i < ext_count; i++)
+				has_pci_ext |=
+					strcmp(exts[i].extensionName, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME) == 0;
+			free(exts);
+		}
+	}
+
+	VkPhysicalDeviceIDProperties id_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+	};
+	VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
+	};
+	VkPhysicalDeviceProperties2 props2 = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &id_props,
+	};
+	VkPhysicalDeviceProperties2 *pci_tail = NULL;
+	if (has_pci_ext) {
+		VkPhysicalDeviceProperties2 *node = xmalloc(sizeof(*node));
+		*node							  = (VkPhysicalDeviceProperties2){
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			.pNext = &pci_props,
+		};
+		id_props.pNext = node;
+		pci_tail	   = node;
+	}
+	vkGetPhysicalDeviceProperties2(phys, &props2);
+	if (pci_tail)
+		free(pci_tail);
+
+	if (has_pci_ext && (pci_props.pciDomain != 0 || pci_props.pciBus != 0 ||
+						pci_props.pciDevice != 0 || pci_props.pciFunction != 0)) {
+		snprintf(out, cap, "PCI:%04x:%02x:%02x.%x", pci_props.pciDomain, pci_props.pciBus,
+				 pci_props.pciDevice, pci_props.pciFunction);
+		return OK;
+	}
+
+	uint64_t lo = 0, hi = 0;
+	memcpy(&lo, id_props.deviceUUID, sizeof(lo));
+	memcpy(&hi, id_props.deviceUUID + sizeof(lo), sizeof(hi));
+	if (lo || hi) {
+		snprintf(out, cap, "UUID:%016llx%016llx", (unsigned long long)lo, (unsigned long long)hi);
+		return OK;
+	}
+	return ERR_UNSUPPORTED;
+}
+
 static uint32_t find_memory_type(vk_priv *p, uint32_t type_bits, VkMemoryPropertyFlags want) {
 	for (uint32_t i = 0; i < p->mem_props.memoryTypeCount; i++) {
 		if (!(type_bits & (1u << i)))
@@ -1973,7 +2060,8 @@ static status_code vk_init(backend *self, int device_index) {
 	if (p->caps.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
 
-	log_tag("VLK", "device: %s", props.deviceName);
+	log_tag("VLK", "%.*s", (int)backend_name_brief_len(props.deviceName), props.deviceName);
+	DEBUG("vulkan: device: %s", props.deviceName);
 
 	if (p->caps.is_mali || p->caps.is_power_vr || p->caps.is_adreno) {
 		p->matmul_wg_size		  = 32;
@@ -5953,6 +6041,7 @@ static status_code vk_ctor(backend *out) {
 				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT;
 	out->probe = vk_probe;
 	out->device_count					 = vk_device_count;
+	out->device_identity				 = vk_device_identity;
 	out->init							 = vk_init;
 	out->free							 = vk_free;
 	out->buffer_alloc_weight			 = vk_buffer_alloc_weight;

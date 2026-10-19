@@ -64,6 +64,8 @@ log_level log_get_level(void);
 void log_msg(log_level level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 
 void log_tag(const char *tag, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void log_tag_c(const char *color, const char *tag, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
 bool log_color_enabled(void);
 
 void progress_start(progress *p, const char *label, uint64_t total);

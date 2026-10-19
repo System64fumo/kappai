@@ -93,8 +93,12 @@ status_code monitor_init(monitor *mon, const char *path) {
 	mon->fd = fd;
 	atomic_store_explicit(&mon->n_clients, 0, memory_order_relaxed);
 	atomic_fetch_add_explicit(&g_monitors_listening, 1, memory_order_relaxed);
-	INFO("monitor: listening on %s", mon->path);
 	return OK;
+}
+
+void monitor_log_listening(const monitor *mon) {
+	if (mon && mon->fd >= 0)
+		INFO("monitor: listening on %s", mon->path);
 }
 
 void monitor_poll(monitor *mon) {

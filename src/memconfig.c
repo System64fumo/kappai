@@ -330,13 +330,13 @@ static void log_pools(const mem_topology *t) {
 	for (int i = 0; i < t->n_pools; i++) {
 		char users[256];
 		format_pool_users(&t->pools[i], users, sizeof(users));
-		log_tag("MEM", "pool%d: %.4g GB | Users: %s", i,
-				to_unit(mem_pool_available(&t->pools[i]), MEM_UNIT_GB), users);
+		log_tag_c("\x1b[35m", "MEM", "pool%d: %.4g GB | Users: %s", i,
+				  to_unit(mem_pool_available(&t->pools[i]), MEM_UNIT_GB), users);
 		names_len += (size_t)snprintf(pool_names + names_len, sizeof(pool_names) - names_len,
 									  "%spool%d", i ? ", " : "", i);
 	}
-	log_tag("MEM", "Available memory: %.4g GB (%s)",
-			to_unit(mem_topology_available(t), MEM_UNIT_GB), pool_names);
+	log_tag_c("\x1b[35m", "MEM", "Available memory: %.4g GB (%s)",
+			  to_unit(mem_topology_available(t), MEM_UNIT_GB), pool_names);
 }
 
 void report_memory(const model *m, const mem_topology *t, backend *kv_backend, int n_ctx,
@@ -360,9 +360,10 @@ void report_memory(const model *m, const mem_topology *t, backend *kv_backend, i
 		DEBUG("  shared experts:    %.1f MB", to_unit(bd.shexp, MEM_UNIT_MB));
 	if (bd.router > 0)
 		DEBUG("  MoE routers:       %.1f MB", to_unit(bd.router, MEM_UNIT_MB));
-	log_tag("MEM", "Non expert weights: %.4g GB", to_unit(bd.total, MEM_UNIT_GB));
+	log_tag_c("\x1b[35m", "MEM", "Non expert weights: %.4g GB", to_unit(bd.total, MEM_UNIT_GB));
 	if (expert_total > 0)
-		log_tag("MEM", "Expert weights: %.4g GB", to_unit(expert_total, MEM_UNIT_GB));
-	log_tag("MEM", "KV cache: %.4g GB", to_unit(kv_cache, MEM_UNIT_GB));
-	log_tag("MEM", "Required: %.4g GB", to_unit(bd.total + expert_total + kv_cache, MEM_UNIT_GB));
+		log_tag_c("\x1b[35m", "MEM", "Expert weights: %.4g GB", to_unit(expert_total, MEM_UNIT_GB));
+	log_tag_c("\x1b[35m", "MEM", "KV cache: %.4g GB", to_unit(kv_cache, MEM_UNIT_GB));
+	log_tag_c("\x1b[35m", "MEM", "Required: %.4g GB",
+			  to_unit(bd.total + expert_total + kv_cache, MEM_UNIT_GB));
 }

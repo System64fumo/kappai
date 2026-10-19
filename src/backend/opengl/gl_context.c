@@ -42,6 +42,39 @@ static bool sysfs_read_u64(int fd, const char *link, uint64_t *out) {
 	return ok;
 }
 
+status_code gl_render_node_identity(char *out, size_t cap) {
+	int drm_index = 0;
+	int fd		  = open_drm_render_node(&drm_index);
+	if (fd < 0)
+		return ERR_UNSUPPORTED;
+	struct stat st;
+	status_code s = ERR_UNSUPPORTED;
+	if (fstat(fd, &st) == 0) {
+		char path[192];
+		snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/uevent",
+				 (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev));
+		FILE *f = fopen(path, "r");
+		if (f) {
+			char line[128];
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "PCI_SLOT_NAME=", 14) != 0)
+					continue;
+				char slot[64];
+				snprintf(slot, sizeof(slot), "%s", line + 14);
+				size_t len = strlen(slot);
+				while (len > 0 && (slot[len - 1] == '\n' || slot[len - 1] == '\r'))
+					slot[--len] = '\0';
+				snprintf(out, cap, "PCI:%s", slot);
+				s = OK;
+				break;
+			}
+			fclose(f);
+		}
+	}
+	close(fd);
+	return s;
+}
+
 static void query_memory_topology(gl_context *ctx) {
 	ctx->unified_memory		= 1;
 	ctx->video_memory_bytes = 0;

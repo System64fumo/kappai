@@ -193,7 +193,8 @@ static void test_validate(void) {
 	record_hcs("validate.over_subscription", validate_has(&h, "remove 1"), "n=%d", n_layers);
 
 	h = single_device("cpu_0", HCS_TASK_DECODE, HCS_COUNT_ALL, HCS_COUNT_UNSET);
-	record_hcs("validate.tasks_must_cover_both", validate_has(&h, "lacks 'prefill'"), "");
+	record_hcs("validate.tasks_must_cover_both",
+			   validate_has(&h, "must run both prefill and decode"), "");
 
 	h = single_device("cpu_0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4);
 	record_hcs("validate.experts_on_dense", validate_has(&h, "not a MoE"), "experts=%d", n_experts);

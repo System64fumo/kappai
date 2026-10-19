@@ -25,6 +25,7 @@ typedef enum {
 	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
 	BCAP_KV_POS_CAP			  = 1 << 10,
 	BCAP_UNIFIED_MEMORY		  = 1 << 11,
+	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
 } backend_cap;
 
 typedef struct {
@@ -206,6 +207,7 @@ struct backend {
 	uint64_t	caps;
 	status_code (*probe)(void);
 	int (*device_count)(void);
+	status_code (*device_identity)(int device_index, char *out, size_t cap);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -299,6 +301,8 @@ struct backend {
 										 const buffer *gate, const buffer *up, buffer *y, int n,
 										 int k, int activation, int m);
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
+	status_code (*buffer_read_f32_x2)(backend *self, const buffer *a, float *dst_a, int n_a,
+									  const buffer *b, float *dst_b, int n_b);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
 	status_code (*repack_plan)(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
@@ -413,11 +417,15 @@ void		backend_destroyed(backend *b);
 
 #define BACKEND_DEVICE_NAME_MAX 64
 
-int	 backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
-bool backend_device_is_host(const char *spec);
-int	 backend_best_device(char *out, size_t out_cap);
-int	 backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
-int	 backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
+int			backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
+bool		backend_device_is_host(const char *spec);
+bool		backend_device_uma(const char *spec);
+status_code backend_device_identity(const char *spec, char *out, size_t cap);
+status_code backend_identity(const backend *b, char *out, size_t cap);
+int			backend_best_device(char *out, size_t out_cap);
+int			backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
+size_t		backend_name_brief_len(const char *name);
+int			backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
 

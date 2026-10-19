@@ -1281,11 +1281,8 @@ static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_sli
 		const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
 		for (int g = 0; g < n_group; g++) {
 			float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
-			for (int g = 0; g < n_group; g++) {
-				float ss = dot8_q8_0(&qpq[g], kt, head_dim) * scale;
-				float vs = attn_softmax_step(ss, &M[g], &S[g], VKQ[g], head_dim);
-				accum_v_q8_0(VKQ[g], vt, vs, head_dim);
-			}
+			float vs = attn_softmax_step(ss, &M[g], &S[g], VKQ[g], head_dim);
+			accum_v_q8_0(VKQ[g], vt, vs, head_dim);
 		}
 	}
 	for (int g = 0; g < n_group; g++) {

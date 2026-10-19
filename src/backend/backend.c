@@ -471,6 +471,46 @@ bool backend_device_is_host(const char *spec) {
 	return false;
 }
 
+bool backend_device_uma(const char *spec) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return false;
+
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n_backends; i++)
+		if (strcmp(infos[i].name, name) == 0)
+			return (infos[i].caps & BCAP_UNIFIED_MEMORY) != 0;
+	return false;
+}
+
+status_code backend_identity(const backend *b, char *out, size_t cap) {
+	if (!b || !b->device_identity)
+		return ERR_UNSUPPORTED;
+	return b->device_identity(b->device_index, out, cap);
+}
+
+status_code backend_device_identity(const char *spec, char *out, size_t cap) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return ERR_INVALID_ARG;
+	backend_load();
+	for (int i = 0; i < g_registry_count; i++) {
+		if (strcmp(g_registry[i].name, name) != 0)
+			continue;
+		backend probe;
+		memset(&probe, 0, sizeof(probe));
+		if (g_registry[i].ctor(&probe) != OK)
+			return ERR_UNSUPPORTED;
+		if (!probe.device_identity)
+			return ERR_UNSUPPORTED;
+		return probe.device_identity(device_index, out, cap);
+	}
+	return ERR_UNSUPPORTED;
+}
+
 int backend_best_device(char *out, size_t out_cap) {
 	backend_info infos[BACKEND_MAX];
 	int			 n_backends	   = backend_list(infos, BACKEND_MAX);
@@ -500,6 +540,11 @@ status_code backend_create_best(backend **out) {
 
 int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
 	return snprintf(out, out_cap, "%s_%d", name, device_index);
+}
+
+size_t backend_name_brief_len(const char *name) {
+	const char *paren = strstr(name, " (");
+	return paren ? (size_t)(paren - name) : strlen(name);
 }
 
 int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index) {

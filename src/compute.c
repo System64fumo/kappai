@@ -103,6 +103,8 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free_buf(&s->router_softmax_inp);
 	free_buf(&s->router_logits);
 	free_buf(&s->moe_shared_y_dev);
+	for (int i = 0; i < MOE_STAGE_RING; i++)
+		free_buf(&s->moe_stage[i]);
 
 	for (int d = 0; d < s->n_mirrors; d++) {
 		scratch_mirror *mir = &s->mirror[d];

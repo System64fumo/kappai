@@ -108,6 +108,14 @@ void hcs_format_devices(const hcs_config *h, char *buf, size_t cap) {
 						 h->devices[i].name);
 }
 
+void hcs_format_devices_subset(const hcs_config *h, const int *idx, int n, char *buf, size_t cap) {
+	size_t used = 0;
+	buf[0]		= '\0';
+	for (int k = 0; k < n; k++)
+		used += snprintf(buf + used, used < cap && idx[k] < h->n_devices ? cap - used : 0, "%s%s",
+						 k ? ", " : "", h->devices[idx[k]].name);
+}
+
 static void device_defaults(hcs_device *d) {
 	d->tasks   = 0;
 	d->layers  = HCS_COUNT_UNSET;
@@ -367,8 +375,11 @@ static void check_device_name(violations *v, const hcs_config *h, int idx,
 
 static void check_device_fields(violations *v, const hcs_config *h, int idx, int *star_owner) {
 	const hcs_device *d = &h->devices[idx];
-	if (d->tasks == 0)
-		add_violation(v, d->name, "tasks", "no tasks listed; use 'prefill, decode'");
+	if (d->tasks != HCS_TASKS_ALL)
+		add_violation(v, d->name, "tasks",
+					  !d->tasks ? "no tasks listed; a device must run both prefill and decode"
+								: "splitting prefill/decode execution is not supported yet; "
+								  "a device must run both ('tasks = prefill, decode')");
 	if (d->layers == HCS_COUNT_UNSET)
 		add_violation(v, d->name, "layers", "not set; use a layer count or '*'");
 	if (d->layers != HCS_COUNT_ALL)
@@ -466,10 +477,6 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 
 	for (int i = 0; i < h->n_devices; i++) {
 		const hcs_device *d = &h->devices[i];
-		if (held[i] > 0 && d->tasks != 0 && d->tasks != HCS_TASKS_ALL)
-			add_violation(v, d->name, "tasks",
-						  "holds layers but lacks '%s'; a layer's holder must run both phases",
-						  (d->tasks & HCS_TASK_PREFILL) ? "decode" : "prefill");
 		if (n_experts == 0 && d->experts != HCS_COUNT_UNSET)
 			add_violation(v, d->name, "experts", "model is not a MoE model; remove this key");
 		if (n_experts == 0 && d->has_priority)

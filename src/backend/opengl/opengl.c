@@ -1078,6 +1078,12 @@ static int gl_device_count(void) {
 	return gl_context_probe() == OK ? 1 : 0;
 }
 
+static status_code gl_device_identity(int device_index, char *out, size_t cap) {
+	if (device_index != 0)
+		return ERR_INVALID_ARG;
+	return gl_render_node_identity(out, cap);
+}
+
 static status_code gl_init(backend *self, int device_index) {
 	(void)device_index;
 	gl_priv *p = xcalloc(1, sizeof(gl_priv));
@@ -1390,9 +1396,10 @@ static status_code gl_init(backend *self, int device_index) {
 	p->device_local_total_estimate =
 		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes : get_total_memory();
 
-	log_tag("OGL", "%s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
-			p->ctx.renderer, p->ctx.max_wg_size, p->ctx.max_shared_bytes / 1024,
-			p->ctx.max_ssbo_bindings, GL_ATTENTION_WG, p->matmul_wg);
+	log_tag("OGL", "%.*s", (int)backend_name_brief_len(p->ctx.renderer), p->ctx.renderer);
+	DEBUG("opengl: %s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
+		  p->ctx.renderer, p->ctx.max_wg_size, p->ctx.max_shared_bytes / 1024,
+		  p->ctx.max_ssbo_bindings, GL_ATTENTION_WG, p->matmul_wg);
 
 	return OK;
 }
@@ -1591,6 +1598,84 @@ static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, vo
 	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	return OK;
+}
+
+static status_code gl_read_two_regions_f32(gl_priv *p, gl_buf *b0, size_t off0, void *dst0,
+										   size_t bytes0, gl_buf *b1, size_t off1, void *dst1,
+										   size_t bytes1) {
+	size_t pad0	 = (bytes0 + (size_t)255) & ~(size_t)255;
+	size_t total = pad0 + bytes1;
+	if (!p->readback || p->readback_bytes < total) {
+		size_t want = (total + (size_t)65535) & ~(size_t)65535;
+		if (p->readback)
+			gl_buf_free(p, p->readback);
+		p->readback		  = gl_buf_alloc(p, want, GL_DYNAMIC_COPY, NULL);
+		p->readback_bytes = p->readback ? want : 0;
+		if (!p->readback)
+			return ERR_OUT_OF_MEMORY;
+	}
+	gl_barrier_if_pending(p);
+	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
+	glBindBuffer(GL_COPY_READ_BUFFER, b0->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)off0, 0,
+						(GLsizeiptr)bytes0);
+	glBindBuffer(GL_COPY_READ_BUFFER, b1->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)off1, (GLintptr)pad0,
+						(GLsizeiptr)bytes1);
+	glBindBuffer(GL_COPY_READ_BUFFER, 0);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	if (glGetError() != GL_NO_ERROR)
+		return ERR_INTERNAL;
+	GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	if (!fence)
+		return ERR_INTERNAL;
+	GLenum wr = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)500000000);
+	while (wr == GL_TIMEOUT_EXPIRED)
+		wr = glClientWaitSync(fence, 0, (GLuint64)1000000000);
+	glDeleteSync(fence);
+	if (wr != GL_ALREADY_SIGNALED && wr != GL_CONDITION_SATISFIED)
+		return ERR_INTERNAL;
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->readback->name);
+	void *src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)total, GL_MAP_READ_BIT);
+	if (!src) {
+		glGetError();
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+		return ERR_INTERNAL;
+	}
+	memcpy(dst0, src, bytes0);
+	memcpy(dst1, (const char *)src + pad0, bytes1);
+	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	return OK;
+}
+
+static status_code gl_buffer_read_f32(backend *self, const buffer *buf, float *host_dst, int n);
+
+static status_code gl_buffer_read_f32_x2(backend *self, const buffer *buf_a, float *dst_a, int n_a,
+										 const buffer *buf_b, float *dst_b, int n_b) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	gl_buf *ba		= as_glbuf(buf_a);
+	gl_buf *bb		= as_glbuf(buf_b);
+	size_t	bytes_a = (size_t)n_a * sizeof(float);
+	size_t	bytes_b = (size_t)n_b * sizeof(float);
+	int fused = n_a > 0 && n_b > 0 && ba->name && bb->name &&
+				(ba->device_dirty || !ba->host_mirror) && (bb->device_dirty || !bb->host_mirror) &&
+				buf_a->offset + bytes_a <= ba->size_bytes &&
+				buf_b->offset + bytes_b <= bb->size_bytes;
+	if (fused && gl_read_two_regions_f32(p, ba, buf_a->offset, dst_a, bytes_a, bb, buf_b->offset,
+										 dst_b, bytes_b) == OK) {
+		if (ba->host_mirror)
+			memcpy((char *)ba->host_mirror + buf_a->offset, dst_a, bytes_a);
+		if (bb->host_mirror)
+			memcpy((char *)bb->host_mirror + buf_b->offset, dst_b, bytes_b);
+		return OK;
+	}
+	status_code st = gl_buffer_read_f32(self, buf_a, dst_a, n_a);
+	if (st == OK)
+		st = gl_buffer_read_f32(self, buf_b, dst_b, n_b);
+	return st;
 }
 
 static status_code gl_buffer_read_f32(backend *self, const buffer *buf, float *host_dst, int n) {
@@ -3581,6 +3666,7 @@ static status_code gl_attention_host_fallback(backend *self, const buffer *q, co
 											  int pos, int n_heads, int n_kv_heads, int n_active,
 											  int head_dim, int n_ctx, float scale,
 											  int attn_start) {
+	(void)n_kv_heads;
 	gl_priv *p = self->priv;
 
 	gl_buffer_sync_to_host(q);
@@ -5055,10 +5141,11 @@ static status_code gl_ctor(backend *out) {
 	out->priority = 80;
 	out->caps	  = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
 					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
-					BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT;
+					BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT | BCAP_IN_ORDER_QUEUE;
 
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
+	out->device_identity				 = gl_device_identity;
 	out->init							 = gl_init;
 	out->free							 = gl_free;
 	out->buffer_alloc_weight			 = gl_buffer_alloc_weight;
@@ -5066,6 +5153,7 @@ static status_code gl_ctor(backend *out) {
 	out->buffer_alloc_from_host			 = gl_buffer_alloc_from_host;
 	out->buffer_free					 = gl_buffer_free;
 	out->buffer_read_f32				 = gl_buffer_read_f32;
+	out->buffer_read_f32_x2				 = gl_buffer_read_f32_x2;
 	out->buffer_write_f32				 = gl_buffer_write_f32;
 	out->copy_buffer					 = gl_copy_buffer;
 	out->ple_combine					 = gl_ple_combine;

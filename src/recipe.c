@@ -5,6 +5,7 @@
 #include "log.h"
 #include "model.h"
 #include "moe/moe_common.h"
+#include "moe/moe_exec.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
 
@@ -3082,6 +3083,29 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 	return K;
 }
 
+static status_code router_read_logits(backend *a, struct compute_scratch *s, const buffer *src,
+									  float *dst, int n, const buffer *xb, int dim,
+									  profile_scope *router_ps) {
+	profile_end(&s->prof, router_ps);
+	profile_scope sync_ps = profile_begin(&s->prof, STAGE_MOE_ROUTER_SYNC);
+	status_code	  st;
+	s->moe_xb_cache_handle = NULL;
+	if (xb && a->buffer_read_f32_x2 && xb->owner == a) {
+		float *xh = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
+		st		  = a->buffer_read_f32_x2(a, src, dst, n, xb, xh, dim);
+		if (st == OK) {
+			s->moe_xb_cache_handle = xb->handle;
+			s->moe_xb_cache_offset = xb->offset;
+			s->moe_xb_cache_dim	   = dim;
+		}
+	} else {
+		st = a->buffer_read_f32(a, src, dst, n);
+	}
+	profile_end(&s->prof, &sync_ps);
+	*router_ps = profile_begin(&s->prof, STAGE_MOE_ROUTER);
+	return st;
+}
+
 static status_code op_moe_router_single(backend *a, const model *m, layer_weights *L, int E, int K,
 										int dim, int uses_softmax, int norm_topk,
 										float routed_scale, float *router_input, buffer *inp,
@@ -3090,7 +3114,8 @@ static status_code op_moe_router_single(backend *a, const model *m, layer_weight
 	float *logits = logits_fallback;
 	if (E > (int)(sizeof(logits_fallback) / sizeof(float)))
 		logits = xmalloc((size_t)E * sizeof(float));
-	status_code st = OK;
+	status_code	  st		= OK;
+	profile_scope router_ps = profile_begin(&s->prof, STAGE_MOE_ROUTER);
 
 	if (uses_softmax) {
 		buffer *inp_buf = &s->router_softmax_inp;
@@ -3103,7 +3128,7 @@ static status_code op_moe_router_single(backend *a, const model *m, layer_weight
 			st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp_buf, &s->router_logits, E,
 						   dim);
 		if (st == OK)
-			st = a->buffer_read_f32(a, &s->router_logits, logits, E);
+			st = router_read_logits(a, s, &s->router_logits, logits, E, NULL, dim, &router_ps);
 	} else if (backend_has_cap(a, BCAP_IS_HOST)) {
 		buffer logits_buf = buffer_host_view(a, logits, (size_t)E * sizeof(float));
 		st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, &logits_buf, E, dim);
@@ -3113,8 +3138,9 @@ static status_code op_moe_router_single(backend *a, const model *m, layer_weight
 		if (st == OK)
 			st = a->matmul(a, &L->router_w.buf, L->router_w.type, inp, logits_buf, E, dim);
 		if (st == OK)
-			st = a->buffer_read_f32(a, logits_buf, logits, E);
+			st = router_read_logits(a, s, logits_buf, logits, E, inp, dim, &router_ps);
 	}
+	profile_end(&s->prof, &router_ps);
 	if (st == OK && !moe_router_logits_finite(logits, E)) {
 		ERROR("op_moe_router: non-finite router logit (E=%d)", E);
 		st = ERR_FORMAT;
@@ -4415,6 +4441,7 @@ static status_code op_moe_router(exec_ctx *ctx) {
 
 	buffer *inp = &slots[op->in[0]];
 
+	s->moe_xb_cache_handle = NULL;
 	if (uses_softmax) {
 		float	   *router_input = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
 		backend	   *ib			 = inp->owner ? inp->owner : a;
@@ -4482,13 +4509,11 @@ static void moe_fused_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, backend *a,
-											moe_expert_slot *slot_buf, const int *expert_ids,
-											const float *weights, buffer *xb, compute_scratch *s,
-											int I, int any_fused, int use_gelu, int xb_q8_gate_ok,
-											uint32_t gate_q8_type, const buffer *xb_q8_gate,
-											size_t scratch_need, tpool *pool, int interleave,
-											moe_stream_op *moe_op, float *outf) {
+static status_code moe_experts_run_parallel(
+	model *m, int li, int K, int dim, backend *a, moe_expert_slot *slot_buf, const int *expert_ids,
+	const float *weights, buffer *xb, compute_scratch *s, int I, int any_fused, int use_gelu,
+	int xb_q8_gate_ok, uint32_t gate_q8_type, const buffer *xb_q8_gate, size_t scratch_need,
+	tpool *pool, int interleave, moe_stream_op *moe_op, const float *xb_host, float *outf) {
 	int n_threads = tpool_n_threads(pool);
 	if (n_threads < 1)
 		n_threads = 1;
@@ -4509,12 +4534,14 @@ static status_code moe_experts_run_parallel(model *m, int li, int K, int dim, ba
 	for (int d = 0; d < dim; d++)
 		outf[d] = 0.0f;
 
-	float *xb_f = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
-	{
+	const float *xb_f = xb_host;
+	if (!xb_f) {
+		float	   *xb_read	 = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
 		backend	   *xb_owner = xb->owner ? xb->owner : a;
-		status_code rs		 = xb_owner->buffer_read_f32(xb_owner, xb, xb_f, dim);
+		status_code rs		 = xb_owner->buffer_read_f32(xb_owner, xb, xb_read, dim);
 		if (rs != OK)
 			return rs;
+		xb_f = xb_read;
 	}
 
 	moe_par_job job = {.m				   = m,
@@ -4567,14 +4594,20 @@ static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, 
 											  const float *weights, buffer *xb, compute_scratch *s,
 											  int I, int use_gelu, int xb_q8_gate_ok,
 											  uint32_t gate_q8_type, const buffer *xb_q8_gate,
-											  size_t scratch_need, float *outf) {
+											  size_t scratch_need, const float *xb_host,
+											  float *outf) {
 	float *scratch = float_buf_ensure(&s->moe_scratch, scratch_need / sizeof(float));
 
-	float	   *xb_f	 = float_buf_ensure(&s->moe_xb_f, dim);
-	backend	   *xb_owner = xb->owner ? xb->owner : a;
-	status_code st		 = xb_owner->buffer_read_f32(xb_owner, xb, xb_f, dim);
-	if (st != OK)
-		return st;
+	const float *xb_f = xb_host;
+	status_code	 st	  = OK;
+	if (!xb_f) {
+		float	*xb_read  = float_buf_ensure(&s->moe_xb_f, dim);
+		backend *xb_owner = xb->owner ? xb->owner : a;
+		st				  = xb_owner->buffer_read_f32(xb_owner, xb, xb_read, dim);
+		if (st != OK)
+			return st;
+		xb_f = xb_read;
+	}
 
 	for (int d = 0; d < dim; d++)
 		outf[d] = 0.0f;
@@ -4603,168 +4636,11 @@ static status_code moe_experts_run_sequential(model *m, int li, int K, int dim, 
 	return OK;
 }
 
-#define MOE_MAX_DEV_GROUPS 4
-
-typedef struct {
-	backend			*eb;
-	moe_expert_slot *slots;
-} moe_dev_group;
-
-typedef struct {
-	moe_dev_group groups[MOE_MAX_DEV_GROUPS];
-	int			  n;
-} moe_dev_pending;
-
-static status_code moe_dev_submit(struct model *m, int li, backend *eb, struct compute_scratch *s,
-								  const float *xh, const int *ids_dev, const float *weights,
-								  moe_expert_slot *slot_buf, const moe_exec_plan *plan) {
-	int			dim = plan->dim;
-	int			K	= plan->K;
-	status_code st	= moe_stream_resolve(m, li, ids_dev, K, slot_buf);
-	if (st != OK)
-		return st;
-	expert_dev_entry *e = expert_dev_scratch_get(&s->expert_dev, eb, (size_t)dim);
-	if (!e) {
-		moe_stream_release_slots(m, li, slot_buf, K);
-		return ERR_OUT_OF_MEMORY;
-	}
-	st = eb->buffer_write_f32(eb, &e->x, xh, dim);
-	if (st == OK)
-		st = eb->scale_inplace(eb, &e->out, 0.0f, dim);
-	for (int k = 0; st == OK && k < K; k++) {
-		if (slot_buf[k].eid < 0 || !moe_slot_present(&slot_buf[k]))
-			continue;
-		if (!slot_buf[k].dev_ready || slot_buf[k].dev_gate.owner != eb) {
-			backend_report_host_fallback(
-				eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
-				"layer %d expert %d slot %s (dev_ready=%d)", li, slot_buf[k].eid,
-				slot_buf[k].dev_ready ? "owned by another backend" : "not resident on device",
-				(int)slot_buf[k].dev_ready);
-			st = ERR_UNSUPPORTED;
-			break;
-		}
-		moe_resident_expert ge = {
-			.gate_w		   = &slot_buf[k].dev_gate,
-			.up_w		   = &slot_buf[k].dev_up,
-			.down_w		   = &slot_buf[k].dev_down,
-			.gate_type	   = slot_buf[k].gate_type,
-			.up_type	   = slot_buf[k].up_type,
-			.down_type	   = slot_buf[k].down_type,
-			.gate_up_fused = slot_buf[k].gate_up_fused,
-			.use_gelu	   = plan->use_gelu,
-			.gate_scale	   = slot_buf[k].gate_scale,
-			.up_scale	   = slot_buf[k].up_scale,
-			.down_scale	   = slot_buf[k].down_scale,
-			.weight		   = weights[k],
-		};
-		st = eb->moe_expert_ffn(eb, &e->x, &e->out, &ge, dim, plan->I);
-	}
-	if (st != OK) {
-		moe_stream_release_slots(m, li, slot_buf, K);
-		return st;
-	}
-	if (eb->submit)
-		eb->submit(eb);
-	return OK;
-}
-
-static status_code moe_dev_collect(struct model *m, int li, backend *eb, struct compute_scratch *s,
-								   moe_expert_slot *slot_buf, int K, int dim, float *out_host) {
-	expert_dev_entry *e	 = expert_dev_scratch_get(&s->expert_dev, eb, (size_t)dim);
-	status_code		  st = e ? OK : ERR_OUT_OF_MEMORY;
-	if (st == OK)
-		st = eb->buffer_read_f32(eb, &e->out, out_host, dim);
-	moe_stream_release_slots(m, li, slot_buf, K);
-	return st;
-}
-
-static status_code moe_dev_finish(moe_dev_pending *pend, struct model *m, int li,
-								  struct compute_scratch *s, int K, int dim, int discard) {
-	float	   *acc = float_buf_ensure(&s->expert_dev.acc, (size_t)dim);
-	float	   *tmp = float_buf_ensure(&s->expert_dev.tmp, (size_t)dim);
-	status_code st	= OK;
-	memset(acc, 0, (size_t)dim * sizeof(float));
-	for (int g = 0; g < pend->n; g++) {
-		backend	   *eb = pend->groups[g].eb;
-		status_code gs = moe_dev_collect(m, li, eb, s, pend->groups[g].slots, K, dim, tmp);
-		if (gs != OK) {
-			ERROR("moe expert ffn readback on '%s' layer %d failed (%s)", eb->name ? eb->name : "?",
-				  li, status_str(gs));
-			if (st == OK)
-				st = gs;
-			continue;
-		}
-		if (!discard)
-			for (int d = 0; d < dim; d++)
-				acc[d] += tmp[d];
-	}
-	pend->n = 0;
-	return st;
-}
-
-static int moe_experts_split_begin(struct model *m, int li, backend *a, struct compute_scratch *s,
-								   const buffer *xb, const int *expert_ids, const float *weights,
-								   const moe_exec_plan *plan, int *host_ids,
-								   moe_dev_pending *pend) {
-	int		 dim = plan->dim;
-	int		 K	 = plan->K;
-	backend *owners[MOE_MAX_TOPK];
-	int		 any = 0;
+static int moe_all_experts_on(struct model *m, int li, backend *a, const int *expert_ids, int K,
+							  profile *prof) {
+	profile_scope tier_ps = profile_begin(prof, STAGE_MOE_TIER);
 	moe_stream_tier_maintain(m, li);
-	for (int k = 0; k < K; k++) {
-		owners[k]	= moe_stream_expert_owner(m, li, expert_ids[k]);
-		host_ids[k] = owners[k] ? -1 : expert_ids[k];
-		any |= owners[k] != NULL;
-	}
-	if (!any)
-		return 0;
-
-	float *xh = float_buf_ensure(&s->moe_xb_f, (size_t)dim);
-	if (a->buffer_read_f32(a, xb, xh, dim) != OK) {
-		for (int k = 0; k < K; k++)
-			host_ids[k] = expert_ids[k];
-		return 0;
-	}
-	if (!s->moe_slot_dev)
-		s->moe_slot_dev =
-			xcalloc((size_t)MOE_MAX_TOPK * MOE_MAX_DEV_GROUPS, sizeof(moe_expert_slot));
-
-	int n_dev = 0;
-	for (int k0 = 0; k0 < K; k0++) {
-		backend *eb = owners[k0];
-		if (!eb)
-			continue;
-		int ids_dev[MOE_MAX_TOPK];
-		for (int k = 0; k < K; k++)
-			ids_dev[k] = owners[k] == eb ? expert_ids[k] : -1;
-
-		status_code		 st	   = ERR_UNSUPPORTED;
-		moe_expert_slot *slots = NULL;
-		if (pend->n < MOE_MAX_DEV_GROUPS) {
-			slots = s->moe_slot_dev + (size_t)pend->n * MOE_MAX_TOPK;
-			st	  = moe_dev_submit(m, li, eb, s, xh, ids_dev, weights, slots, plan);
-		}
-		for (int k = 0; k < K; k++) {
-			if (owners[k] != eb)
-				continue;
-			owners[k] = NULL;
-			if (st == OK)
-				n_dev++;
-			else
-				host_ids[k] = expert_ids[k];
-		}
-		if (st == OK) {
-			pend->groups[pend->n++] = (moe_dev_group){.eb = eb, .slots = slots};
-		} else {
-			WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
-				 eb->name ? eb->name : "?", li, status_str(st));
-		}
-	}
-	return n_dev;
-}
-
-static int moe_all_experts_on(struct model *m, int li, backend *a, const int *expert_ids, int K) {
-	moe_stream_tier_maintain(m, li);
+	profile_end(prof, &tier_ps);
 	for (int k = 0; k < K; k++)
 		if (expert_ids[k] < 0 || moe_stream_expert_owner(m, li, expert_ids[k]) != a)
 			return 0;
@@ -4784,14 +4660,16 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	status_code st = OK;
 
-	int				out_is_host = out_buf->host_ptr != NULL || !out_buf->owner ||
-								  backend_has_cap(out_buf->owner, BCAP_IS_HOST);
-	float			local_outf[MOE_MAX_DIM_STACK];
-	float		   *heap_outf = NULL;
-	float		   *dev_acc	  = NULL;
-	int				host_ids[MOE_MAX_TOPK];
-	moe_dev_pending dev_pend = {0};
-	float		   *outf;
+	int				 out_is_host = out_buf->host_ptr != NULL || !out_buf->owner ||
+								   backend_has_cap(out_buf->owner, BCAP_IS_HOST);
+	float			 local_outf[MOE_MAX_DIM_STACK];
+	float			*heap_outf = NULL;
+	float			*dev_acc   = NULL;
+	int				 host_ids[MOE_MAX_TOPK];
+	moe_exec_pending dev_pend	= {0};
+	moe_exec_request rq			= {0};
+	int				 dev_direct = 0;
+	float			*outf;
 	if (out_is_host) {
 		outf = (float *)(out_buf->host_ptr ? out_buf->host_ptr : out_buf->handle);
 		if (!outf) {
@@ -4839,7 +4717,7 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	buffer *xb_dev = &slots[op->in[0]];
 	if (!exec_is_batch(ctx) && backend_has_cap(a, BCAP_MOE_EXPERT_RESIDENT) && a->moe_expert_ffn &&
 		m->layers[li].experts_resident && xb_dev->owner == a && out_buf->owner == a &&
-		moe_all_experts_on(m, li, a, expert_ids, K)) {
+		moe_all_experts_on(m, li, a, expert_ids, K, &s->prof)) {
 		status_code gst	   = moe_stream_resolve(m, li, expert_ids, K, slot_buf);
 		int			dev_ok = (gst == OK);
 		for (int k = 0; dev_ok && k < K; k++)
@@ -4877,17 +4755,38 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 		moe_stream_release_slots(m, li, slot_buf, K);
 	}
 
+	rq = (moe_exec_request){.m		  = m,
+							.s		  = s,
+							.weights  = weights,
+							.layer	  = li,
+							.dim	  = dim,
+							.K		  = K,
+							.I		  = I,
+							.use_gelu = plan.use_gelu};
+	if (s->moe_xb_cache_handle && s->moe_xb_cache_handle == xb_dev->handle &&
+		s->moe_xb_cache_offset == xb_dev->offset && s->moe_xb_cache_dim == dim)
+		rq.x = s->moe_xb_f.p;
+	s->moe_xb_cache_handle = NULL;
+	if (moe_exec_direct_capable(a, xb_dev, out_buf)) {
+		rq.xb_dev  = xb_dev;
+		rq.out_dev = out_buf;
+	}
 	if (m->layers[li].experts_resident &&
-		moe_experts_split_begin(m, li, a, s, xb_dev, expert_ids, weights, &plan, host_ids,
-								&dev_pend) > 0) {
+		moe_exec_dispatch(&rq, a, xb_dev, expert_ids, host_ids, &dev_pend) > 0) {
 		expert_ids = host_ids;
 		int n_host = 0;
 		for (int k = 0; k < K; k++)
 			n_host += host_ids[k] >= 0;
+		dev_direct = dev_pend.n_direct;
 		if (n_host == 0) {
-			st = moe_dev_finish(&dev_pend, m, li, s, K, dim, 0);
-			if (st == OK)
+			int n_acc = dev_pend.n - dev_pend.n_direct;
+			st		  = moe_exec_gather(&dev_pend, &rq, 0);
+			if (st == OK && n_acc > 0)
 				memcpy(outf, s->expert_dev.acc.p, (size_t)dim * sizeof(float));
+			else if (st == OK && dev_direct) {
+				free(heap_outf);
+				goto done_direct;
+			}
 			goto writeback;
 		}
 		dev_acc = s->expert_dev.acc.p;
@@ -4895,9 +4794,10 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	monitor_emit_moe_experts(g_monitor, li, -1, expert_ids, weights, K);
 
-	tpool *pool		  = (a->matmul_thread_local) ? backend_get_pool(a) : NULL;
-	int	   par		  = (pool && a->matmul_thread_local && K >= 2);
-	int	   interleave = par;
+	backend *hb			= backend_has_cap(a, BCAP_IS_HOST) ? a : backend_host();
+	tpool	*pool		= hb->matmul_thread_local ? backend_get_pool(hb) : NULL;
+	int		 par		= (pool && K >= 2);
+	int		 interleave = par;
 
 	profile_scope  io_ps  = profile_begin(&s->prof, STAGE_MOE_IO_WAIT);
 	moe_stream_op *moe_op = NULL;
@@ -4925,10 +4825,11 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 
 	buffer *xb = &slots[RECIPE_SLOT_XB];
 
-	int	   has_qonly = backend_has_cap(a, BCAP_MATMUL_QONLY) && a->matmul_qonly && a->prequantize_x;
-	buffer xb_q8_gate	  = {0};
-	int	   xb_q8_gate_ok  = 0;
-	uint32_t gate_q8_type = has_qonly ? m->layers[li].gate_q8_type : 0;
+	int has_qonly =
+		hb == a && backend_has_cap(a, BCAP_MATMUL_QONLY) && a->matmul_qonly && a->prequantize_x;
+	buffer	 xb_q8_gate	   = {0};
+	int		 xb_q8_gate_ok = 0;
+	uint32_t gate_q8_type  = has_qonly ? m->layers[li].gate_q8_type : 0;
 	if (has_qonly) {
 		if (gate_q8_type) {
 			st = a->prequantize_x(a, xb, dim, gate_q8_type, &xb_q8_gate);
@@ -4940,18 +4841,20 @@ static status_code op_moe_experts(exec_ctx *ctx) {
 	}
 
 	if (par) {
-		backend_report_host_fallback(
-			a, "moe_experts_batch", HFB_CAPABILITY,
-			"expert FFN batch executes on the host (cpu) fallback (device '%s' "
-			"has no resident-expert batch path)",
-			a->name);
+		if (hb != a && m->n_expert_parts == 0)
+			backend_report_host_fallback(
+				a, "moe_experts_batch", HFB_CAPABILITY,
+				"expert FFN batch executes on the host (cpu) fallback (device '%s' "
+				"has no resident-expert batch path)",
+				a->name);
 		st = moe_experts_run_parallel(m, li, K, dim, backend_host(), slot_buf, expert_ids, weights,
 									  xb, s, I, any_fused, use_gelu, xb_q8_gate_ok, gate_q8_type,
-									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, outf);
+									  &xb_q8_gate, scratch_need, pool, interleave, moe_op, rq.x,
+									  outf);
 	} else {
 		st = moe_experts_run_sequential(m, li, K, dim, backend_host(), slot_buf, expert_ids,
 										weights, xb, s, I, use_gelu, xb_q8_gate_ok, gate_q8_type,
-										&xb_q8_gate, scratch_need, outf);
+										&xb_q8_gate, scratch_need, rq.x, outf);
 	}
 
 cleanup:
@@ -4978,7 +4881,7 @@ cleanup:
 	moe_stream_release_slots(m, li, slot_buf, K);
 
 	if (dev_pend.n > 0) {
-		status_code dst = moe_dev_finish(&dev_pend, m, li, s, K, dim, st != OK);
+		status_code dst = moe_exec_gather(&dev_pend, &rq, st != OK);
 		if (st == OK)
 			st = dst;
 		dev_acc = s->expert_dev.acc.p;
@@ -4991,18 +4894,24 @@ cleanup:
 
 zero_fail:
 	if (dev_pend.n > 0)
-		(void)moe_dev_finish(&dev_pend, m, li, s, K, dim, 1);
+		(void)moe_exec_gather(&dev_pend, &rq, 1);
 	for (int d = 0; d < dim; d++)
 		outf[d] = 0.0f;
 
 writeback:
 	if (!out_is_host) {
-		status_code wst = out_buf->owner->buffer_write_f32(out_buf->owner, out_buf, outf, dim);
+		profile_scope wb_ps = profile_begin(&s->prof, STAGE_MOE_WRITEBACK);
+		backend		 *ob	= out_buf->owner;
+		status_code	  wst	= moe_exec_staged_capable(ob, out_buf)
+								  ? moe_exec_upload_host(s, ob, out_buf, outf, dim, dev_direct)
+								  : ob->buffer_write_f32(ob, out_buf, outf, dim);
+		profile_end(&s->prof, &wb_ps);
 		free(heap_outf);
 		if (st == OK)
 			st = wst;
 	}
 
+done_direct:
 	return st;
 }
 
@@ -5146,6 +5055,8 @@ static status_code op_moe_shared(exec_ctx *ctx) {
 	st = OK;
 
 done:
+	if (st == OK && a->submit && !backend_has_cap(a, BCAP_IS_HOST))
+		a->submit(a);
 	profile_end(prof, &ps);
 	return st;
 }
@@ -6623,12 +6534,12 @@ int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t 
 	int dim		  = m->dim;
 	int moe_inter = m->moe.moe_intermediate;
 
+	ops[i++] = mk_moe_router(router_in_slot, m->moe.n_experts, dim);
+
 	if (m->moe.n_shared_experts > 0) {
 		int sh_inter = moe_inter * m->moe.n_shared_experts;
 		ops[i++]	 = mk_moe_shared(experts_in_slot, sh_inter, dim);
 	}
-
-	ops[i++] = mk_moe_router(router_in_slot, m->moe.n_experts, dim);
 
 	ops[i++] = mk_moe_experts(experts_in_slot, out_slot, dim, moe_inter);
 

@@ -36,4 +36,6 @@ void gl_context_free(gl_context *ctx);
 
 status_code gl_context_probe(void);
 
+status_code gl_render_node_identity(char *out, size_t cap);
+
 #endif

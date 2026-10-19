@@ -220,14 +220,14 @@ static int validate_kda_layer(const model *m, const gguf_ctx *g, int i, char *tn
 		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_dt.bias", i, d_inner) ||
 		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_norm.weight", i, hd))
 		return -1;
-	static const char *const f32_names[] = {"blk.%d.ssm_a",
-											"blk.%d.ssm_dt.bias",
-											"blk.%d.ssm_norm.weight",
-											"blk.%d.ssm_conv1d_q.weight",
-											"blk.%d.ssm_conv1d_k.weight",
-											"blk.%d.ssm_conv1d_v.weight"};
+	static const char *const f32_names[] = {"ssm_a",
+											"ssm_dt.bias",
+											"ssm_norm.weight",
+											"ssm_conv1d_q.weight",
+											"ssm_conv1d_k.weight",
+											"ssm_conv1d_v.weight"};
 	for (size_t k = 0; k < ARRAY_LEN(f32_names); k++) {
-		snprintf(tname, tname_sz, f32_names[k], i);
+		snprintf(tname, tname_sz, "blk.%d.%s", i, f32_names[k]);
 		if (!gguf_find_tensor(g, tname)) {
 			ERROR("model: missing required tensor '%s'", tname);
 			return -1;

@@ -737,7 +737,7 @@ static status_code moe_plan_hcs(const struct model *m, const config *cfg, moe_hc
 	n_host		   = MIN(n_host, n_exp - n_dev);
 	int unassigned = n_exp - n_dev - n_host;
 
-	size_t avail   = m->topo ? mem_pool_available(&m->topo->pools[0]) : get_available_memory();
+	size_t avail   = m->topo ? mem_topology_host_available(m->topo) : get_available_memory();
 	size_t budget  = moe_tier_pool_budget(avail);
 	size_t layer_b = per_expert * (size_t)moe_layers;
 	int	   fit	   = moe_tier_fit(budget, layer_b, n_exp);
