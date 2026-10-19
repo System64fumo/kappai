@@ -80,15 +80,4 @@ status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_sta
 							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
 							  int n_rows);
 
-typedef struct {
-	int		n_pos;
-	int		n_layers;
-	float **k;
-	float **v;
-} kv_prefix_snapshot;
-
-status_code kvcache_snapshot_prefix(kv_prefix_snapshot *out, const kvcache *src, const model *m,
-									int n_pos);
-status_code kvcache_seed_prefix(kvcache *dst, const model *m, const kv_prefix_snapshot *snap);
-void		kvcache_snapshot_free(kv_prefix_snapshot *s);
 #endif

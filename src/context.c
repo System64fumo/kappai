@@ -487,18 +487,22 @@ void context_free(context *c) {
 	memset(c, 0, sizeof(*c));
 }
 
-void context_reset(context *c) {
+void context_reset_session(context *c) {
 	context_idle_prefill_wait(c);
-	kvcache_reset(&c->kv);
 	c->samp.recent_count = 0;
 	c->samp.recent_head	 = 0;
 	chat_template_clear_messages(&c->chat);
 	sync_set(c, NULL, 0, 0);
-	c->fed_ids.n		 = 0;
-	c->warmup_done		 = false;
 	c->interrupt		 = 0;
 	c->context_limit_hit = false;
-	c->session_poisoned	 = false;
+}
+
+void context_reset(context *c) {
+	context_reset_session(c);
+	kvcache_reset(&c->kv);
+	c->fed_ids.n		= 0;
+	c->warmup_done		= false;
+	c->session_poisoned = false;
 }
 
 status_code context_slot_init(context *s, const context *e) {

@@ -88,6 +88,7 @@ void context_set_debug_prompt(context *c, bool enabled);
 
 status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);
+void		context_reset_session(context *c);
 void		context_reset(context *c);
 
 status_code context_slot_init(context *s, const context *e);

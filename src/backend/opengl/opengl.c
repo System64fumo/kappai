@@ -3519,55 +3519,6 @@ static status_code gl_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 						  head_dim, n_ctx, n_kv_heads_active, m);
 }
 
-static status_code gl_kv_get_range(backend *self, const buffer *k, const buffer *v, int layer,
-								   int pos_start, int n_rows, buffer *k_out, buffer *v_out,
-								   int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active) {
-	gl_priv *p = self->priv;
-	GL_ENTER(p);
-	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-	if (n_rows <= 0 || n_active <= 0 || head_dim <= 0 || pos_start < 0 ||
-		pos_start + n_rows > n_ctx || !k_out->host_ptr || !v_out->host_ptr)
-		return ERR_INVALID_ARG;
-
-	int	   kv_q8	  = (p->kv_quant == KV_QUANT_Q8_0);
-	size_t kvh_stride = p->kv_kvh_stride
-							? p->kv_kvh_stride
-							: (kv_q8 ? (size_t)n_ctx * p->kv_row_bytes : (size_t)n_ctx * head_dim);
-	size_t row_stride = kv_q8 ? p->kv_row_bytes : (size_t)head_dim;
-
-	void *k_host = gl_kv_layer_read(p, gl_kv_layer_buf(k, layer));
-	void *v_host = gl_kv_layer_read(p, gl_kv_layer_buf(v, layer));
-	if (!k_host || !v_host) {
-		free(k_host);
-		free(v_host);
-		return ERR_INTERNAL;
-	}
-
-	float *kd = (float *)k_out->host_ptr;
-	float *vd = (float *)v_out->host_ptr;
-	for (int row = 0; row < n_rows; row++) {
-		for (int kvh = 0; kvh < n_active; kvh++) {
-			float *kdst = kd + ((size_t)row * n_active + kvh) * head_dim;
-			float *vdst = vd + ((size_t)row * n_active + kvh) * head_dim;
-			size_t base = (size_t)kvh * kvh_stride + (size_t)(pos_start + row) * row_stride;
-			if (kv_q8) {
-				gl_kv_row_dequant_q8_0((const uint8_t *)k_host + base, kdst, head_dim);
-				gl_kv_row_dequant_q8_0((const uint8_t *)v_host + base, vdst, head_dim);
-			} else {
-				const uint16_t *ksrc = (const uint16_t *)k_host + base;
-				const uint16_t *vsrc = (const uint16_t *)v_host + base;
-				for (int d = 0; d < head_dim; d++) {
-					kdst[d] = gl_f16_to_f32(ksrc[d]);
-					vdst[d] = gl_f16_to_f32(vsrc[d]);
-				}
-			}
-		}
-	}
-	free(k_host);
-	free(v_host);
-	return OK;
-}
-
 static uint32_t gl_mla_wtype_code(uint32_t type) {
 	if (type == GGML_TYPE_F32)
 		return 0;
@@ -5241,7 +5192,6 @@ static status_code gl_ctor(backend *out) {
 	out->kv_free						 = gl_kv_free;
 	out->kv_put							 = gl_kv_put;
 	out->kv_put_batch					 = gl_kv_put_batch;
-	out->kv_get_range					 = gl_kv_get_range;
 	out->attention_mla					 = gl_attention_mla;
 	out->kv_alloc_mla					 = gl_kv_alloc_mla;
 	out->kv_put_mla						 = gl_kv_put_mla;

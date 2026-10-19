@@ -3783,52 +3783,6 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 						  0x3);
 }
 
-static status_code vk_kv_get_range(backend *self, const buffer *k, const buffer *v, int layer,
-								   int pos_start, int n_rows, buffer *k_out, buffer *v_out,
-								   int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active) {
-	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-	if (n_rows <= 0 || n_active <= 0 || head_dim <= 0 || pos_start < 0 ||
-		pos_start + n_rows > n_ctx || !k_out->host_ptr || !v_out->host_ptr)
-		return ERR_INVALID_ARG;
-
-	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
-	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
-	if (!kb || !vb)
-		return ERR_INVALID_ARG;
-
-	size_t layer_off_elems = vk_kv_layer_off_elems(kh, layer);
-	size_t kvh_stride	   = (size_t)n_ctx * (size_t)head_dim;
-	size_t row_bytes	   = (size_t)head_dim * sizeof(uint16_t);
-
-	status_code st	   = OK;
-	uint16_t   *rowbuf = xmalloc((size_t)n_rows * (size_t)head_dim * sizeof(uint16_t));
-	if (!rowbuf)
-		return ERR_OUT_OF_MEMORY;
-
-	for (int side = 0; side < 2 && st == OK; side++) {
-		vk_buf *src = side ? vb : kb;
-		float  *dst = (float *)(side ? v_out->host_ptr : k_out->host_ptr);
-		for (int kvh = 0; kvh < n_active && st == OK; kvh++) {
-			size_t src_off = (layer_off_elems + (size_t)kvh * kvh_stride +
-							  (size_t)pos_start * (size_t)head_dim) *
-							 sizeof(uint16_t);
-			st = vk_buf_download_raw(self, src, src_off, rowbuf, (size_t)n_rows * row_bytes);
-			if (st != OK)
-				break;
-			for (int row = 0; row < n_rows; row++) {
-				const uint16_t *r = rowbuf + (size_t)row * head_dim;
-				float		   *d = dst + ((size_t)row * n_active + (size_t)kvh) * head_dim;
-				for (int dd = 0; dd < head_dim; dd++)
-					d[dd] = vk_f16_to_f32(r[dd]);
-			}
-		}
-	}
-	free(rowbuf);
-	return st;
-}
-
 static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
 								  int token, int dim, buffer *x_out) {
 	vk_priv *p = self->priv;
@@ -6104,7 +6058,6 @@ static status_code vk_ctor(backend *out) {
 	out->kv_free						 = vk_kv_free;
 	out->kv_put							 = vk_kv_put;
 	out->kv_put_batch					 = vk_kv_put_batch;
-	out->kv_get_range					 = vk_kv_get_range;
 	out->embd_lookup					 = vk_embd_lookup;
 	out->rmsnorm						 = vk_rmsnorm;
 	out->matmul							 = vk_matmul;
