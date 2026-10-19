@@ -5,6 +5,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
+#include "mempool.h"
 
 struct model_recipe;
 typedef struct model_recipe model_recipe;
@@ -101,7 +102,16 @@ typedef struct layer_weights {
 	bool	mla_vb_f32;
 	bool	is_moe_layer;
 	bool	any_fused_experts;
+	bool	experts_resident;
 } layer_weights;
+
+#define MODEL_MAX_EXPERT_PARTS 8
+
+typedef struct {
+	struct backend *be;
+	int				count;
+	int				priority;
+} model_expert_part;
 
 typedef struct model_mla_params {
 	int32_t q_lora;
@@ -191,6 +201,10 @@ typedef struct model {
 	model_recipe			*recipe;
 	weight_ref			   **wrefs_by_layer;
 	backend				   **layer_backends;
+	const mem_topology		*topo;
+	model_expert_part		 expert_parts[MODEL_MAX_EXPERT_PARTS];
+	int						 n_expert_parts;
+	int						 host_priority;
 	model_tensor_slot		*tensor_data_order;
 	size_t					 tensor_data_order_n;
 
@@ -232,10 +246,11 @@ typedef struct model {
 
 status_code model_load(model *m, const char *path);
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
-										 const char *repack_config, int requested_n_ctx);
+										 const char *repack_config);
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config, int requested_n_ctx);
+							 const char *repack_config);
+status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);
 void		model_free(model *m);
@@ -254,6 +269,18 @@ static inline backend *model_layer_backend(const model *m, int li) {
 		return m ? m->backend : NULL;
 	backend *b = m->layer_backends[li];
 	return b ? b : m->backend;
+}
+
+static inline backend *model_pin_backend(const model *m, int li, int pin_index) {
+	if (!m || m->n_expert_parts == 0)
+		return model_layer_backend(m, li);
+	int end = 0;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		end += m->expert_parts[i].count;
+		if (pin_index < end)
+			return m->expert_parts[i].be;
+	}
+	return NULL;
 }
 
 static inline int model_layer_backend_is_host(const model *m, int li) {
@@ -338,7 +365,7 @@ static inline int model_hybrid_gate_size(const model *m) {
 static inline tpool *model_get_pool(const model *m) {
 	if (m->backend && m->backend->get_pool)
 		return m->backend->get_pool(m->backend);
-	return NULL;
+	return tpool_fetch_pool();
 }
 
 #endif

@@ -1,0 +1,169 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 1) readonly buffer KvBuf {
+	float kv_cache[];
+};
+layout(std430, binding = 2) readonly buffer KBuf {
+	float k_b[];
+};
+layout(std430, binding = 3) readonly buffer VBuf {
+	float v_b[];
+};
+layout(std430, binding = 4) readonly buffer CosBuf {
+	float cos_t[];
+};
+layout(std430, binding = 5) readonly buffer SinBuf {
+	float sin_t[];
+};
+layout(std430, binding = 6) writeonly buffer OutBuf {
+	float out_[];
+};
+
+layout(location = 0) uniform int u_pos;
+layout(location = 1) uniform int u_qk_head;
+layout(location = 2) uniform int u_qk_nope;
+layout(location = 3) uniform int u_qk_rope;
+layout(location = 4) uniform int u_v_head;
+layout(location = 5) uniform int u_kv_lora;
+layout(location = 6) uniform float u_scale;
+layout(location = 7) uniform int u_kwtype;
+layout(location = 8) uniform int u_vwtype;
+
+#define MAX_QK_HEAD 512
+#define MAX_KV_LORA 512
+#define TILE_T 8
+
+shared float s_q[MAX_QK_HEAD];
+shared float s_qabs[MAX_KV_LORA];
+shared float s_lat[TILE_T * MAX_KV_LORA];
+shared float s_sc[TILE_T];
+shared float s_e[TILE_T];
+
+float unpack16(uint bits, int wtype) {
+	if (wtype == 1)
+		return unpackHalf2x16(bits).x;
+	return uintBitsToFloat(bits << 16u);
+}
+
+float wq(uint e) {
+	if (u_kwtype == 0)
+		return k_b[e];
+	uint word = floatBitsToUint(k_b[e >> 1u]);
+	return unpack16((word >> ((e & 1u) * 16u)) & 0xFFFFu, u_kwtype);
+}
+
+float wv(uint e) {
+	if (u_vwtype == 0)
+		return v_b[e];
+	uint word = floatBitsToUint(v_b[e >> 1u]);
+	return unpack16((word >> ((e & 1u) * 16u)) & 0xFFFFu, u_vwtype);
+}
+
+void main() {
+	int	 h		= int(gl_WorkGroupID.x);
+	int	 tid	= int(gl_LocalInvocationID.x);
+	int	 kl		= u_kv_lora;
+	int	 nope	= u_qk_nope;
+	int	 rope	= u_qk_rope;
+	int	 tot	= kl + rope;
+	int	 half_r = rope / 2;
+	int	 n_pos	= u_pos + 1;
+	uint kb_row = uint(h * (nope * kl));
+	uint vb_row = uint(h * (kl * u_v_head));
+
+	for (int d = tid; d < u_qk_head; d += 64)
+		s_q[d] = q[uint(h * u_qk_head + d)];
+	barrier();
+	for (int j = tid; j < half_r; j += 64) {
+		float c				  = cos_t[uint(u_pos * half_r + j)];
+		float s				  = sin_t[uint(u_pos * half_r + j)];
+		float a				  = s_q[nope + 2 * j];
+		float b				  = s_q[nope + 2 * j + 1];
+		s_q[nope + 2 * j]	  = a * c - b * s;
+		s_q[nope + 2 * j + 1] = a * s + b * c;
+	}
+	barrier();
+
+	for (int r = tid; r < kl; r += 64) {
+		float acc = 0.0;
+		for (int d = 0; d < nope; d++)
+			acc += wq(kb_row + uint(r * nope + d)) * s_q[d];
+		s_qabs[r] = acc;
+	}
+	barrier();
+
+	float m_run = uintBitsToFloat(0xFF800000u);
+	float l_run = 0.0;
+	float acc[8];
+	for (int k = 0; k < 8; k++)
+		acc[k] = 0.0;
+
+	for (int t0 = 0; t0 < n_pos; t0 += TILE_T) {
+		int tlen = min(TILE_T, n_pos - t0);
+		for (int idx = tid; idx < tlen * kl; idx += 64)
+			s_lat[idx] = kv_cache[uint(t0 + idx / kl) * uint(tot) + uint(idx % kl)];
+		if (tid < tlen) {
+			uint  base = uint(t0 + tid) * uint(tot);
+			float sc   = 0.0;
+			for (int i = 0; i < kl; i++)
+				sc += kv_cache[base + uint(i)] * s_qabs[i];
+			for (int j = 0; j < half_r; j++) {
+				float c	 = cos_t[uint((t0 + tid) * half_r + j)];
+				float s	 = sin_t[uint((t0 + tid) * half_r + j)];
+				float k0 = kv_cache[base + uint(kl + 2 * j)];
+				float k1 = kv_cache[base + uint(kl + 2 * j + 1)];
+				sc += s_q[nope + 2 * j] * (k0 * c - k1 * s) +
+					  s_q[nope + 2 * j + 1] * (k0 * s + k1 * c);
+			}
+			s_sc[tid] = sc * u_scale;
+		}
+		barrier();
+
+		float m_tile = uintBitsToFloat(0xFF800000u);
+		for (int t = 0; t < tlen; t++)
+			m_tile = max(m_tile, s_sc[t]);
+		float m_new	 = max(m_run, m_tile);
+		float alpha	 = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		float l_tile = 0.0;
+		m_run		 = m_new;
+		for (int t = 0; t < tlen; t++)
+			l_tile += exp(s_sc[t] - m_new);
+		l_run = l_run * alpha + l_tile;
+		if (tid < tlen) {
+			float e	 = exp(s_sc[tid] - m_new);
+			s_e[tid] = e;
+		}
+		barrier();
+
+		for (int k = 0; k < 8; k++) {
+			int i = tid + k * 64;
+			if (i >= kl)
+				break;
+			acc[k] *= alpha;
+			for (int t = 0; t < tlen; t++)
+				acc[k] += s_e[t] * s_lat[t * kl + i];
+		}
+		barrier();
+	}
+
+	float inv = l_run > 0.0 ? 1.0 / l_run : 0.0;
+	for (int k = 0; k < 8; k++) {
+		int i = tid + k * 64;
+		if (i < kl)
+			s_lat[i] = acc[k];
+	}
+	barrier();
+	for (int d = tid; d < u_v_head; d += 64) {
+		float o = 0.0;
+		for (int i = 0; i < kl; i++)
+			o += s_lat[i] * wv(vb_row + uint(d * kl + i));
+		out_[uint(h * u_v_head + d)] = o * inv;
+	}
+}

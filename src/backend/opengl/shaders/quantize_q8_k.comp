@@ -12,10 +12,12 @@ layout(std430, binding = 2) readonly buffer UpBuf {
 	float up[];
 };
 layout(location = 8) uniform int u_act;
+layout(location = 9) uniform float u_gs;
+layout(location = 10) uniform float u_us;
 
 float xin(uint i) {
-	float g = gate[i];
-	float u = up[i];
+	float g = gate[i] * u_gs;
+	float u = up[i] * u_us;
 	float gv;
 	if (u_act == 1) {
 		float t = 0.7978845608 * (g + 0.044715 * g * g * g);

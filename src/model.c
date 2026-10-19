@@ -220,14 +220,14 @@ static int validate_kda_layer(const model *m, const gguf_ctx *g, int i, char *tn
 		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_dt.bias", i, d_inner) ||
 		require_layer_dims_1d(g, tname, tname_sz, "blk.%d.ssm_norm.weight", i, hd))
 		return -1;
-	static const char *const f32_names[] = {"blk.%d.ssm_a",
-											"blk.%d.ssm_dt.bias",
-											"blk.%d.ssm_norm.weight",
-											"blk.%d.ssm_conv1d_q.weight",
-											"blk.%d.ssm_conv1d_k.weight",
-											"blk.%d.ssm_conv1d_v.weight"};
+	static const char *const f32_names[] = {"ssm_a",
+											"ssm_dt.bias",
+											"ssm_norm.weight",
+											"ssm_conv1d_q.weight",
+											"ssm_conv1d_k.weight",
+											"ssm_conv1d_v.weight"};
 	for (size_t k = 0; k < ARRAY_LEN(f32_names); k++) {
-		snprintf(tname, tname_sz, f32_names[k], i);
+		snprintf(tname, tname_sz, "blk.%d.%s", i, f32_names[k]);
 		if (!gguf_find_tensor(g, tname)) {
 			ERROR("model: missing required tensor '%s'", tname);
 			return -1;
@@ -1094,6 +1094,10 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 			ref->host_ptr	  = NULL;
 			return OK;
 		}
+		const void *orig = ref->host_ptr;
+		dequant_weight_to_f32(target, &ref->host_ptr, &ref->type, ref->dequant_cols,
+							  ref->dequant_rows);
+		release_original_weight_data(m, orig, bytes);
 	}
 	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
 }
@@ -1290,6 +1294,11 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 					   WCLASS_MATMUL);
 			UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
 					   WCLASS_MATMUL);
+		} else {
+			UPLOAD(&L->k_b_w, L->k_b_w.type, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora,
+				   m->n_heads, WCLASS_MATMUL);
+			UPLOAD(&L->v_b_w, L->v_b_w.type, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head,
+				   m->n_heads, WCLASS_MATMUL);
 		}
 		UPLOAD(&L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
 		int wo_in = m->n_heads * m->mla.v_head;
@@ -1825,7 +1834,7 @@ status_code model_load(model *m, const char *path) {
 	if (s != OK)
 		return s;
 
-	s = model_load_backend_ex_repack(m, path, cpu, 1, NULL, 0);
+	s = model_load_backend_ex_repack(m, path, cpu, 1, NULL);
 	if (s != OK) {
 		backend_destroy(cpu);
 		return s;
@@ -1979,10 +1988,10 @@ static void load_mla_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 	m->mla.v_head  = v_head;
 	m->head_dim	   = m->mla.qk_head;
 	m->rope_dim	   = m->mla.qk_rope;
-	DEBUG("glm-dsa: MLA q_lora=%d kv_lora=%d qk_nope=%d qk_rope=%d "
+	DEBUG("%s: MLA q_lora=%d kv_lora=%d qk_nope=%d qk_rope=%d "
 		  "qk_head=%d v_head=%d (head_dim=%d, rope_dim=%d)",
-		  m->mla.q_lora, m->mla.kv_lora, m->mla.qk_nope, m->mla.qk_rope, m->mla.qk_head,
-		  m->mla.v_head, m->head_dim, m->rope_dim);
+		  m->arch_info->gguf_name, m->mla.q_lora, m->mla.kv_lora, m->mla.qk_nope, m->mla.qk_rope,
+		  m->mla.qk_head, m->mla.v_head, m->head_dim, m->rope_dim);
 }
 
 static int hybrid_count_full_attention(const model *m) {
@@ -2082,10 +2091,12 @@ static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *pr
 	k->gate_lower_bound = -INFINITY;
 	akey_f32(g, prefix, "kda.gate_lower_bound", &k->gate_lower_bound);
 
-	if (q->conv_kernel < 2 || k->head_dim < 1 || k->hc_count != 4 || k->hc_sinkhorn_iters < 1) {
-		ERROR("glm5-next: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
-			  "only hc_count=4 is supported",
-			  q->conv_kernel, k->head_dim, k->hc_count, k->hc_sinkhorn_iters);
+	if (q->conv_kernel < 2 || k->head_dim < 1 || k->head_dim > HEAD_DIM_MAX || k->hc_count != 4 ||
+		k->hc_sinkhorn_iters < 1) {
+		ERROR("%s: invalid KDA/mHC configuration (conv=%d head_dim=%d hc=%d iters=%d); "
+			  "head_dim must be <= %d and only hc_count=4 is supported",
+			  m->arch_info->gguf_name, q->conv_kernel, k->head_dim, k->hc_count,
+			  k->hc_sinkhorn_iters, HEAD_DIM_MAX);
 		return ERR_FORMAT;
 	}
 
@@ -2116,9 +2127,10 @@ static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *pr
 	q->inner_size	  = d_inner;
 	q->conv_channels  = 3 * d_inner;
 	q->conv_dim		  = 3 * d_inner;
-	DEBUG("glm5-next: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
-		  m->n_heads, k->head_dim, q->conv_kernel, (double)k->gate_lower_bound, k->hc_count,
-		  k->hc_sinkhorn_iters, k->swiglu_clamp_exp ? "yes" : "no");
+	DEBUG("%s: KDA heads=%d head_dim=%d conv=%d gate_lb=%g hc=%d sinkhorn=%d clamp=%s",
+		  m->arch_info->gguf_name, m->n_heads, k->head_dim, q->conv_kernel,
+		  (double)k->gate_lower_bound, k->hc_count, k->hc_sinkhorn_iters,
+		  k->swiglu_clamp_exp ? "yes" : "no");
 	return OK;
 }
 
@@ -2144,23 +2156,61 @@ static status_code model_load_open(model *m, const char *path, int use_mmap,
 	return OK;
 }
 
+static status_code metadata_layer_counts(const gguf_ctx *g, const char *prefix, int *n_all,
+										 int *n_nextn) {
+	int32_t v32;
+	if (req_i32(g, prefix, "block_count", &v32) != OK)
+		return ERR_FORMAT;
+	*n_all	 = v32;
+	*n_nextn = 0;
+	if (akey_i32(g, prefix, "nextn_predict_layers", &v32) == OK)
+		*n_nextn = v32;
+	if (*n_nextn < 0 || *n_nextn >= *n_all) {
+		WARN("model_load: '%s.nextn_predict_layers'=%d is out of range for "
+			 "block_count=%d; ignoring (treating as 0)",
+			 prefix, *n_nextn, *n_all);
+		*n_nextn = 0;
+	}
+	return OK;
+}
+
+status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers) {
+	gguf_ctx	g;
+	status_code s = gguf_load_metadata(&g, path);
+	if (s != OK)
+		return s;
+
+	const char *prefix = NULL;
+	int			n_all = 0, n_nextn = 0;
+	model_arch	arch = arch_detect(&g);
+	if (arch == ARCH_UNKNOWN || gguf_get_str(&g, "general.architecture", &prefix) != OK ||
+		metadata_layer_counts(&g, prefix, &n_all, &n_nextn) != OK) {
+		gguf_free(&g);
+		return ERR_FORMAT;
+	}
+
+	int32_t experts = 0;
+	if (akey_i32(&g, prefix, "expert_count", &experts) != OK) {
+		experts = 0;
+		if (arch_lookup(arch)->is_moe)
+			s = ERR_FORMAT;
+	}
+
+	int32_t kv_shared = 0;
+	akey_i32(&g, prefix, "attention.shared_kv_layers", &kv_shared);
+	*n_layers	 = n_all - n_nextn;
+	*n_experts	 = experts;
+	*n_kv_layers = kv_shared > 0 && kv_shared < *n_layers ? *n_layers - kv_shared : *n_layers;
+	gguf_free(&g);
+	return s;
+}
+
 static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *prefix) {
 	int32_t v32;
 	float	vf;
-	if (req_i32(g, prefix, "block_count", &v32) != OK) {
+	int		n_layer_all, n_layer_nextn;
+	if (metadata_layer_counts(g, prefix, &n_layer_all, &n_layer_nextn) != OK)
 		return ERR_FORMAT;
-	}
-	int n_layer_all	  = v32;
-	int n_layer_nextn = 0;
-	if (akey_i32(g, prefix, "nextn_predict_layers", &v32) == OK) {
-		n_layer_nextn = v32;
-	}
-	if (n_layer_nextn < 0 || n_layer_nextn >= n_layer_all) {
-		WARN("model_load: '%s.nextn_predict_layers'=%d is out of range for "
-			 "block_count=%d; ignoring (treating as 0)",
-			 prefix, n_layer_nextn, n_layer_all);
-		n_layer_nextn = 0;
-	}
 	m->n_layers = n_layer_all - n_layer_nextn;
 	if (n_layer_nextn > 0) {
 		DEBUG("skipping %d NextN/MTP layers (n_layers=%d of %d)", n_layer_nextn, m->n_layers,
@@ -2586,7 +2636,8 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 			if (load_layer_tensor(g, tname, sizeof(tname), i, &L->v_b_w, "blk.%d.attn_v_b.weight",
 								  1) != OK)
 				return ERR_FORMAT;
-			if (m->backend && backend_has_cap(m->backend, BCAP_IS_HOST)) {
+			if (m->backend && (m->arch_info->has_hyper_connections ||
+							   backend_has_cap(m->backend, BCAP_IS_HOST))) {
 				if (L->k_b_w.type != GGML_TYPE_F32) {
 					dequant_ref_to_f32(m, &L->k_b_w, (size_t)m->mla.qk_nope * m->mla.kv_lora,
 									   (size_t)m->n_heads);
@@ -3105,12 +3156,9 @@ status_code model_set_layer_backend_range(model *m, int begin, int end, backend 
 }
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config, int requested_n_ctx) {
+							 const char *repack_config) {
 	memset(m, 0, sizeof(*m));
 	m->backend = bk;
-
-	int	   is_host_backend	 = backend_has_cap(bk, BCAP_IS_HOST) ? 1 : 0;
-	size_t avail_before_load = is_host_backend ? get_available_memory() : backend_mem_available(bk);
 
 	status_code s = model_load_open(m, path, use_mmap, repack_config);
 	if (s != OK) {
@@ -3150,12 +3198,7 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 		goto fail;
 	}
 
-	int report_n_ctx = requested_n_ctx;
-	if (report_n_ctx <= 0 || report_n_ctx > m->n_ctx)
-		report_n_ctx = m->n_ctx;
 	model_mem_estimates_ensure(m);
-	recommend_memory_config(m, bk->kv_alloc ? bk : backend_host(), report_n_ctx, avail_before_load,
-							(kv_quant_type)config_get()->kv_quant, is_host_backend);
 
 	return OK;
 
@@ -3202,8 +3245,8 @@ status_code model_build_recipe(model *m) {
 }
 
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
-										 const char *repack_config, int requested_n_ctx) {
-	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config, requested_n_ctx);
+										 const char *repack_config) {
+	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config);
 	if (s != OK)
 		return s;
 

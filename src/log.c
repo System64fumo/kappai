@@ -96,6 +96,13 @@ void log_tag(const char *tag, const char *fmt, ...) {
 	va_end(ap);
 }
 
+void log_tag_c(const char *color, const char *tag, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	log_locked(LOG_INFO, color, tag, fmt, ap);
+	va_end(ap);
+}
+
 bool log_color_enabled(void) {
 	return g_log.color;
 }
@@ -106,24 +113,26 @@ static void progress_render(progress *p) {
 		return;
 
 	double pct = p->total > 0 ? (100.0 * (double)p->current / (double)p->total) : 0.0;
-	if (pct > 100.0)
-		pct = 100.0;
+	if (pct >= 100.0)
+		pct = 99.0;
 
-	int filled = (int)(pct / 100.0 * PROGRESS_BAR_WIDTH);
+	int filled = (int)(pct / 100.0 * PROGRESS_BAR_WIDTH + 0.5);
 
 	char bar[PROGRESS_BAR_WIDTH + 1];
 	for (int i = 0; i < PROGRESS_BAR_WIDTH; i++)
-		bar[i] = i < filled ? '#' : '-';
+		bar[i] = i < filled ? '#' : ' ';
 	bar[PROGRESS_BAR_WIDTH] = '\0';
 
-	char line[256];
-	char pct_buf[32];
+	char line[512];
+	int	 n;
 	if (g_log.color)
-		snprintf(pct_buf, sizeof(pct_buf), "\r\x1b[35m[ %3.0f%% ]" COLOR_RESET " ", pct);
+		n = snprintf(
+			line, sizeof(line),
+			"\r\x1b[90m[ %2.0f%% ]\x1b[0m \x1b[90m[\x1b[0m\x1b[37m%s\x1b[0m\x1b[90m]\x1b[0m "
+			"(%llu/%llu) %s",
+			pct, bar, (unsigned long long)p->current, (unsigned long long)p->total, p->label);
 	else
-		snprintf(pct_buf, sizeof(pct_buf), "\r[ %3.0f%% ] ", pct);
-
-	int n = snprintf(line, sizeof(line), "%s[%s] (%llu/%llu) %s", pct_buf, bar,
+		n = snprintf(line, sizeof(line), "\r[ %2.0f%% ] [%s] (%llu/%llu) %s", pct, bar,
 					 (unsigned long long)p->current, (unsigned long long)p->total, p->label);
 	if (n < 0)
 		return;

@@ -19,6 +19,8 @@ typedef struct monitor {
 
 status_code monitor_init(monitor *mon, const char *path);
 
+void monitor_log_listening(const monitor *mon);
+
 void monitor_reset(monitor *mon);
 
 void monitor_send(monitor *mon, const char *json_fmt, ...) __attribute__((format(printf, 2, 3)));

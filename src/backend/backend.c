@@ -70,8 +70,6 @@ static const char *hfb_reason_str(host_fallback_reason r) {
 		return "missing capability";
 	case HFB_ERROR:
 		return "device error, retried on host";
-	case HFB_LAYER_NOT_OFFLOADED:
-		return "layer not offloaded";
 	default:
 		return "unknown";
 	}
@@ -285,6 +283,12 @@ static void log_op_homes(backend *b) {
 		{"matmul_multi_batch", b->matmul_multi_batch != NULL},
 		{"moe_activate", b->moe_activate != NULL},
 		{"moe_experts_batch", b->moe_experts_batch != NULL},
+		{"hc_init", b->hc_init != NULL},
+		{"hc_pre", b->hc_pre != NULL},
+		{"hc_post", b->hc_post != NULL},
+		{"hc_final", b->hc_final != NULL},
+		{"kda", b->kda != NULL},
+		{"mla_absorbed", b->mla_absorbed != NULL},
 	};
 	int	 n_native = 0;
 	int	 n_total  = (int)ARRAY_LEN(ops);
@@ -354,6 +358,7 @@ static status_code make_backend(backend_reg_entry *e, int device_index, backend 
 		return s;
 	}
 
+	b->device_index = device_index;
 	log_op_homes(b);
 
 	*out = b;
@@ -437,105 +442,134 @@ status_code backend_create_host(backend **out) {
 	return OK;
 }
 
-status_code backend_create_best(backend **out) {
-	backend_load();
-	int best_priority = -1;
-	int best_idx	  = -1;
+int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max) {
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	int			 n			= 0;
+	for (int i = 0; i < n_backends; i++) {
+		if (!infos[i].available)
+			continue;
+		for (int d = 0; d < infos[i].n_devices && n < max; d++)
+			backend_format_device(infos[i].name, d, out[n++], BACKEND_DEVICE_NAME_MAX);
+	}
+	return n;
+}
 
+bool backend_device_is_host(const char *spec) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return false;
+	if (strcmp(name, "cpu") == 0)
+		return true;
+
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n_backends; i++)
+		if (strcmp(infos[i].name, name) == 0)
+			return (infos[i].caps & BCAP_IS_HOST) != 0;
+	return false;
+}
+
+bool backend_device_uma(const char *spec) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return false;
+
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n_backends; i++)
+		if (strcmp(infos[i].name, name) == 0)
+			return (infos[i].caps & BCAP_UNIFIED_MEMORY) != 0;
+	return false;
+}
+
+status_code backend_identity(const backend *b, char *out, size_t cap) {
+	if (!b || !b->device_identity)
+		return ERR_UNSUPPORTED;
+	return b->device_identity(b->device_index, out, cap);
+}
+
+status_code backend_device_identity(const char *spec, char *out, size_t cap) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
+		return ERR_INVALID_ARG;
+	backend_load();
 	for (int i = 0; i < g_registry_count; i++) {
+		if (strcmp(g_registry[i].name, name) != 0)
+			continue;
 		backend probe;
 		memset(&probe, 0, sizeof(probe));
 		if (g_registry[i].ctor(&probe) != OK)
+			return ERR_UNSUPPORTED;
+		if (!probe.device_identity)
+			return ERR_UNSUPPORTED;
+		return probe.device_identity(device_index, out, cap);
+	}
+	return ERR_UNSUPPORTED;
+}
+
+int backend_best_device(char *out, size_t out_cap) {
+	backend_info infos[BACKEND_MAX];
+	int			 n_backends	   = backend_list(infos, BACKEND_MAX);
+	int			 best_priority = -1;
+	int			 best_idx	   = -1;
+	for (int i = 0; i < n_backends; i++) {
+		if (!infos[i].available || (infos[i].caps & BCAP_IS_HOST))
 			continue;
-		if (probe.probe && probe.probe() != OK)
+		if (infos[i].priority <= best_priority)
 			continue;
-		if (probe.caps & BCAP_IS_HOST)
-			continue;
-		if (probe.priority <= best_priority)
-			continue;
-		best_priority = probe.priority;
+		best_priority = infos[i].priority;
 		best_idx	  = i;
 	}
-
 	if (best_idx < 0)
-		return backend_create_host(out);
-	return make_backend(&g_registry[best_idx], 0, out);
+		return backend_format_device("cpu", 0, out, out_cap);
+	return backend_format_device(infos[best_idx].name, 0, out, out_cap);
+}
+
+status_code backend_create_best(backend **out) {
+	char spec[BACKEND_DEVICE_NAME_MAX];
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	backend_best_device(spec, sizeof(spec));
+	backend_parse_device(spec, name, sizeof(name), &device_index);
+	return backend_create(name, device_index, out);
+}
+
+int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
+	return snprintf(out, out_cap, "%s_%d", name, device_index);
+}
+
+size_t backend_name_brief_len(const char *name) {
+	const char *paren = strstr(name, " (");
+	return paren ? (size_t)(paren - name) : strlen(name);
 }
 
 int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index) {
 	if (!spec || !*spec)
 		return -1;
 
-	backend_load();
-
-	for (int i = 0; i < g_registry_count; i++) {
-		if (strcmp(g_registry[i].name, spec) == 0) {
-			snprintf(name, name_cap, "%s", spec);
-			*device_index = 0;
-			return 0;
-		}
-	}
-
-	const char *colon = strchr(spec, ':');
-	if (colon && colon != spec) {
-		size_t name_len = (size_t)(colon - spec);
-		if (name_len >= name_cap)
-			return -1;
-		char *tail = NULL;
-		long  v	   = strtol(colon + 1, &tail, 10);
-		if (*tail != '\0' || v < 0 || v > INT_MAX)
-			return -1;
-		memcpy(name, spec, name_len);
-		name[name_len] = '\0';
-		*device_index  = (int)v;
-		return 0;
-	}
-
-	int best_len = -1;
-	int best_idx = 0;
-	for (int i = 0; i < g_registry_count; i++) {
-		size_t len = strlen(g_registry[i].name);
-		if ((int)len <= best_len)
-			continue;
-		if (strncmp(spec, g_registry[i].name, len) != 0)
-			continue;
-		const char *rem		   = spec + len;
-		int			all_digits = 1;
-		for (const char *p = rem; *p; p++) {
-			if (*p < '0' || *p > '9') {
-				all_digits = 0;
-				break;
-			}
-		}
-		if (!all_digits)
-			continue;
-		best_len = (int)len;
-		best_idx = (*rem) ? (int)strtol(rem, NULL, 10) : 0;
-	}
-	if (best_len > 0) {
-		snprintf(name, name_cap, "%.*s", best_len, spec);
-		*device_index = best_idx;
-		return 0;
-	}
-
-	const char *end_all = spec + strlen(spec);
-	const char *digits	= end_all;
+	const char *end	   = spec + strlen(spec);
+	const char *digits = end;
 	while (digits > spec && digits[-1] >= '0' && digits[-1] <= '9')
 		digits--;
-	size_t name_len = (size_t)(digits - spec);
+	if (digits == end || digits == spec || digits[-1] != '_')
+		return -1;
+
+	size_t name_len = (size_t)(digits - 1 - spec);
 	if (name_len == 0 || name_len >= name_cap)
 		return -1;
+
+	char *tail = NULL;
+	long  v	   = strtol(digits, &tail, 10);
+	if (*tail != '\0' || v > INT_MAX)
+		return -1;
+
 	memcpy(name, spec, name_len);
 	name[name_len] = '\0';
-	int idx		   = 0;
-	if (*digits) {
-		char *tail = NULL;
-		long  v	   = strtol(digits, &tail, 10);
-		if (*tail != '\0' || v < 0 || v > INT_MAX)
-			return -1;
-		idx = (int)v;
-	}
-	*device_index = idx;
+	*device_index  = (int)v;
 	return 0;
 }
 
@@ -548,9 +582,12 @@ void backend_destroy(backend *b) {
 	free(b);
 }
 
-static backend			 *g_host_backend  = NULL;
-static pthread_once_t	  g_host_once	  = PTHREAD_ONCE_INIT;
-static _Atomic(backend *) g_host_override = NULL;
+static backend			 *g_host_backend	= NULL;
+static pthread_once_t	  g_host_once		= PTHREAD_ONCE_INIT;
+static _Atomic(backend *) g_host_override	= NULL;
+static const char		 *g_host_first_file = "?";
+static int				  g_host_first_line = 0;
+static const char		 *g_host_first_func = "?";
 
 void backend_host_use(backend *b) {
 	if (!b || !backend_has_cap(b, BCAP_IS_HOST))
@@ -576,12 +613,17 @@ static void host_backend_init(void) {
 	}
 	if (atomic_load(&g_host_override) == NULL)
 		atomic_store(&g_host_override, g_host_backend);
+	INFO("host (cpu) fallback backend '%s' created; first needed by %s() at %s:%d",
+		 g_host_backend->name, g_host_first_func, g_host_first_file, g_host_first_line);
 }
 
-backend *backend_host(void) {
+backend *backend_host_at(const char *file, int line, const char *func) {
 	backend *o = atomic_load(&g_host_override);
 	if (o)
 		return o;
+	g_host_first_file = file;
+	g_host_first_line = line;
+	g_host_first_func = func;
 	pthread_once(&g_host_once, host_backend_init);
 	return g_host_backend;
 }
@@ -620,14 +662,14 @@ void host_kernels_register(int priority, host_matmul_generic_fn mm) {
 }
 
 void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *y, int n, int k) {
-	host_matmul_generic_fn fn = atomic_load(&g_hk_matmul);
-	if (fn) {
-		fn(w, w_type, x, y, n, k);
+	backend *host = backend_host();
+	if (host && host->matmul_thread_local) {
+		host->matmul_thread_local(host, w, w_type, x, y, n, k, tpool_current_tid());
 		return;
 	}
-	backend *host = backend_host();
-	if (host && host->matmul_thread_local)
-		host->matmul_thread_local(host, w, w_type, x, y, n, k, 0);
+	host_matmul_generic_fn fn = atomic_load(&g_hk_matmul);
+	if (fn)
+		fn(w, w_type, x, y, n, k);
 }
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {

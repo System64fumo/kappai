@@ -30,7 +30,7 @@ static void hyb_load(hyb_sess *r, const char *path, int n_ctx) {
 	r->flash = 0;
 	if (backend_create("cpu", 0, &r->be) != OK)
 		abort();
-	if (model_load_backend_ex_repack(&r->m, path, r->be, 0, NULL, 0) != OK)
+	if (model_load_backend_ex_repack(&r->m, path, r->be, 0, NULL) != OK)
 		abort();
 	if (kvcache_init(&r->kv, &r->m, n_ctx, KV_QUANT_F16) != OK)
 		abort();

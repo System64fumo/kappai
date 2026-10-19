@@ -81,6 +81,15 @@ typedef enum {
 	OPFAM_MOE_STREAM,
 	OPFAM_TOOLCALL,
 	OPFAM_REAL_SHAPE,
+	OPFAM_HCS,
+	OPFAM_MEMPOOL,
+	OPFAM_MOE_TIER,
+	OPFAM_HC_INIT,
+	OPFAM_HC_PRE,
+	OPFAM_HC_POST,
+	OPFAM_HC_FINAL,
+	OPFAM_KDA,
+	OPFAM_MLA_ABSORBED,
 	OPFAM_COUNT
 } op_family;
 
@@ -171,6 +180,9 @@ void		run_hybrid_state_tests(backend *ref);
 void		run_orchestration_tests(void);
 void		run_moe_stream_tests(void);
 void		run_toolcall_tests(void);
+void		run_hcs_tests(void);
+void		run_mempool_tests(void);
+void		run_moe_tier_tests(void);
 void		test_quant_determinism(backend *ref, const qtype_info *qt);
 void		test_quant_finiteness(backend *ref, const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(backend *ref);

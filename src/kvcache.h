@@ -6,32 +6,45 @@
 #include "model.h"
 
 typedef struct kvcache_mla {
-	buffer kv;
-	buffer kv_host;
-	int	   lora_dim;
-	int	   qk_rope_dim;
-	int	   host_alloced;
+	int lora_dim;
+	int qk_rope_dim;
 } kvcache_mla;
 
 typedef struct kvcache_hybrid {
-	float *conv_state;
-	float *recurrent_state;
-	size_t conv_stride;
-	size_t recurrent_stride;
-	size_t conv_total;
-	size_t recurrent_total;
-	float *mla_latent;
-	size_t mla_latent_stride;
+	float  *conv_state;
+	float  *recurrent_state;
+	size_t	conv_stride;
+	size_t	recurrent_stride;
+	size_t	conv_total;
+	size_t	recurrent_total;
+	size_t	mla_latent_stride;
+	int		n_layers;
+	buffer *conv_buf;
+	buffer *state_buf;
+	buffer *latent_buf;
 } kvcache_hybrid;
+
+#define KV_MAX_MIRRORS 7
+
+typedef struct {
+	backend *be;
+	buffer	 k, v;
+	int		*remap;
+	int		 n_remap;
+	int		 n_slots;
+} kv_mirror;
 
 typedef struct kvcache {
 	int			  n_ctx, n_pos;
 	int			  n_kv_layers;
 	buffer		  k, v;
-	buffer		  k_host, v_host;
-	int			  has_host_kv;
-	int			 *kv_slot_on_host;
-	int			  n_kv_slot_flags;
+	kv_mirror	  mirror[KV_MAX_MIRRORS];
+	int			  n_mirrors;
+	int			 *primary_remap;
+	int			  n_primary_remap;
+	int			  n_primary_slots;
+	unsigned	 *slot_devices;
+	int			  n_slot_devices;
 	float		 *kv_transfer_buf;
 	size_t		  kv_transfer_cap;
 	kv_quant_type kv_quant;
@@ -51,30 +64,14 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 void		kvcache_free(kvcache *c);
 void		kvcache_reset(kvcache *c);
 
-status_code kvcache_alloc_host_mirror(kvcache *c, const model *m);
-
-static inline int kvcache_mirror_layer(const kvcache *c, int layer) {
-	if (!c->mirror_remap || layer < 0 || layer >= c->n_mirror_remap)
-		return layer;
-	int mapped = c->mirror_remap[layer];
-	return mapped >= 0 ? mapped : layer;
-}
-
-static inline int kvcache_slot_on_host(const kvcache *c, int slot) {
-	if (!c || !c->kv_slot_on_host)
-		return 0;
-	if (slot < 0 || slot >= c->n_kv_slot_flags)
-		return 0;
-	return c->kv_slot_on_host[slot];
-}
-
-static inline buffer *kvcache_k_for_layer(kvcache *c, int layer) {
-	return kvcache_slot_on_host(c, layer) ? &c->k_host : &c->k;
-}
-
-static inline buffer *kvcache_v_for_layer(kvcache *c, int layer) {
-	return kvcache_slot_on_host(c, layer) ? &c->v_host : &c->v;
-}
+status_code kvcache_alloc_mirrors(kvcache *c, const model *m);
+int			kvcache_layer_device(const kvcache *c, const model *m, int layer);
+int			kvcache_device_count(const kvcache *c);
+backend	   *kvcache_device_backend(const kvcache *c, int dev);
+int			kvcache_device_slots(const kvcache *c, int dev);
+size_t		kvcache_device_bytes(const kvcache *c, const model *m, int dev);
+void kvcache_attn_view(const kvcache *c, const model *m, int exec_layer, int kv_layer, buffer **k,
+					   buffer **v, int *slot);
 
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in);

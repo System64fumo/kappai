@@ -2,6 +2,7 @@
 #define TUI_SCHEMA_H
 
 #include "config.h"
+#include "hcs.h"
 
 #include <limits.h>
 #include <stdbool.h>
@@ -22,7 +23,6 @@
 typedef struct {
 	char name[SC_NAME_MAX];
 	char model[SC_PATH_MAX];
-	char device[SC_TEXT_MAX];
 	char repack[SC_TEXT_MAX];
 	char fuse[SC_TEXT_MAX];
 	char moe_pin_list[SC_PINLIST_MAX];
@@ -32,14 +32,13 @@ typedef struct {
 	char host[SC_HOST_MAX];
 	char api_key[SC_HOST_MAX];
 
+	hcs_config hcs;
+
 	uint64_t seed;
 
 	int ctx_size;
 	int n_threads;
-	int ngl;
 	int kv_quant;
-	int moe_cache_cap;
-	int moe_pin;
 	int n_predict;
 	int top_k;
 	int repeat_last_n;
@@ -77,7 +76,6 @@ typedef enum {
 	UIK_PATH,
 	UIK_SELECT,
 	UIK_MULTI,
-	UIK_DEVICE,
 } fld_uikind;
 
 typedef struct {
@@ -127,7 +125,6 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a);
 void sc_multi_parse(const char *val, const char *const choices[], int n, bool empty_all, bool *sel);
 void sc_multi_format(char *out, size_t cap, const char *const choices[], int n, bool empty_all,
 					 const bool *sel);
-int	 sc_enum_devices(char out[][SC_TEXT_MAX], int max);
 void sc_default_name(char *out, size_t cap);
 
 #endif

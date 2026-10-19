@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define CONFIG_MAX_LAYER_DEVICES 8
+#define CONFIG_PRIORITY_UNSET (-1)
+
 typedef struct config {
 	const char *device;
 	const char *model;
@@ -14,12 +17,21 @@ typedef struct config {
 	const char *fuse;
 	uint64_t	seed;
 
-	int n_threads;
-	int ctx_size;
-	int kv_quant;
-	int moe_cache_cap;
-	int moe_pin;
-	int ngl;
+	int			n_threads;
+	int			ctx_size;
+	int			kv_quant;
+	int			moe_cache_cap;
+	int			moe_pin;
+	int			ngl;
+	int			n_layer_devices;
+	const char *layer_devices[CONFIG_MAX_LAYER_DEVICES];
+	int			layer_counts[CONFIG_MAX_LAYER_DEVICES];
+	int			n_expert_devices;
+	const char *expert_devices[CONFIG_MAX_LAYER_DEVICES];
+	int			expert_counts[CONFIG_MAX_LAYER_DEVICES];
+	int			expert_priorities[CONFIG_MAX_LAYER_DEVICES];
+	const char *expert_pins[CONFIG_MAX_LAYER_DEVICES];
+	int			host_priority;
 
 	bool debug;
 	bool use_mmap;

@@ -1,0 +1,38 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) readonly buffer WBuf {
+	float w[];
+};
+layout(std430, binding = 2) buffer StateBuf {
+	float state[];
+};
+layout(location = 0) uniform int u_channels;
+layout(location = 1) uniform int u_kernel;
+layout(location = 2) uniform int u_reset;
+layout(location = 3) uniform int u_state_base;
+
+const int MAX_HIST = 8;
+
+void main(void) {
+	int c = int(gl_GlobalInvocationID.x);
+	if (c >= u_channels)
+		return;
+	int	  hist	= u_kernel - 1;
+	int	  sbase = u_state_base + c * hist;
+	int	  wbase = c * u_kernel;
+	float old[MAX_HIST];
+	float cur = x[c];
+	float sum = cur * w[wbase + hist];
+	for (int k = 0; k < hist; k++) {
+		old[k] = u_reset != 0 ? 0.0 : state[sbase + k];
+		sum += old[k] * w[wbase + k];
+	}
+	for (int k = 0; k + 1 < hist; k++)
+		state[sbase + k] = old[k + 1];
+	state[sbase + hist - 1] = cur;
+	x[c]					= sum / (1.0 + exp(-sum));
+}

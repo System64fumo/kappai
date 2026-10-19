@@ -1,0 +1,33 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer MixBuf {
+	float mixes[];
+};
+layout(std430, binding = 1) readonly buffer BaseBuf {
+	float base[];
+};
+layout(std430, binding = 2) readonly buffer ScaleBuf {
+	float scale[];
+};
+layout(std430, binding = 3) readonly buffer StreamBuf {
+	float stream[];
+};
+layout(std430, binding = 4) writeonly buffer XBuf {
+	float x[];
+};
+layout(location = 0) uniform int u_dim;
+layout(location = 1) uniform int u_n_hc;
+layout(location = 2) uniform float u_eps;
+
+void main(void) {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= u_dim)
+		return;
+	float acc = 0.0;
+	for (int h = 0; h < u_n_hc; h++) {
+		float pre = 1.0 / (1.0 + exp(-(mixes[h] * scale[0] + base[h]))) + u_eps;
+		acc += pre * stream[h * u_dim + i];
+	}
+	x[i] = acc;
+}

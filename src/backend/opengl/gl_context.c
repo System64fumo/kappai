@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 static int open_drm_render_node(int *out_index) {
@@ -20,6 +22,68 @@ static int open_drm_render_node(int *out_index) {
 		}
 	}
 	return -1;
+}
+
+static bool sysfs_read_u64(int fd, const char *link, uint64_t *out) {
+	struct stat st;
+	if (fstat(fd, &st) != 0)
+		return false;
+	char path[160];
+	snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/%s", (unsigned)major(st.st_rdev),
+			 (unsigned)minor(st.st_rdev), link);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return false;
+	unsigned long long v  = 0;
+	bool			   ok = fscanf(f, "%llu", &v) == 1;
+	fclose(f);
+	if (ok)
+		*out = (uint64_t)v;
+	return ok;
+}
+
+status_code gl_render_node_identity(char *out, size_t cap) {
+	int drm_index = 0;
+	int fd		  = open_drm_render_node(&drm_index);
+	if (fd < 0)
+		return ERR_UNSUPPORTED;
+	struct stat st;
+	status_code s = ERR_UNSUPPORTED;
+	if (fstat(fd, &st) == 0) {
+		char path[192];
+		snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/device/uevent",
+				 (unsigned)major(st.st_rdev), (unsigned)minor(st.st_rdev));
+		FILE *f = fopen(path, "r");
+		if (f) {
+			char line[128];
+			while (fgets(line, sizeof(line), f)) {
+				if (strncmp(line, "PCI_SLOT_NAME=", 14) != 0)
+					continue;
+				char slot[64];
+				snprintf(slot, sizeof(slot), "%s", line + 14);
+				size_t len = strlen(slot);
+				while (len > 0 && (slot[len - 1] == '\n' || slot[len - 1] == '\r'))
+					slot[--len] = '\0';
+				snprintf(out, cap, "PCI:%s", slot);
+				s = OK;
+				break;
+			}
+			fclose(f);
+		}
+	}
+	close(fd);
+	return s;
+}
+
+static void query_memory_topology(gl_context *ctx) {
+	ctx->unified_memory		= 1;
+	ctx->video_memory_bytes = 0;
+
+	uint64_t vram = 0;
+	if (sysfs_read_u64(ctx->drm_fd, "mem_info_vram_total", &vram) && vram > 0) {
+		ctx->unified_memory		= 0;
+		ctx->video_memory_bytes = (size_t)vram;
+	}
 }
 
 static int g_probed = -1;
@@ -148,6 +212,7 @@ status_code gl_context_init(gl_context *out) {
 	out->drm_fd				= fd;
 	out->has_compute		= usable ? 1 : 0;
 	out->max_wg_invocations = has_compute > 0 ? has_compute : 0;
+	query_memory_topology(out);
 
 	if (usable) {
 		for (int i = 0; i < 3; i++)

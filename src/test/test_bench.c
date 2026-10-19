@@ -413,8 +413,11 @@ static int bench_e2e_one(backend *b, const char *name, void *ud) {
 	(void)b;
 	synth_suite_common_init();
 
+	char device[64];
+	backend_format_device(name, 0, device, sizeof(device));
+
 	config cfg	   = config_defaults();
-	cfg.device	   = name;
+	cfg.device	   = device;
 	cfg.model	   = synth_chat_model_path;
 	cfg.use_mmap   = false;
 	cfg.flash_attn = false;

@@ -1,0 +1,29 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer SrcBuf {
+	uint src[];
+};
+layout(std430, binding = 1) writeonly buffer DstBuf {
+	float dst[];
+};
+layout(location = 0) uniform int u_total;
+layout(location = 1) uniform int u_stride;
+
+uint read_byte(uint byte_index) {
+	return (src[byte_index >> 2u] >> ((byte_index & 3u) * 8u)) & 255u;
+}
+
+void main(void) {
+	for (int i = int(gl_GlobalInvocationID.x); i < u_total; i += u_stride) {
+		uint  block = uint(i) >> 5u;
+		uint  lane	= uint(i) & 31u;
+		uint  base	= block * 34u;
+		float scale = unpackHalf2x16(read_byte(base) | (read_byte(base + 1u) << 8u)).x;
+		int	  q		= int(read_byte(base + 2u + lane));
+		if (q > 127)
+			q -= 256;
+		dst[i] = scale * float(q);
+	}
+}

@@ -2,6 +2,7 @@
 
 #include "backend/backend.h"
 #include "common.h"
+#include "hcs.h"
 #include "log.h"
 
 #include <ctype.h>
@@ -24,8 +25,6 @@ static const char *const fuse_choices[] = {"qkv", NULL};
 	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_TEXT, false}
 #define S_PATH(k, l, h, f, cap)                                                                    \
 	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_PATH, false}
-#define S_DEV(k, l, h, f, cap)                                                                     \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_DEVICE, false}
 #define S_MULTI(k, l, h, f, cap, ch, ea)                                                           \
 	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, ch, UIK_MULTI, ea}
 #define S_INT(k, l, h, f, lo, hi)                                                                  \
@@ -44,8 +43,6 @@ static const field_desc MODEL_FIELDS[] = {
 	S_PATH("model", "Model path", "path to the GGUF model file", model, SC_PATH_MAX),
 	S_INT("ctx_size", "Context size", "0 = use model default", ctx_size, 0, INT_MAX),
 	S_INT("threads", "Threads", "0 = auto-detect", n_threads, 0, 4096),
-	S_DEV("device", "Device", "compute device to run on", device, SC_TEXT_MAX),
-	S_INT("ngl", "GPU layers", "-1 = all on device, 0 = all on CPU", ngl, -1, INT_MAX),
 };
 
 static const field_desc ENGINE_FIELDS[] = {
@@ -69,10 +66,7 @@ static const field_desc ENGINE_FIELDS[] = {
 
 static const field_desc MOE_FIELDS[] = {
 	S_BOOL("stream", "Expert streaming", "streaming expert cache for MoE models", moe_stream),
-	S_INT("cache", "Cache capacity", "per-layer expert LRU capacity, 0 = default", moe_cache_cap, 0,
-		  INT_MAX),
 	S_BOOL("preload", "Preload experts", "load all expert weights at startup", moe_preload),
-	S_INT("pin", "Pin first n", "first n experts per layer never evicted", moe_pin, 0, INT_MAX),
 	S_STR("pin_list", "Pin list", "comma-separated expert ids, e.g. 3,17,42", moe_pin_list,
 		  SC_PINLIST_MAX),
 };
@@ -255,18 +249,16 @@ void sc_defaults(saved_config *sc) {
 	cli_args a;
 	cli_args_defaults(&a);
 
-	snprintf(sc->device, sizeof(sc->device), "%s", c.device ? c.device : "auto");
+	hcs_defaults(&sc->hcs);
 	snprintf(sc->metrics, sizeof(sc->metrics), "%s", a.metrics);
 	snprintf(sc->host, sizeof(sc->host), "%s", a.server_host);
 	snprintf(sc->repack, sizeof(sc->repack), "all");
 	snprintf(sc->fuse, sizeof(sc->fuse), "qkv");
 
-	sc->use_mmap	  = c.use_mmap;
-	sc->flash_attn	  = c.flash_attn;
-	sc->reasoning	  = c.reasoning;
-	sc->moe_stream	  = c.moe_stream;
-	sc->moe_cache_cap = c.moe_cache_cap;
-	sc->ngl			  = c.ngl;
+	sc->use_mmap   = c.use_mmap;
+	sc->flash_attn = c.flash_attn;
+	sc->reasoning  = c.reasoning;
+	sc->moe_stream = c.moe_stream;
 
 	sc->n_predict	   = a.n_predict;
 	sc->temperature	   = a.temperature;
@@ -454,11 +446,84 @@ static const field_desc *find_field(const schema_tab *tab, const char *key, size
 	return NULL;
 }
 
+#define HCS_SECTION_NONE (-2)
+#define HCS_SECTION_ROOT (-1)
+
+static bool section_is_hcs(str_span sec, str_span *device) {
+	if (sec.len == 3 && strncasecmp(sec.p, "hcs", 3) == 0) {
+		device->len = 0;
+		return true;
+	}
+	if (sec.len <= 4 || strncasecmp(sec.p, "hcs.", 4) != 0)
+		return false;
+	*device = span_trim(sec.p + 4, sec.len - 4);
+	return true;
+}
+
+static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char *key,
+						   const char *value, char *err, size_t errlen) {
+	bool is_model = strcasecmp(tab->name, "model") == 0;
+	bool is_moe	  = strcasecmp(tab->name, "moe") == 0;
+	if (is_moe && strcasecmp(key, "pin") == 0) {
+		char *end = NULL;
+		(void)strtol(value, &end, 10);
+		if (!*value || *end != '\0') {
+			snprintf(err, errlen, "'pin' expects an integer, got '%s'", value);
+			return -1;
+		}
+		return 1;
+	}
+	if (is_model && strcasecmp(key, "device") == 0) {
+		if (strlen(value) >= sizeof(legacy->device)) {
+			snprintf(err, errlen, "value too long for 'device'");
+			return -1;
+		}
+		snprintf(legacy->device, sizeof(legacy->device), "%s", value);
+		legacy->has_device = true;
+		return 1;
+	}
+	if (!(is_model && strcasecmp(key, "ngl") == 0) && !(is_moe && strcasecmp(key, "cache") == 0))
+		return 0;
+
+	char *end = NULL;
+	long  v	  = strtol(value, &end, 10);
+	if (!*value || *end != '\0' || v < -1 || v > INT_MAX) {
+		snprintf(err, errlen, "'%s' expects an integer, got '%s'", key, value);
+		return -1;
+	}
+	if (is_model) {
+		legacy->has_ngl = true;
+		legacy->ngl		= (int)v;
+	} else {
+		legacy->has_cache = true;
+		legacy->cache	  = (int)v;
+	}
+	return 1;
+}
+
+static int ini_finish_hcs(saved_config *sc, const hcs_loader *loader, bool hcs_used,
+						  const hcs_legacy *legacy, char *err, size_t errlen) {
+	if (!hcs_used)
+		return hcs_migrate_legacy(&sc->hcs, legacy, err, errlen);
+	if (legacy->has_device || legacy->has_ngl || legacy->has_cache) {
+		snprintf(err, errlen,
+				 "legacy keys ([model] device/ngl, [moe] cache) cannot be combined with [hcs]");
+		return -1;
+	}
+	return hcs_loader_finish(loader, &sc->hcs, err, errlen);
+}
+
 static int ini_apply(saved_config *sc, const char *data, char *err, size_t errlen) {
 	ini_cursor		  cur = {data, 0};
 	char			  line[SC_SYSTEM_MAX * 2];
-	const schema_tab *tab = NULL;
+	const schema_tab *tab		  = NULL;
+	int				  hcs_section = HCS_SECTION_NONE;
+	bool			  hcs_used	  = false;
+	hcs_loader		  loader;
+	hcs_legacy		  legacy = {0};
 	int				  r;
+
+	hcs_loader_init(&loader);
 
 	while ((r = ini_next_line(&cur, line, sizeof(line))) == 1) {
 		str_span	sp	= span_trim(line, strlen(line));
@@ -477,6 +542,24 @@ static int ini_apply(saved_config *sc, const char *data, char *err, size_t errle
 			if (sec.len == 0) {
 				snprintf(err, errlen, "line %d: empty section name", cur.line_no);
 				return -1;
+			}
+			str_span device = {0};
+			tab				= NULL;
+			hcs_section		= HCS_SECTION_NONE;
+			if (section_is_hcs(sec, &device)) {
+				hcs_used	= true;
+				hcs_section = HCS_SECTION_ROOT;
+				if (device.len > 0) {
+					char name[HCS_NAME_MAX];
+					snprintf(name, sizeof(name), "%.*s", (int)device.len, device.p);
+					char perr[SC_ERR_MAX];
+					hcs_section = hcs_loader_open_section(&loader, name, perr, sizeof(perr));
+					if (hcs_section < 0) {
+						snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
+						return -1;
+					}
+				}
+				continue;
 			}
 			tab = find_tab(sec.p, sec.len);
 			if (!tab) {
@@ -498,23 +581,41 @@ static int ini_apply(saved_config *sc, const char *data, char *err, size_t errle
 			snprintf(err, errlen, "line %d: empty key", cur.line_no);
 			return -1;
 		}
-		if (!tab) {
+		if (!tab && hcs_section == HCS_SECTION_NONE) {
 			snprintf(err, errlen, "line %d: '%.*s' appears before any section", cur.line_no,
 					 (int)key.len, key.p);
 			return -1;
 		}
+		char perr[SC_ERR_MAX];
+		char keybuf[SC_TEXT_MAX];
+		char valbuf[SC_SYSTEM_MAX * 2];
+		if (val.len >= sizeof(valbuf))
+			val.len = sizeof(valbuf) - 1;
+		snprintf(keybuf, sizeof(keybuf), "%.*s", (int)key.len, key.p);
+		memcpy(valbuf, val.p, val.len);
+		valbuf[val.len] = '\0';
+
+		if (!tab) {
+			if (hcs_loader_set(&loader, hcs_section, keybuf, valbuf, perr, sizeof(perr)) < 0) {
+				snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
+				return -1;
+			}
+			continue;
+		}
+		int legacy_rc = take_legacy_key(&legacy, tab, keybuf, valbuf, perr, sizeof(perr));
+		if (legacy_rc < 0) {
+			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
+			return -1;
+		}
+		if (legacy_rc > 0)
+			continue;
+
 		const field_desc *f = find_field(tab, key.p, key.len);
 		if (!f) {
 			snprintf(err, errlen, "line %d: unknown key '%.*s' in section [%s]", cur.line_no,
 					 (int)key.len, key.p, tab->name);
 			return -1;
 		}
-		char perr[SC_ERR_MAX];
-		char valbuf[SC_SYSTEM_MAX * 2];
-		if (val.len >= sizeof(valbuf))
-			val.len = sizeof(valbuf) - 1;
-		memcpy(valbuf, val.p, val.len);
-		valbuf[val.len] = '\0';
 		if (sc_parse_value(sc, f, valbuf, perr, sizeof(perr)) < 0) {
 			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
 			return -1;
@@ -524,7 +625,7 @@ static int ini_apply(saved_config *sc, const char *data, char *err, size_t errle
 		snprintf(err, errlen, "line %d: line too long", cur.line_no);
 		return -1;
 	}
-	return 0;
+	return ini_finish_hcs(sc, &loader, hcs_used, &legacy, err, errlen);
 }
 
 int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
@@ -578,6 +679,30 @@ static int mkdir_p(const char *path, char *err, size_t errlen) {
 	return 0;
 }
 
+static void write_hcs(FILE *fp, const hcs_config *h) {
+	char devices[HCS_MAX_DEVICES * (HCS_NAME_MAX + 2)];
+	hcs_format_devices(h, devices, sizeof(devices));
+	fprintf(fp, "[hcs]\nenabled = %s\ndevices = %s\n\n", h->enabled ? "on" : "off", devices);
+	for (int i = 0; i < h->n_devices; i++) {
+		const hcs_device *d = &h->devices[i];
+		char			  tasks[SC_TEXT_MAX];
+		char			  count[16];
+		hcs_format_tasks(d->tasks, tasks, sizeof(tasks));
+		fprintf(fp, "[hcs.%s]\n", d->name);
+		if (d->tasks)
+			fprintf(fp, "tasks = %s\n", tasks);
+		if (d->layers != HCS_COUNT_UNSET)
+			fprintf(fp, "layers = %s\n", hcs_format_count(d->layers, count, sizeof(count)));
+		if (d->experts != HCS_COUNT_UNSET)
+			fprintf(fp, "experts = %s\n", hcs_format_count(d->experts, count, sizeof(count)));
+		if (d->pins[0])
+			fprintf(fp, "pins = %s\n", d->pins);
+		if (d->has_priority)
+			fprintf(fp, "priority = %d\n", d->priority);
+		fputc('\n', fp);
+	}
+}
+
 int sc_save(const saved_config *sc, const char *orig_name, char *err, size_t errlen) {
 	char stem[SC_NAME_MAX];
 	sc_sanitize_name(sc->name, stem, sizeof(stem));
@@ -625,6 +750,8 @@ int sc_save(const saved_config *sc, const char *orig_name, char *err, size_t err
 		fputc('\n', fp);
 	}
 
+	write_hcs(fp, &sc->hcs);
+
 	if (fclose(fp) != 0) {
 		snprintf(err, errlen, "cannot write '%s': %s", tmp, strerror(errno));
 		unlink(tmp);
@@ -650,19 +777,16 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	*cfg = config_defaults();
 	cli_args_defaults(a);
 
-	cfg->model			   = sc->model[0] ? sc->model : NULL;
-	cfg->device			   = sc->device[0] ? sc->device : "auto";
-	cfg->repack			   = sc->repack[0] ? sc->repack : NULL;
-	cfg->fuse			   = sc->fuse[0] ? sc->fuse : NULL;
-	cfg->moe_pin_list	   = sc->moe_pin_list[0] ? sc->moe_pin_list : NULL;
-	cfg->monitor		   = sc->monitor[0] ? sc->monitor : NULL;
-	cfg->seed			   = sc->seed;
-	cfg->n_threads		   = sc->n_threads;
-	cfg->ctx_size		   = sc->ctx_size;
-	cfg->kv_quant		   = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
-	cfg->moe_cache_cap	   = sc->moe_cache_cap;
-	cfg->moe_pin		   = sc->moe_pin;
-	cfg->ngl			   = sc->ngl;
+	cfg->model		  = sc->model[0] ? sc->model : NULL;
+	cfg->repack		  = sc->repack[0] ? sc->repack : NULL;
+	cfg->fuse		  = sc->fuse[0] ? sc->fuse : NULL;
+	cfg->moe_pin_list = sc->moe_pin_list[0] ? sc->moe_pin_list : NULL;
+	cfg->monitor	  = sc->monitor[0] ? sc->monitor : NULL;
+	cfg->seed		  = sc->seed;
+	cfg->n_threads	  = sc->n_threads;
+	cfg->ctx_size	  = sc->ctx_size;
+	cfg->kv_quant	  = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
+	hcs_materialize(&sc->hcs, sc->model, cfg);
 	cfg->debug			   = sc->debug;
 	cfg->use_mmap		   = sc->use_mmap;
 	cfg->flash_attn		   = sc->flash_attn;
@@ -767,29 +891,6 @@ void sc_multi_format(char *out, size_t cap, const char *const choices[], int n, 
 		out[used] = '\0';
 		on--;
 	}
-}
-
-int sc_enum_devices(char out[][SC_TEXT_MAX], int max) {
-	int n = 0;
-	if (max < 1)
-		return 0;
-	snprintf(out[n++], SC_TEXT_MAX, "auto");
-
-	backend_info infos[BACKEND_MAX];
-	int			 nb = backend_list(infos, BACKEND_MAX);
-	for (int i = 0; i < nb && n < max; i++) {
-		if (!infos[i].available)
-			continue;
-		int nd = MIN(infos[i].n_devices, 8);
-		for (int d = 0; d < nd && n < max; d++) {
-			if (infos[i].n_devices > 1)
-				snprintf(out[n], SC_TEXT_MAX, "%s:%d", infos[i].name, d);
-			else
-				snprintf(out[n], SC_TEXT_MAX, "%s", infos[i].name);
-			n++;
-		}
-	}
-	return n;
 }
 
 static bool name_taken(const char *dir, const char *name) {

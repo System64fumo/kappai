@@ -1,0 +1,45 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer KvaBuf {
+	float kv_a[];
+};
+layout(std430, binding = 1) readonly buffer NormBuf {
+	float norm_w[];
+};
+layout(std430, binding = 2) buffer CacheBuf {
+	float cache[];
+};
+
+layout(location = 0) uniform int u_kv_lora;
+layout(location = 1) uniform int u_qk_rope;
+layout(location = 2) uniform int u_pos;
+layout(location = 3) uniform float u_eps;
+
+shared float s_ss[64];
+
+void main() {
+	int tid = int(gl_LocalInvocationID.x);
+	int kl	= u_kv_lora;
+
+	float partial = 0.0;
+	for (int i = tid; i < kl; i += 64)
+		partial += kv_a[i] * kv_a[i];
+	s_ss[tid] = partial;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_ss[tid] += s_ss[tid + s];
+		barrier();
+	}
+
+	float rstd = inversesqrt(s_ss[0] / float(kl) + u_eps);
+	uint  base = uint(u_pos * (kl + u_qk_rope));
+	for (int i = tid; i < kl; i += 64)
+		cache[base + uint(i)] = kv_a[i] * rstd * norm_w[i];
+	for (int j = tid; j < u_qk_rope; j += 64)
+		cache[base + uint(kl + j)] = kv_a[kl + j];
+}

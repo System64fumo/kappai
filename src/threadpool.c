@@ -270,7 +270,7 @@ static void *tpool_worker_main(void *arg) {
 		int job_epoch_now = atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire);
 		int n_workers_now = atomic_load_explicit(&pool->job.n_workers, memory_order_relaxed);
 
-		if (pub_ok && job_epoch_now == new_epoch && tid <= n_workers_now) {
+		if (pub_ok && job_epoch_now == new_epoch && tid >= 1 && tid <= n_workers_now) {
 			tpool_cur_tid = tid;
 			tpool_drain_work(pool, tid, new_epoch);
 			tpool_cur_tid = -1;
@@ -381,7 +381,21 @@ static void tpool_dump_stats(const tpool *pool) {
 	sb_free(&sb);
 }
 
+static tpool *g_fetch_pool;
+
+static void tpool_fetch_pool_init(void) {
+	int n		 = tpool_default_n_threads();
+	g_fetch_pool = n > 1 ? tpool_create(n) : NULL;
+}
+
+tpool *tpool_fetch_pool(void) {
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, tpool_fetch_pool_init);
+	return g_fetch_pool;
+}
+
 void tpool_destroy(tpool *pool) {
+
 	if (!pool)
 		return;
 	tpool_dump_stats(pool);

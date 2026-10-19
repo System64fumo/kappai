@@ -20,7 +20,7 @@
 
 #define DEFAULT_PATH "/tmp/kappai.monitor"
 #define MAX_OUTPUT 16384
-#define MAX_EXPERTS 256
+#define MAX_EXPERTS 512
 #define MAX_LAYERS 128
 #define MAX_TOPK 64
 #define MAX_LOAD_STEPS 24
@@ -85,6 +85,8 @@ typedef struct {
 
 	int scroll_x;
 	int scroll_y;
+
+	char dump_msg[64];
 } monitor_state;
 
 static volatile sig_atomic_t g_running = 1;
@@ -543,14 +545,7 @@ static void render_output(WINDOW *win, monitor_state *st, int y0, int max_y, int
 	free_lines(lines, nl);
 }
 
-static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int cols, int *sy) {
-	int n_experts = st->n_experts;
-	if (n_experts <= 0 || n_experts > MAX_EXPERTS) {
-		mvwprintw(win, y0, 1, "(no MoE data)");
-		return;
-	}
-
-	int idx[MAX_EXPERTS];
+static void expert_sorted_order(const monitor_state *st, int n_experts, int idx[MAX_EXPERTS]) {
 	for (int i = 0; i < n_experts; i++)
 		idx[i] = i;
 	for (int i = 1; i < n_experts; i++) {
@@ -563,6 +558,38 @@ static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int
 		}
 		idx[j + 1] = key;
 	}
+}
+
+static bool dump_experts(const monitor_state *st) {
+	int n_experts = st->n_experts;
+	if (n_experts > MAX_EXPERTS)
+		n_experts = MAX_EXPERTS;
+	if (n_experts <= 0)
+		return false;
+
+	int idx[MAX_EXPERTS];
+	expert_sorted_order(st, n_experts, idx);
+
+	FILE *f = fopen("/tmp/experts.txt", "w");
+	if (!f)
+		return false;
+	for (int i = 0; i < n_experts; i++)
+		fprintf(f, "%d %d\n", idx[i], st->expert_total[idx[i]]);
+	fclose(f);
+	return true;
+}
+
+static void render_sorted(WINDOW *win, monitor_state *st, int y0, int max_y, int cols, int *sy) {
+	int n_experts = st->n_experts;
+	if (n_experts > MAX_EXPERTS)
+		n_experts = MAX_EXPERTS;
+	if (n_experts <= 0) {
+		mvwprintw(win, y0, 1, "(no MoE data)");
+		return;
+	}
+
+	int idx[MAX_EXPERTS];
+	expert_sorted_order(st, n_experts, idx);
 
 	unsigned long long total_dispatches = 0;
 	for (int i = 0; i < n_experts; i++)
@@ -792,7 +819,13 @@ static void render(WINDOW *win, monitor_state *st, int view_mode) {
 
 	draw_divider(win, bottom_div, cols);
 	wattron(win, A_DIM);
-	mvwprintw(win, keybar_row, 1, " q:quit  c:clear  o:output  h:heatmap  s:sorted  space:cycle ");
+	mvwprintw(win, keybar_row, 1,
+			  " q:quit  c:clear  o:output  h:heatmap  s:sorted  d:dump  space:cycle ");
+	if (st->dump_msg[0]) {
+		int msg_w = (int)strlen(st->dump_msg);
+		if (msg_w <= cols - 60)
+			mvwprintw(win, keybar_row, cols - msg_w - 2, "%s", st->dump_msg);
+	}
 	wattroff(win, A_DIM);
 	wrefresh(win);
 }
@@ -1066,6 +1099,13 @@ int main(int argc, char **argv) {
 				view_mode = V_HEATMAP;
 			if (ch == 's' || ch == 'S')
 				view_mode = V_SORTED;
+			if (ch == 'd' || ch == 'D') {
+				if (dump_experts(&st))
+					snprintf(st.dump_msg, sizeof(st.dump_msg), "dumped to /tmp/experts.txt");
+				else
+					snprintf(st.dump_msg, sizeof(st.dump_msg),
+							 st.n_experts <= 0 ? "no expert data" : "dump failed");
+			}
 			if (ch == ' ' || ch == '\t' || ch == 'v' || ch == 'V')
 				view_mode = (view_mode + 1) % 3;
 

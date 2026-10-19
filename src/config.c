@@ -21,7 +21,7 @@ config config_defaults(void) {
 	c.use_mmap		= true;
 	c.flash_attn	= true;
 	c.reasoning		= true;
-	c.moe_stream	= true;
+	c.moe_stream	= false;
 	c.moe_cache_cap = 0;
 	c.ngl			= -1;
 
@@ -59,8 +59,7 @@ void config_usage(FILE *fp, bool is_server) {
 			"  -m, --model <path>       model file (required)\n"
 			"  -c, --ctx-size <n>       context size (0 = from model)\n"
 			"  --device <spec>          compute device (default: auto)\n"
-			"                           <backend><n>, e.g. vulkan0, vulkan1, cpu0;\n"
-			"                           a bare backend name means device 0\n"
+			"                           <backend>_<n>, e.g. vulkan_0, vulkan_1, cpu_scalar_0\n"
 			"  --ngl <n>                offload the first <n> layers to the --device backend\n"
 			"                           and keep the remaining layers on CPU (-1 = all on the\n"
 			"                           device, 0 = all on CPU; default: -1)\n"

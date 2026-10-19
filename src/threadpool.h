@@ -12,6 +12,7 @@ tpool *tpool_create(int n_threads);
 void   tpool_destroy(tpool *pool);
 int	   tpool_current_tid(void);
 int	   tpool_default_n_threads(void);
+tpool *tpool_fetch_pool(void);
 
 void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpool_chunk_fn fn,
 						void *ctx);

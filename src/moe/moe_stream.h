@@ -42,6 +42,10 @@ typedef struct {
 	int				 owned;
 } moe_expert_slot;
 
+static inline int moe_slot_present(const moe_expert_slot *s) {
+	return s->gate_w || s->dev_ready;
+}
+
 typedef struct {
 	size_t gate_b;
 	size_t up_b;
@@ -73,6 +77,9 @@ status_code moe_stream_cache_init(struct model *m);
 void		moe_stream_cache_free(moe_stream_cache *c);
 
 moe_expert_bytes moe_calc_expert_bytes(const struct model *m, int layer, int eid);
+
+backend *moe_stream_expert_owner(const struct model *m, int layer, int eid);
+void	 moe_stream_tier_maintain(struct model *m, int layer);
 
 status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids, int k,
 							   moe_expert_slot *out_slots);

@@ -79,6 +79,175 @@ void context_set_debug_prompt(context *c, bool enabled) {
 	c->debug_prompt = enabled;
 }
 
+static void context_destroy_extra_backends(context *c) {
+	for (int i = 0; i < c->n_extra_backends; i++)
+		backend_destroy(c->extra_backends[i]);
+	c->n_extra_backends = 0;
+}
+
+static status_code context_open_device(context *c, const char *spec, backend **out) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 device_index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0) {
+		ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", spec);
+		return ERR_INVALID_ARG;
+	}
+	if (strcmp(name, "cpu") == 0) {
+		*out = backend_host();
+		return OK;
+	}
+	for (int i = 0; i < c->n_extra_backends; i++) {
+		if (strcmp(c->extra_specs[i], spec) == 0) {
+			*out = c->extra_backends[i];
+			return OK;
+		}
+	}
+	if (c->n_extra_backends >= CONFIG_MAX_LAYER_DEVICES) {
+		ERROR("too many devices opened (max %d)", CONFIG_MAX_LAYER_DEVICES);
+		return ERR_INVALID_ARG;
+	}
+	status_code s = backend_create(name, device_index, out);
+	if (s != OK) {
+		ERROR("failed to initialize device '%s'", spec);
+		return s;
+	}
+	snprintf(c->extra_specs[c->n_extra_backends], sizeof(c->extra_specs[0]), "%s", spec);
+	c->extra_backends[c->n_extra_backends++] = *out;
+	backend_host_use(*out);
+	return OK;
+}
+
+static status_code apply_layer_map(context *c, const config *cfg) {
+	int n_layers = c->m.n_layers;
+	int total	 = 0;
+	for (int i = 0; i < cfg->n_layer_devices; i++)
+		total += cfg->layer_counts[i];
+	if (total != n_layers) {
+		ERROR("layer map assigns %d layer(s) but the model has %d", total, n_layers);
+		return ERR_INVALID_ARG;
+	}
+
+	int begin = 0;
+	for (int i = 0; i < cfg->n_layer_devices; i++) {
+		int		 end = begin + cfg->layer_counts[i];
+		backend *be	 = c->backend;
+		if (i > 0 || strcmp(cfg->layer_devices[i], cfg->device) != 0) {
+			status_code s = context_open_device(c, cfg->layer_devices[i], &be);
+			if (s != OK)
+				return s;
+			be->rope_neox = c->m.arch_info->uses_neox_rope;
+		}
+		if (be != c->backend && model_set_layer_backend_range(&c->m, begin, end, be) != OK)
+			return ERR_INVALID_ARG;
+		begin = end;
+	}
+	return OK;
+}
+
+static status_code apply_expert_parts(context *c, const config *cfg) {
+	c->m.host_priority = cfg->host_priority;
+	if (cfg->n_expert_devices <= 0 || c->m.moe.n_experts <= 0)
+		return OK;
+	if (cfg->n_expert_devices > MODEL_MAX_EXPERT_PARTS) {
+		ERROR("too many expert devices (max %d)", MODEL_MAX_EXPERT_PARTS);
+		return ERR_INVALID_ARG;
+	}
+	for (int i = 0; i < cfg->n_expert_devices; i++) {
+		backend	   *be = c->backend;
+		status_code s  = OK;
+		if (!cfg->device || strcmp(cfg->expert_devices[i], cfg->device) != 0)
+			s = context_open_device(c, cfg->expert_devices[i], &be);
+		if (s != OK)
+			return s;
+		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
+		if (!is_host && be != c->backend)
+			be->rope_neox = c->m.arch_info->uses_neox_rope;
+		c->m.expert_parts[i].be		  = is_host ? NULL : be;
+		c->m.expert_parts[i].count	  = cfg->expert_counts[i];
+		c->m.expert_parts[i].priority = cfg->expert_priorities[i];
+	}
+	c->m.n_expert_parts = cfg->n_expert_devices;
+	return OK;
+}
+
+static status_code apply_layer_split(context *c, const config *cfg) {
+	if (cfg->n_layer_devices > 1)
+		return apply_layer_map(c, cfg);
+
+	int n_layers = c->m.n_layers;
+	int host	 = cfg->ngl >= 0 ? n_layers - MIN(cfg->ngl, n_layers) : 0;
+	if (host == 0)
+		return OK;
+	if (model_set_layer_backend_range(&c->m, n_layers - host, n_layers, backend_host()) != OK)
+		return ERR_INVALID_ARG;
+	return OK;
+}
+
+static void context_log_assignment(context *c, const config *cfg) {
+	int n_layers = c->m.n_layers;
+	if (cfg->n_layer_devices > 1) {
+		int begin = 0;
+		for (int i = 0; i < cfg->n_layer_devices; i++) {
+			int		 end = begin + cfg->layer_counts[i];
+			backend *be	 = c->backend;
+			if (i > 0 || strcmp(cfg->layer_devices[i], cfg->device) != 0)
+				context_open_device(c, cfg->layer_devices[i], &be);
+			INFO("layers %d-%d on '%s' (%s)", begin, end - 1, be->name, cfg->layer_devices[i]);
+			begin = end;
+		}
+	} else {
+		int host = cfg->ngl >= 0 ? n_layers - MIN(cfg->ngl, n_layers) : 0;
+		if (host)
+			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_layers - host,
+				 c->backend->name, host);
+	}
+	if (cfg->n_expert_devices <= 0 || c->m.moe.n_experts <= 0)
+		return;
+	for (int i = 0; i < cfg->n_expert_devices; i++) {
+		backend *be = c->backend;
+		if (!cfg->device || strcmp(cfg->expert_devices[i], cfg->device) != 0)
+			context_open_device(c, cfg->expert_devices[i], &be);
+		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
+		INFO("experts: %d/layer on '%s' (%s)", cfg->expert_counts[i], is_host ? "cpu" : be->name,
+			 cfg->expert_devices[i]);
+	}
+}
+
+static void context_build_topology(context *c) {
+	backend *all[CONFIG_MAX_LAYER_DEVICES + 1];
+	int		 n = 0;
+	all[n++]   = c->backend;
+	for (int i = 0; i < c->n_extra_backends; i++)
+		all[n++] = c->extra_backends[i];
+	mem_topology_build(&c->topo, all, n);
+	c->m.topo = &c->topo;
+}
+
+static void context_log_devices(context *c) {
+	for (int d = 0; d < kvcache_device_count(&c->kv); d++) {
+		backend *be	   = kvcache_device_backend(&c->kv, d);
+		int		 first = -1;
+		int		 last  = -1;
+		int		 n	   = 0;
+		for (int i = 0; i < c->m.n_layers; i++) {
+			if (model_layer_backend(&c->m, i) != be)
+				continue;
+			first = first < 0 ? i : first;
+			last  = i;
+			n++;
+		}
+		size_t weights = model_device_weight_bytes(&c->m, be);
+		size_t kv	   = kvcache_device_bytes(&c->kv, &c->m, d);
+		size_t avail   = mem_topology_pool_available(&c->topo, be);
+		INFO("device '%s': %d layer(s)%s, weights %.0f MB, KV %.0f MB (%d slot(s)), %.1f GB free",
+			 be->name, n, n > 0 ? "" : " (none)", weights / (1024.0 * 1024.0),
+			 kv / (1024.0 * 1024.0), kvcache_device_slots(&c->kv, d),
+			 avail / (1024.0 * 1024.0 * 1024.0));
+		if (n > 0 && last - first + 1 == n)
+			DEBUG("device '%s' holds layers %d-%d", be->name, first, last);
+	}
+}
+
 status_code context_init(context *c, const config *cfg) {
 	memset(c, 0, sizeof(*c));
 	monitor_reset(&c->monitor);
@@ -88,7 +257,6 @@ status_code context_init(context *c, const config *cfg) {
 	if (mon_path) {
 		monitor_init(&c->monitor, mon_path);
 		g_monitor = &c->monitor;
-		monitor_emit_load_phase_backend(&c->monitor, cfg->device);
 	}
 
 	status_code s = ERR_INVALID_ARG;
@@ -98,7 +266,7 @@ status_code context_init(context *c, const config *cfg) {
 		char name[32];
 		int	 device_index = 0;
 		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
-			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
+			ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", cfg->device);
 			return ERR_INVALID_ARG;
 		}
 		s = backend_create(name, device_index, &c->backend);
@@ -109,43 +277,51 @@ status_code context_init(context *c, const config *cfg) {
 	}
 	backend_host_use(c->backend);
 
+	monitor_emit_load_phase_backend(&c->monitor, cfg->device);
+
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
 	uint64_t load_t0 = time_us();
-	s = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack, cfg->ctx_size);
+	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack);
 	if (s != OK) {
 		ERROR("failed to parse model '%s'", cfg->model);
 		monitor_emit_load_phase_model_failed(&c->monitor, s);
 		goto fail_backend;
 	}
 
+	for (int i = 0; i < cfg->n_layer_devices; i++)
+		if (strcmp(cfg->layer_devices[i], cfg->device) != 0) {
+			backend *be = NULL;
+			s			= context_open_device(c, cfg->layer_devices[i], &be);
+			if (s != OK)
+				goto fail_model;
+		}
+	if (c->m.moe.n_experts > 0)
+		for (int i = 0; i < cfg->n_expert_devices; i++)
+			if (strcmp(cfg->expert_devices[i], cfg->device) != 0) {
+				backend *be = NULL;
+				s			= context_open_device(c, cfg->expert_devices[i], &be);
+				if (s != OK)
+					goto fail_model;
+			}
+
 	c->backend->rope_neox = c->m.arch_info->uses_neox_rope;
 
 	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
 		c->m.fuse_config = cfg->fuse;
 
-	if (cfg->ngl >= 0) {
-		int n_offload = cfg->ngl;
-		if (n_offload > c->m.n_layers)
-			n_offload = c->m.n_layers;
-		if (n_offload < c->m.n_layers) {
-			backend_report_host_fallback(c->backend, "ngl_layers", HFB_LAYER_NOT_OFFLOADED,
-										 "%d of %d layer(s) intentionally kept on the host (cpu) "
-										 "fallback (--ngl %d)",
-										 c->m.n_layers - n_offload, c->m.n_layers, cfg->ngl);
-			s = model_set_layer_backend_range(&c->m, n_offload, c->m.n_layers, backend_host());
-			if (s != OK) {
-				ERROR("failed to apply --ngl");
-				goto fail_model;
-			}
-			if (c->m.arch_info->is_mla) {
-				WARN("--ngl: MLA architectures do not yet support per-layer KV on host; "
-					 "MLA layers running on host may fall back to primary KV path");
-			}
-			INFO("mixed backend mode: %d layer(s) on '%s', %d on host", n_offload, c->backend->name,
-				 c->m.n_layers - n_offload);
-		}
-	}
+	context_build_topology(c);
+	report_memory(&c->m, &c->topo, c->backend->kv_alloc ? c->backend : backend_host(),
+				  cfg->ctx_size, (kv_quant_type)cfg->kv_quant);
+	context_log_assignment(c, cfg);
+
+	s = apply_layer_split(c, cfg);
+	if (s != OK)
+		goto fail_model;
+
+	s = apply_expert_parts(c, cfg);
+	if (s != OK)
+		goto fail_model;
 
 	{
 		int n_ctx_precheck = cfg->ctx_size;
@@ -164,7 +340,7 @@ status_code context_init(context *c, const config *cfg) {
 		size_t		  kv_bytes_precheck =
 			model_kv_cache_bytes_quant(&c->m, n_ctx_precheck, kv_quant_precheck,
 									   backend_has_cap(kv_owner_precheck, BCAP_KV_POS_CAP));
-		size_t avail_precheck = backend_mem_available(kv_owner_precheck);
+		size_t avail_precheck = mem_topology_pool_available(&c->topo, kv_owner_precheck);
 
 		size_t reserve_for_weights = 0;
 		if (kv_owner_precheck == c->backend)
@@ -234,7 +410,7 @@ status_code context_init(context *c, const config *cfg) {
 	{
 		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant,
 													 backend_has_cap(kv_owner, BCAP_KV_POS_CAP));
-		size_t avail	= backend_mem_available(kv_owner);
+		size_t avail	= mem_topology_pool_available(&c->topo, kv_owner);
 		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
 				  "backend '%s' after loading weights -- refusing to run (see "
@@ -254,13 +430,14 @@ status_code context_init(context *c, const config *cfg) {
 	}
 
 	if (c->m.mixed_backend_mode) {
-		s = kvcache_alloc_host_mirror(&c->kv, &c->m);
+		s = kvcache_alloc_mirrors(&c->kv, &c->m);
 		if (s != OK) {
 			ERROR("failed to allocate host-side KV cache mirror for mixed backend mode");
 			goto fail_chat;
 		}
 		DEBUG("mixed backend mode: allocated host KV cache mirror");
 	}
+	context_log_devices(c);
 
 	compute_scratch_init(&c->scratch);
 	c->scratch.interrupt = &c->interrupt;
@@ -270,6 +447,7 @@ status_code context_init(context *c, const config *cfg) {
 	c->fed_ids.p   = xmalloc((size_t)n_ctx * sizeof(int32_t));
 	c->fed_ids.cap = n_ctx;
 
+	monitor_log_listening(&c->monitor);
 	return OK;
 
 fail_chat:
@@ -279,6 +457,7 @@ fail_tokenizer:
 fail_model:
 	model_free(&c->m);
 fail_backend:
+	context_destroy_extra_backends(c);
 	monitor_free(&c->monitor);
 	g_monitor = NULL;
 	backend_destroy(c->backend);
@@ -298,6 +477,7 @@ void context_free(context *c) {
 	chat_template_free(&c->chat);
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
+	context_destroy_extra_backends(c);
 	backend_destroy(c->backend);
 	c->backend = NULL;
 	free(c->ids_buf.p);
@@ -516,13 +696,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 
 	int pos = c->kv.n_pos;
 
-	int n_threads = 1;
-	if (c->backend && c->backend->get_pool) {
-		tpool *pool = c->backend->get_pool(c->backend);
-		if (pool)
-			n_threads = tpool_n_threads(pool);
-	}
-	int chunk = context_prefill_chunk_size(c, n_threads);
+	int chunk = context_prefill_chunk_size(c, tpool_n_threads(tpool_fetch_pool()));
 	if (chunk > n)
 		chunk = n;
 	progress prog;

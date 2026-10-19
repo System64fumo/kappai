@@ -24,6 +24,9 @@ typedef struct {
 	int max_ssbo_bindings;
 	int max_dispatch[3];
 
+	int	   unified_memory;
+	size_t video_memory_bytes;
+
 	char renderer[128];
 } gl_context;
 
@@ -32,5 +35,7 @@ status_code gl_context_init(gl_context *out);
 void gl_context_free(gl_context *ctx);
 
 status_code gl_context_probe(void);
+
+status_code gl_render_node_identity(char *out, size_t cap);
 
 #endif

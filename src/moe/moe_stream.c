@@ -2,9 +2,12 @@
 #include "moe/moe_stream.h"
 #include "common.h"
 #include "config.h"
+#include "hcs.h"
 #include "log.h"
+#include "memconfig.h"
 #include "model.h"
 #include "moe/moe_common.h"
+#include "moe/moe_tier.h"
 #include "monitor.h"
 #include "profile.h"
 #include "threadpool.h"
@@ -26,6 +29,8 @@
 #define PIN_COPY_MAX_WORKERS 8
 #define MOE_PRELOAD_MAX_THREADS 32
 #define LFRU_DECAY_INTERVAL 256
+#define TIER_SWEEP_INTERVAL 8
+#define TIER_MOVES_PER_SWEEP 4
 
 static pthread_mutex_t g_fetch_pool_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -44,6 +49,13 @@ struct moe_stream_layer {
 	int *heap_idx;
 	int *heap_pos;
 	int	 heap_n;
+
+	int				 tier_cap;
+	moe_expert_slot *tier_slots;
+	int				*eid_to_tier;
+	moe_tier_state	*tstate;
+	uint64_t		 step;
+	uint64_t		 last_sweep;
 };
 
 struct moe_stream_cache {
@@ -56,6 +68,10 @@ struct moe_stream_cache {
 	_Atomic uint64_t		 stat_pin_hits;
 	_Atomic uint64_t		 stat_lru_hits;
 	int						 n_pinned;
+	backend				   **pin_be;
+	int						*pin_ids;
+	backend					*tier_be;
+	moe_tier_policy			 tier_policy;
 	const void				*map_base;
 	size_t					 map_size;
 	long					 page_size;
@@ -96,6 +112,7 @@ typedef struct {
 	_Atomic int		  n_copied;
 	_Atomic int		  n_err;
 	_Atomic int		  first_err;
+	_Atomic int		  workers_running;
 } pin_copy_job;
 
 typedef struct {
@@ -146,7 +163,7 @@ typedef struct moe_stream_op {
 	uint64_t				   now;
 	int						   n_k;
 	moe_expert_slot			  *out_slots;
-	moe_miss_entry			   misses[MOE_MAX_TOPK];
+	moe_miss_entry			  *misses;
 	int						   n_misses;
 	moe_fill_chunk			  *chunks;
 	int						   n_chunks;
@@ -622,6 +639,7 @@ static void *pin_copy_worker(void *arg) {
 				atomic_store_explicit(&j->first_err, st, memory_order_relaxed);
 		}
 	}
+	atomic_fetch_sub_explicit(&j->workers_running, 1, memory_order_release);
 	moe_stream_thread_cleanup();
 	return NULL;
 }
@@ -633,7 +651,506 @@ static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
 		sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
 	if (sl->dev_down.owner)
 		sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
+	sl->dev_gate  = (buffer){0};
+	sl->dev_up	  = (buffer){0};
+	sl->dev_down  = (buffer){0};
 	sl->dev_ready = 0;
+}
+
+typedef struct {
+	int		  n_pinned;
+	int		  lru_cap;
+	backend **pin_be;
+	int		 *pin_ids;
+	backend	 *tier_be;
+	int		  tier_cap;
+	int		  tier_pool;
+} moe_hcs_plan;
+
+static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_part, int n_dev,
+						  int pin_host, moe_hcs_plan *p);
+
+static int moe_backend_resident_capable(backend *b) {
+	return b && !backend_has_cap(b, BCAP_IS_HOST) && b->moe_expert_ffn &&
+		   b->buffer_alloc_from_host && (b->caps & BCAP_MOE_EXPERT_RESIDENT);
+}
+
+static backend *moe_pin_dest(const struct model *m, const moe_stream_cache *c, int layer, int pi,
+							 int dev_upload) {
+	if (!dev_upload)
+		return NULL;
+	backend *b = c->pin_be ? c->pin_be[pi] : model_pin_backend(m, layer, pi);
+	return moe_backend_resident_capable(b) ? b : NULL;
+}
+
+static int moe_tier_part_pool(const struct model *m, int part) {
+	backend *be = m->expert_parts[part].be;
+	if (!m->topo || !moe_backend_resident_capable(be))
+		return -1;
+	int pool = mem_topology_pool_of(m->topo, be);
+	return pool >= 0 && !m->topo->pools[pool].is_host ? pool : -1;
+}
+
+static int moe_pick_tier_part(const struct model *m, const config *cfg) {
+	if (!cfg->moe_stream)
+		return -1;
+	int best		  = -1;
+	int best_priority = m->host_priority;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		int pool = m->expert_parts[i].count > 0 ? moe_tier_part_pool(m, i) : -1;
+		if (pool < 0)
+			continue;
+		int priority = m->expert_parts[i].priority >= 0 ? m->expert_parts[i].priority : pool;
+		if (priority > best_priority) {
+			best		  = i;
+			best_priority = priority;
+		}
+	}
+	return best;
+}
+
+static status_code moe_plan_hcs(const struct model *m, const config *cfg, moe_hcs_plan *p) {
+	int n_exp	  = m->moe.n_experts;
+	int first_moe = m->moe.first_dense_layer;
+	if (first_moe < 0 || first_moe >= m->n_layers)
+		first_moe = 0;
+	int	   moe_layers = m->n_layers - first_moe;
+	size_t per_expert = moe_calc_expert_bytes(m, first_moe, 0).total;
+
+	int tier_part = moe_pick_tier_part(m, cfg);
+	if (tier_part >= 0) {
+		p->tier_pool = moe_tier_part_pool(m, tier_part);
+		p->tier_cap =
+			moe_tier_pool_capacity(&m->topo->pools[p->tier_pool], per_expert * (size_t)moe_layers,
+								   m->expert_parts[tier_part].count);
+		if (tier_part < cfg->n_expert_devices && cfg->expert_pins[tier_part]) {
+			int tier_pins[128];
+			int n_tier_pins = hcs_pin_list_ids(cfg->expert_pins[tier_part], tier_pins, 128);
+			p->tier_cap		= p->tier_cap > n_tier_pins ? p->tier_cap - n_tier_pins : n_tier_pins;
+			DEBUG("MoE: %d tier pool slot(s)/layer reserved for pins", n_tier_pins);
+		}
+		if (p->tier_cap > 0)
+			p->tier_be = m->expert_parts[tier_part].be;
+		else
+			tier_part = -1;
+	}
+
+	int n_dev  = 0;
+	int n_host = 0;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		int cnt = m->expert_parts[i].count;
+		if (i == tier_part)
+			continue;
+		if (moe_backend_resident_capable(m->expert_parts[i].be))
+			n_dev += MIN(cnt, n_exp - n_dev);
+		else
+			n_host += cnt;
+	}
+	n_host		   = MIN(n_host, n_exp - n_dev);
+	int unassigned = n_exp - n_dev - n_host;
+
+	size_t avail   = m->topo ? mem_topology_host_available(m->topo) : get_available_memory();
+	size_t budget  = moe_tier_pool_budget(avail);
+	size_t layer_b = per_expert * (size_t)moe_layers;
+	int	   fit	   = moe_tier_fit(budget, layer_b, n_exp);
+
+	int pin_host = n_host;
+	int lru_need = unassigned;
+	if (tier_part >= 0) {
+		pin_host = 0;
+		lru_need += n_host;
+	} else if (n_host > fit) {
+		if (!cfg->moe_stream && !cfg->disable_failsafes) {
+			ERROR("MoE: %d host expert(s)/layer (%.1f GB) exceed the %.1f GB RAM budget and "
+				  "streaming is off -- enable --moe-stream or move experts to a device",
+				  n_host, (double)(layer_b * (size_t)n_host) / (1024.0 * 1024.0 * 1024.0),
+				  (double)budget / (1024.0 * 1024.0 * 1024.0));
+			return ERR_OUT_OF_MEMORY;
+		}
+		if (cfg->moe_stream) {
+			pin_host = 0;
+			lru_need += n_host;
+		}
+	}
+
+	int lru_budget = MAX(fit - pin_host, 0);
+	int lru_cap	   = MIN(lru_need, lru_budget);
+	if (lru_need > 0 && lru_cap < m->moe.n_experts_used)
+		lru_cap = MIN(lru_need, m->moe.n_experts_used);
+	if (lru_cap < 1)
+		lru_cap = 1;
+	if (lru_cap > 1024)
+		lru_cap = 1024;
+
+	p->n_pinned = n_dev + pin_host;
+	p->lru_cap	= lru_cap;
+	p->pin_be	= xcalloc((size_t)(p->n_pinned > 0 ? p->n_pinned : 1), sizeof(backend *));
+	int idx		= 0;
+	int left	= n_dev;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		if (i == tier_part || !moe_backend_resident_capable(m->expert_parts[i].be))
+			continue;
+		int cnt = MIN(m->expert_parts[i].count, left);
+		for (int k = 0; k < cnt; k++)
+			p->pin_be[idx++] = m->expert_parts[i].be;
+		left -= cnt;
+	}
+
+	INFO("MoE placement per layer: %d on device, %d pinned in RAM, %d streamed via LRU "
+		 "(cap %d); RAM budget %.1f GB",
+		 n_dev, pin_host, lru_need, lru_need > 0 ? lru_cap : 0,
+		 (double)budget / (1024.0 * 1024.0 * 1024.0));
+	if (p->tier_be)
+		INFO("MoE tiering: pool0 -> pool%d ('%s'), %d expert slot(s)/layer", p->tier_pool,
+			 p->tier_be->name ? p->tier_be->name : "?", p->tier_cap);
+	if (!moe_plan_pins(m, cfg, tier_part, n_dev, pin_host, p))
+		return ERR_INVALID_ARG;
+	return OK;
+}
+
+static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_part, int n_dev,
+						  int pin_host, moe_hcs_plan *p) {
+	int	 n_exp = m->moe.n_experts;
+	int	 listed[MODEL_MAX_EXPERT_PARTS][128];
+	int	 listed_len[MODEL_MAX_EXPERT_PARTS] = {0};
+	int	 listed_total						= 0;
+	bool have_pins							= false;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		const char *text = i < cfg->n_expert_devices ? cfg->expert_pins[i] : NULL;
+		listed_len[i]	 = text ? hcs_pin_list_ids(text, listed[i], 128) : 0;
+		have_pins |= listed_len[i] > 0;
+		listed_total += listed_len[i];
+	}
+	if (!have_pins)
+		return true;
+
+	int		 share[MODEL_MAX_EXPERT_PARTS]	 = {0};
+	backend *part_be[MODEL_MAX_EXPERT_PARTS] = {NULL};
+	int		 host_listed					 = 0;
+	int		 left							 = n_dev;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		bool tier = i == tier_part;
+		if (!tier && !moe_backend_resident_capable(m->expert_parts[i].be))
+			continue;
+		part_be[i] =
+			moe_backend_resident_capable(m->expert_parts[i].be) ? m->expert_parts[i].be : NULL;
+		share[i] = tier ? 0 : MIN(m->expert_parts[i].count, left);
+		if (!tier)
+			left -= share[i];
+	}
+	int host_part = -1;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		if (m->expert_parts[i].be != NULL)
+			continue;
+		host_listed += listed_len[i];
+		if (host_part < 0)
+			host_part = i;
+	}
+	if (host_part >= 0)
+		part_be[host_part] = NULL;
+
+	int cap		 = n_dev + pin_host + listed_total;
+	p->pin_be	 = xcalloc((size_t)(cap > 0 ? cap : 1), sizeof(backend *));
+	p->pin_ids	 = xcalloc((size_t)(cap > 0 ? cap : 1), sizeof(int));
+	char *used	 = xcalloc((size_t)n_exp, 1);
+	int	  n_head = 0;
+
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		backend *be = part_be[i];
+		for (int k = 0; k < listed_len[i]; k++) {
+			int e = listed[i][k];
+			if (e < 0 || e >= n_exp) {
+				ERROR("MoE: pinned expert id %d is out of range; the model has %d expert(s) "
+					  "per layer",
+					  e, n_exp);
+				free(used);
+				free(p->pin_be);
+				free(p->pin_ids);
+				p->pin_be	= NULL;
+				p->pin_ids	= NULL;
+				p->n_pinned = 0;
+				return false;
+			}
+			if (used[e]) {
+				ERROR("MoE: expert %d is pinned more than once; remove the duplicate pin "
+					  "and re-save the config",
+					  e);
+				free(used);
+				free(p->pin_be);
+				free(p->pin_ids);
+				p->pin_be	= NULL;
+				p->pin_ids	= NULL;
+				p->n_pinned = 0;
+				return false;
+			}
+			used[e]				= 1;
+			p->pin_ids[n_head]	= e;
+			p->pin_be[n_head++] = be;
+		}
+	}
+	int seq = 0;
+	for (int i = 0; i < m->n_expert_parts; i++) {
+		int fill = share[i] > listed_len[i] ? share[i] - listed_len[i] : 0;
+		for (int k = 0; k < fill; k++) {
+			while (seq < n_exp && used[seq])
+				seq++;
+			if (seq >= n_exp)
+				break;
+			used[seq]			= 1;
+			p->pin_ids[n_head]	= seq++;
+			p->pin_be[n_head++] = part_be[i];
+		}
+	}
+	int host_fill = pin_host > host_listed ? pin_host - host_listed : 0;
+	for (int k = 0; k < host_fill; k++) {
+		while (seq < n_exp && used[seq])
+			seq++;
+		if (seq >= n_exp)
+			break;
+		used[seq]			= 1;
+		p->pin_ids[n_head]	= seq++;
+		p->pin_be[n_head++] = NULL;
+	}
+	free(used);
+	p->n_pinned = n_head;
+	if (n_head == 0) {
+		free(p->pin_be);
+		free(p->pin_ids);
+		p->pin_be  = NULL;
+		p->pin_ids = NULL;
+		return true;
+	}
+	DEBUG("MoE pins: %d listed id(s), %d pinned slot(s)/layer", listed_total, p->n_pinned);
+	return true;
+}
+
+typedef struct {
+	moe_expert_slot *slot;
+	moe_expert_slot	 tmp;
+	backend			*be;
+	int				 layer;
+	status_code		 st;
+	_Atomic int		 io_err;
+} moe_upload_item;
+
+static void moe_slot_to_host_fallback(struct model *m, moe_stream_cache *c, int layer,
+									  moe_expert_slot *sl) {
+	status_code st = moe_pin_copy_slot(m, c, layer, sl, NULL, 0);
+	if (st != OK) {
+		WARN("moe upload fallback: layer=%d eid=%d host pin failed (st=%d)", layer, sl->eid,
+			 (int)st);
+		sl->gate_w = sl->up_w = sl->down_w = NULL;
+		sl->eid							   = -1;
+	}
+	atomic_store_explicit(&sl->io_ready, 1, memory_order_release);
+}
+
+static int moe_upload_one(struct model *m, moe_upload_item *it, size_t *dev_bytes) {
+	moe_expert_slot *sl = it->slot;
+	backend			*lb = it->be;
+	moe_expert_bytes eb = moe_calc_expert_bytes(m, it->layer, sl->eid);
+	status_code		 st = lb->buffer_alloc_from_host(lb, it->tmp.gate_w, eb.gate_b, &sl->dev_gate);
+	if (st == OK && !sl->gate_up_fused)
+		st = lb->buffer_alloc_from_host(lb, it->tmp.up_w, eb.up_b, &sl->dev_up);
+	if (st == OK)
+		st = lb->buffer_alloc_from_host(lb, it->tmp.down_w, eb.down_b, &sl->dev_down);
+	if (st != OK) {
+		ERROR("MoE: expert upload failed for layer %d on '%s' (st=%d) -- keeping its experts "
+			  "in RAM",
+			  it->layer, lb->name ? lb->name : "?", (int)st);
+		moe_slot_free_dev_buffers(sl);
+		return 0;
+	}
+	sl->dev_ready = 1;
+	if (!m->use_mmap)
+		sl->gate_w = sl->up_w = sl->down_w = NULL;
+	atomic_store_explicit(&sl->io_ready, 1, memory_order_release);
+	*dev_bytes += eb.total;
+	return 1;
+}
+
+typedef struct {
+	struct model	 *m;
+	moe_stream_cache *c;
+	moe_upload_item	 *items;
+	moe_fill_chunk	 *chunks;
+	int				  chunk_cap;
+	void			**bufs;
+	size_t			 *buf_sz;
+	tpool			 *pool;
+	backend			**failed;
+	int				 *n_failed;
+	char			 *layer_dev;
+	char			 *layer_partial;
+	int				 *uploaded;
+	size_t			 *dev_bytes;
+	progress		 *prog;
+	int				  n_items;
+	int				  n_done;
+} moe_upload_ctx;
+
+static int moe_upload_backend_failed(const moe_upload_ctx *u, const backend *b) {
+	for (int f = 0; f < *u->n_failed; f++)
+		if (u->failed[f] == b)
+			return 1;
+	return 0;
+}
+
+static void moe_upload_flush(moe_upload_ctx *u) {
+	int n_chunks = 0;
+	for (int j = 0; j < u->n_items; j++) {
+		moe_upload_item *it = &u->items[j];
+		it->tmp				= *it->slot;
+		int start			= n_chunks;
+		it->st = moe_pin_prepare_slot(u->m, u->c, it->layer, &it->tmp, u->bufs[j], u->buf_sz[j],
+									  u->chunks, &n_chunks, u->chunk_cap, &it->io_err);
+		if (it->tmp.heap_buf) {
+			u->bufs[j]	 = it->tmp.heap_buf;
+			u->buf_sz[j] = it->tmp.heap_size;
+		} else if (it->st != ERR_INVALID_ARG) {
+			u->bufs[j]	 = NULL;
+			u->buf_sz[j] = 0;
+		}
+		if (it->st != OK)
+			n_chunks = start;
+	}
+	if (n_chunks > 0) {
+		if (u->pool && pthread_mutex_trylock(&g_fetch_pool_mtx) == 0) {
+			tpool_parallel_for(u->pool, n_chunks, 1, moe_fill_chunk_run, u->chunks);
+			pthread_mutex_unlock(&g_fetch_pool_mtx);
+		} else {
+			moe_fill_chunk_run(0, n_chunks, 0, u->chunks);
+		}
+	}
+	for (int j = 0; j < u->n_items; j++, u->n_done++) {
+		moe_upload_item *it = &u->items[j];
+		progress_update(u->prog, (uint64_t)u->n_done);
+		int ok = it->st == OK && !atomic_load_explicit(&it->io_err, memory_order_relaxed);
+		if (ok)
+			ok = moe_upload_one(u->m, it, u->dev_bytes);
+		if (ok) {
+			(*u->uploaded)++;
+			u->layer_dev[it->layer] = 1;
+			continue;
+		}
+		if (*u->n_failed < 16)
+			u->failed[(*u->n_failed)++] = it->be;
+		u->layer_partial[it->layer] = 1;
+		moe_slot_to_host_fallback(u->m, u->c, it->layer, it->slot);
+	}
+	u->n_items = 0;
+}
+
+static status_code moe_upload_resident(struct model *m, moe_stream_cache *c) {
+	int n_total = 0;
+	for (int i = 0; i < m->n_layers; i++)
+		for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
+			n_total += moe_pin_dest(m, c, i, pi, 1) != NULL;
+	if (n_total == 0)
+		return OK;
+
+	int first_moe = m->moe.first_dense_layer;
+	if (first_moe < 0 || first_moe >= m->n_layers)
+		first_moe = 0;
+	size_t max_expert = 0;
+	for (int i = first_moe; i < m->n_layers; i++)
+		max_expert = MAX(max_expert, moe_calc_expert_bytes(m, i, 0).total);
+	if (max_expert == 0)
+		return ERR_INVALID_ARG;
+
+	int				window = (int)MIN((size_t)16, MAX((size_t)1, ((size_t)512 << 20) / max_expert));
+	size_t			chunk_cap	   = (size_t)window * (max_expert / MOE_CHUNK_TARGET_BYTES + 6);
+	moe_fill_chunk *chunks		   = xmalloc(chunk_cap * sizeof(*chunks));
+	moe_upload_item *items		   = xcalloc((size_t)window, sizeof(*items));
+	void		   **bufs		   = xcalloc((size_t)window, sizeof(void *));
+	size_t			*buf_sz		   = xcalloc((size_t)window, sizeof(size_t));
+	char			*layer_dev	   = xcalloc((size_t)m->n_layers, 1);
+	char			*layer_partial = xcalloc((size_t)m->n_layers, 1);
+
+	tpool *pool = tpool_fetch_pool();
+
+	backend *failed[16] = {0};
+	int		 n_failed	= 0;
+	int		 uploaded	= 0;
+	size_t	 dev_bytes	= 0;
+	uint64_t t0			= time_us();
+
+	progress prog;
+	progress_start(&prog, "Uploading experts", (uint64_t)n_total);
+
+	moe_upload_ctx uc = {
+		.m			   = m,
+		.c			   = c,
+		.items		   = items,
+		.chunks		   = chunks,
+		.chunk_cap	   = (int)chunk_cap,
+		.bufs		   = bufs,
+		.buf_sz		   = buf_sz,
+		.pool		   = pool,
+		.failed		   = failed,
+		.n_failed	   = &n_failed,
+		.layer_dev	   = layer_dev,
+		.layer_partial = layer_partial,
+		.uploaded	   = &uploaded,
+		.dev_bytes	   = &dev_bytes,
+		.prog		   = &prog,
+	};
+	for (int i = 0; i < m->n_layers; i++) {
+		for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
+			backend *lb = moe_pin_dest(m, c, i, pi, 1);
+			if (!lb)
+				continue;
+			moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
+			if (moe_upload_backend_failed(&uc, lb)) {
+				moe_slot_to_host_fallback(m, c, i, sl);
+				layer_partial[i] = 1;
+				uc.n_done++;
+				continue;
+			}
+			moe_upload_item *it = &items[uc.n_items++];
+			it->slot			= sl;
+			it->be				= lb;
+			it->layer			= i;
+			atomic_init(&it->io_err, 0);
+			if (uc.n_items == window)
+				moe_upload_flush(&uc);
+		}
+	}
+	moe_upload_flush(&uc);
+	progress_finish(&prog);
+
+	int moe_layers	= 0;
+	int full_layers = 0;
+	for (int i = 0; i < m->n_layers; i++) {
+		if (c->layers[i].n_pinned <= 0)
+			continue;
+		moe_layers++;
+		if (layer_dev[i])
+			m->layers[i].experts_resident = 1;
+		full_layers += !layer_partial[i];
+	}
+	if (uploaded > 0) {
+		double mb	= (double)dev_bytes / (1024.0 * 1024.0);
+		double secs = (double)(time_us() - t0) / 1e6;
+		if (full_layers != moe_layers)
+			WARN("MoE: %d expert(s) device-resident (%.1f MB) in %.1f s -- some experts fell "
+				 "back to RAM",
+				 uploaded, mb, secs);
+		else
+			INFO("MoE: %d experts resident on device (%.1f MB) in %.1f s, no host copy kept",
+				 uploaded, mb, secs);
+		m->moe.experts_resident = (full_layers == moe_layers);
+	}
+
+	for (int j = 0; j < window; j++)
+		free(bufs[j]);
+	free(bufs);
+	free(buf_sz);
+	free(items);
+	free(chunks);
+	free(layer_dev);
+	free(layer_partial);
+	return OK;
 }
 
 status_code moe_stream_cache_init(struct model *m) {
@@ -646,7 +1163,15 @@ status_code moe_stream_cache_init(struct model *m) {
 	}
 	const config *cfg			= config_get();
 	int			  full_resident = !m->use_mmap && cfg->moe_stream == 0;
-	m->moe_stream_enabled		= (cfg->moe_stream != 0) || !m->use_mmap;
+	int			  hcs_parts		= m->n_expert_parts > 0;
+	int			  dev_upload	= hcs_parts || (full_resident && m->backend);
+	m->moe_stream_enabled		= (cfg->moe_stream != 0) || !m->use_mmap || hcs_parts;
+	moe_hcs_plan plan			= {0};
+	if (hcs_parts) {
+		status_code ps = moe_plan_hcs(m, cfg, &plan);
+		if (ps != OK)
+			return ps;
+	}
 
 #if HAVE_MALLOC
 	if (!m->use_mmap) {
@@ -660,6 +1185,8 @@ status_code moe_stream_cache_init(struct model *m) {
 	c->n_layers			= m->n_layers;
 	c->layers			= xcalloc(m->n_layers, sizeof(*c->layers));
 	int lru_cap			= cfg->moe_cache_cap > 0 ? cfg->moe_cache_cap : MOE_DEFAULT_CACHE_CAP;
+	if (hcs_parts)
+		lru_cap = plan.lru_cap;
 	if (lru_cap > 1024)
 		lru_cap = 1024;
 	if (m->moe.n_experts_used > 0 && lru_cap < m->moe.n_experts_used) {
@@ -667,7 +1194,12 @@ status_code moe_stream_cache_init(struct model *m) {
 			  m->moe.n_experts_used);
 	}
 
-	c->n_pinned = full_resident ? m->moe.n_experts : cfg->moe_pin;
+	c->n_pinned = hcs_parts ? plan.n_pinned : (full_resident ? m->moe.n_experts : cfg->moe_pin);
+	c->pin_be	= plan.pin_be;
+	c->pin_ids	= plan.pin_ids;
+	c->tier_be	= plan.tier_be;
+	if (c->tier_be)
+		c->tier_policy = moe_tier_policy_default();
 	if (c->n_pinned < 0)
 		c->n_pinned = 0;
 	if (c->n_pinned > m->moe.n_experts)
@@ -675,7 +1207,7 @@ status_code moe_stream_cache_init(struct model *m) {
 
 	int *pin_list	= xmalloc((size_t)m->moe.n_experts * sizeof(int));
 	int	 n_pin_list = 0;
-	if (!full_resident && cfg->moe_pin_list && cfg->moe_pin_list[0]) {
+	if (!full_resident && !hcs_parts && cfg->moe_pin_list && cfg->moe_pin_list[0]) {
 		const char *p = cfg->moe_pin_list;
 		while (*p) {
 			const char *seg_start = p;
@@ -762,6 +1294,23 @@ status_code moe_stream_cache_init(struct model *m) {
 			atomic_init(&L->lru_slots[s].inuse, 0);
 		}
 
+		if (c->tier_be) {
+			L->tstate	   = xcalloc((size_t)m->moe.n_experts, sizeof(*L->tstate));
+			L->eid_to_tier = xmalloc((size_t)m->moe.n_experts * sizeof(int));
+			for (int e = 0; e < m->moe.n_experts; e++)
+				L->eid_to_tier[e] = -1;
+			if (m->layers[i].experts) {
+				L->tier_cap	  = plan.tier_cap;
+				L->tier_slots = xcalloc((size_t)L->tier_cap, sizeof(moe_expert_slot));
+				for (int t = 0; t < L->tier_cap; t++) {
+					L->tier_slots[t].eid = -1;
+					atomic_init(&L->tier_slots[t].io_ready, 1);
+					atomic_init(&L->tier_slots[t].inuse, 0);
+				}
+				m->layers[i].experts_resident = 1;
+			}
+		}
+
 		int n_pin_this_layer = c->n_pinned;
 
 		L->n_pinned		= 0;
@@ -769,7 +1318,7 @@ status_code moe_stream_cache_init(struct model *m) {
 		if (n_pin_this_layer > 0 && m->layers[i].experts) {
 			L->pinned_slots = xcalloc(n_pin_this_layer, sizeof(moe_expert_slot));
 			for (int pi = 0; pi < n_pin_this_layer; pi++) {
-				int e = (n_pin_list > 0) ? pin_list[pi] : pi;
+				int e = n_pin_list > 0 ? pin_list[pi] : c->pin_ids ? c->pin_ids[pi] : pi;
 				if (e < 0 || e >= m->moe.n_experts)
 					continue;
 				moe_expert_slot *s = &L->pinned_slots[L->n_pinned++];
@@ -815,7 +1364,8 @@ status_code moe_stream_cache_init(struct model *m) {
 	{
 		int n_total = 0;
 		for (int i = 0; i < m->n_layers; i++)
-			n_total += c->layers[i].n_pinned;
+			for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
+				n_total += moe_pin_dest(m, c, i, pi, dev_upload) == NULL;
 
 		if (n_total > 0) {
 			moe_expert_slot **slots = (moe_expert_slot **)xmalloc((size_t)n_total * sizeof(*slots));
@@ -823,6 +1373,8 @@ status_code moe_stream_cache_init(struct model *m) {
 			int				  idx	 = 0;
 			for (int i = 0; i < m->n_layers; i++) {
 				for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
+					if (moe_pin_dest(m, c, i, pi, dev_upload))
+						continue;
 					slots[idx]	= &c->layers[i].pinned_slots[pi];
 					layers[idx] = i;
 					idx++;
@@ -854,18 +1406,28 @@ status_code moe_stream_cache_init(struct model *m) {
 			}
 
 			pthread_t th[PIN_COPY_MAX_WORKERS];
-			for (int i = 0; i < nw; i++) {
-				if (pthread_create(&th[i], NULL, pin_copy_worker, &job) != 0) {
-					th[i] = 0;
-					nw	  = i;
+			atomic_store(&job.workers_running, nw);
+			int started = 0;
+			for (; started < nw; started++) {
+				if (pthread_create(&th[started], NULL, pin_copy_worker, &job) != 0)
 					break;
-				}
 			}
-			pin_copy_worker(&job);
-			for (int i = 0; i < nw; i++) {
-				if (th[i])
-					pthread_join(th[i], NULL);
+			atomic_fetch_sub(&job.workers_running, nw - started);
+			if (started == 0) {
+				atomic_store(&job.workers_running, 1);
+				pin_copy_worker(&job);
 			}
+
+			progress prog;
+			progress_start(&prog, "Pinning experts", (uint64_t)n_total);
+			while (atomic_load_explicit(&job.workers_running, memory_order_acquire) > 0) {
+				progress_update(&prog,
+								(uint64_t)(atomic_load(&job.n_copied) + atomic_load(&job.n_err)));
+				usleep(20000);
+			}
+			progress_finish(&prog);
+			for (int i = 0; i < started; i++)
+				pthread_join(th[i], NULL);
 
 			uint64_t elapsed_us = time_us() - t0;
 			size_t	 copied		= atomic_load(&job.total_copied);
@@ -885,44 +1447,10 @@ status_code moe_stream_cache_init(struct model *m) {
 			free((void *)layers);
 		}
 	}
-	if (full_resident && m->backend && m->backend->moe_expert_ffn &&
-		m->backend->buffer_alloc_from_host && (m->backend->caps & BCAP_MOE_EXPERT_RESIDENT)) {
-		int		 uploaded  = 0;
-		int		 failed	   = 0;
-		size_t	 dev_bytes = 0;
-		uint64_t t0		   = time_us();
-		for (int i = 0; i < m->n_layers && !failed; i++) {
-			for (int pi = 0; pi < c->layers[i].n_pinned; pi++) {
-				moe_expert_slot *sl = &c->layers[i].pinned_slots[pi];
-				moe_expert_bytes eb = moe_calc_expert_bytes(m, i, sl->eid);
-				status_code		 st = m->backend->buffer_alloc_from_host(m->backend, sl->gate_w,
-																		 eb.gate_b, &sl->dev_gate);
-				if (st == OK && !sl->gate_up_fused)
-					st = m->backend->buffer_alloc_from_host(m->backend, sl->up_w, eb.up_b,
-															&sl->dev_up);
-				if (st == OK)
-					st = m->backend->buffer_alloc_from_host(m->backend, sl->down_w, eb.down_b,
-															&sl->dev_down);
-				if (st != OK) {
-					failed = 1;
-					break;
-				}
-				dev_bytes += eb.total;
-				sl->dev_ready = 1;
-				uploaded++;
-			}
-		}
-		if (failed) {
-			for (int i = 0; i < m->n_layers; i++) {
-				for (int pi = 0; pi < c->layers[i].n_pinned; pi++)
-					moe_slot_free_dev_buffers(&c->layers[i].pinned_slots[pi]);
-			}
-			INFO("MoE: expert residency unavailable (allocation failed) -- keeping CPU path");
-		} else if (uploaded > 0) {
-			m->moe.experts_resident = 1;
-			INFO("MoE: %d experts resident on device (%.1f MB) in %.1f s", uploaded,
-				 (double)dev_bytes / (1024.0 * 1024.0), (double)(time_us() - t0) / 1e6);
-		}
+	if (dev_upload) {
+		status_code us = moe_upload_resident(m, c);
+		if (us != OK)
+			return us;
 	}
 
 	return OK;
@@ -941,6 +1469,11 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		for (int s = 0; s < c->layers[i].n_lru; s++) {
 			free(c->layers[i].lru_slots[s].heap_buf);
 		}
+		for (int s = 0; s < c->layers[i].tier_cap; s++)
+			moe_slot_free_dev_buffers(&c->layers[i].tier_slots[s]);
+		free(c->layers[i].tier_slots);
+		free(c->layers[i].eid_to_tier);
+		free(c->layers[i].tstate);
 		free(c->layers[i].lru_slots);
 		free(c->layers[i].lru_freq);
 		free(c->layers[i].pinned_slots);
@@ -951,6 +1484,8 @@ void moe_stream_cache_free(moe_stream_cache *c) {
 		pthread_mutex_destroy(&c->layers[i].mtx);
 	}
 	free(c->layers);
+	free(c->pin_be);
+	free(c->pin_ids);
 	moe_direct_io_close(c);
 	moe_nomap_close(c);
 	free(c);
@@ -1048,6 +1583,15 @@ static void heap_push(struct moe_stream_layer *sl, int idx, uint64_t now) {
 	heap_sift_up(sl, pos, now);
 }
 
+static moe_expert_slot *layer_find_tier(struct moe_stream_layer *sl, int eid) {
+	if (!sl->eid_to_tier)
+		return NULL;
+	int ti = sl->eid_to_tier[eid];
+	if (ti >= 0 && ti < sl->tier_cap && sl->tier_slots[ti].eid == eid)
+		return &sl->tier_slots[ti];
+	return NULL;
+}
+
 static moe_expert_slot *layer_find(struct moe_stream_layer *sl, int eid, uint64_t now) {
 	if (eid >= 0 && sl->eid_to_pinned) {
 		int pi = sl->eid_to_pinned[eid];
@@ -1055,6 +1599,11 @@ static moe_expert_slot *layer_find(struct moe_stream_layer *sl, int eid, uint64_
 			sl->pinned_slots[pi].last_used = now;
 			return &sl->pinned_slots[pi];
 		}
+	}
+	moe_expert_slot *tier = layer_find_tier(sl, eid);
+	if (tier) {
+		tier->last_used = now;
+		return tier;
 	}
 	int i = sl->eid_to_lru[eid];
 	if (i >= 0 && i < sl->n_lru && sl->lru_slots[i].eid == eid) {
@@ -1336,6 +1885,9 @@ static moe_expert_slot *live_slot_find(struct moe_stream_layer *L, const moe_exp
 		if (pi >= 0 && pi < L->n_pinned && L->pinned_slots[pi].eid == slot->eid)
 			return &L->pinned_slots[pi];
 	}
+	moe_expert_slot *tier = layer_find_tier(L, slot->eid);
+	if (tier)
+		return tier;
 	int i = L->eid_to_lru[slot->eid];
 	if (i >= 0 && i < L->n_lru && L->lru_slots[i].eid == slot->eid)
 		return &L->lru_slots[i];
@@ -1346,6 +1898,227 @@ static void live_slot_unuse(moe_expert_slot *live) {
 	int prev = atomic_fetch_sub_explicit(&live->inuse, 1, memory_order_acq_rel);
 	if (prev <= 0)
 		atomic_store_explicit(&live->inuse, 0, memory_order_release);
+}
+
+static uint64_t tier_clock(const moe_stream_cache *c) {
+	return atomic_load_explicit(&c->clock, memory_order_relaxed);
+}
+
+static float tier_score(const moe_stream_cache *c, const struct moe_stream_layer *L, int eid) {
+	return moe_tier_score_at(&c->tier_policy, &L->tstate[eid].score, L->step);
+}
+
+static void tier_note_move(struct moe_stream_layer *L, int eid) {
+	L->tstate[eid].last_move = L->step;
+}
+
+static void tier_note_load(const moe_stream_cache *c, struct moe_stream_layer *L, int eid) {
+	if (c->tier_be)
+		tier_note_move(L, eid);
+}
+
+static void tier_score_requests(const moe_stream_cache *c, struct moe_stream_layer *L,
+								int n_experts, const int *expert_ids, int n_k) {
+	L->step++;
+	for (int k = 0; k < n_k; k++) {
+		int eid = expert_ids[k];
+		if (eid >= 0 && eid < n_experts)
+			moe_tier_score_hit(&c->tier_policy, &L->tstate[eid].score, L->step);
+	}
+}
+
+static int tier_movable(const moe_stream_cache *c, const struct moe_stream_layer *L,
+						const moe_expert_slot *s) {
+	return s->eid >= 0 && atomic_load_explicit(&s->io_ready, memory_order_acquire) &&
+		   atomic_load_explicit(&s->inuse, memory_order_acquire) == 0 &&
+		   moe_tier_may_move(&c->tier_policy, L->tstate[s->eid].last_move, L->step);
+}
+
+static void lru_slot_clear(moe_stream_cache *c, struct moe_stream_layer *L, int idx) {
+	moe_expert_slot *s = &L->lru_slots[idx];
+	atomic_fetch_add_explicit(&s->gen, 1, memory_order_acq_rel);
+	if (s->eid >= 0 && L->eid_to_lru[s->eid] == idx)
+		L->eid_to_lru[s->eid] = -1;
+	s->heap_buf	 = NULL;
+	s->heap_size = 0;
+	s->gate_w = s->up_w = s->down_w = NULL;
+	s->eid							= -1;
+	s->last_used					= 0;
+	L->lru_freq[idx]				= 0;
+	heap_touch(L, idx, tier_clock(c));
+}
+
+static void tier_evict(moe_stream_cache *c, struct moe_stream_layer *L, int idx) {
+	moe_expert_slot *s = &L->lru_slots[idx];
+	tier_note_move(L, s->eid);
+	free(s->heap_buf);
+	lru_slot_clear(c, L, idx);
+}
+
+static int lru_slot_refill(struct model *m, moe_stream_cache *c, int layer,
+						   struct moe_stream_layer *L, int idx, int eid) {
+	moe_expert_slot *s		  = &L->lru_slots[idx];
+	void			*reuse	  = s->heap_buf;
+	size_t			 reuse_sz = s->heap_size;
+	moe_expert_slot	 tmp	  = *s;
+	slot_from_expert_desc(&tmp, eid, &m->layers[layer].experts[eid]);
+	status_code st = moe_pin_copy_slot(m, c, layer, &tmp, reuse, reuse_sz);
+	lru_slot_clear(c, L, idx);
+	if (st != OK)
+		return 0;
+	*s				   = tmp;
+	s->last_used	   = tier_clock(c);
+	L->eid_to_lru[eid] = idx;
+	L->lru_freq[idx]   = 1;
+	atomic_store_explicit(&s->io_ready, 1, memory_order_release);
+	heap_touch(L, idx, s->last_used);
+	tier_note_move(L, eid);
+	return 1;
+}
+
+static int tier_upload(struct model *m, moe_stream_cache *c, int layer, const moe_expert_slot *host,
+					   moe_expert_slot *out) {
+	slot_zero(out);
+	slot_from_expert_desc(out, host->eid, &m->layers[layer].experts[host->eid]);
+	moe_upload_item it	  = {.slot = out, .be = c->tier_be, .layer = layer, .tmp = *host};
+	size_t			bytes = 0;
+	if (moe_upload_one(m, &it, &bytes))
+		return 1;
+	out->eid = -1;
+	return 0;
+}
+
+static void tier_release(moe_expert_slot *t) {
+	moe_slot_free_dev_buffers(t);
+	t->gate_w = t->up_w = t->down_w = NULL;
+	t->eid							= -1;
+	t->last_used					= 0;
+}
+
+static int tier_free_index(const struct moe_stream_layer *L) {
+	for (int t = 0; t < L->tier_cap; t++)
+		if (L->tier_slots[t].eid < 0)
+			return t;
+	return -1;
+}
+
+static int tier_weakest_index(const moe_stream_cache *c, const struct moe_stream_layer *L) {
+	int	  weakest = -1;
+	float low	  = 0.0f;
+	for (int t = 0; t < L->tier_cap; t++) {
+		const moe_expert_slot *ts = &L->tier_slots[t];
+		if (!tier_movable(c, L, ts))
+			continue;
+		float score = tier_score(c, L, ts->eid);
+		if (weakest < 0 || score < low) {
+			weakest = t;
+			low		= score;
+		}
+	}
+	return weakest;
+}
+
+static int tier_promote(struct model *m, moe_stream_cache *c, int layer, struct moe_stream_layer *L,
+						int idx) {
+	moe_expert_slot *host	= &L->lru_slots[idx];
+	int				 eid	= host->eid;
+	int				 dst	= tier_free_index(L);
+	int				 victim = -1;
+	if (dst < 0) {
+		victim = tier_weakest_index(c, L);
+		if (victim < 0 || !moe_tier_beats(&c->tier_policy, tier_score(c, L, eid),
+										  tier_score(c, L, L->tier_slots[victim].eid)))
+			return 0;
+		dst = victim;
+	}
+
+	moe_expert_slot placed;
+	if (!tier_upload(m, c, layer, host, &placed)) {
+		tier_note_move(L, eid);
+		return 0;
+	}
+
+	if (victim < 0) {
+		free(host->heap_buf);
+		lru_slot_clear(c, L, idx);
+	} else {
+		int victim_eid = L->tier_slots[victim].eid;
+		if (!lru_slot_refill(m, c, layer, L, idx, victim_eid)) {
+			moe_slot_free_dev_buffers(&placed);
+			tier_note_move(L, eid);
+			return 0;
+		}
+		L->eid_to_tier[victim_eid] = -1;
+		tier_release(&L->tier_slots[victim]);
+	}
+
+	L->tier_slots[dst]	= placed;
+	L->eid_to_tier[eid] = dst;
+	tier_note_move(L, eid);
+	return 1;
+}
+
+static int tier_demote(struct model *m, moe_stream_cache *c, int layer, struct moe_stream_layer *L,
+					   int tier_idx) {
+	moe_expert_slot *t		  = &L->tier_slots[tier_idx];
+	int				 eid	  = t->eid;
+	void			*freed	  = NULL;
+	size_t			 freed_sz = 0;
+	moe_expert_slot *s = layer_insert_lru(m, c, layer, L, eid, tier_clock(c), &freed, &freed_sz);
+	if (!s)
+		return 0;
+
+	int				idx = (int)(s - L->lru_slots);
+	moe_expert_slot tmp = *s;
+	slot_from_expert_desc(&tmp, eid, &m->layers[layer].experts[eid]);
+	status_code st = moe_pin_copy_slot(m, c, layer, &tmp, freed, freed_sz);
+	if (st != OK) {
+		lru_slot_clear(c, L, idx);
+		atomic_store_explicit(&s->io_ready, 1, memory_order_release);
+		tier_note_move(L, eid);
+		return 0;
+	}
+	*s = tmp;
+	atomic_store_explicit(&s->io_ready, 1, memory_order_release);
+	L->eid_to_tier[eid] = -1;
+	tier_release(t);
+	tier_note_move(L, eid);
+	return 1;
+}
+
+static void tier_sweep(struct model *m, moe_stream_cache *c, int layer,
+					   struct moe_stream_layer *L) {
+	const moe_tier_policy *p	 = &c->tier_policy;
+	int					   moves = 0;
+	for (int t = 0; t < L->tier_cap && moves < TIER_MOVES_PER_SWEEP; t++) {
+		const moe_expert_slot *ts = &L->tier_slots[t];
+		if (!tier_movable(c, L, ts) ||
+			moe_tier_decide(p, tier_score(c, L, ts->eid), 1, 1) != MOE_TIER_DEMOTE)
+			continue;
+		moves += tier_demote(m, c, layer, L, t);
+	}
+	for (int i = 0; i < L->n_lru && moves < TIER_MOVES_PER_SWEEP; i++) {
+		moe_expert_slot *s = &L->lru_slots[i];
+		if (!tier_movable(c, L, s))
+			continue;
+		moe_tier_action action = moe_tier_decide(p, tier_score(c, L, s->eid), 0, 1);
+		if (action == MOE_TIER_EVICT)
+			tier_evict(c, L, i);
+		else if (action == MOE_TIER_PROMOTE)
+			moves += tier_promote(m, c, layer, L, i);
+	}
+}
+
+static void tier_maintain(struct model *m, moe_stream_cache *c, int layer,
+						  struct moe_stream_layer *L) {
+	if (!c->tier_be || L->tier_cap <= 0)
+		return;
+	pthread_mutex_lock(&L->mtx);
+	if (L->step - L->last_sweep >= TIER_SWEEP_INTERVAL) {
+		L->last_sweep = L->step;
+		tier_sweep(m, c, layer, L);
+	}
+	pthread_mutex_unlock(&L->mtx);
 }
 
 static void *moe_fetch_worker(void *arg) {
@@ -1366,6 +2139,8 @@ static void resolve_scan_hits(moe_stream_cache *c, struct moe_stream_layer *L, s
 							  moe_expert_slot *out_slots, int *need_fetch, int *n_need,
 							  int sync_wait_not_ready) {
 	pthread_mutex_lock(&L->mtx);
+	if (c->tier_be)
+		tier_score_requests(c, L, m->moe.n_experts, expert_ids, n_k);
 	for (int k = 0; k < n_k; k++) {
 		int eid = expert_ids[k];
 		if (eid < 0 || eid >= m->moe.n_experts) {
@@ -1452,6 +2227,7 @@ static void resolve_collect_misses(moe_stream_cache *c, struct moe_stream_layer 
 			continue;
 		}
 		slot_from_expert_desc(s, eid, &m->layers[layer].experts[eid]);
+		tier_note_load(c, L, eid);
 		uint64_t my_gen = atomic_load_explicit(&s->gen, memory_order_acquire);
 
 		miss_fill_slot(&misses[*n_misses], k, eid, s, my_gen, freed_buf, freed_size);
@@ -1471,8 +2247,8 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 		return ERR_INVALID_ARG;
 	}
 
-	if (n_k > MOE_MAX_TOPK) {
-		ERROR("moe_stream_resolve: n_k=%d exceeds MOE_MAX_TOPK=%d buffer", n_k, MOE_MAX_TOPK);
+	if (n_k < 0) {
+		ERROR("moe_stream_resolve: invalid n_k=%d", n_k);
 		return ERR_INVALID_ARG;
 	}
 
@@ -1482,21 +2258,34 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 	}
 
 	struct moe_stream_layer *L = &c->layers[layer];
-	uint64_t	now			   = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
-	status_code rc			   = OK;
+	tier_maintain(m, c, layer, L);
+	uint64_t	now = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
+	status_code rc	= OK;
 
-	int need_fetch[MOE_MAX_TOPK];
+	int				need_fetch_stack[MOE_MAX_TOPK];
+	moe_miss_entry	misses_stack[MOE_MAX_TOPK];
+	int				wait_needed_stack[MOE_MAX_TOPK];
+	void		   *resolve_heap = NULL;
+	int			   *need_fetch	 = need_fetch_stack;
+	moe_miss_entry *misses		 = misses_stack;
+	int			   *wait_needed	 = wait_needed_stack;
+	if (n_k > MOE_MAX_TOPK) {
+		resolve_heap = xmalloc((size_t)n_k * (sizeof(moe_miss_entry) + 2 * sizeof(int)));
+		misses		 = resolve_heap;
+		need_fetch	 = (int *)((char *)resolve_heap + (size_t)n_k * sizeof(moe_miss_entry));
+		wait_needed	 = need_fetch + n_k;
+	}
 	int n_need = 0;
 
 	resolve_scan_hits(c, L, m, expert_ids, n_k, now, out_slots, need_fetch, &n_need, 0);
 
-	if (n_need == 0)
+	if (n_need == 0) {
+		free(resolve_heap);
 		return OK;
+	}
 
-	moe_miss_entry misses[MOE_MAX_TOPK];
-	int			   n_misses = 0;
+	int n_misses = 0;
 
-	int wait_needed[MOE_MAX_TOPK];
 	int n_wait_needed = 0;
 
 	resolve_collect_misses(c, L, m, layer, expert_ids, now, out_slots, need_fetch, n_need, misses,
@@ -1526,6 +2315,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 			continue;
 		}
 		slot_from_expert_desc(s, eid, &Lw->experts[eid]);
+		tier_note_load(c, L, eid);
 		uint64_t my_gen = atomic_load_explicit(&s->gen, memory_order_acquire);
 		pthread_mutex_unlock(&L->mtx);
 
@@ -1534,8 +2324,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 	}
 
 	if (n_misses > 0) {
-		backend *host_be = backend_host();
-		tpool	*pool	 = (host_be && host_be->get_pool) ? host_be->get_pool(host_be) : NULL;
+		tpool *pool = tpool_fetch_pool();
 
 		int got_pool = pool && pthread_mutex_trylock(&g_fetch_pool_mtx) == 0;
 
@@ -1628,6 +2417,7 @@ status_code moe_stream_resolve(struct model *m, int layer, const int *expert_ids
 		}
 		pthread_mutex_unlock(&L->mtx);
 	}
+	free(resolve_heap);
 	return rc;
 }
 
@@ -1663,10 +2453,8 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	moe_stream_cache *c = m->moe_cache;
 	if (layer < 0 || layer >= m->n_layers || !m->layers[layer].experts)
 		return NULL;
-	if (n_k > MOE_MAX_TOPK) {
-		ERROR("moe_stream_resolve_prep: n_k=%d exceeds MOE_MAX_TOPK=%d buffer", n_k, MOE_MAX_TOPK);
+	if (n_k < 0)
 		return NULL;
-	}
 
 	if (!c || !m->moe_stream_enabled) {
 		moe_resolve_no_cache(m, &m->layers[layer], expert_ids, n_k, out_slots);
@@ -1674,14 +2462,23 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	}
 
 	struct moe_stream_layer *L = &c->layers[layer];
-	uint64_t now			   = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
-	int		 need_fetch[MOE_MAX_TOPK];
-	int		 n_need = 0;
+	tier_maintain(m, c, layer, L);
+	uint64_t now = atomic_fetch_add_explicit(&c->clock, 1, memory_order_relaxed) + 1;
+	int		 need_fetch_stack[MOE_MAX_TOPK];
+	int		*need_fetch = need_fetch_stack;
+	void	*prep_heap	= NULL;
+	if (n_k > MOE_MAX_TOPK) {
+		prep_heap  = xmalloc((size_t)n_k * sizeof(int));
+		need_fetch = prep_heap;
+	}
+	int n_need = 0;
 
 	resolve_scan_hits(c, L, m, expert_ids, n_k, now, out_slots, need_fetch, &n_need, 1);
 
-	if (n_need == 0)
+	if (n_need == 0) {
+		free(prep_heap);
 		return NULL;
+	}
 
 	moe_stream_op *op  = xcalloc(1, sizeof(*op));
 	op->model		   = m;
@@ -1698,9 +2495,13 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	op->items		   = NULL;
 	op->n_items		   = 0;
 	op->n_misses	   = 0;
+	op->misses		   = xcalloc((size_t)n_k, sizeof(moe_miss_entry));
 
 	resolve_collect_misses(c, L, m, layer, expert_ids, op->now, out_slots, need_fetch, n_need,
 						   op->misses, &op->n_misses, NULL, NULL);
+
+	free(prep_heap);
+	need_fetch = NULL;
 
 	if (op->n_misses == 0) {
 		moe_stream_op_free(op);
@@ -1748,8 +2549,14 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	}
 
 	{
-		char pending[MOE_MAX_TOPK];
-		memset(pending, 0, sizeof(pending));
+		char  pending_stack[MOE_MAX_TOPK];
+		char *pending	   = pending_stack;
+		void *pending_heap = NULL;
+		if (n_k > MOE_MAX_TOPK) {
+			pending_heap = xmalloc((size_t)n_k);
+			pending		 = pending_heap;
+		}
+		memset(pending, 0, (size_t)n_k);
 		for (int i = 0; i < op->n_misses; i++) {
 			moe_miss_entry *me = &op->misses[i];
 			if (me->k >= 0 && me->k < n_k)
@@ -1769,6 +2576,7 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 			op->items[it++] = (moe_op_item){.chunk = ci, .k = -1};
 
 		op->n_items = it;
+		free(pending_heap);
 	}
 	return op;
 }
@@ -1841,6 +2649,7 @@ void moe_stream_op_free(moe_stream_op *op) {
 	free(op->chunks);
 	free(op->chunk_miss_idx);
 	free(op->items);
+	free(op->misses);
 	free(op);
 }
 
@@ -2035,4 +2844,34 @@ status_code moe_stream_preload_all(struct model *m) {
 
 	INFO("moe_stream: preloaded %d experts across %d layers", total_experts, total_layers);
 	return OK;
+}
+
+void moe_stream_tier_maintain(struct model *m, int layer) {
+	moe_stream_cache *c = m ? m->moe_cache : NULL;
+	if (!c || !m->moe_stream_enabled || layer < 0 || layer >= m->n_layers)
+		return;
+	tier_maintain(m, c, layer, &c->layers[layer]);
+}
+
+backend *moe_stream_expert_owner(const struct model *m, int layer, int eid) {
+	if (!m || !m->moe_cache || layer < 0 || layer >= m->n_layers || eid < 0 ||
+		eid >= m->moe.n_experts)
+		return NULL;
+	struct moe_stream_layer *L = &m->moe_cache->layers[layer];
+	if (L->eid_to_pinned) {
+		int pi = L->eid_to_pinned[eid];
+		if (pi >= 0 && pi < L->n_pinned) {
+			const moe_expert_slot *sl = &L->pinned_slots[pi];
+			return sl->dev_ready ? sl->dev_gate.owner : NULL;
+		}
+	}
+	if (!L->eid_to_tier)
+		return NULL;
+	backend *owner = NULL;
+	pthread_mutex_lock(&L->mtx);
+	const moe_expert_slot *live = layer_find_tier(L, eid);
+	if (live && live->dev_ready)
+		owner = live->dev_gate.owner;
+	pthread_mutex_unlock(&L->mtx);
+	return owner;
 }

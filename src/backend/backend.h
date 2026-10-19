@@ -24,6 +24,8 @@ typedef enum {
 	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
 	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
 	BCAP_KV_POS_CAP			  = 1 << 10,
+	BCAP_UNIFIED_MEMORY		  = 1 << 11,
+	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
 } backend_cap;
 
 typedef struct {
@@ -120,12 +122,92 @@ typedef struct {
 	float		*ws;
 } gdn_desc;
 
+typedef struct {
+	const buffer *buf;
+	uint32_t	  type;
+} backend_weight;
+
+typedef struct {
+	int			  dim, n_hc;
+	const buffer *x;
+	buffer		 *hc;
+} hc_init_desc;
+
+typedef struct {
+	int			  dim, n_hc;
+	const buffer *hc;
+	buffer		 *x;
+} hc_final_desc;
+
+typedef struct {
+	int			   dim, n_hc, sinkhorn_iters;
+	float		   norm_eps, eps;
+	const buffer  *stream;
+	backend_weight fn;
+	const buffer  *base, *scale;
+	buffer		  *x, *coef;
+	float		  *ws;
+} hc_pre_desc;
+
+typedef struct {
+	int			  dim, n_hc;
+	const buffer *sub, *coef;
+	buffer		 *hc;
+} hc_post_desc;
+
+typedef struct {
+	int			   dim, n_heads, head_dim, conv_kernel, reset;
+	float		   gate_lower_bound, norm_eps;
+	const buffer  *x;
+	backend_weight wq, wk, wv, wo, f_a, f_b, g_a, g_b, beta;
+	const buffer  *conv_q, *conv_k, *conv_v, *dt_bias, *ssm_a, *out_norm;
+	buffer		  *conv_state, *state;
+	buffer		  *out;
+	float		  *ws;
+} kda_desc;
+
+typedef struct {
+	int			   dim, n_heads, kv_lora, qk_head, v_head, q_lora, pos, n_threads;
+	float		   norm_eps;
+	const buffer  *x;
+	backend_weight q_a, q_b, kv_a, wo;
+	const buffer  *q_a_norm, *kv_a_norm, *k_b, *v_b;
+	buffer		  *latent_cache;
+	buffer		  *out;
+	float		  *ws;
+} mla_absorbed_desc;
+
+static inline float *buffer_f32(const buffer *b) {
+	return (float *)(b->handle ? (char *)b->handle + b->offset : (char *)b->host_ptr);
+}
+
+static inline int hc_mix_dim(int n_hc) {
+	return (2 + n_hc) * n_hc;
+}
+
+static inline size_t hc_pre_ws_floats(const hc_pre_desc *d) {
+	return (size_t)d->n_hc * d->dim + hc_mix_dim(d->n_hc);
+}
+
+static inline size_t kda_ws_floats(const kda_desc *d) {
+	size_t inner = (size_t)d->n_heads * d->head_dim;
+	return 6 * inner + 2 * (size_t)d->head_dim + d->n_heads;
+}
+
+static inline size_t mla_absorbed_ws_floats(const mla_absorbed_desc *d) {
+	size_t stride = (size_t)d->pos + 1 + d->kv_lora;
+	return (size_t)d->q_lora + (size_t)d->n_heads * d->qk_head + (size_t)d->n_heads * d->kv_lora +
+		   d->kv_lora + (size_t)d->n_heads * d->v_head + (size_t)(d->n_threads + 1) * stride;
+}
+
 struct backend {
 	const char *name;
 	int			priority;
+	int			device_index;
 	uint64_t	caps;
 	status_code (*probe)(void);
 	int (*device_count)(void);
+	status_code (*device_identity)(int device_index, char *out, size_t cap);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -219,6 +301,8 @@ struct backend {
 										 const buffer *gate, const buffer *up, buffer *y, int n,
 										 int k, int activation, int m);
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
+	status_code (*buffer_read_f32_x2)(backend *self, const buffer *a, float *dst_a, int n_a,
+									  const buffer *b, float *dst_b, int n_b);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
 	status_code (*repack_plan)(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
@@ -267,13 +351,20 @@ struct backend {
 								 const buffer *k_b_w, const buffer *v_b_w, buffer *out, int layer,
 								 int pos, int n_heads, int qk_head, int qk_rope, int qk_nope,
 								 int v_head, int kv_lora, int n_ctx, const float *rope_cos_base,
-								 const float *rope_sin_base, float scale);
+								 const float *rope_sin_base, uint32_t k_b_type, uint32_t v_b_type,
+								 float scale);
 	status_code (*kv_alloc_mla)(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
 								buffer *kv_out);
 	status_code (*kv_put_mla)(backend *self, buffer *kv_cache, int layer, int pos,
 							  const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
 							  int qk_rope, int n_ctx, float eps);
 	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
+	status_code (*hc_init)(backend *self, const hc_init_desc *d);
+	status_code (*hc_pre)(backend *self, const hc_pre_desc *d);
+	status_code (*hc_post)(backend *self, const hc_post_desc *d);
+	status_code (*hc_final)(backend *self, const hc_final_desc *d);
+	status_code (*kda)(backend *self, const kda_desc *d);
+	status_code (*mla_absorbed)(backend *self, const mla_absorbed_desc *d);
 	tpool *(*get_pool)(backend *self);
 	status_code (*matmul_thread_local)(backend *self, const void *w, uint32_t w_type,
 									   const float *x, float *y, int n, int k, int tid);
@@ -324,7 +415,17 @@ status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
 
-int backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
+#define BACKEND_DEVICE_NAME_MAX 64
+
+int			backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
+bool		backend_device_is_host(const char *spec);
+bool		backend_device_uma(const char *spec);
+status_code backend_device_identity(const char *spec, char *out, size_t cap);
+status_code backend_identity(const backend *b, char *out, size_t cap);
+int			backend_best_device(char *out, size_t out_cap);
+int			backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
+size_t		backend_name_brief_len(const char *name);
+int			backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
 
@@ -335,18 +436,18 @@ void host_kernels_register(int priority, host_matmul_generic_fn mm);
 
 void host_matmul_generic(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);
 
-backend *backend_host(void);
+backend *backend_host_at(const char *file, int line, const char *func);
+#define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
 
 typedef enum {
-	HFB_OP_NOT_NATIVE		= 0,
-	HFB_BATCH_DESIGN		= 1,
-	HFB_WEIGHT_TYPE			= 2,
-	HFB_BUF_HOST_RESIDENT	= 3,
-	HFB_CAPABILITY			= 4,
-	HFB_ERROR				= 5,
-	HFB_LAYER_NOT_OFFLOADED = 6,
+	HFB_OP_NOT_NATIVE	  = 0,
+	HFB_BATCH_DESIGN	  = 1,
+	HFB_WEIGHT_TYPE		  = 2,
+	HFB_BUF_HOST_RESIDENT = 3,
+	HFB_CAPABILITY		  = 4,
+	HFB_ERROR			  = 5,
 } host_fallback_reason;
 
 void backend_report_host_fallback(const backend *device, const char *op,

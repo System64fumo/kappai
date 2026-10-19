@@ -17,7 +17,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 - High-performance CPU inference
 - Vulkan backend
 - OpenGL backend
-- Mixed backend / partial offloading
+- Heterogeneous Compute Scheduler
 - MoE streaming
 - OpenAI-compatible server
 - Tool calling

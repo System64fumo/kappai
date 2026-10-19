@@ -1,0 +1,21 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer HcBuf {
+	float hc[];
+};
+layout(std430, binding = 1) writeonly buffer XBuf {
+	float x[];
+};
+layout(location = 0) uniform int u_dim;
+layout(location = 1) uniform int u_n_hc;
+
+void main(void) {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= u_dim)
+		return;
+	float acc = 0.0;
+	for (int h = 0; h < u_n_hc; h++)
+		acc += hc[h * u_dim + i];
+	x[i] = acc / float(u_n_hc);
+}
