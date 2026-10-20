@@ -24,6 +24,7 @@ layout(push_constant) uniform Params {
 	int	 stride_head_dim;
 	int	 in_row_stride;
 	int	 m_tokens;
+	int	 in_row0;
 }
 params;
 
@@ -49,7 +50,7 @@ void main() {
 	uint base		= params.layer_off + uint(kvh) * kvh_stride + pos_off;
 	uint word_idx	= (base + uint(d0)) >> 1u;
 
-	int in_base = row * params.in_row_stride + kvh * head_dim;
+	int in_base = (params.in_row0 + row) * params.in_row_stride + kvh * head_dim;
 	int in_idx0 = in_base + d0;
 	int in_idx1 = in_base + d1;
 

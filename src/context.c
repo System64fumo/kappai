@@ -688,6 +688,103 @@ static void context_rewind(context *c, int32_t pos) {
 	c->kv.n_pos	 = pos;
 }
 
+#define KV_SHIFT_MIN_CHUNK 32
+#define KV_SHIFT_MAX_CHUNKS 64
+
+typedef struct {
+	kv_shift_chunk chunks[KV_SHIFT_MAX_CHUNKS];
+	int			   n;
+} kv_reuse_plan;
+
+static void kv_reuse_plan_build(const context *c, const int32_t *ids, int n, int32_t reuse,
+								kv_reuse_plan *plan) {
+	plan->n	   = 0;
+	int head_c = reuse;
+	int head_p = reuse;
+	while (head_c < c->fed_ids.n && head_p < n - 1 && plan->n < KV_SHIFT_MAX_CHUNKS) {
+		int matched = 0;
+		while (head_c + matched < c->fed_ids.n && head_p + matched < n - 1 &&
+			   c->fed_ids.p[head_c + matched] == ids[head_p + matched])
+			matched++;
+		if (matched < KV_SHIFT_MIN_CHUNK) {
+			head_c++;
+			continue;
+		}
+		plan->chunks[plan->n++] = (kv_shift_chunk){head_c, head_p, matched};
+		head_c += matched;
+		head_p += matched;
+	}
+}
+
+static bool kv_reuse_plan_shift(context *c, const kv_reuse_plan *plan) {
+	kv_shift_chunk moves[KV_SHIFT_MAX_CHUNKS];
+	int			   n_moves	= 0;
+	int			   n_reused = 0;
+	for (int i = 0; i < plan->n; i++) {
+		n_reused += plan->chunks[i].n_rows;
+		if (plan->chunks[i].src_pos != plan->chunks[i].dst_pos)
+			moves[n_moves++] = plan->chunks[i];
+	}
+	if (n_moves > 0) {
+		status_code st = kvcache_shift(&c->kv, &c->m, moves, n_moves);
+		if (st != OK) {
+			WARN("kv shift failed (%s); refeeding tail", status_str(st));
+			return false;
+		}
+	}
+	INFO("kv shift: %d chunk(s), %d token(s) reused after mismatch", plan->n, n_reused);
+	return true;
+}
+
+static int32_t context_reuse_prefix(context *c, const int32_t *ids, int n, kv_reuse_plan *plan) {
+	plan->n		  = 0;
+	int32_t reuse = fed_ids_common_prefix(c, ids, n);
+	if (reuse >= c->fed_ids.n) {
+		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
+		return reuse;
+	}
+	DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
+		  (int)c->fed_ids.n);
+	if (kvcache_can_shift(&c->kv, &c->m)) {
+		kv_reuse_plan_build(c, ids, n, reuse, plan);
+		if (plan->n > 0 && !kv_reuse_plan_shift(c, plan))
+			plan->n = 0;
+	}
+	context_rewind(c, reuse);
+	return reuse;
+}
+
+static prefill_result context_prefill_with_plan(context *c, const int32_t *tokens, int n_tokens,
+												const kv_reuse_plan *plan) {
+	prefill_result total = {0};
+	int32_t		   base	 = c->kv.n_pos;
+	int			   n_fed = 0;
+	prefill_result part	 = {0};
+	for (int i = 0; i < plan->n; i++) {
+		const kv_shift_chunk *chunk = &plan->chunks[i];
+		int					  gap	= chunk->dst_pos - c->kv.n_pos;
+		if (gap > 0) {
+			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, "prefill", false);
+			total.us += part.us;
+			if (part.rc < 0) {
+				total.rc = part.rc;
+				return total;
+			}
+			n_fed += gap;
+		}
+		for (int t = 0; t < chunk->n_rows; t++)
+			fed_ids_append(c, tokens[chunk->dst_pos - base + t]);
+		c->kv.n_pos = chunk->dst_pos + chunk->n_rows;
+	}
+	int done = c->kv.n_pos - base;
+	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, "prefill", false);
+	total.rc = part.rc;
+	total.us += part.us;
+	n_fed += n_tokens - done;
+	total.tps = total.us > 0 ? n_fed * 1.0e6 / (double)total.us : part.tps;
+	return total;
+}
+
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
 	if (c->kv.n_pos >= c->n_ctx)
 		return ERR_INVALID_ARG;
@@ -1146,12 +1243,12 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 						  const sampler_params *samp,
 						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
 						  int show_pp_tg, const char *metrics_spec, uint64_t t_turn_start_us,
-						  bool *out_unfed_tail) {
+						  bool *out_unfed_tail, const kv_reuse_plan *plan) {
 	context_monitor_send_start(c);
 	bool prof_was_on = c->scratch.prof.enabled;
 
 	int32_t		   n_pos_before = c->kv.n_pos;
-	prefill_result pf			= context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
+	prefill_result pf			= context_prefill_with_plan(c, tokens, n_tokens, plan);
 	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",
@@ -1290,14 +1387,8 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	if (!tail_encode_ids(c, ids, &n))
 		goto restore_fail;
 
-	int32_t reuse = fed_ids_common_prefix(c, ids, n);
-	if (reuse < c->fed_ids.n) {
-		DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
-			  (int)c->fed_ids.n);
-		context_rewind(c, reuse);
-	} else {
-		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
-	}
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, ids, n, &plan);
 
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
@@ -1313,7 +1404,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	int	 generated =
 		run_generation(c, ids + reuse, n - reuse, max_tokens, samp,
 					   add_generation_prompt ? assistant_capture_cb : on_token, &acap, 1,
-					   metrics_spec ? metrics_spec : "pp,tg", t_turn_start, &unfed_tail);
+					   metrics_spec ? metrics_spec : "pp,tg", t_turn_start, &unfed_tail, &plan);
 
 	if (unfed_tail && acap.buf && acap.len > acap.last_piece_start) {
 		acap.len			  = acap.last_piece_start;
@@ -1383,13 +1474,12 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 	c->last_prompt_tokens = n;
 
 	fed_ids_sync(c);
-	int32_t reuse = fed_ids_common_prefix(c, ids, n);
-	if (reuse < c->fed_ids.n)
-		context_rewind(c, reuse);
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, ids, n, &plan);
 
 	bool unfed_tail = false;
 	return run_generation(c, ids + reuse, n - reuse, max_tokens, samp, on_token, ud, 1, "",
-						  t_turn_start, &unfed_tail);
+						  t_turn_start, &unfed_tail, &plan);
 }
 
 static void *idle_prefill_thread(void *arg) {

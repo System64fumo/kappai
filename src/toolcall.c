@@ -740,10 +740,9 @@ static json_object *coerce_arg_value(const char *p, size_t len) {
 }
 
 static void record_call(toolcall_scanner *sc, const char *name, json_object *args) {
-	json_object *tc = json_object_new_object();
-	json_set_int(tc, "index", (int)sc->n_calls);
-	uint64_t seq = atomic_fetch_add_explicit(&g_call_seq, 1, memory_order_relaxed);
-	char	 idbuf[64];
+	json_object *tc	 = json_object_new_object();
+	uint64_t	 seq = atomic_fetch_add_explicit(&g_call_seq, 1, memory_order_relaxed);
+	char		 idbuf[64];
 	snprintf(idbuf, sizeof(idbuf), "call_%llx_%016llx%03zu", (unsigned long long)time(NULL),
 			 (unsigned long long)seq, sc->n_calls);
 	json_set_str(tc, "id", idbuf);

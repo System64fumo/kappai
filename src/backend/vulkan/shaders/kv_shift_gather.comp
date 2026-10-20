@@ -1,0 +1,71 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer KCache {
+	uint kcache[];
+};
+layout(set = 0, binding = 1) readonly buffer VCache {
+	uint vcache[];
+};
+layout(set = 0, binding = 2) writeonly buffer KTmp {
+	float ktmp[];
+};
+layout(set = 0, binding = 3) writeonly buffer VTmp {
+	float vtmp[];
+};
+layout(set = 0, binding = 4) readonly buffer CosTbl {
+	float rcos[];
+};
+layout(set = 0, binding = 5) readonly buffer SinTbl {
+	float rsin[];
+};
+
+layout(push_constant) uniform Params {
+	uint layer_off;
+	int	 src_pos;
+	int	 n_kv_heads;
+	int	 head_dim;
+	int	 n_ctx;
+	int	 neox;
+	int	 tmp_row0;
+	int	 tbl_off;
+	int	 m_rows;
+}
+params;
+
+float load_elem(bool is_v, uint idx) {
+	uint w = is_v ? vcache[idx >> 1u] : kcache[idx >> 1u];
+	uint h = ((idx & 1u) != 0u) ? (w >> 16u) : (w & 0xFFFFu);
+	return unpackHalf2x16(h).x;
+}
+
+void main() {
+	int head_dim	= params.head_dim;
+	int half_dim	= head_dim / 2;
+	int total_pairs = params.n_kv_heads * half_dim;
+	int g			= int(gl_GlobalInvocationID.x);
+	if (g >= total_pairs * params.m_rows)
+		return;
+
+	int row = g / total_pairs;
+	int rem = g - row * total_pairs;
+	int kvh = rem / half_dim;
+	int j	= rem - kvh * half_dim;
+
+	uint row_base = params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(head_dim) +
+					uint(params.src_pos + row) * uint(head_dim);
+	int	 out_base = (params.tmp_row0 + row) * params.n_kv_heads * head_dim + kvh * head_dim;
+
+	int v0					= 2 * j;
+	vtmp[out_base + v0]		= load_elem(true, row_base + uint(v0));
+	vtmp[out_base + v0 + 1] = load_elem(true, row_base + uint(v0) + 1u);
+
+	int	  i0			= (params.neox != 0) ? j : 2 * j;
+	int	  i1			= (params.neox != 0) ? j + half_dim : 2 * j + 1;
+	float a				= load_elem(false, row_base + uint(i0));
+	float b				= load_elem(false, row_base + uint(i1));
+	float c				= rcos[params.tbl_off + j];
+	float s				= rsin[params.tbl_off + j];
+	ktmp[out_base + i0] = a * c - b * s;
+	ktmp[out_base + i1] = a * s + b * c;
+}

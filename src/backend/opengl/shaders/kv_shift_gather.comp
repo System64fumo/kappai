@@ -1,0 +1,79 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer KCacheBuf {
+	uint k_cache[];
+};
+layout(std430, binding = 1) readonly buffer VCacheBuf {
+	uint v_cache[];
+};
+layout(std430, binding = 2) writeonly buffer KTmpBuf {
+	float k_tmp[];
+};
+layout(std430, binding = 3) writeonly buffer VTmpBuf {
+	float v_tmp[];
+};
+layout(std430, binding = 4) readonly buffer CosBuf {
+	float rcos[];
+};
+layout(std430, binding = 5) readonly buffer SinBuf {
+	float rsin[];
+};
+
+layout(location = 0) uniform int u_src_pos;
+layout(location = 1) uniform int u_kvh_stride;
+layout(location = 2) uniform int u_row_stride;
+layout(location = 3) uniform int u_head_dim;
+layout(location = 4) uniform int u_kv_q8;
+layout(location = 5) uniform int u_neox;
+layout(location = 6) uniform int u_tmp_row0;
+layout(location = 7) uniform int u_tmp_row_stride;
+layout(location = 8) uniform int u_tbl_off;
+
+uint load_byte(bool is_v, uint byte_off) {
+	uint w = is_v ? v_cache[byte_off >> 2u] : k_cache[byte_off >> 2u];
+	return (w >> ((byte_off & 3u) << 3u)) & 0xFFu;
+}
+
+float load_elem(bool is_v, uint row_base, int e) {
+	if (u_kv_q8 == 0) {
+		uint idx = row_base + uint(e);
+		uint w	 = is_v ? v_cache[idx >> 1u] : k_cache[idx >> 1u];
+		uint h	 = ((idx & 1u) != 0u) ? (w >> 16u) : (w & 0xFFFFu);
+		return unpackHalf2x16(h).x;
+	}
+	uint  blk_off = row_base + uint(e >> 5) * 34u;
+	uint  d16	  = load_byte(is_v, blk_off) | (load_byte(is_v, blk_off + 1u) << 8u);
+	float d		  = unpackHalf2x16(d16).x;
+	uint  q		  = load_byte(is_v, blk_off + 2u + uint(e & 31));
+	int	  qi	  = int(q) - (((q & 0x80u) != 0u) ? 256 : 0);
+	return d * float(qi);
+}
+
+void main() {
+	int row		 = int(gl_WorkGroupID.x);
+	int kvh		 = int(gl_WorkGroupID.y);
+	int tid		 = int(gl_LocalInvocationID.x);
+	int head_dim = u_head_dim;
+	int half_dim = head_dim / 2;
+
+	uint row_base = uint(kvh) * uint(u_kvh_stride) + uint(u_src_pos + row) * uint(u_row_stride);
+	int	 out_off  = (u_tmp_row0 + row) * u_tmp_row_stride + kvh * head_dim;
+
+	for (int e = tid; e < head_dim; e += 64)
+		v_tmp[out_off + e] = load_elem(true, row_base, e);
+
+	for (int j = tid; j < half_dim; j += 64) {
+		int	  i0			= (u_neox != 0) ? j : 2 * j;
+		int	  i1			= (u_neox != 0) ? j + half_dim : 2 * j + 1;
+		float a				= load_elem(false, row_base, i0);
+		float b				= load_elem(false, row_base, i1);
+		float c				= rcos[u_tbl_off + j];
+		float s				= rsin[u_tbl_off + j];
+		k_tmp[out_off + i0] = a * c - b * s;
+		k_tmp[out_off + i1] = a * s + b * c;
+	}
+}

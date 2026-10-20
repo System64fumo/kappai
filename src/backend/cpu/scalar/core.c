@@ -2283,6 +2283,106 @@ __attribute__((weak)) status_code cpu_argmax(backend *self, const buffer *logits
 	return OK;
 }
 
+static void cpu_kv_load_head(const uint8_t *src, int q8, int head_dim, float *dst) {
+	if (!q8) {
+		const uint16_t *h = (const uint16_t *)src;
+		for (int i = 0; i < head_dim; i++)
+			dst[i] = f16_to_f32(h[i]);
+		return;
+	}
+	int n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+	for (int b = 0; b < n_blocks; b++) {
+		const uint8_t *blk = src + (size_t)b * KV_Q8_0_BLOCK_BYTES;
+		uint16_t	   d16;
+		memcpy(&d16, blk, sizeof(d16));
+		float d	   = f16_to_f32(d16);
+		int	  base = b * KV_Q8_0_BLOCK;
+		int	  n	   = head_dim - base < KV_Q8_0_BLOCK ? head_dim - base : KV_Q8_0_BLOCK;
+		for (int j = 0; j < n; j++)
+			dst[base + j] = d * (float)(int8_t)blk[2 + j];
+	}
+}
+
+static void cpu_kv_rotate_head(float *head, int head_dim, int neox, const float *cos_row,
+							   const float *sin_row) {
+	int half = head_dim / 2;
+	for (int j = 0; j < half; j++) {
+		int	  i0 = neox ? j : 2 * j;
+		int	  i1 = neox ? j + half : 2 * j + 1;
+		float a	 = head[i0];
+		float b	 = head[i1];
+		head[i0] = a * cos_row[j] - b * sin_row[j];
+		head[i1] = a * sin_row[j] + b * cos_row[j];
+	}
+}
+
+__attribute__((weak)) status_code cpu_kv_shift(backend *self, buffer *k, buffer *v, int layer,
+											   const kv_shift_chunk *chunks, int n_chunks,
+											   const float *cos_tbl, const float *sin_tbl,
+											   int n_kv_heads, int head_dim, int n_ctx,
+											   int n_kv_heads_active) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int		  half	   = head_dim / 2;
+	int		  q8	   = p->kv_quant == KV_QUANT_Q8_0;
+	if (n_chunks <= 0 || n_active <= 0 || half <= 0)
+		return OK;
+
+	size_t row_bytes =
+		q8 ? (((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * KV_Q8_0_BLOCK_BYTES
+		   : (size_t)head_dim * sizeof(uint16_t);
+	size_t rows		  = cpu_kv_layer_rows(p, layer, n_ctx);
+	size_t kvh_stride = rows * row_bytes;
+	size_t layer_base =
+		p->kv_layer_off ? p->kv_layer_off[layer] : (size_t)layer * (size_t)n_kv_heads * kvh_stride;
+	size_t base0	  = p->kv_base_pos ? p->kv_base_pos[layer] : 0;
+	size_t total_rows = 0;
+	for (int i = 0; i < n_chunks; i++) {
+		if ((size_t)chunks[i].src_pos < base0 && (size_t)chunks[i].dst_pos >= base0)
+			return ERR_UNSUPPORTED;
+		total_rows += (size_t)chunks[i].n_rows;
+	}
+
+	size_t row_floats = (size_t)n_active * (size_t)head_dim;
+	float *kt		  = xmalloc(total_rows * row_floats * sizeof(float));
+	float *vt		  = xmalloc(total_rows * row_floats * sizeof(float));
+	size_t r		  = 0;
+	for (int i = 0; i < n_chunks; i++) {
+		for (int t = 0; t < chunks[i].n_rows; t++, r++) {
+			size_t src = (size_t)(chunks[i].src_pos + t);
+			if (src < base0 || src - base0 >= rows)
+				continue;
+			size_t pos_off = (src - base0) * row_bytes;
+			for (int kvh = 0; kvh < n_active; kvh++) {
+				size_t off = layer_base + (size_t)kvh * kvh_stride + pos_off;
+				float *kh  = kt + r * row_floats + (size_t)kvh * head_dim;
+				float *vh  = vt + r * row_floats + (size_t)kvh * head_dim;
+				cpu_kv_load_head((const uint8_t *)k->handle + off, q8, head_dim, kh);
+				cpu_kv_load_head((const uint8_t *)v->handle + off, q8, head_dim, vh);
+				cpu_kv_rotate_head(kh, head_dim, self->rope_neox, cos_tbl + (size_t)i * half,
+								   sin_tbl + (size_t)i * half);
+			}
+		}
+	}
+
+	status_code st = OK;
+	r			   = 0;
+	for (int i = 0; i < n_chunks && st == OK; i++) {
+		for (int t = 0; t < chunks[i].n_rows && st == OK; t++, r++) {
+			size_t dst = (size_t)(chunks[i].dst_pos + t);
+			if (p->kv_base_pos && dst < p->kv_base_pos[layer])
+				continue;
+			buffer k_row = buffer_host_view(self, kt + r * row_floats, row_floats * sizeof(float));
+			buffer v_row = buffer_host_view(self, vt + r * row_floats, row_floats * sizeof(float));
+			st = self->kv_put(self, k, v, layer, (int)dst, &k_row, &v_row, n_kv_heads, head_dim,
+							  n_ctx, n_kv_heads_active);
+		}
+	}
+	free(kt);
+	free(vt);
+	return st;
+}
+
 __attribute__((weak)) status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx,
 												   int kv_lora, int qk_rope, buffer *kv_out) {
 	cpu_priv *p			= self->priv;
@@ -3675,6 +3775,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->kv_alloc						 = cpu_kv_alloc;
 	out->kv_put							 = cpu_kv_put;
 	out->kv_put_batch					 = cpu_kv_put_batch;
+	out->kv_shift						 = cpu_kv_shift;
 	out->embd_lookup					 = cpu_embd_lookup;
 	out->rmsnorm						 = cpu_rmsnorm;
 	out->matmul							 = cpu_matmul;

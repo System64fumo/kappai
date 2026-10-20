@@ -24,6 +24,7 @@ layout(location = 3) uniform int u_row_stride;
 layout(location = 4) uniform int u_head_dim;
 layout(location = 5) uniform int u_kv_q8;
 layout(location = 6) uniform int u_in_row_stride;
+layout(location = 7) uniform int u_in_row0;
 
 uint float_to_half(float f) {
 	uint fbits	  = floatBitsToUint(f);
@@ -67,7 +68,7 @@ void main() {
 	int tid		 = int(gl_LocalInvocationID.x);
 	int head_dim = u_head_dim;
 
-	int in_off = row * u_in_row_stride + kvh * head_dim;
+	int in_off = (u_in_row0 + row) * u_in_row_stride + kvh * head_dim;
 
 	uint row_base = uint(u_layer_off) + uint(kvh) * uint(u_kvh_stride) +
 					uint(u_pos_start + row) * uint(u_row_stride);

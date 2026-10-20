@@ -76,6 +76,9 @@ void kvcache_attn_view(const kvcache *c, const model *m, int exec_layer, int kv_
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in);
 
+bool		kvcache_can_shift(const kvcache *c, const model *m);
+status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks);
+
 status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
 							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
 							  int n_rows);
