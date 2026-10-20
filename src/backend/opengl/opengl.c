@@ -144,6 +144,7 @@ typedef struct gl_buf {
 	GLenum	 usage;
 	int		 device_dirty;
 	int		 host_dirty;
+	int		 scratch;
 } gl_buf;
 
 typedef struct {
@@ -1019,6 +1020,9 @@ static gl_buf *gl_scratch_pool_take(gl_priv *p, size_t size) {
 }
 
 static void gl_scratch_pool_release(gl_priv *p, gl_buf *b) {
+	for (int i = 0; i < p->scratch_pool_count; i++)
+		if (p->scratch_pool[i] == b)
+			return;
 	if (p->scratch_pool_count < GL_SCRATCH_POOL_CAP) {
 		p->scratch_pool[p->scratch_pool_count]		 = b;
 		p->scratch_pool_sizes[p->scratch_pool_count] = b->size_bytes;
@@ -1513,6 +1517,7 @@ static status_code gl_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 	b = gl_buf_alloc(p, size, GL_DYNAMIC_COPY, NULL);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
+	b->scratch	  = 1;
 	out->handle	  = b->host_mirror;
 	out->size	  = size;
 	out->host_ptr = NULL;
@@ -1547,7 +1552,7 @@ static void gl_buffer_free(backend *self, buffer *buf) {
 
 	if (b->usage == GL_KV_STORE_USAGE)
 		gl_kv_store_free(p, buf->handle);
-	else if (b->usage == GL_DYNAMIC_COPY)
+	else if (b->scratch)
 		gl_scratch_pool_release(p, b);
 	else
 		gl_buf_free(p, b);

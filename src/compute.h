@@ -110,8 +110,8 @@ typedef struct compute_scratch {
 	moe_expert_slot	  *moe_slot_dev;
 	expert_dev_scratch expert_dev;
 
-	layer_progress_cb			 layer_cb;
-	void						*layer_cb_ud;
+	layer_progress_cb			layer_cb;
+	void					   *layer_cb_ud;
 	const _Atomic sig_atomic_t *interrupt;
 
 	batch_scratch *bs;

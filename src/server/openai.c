@@ -59,14 +59,14 @@ typedef struct {
 } sse_frame;
 
 typedef struct {
-	openai_state  *st;
+	openai_state	  *st;
 	_Atomic(context *) sctx;
-	oa_req_params *params;
+	oa_req_params	  *params;
 
-	bool	 streaming;
-	bool	 chat_api;
-	bool	 same_session;
-	uint64_t session_key_at_start;
+	bool		streaming;
+	bool		chat_api;
+	bool		same_session;
+	uint64_t	session_key_at_start;
 	atomic_bool generation_done;
 
 	pthread_mutex_t q_mtx;
@@ -1356,7 +1356,8 @@ static void task_main(void) {
 	slot_record_catalog(st, t->slot);
 	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)", j->chat_api ? "chat" : "completion",
 		 g->prompt_tokens, g->generated, (double)(time_us() - j->t_start_us) / 1e6,
-		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected" : "completed");
+		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected"
+																	 : "completed");
 	job_free(st, j);
 	t->done = true;
 }
@@ -1491,7 +1492,8 @@ static void job_push(openai_state *st, oa_job *j) {
 
 static void job_wait_done(req_ctx *rc) {
 	pthread_mutex_lock(&rc->gen.q_mtx);
-	while (!rc->gen.generation_done && !atomic_load_explicit(&rc->gen.client_gone, memory_order_acquire))
+	while (!rc->gen.generation_done &&
+		   !atomic_load_explicit(&rc->gen.client_gone, memory_order_acquire))
 		pthread_cond_wait(&rc->gen.q_cv, &rc->gen.q_mtx);
 	pthread_mutex_unlock(&rc->gen.q_mtx);
 }

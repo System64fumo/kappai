@@ -33,6 +33,16 @@
 
 #define RECIPE_SLOT_NONE 0xFF
 
+#define OP_TOUCH_NONE 0
+#define OP_TOUCH_IN0 1
+#define OP_TOUCH_IN1 2
+#define OP_TOUCH_IN2 3
+#define OP_TOUCH_OUT 4
+#define OP_TOUCH_OUT1 5
+#define OP_TOUCH_OUT2_WQ 6
+#define OP_TOUCH_SLOT(s) (-(int)(s) - 1)
+#define OP_TOUCH_MAX 6
+
 #define RECIPE_NO_WEIGHT WIDX_NONE
 
 struct model;
@@ -282,6 +292,8 @@ typedef struct model_recipe {
 
 	layer_ctx_entry *layer_ctx;
 
+	struct model_plan *plan;
+
 	int max_intermediate;
 	int max_head_dim;
 	int max_kv_heads;
@@ -377,6 +389,17 @@ int		  recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, 
 int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
 						  uint8_t experts_in_slot, uint8_t out_slot);
 
+typedef struct model_plan model_plan;
+
+const recipe_op *recipe_layer_ops(const model_recipe *r, int li);
+const char		*recipe_op_missing_fn(const backend *a, op_kind kind);
+int				 recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
+								 int *n_writes);
+void			 recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops);
+void			 recipe_fuse_output_scale(recipe_op *ops, int n_ops, const struct model *m, int li);
+void			 recipe_refine_matmul_stages(recipe_op *ops, int n_ops);
+void			 recipe_batch_slot_mask(model_recipe *r, const struct model *m);
+
 void recipe_build_post_ops(model_recipe *r, const struct model *m);
 void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 
@@ -386,5 +409,6 @@ void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 	}
 
 int ple_device_path_possible(const struct model *m);
+int ple_build_dev_path_ok(backend *a, const struct model *m, int batched);
 
 #endif

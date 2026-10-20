@@ -90,6 +90,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_HCS]				 = "hcs",
 		[OPFAM_MEMPOOL]			 = "mempool",
 		[OPFAM_MOE_TIER]		 = "moe_tier",
+		[OPFAM_PLAN]			 = "plan",
 		[OPFAM_HC_INIT]			 = "hc_init",
 		[OPFAM_HC_PRE]			 = "hc_pre",
 		[OPFAM_HC_POST]			 = "hc_post",

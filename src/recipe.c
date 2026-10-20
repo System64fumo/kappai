@@ -8,6 +8,7 @@
 #include "moe/moe_exec.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
+#include "plan.h"
 
 #include <assert.h>
 #include <math.h>
@@ -51,7 +52,6 @@ static inline backend *op_backend_pick(backend *a, int has_field, const char *op
 }
 static stage		 matmul_substage(uint8_t w_idx);
 static void			 profile_weight_bytes(profile *prof, stage s, uint32_t w_type, int rows, int k);
-static void			 recipe_refine_matmul_stages(recipe_op *ops, int n_ops);
 static status_code	 exec_op(const recipe_op *op, struct model *m, struct kvcache *cache,
 							 struct compute_scratch *s, int token, int pos, int li, int flash_attn,
 							 float *logits_out);
@@ -72,6 +72,7 @@ static status_code	 batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n
 static uint32_t		 op_batch_slot_mask(const recipe_op *op);
 static status_code	 ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a, int n, int act,
 														int fused_stride, int n_rows);
+static void			 recipe_optimize(model_recipe *r, const struct model *m);
 
 static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 	if (ctx->bs)
@@ -259,7 +260,7 @@ static void resolve_matmul_dims(const layer_ctx_entry *lc, const model *m, uint8
 	}
 }
 
-static void recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops) {
+void recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops) {
 	for (int j = 0; j < n_ops; j++) {
 		recipe_op *op = &ops[j];
 		if (op->kind != OP_MATMUL || op->u.matmul.n == 0 || op->u.matmul.k == 0)
@@ -279,7 +280,7 @@ static void recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops) {
 
 static int model_has_sliding_layers(const model *m);
 
-static const recipe_op *recipe_layer_ops(const model_recipe *r, int li) {
+const recipe_op *recipe_layer_ops(const model_recipe *r, int li) {
 	return r->per_layer_ops ? &r->per_layer_ops[(size_t)li * r->layer.n_ops] : r->layer.ops;
 }
 
@@ -307,8 +308,6 @@ static status_code recipe_require_capability(const struct model *m, const backen
 		  op_name, a->name, allow_fallback ? " (no CPU fallback)" : "");
 	return allow_fallback ? ERR_FORMAT : ERR_UNSUPPORTED;
 }
-
-static const char *recipe_op_missing_fn(const backend *a, op_kind k);
 
 static status_code recipe_require_native(const model_recipe *r, const struct model *m,
 										 op_kind kind) {
@@ -361,70 +360,367 @@ typedef struct {
 	size_t		slot0;
 	size_t		slot1;
 	uint32_t	batch_extra_mask;
+	int8_t		reads[4];
+	int8_t		writes[4];
+	uint8_t		inplace_out_none;
 } op_requirement;
 
 #define OP_NO_SLOT ((size_t)-1)
 #define OP_FN_SLOT(fn) offsetof(backend, fn)
 
-static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] = {
-	[OP_EMBD_LOOKUP]	  = {"embd_lookup", OP_FN_SLOT(embd_lookup), OP_NO_SLOT},
-	[OP_SCALE_EMBEDDINGS] = {"scale_inplace", OP_FN_SLOT(scale_inplace), OP_NO_SLOT},
-	[OP_SCALE]			  = {"scale_inplace", OP_FN_SLOT(scale_inplace), OP_NO_SLOT},
-	[OP_RMSNORM]		  = {"rmsnorm", OP_FN_SLOT(rmsnorm), OP_NO_SLOT},
-	[OP_RMSNORM_PER_HEAD] = {"rmsnorm_per_head", OP_FN_SLOT(rmsnorm_per_head), OP_NO_SLOT},
-	[OP_RMSNORM_NOWEIGHT] = {"rmsnorm_noweight", OP_FN_SLOT(rmsnorm_noweight), OP_NO_SLOT},
-	[OP_RMSNORM_ADD]	  = {"rmsnorm_add", OP_FN_SLOT(rmsnorm_add), OP_NO_SLOT},
-	[OP_MATMUL]			  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT,
-							 (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V)},
-	[OP_MATMUL_MULTI]	  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT,
-							 (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V)},
-	[OP_MATMUL_RESIDUAL]  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT,
-							 (1u << RECIPE_SLOT_RESID_TMP)},
-	[OP_MATMUL_FFN_DOWN]  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT, (1u << RECIPE_SLOT_FFN_ACT)},
-	[OP_MLA_Q_PROJ]		  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT},
-	[OP_MLA_KV_PROJ]	  = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT},
-	[OP_MLA_QKV_PROJ_FUSED] = {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT},
-	[OP_MOE_ROUTER]			= {"matmul", OP_FN_SLOT(matmul), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
-								   (1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP)},
-	[OP_ROPE]				= {"rope", OP_FN_SLOT(rope), OP_NO_SLOT},
-	[OP_ROPE_QK_FUSED]		= {"rope_qk", OP_FN_SLOT(rope_qk), OP_FN_SLOT(rope)},
-	[OP_ROPE_EXT]			= {"rope_ext", OP_FN_SLOT(rope_ext), OP_FN_SLOT(rope)},
-	[OP_KV_PUT]				= {"kv_put", OP_FN_SLOT(kv_put), OP_NO_SLOT},
-	[OP_ATTENTION]			= {"attention", OP_FN_SLOT(attention), OP_NO_SLOT},
-	[OP_ADD]				= {"add_inplace", OP_FN_SLOT(add_inplace), OP_NO_SLOT},
-	[OP_FFN_ACTIVATE]		= {"ffn_activate", OP_FN_SLOT(ffn_activate), OP_NO_SLOT},
-	[OP_FFN_ACTIVATE_FUSED] = {"ffn_activate", OP_FN_SLOT(ffn_activate), OP_NO_SLOT},
-	[OP_FFN_ACTIVATE_EX]	= {"ffn_activate_ex", OP_FN_SLOT(ffn_activate_ex),
-							   OP_FN_SLOT(ffn_activate)},
-	[OP_SOFTCAP]			= {"softcap", OP_FN_SLOT(softcap), OP_NO_SLOT},
-	[OP_SPLIT_QGATE]		= {"split_qgate", OP_FN_SLOT(split_qgate), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_Q) |
-								   (1u << RECIPE_SLOT_HYB_GATE)},
-	[OP_PARTIAL_ROPE_QK]	= {"partial_rope_qk", OP_FN_SLOT(partial_rope_qk), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_K)},
-	[OP_ATTN_OUTPUT_GATE]	= {"attn_output_gate", OP_FN_SLOT(attn_output_gate), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_HYB_GATE)},
-	[OP_GATED_DELTA_NET]	= {"gated_delta_net", OP_FN_SLOT(gated_delta_net), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_HYB_GATE) |
-								   (1u << RECIPE_SLOT_HYB_ALPHA) | (1u << RECIPE_SLOT_HYB_BETA) |
-								   (1u << RECIPE_SLOT_XB2)},
-	[OP_HC_INIT]			= {"hc_init", OP_FN_SLOT(hc_init), OP_NO_SLOT},
-	[OP_HC_PRE]				= {"hc_pre", OP_FN_SLOT(hc_pre), OP_NO_SLOT},
-	[OP_HC_POST]			= {"hc_post", OP_FN_SLOT(hc_post), OP_NO_SLOT},
-	[OP_HC_FINAL]			= {"hc_final", OP_FN_SLOT(hc_final), OP_NO_SLOT},
-	[OP_KDA]				= {"kda", OP_FN_SLOT(kda), OP_NO_SLOT},
-	[OP_MLA_ABSORBED]		= {"mla_absorbed", OP_FN_SLOT(mla_absorbed), OP_NO_SLOT},
-	[OP_MOE_SHARED]			= {"moe_activate", OP_FN_SLOT(moe_activate), OP_NO_SLOT,
-							   (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
-								   (1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP)},
-	[OP_MOE_EXPERTS]		= {"moe_experts", OP_FN_SLOT(moe_experts_batch),
-							   OP_FN_SLOT(matmul_thread_local),
-							   (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
-								   (1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP)},
+static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
+	{
+		[OP_NONE]		 = {},
+		[OP_PLE_BUILD]	 = {},
+		[OP_EMBD_LOOKUP] = {.fn_name = "embd_lookup",
+							.slot0	 = OP_FN_SLOT(embd_lookup),
+							.slot1	 = OP_NO_SLOT,
+							.writes	 = {OP_TOUCH_OUT}},
+		[OP_SCALE_EMBEDDINGS] =
+			{
+				.fn_name		  = "scale_inplace",
+				.slot0			  = OP_FN_SLOT(scale_inplace),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_SCALE] =
+			{
+				.fn_name		  = "scale_inplace",
+				.slot0			  = OP_FN_SLOT(scale_inplace),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_RMSNORM] =
+			{
+				.fn_name = "rmsnorm",
+				.slot0	 = OP_FN_SLOT(rmsnorm),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_RMSNORM_PER_HEAD] =
+			{
+				.fn_name		  = "rmsnorm_per_head",
+				.slot0			  = OP_FN_SLOT(rmsnorm_per_head),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_RMSNORM_NOWEIGHT] =
+			{
+				.fn_name		  = "rmsnorm_noweight",
+				.slot0			  = OP_FN_SLOT(rmsnorm_noweight),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_RMSNORM_ADD] =
+			{
+				.fn_name = "rmsnorm_add",
+				.slot0	 = OP_FN_SLOT(rmsnorm_add),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_MATMUL] =
+			{
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+			},
+		[OP_MATMUL_MULTI] =
+			{
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2_WQ},
+			},
+		[OP_MATMUL_RESIDUAL] =
+			{
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_RESID_TMP),
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes			  = {OP_TOUCH_OUT},
+			},
+		[OP_MATMUL_FFN_DOWN] =
+			{
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_FFN_ACT),
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes			  = {OP_TOUCH_OUT},
+			},
+		[OP_MLA_Q_PROJ] =
+			{
+				.fn_name = "matmul",
+				.slot0	 = OP_FN_SLOT(matmul),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE)},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE)},
+			},
+		[OP_MLA_KV_PROJ] =
+			{
+				.fn_name = "matmul",
+				.slot0	 = OP_FN_SLOT(matmul),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+			},
+		[OP_MLA_QKV_PROJ_FUSED] =
+			{
+				.fn_name = "matmul",
+				.slot0	 = OP_FN_SLOT(matmul),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE),
+							OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE),
+							OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+			},
+		[OP_MOE_ROUTER] =
+			{
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
+									(1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_ROUTER_W)},
+			},
+		[OP_ROPE] =
+			{
+				.fn_name		  = "rope",
+				.slot0			  = OP_FN_SLOT(rope),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_ROPE_QK_FUSED] =
+			{
+				.fn_name = "rope_qk",
+				.slot0	 = OP_FN_SLOT(rope_qk),
+				.slot1	 = OP_FN_SLOT(rope),
+				.reads	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+			},
+		[OP_ROPE_EXT] =
+			{
+				.fn_name		  = "rope_ext",
+				.slot0			  = OP_FN_SLOT(rope_ext),
+				.slot1			  = OP_FN_SLOT(rope),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_KV_PUT] =
+			{
+				.fn_name = "kv_put",
+				.slot0	 = OP_FN_SLOT(kv_put),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			},
+		[OP_ATTENTION] =
+			{
+				.fn_name = "attention",
+				.slot0	 = OP_FN_SLOT(attention),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_ATTENTION_MLA] =
+			{
+				.fn_name = "attention",
+				.slot0	 = OP_FN_SLOT(attention),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_MLA_ABSORBED] =
+			{
+				.fn_name = "mla_absorbed",
+				.slot0	 = OP_FN_SLOT(mla_absorbed),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_ADD] =
+			{
+				.fn_name = "add_inplace",
+				.slot0	 = OP_FN_SLOT(add_inplace),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_IN0},
+			},
+		[OP_SWAP] =
+			{
+				.reads	= {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			},
+		[OP_FFN_ACTIVATE] =
+			{
+				.fn_name = "ffn_activate",
+				.slot0	 = OP_FN_SLOT(ffn_activate),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_FFN_ACTIVATE_EX] =
+			{
+				.fn_name = "ffn_activate_ex",
+				.slot0	 = OP_FN_SLOT(ffn_activate_ex),
+				.slot1	 = OP_FN_SLOT(ffn_activate),
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_FFN_ACTIVATE_FUSED] =
+			{
+				.fn_name = "ffn_activate",
+				.slot0	 = OP_FN_SLOT(ffn_activate),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE),
+							OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_SOFTCAP] =
+			{
+				.fn_name		  = "softcap",
+				.slot0			  = OP_FN_SLOT(softcap),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+				.inplace_out_none = 1,
+			},
+		[OP_SPLIT_QGATE] =
+			{
+				.fn_name		  = "split_qgate",
+				.slot0			  = OP_FN_SLOT(split_qgate),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) |
+									(1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_HYB_GATE),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_HYB_GATE)},
+			},
+		[OP_PARTIAL_ROPE_QK] =
+			{
+				.fn_name		  = "partial_rope_qk",
+				.slot0			  = OP_FN_SLOT(partial_rope_qk),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_K),
+				.reads			  = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.writes			  = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+			},
+		[OP_ATTN_OUTPUT_GATE] =
+			{
+				.fn_name		  = "attn_output_gate",
+				.slot0			  = OP_FN_SLOT(attn_output_gate),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_GATE),
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HYB_GATE)},
+				.writes			  = {OP_TOUCH_IN0},
+			},
+		[OP_GATED_DELTA_NET] =
+			{
+				.fn_name		  = "gated_delta_net",
+				.slot0			  = OP_FN_SLOT(gated_delta_net),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_HYB_GATE) |
+									(1u << RECIPE_SLOT_HYB_ALPHA) | (1u << RECIPE_SLOT_HYB_BETA) |
+									(1u << RECIPE_SLOT_XB2),
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2,
+									 OP_TOUCH_SLOT(RECIPE_SLOT_HYB_BETA)},
+				.writes			  = {OP_TOUCH_OUT},
+			},
+		[OP_SHORTCONV] =
+			{
+				.reads	= {OP_TOUCH_IN0},
+				.writes = {OP_TOUCH_OUT},
+			},
+		[OP_HC_INIT] =
+			{
+				.fn_name = "hc_init",
+				.slot0	 = OP_FN_SLOT(hc_init),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_HC_PRE] =
+			{
+				.fn_name = "hc_pre",
+				.slot0	 = OP_FN_SLOT(hc_pre),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF), OP_TOUCH_OUT},
+			},
+		[OP_HC_POST] =
+			{
+				.fn_name = "hc_post",
+				.slot0	 = OP_FN_SLOT(hc_post),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF)},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_HC_FINAL] =
+			{
+				.fn_name = "hc_final",
+				.slot0	 = OP_FN_SLOT(hc_final),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_KDA] =
+			{
+				.fn_name = "kda",
+				.slot0	 = OP_FN_SLOT(kda),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
+			},
+		[OP_LOGITS_READBACK] =
+			{
+				.reads = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			},
+		[OP_PLE_PROJ_INJECT] =
+			{
+				.reads	= {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			},
+		[OP_MOE_SHARED] =
+			{
+				.fn_name		  = "moe_activate",
+				.slot0			  = OP_FN_SLOT(moe_activate),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
+									(1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
+			},
+		[OP_MOE_EXPERTS] =
+			{
+				.fn_name		  = "moe_experts",
+				.slot0			  = OP_FN_SLOT(moe_experts_batch),
+				.slot1			  = OP_FN_SLOT(matmul_thread_local),
+				.batch_extra_mask = (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
+									(1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP),
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+				.writes			  = {OP_TOUCH_OUT},
+			},
 };
 
-static const char *recipe_op_missing_fn(const backend *a, op_kind k) {
+const char *recipe_op_missing_fn(const backend *a, op_kind k) {
 	if ((int)k < 0 || k >= OP_KIND_COUNT)
 		return NULL;
 	const op_requirement *req = &OP_REQUIREMENTS[k];
@@ -438,11 +734,48 @@ static const char *recipe_op_missing_fn(const backend *a, op_kind k) {
 	return req->fn_name;
 }
 
+static void touch_push(uint8_t *list, int *n, uint8_t slot) {
+	if (slot == RECIPE_SLOT_NONE || *n >= OP_TOUCH_MAX)
+		return;
+	for (int i = 0; i < *n; i++)
+		if (list[i] == slot)
+			return;
+	list[(*n)++] = slot;
+}
+
+static uint8_t touch_resolve(int8_t t, const recipe_op *op, uint8_t inplace_out_none) {
+	if (t < 0)
+		return (uint8_t)(-t - 1);
+	if (t <= OP_TOUCH_IN2)
+		return op->in[t - 1];
+	if (t == OP_TOUCH_OUT) {
+		uint8_t slot = op->out;
+		if (slot == RECIPE_SLOT_NONE && inplace_out_none)
+			slot = op->in[0];
+		return slot;
+	}
+	if (t == OP_TOUCH_OUT1)
+		return (uint8_t)(op->out + 1);
+	if (op->w_idx != WIDX_WQ)
+		return RECIPE_SLOT_NONE;
+	return (uint8_t)(op->out + 2);
+}
+
+int recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
+					int *n_writes) {
+	if (op->kind < 0 || op->kind >= OP_KIND_COUNT)
+		return 0;
+	const op_requirement *req = &OP_REQUIREMENTS[op->kind];
+	for (int i = 0; i < 4 && req->reads[i]; i++)
+		touch_push(reads, n_reads, touch_resolve(req->reads[i], op, req->inplace_out_none));
+	for (int i = 0; i < 4 && req->writes[i]; i++)
+		touch_push(writes, n_writes, touch_resolve(req->writes[i], op, req->inplace_out_none));
+	return 1;
+}
+
 static int matmul_type_ok(const backend *a, uint32_t t) {
 	return !a->matmul_type_native || a->matmul_type_native((backend *)a, t);
 }
-
-static int ple_build_dev_path_ok(backend *a, const struct model *m, int batched);
 
 static int ple_build_dev_path_cached(const struct model *m, backend *a, int batched) {
 	if (!m->mixed_backend_mode && a == m->backend && m->recipe)
@@ -450,44 +783,7 @@ static int ple_build_dev_path_cached(const struct model *m, backend *a, int batc
 	return ple_build_dev_path_ok(a, m, batched);
 }
 
-static void recipe_scan_op(const struct model *m, const backend *a, const recipe_op *op) {
-	op_kind k = op->kind;
-	if (k == OP_PLE_BUILD) {
-		int native = ple_build_dev_path_ok((backend *)a, m, 1);
-		if (!native)
-			backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE, NULL);
-		return;
-	}
-	if (k == OP_FFN_ACTIVATE_FUSED && !backend_has_cap(a, BCAP_IS_HOST) &&
-		!a->ffn_activate_fused_batch)
-		backend_report_host_fallback(a, "ffn_activate_fused", HFB_BATCH_DESIGN, NULL);
-	const char *fn = recipe_op_missing_fn(a, k);
-	if (fn)
-		backend_report_host_fallback(a, fn, HFB_OP_NOT_NATIVE, NULL);
-}
-
-static void recipe_scan_missing(const model_recipe *r, const struct model *m) {
-	const backend *a = m->backend;
-	if (!a)
-		return;
-	for (int i = 0; i < r->n_pre_ops; i++)
-		recipe_scan_op(m, a, &r->pre_ops[i]);
-	const int n_variants			 = r->per_layer_ops ? m->n_layers : 1;
-	bool	  scanned[OP_KIND_COUNT] = {false};
-	for (int li = 0; li < n_variants; li++) {
-		const recipe_op *ops = recipe_layer_ops(r, li);
-		for (int i = 0; i < r->layer.n_ops; i++) {
-			if (scanned[ops[i].kind])
-				continue;
-			scanned[ops[i].kind] = true;
-			recipe_scan_op(m, a, &ops[i]);
-		}
-	}
-	for (int i = 0; i < r->n_post_ops; i++)
-		recipe_scan_op(m, a, &r->post_ops[i]);
-}
-
-static void recipe_fuse_output_scale(recipe_op *ops, int n_ops, const struct model *m, int li) {
+void recipe_fuse_output_scale(recipe_op *ops, int n_ops, const struct model *m, int li) {
 	for (int j = 0; j < n_ops; j++) {
 		recipe_op *op = &ops[j];
 		if (op->kind != OP_SCALE)
@@ -549,13 +845,6 @@ model_recipe *recipe_build(const struct model *m) {
 			  m->moe.n_experts_used, MOE_MAX_TOPK);
 
 	int has_vld = m->arch_info->has_variable_layer_dims;
-
-	recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
-	if (r->per_layer_ops) {
-		for (int li = 0; li < m->n_layers; li++)
-			recipe_coalesce_matmul_runs(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
-										r->layer.n_ops);
-	}
 
 	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
 	for (int li = 0; li < m->n_layers; li++) {
@@ -651,22 +940,46 @@ model_recipe *recipe_build(const struct model *m) {
 					op->u.attention.kv_layer		  = lc->kv_layer;
 				}
 			}
-			recipe_fuse_output_scale(dst, n_ops, m, li);
-			recipe_coalesce_matmul_runs(dst, n_ops);
 		}
 	}
 
+	r->has_sliding_layers	  = model_has_sliding_layers(m);
+	r->ple_build_dev_ok		  = ple_build_dev_path_ok(m->backend, m, 0);
+	r->ple_build_dev_ok_batch = ple_build_dev_path_ok(m->backend, m, 1);
+
+	recipe_optimize(r, m);
+	plan_fuse_residuals(r, m);
+
+	if (recipe_check_backend_capabilities(r, m) != OK) {
+		recipe_free(r);
+		return NULL;
+	}
+
+	plan_attach(r, m);
+	backend_fallback_report();
+
+	return r;
+}
+
+static void recipe_optimize(model_recipe *r, const struct model *m) {
+	recipe_refine_matmul_stages(r->layer.ops, r->layer.n_ops);
+	recipe_coalesce_matmul_runs(r->layer.ops, r->layer.n_ops);
 	for (int i = 0; i < r->n_pre_ops; i++)
 		recipe_refine_matmul_stages(&r->pre_ops[i], 1);
-	recipe_refine_matmul_stages(r->layer.ops, r->layer.n_ops);
 	for (int i = 0; i < r->n_post_ops; i++)
 		recipe_refine_matmul_stages(&r->post_ops[i], 1);
 	if (r->per_layer_ops && m->n_layers > 0 && r->layer.n_ops > 0) {
-		for (int li = 0; li < m->n_layers; li++)
-			recipe_refine_matmul_stages(&r->per_layer_ops[(size_t)li * r->layer.n_ops],
-										r->layer.n_ops);
+		for (int li = 0; li < m->n_layers; li++) {
+			recipe_op *dst = &r->per_layer_ops[(size_t)li * r->layer.n_ops];
+			recipe_fuse_output_scale(dst, r->layer.n_ops, m, li);
+			recipe_refine_matmul_stages(dst, r->layer.n_ops);
+			recipe_coalesce_matmul_runs(dst, r->layer.n_ops);
+		}
 	}
+	recipe_batch_slot_mask(r, m);
+}
 
+void recipe_batch_slot_mask(model_recipe *r, const struct model *m) {
 	uint32_t bs_mask = 0;
 	for (int i = 0; i < r->n_pre_ops; i++)
 		bs_mask |= op_batch_slot_mask(&r->pre_ops[i]);
@@ -681,20 +994,6 @@ model_recipe *recipe_build(const struct model *m) {
 			bs_mask |= op_batch_slot_mask(&r->layer.ops[j]);
 	}
 	r->bs_slot_mask = bs_mask;
-
-	r->has_sliding_layers	  = model_has_sliding_layers(m);
-	r->ple_build_dev_ok		  = ple_build_dev_path_ok(m->backend, m, 0);
-	r->ple_build_dev_ok_batch = ple_build_dev_path_ok(m->backend, m, 1);
-
-	if (recipe_check_backend_capabilities(r, m) != OK) {
-		recipe_free(r);
-		return NULL;
-	}
-
-	recipe_scan_missing(r, m);
-	backend_fallback_report();
-
-	return r;
 }
 
 void recipe_free(model_recipe *r) {
@@ -705,6 +1004,7 @@ void recipe_free(model_recipe *r) {
 	free(r->post_ops);
 	free(r->per_layer_ops);
 	free(r->layer_ctx);
+	plan_free(r->plan);
 	memset(r, 0, sizeof(*r));
 	free(r);
 }
@@ -895,7 +1195,7 @@ static int matmul_op_uses_substage(op_kind k) {
 		   k == OP_MATMUL_FFN_DOWN;
 }
 
-static void recipe_refine_matmul_stages(recipe_op *ops, int n_ops) {
+void recipe_refine_matmul_stages(recipe_op *ops, int n_ops) {
 	for (int i = 0; i < n_ops; i++) {
 		recipe_op *op = &ops[i];
 		if (!matmul_op_uses_substage(op->kind) || op->stage != STAGE_MATMUL)
@@ -1137,7 +1437,7 @@ static int ple_build_dev_caps_ok(backend *a, const struct model *m, int batched)
 		   matmul_type_ok(a, m->layer_dims.per_layer_model_proj.type);
 }
 
-static int ple_build_dev_path_ok(backend *a, const struct model *m, int batched) {
+int ple_build_dev_path_ok(backend *a, const struct model *m, int batched) {
 	return ple_build_dev_caps_ok(a, m, batched) && m->layer_dims.per_layer_model_proj.buf.handle &&
 		   m->layer_dims.per_layer_tok_embd.buf.handle;
 }
@@ -1772,7 +2072,9 @@ static status_code op_matmul_ffn_down(exec_ctx *ctx) {
 	profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wt, n, k);
 	if (exec_is_batch(ctx)) {
 		ps = profile_begin(prof, ctx->op->stage);
-		if (a->matmul_ffn_down_batch && backend_has_cap(a, BCAP_MATMUL_FFN_DOWN)) {
+		int fused_batch =
+			(a->matmul_ffn_down_batch && backend_has_cap(a, BCAP_MATMUL_FFN_DOWN)) ? 1 : 0;
+		if (fused_batch) {
 			st = a->matmul_ffn_down_batch(a, w, wt, exec_slot(ctx, ctx->op->in[0]),
 										  exec_slot(ctx, ctx->op->in[1]),
 										  exec_slot(ctx, ctx->op->out), n, k, act, ctx->n_rows);
@@ -1787,7 +2089,8 @@ static status_code op_matmul_ffn_down(exec_ctx *ctx) {
 		profile_end(prof, &ps);
 		return st;
 	}
-	if (a->matmul_ffn_down && backend_has_cap(a, BCAP_MATMUL_FFN_DOWN)) {
+	int ffd = (a->matmul_ffn_down && backend_has_cap(a, BCAP_MATMUL_FFN_DOWN)) ? 1 : 0;
+	if (ffd) {
 		ps = profile_begin(prof, ctx->op->stage);
 		st = a->matmul_ffn_down(a, w, wt, exec_slot(ctx, ctx->op->in[0]),
 								exec_slot(ctx, ctx->op->in[1]), exec_slot(ctx, ctx->op->out), n, k,
@@ -2019,7 +2322,8 @@ static status_code op_ffn_activate_fused(exec_ctx *ctx) {
 				return st;
 			}
 		}
-		if (!backend_has_cap(a, BCAP_IS_HOST)) {
+		int dev_fallback = !backend_has_cap(a, BCAP_IS_HOST);
+		if (dev_fallback) {
 			backend_report_host_fallback(
 				a, "ffn_activate_fused", HFB_BATCH_DESIGN,
 				"batch prefill stages gate/up activation through host memory");
@@ -2231,7 +2535,8 @@ static status_code op_rmsnorm_add(exec_ctx *ctx) {
 			}
 		}
 	} else {
-		if (a->rmsnorm_add && backend_has_cap(a, BCAP_RMSNORM_ADD)) {
+		int fused = (a->rmsnorm_add && backend_has_cap(a, BCAP_RMSNORM_ADD)) ? 1 : 0;
+		if (fused) {
 			st =
 				a->rmsnorm_add(a, exec_slot(ctx, ctx->op->in[0]), w, exec_slot(ctx, ctx->op->in[1]),
 							   exec_slot(ctx, ctx->op->out), n, ctx->op->u.rmsnorm.eps, out_scale);
@@ -2675,30 +2980,34 @@ static uint32_t op_batch_slot_mask(const recipe_op *op) {
 	return m & ((RECIPE_SLOT_MAX >= 32) ? 0xffffffffu : ((1u << RECIPE_SLOT_MAX) - 1u));
 }
 
-static void bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
+static int bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
 	bs_pair *p	   = &bs->pair[slot];
 	size_t	 bytes = n_elems * sizeof(float);
 
 	if (!backend_has_cap(owner, BCAP_IS_HOST)) {
 		if (p->b.owner == owner && p->b.handle && p->b.size >= bytes)
-			return;
+			return 0;
 		if (p->b.handle && p->b.owner && !backend_has_cap(p->b.owner, BCAP_IS_HOST))
 			p->b.owner->buffer_free(p->b.owner, &p->b);
 		memset(&p->b, 0, sizeof(p->b));
 		owner->buffer_alloc_scratch(owner, bytes, &p->b);
-	} else {
-		if (p->b.handle && p->b.owner && p->b.owner != owner &&
-			!backend_has_cap(p->b.owner, BCAP_IS_HOST)) {
-			p->b.owner->buffer_free(p->b.owner, &p->b);
-			memset(&p->b, 0, sizeof(p->b));
-		}
-		float_buf_ensure_nocopy(&p->fb, n_elems, 64);
-		p->b.handle	  = p->fb.p;
-		p->b.host_ptr = p->fb.p;
-		p->b.size	  = bytes;
-		p->b.offset	  = 0;
-		p->b.owner	  = owner;
+		return 1;
 	}
+	if (p->b.handle && p->b.owner && p->b.owner != owner &&
+		!backend_has_cap(p->b.owner, BCAP_IS_HOST)) {
+		p->b.owner->buffer_free(p->b.owner, &p->b);
+		memset(&p->b, 0, sizeof(p->b));
+	}
+	int	   existed = p->b.handle != NULL;
+	size_t old_cap = p->fb.cap;
+	float_buf_ensure_nocopy(&p->fb, n_elems, 64);
+	int fresh	  = !existed || p->fb.cap > old_cap;
+	p->b.handle	  = p->fb.p;
+	p->b.host_ptr = p->fb.p;
+	p->b.size	  = bytes;
+	p->b.offset	  = 0;
+	p->b.owner	  = owner;
+	return fresh;
 }
 
 static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int intermediate,
@@ -2727,7 +3036,9 @@ static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int inte
 static void batch_scratch_alloc(batch_scratch *bs, backend *owner, int m, int dim, int q_out,
 								int kv_out, int intermediate, int attn_buf_size,
 								uint32_t slot_mask) {
-	int ffn_act_size = intermediate > dim ? intermediate : dim;
+	int	   ffn_act_size = intermediate > dim ? intermediate : dim;
+	size_t alloc_bytes = 0, total_bytes = 0;
+	int	   fresh_alloc = 0;
 	for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++) {
 		if (!bs_slot_info[slot].valid)
 			continue;
@@ -2735,9 +3046,17 @@ static void batch_scratch_alloc(batch_scratch *bs, backend *owner, int m, int di
 			continue;
 		size_t elems = bs_slot_elems((uint8_t)slot, m, q_out, kv_out, intermediate, attn_buf_size,
 									 ffn_act_size);
-		if (elems)
-			bs_ensure_slot(bs, owner, (uint8_t)slot, elems);
+		if (!elems)
+			continue;
+		total_bytes += elems * sizeof(float);
+		if (bs_ensure_slot(bs, owner, (uint8_t)slot, elems)) {
+			fresh_alloc = 1;
+			alloc_bytes += elems * sizeof(float);
+		}
 	}
+	if (fresh_alloc)
+		INFO("batch scratch: %zu B new, %zu B total (%zu MiB) for %d rows", alloc_bytes,
+			 total_bytes, total_bytes >> 20, m);
 }
 
 void batch_scratch_free(batch_scratch *bs) {
