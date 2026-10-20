@@ -11,6 +11,7 @@
 
 #include <assert.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1063,16 +1064,28 @@ typedef struct {
 static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
 static _Atomic int		g_op_fallback_n_seen;
 
-static void op_fallback_note(backend *a, const char *op_name) {
-	int n = atomic_load(&g_op_fallback_n_seen);
+static pthread_mutex_t g_op_fallback_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static bool op_fallback_seen_before(const backend *a, const char *op_name, int n) {
 	for (int i = 0; i < n && i < OP_FALLBACK_SEEN_MAX; i++)
 		if (g_op_fallback_seen[i].be == a && strcmp(g_op_fallback_seen[i].op, op_name) == 0)
-			return;
-	if (n >= OP_FALLBACK_SEEN_MAX)
+			return true;
+	return false;
+}
+
+static void op_fallback_note(backend *a, const char *op_name) {
+	if (op_fallback_seen_before(a, op_name, atomic_load(&g_op_fallback_n_seen)))
 		return;
+	pthread_mutex_lock(&g_op_fallback_mtx);
+	int n = atomic_load(&g_op_fallback_n_seen);
+	if (n >= OP_FALLBACK_SEEN_MAX || op_fallback_seen_before(a, op_name, n)) {
+		pthread_mutex_unlock(&g_op_fallback_mtx);
+		return;
+	}
 	g_op_fallback_seen[n].be = a;
 	g_op_fallback_seen[n].op = op_name;
 	atomic_store(&g_op_fallback_n_seen, n + 1);
+	pthread_mutex_unlock(&g_op_fallback_mtx);
 	backend_report_host_fallback(a, op_name, HFB_OP_NOT_NATIVE,
 								 "backend has no native '%s'; running on the host fallback",
 								 op_name);

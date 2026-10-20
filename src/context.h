@@ -13,6 +13,7 @@
 #include "tokenizer.h"
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 typedef struct {
 	model				  m;
@@ -24,7 +25,7 @@ typedef struct {
 	int					  n_ctx;
 	bool				  flash_attn;
 	bool				  debug_forward;
-	volatile sig_atomic_t interrupt;
+	_Atomic sig_atomic_t interrupt;
 	bool				  context_limit_hit;
 	bool				  session_poisoned;
 	bool				  debug_prompt;

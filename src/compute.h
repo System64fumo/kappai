@@ -2,6 +2,7 @@
 #define COMPUTE_H
 
 #include <signal.h>
+#include <stdatomic.h>
 
 #include "backend/backend.h"
 #include "common.h"
@@ -111,7 +112,7 @@ typedef struct compute_scratch {
 
 	layer_progress_cb			 layer_cb;
 	void						*layer_cb_ud;
-	const volatile sig_atomic_t *interrupt;
+	const _Atomic sig_atomic_t *interrupt;
 
 	batch_scratch *bs;
 	float_buf	   batch_logits_tmp;

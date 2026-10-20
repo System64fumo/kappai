@@ -137,6 +137,7 @@ static void progress_render(progress *p) {
 	if (n < 0)
 		return;
 
+	pthread_mutex_lock(&g_log_mtx);
 	int pad = p->last_len - n;
 	fputs(line, out);
 	for (int i = 0; i < pad; i++)
@@ -145,6 +146,7 @@ static void progress_render(progress *p) {
 
 	p->last_len			 = n;
 	g_progress_on_screen = (out == g_log.stream);
+	pthread_mutex_unlock(&g_log_mtx);
 }
 
 void progress_start(progress *p, const char *label, uint64_t total) {
@@ -174,6 +176,7 @@ void progress_finish(progress *p) {
 	if (!p->active)
 		return;
 	FILE *out = g_log.stream ? g_log.stream : stderr;
+	pthread_mutex_lock(&g_log_mtx);
 	fputc('\r', out);
 	for (int i = 0; i < p->last_len; i++)
 		fputc(' ', out);
@@ -181,5 +184,6 @@ void progress_finish(progress *p) {
 	fflush(out);
 	if (out == g_log.stream)
 		g_progress_on_screen = 0;
+	pthread_mutex_unlock(&g_log_mtx);
 	p->active = 0;
 }

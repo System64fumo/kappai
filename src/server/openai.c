@@ -60,14 +60,14 @@ typedef struct {
 
 typedef struct {
 	openai_state  *st;
-	context		  *sctx;
+	_Atomic(context *) sctx;
 	oa_req_params *params;
 
 	bool	 streaming;
 	bool	 chat_api;
 	bool	 same_session;
 	uint64_t session_key_at_start;
-	bool	 generation_done;
+	atomic_bool generation_done;
 
 	pthread_mutex_t q_mtx;
 	pthread_cond_t	q_cv;
@@ -76,7 +76,7 @@ typedef struct {
 	size_t			q_cap;
 	size_t			q_off;
 	bool			producer_done;
-	bool			client_gone;
+	atomic_bool		client_gone;
 
 	str_builder content;
 	str_builder reasoning;
@@ -250,7 +250,7 @@ static bool shutting_down(openai_state *st) {
 }
 
 static inline bool gen_dead(const oa_gen *g) {
-	return g->client_gone || shutting_down(g->st);
+	return atomic_load_explicit(&g->client_gone, memory_order_acquire) || shutting_down(g->st);
 }
 
 static char *extract_message_content(json_object *msg) {
@@ -587,7 +587,7 @@ static void gen_queue_done(oa_gen *g) {
 static void gen_mark_client_gone(oa_gen *g) {
 	pthread_mutex_lock(&g->q_mtx);
 	bool was_in_flight = !g->generation_done;
-	g->client_gone	   = true;
+	atomic_store_explicit(&g->client_gone, true, memory_order_release);
 	pthread_cond_broadcast(&g->q_cv);
 	pthread_mutex_unlock(&g->q_mtx);
 	if (was_in_flight && g->sctx)
@@ -1356,7 +1356,7 @@ static void task_main(void) {
 	slot_record_catalog(st, t->slot);
 	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)", j->chat_api ? "chat" : "completion",
 		 g->prompt_tokens, g->generated, (double)(time_us() - j->t_start_us) / 1e6,
-		 g->client_gone ? "client disconnected" : "completed");
+		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected" : "completed");
 	job_free(st, j);
 	t->done = true;
 }
@@ -1444,6 +1444,11 @@ static void admit_jobs(openai_state *st) {
 	}
 }
 
+static void slots_idle_prefill_wait(openai_state *st) {
+	for (int i = 0; i < st->n_slots; i++)
+		context_idle_prefill_wait(&st->slots[i].sess);
+}
+
 static void *worker_main(void *arg) {
 	openai_state *st = (openai_state *)arg;
 	for (;;) {
@@ -1454,6 +1459,7 @@ static void *worker_main(void *arg) {
 		if (st->n_tasks == 0 && shutting_down(st))
 			break;
 
+		slots_idle_prefill_wait(st);
 		admit_jobs(st);
 
 		for (int i = 0; i < st->n_tasks;) {
@@ -1485,7 +1491,7 @@ static void job_push(openai_state *st, oa_job *j) {
 
 static void job_wait_done(req_ctx *rc) {
 	pthread_mutex_lock(&rc->gen.q_mtx);
-	while (!rc->gen.generation_done && !rc->gen.client_gone)
+	while (!rc->gen.generation_done && !atomic_load_explicit(&rc->gen.client_gone, memory_order_acquire))
 		pthread_cond_wait(&rc->gen.q_cv, &rc->gen.q_mtx);
 	pthread_mutex_unlock(&rc->gen.q_mtx);
 }
@@ -1736,6 +1742,8 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	st->slots[0].owns	 = true;
 	st->slots[0].last_ns = time_us();
 	slot_warm(&st->slots[0].sess, args->warmup);
+	if (args->warmup && !st->slots[0].sess.session_poisoned)
+		context_idle_prefill_start(&st->slots[0].sess);
 	backend_release_thread(st->ctx->backend);
 
 	if (pthread_create(&st->worker, NULL, worker_main, st) != 0) {
