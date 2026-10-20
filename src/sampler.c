@@ -52,6 +52,34 @@ void sampler_init(sampler *s, uint64_t seed) {
 	s->recent		   = xmalloc(s->recent_capacity * sizeof(int32_t));
 }
 
+void sampler_clone(sampler *dst, const sampler *src) {
+	if (!src || !src->recent)
+		return;
+	sampler tmp = *src;
+	size_t	nb	= (size_t)src->recent_capacity * sizeof(int32_t);
+	tmp.recent	= xmalloc(nb);
+	memcpy(tmp.recent, src->recent, nb);
+	if (src->buf_vocab > 0) {
+		size_t sz	   = (size_t)src->buf_vocab * sizeof(float);
+		tmp.logits_buf = xmalloc(sz);
+		memcpy(tmp.logits_buf, src->logits_buf, sz);
+	}
+	if (src->cand_vocab > 0) {
+		size_t sz	 = (size_t)src->cand_vocab * sizeof(sampler_top_k_entry);
+		tmp.cand_buf = xmalloc(sz);
+		memcpy(tmp.cand_buf, src->cand_buf, sz);
+	}
+	if (src->heap_cap > 0) {
+		size_t sz		= (size_t)src->heap_cap * sizeof(float);
+		tmp.heap_scores = xmalloc(sz);
+		memcpy(tmp.heap_scores, src->heap_scores, sz);
+		sz			 = (size_t)src->heap_cap * sizeof(int32_t);
+		tmp.heap_idx = xmalloc(sz);
+		memcpy(tmp.heap_idx, src->heap_idx, sz);
+	}
+	*dst = tmp;
+}
+
 void sampler_free(sampler *s) {
 	free(s->recent);
 	free(s->logits_buf);

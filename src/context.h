@@ -13,6 +13,7 @@
 #include "tokenizer.h"
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 
 typedef struct {
 	model				  m;
@@ -24,7 +25,7 @@ typedef struct {
 	int					  n_ctx;
 	bool				  flash_attn;
 	bool				  debug_forward;
-	volatile sig_atomic_t interrupt;
+	_Atomic sig_atomic_t interrupt;
 	bool				  context_limit_hit;
 	bool				  session_poisoned;
 	bool				  debug_prompt;
@@ -60,6 +61,13 @@ typedef struct {
 
 	char   *sync_render;
 	int32_t sync_tok;
+
+	void (*yield)(void *ud);
+	void *yield_ud;
+
+	status_code (*decode_step)(void *ud, int32_t token, int pos, float *logits_out);
+	void *decode_step_ud;
+	bool  logits_on_host;
 } context;
 
 typedef struct {
@@ -81,7 +89,11 @@ void context_set_debug_prompt(context *c, bool enabled);
 
 status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);
+void		context_reset_session(context *c);
 void		context_reset(context *c);
+
+status_code context_slot_init(context *s, const context *e);
+void		context_slot_free(context *s);
 
 void context_monitor_send_start(context *c);
 

@@ -97,7 +97,10 @@ void config_usage(FILE *fp, bool is_server) {
 					"  --host <addr>            bind address (default: 127.0.0.1)\n"
 					"  --port <n>               listen port (default: 8080)\n"
 					"  --api-key <key>          require 'Authorization: Bearer <key>' on /v1 "
-					"requests\n");
+					"requests\n"
+					"  --slots <n>              max concurrent sessions; slots are created on\n"
+					"                           demand and each owns a full n_ctx KV cache "
+					"(default: 4)\n");
 	}
 
 	fprintf(fp,
@@ -134,9 +137,10 @@ void cli_args_defaults(cli_args *a) {
 	a->repeat_last_n  = 64;
 	a->output_stream  = true;
 	snprintf(a->metrics, sizeof(a->metrics), "pp,tg");
-	a->warmup	   = true;
-	a->server_host = "127.0.0.1";
-	a->server_port = 8080;
+	a->warmup		= true;
+	a->server_host	= "127.0.0.1";
+	a->server_port	= 8080;
+	a->server_slots = 4;
 }
 
 int parse_bool_token(const char *s) {
@@ -387,6 +391,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_HOST,
 		OPT_PORT,
 		OPT_API_KEY,
+		OPT_SLOTS,
 		OPT_REPEAT_PENALTY,
 		OPT_REPEAT_LAST_N
 	};
@@ -433,6 +438,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"host", OPT_HOST, CLI_OPT_STRING, &a->server_host, 0, 0},
 		{"port", OPT_PORT, CLI_OPT_PORT, NULL, 0, 0},
 		{"api-key", OPT_API_KEY, CLI_OPT_STRING, &a->server_api_key, 0, 0},
+		{"slots", OPT_SLOTS, CLI_OPT_INT, &a->server_slots, 1, 4096},
 		{"repeat-penalty", OPT_REPEAT_PENALTY, CLI_OPT_FLOAT, &a->repeat_penalty, 1e-6, 1000.0},
 		{"repeat-last-n", OPT_REPEAT_LAST_N, CLI_OPT_INT, &a->repeat_last_n, 0, INT_MAX},
 	};

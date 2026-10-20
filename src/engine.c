@@ -88,7 +88,7 @@ static void on_token_cb(int32_t id, const char *piece, int n, void *ud) {
 	}
 }
 
-static status_code prepare_system(context *c, const char *system, bool warmup) {
+status_code engine_prepare_system(context *c, const char *system, bool warmup) {
 	if (!c)
 		return ERR_INVALID_ARG;
 
@@ -161,7 +161,7 @@ static int run_one_shot(context *c, cli_args *a) {
 
 	if (!c->warmup_done) {
 		context_reset(c);
-		prepare_system(c, a->system, a->warmup);
+		engine_prepare_system(c, a->system, a->warmup);
 	}
 	c->warmup_done = false;
 
@@ -195,7 +195,7 @@ static int run_one_shot(context *c, cli_args *a) {
 static void reset_and_warmup(context *c, cli_args *a, const char *system) {
 	context_idle_prefill_wait(c);
 	context_reset(c);
-	prepare_system(c, system, a->warmup);
+	engine_prepare_system(c, system, a->warmup);
 	if (a->warmup && !c->session_poisoned)
 		context_idle_prefill_start(c);
 }
@@ -206,7 +206,7 @@ static int run_interactive(context *c, cli_args *a) {
 
 	if (!c->warmup_done) {
 		context_reset(c);
-		prepare_system(c, a->system, a->warmup);
+		engine_prepare_system(c, a->system, a->warmup);
 	}
 	c->warmup_done = false;
 

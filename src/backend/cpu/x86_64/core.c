@@ -1193,8 +1193,9 @@ static void cpu_attn_kvh_chunk_avx(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *out, int layer,
-									  int pos, int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+static status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_cache,
+									  const buffer *v_cache, buffer *out, int layer, int pos,
+									  int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									  int flash_attn, float scale, int sliding_window,
 									  int n_kv_heads_active) {
 	cpu_priv *p		   = self->priv;
@@ -1227,9 +1228,9 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 		size_t layer_base =
 			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
 		const uint8_t *kl_base =
-			(const uint8_t *)p->kv_k + layer_base + ((size_t)attn_start * elem_stride);
+			(const uint8_t *)k_cache->handle + layer_base + ((size_t)attn_start * elem_stride);
 		const uint8_t *vl_base =
-			(const uint8_t *)p->kv_v + layer_base + ((size_t)attn_start * elem_stride);
+			(const uint8_t *)v_cache->handle + layer_base + ((size_t)attn_start * elem_stride);
 
 		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
@@ -1274,8 +1275,8 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, buffer *ou
 	size_t layer_base	= p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
 										  : ((size_t)layer * layer_stride);
 
-	uint16_t *kl_base = p->kv_k + layer_base;
-	uint16_t *vl_base = p->kv_v + layer_base;
+	uint16_t *kl_base = (uint16_t *)k_cache->handle + layer_base;
+	uint16_t *vl_base = (uint16_t *)v_cache->handle + layer_base;
 	kl_base += (size_t)attn_start * hd_stride;
 	vl_base += (size_t)attn_start * hd_stride;
 
@@ -1320,20 +1321,17 @@ status_code cpu_attention(backend *self, const buffer *q, const buffer *k_cache,
 						  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
 						  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
 						  int n_kv_heads_active) {
-	(void)k_cache;
-	(void)v_cache;
-	return cpu_attention_impl(self, q, out, layer, pos, n_heads, n_kv_heads, head_dim, n_ctx,
-							  flash_attn, scale, 0, n_kv_heads_active);
+	return cpu_attention_impl(self, q, k_cache, v_cache, out, layer, pos, n_heads, n_kv_heads,
+							  head_dim, n_ctx, flash_attn, scale, 0, n_kv_heads_active);
 }
 
 status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_cache,
 							  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
 							  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
 							  int sliding_window, int n_kv_heads_active) {
-	(void)k_cache;
-	(void)v_cache;
-	return cpu_attention_impl(self, q, out, layer, pos, n_heads, n_kv_heads, head_dim, n_ctx,
-							  flash_attn, scale, sliding_window, n_kv_heads_active);
+	return cpu_attention_impl(self, q, k_cache, v_cache, out, layer, pos, n_heads, n_kv_heads,
+							  head_dim, n_ctx, flash_attn, scale, sliding_window,
+							  n_kv_heads_active);
 }
 
 static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
@@ -1377,7 +1375,8 @@ static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buffer *out, int layer,
+static status_code cpu_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
+											const buffer *v_cache, buffer *out, int layer,
 											int pos_start, int n_heads, int n_kv_heads,
 											int head_dim, int n_ctx, int flash_attn, float scale,
 											int sliding_window, int n_kv_heads_active, int m) {
@@ -1401,16 +1400,16 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, buff
 		kvh_stride		= rows * (size_t)hd_stride;
 		size_t layer_base =
 			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
-		kl_base_raw = (const uint8_t *)p->kv_k + layer_base;
-		vl_base_raw = (const uint8_t *)p->kv_v + layer_base;
+		kl_base_raw = (const uint8_t *)k_cache->handle + layer_base;
+		vl_base_raw = (const uint8_t *)v_cache->handle + layer_base;
 	} else {
 		hd_stride		  = head_dim;
 		layer_stride	  = (size_t)n_kv_heads * rows * hd_stride;
 		kvh_stride		  = rows * hd_stride;
 		size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
 											: ((size_t)layer * layer_stride);
-		kl_base_raw		  = p->kv_k + layer_base;
-		vl_base_raw		  = p->kv_v + layer_base;
+		kl_base_raw		  = (const uint16_t *)k_cache->handle + layer_base;
+		vl_base_raw		  = (const uint16_t *)v_cache->handle + layer_base;
 	}
 
 	cpu_attn_batch_job_avx job = {.kl_base		  = kl_base_raw,
@@ -1447,10 +1446,9 @@ status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_
 								const buffer *v_cache, buffer *out, int layer, int pos_start,
 								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 								int flash_attn, float scale, int n_kv_heads_active, int m) {
-	(void)k_cache;
-	(void)v_cache;
-	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
-									n_ctx, flash_attn, scale, 0, n_kv_heads_active, m);
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, 0,
+									n_kv_heads_active, m);
 }
 
 status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
@@ -1458,10 +1456,9 @@ status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer
 									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									int flash_attn, float scale, int sliding_window,
 									int n_kv_heads_active, int m) {
-	(void)k_cache;
-	(void)v_cache;
-	return cpu_attention_batch_impl(self, q, out, layer, pos_start, n_heads, n_kv_heads, head_dim,
-									n_ctx, flash_attn, scale, sliding_window, n_kv_heads_active, m);
+	return cpu_attention_batch_impl(self, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+									n_kv_heads, head_dim, n_ctx, flash_attn, scale, sliding_window,
+									n_kv_heads_active, m);
 }
 
 static void cpu_add_inplace_chunk_avx(int begin, int end, int tid, void *ctx) {
@@ -2094,34 +2091,29 @@ typedef struct {
 } x86_matmul_kernel;
 
 static const x86_matmul_kernel x86_kernel_by_type[GGML_TYPE_Q6_K_REPACKED + 1] = {
-	[GGML_TYPE_Q4_0] = {(x86_qonly_fn)matmul_q4_q8_qonly_f32, GGML_TYPE_Q8_0},
-	[GGML_TYPE_IQ4_NL] = {(x86_qonly_fn)matmul_iq4_nl_q8_qonly_f32, GGML_TYPE_Q8_0},
-	[GGML_TYPE_Q8_0] = {(x86_qonly_fn)matmul_q8_0_q8_qonly_f32, GGML_TYPE_Q8_0},
-	[GGML_TYPE_Q4_1] = {(x86_qonly_fn)matmul_q4_1_q8_qonly_f32, GGML_TYPE_Q8_1},
-	[GGML_TYPE_Q5_0] = {(x86_qonly_fn)matmul_q5_0_q8_qonly_f32, GGML_TYPE_Q8_0},
-	[GGML_TYPE_Q5_1] = {(x86_qonly_fn)matmul_q5_1_q8_qonly_f32, GGML_TYPE_Q8_1},
-	[GGML_TYPE_Q6_K] = {(x86_qonly_fn)matmul_q6_k_q8_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_Q4_K] = {(x86_qonly_fn)matmul_q4_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_Q5_K] = {(x86_qonly_fn)matmul_q5_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ3_S] = {(x86_qonly_fn)matmul_iq3_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ3_S_REPACKED] = {(x86_qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32,
+	[GGML_TYPE_Q4_0]			= {(x86_qonly_fn)matmul_q4_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_IQ4_NL]			= {(x86_qonly_fn)matmul_iq4_nl_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q8_0]			= {(x86_qonly_fn)matmul_q8_0_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q4_1]			= {(x86_qonly_fn)matmul_q4_1_q8_qonly_f32, GGML_TYPE_Q8_1},
+	[GGML_TYPE_Q5_0]			= {(x86_qonly_fn)matmul_q5_0_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q5_1]			= {(x86_qonly_fn)matmul_q5_1_q8_qonly_f32, GGML_TYPE_Q8_1},
+	[GGML_TYPE_Q6_K]			= {(x86_qonly_fn)matmul_q6_k_q8_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q4_K]			= {(x86_qonly_fn)matmul_q4_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q5_K]			= {(x86_qonly_fn)matmul_q5_k_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_S]			= {(x86_qonly_fn)matmul_iq3_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_S_REPACKED]	= {(x86_qonly_fn)matmul_iq3_s_repacked_q8_k_qonly_f32,
 								   GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ2_S] = {(x86_qonly_fn)matmul_iq2_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ2_XXS] = {(x86_qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ3_XXS] = {(x86_qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_IQ4_XS] = {(x86_qonly_fn)matmul_iq4_xs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
-	[GGML_TYPE_Q8_0_REPACKED] = {(x86_qonly_fn)matmul_q8_0_repacked_q8_qonly_f32,
-								 GGML_TYPE_Q8_0},
-	[GGML_TYPE_Q4_0_REPACKED] = {(x86_qonly_fn)matmul_q4_0_repacked_q8_qonly_f32,
-								 GGML_TYPE_Q8_0},
+	[GGML_TYPE_IQ2_S]			= {(x86_qonly_fn)matmul_iq2_s_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ2_XXS]			= {(x86_qonly_fn)matmul_iq2_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ3_XXS]			= {(x86_qonly_fn)matmul_iq3_xxs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_IQ4_XS]			= {(x86_qonly_fn)matmul_iq4_xs_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q8_0_REPACKED]	= {(x86_qonly_fn)matmul_q8_0_repacked_q8_qonly_f32, GGML_TYPE_Q8_0},
+	[GGML_TYPE_Q4_0_REPACKED]	= {(x86_qonly_fn)matmul_q4_0_repacked_q8_qonly_f32, GGML_TYPE_Q8_0},
 	[GGML_TYPE_IQ4_NL_REPACKED] = {(x86_qonly_fn)matmul_iq4_nl_repacked_q8_qonly_f32,
 								   GGML_TYPE_Q8_0},
-	[GGML_TYPE_Q4_K_REPACKED] = {(x86_qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32,
-								 GGML_TYPE_Q8_K},
-	[GGML_TYPE_Q5_K_REPACKED] = {(x86_qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32,
-								 GGML_TYPE_Q8_K},
-	[GGML_TYPE_Q6_K_REPACKED] = {(x86_qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32,
-								 GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q4_K_REPACKED] = {(x86_qonly_fn)matmul_q4_k_repacked_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q5_K_REPACKED] = {(x86_qonly_fn)matmul_q5_k_repacked_q8_k_qonly_f32, GGML_TYPE_Q8_K},
+	[GGML_TYPE_Q6_K_REPACKED] = {(x86_qonly_fn)matmul_q6_k_repacked_q8_k_qonly_f32, GGML_TYPE_Q8_K},
 };
 
 status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,

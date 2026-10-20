@@ -10,7 +10,7 @@
 #define CPU_BACKEND_CAPS                                                                           \
 	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
-	 BCAP_KV_POS_CAP)
+	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT)
 
 status_code cpu_backend_fill(backend *out);
 
@@ -75,9 +75,6 @@ typedef struct {
 	size_t kv_block_stride;
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
-
-	uint16_t *kv_k;
-	uint16_t *kv_v;
 
 	size_t *kv_layer_off;
 	size_t	kv_k_bytes;

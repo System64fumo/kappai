@@ -4712,18 +4712,17 @@ static int32_t iq2_xxs_block_tot(const void *b_, const int8_t *restrict q8) {
 	const uint8_t		*qs	 = (const uint8_t *)b->qs;
 	int32_t				 tot = 0;
 	for (int ib = 0; ib < 8; ib++) {
-		uint32_t	   aux[2];
+		uint32_t aux[2];
 		memcpy(aux, qs + (8 * ib), 8);
-		const uint8_t *a   = (const uint8_t *)aux;
-		uint32_t	   s   = aux[1];
-		__m256i		   wv  = iq_pack16(
-			 _mm_unpacklo_epi64(iq_flip8_u64(ggml_iq2xxs_grid[a[0]], ggml_ksigns_iq2xs[s & 127]),
-								iq_flip8_u64(ggml_iq2xxs_grid[a[1]],
-											 ggml_ksigns_iq2xs[(s >> 7) & 127])),
-			 _mm_unpacklo_epi64(iq_flip8_u64(ggml_iq2xxs_grid[a[2]],
-											 ggml_ksigns_iq2xs[(s >> 14) & 127]),
-								iq_flip8_u64(ggml_iq2xxs_grid[a[3]],
-											 ggml_ksigns_iq2xs[(s >> 21) & 127])));
+		const uint8_t *a  = (const uint8_t *)aux;
+		uint32_t	   s  = aux[1];
+		__m256i		   wv = iq_pack16(
+			_mm_unpacklo_epi64(
+				iq_flip8_u64(ggml_iq2xxs_grid[a[0]], ggml_ksigns_iq2xs[s & 127]),
+				iq_flip8_u64(ggml_iq2xxs_grid[a[1]], ggml_ksigns_iq2xs[(s >> 7) & 127])),
+			_mm_unpacklo_epi64(
+				iq_flip8_u64(ggml_iq2xxs_grid[a[2]], ggml_ksigns_iq2xs[(s >> 14) & 127]),
+				iq_flip8_u64(ggml_iq2xxs_grid[a[3]], ggml_ksigns_iq2xs[(s >> 21) & 127])));
 		tot += (1 + 2 * (int)(s >> 28)) * iq_dot32_avx2((const int8_t *)&wv, q8 + (ib * 32));
 	}
 	return tot;
@@ -4742,11 +4741,11 @@ static int32_t iq3_xxs_block_tot(const void *b_, const int8_t *restrict q8) {
 		uint64_t c1 = (uint64_t)ggml_iq3xxs_grid[q[2]] | ((uint64_t)ggml_iq3xxs_grid[q[3]] << 32);
 		uint64_t c2 = (uint64_t)ggml_iq3xxs_grid[q[4]] | ((uint64_t)ggml_iq3xxs_grid[q[5]] << 32);
 		uint64_t c3 = (uint64_t)ggml_iq3xxs_grid[q[6]] | ((uint64_t)ggml_iq3xxs_grid[q[7]] << 32);
-		__m256i	 wv = iq_pack16(
-			   _mm_unpacklo_epi64(iq_flip8_u64(c0, ggml_ksigns_iq2xs[saux & 127]),
-								  iq_flip8_u64(c1, ggml_ksigns_iq2xs[(saux >> 7) & 127])),
-			   _mm_unpacklo_epi64(iq_flip8_u64(c2, ggml_ksigns_iq2xs[(saux >> 14) & 127]),
-								  iq_flip8_u64(c3, ggml_ksigns_iq2xs[(saux >> 21) & 127])));
+		__m256i	 wv =
+			iq_pack16(_mm_unpacklo_epi64(iq_flip8_u64(c0, ggml_ksigns_iq2xs[saux & 127]),
+										 iq_flip8_u64(c1, ggml_ksigns_iq2xs[(saux >> 7) & 127])),
+					  _mm_unpacklo_epi64(iq_flip8_u64(c2, ggml_ksigns_iq2xs[(saux >> 14) & 127]),
+										 iq_flip8_u64(c3, ggml_ksigns_iq2xs[(saux >> 21) & 127])));
 		tot += (1 + 2 * (int)(saux >> 28)) * iq_dot32_avx2((const int8_t *)&wv, q8 + (ib * 32));
 	}
 	return tot;
@@ -4759,17 +4758,13 @@ static int32_t iq2_s_block_tot(const void *b_, const int8_t *restrict q8) {
 	const uint8_t	  *qh	 = b->qh;
 	int32_t			   tot	 = 0;
 	for (int ib = 0; ib < 8; ib++) {
-		uint8_t sb = b->scales[ib];
-		__m128i w01 =
-			_mm_unpacklo_epi64(iq_flip8_u64(ggml_iq2s_grid[qs[0] | ((qh[ib] << 8) & 0x300)],
-											signs[0]),
-							   iq_flip8_u64(ggml_iq2s_grid[qs[1] | ((qh[ib] << 6) & 0x300)],
-											signs[1]));
-		__m128i w23 =
-			_mm_unpacklo_epi64(iq_flip8_u64(ggml_iq2s_grid[qs[2] | ((qh[ib] << 4) & 0x300)],
-											signs[2]),
-							   iq_flip8_u64(ggml_iq2s_grid[qs[3] | ((qh[ib] << 2) & 0x300)],
-											signs[3]));
+		uint8_t sb	= b->scales[ib];
+		__m128i w01 = _mm_unpacklo_epi64(
+			iq_flip8_u64(ggml_iq2s_grid[qs[0] | ((qh[ib] << 8) & 0x300)], signs[0]),
+			iq_flip8_u64(ggml_iq2s_grid[qs[1] | ((qh[ib] << 6) & 0x300)], signs[1]));
+		__m128i w23 = _mm_unpacklo_epi64(
+			iq_flip8_u64(ggml_iq2s_grid[qs[2] | ((qh[ib] << 4) & 0x300)], signs[2]),
+			iq_flip8_u64(ggml_iq2s_grid[qs[3] | ((qh[ib] << 2) & 0x300)], signs[3]));
 		__m256i wv = iq_pack16(w01, w23);
 		tot += iq_dot32_dual16_avx2((const int8_t *)&wv, q8 + (ib * 32), 1 + 2 * (sb & 0xf),
 									1 + 2 * (sb >> 4));
@@ -4781,18 +4776,18 @@ static int32_t iq2_s_block_tot(const void *b_, const int8_t *restrict q8) {
 
 static int32_t iq4_xs_block_tot(const void *b_, const int8_t *restrict q8) {
 	const iq4_xs_block *b	= b_;
-	const __m128i	   lut	= _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
-	const __m128i	   nib	= _mm_set1_epi8(0x0f);
-	const uint8_t	  *qs	= b->qs;
-	int32_t			   tot	= 0;
+	const __m128i		lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+	const __m128i		nib = _mm_set1_epi8(0x0f);
+	const uint8_t	   *qs	= b->qs;
+	int32_t				tot = 0;
 	for (int ib = 0; ib < 8; ib++) {
-		int		   sl = (b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
-		int		   sh = (b->scales_h >> (2 * ib)) & 3;
-		int		   dl = (sl | (sh << 4)) - 32;
-		__m128i	   q  = _mm_loadu_si128((const __m128i *)(qs + (ib * 16)));
-		__m128i	   w0 = _mm_shuffle_epi8(lut, _mm_and_si128(q, nib));
-		__m128i	   w1 = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
-		__m256i	   wv = iq_pack16(w0, w1);
+		int		sl = (b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
+		int		sh = (b->scales_h >> (2 * ib)) & 3;
+		int		dl = (sl | (sh << 4)) - 32;
+		__m128i q  = _mm_loadu_si128((const __m128i *)(qs + (ib * 16)));
+		__m128i w0 = _mm_shuffle_epi8(lut, _mm_and_si128(q, nib));
+		__m128i w1 = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(q, 4), nib));
+		__m256i wv = iq_pack16(w0, w1);
 		tot += dl * iq_dot32_avx2((const int8_t *)&wv, q8 + (ib * 32));
 	}
 	return tot;
@@ -4802,7 +4797,7 @@ typedef int32_t (*iq_block_tot_fn)(const void *b, const int8_t *restrict q8);
 
 static void iq_run_rows(const void *w, size_t row_stride, int bpr, size_t block_size,
 						iq_block_tot_fn tot_fn, float factor, const q8_k_block *restrict xq,
-						float *restrict y, int n) {
+						float *restrict y, int		  n) {
 	const uint8_t *wb = w;
 	for (int i = 0; i < n; i++) {
 		const uint8_t *row	= wb + ((size_t)i * row_stride);
@@ -4812,8 +4807,8 @@ static void iq_run_rows(const void *w, size_t row_stride, int bpr, size_t block_
 			if (bi + 1 < bpr)
 				__builtin_prefetch(row + ((size_t)(bi + 1) * block_size), 0, 1);
 			int32_t tot = tot_fn(b, xq[bi].qs);
-			sumf = fmaf(factor * f16_to_f32_fast(*(const uint16_t *)b) * xq[bi].d, (float)tot,
-						sumf);
+			sumf =
+				fmaf(factor * f16_to_f32_fast(*(const uint16_t *)b) * xq[bi].d, (float)tot, sumf);
 		}
 		y[i] = sumf;
 	}
@@ -4825,8 +4820,8 @@ static void iq_qonly_dispatch(const void *w, int bpr, size_t block_size, iq_bloc
 	size_t row_stride = (size_t)bpr * block_size;
 	if (m <= 1 || row_stride == 0) {
 		for (int t = 0; t < m; t++)
-			iq_run_rows(w, row_stride, bpr, block_size, tot_fn, factor,
-						xq + ((size_t)t * xs), y + ((size_t)t * ys), n);
+			iq_run_rows(w, row_stride, bpr, block_size, tot_fn, factor, xq + ((size_t)t * xs),
+						y + ((size_t)t * ys), n);
 		return;
 	}
 	int nb = (int)(((size_t)128 << 10) / row_stride);
@@ -4836,8 +4831,8 @@ static void iq_qonly_dispatch(const void *w, int bpr, size_t block_size, iq_bloc
 		int			   nn = (n - i0) < nb ? (n - i0) : nb;
 		const uint8_t *wp = (const uint8_t *)w + ((size_t)i0 * row_stride);
 		for (int t = 0; t < m; t++)
-			iq_run_rows(wp, row_stride, bpr, block_size, tot_fn, factor,
-						xq + ((size_t)t * xs), y + ((size_t)t * ys) + i0, nn);
+			iq_run_rows(wp, row_stride, bpr, block_size, tot_fn, factor, xq + ((size_t)t * xs),
+						y + ((size_t)t * ys) + i0, nn);
 	}
 }
 

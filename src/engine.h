@@ -14,4 +14,6 @@ int	 engine_init_config(context *ctx, cli_args *a, const config *cfg);
 int	 engine_run(context *ctx, cli_args *a);
 void engine_shutdown(context *ctx);
 
+status_code engine_prepare_system(context *c, const char *system, bool warmup);
+
 #endif

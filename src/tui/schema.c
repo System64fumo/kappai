@@ -89,6 +89,8 @@ static const field_desc SERVER_FIELDS[] = {
 	S_STR("host", "Bind address", "address the server listens on", host, SC_HOST_MAX),
 	S_INT("port", "Port", "listen port", server_port, 1, 65535),
 	S_STR("api_key", "API key", "require Bearer auth, empty = off", api_key, SC_HOST_MAX),
+	S_INT("slots", "Session slots", "max sessions; created on demand, 1 = off", server_slots, 1,
+		  4096),
 };
 
 const schema_tab SCHEMA_TABS[] = {
@@ -270,6 +272,7 @@ void sc_defaults(saved_config *sc) {
 	sc->output_stream  = a.output_stream;
 	sc->warmup		   = a.warmup;
 	sc->server_port	   = a.server_port;
+	sc->server_slots   = a.server_slots;
 
 	sc->kv_quant = KV_QUANT_F16;
 }
@@ -810,6 +813,7 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	a->warmup		  = sc->warmup;
 	a->server_host	  = sc->host[0] ? sc->host : "127.0.0.1";
 	a->server_port	  = sc->server_port;
+	a->server_slots	  = sc->server_slots > 0 ? sc->server_slots : 4;
 	a->server_api_key = sc->api_key[0] ? sc->api_key : NULL;
 }
 

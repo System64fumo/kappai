@@ -2,6 +2,7 @@
 #define COMPUTE_H
 
 #include <signal.h>
+#include <stdatomic.h>
 
 #include "backend/backend.h"
 #include "common.h"
@@ -111,7 +112,7 @@ typedef struct compute_scratch {
 
 	layer_progress_cb			 layer_cb;
 	void						*layer_cb_ud;
-	const volatile sig_atomic_t *interrupt;
+	const _Atomic sig_atomic_t *interrupt;
 
 	batch_scratch *bs;
 	float_buf	   batch_logits_tmp;
@@ -131,6 +132,10 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out);
+
+status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,
+										 const int32_t *tokens, const int *positions, int n_seqs,
+										 int flash_attn, float *logits_out);
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 

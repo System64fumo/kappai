@@ -257,7 +257,8 @@ VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/attention.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash.spv \
 	$(OBJ_DIR)/backend/vulkan/embd_lookup.spv \
-	$(OBJ_DIR)/backend/vulkan/kv_put.spv
+	$(OBJ_DIR)/backend/vulkan/kv_put.spv \
+	$(OBJ_DIR)/backend/vulkan/kv_shift_gather.spv
 
 SHADER_SPVS := \
 	$(VK_NONBATCH_SPVS) \

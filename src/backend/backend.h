@@ -26,6 +26,7 @@ typedef enum {
 	BCAP_KV_POS_CAP			  = 1 << 10,
 	BCAP_UNIFIED_MEMORY		  = 1 << 11,
 	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
+	BCAP_KV_SHIFT			  = 1 << 13,
 } backend_cap;
 
 typedef struct {
@@ -102,6 +103,12 @@ typedef struct {
 	const int	 *layer_n_kv_heads;
 	const int	 *layer_pos_cap;
 } kv_desc;
+
+typedef struct {
+	int src_pos;
+	int dst_pos;
+	int n_rows;
+} kv_shift_chunk;
 
 typedef struct {
 	char	 name[32];
@@ -381,6 +388,10 @@ struct backend {
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
 	void (*release_thread)(backend *self);
+	status_code (*kv_shift)(backend *self, buffer *k, buffer *v, int layer,
+							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
+							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
+							int n_kv_heads_active);
 	const char *desc;
 };
 

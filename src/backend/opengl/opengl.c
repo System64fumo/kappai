@@ -72,6 +72,7 @@ typedef enum {
 	GL_PIPE_ATTENTION_BATCH,
 	GL_PIPE_PARTIAL_ROPE_QK,
 	GL_PIPE_KV_PUT,
+	GL_PIPE_KV_SHIFT_GATHER,
 	GL_PIPE_MLA_KV_PUT,
 	GL_PIPE_MLA_ATTENTION,
 	GL_PIPE_MOE_GATHER,
@@ -1249,6 +1250,8 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_PARTIAL_ROPE_QK] = {"partial_rope_qk", gl_shader_partial_rope_qk_src, 0,
 									 UINT32_MAX, 1, 0},
 		[GL_PIPE_KV_PUT]		  = {"kv_put", gl_shader_kv_put_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_KV_SHIFT_GATHER] = {"kv_shift_gather", gl_shader_kv_shift_gather_src, 0,
+									 UINT32_MAX, 1, 0},
 		[GL_PIPE_MLA_KV_PUT]	  = {"mla_kv_put", gl_shader_mla_kv_put_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_MLA_ATTENTION]	  = {"mla_attention", gl_shader_mla_attention_src, 0, UINT32_MAX, 1,
 									 0},
@@ -2549,12 +2552,13 @@ static status_code gl_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, 
 		kgb->device_dirty = 1;
 		return OK;
 	}
-separate: {
-	status_code s = gl_rope(self, q, n_heads, head_dim, pos, rope_cos_base, rope_sin_base);
-	if (s != OK)
-		return s;
-	return gl_rope(self, k, n_kv_heads, head_dim, pos, rope_cos_base, rope_sin_base);
-}
+separate:
+	{
+		status_code s = gl_rope(self, q, n_heads, head_dim, pos, rope_cos_base, rope_sin_base);
+		if (s != OK)
+			return s;
+		return gl_rope(self, k, n_kv_heads, head_dim, pos, rope_cos_base, rope_sin_base);
+	}
 }
 
 static status_code gl_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
@@ -3074,28 +3078,29 @@ static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, co
 		return s;
 	}
 
-host_fallback: {
-	buffer w_view;
-	void  *w_heap = NULL;
-	if (gl_host_weight_view(p, w, w->size, &w_view, &w_heap) != OK)
-		return ERR_UNSUPPORTED;
-	gl_buffer_sync_to_host(x);
+host_fallback:
 	{
-		backend_report_host_fallback(self, "matmul",
-									 gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE
-																		 : HFB_WEIGHT_TYPE,
-									 "weight type '%s' (type=%u)", ggml_type_name(w_type), w_type);
-		backend *host = backend_host();
-		if (!host || !host->matmul) {
-			free(w_heap);
+		buffer w_view;
+		void  *w_heap = NULL;
+		if (gl_host_weight_view(p, w, w->size, &w_view, &w_heap) != OK)
 			return ERR_UNSUPPORTED;
+		gl_buffer_sync_to_host(x);
+		{
+			backend_report_host_fallback(
+				self, "matmul",
+				gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE : HFB_WEIGHT_TYPE,
+				"weight type '%s' (type=%u)", ggml_type_name(w_type), w_type);
+			backend *host = backend_host();
+			if (!host || !host->matmul) {
+				free(w_heap);
+				return ERR_UNSUPPORTED;
+			}
+			status_code hs = host->matmul(host, &w_view, w_type, x, y, n, k);
+			free(w_heap);
+			gl_buffer_mark_host_written(y);
+			return hs;
 		}
-		status_code hs = host->matmul(host, &w_view, w_type, x, y, n, k);
-		free(w_heap);
-		gl_buffer_mark_host_written(y);
-		return hs;
 	}
-}
 }
 
 static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
@@ -3132,29 +3137,30 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 		return ds;
 	}
 
-host_fallback: {
-	buffer w_view;
-	void  *w_heap = NULL;
-	if (gl_host_weight_view(p, w, w->size, &w_view, &w_heap) != OK)
-		return ERR_UNSUPPORTED;
-	gl_buffer_sync_to_host(x);
-	gl_buffer_sync_to_host(y);
+host_fallback:
 	{
-		backend_report_host_fallback(
-			self, "matmul_batch",
-			gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE : HFB_WEIGHT_TYPE,
-			"weight type '%s' (type=%u) m=%d", ggml_type_name(w_type), w_type, m);
-		backend *host = backend_host();
-		if (!host || !host->matmul_batch) {
-			free(w_heap);
+		buffer w_view;
+		void  *w_heap = NULL;
+		if (gl_host_weight_view(p, w, w->size, &w_view, &w_heap) != OK)
 			return ERR_UNSUPPORTED;
+		gl_buffer_sync_to_host(x);
+		gl_buffer_sync_to_host(y);
+		{
+			backend_report_host_fallback(
+				self, "matmul_batch",
+				gl_matmul_type_native(self, w_type) ? HFB_OP_NOT_NATIVE : HFB_WEIGHT_TYPE,
+				"weight type '%s' (type=%u) m=%d", ggml_type_name(w_type), w_type, m);
+			backend *host = backend_host();
+			if (!host || !host->matmul_batch) {
+				free(w_heap);
+				return ERR_UNSUPPORTED;
+			}
+			status_code hs = host->matmul_batch(host, &w_view, w_type, x, y, n, k, m);
+			free(w_heap);
+			gl_buffer_mark_host_written(y);
+			return hs;
 		}
-		status_code hs = host->matmul_batch(host, &w_view, w_type, x, y, n, k, m);
-		free(w_heap);
-		gl_buffer_mark_host_written(y);
-		return hs;
 	}
-}
 }
 
 static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
@@ -3271,36 +3277,37 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 		return OK;
 	}
 
-host_fallback: {
-	buffer		  w_view[GL_MATMUL_MULTI_MAX];
-	const buffer *w_ptrs[GL_MATMUL_MULTI_MAX];
-	void		 *w_heap[GL_MATMUL_MULTI_MAX] = {0};
-	for (int i = 0; i < n_matmuls; i++) {
-		if (gl_host_weight_view(p, w[i], w[i]->size, &w_view[i], &w_heap[i]) != OK) {
-			for (int j = 0; j < i; j++)
-				free(w_heap[j]);
-			return ERR_UNSUPPORTED;
-		}
-		w_ptrs[i] = &w_view[i];
-	}
-	gl_buffer_sync_to_host(x);
+host_fallback:
 	{
-		backend_report_host_fallback(self, "matmul_multi", HFB_OP_NOT_NATIVE, "n_matmuls=%d k=%d",
-									 n_matmuls, k);
-		backend *host = backend_host();
-		if (!host || !host->matmul_multi) {
+		buffer		  w_view[GL_MATMUL_MULTI_MAX];
+		const buffer *w_ptrs[GL_MATMUL_MULTI_MAX];
+		void		 *w_heap[GL_MATMUL_MULTI_MAX] = {0};
+		for (int i = 0; i < n_matmuls; i++) {
+			if (gl_host_weight_view(p, w[i], w[i]->size, &w_view[i], &w_heap[i]) != OK) {
+				for (int j = 0; j < i; j++)
+					free(w_heap[j]);
+				return ERR_UNSUPPORTED;
+			}
+			w_ptrs[i] = &w_view[i];
+		}
+		gl_buffer_sync_to_host(x);
+		{
+			backend_report_host_fallback(self, "matmul_multi", HFB_OP_NOT_NATIVE,
+										 "n_matmuls=%d k=%d", n_matmuls, k);
+			backend *host = backend_host();
+			if (!host || !host->matmul_multi) {
+				for (int i = 0; i < n_matmuls; i++)
+					free(w_heap[i]);
+				return ERR_UNSUPPORTED;
+			}
+			status_code hs = host->matmul_multi(host, w_ptrs, w_types, x, y, n_list, k, n_matmuls);
 			for (int i = 0; i < n_matmuls; i++)
 				free(w_heap[i]);
-			return ERR_UNSUPPORTED;
+			for (int i = 0; i < n_matmuls; i++)
+				gl_buffer_mark_host_written(y[i]);
+			return hs;
 		}
-		status_code hs = host->matmul_multi(host, w_ptrs, w_types, x, y, n_list, k, n_matmuls);
-		for (int i = 0; i < n_matmuls; i++)
-			free(w_heap[i]);
-		for (int i = 0; i < n_matmuls; i++)
-			gl_buffer_mark_host_written(y[i]);
-		return hs;
 	}
-}
 }
 
 static void gl_kv_store_free(gl_priv *p, gl_kv_store *st) {
@@ -3463,7 +3470,7 @@ static void gl_kv_row_dequant_q8_0(const uint8_t *row, float *out, int head_dim)
 static status_code gl_kv_put_impl(backend *self, buffer *k, buffer *v, int layer, int pos_start,
 								  const buffer *k_in, const buffer *v_in, int in_row_stride,
 								  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
-								  int m) {
+								  int m, int in_row0) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
 	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
@@ -3499,6 +3506,7 @@ static status_code gl_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_head_dim", head_dim);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_kv_q8", kv_q8 ? 1 : 0);
 	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_in_row_stride", in_row_stride);
+	gl_pu(&p->pipes[GL_PIPE_KV_PUT], "u_in_row0", in_row0);
 
 	gl_launch(p, (GLuint)m, (GLuint)n_active, 1);
 	return OK;
@@ -3508,7 +3516,7 @@ static status_code gl_kv_put(backend *self, buffer *k, buffer *v, int layer, int
 							 const buffer *k_in, const buffer *v_in, int n_kv_heads, int head_dim,
 							 int n_ctx, int n_kv_heads_active) {
 	return gl_kv_put_impl(self, k, v, layer, pos, k_in, v_in, 0, n_kv_heads, head_dim, n_ctx,
-						  n_kv_heads_active, 1);
+						  n_kv_heads_active, 1, 0);
 }
 
 static status_code gl_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
@@ -3516,7 +3524,97 @@ static status_code gl_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 								   int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
 								   int m) {
 	return gl_kv_put_impl(self, k, v, layer, pos_start, k_in, v_in, in_row_stride, n_kv_heads,
-						  head_dim, n_ctx, n_kv_heads_active, m);
+						  head_dim, n_ctx, n_kv_heads_active, m, 0);
+}
+
+static status_code gl_kv_shift(backend *self, buffer *k, buffer *v, int layer,
+							   const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
+							   const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
+							   int n_kv_heads_active) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int half	 = head_dim / 2;
+	if (n_chunks <= 0 || n_active <= 0 || half <= 0)
+		return OK;
+	if (!p->pipes[GL_PIPE_KV_SHIFT_GATHER].program || !p->pipes[GL_PIPE_KV_PUT].program)
+		return ERR_UNSUPPORTED;
+
+	int total_rows = 0;
+	for (int i = 0; i < n_chunks; i++)
+		total_rows += chunks[i].n_rows;
+	int	   tmp_stride = n_active * head_dim;
+	size_t tmp_bytes  = (size_t)total_rows * (size_t)tmp_stride * sizeof(float);
+	size_t tbl_floats = (size_t)n_chunks * (size_t)half;
+
+	buffer		k_tmp = {0}, v_tmp = {0}, cos_b = {0}, sin_b = {0};
+	status_code s = buffer_ensure_scratch(self, &k_tmp, tmp_bytes);
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &v_tmp, tmp_bytes);
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &cos_b, tbl_floats * sizeof(float));
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &sin_b, tbl_floats * sizeof(float));
+	if (s != OK)
+		goto done;
+	self->buffer_write_f32(self, &cos_b, cos_tbl, (int)tbl_floats);
+	self->buffer_write_f32(self, &sin_b, sin_tbl, (int)tbl_floats);
+	gl_buf_sync_to_device(as_glbuf(&cos_b));
+	gl_buf_sync_to_device(as_glbuf(&sin_b));
+
+	gl_buf *kb		   = gl_kv_layer_buf(k, layer);
+	gl_buf *vb		   = gl_kv_layer_buf(v, layer);
+	int		kv_q8	   = (p->kv_quant == KV_QUANT_Q8_0);
+	size_t	kvh_stride = p->kv_kvh_stride
+							 ? p->kv_kvh_stride
+							 : (kv_q8 ? (size_t)n_ctx * p->kv_row_bytes : (size_t)n_ctx * head_dim);
+	int		row_stride_u = kv_q8 ? (int)p->kv_row_bytes : head_dim;
+
+	gl_barrier(p);
+	int row0 = 0;
+	for (int i = 0; i < n_chunks; i++) {
+		gl_pipeline *pipe = &p->pipes[GL_PIPE_KV_SHIFT_GATHER];
+		gl_use_pipeline(p, pipe);
+		gl_bind_raw(p, 0, kb->name, 0, 0, 0);
+		gl_bind_raw(p, 1, vb->name, 0, 0, 0);
+		gl_bind_ssbo_out(2, &k_tmp);
+		gl_bind_ssbo_out(3, &v_tmp);
+		gl_bind_ssbo(4, &cos_b);
+		gl_bind_ssbo(5, &sin_b);
+		gl_pu(pipe, "u_src_pos", chunks[i].src_pos);
+		gl_pu(pipe, "u_kvh_stride", (int)kvh_stride);
+		gl_pu(pipe, "u_row_stride", row_stride_u);
+		gl_pu(pipe, "u_head_dim", head_dim);
+		gl_pu(pipe, "u_kv_q8", kv_q8 ? 1 : 0);
+		gl_pu(pipe, "u_neox", self->rope_neox);
+		gl_pu(pipe, "u_tmp_row0", row0);
+		gl_pu(pipe, "u_tmp_row_stride", tmp_stride);
+		gl_pu(pipe, "u_tbl_off", i * half);
+		gl_launch(p, (GLuint)chunks[i].n_rows, (GLuint)n_active, 1);
+		row0 += chunks[i].n_rows;
+	}
+	as_glbuf(&k_tmp)->device_dirty = 1;
+	as_glbuf(&v_tmp)->device_dirty = 1;
+	gl_barrier(p);
+
+	row0 = 0;
+	for (int i = 0; i < n_chunks && s == OK; i++) {
+		s = gl_kv_put_impl(self, k, v, layer, chunks[i].dst_pos, &k_tmp, &v_tmp, tmp_stride,
+						   n_kv_heads, head_dim, n_ctx, n_kv_heads_active, chunks[i].n_rows, row0);
+		row0 += chunks[i].n_rows;
+	}
+	gl_barrier(p);
+
+done:
+	if (k_tmp.owner)
+		self->buffer_free(self, &k_tmp);
+	if (v_tmp.owner)
+		self->buffer_free(self, &v_tmp);
+	if (cos_b.owner)
+		self->buffer_free(self, &cos_b);
+	if (sin_b.owner)
+		self->buffer_free(self, &sin_b);
+	return s;
 }
 
 static uint32_t gl_mla_wtype_code(uint32_t type) {
@@ -5139,9 +5237,9 @@ static status_code gl_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "opengl";
 	out->priority = 80;
-	out->caps	  = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
-					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
-					BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT | BCAP_IN_ORDER_QUEUE;
+	out->caps = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
+				BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
+				BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT | BCAP_IN_ORDER_QUEUE | BCAP_KV_SHIFT;
 
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
@@ -5192,6 +5290,7 @@ static status_code gl_ctor(backend *out) {
 	out->kv_free						 = gl_kv_free;
 	out->kv_put							 = gl_kv_put;
 	out->kv_put_batch					 = gl_kv_put_batch;
+	out->kv_shift						 = gl_kv_shift;
 	out->attention_mla					 = gl_attention_mla;
 	out->kv_alloc_mla					 = gl_kv_alloc_mla;
 	out->kv_put_mla						 = gl_kv_put_mla;

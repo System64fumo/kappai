@@ -140,6 +140,7 @@ status_code chat_template_init(chat_template_state *cts, const gguf_ctx *g, cons
 	char errbuf[512];
 	cts->prog = jinja_compile(tmpl_src_patched, errbuf, sizeof(errbuf));
 	free(tmpl_src_patched);
+	cts->owns_prog = cts->prog != NULL;
 	if (!cts->prog) {
 		ERROR("failed to compile tokenizer.chat_template: %s", errbuf);
 		return ERR_FORMAT;
@@ -219,6 +220,31 @@ void chat_template_set_tools(chat_template_state *cts, json_object *tools,
 	notify_render_replaced(cts);
 }
 
+void chat_template_clone(chat_template_state *dst, const chat_template_state *src) {
+	memset(dst, 0, sizeof(*dst));
+	if (!src)
+		return;
+	*dst			  = *src;
+	dst->prog		  = src->prog;
+	dst->owns_prog	  = false;
+	dst->messages	  = NULL;
+	dst->n_messages	  = 0;
+	dst->cap_messages = 0;
+	dst->last_render  = xstrdup(src->last_render ? src->last_render : "");
+	dst->bos_token	  = xstrdup(src->bos_token ? src->bos_token : "");
+	dst->eos_token	  = xstrdup(src->eos_token ? src->eos_token : "");
+	dst->tools		  = NULL;
+	dst->tool_choice  = src->tool_choice ? xstrdup(src->tool_choice) : NULL;
+	if (src->tools)
+		dst->tools = json_object_get(src->tools);
+	for (size_t i = 0; i < src->n_messages; i++)
+		chat_template_add_message_ex(dst, &src->messages[i]);
+	if (src->think_open)
+		dst->think_open = src->think_open;
+	dst->invalidate_cb = NULL;
+	dst->invalidate_ud = NULL;
+}
+
 void chat_template_free(chat_template_state *cts) {
 	if (!cts)
 		return;
@@ -227,7 +253,8 @@ void chat_template_free(chat_template_state *cts) {
 	free(cts->last_render);
 	free(cts->bos_token);
 	free(cts->eos_token);
-	jinja_program_free(cts->prog);
+	if (cts->owns_prog)
+		jinja_program_free(cts->prog);
 	memset(cts, 0, sizeof(*cts));
 }
 

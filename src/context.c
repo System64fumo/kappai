@@ -487,18 +487,103 @@ void context_free(context *c) {
 	memset(c, 0, sizeof(*c));
 }
 
-void context_reset(context *c) {
+void context_reset_session(context *c) {
 	context_idle_prefill_wait(c);
-	kvcache_reset(&c->kv);
 	c->samp.recent_count = 0;
 	c->samp.recent_head	 = 0;
 	chat_template_clear_messages(&c->chat);
 	sync_set(c, NULL, 0, 0);
-	c->fed_ids.n		 = 0;
-	c->warmup_done		 = false;
 	c->interrupt		 = 0;
 	c->context_limit_hit = false;
-	c->session_poisoned	 = false;
+}
+
+void context_reset(context *c) {
+	context_reset_session(c);
+	kvcache_reset(&c->kv);
+	c->fed_ids.n		= 0;
+	c->warmup_done		= false;
+	c->session_poisoned = false;
+}
+
+status_code context_slot_init(context *s, const context *e) {
+	memset(s, 0, sizeof(*s));
+	*s = *e;
+
+	s->interrupt		  = 0;
+	s->context_limit_hit  = false;
+	s->session_poisoned	  = false;
+	s->last_prompt_tokens = 0;
+	s->sync_render		  = e->sync_render ? xstrdup(e->sync_render) : NULL;
+	s->idle.active		  = false;
+	s->yield			  = NULL;
+	s->yield_ud			  = NULL;
+	s->decode_step		  = NULL;
+	s->decode_step_ud	  = NULL;
+
+	s->fed_ids.p   = xmalloc((size_t)e->fed_ids.cap * sizeof(int32_t));
+	s->fed_ids.n   = e->fed_ids.n;
+	s->fed_ids.cap = e->fed_ids.cap;
+	memcpy(s->fed_ids.p, e->fed_ids.p, (size_t)e->fed_ids.n * sizeof(int32_t));
+
+	s->ids_buf.p		= NULL;
+	s->ids_buf.cap		= 0;
+	s->idle_ids_buf.p	= NULL;
+	s->idle_ids_buf.cap = 0;
+
+	sampler_clone(&s->samp, &e->samp);
+	chat_template_clone(&s->chat, &e->chat);
+	chat_template_set_invalidate_cb(&s->chat, sync_invalidate_cb, s);
+
+	context_idle_prefill_wait(s);
+	memset(&s->scratch, 0, sizeof(s->scratch));
+	s->scratch.prof		 = e->scratch.prof;
+	s->scratch.interrupt = &s->interrupt;
+
+	s->tok.bpe_work			 = NULL;
+	s->tok.bpe_work_cap		 = 0;
+	s->tok.bpe_arena		 = NULL;
+	s->tok.bpe_arena_cap	 = 0;
+	s->tok.bpe_pcs_cache	 = NULL;
+	s->tok.bpe_pcs_cache_cap = 0;
+	s->tok.chunk_cache		 = xcalloc((size_t)e->tok.chunk_cache_cap, sizeof(tok_cache_entry));
+	s->tok.chunk_cache_used	 = 0;
+	memset(&s->tok.chunk_cache_pool, 0, sizeof(s->tok.chunk_cache_pool));
+	memset(&s->tok.bpe_sp, 0, sizeof(s->tok.bpe_sp));
+	memset(&s->tok.gpt2_scratch, 0, sizeof(s->tok.gpt2_scratch));
+
+	status_code s_st = kvcache_init(&s->kv, &s->m, s->n_ctx, s->kv.kv_quant);
+	if (s_st != OK)
+		return s_st;
+	if (e->kv.n_mirrors > 0) {
+		s_st = kvcache_alloc_mirrors(&s->kv, &s->m);
+		if (s_st != OK) {
+			kvcache_free(&s->kv);
+			return s_st;
+		}
+	}
+	return OK;
+}
+
+void context_slot_free(context *s) {
+	if (!s)
+		return;
+	context_idle_prefill_wait(s);
+	kvcache_free(&s->kv);
+	sampler_free(&s->samp);
+	chat_template_free(&s->chat);
+	compute_scratch_free(&s->scratch);
+	str_arena_free(&s->tok.chunk_cache_pool);
+	free(s->tok.chunk_cache);
+	free(s->tok.bpe_work);
+	free(s->tok.bpe_arena);
+	free(s->tok.bpe_pcs_cache);
+	sb_free(&s->tok.bpe_sp);
+	sb_free(&s->tok.gpt2_scratch);
+	free(s->fed_ids.p);
+	free(s->ids_buf.p);
+	free(s->idle_ids_buf.p);
+	free(s->sync_render);
+	memset(s, 0, sizeof(*s));
 }
 
 static void fed_ids_append(context *c, int32_t token) {
@@ -603,6 +688,103 @@ static void context_rewind(context *c, int32_t pos) {
 	c->kv.n_pos	 = pos;
 }
 
+#define KV_SHIFT_MIN_CHUNK 32
+#define KV_SHIFT_MAX_CHUNKS 64
+
+typedef struct {
+	kv_shift_chunk chunks[KV_SHIFT_MAX_CHUNKS];
+	int			   n;
+} kv_reuse_plan;
+
+static void kv_reuse_plan_build(const context *c, const int32_t *ids, int n, int32_t reuse,
+								kv_reuse_plan *plan) {
+	plan->n	   = 0;
+	int head_c = reuse;
+	int head_p = reuse;
+	while (head_c < c->fed_ids.n && head_p < n - 1 && plan->n < KV_SHIFT_MAX_CHUNKS) {
+		int matched = 0;
+		while (head_c + matched < c->fed_ids.n && head_p + matched < n - 1 &&
+			   c->fed_ids.p[head_c + matched] == ids[head_p + matched])
+			matched++;
+		if (matched < KV_SHIFT_MIN_CHUNK) {
+			head_c++;
+			continue;
+		}
+		plan->chunks[plan->n++] = (kv_shift_chunk){head_c, head_p, matched};
+		head_c += matched;
+		head_p += matched;
+	}
+}
+
+static bool kv_reuse_plan_shift(context *c, const kv_reuse_plan *plan) {
+	kv_shift_chunk moves[KV_SHIFT_MAX_CHUNKS];
+	int			   n_moves	= 0;
+	int			   n_reused = 0;
+	for (int i = 0; i < plan->n; i++) {
+		n_reused += plan->chunks[i].n_rows;
+		if (plan->chunks[i].src_pos != plan->chunks[i].dst_pos)
+			moves[n_moves++] = plan->chunks[i];
+	}
+	if (n_moves > 0) {
+		status_code st = kvcache_shift(&c->kv, &c->m, moves, n_moves);
+		if (st != OK) {
+			WARN("kv shift failed (%s); refeeding tail", status_str(st));
+			return false;
+		}
+	}
+	INFO("kv shift: %d chunk(s), %d token(s) reused after mismatch", plan->n, n_reused);
+	return true;
+}
+
+static int32_t context_reuse_prefix(context *c, const int32_t *ids, int n, kv_reuse_plan *plan) {
+	plan->n		  = 0;
+	int32_t reuse = fed_ids_common_prefix(c, ids, n);
+	if (reuse >= c->fed_ids.n) {
+		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
+		return reuse;
+	}
+	DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
+		  (int)c->fed_ids.n);
+	if (kvcache_can_shift(&c->kv, &c->m)) {
+		kv_reuse_plan_build(c, ids, n, reuse, plan);
+		if (plan->n > 0 && !kv_reuse_plan_shift(c, plan))
+			plan->n = 0;
+	}
+	context_rewind(c, reuse);
+	return reuse;
+}
+
+static prefill_result context_prefill_with_plan(context *c, const int32_t *tokens, int n_tokens,
+												const kv_reuse_plan *plan) {
+	prefill_result total = {0};
+	int32_t		   base	 = c->kv.n_pos;
+	int			   n_fed = 0;
+	prefill_result part	 = {0};
+	for (int i = 0; i < plan->n; i++) {
+		const kv_shift_chunk *chunk = &plan->chunks[i];
+		int					  gap	= chunk->dst_pos - c->kv.n_pos;
+		if (gap > 0) {
+			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, "prefill", false);
+			total.us += part.us;
+			if (part.rc < 0) {
+				total.rc = part.rc;
+				return total;
+			}
+			n_fed += gap;
+		}
+		for (int t = 0; t < chunk->n_rows; t++)
+			fed_ids_append(c, tokens[chunk->dst_pos - base + t]);
+		c->kv.n_pos = chunk->dst_pos + chunk->n_rows;
+	}
+	int done = c->kv.n_pos - base;
+	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, "prefill", false);
+	total.rc = part.rc;
+	total.us += part.us;
+	n_fed += n_tokens - done;
+	total.tps = total.us > 0 ? n_fed * 1.0e6 / (double)total.us : part.tps;
+	return total;
+}
+
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
 	if (c->kv.n_pos >= c->n_ctx)
 		return ERR_INVALID_ARG;
@@ -610,8 +792,9 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 		return ERR_INVALID_ARG;
 	fed_ids_sync(c);
 	int			pos = c->kv.n_pos;
-	status_code cst =
-		compute_forward(&c->m, &c->kv, &c->scratch, token, pos, c->flash_attn, logits_out);
+	status_code cst = c->decode_step ? c->decode_step(c->decode_step_ud, token, pos, logits_out)
+									 : compute_forward(&c->m, &c->kv, &c->scratch, token, pos,
+													   c->flash_attn, logits_out);
 	if (cst == ERR_INTERRUPTED)
 		return ERR_INTERRUPTED;
 	if (cst != OK) {
@@ -740,6 +923,8 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
+		if (c->yield && chunk_offset + chunk_size < n)
+			c->yield(c->yield_ud);
 	}
 
 	if (show_progress) {
@@ -872,7 +1057,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		monitor_setup_cb(c, &cb, "decode", i, i + 1);
 
 		int32_t tok;
-		if (fast_argmax) {
+		if (fast_argmax && !c->logits_on_host) {
 			status_code st = c->backend->argmax(c->backend, &c->scratch.slots[RECIPE_SLOT_LOGITS],
 												c->m.vocab_size, &tok);
 			if (st == OK) {
@@ -934,6 +1119,8 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		}
 		has_fed_tok	 = true;
 		last_fed_tok = tok;
+		if (c->yield && !c->decode_step)
+			c->yield(c->yield_ud);
 	}
 
 	compute_set_layer_progress_cb(&c->scratch, NULL, NULL);
@@ -1056,12 +1243,12 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 						  const sampler_params *samp,
 						  void (*on_token)(int32_t, const char *, int, void *), void *ud,
 						  int show_pp_tg, const char *metrics_spec, uint64_t t_turn_start_us,
-						  bool *out_unfed_tail) {
+						  bool *out_unfed_tail, const kv_reuse_plan *plan) {
 	context_monitor_send_start(c);
 	bool prof_was_on = c->scratch.prof.enabled;
 
 	int32_t		   n_pos_before = c->kv.n_pos;
-	prefill_result pf			= context_prefill_tokens(c, tokens, n_tokens, "prefill", false);
+	prefill_result pf			= context_prefill_with_plan(c, tokens, n_tokens, plan);
 	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",
@@ -1200,14 +1387,8 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	if (!tail_encode_ids(c, ids, &n))
 		goto restore_fail;
 
-	int32_t reuse = fed_ids_common_prefix(c, ids, n);
-	if (reuse < c->fed_ids.n) {
-		DEBUG("prefix reuse: id mismatch at %d of %d cached positions; refeeding tail", (int)reuse,
-			  (int)c->fed_ids.n);
-		context_rewind(c, reuse);
-	} else {
-		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
-	}
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, ids, n, &plan);
 
 	assistant_capture_ud acap = {0};
 	acap.on_token			  = on_token;
@@ -1223,7 +1404,7 @@ int context_chat_turn_msg(context *c, const chat_message *msg, bool add_generati
 	int	 generated =
 		run_generation(c, ids + reuse, n - reuse, max_tokens, samp,
 					   add_generation_prompt ? assistant_capture_cb : on_token, &acap, 1,
-					   metrics_spec ? metrics_spec : "pp,tg", t_turn_start, &unfed_tail);
+					   metrics_spec ? metrics_spec : "pp,tg", t_turn_start, &unfed_tail, &plan);
 
 	if (unfed_tail && acap.buf && acap.len > acap.last_piece_start) {
 		acap.len			  = acap.last_piece_start;
@@ -1292,9 +1473,13 @@ int context_completion(context *c, const char *prompt, int max_tokens, const sam
 	n += r;
 	c->last_prompt_tokens = n;
 
+	fed_ids_sync(c);
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, ids, n, &plan);
+
 	bool unfed_tail = false;
-	return run_generation(c, ids, n, max_tokens, samp, on_token, ud, 1, "", t_turn_start,
-						  &unfed_tail);
+	return run_generation(c, ids + reuse, n - reuse, max_tokens, samp, on_token, ud, 1, "",
+						  t_turn_start, &unfed_tail, &plan);
 }
 
 static void *idle_prefill_thread(void *arg) {

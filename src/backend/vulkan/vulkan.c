@@ -246,6 +246,7 @@ typedef struct {
 
 	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
 	vk_pipeline_set p_kv_put;
+	vk_pipeline_set p_kv_shift_gather;
 	vk_pipeline_set p_embd_lookup;
 	vk_pipeline_set p_argmax;
 	vk_pipeline_set p_argmax_reduce;
@@ -848,6 +849,7 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_matmul_iq4_nl_batch,
 
 			&p->p_kv_put,
+			&p->p_kv_shift_gather,
 			&p->p_embd_lookup,
 			&p->p_argmax,
 			&p->p_argmax_reduce,
@@ -2235,10 +2237,15 @@ static status_code vk_init(backend *self, int device_index) {
 		kquant_tile_k,
 	};
 
-	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 32, &p->p_kv_put);
+	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 36, &p->p_kv_put);
 	if (s != OK)
 		return s;
 	p->p_kv_put.name = "kv_put";
+	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 36,
+						   &p->p_kv_shift_gather);
+	if (s != OK)
+		return s;
+	p->p_kv_shift_gather.name = "kv_shift_gather";
 	s = vk_create_pipeline(p, shader_embd_lookup_spv, shader_embd_lookup_spv_len, 3, 16,
 						   &p->p_embd_lookup);
 	if (s != OK)
@@ -2517,6 +2524,7 @@ static void vk_free(backend *self) {
 			for (int fi = 0; fi < VK_ATTN_CACHE_CAP; fi++)
 				vk_destroy_pipeline(p, &p->attn_cache[ci].set[fi]);
 		vk_destroy_pipeline(p, &p->p_kv_put);
+		vk_destroy_pipeline(p, &p->p_kv_shift_gather);
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
 		vk_destroy_pipeline(p, &p->p_argmax);
 		vk_destroy_pipeline(p, &p->p_argmax_reduce);
@@ -3719,9 +3727,10 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	return OK;
 }
 
-static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos,
-							 const buffer *k_in, const buffer *v_in, int n_kv_heads, int head_dim,
-							 int n_ctx, int n_kv_heads_active) {
+static status_code vk_kv_put_impl(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								  const buffer *k_in, const buffer *v_in, int in_row_stride,
+								  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+								  int m, int in_row0) {
 	vk_priv *p		  = self->priv;
 	int		 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 
@@ -3733,39 +3742,7 @@ static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int
 	struct {
 		uint32_t layer_off;
 		int32_t	 pos_start, n_kv_heads, head_dim, n_ctx, stride_head_dim;
-		int32_t	 in_row_stride, m_tokens;
-	} push					 = {(uint32_t)vk_kv_layer_off_elems(kh, layer),
-								pos,
-								n_active,
-								head_dim,
-								n_ctx,
-								head_dim,
-								n_active * head_dim,
-								1};
-	vk_buf		*bufs[4]	 = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
-	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
-	int			 total_pairs = n_active * (head_dim / 2);
-	uint32_t	 groups		 = (uint32_t)((total_pairs + 127) / 128);
-	return vk_dispatch_ex(p, &p->p_kv_put, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
-						  0x3);
-}
-
-static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
-								   const buffer *k_in, const buffer *v_in, int in_row_stride,
-								   int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
-								   int m) {
-	vk_priv *p		  = self->priv;
-	int		 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-
-	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
-	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
-
-	struct {
-		uint32_t layer_off;
-		int32_t	 pos_start, n_kv_heads, head_dim, n_ctx, stride_head_dim;
-		int32_t	 in_row_stride, m_tokens;
+		int32_t	 in_row_stride, m_tokens, in_row0;
 	} push					 = {(uint32_t)vk_kv_layer_off_elems(kh, layer),
 								pos_start,
 								n_active,
@@ -3773,7 +3750,8 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 								n_ctx,
 								head_dim,
 								in_row_stride > 0 ? in_row_stride : n_active * head_dim,
-								m};
+								m,
+								in_row0};
 	vk_buf		*bufs[4]	 = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
 	int			 total_pairs = n_active * (head_dim / 2);
@@ -3781,6 +3759,99 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 	uint32_t	 groups		 = (uint32_t)((total + 127) / 128);
 	return vk_dispatch_ex(p, &p->p_kv_put, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
 						  0x3);
+}
+
+static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos,
+							 const buffer *k_in, const buffer *v_in, int n_kv_heads, int head_dim,
+							 int n_ctx, int n_kv_heads_active) {
+	return vk_kv_put_impl(self, k, v, layer, pos, k_in, v_in, 0, n_kv_heads, head_dim, n_ctx,
+						  n_kv_heads_active, 1, 0);
+}
+
+static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								   const buffer *k_in, const buffer *v_in, int in_row_stride,
+								   int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+								   int m) {
+	return vk_kv_put_impl(self, k, v, layer, pos_start, k_in, v_in, in_row_stride, n_kv_heads,
+						  head_dim, n_ctx, n_kv_heads_active, m, 0);
+}
+
+static status_code vk_kv_shift(backend *self, buffer *k, buffer *v, int layer,
+							   const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
+							   const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
+							   int n_kv_heads_active) {
+	vk_priv *p		  = self->priv;
+	int		 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int		 half	  = head_dim / 2;
+	if (n_chunks <= 0 || n_active <= 0 || half <= 0)
+		return OK;
+
+	int total_rows = 0;
+	for (int i = 0; i < n_chunks; i++)
+		total_rows += chunks[i].n_rows;
+	size_t tmp_bytes  = (size_t)total_rows * (size_t)n_active * (size_t)head_dim * sizeof(float);
+	size_t tbl_floats = (size_t)n_chunks * (size_t)half;
+
+	buffer		k_tmp = {0}, v_tmp = {0}, cos_b = {0}, sin_b = {0};
+	status_code s = buffer_ensure_scratch(self, &k_tmp, tmp_bytes);
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &v_tmp, tmp_bytes);
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &cos_b, tbl_floats * sizeof(float));
+	if (s == OK)
+		s = buffer_ensure_scratch(self, &sin_b, tbl_floats * sizeof(float));
+	if (s != OK)
+		goto done;
+	vk_buffer_write_f32(self, &cos_b, cos_tbl, (int)tbl_floats);
+	vk_buffer_write_f32(self, &sin_b, sin_tbl, (int)tbl_floats);
+
+	const vk_kv_handle *kh		= (const vk_kv_handle *)k->handle;
+	const vk_kv_handle *vh		= (const vk_kv_handle *)v->handle;
+	vk_buf			   *bufs[6] = {vk_kv_layer_buf(kh, layer, NULL),
+								   vk_kv_layer_buf(vh, layer, NULL),
+								   as_vkbuf(&k_tmp),
+								   as_vkbuf(&v_tmp),
+								   as_vkbuf(&cos_b),
+								   as_vkbuf(&sin_b)};
+	int					row0	= 0;
+	for (int i = 0; i < n_chunks && s == OK; i++) {
+		struct {
+			uint32_t layer_off;
+			int32_t	 src_pos, n_kv_heads, head_dim, n_ctx, neox, tmp_row0, tbl_off, m_rows;
+		} push			= {(uint32_t)vk_kv_layer_off_elems(kh, layer),
+						   chunks[i].src_pos,
+						   n_active,
+						   head_dim,
+						   n_ctx,
+						   self->rope_neox ? 1 : 0,
+						   row0,
+						   i * half,
+						   chunks[i].n_rows};
+		uint64_t total	= (uint64_t)n_active * (uint64_t)half * (uint64_t)chunks[i].n_rows;
+		uint32_t groups = (uint32_t)((total + 127) / 128);
+		s = vk_dispatch_ex(p, &p->p_kv_shift_gather, bufs, NULL, NULL, 6, &push, sizeof(push),
+						   groups, 1, 0xC);
+		row0 += chunks[i].n_rows;
+	}
+
+	row0 = 0;
+	for (int i = 0; i < n_chunks && s == OK; i++) {
+		s = vk_kv_put_impl(self, k, v, layer, chunks[i].dst_pos, &k_tmp, &v_tmp,
+						   n_active * head_dim, n_kv_heads, head_dim, n_ctx, n_kv_heads_active,
+						   chunks[i].n_rows, row0);
+		row0 += chunks[i].n_rows;
+	}
+
+done:
+	if (k_tmp.owner)
+		self->buffer_free(self, &k_tmp);
+	if (v_tmp.owner)
+		self->buffer_free(self, &v_tmp);
+	if (cos_b.owner)
+		self->buffer_free(self, &cos_b);
+	if (sin_b.owner)
+		self->buffer_free(self, &sin_b);
+	return s;
 }
 
 static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
@@ -5969,9 +6040,11 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		} push = {
 			(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			attn_start,			 m};
-		uint32_t groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
-		vk_buf	*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
-		return vk_dispatch_2d(p, flash_ps, bufs, 4, &push, sizeof(push), groups_x, (uint32_t)m);
+		uint32_t	 groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
+		vk_buf		*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
+		VkDeviceSize offs[4]  = {q->offset, 0, 0, out->offset};
+		return vk_dispatch_2d_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups_x,
+								 (uint32_t)m, 0x8);
 	}
 
 	status_code s = vk_ensure_scores_buf_batch(self, n_heads, n_ctx, m);
@@ -5987,6 +6060,7 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 	} push = {(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 			  attn_start,		   m};
 	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
+	VkDeviceSize	 offs[5] = {q->offset, 0, 0, 0, out->offset};
 	vk_pipeline_set *ps		 = NULL;
 	if (vk_ensure_attention_pipeline_batch(p, head_dim, &ps) != OK) {
 		DEBUG(
@@ -5994,8 +6068,8 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 			head_dim, layer);
 		return ERR_UNSUPPORTED;
 	}
-	return vk_dispatch_2d_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads,
-								 (uint32_t)m, 0x18);
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 5, &push, sizeof(push), (uint32_t)n_heads,
+							 (uint32_t)m, 0x18);
 }
 
 static status_code vk_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
@@ -6038,7 +6112,7 @@ static status_code vk_ctor(backend *out) {
 	out->name	  = "vulkan";
 	out->priority = 100;
 	out->caps  = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
-				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT;
+				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT | BCAP_KV_SHIFT;
 	out->probe = vk_probe;
 	out->device_count					 = vk_device_count;
 	out->device_identity				 = vk_device_identity;
@@ -6055,6 +6129,7 @@ static status_code vk_ctor(backend *out) {
 	out->kv_free						 = vk_kv_free;
 	out->kv_put							 = vk_kv_put;
 	out->kv_put_batch					 = vk_kv_put_batch;
+	out->kv_shift						 = vk_kv_shift;
 	out->embd_lookup					 = vk_embd_lookup;
 	out->rmsnorm						 = vk_rmsnorm;
 	out->matmul							 = vk_matmul;

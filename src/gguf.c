@@ -1136,24 +1136,25 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 				return 0;
 		}
 
-	bounce_fallback: {
-		uintptr_t am		  = ~((uintptr_t)align - 1);
-		uint64_t  aligned_off = file_off & am;
-		size_t	  head_slop	  = (size_t)(file_off - aligned_off);
-		size_t	  aligned_len = (head_slop + len + align - 1) & ~(align - 1);
+	bounce_fallback:
+		{
+			uintptr_t am		  = ~((uintptr_t)align - 1);
+			uint64_t  aligned_off = file_off & am;
+			size_t	  head_slop	  = (size_t)(file_off - aligned_off);
+			size_t	  aligned_len = (head_slop + len + align - 1) & ~(align - 1);
 
-		void *bounce = NULL;
-		if (posix_memalign(&bounce, align, aligned_len) == 0 && bounce) {
-			uint8_t *bp	   = bounce;
-			ssize_t	 total = gguf_pread_full(direct_fd, bp, aligned_len, aligned_off);
-			if (total >= 0 && (size_t)total >= head_slop + len) {
-				memcpy(dst, bp + head_slop, len);
+			void *bounce = NULL;
+			if (posix_memalign(&bounce, align, aligned_len) == 0 && bounce) {
+				uint8_t *bp	   = bounce;
+				ssize_t	 total = gguf_pread_full(direct_fd, bp, aligned_len, aligned_off);
+				if (total >= 0 && (size_t)total >= head_slop + len) {
+					memcpy(dst, bp + head_slop, len);
+					free(bounce);
+					return 0;
+				}
 				free(bounce);
-				return 0;
 			}
-			free(bounce);
 		}
-	}
 	}
 
 	if (plain_fd < 0)

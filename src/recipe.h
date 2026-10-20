@@ -306,6 +306,8 @@ typedef struct {
 	backend				   *layer_be;
 	buffer				   *slot_base;
 	weight_ref			  **wtab_row;
+	struct kvcache		  **row_caches;
+	const int			   *row_pos;
 } exec_ctx;
 
 #define recipe_exec_is_batch(ctx) ((ctx) && (ctx)->bs != NULL)
@@ -325,6 +327,13 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,
 										 int n_tokens, int pos_start, int flash_attn,
 										 float *logits_out);
+
+int recipe_is_decode_batchable(const struct model *m);
+
+status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
+												struct compute_scratch *s, const int32_t *tokens,
+												const int *positions, int n_seqs, int flash_attn,
+												float *logits_out);
 
 void batch_scratch_free(struct batch_scratch *bs);
 

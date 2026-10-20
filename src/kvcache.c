@@ -3,6 +3,7 @@
 #include "memconfig.h"
 #include "recipe.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -600,6 +601,94 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 		if (dev != owner && (mask & (1u << dev)))
 			st = kvcache_put_device(c, m, dev, layer, pos, k_in, v_in);
 	return st;
+}
+
+static unsigned kvcache_slot_mask(const kvcache *c, int slot) {
+	return c->slot_devices && slot < c->n_slot_devices ? c->slot_devices[slot] : 1u;
+}
+
+static backend *kvcache_shift_backend(const kvcache *c, int dev, const buffer *kb) {
+	if (kb && kb->owner)
+		return kb->owner;
+	return kvcache_device_backend(c, dev);
+}
+
+bool kvcache_can_shift(const kvcache *c, const model *m) {
+	if (!c || !m || c->mla || c->hybrid || c->n_kv_layers <= 0)
+		return false;
+	if (!m->arch_info->has_variable_layer_dims || !m->recipe || !m->recipe->layer_ctx)
+		return false;
+	for (int li = 0; li < c->n_kv_layers; li++) {
+		unsigned mask = kvcache_slot_mask(c, li);
+		for (int dev = 0; dev <= c->n_mirrors; dev++) {
+			if (!(mask & (1u << dev)))
+				continue;
+			buffer *kb, *vb;
+			int		slot;
+			if (kvcache_device_view(c, dev, li, &kb, &vb, &slot) < 0)
+				return false;
+			backend *be = kvcache_shift_backend(c, dev, kb);
+			if (!be || !be->kv_shift || !backend_has_cap(be, BCAP_KV_SHIFT))
+				return false;
+		}
+	}
+	return true;
+}
+
+static void kvcache_shift_tables(const model *m, const layer_ctx_entry *lc, int head_dim,
+								 const kv_shift_chunk *chunks, int n_chunks, float *cos_tbl,
+								 float *sin_tbl) {
+	const int	half = head_dim / 2;
+	const float theta =
+		lc->is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
+	const float *ff			 = lc->is_global ? m->rope_freqs : NULL;
+	const double theta_scale = pow((double)theta, -2.0 / (double)head_dim);
+	for (int i = 0; i < n_chunks; i++) {
+		double delta = (double)(chunks[i].dst_pos - chunks[i].src_pos);
+		double freq	 = 1.0;
+		for (int j = 0; j < half; j++, freq *= theta_scale) {
+			double factor = 1.0;
+			if (ff)
+				factor = (ff[j] >= 1e10f || ff[j] == 0.0f) ? 0.0 : (double)ff[j];
+			double angle				  = delta * freq * factor;
+			cos_tbl[(size_t)i * half + j] = (float)cos(angle);
+			sin_tbl[(size_t)i * half + j] = (float)sin(angle);
+		}
+	}
+}
+
+status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks) {
+	for (int li = 0; li < c->n_kv_layers; li++) {
+		const layer_ctx_entry *lc		= &m->recipe->layer_ctx[li];
+		int					   head_dim = model_layer_head_dim(m, li);
+		if (lc->is_global && (!m->rope_freqs || m->rope_freqs_count < head_dim / 2))
+			return ERR_UNSUPPORTED;
+		size_t tbl_floats = (size_t)n_chunks * (size_t)(head_dim / 2);
+		float *tables	  = xmalloc(2 * tbl_floats * sizeof(float));
+		kvcache_shift_tables(m, lc, head_dim, chunks, n_chunks, tables, tables + tbl_floats);
+		unsigned	mask = kvcache_slot_mask(c, li);
+		status_code st	 = OK;
+		for (int dev = 0; dev <= c->n_mirrors && st == OK; dev++) {
+			if (!(mask & (1u << dev)))
+				continue;
+			buffer *kb, *vb;
+			int		slot;
+			kvcache_device_view(c, dev, li, &kb, &vb, &slot);
+			backend *be	  = kvcache_shift_backend(c, dev, kb);
+			be->rope_neox = m->arch_info->uses_neox_rope;
+			if (be != c->backend)
+				ensure_sync(be);
+			st = be->kv_shift(be, kb, vb, slot, chunks, n_chunks, tables, tables + tbl_floats,
+							  kvcache_kv_heads_stride(c), head_dim, c->n_ctx,
+							  model_layer_kv_heads(m, li));
+			if (st == OK && be != c->backend)
+				ensure_sync(be);
+		}
+		free(tables);
+		if (st != OK)
+			return st;
+	}
+	return OK;
 }
 
 status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
