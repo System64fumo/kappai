@@ -72,6 +72,9 @@ void run_moe_stream_tests(void) {
 	char detail[512];
 	synth_suite_common_init();
 
+	config saved_cfg = *(const config *)config_get();
+	synth_apply_config();
+
 	moe_sess streamed, resident;
 	moe_load(&streamed, synth_dsa_model_path, 128);
 	moe_load(&resident, synth_dsa_model_path, 128);
@@ -85,6 +88,7 @@ void run_moe_stream_tests(void) {
 		record_result(OPFAM_MOE_STREAM, "moe_stream.setup", V_SKIP, detail);
 		moe_free(&streamed);
 		moe_free(&resident);
+		*((config *)config_get()) = saved_cfg;
 		return;
 	}
 	resident.m.moe_stream_enabled = 0;
@@ -193,4 +197,5 @@ void run_moe_stream_tests(void) {
 
 	moe_free(&streamed);
 	moe_free(&resident);
+	*((config *)config_get()) = saved_cfg;
 }

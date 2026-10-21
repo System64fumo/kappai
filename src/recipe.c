@@ -435,7 +435,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.slot1			  = OP_NO_SLOT,
 				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
 				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT_GATE, OP_TOUCH_OUT_UP},
 			},
 		[OP_MATMUL_MULTI] =
 			{
@@ -659,19 +659,21 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_HC_PRE] =
 			{
-				.fn_name = "hc_pre",
-				.slot0	 = OP_FN_SLOT(hc_pre),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0},
-				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF), OP_TOUCH_OUT},
+				.fn_name		  = "hc_pre",
+				.slot0			  = OP_FN_SLOT(hc_pre),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF), OP_TOUCH_OUT},
+				.batch_extra_mask = (1u << RECIPE_SLOT_HC_COEF),
 			},
 		[OP_HC_POST] =
 			{
-				.fn_name = "hc_post",
-				.slot0	 = OP_FN_SLOT(hc_post),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF)},
-				.writes	 = {OP_TOUCH_OUT},
+				.fn_name		  = "hc_post",
+				.slot0			  = OP_FN_SLOT(hc_post),
+				.slot1			  = OP_NO_SLOT,
+				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF)},
+				.writes			  = {OP_TOUCH_OUT},
+				.batch_extra_mask = (1u << RECIPE_SLOT_HC_COEF),
 			},
 		[OP_HC_FINAL] =
 			{
@@ -754,11 +756,25 @@ static uint8_t touch_resolve(int8_t t, const recipe_op *op, uint8_t inplace_out_
 			slot = op->in[0];
 		return slot;
 	}
-	if (t == OP_TOUCH_OUT1)
+	if (t == OP_TOUCH_OUT1) {
+		if (op->w_idx == WIDX_GATE_UP)
+			return RECIPE_SLOT_FFN_GATE;
 		return (uint8_t)(op->out + 1);
-	if (op->w_idx != WIDX_WQ)
+	}
+	if (t == OP_TOUCH_OUT2_WQ) {
+		if (op->w_idx == WIDX_GATE_UP)
+			return RECIPE_SLOT_FFN_UP;
+		if (op->w_idx != WIDX_WQ)
+			return RECIPE_SLOT_NONE;
+		return (uint8_t)(op->out + 2);
+	}
+	if (op->out != RECIPE_SLOT_FFN_GATE_UP)
 		return RECIPE_SLOT_NONE;
-	return (uint8_t)(op->out + 2);
+	if (t == OP_TOUCH_OUT_GATE)
+		return RECIPE_SLOT_FFN_GATE;
+	if (t == OP_TOUCH_OUT_UP)
+		return RECIPE_SLOT_FFN_UP;
+	return RECIPE_SLOT_NONE;
 }
 
 int recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
@@ -2930,7 +2946,7 @@ struct batch_scratch {
 	buffer	  ple_slice_dev;
 };
 
-typedef enum {
+enum {
 	BS_SIZE_NONE = 0,
 	BS_SIZE_ATTN_BUF,
 	BS_SIZE_Q_OUT,
@@ -2938,6 +2954,8 @@ typedef enum {
 	BS_SIZE_INTER,
 	BS_SIZE_INTER_X2,
 	BS_SIZE_ACT,
+	BS_SIZE_HC,
+	BS_SIZE_HC_COEF,
 } bs_slot_size_kind;
 
 static const struct {
@@ -2961,6 +2979,8 @@ static const struct {
 	[RECIPE_SLOT_HYB_ALPHA]	  = {1, BS_SIZE_NONE},
 	[RECIPE_SLOT_HYB_BETA]	  = {1, BS_SIZE_NONE},
 	[RECIPE_SLOT_LOGITS]	  = {1, BS_SIZE_NONE},
+	[RECIPE_SLOT_HC]		  = {1, BS_SIZE_HC},
+	[RECIPE_SLOT_HC_COEF]	  = {1, BS_SIZE_HC_COEF},
 };
 
 static uint32_t bs_slot_bit(uint8_t slot) {
@@ -3011,7 +3031,7 @@ static int bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_
 }
 
 static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int intermediate,
-							int attn_buf_size, int ffn_act_size) {
+							int attn_buf_size, int ffn_act_size, int hc_flat, int hc_coef) {
 	if (slot >= RECIPE_SLOT_MAX)
 		return 0;
 	switch (bs_slot_info[slot].size_kind) {
@@ -3027,6 +3047,10 @@ static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int inte
 		return (size_t)m * 2 * (size_t)intermediate;
 	case BS_SIZE_ACT:
 		return (size_t)m * (size_t)ffn_act_size;
+	case BS_SIZE_HC:
+		return (size_t)m * (size_t)hc_flat;
+	case BS_SIZE_HC_COEF:
+		return (size_t)m * (size_t)hc_coef;
 	case BS_SIZE_NONE:
 	default:
 		return 0;
@@ -3034,8 +3058,8 @@ static size_t bs_slot_elems(uint8_t slot, int m, int q_out, int kv_out, int inte
 }
 
 static void batch_scratch_alloc(batch_scratch *bs, backend *owner, int m, int dim, int q_out,
-								int kv_out, int intermediate, int attn_buf_size,
-								uint32_t slot_mask) {
+								int kv_out, int intermediate, int attn_buf_size, uint32_t slot_mask,
+								int hc_flat, int hc_coef) {
 	int	   ffn_act_size = intermediate > dim ? intermediate : dim;
 	size_t alloc_bytes = 0, total_bytes = 0;
 	int	   fresh_alloc = 0;
@@ -3045,7 +3069,7 @@ static void batch_scratch_alloc(batch_scratch *bs, backend *owner, int m, int di
 		if (slot_mask && !(slot_mask & bs_slot_bit((uint8_t)slot)))
 			continue;
 		size_t elems = bs_slot_elems((uint8_t)slot, m, q_out, kv_out, intermediate, attn_buf_size,
-									 ffn_act_size);
+									 ffn_act_size, hc_flat, hc_coef);
 		if (!elems)
 			continue;
 		total_bytes += elems * sizeof(float);
@@ -5545,6 +5569,14 @@ static status_code mla_proj_buf(backend *a, const buffer *dev_slot, float *stack
 	return OK;
 }
 
+static const buffer *mla_host_weight(const weight_ref *w, size_t bytes, backend *host,
+									 buffer *view) {
+	if (!w->buf.owner || backend_has_cap(w->buf.owner, BCAP_IS_HOST))
+		return &w->buf;
+	*view = buffer_host_view(host, (void *)w->host_ptr, bytes);
+	return view;
+}
+
 static status_code mla_kv_put_row(exec_ctx *ctx, kvcache *cache, backend *a, const buffer *kv_a_row,
 								  int pos) {
 	const model	  *m	   = ctx->m;
@@ -5557,13 +5589,16 @@ static status_code mla_kv_put_row(exec_ctx *ctx, kvcache *cache, backend *a, con
 		return a->kv_put_mla(a, kv, slot, pos, kv_a_row, &L->kv_a_norm_w.buf, kv_lora, qk_rope,
 							 cache->n_ctx, m->norm_eps);
 
-	backend	   *host = op_backend_fallback(a, "kv_put_mla");
+	backend		 *host = op_backend_fallback(a, "kv_put_mla");
+	buffer		  norm_view;
+	const buffer *norm_w =
+		mla_host_weight(&L->kv_a_norm_w, (size_t)kv_lora * sizeof(float), host, &norm_view);
 	int			heap;
 	buffer		staged = mla_scratch_buf_alloc(NULL, 0, kv_lora + qk_rope, &heap);
 	status_code st	   = a->buffer_read_f32(a, kv_a_row, staged.handle, kv_lora + qk_rope);
 	if (st == OK)
-		st = host->kv_put_mla(host, kv, slot, pos, &staged, &L->kv_a_norm_w.buf, kv_lora, qk_rope,
-							  cache->n_ctx, m->norm_eps);
+		st = host->kv_put_mla(host, kv, slot, pos, &staged, norm_w, kv_lora, qk_rope, cache->n_ctx,
+							  m->norm_eps);
 	mla_scratch_buf_free(&staged, heap);
 	return st;
 }
@@ -5582,7 +5617,14 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 								m->mla.kv_lora, cache->n_ctx, ctx->s->rope_cos, ctx->s->rope_sin,
 								L->k_b_w.type, L->v_b_w.type, scale);
 
-	backend	   *host  = op_backend_fallback(a, "attention_mla");
+	backend		 *host = op_backend_fallback(a, "attention_mla");
+	buffer		  k_b_view, v_b_view;
+	const buffer *k_b_w = mla_host_weight(
+		&L->k_b_w, (size_t)n_heads * m->mla.qk_nope * m->mla.kv_lora * sizeof(float), host,
+		&k_b_view);
+	const buffer *v_b_w =
+		mla_host_weight(&L->v_b_w, (size_t)n_heads * m->mla.kv_lora * m->mla.v_head * sizeof(float),
+						host, &v_b_view);
 	int			q_n	  = n_heads * m->mla.qk_head;
 	int			out_n = n_heads * m->mla.v_head;
 	int			q_heap, out_heap;
@@ -5590,10 +5632,10 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 	buffer		out_host = mla_scratch_buf_alloc(NULL, 0, out_n, &out_heap);
 	status_code st		 = a->buffer_read_f32(a, q, q_host.handle, q_n);
 	if (st == OK)
-		st = host->attention_mla(host, &q_host, kv, &L->k_b_w.buf, &L->v_b_w.buf, &out_host, slot,
-								 pos, n_heads, m->mla.qk_head, m->mla.qk_rope, m->mla.qk_nope,
-								 m->mla.v_head, m->mla.kv_lora, cache->n_ctx, ctx->s->rope_cos,
-								 ctx->s->rope_sin, L->k_b_w.type, L->v_b_w.type, scale);
+		st = host->attention_mla(host, &q_host, kv, k_b_w, v_b_w, &out_host, slot, pos, n_heads,
+								 m->mla.qk_head, m->mla.qk_rope, m->mla.qk_nope, m->mla.v_head,
+								 m->mla.kv_lora, cache->n_ctx, ctx->s->rope_cos, ctx->s->rope_sin,
+								 L->k_b_w.type, L->v_b_w.type, scale);
 	if (st == OK)
 		st = a->buffer_write_f32(a, out, out_host.handle, out_n);
 	mla_scratch_buf_free(&q_host, q_heap);
@@ -6150,22 +6192,42 @@ static status_code op_hc_init(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
 	if (!a->hc_init)
 		return ERR_UNSUPPORTED;
-	hc_init_desc d = {.dim	= ctx->m->dim,
-					  .n_hc = ctx->m->kda.hc_count,
-					  .x	= exec_slot(ctx, ctx->op->in[0]),
-					  .hc	= exec_slot(ctx, ctx->op->out)};
-	return a->hc_init(a, &d);
+	const model	 *m		 = ctx->m;
+	exec_segments seg	 = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer		 *x_all	 = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *hc_all = exec_slot(ctx, ctx->op->out);
+	status_code	  st	 = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int			 row  = call * seg.rows + t;
+			buffer		 xrow = batch_row_view(x_all, row, m->dim);
+			buffer		 hrow = batch_row_view(hc_all, row, m->kda.hc_count * m->dim);
+			hc_init_desc d	  = {.dim = m->dim, .n_hc = m->kda.hc_count, .x = &xrow, .hc = &hrow};
+			st				  = a->hc_init(a, &d);
+		}
+	}
+	return st;
 }
 
 static status_code op_hc_final(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
 	if (!a->hc_final)
 		return ERR_UNSUPPORTED;
-	hc_final_desc d = {.dim	 = ctx->m->dim,
-					   .n_hc = ctx->m->kda.hc_count,
-					   .hc	 = exec_slot(ctx, ctx->op->in[0]),
-					   .x	 = exec_slot(ctx, ctx->op->out)};
-	return a->hc_final(a, &d);
+	const model	 *m		 = ctx->m;
+	exec_segments seg	 = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer		 *hc_all = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *x_all	 = exec_slot(ctx, ctx->op->out);
+	status_code	  st	 = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int			  row  = call * seg.rows + t;
+			buffer		  hrow = batch_row_view(hc_all, row, m->kda.hc_count * m->dim);
+			buffer		  xrow = batch_row_view(x_all, row, m->dim);
+			hc_final_desc d	   = {.dim = m->dim, .n_hc = m->kda.hc_count, .hc = &hrow, .x = &xrow};
+			st				   = a->hc_final(a, &d);
+		}
+	}
+	return st;
 }
 
 static status_code op_hc_pre(exec_ctx *ctx) {
@@ -6178,34 +6240,69 @@ static status_code op_hc_pre(exec_ctx *ctx) {
 	const weight_ref	*fn	   = attn ? &L->hc_attn_fn_w : &L->hc_ffn_fn_w;
 	const weight_ref	*base  = attn ? &L->hc_attn_base_w : &L->hc_ffn_base_w;
 	const weight_ref	*scale = attn ? &L->hc_attn_scale_w : &L->hc_ffn_scale_w;
-	hc_pre_desc			 d	   = {
+	exec_segments		 seg   = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer				*stream_all = exec_slot(ctx, ctx->op->in[0]);
+	buffer				*x_all		= exec_slot(ctx, ctx->op->out);
+	buffer				*coef_all	= exec_slot(ctx, RECIPE_SLOT_HC_COEF);
+	const int			 flat		= m->kda.hc_count * m->dim;
+	const int			 coef_elems = m->kda.hc_count * (m->kda.hc_count + 1);
+	hc_pre_desc			 d			= {
 		.dim			= m->dim,
 		.n_hc			= m->kda.hc_count,
 		.sinkhorn_iters = m->kda.hc_sinkhorn_iters,
 		.norm_eps		= m->norm_eps,
 		.eps			= m->kda.hc_eps,
-		.stream			= exec_slot(ctx, ctx->op->in[0]),
 		.fn				= weight_view(fn),
 		.base			= &base->buf,
 		.scale			= &scale->buf,
-		.x				= exec_slot(ctx, ctx->op->out),
-		.coef			= exec_slot(ctx, RECIPE_SLOT_HC_COEF),
 	};
 	if (backend_has_cap(a, BCAP_IS_HOST))
 		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, hc_pre_ws_floats(&d), 64);
-	return a->hc_pre(a, &d);
+	status_code st = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int	   row	= call * seg.rows + t;
+			buffer srow = batch_row_view(stream_all, row, flat);
+			buffer xrow = batch_row_view(x_all, row, m->dim);
+			buffer crow = batch_row_view(coef_all, row, coef_elems);
+			d.stream	= &srow;
+			d.x			= &xrow;
+			d.coef		= &crow;
+			st			= a->hc_pre(a, &d);
+		}
+	}
+	return st;
 }
 
 static status_code op_hc_post(exec_ctx *ctx) {
 	backend *a = exec_layer_backend(ctx);
 	if (!a->hc_post)
 		return ERR_UNSUPPORTED;
-	hc_post_desc d = {.dim	= ctx->m->dim,
-					  .n_hc = ctx->m->kda.hc_count,
-					  .sub	= exec_slot(ctx, ctx->op->in[0]),
-					  .coef = exec_slot(ctx, RECIPE_SLOT_HC_COEF),
-					  .hc	= exec_slot(ctx, ctx->op->out)};
-	return a->hc_post(a, &d);
+	const model	 *m			 = ctx->m;
+	exec_segments seg		 = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer		 *sub_all	 = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *hc_all	 = exec_slot(ctx, ctx->op->out);
+	buffer		 *coef_all	 = exec_slot(ctx, RECIPE_SLOT_HC_COEF);
+	const int	  flat		 = m->kda.hc_count * m->dim;
+	const int	  coef_elems = m->kda.hc_count * (m->kda.hc_count + 1);
+	status_code	  st		 = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int			 row	= call * seg.rows + t;
+			buffer		 subrow = batch_row_view(sub_all, row, flat);
+			buffer		 crow	= batch_row_view(coef_all, row, coef_elems);
+			buffer		 hrow	= batch_row_view(hc_all, row, flat);
+			hc_post_desc d		= {
+				.dim  = m->dim,
+				.n_hc = m->kda.hc_count,
+				.sub  = &subrow,
+				.coef = &crow,
+				.hc	  = &hrow,
+			};
+			st = a->hc_post(a, &d);
+		}
+	}
+	return st;
 }
 
 static status_code op_kda(exec_ctx *ctx) {
@@ -6221,10 +6318,8 @@ static status_code op_kda(exec_ctx *ctx) {
 		.n_heads		  = m->n_heads,
 		.head_dim		  = m->kda.head_dim,
 		.conv_kernel	  = m->hybrid.conv_kernel,
-		.reset			  = ctx->pos_start == 0,
 		.gate_lower_bound = m->kda.gate_lower_bound,
 		.norm_eps		  = m->norm_eps,
-		.x				  = exec_slot(ctx, ctx->op->in[0]),
 		.wq				  = weight_view(&L->wq),
 		.wk				  = weight_view(&L->wk),
 		.wv				  = weight_view(&L->wv),
@@ -6240,13 +6335,32 @@ static status_code op_kda(exec_ctx *ctx) {
 		.dt_bias		  = &L->ssm_dt_b.buf,
 		.ssm_a			  = &L->ssm_a.buf,
 		.out_norm		  = &L->ssm_norm_w.buf,
-		.conv_state		  = &c->conv_buf[ctx->li],
-		.state			  = &c->state_buf[ctx->li],
-		.out			  = exec_slot(ctx, ctx->op->out),
 	};
 	if (backend_has_cap(a, BCAP_IS_HOST))
 		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, kda_ws_floats(&d), 64);
-	return a->kda(a, &d);
+
+	exec_segments seg	  = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer		 *x_all	  = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *out_all = exec_slot(ctx, ctx->op->out);
+	status_code	  st	  = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		kvcache		   *rcache = exec_segment_cache(ctx, call);
+		kvcache_hybrid *rc	   = rcache ? rcache->hybrid : c;
+		if (!rc || !rc->conv_buf || !rc->state_buf)
+			return ERR_UNSUPPORTED;
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int	   row	 = call * seg.rows + t;
+			buffer xrow	 = batch_row_view(x_all, row, m->dim);
+			buffer orow	 = batch_row_view(out_all, row, m->dim);
+			d.x			 = &xrow;
+			d.out		 = &orow;
+			d.conv_state = &rc->conv_buf[ctx->li];
+			d.state		 = &rc->state_buf[ctx->li];
+			d.reset		 = exec_row_pos(ctx, row) == 0;
+			st			 = a->kda(a, &d);
+		}
+	}
+	return st;
 }
 
 static status_code op_mla_absorbed(exec_ctx *ctx) {
@@ -6263,30 +6377,47 @@ static status_code op_mla_absorbed(exec_ctx *ctx) {
 	int	   n_threads = pool ? tpool_n_threads(pool) : 1;
 
 	mla_absorbed_desc d = {
-		.dim		  = m->dim,
-		.n_heads	  = m->n_heads,
-		.kv_lora	  = m->mla.kv_lora,
-		.qk_head	  = m->mla.qk_head,
-		.v_head		  = m->mla.v_head,
-		.q_lora		  = m->mla.q_lora,
-		.pos		  = ctx->pos,
-		.n_threads	  = n_threads < 1 ? 1 : n_threads,
-		.norm_eps	  = m->norm_eps,
-		.x			  = exec_slot(ctx, ctx->op->in[0]),
-		.q_a		  = weight_view(&L->q_a_w),
-		.q_b		  = weight_view(&L->q_b_w),
-		.kv_a		  = weight_view(&L->kv_a_w),
-		.wo			  = weight_view(&L->wo),
-		.q_a_norm	  = &L->q_a_norm_w.buf,
-		.kv_a_norm	  = &L->kv_a_norm_w.buf,
-		.k_b		  = &L->k_b_w.buf,
-		.v_b		  = &L->v_b_w.buf,
-		.latent_cache = &c->latent_buf[ctx->li],
-		.out		  = exec_slot(ctx, ctx->op->out),
+		.dim	   = m->dim,
+		.n_heads   = m->n_heads,
+		.kv_lora   = m->mla.kv_lora,
+		.qk_head   = m->mla.qk_head,
+		.v_head	   = m->mla.v_head,
+		.q_lora	   = m->mla.q_lora,
+		.n_threads = n_threads < 1 ? 1 : n_threads,
+		.norm_eps  = m->norm_eps,
+		.q_a	   = weight_view(&L->q_a_w),
+		.q_b	   = weight_view(&L->q_b_w),
+		.kv_a	   = weight_view(&L->kv_a_w),
+		.wo		   = weight_view(&L->wo),
+		.q_a_norm  = &L->q_a_norm_w.buf,
+		.kv_a_norm = &L->kv_a_norm_w.buf,
+		.k_b	   = &L->k_b_w.buf,
+		.v_b	   = &L->v_b_w.buf,
 	};
 	if (backend_has_cap(a, BCAP_IS_HOST))
 		d.ws = float_buf_ensure_nocopy(&ctx->s->op_ws, mla_absorbed_ws_floats(&d), 64);
-	return a->mla_absorbed(a, &d);
+
+	exec_segments seg	  = exec_is_batch(ctx) ? exec_segments_of(ctx) : (exec_segments){1, 1};
+	buffer		 *x_all	  = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *out_all = exec_slot(ctx, ctx->op->out);
+	status_code	  st	  = OK;
+	for (int call = 0; call < seg.n_calls && st == OK; call++) {
+		kvcache		   *rcache = exec_segment_cache(ctx, call);
+		kvcache_hybrid *rc	   = rcache ? rcache->hybrid : c;
+		if (!rc || !rc->latent_buf)
+			return ERR_UNSUPPORTED;
+		for (int t = 0; t < seg.rows && st == OK; t++) {
+			int	   row	   = call * seg.rows + t;
+			buffer xrow	   = batch_row_view(x_all, row, m->dim);
+			buffer orow	   = batch_row_view(out_all, row, m->dim);
+			d.latent_cache = &rc->latent_buf[ctx->li];
+			d.x			   = &xrow;
+			d.out		   = &orow;
+			d.pos		   = exec_row_pos(ctx, row);
+			st			   = a->mla_absorbed(a, &d);
+		}
+	}
+	return st;
 }
 
 static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
@@ -6521,7 +6652,10 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 	uint32_t slot_mask = r->bs_slot_mask;
 	if (!slot_mask)
 		slot_mask = 0xffffffffu;
-	batch_scratch_alloc(bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size, slot_mask);
+	batch_scratch_alloc(
+		bs, a, n_tokens, dim, q_out, kv_out, max_inter, attn_buf_size, slot_mask,
+		m->arch_info->has_hyper_connections ? m->kda.hc_count * m->dim : 0,
+		m->arch_info->has_hyper_connections ? m->kda.hc_count * (m->kda.hc_count + 1) : 0);
 	if (m->arch_info->is_hybrid_recurrent) {
 		bs_ensure_slot(bs, a, RECIPE_SLOT_HYB_PROJ, (size_t)n_tokens * model_hybrid_proj_size(m));
 		bs_ensure_slot(bs, a, RECIPE_SLOT_HYB_GATE, (size_t)n_tokens * model_hybrid_gate_size(m));
@@ -6594,18 +6728,34 @@ static status_code compute_forward_batch_recipe_fast(struct model *m, struct kvc
 		st = OK;
 	}
 
+	int n_hc_copy = 0;
+	for (int i = 0; i < r->n_post_ops; i++)
+		if (r->post_ops[i].kind == OP_HC_FINAL)
+			n_hc_copy = m->arch_info->has_hyper_connections ? m->kda.hc_count * m->dim : 0;
+
 	for (int out_row = 0; out_row < n_out; out_row++) {
 		const int src_row = row_pos ? out_row : n_tokens - 1;
 		const int pos	  = row_pos ? row_pos[out_row] : pos_start + n_tokens - 1;
 		buffer	  last_x  = batch_row_view(&bs->pair[RECIPE_SLOT_X].b, src_row, dim);
 		backend	 *owner_x = s->slots[RECIPE_SLOT_X].owner;
-		float	 *tmp	  = float_buf_ensure(&s->batch_logits_tmp, (size_t)dim);
-		st				  = a->buffer_read_f32(a, &last_x, tmp, dim);
+		float	 *tmp =
+			float_buf_ensure(&s->batch_logits_tmp, (size_t)(dim > n_hc_copy ? dim : n_hc_copy));
+		st = a->buffer_read_f32(a, &last_x, tmp, dim);
 		if (st != OK)
 			goto done;
 		st = owner_x->buffer_write_f32(owner_x, &s->slots[RECIPE_SLOT_X], tmp, dim);
 		if (st != OK)
 			goto done;
+		if (n_hc_copy) {
+			buffer	 hc_row	  = batch_row_view(&bs->pair[RECIPE_SLOT_HC].b, src_row, n_hc_copy);
+			backend *owner_hc = s->slots[RECIPE_SLOT_HC].owner;
+			st				  = a->buffer_read_f32(a, &hc_row, tmp, n_hc_copy);
+			if (st != OK)
+				goto done;
+			st = owner_hc->buffer_write_f32(owner_hc, &s->slots[RECIPE_SLOT_HC], tmp, n_hc_copy);
+			if (st != OK)
+				goto done;
+		}
 
 		float *row_logits = logits_out ? logits_out + (size_t)out_row * m->vocab_size : NULL;
 		for (int i = 0; i < r->n_post_ops; i++) {

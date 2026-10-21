@@ -40,6 +40,8 @@
 #define OP_TOUCH_OUT 4
 #define OP_TOUCH_OUT1 5
 #define OP_TOUCH_OUT2_WQ 6
+#define OP_TOUCH_OUT_GATE 7
+#define OP_TOUCH_OUT_UP 8
 #define OP_TOUCH_SLOT(s) (-(int)(s) - 1)
 #define OP_TOUCH_MAX 6
 

@@ -100,6 +100,7 @@ typedef struct layer_weights {
 	bool	is_recurrent;
 	bool	mla_kb_f32;
 	bool	mla_vb_f32;
+	bool	mla_kvn_host;
 	bool	is_moe_layer;
 	bool	any_fused_experts;
 	bool	experts_resident;

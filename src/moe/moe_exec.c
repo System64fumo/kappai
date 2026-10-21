@@ -33,19 +33,30 @@ static status_code device_submit(moe_exec_target *t, const moe_exec_request *rq,
 		const moe_expert_slot *sl = &t->slots[k];
 		if (sl->eid < 0 || !moe_slot_present(sl))
 			continue;
-		if (!sl->dev_ready || sl->dev_gate.owner != eb) {
-			backend_report_host_fallback(
-				eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
-				"layer %d expert %d slot %s (dev_ready=%d)", rq->layer, sl->eid,
-				sl->dev_ready ? "owned by another backend" : "not resident on device",
-				(int)sl->dev_ready);
-			st = ERR_UNSUPPORTED;
-			break;
+		moe_expert_slot live = *sl;
+		if (!sl->dev_ready) {
+			if (sl->dev_gate.owner) {
+				backend_report_host_fallback(
+					eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
+					"layer %d expert %d resident on '%s', not on '%s'", rq->layer, sl->eid,
+					sl->dev_gate.owner->name ? sl->dev_gate.owner->name : "?",
+					eb->name ? eb->name : "?");
+				st = ERR_UNSUPPORTED;
+				break;
+			}
+			status_code us = moe_stream_upload_live(m, rq->layer, sl->eid, eb, &live);
+			if (us != OK) {
+				backend_report_host_fallback(eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
+											 "layer %d expert %d upload to device failed (st=%d)",
+											 rq->layer, sl->eid, (int)us);
+				st = ERR_UNSUPPORTED;
+				break;
+			}
 		}
 		moe_resident_expert ge = {
-			.gate_w		   = &sl->dev_gate,
-			.up_w		   = &sl->dev_up,
-			.down_w		   = &sl->dev_down,
+			.gate_w		   = &live.dev_gate,
+			.up_w		   = &live.dev_up,
+			.down_w		   = &live.dev_down,
 			.gate_type	   = sl->gate_type,
 			.up_type	   = sl->up_type,
 			.down_type	   = sl->down_type,
@@ -155,8 +166,12 @@ static void submit_target(moe_exec_request *rq, moe_exec_pending *pend, backend 
 			pend->n_direct++;
 		return;
 	}
-	WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
-		 eb->name ? eb->name : "?", rq->layer, status_str(st));
+	if (st == ERR_UNSUPPORTED)
+		DEBUG("moe expert ffn on '%s' layer %d unsupported (%s) -- experts execute on the host",
+			  eb->name ? eb->name : "?", rq->layer, status_str(st));
+	else
+		WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
+			 eb->name ? eb->name : "?", rq->layer, status_str(st));
 }
 
 int moe_exec_dispatch(moe_exec_request *rq, backend *local, const buffer *xb, const int *expert_ids,

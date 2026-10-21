@@ -423,10 +423,11 @@ static void check_device_name(violations *v, const hcs_config *h, int idx,
 static void check_device_fields(violations *v, const hcs_config *h, int idx, int *star_owner) {
 	const hcs_device *d = &h->devices[idx];
 	if (d->tasks != HCS_TASKS_ALL)
-		add_violation(v, d->name, "tasks",
-					  !d->tasks ? "no tasks listed; a device must run both prefill and decode"
-								: "splitting prefill/decode execution is not supported yet; "
-								  "a device must run both ('tasks = prefill, decode')");
+		add_violation(
+			v, d->name, "tasks",
+			!d->tasks ? "no tasks listed; a device must run both prefill and decode"
+					  : "splitting prefill/decode execution is not supported yet; "
+						"a device must run both prefill and decode ('tasks = prefill, decode')");
 	if (d->layers == HCS_COUNT_UNSET)
 		add_violation(v, d->name, "layers", "not set; use a layer count or '*'");
 	if (d->layers != HCS_COUNT_ALL)

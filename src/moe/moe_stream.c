@@ -99,6 +99,7 @@ struct moe_stream_cache {
 	_Atomic uint64_t stat_fill_direct_fallback_copy;
 	_Atomic uint64_t stat_fill_memcpy;
 	_Atomic uint64_t stat_fill_bytes;
+	int				 pin_fail_warned;
 };
 
 typedef struct {
@@ -443,6 +444,7 @@ static int moe_fill_chunk_do_read(moe_fill_chunk *ch) {
 		if (!ok) {
 			memcpy(ch->dst, ch->mmap_src, ch->len);
 			atomic_fetch_add_explicit(&c->stat_fill_direct_fallback_copy, 1, memory_order_relaxed);
+			ok = 1;
 		}
 		atomic_fetch_add_explicit(&c->stat_fill_bytes, ch->len, memory_order_relaxed);
 		return ok;
@@ -504,6 +506,15 @@ static status_code moe_pin_prepare_slot(struct model *m, moe_stream_cache *c, in
 	s->down_w	 = buf + gate_b + up_b;
 	s->heap_buf	 = buf;
 	s->heap_size = total;
+
+	if (!c->use_mmap && c->nomap_fd < 0) {
+		const struct expert_desc *ed = &m->layers[layer].experts[e];
+		memcpy(buf, ed->gate_w, gate_b);
+		if (!fused)
+			memcpy(buf + gate_b, ed->up_w, up_b);
+		memcpy(buf + gate_b + up_b, ed->down_w, down_b);
+		return OK;
+	}
 
 	if (!c->use_mmap) {
 		const struct expert_desc *ed	   = &m->layers[layer].experts[e];
@@ -628,7 +639,7 @@ static void *pin_copy_worker(void *arg) {
 			atomic_fetch_add_explicit(&j->total_copied, s->heap_size, memory_order_relaxed);
 			atomic_fetch_add_explicit(&j->n_copied, 1, memory_order_relaxed);
 		} else {
-			WARN("moe pin-copy: layer=%d eid=%d failed (st=%d)", layer, s->eid, st);
+			DEBUG("moe pin-copy: layer=%d eid=%d failed (st=%d)", layer, s->eid, (int)st);
 			s->heap_buf	 = NULL;
 			s->heap_size = 0;
 			s->gate_w = s->up_w = s->down_w = NULL;
@@ -937,8 +948,14 @@ static void moe_slot_to_host_fallback(struct model *m, moe_stream_cache *c, int 
 									  moe_expert_slot *sl) {
 	status_code st = moe_pin_copy_slot(m, c, layer, sl, NULL, 0);
 	if (st != OK) {
-		WARN("moe upload fallback: layer=%d eid=%d host pin failed (st=%d)", layer, sl->eid,
-			 (int)st);
+		int warned = atomic_fetch_add_explicit(&c->pin_fail_warned, 1, memory_order_relaxed);
+		if (warned == 0)
+			WARN("moe upload fallback: host pin failed for layer=%d eid=%d (st=%d); streaming "
+				 "falls back to direct host execution",
+				 layer, sl->eid, (int)st);
+		else
+			DEBUG("moe upload fallback: layer=%d eid=%d host pin failed (st=%d)", layer, sl->eid,
+				  (int)st);
 		sl->gate_w = sl->up_w = sl->down_w = NULL;
 		sl->eid							   = -1;
 	}
@@ -1438,6 +1455,20 @@ status_code moe_stream_cache_init(struct model *m) {
 
 			INFO("moe pin-copy: %d experts, %.1f MB in %.1f s (%.0f MB/s)", n_copied, mb, secs,
 				 mbps);
+			int n_err = atomic_load(&job.n_err);
+			if (n_err > 0) {
+				int warned =
+					atomic_fetch_add_explicit(&c->pin_fail_warned, 1, memory_order_relaxed);
+				if (warned == 0)
+					WARN("moe pin-copy: %d/%d experts failed (first error: %s) "
+						 "[use_mmap=%d direct_fd=%d align=%zu nomap_fd=%d nomap_direct_fd=%d]; "
+						 "those slots fall back to on-demand fills",
+						 n_err, n_total, status_str((status_code)atomic_load(&job.first_err)),
+						 c->use_mmap, c->direct_io_fd, c->direct_io_align, c->nomap_fd,
+						 c->nomap_direct_fd);
+				else
+					DEBUG("moe pin-copy: %d/%d experts failed", n_err, n_total);
+			}
 
 			if (g_monitor && g_monitor->fd >= 0) {
 				monitor_emit_load_pin_copy_done(g_monitor, n_copied, mb, elapsed_us / 1000);
@@ -1657,6 +1688,7 @@ static moe_expert_slot *layer_insert_lru(struct model *m, moe_stream_cache *c, i
 		atomic_fetch_add_explicit(&sl->lru_slots[idx].gen, 1, memory_order_acq_rel);
 
 		moe_expert_slot *victim = &sl->lru_slots[idx];
+		moe_slot_free_dev_buffers(victim);
 		if (victim->eid >= 0 && sl->eid_to_lru[victim->eid] == idx)
 			sl->eid_to_lru[victim->eid] = -1;
 		if (victim->heap_buf) {
@@ -1939,6 +1971,7 @@ static void lru_slot_clear(moe_stream_cache *c, struct moe_stream_layer *L, int 
 	atomic_fetch_add_explicit(&s->gen, 1, memory_order_acq_rel);
 	if (s->eid >= 0 && L->eid_to_lru[s->eid] == idx)
 		L->eid_to_lru[s->eid] = -1;
+	moe_slot_free_dev_buffers(s);
 	s->heap_buf	 = NULL;
 	s->heap_size = 0;
 	s->gate_w = s->up_w = s->down_w = NULL;
@@ -2662,6 +2695,38 @@ void moe_stream_wait_slot(const moe_expert_slot *slot) {
 	if (!slot)
 		return;
 	spin_wait_relax(moe_slot_ready_pred, (void *)slot);
+}
+
+status_code moe_stream_upload_live(struct model *m, int layer, int eid, backend *eb,
+								   moe_expert_slot *out) {
+	if (!m || !m->moe_cache || !eb || layer < 0 || layer >= m->n_layers || eid < 0 ||
+		eid >= m->moe.n_experts || !m->layers[layer].experts)
+		return ERR_INVALID_ARG;
+	if (eb == backend_host())
+		return ERR_UNSUPPORTED;
+
+	moe_stream_cache		*c	= m->moe_cache;
+	struct moe_stream_layer *L	= &c->layers[layer];
+	status_code				 st = ERR_UNSUPPORTED;
+
+	pthread_mutex_lock(&L->mtx);
+	moe_expert_slot *s = layer_find(L, eid, tier_clock(c));
+	if (s && s->dev_ready) {
+		st = s->dev_gate.owner == eb ? OK : ERR_UNSUPPORTED;
+	} else if (s && !s->dev_gate.owner) {
+		moe_upload_item it			 = {.slot = s, .be = eb, .layer = layer};
+		size_t			uplue		 = 0;
+		it.tmp						 = *s;
+		const struct expert_desc *ed = &m->layers[layer].experts[eid];
+		it.tmp.gate_w				 = s->gate_w ? s->gate_w : ed->gate_w;
+		it.tmp.up_w					 = s->gate_up_fused ? NULL : (s->up_w ? s->up_w : ed->up_w);
+		it.tmp.down_w				 = s->down_w ? s->down_w : ed->down_w;
+		st							 = moe_upload_one(m, &it, &uplue) ? OK : ERR_UNSUPPORTED;
+	}
+	if (st == OK && s && out)
+		*out = *s;
+	pthread_mutex_unlock(&L->mtx);
+	return st;
 }
 
 void moe_stream_release_slot(struct model *m, int layer, const moe_expert_slot *slot) {

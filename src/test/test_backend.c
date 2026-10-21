@@ -4458,9 +4458,6 @@ static void run_native_exec_op_tests(backend *ref, backend *tgt) {
 }
 
 void run_per_op_tests(backend *ref, backend *tgt) {
-	printf("\n========================================\n");
-	printf("Per-op validation: %s  vs  %s (reference)\n", tgt->name, ref->name);
-	printf("========================================\n");
 	print_op_coverage(ref, tgt);
 
 	int shapes[][2] = {{32, 32}, {128, 256}, {64, 512}, {17, 256}, {512, 512}};

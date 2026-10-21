@@ -334,6 +334,7 @@ typedef struct {
 	const float *rope_ff_base;
 	int			 rope_ff_pos;
 	int			 rope_ff_head_dim;
+	int			 rope_ff_n_ctx;
 	float		 rope_ff_theta;
 	int			 rope_half_stored;
 	int			 rope_n_ctx_stored;
@@ -5015,9 +5016,9 @@ static void vk_synchronize(backend *self) {
 	if (r->has_work) {
 		status_code fs = vk_flush(p);
 		if (fs != OK) {
-			ERROR("vk: vk_synchronize: flush failed (%s) -- "
+			ERROR("vk: vk_synchronize: flush failed (%d=%s) -- "
 				  "pending work was NOT executed",
-				  status_str(fs));
+				  (int)fs, status_str(fs));
 		}
 	}
 }
@@ -5061,7 +5062,7 @@ static void vk_end_batch(backend *self) {
 		if (fs != OK) {
 			ERROR("vk: vk_end_batch: flush failed (%s) -- "
 				  "batch was NOT submitted to the device",
-				  (int)fs);
+				  status_str(fs));
 		}
 	}
 }
@@ -5897,8 +5898,9 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 			return ERR_INVALID_ARG;
 		size_t table_floats = (size_t)n_ctx * (size_t)half;
 		size_t need			= table_floats * 2 * sizeof(float);
-		int table_stale = (need > (size_t)p->rope_ff_cap || p->rope_ff_base != freq_factors ||
-						   p->rope_ff_head_dim != head_dim || p->rope_ff_theta != self->rope_theta);
+		int	   table_stale	= (need > (size_t)p->rope_ff_cap || p->rope_ff_base != freq_factors ||
+							   p->rope_ff_head_dim != head_dim || p->rope_ff_n_ctx != n_ctx ||
+							   p->rope_ff_theta != self->rope_theta);
 		if (table_stale) {
 			if (need > (size_t)p->rope_ff_cap) {
 				if (p->rope_ff_buf.handle) {
@@ -5939,6 +5941,7 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 				return s;
 			p->rope_ff_base		= freq_factors;
 			p->rope_ff_head_dim = head_dim;
+			p->rope_ff_n_ctx	= n_ctx;
 			p->rope_ff_theta	= self->rope_theta;
 		}
 		struct {

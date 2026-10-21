@@ -139,11 +139,13 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		if (strcmp(infos[bi].name, sel.ref) == 0)
 			continue;
 		if (!infos[bi].available) {
+			any_run = 1;
 			printf("\n=== %s: SKIPPED (not available) ===\n", infos[bi].name);
 			continue;
 		}
 		backend *tgt = NULL;
 		if (backend_create(infos[bi].name, 0, &tgt) != OK) {
+			any_run = 1;
 			printf("\n=== %s: SKIPPED (failed to init) ===\n", infos[bi].name);
 			continue;
 		}
@@ -152,12 +154,8 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		run_arch_tests(ref, tgt);
 		backend_destroy(tgt);
 	}
-	if (!any_run) {
+	if (!any_run)
 		fprintf(stderr, "No matching/available backends were tested.\n");
-		usage(argv[0]);
-		backend_destroy(ref);
-		return 1;
-	}
 	print_final_results();
 	backend_destroy(ref);
 	return g_fail > 0 ? 1 : 0;

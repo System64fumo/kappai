@@ -82,6 +82,18 @@ static void test_touch_contents(void) {
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
 	ok = nr == 3 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
 	record_plan("touch.mla_qkv_fused", ok, "nr=%d nw=%d", nr, nw);
+
+	op.kind	 = OP_MATMUL;
+	op.out	 = RECIPE_SLOT_FFN_GATE_UP;
+	op.w_idx = WIDX_GATE_UP;
+	nr = nw = 0;
+	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
+	ok = nr == 1 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
+	op.out = RECIPE_SLOT_ATTN_OUT;
+	nr = nw = 0;
+	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
+	ok &= nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_ATTN_OUT;
+	record_plan("touch.matmul_gate_up_slices", ok, "nr=%d nw=%d", nr, nw);
 }
 
 static void set_mm(recipe_op *op, uint8_t out) {

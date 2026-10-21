@@ -16,9 +16,11 @@ layout(std430, binding = 2) buffer YBuf {
 layout(std430, binding = 3) readonly buffer ResBuf {
 	float res[];
 };
+#ifndef REPACKED
 layout(std430, binding = 4) readonly buffer GridBuf {
 	uint grid[];
 };
+#endif
 layout(location = 0) uniform int u_n;
 layout(location = 1) uniform int u_k_blocks;
 layout(location = 2) uniform int u_add_residual;
@@ -29,6 +31,11 @@ layout(location = 11) uniform int u_wg_base;
 uint g_mi;
 
 #define ROWS 32
+
+#ifdef REPACKED
+#define GROUP_ROWS 8u
+#define BLOCK_GROUP_BYTES 1072u
+#endif
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -43,6 +50,12 @@ int xq8(uint bb, int e) {
 	return bitfieldExtract(int(xq[bb + uint(e >> 2)]), (e & 3) * 8, 8);
 }
 
+#ifdef REPACKED
+int decode_code(uint c) {
+	return c < 8u ? int(2u * c + 1u) : -int(2u * (c - 8u) + 1u);
+}
+#endif
+
 void store_row(uint idx, float acc) {
 	if (u_add_residual == 1)
 		y[g_mi * uint(u_n) + idx] = acc + res[idx];
@@ -52,6 +65,49 @@ void store_row(uint idx, float acc) {
 		y[g_mi * uint(u_n) + idx] = acc;
 }
 
+#ifdef REPACKED
+void main(void) {
+	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb	  = uint(max(u_m, 1));
+	g_mi	  = wgid % mb;
+	wgid	  = wgid / mb;
+	uint row  = wgid * uint(ROWS) + gl_LocalInvocationID.x;
+	if (int(row) >= u_n)
+		return;
+	uint group	   = row / GROUP_ROWS;
+	uint lane	   = row % GROUP_ROWS;
+	uint group_off = group * uint(u_k_blocks) * BLOCK_GROUP_BYTES;
+
+	float acc = 0.0;
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		uint  xbq	   = g_mi * uint(u_x_stride) + uint(bi) * 212u;
+		float xd	   = uintBitsToFloat(xq[xbq + 80u]);
+		uint  blk	   = group_off + uint(bi) * BLOCK_GROUP_BYTES;
+		float dw	   = h2f(rb(blk + lane * 2u) | (rb(blk + lane * 2u + 1u) << 8u));
+		uint  scales_o = blk + GROUP_ROWS * 2u + lane * 4u;
+		uint  idx_o	   = blk + GROUP_ROWS * 2u + GROUP_ROWS * 4u + lane * 128u;
+		int	  total	   = 0;
+		for (int gr = 0; gr < 8; gr++) {
+			uint sb		   = rb(scales_o + uint(gr >> 1));
+			int	 sc		   = (gr & 1) != 0 ? 1 + 2 * int(sb >> 4u) : 1 + 2 * int(sb & 0xFu);
+			uint word_o	   = (idx_o + uint(gr) * 16u) >> 2u;
+			int	 group_sum = 0;
+			for (int wi = 0; wi < 4; wi++) {
+				uint wd = w[word_o + uint(wi)];
+				for (int b = 0; b < 4; b++) {
+					uint v = (wd >> uint(b * 8)) & 0xFFu;
+					int	 e = wi * 4 + b;
+					group_sum += decode_code(v & 0xFu) * xq8(xbq, gr * 32 + e);
+					group_sum += decode_code(v >> 4u) * xq8(xbq, gr * 32 + 16 + e);
+				}
+			}
+			total += sc * group_sum;
+		}
+		acc += dw * xd * float(total);
+	}
+	store_row(row, acc);
+}
+#else
 void main(void) {
 	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	  = uint(max(u_m, 1));
@@ -154,3 +210,4 @@ void main(void) {
 	}
 	store_row(row, acc);
 }
+#endif

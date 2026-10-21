@@ -23,7 +23,7 @@ void xq8_quant_superblock(int bi, int block_start, int tile_start) {
 		return;
 	}
 
-	float iscale = -127.0 / maxv;
+	float iscale = div_exact(-127.0, maxv);
 	for (int w = 0; w < 64; w++) {
 		int a			  = clamp(nearest_int(iscale * x_shared[xb + w * 4 + 0]), -127, 127);
 		int b			  = clamp(nearest_int(iscale * x_shared[xb + w * 4 + 1]), -127, 127);
@@ -44,5 +44,5 @@ void xq8_quant_superblock(int bi, int block_start, int tile_start) {
 		xq_bsums[local_bi * 16 + j] = sum;
 	}
 #endif
-	xq_d[local_bi] = 1.0 / iscale;
+	xq_d[local_bi] = div_exact(1.0, iscale);
 }

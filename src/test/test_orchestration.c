@@ -18,12 +18,7 @@ char synth_dsa_model_path[512];
 char synth_tied_model_path[512];
 char synth_tied_twin_path[512];
 
-void synth_suite_common_init(void) {
-	static int done = 0;
-	if (done)
-		return;
-	done = 1;
-
+void synth_apply_config(void) {
 	config cfg				  = config_defaults();
 	cfg.device				  = "cpu_0";
 	cfg.model				  = synth_chat_model_path;
@@ -33,6 +28,15 @@ void synth_suite_common_init(void) {
 	cfg.moe_cache_cap		  = 2;
 	cfg.seed				  = 7;
 	*((config *)config_get()) = cfg;
+}
+
+void synth_suite_common_init(void) {
+	static int done = 0;
+	if (done)
+		return;
+	done = 1;
+
+	synth_apply_config();
 
 	const char *tmpdir = getenv("TMPDIR");
 	snprintf(synth_fixture_dir, sizeof(synth_fixture_dir), "%s/kappai_test_fixtures",

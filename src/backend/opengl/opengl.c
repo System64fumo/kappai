@@ -59,6 +59,7 @@ typedef enum {
 	GL_PIPE_MATMUL_Q5_K,
 	GL_PIPE_MATMUL_Q6_K,
 	GL_PIPE_MATMUL_IQ3_S,
+	GL_PIPE_MATMUL_IQ3_S_REPACKED,
 	GL_PIPE_MATMUL_IQ2_S,
 	GL_PIPE_MATMUL_IQ2_XXS,
 	GL_PIPE_MATMUL_IQ3_XXS,
@@ -209,6 +210,7 @@ typedef struct {
 	int		 k, m;
 	int		 act;
 	gl_buf	*up;
+	int		 stride;
 	float	 gs, us;
 	gl_buf	*stage;
 	uint64_t gen;
@@ -1170,9 +1172,12 @@ static status_code gl_init(backend *self, int device_index) {
 								  GL_PIPE_F_MATMUL_WG | GL_PIPE_F_USES_XQK, GGML_TYPE_Q6_K, 4, 256},
 		[GL_PIPE_MATMUL_IQ3_S] = {"matmul_iq3_s", gl_shader_matmul_iq3_s_src, GL_PIPE_F_USES_XQK,
 								  GGML_TYPE_IQ3_S, 32, 256},
-		[GL_PIPE_MATMUL_IQ2_S] = {"matmul_iq2_s", gl_shader_matmul_iq2_s_src,
-								  GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ2_S, 32,
-								  256},
+		[GL_PIPE_MATMUL_IQ3_S_REPACKED] = {"matmul_iq3_s_repacked", gl_shader_matmul_iq3_s_src,
+										   GL_PIPE_F_REPACKED | GL_PIPE_F_USES_XQK,
+										   GGML_TYPE_IQ3_S_REPACKED, 32, 256},
+		[GL_PIPE_MATMUL_IQ2_S]	 = {"matmul_iq2_s", gl_shader_matmul_iq2_s_src,
+									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ2_S, 32,
+									256},
 		[GL_PIPE_MATMUL_IQ2_XXS] = {"matmul_iq2_xxs", gl_shader_matmul_iq2_xxs_src,
 									GL_PIPE_F_USES_XQK | GL_PIPE_F_IQX_GRID, GGML_TYPE_IQ2_XXS, 32,
 									256},
@@ -1460,7 +1465,8 @@ static void gl_free(backend *self) {
 static int gl_type_is_repacked(uint32_t type) {
 	return type == GGML_TYPE_Q4_0_REPACKED || type == GGML_TYPE_Q8_0_REPACKED ||
 		   type == GGML_TYPE_IQ4_NL_REPACKED || type == GGML_TYPE_Q4_K_REPACKED ||
-		   type == GGML_TYPE_Q5_K_REPACKED || type == GGML_TYPE_Q6_K_REPACKED;
+		   type == GGML_TYPE_Q5_K_REPACKED || type == GGML_TYPE_Q6_K_REPACKED ||
+		   type == GGML_TYPE_IQ3_S_REPACKED;
 }
 
 static int gl_matmul_pipe_for_type(gl_priv *p, uint32_t w_type, gl_pipeline **out_pipe,
@@ -2678,6 +2684,8 @@ static status_code gl_repack_plan(backend *self, uint32_t type, uint64_t d0, uin
 			re_type = GGML_TYPE_Q8_0_REPACKED;
 		else if (type == GGML_TYPE_IQ4_NL && d0 % 32 == 0)
 			re_type = GGML_TYPE_IQ4_NL_REPACKED;
+		else if (type == GGML_TYPE_IQ3_S && d0 % 256 == 0)
+			re_type = GGML_TYPE_IQ3_S_REPACKED;
 		else if (type == GGML_TYPE_Q4_K && d0 % 256 == 0)
 			re_type = GGML_TYPE_Q4_K_REPACKED;
 		else if (type == GGML_TYPE_Q5_K && d0 % 256 == 0)
@@ -2768,7 +2776,8 @@ typedef struct {
 
 static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_buf **slot,
 								   size_t *row_words, const buffer *x, int k, int m,
-								   const buffer *up, int activation, float gs, float us) {
+								   const buffer *up, int activation, float gs, float us,
+								   int row_stride) {
 	gl_pipeline *pipe = &p->pipes[up ? spec->act_pipe : spec->plain_pipe];
 	if (!pipe->program || m > (int)GL_MAX_DISPATCH_PER_DIM)
 		return ERR_UNSUPPORTED;
@@ -2789,7 +2798,7 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 			continue;
 		gl_buf *upb = up ? as_glbuf(up) : NULL;
 		if (c->src == as_glbuf(x) && c->src_offset == x->offset && c->k == k && c->m == m &&
-			c->act == (up ? activation : -1) && c->up == upb &&
+			c->act == (up ? activation : -1) && c->up == upb && c->stride == row_stride &&
 			(!up || (c->gs == gs && c->us == us))) {
 			hit = c;
 			break;
@@ -2834,6 +2843,8 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 		gl_pu(pipe, "u_act", activation);
 		gl_puf(pipe, "u_gs", gs);
 		gl_puf(pipe, "u_us", us);
+		gl_pu(pipe, "u_stride", row_stride > 0 ? row_stride : k);
+		gl_pu(pipe, "u_up_off", row_stride > 0 ? k : 0);
 	}
 	gl_bind_raw(p, 1, (*slot)->name, 0, 0, 1);
 	gl_pu(pipe, "u_k_blocks", k_blocks);
@@ -2860,24 +2871,27 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 	ce->up		   = up ? as_glbuf(up) : NULL;
 	ce->gs		   = gs;
 	ce->us		   = us;
+	ce->stride	   = row_stride;
 	ce->gen		   = ++p->xq_gen;
 	return OK;
 }
 
 static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
-								 int activation, float gs, float us) {
+								 int activation, float gs, float us, int row_stride) {
 	static const gl_quantize_spec spec = {
 		GL_PIPE_QUANTIZE_X, GL_PIPE_QUANTIZE_X_ACT, 32, 0, GL_XQ_BLOCK_WORDS, 64};
-	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation, gs, us);
+	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation, gs, us,
+						   row_stride);
 }
 
 #define GL_XQK_WORDS_PER_BLOCK 212u
 
 static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
-									int activation, float gs, float us) {
+									int activation, float gs, float us, int row_stride) {
 	static const gl_quantize_spec spec = {
 		GL_PIPE_QUANTIZE_Q8_K, GL_PIPE_QUANTIZE_Q8_K_ACT, 256, 1, GL_XQK_WORDS_PER_BLOCK, 1};
-	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation, gs, us);
+	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation, gs, us,
+						   row_stride);
 }
 
 static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
@@ -2976,14 +2990,14 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 
 	const int use_xq = gl_pipe_uses_xq(p, pipe);
 	if (use_xq && !xq_ready) {
-		status_code qs = gl_quantize_x(p, x, k, m, NULL, 0, 1.0f, 1.0f);
+		status_code qs = gl_quantize_x(p, x, k, m, NULL, 0, 1.0f, 1.0f, 0);
 		if (qs != OK)
 			return qs;
 	}
 
 	const int use_xqk = gl_pipe_uses_xqk(p, pipe);
 	if (use_xqk && !xq_ready) {
-		status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0, 1.0f, 1.0f);
+		status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0, 1.0f, 1.0f, 0);
 		if (qs != OK)
 			return qs == ERR_UNSUPPORTED ? ERR_UNSUPPORTED : qs;
 	}
@@ -3256,8 +3270,8 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 			if (use_xqk ? xqk_ready : (xq_ready || !gl_pipe_uses_xq(p, pipes[i])))
 				continue;
 			gl_buf_sync_to_device(as_glbuf(x));
-			status_code qs = use_xqk ? gl_quantize_q8_k(p, x, k, 1, NULL, 0, 1.0f, 1.0f)
-									 : gl_quantize_x(p, x, k, 1, NULL, 0, 1.0f, 1.0f);
+			status_code qs = use_xqk ? gl_quantize_q8_k(p, x, k, 1, NULL, 0, 1.0f, 1.0f, 0)
+									 : gl_quantize_x(p, x, k, 1, NULL, 0, 1.0f, 1.0f, 0);
 			if (qs == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (qs != OK)
@@ -4340,8 +4354,8 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 			gl_buf_sync_to_device(as_glbuf(gate));
 			gl_buf_sync_to_device(as_glbuf(up));
 			status_code qs = gl_pipe_uses_xqk(p, pipe)
-								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation, 1.0f, 1.0f)
-								 : gl_quantize_x(p, gate, k, 1, up, activation, 1.0f, 1.0f);
+								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0)
+								 : gl_quantize_x(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0);
 			if (qs == OK) {
 				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 1);
 				if (qs != ERR_UNSUPPORTED)
@@ -4573,9 +4587,8 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 
 	buffer gate_b = {0}, up_b = {0};
 	if (e->gate_up_fused) {
-		gate_b = buffer_slice(&gu, 0, (size_t)cnt * (size_t)inter * sizeof(float));
-		up_b   = buffer_slice(&gu, (size_t)cnt * (size_t)inter * sizeof(float),
-							  (size_t)cnt * (size_t)inter * sizeof(float));
+		gate_b = gu;
+		up_b   = gu;
 		s = gl_matmul_dispatch(p, gate_pipe, gate_block, e->gate_w, &x_pk, &gu, NULL, inter * 2,
 							   dim, cnt, 0);
 	} else {
@@ -4591,11 +4604,13 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 		goto done;
 
 	{
-		int act_mode = use_gelu ? 1 : 0;
-		s = gl_pipe_uses_xqk(p, down_pipe) ? gl_quantize_q8_k(p, &gate_b, inter, cnt, &up_b,
-															  act_mode, e->gate_scale, e->up_scale)
-										   : gl_quantize_x(p, &gate_b, inter, cnt, &up_b, act_mode,
-														   e->gate_scale, e->up_scale);
+		int act_mode   = use_gelu ? 1 : 0;
+		int row_stride = e->gate_up_fused ? inter * 2 : 0;
+		s = gl_pipe_uses_xqk(p, down_pipe)
+				? gl_quantize_q8_k(p, &gate_b, inter, cnt, &up_b, act_mode, e->gate_scale,
+								   e->up_scale, row_stride)
+				: gl_quantize_x(p, &gate_b, inter, cnt, &up_b, act_mode, e->gate_scale, e->up_scale,
+								row_stride);
 		if (s != OK)
 			goto done;
 	}
@@ -4698,10 +4713,11 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 		gl_buf_sync_to_device(as_glbuf(&up_buf));
 		int			act_mode = e->use_gelu ? 1 : 0;
 		float		uscale	 = e->up_scale * ws;
-		status_code qs =
-			gl_pipe_uses_xqk(p, down_pipe)
-				? gl_quantize_q8_k(p, &gate_buf, inter, 1, &up_buf, act_mode, e->gate_scale, uscale)
-				: gl_quantize_x(p, &gate_buf, inter, 1, &up_buf, act_mode, e->gate_scale, uscale);
+		status_code qs		 = gl_pipe_uses_xqk(p, down_pipe)
+								   ? gl_quantize_q8_k(p, &gate_buf, inter, 1, &up_buf, act_mode,
+													  e->gate_scale, uscale, 0)
+								   : gl_quantize_x(p, &gate_buf, inter, 1, &up_buf, act_mode,
+												   e->gate_scale, uscale, 0);
 		if (qs == OK) {
 			qs = gl_matmul_dispatch(p, down_pipe, down_block, e->down_w, &gate_buf, out, out, dim,
 									inter, 1, 1);
@@ -4777,6 +4793,10 @@ static status_code gl_moe_experts_batch(backend *self, const buffer *xb, buffer 
 		if (us == OK && idx_buf.handle && w_buf.handle) {
 			memcpy(idx_buf.handle, rows_packed, (size_t)total_packed * sizeof(int));
 			memcpy(w_buf.handle, weights_packed, (size_t)total_packed * sizeof(float));
+			as_glbuf(&idx_buf)->device_dirty = 0;
+			as_glbuf(&idx_buf)->host_dirty	 = 1;
+			as_glbuf(&w_buf)->device_dirty	 = 0;
+			as_glbuf(&w_buf)->host_dirty	 = 1;
 			gl_buf_sync_to_device(as_glbuf(&idx_buf));
 			gl_buf_sync_to_device(as_glbuf(&w_buf));
 			idx_uploaded = 1;

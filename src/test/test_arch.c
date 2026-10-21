@@ -1914,13 +1914,6 @@ static void test_arch_generate(backend *ref, backend *tgt, model_arch arch, cons
 }
 
 void run_arch_tests(backend *ref, backend *tgt) {
-	printf("\n========================================\n");
-	if (tgt)
-		printf("Architecture-level tests: %s  vs  %s (reference)\n", tgt->name, ref->name);
-	else
-		printf("Architecture-level tests: %s (self-test)\n", ref->name);
-	printf("========================================\n");
-
 	if (tgt) {
 		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 0);
 		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 1);

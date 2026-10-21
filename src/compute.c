@@ -379,7 +379,9 @@ static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
 							(size_t)m->kda.hc_count * m->dim * sizeof(float), "HC");
 		if (_st != OK)
 			return _st;
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC_COEF], 32 * sizeof(float), "HC_COEF");
+		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC_COEF],
+							(size_t)m->kda.hc_count * (m->kda.hc_count + 1) * sizeof(float),
+							"HC_COEF");
 		if (_st != OK)
 			return _st;
 	}
@@ -659,9 +661,15 @@ status_code compute_switch_active_backend(compute_scratch *s, backend *target, c
 	}
 
 	ensure_sync(current);
-	status_code st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_X, m->dim);
-	if (st == OK && m->arch_info->has_hyper_connections)
-		st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_HC, m->kda.hc_count * m->dim);
+	size_t x_n = s->slots[RECIPE_SLOT_X].size / sizeof(float);
+	if (x_n == 0)
+		x_n = (size_t)m->dim;
+	status_code st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_X, (int)x_n);
+	if (st == OK && m->arch_info->has_hyper_connections) {
+		size_t hc_n = s->slots[RECIPE_SLOT_HC].size / sizeof(float);
+		if (hc_n)
+			st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_HC, (int)hc_n);
+	}
 	if (st != OK)
 		return st;
 

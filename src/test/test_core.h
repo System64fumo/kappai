@@ -170,6 +170,7 @@ void run_per_op_tests(backend *ref, backend *tgt);
 void run_arch_tests(backend *ref, backend *tgt);
 
 void		synth_suite_common_init(void);
+void		synth_apply_config(void);
 extern char synth_fixture_dir[256];
 extern char synth_chat_model_path[512];
 extern char synth_lfm2_model_path[512];
