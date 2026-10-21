@@ -585,12 +585,12 @@ static void t_prefix_reuse_accounting(void) {
 				if (cont_ok == 1) {
 					const int KF = 8;
 					float	  eng_lg[512];
-					buffer	 *lslot = &c.scratch.slots[RECIPE_SLOT_LOGITS];
+					buffer	 *lslot = compute_logits_device(&c.scratch);
 					if (c.backend && c.backend->synchronize)
 						c.backend->synchronize(c.backend);
 					backend *owner = lslot->owner ? lslot->owner : c.backend;
 					int		 have  = 0;
-					if (owner && owner->buffer_read_f32 && !c.scratch.logits_alias)
+					if (owner && owner->buffer_read_f32)
 						have = owner->buffer_read_f32(owner, lslot, eng_lg, c.m.vocab_size) == OK;
 					if (!have)
 						memcpy(eng_lg, c.scratch.logits_host,

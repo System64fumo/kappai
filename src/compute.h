@@ -36,35 +36,20 @@ typedef struct {
 } expert_dev_scratch;
 
 typedef struct {
-	backend *be;
-	buffer	 slots[RECIPE_SLOT_MAX];
-	buffer	 ple_inp;
-	buffer	 ple_slice;
+	backend		  *be;
+	batch_scratch *bs;
 } scratch_mirror;
 
 typedef struct compute_scratch {
-	buffer		 router_softmax_inp;
-	buffer		 router_logits;
-	buffer		 moe_shared_y_dev;
-	int			 router_ids_host[64];
-	float		 router_w_host[64];
 	float		*rope_cos, *rope_sin, *logits_host;
-	int			 logits_alias;
 	float		*rope_cos_swa, *rope_sin_swa;
-	buffer		 ple_inp;
-	buffer		 ple_slice;
-	buffer		 ple_all;
-	buffer		 ple_proj;
 	buffer		 ple_proj_norm_w;
 	int			 ple_proj_norm_w_uploaded;
-	float		*ple_buf;
 	backend		*backend;
 	int			 allocated_n_ctx;
 	const model *last_model;
 	int			 last_n_ctx;
 	profile		 prof;
-
-	buffer slots[RECIPE_SLOT_MAX];
 
 	scratch_mirror mirror[SCRATCH_MAX_MIRRORS];
 	int			   n_mirrors;
@@ -134,26 +119,15 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  int flash_attn, float *logits_out);
 
 status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,
-										 const int32_t *tokens, const int *positions, int n_seqs,
-										 int flash_attn, float *logits_out);
+										 const int32_t *tokens, const int *positions,
+										 const uint8_t *needs_logits, int n_seqs, int flash_attn,
+										 float *logits_out);
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
-status_code compute_switch_active_backend(compute_scratch *s, backend *target, const model *m);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
-static inline backend *compute_active_backend(compute_scratch *s) {
-	return s->active_backend ? s->active_backend : s->backend;
-}
 
 int compute_device_index(const compute_scratch *s, const backend *b);
-
-static inline buffer *compute_dev_slots(compute_scratch *s, int dev) {
-	return dev > 0 ? s->mirror[dev - 1].slots : s->slots;
-}
-
-static inline buffer *compute_slots_array(compute_scratch *s) {
-	return compute_dev_slots(s, s->active_dev);
-}
 
 #endif

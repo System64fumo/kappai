@@ -3261,7 +3261,6 @@ status_code model_build_recipe(model *m) {
 	}
 	DEBUG("recipe: built for arch '%s' (pre=%d layer=%d post=%d ops)", m->arch_info->gguf_name,
 		  m->recipe->n_pre_ops, m->recipe->layer.n_ops, m->recipe->n_post_ops);
-	m->batchable = recipe_is_batchable(m) != 0;
 	return OK;
 }
 

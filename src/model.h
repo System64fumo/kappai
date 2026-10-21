@@ -233,7 +233,6 @@ typedef struct model {
 	bool moe_stream_enabled;
 	bool owns_backend;
 	bool use_mmap;
-	bool batchable;
 	bool mixed_backend_mode;
 
 	size_t mem_non_expert_bytes;

@@ -880,6 +880,7 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 	int pos = c->kv.n_pos;
 
 	int chunk = context_prefill_chunk_size(c, tpool_n_threads(tpool_fetch_pool()));
+	compute_scratch_reserve_rows(&c->m, &c->scratch, chunk);
 	if (chunk > n)
 		chunk = n;
 	progress prog;
@@ -949,8 +950,8 @@ fail:
 }
 
 static void debug_print_logits(context *c) {
-	buffer *logits = &c->scratch.slots[RECIPE_SLOT_LOGITS];
-	if (c->backend && c->backend->argmax && !c->scratch.logits_alias) {
+	buffer *logits = compute_logits_device(&c->scratch);
+	if (c->backend && c->backend->argmax) {
 		ensure_sync(c->backend);
 		backend *owner = logits->owner ? logits->owner : c->backend;
 		if (owner->buffer_read_f32) {
@@ -992,7 +993,7 @@ int32_t context_sample_next(context *c) {
 	if (c->backend && c->backend->argmax && (c->samp.temperature <= 0.0f || c->samp.top_k == 1) &&
 		c->samp.repeat_penalty == 1.0f) {
 		int32_t		idx;
-		status_code st = c->backend->argmax(c->backend, &c->scratch.slots[RECIPE_SLOT_LOGITS],
+		status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
 											c->m.vocab_size, &idx);
 		if (st == OK) {
 			sampler_observe(&c->samp, idx);
@@ -1058,7 +1059,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 
 		int32_t tok;
 		if (fast_argmax && !c->logits_on_host) {
-			status_code st = c->backend->argmax(c->backend, &c->scratch.slots[RECIPE_SLOT_LOGITS],
+			status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
 												c->m.vocab_size, &tok);
 			if (st == OK) {
 				sampler_observe(&c->samp, tok);

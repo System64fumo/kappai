@@ -11,19 +11,6 @@ void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
 }
 
-static void compute_scratch_set_router_bufs(compute_scratch *s) {
-	buffer *rid	  = &s->slots[RECIPE_SLOT_ROUTER_IDS];
-	buffer *rw	  = &s->slots[RECIPE_SLOT_ROUTER_W];
-	rid->handle	  = s->router_ids_host;
-	rid->host_ptr = s->router_ids_host;
-	rid->size	  = sizeof(s->router_ids_host);
-	rid->owner	  = NULL;
-	rw->handle	  = s->router_w_host;
-	rw->host_ptr  = s->router_w_host;
-	rw->size	  = sizeof(s->router_w_host);
-	rw->owner	  = NULL;
-}
-
 typedef struct {
 	float *cos_out;
 	float *sin_out;
@@ -85,40 +72,17 @@ static void free_buf(buffer *b) {
 	b->owner->buffer_free(b->owner, b);
 }
 
-static void scratch_free_slot_buffers(buffer *slots) {
-	for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
-		if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
-			continue;
-		free_buf(&slots[i]);
-	}
-}
-
 static void scratch_free_device_buffers(compute_scratch *s) {
-	scratch_free_slot_buffers(s->slots);
-	free_buf(&s->ple_inp);
-	free_buf(&s->ple_slice);
-	free_buf(&s->ple_all);
-	free_buf(&s->ple_proj);
 	free_buf(&s->ple_proj_norm_w);
-	free_buf(&s->router_softmax_inp);
-	free_buf(&s->router_logits);
-	free_buf(&s->moe_shared_y_dev);
 	for (int i = 0; i < MOE_STAGE_RING; i++)
 		free_buf(&s->moe_stage[i]);
 
 	for (int d = 0; d < s->n_mirrors; d++) {
 		scratch_mirror *mir = &s->mirror[d];
-		scratch_free_slot_buffers(mir->slots);
-		free_buf(&mir->ple_inp);
-		free_buf(&mir->ple_slice);
-		for (int i = 0; i < RECIPE_SLOT_MAX; i++) {
-			if (i == RECIPE_SLOT_FFN_GATE || i == RECIPE_SLOT_FFN_UP)
-				continue;
-			mir->slots[i].owner	   = NULL;
-			mir->slots[i].handle   = NULL;
-			mir->slots[i].host_ptr = NULL;
-			mir->slots[i].size	   = 0;
-			mir->slots[i].offset   = 0;
+		if (mir->bs) {
+			batch_scratch_free(mir->bs);
+			free(mir->bs);
+			mir->bs = NULL;
 		}
 		mir->be = NULL;
 	}
@@ -129,10 +93,8 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 	free(s->transfer_buf);
 	s->transfer_buf		= NULL;
 	s->transfer_buf_cap = 0;
-	if (!s->logits_alias)
-		free(s->logits_host);
-	s->logits_host	= NULL;
-	s->logits_alias = 0;
+	free(s->logits_host);
+	s->logits_host = NULL;
 }
 
 static void scratch_free_host_buffers(compute_scratch *s) {
@@ -140,7 +102,6 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->rope_sin);
 	free(s->rope_cos_swa);
 	free(s->rope_sin_swa);
-	free(s->ple_buf);
 	free(s->ple_inp_host);
 	s->ple_inp_host = NULL;
 	free(s->cur_host);
@@ -288,15 +249,6 @@ static int layer_max_intermediate(const model *m) {
 	return best;
 }
 
-static status_code scratch_alloc(backend *a, buffer *dst, size_t size, const char *name) {
-	status_code st = a->buffer_alloc_scratch(a, size, dst);
-	if (st != OK) {
-		ERROR("compute_scratch_ensure: failed to allocate scratch buffer '%s' (%zu bytes): %s",
-			  name, size, status_str(st));
-	}
-	return st;
-}
-
 typedef struct {
 	int attn_buf_size;
 	int q_out;
@@ -350,80 +302,6 @@ static void compute_layout_init(const model *m, compute_layout *L) {
 	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
 }
 
-static status_code scratch_alloc_slots(backend *a, buffer *dst, const model *m,
-									   const compute_layout *L) {
-	status_code _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_X], (size_t)L->attn_buf_size * sizeof(float), "X");
-	if (_st != OK)
-		return _st;
-	if (m->arch_info->is_hybrid_recurrent) {
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_PROJ],
-							(size_t)model_hybrid_proj_size(m) * sizeof(float), "hybrid projection");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_GATE],
-							(size_t)model_hybrid_gate_size(m) * sizeof(float), "hybrid gate");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_ALPHA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid alpha");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HYB_BETA],
-							(size_t)m->hybrid.n_value_heads * sizeof(float), "hybrid beta");
-		if (_st != OK)
-			return _st;
-	}
-	if (m->arch_info->has_hyper_connections) {
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC],
-							(size_t)m->kda.hc_count * m->dim * sizeof(float), "HC");
-		if (_st != OK)
-			return _st;
-		_st = scratch_alloc(a, &dst[RECIPE_SLOT_HC_COEF],
-							(size_t)m->kda.hc_count * (m->kda.hc_count + 1) * sizeof(float),
-							"HC_COEF");
-		if (_st != OK)
-			return _st;
-	}
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB], (size_t)L->attn_buf_size * sizeof(float), "XB");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_XB2], (size_t)L->attn_buf_size * sizeof(float), "XB2");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_ATTN_OUT], (size_t)L->attn_buf_size * sizeof(float),
-						"ATTN_OUT");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_Q], (size_t)L->q_out * sizeof(float), "Q");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_K], (size_t)L->kv_out * sizeof(float), "K");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_V], (size_t)L->kv_out * sizeof(float), "V");
-	if (_st != OK)
-		return _st;
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_GATE_UP],
-						(size_t)L->max_intermediate * 2 * sizeof(float), "FFN_GATE_UP");
-	if (_st != OK)
-		return _st;
-	dst[RECIPE_SLOT_FFN_GATE] =
-		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], 0, (size_t)L->max_intermediate * sizeof(float));
-	dst[RECIPE_SLOT_FFN_UP] =
-		buffer_slice(&dst[RECIPE_SLOT_FFN_GATE_UP], (size_t)L->max_intermediate * sizeof(float),
-					 (size_t)L->max_intermediate * sizeof(float));
-	_st = scratch_alloc(a, &dst[RECIPE_SLOT_FFN_ACT], (size_t)L->ffn_act_size * sizeof(float),
-						"FFN_ACT");
-	if (_st != OK)
-		return _st;
-	_st =
-		scratch_alloc(a, &dst[RECIPE_SLOT_LOGITS], (size_t)m->vocab_size * sizeof(float), "LOGITS");
-	if (_st != OK)
-		return _st;
-	return OK;
-}
-
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
 	if (!compute_model_changed(s, m, n_ctx))
 		return OK;
@@ -437,20 +315,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	compute_layout L;
 	compute_layout_init(m, &L);
 
-	status_code _st = scratch_alloc_slots(a, s->slots, m, &L);
-	if (_st != OK)
-		return _st;
-
-	if (backend_has_cap(a, BCAP_IS_HOST)) {
-		buffer *lb		= &s->slots[RECIPE_SLOT_LOGITS];
-		s->logits_host	= (float *)((char *)lb->handle + lb->offset);
-		s->logits_alias = 1;
-	} else {
-		s->logits_host	= xmalloc((size_t)m->vocab_size * sizeof(float));
-		s->logits_alias = 0;
-	}
-
-	compute_scratch_set_router_bufs(s);
+	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
 
 	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
 
@@ -470,24 +335,6 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
 						 m->layer_dims.rope_theta_global);
 
-		if (m->has_per_layer_embeddings) {
-			s->ple_buf =
-				xmalloc((size_t)m->layer_dims.n_embd_per_layer * m->n_layers * sizeof(float));
-			{
-				status_code _st = scratch_alloc(
-					a, &s->ple_inp, (size_t)m->layer_dims.n_embd_per_layer * sizeof(float),
-					"&s->ple_inp");
-				if (_st != OK)
-					return _st;
-			}
-			{
-				status_code _st = scratch_alloc(
-					a, &s->ple_slice, (size_t)m->layer_dims.n_embd_per_layer * sizeof(float),
-					"&s->ple_slice");
-				if (_st != OK)
-					return _st;
-			}
-		}
 	} else {
 		const int rope_head_dim =
 			m->arch_info->is_mla ? m->mla.qk_rope
@@ -537,13 +384,14 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 }
 
 status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,
-										 const int32_t *tokens, const int *positions, int n_seqs,
-										 int flash_attn, float *logits_out) {
+										 const int32_t *tokens, const int *positions,
+										 const uint8_t *needs_logits, int n_seqs, int flash_attn,
+										 float *logits_out) {
 	status_code st = compute_scratch_ensure(s, m, caches[0]->n_ctx);
 	if (st != OK)
 		return st;
-	return compute_forward_decode_batch_recipe(m, caches, s, tokens, positions, n_seqs, flash_attn,
-											   logits_out);
+	return compute_forward_decode_batch_recipe(m, caches, s, tokens, positions, needs_logits,
+											   n_seqs, flash_attn, logits_out);
 }
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud) {
@@ -568,37 +416,6 @@ int compute_device_index(const compute_scratch *s, const backend *b) {
 	return -1;
 }
 
-static void scratch_bind_router_slots(compute_scratch *s, buffer *slots) {
-	slots[RECIPE_SLOT_ROUTER_IDS].handle   = s->router_ids_host;
-	slots[RECIPE_SLOT_ROUTER_IDS].host_ptr = s->router_ids_host;
-	slots[RECIPE_SLOT_ROUTER_IDS].size	   = sizeof(s->router_ids_host);
-	slots[RECIPE_SLOT_ROUTER_IDS].offset   = 0;
-	slots[RECIPE_SLOT_ROUTER_IDS].owner	   = NULL;
-	slots[RECIPE_SLOT_ROUTER_W].handle	   = s->router_w_host;
-	slots[RECIPE_SLOT_ROUTER_W].host_ptr   = s->router_w_host;
-	slots[RECIPE_SLOT_ROUTER_W].size	   = sizeof(s->router_w_host);
-	slots[RECIPE_SLOT_ROUTER_W].offset	   = 0;
-	slots[RECIPE_SLOT_ROUTER_W].owner	   = NULL;
-}
-
-static status_code scratch_alloc_mirror(compute_scratch *s, const model *m, const compute_layout *L,
-										scratch_mirror *mir) {
-	status_code st = scratch_alloc_slots(mir->be, mir->slots, m, L);
-	if (st != OK)
-		return st;
-	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0) {
-		size_t ple_bytes = (size_t)m->layer_dims.n_embd_per_layer * sizeof(float);
-		st				 = scratch_alloc(mir->be, &mir->ple_slice, ple_bytes, "ple_slice mirror");
-		if (st != OK)
-			return st;
-		st = scratch_alloc(mir->be, &mir->ple_inp, ple_bytes, "ple_inp mirror");
-		if (st != OK)
-			return st;
-	}
-	scratch_bind_router_slots(s, mir->slots);
-	return OK;
-}
-
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	if (s->mirrors_alloced)
 		return OK;
@@ -616,65 +433,7 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 		s->mirror[s->n_mirrors++].be = lb;
 	}
 
-	compute_layout L;
-	compute_layout_init(m, &L);
-	for (int d = 0; d < s->n_mirrors; d++) {
-		status_code st = scratch_alloc_mirror(s, m, &L, &s->mirror[d]);
-		if (st != OK)
-			return st;
-	}
-
-	size_t xfer_need = (size_t)L.attn_buf_size;
-	if (m->has_per_layer_embeddings && m->layer_dims.n_embd_per_layer > 0 &&
-		(size_t)m->layer_dims.n_embd_per_layer > xfer_need)
-		xfer_need = (size_t)m->layer_dims.n_embd_per_layer;
-	status_code st = ensure_transfer_buf(s, xfer_need);
-	if (st != OK)
-		return st;
-
 	s->mirrors_alloced = 1;
-	return OK;
-}
-
-static status_code carry_slot_to_device(compute_scratch *s, int target_dev, uint8_t slot, int n) {
-	return compute_copy_buffer_cross(s, &compute_slots_array(s)[slot],
-									 &compute_dev_slots(s, target_dev)[slot], n);
-}
-
-status_code compute_switch_active_backend(compute_scratch *s, backend *target, const model *m) {
-	if (!target)
-		target = s->backend;
-	backend *current = compute_active_backend(s);
-	if (target == current) {
-		s->active_backend = current;
-		s->active_dev	  = compute_device_index(s, current);
-		if (s->active_dev < 0)
-			s->active_dev = 0;
-		return OK;
-	}
-
-	int target_dev = compute_device_index(s, target);
-	if (target_dev < 0) {
-		ERROR("compute_switch_active_backend: target backend '%s' is not a device of this model",
-			  target->name);
-		return ERR_UNSUPPORTED;
-	}
-
-	ensure_sync(current);
-	size_t x_n = s->slots[RECIPE_SLOT_X].size / sizeof(float);
-	if (x_n == 0)
-		x_n = (size_t)m->dim;
-	status_code st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_X, (int)x_n);
-	if (st == OK && m->arch_info->has_hyper_connections) {
-		size_t hc_n = s->slots[RECIPE_SLOT_HC].size / sizeof(float);
-		if (hc_n)
-			st = carry_slot_to_device(s, target_dev, RECIPE_SLOT_HC, (int)hc_n);
-	}
-	if (st != OK)
-		return st;
-
-	s->active_backend = target;
-	s->active_dev	  = target_dev;
 	return OK;
 }
 

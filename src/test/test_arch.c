@@ -1008,7 +1008,6 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 
 	model_build_weight_refs(&sm->m);
 	m->recipe			  = recipe_build(m);
-	m->batchable		  = recipe_is_batchable(m) != 0;
 	m->moe_stream_enabled = 0;
 	return sm;
 }
@@ -1447,6 +1446,264 @@ static void test_arch_batch_vs_single(backend *ref, model_arch arch, const synth
 	free(prompt);
 	synth_model_free(sm_batch);
 	synth_model_free(sm_single);
+}
+
+static status_code prefill_in_chunks(synth_model *sm, const int32_t *prompt, int n_prefill,
+									 int chunk, int n_ctx, float *logits) {
+	kvcache			kv;
+	status_code		st = kvcache_init(&kv, &sm->m, n_ctx, KV_QUANT_F16);
+	compute_scratch s;
+	compute_scratch_init(&s);
+	if (st == OK)
+		st = compute_scratch_ensure(&s, &sm->m, n_ctx);
+	for (int pos = 0; pos < n_prefill && st == OK; pos += chunk) {
+		int n = n_prefill - pos < chunk ? n_prefill - pos : chunk;
+		st	  = compute_forward_batch(&sm->m, &kv, &s, prompt + pos, n, pos, 1, logits);
+		kv.n_pos += n;
+	}
+	compute_scratch_free(&s);
+	kvcache_free(&kv);
+	return st;
+}
+
+static void test_arch_chunked_prefill(backend *ref, model_arch arch, const synth_cfg *cfg,
+									  int n_prefill, int chunk) {
+	const char *arch_name = arch_lookup(arch)->gguf_name;
+	const int	n_ctx	  = n_prefill + 16;
+	char		label[160];
+	char		detail[320];
+	snprintf(label, sizeof(label), "chunked_prefill[%s %d/%d]", arch_name, n_prefill, chunk);
+
+	synth_model *sm_whole	= synth_model_build(ref, arch, cfg, n_ctx);
+	synth_model *sm_chunked = synth_model_build(ref, arch, cfg, n_ctx);
+	int32_t		*prompt		= xmalloc((size_t)n_prefill * sizeof(int32_t));
+	seed_test_rng(0xC4A9CULL + (uint64_t)arch);
+	for (int i = 0; i < n_prefill; i++)
+		prompt[i] = (int32_t)(next_u32() % (uint32_t)cfg->vocab);
+	float *logits_whole	  = xcalloc((size_t)cfg->vocab, sizeof(float));
+	float *logits_chunked = xcalloc((size_t)cfg->vocab, sizeof(float));
+
+	status_code st = prefill_in_chunks(sm_whole, prompt, n_prefill, n_prefill, n_ctx, logits_whole);
+	if (st == OK)
+		st = prefill_in_chunks(sm_chunked, prompt, n_prefill, chunk, n_ctx, logits_chunked);
+
+	if (st != OK) {
+		snprintf(detail, sizeof(detail), "status=%s", status_str(st));
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
+	} else {
+		float max_diff = 0;
+		for (int i = 0; i < cfg->vocab; i++) {
+			float d = fabsf(logits_whole[i] - logits_chunked[i]);
+			if (!(d <= max_diff))
+				max_diff = d;
+		}
+		snprintf(detail, sizeof(detail), "max_diff=%.6f", max_diff);
+		record_result(OPFAM_ARCH_GENERATE, label, max_diff > 0.1f ? V_FAIL : V_PASS, detail);
+	}
+
+	free(logits_whole);
+	free(logits_chunked);
+	free(prompt);
+	synth_model_free(sm_whole);
+	synth_model_free(sm_chunked);
+}
+
+static void test_arch_batchable(backend *ref, model_arch arch, const synth_cfg *cfg) {
+	const char *arch_name = arch_lookup(arch)->gguf_name;
+	char		label[160];
+	snprintf(label, sizeof(label), "batchable[%s]", arch_name);
+	synth_model *sm = synth_model_build(ref, arch, cfg, 32);
+	int			 ok = recipe_is_decode_batchable(&sm->m);
+	record_result(OPFAM_ARCH_GENERATE, label, ok ? V_PASS : V_FAIL,
+				  ok ? "prefill and decode batchable" : "not batchable");
+	synth_model_free(sm);
+}
+
+static float max_row_diff(const float *a, const float *b, int n_rows, int vocab, int *worst_row,
+						  float *row_diffs) {
+	float max_diff = 0;
+	for (int row = 0; row < n_rows; row++) {
+		row_diffs[row] = 0;
+		for (int i = 0; i < vocab; i++) {
+			float d = fabsf(a[(size_t)row * vocab + i] - b[(size_t)row * vocab + i]);
+			if (d > row_diffs[row])
+				row_diffs[row] = d;
+		}
+		if (row_diffs[row] > max_diff) {
+			max_diff   = row_diffs[row];
+			*worst_row = row;
+		}
+	}
+	return max_diff;
+}
+
+static void format_row_diffs(char *detail, size_t cap, float max_diff, int worst_row,
+							 const float *row_diffs, int n_rows) {
+	int len = snprintf(detail, cap, "max_diff=%.6f row=%d rows=[", max_diff, worst_row);
+	for (int row = 0; row < n_rows && len < (int)cap; row++)
+		len += snprintf(detail + len, cap - (size_t)len, row ? " %.4f" : "%.4f", row_diffs[row]);
+	if (len < (int)cap)
+		snprintf(detail + len, cap - (size_t)len, "]");
+}
+
+static void test_arch_decode_batch_vs_single(backend *ref, model_arch arch, const synth_cfg *cfg,
+											 int n_seqs, int flash_attn) {
+	const char *arch_name = arch_lookup(arch)->gguf_name;
+	const int	n_ctx	  = 32;
+	const int	vocab	  = cfg->vocab;
+	char		label[160];
+	char		detail[320];
+	snprintf(label, sizeof(label), "decode_batch_vs_single[%s rows=%d]", arch_name, n_seqs);
+
+	synth_model *sm_batch  = synth_model_build(ref, arch, cfg, n_ctx);
+	synth_model *sm_single = synth_model_build(ref, arch, cfg, n_ctx);
+
+	kvcache	 *kv_batch		= xcalloc((size_t)n_seqs, sizeof(kvcache));
+	kvcache	 *kv_single		= xcalloc((size_t)n_seqs, sizeof(kvcache));
+	kvcache **kv_ptrs		= xcalloc((size_t)n_seqs, sizeof(kvcache *));
+	int32_t	 *tokens		= xmalloc((size_t)n_seqs * sizeof(int32_t));
+	int		 *positions		= xmalloc((size_t)n_seqs * sizeof(int));
+	float	 *logits_batch	= xcalloc((size_t)n_seqs * vocab, sizeof(float));
+	float	 *logits_single = xcalloc((size_t)n_seqs * vocab, sizeof(float));
+
+	compute_scratch s_batch, s_single;
+	compute_scratch_init(&s_batch);
+	compute_scratch_init(&s_single);
+	(void)compute_scratch_ensure(&s_batch, &sm_batch->m, n_ctx);
+	(void)compute_scratch_ensure(&s_single, &sm_single->m, n_ctx);
+
+	seed_test_rng(0xDEC0DEULL + (uint64_t)arch * 131 + (uint64_t)n_seqs);
+	status_code st = OK;
+	for (int i = 0; i < n_seqs && st == OK; i++) {
+		kvcache_init(&kv_batch[i], &sm_batch->m, n_ctx, KV_QUANT_F16);
+		kvcache_init(&kv_single[i], &sm_single->m, n_ctx, KV_QUANT_F16);
+		kv_ptrs[i]			 = &kv_batch[i];
+		const int prompt_len = 2 + i;
+		for (int pos = 0; pos < prompt_len && st == OK; pos++) {
+			int32_t token = (int32_t)(next_u32() % (uint32_t)vocab);
+			st =
+				compute_forward(&sm_batch->m, &kv_batch[i], &s_batch, token, pos, flash_attn, NULL);
+			kv_batch[i].n_pos++;
+			if (st != OK)
+				break;
+			st = compute_forward(&sm_single->m, &kv_single[i], &s_single, token, pos, flash_attn,
+								 NULL);
+			kv_single[i].n_pos++;
+		}
+		positions[i] = prompt_len;
+		tokens[i]	 = (int32_t)(next_u32() % (uint32_t)vocab);
+	}
+	if (st == OK)
+		st = compute_forward_decode_batch(&sm_batch->m, kv_ptrs, &s_batch, tokens, positions, NULL,
+										  n_seqs, flash_attn, logits_batch);
+	for (int i = 0; i < n_seqs && st == OK; i++)
+		st = compute_forward(&sm_single->m, &kv_single[i], &s_single, tokens[i], positions[i],
+							 flash_attn, logits_single + (size_t)i * vocab);
+
+	int worst_row = 0;
+	if (st != OK) {
+		snprintf(detail, sizeof(detail), "status=%s", status_str(st));
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
+	} else if (count_nonfinite(logits_batch, n_seqs * vocab) > 0 ||
+			   count_nonfinite(logits_single, n_seqs * vocab) > 0) {
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, "nonfinite logits");
+	} else {
+		float row_diffs[16];
+		float max_diff =
+			max_row_diff(logits_batch, logits_single, n_seqs, vocab, &worst_row, row_diffs);
+		format_row_diffs(detail, sizeof(detail), max_diff, worst_row, row_diffs, n_seqs);
+		record_result(OPFAM_ARCH_GENERATE, label, max_diff > 0.1f ? V_FAIL : V_PASS, detail);
+	}
+
+	for (int i = 0; i < n_seqs; i++) {
+		kvcache_free(&kv_batch[i]);
+		kvcache_free(&kv_single[i]);
+	}
+	compute_scratch_free(&s_batch);
+	compute_scratch_free(&s_single);
+	free(kv_batch);
+	free(kv_single);
+	free(kv_ptrs);
+	free(tokens);
+	free(positions);
+	free(logits_batch);
+	free(logits_single);
+	synth_model_free(sm_batch);
+	synth_model_free(sm_single);
+}
+
+static void test_arch_decode_needs_logits(backend *ref, model_arch arch, const synth_cfg *cfg) {
+	static const uint8_t flags[7]  = {1, 0, 1, 1, 0, 0, 1};
+	const int			 n_seqs	   = 7;
+	const int			 n_ctx	   = 32;
+	const int			 vocab	   = cfg->vocab;
+	const char			*arch_name = arch_lookup(arch)->gguf_name;
+	char				 label[160];
+	char				 detail[320];
+	snprintf(label, sizeof(label), "decode_needs_logits[%s]", arch_name);
+
+	synth_model *sm = synth_model_build(ref, arch, cfg, n_ctx);
+
+	kvcache	 *kv	  = xcalloc((size_t)n_seqs, sizeof(kvcache));
+	kvcache **kv_ptrs = xcalloc((size_t)n_seqs, sizeof(kvcache *));
+	int32_t	 *tokens  = xmalloc((size_t)n_seqs * sizeof(int32_t));
+	int		 *pos	  = xmalloc((size_t)n_seqs * sizeof(int));
+	float	 *full	  = xcalloc((size_t)n_seqs * vocab, sizeof(float));
+	float	 *subset  = xcalloc((size_t)n_seqs * vocab, sizeof(float));
+
+	compute_scratch s;
+	compute_scratch_init(&s);
+	(void)compute_scratch_ensure(&s, &sm->m, n_ctx);
+
+	seed_test_rng(0x4E11ULL + (uint64_t)arch);
+	status_code st = OK;
+	for (int i = 0; i < n_seqs && st == OK; i++) {
+		kvcache_init(&kv[i], &sm->m, n_ctx, KV_QUANT_F16);
+		kv_ptrs[i] = &kv[i];
+		for (int p = 0; p < 2 + i && st == OK; p++) {
+			st = compute_forward(&sm->m, &kv[i], &s, (int32_t)(next_u32() % (uint32_t)vocab), p, 1,
+								 NULL);
+			kv[i].n_pos++;
+		}
+		pos[i]	  = 2 + i;
+		tokens[i] = (int32_t)(next_u32() % (uint32_t)vocab);
+	}
+	if (st == OK)
+		st = compute_forward_decode_batch(&sm->m, kv_ptrs, &s, tokens, pos, NULL, n_seqs, 1, full);
+	if (st == OK)
+		st = compute_forward_decode_batch(&sm->m, kv_ptrs, &s, tokens, pos, flags, n_seqs, 1,
+										  subset);
+
+	float max_diff = 0;
+	int	  k		   = 0;
+	for (int i = 0; i < n_seqs && st == OK; i++) {
+		if (!flags[i])
+			continue;
+		for (int v = 0; v < vocab; v++) {
+			float d = fabsf(subset[(size_t)k * vocab + v] - full[(size_t)i * vocab + v]);
+			if (d > max_diff)
+				max_diff = d;
+		}
+		k++;
+	}
+	if (st != OK) {
+		snprintf(detail, sizeof(detail), "status=%s", status_str(st));
+		record_result(OPFAM_ARCH_GENERATE, label, V_FAIL, detail);
+	} else {
+		snprintf(detail, sizeof(detail), "max_diff=%.6f over %d flagged rows", max_diff, k);
+		record_result(OPFAM_ARCH_GENERATE, label, max_diff > 1e-3f ? V_FAIL : V_PASS, detail);
+	}
+
+	for (int i = 0; i < n_seqs; i++)
+		kvcache_free(&kv[i]);
+	compute_scratch_free(&s);
+	free(kv);
+	free(kv_ptrs);
+	free(tokens);
+	free(pos);
+	free(full);
+	free(subset);
+	synth_model_free(sm);
 }
 
 static status_code run_decode_steps(synth_model *sm, const int32_t *tokens, int n_prefill,
@@ -1955,6 +2212,31 @@ void run_arch_tests(backend *ref, backend *tgt) {
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 8, 1);
 	test_arch_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED, 16, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 2, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 7, 1);
+	test_arch_batch_vs_single(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 8, 1);
+	test_arch_batchable(ref, ARCH_LLAMA, &ARCH_CFG_SMALL);
+	test_arch_batchable(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL);
+	test_arch_batchable(ref, ARCH_GEMMA4, &ARCH_CFG_KV_SHARED);
+	test_arch_batchable(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA);
+	test_arch_batchable(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5);
+	test_arch_chunked_prefill(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 7, 3);
+	test_arch_chunked_prefill(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL, 7, 3);
+	test_arch_chunked_prefill(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA, 7, 3);
+	test_arch_chunked_prefill(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 7, 3);
+	test_arch_chunked_prefill(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 7, 1);
+	test_arch_chunked_prefill(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA, 7, 1);
+	test_arch_chunked_prefill(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, 7, 1);
+	static const int decode_rows[] = {1, 2, 7};
+	for (size_t ri = 0; ri < ARRAY_LEN(decode_rows); ri++) {
+		test_arch_decode_batch_vs_single(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, decode_rows[ri], 1);
+		test_arch_decode_batch_vs_single(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL, decode_rows[ri], 1);
+		test_arch_decode_batch_vs_single(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA, decode_rows[ri], 1);
+		test_arch_decode_batch_vs_single(ref, ARCH_GLM5_NEXT, &ARCH_CFG_GLM5, decode_rows[ri], 1);
+	}
+	test_arch_decode_needs_logits(ref, ARCH_LLAMA, &ARCH_CFG_SMALL);
+	test_arch_decode_needs_logits(ref, ARCH_GEMMA4, &ARCH_CFG_SMALL);
+	test_arch_decode_needs_logits(ref, ARCH_GLM_DSA, &ARCH_CFG_MLA);
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, false, 8, 4);
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 0, false, 8, 4);
 	test_arch_mixed_split(ref, ARCH_LLAMA, &ARCH_CFG_SMALL, 1, true, 8, 4);

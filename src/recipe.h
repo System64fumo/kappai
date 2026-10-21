@@ -308,30 +308,30 @@ typedef struct model_recipe {
 } model_recipe;
 
 typedef struct {
+	int				 n_rows;
+	int				 pos_start;
+	const int		*pos;
+	struct kvcache	*cache;
+	struct kvcache **caches;
+	const uint8_t	*needs_logits;
+} row_desc;
+
+typedef struct {
 	const recipe_op		   *op;
 	struct model		   *m;
-	struct kvcache		   *cache;
+	row_desc				rows;
 	struct compute_scratch *s;
 	batch_scratch		   *bs;
-	int						token, pos, li, flash_attn;
-	int						n_rows;
-	int						pos_start;
-	float				   *logits_out;
+	int						li, flash_attn;
 	backend				   *layer_be;
-	buffer				   *slot_base;
 	weight_ref			  **wtab_row;
-	struct kvcache		  **row_caches;
-	const int			   *row_pos;
 } exec_ctx;
-
-#define recipe_exec_is_batch(ctx) ((ctx) && (ctx)->bs != NULL)
 
 typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
 
 void		  recipe_register(const char *arch_gguf_name, recipe_builder_fn builder);
 model_recipe *recipe_build(const struct model *m);
 void		  recipe_free(model_recipe *r);
-int			  recipe_is_batchable(const struct model *m);
 
 status_code compute_forward_recipe(struct model *m, struct kvcache *cache,
 								   struct compute_scratch *s, int token, int pos, int flash_attn,
@@ -346,10 +346,12 @@ int recipe_is_decode_batchable(const struct model *m);
 
 status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
 												struct compute_scratch *s, const int32_t *tokens,
-												const int *positions, int n_seqs, int flash_attn,
-												float *logits_out);
+												const int *positions, const uint8_t *needs_logits,
+												int n_seqs, int flash_attn, float *logits_out);
 
-void batch_scratch_free(struct batch_scratch *bs);
+void	batch_scratch_free(struct batch_scratch *bs);
+void	compute_scratch_reserve_rows(struct model *m, struct compute_scratch *s, int n_rows);
+buffer *compute_logits_device(struct compute_scratch *s);
 
 recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage stage);
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,

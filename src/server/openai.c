@@ -1279,6 +1279,8 @@ static void decode_batch_reserve(openai_state *st) {
 		b->tokens	 = xcalloc((size_t)st->slots_cap, sizeof(*b->tokens));
 		b->positions = xcalloc((size_t)st->slots_cap, sizeof(*b->positions));
 		b->caches	 = xcalloc((size_t)st->slots_cap, sizeof(*b->caches));
+		compute_scratch_reserve_rows(&st->slots[0].sess.m, &st->slots[0].sess.scratch,
+									 st->slots_cap);
 	}
 	size_t need = (size_t)st->slots_cap * (size_t)st->ctx->m.vocab_size;
 	if (b->logits_cap < need) {
@@ -1315,25 +1317,15 @@ static void run_decode_step(openai_state *st) {
 	if (b->n == 0)
 		return;
 
-	status_code batch_status = ERR_FALLBACK;
-	if (b->n > 1) {
-		context *lead = &st->slots[0].sess;
-		batch_status =
-			compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens,
-										 b->positions, b->n, lead->flash_attn, b->logits);
-	}
-	bool fall_back = batch_status == ERR_FALLBACK || batch_status == ERR_UNSUPPORTED;
+	context	   *lead = &st->slots[0].sess;
+	status_code batch_status =
+		compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens, b->positions,
+									 NULL, b->n, lead->flash_attn, b->logits);
 
 	const size_t vocab = (size_t)st->ctx->m.vocab_size;
 	for (int i = 0; i < b->n; i++) {
-		oa_task *t = b->tasks[i];
-		context *c = &t->slot->sess;
-		if (fall_back) {
-			c->logits_on_host = false;
-			t->decode_status  = compute_forward(&c->m, &c->kv, &c->scratch, t->decode_token,
-												t->decode_pos, c->flash_attn, t->decode_logits);
-			continue;
-		}
+		oa_task *t		 = b->tasks[i];
+		context *c		 = &t->slot->sess;
 		t->decode_status = batch_status;
 		if (batch_status != OK)
 			continue;

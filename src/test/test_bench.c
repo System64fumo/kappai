@@ -45,16 +45,18 @@ typedef struct {
 } matmul_bench_ud;
 
 static double bench_mul_batch_once(backend *b, const buffer *w, uint32_t w_type, const buffer *xb,
-								   buffer *yb, int n, int k, int m) {
+								   buffer *yb, int n, int k, int m, int single) {
 	uint64_t	t0 = time_us();
-	status_code s  = b->matmul_batch(b, w, w_type, xb, yb, n, k, m);
+	status_code s  = single ? b->matmul(b, w, w_type, xb, yb, n, k)
+							: b->matmul_batch(b, w, w_type, xb, yb, n, k, m);
 	if (b->synchronize)
 		b->synchronize(b);
 	(void)s;
 	return (double)(time_us() - t0);
 }
 
-static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, int m, int iters) {
+static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, int m, int iters,
+							   int single) {
 	seed_test_rng((0xBEEFULL * (qt->type + 1) * 1000003ULL) + (uint64_t)n);
 
 	size_t weight_bytes = 0;
@@ -87,11 +89,11 @@ static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, i
 	}
 
 	for (int i = 0; i < 2; i++)
-		bench_mul_batch_once(b, &w, qt->type, &xb, &yb, n, k, m);
+		bench_mul_batch_once(b, &w, qt->type, &xb, &yb, n, k, m, single);
 
 	double best_us = 1e300;
 	for (int i = 0; i < iters; i++) {
-		double us = bench_mul_batch_once(b, &w, qt->type, &xb, &yb, n, k, m);
+		double us = bench_mul_batch_once(b, &w, qt->type, &xb, &yb, n, k, m, single);
 		if (us < best_us)
 			best_us = us;
 	}
@@ -114,6 +116,7 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 	}
 	int name_width = qtype_name_width();
 	printf("  %-*s", name_width, "quant");
+	printf("   %7s", "single");
 	for (int mi = 0; mi < u->n_ms; mi++) {
 		char label[16];
 		snprintf(label, sizeof(label), "M=%d", u->ms[mi]);
@@ -129,9 +132,10 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		if (test_repack_base_type(QTYPES[qi].type, &repack_base) && u->n % 8 != 0)
 			continue;
 		printf("  %-*s", name_width, QTYPES[qi].name);
+		printf("   %7.1f", bench_mul_gflops(b, &QTYPES[qi], u->n, u->k, 1, u->iters, 1));
 		fflush(stdout);
 		for (int mi = 0; mi < u->n_ms; mi++) {
-			double g = bench_mul_gflops(b, &QTYPES[qi], u->n, u->k, u->ms[mi], u->iters);
+			double g = bench_mul_gflops(b, &QTYPES[qi], u->n, u->k, u->ms[mi], u->iters, 0);
 			printf("   %7.1f", g);
 			fflush(stdout);
 		}
