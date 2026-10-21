@@ -1,0 +1,58 @@
+#version 310 es
+precision highp float;
+precision highp int;
+#define MERGE_WG 64
+#define MAX_SPLITS 64
+layout(local_size_x = MERGE_WG) in;
+layout(std430, binding = 3) readonly buffer PartBuf {
+	float part[];
+};
+layout(std430, binding = 4) buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_head_dim;
+layout(location = 1) uniform int u_n_splits;
+shared float w_split[MAX_SPLITS];
+shared float s_red[MERGE_WG];
+shared float inv_l_shared;
+
+void main(void) {
+	uint  h			= gl_WorkGroupID.x;
+	uint  tid		= gl_LocalInvocationID.x;
+	int	  stride	= u_head_dim + 2;
+	uint  base		= h * uint(u_n_splits) * uint(stride);
+	float neg_inf	= uintBitsToFloat(0xFF800000u);
+	bool  has_split = int(tid) < u_n_splits;
+
+	float m_s  = has_split ? part[base + tid * uint(stride)] : neg_inf;
+	s_red[tid] = m_s;
+	barrier();
+	for (uint r = uint(MERGE_WG) / 2u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_red[tid] = max(s_red[tid], s_red[tid + r]);
+		barrier();
+	}
+	float m_max = s_red[0];
+	barrier();
+
+	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : exp(m_s - m_max);
+	w_split[tid] = w;
+	s_red[tid]	 = has_split ? w * part[base + tid * uint(stride) + 1u] : 0.0;
+	barrier();
+	for (uint r = uint(MERGE_WG) / 2u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_red[tid] += s_red[tid + r];
+		barrier();
+	}
+	if (tid == 0u)
+		inv_l_shared = s_red[0] > 0.0 ? 1.0 / s_red[0] : 0.0;
+	barrier();
+
+	float inv_l = inv_l_shared;
+	for (int e = int(tid); e < u_head_dim; e += MERGE_WG) {
+		float o = 0.0;
+		for (int s = 0; s < u_n_splits; s++)
+			o += w_split[s] * part[base + uint(s * stride) + 2u + uint(e)];
+		out_[h * uint(u_head_dim) + uint(e)] = o * inv_l;
+	}
+}

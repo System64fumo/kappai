@@ -46,13 +46,18 @@ typedef struct {
 
 static double bench_mul_batch_once(backend *b, const buffer *w, uint32_t w_type, const buffer *xb,
 								   buffer *yb, int n, int k, int m, int single) {
-	uint64_t	t0 = time_us();
-	status_code s  = single ? b->matmul(b, w, w_type, xb, yb, n, k)
-							: b->matmul_batch(b, w, w_type, xb, yb, n, k, m);
+	double	 flops = 2.0 * (double)n * (double)k * (double)m;
+	int		 reps  = flops >= 1e9 ? 1 : flops <= 1e8 ? 10 : (int)(1e9 / flops);
+	uint64_t t0	   = time_us();
+	for (int r = 0; r < reps; r++) {
+		if (single)
+			b->matmul(b, w, w_type, xb, yb, n, k);
+		else
+			b->matmul_batch(b, w, w_type, xb, yb, n, k, m);
+	}
 	if (b->synchronize)
 		b->synchronize(b);
-	(void)s;
-	return (double)(time_us() - t0);
+	return (double)(time_us() - t0) / reps;
 }
 
 static double bench_mul_gflops(backend *b, const qtype_info *qt, int n, int k, int m, int iters,

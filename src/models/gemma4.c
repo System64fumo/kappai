@@ -32,7 +32,10 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, 0, dim, STAGE_MATMUL));
 	}
 
-	if (m->arch_info->has_qk_norm) {
+	const int fuse_qk_norm_rope =
+		m->arch_info->has_qk_norm && backend_has_cap(m->backend, BCAP_QK_NORM_ROPE);
+
+	if (m->arch_info->has_qk_norm && !fuse_qk_norm_rope) {
 		OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, eps, 0));
 		OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, eps, 0));
 	}
@@ -41,8 +44,12 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 		OP_EMIT(e, mk_rmsnorm_noweight(RECIPE_SLOT_V));
 	}
 
-	OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_Q, rope_neox));
-	OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_K, rope_neox));
+	if (fuse_qk_norm_rope) {
+		OP_EMIT(e, mk_qk_norm_rope(eps, rope_neox));
+	} else {
+		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_Q, rope_neox));
+		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_K, rope_neox));
+	}
 
 	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
 

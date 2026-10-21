@@ -2913,15 +2913,15 @@ __attribute__((weak)) status_code cpu_matmul_ffn_down_batch(backend *self, const
 	cpu_priv *p = self->priv;
 	if (m <= 0)
 		return ERR_INVALID_ARG;
-	if (m == 1)
+	const matmul_kernel *entry	  = matmul_kernel_lookup(w_type);
+	int					 q8_class = entry ? entry->q8_class : 0;
+	if (m == 1 && !q8_class)
 		return cpu_matmul_ffn_down(self, w, w_type, gate, up, y, n, k, activation);
 	const float *gate_f = cpu_ptr(gate);
 	const float *up_f	= cpu_ptr(up);
 	const void	*W		= cpu_ptr(w);
 	float		*yf		= cpu_ptr(y);
 
-	const matmul_kernel *entry	  = matmul_kernel_lookup(w_type);
-	int					 q8_class = entry ? entry->q8_class : 0;
 	if (q8_class) {
 		size_t stride = cpu_matmul_xq_row_stride(q8_class, k);
 		quant_scratch_ensure(&p->qscratch, (size_t)m * stride);

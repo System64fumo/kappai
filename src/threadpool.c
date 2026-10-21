@@ -23,7 +23,8 @@
 #define TPOOL_SPIN_BUDGET_INITIAL_NS 50000
 #define TPOOL_WAIT_EPOCH_SPIN_BUDGET_NS 20000
 #define TPOOL_SPIN_CHECK_EVERY 128
-#define TPOOL_MIN_CHUNKS_PER_THREAD 8
+#define TPOOL_MIN_CHUNKS_PER_THREAD 32
+#define TPOOL_GUIDED_DIVISOR 4
 #define TPOOL_MAX_THREADS 256
 #define TPOOL_SPIN_EMA_NUM 1
 #define TPOOL_SPIN_EMA_DEN 4
@@ -222,7 +223,7 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 		tpool_chunk_fn fn  = atomic_load_explicit(&pool->job.job_fn, memory_order_acquire);
 		void		  *ctx = (void *)atomic_load_explicit(&pool->job.job_ctx, memory_order_acquire);
 		int			   end = atomic_load_explicit(&pool->job.job_end, memory_order_acquire);
-		int			   chunk = atomic_load_explicit(&pool->job.chunk_size, memory_order_acquire);
+		int min_chunk	   = atomic_load_explicit(&pool->job.chunk_size, memory_order_acquire);
 		if (!fn)
 			return 1;
 		if (atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire) != expected_epoch)
@@ -235,6 +236,10 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 		if (cur >= end)
 			return 1;
 
+		int n_active = atomic_load_explicit(&pool->job.n_workers, memory_order_relaxed) + 1;
+		int chunk	 = (end - cur) / (TPOOL_GUIDED_DIVISOR * n_active);
+		if (chunk < min_chunk)
+			chunk = min_chunk;
 		int next = cur + chunk;
 		if (next > end)
 			next = end;
@@ -243,7 +248,7 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 		if (atomic_compare_exchange_weak_explicit(&pool->job.cursor_ep, &snap, claimed,
 												  memory_order_acq_rel, memory_order_relaxed)) {
 			tpool_run_timed(s, fn, cur, next, tid, ctx, pool->stats_enabled);
-			atomic_fetch_add_explicit(&pool->job.executed, 1, memory_order_relaxed);
+			atomic_fetch_add_explicit(&pool->job.executed, next - cur, memory_order_release);
 		}
 	}
 }
@@ -497,11 +502,10 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 
 	tpool_drain_work(pool, 0, new_epoch);
 
-	int		 total_chunks = (n_items + chunk_size - 1) / chunk_size;
 	int		 budget_ns	  = atomic_load_explicit(&pool->sync.spin_budget_ns, memory_order_relaxed);
 	uint64_t t_spin_start = time_ns();
 	unsigned spins		  = 0;
-	while (atomic_load_explicit(&pool->job.executed, memory_order_acquire) < total_chunks) {
+	while (atomic_load_explicit(&pool->job.executed, memory_order_acquire) < n_items) {
 		spins++;
 		if (spins % TPOOL_SPIN_CHECK_EVERY == 0 && time_ns() - t_spin_start > (uint64_t)budget_ns) {
 			sched_yield();

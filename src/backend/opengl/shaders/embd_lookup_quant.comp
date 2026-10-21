@@ -17,6 +17,13 @@ layout(location = 0) uniform int u_token;
 layout(location = 1) uniform int u_dim;
 layout(location = 2) uniform int u_type;
 layout(location = 3) uniform int u_row_stride;
+layout(std430, binding = 5) readonly buffer TokBuf {
+	uint tok_reg[];
+};
+layout(location = 8) uniform int u_tok_slot;
+uint token_id(void) {
+	return u_tok_slot >= 0 ? tok_reg[u_tok_slot] : uint(u_token);
+}
 
 const uint IQX_IQ2S_BASE   = 0u;
 const uint IQX_IQ2XXS_BASE = 2048u;
@@ -68,7 +75,7 @@ void main() {
 	if (int(d) >= u_dim)
 		return;
 
-	uint  row_off = uint(u_token) * uint(u_row_stride);
+	uint  row_off = token_id() * uint(u_row_stride);
 	float val	  = 0.0;
 
 	if (u_type == 2) {

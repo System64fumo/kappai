@@ -18,6 +18,9 @@ layout(std430, binding = 1) readonly buffer KBuf {
 layout(std430, binding = 2) readonly buffer VBuf {
 	uint vcache[];
 };
+layout(std430, binding = 3) writeonly buffer PartBuf {
+	float part[];
+};
 layout(std430, binding = 4) buffer OutBuf {
 	float out_[];
 };
@@ -32,6 +35,8 @@ layout(location = 7) uniform int u_stride_head_dim;
 layout(location = 8) uniform int u_attn_start;
 layout(location = 9) uniform int u_kv_q8;
 layout(location = 10) uniform int u_kvh_stride;
+layout(location = 11) uniform int u_chunk;
+layout(location = 12) uniform int u_n_splits;
 shared vec2	 q2[MAX_HEAD_DIM / 2];
 shared float partial[ATTN_WG * LANES];
 shared float e_tile[ATTN_WG];
@@ -78,12 +83,14 @@ vec2 v_pair(uint row, int p) {
 
 void main(void) {
 	uint h		  = gl_WorkGroupID.x;
+	int	 split	  = int(gl_WorkGroupID.y);
 	uint tid	  = gl_LocalInvocationID.x;
 	int	 n_groups = u_n_heads / u_n_kv_heads;
 	int	 kvh	  = int(h) / n_groups;
 	int	 head_dim = u_head_dim;
 	int	 pairs	  = head_dim >> 1;
-	int	 pos	  = u_pos;
+	int	 t_begin  = u_attn_start + split * u_chunk;
+	int	 t_end	  = min(u_pos + 1, t_begin + u_chunk);
 	uint q_base	  = h * uint(head_dim);
 
 	for (int p = int(tid); p < pairs; p += ATTN_WG)
@@ -110,12 +117,12 @@ void main(void) {
 	float m_run	  = neg_inf;
 	float l_part  = 0.0;
 
-	for (int t0 = u_attn_start; t0 <= pos; t0 += ATTN_WG) {
-		int len = min(ATTN_WG, pos + 1 - t0);
+	for (int t0 = t_begin; t0 < t_end; t0 += ATTN_WG) {
+		int len = min(ATTN_WG, t_end - t0);
 		for (int base = 0; base < len; base += PASS_TOKENS) {
 			int	  tl = base + tok_in_pass;
 			float a	 = 0.0;
-			if (t0 + tl <= pos)
+			if (t0 + tl < t_end)
 				a = k_partial(kv_base + uint(t0 + tl) * row_stride, lane, pairs);
 			partial[tl * LANES + lane] = a;
 		}
@@ -123,7 +130,7 @@ void main(void) {
 
 		int	  tok	= t0 + int(tid);
 		float score = neg_inf;
-		if (tok <= pos) {
+		if (tok < t_end) {
 			float s = 0.0;
 			for (int l = 0; l < LANES; l++)
 				s += partial[int(tid) * LANES + l];
@@ -141,7 +148,7 @@ void main(void) {
 		for (int t = 0; t < ATTN_WG / 4; t++)
 			m_tile = max(m_tile, m_part[t]);
 		float m_new = max(m_run, m_tile);
-		e_tile[tid] = tok <= pos ? exp(score - m_new) : 0.0;
+		e_tile[tid] = tok < t_end ? exp(score - m_new) : 0.0;
 		float alpha = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
 		m_run		= m_new;
 		barrier();
@@ -165,6 +172,8 @@ void main(void) {
 		barrier();
 	}
 
+	uint pbase	   = (h * uint(u_n_splits) + uint(split)) * uint(head_dim + 2);
+	bool final_out = u_n_splits == 1;
 	if (split_groups > 1) {
 		red[tid]   = o_acc[0];
 		l_red[tid] = l_part;
@@ -176,20 +185,40 @@ void main(void) {
 				o += red[g * pairs + slot_pair];
 				l += l_red[g * pairs + slot_pair];
 			}
-			float inv_l	  = l > 0.0 ? 1.0 / l : 0.0;
-			uint  ob	  = h * uint(head_dim) + uint(slot_pair * 2);
-			out_[ob]	  = o.x * inv_l;
-			out_[ob + 1u] = o.y * inv_l;
+			if (final_out) {
+				float inv_l	  = l > 0.0 ? 1.0 / l : 0.0;
+				uint  ob	  = h * uint(head_dim) + uint(slot_pair * 2);
+				out_[ob]	  = o.x * inv_l;
+				out_[ob + 1u] = o.y * inv_l;
+			} else {
+				uint ob		  = pbase + 2u + uint(slot_pair * 2);
+				part[ob]	  = o.x;
+				part[ob + 1u] = o.y;
+				if (slot_pair == 0) {
+					part[pbase]		 = m_run;
+					part[pbase + 1u] = l;
+				}
+			}
 		}
 		return;
 	}
 	float inv_l = l_part > 0.0 ? 1.0 / l_part : 0.0;
+	if (!final_out && tid == 0u) {
+		part[pbase]		 = m_run;
+		part[pbase + 1u] = l_part;
+	}
 	for (int j = 0; j < MAX_PAIR_SLOTS; j++) {
 		int p = int(tid) + j * ATTN_WG;
 		if (p >= pairs)
 			break;
-		uint ob		  = h * uint(head_dim) + uint(p * 2);
-		out_[ob]	  = o_acc[j].x * inv_l;
-		out_[ob + 1u] = o_acc[j].y * inv_l;
+		if (final_out) {
+			uint ob		  = h * uint(head_dim) + uint(p * 2);
+			out_[ob]	  = o_acc[j].x * inv_l;
+			out_[ob + 1u] = o_acc[j].y * inv_l;
+		} else {
+			uint ob		  = pbase + 2u + uint(p * 2);
+			part[ob]	  = o_acc[j].x;
+			part[ob + 1u] = o_acc[j].y;
+		}
 	}
 }

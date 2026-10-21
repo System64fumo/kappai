@@ -75,6 +75,7 @@ typedef enum {
 	OP_ROPE,
 	OP_ROPE_QK_FUSED,
 	OP_ROPE_EXT,
+	OP_QK_NORM_ROPE,
 
 	OP_KV_PUT,
 	OP_ATTENTION,
@@ -213,6 +214,10 @@ typedef union {
 		int use_freq_factors;
 		int rope_neox;
 	} rope_ext;
+	struct {
+		float eps;
+		int	  rope_neox;
+	} qk_norm_rope;
 	struct {
 		int	  n_heads;
 		int	  n_kv_heads;
@@ -386,6 +391,7 @@ recipe_op mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int
 recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox);
 recipe_op mk_rope_ext(uint8_t in, int rope_neox);
+recipe_op mk_qk_norm_rope(float eps, int rope_neox);
 recipe_op mk_partial_rope_qk(void);
 int		  recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
 int		  recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,

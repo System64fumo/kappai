@@ -1,0 +1,196 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define WG 64
+#define MAX_SUBGROUPS 16
+#define PARTS 16u
+#define XQ_BLOCK_WORDS 76u
+
+layout(local_size_x = WG) in;
+layout(constant_id = 0) const uint COLS = 1;
+layout(constant_id = 1) const uint ROWS = 2;
+
+layout(set = 0, binding = 0) readonly buffer W {
+	uint16_t w16[];
+};
+layout(set = 0, binding = 1) readonly buffer XQ {
+	uint xq[];
+};
+layout(set = 0, binding = 2) buffer Y {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer R {
+	float res[];
+};
+
+layout(push_constant) uniform Params {
+	int n;
+	int kb;
+	int m;
+	int res_mode;
+}
+pc;
+
+#if defined(Q4_K)
+#define BLOCK_U16 72u
+#define QS_U16 8u
+#elif defined(Q5_K)
+#define BLOCK_U16 88u
+#define QS_U16 24u
+#elif defined(Q6_K)
+#define BLOCK_U16 105u
+#endif
+
+uint wq16(uint i) {
+	return uint(w16[i]);
+}
+
+uint wq32(uint i) {
+	return wq16(i) | (wq16(i + 1u) << 16u);
+}
+
+int dot2(uint w0, uint w1, uint x0, uint x1) {
+	return dotPacked4x8EXT(int(w0), int(x0)) + dotPacked4x8EXT(int(w1), int(x1));
+}
+
+uint sub_bytes(uint v, uint k) {
+	return ((v | 0x80808080u) - k) ^ 0x80808080u;
+}
+
+#if defined(Q4_K) || defined(Q5_K)
+uint sbyte(uint b, uint i) {
+	return (wq16(b + 2u + (i >> 1u)) >> ((i & 1u) * 8u)) & 0xFFu;
+}
+
+void scale_min(uint b, uint j, out int sc, out int mn) {
+	if (j < 4u) {
+		sc = int(sbyte(b, j) & 63u);
+		mn = int(sbyte(b, j + 4u) & 63u);
+	} else {
+		sc = int((sbyte(b, j + 4u) & 0xFu) | ((sbyte(b, j - 4u) >> 6u) << 4u));
+		mn = int((sbyte(b, j + 4u) >> 4u) | ((sbyte(b, j) >> 6u) << 4u));
+	}
+}
+#endif
+
+float block_part(uint b, uint xbase, uint p) {
+#if defined(Q4_K) || defined(Q5_K)
+	uint g	= p >> 2u;
+	uint qq = p & 3u;
+	uint q0 = wq32(b + QS_U16 + g * 16u + qq * 4u);
+	uint q1 = wq32(b + QS_U16 + g * 16u + qq * 4u + 2u);
+	uint l0 = q0 & 0x0F0F0F0Fu;
+	uint l1 = q1 & 0x0F0F0F0Fu;
+	uint h0 = (q0 >> 4u) & 0x0F0F0F0Fu;
+	uint h1 = (q1 >> 4u) & 0x0F0F0F0Fu;
+#ifdef Q5_K
+	uint e0 = wq32(b + 8u + qq * 4u);
+	uint e1 = wq32(b + 8u + qq * 4u + 2u);
+	l0 |= ((e0 >> (2u * g)) & 0x01010101u) << 4u;
+	l1 |= ((e1 >> (2u * g)) & 0x01010101u) << 4u;
+	h0 |= ((e0 >> (2u * g + 1u)) & 0x01010101u) << 4u;
+	h1 |= ((e1 >> (2u * g + 1u)) & 0x01010101u) << 4u;
+#endif
+	uint xa	  = xbase + 2u * g * 8u + qq * 2u;
+	uint xb	  = xa + 8u;
+	int	 dot0 = dot2(l0, l1, xq[xa], xq[xa + 1u]);
+	int	 dot1 = dot2(h0, h1, xq[xb], xq[xb + 1u]);
+	int	 s0, m0, s1, m1;
+	scale_min(b, 2u * g, s0, m0);
+	scale_min(b, 2u * g + 1u, s1, m1);
+	int sumi = s0 * dot0 + s1 * dot1;
+	int summ = 0;
+	if (qq == 0u)
+		summ = m0 * int(xq[xbase + 65u + 2u * g]) + m1 * int(xq[xbase + 66u + 2u * g]);
+	float d	   = unpackHalf2x16(wq16(b)).x;
+	float dmin = unpackHalf2x16(wq16(b + 1u)).x;
+	float xd   = uintBitsToFloat(xq[xbase + 64u]);
+	return xd * (d * float(sumi) - dmin * float(summ));
+#else
+	uint h	  = p >> 3u;
+	uint sub  = (p >> 2u) & 1u;
+	uint qq	  = p & 3u;
+	uint qlo  = b + h * 32u + sub * 16u + qq * 4u;
+	uint qho  = b + 64u + h * 16u + qq * 4u;
+	uint ql0  = wq32(qlo);
+	uint ql1  = wq32(qlo + 2u);
+	uint qh0  = wq32(qho);
+	uint qh1  = wq32(qho + 2u);
+	uint sl	  = sub * 2u;
+	uint lo0  = sub_bytes((ql0 & 0x0F0F0F0Fu) | (((qh0 >> sl) & 0x03030303u) << 4u), 0x20202020u);
+	uint lo1  = sub_bytes((ql1 & 0x0F0F0F0Fu) | (((qh1 >> sl) & 0x03030303u) << 4u), 0x20202020u);
+	uint hi0  = sub_bytes(((ql0 >> 4u) & 0x0F0F0F0Fu) | (((qh0 >> (sl + 4u)) & 0x03030303u) << 4u),
+						  0x20202020u);
+	uint hi1  = sub_bytes(((ql1 >> 4u) & 0x0F0F0F0Fu) | (((qh1 >> (sl + 4u)) & 0x03030303u) << 4u),
+						  0x20202020u);
+	uint w_lo = h * 128u + sub * 32u + qq * 8u;
+	uint w_hi = w_lo + 64u;
+	uint j_lo = w_lo >> 4u;
+	uint j_hi = w_hi >> 4u;
+	int	 s_lo = bitfieldExtract(int(wq16(b + 96u + (j_lo >> 1u))), int((j_lo & 1u) * 8u), 8);
+	int	 s_hi = bitfieldExtract(int(wq16(b + 96u + (j_hi >> 1u))), int((j_hi & 1u) * 8u), 8);
+	uint xa	  = xbase + (w_lo >> 2u);
+	uint xb	  = xbase + (w_hi >> 2u);
+	int	 sumi =
+		s_lo * dot2(lo0, lo1, xq[xa], xq[xa + 1u]) + s_hi * dot2(hi0, hi1, xq[xb], xq[xb + 1u]);
+	float d	 = unpackHalf2x16(wq16(b + 104u)).x;
+	float xd = uintBitsToFloat(xq[xbase + 64u]);
+	return d * xd * float(sumi);
+#endif
+}
+
+shared float s_red[16 * MAX_SUBGROUPS];
+
+void main() {
+	uint tid  = gl_LocalInvocationID.x;
+	uint n	  = uint(pc.n);
+	uint m	  = uint(pc.m);
+	uint kb	  = uint(pc.kb);
+	uint row0 = gl_WorkGroupID.x * ROWS;
+	uint col0 = gl_WorkGroupID.y * COLS;
+
+	float acc[ROWS * COLS];
+	for (uint i = 0u; i < ROWS * COLS; i++)
+		acc[i] = 0.0;
+
+	for (uint it = tid; it < kb * PARTS; it += WG) {
+		uint bi = it / PARTS;
+		uint pp = it % PARTS;
+		for (uint r = 0u; r < ROWS; r++) {
+			uint b = (min(row0 + r, n - 1u) * kb + bi) * BLOCK_U16;
+			for (uint c = 0u; c < COLS; c++) {
+				uint xbase = (min(col0 + c, m - 1u) * kb + bi) * XQ_BLOCK_WORDS;
+				acc[r * COLS + c] += block_part(b, xbase, pp);
+			}
+		}
+	}
+
+	for (uint i = 0u; i < ROWS * COLS; i++) {
+		float v = subgroupAdd(acc[i]);
+		if (subgroupElect())
+			s_red[i * MAX_SUBGROUPS + gl_SubgroupID] = v;
+	}
+	barrier();
+	if (tid >= ROWS * COLS)
+		return;
+	uint r	 = tid / COLS;
+	uint c	 = tid % COLS;
+	uint row = row0 + r;
+	uint col = col0 + c;
+	if (row >= n || col >= m)
+		return;
+	float v = 0.0;
+	for (uint s = 0u; s < gl_NumSubgroups; s++)
+		v += s_red[tid * MAX_SUBGROUPS + s];
+	uint yi = col * n + row;
+	if (pc.res_mode == 1)
+		y[yi] = v + res[row];
+	else if (pc.res_mode == 2)
+		y[yi] += v;
+	else
+		y[yi] = v;
+}

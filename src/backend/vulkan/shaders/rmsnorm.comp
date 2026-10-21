@@ -42,6 +42,27 @@ layout(set = 0, binding = 1) writeonly buffer YBuf {
 #endif
 #endif
 
+#ifdef NORM2
+layout(set = 0, binding = 4) readonly buffer W2Buf {
+	float w2[];
+};
+layout(set = 0, binding = 5) writeonly buffer Y2Buf {
+	float y2[];
+};
+#define XQ_BINDING 6
+#else
+#define XQ_BINDING 3
+#endif
+
+#ifdef QUANT_OUT
+layout(set = 0, binding = XQ_BINDING) writeonly buffer XQBuf {
+	uint xq[];
+};
+#include "common.glsl"
+#define QUANT_MAX_N 4096
+shared float s_y[QUANT_MAX_N];
+#endif
+
 #ifdef PER_HEAD
 layout(push_constant) uniform Params {
 	int	  n_heads;
@@ -67,6 +88,41 @@ shared float sg_partial[256];
 #else
 shared float partial[256];
 #endif
+
+float block_sum(float sum) {
+	uint tid = gl_LocalInvocationID.x;
+	barrier();
+#ifdef USE_SUBGROUP
+	sum = subgroupAdd(sum);
+	if (gl_NumSubgroups > 1) {
+		if (gl_SubgroupInvocationID == 0) {
+			sg_partial[gl_SubgroupID] = sum;
+		}
+		barrier();
+		if (gl_SubgroupID == 0) {
+			uint  n_sg = gl_NumSubgroups;
+			float sg_sum =
+				(gl_SubgroupInvocationID < n_sg) ? sg_partial[gl_SubgroupInvocationID] : 0.0;
+			sg_sum = subgroupAdd(sg_sum);
+			if (gl_SubgroupInvocationID == 0) {
+				sg_partial[0] = sg_sum;
+			}
+		}
+		barrier();
+		sum = sg_partial[0];
+	}
+#else
+	partial[tid] = sum;
+	barrier();
+	for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+		if (tid < stride)
+			partial[tid] += partial[tid + stride];
+		barrier();
+	}
+	sum = partial[0];
+#endif
+	return sum;
+}
 
 void main() {
 	uint tid = gl_LocalInvocationID.x;
@@ -100,38 +156,13 @@ void main() {
 		sum += v * v;
 	}
 
-#ifdef USE_SUBGROUP
-	sum = subgroupAdd(sum);
-	if (gl_NumSubgroups > 1) {
-		if (gl_SubgroupInvocationID == 0) {
-			sg_partial[gl_SubgroupID] = sum;
-		}
-		barrier();
-		if (gl_SubgroupID == 0) {
-			uint  n_sg = gl_NumSubgroups;
-			float sg_sum =
-				(gl_SubgroupInvocationID < n_sg) ? sg_partial[gl_SubgroupInvocationID] : 0.0;
-			sg_sum = subgroupAdd(sg_sum);
-			if (gl_SubgroupInvocationID == 0) {
-				sg_partial[0] = sg_sum;
-			}
-		}
-		barrier();
-		sum = sg_partial[0];
-	}
-#else
-	partial[tid] = sum;
-	barrier();
-	for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-		if (tid < stride)
-			partial[tid] += partial[tid + stride];
-		barrier();
-	}
-	sum = partial[0];
-#endif
+	sum = block_sum(sum);
 
 	float scale = (sum > 0.0 || params.eps > 0.0) ? inversesqrt(sum / float(n) + params.eps) : 0.0;
 
+#ifdef NORM2
+	float sum2 = 0.0;
+#endif
 	for (int i = int(tid); i < n; i += 256) {
 		float xv = x[x_off + uint(i)];
 		float result;
@@ -145,5 +176,49 @@ void main() {
 		result *= params.os;
 #endif
 		y[y_off + uint(i)] = result;
+#ifdef QUANT_OUT
+		s_y[i] = result;
+#endif
+#ifdef NORM2
+		sum2 += result * result;
+#endif
 	}
+
+#ifdef NORM2
+	sum2 = block_sum(sum2);
+	float scale2 =
+		(sum2 > 0.0 || params.eps > 0.0) ? inversesqrt(sum2 / float(n) + params.eps) : 0.0;
+	for (int i = int(tid); i < n; i += 256) {
+		float r2			= s_y[i] * scale2 * w2[i];
+		y2[y_off + uint(i)] = r2;
+		s_y[i]				= r2;
+	}
+#endif
+
+#ifdef QUANT_OUT
+	barrier();
+	uint kb = uint(n) / 32u;
+	for (uint b = tid; b < kb; b += 256u) {
+		float amax = 0.0;
+		for (uint j = 0u; j < 32u; j++)
+			amax = max(amax, abs(s_y[b * 32u + j]));
+		float d	  = div_exact(amax, 127.0);
+		float inv = d > 0.0 ? div_exact(1.0, d) : 0.0;
+		uint  dst = (row * kb + b) * 12u;
+		int	  sum = 0;
+		for (uint wd = 0u; wd < 8u; wd++) {
+			uint packed = 0u;
+			for (uint j = 0u; j < 4u; j++) {
+				int q = clamp(round_away(s_y[b * 32u + wd * 4u + j] * inv), -127, 127);
+				sum += q;
+				packed |= (uint(q) & 0xFFu) << (8u * j);
+			}
+			xq[dst + wd] = packed;
+		}
+		xq[dst + 8u]  = floatBitsToUint(f32_to_f16_to_f32(d));
+		xq[dst + 9u]  = floatBitsToUint(f32_to_f16_to_f32(d * float(sum)));
+		xq[dst + 10u] = 0u;
+		xq[dst + 11u] = 0u;
+	}
+#endif
 }

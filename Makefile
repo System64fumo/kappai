@@ -41,18 +41,6 @@ ifneq ($(BUILD_GOALS),)
   endif
 endif
 
-ifeq ($(HOST_ARCH),aarch64)
-  DETECTED_CACHE_LINE := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size 2>/dev/null)
-  DETECTED_L1D_KB     := $(shell cat /sys/devices/system/cpu/cpu0/cache/index0/size 2>/dev/null | tr -dc '0-9')
-  DETECTED_L2_KB      := $(shell for d in /sys/devices/system/cpu/cpu0/cache/index*; do \
-                           if grep -qxE '(Unified)' $$d/type 2>/dev/null && [ "$$(cat $$d/level)" -gt 1 ]; then \
-                             cat $$d/size | tr -dc '0-9'; break; fi; done)
-endif
-ifeq ($(HOST_ARCH),x86_64)
-  DETECTED_CACHE_LINE := $(shell getconf LEVEL1_DCACHE_LINESIZE 2>/dev/null || echo 64)
-  DETECTED_L1D_KB     := $(shell getconf LEVEL1_DCACHE_SIZE 2>/dev/null | tr -dc '0-9')
-  DETECTED_L2_KB      := $(shell getconf LEVEL2_CACHE_SIZE 2>/dev/null | tr -dc '0-9')
-endif
 DETECTED_ARCH_FLAGS := $(shell $(CC) -### -E - -march=native 2>&1 | sed -rn '/cc1/!d;s/(\")|(^.* - )//g;s/ -dumpbase -//g;p')
 
 ifeq ($(origin ARCH_FLAGS),undefined)
@@ -64,9 +52,6 @@ ifeq ($(origin ARCH_FLAGS),undefined)
 endif
 
 ifeq ($(wildcard $(OUT_DIR)/config.mk),)
-  KAI_CACHE_LINE     := $(DETECTED_CACHE_LINE)
-  KAI_L1D_KB         := $(DETECTED_L1D_KB)
-  KAI_L2_KB          := $(DETECTED_L2_KB)
   MACHINE_ARCH_FLAGS := $(DETECTED_ARCH_FLAGS)
 endif
 
@@ -79,21 +64,6 @@ ifeq ($(TSAN),1)
   SANITIZE_FLAGS := -fsanitize=thread
 else
   SANITIZE_FLAGS := -fsanitize=address,undefined -fno-sanitize-recover=undefined
-endif
-
-ifeq ($(CPU_ARCH_OPT),1)
-  ifneq ($(strip $(KAI_CACHE_LINE)),)
-    CFLAGS += -DCACHE_LINE_BYTES=$(KAI_CACHE_LINE)
-  endif
-  ifneq ($(strip $(KAI_L1D_KB)),)
-    CFLAGS += -DL1D_SIZE_BYTES=$(shell echo $$(( $(KAI_L1D_KB) * 1024 )))
-  endif
-  ifneq ($(strip $(KAI_L2_KB)),)
-    CFLAGS += -DL2_SIZE_BYTES=$(shell echo $$(( $(KAI_L2_KB) * 1024 )))
-    ifeq ($(shell test $(KAI_L2_KB) -lt 256 && echo yes),yes)
-      CFLAGS += -DPREFETCH_LOCALITY=0
-    endif
-  endif
 endif
 
 ifeq ($(BUILD),debug)
@@ -234,8 +204,24 @@ MATMUL_BATCH           := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul
 MATMUL_NMAT_DUAL_BATCH := matmul_q4_0 matmul_q4_k matmul_q6_k
 MATMUL_NMAT_TRIPLE_BATCH := matmul_q4_0
 
+QCORE_TYPES := q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl
+q4_0_QFLAG   := -DQ4_0
+q4_1_QFLAG   := -DQ4_1
+q5_0_QFLAG   := -DQ5_0
+q5_1_QFLAG   := -DQ5_1
+q8_0_QFLAG   := -DQ8_0
+iq4_nl_QFLAG := -DIQ4_NL
+KQ_TYPES     := q4_k q5_k q6_k
+DENSE_TYPES  := f32 f16 bf16
+f32_QFLAG    := -DF32
+f16_QFLAG    := -DF16
+bf16_QFLAG   := -DBF16
+q4_k_QFLAG   := -DQ4_K
+q5_k_QFLAG   := -DQ5_K
+q6_k_QFLAG   := -DQ6_K
+
 RMSNORM_VARIANTS := rmsnorm_noweight rmsnorm_sg rmsnorm_noweight_sg \
-                    rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add \
+                    rmsnorm_per_head rmsnorm_per_head_sg rmsnorm_add rmsnorm_sg_quant rmsnorm_add_norm \
                     rmsnorm_noweight_per_head rmsnorm_noweight_per_head_sg
 RMSNORM_ALL := rmsnorm $(RMSNORM_VARIANTS)
 
@@ -246,6 +232,8 @@ rmsnorm_noweight_sg_FLAGS          := -DUSE_SUBGROUP
 rmsnorm_per_head_FLAGS             := -DHAS_WEIGHT -DPER_HEAD
 rmsnorm_per_head_sg_FLAGS          := -DHAS_WEIGHT -DPER_HEAD -DUSE_SUBGROUP
 rmsnorm_add_FLAGS                  := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL
+rmsnorm_sg_quant_FLAGS             := -DHAS_WEIGHT -DUSE_SUBGROUP -DQUANT_OUT
+rmsnorm_add_norm_FLAGS             := -DHAS_WEIGHT -DUSE_SUBGROUP -DADD_RESIDUAL -DNORM2 -DQUANT_OUT
 rmsnorm_noweight_per_head_FLAGS    := -DPER_HEAD
 rmsnorm_noweight_per_head_sg_FLAGS := -DPER_HEAD -DUSE_SUBGROUP
 
@@ -258,7 +246,10 @@ VK_NONBATCH_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/attention_flash.spv \
 	$(OBJ_DIR)/backend/vulkan/embd_lookup.spv \
 	$(OBJ_DIR)/backend/vulkan/kv_put.spv \
-	$(OBJ_DIR)/backend/vulkan/kv_shift_gather.spv
+	$(OBJ_DIR)/backend/vulkan/kv_shift_gather.spv \
+	$(OBJ_DIR)/backend/vulkan/q8_quant.spv \
+	$(OBJ_DIR)/backend/vulkan/attn_decode.spv \
+	$(OBJ_DIR)/backend/vulkan/attn_merge.spv
 
 SHADER_SPVS := \
 	$(VK_NONBATCH_SPVS) \
@@ -270,13 +261,19 @@ SHADER_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/rope_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/rope_ext_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/rope_qk_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/qk_norm_rope.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/attention_flash_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/dequant.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_fused_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
-	$(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv
+	$(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv \
+	$(foreach t,$(QCORE_TYPES),$(OBJ_DIR)/backend/vulkan/q_matvec_$(t).spv) \
+	$(foreach t,$(QCORE_TYPES),$(OBJ_DIR)/backend/vulkan/q_matmul_$(t).spv) \
+	$(foreach t,$(KQ_TYPES),$(OBJ_DIR)/backend/vulkan/kq_matvec_$(t).spv) \
+	$(foreach t,$(DENSE_TYPES),$(OBJ_DIR)/backend/vulkan/dense_matvec_$(t).spv) \
+	$(OBJ_DIR)/backend/vulkan/q8k_quant.spv
 
 SHADERS_H := $(OBJ_DIR)/backend/vulkan/shaders_embedded.h
 
@@ -315,6 +312,11 @@ ifneq ($(HAS_VULKAN),)
   $(eval $(call VK_VARIANT_RULE,ffn,_activate_batch,ffn_activate,-DBATCHED))
   $(eval $(call VK_VARIANT_RULE,elementwise,_batch,elementwise,-DBATCHED))
   $(eval $(call VK_VARIANT_RULE,matmul_iq4_nl,_batch,matmul_iq4_nl,-DBATCHED))
+  $(foreach t,$(QCORE_TYPES),$(eval $(call VK_VARIANT_RULE,q_matvec,_$(t),q_matvec,$($(t)_QFLAG))))
+  $(foreach t,$(QCORE_TYPES),$(eval $(call VK_VARIANT_RULE,q_matmul,_$(t),q_matmul,$($(t)_QFLAG))))
+  $(foreach t,$(KQ_TYPES),$(eval $(call VK_VARIANT_RULE,kq_matvec,_$(t),kq_matvec,$($(t)_QFLAG))))
+  $(foreach t,$(DENSE_TYPES),$(eval $(call VK_VARIANT_RULE,dense_matvec,_$(t),dense_matvec,$($(t)_QFLAG))))
+  $(eval $(call VK_VARIANT_RULE,q8k,_quant,q8_quant,-DQ8K))
 
   $(SHADERS_H): $(SHADER_SPVS) | $(OUT_DIR)
 	@echo "  GEN     $@"
@@ -367,9 +369,6 @@ $(CONFIG_FILE): | $(OUT_DIR)
 	@printf 'TSAN = %s\n' "$(if $(filter 1,$(TSAN)),1,0)" >> $@
 	@printf 'HOST_ARCH = %s\n' "$(HOST_ARCH)" >> $@
 	@printf 'MACHINE_ARCH_FLAGS = %s\n' "$(DETECTED_ARCH_FLAGS)" >> $@
-	@printf 'KAI_CACHE_LINE = %s\n' "$(DETECTED_CACHE_LINE)" >> $@
-	@printf 'KAI_L1D_KB = %s\n' "$(DETECTED_L1D_KB)" >> $@
-	@printf 'KAI_L2_KB = %s\n' "$(DETECTED_L2_KB)" >> $@
 
 backends-help:
 	@echo "optional backends (via BACKENDS=...): $(AVAILABLE_BACKENDS)"
@@ -473,8 +472,6 @@ print-config:
 	@echo "TSAN               = $(if $(filter 1,$(TSAN)),1,0)"
 	@echo "SANITIZE_FLAGS     = $(SANITIZE_FLAGS)"
 	@echo "SPLIT_DEBUG        = $(if $(SPLIT_DEBUG),1,0) ($(if $(SPLIT_DEBUG),symbols+line info in .debug sidecars,inline -g))"
-	@echo "Cache line         = $(if $(KAI_CACHE_LINE),$(KAI_CACHE_LINE) B,64 B (generic default))"
-	@echo "L1D / L2           = $(if $(KAI_L1D_KB),$(KAI_L1D_KB)K,generic) / $(if $(KAI_L2_KB),$(KAI_L2_KB)K,generic)"
 	@echo "AVAILABLE_BACKENDS = $(AVAILABLE_BACKENDS)"
 	@echo "BACKENDS           = $(REQUESTED_BACKENDS)"
 	@echo "CPU_ARCH_DIR       = $(if $(CPU_ARCH_DIR),$(CPU_ARCH_DIR),(none: scalar library only))"

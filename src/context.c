@@ -1,6 +1,7 @@
 #include "context.h"
 #include "compute.h"
 #include "config.h"
+#include "cpu_cache.h"
 #include "log.h"
 #include "memconfig.h"
 #include "model.h"
@@ -807,6 +808,33 @@ static int context_feed_token_inner(context *c, int32_t token, float *logits_out
 	return pos + 1;
 }
 
+static int context_feed_reg(context *c, int reg) {
+	if (c->kv.n_pos >= c->n_ctx)
+		return ERR_INVALID_ARG;
+	fed_ids_sync(c);
+	int			pos = c->kv.n_pos;
+	status_code cst =
+		compute_forward(&c->m, &c->kv, &c->scratch, TOKEN_FROM_REG(reg), pos, c->flash_attn, NULL);
+	if (cst == ERR_INTERRUPTED || cst == ERR_UNSUPPORTED)
+		return cst;
+	if (cst != OK) {
+		ERROR("compute_forward failed: %s at pos=%d (device-fed token) -- aborting feed",
+			  status_str(cst), pos);
+		return ERR_COMPUTE_FAIL;
+	}
+	c->kv.n_pos++;
+	return pos + 1;
+}
+
+static bool context_token_regs_usable(const context *c) {
+	const backend *b = c->backend;
+	if (!b || !b->argmax_to_reg || !b->read_token_reg || c->decode_step || c->debug_forward)
+		return false;
+	if (c->m.mixed_backend_mode)
+		return false;
+	return !c->m.has_per_layer_embeddings || ple_build_dev_path_ok(c->backend, &c->m, 1);
+}
+
 #define PREFILL_CHUNK_WS_TARGET_BYTES (8ull << 20)
 
 static size_t context_kv_bytes_per_token(const context *c) {
@@ -836,16 +864,14 @@ static int context_prefill_chunk_size(const context *c, int n_threads) {
 	if (n_threads < 1)
 		n_threads = 1;
 	size_t ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
-#if defined(L2_SIZE_BYTES) && (L2_SIZE_BYTES > 0)
-	{
-		size_t scaled = (size_t)L2_SIZE_BYTES * (size_t)n_threads;
+	if (g_cpu_cache.l2_bytes > 0) {
+		size_t scaled = g_cpu_cache.l2_bytes * (size_t)n_threads;
 		if (scaled < (1ull << 20))
 			scaled = (1ull << 20);
 		if (scaled > PREFILL_CHUNK_WS_TARGET_BYTES)
 			scaled = PREFILL_CHUNK_WS_TARGET_BYTES;
 		ws_target = scaled;
 	}
-#endif
 	size_t kv_per_tok	= context_kv_bytes_per_token(c);
 	int	   chunk		= (int)(ws_target / (kv_per_tok > 0 ? kv_per_tok : 1));
 	size_t slot_per_tok = context_slot_bytes_per_token(c);
@@ -1041,6 +1067,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 									(samp->temperature <= 0.0f || samp->top_k == 1) && c->backend &&
 									c->backend->argmax && !c->debug_forward &&
 									!(c->m.arch_info && c->m.arch_info->is_hybrid_recurrent);
+	bool			pipelined	  = fast_argmax && context_token_regs_usable(c);
 	bool			has_fed_tok	  = false;
 	int32_t			last_fed_tok  = -1;
 	uint64_t		last_poll_us  = 0;
@@ -1057,8 +1084,37 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		}
 		monitor_setup_cb(c, &cb, "decode", i, i + 1);
 
-		int32_t tok;
-		if (fast_argmax && !c->logits_on_host) {
+		int32_t tok		  = 0;
+		bool	spec_fed  = false;
+		bool	host_redo = false;
+		int		pre_rc	  = 0;
+		if (pipelined) {
+			int			reg = i % BACKEND_TOKEN_REGS;
+			status_code st	= c->backend->argmax_to_reg(
+				c->backend, compute_logits_device(&c->scratch), c->m.vocab_size, reg);
+			if (st == OK) {
+				pre_rc	 = context_feed_reg(c, reg);
+				spec_fed = pre_rc >= 0;
+				if (pre_rc == ERR_UNSUPPORTED) {
+					pipelined = false;
+					pre_rc	  = 0;
+				}
+				st = c->backend->read_token_reg(c->backend, reg, &tok);
+			}
+			if (st == OK) {
+				sampler_observe(&c->samp, tok);
+			} else {
+				WARN("device token pipeline failed (%s); falling back to host sampling",
+					 status_str(st));
+				if (spec_fed)
+					c->kv.n_pos--;
+				spec_fed	= false;
+				pre_rc		= 0;
+				pipelined	= false;
+				fast_argmax = false;
+				host_redo	= true;
+			}
+		} else if (fast_argmax && !c->logits_on_host) {
 			status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
 												c->m.vocab_size, &tok);
 			if (st == OK) {
@@ -1066,22 +1122,28 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 			} else {
 				WARN("device argmax failed (%s); falling back to host sampling", status_str(st));
 				fast_argmax = false;
-				if (has_fed_tok) {
-					c->kv.n_pos--;
-					int rc = context_feed_token_inner(c, last_fed_tok, c->scratch.logits_host);
-					if (rc < 0) {
-						ERROR("device-argmax fallback redo failed (rc=%d); poisoning session", rc);
-						c->session_poisoned = true;
-						break;
-					}
-				}
-				tok = context_sample_next(c);
+				host_redo	= true;
 			}
 		} else {
 			tok = context_sample_next(c);
 		}
-		if (tokenizer_is_eog(&c->tok, tok))
+		if (host_redo) {
+			if (has_fed_tok) {
+				c->kv.n_pos--;
+				int rc = context_feed_token_inner(c, last_fed_tok, c->scratch.logits_host);
+				if (rc < 0) {
+					ERROR("device-argmax fallback redo failed (rc=%d); poisoning session", rc);
+					c->session_poisoned = true;
+					break;
+				}
+			}
+			tok = context_sample_next(c);
+		}
+		if (tokenizer_is_eog(&c->tok, tok)) {
+			if (spec_fed)
+				c->kv.n_pos--;
 			break;
+		}
 		char piece[256];
 		int	 pn = tokenizer_decode(&c->tok, &tok, 1, piece, sizeof(piece), &c->scratch.prof);
 		if (pn < 0)
@@ -1096,11 +1158,20 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 			if (on_token)
 				on_token(tok, piece, pn, ud);
 			if (monitor_active(&c->monitor))
-				monitor_emit_token(&c->monitor, i, tok, c->kv.n_pos - 1, piece, pn);
+				monitor_emit_token(&c->monitor, i, tok, c->kv.n_pos - 1 - (spec_fed ? 1 : 0), piece,
+								   pn);
 		}
 		generated++;
 		float *logits_out = fast_argmax ? NULL : c->scratch.logits_host;
-		int	   rc		  = context_feed_token_inner(c, tok, logits_out);
+		int	   rc;
+		if (spec_fed) {
+			fed_ids_append(c, tok);
+			rc = c->kv.n_pos;
+		} else if (pre_rc < 0) {
+			rc = pre_rc;
+		} else {
+			rc = context_feed_token_inner(c, tok, logits_out);
+		}
 		if (rc == ERR_COMPUTE_FAIL) {
 			ERROR("decode aborted: device compute error at token %d (pos=%d)", i, c->kv.n_pos);
 			c->session_poisoned = true;

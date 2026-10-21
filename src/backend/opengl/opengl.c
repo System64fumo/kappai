@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define GL_MAX_BINDINGS 8
@@ -25,6 +26,7 @@
 #define GL_PIPELINE_NAME_PTR_CAP 32
 #define GL_MAX_PENDING_ACCESSES 256
 #define GL_FLUSH_INTERVAL_DISPATCHES 64
+#define GL_QK_NORM_ROPE_MAX_HEAD_DIM 1024
 #define GL_ROPE_CACHE_SLOTS 4
 #define GL_ROPE_CACHE_MIN_POSITIONS 1024
 #define GL_WHOLE_BUFFER ((size_t)1 << 62)
@@ -70,6 +72,7 @@ typedef enum {
 	GL_PIPE_FFN_ACTIVATE,
 	GL_PIPE_FFN_ACTIVATE_FUSED_BATCH,
 	GL_PIPE_ATTENTION,
+	GL_PIPE_ATTENTION_MERGE,
 	GL_PIPE_ATTENTION_BATCH,
 	GL_PIPE_PARTIAL_ROPE_QK,
 	GL_PIPE_KV_PUT,
@@ -111,6 +114,12 @@ typedef enum {
 	GL_PIPE_MLA_ABSORB_Q,
 	GL_PIPE_MLA_ABSORB_ATTN,
 	GL_PIPE_DEQUANT_Q8_0,
+	GL_PIPE_QK_NORM_ROPE,
+	GL_PIPE_QUANTIZE_X_NORM,
+	GL_PIPE_MATMUL_F32_ACT,
+	GL_PIPE_MATMUL_MM_IQ4_NL,
+	GL_PIPE_MATMUL_MM_Q4_0,
+	GL_PIPE_MATMUL_MM_Q8_0,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -134,6 +143,7 @@ enum {
 	GL_PIPE_F_IQ4NL_LUT		= 1u << 7,
 	GL_PIPE_F_BF16			= 1u << 8,
 	GL_PIPE_F_IQX_GRID		= 1u << 9,
+	GL_PIPE_F_MM			= 1u << 10,
 };
 
 typedef struct gl_buf {
@@ -216,8 +226,44 @@ typedef struct {
 	uint64_t gen;
 } gl_xq_cache;
 
+#define GL_PROF_RING 4096
+#define GL_TIME_ELAPSED_EXT 0x88BF
+#define GL_QUERY_RESULT_EXT 0x8866
+
+typedef struct {
+	int enabled;
+	int n;
+	void (*gen)(GLsizei n, GLuint *ids);
+	void (*del)(GLsizei n, const GLuint *ids);
+	void (*begin)(GLenum target, GLuint id);
+	void (*end)(GLenum target);
+	void (*result)(GLuint id, GLenum pname, uint64_t *out);
+	GLuint	 q[GL_PROF_RING];
+	int		 pipe_of[GL_PROF_RING];
+	uint64_t ns[GL_PIPE_COUNT];
+	uint64_t calls[GL_PIPE_COUNT];
+} gl_gpuprof;
+
+typedef struct {
+	uint64_t dispatches;
+	uint64_t barriers;
+	uint64_t flushes;
+	uint64_t finishes;
+	uint64_t readbacks;
+	uint64_t launch_us;
+	uint64_t wait_us;
+} gl_stats;
+
+static uint64_t gl_now_us(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
 struct gl_priv {
 	gl_context ctx;
+	gl_stats   stats;
+	gl_gpuprof gpuprof;
 
 	gl_pipeline pipes[GL_PIPE_COUNT];
 
@@ -249,6 +295,9 @@ struct gl_priv {
 
 	gl_buf *argmax_partial;
 	size_t	argmax_partial_bytes;
+	gl_buf *tok_reg;
+	gl_buf *tok_rb;
+	GLsync	tok_fence[BACKEND_TOKEN_REGS];
 
 	gl_buf *readback;
 	size_t	readback_bytes;
@@ -262,8 +311,8 @@ struct gl_priv {
 	int	   kv_quant;
 	size_t kv_row_bytes;
 
-	gl_buf *attn_scores;
-	size_t	attn_scores_cap;
+	gl_buf *attn_part;
+	size_t	attn_part_cap;
 
 	gl_buf *dummy;
 
@@ -468,7 +517,14 @@ static status_code gl_link_program_from_shader(GLuint shader, GLuint *out_progra
 #define GL_ATTENTION_TILE_T_MAX 16
 #define GL_ATTENTION_Q_CHUNK 4
 #define GL_ATTENTION_WG 64
+#define GL_ATTENTION_MAX_SPLITS 64
+#define GL_ATTENTION_MIN_CHUNK 16
+#define GL_ATTENTION_TARGET_WORKGROUPS 256
 #define GL_MATMUL_COLS 4
+#define GL_MM_TILE 64
+#define GL_MM_THREADS 256
+#define GL_MM_SHARED_BYTES ((2 * 32 * GL_MM_TILE + 2 * GL_MM_TILE) * 4)
+#define GL_MM_MIN_M 16
 #define GL_ATTENTION_KV_ROW_BYTES (GL_ATTENTION_MAX_HEAD_DIM * 4)
 #define GL_ATTENTION_FIXED_SHARED_BYTES (GL_ATTENTION_Q_CHUNK * GL_ATTENTION_MAX_HEAD_DIM * 4)
 
@@ -695,25 +751,74 @@ static void gl_bind_ssbo_out(int binding, const buffer *b) {
 	gl_bind_ssbo_access(binding, b, 1);
 }
 
+static int gl_pipe_index(const gl_priv *p) {
+	for (int i = 0; i < GL_PIPE_COUNT; i++)
+		if (p->pipes[i].program == p->current_program)
+			return i;
+	return 0;
+}
+
+static void gl_prof_drain(gl_priv *p) {
+	gl_gpuprof *g = &p->gpuprof;
+	for (int i = 0; i < g->n; i++) {
+		uint64_t ns = 0;
+		g->result(g->q[i], GL_QUERY_RESULT_EXT, &ns);
+		g->ns[g->pipe_of[i]] += ns;
+		g->calls[g->pipe_of[i]]++;
+	}
+	g->n = 0;
+}
+
+static void gl_prof_begin(gl_priv *p) {
+	gl_gpuprof *g = &p->gpuprof;
+	if (!g->enabled)
+		return;
+	if (g->n == GL_PROF_RING) {
+		glFinish();
+		gl_prof_drain(p);
+	}
+	g->begin(GL_TIME_ELAPSED_EXT, g->q[g->n]);
+}
+
+static void gl_prof_end(gl_priv *p) {
+	gl_gpuprof *g = &p->gpuprof;
+	if (!g->enabled)
+		return;
+	g->end(GL_TIME_ELAPSED_EXT);
+	g->pipe_of[g->n++] = gl_pipe_index(p);
+}
+
 static void gl_barrier(gl_priv *p) {
+	uint64_t t0 = gl_now_us();
+	p->stats.barriers++;
 	glMemoryBarrier(GL_COMPUTE_BARRIER_BITS);
+	p->stats.launch_us += gl_now_us() - t0;
 	p->n_pending = 0;
 }
 
 static void gl_finish(gl_priv *p) {
+	uint64_t t0 = gl_now_us();
+	p->stats.finishes++;
 	glFinish();
+	p->stats.wait_us += gl_now_us() - t0;
+	if (p->gpuprof.enabled)
+		gl_prof_drain(p);
 	p->dispatches_since_flush = 0;
 }
 
 static void gl_flush_if_due(gl_priv *p) {
 	if (++p->dispatches_since_flush < GL_FLUSH_INTERVAL_DISPATCHES)
 		return;
+	p->stats.flushes++;
 	glFlush();
 	p->dispatches_since_flush = 0;
 }
 
 static void gl_dispatch_barrier(gl_priv *p) {
+	uint64_t t0 = gl_now_us();
+	p->stats.barriers++;
 	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	p->stats.launch_us += gl_now_us() - t0;
 	p->n_pending = 0;
 }
 
@@ -755,7 +860,12 @@ static void gl_launch(gl_priv *p, GLuint groups_x, GLuint groups_y, GLuint group
 			break;
 		}
 	}
+	uint64_t t0 = gl_now_us();
+	p->stats.dispatches++;
+	gl_prof_begin(p);
 	glDispatchCompute(groups_x, groups_y, groups_z);
+	gl_prof_end(p);
+	p->stats.launch_us += gl_now_us() - t0;
 	gl_xq_cache_scan_writes(p, mask);
 	gl_flush_if_due(p);
 	p->access_mask = 0;
@@ -1254,6 +1364,8 @@ static status_code gl_init(backend *self, int device_index) {
 											  gl_shader_ffn_activate_fused_batch_src, 0, UINT32_MAX,
 											  1, 0},
 		[GL_PIPE_ATTENTION]				   = {"attention", p->attention_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ATTENTION_MERGE]		   = {"attention_merge", gl_shader_attention_merge_src, 0,
+											  UINT32_MAX, 1, 0},
 		[GL_PIPE_ATTENTION_BATCH] = {"attention_batch", p->attention_batch_src, 0, UINT32_MAX, 1,
 									 0},
 		[GL_PIPE_PARTIAL_ROPE_QK] = {"partial_rope_qk", gl_shader_partial_rope_qk_src, 0,
@@ -1280,6 +1392,17 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_MLA_ABSORB_ATTN] = {"mla_absorb_attn", gl_shader_mla_absorb_attn_src, 0,
 									 UINT32_MAX, 1, 0},
 		[GL_PIPE_DEQUANT_Q8_0] = {"dequant_q8_0", gl_shader_dequant_q8_0_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_QK_NORM_ROPE] = {"qk_norm_rope", gl_shader_qk_norm_rope_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_MATMUL_MM_IQ4_NL] = {"matmul_mm_iq4_nl", gl_shader_matmul_mm_src,
+									  GL_PIPE_F_MM | GL_PIPE_F_USES_XQ, UINT32_MAX, GL_MM_TILE, 32},
+		[GL_PIPE_MATMUL_MM_Q4_0]   = {"matmul_mm_q4_0", gl_shader_matmul_mm_src,
+									  GL_PIPE_F_MM | GL_PIPE_F_USES_XQ, UINT32_MAX, GL_MM_TILE, 32},
+		[GL_PIPE_MATMUL_MM_Q8_0]   = {"matmul_mm_q8_0", gl_shader_matmul_mm_src,
+									  GL_PIPE_F_MM | GL_PIPE_F_USES_XQ, UINT32_MAX, GL_MM_TILE, 32},
+		[GL_PIPE_MATMUL_F32_ACT] = {"matmul_f32_act", gl_shader_matmul_f32_src, GL_PIPE_F_FUSED_ACT,
+									UINT32_MAX, 4, 0},
+		[GL_PIPE_QUANTIZE_X_NORM] = {"rmsnorm_quantize", gl_shader_quantize_x_src, 0, UINT32_MAX, 1,
+									 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -1291,6 +1414,10 @@ static status_code gl_init(backend *self, int device_index) {
 		{GL_PIPE_MATMUL_BF16_TILED, "BF16"},
 		{GL_PIPE_MATMUL_Q5_K, "Q5K"},
 		{GL_PIPE_MATMUL_Q5_K_REPACKED, "Q5K"},
+		{GL_PIPE_QUANTIZE_X_NORM, "FUSED_NORM"},
+		{GL_PIPE_MATMUL_MM_IQ4_NL, "IQ4_NL"},
+		{GL_PIPE_MATMUL_MM_Q4_0, "Q4_0"},
+		{GL_PIPE_MATMUL_MM_Q8_0, "Q8_0"},
 	};
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		char *tuned_src = NULL;
@@ -1345,7 +1472,10 @@ static status_code gl_init(backend *self, int device_index) {
 		}
 		if (s != OK)
 			break;
-		s = gl_build_pipeline(tuned_src ? tuned_src : defs[i].src, defs[i].name, &p->pipes[i]);
+		if (!(defs[i].flags & GL_PIPE_F_MM) ||
+			(p->ctx.max_shared_bytes >= GL_MM_SHARED_BYTES && p->ctx.max_wg_size >= GL_MM_THREADS &&
+			 p->ctx.max_wg_invocations >= GL_MM_THREADS))
+			s = gl_build_pipeline(tuned_src ? tuned_src : defs[i].src, defs[i].name, &p->pipes[i]);
 		p->pipes[i].src			= defs[i].src;
 		p->pipes[i].flags		= defs[i].flags;
 		p->pipes[i].w_type		= defs[i].w_type;
@@ -1416,6 +1546,8 @@ static status_code gl_init(backend *self, int device_index) {
 	return OK;
 }
 
+static void gl_gpuprof_report(gl_priv *p);
+
 static void gl_free(backend *self) {
 	gl_priv *p = self->priv;
 	if (!p)
@@ -1434,6 +1566,18 @@ static void gl_free(backend *self) {
 		return;
 	}
 
+	INFO("gl: totals: %llu dispatches, %llu barriers, %llu flushes, %llu finishes, %llu readbacks",
+		 (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
+		 (unsigned long long)p->stats.flushes, (unsigned long long)p->stats.finishes,
+		 (unsigned long long)p->stats.readbacks);
+	INFO("gl: host time: %.1f ms in dispatch/barrier calls, %.1f ms waiting in glFinish",
+		 (double)p->stats.launch_us / 1000.0, (double)p->stats.wait_us / 1000.0);
+
+	gl_gpuprof_report(p);
+
+	for (int i = 0; i < BACKEND_TOKEN_REGS; i++)
+		if (p->tok_fence[i])
+			glDeleteSync(p->tok_fence[i]);
 	for (int i = 0; i < GL_PIPE_COUNT; i++)
 		glDeleteProgram(p->pipes[i].program);
 
@@ -1592,6 +1736,7 @@ static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, vo
 	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 	if (glGetError() != GL_NO_ERROR)
 		return ERR_INTERNAL;
+	p->stats.readbacks++;
 	GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 	if (!fence)
 		return ERR_INTERNAL;
@@ -1641,6 +1786,7 @@ static status_code gl_read_two_regions_f32(gl_priv *p, gl_buf *b0, size_t off0, 
 	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 	if (glGetError() != GL_NO_ERROR)
 		return ERR_INTERNAL;
+	p->stats.readbacks++;
 	GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 	if (!fence)
 		return ERR_INTERNAL;
@@ -1813,24 +1959,77 @@ static void gl_synchronize(backend *self) {
 	}
 }
 
+static void gl_set_gpu_profile(backend *self, int enable) {
+	gl_priv *p = self->priv;
+	GL_ENTER_VOID(p);
+	gl_gpuprof *g = &p->gpuprof;
+	if (!enable || g->enabled)
+		return;
+	const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+	if (!ext || !strstr(ext, "GL_EXT_disjoint_timer_query")) {
+		WARN("gl: GL_EXT_disjoint_timer_query unavailable; per-kernel GPU timing disabled");
+		return;
+	}
+	g->gen	  = (void *)eglGetProcAddress("glGenQueriesEXT");
+	g->del	  = (void *)eglGetProcAddress("glDeleteQueriesEXT");
+	g->begin  = (void *)eglGetProcAddress("glBeginQueryEXT");
+	g->end	  = (void *)eglGetProcAddress("glEndQueryEXT");
+	g->result = (void *)eglGetProcAddress("glGetQueryObjectui64vEXT");
+	if (!g->gen || !g->del || !g->begin || !g->end || !g->result) {
+		WARN("gl: timer query entry points missing; per-kernel GPU timing disabled");
+		return;
+	}
+	g->gen(GL_PROF_RING, g->q);
+	g->enabled = 1;
+}
+
+static void gl_gpuprof_report(gl_priv *p) {
+	gl_gpuprof *g = &p->gpuprof;
+	if (!g->enabled)
+		return;
+	gl_finish(p);
+	int		 order[GL_PIPE_COUNT];
+	uint64_t total = 0;
+	for (int i = 0; i < GL_PIPE_COUNT; i++) {
+		order[i] = i;
+		total += g->ns[i];
+	}
+	for (int i = 1; i < GL_PIPE_COUNT; i++) {
+		int k = order[i];
+		int j = i;
+		while (j > 0 && g->ns[order[j - 1]] < g->ns[k]) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = k;
+	}
+	INFO("gl: GPU kernel time %.1f ms total (host waited %.1f ms in glFinish)", (double)total / 1e6,
+		 (double)p->stats.wait_us / 1000.0);
+	for (int i = 0; i < GL_PIPE_COUNT && i < 16 && g->ns[order[i]]; i++) {
+		int k = order[i];
+		INFO("gl:   %-28s %8.1f ms %5.1f%% %8llu calls %7.1f us/call", p->pipes[k].name,
+			 (double)g->ns[k] / 1e6, 100.0 * (double)g->ns[k] / (double)total,
+			 (unsigned long long)g->calls[k], (double)g->ns[k] / 1e3 / (double)g->calls[k]);
+	}
+	g->del(GL_PROF_RING, g->q);
+	g->enabled = 0;
+}
+
 static void gl_submit(backend *self) {
 	gl_priv *p = self->priv;
 	GL_ENTER_VOID(p);
+	p->stats.flushes++;
 	glFlush();
 	p->dispatches_since_flush = 0;
 }
 
-static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
-	gl_priv *p = self->priv;
-	GL_ENTER(p);
+#define GL_ARGMAX_WG_CHUNK 8192
+#define GL_ARGMAX_MAX_GROUPS 256
 
-	const int ARGMAX_WG_CHUNK	= 8192;
-	const int ARGMAX_MAX_GROUPS = 256;
-	int		  groups			= (n + ARGMAX_WG_CHUNK - 1) / ARGMAX_WG_CHUNK;
-	if (groups > ARGMAX_MAX_GROUPS)
-		groups = ARGMAX_MAX_GROUPS;
-	if (groups < 1)
-		groups = 1;
+static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int *groups_out) {
+	int groups = (n + GL_ARGMAX_WG_CHUNK - 1) / GL_ARGMAX_WG_CHUNK;
+	groups	   = MIN(groups, GL_ARGMAX_MAX_GROUPS);
+	groups	   = MAX(groups, 1);
 
 	size_t partial_bytes = (size_t)groups * 2 * sizeof(uint32_t);
 	if (!p->argmax_partial || p->argmax_partial_bytes < partial_bytes) {
@@ -1848,6 +2047,16 @@ static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t
 	static const char *s1_unames[2]	  = {"u_n", "u_chunk"};
 	status_code s = gl_dispatch_all_dirty(p, &p->pipes[GL_PIPE_ARGMAX_STAGE1], s1_bufs, 2,
 										  s1_unames, s1_uniforms, 2, (GLuint)groups, 1, 1, 1);
+	*groups_out	  = groups;
+	return s;
+}
+
+static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+
+	int			groups;
+	status_code s = gl_argmax_stage1(p, logits, n, &groups);
 	if (s != OK)
 		return s;
 
@@ -1867,6 +2076,82 @@ static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t
 	p->argmax_partial->device_dirty = 1;
 
 	*out_idx = best_idx;
+	return OK;
+}
+
+static status_code gl_ensure_token_regs(gl_priv *p) {
+	if (p->tok_reg && p->tok_rb)
+		return OK;
+	p->tok_reg = gl_buf_alloc(p, 64, GL_DYNAMIC_COPY, NULL);
+	p->tok_rb  = gl_buf_alloc(p, 64, GL_DYNAMIC_COPY, NULL);
+	return p->tok_reg && p->tok_rb ? OK : ERR_OUT_OF_MEMORY;
+}
+
+static status_code gl_argmax_to_reg(backend *self, const buffer *logits, int n, int reg) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS)
+		return ERR_INVALID_ARG;
+	status_code s = gl_ensure_token_regs(p);
+	if (s != OK)
+		return s;
+
+	int groups;
+	s = gl_argmax_stage1(p, logits, n, &groups);
+	if (s != OK)
+		return s;
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_ARGMAX_STAGE2];
+	gl_use_pipeline(p, pipe);
+	gl_bind_raw(p, 0, p->argmax_partial->name, 0, 0, 0);
+	gl_bind_raw(p, 1, p->tok_reg->name, 0, 0, 1);
+	gl_pu(pipe, "u_groups", groups);
+	gl_pu(pipe, "u_slot", reg);
+	gl_launch(p, 1, 1, 1);
+
+	gl_barrier_if_pending(p);
+	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	glBindBuffer(GL_COPY_READ_BUFFER, p->tok_reg->name);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, p->tok_rb->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)(reg * 4),
+						(GLintptr)(reg * 4), 4);
+	glBindBuffer(GL_COPY_READ_BUFFER, 0);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	if (p->tok_fence[reg])
+		glDeleteSync(p->tok_fence[reg]);
+	p->tok_fence[reg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	p->stats.flushes++;
+	glFlush();
+	return p->tok_fence[reg] ? OK : ERR_INTERNAL;
+}
+
+static status_code gl_read_token_reg(backend *self, int reg, int32_t *out_token) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->tok_fence[reg])
+		return ERR_INVALID_ARG;
+	uint64_t t0 = gl_now_us();
+	GLenum	 wr =
+		glClientWaitSync(p->tok_fence[reg], GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)500000000);
+	while (wr == GL_TIMEOUT_EXPIRED)
+		wr = glClientWaitSync(p->tok_fence[reg], 0, (GLuint64)1000000000);
+	p->stats.wait_us += gl_now_us() - t0;
+	p->stats.readbacks++;
+	glDeleteSync(p->tok_fence[reg]);
+	p->tok_fence[reg] = NULL;
+	if (wr != GL_ALREADY_SIGNALED && wr != GL_CONDITION_SATISFIED)
+		return ERR_INTERNAL;
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->tok_rb->name);
+	const uint32_t *src =
+		glMapBufferRange(GL_SHADER_STORAGE_BUFFER, (GLintptr)(reg * 4), 4, GL_MAP_READ_BIT);
+	if (!src) {
+		glGetError();
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+		return ERR_INTERNAL;
+	}
+	*out_token = (int32_t)*src;
+	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	return OK;
 }
 
@@ -1892,6 +2177,13 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 								  int token, int dim, buffer *x_out) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
+	int tok_slot = -1;
+	if (TOKEN_IS_REG(token)) {
+		tok_slot = TOKEN_REG_INDEX(token);
+		if (tok_slot >= BACKEND_TOKEN_REGS || !p->tok_reg)
+			return ERR_INVALID_ARG;
+		token = 0;
+	}
 	gl_pipeline *pipe;
 	switch (tok_embd_type) {
 	case GGML_TYPE_F32:
@@ -1928,6 +2220,8 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	case GGML_TYPE_Q6_K_REPACKED:
 		return ERR_UNSUPPORTED;
 	default: {
+		if (tok_slot >= 0)
+			return ERR_UNSUPPORTED;
 		gl_buf *eb = as_glbuf(tok_embd);
 		gl_buf *ob = as_glbuf(x_out);
 		if (!eb || !ob)
@@ -1969,11 +2263,13 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	gl_buf_sync_to_device(bufs[1]);
 
 	if (pipe == &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT]) {
-		int				   uniforms[4] = {token, dim, (int)tok_embd_type, (int)row_stride};
-		static const char *unames[4]   = {"u_token", "u_dim", "u_type", "u_row_stride"};
+		int uniforms[5]				 = {token, dim, (int)tok_embd_type, (int)row_stride, tok_slot};
+		static const char *unames[5] = {"u_token", "u_dim", "u_type", "u_row_stride", "u_tok_slot"};
 		gl_use_pipeline(p, pipe);
 		gl_bind_ssbo(0, tok_embd);
 		gl_bind_ssbo_out(1, x_out);
+		if (tok_slot >= 0)
+			gl_bind_raw(p, 5, p->tok_reg->name, 0, 0, 0);
 		if ((tok_embd_type == GGML_TYPE_IQ2_S || tok_embd_type == GGML_TYPE_IQ2_XXS ||
 			 tok_embd_type == GGML_TYPE_IQ3_XXS || tok_embd_type == GGML_TYPE_IQ4_XS) &&
 			p->iqx_grid)
@@ -1984,20 +2280,26 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 		gl_pu(pipe, unames[1], uniforms[1]);
 		gl_pu(pipe, unames[2], uniforms[2]);
 		gl_pu(pipe, unames[3], uniforms[3]);
+		gl_pu(pipe, unames[4], uniforms[4]);
 		GLuint groups = (GLuint)((dim + 63) / 64);
 		gl_launch(p, groups, 1, 1);
 		bufs[1]->device_dirty = 1;
 		return OK;
 	}
 
-	int				   uniforms[3] = {token, dim, (int)row_stride};
-	static const char *unames[3]   = {"u_token", "u_dim", "u_row_stride"};
+	int				   uniforms[4] = {token, dim, (int)row_stride, tok_slot};
+	static const char *unames[4]   = {"u_token", "u_dim", "u_row_stride", "u_tok_slot"};
 	GLuint			   groups	   = (GLuint)((dim + 63) / 64);
-	status_code		   s = gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 3, groups, 1, 1, 1);
+	if (tok_slot >= 0)
+		gl_bind_raw(p, 5, p->tok_reg->name, 0, 0, 0);
+	status_code s = gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 4, groups, 1, 1, 1);
 	if (s == OK)
 		bufs[1]->device_dirty = 1;
 	return s;
 }
+
+static status_code gl_rmsnorm_quantize(gl_priv *p, const buffer *x, const buffer *w, buffer *y,
+									   int n, float eps);
 
 static status_code gl_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
 							  float eps) {
@@ -2010,6 +2312,14 @@ static status_code gl_rmsnorm(backend *self, const buffer *x, const buffer *w, b
 
 	if (n <= 0)
 		return OK;
+
+	status_code fs = gl_rmsnorm_quantize(p, x, w, y, n, eps);
+	if (fs == OK) {
+		bufs[2]->device_dirty = 1;
+		return OK;
+	}
+	if (fs != ERR_UNSUPPORTED)
+		return fs;
 
 	gl_use_pipeline(p, &p->pipes[GL_PIPE_RMSNORM]);
 	gl_bind_ssbo(0, x);
@@ -2445,12 +2755,36 @@ static gl_rope_cache *gl_rope_cache_slot(gl_priv *p, const float *cos_base, cons
 	return slot;
 }
 
+static void gl_rope_freq_rows(const float *freq_factors, int half, float theta, int pos0, int count,
+							  float *cos_out, float *sin_out) {
+	double theta_scale = pow((double)theta, -1.0 / (double)half);
+	for (int i = 0; i < count; i++) {
+		double base_freq = 1.0;
+		for (int j = 0; j < half; j++) {
+			float  fv = freq_factors[j];
+			double ff = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+			float  c  = 1.0f;
+			float  sn = 0.0f;
+			if (ff > 0.0) {
+				double angle = base_freq * ff * (double)(pos0 + i);
+				c			 = (float)cos(angle);
+				sn			 = (float)sin(angle);
+			}
+			cos_out[(size_t)i * half + j] = c;
+			sin_out[(size_t)i * half + j] = sn;
+			base_freq *= theta_scale;
+		}
+	}
+}
+
 static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, const float *sin_base,
-										  int half, float theta, int pos, int count) {
+										  const float *freq_factors, int half, float theta, int pos,
+										  int count) {
 	if (pos < 0 || count <= 0)
 		return NULL;
 	int			   last = pos + count - 1;
-	gl_rope_cache *slot = gl_rope_cache_slot(p, cos_base, sin_base, half, theta);
+	gl_rope_cache *slot = freq_factors ? gl_rope_cache_slot(p, freq_factors, NULL, half, theta)
+									   : gl_rope_cache_slot(p, cos_base, sin_base, half, theta);
 	if (last >= slot->capacity) {
 		int capacity = GL_ROPE_CACHE_MIN_POSITIONS;
 		while (capacity <= last)
@@ -2489,8 +2823,17 @@ static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, con
 	if (first_missing >= 0) {
 		size_t offset = (size_t)first_missing * (size_t)half;
 		int	   floats = (last_missing - first_missing + 1) * half;
-		gl_upload_row(slot->cos_buf, offset, cos_base + offset, floats);
-		gl_upload_row(slot->sin_buf, offset, sin_base + offset, floats);
+		if (freq_factors) {
+			float *tbl = xmalloc((size_t)floats * 2 * sizeof(float));
+			gl_rope_freq_rows(freq_factors, half, theta, first_missing,
+							  last_missing - first_missing + 1, tbl, tbl + floats);
+			gl_upload_row(slot->cos_buf, offset, tbl, floats);
+			gl_upload_row(slot->sin_buf, offset, tbl + floats, floats);
+			free(tbl);
+		} else {
+			gl_upload_row(slot->cos_buf, offset, cos_base + offset, floats);
+			gl_upload_row(slot->sin_buf, offset, sin_base + offset, floats);
+		}
 		memset(slot->valid + first_missing, 1, (size_t)(last_missing - first_missing + 1));
 	}
 	return slot;
@@ -2498,7 +2841,7 @@ static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, con
 
 static gl_rope_cache *gl_rope_cache_row(gl_priv *p, const float *cos_base, const float *sin_base,
 										int half, float theta, int pos) {
-	return gl_rope_cache_range(p, cos_base, sin_base, half, theta, pos, 1);
+	return gl_rope_cache_range(p, cos_base, sin_base, NULL, half, theta, pos, 1);
 }
 
 static status_code gl_rope(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
@@ -2572,6 +2915,11 @@ separate:
 	}
 }
 
+static status_code gl_rope_batch_dispatch(backend *self, buffer *vec, int n_heads, int head_dim,
+										  int pos_start, const float *rope_cos_base,
+										  const float *rope_sin_base, const float *freq_factors,
+										  int m);
+
 static status_code gl_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
 							   const float *rope_cos_base, const float *rope_sin_base,
 							   const float *freq_factors) {
@@ -2579,37 +2927,7 @@ static status_code gl_rope_ext(backend *self, buffer *vec, int n_heads, int head
 	GL_ENTER(p);
 	if (!freq_factors)
 		return gl_rope(self, vec, n_heads, head_dim, pos, rope_cos_base, rope_sin_base);
-
-	int half = head_dim / 2;
-	if (n_heads <= 0 || half <= 0)
-		return OK;
-
-	float *cs = xmalloc((size_t)half * 2 * sizeof(float));
-	if (!cs)
-		return ERR_OUT_OF_MEMORY;
-	float *cos_row = cs;
-	float *sin_row = cs + half;
-
-	double theta_scale = pow((double)self->rope_theta, -2.0 / (double)head_dim);
-	double base_freq   = 1.0;
-	for (int j = 0; j < half; j++) {
-		double ff;
-		float  fv = freq_factors[j];
-		ff		  = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
-		if (ff > 0.0) {
-			double angle = base_freq * ff * (double)pos;
-			cos_row[j]	 = (float)cos(angle);
-			sin_row[j]	 = (float)sin(angle);
-		} else {
-			cos_row[j] = 1.0f;
-			sin_row[j] = 0.0f;
-		}
-		base_freq *= theta_scale;
-	}
-
-	status_code s = gl_rope_apply(self, vec, n_heads, head_dim, cos_row, sin_row);
-	free(cs);
-	return s;
+	return gl_rope_batch_dispatch(self, vec, n_heads, head_dim, pos, NULL, NULL, freq_factors, 1);
 }
 
 static status_code gl_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads,
@@ -2774,13 +3092,21 @@ typedef struct {
 	unsigned gx_div;
 } gl_quantize_spec;
 
+typedef struct {
+	const buffer *w;
+	buffer		 *y;
+	float		  eps;
+} gl_quantize_norm;
+
 static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_buf **slot,
 								   size_t *row_words, const buffer *x, int k, int m,
 								   const buffer *up, int activation, float gs, float us,
-								   int row_stride) {
-	gl_pipeline *pipe = &p->pipes[up ? spec->act_pipe : spec->plain_pipe];
+								   int row_stride, const gl_quantize_norm *norm) {
+	gl_pipeline *pipe =
+		&p->pipes[norm ? GL_PIPE_QUANTIZE_X_NORM : (up ? spec->act_pipe : spec->plain_pipe)];
 	if (!pipe->program || m > (int)GL_MAX_DISPATCH_PER_DIM)
 		return ERR_UNSUPPORTED;
+	const buffer *src = norm ? norm->y : x;
 	if (spec->check_block && (k <= 0 || (k % spec->block) != 0))
 		return ERR_UNSUPPORTED;
 	int	   k_blocks	 = k / spec->block;
@@ -2792,7 +3118,7 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 	int			 fam  = (slot == &p->qx) ? 0 : 1;
 	int			 base = fam * 2;
 	gl_xq_cache *hit  = NULL;
-	for (int j = 0; j < 2; j++) {
+	for (int j = 0; j < 2 && !norm; j++) {
 		gl_xq_cache *c = &p->xq_cache[base + j];
 		if (!c->valid || !c->stage || c->stage->size_bytes < need)
 			continue;
@@ -2838,6 +3164,11 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 
 	gl_use_pipeline(p, pipe);
 	gl_bind_ssbo(0, x);
+	if (norm) {
+		gl_bind_ssbo(3, norm->w);
+		gl_bind_ssbo_out(4, norm->y);
+		gl_puf(pipe, "u_eps", norm->eps);
+	}
 	if (up) {
 		gl_bind_ssbo(2, up);
 		gl_pu(pipe, "u_act", activation);
@@ -2862,9 +3193,9 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 		gl_launch(p, gx, (GLuint)rows, 1);
 	}
 	ce->valid	   = 1;
-	ce->src		   = as_glbuf(x);
+	ce->src		   = as_glbuf(src);
 	ce->src_name   = ce->src->name;
-	ce->src_offset = x->offset;
+	ce->src_offset = src->offset;
 	ce->k		   = k;
 	ce->m		   = m;
 	ce->act		   = up ? activation : -1;
@@ -2881,7 +3212,18 @@ static status_code gl_quantize_x(gl_priv *p, const buffer *x, int k, int m, cons
 	static const gl_quantize_spec spec = {
 		GL_PIPE_QUANTIZE_X, GL_PIPE_QUANTIZE_X_ACT, 32, 0, GL_XQ_BLOCK_WORDS, 64};
 	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, k, m, up, activation, gs, us,
-						   row_stride);
+						   row_stride, NULL);
+}
+
+static status_code gl_rmsnorm_quantize(gl_priv *p, const buffer *x, const buffer *w, buffer *y,
+									   int n, float eps) {
+	static const gl_quantize_spec spec = {
+		GL_PIPE_QUANTIZE_X, GL_PIPE_QUANTIZE_X_ACT, 32, 0, GL_XQ_BLOCK_WORDS, 64};
+	if (n % spec.block != 0 || n / spec.block > (int)spec.gx_div)
+		return ERR_UNSUPPORTED;
+	gl_quantize_norm norm = {w, y, eps};
+	return gl_quantize_run(p, &spec, &p->qx, &p->qx_row_words, x, n, 1, NULL, 0, 1.0f, 1.0f, 0,
+						   &norm);
 }
 
 #define GL_XQK_WORDS_PER_BLOCK 212u
@@ -2891,7 +3233,7 @@ static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, c
 	static const gl_quantize_spec spec = {
 		GL_PIPE_QUANTIZE_Q8_K, GL_PIPE_QUANTIZE_Q8_K_ACT, 256, 1, GL_XQK_WORDS_PER_BLOCK, 1};
 	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation, gs, us,
-						   row_stride);
+						   row_stride, NULL);
 }
 
 static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
@@ -2899,9 +3241,17 @@ static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
 	return pipe->rows_per_wg;
 }
 
-static gl_pipeline *gl_matmul_tiled_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
-	if (m < 2 || (pipe->flags & GL_PIPE_F_TILED))
+static gl_pipeline *gl_matmul_batch_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
+	static const int mm_pipes[][2] = {
+		{GL_PIPE_MATMUL_IQ4_NL, GL_PIPE_MATMUL_MM_IQ4_NL},
+		{GL_PIPE_MATMUL_Q4_0, GL_PIPE_MATMUL_MM_Q4_0},
+		{GL_PIPE_MATMUL_Q8_0, GL_PIPE_MATMUL_MM_Q8_0},
+	};
+	if (m < 2 || (pipe->flags & (GL_PIPE_F_TILED | GL_PIPE_F_MM)))
 		return pipe;
+	for (size_t i = 0; m >= GL_MM_MIN_M && i < ARRAY_LEN(mm_pipes); i++)
+		if (pipe == &p->pipes[mm_pipes[i][0]] && p->pipes[mm_pipes[i][1]].program)
+			return &p->pipes[mm_pipes[i][1]];
 	for (int i = 0; i < GL_PIPE_COUNT; i++) {
 		if (!(p->pipes[i].flags & GL_PIPE_F_TILED) || p->pipes[i].src != pipe->src)
 			continue;
@@ -2951,10 +3301,11 @@ static status_code gl_matmul_launch_chunked(gl_priv *p, gl_pipeline *pipe, long 
 
 static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_size,
 									  const buffer *w, const buffer *x, buffer *y,
-									  const buffer *residual, int n, int k, int m, int xq_ready) {
+									  const buffer *residual, int n, int k, int m, int xq_ready,
+									  const buffer *act_up, int activation) {
 	if (n <= 0 || k <= 0 || m <= 0)
 		return OK;
-	pipe = gl_matmul_tiled_pipe(p, pipe, m);
+	pipe = act_up ? &p->pipes[GL_PIPE_MATMUL_F32_ACT] : gl_matmul_batch_pipe(p, pipe, m);
 
 	gl_buf *bufs[3] = {as_glbuf(w), as_glbuf(x), as_glbuf(y)};
 	for (int i = 0; i < 3; i++) {
@@ -3029,6 +3380,11 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		int k_blocks = k / block_size;
 		gl_pu(pipe, "u_k_blocks", k_blocks);
 	}
+	if (act_up) {
+		gl_buf_sync_to_device(as_glbuf(act_up));
+		gl_bind_ssbo(4, act_up);
+		gl_pu(pipe, "u_act", activation);
+	}
 	gl_pu(pipe, "u_m", m);
 	if (use_xq)
 		gl_pu(pipe, "u_x_stride", (int)(p->qx_row_words / 4));
@@ -3037,7 +3393,9 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 	gl_pu(pipe, "u_add_residual", mode);
 
 	int	 rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
-	int	 cols_per_wg = (pipe->flags & GL_PIPE_F_TILED) ? GL_MATMUL_COLS : 1;
+	int	 cols_per_wg = (pipe->flags & GL_PIPE_F_MM)		 ? GL_MM_TILE
+					   : (pipe->flags & GL_PIPE_F_TILED) ? GL_MATMUL_COLS
+														 : 1;
 	long total_wg =
 		(long)((n + rows_per_wg - 1) / rows_per_wg) * (long)((m + cols_per_wg - 1) / cols_per_wg);
 	int			k_eff	  = block_size > 0 ? k / block_size : (k + 31) / 32;
@@ -3091,7 +3449,7 @@ static status_code gl_matmul(backend *self, const buffer *w, uint32_t w_type, co
 		goto host_fallback;
 
 	{
-		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 1, 0);
+		status_code s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, 1, 0, NULL, 0);
 		if (s == ERR_UNSUPPORTED)
 			goto host_fallback;
 		return s;
@@ -3150,7 +3508,8 @@ static status_code gl_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	}
 
 	{
-		status_code ds = gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, m, 0);
+		status_code ds =
+			gl_matmul_dispatch(p, pipe, block_size, w, x, y, NULL, n, k, m, 0, NULL, 0);
 		if (ds == ERR_UNSUPPORTED)
 			goto host_fallback;
 		return ds;
@@ -3197,7 +3556,7 @@ static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w
 		gl_matmul_buf_ok(x) && gl_matmul_buf_ok(y) && gl_matmul_buf_ok(residual) &&
 		(w_type != GGML_TYPE_F32 || gl_matmul_f32_align_ok(x, y, residual, k)) &&
 		(block_size == 0 || (k % block_size) == 0))
-		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 1, 0);
+		s = gl_matmul_dispatch(p, pipe, block_size, w, x, y, residual, n, k, 1, 0, NULL, 0);
 
 	if (s != ERR_UNSUPPORTED)
 		return s;
@@ -3285,9 +3644,9 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 		for (int i = 0; i < n_matmuls; i++) {
 			if (n_list[i] <= 0)
 				continue;
-			status_code s =
-				gl_matmul_dispatch(p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k,
-								   1, gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready);
+			status_code s = gl_matmul_dispatch(
+				p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k, 1,
+				gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready, NULL, 0);
 			if (s == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (s != OK)
@@ -3740,8 +4099,8 @@ static status_code gl_attention_mla(backend *self, const buffer *q, const buffer
 	int			   half_rope = qk_rope / 2;
 	gl_rope_cache *rsp		 = NULL;
 	if (half_rope > 0 && rope_cos_base && rope_sin_base) {
-		rsp = gl_rope_cache_range(p, rope_cos_base, rope_sin_base, half_rope, self->rope_theta, 0,
-								  pos + 1);
+		rsp = gl_rope_cache_range(p, rope_cos_base, rope_sin_base, NULL, half_rope,
+								  self->rope_theta, 0, pos + 1);
 		if (!rsp)
 			return ERR_OUT_OF_MEMORY;
 	}
@@ -3921,14 +4280,22 @@ static status_code gl_attention_impl(backend *self, const buffer *q, const buffe
 	int kv_q8		 = (p->kv_quant == KV_QUANT_Q8_0);
 	int row_stride_u = kv_q8 ? (int)p->kv_row_bytes : head_dim;
 
-	size_t scores_bytes = (size_t)n_heads * n_ctx * sizeof(float);
-	if (!p->attn_scores || p->attn_scores_cap < scores_bytes) {
-		if (p->attn_scores)
-			gl_buf_free(p, p->attn_scores);
-		p->attn_scores = gl_buf_alloc(p, scores_bytes, GL_DYNAMIC_COPY, NULL);
-		if (!p->attn_scores)
+	const int n_pos	   = MAX(pos + 1 - attn_start, 1);
+	int		  n_splits = (GL_ATTENTION_TARGET_WORKGROUPS + n_heads - 1) / n_heads;
+	n_splits		   = MIN(n_splits, GL_ATTENTION_MAX_SPLITS);
+	n_splits		= MIN(n_splits, (n_pos + GL_ATTENTION_MIN_CHUNK - 1) / GL_ATTENTION_MIN_CHUNK);
+	n_splits		= MAX(n_splits, 1);
+	const int chunk = (n_pos + n_splits - 1) / n_splits;
+	n_splits		= (n_pos + chunk - 1) / chunk;
+
+	size_t part_bytes = (size_t)n_heads * n_splits * (size_t)(head_dim + 2) * sizeof(float);
+	if (!p->attn_part || p->attn_part_cap < part_bytes) {
+		if (p->attn_part)
+			gl_buf_free(p, p->attn_part);
+		p->attn_part = gl_buf_alloc(p, part_bytes, GL_DYNAMIC_COPY, NULL);
+		if (!p->attn_part)
 			return ERR_OUT_OF_MEMORY;
-		p->attn_scores_cap = scores_bytes;
+		p->attn_part_cap = part_bytes;
 	}
 
 	gl_buf *qbuf = as_glbuf(q);
@@ -3938,30 +4305,39 @@ static status_code gl_attention_impl(backend *self, const buffer *q, const buffe
 
 	gl_buf_sync_to_device(qbuf);
 	gl_buf_sync_to_device(obuf);
-	p->attn_scores->host_dirty = 0;
 
-	gl_use_pipeline(p, &p->pipes[GL_PIPE_ATTENTION]);
+	gl_pipeline *attn = &p->pipes[GL_PIPE_ATTENTION];
+	gl_use_pipeline(p, attn);
 	gl_bind_ssbo(0, q);
 	gl_bind_raw(p, 1, kbuf->name, 0, 0, 0);
 	gl_bind_raw(p, 2, vbuf->name, 0, 0, 0);
-	gl_bind_raw(p, 3, p->attn_scores->name, 0, 0, 1);
+	gl_bind_raw(p, 3, p->attn_part->name, 0, 0, 1);
 	gl_bind_ssbo_out(4, out);
 
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_layer_off", 0);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_pos", pos);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_n_heads", n_heads);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_n_kv_heads", n_kv_heads);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_head_dim", head_dim);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_n_ctx", n_ctx);
-	gl_puf(&p->pipes[GL_PIPE_ATTENTION], "u_scale", scale);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_stride_head_dim", row_stride_u);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_attn_start", attn_start);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_kv_q8", kv_q8 ? 1 : 0);
-	gl_pu(&p->pipes[GL_PIPE_ATTENTION], "u_kvh_stride",
-		  p->kv_kvh_stride ? (int)p->kv_kvh_stride : n_ctx * row_stride_u);
+	gl_pu(attn, "u_layer_off", 0);
+	gl_pu(attn, "u_pos", pos);
+	gl_pu(attn, "u_n_heads", n_heads);
+	gl_pu(attn, "u_n_kv_heads", n_kv_heads);
+	gl_pu(attn, "u_head_dim", head_dim);
+	gl_pu(attn, "u_n_ctx", n_ctx);
+	gl_puf(attn, "u_scale", scale);
+	gl_pu(attn, "u_stride_head_dim", row_stride_u);
+	gl_pu(attn, "u_attn_start", attn_start);
+	gl_pu(attn, "u_kv_q8", kv_q8 ? 1 : 0);
+	gl_pu(attn, "u_kvh_stride", p->kv_kvh_stride ? (int)p->kv_kvh_stride : n_ctx * row_stride_u);
+	gl_pu(attn, "u_chunk", chunk);
+	gl_pu(attn, "u_n_splits", n_splits);
+	gl_launch(p, (GLuint)n_heads, (GLuint)n_splits, 1);
 
-	GLuint groups = (GLuint)n_heads;
-	gl_launch(p, groups, 1, 1);
+	if (n_splits > 1) {
+		gl_pipeline *merge = &p->pipes[GL_PIPE_ATTENTION_MERGE];
+		gl_use_pipeline(p, merge);
+		gl_bind_raw(p, 3, p->attn_part->name, 0, 0, 0);
+		gl_bind_ssbo_out(4, out);
+		gl_pu(merge, "u_head_dim", head_dim);
+		gl_pu(merge, "u_n_splits", n_splits);
+		gl_launch(p, (GLuint)n_heads, 1, 1);
+	}
 	obuf->device_dirty = 1;
 	return OK;
 }
@@ -4106,14 +4482,15 @@ static status_code gl_add_batch(backend *self, buffer *x, const buffer *y, int n
 
 static status_code gl_rope_batch_dispatch(backend *self, buffer *vec, int n_heads, int head_dim,
 										  int pos_start, const float *rope_cos_base,
-										  const float *rope_sin_base, int m) {
+										  const float *rope_sin_base, const float *freq_factors,
+										  int m) {
 	gl_priv *p	  = self->priv;
 	int		 half = head_dim / 2;
 	if (n_heads <= 0 || half <= 0 || m <= 0)
 		return OK;
 
-	gl_rope_cache *slot =
-		gl_rope_cache_range(p, rope_cos_base, rope_sin_base, half, self->rope_theta, pos_start, m);
+	gl_rope_cache *slot = gl_rope_cache_range(p, rope_cos_base, rope_sin_base, freq_factors, half,
+											  self->rope_theta, pos_start, m);
 	if (!slot)
 		return ERR_OUT_OF_MEMORY;
 
@@ -4149,7 +4526,7 @@ static status_code gl_rope_batch(backend *self, buffer *vec, int n_heads, int he
 	if (m == 1)
 		return gl_rope(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base);
 	return gl_rope_batch_dispatch(self, vec, n_heads, head_dim, pos_start, rope_cos_base,
-								  rope_sin_base, m);
+								  rope_sin_base, NULL, m);
 }
 
 static status_code gl_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads,
@@ -4163,11 +4540,11 @@ static status_code gl_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_h
 		return gl_rope_qk(self, q, k, n_heads, n_kv_heads, head_dim, pos_start, rope_cos_base,
 						  rope_sin_base);
 	status_code s = gl_rope_batch_dispatch(self, q, n_heads, head_dim, pos_start, rope_cos_base,
-										   rope_sin_base, m);
+										   rope_sin_base, NULL, m);
 	if (s != OK)
 		return s;
 	return gl_rope_batch_dispatch(self, k, n_kv_heads, head_dim, pos_start, rope_cos_base,
-								  rope_sin_base, m);
+								  rope_sin_base, NULL, m);
 }
 
 static status_code gl_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
@@ -4180,44 +4557,68 @@ static status_code gl_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 	if (!freq_factors)
 		return gl_rope_batch(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
 							 m);
-	if (m == 1)
-		return gl_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
-						   freq_factors);
+	return gl_rope_batch_dispatch(self, vec, n_heads, head_dim, pos_start, NULL, NULL, freq_factors,
+								  m);
+}
 
-	int half = head_dim / 2;
-	if (n_heads <= 0 || half <= 0)
+static status_code gl_qk_norm_rope(backend *self, buffer *q, buffer *k, const buffer *q_w,
+								   const buffer *k_w, int n_heads, int n_kv_heads, int head_dim,
+								   float eps, int pos_start, const float *rope_cos_base,
+								   const float *rope_sin_base, const float *freq_factors, int m) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (m <= 0)
 		return OK;
-
-	size_t tbl	= (size_t)m * (size_t)half * sizeof(float);
-	float *tblc = xmalloc(tbl);
-	float *tbls = xmalloc(tbl);
-	if (!tblc || !tbls) {
-		free(tblc);
-		free(tbls);
+	if (head_dim <= 0 || (head_dim & 1) || head_dim > GL_QK_NORM_ROPE_MAX_HEAD_DIM)
+		return ERR_UNSUPPORTED;
+	if (!p->pipes[GL_PIPE_QK_NORM_ROPE].program)
+		return ERR_UNSUPPORTED;
+	gl_buf *qb = as_glbuf(q);
+	gl_buf *kb = n_kv_heads > 0 ? as_glbuf(k) : NULL;
+	gl_buf *wq = as_glbuf(q_w);
+	gl_buf *wk = n_kv_heads > 0 ? as_glbuf(k_w) : NULL;
+	if (!qb || !wq || (n_kv_heads > 0 && (!kb || !wk)))
+		return ERR_INVALID_ARG;
+	if (gl_ensure_dummy(p) != OK)
 		return ERR_OUT_OF_MEMORY;
+
+	int			   half = head_dim / 2;
+	gl_rope_cache *slot = gl_rope_cache_range(p, rope_cos_base, rope_sin_base, freq_factors, half,
+											  self->rope_theta, pos_start, m);
+	if (!slot)
+		return ERR_OUT_OF_MEMORY;
+
+	gl_buf_sync_to_device(qb);
+	gl_buf_sync_to_device(wq);
+	if (kb) {
+		gl_buf_sync_to_device(kb);
+		gl_buf_sync_to_device(wk);
 	}
-	double theta_scale = pow((double)self->rope_theta, -2.0 / (double)head_dim);
-	for (int i = 0; i < m; i++) {
-		double base_freq = 1.0;
-		int	   pos		 = pos_start + i;
-		for (int j = 0; j < half; j++) {
-			float  fv = freq_factors[j];
-			double ff = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
-			if (ff > 0.0) {
-				double angle			   = base_freq * ff * (double)pos;
-				tblc[(size_t)i * half + j] = (float)cos(angle);
-				tbls[(size_t)i * half + j] = (float)sin(angle);
-			} else {
-				tblc[(size_t)i * half + j] = 1.0f;
-				tbls[(size_t)i * half + j] = 0.0f;
-			}
-			base_freq *= theta_scale;
-		}
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_QK_NORM_ROPE];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo_out(0, q);
+	if (kb) {
+		gl_bind_ssbo_out(1, k);
+		gl_bind_ssbo(3, k_w);
+	} else {
+		gl_bind_raw(p, 1, p->dummy->name, 0, 0, 0);
+		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
 	}
-	status_code s = gl_rope_batch_dispatch(self, vec, n_heads, head_dim, 0, tblc, tbls, m);
-	free(tblc);
-	free(tbls);
-	return s;
+	gl_bind_ssbo(2, q_w);
+	gl_bind_raw(p, 4, slot->cos_buf->name, 0, 0, 0);
+	gl_bind_raw(p, 5, slot->sin_buf->name, 0, 0, 0);
+	gl_pu(pipe, "u_n_heads", n_heads);
+	gl_pu(pipe, "u_n_kv_heads", n_kv_heads);
+	gl_pu(pipe, "u_head_dim", head_dim);
+	gl_puf(pipe, "u_eps", eps);
+	gl_pu(pipe, "u_neox", self->rope_neox);
+	gl_pu(pipe, "u_pos0", pos_start);
+	gl_launch(p, (GLuint)(n_heads + n_kv_heads), (GLuint)m, 1);
+	qb->device_dirty = 1;
+	if (kb)
+		kb->device_dirty = 1;
+	return OK;
 }
 
 static status_code gl_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
@@ -4357,12 +4758,23 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0)
 								 : gl_quantize_x(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0);
 			if (qs == OK) {
-				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 1);
+				qs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 1, NULL, 0);
 				if (qs != ERR_UNSUPPORTED)
 					return qs;
 			} else if (qs != ERR_UNSUPPORTED) {
 				return qs;
 			}
+		}
+	}
+	if (w_type == GGML_TYPE_F32 && gl_matmul_f32_align_ok(gate, y, NULL, k) &&
+		(up->offset & 15u) == 0 && gl_matmul_buf_ok(up)) {
+		gl_pipeline *pipe		= NULL;
+		int			 block_size = 0;
+		if (gl_matmul_pipe_for_type(p, w_type, &pipe, &block_size)) {
+			status_code fs = gl_matmul_dispatch(p, pipe, block_size, w, gate, y, NULL, n, k, 1, 0,
+												up, activation);
+			if (fs != ERR_UNSUPPORTED)
+				return fs;
 		}
 	}
 	buffer		act = {0};
@@ -4590,13 +5002,13 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 		gate_b = gu;
 		up_b   = gu;
 		s = gl_matmul_dispatch(p, gate_pipe, gate_block, e->gate_w, &x_pk, &gu, NULL, inter * 2,
-							   dim, cnt, 0);
+							   dim, cnt, 0, NULL, 0);
 	} else {
 		s = gl_matmul_dispatch(p, gate_pipe, gate_block, e->gate_w, &x_pk, &g, NULL, inter, dim,
-							   cnt, 0);
+							   cnt, 0, NULL, 0);
 		if (s == OK)
 			s = gl_matmul_dispatch(p, up_pipe, up_block, e->up_w, &x_pk, &u, NULL, inter, dim, cnt,
-								   0);
+								   0, NULL, 0);
 		gate_b = g;
 		up_b   = u;
 	}
@@ -4616,7 +5028,7 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 	}
 
 	s = gl_matmul_dispatch(p, down_pipe, down_block, e->down_w, &gate_b, &y, NULL, dim, inter, cnt,
-						   1);
+						   1, NULL, 0);
 	if (s != OK)
 		goto done;
 
@@ -4720,7 +5132,7 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 												   e->gate_scale, uscale, 0);
 		if (qs == OK) {
 			qs = gl_matmul_dispatch(p, down_pipe, down_block, e->down_w, &gate_buf, out, out, dim,
-									inter, 1, 1);
+									inter, 1, 1, NULL, 0);
 			if (qs != ERR_UNSUPPORTED) {
 				if (qs != OK)
 					return qs;
@@ -5262,9 +5674,10 @@ static status_code gl_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "opengl";
 	out->priority = 80;
-	out->caps = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
-				BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
-				BCAP_ROPE_QK_FUSED | BCAP_MOE_EXPERT_RESIDENT | BCAP_IN_ORDER_QUEUE | BCAP_KV_SHIFT;
+	out->caps	  = BCAP_HOST_VISIBLE_BUFFERS | BCAP_RMSNORM_ADD | BCAP_KV_QUANT_Q8_0 |
+					BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_MATMUL_FFN_DOWN |
+					BCAP_ROPE_QK_FUSED | BCAP_QK_NORM_ROPE | BCAP_MOE_EXPERT_RESIDENT |
+					BCAP_IN_ORDER_QUEUE | BCAP_KV_SHIFT;
 
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
@@ -5284,8 +5697,11 @@ static status_code gl_ctor(backend *out) {
 	out->mem_total						 = gl_mem_total;
 	out->release_thread					 = gl_release_thread;
 	out->synchronize					 = gl_synchronize;
+	out->set_gpu_profile				 = gl_set_gpu_profile;
 	out->submit							 = gl_submit;
 	out->argmax							 = gl_argmax;
+	out->argmax_to_reg					 = gl_argmax_to_reg;
+	out->read_token_reg					 = gl_read_token_reg;
 	out->embd_lookup					 = gl_embd_lookup;
 	out->rmsnorm						 = gl_rmsnorm;
 	out->rmsnorm_per_head				 = gl_rmsnorm_per_head;
@@ -5328,6 +5744,7 @@ static status_code gl_ctor(backend *out) {
 	out->add_batch						 = gl_add_batch;
 	out->rope_batch						 = gl_rope_batch;
 	out->rope_qk_batch					 = gl_rope_qk_batch;
+	out->qk_norm_rope					 = gl_qk_norm_rope;
 	out->rope_ext_batch					 = gl_rope_ext_batch;
 	out->attention_batch				 = gl_attention_batch;
 	out->attention_swa_batch			 = gl_attention_swa_batch;

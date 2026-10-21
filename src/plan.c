@@ -83,10 +83,27 @@ static void plan_validate(const model_plan *p) {
 	}
 }
 
+static const struct {
+	op_kind		kind;
+	const char *name;
+} HOST_ONLY_OPS[] = {
+	{OP_SHORTCONV, "shortconv"},
+	{OP_MOE_ROUTER, "moe_router_topk"},
+};
+
 static void plan_fallback_scan(model_plan *p, backend *a, const struct model *m) {
-	bool scanned[OP_KIND_COUNT] = {false};
+	bool scanned[OP_KIND_COUNT]		   = {false};
+	bool host_only_seen[OP_KIND_COUNT] = {false};
 	for (int i = 0; i < p->n_total; i++) {
 		op_kind k = p->nodes[i].kind;
+		for (size_t h = 0; h < ARRAY_LEN(HOST_ONLY_OPS); h++) {
+			if (HOST_ONLY_OPS[h].kind != k || host_only_seen[k])
+				continue;
+			host_only_seen[k] = true;
+			backend_report_host_fallback(a, HOST_ONLY_OPS[h].name, HFB_OP_NOT_NATIVE,
+										 "no device implementation; executes on the host");
+			p->n_fallbacks++;
+		}
 		if (k == OP_PLE_BUILD) {
 			if (!scanned[k]) {
 				scanned[k] = true;

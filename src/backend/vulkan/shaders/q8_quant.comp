@@ -1,0 +1,129 @@
+#version 450
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly buffer X {
+	float x[];
+};
+layout(set = 0, binding = 1) readonly buffer U {
+	float up[];
+};
+layout(set = 0, binding = 2) writeonly buffer XQ {
+	uint xq[];
+};
+
+layout(push_constant) uniform Params {
+	int k;
+	int m;
+	int x_stride;
+	int act;
+}
+pc;
+
+#include "common.glsl"
+
+#ifdef Q8K
+#define QBLOCK 256u
+#define XQ_BLOCK_WORDS 76u
+#else
+#define QBLOCK 32u
+#define XQ_BLOCK_WORDS 12u
+#endif
+#define TPB (QBLOCK / 4u)
+#define BLOCKS_PER_WG (WG / TPB)
+
+shared float s_abs[WG];
+shared float s_val[WG];
+shared int	 s_sum[WG];
+
+float gelu_tanh(float v) {
+	float inner = 0.7978845608028654 * (v + 0.044715 * v * v * v);
+	return 0.5 * v * (1.0 + tanh(inner));
+}
+
+float xin(uint i) {
+	if (pc.act < 0)
+		return x[i];
+	float g = x[i];
+	float a = pc.act == 1 ? gelu_tanh(g) : g / (1.0 + exp(-g));
+	return a * up[i];
+}
+
+void main() {
+	uint tid  = gl_LocalInvocationID.x;
+	uint kb	  = uint(pc.k) / QBLOCK;
+	uint lb	  = tid / TPB;
+	uint lt	  = tid % TPB;
+	uint bi	  = gl_WorkGroupID.x * BLOCKS_PER_WG + lb;
+	uint row  = gl_WorkGroupID.y;
+	bool live = bi < kb;
+
+	vec4 v = vec4(0.0);
+	if (live) {
+		uint src = row * uint(pc.x_stride) + bi * QBLOCK + lt * 4u;
+		v		 = vec4(xin(src), xin(src + 1u), xin(src + 2u), xin(src + 3u));
+	}
+	float best = abs(v.x);
+	float bval = v.x;
+	for (int j = 1; j < 4; j++) {
+		if (abs(v[j]) > best) {
+			best = abs(v[j]);
+			bval = v[j];
+		}
+	}
+	s_abs[tid] = best;
+	s_val[tid] = bval;
+	barrier();
+	for (uint h = TPB / 2u; h > 0u; h >>= 1u) {
+		if (lt < h && s_abs[tid + h] > s_abs[tid]) {
+			s_abs[tid] = s_abs[tid + h];
+			s_val[tid] = s_val[tid + h];
+		}
+		barrier();
+	}
+	uint  b0   = lb * TPB;
+	float amax = s_abs[b0];
+#ifdef Q8K
+	float maxv	 = s_val[b0];
+	float iscale = amax > 0.0 ? div_exact(-127.0, maxv) : 0.0;
+	ivec4 q;
+	for (int j = 0; j < 4; j++)
+		q[j] = clamp(round_away(iscale * v[j]), -127, 127);
+#else
+	float d	  = div_exact(amax, 127.0);
+	float inv = d > 0.0 ? div_exact(1.0, d) : 0.0;
+	ivec4 q;
+	for (int j = 0; j < 4; j++)
+		q[j] = clamp(round_away(v[j] * inv), -127, 127);
+#endif
+	s_sum[tid] = q.x + q.y + q.z + q.w;
+	barrier();
+	if (!live)
+		return;
+	uint dst  = (row * kb + bi) * XQ_BLOCK_WORDS;
+	uint word = (uint(q.x) & 0xFFu) | ((uint(q.y) & 0xFFu) << 8u) | ((uint(q.z) & 0xFFu) << 16u) |
+				((uint(q.w) & 0xFFu) << 24u);
+	xq[dst + lt] = word;
+#ifdef Q8K
+	if (lt < 8u) {
+		int sum = 0;
+		for (uint j = 0u; j < 8u; j++)
+			sum += s_sum[b0 + lt * 8u + j];
+		xq[dst + 65u + lt] = uint(sum);
+	}
+	if (lt == 0u)
+		xq[dst + 64u] = floatBitsToUint(amax > 0.0 ? div_exact(1.0, iscale) : 0.0);
+#else
+	if (lt == 0u) {
+		int sum = 0;
+		for (uint j = 0u; j < TPB; j++)
+			sum += s_sum[b0 + j];
+		xq[dst + 8u]  = floatBitsToUint(f32_to_f16_to_f32(d));
+		xq[dst + 9u]  = floatBitsToUint(f32_to_f16_to_f32(d * float(sum)));
+		xq[dst + 10u] = 0u;
+		xq[dst + 11u] = 0u;
+	}
+#endif
+}

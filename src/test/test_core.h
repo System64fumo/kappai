@@ -32,7 +32,7 @@
 #define REF_MAGNITUDE_MIN 1e-6f
 #define ARCH_GENERATE_N_DECODE 3
 
-#define MAX_RESULTS_PER_FAMILY 128
+#define MAX_RESULTS_PER_FAMILY 512
 #define V_COUNT 3
 
 typedef enum {

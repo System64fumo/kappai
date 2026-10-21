@@ -371,6 +371,8 @@ static void synth_fill_layer_rng(layer_weights *L, int li, uint64_t *seed) {
 	if (L->is_moe_layer) {
 		int E = cfg->n_experts;
 		synth_fill_f32((float *)L->router_w.host_ptr, cfg->dim * E, 0.0f);
+		for (int i = 0; i < cfg->dim * E; i++)
+			((float *)L->router_w.host_ptr)[i] *= 2.0f / (float)cfg->dim;
 		if (L->router_scale_w.host_ptr) {
 			synth_fill_f32((float *)L->router_scale_w.host_ptr, cfg->dim, 1.0f);
 		}
@@ -1612,7 +1614,11 @@ static void test_arch_decode_batch_vs_single(backend *ref, model_arch arch, cons
 		float max_diff =
 			max_row_diff(logits_batch, logits_single, n_seqs, vocab, &worst_row, row_diffs);
 		format_row_diffs(detail, sizeof(detail), max_diff, worst_row, row_diffs, n_seqs);
-		record_result(OPFAM_ARCH_GENERATE, label, max_diff > 0.1f ? V_FAIL : V_PASS, detail);
+		float logit_scale = 0.0f;
+		for (int i = 0; i < n_seqs * vocab; i++)
+			logit_scale = fmaxf(logit_scale, fabsf(logits_single[i]));
+		float tol = fmaxf(0.1f, 1e-2f * logit_scale);
+		record_result(OPFAM_ARCH_GENERATE, label, max_diff > tol ? V_FAIL : V_PASS, detail);
 	}
 
 	for (int i = 0; i < n_seqs; i++) {

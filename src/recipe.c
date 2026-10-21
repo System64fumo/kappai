@@ -59,6 +59,7 @@ static buffer		*batch_slot(batch_scratch *bs, uint8_t slot);
 static buffer		 batch_row_view(const buffer *whole, int row, int row_elems);
 static inline float *batch_buf_ptr(const buffer *b);
 static status_code	 ple_build_batch(exec_ctx *ctx);
+static status_code	 op_rmsnorm_per_head(exec_ctx *ctx);
 static buffer		 bs_cached_view(float_buf *fb, backend *owner, size_t n_elems);
 static status_code	 ple_proj_inject_batch(exec_ctx *ctx);
 static status_code	 scale_inplace_fallback(struct compute_scratch *s, backend *sync_be, buffer *xb,
@@ -510,6 +511,14 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.writes			  = {OP_TOUCH_OUT},
 				.inplace_out_none = 1,
 			},
+		[OP_QK_NORM_ROPE] =
+			{
+				.fn_name = "qk_norm_rope",
+				.slot0	 = OP_FN_SLOT(qk_norm_rope),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+			},
 		[OP_KV_PUT] =
 			{
 				.fn_name = "kv_put",
@@ -593,8 +602,8 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.fn_name		  = "split_qgate",
 				.slot0			  = OP_FN_SLOT(split_qgate),
 				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) |
-									(1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_HYB_GATE),
+				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_Q) |
+									(1u << RECIPE_SLOT_HYB_GATE),
 				.reads			  = {OP_TOUCH_IN0},
 				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_HYB_GATE)},
 			},
@@ -1436,36 +1445,43 @@ static status_code op_ffn_activate_ex(exec_ctx *ctx) {
 	return st;
 }
 
+typedef struct {
+	const float *cos;
+	const float *sin;
+	const float *freq_factors;
+} rope_tables;
+
+static rope_tables exec_rope_setup(const exec_ctx *ctx, backend *a, int rope_neox,
+								   int use_freq_factors) {
+	const struct model	  *m  = ctx->m;
+	const layer_ctx_entry *lc = &m->recipe->layer_ctx[ctx->li];
+	a->rope_neox			  = rope_neox;
+	a->rope_theta = lc->is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
+	if (lc->is_global)
+		return (rope_tables){ctx->s->rope_cos, ctx->s->rope_sin,
+							 use_freq_factors ? m->rope_freqs : NULL};
+	return (rope_tables){ctx->s->rope_cos_swa, ctx->s->rope_sin_swa, NULL};
+}
+
 static status_code op_rope_ext(exec_ctx *ctx) {
-	const recipe_op		   *op	 = ctx->op;
-	struct model		   *m	 = ctx->m;
-	struct compute_scratch *s	 = ctx->s;
-	int						li	 = ctx->li;
-	backend				   *a	 = exec_layer_backend(ctx);
-	profile				   *prof = &ctx->s->prof;
+	const recipe_op *op	  = ctx->op;
+	struct model	*m	  = ctx->m;
+	int				 li	  = ctx->li;
+	backend			*a	  = exec_layer_backend(ctx);
+	profile			*prof = &ctx->s->prof;
 	if (li < 0)
 		return ERR_INVALID_ARG;
-	const layer_ctx_entry *lc		 = &m->recipe->layer_ctx[li];
-	int					   is_global = lc->is_global;
-	int					   n_heads	 = op->u.rope_ext.n_heads;
-	int					   head_dim	 = lc->head_dim;
+	const layer_ctx_entry *lc		= &m->recipe->layer_ctx[li];
+	int					   n_heads	= op->u.rope_ext.n_heads;
+	int					   head_dim = lc->head_dim;
 	if (n_heads == 0) {
 		n_heads = (op->in[0] == RECIPE_SLOT_Q) ? m->n_heads : lc->n_kv_heads;
 	}
-	const float *rope_cos;
-	const float *rope_sin;
-	const float *freq_factors;
-	if (is_global) {
-		rope_cos	 = s->rope_cos;
-		rope_sin	 = s->rope_sin;
-		freq_factors = op->u.rope_ext.use_freq_factors ? m->rope_freqs : NULL;
-	} else {
-		rope_cos	 = s->rope_cos_swa;
-		rope_sin	 = s->rope_sin_swa;
-		freq_factors = NULL;
-	}
-	a->rope_neox  = op->u.rope_ext.rope_neox;
-	a->rope_theta = is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
+	rope_tables rt =
+		exec_rope_setup(ctx, a, op->u.rope_ext.rope_neox, op->u.rope_ext.use_freq_factors);
+	const float *rope_cos	  = rt.cos;
+	const float *rope_sin	  = rt.sin;
+	const float *freq_factors = rt.freq_factors;
 
 	profile_scope ps			 = profile_begin(prof, op->stage);
 	status_code	  st			 = OK;
@@ -1511,6 +1527,56 @@ static status_code op_rope_ext(exec_ctx *ctx) {
 typedef status_code (*op_handler)(exec_ctx *ctx);
 
 static const op_handler g_op_dispatch[OP_KIND_COUNT];
+
+static status_code qk_norm_rope_unfused(exec_ctx *ctx, const layer_ctx_entry *lc) {
+	const float eps		 = ctx->op->u.qk_norm_rope.eps;
+	const int	neox	 = ctx->op->u.qk_norm_rope.rope_neox;
+	recipe_op	steps[4] = {
+		mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, eps, 0),
+		mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, eps, 0),
+		mk_rope_ext(RECIPE_SLOT_Q, neox),
+		mk_rope_ext(RECIPE_SLOT_K, neox),
+	};
+	exec_ctx	sub = *ctx;
+	status_code st	= OK;
+	for (int i = 0; i < 4 && st == OK; i++) {
+		if (!lc->has_kv && (i == 1 || i == 3))
+			continue;
+		sub.op = &steps[i];
+		st	   = i < 2 ? op_rmsnorm_per_head(&sub) : op_rope_ext(&sub);
+	}
+	return st;
+}
+
+static status_code op_qk_norm_rope(exec_ctx *ctx) {
+	backend				  *a  = exec_layer_backend(ctx);
+	const layer_ctx_entry *lc = &ctx->m->recipe->layer_ctx[ctx->li];
+	if (!a->qk_norm_rope)
+		return qk_norm_rope_unfused(ctx, lc);
+	profile_scope ps		 = profile_begin(&ctx->s->prof, ctx->op->stage);
+	rope_tables	  rt		 = exec_rope_setup(ctx, a, ctx->op->u.qk_norm_rope.rope_neox, 1);
+	const int	  n_kv_heads = lc->has_kv ? lc->n_kv_heads : 0;
+	exec_segments seg		 = exec_segments_of(ctx);
+	buffer		 *q_all		 = exec_slot(ctx, RECIPE_SLOT_Q);
+	buffer		 *k_all		 = exec_slot(ctx, RECIPE_SLOT_K);
+	status_code	  st		 = OK;
+	for (int c = 0; c < seg.n_calls && st == OK; c++) {
+		buffer q_view = batch_row_view(q_all, c * seg.rows, lc->q_row_stride);
+		buffer k_view = {0};
+		if (n_kv_heads)
+			k_view = batch_row_view(k_all, c * seg.rows, lc->kv_row_stride);
+		st = a->qk_norm_rope(a, &q_view, n_kv_heads ? &k_view : NULL,
+							 exec_weight(ctx, WIDX_ATTN_Q_NORM), exec_weight(ctx, WIDX_ATTN_K_NORM),
+							 ctx->m->n_heads, n_kv_heads, lc->head_dim, ctx->op->u.qk_norm_rope.eps,
+							 exec_segment_pos(ctx, c), rt.cos, rt.sin, rt.freq_factors, seg.rows);
+		if (st == ERR_UNSUPPORTED && c == 0) {
+			profile_end(&ctx->s->prof, &ps);
+			return qk_norm_rope_unfused(ctx, lc);
+		}
+	}
+	profile_end(&ctx->s->prof, &ps);
+	return st;
+}
 
 static status_code scale_inplace_fallback(struct compute_scratch *s, backend *sync_be, buffer *xb,
 										  int n, float scale) {
@@ -1939,6 +2005,21 @@ static status_code op_rmsnorm_add(exec_ctx *ctx) {
 	return st;
 }
 
+static int exec_rmsnorm_add_norm(exec_ctx *ctx, const recipe_op *add, const recipe_op *norm) {
+	backend *a = exec_layer_backend(ctx);
+	if (!a->rmsnorm_add_norm_batch || norm->kind != OP_RMSNORM || norm->in[0] != add->out ||
+		norm->u.rmsnorm.eps != add->u.rmsnorm.eps)
+		return 0;
+	profile		 *prof = &ctx->s->prof;
+	profile_scope ps   = profile_begin(prof, add->stage);
+	status_code	  st   = a->rmsnorm_add_norm_batch(
+		a, exec_slot(ctx, add->in[0]), exec_weight(ctx, add->w_idx), exec_slot(ctx, add->in[1]),
+		exec_slot(ctx, add->out), exec_weight(ctx, norm->w_idx), exec_slot(ctx, norm->out),
+		ctx->m->dim, add->u.rmsnorm.eps, add->u.rmsnorm.out_scale, ctx->rows.n_rows);
+	profile_end(prof, &ps);
+	return st == OK ? 2 : 0;
+}
+
 static status_code op_scale(exec_ctx *ctx) {
 	backend					   *a	 = exec_layer_backend(ctx);
 	profile					   *prof = &ctx->s->prof;
@@ -2024,6 +2105,14 @@ static status_code walk_layer_ops(op_walker *w, const recipe_op *lops, int n_ops
 				if (coalesced_status != OK)
 					return coalesced_status;
 				j += consumed;
+				continue;
+			}
+		}
+
+		if (rop->kind == OP_RMSNORM_ADD && j + 1 < n_ops) {
+			int fused = exec_rmsnorm_add_norm(&ctx, rop, &lops[j + 1]);
+			if (fused > 0) {
+				j += fused;
 				continue;
 			}
 		}
@@ -2134,6 +2223,7 @@ struct batch_scratch {
 	float_buf ple_slice;
 	buffer	  ple_inp_dev;
 	buffer	  ple_slice_dev;
+	buffer	  ple_proj_dev;
 };
 
 enum {
@@ -2326,6 +2416,8 @@ void batch_scratch_free(batch_scratch *bs) {
 		bs->ple_inp_dev.owner->buffer_free(bs->ple_inp_dev.owner, &bs->ple_inp_dev);
 	if (bs->ple_slice_dev.owner)
 		bs->ple_slice_dev.owner->buffer_free(bs->ple_slice_dev.owner, &bs->ple_slice_dev);
+	if (bs->ple_proj_dev.owner)
+		bs->ple_proj_dev.owner->buffer_free(bs->ple_proj_dev.owner, &bs->ple_proj_dev);
 	memset(bs, 0, sizeof(*bs));
 }
 
@@ -3742,29 +3834,29 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 
 		size_t n_proj	= (size_t)n_rows * total_ple;
 		buffer proj_buf = {0};
-		int	   heap		= !backend_has_cap(a, BCAP_IS_HOST);
-		float_buf_ensure(&ctx->bs->ple_proj, n_proj);
-		if (heap) {
-			st = a->buffer_alloc_scratch(a, n_proj * sizeof(float), &proj_buf);
+		if (backend_has_cap(a, BCAP_IS_HOST)) {
+			float_buf_ensure(&ctx->bs->ple_proj, n_proj);
+			proj_buf = bs_cached_view(&ctx->bs->ple_proj, a, n_proj);
+		} else {
+			st = buffer_ensure_scratch(a, &ctx->bs->ple_proj_dev, n_proj * sizeof(float));
 			if (st != OK)
 				return st;
-		} else {
-			proj_buf = bs_cached_view(&ctx->bs->ple_proj, a, n_proj);
+			proj_buf = ctx->bs->ple_proj_dev;
 		}
 
 		st = a->matmul_batch(a, &m->layer_dims.per_layer_model_proj.buf,
 							 m->layer_dims.per_layer_model_proj.type, xb, &proj_buf, total_ple, dim,
 							 n_rows);
 		if (st != OK)
-			goto ple_build_cleanup;
+			return st;
 
 		st = a->scale_inplace(a, &proj_buf, plan.inv_sqrt_ple, n_rows * total_ple);
 		if (st != OK)
-			goto ple_build_cleanup;
+			return st;
 
 		st = ple_ensure_norm_w(a, ctx->s, m, plan.n_embd_per_layer);
 		if (st != OK)
-			goto ple_build_cleanup;
+			return st;
 
 		for (int row = 0; row < n_rows; row++) {
 			buffer row_view = proj_buf;
@@ -3772,16 +3864,11 @@ static status_code ple_build_batch(exec_ctx *ctx) {
 			st				= ple_norm_layers(a, &ctx->s->ple_proj_norm_w, &row_view, n_layers,
 											  plan.n_embd_per_layer, plan.eps);
 			if (st != OK)
-				goto ple_build_cleanup;
+				return st;
 		}
 
-		st = a->ple_combine(a, &ctx->bs->ple_all, &proj_buf, n_rows * total_ple,
-							0.70710678118654752f);
-	ple_build_cleanup:
-		ensure_sync(a);
-		if (heap)
-			a->buffer_free(a, &proj_buf);
-		return st;
+		return a->ple_combine(a, &ctx->bs->ple_all, &proj_buf, n_rows * total_ple,
+							  0.70710678118654752f);
 	}
 
 	ensure_sync(a);
@@ -3850,21 +3937,28 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 	size_t		n_ple	  = (size_t)n_rows * n_embd_per_layer;
 	buffer		ple_inp_b = {0}, ple_slice_b = {0};
 	int			heap = !backend_has_cap(a, BCAP_IS_HOST);
+	int			slice_in_place =
+		heap && n_rows == 1 && ple_src_bs->ple_all.handle && ple_src_bs->ple_all.owner == a;
 	if (heap) {
 		st = buffer_ensure_scratch(a, &ctx->bs->ple_inp_dev, n_ple * sizeof(float));
 		if (st != OK)
 			return st;
-		st = buffer_ensure_scratch(a, &ctx->bs->ple_slice_dev, n_ple * sizeof(float));
-		if (st != OK)
-			return st;
-		ple_inp_b	= ctx->bs->ple_inp_dev;
-		ple_slice_b = ctx->bs->ple_slice_dev;
+		ple_inp_b = ctx->bs->ple_inp_dev;
+		if (slice_in_place) {
+			ple_slice_b = ple_src_bs->ple_all;
+			ple_slice_b.offset += (size_t)ctx->li * n_embd_per_layer * sizeof(float);
+		} else {
+			st = buffer_ensure_scratch(a, &ctx->bs->ple_slice_dev, n_ple * sizeof(float));
+			if (st != OK)
+				return st;
+			ple_slice_b = ctx->bs->ple_slice_dev;
+		}
 	} else {
 		ple_inp_b	= bs_cached_view(&ctx->bs->ple_inp, a, n_ple);
 		ple_slice_b = bs_cached_view(&ctx->bs->ple_slice, a, n_ple);
 	}
 
-	if (ple_src_bs->ple_all.handle) {
+	if (!slice_in_place && ple_src_bs->ple_all.handle) {
 		for (int row = 0; row < n_rows; row++) {
 			buffer ple_src = ple_src_bs->ple_all;
 			ple_src.offset +=
@@ -3877,7 +3971,7 @@ static status_code ple_proj_inject_batch(exec_ctx *ctx) {
 				goto ple_cleanup;
 			}
 		}
-	} else {
+	} else if (!slice_in_place) {
 		for (int row = 0; row < n_rows; row++) {
 			float *ple_row = ple_src_bs->ple_buf.p + (size_t)row * total_ple +
 							 (size_t)ctx->li * n_embd_per_layer;
@@ -4771,6 +4865,7 @@ static const op_handler g_op_dispatch[OP_KIND_COUNT] = {
 	[OP_ROPE]				= op_rope,
 	[OP_ROPE_QK_FUSED]		= op_rope_qk_fused,
 	[OP_ROPE_EXT]			= op_rope_ext,
+	[OP_QK_NORM_ROPE]		= op_qk_norm_rope,
 	[OP_KV_PUT]				= op_kv_put,
 	[OP_ATTENTION]			= op_attention,
 	[OP_ADD]				= op_add,
@@ -5088,8 +5183,6 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 		batch_open = 0;
 	}
 
-	ensure_sync(a);
-
 	st = batch_gather_logit_rows(m, s, bs, rows);
 	if (st != OK)
 		goto done;
@@ -5355,6 +5448,14 @@ recipe_op mk_rope_ext(uint8_t in, int rope_neox) {
 	op.u.rope_ext.head_dim		   = 0;
 	op.u.rope_ext.use_freq_factors = 1;
 	op.u.rope_ext.rope_neox		   = rope_neox;
+	return op;
+}
+
+recipe_op mk_qk_norm_rope(float eps, int rope_neox) {
+	recipe_op op = mk_op_base(OP_QK_NORM_ROPE, RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE,
+							  RECIPE_SLOT_NONE, WIDX_ATTN_Q_NORM, STAGE_ROPE);
+	op.u.qk_norm_rope.eps		= eps;
+	op.u.qk_norm_rope.rope_neox = rope_neox;
 	return op;
 }
 

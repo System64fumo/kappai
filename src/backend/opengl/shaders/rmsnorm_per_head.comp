@@ -1,5 +1,6 @@
 #version 310 es
 precision highp float;
+#define LOAD_BATCH 8
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer XBuf {
 	float x[];
@@ -32,8 +33,15 @@ void		 main(void) {
 	uint  base		 = row * row_stride + h * uint(u_head_dim);
 	int	  head_dim	 = u_head_dim;
 	float my_sum	 = 0.0;
-	for (int i = int(tid); i < head_dim; i += 64)
-		my_sum += x[base + uint(i)] * x[base + uint(i)];
+	for (int i0 = int(tid); i0 < head_dim; i0 += 64 * LOAD_BATCH) {
+		float xv[LOAD_BATCH];
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int i = i0 + j * 64;
+			xv[j] = i < head_dim ? x[base + uint(i)] : 0.0;
+		}
+		for (int j = 0; j < LOAD_BATCH; j++)
+			my_sum += xv[j] * xv[j];
+	}
 	s_ss[tid] = my_sum;
 	barrier();
 	if (tid < 32u) {
@@ -62,25 +70,21 @@ void		 main(void) {
 	barrier();
 	float ss  = s_ss[0];
 	float inv = 1.0 / sqrt(ss / float(head_dim) + u_eps);
-	if (u_has_weight != 0) {
-		if (u_has_residual != 0) {
-			for (int i = int(tid); i < head_dim; i += 64) {
-				float t			  = x[base + uint(i)] * inv * w[i] + r[base + uint(i)];
-				y[base + uint(i)] = t * u_out_scale;
-			}
-		} else {
-			for (int i = int(tid); i < head_dim; i += 64)
-				y[base + uint(i)] = x[base + uint(i)] * inv * w[i] * u_out_scale;
+	for (int i0 = int(tid); i0 < head_dim; i0 += 64 * LOAD_BATCH) {
+		float xv[LOAD_BATCH];
+		float wv[LOAD_BATCH];
+		float rv[LOAD_BATCH];
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int	 i	   = i0 + j * 64;
+			bool valid = i < head_dim;
+			xv[j]	   = valid ? x[base + uint(i)] : 0.0;
+			wv[j]	   = (u_has_weight != 0 && valid) ? w[i] : 1.0;
+			rv[j]	   = (u_has_residual != 0 && valid) ? r[base + uint(i)] : 0.0;
 		}
-	} else {
-		if (u_has_residual != 0) {
-			for (int i = int(tid); i < head_dim; i += 64) {
-				float t			  = x[base + uint(i)] * inv + r[base + uint(i)];
-				y[base + uint(i)] = t * u_out_scale;
-			}
-		} else {
-			for (int i = int(tid); i < head_dim; i += 64)
-				y[base + uint(i)] = x[base + uint(i)] * inv * u_out_scale;
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int i = i0 + j * 64;
+			if (i < head_dim)
+				y[base + uint(i)] = (xv[j] * inv * wv[j] + rv[j]) * u_out_scale;
 		}
 	}
 }

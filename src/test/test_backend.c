@@ -4666,6 +4666,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		if (512 % QTYPES[qi].block != 0)
 			continue;
 		test_batch_matmul_parity(ref, tgt, &QTYPES[qi], 512, 512, 2);
+		test_batch_matmul_parity(ref, tgt, &QTYPES[qi], 192, 512, 37);
 	}
 	{
 		int bat_sh[][6] = {
@@ -4686,6 +4687,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 6144, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 12288, 8);
+		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 70);
 	}
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);

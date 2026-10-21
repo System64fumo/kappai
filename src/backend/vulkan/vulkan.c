@@ -1,6 +1,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "log.h"
+#include "profile.h"
 #include "recipe.h"
 #include "shaders_embedded.h"
 #include <math.h>
@@ -24,6 +25,19 @@
 #define VK_DESC_CACHE_CAP 256
 #define VK_MAX_BINDINGS 8
 #define VK_RING_DEPTH 4
+#define VK_PROF_SLOT_CAP 4096
+#define VK_QMM_MIN_M 16
+#define VK_READ_SET_CAP 64
+#define VK_QMV_ROWS 2
+#define VK_QMV_COLS 4
+#define VK_QMM_TILE 64
+#define VK_XQ_BLOCK_BYTES 48
+#define VK_ATTN_DEC_MAX_M 4
+#define VK_ATTN_DEC_MAX_HEAD_DIM 512
+#define VK_ATTN_DEC_TARGET_WG 256
+#define VK_ATTN_DEC_MAX_SPLITS 64
+#define VK_ATTN_DEC_MIN_CHUNK 16
+#define VK_PROF_NAMES 128
 
 static inline uint32_t vk_f32_to_bits(float f) {
 	union {
@@ -97,6 +111,24 @@ typedef struct {
 	vk_desc_slot		  desc_cache[VK_DESC_CACHE_CAP];
 	const char			 *name;
 } vk_pipeline_set;
+
+enum {
+	VQ_Q4_0,
+	VQ_Q4_1,
+	VQ_Q5_0,
+	VQ_Q5_1,
+	VQ_Q8_0,
+	VQ_IQ4_NL,
+	VQ_MM_COUNT,
+	VQ_Q4_K = VQ_MM_COUNT,
+	VQ_Q5_K,
+	VQ_Q6_K,
+	VQ_DENSE,
+	VQ_F32 = VQ_DENSE,
+	VQ_F16,
+	VQ_BF16,
+	VQ_COUNT
+};
 
 #define VK_ATTN_CACHE_CAP 6
 #define VK_ATTN_KIND_MAX 4
@@ -212,6 +244,8 @@ typedef struct {
 		int			 supports_subgroup_ballot;
 		int			 supports_int8;
 		int			 supports_integer_dot_product;
+		int			 supports_16bit_storage;
+		uint32_t	 max_workgroup_count[2];
 	} caps;
 
 	int		 pending_dispatches;
@@ -296,6 +330,24 @@ typedef struct {
 	vk_pipeline_set p_matmul_bf16_wide_batch;
 	vk_pipeline_set p_matmul_bf16_wide_res_batch;
 	vk_pipeline_set p_matmul_iq4_nl_batch;
+
+	int				qcore_ok;
+	vk_pipeline_set p_q8_quant[2];
+	vk_pipeline_set p_qmv[VQ_COUNT][2];
+	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	buffer			xq_buf[2];
+	struct {
+		const vk_buf *buf;
+		VkDeviceSize  off;
+		int			  k, m;
+		uint64_t	  seq;
+	} xq_fused;
+	uint64_t		stream_seq;
+	size_t			xq_cap[2];
+	vk_pipeline_set p_attn_decode;
+	vk_pipeline_set p_attn_merge;
+	buffer			attn_part_buf;
+	size_t			attn_part_cap;
 	vk_pipeline_set p_rmsnorm_batch;
 	vk_pipeline_set p_rmsnorm_sg_batch;
 	vk_pipeline_set p_rmsnorm_noweight_batch;
@@ -305,8 +357,11 @@ typedef struct {
 	vk_pipeline_set p_rmsnorm_noweight_per_head_batch;
 	vk_pipeline_set p_rmsnorm_noweight_per_head_sg_batch;
 	vk_pipeline_set p_rmsnorm_add_batch;
+	vk_pipeline_set p_rmsnorm_sg_quant;
+	vk_pipeline_set p_rmsnorm_add_norm;
 	vk_pipeline_set p_rope_batch;
 	vk_pipeline_set p_rope_ext_batch;
+	vk_pipeline_set p_qk_norm_rope;
 	vk_pipeline_set p_rope_qk_batch;
 	vk_pipeline_set p_dequant;
 	vk_pipeline_set p_ffn_activate_batch;
@@ -357,9 +412,12 @@ typedef struct {
 	uint64_t last_signal_value;
 	uint64_t pending_free_after;
 
-	vk_buf argmax_out_buf;
-	size_t argmax_partial_cap;
-	vk_buf argmax_partial_buf;
+	vk_buf	 tok_reg_buf;
+	vk_buf	 tok_rb_buf;
+	uint64_t tok_signal[BACKEND_TOKEN_REGS];
+	int		 tok_pipe;
+	size_t	 argmax_partial_cap;
+	vk_buf	 argmax_partial_buf;
 
 	vk_buf moe_arena;
 	int	   moe_arena_inter;
@@ -392,6 +450,34 @@ typedef struct {
 
 	int batch_active;
 
+	VkBuffer read_set[VK_READ_SET_CAP];
+	int		 n_read;
+	int		 read_overflow;
+
+	struct {
+		uint64_t dispatches;
+		uint64_t barriers;
+		uint64_t submits;
+		uint64_t waits;
+		uint64_t uploads;
+		uint64_t downloads;
+		uint64_t wait_us;
+	} stats;
+
+	struct {
+		int			 enabled;
+		VkQueryPool	 pool;
+		double		 ns_per_tick;
+		uint64_t	 ts_mask;
+		const char **rec;
+		int			 n_rec[VK_RING_DEPTH];
+		int			 reset_done[VK_RING_DEPTH];
+		const char	*names[VK_PROF_NAMES];
+		uint64_t	 ns[VK_PROF_NAMES];
+		uint64_t	 calls[VK_PROF_NAMES];
+		int			 n_names;
+	} prof;
+
 	struct {
 		int diag;
 		int abort_on_error;
@@ -407,6 +493,30 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed);
 static status_code vk_ensure_staging_cap(vk_priv *p, size_t need);
 static void		   vk_kv_store_free(vk_priv *p, vk_kv_store *store);
 static void		   vk_dirty_clear(vk_priv *p);
+
+static void vk_reads_clear(vk_priv *p) {
+	p->n_read		 = 0;
+	p->read_overflow = 0;
+}
+
+static int vk_reads_has(const vk_priv *p, VkBuffer buf) {
+	if (p->read_overflow)
+		return 1;
+	for (int i = 0; i < p->n_read; i++)
+		if (p->read_set[i] == buf)
+			return 1;
+	return 0;
+}
+
+static void vk_reads_add(vk_priv *p, VkBuffer buf) {
+	if (vk_reads_has(p, buf))
+		return;
+	if (p->n_read == VK_READ_SET_CAP)
+		p->read_overflow = 1;
+	else
+		p->read_set[p->n_read++] = buf;
+}
+
 static status_code vk_timeline_wait(vk_priv *p, uint64_t value);
 static void		   vk_timeline_poll(vk_priv *p);
 static int		   vk_timeline_done(vk_priv *p, uint64_t value);
@@ -801,6 +911,7 @@ static void vk_free_buffer(vk_priv *p, vk_buf *b) {
 }
 
 static status_code vk_flush(vk_priv *p);
+static status_code vk_ensure_token_regs(vk_priv *p);
 
 static void vk_queue_desc_free(vk_priv *p, VkDescriptorSet set) {
 	if (set == VK_NULL_HANDLE)
@@ -832,6 +943,40 @@ static void vk_flush_pending_desc_frees(vk_priv *p) {
 	vkFreeDescriptorSets(p->dev, p->desc_pool, (uint32_t)p->pending_free_count,
 						 p->pending_free_sets);
 	p->pending_free_count = 0;
+}
+
+#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
+
+static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
+	if (i < 2)
+		return &p->p_q8_quant[i];
+	if (i == 2)
+		return &p->p_attn_decode;
+	if (i == 3)
+		return &p->p_attn_merge;
+	i -= 4;
+	if (i < VQ_MM_COUNT)
+		return &p->p_qmm[i];
+	i -= VQ_MM_COUNT;
+	return &p->p_qmv[i / 2][i % 2];
+}
+
+static void vk_desc_cache_drop_buf(vk_priv *p, vk_pipeline_set *ps, VkBuffer freed) {
+	if (!ps->pipeline)
+		return;
+	for (int j = 0; j < VK_DESC_CACHE_CAP; j++) {
+		vk_desc_slot *s = &ps->desc_cache[j];
+		if (!s->valid)
+			continue;
+		for (int k = 0; k < ps->n_bindings; k++) {
+			if (s->bufs[k] == freed) {
+				vk_queue_desc_free(p, s->set);
+				s->valid = 0;
+				s->set	 = VK_NULL_HANDLE;
+				break;
+			}
+		}
+	}
 }
 
 static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
@@ -902,33 +1047,21 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_rmsnorm_noweight_per_head_batch,
 			&p->p_rmsnorm_noweight_per_head_sg_batch,
 			&p->p_rmsnorm_add_batch,
+			&p->p_rmsnorm_sg_quant,
+			&p->p_rmsnorm_add_norm,
 			&p->p_rope_batch,
 			&p->p_rope_ext_batch,
+			&p->p_qk_norm_rope,
 			&p->p_rope_qk_batch,
 			&p->p_ffn_activate_batch,
 			&p->p_elementwise_batch,
 			&p->p_dequant,
 		};
 		const int n_pipelines = (int)(sizeof(pipelines) / sizeof(pipelines[0]));
-		for (int i = 0; i < n_pipelines; i++) {
-			vk_pipeline_set *ps = pipelines[i];
-			if (!ps->pipeline)
-				continue;
-			int n = ps->n_bindings;
-			for (int j = 0; j < VK_DESC_CACHE_CAP; j++) {
-				vk_desc_slot *s = &ps->desc_cache[j];
-				if (!s->valid)
-					continue;
-				for (int k = 0; k < n; k++) {
-					if (s->bufs[k] == freed) {
-						vk_queue_desc_free(p, s->set);
-						s->valid = 0;
-						s->set	 = VK_NULL_HANDLE;
-						break;
-					}
-				}
-			}
-		}
+		for (int i = 0; i < n_pipelines; i++)
+			vk_desc_cache_drop_buf(p, pipelines[i], freed);
+		for (int i = 0; i < VK_QCORE_PIPES; i++)
+			vk_desc_cache_drop_buf(p, vk_qcore_pipe(p, i), freed);
 		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++) {
 			vk_attn_cache *c = &p->attn_cache[ci];
 			for (int i = 0; i < c->count; i++) {
@@ -962,11 +1095,129 @@ static int vk_buf_is_dead(vk_priv *p, VkBuffer buf) {
 	return 0;
 }
 
+static void vk_prof_resolve(vk_priv *p, int idx) {
+	int n = p->prof.n_rec[idx];
+	if (!p->prof.pool || n == 0)
+		return;
+	p->prof.n_rec[idx] = 0;
+	uint64_t *ts	   = xmalloc((size_t)n * 2 * sizeof(uint64_t));
+	VkResult  r =
+		vkGetQueryPoolResults(p->dev, p->prof.pool, (uint32_t)(idx * VK_PROF_SLOT_CAP * 2),
+							  (uint32_t)(n * 2), (size_t)n * 2 * sizeof(uint64_t), ts,
+							  sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+	for (int i = 0; r == VK_SUCCESS && i < n; i++) {
+		const char *name = p->prof.rec[idx * VK_PROF_SLOT_CAP + i];
+		int			k	 = 0;
+		while (k < p->prof.n_names && p->prof.names[k] != name)
+			k++;
+		if (k == p->prof.n_names) {
+			if (k == VK_PROF_NAMES)
+				continue;
+			p->prof.names[p->prof.n_names++] = name;
+		}
+		uint64_t ticks = (ts[2 * i + 1] - ts[2 * i]) & p->prof.ts_mask;
+		p->prof.ns[k] += (uint64_t)((double)ticks * p->prof.ns_per_tick);
+		p->prof.calls[k]++;
+	}
+	free(ts);
+}
+
+static int vk_prof_begin(vk_priv *p, const char *name) {
+	int idx = p->ring_cur;
+	if (!p->prof.enabled || p->prof.n_rec[idx] >= VK_PROF_SLOT_CAP)
+		return -1;
+	if (!p->prof.reset_done[idx]) {
+		vkCmdResetQueryPool(p->cmd, p->prof.pool, (uint32_t)(idx * VK_PROF_SLOT_CAP * 2),
+							VK_PROF_SLOT_CAP * 2);
+		p->prof.reset_done[idx] = 1;
+	}
+	int q									= p->prof.n_rec[idx]++;
+	p->prof.rec[idx * VK_PROF_SLOT_CAP + q] = name ? name : "?";
+	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, p->prof.pool,
+						(uint32_t)((idx * VK_PROF_SLOT_CAP + q) * 2));
+	return q;
+}
+
+static void vk_prof_end(vk_priv *p, int q) {
+	if (q < 0)
+		return;
+	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p->prof.pool,
+						(uint32_t)((p->ring_cur * VK_PROF_SLOT_CAP + q) * 2 + 1));
+}
+
+static void vk_prof_report(vk_priv *p) {
+	if (!p->prof.enabled)
+		return;
+	for (int i = 0; i < VK_RING_DEPTH; i++)
+		if (p->ring[i].submitted || !p->ring[i].recording)
+			vk_prof_resolve(p, i);
+	uint64_t total = 0;
+	int		 order[VK_PROF_NAMES];
+	for (int i = 0; i < p->prof.n_names; i++) {
+		total += p->prof.ns[i];
+		int j = i;
+		while (j > 0 && p->prof.ns[order[j - 1]] < p->prof.ns[i]) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = i;
+	}
+	INFO("vk: GPU kernel time %.1f ms total (host waited %.1f ms)", (double)total / 1e6,
+		 (double)p->stats.wait_us / 1000.0);
+	for (int i = 0; i < p->prof.n_names && i < 24 && total; i++) {
+		int k = order[i];
+		INFO("vk:   %-30s %8.1f ms %5.1f%% %8llu calls %7.1f us/call", p->prof.names[k],
+			 (double)p->prof.ns[k] / 1e6, 100.0 * (double)p->prof.ns[k] / (double)total,
+			 (unsigned long long)p->prof.calls[k],
+			 (double)p->prof.ns[k] / 1e3 / (double)p->prof.calls[k]);
+	}
+	vkDestroyQueryPool(p->dev, p->prof.pool, NULL);
+	free(p->prof.rec);
+	p->prof.pool	= VK_NULL_HANDLE;
+	p->prof.enabled = 0;
+}
+
+static void vk_set_gpu_profile(backend *self, int enable) {
+	vk_priv *p = self->priv;
+	if (!enable || p->prof.enabled || !p->dev)
+		return;
+	VkPhysicalDeviceProperties props;
+	vkGetPhysicalDeviceProperties(p->phys, &props);
+	uint32_t nq = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(p->phys, &nq, NULL);
+	VkQueueFamilyProperties *qf = xcalloc(nq ? nq : 1, sizeof(*qf));
+	vkGetPhysicalDeviceQueueFamilyProperties(p->phys, &nq, qf);
+	uint32_t bits = p->queue_family < nq ? qf[p->queue_family].timestampValidBits : 0;
+	free(qf);
+	if (bits == 0 || props.limits.timestampPeriod <= 0.0f) {
+		WARN("vk: queue has no timestamp support; per-kernel GPU timing disabled");
+		return;
+	}
+	VkQueryPoolCreateInfo qpci = {
+		.sType		= VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+		.queryType	= VK_QUERY_TYPE_TIMESTAMP,
+		.queryCount = VK_RING_DEPTH * VK_PROF_SLOT_CAP * 2,
+	};
+	if (vkCreateQueryPool(p->dev, &qpci, NULL, &p->prof.pool) != VK_SUCCESS) {
+		WARN("vk: vkCreateQueryPool failed; per-kernel GPU timing disabled");
+		return;
+	}
+	p->prof.rec			= xcalloc(VK_RING_DEPTH * VK_PROF_SLOT_CAP, sizeof(const char *));
+	p->prof.ns_per_tick = (double)props.limits.timestampPeriod;
+	p->prof.ts_mask		= bits >= 64 ? UINT64_MAX : ((1ull << bits) - 1);
+	for (int i = 0; i < VK_RING_DEPTH; i++)
+		p->prof.reset_done[i] = 0;
+	p->prof.enabled = 1;
+}
+
 static status_code vk_ring_begin(vk_priv *p, int idx) {
 	vk_ring_slot *r = &p->ring[idx];
+	vk_prof_resolve(p, idx);
+	p->prof.reset_done[idx] = 0;
 	vkResetCommandPool(p->dev, p->cmd_pools[idx], 0);
 	VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	VK_CHECK(vkBeginCommandBuffer(r->cmd, &bi));
+	vk_reads_clear(p);
 	r->recording				= 1;
 	r->has_work					= 0;
 	r->submitted				= 0;
@@ -988,7 +1239,10 @@ static status_code vk_timeline_wait(vk_priv *p, uint64_t value) {
 		.pSemaphores	= &p->timeline,
 		.pValues		= &value,
 	};
+	uint64_t t0 = time_us();
 	VK_CHECK(vkWaitSemaphores(p->dev, &wi, UINT64_MAX));
+	p->stats.waits++;
+	p->stats.wait_us += time_us() - t0;
 	p->timeline_completed = value;
 	return OK;
 }
@@ -1012,9 +1266,11 @@ static int vk_timeline_done(vk_priv *p, uint64_t value) {
 static void vk_ring_invalidate(vk_priv *p, int idx) {
 	vk_ring_slot *r = &p->ring[idx];
 	(void)vkResetCommandPool(p->dev, p->cmd_pools[idx], 0);
-	r->recording = 0;
-	r->has_work	 = 0;
-	r->submitted = 0;
+	r->recording			= 0;
+	r->has_work				= 0;
+	r->submitted			= 0;
+	p->prof.n_rec[idx]		= 0;
+	p->prof.reset_done[idx] = 0;
 	if (p->cmd == r->cmd) {
 		p->cmd						= VK_NULL_HANDLE;
 		p->cmd_recording			= 0;
@@ -1077,6 +1333,7 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 			.pWaitSemaphores	  = wait_count ? &p->timeline : NULL,
 			.pWaitDstStageMask	  = wait_count ? &wait_stage : NULL,
 		};
+		p->stats.submits++;
 		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, VK_NULL_HANDLE);
 		if (submit_res != VK_SUCCESS) {
 			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
@@ -1113,6 +1370,7 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 	};
 	vkResetFences(p->dev, 1, &p->fence);
 	{
+		p->stats.submits++;
 		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, p->fence);
 		if (submit_res != VK_SUCCESS) {
 			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
@@ -1130,7 +1388,10 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 	r->submitted = 1;
 	r->recording = 0;
 	{
+		uint64_t t0		  = time_us();
 		VkResult wait_res = vkWaitForFences(p->dev, 1, &p->fence, VK_TRUE, UINT64_MAX);
+		p->stats.waits++;
+		p->stats.wait_us += time_us() - t0;
 		if (wait_res != VK_SUCCESS) {
 			if (wait_res == VK_ERROR_DEVICE_LOST)
 				p->device_lost = 1;
@@ -1401,6 +1662,7 @@ static inline uint32_t vk_dirty_index(VkBuffer buf) {
 static void vk_dirty_clear(vk_priv *p) {
 	memset(p->dirty_table, 0, sizeof(p->dirty_table));
 	p->dirty_count = 0;
+	vk_reads_clear(p);
 }
 
 static int vk_dirty_lookup(vk_priv *p, VkBuffer buf) {
@@ -1470,6 +1732,7 @@ static void vk_dirty_add(vk_priv *p, const VkBuffer *bufs, int n_bufs, uint32_t 
 				.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
 				.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
 			};
+			p->stats.barriers++;
 			vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 								 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0,
 								 NULL);
@@ -1492,6 +1755,7 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 	if (groups_y == 0)
 		groups_y = 1;
 
+	p->stream_seq++;
 	if (!p->ring[p->ring_cur].recording) {
 		status_code bs = vk_ring_begin(p, p->ring_cur);
 		if (bs != OK)
@@ -1538,6 +1802,22 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 		key_offs[i] = offs ? offs[i] : 0;
 	}
 
+	int war = 0;
+	for (int i = 0; i < n_bufs && !war; i++)
+		war = ((write_mask >> i) & 1u) && vk_reads_has(p, key[i]);
+	if (war) {
+		VkMemoryBarrier barrier = {
+			.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+			.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+		};
+		p->stats.barriers++;
+		vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+							 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0,
+							 NULL);
+		vk_dirty_clear(p);
+	}
+
 	if (p->dirty_count > 0) {
 		VkBufferMemoryBarrier bars[VK_MAX_BINDINGS];
 		int					  nbar = 0;
@@ -1557,6 +1837,8 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 			vk_dirty_remove(p, key[i]);
 		}
 		if (nbar > 0) {
+			vk_reads_clear(p);
+			p->stats.barriers++;
 			vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 								 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, (uint32_t)nbar,
 								 bars, 0, NULL);
@@ -1711,9 +1993,15 @@ have_set:;
 	if (push_size > 0)
 		vkCmdPushConstants(p->cmd, ps->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
 
+	int pq = vk_prof_begin(p, ps->name);
 	vkCmdDispatch(p->cmd, groups_x, groups_y, 1);
+	vk_prof_end(p, pq);
+	p->stats.dispatches++;
 
 	vk_dirty_add(p, key, n_bufs, write_mask);
+	for (int i = 0; i < n_bufs; i++)
+		if (!((write_mask >> i) & 1u))
+			vk_reads_add(p, key[i]);
 
 	p->pending_dispatches++;
 	p->ring[p->ring_cur].has_work = 1;
@@ -1769,6 +2057,72 @@ static VkBool32 vk_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT	  sever
 		level = "WARN";
 	fprintf(stderr, "[VK_VALIDATE][%s] %s\n", level, data->pMessage ? data->pMessage : "?");
 	return VK_FALSE;
+}
+
+#define VQ_MV(t, label)                                                                            \
+	{                                                                                              \
+		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
+			"q_matvec_" label, "q_matvec_m4_" label                                                \
+		}                                                                                          \
+	}
+#define VQ_MM(t, label) {shader_##t##_spv, sizeof(shader_##t##_spv), "q_matmul_" label}
+
+static const uint32_t VQ_MV_SPEC[2][2] = {{1, 4}, {VK_QMV_COLS, 2}};
+
+static void vk_qcore_init(vk_priv *p) {
+	static const struct {
+		const uint32_t *spv;
+		size_t			len;
+		const char	   *name[2];
+	} MV[VQ_COUNT] = {
+		[VQ_Q4_0] = VQ_MV(q_matvec_q4_0, "q4_0"),  [VQ_Q4_1] = VQ_MV(q_matvec_q4_1, "q4_1"),
+		[VQ_Q5_0] = VQ_MV(q_matvec_q5_0, "q5_0"),  [VQ_Q5_1] = VQ_MV(q_matvec_q5_1, "q5_1"),
+		[VQ_Q8_0] = VQ_MV(q_matvec_q8_0, "q8_0"),  [VQ_IQ4_NL] = VQ_MV(q_matvec_iq4_nl, "iq4_nl"),
+		[VQ_Q4_K] = VQ_MV(kq_matvec_q4_k, "q4_k"), [VQ_Q5_K] = VQ_MV(kq_matvec_q5_k, "q5_k"),
+		[VQ_Q6_K] = VQ_MV(kq_matvec_q6_k, "q6_k"), [VQ_F32] = VQ_MV(dense_matvec_f32, "f32"),
+		[VQ_F16] = VQ_MV(dense_matvec_f16, "f16"), [VQ_BF16] = VQ_MV(dense_matvec_bf16, "bf16"),
+	};
+	static const struct {
+		const uint32_t *spv;
+		size_t			len;
+		const char	   *name;
+	} MM[VQ_MM_COUNT] = {
+		[VQ_Q4_0] = VQ_MM(q_matmul_q4_0, "q4_0"), [VQ_Q4_1] = VQ_MM(q_matmul_q4_1, "q4_1"),
+		[VQ_Q5_0] = VQ_MM(q_matmul_q5_0, "q5_0"), [VQ_Q5_1] = VQ_MM(q_matmul_q5_1, "q5_1"),
+		[VQ_Q8_0] = VQ_MM(q_matmul_q8_0, "q8_0"), [VQ_IQ4_NL] = VQ_MM(q_matmul_iq4_nl, "iq4_nl"),
+	};
+	if (vk_create_pipeline(p, shader_attn_decode_spv, sizeof(shader_attn_decode_spv), 5, 40,
+						   &p->p_attn_decode) == OK)
+		p->p_attn_decode.name = "attn_decode";
+	if (vk_create_pipeline(p, shader_attn_merge_spv, sizeof(shader_attn_merge_spv), 2, 8,
+						   &p->p_attn_merge) == OK)
+		p->p_attn_merge.name = "attn_merge";
+	p->qcore_ok = 0;
+	if (!p->caps.supports_integer_dot_product || !p->caps.supports_16bit_storage ||
+		!p->caps.supports_subgroup_arithmetic || p->caps.max_workgroup_invocations < 256 ||
+		p->caps.max_shared_memory < 16384)
+		return;
+	if (vk_create_pipeline(p, shader_q8_quant_spv, sizeof(shader_q8_quant_spv), 3, 16,
+						   &p->p_q8_quant[0]) != OK ||
+		vk_create_pipeline(p, shader_q8k_quant_spv, sizeof(shader_q8k_quant_spv), 3, 16,
+						   &p->p_q8_quant[1]) != OK)
+		return;
+	p->p_q8_quant[0].name = "q8_quant";
+	p->p_q8_quant[1].name = "q8k_quant";
+	for (int t = 0; t < VQ_COUNT; t++) {
+		for (int c = 0; c < 2; c++) {
+			if (vk_create_pipeline_spec(p, MV[t].spv, MV[t].len, 4, 16, VQ_MV_SPEC[c],
+										sizeof(VQ_MV_SPEC[c]), &p->p_qmv[t][c]) != OK)
+				return;
+			p->p_qmv[t][c].name = MV[t].name[c];
+		}
+	}
+	for (int t = 0; t < VQ_MM_COUNT; t++) {
+		if (vk_create_pipeline(p, MM[t].spv, MM[t].len, 4, 16, &p->p_qmm[t]) != OK)
+			return;
+		p->p_qmm[t].name = MM[t].name;
+	}
+	p->qcore_ok = 1;
 }
 
 static status_code vk_init(backend *self, int device_index) {
@@ -1909,9 +2263,13 @@ static status_code vk_init(backend *self, int device_index) {
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR dot_product_feat = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
 	};
+	VkPhysicalDeviceVulkan11Features vk11_feat = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		.pNext = &dot_product_feat,
+	};
 	VkPhysicalDeviceVulkan12Features vk12_feat = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-		.pNext = &dot_product_feat,
+		.pNext = &vk11_feat,
 	};
 	VkPhysicalDeviceTimelineSemaphoreFeatures timeline_feat = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
@@ -1929,6 +2287,8 @@ static status_code vk_init(backend *self, int device_index) {
 	int timeline_available = timeline_feat.timelineSemaphore ? 1 : 0;
 
 	int int8_available		  = (device_api_version >= VK_API_VERSION_1_2) && vk12_feat.shaderInt8;
+	int int16_available		  = (device_api_version >= VK_API_VERSION_1_2) &&
+								vk11_feat.storageBuffer16BitAccess && feat2.features.shaderInt16;
 	int dot_product_available = (device_api_version >= VK_API_VERSION_1_3 || has_dot_product_ext) &&
 								dot_product_feat.shaderIntegerDotProduct;
 
@@ -1982,9 +2342,14 @@ static status_code vk_init(backend *self, int device_index) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
 		.shaderIntegerDotProduct = dot_product_available ? VK_TRUE : VK_FALSE,
 	};
+	VkPhysicalDeviceVulkan11Features enable_vk11 = {
+		.sType					  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		.pNext					  = &enable_dot_product,
+		.storageBuffer16BitAccess = int16_available ? VK_TRUE : VK_FALSE,
+	};
 	VkPhysicalDeviceVulkan12Features enable_vk12 = {
 		.sType			   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-		.pNext			   = &enable_dot_product,
+		.pNext			   = &enable_vk11,
 		.shaderInt8		   = int8_available ? VK_TRUE : VK_FALSE,
 		.timelineSemaphore = timeline_available ? VK_TRUE : VK_FALSE,
 	};
@@ -1997,6 +2362,7 @@ static status_code vk_init(backend *self, int device_index) {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
 		.pNext = (device_api_version >= VK_API_VERSION_1_2) ? (void *)&enable_vk12
 															: (void *)&enable_timeline,
+		.features.shaderInt16 = int16_available ? VK_TRUE : VK_FALSE,
 	};
 	VkDeviceCreateInfo dci = {
 		.sType					 = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -2009,6 +2375,7 @@ static status_code vk_init(backend *self, int device_index) {
 	if (vkCreateDevice(p->phys, &dci, NULL, &p->dev) != VK_SUCCESS) {
 		timeline_available			= 0;
 		int8_available				= 0;
+		int16_available				= 0;
 		dot_product_available		= 0;
 		has_memory_budget_ext		= 0;
 		dci.pNext					= NULL;
@@ -2020,6 +2387,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->timeline_supported				 = timeline_available;
 	p->caps.supports_int8				 = int8_available;
 	p->caps.supports_integer_dot_product = dot_product_available;
+	p->caps.supports_16bit_storage		 = int16_available;
 	p->has_memory_budget_ext			 = has_memory_budget_ext;
 
 	vkGetDeviceQueue(p->dev, p->queue_family, 0, &p->queue);
@@ -2033,6 +2401,8 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.max_workgroup_size[2]			= props.limits.maxComputeWorkGroupSize[2];
 	p->caps.max_workgroup_invocations		= props.limits.maxComputeWorkGroupInvocations;
 	p->caps.storage_buffer_offset_alignment = props.limits.minStorageBufferOffsetAlignment;
+	p->caps.max_workgroup_count[0]			= props.limits.maxComputeWorkGroupCount[0];
+	p->caps.max_workgroup_count[1]			= props.limits.maxComputeWorkGroupCount[1];
 	p->caps.max_storage_buffer_range		= props.limits.maxStorageBufferRange;
 
 	p->caps.is_mali		= (props.vendorID == 0x13B5);
@@ -2247,7 +2617,7 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_kv_shift_gather.name = "kv_shift_gather";
-	s = vk_create_pipeline(p, shader_embd_lookup_spv, shader_embd_lookup_spv_len, 3, 16,
+	s = vk_create_pipeline(p, shader_embd_lookup_spv, shader_embd_lookup_spv_len, 4, 16,
 						   &p->p_embd_lookup);
 	if (s != OK)
 		return s;
@@ -2256,7 +2626,7 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_argmax.name = "argmax";
-	s = vk_create_pipeline(p, shader_argmax_reduce_spv, shader_argmax_reduce_spv_len, 2, 8,
+	s = vk_create_pipeline(p, shader_argmax_reduce_spv, shader_argmax_reduce_spv_len, 3, 8,
 						   &p->p_argmax_reduce);
 	if (s != OK)
 		return s;
@@ -2429,6 +2799,8 @@ static status_code vk_init(backend *self, int device_index) {
 	else
 		p->p_matmul_iq4_nl_batch.name = "matmul_iq4_nl_batch";
 
+	vk_qcore_init(p);
+
 	s = vk_create_pipeline(p, shader_rmsnorm_batch_spv, shader_rmsnorm_batch_spv_len, 3, 12,
 						   &p->p_rmsnorm_batch);
 	if (s == OK)
@@ -2474,6 +2846,16 @@ static status_code vk_init(backend *self, int device_index) {
 							   16, &p->p_rmsnorm_add_batch);
 		if (s == OK)
 			p->p_rmsnorm_add_batch.name = "rmsnorm_add_batch";
+		s = vk_create_pipeline(p, shader_rmsnorm_sg_quant_batch_spv,
+							   shader_rmsnorm_sg_quant_batch_spv_len, 4, 12,
+							   &p->p_rmsnorm_sg_quant);
+		if (s == OK)
+			p->p_rmsnorm_sg_quant.name = "rmsnorm_sg_quant";
+		s = vk_create_pipeline(p, shader_rmsnorm_add_norm_batch_spv,
+							   shader_rmsnorm_add_norm_batch_spv_len, 7, 16,
+							   &p->p_rmsnorm_add_norm);
+		if (s == OK)
+			p->p_rmsnorm_add_norm.name = "rmsnorm_add_norm";
 	}
 
 	memset(p->attn_cache, 0, sizeof(p->attn_cache));
@@ -2486,6 +2868,10 @@ static status_code vk_init(backend *self, int device_index) {
 						   &p->p_rope_ext_batch);
 	if (s == OK)
 		p->p_rope_ext_batch.name = "rope_ext_batch";
+	s = vk_create_pipeline(p, shader_qk_norm_rope_spv, shader_qk_norm_rope_spv_len, 6, 24,
+						   &p->p_qk_norm_rope);
+	if (s == OK)
+		p->p_qk_norm_rope.name = "qk_norm_rope";
 	s = vk_create_pipeline(p, shader_rope_qk_batch_spv, shader_rope_qk_batch_spv_len, 4, 28,
 						   &p->p_rope_qk_batch);
 	if (s == OK)
@@ -2520,6 +2906,13 @@ static void vk_free(backend *self) {
 		return;
 	if (p->dev) {
 		vkDeviceWaitIdle(p->dev);
+		INFO("vk: totals: %llu dispatches, %llu barriers, %llu submits, %llu waits, %llu uploads, "
+			 "%llu downloads, %.1f ms waiting",
+			 (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
+			 (unsigned long long)p->stats.submits, (unsigned long long)p->stats.waits,
+			 (unsigned long long)p->stats.uploads, (unsigned long long)p->stats.downloads,
+			 (double)p->stats.wait_us / 1000.0);
+		vk_prof_report(p);
 
 		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++)
 			for (int fi = 0; fi < VK_ATTN_CACHE_CAP; fi++)
@@ -2584,13 +2977,28 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_rmsnorm_noweight_per_head_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_noweight_per_head_sg_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_add_batch);
+		vk_destroy_pipeline(p, &p->p_rmsnorm_sg_quant);
+		vk_destroy_pipeline(p, &p->p_rmsnorm_add_norm);
 		vk_destroy_pipeline(p, &p->p_rope_batch);
 		vk_destroy_pipeline(p, &p->p_rope_ext_batch);
+		vk_destroy_pipeline(p, &p->p_qk_norm_rope);
 		vk_destroy_pipeline(p, &p->p_rope_qk_batch);
 		vk_destroy_pipeline(p, &p->p_dequant);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_batch);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_fused_batch);
 		vk_destroy_pipeline(p, &p->p_elementwise_batch);
+		for (int i = 0; i < VK_QCORE_PIPES; i++)
+			vk_destroy_pipeline(p, vk_qcore_pipe(p, i));
+		for (int i = 0; i < 2; i++) {
+			if (p->xq_buf[i].handle) {
+				vk_free_buffer(p, (vk_buf *)p->xq_buf[i].handle);
+				free(p->xq_buf[i].handle);
+			}
+		}
+		if (p->attn_part_buf.handle) {
+			vk_free_buffer(p, (vk_buf *)p->attn_part_buf.handle);
+			free(p->attn_part_buf.handle);
+		}
 
 		if (p->rope_cos_buf.handle) {
 			vk_free_buffer(p, (vk_buf *)p->rope_cos_buf.handle);
@@ -2626,8 +3034,11 @@ static void vk_free(backend *self) {
 			vk_free_buffer(p, &p->staging_buf);
 			p->staging_cap = 0;
 		}
-		if (p->argmax_out_buf.buf) {
-			vk_free_buffer(p, &p->argmax_out_buf);
+		if (p->tok_reg_buf.buf) {
+			vk_free_buffer(p, &p->tok_reg_buf);
+		}
+		if (p->tok_rb_buf.buf) {
+			vk_free_buffer(p, &p->tok_rb_buf);
 		}
 		if (p->argmax_partial_buf.buf) {
 			vk_free_buffer(p, &p->argmax_partial_buf);
@@ -2827,6 +3238,8 @@ static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const tensor_desc *d
 	return OK;
 }
 
+static void vk_drain_gpu(vk_priv *p);
+
 static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out) {
 	vk_priv *p	  = self->priv;
 	size_t	 size = (desc->n_dims == 1) ? ggml_row_size(desc->type, desc->dims[0])
@@ -2835,6 +3248,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 
 	vk_buf *b = vk_scratch_pool_take(p, alloc_size, NULL);
 	if (b) {
+		vk_drain_gpu(p);
 		if (b->mapped) {
 			status_code s = tensor_desc_read(desc, 0, b->mapped, size);
 			if (s != OK)
@@ -3318,13 +3732,14 @@ static status_code vk_moe_experts_batch(backend *self, const buffer *xb, buffer 
 }
 
 static status_code vk_buffer_upload(backend *self, buffer *buf, const void *host_src, size_t size) {
-	vk_priv *p	 = self->priv;
-	vk_buf	*vb	 = as_vkbuf(buf);
-	size_t	 off = buf->offset;
+	vk_priv *p = self->priv;
+	p->stream_seq++;
+	vk_buf *vb	= as_vkbuf(buf);
+	size_t	off = buf->offset;
 
 	if (vb->mapped) {
 		vk_ring_slot *r = &p->ring[p->ring_cur];
-		if (r->has_work && !p->device_lost) {
+		if (!p->device_lost && (r->has_work || p->last_signal_value > p->timeline_completed)) {
 			status_code fs = vk_flush(p);
 			if (fs != OK)
 				return fs;
@@ -3349,6 +3764,7 @@ static status_code vk_buffer_upload(backend *self, buffer *buf, const void *host
 		return s;
 
 	memcpy(p->staging_buf.mapped, host_src, size);
+	p->stats.uploads++;
 
 	VkBufferCopy copy = {.dstOffset = off, .size = size};
 	vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, vb->buf, 1, &copy);
@@ -3362,7 +3778,7 @@ static status_code vk_buf_download_raw(backend *self, vk_buf *vb, size_t off, vo
 
 	if (vb->mapped) {
 		vk_ring_slot *r = &p->ring[p->ring_cur];
-		if (r->has_work && !p->device_lost) {
+		if (!p->device_lost && (r->has_work || p->last_signal_value > p->timeline_completed)) {
 			status_code fs = vk_flush(p);
 			if (fs != OK)
 				return fs;
@@ -3401,6 +3817,7 @@ static status_code vk_buf_download_raw(backend *self, vk_buf *vb, size_t off, vo
 		return rs;
 
 	memcpy(host_dst, p->staging_buf.mapped, size);
+	p->stats.downloads++;
 	return OK;
 }
 
@@ -3427,6 +3844,7 @@ static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
 		if (bs != OK)
 			return bs;
 	}
+	p->stream_seq++;
 	vkCmdFillBuffer(p->cmd, b->buf, 0, VK_WHOLE_SIZE, 0);
 	r->has_work = 1;
 	return vk_run_cmd_sync(p);
@@ -3860,6 +4278,8 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	vk_priv *p = self->priv;
 
 	if (!tok_embd->handle && tok_embd->host_ptr) {
+		if (TOKEN_IS_REG(token))
+			return ERR_UNSUPPORTED;
 		backend_report_host_fallback(
 			self, "embd_lookup", HFB_BUF_HOST_RESIDENT,
 			"token embedding buffer is host-resident; embedding lookup executed "
@@ -3954,19 +4374,27 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 		int		embd_needs_iqx =
 			(tok_embd_type == GGML_TYPE_IQ2_S || tok_embd_type == GGML_TYPE_IQ2_XXS ||
 			 tok_embd_type == GGML_TYPE_IQ3_XXS);
-		vk_buf		*grid_buf = (tok_embd_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf)
-									? &p->iq3s_grid_buf
-								: (embd_needs_iqx && p->iqx_grid_buf.buf) ? &p->iqx_grid_buf
-																		  : dummy;
-		vk_buf		*bufs[3]  = {as_vkbuf(tok_embd), as_vkbuf(x_out), grid_buf};
-		VkDeviceSize offs[3]  = {tok_embd->offset, x_out->offset, 0};
-		uint32_t	 groups	  = (uint32_t)((dim + 63) / 64);
-		return vk_dispatch_ex(p, &p->p_embd_lookup, bufs, offs, NULL, 3, &push, sizeof(push),
+		vk_buf *grid_buf = (tok_embd_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf)
+							   ? &p->iq3s_grid_buf
+						   : (embd_needs_iqx && p->iqx_grid_buf.buf) ? &p->iqx_grid_buf
+																	 : dummy;
+		if (TOKEN_IS_REG(token)) {
+			status_code rs = vk_ensure_token_regs(p);
+			if (rs != OK)
+				return rs;
+		}
+		vk_buf		*bufs[4] = {as_vkbuf(tok_embd), as_vkbuf(x_out), grid_buf,
+								TOKEN_IS_REG(token) ? &p->tok_reg_buf : dummy};
+		VkDeviceSize offs[4] = {tok_embd->offset, x_out->offset, 0, 0};
+		uint32_t	 groups	 = (uint32_t)((dim + 63) / 64);
+		return vk_dispatch_ex(p, &p->p_embd_lookup, bufs, offs, NULL, 4, &push, sizeof(push),
 							  groups, 1, 0x2);
 	}
 
 	size_t		   row_stride = ggml_row_size(tok_embd_type, dim);
 	const uint8_t *embd_host;
+	if (TOKEN_IS_REG(token))
+		return ERR_UNSUPPORTED;
 	if (tok_embd->host_ptr) {
 		embd_host = (const uint8_t *)tok_embd->host_ptr + ((size_t)token * row_stride);
 	} else {
@@ -4095,6 +4523,126 @@ static int vk_matmul_groups_x(vk_priv *p, int n, uint32_t w_type) {
 	return (n + per_wg - 1) / per_wg;
 }
 
+static status_code vk_ensure_scratch(backend *self, buffer *buf, size_t *cap, size_t need) {
+	vk_priv *p = self->priv;
+	if (need <= *cap)
+		return OK;
+	if (buf->handle) {
+		vk_drain_gpu(p);
+		vk_free_buffer(p, as_vkbuf(buf));
+		free(buf->handle);
+		buf->handle = NULL;
+		*cap		= 0;
+	}
+	size_t		c = need < ((size_t)1 << 20) ? ((size_t)1 << 20) : need;
+	status_code s = vk_buffer_alloc_scratch(self, c, buf);
+	if (s == OK)
+		*cap = c;
+	return s;
+}
+
+static int vk_qfamily(int t) {
+	return t >= VQ_DENSE ? 2 : t >= VQ_MM_COUNT ? 1 : 0;
+}
+
+static int vk_qcore_type(vk_priv *p, uint32_t w_type, int k, int m) {
+	static const struct {
+		uint32_t type;
+		int		 vq;
+	} MAP[] = {
+		{GGML_TYPE_Q4_0, VQ_Q4_0}, {GGML_TYPE_Q4_1, VQ_Q4_1}, {GGML_TYPE_Q5_0, VQ_Q5_0},
+		{GGML_TYPE_Q5_1, VQ_Q5_1}, {GGML_TYPE_Q8_0, VQ_Q8_0}, {GGML_TYPE_IQ4_NL, VQ_IQ4_NL},
+		{GGML_TYPE_Q4_K, VQ_Q4_K}, {GGML_TYPE_Q5_K, VQ_Q5_K}, {GGML_TYPE_Q6_K, VQ_Q6_K},
+		{GGML_TYPE_F32, VQ_F32},   {GGML_TYPE_F16, VQ_F16},	  {GGML_TYPE_BF16, VQ_BF16},
+	};
+	static const int BLOCK[3] = {32, 256, 4};
+	if (!p->qcore_ok || k <= 0)
+		return -1;
+	for (size_t i = 0; i < ARRAY_LEN(MAP); i++) {
+		if (MAP[i].type != w_type)
+			continue;
+		int fam = vk_qfamily(MAP[i].vq);
+		if (k % BLOCK[fam] != 0 || (fam != 0 && m >= VK_QMM_MIN_M))
+			return -1;
+		return MAP[i].vq;
+	}
+	return -1;
+}
+
+static status_code vk_qcore_quantize(backend *self, int family, const buffer *x, const buffer *up,
+									 int act, int k, int m) {
+	static const int QB[2]	   = {32, 256};
+	static const int WORDS[2]  = {12, 76};
+	static const int PER_WG[2] = {8, 1};
+	vk_priv			*p		   = self->priv;
+	if (family == 0 && !up && p->xq_fused.buf == as_vkbuf(x) && p->xq_fused.off == x->offset &&
+		p->xq_fused.k == k && p->xq_fused.m == m && p->xq_fused.seq == p->stream_seq)
+		return OK;
+	int			kb	 = k / QB[family];
+	size_t		need = (size_t)m * (size_t)kb * (size_t)WORDS[family] * 4;
+	status_code s	 = vk_ensure_scratch(self, &p->xq_buf[family], &p->xq_cap[family], need);
+	if (s != OK)
+		return s;
+	const buffer *u = up ? up : x;
+	struct {
+		int32_t k, m, x_stride, act;
+	} push				 = {k, m, k, up ? act : -1};
+	vk_buf		*bufs[3] = {as_vkbuf(x), as_vkbuf(u), as_vkbuf(&p->xq_buf[family])};
+	VkDeviceSize offs[3] = {x->offset, u->offset, p->xq_buf[family].offset};
+	return vk_dispatch_ex(p, &p->p_q8_quant[family], bufs, offs, NULL, 3, &push, sizeof(push),
+						  (uint32_t)((kb + PER_WG[family] - 1) / PER_WG[family]), (uint32_t)m,
+						  1u << 2);
+}
+
+static status_code vk_qcore_matmul(vk_priv *p, int t, const buffer *w, const buffer *x, buffer *y,
+								   const buffer *res, int n, int k, int m) {
+	static const int BLOCK[3] = {32, 256, 4};
+	int				 res_mode = 0;
+	if (res)
+		res_mode = (as_vkbuf(res) == as_vkbuf(y) && res->offset == y->offset) ? 2 : 1;
+	const buffer *xs = vk_qfamily(t) == 2 ? x : &p->xq_buf[vk_qfamily(t)];
+	struct {
+		int32_t n, kb, m, res_mode;
+	} push					 = {n, k / BLOCK[vk_qfamily(t)], m, res_mode};
+	vk_buf			*bufs[4] = {as_vkbuf(w), as_vkbuf(xs), as_vkbuf(y),
+								res ? as_vkbuf(res) : vk_dummy_buf(p)};
+	VkDeviceSize	 offs[4] = {w->offset, xs->offset, y->offset, res ? res->offset : 0};
+	vk_pipeline_set *ps;
+	uint32_t		 gx, gy;
+	if (m >= VK_QMM_MIN_M) {
+		ps = &p->p_qmm[t];
+		gx = (uint32_t)((m + VK_QMM_TILE - 1) / VK_QMM_TILE);
+		gy = (uint32_t)((n + VK_QMM_TILE - 1) / VK_QMM_TILE);
+	} else {
+		int c = m == 1 ? 0 : 1;
+		ps	  = &p->p_qmv[t][c];
+		gx	  = (uint32_t)((n + (int)VQ_MV_SPEC[c][1] - 1) / (int)VQ_MV_SPEC[c][1]);
+		gy	  = (uint32_t)((m + (int)VQ_MV_SPEC[c][0] - 1) / (int)VQ_MV_SPEC[c][0]);
+	}
+	if (gx > p->caps.max_workgroup_count[0] || gy > p->caps.max_workgroup_count[1])
+		return ERR_UNSUPPORTED;
+	int			keeps_fused = p->xq_fused.seq == p->stream_seq && as_vkbuf(y) != p->xq_fused.buf;
+	status_code s =
+		vk_dispatch_ex(p, ps, bufs, offs, NULL, 4, &push, sizeof(push), gx, gy, 1u << 2);
+	if (s == OK && keeps_fused)
+		p->xq_fused.seq = p->stream_seq;
+	return s;
+}
+
+static status_code vk_qcore_run(backend *self, int t, const buffer *w, const buffer *x,
+								const buffer *up, int act, buffer *y, const buffer *res, int n,
+								int k, int m) {
+	if (vk_qfamily(t) == 2) {
+		if (up)
+			return ERR_UNSUPPORTED;
+		return vk_qcore_matmul(self->priv, t, w, x, y, res, n, k, m);
+	}
+	status_code s = vk_qcore_quantize(self, vk_qfamily(t), x, up, act, k, m);
+	if (s != OK)
+		return s;
+	return vk_qcore_matmul(self->priv, t, w, x, y, res, n, k, m);
+}
+
 static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 								  const buffer *residual, buffer *y, int n, int k) {
 	vk_priv *p			  = self->priv;
@@ -4106,6 +4654,13 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 			"weight buffer is host-resident (never uploaded to the device); "
 			"matmul executed on host (cpu)");
 		return vk_matmul_host_fallback(self, w, w_type, x, residual, y, n, k);
+	}
+
+	int qt = vk_qcore_type(p, w_type, k, 1);
+	if (qt >= 0) {
+		status_code qs = vk_qcore_run(self, qt, w, x, NULL, -1, y, residual, n, k, 1);
+		if (qs != ERR_UNSUPPORTED)
+			return qs;
 	}
 
 	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type, has_residual);
@@ -4235,11 +4790,11 @@ static status_code vk_matmul_multi(backend *self, const buffer **w, const uint32
 	return vk_matmul_multi_batch(self, w, w_types, x, y, n_list, k, n_matmuls, 1);
 }
 
-static void vk_drain_before_free(vk_priv *p) {
+static void vk_drain_gpu(vk_priv *p) {
 	if (p->device_lost)
 		return;
-	if (p->pending_dispatches > 0 || p->ring[p->ring_cur].has_work)
-		vk_run_cmd_sync(p);
+	if (vk_flush(p) != OK)
+		ERROR("vk: draining the GPU failed; a buffer may be reused while still in use");
 }
 
 static status_code vk_ensure_ffn_act_buf(backend *self, int k, buffer *out) {
@@ -4251,7 +4806,7 @@ static status_code vk_ensure_ffn_act_buf(backend *self, int k, buffer *out) {
 	}
 
 	if (p->ffn_act_buf.handle) {
-		vk_drain_before_free(p);
+		vk_drain_gpu(p);
 		vk_free_buffer(p, (vk_buf *)p->ffn_act_buf.handle);
 		free(p->ffn_act_buf.handle);
 		p->ffn_act_buf.handle = NULL;
@@ -4282,6 +4837,13 @@ static status_code vk_matmul_ffn_down_batch(backend *self, const buffer *w, uint
 	if (n <= 0 || k <= 0)
 		return ERR_INVALID_ARG;
 
+	int qt = vk_qcore_type(self->priv, w_type, k, m);
+	if (qt >= 0) {
+		status_code qs = vk_qcore_run(self, qt, w, gate, up, activation, y, NULL, n, k, m);
+		if (qs != ERR_UNSUPPORTED)
+			return qs;
+	}
+
 	if (!vk_matmul_type_native(self, w_type)) {
 		backend_report_host_fallback(
 			self, "ffn_down", HFB_WEIGHT_TYPE,
@@ -4307,6 +4869,13 @@ static status_code vk_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 									  const buffer *gate, const buffer *up, buffer *y, int n, int k,
 									  int activation) {
 	vk_priv *p = self->priv;
+
+	int qt = vk_qcore_type(p, w_type, k, 1);
+	if (qt >= 0) {
+		status_code qs = vk_qcore_run(self, qt, w, gate, up, activation, y, NULL, n, k, 1);
+		if (qs != ERR_UNSUPPORTED)
+			return qs;
+	}
 
 	if (w_type == GGML_TYPE_IQ4_NL && p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
 		return vk_dispatch_iq4_nl_unified(p, 2, w, gate, up, y, NULL, n, 0, k, activation, 0);
@@ -4473,7 +5042,7 @@ static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 		return OK;
 
 	if (p->attn_scores_buf.handle) {
-		vk_drain_before_free(p);
+		vk_drain_gpu(p);
 		vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
 		free(p->attn_scores_buf.handle);
 		p->attn_scores_buf.handle = NULL;
@@ -4641,112 +5210,53 @@ static status_code vk_ensure_attention_pipeline(vk_priv *p, int head_dim, vk_pip
 							   shader_attention_spv_len, 5, 36, "attention", out);
 }
 
-static status_code vk_attention_host_fallback(backend *self, const buffer *q, buffer *out,
-											  vk_buf *kb, vk_buf *vb, size_t layer_off_elems,
-											  size_t layer_n_elems, int n_heads, int n_kv_heads,
-											  int n_active, int head_dim, int n_ctx, float scale,
-											  int attn_start, int n_pos) {
-	(void)n_kv_heads;
-	(void)layer_n_elems;
-	int			n_groups = (n_heads + n_active - 1) / n_active;
-	int			q_total	 = n_heads * head_dim;
-	float	   *qf		 = xmalloc((size_t)q_total * sizeof(float));
-	float	   *outf	 = xmalloc((size_t)q_total * sizeof(float));
-	status_code st;
-	st = self->buffer_read_f32(self, q, qf, q_total);
-	if (st) {
-		free(qf);
-		free(outf);
-		return st;
-	}
+static status_code vk_attention_decode(backend *self, const buffer *q, vk_buf *kb, vk_buf *vb,
+									   size_t layer_off, buffer *out, int pos_start, int n_heads,
+									   int n_kv_heads, int head_dim, int n_ctx, float scale,
+									   int window, int m) {
+	vk_priv *p		  = self->priv;
+	int		 start	  = window > 0 ? MAX(0, pos_start + 1 - window) : 0;
+	int		 n_pos	  = MAX(pos_start + m - start, 1);
+	int		 n_wg	  = n_heads * m;
+	int		 n_splits = MIN((VK_ATTN_DEC_TARGET_WG + n_wg - 1) / n_wg, VK_ATTN_DEC_MAX_SPLITS);
+	n_splits  = MAX(MIN(n_splits, (n_pos + VK_ATTN_DEC_MIN_CHUNK - 1) / VK_ATTN_DEC_MIN_CHUNK), 1);
+	int chunk = (n_pos + n_splits - 1) / n_splits;
+	n_splits  = (n_pos + chunk - 1) / chunk;
 
-	size_t kvh_stride  = (size_t)n_ctx * head_dim;
-	size_t slice_elems = (size_t)n_active * (size_t)n_pos * (size_t)head_dim;
+	size_t		part_bytes = (size_t)n_wg * n_splits * (size_t)(head_dim + 2) * sizeof(float);
+	status_code s = vk_ensure_scratch(self, &p->attn_part_buf, &p->attn_part_cap, part_bytes);
+	if (s != OK)
+		return s;
 
-	uint16_t *kd_base_buf = xmalloc(slice_elems * sizeof(uint16_t));
-	uint16_t *vd_base_buf = xmalloc(slice_elems * sizeof(uint16_t));
-	st					  = OK;
-	for (int kvh = 0; kvh < n_active && st == OK; kvh++) {
-		size_t src_off =
-			(layer_off_elems + (size_t)kvh * kvh_stride + (size_t)attn_start * (size_t)head_dim) *
-			sizeof(uint16_t);
-		uint16_t *kd_dst = kd_base_buf + (size_t)kvh * (size_t)n_pos * (size_t)head_dim;
-		uint16_t *vd_dst = vd_base_buf + (size_t)kvh * (size_t)n_pos * (size_t)head_dim;
-		for (int t = 0; t < n_pos && st == OK; t++) {
-			size_t row_off = src_off + (size_t)t * kvh_stride * sizeof(uint16_t);
-			size_t row_b   = (size_t)head_dim * sizeof(uint16_t);
-			st = vk_buf_download_raw(self, kb, row_off, kd_dst + (size_t)t * head_dim, row_b);
-			if (st == OK)
-				st = vk_buf_download_raw(self, vb, row_off, vd_dst + (size_t)t * head_dim, row_b);
-		}
-	}
-	kvh_stride = (size_t)n_pos * head_dim;
-	if (st != OK) {
-		free(qf);
-		free(outf);
-		free(kd_base_buf);
-		free(vd_base_buf);
-		return st;
-	}
-
-	float *k_slice = xmalloc((size_t)n_pos * head_dim * sizeof(float));
-	float *v_slice = xmalloc((size_t)n_pos * head_dim * sizeof(float));
-	float *scores  = xmalloc((size_t)n_pos * sizeof(float));
-	int	   cur_kvh = -1;
-
-	for (int h = 0; h < n_heads; h++) {
-		int kvh = h / n_groups;
-		if (kvh != cur_kvh) {
-			cur_kvh = kvh;
-			for (int t = 0; t < n_pos; t++) {
-				size_t	  kv_off = ((size_t)kvh * kvh_stride) + ((size_t)t * head_dim);
-				uint16_t *kd	 = kd_base_buf + kv_off;
-				uint16_t *vd	 = vd_base_buf + kv_off;
-				float	 *ks	 = k_slice + ((size_t)t * head_dim);
-				float	 *vs	 = v_slice + ((size_t)t * head_dim);
-				for (int d = 0; d < head_dim; d++) {
-					ks[d] = vk_f16_to_f32(kd[d]);
-					vs[d] = vk_f16_to_f32(vd[d]);
-				}
-			}
-		}
-		{
-			float *qh	 = qf + ((size_t)h * head_dim);
-			float *out_h = outf + ((size_t)h * head_dim);
-			for (int t = 0; t < n_pos; t++) {
-				float *kt	   = k_slice + ((size_t)t * head_dim);
-				float  dot	   = 0.0f;
-				int	   d	   = 0;
-				int	   hd_main = head_dim - (head_dim % 8);
-				for (; d < hd_main; d += 8)
-					dot += (qh[d] * kt[d]) + (qh[d + 1] * kt[d + 1]) + (qh[d + 2] * kt[d + 2]) +
-						   (qh[d + 3] * kt[d + 3]) + (qh[d + 4] * kt[d + 4]) +
-						   (qh[d + 5] * kt[d + 5]) + (qh[d + 6] * kt[d + 6]) +
-						   (qh[d + 7] * kt[d + 7]);
-				for (; d < head_dim; d++)
-					dot += qh[d] * kt[d];
-				scores[t] = dot * scale;
-			}
-			vk_softmax_masked(scores, n_pos);
-			for (int d = 0; d < head_dim; d++)
-				out_h[d] = 0.0f;
-			for (int t = 0; t < n_pos; t++) {
-				float  sv = scores[t];
-				float *vt = v_slice + ((size_t)t * head_dim);
-				for (int d = 0; d < head_dim; d++)
-					out_h[d] += sv * vt[d];
-			}
-		}
-	}
-	free(k_slice);
-	free(v_slice);
-	free(scores);
-	free(kd_base_buf);
-	free(vd_base_buf);
-	st = self->buffer_write_f32(self, out, outf, q_total);
-	free(qf);
-	free(outf);
-	return st;
+	struct {
+		uint32_t layer_off;
+		int32_t	 pos, n_heads, n_kv_heads, head_dim, n_ctx;
+		float	 scale;
+		int32_t	 window, chunk, n_splits;
+	} push				 = {(uint32_t)layer_off,
+							pos_start,
+							n_heads,
+							n_kv_heads,
+							head_dim,
+							n_ctx,
+							scale,
+							window,
+							chunk,
+							n_splits};
+	vk_buf		*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_part_buf), as_vkbuf(out)};
+	VkDeviceSize offs[5] = {q->offset, 0, 0, p->attn_part_buf.offset, out->offset};
+	vk_buf		*pb		 = as_vkbuf(&p->attn_part_buf);
+	s = vk_dispatch_ex(p, &p->p_attn_decode, bufs, offs, NULL, 5, &push, sizeof(push),
+					   (uint32_t)n_heads, (uint32_t)(n_splits * m), n_splits > 1 ? 0x8 : 0x10);
+	if (s != OK || n_splits == 1)
+		return s;
+	struct {
+		int32_t head_dim, n_splits;
+	} mpush				  = {head_dim, n_splits};
+	vk_buf		*mbufs[2] = {pb, as_vkbuf(out)};
+	VkDeviceSize moffs[2] = {p->attn_part_buf.offset, out->offset};
+	return vk_dispatch_ex(p, &p->p_attn_merge, mbufs, moffs, NULL, 2, &mpush, sizeof(mpush),
+						  (uint32_t)n_wg, 1, 0x2);
 }
 
 static status_code vk_attention_impl(backend *self, const buffer *q, const buffer *k_cache,
@@ -4803,15 +5313,12 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 		}
 	}
 
-	int need_host_path = (n_active != n_kv_heads);
+	n_kv_heads = n_active;
 
-	if (need_host_path) {
-		size_t layer_off = vk_kv_layer_off_elems(kh, layer);
-		size_t layer_n	 = vk_kv_layer_n_elems(kh, layer);
-		return vk_attention_host_fallback(self, q, out, kb, vb, layer_off, layer_n, n_heads,
-										  n_kv_heads, n_active, head_dim, n_ctx, scale, attn_start,
-										  n_pos);
-	}
+	if (head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 && p->p_attn_decode.pipeline &&
+		p->p_attn_merge.pipeline)
+		return vk_attention_decode(self, q, kb, vb, vk_kv_layer_off_elems(kh, layer), out, pos,
+								   n_heads, n_kv_heads, head_dim, n_ctx, scale, sliding_window, 1);
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
@@ -5058,7 +5565,7 @@ static void vk_end_batch(backend *self) {
 		return;
 	}
 	if (r->has_work) {
-		status_code fs = vk_flush(p);
+		status_code fs = p->tok_pipe ? vk_run_cmd(p) : vk_flush(p);
 		if (fs != OK) {
 			ERROR("vk: vk_end_batch: flush failed (%s) -- "
 				  "batch was NOT submitted to the device",
@@ -5067,18 +5574,23 @@ static void vk_end_batch(backend *self) {
 	}
 }
 
-static status_code vk_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
-	vk_priv *p = self->priv;
+static status_code vk_ensure_token_regs(vk_priv *p) {
+	if (p->tok_reg_buf.buf && p->tok_rb_buf.buf)
+		return OK;
+	const size_t bytes = (BACKEND_TOKEN_REGS + 1) * sizeof(uint32_t);
+	status_code	 s	   = vk_alloc_buffer(p, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+										 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->tok_reg_buf);
+	if (s != OK)
+		return s;
+	return vk_alloc_buffer(
+		p, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &p->tok_rb_buf);
+}
 
-	if (!p->argmax_out_buf.buf) {
-		VkBufferUsageFlags usage =
-			VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-		VkMemoryPropertyFlags flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		status_code s = vk_alloc_buffer(p, 256, usage, flags, &p->argmax_out_buf);
-		if (s != OK)
-			return s;
-	}
+static status_code vk_argmax_dispatch(vk_priv *p, const buffer *logits, int n, int slot) {
+	status_code s = vk_ensure_token_regs(p);
+	if (s != OK)
+		return s;
 
 	const int ARGMAX_WG_CHUNK	= 8192;
 	const int ARGMAX_MAX_GROUPS = 256;
@@ -5093,8 +5605,8 @@ static status_code vk_argmax(backend *self, const buffer *logits, int n, int32_t
 		if (p->argmax_partial_buf.buf)
 			vk_free_buffer(p, &p->argmax_partial_buf);
 		VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		status_code		   s	 = vk_alloc_buffer(
-			p, partial_bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &p->argmax_partial_buf);
+		s = vk_alloc_buffer(p, partial_bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+							&p->argmax_partial_buf);
 		if (s != OK)
 			return s;
 		p->argmax_partial_cap = partial_bytes;
@@ -5103,28 +5615,64 @@ static status_code vk_argmax(backend *self, const buffer *logits, int n, int32_t
 	struct {
 		int32_t n;
 		int32_t groups;
-	} push					   = {n, groups};
-	vk_buf	   *stage1_bufs[2] = {as_vkbuf(logits), &p->argmax_partial_buf};
-	status_code s = vk_dispatch(p, &p->p_argmax, stage1_bufs, 2, &push, sizeof(push), groups);
+	} push				   = {n, groups};
+	vk_buf *stage1_bufs[2] = {as_vkbuf(logits), &p->argmax_partial_buf};
+	s = vk_dispatch(p, &p->p_argmax, stage1_bufs, 2, &push, sizeof(push), groups);
 	if (s != OK)
 		return s;
 
 	struct {
 		int32_t n;
-		int32_t groups;
-	} reduce_push		   = {groups, 0};
-	vk_buf *stage2_bufs[2] = {&p->argmax_partial_buf, &p->argmax_out_buf};
-	s = vk_dispatch(p, &p->p_argmax_reduce, stage2_bufs, 2, &reduce_push, sizeof(reduce_push), 1);
+		int32_t slot;
+	} reduce_push		   = {groups, slot};
+	vk_buf *stage2_bufs[3] = {&p->argmax_partial_buf, &p->tok_reg_buf, &p->tok_rb_buf};
+	return vk_dispatch_ex(p, &p->p_argmax_reduce, stage2_bufs, NULL, NULL, 3, &reduce_push,
+						  sizeof(reduce_push), 1, 1, 0x6);
+}
+
+static uint32_t vk_token_slot_value(const vk_priv *p, int slot) {
+	uint32_t result;
+	memcpy(&result, (const uint32_t *)p->tok_rb_buf.mapped + slot, sizeof(result));
+	return result;
+}
+
+static status_code vk_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
+	vk_priv	   *p = self->priv;
+	status_code s = vk_argmax_dispatch(p, logits, n, BACKEND_TOKEN_REGS);
 	if (s != OK)
 		return s;
-
 	s = vk_flush(p);
 	if (s != OK)
 		return s;
+	*out_idx = (int32_t)vk_token_slot_value(p, BACKEND_TOKEN_REGS);
+	return OK;
+}
 
-	uint32_t result;
-	memcpy(&result, p->argmax_out_buf.mapped, sizeof(uint32_t));
-	*out_idx = (int32_t)result;
+static status_code vk_argmax_to_reg(backend *self, const buffer *logits, int n, int reg) {
+	vk_priv *p = self->priv;
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->timeline_supported)
+		return ERR_INVALID_ARG;
+	status_code s = vk_argmax_dispatch(p, logits, n, reg);
+	if (s != OK)
+		return s;
+	s = vk_run_cmd(p);
+	if (s != OK)
+		return s;
+	p->tok_signal[reg] = p->last_signal_value;
+	p->tok_pipe		   = 1;
+	return OK;
+}
+
+static status_code vk_read_token_reg(backend *self, int reg, int32_t *out_token) {
+	vk_priv *p = self->priv;
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->tok_signal[reg])
+		return ERR_INVALID_ARG;
+	p->tok_pipe	   = 0;
+	status_code ws = vk_timeline_wait(p, p->tok_signal[reg]);
+	if (ws != OK)
+		return ws;
+	p->tok_signal[reg] = 0;
+	*out_token		   = (int32_t)vk_token_slot_value(p, reg);
 	return OK;
 }
 
@@ -5178,6 +5726,40 @@ static status_code vk_rmsnorm_add_batch(backend *self, const buffer *x, const bu
 	VkDeviceSize offs[4] = {x->offset, w->offset, residual->offset, y->offset};
 	return vk_dispatch_2d_ex(p, &p->p_rmsnorm_add_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 (uint32_t)1, (uint32_t)m, 1u << 3);
+}
+
+static status_code vk_rmsnorm_add_norm_batch(backend *self, const buffer *x, const buffer *w_add,
+											 const buffer *residual, buffer *y_add,
+											 const buffer *w_norm, buffer *y_norm, int n, float eps,
+											 float out_scale, int m) {
+	vk_priv *p = self->priv;
+	if (!p->p_rmsnorm_add_norm.pipeline || !p->qcore_ok || n % 32 != 0 || n > 4096 ||
+		!w_add->handle || !w_norm->handle)
+		return ERR_UNSUPPORTED;
+	size_t		need = (size_t)m * (size_t)(n / 32) * 12 * sizeof(uint32_t);
+	status_code s	 = vk_ensure_scratch(self, &p->xq_buf[0], &p->xq_cap[0], need);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t n;
+		float	eps;
+		int32_t m;
+		float	os;
+	} push			= {n, eps, m, out_scale};
+	vk_buf *bufs[7] = {as_vkbuf(x),		 as_vkbuf(w_add),  as_vkbuf(residual),	   as_vkbuf(y_add),
+					   as_vkbuf(w_norm), as_vkbuf(y_norm), as_vkbuf(&p->xq_buf[0])};
+	VkDeviceSize offs[7] = {x->offset,		w_add->offset,	residual->offset,	y_add->offset,
+							w_norm->offset, y_norm->offset, p->xq_buf[0].offset};
+	s = vk_dispatch_2d_ex(p, &p->p_rmsnorm_add_norm, bufs, offs, NULL, 7, &push, sizeof(push), 1,
+						  (uint32_t)m, 0x68);
+	if (s != OK)
+		return s;
+	p->xq_fused.buf = as_vkbuf(y_norm);
+	p->xq_fused.off = y_norm->offset;
+	p->xq_fused.k	= n;
+	p->xq_fused.m	= m;
+	p->xq_fused.seq = p->stream_seq;
+	return OK;
 }
 
 static status_code vk_rmsnorm_add(backend *self, const buffer *x, const buffer *w,
@@ -5264,6 +5846,8 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 
 	if (m <= 0)
 		return ERR_INVALID_ARG;
+	if (n <= 0 || k <= 0)
+		return OK;
 
 	if (!w->handle && w->host_ptr) {
 		status_code st = OK;
@@ -5275,6 +5859,13 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 			st = vk_matmul_impl(self, w, w_type, &x_row, NULL, &y_row, n, k);
 		}
 		return st;
+	}
+
+	int qt = vk_qcore_type(p, w_type, k, m);
+	if (qt >= 0) {
+		status_code qs = vk_qcore_run(self, qt, w, x, NULL, -1, y, NULL, n, k, m);
+		if (qs != ERR_UNSUPPORTED)
+			return qs;
 	}
 
 	if (w_type == GGML_TYPE_IQ4_NL && p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
@@ -5385,6 +5976,29 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 		return st;
 	}
 
+	int qts[8];
+	int all_q = n_matmuls <= 8;
+	int fams  = 0;
+	for (int i = 0; all_q && i < n_matmuls; i++) {
+		if (n_list[i] <= 0)
+			continue;
+		qts[i] = vk_qcore_type(p, w_types[i], k, m);
+		all_q  = qts[i] >= 0;
+		if (all_q)
+			fams |= 1 << vk_qfamily(qts[i]);
+	}
+	if (all_q && fams) {
+		status_code st = OK;
+		for (int f = 0; f < 2 && st == OK; f++)
+			if (fams & (1 << f))
+				st = vk_qcore_quantize(self, f, x, NULL, -1, k, m);
+		for (int i = 0; i < n_matmuls && st == OK; i++)
+			if (n_list[i] > 0)
+				st = vk_qcore_matmul(p, qts[i], w[i], x, y[i], NULL, n_list[i], k, m);
+		if (st != ERR_UNSUPPORTED)
+			return st;
+	}
+
 	if (n_matmuls == 3 && w_types[0] == w_types[1] && w_types[1] == w_types[2] &&
 		w_types[0] == GGML_TYPE_Q4_0 && p->p_matmul_q4_0_triple_batch.pipeline && k > 0) {
 		int n0 = n_list[0], n1 = n_list[1], n2 = n_list[2];
@@ -5477,6 +6091,32 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 	return st;
 }
 
+static status_code vk_rmsnorm_quant_batch(backend *self, const buffer *x, const buffer *w,
+										  buffer *y, int n, float eps, int m) {
+	vk_priv	   *p	 = self->priv;
+	size_t		need = (size_t)m * (size_t)(n / 32) * 12 * sizeof(uint32_t);
+	status_code s	 = vk_ensure_scratch(self, &p->xq_buf[0], &p->xq_cap[0], need);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t n;
+		float	eps;
+		int32_t m;
+	} push				 = {n, eps, m};
+	vk_buf		*bufs[4] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(y), as_vkbuf(&p->xq_buf[0])};
+	VkDeviceSize offs[4] = {x->offset, w->offset, y->offset, p->xq_buf[0].offset};
+	s = vk_dispatch_2d_ex(p, &p->p_rmsnorm_sg_quant, bufs, offs, NULL, 4, &push, sizeof(push), 1,
+						  (uint32_t)m, 0xC);
+	if (s != OK)
+		return s;
+	p->xq_fused.buf = as_vkbuf(y);
+	p->xq_fused.off = y->offset;
+	p->xq_fused.k	= n;
+	p->xq_fused.m	= m;
+	p->xq_fused.seq = p->stream_seq;
+	return OK;
+}
+
 static status_code vk_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
 									int n, float eps, int m) {
 	vk_priv *p = self->priv;
@@ -5522,6 +6162,9 @@ static status_code vk_rmsnorm_batch(backend *self, const buffer *x, const buffer
 		p->p_rmsnorm_sg_batch.pipeline ? &p->p_rmsnorm_sg_batch : &p->p_rmsnorm_batch;
 	if (!ps->pipeline)
 		return ERR_UNSUPPORTED;
+	if (ps == &p->p_rmsnorm_sg_batch && p->p_rmsnorm_sg_quant.pipeline && p->qcore_ok &&
+		n % 32 == 0 && n <= 4096)
+		return vk_rmsnorm_quant_batch(self, x, w, y, n, eps, m);
 	struct {
 		int32_t n;
 		float	eps;
@@ -5884,15 +6527,19 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 							 groups_x, (uint32_t)n_rows, 0x3);
 }
 
-static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
-									 int pos_start, const float *rope_cos_base,
-									 const float *rope_sin_base, const float *freq_factors, int m) {
+typedef struct {
+	vk_buf		*cos_b;
+	vk_buf		*sin_b;
+	VkDeviceSize cos_off;
+	VkDeviceSize sin_off;
+} vk_rope_tables;
+
+static status_code vk_rope_tables_get(backend *self, int head_dim, const float *rope_cos_base,
+									  const float *rope_sin_base, const float *freq_factors,
+									  vk_rope_tables *out) {
 	vk_priv *p	  = self->priv;
 	int		 half = head_dim / 2;
-
 	if (freq_factors) {
-		if (!p->p_rope_ext_batch.pipeline)
-			return ERR_UNSUPPORTED;
 		int n_ctx = p->n_ctx_stored;
 		if (n_ctx <= 0 || half <= 0)
 			return ERR_INVALID_ARG;
@@ -5904,7 +6551,7 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 		if (table_stale) {
 			if (need > (size_t)p->rope_ff_cap) {
 				if (p->rope_ff_buf.handle) {
-					vk_drain_before_free(p);
+					vk_drain_gpu(p);
 					vk_buffer_free(self, &p->rope_ff_buf);
 				}
 				status_code s = vk_buffer_alloc_scratch(self, need, &p->rope_ff_buf);
@@ -5944,30 +6591,68 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 			p->rope_ff_n_ctx	= n_ctx;
 			p->rope_ff_theta	= self->rope_theta;
 		}
-		struct {
-			int32_t n_heads, head_dim, pos, has_ff, neox, m;
-		} push				  = {n_heads, head_dim, pos_start, 0, self->rope_neox, m};
-		VkDeviceSize offs[4]  = {0, 0, (VkDeviceSize)table_floats * sizeof(float), 0};
-		uint32_t	 total	  = (uint32_t)(n_heads * half);
-		uint32_t	 groups_x = (total + 63) / 64;
-		vk_buf		*ffb	  = as_vkbuf(&p->rope_ff_buf);
-		vk_buf		*fbufs[4] = {as_vkbuf(vec), ffb, ffb, ffb};
-		return vk_dispatch_2d_ex(p, &p->p_rope_ext_batch, fbufs, offs, NULL, 4, &push, sizeof(push),
-								 groups_x, (uint32_t)m, 0x1);
+		vk_buf *ffb = as_vkbuf(&p->rope_ff_buf);
+		*out		= (vk_rope_tables){ffb, ffb, 0, (VkDeviceSize)table_floats * sizeof(float)};
+		return OK;
 	}
-
 	status_code s = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	if (s != OK)
+		return s;
+	*out =
+		(vk_rope_tables){as_vkbuf(p->rope_cos_buf_active), as_vkbuf(p->rope_sin_buf_active), 0, 0};
+	return OK;
+}
+
+static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim,
+									 int pos_start, const float *rope_cos_base,
+									 const float *rope_sin_base, const float *freq_factors, int m) {
+	vk_priv *p	  = self->priv;
+	int		 half = head_dim / 2;
+	if (freq_factors && !p->p_rope_ext_batch.pipeline)
+		return ERR_UNSUPPORTED;
+	vk_rope_tables t;
+	status_code	   s =
+		vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors, &t);
 	if (s != OK)
 		return s;
 	struct {
 		int32_t n_heads, head_dim, pos, has_ff, neox, m;
-	} push			  = {n_heads, head_dim, pos_start, 0, self->rope_neox, m};
-	vk_buf	*bufs[4]  = {as_vkbuf(vec), as_vkbuf(p->rope_cos_buf_active),
-						 as_vkbuf(p->rope_sin_buf_active), as_vkbuf(p->rope_cos_buf_active)};
-	uint32_t total	  = (uint32_t)(n_heads * half);
-	uint32_t groups_x = (total + 63) / 64;
-	return vk_dispatch_2d_masked(p, &p->p_rope_ext_batch, bufs, 4, &push, sizeof(push), groups_x,
-								 (uint32_t)m, 0x1);
+	} push				  = {n_heads, head_dim, pos_start, 0, self->rope_neox, m};
+	vk_buf		*bufs[4]  = {as_vkbuf(vec), t.cos_b, t.sin_b, t.cos_b};
+	VkDeviceSize offs[4]  = {0, t.cos_off, t.sin_off, 0};
+	uint32_t	 groups_x = (uint32_t)((n_heads * half + 63) / 64);
+	return vk_dispatch_2d_ex(p, &p->p_rope_ext_batch, bufs, offs, NULL, 4, &push, sizeof(push),
+							 groups_x, (uint32_t)m, 0x1);
+}
+
+static status_code vk_qk_norm_rope(backend *self, buffer *q, buffer *k, const buffer *q_w,
+								   const buffer *k_w, int n_heads, int n_kv_heads, int head_dim,
+								   float eps, int pos_start, const float *rope_cos_base,
+								   const float *rope_sin_base, const float *freq_factors, int m) {
+	vk_priv *p = self->priv;
+	if (!p->p_qk_norm_rope.pipeline || head_dim <= 0 || (head_dim & 1) || head_dim > 1024)
+		return ERR_UNSUPPORTED;
+	if (freq_factors && !p->p_rope_ext_batch.pipeline)
+		return ERR_UNSUPPORTED;
+	vk_rope_tables t;
+	status_code	   s =
+		vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors, &t);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t n_heads, n_kv_heads, head_dim;
+		float	eps;
+		int32_t neox, pos0;
+	} push				 = {n_heads, n_kv_heads, head_dim, eps, self->rope_neox, pos_start};
+	vk_buf		*dummy	 = vk_dummy_buf(p);
+	vk_buf		*bufs[6] = {as_vkbuf(q),   n_kv_heads > 0 ? as_vkbuf(k) : dummy,
+							as_vkbuf(q_w), n_kv_heads > 0 ? as_vkbuf(k_w) : dummy,
+							t.cos_b,	   t.sin_b};
+	VkDeviceSize offs[6] = {q->offset,	 n_kv_heads > 0 ? k->offset : 0,
+							q_w->offset, n_kv_heads > 0 ? k_w->offset : 0,
+							t.cos_off,	 t.sin_off};
+	return vk_dispatch_2d_ex(p, &p->p_qk_norm_rope, bufs, offs, NULL, 6, &push, sizeof(push),
+							 (uint32_t)(n_heads + n_kv_heads), (uint32_t)m, 0x3);
 }
 
 static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_ctx, int m) {
@@ -5976,7 +6661,7 @@ static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_
 	if (needed <= p->attn_scores_cap)
 		return OK;
 	if (p->attn_scores_buf.handle) {
-		vk_drain_before_free(p);
+		vk_drain_gpu(p);
 		vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
 		free(p->attn_scores_buf.handle);
 		p->attn_scores_buf.handle = NULL;
@@ -6009,7 +6694,6 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 										   int n_ctx, int flash_attn, float scale,
 										   int n_kv_heads_active, int sliding_window,
 										   int attn_start, int m) {
-	(void)sliding_window;
 	vk_priv *p		  = self->priv;
 	int		 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
 
@@ -6024,6 +6708,12 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 	const vk_kv_handle *vh = (const vk_kv_handle *)v_cache->handle;
 	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
 	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
+
+	if (m <= VK_ATTN_DEC_MAX_M && head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 &&
+		p->p_attn_decode.pipeline && p->p_attn_merge.pipeline)
+		return vk_attention_decode(self, q, kb, vb, vk_kv_layer_off_elems(kh, layer), out,
+								   pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale,
+								   sliding_window, m);
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
@@ -6114,9 +6804,9 @@ static status_code vk_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "vulkan";
 	out->priority = 100;
-	out->caps  = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
-				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT | BCAP_KV_SHIFT;
-	out->probe = vk_probe;
+	out->caps = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
+				BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT | BCAP_KV_SHIFT | BCAP_QK_NORM_ROPE;
+	out->probe							 = vk_probe;
 	out->device_count					 = vk_device_count;
 	out->device_identity				 = vk_device_identity;
 	out->init							 = vk_init;
@@ -6137,6 +6827,9 @@ static status_code vk_ctor(backend *out) {
 	out->rmsnorm						 = vk_rmsnorm;
 	out->matmul							 = vk_matmul;
 	out->matmul_type_native				 = vk_matmul_type_native;
+	out->argmax_to_reg					 = vk_argmax_to_reg;
+	out->read_token_reg					 = vk_read_token_reg;
+	out->qk_norm_rope					 = vk_qk_norm_rope;
 	out->dequant_type_native			 = vk_dequant_type_native;
 	out->dequant_weight					 = vk_dequant_weight;
 	out->matmul_residual				 = vk_matmul_residual;
@@ -6161,6 +6854,7 @@ static status_code vk_ctor(backend *out) {
 	out->ffn_activate					 = vk_ffn_activate;
 	out->argmax							 = vk_argmax;
 	out->synchronize					 = vk_synchronize;
+	out->set_gpu_profile				 = vk_set_gpu_profile;
 	out->submit							 = vk_submit;
 	out->begin_batch					 = vk_begin_batch;
 	out->end_batch						 = vk_end_batch;
@@ -6169,6 +6863,7 @@ static status_code vk_ctor(backend *out) {
 	out->rmsnorm_noweight_per_head		 = vk_rmsnorm_noweight_per_head;
 	out->rmsnorm_add					 = vk_rmsnorm_add;
 	out->rmsnorm_add_batch				 = vk_rmsnorm_add_batch;
+	out->rmsnorm_add_norm_batch			 = vk_rmsnorm_add_norm_batch;
 	out->ffn_activate_ex				 = vk_ffn_activate_ex;
 	out->rope_ext						 = vk_rope_ext;
 	out->attention_swa					 = vk_attention_swa;

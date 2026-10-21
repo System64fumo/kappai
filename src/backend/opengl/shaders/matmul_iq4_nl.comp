@@ -57,14 +57,15 @@ uint g_mi;
 #ifndef REPACKED
 shared float s_acc[ROWS][WG + 1];
 
-float reduce_row(uint i) {
-	float v = 0.0;
-	for (int j = 0; j < WG; j++)
-		v += s_acc[i][j];
-	return v;
+#endif
+shared uint s_lut[256];
+
+void load_lut(void) {
+	for (uint i = gl_LocalInvocationID.x; i < 256u; i += gl_WorkGroupSize.x)
+		s_lut[i] = lut[i];
+	barrier();
 }
 
-#endif
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
 }
@@ -75,8 +76,10 @@ int pair_field_sum(uint acc) {
 }
 
 int dot_word(uint qw, uvec4 yv) {
-	return pair_field_sum(lut[qw & 0xFFu] * yv.x) + pair_field_sum(lut[(qw >> 8u) & 0xFFu] * yv.y) +
-		   pair_field_sum(lut[(qw >> 16u) & 0xFFu] * yv.z) + pair_field_sum(lut[qw >> 24u] * yv.w);
+	return pair_field_sum(s_lut[qw & 0xFFu] * yv.x) +
+		   pair_field_sum(s_lut[(qw >> 8u) & 0xFFu] * yv.y) +
+		   pair_field_sum(s_lut[(qw >> 16u) & 0xFFu] * yv.z) +
+		   pair_field_sum(s_lut[qw >> 24u] * yv.w);
 }
 
 #ifndef REPACKED
@@ -104,6 +107,7 @@ void load_block(uint rowg, int bi, out float wd, out uint q0, out uint q1, out u
 
 #ifdef REPACKED
 void main(void) {
+	load_lut();
 	uint wgid  = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	   = uint(max(u_m, 1));
 	uint mt	   = (mb + uint(MT) - 1u) / uint(MT);
@@ -145,6 +149,7 @@ void main(void) {
 }
 #else
 void main(void) {
+	load_lut();
 	uint wgid = gl_WorkGroupID.x + uint(u_wg_base);
 	uint mb	  = uint(max(u_m, 1));
 	g_mi	  = wgid % mb;
@@ -175,10 +180,16 @@ void main(void) {
 	for (int r = 0; r < ROWS; r++)
 		s_acc[r][tid] = acc[r];
 	barrier();
+	for (uint h = uint(WG) / 2u; h > 0u; h >>= 1u) {
+		if (tid < h)
+			for (int r = 0; r < ROWS; r++)
+				s_acc[r][tid] += s_acc[r][tid + h];
+		barrier();
+	}
 	if (tid < uint(ROWS)) {
 		uint row = row0 + tid;
 		if (int(row) < u_n) {
-			float v = reduce_row(tid);
+			float v = s_acc[tid][0];
 			if (u_add_residual == 1)
 				y[g_mi * uint(u_n) + row] = v + res[row];
 			else if (u_add_residual == 2)
