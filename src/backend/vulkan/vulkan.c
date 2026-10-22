@@ -55,35 +55,6 @@ static inline float vk_f32_from_bits(uint32_t b) {
 	return u.v;
 }
 
-static float vk_f16_to_f32(uint16_t h) {
-	uint32_t w			  = (uint32_t)h << 16;
-	uint32_t sign		  = w & 0x80000000u;
-	uint32_t two_w		  = w + w;
-	uint32_t exp_offset	  = 0xE0u << 23;
-	float	 exp_scale	  = 0x1.0p-112f;
-	float	 normalized	  = vk_f32_from_bits((two_w >> 4) + exp_offset) * exp_scale;
-	uint32_t magic_mask	  = 126u << 23;
-	float	 denormalized = vk_f32_from_bits((two_w >> 17) | magic_mask) - 0.5f;
-	uint32_t cutoff		  = 1u << 27;
-	uint32_t bits = two_w < cutoff ? vk_f32_to_bits(denormalized) : vk_f32_to_bits(normalized);
-	return vk_f32_from_bits(sign | bits);
-}
-
-static void vk_softmax_masked(float *scores, int n_valid) {
-	float m = scores[0];
-	for (int i = 1; i < n_valid; i++)
-		if (scores[i] > m)
-			m = scores[i];
-	float sum = 0.0f;
-	for (int i = 0; i < n_valid; i++) {
-		scores[i] = expf(scores[i] - m);
-		sum += scores[i];
-	}
-	float inv = 1.0f / sum;
-	for (int i = 0; i < n_valid; i++)
-		scores[i] *= inv;
-}
-
 enum elem_mode {
 	ELEM_MODE_COPY			   = 0,
 	ELEM_MODE_ADD_INPLACE	   = 1,
@@ -1064,24 +1035,8 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			vk_desc_cache_drop_buf(p, vk_qcore_pipe(p, i), freed);
 		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++) {
 			vk_attn_cache *c = &p->attn_cache[ci];
-			for (int i = 0; i < c->count; i++) {
-				vk_pipeline_set *ps = &c->set[i];
-				if (!ps->pipeline)
-					continue;
-				for (int j = 0; j < VK_DESC_CACHE_CAP; j++) {
-					vk_desc_slot *s = &ps->desc_cache[j];
-					if (!s->valid)
-						continue;
-					for (int k = 0; k < ps->n_bindings; k++) {
-						if (s->bufs[k] == freed) {
-							vk_queue_desc_free(p, s->set);
-							s->valid = 0;
-							s->set	 = VK_NULL_HANDLE;
-							break;
-						}
-					}
-				}
-			}
+			for (int i = 0; i < c->count; i++)
+				vk_desc_cache_drop_buf(p, &c->set[i], freed);
 		}
 		p->dead_buf_count = 0;
 	}
@@ -1282,6 +1237,23 @@ static void vk_ring_invalidate(vk_priv *p, int idx) {
 	vk_dirty_clear(p);
 }
 
+static status_code vk_queue_submit_checked(vk_priv *p, int idx, const VkSubmitInfo *si,
+										   VkFence fence) {
+	p->stats.submits++;
+	VkResult res = vkQueueSubmit(p->queue, 1, si, fence);
+	if (res == VK_SUCCESS)
+		return OK;
+	ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)res, vk_result_str((int)res),
+		  __FILE__, __LINE__, p->last_pipeline_name ? "; last pipeline: " : "",
+		  p->last_pipeline_name ? p->last_pipeline_name : "");
+	if (res == VK_ERROR_DEVICE_LOST)
+		p->device_lost = 1;
+	if (p->debug.abort_on_error)
+		abort();
+	vk_ring_invalidate(p, idx);
+	return ERR_INTERNAL;
+}
+
 static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 	vk_ring_slot *r = &p->ring[idx];
 	if (!r->recording || r->submitted)
@@ -1333,20 +1305,9 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 			.pWaitSemaphores	  = wait_count ? &p->timeline : NULL,
 			.pWaitDstStageMask	  = wait_count ? &wait_stage : NULL,
 		};
-		p->stats.submits++;
-		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, VK_NULL_HANDLE);
-		if (submit_res != VK_SUCCESS) {
-			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
-				  vk_result_str((int)submit_res), __FILE__, __LINE__,
-				  p->last_pipeline_name ? "; last pipeline: " : "",
-				  p->last_pipeline_name ? p->last_pipeline_name : "");
-			if (submit_res == VK_ERROR_DEVICE_LOST)
-				p->device_lost = 1;
-			if (p && p->debug.abort_on_error)
-				abort();
-			vk_ring_invalidate(p, idx);
-			return ERR_INTERNAL;
-		}
+		status_code submit_st = vk_queue_submit_checked(p, idx, &si, VK_NULL_HANDLE);
+		if (submit_st != OK)
+			return submit_st;
 		r->submitted		 = 1;
 		r->recording		 = 0;
 		p->last_signal_value = r->signal_value;
@@ -1369,22 +1330,9 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 		.pCommandBuffers	= &r->cmd,
 	};
 	vkResetFences(p->dev, 1, &p->fence);
-	{
-		p->stats.submits++;
-		VkResult submit_res = vkQueueSubmit(p->queue, 1, &si, p->fence);
-		if (submit_res != VK_SUCCESS) {
-			ERROR("vk: vkQueueSubmit failed: %d (%s) at %s:%d%s%s", (int)submit_res,
-				  vk_result_str((int)submit_res), __FILE__, __LINE__,
-				  p->last_pipeline_name ? "; last pipeline: " : "",
-				  p->last_pipeline_name ? p->last_pipeline_name : "");
-			if (submit_res == VK_ERROR_DEVICE_LOST)
-				p->device_lost = 1;
-			if (p && p->debug.abort_on_error)
-				abort();
-			vk_ring_invalidate(p, idx);
-			return ERR_INTERNAL;
-		}
-	}
+	status_code submit_st = vk_queue_submit_checked(p, idx, &si, p->fence);
+	if (submit_st != OK)
+		return submit_st;
 	r->submitted = 1;
 	r->recording = 0;
 	{
@@ -2012,28 +1960,6 @@ static status_code vk_dispatch(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, i
 							   const void *push, uint32_t push_size, uint32_t groups_x) {
 	uint32_t wmask = (n_bufs > 0) ? (1u << (n_bufs - 1)) : 0;
 	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, 1, wmask);
-}
-
-static status_code vk_dispatch_masked(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
-									  const void *push, uint32_t push_size, uint32_t groups_x,
-									  uint32_t write_mask) {
-	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, 1,
-						  write_mask);
-}
-
-static status_code vk_dispatch_2d(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
-								  const void *push, uint32_t push_size, uint32_t groups_x,
-								  uint32_t groups_y) {
-	uint32_t wmask = (n_bufs > 0) ? (1u << (n_bufs - 1)) : 0;
-	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, groups_y,
-						  wmask);
-}
-
-static status_code vk_dispatch_2d_masked(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
-										 const void *push, uint32_t push_size, uint32_t groups_x,
-										 uint32_t groups_y, uint32_t write_mask) {
-	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, groups_y,
-						  write_mask);
 }
 
 static status_code vk_dispatch_2d_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs,
@@ -4009,19 +3935,6 @@ static size_t vk_kv_layer_off_elems(const vk_kv_handle *h, int layer) {
 	return (size_t)layer * per_layer_elems;
 }
 
-static size_t vk_kv_layer_n_elems(const vk_kv_handle *h, int layer) {
-	if (layer < 0)
-		layer = 0;
-	vk_kv_store *s = (vk_kv_store *)&h->store;
-	if (s->n_kv_layers < 1)
-		return s->per_layer_size / sizeof(uint16_t);
-	if (layer >= s->n_kv_layers)
-		layer = s->n_kv_layers - 1;
-	if (s->layer_bytes)
-		return s->layer_bytes[layer] / sizeof(uint16_t);
-	return s->per_layer_size / sizeof(uint16_t);
-}
-
 static size_t vk_device_local_heap_total(vk_priv *p) {
 	size_t total = 0;
 	for (uint32_t i = 0; i < p->mem_props.memoryHeapCount; i++) {
@@ -5035,9 +4948,9 @@ static status_code vk_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, 
 							rope_sin_base, 1);
 }
 
-static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
+static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_ctx, int m) {
 	vk_priv *p		= self->priv;
-	int		 needed = n_heads * n_ctx;
+	int		 needed = m * n_heads * n_ctx;
 	if (needed <= p->attn_scores_cap)
 		return OK;
 
@@ -5054,6 +4967,10 @@ static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 		return s;
 	p->attn_scores_cap = needed;
 	return OK;
+}
+
+static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
+	return vk_ensure_scores_buf_batch(self, n_heads, n_ctx, 1);
 }
 
 #define FLASH_MAX_DPL 16
@@ -5335,9 +5252,11 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 			int32_t	 attn_start;
 		} push = {(uint32_t)layer_off, pos, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
 				  attn_start};
-		uint32_t groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
-		vk_buf	*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
-		return vk_dispatch(p, flash_ps, bufs, 4, &push, sizeof(push), groups);
+		uint32_t	 groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
+		vk_buf		*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
+		VkDeviceSize offs[4] = {q->offset, 0, 0, out->offset};
+		return vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
+							  1u << 3);
 	}
 
 	status_code s = vk_ensure_scores_buf(self, n_heads, n_ctx);
@@ -5355,7 +5274,9 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 	vk_pipeline_set *ps		 = NULL;
 	if (vk_ensure_attention_pipeline(p, head_dim, &ps) != OK)
 		return ERR_UNSUPPORTED;
-	return vk_dispatch_masked(p, ps, bufs, 5, &push, sizeof(push), (uint32_t)n_heads, 0x18);
+	VkDeviceSize offs[5] = {q->offset, 0, 0, 0, out->offset};
+	return vk_dispatch_ex(p, ps, bufs, offs, NULL, 5, &push, sizeof(push), (uint32_t)n_heads, 1,
+						  0x18);
 }
 
 static status_code vk_attention(backend *self, const buffer *q, const buffer *k_cache,
@@ -6246,9 +6167,10 @@ static status_code vk_rmsnorm_per_head_batch(backend *self, const buffer *x, con
 		int32_t head_dim;
 		float	eps;
 		int32_t m;
-	} push			= {n_heads, head_dim, eps, m};
-	vk_buf *bufs[3] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(y)};
-	return vk_dispatch_2d_ex(p, ps, bufs, NULL, NULL, 3, &push, sizeof(push), (uint32_t)n_heads,
+	} push				 = {n_heads, head_dim, eps, m};
+	vk_buf		*bufs[3] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(y)};
+	VkDeviceSize offs[3] = {x->offset, w->offset, y->offset};
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 3, &push, sizeof(push), (uint32_t)n_heads,
 							 (uint32_t)m, 1u << 2);
 }
 
@@ -6265,9 +6187,10 @@ static status_code vk_rmsnorm_noweight_per_head_batch(backend *self, const buffe
 		int32_t head_dim;
 		float	eps;
 		int32_t m;
-	} push			= {n_heads, head_dim, eps, m};
-	vk_buf *bufs[2] = {as_vkbuf(x), as_vkbuf(y)};
-	return vk_dispatch_2d_ex(p, ps, bufs, NULL, NULL, 2, &push, sizeof(push), (uint32_t)n_heads,
+	} push				 = {n_heads, head_dim, eps, m};
+	vk_buf		*bufs[2] = {as_vkbuf(x), as_vkbuf(y)};
+	VkDeviceSize offs[2] = {x->offset, y->offset};
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 2, &push, sizeof(push), (uint32_t)n_heads,
 							 (uint32_t)m, 1u << 1);
 }
 
@@ -6619,7 +6542,7 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 		int32_t n_heads, head_dim, pos, has_ff, neox, m;
 	} push				  = {n_heads, head_dim, pos_start, 0, self->rope_neox, m};
 	vk_buf		*bufs[4]  = {as_vkbuf(vec), t.cos_b, t.sin_b, t.cos_b};
-	VkDeviceSize offs[4]  = {0, t.cos_off, t.sin_off, 0};
+	VkDeviceSize offs[4]  = {vec->offset, t.cos_off, t.sin_off, 0};
 	uint32_t	 groups_x = (uint32_t)((n_heads * half + 63) / 64);
 	return vk_dispatch_2d_ex(p, &p->p_rope_ext_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)m, 0x1);
@@ -6653,26 +6576,6 @@ static status_code vk_qk_norm_rope(backend *self, buffer *q, buffer *k, const bu
 							t.cos_off,	 t.sin_off};
 	return vk_dispatch_2d_ex(p, &p->p_qk_norm_rope, bufs, offs, NULL, 6, &push, sizeof(push),
 							 (uint32_t)(n_heads + n_kv_heads), (uint32_t)m, 0x3);
-}
-
-static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_ctx, int m) {
-	vk_priv *p		= self->priv;
-	int		 needed = m * n_heads * n_ctx;
-	if (needed <= p->attn_scores_cap)
-		return OK;
-	if (p->attn_scores_buf.handle) {
-		vk_drain_gpu(p);
-		vk_free_buffer(p, (vk_buf *)p->attn_scores_buf.handle);
-		free(p->attn_scores_buf.handle);
-		p->attn_scores_buf.handle = NULL;
-	}
-
-	status_code s =
-		vk_buffer_alloc_scratch(self, (size_t)needed * sizeof(float), &p->attn_scores_buf);
-	if (s != OK)
-		return s;
-	p->attn_scores_cap = needed;
-	return OK;
 }
 
 static status_code vk_ensure_flash_pipeline_batch(vk_priv *p, int head_dim, int n_groups,

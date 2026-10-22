@@ -441,8 +441,8 @@ status_code context_init(context *c, const config *cfg) {
 	context_log_devices(c);
 
 	compute_scratch_init(&c->scratch);
-	c->scratch.interrupt = &c->interrupt;
-	c->scratch.backend	 = c->backend;
+	c->scratch.interrupt	 = &c->interrupt;
+	c->scratch.model.backend = c->backend;
 	sampler_init(&c->samp, cfg->seed);
 	sampler_set_vocab(&c->samp, c->m.vocab_size);
 	c->fed_ids.p   = xmalloc((size_t)n_ctx * sizeof(int32_t));
@@ -1341,6 +1341,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	if (prof_was_on) {
 		profile_set_wall(&c->scratch.prof, pf.us);
 		profile_print(&c->scratch.prof, "prefill", stderr);
+		recipe_exec_profile_report(c->m.recipe, "prefill", stderr);
 		profile_reset(&c->scratch.prof);
 	}
 
@@ -1364,6 +1365,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	if (prof_was_on) {
 		profile_set_wall(&c->scratch.prof, decode_us);
 		profile_print(&c->scratch.prof, "decode", stderr);
+		recipe_exec_profile_report(c->m.recipe, "decode", stderr);
 	}
 
 	send_generation_end(c, generated, pf.tps, decode_tps, ttft_ms);

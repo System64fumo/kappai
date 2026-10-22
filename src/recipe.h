@@ -33,6 +33,18 @@
 
 #define RECIPE_SLOT_NONE 0xFF
 
+enum {
+	BS_SIZE_NONE = 0,
+	BS_SIZE_ATTN_BUF,
+	BS_SIZE_Q_OUT,
+	BS_SIZE_KV_OUT,
+	BS_SIZE_INTER,
+	BS_SIZE_INTER_X2,
+	BS_SIZE_ACT,
+	BS_SIZE_HC,
+	BS_SIZE_HC_COEF,
+};
+
 #define OP_TOUCH_NONE 0
 #define OP_TOUCH_IN0 1
 #define OP_TOUCH_IN1 2
@@ -46,6 +58,7 @@
 #define OP_TOUCH_MAX 6
 
 #define RECIPE_NO_WEIGHT WIDX_NONE
+#define RECIPE_COALESCE_MAX 4
 
 struct model;
 struct kvcache;
@@ -246,6 +259,7 @@ typedef struct {
 	uint8_t	  out;
 	uint8_t	  w_idx;
 	uint8_t	  coalesce_run_len;
+	uint8_t	  fuse_next;
 	stage	  stage;
 	op_params u;
 } recipe_op;
@@ -300,10 +314,9 @@ typedef struct model_recipe {
 	layer_ctx_entry *layer_ctx;
 
 	struct model_plan *plan;
-
-	int max_intermediate;
-	int max_head_dim;
-	int max_kv_heads;
+	struct cg_set	  *graphs;
+	struct exec_plan  *exec;
+	struct mem_plan	  *mem;
 
 	uint32_t bs_slot_mask;
 
@@ -330,6 +343,8 @@ typedef struct {
 	int						li, flash_attn;
 	backend				   *layer_be;
 	weight_ref			  **wtab_row;
+	const layer_ctx_entry  *lc;
+	float				   *logits_out;
 } exec_ctx;
 
 typedef model_recipe *(*recipe_builder_fn)(const struct model *m);
@@ -402,13 +417,31 @@ int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t 
 typedef struct model_plan model_plan;
 
 const recipe_op *recipe_layer_ops(const model_recipe *r, int li);
-const char		*recipe_op_missing_fn(const backend *a, op_kind kind);
-int				 recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
-								 int *n_writes);
-void			 recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops);
-void			 recipe_fuse_output_scale(recipe_op *ops, int n_ops, const struct model *m, int li);
-void			 recipe_refine_matmul_stages(recipe_op *ops, int n_ops);
-void			 recipe_batch_slot_mask(model_recipe *r, const struct model *m);
+typedef enum {
+	CG_STATE_KV		   = 1 << 0,
+	CG_STATE_MLA	   = 1 << 1,
+	CG_STATE_RECURRENT = 1 << 2,
+	CG_STATE_PLE	   = 1 << 3,
+	CG_STATE_LOGITS	   = 1 << 4,
+} cg_state;
+
+const char *recipe_op_name(op_kind k);
+uint8_t		recipe_op_state_reads(op_kind k);
+uint8_t		recipe_op_state_writes(op_kind k);
+weight_ref *recipe_resolve_weight_ref(const struct model *m, int li, uint8_t w_idx);
+int			recipe_slot_batch_backed(uint8_t slot);
+void		recipe_exec_profile_report(const model_recipe *r, const char *label, FILE *fp);
+int			recipe_slot_size_kind(uint8_t slot);
+uint32_t	recipe_op_batch_extra_mask(op_kind k);
+const char *recipe_op_missing_fn(const backend *a, op_kind kind);
+int			recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
+							int *n_writes);
+void		recipe_coalesce_matmul_runs(recipe_op *ops, int n_ops);
+void		recipe_fuse_output_scale(recipe_op *ops, int n_ops, const struct model *m, int li);
+void		recipe_refine_matmul_stages(recipe_op *ops, int n_ops);
+stage		recipe_matmul_substage(uint8_t w_idx);
+int			recipe_op_has_matmul_substage(op_kind k);
+void		recipe_batch_slot_mask(model_recipe *r, const struct model *m);
 
 void recipe_build_post_ops(model_recipe *r, const struct model *m);
 void recipe_build_pre_ops(model_recipe *r, const struct model *m);

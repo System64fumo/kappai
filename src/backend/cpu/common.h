@@ -7,6 +7,10 @@
 #include "threadpool.h"
 #include <stdlib.h>
 
+#define CPU_ELEMWISE_MIN_PER_THREAD 4096
+#define MLA_KROT_PARALLEL_MIN_POS 64
+#define ATTN_BITREV_MIN_M 8
+
 #define CPU_BACKEND_CAPS                                                                           \
 	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
@@ -168,6 +172,41 @@ static inline size_t cpu_kv_layer_rows(const cpu_priv *p, int layer, int n_ctx) 
 	return (size_t)n_ctx;
 }
 
+static inline size_t cpu_kv_layer_base(const cpu_priv *p, int layer, size_t layer_stride,
+									   size_t elem_bytes) {
+	if (p->kv_layer_off)
+		return p->kv_layer_off[layer] / elem_bytes;
+	return (size_t)layer * layer_stride;
+}
+
+typedef struct {
+	int			hd_stride;
+	size_t		kvh_stride;
+	const void *k_base;
+	const void *v_base;
+} cpu_kv_layer_view;
+
+static inline cpu_kv_layer_view cpu_kv_layer_view_get(const cpu_priv *p, const buffer *k_cache,
+													  const buffer *v_cache, int layer,
+													  int n_kv_heads, int head_dim, size_t rows) {
+	cpu_kv_layer_view v;
+	if (p->kv_quant == KV_QUANT_Q8_0) {
+		size_t n_blocks = ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+		v.hd_stride		= (int)(n_blocks * KV_Q8_0_BLOCK_BYTES);
+		v.kvh_stride	= rows * (size_t)v.hd_stride;
+		size_t base		= cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * v.kvh_stride, 1);
+		v.k_base		= (const uint8_t *)k_cache->handle + base;
+		v.v_base		= (const uint8_t *)v_cache->handle + base;
+		return v;
+	}
+	v.hd_stride	 = head_dim;
+	v.kvh_stride = rows * (size_t)head_dim;
+	size_t base	 = cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * v.kvh_stride, sizeof(uint16_t));
+	v.k_base	 = (const uint16_t *)k_cache->handle + base;
+	v.v_base	 = (const uint16_t *)v_cache->handle + base;
+	return v;
+}
+
 static inline void cpu_kv_window_to_slots_base(size_t b, int *attn_start, int *n_pos) {
 	if (!b)
 		return;
@@ -319,6 +358,34 @@ typedef struct {
 	kv_quant_type	kv_quant;
 	size_t			kv_rows, kv_base;
 } cpu_attn_batch_job;
+typedef struct {
+	const float *g, *u;
+	float		*o;
+} cpu_ffn_act_args;
+
+typedef struct {
+	const float *qf;
+	float		*outf;
+	const float *layer_c;
+	const float *k_b;
+	const float *v_b;
+	const float *k_pe_rot_all;
+	const float *rope_cos_base;
+	const float *rope_sin_base;
+	int			 qk_head, qk_rope, qk_nope, v_head, kv_lora, n_pos, half_rope, pos;
+	float		 scale;
+} cpu_mla_job;
+
+typedef struct {
+	const float *layer_c;
+	float		*k_pe_rot_all;
+	const float *rope_cos_base;
+	const float *rope_sin_base;
+	int			 total_dim;
+	int			 kv_lora;
+	int			 qk_rope;
+	int			 half_rope;
+} cpu_mla_krot_job;
 
 typedef struct {
 	const float *g;

@@ -1,11 +1,11 @@
 #include "plan.h"
+#include "capability.h"
+#include "graph.h"
 #include "log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define PLAN_MAX_VARIANTS 512
 
 typedef struct {
 	op_kind kind;
@@ -83,49 +83,36 @@ static void plan_validate(const model_plan *p) {
 	}
 }
 
-static const struct {
-	op_kind		kind;
-	const char *name;
-} HOST_ONLY_OPS[] = {
-	{OP_SHORTCONV, "shortconv"},
-	{OP_MOE_ROUTER, "moe_router_topk"},
-};
-
-static void plan_fallback_scan(model_plan *p, backend *a, const struct model *m) {
-	bool scanned[OP_KIND_COUNT]		   = {false};
-	bool host_only_seen[OP_KIND_COUNT] = {false};
+static void plan_scan_backend(model_plan *p, const struct model *m, backend *be,
+							  int layer_section) {
+	bool seen[OP_KIND_COUNT] = {false};
 	for (int i = 0; i < p->n_total; i++) {
-		op_kind k = p->nodes[i].kind;
-		for (size_t h = 0; h < ARRAY_LEN(HOST_ONLY_OPS); h++) {
-			if (HOST_ONLY_OPS[h].kind != k || host_only_seen[k])
-				continue;
-			host_only_seen[k] = true;
-			backend_report_host_fallback(a, HOST_ONLY_OPS[h].name, HFB_OP_NOT_NATIVE,
-										 "no device implementation; executes on the host");
-			p->n_fallbacks++;
-		}
-		if (k == OP_PLE_BUILD) {
-			if (!scanned[k]) {
-				scanned[k] = true;
-				if (!ple_build_dev_path_ok(a, (struct model *)m, 1))
-					backend_report_host_fallback(a, "ple_build", HFB_WEIGHT_TYPE, NULL);
-			}
+		op_kind kind = p->nodes[i].kind;
+		if ((p->nodes[i].section == 1) != layer_section || seen[kind])
 			continue;
-		}
-		if (k == OP_FFN_ACTIVATE_FUSED && !backend_has_cap(a, BCAP_IS_HOST) &&
-			!a->ffn_activate_fused_batch) {
-			if (!scanned[k])
-				backend_report_host_fallback(
-					a, "ffn_activate_fused", HFB_BATCH_DESIGN,
-					"batch prefill stages gate/up activation through host memory");
-			scanned[k] = true;
-		}
-		const char *missing = recipe_op_missing_fn(a, k);
-		if (!missing || scanned[k])
+		seen[kind]		   = true;
+		cap_resolution res = cap_resolve(be, m, kind, NULL, 1);
+		if (res.impl == CAP_NATIVE)
 			continue;
-		scanned[k] = true;
-		backend_report_host_fallback(a, missing, HFB_OP_NOT_NATIVE, NULL);
 		p->n_fallbacks++;
+		if (!graph_enabled())
+			cap_report(be, &res);
+	}
+}
+
+static void plan_fallback_scan(model_plan *p, const struct model *m) {
+	plan_scan_backend(p, m, m->backend, 0);
+	if (!m->mixed_backend_mode) {
+		plan_scan_backend(p, m, m->backend, 1);
+		return;
+	}
+	for (int li = 0; li < m->n_layers; li++) {
+		backend *be	   = model_layer_backend(m, li);
+		int		 first = 1;
+		for (int prev = 0; prev < li && first; prev++)
+			first = model_layer_backend(m, prev) != be;
+		if (first)
+			plan_scan_backend(p, m, be, 1);
 	}
 }
 
@@ -157,10 +144,8 @@ static void plan_log(const model_plan *p, const struct model *m) {
 
 static void plan_build_all(model_plan *p, const model_recipe *r, const struct model *m) {
 	int n_variants = r->per_layer_ops ? m->n_layers : 1;
-	if (n_variants > PLAN_MAX_VARIANTS)
-		n_variants = PLAN_MAX_VARIANTS;
-	p->n_variants = n_variants;
-	size_t est	  = (size_t)n_variants * (r->n_pre_ops + r->layer.n_ops + r->n_post_ops);
+	p->n_variants  = n_variants;
+	size_t est	   = (size_t)n_variants * (r->n_pre_ops + r->layer.n_ops + r->n_post_ops);
 	if (est == 0)
 		return;
 	p->nodes = xmalloc(est * sizeof(plan_node));
@@ -234,8 +219,6 @@ int plan_fuse_residuals(model_recipe *r, const struct model *m) {
 		return 0;
 	int n_fused	   = 0;
 	int n_variants = r->per_layer_ops ? m->n_layers : 1;
-	if (n_variants > PLAN_MAX_VARIANTS)
-		n_variants = PLAN_MAX_VARIANTS;
 	for (int v = 0; v < n_variants; v++) {
 		backend *bv = m->mixed_backend_mode ? model_layer_backend(m, v) : m->backend;
 		if (!r->per_layer_ops && m->mixed_backend_mode)
@@ -260,7 +243,7 @@ void plan_attach(model_recipe *r, const struct model *m) {
 	model_plan *p = xcalloc(1, sizeof(model_plan));
 	plan_build_all(p, r, m);
 	plan_validate(p);
-	plan_fallback_scan(p, m->backend, m);
+	plan_fallback_scan(p, m);
 	plan_log(p, m);
 	r->plan = p;
 }

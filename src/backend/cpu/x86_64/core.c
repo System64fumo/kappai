@@ -7,41 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CPU_ELEMWISE_MIN_PER_THREAD 4096
-#define MLA_KROT_PARALLEL_MIN_POS 64
-
-#define cpu_attn_job_avx cpu_attn_job
-#define cpu_attn_batch_job_avx cpu_attn_batch_job
-
-typedef struct {
-	const float *g, *u;
-	float		*o;
-} cpu_ffn_act_args;
-
-typedef struct {
-	const float *qf;
-	float		*outf;
-	const float *layer_c;
-	const float *k_b;
-	const float *v_b;
-	const float *k_pe_rot_all;
-	const float *rope_cos_base;
-	const float *rope_sin_base;
-	int			 qk_head, qk_rope, qk_nope, v_head, kv_lora, n_pos, half_rope, pos;
-	float		 scale;
-} cpu_mla_job_avx;
-
-typedef struct {
-	const float *layer_c;
-	float		*k_pe_rot_all;
-	const float *rope_cos_base;
-	const float *rope_sin_base;
-	int			 total_dim;
-	int			 kv_lora;
-	int			 qk_rope;
-	int			 half_rope;
-} cpu_mla_krot_job;
-
 typedef struct {
 	const float *g, *u;
 	float		*o;
@@ -66,12 +31,11 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 		uint8_t *kd_base	  = (uint8_t *)k->handle;
 		uint8_t *vd_base	  = (uint8_t *)v->handle;
 		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t layer_base =
-				p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
-			size_t pos_off = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
-											 kvh_stride, block_stride, n_active) *
-							 block_stride;
-			size_t off	   = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
+			size_t layer_base = cpu_kv_layer_base(p, layer, layer_stride, 1);
+			size_t pos_off	  = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
+												kvh_stride, block_stride, n_active) *
+								block_stride;
+			size_t off		  = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
 			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
 								 vf + ((size_t)kvh * head_dim), head_dim);
 		}
@@ -84,8 +48,7 @@ status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, 
 	size_t	  layer_stride = (size_t)n_kv_heads * kvh_stride;
 
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-											: ((size_t)layer * layer_stride);
+		size_t layer_base = cpu_kv_layer_base(p, layer, layer_stride, sizeof(uint16_t));
 		size_t pos_off =
 			cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base * sizeof(uint16_t),
 							kvh_stride * sizeof(uint16_t), (size_t)hd_stride * sizeof(uint16_t),
@@ -1142,8 +1105,8 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 }
 
 static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_avx *j		 = ctx;
-	float			 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
+	cpu_attn_job *j		 = ctx;
+	float		 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int h = begin; h < end; h++) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
@@ -1163,8 +1126,8 @@ static void cpu_attn_head_chunk_avx(int begin, int end, int tid, void *ctx) {
 }
 
 static void cpu_attn_kvh_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_job_avx *j		 = ctx;
-	float			 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
+	cpu_attn_job *j		 = ctx;
+	float		 *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, j->n_pos);
 	for (int kvh = begin; kvh < end; kvh++) {
 		int h_start = kvh * j->n_groups;
 		int h_end	= h_start + j->n_groups;
@@ -1224,9 +1187,8 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 		size_t elem_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
 		size_t kvh_stride  = cpu_kv_layer_rows(p, layer, n_ctx) * elem_stride;
 
-		size_t layer_stride = (size_t)n_kv_heads * kvh_stride;
-		size_t layer_base =
-			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
+		size_t		   layer_stride = (size_t)n_kv_heads * kvh_stride;
+		size_t		   layer_base	= cpu_kv_layer_base(p, layer, layer_stride, 1);
 		const uint8_t *kl_base =
 			(const uint8_t *)k_cache->handle + layer_base + ((size_t)attn_start * elem_stride);
 		const uint8_t *vl_base =
@@ -1234,20 +1196,20 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 
 		if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 			(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
-			cpu_attn_job_avx job = {.kl_base	= (const uint16_t *)kl_base,
-									.vl_base	= (const uint16_t *)vl_base,
-									.qf			= qf,
-									.outf		= outf,
-									.n_groups	= n_groups,
-									.head_dim	= head_dim,
-									.hd_stride	= (int)elem_stride,
-									.n_pos		= n_pos,
-									.flash_attn = flash_attn,
-									.n_heads	= n_heads,
-									.scale		= scale,
-									.kvh_stride = kvh_stride,
-									.p			= p,
-									.kv_quant	= KV_QUANT_Q8_0};
+			cpu_attn_job job = {.kl_base	= (const uint16_t *)kl_base,
+								.vl_base	= (const uint16_t *)vl_base,
+								.qf			= qf,
+								.outf		= outf,
+								.n_groups	= n_groups,
+								.head_dim	= head_dim,
+								.hd_stride	= (int)elem_stride,
+								.n_pos		= n_pos,
+								.flash_attn = flash_attn,
+								.n_heads	= n_heads,
+								.scale		= scale,
+								.kvh_stride = kvh_stride,
+								.p			= p,
+								.kv_quant	= KV_QUANT_Q8_0};
 			if (n_groups > 1)
 				tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk_avx, &job);
 			else
@@ -1272,8 +1234,7 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 	size_t kvh_stride = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
 
 	size_t layer_stride = (size_t)n_kv_heads * kvh_stride;
-	size_t layer_base	= p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-										  : ((size_t)layer * layer_stride);
+	size_t layer_base	= cpu_kv_layer_base(p, layer, layer_stride, sizeof(uint16_t));
 
 	uint16_t *kl_base = (uint16_t *)k_cache->handle + layer_base;
 	uint16_t *vl_base = (uint16_t *)v_cache->handle + layer_base;
@@ -1282,20 +1243,20 @@ static status_code cpu_attention_impl(backend *self, const buffer *q, const buff
 
 	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
-		cpu_attn_job_avx job = {.kl_base	= kl_base,
-								.vl_base	= vl_base,
-								.qf			= qf,
-								.outf		= outf,
-								.n_groups	= n_groups,
-								.head_dim	= head_dim,
-								.hd_stride	= hd_stride,
-								.n_pos		= n_pos,
-								.flash_attn = flash_attn,
-								.n_heads	= n_heads,
-								.scale		= scale,
-								.kvh_stride = kvh_stride,
-								.p			= p,
-								.kv_quant	= KV_QUANT_F16};
+		cpu_attn_job job = {.kl_base	= kl_base,
+							.vl_base	= vl_base,
+							.qf			= qf,
+							.outf		= outf,
+							.n_groups	= n_groups,
+							.head_dim	= head_dim,
+							.hd_stride	= hd_stride,
+							.n_pos		= n_pos,
+							.flash_attn = flash_attn,
+							.n_heads	= n_heads,
+							.scale		= scale,
+							.kvh_stride = kvh_stride,
+							.p			= p,
+							.kv_quant	= KV_QUANT_F16};
 		if (n_groups > 1)
 			tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk_avx, &job);
 		else
@@ -1335,8 +1296,8 @@ status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_ca
 }
 
 static void cpu_attn_batch_chunk_avx(int begin, int end, int tid, void *ctx) {
-	cpu_attn_batch_job_avx *j			= ctx;
-	int						need_scores = j->pos_start + j->m;
+	cpu_attn_batch_job *j			= ctx;
+	int					need_scores = j->pos_start + j->m;
 	if (j->kv_rows && (size_t)need_scores > j->kv_rows)
 		need_scores = (int)j->kv_rows;
 	float *scores = j->flash_attn ? NULL : cpu_grow_scores(j->p, tid, need_scores);
@@ -1386,50 +1347,29 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, cons
 		return ERR_INVALID_ARG;
 	int n_groups = (n_heads + n_active - 1) / n_active;
 
-	int			hd_stride;
-	size_t		layer_stride;
-	size_t		kvh_stride;
-	const void *kl_base_raw;
-	const void *vl_base_raw;
-	size_t		rows = cpu_kv_layer_rows(p, layer, n_ctx);
-	size_t		base = p->kv_base_pos ? p->kv_base_pos[layer] : 0;
-	if (p->kv_quant == KV_QUANT_Q8_0) {
-		size_t n_blocks = ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		hd_stride		= (int)(n_blocks * KV_Q8_0_BLOCK_BYTES);
-		layer_stride	= (size_t)n_kv_heads * rows * (size_t)hd_stride;
-		kvh_stride		= rows * (size_t)hd_stride;
-		size_t layer_base =
-			p->kv_layer_off ? p->kv_layer_off[layer] : ((size_t)layer * layer_stride);
-		kl_base_raw = (const uint8_t *)k_cache->handle + layer_base;
-		vl_base_raw = (const uint8_t *)v_cache->handle + layer_base;
-	} else {
-		hd_stride		  = head_dim;
-		layer_stride	  = (size_t)n_kv_heads * rows * hd_stride;
-		kvh_stride		  = rows * hd_stride;
-		size_t layer_base = p->kv_layer_off ? p->kv_layer_off[layer] / sizeof(uint16_t)
-											: ((size_t)layer * layer_stride);
-		kl_base_raw		  = (const uint16_t *)k_cache->handle + layer_base;
-		vl_base_raw		  = (const uint16_t *)v_cache->handle + layer_base;
-	}
+	size_t			  rows = cpu_kv_layer_rows(p, layer, n_ctx);
+	size_t			  base = p->kv_base_pos ? p->kv_base_pos[layer] : 0;
+	cpu_kv_layer_view view =
+		cpu_kv_layer_view_get(p, k_cache, v_cache, layer, n_kv_heads, head_dim, rows);
 
-	cpu_attn_batch_job_avx job = {.kl_base		  = kl_base_raw,
-								  .vl_base		  = vl_base_raw,
-								  .qf			  = (const float *)cpu_ptr(q),
-								  .outf			  = (float *)cpu_ptr(out),
-								  .n_groups		  = n_groups,
-								  .head_dim		  = head_dim,
-								  .hd_stride	  = hd_stride,
-								  .n_heads		  = n_heads,
-								  .pos_start	  = pos_start,
-								  .m			  = m,
-								  .sliding_window = sliding_window,
-								  .flash_attn	  = flash_attn,
-								  .scale		  = scale,
-								  .kvh_stride	  = kvh_stride,
-								  .p			  = p,
-								  .kv_quant		  = p->kv_quant,
-								  .kv_rows		  = rows,
-								  .kv_base		  = base};
+	cpu_attn_batch_job job = {.kl_base		  = view.k_base,
+							  .vl_base		  = view.v_base,
+							  .qf			  = (const float *)cpu_ptr(q),
+							  .outf			  = (float *)cpu_ptr(out),
+							  .n_groups		  = n_groups,
+							  .head_dim		  = head_dim,
+							  .hd_stride	  = view.hd_stride,
+							  .n_heads		  = n_heads,
+							  .pos_start	  = pos_start,
+							  .m			  = m,
+							  .sliding_window = sliding_window,
+							  .flash_attn	  = flash_attn,
+							  .scale		  = scale,
+							  .kvh_stride	  = view.kvh_stride,
+							  .p			  = p,
+							  .kv_quant		  = p->kv_quant,
+							  .kv_rows		  = rows,
+							  .kv_base		  = base};
 
 	int total		= n_heads * m;
 	int cur_tid		= tpool_current_tid();
@@ -1838,7 +1778,7 @@ int32_t cpu_argmax_f32(const float *restrict logits, int vocab) {
 
 static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 	(void)tid;
-	cpu_mla_job_avx *j = ctx;
+	cpu_mla_job *j = ctx;
 
 	float q_h[HEAD_DIM_MAX];
 	float q_absorbed[HEAD_DIM_MAX];
@@ -2055,23 +1995,23 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	for (int i = 0; i < n_heads * v_head; i++)
 		outf[i] = 0.0f;
 
-	cpu_mla_job_avx job = {.qf			  = qf,
-						   .outf		  = outf,
-						   .layer_c		  = layer_c,
-						   .k_b			  = k_b,
-						   .v_b			  = v_b,
-						   .k_pe_rot_all  = k_pe_rot_all,
-						   .rope_cos_base = rope_cos_base,
-						   .rope_sin_base = rope_sin_base,
-						   .qk_head		  = qk_head,
-						   .qk_rope		  = qk_rope,
-						   .qk_nope		  = qk_nope,
-						   .v_head		  = v_head,
-						   .kv_lora		  = kv_lora,
-						   .n_pos		  = n_pos,
-						   .half_rope	  = half_rope,
-						   .pos			  = pos,
-						   .scale		  = scale};
+	cpu_mla_job job = {.qf			  = qf,
+					   .outf		  = outf,
+					   .layer_c		  = layer_c,
+					   .k_b			  = k_b,
+					   .v_b			  = v_b,
+					   .k_pe_rot_all  = k_pe_rot_all,
+					   .rope_cos_base = rope_cos_base,
+					   .rope_sin_base = rope_sin_base,
+					   .qk_head		  = qk_head,
+					   .qk_rope		  = qk_rope,
+					   .qk_nope		  = qk_nope,
+					   .v_head		  = v_head,
+					   .kv_lora		  = kv_lora,
+					   .n_pos		  = n_pos,
+					   .half_rope	  = half_rope,
+					   .pos			  = pos,
+					   .scale		  = scale};
 
 	if (p->pool && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)(qk_head + v_head) >= 4096) {

@@ -1,11 +1,12 @@
 #include "compute.h"
 #include "log.h"
+#include "mem_plan.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define compute_model_changed(s, m, n_ctx)                                                         \
-	((s)->last_model != (m) || (s)->allocated_n_ctx < (n_ctx))
+	((s)->model.last_model != (m) || (s)->model.allocated_n_ctx < (n_ctx))
 
 void compute_scratch_init(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
@@ -73,9 +74,9 @@ static void free_buf(buffer *b) {
 }
 
 static void scratch_free_device_buffers(compute_scratch *s) {
-	free_buf(&s->ple_proj_norm_w);
+	free_buf(&s->model.ple_proj_norm_w);
 	for (int i = 0; i < MOE_STAGE_RING; i++)
-		free_buf(&s->moe_stage[i]);
+		free_buf(&s->moe.stage[i]);
 
 	for (int d = 0; d < s->n_mirrors; d++) {
 		scratch_mirror *mir = &s->mirror[d];
@@ -86,56 +87,56 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 		}
 		mir->be = NULL;
 	}
-	s->n_mirrors	   = 0;
-	s->mirrors_alloced = 0;
-	s->active_backend  = NULL;
-	s->active_dev	   = 0;
-	free(s->transfer_buf);
-	s->transfer_buf		= NULL;
-	s->transfer_buf_cap = 0;
+	s->n_mirrors		  = 0;
+	s->mirrors_alloced	  = 0;
+	s->run.active_backend = NULL;
+	s->run.active_dev	  = 0;
+	free(s->run.transfer_buf);
+	s->run.transfer_buf		= NULL;
+	s->run.transfer_buf_cap = 0;
 	free(s->logits_host);
 	s->logits_host = NULL;
 }
 
 static void scratch_free_host_buffers(compute_scratch *s) {
-	free(s->rope_cos);
-	free(s->rope_sin);
-	free(s->rope_cos_swa);
-	free(s->rope_sin_swa);
-	free(s->ple_inp_host);
-	s->ple_inp_host = NULL;
-	free(s->cur_host);
-	s->cur_host = NULL;
-	free(s->out_proj_host);
-	s->out_proj_host = NULL;
-	free(s->vf_host);
-	s->vf_host = NULL;
-	free(s->xf_host);
-	s->xf_host				   = NULL;
-	s->small_host_dim		   = 0;
-	s->small_host_intermediate = 0;
-	s->small_host_kv_out	   = 0;
-	free(s->ple_proj_host.p);
-	free(s->inpL_host.p);
-	s->ple_proj_host.p	 = NULL;
-	s->ple_proj_host.cap = 0;
-	s->inpL_host.p		 = NULL;
-	s->inpL_host.cap	 = 0;
-	free(s->moe_all_scratch.p);
-	free(s->moe_all_outs.p);
-	free(s->moe_scratch.p);
-	free(s->moe_xb_f.p);
-	free(s->moe_shared_y.p);
-	s->moe_all_scratch.p = NULL;
-	s->moe_all_outs.p	 = NULL;
-	s->moe_scratch.p	 = NULL;
-	s->moe_xb_f.p		 = NULL;
-	s->moe_shared_y.p	 = NULL;
-	free(s->moe_slot_buf);
-	s->moe_slot_buf = NULL;
-	free(s->moe_slot_dev);
-	s->moe_slot_dev = NULL;
-	expert_dev_scratch_release(&s->expert_dev);
+	free(s->model.rope_cos);
+	free(s->model.rope_sin);
+	free(s->model.rope_cos_swa);
+	free(s->model.rope_sin_swa);
+	free(s->ple.inp_host);
+	s->ple.inp_host = NULL;
+	free(s->run.cur_host);
+	s->run.cur_host = NULL;
+	free(s->run.out_proj_host);
+	s->run.out_proj_host = NULL;
+	free(s->run.vf_host);
+	s->run.vf_host = NULL;
+	free(s->run.xf_host);
+	s->run.xf_host				   = NULL;
+	s->run.small_host_dim		   = 0;
+	s->run.small_host_intermediate = 0;
+	s->run.small_host_kv_out	   = 0;
+	free(s->ple.proj_host.p);
+	free(s->ple.inpL_host.p);
+	s->ple.proj_host.p	 = NULL;
+	s->ple.proj_host.cap = 0;
+	s->ple.inpL_host.p	 = NULL;
+	s->ple.inpL_host.cap = 0;
+	free(s->moe.all_scratch.p);
+	free(s->moe.all_outs.p);
+	free(s->moe.scratch.p);
+	free(s->moe.xb_f.p);
+	free(s->moe.shared_y.p);
+	s->moe.all_scratch.p = NULL;
+	s->moe.all_outs.p	 = NULL;
+	s->moe.scratch.p	 = NULL;
+	s->moe.xb_f.p		 = NULL;
+	s->moe.shared_y.p	 = NULL;
+	free(s->moe.slot_buf);
+	s->moe.slot_buf = NULL;
+	free(s->moe.slot_dev);
+	s->moe.slot_dev = NULL;
+	expert_dev_scratch_release(&s->moe.expert_dev);
 
 #define FREE_FLOAT_BUF(field)                                                                      \
 	do {                                                                                           \
@@ -143,15 +144,16 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 		s->field.p	 = NULL;                                                                       \
 		s->field.cap = 0;                                                                          \
 	} while (0)
-	FREE_FLOAT_BUF(hybrid_host);
-	FREE_FLOAT_BUF(hybrid_host2);
-	FREE_FLOAT_BUF(hybrid_host3);
-	FREE_FLOAT_BUF(gdn_ws_host);
-	FREE_FLOAT_BUF(op_ws);
-	FREE_FLOAT_BUF(gdn_z_host);
-	FREE_FLOAT_BUF(gdn_alpha_host);
-	FREE_FLOAT_BUF(gdn_beta_host);
-	FREE_FLOAT_BUF(gdn_out_host);
+	FREE_FLOAT_BUF(hybrid.host);
+	FREE_FLOAT_BUF(hybrid.host2);
+	FREE_FLOAT_BUF(hybrid.gdn_ws);
+	FREE_FLOAT_BUF(run.op_ws);
+	FREE_FLOAT_BUF(run.stage_a);
+	FREE_FLOAT_BUF(run.stage_b);
+	FREE_FLOAT_BUF(hybrid.gdn_z);
+	FREE_FLOAT_BUF(hybrid.gdn_alpha);
+	FREE_FLOAT_BUF(hybrid.gdn_beta);
+	FREE_FLOAT_BUF(hybrid.gdn_out);
 #undef FREE_FLOAT_BUF
 
 	if (s->bs) {
@@ -159,8 +161,11 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 		free(s->bs);
 		s->bs = NULL;
 	}
-	free(s->batch_logits_tmp.p);
-	s->batch_logits_tmp.cap = 0;
+	free(s->run.last_only);
+	s->run.last_only	 = NULL;
+	s->run.last_only_cap = 0;
+	free(s->run.batch_logits_tmp.p);
+	s->run.batch_logits_tmp.cap = 0;
 }
 
 static void expert_dev_entry_release(expert_dev_entry *e) {
@@ -211,95 +216,22 @@ void compute_scratch_free(compute_scratch *s) {
 }
 
 void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, int kv_out) {
-	if (s->small_host_dim >= dim && s->small_host_intermediate >= intermediate &&
-		s->small_host_kv_out >= kv_out)
+	if (s->run.small_host_dim >= dim && s->run.small_host_intermediate >= intermediate &&
+		s->run.small_host_kv_out >= kv_out)
 		return;
 
-	int new_dim = s->small_host_dim < dim ? dim : s->small_host_dim;
-	int new_int =
-		s->small_host_intermediate < intermediate ? intermediate : s->small_host_intermediate;
-	int new_kv				   = s->small_host_kv_out < kv_out ? kv_out : s->small_host_kv_out;
-	s->ple_inp_host			   = xrealloc(s->ple_inp_host, (size_t)new_int * sizeof(float));
-	s->cur_host				   = xrealloc(s->cur_host, (size_t)new_dim * sizeof(float));
-	s->out_proj_host		   = xrealloc(s->out_proj_host, (size_t)new_dim * sizeof(float));
-	s->vf_host				   = xrealloc(s->vf_host, (size_t)new_kv * sizeof(float));
-	s->xf_host				   = xrealloc(s->xf_host, (size_t)new_dim * sizeof(float));
-	s->small_host_dim		   = new_dim;
-	s->small_host_intermediate = new_int;
-	s->small_host_kv_out	   = new_kv;
-}
-
-static int layer_max_kv_heads(const model *m) {
-	int best = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		int v = model_layer_kv_heads(m, i);
-		if (v > best)
-			best = v;
-	}
-	return best;
-}
-
-static int layer_max_intermediate(const model *m) {
-	int best = 0;
-	for (int i = 0; i < m->n_layers; i++) {
-		int v = model_layer_intermediate(m, i);
-		if (v > best)
-			best = v;
-	}
-	return best;
-}
-
-typedef struct {
-	int attn_buf_size;
-	int q_out;
-	int kv_out;
-	int max_head_dim;
-	int max_kv_heads;
-	int max_intermediate;
-	int ffn_act_size;
-} compute_layout;
-
-static void compute_layout_init(const model *m, compute_layout *L) {
-	L->max_head_dim = m->head_dim;
-	L->max_kv_heads = m->n_kv_heads;
-	if (m->arch_info->has_variable_layer_dims) {
-		L->max_head_dim = MAX(m->layer_dims.head_dim_global, m->layer_dims.head_dim_swa);
-		L->max_kv_heads = layer_max_kv_heads(m);
-		if (L->max_kv_heads == 0)
-			L->max_kv_heads = m->n_kv_heads;
-	}
-
-	L->attn_buf_size = m->dim;
-	if (m->arch_info->has_variable_layer_dims) {
-		int q_out_max = m->n_heads * L->max_head_dim;
-		if (q_out_max > L->attn_buf_size)
-			L->attn_buf_size = q_out_max;
-	}
-	if (m->arch_info->is_mla) {
-		int mla_out = m->n_heads * m->mla.v_head;
-		if (mla_out > L->attn_buf_size)
-			L->attn_buf_size = mla_out;
-	}
-	if (m->arch_info->is_hybrid_recurrent && m->hybrid.value_dim > L->attn_buf_size)
-		L->attn_buf_size = m->hybrid.value_dim;
-
-	L->q_out  = m->n_heads * L->max_head_dim;
-	L->kv_out = L->max_kv_heads * L->max_head_dim;
-
-	L->max_intermediate = m->intermediate;
-	if (m->arch_info->has_variable_layer_dims) {
-		int layer_max = layer_max_intermediate(m);
-		if (layer_max > L->max_intermediate)
-			L->max_intermediate = layer_max;
-	}
-	if (m->moe.n_experts > 0 || m->moe.moe_intermediate > 0) {
-		if (m->moe.moe_intermediate > L->max_intermediate)
-			L->max_intermediate = m->moe.moe_intermediate;
-		int sh_inter = m->moe.moe_intermediate * m->moe.n_shared_experts;
-		if (sh_inter > L->max_intermediate)
-			L->max_intermediate = sh_inter;
-	}
-	L->ffn_act_size = L->max_intermediate > m->dim ? L->max_intermediate : m->dim;
+	int new_dim = s->run.small_host_dim < dim ? dim : s->run.small_host_dim;
+	int new_int = s->run.small_host_intermediate < intermediate ? intermediate
+																: s->run.small_host_intermediate;
+	int new_kv	= s->run.small_host_kv_out < kv_out ? kv_out : s->run.small_host_kv_out;
+	s->ple.inp_host		  = xrealloc(s->ple.inp_host, (size_t)new_int * sizeof(float));
+	s->run.cur_host		  = xrealloc(s->run.cur_host, (size_t)new_dim * sizeof(float));
+	s->run.out_proj_host  = xrealloc(s->run.out_proj_host, (size_t)new_dim * sizeof(float));
+	s->run.vf_host		  = xrealloc(s->run.vf_host, (size_t)new_kv * sizeof(float));
+	s->run.xf_host		  = xrealloc(s->run.xf_host, (size_t)new_dim * sizeof(float));
+	s->run.small_host_dim = new_dim;
+	s->run.small_host_intermediate = new_int;
+	s->run.small_host_kv_out	   = new_kv;
 }
 
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
@@ -309,30 +241,30 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	scratch_free_device_buffers(s);
 	scratch_free_host_buffers(s);
 
-	s->backend = m->backend;
-	backend *a = s->backend;
+	s->model.backend = m->backend;
+	backend *a		 = s->model.backend;
 
-	compute_layout L;
-	compute_layout_init(m, &L);
+	mem_dims dims;
+	mem_dims_init(&dims, m);
 
 	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
 
-	compute_small_host_ensure(s, m->dim, L.max_intermediate, L.kv_out);
+	compute_small_host_ensure(s, m->dim, dims.max_inter, dims.kv_out);
 
 	if (m->arch_info->is_moe)
-		s->moe_slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe_slot_buf));
+		s->moe.slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe.slot_buf));
 
 	if (m->arch_info->has_variable_layer_dims) {
-		const int half_swa = m->layer_dims.head_dim_swa / 2;
-		s->rope_cos_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		s->rope_sin_swa	   = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		build_rope_table(s->rope_cos_swa, s->rope_sin_swa, n_ctx, m->layer_dims.head_dim_swa,
-						 m->layer_dims.rope_theta_swa);
+		const int half_swa	  = m->layer_dims.head_dim_swa / 2;
+		s->model.rope_cos_swa = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
+		s->model.rope_sin_swa = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
+		build_rope_table(s->model.rope_cos_swa, s->model.rope_sin_swa, n_ctx,
+						 m->layer_dims.head_dim_swa, m->layer_dims.rope_theta_swa);
 
 		const int half_global = m->layer_dims.head_dim_global / 2;
-		s->rope_cos			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		s->rope_sin			  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		build_rope_table(s->rope_cos, s->rope_sin, n_ctx, m->layer_dims.head_dim_global,
+		s->model.rope_cos	  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
+		s->model.rope_sin	  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
+		build_rope_table(s->model.rope_cos, s->model.rope_sin, n_ctx, m->layer_dims.head_dim_global,
 						 m->layer_dims.rope_theta_global);
 
 	} else {
@@ -341,15 +273,16 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 								 : (m->arch_info->is_hybrid_recurrent ? m->rope_dim : m->head_dim);
 		const int half = rope_head_dim / 2;
 		if (half > 0) {
-			s->rope_cos = xmalloc((size_t)n_ctx * half * sizeof(float));
-			s->rope_sin = xmalloc((size_t)n_ctx * half * sizeof(float));
-			build_rope_table(s->rope_cos, s->rope_sin, n_ctx, rope_head_dim, m->rope_theta);
+			s->model.rope_cos = xmalloc((size_t)n_ctx * half * sizeof(float));
+			s->model.rope_sin = xmalloc((size_t)n_ctx * half * sizeof(float));
+			build_rope_table(s->model.rope_cos, s->model.rope_sin, n_ctx, rope_head_dim,
+							 m->rope_theta);
 		}
 	}
 
-	s->allocated_n_ctx = n_ctx;
-	s->last_model	   = m;
-	s->last_n_ctx	   = n_ctx;
+	s->model.allocated_n_ctx = n_ctx;
+	s->model.last_model		 = m;
+	s->model.last_n_ctx		 = n_ctx;
 
 	return OK;
 }
@@ -400,15 +333,15 @@ void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, voi
 }
 
 static status_code ensure_transfer_buf(compute_scratch *s, size_t need_floats) {
-	if (s->transfer_buf_cap >= need_floats)
+	if (s->run.transfer_buf_cap >= need_floats)
 		return OK;
-	s->transfer_buf		= xrealloc(s->transfer_buf, need_floats * sizeof(float));
-	s->transfer_buf_cap = need_floats;
+	s->run.transfer_buf		= xrealloc(s->run.transfer_buf, need_floats * sizeof(float));
+	s->run.transfer_buf_cap = need_floats;
 	return OK;
 }
 
 int compute_device_index(const compute_scratch *s, const backend *b) {
-	if (b == s->backend)
+	if (b == s->model.backend)
 		return 0;
 	for (int i = 0; i < s->n_mirrors; i++)
 		if (s->mirror[i].be == b)
@@ -451,10 +384,10 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 			status_code st = ensure_transfer_buf(s, (size_t)n);
 			if (st != OK)
 				return st;
-			st = src_owner->buffer_read_f32(src_owner, src, s->transfer_buf, n);
+			st = src_owner->buffer_read_f32(src_owner, src, s->run.transfer_buf, n);
 			if (st != OK)
 				return st;
-			return src_owner->buffer_write_f32(src_owner, dst, s->transfer_buf, n);
+			return src_owner->buffer_write_f32(src_owner, dst, s->run.transfer_buf, n);
 		}
 		if (src->host_ptr && dst->host_ptr) {
 			memcpy((void *)dst->host_ptr, src->host_ptr, (size_t)n * sizeof(float));
@@ -470,19 +403,19 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return st;
 
 	if (src_owner && src_owner->buffer_read_f32) {
-		st = src_owner->buffer_read_f32(src_owner, src, s->transfer_buf, n);
+		st = src_owner->buffer_read_f32(src_owner, src, s->run.transfer_buf, n);
 		if (st != OK)
 			return st;
 	} else if (src->host_ptr) {
-		memcpy(s->transfer_buf, src->host_ptr, (size_t)n * sizeof(float));
+		memcpy(s->run.transfer_buf, src->host_ptr, (size_t)n * sizeof(float));
 	} else {
 		return ERR_UNSUPPORTED;
 	}
 
 	if (dst_owner && dst_owner->buffer_write_f32) {
-		return dst_owner->buffer_write_f32(dst_owner, dst, s->transfer_buf, n);
+		return dst_owner->buffer_write_f32(dst_owner, dst, s->run.transfer_buf, n);
 	} else if (dst->host_ptr) {
-		memcpy((void *)dst->host_ptr, s->transfer_buf, (size_t)n * sizeof(float));
+		memcpy((void *)dst->host_ptr, s->run.transfer_buf, (size_t)n * sizeof(float));
 		return OK;
 	}
 	return ERR_UNSUPPORTED;

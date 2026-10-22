@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #define GL_MAX_BINDINGS 8
@@ -253,12 +252,6 @@ typedef struct {
 	uint64_t launch_us;
 	uint64_t wait_us;
 } gl_stats;
-
-static uint64_t gl_now_us(void) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-}
 
 struct gl_priv {
 	gl_context ctx;
@@ -789,18 +782,18 @@ static void gl_prof_end(gl_priv *p) {
 }
 
 static void gl_barrier(gl_priv *p) {
-	uint64_t t0 = gl_now_us();
+	uint64_t t0 = time_us();
 	p->stats.barriers++;
 	glMemoryBarrier(GL_COMPUTE_BARRIER_BITS);
-	p->stats.launch_us += gl_now_us() - t0;
+	p->stats.launch_us += time_us() - t0;
 	p->n_pending = 0;
 }
 
 static void gl_finish(gl_priv *p) {
-	uint64_t t0 = gl_now_us();
+	uint64_t t0 = time_us();
 	p->stats.finishes++;
 	glFinish();
-	p->stats.wait_us += gl_now_us() - t0;
+	p->stats.wait_us += time_us() - t0;
 	if (p->gpuprof.enabled)
 		gl_prof_drain(p);
 	p->dispatches_since_flush = 0;
@@ -815,10 +808,10 @@ static void gl_flush_if_due(gl_priv *p) {
 }
 
 static void gl_dispatch_barrier(gl_priv *p) {
-	uint64_t t0 = gl_now_us();
+	uint64_t t0 = time_us();
 	p->stats.barriers++;
 	glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-	p->stats.launch_us += gl_now_us() - t0;
+	p->stats.launch_us += time_us() - t0;
 	p->n_pending = 0;
 }
 
@@ -860,12 +853,12 @@ static void gl_launch(gl_priv *p, GLuint groups_x, GLuint groups_y, GLuint group
 			break;
 		}
 	}
-	uint64_t t0 = gl_now_us();
+	uint64_t t0 = time_us();
 	p->stats.dispatches++;
 	gl_prof_begin(p);
 	glDispatchCompute(groups_x, groups_y, groups_z);
 	gl_prof_end(p);
-	p->stats.launch_us += gl_now_us() - t0;
+	p->stats.launch_us += time_us() - t0;
 	gl_xq_cache_scan_writes(p, mask);
 	gl_flush_if_due(p);
 	p->access_mask = 0;
@@ -1713,25 +1706,18 @@ static void gl_buffer_free(backend *self, buffer *buf) {
 	buf->offset	  = 0;
 }
 
-static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, void *dst,
-									  size_t bytes) {
-	if (bytes == 0)
+static status_code gl_readback_reserve(gl_priv *p, size_t bytes) {
+	if (p->readback && p->readback_bytes >= bytes)
 		return OK;
-	if (!p->readback || p->readback_bytes < bytes) {
-		size_t want = (bytes + (size_t)65535) & ~(size_t)65535;
-		if (p->readback)
-			gl_buf_free(p, p->readback);
-		p->readback		  = gl_buf_alloc(p, want, GL_DYNAMIC_COPY, NULL);
-		p->readback_bytes = p->readback ? want : 0;
-		if (!p->readback)
-			return ERR_OUT_OF_MEMORY;
-	}
-	gl_barrier_if_pending(p);
-	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-	glBindBuffer(GL_COPY_READ_BUFFER, b->name);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
-	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)byte_off, 0,
-						(GLsizeiptr)bytes);
+	size_t want = (bytes + (size_t)65535) & ~(size_t)65535;
+	if (p->readback)
+		gl_buf_free(p, p->readback);
+	p->readback		  = gl_buf_alloc(p, want, GL_DYNAMIC_COPY, NULL);
+	p->readback_bytes = p->readback ? want : 0;
+	return p->readback ? OK : ERR_OUT_OF_MEMORY;
+}
+
+static status_code gl_readback_map(gl_priv *p, size_t bytes, void **src) {
 	glBindBuffer(GL_COPY_READ_BUFFER, 0);
 	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 	if (glGetError() != GL_NO_ERROR)
@@ -1747,32 +1733,50 @@ static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, vo
 	if (wr != GL_ALREADY_SIGNALED && wr != GL_CONDITION_SATISFIED)
 		return ERR_INTERNAL;
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->readback->name);
-	void *src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
-	if (!src) {
+	*src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+	if (!*src) {
 		glGetError();
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 		return ERR_INTERNAL;
 	}
-	memcpy(dst, src, bytes);
+	return OK;
+}
+
+static void gl_readback_unmap(void) {
 	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, void *dst,
+									  size_t bytes) {
+	if (bytes == 0)
+		return OK;
+	status_code st = gl_readback_reserve(p, bytes);
+	if (st != OK)
+		return st;
+	gl_barrier_if_pending(p);
+	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	glBindBuffer(GL_COPY_READ_BUFFER, b->name);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)byte_off, 0,
+						(GLsizeiptr)bytes);
+	void *src;
+	st = gl_readback_map(p, bytes, &src);
+	if (st != OK)
+		return st;
+	memcpy(dst, src, bytes);
+	gl_readback_unmap();
 	return OK;
 }
 
 static status_code gl_read_two_regions_f32(gl_priv *p, gl_buf *b0, size_t off0, void *dst0,
 										   size_t bytes0, gl_buf *b1, size_t off1, void *dst1,
 										   size_t bytes1) {
-	size_t pad0	 = (bytes0 + (size_t)255) & ~(size_t)255;
-	size_t total = pad0 + bytes1;
-	if (!p->readback || p->readback_bytes < total) {
-		size_t want = (total + (size_t)65535) & ~(size_t)65535;
-		if (p->readback)
-			gl_buf_free(p, p->readback);
-		p->readback		  = gl_buf_alloc(p, want, GL_DYNAMIC_COPY, NULL);
-		p->readback_bytes = p->readback ? want : 0;
-		if (!p->readback)
-			return ERR_OUT_OF_MEMORY;
-	}
+	size_t		pad0  = (bytes0 + (size_t)255) & ~(size_t)255;
+	size_t		total = pad0 + bytes1;
+	status_code st	  = gl_readback_reserve(p, total);
+	if (st != OK)
+		return st;
 	gl_barrier_if_pending(p);
 	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
 	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
@@ -1782,31 +1786,13 @@ static status_code gl_read_two_regions_f32(gl_priv *p, gl_buf *b0, size_t off0, 
 	glBindBuffer(GL_COPY_READ_BUFFER, b1->name);
 	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)off1, (GLintptr)pad0,
 						(GLsizeiptr)bytes1);
-	glBindBuffer(GL_COPY_READ_BUFFER, 0);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
-	if (glGetError() != GL_NO_ERROR)
-		return ERR_INTERNAL;
-	p->stats.readbacks++;
-	GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-	if (!fence)
-		return ERR_INTERNAL;
-	GLenum wr = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)500000000);
-	while (wr == GL_TIMEOUT_EXPIRED)
-		wr = glClientWaitSync(fence, 0, (GLuint64)1000000000);
-	glDeleteSync(fence);
-	if (wr != GL_ALREADY_SIGNALED && wr != GL_CONDITION_SATISFIED)
-		return ERR_INTERNAL;
-	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->readback->name);
-	void *src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)total, GL_MAP_READ_BIT);
-	if (!src) {
-		glGetError();
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-		return ERR_INTERNAL;
-	}
+	void *src;
+	st = gl_readback_map(p, total, &src);
+	if (st != OK)
+		return st;
 	memcpy(dst0, src, bytes0);
 	memcpy(dst1, (const char *)src + pad0, bytes1);
-	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	gl_readback_unmap();
 	return OK;
 }
 
@@ -2130,12 +2116,12 @@ static status_code gl_read_token_reg(backend *self, int reg, int32_t *out_token)
 	GL_ENTER(p);
 	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->tok_fence[reg])
 		return ERR_INVALID_ARG;
-	uint64_t t0 = gl_now_us();
+	uint64_t t0 = time_us();
 	GLenum	 wr =
 		glClientWaitSync(p->tok_fence[reg], GL_SYNC_FLUSH_COMMANDS_BIT, (GLuint64)500000000);
 	while (wr == GL_TIMEOUT_EXPIRED)
 		wr = glClientWaitSync(p->tok_fence[reg], 0, (GLuint64)1000000000);
-	p->stats.wait_us += gl_now_us() - t0;
+	p->stats.wait_us += time_us() - t0;
 	p->stats.readbacks++;
 	glDeleteSync(p->tok_fence[reg]);
 	p->tok_fence[reg] = NULL;

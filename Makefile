@@ -67,7 +67,7 @@ else
 endif
 
 ifeq ($(BUILD),debug)
-  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -O2 -g -fno-omit-frame-pointer \
+  CFLAGS  := $(BASE_FLAGS) $(DEP_FLAGS) -DKAPPAI_DEBUG -O2 -g -fno-omit-frame-pointer \
              $(SANITIZE_FLAGS) $(WARN_FLAGS) $(MATH_FLAGS) $(ARCH_FLAGS)
   LDFLAGS := -lm -lpthread $(SANITIZE_FLAGS)
 else
