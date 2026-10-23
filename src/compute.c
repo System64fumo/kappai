@@ -240,7 +240,6 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 	scratch_free_host_buffers(s);
 
 	s->model.backend = m->backend;
-	backend *a		 = s->model.backend;
 
 	mem_dims dims;
 	mem_dims_init(&dims, m);

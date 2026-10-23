@@ -29,7 +29,7 @@ typedef struct {
 	float			*all_scratch;
 	float			*all_outs;
 	size_t			 per_thread_scratch;
-	size_t			 per_thread_out;
+	size_t			 per_expert_out;
 } moe_batch_job;
 
 int moe_topk_select(const float *scores, int n_experts, int top_k, int *top_idx, float *top_score) {
@@ -856,10 +856,12 @@ status_code moe_experts_batch(exec_ctx *ctx) {
 		goto finish;
 	}
 
-	tpool *pool			 = model_get_pool(ctx->m);
-	int	   total_experts = ctx->rows.n_rows * K;
+	tpool *pool			  = model_get_pool(ctx->m);
+	int	   total_experts  = ctx->rows.n_rows * K;
+	size_t per_expert_out = (size_t)ctx->rows.n_rows * dim;
 
-	if (pool && total_experts >= 2) {
+	if (pool && total_experts >= 2 &&
+		(size_t)total_experts * per_expert_out * sizeof(float) <= (size_t)256 * 1024 * 1024) {
 		int n_threads = tpool_n_threads(pool);
 		if (n_threads < 1)
 			n_threads = 1;
@@ -869,13 +871,9 @@ status_code moe_experts_batch(exec_ctx *ctx) {
 		size_t per_thread_scratch = (size_t)I * 3 + (size_t)dim + (size_t)I * 2;
 		float *all_scratch =
 			float_buf_ensure(&ctx->s->moe.all_scratch, (size_t)n_threads * per_thread_scratch);
-		size_t per_thread_out = (size_t)ctx->rows.n_rows * dim;
 		float *all_outs =
-			float_buf_ensure(&ctx->s->moe.all_outs, (size_t)n_threads * per_thread_out);
-		for (int t = 0; t < n_threads; t++) {
-			float *o = all_outs + (size_t)t * per_thread_out;
-			memset(o, 0, per_thread_out * sizeof(float));
-		}
+			float_buf_ensure(&ctx->s->moe.all_outs, (size_t)total_experts * per_expert_out);
+		memset(all_outs, 0, (size_t)total_experts * per_expert_out * sizeof(float));
 
 		moe_batch_job job;
 		job.m		 = ctx->m;
@@ -899,13 +897,13 @@ status_code moe_experts_batch(exec_ctx *ctx) {
 		job.all_scratch		   = all_scratch;
 		job.all_outs		   = all_outs;
 		job.per_thread_scratch = per_thread_scratch;
-		job.per_thread_out	   = per_thread_out;
+		job.per_expert_out	   = per_expert_out;
 
 		tpool_parallel_for(pool, total_experts, 1, moe_batch_expert_chunk, &job);
 
-		for (int t = 0; t < n_threads; t++) {
-			float *o = all_outs + (size_t)t * per_thread_out;
-			for (int i = 0; i < ctx->rows.n_rows * dim; i++)
+		for (int idx = 0; idx < total_experts; idx++) {
+			const float *o = all_outs + (size_t)idx * per_expert_out;
+			for (int i = 0; i < (int)per_expert_out; i++)
 				ctx->bs->moe_out.p[i] += o[i];
 		}
 	} else {
@@ -1159,7 +1157,6 @@ down_batch:
 static void moe_batch_expert_chunk(int begin, int end, int tid, void *ctx) {
 	moe_batch_job *j	   = ctx;
 	float		  *scratch = j->all_scratch + (size_t)tid * j->per_thread_scratch;
-	float		  *out	   = j->all_outs + (size_t)tid * j->per_thread_out;
 
 	moe_expert_ctx cx = {
 		.a		  = j->a,
@@ -1179,7 +1176,7 @@ static void moe_batch_expert_chunk(int begin, int end, int tid, void *ctx) {
 
 		const float *xb_row = j->xb_base + (size_t)row * j->dim;
 		float		*w		= &j->bs->moe_router_w[(size_t)row * j->top_k + k];
-		cx.out				= out + (size_t)row * j->dim;
+		cx.out				= j->all_outs + (size_t)idx * j->per_expert_out + (size_t)row * j->dim;
 		(void)moe_expert_exec(&cx, es, xb_row, *w, tid);
 	}
 }

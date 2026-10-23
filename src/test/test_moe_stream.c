@@ -167,6 +167,13 @@ void run_moe_stream_tests(void) {
 					}
 				}
 			}
+			moe_stream_release_slots(&streamed.m, last_moe_layer, slots, n_k);
+			for (int k = 0; k < n_k; k++) {
+				if (slots[k].owned && slots[k].heap_buf) {
+					free(slots[k].heap_buf);
+					slots[k].heap_buf = NULL;
+				}
+			}
 			snprintf(detail, sizeof(detail),
 					 "streamed cache: n_k=%d (> MOE_MAX_TOPK=%d) resolved ok=%d", n_k, MOE_MAX_TOPK,
 					 ok_union);

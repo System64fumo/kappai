@@ -1143,12 +1143,12 @@ static oa_slot *slot_create(openai_state *st) {
 
 static oa_slot *slot_pick_chat(openai_state *st, uint64_t *chain, size_t chain_len,
 							   bool *matched_out) {
-	oa_slot *best		= NULL;
-	oa_slot *lru		= NULL;
-	bool	 best_match = false;
-	size_t	 best_reuse = 0;
+	oa_slot *best		  = NULL;
+	oa_slot *volatile lru = NULL;
+	bool   best_match	  = false;
+	size_t best_reuse	  = 0;
 	for (int i = 0; i < st->n_slots; i++) {
-		oa_slot *s = &st->slots[i];
+		oa_slot *volatile s = &st->slots[i];
 		if (s->busy)
 			continue;
 		if (!lru || s->last_ns < lru->last_ns)
@@ -1167,17 +1167,17 @@ static oa_slot *slot_pick_chat(openai_state *st, uint64_t *chain, size_t chain_l
 		*matched_out = true;
 		return best;
 	}
-	*matched_out   = false;
-	oa_slot *fresh = slot_create(st);
+	*matched_out			= false;
+	oa_slot *volatile fresh = slot_create(st);
 	return fresh ? fresh : lru;
 }
 
 static oa_slot *slot_pick_text(openai_state *st, const int32_t *ids, int n, bool *matched_out) {
-	oa_slot *best		= NULL;
-	oa_slot *lru		= NULL;
-	int32_t	 best_reuse = -1;
+	oa_slot *volatile best = NULL;
+	oa_slot *volatile lru  = NULL;
+	int32_t best_reuse	   = -1;
 	for (int i = 0; i < st->n_slots; i++) {
-		oa_slot *s = &st->slots[i];
+		oa_slot *volatile s = &st->slots[i];
 		if (s->busy)
 			continue;
 		if (!lru || s->last_ns < lru->last_ns)
@@ -1191,7 +1191,7 @@ static oa_slot *slot_pick_text(openai_state *st, const int32_t *ids, int n, bool
 	*matched_out = best_reuse > 0;
 	if (best_reuse > 0)
 		return best;
-	oa_slot *fresh = slot_create(st);
+	oa_slot *volatile fresh = slot_create(st);
 	return fresh ? fresh : lru;
 }
 

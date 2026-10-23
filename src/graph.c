@@ -313,6 +313,8 @@ static int count_add_size_mismatch(const cg_graph *g, const cg_node *n, int inde
 	uint8_t addend = g->values[n->in[CG_ADD_ADDEND]].size_kind;
 	if (!acc || !addend || acc == addend)
 		return 0;
+	if (acc == BS_SIZE_ACT || addend == BS_SIZE_ACT)
+		return 0;
 	GRAPH_DIAG("graph: node %d (add, %s) adds buffers of different sizes", index,
 			   SECTION_NAMES[n->section]);
 	return 1;

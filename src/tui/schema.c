@@ -471,7 +471,7 @@ static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char
 		char *end = NULL;
 		(void)strtol(value, &end, 10);
 		if (!*value || *end != '\0') {
-			snprintf(err, errlen, "'pin' expects an integer, got '%s'", value);
+			snprintf(err, errlen, "'pin' expects an integer, got '%.16s'", value);
 			return -1;
 		}
 		return 1;

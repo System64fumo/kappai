@@ -1142,6 +1142,8 @@ static void synth_model_free(synth_model *sm) {
 	free(sm->output_norm_raw);
 	free(sm->output_w_raw);
 	free(sm->m.layers);
+	free(sm->m.layer_backends);
+	sm->m.layer_backends = NULL;
 	free(sm->m.wrefs_by_layer);
 	sm->m.wrefs_by_layer = NULL;
 	free(sm->m.layer_dims.is_global_layer);

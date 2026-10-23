@@ -2472,13 +2472,6 @@ static status_code vk_init(backend *self, int device_index) {
 		(uint32_t)p->matmul_tile_k,
 	};
 
-	uint32_t spec_matmul_narrow[4] = {
-		(uint32_t)p->matmul_wg_size,
-		(uint32_t)p->matmul_rows_per_thread,
-		(uint32_t)p->matmul_tile_k,
-		1u,
-	};
-
 	uint32_t spec_matmul_dense_narrow[6] = {
 		(uint32_t)p->matmul_wg_size,	   (uint32_t)p->matmul_rows_per_thread,
 		(uint32_t)p->matmul_tile_k,		   1u,

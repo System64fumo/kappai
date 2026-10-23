@@ -1505,11 +1505,12 @@ static void test_op_attention_swa_slide(backend *b, int n_heads, int n_kv_heads,
 		float *r = xmalloc((size_t)n * sizeof(float));
 		if (ref_all)
 			memcpy(r, ref_all + (size_t)p * n, (size_t)n * sizeof(float));
-		else
-			memcpy(r,
-				   ref_softmax_attn(qf + (size_t)p * n, kf, vf, n_heads, n_kv_heads, head_dim, t0,
-									p + 1, scale),
-				   (size_t)n * sizeof(float));
+		else {
+			float *r_ref = ref_softmax_attn(qf + (size_t)p * n, kf, vf, n_heads, n_kv_heads,
+											head_dim, t0, p + 1, scale);
+			memcpy(r, r_ref, (size_t)n * sizeof(float));
+			free(r_ref);
+		}
 		float ma = 0.0f;
 		for (int i = 0; i < n; i++) {
 			float e = fabsf(r[i] - y_all[(size_t)p * n + i]);

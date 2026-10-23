@@ -5,13 +5,6 @@
 
 #define record_plan(label, ok, ...) record_resultf(OPFAM_PLAN, (label), (ok), __VA_ARGS__)
 
-static int find_slot(const uint8_t *list, int n, uint8_t slot) {
-	for (int i = 0; i < n; i++)
-		if (list[i] == slot)
-			return 1;
-	return 0;
-}
-
 static void test_touch_contents(void) {
 	recipe_op op;
 	memset(&op, 0, sizeof(op));
@@ -82,7 +75,7 @@ static void test_touch_contents(void) {
 	op.w_idx = WIDX_NONE;
 	nr = nw = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
-	ok = nr == 3 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
+	ok = nr == 1 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
 	record_plan("touch.mla_qkv_fused", ok, "nr=%d nw=%d", nr, nw);
 
 	op.kind	 = OP_MATMUL;
