@@ -100,6 +100,7 @@ endif
 
 LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/*.c) \
+	$(wildcard $(SRC_DIR)/recipe/*.c) \
 	$(wildcard $(SRC_DIR)/models/*.c) \
 	$(wildcard $(SRC_DIR)/moe/*.c) \
 	$(SRC_DIR)/backend/backend.c

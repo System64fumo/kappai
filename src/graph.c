@@ -55,18 +55,6 @@ static const struct {
 
 static const char *SECTION_NAMES[CG_SECTION_COUNT] = {"pre", "layer", "post"};
 
-static int env_flag(const char *name) {
-	const char *v = getenv(name);
-	return v && v[0] && strcmp(v, "0") != 0;
-}
-
-int graph_enabled(void) {
-	static _Atomic int cached = -1;
-	if (cached < 0)
-		cached = env_flag("KAPPAI_GRAPH");
-	return cached;
-}
-
 int graph_dump_mode(void) {
 	static _Atomic int cached = -1;
 	if (cached >= 0)
@@ -83,6 +71,31 @@ static int slot_is_router(uint8_t slot) {
 	return slot == RECIPE_SLOT_ROUTER_IDS || slot == RECIPE_SLOT_ROUTER_W;
 }
 
+static const uint8_t SLOT_SIZE_KIND[RECIPE_SLOT_MAX] = {
+	[RECIPE_SLOT_X]			  = BS_SIZE_ATTN_BUF,
+	[RECIPE_SLOT_XB]		  = BS_SIZE_ATTN_BUF,
+	[RECIPE_SLOT_XB2]		  = BS_SIZE_ATTN_BUF,
+	[RECIPE_SLOT_ATTN_OUT]	  = BS_SIZE_ATTN_BUF,
+	[RECIPE_SLOT_Q]			  = BS_SIZE_Q_OUT,
+	[RECIPE_SLOT_K]			  = BS_SIZE_KV_OUT,
+	[RECIPE_SLOT_V]			  = BS_SIZE_KV_OUT,
+	[RECIPE_SLOT_FFN_GATE]	  = BS_SIZE_INTER,
+	[RECIPE_SLOT_FFN_UP]	  = BS_SIZE_INTER,
+	[RECIPE_SLOT_FFN_ACT]	  = BS_SIZE_ACT,
+	[RECIPE_SLOT_FFN_GATE_UP] = BS_SIZE_INTER_X2,
+	[RECIPE_SLOT_RESID_TMP]	  = BS_SIZE_ATTN_BUF,
+	[RECIPE_SLOT_HC]		  = BS_SIZE_HC,
+	[RECIPE_SLOT_HC_COEF]	  = BS_SIZE_HC_COEF,
+};
+
+int graph_slot_size_kind(uint8_t slot) {
+	return slot < RECIPE_SLOT_MAX ? SLOT_SIZE_KIND[slot] : BS_SIZE_NONE;
+}
+
+static int slot_batch_backed(uint8_t slot) {
+	return slot_is_router(slot) || graph_slot_valid(slot);
+}
+
 static int new_value(builder *b, uint8_t slot, int producer, uint8_t port, int host_only) {
 	cg_graph *g	  = b->g;
 	int		  id  = g->n_values++;
@@ -91,7 +104,7 @@ static int new_value(builder *b, uint8_t slot, int producer, uint8_t port, int h
 		.alias_of  = CG_NONE,
 		.slot	   = slot,
 		.port	   = port,
-		.size_kind = (uint8_t)recipe_slot_size_kind(slot),
+		.size_kind = (uint8_t)graph_slot_size_kind(slot),
 		.rows	   = slot == RECIPE_SLOT_LOGITS ? CG_ROWS_OUTPUT : CG_ROWS_BATCH,
 		.dtype	   = slot == RECIPE_SLOT_ROUTER_IDS ? CG_DTYPE_I32 : CG_DTYPE_F32,
 		.residency = host_only || slot_is_router(slot) ? CG_RES_HOST : CG_RES_DEVICE,
@@ -271,7 +284,7 @@ static int count_unbacked_values(const cg_graph *g, const cg_node *n, int index)
 	for (int j = 0; j < n->n_in + n->n_out; j++) {
 		int		value = j < n->n_in ? n->in[j] : n->out[j - n->n_in];
 		uint8_t slot  = g->values[value].slot;
-		if (recipe_slot_batch_backed(slot))
+		if (slot_batch_backed(slot))
 			continue;
 		GRAPH_DIAG("graph: node %d (%s, %s) touches slot %u which has no batch buffer", index,
 				   recipe_op_name(n->kind), SECTION_NAMES[n->section], slot);
@@ -601,7 +614,7 @@ static int lower_layers(cg_set *s, const model_recipe *r) {
 static void lower_set(cg_set *s, const model_recipe *r) {
 	if (lower_outer_sections(s, r) != CG_NONE && lower_layers(s, r) != CG_NONE)
 		return;
-	WARN("graph: lowering failed; execution stays on the recipe");
+	ERROR("graph: lowering failed");
 	free(s->pre_ops);
 	free(s->layer_ops);
 	free(s->post_ops);

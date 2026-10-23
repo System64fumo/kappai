@@ -49,7 +49,7 @@ typedef struct {
 } mem_layout_cache;
 
 void			  mem_dims_init(mem_dims *d, const struct model *m);
-mem_plan		 *mem_plan_build(const cg_set *graphs, const struct model *m, uint32_t slot_mask);
+mem_plan		 *mem_plan_build(const cg_set *graphs, const struct model *m);
 void			  mem_plan_free(mem_plan *p);
 int				  mem_rows_bucket(int n_rows);
 const mem_layout *mem_layout_get(mem_layout_cache *cache, const mem_plan *p, int n_rows);

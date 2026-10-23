@@ -14,9 +14,30 @@
 #define CG_RESID_INPUT 0
 #define CG_RESID_ACC 1
 
+#define CG_BATCH_SLOTS                                                                             \
+	((1u << RECIPE_SLOT_X) | (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |                    \
+	 (1u << RECIPE_SLOT_ATTN_OUT) | (1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_K) |                \
+	 (1u << RECIPE_SLOT_V) | (1u << RECIPE_SLOT_FFN_GATE) | (1u << RECIPE_SLOT_FFN_UP) |           \
+	 (1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_FFN_GATE_UP) |                               \
+	 (1u << RECIPE_SLOT_RESID_TMP) | (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_HYB_GATE) | \
+	 (1u << RECIPE_SLOT_HYB_ALPHA) | (1u << RECIPE_SLOT_HYB_BETA) | (1u << RECIPE_SLOT_LOGITS) |   \
+	 (1u << RECIPE_SLOT_HC) | (1u << RECIPE_SLOT_HC_COEF))
+
 #define CG_DUMP_OFF 0
 #define CG_DUMP_TEXT 1
 #define CG_DUMP_DOT 2
+
+enum {
+	BS_SIZE_NONE = 0,
+	BS_SIZE_ATTN_BUF,
+	BS_SIZE_Q_OUT,
+	BS_SIZE_KV_OUT,
+	BS_SIZE_INTER,
+	BS_SIZE_INTER_X2,
+	BS_SIZE_ACT,
+	BS_SIZE_HC,
+	BS_SIZE_HC_COEF,
+};
 
 typedef enum { CG_SECTION_PRE = 0, CG_SECTION_LAYER, CG_SECTION_POST, CG_SECTION_COUNT } cg_section;
 
@@ -81,7 +102,11 @@ typedef struct cg_graph {
 	uint8_t	  frozen;
 } cg_graph;
 
-int graph_enabled(void);
+static inline int graph_slot_valid(uint8_t slot) {
+	return slot < RECIPE_SLOT_MAX && ((CG_BATCH_SLOTS >> slot) & 1u);
+}
+
+int graph_slot_size_kind(uint8_t slot);
 int graph_dump_mode(void);
 typedef struct {
 	backend	   *be;

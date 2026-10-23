@@ -83,7 +83,7 @@ static size_t slot_row_elems(const mem_dims *d, uint8_t slot) {
 	default:
 		break;
 	}
-	switch (recipe_slot_size_kind(slot)) {
+	switch (graph_slot_size_kind(slot)) {
 	case BS_SIZE_ATTN_BUF:
 		return (size_t)d->attn_buf;
 	case BS_SIZE_Q_OUT:
@@ -258,9 +258,11 @@ static void report(const mem_plan *p, int aliasing) {
 		 (shared * REPORT_ROWS) >> 20, REPORT_ROWS);
 }
 
-mem_plan *mem_plan_build(const cg_set *graphs, const struct model *m, uint32_t slot_mask) {
+mem_plan *mem_plan_build(const cg_set *graphs, const struct model *m) {
 	mem_plan *p	   = xcalloc(1, sizeof(*p));
-	uint32_t  mask = slot_mask ? slot_mask : ALL_SLOTS;
+	uint32_t  mask = graphs ? graph_set_batch_slot_mask(graphs) : ALL_SLOTS;
+	if (!mask)
+		mask = ALL_SLOTS;
 	mem_dims_init(&p->dims, m);
 	if (m->arch_info->is_hybrid_recurrent)
 		mask |= HYBRID_SLOTS;

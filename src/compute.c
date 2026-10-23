@@ -87,10 +87,8 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 		}
 		mir->be = NULL;
 	}
-	s->n_mirrors		  = 0;
-	s->mirrors_alloced	  = 0;
-	s->run.active_backend = NULL;
-	s->run.active_dev	  = 0;
+	s->n_mirrors	   = 0;
+	s->mirrors_alloced = 0;
 	free(s->run.transfer_buf);
 	s->run.transfer_buf		= NULL;
 	s->run.transfer_buf_cap = 0;
@@ -398,24 +396,36 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 
 	ensure_sync(src_owner);
 
-	status_code st = ensure_transfer_buf(s, (size_t)n);
-	if (st != OK)
-		return st;
-
-	if (src_owner && src_owner->buffer_read_f32) {
-		st = src_owner->buffer_read_f32(src_owner, src, s->run.transfer_buf, n);
-		if (st != OK)
+	const int	 dst_direct = buffer_is_host_resident(dst);
+	const float *from		= NULL;
+	if (buffer_is_host_resident(src)) {
+		from = buffer_f32(src);
+	} else if (src_owner && src_owner->buffer_read_f32) {
+		float *to = dst_direct ? buffer_f32(dst) : NULL;
+		if (!to) {
+			status_code st = ensure_transfer_buf(s, (size_t)n);
+			if (st != OK)
+				return st;
+			to = s->run.transfer_buf;
+		}
+		status_code st = src_owner->buffer_read_f32(src_owner, src, to, n);
+		if (st != OK || dst_direct)
 			return st;
+		from = to;
 	} else if (src->host_ptr) {
-		memcpy(s->run.transfer_buf, src->host_ptr, (size_t)n * sizeof(float));
+		from = src->host_ptr;
 	} else {
 		return ERR_UNSUPPORTED;
 	}
 
-	if (dst_owner && dst_owner->buffer_write_f32) {
-		return dst_owner->buffer_write_f32(dst_owner, dst, s->run.transfer_buf, n);
-	} else if (dst->host_ptr) {
-		memcpy((void *)dst->host_ptr, s->run.transfer_buf, (size_t)n * sizeof(float));
+	if (dst_direct) {
+		memcpy(buffer_f32(dst), from, (size_t)n * sizeof(float));
+		return OK;
+	}
+	if (dst_owner && dst_owner->buffer_write_f32)
+		return dst_owner->buffer_write_f32(dst_owner, dst, from, n);
+	if (dst->host_ptr) {
+		memcpy((void *)dst->host_ptr, from, (size_t)n * sizeof(float));
 		return OK;
 	}
 	return ERR_UNSUPPORTED;

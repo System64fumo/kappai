@@ -52,8 +52,6 @@ typedef struct {
 } scratch_model;
 
 typedef struct {
-	backend	 *active_backend;
-	int		  active_dev;
 	float	 *transfer_buf;
 	size_t	  transfer_buf_cap;
 	float_buf batch_logits_tmp;

@@ -427,6 +427,12 @@ static inline tpool *backend_get_pool(backend *b) {
 	return NULL;
 }
 
+static inline int buffer_is_host_resident(const buffer *b) {
+	if (!b->handle)
+		return 1;
+	return b->owner && backend_has_cap(b->owner, BCAP_IS_HOST);
+}
+
 static inline void ensure_sync(backend *a) {
 	if (a && a->synchronize)
 		a->synchronize(a);

@@ -466,5 +466,4 @@ void graph_optimize_recipe(model_recipe *r, const struct model *m) {
 		graph_free(g);
 	}
 	log_pass_totals(totals);
-	recipe_batch_slot_mask(r, m);
 }
