@@ -88,6 +88,13 @@ static const uint8_t SLOT_SIZE_KIND[RECIPE_SLOT_MAX] = {
 	[RECIPE_SLOT_HC_COEF]	  = BS_SIZE_HC_COEF,
 };
 
+static const struct {
+	uint8_t parent;
+	uint8_t views[2];
+} SLOT_VIEWS[] = {
+	{RECIPE_SLOT_FFN_GATE_UP, {RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP}},
+};
+
 int graph_slot_size_kind(uint8_t slot) {
 	return slot < RECIPE_SLOT_MAX ? SLOT_SIZE_KIND[slot] : BS_SIZE_NONE;
 }
@@ -102,6 +109,7 @@ static int new_value(builder *b, uint8_t slot, int producer, uint8_t port, int h
 	g->values[id] = (cg_value){
 		.producer  = producer,
 		.alias_of  = CG_NONE,
+		.view_of   = CG_NONE,
 		.slot	   = slot,
 		.port	   = port,
 		.size_kind = (uint8_t)graph_slot_size_kind(slot),
@@ -128,6 +136,21 @@ static int find_slot(const uint8_t *slots, int n, uint8_t slot) {
 		if (slots[i] == slot)
 			return i;
 	return CG_NONE;
+}
+
+static void add_slot_views(builder *b, cg_node *n, int node_id, int parent, int host_only) {
+	cg_graph *g = b->g;
+	for (size_t i = 0; i < ARRAY_LEN(SLOT_VIEWS); i++) {
+		if (SLOT_VIEWS[i].parent != g->values[parent].slot)
+			continue;
+		for (size_t k = 0; k < ARRAY_LEN(SLOT_VIEWS[i].views) && n->n_out < OP_TOUCH_MAX; k++) {
+			uint8_t slot		 = SLOT_VIEWS[i].views[k];
+			int		v			 = new_value(b, slot, node_id, (uint8_t)n->n_out, host_only);
+			g->values[v].view_of = parent;
+			b->cur[slot]		 = v;
+			n->out[n->n_out++]	 = v;
+		}
+	}
 }
 
 static void lower_op(builder *b, const recipe_op *op, cg_section section, int recipe_index) {
@@ -161,12 +184,14 @@ static void lower_op(builder *b, const recipe_op *op, cg_section section, int re
 		n->n_in++;
 	}
 	for (int i = 0; i < n_writes; i++) {
-		int v = new_value(b, writes[i], id, (uint8_t)i, cap_host_only_fn(op->kind) != NULL);
-		int r = find_slot(reads, n_reads, writes[i]);
+		int host_only = cap_host_only_fn(op->kind) != NULL;
+		int v		  = new_value(b, writes[i], id, (uint8_t)n->n_out, host_only);
+		int r		  = find_slot(reads, n_reads, writes[i]);
 		if (r != CG_NONE)
 			g->values[v].alias_of = n->in[r];
 		b->cur[writes[i]]  = v;
 		n->out[n->n_out++] = v;
+		add_slot_views(b, n, id, v, host_only);
 	}
 	for (int k = 0; k < CG_STATE_SLOTS; k++)
 		if ((n->state_writes >> k) & 1)
@@ -382,6 +407,9 @@ cg_range *graph_value_ranges(const cg_graph *g) {
 		range_extend(&ranges[g->carry[c].in], 0, g->n_nodes - 1);
 		range_extend(&ranges[g->carry[c].out], 0, g->n_nodes - 1);
 	}
+	for (int v = 0; v < g->n_values; v++)
+		if (g->values[v].view_of != CG_NONE && ranges[v].end >= 0)
+			range_extend(&ranges[g->values[v].view_of], ranges[v].start, ranges[v].end);
 	return ranges;
 }
 
@@ -390,7 +418,9 @@ int graph_peak_live_buffers(const cg_graph *g) {
 	int		 *root	 = xmalloc((size_t)(g->n_values + 1) * sizeof(int));
 	cg_range *groups = xmalloc((size_t)(g->n_values + 1) * sizeof(cg_range));
 	for (int v = 0; v < g->n_values; v++) {
-		root[v]	  = g->values[v].alias_of == CG_NONE ? v : root[g->values[v].alias_of];
+		int parent =
+			g->values[v].alias_of != CG_NONE ? g->values[v].alias_of : g->values[v].view_of;
+		root[v]	  = parent == CG_NONE ? v : root[parent];
 		groups[v] = (cg_range){.start = INT_MAX, .end = -1};
 	}
 	for (int v = 0; v < g->n_values; v++)
@@ -412,8 +442,9 @@ int graph_peak_live_buffers(const cg_graph *g) {
 
 static void dump_value(FILE *out, const cg_graph *g, int id) {
 	const cg_value *v = &g->values[id];
-	fprintf(out, " v%d:%s%s%s", id, SLOT_NAMES[v->slot] ? SLOT_NAMES[v->slot] : "?",
-			v->alias_of != CG_NONE ? "~" : "", v->loop_carried ? "*" : "");
+	fprintf(out, " v%d:%s%s%s%s", id, SLOT_NAMES[v->slot] ? SLOT_NAMES[v->slot] : "?",
+			v->alias_of != CG_NONE ? "~" : "", v->view_of != CG_NONE ? "^" : "",
+			v->loop_carried ? "*" : "");
 }
 
 static void dump_node(FILE *out, const cg_graph *g, int id) {
@@ -634,9 +665,11 @@ const layer_ctx_entry *graph_set_layer_ctx(const cg_set *s, int layer) {
 static uint32_t node_batch_slot_mask(const cg_graph *g, const cg_node *n) {
 	uint32_t mask = recipe_op_batch_extra_mask(n->kind);
 	for (int j = 0; j < n->n_in + n->n_out; j++) {
-		uint8_t slot = g->values[j < n->n_in ? n->in[j] : n->out[j - n->n_in]].slot;
-		if (slot < RECIPE_SLOT_MAX)
-			mask |= 1u << slot;
+		const cg_value *v = &g->values[j < n->n_in ? n->in[j] : n->out[j - n->n_in]];
+		if (v->view_of != CG_NONE)
+			continue;
+		if (v->slot < RECIPE_SLOT_MAX)
+			mask |= 1u << v->slot;
 	}
 	return mask;
 }

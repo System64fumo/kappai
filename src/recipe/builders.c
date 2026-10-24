@@ -40,9 +40,13 @@ recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage s
 	return op;
 }
 
-recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int k) {
-	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, widx,
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
+						   int k) {
+	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out0, widx,
 							  STAGE_MATMUL);
+	op.u.matmul_multi.out[0]   = out0;
+	op.u.matmul_multi.out[1]   = out1;
+	op.u.matmul_multi.out[2]   = RECIPE_SLOT_NONE;
 	op.u.matmul_multi.n		   = 2;
 	op.u.matmul_multi.k		   = k;
 	op.u.matmul_multi.n_out[0] = n0;
@@ -50,9 +54,13 @@ recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1
 	return op;
 }
 
-recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int n2, int k) {
-	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, widx,
+recipe_op mk_matmul_multi3(uint8_t in, uint8_t out0, uint8_t out1, uint8_t out2, uint8_t widx,
+						   int n0, int n1, int n2, int k) {
+	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out0, widx,
 							  STAGE_MATMUL);
+	op.u.matmul_multi.out[0]   = out0;
+	op.u.matmul_multi.out[1]   = out1;
+	op.u.matmul_multi.out[2]   = out2;
 	op.u.matmul_multi.n		   = 3;
 	op.u.matmul_multi.k		   = k;
 	op.u.matmul_multi.n_out[0] = n0;
@@ -105,7 +113,7 @@ recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads) 
 }
 
 recipe_op mk_rmsnorm_noweight(uint8_t in) {
-	return mk_op_base(OP_RMSNORM_NOWEIGHT, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
+	return mk_op_base(OP_RMSNORM_NOWEIGHT, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, in,
 					  RECIPE_NO_WEIGHT, STAGE_RMSNORM);
 }
 
@@ -152,8 +160,8 @@ recipe_op mk_attention_mla(uint8_t q_in, uint8_t out, int n_heads, int head_dim,
 }
 
 recipe_op mk_scale(uint8_t io, uint8_t widx, float scale) {
-	recipe_op op = mk_op_base(OP_SCALE, io, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-							  widx, STAGE_ADD);
+	recipe_op op =
+		mk_op_base(OP_SCALE, io, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, io, widx, STAGE_ADD);
 	op.u.scale.scale = scale;
 	return op;
 }
@@ -314,8 +322,8 @@ int recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int
 		ops[i++] = mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT, inter, act);
 	} else {
 		if (has_matmul_multi) {
-			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter,
-										inter, dim);
+			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+										WIDX_GATE, inter, inter, dim);
 		} else {
 			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter, dim,
 								 STAGE_MATMUL);

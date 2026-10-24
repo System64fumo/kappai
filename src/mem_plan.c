@@ -116,13 +116,17 @@ static void add_conflict(interference *x, uint8_t a, uint8_t b) {
 	x->conflict[b][a] = 1;
 }
 
+static int has_storage(const cg_graph *g, const cg_range *ranges, int v) {
+	return ranges[v].end >= 0 && g->values[v].view_of == CG_NONE;
+}
+
 static void collect_value_conflicts(interference *x, const cg_graph *g, const cg_range *ranges) {
 	for (int v = 0; v < g->n_values; v++) {
-		if (ranges[v].end < 0)
+		if (!has_storage(g, ranges, v))
 			continue;
 		x->seen[g->values[v].slot] = 1;
 		for (int w = v + 1; w < g->n_values; w++)
-			if (ranges[w].end >= 0 && ranges_overlap(&ranges[v], &ranges[w]))
+			if (has_storage(g, ranges, w) && ranges_overlap(&ranges[v], &ranges[w]))
 				add_conflict(x, g->values[v].slot, g->values[w].slot);
 	}
 }
@@ -166,7 +170,7 @@ static void collect_use_conflicts(interference *x, const cg_graph *g, const cg_r
 	for (int u = 0; u < n_uses; u++) {
 		x->seen[uses[u].slot] = 1;
 		for (int v = 0; v < g->n_values; v++)
-			if (ranges[v].end >= 0 && ranges_overlap(&ranges[v], &uses[u].range))
+			if (has_storage(g, ranges, v) && ranges_overlap(&ranges[v], &uses[u].range))
 				add_conflict(x, uses[u].slot, g->values[v].slot);
 		for (int w = u + 1; w < n_uses; w++)
 			if (ranges_overlap(&uses[u].range, &uses[w].range))

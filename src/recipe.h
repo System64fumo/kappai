@@ -39,9 +39,7 @@
 #define OP_TOUCH_IN2 3
 #define OP_TOUCH_OUT 4
 #define OP_TOUCH_OUT1 5
-#define OP_TOUCH_OUT2_WQ 6
-#define OP_TOUCH_OUT_GATE 7
-#define OP_TOUCH_OUT_UP 8
+#define OP_TOUCH_OUT2 6
 #define OP_TOUCH_SLOT(s) (-(int)(s) - 1)
 #define OP_TOUCH_MAX 6
 
@@ -194,9 +192,10 @@ typedef union {
 		int k;
 	} matmul;
 	struct {
-		int n;
-		int k;
-		int n_out[3];
+		int		n;
+		int		k;
+		int		n_out[3];
+		uint8_t out[3];
 	} matmul_multi;
 	struct {
 		int n;
@@ -364,8 +363,10 @@ recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage sta
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
-recipe_op mk_matmul_multi2(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int k);
-recipe_op mk_matmul_multi3(uint8_t in, uint8_t out, uint8_t widx, int n0, int n1, int n2, int k);
+recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
+						   int k);
+recipe_op mk_matmul_multi3(uint8_t in, uint8_t out0, uint8_t out1, uint8_t out2, uint8_t widx,
+						   int n0, int n1, int n2, int k);
 recipe_op mk_matmul_residual(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, int n, int k);
 recipe_op mk_matmul_ffn_down(uint8_t gate_in, uint8_t up_in, uint8_t out, uint8_t widx, int n,
 							 int k, int activation);

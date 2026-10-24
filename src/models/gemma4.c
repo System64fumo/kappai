@@ -23,8 +23,9 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 	const int fuse_qkv = has_matmul_multi;
 
 	if (fuse_qkv) {
-		OP_EMIT(e, mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, n_heads * head_dim,
-									n_kv_heads * head_dim, n_kv_heads * head_dim, dim));
+		OP_EMIT(e, mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_V,
+									WIDX_WQ, n_heads * head_dim, n_kv_heads * head_dim,
+									n_kv_heads * head_dim, dim));
 	} else {
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, 0, dim, STAGE_MATMUL));
 
@@ -65,7 +66,8 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 static void build_gemma4_ffn_prefix(op_emitter *e, int dim, float eps, int has_matmul_multi) {
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 	if (has_matmul_multi) {
-		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, 0, 0, dim));
+		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+									WIDX_GATE, 0, 0, dim));
 	} else {
 		OP_EMIT(e,
 				mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, 0, dim, STAGE_MATMUL));

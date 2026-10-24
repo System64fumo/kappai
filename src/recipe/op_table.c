@@ -9,7 +9,6 @@ typedef struct {
 	uint32_t	batch_extra_mask;
 	int8_t		reads[4];
 	int8_t		writes[4];
-	uint8_t		inplace_out_none;
 	const char *name;
 	uint8_t		state_reads;
 	uint8_t		state_writes;
@@ -37,23 +36,21 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 							.writes	 = {OP_TOUCH_OUT}},
 		[OP_SCALE_EMBEDDINGS] =
 			{
-				.name			  = "scale_embeddings",
-				.fn_name		  = "scale_inplace",
-				.slot0			  = OP_FN_SLOT(scale_inplace),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "scale_embeddings",
+				.fn_name = "scale_inplace",
+				.slot0	 = OP_FN_SLOT(scale_inplace),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_SCALE] =
 			{
-				.name			  = "scale",
-				.fn_name		  = "scale_inplace",
-				.slot0			  = OP_FN_SLOT(scale_inplace),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "scale",
+				.fn_name = "scale_inplace",
+				.slot0	 = OP_FN_SLOT(scale_inplace),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_RMSNORM] =
 			{
@@ -66,23 +63,21 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_RMSNORM_PER_HEAD] =
 			{
-				.name			  = "rmsnorm_per_head",
-				.fn_name		  = "rmsnorm_per_head",
-				.slot0			  = OP_FN_SLOT(rmsnorm_per_head),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "rmsnorm_per_head",
+				.fn_name = "rmsnorm_per_head",
+				.slot0	 = OP_FN_SLOT(rmsnorm_per_head),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_RMSNORM_NOWEIGHT] =
 			{
-				.name			  = "rmsnorm_noweight",
-				.fn_name		  = "rmsnorm_noweight",
-				.slot0			  = OP_FN_SLOT(rmsnorm_noweight),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "rmsnorm_noweight",
+				.fn_name = "rmsnorm_noweight",
+				.slot0	 = OP_FN_SLOT(rmsnorm_noweight),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_RMSNORM_ADD] =
 			{
@@ -101,7 +96,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.slot1			  = OP_NO_SLOT,
 				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
 				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT_GATE, OP_TOUCH_OUT_UP},
+				.writes			  = {OP_TOUCH_OUT},
 			},
 		[OP_MATMUL_MULTI] =
 			{
@@ -111,7 +106,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.slot1			  = OP_NO_SLOT,
 				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
 				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2_WQ},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2},
 			},
 		[OP_MATMUL_RESIDUAL] =
 			{
@@ -176,13 +171,12 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_ROPE] =
 			{
-				.name			  = "rope",
-				.fn_name		  = "rope",
-				.slot0			  = OP_FN_SLOT(rope),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "rope",
+				.fn_name = "rope",
+				.slot0	 = OP_FN_SLOT(rope),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_ROPE_QK_FUSED] =
 			{
@@ -195,13 +189,12 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_ROPE_EXT] =
 			{
-				.name			  = "rope_ext",
-				.fn_name		  = "rope_ext",
-				.slot0			  = OP_FN_SLOT(rope_ext),
-				.slot1			  = OP_FN_SLOT(rope),
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "rope_ext",
+				.fn_name = "rope_ext",
+				.slot0	 = OP_FN_SLOT(rope_ext),
+				.slot1	 = OP_FN_SLOT(rope),
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_QK_NORM_ROPE] =
 			{
@@ -296,13 +289,12 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_SOFTCAP] =
 			{
-				.name			  = "softcap",
-				.fn_name		  = "softcap",
-				.slot0			  = OP_FN_SLOT(softcap),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
-				.inplace_out_none = 1,
+				.name	 = "softcap",
+				.fn_name = "softcap",
+				.slot0	 = OP_FN_SLOT(softcap),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_SPLIT_QGATE] =
 			{
@@ -483,35 +475,17 @@ static void touch_push(uint8_t *list, int *n, uint8_t slot) {
 	list[(*n)++] = slot;
 }
 
-static uint8_t touch_resolve(int8_t t, const recipe_op *op, uint8_t inplace_out_none) {
+static uint8_t touch_resolve(int8_t t, const recipe_op *op) {
 	if (t < 0)
 		return (uint8_t)(-t - 1);
 	if (t <= OP_TOUCH_IN2)
 		return op->in[t - 1];
-	if (t == OP_TOUCH_OUT) {
-		uint8_t slot = op->out;
-		if (slot == RECIPE_SLOT_NONE && inplace_out_none)
-			slot = op->in[0];
-		return slot;
-	}
-	if (t == OP_TOUCH_OUT1) {
-		if (op->w_idx == WIDX_GATE_UP)
-			return RECIPE_SLOT_FFN_GATE;
-		return (uint8_t)(op->out + 1);
-	}
-	if (t == OP_TOUCH_OUT2_WQ) {
-		if (op->w_idx == WIDX_GATE_UP)
-			return RECIPE_SLOT_FFN_UP;
-		if (op->w_idx != WIDX_WQ)
-			return RECIPE_SLOT_NONE;
-		return (uint8_t)(op->out + 2);
-	}
-	if (op->out != RECIPE_SLOT_FFN_GATE_UP)
-		return RECIPE_SLOT_NONE;
-	if (t == OP_TOUCH_OUT_GATE)
-		return RECIPE_SLOT_FFN_GATE;
-	if (t == OP_TOUCH_OUT_UP)
-		return RECIPE_SLOT_FFN_UP;
+	if (t == OP_TOUCH_OUT)
+		return op->out;
+	if (t == OP_TOUCH_OUT1)
+		return op->u.matmul_multi.out[1];
+	if (t == OP_TOUCH_OUT2)
+		return op->u.matmul_multi.out[2];
 	return RECIPE_SLOT_NONE;
 }
 
@@ -521,9 +495,9 @@ int recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *
 		return 0;
 	const op_requirement *req = &OP_REQUIREMENTS[op->kind];
 	for (int i = 0; i < 4 && req->reads[i]; i++)
-		touch_push(reads, n_reads, touch_resolve(req->reads[i], op, req->inplace_out_none));
+		touch_push(reads, n_reads, touch_resolve(req->reads[i], op));
 	for (int i = 0; i < 4 && req->writes[i]; i++)
-		touch_push(writes, n_writes, touch_resolve(req->writes[i], op, req->inplace_out_none));
+		touch_push(writes, n_writes, touch_resolve(req->writes[i], op));
 	return 1;
 }
 

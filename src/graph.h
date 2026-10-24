@@ -48,6 +48,7 @@ typedef enum { CG_RES_DEVICE = 0, CG_RES_HOST } cg_residency;
 typedef struct {
 	int		producer;
 	int		alias_of;
+	int		view_of;
 	int		n_uses;
 	uint8_t slot;
 	uint8_t loop_carried;

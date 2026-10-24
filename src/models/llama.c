@@ -36,8 +36,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, eps, STAGE_RMSNORM));
 
 		if (has_matmul_multi) {
-			OP_EMIT(&e, mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, kv_out,
-										 kv_out, dim));
+			OP_EMIT(&e, mk_matmul_multi3(RECIPE_SLOT_XB, RECIPE_SLOT_Q, RECIPE_SLOT_K,
+										 RECIPE_SLOT_V, WIDX_WQ, q_out, kv_out, kv_out, dim));
 		} else {
 			OP_EMIT(&e,
 					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
@@ -80,8 +80,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 			OP_EMIT(&e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT,
 											  intermediate, act));
 		} else if (has_matmul_multi) {
-			OP_EMIT(&e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE,
-										 intermediate, intermediate, dim));
+			OP_EMIT(&e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+										 WIDX_GATE, intermediate, intermediate, dim));
 		} else {
 			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, intermediate,
 								  dim, STAGE_MATMUL));

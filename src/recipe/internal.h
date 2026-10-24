@@ -290,10 +290,6 @@ status_code	   embd_fill_rows(backend *a, const buffer *w, uint32_t w_type, cons
 buffer		   bs_cached_view(float_buf *fb, backend *owner, size_t n_elems);
 batch_scratch *batch_scratch_prepare(model *m, compute_scratch *s, int n_rows);
 
-static inline void recipe_unused(int dummy, ...) {
-	(void)dummy;
-}
-
 static inline backend *op_host_backend(void) {
 	backend *b = atomic_load_explicit(&cached_host_backend, memory_order_relaxed);
 	if (!b) {

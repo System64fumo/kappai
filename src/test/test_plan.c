@@ -50,22 +50,26 @@ static void test_touch_contents(void) {
 	}
 	record_plan("touch.table_complete", ok, "");
 
-	op.kind = OP_SCALE;
-	op.out	= RECIPE_SLOT_NONE;
+	op.kind	 = OP_SCALE;
+	op.in[0] = RECIPE_SLOT_X;
+	op.out	 = RECIPE_SLOT_X;
 	nr = nw = 0;
 	ok		= recipe_op_touch(&op, reads, &nr, writes, &nw) == 1;
 	ok &= nr == 1 && reads[0] == RECIPE_SLOT_X && nw == 1 && writes[0] == RECIPE_SLOT_X;
-	record_plan("touch.inplace_out_none", ok, "nr=%d nw=%d", nr, nw);
+	record_plan("touch.inplace_explicit", ok, "nr=%d nw=%d", nr, nw);
 
-	op.kind	 = OP_MATMUL_MULTI;
-	op.out	 = RECIPE_SLOT_Q;
-	op.w_idx = WIDX_WQ;
+	op.kind					 = OP_MATMUL_MULTI;
+	op.out					 = RECIPE_SLOT_Q;
+	op.w_idx				 = WIDX_WQ;
+	op.u.matmul_multi.out[0] = RECIPE_SLOT_Q;
+	op.u.matmul_multi.out[1] = RECIPE_SLOT_K;
+	op.u.matmul_multi.out[2] = RECIPE_SLOT_V;
 	nr = nw = 0;
 	ok		= recipe_op_touch(&op, reads, &nr, writes, &nw) == 1;
-	ok &= nr == 1 && nw == 3 && writes[0] == RECIPE_SLOT_Q && writes[1] == RECIPE_SLOT_Q + 1 &&
-		  writes[2] == RECIPE_SLOT_Q + 2;
-	op.w_idx = WIDX_WV;
-	nw		 = 0;
+	ok &= nr == 1 && nw == 3 && writes[0] == RECIPE_SLOT_Q && writes[1] == RECIPE_SLOT_K &&
+		  writes[2] == RECIPE_SLOT_V;
+	op.u.matmul_multi.out[2] = RECIPE_SLOT_NONE;
+	nw						 = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
 	ok &= nw == 2;
 	record_plan("touch.matmul_multi", ok, "nw=%d", nw);
@@ -83,12 +87,8 @@ static void test_touch_contents(void) {
 	op.w_idx = WIDX_GATE_UP;
 	nr = nw = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
-	ok = nr == 1 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
-	op.out = RECIPE_SLOT_ATTN_OUT;
-	nr = nw = 0;
-	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
-	ok &= nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_ATTN_OUT;
-	record_plan("touch.matmul_gate_up_slices", ok, "nr=%d nw=%d", nr, nw);
+	ok = nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_FFN_GATE_UP;
+	record_plan("touch.matmul_gate_up_primary", ok, "nr=%d nw=%d", nr, nw);
 }
 
 static void set_mm(recipe_op *op, uint8_t out) {
@@ -421,6 +421,43 @@ static void test_graph_pass_add_norm(void) {
 	graph_free(g);
 }
 
+static void test_graph_slot_views(void) {
+	recipe_op	 pre[1], layer[3];
+	model_recipe r;
+	fill_recipe(&r, pre, layer, 3, NULL, 0);
+	set_op(&layer[0], OP_RMSNORM, RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_XB);
+	set_matmul(&layer[1], RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP, 16, 4);
+	set_op(&layer[2], OP_FFN_ACTIVATE_FUSED, RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_NONE,
+		   RECIPE_SLOT_FFN_ACT);
+
+	cg_graph *g	 = graph_build(&r);
+	int		  ok = g && g->n_nodes == 4 && g->nodes[2].n_out == 3;
+	if (ok) {
+		const cg_node  *mm	   = &g->nodes[2];
+		const cg_value *parent = &g->values[mm->out[0]];
+		const cg_value *gate   = &g->values[mm->out[1]];
+		const cg_value *up	   = &g->values[mm->out[2]];
+		ok = parent->view_of == CG_NONE && gate->view_of == mm->out[0] &&
+			 up->view_of == mm->out[0] && gate->slot == RECIPE_SLOT_FFN_GATE &&
+			 up->slot == RECIPE_SLOT_FFN_UP && gate->producer == 2 && up->producer == 2 &&
+			 gate->port == 1 && up->port == 2;
+	}
+	record_plan("graph.slot_views_gate_up", ok, "");
+	ok = g && graph_validate(g) == 0;
+	record_plan("graph.slot_views_validate", ok, "");
+	cg_range *ranges = g ? graph_value_ranges(g) : NULL;
+	ok				 = ranges != NULL;
+	if (ok) {
+		const cg_node *mm = &g->nodes[2];
+		for (int k = 1; k < mm->n_out; k++)
+			ok &= ranges[mm->out[0]].start <= ranges[mm->out[k]].start &&
+				  ranges[mm->out[0]].end >= ranges[mm->out[k]].end;
+	}
+	record_plan("graph.slot_views_range_folded", ok, "");
+	free(ranges);
+	graph_free(g);
+}
+
 static void test_graph_pass_gate_up(void) {
 	recipe_op	 pre[1], layer[4], lowered[4];
 	model_recipe r;
@@ -465,7 +502,7 @@ static void test_graph_pass_output_scale(void) {
 	set_matmul(&layer[1], RECIPE_SLOT_XB, RECIPE_SLOT_ATTN_OUT, WIDX_WO, 4, 4);
 	set_op(&layer[2], OP_RMSNORM_ADD, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, RECIPE_SLOT_X);
 	layer[2].u.rmsnorm.out_scale = 2.0f;
-	set_op(&layer[3], OP_SCALE, RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE);
+	set_op(&layer[3], OP_SCALE, RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_X);
 	layer[3].u.scale.scale = 0.5f;
 	set_op(&post[0], OP_RMSNORM, RECIPE_SLOT_X, RECIPE_SLOT_NONE, RECIPE_SLOT_XB);
 
@@ -902,6 +939,7 @@ void run_plan_tests(void) {
 	test_graph_pass_coalesce();
 	test_graph_pass_add_norm();
 	test_graph_pass_gate_up();
+	test_graph_slot_views();
 	test_graph_pass_output_scale();
 	test_graph_set_variants();
 	test_graph_set_weights();

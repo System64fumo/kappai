@@ -191,9 +191,12 @@ static void replace_value(cg_graph *g, int from, int to) {
 	for (int c = 0; c < g->n_carry; c++)
 		if (g->carry[c].out == from)
 			g->carry[c].out = to;
-	for (int v = 0; v < g->n_values; v++)
+	for (int v = 0; v < g->n_values; v++) {
 		if (g->values[v].alias_of == from)
 			g->values[v].alias_of = to;
+		if (g->values[v].view_of == from)
+			g->values[v].view_of = to;
+	}
 	g->values[to].n_uses += g->values[from].n_uses - 1;
 	g->values[from].n_uses = 0;
 }
@@ -268,6 +271,9 @@ static void merge_gate_up(cg_graph *g, int gate_index) {
 	op_params params;
 	memset(&params, 0, sizeof(params));
 	params.matmul_multi.n		 = 2;
+	params.matmul_multi.out[0]	 = g->values[gate->out[0]].slot;
+	params.matmul_multi.out[1]	 = g->values[up_out].slot;
+	params.matmul_multi.out[2]	 = RECIPE_SLOT_NONE;
 	params.matmul_multi.k		 = gate->params.matmul.k;
 	params.matmul_multi.n_out[0] = gate->params.matmul.n;
 	params.matmul_multi.n_out[1] = up->params.matmul.n;
@@ -365,9 +371,9 @@ static recipe_op lower_fused_node(const cg_graph *g, const cg_node *n) {
 }
 
 static recipe_op lower_multi_node(const cg_graph *g, const cg_node *n) {
-	return mk_matmul_multi2(node_in_slot(g, n, 0), g->values[n->out[0]].slot, n->w_idx,
-							n->params.matmul_multi.n_out[0], n->params.matmul_multi.n_out[1],
-							n->params.matmul_multi.k);
+	return mk_matmul_multi2(node_in_slot(g, n, 0), g->values[n->out[0]].slot,
+							g->values[n->out[1]].slot, n->w_idx, n->params.matmul_multi.n_out[0],
+							n->params.matmul_multi.n_out[1], n->params.matmul_multi.k);
 }
 
 static int lowerable_rewrite(op_kind lowered, op_kind original) {

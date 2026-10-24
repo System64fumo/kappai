@@ -1125,8 +1125,8 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			for (int i = 0; i < nb; i++)
 				profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[i], n_out[i], k);
 			buffer	   *ys[3] = {batch_slot(ctx->bs, ctx->op->out),
-								 batch_slot(ctx->bs, ctx->op->out + 1),
-								 batch_slot(ctx->bs, ctx->op->out + 2)};
+								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]),
+								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[2])};
 			status_code st = a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]),
 												   ys, n_out, k, n_mats, ctx->rows.n_rows);
 			if (st == OK && !lc->has_own_v)
@@ -1138,11 +1138,11 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 							batch_slot(ctx->bs, ctx->op->out), n_out[0], k, ctx->rows.n_rows);
 		if (st == OK)
 			st = a->matmul_batch(a, &lw->wk.buf, lw->wk.type, batch_slot(ctx->bs, ctx->op->in[0]),
-								 batch_slot(ctx->bs, ctx->op->out + 1), n_out[1], k,
+								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]), n_out[1], k,
 								 ctx->rows.n_rows);
 		if (st == OK && lc->has_own_v)
 			st = a->matmul_batch(a, &lw->wv.buf, lw->wv.type, batch_slot(ctx->bs, ctx->op->in[0]),
-								 batch_slot(ctx->bs, ctx->op->out + 2), n_out[2], k,
+								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[2]), n_out[2], k,
 								 ctx->rows.n_rows);
 		if (st == OK && !lc->has_own_v)
 			st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows);
@@ -1184,7 +1184,7 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[0], n_out[0], k);
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[1], n_out[1], k);
 			buffer *ys[2] = {batch_slot(ctx->bs, ctx->op->out),
-							 batch_slot(ctx->bs, ctx->op->out + 1)};
+							 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1])};
 			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
 										 k, 2, ctx->rows.n_rows);
 		}
@@ -1194,7 +1194,7 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 		if (st == OK)
 			st = a->matmul_batch(
 				a, &lw->up_w.buf, lw->up_w.type, batch_slot(ctx->bs, ctx->op->in[0]),
-				batch_slot(ctx->bs, ctx->op->out + 1), n_out[1], k, ctx->rows.n_rows);
+				batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]), n_out[1], k, ctx->rows.n_rows);
 		return st;
 	}
 	return ERR_INVALID_ARG;

@@ -637,7 +637,7 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 	if (n_tokens < 1)
 		return OK;
 	if (!recipe_is_decode_batchable(m)) {
-		ERROR("model cannot run on the batch walker: a backend holding layers lacks batch ops");
+		ERROR("model cannot run on the graph executor: a backend holding layers lacks batch ops");
 		return ERR_UNSUPPORTED;
 	}
 
