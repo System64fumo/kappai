@@ -58,18 +58,17 @@ static void test_touch_contents(void) {
 	ok &= nr == 1 && reads[0] == RECIPE_SLOT_X && nw == 1 && writes[0] == RECIPE_SLOT_X;
 	record_plan("touch.inplace_explicit", ok, "nr=%d nw=%d", nr, nw);
 
-	op.kind					 = OP_MATMUL_MULTI;
-	op.out					 = RECIPE_SLOT_Q;
-	op.w_idx				 = WIDX_WQ;
-	op.u.matmul_multi.out[0] = RECIPE_SLOT_Q;
-	op.u.matmul_multi.out[1] = RECIPE_SLOT_K;
-	op.u.matmul_multi.out[2] = RECIPE_SLOT_V;
+	op.kind	 = OP_MATMUL_MULTI;
+	op.out	 = RECIPE_SLOT_Q;
+	op.w_idx = WIDX_WQ;
+	op.out1	 = RECIPE_SLOT_K;
+	op.out2	 = RECIPE_SLOT_V;
 	nr = nw = 0;
 	ok		= recipe_op_touch(&op, reads, &nr, writes, &nw) == 1;
 	ok &= nr == 1 && nw == 3 && writes[0] == RECIPE_SLOT_Q && writes[1] == RECIPE_SLOT_K &&
 		  writes[2] == RECIPE_SLOT_V;
-	op.u.matmul_multi.out[2] = RECIPE_SLOT_NONE;
-	nw						 = 0;
+	op.out2 = RECIPE_SLOT_NONE;
+	nw		= 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
 	ok &= nw == 2;
 	record_plan("touch.matmul_multi", ok, "nw=%d", nw);
@@ -79,27 +78,46 @@ static void test_touch_contents(void) {
 	op.w_idx = WIDX_NONE;
 	nr = nw = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
-	ok = nr == 1 && nw == 3 && writes[1] == RECIPE_SLOT_FFN_GATE && writes[2] == RECIPE_SLOT_FFN_UP;
+	ok = nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_XB;
 	record_plan("touch.mla_qkv_fused", ok, "nr=%d nw=%d", nr, nw);
 
 	op.kind	 = OP_MATMUL;
 	op.out	 = RECIPE_SLOT_FFN_GATE_UP;
 	op.w_idx = WIDX_GATE_UP;
+	op.in[1] = RECIPE_SLOT_NONE;
 	nr = nw = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
 	ok = nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_FFN_GATE_UP;
 	record_plan("touch.matmul_gate_up_primary", ok, "nr=%d nw=%d", nr, nw);
+
+	op.out	 = RECIPE_SLOT_V;
+	op.w_idx = WIDX_WV;
+	op.in[0] = RECIPE_SLOT_XB;
+	op.in[1] = RECIPE_SLOT_K;
+	nr = nw = 0;
+	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
+	ok = nr == 2 && nw == 1 && reads[0] == RECIPE_SLOT_XB && reads[1] == RECIPE_SLOT_K &&
+		 writes[0] == RECIPE_SLOT_V;
+	record_plan("touch.matmul_v_reads_k", ok, "nr=%d nw=%d", nr, nw);
+}
+
+static void reset_op(recipe_op *op) {
+	memset(op, 0, sizeof(*op));
+	for (size_t i = 0; i < sizeof(op->in) / sizeof(op->in[0]); i++)
+		op->in[i] = RECIPE_SLOT_NONE;
+	op->out1 = RECIPE_SLOT_NONE;
+	op->out2 = RECIPE_SLOT_NONE;
 }
 
 static void set_mm(recipe_op *op, uint8_t out) {
-	memset(op, 0, sizeof(*op));
+	reset_op(op);
 	op->kind  = OP_MATMUL;
 	op->out	  = out;
 	op->stage = STAGE_ATTN;
 }
 
 static void set_op(recipe_op *op, op_kind kind, uint8_t in0, uint8_t in1, uint8_t out) {
-	memset(op, 0, sizeof(*op));
+	reset_op(op);
 	op->kind  = kind;
 	op->in[0] = in0;
 	op->in[1] = in1;

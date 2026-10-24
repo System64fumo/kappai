@@ -124,7 +124,7 @@ status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 	if (st != OK)
 		goto mla_qkv_cleanup;
 
-	buffer *q_buf = batch_slot(ctx->bs, RECIPE_SLOT_Q);
+	buffer *q_buf = batch_slot(ctx->bs, ctx->op->out);
 	st			  = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, q_a_b, q_buf, q_b_rows, q_lora,
 									ctx->rows.n_rows);
 	if (st != OK)
@@ -162,7 +162,7 @@ status_code op_mla_q_proj(exec_ctx *ctx) {
 							  ctx->rows.n_rows);
 	if (st != OK)
 		goto mla_q_cleanup;
-	buffer *q_buf = batch_slot(ctx->bs, RECIPE_SLOT_Q);
+	buffer *q_buf = batch_slot(ctx->bs, ctx->op->out);
 	st			  = a->matmul_batch(a, &L->q_b_w.buf, L->q_b_w.type, q_a_b, q_buf, q_b_rows, q_lora,
 									ctx->rows.n_rows);
 mla_q_cleanup:

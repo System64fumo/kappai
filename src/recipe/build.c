@@ -216,7 +216,7 @@ model_recipe *recipe_build(const struct model *m) {
 				recipe_op *op = &dst[j];
 				if (!lc->has_kv) {
 					if ((op->w_idx == WIDX_WK || op->w_idx == WIDX_WV) || op->kind == OP_KV_PUT ||
-						(op->kind == OP_ROPE_EXT && op->in[0] == RECIPE_SLOT_K) ||
+						(op->kind == OP_ROPE_EXT && !op->u.rope_ext.is_q) ||
 						(op->kind == OP_RMSNORM_PER_HEAD && op->w_idx == WIDX_ATTN_K_NORM) ||
 						op->kind == OP_RMSNORM_NOWEIGHT) {
 						op->kind = OP_NONE;

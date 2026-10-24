@@ -11,8 +11,10 @@ static recipe_op mk_op_base(op_kind kind, uint8_t in0, uint8_t in1, uint8_t in2,
 							uint8_t widx, stage stg) {
 	recipe_op op = {
 		.kind  = kind,
-		.in	   = {in0, in1, in2},
+		.in	   = {in0, in1, in2, RECIPE_SLOT_NONE},
 		.out   = out,
+		.out1  = RECIPE_SLOT_NONE,
+		.out2  = RECIPE_SLOT_NONE,
 		.w_idx = widx,
 		.stage = stg,
 	};
@@ -40,13 +42,17 @@ recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage s
 	return op;
 }
 
+recipe_op mk_matmul_v(uint8_t in, uint8_t k_slot, uint8_t v_slot, int n, int k, stage stage) {
+	recipe_op op = mk_matmul(in, v_slot, WIDX_WV, n, k, stage);
+	op.in[1]	 = k_slot;
+	return op;
+}
+
 recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
 						   int k) {
 	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out0, widx,
 							  STAGE_MATMUL);
-	op.u.matmul_multi.out[0]   = out0;
-	op.u.matmul_multi.out[1]   = out1;
-	op.u.matmul_multi.out[2]   = RECIPE_SLOT_NONE;
+	op.out1		 = out1;
 	op.u.matmul_multi.n		   = 2;
 	op.u.matmul_multi.k		   = k;
 	op.u.matmul_multi.n_out[0] = n0;
@@ -58,9 +64,8 @@ recipe_op mk_matmul_multi3(uint8_t in, uint8_t out0, uint8_t out1, uint8_t out2,
 						   int n0, int n1, int n2, int k) {
 	recipe_op op = mk_op_base(OP_MATMUL_MULTI, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out0, widx,
 							  STAGE_MATMUL);
-	op.u.matmul_multi.out[0]   = out0;
-	op.u.matmul_multi.out[1]   = out1;
-	op.u.matmul_multi.out[2]   = out2;
+	op.out1		 = out1;
+	op.out2		 = out2;
 	op.u.matmul_multi.n		   = 3;
 	op.u.matmul_multi.k		   = k;
 	op.u.matmul_multi.n_out[0] = n0;
@@ -117,19 +122,35 @@ recipe_op mk_rmsnorm_noweight(uint8_t in) {
 					  RECIPE_NO_WEIGHT, STAGE_RMSNORM);
 }
 
-recipe_op mk_split_qgate(void) {
-	return mk_op_base(OP_SPLIT_QGATE, RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-					  RECIPE_SLOT_Q, RECIPE_NO_WEIGHT, STAGE_MATMUL);
+recipe_op mk_split_qgate(uint8_t proj, uint8_t q, uint8_t gate) {
+	recipe_op op = mk_op_base(OP_SPLIT_QGATE, proj, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, q,
+							  RECIPE_NO_WEIGHT, STAGE_MATMUL);
+	op.out1		 = gate;
+	return op;
 }
 
-recipe_op mk_attn_output_gate(uint8_t attn_in, uint8_t gate_in, uint8_t out) {
-	return mk_op_base(OP_ATTN_OUTPUT_GATE, attn_in, gate_in, RECIPE_SLOT_NONE, out,
-					  RECIPE_NO_WEIGHT, STAGE_ATTN);
-}
-
-recipe_op mk_gated_delta_net(uint8_t proj_in, uint8_t gate_in, uint8_t alpha_in, uint8_t out) {
-	return mk_op_base(OP_GATED_DELTA_NET, proj_in, gate_in, alpha_in, out, RECIPE_NO_WEIGHT,
+recipe_op mk_attn_output_gate(uint8_t io, uint8_t gate) {
+	return mk_op_base(OP_ATTN_OUTPUT_GATE, io, gate, RECIPE_SLOT_NONE, io, RECIPE_NO_WEIGHT,
 					  STAGE_ATTN);
+}
+
+recipe_op mk_gated_delta_net(uint8_t proj_in, uint8_t gate_in, uint8_t alpha_in, uint8_t beta_in,
+							 uint8_t out) {
+	recipe_op op = mk_op_base(OP_GATED_DELTA_NET, proj_in, gate_in, alpha_in, out, RECIPE_NO_WEIGHT,
+							  STAGE_ATTN);
+	op.in[3]	 = beta_in;
+	return op;
+}
+
+recipe_op mk_hc_pre(uint8_t stream, uint8_t x, uint8_t coef, uint8_t widx) {
+	recipe_op op =
+		mk_op_base(OP_HC_PRE, stream, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, x, widx, STAGE_ATTN);
+	op.out1 = coef;
+	return op;
+}
+
+recipe_op mk_hc_post(uint8_t sub, uint8_t coef, uint8_t hc) {
+	return mk_op_base(OP_HC_POST, sub, coef, hc, hc, WIDX_NONE, STAGE_ADD);
 }
 
 recipe_op mk_shortconv(uint8_t in, uint8_t out) {
@@ -207,45 +228,51 @@ recipe_op mk_attention_default_scale(uint8_t q_in, uint8_t out, int n_heads, int
 }
 
 recipe_op mk_rope(uint8_t in, int n_heads, int head_dim, int rope_neox) {
-	recipe_op op = mk_op_base(OP_ROPE, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-							  RECIPE_NO_WEIGHT, STAGE_ROPE);
+	recipe_op op = mk_op_base(OP_ROPE, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, in, RECIPE_NO_WEIGHT,
+							  STAGE_ROPE);
 	op.u.rope.n_heads	= n_heads;
 	op.u.rope.head_dim	= head_dim;
 	op.u.rope.rope_neox = rope_neox;
 	return op;
 }
 
-recipe_op mk_rope_qk_fused(int n_heads, int n_kv_heads, int head_dim, int rope_neox) {
-	recipe_op op	  = mk_op_base(OP_ROPE_QK_FUSED, RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE,
-								   RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_ROPE);
-	op.u.rope.n_heads = n_heads;
+recipe_op mk_rope_qk_fused(uint8_t q, uint8_t k, int n_heads, int n_kv_heads, int head_dim,
+						   int rope_neox) {
+	recipe_op op =
+		mk_op_base(OP_ROPE_QK_FUSED, q, k, RECIPE_SLOT_NONE, q, RECIPE_NO_WEIGHT, STAGE_ROPE);
+	op.out1				 = k;
+	op.u.rope.n_heads	 = n_heads;
 	op.u.rope.n_kv_heads = n_kv_heads;
 	op.u.rope.head_dim	 = head_dim;
 	op.u.rope.rope_neox	 = rope_neox;
 	return op;
 }
 
-recipe_op mk_rope_ext(uint8_t in, int rope_neox) {
-	recipe_op op = mk_op_base(OP_ROPE_EXT, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-							  RECIPE_NO_WEIGHT, STAGE_ROPE);
-	op.u.rope_ext.n_heads		   = 0;
-	op.u.rope_ext.head_dim		   = 0;
+recipe_op mk_rope_ext(uint8_t in, int is_q, int rope_neox) {
+	recipe_op op		   = mk_op_base(OP_ROPE_EXT, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, in,
+										RECIPE_NO_WEIGHT, STAGE_ROPE);
+	op.u.rope_ext.n_heads  = 0;
+	op.u.rope_ext.head_dim = 0;
 	op.u.rope_ext.use_freq_factors = 1;
 	op.u.rope_ext.rope_neox		   = rope_neox;
+	op.u.rope_ext.is_q			   = is_q;
 	return op;
 }
 
-recipe_op mk_qk_norm_rope(float eps, int rope_neox) {
-	recipe_op op = mk_op_base(OP_QK_NORM_ROPE, RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE,
-							  RECIPE_SLOT_NONE, WIDX_ATTN_Q_NORM, STAGE_ROPE);
+recipe_op mk_qk_norm_rope(uint8_t q, uint8_t k, float eps, int rope_neox) {
+	recipe_op op =
+		mk_op_base(OP_QK_NORM_ROPE, q, k, RECIPE_SLOT_NONE, q, WIDX_ATTN_Q_NORM, STAGE_ROPE);
+	op.out1						= k;
 	op.u.qk_norm_rope.eps		= eps;
 	op.u.qk_norm_rope.rope_neox = rope_neox;
 	return op;
 }
 
-recipe_op mk_partial_rope_qk(void) {
-	return mk_op_base(OP_PARTIAL_ROPE_QK, RECIPE_SLOT_Q, RECIPE_SLOT_K, RECIPE_SLOT_NONE,
-					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_ROPE);
+recipe_op mk_partial_rope_qk(uint8_t q, uint8_t k) {
+	recipe_op op =
+		mk_op_base(OP_PARTIAL_ROPE_QK, q, k, RECIPE_SLOT_NONE, q, RECIPE_NO_WEIGHT, STAGE_ROPE);
+	op.out1 = k;
+	return op;
 }
 
 static recipe_op mk_embd_lookup(void) {
@@ -275,17 +302,18 @@ static recipe_op mk_logits_readback(void) {
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
 }
 
-static recipe_op mk_moe_router(uint8_t in, int n_experts, int k) {
-	recipe_op op  = mk_op_base(OP_MOE_ROUTER, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-							   RECIPE_SLOT_ROUTER_IDS, WIDX_FFN_GATE_INP, STAGE_MATMUL);
+static recipe_op mk_moe_router(uint8_t in, uint8_t ids, uint8_t weights, int n_experts, int k) {
+	recipe_op op  = mk_op_base(OP_MOE_ROUTER, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, ids,
+							   WIDX_FFN_GATE_INP, STAGE_MATMUL);
+	op.out1		  = weights;
 	op.u.matmul.n = n_experts;
 	op.u.matmul.k = k;
 	return op;
 }
 
-static recipe_op mk_moe_experts(uint8_t in, uint8_t out, int n, int k) {
-	recipe_op op = mk_op_base(OP_MOE_EXPERTS, in, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W, out,
-							  WIDX_NONE, STAGE_MATMUL);
+static recipe_op mk_moe_experts(uint8_t in, uint8_t ids, uint8_t weights, uint8_t out, int n,
+								int k) {
+	recipe_op op  = mk_op_base(OP_MOE_EXPERTS, in, ids, weights, out, WIDX_NONE, STAGE_MATMUL);
 	op.u.matmul.n = n;
 	op.u.matmul.k = k;
 	return op;
@@ -343,14 +371,16 @@ int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t 
 	int dim		  = m->dim;
 	int moe_inter = m->moe.moe_intermediate;
 
-	ops[i++] = mk_moe_router(router_in_slot, m->moe.n_experts, dim);
+	ops[i++] = mk_moe_router(router_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
+							 m->moe.n_experts, dim);
 
 	if (m->moe.n_shared_experts > 0) {
 		int sh_inter = moe_inter * m->moe.n_shared_experts;
 		ops[i++]	 = mk_moe_shared(experts_in_slot, sh_inter, dim);
 	}
 
-	ops[i++] = mk_moe_experts(experts_in_slot, out_slot, dim, moe_inter);
+	ops[i++] = mk_moe_experts(experts_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
+							  out_slot, dim, moe_inter);
 
 	return i;
 }

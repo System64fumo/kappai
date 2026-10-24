@@ -39,20 +39,18 @@ static void append_moe_ffn(op_emitter *e, const model *m) {
 }
 
 static void append_layer(op_emitter *e, const model *m, int li) {
-	OP_EMIT(e,
-			mk_backend_op(OP_HC_PRE, RECIPE_SLOT_HC, RECIPE_SLOT_X, WIDX_HC_ATTN_FN, STAGE_ATTN));
+	OP_EMIT(e, mk_hc_pre(RECIPE_SLOT_HC, RECIPE_SLOT_X, RECIPE_SLOT_HC_COEF, WIDX_HC_ATTN_FN));
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
 	OP_EMIT(e, mk_backend_op(model_layer_is_recurrent(m, li) ? OP_KDA : OP_MLA_ABSORBED,
 							 RECIPE_SLOT_XB, RECIPE_SLOT_ATTN_OUT, WIDX_NONE, STAGE_ATTN));
-	OP_EMIT(e,
-			mk_backend_op(OP_HC_POST, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_HC, WIDX_NONE, STAGE_ADD));
-	OP_EMIT(e, mk_backend_op(OP_HC_PRE, RECIPE_SLOT_HC, RECIPE_SLOT_X, WIDX_HC_FFN_FN, STAGE_ATTN));
+	OP_EMIT(e, mk_hc_post(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_HC_COEF, RECIPE_SLOT_HC));
+	OP_EMIT(e, mk_hc_pre(RECIPE_SLOT_HC, RECIPE_SLOT_X, RECIPE_SLOT_HC_COEF, WIDX_HC_FFN_FN));
 	if (model_layer_is_moe(m, li))
 		append_moe_ffn(e, m);
 	else
 		append_dense_ffn(e, m, li);
-	OP_EMIT(e, mk_backend_op(OP_HC_POST, RECIPE_SLOT_XB2, RECIPE_SLOT_HC, WIDX_NONE, STAGE_ADD));
+	OP_EMIT(e, mk_hc_post(RECIPE_SLOT_XB2, RECIPE_SLOT_HC_COEF, RECIPE_SLOT_HC));
 }
 
 static model_recipe *build_glm5_next_recipe(const model *m) {

@@ -90,23 +90,21 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_MATMUL] =
 			{
-				.name			  = "matmul",
-				.fn_name		  = "matmul",
-				.slot0			  = OP_FN_SLOT(matmul),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT},
+				.name	 = "matmul",
+				.fn_name = "matmul",
+				.slot0	 = OP_FN_SLOT(matmul),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_MATMUL_MULTI] =
 			{
-				.name			  = "matmul_multi",
-				.fn_name		  = "matmul",
-				.slot0			  = OP_FN_SLOT(matmul),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_K) | (1u << RECIPE_SLOT_V),
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2},
+				.name	 = "matmul_multi",
+				.fn_name = "matmul",
+				.slot0	 = OP_FN_SLOT(matmul),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2},
 			},
 		[OP_MATMUL_RESIDUAL] =
 			{
@@ -130,33 +128,34 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_MLA_Q_PROJ] =
 			{
-				.name	 = "mla_q_proj",
-				.fn_name = "matmul",
-				.slot0	 = OP_FN_SLOT(matmul),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE)},
-				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE)},
+				.name			  = "mla_q_proj",
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = 1u << RECIPE_SLOT_FFN_GATE,
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
 			},
 		[OP_MLA_KV_PROJ] =
 			{
-				.name		  = "mla_kv_proj",
-				.state_writes = CG_STATE_MLA,
-				.fn_name	  = "matmul",
-				.slot0		  = OP_FN_SLOT(matmul),
-				.slot1		  = OP_NO_SLOT,
-				.reads		  = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
-				.writes		  = {OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.name			  = "mla_kv_proj",
+				.state_writes	  = CG_STATE_MLA,
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = 1u << RECIPE_SLOT_FFN_UP,
+				.reads			  = {OP_TOUCH_IN0},
 			},
 		[OP_MLA_QKV_PROJ_FUSED] =
 			{
-				.name		  = "mla_qkv_proj_fused",
-				.state_writes = CG_STATE_MLA,
-				.fn_name	  = "matmul",
-				.slot0		  = OP_FN_SLOT(matmul),
-				.slot1		  = OP_NO_SLOT,
-				.reads		  = {OP_TOUCH_IN0},
-				.writes		  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE),
-								 OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.name			  = "mla_qkv_proj_fused",
+				.state_writes	  = CG_STATE_MLA,
+				.fn_name		  = "matmul",
+				.slot0			  = OP_FN_SLOT(matmul),
+				.slot1			  = OP_NO_SLOT,
+				.batch_extra_mask = (1u << RECIPE_SLOT_FFN_GATE) | (1u << RECIPE_SLOT_FFN_UP),
+				.reads			  = {OP_TOUCH_IN0},
+				.writes			  = {OP_TOUCH_OUT},
 			},
 		[OP_MOE_ROUTER] =
 			{
@@ -167,7 +166,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.batch_extra_mask = (1u << RECIPE_SLOT_XB) | (1u << RECIPE_SLOT_XB2) |
 									(1u << RECIPE_SLOT_FFN_ACT) | (1u << RECIPE_SLOT_RESID_TMP),
 				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_ROUTER_W)},
+				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_ROPE] =
 			{
@@ -184,8 +183,8 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.fn_name = "rope_qk",
 				.slot0	 = OP_FN_SLOT(rope_qk),
 				.slot1	 = OP_FN_SLOT(rope),
-				.reads	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
-				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_ROPE_EXT] =
 			{
@@ -202,8 +201,8 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.fn_name = "qk_norm_rope",
 				.slot0	 = OP_FN_SLOT(qk_norm_rope),
 				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
-				.writes	 = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_KV_PUT] =
 			{
@@ -283,8 +282,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.fn_name = "ffn_activate",
 				.slot0	 = OP_FN_SLOT(ffn_activate),
 				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_FFN_GATE),
-							OP_TOUCH_SLOT(RECIPE_SLOT_FFN_UP)},
+				.reads	 = {OP_TOUCH_IN0},
 				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_SOFTCAP] =
@@ -298,49 +296,41 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_SPLIT_QGATE] =
 			{
-				.name			  = "split_qgate",
-				.fn_name		  = "split_qgate",
-				.slot0			  = OP_FN_SLOT(split_qgate),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_Q) |
-									(1u << RECIPE_SLOT_HYB_GATE),
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_OUT, OP_TOUCH_SLOT(RECIPE_SLOT_HYB_GATE)},
+				.name	 = "split_qgate",
+				.fn_name = "split_qgate",
+				.slot0	 = OP_FN_SLOT(split_qgate),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_PARTIAL_ROPE_QK] =
 			{
-				.name			  = "partial_rope_qk",
-				.fn_name		  = "partial_rope_qk",
-				.slot0			  = OP_FN_SLOT(partial_rope_qk),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_Q) | (1u << RECIPE_SLOT_K),
-				.reads			  = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
-				.writes			  = {OP_TOUCH_SLOT(RECIPE_SLOT_Q), OP_TOUCH_SLOT(RECIPE_SLOT_K)},
+				.name	 = "partial_rope_qk",
+				.fn_name = "partial_rope_qk",
+				.slot0	 = OP_FN_SLOT(partial_rope_qk),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_ATTN_OUTPUT_GATE] =
 			{
-				.name			  = "attn_output_gate",
-				.fn_name		  = "attn_output_gate",
-				.slot0			  = OP_FN_SLOT(attn_output_gate),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_GATE),
-				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HYB_GATE)},
-				.writes			  = {OP_TOUCH_IN0},
+				.name	 = "attn_output_gate",
+				.fn_name = "attn_output_gate",
+				.slot0	 = OP_FN_SLOT(attn_output_gate),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_GATED_DELTA_NET] =
 			{
-				.name			  = "gated_delta_net",
-				.state_reads	  = CG_STATE_RECURRENT,
-				.state_writes	  = CG_STATE_RECURRENT,
-				.fn_name		  = "gated_delta_net",
-				.slot0			  = OP_FN_SLOT(gated_delta_net),
-				.slot1			  = OP_NO_SLOT,
-				.batch_extra_mask = (1u << RECIPE_SLOT_HYB_PROJ) | (1u << RECIPE_SLOT_HYB_GATE) |
-									(1u << RECIPE_SLOT_HYB_ALPHA) | (1u << RECIPE_SLOT_HYB_BETA) |
-									(1u << RECIPE_SLOT_XB2),
-				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2,
-									 OP_TOUCH_SLOT(RECIPE_SLOT_HYB_BETA)},
-				.writes			  = {OP_TOUCH_OUT},
+				.name		  = "gated_delta_net",
+				.state_reads  = CG_STATE_RECURRENT,
+				.state_writes = CG_STATE_RECURRENT,
+				.fn_name	  = "gated_delta_net",
+				.slot0		  = OP_FN_SLOT(gated_delta_net),
+				.slot1		  = OP_NO_SLOT,
+				.reads		  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2, OP_TOUCH_IN3},
+				.writes		  = {OP_TOUCH_OUT},
 			},
 		[OP_SHORTCONV] =
 			{
@@ -361,23 +351,21 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_HC_PRE] =
 			{
-				.name			  = "hc_pre",
-				.fn_name		  = "hc_pre",
-				.slot0			  = OP_FN_SLOT(hc_pre),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0},
-				.writes			  = {OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF), OP_TOUCH_OUT},
-				.batch_extra_mask = (1u << RECIPE_SLOT_HC_COEF),
+				.name	 = "hc_pre",
+				.fn_name = "hc_pre",
+				.slot0	 = OP_FN_SLOT(hc_pre),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0},
+				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_HC_POST] =
 			{
-				.name			  = "hc_post",
-				.fn_name		  = "hc_post",
-				.slot0			  = OP_FN_SLOT(hc_post),
-				.slot1			  = OP_NO_SLOT,
-				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_SLOT(RECIPE_SLOT_HC_COEF)},
-				.writes			  = {OP_TOUCH_OUT},
-				.batch_extra_mask = (1u << RECIPE_SLOT_HC_COEF),
+				.name	 = "hc_post",
+				.fn_name = "hc_post",
+				.slot0	 = OP_FN_SLOT(hc_post),
+				.slot1	 = OP_NO_SLOT,
+				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_HC_FINAL] =
 			{
@@ -476,16 +464,16 @@ static void touch_push(uint8_t *list, int *n, uint8_t slot) {
 }
 
 static uint8_t touch_resolve(int8_t t, const recipe_op *op) {
-	if (t < 0)
-		return (uint8_t)(-t - 1);
+	if (t == OP_TOUCH_IN3)
+		return op->in[3];
 	if (t <= OP_TOUCH_IN2)
 		return op->in[t - 1];
 	if (t == OP_TOUCH_OUT)
 		return op->out;
 	if (t == OP_TOUCH_OUT1)
-		return op->u.matmul_multi.out[1];
+		return op->out1;
 	if (t == OP_TOUCH_OUT2)
-		return op->u.matmul_multi.out[2];
+		return op->out2;
 	return RECIPE_SLOT_NONE;
 }
 

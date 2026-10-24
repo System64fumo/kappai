@@ -21,7 +21,7 @@ static void qwen_append_recurrent(op_emitter *e, const model *m, int li) {
 	OP_EMIT(
 		e, qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_HYB_BETA, WIDX_SSM_BETA, p->n_value_heads, dim));
 	OP_EMIT(e, mk_gated_delta_net(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_HYB_GATE, RECIPE_SLOT_HYB_ALPHA,
-								  RECIPE_SLOT_XB2));
+								  RECIPE_SLOT_HYB_BETA, RECIPE_SLOT_XB2));
 	OP_EMIT(e, qwen_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_SSM_OUT, dim, p->value_dim));
 	e->count = recipe_append_dense_ffn_ex(e->ops, e->count, m, li, WIDX_POST_ATTN_NORM);
 }
@@ -33,16 +33,17 @@ static void qwen_append_full_attention(op_emitter *e, const model *m, int li) {
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
 	OP_EMIT(e, qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_HYB_PROJ, WIDX_WQ, 2 * q_out, dim));
-	OP_EMIT(e, mk_split_qgate());
+	OP_EMIT(e, mk_split_qgate(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_Q, RECIPE_SLOT_HYB_GATE));
 	OP_EMIT(e, qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim));
-	OP_EMIT(e, qwen_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim));
+	OP_EMIT(e,
+			mk_matmul_v(RECIPE_SLOT_XB, RECIPE_SLOT_K, RECIPE_SLOT_V, kv_out, dim, STAGE_MATMUL));
 	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
 	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, m->n_kv_heads));
-	OP_EMIT(e, mk_partial_rope_qk());
+	OP_EMIT(e, mk_partial_rope_qk(RECIPE_SLOT_Q, RECIPE_SLOT_K));
 	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
 	OP_EMIT(e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, m->n_kv_heads,
 										  m->head_dim, m->n_ctx, 0));
-	OP_EMIT(e, mk_attn_output_gate(RECIPE_SLOT_XB2, RECIPE_SLOT_HYB_GATE, RECIPE_SLOT_XB2));
+	OP_EMIT(e, mk_attn_output_gate(RECIPE_SLOT_XB2, RECIPE_SLOT_HYB_GATE));
 	OP_EMIT(e, qwen_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out));
 	e->count = recipe_append_dense_ffn_ex(e->ops, e->count, m, li, WIDX_POST_ATTN_NORM);
 }

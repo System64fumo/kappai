@@ -178,7 +178,6 @@ weight_ref			   *resolve_weight_ref(const model *m, int li, uint8_t w_idx);
 int						model_has_sliding_layers(const model *m);
 
 recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads);
-recipe_op mk_rope_ext(uint8_t in, int rope_neox);
 
 uint32_t	ple_inject_caps(const backend *a);
 uint32_t	moe_shared_caps(const backend *a);

@@ -4,7 +4,7 @@ static status_code split_qgate_run(exec_ctx *ctx, backend *t) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
 	return t->split_qgate(t, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->out),
-						  exec_slot(ctx, RECIPE_SLOT_HYB_GATE), ctx->m->n_heads, ctx->m->head_dim,
+						  exec_slot(ctx, ctx->op->out1), ctx->m->n_heads, ctx->m->head_dim,
 						  ctx->rows.n_rows);
 }
 
@@ -27,8 +27,8 @@ static status_code partial_rope_qk_run(exec_ctx *ctx, backend *t) {
 	int			  n_heads	 = m->n_heads;
 	int			  n_kv_heads = m->n_kv_heads;
 	int			  head_dim	 = m->head_dim;
-	buffer		 *q			 = exec_slot(ctx, RECIPE_SLOT_Q);
-	buffer		 *k			 = exec_slot(ctx, RECIPE_SLOT_K);
+	buffer		 *q			 = exec_slot(ctx, ctx->op->in[0]);
+	buffer		 *k			 = exec_slot(ctx, ctx->op->in[1]);
 	status_code	  st		 = OK;
 	exec_segments seg		 = exec_segments_of(ctx);
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
@@ -62,8 +62,7 @@ status_code op_partial_rope_qk(exec_ctx *ctx) {
 static status_code attn_output_gate_run(exec_ctx *ctx, backend *t) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
-	return t->attn_output_gate(t, exec_slot(ctx, ctx->op->in[0]),
-							   exec_slot(ctx, RECIPE_SLOT_HYB_GATE),
+	return t->attn_output_gate(t, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
 							   ctx->m->n_heads * ctx->m->head_dim, ctx->rows.n_rows);
 }
 
@@ -167,9 +166,8 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 	const float *z	   = recipe_slot_read_f32(ctx, ctx->op->in[1], &ctx->s->hybrid.gdn_z, z_n);
 	const float *alpha =
 		recipe_slot_read_f32(ctx, ctx->op->in[2], &ctx->s->hybrid.gdn_alpha, alpha_n);
-	const float *beta =
-		recipe_slot_read_f32(ctx, RECIPE_SLOT_HYB_BETA, &ctx->s->hybrid.gdn_beta, beta_n);
-	float *out = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->hybrid.gdn_out, out_n);
+	const float *beta = recipe_slot_read_f32(ctx, ctx->op->in[3], &ctx->s->hybrid.gdn_beta, beta_n);
+	float		*out  = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->hybrid.gdn_out, out_n);
 	if (!mixed || !z || !alpha || !beta || !out)
 		return ERR_INVALID_ARG;
 
@@ -359,7 +357,7 @@ status_code op_hc_pre(exec_ctx *ctx) {
 	exec_segments		 seg		= exec_segments_of(ctx);
 	buffer				*stream_all = exec_slot(ctx, ctx->op->in[0]);
 	buffer				*x_all		= exec_slot(ctx, ctx->op->out);
-	buffer				*coef_all	= exec_slot(ctx, RECIPE_SLOT_HC_COEF);
+	buffer				*coef_all	= exec_slot(ctx, ctx->op->out1);
 	const int			 flat		= m->kda.hc_count * m->dim;
 	const int			 coef_elems = m->kda.hc_count * (m->kda.hc_count + 1);
 	hc_pre_desc			 d			= {
@@ -398,7 +396,7 @@ status_code op_hc_post(exec_ctx *ctx) {
 	exec_segments seg		 = exec_segments_of(ctx);
 	buffer		 *sub_all	 = exec_slot(ctx, ctx->op->in[0]);
 	buffer		 *hc_all	 = exec_slot(ctx, ctx->op->out);
-	buffer		 *coef_all	 = exec_slot(ctx, RECIPE_SLOT_HC_COEF);
+	buffer		 *coef_all	 = exec_slot(ctx, ctx->op->in[1]);
 	const int	  flat		 = m->kda.hc_count * m->dim;
 	const int	  coef_elems = m->kda.hc_count * (m->kda.hc_count + 1);
 	status_code	  st		 = OK;

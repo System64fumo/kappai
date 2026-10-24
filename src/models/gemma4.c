@@ -30,7 +30,7 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, 0, dim, STAGE_MATMUL));
 
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, 0, dim, STAGE_MATMUL));
-		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, 0, dim, STAGE_MATMUL));
+		OP_EMIT(e, mk_matmul_v(RECIPE_SLOT_XB, RECIPE_SLOT_K, RECIPE_SLOT_V, 0, dim, STAGE_MATMUL));
 	}
 
 	const int fuse_qk_norm_rope =
@@ -46,10 +46,10 @@ static void recipe_append_gemma4_attn_block(op_emitter *e, const model *m, int h
 	}
 
 	if (fuse_qk_norm_rope) {
-		OP_EMIT(e, mk_qk_norm_rope(eps, rope_neox));
+		OP_EMIT(e, mk_qk_norm_rope(RECIPE_SLOT_Q, RECIPE_SLOT_K, eps, rope_neox));
 	} else {
-		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_Q, rope_neox));
-		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_K, rope_neox));
+		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_Q, 1, rope_neox));
+		OP_EMIT(e, mk_rope_ext(RECIPE_SLOT_K, 0, rope_neox));
 	}
 
 	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));

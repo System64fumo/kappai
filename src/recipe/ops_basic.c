@@ -2,7 +2,8 @@
 
 _Atomic(backend *) cached_host_backend = NULL;
 
-static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_tokens);
+static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_tokens,
+									 uint8_t k_slot, uint8_t v_slot);
 
 static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a, int n, int act,
 													  int fused_stride, int n_rows);
@@ -298,7 +299,7 @@ typedef struct {
 static rope_ext_args rope_ext_args_of(exec_ctx *ctx, backend *a) {
 	const recipe_op		  *op	= ctx->op;
 	const layer_ctx_entry *lc	= exec_layer_ctx(ctx);
-	int					   is_q = op->in[0] == RECIPE_SLOT_Q;
+	int					   is_q = op->u.rope_ext.is_q;
 	rope_ext_args		   g	= {.n_heads	   = op->u.rope_ext.n_heads,
 								   .head_dim   = lc->head_dim,
 								   .row_stride = is_q ? lc->q_row_stride : lc->kv_row_stride};
@@ -368,10 +369,10 @@ static status_code qk_norm_rope_unfused(exec_ctx *ctx, const layer_ctx_entry *lc
 	const float eps		 = ctx->op->u.qk_norm_rope.eps;
 	const int	neox	 = ctx->op->u.qk_norm_rope.rope_neox;
 	recipe_op	steps[4] = {
-		mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, eps, 0),
-		mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, eps, 0),
-		mk_rope_ext(RECIPE_SLOT_Q, neox),
-		mk_rope_ext(RECIPE_SLOT_K, neox),
+		mk_rmsnorm_per_head(ctx->op->in[0], WIDX_ATTN_Q_NORM, eps, 0),
+		mk_rmsnorm_per_head(ctx->op->in[1], WIDX_ATTN_K_NORM, eps, 0),
+		mk_rope_ext(ctx->op->in[0], 1, neox),
+		mk_rope_ext(ctx->op->in[1], 0, neox),
 	};
 	exec_ctx	sub = *ctx;
 	status_code st	= OK;
@@ -391,8 +392,8 @@ static status_code qk_norm_rope_fused(exec_ctx *ctx) {
 	rope_tables			   rt = exec_rope_setup(ctx, a, ctx->op->u.qk_norm_rope.rope_neox, 1);
 	const int			   n_kv_heads = lc->has_kv ? lc->n_kv_heads : 0;
 	exec_segments		   seg		  = exec_segments_of(ctx);
-	buffer				  *q_all	  = exec_slot(ctx, RECIPE_SLOT_Q);
-	buffer				  *k_all	  = exec_slot(ctx, RECIPE_SLOT_K);
+	buffer				  *q_all	  = exec_slot(ctx, ctx->op->in[0]);
+	buffer				  *k_all	  = exec_slot(ctx, ctx->op->in[1]);
 	status_code			   st		  = OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
 		buffer q_view = batch_row_view(q_all, c * seg.rows, lc->q_row_stride);
@@ -464,7 +465,8 @@ status_code op_matmul_plain(exec_ctx *ctx) {
 status_code op_matmul(exec_ctx *ctx) {
 	if (ctx->op->w_idx == WIDX_WV && ctx->li >= 0 && ctx->li < ctx->m->n_layers &&
 		!exec_layer_ctx(ctx)->has_own_v)
-		return batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows);
+		return batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows, ctx->op->in[1],
+								 ctx->op->out);
 	return op_matmul_plain(ctx);
 }
 
@@ -1124,13 +1126,13 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			int			  nb	 = n_mats;
 			for (int i = 0; i < nb; i++)
 				profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[i], n_out[i], k);
-			buffer	   *ys[3] = {batch_slot(ctx->bs, ctx->op->out),
-								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]),
-								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[2])};
+			buffer *ys[3]  = {batch_slot(ctx->bs, ctx->op->out), batch_slot(ctx->bs, ctx->op->out1),
+							  batch_slot(ctx->bs, ctx->op->out2)};
 			status_code st = a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]),
 												   ys, n_out, k, n_mats, ctx->rows.n_rows);
 			if (st == OK && !lc->has_own_v)
-				st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows);
+				st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows, ctx->op->out1,
+									   ctx->op->out2);
 			return st;
 		}
 		status_code st =
@@ -1138,43 +1140,14 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 							batch_slot(ctx->bs, ctx->op->out), n_out[0], k, ctx->rows.n_rows);
 		if (st == OK)
 			st = a->matmul_batch(a, &lw->wk.buf, lw->wk.type, batch_slot(ctx->bs, ctx->op->in[0]),
-								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]), n_out[1], k,
-								 ctx->rows.n_rows);
+								 batch_slot(ctx->bs, ctx->op->out1), n_out[1], k, ctx->rows.n_rows);
 		if (st == OK && lc->has_own_v)
 			st = a->matmul_batch(a, &lw->wv.buf, lw->wv.type, batch_slot(ctx->bs, ctx->op->in[0]),
-								 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[2]), n_out[2], k,
-								 ctx->rows.n_rows);
+								 batch_slot(ctx->bs, ctx->op->out2), n_out[2], k, ctx->rows.n_rows);
 		if (st == OK && !lc->has_own_v)
-			st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows);
+			st = batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows, ctx->op->out1,
+								   ctx->op->out2);
 		return st;
-	}
-	if (ctx->op->w_idx == WIDX_WK) {
-		int kv_out = lc->kv_row_stride;
-		if (!lc->has_own_v) {
-			status_code st =
-				a->matmul_batch(a, &lw->wk.buf, lw->wk.type, batch_slot(ctx->bs, ctx->op->in[0]),
-								&ctx->bs->pair[RECIPE_SLOT_K].b, kv_out, k, ctx->rows.n_rows);
-			if (st != OK)
-				return st;
-			return batch_copy_k_to_v(ctx->m, ctx->bs, ctx->li, ctx->rows.n_rows);
-		}
-		if (fused) {
-			const buffer *ws[2]	 = {&lw->wk.buf, &lw->wv.buf};
-			uint32_t	  wts[2] = {lw->wk.type, lw->wv.type};
-			buffer *ys[2]	 = {&ctx->bs->pair[RECIPE_SLOT_K].b, &ctx->bs->pair[RECIPE_SLOT_V].b};
-			int		n_out[2] = {kv_out, kv_out};
-			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[0], n_out[0], k);
-			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[1], n_out[1], k);
-			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
-										 k, 2, ctx->rows.n_rows);
-		}
-		status_code st =
-			a->matmul_batch(a, &lw->wk.buf, lw->wk.type, batch_slot(ctx->bs, ctx->op->in[0]),
-							&ctx->bs->pair[RECIPE_SLOT_K].b, kv_out, k, ctx->rows.n_rows);
-		if (st != OK)
-			return st;
-		return a->matmul_batch(a, &lw->wv.buf, lw->wv.type, batch_slot(ctx->bs, ctx->op->in[0]),
-							   &ctx->bs->pair[RECIPE_SLOT_V].b, kv_out, k, ctx->rows.n_rows);
 	}
 	if (ctx->op->w_idx == WIDX_GATE) {
 		const int *n_out = ctx->op->u.matmul_multi.n_out;
@@ -1183,8 +1156,7 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			uint32_t	  wts[2] = {lw->gate_w.type, lw->up_w.type};
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[0], n_out[0], k);
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[1], n_out[1], k);
-			buffer *ys[2] = {batch_slot(ctx->bs, ctx->op->out),
-							 batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1])};
+			buffer *ys[2] = {batch_slot(ctx->bs, ctx->op->out), batch_slot(ctx->bs, ctx->op->out1)};
 			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
 										 k, 2, ctx->rows.n_rows);
 		}
@@ -1192,9 +1164,9 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			a, &lw->gate_w.buf, lw->gate_w.type, batch_slot(ctx->bs, ctx->op->in[0]),
 			batch_slot(ctx->bs, ctx->op->out), n_out[0], k, ctx->rows.n_rows);
 		if (st == OK)
-			st = a->matmul_batch(
-				a, &lw->up_w.buf, lw->up_w.type, batch_slot(ctx->bs, ctx->op->in[0]),
-				batch_slot(ctx->bs, ctx->op->u.matmul_multi.out[1]), n_out[1], k, ctx->rows.n_rows);
+			st = a->matmul_batch(a, &lw->up_w.buf, lw->up_w.type,
+								 batch_slot(ctx->bs, ctx->op->in[0]),
+								 batch_slot(ctx->bs, ctx->op->out1), n_out[1], k, ctx->rows.n_rows);
 		return st;
 	}
 	return ERR_INVALID_ARG;
@@ -1226,12 +1198,13 @@ status_code matmul_multi_batch_body(exec_ctx *ctx) {
 	return st;
 }
 
-static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_tokens) {
+static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int li, int n_tokens,
+									 uint8_t k_slot, uint8_t v_slot) {
 	const layer_ctx_entry *lc			 = &m->recipe->layer_ctx[li];
 	int					   kv_out		 = lc->kv_row_stride;
 	backend				  *a			 = m->backend;
-	buffer				  *kb			 = &bs->pair[RECIPE_SLOT_K].b;
-	buffer				  *vb			 = &bs->pair[RECIPE_SLOT_V].b;
+	buffer				  *kb			 = &bs->pair[k_slot].b;
+	buffer				  *vb			 = &bs->pair[v_slot].b;
 	int					   kv_row_stride = lc->kv_row_stride;
 
 	return copy_k_to_v_buffers(a, kb, vb, kv_out, kv_row_stride, n_tokens, &bs->copy_tmp);
