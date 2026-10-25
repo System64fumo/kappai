@@ -28,8 +28,7 @@ static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
-	OP_EMIT(e,
-			mk_matmul_v(RECIPE_SLOT_XB, RECIPE_SLOT_K, RECIPE_SLOT_V, kv_out, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
 
 	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
 	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, m->n_kv_heads));
@@ -62,17 +61,7 @@ static model_recipe *build_lfm2_recipe(const model *m) {
 		if (e.count > max_ops)
 			max_ops = e.count;
 	}
-	if (max_ops > 0 && max_ops < LFM_MAX_OPS_PER_LAYER) {
-		for (int li = 0; li < m->n_layers; li++) {
-			recipe_op *src = r->per_layer_ops + (size_t)li * LFM_MAX_OPS_PER_LAYER;
-			recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
-			if (dst != src)
-				memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
-		}
-		r->per_layer_ops =
-			xrealloc(r->per_layer_ops, (size_t)m->n_layers * (size_t)max_ops * sizeof(recipe_op));
-		r->layer.n_ops = max_ops;
-	}
+	recipe_pack_per_layer_ops(r, m->n_layers, LFM_MAX_OPS_PER_LAYER, max_ops);
 	recipe_build_post_ops(r, m);
 	return r;
 }

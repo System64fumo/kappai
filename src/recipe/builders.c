@@ -42,10 +42,23 @@ recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage s
 	return op;
 }
 
-recipe_op mk_matmul_v(uint8_t in, uint8_t k_slot, uint8_t v_slot, int n, int k, stage stage) {
-	recipe_op op = mk_matmul(in, v_slot, WIDX_WV, n, k, stage);
-	op.in[1]	 = k_slot;
-	return op;
+recipe_op mk_copy_k_to_v(uint8_t k_slot, uint8_t v_slot) {
+	return mk_op_base(OP_COPY_K_TO_V, k_slot, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, v_slot,
+					  RECIPE_NO_WEIGHT, STAGE_MATMUL);
+}
+
+void recipe_pack_per_layer_ops(model_recipe *r, int n_layers, int cap, int max_ops) {
+	if (max_ops <= 0 || max_ops >= cap)
+		return;
+	for (int li = 0; li < n_layers; li++) {
+		recipe_op *src = r->per_layer_ops + (size_t)li * cap;
+		recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
+		if (dst != src)
+			memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
+	}
+	r->per_layer_ops =
+		xrealloc(r->per_layer_ops, (size_t)n_layers * (size_t)max_ops * sizeof(recipe_op));
+	r->layer.n_ops = max_ops;
 }
 
 recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
@@ -263,6 +276,7 @@ recipe_op mk_qk_norm_rope(uint8_t q, uint8_t k, float eps, int rope_neox) {
 	recipe_op op =
 		mk_op_base(OP_QK_NORM_ROPE, q, k, RECIPE_SLOT_NONE, q, WIDX_ATTN_Q_NORM, STAGE_ROPE);
 	op.out1						= k;
+	op.u.qk_norm_rope.q_only	= k == RECIPE_SLOT_NONE;
 	op.u.qk_norm_rope.eps		= eps;
 	op.u.qk_norm_rope.rope_neox = rope_neox;
 	return op;
@@ -285,9 +299,9 @@ static recipe_op mk_scale_embeddings(void) {
 					  RECIPE_SLOT_X, RECIPE_NO_WEIGHT, STAGE_EMBD);
 }
 
-static recipe_op mk_ple_build(void) {
-	return mk_op_base(OP_PLE_BUILD, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_EMBD);
+static recipe_op mk_ple_build(uint8_t x) {
+	return mk_op_base(OP_PLE_BUILD, x, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
+					  RECIPE_NO_WEIGHT, STAGE_EMBD);
 }
 
 static recipe_op mk_softcap(uint8_t in, float cap) {
@@ -399,7 +413,7 @@ void recipe_build_pre_ops(model_recipe *r, const model *m) {
 		ops[i++] = mk_scale_embeddings();
 	}
 	if (m->has_per_layer_embeddings) {
-		ops[i++] = mk_ple_build();
+		ops[i++] = mk_ple_build(RECIPE_SLOT_X);
 	}
 	r->pre_ops	 = ops;
 	r->n_pre_ops = i;

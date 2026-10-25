@@ -77,6 +77,7 @@ typedef enum {
 	OP_QK_NORM_ROPE,
 
 	OP_KV_PUT,
+	OP_COPY_K_TO_V,
 	OP_ATTENTION,
 
 	OP_ADD,
@@ -195,6 +196,7 @@ typedef union {
 		int n;
 		int k;
 		int n_out[3];
+		int v_from_k;
 	} matmul_multi;
 	struct {
 		int n;
@@ -217,6 +219,7 @@ typedef union {
 	struct {
 		float eps;
 		int	  rope_neox;
+		int	  q_only;
 	} qk_norm_rope;
 	struct {
 		int	  n_heads;
@@ -241,16 +244,25 @@ typedef union {
 } op_params;
 
 typedef struct {
-	op_kind	  kind;
-	uint8_t	  in[4];
-	uint8_t	  out;
-	uint8_t	  out1;
-	uint8_t	  out2;
-	uint8_t	  w_idx;
-	uint8_t	  coalesce_run_len;
-	uint8_t	  fuse_next;
-	stage	  stage;
-	op_params u;
+	int		head_dim;
+	int		n_kv_heads;
+	int		q_row_stride;
+	int		kv_row_stride;
+	uint8_t is_global;
+} op_layer_geom;
+
+typedef struct {
+	op_kind		  kind;
+	uint8_t		  in[4];
+	uint8_t		  out;
+	uint8_t		  out1;
+	uint8_t		  out2;
+	uint8_t		  w_idx;
+	uint8_t		  coalesce_run_len;
+	uint8_t		  fuse_next;
+	stage		  stage;
+	op_params	  u;
+	op_layer_geom geom;
 } recipe_op;
 
 typedef struct {
@@ -297,6 +309,8 @@ typedef struct model_recipe {
 	recipe_op	*post_ops;
 	int			 n_pre_ops;
 	int			 n_post_ops;
+	uint8_t		 embd_slot;
+	uint8_t		 logits_slot;
 
 	recipe_op *per_layer_ops;
 
@@ -330,7 +344,6 @@ typedef struct {
 	int						li, flash_attn;
 	backend				   *layer_be;
 	weight_ref			  **wtab_row;
-	const layer_ctx_entry  *lc;
 	float				   *logits_out;
 	uint32_t				caps;
 } exec_ctx;
@@ -365,7 +378,8 @@ recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage sta
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
-recipe_op mk_matmul_v(uint8_t in, uint8_t k_slot, uint8_t v_slot, int n, int k, stage stage);
+recipe_op mk_copy_k_to_v(uint8_t k_slot, uint8_t v_slot);
+void	  recipe_pack_per_layer_ops(model_recipe *r, int n_layers, int cap, int max_ops);
 recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
 						   int k);
 recipe_op mk_matmul_multi3(uint8_t in, uint8_t out0, uint8_t out1, uint8_t out2, uint8_t widx,
@@ -424,6 +438,7 @@ uint8_t		recipe_op_state_writes(op_kind k);
 weight_ref *recipe_resolve_weight_ref(const struct model *m, int li, uint8_t w_idx);
 void		recipe_exec_profile_report(const model_recipe *r, const char *label, FILE *fp);
 uint32_t	recipe_op_batch_extra_mask(op_kind k);
+int			recipe_op_has_layer_geom(op_kind k);
 const char *recipe_op_missing_fn(const backend *a, op_kind kind);
 int			recipe_op_touch(const recipe_op *op, uint8_t *reads, int *n_reads, uint8_t *writes,
 							int *n_writes);

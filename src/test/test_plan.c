@@ -90,15 +90,14 @@ static void test_touch_contents(void) {
 	ok = nr == 1 && nw == 1 && writes[0] == RECIPE_SLOT_FFN_GATE_UP;
 	record_plan("touch.matmul_gate_up_primary", ok, "nr=%d nw=%d", nr, nw);
 
+	op.kind	 = OP_COPY_K_TO_V;
+	op.in[0] = RECIPE_SLOT_K;
+	op.in[1] = RECIPE_SLOT_NONE;
 	op.out	 = RECIPE_SLOT_V;
-	op.w_idx = WIDX_WV;
-	op.in[0] = RECIPE_SLOT_XB;
-	op.in[1] = RECIPE_SLOT_K;
 	nr = nw = 0;
 	(void)recipe_op_touch(&op, reads, &nr, writes, &nw);
-	ok = nr == 2 && nw == 1 && reads[0] == RECIPE_SLOT_XB && reads[1] == RECIPE_SLOT_K &&
-		 writes[0] == RECIPE_SLOT_V;
-	record_plan("touch.matmul_v_reads_k", ok, "nr=%d nw=%d", nr, nw);
+	ok = nr == 1 && nw == 1 && reads[0] == RECIPE_SLOT_K && writes[0] == RECIPE_SLOT_V;
+	record_plan("touch.copy_k_to_v", ok, "nr=%d nw=%d", nr, nw);
 }
 
 static void reset_op(recipe_op *op) {

@@ -186,7 +186,7 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 		if (st != OK)
 			return st;
 
-		buffer *xb = batch_slot(ctx->bs, RECIPE_SLOT_X);
+		buffer *xb = batch_slot(ctx->bs, ctx->op->in[0]);
 
 		size_t n_proj	= (size_t)n_rows * total_ple;
 		buffer proj_buf = {0};
@@ -245,7 +245,7 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 	float *ple_proj	 = float_buf_ensure(&ctx->s->ple.proj_host, (size_t)n_rows * total_ple);
 	float *inpL_host = float_buf_ensure(&ctx->s->ple.inpL_host, (size_t)n_rows * dim);
 
-	buffer	*xb		 = batch_slot(ctx->bs, RECIPE_SLOT_X);
+	buffer	*xb		 = batch_slot(ctx->bs, ctx->op->in[0]);
 	backend *x_owner = xb->owner;
 	st				 = x_owner->buffer_read_f32(x_owner, xb, inpL_host, n_rows * dim);
 	if (st != OK)
@@ -351,7 +351,7 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		}
 	}
 
-	buffer		 *xb2b = batch_slot(ctx->bs, RECIPE_SLOT_XB2);
+	buffer		 *xb2b = batch_slot(ctx->bs, ctx->op->in[0]);
 	profile_scope pps  = profile_begin(&ctx->s->prof, ctx->op->stage);
 	profile_weight_bytes(&ctx->s->prof, ctx->op->stage, plan.gate_type, inj_dim, n_embd_per_layer);
 	profile_weight_bytes(&ctx->s->prof, ctx->op->stage, plan.proj_type, n_embd_per_layer, inj_dim);
@@ -362,7 +362,7 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		goto ple_cleanup;
 	}
 
-	buffer *aob = batch_slot(ctx->bs, RECIPE_SLOT_ATTN_OUT);
+	buffer *aob = batch_slot(ctx->bs, ctx->op->in[1]);
 	if (caps & PLE_CAP_FUSED_DOWN) {
 		st = a->matmul_ffn_down_batch(a, plan.proj_w, plan.proj_type, &ple_inp_b, &ple_slice_b, aob,
 									  inj_dim, n_embd_per_layer, ACTIVATION_GELU, n_rows);

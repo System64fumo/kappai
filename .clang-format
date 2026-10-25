@@ -7,6 +7,12 @@ AllowShortFunctionsOnASingleLine: Empty
 AllowShortIfStatementsOnASingleLine: false
 BreakBeforeBraces: Attach
 PointerAlignment: Right
-AlignConsecutiveAssignments: true
-AlignConsecutiveDeclarations: true
+DerivePointerAlignment: false
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveDeclarations: Consecutive
 AlignTrailingComments: true
+IncludeBlocks: Preserve
+SortIncludes: CaseInsensitive
+SpaceAfterCStyleCast: false
+MaxEmptyLinesToKeep: 1
+IndentCaseLabels: false

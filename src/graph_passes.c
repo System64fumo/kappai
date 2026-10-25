@@ -380,8 +380,10 @@ static int lowerable_rewrite(op_kind lowered, op_kind original) {
 
 static recipe_op lower_node(const cg_graph *g, const cg_node *n, const recipe_op *orig) {
 	recipe_op op = *orig;
-	if (n->kind != orig->kind)
-		op = n->kind == OP_MATMUL_RESIDUAL ? lower_fused_node(g, n) : lower_multi_node(g, n);
+	if (n->kind != orig->kind) {
+		op		= n->kind == OP_MATMUL_RESIDUAL ? lower_fused_node(g, n) : lower_multi_node(g, n);
+		op.geom = orig->geom;
+	}
 	if (n->kind == orig->kind)
 		op.stage = n->stage;
 	op.coalesce_run_len = n->coalesce_run_len;

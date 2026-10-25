@@ -328,6 +328,13 @@ static inline int model_layer_has_kv(const model *m, int li) {
 	return li < m->layer_dims.n_layer_kv_from_start;
 }
 
+static inline int model_layer_kv_layer(const model *m, int li) {
+	if (model_layer_has_kv(m, li))
+		return li;
+	return m->layers[li].is_global_layer ? m->layer_dims.kv_layer_global
+										 : m->layer_dims.kv_layer_swa;
+}
+
 static inline int model_layer_rope_dim(const model *m, int li) {
 	if (!m->arch_info->has_variable_layer_dims)
 		return m->rope_dim;

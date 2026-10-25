@@ -656,12 +656,6 @@ static void lower_set(cg_set *s, const model_recipe *r) {
 	s->post_ops	 = NULL;
 }
 
-const layer_ctx_entry *graph_set_layer_ctx(const cg_set *s, int layer) {
-	if (!s->layer_ctx || layer < 0 || layer >= s->n_layer_ctx)
-		return NULL;
-	return &s->layer_ctx[layer];
-}
-
 static uint32_t node_batch_slot_mask(const cg_graph *g, const cg_node *n) {
 	uint32_t mask = recipe_op_batch_extra_mask(n->kind);
 	for (int j = 0; j < n->n_in + n->n_out; j++) {
@@ -725,8 +719,6 @@ cg_set *graph_set_build(const model_recipe *r, const struct model *m, int n_laye
 		resolve_layer_backends(s, m, count);
 		resolve_impls(s, m, count);
 	}
-	s->layer_ctx   = r->layer_ctx;
-	s->n_layer_ctx = r->layer_ctx ? n_layers : 0;
 	lower_set(s, r);
 	for (int g = 0; g < s->n_graphs; g++)
 		graph_freeze(s->graphs[g]);

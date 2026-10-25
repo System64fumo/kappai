@@ -12,6 +12,7 @@ typedef struct {
 	const char *name;
 	uint8_t		state_reads;
 	uint8_t		state_writes;
+	uint8_t		layer_geom;
 } op_requirement;
 
 #define OP_NO_SLOT ((size_t)-1)
@@ -28,6 +29,7 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			{
 				.name		  = "ple_build",
 				.state_writes = CG_STATE_PLE,
+				.reads		  = {OP_TOUCH_IN0},
 			},
 		[OP_EMBD_LOOKUP] = {.name	 = "embd_lookup",
 							.fn_name = "embd_lookup",
@@ -63,21 +65,23 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_RMSNORM_PER_HEAD] =
 			{
-				.name	 = "rmsnorm_per_head",
-				.fn_name = "rmsnorm_per_head",
-				.slot0	 = OP_FN_SLOT(rmsnorm_per_head),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0},
-				.writes	 = {OP_TOUCH_OUT},
+				.name		= "rmsnorm_per_head",
+				.layer_geom = 1,
+				.fn_name	= "rmsnorm_per_head",
+				.slot0		= OP_FN_SLOT(rmsnorm_per_head),
+				.slot1		= OP_NO_SLOT,
+				.reads		= {OP_TOUCH_IN0},
+				.writes		= {OP_TOUCH_OUT},
 			},
 		[OP_RMSNORM_NOWEIGHT] =
 			{
-				.name	 = "rmsnorm_noweight",
-				.fn_name = "rmsnorm_noweight",
-				.slot0	 = OP_FN_SLOT(rmsnorm_noweight),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0},
-				.writes	 = {OP_TOUCH_OUT},
+				.name		= "rmsnorm_noweight",
+				.layer_geom = 1,
+				.fn_name	= "rmsnorm_noweight",
+				.slot0		= OP_FN_SLOT(rmsnorm_noweight),
+				.slot1		= OP_NO_SLOT,
+				.reads		= {OP_TOUCH_IN0},
+				.writes		= {OP_TOUCH_OUT},
 			},
 		[OP_RMSNORM_ADD] =
 			{
@@ -94,17 +98,18 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.fn_name = "matmul",
 				.slot0	 = OP_FN_SLOT(matmul),
 				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.reads	 = {OP_TOUCH_IN0},
 				.writes	 = {OP_TOUCH_OUT},
 			},
 		[OP_MATMUL_MULTI] =
 			{
-				.name	 = "matmul_multi",
-				.fn_name = "matmul",
-				.slot0	 = OP_FN_SLOT(matmul),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0},
-				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2},
+				.name		= "matmul_multi",
+				.layer_geom = 1,
+				.fn_name	= "matmul",
+				.slot0		= OP_FN_SLOT(matmul),
+				.slot1		= OP_NO_SLOT,
+				.reads		= {OP_TOUCH_IN0},
+				.writes		= {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2},
 			},
 		[OP_MATMUL_RESIDUAL] =
 			{
@@ -188,30 +193,40 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 			},
 		[OP_ROPE_EXT] =
 			{
-				.name	 = "rope_ext",
-				.fn_name = "rope_ext",
-				.slot0	 = OP_FN_SLOT(rope_ext),
-				.slot1	 = OP_FN_SLOT(rope),
-				.reads	 = {OP_TOUCH_IN0},
-				.writes	 = {OP_TOUCH_OUT},
+				.name		= "rope_ext",
+				.layer_geom = 1,
+				.fn_name	= "rope_ext",
+				.slot0		= OP_FN_SLOT(rope_ext),
+				.slot1		= OP_FN_SLOT(rope),
+				.reads		= {OP_TOUCH_IN0},
+				.writes		= {OP_TOUCH_OUT},
 			},
 		[OP_QK_NORM_ROPE] =
 			{
-				.name	 = "qk_norm_rope",
-				.fn_name = "qk_norm_rope",
-				.slot0	 = OP_FN_SLOT(qk_norm_rope),
-				.slot1	 = OP_NO_SLOT,
-				.reads	 = {OP_TOUCH_IN0, OP_TOUCH_IN1},
-				.writes	 = {OP_TOUCH_OUT, OP_TOUCH_OUT1},
+				.name		= "qk_norm_rope",
+				.layer_geom = 1,
+				.fn_name	= "qk_norm_rope",
+				.slot0		= OP_FN_SLOT(qk_norm_rope),
+				.slot1		= OP_NO_SLOT,
+				.reads		= {OP_TOUCH_IN0, OP_TOUCH_IN1},
+				.writes		= {OP_TOUCH_OUT, OP_TOUCH_OUT1},
 			},
 		[OP_KV_PUT] =
 			{
 				.name		  = "kv_put",
+				.layer_geom	  = 1,
 				.state_writes = CG_STATE_KV,
 				.fn_name	  = "kv_put",
 				.slot0		  = OP_FN_SLOT(kv_put),
 				.slot1		  = OP_NO_SLOT,
 				.reads		  = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			},
+		[OP_COPY_K_TO_V] =
+			{
+				.name		= "copy_k_to_v",
+				.layer_geom = 1,
+				.reads		= {OP_TOUCH_IN0},
+				.writes		= {OP_TOUCH_OUT},
 			},
 		[OP_ATTENTION] =
 			{
@@ -542,4 +557,8 @@ static stage matmul_substage(uint8_t w_idx) {
 
 uint32_t recipe_op_batch_extra_mask(op_kind k) {
 	return ((int)k < 0 || k >= OP_KIND_COUNT) ? 0 : OP_REQUIREMENTS[k].batch_extra_mask;
+}
+
+int recipe_op_has_layer_geom(op_kind k) {
+	return ((int)k < 0 || k >= OP_KIND_COUNT) ? 0 : OP_REQUIREMENTS[k].layer_geom;
 }

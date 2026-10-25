@@ -240,7 +240,8 @@ buffer bs_cached_view(float_buf *fb, backend *owner, size_t n_elems) {
 }
 
 static void batch_scratch_bind(model *m, batch_scratch *bs, backend *a, int n_rows) {
-	bs->layout = *mem_layout_get(&bs->layouts, m->recipe->mem, n_rows);
+	bs->layout		= *mem_layout_get(&bs->layouts, m->recipe->mem, n_rows);
+	bs->logits_slot = m->recipe->logits_slot;
 	bs_arena_ensure(bs, a, bs->layout.total);
 	bs_bind_views(bs, a);
 }
@@ -259,7 +260,7 @@ batch_scratch *batch_scratch_prepare(model *m, compute_scratch *s, int n_rows) {
 }
 
 buffer *compute_logits_device(compute_scratch *s) {
-	return &s->bs->pair[RECIPE_SLOT_LOGITS].b;
+	return &s->bs->pair[s->bs->logits_slot].b;
 }
 
 void compute_scratch_reserve_rows(model *m, compute_scratch *s, int n_rows) {

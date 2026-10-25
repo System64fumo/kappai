@@ -41,42 +41,6 @@ static const recipe_builder_fn *recipe_lookup(const char *arch_gguf_name) {
 	return NULL;
 }
 
-static inline int layer_has_kv(const model *m, int li) {
-	if (!m->arch_info->has_variable_layer_dims)
-		return 1;
-	if (m->layer_dims.n_layer_kv_from_start <= 0)
-		return 1;
-	return li < m->layer_dims.n_layer_kv_from_start;
-}
-
-static void resolve_matmul_dims(const layer_ctx_entry *lc, const model *m, uint8_t w_idx, int *n,
-								int *k) {
-	int head_dim = lc->head_dim;
-	switch ((weight_idx)w_idx) {
-	case WIDX_WQ:
-		*n = m->n_heads * head_dim;
-		break;
-	case WIDX_WK:
-	case WIDX_WV:
-		*n = lc->n_kv_heads * head_dim;
-		break;
-	case WIDX_WO:
-		*n = m->dim;
-		*k = m->n_heads * head_dim;
-		break;
-	case WIDX_DOWN:
-		*n = m->dim;
-		*k = lc->intermediate;
-		break;
-	case WIDX_GATE:
-	case WIDX_UP:
-		*n = lc->intermediate;
-		break;
-	default:
-		break;
-	}
-}
-
 const recipe_op *recipe_layer_ops(const model_recipe *r, int li) {
 	return r->per_layer_ops ? &r->per_layer_ops[(size_t)li * r->layer.n_ops] : r->layer.ops;
 }
@@ -162,6 +126,64 @@ int ple_build_dev_path_cached(const struct model *m, backend *a, int batched) {
 	return ple_build_dev_path_ok(a, m, batched);
 }
 
+static status_code recipe_resolve_bindings(model_recipe *r) {
+	r->embd_slot   = RECIPE_SLOT_NONE;
+	r->logits_slot = RECIPE_SLOT_NONE;
+	for (int i = 0; i < r->n_pre_ops; i++)
+		if (r->pre_ops[i].kind == OP_EMBD_LOOKUP)
+			r->embd_slot = r->pre_ops[i].out;
+	for (int i = 0; i < r->n_post_ops; i++)
+		if (r->post_ops[i].kind == OP_LOGITS_READBACK)
+			r->logits_slot = r->post_ops[i].in[0];
+	return r->embd_slot == RECIPE_SLOT_NONE || r->logits_slot == RECIPE_SLOT_NONE ? ERR_FORMAT : OK;
+}
+
+static op_layer_geom layer_geom_of(const layer_ctx_entry *lc) {
+	op_layer_geom geom;
+	memset(&geom, 0, sizeof(geom));
+	geom.head_dim	   = lc->head_dim;
+	geom.n_kv_heads	   = lc->n_kv_heads;
+	geom.q_row_stride  = lc->q_row_stride;
+	geom.kv_row_stride = lc->kv_row_stride;
+	geom.is_global	   = (uint8_t)lc->is_global;
+	return geom;
+}
+
+static void fill_layer_geom(recipe_op *ops, int n_ops, const layer_ctx_entry *lc) {
+	op_layer_geom geom = layer_geom_of(lc);
+	for (int j = 0; j < n_ops; j++)
+		if (recipe_op_has_layer_geom(ops[j].kind))
+			ops[j].geom = geom;
+}
+
+static int layers_share_geom(const model_recipe *r, int n_layers) {
+	op_layer_geom first = layer_geom_of(&r->layer_ctx[0]);
+	for (int li = 1; li < n_layers; li++) {
+		op_layer_geom g = layer_geom_of(&r->layer_ctx[li]);
+		if (memcmp(&first, &g, sizeof(g)) != 0)
+			return 0;
+	}
+	return 1;
+}
+
+static void recipe_specialize_geometry(model_recipe *r, const model *m) {
+	const int n_ops = r->layer.n_ops;
+	if (m->n_layers < 1 || n_ops < 1)
+		return;
+	if (!r->per_layer_ops) {
+		if (layers_share_geom(r, m->n_layers)) {
+			fill_layer_geom(r->layer.ops, n_ops, &r->layer_ctx[0]);
+			return;
+		}
+		r->per_layer_ops = xcalloc((size_t)m->n_layers * n_ops, sizeof(recipe_op));
+		for (int li = 0; li < m->n_layers; li++)
+			memcpy(&r->per_layer_ops[(size_t)li * n_ops], r->layer.ops,
+				   (size_t)n_ops * sizeof(recipe_op));
+	}
+	for (int li = 0; li < m->n_layers; li++)
+		fill_layer_geom(&r->per_layer_ops[(size_t)li * n_ops], n_ops, &r->layer_ctx[li]);
+}
+
 model_recipe *recipe_build(const struct model *m) {
 	if (!m || !m->arch_info)
 		return NULL;
@@ -173,6 +195,13 @@ model_recipe *recipe_build(const struct model *m) {
 	model_recipe *r = (*fb)(m);
 	if (!r)
 		return NULL;
+
+	if (recipe_resolve_bindings(r) != OK) {
+		ERROR("recipe_build: '%s' recipe lacks an embedding lookup or logits readback op",
+			  m->arch_info->gguf_name);
+		recipe_free(r);
+		return NULL;
+	}
 
 	assert(m->moe.n_experts <= MOE_MAX_K);
 	if (m->moe.n_experts > MOE_MAX_K) {
@@ -186,78 +215,26 @@ model_recipe *recipe_build(const struct model *m) {
 			  "rather than silently truncate",
 			  m->moe.n_experts_used, MOE_MAX_TOPK);
 
-	int has_vld = m->arch_info->has_variable_layer_dims;
-
 	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
 	for (int li = 0; li < m->n_layers; li++) {
 		layer_ctx_entry *lc = &r->layer_ctx[li];
 		lc->head_dim		= model_layer_head_dim(m, li);
 		lc->n_kv_heads		= model_layer_kv_heads(m, li);
 		lc->intermediate	= model_layer_intermediate(m, li);
-		lc->has_kv			= layer_has_kv(m, li);
+		lc->has_kv			= model_layer_has_kv(m, li);
 		lc->has_own_v		= model_layer_has_own_v(m, li);
 		lc->is_global		= m->layers[li].is_global_layer;
 		lc->kv_row_stride	= lc->n_kv_heads * lc->head_dim;
 		lc->q_row_stride	= m->n_heads * lc->head_dim;
-		lc->kv_layer		= li;
-		if (has_vld && !lc->has_kv)
-			lc->kv_layer =
-				lc->is_global ? m->layer_dims.kv_layer_global : m->layer_dims.kv_layer_swa;
-	}
-
-	if (has_vld) {
-		int n_ops		 = r->layer.n_ops;
-		r->per_layer_ops = xcalloc((size_t)m->n_layers * n_ops, sizeof(recipe_op));
-		for (int li = 0; li < m->n_layers; li++) {
-			const layer_ctx_entry *lc  = &r->layer_ctx[li];
-			recipe_op			  *dst = &r->per_layer_ops[(size_t)li * n_ops];
-			memcpy(dst, r->layer.ops, (size_t)n_ops * sizeof(recipe_op));
-			for (int j = 0; j < n_ops; j++) {
-				recipe_op *op = &dst[j];
-				if (!lc->has_kv) {
-					if ((op->w_idx == WIDX_WK || op->w_idx == WIDX_WV) || op->kind == OP_KV_PUT ||
-						(op->kind == OP_ROPE_EXT && !op->u.rope_ext.is_q) ||
-						(op->kind == OP_RMSNORM_PER_HEAD && op->w_idx == WIDX_ATTN_K_NORM) ||
-						op->kind == OP_RMSNORM_NOWEIGHT) {
-						op->kind = OP_NONE;
-						continue;
-					}
-				}
-				if (op->kind == OP_MATMUL || op->kind == OP_MATMUL_RESIDUAL) {
-					if (op->u.matmul.n == 0 || op->u.matmul.k == 0)
-						resolve_matmul_dims(lc, m, op->w_idx, &op->u.matmul.n, &op->u.matmul.k);
-				}
-				if (op->kind == OP_MATMUL_FFN_DOWN) {
-					if (op->u.matmul_ffn_down.n == 0)
-						op->u.matmul_ffn_down.n = m->dim;
-					if (op->u.matmul_ffn_down.k == 0)
-						op->u.matmul_ffn_down.k = lc->intermediate;
-				}
-				if (op->kind == OP_MATMUL_MULTI && op->w_idx == WIDX_GATE) {
-					if (op->u.matmul_multi.n_out[0] == 0)
-						op->u.matmul_multi.n_out[0] = lc->intermediate;
-					if (op->u.matmul_multi.n_out[1] == 0)
-						op->u.matmul_multi.n_out[1] = lc->intermediate;
-				}
-				if (op->kind == OP_MATMUL_MULTI && op->w_idx == WIDX_WQ) {
-					op->u.matmul_multi.n_out[0] = m->n_heads * lc->head_dim;
-					op->u.matmul_multi.n_out[1] = lc->n_kv_heads * lc->head_dim;
-					op->u.matmul_multi.n_out[2] = lc->n_kv_heads * lc->head_dim;
-				}
-				if (op->kind == OP_ATTENTION) {
-					op->u.attention.head_dim		  = lc->head_dim;
-					op->u.attention.n_kv_heads		  = lc->n_kv_heads;
-					op->u.attention.n_kv_heads_active = lc->n_kv_heads;
-					op->u.attention.kv_layer		  = lc->kv_layer;
-				}
-			}
-		}
+		lc->kv_layer		= model_layer_kv_layer(m, li);
 	}
 
 	r->has_sliding_layers = model_has_sliding_layers(m);
 	r->ple_build_dev_ok	  = cap_resolve(m->backend, m, OP_PLE_BUILD, NULL, 0).impl == CAP_NATIVE;
 	r->ple_build_dev_ok_batch =
 		cap_resolve(m->backend, m, OP_PLE_BUILD, NULL, 1).impl == CAP_NATIVE;
+
+	recipe_specialize_geometry(r, m);
 
 	graph_optimize_recipe(r, m);
 

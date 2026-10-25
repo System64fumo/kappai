@@ -45,8 +45,6 @@ static const op_handler g_op_handlers[OP_KIND_COUNT];
 
 static op_handler exec_pick_variant(const recipe_op *op, const backend *a) {
 	switch (op->kind) {
-	case OP_MATMUL:
-		return op->w_idx == WIDX_WV ? NULL : op_matmul_plain;
 	case OP_MATMUL_FFN_DOWN:
 		return ffn_down_native(a) ? op_matmul_ffn_down_fused : op_matmul_ffn_down_composed;
 	case OP_ROPE_EXT:
@@ -158,7 +156,6 @@ static exec_ctx layer_run_ctx(layer_run *w) {
 		.flash_attn = w->flash_attn,
 		.layer_be	= layer_be,
 		.wtab_row	= wtab_row,
-		.lc			= graph_set_layer_ctx(w->graphs, li),
 	};
 }
 
@@ -440,7 +437,8 @@ static const op_handler g_op_handlers[OP_KIND_COUNT] = {
 	[OP_RMSNORM_PER_HEAD]	= op_rmsnorm_per_head,
 	[OP_RMSNORM_NOWEIGHT]	= op_rmsnorm_noweight,
 	[OP_RMSNORM_ADD]		= op_rmsnorm_add,
-	[OP_MATMUL]				= op_matmul,
+	[OP_MATMUL]				= op_matmul_plain,
+	[OP_COPY_K_TO_V]		= op_copy_k_to_v,
 	[OP_MATMUL_RESIDUAL]	= op_matmul_residual,
 	[OP_MATMUL_MULTI]		= matmul_multi_batch_body,
 	[OP_MATMUL_FFN_DOWN]	= op_matmul_ffn_down,
@@ -505,7 +503,7 @@ static status_code batch_run_post_ops(model *m, kvcache *cache, compute_scratch 
 	backend			   *a	  = m->backend;
 	const model_recipe *r	  = m->recipe;
 	const int			total = n_rows * m->vocab_size;
-	bs_ensure_slot(bs, a, RECIPE_SLOT_LOGITS, (size_t)total);
+	bs_ensure_slot(bs, a, r->logits_slot, (size_t)total);
 	status_code st = exec_outer_schedule(r->exec, &r->exec->post, OP_NONE, OP_NONE, m, cache, s, bs,
 										 0, n_rows, flash_attn, logits_out);
 	if (st != OK || r->exec->post_reads_logits)
@@ -513,7 +511,7 @@ static status_code batch_run_post_ops(model *m, kvcache *cache, compute_scratch 
 	if (!logits_out)
 		return OK;
 	ensure_sync(a);
-	buffer *logits = batch_slot(bs, RECIPE_SLOT_LOGITS);
+	buffer *logits = batch_slot(bs, r->logits_slot);
 	return logits->owner->buffer_read_f32(logits->owner, logits, logits_out, total);
 }
 
@@ -657,7 +655,7 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 	batch_scratch *bs = batch_scratch_prepare(m, s, n_tokens);
 	bs->tokens		  = tokens;
 
-	st = embd_fill_rows(a, &m->tok_embd.buf, m->tok_embd.type, tokens, &bs->pair[RECIPE_SLOT_X].b,
+	st = embd_fill_rows(a, &m->tok_embd.buf, m->tok_embd.type, tokens, &bs->pair[r->embd_slot].b,
 						n_tokens, dim, m->arch_info->has_scale_embeddings ? m->dim_sqrt : 1.0f);
 	if (st != OK)
 		goto done;

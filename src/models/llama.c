@@ -43,8 +43,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
 			OP_EMIT(&e,
 					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
-			OP_EMIT(&e, mk_matmul_v(RECIPE_SLOT_XB, RECIPE_SLOT_K, RECIPE_SLOT_V, kv_out, dim,
-									STAGE_MATMUL));
+			OP_EMIT(&e,
+					mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
 		}
 
 		if (has_rope_qk) {

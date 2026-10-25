@@ -64,6 +64,7 @@ typedef struct {
 struct batch_scratch {
 	bs_pair pair[RECIPE_SLOT_MAX];
 	uint8_t own[RECIPE_SLOT_MAX];
+	uint8_t logits_slot;
 
 	char	 *moe_pack;
 	size_t	  moe_pack_cap;
@@ -209,7 +210,7 @@ status_code scale_inplace_fallback(struct compute_scratch *s, backend *sync_be, 
 								   float scale);
 status_code op_rmsnorm(exec_ctx *ctx);
 status_code op_matmul_plain(exec_ctx *ctx);
-status_code op_matmul(exec_ctx *ctx);
+status_code op_copy_k_to_v(exec_ctx *ctx);
 status_code op_matmul_residual(exec_ctx *ctx);
 status_code op_matmul_ffn_down(exec_ctx *ctx);
 status_code op_matmul_ffn_down_fused(exec_ctx *ctx);
