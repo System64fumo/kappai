@@ -71,7 +71,7 @@ static void bs_arena_ensure(batch_scratch *bs, backend *owner, size_t bytes) {
 		}
 	}
 	bs->arena_bytes = bytes;
-	INFO("batch scratch: arena %zu B (%zu MiB) for %d rows", bytes, bytes >> 20, bs->layout.bucket);
+	DEBUG("batch scratch: arena %zu B (%zu MiB) for %d rows", bytes, bytes >> 20, bs->layout.bucket);
 }
 
 static buffer bs_arena_view(const batch_scratch *bs, backend *owner, size_t offset, size_t bytes) {

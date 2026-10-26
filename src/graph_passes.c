@@ -449,7 +449,7 @@ static void log_pass_totals(const int *totals) {
 			break;
 		used += (size_t)n;
 	}
-	INFO("graph: optimization passes changed: %s", used ? line : "nothing");
+	DEBUG("graph: optimization passes changed: %s", used ? line : "nothing");
 }
 
 void graph_optimize_recipe(model_recipe *r, const struct model *m) {

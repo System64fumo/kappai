@@ -723,9 +723,9 @@ cg_set *graph_set_build(const model_recipe *r, const struct model *m, int n_laye
 	for (int g = 0; g < s->n_graphs; g++)
 		graph_freeze(s->graphs[g]);
 	for (int g = 0; g < s->n_graphs; g++)
-		INFO("graph: variant %d: %d nodes, %d values, peak %d live buffers", g,
-			 s->graphs[g]->n_nodes, s->graphs[g]->n_values, graph_peak_live_buffers(s->graphs[g]));
-	INFO("graph: %d distinct layer variants over %d layers", s->n_graphs, n_layers);
+		DEBUG("graph: variant %d: %d nodes, %d values, peak %d live buffers", g,
+			  s->graphs[g]->n_nodes, s->graphs[g]->n_values, graph_peak_live_buffers(s->graphs[g]));
+	DEBUG("graph: %d distinct layer variants over %d layers", s->n_graphs, n_layers);
 	return s;
 }
 
