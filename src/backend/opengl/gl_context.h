@@ -4,8 +4,8 @@
 #include "common.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES3/gl31.h>
 #include <gbm.h>
+#include <GLES3/gl31.h>
 #include <stddef.h>
 #include <stdint.h>
 

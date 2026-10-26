@@ -1,11 +1,15 @@
 #version 310 es
 precision highp float;
 
-#ifndef WG
-#define WG 32
-#endif
 #ifndef MT
 #define MT 1
+#endif
+#if MT == 1
+#define KB 6
+#define WG 64
+#else
+#define KB 1
+#define WG 32
 #endif
 layout(local_size_x = WG) in;
 
@@ -27,6 +31,29 @@ layout(location = 2) uniform int u_add_residual;
 layout(location = 9) uniform int u_m;
 layout(location = 10) uniform int u_x_stride;
 layout(location = 11) uniform int u_wg_base;
+#ifdef FUSED_ACT
+layout(std430, binding = 4) readonly buffer UpBuf {
+	vec4 up[];
+};
+layout(location = 12) uniform int u_act;
+
+float act1(float g) {
+	if (u_act == 1) {
+		float t = 0.7978845608 * (g + 0.044715 * g * g * g);
+		return 0.5 * g * (1.0 + tanh(t));
+	}
+	return g / (1.0 + exp(-g));
+}
+
+vec4 xin(uint i) {
+	vec4 g = x[i];
+	return vec4(act1(g.x), act1(g.y), act1(g.z), act1(g.w)) * up[i];
+}
+#else
+vec4 xin(uint i) {
+	return x[i];
+}
+#endif
 
 #define ROWS 4
 
@@ -53,15 +80,21 @@ void main(void) {
 	for (int i = 0; i < ROWS * MT; i++)
 		acc[i] = vec4(0.0);
 
-	for (uint k = tid; k < k4; k += uint(WG)) {
-		vec4 xv[MT];
-		for (int c = 0; c < MT; c++)
-			xv[c] = x[xrow[c] + k];
-		for (int r = 0; r < ROWS; r++) {
-			vec4 wv = w[wrow[r] + k];
+	for (uint k0 = tid; k0 < k4; k0 += uint(WG * KB)) {
+		vec4 xv[KB * MT];
+		vec4 wv[KB * ROWS];
+		for (int b = 0; b < KB; b++) {
+			uint k	 = k0 + uint(b * WG);
+			bool act = k < k4;
 			for (int c = 0; c < MT; c++)
-				acc[r * MT + c] += wv * xv[c];
+				xv[b * MT + c] = act ? xin(xrow[c] + k) : vec4(0.0);
+			for (int r = 0; r < ROWS; r++)
+				wv[b * ROWS + r] = act ? w[wrow[r] + k] : vec4(0.0);
 		}
+		for (int b = 0; b < KB; b++)
+			for (int r = 0; r < ROWS; r++)
+				for (int c = 0; c < MT; c++)
+					acc[r * MT + c] += wv[b * ROWS + r] * xv[b * MT + c];
 	}
 	for (int i = 0; i < ROWS * MT; i++)
 		s_acc[i][tid] = acc[i].x + acc[i].y + acc[i].z + acc[i].w;

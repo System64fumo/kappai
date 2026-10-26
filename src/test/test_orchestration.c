@@ -18,14 +18,9 @@ char synth_dsa_model_path[512];
 char synth_tied_model_path[512];
 char synth_tied_twin_path[512];
 
-void synth_suite_common_init(void) {
-	static int done = 0;
-	if (done)
-		return;
-	done = 1;
-
+void synth_apply_config(void) {
 	config cfg				  = config_defaults();
-	cfg.device				  = "cpu_0";
+	cfg.device				  = "cpu0";
 	cfg.model				  = synth_chat_model_path;
 	cfg.use_mmap			  = false;
 	cfg.flash_attn			  = false;
@@ -33,6 +28,15 @@ void synth_suite_common_init(void) {
 	cfg.moe_cache_cap		  = 2;
 	cfg.seed				  = 7;
 	*((config *)config_get()) = cfg;
+}
+
+void synth_suite_common_init(void) {
+	static int done = 0;
+	if (done)
+		return;
+	done = 1;
+
+	synth_apply_config();
 
 	const char *tmpdir = getenv("TMPDIR");
 	snprintf(synth_fixture_dir, sizeof(synth_fixture_dir), "%s/kappai_test_fixtures",
@@ -151,7 +155,7 @@ static void restore_logging(void) {
 
 static int ctx_init_for(context *c, int ctx_size) {
 	config cfg	   = config_defaults();
-	cfg.device	   = "cpu_0";
+	cfg.device	   = "cpu0";
 	cfg.model	   = synth_chat_model_path;
 	cfg.use_mmap   = false;
 	cfg.flash_attn = false;
@@ -581,12 +585,12 @@ static void t_prefix_reuse_accounting(void) {
 				if (cont_ok == 1) {
 					const int KF = 8;
 					float	  eng_lg[512];
-					buffer	 *lslot = &c.scratch.slots[RECIPE_SLOT_LOGITS];
+					buffer	 *lslot = compute_logits_device(&c.scratch);
 					if (c.backend && c.backend->synchronize)
 						c.backend->synchronize(c.backend);
 					backend *owner = lslot->owner ? lslot->owner : c.backend;
 					int		 have  = 0;
-					if (owner && owner->buffer_read_f32 && !c.scratch.logits_alias)
+					if (owner && owner->buffer_read_f32)
 						have = owner->buffer_read_f32(owner, lslot, eng_lg, c.m.vocab_size) == OK;
 					if (!have)
 						memcpy(eng_lg, c.scratch.logits_host,
@@ -841,7 +845,7 @@ static void t_engine_exit_code_context_full(void) {
 	ORCH_PUSH("-m");
 	ORCH_PUSH(synth_chat_model_path);
 	ORCH_PUSH("--device");
-	ORCH_PUSH("cpu_0");
+	ORCH_PUSH("cpu0");
 	ORCH_PUSH("-c");
 	ORCH_PUSH("40");
 	ORCH_PUSH("-p");

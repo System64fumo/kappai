@@ -1,0 +1,169 @@
+#version 310 es
+precision highp float;
+precision highp int;
+
+#define BM 64
+#define BN 64
+#define NT 256
+layout(local_size_x = NT) in;
+
+layout(std430, binding = 0) readonly buffer WBuf {
+	uint w[];
+};
+layout(std430, binding = 1) readonly buffer XQBuf {
+	uint xq[];
+};
+layout(std430, binding = 2) buffer YBuf {
+	float y[];
+};
+layout(std430, binding = 3) readonly buffer ResBuf {
+	float res[];
+};
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_k_blocks;
+layout(location = 2) uniform int u_add_residual;
+layout(location = 9) uniform int u_m;
+layout(location = 10) uniform int u_x_stride;
+layout(location = 11) uniform int u_wg_base;
+
+#ifdef Q8_0
+#define BLOCK_BYTES 34u
+#else
+#define BLOCK_BYTES 18u
+#endif
+#define XQ_BLOCK_WORDS 44u
+
+#ifdef IQ4_NL
+const float KV[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0,
+							   25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
+#endif
+
+shared float s_w[32 * BM];
+shared float s_x[32 * BN];
+shared float s_dw[BM];
+shared float s_dx[BN];
+
+uint word_at(uint bo) {
+	uint wi = bo >> 2u;
+	if ((bo & 2u) == 0u)
+		return w[wi];
+	return (w[wi] >> 16u) | (w[wi + 1u] << 16u);
+}
+
+float wval(uint word, uint j, uint high) {
+#ifdef Q8_0
+	return float(bitfieldExtract(int(word), int(j * 8u), 8));
+#else
+	uint b	 = (word >> (j * 8u)) & 0xFFu;
+	uint nib = high != 0u ? b >> 4u : b & 0xFu;
+#ifdef IQ4_NL
+	return KV[nib];
+#else
+	return float(int(nib) - 8);
+#endif
+#endif
+}
+
+void main(void) {
+	uint tid	= gl_LocalInvocationID.x;
+	uint wgid	= gl_WorkGroupID.x + uint(u_wg_base);
+	uint mb		= uint(max(u_m, 1));
+	uint n_ct	= (mb + uint(BN) - 1u) / uint(BN);
+	uint col0	= (wgid % n_ct) * uint(BN);
+	uint row0	= (wgid / n_ct) * uint(BM);
+	uint last_r = uint(max(u_n - 1, 0));
+
+	uint lr	   = tid >> 2u;
+	uint qd	   = tid & 3u;
+	uint rbase = min(row0 + lr, last_r) * uint(u_k_blocks) * BLOCK_BYTES;
+#ifdef Q8_0
+	uint qoff = 2u + qd * 8u;
+	uint kb0  = qd * 8u;
+	uint high = 0u;
+#else
+	uint qoff = 2u + (qd & 1u) * 8u;
+	uint kb0  = (qd >> 1u) * 16u + (qd & 1u) * 8u;
+	uint high = qd >> 1u;
+#endif
+	uint xbase = min(col0 + lr, mb - 1u) * uint(u_x_stride) * 4u;
+
+	uint tr = tid & 15u;
+	uint tc = tid >> 4u;
+
+	float acc[16];
+	for (int i = 0; i < 16; i++)
+		acc[i] = 0.0;
+
+	uint bo = rbase;
+	uint wd = word_at(bo);
+	uint w0 = word_at(bo + qoff);
+	uint w1 = word_at(bo + qoff + 4u);
+	uint xb = xbase;
+	uint x0 = xq[xb + qd * 2u];
+	uint x1 = xq[xb + qd * 2u + 1u];
+	uint xd = xq[xb + 8u];
+
+	for (int bi = 0; bi < u_k_blocks; bi++) {
+		barrier();
+		if (qd == 0u) {
+			s_dw[lr] = unpackHalf2x16(wd & 0xFFFFu).x;
+			s_dx[lr] = uintBitsToFloat(xd);
+		}
+		for (uint j = 0u; j < 4u; j++) {
+			s_w[(kb0 + j) * uint(BM) + lr]		= wval(w0, j, high);
+			s_w[(kb0 + 4u + j) * uint(BM) + lr] = wval(w1, j, high);
+			s_x[(qd * 8u + j) * uint(BN) + lr]	= float(bitfieldExtract(int(x0), int(j * 8u), 8));
+			s_x[(qd * 8u + 4u + j) * uint(BN) + lr] =
+				float(bitfieldExtract(int(x1), int(j * 8u), 8));
+		}
+		barrier();
+
+		if (bi + 1 < u_k_blocks) {
+			bo += BLOCK_BYTES;
+			wd = word_at(bo);
+			w0 = word_at(bo + qoff);
+			w1 = word_at(bo + qoff + 4u);
+			xb += XQ_BLOCK_WORDS;
+			x0 = xq[xb + qd * 2u];
+			x1 = xq[xb + qd * 2u + 1u];
+			xd = xq[xb + 8u];
+		}
+
+		float s[16];
+		for (int i = 0; i < 16; i++)
+			s[i] = 0.0;
+		for (uint kk = 0u; kk < 32u; kk++) {
+			uint ab = kk * uint(BM) + tr * 4u;
+			uint bb = kk * uint(BN) + tc * 4u;
+			vec4 a	= vec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
+			vec4 b	= vec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
+			for (int i = 0; i < 4; i++)
+				for (int j = 0; j < 4; j++)
+					s[i * 4 + j] += a[i] * b[j];
+		}
+		for (int i = 0; i < 4; i++) {
+			float dw = s_dw[tr * 4u + uint(i)];
+			for (int j = 0; j < 4; j++)
+				acc[i * 4 + j] += dw * s_dx[tc * 4u + uint(j)] * s[i * 4 + j];
+		}
+	}
+
+	for (int i = 0; i < 4; i++) {
+		uint row = row0 + tr * 4u + uint(i);
+		if (int(row) >= u_n)
+			continue;
+		for (int j = 0; j < 4; j++) {
+			uint col = col0 + tc * 4u + uint(j);
+			if (col >= mb)
+				continue;
+			uint  yi = col * uint(u_n) + row;
+			float v	 = acc[i * 4 + j];
+			if (u_add_residual == 1)
+				y[yi] = v + res[row];
+			else if (u_add_residual == 2)
+				y[yi] += v;
+			else
+				y[yi] = v;
+		}
+	}
+}

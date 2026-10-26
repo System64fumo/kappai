@@ -25,7 +25,7 @@ typedef struct {
 	int					  n_ctx;
 	bool				  flash_attn;
 	bool				  debug_forward;
-	_Atomic sig_atomic_t interrupt;
+	_Atomic sig_atomic_t  interrupt;
 	bool				  context_limit_hit;
 	bool				  session_poisoned;
 	bool				  debug_prompt;

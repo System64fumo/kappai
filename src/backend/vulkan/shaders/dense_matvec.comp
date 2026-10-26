@@ -1,0 +1,101 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define WG 64
+#define MAX_SUBGROUPS 16
+
+layout(local_size_x = WG) in;
+layout(constant_id = 0) const uint COLS = 1;
+layout(constant_id = 1) const uint ROWS = 2;
+
+#ifdef F32
+layout(set = 0, binding = 0) readonly buffer W {
+	vec4 w4[];
+};
+#else
+layout(set = 0, binding = 0) readonly buffer W {
+	uvec2 w4[];
+};
+#endif
+layout(set = 0, binding = 1) readonly buffer X {
+	vec4 x4[];
+};
+layout(set = 0, binding = 2) buffer Y {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer R {
+	float res[];
+};
+
+layout(push_constant) uniform Params {
+	int n;
+	int k4;
+	int m;
+	int res_mode;
+}
+pc;
+
+vec4 wload(uint i) {
+#if defined(F32)
+	return w4[i];
+#elif defined(F16)
+	uvec2 v = w4[i];
+	return vec4(unpackHalf2x16(v.x), unpackHalf2x16(v.y));
+#else
+	uvec2 v = w4[i];
+	return vec4(uintBitsToFloat(v.x << 16u), uintBitsToFloat(v.x & 0xFFFF0000u),
+				uintBitsToFloat(v.y << 16u), uintBitsToFloat(v.y & 0xFFFF0000u));
+#endif
+}
+
+shared float s_red[16 * MAX_SUBGROUPS];
+
+void main() {
+	uint tid  = gl_LocalInvocationID.x;
+	uint n	  = uint(pc.n);
+	uint m	  = uint(pc.m);
+	uint k4	  = uint(pc.k4);
+	uint row0 = gl_WorkGroupID.x * ROWS;
+	uint col0 = gl_WorkGroupID.y * COLS;
+
+	float acc[ROWS * COLS];
+	for (uint i = 0u; i < ROWS * COLS; i++)
+		acc[i] = 0.0;
+
+	for (uint i = tid; i < k4; i += WG) {
+		vec4 xv[COLS];
+		for (uint c = 0u; c < COLS; c++)
+			xv[c] = x4[min(col0 + c, m - 1u) * k4 + i];
+		for (uint r = 0u; r < ROWS; r++) {
+			vec4 wv = wload(min(row0 + r, n - 1u) * k4 + i);
+			for (uint c = 0u; c < COLS; c++)
+				acc[r * COLS + c] += dot(wv, xv[c]);
+		}
+	}
+
+	for (uint i = 0u; i < ROWS * COLS; i++) {
+		float v = subgroupAdd(acc[i]);
+		if (subgroupElect())
+			s_red[i * MAX_SUBGROUPS + gl_SubgroupID] = v;
+	}
+	barrier();
+	if (tid >= ROWS * COLS)
+		return;
+	uint r	 = tid / COLS;
+	uint c	 = tid % COLS;
+	uint row = row0 + r;
+	uint col = col0 + c;
+	if (row >= n || col >= m)
+		return;
+	float v = 0.0;
+	for (uint s = 0u; s < gl_NumSubgroups; s++)
+		v += s_red[tid * MAX_SUBGROUPS + s];
+	uint yi = col * n + row;
+	if (pc.res_mode == 1)
+		y[yi] = v + res[row];
+	else if (pc.res_mode == 2)
+		y[yi] += v;
+	else
+		y[yi] = v;
+}

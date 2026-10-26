@@ -3,6 +3,12 @@
 
 #include <string.h>
 
+#define GEMMA4_COMMON_FIELDS                                                                       \
+	.has_scale_embeddings = true, .default_rope_theta = 1000000.0f, .sliding_window_period = 5,    \
+	.has_qk_norm = true, .has_post_norm_ple = true, .uses_gelu_activation = true,                  \
+	.uses_norm_v_without_weight = true, .has_attn_post_norm = true, .has_ffn_post_norm = true,     \
+	.has_layer_output_scale = true, .has_variable_layer_dims = true, .uses_neox_rope = true
+
 static const arch_info k_registry[] = {
 	{
 		.arch				= ARCH_LLAMA,
@@ -11,42 +17,20 @@ static const arch_info k_registry[] = {
 		.default_rope_theta = 10000.0f,
 	},
 	{
-		.arch						= ARCH_GEMMA4,
-		.gguf_name					= "gemma4",
-		.key_prefix					= "gemma4",
-		.has_scale_embeddings		= true,
-		.default_rope_theta			= 1000000.0f,
-		.sliding_window_period		= 5,
-		.has_qk_norm				= true,
-		.has_post_norm_ple			= true,
-		.uses_gelu_activation		= true,
-		.uses_norm_v_without_weight = true,
-		.has_attn_post_norm			= true,
-		.has_ffn_post_norm			= true,
-		.has_layer_output_scale		= true,
-		.has_variable_layer_dims	= true,
-		.uses_neox_rope				= true,
+		.arch		= ARCH_GEMMA4,
+		.gguf_name	= "gemma4",
+		.key_prefix = "gemma4",
+		GEMMA4_COMMON_FIELDS,
 	},
 	{
-		.arch						= ARCH_GEMMA4_MOE,
-		.gguf_name					= "gemma4_moe",
-		.key_prefix					= "gemma4",
-		.has_scale_embeddings		= true,
-		.default_rope_theta			= 1000000.0f,
-		.sliding_window_period		= 5,
-		.has_qk_norm				= true,
-		.has_post_norm_ple			= true,
-		.uses_gelu_activation		= true,
-		.uses_norm_v_without_weight = true,
-		.has_attn_post_norm			= true,
-		.has_ffn_post_norm			= true,
-		.has_layer_output_scale		= true,
-		.has_variable_layer_dims	= true,
-		.uses_neox_rope				= true,
-		.is_moe						= true,
-		.uses_moe_softmax_router	= true,
-		.uses_moe_shared_dense_ffn	= true,
-		.uses_moe_norm_topk_prob	= true,
+		.arch		= ARCH_GEMMA4_MOE,
+		.gguf_name	= "gemma4_moe",
+		.key_prefix = "gemma4",
+		GEMMA4_COMMON_FIELDS,
+		.is_moe					   = true,
+		.uses_moe_softmax_router   = true,
+		.uses_moe_shared_dense_ffn = true,
+		.uses_moe_norm_topk_prob   = true,
 	},
 	{
 		.arch					 = ARCH_GLM_DSA,

@@ -27,7 +27,13 @@ typedef enum {
 	BCAP_UNIFIED_MEMORY		  = 1 << 11,
 	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
 	BCAP_KV_SHIFT			  = 1 << 13,
+	BCAP_QK_NORM_ROPE		  = 1 << 14,
 } backend_cap;
+
+#define BACKEND_TOKEN_REGS 2
+#define TOKEN_FROM_REG(reg) (-1 - (reg))
+#define TOKEN_IS_REG(token) ((token) < 0)
+#define TOKEN_REG_INDEX(token) (-1 - (token))
 
 typedef struct {
 	void	   *handle;
@@ -295,6 +301,10 @@ struct backend {
 	status_code (*rmsnorm_add_batch)(backend *self, const buffer *x, const buffer *w,
 									 const buffer *residual, buffer *y, int n, float eps,
 									 float out_scale, int m);
+	status_code (*rmsnorm_add_norm_batch)(backend *self, const buffer *x, const buffer *w_add,
+										  const buffer *residual, buffer *y_add,
+										  const buffer *w_norm, buffer *y_norm, int n, float eps,
+										  float out_scale, int m);
 	status_code (*rmsnorm_per_head_batch)(backend *self, const buffer *x, const buffer *w,
 										  buffer *y, int n_heads, int head_dim, float eps, int m);
 	status_code (*rmsnorm_noweight_batch)(backend *self, const buffer *x, buffer *y, int n,
@@ -312,6 +322,8 @@ struct backend {
 									  const buffer *b, float *dst_b, int n_b);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
+	status_code (*argmax_to_reg)(backend *self, const buffer *logits, int n, int reg);
+	status_code (*read_token_reg)(backend *self, int reg, int32_t *out_token);
 	status_code (*repack_plan)(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
 							   uint32_t *re_type_out);
 	status_code (*repack_weight)(backend *self, uint32_t type, const void *src, void *dst,
@@ -322,6 +334,7 @@ struct backend {
 	status_code (*dequant_weight)(backend *self, uint32_t type, const void *src, int n_rows, int k,
 								  buffer *out);
 	void (*synchronize)(backend *self);
+	void (*set_gpu_profile)(backend *self, int enable);
 	void (*submit)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
@@ -336,6 +349,10 @@ struct backend {
 											int activation, int m);
 	status_code (*rope_batch)(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
 							  const float *rope_cos_base, const float *rope_sin_base, int m);
+	status_code (*qk_norm_rope)(backend *self, buffer *q, buffer *k, const buffer *q_w,
+								const buffer *k_w, int n_heads, int n_kv_heads, int head_dim,
+								float eps, int pos_start, const float *rope_cos_base,
+								const float *rope_sin_base, const float *freq_factors, int m);
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
 								 int head_dim, int pos_start, const float *rope_cos_base,
 								 const float *rope_sin_base, int m);
@@ -408,6 +425,12 @@ static inline tpool *backend_get_pool(backend *b) {
 	if (b && b->get_pool)
 		return b->get_pool(b);
 	return NULL;
+}
+
+static inline int buffer_is_host_resident(const buffer *b) {
+	if (!b->handle)
+		return 1;
+	return b->owner && backend_has_cap(b->owner, BCAP_IS_HOST);
 }
 
 static inline void ensure_sync(backend *a) {

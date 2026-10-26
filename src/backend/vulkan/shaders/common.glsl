@@ -84,11 +84,56 @@ float neg_max_float() {
 }
 
 int round_away(float f) {
-	return f >= 0.0 ? int(floor(f + 0.5)) : int(ceil(f - 0.5));
+	float a = abs(f);
+	float t = trunc(a);
+	int	  r = int(t) + ((a - t) >= 0.5 ? 1 : 0);
+	return f < 0.0 ? -r : r;
 }
 
 int nearest_int(float f) {
-	return f >= 0.0 ? int(floor(f + 0.5)) : -int(floor(-f + 0.5));
+	return round_away(f);
+}
+
+float div_exact(float a, float b) {
+	uint nb	  = floatBitsToUint(a);
+	uint db	  = floatBitsToUint(b);
+	uint sign = (nb ^ db) & 0x80000000u;
+	if ((nb & 0x7FFFFFFFu) == 0u || (db & 0x7FFFFFFFu) == 0u)
+		return uintBitsToFloat(sign);
+	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
+	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
+	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
+	uint M24 = 0u;
+	uint rem;
+	int	 me;
+	if (Nn >= Dd) {
+		me	= eq;
+		rem = Nn - Dd;
+	} else {
+		me	= eq - 1;
+		rem = (Nn << 1u) - Dd;
+	}
+	for (int i = 0; i < 23; i++) {
+		rem <<= 1u;
+		M24 <<= 1u;
+		if (rem >= Dd) {
+			rem -= Dd;
+			M24 |= 1u;
+		}
+	}
+	uint r2 = rem << 1u;
+	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
+		M24++;
+	if (M24 >= (1u << 23)) {
+		M24 = 0u;
+		me++;
+	}
+	int fe = me + 127;
+	if (fe >= 255)
+		return uintBitsToFloat(sign | 0x7F800000u);
+	if (fe <= 0)
+		return uintBitsToFloat(sign);
+	return uintBitsToFloat(sign | (uint(fe) << 23u) | M24);
 }
 
 #endif

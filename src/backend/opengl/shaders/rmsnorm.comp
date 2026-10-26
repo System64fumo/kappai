@@ -1,5 +1,6 @@
 #version 310 es
 precision highp float;
+#define LOAD_BATCH 8
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer XBuf {
 	float x[];
@@ -17,8 +18,15 @@ void		 main(void) {
 	uint  tid	 = gl_LocalInvocationID.x;
 	int	  n		 = u_n;
 	float my_sum = 0.0;
-	for (int i = int(tid); i < n; i += 64)
-		my_sum += x[i] * x[i];
+	for (int i0 = int(tid); i0 < n; i0 += 64 * LOAD_BATCH) {
+		float xv[LOAD_BATCH];
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int i = i0 + j * 64;
+			xv[j] = i < n ? x[i] : 0.0;
+		}
+		for (int j = 0; j < LOAD_BATCH; j++)
+			my_sum += xv[j] * xv[j];
+	}
 	s_ss[tid] = my_sum;
 	barrier();
 	if (tid < 32u) {
@@ -47,7 +55,18 @@ void		 main(void) {
 	barrier();
 	float ss  = s_ss[0];
 	float inv = 1.0 / sqrt(ss / float(n) + u_eps);
-	for (int i = int(tid); i < n; i += 64) {
-		y[i] = x[i] * inv * w[i];
+	for (int i0 = int(tid); i0 < n; i0 += 64 * LOAD_BATCH) {
+		float xv[LOAD_BATCH];
+		float wv[LOAD_BATCH];
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int i = i0 + j * 64;
+			xv[j] = i < n ? x[i] : 0.0;
+			wv[j] = i < n ? w[i] : 0.0;
+		}
+		for (int j = 0; j < LOAD_BATCH; j++) {
+			int i = i0 + j * 64;
+			if (i < n)
+				y[i] = xv[j] * inv * wv[j];
+		}
 	}
 }

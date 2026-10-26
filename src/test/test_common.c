@@ -90,6 +90,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_HCS]				 = "hcs",
 		[OPFAM_MEMPOOL]			 = "mempool",
 		[OPFAM_MOE_TIER]		 = "moe_tier",
+		[OPFAM_PLAN]			 = "plan",
 		[OPFAM_HC_INIT]			 = "hc_init",
 		[OPFAM_HC_PRE]			 = "hc_pre",
 		[OPFAM_HC_POST]			 = "hc_post",
@@ -846,10 +847,7 @@ void print_summary_table(void) {
 		total_skip += g_stats[i].cnt[V_SKIP];
 	}
 
-	printf("\n========================================\n");
-	printf("%sPer-op summary%s\n", color_bold(), color_reset());
-	printf("========================================\n");
-	printf("  %-20s  %4s %4s %4s  %6s\n", "op", "pass", "fail", "skip", "rate");
+	printf("\n  %-20s  %4s %4s %4s  %6s\n", "op", "pass", "fail", "skip", "rate");
 	printf("  %-20s  %4s %4s %4s  %6s\n", "----", "----", "----", "----", "----");
 	for (int i = 0; i < OPFAM_COUNT; i++) {
 		if (g_stats[i].calls == 0)

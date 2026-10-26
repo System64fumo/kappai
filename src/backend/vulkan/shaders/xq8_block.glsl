@@ -3,9 +3,9 @@ int xq8_quant_block(int xb, out float d_out) {
 	for (int j = 0; j < 32; j++)
 		amax = max(amax, abs(x_shared[xb + j]));
 
-	float d	  = amax / 127.0;
+	float d	  = div_exact(amax, 127.0);
 	d_out	  = d;
-	float inv = d > 0.0 ? 1.0 / d : 0.0;
+	float inv = d > 0.0 ? div_exact(1.0, d) : 0.0;
 
 	int wp	= xb >> 2;
 	int sum = 0;

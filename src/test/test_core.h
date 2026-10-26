@@ -32,7 +32,7 @@
 #define REF_MAGNITUDE_MIN 1e-6f
 #define ARCH_GENERATE_N_DECODE 3
 
-#define MAX_RESULTS_PER_FAMILY 128
+#define MAX_RESULTS_PER_FAMILY 512
 #define V_COUNT 3
 
 typedef enum {
@@ -84,6 +84,7 @@ typedef enum {
 	OPFAM_HCS,
 	OPFAM_MEMPOOL,
 	OPFAM_MOE_TIER,
+	OPFAM_PLAN,
 	OPFAM_HC_INIT,
 	OPFAM_HC_PRE,
 	OPFAM_HC_POST,
@@ -169,6 +170,7 @@ void run_per_op_tests(backend *ref, backend *tgt);
 void run_arch_tests(backend *ref, backend *tgt);
 
 void		synth_suite_common_init(void);
+void		synth_apply_config(void);
 extern char synth_fixture_dir[256];
 extern char synth_chat_model_path[512];
 extern char synth_lfm2_model_path[512];
@@ -183,6 +185,7 @@ void		run_toolcall_tests(void);
 void		run_hcs_tests(void);
 void		run_mempool_tests(void);
 void		run_moe_tier_tests(void);
+void		run_plan_tests(void);
 void		test_quant_determinism(backend *ref, const qtype_info *qt);
 void		test_quant_finiteness(backend *ref, const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(backend *ref);

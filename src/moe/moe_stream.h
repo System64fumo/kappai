@@ -108,7 +108,9 @@ void		moe_stream_op_free(moe_stream_op *op);
 
 void moe_stream_wait_slot(const moe_expert_slot *slot);
 
-void moe_stream_release_slot(struct model *m, int layer, const moe_expert_slot *slot);
+status_code moe_stream_upload_live(struct model *m, int layer, int eid, backend *eb,
+								   moe_expert_slot *out);
+void		moe_stream_release_slot(struct model *m, int layer, const moe_expert_slot *slot);
 
 void moe_stream_release_slots(struct model *m, int layer, const moe_expert_slot *slots, int n);
 

@@ -276,6 +276,7 @@ static void log_op_homes(backend *b) {
 		{"matmul_batch", b->matmul_batch != NULL},
 		{"rmsnorm_batch", b->rmsnorm_batch != NULL},
 		{"rope_qk_batch", b->rope_qk_batch != NULL},
+		{"qk_norm_rope", b->qk_norm_rope != NULL},
 		{"attention_batch", b->attention_batch != NULL},
 		{"attention_swa_batch", b->attention_swa_batch != NULL},
 		{"ffn_activate_batch", b->ffn_activate_batch != NULL},
@@ -289,6 +290,22 @@ static void log_op_homes(backend *b) {
 		{"hc_final", b->hc_final != NULL},
 		{"kda", b->kda != NULL},
 		{"mla_absorbed", b->mla_absorbed != NULL},
+		{"attention_mla", b->attention_mla != NULL},
+		{"kv_alloc_mla", b->kv_alloc_mla != NULL},
+		{"kv_put_mla", b->kv_put_mla != NULL},
+		{"gated_delta_net", b->gated_delta_net != NULL},
+		{"rope_batch", b->rope_batch != NULL},
+		{"rope_ext_batch", b->rope_ext_batch != NULL},
+		{"rmsnorm_per_head_batch", b->rmsnorm_per_head_batch != NULL},
+		{"rmsnorm_noweight_batch", b->rmsnorm_noweight_batch != NULL},
+		{"rmsnorm_noweight_per_head_batch", b->rmsnorm_noweight_per_head_batch != NULL},
+		{"add_batch", b->add_batch != NULL},
+		{"moe_expert_ffn", b->moe_expert_ffn != NULL},
+		{"kv_shift", b->kv_shift != NULL},
+		{"copy_buffer", b->copy_buffer != NULL},
+		{"ple_combine", b->ple_combine != NULL},
+		{"prequantize_x", b->prequantize_x != NULL},
+		{"matmul_qonly", b->matmul_qonly != NULL},
 	};
 	int	 n_native = 0;
 	int	 n_total  = (int)ARRAY_LEN(ops);
@@ -539,7 +556,7 @@ status_code backend_create_best(backend **out) {
 }
 
 int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
-	return snprintf(out, out_cap, "%s_%d", name, device_index);
+	return snprintf(out, out_cap, "%s%d", name, device_index);
 }
 
 size_t backend_name_brief_len(const char *name) {
@@ -555,10 +572,10 @@ int backend_parse_device(const char *spec, char *name, size_t name_cap, int *dev
 	const char *digits = end;
 	while (digits > spec && digits[-1] >= '0' && digits[-1] <= '9')
 		digits--;
-	if (digits == end || digits == spec || digits[-1] != '_')
+	if (digits == end || digits == spec)
 		return -1;
 
-	size_t name_len = (size_t)(digits - 1 - spec);
+	size_t name_len = (size_t)(digits - spec);
 	if (name_len == 0 || name_len >= name_cap)
 		return -1;
 

@@ -208,8 +208,8 @@ void main() {
 				if (ax > amax)
 					amax = ax;
 			}
-			float d				   = amax / 127.0;
-			float id			   = d > 0.0 ? 1.0 / d : 0.0;
+			float d				   = div_exact(amax, 127.0);
+			float id			   = d > 0.0 ? div_exact(1.0, d) : 0.0;
 			xq_d[bi - block_start] = f32_to_f16_to_f32(d);
 
 			int q[32];

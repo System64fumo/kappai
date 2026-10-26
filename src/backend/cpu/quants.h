@@ -1,7 +1,7 @@
 #ifndef QUANTS_H
 #define QUANTS_H
 
-#include "common.h"
+#include "../../common.h"
 #include "gguf.h"
 #include <math.h>
 
@@ -171,6 +171,14 @@ typedef struct {
 
 float	 f16_to_f32(uint16_t h);
 uint16_t f32_to_f16(float f);
+void	 f32_to_f16_row(const float *src, uint16_t *dst, int n);
+void	 scale_f32(float *x, float s, int n);
+void	 add_scale_f32(float *x, const float *y, float s, int n);
+void gdn_decay_accum_f32(float *restrict row, float *restrict mem, float decay, float ks, int n);
+void gdn_out_norm_f32(float *restrict y, const float *restrict norm_w, const float *restrict z,
+					  float inv_rms, int n);
+void gdn_update_accum_f32(float *restrict row, float *restrict y, const float *restrict delta,
+						  float ks, float qs, int n);
 
 void dequant_q4_0_row(const void *blocks, size_t n_blocks, float *dst);
 void dequant_q4_1_row(const void *blocks, size_t n_blocks, float *dst);
@@ -462,5 +470,18 @@ static const uint8_t kmask_iq2xs[8] = {1, 2, 4, 8, 16, 32, 64, 128};
 static const int8_t iq3_s_repacked_decode[16] = {
 	1, 3, 5, 7, 9, 11, 13, 15, -1, -3, -5, -7, -9, -11, -13, -15,
 };
+
+#define MATMUL_Q8_F32(name, xq_t, qk, quantize_fn, qonly_fn)                                       \
+	void matmul_##name##_f32(const void *w, const float *restrict x, float *restrict y, int n,     \
+							 int k, quant_scratch *qs) {                                           \
+		int blocks_per_row = k / (qk);                                                             \
+		quant_scratch_ensure(qs, (size_t)blocks_per_row * sizeof(xq_t));                           \
+		xq_t *xq = qs->q8_buf;                                                                     \
+		quantize_fn(x, xq, k);                                                                     \
+		qonly_fn(w, xq, 0, y, n, n, k, 1);                                                         \
+	}
+
+#define Q4_K_REPACKED_ROW_BYTES (Q4_K_REPACKED_GROUP_BYTES / Q4_K_REPACKED_ROWS)
+#define Q5_K_REPACKED_ROW_BYTES (Q5_K_REPACKED_GROUP_BYTES / Q5_K_REPACKED_ROWS)
 
 #endif

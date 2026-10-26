@@ -1,20 +1,14 @@
 #ifndef CPU_AARCH64_COMMON_H
 #define CPU_AARCH64_COMMON_H
 
+#include "cpu_cache.h"
+
 #include <arm_neon.h>
 #include <string.h>
 
-#ifndef CACHE_LINE_BYTES
-#define CACHE_LINE_BYTES 64
-#endif
-
-#ifndef L1D_SIZE_BYTES
-#define L1D_SIZE_BYTES (32 * 1024)
-#endif
-
-#ifndef L2_SIZE_BYTES
-#define L2_SIZE_BYTES (512 * 1024)
-#endif
+#define CACHE_LINE_BYTES (g_cpu_cache.line_bytes)
+#define L1D_SIZE_BYTES (g_cpu_cache.l1d_bytes)
+#define L2_SIZE_BYTES (g_cpu_cache.l2_bytes)
 
 #ifndef PREFETCH_LOCALITY
 #define PREFETCH_LOCALITY 1

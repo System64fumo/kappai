@@ -1,0 +1,82 @@
+#version 310 es
+precision highp float;
+precision highp int;
+#define WG 64
+#define MAX_HEAD_DIM 1024
+layout(local_size_x = WG) in;
+layout(std430, binding = 0) buffer QBuf {
+	float q[];
+};
+layout(std430, binding = 1) buffer KBuf {
+	float k[];
+};
+layout(std430, binding = 2) readonly buffer QWBuf {
+	float qw[];
+};
+layout(std430, binding = 3) readonly buffer KWBuf {
+	float kw[];
+};
+layout(std430, binding = 4) readonly buffer CosBuf {
+	float rcos[];
+};
+layout(std430, binding = 5) readonly buffer SinBuf {
+	float rsin[];
+};
+layout(location = 0) uniform int u_n_heads;
+layout(location = 1) uniform int u_n_kv_heads;
+layout(location = 2) uniform int u_head_dim;
+layout(location = 3) uniform float u_eps;
+layout(location = 4) uniform int u_neox;
+layout(location = 5) uniform int u_pos0;
+
+shared float s_v[MAX_HEAD_DIM];
+shared float s_ss[WG];
+
+void main(void) {
+	uint tid	  = gl_LocalInvocationID.x;
+	int	 hh		  = int(gl_WorkGroupID.x);
+	uint row	  = gl_WorkGroupID.y;
+	bool is_q	  = hh < u_n_heads;
+	int	 h		  = is_q ? hh : hh - u_n_heads;
+	int	 head_dim = u_head_dim;
+	int	 half_dim = head_dim / 2;
+	uint stride	  = uint((is_q ? u_n_heads : u_n_kv_heads) * head_dim);
+	uint base	  = row * stride + uint(h * head_dim);
+
+	float my_sum = 0.0;
+	for (int i = int(tid); i < head_dim; i += WG) {
+		float v = is_q ? q[base + uint(i)] : k[base + uint(i)];
+		s_v[i]	= v;
+		my_sum += v * v;
+	}
+	s_ss[tid] = my_sum;
+	barrier();
+	for (uint r = uint(WG) / 2u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_ss[tid] += s_ss[tid + r];
+		barrier();
+	}
+	float inv = 1.0 / sqrt(s_ss[0] / float(head_dim) + u_eps);
+	for (int i = int(tid); i < head_dim; i += WG)
+		s_v[i] = s_v[i] * inv * (is_q ? qw[i] : kw[i]);
+	barrier();
+
+	for (int j = int(tid); j < half_dim; j += WG) {
+		uint  co = (uint(u_pos0) + row) * uint(half_dim) + uint(j);
+		float c	 = rcos[co];
+		float s	 = rsin[co];
+		int	  i0 = u_neox != 0 ? j : 2 * j;
+		int	  i1 = u_neox != 0 ? j + half_dim : 2 * j + 1;
+		float a	 = s_v[i0];
+		float b	 = s_v[i1];
+		float oa = a * c - b * s;
+		float ob = a * s + b * c;
+		if (is_q) {
+			q[base + uint(i0)] = oa;
+			q[base + uint(i1)] = ob;
+		} else {
+			k[base + uint(i0)] = oa;
+			k[base + uint(i1)] = ob;
+		}
+	}
+}

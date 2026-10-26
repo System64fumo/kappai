@@ -59,14 +59,14 @@ typedef struct {
 } sse_frame;
 
 typedef struct {
-	openai_state  *st;
+	openai_state	  *st;
 	_Atomic(context *) sctx;
-	oa_req_params *params;
+	oa_req_params	  *params;
 
-	bool	 streaming;
-	bool	 chat_api;
-	bool	 same_session;
-	uint64_t session_key_at_start;
+	bool		streaming;
+	bool		chat_api;
+	bool		same_session;
+	uint64_t	session_key_at_start;
 	atomic_bool generation_done;
 
 	pthread_mutex_t q_mtx;
@@ -1143,12 +1143,12 @@ static oa_slot *slot_create(openai_state *st) {
 
 static oa_slot *slot_pick_chat(openai_state *st, uint64_t *chain, size_t chain_len,
 							   bool *matched_out) {
-	oa_slot *best		= NULL;
-	oa_slot *lru		= NULL;
-	bool	 best_match = false;
-	size_t	 best_reuse = 0;
+	oa_slot *best		  = NULL;
+	oa_slot *volatile lru = NULL;
+	bool   best_match	  = false;
+	size_t best_reuse	  = 0;
 	for (int i = 0; i < st->n_slots; i++) {
-		oa_slot *s = &st->slots[i];
+		oa_slot *volatile s = &st->slots[i];
 		if (s->busy)
 			continue;
 		if (!lru || s->last_ns < lru->last_ns)
@@ -1167,17 +1167,17 @@ static oa_slot *slot_pick_chat(openai_state *st, uint64_t *chain, size_t chain_l
 		*matched_out = true;
 		return best;
 	}
-	*matched_out   = false;
-	oa_slot *fresh = slot_create(st);
+	*matched_out			= false;
+	oa_slot *volatile fresh = slot_create(st);
 	return fresh ? fresh : lru;
 }
 
 static oa_slot *slot_pick_text(openai_state *st, const int32_t *ids, int n, bool *matched_out) {
-	oa_slot *best		= NULL;
-	oa_slot *lru		= NULL;
-	int32_t	 best_reuse = -1;
+	oa_slot *volatile best = NULL;
+	oa_slot *volatile lru  = NULL;
+	int32_t best_reuse	   = -1;
 	for (int i = 0; i < st->n_slots; i++) {
-		oa_slot *s = &st->slots[i];
+		oa_slot *volatile s = &st->slots[i];
 		if (s->busy)
 			continue;
 		if (!lru || s->last_ns < lru->last_ns)
@@ -1191,7 +1191,7 @@ static oa_slot *slot_pick_text(openai_state *st, const int32_t *ids, int n, bool
 	*matched_out = best_reuse > 0;
 	if (best_reuse > 0)
 		return best;
-	oa_slot *fresh = slot_create(st);
+	oa_slot *volatile fresh = slot_create(st);
 	return fresh ? fresh : lru;
 }
 
@@ -1279,6 +1279,8 @@ static void decode_batch_reserve(openai_state *st) {
 		b->tokens	 = xcalloc((size_t)st->slots_cap, sizeof(*b->tokens));
 		b->positions = xcalloc((size_t)st->slots_cap, sizeof(*b->positions));
 		b->caches	 = xcalloc((size_t)st->slots_cap, sizeof(*b->caches));
+		compute_scratch_reserve_rows(&st->slots[0].sess.m, &st->slots[0].sess.scratch,
+									 st->slots_cap);
 	}
 	size_t need = (size_t)st->slots_cap * (size_t)st->ctx->m.vocab_size;
 	if (b->logits_cap < need) {
@@ -1315,25 +1317,15 @@ static void run_decode_step(openai_state *st) {
 	if (b->n == 0)
 		return;
 
-	status_code batch_status = ERR_FALLBACK;
-	if (b->n > 1) {
-		context *lead = &st->slots[0].sess;
-		batch_status =
-			compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens,
-										 b->positions, b->n, lead->flash_attn, b->logits);
-	}
-	bool fall_back = batch_status == ERR_FALLBACK || batch_status == ERR_UNSUPPORTED;
+	context	   *lead = &st->slots[0].sess;
+	status_code batch_status =
+		compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens, b->positions,
+									 NULL, b->n, lead->flash_attn, b->logits);
 
 	const size_t vocab = (size_t)st->ctx->m.vocab_size;
 	for (int i = 0; i < b->n; i++) {
-		oa_task *t = b->tasks[i];
-		context *c = &t->slot->sess;
-		if (fall_back) {
-			c->logits_on_host = false;
-			t->decode_status  = compute_forward(&c->m, &c->kv, &c->scratch, t->decode_token,
-												t->decode_pos, c->flash_attn, t->decode_logits);
-			continue;
-		}
+		oa_task *t		 = b->tasks[i];
+		context *c		 = &t->slot->sess;
 		t->decode_status = batch_status;
 		if (batch_status != OK)
 			continue;
@@ -1356,7 +1348,8 @@ static void task_main(void) {
 	slot_record_catalog(st, t->slot);
 	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)", j->chat_api ? "chat" : "completion",
 		 g->prompt_tokens, g->generated, (double)(time_us() - j->t_start_us) / 1e6,
-		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected" : "completed");
+		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected"
+																	 : "completed");
 	job_free(st, j);
 	t->done = true;
 }
@@ -1491,7 +1484,8 @@ static void job_push(openai_state *st, oa_job *j) {
 
 static void job_wait_done(req_ctx *rc) {
 	pthread_mutex_lock(&rc->gen.q_mtx);
-	while (!rc->gen.generation_done && !atomic_load_explicit(&rc->gen.client_gone, memory_order_acquire))
+	while (!rc->gen.generation_done &&
+		   !atomic_load_explicit(&rc->gen.client_gone, memory_order_acquire))
 		pthread_cond_wait(&rc->gen.q_cv, &rc->gen.q_mtx);
 	pthread_mutex_unlock(&rc->gen.q_mtx);
 }

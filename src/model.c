@@ -845,6 +845,23 @@ static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *
 	*type = GGML_TYPE_F32;
 }
 
+static int dequant_ref_to_host_f32(model *m, weight_ref *ref, size_t row_len, size_t n_rows,
+								   backend *dev) {
+	if (ensure_tensor_loaded(m, ref->host_ptr) != OK)
+		return 0;
+	const void *orig  = ref->host_ptr;
+	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
+	if (ref->type == GGML_TYPE_F32) {
+		void *copy = xmalloc(bytes);
+		memcpy(copy, orig, bytes);
+		ref->host_ptr = copy;
+	} else {
+		dequant_weight_to_f32(dev, &ref->host_ptr, &ref->type, row_len, n_rows);
+	}
+	release_original_weight_data(m, orig, bytes);
+	return 1;
+}
+
 static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t n_rows) {
 	if (ref->type == GGML_TYPE_F32)
 		return 0;
@@ -856,13 +873,7 @@ static int dequant_ref_to_f32(model *m, weight_ref *ref, size_t row_len, size_t 
 		ref->dequant_rows	= n_rows;
 		return 0;
 	}
-	if (ensure_tensor_loaded(m, ref->host_ptr) != OK)
-		return 0;
-	const void *orig  = ref->host_ptr;
-	size_t		bytes = ggml_row_size(ref->type, row_len) * n_rows;
-	dequant_weight_to_f32(m->backend, &ref->host_ptr, &ref->type, row_len, n_rows);
-	release_original_weight_data(m, orig, bytes);
-	return 1;
+	return dequant_ref_to_host_f32(m, ref, row_len, n_rows, m->backend);
 }
 
 static void *build_fused_gate_up(model *m, const void *gate_w, const void *up_w, uint32_t type,
@@ -2648,6 +2659,16 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 									   (size_t)m->n_heads);
 					L->mla_vb_f32 = 1;
 				}
+			} else if (m->backend && !(m->backend->attention_mla && m->backend->kv_put_mla)) {
+				backend *host		= backend_host();
+				L->kv_a_norm_w.type = GGML_TYPE_F32;
+				L->mla_kvn_host =
+					dequant_ref_to_host_f32(m, &L->kv_a_norm_w, m->mla.kv_lora, 1, host);
+				L->mla_kb_f32 =
+					dequant_ref_to_host_f32(m, &L->k_b_w, (size_t)m->mla.qk_nope * m->mla.kv_lora,
+											(size_t)m->n_heads, host);
+				L->mla_vb_f32 = dequant_ref_to_host_f32(
+					m, &L->v_b_w, (size_t)m->mla.kv_lora * m->mla.v_head, (size_t)m->n_heads, host);
 			}
 			L->wq		 = (weight_ref){0};
 			L->wk		 = (weight_ref){0};
@@ -3240,7 +3261,6 @@ status_code model_build_recipe(model *m) {
 	}
 	DEBUG("recipe: built for arch '%s' (pre=%d layer=%d post=%d ops)", m->arch_info->gguf_name,
 		  m->recipe->n_pre_ops, m->recipe->layer.n_ops, m->recipe->n_post_ops);
-	m->batchable = recipe_is_batchable(m) != 0;
 	return OK;
 }
 
@@ -3324,6 +3344,10 @@ void model_free(model *m) {
 			if (L->mla_vb_f32) {
 				free((void *)L->v_b_w.host_ptr);
 				L->v_b_w.host_ptr = NULL;
+			}
+			if (L->mla_kvn_host) {
+				free((void *)L->kv_a_norm_w.host_ptr);
+				L->kv_a_norm_w.host_ptr = NULL;
 			}
 			free(L->shexp_fused_host);
 			L->shexp_fused_host = NULL;

@@ -10,10 +10,17 @@ layout(std430, binding = 1) writeonly buffer OutBuf {
 layout(location = 0) uniform int u_token;
 layout(location = 1) uniform int u_dim;
 layout(location = 2) uniform int u_row_stride;
+layout(std430, binding = 5) readonly buffer TokBuf {
+	uint tok_reg[];
+};
+layout(location = 8) uniform int u_tok_slot;
+uint token_id(void) {
+	return u_tok_slot >= 0 ? tok_reg[u_tok_slot] : uint(u_token);
+}
 void main(void) {
 	uint d = gl_GlobalInvocationID.x;
 	if (int(d) >= u_dim)
 		return;
-	uint off = uint(u_token) * uint(u_row_stride) + d * 4u;
+	uint off = token_id() * uint(u_row_stride) + d * 4u;
 	out_[d]	 = embd[off / 4u];
 }

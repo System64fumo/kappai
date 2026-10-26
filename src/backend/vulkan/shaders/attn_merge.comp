@@ -1,0 +1,60 @@
+#version 450
+
+#define WG 64
+
+layout(local_size_x = WG) in;
+
+layout(set = 0, binding = 0) readonly buffer PartBuf {
+	float part[];
+};
+layout(set = 0, binding = 1) writeonly buffer OutBuf {
+	float out_[];
+};
+
+layout(push_constant) uniform Params {
+	int head_dim;
+	int n_splits;
+}
+pc;
+
+shared float w_split[WG];
+shared float s_red[WG];
+
+void main() {
+	uint  qh		= gl_WorkGroupID.x;
+	uint  tid		= gl_LocalInvocationID.x;
+	uint  stride	= uint(pc.head_dim + 2);
+	uint  base		= qh * uint(pc.n_splits) * stride;
+	float neg_inf	= uintBitsToFloat(0xFF800000u);
+	bool  has_split = int(tid) < pc.n_splits;
+
+	float m_s  = has_split ? part[base + tid * stride] : neg_inf;
+	s_red[tid] = m_s;
+	barrier();
+	for (uint r = WG / 2u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_red[tid] = max(s_red[tid], s_red[tid + r]);
+		barrier();
+	}
+	float m_max = s_red[0];
+	barrier();
+
+	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : exp(m_s - m_max);
+	w_split[tid] = w;
+	s_red[tid]	 = has_split ? w * part[base + tid * stride + 1u] : 0.0;
+	barrier();
+	for (uint r = WG / 2u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_red[tid] += s_red[tid + r];
+		barrier();
+	}
+	float l		= s_red[0];
+	float inv_l = l > 0.0 ? 1.0 / l : 0.0;
+
+	for (uint e = tid; e < uint(pc.head_dim); e += WG) {
+		float o = 0.0;
+		for (int s = 0; s < pc.n_splits; s++)
+			o += w_split[s] * part[base + uint(s) * stride + 2u + e];
+		out_[qh * uint(pc.head_dim) + e] = o * inv_l;
+	}
+}

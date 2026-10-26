@@ -362,6 +362,8 @@ static int engine_load(context *ctx, cli_args *a) {
 	}
 
 	ctx->scratch.prof.enabled = (ec->profile_time) ? 1 : 0;
+	if (ec->profile_time && ctx->backend->set_gpu_profile)
+		ctx->backend->set_gpu_profile(ctx->backend, 1);
 	if (!(ec->profile_time))
 		profile_reset(&ctx->scratch.prof);
 

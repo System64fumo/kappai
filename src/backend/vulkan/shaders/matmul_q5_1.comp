@@ -63,9 +63,12 @@ void main() {
 	uint r_off = y_off;
 #endif
 
-	float acc[ROWS_PER_THREAD];
-	for (int r = 0; r < ROWS_PER_THREAD; r++)
+	precise float acc[ROWS_PER_THREAD];
+	precise float off[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
 		acc[r] = 0.0;
+		off[r] = 0.0;
+	}
 	bool valid[ROWS_PER_THREAD];
 	for (int r = 0; r < ROWS_PER_THREAD; r++)
 		valid[r] = (int(base_i) + r < params.n);
@@ -103,7 +106,6 @@ void main() {
 				uint block_off =
 					row_idx * uint(blocks_per_row) * Q5_1_BLOCK_BYTES + uint(bi) * Q5_1_BLOCK_BYTES;
 				float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
-				float m		 = half_to_float(w0_read_u16(block_off + 2u)) * s_xq;
 				uint  qh	 = w0_read_u32(block_off + 4u);
 				uint  qs_off = block_off + 8u;
 
@@ -128,7 +130,8 @@ void main() {
 					sumi += dotPacked4x8EXT(hi_vals, int(xq_packed[wp + 4 + w4]));
 				}
 
-				acc[r] = fma(d, float(sumi), m + acc[r]);
+				acc[r] = fma(d, float(sumi), acc[r]);
+				off[r] = fma(half_to_float(w0_read_u16(block_off + 2u)), s_xq, off[r]);
 			}
 		}
 		barrier();
@@ -138,9 +141,9 @@ void main() {
 		if (!valid[r])
 			continue;
 #ifdef HAS_RESIDUAL
-		y[y_off + base_i + uint(r)] = acc[r] + residual[r_off + base_i + uint(r)];
+		y[y_off + base_i + uint(r)] = (acc[r] + off[r]) + residual[r_off + base_i + uint(r)];
 #else
-		y[y_off + base_i + uint(r)] = acc[r];
+		y[y_off + base_i + uint(r)] = acc[r] + off[r];
 #endif
 	}
 }

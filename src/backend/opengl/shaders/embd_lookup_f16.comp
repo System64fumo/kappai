@@ -10,6 +10,13 @@ layout(std430, binding = 1) writeonly buffer OutBuf {
 layout(location = 0) uniform int u_token;
 layout(location = 1) uniform int u_dim;
 layout(location = 2) uniform int u_row_stride;
+layout(std430, binding = 5) readonly buffer TokBuf {
+	uint tok_reg[];
+};
+layout(location = 8) uniform int u_tok_slot;
+uint token_id(void) {
+	return u_tok_slot >= 0 ? tok_reg[u_tok_slot] : uint(u_token);
+}
 float f16_to_f32(uint h);
 float f16_to_f32(uint h) {
 	uint sgn  = (h >> 15u) & 1u;
@@ -34,7 +41,7 @@ void main(void) {
 	uint d = gl_GlobalInvocationID.x;
 	if (int(d) >= u_dim)
 		return;
-	uint byte_off = uint(u_token) * uint(u_row_stride) + d * 2u;
+	uint byte_off = token_id() * uint(u_row_stride) + d * 2u;
 	uint word	  = embd[byte_off >> 2u];
 	uint shift	  = (byte_off & 3u) * 8u;
 	uint h		  = (word >> shift) & 0xFFFFu;

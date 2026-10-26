@@ -100,6 +100,7 @@ typedef struct layer_weights {
 	bool	is_recurrent;
 	bool	mla_kb_f32;
 	bool	mla_vb_f32;
+	bool	mla_kvn_host;
 	bool	is_moe_layer;
 	bool	any_fused_experts;
 	bool	experts_resident;
@@ -232,7 +233,6 @@ typedef struct model {
 	bool moe_stream_enabled;
 	bool owns_backend;
 	bool use_mmap;
-	bool batchable;
 	bool mixed_backend_mode;
 
 	size_t mem_non_expert_bytes;
@@ -326,6 +326,13 @@ static inline int model_layer_has_kv(const model *m, int li) {
 	if (m->layer_dims.n_layer_kv_from_start <= 0)
 		return 1;
 	return li < m->layer_dims.n_layer_kv_from_start;
+}
+
+static inline int model_layer_kv_layer(const model *m, int li) {
+	if (model_layer_has_kv(m, li))
+		return li;
+	return m->layers[li].is_global_layer ? m->layer_dims.kv_layer_global
+										 : m->layer_dims.kv_layer_swa;
 }
 
 static inline int model_layer_rope_dim(const model *m, int li) {

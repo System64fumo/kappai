@@ -4,13 +4,16 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly buffer PartialBuf {
 	uvec2 partials[];
 };
-layout(set = 0, binding = 1) buffer OutBuf {
-	uint best_idx[];
+layout(set = 0, binding = 1) buffer RegBuf {
+	uint reg_idx[];
+};
+layout(set = 0, binding = 2) buffer ReadbackBuf {
+	uint readback_idx[];
 };
 
 layout(push_constant) uniform Params {
 	int n;
-	int groups;
+	int slot;
 }
 params;
 
@@ -49,6 +52,7 @@ void main() {
 	}
 
 	if (tid == 0u) {
-		best_idx[0] = s_idx[0];
+		reg_idx[params.slot]	  = s_idx[0];
+		readback_idx[params.slot] = s_idx[0];
 	}
 }

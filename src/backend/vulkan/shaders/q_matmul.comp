@@ -1,0 +1,139 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_integer_dot_product : require
+
+#define BM 64u
+#define BN 64u
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W {
+	uint16_t w16[];
+};
+layout(set = 0, binding = 1) readonly buffer XQ {
+	uint xq[];
+};
+layout(set = 0, binding = 2) buffer Y {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer R {
+	float res[];
+};
+
+layout(push_constant) uniform Params {
+	int n;
+	int kb;
+	int m;
+	int res_mode;
+}
+pc;
+
+#define W16 w16
+#include "qblock.glsl"
+
+shared uint	 s_w[8u * BM];
+shared float s_dw[BM];
+shared float s_mw[BM];
+shared uint	 s_x[8u * BN];
+shared float s_dx[BN];
+shared float s_sx[BN];
+
+void main() {
+	qblock_init();
+	barrier();
+
+	uint tid  = gl_LocalInvocationID.x;
+	uint n	  = uint(pc.n);
+	uint m	  = uint(pc.m);
+	uint kb	  = uint(pc.kb);
+	uint col0 = gl_WorkGroupID.x * BN;
+	uint row0 = gl_WorkGroupID.y * BM;
+
+	uint lr	   = tid >> 2u;
+	uint pp	   = tid & 3u;
+	uint wbase = min(row0 + lr, n - 1u) * kb * BLOCK_U16;
+	uint xbase = min(col0 + lr, m - 1u) * kb * XQ_BLOCK_WORDS;
+	uint tr	   = tid & 15u;
+	uint tc	   = tid >> 4u;
+
+	float acc[16];
+	for (uint i = 0u; i < 16u; i++)
+		acc[i] = 0.0;
+
+	uint  wa, wb, xa, xb;
+	float wd, wm, xd, xs;
+	load_wpart(wbase, pp, wa, wb, wd, wm);
+	xa = xq[xbase + XW_A(pp)];
+	xb = xq[xbase + XW_B(pp)];
+	xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
+	xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
+
+	for (uint bi = 0u; bi < kb; bi++) {
+		barrier();
+		s_w[XW_A(pp) * BM + lr] = wa;
+		s_w[XW_B(pp) * BM + lr] = wb;
+		s_x[XW_A(pp) * BN + lr] = xa;
+		s_x[XW_B(pp) * BN + lr] = xb;
+		if (pp == 0u) {
+			s_dw[lr] = wd;
+			s_mw[lr] = wm;
+			s_dx[lr] = xd;
+			s_sx[lr] = xs;
+		}
+		barrier();
+
+		if (bi + 1u < kb) {
+			wbase += BLOCK_U16;
+			xbase += XQ_BLOCK_WORDS;
+			load_wpart(wbase, pp, wa, wb, wd, wm);
+			xa = xq[xbase + XW_A(pp)];
+			xb = xq[xbase + XW_B(pp)];
+			xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
+			xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
+		}
+
+		int sumi[16];
+		for (uint i = 0u; i < 16u; i++)
+			sumi[i] = 0;
+		for (uint wd8 = 0u; wd8 < 8u; wd8++) {
+			uint  ab = wd8 * BM + tr * 4u;
+			uint  bb = wd8 * BN + tc * 4u;
+			uvec4 a	 = uvec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
+			uvec4 b	 = uvec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
+			for (uint i = 0u; i < 4u; i++)
+				for (uint j = 0u; j < 4u; j++)
+					sumi[i * 4u + j] += dotPacked4x8EXT(int(a[i]), int(b[j]));
+		}
+		for (uint i = 0u; i < 4u; i++) {
+			float dwi = s_dw[tr * 4u + i];
+			float mwi = s_mw[tr * 4u + i];
+			for (uint j = 0u; j < 4u; j++) {
+				float a = acc[i * 4u + j];
+#ifdef HAS_MIN
+				a = mwi * s_sx[tc * 4u + j] + a;
+#endif
+				acc[i * 4u + j] = fma(dwi * s_dx[tc * 4u + j], float(sumi[i * 4u + j]), a);
+			}
+		}
+	}
+
+	for (uint i = 0u; i < 4u; i++) {
+		uint row = row0 + tr * 4u + i;
+		if (row >= n)
+			continue;
+		for (uint j = 0u; j < 4u; j++) {
+			uint col = col0 + tc * 4u + j;
+			if (col >= m)
+				continue;
+			uint  yi = col * n + row;
+			float v	 = acc[i * 4u + j];
+			if (pc.res_mode == 1)
+				y[yi] = v + res[row];
+			else if (pc.res_mode == 2)
+				y[yi] += v;
+			else
+				y[yi] = v;
+		}
+	}
+}

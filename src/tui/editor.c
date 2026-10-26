@@ -79,7 +79,7 @@ static const char EDITOR_HCS_MOE_LAYERS_HINT[] =
 #define HCS_REF_FIELD_COUNT 5
 
 static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
-	"compute device, <backend>_<n>",
+	"compute device, <backend><n>",
 	"phases this device runs for the weights it holds; prefill and decode must both be enabled",
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
 	"experts of every layer cached (LRU) on this device, a number, '*' for the remainder (one '*' "
@@ -1116,7 +1116,7 @@ static void editor_add_hcs_device(editor_state *st) {
 
 	char		avail[16][BACKEND_DEVICE_NAME_MAX];
 	int			n	  = backend_enum_devices(avail, 16);
-	const char *pick  = "cpu_0";
+	const char *pick  = "cpu0";
 	bool		found = false;
 	for (int i = 0; i < n && !found; i++) {
 		bool used = false;

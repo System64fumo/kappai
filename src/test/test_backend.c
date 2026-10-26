@@ -1505,11 +1505,12 @@ static void test_op_attention_swa_slide(backend *b, int n_heads, int n_kv_heads,
 		float *r = xmalloc((size_t)n * sizeof(float));
 		if (ref_all)
 			memcpy(r, ref_all + (size_t)p * n, (size_t)n * sizeof(float));
-		else
-			memcpy(r,
-				   ref_softmax_attn(qf + (size_t)p * n, kf, vf, n_heads, n_kv_heads, head_dim, t0,
-									p + 1, scale),
-				   (size_t)n * sizeof(float));
+		else {
+			float *r_ref = ref_softmax_attn(qf + (size_t)p * n, kf, vf, n_heads, n_kv_heads,
+											head_dim, t0, p + 1, scale);
+			memcpy(r, r_ref, (size_t)n * sizeof(float));
+			free(r_ref);
+		}
 		float ma = 0.0f;
 		for (int i = 0; i < n; i++) {
 			float e = fabsf(r[i] - y_all[(size_t)p * n + i]);
@@ -4458,9 +4459,6 @@ static void run_native_exec_op_tests(backend *ref, backend *tgt) {
 }
 
 void run_per_op_tests(backend *ref, backend *tgt) {
-	printf("\n========================================\n");
-	printf("Per-op validation: %s  vs  %s (reference)\n", tgt->name, ref->name);
-	printf("========================================\n");
 	print_op_coverage(ref, tgt);
 
 	int shapes[][2] = {{32, 32}, {128, 256}, {64, 512}, {17, 256}, {512, 512}};
@@ -4669,6 +4667,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		if (512 % QTYPES[qi].block != 0)
 			continue;
 		test_batch_matmul_parity(ref, tgt, &QTYPES[qi], 512, 512, 2);
+		test_batch_matmul_parity(ref, tgt, &QTYPES[qi], 192, 512, 37);
 	}
 	{
 		int bat_sh[][6] = {
@@ -4689,6 +4688,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 6144, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 12288, 8);
+		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 70);
 	}
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);

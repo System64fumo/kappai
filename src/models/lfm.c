@@ -61,17 +61,7 @@ static model_recipe *build_lfm2_recipe(const model *m) {
 		if (e.count > max_ops)
 			max_ops = e.count;
 	}
-	if (max_ops > 0 && max_ops < LFM_MAX_OPS_PER_LAYER) {
-		for (int li = 0; li < m->n_layers; li++) {
-			recipe_op *src = r->per_layer_ops + (size_t)li * LFM_MAX_OPS_PER_LAYER;
-			recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
-			if (dst != src)
-				memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
-		}
-		r->per_layer_ops =
-			xrealloc(r->per_layer_ops, (size_t)m->n_layers * (size_t)max_ops * sizeof(recipe_op));
-		r->layer.n_ops = max_ops;
-	}
+	recipe_pack_per_layer_ops(r, m->n_layers, LFM_MAX_OPS_PER_LAYER, max_ops);
 	recipe_build_post_ops(r, m);
 	return r;
 }

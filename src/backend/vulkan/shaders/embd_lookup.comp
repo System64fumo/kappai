@@ -8,6 +8,9 @@ layout(set = 0, binding = 0) readonly buffer EmbdBuf {
 layout(set = 0, binding = 1) writeonly buffer OutBuf {
 	float out_[];
 };
+layout(set = 0, binding = 3) readonly buffer TokenRegBuf {
+	uint token_reg[];
+};
 
 layout(push_constant) uniform Params {
 	int token;
@@ -53,7 +56,8 @@ void main() {
 	if (int(d) >= params.dim)
 		return;
 
-	uint  row_off = uint(params.token) * uint(params.row_stride);
+	uint  token	  = params.token >= 0 ? uint(params.token) : token_reg[uint(-1 - params.token)];
+	uint  row_off = token * uint(params.row_stride);
 	float val	  = 0.0;
 
 	switch (params.type) {

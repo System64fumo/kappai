@@ -4,6 +4,8 @@ precision highp int;
 
 layout(local_size_x = 64) in;
 
+layout(location = 1) uniform int u_k;
+
 #ifdef FUSED_ACT
 layout(std430, binding = 0) readonly buffer GateBuf {
 	float gate[];
@@ -14,10 +16,15 @@ layout(std430, binding = 2) readonly buffer UpBuf {
 layout(location = 8) uniform int u_act;
 layout(location = 9) uniform float u_gs;
 layout(location = 10) uniform float u_us;
+layout(location = 11) uniform int u_stride;
+layout(location = 12) uniform int u_up_off;
 
 float xin(uint i) {
-	float g = gate[i] * u_gs;
-	float u = up[i] * u_us;
+	uint  r	 = i / uint(u_k);
+	uint  c	 = i - r * uint(u_k);
+	uint  gi = r * uint(u_stride) + c;
+	float g	 = gate[gi] * u_gs;
+	float u	 = up[gi + uint(u_up_off)] * u_us;
 	float gv;
 	if (u_act == 1) {
 		float t = 0.7978845608 * (g + 0.044715 * g * g * g);
@@ -40,9 +47,18 @@ layout(std430, binding = 1) writeonly buffer XQBuf {
 	uint xq[];
 };
 layout(location = 0) uniform int u_k_blocks;
-layout(location = 1) uniform int u_k;
 layout(location = 2) uniform int u_row_words;
 layout(location = 3) uniform int u_row0;
+#ifdef FUSED_NORM
+layout(std430, binding = 3) readonly buffer NormWBuf {
+	float nw[];
+};
+layout(std430, binding = 4) writeonly buffer NormYBuf {
+	float ny[];
+};
+layout(location = 8) uniform float u_eps;
+shared float s_ss[64];
+#endif
 
 float h2f(uint h) {
 	return unpackHalf2x16(h & 0xFFFFu).x;
@@ -120,14 +136,38 @@ int round_away(float f) {
 	return (f < 0.0) ? -int(r) : int(r);
 }
 void main(void) {
-	int bi	= int(gl_GlobalInvocationID.x);
-	int row = int(gl_WorkGroupID.y) + u_row0;
+	int	  bi  = int(gl_GlobalInvocationID.x);
+	int	  row = int(gl_WorkGroupID.y) + u_row0;
+	int	  xb  = row * u_k + bi * 32;
+	float xv[32];
+#ifdef FUSED_NORM
+	bool  in_range = bi < u_k_blocks;
+	float part	   = 0.0;
+	for (int j = 0; j < 32; j++) {
+		xv[j] = in_range ? xin(uint(xb + j)) : 0.0;
+		part += xv[j] * xv[j];
+	}
+	uint tid  = gl_LocalInvocationID.x;
+	s_ss[tid] = part;
+	barrier();
+	for (uint r = 32u; r > 0u; r >>= 1u) {
+		if (tid < r)
+			s_ss[tid] += s_ss[tid + r];
+		barrier();
+	}
+	float inv = 1.0 / sqrt(s_ss[0] / float(u_k) + u_eps);
+	if (!in_range)
+		return;
+	for (int j = 0; j < 32; j++) {
+		xv[j]	   = xv[j] * inv * nw[bi * 32 + j];
+		ny[xb + j] = xv[j];
+	}
+#else
 	if (bi >= u_k_blocks)
 		return;
-	int	  xb = row * u_k + bi * 32;
-	float xv[32];
 	for (int j = 0; j < 32; j++)
 		xv[j] = xin(uint(xb + j));
+#endif
 	float amax = 0.0;
 	for (int j = 0; j < 32; j++) {
 		float ax = abs(xv[j]);

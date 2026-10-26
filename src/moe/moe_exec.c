@@ -18,7 +18,7 @@ static status_code device_submit(moe_exec_target *t, const moe_exec_request *rq,
 	const buffer *x_dev = rq->xb_dev;
 	buffer		 *o_dev = rq->out_dev;
 	if (!t->direct) {
-		expert_dev_entry *e = expert_dev_scratch_get(&rq->s->expert_dev, eb, (size_t)rq->dim);
+		expert_dev_entry *e = expert_dev_scratch_get(&rq->s->moe.expert_dev, eb, (size_t)rq->dim);
 		if (!e) {
 			moe_stream_release_slots(m, rq->layer, t->slots, rq->K);
 			return ERR_OUT_OF_MEMORY;
@@ -33,19 +33,30 @@ static status_code device_submit(moe_exec_target *t, const moe_exec_request *rq,
 		const moe_expert_slot *sl = &t->slots[k];
 		if (sl->eid < 0 || !moe_slot_present(sl))
 			continue;
-		if (!sl->dev_ready || sl->dev_gate.owner != eb) {
-			backend_report_host_fallback(
-				eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
-				"layer %d expert %d slot %s (dev_ready=%d)", rq->layer, sl->eid,
-				sl->dev_ready ? "owned by another backend" : "not resident on device",
-				(int)sl->dev_ready);
-			st = ERR_UNSUPPORTED;
-			break;
+		moe_expert_slot live = *sl;
+		if (!sl->dev_ready) {
+			if (sl->dev_gate.owner) {
+				backend_report_host_fallback(
+					eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
+					"layer %d expert %d resident on '%s', not on '%s'", rq->layer, sl->eid,
+					sl->dev_gate.owner->name ? sl->dev_gate.owner->name : "?",
+					eb->name ? eb->name : "?");
+				st = ERR_UNSUPPORTED;
+				break;
+			}
+			status_code us = moe_stream_upload_live(m, rq->layer, sl->eid, eb, &live);
+			if (us != OK) {
+				backend_report_host_fallback(eb, "moe_expert_ffn", HFB_BUF_HOST_RESIDENT,
+											 "layer %d expert %d upload to device failed (st=%d)",
+											 rq->layer, sl->eid, (int)us);
+				st = ERR_UNSUPPORTED;
+				break;
+			}
 		}
 		moe_resident_expert ge = {
-			.gate_w		   = &sl->dev_gate,
-			.up_w		   = &sl->dev_up,
-			.down_w		   = &sl->dev_down,
+			.gate_w		   = &live.dev_gate,
+			.up_w		   = &live.dev_up,
+			.down_w		   = &live.dev_down,
 			.gate_type	   = sl->gate_type,
 			.up_type	   = sl->up_type,
 			.down_type	   = sl->down_type,
@@ -74,7 +85,7 @@ static status_code device_collect(moe_exec_target *t, const moe_exec_request *rq
 		moe_stream_release_slots(rq->m, rq->layer, t->slots, rq->K);
 		return OK;
 	}
-	expert_dev_entry *e	 = expert_dev_scratch_get(&rq->s->expert_dev, t->be, (size_t)rq->dim);
+	expert_dev_entry *e	 = expert_dev_scratch_get(&rq->s->moe.expert_dev, t->be, (size_t)rq->dim);
 	status_code		  st = e ? OK : ERR_OUT_OF_MEMORY;
 	if (st == OK)
 		st = t->be->buffer_read_f32(t->be, &e->out, out, rq->dim);
@@ -105,7 +116,7 @@ int moe_exec_staged_capable(const backend *a, const buffer *out) {
 
 status_code moe_exec_upload_host(struct compute_scratch *s, backend *a, buffer *out,
 								 const float *host, int dim, int accumulate) {
-	buffer *stage = &s->moe_stage[s->moe_stage_next];
+	buffer *stage = &s->moe.stage[s->moe.stage_next];
 	size_t	bytes = (size_t)dim * sizeof(float);
 	if (!stage->owner || stage->size < bytes) {
 		if (stage->owner)
@@ -115,7 +126,7 @@ status_code moe_exec_upload_host(struct compute_scratch *s, backend *a, buffer *
 		if (as != OK)
 			return as;
 	}
-	s->moe_stage_next = (s->moe_stage_next + 1) % MOE_STAGE_RING;
+	s->moe.stage_next = (s->moe.stage_next + 1) % MOE_STAGE_RING;
 	status_code st	  = a->buffer_write_f32(a, stage, host, dim);
 	if (st != OK)
 		return st;
@@ -135,7 +146,7 @@ static void submit_target(moe_exec_request *rq, moe_exec_pending *pend, backend 
 		slot->ops		 = &device_ops;
 		slot->be		 = eb;
 		slot->direct	 = eb == local && rq->out_dev && !pend->n_direct;
-		slot->slots		 = rq->s->moe_slot_dev + (size_t)pend->n * MOE_MAX_TOPK;
+		slot->slots		 = rq->s->moe.slot_dev + (size_t)pend->n * MOE_MAX_TOPK;
 		profile_scope ps = profile_begin(&rq->s->prof, STAGE_MOE_DEV_SUBMIT);
 		st				 = slot->ops->submit(slot, rq, ids);
 		profile_end(&rq->s->prof, &ps);
@@ -155,8 +166,12 @@ static void submit_target(moe_exec_request *rq, moe_exec_pending *pend, backend 
 			pend->n_direct++;
 		return;
 	}
-	WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
-		 eb->name ? eb->name : "?", rq->layer, status_str(st));
+	if (st == ERR_UNSUPPORTED)
+		DEBUG("moe expert ffn on '%s' layer %d unsupported (%s) -- experts execute on the host",
+			  eb->name ? eb->name : "?", rq->layer, status_str(st));
+	else
+		WARN("moe expert ffn on '%s' layer %d failed (%s) -- falling back to cpu",
+			 eb->name ? eb->name : "?", rq->layer, status_str(st));
 }
 
 int moe_exec_dispatch(moe_exec_request *rq, backend *local, const buffer *xb, const int *expert_ids,
@@ -174,7 +189,7 @@ int moe_exec_dispatch(moe_exec_request *rq, backend *local, const buffer *xb, co
 		return 0;
 
 	if (!rq->x) {
-		float		 *xh	  = float_buf_ensure(&s->moe_xb_f, (size_t)rq->dim);
+		float		 *xh	  = float_buf_ensure(&s->moe.xb_f, (size_t)rq->dim);
 		profile_scope sync_ps = profile_begin(&s->prof, STAGE_MOE_XB_SYNC);
 		status_code	  rs	  = local->buffer_read_f32(local, xb, xh, rq->dim);
 		profile_end(&s->prof, &sync_ps);
@@ -184,8 +199,8 @@ int moe_exec_dispatch(moe_exec_request *rq, backend *local, const buffer *xb, co
 		}
 		rq->x = xh;
 	}
-	if (!s->moe_slot_dev)
-		s->moe_slot_dev =
+	if (!s->moe.slot_dev)
+		s->moe.slot_dev =
 			xcalloc((size_t)MOE_MAX_TOPK * MOE_EXEC_MAX_TARGETS, sizeof(moe_expert_slot));
 
 	int n_dev = 0;
@@ -199,8 +214,8 @@ int moe_exec_dispatch(moe_exec_request *rq, backend *local, const buffer *xb, co
 status_code moe_exec_gather(moe_exec_pending *pend, const moe_exec_request *rq, int discard) {
 	struct compute_scratch *s	= rq->s;
 	profile_scope			ps	= profile_begin(&s->prof, STAGE_MOE_DEV_COLLECT);
-	float				   *acc = float_buf_ensure(&s->expert_dev.acc, (size_t)rq->dim);
-	float				   *tmp = float_buf_ensure(&s->expert_dev.tmp, (size_t)rq->dim);
+	float				   *acc = float_buf_ensure(&s->moe.expert_dev.acc, (size_t)rq->dim);
+	float				   *tmp = float_buf_ensure(&s->moe.expert_dev.tmp, (size_t)rq->dim);
 	status_code				st	= OK;
 	memset(acc, 0, (size_t)rq->dim * sizeof(float));
 	for (int g = 0; g < pend->n; g++) {
