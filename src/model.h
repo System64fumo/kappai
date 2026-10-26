@@ -84,12 +84,11 @@ typedef struct layer_weights {
 	weight_ref ffn_post_norm_1_w;
 	weight_ref ffn_post_norm_2_w;
 
-	int32_t	 head_dim;
-	int32_t	 intermediate;
-	float	 layer_out_scale;
-	int32_t	 n_kv_heads;
-	int32_t	 rope_dim;
-	uint32_t gate_q8_type;
+	int32_t head_dim;
+	int32_t intermediate;
+	float	layer_out_scale;
+	int32_t n_kv_heads;
+	int32_t rope_dim;
 
 	bool	gate_up_fused;
 	bool	shexp_fused;
@@ -102,7 +101,6 @@ typedef struct layer_weights {
 	bool	mla_vb_f32;
 	bool	mla_kvn_host;
 	bool	is_moe_layer;
-	bool	any_fused_experts;
 	bool	experts_resident;
 } layer_weights;
 

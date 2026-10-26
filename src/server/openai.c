@@ -187,7 +187,6 @@ struct openai_state {
 
 	struct MHD_Daemon *daemon;
 	struct sockaddr	  *bind_addr;
-	socklen_t		   bind_len;
 	atomic_bool		   shutting_down;
 };
 
@@ -1776,7 +1775,6 @@ bool openai_bind(openai_state *st, const char *host, int port) {
 	}
 	st->bind_addr = xmalloc(ai->ai_addrlen);
 	memcpy(st->bind_addr, ai->ai_addr, ai->ai_addrlen);
-	st->bind_len = ai->ai_addrlen;
 	freeaddrinfo(ai);
 	return true;
 }

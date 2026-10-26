@@ -2894,17 +2894,6 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 						}
 					}
 				}
-				L->any_fused_experts = 0;
-				L->gate_q8_type		 = 0;
-				for (int e = 0; e < m->moe.n_experts; e++) {
-					if (L->experts[e].gate_up_fused)
-						L->any_fused_experts = 1;
-					if (!L->gate_q8_type) {
-						uint32_t qt = wtype_to_q8type(L->experts[e].gate_type);
-						if (qt)
-							L->gate_q8_type = qt;
-					}
-				}
 				if (!m->arch_info->uses_moe_shared_dense_ffn) {
 					L->gate_w = (weight_ref){0};
 					L->up_w	  = (weight_ref){0};

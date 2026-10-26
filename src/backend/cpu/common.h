@@ -69,15 +69,10 @@ typedef struct {
 	float		 *scores;
 	size_t		  scores_cap;
 	size_t		  scores_want;
-	int			  kv_head_dim_max;
 	kv_quant_type kv_quant;
 
 	size_t *kv_pos_cap;
 	size_t *kv_base_pos;
-
-	size_t kv_block_stride;
-	size_t kv_layer_stride;
-	size_t kv_kvh_stride;
 
 	size_t *kv_layer_off;
 	size_t	kv_k_bytes;

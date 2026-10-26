@@ -413,8 +413,7 @@ status_code op_qk_norm_rope(exec_ctx *ctx) {
 status_code scale_inplace_fallback(struct compute_scratch *s, backend *sync_be, buffer *xb, int n,
 								   float scale) {
 	ensure_sync(sync_be);
-	compute_small_host_ensure(s, n, 0, 0);
-	float	   *xf	  = s->run.xf_host;
+	float	   *xf	  = float_buf_ensure(&s->run.scale_tmp, (size_t)n);
 	backend	   *owner = xb->owner;
 	status_code st	  = owner->buffer_read_f32(owner, xb, xf, n);
 	if (st == OK) {

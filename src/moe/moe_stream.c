@@ -162,7 +162,6 @@ typedef struct moe_stream_op {
 	struct moe_stream_layer	  *slayer;
 	int						   layer;
 	uint64_t				   now;
-	int						   n_k;
 	moe_expert_slot			  *out_slots;
 	moe_miss_entry			  *misses;
 	int						   n_misses;
@@ -2518,7 +2517,6 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	op->cache		   = c;
 	op->slayer		   = L;
 	op->layer		   = layer;
-	op->n_k			   = n_k;
 	op->out_slots	   = out_slots;
 	op->now			   = now;
 	op->st			   = OK;

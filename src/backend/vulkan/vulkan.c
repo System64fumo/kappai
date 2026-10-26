@@ -187,8 +187,6 @@ typedef struct {
 	size_t device_local_allocated;
 
 	struct {
-		uint32_t	 vendor_id;
-		uint32_t	 device_id;
 		uint32_t	 max_shared_memory;
 		uint32_t	 max_workgroup_size[3];
 		uint32_t	 max_workgroup_invocations;
@@ -201,10 +199,7 @@ typedef struct {
 		int			 is_adreno;
 		int			 is_amd;
 		int			 supports_subgroup_basic;
-		int			 supports_subgroup_vote;
 		int			 supports_subgroup_arithmetic;
-		int			 supports_subgroup_ballot;
-		int			 supports_int8;
 		int			 supports_integer_dot_product;
 		int			 supports_16bit_storage;
 		uint32_t	 max_workgroup_count[2];
@@ -349,12 +344,10 @@ typedef struct {
 	const float *rope_cos_base;
 	const float *rope_sin_base;
 	const float *rope_ff_base;
-	int			 rope_ff_pos;
 	int			 rope_ff_head_dim;
 	int			 rope_ff_n_ctx;
 	float		 rope_ff_theta;
 	int			 rope_half_stored;
-	int			 rope_n_ctx_stored;
 
 	buffer *rope_cos_buf_active;
 	buffer *rope_sin_buf_active;
@@ -444,8 +437,6 @@ typedef struct {
 		int diag;
 		int abort_on_error;
 		int validate;
-		int attention_native;
-		int attention_native_checked;
 	} debug;
 
 } vk_priv;
@@ -2318,7 +2309,6 @@ static status_code vk_init(backend *self, int device_index) {
 			return ERR_INTERNAL;
 	}
 	p->timeline_supported				 = timeline_available;
-	p->caps.supports_int8				 = int8_available;
 	p->caps.supports_integer_dot_product = dot_product_available;
 	p->caps.supports_16bit_storage		 = int16_available;
 	p->has_memory_budget_ext			 = has_memory_budget_ext;
@@ -2326,8 +2316,6 @@ static status_code vk_init(backend *self, int device_index) {
 	vkGetDeviceQueue(p->dev, p->queue_family, 0, &p->queue);
 
 	VkPhysicalDeviceProperties props		= dev_props_for_version;
-	p->caps.vendor_id						= props.vendorID;
-	p->caps.device_id						= props.deviceID;
 	p->caps.max_shared_memory				= props.limits.maxComputeSharedMemorySize;
 	p->caps.max_workgroup_size[0]			= props.limits.maxComputeWorkGroupSize[0];
 	p->caps.max_workgroup_size[1]			= props.limits.maxComputeWorkGroupSize[1];
@@ -2356,9 +2344,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.subgroup_size				 = subgroup_props.subgroupSize;
 	VkSubgroupFeatureFlags sf			 = subgroup_props.supportedOperations;
 	p->caps.supports_subgroup_basic		 = (sf & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0;
-	p->caps.supports_subgroup_vote		 = (sf & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
 	p->caps.supports_subgroup_arithmetic = (sf & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
-	p->caps.supports_subgroup_ballot	 = (sf & VK_SUBGROUP_FEATURE_BALLOT_BIT) != 0;
 #endif
 
 	p->caps.unified_memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||

@@ -310,11 +310,9 @@ struct gl_priv {
 	gl_rope_cache rope_cache[GL_ROPE_CACHE_SLOTS];
 	int			  rope_cache_next;
 
-	gl_buf *qx_stage[2];
 	gl_buf *qx;
 	size_t	qx_row_words;
 
-	gl_buf *qxk_stage[2];
 	gl_buf *qxk;
 	size_t	qxk_row_words;
 
@@ -336,9 +334,6 @@ struct gl_priv {
 
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
-	int	   kv_head_dim;
-	int	   kv_n_kv_heads;
-	int	   kv_n_ctx;
 	int	   kv_n_layers;
 	int	   kv_quant;
 	size_t kv_row_bytes;
@@ -3767,10 +3762,7 @@ static status_code gl_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	p->kv_head_dim	 = head_dim;
-	p->kv_n_kv_heads = n_kv_heads;
-	p->kv_n_ctx		 = n_ctx;
-	p->kv_n_layers	 = n_kv_layers;
+	p->kv_n_layers = n_kv_layers;
 
 	k_out->handle	= ks;
 	k_out->size		= total_bytes;

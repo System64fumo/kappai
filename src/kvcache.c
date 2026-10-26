@@ -67,7 +67,7 @@ int kvcache_device_slots(const kvcache *c, int dev) {
 }
 
 size_t kvcache_device_bytes(const kvcache *c, const model *m, int dev) {
-	if (c->mla || c->hybrid)
+	if (c->is_mla || c->hybrid)
 		return 0;
 	backend *be		   = kvcache_device_backend(c, dev);
 	int		 compacted = backend_has_cap(be, BCAP_KV_POS_CAP);
@@ -86,7 +86,8 @@ static status_code kvcache_ensure_transfer_buf(kvcache *c, size_t need_floats);
 static status_code kvcache_map_slots(kvcache *c, const model *m);
 static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, backend *be, buffer *k,
 									   buffer *v, int **remap_out, int *n_slots_out);
-static status_code kvcache_alloc_mla_buffer(kvcache *c, backend *be, int n_layers, buffer *kv);
+static status_code kvcache_alloc_mla_buffer(kvcache *c, const model *m, backend *be, int n_layers,
+											buffer *kv);
 static status_code kvcache_alloc_primary_slots(kvcache *c, const model *m, backend *be, bool *held);
 
 static status_code kvcache_alloc_layer_state(backend *be, buffer *out, size_t floats) {
@@ -157,11 +158,9 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	c->n_kv_layers = n_kv_layers;
 
 	if (is_mla && !m->arch_info->is_kda) {
-		c->mla				= xcalloc(1, sizeof(kvcache_mla));
-		c->mla->lora_dim	= m->mla.kv_lora;
-		c->mla->qk_rope_dim = m->mla.qk_rope;
+		c->is_mla = true;
 		if (!m->mixed_backend_mode)
-			return kvcache_alloc_mla_buffer(c, m->backend, m->n_layers, &c->k);
+			return kvcache_alloc_mla_buffer(c, m, m->backend, m->n_layers, &c->k);
 		bool held;
 		return kvcache_alloc_primary_slots(c, m, m->backend, &held);
 	}
@@ -283,7 +282,7 @@ void kvcache_free(kvcache *c) {
 	if (!c->backend)
 		return;
 	if (!(c->hybrid && c->hybrid->conv_buf)) {
-		bool mla = c->mla != NULL;
+		bool mla = c->is_mla;
 		kv_pair_free(c->backend, &c->k, &c->v, mla);
 		for (int i = 0; i < c->n_mirrors; i++) {
 			kv_mirror *mir = &c->mirror[i];
@@ -292,8 +291,7 @@ void kvcache_free(kvcache *c) {
 		}
 		c->n_mirrors = 0;
 	}
-	free(c->mla);
-	c->mla = NULL;
+	c->is_mla = false;
 	if (c->hybrid) {
 		kvcache_free_layer_states(c->hybrid);
 		free(c->hybrid->conv_state);
@@ -336,8 +334,8 @@ static status_code kvcache_map_slots(kvcache *c, const model *m) {
 			return ERR_UNSUPPORTED;
 		}
 		int slot = i;
-		if (m->recipe && m->recipe->layer_ctx)
-			slot = m->recipe->layer_ctx[i].kv_layer;
+		if (m->recipe)
+			slot = model_layer_kv_layer(m, i);
 		if (slot >= 0 && slot < m->n_layers)
 			c->slot_devices[slot] |= 1u << dev;
 		if (i < c->n_kv_layers)
@@ -353,7 +351,8 @@ static int kvcache_slot_remap(const kvcache *c, const model *m, unsigned bit, in
 	return next;
 }
 
-static status_code kvcache_alloc_mla_buffer(kvcache *c, backend *be, int n_layers, buffer *kv) {
+static status_code kvcache_alloc_mla_buffer(kvcache *c, const model *m, backend *be, int n_layers,
+											buffer *kv) {
 	bool	 native = be->kv_alloc_mla && be->attention_mla && be->kv_put_mla;
 	backend *owner	= native ? be : backend_host();
 	if (!owner || !owner->kv_alloc_mla) {
@@ -365,8 +364,7 @@ static status_code kvcache_alloc_mla_buffer(kvcache *c, backend *be, int n_layer
 			be, "kv_alloc_mla", HFB_CAPABILITY,
 			"backend '%s' has no native MLA; MLA kv cache allocated in host (cpu) memory",
 			be->name);
-	return owner->kv_alloc_mla(owner, n_layers, c->n_ctx, c->mla->lora_dim, c->mla->qk_rope_dim,
-							   kv);
+	return owner->kv_alloc_mla(owner, n_layers, c->n_ctx, m->mla.kv_lora, m->mla.qk_rope, kv);
 }
 
 static status_code kvcache_alloc_primary_slots(kvcache *c, const model *m, backend *be,
@@ -395,8 +393,8 @@ static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, back
 		return ERR_INVALID_ARG;
 	}
 
-	if (c->mla) {
-		status_code s = kvcache_alloc_mla_buffer(c, be, n_slots, k);
+	if (c->is_mla) {
+		status_code s = kvcache_alloc_mla_buffer(c, m, be, n_slots, k);
 		if (s != OK) {
 			free(remap);
 			return s;
@@ -614,9 +612,9 @@ static backend *kvcache_shift_backend(const kvcache *c, int dev, const buffer *k
 }
 
 bool kvcache_can_shift(const kvcache *c, const model *m) {
-	if (!c || !m || c->mla || c->hybrid || c->n_kv_layers <= 0)
+	if (!c || !m || c->is_mla || c->hybrid || c->n_kv_layers <= 0)
 		return false;
-	if (!m->arch_info->has_variable_layer_dims || !m->recipe || !m->recipe->layer_ctx)
+	if (!m->arch_info->has_variable_layer_dims || !m->recipe)
 		return false;
 	for (int li = 0; li < c->n_kv_layers; li++) {
 		unsigned mask = kvcache_slot_mask(c, li);
@@ -635,13 +633,12 @@ bool kvcache_can_shift(const kvcache *c, const model *m) {
 	return true;
 }
 
-static void kvcache_shift_tables(const model *m, const layer_ctx_entry *lc, int head_dim,
+static void kvcache_shift_tables(const model *m, int is_global, int head_dim,
 								 const kv_shift_chunk *chunks, int n_chunks, float *cos_tbl,
 								 float *sin_tbl) {
-	const int	half = head_dim / 2;
-	const float theta =
-		lc->is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
-	const float *ff			 = lc->is_global ? m->rope_freqs : NULL;
+	const int	 half  = head_dim / 2;
+	const float	 theta = is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
+	const float *ff	   = is_global ? m->rope_freqs : NULL;
 	const double theta_scale = pow((double)theta, -2.0 / (double)head_dim);
 	for (int i = 0; i < n_chunks; i++) {
 		double delta = (double)(chunks[i].dst_pos - chunks[i].src_pos);
@@ -659,13 +656,13 @@ static void kvcache_shift_tables(const model *m, const layer_ctx_entry *lc, int 
 
 status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks) {
 	for (int li = 0; li < c->n_kv_layers; li++) {
-		const layer_ctx_entry *lc		= &m->recipe->layer_ctx[li];
-		int					   head_dim = model_layer_head_dim(m, li);
-		if (lc->is_global && (!m->rope_freqs || m->rope_freqs_count < head_dim / 2))
+		int is_global = m->layers[li].is_global_layer;
+		int head_dim  = model_layer_head_dim(m, li);
+		if (is_global && (!m->rope_freqs || m->rope_freqs_count < head_dim / 2))
 			return ERR_UNSUPPORTED;
 		size_t tbl_floats = (size_t)n_chunks * (size_t)(head_dim / 2);
 		float *tables	  = xmalloc(2 * tbl_floats * sizeof(float));
-		kvcache_shift_tables(m, lc, head_dim, chunks, n_chunks, tables, tables + tbl_floats);
+		kvcache_shift_tables(m, is_global, head_dim, chunks, n_chunks, tables, tables + tbl_floats);
 		unsigned	mask = kvcache_slot_mask(c, li);
 		status_code st	 = OK;
 		for (int dev = 0; dev <= c->n_mirrors && st == OK; dev++) {

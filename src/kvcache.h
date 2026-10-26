@@ -5,11 +5,6 @@
 #include "common.h"
 #include "model.h"
 
-typedef struct kvcache_mla {
-	int lora_dim;
-	int qk_rope_dim;
-} kvcache_mla;
-
 typedef struct kvcache_hybrid {
 	float  *conv_state;
 	float  *recurrent_state;
@@ -48,15 +43,12 @@ typedef struct kvcache {
 	float		 *kv_transfer_buf;
 	size_t		  kv_transfer_cap;
 	kv_quant_type kv_quant;
+	bool		  is_mla;
 	backend		 *backend;
-
-	int *mirror_remap;
-	int	 n_mirror_remap;
 
 	int head_dim_max;
 	int n_kv_heads_max;
 
-	kvcache_mla	   *mla;
 	kvcache_hybrid *hybrid;
 } kvcache;
 

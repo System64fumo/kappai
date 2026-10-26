@@ -1214,9 +1214,8 @@ status_code cpu_copy_buffer(backend *self, const buffer *src, buffer *dst, int n
 }
 
 status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
-	cpu_priv *p		   = self->priv;
-	p->kv_head_dim_max = desc->head_dim;
-	p->kv_quant		   = desc->kv_quant;
+	cpu_priv *p = self->priv;
+	p->kv_quant = desc->kv_quant;
 
 	if (k_out->handle) {
 		free(k_out->handle);
@@ -1317,15 +1316,6 @@ status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buff
 	madvise_hugepage(v_out->handle, total_bytes);
 	prefault(k_out->handle, total_bytes);
 	prefault(v_out->handle, total_bytes);
-
-	if (desc->kv_quant == KV_QUANT_Q8_0) {
-		size_t n_blocks	   = ((size_t)desc->head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		p->kv_block_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-	} else {
-		p->kv_block_stride = (size_t)desc->head_dim * sizeof(uint16_t);
-	}
-	p->kv_layer_stride = (size_t)desc->n_kv_heads * desc->n_ctx * p->kv_block_stride;
-	p->kv_kvh_stride   = (size_t)desc->n_ctx * p->kv_block_stride;
 
 	p->scores_want = (size_t)desc->n_ctx;
 

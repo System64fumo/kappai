@@ -64,11 +64,11 @@ struct batch_scratch {
 	size_t	  moe_pack_cap;
 	float_buf copy_tmp;
 
-	buffer			 arena;
-	float_buf		 arena_host;
-	size_t			 arena_bytes;
-	mem_layout		 layout;
-	mem_layout_cache layouts;
+	buffer			  arena;
+	float_buf		  arena_host;
+	size_t			  arena_bytes;
+	const mem_layout *layout;
+	mem_layout_cache  layouts;
 
 	int	  *moe_router_ids;
 	float *moe_router_w;

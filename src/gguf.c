@@ -38,7 +38,6 @@ typedef struct {
 	uint32_t arr_type;
 	uint64_t arr_len;
 	void	*arr_data;
-	gguf_str arr_str;
 } kv_entry;
 
 typedef struct {

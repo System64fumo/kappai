@@ -138,28 +138,27 @@ static status_code recipe_resolve_bindings(model_recipe *r) {
 	return r->embd_slot == RECIPE_SLOT_NONE || r->logits_slot == RECIPE_SLOT_NONE ? ERR_FORMAT : OK;
 }
 
-static op_layer_geom layer_geom_of(const layer_ctx_entry *lc) {
+static op_layer_geom layer_geom_of(const model *m, int li) {
 	op_layer_geom geom;
 	memset(&geom, 0, sizeof(geom));
-	geom.head_dim	   = lc->head_dim;
-	geom.n_kv_heads	   = lc->n_kv_heads;
-	geom.q_row_stride  = lc->q_row_stride;
-	geom.kv_row_stride = lc->kv_row_stride;
-	geom.is_global	   = (uint8_t)lc->is_global;
+	geom.head_dim	   = model_layer_head_dim(m, li);
+	geom.n_kv_heads	   = model_layer_kv_heads(m, li);
+	geom.q_row_stride  = m->n_heads * geom.head_dim;
+	geom.kv_row_stride = geom.n_kv_heads * geom.head_dim;
+	geom.is_global	   = m->layers[li].is_global_layer;
 	return geom;
 }
 
-static void fill_layer_geom(recipe_op *ops, int n_ops, const layer_ctx_entry *lc) {
-	op_layer_geom geom = layer_geom_of(lc);
+static void fill_layer_geom(recipe_op *ops, int n_ops, op_layer_geom geom) {
 	for (int j = 0; j < n_ops; j++)
 		if (recipe_op_has_layer_geom(ops[j].kind))
 			ops[j].geom = geom;
 }
 
-static int layers_share_geom(const model_recipe *r, int n_layers) {
-	op_layer_geom first = layer_geom_of(&r->layer_ctx[0]);
-	for (int li = 1; li < n_layers; li++) {
-		op_layer_geom g = layer_geom_of(&r->layer_ctx[li]);
+static int layers_share_geom(const model *m) {
+	op_layer_geom first = layer_geom_of(m, 0);
+	for (int li = 1; li < m->n_layers; li++) {
+		op_layer_geom g = layer_geom_of(m, li);
 		if (memcmp(&first, &g, sizeof(g)) != 0)
 			return 0;
 	}
@@ -171,8 +170,8 @@ static void recipe_specialize_geometry(model_recipe *r, const model *m) {
 	if (m->n_layers < 1 || n_ops < 1)
 		return;
 	if (!r->per_layer_ops) {
-		if (layers_share_geom(r, m->n_layers)) {
-			fill_layer_geom(r->layer.ops, n_ops, &r->layer_ctx[0]);
+		if (layers_share_geom(m)) {
+			fill_layer_geom(r->layer.ops, n_ops, layer_geom_of(m, 0));
 			return;
 		}
 		r->per_layer_ops = xcalloc((size_t)m->n_layers * n_ops, sizeof(recipe_op));
@@ -181,7 +180,7 @@ static void recipe_specialize_geometry(model_recipe *r, const model *m) {
 				   (size_t)n_ops * sizeof(recipe_op));
 	}
 	for (int li = 0; li < m->n_layers; li++)
-		fill_layer_geom(&r->per_layer_ops[(size_t)li * n_ops], n_ops, &r->layer_ctx[li]);
+		fill_layer_geom(&r->per_layer_ops[(size_t)li * n_ops], n_ops, layer_geom_of(m, li));
 }
 
 model_recipe *recipe_build(const struct model *m) {
@@ -214,20 +213,6 @@ model_recipe *recipe_build(const struct model *m) {
 		ERROR("recipe_build: n_experts_used=%d exceeds supported top-k %d; execution will fail "
 			  "rather than silently truncate",
 			  m->moe.n_experts_used, MOE_MAX_TOPK);
-
-	r->layer_ctx = xcalloc((size_t)m->n_layers, sizeof(layer_ctx_entry));
-	for (int li = 0; li < m->n_layers; li++) {
-		layer_ctx_entry *lc = &r->layer_ctx[li];
-		lc->head_dim		= model_layer_head_dim(m, li);
-		lc->n_kv_heads		= model_layer_kv_heads(m, li);
-		lc->intermediate	= model_layer_intermediate(m, li);
-		lc->has_kv			= model_layer_has_kv(m, li);
-		lc->has_own_v		= model_layer_has_own_v(m, li);
-		lc->is_global		= m->layers[li].is_global_layer;
-		lc->kv_row_stride	= lc->n_kv_heads * lc->head_dim;
-		lc->q_row_stride	= m->n_heads * lc->head_dim;
-		lc->kv_layer		= model_layer_kv_layer(m, li);
-	}
 
 	r->has_sliding_layers = model_has_sliding_layers(m);
 	r->ple_build_dev_ok	  = cap_resolve(m->backend, m, OP_PLE_BUILD, NULL, 0).impl == CAP_NATIVE;
@@ -267,7 +252,6 @@ void recipe_free(model_recipe *r) {
 	free(r->layer.ops);
 	free(r->post_ops);
 	free(r->per_layer_ops);
-	free(r->layer_ctx);
 	exec_plan_free(r->exec);
 	graph_set_free(r->graphs);
 	mem_plan_free(r->mem);

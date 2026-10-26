@@ -291,18 +291,6 @@ typedef struct {
 	int		   n_ops;
 } layer_recipe;
 
-typedef struct {
-	int		head_dim;
-	int		n_kv_heads;
-	int		intermediate;
-	int		kv_layer;
-	int		kv_row_stride;
-	int		q_row_stride;
-	uint8_t has_kv;
-	uint8_t has_own_v;
-	uint8_t is_global;
-} layer_ctx_entry;
-
 typedef struct model_recipe {
 	layer_recipe layer;
 	recipe_op	*pre_ops;
@@ -313,8 +301,6 @@ typedef struct model_recipe {
 	uint8_t		 logits_slot;
 
 	recipe_op *per_layer_ops;
-
-	layer_ctx_entry *layer_ctx;
 
 	struct cg_set	 *graphs;
 	struct exec_plan *exec;

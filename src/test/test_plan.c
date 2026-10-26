@@ -1,6 +1,7 @@
 #include "graph.h"
 #include "mem_plan.h"
 #include "partition.h"
+#include "recipe/internal.h"
 #include "test_core.h"
 
 #define record_plan(label, ok, ...) record_resultf(OPFAM_PLAN, (label), (ok), __VA_ARGS__)
@@ -1007,6 +1008,49 @@ static void test_mem_plan_aliasing(const char *arch, const char *path) {
 		parity_close(&p);
 }
 
+static void test_scratch_storage(void) {
+	parity_sess p;
+	if (!parity_open(&p, synth_chat_model_path)) {
+		record_plan("scratch.storage", 0, "fixture initialization failed");
+		return;
+	}
+	record_plan("scratch.scale_lazy", p.s.run.scale_tmp.p == NULL && p.s.run.scale_tmp.cap == 0,
+				"");
+	buffer		b		 = {0};
+	int			ok		 = p.be->buffer_alloc_scratch(p.be, 8 * sizeof(float), &b) == OK;
+	const float input[8] = {1, -2, 3, -4, 5, -6, 7, -8};
+	const int	sizes[]	 = {4, 8, 2};
+	for (size_t i = 0; ok && i < ARRAY_LEN(sizes); i++) {
+		float output[8];
+		ok = p.be->buffer_write_f32(p.be, &b, input, sizes[i]) == OK &&
+			 scale_inplace_fallback(&p.s, p.be, &b, sizes[i], 2.0f) == OK &&
+			 p.be->buffer_read_f32(p.be, &b, output, sizes[i]) == OK;
+		for (int j = 0; ok && j < sizes[i]; j++)
+			ok &= output[j] == 2.0f * input[j];
+	}
+	record_plan("scratch.scale_growth_reuse", ok && p.s.run.scale_tmp.cap == 8, "");
+	if (b.owner)
+		b.owner->buffer_free(b.owner, &b);
+
+	const int rows[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1, 32};
+	ok				 = 1;
+	for (size_t i = 0; i < ARRAY_LEN(rows); i++) {
+		batch_scratch *bs	  = batch_scratch_prepare(&p.m, &p.s, rows[i]);
+		int			   cached = 0;
+		for (int j = 0; j < bs->layouts.n; j++)
+			cached |= bs->layout == &bs->layouts.entries[j];
+		ok &= cached && bs->layout->bucket == mem_rows_bucket(rows[i]);
+		for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++)
+			if (bs->layout->cap[slot])
+				ok &= bs->pair[slot].b.size == bs->layout->cap[slot];
+	}
+	record_plan("scratch.layout_cache_rebinding", ok, "");
+	ok = compute_scratch_ensure(&p.s, &p.m, PARITY_CTX + 1) == OK && p.s.run.scale_tmp.p == NULL &&
+		 p.s.run.scale_tmp.cap == 0;
+	record_plan("scratch.scale_reset", ok, "");
+	parity_close(&p);
+}
+
 void run_plan_tests(void) {
 	test_recipe_build_layers();
 	test_recipe_ffn_activation();
@@ -1026,6 +1070,7 @@ void run_plan_tests(void) {
 	test_graph_set_variants();
 	test_graph_set_weights();
 	test_partition_plan();
+	test_scratch_storage();
 	test_graph_executor_runs("llama", synth_chat_model_path);
 	test_graph_executor_runs("lfm2", synth_lfm2_model_path);
 	test_graph_executor_runs("dsa", synth_dsa_model_path);

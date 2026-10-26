@@ -44,7 +44,7 @@ static int bs_ensure_detached(batch_scratch *bs, backend *owner, uint8_t slot, s
 
 int bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
 	size_t bytes = n_elems * sizeof(float);
-	size_t cap	 = bs->layout.cap[slot];
+	size_t cap	 = bs->layout ? bs->layout->cap[slot] : 0;
 	if (cap && !bs->own[slot]) {
 		if (bytes <= cap)
 			return 0;
@@ -83,7 +83,7 @@ static void bs_arena_ensure(batch_scratch *bs, backend *owner, size_t bytes) {
 	}
 	bs->arena_bytes = bytes;
 	DEBUG("batch scratch: arena %zu B (%zu MiB) for %d rows", bytes, bytes >> 20,
-		  bs->layout.bucket);
+		  bs->layout->bucket);
 }
 
 static buffer bs_arena_view(const batch_scratch *bs, backend *owner, size_t offset, size_t bytes) {
@@ -94,11 +94,12 @@ static buffer bs_arena_view(const batch_scratch *bs, backend *owner, size_t offs
 
 static void bs_bind_views(batch_scratch *bs, backend *owner) {
 	for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++) {
-		if (!bs->layout.cap[slot])
+		if (!bs->layout->cap[slot])
 			continue;
 		if (bs->own[slot])
 			bs_release_slot(bs, (uint8_t)slot);
-		bs->pair[slot].b = bs_arena_view(bs, owner, bs->layout.offset[slot], bs->layout.cap[slot]);
+		bs->pair[slot].b =
+			bs_arena_view(bs, owner, bs->layout->offset[slot], bs->layout->cap[slot]);
 	}
 }
 
@@ -241,9 +242,9 @@ buffer bs_cached_view(float_buf *fb, backend *owner, size_t n_elems) {
 }
 
 static void batch_scratch_bind(model *m, batch_scratch *bs, backend *a, int n_rows) {
-	bs->layout		= *mem_layout_get(&bs->layouts, m->recipe->mem, n_rows);
+	bs->layout		= mem_layout_get(&bs->layouts, m->recipe->mem, n_rows);
 	bs->logits_slot = m->recipe->logits_slot;
-	bs_arena_ensure(bs, a, bs->layout.total);
+	bs_arena_ensure(bs, a, bs->layout->total);
 	bs_bind_views(bs, a);
 }
 
