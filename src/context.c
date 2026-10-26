@@ -15,9 +15,9 @@
 #include <unistd.h>
 
 #define MONITOR_POLL_INTERVAL_US 50000ull
-
-static void sync_invalidate_cb(void *ud);
-static void sync_set(context *c, const char *render, size_t len, int32_t tok);
+#define KV_SHIFT_MIN_CHUNK 32
+#define KV_SHIFT_MAX_CHUNKS 64
+#define PREFILL_CHUNK_WS_TARGET_BYTES (8ull << 20)
 
 typedef struct {
 	progress		 *prog;
@@ -30,6 +30,23 @@ typedef struct {
 	layer_progress_cb chained_cb;
 	void			 *chained_ud;
 } prefill_progress;
+
+typedef struct {
+	kv_shift_chunk chunks[KV_SHIFT_MAX_CHUNKS];
+	int			   n;
+} kv_reuse_plan;
+
+typedef struct {
+	char  *buf;
+	size_t len;
+	size_t cap;
+	size_t last_piece_start;
+	void (*on_token)(int32_t, const char *, int, void *);
+	void *ud;
+} assistant_capture_ud;
+
+static void sync_invalidate_cb(void *ud);
+static void sync_set(context *c, const char *render, size_t len, int32_t tok);
 
 static void prefill_progress_start_chunk(prefill_progress *pp, int chunk_offset, int chunk_size) {
 	pp->chunk_offset		 = chunk_offset;
@@ -689,14 +706,6 @@ static void context_rewind(context *c, int32_t pos) {
 	c->kv.n_pos	 = pos;
 }
 
-#define KV_SHIFT_MIN_CHUNK 32
-#define KV_SHIFT_MAX_CHUNKS 64
-
-typedef struct {
-	kv_shift_chunk chunks[KV_SHIFT_MAX_CHUNKS];
-	int			   n;
-} kv_reuse_plan;
-
 static void kv_reuse_plan_build(const context *c, const int32_t *ids, int n, int32_t reuse,
 								kv_reuse_plan *plan) {
 	plan->n	   = 0;
@@ -834,8 +843,6 @@ static bool context_token_regs_usable(const context *c) {
 		return false;
 	return !c->m.has_per_layer_embeddings || ple_build_dev_path_ok(c->backend, &c->m, 1);
 }
-
-#define PREFILL_CHUNK_WS_TARGET_BYTES (8ull << 20)
 
 static size_t context_kv_bytes_per_token(const context *c) {
 	size_t head_row;
@@ -1034,14 +1041,9 @@ int32_t context_sample_next(context *c) {
 	return tok;
 }
 
-typedef struct {
-	context *c;
-} sub_token_cb_ud;
-
 static void sub_token_cb(int layer_idx, int n_layers, int token_progress, int batched, void *ud) {
 	(void)batched;
-	sub_token_cb_ud *cb = (sub_token_cb_ud *)ud;
-	context			*c	= cb->c;
+	context *c = ud;
 	if (!monitor_active(&c->monitor))
 		return;
 	moe_stats_summary ms;
@@ -1050,30 +1052,27 @@ static void sub_token_cb(int layer_idx, int n_layers, int token_progress, int ba
 							   &ms);
 }
 
-static void monitor_setup_cb(context *c, sub_token_cb_ud *cb, const char *phase, int token_idx,
-							 int phase_tokens) {
+static void monitor_setup_cb(context *c, const char *phase, int token_idx, int phase_tokens) {
 	if (!monitor_active(&c->monitor))
 		return;
 	monitor_begin_phase(&c->layer_tracker, phase, token_idx, phase_tokens);
-	*cb = (sub_token_cb_ud){.c = c};
-	compute_set_layer_progress_cb(&c->scratch, sub_token_cb, cb);
+	compute_set_layer_progress_cb(&c->scratch, sub_token_cb, c);
 }
 
 static int context_decode_loop(context *c, int max_tokens, const sampler_params *samp,
 							   void (*on_token)(int32_t, const char *, int, void *), void *ud,
 							   uint64_t ttft_start_us, uint64_t *out_ttft_us,
 							   bool *out_unfed_tail) {
-	int				generated = 0;
-	sub_token_cb_ud cb;
-	bool			ttft_captured = (out_ttft_us == NULL);
-	bool			fast_argmax	  = samp && samp->repeat_penalty == 1.0f &&
-									(samp->temperature <= 0.0f || samp->top_k == 1) && c->backend &&
-									c->backend->argmax && !c->debug_forward &&
-									!(c->m.arch_info && c->m.arch_info->is_hybrid_recurrent);
-	bool			pipelined	  = fast_argmax && context_token_regs_usable(c);
-	bool			has_fed_tok	  = false;
-	int32_t			last_fed_tok  = -1;
-	uint64_t		last_poll_us  = 0;
+	int		 generated	   = 0;
+	bool	 ttft_captured = (out_ttft_us == NULL);
+	bool	 fast_argmax   = samp && samp->repeat_penalty == 1.0f &&
+							 (samp->temperature <= 0.0f || samp->top_k == 1) && c->backend &&
+							 c->backend->argmax && !c->debug_forward &&
+							 !(c->m.arch_info && c->m.arch_info->is_hybrid_recurrent);
+	bool	 pipelined	   = fast_argmax && context_token_regs_usable(c);
+	bool	 has_fed_tok   = false;
+	int32_t	 last_fed_tok  = -1;
+	uint64_t last_poll_us  = 0;
 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
@@ -1085,7 +1084,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 				last_poll_us = now_us;
 			}
 		}
-		monitor_setup_cb(c, &cb, "decode", i, i + 1);
+		monitor_setup_cb(c, "decode", i, i + 1);
 
 		int32_t tok		  = 0;
 		bool	spec_fed  = false;
@@ -1247,9 +1246,8 @@ static void context_debug_print_feed(context *c, const char *phase, const int32_
 
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,
 									  const char *phase, bool quiet) {
-	prefill_result	result = {0};
-	sub_token_cb_ud cb;
-	monitor_setup_cb(c, &cb, phase, 0, n_tokens);
+	prefill_result result = {0};
+	monitor_setup_cb(c, phase, 0, n_tokens);
 	context_debug_print_feed(c, phase, tokens, n_tokens, c->kv.n_pos);
 	uint64_t t_start = time_us();
 	result.rc		 = context_feed_tokens_batch(c, tokens, n_tokens, quiet);
@@ -1375,15 +1373,6 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	return generated;
 }
 
-typedef struct {
-	char  *buf;
-	size_t len;
-	size_t cap;
-	size_t last_piece_start;
-	void (*on_token)(int32_t, const char *, int, void *);
-	void *ud;
-} assistant_capture_ud;
-
 static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_) {
 	assistant_capture_ud *ud = (assistant_capture_ud *)ud_;
 	if (n > 0) {
@@ -1400,13 +1389,9 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 		ud->on_token(id, piece, n, ud->ud);
 }
 
-static int32_t *context_ids_buf_grow(int32_t **pp, int *cap, int n) {
-	ARR_ENSURE(*pp, n, *cap);
-	return *pp;
-}
-
 int32_t *context_ids_scratch(context *c, int n) {
-	return context_ids_buf_grow(&c->ids_buf.p, &c->ids_buf.cap, n);
+	ARR_ENSURE(c->ids_buf.p, n, c->ids_buf.cap);
+	return c->ids_buf.p;
 }
 
 static void rollback_unfed_turn(context *c, size_t n_messages, char *prev_render,
@@ -1580,7 +1565,8 @@ static void *idle_prefill_thread(void *arg) {
 	memcpy(header, r1, header_bytes);
 	header[header_bytes] = '\0';
 
-	int32_t *ids = context_ids_buf_grow(&c->idle_ids_buf.p, &c->idle_ids_buf.cap, c->n_ctx + 1);
+	ARR_ENSURE(c->idle_ids_buf.p, c->n_ctx + 1, c->idle_ids_buf.cap);
+	int32_t *ids = c->idle_ids_buf.p;
 	int n = tokenizer_encode_with_specials(&c->tok, header, 0, ids, c->n_ctx, &c->scratch.prof);
 	if (n < 0 || c->interrupt)
 		goto out;

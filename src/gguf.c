@@ -18,10 +18,6 @@
 #define GGUF_LOAD_CHUNK_TARGET_BYTES ((size_t)(8 * 1024 * 1024))
 #define GGUF_LOAD_MAX_THREADS 64
 
-static inline size_t align_up_bytes(size_t v, size_t a) {
-	return (v + a - 1) & ~(a - 1);
-}
-
 typedef struct {
 	uint32_t	type;
 	const char *name;
@@ -46,11 +42,6 @@ typedef struct {
 } kv_entry;
 
 typedef struct {
-	kv_entry *e;
-	size_t	  n;
-} kv_table;
-
-typedef struct {
 	const gguf_tensor *t;
 	uint64_t		   file_off;
 	size_t			   len;
@@ -70,6 +61,10 @@ typedef struct {
 	_Atomic int		 first_err;
 	_Atomic size_t	*chunk_remaining;
 } gguf_load_job;
+
+static inline size_t align_up_bytes(size_t v, size_t a) {
+	return (v + a - 1) & ~(a - 1);
+}
 
 static inline void gguf_ctx_init(gguf_ctx *ctx) {
 	memset(ctx, 0, sizeof(*ctx));
@@ -173,24 +168,18 @@ static int gguf_reader_u64(gguf_reader *r, uint64_t *o) {
 }
 
 static int gguf_reader_f32(gguf_reader *r, float *o) {
-	if (gguf_reader_left(r) < (ptrdiff_t)4)
-		return -1;
 	uint32_t v;
-	memcpy(&v, r->p, 4);
-	v = le32toh(v);
-	memcpy(o, &v, 4);
-	r->p += 4;
+	if (gguf_reader_u32(r, &v))
+		return -1;
+	memcpy(o, &v, sizeof(v));
 	return 0;
 }
 
 static int gguf_reader_f64(gguf_reader *r, double *o) {
-	if (gguf_reader_left(r) < (ptrdiff_t)8)
-		return -1;
 	uint64_t v;
-	memcpy(&v, r->p, 8);
-	v = le64toh(v);
-	memcpy(o, &v, 8);
-	r->p += 8;
+	if (gguf_reader_u64(r, &v))
+		return -1;
+	memcpy(o, &v, sizeof(v));
 	return 0;
 }
 
@@ -218,6 +207,32 @@ static int gguf_arr_len_ok(const gguf_reader *r, uint64_t n, size_t elem_size) {
 	if (elem_size == 0 || n > (uint64_t)(SIZE_MAX / elem_size))
 		return 0;
 	return n * (uint64_t)elem_size <= (uint64_t)gguf_reader_left(r);
+}
+
+static int gguf_read_numeric_array(gguf_reader *r, kv_entry *e) {
+	static const uint8_t sizes[] = {
+		[GGUF_TYPE_U8] = 1,	 [GGUF_TYPE_I8] = 1,  [GGUF_TYPE_BOOL] = 1, [GGUF_TYPE_U16] = 2,
+		[GGUF_TYPE_I16] = 2, [GGUF_TYPE_U32] = 4, [GGUF_TYPE_I32] = 4,	[GGUF_TYPE_F32] = 4,
+		[GGUF_TYPE_U64] = 8, [GGUF_TYPE_I64] = 8, [GGUF_TYPE_F64] = 8,
+	};
+	size_t width = e->arr_type < ARRAY_LEN(sizes) ? sizes[e->arr_type] : 0;
+	if (!gguf_arr_len_ok(r, e->arr_len, width))
+		return -1;
+	size_t	 bytes = (size_t)e->arr_len * width;
+	uint8_t *data  = xmalloc(bytes);
+	memcpy(data, r->p, bytes);
+	if (__BYTE_ORDER == __BIG_ENDIAN) {
+		for (size_t off = 0; off < bytes; off += width) {
+			for (size_t i = 0; i < width / 2; i++) {
+				uint8_t tmp				  = data[off + i];
+				data[off + i]			  = data[off + width - 1 - i];
+				data[off + width - 1 - i] = tmp;
+			}
+		}
+	}
+	r->p += bytes;
+	e->arr_data = data;
+	return 0;
 }
 
 static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena *sa) {
@@ -320,59 +335,7 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena 
 			return -1;
 		e->arr_type = et;
 		e->arr_len	= n;
-		switch (et) {
-		case GGUF_TYPE_U8:
-		case GGUF_TYPE_I8:
-		case GGUF_TYPE_BOOL:
-			if (!gguf_arr_len_ok(r, n, 1))
-				return -1;
-			e->arr_data = xmalloc(n);
-			for (uint64_t i = 0; i < n; i++) {
-				uint8_t v;
-				if (gguf_reader_u8(r, &v))
-					return -1;
-				((uint8_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U16:
-		case GGUF_TYPE_I16:
-			if (!gguf_arr_len_ok(r, n, 2))
-				return -1;
-			e->arr_data = xmalloc(n * 2);
-			for (uint64_t i = 0; i < n; i++) {
-				uint16_t v;
-				if (gguf_reader_u16(r, &v))
-					return -1;
-				((uint16_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U32:
-		case GGUF_TYPE_I32:
-		case GGUF_TYPE_F32:
-			if (!gguf_arr_len_ok(r, n, 4))
-				return -1;
-			e->arr_data = xmalloc(n * 4);
-			for (uint64_t i = 0; i < n; i++) {
-				uint32_t v;
-				if (gguf_reader_u32(r, &v))
-					return -1;
-				((uint32_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U64:
-		case GGUF_TYPE_I64:
-		case GGUF_TYPE_F64:
-			if (!gguf_arr_len_ok(r, n, 8))
-				return -1;
-			e->arr_data = xmalloc(n * 8);
-			for (uint64_t i = 0; i < n; i++) {
-				uint64_t v;
-				if (gguf_reader_u64(r, &v))
-					return -1;
-				((uint64_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_STRING: {
+		if (et == GGUF_TYPE_STRING) {
 			if (!gguf_arr_len_ok(r, n, sizeof(char *)))
 				return -1;
 			char **arr = (char **)xmalloc(n * sizeof(char *));
@@ -385,10 +348,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena 
 				arr[i] = str_arena_dup(sa, s.data, s.len);
 			}
 			e->arr_data = (void *)arr;
-			break;
-		}
-		default:
-			return -1;
+		} else {
+			return gguf_read_numeric_array(r, e);
 		}
 		return 0;
 	}

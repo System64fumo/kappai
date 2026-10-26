@@ -11,6 +11,139 @@
 #include <string.h>
 #include <unistd.h>
 
+#define CPU_MATMUL_MIN_ROWS_PER_THREAD 32
+#define CPU_MATMUL_MULTI_MAX 8
+#define CPU_QUANTIZE_MIN_ROWS_PER_THREAD 8
+
+enum { FFN_ACTQ_TILE = 256 };
+
+typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
+
+typedef struct {
+	const float *kf_base;
+	const float *vf_base;
+	uint8_t		*kd_u8;
+	uint8_t		*vd_u8;
+	uint16_t	*kd_u16;
+	uint16_t	*vd_u16;
+	size_t		 layer_base;
+	size_t		 blk_stride;
+	size_t		 kvh_stride;
+	size_t		 slot_start;
+	int			 in_row_stride;
+	int			 head_dim;
+	int			 n_active;
+	int			 is_q80;
+} cpu_kv_put_batch_job;
+
+typedef struct {
+	const void *src;
+	void	   *dst;
+	int			k;
+	int			rows_per_group;
+	void (*repack_fn)(const void *, void *, int, int, int);
+} cpu_repack_job;
+
+typedef struct {
+	const float *x, *w;
+	float		*y;
+	int			 n;
+	float		 eps;
+} cpu_rmsnorm_batch_job;
+
+typedef struct {
+	const buffer *x;
+	const buffer *w;
+	buffer		 *y;
+	int			  n_heads, head_dim, row_stride;
+	float		  eps;
+	int			  noweight;
+} cpu_rmsnorm_row_batch_job;
+
+typedef struct {
+	float		*conv_out, *conv_state;
+	const float *mixed, *conv_w;
+	int			 conv_dim, conv_kernel, n_tokens, mixed_stride, history;
+} gdn_conv_job;
+
+typedef struct {
+	float		*state;
+	const float *conv;
+	const float *z;
+	const float *alpha;
+	const float *beta;
+	float		*out;
+	const float *dt;
+	const float *a;
+	const float *norm_w;
+	float		*scratch;
+	int			 n_tokens;
+	int			 conv_stride;
+	int			 z_stride;
+	int			 alpha_stride;
+	int			 beta_stride;
+	int			 out_stride;
+	int			 nkh;
+	int			 kd;
+	int			 vd;
+	int			 key_dim;
+	int			 scratch_stride;
+	float		 eps;
+} gdn_job;
+
+typedef struct {
+	qonly_fn qonly;
+	uint32_t w_type;
+	int		 q8_class;
+} matmul_kernel;
+
+typedef struct {
+	const void			*W;
+	uint32_t			 w_type;
+	const void			*xq;
+	const float			*xf;
+	float				*y;
+	int					 n, k, m;
+	size_t				 row_stride;
+	size_t				 xq_row_stride;
+	const float			*bias;
+	const float			*residual;
+	int					 group_rows;
+	const matmul_kernel *kernel;
+	size_t				 xq_row_stride_blocks;
+} cpu_matmul_job;
+
+typedef struct {
+	uint32_t	   w_type;
+	int			   group_rows;
+	tpool_chunk_fn chunk_fn;
+} grouped_matmul_kernel;
+
+typedef struct {
+	int			 q8_class;
+	const float *xf;
+	int			 k;
+	size_t		 row_stride;
+	uint8_t		*xq;
+} cpu_quantize_x_rows_job;
+
+typedef struct {
+	cpu_matmul_job jobs[CPU_MATMUL_MULTI_MAX];
+	int			   row_offset[CPU_MATMUL_MULTI_MAX + 1];
+	int			   n_matmuls;
+	int			   group_offset[CPU_MATMUL_MULTI_MAX + 1];
+	int			   group_rows;
+} cpu_matmul_multi_job;
+
+typedef struct {
+	const float *g, *u;
+	uint8_t		*xq;
+	int			 k;
+	size_t		 stride;
+	int			 activation;
+	int			 q8_class;
+} cpu_ffn_actq_job;
+
 void dequant_q3_k_row(const void *blocks, size_t n_blocks, float *dst) {
 	const q3_k_block *b		 = blocks;
 	const uint32_t	  kmask1 = 0x03030303;
@@ -1199,23 +1332,6 @@ status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buff
 	return OK;
 }
 
-typedef struct {
-	const float *kf_base;
-	const float *vf_base;
-	uint8_t		*kd_u8;
-	uint8_t		*vd_u8;
-	uint16_t	*kd_u16;
-	uint16_t	*vd_u16;
-	size_t		 layer_base;
-	size_t		 blk_stride;
-	size_t		 kvh_stride;
-	size_t		 slot_start;
-	int			 in_row_stride;
-	int			 head_dim;
-	int			 n_active;
-	int			 is_q80;
-} cpu_kv_put_batch_job;
-
 static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_kv_put_batch_job *j = ctx;
@@ -1237,36 +1353,29 @@ static void cpu_kv_put_batch_chunk(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
-							 const buffer *k_in, const buffer *v_in, int in_row_stride,
-							 int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
-							 int m) {
+static cpu_kv_put_batch_job cpu_kv_put_prepare(backend *self, buffer *k, buffer *v, int layer,
+											   int pos_start, const buffer *k_in,
+											   const buffer *v_in, int in_row_stride,
+											   int n_kv_heads, int head_dim, int n_ctx,
+											   int n_kv_heads_active, int m) {
 	cpu_priv *p		   = self->priv;
 	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-	int		  total	   = m * n_active;
-	if (total <= 0)
-		return OK;
-
-	int	   is_q80 = (p->kv_quant == KV_QUANT_Q8_0);
-	size_t rows	  = cpu_kv_layer_rows(p, layer, n_ctx);
-	size_t blk_stride =
+	int		  is_q80   = (p->kv_quant == KV_QUANT_Q8_0);
+	size_t	  rows	   = cpu_kv_layer_rows(p, layer, n_ctx);
+	size_t	  blk_stride =
 		is_q80 ? (((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES)
 			   : ((size_t)head_dim * sizeof(uint16_t));
 	size_t layer_base = cpu_kv_layer_base(
 		p, layer, (size_t)n_kv_heads * rows * (is_q80 ? blk_stride : (size_t)head_dim),
 		is_q80 ? 1 : sizeof(uint16_t));
 
-	size_t slot_start = (size_t)pos_start;
-	if (m > 0) {
-		cpu_kv_put_slot(p, layer, pos_start + m - 1, n_ctx,
-						is_q80 ? (void *)k->handle : (void *)cpu_ptr(k),
-						is_q80 ? (void *)v->handle : (void *)cpu_ptr(v),
-						is_q80 ? layer_base : layer_base * sizeof(uint16_t),
-						is_q80 ? rows * blk_stride : rows * (size_t)head_dim * sizeof(uint16_t),
-						blk_stride, n_active);
-		size_t b   = p->kv_base_pos ? p->kv_base_pos[layer] : 0;
-		slot_start = b ? (size_t)pos_start - b : (size_t)pos_start;
-	}
+	size_t last_slot = cpu_kv_put_slot(
+		p, layer, pos_start + m - 1, n_ctx, is_q80 ? (void *)k->handle : (void *)cpu_ptr(k),
+		is_q80 ? (void *)v->handle : (void *)cpu_ptr(v),
+		is_q80 ? layer_base : layer_base * sizeof(uint16_t),
+		is_q80 ? rows * blk_stride : rows * (size_t)head_dim * sizeof(uint16_t), blk_stride,
+		n_active);
+	size_t slot_start = last_slot >= (size_t)(m - 1) ? last_slot - (size_t)(m - 1) : 0;
 
 	cpu_kv_put_batch_job job = {.kf_base	= (const float *)cpu_ptr(k_in),
 								.vf_base	= (const float *)cpu_ptr(v_in),
@@ -1283,6 +1392,31 @@ status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int
 								.n_active	   = n_active,
 								.is_q80		   = is_q80};
 
+	return job;
+}
+
+status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, const buffer *k_in,
+					   const buffer *v_in, int n_kv_heads, int head_dim, int n_ctx,
+					   int n_kv_heads_active) {
+	cpu_kv_put_batch_job job =
+		cpu_kv_put_prepare(self, k, v, layer, pos, k_in, v_in, n_kv_heads * head_dim, n_kv_heads,
+						   head_dim, n_ctx, n_kv_heads_active, 1);
+	cpu_kv_put_batch_chunk(0, job.n_active, -1, &job);
+	return OK;
+}
+
+status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+							 const buffer *k_in, const buffer *v_in, int in_row_stride,
+							 int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+							 int m) {
+	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	int total	 = m * n_active;
+	if (total <= 0)
+		return OK;
+	cpu_priv			*p = self->priv;
+	cpu_kv_put_batch_job job =
+		cpu_kv_put_prepare(self, k, v, layer, pos_start, k_in, v_in, in_row_stride, n_kv_heads,
+						   head_dim, n_ctx, n_kv_heads_active, m);
 	if (p->pool && total >= 2) {
 		tpool_parallel_for(p->pool, total, 1, cpu_kv_put_batch_chunk, &job);
 		return OK;
@@ -1456,14 +1590,6 @@ void cpu_kv_free(backend *self, buffer *k, buffer *v) {
 	cpu_buffer_free(self, k);
 	cpu_buffer_free(self, v);
 }
-
-typedef struct {
-	const void *src;
-	void	   *dst;
-	int			k;
-	int			rows_per_group;
-	void (*repack_fn)(const void *src, void *dst, int row_begin, int row_end, int k);
-} cpu_repack_job;
 
 static void cpu_repack_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
@@ -1740,13 +1866,6 @@ status_code cpu_backend_fill(backend *out) {
 	return OK;
 }
 
-typedef struct {
-	const float *x, *w;
-	float		*y;
-	int			 n;
-	float		 eps;
-} cpu_rmsnorm_batch_job;
-
 status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
 						float eps) {
 	return cpu_rmsnorm_batch(self, x, w, y, n, eps, 1);
@@ -1796,15 +1915,6 @@ status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x, buffer
 	}
 	return OK;
 }
-
-typedef struct {
-	const buffer *x;
-	const buffer *w;
-	buffer		 *y;
-	int			  n_heads, head_dim, row_stride;
-	float		  eps;
-	int			  noweight;
-} cpu_rmsnorm_row_batch_job;
 
 static void cpu_rmsnorm_row_batch_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
@@ -1878,12 +1988,6 @@ status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj, int 
 	return OK;
 }
 
-typedef struct {
-	float		*conv_out, *conv_state;
-	const float *mixed, *conv_w;
-	int			 conv_dim, conv_kernel, n_tokens, mixed_stride, history;
-} gdn_conv_job;
-
 static void gdn_conv_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	gdn_conv_job *j		  = ctx;
@@ -1941,31 +2045,6 @@ static void gdn_conv_tokens(tpool *pool, float *conv_out, float *conv_state, con
 	}
 	gdn_conv_chunk(0, conv_dim, -1, &job);
 }
-
-typedef struct {
-	float		*state;
-	const float *conv;
-	const float *z;
-	const float *alpha;
-	const float *beta;
-	float		*out;
-	const float *dt;
-	const float *a;
-	const float *norm_w;
-	float		*scratch;
-	int			 n_tokens;
-	int			 conv_stride;
-	int			 z_stride;
-	int			 alpha_stride;
-	int			 beta_stride;
-	int			 out_stride;
-	int			 nkh;
-	int			 kd;
-	int			 vd;
-	int			 key_dim;
-	int			 scratch_stride;
-	float		 eps;
-} gdn_job;
 
 static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 	int	   kd		  = j->kd;
@@ -2187,56 +2266,6 @@ status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads
 	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_partial_rope_qk_chunk, &job);
 	return OK;
 }
-
-#define CPU_MATMUL_MIN_ROWS_PER_THREAD 32
-#define CPU_MATMUL_MULTI_MAX 8
-#define CPU_QUANTIZE_MIN_ROWS_PER_THREAD 8
-
-typedef void (*qonly_fn)(const void *, const void *, size_t, float *, int, int, int, int);
-
-typedef struct {
-	qonly_fn qonly;
-	uint32_t w_type;
-	int		 q8_class;
-} matmul_kernel;
-
-typedef struct {
-	const void			*W;
-	uint32_t			 w_type;
-	const void			*xq;
-	const float			*xf;
-	float				*y;
-	int					 n, k, m;
-	size_t				 row_stride;
-	size_t				 xq_row_stride;
-	const float			*bias;
-	const float			*residual;
-	int					 group_rows;
-	const matmul_kernel *kernel;
-	size_t				 xq_row_stride_blocks;
-} cpu_matmul_job;
-
-typedef struct {
-	uint32_t	   w_type;
-	int			   group_rows;
-	tpool_chunk_fn chunk_fn;
-} grouped_matmul_kernel;
-
-typedef struct {
-	int			 q8_class;
-	const float *xf;
-	int			 k;
-	size_t		 row_stride;
-	uint8_t		*xq;
-} cpu_quantize_x_rows_job;
-
-typedef struct {
-	cpu_matmul_job jobs[CPU_MATMUL_MULTI_MAX];
-	int			   row_offset[CPU_MATMUL_MULTI_MAX + 1];
-	int			   n_matmuls;
-	int			   group_offset[CPU_MATMUL_MULTI_MAX + 1];
-	int			   group_rows;
-} cpu_matmul_multi_job;
 
 #define MATMUL_KERNEL(wt, fn, q8) [(wt)] = {(qonly_fn)fn, wt, q8}
 
@@ -3036,17 +3065,6 @@ status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
 	cpu_matmul_threaded_bias_residual(self, W, w_type, act, yf, n, k, NULL, NULL);
 	return OK;
 }
-
-enum { FFN_ACTQ_TILE = 256 };
-
-typedef struct {
-	const float *g, *u;
-	uint8_t		*xq;
-	int			 k;
-	size_t		 stride;
-	int			 activation;
-	int			 q8_class;
-} cpu_ffn_actq_job;
 
 static void ffn_actq_row(const float *g, const float *u, uint8_t *xq, int k, int activation,
 						 int q8_class) {

@@ -10,6 +10,20 @@
 #include <string.h>
 #include <sys/sysinfo.h>
 
+typedef enum {
+	MEM_UNIT_MB,
+	MEM_UNIT_GB,
+} mem_unit;
+
+typedef struct {
+	size_t embd;
+	size_t attn;
+	size_t dense_ffn;
+	size_t shexp;
+	size_t router;
+	size_t total;
+} non_expert_breakdown;
+
 size_t get_available_memory(void) {
 	FILE *f = fopen("/proc/meminfo", "r");
 	if (!f) {
@@ -189,11 +203,6 @@ size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_qu
 	return kv_cache;
 }
 
-typedef enum {
-	MEM_UNIT_MB,
-	MEM_UNIT_GB,
-} mem_unit;
-
 static double to_unit(size_t bytes, mem_unit unit) {
 	const double k		 = 1024.0;
 	double		 divisor = (unit == MEM_UNIT_GB) ? k * k * k : k * k;
@@ -213,15 +222,6 @@ static int moe_cache_cap(const model *m, const config *cfg) {
 		cache_cap = m->moe.n_experts;
 	return cache_cap;
 }
-
-typedef struct {
-	size_t embd;
-	size_t attn;
-	size_t dense_ffn;
-	size_t shexp;
-	size_t router;
-	size_t total;
-} non_expert_breakdown;
 
 static non_expert_breakdown calc_non_expert_breakdown(const model *m) {
 	non_expert_breakdown b = {0};

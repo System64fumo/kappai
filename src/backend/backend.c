@@ -18,6 +18,9 @@
 #define HFB_DETAIL_CAP 160
 #define HFB_PATH_CAP 512
 #define HFB_LIB_MAX 16
+#define BACKEND_LIB_PREFIX "libkappai_"
+#define BACKEND_LIB_SUFFIX ".so"
+#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
 
 typedef struct {
 	uint64_t			 count;
@@ -27,6 +30,15 @@ typedef struct {
 	char				 device[32];
 	char				 detail[HFB_DETAIL_CAP];
 } hfb_entry;
+
+typedef struct {
+	char			name[32];
+	backend_ctor_fn ctor;
+} backend_reg_entry;
+
+static backend_reg_entry g_registry[BACKEND_MAX];
+static int				 g_registry_count = 0;
+static pthread_once_t	 g_backends_once  = PTHREAD_ONCE_INIT;
 
 static hfb_entry	   g_hfb_entries[HFB_MAX_ENTRIES];
 static int			   g_hfb_n_entries = 0;
@@ -192,14 +204,6 @@ static void backend_dump_load_diagnosis(void) {
 	else
 		ERROR("  no host fallback trigger recorded");
 }
-
-typedef struct {
-	char			name[32];
-	backend_ctor_fn ctor;
-} backend_reg_entry;
-
-static backend_reg_entry g_registry[BACKEND_MAX];
-static int				 g_registry_count = 0;
 
 void backend_register(const char *name, backend_ctor_fn ctor) {
 	if (g_registry_count >= BACKEND_MAX)
@@ -712,11 +716,6 @@ size_t backend_mem_total(const backend *b) {
 		return b->mem_total((backend *)b);
 	return get_total_memory();
 }
-#define BACKEND_LIB_PREFIX "libkappai_"
-#define BACKEND_LIB_SUFFIX ".so"
-
-static pthread_once_t g_backends_once = PTHREAD_ONCE_INIT;
-
 static int str_ends_with(const char *s, const char *suffix) {
 	size_t ls = strlen(s), lx = strlen(suffix);
 	return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
@@ -829,8 +828,6 @@ static void backends_init(void) {
 void backend_load(void) {
 	pthread_once(&g_backends_once, backends_init);
 }
-
-#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
 
 status_code tensor_desc_read(const tensor_desc *desc, size_t off, void *dst, size_t len) {
 	if (!desc->read_fn) {

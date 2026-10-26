@@ -10,6 +10,36 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef enum {
+	CLI_OPT_STRING,
+	CLI_OPT_INT,
+	CLI_OPT_FLOAT,
+	CLI_OPT_BOOL_FLAG,
+	CLI_OPT_FLAG_TRUE,
+	CLI_OPT_SEED,
+	CLI_OPT_KV_QUANT,
+	CLI_OPT_MONITOR,
+	CLI_OPT_METRICS,
+	CLI_OPT_PORT,
+	CLI_OPT_HELP,
+} cli_opt_kind;
+
+typedef struct {
+	const char	*name;
+	int			 val;
+	cli_opt_kind kind;
+	void		*target;
+	double		 lo;
+	double		 hi;
+} cli_option_desc;
+
+static const struct {
+	const char *token;
+	int			value;
+} bool_tokens[] = {
+	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
+};
+
 static config g_cfg;
 static int	  g_cfg_initialized = 0;
 
@@ -117,13 +147,6 @@ void config_usage(FILE *fp, bool is_server) {
 			"  --disable-failsafes      skip memory guardrails (unsafe; debug only)\n"
 			"  -h, --help               show this help\n");
 }
-
-static const struct {
-	const char *token;
-	int			value;
-} bool_tokens[] = {
-	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
-};
 
 void cli_args_defaults(cli_args *a) {
 	memset(a, 0, sizeof(*a));
@@ -253,29 +276,6 @@ static void parse_monitor(const char *optarg, int argc, char **argv, int *optind
 		cfg->monitor = "";
 	}
 }
-
-typedef enum {
-	CLI_OPT_STRING,
-	CLI_OPT_INT,
-	CLI_OPT_FLOAT,
-	CLI_OPT_BOOL_FLAG,
-	CLI_OPT_FLAG_TRUE,
-	CLI_OPT_SEED,
-	CLI_OPT_KV_QUANT,
-	CLI_OPT_MONITOR,
-	CLI_OPT_METRICS,
-	CLI_OPT_PORT,
-	CLI_OPT_HELP,
-} cli_opt_kind;
-
-typedef struct {
-	const char	*name;
-	int			 val;
-	cli_opt_kind kind;
-	void		*target;
-	double		 lo;
-	double		 hi;
-} cli_option_desc;
 
 static int cli_opt_arg_type(cli_opt_kind kind) {
 	switch (kind) {

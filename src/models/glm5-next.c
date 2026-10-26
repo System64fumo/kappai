@@ -13,19 +13,7 @@ static void append_dense_ffn(op_emitter *e, const model *m, int li) {
 	const int dim = m->dim, inter = m->intermediate;
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, m->norm_eps, STAGE_RMSNORM));
-	if (m->layers[li].gate_up_fused) {
-		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP, 2 * inter, dim,
-							 STAGE_MATMUL));
-		OP_EMIT(e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT, inter,
-										 ACTIVATION_SILU));
-	} else {
-		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter, dim,
-							 STAGE_MATMUL));
-		OP_EMIT(e,
-				mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL));
-		OP_EMIT(e, mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_FFN_ACT,
-								   inter, ACTIVATION_SILU));
-	}
+	recipe_emit_ffn_activation(e, dim, inter, m->layers[li].gate_up_fused, 0, ACTIVATION_SILU);
 	OP_EMIT(e,
 			mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter, STAGE_MATMUL));
 }
@@ -33,8 +21,7 @@ static void append_dense_ffn(op_emitter *e, const model *m, int li) {
 static void append_moe_ffn(op_emitter *e, const model *m) {
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, m->norm_eps, STAGE_RMSNORM));
-	e->count =
-		recipe_append_moe_ffn(e->ops, e->count, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
+	recipe_emit_moe_ffn(e, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
 	OP_EMIT(e, mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_FFN_ACT, STAGE_ADD));
 }
 
@@ -73,15 +60,7 @@ static model_recipe *build_glm5_next_recipe(const model *m) {
 	r->pre_ops[r->n_pre_ops++] =
 		mk_backend_op(OP_HC_INIT, RECIPE_SLOT_X, RECIPE_SLOT_HC, WIDX_NONE, STAGE_ADD);
 
-	r->layer.ops   = xcalloc(GLM5_NEXT_MAX_OPS_PER_LAYER, sizeof(recipe_op));
-	r->layer.n_ops = GLM5_NEXT_MAX_OPS_PER_LAYER;
-	r->per_layer_ops =
-		xcalloc((size_t)m->n_layers * GLM5_NEXT_MAX_OPS_PER_LAYER, sizeof(recipe_op));
-	for (int li = 0; li < m->n_layers; li++) {
-		recipe_op *ops = r->per_layer_ops + (size_t)li * GLM5_NEXT_MAX_OPS_PER_LAYER;
-		op_emitter e   = op_emitter_make(ops, GLM5_NEXT_MAX_OPS_PER_LAYER, "glm5-next");
-		append_layer(&e, m, li);
-	}
+	recipe_build_layers(r, m, GLM5_NEXT_MAX_OPS_PER_LAYER, "glm5-next", append_layer);
 
 	recipe_build_post_ops(r, m);
 	r->post_ops = xrealloc(r->post_ops, (size_t)(r->n_post_ops + 1) * sizeof(recipe_op));

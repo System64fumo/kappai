@@ -5,6 +5,69 @@
 
 #define record_plan(label, ok, ...) record_resultf(OPFAM_PLAN, (label), (ok), __VA_ARGS__)
 
+static void append_test_layer(op_emitter *e, const model *m, int li) {
+	for (int i = 0; i <= li; i++)
+		OP_EMIT(e, mk_matmul(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_WQ, li + 1, m->dim, STAGE_MATMUL));
+}
+
+static void test_recipe_build_layers(void) {
+	model m = {.n_layers = 3, .dim = 64};
+	for (int cap = 3; cap <= 5; cap += 2) {
+		model_recipe *r = xcalloc(1, sizeof(*r));
+		recipe_build_layers(r, &m, cap, "test", append_test_layer);
+		int ok = r->layer.n_ops == 3;
+		for (int li = 0; li < m.n_layers; li++) {
+			for (int i = 0; i < r->layer.n_ops; i++) {
+				const recipe_op *op = r->per_layer_ops + li * r->layer.n_ops + i;
+				if (i <= li)
+					ok &= op->kind == OP_MATMUL && op->u.matmul.n == li + 1 &&
+						  op->u.matmul.k == m.dim;
+				else
+					ok &= op->kind == OP_NONE;
+			}
+			ok &= r->layer.ops[li].kind == OP_NONE;
+		}
+		record_plan("recipe.build_layers", ok, "cap=%d stride=%d", cap, r->layer.n_ops);
+		recipe_free(r);
+	}
+}
+
+static void test_recipe_ffn_activation(void) {
+	for (int fused = 0; fused <= 1; fused++) {
+		for (int multi = 0; multi <= 1; multi++) {
+			for (int act = ACTIVATION_SILU; act <= ACTIVATION_GELU; act++) {
+				recipe_op  ops[3] = {0};
+				op_emitter e	  = op_emitter_make(ops, 3, "test");
+				recipe_emit_ffn_activation(&e, 64, 128, fused, multi, act);
+				int ok = e.count == (fused || multi ? 2 : 3);
+				ok &= ops[0].in[0] == RECIPE_SLOT_XB;
+				if (fused) {
+					ok &= ops[0].kind == OP_MATMUL && ops[0].w_idx == WIDX_GATE_UP &&
+						  ops[0].u.matmul.n == 256 && ops[0].u.matmul.k == 64 &&
+						  ops[0].out == RECIPE_SLOT_FFN_GATE_UP;
+				} else if (multi) {
+					ok &= ops[0].kind == OP_MATMUL_MULTI && ops[0].w_idx == WIDX_GATE &&
+						  ops[0].u.matmul_multi.n == 2 && ops[0].u.matmul_multi.k == 64 &&
+						  ops[0].u.matmul_multi.n_out[0] == 128 &&
+						  ops[0].u.matmul_multi.n_out[1] == 128 &&
+						  ops[0].out == RECIPE_SLOT_FFN_GATE && ops[0].out1 == RECIPE_SLOT_FFN_UP;
+				} else {
+					ok &= ops[0].kind == OP_MATMUL && ops[0].w_idx == WIDX_GATE &&
+						  ops[1].kind == OP_MATMUL && ops[1].w_idx == WIDX_UP &&
+						  ops[0].u.matmul.n == 128 && ops[1].u.matmul.n == 128 &&
+						  ops[0].u.matmul.k == 64 && ops[1].u.matmul.k == 64;
+				}
+				const recipe_op *activation = &ops[e.count - 1];
+				ok &= activation->kind == (fused ? OP_FFN_ACTIVATE_FUSED : OP_FFN_ACTIVATE) &&
+					  activation->out == RECIPE_SLOT_FFN_ACT &&
+					  activation->u.ffn_act.activation == act;
+				record_plan("recipe.ffn_activation", ok, "fused=%d multi=%d act=%d", fused, multi,
+							act);
+			}
+		}
+	}
+}
+
 static void test_touch_contents(void) {
 	recipe_op op;
 	memset(&op, 0, sizeof(op));
@@ -945,6 +1008,8 @@ static void test_mem_plan_aliasing(const char *arch, const char *path) {
 }
 
 void run_plan_tests(void) {
+	test_recipe_build_layers();
+	test_recipe_ffn_activation();
 	test_touch_contents();
 	test_fuse_legality();
 	test_graph_build();

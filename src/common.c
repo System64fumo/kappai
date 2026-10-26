@@ -1,5 +1,11 @@
 #include "common.h"
 
+#include <ctype.h>
+#include <execinfo.h>
+#include <sched.h>
+#include <stdio.h>
+#include <string.h>
+
 const char *status_str(status_code s) {
 	switch (s) {
 	case OK:
@@ -28,12 +34,6 @@ const char *status_str(status_code s) {
 		return "unknown";
 	}
 }
-
-#include <ctype.h>
-#include <execinfo.h>
-#include <sched.h>
-#include <stdio.h>
-#include <string.h>
 
 void oom_abort(size_t bytes) {
 	fprintf(stderr, "fatal: out of memory (%zu bytes)\n", bytes);
@@ -155,12 +155,11 @@ size_t marker_tail_len(const char *s, size_t len, const char *marker) {
 	return 0;
 }
 
-static float *float_buf_ensure_aligned(float_buf *b, size_t need, size_t align) {
+float *float_buf_ensure(float_buf *b, size_t need) {
 	if (need > b->cap) {
 		size_t bytes = need * sizeof(float);
-		if (bytes >= (2u << 20))
-			align = align < 4096 ? 4096 : align;
-		float *np = xmalloc_aligned(bytes, align);
+		size_t align = bytes >= (2u << 20) ? 4096 : 64;
+		float *np	 = xmalloc_aligned(bytes, align);
 		if (bytes >= (2u << 20))
 			madvise_hugepage(np, bytes);
 		if (b->p && b->cap > 0)
@@ -184,10 +183,6 @@ float *float_buf_ensure_nocopy(float_buf *b, size_t need, size_t align) {
 		b->cap = need;
 	}
 	return b->p;
-}
-
-float *float_buf_ensure(float_buf *b, size_t need) {
-	return float_buf_ensure_aligned(b, need, 64);
 }
 
 void sb_reserve(str_builder *b, size_t extra) {

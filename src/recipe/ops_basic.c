@@ -1,12 +1,57 @@
 #include "recipe/internal.h"
 
-_Atomic(backend *) cached_host_backend = NULL;
+#define OP_FALLBACK_SEEN_MAX 64
+
+typedef struct {
+	const backend *be;
+	const char	  *op;
+} op_fallback_seen;
+
+typedef struct {
+	const float *cos;
+	const float *sin;
+	const float *freq_factors;
+} rope_tables;
+
+typedef struct {
+	int			n_heads;
+	int			head_dim;
+	int			row_stride;
+	rope_tables rt;
+} rope_ext_args;
+
+typedef struct {
+	const buffer *w;
+	uint32_t	  wt;
+	int			  n, k, act;
+} ffn_down_args;
+
+typedef struct {
+	backend		 *t;
+	const buffer *w;
+	int			  n_heads;
+	int			  head_dim;
+	float		  eps;
+} rmsnorm_ph_row_ud;
+
+typedef struct {
+	backend *t;
+	float	 eps;
+	int		 n;
+} rmsnorm_nw_row_ud;
+
+_Atomic(backend *)		cached_host_backend = NULL;
+static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
+static _Atomic int		g_op_fallback_n_seen;
+static pthread_mutex_t	g_op_fallback_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int n_tokens, uint8_t k_slot,
 									 uint8_t v_slot, int kv_row_stride);
 
 static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a, int n, int act,
 													  int fused_stride, int n_rows);
+static status_code ffn_activate_ex_rows(backend *t, const float *fused, float *out, int n, int act,
+										int n_rows, int fused_stride);
 
 const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n) {
 	buffer *b = exec_slot(ctx, idx);
@@ -40,10 +85,6 @@ status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const flo
 		return OK;
 	}
 	return b->owner->buffer_write_f32(b->owner, b, staged, n);
-}
-
-static inline const op_layer_geom *exec_layer_ctx(const exec_ctx *ctx) {
-	return &ctx->op->geom;
 }
 
 static inline weight_ref *exec_weight_ref(const exec_ctx *ctx, uint8_t w_idx) {
@@ -102,11 +143,11 @@ void profile_weight_bytes(profile *prof, stage s, uint32_t w_type, int rows, int
 	profile_add_bytes(prof, s, (uint64_t)rb * (uint64_t)rows);
 }
 
-static int exec_matmul_run_coalesced_impl(const recipe_op *ops, int n_ops, model *m,
-										  compute_scratch *s, int li, buffer *xb, buffer *ys[],
-										  int batched, int n_rows, status_code *out_status) {
+int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, compute_scratch *s,
+									int li, buffer *xb, buffer *ys[], int n_rows,
+									status_code *out_status) {
 	backend *a = m->backend;
-	if ((batched ? !a->matmul_multi_batch : !a->matmul_multi) || n_ops < 2) {
+	if (!a->matmul_multi_batch || n_ops < 2) {
 		*out_status = OK;
 		return 0;
 	}
@@ -114,7 +155,6 @@ static int exec_matmul_run_coalesced_impl(const recipe_op *ops, int n_ops, model
 	int			  n = n_ops > RECIPE_COALESCE_MAX ? RECIPE_COALESCE_MAX : n_ops;
 	const buffer *w_list[RECIPE_COALESCE_MAX];
 	uint32_t	  w_types[RECIPE_COALESCE_MAX];
-	buffer		 *y_list[RECIPE_COALESCE_MAX];
 	int			  n_out[RECIPE_COALESCE_MAX];
 	int			  k = ops[0].u.matmul.k;
 
@@ -122,7 +162,6 @@ static int exec_matmul_run_coalesced_impl(const recipe_op *ops, int n_ops, model
 		weight_ref *w = resolve_weight_ref(m, li, ops[i].w_idx);
 		w_list[i]	  = &w->buf;
 		w_types[i]	  = w->type;
-		y_list[i]	  = ys[i];
 		n_out[i]	  = ops[i].u.matmul.n;
 	}
 
@@ -130,19 +169,11 @@ static int exec_matmul_run_coalesced_impl(const recipe_op *ops, int n_ops, model
 	profile_scope ps   = profile_begin(prof, ops[0].stage);
 	for (int i = 0; i < n; i++)
 		profile_weight_bytes(prof, ops[0].stage, w_types[i], n_out[i], k);
-	status_code st =
-		batched ? a->matmul_multi_batch(a, w_list, w_types, xb, y_list, n_out, k, n, n_rows)
-				: a->matmul_multi(a, w_list, w_types, xb, y_list, n_out, k, n);
+	status_code st = a->matmul_multi_batch(a, w_list, w_types, xb, ys, n_out, k, n, n_rows);
 	profile_end(prof, &ps);
 
 	*out_status = st;
 	return n;
-}
-
-int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, compute_scratch *s,
-									int li, buffer *xb, buffer *ys[], int n_rows,
-									status_code *out_status) {
-	return exec_matmul_run_coalesced_impl(ops, n_ops, m, s, li, xb, ys, 1, n_rows, out_status);
 }
 
 int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb, buffer **y_list,
@@ -193,19 +224,6 @@ int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb,
 	return n;
 }
 
-#define OP_FALLBACK_SEEN_MAX 64
-
-typedef struct {
-	const backend *be;
-	const char	  *op;
-} op_fallback_seen;
-
-static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
-
-static _Atomic int g_op_fallback_n_seen;
-
-static pthread_mutex_t g_op_fallback_mtx = PTHREAD_MUTEX_INITIALIZER;
-
 static bool op_fallback_seen_before(const backend *a, const char *op_name, int n) {
 	for (int i = 0; i < n && i < OP_FALLBACK_SEEN_MAX; i++)
 		if (g_op_fallback_seen[i].be == a && strcmp(g_op_fallback_seen[i].op, op_name) == 0)
@@ -253,16 +271,10 @@ status_code op_ffn_activate_ex(exec_ctx *ctx) {
 	return st;
 }
 
-typedef struct {
-	const float *cos;
-	const float *sin;
-	const float *freq_factors;
-} rope_tables;
-
 static rope_tables exec_rope_setup(const exec_ctx *ctx, backend *a, int rope_neox,
 								   int use_freq_factors) {
 	const struct model	*m	= ctx->m;
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	a->rope_neox			= rope_neox;
 	a->rope_theta = lc->is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
 	if (lc->is_global)
@@ -271,16 +283,9 @@ static rope_tables exec_rope_setup(const exec_ctx *ctx, backend *a, int rope_neo
 	return (rope_tables){ctx->s->model.rope_cos_swa, ctx->s->model.rope_sin_swa, NULL};
 }
 
-typedef struct {
-	int			n_heads;
-	int			head_dim;
-	int			row_stride;
-	rope_tables rt;
-} rope_ext_args;
-
 static rope_ext_args rope_ext_args_of(exec_ctx *ctx, backend *a) {
 	const recipe_op		*op	  = ctx->op;
-	const op_layer_geom *lc	  = exec_layer_ctx(ctx);
+	const op_layer_geom *lc	  = &ctx->op->geom;
 	int					 is_q = op->u.rope_ext.is_q;
 	rope_ext_args		 g	  = {.n_heads	 = op->u.rope_ext.n_heads,
 								 .head_dim	 = lc->head_dim,
@@ -370,7 +375,7 @@ static status_code qk_norm_rope_unfused(exec_ctx *ctx, const op_layer_geom *lc) 
 
 static status_code qk_norm_rope_fused(exec_ctx *ctx) {
 	backend				*a			= exec_layer_backend(ctx);
-	const op_layer_geom *lc			= exec_layer_ctx(ctx);
+	const op_layer_geom *lc			= &ctx->op->geom;
 	profile_scope		 ps			= profile_begin(&ctx->s->prof, ctx->op->stage);
 	rope_tables			 rt			= exec_rope_setup(ctx, a, ctx->op->u.qk_norm_rope.rope_neox, 1);
 	const int			 n_kv_heads = ctx->op->u.qk_norm_rope.q_only ? 0 : lc->n_kv_heads;
@@ -397,7 +402,7 @@ static status_code qk_norm_rope_fused(exec_ctx *ctx) {
 }
 
 status_code op_qk_norm_rope_unfused(exec_ctx *ctx) {
-	return qk_norm_rope_unfused(ctx, exec_layer_ctx(ctx));
+	return qk_norm_rope_unfused(ctx, &ctx->op->geom);
 }
 
 status_code op_qk_norm_rope(exec_ctx *ctx) {
@@ -471,15 +476,6 @@ status_code op_matmul_residual(exec_ctx *ctx) {
 	profile_end(prof, &ps);
 	return st;
 }
-
-static status_code ffn_activate_ex_rows(backend *t, const float *fused, float *out, int n, int act,
-										int n_rows, int fused_stride);
-
-typedef struct {
-	const buffer *w;
-	uint32_t	  wt;
-	int			  n, k, act;
-} ffn_down_args;
 
 static ffn_down_args ffn_down_args_of(exec_ctx *ctx) {
 	weight_ref	 *wref = exec_weight_ref(ctx, ctx->op->w_idx);
@@ -579,7 +575,7 @@ status_code op_rope_qk_fused(exec_ctx *ctx) {
 status_code op_kv_put(exec_ctx *ctx) {
 	profile_scope ps			= profile_begin(&ctx->s->prof, ctx->op->stage);
 	status_code	  st			= OK;
-	int			  kv_row_stride = exec_layer_ctx(ctx)->kv_row_stride;
+	int			  kv_row_stride = ctx->op->geom.kv_row_stride;
 	exec_segments seg			= exec_segments_of(ctx);
 	buffer		 *k_all			= batch_slot(ctx->bs, ctx->op->in[0]);
 	buffer		 *v_all			= batch_slot(ctx->bs, ctx->op->in[1]);
@@ -790,24 +786,10 @@ static status_code batch_row_each(exec_ctx *ctx, uint8_t slot, int row_elems, ba
 	return OK;
 }
 
-typedef struct {
-	backend		 *t;
-	const buffer *w;
-	int			  n_heads;
-	int			  head_dim;
-	float		  eps;
-} rmsnorm_ph_row_ud;
-
 static status_code rmsnorm_ph_row_fn(buffer *rowb, void *v) {
 	rmsnorm_ph_row_ud *u = v;
 	return u->t->rmsnorm_per_head(u->t, rowb, u->w, rowb, u->n_heads, u->head_dim, u->eps);
 }
-
-typedef struct {
-	backend *t;
-	float	 eps;
-	int		 n;
-} rmsnorm_nw_row_ud;
 
 static status_code rmsnorm_nw_row_fn(buffer *rowb, void *v) {
 	rmsnorm_nw_row_ud *u = v;
@@ -815,7 +797,7 @@ static status_code rmsnorm_nw_row_fn(buffer *rowb, void *v) {
 }
 
 static status_code rmsnorm_per_head_batched(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	int n_heads				= ctx->op->w_idx == WIDX_ATTN_Q_NORM ? ctx->m->n_heads : lc->n_kv_heads;
 	return t->rmsnorm_per_head_batch(
 		t, exec_slot(ctx, ctx->op->in[0]), exec_weight(ctx, ctx->op->w_idx),
@@ -823,7 +805,7 @@ static status_code rmsnorm_per_head_batched(exec_ctx *ctx, backend *t) {
 }
 
 static status_code rmsnorm_per_head_rows(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc	  = exec_layer_ctx(ctx);
+	const op_layer_geom *lc	  = &ctx->op->geom;
 	int					 is_q = ctx->op->w_idx == WIDX_ATTN_Q_NORM;
 	rmsnorm_ph_row_ud	 ud	  = {t, exec_weight(ctx, ctx->op->w_idx),
 								 is_q ? ctx->m->n_heads : lc->n_kv_heads, lc->head_dim,
@@ -860,21 +842,21 @@ status_code op_rmsnorm_per_head(exec_ctx *ctx) {
 }
 
 static status_code rmsnorm_noweight_ph_batched(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	return t->rmsnorm_noweight_per_head_batch(t, exec_slot(ctx, ctx->op->in[0]),
 											  exec_slot(ctx, ctx->op->in[0]), lc->n_kv_heads,
 											  lc->head_dim, ctx->m->norm_eps, ctx->rows.n_rows);
 }
 
 static status_code rmsnorm_noweight_batched(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	return t->rmsnorm_noweight_batch(t, exec_slot(ctx, ctx->op->in[0]),
 									 exec_slot(ctx, ctx->op->in[0]), lc->kv_row_stride,
 									 ctx->m->norm_eps, ctx->rows.n_rows);
 }
 
 static status_code rmsnorm_noweight_ph_rows(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	for (int row = 0; row < ctx->rows.n_rows; row++) {
 		buffer rowb = batch_row_view(batch_slot(ctx->bs, ctx->op->in[0]), row, lc->kv_row_stride);
 		status_code st = t->rmsnorm_noweight_per_head(t, &rowb, &rowb, lc->n_kv_heads, lc->head_dim,
@@ -886,7 +868,7 @@ static status_code rmsnorm_noweight_ph_rows(exec_ctx *ctx, backend *t) {
 }
 
 static status_code rmsnorm_noweight_rows(exec_ctx *ctx, backend *t) {
-	const op_layer_geom *lc = exec_layer_ctx(ctx);
+	const op_layer_geom *lc = &ctx->op->geom;
 	rmsnorm_nw_row_ud	 ud = {t, ctx->m->norm_eps, lc->kv_row_stride};
 	return batch_row_each(ctx, ctx->op->in[0], lc->kv_row_stride, rmsnorm_nw_row_fn, &ud);
 }

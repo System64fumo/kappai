@@ -7,16 +7,21 @@
 #include <stdio.h>
 #include <string.h>
 
-volatile sig_atomic_t ui_interrupt = 0;
-
-static int g_colors = 0;
-
 enum {
 	UI_PAIR_TITLE = 1,
 	UI_PAIR_ERR,
 	UI_PAIR_OK,
 	UI_PAIR_WARN,
 };
+
+typedef struct {
+	const char *p;
+	size_t		bytes;
+	int			cols;
+} wrap_span;
+
+volatile sig_atomic_t ui_interrupt = 0;
+static int			  g_colors	   = 0;
 
 static void on_sigint(int sig) {
 	(void)sig;
@@ -178,12 +183,6 @@ void ui_box(int y, int x, int h, int w, const char *title, chtype title_attr) {
 		ui_putn(y, tx, title, w - 2, title_attr);
 	}
 }
-
-typedef struct {
-	const char *p;
-	size_t		bytes;
-	int			cols;
-} wrap_span;
 
 static int wrap_step(const char **cursor, int width, wrap_span *out) {
 	if (width < 1)

@@ -1,5 +1,16 @@
 #include "recipe/internal.h"
 
+typedef struct {
+	backend		  *a;
+	const buffer  *w;
+	uint32_t	   w_type;
+	const int32_t *tokens;
+	buffer		  *xs;
+	int			   dim;
+	float		   scale;
+	_Atomic int	  *first_err;
+} embd_fill_job;
+
 static int bs_ensure_detached(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_elems) {
 	bs_pair *p	   = &bs->pair[slot];
 	size_t	 bytes = n_elems * sizeof(float);
@@ -164,17 +175,6 @@ buffer batch_row_view(const buffer *whole, int row, int row_elems) {
 		v.size = whole->size - delta;
 	return v;
 }
-
-typedef struct {
-	backend		  *a;
-	const buffer  *w;
-	uint32_t	   w_type;
-	const int32_t *tokens;
-	buffer		  *xs;
-	int			   dim;
-	float		   scale;
-	_Atomic int	  *first_err;
-} embd_fill_job;
 
 static void embd_fill_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;

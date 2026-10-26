@@ -1,9 +1,61 @@
 #include "recipe/internal.h"
 
-static int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
-							  int n_group, int topk_group, float *logits, const float *bias,
-							  float *scores_scratch, int *ids_out, float *w_out);
+typedef struct {
+	model			*m;
+	backend			*a;
+	batch_scratch	*bs;
+	moe_expert_slot *slot_buf;
+	int				 li, top_k, inter, dim, n_tokens, use_gelu;
+	const float		*xb_base;
+	float			*all_scratch;
+	float			*all_outs;
+	size_t			 per_thread_scratch;
+	size_t			 per_expert_out;
+} moe_batch_job;
 
+typedef struct {
+	batch_scratch *bs;
+	layer_weights *L;
+	int			   E, K, rows;
+	int			   uses_softmax, norm_topk;
+	float		   routed_scale;
+	int			   n_group, topk_group;
+} moe_router_emit_job;
+
+typedef struct {
+	int dim;
+	int K;
+	int I;
+	int use_gelu;
+} moe_exec_plan;
+
+typedef struct {
+	int			  is_moe;
+	int			  sh_inter;
+	int			  use_gelu;
+	int			  gate_up_fused;
+	const buffer *gate_w;
+	uint32_t	  gate_type;
+	const buffer *up_w;
+	uint32_t	  up_type;
+	const buffer *down_w;
+	uint32_t	  down_type;
+	const buffer *gate_up_w;
+	uint32_t	  gate_up_type;
+} moe_shared_plan;
+
+typedef struct {
+	moe_resident_expert *experts;
+	int					*counts;
+	int					*idx;
+	int					*rows_packed;
+	float				*weights_packed;
+	backend			   **owners;
+} moe_pack;
+
+static int	moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float routed_scale,
+							   int n_group, int topk_group, float *logits, const float *bias,
+							   float *scores_scratch, int *ids_out, float *w_out);
 static void moe_batch_expert_chunk(int begin, int end, int tid, void *ctx);
 
 static int moe_order_pair_cmp(const void *pa, const void *pb) {
@@ -18,19 +70,6 @@ static inline void batch_sync(const exec_ctx *ctx) {
 	if (a && a->synchronize && !backend_has_cap(a, BCAP_IS_HOST))
 		a->synchronize(a);
 }
-
-typedef struct {
-	model			*m;
-	backend			*a;
-	batch_scratch	*bs;
-	moe_expert_slot *slot_buf;
-	int				 li, top_k, inter, dim, n_tokens, use_gelu;
-	const float		*xb_base;
-	float			*all_scratch;
-	float			*all_outs;
-	size_t			 per_thread_scratch;
-	size_t			 per_expert_out;
-} moe_batch_job;
 
 int moe_topk_select(const float *scores, int n_experts, int top_k, int *top_idx, float *top_score) {
 	if (top_k <= 0)
@@ -236,15 +275,6 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 	}
 	return K;
 }
-
-typedef struct {
-	batch_scratch *bs;
-	layer_weights *L;
-	int			   E, K, rows;
-	int			   uses_softmax, norm_topk;
-	float		   routed_scale;
-	int			   n_group, topk_group;
-} moe_router_emit_job;
 
 static void moe_router_emit_chunk(int begin, int end, int tid, void *v) {
 	(void)tid;
@@ -774,13 +804,6 @@ static void moe_release_batch_slots(model *m, int li, batch_scratch *bs, int n_r
 	}
 }
 
-typedef struct {
-	int dim;
-	int K;
-	int I;
-	int use_gelu;
-} moe_exec_plan;
-
 static void moe_exec_plan_fill(moe_exec_plan *p, struct model *m) {
 	p->dim		= m->dim;
 	p->K		= m->moe.n_experts_used;
@@ -965,21 +988,6 @@ finish:
 	moe_release_batch_slots(ctx->m, ctx->li, ctx->bs, ctx->rows.n_rows, K, n_union);
 	return st;
 }
-
-typedef struct {
-	int			  is_moe;
-	int			  sh_inter;
-	int			  use_gelu;
-	int			  gate_up_fused;
-	const buffer *gate_w;
-	uint32_t	  gate_type;
-	const buffer *up_w;
-	uint32_t	  up_type;
-	const buffer *down_w;
-	uint32_t	  down_type;
-	const buffer *gate_up_w;
-	uint32_t	  gate_up_type;
-} moe_shared_plan;
 
 static int moe_shared_plan_fill(moe_shared_plan *p, struct model *m, int li) {
 	int is_moe = model_layer_is_moe(m, li);

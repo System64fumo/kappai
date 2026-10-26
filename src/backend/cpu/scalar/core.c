@@ -11,6 +11,8 @@
 #include <string.h>
 #include <unistd.h>
 
+enum { HC_SUPPORTED = 4 };
+
 typedef struct {
 	const float *qf;
 	float		*outf;
@@ -30,52 +32,36 @@ typedef struct {
 	float		 scale;
 } cpu_attn_mla_job;
 
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
+
+typedef struct {
+	float		*state;
+	const float *q, *k, *v, *g, *beta;
+	float		*out;
+	int			 head_dim;
+} kda_job;
+
+typedef struct {
+	const float *q_abs;
+	const float *cache;
+	const float *v_b;
+	float		*out;
+	float		*scratch;
+	int			 n_pos, kv_lora, v_head, scratch_stride;
+	float		 scale;
+} mla_job;
+
+static const float KDA_L2_EPS = 1e-6f;
+
 void detect_features(char *buf, size_t cap) {
 	snprintf(buf, cap, "generic");
-}
-
-status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, const buffer *k_in,
-					   const buffer *v_in, int n_kv_heads, int head_dim, int n_ctx,
-					   int n_kv_heads_active) {
-	cpu_priv	*p		  = self->priv;
-	const float *kf		  = cpu_ptr(k_in);
-	const float *vf		  = cpu_ptr(v_in);
-	int			 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-
-	if (p->kv_quant == KV_QUANT_Q8_0) {
-		size_t	 n_blocks	 = ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		size_t	 elem_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-		size_t	 kvh_stride	 = cpu_kv_layer_rows(p, layer, n_ctx) * elem_stride;
-		uint8_t *kd_base	 = (uint8_t *)k->handle;
-		uint8_t *vd_base	 = (uint8_t *)v->handle;
-		size_t	 layer_base	 = cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * kvh_stride, 1);
-		size_t	 slot		 = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
-											   kvh_stride, elem_stride, n_active);
-		size_t	 pos_off	 = slot * elem_stride;
-		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
-								 vf + ((size_t)kvh * head_dim), head_dim);
-		}
-		return OK;
-	}
-
-	uint16_t *kd_base	 = k->handle;
-	uint16_t *vd_base	 = v->handle;
-	int		  hd_stride	 = head_dim;
-	size_t	  kvh_stride = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
-	size_t	  layer_base =
-		cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * kvh_stride, sizeof(uint16_t));
-	size_t pos_off = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base,
-									 layer_base * sizeof(uint16_t), kvh_stride * sizeof(uint16_t),
-									 (size_t)hd_stride * sizeof(uint16_t), n_active) *
-					 hd_stride;
-	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		cpu_kv_put_f16_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
-							vf + ((size_t)kvh * head_dim), head_dim);
-	}
-	return OK;
 }
 
 static void cpu_rope_one(float *v, int n_heads, int head_dim, const float *rope_cos,
@@ -196,15 +182,6 @@ status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, 
 	}
 	return OK;
 }
-
-typedef struct {
-	float		*base;
-	int			 n_heads, head_dim, row_stride, pos_start;
-	float		 theta;
-	int			 neox;
-	const float *freq_factors;
-	const float *cos_base, *sin_base;
-} cpu_rope_ext_batch_job;
 
 static void cpu_rope_ext_batch_row(float *v, int n_heads, int half, const float *cs, int neox) {
 	rope_rotate_rows(v, n_heads, half * 2, half, cs, neox);
@@ -1139,12 +1116,6 @@ int32_t cpu_argmax_f32(const float *logits, int vocab) {
 	return best;
 }
 
-enum {
-	HC_SUPPORTED = 4,
-};
-
-static const float KDA_L2_EPS = 1e-6f;
-
 static status_code matmul_vec(backend *self, const backend_weight *w, const float *x, float *y,
 							  int n, int k) {
 	buffer		xb = buffer_host_view(self, (void *)x, (size_t)k * sizeof(float));
@@ -1293,13 +1264,6 @@ static void causal_conv_silu(float *state, const float *w, float *x, int channel
 	}
 }
 
-typedef struct {
-	float		*state;
-	const float *q, *k, *v, *g, *beta;
-	float		*out;
-	int			 head_dim;
-} kda_job;
-
 static void kda_heads(int begin, int end, int tid, void *arg) {
 	(void)tid;
 	kda_job	   *j	  = arg;
@@ -1406,16 +1370,6 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	}
 	return matmul_vec(self, &d->wo, o, d->out, dim, D);
 }
-
-typedef struct {
-	const float *q_abs;
-	const float *cache;
-	const float *v_b;
-	float		*out;
-	float		*scratch;
-	int			 n_pos, kv_lora, v_head, scratch_stride;
-	float		 scale;
-} mla_job;
 
 static void mla_heads(int begin, int end, int tid, void *arg) {
 	mla_job	 *j	  = arg;

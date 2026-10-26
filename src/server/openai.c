@@ -26,6 +26,7 @@
 
 #define MAX_BODY_BYTES (32 * 1024 * 1024)
 #define SSE_POLL_SEC 1
+#define TASK_STACK_BYTES ((size_t)16 << 20)
 
 typedef struct {
 	bool	 stream;
@@ -191,6 +192,17 @@ struct openai_state {
 };
 
 static sigset_t g_signal_mask;
+
+typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method);
+
+typedef struct {
+	const char *method;
+	const char *path;
+	route_fn	fn;
+} route;
+
+static oa_task *task_entering;
 
 static char *derive_model_id(const char *model_path) {
 	const char *base = path_basename(model_path);
@@ -1223,10 +1235,6 @@ static void slot_adopt_chat_chain(oa_slot *s, oa_job *j) {
 	s->n_msgs = cts->n_messages;
 }
 
-#define TASK_STACK_BYTES ((size_t)16 << 20)
-
-static oa_task *task_entering;
-
 static void fail_job(openai_state *st, oa_job *j) {
 	oa_gen *g	 = &j->rc->gen;
 	g->generated = -1;
@@ -1637,15 +1645,6 @@ static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *con
 		return respond_auth_failure(st, conn);
 	return respond_json(conn, MHD_HTTP_OK, models_body(st));
 }
-
-typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
-									const char *url, const char *method);
-
-typedef struct {
-	const char *method;
-	const char *path;
-	route_fn	fn;
-} route;
 
 static const route routes[] = {
 	{"GET", "/health", route_health},

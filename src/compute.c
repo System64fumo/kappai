@@ -5,12 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define compute_model_changed(s, m, n_ctx)                                                         \
-	((s)->model.last_model != (m) || (s)->model.allocated_n_ctx < (n_ctx))
-
-void compute_scratch_init(compute_scratch *s) {
-	memset(s, 0, sizeof(*s));
-}
+#define ROPE_TABLE_BLOCK 4096
 
 typedef struct {
 	float *cos_out;
@@ -20,7 +15,9 @@ typedef struct {
 	double theta_scale;
 } rope_table_job;
 
-#define ROPE_TABLE_BLOCK 4096
+void compute_scratch_init(compute_scratch *s) {
+	memset(s, 0, sizeof(*s));
+}
 
 static void rope_table_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
@@ -136,23 +133,15 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	s->moe.slot_dev = NULL;
 	expert_dev_scratch_release(&s->moe.expert_dev);
 
-#define FREE_FLOAT_BUF(field)                                                                      \
-	do {                                                                                           \
-		free(s->field.p);                                                                          \
-		s->field.p	 = NULL;                                                                       \
-		s->field.cap = 0;                                                                          \
-	} while (0)
-	FREE_FLOAT_BUF(hybrid.host);
-	FREE_FLOAT_BUF(hybrid.host2);
-	FREE_FLOAT_BUF(hybrid.gdn_ws);
-	FREE_FLOAT_BUF(run.op_ws);
-	FREE_FLOAT_BUF(run.stage_a);
-	FREE_FLOAT_BUF(run.stage_b);
-	FREE_FLOAT_BUF(hybrid.gdn_z);
-	FREE_FLOAT_BUF(hybrid.gdn_alpha);
-	FREE_FLOAT_BUF(hybrid.gdn_beta);
-	FREE_FLOAT_BUF(hybrid.gdn_out);
-#undef FREE_FLOAT_BUF
+	float_buf *buffers[] = {
+		&s->hybrid.host,	 &s->hybrid.host2,	 &s->hybrid.gdn_ws, &s->run.op_ws,
+		&s->run.stage_a,	 &s->run.stage_b,	 &s->hybrid.gdn_z,	&s->hybrid.gdn_alpha,
+		&s->hybrid.gdn_beta, &s->hybrid.gdn_out,
+	};
+	for (size_t i = 0; i < ARRAY_LEN(buffers); i++) {
+		free(buffers[i]->p);
+		*buffers[i] = (float_buf){0};
+	}
 
 	if (s->bs) {
 		batch_scratch_free(s->bs);
@@ -233,7 +222,7 @@ void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, in
 }
 
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
-	if (!compute_model_changed(s, m, n_ctx))
+	if (s->model.last_model == m && s->model.allocated_n_ctx >= n_ctx)
 		return OK;
 
 	scratch_free_device_buffers(s);

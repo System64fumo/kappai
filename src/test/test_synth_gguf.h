@@ -93,6 +93,8 @@ typedef struct {
 } tsg_dsa_spec;
 
 void	 tsg_seed(uint64_t s);
+void	 tsg_build_array_file(const char *path, uint32_t type, uint64_t count, const void *data,
+							  size_t bytes);
 uint32_t tsg_rand(void);
 void	 tsg_build_vocab_file(const char *path, const char *model_name, const char *pre,
 							  int has_space_flag, int space_flag, const char *const *tokens,

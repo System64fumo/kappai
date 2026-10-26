@@ -4616,6 +4616,11 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_kv_put(ref, tgt, 4, 64, 1024, 0);
 	test_op_kv_put(ref, tgt, 4, 64, 1024, 127);
 	test_op_kv_put(ref, tgt, 8, 128, 2048, 511);
+	if (backend_has_cap(ref, BCAP_IS_HOST) && backend_has_cap(tgt, BCAP_IS_HOST)) {
+		test_op_kv_put(ref, tgt, 3, 1, 16, 0);
+		test_op_kv_put(ref, tgt, 3, 7, 16, 5);
+		test_op_kv_put(ref, tgt, 3, 33, 16, 15);
+	}
 	test_op_kv_put_batch(ref, tgt, 4, 64, 1024, 0, 7);
 	test_op_kv_put_batch(ref, tgt, 8, 128, 2048, 511, 33);
 	test_model_kv_size_shared();

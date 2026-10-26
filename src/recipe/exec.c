@@ -1,5 +1,47 @@
 #include "recipe/internal.h"
 
+typedef status_code (*op_handler)(exec_ctx *ctx);
+
+typedef struct {
+	const recipe_op *op;
+	op_handler		 fn;
+	uint32_t		 caps;
+	int				 node;
+	int				 op_index;
+	_Atomic uint64_t us;
+	_Atomic uint64_t calls;
+} exec_step;
+
+typedef struct {
+	exec_step		*steps;
+	int				 n_steps;
+	const recipe_op *ops;
+	int				 n_ops;
+} exec_schedule;
+
+struct exec_plan {
+	exec_schedule  pre;
+	exec_schedule  post;
+	exec_schedule *layer;
+	int			   n_variants;
+	int			   n_layers;
+	int			   post_reads_logits;
+	weight_ref	 **wtab;
+};
+
+typedef struct {
+	struct model		   *m;
+	row_desc				rows;
+	struct compute_scratch *s;
+	batch_scratch		   *bs;
+	int						li;
+	int						flash_attn;
+	const struct cg_set	   *graphs;
+	const struct exec_plan *plan;
+} layer_run;
+
+static const op_handler g_op_handlers[OP_KIND_COUNT];
+
 uint32_t ple_inject_caps(const backend *a) {
 	return (backend_has_cap(a, BCAP_IS_HOST) ? 0 : PLE_CAP_HEAP) |
 		   (a->matmul_ffn_down_batch ? PLE_CAP_FUSED_DOWN : 0) |
@@ -38,10 +80,6 @@ static uint32_t exec_pick_caps(op_kind kind, const backend *a) {
 static inline int backend_native_or_host(const backend *a, int has_fn) {
 	return has_fn || backend_has_cap(a, BCAP_IS_HOST);
 }
-
-typedef status_code (*op_handler)(exec_ctx *ctx);
-
-static const op_handler g_op_handlers[OP_KIND_COUNT];
 
 static op_handler exec_pick_variant(const recipe_op *op, const backend *a) {
 	switch (op->kind) {
@@ -96,44 +134,6 @@ static op_handler exec_pick_variant(const recipe_op *op, const backend *a) {
 		return NULL;
 	}
 }
-
-typedef struct {
-	const recipe_op *op;
-	op_handler		 fn;
-	uint32_t		 caps;
-	int				 node;
-	int				 op_index;
-	_Atomic uint64_t us;
-	_Atomic uint64_t calls;
-} exec_step;
-
-typedef struct {
-	exec_step		*steps;
-	int				 n_steps;
-	const recipe_op *ops;
-	int				 n_ops;
-} exec_schedule;
-
-struct exec_plan {
-	exec_schedule  pre;
-	exec_schedule  post;
-	exec_schedule *layer;
-	int			   n_variants;
-	int			   n_layers;
-	int			   post_reads_logits;
-	weight_ref	 **wtab;
-};
-
-typedef struct {
-	struct model		   *m;
-	row_desc				rows;
-	struct compute_scratch *s;
-	batch_scratch		   *bs;
-	int						li;
-	int						flash_attn;
-	const struct cg_set	   *graphs;
-	const struct exec_plan *plan;
-} layer_run;
 
 static exec_ctx layer_run_ctx(layer_run *w) {
 	model	*m		  = w->m;

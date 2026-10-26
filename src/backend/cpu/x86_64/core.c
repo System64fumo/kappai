@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+enum { HC_SUPPORTED = 4 };
+
 typedef struct {
 	const float *g, *u;
 	float		*o;
@@ -14,110 +16,33 @@ typedef struct {
 	int			 activation;
 } cpu_ffn_act_batch_args;
 
-status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, const buffer *k_in,
-					   const buffer *v_in, int n_kv_heads, int head_dim, int n_ctx,
-					   int n_kv_heads_active) {
-	cpu_priv	*p		  = self->priv;
-	const float *kf		  = (const float *)cpu_ptr(k_in);
-	const float *vf		  = (const float *)cpu_ptr(v_in);
-	int			 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} x86_rope_ext_batch_job;
 
-	if (p->kv_quant == KV_QUANT_Q8_0) {
-		int		 hd_stride	  = head_dim;
-		size_t	 n_blocks	  = ((size_t)hd_stride + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		size_t	 block_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-		size_t	 kvh_stride	  = cpu_kv_layer_rows(p, layer, n_ctx) * block_stride;
-		size_t	 layer_stride = (size_t)n_kv_heads * kvh_stride;
-		uint8_t *kd_base	  = (uint8_t *)k->handle;
-		uint8_t *vd_base	  = (uint8_t *)v->handle;
-		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t layer_base = cpu_kv_layer_base(p, layer, layer_stride, 1);
-			size_t pos_off	  = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
-												kvh_stride, block_stride, n_active) *
-								block_stride;
-			size_t off		  = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
-								 vf + ((size_t)kvh * head_dim), head_dim);
-		}
-		return OK;
-	}
-	uint16_t *kd_base	   = (uint16_t *)cpu_ptr(k);
-	uint16_t *vd_base	   = (uint16_t *)cpu_ptr(v);
-	int		  hd_stride	   = head_dim;
-	size_t	  kvh_stride   = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
-	size_t	  layer_stride = (size_t)n_kv_heads * kvh_stride;
+typedef struct {
+	float		*state;
+	const float *q, *k, *v, *g, *beta;
+	float		*out;
+	int			 head_dim;
+} kda_job;
 
-	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t layer_base = cpu_kv_layer_base(p, layer, layer_stride, sizeof(uint16_t));
-		size_t pos_off =
-			cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base * sizeof(uint16_t),
-							kvh_stride * sizeof(uint16_t), (size_t)hd_stride * sizeof(uint16_t),
-							n_active) *
-			hd_stride;
-		size_t		 off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		uint16_t	*kd	 = kd_base + off;
-		uint16_t	*vd	 = vd_base + off;
-		const float *kfh = kf + ((size_t)kvh * head_dim);
-		const float *vfh = vf + ((size_t)kvh * head_dim);
-		int			 i	 = 0;
-		for (; i + 32 <= head_dim; i += 32) {
-			__m256 k0 = _mm256_loadu_ps(kfh + i);
-			__m256 k1 = _mm256_loadu_ps(kfh + i + 8);
-			__m256 k2 = _mm256_loadu_ps(kfh + i + 16);
-			__m256 k3 = _mm256_loadu_ps(kfh + i + 24);
-			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(kd + i + 8),
-							 _mm256_cvtps_ph(k1, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(kd + i + 16),
-							 _mm256_cvtps_ph(k2, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(kd + i + 24),
-							 _mm256_cvtps_ph(k3, _MM_FROUND_TO_NEAREST_INT));
+typedef struct {
+	const float *q_abs;
+	const float *cache;
+	const float *v_b;
+	float		*out;
+	float		*scratch;
+	int			 n_pos, kv_lora, v_head, scratch_stride;
+	float		 scale;
+} mla_job;
 
-			__m256 v0 = _mm256_loadu_ps(vfh + i);
-			__m256 v1 = _mm256_loadu_ps(vfh + i + 8);
-			__m256 v2 = _mm256_loadu_ps(vfh + i + 16);
-			__m256 v3 = _mm256_loadu_ps(vfh + i + 24);
-			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(vd + i + 8),
-							 _mm256_cvtps_ph(v1, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(vd + i + 16),
-							 _mm256_cvtps_ph(v2, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(vd + i + 24),
-							 _mm256_cvtps_ph(v3, _MM_FROUND_TO_NEAREST_INT));
-		}
-		for (; i + 16 <= head_dim; i += 16) {
-			__m256 k0 = _mm256_loadu_ps(kfh + i);
-			__m256 k1 = _mm256_loadu_ps(kfh + i + 8);
-			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(kd + i + 8),
-							 _mm256_cvtps_ph(k1, _MM_FROUND_TO_NEAREST_INT));
-
-			__m256 v0 = _mm256_loadu_ps(vfh + i);
-			__m256 v1 = _mm256_loadu_ps(vfh + i + 8);
-			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storeu_si128((__m128i *)(vd + i + 8),
-							 _mm256_cvtps_ph(v1, _MM_FROUND_TO_NEAREST_INT));
-		}
-		for (; i + 8 <= head_dim; i += 8) {
-			__m256 k0 = _mm256_loadu_ps(kfh + i);
-			_mm_storeu_si128((__m128i *)(kd + i), _mm256_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
-
-			__m256 v0 = _mm256_loadu_ps(vfh + i);
-			_mm_storeu_si128((__m128i *)(vd + i), _mm256_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
-		}
-		for (; i + 4 <= head_dim; i += 4) {
-			__m128 k0 = _mm_loadu_ps(kfh + i);
-			__m128 v0 = _mm_loadu_ps(vfh + i);
-			_mm_storel_epi64((__m128i *)(kd + i), _mm_cvtps_ph(k0, _MM_FROUND_TO_NEAREST_INT));
-			_mm_storel_epi64((__m128i *)(vd + i), _mm_cvtps_ph(v0, _MM_FROUND_TO_NEAREST_INT));
-		}
-		for (; i < head_dim; i++) {
-			kd[i] = f32_to_f16(kfh[i]);
-			vd[i] = f32_to_f16(vfh[i]);
-		}
-	}
-	return OK;
-}
+static const float KDA_L2_EPS = 1e-6f;
 
 static void cpu_rope_neox_one_avx(float *vh, int half, const float *rope_cos,
 								  const float *rope_sin) {
@@ -302,15 +227,6 @@ status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, 
 	cpu_run_batch(p->pool, m, cpu_rope_qk_batch_chunk_avx, &job);
 	return OK;
 }
-
-typedef struct {
-	float		*base;
-	int			 n_heads, head_dim, row_stride, pos_start;
-	float		 theta;
-	int			 neox;
-	const float *freq_factors;
-	const float *cos_base, *sin_base;
-} x86_rope_ext_batch_job;
 
 status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
 						 const float *rope_cos_base, const float *rope_sin_base,
@@ -1962,12 +1878,6 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	return OK;
 }
 
-enum {
-	HC_SUPPORTED = 4,
-};
-
-static const float KDA_L2_EPS = 1e-6f;
-
 static inline void scale_vec_f32(float *restrict x, float s, int n) {
 	__m256 s_v = _mm256_set1_ps(s);
 	int	   i   = 0;
@@ -2192,13 +2102,6 @@ static void causal_conv_silu(float *state, const float *w, float *x, int channel
 	}
 }
 
-typedef struct {
-	float		*state;
-	const float *q, *k, *v, *g, *beta;
-	float		*out;
-	int			 head_dim;
-} kda_job;
-
 static void kda_heads(int begin, int end, int tid, void *arg) {
 	(void)tid;
 	kda_job	   *j	  = arg;
@@ -2291,16 +2194,6 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	}
 	return matmul_vec(self, &d->wo, o, d->out, dim, D);
 }
-
-typedef struct {
-	const float *q_abs;
-	const float *cache;
-	const float *v_b;
-	float		*out;
-	float		*scratch;
-	int			 n_pos, kv_lora, v_head, scratch_stride;
-	float		 scale;
-} mla_job;
 
 static void mla_heads(int begin, int end, int tid, void *arg) {
 	mla_job	 *j	  = arg;

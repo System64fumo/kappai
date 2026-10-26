@@ -36,44 +36,6 @@ typedef struct tlocal_slot {
 	struct tlocal_slot *next;
 } tlocal_slot;
 
-static void tlocal_cleanup(void *v) {
-	tlocal_slot *s = v;
-	while (s) {
-		if (s->ptr && *s->ptr) {
-			free(*s->ptr);
-			*s->ptr = NULL;
-		}
-		tlocal_slot *n = s->next;
-		free(s);
-		s = n;
-	}
-}
-
-static pthread_once_t tlocal_once = PTHREAD_ONCE_INIT;
-static pthread_key_t  tlocal_key  = 0;
-
-static void tlocal_key_make(void) {
-	pthread_key_create(&tlocal_key, tlocal_cleanup);
-}
-
-void tlocal_register(void **tls_ptr) {
-	pthread_once(&tlocal_once, tlocal_key_make);
-	for (tlocal_slot *s = pthread_getspecific(tlocal_key); s; s = s->next)
-		if (s->ptr == tls_ptr)
-			return;
-	tlocal_slot *s = xmalloc(sizeof(*s));
-	s->ptr		   = tls_ptr;
-	s->next		   = pthread_getspecific(tlocal_key);
-	pthread_setspecific(tlocal_key, s);
-}
-
-void tlocal_free_all(void) {
-	if (!tlocal_key)
-		return;
-	tlocal_cleanup(pthread_getspecific(tlocal_key));
-	pthread_setspecific(tlocal_key, NULL);
-}
-
 typedef struct {
 	_Atomic uint64_t total_items;
 	_Atomic uint64_t total_busy_ns;
@@ -86,22 +48,6 @@ typedef struct {
 	tpool *pool;
 	long   tid;
 } tpool_thread_arg;
-
-static inline void tpool_run_timed(tpool_slot *slot, tpool_chunk_fn fn, int begin, int end, int tid,
-								   void *ctx, int stats_enabled) {
-	int n = end - begin;
-	if (n <= 0)
-		return;
-	if (!stats_enabled) {
-		fn(begin, end, tid, ctx);
-		return;
-	}
-	long long t0 = time_ns();
-	fn(begin, end, tid, ctx);
-	long long t1 = time_ns();
-	atomic_fetch_add_explicit(&slot->total_items, (uint64_t)n, memory_order_relaxed);
-	atomic_fetch_add_explicit(&slot->total_busy_ns, (uint64_t)(t1 - t0), memory_order_relaxed);
-}
 
 typedef struct {
 	_Atomic tpool_chunk_fn job_fn;
@@ -139,7 +85,60 @@ struct tpool {
 	int						stats_enabled;
 };
 
-static __thread int tpool_cur_tid = -1;
+static __thread int	  tpool_cur_tid = -1;
+static pthread_once_t tlocal_once	= PTHREAD_ONCE_INIT;
+static pthread_key_t  tlocal_key	= 0;
+
+static void tlocal_cleanup(void *v) {
+	tlocal_slot *s = v;
+	while (s) {
+		if (s->ptr && *s->ptr) {
+			free(*s->ptr);
+			*s->ptr = NULL;
+		}
+		tlocal_slot *n = s->next;
+		free(s);
+		s = n;
+	}
+}
+
+static void tlocal_key_make(void) {
+	pthread_key_create(&tlocal_key, tlocal_cleanup);
+}
+
+void tlocal_register(void **tls_ptr) {
+	pthread_once(&tlocal_once, tlocal_key_make);
+	for (tlocal_slot *s = pthread_getspecific(tlocal_key); s; s = s->next)
+		if (s->ptr == tls_ptr)
+			return;
+	tlocal_slot *s = xmalloc(sizeof(*s));
+	s->ptr		   = tls_ptr;
+	s->next		   = pthread_getspecific(tlocal_key);
+	pthread_setspecific(tlocal_key, s);
+}
+
+void tlocal_free_all(void) {
+	if (!tlocal_key)
+		return;
+	tlocal_cleanup(pthread_getspecific(tlocal_key));
+	pthread_setspecific(tlocal_key, NULL);
+}
+
+static inline void tpool_run_timed(tpool_slot *slot, tpool_chunk_fn fn, int begin, int end, int tid,
+								   void *ctx, int stats_enabled) {
+	int n = end - begin;
+	if (n <= 0)
+		return;
+	if (!stats_enabled) {
+		fn(begin, end, tid, ctx);
+		return;
+	}
+	long long t0 = time_ns();
+	fn(begin, end, tid, ctx);
+	long long t1 = time_ns();
+	atomic_fetch_add_explicit(&slot->total_items, (uint64_t)n, memory_order_relaxed);
+	atomic_fetch_add_explicit(&slot->total_busy_ns, (uint64_t)(t1 - t0), memory_order_relaxed);
+}
 
 int tpool_current_tid(void) {
 	return tpool_cur_tid;

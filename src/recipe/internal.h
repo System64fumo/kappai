@@ -46,12 +46,6 @@ enum { MLA_QKV_MULTI = 1u << 0 };
 enum { GDN_NATIVE = 1u << 0 };
 
 typedef struct {
-	const weight_ref *w;
-	buffer			 *y;
-	int				  n;
-} matmul_fallback_item;
-
-typedef struct {
 	float_buf fb;
 	buffer	  b;
 } bs_pair;
@@ -136,41 +130,6 @@ struct batch_scratch {
 	buffer	  ple_slice_dev;
 	buffer	  ple_proj_dev;
 };
-
-typedef struct {
-	model				  *m;
-	int					   li;
-	int					   top_k, inter, dim;
-	int					   any_fused, use_gelu;
-	int					   xb_q8_gate_ok;
-	uint32_t			   gate_q8_type;
-	const moe_expert_slot *slot_buf;
-	const int			  *expert_ids;
-	const float			  *weights;
-	const float			  *xb_f;
-	const buffer		  *xb_q8_gate;
-	backend				  *a;
-	float				  *all_scratch;
-	size_t				   per_thread_scratch;
-	float				  *all_outs;
-	size_t				   per_expert_out;
-	_Atomic int			   first_err;
-	_Atomic int			   n_err;
-} moe_par_job;
-
-typedef struct {
-	moe_resident_expert *experts;
-	int					*counts;
-	int					*idx;
-	int					*rows_packed;
-	float				*weights_packed;
-	backend			   **owners;
-} moe_pack;
-
-typedef struct {
-	moe_stream_op *op;
-	moe_par_job	  *job;
-} moe_fused_job;
 
 int						matmul_type_ok(const backend *a, uint32_t t);
 int						ple_build_dev_path_cached(const struct model *m, backend *a, int batched);

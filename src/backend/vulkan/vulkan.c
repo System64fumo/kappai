@@ -39,22 +39,6 @@
 #define VK_ATTN_DEC_MIN_CHUNK 16
 #define VK_PROF_NAMES 128
 
-static inline uint32_t vk_f32_to_bits(float f) {
-	union {
-		float	 v;
-		uint32_t b;
-	} u = {.v = f};
-	return u.b;
-}
-
-static inline float vk_f32_from_bits(uint32_t b) {
-	union {
-		uint32_t b;
-		float	 v;
-	} u = {.b = b};
-	return u.v;
-}
-
 enum elem_mode {
 	ELEM_MODE_COPY			   = 0,
 	ELEM_MODE_ADD_INPLACE	   = 1,
@@ -130,6 +114,13 @@ typedef struct {
 	VkDeviceSize			  sub_off;
 	VkDeviceSize			  sub_size;
 } vk_buf;
+
+typedef struct {
+	vk_buf		*cos_b;
+	vk_buf		*sin_b;
+	VkDeviceSize cos_off;
+	VkDeviceSize sin_off;
+} vk_rope_tables;
 
 typedef struct vk_suballoc_range {
 	VkDeviceSize off;
@@ -458,6 +449,22 @@ typedef struct {
 	} debug;
 
 } vk_priv;
+
+static inline uint32_t vk_f32_to_bits(float f) {
+	union {
+		float	 v;
+		uint32_t b;
+	} u = {.v = f};
+	return u.b;
+}
+
+static inline float vk_f32_from_bits(uint32_t b) {
+	union {
+		uint32_t b;
+		float	 v;
+	} u = {.b = b};
+	return u.v;
+}
 
 static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed);
 
@@ -6442,13 +6449,6 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)n_rows, 0x3);
 }
-
-typedef struct {
-	vk_buf		*cos_b;
-	vk_buf		*sin_b;
-	VkDeviceSize cos_off;
-	VkDeviceSize sin_off;
-} vk_rope_tables;
 
 static status_code vk_rope_tables_get(backend *self, int head_dim, const float *rope_cos_base,
 									  const float *rope_sin_base, const float *freq_factors,

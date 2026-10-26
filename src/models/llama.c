@@ -75,25 +75,8 @@ static model_recipe *build_standard_recipe(const model *m) {
 
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 
-		if (m->layers[0].gate_up_fused) {
-			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP,
-								  2 * intermediate, dim, STAGE_MATMUL));
-			OP_EMIT(&e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT,
-											  intermediate, act));
-		} else if (has_matmul_multi) {
-			OP_EMIT(&e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
-										 WIDX_GATE, intermediate, intermediate, dim));
-		} else {
-			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, intermediate,
-								  dim, STAGE_MATMUL));
-			OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, intermediate, dim,
-								  STAGE_MATMUL));
-		}
-
-		if (!m->layers[0].gate_up_fused) {
-			OP_EMIT(&e, mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
-										RECIPE_SLOT_FFN_ACT, intermediate, act));
-		}
+		recipe_emit_ffn_activation(&e, dim, intermediate, m->layers[0].gate_up_fused,
+								   has_matmul_multi, act);
 
 		if (can_fuse_ffn_residual) {
 			OP_EMIT(&e, mk_matmul_residual(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_X,

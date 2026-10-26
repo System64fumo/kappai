@@ -186,6 +186,7 @@ void		run_hcs_tests(void);
 void		run_mempool_tests(void);
 void		run_moe_tier_tests(void);
 void		run_plan_tests(void);
+void		run_gguf_tests(void);
 void		test_quant_determinism(backend *ref, const qtype_info *qt);
 void		test_quant_finiteness(backend *ref, const qtype_info *qt);
 void		test_quant_q8_0_roundtrip(backend *ref);

@@ -1113,20 +1113,10 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
 }
 
-static status_code upload_one(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
-							  uint64_t d1, weight_class wc) {
-	return upload_one_to(m, ref, wtype, ndims, d0, d1, wc, m->backend);
-}
-
 static status_code upload_one_repack_to(model *m, weight_ref *ref, int ndims, uint64_t d0,
 										uint64_t d1, weight_class wc, backend *target) {
 	return upload_tensor_repack_to(m, ref->host_ptr, &ref->type, ndims, d0, d1, wc, target,
 								   &ref->buf);
-}
-
-static status_code upload_one_repack(model *m, weight_ref *ref, int ndims, uint64_t d0, uint64_t d1,
-									 weight_class wc) {
-	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, m->backend);
 }
 
 static int tied_output_shares_buffer(const model *m) {
@@ -1148,7 +1138,8 @@ static void progress_step(progress *prog) {
 static status_code upload_embeddings(model *m, progress *prog) {
 	status_code s;
 
-	s = upload_one(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING);
+	s = upload_one_to(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING,
+					  m->backend);
 	if (s != OK) {
 		ERROR("model_upload: token_embd upload failed (%d)", s);
 		return s;
@@ -1159,7 +1150,7 @@ static status_code upload_embeddings(model *m, progress *prog) {
 		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
 							   MADV_RANDOM);
 	}
-	s = upload_one(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
+	s = upload_one_to(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM, m->backend);
 	if (s != OK) {
 		ERROR("model_upload: output_norm upload failed (%d)", s);
 		return s;
@@ -1169,7 +1160,8 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	if (tied_output_shares_buffer(m)) {
 		m->output_w.buf = m->tok_embd.buf;
 	} else {
-		s = upload_one_repack(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL);
+		s = upload_one_repack_to(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL,
+								 m->backend);
 		if (s != OK) {
 			ERROR("model_upload: output head upload failed (%d)", s);
 			return s;
@@ -1178,24 +1170,25 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	progress_step(prog);
 
 	if (m->has_per_layer_embeddings) {
-		s = upload_one(m, &m->layer_dims.per_layer_tok_embd, m->layer_dims.per_layer_tok_embd.type,
-					   2, (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
-					   WCLASS_EMBEDDING);
+		s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
+						  m->layer_dims.per_layer_tok_embd.type, 2,
+						  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
+						  WCLASS_EMBEDDING, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
 			return s;
 		}
 		progress_step(prog);
-		s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
-							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
-							  WCLASS_MATMUL);
+		s = upload_one_repack_to(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
+								 (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
+								 WCLASS_MATMUL, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
 			return s;
 		}
 		progress_step(prog);
-		s = upload_one(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
-					   m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM);
+		s = upload_one_to(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
+						  m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_proj_norm upload failed (%d)", s);
 			return s;
@@ -1204,7 +1197,8 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	}
 	if (m->rope_freqs_count > 0) {
 		m->rope_freqs_w.host_ptr = m->rope_freqs;
-		s = upload_one(m, &m->rope_freqs_w, GGML_TYPE_F32, 1, m->rope_freqs_count, 0, WCLASS_MISC);
+		s = upload_one_to(m, &m->rope_freqs_w, GGML_TYPE_F32, 1, m->rope_freqs_count, 0,
+						  WCLASS_MISC, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: rope_freqs upload failed (%d)", s);
 			return s;

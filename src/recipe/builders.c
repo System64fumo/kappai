@@ -1,13 +1,6 @@
 #include "recipe/internal.h"
 
 static recipe_op mk_op_base(op_kind kind, uint8_t in0, uint8_t in1, uint8_t in2, uint8_t out,
-							uint8_t widx, stage stg);
-
-recipe_op mk_backend_op(op_kind kind, uint8_t in, uint8_t out, uint8_t widx, stage stage) {
-	return mk_op_base(kind, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, widx, stage);
-}
-
-static recipe_op mk_op_base(op_kind kind, uint8_t in0, uint8_t in1, uint8_t in2, uint8_t out,
 							uint8_t widx, stage stg) {
 	recipe_op op = {
 		.kind  = kind,
@@ -19,6 +12,10 @@ static recipe_op mk_op_base(op_kind kind, uint8_t in0, uint8_t in1, uint8_t in2,
 		.stage = stg,
 	};
 	return op;
+}
+
+recipe_op mk_backend_op(op_kind kind, uint8_t in, uint8_t out, uint8_t widx, stage stage) {
+	return mk_op_base(kind, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, widx, stage);
 }
 
 recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage stage) {
@@ -47,17 +44,27 @@ recipe_op mk_copy_k_to_v(uint8_t k_slot, uint8_t v_slot) {
 					  RECIPE_NO_WEIGHT, STAGE_MATMUL);
 }
 
-void recipe_pack_per_layer_ops(model_recipe *r, int n_layers, int cap, int max_ops) {
+void recipe_build_layers(model_recipe *r, const model *m, int cap, const char *arch_name,
+						 void (*append_layer)(op_emitter *, const model *, int)) {
+	r->layer.ops	 = xcalloc((size_t)cap, sizeof(recipe_op));
+	r->layer.n_ops	 = cap;
+	r->per_layer_ops = xcalloc((size_t)m->n_layers * cap, sizeof(recipe_op));
+	int max_ops		 = 0;
+	for (int li = 0; li < m->n_layers; li++) {
+		op_emitter e = op_emitter_make(r->per_layer_ops + (size_t)li * cap, cap, arch_name);
+		append_layer(&e, m, li);
+		if (e.count > max_ops)
+			max_ops = e.count;
+	}
 	if (max_ops <= 0 || max_ops >= cap)
 		return;
-	for (int li = 0; li < n_layers; li++) {
+	for (int li = 1; li < m->n_layers; li++) {
 		recipe_op *src = r->per_layer_ops + (size_t)li * cap;
 		recipe_op *dst = r->per_layer_ops + (size_t)li * (size_t)max_ops;
-		if (dst != src)
-			memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
+		memmove(dst, src, (size_t)max_ops * sizeof(recipe_op));
 	}
 	r->per_layer_ops =
-		xrealloc(r->per_layer_ops, (size_t)n_layers * (size_t)max_ops * sizeof(recipe_op));
+		xrealloc(r->per_layer_ops, (size_t)m->n_layers * (size_t)max_ops * sizeof(recipe_op));
 	r->layer.n_ops = max_ops;
 }
 
@@ -341,62 +348,54 @@ static recipe_op mk_moe_shared(uint8_t in, int n, int k) {
 	return op;
 }
 
-int recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li) {
-	return recipe_append_dense_ffn_ex(ops, i, m, li, WIDX_FFN_NORM);
-}
-
-int recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
-							   uint8_t norm_widx) {
-	int	  dim			   = m->dim;
-	int	  inter			   = m->intermediate;
-	float eps			   = m->norm_eps;
-	int	  has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
-	int	  gate_up_fused	   = li >= 0 && m->layers[li].gate_up_fused;
-	int	  act =
-		m->arch_info && m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
-
-	ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD);
-	ops[i++] = mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, norm_widx, eps, STAGE_RMSNORM);
-
+void recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_fused,
+								int has_matmul_multi, int act) {
 	if (gate_up_fused) {
-		ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP, 2 * inter, dim,
-							 STAGE_MATMUL);
-		ops[i++] = mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT, inter, act);
-	} else {
-		if (has_matmul_multi) {
-			ops[i++] = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
-										WIDX_GATE, inter, inter, dim);
-		} else {
-			ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter, dim,
-								 STAGE_MATMUL);
-			ops[i++] =
-				mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL);
-		}
-		ops[i++] = mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_FFN_ACT,
-								   inter, act);
+		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE_UP, WIDX_GATE_UP, 2 * inter, dim,
+							 STAGE_MATMUL));
+		OP_EMIT(e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT, inter, act));
+		return;
 	}
-	ops[i++] = mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter, STAGE_MATMUL);
-	ops[i++] = mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD);
-	return i;
+	if (has_matmul_multi) {
+		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
+									WIDX_GATE, inter, inter, dim));
+	} else {
+		OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, WIDX_GATE, inter, dim,
+							 STAGE_MATMUL));
+		OP_EMIT(e,
+				mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL));
+	}
+	OP_EMIT(e, mk_ffn_activate(RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP, RECIPE_SLOT_FFN_ACT, inter,
+							   act));
 }
 
-int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
-						  uint8_t experts_in_slot, uint8_t out_slot) {
+void recipe_emit_dense_ffn(op_emitter *e, const model *m, int li, uint8_t norm_widx) {
+	int act =
+		m->arch_info && m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
+	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD));
+	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, norm_widx, m->norm_eps, STAGE_RMSNORM));
+	recipe_emit_ffn_activation(e, m->dim, m->intermediate, li >= 0 && m->layers[li].gate_up_fused,
+							   backend_has_cap(m->backend, BCAP_MULTI_MATMUL), act);
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, m->dim, m->intermediate,
+						 STAGE_MATMUL));
+	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
+}
+
+void recipe_emit_moe_ffn(op_emitter *e, const struct model *m, uint8_t router_in_slot,
+						 uint8_t experts_in_slot, uint8_t out_slot) {
 	int dim		  = m->dim;
 	int moe_inter = m->moe.moe_intermediate;
 
-	ops[i++] = mk_moe_router(router_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
-							 m->moe.n_experts, dim);
+	OP_EMIT(e, mk_moe_router(router_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
+							 m->moe.n_experts, dim));
 
 	if (m->moe.n_shared_experts > 0) {
 		int sh_inter = moe_inter * m->moe.n_shared_experts;
-		ops[i++]	 = mk_moe_shared(experts_in_slot, sh_inter, dim);
+		OP_EMIT(e, mk_moe_shared(experts_in_slot, sh_inter, dim));
 	}
 
-	ops[i++] = mk_moe_experts(experts_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
-							  out_slot, dim, moe_inter);
-
-	return i;
+	OP_EMIT(e, mk_moe_experts(experts_in_slot, RECIPE_SLOT_ROUTER_IDS, RECIPE_SLOT_ROUTER_W,
+							  out_slot, dim, moe_inter));
 }
 
 void recipe_build_pre_ops(model_recipe *r, const model *m) {
