@@ -258,8 +258,8 @@ static void report(const mem_plan *p, int aliasing) {
 	}
 	DEBUG("memory plan: %d slots in %d buffers (aliasing %s), %zu B/row vs %zu B/row unaliased, "
 		  "%zu MiB at %d rows",
-		 p->n_slots, p->n_buffers, aliasing ? "on" : "off", shared, separate,
-		 (shared * REPORT_ROWS) >> 20, REPORT_ROWS);
+		  p->n_slots, p->n_buffers, aliasing ? "on" : "off", shared, separate,
+		  (shared * REPORT_ROWS) >> 20, REPORT_ROWS);
 }
 
 mem_plan *mem_plan_build(const cg_set *graphs, const struct model *m) {

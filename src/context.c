@@ -905,6 +905,9 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 
 	int pos = c->kv.n_pos;
 
+	status_code est = compute_scratch_ensure(&c->scratch, &c->m, c->kv.n_ctx);
+	if (est != OK)
+		return (int)est;
 	int chunk = context_prefill_chunk_size(c, tpool_n_threads(tpool_fetch_pool()));
 	compute_scratch_reserve_rows(&c->m, &c->scratch, chunk);
 	if (chunk > n)

@@ -446,6 +446,7 @@ static void t_batch_boundary_lengths(void) {
 	{
 		const int lens[3] = {ck - 1, ck, ck + 1};
 		int		  all_ok  = 1;
+		float	  worst	  = 0;
 		for (int li = 0; li < 3; li++) {
 			int		L = lens[li];
 			context t;
@@ -482,8 +483,11 @@ static void t_batch_boundary_lengths(void) {
 					maxdiff = d;
 			}
 			if (pf.rc != n || rst != OK || maxdiff > 2e-3f ||
-				count_nonfinite(t.scratch.logits_host, t.m.vocab_size) > 0)
+				count_nonfinite(t.scratch.logits_host, t.m.vocab_size) > 0) {
 				all_ok = 0;
+				if (maxdiff > worst)
+					worst = maxdiff;
+			}
 			ref_free(&r);
 			free(ids);
 			free(prompt);
@@ -491,15 +495,12 @@ static void t_batch_boundary_lengths(void) {
 		}
 		if (all_ok) {
 			record_result(OPFAM_ORCHESTRATION, "batch_boundary_exact_lengths", V_PASS,
-						  "tiny-tail boundary lengths now match unchunked reference");
+						  "tiny-tail boundary lengths match unchunked reference");
 		} else {
 			snprintf(detail, sizeof(detail),
-					 "KNOWN BUG, escalated to backend/cpu owners (both cores): lengths "
-					 "{%d,%d,%d} produce chunks {%d,tiny}; cpu_bitrev_perm_get() reuses a "
-					 "stale permutation when batched-attention width's pow2 shrinks. See "
-					 "hybrid 'shrinking_batch_known_bug'. Fixing it flips this to PASS.",
-					 lens[0], lens[1], lens[2], ck);
-			record_result(OPFAM_ORCHESTRATION, "batch_boundary_exact_lengths", V_SKIP, detail);
+					 "boundary lengths {%d,%d,%d}: divergence max|dlogits|=%.3e", lens[0], lens[1],
+					 lens[2], worst);
+			record_result(OPFAM_ORCHESTRATION, "batch_boundary_exact_lengths", V_FAIL, detail);
 		}
 	}
 	context_free(&c);
