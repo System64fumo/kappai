@@ -2,7 +2,7 @@
 #define CPU_COMMON_H
 
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
+#include "backend/cpu/quants.h"
 #include "log.h"
 #include "threadpool.h"
 #include <stdlib.h>
@@ -27,8 +27,7 @@ status_code cpu_backend_fill(backend *out);
 		out->desc	  = desc_str;                                                                  \
 		return cpu_backend_fill(out);                                                              \
 	}                                                                                              \
-	BACKEND_REGISTER(name_str, ctor_fn)                                                            \
-	void backend_autoreg_cpu_scalar_ctor(void) {}
+	BACKEND_REGISTER(name_str, ctor_fn)
 
 int32_t cpu_argmax_f32(const float *logits, int vocab);
 
@@ -99,6 +98,12 @@ typedef struct {
 
 	quant_scratch matmul_multi_scratch[4];
 } cpu_priv;
+
+static inline quant_scratch *cpu_scratch_for_tid(cpu_priv *p, int tid) {
+	if (p->thread_scratch && tid >= 0 && tid < p->n_threads)
+		return &p->thread_scratch[tid].qscratch;
+	return &p->qscratch;
+}
 
 void feat_add(char *buf, size_t cap, const char *name);
 void detect_features(char *buf, size_t cap);
@@ -307,10 +312,8 @@ static inline void cpu_kv_put_q8_0_head(uint8_t *kd, uint8_t *vd, const float *k
 
 static inline void cpu_kv_put_f16_head(uint16_t *kd, uint16_t *vd, const float *kfh,
 									   const float *vfh, int head_dim) {
-	for (int i = 0; i < head_dim; i++) {
-		kd[i] = f32_to_f16(kfh[i]);
-		vd[i] = f32_to_f16(vfh[i]);
-	}
+	f32_to_f16_row(kfh, kd, head_dim);
+	f32_to_f16_row(vfh, vd, head_dim);
 }
 
 static inline int *cpu_bitrev_perm_get(cpu_priv *p, int m_pow2) {
@@ -522,5 +525,155 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d);
 status_code cpu_hc_post(backend *self, const hc_post_host_desc *d);
 status_code cpu_kda(backend *self, const kda_host_desc *d);
 status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d);
+
+status_code cpu_probe(void);
+status_code cpu_init(backend *self, int device_index);
+void		cpu_free(backend *self);
+status_code cpu_buffer_alloc_weight(backend *self, const tensor_desc *desc, buffer *out);
+status_code cpu_buffer_alloc_scratch(backend *self, size_t size, buffer *out);
+void		cpu_buffer_free(backend *self, buffer *buf);
+status_code cpu_copy_buffer(backend *self, const buffer *src, buffer *dst, int n);
+status_code cpu_buffer_read_f32(backend *self, const buffer *buf, float *host_dst, int n);
+status_code cpu_buffer_write_f32(backend *self, buffer *buf, const float *host_src, int n);
+status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out);
+status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, const buffer *k_in,
+					   const buffer *v_in, int n_kv_heads, int head_dim, int n_ctx,
+					   int n_kv_heads_active);
+status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+							 const buffer *k_in, const buffer *v_in, int in_row_stride,
+							 int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active, int m);
+status_code cpu_kv_shift(backend *self, buffer *k, buffer *v, int layer,
+						 const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
+						 const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
+						 int n_kv_heads_active);
+status_code cpu_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
+							int token, int dim, buffer *x_out);
+status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
+						float eps);
+status_code cpu_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x, buffer *y,
+					   int n, int k);
+status_code cpu_matmul_residual(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+								const buffer *residual, buffer *y, int n, int k);
+status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+							 buffer *y, int n, int k, int m);
+status_code cpu_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
+							 const buffer *x, buffer **y, const int *n_list, int k, int n_matmuls);
+status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
+								   const buffer *x, buffer **y, const int *n_list, int k,
+								   int n_matmuls, int m);
+status_code cpu_matmul_qonly(backend *self, const buffer *w, uint32_t w_type, const buffer *x_q8,
+							 uint32_t q8_type, buffer *y, int n, int k, int m);
+status_code cpu_prequantize_x(backend *self, const buffer *x, int k, uint32_t q8_type,
+							  buffer *x_q8_out);
+status_code cpu_rope(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
+					 const float *rope_cos_base, const float *rope_sin_base);
+status_code cpu_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+						int head_dim, int pos, const float *rope_cos_base,
+						const float *rope_sin_base);
+status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
+						 const float *rope_cos_base, const float *rope_sin_base,
+						 const float *freq_factors);
+status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
+							   const float *rope_cos_base, const float *rope_sin_base,
+							   const float *freq_factors, int m);
+status_code cpu_attention(backend *self, const buffer *q, const buffer *k_cache,
+						  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
+						  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
+						  int n_kv_heads_active);
+status_code cpu_attention_swa(backend *self, const buffer *q, const buffer *k_cache,
+							  const buffer *v_cache, buffer *out, int layer, int pos, int n_heads,
+							  int n_kv_heads, int head_dim, int n_ctx, int flash_attn, float scale,
+							  int sliding_window, int n_kv_heads_active);
+status_code cpu_add_inplace(backend *self, buffer *x, const buffer *y, int n);
+status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up, buffer *out,
+							 int n);
+status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up, buffer *out,
+								int n, int activation);
+status_code cpu_rmsnorm_per_head(backend *self, const buffer *x, const buffer *w, buffer *y,
+								 int n_heads, int head_dim, float eps);
+status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
+									   int n_heads, int head_dim, float eps, int m);
+status_code cpu_rmsnorm_noweight_batch(backend *self, const buffer *x, buffer *y, int n, float eps,
+									   int m);
+status_code cpu_rmsnorm_noweight_per_head_batch(backend *self, const buffer *x, buffer *y,
+												int n_heads, int head_dim, float eps, int m);
+status_code cpu_rmsnorm_noweight(backend *self, const buffer *x, buffer *y, int n, float eps);
+status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x, buffer *y, int n_heads,
+										  int head_dim, float eps);
+status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx);
+status_code cpu_gated_delta_net(backend *self, const gdn_desc *d);
+status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
+							uint32_t *re_type_out);
+status_code cpu_repack_weight(backend *self, uint32_t type, const void *src, void *dst, int n_rows,
+							  int k);
+status_code cpu_dequant_row(backend *self, uint32_t type, const void *src, int n_elems, float *dst);
+status_code cpu_moe_activate(backend *self, const buffer *gate, const buffer *up, buffer *out,
+							 int n, float gate_scale, float up_scale, int use_gelu);
+void		cpu_synchronize(backend *self);
+status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_cache,
+							  const buffer *k_b_w, const buffer *v_b_w, buffer *out, int layer,
+							  int pos, int n_heads, int qk_head, int qk_rope, int qk_nope,
+							  int v_head, int kv_lora, int n_ctx, const float *rope_cos_base,
+							  const float *rope_sin_base, uint32_t k_b_type, uint32_t v_b_type,
+							  float scale);
+status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
+							 buffer *kv_out);
+status_code cpu_kv_put_mla(backend *self, buffer *kv_cache, int layer, int pos,
+						   const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
+						   int qk_rope, int n_ctx, float eps);
+tpool	   *cpu_get_pool(backend *self);
+status_code cpu_matmul_thread_local(backend *self, const void *W, uint32_t w_type, const float *x,
+									float *y, int n, int k, int tid);
+size_t		cpu_mem_available(backend *self);
+size_t		cpu_mem_total(backend *self);
+status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
+							  float eps, int m);
+status_code cpu_add_batch(backend *self, buffer *x, const buffer *y, int n, int m);
+status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up, buffer *out,
+								   int n, int activation, int m);
+status_code cpu_rope_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
+						   const float *rope_cos_base, const float *rope_sin_base, int m);
+status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+							  int head_dim, int pos_start, const float *rope_cos_base,
+							  const float *rope_sin_base, int m);
+status_code cpu_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
+								const buffer *v_cache, buffer *out, int layer, int pos_start,
+								int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+								int flash_attn, float scale, int n_kv_heads_active, int m);
+status_code cpu_attention_swa_batch(backend *self, const buffer *q, const buffer *k_cache,
+									const buffer *v_cache, buffer *out, int layer, int pos_start,
+									int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+									int flash_attn, float scale, int sliding_window,
+									int n_kv_heads_active, int m);
+status_code cpu_rmsnorm_add(backend *self, const buffer *x, const buffer *w, const buffer *residual,
+							buffer *y, int n, float eps, float out_scale);
+status_code cpu_rmsnorm_add_batch(backend *self, const buffer *x, const buffer *w,
+								  const buffer *residual, buffer *y, int n, float eps,
+								  float out_scale, int m);
+status_code cpu_scale_inplace(backend *self, buffer *x, float scale, int n);
+status_code cpu_softcap(backend *self, buffer *x, float cap, int n);
+status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
+							int n_heads, int head_dim, int n_rows);
+status_code cpu_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n, int n_rows);
+status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
+								int head_dim, int rope_dim, int pos_start,
+								const float *rope_cos_base, const float *rope_sin_base, int n_rows);
+status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
+							float combine_scale);
+status_code cpu_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type, const buffer *gate,
+								const buffer *up, buffer *y, int n, int k, int activation);
+status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
+									  const buffer *gate, const buffer *up, buffer *y, int n, int k,
+									  int activation, int m);
+void		cpu_kv_free(backend *self, buffer *k, buffer *v);
+void		cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx);
+
+void cpu_softcap_chunk(int begin, int end, int tid, void *ctx);
+void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx);
+void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx);
+void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
+void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
+							   const float *freq_factors, float **cs_out);
 
 #endif

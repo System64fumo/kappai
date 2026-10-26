@@ -556,7 +556,7 @@ status_code backend_create_best(backend **out) {
 }
 
 int backend_format_device(const char *name, int device_index, char *out, size_t out_cap) {
-	return snprintf(out, out_cap, "%s_%d", name, device_index);
+	return snprintf(out, out_cap, "%s%d", name, device_index);
 }
 
 size_t backend_name_brief_len(const char *name) {
@@ -572,10 +572,10 @@ int backend_parse_device(const char *spec, char *name, size_t name_cap, int *dev
 	const char *digits = end;
 	while (digits > spec && digits[-1] >= '0' && digits[-1] <= '9')
 		digits--;
-	if (digits == end || digits == spec || digits[-1] != '_')
+	if (digits == end || digits == spec)
 		return -1;
 
-	size_t name_len = (size_t)(digits - 1 - spec);
+	size_t name_len = (size_t)(digits - spec);
 	if (name_len == 0 || name_len >= name_cap)
 		return -1;
 

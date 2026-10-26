@@ -109,11 +109,13 @@ BACKEND_DIR     := $(OUT_DIR)/backends
 BACKEND_OBJ_DIR := $(OUT_DIR)/backend_obj
 BACKEND_CFLAGS  := $(CFLAGS) -fvisibility=hidden
 
-SCALAR_CORE_OBJS := \
-	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/core.o \
-	$(BACKEND_OBJ_DIR)/backend/cpu/scalar/quants.o
+CPU_SHARED_OBJS := $(BACKEND_OBJ_DIR)/backend/cpu/common.o
 
-SCALAR_BACKEND_OBJS := $(SCALAR_CORE_OBJS)
+cpu_backend_objs = $(CPU_SHARED_OBJS) \
+	$(BACKEND_OBJ_DIR)/backend/cpu/$(1)/core.o \
+	$(BACKEND_OBJ_DIR)/backend/cpu/$(1)/quants.o
+
+SCALAR_BACKEND_OBJS := $(call cpu_backend_objs,scalar)
 
 CPU_ARCH_DIR :=
 ifeq ($(CPU_ARCH_OPT),1)
@@ -130,9 +132,7 @@ BACKEND_LIBS   := $(SCALAR_BACKEND)
 BACKEND_OBJS   := $(SCALAR_BACKEND_OBJS)
 
 ifneq ($(CPU_ARCH_DIR),)
-  ARCH_BACKEND_OBJS := $(SCALAR_CORE_OBJS) \
-                       $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/core.o \
-                       $(BACKEND_OBJ_DIR)/backend/cpu/$(CPU_ARCH_DIR)/quants.o
+  ARCH_BACKEND_OBJS := $(call cpu_backend_objs,$(CPU_ARCH_DIR))
   ARCH_BACKEND := $(BACKEND_DIR)/libkappai_cpu_$(CPU_ARCH_DIR).so
   BACKEND_LIBS += $(ARCH_BACKEND)
   BACKEND_OBJS += $(ARCH_BACKEND_OBJS)
@@ -507,4 +507,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d) $(MONITOR_BIN).d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(sort $(BACKEND_OBJS:.o=.d)) $(MONITOR_BIN).d

@@ -90,7 +90,7 @@ static status_code context_open_device(context *c, const char *spec, backend **o
 	char name[BACKEND_DEVICE_NAME_MAX];
 	int	 device_index = 0;
 	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0) {
-		ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", spec);
+		ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", spec);
 		return ERR_INVALID_ARG;
 	}
 	if (strcmp(name, "cpu") == 0) {
@@ -267,7 +267,7 @@ status_code context_init(context *c, const config *cfg) {
 		char name[32];
 		int	 device_index = 0;
 		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
-			ERROR("invalid device spec '%s' (expected <backend>_<n>, e.g. vulkan_0)", cfg->device);
+			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
 			return ERR_INVALID_ARG;
 		}
 		s = backend_create(name, device_index, &c->backend);

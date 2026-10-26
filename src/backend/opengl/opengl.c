@@ -1,5 +1,5 @@
 #include "backend/backend.h"
-#include "backend/cpu/scalar/quants.h"
+#include "backend/cpu/quants.h"
 #include "common.h"
 #include "gl_context.h"
 #include "log.h"

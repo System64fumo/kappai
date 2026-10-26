@@ -397,7 +397,7 @@ static void check_device_name(violations *v, const hcs_config *h, int idx,
 	char		backend_name[BACKEND_DEVICE_NAME_MAX];
 	int			device_index = 0;
 	if (backend_parse_device(name, backend_name, sizeof(backend_name), &device_index) != 0) {
-		add_violation(v, name, "device", "'%s' is not a valid device name; expected <backend>_<n>",
+		add_violation(v, name, "device", "'%s' is not a valid device name; expected <backend><n>",
 					  name);
 		return;
 	}
@@ -406,7 +406,7 @@ static void check_device_name(violations *v, const hcs_config *h, int idx,
 			add_violation(v, name, "device", "listed more than once in 'devices'");
 			return;
 		}
-	if (strcmp(name, "cpu_0") == 0)
+	if (strcmp(name, "cpu0") == 0)
 		return;
 	for (int j = 0; j < n_available; j++)
 		if (strcmp(available[j], name) == 0)

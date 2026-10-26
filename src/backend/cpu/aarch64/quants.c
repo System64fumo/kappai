@@ -1,4 +1,4 @@
-#include "backend/cpu/scalar/quants.h"
+#include "backend/cpu/quants.h"
 #include "common.h"
 #include "threadpool.h"
 
@@ -10149,4 +10149,114 @@ static inline void bf16x8_to_f32x2(const uint16_t *p, float32x4_t *o0, float32x4
 	uint16x8_t bw = vld1q_u16(p);
 	*o0			  = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bw), 16));
 	*o1			  = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bw), 16));
+}
+
+float f16_to_f32(uint16_t h) {
+	return f16_to_f32_fast(h);
+}
+
+uint16_t f32_to_f16(float f) {
+	__fp16 v = (__fp16)f;
+	uint16_t h;
+	memcpy(&h, &v, sizeof(h));
+	return h;
+}
+
+float bf16_to_f32(uint16_t h) {
+	uint32_t u = (uint32_t)h << 16;
+	float	 f;
+	memcpy(&f, &u, sizeof(f));
+	return f;
+}
+
+void f32_to_f16_row(const float *src, uint16_t *dst, int n) {
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		uint16x4_t lo = vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i)));
+		uint16x4_t hi = vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i + 4)));
+		vst1q_u16(dst + i, vcombine_u16(lo, hi));
+	}
+	for (; i + 4 <= n; i += 4)
+		vst1_u16(dst + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i))));
+	for (; i < n; i++)
+		dst[i] = f32_to_f16(src[i]);
+}
+
+void scale_f32(float *x, float s, int n) {
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		vst1q_f32(x + i, vmulq_n_f32(vld1q_f32(x + i), s));
+		vst1q_f32(x + i + 4, vmulq_n_f32(vld1q_f32(x + i + 4), s));
+	}
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(x + i, vmulq_n_f32(vld1q_f32(x + i), s));
+	for (; i < n; i++)
+		x[i] *= s;
+}
+
+void add_scale_f32(float *x, const float *y, float s, int n) {
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		vst1q_f32(x + i, vmulq_n_f32(vaddq_f32(vld1q_f32(x + i), vld1q_f32(y + i)), s));
+		vst1q_f32(x + i + 4, vmulq_n_f32(vaddq_f32(vld1q_f32(x + i + 4), vld1q_f32(y + i + 4)), s));
+	}
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(x + i, vmulq_n_f32(vaddq_f32(vld1q_f32(x + i), vld1q_f32(y + i)), s));
+	for (; i < n; i++)
+		x[i] = (x[i] + y[i]) * s;
+}
+
+void gdn_decay_accum_f32(float *restrict row, float *restrict mem, float decay, float ks, int n) {
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		float32x4_t r0 = vmulq_n_f32(vld1q_f32(row + i), decay);
+		float32x4_t r1 = vmulq_n_f32(vld1q_f32(row + i + 4), decay);
+		vst1q_f32(row + i, r0);
+		vst1q_f32(row + i + 4, r1);
+		vst1q_f32(mem + i, vfmaq_n_f32(vld1q_f32(mem + i), r0, ks));
+		vst1q_f32(mem + i + 4, vfmaq_n_f32(vld1q_f32(mem + i + 4), r1, ks));
+	}
+	for (; i + 4 <= n; i += 4) {
+		float32x4_t r = vmulq_n_f32(vld1q_f32(row + i), decay);
+		vst1q_f32(row + i, r);
+		vst1q_f32(mem + i, vfmaq_n_f32(vld1q_f32(mem + i), r, ks));
+	}
+	for (; i < n; i++) {
+		row[i] *= decay;
+		mem[i] += row[i] * ks;
+	}
+}
+
+void gdn_update_accum_f32(float *restrict row, float *restrict y, const float *restrict delta,
+						  float ks, float qs, int n) {
+	int i = 0;
+	for (; i + 8 <= n; i += 8) {
+		float32x4_t r0 = vfmaq_n_f32(vld1q_f32(row + i), vld1q_f32(delta + i), ks);
+		float32x4_t r1 = vfmaq_n_f32(vld1q_f32(row + i + 4), vld1q_f32(delta + i + 4), ks);
+		vst1q_f32(row + i, r0);
+		vst1q_f32(row + i + 4, r1);
+		vst1q_f32(y + i, vfmaq_n_f32(vld1q_f32(y + i), r0, qs));
+		vst1q_f32(y + i + 4, vfmaq_n_f32(vld1q_f32(y + i + 4), r1, qs));
+	}
+	for (; i + 4 <= n; i += 4) {
+		float32x4_t r = vfmaq_n_f32(vld1q_f32(row + i), vld1q_f32(delta + i), ks);
+		vst1q_f32(row + i, r);
+		vst1q_f32(y + i, vfmaq_n_f32(vld1q_f32(y + i), r, qs));
+	}
+	for (; i < n; i++) {
+		row[i] += ks * delta[i];
+		y[i] += row[i] * qs;
+	}
+}
+
+void gdn_out_norm_f32(float *restrict y, const float *restrict norm_w, const float *restrict z,
+					  float inv_rms, int n) {
+	int i = 0;
+	for (; i + 4 <= n; i += 4) {
+		float32x4_t scaled =
+			vmulq_f32(vmulq_n_f32(vld1q_f32(y + i), inv_rms), vld1q_f32(norm_w + i));
+		vst1q_f32(y + i, silu_mul_vec4(vld1q_f32(z + i), scaled));
+	}
+	for (; i < n; i++)
+		y[i] = y[i] * inv_rms * norm_w[i] * silu(z[i]);
 }

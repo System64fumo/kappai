@@ -1,6 +1,6 @@
 #include "backend/backend.h"
 #include "backend/cpu/common.h"
-#include "backend/cpu/scalar/quants.h"
+#include "backend/cpu/quants.h"
 #include "common.h"
 #include <math.h>
 #include <stdbool.h>
@@ -420,6 +420,121 @@ status_code cpu_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_heads, 
 	return OK;
 }
 
+static void cpu_rope_cs_one_neon(float *vh, int half, const float *cs, int neox) {
+	int j = 0;
+	if (neox) {
+		for (; j + 4 <= half; j += 4) {
+			float32x4x2_t cos_sin = vld2q_f32(cs + (2 * j));
+			float32x4_t	  v0	  = vld1q_f32(vh + j);
+			float32x4_t	  v1	  = vld1q_f32(vh + j + half);
+			vst1q_f32(vh + j, vmlsq_f32(vmulq_f32(v0, cos_sin.val[0]), v1, cos_sin.val[1]));
+			vst1q_f32(vh + j + half, vmlaq_f32(vmulq_f32(v0, cos_sin.val[1]), v1, cos_sin.val[0]));
+		}
+		for (; j < half; j++) {
+			float c		 = cs[2 * j];
+			float s		 = cs[(2 * j) + 1];
+			float v0	 = vh[j];
+			float v1	 = vh[j + half];
+			vh[j]		 = (v0 * c) - (v1 * s);
+			vh[j + half] = (v0 * s) + (v1 * c);
+		}
+		return;
+	}
+	for (; j + 4 <= half; j += 4) {
+		float32x4x2_t cos_sin = vld2q_f32(cs + (2 * j));
+		float32x4x2_t pair	  = vld2q_f32(vh + (2 * j));
+		float32x4x2_t rotated;
+		rotated.val[0] =
+			vmlsq_f32(vmulq_f32(pair.val[0], cos_sin.val[0]), pair.val[1], cos_sin.val[1]);
+		rotated.val[1] =
+			vmlaq_f32(vmulq_f32(pair.val[0], cos_sin.val[1]), pair.val[1], cos_sin.val[0]);
+		vst2q_f32(vh + (2 * j), rotated);
+	}
+	for (; j < half; j++) {
+		float c			= cs[2 * j];
+		float s			= cs[(2 * j) + 1];
+		float v0		= vh[2 * j];
+		float v1		= vh[(2 * j) + 1];
+		vh[2 * j]		= (v0 * c) - (v1 * s);
+		vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+	}
+}
+
+status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, int pos,
+						 const float *rope_cos_base, const float *rope_sin_base,
+						 const float *freq_factors) {
+	float *v = cpu_ptr(vec);
+	if (!freq_factors) {
+		int half = head_dim / 2;
+		cpu_rope_one_neon(v, n_heads, head_dim, rope_cos_base + ((size_t)pos * half),
+						  rope_sin_base + ((size_t)pos * half), self->rope_neox);
+		return OK;
+	}
+	float	   *cs;
+	status_code st =
+		cpu_rope_cs_cached(self->priv, head_dim, pos, self->rope_theta, freq_factors, &cs);
+	if (st != OK)
+		return st;
+	for (int h = 0; h < n_heads; h++)
+		cpu_rope_cs_one_neon(v + ((size_t)h * head_dim), head_dim / 2, cs, self->rope_neox);
+	return OK;
+}
+
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
+
+static void cpu_rope_ext_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_rope_ext_batch_job *j			= ctx;
+	int						half		= j->head_dim / 2;
+	double					theta_scale = pow((double)j->theta, -2.0 / (double)j->head_dim);
+
+	for (int r = begin; r < end; r++) {
+		int	   pos = j->pos_start + r;
+		float *v   = j->base + (size_t)r * j->row_stride;
+		if (!j->freq_factors) {
+			cpu_rope_one_neon(v, j->n_heads, j->head_dim, j->cos_base + ((size_t)pos * half),
+							  j->sin_base + ((size_t)pos * half), j->neox);
+			continue;
+		}
+		float  cs_stack[512];
+		float *cs = half > 256 ? xmalloc((size_t)half * 2 * sizeof(float)) : cs_stack;
+		cpu_rope_cs_fill(cs, half, pos, theta_scale, j->freq_factors);
+		for (int h = 0; h < j->n_heads; h++)
+			cpu_rope_cs_one_neon(v + ((size_t)h * j->head_dim), half, cs, j->neox);
+		if (cs != cs_stack)
+			free(cs);
+	}
+}
+
+status_code cpu_rope_ext_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
+							   const float *rope_cos_base, const float *rope_sin_base,
+							   const float *freq_factors, int m) {
+	cpu_priv *p = self->priv;
+	if (m <= 1)
+		return cpu_rope_ext(self, vec, n_heads, head_dim, pos_start, rope_cos_base, rope_sin_base,
+							freq_factors);
+
+	cpu_rope_ext_batch_job job = {.base			= (float *)cpu_ptr(vec),
+								  .n_heads		= n_heads,
+								  .head_dim		= head_dim,
+								  .row_stride	= n_heads * head_dim,
+								  .pos_start	= pos_start,
+								  .theta		= self->rope_theta,
+								  .neox			= self->rope_neox,
+								  .freq_factors = freq_factors,
+								  .cos_base		= rope_cos_base,
+								  .sin_base		= rope_sin_base};
+	cpu_run_batch(p->pool, m, cpu_rope_ext_batch_chunk_neon, &job);
+	return OK;
+}
+
 static void rope_rotate_neox_dim_neon(float *v, int n_heads, int head_dim, int half,
 									  const float *rope_cos, const float *rope_sin) {
 	int j = 0;
@@ -464,7 +579,7 @@ static void rope_rotate_neox_dim_neon(float *v, int n_heads, int head_dim, int h
 	}
 }
 
-static void cpu_partial_rope_qk_chunk_neon(int begin, int end, int tid, void *ctx) {
+void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_partial_rope_qk_job *j = ctx;
 	for (int row = begin; row < end; row++) {
@@ -477,32 +592,7 @@ static void cpu_partial_rope_qk_chunk_neon(int begin, int end, int tid, void *ct
 	}
 }
 
-status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
-								int head_dim, int rope_dim, int pos_start,
-								const float *rope_cos_base, const float *rope_sin_base,
-								int n_rows) {
-	cpu_priv *p = self->priv;
-	if (n_rows <= 0 || rope_dim <= 0)
-		return OK;
-	int						qn	= n_heads * head_dim;
-	int						kn	= n_kv_heads * head_dim;
-	cpu_partial_rope_qk_job job = {.q		   = cpu_ptr(q),
-								   .k		   = cpu_ptr(k),
-								   .cos_base   = rope_cos_base,
-								   .sin_base   = rope_sin_base,
-								   .qn		   = qn,
-								   .kn		   = kn,
-								   .half	   = rope_dim / 2,
-								   .rope_dim   = rope_dim,
-								   .n_heads	   = n_heads,
-								   .n_kv_heads = n_kv_heads,
-								   .head_dim   = head_dim,
-								   .pos0	   = pos_start};
-	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_partial_rope_qk_chunk_neon, &job);
-	return OK;
-}
-
-static void cpu_split_qgate_chunk_neon(int begin, int end, int tid, void *ctx) {
+void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_split_qgate_job *j			  = ctx;
 	const int			 hd			  = j->head_dim;
@@ -528,20 +618,6 @@ static void cpu_split_qgate_chunk_neon(int begin, int end, int tid, void *ctx) {
 	}
 }
 
-status_code cpu_split_qgate(backend *self, const buffer *mixed, buffer *q, buffer *gate,
-							int n_heads, int head_dim, int n_rows) {
-	cpu_priv *p = self->priv;
-	if (n_rows <= 0 || n_heads <= 0 || head_dim <= 0)
-		return OK;
-	cpu_split_qgate_job job = {.mixed	 = cpu_ptr(mixed),
-							   .q		 = cpu_ptr(q),
-							   .gate	 = cpu_ptr(gate),
-							   .n_heads	 = n_heads,
-							   .head_dim = head_dim};
-	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_split_qgate_chunk_neon, &job);
-	return OK;
-}
-
 static float32x4_t sigmoid_mul_vec4(float32x4_t g, float32x4_t u) {
 	float32x4_t t	= vexpq_f32(vnegq_f32(vabsq_f32(g)));
 	float32x4_t den = vaddq_f32(vdupq_n_f32(1.0f), t);
@@ -552,7 +628,7 @@ static float32x4_t sigmoid_mul_vec4(float32x4_t g, float32x4_t u) {
 	return vmulq_f32(u, vmulq_f32(num, r));
 }
 
-static void cpu_attn_output_gate_chunk_neon(int begin, int end, int tid, void *ctx) {
+void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_attn_output_gate_job *j = ctx;
 	int						  n = j->n;
@@ -567,16 +643,6 @@ static void cpu_attn_output_gate_chunk_neon(int begin, int end, int tid, void *c
 	}
 }
 
-status_code cpu_attn_output_gate(backend *self, buffer *out, const buffer *gate, int n,
-								 int n_rows) {
-	cpu_priv *p = self->priv;
-	if (n <= 0 || n_rows <= 0)
-		return OK;
-	cpu_attn_output_gate_job job = {.out = cpu_ptr(out), .gate = cpu_ptr(gate), .n = n};
-	cpu_run_batch(p ? p->pool : NULL, n_rows, cpu_attn_output_gate_chunk_neon, &job);
-	return OK;
-}
-
 void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_softcap_job *j		 = ctx;
@@ -589,20 +655,6 @@ void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
 	}
 	for (; i < end; i++)
 		j->x[i] = cap * tanhf(j->x[i] * inv_cap);
-}
-
-status_code cpu_softcap(backend *self, buffer *x, float cap, int n) {
-	if (cap <= 0.0f || n <= 0)
-		return OK;
-	cpu_priv	   *p		= self->priv;
-	cpu_softcap_job job		= {.x = cpu_ptr(x), .inv_cap = 1.0f / cap, .cap = cap};
-	tpool		   *pool	= p ? p->pool : NULL;
-	int				cur_tid = tpool_current_tid();
-	if (pool && tpool_n_threads(pool) > 1 && n >= 2 * CPU_ELEMWISE_MIN_PER_THREAD)
-		tpool_parallel_for(pool, n, CPU_ELEMWISE_MIN_PER_THREAD, cpu_softcap_chunk, &job);
-	else
-		cpu_softcap_chunk(0, n, cur_tid, &job);
-	return OK;
 }
 
 float dot8(const float *restrict a, const float *restrict b, int head_dim) {
@@ -2740,4 +2792,4 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
-CPU_BACKEND_REGISTER("cpu_aarch64", cpu_arch_ctor, 10, NULL)
+CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, NULL)
