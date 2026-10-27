@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #if defined(__GLIBC__) && defined(__linux__)
@@ -52,6 +53,14 @@ typedef int (*spin_until_fn)(void *ud);
 
 void cpu_relax(void);
 void spin_wait_relax(spin_until_fn pred, void *ud);
+int	 available_cpu_count(void);
+
+typedef enum {
+	FILE_ADVICE_RANDOM,
+	FILE_ADVICE_RELEASE,
+} file_advice;
+
+void file_advise(int fd, off_t offset, off_t length, file_advice advice);
 
 static inline void madvise_hugepage(void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
@@ -88,6 +97,7 @@ void weight_source_release(const void *ptr, size_t bytes);
 void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_src);
 
 size_t		str_lcp_len(const char *a, const char *b);
+const char *str_find_n(const char *s, size_t len, const char *needle, size_t needle_len);
 const char *path_basename(const char *path);
 
 typedef struct {

@@ -979,7 +979,7 @@ status_code moe_experts_batch(exec_ctx *ctx) {
 		}
 	}
 
-finish:
+finish:;
 	buffer *xb2 = batch_slot(ctx->bs, ctx->op->out);
 	st			= a->buffer_write_f32(a, xb2, ctx->bs->moe_out.p, ctx->rows.n_rows * dim);
 	if (st != OK)

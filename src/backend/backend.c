@@ -19,7 +19,11 @@
 #define HFB_PATH_CAP 512
 #define HFB_LIB_MAX 16
 #define BACKEND_LIB_PREFIX "libkappai_"
+#if defined(__APPLE__)
+#define BACKEND_LIB_SUFFIX ".dylib"
+#else
 #define BACKEND_LIB_SUFFIX ".so"
+#endif
 #define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
 
 typedef struct {
@@ -188,7 +192,7 @@ static void backend_dump_load_diagnosis(void) {
 		ERROR("  backend library search dirs: none");
 	}
 	if (!g_backend_path_env)
-		ERROR("  (set KAPPAI_BACKEND_PATH to the backend .so directory)");
+		ERROR("  (set KAPPAI_BACKEND_PATH to the backend library directory)");
 
 	if (g_n_loaded_libs > 0) {
 		for (int i = 0; i < g_n_loaded_libs; i++)

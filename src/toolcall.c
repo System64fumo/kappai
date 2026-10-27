@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "toolcall.h"
 
 #include "json_helpers.h"
@@ -46,7 +45,7 @@ static long find_marker(const char *s, size_t len, size_t from, const char *mark
 	size_t mlen = strlen(marker);
 	if (len < mlen || from > len - mlen)
 		return -1;
-	const char *hit = memmem(s + from, len - from, marker, mlen);
+	const char *hit = str_find_n(s + from, len - from, marker, mlen);
 	return hit ? (long)(hit - s) : -1;
 }
 
@@ -89,7 +88,7 @@ static json_object *cc_string(cc_lex *s) {
 		return NULL;
 	const char *start = s->p + s->pos;
 	size_t		dlen  = strlen(CC_STR_DELIM);
-	const char *hit	  = memmem(start, s->len - s->pos, CC_STR_DELIM, dlen);
+	const char *hit	  = str_find_n(start, s->len - s->pos, CC_STR_DELIM, dlen);
 	if (!hit)
 		return NULL;
 	s->pos += (size_t)(hit - start) + dlen;

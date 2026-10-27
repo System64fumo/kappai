@@ -3,6 +3,7 @@
 #endif
 
 #include "cpu_cache.h"
+#include "common.h"
 
 #include <sched.h>
 #include <stdio.h>
@@ -20,6 +21,7 @@ cpu_cache_info g_cpu_cache = {
 	.l2_bytes	= CACHE_DEFAULT_L2,
 };
 
+#if defined(__linux__)
 static int cache_read(int cpu, int idx, const char *field, char *buf, size_t cap) {
 	char path[160];
 	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/%s", cpu, idx, field);
@@ -119,6 +121,18 @@ void cpu_cache_init(void) {
 	g_cpu_cache.l3_bytes = l3;
 	g_cpu_cache.detected = l1d || l2 || l3;
 }
+#else
+void cpu_cache_init(void) {
+	g_cpu_cache.n_cpus = available_cpu_count();
+#ifdef _SC_LEVEL1_DCACHE_SIZE
+	long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+	if (l1d > 0) {
+		g_cpu_cache.l1d_bytes = (size_t)l1d;
+		g_cpu_cache.detected  = 1;
+	}
+#endif
+}
+#endif
 
 __attribute__((constructor)) static void cpu_cache_ctor(void) {
 	cpu_cache_init();

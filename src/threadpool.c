@@ -1,6 +1,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 
 #include "threadpool.h"
 #include "common.h"
@@ -37,12 +40,12 @@ typedef struct tlocal_slot {
 } tlocal_slot;
 
 typedef struct {
-	_Atomic uint64_t total_items;
+	_Alignas(64) _Atomic uint64_t total_items;
 	_Atomic uint64_t total_busy_ns;
 	_Atomic uint64_t total_wait_ns;
 	_Atomic uint64_t total_parked_ns;
 	char			 _pad[64];
-} __attribute__((aligned(64))) tpool_slot;
+} tpool_slot;
 
 typedef struct {
 	tpool *pool;
@@ -50,27 +53,27 @@ typedef struct {
 } tpool_thread_arg;
 
 typedef struct {
-	_Atomic tpool_chunk_fn job_fn;
-	_Atomic uintptr_t	   job_ctx;
-	_Atomic int			   job_end;
-	_Atomic int			   chunk_size;
-	_Atomic int			   n_workers;
+	_Alignas(64) _Atomic tpool_chunk_fn job_fn;
+	_Atomic uintptr_t job_ctx;
+	_Atomic int		  job_end;
+	_Atomic int		  chunk_size;
+	_Atomic int		  n_workers;
 	/* High 32 bits: job epoch. Low 32: next unclaimed chunk start. One
 	 * atomic so a claim can never land on a newer job's range. */
 	_Atomic int64_t cursor_ep;
 	_Atomic int		executed;
 	_Atomic int		job_epoch;
-} __attribute__((aligned(64))) tpool_job_block;
+} tpool_job_block;
 
 typedef struct {
-	_Atomic int epoch;
+	_Alignas(64) _Atomic int epoch;
 	_Atomic int parked_workers;
 	_Atomic int shutdown;
 	_Atomic int spin_budget_ns;
 	_Atomic int pub_gate;
 	_Atomic int active_workers;
 	_Atomic int in_job;
-} __attribute__((aligned(64))) tpool_sync_block;
+} tpool_sync_block;
 
 struct tpool {
 	tpool_job_block			job;
@@ -79,15 +82,16 @@ struct tpool {
 	tpool_worker_cleanup_fn worker_cleanup;
 	pthread_mutex_t			wake_mtx;
 	pthread_cond_t			wake_cv;
+	clockid_t				wake_clock;
 	pthread_mutex_t			pub_mtx;
 	pthread_t				threads[TPOOL_MAX_THREADS];
 	int						n_threads;
 	int						stats_enabled;
 };
 
-static __thread int	  tpool_cur_tid = -1;
-static pthread_once_t tlocal_once	= PTHREAD_ONCE_INIT;
-static pthread_key_t  tlocal_key	= 0;
+static _Thread_local int tpool_cur_tid = -1;
+static pthread_once_t	 tlocal_once   = PTHREAD_ONCE_INIT;
+static pthread_key_t	 tlocal_key;
 
 static void tlocal_cleanup(void *v) {
 	tlocal_slot *s = v;
@@ -118,8 +122,7 @@ void tlocal_register(void **tls_ptr) {
 }
 
 void tlocal_free_all(void) {
-	if (!tlocal_key)
-		return;
+	pthread_once(&tlocal_once, tlocal_key_make);
 	tlocal_cleanup(pthread_getspecific(tlocal_key));
 	pthread_setspecific(tlocal_key, NULL);
 }
@@ -184,10 +187,19 @@ static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 			break;
 
 		struct timespec ts;
-		uint64_t		deadline = time_ns() + 200000;
-		ts.tv_sec				 = deadline / 1000000000ULL;
-		ts.tv_nsec				 = deadline % 1000000000ULL;
+#if defined(__APPLE__)
+		ts.tv_sec  = 0;
+		ts.tv_nsec = 200000;
+		pthread_cond_timedwait_relative_np(&pool->wake_cv, &pool->wake_mtx, &ts);
+#else
+		clock_gettime(pool->wake_clock, &ts);
+		ts.tv_nsec += 200000;
+		if (ts.tv_nsec >= 1000000000L) {
+			ts.tv_sec++;
+			ts.tv_nsec -= 1000000000L;
+		}
 		pthread_cond_timedwait(&pool->wake_cv, &pool->wake_mtx, &ts);
+#endif
 	}
 	pthread_mutex_unlock(&pool->wake_mtx);
 	atomic_fetch_sub_explicit(&pool->sync.parked_workers, 1, memory_order_relaxed);
@@ -200,15 +212,6 @@ static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 								  memory_order_relaxed);
 	}
 	return e;
-}
-
-static int tpool_affinity_count(void) {
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	if (sched_getaffinity(0, sizeof(set), &set) != 0)
-		return 0;
-	int n = CPU_COUNT(&set);
-	return n > 0 ? n : 0;
 }
 
 static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
@@ -289,11 +292,7 @@ int tpool_default_n_threads(void) {
 	if (v > 0)
 		return v > TPOOL_MAX_THREADS ? TPOOL_MAX_THREADS : v;
 
-	int n = tpool_affinity_count();
-	if (n < 1) {
-		long online = sysconf(_SC_NPROCESSORS_ONLN);
-		n			= online < 1 ? 1 : (int)online;
-	}
+	int n = available_cpu_count();
 	if (n > TPOOL_MAX_THREADS)
 		n = TPOOL_MAX_THREADS;
 	return n;
@@ -308,13 +307,18 @@ tpool *tpool_create(int n_threads) {
 	tpool *pool = xmalloc_aligned(sizeof(*pool), 64);
 	memset(pool, 0, sizeof(*pool));
 	pool->n_threads = n_threads;
-	pool->slot		= xcalloc((size_t)n_threads, sizeof(tpool_slot));
+	pool->slot		= xmalloc_aligned((size_t)n_threads * sizeof(tpool_slot), _Alignof(tpool_slot));
+	memset(pool->slot, 0, (size_t)n_threads * sizeof(tpool_slot));
 	pthread_mutex_init(&pool->wake_mtx, NULL);
 	pthread_mutex_init(&pool->pub_mtx, NULL);
 	{
 		pthread_condattr_t cattr;
 		pthread_condattr_init(&cattr);
-		pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
+		pool->wake_clock = CLOCK_REALTIME;
+#if defined(_POSIX_CLOCK_SELECTION) && _POSIX_CLOCK_SELECTION >= 0 && !defined(__APPLE__)
+		if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) == 0)
+			pool->wake_clock = CLOCK_MONOTONIC;
+#endif
 		pthread_cond_init(&pool->wake_cv, &cattr);
 		pthread_condattr_destroy(&cattr);
 	}

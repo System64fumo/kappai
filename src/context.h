@@ -89,6 +89,7 @@ void context_set_debug_prompt(context *c, bool enabled);
 
 status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);
+void		context_release_thread(context *c);
 void		context_reset_session(context *c);
 void		context_reset(context *c);
 

@@ -1213,12 +1213,15 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	layer_weights *L		= &m->layers[i];
 	backend		  *layer_be = model_layer_backend(m, i);
 
-	int q_out		 = m->n_heads * model_layer_head_dim(m, i);
-	int q_weight_out = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
-	int kv_out		 = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
-	int intermediate = model_layer_intermediate(m, i);
-	int is_mla_layer = m->arch_info->is_mla;
-	int is_moe_layer = model_layer_is_moe(m, i);
+	int q_out		  = m->n_heads * model_layer_head_dim(m, i);
+	int q_weight_out  = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
+	int kv_out		  = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
+	int intermediate  = model_layer_intermediate(m, i);
+	int is_mla_layer  = m->arch_info->is_mla;
+	int is_moe_layer  = model_layer_is_moe(m, i);
+	L->qkv_fused	  = 0;
+	L->qkv_fused_host = NULL;
+	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
@@ -1411,9 +1414,6 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	L->gate_up_fused_host = NULL;
 	L->shexp_fused		  = 0;
 	L->shexp_fused_host	  = NULL;
-	L->qkv_fused		  = 0;
-	L->qkv_fused_host	  = NULL;
-	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 	memset(&L->gate_w.buf, 0, sizeof(L->gate_w.buf));
 	memset(&L->up_w.buf, 0, sizeof(L->up_w.buf));
 	memset(&L->down_w.buf, 0, sizeof(L->down_w.buf));
@@ -1554,7 +1554,11 @@ static void prefetch_layer_pages(const model *m, int layer) {
 		page_span r = page_span_for(gt->data, gt->byte_size, ps);
 		if (!page_span_clamp(&r, base, g->map_size) || r.len == 0)
 			continue;
+#if defined(__linux__)
 		readahead(g->fd, (off_t)(r.start - base), r.len);
+#else
+		weight_source_prefetch((const void *)r.start, r.len);
+#endif
 	}
 }
 

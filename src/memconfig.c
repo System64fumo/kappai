@@ -8,7 +8,6 @@
 #include "model.h"
 #include "moe/moe_stream.h"
 #include <string.h>
-#include <sys/sysinfo.h>
 
 typedef enum {
 	MEM_UNIT_MB,
@@ -23,44 +22,6 @@ typedef struct {
 	size_t router;
 	size_t total;
 } non_expert_breakdown;
-
-size_t get_available_memory(void) {
-	FILE *f = fopen("/proc/meminfo", "r");
-	if (!f) {
-		struct sysinfo si;
-		if (sysinfo(&si) == 0)
-			return (size_t)si.freeram * (size_t)si.mem_unit;
-		return 0;
-	}
-	char   line[256];
-	size_t mem_available = 0;
-	size_t mem_free		 = 0;
-	size_t mem_cached	 = 0;
-	size_t mem_buffers	 = 0;
-	while (fgets(line, sizeof(line), f)) {
-		if (line[0] == 'M' && strncmp(line, "MemAvailable:", 13) == 0) {
-			mem_available = strtoull(line + 13, NULL, 10) * 1024;
-			break;
-		}
-		if (strncmp(line, "MemFree:", 8) == 0)
-			mem_free = strtoull(line + 8, NULL, 10) * 1024;
-		else if (strncmp(line, "Cached:", 7) == 0)
-			mem_cached = strtoull(line + 7, NULL, 10) * 1024;
-		else if (strncmp(line, "Buffers:", 8) == 0)
-			mem_buffers = strtoull(line + 8, NULL, 10) * 1024;
-	}
-	fclose(f);
-	if (mem_available > 0)
-		return mem_available;
-	return mem_free + mem_cached + mem_buffers;
-}
-
-size_t get_total_memory(void) {
-	struct sysinfo si;
-	if (sysinfo(&si) != 0)
-		return 0;
-	return (size_t)si.totalram * (size_t)si.mem_unit;
-}
 
 static size_t calc_embeddings_bytes(const model *m) {
 	size_t total = ggml_row_size(m->tok_embd.type, m->dim) * m->vocab_size;

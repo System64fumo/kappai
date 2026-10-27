@@ -1,7 +1,17 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
 #include "common.h"
 
 #include <ctype.h>
+#include <fcntl.h>
+#if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
+#endif
+#include <limits.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,9 +47,11 @@ const char *status_str(status_code s) {
 
 void oom_abort(size_t bytes) {
 	fprintf(stderr, "fatal: out of memory (%zu bytes)\n", bytes);
+#if defined(__GLIBC__) || defined(__APPLE__)
 	void *frames[32];
 	int	  n = backtrace(frames, 32);
 	backtrace_symbols_fd(frames, n, 2);
+#endif
 	abort();
 }
 
@@ -84,9 +96,9 @@ void *xrealloc(void *p, size_t n) {
 }
 
 char *xstrdup(const char *s) {
-	char *p = strdup(s);
-	if (!p)
-		oom_abort(strlen(s));
+	size_t n = strlen(s) + 1;
+	char  *p = xmalloc(n);
+	memcpy(p, s, n);
 	return p;
 }
 
@@ -115,6 +127,68 @@ void spin_wait_relax(spin_until_fn pred, void *ud) {
 		else
 			cpu_relax();
 	}
+}
+
+void file_advise(int fd, off_t offset, off_t length, file_advice advice) {
+	if (fd < 0 || offset < 0 || length < 0)
+		return;
+#if defined(POSIX_FADV_RANDOM) && defined(POSIX_FADV_DONTNEED)
+	int native_advice;
+	switch (advice) {
+	case FILE_ADVICE_RANDOM:
+		native_advice = POSIX_FADV_RANDOM;
+		break;
+	case FILE_ADVICE_RELEASE:
+		native_advice = POSIX_FADV_DONTNEED;
+		break;
+	default:
+		return;
+	}
+	posix_fadvise(fd, offset, length, native_advice);
+#else
+	(void)advice;
+#endif
+}
+
+int available_cpu_count(void) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+		int n = CPU_COUNT(&set);
+		if (n > 0)
+			return n;
+	}
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	if (n > 0)
+		return n > INT_MAX ? INT_MAX : (int)n;
+#endif
+	return 1;
+}
+
+const char *str_find_n(const char *s, size_t len, const char *needle, size_t needle_len) {
+	if (needle_len == 0)
+		return s;
+	if (needle_len > len)
+		return NULL;
+#if defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||    \
+	defined(__NetBSD__) || defined(__DragonFly__)
+	return memmem(s, len, needle, needle_len);
+#else
+	size_t remaining = len - needle_len + 1;
+	while (remaining > 0) {
+		const char *p = memchr(s, (unsigned char)needle[0], remaining);
+		if (!p)
+			return NULL;
+		if (memcmp(p, needle, needle_len) == 0)
+			return p;
+		remaining -= (size_t)(p - s) + 1;
+		s = p + 1;
+	}
+	return NULL;
+#endif
 }
 
 size_t str_lcp_len(const char *a, const char *b) {

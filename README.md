@@ -51,19 +51,20 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | OS    | Architecture                   |
 |-------|--------------------------------|
 | Linux | `aarch64`, `riscv64`, `x86_64` |
+| MacOS | `aarch64`                      |
 
 ## Building
 
 ```bash
 make config BUILD=release
-make -j$(nproc)
+make -j 4
 ```
 
 With some backends enabled:
 
 ```bash
 make config BUILD=release BACKENDS=vulkan,opengl
-make -j$(nproc)
+make -j 4
 ```
 
 ## Usage

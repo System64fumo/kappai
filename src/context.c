@@ -266,16 +266,22 @@ static void context_log_devices(context *c) {
 	}
 }
 
+void context_release_thread(context *c) {
+	backend_release_thread(c->backend);
+	for (int i = 0; i < c->n_extra_backends; i++)
+		backend_release_thread(c->extra_backends[i]);
+}
+
 status_code context_init(context *c, const config *cfg) {
 	memset(c, 0, sizeof(*c));
-	monitor_reset(&c->monitor);
 
 	const char *mon_path =
 		cfg->monitor ? (cfg->monitor[0] ? cfg->monitor : "/tmp/kappai.monitor") : NULL;
 	if (mon_path) {
 		monitor_init(&c->monitor, mon_path);
 		g_monitor = &c->monitor;
-	}
+	} else
+		monitor_reset(&c->monitor);
 
 	status_code s = ERR_INVALID_ARG;
 	if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
@@ -749,6 +755,8 @@ static bool kv_reuse_plan_shift(context *c, const kv_reuse_plan *plan) {
 static int32_t context_reuse_prefix(context *c, const int32_t *ids, int n, kv_reuse_plan *plan) {
 	plan->n		  = 0;
 	int32_t reuse = fed_ids_common_prefix(c, ids, n);
+	if (n > 0 && reuse == n && reuse < c->fed_ids.n)
+		reuse--;
 	if (reuse >= c->fed_ids.n) {
 		DEBUG("prefix reuse: %d of %d prompt tokens already cached", (int)reuse, n);
 		return reuse;
@@ -1026,8 +1034,8 @@ static void debug_print_logits(context *c) {
 int32_t context_sample_next(context *c) {
 	if (c->debug_forward)
 		debug_print_logits(c);
-	if (c->backend && c->backend->argmax && (c->samp.temperature <= 0.0f || c->samp.top_k == 1) &&
-		c->samp.repeat_penalty == 1.0f) {
+	if (!c->logits_on_host && c->backend && c->backend->argmax &&
+		(c->samp.temperature <= 0.0f || c->samp.top_k == 1) && c->samp.repeat_penalty == 1.0f) {
 		int32_t		idx;
 		status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
 											c->m.vocab_size, &idx);
@@ -1629,7 +1637,7 @@ static void *idle_prefill_thread(void *arg) {
 	DEBUG("idle-prefill: %d tokens [%d..%d)", to_prefill, reuse, header_count);
 
 out:
-	backend_release_thread(c->backend);
+	context_release_thread(c);
 	free(header);
 	free(r1);
 	free(r2);
@@ -1640,7 +1648,7 @@ void context_idle_prefill_start(context *c) {
 	if (!c || c->idle.active)
 		return;
 	c->idle.active = true;
-	backend_release_thread(c->backend);
+	context_release_thread(c);
 	if (pthread_create(&c->idle.thread, NULL, idle_prefill_thread, c) != 0)
 		c->idle.active = false;
 }

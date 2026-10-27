@@ -99,7 +99,7 @@ struct moe_stream_cache {
 	_Atomic uint64_t stat_fill_direct_fallback_copy;
 	_Atomic uint64_t stat_fill_memcpy;
 	_Atomic uint64_t stat_fill_bytes;
-	int				 pin_fail_warned;
+	_Atomic int		 pin_fail_warned;
 };
 
 typedef struct {
@@ -291,13 +291,13 @@ static void moe_nomap_open(moe_stream_cache *c, const char *path) {
 		WARN("moe no-mmap: could not open '%s' for expert streaming (%s)", path, strerror(errno));
 		return;
 	}
-	posix_fadvise(c->nomap_fd, 0, 0, POSIX_FADV_RANDOM);
+	file_advise(c->nomap_fd, 0, 0, FILE_ADVICE_RANDOM);
 
 	struct stat nst;
 	if (fstat(c->nomap_fd, &nst) == 0 && S_ISREG(nst.st_mode) && nst.st_size > 0)
 		c->nomap_file_size = (uint64_t)nst.st_size;
 
-	int fd = open(path, O_RDONLY | O_DIRECT);
+	int fd = open(path, O_RDONLY);
 	if (fd < 0) {
 		DEBUG("moe no-mmap: O_DIRECT unavailable (%s), using buffered reads", strerror(errno));
 		return;
@@ -322,9 +322,9 @@ static void moe_nomap_close(moe_stream_cache *c) {
 	}
 }
 
-static __thread void  *tl_bounce_buf   = NULL;
-static __thread size_t tl_bounce_cap   = 0;
-static __thread size_t tl_bounce_align = 0;
+static _Thread_local void  *tl_bounce_buf	= NULL;
+static _Thread_local size_t tl_bounce_cap	= 0;
+static _Thread_local size_t tl_bounce_align = 0;
 
 static void *bounce_buf_get(size_t align, size_t need) {
 	if (tl_bounce_buf && tl_bounce_align == align && tl_bounce_cap >= need)
@@ -354,8 +354,8 @@ static int bounce_read_aligned(int fd, uint64_t aligned_off, size_t aligned_len,
 	void *bounce = bounce_buf_get(align, aligned_len);
 	if (!bounce)
 		return -1;
-	ssize_t got = gguf_pread_full(fd, bounce, aligned_len, (off_t)aligned_off);
-	if ((size_t)got < head_slop + len)
+	ssize_t got = gguf_pread_full(fd, bounce, aligned_len, aligned_off);
+	if (got < 0 || (size_t)got < head_slop + len)
 		return -1;
 	memcpy(dst, (uint8_t *)bounce + head_slop, len);
 	return 0;
@@ -386,11 +386,13 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_direct_fd >= 0 && c->nomap_direct_align > 0) {
 		size_t align = c->nomap_direct_align;
 
-		if (precheck_aligned &&
-			(size_t)gguf_pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off) >= len) {
-			atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
-			return 0;
+		if (precheck_aligned) {
+			ssize_t got = gguf_pread_full(c->nomap_direct_fd, dst, len, file_off);
+			if (got >= 0 && (size_t)got >= len) {
+				atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
+				atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
+				return 0;
+			}
 		}
 
 		if (aligned_pread_bounce(c->nomap_direct_fd, align, file_off, len, dst, 0) == 0) {
@@ -405,9 +407,10 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_fd < 0)
 		return -1;
 	atomic_fetch_add_explicit(&c->stat_direct_fallback, 1, memory_order_relaxed);
-	if ((size_t)gguf_pread_full(c->nomap_fd, dst, len, (off_t)file_off) < len)
+	ssize_t got = gguf_pread_full(c->nomap_fd, dst, len, file_off);
+	if (got < 0 || (size_t)got < len)
 		return -1;
-	posix_fadvise(c->nomap_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
+	file_advise(c->nomap_fd, (off_t)file_off, (off_t)len, FILE_ADVICE_RELEASE);
 	return 0;
 }
 
@@ -418,8 +421,11 @@ static int moe_direct_io_read(moe_stream_cache *c, off_t file_off, size_t len, u
 
 	size_t align = c->direct_io_align;
 
-	if (precheck_aligned && (size_t)gguf_pread_full(c->direct_io_fd, dst, len, file_off) >= len)
-		return 0;
+	if (precheck_aligned) {
+		ssize_t got = gguf_pread_full(c->direct_io_fd, dst, len, (uint64_t)file_off);
+		if (got >= 0 && (size_t)got >= len)
+			return 0;
+	}
 
 	return aligned_pread_bounce(c->direct_io_fd, align, (uint64_t)file_off, len, dst,
 								c->backing_file_size);
