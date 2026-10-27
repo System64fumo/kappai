@@ -53,7 +53,6 @@ typedef int (*spin_until_fn)(void *ud);
 
 void cpu_relax(void);
 void spin_wait_relax(spin_until_fn pred, void *ud);
-int	 available_cpu_count(void);
 
 typedef enum {
 	FILE_ADVICE_RANDOM,

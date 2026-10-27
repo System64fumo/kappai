@@ -6,7 +6,7 @@
 #include "compute.h"
 #include "config.h"
 #include "kvcache.h"
-#include "mempool.h"
+#include "memory.h"
 #include "model.h"
 #include "monitor.h"
 #include "sampler.h"

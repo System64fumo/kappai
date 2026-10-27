@@ -1,7 +1,7 @@
 #include "test_core.h"
 
 #include "arch.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "model.h"
 
 static float *ref_softmax_attn(const float *q, const float *k, const float *v, int n_heads, int kvh,

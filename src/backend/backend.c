@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "backend.h"
+#include "backend/cpu/common.h"
 #include "log.h"
-#include "memconfig.h"
 #include "model.h"
 #include <dirent.h>
 #include <dlfcn.h>
@@ -402,7 +402,7 @@ status_code backend_create(const char *name, int device_index, backend **out) {
 	return ERR_NOT_FOUND;
 }
 
-status_code backend_create_host(backend **out) {
+static status_code backend_host_template(backend *out) {
 	backend_load();
 	int				best_priority = -1;
 	backend_ctor_fn best_ctor	  = NULL;
@@ -447,8 +447,12 @@ status_code backend_create_host(backend **out) {
 		backend_dump_load_diagnosis();
 		return ERR_NOT_FOUND;
 	}
+	return best_ctor(out);
+}
+
+status_code backend_create_host(backend **out) {
 	backend	   *b = xcalloc(1, sizeof(backend));
-	status_code s = best_ctor(b);
+	status_code s = backend_host_template(b);
 	if (s != OK) {
 		free(b);
 		return s;
@@ -465,6 +469,20 @@ status_code backend_create_host(backend **out) {
 	log_op_homes(b);
 	*out = b;
 	return OK;
+}
+
+static cpu_cache_info (*g_host_cpu_info)(void);
+
+static void host_cpu_info_init(void) {
+	backend probe = {0};
+	if (backend_host_template(&probe) == OK)
+		g_host_cpu_info = probe.cpu_info;
+}
+
+cpu_cache_info backend_host_cpu_info(void) {
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, host_cpu_info_init);
+	return g_host_cpu_info ? g_host_cpu_info() : (cpu_cache_info){.n_cpus = 1};
 }
 
 int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max) {
@@ -712,13 +730,13 @@ status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {
 size_t backend_mem_available(const backend *b) {
 	if (b && b->mem_available)
 		return b->mem_available((backend *)b);
-	return get_available_memory();
+	return 0;
 }
 
 size_t backend_mem_total(const backend *b) {
 	if (b && b->mem_total)
 		return b->mem_total((backend *)b);
-	return get_total_memory();
+	return 0;
 }
 static int str_ends_with(const char *s, const char *suffix) {
 	size_t ls = strlen(s), lx = strlen(suffix);

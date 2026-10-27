@@ -5,7 +5,7 @@
 #include "json-c/json.h"
 #include "json_helpers.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "microhttpd.h"
 #include "sampler.h"
 #include "task.h"

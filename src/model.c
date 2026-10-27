@@ -2,7 +2,7 @@
 #include "model.h"
 #include "config.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
 #include "recipe.h"

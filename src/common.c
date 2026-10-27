@@ -11,7 +11,6 @@
 #if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
-#include <limits.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -148,24 +147,6 @@ void file_advise(int fd, off_t offset, off_t length, file_advice advice) {
 #else
 	(void)advice;
 #endif
-}
-
-int available_cpu_count(void) {
-#if defined(__linux__)
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-		int n = CPU_COUNT(&set);
-		if (n > 0)
-			return n;
-	}
-#endif
-#ifdef _SC_NPROCESSORS_ONLN
-	long n = sysconf(_SC_NPROCESSORS_ONLN);
-	if (n > 0)
-		return n > INT_MAX ? INT_MAX : (int)n;
-#endif
-	return 1;
 }
 
 const char *str_find_n(const char *s, size_t len, const char *needle, size_t needle_len) {

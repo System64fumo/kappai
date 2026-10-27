@@ -6,6 +6,7 @@
 #endif
 
 #include "threadpool.h"
+#include "backend/cpu/common.h"
 #include "common.h"
 #include "config.h"
 #include "log.h"
@@ -292,7 +293,7 @@ int tpool_default_n_threads(void) {
 	if (v > 0)
 		return v > TPOOL_MAX_THREADS ? TPOOL_MAX_THREADS : v;
 
-	int n = available_cpu_count();
+	int n = backend_host_cpu_info().n_cpus;
 	if (n > TPOOL_MAX_THREADS)
 		n = TPOOL_MAX_THREADS;
 	return n;

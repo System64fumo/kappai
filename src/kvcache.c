@@ -1,6 +1,6 @@
 #include "kvcache.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "recipe.h"
 
 #include <math.h>

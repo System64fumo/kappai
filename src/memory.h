@@ -1,10 +1,11 @@
-#ifndef MEMPOOL_H
-#define MEMPOOL_H
+#ifndef MEMORY_H
+#define MEMORY_H
 
 #include "backend/backend.h"
+#include "common.h"
 
-#include <stdbool.h>
-#include <stddef.h>
+typedef struct model  model;
+typedef struct config config;
 
 typedef struct {
 	backend *members[BACKEND_MAX];
@@ -26,5 +27,17 @@ size_t mem_topology_host_available(const mem_topology *t);
 size_t mem_topology_pool_available(const mem_topology *t, const backend *b);
 size_t mem_topology_available(const mem_topology *t);
 size_t mem_topology_total(const mem_topology *t);
+
+int	   model_kv_layer_pos_cap(const model *m, int n_ctx, int kv_layer);
+size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant, int compacted);
+size_t model_kv_slot_bytes(const model *m, int n_ctx, kv_quant_type kv_quant, int compacted,
+						   int slot);
+size_t model_device_weight_bytes(const model *m, const backend *b);
+size_t model_pending_weight_bytes(const model *m, const config *cfg);
+
+void model_mem_estimates_ensure(model *m);
+
+void report_memory(const model *m, const mem_topology *t, backend *kv_backend, int n_ctx,
+				   kv_quant_type kv_quant);
 
 #endif

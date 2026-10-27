@@ -1,15 +1,172 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "backend/cpu/common.h"
 #include "backend/backend.h"
-#include "memconfig.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include "threadpool.h"
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/sysinfo.h>
+#endif
+
+#define CACHE_DEFAULT_LINE 64
+#define CACHE_DEFAULT_L1D (32 * 1024)
+#define CACHE_DEFAULT_L2 (512 * 1024)
+#define CACHE_MAX_INDEX 8
+
+static int available_cpu_count(void) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+		int n = CPU_COUNT(&set);
+		if (n > 0)
+			return n;
+	}
+#endif
+#ifdef _SC_NPROCESSORS_ONLN
+	long n = sysconf(_SC_NPROCESSORS_ONLN);
+	if (n > 0)
+		return n > INT_MAX ? INT_MAX : (int)n;
+#endif
+	return 1;
+}
+
+cpu_cache_info g_cpu_cache = {
+	.line_bytes = CACHE_DEFAULT_LINE,
+	.l1d_bytes	= CACHE_DEFAULT_L1D,
+	.l2_bytes	= CACHE_DEFAULT_L2,
+};
+
+#if defined(__linux__)
+static int cache_read(int cpu, int idx, const char *field, char *buf, size_t cap) {
+	char path[160];
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index%d/%s", cpu, idx, field);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return 0;
+	char *ok = fgets(buf, (int)cap, f);
+	fclose(f);
+	if (!ok)
+		return 0;
+	buf[strcspn(buf, "\r\n")] = '\0';
+	return buf[0] != '\0';
+}
+
+static size_t cache_parse_size(const char *s) {
+	char		 *end;
+	unsigned long v = strtoul(s, &end, 10);
+	if (*end == 'K' || *end == 'k')
+		v <<= 10;
+	else if (*end == 'M' || *end == 'm')
+		v <<= 20;
+	else if (*end == 'G' || *end == 'g')
+		v <<= 30;
+	return (size_t)v;
+}
+
+static int cache_count_cpus(const char *list) {
+	int n = 0;
+	for (const char *p = list; *p;) {
+		char *end;
+		long  lo = strtol(p, &end, 10);
+		if (end == p)
+			break;
+		long hi = lo;
+		if (*end == '-')
+			hi = strtol(end + 1, &end, 10);
+		n += (int)(hi - lo + 1);
+		p = *end == ',' ? end + 1 : end;
+		if (p == end && *p)
+			break;
+	}
+	return n > 0 ? n : 1;
+}
+
+static void cache_keep_min(size_t *dst, size_t v) {
+	if (v && (!*dst || v < *dst))
+		*dst = v;
+}
+
+static void cpu_cache_init(void) {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) != 0)
+		return;
+	size_t l1d = 0, l2 = 0, l3 = 0, line = 0;
+	int	   n_cpus = 0;
+	for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+		if (!CPU_ISSET(cpu, &set))
+			continue;
+		n_cpus++;
+		for (int idx = 0; idx < CACHE_MAX_INDEX; idx++) {
+			char level[16], type[32], size[32], ln[16], shared[128];
+			if (!cache_read(cpu, idx, "level", level, sizeof(level)))
+				break;
+			if (!cache_read(cpu, idx, "type", type, sizeof(type)) ||
+				!cache_read(cpu, idx, "size", size, sizeof(size)) || !strcmp(type, "Instruction"))
+				continue;
+			size_t bytes = cache_parse_size(size);
+			if (cache_read(cpu, idx, "coherency_line_size", ln, sizeof(ln)))
+				cache_keep_min(&line, (size_t)atoi(ln));
+			switch (atoi(level)) {
+			case 1:
+				cache_keep_min(&l1d, bytes);
+				break;
+			case 2: {
+				int sharers = cache_read(cpu, idx, "shared_cpu_list", shared, sizeof(shared))
+								  ? cache_count_cpus(shared)
+								  : 1;
+				cache_keep_min(&l2, bytes / (size_t)sharers);
+				break;
+			}
+			case 3:
+				cache_keep_min(&l3, bytes);
+				break;
+			}
+		}
+	}
+	g_cpu_cache.n_cpus = n_cpus;
+	if (line >= 32 && line <= 256 && (line & (line - 1)) == 0)
+		g_cpu_cache.line_bytes = (int)line;
+	if (l1d)
+		g_cpu_cache.l1d_bytes = l1d;
+	if (l2)
+		g_cpu_cache.l2_bytes = l2;
+	g_cpu_cache.l3_bytes = l3;
+	g_cpu_cache.detected = l1d || l2 || l3;
+}
+#else
+static void cpu_cache_init(void) {
+	g_cpu_cache.n_cpus = available_cpu_count();
+#ifdef _SC_LEVEL1_DCACHE_SIZE
+	long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+	if (l1d > 0) {
+		g_cpu_cache.l1d_bytes = (size_t)l1d;
+		g_cpu_cache.detected  = 1;
+	}
+#endif
+}
+#endif
+
+__attribute__((constructor)) static void cpu_cache_ctor(void) {
+	cpu_cache_init();
+}
+
+static cpu_cache_info cpu_info(void) {
+	cpu_cache_info info = g_cpu_cache;
+	info.n_cpus			= available_cpu_count();
+	return info;
+}
 
 #define CPU_MATMUL_MIN_ROWS_PER_THREAD 32
 #define CPU_MATMUL_MULTI_MAX 8
@@ -1093,12 +1250,58 @@ status_code cpu_probe(void) {
 
 size_t cpu_mem_available(backend *self) {
 	(void)self;
-	return get_available_memory();
+#if defined(__linux__)
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (!f) {
+		struct sysinfo si;
+		if (sysinfo(&si) == 0)
+			return (size_t)si.freeram * (size_t)si.mem_unit;
+		return 0;
+	}
+	char   line[256];
+	size_t mem_available = 0;
+	size_t mem_free		 = 0;
+	size_t mem_cached	 = 0;
+	size_t mem_buffers	 = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (line[0] == 'M' && strncmp(line, "MemAvailable:", 13) == 0) {
+			mem_available = strtoull(line + 13, NULL, 10) * 1024;
+			break;
+		}
+		if (strncmp(line, "MemFree:", 8) == 0)
+			mem_free = strtoull(line + 8, NULL, 10) * 1024;
+		else if (strncmp(line, "Cached:", 7) == 0)
+			mem_cached = strtoull(line + 7, NULL, 10) * 1024;
+		else if (strncmp(line, "Buffers:", 8) == 0)
+			mem_buffers = strtoull(line + 8, NULL, 10) * 1024;
+	}
+	fclose(f);
+	return mem_available > 0 ? mem_available : mem_free + mem_cached + mem_buffers;
+#elif defined(__APPLE__)
+	return cpu_host_mem_available();
+#elif defined(_SC_AVPHYS_PAGES)
+	long pages = sysconf(_SC_AVPHYS_PAGES);
+	return pages > 0 ? (size_t)pages * (size_t)page_size_cached() : 0;
+#else
+	return 0;
+#endif
 }
 
 size_t cpu_mem_total(backend *self) {
 	(void)self;
-	return get_total_memory();
+#if defined(__linux__)
+	struct sysinfo si;
+	if (sysinfo(&si) != 0)
+		return 0;
+	return (size_t)si.totalram * (size_t)si.mem_unit;
+#elif defined(__APPLE__)
+	return cpu_host_mem_total();
+#elif defined(_SC_PHYS_PAGES)
+	long pages = sysconf(_SC_PHYS_PAGES);
+	return pages > 0 ? (size_t)pages * (size_t)page_size_cached() : 0;
+#else
+	return 0;
+#endif
 }
 
 status_code cpu_init(backend *self, int device_index) {
@@ -1829,6 +2032,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->matmul_thread_local			 = cpu_matmul_thread_local;
 	out->mem_available					 = cpu_mem_available;
 	out->mem_total						 = cpu_mem_total;
+	out->cpu_info						 = cpu_info;
 	out->rmsnorm_batch					 = cpu_rmsnorm_batch;
 	out->add_batch						 = cpu_add_batch;
 	out->ffn_activate_batch				 = cpu_ffn_activate_batch;

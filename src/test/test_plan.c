@@ -1,7 +1,6 @@
-#include "graph.h"
-#include "mem_plan.h"
-#include "partition.h"
+#include "recipe/graph.h"
 #include "recipe/internal.h"
+#include "recipe/plan.h"
 #include "test_core.h"
 
 #define record_plan(label, ok, ...) record_resultf(OPFAM_PLAN, (label), (ok), __VA_ARGS__)

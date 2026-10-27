@@ -1,4 +1,4 @@
-#include "graph.h"
+#include "recipe/graph.h"
 
 #include <stdio.h>
 #include <stdlib.h>

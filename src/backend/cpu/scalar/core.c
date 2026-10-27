@@ -1,7 +1,6 @@
 #include "backend/backend.h"
 #include "backend/cpu/common.h"
 #include "backend/cpu/quants.h"
-#include "memconfig.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include <math.h>

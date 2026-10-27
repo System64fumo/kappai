@@ -7,7 +7,8 @@
 
 #define BACKEND_MAX 8
 
-typedef struct backend backend;
+typedef struct backend		  backend;
+typedef struct cpu_cache_info cpu_cache_info;
 
 typedef status_code (*backend_ctor_fn)(backend *out);
 
@@ -404,6 +405,7 @@ struct backend {
 								int n, float gate_scale, float up_scale, int use_gelu);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
+	cpu_cache_info (*cpu_info)(void);
 	void (*release_thread)(backend *self);
 	status_code (*kv_shift)(backend *self, buffer *k, buffer *v, int layer,
 							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
@@ -494,8 +496,9 @@ void backend_set_fallback_warn(int enable);
 
 backend *backend_weight_home(backend *b, weight_class wc);
 
-size_t backend_mem_available(const backend *b);
-size_t backend_mem_total(const backend *b);
+size_t		   backend_mem_available(const backend *b);
+size_t		   backend_mem_total(const backend *b);
+cpu_cache_info backend_host_cpu_info(void);
 
 #define BACKEND_REGISTER(name_str, ctor_fn)                                                        \
 	static void __attribute__((constructor)) backend_autoreg_##ctor_fn(void) {                     \

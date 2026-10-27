@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "gguf.h"
+#include "backend/cpu/common.h"
 #include "log.h"
 #include "profile.h"
 #include <ctype.h>
@@ -1175,7 +1176,7 @@ static void *gguf_load_worker(void *arg) {
 }
 
 static int gguf_affinity_thread_count(void) {
-	int n_cpu = MIN(available_cpu_count(), GGUF_LOAD_MAX_THREADS);
+	int n_cpu = MIN(backend_host_cpu_info().n_cpus, GGUF_LOAD_MAX_THREADS);
 	int n	  = n_cpu * 4;
 	if (n < 8)
 		n = 8;

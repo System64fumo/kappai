@@ -5,7 +5,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "gguf.h"
-#include "mempool.h"
+#include "memory.h"
 
 struct model_recipe;
 typedef struct model_recipe model_recipe;

@@ -1,5 +1,5 @@
-#ifndef GRAPH_H
-#define GRAPH_H
+#ifndef RECIPE_GRAPH_H
+#define RECIPE_GRAPH_H
 
 #include "recipe.h"
 

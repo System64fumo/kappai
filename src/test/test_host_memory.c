@@ -60,11 +60,7 @@ static int mock_sysctl(const char *name, void *out, size_t *len, const void *new
 #define host_statistics64 mock_statistics
 #define mach_port_deallocate mock_deallocate
 #define sysctlbyname mock_sysctl
-#define get_available_memory test_available_memory
-#define get_total_memory test_total_memory
-#include "../host_memory.c"
-#undef get_total_memory
-#undef get_available_memory
+#include "backend/cpu/common.h"
 #undef sysctlbyname
 #undef mach_port_deallocate
 #undef host_statistics64
@@ -87,40 +83,40 @@ void run_host_memory_tests(void) {
 	memory_mock.count					= HOST_VM_INFO64_COUNT;
 	memory_mock.installed				= UINT64_C(16) << 30;
 	memory_mock.installed_size			= sizeof(memory_mock.installed);
-	memory_expect("memory.apple_total", test_total_memory(), (size_t)memory_mock.installed);
-	memory_expect("memory.apple_16k_pages", test_available_memory(), (size_t)600000 * 16384);
+	memory_expect("memory.apple_total", cpu_host_mem_total(), (size_t)memory_mock.installed);
+	memory_expect("memory.apple_16k_pages", cpu_host_mem_available(), (size_t)600000 * 16384);
 	memory_mock.page_size = 4096;
-	memory_expect("memory.apple_4k_pages", test_available_memory(), (size_t)600000 * 4096);
+	memory_expect("memory.apple_4k_pages", cpu_host_mem_available(), (size_t)600000 * 4096);
 	memory_mock.page_status = 1;
 	int queries				= memory_mock.queries;
-	memory_expect("memory.apple_page_failure", test_available_memory(), 0);
+	memory_expect("memory.apple_page_failure", cpu_host_mem_available(), 0);
 	memory_expect("memory.apple_skip_stats", memory_mock.queries, queries);
 	memory_mock.page_status	 = KERN_SUCCESS;
 	memory_mock.stats_status = 1;
-	memory_expect("memory.apple_stats_failure", test_available_memory(), 0);
+	memory_expect("memory.apple_stats_failure", cpu_host_mem_available(), 0);
 	memory_mock.stats_status = KERN_SUCCESS;
 	memory_mock.count		 = 0;
-	memory_expect("memory.apple_short_stats", test_available_memory(), 0);
+	memory_expect("memory.apple_short_stats", cpu_host_mem_available(), 0);
 	memory_mock.count	  = HOST_VM_INFO64_COUNT;
 	memory_mock.page_size = 0;
-	memory_expect("memory.apple_zero_page", test_available_memory(), 0);
+	memory_expect("memory.apple_zero_page", cpu_host_mem_available(), 0);
 	memory_mock.page_size			 = 16384;
 	memory_mock.stats.free_count	 = UINT32_MAX;
 	memory_mock.stats.inactive_count = UINT32_MAX;
 	uint64_t bytes					 = (UINT64_C(2) * UINT32_MAX) * 16384;
-	memory_expect("memory.apple_wide_sum", test_available_memory(),
+	memory_expect("memory.apple_wide_sum", cpu_host_mem_available(),
 				  bytes > SIZE_MAX ? SIZE_MAX : (size_t)bytes);
 	memory_mock.page_size = (vm_size_t)SIZE_MAX;
-	memory_expect("memory.apple_overflow", test_available_memory(), SIZE_MAX);
+	memory_expect("memory.apple_overflow", cpu_host_mem_available(), SIZE_MAX);
 	memory_expect("memory.apple_release_ports", memory_mock.releases, 8);
 	memory_mock.host = MACH_PORT_NULL;
-	memory_expect("memory.apple_missing_host", test_available_memory(), 0);
+	memory_expect("memory.apple_missing_host", cpu_host_mem_available(), 0);
 	memory_expect("memory.apple_no_null_release", memory_mock.releases, 8);
 	memory_mock.sysctl_status = -1;
-	memory_expect("memory.apple_sysctl_failure", test_total_memory(), 0);
+	memory_expect("memory.apple_sysctl_failure", cpu_host_mem_total(), 0);
 	memory_mock.sysctl_status  = 0;
 	memory_mock.installed_size = sizeof(memory_mock.installed) - 1;
-	memory_expect("memory.apple_short_total", test_total_memory(), 0);
+	memory_expect("memory.apple_short_total", cpu_host_mem_total(), 0);
 	memory_expect("memory.apple_api_arguments", memory_mock.errors, 0);
 }
 

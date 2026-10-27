@@ -2,19 +2,18 @@
 #define RECIPE_INTERNAL_H
 
 #include "backend/backend.h"
-#include "capability.h"
 #include "compute.h"
-#include "graph.h"
 #include "kvcache.h"
 #include "log.h"
-#include "mem_plan.h"
 #include "model.h"
 #include "moe/moe_common.h"
 #include "moe/moe_exec.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
-#include "partition.h"
 #include "recipe.h"
+#include "recipe/capability.h"
+#include "recipe/graph.h"
+#include "recipe/plan.h"
 #include <assert.h>
 #include <math.h>
 #include <pthread.h>

@@ -1,4 +1,4 @@
-#include "memconfig.h"
+#include "backend/cpu/common.h"
 #include "monitor.h"
 #include "test_core.h"
 #include "threadpool.h"
@@ -169,11 +169,11 @@ void run_portability_tests(void) {
 		record_resultf(OPFAM_EDGE_CASE, "common.bounded_search", offset == cases[i].offset,
 					   "case=%zu offset=%d", i, offset);
 	}
-	int n = available_cpu_count();
+	int n = backend_host_cpu_info().n_cpus;
 	record_resultf(OPFAM_EDGE_CASE, "common.cpu_count", n >= 1, "cpus=%d", n);
 #if defined(__linux__) || defined(__APPLE__)
-	size_t total	 = get_total_memory();
-	size_t available = get_available_memory();
+	size_t total	 = backend_mem_total(backend_host());
+	size_t available = backend_mem_available(backend_host());
 	record_resultf(OPFAM_EDGE_CASE, "memory.total", total > 0, "bytes=%zu", total);
 	record_resultf(OPFAM_EDGE_CASE, "memory.available", available > 0 && available <= total,
 				   "available=%zu total=%zu", available, total);

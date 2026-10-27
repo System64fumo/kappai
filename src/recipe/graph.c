@@ -1,6 +1,6 @@
-#include "graph.h"
+#include "recipe/graph.h"
 
-#include "capability.h"
+#include "recipe/capability.h"
 
 #include <limits.h>
 #include <stdlib.h>

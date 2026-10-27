@@ -1,9 +1,9 @@
 #include "context.h"
+#include "backend/cpu/common.h"
 #include "compute.h"
 #include "config.h"
-#include "cpu_cache.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "model.h"
 #include "moe/moe_stream.h"
 #include "recipe.h"
@@ -878,9 +878,10 @@ static size_t context_slot_bytes_per_token(const context *c) {
 static int context_prefill_chunk_size(const context *c, int n_threads) {
 	if (n_threads < 1)
 		n_threads = 1;
-	size_t ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
-	if (g_cpu_cache.l2_bytes > 0) {
-		size_t scaled = g_cpu_cache.l2_bytes * (size_t)n_threads;
+	size_t		   ws_target = PREFILL_CHUNK_WS_TARGET_BYTES;
+	cpu_cache_info cpu		 = backend_host_cpu_info();
+	if (cpu.l2_bytes > 0) {
+		size_t scaled = cpu.l2_bytes * (size_t)n_threads;
 		if (scaled < (1ull << 20))
 			scaled = (1ull << 20);
 		if (scaled > PREFILL_CHUNK_WS_TARGET_BYTES)

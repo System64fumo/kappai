@@ -1,7 +1,7 @@
 #ifndef MOE_TIER_H
 #define MOE_TIER_H
 
-#include "mempool.h"
+#include "memory.h"
 
 #include <stdbool.h>
 #include <stddef.h>
