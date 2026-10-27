@@ -48,20 +48,15 @@ typedef struct {
 	backend		*backend;
 	int			 allocated_n_ctx;
 	const model *last_model;
-	int			 last_n_ctx;
 } scratch_model;
 
 typedef struct {
 	float	 *transfer_buf;
 	size_t	  transfer_buf_cap;
-	float_buf batch_logits_tmp;
 	float_buf op_ws;
 	float_buf stage_a;
 	float_buf stage_b;
-	float	 *cur_host, *out_proj_host, *vf_host, *xf_host;
-	int		  small_host_dim;
-	int		  small_host_intermediate;
-	int		  small_host_kv_out;
+	float_buf scale_tmp;
 	uint8_t	 *last_only;
 	size_t	  last_only_cap;
 } scratch_run;
@@ -73,7 +68,6 @@ typedef struct {
 	float_buf		   xb_f;
 	buffer			   stage[MOE_STAGE_RING];
 	int				   stage_next;
-	float_buf		   shared_y;
 	moe_expert_slot	  *slot_buf;
 	moe_expert_slot	  *slot_dev;
 	expert_dev_scratch expert_dev;
@@ -90,7 +84,6 @@ typedef struct {
 } scratch_hybrid;
 
 typedef struct {
-	float	 *inp_host;
 	float_buf proj_host;
 	float_buf inpL_host;
 } scratch_ple;
@@ -120,8 +113,6 @@ void			  compute_scratch_free(compute_scratch *s);
 void			  expert_dev_scratch_release(expert_dev_scratch *ds);
 expert_dev_entry *expert_dev_scratch_get(expert_dev_scratch *ds, backend *eb, size_t floats);
 status_code		  compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx);
-
-void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, int kv_out);
 
 status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int token, int pos,
 							int flash_attn, float *logits_out);

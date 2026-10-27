@@ -6,7 +6,9 @@
 #include "log.h"
 #include "moe/moe_stream.h"
 
+#if HAVE_MALLOC
 #include <malloc.h>
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -316,9 +318,11 @@ static int grep_vocab(const char *model_path, const char *substr) {
 }
 
 static void engine_tune_allocator(void) {
+#if HAVE_MALLOC
 	mallopt(M_MMAP_THRESHOLD, 64 * 1024 * 1024);
 	mallopt(M_MMAP_MAX, 0);
 	mallopt(M_TRIM_THRESHOLD, -1);
+#endif
 }
 
 static void engine_init_logging(void) {
@@ -369,7 +373,9 @@ static int engine_load(context *ctx, cli_args *a) {
 
 	context_set_debug_prompt(ctx, a->debug_prompt);
 
+#if HAVE_MALLOC
 	malloc_trim(0);
+#endif
 
 	backend_release_thread(ctx->backend);
 

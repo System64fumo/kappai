@@ -186,10 +186,17 @@ void		run_hcs_tests(void);
 void		run_mempool_tests(void);
 void		run_moe_tier_tests(void);
 void		run_plan_tests(void);
-void		test_quant_determinism(backend *ref, const qtype_info *qt);
-void		test_quant_finiteness(backend *ref, const qtype_info *qt);
-void		test_quant_q8_0_roundtrip(backend *ref);
-void		run_repack_parity_tests(backend *ref, backend *tgt);
+void		run_gguf_tests(void);
+void		run_portability_tests(void);
+#if defined(__APPLE__)
+void run_host_memory_tests(void);
+#endif
+void run_model_lifecycle_tests(void);
+void run_server_task_tests(void);
+void test_quant_determinism(backend *ref, const qtype_info *qt);
+void test_quant_finiteness(backend *ref, const qtype_info *qt);
+void test_quant_q8_0_roundtrip(backend *ref);
+void run_repack_parity_tests(backend *ref, backend *tgt);
 void test_dequant_parity_cross(backend *ref, backend *tgt, const qtype_info *qt, int dim, int n);
 void test_dequant_weight_parity(backend *ref, backend *tgt, const qtype_info *qt, int k,
 								int n_rows);

@@ -2,6 +2,10 @@
 #include "log.h"
 #include <ctype.h>
 
+#define TOK_CHUNK_CACHE_SLOTS (1u << 14)
+#define TOK_CHUNK_CACHE_MAX_ENTRIES 4096
+#define TOK_CHUNK_CACHE_MAX_KEY 64
+
 typedef struct {
 	const char *p;
 	size_t		n;
@@ -9,6 +13,20 @@ typedef struct {
 	int32_t		id;
 	int			locked;
 } piece;
+
+typedef struct {
+	piece	 *pcs;
+	int		  npcs;
+	int		  head;
+	int		 *prev;
+	int		 *next;
+	uint8_t	 *alive;
+	uint32_t *ver;
+	int32_t	 *hrank;
+	int32_t	 *hnode;
+	uint32_t *hver;
+	int		  hn;
+} bpe_state;
 
 static const int g_byte_to_cp[256] = {
 	256, 257, 258, 259, 260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 271, 272, 273, 274,
@@ -550,27 +568,6 @@ static size_t next_pretoken_unicode(const char *s, size_t len, size_t *pos, int 
 	return 1;
 }
 
-typedef struct {
-	int32_t	 rank;
-	int32_t	 node;
-	uint32_t ver;
-} bpe_heap_entry;
-
-typedef struct {
-	piece	 *pcs;
-	int		  npcs;
-	int		  head;
-	int		 *prev;
-	int		 *next;
-	uint8_t	 *alive;
-	uint32_t *ver;
-
-	int32_t	 *hrank;
-	int32_t	 *hnode;
-	uint32_t *hver;
-	int		  hn;
-} bpe_state;
-
 static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 	const piece *a = &bs->pcs[i];
 	const piece *b = &bs->pcs[bs->next[i]];
@@ -644,10 +641,6 @@ static int bpe_work_reserve(tokenizer *t, size_t need) {
 	t->bpe_work_cap = (uint32_t)new_cap;
 	return 0;
 }
-
-#define TOK_CHUNK_CACHE_SLOTS (1u << 14)
-#define TOK_CHUNK_CACHE_MAX_ENTRIES 4096
-#define TOK_CHUNK_CACHE_MAX_KEY 64
 
 static const tok_cache_entry *chunk_cache_find(const tok_cache_entry *tab, uint32_t cap,
 											   const char *key, size_t klen) {

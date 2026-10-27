@@ -291,18 +291,6 @@ typedef struct {
 	int		   n_ops;
 } layer_recipe;
 
-typedef struct {
-	int		head_dim;
-	int		n_kv_heads;
-	int		intermediate;
-	int		kv_layer;
-	int		kv_row_stride;
-	int		q_row_stride;
-	uint8_t has_kv;
-	uint8_t has_own_v;
-	uint8_t is_global;
-} layer_ctx_entry;
-
 typedef struct model_recipe {
 	layer_recipe layer;
 	recipe_op	*pre_ops;
@@ -313,8 +301,6 @@ typedef struct model_recipe {
 	uint8_t		 logits_slot;
 
 	recipe_op *per_layer_ops;
-
-	layer_ctx_entry *layer_ctx;
 
 	struct cg_set	 *graphs;
 	struct exec_plan *exec;
@@ -379,7 +365,8 @@ recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx
 						 stage stage);
 recipe_op mk_matmul(uint8_t in, uint8_t out, uint8_t widx, int n, int k, stage stage);
 recipe_op mk_copy_k_to_v(uint8_t k_slot, uint8_t v_slot);
-void	  recipe_pack_per_layer_ops(model_recipe *r, int n_layers, int cap, int max_ops);
+void recipe_build_layers(model_recipe *r, const struct model *m, int cap, const char *arch_name,
+						 void (*append_layer)(op_emitter *, const struct model *, int));
 recipe_op mk_matmul_multi2(uint8_t in, uint8_t out0, uint8_t out1, uint8_t widx, int n0, int n1,
 						   int k);
 recipe_op mk_matmul_multi3(uint8_t in, uint8_t out0, uint8_t out1, uint8_t out2, uint8_t widx,
@@ -417,11 +404,11 @@ recipe_op mk_rope_qk_fused(uint8_t q, uint8_t k, int n_heads, int n_kv_heads, in
 recipe_op mk_rope_ext(uint8_t in, int is_q, int rope_neox);
 recipe_op mk_qk_norm_rope(uint8_t q, uint8_t k, float eps, int rope_neox);
 recipe_op mk_partial_rope_qk(uint8_t q, uint8_t k);
-int		  recipe_append_dense_ffn(recipe_op *ops, int i, const struct model *m, int li);
-int		  recipe_append_dense_ffn_ex(recipe_op *ops, int i, const struct model *m, int li,
-									 uint8_t norm_widx);
-int recipe_append_moe_ffn(recipe_op *ops, int i, const struct model *m, uint8_t router_in_slot,
-						  uint8_t experts_in_slot, uint8_t out_slot);
+void	  recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_fused,
+									 int has_matmul_multi, int activation);
+void	  recipe_emit_dense_ffn(op_emitter *e, const struct model *m, int li, uint8_t norm_widx);
+void	  recipe_emit_moe_ffn(op_emitter *e, const struct model *m, uint8_t router_in_slot,
+							  uint8_t experts_in_slot, uint8_t out_slot);
 
 const recipe_op *recipe_layer_ops(const model_recipe *r, int li);
 typedef enum {

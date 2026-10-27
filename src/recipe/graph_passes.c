@@ -1,8 +1,21 @@
-#include "graph.h"
+#include "recipe/graph.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef int (*backend_pred)(const backend *be);
+
+static const graph_pass OPTIMIZE_PASSES[] = {
+	{"refine_matmul_stages", graph_refine_matmul_stages},
+	{"fuse_output_scale", graph_fuse_output_scale},
+	{"fuse_gate_up_multi", graph_fuse_gate_up_multi},
+	{"coalesce_matmul_runs", graph_coalesce_matmul_runs},
+	{"fuse_rmsnorm_add_norm", graph_fuse_rmsnorm_add_norm},
+	{"fuse_matmul_residual", graph_fuse_matmul_residual},
+};
+
+enum { N_PASSES = ARRAY_LEN(OPTIMIZE_PASSES) };
 
 static void graph_compact(cg_graph *g) {
 	int *remap = xmalloc((size_t)g->n_nodes * sizeof(int));
@@ -54,8 +67,6 @@ int graph_run_passes(cg_graph *g, const graph_pass *passes, int n_passes, const 
 	}
 	return total;
 }
-
-typedef int (*backend_pred)(const backend *be);
 
 static int has_matmul_residual(const backend *be) {
 	return backend_has_cap(be, BCAP_MATMUL_RESIDUAL);
@@ -415,17 +426,6 @@ int graph_lower_section(const cg_graph *g, cg_section section, const recipe_op *
 	return n_lowered;
 }
 
-#define N_PASSES ((int)ARRAY_LEN(OPTIMIZE_PASSES))
-
-static const graph_pass OPTIMIZE_PASSES[] = {
-	{"refine_matmul_stages", graph_refine_matmul_stages},
-	{"fuse_output_scale", graph_fuse_output_scale},
-	{"fuse_gate_up_multi", graph_fuse_gate_up_multi},
-	{"coalesce_matmul_runs", graph_coalesce_matmul_runs},
-	{"fuse_rmsnorm_add_norm", graph_fuse_rmsnorm_add_norm},
-	{"fuse_matmul_residual", graph_fuse_matmul_residual},
-};
-
 static void lower_into(const cg_graph *g, cg_section section, recipe_op *ops, int n_ops) {
 	if (n_ops <= 0)
 		return;
@@ -449,7 +449,7 @@ static void log_pass_totals(const int *totals) {
 			break;
 		used += (size_t)n;
 	}
-	INFO("graph: optimization passes changed: %s", used ? line : "nothing");
+	DEBUG("graph: optimization passes changed: %s", used ? line : "nothing");
 }
 
 void graph_optimize_recipe(model_recipe *r, const struct model *m) {

@@ -1,5 +1,15 @@
 #include "recipe/internal.h"
 
+typedef struct {
+	float		*out;
+	float		*state;
+	const float *mixed;
+	const float *conv_w;
+	int			 dim, kernel, history;
+	int			 in_stride, out_stride;
+	int			 n_rows;
+} shortconv_job;
+
 static status_code split_qgate_run(exec_ctx *ctx, backend *t) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
@@ -192,16 +202,6 @@ static int lfm_attn_buf(const model *m) {
 	int q_out = m->n_heads * m->head_dim;
 	return buf > q_out ? buf : q_out;
 }
-
-typedef struct {
-	float		*out;
-	float		*state;
-	const float *mixed;
-	const float *conv_w;
-	int			 dim, kernel, history;
-	int			 in_stride, out_stride;
-	int			 n_rows;
-} shortconv_job;
 
 static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;

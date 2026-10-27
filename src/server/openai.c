@@ -5,9 +5,10 @@
 #include "json-c/json.h"
 #include "json_helpers.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "microhttpd.h"
 #include "sampler.h"
+#include "task.h"
 #include "toolcall.h"
 
 #include <errno.h>
@@ -19,13 +20,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
-#include <ucontext.h>
 #include <unistd.h>
 
 #define MAX_BODY_BYTES (32 * 1024 * 1024)
 #define SSE_POLL_SEC 1
+#define TASK_STACK_BYTES ((size_t)16 << 20)
 
 typedef struct {
 	bool	 stream;
@@ -137,9 +137,7 @@ typedef struct {
 	openai_state *st;
 	oa_job		 *job;
 	oa_slot		 *slot;
-	ucontext_t	  uc;
-	void		 *stack;
-	bool		  done;
+	server_task	 *runner;
 
 	bool		decode_pending;
 	int32_t		decode_token;
@@ -149,13 +147,14 @@ typedef struct {
 } oa_task;
 
 typedef struct {
-	oa_task **tasks;
-	int32_t	 *tokens;
-	int		 *positions;
-	kvcache **caches;
-	float	 *logits;
-	size_t	  logits_cap;
-	int		  n;
+	compute_scratch scratch;
+	oa_task		  **tasks;
+	int32_t		   *tokens;
+	int			   *positions;
+	kvcache		  **caches;
+	float		   *logits;
+	size_t			logits_cap;
+	int				n;
 } oa_decode_batch;
 
 struct openai_state {
@@ -179,18 +178,25 @@ struct openai_state {
 
 	pthread_t worker;
 
-	ucontext_t		sched_uc;
 	oa_task		  **tasks;
 	int				n_tasks;
 	oa_decode_batch decode;
 
 	struct MHD_Daemon *daemon;
 	struct sockaddr	  *bind_addr;
-	socklen_t		   bind_len;
 	atomic_bool		   shutting_down;
 };
 
 static sigset_t g_signal_mask;
+
+typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									const char *url, const char *method);
+
+typedef struct {
+	const char *method;
+	const char *path;
+	route_fn	fn;
+} route;
 
 static char *derive_model_id(const char *model_path) {
 	const char *base = path_basename(model_path);
@@ -1032,8 +1038,6 @@ static void run_generation(req_ctx *rc, oa_slot *slot) {
 		pthread_cond_broadcast(&g->q_cv);
 		pthread_mutex_unlock(&g->q_mtx);
 	}
-	backend_release_thread(c->backend);
-
 	if (g->streaming)
 		sse_finish_stream(g);
 }
@@ -1223,10 +1227,6 @@ static void slot_adopt_chat_chain(oa_slot *s, oa_job *j) {
 	s->n_msgs = cts->n_messages;
 }
 
-#define TASK_STACK_BYTES ((size_t)16 << 20)
-
-static oa_task *task_entering;
-
 static void fail_job(openai_state *st, oa_job *j) {
 	oa_gen *g	 = &j->rc->gen;
 	g->generated = -1;
@@ -1259,16 +1259,21 @@ static oa_slot *job_pick_slot(openai_state *st, oa_job *j, bool *matched) {
 
 static void task_yield(void *ud) {
 	oa_task *t = ud;
-	swapcontext(&t->uc, &t->st->sched_uc);
+#if SERVER_TASK_THREADED
+	context_release_thread(&t->slot->sess);
+#endif
+	server_task_yield(t->runner);
 }
 
 static status_code task_decode_step(void *ud, int32_t token, int pos, float *logits_out) {
-	oa_task *t		  = ud;
+	oa_task *t = ud;
+	if (gen_dead(&t->job->rc->gen))
+		return ERR_INTERRUPTED;
 	t->decode_token	  = token;
 	t->decode_pos	  = pos;
 	t->decode_logits  = logits_out;
 	t->decode_pending = true;
-	swapcontext(&t->uc, &t->st->sched_uc);
+	task_yield(t);
 	return t->decode_status;
 }
 
@@ -1279,8 +1284,6 @@ static void decode_batch_reserve(openai_state *st) {
 		b->tokens	 = xcalloc((size_t)st->slots_cap, sizeof(*b->tokens));
 		b->positions = xcalloc((size_t)st->slots_cap, sizeof(*b->positions));
 		b->caches	 = xcalloc((size_t)st->slots_cap, sizeof(*b->caches));
-		compute_scratch_reserve_rows(&st->slots[0].sess.m, &st->slots[0].sess.scratch,
-									 st->slots_cap);
 	}
 	size_t need = (size_t)st->slots_cap * (size_t)st->ctx->m.vocab_size;
 	if (b->logits_cap < need) {
@@ -1317,10 +1320,14 @@ static void run_decode_step(openai_state *st) {
 	if (b->n == 0)
 		return;
 
-	context	   *lead = &st->slots[0].sess;
-	status_code batch_status =
-		compute_forward_decode_batch(&lead->m, b->caches, &lead->scratch, b->tokens, b->positions,
-									 NULL, b->n, lead->flash_attn, b->logits);
+	context	   *lead		 = &st->slots[0].sess;
+	status_code batch_status = compute_scratch_ensure(&b->scratch, &lead->m, lead->n_ctx);
+	if (batch_status == OK) {
+		compute_scratch_reserve_rows(&lead->m, &b->scratch, st->slots_cap);
+		batch_status =
+			compute_forward_decode_batch(&lead->m, b->caches, &b->scratch, b->tokens, b->positions,
+										 NULL, b->n, lead->flash_attn, b->logits);
+	}
 
 	const size_t vocab = (size_t)st->ctx->m.vocab_size;
 	for (int i = 0; i < b->n; i++) {
@@ -1335,8 +1342,9 @@ static void run_decode_step(openai_state *st) {
 	}
 }
 
-static void task_main(void) {
-	oa_task		 *t	 = task_entering;
+static void task_main(server_task *runner, void *ud) {
+	(void)runner;
+	oa_task		 *t	 = ud;
 	openai_state *st = t->st;
 	oa_job		 *j	 = t->job;
 	oa_gen		 *g	 = &j->rc->gen;
@@ -1351,7 +1359,10 @@ static void task_main(void) {
 		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected"
 																	 : "completed");
 	job_free(st, j);
-	t->done = true;
+#if SERVER_TASK_THREADED
+	context_release_thread(&t->slot->sess);
+	moe_stream_thread_cleanup();
+#endif
 }
 
 static bool task_start(openai_state *st, oa_job *j) {
@@ -1372,28 +1383,20 @@ static bool task_start(openai_state *st, oa_job *j) {
 		 (int)(slot - st->slots), matched ? "continuing existing session" : "fresh start",
 		 j->rc->params.n_messages);
 
-	void *stack = mmap(NULL, TASK_STACK_BYTES, PROT_READ | PROT_WRITE,
-					   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
-	if (stack == MAP_FAILED) {
-		ERROR("server: failed to allocate task stack");
-		fail_job(st, j);
-		return true;
-	}
-	mprotect(stack, (size_t)sysconf(_SC_PAGESIZE), PROT_NONE);
-
 	oa_task *t = xcalloc(1, sizeof(*t));
 	t->st	   = st;
 	t->job	   = j;
 	t->slot	   = slot;
-	t->stack   = stack;
-	getcontext(&t->uc);
-	t->uc.uc_stack.ss_sp   = stack;
-	t->uc.uc_stack.ss_size = TASK_STACK_BYTES;
-	t->uc.uc_link		   = &st->sched_uc;
-	makecontext(&t->uc, task_main, 0);
+	int rc	   = server_task_create(&t->runner, TASK_STACK_BYTES, task_main, t);
+	if (rc != 0) {
+		ERROR("server: failed to start generation task: %s", strerror(rc));
+		free(t);
+		fail_job(st, j);
+		return true;
+	}
 
 	slot->busy				  = true;
-	slot->sess.logits_on_host = false;
+	slot->sess.logits_on_host = true;
 	slot->sess.yield		  = task_yield;
 	slot->sess.yield_ud		  = t;
 	slot->sess.decode_step	  = task_decode_step;
@@ -1403,12 +1406,12 @@ static bool task_start(openai_state *st, oa_job *j) {
 }
 
 static void task_finish(openai_state *st, int idx) {
-	oa_task *t					 = st->tasks[idx];
+	oa_task *t = st->tasks[idx];
+	server_task_join(t->runner);
 	t->slot->sess.yield			 = NULL;
 	t->slot->sess.yield_ud		 = NULL;
 	t->slot->sess.decode_step	 = NULL;
 	t->slot->sess.decode_step_ud = NULL;
-	munmap(t->stack, TASK_STACK_BYTES);
 	free(t);
 	st->tasks[idx] = st->tasks[--st->n_tasks];
 }
@@ -1428,6 +1431,11 @@ static void admit_jobs(openai_state *st) {
 		if (task_start(st, j))
 			continue;
 		pthread_mutex_lock(&st->sch_mtx);
+		if (shutting_down(st)) {
+			pthread_mutex_unlock(&st->sch_mtx);
+			fail_job(st, j);
+			return;
+		}
 		j->next	   = st->q_head;
 		st->q_head = j;
 		if (!st->q_tail)
@@ -1456,22 +1464,30 @@ static void *worker_main(void *arg) {
 		admit_jobs(st);
 
 		for (int i = 0; i < st->n_tasks;) {
-			oa_task *t	  = st->tasks[i];
-			task_entering = t;
-			swapcontext(&st->sched_uc, &t->uc);
-			if (t->done)
+			oa_task *t = st->tasks[i];
+			if (shutting_down(st))
+				t->slot->sess.interrupt = 1;
+#if SERVER_TASK_THREADED
+			context_release_thread(st->ctx);
+#endif
+			if (server_task_resume(t->runner))
 				task_finish(st, i);
 			else
 				i++;
 		}
 		run_decode_step(st);
 	}
-	backend_release_thread(st->ctx->backend);
+	context_release_thread(st->ctx);
+	moe_stream_thread_cleanup();
 	return NULL;
 }
 
-static void job_push(openai_state *st, oa_job *j) {
+static bool job_push(openai_state *st, oa_job *j) {
 	pthread_mutex_lock(&st->sch_mtx);
+	if (shutting_down(st)) {
+		pthread_mutex_unlock(&st->sch_mtx);
+		return false;
+	}
 	j->next = NULL;
 	if (st->q_tail)
 		st->q_tail->next = j;
@@ -1480,6 +1496,7 @@ static void job_push(openai_state *st, oa_job *j) {
 	st->q_tail = j;
 	pthread_cond_signal(&st->sch_cv);
 	pthread_mutex_unlock(&st->sch_mtx);
+	return true;
 }
 
 static void job_wait_done(req_ctx *rc) {
@@ -1494,11 +1511,7 @@ static void jobs_cancel(openai_state *st) {
 	while (st->q_head) {
 		oa_job *j  = st->q_head;
 		st->q_head = j->next;
-		pthread_mutex_lock(&j->rc->gen.q_mtx);
-		j->rc->gen.generation_done = true;
-		pthread_cond_broadcast(&j->rc->gen.q_cv);
-		pthread_mutex_unlock(&j->rc->gen.q_mtx);
-		job_free(st, j);
+		fail_job(st, j);
 	}
 	st->q_tail = NULL;
 }
@@ -1557,7 +1570,11 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 						 .session_key = key};
 	rc_ref(rc);
 	INFO("push j=%p chain=%p", (void *)j, (void *)j->chain);
-	job_push(st, j);
+	if (!job_push(st, j)) {
+		job_free(st, j);
+		return respond_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
+							error_body("Server is shutting down", "server_error"));
+	}
 
 	if (rc->gen.streaming) {
 		rc_ref(rc);
@@ -1638,15 +1655,6 @@ static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *con
 	return respond_json(conn, MHD_HTTP_OK, models_body(st));
 }
 
-typedef enum MHD_Result (*route_fn)(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
-									const char *url, const char *method);
-
-typedef struct {
-	const char *method;
-	const char *path;
-	route_fn	fn;
-} route;
-
 static const route routes[] = {
 	{"GET", "/health", route_health},
 	{"GET", "/", route_root},
@@ -1722,6 +1730,7 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	st->n_slots	  = 1;
 	if (context_slot_init(&st->slots[0].sess, st->ctx) != OK) {
 		ERROR("openai: failed to allocate base session slot");
+		context_slot_free(&st->slots[0].sess);
 		free(st->slots);
 		free(st->tasks);
 		free(st->model_id);
@@ -1738,10 +1747,12 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	slot_warm(&st->slots[0].sess, args->warmup);
 	if (args->warmup && !st->slots[0].sess.session_poisoned)
 		context_idle_prefill_start(&st->slots[0].sess);
-	backend_release_thread(st->ctx->backend);
+	context_release_thread(st->ctx);
 
 	if (pthread_create(&st->worker, NULL, worker_main, st) != 0) {
 		ERROR("openai: failed to start scheduler worker");
+		context_slot_free(&st->slots[0].sess);
+		context_release_thread(st->ctx);
 		free(st->slots);
 		free(st->tasks);
 		free(st->model_id);
@@ -1751,8 +1762,8 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 		free(st);
 		return NULL;
 	}
-	INFO("openai: model=%s api-key=%s slots=%d", st->model_id, st->api_key ? "set" : "unset",
-		 st->slots_cap);
+	INFO("openai: model=%s api-key=%s slots=%d tasks=%s", st->model_id,
+		 st->api_key ? "set" : "unset", st->slots_cap, SERVER_TASK_BACKEND_NAME);
 	return st;
 }
 
@@ -1777,7 +1788,6 @@ bool openai_bind(openai_state *st, const char *host, int port) {
 	}
 	st->bind_addr = xmalloc(ai->ai_addrlen);
 	memcpy(st->bind_addr, ai->ai_addr, ai->ai_addrlen);
-	st->bind_len = ai->ai_addrlen;
 	freeaddrinfo(ai);
 	return true;
 }
@@ -1814,10 +1824,9 @@ void openai_stop(openai_state *st) {
 		return;
 	atomic_store_explicit(&st->shutting_down, true, memory_order_relaxed);
 	pthread_mutex_lock(&st->sch_mtx);
+	jobs_cancel(st);
 	pthread_cond_broadcast(&st->sch_cv);
 	pthread_mutex_unlock(&st->sch_mtx);
-	for (int i = 0; i < st->n_slots; i++)
-		st->slots[i].sess.interrupt = 1;
 	if (st->daemon)
 		MHD_stop_daemon(st->daemon);
 	st->daemon = NULL;
@@ -1828,6 +1837,7 @@ void openai_free(openai_state *st) {
 		return;
 	openai_stop(st);
 	pthread_join(st->worker, NULL);
+	compute_scratch_free(&st->decode.scratch);
 	for (int i = 0; i < st->n_slots; i++)
 		if (st->slots[i].owns)
 			context_slot_free(&st->slots[i].sess);

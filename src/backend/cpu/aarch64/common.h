@@ -1,7 +1,7 @@
 #ifndef CPU_AARCH64_COMMON_H
 #define CPU_AARCH64_COMMON_H
 
-#include "cpu_cache.h"
+#include "backend/cpu/common.h"
 
 #include <arm_neon.h>
 #include <string.h>

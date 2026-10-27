@@ -1,5 +1,35 @@
 #include "recipe/internal.h"
 
+typedef struct {
+	struct model *m;
+	backend		 *host;
+	backend		 *dev;
+	int			  total_ple;
+	int			  dim;
+	int			  n_embd_per_layer;
+	int			  n_layers;
+	float		  n_embd_sqrt;
+	float		  inv_sqrt_ple;
+	float		  eps;
+} ple_build_plan;
+
+typedef struct {
+	struct model			   *m;
+	const struct layer_weights *L;
+	int							li;
+	int							n_embd_per_layer;
+	int							total_ple;
+	int							inj_dim;
+	float						eps;
+	const buffer			   *gate_w;
+	const buffer			   *proj_w;
+	const buffer			   *post_norm_w;
+	uint32_t					gate_type;
+	uint32_t					proj_type;
+} ple_inject_plan;
+
+enum { PLE_BUILD_AUTO, PLE_BUILD_DEVICE, PLE_BUILD_HOST };
+
 static status_code ple_ensure_norm_w(backend *a, compute_scratch *s, model *m,
 									 int n_embd_per_layer) {
 	if (s->model.ple_proj_norm_w_uploaded)
@@ -15,19 +45,6 @@ static status_code ple_ensure_norm_w(backend *a, compute_scratch *s, model *m,
 	s->model.ple_proj_norm_w_uploaded = 1;
 	return OK;
 }
-
-typedef struct {
-	struct model *m;
-	backend		 *host;
-	backend		 *dev;
-	int			  total_ple;
-	int			  dim;
-	int			  n_embd_per_layer;
-	int			  n_layers;
-	float		  n_embd_sqrt;
-	float		  inv_sqrt_ple;
-	float		  eps;
-} ple_build_plan;
 
 static void ple_build_plan_fill(ple_build_plan *p, struct model *m, backend *dev) {
 	p->m				= m;
@@ -120,21 +137,6 @@ static void ple_host_finish(const ple_build_plan *p, float *ple, float *proj, in
 	host->ple_combine(host, &ple_view, &proj_view2, n_rows * p->total_ple, 0.70710678118654752f);
 }
 
-typedef struct {
-	struct model			   *m;
-	const struct layer_weights *L;
-	int							li;
-	int							n_embd_per_layer;
-	int							total_ple;
-	int							inj_dim;
-	float						eps;
-	const buffer			   *gate_w;
-	const buffer			   *proj_w;
-	const buffer			   *post_norm_w;
-	uint32_t					gate_type;
-	uint32_t					proj_type;
-} ple_inject_plan;
-
 static int ple_inject_plan_fill(ple_inject_plan *p, struct model *m, int li) {
 	if (li < 0 || li >= m->n_layers)
 		return 0;
@@ -152,8 +154,6 @@ static int ple_inject_plan_fill(ple_inject_plan *p, struct model *m, int li) {
 	p->proj_type		= p->L->ple_proj_w.type;
 	return 1;
 }
-
-enum { PLE_BUILD_AUTO, PLE_BUILD_DEVICE, PLE_BUILD_HOST };
 
 static status_code ple_build_run(exec_ctx *ctx, int mode) {
 

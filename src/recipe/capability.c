@@ -1,4 +1,4 @@
-#include "capability.h"
+#include "recipe/capability.h"
 
 const char *cap_host_only_fn(op_kind kind) {
 	if (kind == OP_SHORTCONV)

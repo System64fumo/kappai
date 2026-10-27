@@ -45,8 +45,7 @@ static model_recipe *build_glm_dsa_recipe(const model *m) {
 
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 
-		e.count = recipe_append_moe_ffn(e.ops, e.count, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB,
-										RECIPE_SLOT_XB2);
+		recipe_emit_moe_ffn(&e, m, RECIPE_SLOT_XB, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
 
 		OP_EMIT(&e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
 		if (m->moe.n_shared_experts > 0)

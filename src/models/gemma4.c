@@ -105,14 +105,16 @@ static void gemma4_append_ffn_tail(op_emitter *e, const model *m) {
 	OP_EMIT(e, mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
 }
 
-static void gemma4_append_dense_layer(op_emitter *e, const model *m, int li, int has_matmul_multi) {
+static void gemma4_append_dense_layer(op_emitter *e, const model *m, int li) {
+	const int has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
 	gemma4_append_attn_block(e, m, li, has_matmul_multi);
 	gemma4_append_ffn_prefix(e, m, li, has_matmul_multi);
 	gemma4_append_ffn_tail(e, m);
 }
 
-static void gemma4_append_moe_layer(op_emitter *e, const model *m, int li, int has_matmul_multi) {
-	const float eps = m->norm_eps;
+static void gemma4_append_moe_layer(op_emitter *e, const model *m, int li) {
+	const int	has_matmul_multi = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
+	const float eps				 = m->norm_eps;
 
 	gemma4_append_attn_block(e, m, li, has_matmul_multi);
 	gemma4_append_ffn_prefix(e, m, li, has_matmul_multi);
@@ -121,8 +123,7 @@ static void gemma4_append_moe_layer(op_emitter *e, const model *m, int li, int h
 						  STAGE_RMSNORM));
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_PRE_NORM_2, eps,
 						  STAGE_RMSNORM));
-	e->count = recipe_append_moe_ffn(e->ops, e->count, m, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB,
-									 RECIPE_SLOT_XB2);
+	recipe_emit_moe_ffn(e, m, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, RECIPE_SLOT_XB2);
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_XB2, RECIPE_SLOT_XB2, WIDX_FFN_POST_NORM_2, eps, STAGE_RMSNORM));
 	OP_EMIT(e, mk_add(RECIPE_SLOT_XB2, RECIPE_SLOT_FFN_ACT, STAGE_ADD));
@@ -130,30 +131,11 @@ static void gemma4_append_moe_layer(op_emitter *e, const model *m, int li, int h
 	gemma4_append_ffn_tail(e, m);
 }
 
-typedef void (*gemma4_layer_fn)(op_emitter *e, const model *m, int li, int has_matmul_multi);
-
-static void gemma4_build_layers(model_recipe *r, const model *m, int cap, const char *arch_name,
-								gemma4_layer_fn append_layer) {
-	const int has_mm = backend_has_cap(m->backend, BCAP_MULTI_MATMUL);
-
-	r->layer.ops	 = xcalloc((size_t)cap, sizeof(recipe_op));
-	r->layer.n_ops	 = cap;
-	r->per_layer_ops = xcalloc((size_t)m->n_layers * cap, sizeof(recipe_op));
-	int max_ops		 = 0;
-	for (int li = 0; li < m->n_layers; li++) {
-		op_emitter e = op_emitter_make(r->per_layer_ops + (size_t)li * cap, cap, arch_name);
-		append_layer(&e, m, li, has_mm);
-		if (e.count > max_ops)
-			max_ops = e.count;
-	}
-	recipe_pack_per_layer_ops(r, m->n_layers, cap, max_ops);
-}
-
 static model_recipe *build_gemma4_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));
 
 	recipe_build_pre_ops(r, m);
-	gemma4_build_layers(r, m, 28, "gemma4", gemma4_append_dense_layer);
+	recipe_build_layers(r, m, 28, "gemma4", gemma4_append_dense_layer);
 	recipe_build_post_ops(r, m);
 	return r;
 }
@@ -164,7 +146,7 @@ static model_recipe *build_gemma4_moe_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(model_recipe));
 
 	recipe_build_pre_ops(r, m);
-	gemma4_build_layers(r, m, 40, "gemma4_moe", gemma4_append_moe_layer);
+	recipe_build_layers(r, m, 40, "gemma4_moe", gemma4_append_moe_layer);
 	recipe_build_post_ops(r, m);
 	if (moe_stream_cache_init((struct model *)m) != OK) {
 		ERROR("recipe: failed to init MoE expert cache");

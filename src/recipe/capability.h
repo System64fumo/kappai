@@ -1,5 +1,5 @@
-#ifndef CAPABILITY_H
-#define CAPABILITY_H
+#ifndef RECIPE_CAPABILITY_H
+#define RECIPE_CAPABILITY_H
 
 #include "recipe.h"
 

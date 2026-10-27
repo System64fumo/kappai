@@ -9,11 +9,199 @@
 #include <string.h>
 #include <time.h>
 
+#define JINJA_MAX_BLOCK_DEPTH 100
+#define JINJA_MAX_RANGE_ELEMS (1 << 20)
+
 typedef struct {
 	char   **msgs;
 	uint32_t n;
 	uint32_t cap;
 } strlist;
+
+typedef struct {
+	jinja_value **vals;
+	uint32_t	  n;
+	uint32_t	  cap;
+} jinja_arena;
+
+typedef enum {
+	TOK_TEXT,
+	TOK_EXPR_OPEN,
+	TOK_EXPR_CLOSE,
+	TOK_STMT_OPEN,
+	TOK_STMT_CLOSE,
+	TOK_IDENT,
+	TOK_STRING,
+	TOK_NUMBER,
+	TOK_DOT,
+	TOK_LBRACKET,
+	TOK_RBRACKET,
+	TOK_LPAREN,
+	TOK_RPAREN,
+	TOK_COMMA,
+	TOK_COLON,
+	TOK_OP,
+	TOK_PIPE,
+	TOK_UNKNOWN,
+	TOK_EOF,
+} tok_type;
+
+typedef struct {
+	tok_type	type;
+	const char *start;
+	uint32_t	len;
+	bool		strip_left;
+	bool		strip_right;
+} token;
+
+typedef struct {
+	const char *src;
+	uint32_t	len;
+	uint32_t	pos;
+	token	   *toks;
+	uint32_t	n_toks;
+	uint32_t	cap_toks;
+	strlist		diagnostics;
+	char	   *errbuf;
+	uint32_t	errbuf_len;
+	uint32_t	text_start;
+	bool		next_strip_left;
+	bool		next_trim_nl;
+	uint32_t	tag_start;
+	bool		tag_is_expr;
+	bool		tag_strip_after;
+} lexer;
+
+typedef enum {
+	EX_STRING,
+	EX_NUMBER,
+	EX_IDENT,
+	EX_ATTR,
+	EX_INDEX,
+	EX_SLICE,
+	EX_BINOP,
+	EX_NOT,
+	EX_FILTER,
+	EX_ISDEFINED,
+	EX_CALL,
+	EX_LIST,
+	EX_TERNARY,
+	EX_METHODCALL,
+	EX_DYNINDEX,
+} expr_kind;
+
+typedef struct expr_arg {
+	char			 *name;
+	struct expr_node *val;
+	struct expr_arg	 *next;
+} expr_arg;
+
+typedef struct expr_node {
+	expr_kind		   kind;
+	char			  *str;
+	char			  *op;
+	struct expr_node  *a, *b, *c, *step;
+	expr_arg		  *args;
+	struct expr_node **items;
+	uint32_t		   n_items;
+} expr_node;
+
+typedef enum {
+	ST_TEXT,
+	ST_OUTPUT,
+	ST_IF,
+	ST_FOR,
+	ST_LIST,
+	ST_SET,
+	ST_MACRO,
+	ST_GENERATION,
+	ST_NOOP,
+	ST_BREAK,
+} stmt_kind;
+
+typedef struct macro_param {
+	char			   *name;
+	struct expr_node   *default_val;
+	struct macro_param *next;
+} macro_param;
+
+typedef struct stmt_node {
+	stmt_kind		   kind;
+	char			  *text;
+	expr_node		  *expr;
+	expr_node		  *cond;
+	struct stmt_node  *then_body;
+	struct stmt_node  *else_body;
+	char			  *loop_var;
+	char			  *loop_var2;
+	expr_node		  *iterable;
+	struct stmt_node  *body;
+	struct stmt_node **items;
+	uint32_t		   n_items;
+	char			  *set_name;
+	char			  *set_attr;
+	expr_node		  *set_val;
+	char			  *macro_name;
+	macro_param		  *macro_params;
+	struct stmt_node  *macro_body;
+	struct stmt_node  *next;
+} stmt_node;
+
+typedef struct {
+	lexer	*lx;
+	uint32_t pos;
+	char	*errbuf;
+	uint32_t errbuf_len;
+	bool	 failed;
+	strlist	 diagnostics;
+	strlist	 features;
+	uint16_t depth;
+} parser;
+
+typedef struct scope_entry {
+	char			   *name;
+	jinja_value		   *val;
+	struct scope_entry *next;
+} scope_entry;
+
+typedef struct scope {
+	scope_entry	 *entries;
+	struct scope *parent;
+} scope;
+
+typedef struct {
+	scope	*sc;
+	char	*errbuf;
+	size_t	 errbuf_len;
+	bool	 failed;
+	uint16_t call_depth;
+	bool	 break_hit;
+} eval_ctx;
+
+typedef jinja_value *(*jinja_filter_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args);
+typedef jinja_value *(*jinja_method_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args,
+										const char *name);
+
+static const char *g_op_words[]	  = {"and", "or", "not", "in", "is", NULL};
+static const char *k_test_names[] = {
+	"none",	   "null",	   "Null",	 "defined", "undefined", "string",
+	"mapping", "iterable", "number", "integer", "float",	 "sequence",
+	"boolean", "true",	   "false",	 "dict",	NULL,
+};
+static const char *k_supported_ops[] = {
+	"and", "or", "+", "-", "==", "!=", ">", "<", ">=", "<=", "in", NULL};
+
+static _Thread_local jinja_arena *g_render_arena	 = NULL;
+static _Thread_local time_t		  g_jinja_time_shift = 0;
+
+static expr_node	  *parse_expr(parser *p);
+static stmt_node	  *parse_block(parser *p);
+static int			   filter_name_supported(const char *name);
+static int			   method_name_supported(const char *name);
+static int			   test_name_supported(const char *name);
+static void			   exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
+static jinja_value	  *eval_expr(eval_ctx *ctx, expr_node *e);
+static jinja_filter_fn lookup_filter(const char *name);
 
 static void strlist_add(strlist *sl, char *msg) {
 	ARR_RESERVE(sl->msgs, sl->n, sl->cap);
@@ -42,15 +230,6 @@ static void strlist_report(const strlist *sl, char *errbuf, size_t errbuf_len) {
 		snprintf(errbuf, errbuf_len, "%s", sb.p);
 	sb_free(&sb);
 }
-
-typedef struct {
-	jinja_value **vals;
-	uint32_t	  n;
-	uint32_t	  cap;
-} jinja_arena;
-
-static _Thread_local jinja_arena *g_render_arena	 = NULL;
-static _Thread_local time_t		  g_jinja_time_shift = 0;
 
 void jinja_set_time_shift(time_t seconds) {
 	g_jinja_time_shift = seconds;
@@ -298,54 +477,6 @@ static const char *value_as_cstr(const jinja_value *v) {
 	return "";
 }
 
-typedef enum {
-	TOK_TEXT,
-	TOK_EXPR_OPEN,
-	TOK_EXPR_CLOSE,
-	TOK_STMT_OPEN,
-	TOK_STMT_CLOSE,
-	TOK_IDENT,
-	TOK_STRING,
-	TOK_NUMBER,
-	TOK_DOT,
-	TOK_LBRACKET,
-	TOK_RBRACKET,
-	TOK_LPAREN,
-	TOK_RPAREN,
-	TOK_COMMA,
-	TOK_COLON,
-	TOK_OP,
-	TOK_PIPE,
-	TOK_UNKNOWN,
-	TOK_EOF,
-} tok_type;
-
-typedef struct {
-	tok_type	type;
-	const char *start;
-	uint32_t	len;
-	bool		strip_left;
-	bool		strip_right;
-} token;
-
-typedef struct {
-	const char *src;
-	uint32_t	len;
-	uint32_t	pos;
-	token	   *toks;
-	uint32_t	n_toks;
-	uint32_t	cap_toks;
-	strlist		diagnostics;
-	char	   *errbuf;
-	uint32_t	errbuf_len;
-	uint32_t	text_start;
-	bool		next_strip_left;
-	bool		next_trim_nl;
-	uint32_t	tag_start;
-	bool		tag_is_expr;
-	bool		tag_strip_after;
-} lexer;
-
 static void lex_push(lexer *lx, tok_type type, const char *start, size_t len, int strip_left,
 					 int strip_right) {
 	ARR_RESERVE(lx->toks, lx->n_toks, lx->cap_toks);
@@ -390,8 +521,6 @@ static int is_ident_start(char c) {
 static int is_ident_char(char c) {
 	return isalnum((unsigned char)c) || c == '_';
 }
-
-static const char *g_op_words[] = {"and", "or", "not", "in", "is", NULL};
 
 static int lex_word_is_op(const char *s, size_t n) {
 	for (int i = 0; g_op_words[i]; i++)
@@ -587,105 +716,6 @@ static status_code jinja_lex(const char *src, lexer *lx, char *errbuf, size_t er
 	return OK;
 }
 
-typedef enum {
-	EX_STRING,
-	EX_NUMBER,
-	EX_IDENT,
-	EX_ATTR,
-	EX_INDEX,
-	EX_SLICE,
-	EX_BINOP,
-	EX_NOT,
-	EX_FILTER,
-	EX_ISDEFINED,
-	EX_CALL,
-	EX_LIST,
-	EX_TERNARY,
-	EX_METHODCALL,
-	EX_DYNINDEX,
-} expr_kind;
-
-typedef struct expr_arg {
-	char			 *name;
-	struct expr_node *val;
-	struct expr_arg	 *next;
-} expr_arg;
-
-typedef struct expr_node {
-	expr_kind		  kind;
-	char			 *str;
-	char			 *op;
-	struct expr_node *a, *b, *c, *step;
-
-	expr_arg *args;
-
-	struct expr_node **items;
-	uint32_t		   n_items;
-} expr_node;
-
-typedef enum {
-	ST_TEXT,
-	ST_OUTPUT,
-	ST_IF,
-	ST_FOR,
-	ST_LIST,
-	ST_SET,
-	ST_MACRO,
-	ST_GENERATION,
-	ST_NOOP,
-	ST_BREAK,
-} stmt_kind;
-
-typedef struct macro_param {
-	char			   *name;
-	struct expr_node   *default_val;
-	struct macro_param *next;
-} macro_param;
-
-typedef struct stmt_node {
-	stmt_kind kind;
-
-	char *text;
-
-	expr_node *expr;
-
-	expr_node		 *cond;
-	struct stmt_node *then_body;
-	struct stmt_node *else_body;
-
-	char			 *loop_var;
-	char			 *loop_var2;
-	expr_node		 *iterable;
-	struct stmt_node *body;
-
-	struct stmt_node **items;
-	uint32_t		   n_items;
-
-	char	  *set_name;
-	char	  *set_attr;
-	expr_node *set_val;
-
-	char			 *macro_name;
-	macro_param		 *macro_params;
-	struct stmt_node *macro_body;
-
-	struct stmt_node *next;
-} stmt_node;
-
-typedef struct {
-	lexer	*lx;
-	uint32_t pos;
-	char	*errbuf;
-	uint32_t errbuf_len;
-	bool	 failed;
-	strlist	 diagnostics;
-	strlist	 features;
-	uint16_t depth;
-} parser;
-
-#define JINJA_MAX_BLOCK_DEPTH 100
-#define JINJA_MAX_RANGE_ELEMS (1 << 20)
-
 static token *pcur(parser *p) {
 	return &p->lx->toks[p->pos];
 }
@@ -783,8 +813,6 @@ static void expect_stmt_close(parser *p, const char *context) {
 		padvance(p);
 	}
 }
-
-static expr_node *parse_expr(parser *p);
 
 static expr_arg *parse_call_args(parser *p) {
 	expr_arg *head = NULL, *tail = NULL;
@@ -1181,8 +1209,6 @@ static stmt_node *new_stmt(stmt_kind k) {
 	return s;
 }
 
-static stmt_node *parse_block(parser *p);
-
 static int stmt_kw_is(parser *p, const char *kw) {
 	return ptok_is(p, TOK_IDENT) && ptok_ident_is(p, kw);
 }
@@ -1468,21 +1494,12 @@ static stmt_node *parse_block(parser *p) {
 	return head;
 }
 
-static const char *k_test_names[] = {"none",   "null",	   "Null",	   "defined", "undefined",
-									 "string", "mapping",  "iterable", "number",  "integer",
-									 "float",  "sequence", "boolean",  "true",	  "false",
-									 "dict",   NULL};
-
 static int list_has(const char **list, const char *s) {
 	for (int i = 0; list[i]; i++)
 		if (!strcmp(list[i], s))
 			return 1;
 	return 0;
 }
-
-static int filter_name_supported(const char *name);
-static int method_name_supported(const char *name);
-static int test_name_supported(const char *name);
 
 static void report_unsupported_fn(parser *p, const char *name, int (*supported)(const char *),
 								  const char *prefix, const char *suffix) {
@@ -1500,9 +1517,6 @@ static void report_unsupported(parser *p, const char *name, const char **table, 
 		strlist_add(&p->features, xstrdup(buf));
 	}
 }
-
-static const char *k_supported_ops[] = {
-	"and", "or", "+", "-", "==", "!=", ">", "<", ">=", "<=", "in", NULL};
 
 static void scan_expr(parser *p, expr_node *e) {
 	if (!e)
@@ -1684,17 +1698,6 @@ void jinja_program_free(jinja_program *prog) {
 	stmt_free(prog);
 }
 
-typedef struct scope_entry {
-	char			   *name;
-	jinja_value		   *val;
-	struct scope_entry *next;
-} scope_entry;
-
-typedef struct scope {
-	scope_entry	 *entries;
-	struct scope *parent;
-} scope;
-
 static jinja_value *scope_lookup(scope *sc, const char *name) {
 	for (scope *s = sc; s; s = s->parent)
 		for (scope_entry *e = s->entries; e; e = e->next)
@@ -1727,23 +1730,11 @@ static void scope_free_entries(scope *sc) {
 	}
 }
 
-typedef struct {
-	scope	*sc;
-	char	*errbuf;
-	size_t	 errbuf_len;
-	bool	 failed;
-	uint16_t call_depth;
-	bool	 break_hit;
-} eval_ctx;
-
 static void everr(eval_ctx *ctx, const char *msg) {
 	if (!ctx->failed)
 		snprintf(ctx->errbuf, ctx->errbuf_len, "render error: %s", msg);
 	ctx->failed = 1;
 }
-
-static void			exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
-static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e);
 
 static void bind_one_param(scope *call_sc, macro_param *mp, expr_arg *args, expr_arg **cur_pos,
 						   eval_ctx *ctx) {
@@ -1886,11 +1877,6 @@ static void json_to_json(str_builder *sb, const jinja_value *v) {
 		break;
 	}
 }
-
-static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e);
-typedef jinja_value *(*jinja_filter_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args);
-
-static jinja_filter_fn lookup_filter(const char *name);
 
 static char *trim_dup(const char *s, int left, int right) {
 	if (left)
@@ -2108,9 +2094,6 @@ static jinja_value *eval_filter(eval_ctx *ctx, expr_node *e) {
 		return fn(ctx, base, e->args);
 	return base;
 }
-
-typedef jinja_value *(*jinja_method_fn)(eval_ctx *ctx, jinja_value *base, expr_arg *args,
-										const char *name);
 
 static jinja_value *method_get(eval_ctx *ctx, jinja_value *base, expr_arg *args, const char *name) {
 	(void)name;
@@ -2588,8 +2571,6 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 	}
 	return jinja_none();
 }
-
-static void exec_stmts(eval_ctx *ctx, stmt_node *s, str_builder *out);
 
 static void exec_stmt(eval_ctx *ctx, stmt_node *s, str_builder *out) {
 	if (ctx->failed)

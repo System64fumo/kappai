@@ -1,11 +1,12 @@
 #define _GNU_SOURCE
 #include "gguf.h"
+#include "backend/cpu/common.h"
 #include "log.h"
 #include "profile.h"
 #include <ctype.h>
-#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -17,10 +18,6 @@
 
 #define GGUF_LOAD_CHUNK_TARGET_BYTES ((size_t)(8 * 1024 * 1024))
 #define GGUF_LOAD_MAX_THREADS 64
-
-static inline size_t align_up_bytes(size_t v, size_t a) {
-	return (v + a - 1) & ~(a - 1);
-}
 
 typedef struct {
 	uint32_t	type;
@@ -42,13 +39,7 @@ typedef struct {
 	uint32_t arr_type;
 	uint64_t arr_len;
 	void	*arr_data;
-	gguf_str arr_str;
 } kv_entry;
-
-typedef struct {
-	kv_entry *e;
-	size_t	  n;
-} kv_table;
 
 typedef struct {
 	const gguf_tensor *t;
@@ -70,6 +61,10 @@ typedef struct {
 	_Atomic int		 first_err;
 	_Atomic size_t	*chunk_remaining;
 } gguf_load_job;
+
+static inline size_t align_up_bytes(size_t v, size_t a) {
+	return (v + a - 1) & ~(a - 1);
+}
 
 static inline void gguf_ctx_init(gguf_ctx *ctx) {
 	memset(ctx, 0, sizeof(*ctx));
@@ -145,9 +140,7 @@ static int gguf_reader_u8(gguf_reader *r, uint8_t *o) {
 static int gguf_reader_u16(gguf_reader *r, uint16_t *o) {
 	if (gguf_reader_left(r) < (ptrdiff_t)2)
 		return -1;
-	uint16_t v;
-	memcpy(&v, r->p, 2);
-	*o = le16toh(v);
+	*o = (uint16_t)((uint16_t)r->p[0] | (uint16_t)r->p[1] << 8);
 	r->p += 2;
 	return 0;
 }
@@ -155,9 +148,8 @@ static int gguf_reader_u16(gguf_reader *r, uint16_t *o) {
 static int gguf_reader_u32(gguf_reader *r, uint32_t *o) {
 	if (gguf_reader_left(r) < (ptrdiff_t)4)
 		return -1;
-	uint32_t v;
-	memcpy(&v, r->p, 4);
-	*o = le32toh(v);
+	*o = (uint32_t)r->p[0] | (uint32_t)r->p[1] << 8 | (uint32_t)r->p[2] << 16 |
+		 (uint32_t)r->p[3] << 24;
 	r->p += 4;
 	return 0;
 }
@@ -165,32 +157,27 @@ static int gguf_reader_u32(gguf_reader *r, uint32_t *o) {
 static int gguf_reader_u64(gguf_reader *r, uint64_t *o) {
 	if (gguf_reader_left(r) < (ptrdiff_t)8)
 		return -1;
-	uint64_t v;
-	memcpy(&v, r->p, 8);
-	*o = le64toh(v);
+	uint64_t v = 0;
+	for (size_t i = 0; i < 8; i++)
+		v |= (uint64_t)r->p[i] << (i * 8);
+	*o = v;
 	r->p += 8;
 	return 0;
 }
 
 static int gguf_reader_f32(gguf_reader *r, float *o) {
-	if (gguf_reader_left(r) < (ptrdiff_t)4)
-		return -1;
 	uint32_t v;
-	memcpy(&v, r->p, 4);
-	v = le32toh(v);
-	memcpy(o, &v, 4);
-	r->p += 4;
+	if (gguf_reader_u32(r, &v))
+		return -1;
+	memcpy(o, &v, sizeof(v));
 	return 0;
 }
 
 static int gguf_reader_f64(gguf_reader *r, double *o) {
-	if (gguf_reader_left(r) < (ptrdiff_t)8)
-		return -1;
 	uint64_t v;
-	memcpy(&v, r->p, 8);
-	v = le64toh(v);
-	memcpy(o, &v, 8);
-	r->p += 8;
+	if (gguf_reader_u64(r, &v))
+		return -1;
+	memcpy(o, &v, sizeof(v));
 	return 0;
 }
 
@@ -218,6 +205,33 @@ static int gguf_arr_len_ok(const gguf_reader *r, uint64_t n, size_t elem_size) {
 	if (elem_size == 0 || n > (uint64_t)(SIZE_MAX / elem_size))
 		return 0;
 	return n * (uint64_t)elem_size <= (uint64_t)gguf_reader_left(r);
+}
+
+static int gguf_read_numeric_array(gguf_reader *r, kv_entry *e) {
+	static const uint8_t sizes[] = {
+		[GGUF_TYPE_U8] = 1,	 [GGUF_TYPE_I8] = 1,  [GGUF_TYPE_BOOL] = 1, [GGUF_TYPE_U16] = 2,
+		[GGUF_TYPE_I16] = 2, [GGUF_TYPE_U32] = 4, [GGUF_TYPE_I32] = 4,	[GGUF_TYPE_F32] = 4,
+		[GGUF_TYPE_U64] = 8, [GGUF_TYPE_I64] = 8, [GGUF_TYPE_F64] = 8,
+	};
+	size_t width = e->arr_type < ARRAY_LEN(sizes) ? sizes[e->arr_type] : 0;
+	if (!gguf_arr_len_ok(r, e->arr_len, width))
+		return -1;
+	size_t	 bytes = (size_t)e->arr_len * width;
+	uint8_t *data  = xmalloc(bytes);
+	memcpy(data, r->p, bytes);
+	const uint16_t endian_probe = 1;
+	if (*(const uint8_t *)&endian_probe == 0) {
+		for (size_t off = 0; off < bytes; off += width) {
+			for (size_t i = 0; i < width / 2; i++) {
+				uint8_t tmp				  = data[off + i];
+				data[off + i]			  = data[off + width - 1 - i];
+				data[off + width - 1 - i] = tmp;
+			}
+		}
+	}
+	r->p += bytes;
+	e->arr_data = data;
+	return 0;
 }
 
 static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena *sa) {
@@ -320,59 +334,7 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena 
 			return -1;
 		e->arr_type = et;
 		e->arr_len	= n;
-		switch (et) {
-		case GGUF_TYPE_U8:
-		case GGUF_TYPE_I8:
-		case GGUF_TYPE_BOOL:
-			if (!gguf_arr_len_ok(r, n, 1))
-				return -1;
-			e->arr_data = xmalloc(n);
-			for (uint64_t i = 0; i < n; i++) {
-				uint8_t v;
-				if (gguf_reader_u8(r, &v))
-					return -1;
-				((uint8_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U16:
-		case GGUF_TYPE_I16:
-			if (!gguf_arr_len_ok(r, n, 2))
-				return -1;
-			e->arr_data = xmalloc(n * 2);
-			for (uint64_t i = 0; i < n; i++) {
-				uint16_t v;
-				if (gguf_reader_u16(r, &v))
-					return -1;
-				((uint16_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U32:
-		case GGUF_TYPE_I32:
-		case GGUF_TYPE_F32:
-			if (!gguf_arr_len_ok(r, n, 4))
-				return -1;
-			e->arr_data = xmalloc(n * 4);
-			for (uint64_t i = 0; i < n; i++) {
-				uint32_t v;
-				if (gguf_reader_u32(r, &v))
-					return -1;
-				((uint32_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_U64:
-		case GGUF_TYPE_I64:
-		case GGUF_TYPE_F64:
-			if (!gguf_arr_len_ok(r, n, 8))
-				return -1;
-			e->arr_data = xmalloc(n * 8);
-			for (uint64_t i = 0; i < n; i++) {
-				uint64_t v;
-				if (gguf_reader_u64(r, &v))
-					return -1;
-				((uint64_t *)e->arr_data)[i] = v;
-			}
-			break;
-		case GGUF_TYPE_STRING: {
+		if (et == GGUF_TYPE_STRING) {
 			if (!gguf_arr_len_ok(r, n, sizeof(char *)))
 				return -1;
 			char **arr = (char **)xmalloc(n * sizeof(char *));
@@ -385,10 +347,8 @@ static int parse_kv_value(gguf_reader *r, kv_entry *e, uint32_t type, str_arena 
 				arr[i] = str_arena_dup(sa, s.data, s.len);
 			}
 			e->arr_data = (void *)arr;
-			break;
-		}
-		default:
-			return -1;
+		} else {
+			return gguf_read_numeric_array(r, e);
 		}
 		return 0;
 	}
@@ -935,10 +895,15 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		goto bad;
 	if (version != GGUF_VERSION)
 		DEBUG("gguf: accepting v%u header (layout identical to v%u)", version, GGUF_VERSION);
-	if (gguf_reader_u64(&r, &ctx->n_tensors))
+	uint64_t n_tensors, n_kv;
+	if (gguf_reader_u64(&r, &n_tensors))
 		goto bad;
-	if (gguf_reader_u64(&r, &ctx->n_kv))
+	if (gguf_reader_u64(&r, &n_kv))
 		goto bad;
+	if (n_tensors > SIZE_MAX || n_kv > SIZE_MAX)
+		goto bad;
+	ctx->n_tensors = (size_t)n_tensors;
+	ctx->n_kv	   = (size_t)n_kv;
 
 	{
 		size_t remaining = gguf_reader_left(&r) > 0 ? (size_t)gguf_reader_left(&r) : 0;
@@ -1103,9 +1068,22 @@ status_code gguf_load(gguf_ctx *ctx, const char *path) {
 }
 
 ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off) {
+	if (len == 0)
+		return 0;
+	if (len > (size_t)SSIZE_MAX || file_off > UINT64_MAX - len) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	uint64_t end		= file_off + len;
+	off_t	 native_end = (off_t)end;
+	if (native_end < 0 || (uint64_t)native_end != end) {
+		errno = EOVERFLOW;
+		return -1;
+	}
 	size_t total = 0;
 	while (total < len) {
-		ssize_t n = pread(fd, (char *)dst + total, len - total, (off_t)(file_off + total));
+		size_t	chunk = MIN(len - total, (size_t)1 << 30);
+		ssize_t n	  = pread(fd, (char *)dst + total, chunk, (off_t)(file_off + total));
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1161,7 +1139,7 @@ static int gguf_range_read(int plain_fd, int direct_fd, size_t align, uint64_t f
 		return -1;
 	if (gguf_pread_full(plain_fd, dst, len, file_off) != (ssize_t)len)
 		return -1;
-	posix_fadvise(plain_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
+	file_advise(plain_fd, (off_t)file_off, (off_t)len, FILE_ADVICE_RELEASE);
 	return 0;
 }
 
@@ -1198,16 +1176,8 @@ static void *gguf_load_worker(void *arg) {
 }
 
 static int gguf_affinity_thread_count(void) {
-	cpu_set_t set;
-	CPU_ZERO(&set);
-	int n_cpu = 0;
-	if (sched_getaffinity(0, sizeof(set), &set) == 0)
-		n_cpu = CPU_COUNT(&set);
-	if (n_cpu <= 0) {
-		long online = sysconf(_SC_NPROCESSORS_ONLN);
-		n_cpu		= online < 1 ? 1 : (int)online;
-	}
-	int n = n_cpu * 4;
+	int n_cpu = MIN(backend_host_cpu_info().n_cpus, GGUF_LOAD_MAX_THREADS);
+	int n	  = n_cpu * 4;
 	if (n < 8)
 		n = 8;
 	return n;
@@ -1234,7 +1204,7 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	status_code s = gguf_parse_common(ctx, map, fsize, -1, NULL, 1);
 	munmap(map, fsize);
 	if (s == OK)
-		posix_fadvise(fd, 0, (off_t)ctx->data_file_offset, POSIX_FADV_DONTNEED);
+		file_advise(fd, 0, (off_t)ctx->data_file_offset, FILE_ADVICE_RELEASE);
 	close(fd);
 	if (s != OK)
 		return s;
@@ -1243,6 +1213,7 @@ status_code gguf_load_metadata(gguf_ctx *ctx, const char *path) {
 	return OK;
 }
 
+#ifdef O_DIRECT
 static size_t direct_io_alignment(int fd) {
 #ifdef STATX_DIOALIGN
 	struct statx sx;
@@ -1255,9 +1226,11 @@ static size_t direct_io_alignment(int fd) {
 		return (size_t)st.st_blksize;
 	return 4096;
 }
+#endif
 
 status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int advise_random,
 							   size_t *out_align) {
+#ifdef O_DIRECT
 	int flags = fcntl(fd, F_GETFL);
 	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_DIRECT) != 0) {
 		close(fd);
@@ -1281,11 +1254,19 @@ status_code direct_io_probe_fd(int fd, const char *tag, size_t max_align, int ad
 		return ERR_IO;
 	}
 	if (advise_random)
-		posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+		file_advise(fd, 0, 0, FILE_ADVICE_RANDOM);
 	if (out_align)
 		*out_align = align;
 	DEBUG("%s: O_DIRECT enabled (align=%zu)", tag, align);
 	return OK;
+#else
+	(void)max_align;
+	(void)advise_random;
+	(void)out_align;
+	close(fd);
+	DEBUG("%s: direct I/O unavailable, using buffered reads", tag);
+	return ERR_UNSUPPORTED;
+#endif
 }
 
 int gguf_tensor_layer_index(const char *name) {

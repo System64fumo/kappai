@@ -8,6 +8,51 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define GQA_GROUP_SIZE 8
+
+enum { MATMUL_MULTI_VEC_MAX = 8, MLA_QABS_MIN_ROWS_PER_THREAD = 16 };
+
+typedef struct {
+	float		*base;
+	int			 n_heads, head_dim, row_stride, pos_start;
+	float		 theta;
+	int			 neox;
+	const float *freq_factors;
+	const float *cos_base, *sin_base;
+} cpu_rope_ext_batch_job;
+
+typedef struct {
+	float		 qscale;
+	int8_t		 qa[HEAD_DIM_MAX];
+	const float *qf;
+} q8_preq;
+
+typedef struct {
+	float		*state;
+	const float *q, *k, *v, *g, *beta;
+	float		*out;
+	int			 head_dim;
+} kda_job_neon;
+
+typedef struct {
+	const float *q;
+	const float *k_b;
+	float		*q_abs;
+	int			 kv_lora, qk_head;
+} mla_qabs_job;
+
+typedef struct {
+	const float *q_abs;
+	const float *cache;
+	const float *v_b;
+	float		*out;
+	float		*scratch;
+	int			 n_pos, kv_lora, v_head, scratch_stride;
+	float		 scale;
+} mla_attn_job_neon;
+
+static const float KDA_L2_EPS = 1e-6f;
+
 static inline void neon_zero_f32(float *dst, int n) {
 	float32x4_t zero = vdupq_n_f32(0.0f);
 	int			d	 = 0;
@@ -77,144 +122,6 @@ static inline float attn_softmax_step(float ss, float *M, float *S, float *restr
 	*S = *S * alpha + vs;
 	return vs;
 }
-status_code cpu_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos, const buffer *k_in,
-					   const buffer *v_in, int n_kv_heads, int head_dim, int n_ctx,
-					   int n_kv_heads_active) {
-	cpu_priv	*p		  = self->priv;
-	const float *kf		  = (const float *)cpu_ptr(k_in);
-	const float *vf		  = (const float *)cpu_ptr(v_in);
-	int			 n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-
-	if (p->kv_quant == KV_QUANT_Q8_0) {
-		int		 hd_stride	  = head_dim;
-		size_t	 n_blocks	  = ((size_t)hd_stride + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-		size_t	 block_stride = n_blocks * KV_Q8_0_BLOCK_BYTES;
-		size_t	 kvh_stride	  = cpu_kv_layer_rows(p, layer, n_ctx) * block_stride;
-		size_t	 layer_stride = (size_t)n_kv_heads * kvh_stride;
-		uint8_t *kd_base	  = (uint8_t *)k->handle;
-		uint8_t *vd_base	  = (uint8_t *)v->handle;
-		size_t	 layer_base	  = cpu_kv_layer_base(p, layer, layer_stride, 1);
-		size_t	 pos_off	  = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base, layer_base,
-												kvh_stride, block_stride, n_active) *
-								block_stride;
-		for (int kvh = 0; kvh < n_active; kvh++) {
-			size_t off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-			cpu_kv_put_q8_0_head(kd_base + off, vd_base + off, kf + ((size_t)kvh * head_dim),
-								 vf + ((size_t)kvh * head_dim), head_dim);
-		}
-		return OK;
-	}
-	uint16_t *kd_base	   = (uint16_t *)cpu_ptr(k);
-	uint16_t *vd_base	   = (uint16_t *)cpu_ptr(v);
-	int		  hd_stride	   = head_dim;
-	size_t	  kvh_stride   = cpu_kv_layer_rows(p, layer, n_ctx) * hd_stride;
-	size_t	  layer_stride = (size_t)n_kv_heads * kvh_stride;
-
-	size_t layer_base = cpu_kv_layer_base(p, layer, layer_stride, sizeof(uint16_t));
-	size_t pos_off = cpu_kv_put_slot(p, layer, pos, n_ctx, kd_base, vd_base,
-									 layer_base * sizeof(uint16_t), kvh_stride * sizeof(uint16_t),
-									 (size_t)hd_stride * sizeof(uint16_t), n_active) *
-					 hd_stride;
-	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t		 off = layer_base + ((size_t)kvh * kvh_stride) + pos_off;
-		uint16_t	*kd	 = kd_base + off;
-		uint16_t	*vd	 = vd_base + off;
-		const float *kfh = kf + ((size_t)kvh * head_dim);
-		const float *vfh = vf + ((size_t)kvh * head_dim);
-		int			 i	 = 0;
-		for (; i + 32 <= head_dim; i += 32) {
-			float32x4_t k0	= vld1q_f32(kfh + i);
-			float32x4_t k1	= vld1q_f32(kfh + i + 4);
-			float32x4_t k2	= vld1q_f32(kfh + i + 8);
-			float32x4_t k3	= vld1q_f32(kfh + i + 12);
-			float32x4_t k4	= vld1q_f32(kfh + i + 16);
-			float32x4_t k5	= vld1q_f32(kfh + i + 20);
-			float32x4_t k6	= vld1q_f32(kfh + i + 24);
-			float32x4_t k7	= vld1q_f32(kfh + i + 28);
-			float16x4_t kh0 = vcvt_f16_f32(k0);
-			float16x4_t kh1 = vcvt_f16_f32(k1);
-			float16x4_t kh2 = vcvt_f16_f32(k2);
-			float16x4_t kh3 = vcvt_f16_f32(k3);
-			float16x4_t kh4 = vcvt_f16_f32(k4);
-			float16x4_t kh5 = vcvt_f16_f32(k5);
-			float16x4_t kh6 = vcvt_f16_f32(k6);
-			float16x4_t kh7 = vcvt_f16_f32(k7);
-			vst1q_u16(kd + i, vreinterpretq_u16_f16(vcombine_f16(kh0, kh1)));
-			vst1q_u16(kd + i + 8, vreinterpretq_u16_f16(vcombine_f16(kh2, kh3)));
-			vst1q_u16(kd + i + 16, vreinterpretq_u16_f16(vcombine_f16(kh4, kh5)));
-			vst1q_u16(kd + i + 24, vreinterpretq_u16_f16(vcombine_f16(kh6, kh7)));
-
-			float32x4_t v0	= vld1q_f32(vfh + i);
-			float32x4_t v1	= vld1q_f32(vfh + i + 4);
-			float32x4_t v2	= vld1q_f32(vfh + i + 8);
-			float32x4_t v3	= vld1q_f32(vfh + i + 12);
-			float32x4_t v4	= vld1q_f32(vfh + i + 16);
-			float32x4_t v5	= vld1q_f32(vfh + i + 20);
-			float32x4_t v6	= vld1q_f32(vfh + i + 24);
-			float32x4_t v7	= vld1q_f32(vfh + i + 28);
-			float16x4_t vh0 = vcvt_f16_f32(v0);
-			float16x4_t vh1 = vcvt_f16_f32(v1);
-			float16x4_t vh2 = vcvt_f16_f32(v2);
-			float16x4_t vh3 = vcvt_f16_f32(v3);
-			float16x4_t vh4 = vcvt_f16_f32(v4);
-			float16x4_t vh5 = vcvt_f16_f32(v5);
-			float16x4_t vh6 = vcvt_f16_f32(v6);
-			float16x4_t vh7 = vcvt_f16_f32(v7);
-			vst1q_u16(vd + i, vreinterpretq_u16_f16(vcombine_f16(vh0, vh1)));
-			vst1q_u16(vd + i + 8, vreinterpretq_u16_f16(vcombine_f16(vh2, vh3)));
-			vst1q_u16(vd + i + 16, vreinterpretq_u16_f16(vcombine_f16(vh4, vh5)));
-			vst1q_u16(vd + i + 24, vreinterpretq_u16_f16(vcombine_f16(vh6, vh7)));
-		}
-		for (; i + 16 <= head_dim; i += 16) {
-			float32x4_t k0	= vld1q_f32(kfh + i);
-			float32x4_t k1	= vld1q_f32(kfh + i + 4);
-			float32x4_t k2	= vld1q_f32(kfh + i + 8);
-			float32x4_t k3	= vld1q_f32(kfh + i + 12);
-			float16x4_t kh0 = vcvt_f16_f32(k0);
-			float16x4_t kh1 = vcvt_f16_f32(k1);
-			float16x4_t kh2 = vcvt_f16_f32(k2);
-			float16x4_t kh3 = vcvt_f16_f32(k3);
-			vst1q_u16(kd + i, vreinterpretq_u16_f16(vcombine_f16(kh0, kh1)));
-			vst1q_u16(kd + i + 8, vreinterpretq_u16_f16(vcombine_f16(kh2, kh3)));
-
-			float32x4_t v0	= vld1q_f32(vfh + i);
-			float32x4_t v1	= vld1q_f32(vfh + i + 4);
-			float32x4_t v2	= vld1q_f32(vfh + i + 8);
-			float32x4_t v3	= vld1q_f32(vfh + i + 12);
-			float16x4_t vh0 = vcvt_f16_f32(v0);
-			float16x4_t vh1 = vcvt_f16_f32(v1);
-			float16x4_t vh2 = vcvt_f16_f32(v2);
-			float16x4_t vh3 = vcvt_f16_f32(v3);
-			vst1q_u16(vd + i, vreinterpretq_u16_f16(vcombine_f16(vh0, vh1)));
-			vst1q_u16(vd + i + 8, vreinterpretq_u16_f16(vcombine_f16(vh2, vh3)));
-		}
-		for (; i + 8 <= head_dim; i += 8) {
-			float32x4_t k0	= vld1q_f32(kfh + i);
-			float32x4_t k1	= vld1q_f32(kfh + i + 4);
-			float16x4_t kh0 = vcvt_f16_f32(k0);
-			float16x4_t kh1 = vcvt_f16_f32(k1);
-			vst1q_u16(kd + i, vreinterpretq_u16_f16(vcombine_f16(kh0, kh1)));
-
-			float32x4_t v0	= vld1q_f32(vfh + i);
-			float32x4_t v1	= vld1q_f32(vfh + i + 4);
-			float16x4_t vh0 = vcvt_f16_f32(v0);
-			float16x4_t vh1 = vcvt_f16_f32(v1);
-			vst1q_u16(vd + i, vreinterpretq_u16_f16(vcombine_f16(vh0, vh1)));
-		}
-		for (; i + 4 <= head_dim; i += 4) {
-			float32x4_t k0 = vld1q_f32(kfh + i);
-			float32x4_t v0 = vld1q_f32(vfh + i);
-			vst1_u16(kd + i, vreinterpret_u16_f16(vcvt_f16_f32(k0)));
-			vst1_u16(vd + i, vreinterpret_u16_f16(vcvt_f16_f32(v0)));
-		}
-		for (; i < head_dim; i++) {
-			kd[i] = f32_to_f16(kfh[i]);
-			vd[i] = f32_to_f16(vfh[i]);
-		}
-	}
-	return OK;
-}
-
 static void cpu_rope_one_neon(float *v, int n_heads, int head_dim, const float *rope_cos,
 							  const float *rope_sin, int neox) {
 	int half = head_dim / 2;
@@ -479,15 +386,6 @@ status_code cpu_rope_ext(backend *self, buffer *vec, int n_heads, int head_dim, 
 		cpu_rope_cs_one_neon(v + ((size_t)h * head_dim), head_dim / 2, cs, self->rope_neox);
 	return OK;
 }
-
-typedef struct {
-	float		*base;
-	int			 n_heads, head_dim, row_stride, pos_start;
-	float		 theta;
-	int			 neox;
-	const float *freq_factors;
-	const float *cos_base, *sin_base;
-} cpu_rope_ext_batch_job;
 
 static void cpu_rope_ext_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 	(void)tid;
@@ -981,12 +879,6 @@ static inline float32x4_t vld1_s8x4_to_f32(const int8_t *p) {
 	return vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
 }
 
-typedef struct {
-	float		 qscale;
-	int8_t		 qa[HEAD_DIM_MAX];
-	const float *qf;
-} q8_preq;
-
 static void prequantize_q8_0(const float *restrict qh, int head_dim, q8_preq *out) {
 	if (head_dim <= 0 || head_dim > HEAD_DIM_MAX) {
 		out->qf		= qh;
@@ -1240,8 +1132,6 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 		accum_v_q8_0(out_h, vt, scores[t], head_dim);
 	}
 }
-
-#define GQA_GROUP_SIZE 8
 
 static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_slice, int kv_stride,
 									const float *qh_base, int n_group, int head_dim, int n_pos,
@@ -2103,8 +1993,6 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	return OK;
 }
 
-static const float KDA_L2_EPS = 1e-6f;
-
 static inline float32x4_t vexpq_precise_f32(float32x4_t x) {
 	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
 
@@ -2152,10 +2040,6 @@ static status_code matmul_vec(backend *self, const backend_weight *w, const floa
 	ensure_sync(self);
 	return st;
 }
-
-enum {
-	MATMUL_MULTI_VEC_MAX = 8,
-};
 
 static status_code matmul_multi_vec(backend *self, const backend_weight *const *w, const float *x,
 									float *const *y, const int *n, int k, int count) {
@@ -2432,13 +2316,6 @@ static void kda_gates_neon(float *g, float *beta, const float *dt_bias, const fl
 	}
 }
 
-typedef struct {
-	float		*state;
-	const float *q, *k, *v, *g, *beta;
-	float		*out;
-	int			 head_dim;
-} kda_job_neon;
-
 static void kda_heads_neon(int begin, int end, int tid, void *arg) {
 	(void)tid;
 	kda_job_neon *j	   = arg;
@@ -2587,17 +2464,6 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	return matmul_vec(self, &d->wo, o, d->out, dim, D);
 }
 
-enum {
-	MLA_QABS_MIN_ROWS_PER_THREAD = 16,
-};
-
-typedef struct {
-	const float *q;
-	const float *k_b;
-	float		*q_abs;
-	int			 kv_lora, qk_head;
-} mla_qabs_job;
-
 static void mla_qabs_rows(int begin, int end, int tid, void *arg) {
 	(void)tid;
 	mla_qabs_job *j = arg;
@@ -2623,16 +2489,6 @@ static void mla_qabs_rows(int begin, int end, int tid, void *arg) {
 		idx += count;
 	}
 }
-
-typedef struct {
-	const float *q_abs;
-	const float *cache;
-	const float *v_b;
-	float		*out;
-	float		*scratch;
-	int			 n_pos, kv_lora, v_head, scratch_stride;
-	float		 scale;
-} mla_attn_job_neon;
 
 static void mla_attn_heads_neon(int begin, int end, int tid, void *arg) {
 	mla_attn_job_neon *j   = arg;

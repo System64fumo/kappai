@@ -213,6 +213,20 @@ static int tsg_finish(tsg_writer *w, const char *path) {
 	fclose(fp);
 	return wr == w->body.len ? 0 : -1;
 }
+void tsg_build_array_file(const char *path, uint32_t type, uint64_t count, const void *data,
+						  size_t bytes) {
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_kv_begin(&w, "array", TSG_T_ARRAY);
+	tsg_u32(&w.body, type);
+	tsg_u64(&w.body, count);
+	if (bytes)
+		tsg_put(&w.body, data, bytes);
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
 void tsg_build_vocab_file(const char *path, const char *model_name, const char *pre,
 						  int has_space_flag, int space_flag, const char *const *tokens,
 						  const int32_t *types, size_t n) {

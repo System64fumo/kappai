@@ -3,7 +3,6 @@
 #include "common.h"
 #include "gl_context.h"
 #include "log.h"
-#include "memconfig.h"
 #include "recipe.h"
 #include "shaders_embedded.h"
 
@@ -34,8 +33,47 @@
 #define GL_MLA_MAX_LORA 1024
 #define GL_KDA_L2_EPS 1e-6f
 #define GL_COMPUTE_BARRIER_BITS (GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
+#define GL_ATTENTION_MAX_HEAD_DIM 512
+#define GL_MLA_MAX_QK_HEAD 512
+#define GL_MLA_MAX_KV_LORA 512
+#define GL_ATTENTION_TILE_T_MAX 16
+#define GL_ATTENTION_Q_CHUNK 4
+#define GL_ATTENTION_WG 64
+#define GL_ATTENTION_MAX_SPLITS 64
+#define GL_ATTENTION_MIN_CHUNK 16
+#define GL_ATTENTION_TARGET_WORKGROUPS 256
+#define GL_MATMUL_COLS 4
+#define GL_MM_TILE 64
+#define GL_MM_THREADS 256
+#define GL_MM_SHARED_BYTES ((2 * 32 * GL_MM_TILE + 2 * GL_MM_TILE) * 4)
+#define GL_MM_MIN_M 16
+#define GL_ATTENTION_KV_ROW_BYTES (GL_ATTENTION_MAX_HEAD_DIM * 4)
+#define GL_ATTENTION_FIXED_SHARED_BYTES (GL_ATTENTION_Q_CHUNK * GL_ATTENTION_MAX_HEAD_DIM * 4)
+#define GL_XQ_BLOCK_WORDS 44u
+#define GL_XQK_WORDS_PER_BLOCK 212u
+#define GL_MATMUL_MULTI_MAX 8
+#define GL_KV_ZERO_CHUNK_BYTES ((size_t)1 << 20)
 
 typedef struct gl_priv gl_priv;
+
+typedef struct {
+	int		 plain_pipe;
+	int		 act_pipe;
+	int		 block;
+	int		 check_block;
+	unsigned words_per_block;
+	unsigned gx_div;
+} gl_quantize_spec;
+
+typedef struct {
+	const buffer *w;
+	buffer		 *y;
+	float		  eps;
+} gl_quantize_norm;
+
+typedef struct {
+	buffer q, k, v, g, o, g2, tmp_f, tmp_g, beta;
+} gl_kda_scratch;
 
 typedef enum {
 	GL_PIPE_ARGMAX_STAGE1,
@@ -271,11 +309,9 @@ struct gl_priv {
 	gl_rope_cache rope_cache[GL_ROPE_CACHE_SLOTS];
 	int			  rope_cache_next;
 
-	gl_buf *qx_stage[2];
 	gl_buf *qx;
 	size_t	qx_row_words;
 
-	gl_buf *qxk_stage[2];
 	gl_buf *qxk;
 	size_t	qxk_row_words;
 
@@ -297,9 +333,6 @@ struct gl_priv {
 
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
-	int	   kv_head_dim;
-	int	   kv_n_kv_heads;
-	int	   kv_n_ctx;
 	int	   kv_n_layers;
 	int	   kv_quant;
 	size_t kv_row_bytes;
@@ -502,24 +535,6 @@ static status_code gl_link_program_from_shader(GLuint shader, GLuint *out_progra
 	*out_program = program;
 	return OK;
 }
-
-#define GL_ATTENTION_MAX_HEAD_DIM 512
-
-#define GL_MLA_MAX_QK_HEAD 512
-#define GL_MLA_MAX_KV_LORA 512
-#define GL_ATTENTION_TILE_T_MAX 16
-#define GL_ATTENTION_Q_CHUNK 4
-#define GL_ATTENTION_WG 64
-#define GL_ATTENTION_MAX_SPLITS 64
-#define GL_ATTENTION_MIN_CHUNK 16
-#define GL_ATTENTION_TARGET_WORKGROUPS 256
-#define GL_MATMUL_COLS 4
-#define GL_MM_TILE 64
-#define GL_MM_THREADS 256
-#define GL_MM_SHARED_BYTES ((2 * 32 * GL_MM_TILE + 2 * GL_MM_TILE) * 4)
-#define GL_MM_MIN_M 16
-#define GL_ATTENTION_KV_ROW_BYTES (GL_ATTENTION_MAX_HEAD_DIM * 4)
-#define GL_ATTENTION_FIXED_SHARED_BYTES (GL_ATTENTION_Q_CHUNK * GL_ATTENTION_MAX_HEAD_DIM * 4)
 
 static int gl_attention_batch_tile_t(const gl_context *ctx) {
 	int shared_budget = ctx->max_shared_bytes > 0 ? ctx->max_shared_bytes : 16384;
@@ -1529,7 +1544,8 @@ static status_code gl_init(backend *self, int device_index) {
 	if (p->ctx.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
 	p->device_local_total_estimate =
-		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes : get_total_memory();
+		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes
+								  : (p->ctx.unified_memory ? backend_mem_total(backend_host()) : 0);
 
 	log_tag("OGL", "%.*s", (int)backend_name_brief_len(p->ctx.renderer), p->ctx.renderer);
 	DEBUG("opengl: %s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
@@ -3052,37 +3068,13 @@ static int gl_matmul_f32_align_ok(const buffer *x, const buffer *y, const buffer
 	return 1;
 }
 
-#define GL_XQ_BLOCK_WORDS 44u
-
-static int gl_pipe_uses_xq(const gl_priv *p, const gl_pipeline *pipe) {
-	(void)p;
+static int gl_pipe_uses_xq(const gl_pipeline *pipe) {
 	return (pipe->flags & GL_PIPE_F_USES_XQ) != 0;
 }
 
-static int gl_pipe_uses_iq4nl_lut(const gl_priv *p, const gl_pipeline *pipe) {
-	(void)p;
-	return (pipe->flags & GL_PIPE_F_IQ4NL_LUT) != 0;
-}
-
-static int gl_pipe_uses_xqk(const gl_priv *p, const gl_pipeline *pipe) {
-	(void)p;
+static int gl_pipe_uses_xqk(const gl_pipeline *pipe) {
 	return (pipe->flags & GL_PIPE_F_USES_XQK) != 0;
 }
-
-typedef struct {
-	int		 plain_pipe;
-	int		 act_pipe;
-	int		 block;
-	int		 check_block;
-	unsigned words_per_block;
-	unsigned gx_div;
-} gl_quantize_spec;
-
-typedef struct {
-	const buffer *w;
-	buffer		 *y;
-	float		  eps;
-} gl_quantize_norm;
 
 static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_buf **slot,
 								   size_t *row_words, const buffer *x, int k, int m,
@@ -3212,19 +3204,12 @@ static status_code gl_rmsnorm_quantize(gl_priv *p, const buffer *x, const buffer
 						   &norm);
 }
 
-#define GL_XQK_WORDS_PER_BLOCK 212u
-
 static status_code gl_quantize_q8_k(gl_priv *p, const buffer *x, int k, int m, const buffer *up,
 									int activation, float gs, float us, int row_stride) {
 	static const gl_quantize_spec spec = {
 		GL_PIPE_QUANTIZE_Q8_K, GL_PIPE_QUANTIZE_Q8_K_ACT, 256, 1, GL_XQK_WORDS_PER_BLOCK, 1};
 	return gl_quantize_run(p, &spec, &p->qxk, &p->qxk_row_words, x, k, m, up, activation, gs, us,
 						   row_stride, NULL);
-}
-
-static int gl_matmul_rows_per_wg(const gl_priv *p, const gl_pipeline *pipe) {
-	(void)p;
-	return pipe->rows_per_wg;
 }
 
 static gl_pipeline *gl_matmul_batch_pipe(gl_priv *p, gl_pipeline *pipe, int m) {
@@ -3325,14 +3310,14 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 	if (mode == 1)
 		gl_buf_sync_to_device(as_glbuf(residual));
 
-	const int use_xq = gl_pipe_uses_xq(p, pipe);
+	const int use_xq = gl_pipe_uses_xq(pipe);
 	if (use_xq && !xq_ready) {
 		status_code qs = gl_quantize_x(p, x, k, m, NULL, 0, 1.0f, 1.0f, 0);
 		if (qs != OK)
 			return qs;
 	}
 
-	const int use_xqk = gl_pipe_uses_xqk(p, pipe);
+	const int use_xqk = gl_pipe_uses_xqk(pipe);
 	if (use_xqk && !xq_ready) {
 		status_code qs = gl_quantize_q8_k(p, x, k, m, NULL, 0, 1.0f, 1.0f, 0);
 		if (qs != OK)
@@ -3356,7 +3341,7 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		gl_bind_raw(p, 4, p->iqx_grid->name, 0, 0, 0);
 	else if (use_xqk)
 		gl_bind_raw(p, 4, p->iq3s_grid->name, 0, 0, 0);
-	else if (gl_pipe_uses_iq4nl_lut(p, pipe))
+	else if (pipe->flags & GL_PIPE_F_IQ4NL_LUT)
 		gl_bind_raw(p, 4, p->iq4nl_pairs->name, 0, 0, 0);
 	gl_pu(pipe, "u_n", n);
 
@@ -3378,7 +3363,7 @@ static status_code gl_matmul_dispatch(gl_priv *p, gl_pipeline *pipe, int block_s
 		gl_pu(pipe, "u_x_stride", (int)p->qxk_row_words);
 	gl_pu(pipe, "u_add_residual", mode);
 
-	int	 rows_per_wg = gl_matmul_rows_per_wg(p, pipe);
+	int	 rows_per_wg = pipe->rows_per_wg;
 	int	 cols_per_wg = (pipe->flags & GL_PIPE_F_MM)		 ? GL_MM_TILE
 					   : (pipe->flags & GL_PIPE_F_TILED) ? GL_MATMUL_COLS
 														 : 1;
@@ -3568,8 +3553,6 @@ static status_code gl_matmul_residual(backend *self, const buffer *w, uint32_t w
 	return hs;
 }
 
-#define GL_MATMUL_MULTI_MAX 8
-
 static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
 								   const buffer *x, buffer **y, const int *n_list, int k,
 								   int n_matmuls) {
@@ -3611,8 +3594,8 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 		for (int i = 0; i < n_matmuls; i++) {
 			if (n_list[i] <= 0)
 				continue;
-			int use_xqk = gl_pipe_uses_xqk(p, pipes[i]);
-			if (use_xqk ? xqk_ready : (xq_ready || !gl_pipe_uses_xq(p, pipes[i])))
+			int use_xqk = gl_pipe_uses_xqk(pipes[i]);
+			if (use_xqk ? xqk_ready : (xq_ready || !gl_pipe_uses_xq(pipes[i])))
 				continue;
 			gl_buf_sync_to_device(as_glbuf(x));
 			status_code qs = use_xqk ? gl_quantize_q8_k(p, x, k, 1, NULL, 0, 1.0f, 1.0f, 0)
@@ -3630,9 +3613,9 @@ static status_code gl_matmul_multi(backend *self, const buffer **w, const uint32
 		for (int i = 0; i < n_matmuls; i++) {
 			if (n_list[i] <= 0)
 				continue;
-			status_code s = gl_matmul_dispatch(
-				p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k, 1,
-				gl_pipe_uses_xqk(p, pipes[i]) ? xqk_ready : xq_ready, NULL, 0);
+			status_code s =
+				gl_matmul_dispatch(p, pipes[i], block_sizes[i], w[i], x, y[i], NULL, n_list[i], k,
+								   1, gl_pipe_uses_xqk(pipes[i]) ? xqk_ready : xq_ready, NULL, 0);
 			if (s == ERR_UNSUPPORTED)
 				goto host_fallback;
 			if (s != OK)
@@ -3689,8 +3672,6 @@ static gl_kv_store *gl_kv_store_new(gl_priv *p) {
 	w->hdr.usage  = GL_KV_STORE_USAGE;
 	return &w->st;
 }
-
-#define GL_KV_ZERO_CHUNK_BYTES ((size_t)1 << 20)
 
 static void gl_buf_zero(gl_buf *b) {
 	static const char zeros[GL_KV_ZERO_CHUNK_BYTES];
@@ -3781,10 +3762,7 @@ static status_code gl_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	p->kv_head_dim	 = head_dim;
-	p->kv_n_kv_heads = n_kv_heads;
-	p->kv_n_ctx		 = n_ctx;
-	p->kv_n_layers	 = n_kv_layers;
+	p->kv_n_layers = n_kv_layers;
 
 	k_out->handle	= ks;
 	k_out->size		= total_bytes;
@@ -4737,10 +4715,10 @@ static status_code gl_matmul_ffn_down(backend *self, const buffer *w, uint32_t w
 		int			 block_size = 0;
 		if (gl_matmul_pipe_for_type(p, w_type, &pipe, &block_size) && block_size > 0 &&
 			(k % block_size) == 0 && gl_matmul_buf_ok(gate) && gl_matmul_buf_ok(up) &&
-			(gl_pipe_uses_xq(p, pipe) || gl_pipe_uses_xqk(p, pipe))) {
+			(gl_pipe_uses_xq(pipe) || gl_pipe_uses_xqk(pipe))) {
 			gl_buf_sync_to_device(as_glbuf(gate));
 			gl_buf_sync_to_device(as_glbuf(up));
-			status_code qs = gl_pipe_uses_xqk(p, pipe)
+			status_code qs = gl_pipe_uses_xqk(pipe)
 								 ? gl_quantize_q8_k(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0)
 								 : gl_quantize_x(p, gate, k, 1, up, activation, 1.0f, 1.0f, 0);
 			if (qs == OK) {
@@ -4940,7 +4918,7 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 		(!e->gate_up_fused && !gl_matmul_pipe_for_type(p, e->up_type, &up_pipe, &up_block)) ||
 		!gl_matmul_pipe_for_type(p, e->down_type, &down_pipe, &down_block))
 		return ERR_UNSUPPORTED;
-	if (!gl_pipe_uses_xq(p, down_pipe) && !gl_pipe_uses_xqk(p, down_pipe))
+	if (!gl_pipe_uses_xq(down_pipe) && !gl_pipe_uses_xqk(down_pipe))
 		return ERR_UNSUPPORTED;
 	if (gate_block > 0 && (dim % gate_block) != 0)
 		return ERR_UNSUPPORTED;
@@ -5004,11 +4982,10 @@ static status_code gl_moe_expert_rows_batched(backend *self, gl_priv *p, const b
 	{
 		int act_mode   = use_gelu ? 1 : 0;
 		int row_stride = e->gate_up_fused ? inter * 2 : 0;
-		s = gl_pipe_uses_xqk(p, down_pipe)
-				? gl_quantize_q8_k(p, &gate_b, inter, cnt, &up_b, act_mode, e->gate_scale,
-								   e->up_scale, row_stride)
-				: gl_quantize_x(p, &gate_b, inter, cnt, &up_b, act_mode, e->gate_scale, e->up_scale,
-								row_stride);
+		s = gl_pipe_uses_xqk(down_pipe) ? gl_quantize_q8_k(p, &gate_b, inter, cnt, &up_b, act_mode,
+														   e->gate_scale, e->up_scale, row_stride)
+										: gl_quantize_x(p, &gate_b, inter, cnt, &up_b, act_mode,
+														e->gate_scale, e->up_scale, row_stride);
 		if (s != OK)
 			goto done;
 	}
@@ -5074,7 +5051,7 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 	int			 down_block = 0;
 	float		 ws			= e->weight * e->down_scale;
 	int			 fused_tail = gl_matmul_pipe_for_type(p, e->down_type, &down_pipe, &down_block) &&
-							  (gl_pipe_uses_xq(p, down_pipe) || gl_pipe_uses_xqk(p, down_pipe)) &&
+							  (gl_pipe_uses_xq(down_pipe) || gl_pipe_uses_xqk(down_pipe)) &&
 							  down_block > 0 && (inter % down_block) == 0 && ws >= 1e-2f;
 
 	buffer		gu = {0}, act = {0}, y = {0};
@@ -5111,7 +5088,7 @@ static status_code gl_moe_expert_ffn(backend *self, const buffer *x, buffer *out
 		gl_buf_sync_to_device(as_glbuf(&up_buf));
 		int			act_mode = e->use_gelu ? 1 : 0;
 		float		uscale	 = e->up_scale * ws;
-		status_code qs		 = gl_pipe_uses_xqk(p, down_pipe)
+		status_code qs		 = gl_pipe_uses_xqk(down_pipe)
 								   ? gl_quantize_q8_k(p, &gate_buf, inter, 1, &up_buf, act_mode,
 													  e->gate_scale, uscale, 0)
 								   : gl_quantize_x(p, &gate_buf, inter, 1, &up_buf, act_mode,
@@ -5445,10 +5422,6 @@ static status_code gl_kda_project(backend *self, const backend_weight *w, const 
 								  buffer *y, int n, int k) {
 	return gl_matmul(self, w->buf, w->type, x, y, n, k);
 }
-
-typedef struct {
-	buffer q, k, v, g, o, g2, tmp_f, tmp_g, beta;
-} gl_kda_scratch;
 
 static status_code gl_kda_scratch_alloc(backend *self, const kda_desc *d, buffer *root,
 										gl_kda_scratch *out) {

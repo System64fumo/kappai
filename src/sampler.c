@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define SAMPLER_TOP_FILTER_CAP 1024
+
 static inline uint64_t rotl64(uint64_t x, int k) {
 	return (x << k) | (x >> (64 - k));
 }
@@ -203,8 +205,6 @@ static int top_all_desc(sampler *s, const float *logits, int vocab, sampler_top_
 		return 0;
 	return top_k_sorted(s, logits, vocab, max_keep, out);
 }
-
-#define SAMPLER_TOP_FILTER_CAP 1024
 
 static void apply_repeat_penalty(sampler *s, float *mut, int vocab) {
 	int n = MIN(s->repeat_last_n, s->recent_count);

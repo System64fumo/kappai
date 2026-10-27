@@ -5669,9 +5669,12 @@ void matmul_q4_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 					vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(dw_all)));
 				const float32x4_t dw_vec1 =
 					vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(dw_all)));
+				float dw[Q4_0_REPACKED_ROWS];
+				vst1q_f32(dw, dw_vec0);
+				vst1q_f32(dw + 4, dw_vec1);
 
 				for (int r = 0; r < MR; r++) {
-					const float		 d_w = vgetq_lane_f32(r < 4 ? dw_vec0 : dw_vec1, r & 3);
+					const float		 d_w = dw[r];
 					const uint8x16_t q	 = vld1q_u8(qs_ptr + (size_t)r * 16);
 					const int8x16_t	 lo =
 						vsubq_s8(vreinterpretq_s8_u8(vandq_u8(q, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
@@ -9512,21 +9515,21 @@ void dequant_iq4_xs_row(const void *blocks, size_t n_blocks, float *dst) {
 			int		  sl = (b[bi].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf;
 			int		  sh = (b[bi].scales_h >> (2 * ib)) & 3;
 			float	  dl = d * (float)((sl | (sh << 4)) - 32);
-			int8x16_t lo = vld1q_s8((const int8_t[16]){
+			int8x16_t lo = vld1q_s8(((const int8_t[16]){
 				kvalues_iq4nl[qs[0] & 0xf], kvalues_iq4nl[qs[1] & 0xf], kvalues_iq4nl[qs[2] & 0xf],
 				kvalues_iq4nl[qs[3] & 0xf], kvalues_iq4nl[qs[4] & 0xf], kvalues_iq4nl[qs[5] & 0xf],
 				kvalues_iq4nl[qs[6] & 0xf], kvalues_iq4nl[qs[7] & 0xf], kvalues_iq4nl[qs[8] & 0xf],
 				kvalues_iq4nl[qs[9] & 0xf], kvalues_iq4nl[qs[10] & 0xf],
 				kvalues_iq4nl[qs[11] & 0xf], kvalues_iq4nl[qs[12] & 0xf],
 				kvalues_iq4nl[qs[13] & 0xf], kvalues_iq4nl[qs[14] & 0xf],
-				kvalues_iq4nl[qs[15] & 0xf]});
-			int8x16_t hi = vld1q_s8((const int8_t[16]){
+				kvalues_iq4nl[qs[15] & 0xf]}));
+			int8x16_t hi = vld1q_s8(((const int8_t[16]){
 				kvalues_iq4nl[qs[0] >> 4], kvalues_iq4nl[qs[1] >> 4], kvalues_iq4nl[qs[2] >> 4],
 				kvalues_iq4nl[qs[3] >> 4], kvalues_iq4nl[qs[4] >> 4], kvalues_iq4nl[qs[5] >> 4],
 				kvalues_iq4nl[qs[6] >> 4], kvalues_iq4nl[qs[7] >> 4], kvalues_iq4nl[qs[8] >> 4],
 				kvalues_iq4nl[qs[9] >> 4], kvalues_iq4nl[qs[10] >> 4], kvalues_iq4nl[qs[11] >> 4],
 				kvalues_iq4nl[qs[12] >> 4], kvalues_iq4nl[qs[13] >> 4], kvalues_iq4nl[qs[14] >> 4],
-				kvalues_iq4nl[qs[15] >> 4]});
+				kvalues_iq4nl[qs[15] >> 4]}));
 			store_i8x16_scaled(lo, y, vdupq_n_f32(dl));
 			store_i8x16_scaled(hi, y + 16, vdupq_n_f32(dl));
 			y += 32;

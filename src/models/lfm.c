@@ -15,7 +15,7 @@ static void lfm_append_conv_block(op_emitter *e, const model *m, int li) {
 	OP_EMIT(e, mk_shortconv(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_XB2));
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_SSM_OUT, dim, p->value_dim,
 						 STAGE_MATMUL));
-	e->count = recipe_append_dense_ffn(e->ops, e->count, m, li);
+	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
 }
 
 static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
@@ -38,30 +38,23 @@ static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
 	OP_EMIT(e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, m->n_kv_heads,
 										  m->head_dim, m->n_ctx, m->sliding_window));
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL));
-	e->count = recipe_append_dense_ffn(e->ops, e->count, m, li);
+	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
 }
 
 enum { LFM_MAX_OPS_PER_LAYER = 24 };
+
+static void lfm_append_layer(op_emitter *e, const model *m, int li) {
+	if (model_layer_is_recurrent(m, li))
+		lfm_append_conv_block(e, m, li);
+	else
+		lfm_append_attention_block(e, m, li);
+}
 
 static model_recipe *build_lfm2_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(*r));
 	recipe_build_pre_ops(r, m);
 
-	r->layer.ops	 = xcalloc(LFM_MAX_OPS_PER_LAYER, sizeof(recipe_op));
-	r->layer.n_ops	 = LFM_MAX_OPS_PER_LAYER;
-	r->per_layer_ops = xcalloc((size_t)m->n_layers * LFM_MAX_OPS_PER_LAYER, sizeof(recipe_op));
-	int max_ops		 = 0;
-	for (int li = 0; li < m->n_layers; li++) {
-		recipe_op *ops = r->per_layer_ops + (size_t)li * LFM_MAX_OPS_PER_LAYER;
-		op_emitter e   = op_emitter_make(ops, LFM_MAX_OPS_PER_LAYER, "lfm2");
-		if (model_layer_is_recurrent(m, li))
-			lfm_append_conv_block(&e, m, li);
-		else
-			lfm_append_attention_block(&e, m, li);
-		if (e.count > max_ops)
-			max_ops = e.count;
-	}
-	recipe_pack_per_layer_ops(r, m->n_layers, LFM_MAX_OPS_PER_LAYER, max_ops);
+	recipe_build_layers(r, m, LFM_MAX_OPS_PER_LAYER, "lfm2", lfm_append_layer);
 	recipe_build_post_ops(r, m);
 	return r;
 }

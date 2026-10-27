@@ -39,22 +39,6 @@
 #define VK_ATTN_DEC_MIN_CHUNK 16
 #define VK_PROF_NAMES 128
 
-static inline uint32_t vk_f32_to_bits(float f) {
-	union {
-		float	 v;
-		uint32_t b;
-	} u = {.v = f};
-	return u.b;
-}
-
-static inline float vk_f32_from_bits(uint32_t b) {
-	union {
-		uint32_t b;
-		float	 v;
-	} u = {.b = b};
-	return u.v;
-}
-
 enum elem_mode {
 	ELEM_MODE_COPY			   = 0,
 	ELEM_MODE_ADD_INPLACE	   = 1,
@@ -131,6 +115,13 @@ typedef struct {
 	VkDeviceSize			  sub_size;
 } vk_buf;
 
+typedef struct {
+	vk_buf		*cos_b;
+	vk_buf		*sin_b;
+	VkDeviceSize cos_off;
+	VkDeviceSize sin_off;
+} vk_rope_tables;
+
 typedef struct vk_suballoc_range {
 	VkDeviceSize off;
 	VkDeviceSize size;
@@ -196,8 +187,6 @@ typedef struct {
 	size_t device_local_allocated;
 
 	struct {
-		uint32_t	 vendor_id;
-		uint32_t	 device_id;
 		uint32_t	 max_shared_memory;
 		uint32_t	 max_workgroup_size[3];
 		uint32_t	 max_workgroup_invocations;
@@ -210,10 +199,7 @@ typedef struct {
 		int			 is_adreno;
 		int			 is_amd;
 		int			 supports_subgroup_basic;
-		int			 supports_subgroup_vote;
 		int			 supports_subgroup_arithmetic;
-		int			 supports_subgroup_ballot;
-		int			 supports_int8;
 		int			 supports_integer_dot_product;
 		int			 supports_16bit_storage;
 		uint32_t	 max_workgroup_count[2];
@@ -358,12 +344,10 @@ typedef struct {
 	const float *rope_cos_base;
 	const float *rope_sin_base;
 	const float *rope_ff_base;
-	int			 rope_ff_pos;
 	int			 rope_ff_head_dim;
 	int			 rope_ff_n_ctx;
 	float		 rope_ff_theta;
 	int			 rope_half_stored;
-	int			 rope_n_ctx_stored;
 
 	buffer *rope_cos_buf_active;
 	buffer *rope_sin_buf_active;
@@ -453,11 +437,25 @@ typedef struct {
 		int diag;
 		int abort_on_error;
 		int validate;
-		int attention_native;
-		int attention_native_checked;
 	} debug;
 
 } vk_priv;
+
+static inline uint32_t vk_f32_to_bits(float f) {
+	union {
+		float	 v;
+		uint32_t b;
+	} u = {.v = f};
+	return u.b;
+}
+
+static inline float vk_f32_from_bits(uint32_t b) {
+	union {
+		uint32_t b;
+		float	 v;
+	} u = {.b = b};
+	return u.v;
+}
 
 static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed);
 
@@ -2311,7 +2309,6 @@ static status_code vk_init(backend *self, int device_index) {
 			return ERR_INTERNAL;
 	}
 	p->timeline_supported				 = timeline_available;
-	p->caps.supports_int8				 = int8_available;
 	p->caps.supports_integer_dot_product = dot_product_available;
 	p->caps.supports_16bit_storage		 = int16_available;
 	p->has_memory_budget_ext			 = has_memory_budget_ext;
@@ -2319,8 +2316,6 @@ static status_code vk_init(backend *self, int device_index) {
 	vkGetDeviceQueue(p->dev, p->queue_family, 0, &p->queue);
 
 	VkPhysicalDeviceProperties props		= dev_props_for_version;
-	p->caps.vendor_id						= props.vendorID;
-	p->caps.device_id						= props.deviceID;
 	p->caps.max_shared_memory				= props.limits.maxComputeSharedMemorySize;
 	p->caps.max_workgroup_size[0]			= props.limits.maxComputeWorkGroupSize[0];
 	p->caps.max_workgroup_size[1]			= props.limits.maxComputeWorkGroupSize[1];
@@ -2349,9 +2344,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.subgroup_size				 = subgroup_props.subgroupSize;
 	VkSubgroupFeatureFlags sf			 = subgroup_props.supportedOperations;
 	p->caps.supports_subgroup_basic		 = (sf & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0;
-	p->caps.supports_subgroup_vote		 = (sf & VK_SUBGROUP_FEATURE_VOTE_BIT) != 0;
 	p->caps.supports_subgroup_arithmetic = (sf & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
-	p->caps.supports_subgroup_ballot	 = (sf & VK_SUBGROUP_FEATURE_BALLOT_BIT) != 0;
 #endif
 
 	p->caps.unified_memory = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
@@ -6442,13 +6435,6 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)n_rows, 0x3);
 }
-
-typedef struct {
-	vk_buf		*cos_b;
-	vk_buf		*sin_b;
-	VkDeviceSize cos_off;
-	VkDeviceSize sin_off;
-} vk_rope_tables;
 
 static status_code vk_rope_tables_get(backend *self, int head_dim, const float *rope_cos_base,
 									  const float *rope_sin_base, const float *freq_factors,

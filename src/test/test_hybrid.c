@@ -294,16 +294,12 @@ void run_hybrid_state_tests(backend *ref) {
 				maxdiff = d;
 		}
 		if (maxdiff <= ATOL_LOOSE * 10.0f) {
-			record_result(OPFAM_HYBRID_STATE, "shrinking_batch_known_bug_fixed", V_PASS,
-						  "64/64/22 chunks match single batch (bitrev cache fixed)");
+			record_result(OPFAM_HYBRID_STATE, "shrinking_chunk_parity", V_PASS,
+						  "64/64/22 chunks match single batch");
 		} else {
 			snprintf(detail, sizeof(detail),
-					 "KNOWN BUG, escalated to owners of backend/cpu/{aarch64,scalar}: "
-					 "cpu_bitrev_perm_get() reuses a stale permutation when m_pow2 shrinks "
-					 "(64->22 rows). chunks 64/64/22 vs single batch: max|dlogits|=%.3e. "
-					 "Fix: regenerate when m_pow2 differs, not merely when cap < m_pow2.",
-					 maxdiff);
-			record_result(OPFAM_HYBRID_STATE, "shrinking_batch_known_bug", V_SKIP, detail);
+					 "chunks 64/64/22 diverge from single batch: max|dlogits|=%.3e", maxdiff);
+			record_result(OPFAM_HYBRID_STATE, "shrinking_chunk_parity", V_FAIL, detail);
 		}
 		hyb_free(&ref);
 		hyb_free(&chunked);

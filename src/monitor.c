@@ -1,10 +1,14 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "monitor.h"
 #include "json_helpers.h"
 #include "log.h"
 #include "profile.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +22,60 @@ static void monitor_emit(monitor *mon, const char *json_fmt, ...)
 	__attribute__((format(printf, 2, 3)));
 
 #define MONITOR_DEFAULT_PATH "/tmp/kappai.monitor"
+
+static int monitor_socket_prepare(int fd) {
+#if !defined(__linux__)
+	int flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+		return -1;
+	flags = fcntl(fd, F_GETFD);
+	if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+		return -1;
+#else
+	(void)fd;
+#endif
+#if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
+	int enabled = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) < 0)
+		return -1;
+#endif
+	return 0;
+}
+
+static ssize_t monitor_write(int fd, const void *buf, size_t len) {
+#ifdef MSG_NOSIGNAL
+	return send(fd, buf, len, MSG_NOSIGNAL);
+#elif defined(SO_NOSIGPIPE)
+	return send(fd, buf, len, 0);
+#else
+	sigset_t blocked, previous, pending;
+	sigemptyset(&blocked);
+	sigaddset(&blocked, SIGPIPE);
+	int rc = pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+	if (rc != 0) {
+		errno = rc;
+		return -1;
+	}
+	if (sigpending(&pending) < 0) {
+		int saved = errno;
+		pthread_sigmask(SIG_SETMASK, &previous, NULL);
+		errno = saved;
+		return -1;
+	}
+	int		already_pending = sigismember(&pending, SIGPIPE);
+	ssize_t n				= send(fd, buf, len, 0);
+	int		saved			= errno;
+	if (n < 0 && saved == EPIPE && !already_pending && sigpending(&pending) == 0 &&
+		sigismember(&pending, SIGPIPE) == 1) {
+		int sig;
+		while (sigwait(&blocked, &sig) == EINTR) {
+		}
+	}
+	pthread_sigmask(SIG_SETMASK, &previous, NULL);
+	errno = saved;
+	return n;
+#endif
+}
 
 static void monitor_emit(monitor *mon, const char *json_fmt, ...) {
 	va_list ap;
@@ -48,7 +106,7 @@ void monitor_reset(monitor *mon) {
 	mon->fd = -1;
 	for (int i = 0; i < MONITOR_MAX_CLIENTS; i++)
 		mon->clients[i] = -1;
-	mon->mtx = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+	pthread_mutex_init(&mon->mtx, NULL);
 }
 
 status_code monitor_init(monitor *mon, const char *path) {
@@ -57,9 +115,18 @@ status_code monitor_init(monitor *mon, const char *path) {
 	const char *sock_path = (path && path[0]) ? path : MONITOR_DEFAULT_PATH;
 	snprintf(mon->path, sizeof(mon->path), "%s", sock_path);
 
+#if defined(__linux__)
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+#else
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+#endif
 	if (fd < 0) {
 		WARN("monitor: socket() failed: %s", strerror(errno));
+		return ERR_IO;
+	}
+	if (monitor_socket_prepare(fd) < 0) {
+		WARN("monitor: socket setup failed: %s", strerror(errno));
+		close(fd);
 		return ERR_IO;
 	}
 
@@ -77,7 +144,8 @@ status_code monitor_init(monitor *mon, const char *path) {
 
 	unlink(mon->path);
 
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+	socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_len + 1);
+	if (bind(fd, (struct sockaddr *)&addr, addr_len) < 0) {
 		WARN("monitor: bind(%s) failed: %s", mon->path, strerror(errno));
 		close(fd);
 		return ERR_IO;
@@ -107,9 +175,20 @@ void monitor_poll(monitor *mon) {
 
 	pthread_mutex_lock(&mon->mtx);
 	while (atomic_load_explicit(&mon->n_clients, memory_order_relaxed) < MONITOR_MAX_CLIENTS) {
+#if defined(__linux__)
 		int cfd = accept4(mon->fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-		if (cfd < 0)
+#else
+		int cfd = accept(mon->fd, NULL, NULL);
+#endif
+		if (cfd < 0) {
+			if (errno == EINTR)
+				continue;
 			break;
+		}
+		if (monitor_socket_prepare(cfd) < 0) {
+			close(cfd);
+			continue;
+		}
 
 		int slot = -1;
 		for (int i = 0; i < MONITOR_MAX_CLIENTS; i++) {
@@ -152,7 +231,7 @@ void monitor_send(monitor *mon, const char *json_fmt, ...) {
 		int fd = mon->clients[i];
 		if (fd < 0)
 			continue;
-		ssize_t w = send(fd, buf, (size_t)n, MSG_NOSIGNAL | MSG_DONTWAIT);
+		ssize_t w = monitor_write(fd, buf, (size_t)n);
 		if (w < 0 && (errno == EPIPE || errno == ECONNRESET || errno == EBADF || errno == EAGAIN ||
 					  errno == EWOULDBLOCK)) {
 			if (mon->clients[i] == fd) {

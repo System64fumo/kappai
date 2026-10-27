@@ -1,4 +1,4 @@
-#include "mempool.h"
+#include "memory.h"
 #include "test_core.h"
 
 #define record_mempool(label, ok, ...) record_resultf(OPFAM_MEMPOOL, (label), (ok), __VA_ARGS__)
@@ -59,7 +59,30 @@ static void test_unified_gpu_without_host_member(void) {
 	mem_topology t;
 	mem_topology_build(&t, all, 1);
 	int ok = t.n_pools == 1 && t.pools[0].is_host && mem_topology_pool_of(&t, &igpu) == 0;
+	ok &= mem_topology_available(&t) == 999 * GB && mem_topology_total(&t) == 999 * GB;
 	record_mempool("unified_gpu_no_host_member", ok, "pools=%d", t.n_pools);
+}
+
+static void test_host_capacity_source_order(void) {
+	backend		 cpu   = fake_backend(0, 0, BCAP_IS_HOST, 60 * GB, 64 * GB);
+	backend		 igpu  = fake_backend(1, 100, BCAP_UNIFIED_MEMORY, 999 * GB, 999 * GB);
+	backend		*all[] = {&igpu, &cpu};
+	mem_topology t;
+	mem_topology_build(&t, all, 2);
+	int ok = t.n_pools == 1 && t.pools[0].capacity_source == &cpu;
+	ok &= mem_topology_available(&t) == 60 * GB && mem_topology_total(&t) == 64 * GB;
+	record_mempool("host_capacity_source_order", ok, "pools=%d", t.n_pools);
+}
+
+static void test_unknown_backend_memory(void) {
+	backend		 unknown = {0};
+	backend		*all[]	 = {&unknown};
+	mem_topology t;
+	mem_topology_build(&t, all, 1);
+	int ok = backend_mem_available(&unknown) == 0 && backend_mem_total(&unknown) == 0;
+	ok &= backend_mem_available(NULL) == 0 && backend_mem_total(NULL) == 0;
+	ok &= mem_topology_available(&t) == 0 && mem_topology_total(&t) == 0;
+	record_mempool("unknown_backend_memory", ok, "pools=%d", t.n_pools);
 }
 
 static void test_discrete_gpu_adds_pool(void) {
@@ -116,6 +139,8 @@ void run_mempool_tests(void) {
 	test_host_only();
 	test_unified_gpu_shares_host_pool();
 	test_unified_gpu_without_host_member();
+	test_host_capacity_source_order();
+	test_unknown_backend_memory();
 	test_discrete_gpu_adds_pool();
 	test_igpu_and_dgpu();
 	test_discrete_ordering();

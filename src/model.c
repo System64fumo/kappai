@@ -2,7 +2,7 @@
 #include "model.h"
 #include "config.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "moe/moe_stream.h"
 #include "monitor.h"
 #include "recipe.h"
@@ -1113,20 +1113,10 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
 }
 
-static status_code upload_one(model *m, weight_ref *ref, uint32_t wtype, int ndims, uint64_t d0,
-							  uint64_t d1, weight_class wc) {
-	return upload_one_to(m, ref, wtype, ndims, d0, d1, wc, m->backend);
-}
-
 static status_code upload_one_repack_to(model *m, weight_ref *ref, int ndims, uint64_t d0,
 										uint64_t d1, weight_class wc, backend *target) {
 	return upload_tensor_repack_to(m, ref->host_ptr, &ref->type, ndims, d0, d1, wc, target,
 								   &ref->buf);
-}
-
-static status_code upload_one_repack(model *m, weight_ref *ref, int ndims, uint64_t d0, uint64_t d1,
-									 weight_class wc) {
-	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, m->backend);
 }
 
 static int tied_output_shares_buffer(const model *m) {
@@ -1148,7 +1138,8 @@ static void progress_step(progress *prog) {
 static status_code upload_embeddings(model *m, progress *prog) {
 	status_code s;
 
-	s = upload_one(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING);
+	s = upload_one_to(m, &m->tok_embd, m->tok_embd.type, 2, m->dim, m->vocab_size, WCLASS_EMBEDDING,
+					  m->backend);
 	if (s != OK) {
 		ERROR("model_upload: token_embd upload failed (%d)", s);
 		return s;
@@ -1159,7 +1150,7 @@ static status_code upload_embeddings(model *m, progress *prog) {
 		madvise_access_pattern(m->gctx.map, m->gctx.map_size, m->tok_embd.host_ptr, embd_bytes,
 							   MADV_RANDOM);
 	}
-	s = upload_one(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
+	s = upload_one_to(m, &m->output_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM, m->backend);
 	if (s != OK) {
 		ERROR("model_upload: output_norm upload failed (%d)", s);
 		return s;
@@ -1169,7 +1160,8 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	if (tied_output_shares_buffer(m)) {
 		m->output_w.buf = m->tok_embd.buf;
 	} else {
-		s = upload_one_repack(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL);
+		s = upload_one_repack_to(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL,
+								 m->backend);
 		if (s != OK) {
 			ERROR("model_upload: output head upload failed (%d)", s);
 			return s;
@@ -1178,24 +1170,25 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	progress_step(prog);
 
 	if (m->has_per_layer_embeddings) {
-		s = upload_one(m, &m->layer_dims.per_layer_tok_embd, m->layer_dims.per_layer_tok_embd.type,
-					   2, (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
-					   WCLASS_EMBEDDING);
+		s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
+						  m->layer_dims.per_layer_tok_embd.type, 2,
+						  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
+						  WCLASS_EMBEDDING, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
 			return s;
 		}
 		progress_step(prog);
-		s = upload_one_repack(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
-							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
-							  WCLASS_MATMUL);
+		s = upload_one_repack_to(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,
+								 (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers,
+								 WCLASS_MATMUL, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_model_proj upload failed (%d)", s);
 			return s;
 		}
 		progress_step(prog);
-		s = upload_one(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
-					   m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM);
+		s = upload_one_to(m, &m->layer_dims.per_layer_proj_norm_w, GGML_TYPE_F32, 1,
+						  m->layer_dims.n_embd_per_layer, 0, WCLASS_NORM, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: per_layer_proj_norm upload failed (%d)", s);
 			return s;
@@ -1204,7 +1197,8 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	}
 	if (m->rope_freqs_count > 0) {
 		m->rope_freqs_w.host_ptr = m->rope_freqs;
-		s = upload_one(m, &m->rope_freqs_w, GGML_TYPE_F32, 1, m->rope_freqs_count, 0, WCLASS_MISC);
+		s = upload_one_to(m, &m->rope_freqs_w, GGML_TYPE_F32, 1, m->rope_freqs_count, 0,
+						  WCLASS_MISC, m->backend);
 		if (s != OK) {
 			ERROR("model_upload: rope_freqs upload failed (%d)", s);
 			return s;
@@ -1219,12 +1213,15 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	layer_weights *L		= &m->layers[i];
 	backend		  *layer_be = model_layer_backend(m, i);
 
-	int q_out		 = m->n_heads * model_layer_head_dim(m, i);
-	int q_weight_out = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
-	int kv_out		 = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
-	int intermediate = model_layer_intermediate(m, i);
-	int is_mla_layer = m->arch_info->is_mla;
-	int is_moe_layer = model_layer_is_moe(m, i);
+	int q_out		  = m->n_heads * model_layer_head_dim(m, i);
+	int q_weight_out  = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
+	int kv_out		  = model_layer_kv_heads(m, i) * model_layer_head_dim(m, i);
+	int intermediate  = model_layer_intermediate(m, i);
+	int is_mla_layer  = m->arch_info->is_mla;
+	int is_moe_layer  = model_layer_is_moe(m, i);
+	L->qkv_fused	  = 0;
+	L->qkv_fused_host = NULL;
+	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
@@ -1417,9 +1414,6 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	L->gate_up_fused_host = NULL;
 	L->shexp_fused		  = 0;
 	L->shexp_fused_host	  = NULL;
-	L->qkv_fused		  = 0;
-	L->qkv_fused_host	  = NULL;
-	memset(&L->qkv_w.buf, 0, sizeof(L->qkv_w.buf));
 	memset(&L->gate_w.buf, 0, sizeof(L->gate_w.buf));
 	memset(&L->up_w.buf, 0, sizeof(L->up_w.buf));
 	memset(&L->down_w.buf, 0, sizeof(L->down_w.buf));
@@ -1560,7 +1554,11 @@ static void prefetch_layer_pages(const model *m, int layer) {
 		page_span r = page_span_for(gt->data, gt->byte_size, ps);
 		if (!page_span_clamp(&r, base, g->map_size) || r.len == 0)
 			continue;
+#if defined(__linux__)
 		readahead(g->fd, (off_t)(r.start - base), r.len);
+#else
+		weight_source_prefetch((const void *)r.start, r.len);
+#endif
 	}
 }
 
@@ -2898,17 +2896,6 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 							DEBUG("MoE: %d experts, per-expert tensors, %s", m->moe.n_experts,
 								  ggml_type_name(L->experts[0].gate_type));
 						}
-					}
-				}
-				L->any_fused_experts = 0;
-				L->gate_q8_type		 = 0;
-				for (int e = 0; e < m->moe.n_experts; e++) {
-					if (L->experts[e].gate_up_fused)
-						L->any_fused_experts = 1;
-					if (!L->gate_q8_type) {
-						uint32_t qt = wtype_to_q8type(L->experts[e].gate_type);
-						if (qt)
-							L->gate_q8_type = qt;
 					}
 				}
 				if (!m->arch_info->uses_moe_shared_dense_ffn) {

@@ -4,7 +4,7 @@
 #include "config.h"
 #include "hcs.h"
 #include "log.h"
-#include "memconfig.h"
+#include "memory.h"
 #include "model.h"
 #include "moe/moe_common.h"
 #include "moe/moe_tier.h"
@@ -99,7 +99,7 @@ struct moe_stream_cache {
 	_Atomic uint64_t stat_fill_direct_fallback_copy;
 	_Atomic uint64_t stat_fill_memcpy;
 	_Atomic uint64_t stat_fill_bytes;
-	int				 pin_fail_warned;
+	_Atomic int		 pin_fail_warned;
 };
 
 typedef struct {
@@ -162,7 +162,6 @@ typedef struct moe_stream_op {
 	struct moe_stream_layer	  *slayer;
 	int						   layer;
 	uint64_t				   now;
-	int						   n_k;
 	moe_expert_slot			  *out_slots;
 	moe_miss_entry			  *misses;
 	int						   n_misses;
@@ -175,6 +174,45 @@ typedef struct moe_stream_op {
 	moe_stream_compute_hook_fn hook;
 	void					  *hook_ctx;
 } moe_stream_op;
+
+typedef struct {
+	int		  n_pinned;
+	int		  lru_cap;
+	backend **pin_be;
+	int		 *pin_ids;
+	backend	 *tier_be;
+	int		  tier_cap;
+	int		  tier_pool;
+} moe_hcs_plan;
+
+typedef struct {
+	moe_expert_slot *slot;
+	moe_expert_slot	 tmp;
+	backend			*be;
+	int				 layer;
+	status_code		 st;
+	_Atomic int		 io_err;
+} moe_upload_item;
+
+typedef struct {
+	struct model	 *m;
+	moe_stream_cache *c;
+	moe_upload_item	 *items;
+	moe_fill_chunk	 *chunks;
+	int				  chunk_cap;
+	void			**bufs;
+	size_t			 *buf_sz;
+	tpool			 *pool;
+	backend			**failed;
+	int				 *n_failed;
+	char			 *layer_dev;
+	char			 *layer_partial;
+	int				 *uploaded;
+	size_t			 *dev_bytes;
+	progress		 *prog;
+	int				  n_items;
+	int				  n_done;
+} moe_upload_ctx;
 
 static size_t tensor_bytes_2d(uint32_t type, int d0, int d1) {
 	return ggml_row_size(type, (size_t)d0 * (size_t)d1);
@@ -253,13 +291,13 @@ static void moe_nomap_open(moe_stream_cache *c, const char *path) {
 		WARN("moe no-mmap: could not open '%s' for expert streaming (%s)", path, strerror(errno));
 		return;
 	}
-	posix_fadvise(c->nomap_fd, 0, 0, POSIX_FADV_RANDOM);
+	file_advise(c->nomap_fd, 0, 0, FILE_ADVICE_RANDOM);
 
 	struct stat nst;
 	if (fstat(c->nomap_fd, &nst) == 0 && S_ISREG(nst.st_mode) && nst.st_size > 0)
 		c->nomap_file_size = (uint64_t)nst.st_size;
 
-	int fd = open(path, O_RDONLY | O_DIRECT);
+	int fd = open(path, O_RDONLY);
 	if (fd < 0) {
 		DEBUG("moe no-mmap: O_DIRECT unavailable (%s), using buffered reads", strerror(errno));
 		return;
@@ -284,9 +322,9 @@ static void moe_nomap_close(moe_stream_cache *c) {
 	}
 }
 
-static __thread void  *tl_bounce_buf   = NULL;
-static __thread size_t tl_bounce_cap   = 0;
-static __thread size_t tl_bounce_align = 0;
+static _Thread_local void  *tl_bounce_buf	= NULL;
+static _Thread_local size_t tl_bounce_cap	= 0;
+static _Thread_local size_t tl_bounce_align = 0;
 
 static void *bounce_buf_get(size_t align, size_t need) {
 	if (tl_bounce_buf && tl_bounce_align == align && tl_bounce_cap >= need)
@@ -316,8 +354,8 @@ static int bounce_read_aligned(int fd, uint64_t aligned_off, size_t aligned_len,
 	void *bounce = bounce_buf_get(align, aligned_len);
 	if (!bounce)
 		return -1;
-	ssize_t got = gguf_pread_full(fd, bounce, aligned_len, (off_t)aligned_off);
-	if ((size_t)got < head_slop + len)
+	ssize_t got = gguf_pread_full(fd, bounce, aligned_len, aligned_off);
+	if (got < 0 || (size_t)got < head_slop + len)
 		return -1;
 	memcpy(dst, (uint8_t *)bounce + head_slop, len);
 	return 0;
@@ -348,11 +386,13 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_direct_fd >= 0 && c->nomap_direct_align > 0) {
 		size_t align = c->nomap_direct_align;
 
-		if (precheck_aligned &&
-			(size_t)gguf_pread_full(c->nomap_direct_fd, dst, len, (off_t)file_off) >= len) {
-			atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
-			atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
-			return 0;
+		if (precheck_aligned) {
+			ssize_t got = gguf_pread_full(c->nomap_direct_fd, dst, len, file_off);
+			if (got >= 0 && (size_t)got >= len) {
+				atomic_fetch_add_explicit(&c->stat_direct_ok, 1, memory_order_relaxed);
+				atomic_fetch_add_explicit(&c->stat_nomap_aligned, 1, memory_order_relaxed);
+				return 0;
+			}
 		}
 
 		if (aligned_pread_bounce(c->nomap_direct_fd, align, file_off, len, dst, 0) == 0) {
@@ -367,9 +407,10 @@ static int moe_nomap_read(moe_stream_cache *c, uint64_t file_off, size_t len, ui
 	if (c->nomap_fd < 0)
 		return -1;
 	atomic_fetch_add_explicit(&c->stat_direct_fallback, 1, memory_order_relaxed);
-	if ((size_t)gguf_pread_full(c->nomap_fd, dst, len, (off_t)file_off) < len)
+	ssize_t got = gguf_pread_full(c->nomap_fd, dst, len, file_off);
+	if (got < 0 || (size_t)got < len)
 		return -1;
-	posix_fadvise(c->nomap_fd, (off_t)file_off, (off_t)len, POSIX_FADV_DONTNEED);
+	file_advise(c->nomap_fd, (off_t)file_off, (off_t)len, FILE_ADVICE_RELEASE);
 	return 0;
 }
 
@@ -380,8 +421,11 @@ static int moe_direct_io_read(moe_stream_cache *c, off_t file_off, size_t len, u
 
 	size_t align = c->direct_io_align;
 
-	if (precheck_aligned && (size_t)gguf_pread_full(c->direct_io_fd, dst, len, file_off) >= len)
-		return 0;
+	if (precheck_aligned) {
+		ssize_t got = gguf_pread_full(c->direct_io_fd, dst, len, (uint64_t)file_off);
+		if (got >= 0 && (size_t)got >= len)
+			return 0;
+	}
 
 	return aligned_pread_bounce(c->direct_io_fd, align, (uint64_t)file_off, len, dst,
 								c->backing_file_size);
@@ -668,16 +712,6 @@ static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
 	sl->dev_ready = 0;
 }
 
-typedef struct {
-	int		  n_pinned;
-	int		  lru_cap;
-	backend **pin_be;
-	int		 *pin_ids;
-	backend	 *tier_be;
-	int		  tier_cap;
-	int		  tier_pool;
-} moe_hcs_plan;
-
 static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_part, int n_dev,
 						  int pin_host, moe_hcs_plan *p);
 
@@ -760,7 +794,7 @@ static status_code moe_plan_hcs(const struct model *m, const config *cfg, moe_hc
 	n_host		   = MIN(n_host, n_exp - n_dev);
 	int unassigned = n_exp - n_dev - n_host;
 
-	size_t avail   = m->topo ? mem_topology_host_available(m->topo) : get_available_memory();
+	size_t avail   = mem_topology_host_available(m->topo);
 	size_t budget  = moe_tier_pool_budget(avail);
 	size_t layer_b = per_expert * (size_t)moe_layers;
 	int	   fit	   = moe_tier_fit(budget, layer_b, n_exp);
@@ -935,15 +969,6 @@ static bool moe_plan_pins(const struct model *m, const config *cfg, int tier_par
 	return true;
 }
 
-typedef struct {
-	moe_expert_slot *slot;
-	moe_expert_slot	 tmp;
-	backend			*be;
-	int				 layer;
-	status_code		 st;
-	_Atomic int		 io_err;
-} moe_upload_item;
-
 static void moe_slot_to_host_fallback(struct model *m, moe_stream_cache *c, int layer,
 									  moe_expert_slot *sl) {
 	status_code st = moe_pin_copy_slot(m, c, layer, sl, NULL, 0);
@@ -985,26 +1010,6 @@ static int moe_upload_one(struct model *m, moe_upload_item *it, size_t *dev_byte
 	*dev_bytes += eb.total;
 	return 1;
 }
-
-typedef struct {
-	struct model	 *m;
-	moe_stream_cache *c;
-	moe_upload_item	 *items;
-	moe_fill_chunk	 *chunks;
-	int				  chunk_cap;
-	void			**bufs;
-	size_t			 *buf_sz;
-	tpool			 *pool;
-	backend			**failed;
-	int				 *n_failed;
-	char			 *layer_dev;
-	char			 *layer_partial;
-	int				 *uploaded;
-	size_t			 *dev_bytes;
-	progress		 *prog;
-	int				  n_items;
-	int				  n_done;
-} moe_upload_ctx;
 
 static int moe_upload_backend_failed(const moe_upload_ctx *u, const backend *b) {
 	for (int f = 0; f < *u->n_failed; f++)
@@ -2518,7 +2523,6 @@ moe_stream_op *moe_stream_resolve_prep(struct model *m, int layer, const int *ex
 	op->cache		   = c;
 	op->slayer		   = L;
 	op->layer		   = layer;
-	op->n_k			   = n_k;
 	op->out_slots	   = out_slots;
 	op->now			   = now;
 	op->st			   = OK;

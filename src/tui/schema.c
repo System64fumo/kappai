@@ -15,6 +15,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+typedef struct {
+	const char *p;
+	int			line_no;
+} ini_cursor;
+
 static const char *const kv_quant_choices[] = {"f16", "q8_0", NULL};
 static const char *const repack_choices[]	= {
 	"iq3_s", "q8_0", "iq4_nl", "q4_0", "q4_k", "q5_k", "q6_k", NULL,
@@ -391,11 +396,6 @@ static char *read_file(const char *path, size_t *out_len, char *err, size_t errl
 	*out_len = (size_t)sz;
 	return data;
 }
-
-typedef struct {
-	const char *p;
-	int			line_no;
-} ini_cursor;
 
 static int ini_next_line(ini_cursor *c, char *out, size_t outcap) {
 	size_t used	  = 0;

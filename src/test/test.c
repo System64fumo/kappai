@@ -105,6 +105,9 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	run_tokenizer_tests();
 	flush_family(OPFAM_TOKENIZER);
 	run_jinja_tests();
+	run_portability_tests();
+	run_model_lifecycle_tests();
+	run_server_task_tests();
 	flush_family(OPFAM_EDGE_CASE);
 	run_hybrid_state_tests(ref);
 	flush_family(OPFAM_HYBRID_STATE);
@@ -121,6 +124,7 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 	run_moe_tier_tests();
 	flush_family(OPFAM_MOE_TIER);
 	run_plan_tests();
+	run_gguf_tests();
 	flush_family(OPFAM_PLAN);
 
 	int run_all = wants_all(argc, argv);

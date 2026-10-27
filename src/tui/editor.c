@@ -42,10 +42,6 @@ typedef struct {
 	int			 status_kind;
 } editor_state;
 
-typedef struct {
-	const field_desc *f;
-} field_validate_ud;
-
 typedef enum {
 	HCS_REF_ENABLE,
 	HCS_REF_SPACER,
@@ -66,6 +62,15 @@ typedef struct {
 	hcs_ref_kind kind;
 	int			 device;
 } hcs_ref;
+
+typedef struct {
+	bool			  allow_unset;
+	const hcs_config *h;
+	int				  self;
+	size_t			  field_offset;
+	int				  total;
+	const char		 *unit;
+} count_validate_ud;
 
 static const char EDITOR_HCS_ENABLE_HINT[] =
 	"Heterogeneous Compute Scheduler allows the use of advanced compute routing";
@@ -419,9 +424,9 @@ static void editor_hcs_row_text(const editor_state *st, int row, char *label, si
 }
 
 static int editor_validate_field(const char *value, char *err, size_t errlen, void *ud) {
-	field_validate_ud *vu = (field_validate_ud *)ud;
-	saved_config	   probe;
-	return sc_parse_value(&probe, vu->f, value, err, errlen);
+	const field_desc *f = ud;
+	saved_config	  probe;
+	return sc_parse_value(&probe, f, value, err, errlen);
 }
 
 static int editor_rows(const editor_state *st, int tab) {
@@ -903,11 +908,10 @@ static void editor_edit_field(editor_state *st, const field_desc *f) {
 	char		initial[SC_SYSTEM_MAX + 16];
 	snprintf(initial, sizeof(initial), "%s", cur);
 
-	field_validate_ud ud	 = {f};
-	ui_validate_fn	  v		 = (f->type == FLD_STR) ? NULL : editor_validate_field;
-	size_t			  buflen = (f->type == FLD_STR) ? f->max_len : sizeof(buf);
-	ui_complete_fn	  compl	 = (f->uik == UIK_PATH) ? ui_path_complete : NULL;
-	int				  r		 = ui_input(f->label, initial, buf, buflen, v, &ud, compl);
+	ui_validate_fn v	  = (f->type == FLD_STR) ? NULL : editor_validate_field;
+	size_t		   buflen = (f->type == FLD_STR) ? f->max_len : sizeof(buf);
+	ui_complete_fn compl  = (f->uik == UIK_PATH) ? ui_path_complete : NULL;
+	int			   r	  = ui_input(f->label, initial, buf, buflen, v, (void *)f, compl);
 	if (r <= 0) {
 		st->status[0] = '\0';
 		return;
@@ -921,15 +925,6 @@ static void editor_edit_field(editor_state *st, const field_desc *f) {
 	st->dirty	  = true;
 	st->status[0] = '\0';
 }
-
-typedef struct {
-	bool			  allow_unset;
-	const hcs_config *h;
-	int				  self;
-	size_t			  field_offset;
-	int				  total;
-	const char		 *unit;
-} count_validate_ud;
 
 static int editor_count_of(const hcs_device *d, size_t field_offset) {
 	return *(const int *)((const char *)d + field_offset);
@@ -1040,13 +1035,9 @@ static void editor_toggle_bool(editor_state *st, const char *title, bool *value)
 	editor_set_status(st, UI_OK, msg);
 }
 
-typedef struct {
-	int max_id;
-} pinlist_validate_ud;
-
 static int editor_validate_pinlist(const char *value, char *err, size_t errlen, void *ud) {
-	pinlist_validate_ud *pv = ud;
-	char				 canon[HCS_PINLIST_MAX];
+	int	 max_id = *(const int *)ud;
+	char canon[HCS_PINLIST_MAX];
 	if (hcs_parse_pinlist(value, canon, sizeof(canon)) != 0) {
 		snprintf(err, errlen, "expected a comma-separated expert id list, e.g. 3,17,42");
 		return -1;
@@ -1062,11 +1053,11 @@ static int editor_validate_pinlist(const char *value, char *err, size_t errlen, 
 			snprintf(err, errlen, "expert ids must be non-negative, got %ld", id);
 			return -1;
 		}
-		if (pv->max_id > 0 && id >= pv->max_id) {
+		if (max_id > 0 && id >= max_id) {
 			snprintf(err, errlen,
 					 "expert id %ld out of range; the model has %d expert(s) "
 					 "per layer",
-					 id, pv->max_id);
+					 id, max_id);
 			return -1;
 		}
 	}
@@ -1080,9 +1071,9 @@ static int editor_validate_pinlist(const char *value, char *err, size_t errlen, 
 }
 
 static void editor_edit_pins(editor_state *st, hcs_device *d) {
-	pinlist_validate_ud pv = {st->probe_ok ? st->n_experts : 0};
-	char				buf[HCS_PINLIST_MAX];
-	int r		  = ui_input("Pins", d->pins, buf, sizeof(buf), editor_validate_pinlist, &pv, NULL);
+	int	 max_id = st->probe_ok ? st->n_experts : 0;
+	char buf[HCS_PINLIST_MAX];
+	int	 r = ui_input("Pins", d->pins, buf, sizeof(buf), editor_validate_pinlist, &max_id, NULL);
 	st->status[0] = '\0';
 	if (r <= 0)
 		return;

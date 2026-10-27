@@ -1,16 +1,10 @@
 #include "compute.h"
 #include "log.h"
-#include "mem_plan.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define compute_model_changed(s, m, n_ctx)                                                         \
-	((s)->model.last_model != (m) || (s)->model.allocated_n_ctx < (n_ctx))
-
-void compute_scratch_init(compute_scratch *s) {
-	memset(s, 0, sizeof(*s));
-}
+#define ROPE_TABLE_BLOCK 4096
 
 typedef struct {
 	float *cos_out;
@@ -20,7 +14,9 @@ typedef struct {
 	double theta_scale;
 } rope_table_job;
 
-#define ROPE_TABLE_BLOCK 4096
+void compute_scratch_init(compute_scratch *s) {
+	memset(s, 0, sizeof(*s));
+}
 
 static void rope_table_chunk(int begin, int end, int tid, void *ctx) {
 	(void)tid;
@@ -101,19 +97,6 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->model.rope_sin);
 	free(s->model.rope_cos_swa);
 	free(s->model.rope_sin_swa);
-	free(s->ple.inp_host);
-	s->ple.inp_host = NULL;
-	free(s->run.cur_host);
-	s->run.cur_host = NULL;
-	free(s->run.out_proj_host);
-	s->run.out_proj_host = NULL;
-	free(s->run.vf_host);
-	s->run.vf_host = NULL;
-	free(s->run.xf_host);
-	s->run.xf_host				   = NULL;
-	s->run.small_host_dim		   = 0;
-	s->run.small_host_intermediate = 0;
-	s->run.small_host_kv_out	   = 0;
 	free(s->ple.proj_host.p);
 	free(s->ple.inpL_host.p);
 	s->ple.proj_host.p	 = NULL;
@@ -124,35 +107,25 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->moe.all_outs.p);
 	free(s->moe.scratch.p);
 	free(s->moe.xb_f.p);
-	free(s->moe.shared_y.p);
 	s->moe.all_scratch.p = NULL;
 	s->moe.all_outs.p	 = NULL;
 	s->moe.scratch.p	 = NULL;
 	s->moe.xb_f.p		 = NULL;
-	s->moe.shared_y.p	 = NULL;
 	free(s->moe.slot_buf);
 	s->moe.slot_buf = NULL;
 	free(s->moe.slot_dev);
 	s->moe.slot_dev = NULL;
 	expert_dev_scratch_release(&s->moe.expert_dev);
 
-#define FREE_FLOAT_BUF(field)                                                                      \
-	do {                                                                                           \
-		free(s->field.p);                                                                          \
-		s->field.p	 = NULL;                                                                       \
-		s->field.cap = 0;                                                                          \
-	} while (0)
-	FREE_FLOAT_BUF(hybrid.host);
-	FREE_FLOAT_BUF(hybrid.host2);
-	FREE_FLOAT_BUF(hybrid.gdn_ws);
-	FREE_FLOAT_BUF(run.op_ws);
-	FREE_FLOAT_BUF(run.stage_a);
-	FREE_FLOAT_BUF(run.stage_b);
-	FREE_FLOAT_BUF(hybrid.gdn_z);
-	FREE_FLOAT_BUF(hybrid.gdn_alpha);
-	FREE_FLOAT_BUF(hybrid.gdn_beta);
-	FREE_FLOAT_BUF(hybrid.gdn_out);
-#undef FREE_FLOAT_BUF
+	float_buf *buffers[] = {
+		&s->hybrid.host,	  &s->hybrid.host2,	   &s->hybrid.gdn_ws,  &s->run.op_ws,
+		&s->run.stage_a,	  &s->run.stage_b,	   &s->run.scale_tmp,  &s->hybrid.gdn_z,
+		&s->hybrid.gdn_alpha, &s->hybrid.gdn_beta, &s->hybrid.gdn_out,
+	};
+	for (size_t i = 0; i < ARRAY_LEN(buffers); i++) {
+		free(buffers[i]->p);
+		*buffers[i] = (float_buf){0};
+	}
 
 	if (s->bs) {
 		batch_scratch_free(s->bs);
@@ -162,8 +135,6 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	free(s->run.last_only);
 	s->run.last_only	 = NULL;
 	s->run.last_only_cap = 0;
-	free(s->run.batch_logits_tmp.p);
-	s->run.batch_logits_tmp.cap = 0;
 }
 
 static void expert_dev_entry_release(expert_dev_entry *e) {
@@ -213,27 +184,8 @@ void compute_scratch_free(compute_scratch *s) {
 	memset(s, 0, sizeof(*s));
 }
 
-void compute_small_host_ensure(compute_scratch *s, int dim, int intermediate, int kv_out) {
-	if (s->run.small_host_dim >= dim && s->run.small_host_intermediate >= intermediate &&
-		s->run.small_host_kv_out >= kv_out)
-		return;
-
-	int new_dim = s->run.small_host_dim < dim ? dim : s->run.small_host_dim;
-	int new_int = s->run.small_host_intermediate < intermediate ? intermediate
-																: s->run.small_host_intermediate;
-	int new_kv	= s->run.small_host_kv_out < kv_out ? kv_out : s->run.small_host_kv_out;
-	s->ple.inp_host		  = xrealloc(s->ple.inp_host, (size_t)new_int * sizeof(float));
-	s->run.cur_host		  = xrealloc(s->run.cur_host, (size_t)new_dim * sizeof(float));
-	s->run.out_proj_host  = xrealloc(s->run.out_proj_host, (size_t)new_dim * sizeof(float));
-	s->run.vf_host		  = xrealloc(s->run.vf_host, (size_t)new_kv * sizeof(float));
-	s->run.xf_host		  = xrealloc(s->run.xf_host, (size_t)new_dim * sizeof(float));
-	s->run.small_host_dim = new_dim;
-	s->run.small_host_intermediate = new_int;
-	s->run.small_host_kv_out	   = new_kv;
-}
-
 status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx) {
-	if (!compute_model_changed(s, m, n_ctx))
+	if (s->model.last_model == m && s->model.allocated_n_ctx >= n_ctx)
 		return OK;
 
 	scratch_free_device_buffers(s);
@@ -241,12 +193,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 
 	s->model.backend = m->backend;
 
-	mem_dims dims;
-	mem_dims_init(&dims, m);
-
 	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
-
-	compute_small_host_ensure(s, m->dim, dims.max_inter, dims.kv_out);
 
 	if (m->arch_info->is_moe)
 		s->moe.slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe.slot_buf));
@@ -279,7 +226,6 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 
 	s->model.allocated_n_ctx = n_ctx;
 	s->model.last_model		 = m;
-	s->model.last_n_ctx		 = n_ctx;
 
 	return OK;
 }

@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "backend.h"
+#include "backend/cpu/common.h"
 #include "log.h"
-#include "memconfig.h"
 #include "model.h"
 #include <dirent.h>
 #include <dlfcn.h>
@@ -18,6 +18,13 @@
 #define HFB_DETAIL_CAP 160
 #define HFB_PATH_CAP 512
 #define HFB_LIB_MAX 16
+#define BACKEND_LIB_PREFIX "libkappai_"
+#if defined(__APPLE__)
+#define BACKEND_LIB_SUFFIX ".dylib"
+#else
+#define BACKEND_LIB_SUFFIX ".so"
+#endif
+#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
 
 typedef struct {
 	uint64_t			 count;
@@ -27,6 +34,15 @@ typedef struct {
 	char				 device[32];
 	char				 detail[HFB_DETAIL_CAP];
 } hfb_entry;
+
+typedef struct {
+	char			name[32];
+	backend_ctor_fn ctor;
+} backend_reg_entry;
+
+static backend_reg_entry g_registry[BACKEND_MAX];
+static int				 g_registry_count = 0;
+static pthread_once_t	 g_backends_once  = PTHREAD_ONCE_INIT;
 
 static hfb_entry	   g_hfb_entries[HFB_MAX_ENTRIES];
 static int			   g_hfb_n_entries = 0;
@@ -176,7 +192,7 @@ static void backend_dump_load_diagnosis(void) {
 		ERROR("  backend library search dirs: none");
 	}
 	if (!g_backend_path_env)
-		ERROR("  (set KAPPAI_BACKEND_PATH to the backend .so directory)");
+		ERROR("  (set KAPPAI_BACKEND_PATH to the backend library directory)");
 
 	if (g_n_loaded_libs > 0) {
 		for (int i = 0; i < g_n_loaded_libs; i++)
@@ -192,14 +208,6 @@ static void backend_dump_load_diagnosis(void) {
 	else
 		ERROR("  no host fallback trigger recorded");
 }
-
-typedef struct {
-	char			name[32];
-	backend_ctor_fn ctor;
-} backend_reg_entry;
-
-static backend_reg_entry g_registry[BACKEND_MAX];
-static int				 g_registry_count = 0;
 
 void backend_register(const char *name, backend_ctor_fn ctor) {
 	if (g_registry_count >= BACKEND_MAX)
@@ -394,7 +402,7 @@ status_code backend_create(const char *name, int device_index, backend **out) {
 	return ERR_NOT_FOUND;
 }
 
-status_code backend_create_host(backend **out) {
+static status_code backend_host_template(backend *out) {
 	backend_load();
 	int				best_priority = -1;
 	backend_ctor_fn best_ctor	  = NULL;
@@ -439,8 +447,12 @@ status_code backend_create_host(backend **out) {
 		backend_dump_load_diagnosis();
 		return ERR_NOT_FOUND;
 	}
+	return best_ctor(out);
+}
+
+status_code backend_create_host(backend **out) {
 	backend	   *b = xcalloc(1, sizeof(backend));
-	status_code s = best_ctor(b);
+	status_code s = backend_host_template(b);
 	if (s != OK) {
 		free(b);
 		return s;
@@ -457,6 +469,20 @@ status_code backend_create_host(backend **out) {
 	log_op_homes(b);
 	*out = b;
 	return OK;
+}
+
+static cpu_cache_info (*g_host_cpu_info)(void);
+
+static void host_cpu_info_init(void) {
+	backend probe = {0};
+	if (backend_host_template(&probe) == OK)
+		g_host_cpu_info = probe.cpu_info;
+}
+
+cpu_cache_info backend_host_cpu_info(void) {
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	pthread_once(&once, host_cpu_info_init);
+	return g_host_cpu_info ? g_host_cpu_info() : (cpu_cache_info){.n_cpus = 1};
 }
 
 int backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max) {
@@ -704,19 +730,14 @@ status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {
 size_t backend_mem_available(const backend *b) {
 	if (b && b->mem_available)
 		return b->mem_available((backend *)b);
-	return get_available_memory();
+	return 0;
 }
 
 size_t backend_mem_total(const backend *b) {
 	if (b && b->mem_total)
 		return b->mem_total((backend *)b);
-	return get_total_memory();
+	return 0;
 }
-#define BACKEND_LIB_PREFIX "libkappai_"
-#define BACKEND_LIB_SUFFIX ".so"
-
-static pthread_once_t g_backends_once = PTHREAD_ONCE_INIT;
-
 static int str_ends_with(const char *s, const char *suffix) {
 	size_t ls = strlen(s), lx = strlen(suffix);
 	return ls >= lx && strcmp(s + ls - lx, suffix) == 0;
@@ -829,8 +850,6 @@ static void backends_init(void) {
 void backend_load(void) {
 	pthread_once(&g_backends_once, backends_init);
 }
-
-#define TENSOR_READ_PIECE_BYTES ((size_t)(32 << 20))
 
 status_code tensor_desc_read(const tensor_desc *desc, size_t off, void *dst, size_t len) {
 	if (!desc->read_fn) {
