@@ -1827,7 +1827,13 @@ static void json_append_str(str_builder *sb, const char *s) {
 	sb_putb(sb, "\"", 1);
 }
 
-static void json_to_json(str_builder *sb, const jinja_value *v) {
+static void json_newline(str_builder *sb, int indent, int level) {
+	sb_putb(sb, "\n", 1);
+	for (int i = 0; i < indent * level; i++)
+		sb_putb(sb, " ", 1);
+}
+
+static void json_to_json(str_builder *sb, const jinja_value *v, int indent, int level) {
 	if (!v) {
 		sb_puts(sb, "null");
 		return;
@@ -1849,26 +1855,42 @@ static void json_to_json(str_builder *sb, const jinja_value *v) {
 		json_append_str(sb, v->as.s);
 		break;
 	case JV_DICT: {
+		if (!v->as.dict) {
+			sb_puts(sb, "{}");
+			break;
+		}
 		sb_putb(sb, "{", 1);
 		int first = 1;
 		for (jinja_dict_entry *e = v->as.dict; e; e = e->next) {
 			if (!first)
-				sb_puts(sb, ", ");
+				sb_puts(sb, indent > 0 ? "," : ", ");
 			first = 0;
+			if (indent > 0)
+				json_newline(sb, indent, level + 1);
 			json_append_str(sb, e->key);
 			sb_puts(sb, ": ");
-			json_to_json(sb, e->val);
+			json_to_json(sb, e->val, indent, level + 1);
 		}
+		if (indent > 0)
+			json_newline(sb, indent, level);
 		sb_putb(sb, "}", 1);
 		break;
 	}
 	case JV_LIST: {
+		if (v->as.list.n == 0) {
+			sb_puts(sb, "[]");
+			break;
+		}
 		sb_putb(sb, "[", 1);
 		for (size_t i = 0; i < v->as.list.n; i++) {
 			if (i)
-				sb_puts(sb, ", ");
-			json_to_json(sb, v->as.list.items[i]);
+				sb_puts(sb, indent > 0 ? "," : ", ");
+			if (indent > 0)
+				json_newline(sb, indent, level + 1);
+			json_to_json(sb, v->as.list.items[i], indent, level + 1);
 		}
+		if (indent > 0)
+			json_newline(sb, indent, level);
 		sb_putb(sb, "]", 1);
 		break;
 	}
@@ -1997,11 +2019,17 @@ static jinja_value *filter_join(eval_ctx *ctx, jinja_value *base, expr_arg *args
 }
 
 static jinja_value *filter_tojson(eval_ctx *ctx, jinja_value *base, expr_arg *args) {
-	(void)ctx;
-	(void)args;
+	int indent = 0;
+	for (expr_arg *a = args; a; a = a->next) {
+		if (a->name && !strcmp(a->name, "indent")) {
+			jinja_value *iv = eval_expr(ctx, a->val);
+			if (iv && iv->type == JV_INT)
+				indent = (int)iv->as.integer.value;
+		}
+	}
 	str_builder sb;
 	sb_init(&sb);
-	json_to_json(&sb, base);
+	json_to_json(&sb, base, indent, 0);
 	return jinja_string_take(sb_finish(&sb));
 }
 

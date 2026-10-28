@@ -1,6 +1,7 @@
 #include "openai.h"
 
 #include "common.h"
+#include "decision.h"
 #include "engine.h"
 #include "json-c/json.h"
 #include "json_helpers.h"
@@ -111,12 +112,17 @@ struct req_ctx {
 	oa_req_params params;
 	json_object	 *body_json;
 	oa_gen		  gen;
+
+	decision_request decision;
+	json_object		*answers;
+	int				 answer_tokens;
 };
 
 struct oa_job {
 	oa_job	 *next;
 	req_ctx	 *rc;
 	bool	  chat_api;
+	bool	  decision;
 	uint64_t *chain;
 	size_t	  chain_len;
 	uint64_t  session_key;
@@ -159,6 +165,8 @@ typedef struct {
 
 struct openai_state {
 	context *ctx;
+
+	decision_model *decision;
 
 	char *model_id;
 	char *api_key;
@@ -552,6 +560,8 @@ static void rc_unref(req_ctx *rc) {
 	pthread_mutex_destroy(&rc->gen.q_mtx);
 	pthread_cond_destroy(&rc->gen.q_cv);
 	free_req_params(&rc->params);
+	decision_request_free(&rc->decision);
+	json_object_put(rc->answers);
 	free(rc);
 }
 
@@ -701,6 +711,8 @@ static json_object *root_body(openai_state *st) {
 	json_object_array_add(eps, json_object_new_string("GET /v1/models"));
 	json_object_array_add(eps, json_object_new_string("POST /v1/chat/completions"));
 	json_object_array_add(eps, json_object_new_string("POST /v1/completions"));
+	if (st->decision)
+		json_object_array_add(eps, json_object_new_string("POST /v1/systemone"));
 	json_object_object_add(root, "endpoints", eps);
 	return root;
 }
@@ -714,6 +726,14 @@ static json_object *models_body(openai_state *st) {
 	json_set_str(m, "object", "model");
 	json_object_object_add(m, "created", json_object_new_int64((int64_t)st->created_at));
 	json_set_str(m, "owned_by", "kappai");
+	json_object *arch = json_object_new_object();
+	json_object *in	  = json_object_new_array();
+	json_object *out  = json_object_new_array();
+	json_object_array_add(in, json_object_new_string("text"));
+	json_object_array_add(out, json_object_new_string(st->decision ? "decisions" : "text"));
+	json_object_object_add(arch, "input_modalities", in);
+	json_object_object_add(arch, "output_modalities", out);
+	json_object_object_add(m, "architecture", arch);
 	json_object_array_add(list, m);
 	json_object_object_add(root, "data", list);
 	return root;
@@ -1042,6 +1062,25 @@ static void run_generation(req_ctx *rc, oa_slot *slot) {
 		sse_finish_stream(g);
 }
 
+static void run_decision(req_ctx *rc, oa_slot *slot) {
+	oa_gen	*g = &rc->gen;
+	context *c = &slot->sess;
+	g->sctx	   = c;
+
+	g->generated = -1;
+	if (!gen_dead(g) &&
+		decision_run(rc->st->decision, c, &rc->decision, &rc->answers, &rc->answer_tokens) == OK)
+		g->generated = 0;
+	g->prompt_tokens = rc->answer_tokens;
+	slot->n_msgs	 = 0;
+	slot->full_hash	 = 0;
+
+	pthread_mutex_lock(&g->q_mtx);
+	g->generation_done = true;
+	pthread_cond_broadcast(&g->q_cv);
+	pthread_mutex_unlock(&g->q_mtx);
+}
+
 static ssize_t sse_read_cb(void *cls, uint64_t pos, char *buf, size_t max) {
 	req_ctx *rc = (req_ctx *)cls;
 	oa_gen	*g	= &rc->gen;
@@ -1240,6 +1279,8 @@ static void fail_job(openai_state *st, oa_job *j) {
 
 static oa_slot *job_pick_slot(openai_state *st, oa_job *j, bool *matched) {
 	req_ctx *rc = j->rc;
+	if (j->decision)
+		return slot_pick_text(st, NULL, 0, matched);
 	if (j->chat_api)
 		return slot_pick_chat(st, j->chain, j->chain_len, matched);
 
@@ -1349,12 +1390,18 @@ static void task_main(server_task *runner, void *ud) {
 	oa_job		 *j	 = t->job;
 	oa_gen		 *g	 = &j->rc->gen;
 
-	run_generation(j->rc, t->slot);
+	if (j->decision)
+		run_decision(j->rc, t->slot);
+	else
+		run_generation(j->rc, t->slot);
 	if (j->chat_api)
 		slot_adopt_chat_chain(t->slot, j);
 	j->chain = NULL;
 	slot_record_catalog(st, t->slot);
-	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)", j->chat_api ? "chat" : "completion",
+	INFO("gen: %s prompt=%d tokens generated=%d (%.1f s, %s)",
+		 j->decision   ? "systemone"
+		 : j->chat_api ? "chat"
+					   : "completion",
 		 g->prompt_tokens, g->generated, (double)(time_us() - j->t_start_us) / 1e6,
 		 atomic_load_explicit(&g->client_gone, memory_order_acquire) ? "client disconnected"
 																	 : "completed");
@@ -1522,25 +1569,43 @@ static enum MHD_Result respond_auth_failure(openai_state *st, struct MHD_Connect
 						error_body("Invalid API key", "authentication_error"));
 }
 
+static json_object *parse_body_object(req_ctx *rc, const char **err) {
+	json_object *body = json_tokener_parse(rc->body.p ? rc->body.p : "");
+	if (!body) {
+		*err = "Invalid JSON in request body";
+		return NULL;
+	}
+	if (!json_object_is_type(body, json_type_object)) {
+		json_object_put(body);
+		*err = "Request body must be a JSON object";
+		return NULL;
+	}
+	return body;
+}
+
+static enum MHD_Result respond_decision_only(struct MHD_Connection *conn) {
+	return respond_json(conn, MHD_HTTP_NOT_IMPLEMENTED,
+						error_body("This model is a decision model without text generation, use "
+								   "/v1/systemone",
+								   "not_supported_error"));
+}
+
 static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
 								   bool chat_api) {
 	if (!check_auth(st, conn))
 		return respond_auth_failure(st, conn);
+	if (st->decision)
+		return respond_decision_only(conn);
 
 	DEBUG("request body [%s] (%zu bytes): %.4096s",
 		  chat_api ? "/v1/chat/completions" : "/v1/completions", rc->body.len,
 		  rc->body.p ? rc->body.p : "(empty)");
 
-	json_object *body = json_tokener_parse(rc->body.p ? rc->body.p : "");
+	const char	*body_err = NULL;
+	json_object *body	  = parse_body_object(rc, &body_err);
 	if (!body)
 		return respond_json(conn, MHD_HTTP_BAD_REQUEST,
-							error_body("Invalid JSON in request body", "invalid_request_error"));
-	if (!json_object_is_type(body, json_type_object)) {
-		json_object_put(body);
-		return respond_json(
-			conn, MHD_HTTP_BAD_REQUEST,
-			error_body("Request body must be a JSON object", "invalid_request_error"));
-	}
+							error_body(body_err, "invalid_request_error"));
 
 	const char *err = chat_api ? parse_chat_request(body, &rc->params)
 							   : parse_completion_request(body, &rc->params);
@@ -1607,6 +1672,65 @@ static enum MHD_Result handle_post(openai_state *st, struct MHD_Connection *conn
 	return respond_json(conn, MHD_HTTP_OK, build_completion_body(rc, chat_api));
 }
 
+static json_object *systemone_body(req_ctx *rc) {
+	json_object *root  = json_object_new_object();
+	json_object *usage = json_object_new_object();
+	json_set_str(root, "model", rc->st->model_id);
+	json_object_object_add(root, "answers", json_object_get(rc->answers));
+	json_set_int(usage, "input_tokens", rc->answer_tokens);
+	json_set_int(usage, "output_tokens", 0);
+	json_object_object_add(root, "usage", usage);
+	return root;
+}
+
+static enum MHD_Result handle_systemone(openai_state *st, struct MHD_Connection *conn,
+										req_ctx *rc) {
+	if (!check_auth(st, conn))
+		return respond_auth_failure(st, conn);
+	if (!st->decision)
+		return respond_json(
+			conn, MHD_HTTP_NOT_IMPLEMENTED,
+			error_body("This model is not a decision model", "not_supported_error"));
+
+	DEBUG("request body [/v1/systemone] (%zu bytes): %.4096s", rc->body.len,
+		  rc->body.p ? rc->body.p : "(empty)");
+
+	const char *body_err = NULL;
+	rc->body_json		 = parse_body_object(rc, &body_err);
+	if (!rc->body_json)
+		return respond_json(conn, MHD_HTTP_BAD_REQUEST,
+							error_body(body_err, "invalid_request_error"));
+
+	char				  msg[256];
+	decision_parse_status ps =
+		decision_parse(st->decision, rc->body_json, &rc->decision, msg, sizeof(msg));
+	if (ps != DECISION_PARSE_OK)
+		return respond_json(
+			conn,
+			ps == DECISION_PARSE_UNSUPPORTED ? MHD_HTTP_NOT_IMPLEMENTED : MHD_HTTP_BAD_REQUEST,
+			error_body(msg, ps == DECISION_PARSE_UNSUPPORTED ? "not_supported_error"
+															 : "invalid_request_error"));
+
+	oa_job *j	  = xcalloc(1, sizeof(*j));
+	j->rc		  = rc;
+	j->decision	  = true;
+	j->t_start_us = time_us();
+	rc_ref(rc);
+	if (!job_push(st, j)) {
+		job_free(st, j);
+		return respond_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
+							error_body("Server is shutting down", "server_error"));
+	}
+
+	job_wait_done(rc);
+	if (!rc->answers)
+		return respond_json(conn, MHD_HTTP_SERVICE_UNAVAILABLE,
+							error_body("decision failed (prompt too long, compute error, or out "
+									   "of memory)",
+									   "server_error"));
+	return respond_json(conn, MHD_HTTP_OK, systemone_body(rc));
+}
+
 static enum MHD_Result route_health(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
 									const char *url, const char *method) {
 	(void)st;
@@ -1645,6 +1769,17 @@ static enum MHD_Result route_text_completions(openai_state *st, struct MHD_Conne
 	return route_completions(st, conn, rc, url, method, false);
 }
 
+static enum MHD_Result route_systemone(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
+									   const char *url, const char *method) {
+	if (rc->too_large)
+		return respond_json(conn, MHD_HTTP_PAYLOAD_TOO_LARGE,
+							error_body("request body too large", "invalid_request_error"));
+	uint64_t		t0 = time_us();
+	enum MHD_Result r  = handle_systemone(st, conn, rc);
+	INFO("%s %s (%.1f ms)", method, url, (double)(time_us() - t0) / 1000.0);
+	return r;
+}
+
 static enum MHD_Result route_models(openai_state *st, struct MHD_Connection *conn, req_ctx *rc,
 									const char *url, const char *method) {
 	(void)rc;
@@ -1660,6 +1795,7 @@ static const route routes[] = {
 	{"GET", "/", route_root},
 	{"POST", "/v1/chat/completions", route_chat_completions},
 	{"POST", "/v1/completions", route_text_completions},
+	{"POST", "/v1/systemone", route_systemone},
 	{"GET", "/v1/models", route_models},
 };
 
@@ -1716,9 +1852,18 @@ static enum MHD_Result handle_request(void *cls, struct MHD_Connection *conn, co
 openai_state *openai_init(context *ctx, const cli_args *args) {
 	openai_state *st = xcalloc(1, sizeof(*st));
 	st->ctx			 = ctx;
-	st->model_id	 = derive_model_id(config_get()->model ? config_get()->model : "unknown");
-	st->api_key		 = args->server_api_key ? xstrdup(args->server_api_key) : NULL;
-	st->created_at	 = (long)time(NULL);
+	if (decision_type_of(&ctx->m.gctx)) {
+		char err[256];
+		st->decision = decision_open(&ctx->m.gctx, err, sizeof(err));
+		if (!st->decision) {
+			ERROR("openai: %s", err);
+			free(st);
+			return NULL;
+		}
+	}
+	st->model_id   = derive_model_id(config_get()->model ? config_get()->model : "unknown");
+	st->api_key	   = args->server_api_key ? xstrdup(args->server_api_key) : NULL;
+	st->created_at = (long)time(NULL);
 	atomic_store_explicit(&st->req_counter, 0, memory_order_relaxed);
 	atomic_store_explicit(&st->shutting_down, false, memory_order_relaxed);
 	pthread_mutex_init(&st->sch_mtx, NULL);
@@ -1735,6 +1880,7 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 		free(st->tasks);
 		free(st->model_id);
 		free(st->api_key);
+		decision_close(st->decision);
 		pthread_mutex_destroy(&st->sch_mtx);
 		pthread_cond_destroy(&st->sch_cv);
 		free(st);
@@ -1757,6 +1903,7 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 		free(st->tasks);
 		free(st->model_id);
 		free(st->api_key);
+		decision_close(st->decision);
 		pthread_mutex_destroy(&st->sch_mtx);
 		pthread_cond_destroy(&st->sch_cv);
 		free(st);
@@ -1852,6 +1999,7 @@ void openai_free(openai_state *st) {
 	free(st->bind_addr);
 	free(st->model_id);
 	free(st->api_key);
+	decision_close(st->decision);
 	pthread_mutex_destroy(&st->sch_mtx);
 	pthread_cond_destroy(&st->sch_cv);
 	free(st);
