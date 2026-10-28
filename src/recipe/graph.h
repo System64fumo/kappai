@@ -3,8 +3,8 @@
 
 #include "backend/backend.h"
 #include "common.h"
-#include "nn.h"
 #include "recipe.h"
+#include "recipe/conv.h"
 
 #include <stdio.h>
 
@@ -198,17 +198,6 @@ void graph_optimize_recipe(model_recipe *r, const struct model *m);
 int	 graph_lower_section(const cg_graph *g, cg_section section, const recipe_op *orig, int n_orig,
 						 recipe_op *out);
 
-/* ------------------------------------------------------------------ *
- * Raw graph builder ("device graph").
- *
- * The construction API shared by the LLM recipe path and the diffusion
- * models: model code emits nodes into a cg_builder (a cg_graph plus
- * weight/activation bindings), which is then planned (recipe/plan.h)
- * and executed (recipe/exec.h) by the same engine machinery used for
- * recipes.  Nodes use the shared op_kind enum and op_params, so both
- * paths dispatch through one capability/one naming layer.
- * ------------------------------------------------------------------ */
-
 #define CG_NEW CG_NONE
 #define CG_EMIT_MAX_IN 5
 #define CG_MAX_BINDS 4
@@ -220,9 +209,9 @@ typedef enum {
 } cg_scope;
 
 typedef struct {
-	const weight  *mat;
-	const buffer  *vec;
-	const nn_conv *conv;
+	const weight	 *mat;
+	const buffer	 *vec;
+	const conv_layer *conv;
 } cg_param;
 
 typedef struct {
@@ -255,7 +244,7 @@ void cg_builder_finish(cg_builder *g);
 
 cg_param_ref cg_param_mat(cg_builder *g, const weight *w);
 cg_param_ref cg_param_vec(cg_builder *g, const buffer *v);
-cg_param_ref cg_param_conv(cg_builder *g, const nn_conv *c);
+cg_param_ref cg_param_conv(cg_builder *g, const conv_layer *c);
 
 static inline cg_param_ref cg_layer_param(int idx) {
 	return (cg_param_ref){CG_SCOPE_LAYER, idx};

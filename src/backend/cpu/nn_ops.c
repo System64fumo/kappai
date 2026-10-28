@@ -2,8 +2,6 @@
 #include <math.h>
 #include <string.h>
 
-#define GELU_K 0.7978845608f
-#define GELU_C 0.044715f
 #define ACT_GELU 1
 
 typedef struct {
@@ -15,8 +13,8 @@ typedef struct {
 
 static float activate_one(int activation, float v) {
 	if (activation == ACT_GELU)
-		return 0.5f * v * (1.0f + tanhf(GELU_K * (v + GELU_C * v * v * v)));
-	return v / (1.0f + expf(-v));
+		return gelu_tanh(v);
+	return silu(v);
 }
 
 static void layernorm_modulate_rows(int begin, int end, int tid, void *ctx) {
@@ -93,15 +91,8 @@ static void rope_table_rows(int begin, int end, int tid, void *ctx) {
 	int			   half = j->head_dim / 2;
 	for (int r = begin; r < end; r++) {
 		const float *cs = j->vec + (size_t)r * half * 2;
-		for (int h = 0; h < j->heads; h++) {
-			float *v = j->y + ((size_t)r * j->heads + h) * j->head_dim;
-			for (int i = 0; i < half; i++) {
-				float x0 = v[2 * i], x1 = v[2 * i + 1];
-				float co = cs[i * 2], si = cs[i * 2 + 1];
-				v[2 * i]	 = x0 * co - x1 * si;
-				v[2 * i + 1] = x0 * si + x1 * co;
-			}
-		}
+		rope_rotate_rows(j->y + (size_t)r * j->heads * j->head_dim, j->heads, j->head_dim, half, cs,
+						 0);
 	}
 }
 

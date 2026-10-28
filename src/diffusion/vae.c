@@ -1,7 +1,6 @@
 #include "diffusion/vae.h"
 #include "diffusion/image.h"
 #include "log.h"
-#include "nn.h"
 #include "recipe/exec.h"
 
 #define VAE_STAGES 5
@@ -10,27 +9,27 @@
 #define VAE_UPSAMPLE 2
 
 typedef struct {
-	int		in, out;
-	buffer	gamma1, gamma2;
-	nn_conv conv1, conv2, shortcut;
-	bool	has_shortcut;
+	int		   in, out;
+	buffer	   gamma1, gamma2;
+	conv_layer conv1, conv2, shortcut;
+	bool	   has_shortcut;
 } res_block;
 
 typedef struct {
-	int		  in, out, frames_up;
-	res_block blocks[VAE_BLOCKS_PER_STAGE];
-	bool	  up;
-	nn_conv	  resample;
+	int		   in, out, frames_up;
+	res_block  blocks[VAE_BLOCKS_PER_STAGE];
+	bool	   up;
+	conv_layer resample;
 } up_stage;
 
 struct diffusion_vae {
 	backend				   *be;
 	const vae_latent_stats *stats;
 	gguf_ctx				g;
-	nn_conv					post_quant, conv_in, head;
+	conv_layer				post_quant, conv_in, head;
 	res_block				mid0, mid2;
 	buffer					attn_gamma;
-	nn_conv					attn_q, attn_k, attn_v, attn_proj;
+	conv_layer				attn_q, attn_k, attn_v, attn_proj;
 	up_stage				stages[VAE_STAGES];
 	buffer					head_gamma;
 };
@@ -38,21 +37,18 @@ struct diffusion_vae {
 static const gguf_tensor *vae_tensor(diffusion_vae *v, const char *prefix, const char *suffix) {
 	char name[192];
 	snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
-	const gguf_tensor *t = gguf_find_tensor(&v->g, name);
-	if (!t)
-		ERROR("vae tensor '%s' not found", name);
-	return t;
+	return gguf_require_tensor(&v->g, name);
 }
 
 static status_code load_vec(diffusion_vae *v, const char *prefix, const char *suffix, buffer *out) {
 	const gguf_tensor *t = vae_tensor(v, prefix, suffix);
-	return t ? nn_vec_load(v->be, t, 0.0f, out) : ERR_NOT_FOUND;
+	return t ? tensor_upload_f32(v->be, t, 0, 0, 0.0f, out) : ERR_NOT_FOUND;
 }
 
-static status_code load_conv(diffusion_vae *v, const char *prefix, nn_conv *c) {
+static status_code load_conv(diffusion_vae *v, const char *prefix, conv_layer *c) {
 	const gguf_tensor *w = vae_tensor(v, prefix, "weight");
 	const gguf_tensor *b = vae_tensor(v, prefix, "bias");
-	return w && b ? nn_conv_load(v->be, w, b, 0, 0, c) : ERR_NOT_FOUND;
+	return w && b ? conv_load(v->be, w, b, 0, 0, c) : ERR_NOT_FOUND;
 }
 
 static status_code load_res_block(diffusion_vae *v, const char *prefix, res_block *rb) {
@@ -80,11 +76,11 @@ static status_code load_res_block(diffusion_vae *v, const char *prefix, res_bloc
 }
 
 static void free_res_block(diffusion_vae *v, res_block *rb) {
-	nn_free(v->be, &rb->gamma1);
-	nn_free(v->be, &rb->gamma2);
-	nn_conv_free(v->be, &rb->conv1);
-	nn_conv_free(v->be, &rb->conv2);
-	nn_conv_free(v->be, &rb->shortcut);
+	buffer_release(&rb->gamma1);
+	buffer_release(&rb->gamma2);
+	conv_free(v->be, &rb->conv1);
+	conv_free(v->be, &rb->conv2);
+	conv_free(v->be, &rb->shortcut);
 }
 
 static status_code load_stage(diffusion_vae *v, int idx, up_stage *st) {
@@ -116,9 +112,9 @@ static status_code load_attention(diffusion_vae *v) {
 	const gguf_tensor *b = vae_tensor(v, "decoder.middle.1.to_qkv", "bias");
 	if (s == OK && !(w && b))
 		s = ERR_NOT_FOUND;
-	nn_conv *parts[] = {&v->attn_q, &v->attn_k, &v->attn_v};
+	conv_layer *parts[] = {&v->attn_q, &v->attn_k, &v->attn_v};
 	for (int i = 0; i < 3 && s == OK; i++)
-		s = nn_conv_load(v->be, w, b, i * v->attn_proj.oc, v->attn_proj.oc, parts[i]);
+		s = conv_load(v->be, w, b, i * v->attn_proj.oc, v->attn_proj.oc, parts[i]);
 	return s;
 }
 
@@ -158,21 +154,21 @@ diffusion_vae *diffusion_vae_open(backend *be, const char *path, const vae_laten
 void diffusion_vae_close(diffusion_vae *v) {
 	if (!v)
 		return;
-	nn_conv_free(v->be, &v->post_quant);
-	nn_conv_free(v->be, &v->conv_in);
-	nn_conv_free(v->be, &v->head);
+	conv_free(v->be, &v->post_quant);
+	conv_free(v->be, &v->conv_in);
+	conv_free(v->be, &v->head);
 	free_res_block(v, &v->mid0);
 	free_res_block(v, &v->mid2);
-	nn_conv_free(v->be, &v->attn_q);
-	nn_conv_free(v->be, &v->attn_k);
-	nn_conv_free(v->be, &v->attn_v);
-	nn_conv_free(v->be, &v->attn_proj);
-	nn_free(v->be, &v->attn_gamma);
-	nn_free(v->be, &v->head_gamma);
+	conv_free(v->be, &v->attn_q);
+	conv_free(v->be, &v->attn_k);
+	conv_free(v->be, &v->attn_v);
+	conv_free(v->be, &v->attn_proj);
+	buffer_release(&v->attn_gamma);
+	buffer_release(&v->head_gamma);
 	for (int i = 0; i < VAE_STAGES; i++) {
 		for (int b = 0; b < VAE_BLOCKS_PER_STAGE; b++)
 			free_res_block(v, &v->stages[i].blocks[b]);
-		nn_conv_free(v->be, &v->stages[i].resample);
+		conv_free(v->be, &v->stages[i].resample);
 	}
 	gguf_free(&v->g);
 	free(v);
@@ -183,10 +179,10 @@ void diffusion_vae_close(diffusion_vae *v) {
 
 static int norm_silu(cg_builder *g, int x, const buffer *gamma, int channels, int pixels) {
 	int t = cg_rmsnorm(g, cg_param_vec(g, gamma), x, CG_NEW, channels, VAE_RMS_EPS, pixels);
-	return cg_activate(g, t, NN_SILU);
+	return cg_activate(g, t, ACTIVATION_SILU);
 }
 
-static int conv(cg_builder *g, const nn_conv *c, int x, int H, int W, int shift) {
+static int conv(cg_builder *g, const conv_layer *c, int x, int H, int W, int shift) {
 	return cg_conv(g, cg_param_conv(g, c), x, CG_NEW, H, W, shift);
 }
 

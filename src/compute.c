@@ -64,9 +64,7 @@ static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head
 }
 
 static void free_buf(buffer *b) {
-	if (!b->owner)
-		return;
-	b->owner->buffer_free(b->owner, b);
+	buffer_release(b);
 }
 
 static void scratch_free_device_buffers(compute_scratch *s) {
@@ -138,10 +136,8 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 }
 
 static void expert_dev_entry_release(expert_dev_entry *e) {
-	if (e->x.owner)
-		e->x.owner->buffer_free(e->x.owner, &e->x);
-	if (e->out.owner)
-		e->out.owner->buffer_free(e->out.owner, &e->out);
+	buffer_release(&e->x);
+	buffer_release(&e->out);
 	memset(e, 0, sizeof(*e));
 }
 

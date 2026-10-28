@@ -39,6 +39,8 @@ typedef enum {
 	ERR_COMPUTE_FAIL  = -10,
 } status_code;
 
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+
 const char *status_str(status_code s);
 
 void  oom_abort(size_t bytes);
@@ -226,6 +228,13 @@ static inline int topk_heap_select(const float *scores, int n_scores, int k, flo
 		}
 	}
 	return hn;
+}
+
+static inline uint64_t splitmix64(uint64_t *state) {
+	uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+	z		   = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+	z		   = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+	return z ^ (z >> 31);
 }
 
 static inline uint64_t fnv1a(const char *s, size_t n) {

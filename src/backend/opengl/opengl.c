@@ -672,9 +672,65 @@ static void gl_pui(gl_pipeline *p, const char *const *names, const int *vals, in
 		gl_pu(p, names[i], vals[i]);
 }
 
+static const struct {
+	const char *name;
+	const char *src;
+} gl_shader_includes[] = {
+	{"activate.glsl", gl_shader_activate_src},
+};
+
+static char *gl_shader_splice_includes(const char *src) {
+	if (!strstr(src, "#include "))
+		return NULL;
+	str_builder b;
+	sb_init(&b);
+	const char *p = src;
+	while (*p) {
+		const char *eol	 = strchr(p, '\n');
+		size_t		len	 = eol ? (size_t)(eol - p) + 1 : strlen(p);
+		const char *body = NULL;
+		if (len < 128) {
+			char line[128];
+			memcpy(line, p, len);
+			line[len] = '\0';
+			char name[64];
+			if (sscanf(line, " #include \"%63[^\"]\"", name) == 1) {
+				for (size_t i = 0; i < ARRAY_LEN(gl_shader_includes); i++)
+					if (strcmp(gl_shader_includes[i].name, name) == 0) {
+						body = gl_shader_includes[i].src;
+						break;
+					}
+				if (!body) {
+					ERROR("gl: unknown shader include '%s'", name);
+					sb_free(&b);
+					return NULL;
+				}
+			}
+		}
+		if (body) {
+			sb_puts(&b, body);
+			size_t blen = strlen(body);
+			if (blen == 0 || body[blen - 1] != '\n')
+				sb_putc(&b, '\n');
+		} else {
+			sb_putb(&b, p, len);
+		}
+		p += len;
+	}
+	return sb_finish(&b);
+}
+
 static status_code gl_build_pipeline(const char *src, const char *name, gl_pipeline *out) {
+	char *spliced = gl_shader_splice_includes(src);
+	if (spliced)
+		src = spliced;
+	else if (strstr(src, "#include ")) {
+		ERROR("gl: failed to resolve shader includes for pipeline '%s'", name);
+		return ERR_FORMAT;
+	}
 	GLuint		shader;
 	status_code s = gl_compile_shader(src, GL_COMPUTE_SHADER, &shader);
+	free(spliced);
 	if (s != OK) {
 		ERROR("gl: failed to compile shader for pipeline '%s'", name);
 		return s;

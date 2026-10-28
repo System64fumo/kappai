@@ -1,4 +1,5 @@
 #version 450
+#include "common.glsl"
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) buffer DstBuf {
@@ -71,12 +72,12 @@ void main() {
 		break;
 	case MODE_ACT_SILU: {
 		float v			 = dst[row_off + i];
-		dst[row_off + i] = v / (1.0 + exp(-v));
+		dst[row_off + i] = silu(v);
 		break;
 	}
 	case MODE_ACT_GELU: {
 		float v			 = dst[row_off + i];
-		dst[row_off + i] = 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
+		dst[row_off + i] = gelu_tanh(v);
 		break;
 	}
 	case MODE_ADD_BIAS:

@@ -66,6 +66,10 @@ static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t 
 	return s;
 }
 
+static inline buffer buffer_rows(const buffer *parent, int first, int count, size_t row_bytes) {
+	return buffer_slice(parent, (size_t)first * row_bytes, (size_t)count * row_bytes);
+}
+
 static inline buffer buffer_host_view(backend *owner, void *ptr, size_t bytes) {
 	buffer b   = {0};
 	b.handle   = ptr;
@@ -494,6 +498,9 @@ size_t		backend_name_brief_len(const char *name);
 int			backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
+status_code buffer_alloc_f32(backend *a, size_t floats, buffer *out);
+status_code buffer_upload_f32(backend *a, const float *host, size_t floats, buffer *out);
+void		buffer_release(buffer *b);
 
 typedef void (*host_matmul_generic_fn)(const void *w, uint32_t w_type, const float *x, float *y,
 									   int n, int k);

@@ -83,17 +83,6 @@ void	   part_plan_free(part_plan *p);
 int		   part_plan_n_transfers(const part_plan *p);
 int		   part_plan_check_carry(const part_plan *p, const cg_set *graphs);
 
-/* ------------------------------------------------------------------ *
- * Value-level plans for raw cg_graph execution.
- *
- * The slot-based mem_plan above is the LLM-specialized planner (fixed
- * slots, batch-size buckets).  cg_plan is the general value-level
- * planner: it computes liveness over explicit graph values and packs
- * them into a first-fit arena.  Both paths share cg_graph, the op_kind
- * enum and the backend dispatch; diffusion models plan their graphs
- * with cg_plan and run them through cg_graph_run (recipe/exec.h).
- * ------------------------------------------------------------------ */
-
 #define CG_NO_OFFSET ((size_t)-1)
 #define CG_ARENA_ALIGN_FLOATS 64
 #define CG_PLAN_CACHE_SIZE 3
@@ -107,9 +96,9 @@ typedef struct {
 } cg_node_step;
 
 typedef struct {
-	size_t *offset;			  /* [n_values + 1], CG_NO_OFFSET where not arena-backed */
-	size_t	arena_floats;	  /* total arena size in floats */
-	size_t	unplanned_floats; /* sum of live value sizes without reuse */
+	size_t *offset;
+	size_t	arena_floats;
+	size_t	unplanned_floats;
 } cg_arena_layout;
 
 void		cg_arena_layout_plan(cg_arena_layout *l, const cg_graph *c, const cg_range *ranges);

@@ -1716,6 +1716,11 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 		groups_x = 1;
 	if (groups_y == 0)
 		groups_y = 1;
+	if (groups_x > p->caps.max_workgroup_count[0] || groups_y > p->caps.max_workgroup_count[1]) {
+		ERROR("vk: dispatch %s (%u, %u) exceeds device limit (%u, %u)", ps->name, groups_x,
+			  groups_y, p->caps.max_workgroup_count[0], p->caps.max_workgroup_count[1]);
+		return ERR_INVALID_ARG;
+	}
 
 	p->stream_seq++;
 	if (!p->ring[p->ring_cur].recording) {
@@ -5428,6 +5433,23 @@ static status_code vk_elementwise(backend *self, buffer *dst, const buffer *src1
 	vk_priv *p = self->priv;
 	if (!p->p_elementwise_batch.pipeline)
 		return ERR_UNSUPPORTED;
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		size_t		row_bytes = (size_t)n * sizeof(float);
+		status_code st		  = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int			  rows = MIN(max_rows, m - r);
+			buffer		  d	   = buffer_rows(dst, r, rows, row_bytes);
+			buffer		  s1;
+			const buffer *s1p = src1;
+			if (src1 && mode != ELEM_MODE_ADD_BIAS) {
+				s1	= buffer_rows(src1, r, rows, row_bytes);
+				s1p = &s1;
+			}
+			st = vk_elementwise(self, &d, s1p, src2, n, mode, rows);
+		}
+		return st;
+	}
 	struct {
 		int32_t n, mode;
 		float	scale;
@@ -5920,6 +5942,18 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	if (n <= 0 || k <= 0)
 		return OK;
 
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		status_code st = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int	   rows = MIN(max_rows, m - r);
+			buffer xs	= buffer_rows(x, r, rows, (size_t)k * sizeof(float));
+			buffer ys	= buffer_rows(y, r, rows, (size_t)n * sizeof(float));
+			st			= vk_matmul_batch(self, w, w_type, &xs, &ys, n, k, rows);
+		}
+		return st;
+	}
+
 	if (!w->handle && w->host_ptr) {
 		status_code st = OK;
 		for (int row = 0; row < m && st == OK; row++) {
@@ -6192,6 +6226,18 @@ static status_code vk_rmsnorm_batch(backend *self, const buffer *x, const buffer
 									int n, float eps, int m) {
 	vk_priv *p = self->priv;
 
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		status_code st = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int	   rows = MIN(max_rows, m - r);
+			buffer xs	= buffer_rows(x, r, rows, (size_t)n * sizeof(float));
+			buffer ys	= buffer_rows(y, r, rows, (size_t)n * sizeof(float));
+			st			= vk_rmsnorm_batch(self, &xs, w, &ys, n, eps, rows);
+		}
+		return st;
+	}
+
 	if (!w->handle && w->host_ptr) {
 		backend_report_host_fallback(
 			self, "rmsnorm_batch", HFB_BUF_HOST_RESIDENT,
@@ -6345,21 +6391,7 @@ static status_code vk_rmsnorm_noweight_per_head_batch(backend *self, const buffe
 }
 
 static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
-	vk_priv *p = self->priv;
-	if (!p->p_elementwise_batch.pipeline)
-		return ERR_UNSUPPORTED;
-	struct {
-		int32_t n, mode;
-		float	scale;
-		int32_t _pad;
-		int32_t m;
-	} push				  = {n, ELEM_MODE_ADD_INPLACE, 0.0f, 0, m};
-	vk_buf		*dummy	  = vk_dummy_buf(p);
-	vk_buf		*bufs[3]  = {as_vkbuf(x), as_vkbuf(y), dummy};
-	VkDeviceSize offs[3]  = {x->offset, y->offset, 0};
-	uint32_t	 groups_x = (uint32_t)((n + 127) / 128);
-	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
-							 groups_x, (uint32_t)m, 0x1);
+	return vk_elementwise(self, x, y, NULL, n, ELEM_MODE_ADD_INPLACE, m);
 }
 
 static int vk_dequant_block_elems(uint32_t type, int *out_elems, int *out_block_bytes) {

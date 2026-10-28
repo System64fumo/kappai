@@ -11,6 +11,7 @@
 #if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
+#include <math.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
@@ -393,5 +394,25 @@ void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_s
 								   MIN(bytes - next, WEIGHT_COPY_CHUNK_BYTES));
 		memcpy((char *)dst + off, (const char *)src + off, len);
 		weight_source_release((const char *)src + off, len);
+	}
+}
+
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
+	double base_freq = 1.0;
+	for (int j = 0; j < half; j++) {
+		double ff = 1.0;
+		if (freq_factors) {
+			float fv = freq_factors[j];
+			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+		}
+		if (ff > 0.0) {
+			double angle	= base_freq * ff * (double)pos;
+			cs[2 * j]		= (float)cos(angle);
+			cs[(2 * j) + 1] = (float)sin(angle);
+		} else {
+			cs[2 * j]		= 1.0f;
+			cs[(2 * j) + 1] = 0.0f;
+		}
+		base_freq *= theta_scale;
 	}
 }

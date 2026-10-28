@@ -194,6 +194,7 @@ status_code gguf_get_arr_bool(const gguf_ctx *c, const char *key, const uint8_t 
 							  size_t *out_count);
 
 const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name);
+const gguf_tensor *gguf_require_tensor(const gguf_ctx *c, const char *name);
 
 int gguf_tensor_name_is_expert(const char *name);
 

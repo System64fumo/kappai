@@ -63,9 +63,8 @@ status_code weight_load(backend *be, const gguf_tensor *t, weight *out) {
 	return weight_load_rows(be, t, 0, tensor_rows(t), out);
 }
 
-void weight_free(backend *be, weight *w) {
-	if (be->buffer_free)
-		be->buffer_free(be, &w->buf);
+void weight_free(weight *w) {
+	buffer_release(&w->buf);
 	free(w->owned);
 	memset(w, 0, sizeof(*w));
 }
@@ -82,4 +81,18 @@ float *tensor_to_f32(backend *be, const gguf_tensor *t) {
 		return NULL;
 	}
 	return dst;
+}
+
+status_code tensor_upload_f32(backend *be, const gguf_tensor *t, size_t first, size_t count,
+							  float offset, buffer *out) {
+	float *host = tensor_to_f32(be, t);
+	if (!host)
+		return ERR_FORMAT;
+	if (!count)
+		count = tensor_elems(t);
+	for (size_t i = 0; i < count; i++)
+		host[first + i] += offset;
+	status_code s = buffer_upload_f32(be, host + first, count, out);
+	free(host);
+	return s;
 }

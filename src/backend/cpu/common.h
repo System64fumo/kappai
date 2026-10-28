@@ -718,11 +718,10 @@ status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w
 void		cpu_kv_free(backend *self, buffer *k, buffer *v);
 void		cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx);
 
-void cpu_softcap_chunk(int begin, int end, int tid, void *ctx);
-void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx);
-void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx);
-void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
-void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+void		cpu_softcap_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
 status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 							   const float *freq_factors, float **cs_out);
 

@@ -1,4 +1,5 @@
 #version 310 es
+#include "activate.glsl"
 precision highp float;
 
 #ifndef MT
@@ -38,11 +39,7 @@ layout(std430, binding = 4) readonly buffer UpBuf {
 layout(location = 12) uniform int u_act;
 
 float act1(float g) {
-	if (u_act == 1) {
-		float t = 0.7978845608 * (g + 0.044715 * g * g * g);
-		return 0.5 * g * (1.0 + tanh(t));
-	}
-	return g / (1.0 + exp(-g));
+	return u_act == 1 ? gelu_tanh(g) : silu(g);
 }
 
 vec4 xin(uint i) {

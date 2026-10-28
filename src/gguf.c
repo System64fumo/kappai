@@ -1628,6 +1628,13 @@ const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name) {
 	return &c->tensors[i];
 }
 
+const gguf_tensor *gguf_require_tensor(const gguf_ctx *c, const char *name) {
+	const gguf_tensor *t = gguf_find_tensor(c, name);
+	if (!t)
+		ERROR("tensor '%s' not found", name);
+	return t;
+}
+
 static const char *type_name(uint32_t t) {
 	static const char *names[] = {
 		[GGUF_TYPE_U8] = "u8",	   [GGUF_TYPE_I8] = "i8",	  [GGUF_TYPE_U16] = "u16",

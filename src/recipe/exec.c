@@ -1,5 +1,4 @@
 #include "recipe/exec.h"
-#include "nn.h"
 #include "profile.h"
 #include "recipe/internal.h"
 
@@ -760,21 +759,23 @@ static const cg_param *df_node_param(const cg_exec *x, const cg_node *n) {
 }
 
 static status_code df_run_matmul(const cg_exec *x, const cg_node *n) {
-	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
-	return nn_matmul(x->be, df_node_param(x, n)->mat, &in, &out, n->params.df_matmul.n,
-					 n->params.df_matmul.k, n->params.df_matmul.rows);
+	buffer		  in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	const weight *w = df_node_param(x, n)->mat;
+	return x->be->matmul_batch(x->be, &w->buf, w->type, &in, &out, n->params.df_matmul.n,
+							   n->params.df_matmul.k, n->params.df_matmul.rows);
 }
 
 static status_code df_run_conv(const cg_exec *x, const cg_node *n) {
-	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
-	return nn_conv_forward(x->be, df_node_param(x, n)->conv, &in, &out, n->params.df_conv.height,
-						   n->params.df_conv.width, n->params.df_conv.shift);
+	buffer		in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	conv_layer *c = (conv_layer *)df_node_param(x, n)->conv;
+	return conv_forward(x->be, c, &in, &out, n->params.df_conv.height, n->params.df_conv.width,
+						n->params.df_conv.shift);
 }
 
 static status_code df_run_rmsnorm(const cg_exec *x, const cg_node *n) {
 	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
-	return nn_rmsnorm(x->be, &in, df_node_param(x, n)->vec, &out, n->params.df_norm.dim,
-					  n->params.df_norm.eps, n->params.df_norm.rows);
+	return x->be->rmsnorm_batch(x->be, &in, df_node_param(x, n)->vec, &out, n->params.df_norm.dim,
+								n->params.df_norm.eps, n->params.df_norm.rows);
 }
 
 static status_code df_run_rmsnorm_per_head(const cg_exec *x, const cg_node *n) {
@@ -793,7 +794,7 @@ static status_code df_run_layernorm_modulate(const cg_exec *x, const cg_node *n)
 
 static status_code df_run_add(const cg_exec *x, const cg_node *n) {
 	buffer acc = df_value_buffer(x, n->out[0]), addend = df_in_buffer(x, n, 1);
-	return nn_add(x->be, &acc, &addend, n->params.df_add.dim, n->params.df_add.rows);
+	return x->be->add_batch(x->be, &acc, &addend, n->params.df_add.dim, n->params.df_add.rows);
 }
 
 static status_code df_run_gated_add(const cg_exec *x, const cg_node *n) {
@@ -920,14 +921,15 @@ status_code cg_backend_open(const char *spec, backend **out) {
 static status_code df_arena_reserve(backend *be, cg_arena *a, size_t floats) {
 	if (floats <= a->floats)
 		return OK;
-	cg_arena_free(be, a);
-	NN_TRY(nn_alloc(be, floats, &a->buf));
-	a->floats = floats;
-	return OK;
+	cg_arena_free(a);
+	status_code s = buffer_alloc_f32(be, floats, &a->buf);
+	if (s == OK)
+		a->floats = floats;
+	return s;
 }
 
-void cg_arena_free(backend *be, cg_arena *a) {
-	nn_free(be, &a->buf);
+void cg_arena_free(cg_arena *a) {
+	buffer_release(&a->buf);
 	a->floats = 0;
 }
 
@@ -941,8 +943,10 @@ static status_code df_upload_inputs(const cg_exec *x) {
 			ERROR("%s: input %d not bound", x->plan->label, val->bind);
 			return ERR_INVALID_ARG;
 		}
-		buffer b = df_value_buffer(x, v);
-		NN_TRY(x->be->buffer_write_f32(x->be, &b, host, (int)val->elems));
+		buffer		b = df_value_buffer(x, v);
+		status_code s = x->be->buffer_write_f32(x->be, &b, host, (int)val->elems);
+		if (s != OK)
+			return s;
 	}
 	return OK;
 }
@@ -955,8 +959,11 @@ static status_code df_read_outputs(const cg_exec *x) {
 			ERROR("%s: output %d not bound", x->plan->label, out->bind);
 			return ERR_INVALID_ARG;
 		}
-		buffer b = df_value_buffer(x, out->value);
-		NN_TRY(x->be->buffer_read_f32(x->be, &b, dst, (int)x->graph->g->values[out->value].elems));
+		buffer		b = df_value_buffer(x, out->value);
+		status_code s =
+			x->be->buffer_read_f32(x->be, &b, dst, (int)x->graph->g->values[out->value].elems);
+		if (s != OK)
+			return s;
 	}
 	return OK;
 }
@@ -993,14 +1000,18 @@ status_code cg_graph_run(backend *be, cg_arena *arena, cg_plan *plan, const cg_e
 		ERROR("%s: layer-external buffer not bound", plan->label);
 		return ERR_INVALID_ARG;
 	}
-	NN_TRY(df_arena_reserve(be, arena, plan->layout.arena_floats));
-	cg_exec x = {be, plan->graph, plan, arena, args, 0};
-	NN_TRY(df_upload_inputs(&x));
-	NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_PRE], c->section_begin[CG_SECTION_LAYER]));
-	for (x.layer = 0; x.layer < plan->graph->n_layers; x.layer++)
-		NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_LAYER],
-							c->section_begin[CG_SECTION_POST]));
+	status_code s = df_arena_reserve(be, arena, plan->layout.arena_floats);
+	cg_exec		x = {be, plan->graph, plan, arena, args, 0};
+	if (s == OK)
+		s = df_upload_inputs(&x);
+	if (s == OK)
+		s = df_run_nodes(&x, c->section_begin[CG_SECTION_PRE], c->section_begin[CG_SECTION_LAYER]);
+	for (x.layer = 0; x.layer < plan->graph->n_layers && s == OK; x.layer++)
+		s = df_run_nodes(&x, c->section_begin[CG_SECTION_LAYER], c->section_begin[CG_SECTION_POST]);
 	x.layer = 0;
-	NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_POST], c->section_begin[CG_SECTION_COUNT]));
-	return df_read_outputs(&x);
+	if (s == OK)
+		s = df_run_nodes(&x, c->section_begin[CG_SECTION_POST], c->section_begin[CG_SECTION_COUNT]);
+	if (s == OK)
+		s = df_read_outputs(&x);
+	return s;
 }

@@ -4,9 +4,9 @@
 #include "diffusion/text_encoder.h"
 #include "diffusion/vae.h"
 #include "log.h"
-#include "nn.h"
 #include "recipe/exec.h"
 
+#include <math.h>
 #include <stdio.h>
 
 #define LATENT_CHANNELS 64
@@ -130,6 +130,7 @@ enum { BIND_COND_K, BIND_COND_V };
 #define BIND_VELOCITY 0
 
 enum { LP_Q, LP_K, LP_V, LP_O, LP_GATE, LP_UP, LP_DOWN, LP_NORM_Q, LP_NORM_K, LP_COUNT };
+#define LP_NONE 0xFF
 
 typedef struct {
 	diffusion_model base;
@@ -154,53 +155,55 @@ struct diffusion_cond {
 	buffer	 k, v;
 };
 
-static const gguf_tensor *find(const qwen_image *m, const char *fmt, int idx, const char *suffix) {
-	char name[160];
-	snprintf(name, sizeof(name), fmt, idx, suffix);
-	const gguf_tensor *t = gguf_find_tensor(&m->dit, name);
-	if (!t)
-		ERROR("dit tensor '%s' not found", name);
-	return t;
-}
+enum { LW_MAT, LW_GATE_UP, LW_VEC };
 
-static status_code load_named(const qwen_image *m, const char *name, weight *out) {
-	const gguf_tensor *t = gguf_find_tensor(&m->dit, name);
-	if (!t) {
-		ERROR("dit tensor '%s' not found", name);
-		return ERR_NOT_FOUND;
-	}
-	return weight_load(m->be, t, out);
-}
+static const struct {
+	const char *suffix;
+	size_t		off;
+	size_t		off2;
+	uint8_t		slot;
+	uint8_t		slot2;
+	uint8_t		kind;
+	float		scale;
+} qwen_layer_tensors[] = {
+	{"attn.to_q.weight", offsetof(dit_layer, q), 0, LP_Q, LP_NONE, LW_MAT, 0.0f},
+	{"attn.to_k.weight", offsetof(dit_layer, k), 0, LP_K, LP_NONE, LW_MAT, 0.0f},
+	{"attn.to_v.weight", offsetof(dit_layer, v), 0, LP_V, LP_NONE, LW_MAT, 0.0f},
+	{"attn.to_out.0.weight", offsetof(dit_layer, o), 0, LP_O, LP_NONE, LW_MAT, 0.0f},
+	{"img_mlp.out.weight", offsetof(dit_layer, down), 0, LP_DOWN, LP_NONE, LW_MAT, 0.0f},
+	{"img_mlp.gate_up.weight", offsetof(dit_layer, gate), offsetof(dit_layer, up), LP_GATE, LP_UP,
+	 LW_GATE_UP, 0.0f},
+	{"attn.norm_q.weight", offsetof(dit_layer, norm_q), 0, LP_NORM_Q, LP_NONE, LW_VEC, 0.0f},
+	{"attn.norm_k.weight", offsetof(dit_layer, norm_k), 0, LP_NORM_K, LP_NONE, LW_VEC, 0.0f},
+};
 
 static status_code load_layer(const qwen_image *m, int li, dit_layer *l) {
-	static const struct {
-		const char *name;
-		size_t		off;
-	} mats[] = {
-		{"attn.to_q.weight", offsetof(dit_layer, q)},
-		{"attn.to_k.weight", offsetof(dit_layer, k)},
-		{"attn.to_v.weight", offsetof(dit_layer, v)},
-		{"attn.to_out.0.weight", offsetof(dit_layer, o)},
-		{"img_mlp.out.weight", offsetof(dit_layer, down)},
-	};
-	for (size_t i = 0; i < ARRAY_LEN(mats); i++) {
-		const gguf_tensor *t = find(m, "transformer_blocks.%d.%s", li, mats[i].name);
+	for (size_t i = 0; i < ARRAY_LEN(qwen_layer_tensors); i++) {
+		char name[160];
+		snprintf(name, sizeof(name), "transformer_blocks.%d.%s", li, qwen_layer_tensors[i].suffix);
+		const gguf_tensor *t = gguf_require_tensor(&m->dit, name);
 		if (!t)
 			return ERR_NOT_FOUND;
-		NN_TRY(weight_load(m->be, t, (weight *)((char *)l + mats[i].off)));
+		void	   *dst = (char *)l + qwen_layer_tensors[i].off;
+		status_code s	= OK;
+		switch (qwen_layer_tensors[i].kind) {
+		case LW_MAT:
+			s = weight_load(m->be, t, dst);
+			break;
+		case LW_GATE_UP:
+			s = weight_load_rows(m->be, t, 0, m->inter, dst);
+			if (s == OK)
+				s = weight_load_rows(m->be, t, m->inter, m->inter,
+									 (weight *)((char *)l + qwen_layer_tensors[i].off2));
+			break;
+		case LW_VEC:
+			s = tensor_upload_f32(m->be, t, 0, 0, qwen_layer_tensors[i].scale, dst);
+			break;
+		}
+		if (s != OK)
+			return s;
 	}
-	const gguf_tensor *gu = find(m, "transformer_blocks.%d.%s", li, "img_mlp.gate_up.weight");
-	if (!gu)
-		return ERR_NOT_FOUND;
-	NN_TRY(weight_load_rows(m->be, gu, 0, m->inter, &l->gate));
-	NN_TRY(weight_load_rows(m->be, gu, m->inter, m->inter, &l->up));
-
-	const gguf_tensor *nq = find(m, "transformer_blocks.%d.%s", li, "attn.norm_q.weight");
-	const gguf_tensor *nk = find(m, "transformer_blocks.%d.%s", li, "attn.norm_k.weight");
-	if (!nq || !nk)
-		return ERR_NOT_FOUND;
-	NN_TRY(nn_vec_load(m->be, nq, 0.0f, &l->norm_q));
-	return nn_vec_load(m->be, nk, 0.0f, &l->norm_k);
+	return OK;
 }
 
 static bool qwen_image_detect(const gguf_ctx *dit) {
@@ -211,47 +214,62 @@ static bool qwen_image_detect(const gguf_ctx *dit) {
 static void bind_layer_params(qwen_image *m) {
 	m->layer_params = xcalloc((size_t)m->n_layers * LP_COUNT, sizeof(cg_param));
 	for (int li = 0; li < m->n_layers; li++) {
-		dit_layer *l	   = &m->layers[li];
-		cg_param  *row	   = &m->layer_params[(size_t)li * LP_COUNT];
-		row[LP_Q].mat	   = &l->q;
-		row[LP_K].mat	   = &l->k;
-		row[LP_V].mat	   = &l->v;
-		row[LP_O].mat	   = &l->o;
-		row[LP_GATE].mat   = &l->gate;
-		row[LP_UP].mat	   = &l->up;
-		row[LP_DOWN].mat   = &l->down;
-		row[LP_NORM_Q].vec = &l->norm_q;
-		row[LP_NORM_K].vec = &l->norm_k;
+		dit_layer *l   = &m->layers[li];
+		cg_param  *row = &m->layer_params[(size_t)li * LP_COUNT];
+		for (size_t i = 0; i < ARRAY_LEN(qwen_layer_tensors); i++) {
+			if (qwen_layer_tensors[i].slot == LP_NONE)
+				continue;
+			cg_param *p = &row[qwen_layer_tensors[i].slot];
+			if (qwen_layer_tensors[i].kind == LW_VEC)
+				p->vec = (buffer *)((char *)l + qwen_layer_tensors[i].off);
+			else
+				p->mat = (weight *)((char *)l + qwen_layer_tensors[i].off);
+			if (qwen_layer_tensors[i].slot2 != LP_NONE)
+				row[qwen_layer_tensors[i].slot2].mat =
+					(weight *)((char *)l + qwen_layer_tensors[i].off2);
+		}
 	}
 }
 
+enum { GW_WEIGHT, GW_VEC };
+
+static const struct {
+	const char *name;
+	size_t		off;
+	uint8_t		kind;
+	float		scale;
+} qwen_global_tensors[] = {
+	{"img_in.weight", offsetof(qwen_image, img_in), GW_WEIGHT, 0.0f},
+	{"modulation.1.weight", offsetof(qwen_image, modulation), GW_WEIGHT, 0.0f},
+	{"norm_out.linear.weight", offsetof(qwen_image, norm_out), GW_WEIGHT, 0.0f},
+	{"proj_out.weight", offsetof(qwen_image, proj_out), GW_WEIGHT, 0.0f},
+	{"time_text_embed.timestep_embedder.linear_1.weight", offsetof(qwen_image, time_1), GW_WEIGHT,
+	 0.0f},
+	{"time_text_embed.timestep_embedder.linear_2.weight", offsetof(qwen_image, time_2), GW_WEIGHT,
+	 0.0f},
+	{"txt_in.in_layer.weight", offsetof(qwen_image, txt_in), GW_WEIGHT, 0.0f},
+	{"txt_in.out_layer.weight", offsetof(qwen_image, txt_out), GW_WEIGHT, 0.0f},
+	{"txt_in.text_norm.weight", offsetof(qwen_image, txt_norm), GW_VEC, 1.0f},
+};
+
 static status_code load_dit(qwen_image *m) {
-	static const struct {
-		const char *name;
-		size_t		off;
-	} globals[] = {
-		{"img_in.weight", offsetof(qwen_image, img_in)},
-		{"modulation.1.weight", offsetof(qwen_image, modulation)},
-		{"norm_out.linear.weight", offsetof(qwen_image, norm_out)},
-		{"proj_out.weight", offsetof(qwen_image, proj_out)},
-		{"time_text_embed.timestep_embedder.linear_1.weight", offsetof(qwen_image, time_1)},
-		{"time_text_embed.timestep_embedder.linear_2.weight", offsetof(qwen_image, time_2)},
-		{"txt_in.in_layer.weight", offsetof(qwen_image, txt_in)},
-		{"txt_in.out_layer.weight", offsetof(qwen_image, txt_out)},
-	};
-	for (size_t i = 0; i < ARRAY_LEN(globals); i++)
-		NN_TRY(load_named(m, globals[i].name, (weight *)((char *)m + globals[i].off)));
-
-	const gguf_tensor *norm = gguf_find_tensor(&m->dit, "txt_in.text_norm.weight");
-	if (!norm)
-		return ERR_NOT_FOUND;
-	NN_TRY(nn_vec_load(m->be, norm, 1.0f, &m->txt_norm));
-
+	status_code s = OK;
+	for (size_t i = 0; i < ARRAY_LEN(qwen_global_tensors) && s == OK; i++) {
+		const gguf_tensor *t = gguf_require_tensor(&m->dit, qwen_global_tensors[i].name);
+		if (!t)
+			return ERR_NOT_FOUND;
+		void *dst = (char *)m + qwen_global_tensors[i].off;
+		if (qwen_global_tensors[i].kind == GW_WEIGHT)
+			s = weight_load(m->be, t, dst);
+		else
+			s = tensor_upload_f32(m->be, t, 0, 0, qwen_global_tensors[i].scale, dst);
+	}
 	m->layers = xcalloc((size_t)m->n_layers, sizeof(dit_layer));
-	for (int li = 0; li < m->n_layers; li++)
-		NN_TRY(load_layer(m, li, &m->layers[li]));
-	bind_layer_params(m);
-	return OK;
+	for (int li = 0; li < m->n_layers && s == OK; li++)
+		s = load_layer(m, li, &m->layers[li]);
+	if (s == OK)
+		bind_layer_params(m);
+	return s;
 }
 
 static void detect_config(qwen_image *m) {
@@ -283,22 +301,26 @@ static void qwen_image_close(diffusion_model *dm) {
 	qwen_image *m = (qwen_image *)dm;
 	cg_plan_cache_free(&m->step_plans);
 	cg_plan_cache_free(&m->prefix_plans);
-	cg_arena_free(m->be, &m->arena);
+	cg_arena_free(&m->arena);
 	free(m->layer_params);
-	weight *singles[] = {&m->img_in, &m->modulation, &m->norm_out, &m->proj_out,
-						 &m->time_1, &m->time_2,	 &m->txt_in,   &m->txt_out};
-	for (size_t i = 0; i < ARRAY_LEN(singles); i++)
-		if (singles[i]->buf.owner)
-			weight_free(m->be, singles[i]);
-	nn_free(m->be, &m->txt_norm);
+	for (size_t i = 0; i < ARRAY_LEN(qwen_global_tensors); i++) {
+		void *p = (char *)m + qwen_global_tensors[i].off;
+		if (qwen_global_tensors[i].kind == GW_WEIGHT)
+			weight_free(p);
+		else
+			buffer_release(p);
+	}
 	for (int li = 0; m->layers && li < m->n_layers; li++) {
-		dit_layer *l	  = &m->layers[li];
-		weight	  *mats[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->up, &l->down};
-		for (size_t i = 0; i < ARRAY_LEN(mats); i++)
-			if (mats[i]->buf.owner)
-				weight_free(m->be, mats[i]);
-		nn_free(m->be, &l->norm_q);
-		nn_free(m->be, &l->norm_k);
+		dit_layer *l = &m->layers[li];
+		for (size_t i = 0; i < ARRAY_LEN(qwen_layer_tensors); i++) {
+			void *p = (char *)l + qwen_layer_tensors[i].off;
+			if (qwen_layer_tensors[i].kind == LW_VEC)
+				buffer_release(p);
+			else
+				weight_free(p);
+			if (qwen_layer_tensors[i].slot2 != LP_NONE)
+				weight_free((weight *)((char *)l + qwen_layer_tensors[i].off2));
+		}
 	}
 	free(m->layers);
 	diffusion_vae_close(m->vae);
@@ -313,8 +335,8 @@ static void qwen_image_close(diffusion_model *dm) {
 static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *dit);
 
 static void qwen_image_cond_free(diffusion_cond *c) {
-	nn_free(c->be, &c->k);
-	nn_free(c->be, &c->v);
+	buffer_release(&c->k);
+	buffer_release(&c->v);
 	free(c);
 }
 
@@ -325,9 +347,9 @@ typedef struct {
 static int time_modulation_graph(cg_builder *g, const qwen_image *m, int *time_vec) {
 	int emb = cg_input(g, TIME_EMBED_DIM, BIND_TIME);
 	int mid = cg_matmul(g, cg_param_mat(g, &m->time_1), emb, CG_NEW, m->hidden, TIME_EMBED_DIM, 1);
-	mid		= cg_activate(g, mid, NN_SILU);
+	mid		= cg_activate(g, mid, ACTIVATION_SILU);
 	*time_vec = cg_matmul(g, cg_param_mat(g, &m->time_2), mid, CG_NEW, m->hidden, m->hidden, 1);
-	*time_vec = cg_activate(g, *time_vec, NN_SILU);
+	*time_vec = cg_activate(g, *time_vec, ACTIVATION_SILU);
 	return cg_matmul(g, cg_param_mat(g, &m->modulation), *time_vec, CG_NEW, MOD_CHUNKS * m->hidden,
 					 m->hidden, 1);
 }
@@ -367,7 +389,7 @@ static void layer_graph(cg_builder *g, const qwen_image *m, const layer_values *
 	h		 = cg_layernorm_modulate(g, x, scale_mlp, CG_NEW, dim, NORM_EPS, rows);
 	int gate = cg_matmul(g, cg_layer_param(LP_GATE), h, CG_NEW, m->inter, dim, rows);
 	int up	 = cg_matmul(g, cg_layer_param(LP_UP), h, CG_NEW, m->inter, dim, rows);
-	int act	 = cg_ffn_activate(g, gate, up, CG_NEW, m->inter, NN_SILU, rows);
+	int act	 = cg_ffn_activate(g, gate, up, CG_NEW, m->inter, ACTIVATION_SILU, rows);
 	int down = cg_matmul(g, cg_layer_param(LP_DOWN), act, CG_NEW, dim, m->inter, rows);
 	cg_gated_add(g, x, down, gate_mlp, dim, rows);
 }
@@ -380,7 +402,7 @@ static cg_builder *prefix_graph(const qwen_image *m, int rows) {
 	int			text = cg_input(g, floats, BIND_INPUT);
 	int a = cg_rmsnorm(g, cg_param_vec(g, &m->txt_norm), text, CG_NEW, m->hidden, NORM_EPS, rows);
 	int b = cg_matmul(g, cg_param_mat(g, &m->txt_in), a, CG_NEW, m->hidden, m->hidden, rows);
-	b	  = cg_activate(g, b, NN_GELU);
+	b	  = cg_activate(g, b, ACTIVATION_GELU);
 	int x = cg_matmul(g, cg_param_mat(g, &m->txt_out), b, CG_NEW, m->hidden, m->hidden, rows);
 	int rope = cg_input(g, (size_t)rows * m->head_dim, BIND_ROPE);
 
@@ -434,9 +456,10 @@ static status_code prefix_plan(qwen_image *m, int rows, cg_plan **out) {
 	*out		 = cg_plan_cache_get(&m->prefix_plans, key);
 	if (*out)
 		return OK;
-	NN_TRY(cg_plan_build(prefix_graph(m, rows), m->be, "qwen-image prefix", out));
-	cg_plan_cache_put(&m->prefix_plans, key, *out);
-	return OK;
+	status_code s = cg_plan_build(prefix_graph(m, rows), m->be, "qwen-image prefix", out);
+	if (s == OK)
+		cg_plan_cache_put(&m->prefix_plans, key, *out);
+	return s;
 }
 
 static status_code step_plan(qwen_image *m, int rows, int n_tokens, cg_plan **out) {
@@ -444,14 +467,25 @@ static status_code step_plan(qwen_image *m, int rows, int n_tokens, cg_plan **ou
 	*out		 = cg_plan_cache_get(&m->step_plans, key);
 	if (*out)
 		return OK;
-	NN_TRY(cg_plan_build(step_graph(m, rows, n_tokens), m->be, "qwen-image step", out));
-	cg_plan_cache_put(&m->step_plans, key, *out);
-	return OK;
+	status_code s = cg_plan_build(step_graph(m, rows, n_tokens), m->be, "qwen-image step", out);
+	if (s == OK)
+		cg_plan_cache_put(&m->step_plans, key, *out);
+	return s;
 }
 
 static float *rope_from_positions(const qwen_image *m, int *pos, int rows) {
+	int	   half	 = m->head_dim / 2;
 	float *table = xmalloc((size_t)rows * m->head_dim * sizeof(float));
-	nn_rope_table(table, pos, rows, m->rope_axes, ROPE_THETA);
+	for (int r = 0; r < rows; r++) {
+		float *cs  = table + (size_t)r * half * 2;
+		int	   idx = 0;
+		for (int a = 0; a < ROPE_AXES; a++) {
+			int	   axis_half   = m->rope_axes[a] / 2;
+			double theta_scale = pow(ROPE_THETA, -2.0 / (double)m->rope_axes[a]);
+			rope_cs_fill(cs + idx * 2, axis_half, pos[r * ROPE_AXES + a], theta_scale, NULL);
+			idx += axis_half;
+		}
+	}
 	free(pos);
 	return table;
 }
@@ -481,9 +515,9 @@ static status_code build_prefix(qwen_image *m, const float *hidden, int rows,
 	c->n_tokens		   = rows;
 	size_t		floats = (size_t)rows * m->hidden * m->n_layers;
 	cg_plan	   *plan;
-	status_code s = nn_alloc(m->be, floats, &c->k);
+	status_code s = buffer_alloc_f32(m->be, floats, &c->k);
 	if (s == OK)
-		s = nn_alloc(m->be, floats, &c->v);
+		s = buffer_alloc_f32(m->be, floats, &c->v);
 	if (s == OK)
 		s = prefix_plan(m, rows, &plan);
 	if (s == OK) {
@@ -530,14 +564,16 @@ static status_code qwen_image_predict(diffusion_model *dm, const float *latent, 
 									  float sigma, const diffusion_cond *cond, float *velocity) {
 	qwen_image *m = (qwen_image *)dm;
 	cg_plan	   *plan;
-	NN_TRY(step_plan(m, shape.lw * shape.lh, cond->n_tokens, &plan));
+	status_code s = step_plan(m, shape.lw * shape.lh, cond->n_tokens, &plan);
+	if (s != OK)
+		return s;
 	float emb[TIME_EMBED_DIM];
 	dit_timestep_embedding(emb, TIME_EMBED_DIM, sigma * TIMESTEP_SCALE, TIME_MAX_PERIOD);
 	float		*rope = image_rope(m, shape, cond->n_tokens);
 	cg_exec_args args = {.host_in  = {[BIND_TIME] = emb, [BIND_INPUT] = latent, [BIND_ROPE] = rope},
 						 .host_out = {[BIND_VELOCITY] = velocity},
 						 .layer_ext = {[BIND_COND_K] = cond->k, [BIND_COND_V] = cond->v}};
-	status_code	 s	  = cg_graph_run(m->be, &m->arena, plan, &args);
+	s				  = cg_graph_run(m->be, &m->arena, plan, &args);
 	free(rope);
 	return s;
 }

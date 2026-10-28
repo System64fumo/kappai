@@ -3,17 +3,6 @@
 
 #include "recipe/plan.h"
 
-/*
- * Raw-graph execution.
- *
- * cg_graph_run executes a cg_plan on a backend: it uploads host inputs,
- * walks the graph sections (pre / layers / post) dispatching each node
- * through the shared per-op handler table in recipe/exec.c, and reads
- * results back.  The LLM recipe path drives the same backend ops via
- * its exec_plan schedules; the two paths share the op_kind enum,
- * capability resolution and every backend entry point.
- */
-
 typedef struct {
 	buffer buf;
 	size_t floats;
@@ -37,6 +26,6 @@ struct cg_exec {
 bool		cg_backend_supported(backend *be);
 status_code cg_backend_open(const char *spec, backend **out);
 status_code cg_graph_run(backend *be, cg_arena *arena, cg_plan *plan, const cg_exec_args *args);
-void		cg_arena_free(backend *be, cg_arena *arena);
+void		cg_arena_free(cg_arena *arena);
 
 #endif

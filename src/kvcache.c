@@ -93,7 +93,7 @@ static status_code kvcache_alloc_primary_slots(kvcache *c, const model *m, backe
 static status_code kvcache_alloc_layer_state(backend *be, buffer *out, size_t floats) {
 	if (floats == 0)
 		return OK;
-	return be->buffer_alloc_scratch(be, floats * sizeof(float), out);
+	return buffer_alloc_f32(be, floats, out);
 }
 
 static status_code kvcache_alloc_kda_state(kvcache_hybrid *q, const model *m) {
@@ -119,8 +119,7 @@ static void kvcache_free_layer_states(kvcache_hybrid *q) {
 	buffer *sets[3] = {q->conv_buf, q->state_buf, q->latent_buf};
 	for (int i = 0; i < 3; i++) {
 		for (int li = 0; sets[i] && li < q->n_layers; li++)
-			if (sets[i][li].owner)
-				sets[i][li].owner->buffer_free(sets[i][li].owner, &sets[i][li]);
+			buffer_release(&sets[i][li]);
 		free(sets[i]);
 	}
 }
@@ -264,18 +263,13 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	return OK;
 }
 
-static void kv_buffer_free(buffer *b) {
-	if (b->owner)
-		b->owner->buffer_free(b->owner, b);
-}
-
 static void kv_pair_free(backend *be, buffer *k, buffer *v, bool mla) {
 	if (!mla && be && be->kv_free) {
 		be->kv_free(be, k, v);
 		return;
 	}
-	kv_buffer_free(k);
-	kv_buffer_free(v);
+	buffer_release(k);
+	buffer_release(v);
 }
 
 void kvcache_free(kvcache *c) {

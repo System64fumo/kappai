@@ -848,7 +848,7 @@ cg_param_ref cg_param_vec(cg_builder *g, const buffer *v) {
 	return builder_add_global(g, (cg_param){.vec = v});
 }
 
-cg_param_ref cg_param_conv(cg_builder *g, const nn_conv *c) {
+cg_param_ref cg_param_conv(cg_builder *g, const conv_layer *c) {
 	return builder_add_global(g, (cg_param){.conv = c});
 }
 
@@ -953,8 +953,8 @@ int cg_matmul(cg_builder *g, cg_param_ref w, int in, int out, int n, int k, int 
 }
 
 int cg_conv(cg_builder *g, cg_param_ref conv, int in, int out, int height, int width, int shift) {
-	const nn_conv *c = g->globals[conv.idx].conv;
-	out				 = builder_node_out(g, out, (size_t)height * width * c->oc);
+	const conv_layer *c = g->globals[conv.idx].conv;
+	out					= builder_node_out(g, out, (size_t)height * width * c->oc);
 	return builder_emit(g, OP_DF_CONV, conv, out, (int[]){in}, 1,
 						(op_params){.df_conv = {height, width, shift}});
 }

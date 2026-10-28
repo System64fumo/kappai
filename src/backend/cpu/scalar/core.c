@@ -199,7 +199,7 @@ static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
 		if (half > 256)
 			csp = xmalloc((size_t)half * 2 * sizeof(float));
 		if (j->freq_factors)
-			cpu_rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
+			rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
 		float *v = j->base + (size_t)r * j->row_stride;
 		if (j->freq_factors) {
 			cpu_rope_ext_batch_row(v, j->n_heads, half, csp, j->neox);
