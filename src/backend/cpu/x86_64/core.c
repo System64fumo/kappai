@@ -2278,7 +2278,7 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "f16c");
 #endif
 }
-CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, "host x86_64 SIMD optimized")
+CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, "host x86_64 SIMD optimized", cpu_init)
 
 status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
 									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,

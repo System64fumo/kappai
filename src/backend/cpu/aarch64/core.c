@@ -2648,7 +2648,18 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
-CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, NULL)
+static status_code cpu_arch_init(backend *self, int device_index) {
+	status_code st = cpu_init(self, device_index);
+	if (st != OK)
+		return st;
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+	cpu_priv *p		  = self->priv;
+	p->matmul_packing = &cpu_q8_x4_packing;
+#endif
+	return OK;
+}
+
+CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, NULL, cpu_arch_init)
 
 status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
 									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,

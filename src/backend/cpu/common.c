@@ -255,19 +255,21 @@ typedef struct {
 } matmul_kernel;
 
 typedef struct {
-	const void			*W;
-	uint32_t			 w_type;
-	const void			*xq;
-	const float			*xf;
-	float				*y;
-	int					 n, k, m;
-	size_t				 row_stride;
-	size_t				 xq_row_stride;
-	const float			*bias;
-	const float			*residual;
-	int					 group_rows;
-	const matmul_kernel *kernel;
-	size_t				 xq_row_stride_blocks;
+	const void				 *W;
+	uint32_t				  w_type;
+	const void				 *xq;
+	const float				 *xf;
+	float					 *y;
+	int						  n, k, m;
+	size_t					  row_stride;
+	size_t					  xq_row_stride;
+	const float				 *bias;
+	const float				 *residual;
+	int						  group_rows;
+	const matmul_kernel		 *kernel;
+	const cpu_matmul_packing *packing;
+	const void				 *packed_xq;
+	size_t					  xq_row_stride_blocks;
 } cpu_matmul_job;
 
 typedef struct {
@@ -1349,6 +1351,7 @@ void cpu_free(backend *self) {
 		free(p->thread_scratch);
 	}
 	free(p->qscratch.q8_buf);
+	free(p->matmul_packed);
 	free(p->xq8_buf);
 	free(p->scores);
 
@@ -1981,9 +1984,9 @@ static status_code cpu_mla_absorbed_buf(backend *self, const mla_absorbed_desc *
 	return st;
 }
 
-status_code cpu_backend_fill(backend *out) {
+status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) {
 	out->probe							 = cpu_probe;
-	out->init							 = cpu_init;
+	out->init							 = init;
 	out->free							 = cpu_free;
 	out->buffer_alloc_weight			 = cpu_buffer_alloc_weight;
 	out->buffer_alloc_scratch			 = cpu_buffer_alloc_scratch;
@@ -2559,6 +2562,24 @@ static inline void cpu_matmul_job_prepare_kernel(cpu_matmul_job *j) {
 								: 0;
 }
 
+static status_code cpu_matmul_job_pack(cpu_priv *p, cpu_matmul_job *j, const void **packed) {
+	const cpu_matmul_packing *plan = p->matmul_packing;
+	if (!plan || plan->w_type != j->w_type)
+		return OK;
+	if (!*packed) {
+		status_code st = plan->prepare(j->xq, j->xq_row_stride_blocks, j->k, j->m,
+									   &p->matmul_packed, &p->matmul_packed_cap);
+		if (st == ERR_UNSUPPORTED)
+			return OK;
+		if (st != OK)
+			return st;
+		*packed = p->matmul_packed;
+	}
+	j->packed_xq = *packed;
+	j->packing	 = plan;
+	return OK;
+}
+
 static uint32_t cpu_matmul_q8_expected_type(int q8_class) {
 	switch (q8_class) {
 	case 1:
@@ -2604,7 +2625,9 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	int			 res_off = begin;
 
 	const matmul_kernel *entry = j->kernel;
-	if (entry) {
+	if (j->packing) {
+		j->packing->matmul(W_sub, j->packed_xq, y_sub, j->n, n_sub, j->k, j->m);
+	} else if (entry) {
 		entry->qonly(W_sub, j->xq, j->xq_row_stride_blocks, y_sub, j->n, n_sub, j->k, j->m);
 	} else if (j->w_type == GGML_TYPE_F32) {
 		matmul_f32_f32_batch((const float *)W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
@@ -3023,6 +3046,7 @@ status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32
 
 	quant_scratch *local_scratch  = p->matmul_multi_scratch;
 	void		  *xq_by_class[4] = {NULL, NULL, NULL, NULL};
+	const void	  *packed		  = NULL;
 
 	cpu_matmul_multi_job mj = {.n_matmuls = n_matmuls};
 	mj.row_offset[0]		= 0;
@@ -3051,6 +3075,9 @@ status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32
 		j->m				 = m;
 		mj.row_offset[i + 1] = mj.row_offset[i] + n_list[i];
 		j->row_stride		 = cpu_matmul_w_row_stride(w_types[i], k);
+		status_code st		 = cpu_matmul_job_pack(p, j, &packed);
+		if (st != OK)
+			return st;
 		if (grouped_matmul_kernel_lookup(w_types[i]))
 			has_grouped = 1;
 	}
@@ -3153,6 +3180,10 @@ static status_code cpu_matmul_batch_prequant(backend *self, const void *W, uint3
 	job->xq_row_stride		  = xq_row_stride;
 	job->xq_row_stride_blocks = xq_row_stride / cpu_matmul_q8_block_size(q8_class);
 	job->row_stride			  = cpu_matmul_w_row_stride(w_type, k);
+	const void *packed		  = NULL;
+	status_code st			  = cpu_matmul_job_pack(p, job, &packed);
+	if (st != OK)
+		return st;
 	if (!p->pool || !p->thread_scratch ||
 		(size_t)m * (size_t)n < 2 * CPU_MATMUL_MIN_ROWS_PER_THREAD) {
 		cpu_matmul_rows_worker(0, n, 0, job);

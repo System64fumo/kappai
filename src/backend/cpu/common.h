@@ -60,16 +60,16 @@ static inline size_t cpu_host_mem_total(void) {
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
 	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT)
 
-status_code cpu_backend_fill(backend *out);
+status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int));
 
-#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
+#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str, init_fn)                           \
 	static status_code ctor_fn(backend *out) {                                                     \
 		memset(out, 0, sizeof(*out));                                                              \
 		out->name	  = name_str;                                                                  \
 		out->priority = prio;                                                                      \
 		out->caps	  = CPU_BACKEND_CAPS;                                                          \
 		out->desc	  = desc_str;                                                                  \
-		return cpu_backend_fill(out);                                                              \
+		return cpu_backend_fill(out, init_fn);                                                     \
 	}                                                                                              \
 	BACKEND_REGISTER(name_str, ctor_fn)
 
@@ -106,7 +106,18 @@ typedef struct {
 } cpu_rope_cs_cache;
 
 typedef struct {
-	quant_scratch qscratch;
+	uint32_t w_type;
+	status_code (*prepare)(const void *xq, size_t row_stride_blocks, int k, int m, void **out,
+						   size_t *capacity);
+	void (*matmul)(const void *w, const void *packed, float *y, int y_row_stride, int n, int k,
+				   int m);
+} cpu_matmul_packing;
+
+typedef struct {
+	quant_scratch			  qscratch;
+	const cpu_matmul_packing *matmul_packing;
+	void					 *matmul_packed;
+	size_t					  matmul_packed_cap;
 
 	void		 *xq8_buf;
 	size_t		  xq8_buf_cap;

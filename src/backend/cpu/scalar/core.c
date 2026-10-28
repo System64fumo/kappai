@@ -1458,7 +1458,7 @@ status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
 	return matmul_vec(self, &d->wo, ho, d->out, dim, H * vh);
 }
 
-CPU_BACKEND_REGISTER("cpu_scalar", cpu_scalar_ctor, 0, NULL)
+CPU_BACKEND_REGISTER("cpu_scalar", cpu_scalar_ctor, 0, NULL, cpu_init)
 
 status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
 									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
