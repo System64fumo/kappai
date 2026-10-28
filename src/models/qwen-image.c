@@ -542,6 +542,7 @@ static status_code qwen_image_encode(diffusion_model *dm, const char *const *tex
 	qwen_image		 *m			   = (qwen_image *)dm;
 	text_encoder_spec spec		   = {.llm_path	   = m->llm_path,
 									  .device	   = m->device,
+									  .backend	   = m->be,
 									  .system	   = TEXT_SYSTEM,
 									  .user_prefix = TEXT_USER_PREFIX,
 									  .user_suffix = TEXT_USER_SUFFIX,

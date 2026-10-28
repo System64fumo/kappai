@@ -69,14 +69,59 @@ void weight_free(weight *w) {
 	memset(w, 0, sizeof(*w));
 }
 
+static float f16_bits_to_f32(uint16_t h) {
+	uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp  = (h >> 10) & 0x1fu;
+	uint32_t man  = h & 0x3ffu;
+	uint32_t bits;
+	if (exp == 31) {
+		bits = sign | 0x7f800000u | (man << 13);
+	} else if (exp) {
+		bits = sign | ((exp + 112u) << 23) | (man << 13);
+	} else if (man) {
+		int e = 1;
+		while (!(man & 0x400u)) {
+			man <<= 1;
+			e--;
+		}
+		bits = sign | ((uint32_t)(e + 112) << 23) | ((man & 0x3ffu) << 13);
+	} else {
+		bits = sign;
+	}
+	float f;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+static bool convert_plain_to_f32(const gguf_tensor *t, size_t n, float *dst) {
+	const uint16_t *half = t->data;
+	switch (t->type) {
+	case GGML_TYPE_F32:
+		memcpy(dst, t->data, n * sizeof(float));
+		return true;
+	case GGML_TYPE_F16:
+		for (size_t i = 0; i < n; i++)
+			dst[i] = f16_bits_to_f32(half[i]);
+		return true;
+	case GGML_TYPE_BF16:
+		for (size_t i = 0; i < n; i++) {
+			uint32_t bits = (uint32_t)half[i] << 16;
+			memcpy(&dst[i], &bits, sizeof(float));
+		}
+		return true;
+	default:
+		return false;
+	}
+}
+
 float *tensor_to_f32(backend *be, const gguf_tensor *t) {
-	if (!backend_has_cap(be, BCAP_IS_HOST))
-		be = backend_host();
 	size_t n   = tensor_elems(t);
 	float *dst = xmalloc(n * sizeof(float));
-	if (t->type == GGML_TYPE_F32)
-		memcpy(dst, t->data, n * sizeof(float));
-	else if (be->dequant_row(be, t->type, t->data, (int)n, dst) != OK) {
+	if (convert_plain_to_f32(t, n, dst))
+		return dst;
+	if (!backend_has_cap(be, BCAP_IS_HOST))
+		be = backend_host();
+	if (be->dequant_row(be, t->type, t->data, (int)n, dst) != OK) {
 		free(dst);
 		return NULL;
 	}

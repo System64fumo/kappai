@@ -8,14 +8,17 @@
 #define CONFIG_MAX_LAYER_DEVICES 8
 #define CONFIG_PRIORITY_UNSET (-1)
 
+struct backend;
+
 typedef struct config {
-	const char *device;
-	const char *model;
-	const char *moe_pin_list;
-	const char *monitor;
-	const char *repack;
-	const char *fuse;
-	uint64_t	seed;
+	const char	   *device;
+	struct backend *shared_backend;
+	const char	   *model;
+	const char	   *moe_pin_list;
+	const char	   *monitor;
+	const char	   *repack;
+	const char	   *fuse;
+	uint64_t		seed;
 
 	int			n_threads;
 	int			ctx_size;

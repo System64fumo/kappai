@@ -414,7 +414,7 @@ ifneq ($(HAS_VULKAN),)
 endif
 
 GL_SHADERS_DIR := $(SRC_DIR)/backend/opengl/shaders
-GL_COMP_FILES  := $(sort $(wildcard $(GL_SHADERS_DIR)/*.comp))
+GL_COMP_FILES  := $(sort $(wildcard $(GL_SHADERS_DIR)/*.comp) $(wildcard $(GL_SHADERS_DIR)/*.glsl))
 GL_SHADERS_H   := $(OBJ_DIR)/backend/opengl/shaders_embedded.h
 
 ifneq ($(HAS_OPENGL),)
@@ -425,7 +425,8 @@ ifneq ($(HAS_OPENGL),)
 	@echo "  GEN     $@"
 	@printf '#ifndef SHADERS_H\n#define SHADERS_H\n\n' > $@
 	@for comp in $^; do \
-	        name=$$(basename $$comp .comp); \
+	        name=$$(basename $$comp); \
+	        name=$${name%.*}; \
 	        varname="gl_shader_$${name}_src"; \
 	        printf 'static const char %s[] = {\n' "$$varname" >> $@; \
 	        od -v -An -tu1 "$$comp" | tr -s ' ' '\n' | grep -v '^$$' | sed 's/$$/,/' | tr '\n' ' ' >> $@; \

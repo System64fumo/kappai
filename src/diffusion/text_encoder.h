@@ -4,9 +4,10 @@
 #include "common.h"
 
 typedef struct {
-	const char *llm_path, *device;
-	const char *system, *user_prefix, *user_suffix;
-	int			ctx_tokens;
+	const char	   *llm_path, *device;
+	struct backend *backend;
+	const char	   *system, *user_prefix, *user_suffix;
+	int				ctx_tokens;
 } text_encoder_spec;
 
 typedef struct {

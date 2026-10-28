@@ -1,0 +1,55 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer XBuf {
+	float x[];
+};
+layout(std430, binding = 1) readonly buffer ScaleBuf {
+	float scale[];
+};
+layout(std430, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(location = 0) uniform int u_dim;
+layout(location = 1) uniform int u_rows;
+layout(location = 2) uniform float u_eps;
+
+shared float s_red[128];
+
+float reduce_sum(float v) {
+	uint tid   = gl_LocalInvocationID.x;
+	s_red[tid] = v;
+	barrier();
+	for (uint s = 64u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_red[tid] += s_red[tid + s];
+		barrier();
+	}
+	float total = s_red[0];
+	barrier();
+	return total;
+}
+
+void main(void) {
+	uint row = gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u;
+	if (row >= uint(u_rows))
+		return;
+	uint tid = gl_LocalInvocationID.x;
+	uint dim = uint(u_dim);
+	uint off = row * dim;
+
+	float sum = 0.0;
+	for (uint i = tid; i < dim; i += 128u)
+		sum += x[off + i];
+	float mean = reduce_sum(sum) / float(dim);
+
+	float sq = 0.0;
+	for (uint i = tid; i < dim; i += 128u) {
+		float d = x[off + i] - mean;
+		sq += d * d;
+	}
+	float inv = 1.0 / sqrt(reduce_sum(sq) / float(dim) + u_eps);
+
+	for (uint i = tid; i < dim; i += 128u)
+		y[off + i] = (x[off + i] - mean) * inv * (1.0 + scale[i]);
+}

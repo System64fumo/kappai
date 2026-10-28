@@ -32,11 +32,12 @@ static status_code encode_one(context *ctx, const text_encoder_spec *spec, const
 
 status_code text_encoder_run(const text_encoder_spec *spec, const char *const *texts, int n,
 							 text_encoding *out) {
-	config cfg	 = config_defaults();
-	cfg.model	 = spec->llm_path;
-	cfg.device	 = spec->device;
-	cfg.ctx_size = spec->ctx_tokens;
-	cfg.debug	 = log_get_level() <= LOG_DEBUG;
+	config cfg		   = config_defaults();
+	cfg.model		   = spec->llm_path;
+	cfg.device		   = spec->device;
+	cfg.shared_backend = spec->backend;
+	cfg.ctx_size	   = spec->ctx_tokens;
+	cfg.debug		   = log_get_level() <= LOG_DEBUG;
 	config_init(&cfg);
 
 	context		ctx;

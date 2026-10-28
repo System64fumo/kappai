@@ -1,5 +1,6 @@
 #version 310 es
 precision highp float;
+#include "activate.glsl"
 layout(local_size_x = 128) in;
 layout(std430, binding = 0) buffer DstBuf {
 	float dst[];
@@ -42,5 +43,13 @@ void main(void) {
 		dst[row_off + i] = (dst[row_off + i] + src1[row_off + i]) * u_scale;
 	} else if (u_mode == 8) {
 		dst[row_off + i] = dst[row_off + i] + u_scale * src1[row_off + i];
+	} else if (u_mode == 9) {
+		dst[row_off + i] = silu(dst[row_off + i]);
+	} else if (u_mode == 10) {
+		dst[row_off + i] = gelu_tanh(dst[row_off + i]);
+	} else if (u_mode == 11) {
+		dst[row_off + i] = dst[row_off + i] + src1[i];
+	} else if (u_mode == 12) {
+		dst[row_off + i] = dst[row_off + i] + src1[row_off + i] * tanh(src2[i]);
 	}
 }

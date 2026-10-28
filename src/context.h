@@ -34,6 +34,7 @@ typedef struct {
 	backend				 *backend;
 	backend				 *extra_backends[CONFIG_MAX_LAYER_DEVICES];
 	int					  n_extra_backends;
+	bool				  borrows_backend;
 	mem_topology		  topo;
 	char				  extra_specs[CONFIG_MAX_LAYER_DEVICES][64];
 	monitor_layer_tracker layer_tracker;

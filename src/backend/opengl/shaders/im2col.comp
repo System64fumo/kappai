@@ -1,0 +1,37 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer InBuf {
+	float in_[];
+};
+layout(std430, binding = 1) writeonly buffer ColBuf {
+	float col[];
+};
+layout(location = 0) uniform int u_first_pixel;
+layout(location = 1) uniform int u_n_pixels;
+layout(location = 2) uniform int u_width;
+layout(location = 3) uniform int u_in_height;
+layout(location = 4) uniform int u_in_width;
+layout(location = 5) uniform int u_channels;
+layout(location = 6) uniform int u_shift;
+void main(void) {
+	uint idx   = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * 128u + gl_LocalInvocationID.x;
+	uint ch	   = uint(u_channels);
+	uint total = uint(u_n_pixels) * 9u * ch;
+	if (idx >= total)
+		return;
+	uint  c		= idx % ch;
+	uint  tap	= (idx / ch) % 9u;
+	uint  r		= idx / (9u * ch);
+	int	  pixel = u_first_pixel + int(r);
+	int	  y		= pixel / u_width;
+	int	  x		= pixel % u_width;
+	int	  sy	= y + int(tap / 3u) - 1;
+	int	  sx	= x + int(tap % 3u) - 1;
+	int	  iy	= sy >> u_shift;
+	int	  ix	= sx >> u_shift;
+	float v		= 0.0;
+	if (sy >= 0 && sx >= 0 && iy < u_in_height && ix < u_in_width)
+		v = in_[(uint(iy) * uint(u_in_width) + uint(ix)) * ch + c];
+	col[idx] = v;
+}
