@@ -118,11 +118,19 @@ static inline void iq3s_pair_dot(int8x16_t d00, int8x16_t d01, int8x16_t d10, in
 
 static inline void store_acc_row_mr_nr(const float32x4_t acc_row[MR], float *restrict y,
 									   int y_row_stride, size_t i, size_t t, int nr) {
-	for (int r = 0; r < MR; r++) {
-		float tmp[4];
-		vst1q_f32(tmp, acc_row[r]);
-		for (int c = 0; c < nr; c++)
-			y[((size_t)(t + c) * y_row_stride) + (i + r)] = tmp[c];
+	for (int r = 0; r < MR; r += 4) {
+		float32x4_t a		   = vtrn1q_f32(acc_row[r], acc_row[r + 1]);
+		float32x4_t b		   = vtrn2q_f32(acc_row[r], acc_row[r + 1]);
+		float32x4_t c		   = vtrn1q_f32(acc_row[r + 2], acc_row[r + 3]);
+		float32x4_t d		   = vtrn2q_f32(acc_row[r + 2], acc_row[r + 3]);
+		float32x4_t columns[4] = {
+			vcombine_f32(vget_low_f32(a), vget_low_f32(c)),
+			vcombine_f32(vget_low_f32(b), vget_low_f32(d)),
+			vcombine_f32(vget_high_f32(a), vget_high_f32(c)),
+			vcombine_f32(vget_high_f32(b), vget_high_f32(d)),
+		};
+		for (int col = 0; col < nr; col++)
+			vst1q_f32(y + (t + col) * y_row_stride + i + r, columns[col]);
 	}
 }
 
@@ -6021,17 +6029,28 @@ static const q8_x4_panel *q8_pack_x4(const q8_0_block *xq, size_t stride, int bl
 }
 #endif
 
-static inline int32x4_t q8_dot_x4_lanes(int8x16_t lo, int8x16_t hi, const int8x16_t x[8]) {
-	int32x4_t sum = vdupq_n_s32(0);
-	sum			  = vdotq_laneq_s32(sum, x[0], lo, 0);
-	sum			  = vdotq_laneq_s32(sum, x[1], lo, 1);
-	sum			  = vdotq_laneq_s32(sum, x[2], lo, 2);
-	sum			  = vdotq_laneq_s32(sum, x[3], lo, 3);
-	sum			  = vdotq_laneq_s32(sum, x[4], hi, 0);
-	sum			  = vdotq_laneq_s32(sum, x[5], hi, 1);
-	sum			  = vdotq_laneq_s32(sum, x[6], hi, 2);
-	sum			  = vdotq_laneq_s32(sum, x[7], hi, 3);
-	return sum;
+static inline void q8_dot_x4_rows(const int8_t *weights, const int8x16_t x[8], int32x4_t sums[4]) {
+	int8x16_t w[4];
+	for (int r = 0; r < 4; r++) {
+		w[r]	= vld1q_s8(weights + r * 32);
+		sums[r] = vdotq_laneq_s32(vdupq_n_s32(0), x[0], w[r], 0);
+	}
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[1], w[r], 1);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[2], w[r], 2);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[3], w[r], 3);
+	for (int r = 0; r < 4; r++) {
+		w[r]	= vld1q_s8(weights + r * 32 + 16);
+		sums[r] = vdotq_laneq_s32(sums[r], x[4], w[r], 0);
+	}
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[5], w[r], 1);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[6], w[r], 2);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[7], w[r], 3);
 }
 #endif
 
@@ -6102,19 +6121,31 @@ static void matmul_q8_0_repacked_batch(const void *w, const q8_0_block *restrict
 				const int8_t   *qs_ptr =
 					(const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
+#if defined(__ARM_FEATURE_DOTPROD)
+				for (int r = 0; r < MR; r += 4) {
+					int32x4_t sums[4];
+					q8_dot_x4_rows(qs_ptr + (size_t)r * 32, packed, sums);
+					float32x4_t dw = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d_ptr + r)));
+					acc_row[r]	   = vfmaq_f32(acc_row[r], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[0]), dw, 0));
+					acc_row[r + 1] = vfmaq_f32(acc_row[r + 1], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[1]), dw, 1));
+					acc_row[r + 2] = vfmaq_f32(acc_row[r + 2], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[2]), dw, 2));
+					acc_row[r + 3] = vfmaq_f32(acc_row[r + 3], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[3]), dw, 3));
+				}
+#else
 				for (int r = 0; r < MR; r++) {
 					const float		d_w = f16_to_f32_fast(d_ptr[r]);
 					const int8x16_t lo	= vld1q_s8(qs_ptr + (size_t)r * 32);
 					const int8x16_t hi	= vld1q_s8(qs_ptr + (size_t)r * 32 + 16);
 
-#if defined(__ARM_FEATURE_DOTPROD)
-					const int32x4_t sumi4 = q8_dot_x4_lanes(lo, hi, packed);
-#else
-					const int32x4_t sumi4 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
-#endif
+					const int32x4_t	  sumi4	 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
 					const float32x4_t sumi_f = vcvtq_f32_s32(sumi4);
 					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, vmulq_n_f32(sumi_f, d_w));
 				}
+#endif
 			}
 
 			store_acc_row_mr_nr(acc_row, y, y_row_stride, i, t, NR);
