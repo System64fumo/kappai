@@ -9,6 +9,8 @@
 
 #include <json-c/json_types.h>
 
+jinja_value *json_to_jinja(const json_object *jo);
+
 typedef struct {
 	char		*role;
 	char		*content;

@@ -50,7 +50,7 @@ static char *patch_template_source(const char *src) {
 	return patched;
 }
 
-static jinja_value *json_to_jinja(const json_object *jo) {
+jinja_value *json_to_jinja(const json_object *jo) {
 	if (!jo || json_object_is_type(jo, json_type_null))
 		return jinja_none();
 	switch (json_object_get_type(jo)) {

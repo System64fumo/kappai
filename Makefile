@@ -74,11 +74,7 @@ ifneq ($(BUILD_GOALS),)
 endif
 
 cc_option = $(shell printf 'int main(void) { return 0; }\n' | $(CC) -Werror $(1) -x c -c -o /dev/null - >/dev/null 2>&1 && printf '%s' '$(1)')
-ifeq ($(CPU_ARCH),aarch64)
-  DETECTED_ARCH_FLAGS := $(call cc_option,-mcpu=native)
-else
-  DETECTED_ARCH_FLAGS := $(call cc_option,-march=native)
-endif
+DETECTED_ARCH_FLAGS := $(shell $(CC) -### -E - -march=native 2>&1 | sed -rn '/cc1/!d;s/(\")|(^.* - )//g;s/ -dumpbase -//g;p')
 
 ifeq ($(origin ARCH_FLAGS),undefined)
   ifneq ($(strip $(MACHINE_ARCH_FLAGS)),)

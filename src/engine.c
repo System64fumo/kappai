@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "decision.h"
 
 #include "backend/backend.h"
 #include "common.h"
@@ -331,8 +332,22 @@ static void engine_init_logging(void) {
 	log_set_level(saved_log_level);
 }
 
+static bool model_is_decision(const char *model_path) {
+	gguf_ctx g;
+	if (gguf_load_metadata(&g, model_path) != OK)
+		return false;
+	bool is_decision = decision_type_of(&g) != NULL;
+	gguf_free(&g);
+	return is_decision;
+}
+
 static int engine_load(context *ctx, cli_args *a) {
 	const config *ec = config_get();
+
+	if (!a->is_server && model_is_decision(ec->model)) {
+		ERROR("decision models can only run in server mode (kappai-server)");
+		return ERR_UNSUPPORTED;
+	}
 
 	const char *model_base = path_basename(ec->model);
 
