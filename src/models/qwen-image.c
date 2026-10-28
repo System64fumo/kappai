@@ -1,12 +1,28 @@
-#include "compute.h"
-#include "config.h"
-#include "context.h"
 #include "diffusion/diffusion.h"
+#include "diffusion/dit.h"
+#include "diffusion/image.h"
+#include "diffusion/text_encoder.h"
+#include "diffusion/vae.h"
 #include "log.h"
 #include "nn.h"
+#include "recipe/exec.h"
 
-#include <math.h>
 #include <stdio.h>
+
+#define LATENT_CHANNELS 64
+#define LATENT_PATCH 16
+#define TIME_EMBED_DIM 256
+#define TIME_MAX_PERIOD 10000.0f
+#define TIMESTEP_SCALE 1000.0f
+#define NORM_EPS 1e-6f
+#define MOD_CHUNKS 4
+#define ROPE_THETA 10000.0f
+#define ROPE_AXES 3
+#define ROPE_FRAME_DIM 16
+#define TEXT_CTX_TOKENS 1024
+#define TEXT_SYSTEM "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
+#define TEXT_USER_PREFIX "<|im_start|>user\n"
+#define TEXT_USER_SUFFIX "<|im_end|>\n<|im_start|>assistant\n"
 
 static const float qwen_image_preview_rgb_proj[192] = {
 	0.00860495522f,	 0.01219501462f,  -0.00321337196f,	0.01889233090f,	  0.01246581216f,
@@ -91,412 +107,29 @@ static const float qwen_image_latent_std[64] = {
 	3.7662f, 3.6746f, 3.4563f, 3.8161f,
 };
 
-#define VAE_STAGES 5
-#define VAE_BLOCKS_PER_STAGE 3
-#define VAE_RMS_EPS 1e-12f
-#define VAE_LATENT_CHANNELS 64
-#define VAE_OUT_CHANNELS 4
-#define VAE_UPSAMPLE 2
-#define TIME_EMBED_DIM 256
-#define TIME_MAX_PERIOD 10000.0f
-#define TIMESTEP_SCALE 1000.0f
-#define NORM_EPS 1e-6f
-#define MOD_CHUNKS 4
-#define ROPE_THETA 10000.0f
-#define ROPE_AXES 3
-#define TEXT_CTX_TOKENS 1024
-#define TEXT_SYSTEM "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
-#define TEXT_USER_PREFIX "<|im_start|>user\n"
-#define TEXT_USER_SUFFIX "<|im_end|>\n<|im_start|>assistant\n"
-
-typedef struct {
-	int		in, out;
-	buffer	gamma1, gamma2;
-	nn_conv conv1, conv2, shortcut;
-	bool	has_shortcut;
-} res_block;
-
-typedef struct {
-	int		  in, out, frames_up;
-	res_block blocks[VAE_BLOCKS_PER_STAGE];
-	bool	  up;
-	nn_conv	  resample;
-} up_stage;
-
-typedef struct qwen_vae qwen_vae;
-
-struct qwen_vae {
-	backend	 *be;
-	gguf_ctx  g;
-	nn_conv	  post_quant, conv_in, head;
-	res_block mid0, mid2;
-	buffer	  attn_gamma;
-	nn_conv	  attn_q, attn_k, attn_v, attn_proj;
-	up_stage  stages[VAE_STAGES];
-	buffer	  head_gamma;
+static const vae_latent_stats qwen_image_vae_stats = {
+	.channels = LATENT_CHANNELS,
+	.mean	  = qwen_image_latent_mean,
+	.std	  = qwen_image_latent_std,
 };
 
-static const gguf_tensor *vae_tensor(qwen_vae *v, const char *prefix, const char *suffix) {
-	char name[192];
-	snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
-	const gguf_tensor *t = gguf_find_tensor(&v->g, name);
-	if (!t)
-		ERROR("vae tensor '%s' not found", name);
-	return t;
-}
-
-static status_code load_vec(qwen_vae *v, const char *prefix, const char *suffix, buffer *out) {
-	const gguf_tensor *t = vae_tensor(v, prefix, suffix);
-	return t ? nn_vec_load(v->be, t, 0.0f, out) : ERR_NOT_FOUND;
-}
-
-static status_code load_conv(qwen_vae *v, const char *prefix, nn_conv *c) {
-	const gguf_tensor *w = vae_tensor(v, prefix, "weight");
-	const gguf_tensor *b = vae_tensor(v, prefix, "bias");
-	return w && b ? nn_conv_load(v->be, w, b, 0, 0, c) : ERR_NOT_FOUND;
-}
-
-static status_code load_res_block(qwen_vae *v, const char *prefix, res_block *rb) {
-	char name[160];
-	snprintf(name, sizeof(name), "%s.residual.0", prefix);
-	status_code s = load_vec(v, name, "gamma", &rb->gamma1);
-	snprintf(name, sizeof(name), "%s.residual.3", prefix);
-	if (s == OK)
-		s = load_vec(v, name, "gamma", &rb->gamma2);
-	snprintf(name, sizeof(name), "%s.residual.2", prefix);
-	if (s == OK)
-		s = load_conv(v, name, &rb->conv1);
-	snprintf(name, sizeof(name), "%s.residual.6", prefix);
-	if (s == OK)
-		s = load_conv(v, name, &rb->conv2);
-	rb->in	= rb->conv1.ic;
-	rb->out = rb->conv2.oc;
-	snprintf(name, sizeof(name), "%s.shortcut.weight", prefix);
-	rb->has_shortcut = gguf_find_tensor(&v->g, name) != NULL;
-	if (s == OK && rb->has_shortcut) {
-		snprintf(name, sizeof(name), "%s.shortcut", prefix);
-		s = load_conv(v, name, &rb->shortcut);
-	}
-	return s;
-}
-
-static void free_res_block(qwen_vae *v, res_block *rb) {
-	nn_free(v->be, &rb->gamma1);
-	nn_free(v->be, &rb->gamma2);
-	nn_conv_free(v->be, &rb->conv1);
-	nn_conv_free(v->be, &rb->conv2);
-	nn_conv_free(v->be, &rb->shortcut);
-}
-
-static status_code load_stage(qwen_vae *v, int idx, up_stage *st) {
-	char		prefix[128];
-	status_code s = OK;
-	for (int b = 0; b < VAE_BLOCKS_PER_STAGE && s == OK; b++) {
-		snprintf(prefix, sizeof(prefix), "decoder.upsamples.%d.upsamples.%d", idx, b);
-		s = load_res_block(v, prefix, &st->blocks[b]);
-	}
-	st->in	= st->blocks[0].in;
-	st->out = st->blocks[VAE_BLOCKS_PER_STAGE - 1].out;
-	snprintf(prefix, sizeof(prefix), "decoder.upsamples.%d.upsamples.%d.resample.1.weight", idx,
-			 VAE_BLOCKS_PER_STAGE);
-	st->up = gguf_find_tensor(&v->g, prefix) != NULL;
-	if (s == OK && st->up) {
-		snprintf(prefix, sizeof(prefix), "decoder.upsamples.%d.upsamples.%d.resample.1", idx,
-				 VAE_BLOCKS_PER_STAGE);
-		s = load_conv(v, prefix, &st->resample);
-		snprintf(prefix, sizeof(prefix), "decoder.upsamples.%d.upsamples.%d.time_conv.weight", idx,
-				 VAE_BLOCKS_PER_STAGE);
-		st->frames_up = gguf_find_tensor(&v->g, prefix) ? 2 : 1;
-	}
-	return s;
-}
-
-static status_code load_attention(qwen_vae *v) {
-	status_code		   s = load_conv(v, "decoder.middle.1.proj", &v->attn_proj);
-	const gguf_tensor *w = vae_tensor(v, "decoder.middle.1.to_qkv", "weight");
-	const gguf_tensor *b = vae_tensor(v, "decoder.middle.1.to_qkv", "bias");
-	if (s == OK && !(w && b))
-		s = ERR_NOT_FOUND;
-	nn_conv *parts[] = {&v->attn_q, &v->attn_k, &v->attn_v};
-	for (int i = 0; i < 3 && s == OK; i++)
-		s = nn_conv_load(v->be, w, b, i * v->attn_proj.oc, v->attn_proj.oc, parts[i]);
-	return s;
-}
-
-static status_code load_all(qwen_vae *v) {
-	status_code s = load_conv(v, "conv2", &v->post_quant);
-	if (s == OK)
-		s = load_conv(v, "decoder.conv1", &v->conv_in);
-	if (s == OK)
-		s = load_res_block(v, "decoder.middle.0", &v->mid0);
-	if (s == OK)
-		s = load_res_block(v, "decoder.middle.2", &v->mid2);
-	if (s == OK)
-		s = load_attention(v);
-	if (s == OK)
-		s = load_vec(v, "decoder.middle.1.norm", "gamma", &v->attn_gamma);
-	for (int i = 0; i < VAE_STAGES && s == OK; i++)
-		s = load_stage(v, i, &v->stages[i]);
-	if (s == OK)
-		s = load_vec(v, "decoder.head.0", "gamma", &v->head_gamma);
-	if (s == OK)
-		s = load_conv(v, "decoder.head.2", &v->head);
-	return s;
-}
-
-static void qwen_vae_close(qwen_vae *v);
-
-static qwen_vae *qwen_vae_open(backend *be, const char *path) {
-	qwen_vae *v = xcalloc(1, sizeof(*v));
-	v->be		= be;
-	if (gguf_load(&v->g, path) != OK || load_all(v) != OK) {
-		ERROR("failed to load vae '%s'", path);
-		qwen_vae_close(v);
-		return NULL;
-	}
-	return v;
-}
-
-static void qwen_vae_close(qwen_vae *v) {
-	if (!v)
-		return;
-	nn_conv_free(v->be, &v->post_quant);
-	nn_conv_free(v->be, &v->conv_in);
-	nn_conv_free(v->be, &v->head);
-	free_res_block(v, &v->mid0);
-	free_res_block(v, &v->mid2);
-	nn_conv_free(v->be, &v->attn_q);
-	nn_conv_free(v->be, &v->attn_k);
-	nn_conv_free(v->be, &v->attn_v);
-	nn_conv_free(v->be, &v->attn_proj);
-	nn_free(v->be, &v->attn_gamma);
-	nn_free(v->be, &v->head_gamma);
-	for (int i = 0; i < VAE_STAGES; i++) {
-		for (int b = 0; b < VAE_BLOCKS_PER_STAGE; b++)
-			free_res_block(v, &v->stages[i].blocks[b]);
-		nn_conv_free(v->be, &v->stages[i].resample);
-	}
-	gguf_free(&v->g);
-	free(v);
-}
-
-static status_code norm_silu(backend *be, const buffer *x, const buffer *gamma, int ch, int pixels,
-							 buffer *out) {
-	NN_TRY(nn_alloc(be, (size_t)pixels * ch, out));
-	status_code s = nn_rmsnorm(be, x, gamma, out, ch, VAE_RMS_EPS, pixels);
-	if (s == OK)
-		s = be->activate(be, out, pixels * ch, NN_SILU);
-	if (s != OK)
-		nn_free(be, out);
-	return s;
-}
-
-static status_code res_block_forward(qwen_vae *v, const res_block *rb, const buffer *x, int H,
-									 int W, buffer *y) {
-	backend	   *be = v->be;
-	int			P  = H * W;
-	buffer		t = {0}, u = {0}, sc = {0};
-	status_code s;
-
-	NN_GOTO(norm_silu(be, x, &rb->gamma1, rb->in, P, &t));
-	NN_GOTO(nn_alloc(be, (size_t)P * rb->out, &u));
-	NN_GOTO(nn_conv_forward(be, &rb->conv1, &t, &u, H, W, 0));
-	nn_free(be, &t);
-
-	NN_GOTO(norm_silu(be, &u, &rb->gamma2, rb->out, P, &t));
-	NN_GOTO(nn_alloc(be, (size_t)P * rb->out, y));
-	NN_GOTO(nn_conv_forward(be, &rb->conv2, &t, y, H, W, 0));
-
-	if (rb->has_shortcut) {
-		NN_GOTO(nn_alloc(be, (size_t)P * rb->out, &sc));
-		NN_GOTO(nn_conv_forward(be, &rb->shortcut, x, &sc, H, W, 0));
-		NN_GOTO(nn_add(be, y, &sc, rb->out, P));
-	} else
-		NN_GOTO(nn_add(be, y, x, rb->out, P));
-done:
-	nn_free(be, &t);
-	nn_free(be, &u);
-	nn_free(be, &sc);
-	if (s != OK)
-		nn_free(be, y);
-	return s;
-}
-
-static status_code attention_block(qwen_vae *v, buffer *x, int H, int W) {
-	backend	   *be = v->be;
-	int			P  = H * W;
-	int			ch = v->attn_proj.oc;
-	buffer		xn = {0}, q = {0}, k = {0}, val = {0}, att = {0}, proj = {0};
-	status_code s;
-
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &xn));
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &q));
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &k));
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &val));
-	NN_GOTO(nn_rmsnorm(be, x, &v->attn_gamma, &xn, ch, VAE_RMS_EPS, P));
-	NN_GOTO(nn_conv_forward(be, &v->attn_q, &xn, &q, H, W, 0));
-	NN_GOTO(nn_conv_forward(be, &v->attn_k, &xn, &k, H, W, 0));
-	NN_GOTO(nn_conv_forward(be, &v->attn_v, &xn, &val, H, W, 0));
-
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &att));
-	dense_attention_desc d = {.q		= &q,
-							  .k0		= &k,
-							  .v0		= &val,
-							  .out		= &att,
-							  .n_q		= P,
-							  .n_heads	= 1,
-							  .head_dim = ch,
-							  .n0		= P};
-	NN_GOTO(be->attention_dense(be, &d));
-
-	NN_GOTO(nn_alloc(be, (size_t)P * ch, &proj));
-	NN_GOTO(nn_conv_forward(be, &v->attn_proj, &att, &proj, H, W, 0));
-	NN_GOTO(nn_add(be, x, &proj, ch, P));
-done:
-	nn_free(be, &xn);
-	nn_free(be, &q);
-	nn_free(be, &k);
-	nn_free(be, &val);
-	nn_free(be, &att);
-	nn_free(be, &proj);
-	return s;
-}
-
-static status_code up_stage_forward(qwen_vae *v, const up_stage *st, buffer *x, int *H, int *W) {
-	backend	   *be	= v->be;
-	buffer		cur = *x, next = {0}, up = {0};
-	status_code s = OK;
-	for (int b = 0; b < VAE_BLOCKS_PER_STAGE; b++) {
-		NN_GOTO(res_block_forward(v, &st->blocks[b], &cur, *H, *W, &next));
-		if (cur.handle != x->handle)
-			nn_free(be, &cur);
-		cur	 = next;
-		next = (buffer){0};
-	}
-	if (st->up) {
-		int oH = *H * VAE_UPSAMPLE, oW = *W * VAE_UPSAMPLE;
-		NN_GOTO(nn_alloc(be, (size_t)oH * oW * st->out, &up));
-		NN_GOTO(nn_conv_forward(be, &st->resample, &cur, &up, oH, oW, 1));
-		int					   factor = st->frames_up * VAE_UPSAMPLE * VAE_UPSAMPLE;
-		upsample_shortcut_desc d	  = {.in		   = x,
-										 .out		   = &up,
-										 .height	   = *H,
-										 .width		   = *W,
-										 .in_channels  = st->in,
-										 .out_channels = st->out,
-										 .repeats	   = st->out * factor / st->in,
-										 .frames_up	   = st->frames_up,
-										 .factor	   = VAE_UPSAMPLE};
-		NN_GOTO(be->upsample_shortcut_add(be, &d));
-		nn_free(be, &cur);
-		nn_free(be, x);
-		*x = up;
-		up = (buffer){0};
-		*H = oH;
-		*W = oW;
-		return OK;
-	}
-	nn_free(be, x);
-	*x = cur;
-	return OK;
-done:
-	if (cur.handle != x->handle)
-		nn_free(be, &cur);
-	nn_free(be, &up);
-	nn_free(be, x);
-	return s;
-}
-
-static float *denormalize_latent(const float *latent, int pixels) {
-	float *z = xmalloc((size_t)pixels * VAE_LATENT_CHANNELS * sizeof(float));
-	for (int p = 0; p < pixels; p++)
-		for (int c = 0; c < VAE_LATENT_CHANNELS; c++)
-			z[(size_t)p * VAE_LATENT_CHANNELS + c] =
-				latent[(size_t)p * VAE_LATENT_CHANNELS + c] * qwen_image_latent_std[c] +
-				qwen_image_latent_mean[c];
-	return z;
-}
-
-static uint8_t to_byte(float v) {
-	float s = (v + 1.0f) * 0.5f;
-	return (uint8_t)(MAX(0.0f, MIN(1.0f, s)) * 255.0f + 0.5f);
-}
-
-static status_code vae_run(qwen_vae *v, const float *latent, int H, int W, buffer *rgba) {
-	backend	   *be = v->be;
-	buffer		z = {0}, q = {0}, x = {0}, t = {0};
-	status_code s;
-
-	float *denorm = denormalize_latent(latent, H * W);
-	s			  = nn_upload(be, denorm, (size_t)H * W * VAE_LATENT_CHANNELS, &z);
-	free(denorm);
-	if (s != OK)
-		return s;
-
-	NN_GOTO(nn_alloc(be, (size_t)H * W * v->post_quant.oc, &q));
-	NN_GOTO(nn_conv_forward(be, &v->post_quant, &z, &q, H, W, 0));
-	NN_GOTO(nn_alloc(be, (size_t)H * W * v->conv_in.oc, &x));
-	NN_GOTO(nn_conv_forward(be, &v->conv_in, &q, &x, H, W, 0));
-	nn_free(be, &z);
-	nn_free(be, &q);
-
-	NN_GOTO(res_block_forward(v, &v->mid0, &x, H, W, &t));
-	nn_free(be, &x);
-	NN_GOTO(attention_block(v, &t, H, W));
-	NN_GOTO(res_block_forward(v, &v->mid2, &t, H, W, &x));
-	nn_free(be, &t);
-
-	for (int i = 0; i < VAE_STAGES; i++) {
-		NN_GOTO(up_stage_forward(v, &v->stages[i], &x, &H, &W));
-		DEBUG("vae stage %d done (%dx%d)", i, W, H);
-	}
-
-	NN_GOTO(norm_silu(be, &x, &v->head_gamma, v->head.ic, H * W, &t));
-	NN_GOTO(nn_alloc(be, (size_t)H * W * VAE_OUT_CHANNELS, rgba));
-	NN_GOTO(nn_conv_forward(be, &v->head, &t, rgba, H, W, 0));
-done:
-	if (s != OK)
-		nn_free(be, rgba);
-	nn_free(be, &z);
-	nn_free(be, &q);
-	nn_free(be, &x);
-	nn_free(be, &t);
-	return s;
-}
-
-static status_code qwen_vae_decode(qwen_vae *v, const float *latent, latent_shape shape,
-								   diffusion_image *out) {
-	int			H = shape.lh, W = shape.lw;
-	buffer		rgba = {0};
-	status_code s	 = vae_run(v, latent, H, W, &rgba);
-	if (s != OK)
-		return s;
-	int scale = 1;
-	for (int i = 0; i < VAE_STAGES; i++)
-		scale *= v->stages[i].up ? VAE_UPSAMPLE : 1;
-	H *= scale;
-	W *= scale;
-
-	size_t n	= (size_t)H * W * VAE_OUT_CHANNELS;
-	float *host = xmalloc(n * sizeof(float));
-	s			= v->be->buffer_read_f32(v->be, &rgba, host, (int)n);
-	nn_free(v->be, &rgba);
-	if (s == OK) {
-		out->width	  = W;
-		out->height	  = H;
-		out->channels = VAE_OUT_CHANNELS;
-		out->pixels	  = xmalloc(n);
-		for (size_t i = 0; i < n; i++)
-			out->pixels[i] = to_byte(host[i]);
-	}
-	free(host);
-	return s;
-}
+static const latent_preview_proj qwen_image_preview_proj = {
+	.rgb_proj	= qwen_image_preview_rgb_proj,
+	.rgb_bias	= qwen_image_preview_rgb_bias,
+	.alpha_proj = qwen_image_preview_alpha_proj,
+	.alpha_bias = qwen_image_preview_alpha_bias,
+};
 
 typedef struct {
 	weight q, k, v, o, gate, up, down;
 	buffer norm_q, norm_k;
 } dit_layer;
+
+enum { BIND_TIME, BIND_INPUT, BIND_ROPE };
+enum { BIND_COND_K, BIND_COND_V };
+#define BIND_VELOCITY 0
+
+enum { LP_Q, LP_K, LP_V, LP_O, LP_GATE, LP_UP, LP_DOWN, LP_NORM_Q, LP_NORM_K, LP_COUNT };
 
 typedef struct {
 	diffusion_model base;
@@ -504,12 +137,15 @@ typedef struct {
 	gguf_ctx		dit;
 	char		   *llm_path;
 	char		   *device;
-	qwen_vae	   *vae;
+	diffusion_vae  *vae;
 	int				hidden, heads, head_dim, inter, n_layers, in_channels, out_channels;
 	int				rope_axes[ROPE_AXES];
 	weight			img_in, modulation, norm_out, proj_out, time_1, time_2, txt_in, txt_out;
 	buffer			txt_norm;
 	dit_layer	   *layers;
+	cg_param	   *layer_params;
+	cg_arena		arena;
+	cg_plan_cache	step_plans, prefix_plans;
 } qwen_image;
 
 struct diffusion_cond {
@@ -517,10 +153,6 @@ struct diffusion_cond {
 	int		 n_tokens;
 	buffer	 k, v;
 };
-
-typedef struct {
-	buffer q, a, h, gate, up, raw;
-} layer_scratch;
 
 static const gguf_tensor *find(const qwen_image *m, const char *fmt, int idx, const char *suffix) {
 	char name[160];
@@ -576,6 +208,23 @@ static bool qwen_image_detect(const gguf_ctx *dit) {
 		   gguf_find_tensor(dit, "txt_in.in_layer.weight");
 }
 
+static void bind_layer_params(qwen_image *m) {
+	m->layer_params = xcalloc((size_t)m->n_layers * LP_COUNT, sizeof(cg_param));
+	for (int li = 0; li < m->n_layers; li++) {
+		dit_layer *l	   = &m->layers[li];
+		cg_param  *row	   = &m->layer_params[(size_t)li * LP_COUNT];
+		row[LP_Q].mat	   = &l->q;
+		row[LP_K].mat	   = &l->k;
+		row[LP_V].mat	   = &l->v;
+		row[LP_O].mat	   = &l->o;
+		row[LP_GATE].mat   = &l->gate;
+		row[LP_UP].mat	   = &l->up;
+		row[LP_DOWN].mat   = &l->down;
+		row[LP_NORM_Q].vec = &l->norm_q;
+		row[LP_NORM_K].vec = &l->norm_k;
+	}
+}
+
 static status_code load_dit(qwen_image *m) {
 	static const struct {
 		const char *name;
@@ -601,6 +250,7 @@ static status_code load_dit(qwen_image *m) {
 	m->layers = xcalloc((size_t)m->n_layers, sizeof(dit_layer));
 	for (int li = 0; li < m->n_layers; li++)
 		NN_TRY(load_layer(m, li, &m->layers[li]));
+	bind_layer_params(m);
 	return OK;
 }
 
@@ -624,15 +274,19 @@ static void detect_config(qwen_image *m) {
 		if (!gguf_find_tensor(&m->dit, name))
 			break;
 	}
-	m->rope_axes[0] = 16;
-	m->rope_axes[1] = (m->head_dim - 16) / 2;
-	m->rope_axes[2] = (m->head_dim - 16) / 2;
+	m->rope_axes[0] = ROPE_FRAME_DIM;
+	m->rope_axes[1] = (m->head_dim - ROPE_FRAME_DIM) / 2;
+	m->rope_axes[2] = (m->head_dim - ROPE_FRAME_DIM) / 2;
 }
 
 static void qwen_image_close(diffusion_model *dm) {
-	qwen_image *m		  = (qwen_image *)dm;
-	weight	   *singles[] = {&m->img_in, &m->modulation, &m->norm_out, &m->proj_out,
-							 &m->time_1, &m->time_2,	 &m->txt_in,   &m->txt_out};
+	qwen_image *m = (qwen_image *)dm;
+	cg_plan_cache_free(&m->step_plans);
+	cg_plan_cache_free(&m->prefix_plans);
+	cg_arena_free(m->be, &m->arena);
+	free(m->layer_params);
+	weight *singles[] = {&m->img_in, &m->modulation, &m->norm_out, &m->proj_out,
+						 &m->time_1, &m->time_2,	 &m->txt_in,   &m->txt_out};
 	for (size_t i = 0; i < ARRAY_LEN(singles); i++)
 		if (singles[i]->buf.owner)
 			weight_free(m->be, singles[i]);
@@ -647,7 +301,7 @@ static void qwen_image_close(diffusion_model *dm) {
 		nn_free(m->be, &l->norm_k);
 	}
 	free(m->layers);
-	qwen_vae_close(m->vae);
+	diffusion_vae_close(m->vae);
 	gguf_free(&m->dit);
 	free(m->llm_path);
 	free(m->device);
@@ -658,176 +312,190 @@ static void qwen_image_close(diffusion_model *dm) {
 
 static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *dit);
 
-static status_code time_modulation(qwen_image *m, float t, buffer *time_vec, buffer *mod) {
-	float emb[TIME_EMBED_DIM];
-	int	  half = TIME_EMBED_DIM / 2;
-	for (int j = 0; j < half; j++) {
-		float freq	  = expf(-logf(TIME_MAX_PERIOD) * (float)j / (float)half);
-		emb[j]		  = cosf(t * freq);
-		emb[j + half] = sinf(t * freq);
-	}
-	backend	   *be = m->be;
-	buffer		in = {0}, mid = {0};
-	status_code s;
-
-	NN_GOTO(nn_upload(be, emb, TIME_EMBED_DIM, &in));
-	NN_GOTO(nn_alloc(be, m->hidden, &mid));
-	NN_GOTO(nn_alloc(be, m->hidden, time_vec));
-	NN_GOTO(nn_alloc(be, (size_t)MOD_CHUNKS * m->hidden, mod));
-	NN_GOTO(nn_matmul(be, &m->time_1, &in, &mid, m->hidden, TIME_EMBED_DIM, 1));
-	NN_GOTO(be->activate(be, &mid, m->hidden, NN_SILU));
-	NN_GOTO(nn_matmul(be, &m->time_2, &mid, time_vec, m->hidden, m->hidden, 1));
-	NN_GOTO(be->activate(be, time_vec, m->hidden, NN_SILU));
-	NN_GOTO(nn_matmul(be, &m->modulation, time_vec, mod, MOD_CHUNKS * m->hidden, m->hidden, 1));
-done:
-	nn_free(be, &in);
-	nn_free(be, &mid);
-	if (s != OK) {
-		nn_free(be, time_vec);
-		nn_free(be, mod);
-	}
-	return s;
-}
-
-static status_code layer_forward(qwen_image *m, const dit_layer *l, buffer *x, int rows,
-								 const buffer *mod, const buffer *rope, buffer *k_out,
-								 buffer *v_out, const buffer *prefix_k, const buffer *prefix_v,
-								 int prefix_n, layer_scratch *s) {
-	backend *be			= m->be;
-	int		 dim		= m->hidden;
-	size_t	 chunk		= (size_t)dim * sizeof(float);
-	buffer	 scale_attn = buffer_slice(mod, 0, chunk), gate_attn = buffer_slice(mod, chunk, chunk);
-	buffer	 scale_mlp = buffer_slice(mod, 2 * chunk, chunk),
-			 gate_mlp  = buffer_slice(mod, 3 * chunk, chunk);
-
-	NN_TRY(be->layernorm_modulate(be, x, &scale_attn, &s->h, rows, dim, NORM_EPS));
-	NN_TRY(nn_matmul(be, &l->q, &s->h, &s->raw, dim, dim, rows));
-	NN_TRY(be->rmsnorm_per_head_batch(be, &s->raw, &l->norm_q, &s->q, m->heads, m->head_dim,
-									  NORM_EPS, rows));
-	NN_TRY(nn_matmul(be, &l->k, &s->h, &s->raw, dim, dim, rows));
-	NN_TRY(be->rmsnorm_per_head_batch(be, &s->raw, &l->norm_k, k_out, m->heads, m->head_dim,
-									  NORM_EPS, rows));
-	NN_TRY(nn_matmul(be, &l->v, &s->h, v_out, dim, dim, rows));
-	NN_TRY(be->rope_table(be, &s->q, rope, rows, m->heads, m->head_dim));
-	NN_TRY(be->rope_table(be, k_out, rope, rows, m->heads, m->head_dim));
-
-	dense_attention_desc d = {
-		.q = &s->q, .out = &s->a, .n_q = rows, .n_heads = m->heads, .head_dim = m->head_dim};
-	if (prefix_k) {
-		d.k0 = prefix_k;
-		d.v0 = prefix_v;
-		d.n0 = prefix_n;
-		d.k1 = k_out;
-		d.v1 = v_out;
-		d.n1 = rows;
-	} else {
-		d.k0	 = k_out;
-		d.v0	 = v_out;
-		d.n0	 = rows;
-		d.causal = 1;
-	}
-	NN_TRY(be->attention_dense(be, &d));
-	NN_TRY(nn_matmul(be, &l->o, &s->a, &s->h, dim, dim, rows));
-	NN_TRY(be->gated_add(be, x, &s->h, &gate_attn, rows, dim));
-
-	NN_TRY(be->layernorm_modulate(be, x, &scale_mlp, &s->h, rows, dim, NORM_EPS));
-	NN_TRY(nn_matmul(be, &l->gate, &s->h, &s->gate, m->inter, dim, rows));
-	NN_TRY(nn_matmul(be, &l->up, &s->h, &s->up, m->inter, dim, rows));
-	NN_TRY(be->ffn_activate_batch(be, &s->gate, &s->up, &s->a, m->inter, NN_SILU, rows));
-	NN_TRY(nn_matmul(be, &l->down, &s->a, &s->h, dim, m->inter, rows));
-	return be->gated_add(be, x, &s->h, &gate_mlp, rows, dim);
-}
-
-static status_code scratch_alloc(const qwen_image *m, int rows, layer_scratch *s) {
-	memset(s, 0, sizeof(*s));
-	size_t	n = (size_t)rows * m->hidden, wide = (size_t)rows * m->inter;
-	buffer *bufs[]	= {&s->q, &s->a, &s->h, &s->gate, &s->up, &s->raw};
-	size_t	sizes[] = {n, MAX(n, wide), MAX(n, wide), wide, wide, n};
-	for (size_t i = 0; i < ARRAY_LEN(bufs); i++)
-		NN_TRY(nn_alloc(m->be, sizes[i], bufs[i]));
-	return OK;
-}
-
-static void scratch_free(const qwen_image *m, layer_scratch *s) {
-	buffer *bufs[] = {&s->q, &s->a, &s->h, &s->gate, &s->up, &s->raw};
-	for (size_t i = 0; i < ARRAY_LEN(bufs); i++)
-		nn_free(m->be, bufs[i]);
-}
-
-static status_code project_text(qwen_image *m, const float *hidden, int rows, buffer *out) {
-	backend	   *be = m->be;
-	size_t		n  = (size_t)rows * m->hidden;
-	buffer		in = {0}, a = {0}, b = {0};
-	status_code s;
-
-	NN_GOTO(nn_upload(be, hidden, n, &in));
-	NN_GOTO(nn_alloc(be, n, &a));
-	NN_GOTO(nn_alloc(be, n, &b));
-	NN_GOTO(nn_alloc(be, n, out));
-	NN_GOTO(nn_rmsnorm(be, &in, &m->txt_norm, &a, m->hidden, NORM_EPS, rows));
-	NN_GOTO(nn_matmul(be, &m->txt_in, &a, &b, m->hidden, m->hidden, rows));
-	NN_GOTO(be->activate(be, &b, (int)n, NN_GELU));
-	NN_GOTO(nn_matmul(be, &m->txt_out, &b, out, m->hidden, m->hidden, rows));
-done:
-	nn_free(be, &in);
-	nn_free(be, &a);
-	nn_free(be, &b);
-	if (s != OK)
-		nn_free(be, out);
-	return s;
-}
-
-static status_code upload_rope(qwen_image *m, const int *pos, int rows, buffer *out) {
-	int	   half = m->head_dim / 2;
-	float *host = xmalloc((size_t)rows * half * 2 * sizeof(float));
-	nn_rope_table(host, pos, rows, m->rope_axes, ROPE_THETA);
-	status_code s = nn_upload(m->be, host, (size_t)rows * half * 2, out);
-	free(host);
-	return s;
-}
-
 static void qwen_image_cond_free(diffusion_cond *c) {
 	nn_free(c->be, &c->k);
 	nn_free(c->be, &c->v);
 	free(c);
 }
 
-static status_code build_prefix(qwen_image *m, const float *hidden, int rows,
-								diffusion_cond **out) {
-	backend		   *be			= m->be;
-	size_t			layer_bytes = (size_t)rows * m->hidden * sizeof(float);
-	diffusion_cond *c			= xcalloc(1, sizeof(*c));
-	c->be						= be;
-	c->n_tokens					= rows;
-	buffer		  x = {0}, time = {0}, mod = {0}, rope = {0};
-	layer_scratch sc;
-	status_code	  s;
+typedef struct {
+	int x, mod, rope, k_out, v_out, prefix_k, prefix_v, prefix_n;
+} layer_values;
 
-	memset(&sc, 0, sizeof(sc));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->hidden * m->n_layers, &c->k));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->hidden * m->n_layers, &c->v));
-	NN_GOTO(project_text(m, hidden, rows, &x));
-	NN_GOTO(time_modulation(m, 0.0f, &time, &mod));
+static int time_modulation_graph(cg_builder *g, const qwen_image *m, int *time_vec) {
+	int emb = cg_input(g, TIME_EMBED_DIM, BIND_TIME);
+	int mid = cg_matmul(g, cg_param_mat(g, &m->time_1), emb, CG_NEW, m->hidden, TIME_EMBED_DIM, 1);
+	mid		= cg_activate(g, mid, NN_SILU);
+	*time_vec = cg_matmul(g, cg_param_mat(g, &m->time_2), mid, CG_NEW, m->hidden, m->hidden, 1);
+	*time_vec = cg_activate(g, *time_vec, NN_SILU);
+	return cg_matmul(g, cg_param_mat(g, &m->modulation), *time_vec, CG_NEW, MOD_CHUNKS * m->hidden,
+					 m->hidden, 1);
+}
+
+static void layer_graph(cg_builder *g, const qwen_image *m, const layer_values *lv, int rows) {
+	int dim		   = m->hidden;
+	int scale_attn = cg_view(g, lv->mod, 0, dim);
+	int gate_attn  = cg_view(g, lv->mod, dim, dim);
+	int scale_mlp  = cg_view(g, lv->mod, 2 * dim, dim);
+	int gate_mlp   = cg_view(g, lv->mod, 3 * dim, dim);
+
+	int h	= cg_layernorm_modulate(g, lv->x, scale_attn, CG_NEW, dim, NORM_EPS, rows);
+	int raw = cg_matmul(g, cg_layer_param(LP_Q), h, CG_NEW, dim, dim, rows);
+	int q	= cg_rmsnorm_per_head(g, cg_layer_param(LP_NORM_Q), raw, CG_NEW, m->heads, m->head_dim,
+								  NORM_EPS, rows);
+	raw		= cg_matmul(g, cg_layer_param(LP_K), h, CG_NEW, dim, dim, rows);
+	int k = cg_rmsnorm_per_head(g, cg_layer_param(LP_NORM_K), raw, lv->k_out, m->heads, m->head_dim,
+								NORM_EPS, rows);
+	int v = cg_matmul(g, cg_layer_param(LP_V), h, lv->v_out, dim, dim, rows);
+	q	  = cg_rope_table(g, q, lv->rope, rows, m->heads, m->head_dim);
+	k	  = cg_rope_table(g, k, lv->rope, rows, m->heads, m->head_dim);
+
+	cg_attention_dims dims = {.n_q = rows, .n_heads = m->heads, .head_dim = m->head_dim};
+	int				  attn;
+	if (lv->prefix_k != CG_NONE) {
+		dims.n0 = lv->prefix_n;
+		dims.n1 = rows;
+		attn	= cg_attention(g, q, lv->prefix_k, lv->prefix_v, k, v, CG_NEW, dims);
+	} else {
+		dims.n0		= rows;
+		dims.causal = 1;
+		attn		= cg_attention(g, q, k, v, CG_NONE, CG_NONE, CG_NEW, dims);
+	}
+	int o = cg_matmul(g, cg_layer_param(LP_O), attn, CG_NEW, dim, dim, rows);
+	int x = cg_gated_add(g, lv->x, o, gate_attn, dim, rows);
+
+	h		 = cg_layernorm_modulate(g, x, scale_mlp, CG_NEW, dim, NORM_EPS, rows);
+	int gate = cg_matmul(g, cg_layer_param(LP_GATE), h, CG_NEW, m->inter, dim, rows);
+	int up	 = cg_matmul(g, cg_layer_param(LP_UP), h, CG_NEW, m->inter, dim, rows);
+	int act	 = cg_ffn_activate(g, gate, up, CG_NEW, m->inter, NN_SILU, rows);
+	int down = cg_matmul(g, cg_layer_param(LP_DOWN), act, CG_NEW, dim, m->inter, rows);
+	cg_gated_add(g, x, down, gate_mlp, dim, rows);
+}
+
+static cg_builder *prefix_graph(const qwen_image *m, int rows) {
+	cg_builder *g	   = cg_builder_new();
+	size_t		floats = (size_t)rows * m->hidden;
+	int			time_vec;
+	int			mod	 = time_modulation_graph(g, m, &time_vec);
+	int			text = cg_input(g, floats, BIND_INPUT);
+	int a = cg_rmsnorm(g, cg_param_vec(g, &m->txt_norm), text, CG_NEW, m->hidden, NORM_EPS, rows);
+	int b = cg_matmul(g, cg_param_mat(g, &m->txt_in), a, CG_NEW, m->hidden, m->hidden, rows);
+	b	  = cg_activate(g, b, NN_GELU);
+	int x = cg_matmul(g, cg_param_mat(g, &m->txt_out), b, CG_NEW, m->hidden, m->hidden, rows);
+	int rope = cg_input(g, (size_t)rows * m->head_dim, BIND_ROPE);
+
+	cg_builder_section(g, CG_SECTION_LAYER);
+	cg_builder_layers(g, m->n_layers, m->layer_params, LP_COUNT);
+	layer_values lv = {.x		 = x,
+					   .mod		 = mod,
+					   .rope	 = rope,
+					   .k_out	 = cg_layer_external(g, floats, floats, BIND_COND_K),
+					   .v_out	 = cg_layer_external(g, floats, floats, BIND_COND_V),
+					   .prefix_k = CG_NONE,
+					   .prefix_v = CG_NONE};
+	layer_graph(g, m, &lv, rows);
+	return g;
+}
+
+static cg_builder *step_graph(const qwen_image *m, int rows, int n_tokens) {
+	cg_builder *g			  = cg_builder_new();
+	size_t		prefix_floats = (size_t)n_tokens * m->hidden;
+	int			time_vec;
+	int			mod	   = time_modulation_graph(g, m, &time_vec);
+	int			latent = cg_input(g, (size_t)rows * m->in_channels, BIND_INPUT);
+	int			x =
+		cg_matmul(g, cg_param_mat(g, &m->img_in), latent, CG_NEW, m->hidden, m->in_channels, rows);
+	int rope = cg_input(g, (size_t)rows * m->head_dim, BIND_ROPE);
+
+	cg_builder_section(g, CG_SECTION_LAYER);
+	cg_builder_layers(g, m->n_layers, m->layer_params, LP_COUNT);
+	layer_values lv = {.x		 = x,
+					   .mod		 = mod,
+					   .rope	 = rope,
+					   .k_out	 = CG_NEW,
+					   .v_out	 = CG_NEW,
+					   .prefix_k = cg_layer_external(g, prefix_floats, prefix_floats, BIND_COND_K),
+					   .prefix_v = cg_layer_external(g, prefix_floats, prefix_floats, BIND_COND_V),
+					   .prefix_n = n_tokens};
+	layer_graph(g, m, &lv, rows);
+
+	cg_builder_section(g, CG_SECTION_POST);
+	int scale =
+		cg_matmul(g, cg_param_mat(g, &m->norm_out), time_vec, CG_NEW, m->hidden, m->hidden, 1);
+	int h = cg_layernorm_modulate(g, x, scale, CG_NEW, m->hidden, NORM_EPS, rows);
+	cg_output_value(
+		g, cg_matmul(g, cg_param_mat(g, &m->proj_out), h, CG_NEW, m->out_channels, m->hidden, rows),
+		BIND_VELOCITY);
+	return g;
+}
+
+static status_code prefix_plan(qwen_image *m, int rows, cg_plan **out) {
+	uint64_t key = cg_plan_key(rows, 0);
+	*out		 = cg_plan_cache_get(&m->prefix_plans, key);
+	if (*out)
+		return OK;
+	NN_TRY(cg_plan_build(prefix_graph(m, rows), m->be, "qwen-image prefix", out));
+	cg_plan_cache_put(&m->prefix_plans, key, *out);
+	return OK;
+}
+
+static status_code step_plan(qwen_image *m, int rows, int n_tokens, cg_plan **out) {
+	uint64_t key = cg_plan_key(rows, n_tokens);
+	*out		 = cg_plan_cache_get(&m->step_plans, key);
+	if (*out)
+		return OK;
+	NN_TRY(cg_plan_build(step_graph(m, rows, n_tokens), m->be, "qwen-image step", out));
+	cg_plan_cache_put(&m->step_plans, key, *out);
+	return OK;
+}
+
+static float *rope_from_positions(const qwen_image *m, int *pos, int rows) {
+	float *table = xmalloc((size_t)rows * m->head_dim * sizeof(float));
+	nn_rope_table(table, pos, rows, m->rope_axes, ROPE_THETA);
+	free(pos);
+	return table;
+}
+
+static float *text_rope(const qwen_image *m, int rows) {
 	int *pos = xmalloc((size_t)rows * ROPE_AXES * sizeof(int));
 	for (int i = 0; i < rows; i++)
 		pos[i * ROPE_AXES] = pos[i * ROPE_AXES + 1] = pos[i * ROPE_AXES + 2] = i;
-	s = upload_rope(m, pos, rows, &rope);
-	free(pos);
-	if (s != OK)
-		goto done;
-	NN_GOTO(scratch_alloc(m, rows, &sc));
-	for (int li = 0; li < m->n_layers; li++) {
-		buffer k = buffer_slice(&c->k, li * layer_bytes, layer_bytes);
-		buffer v = buffer_slice(&c->v, li * layer_bytes, layer_bytes);
-		NN_GOTO(
-			layer_forward(m, &m->layers[li], &x, rows, &mod, &rope, &k, &v, NULL, NULL, 0, &sc));
+	return rope_from_positions(m, pos, rows);
+}
+
+static float *image_rope(const qwen_image *m, latent_shape shape, int n_tokens) {
+	int	 rows = shape.lw * shape.lh;
+	int *pos  = xmalloc((size_t)rows * ROPE_AXES * sizeof(int));
+	for (int i = 0; i < rows; i++) {
+		pos[i * ROPE_AXES]	   = n_tokens;
+		pos[i * ROPE_AXES + 1] = i / shape.lw - (shape.lh - shape.lh / 2);
+		pos[i * ROPE_AXES + 2] = i % shape.lw - (shape.lw - shape.lw / 2);
 	}
-done:
-	scratch_free(m, &sc);
-	nn_free(be, &x);
-	nn_free(be, &time);
-	nn_free(be, &mod);
-	nn_free(be, &rope);
+	return rope_from_positions(m, pos, rows);
+}
+
+static status_code build_prefix(qwen_image *m, const float *hidden, int rows,
+								diffusion_cond **out) {
+	diffusion_cond *c  = xcalloc(1, sizeof(*c));
+	c->be			   = m->be;
+	c->n_tokens		   = rows;
+	size_t		floats = (size_t)rows * m->hidden * m->n_layers;
+	cg_plan	   *plan;
+	status_code s = nn_alloc(m->be, floats, &c->k);
+	if (s == OK)
+		s = nn_alloc(m->be, floats, &c->v);
+	if (s == OK)
+		s = prefix_plan(m, rows, &plan);
+	if (s == OK) {
+		float emb[TIME_EMBED_DIM];
+		dit_timestep_embedding(emb, TIME_EMBED_DIM, 0.0f, TIME_MAX_PERIOD);
+		float		*rope = text_rope(m, rows);
+		cg_exec_args args = {
+			.host_in   = {[BIND_TIME] = emb, [BIND_INPUT] = hidden, [BIND_ROPE] = rope},
+			.layer_ext = {[BIND_COND_K] = c->k, [BIND_COND_V] = c->v}};
+		s = cg_graph_run(m->be, &m->arena, plan, &args);
+		free(rope);
+	}
 	if (s == OK)
 		*out = c;
 	else
@@ -835,146 +503,53 @@ done:
 	return s;
 }
 
-static status_code encode_text(qwen_image *m, const char *const *texts, int n, float **hidden,
-							   int *rows) {
-	config cfg	 = config_defaults();
-	cfg.model	 = m->llm_path;
-	cfg.device	 = m->device;
-	cfg.ctx_size = TEXT_CTX_TOKENS;
-	cfg.debug	 = log_get_level() <= LOG_DEBUG;
-	config_init(&cfg);
-
-	context		ctx;
-	status_code s = context_init(&ctx, &cfg);
-	if (s != OK)
-		return s;
-
-	int32_t ids[TEXT_CTX_TOKENS];
-	int skip = tokenizer_encode_with_specials(&ctx.tok, TEXT_SYSTEM, 0, ids, TEXT_CTX_TOKENS, NULL);
-	for (int i = 0; i < n && s == OK; i++) {
-		char prompt[8192];
-		snprintf(prompt, sizeof(prompt), "%s%s%s%s", TEXT_SYSTEM, TEXT_USER_PREFIX, texts[i],
-				 TEXT_USER_SUFFIX);
-		int total = tokenizer_encode_with_specials(&ctx.tok, prompt, 0, ids, TEXT_CTX_TOKENS, NULL);
-		if (total <= skip || total >= TEXT_CTX_TOKENS) {
-			ERROR("prompt does not fit in %d tokens", TEXT_CTX_TOKENS);
-			s = ERR_INVALID_ARG;
-			break;
-		}
-		context_reset(&ctx);
-		float *all = xmalloc((size_t)total * ctx.m.dim * sizeof(float));
-		s = compute_hidden_states(&ctx.m, &ctx.kv, &ctx.scratch, ids, total, ctx.flash_attn, all);
-		rows[i]	  = total - skip;
-		hidden[i] = xmalloc((size_t)rows[i] * ctx.m.dim * sizeof(float));
-		memcpy(hidden[i], all + (size_t)skip * ctx.m.dim,
-			   (size_t)rows[i] * ctx.m.dim * sizeof(float));
-		free(all);
-	}
-	context_free(&ctx);
-	return s;
-}
-
 static status_code qwen_image_encode(diffusion_model *dm, const char *const *texts, int n,
 									 diffusion_cond **out) {
-	qwen_image *m		  = (qwen_image *)dm;
-	float	   *hidden[2] = {0};
-	int			rows[2]	  = {0};
-	status_code s		  = encode_text(m, texts, n, hidden, rows);
+	qwen_image		 *m			   = (qwen_image *)dm;
+	text_encoder_spec spec		   = {.llm_path	   = m->llm_path,
+									  .device	   = m->device,
+									  .system	   = TEXT_SYSTEM,
+									  .user_prefix = TEXT_USER_PREFIX,
+									  .user_suffix = TEXT_USER_SUFFIX,
+									  .ctx_tokens  = TEXT_CTX_TOKENS};
+	text_encoding	  encodings[2] = {0};
+	status_code		  s			   = text_encoder_run(&spec, texts, n, encodings);
 	for (int i = 0; i < n; i++) {
 		if (s == OK)
-			s = build_prefix(m, hidden[i], rows[i], &out[i]);
-		free(hidden[i]);
+			s = build_prefix(m, encodings[i].hidden, encodings[i].rows, &out[i]);
+		text_encoding_free(&encodings[i]);
 	}
 	return s;
 }
 
 static latent_shape qwen_image_shape(int width, int height) {
-	return (latent_shape){width / 16, height / 16, 64};
+	return (latent_shape){width / LATENT_PATCH, height / LATENT_PATCH, LATENT_CHANNELS};
 }
 
 static status_code qwen_image_predict(diffusion_model *dm, const float *latent, latent_shape shape,
 									  float sigma, const diffusion_cond *cond, float *velocity) {
-	qwen_image	 *m			  = (qwen_image *)dm;
-	backend		 *be		  = m->be;
-	int			  rows		  = shape.lw * shape.lh;
-	size_t		  layer_bytes = (size_t)cond->n_tokens * m->hidden * sizeof(float);
-	buffer		  lat = {0}, time = {0}, mod = {0}, x = {0}, rope = {0}, k_img = {0}, v_img = {0},
-				  scale = {0}, vel = {0};
-	layer_scratch sc;
-	status_code	  s;
-
-	memset(&sc, 0, sizeof(sc));
-	NN_GOTO(time_modulation(m, sigma * TIMESTEP_SCALE, &time, &mod));
-	NN_GOTO(nn_upload(be, latent, (size_t)rows * m->in_channels, &lat));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->hidden, &x));
-	NN_GOTO(nn_matmul(be, &m->img_in, &lat, &x, m->hidden, m->in_channels, rows));
-
-	int *pos = xmalloc((size_t)rows * ROPE_AXES * sizeof(int));
-	for (int i = 0; i < rows; i++) {
-		pos[i * ROPE_AXES]	   = cond->n_tokens;
-		pos[i * ROPE_AXES + 1] = i / shape.lw - (shape.lh - shape.lh / 2);
-		pos[i * ROPE_AXES + 2] = i % shape.lw - (shape.lw - shape.lw / 2);
-	}
-	s = upload_rope(m, pos, rows, &rope);
-	free(pos);
-	if (s != OK)
-		goto done;
-
-	NN_GOTO(scratch_alloc(m, rows, &sc));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->hidden, &k_img));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->hidden, &v_img));
-	for (int li = 0; li < m->n_layers; li++) {
-		buffer pk = buffer_slice(&cond->k, li * layer_bytes, layer_bytes);
-		buffer pv = buffer_slice(&cond->v, li * layer_bytes, layer_bytes);
-		NN_GOTO(layer_forward(m, &m->layers[li], &x, rows, &mod, &rope, &k_img, &v_img, &pk, &pv,
-							  cond->n_tokens, &sc));
-	}
-
-	NN_GOTO(nn_alloc(be, m->hidden, &scale));
-	NN_GOTO(nn_matmul(be, &m->norm_out, &time, &scale, m->hidden, m->hidden, 1));
-	NN_GOTO(be->layernorm_modulate(be, &x, &scale, &sc.h, rows, m->hidden, NORM_EPS));
-	NN_GOTO(nn_alloc(be, (size_t)rows * m->out_channels, &vel));
-	NN_GOTO(nn_matmul(be, &m->proj_out, &sc.h, &vel, m->out_channels, m->hidden, rows));
-	NN_GOTO(be->buffer_read_f32(be, &vel, velocity, rows * m->out_channels));
-done:
-	scratch_free(m, &sc);
-	nn_free(be, &lat);
-	nn_free(be, &time);
-	nn_free(be, &mod);
-	nn_free(be, &x);
-	nn_free(be, &rope);
-	nn_free(be, &k_img);
-	nn_free(be, &v_img);
-	nn_free(be, &scale);
-	nn_free(be, &vel);
+	qwen_image *m = (qwen_image *)dm;
+	cg_plan	   *plan;
+	NN_TRY(step_plan(m, shape.lw * shape.lh, cond->n_tokens, &plan));
+	float emb[TIME_EMBED_DIM];
+	dit_timestep_embedding(emb, TIME_EMBED_DIM, sigma * TIMESTEP_SCALE, TIME_MAX_PERIOD);
+	float		*rope = image_rope(m, shape, cond->n_tokens);
+	cg_exec_args args = {.host_in  = {[BIND_TIME] = emb, [BIND_INPUT] = latent, [BIND_ROPE] = rope},
+						 .host_out = {[BIND_VELOCITY] = velocity},
+						 .layer_ext = {[BIND_COND_K] = cond->k, [BIND_COND_V] = cond->v}};
+	status_code	 s	  = cg_graph_run(m->be, &m->arena, plan, &args);
+	free(rope);
 	return s;
 }
 
 static status_code qwen_image_decode(diffusion_model *dm, const float *latent, latent_shape shape,
 									 diffusion_image *out) {
-	return qwen_vae_decode(((qwen_image *)dm)->vae, latent, shape, out);
+	qwen_image *m = (qwen_image *)dm;
+	return diffusion_vae_decode(m->vae, &m->arena, latent, shape, out);
 }
 
 static void qwen_image_preview(const float *x0, latent_shape shape, diffusion_image *out) {
-	out->width	  = shape.lw;
-	out->height	  = shape.lh;
-	out->channels = 4;
-	out->pixels	  = xmalloc((size_t)shape.lw * shape.lh * 4);
-	for (int p = 0; p < shape.lw * shape.lh; p++) {
-		const float *z = x0 + (size_t)p * shape.lc;
-		float		 c[4];
-		memcpy(c, qwen_image_preview_rgb_bias, sizeof(qwen_image_preview_rgb_bias));
-		c[3] = qwen_image_preview_alpha_bias;
-		for (int d = 0; d < shape.lc; d++) {
-			for (int j = 0; j < 3; j++)
-				c[j] += z[d] * qwen_image_preview_rgb_proj[d * 3 + j];
-			c[3] += z[d] * qwen_image_preview_alpha_proj[d];
-		}
-		for (int j = 0; j < 4; j++) {
-			float v						   = j < 3 ? c[j] * 0.5f + 0.5f : c[j];
-			out->pixels[(size_t)p * 4 + j] = (uint8_t)(MAX(0.0f, MIN(1.0f, v)) * 255.0f + 0.5f);
-		}
-	}
+	diffusion_preview_linear(&qwen_image_preview_proj, x0, shape, out);
 }
 
 static const diffusion_ops qwen_image_ops = {
@@ -995,36 +570,24 @@ static const diffusion_ops qwen_image_ops = {
 	.preview   = qwen_image_preview,
 };
 
-static status_code open_device(qwen_image *m) {
-	char name[BACKEND_DEVICE_NAME_MAX];
-	int	 index = 0;
-	if (backend_parse_device(m->device, name, sizeof(name), &index) != 0) {
-		ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", m->device);
-		return ERR_INVALID_ARG;
-	}
-	status_code s = backend_create(name, index, &m->be);
-	if (s != OK)
-		ERROR("failed to initialize device '%s'", m->device);
-	else if (!nn_supported(m->be))
-		return ERR_UNSUPPORTED;
-	else if (!backend_has_cap(m->be, BCAP_IS_HOST))
-		backend_host_use(m->be);
-	return s;
-}
-
 static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *dit) {
 	qwen_image *m = xcalloc(1, sizeof(*m));
 	m->base.ops	  = &qwen_image_ops;
 	m->dit		  = *dit;
 	m->llm_path	  = xstrdup(files->llm);
 	m->device	  = xstrdup(files->device);
-	if (open_device(m) != OK) {
+	if (cg_backend_open(m->device, &m->be) != OK) {
 		qwen_image_close(&m->base);
 		return NULL;
 	}
 	detect_config(m);
 	INFO("qwen-image: %d layers, hidden %d, %d heads", m->n_layers, m->hidden, m->heads);
-	if (load_dit(m) != OK || !(m->vae = qwen_vae_open(m->be, files->vae))) {
+	if (load_dit(m) != OK) {
+		qwen_image_close(&m->base);
+		return NULL;
+	}
+	m->vae = diffusion_vae_open(m->be, files->vae, &qwen_image_vae_stats);
+	if (!m->vae) {
 		qwen_image_close(&m->base);
 		return NULL;
 	}

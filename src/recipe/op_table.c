@@ -3,6 +3,11 @@
 static stage matmul_substage(uint8_t w_idx);
 
 typedef struct {
+	const char *name;
+	size_t		slot;
+} op_also;
+
+typedef struct {
 	const char *fn_name;
 	size_t		slot0;
 	size_t		slot1;
@@ -13,11 +18,19 @@ typedef struct {
 	uint8_t		state_reads;
 	uint8_t		state_writes;
 	uint8_t		layer_geom;
+	op_also		also[2];
 } op_requirement;
 
 #define OP_NO_SLOT ((size_t)-1)
 
 #define OP_FN_SLOT(fn) offsetof(backend, fn)
+
+#define DF_OP(kind_, name_, fn_, ...)                                                              \
+	[kind_] = {.name	= name_,                                                                   \
+			   .fn_name = #fn_,                                                                    \
+			   .slot0	= OP_FN_SLOT(fn_),                                                         \
+			   .slot1	= OP_NO_SLOT,                                                              \
+			   __VA_ARGS__}
 
 static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 	{
@@ -439,6 +452,32 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 				.reads			  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
 				.writes			  = {OP_TOUCH_OUT},
 			},
+		DF_OP(OP_DF_MATMUL, "df_matmul", matmul_batch, .reads = {OP_TOUCH_IN0},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_CONV, "df_conv", matmul_batch, .reads = {OP_TOUCH_IN0},
+			  .writes = {OP_TOUCH_OUT},
+			  .also	  = {{"add_bias", OP_FN_SLOT(add_bias)}, {"im2col3x3", OP_FN_SLOT(im2col3x3)}}),
+		DF_OP(OP_DF_RMSNORM, "df_rmsnorm", rmsnorm_batch, .reads = {OP_TOUCH_IN0},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_RMSNORM_PER_HEAD, "df_rmsnorm_per_head", rmsnorm_per_head_batch,
+			  .reads = {OP_TOUCH_IN0}, .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_LAYERNORM_MODULATE, "df_layernorm_modulate", layernorm_modulate,
+			  .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1}, .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_ADD, "df_add", add_batch, .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_GATED_ADD, "df_gated_add", gated_add,
+			  .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2}, .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_ACTIVATE, "df_activate", activate, .reads = {OP_TOUCH_IN0},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_FFN_ACTIVATE, "df_ffn_activate", ffn_activate_batch,
+			  .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1}, .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_ROPE_TABLE, "df_rope_table", rope_table, .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_ATTENTION, "df_attention", attention_dense,
+			  .reads  = {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2, OP_TOUCH_IN3},
+			  .writes = {OP_TOUCH_OUT}),
+		DF_OP(OP_DF_UPSAMPLE_SHORTCUT_ADD, "df_upsample_shortcut_add", upsample_shortcut_add,
+			  .reads = {OP_TOUCH_IN0, OP_TOUCH_IN1}, .writes = {OP_TOUCH_OUT}),
 };
 
 const char *recipe_op_name(op_kind k) {
@@ -458,10 +497,13 @@ uint8_t recipe_op_state_writes(op_kind k) {
 const char *recipe_op_missing_fn(const backend *a, op_kind k) {
 	if ((int)k < 0 || k >= OP_KIND_COUNT)
 		return NULL;
-	const op_requirement *req = &OP_REQUIREMENTS[k];
+	const op_requirement *req  = &OP_REQUIREMENTS[k];
+	const char			 *base = (const char *)a;
+	for (int i = 0; i < 2 && req->also[i].name; i++)
+		if (!*(const void *const *)(base + req->also[i].slot))
+			return req->also[i].name;
 	if (!req->fn_name)
 		return NULL;
-	const char *base = (const char *)a;
 	if (*(const void *const *)(base + req->slot0))
 		return NULL;
 	if (req->slot1 != OP_NO_SLOT && *(const void *const *)(base + req->slot1))

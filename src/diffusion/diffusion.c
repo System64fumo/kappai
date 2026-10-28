@@ -1,4 +1,5 @@
 #include "diffusion/diffusion.h"
+#include "diffusion/image.h"
 #include "log.h"
 #include "profile.h"
 
@@ -6,7 +7,6 @@
 #include <stdio.h>
 
 #define DIFFUSION_MAX_MODELS 8
-#define OPAQUE_ALPHA 255
 
 static const diffusion_ops *g_registry[DIFFUSION_MAX_MODELS];
 static int					g_registry_count;
@@ -72,49 +72,6 @@ static void fill_noise(float *x, size_t n, uint64_t seed) {
 		if (i + 1 < n)
 			x[i + 1] = (float)(r * sin(2.0 * M_PI * u2));
 	}
-}
-
-static float texel(const diffusion_image *img, int y, int x, int c) {
-	return img->pixels[((size_t)y * img->width + x) * img->channels + c];
-}
-
-static void image_resize(const diffusion_image *src, int width, int height, diffusion_image *dst) {
-	dst->width	  = width;
-	dst->height	  = height;
-	dst->channels = src->channels;
-	dst->pixels	  = xmalloc((size_t)width * height * src->channels);
-	for (int y = 0; y < height; y++) {
-		float fy = ((float)y + 0.5f) * src->height / height - 0.5f;
-		fy		 = MAX(fy, 0.0f);
-		int	  y0 = MIN((int)fy, src->height - 1);
-		int	  y1 = MIN(y0 + 1, src->height - 1);
-		float wy = fy - (float)y0;
-		for (int x = 0; x < width; x++) {
-			float fx = ((float)x + 0.5f) * src->width / width - 0.5f;
-			fx		 = MAX(fx, 0.0f);
-			int	  x0 = MIN((int)fx, src->width - 1);
-			int	  x1 = MIN(x0 + 1, src->width - 1);
-			float wx = fx - (float)x0;
-			for (int c = 0; c < src->channels; c++) {
-				float top = texel(src, y0, x0, c) * (1 - wx) + texel(src, y0, x1, c) * wx;
-				float bot = texel(src, y1, x0, c) * (1 - wx) + texel(src, y1, x1, c) * wx;
-				dst->pixels[((size_t)y * width + x) * src->channels + c] =
-					(uint8_t)(top * (1 - wy) + bot * wy + 0.5f);
-			}
-		}
-	}
-}
-
-static void image_drop_opaque_alpha(diffusion_image *img) {
-	if (img->channels != 4)
-		return;
-	size_t n = (size_t)img->width * img->height;
-	for (size_t i = 0; i < n; i++)
-		if (img->pixels[i * 4 + 3] != OPAQUE_ALPHA)
-			return;
-	for (size_t i = 0; i < n; i++)
-		memcpy(img->pixels + i * 3, img->pixels + i * 4, 3);
-	img->channels = 3;
 }
 
 static void write_preview(const diffusion_ops *ops, const diffusion_params *p, const float *x0,

@@ -113,8 +113,24 @@ typedef enum {
 	OP_KDA,
 	OP_MLA_ABSORBED,
 
+	OP_DF_MATMUL,
+	OP_DF_CONV,
+	OP_DF_RMSNORM,
+	OP_DF_RMSNORM_PER_HEAD,
+	OP_DF_LAYERNORM_MODULATE,
+	OP_DF_ADD,
+	OP_DF_GATED_ADD,
+	OP_DF_ACTIVATE,
+	OP_DF_FFN_ACTIVATE,
+	OP_DF_ROPE_TABLE,
+	OP_DF_ATTENTION,
+	OP_DF_UPSAMPLE_SHORTCUT_ADD,
+
 	OP_KIND_COUNT
 } op_kind;
+
+#define OP_DF_FIRST OP_DF_MATMUL
+#define OP_DF_LAST OP_DF_UPSAMPLE_SHORTCUT_ADD
 
 enum {
 	ACTIVATION_SILU = 0,
@@ -182,7 +198,43 @@ typedef enum {
 	WIDX_COUNT
 } weight_idx;
 
+typedef struct {
+	int n_q, n_heads, head_dim, n0, n1, causal;
+} df_attention_dims;
+
+typedef struct {
+	int height, width, in_channels, out_channels, repeats, frames_up, factor;
+} df_upsample_dims;
+
 typedef union {
+	struct {
+		int n, k, rows;
+	} df_matmul;
+	struct {
+		int height, width, shift;
+	} df_conv;
+	struct {
+		int	  dim, rows;
+		float eps;
+	} df_norm;
+	struct {
+		int	  heads, head_dim, rows;
+		float eps;
+	} df_head_norm;
+	struct {
+		int dim, rows;
+	} df_add;
+	struct {
+		int n, activation;
+	} df_activate;
+	struct {
+		int inter, activation, rows;
+	} df_ffn;
+	struct {
+		int rows, heads, head_dim;
+	} df_rope;
+	df_attention_dims df_attention;
+	df_upsample_dims  df_upsample;
 	struct {
 		float eps;
 		int	  n_heads;

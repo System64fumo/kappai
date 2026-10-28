@@ -30,8 +30,6 @@ typedef struct {
 			goto done;                                                                             \
 	} while (0)
 
-bool nn_supported(backend *be);
-
 status_code nn_alloc(backend *be, size_t floats, buffer *out);
 status_code nn_upload(backend *be, const float *host, size_t floats, buffer *out);
 status_code nn_vec_load(backend *be, const gguf_tensor *t, float offset, buffer *out);

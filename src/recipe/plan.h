@@ -83,4 +83,65 @@ void	   part_plan_free(part_plan *p);
 int		   part_plan_n_transfers(const part_plan *p);
 int		   part_plan_check_carry(const part_plan *p, const cg_set *graphs);
 
+/* ------------------------------------------------------------------ *
+ * Value-level plans for raw cg_graph execution.
+ *
+ * The slot-based mem_plan above is the LLM-specialized planner (fixed
+ * slots, batch-size buckets).  cg_plan is the general value-level
+ * planner: it computes liveness over explicit graph values and packs
+ * them into a first-fit arena.  Both paths share cg_graph, the op_kind
+ * enum and the backend dispatch; diffusion models plan their graphs
+ * with cg_plan and run them through cg_graph_run (recipe/exec.h).
+ * ------------------------------------------------------------------ */
+
+#define CG_NO_OFFSET ((size_t)-1)
+#define CG_ARENA_ALIGN_FLOATS 64
+#define CG_PLAN_CACHE_SIZE 3
+
+typedef struct cg_exec cg_exec;
+typedef status_code (*cg_node_handler)(const cg_exec *x, const cg_node *n);
+
+typedef struct {
+	cg_node_handler fn;
+	uint64_t		us, calls;
+} cg_node_step;
+
+typedef struct {
+	size_t *offset;			  /* [n_values + 1], CG_NO_OFFSET where not arena-backed */
+	size_t	arena_floats;	  /* total arena size in floats */
+	size_t	unplanned_floats; /* sum of live value sizes without reuse */
+} cg_arena_layout;
+
+void		cg_arena_layout_plan(cg_arena_layout *l, const cg_graph *c, const cg_range *ranges);
+status_code cg_arena_layout_build(cg_arena_layout *l, const cg_graph *c);
+void		cg_arena_layout_release(cg_arena_layout *l);
+
+typedef struct {
+	cg_builder	   *graph;
+	cg_node_step   *steps;
+	cg_arena_layout layout;
+	const char	   *label;
+	bool			profiling;
+} cg_plan;
+
+status_code cg_plan_build(cg_builder *g, backend *be, const char *label, cg_plan **out);
+void		cg_plan_free(cg_plan *p);
+void		cg_plan_report(cg_plan *p, FILE *fp);
+
+typedef struct {
+	cg_plan *plans[CG_PLAN_CACHE_SIZE];
+	uint64_t keys[CG_PLAN_CACHE_SIZE];
+	int		 count, next;
+} cg_plan_cache;
+
+cg_plan *cg_plan_cache_get(const cg_plan_cache *c, uint64_t key);
+void	 cg_plan_cache_put(cg_plan_cache *c, uint64_t key, cg_plan *plan);
+void	 cg_plan_cache_free(cg_plan_cache *c);
+
+static inline uint64_t cg_plan_key(int a, int b) {
+	return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b;
+}
+
+cg_node_handler cg_node_handler_for(op_kind kind);
+
 #endif

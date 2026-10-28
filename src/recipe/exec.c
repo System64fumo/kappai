@@ -1,3 +1,6 @@
+#include "recipe/exec.h"
+#include "nn.h"
+#include "profile.h"
 #include "recipe/internal.h"
 
 typedef status_code (*op_handler)(exec_ctx *ctx);
@@ -723,4 +726,281 @@ status_code compute_hidden_states_recipe(struct model *m, struct kvcache *cache,
 										 int n_tokens, int flash_attn, float *hidden_out) {
 	row_desc rows = {.n_rows = n_tokens, .pos_start = 0, .cache = cache};
 	return compute_forward_rows(m, &rows, s, tokens, flash_attn, NULL, hidden_out);
+}
+
+typedef struct {
+	const char *name;
+	size_t		off;
+} df_req;
+
+#define DF_REQ(f) {#f, offsetof(backend, f)}
+
+static buffer df_value_buffer(const cg_exec *x, int v) {
+	const cg_value *val = &x->graph->g->values[v];
+	if (val->alias_of != CG_NONE)
+		return df_value_buffer(x, val->alias_of);
+	if (val->view_of != CG_NONE) {
+		buffer parent = df_value_buffer(x, val->view_of);
+		return buffer_slice(&parent, val->view_offset * sizeof(float), val->elems * sizeof(float));
+	}
+	if (val->external == CG_EXT_LAYER)
+		return buffer_slice(&x->args->layer_ext[val->bind],
+							(size_t)x->layer * val->layer_stride * sizeof(float),
+							val->elems * sizeof(float));
+	return buffer_slice(&x->arena->buf, x->plan->layout.offset[v] * sizeof(float),
+						val->elems * sizeof(float));
+}
+
+static buffer df_in_buffer(const cg_exec *x, const cg_node *n, int i) {
+	return df_value_buffer(x, n->in[i]);
+}
+
+static const cg_param *df_node_param(const cg_exec *x, const cg_node *n) {
+	return cg_builder_param(x->graph, n->param, x->layer);
+}
+
+static status_code df_run_matmul(const cg_exec *x, const cg_node *n) {
+	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	return nn_matmul(x->be, df_node_param(x, n)->mat, &in, &out, n->params.df_matmul.n,
+					 n->params.df_matmul.k, n->params.df_matmul.rows);
+}
+
+static status_code df_run_conv(const cg_exec *x, const cg_node *n) {
+	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	return nn_conv_forward(x->be, df_node_param(x, n)->conv, &in, &out, n->params.df_conv.height,
+						   n->params.df_conv.width, n->params.df_conv.shift);
+}
+
+static status_code df_run_rmsnorm(const cg_exec *x, const cg_node *n) {
+	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	return nn_rmsnorm(x->be, &in, df_node_param(x, n)->vec, &out, n->params.df_norm.dim,
+					  n->params.df_norm.eps, n->params.df_norm.rows);
+}
+
+static status_code df_run_rmsnorm_per_head(const cg_exec *x, const cg_node *n) {
+	buffer in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	return x->be->rmsnorm_per_head_batch(
+		x->be, &in, df_node_param(x, n)->vec, &out, n->params.df_head_norm.heads,
+		n->params.df_head_norm.head_dim, n->params.df_head_norm.eps, n->params.df_head_norm.rows);
+}
+
+static status_code df_run_layernorm_modulate(const cg_exec *x, const cg_node *n) {
+	buffer in = df_in_buffer(x, n, 0), scale = df_in_buffer(x, n, 1),
+		   out = df_value_buffer(x, n->out[0]);
+	return x->be->layernorm_modulate(x->be, &in, &scale, &out, n->params.df_norm.rows,
+									 n->params.df_norm.dim, n->params.df_norm.eps);
+}
+
+static status_code df_run_add(const cg_exec *x, const cg_node *n) {
+	buffer acc = df_value_buffer(x, n->out[0]), addend = df_in_buffer(x, n, 1);
+	return nn_add(x->be, &acc, &addend, n->params.df_add.dim, n->params.df_add.rows);
+}
+
+static status_code df_run_gated_add(const cg_exec *x, const cg_node *n) {
+	buffer acc = df_value_buffer(x, n->out[0]), addend = df_in_buffer(x, n, 1),
+		   gate = df_in_buffer(x, n, 2);
+	return x->be->gated_add(x->be, &acc, &addend, &gate, n->params.df_add.rows,
+							n->params.df_add.dim);
+}
+
+static status_code df_run_activate(const cg_exec *x, const cg_node *n) {
+	buffer io = df_value_buffer(x, n->out[0]);
+	return x->be->activate(x->be, &io, n->params.df_activate.n, n->params.df_activate.activation);
+}
+
+static status_code df_run_ffn_activate(const cg_exec *x, const cg_node *n) {
+	buffer gate = df_in_buffer(x, n, 0), up = df_in_buffer(x, n, 1),
+		   out = df_value_buffer(x, n->out[0]);
+	return x->be->ffn_activate_batch(x->be, &gate, &up, &out, n->params.df_ffn.inter,
+									 n->params.df_ffn.activation, n->params.df_ffn.rows);
+}
+
+static status_code df_run_rope_table(const cg_exec *x, const cg_node *n) {
+	buffer io = df_value_buffer(x, n->out[0]), table = df_in_buffer(x, n, 1);
+	return x->be->rope_table(x->be, &io, &table, n->params.df_rope.rows, n->params.df_rope.heads,
+							 n->params.df_rope.head_dim);
+}
+
+static status_code df_run_attention(const cg_exec *x, const cg_node *n) {
+	buffer q = df_in_buffer(x, n, 0), k0 = df_in_buffer(x, n, 1), v0 = df_in_buffer(x, n, 2);
+	buffer out = df_value_buffer(x, n->out[0]), k1 = {0}, v1 = {0};
+	const df_attention_dims *a = &n->params.df_attention;
+	dense_attention_desc	 d = {.q		= &q,
+								  .k0		= &k0,
+								  .v0		= &v0,
+								  .out		= &out,
+								  .n_q		= a->n_q,
+								  .n_heads	= a->n_heads,
+								  .head_dim = a->head_dim,
+								  .n0		= a->n0,
+								  .n1		= a->n1,
+								  .causal	= a->causal};
+	if (n->n_in > 3) {
+		k1	 = df_in_buffer(x, n, 3);
+		v1	 = df_in_buffer(x, n, 4);
+		d.k1 = &k1;
+		d.v1 = &v1;
+	}
+	return x->be->attention_dense(x->be, &d);
+}
+
+static status_code df_run_upsample_shortcut_add(const cg_exec *x, const cg_node *n) {
+	buffer					in = df_in_buffer(x, n, 0), out = df_value_buffer(x, n->out[0]);
+	const df_upsample_dims *u = &n->params.df_upsample;
+	upsample_shortcut_desc	d = {.in		   = &in,
+								 .out		   = &out,
+								 .height	   = u->height,
+								 .width		   = u->width,
+								 .in_channels  = u->in_channels,
+								 .out_channels = u->out_channels,
+								 .repeats	   = u->repeats,
+								 .frames_up	   = u->frames_up,
+								 .factor	   = u->factor};
+	return x->be->upsample_shortcut_add(x->be, &d);
+}
+
+static const cg_node_handler G_DF_HANDLERS[OP_KIND_COUNT] = {
+	[OP_DF_MATMUL]				  = df_run_matmul,
+	[OP_DF_CONV]				  = df_run_conv,
+	[OP_DF_RMSNORM]				  = df_run_rmsnorm,
+	[OP_DF_RMSNORM_PER_HEAD]	  = df_run_rmsnorm_per_head,
+	[OP_DF_LAYERNORM_MODULATE]	  = df_run_layernorm_modulate,
+	[OP_DF_ADD]					  = df_run_add,
+	[OP_DF_GATED_ADD]			  = df_run_gated_add,
+	[OP_DF_ACTIVATE]			  = df_run_activate,
+	[OP_DF_FFN_ACTIVATE]		  = df_run_ffn_activate,
+	[OP_DF_ROPE_TABLE]			  = df_run_rope_table,
+	[OP_DF_ATTENTION]			  = df_run_attention,
+	[OP_DF_UPSAMPLE_SHORTCUT_ADD] = df_run_upsample_shortcut_add,
+};
+
+cg_node_handler cg_node_handler_for(op_kind kind) {
+	return kind >= 0 && kind < OP_KIND_COUNT ? G_DF_HANDLERS[kind] : NULL;
+}
+
+bool cg_backend_supported(backend *be) {
+	static const df_req runtime[] = {DF_REQ(buffer_alloc_scratch), DF_REQ(buffer_write_f32),
+									 DF_REQ(buffer_read_f32)};
+	bool				ok		  = true;
+	for (size_t i = 0; i < ARRAY_LEN(runtime); i++)
+		if (!*(void **)((char *)be + runtime[i].off)) {
+			ERROR("backend '%s' does not implement '%s'", be->name, runtime[i].name);
+			ok = false;
+		}
+	for (op_kind k = OP_DF_FIRST; k <= OP_DF_LAST; k++) {
+		const char *missing = recipe_op_missing_fn(be, k);
+		if (missing) {
+			ERROR("backend '%s' does not implement '%s' (needed by %s)", be->name, missing,
+				  recipe_op_name(k));
+			ok = false;
+		}
+	}
+	return ok;
+}
+
+status_code cg_backend_open(const char *spec, backend **out) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &index) != 0) {
+		ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", spec);
+		return ERR_INVALID_ARG;
+	}
+	status_code s = backend_create(name, index, out);
+	if (s != OK) {
+		ERROR("failed to initialize device '%s'", spec);
+		return s;
+	}
+	if (!cg_backend_supported(*out))
+		return ERR_UNSUPPORTED;
+	if (!backend_has_cap(*out, BCAP_IS_HOST))
+		backend_host_use(*out);
+	return OK;
+}
+
+static status_code df_arena_reserve(backend *be, cg_arena *a, size_t floats) {
+	if (floats <= a->floats)
+		return OK;
+	cg_arena_free(be, a);
+	NN_TRY(nn_alloc(be, floats, &a->buf));
+	a->floats = floats;
+	return OK;
+}
+
+void cg_arena_free(backend *be, cg_arena *a) {
+	nn_free(be, &a->buf);
+	a->floats = 0;
+}
+
+static status_code df_upload_inputs(const cg_exec *x) {
+	for (int v = 0; v < x->graph->g->n_values; v++) {
+		const cg_value *val = &x->graph->g->values[v];
+		if (val->external != CG_EXT_HOST_INPUT || x->plan->layout.offset[v] == CG_NO_OFFSET)
+			continue;
+		const float *host = x->args->host_in[val->bind];
+		if (!host) {
+			ERROR("%s: input %d not bound", x->plan->label, val->bind);
+			return ERR_INVALID_ARG;
+		}
+		buffer b = df_value_buffer(x, v);
+		NN_TRY(x->be->buffer_write_f32(x->be, &b, host, (int)val->elems));
+	}
+	return OK;
+}
+
+static status_code df_read_outputs(const cg_exec *x) {
+	for (int o = 0; o < x->graph->n_outputs; o++) {
+		const cg_output *out = &x->graph->outputs[o];
+		float			*dst = x->args->host_out[out->bind];
+		if (!dst) {
+			ERROR("%s: output %d not bound", x->plan->label, out->bind);
+			return ERR_INVALID_ARG;
+		}
+		buffer b = df_value_buffer(x, out->value);
+		NN_TRY(x->be->buffer_read_f32(x->be, &b, dst, (int)x->graph->g->values[out->value].elems));
+	}
+	return OK;
+}
+
+static status_code df_run_nodes(const cg_exec *x, int begin, int end) {
+	for (int i = begin; i < end; i++) {
+		const cg_node *n  = &x->graph->g->nodes[i];
+		cg_node_step  *st = &x->plan->steps[i];
+		uint64_t	   t0 = x->plan->profiling ? time_us() : 0;
+		status_code	   s  = st->fn(x, n);
+		if (x->plan->profiling) {
+			st->us += time_us() - t0;
+			st->calls++;
+		}
+		if (s != OK) {
+			ERROR("%s: n%d %s failed (layer %d)", x->plan->label, i, recipe_op_name(n->kind),
+				  x->layer);
+			return s;
+		}
+	}
+	return OK;
+}
+
+static bool df_layer_buffers_bound(const cg_exec_args *args, const cg_graph *c) {
+	for (int v = 0; v < c->n_values; v++)
+		if (c->values[v].external == CG_EXT_LAYER && !args->layer_ext[c->values[v].bind].owner)
+			return false;
+	return true;
+}
+
+status_code cg_graph_run(backend *be, cg_arena *arena, cg_plan *plan, const cg_exec_args *args) {
+	const cg_graph *c = plan->graph->g;
+	if (!df_layer_buffers_bound(args, c)) {
+		ERROR("%s: layer-external buffer not bound", plan->label);
+		return ERR_INVALID_ARG;
+	}
+	NN_TRY(df_arena_reserve(be, arena, plan->layout.arena_floats));
+	cg_exec x = {be, plan->graph, plan, arena, args, 0};
+	NN_TRY(df_upload_inputs(&x));
+	NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_PRE], c->section_begin[CG_SECTION_LAYER]));
+	for (x.layer = 0; x.layer < plan->graph->n_layers; x.layer++)
+		NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_LAYER],
+							c->section_begin[CG_SECTION_POST]));
+	x.layer = 0;
+	NN_TRY(df_run_nodes(&x, c->section_begin[CG_SECTION_POST], c->section_begin[CG_SECTION_COUNT]));
+	return df_read_outputs(&x);
 }

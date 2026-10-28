@@ -39,39 +39,6 @@ void nn_free(backend *be, buffer *b) {
 	memset(b, 0, sizeof(*b));
 }
 
-bool nn_supported(backend *be) {
-	static const struct {
-		const char *name;
-		size_t		off;
-	} ops[] = {
-#define OP(f) {#f, offsetof(backend, f)}
-		OP(buffer_alloc_scratch),
-		OP(buffer_write_f32),
-		OP(buffer_read_f32),
-		OP(matmul_batch),
-		OP(rmsnorm_batch),
-		OP(rmsnorm_per_head_batch),
-		OP(add_batch),
-		OP(ffn_activate_batch),
-		OP(layernorm_modulate),
-		OP(gated_add),
-		OP(add_bias),
-		OP(activate),
-		OP(rope_table),
-		OP(attention_dense),
-		OP(im2col3x3),
-		OP(upsample_shortcut_add),
-#undef OP
-	};
-	bool ok = true;
-	for (size_t i = 0; i < ARRAY_LEN(ops); i++)
-		if (!*(void **)((char *)be + ops[i].off)) {
-			ERROR("backend '%s' does not implement '%s'", be->name, ops[i].name);
-			ok = false;
-		}
-	return ok;
-}
-
 status_code nn_matmul(backend *be, const weight *w, const buffer *x, buffer *y, int n, int k,
 					  int m) {
 	for (int r = 0; r < m; r += ROW_CHUNK) {
