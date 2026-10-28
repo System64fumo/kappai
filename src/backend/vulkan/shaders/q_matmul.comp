@@ -7,9 +7,9 @@
 layout(constant_id = 0) const uint K_BLOCKS = 1u;
 
 #define BM 64u
-#define BN 64u
+layout(constant_id = 1) const uint BN = 64u;
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 256, local_size_x_id = 2) in;
 
 layout(set = 0, binding = 0) readonly buffer W {
 	uint w32[];
@@ -66,7 +66,8 @@ void main() {
 
 	uint  wa, wb, xa, xb;
 	float wd, wm, xd, xs;
-	load_wpart(wbase, pp, wa, wb, wd, wm);
+	if (BN == BM || lr < BM)
+		load_wpart(wbase, pp, wa, wb, wd, wm);
 	xa = xq[xbase + XW_A(pp)];
 	xb = xq[xbase + XW_B(pp)];
 	xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
@@ -75,20 +76,25 @@ void main() {
 	for (uint bi = 0u; bi < kb; bi += K_BLOCKS) {
 		barrier();
 		[[unroll]] for (uint block = 0u; block < K_BLOCKS; block++) {
-			s_w[block * 8u * BM + XW_A(pp) * BM + lr] = wa;
-			s_w[block * 8u * BM + XW_B(pp) * BM + lr] = wb;
+			if (BN == BM || lr < BM) {
+				s_w[block * 8u * BM + XW_A(pp) * BM + lr] = wa;
+				s_w[block * 8u * BM + XW_B(pp) * BM + lr] = wb;
+			}
 			s_x[block * 8u * BN + XW_A(pp) * BN + lr] = xa;
 			s_x[block * 8u * BN + XW_B(pp) * BN + lr] = xb;
 			if (pp == 0u) {
-				s_dw[block * BM + lr] = wd;
-				s_mw[block * BM + lr] = wm;
+				if (BN == BM || lr < BM) {
+					s_dw[block * BM + lr] = wd;
+					s_mw[block * BM + lr] = wm;
+				}
 				s_dx[block * BN + lr] = xd;
 				s_sx[block * BN + lr] = xs;
 			}
 			if (bi + block + 1u < kb) {
 				wbase += BLOCK_U16;
 				xbase += XQ_BLOCK_WORDS;
-				load_wpart(wbase, pp, wa, wb, wd, wm);
+				if (BN == BM || lr < BM)
+					load_wpart(wbase, pp, wa, wb, wd, wm);
 				xa = xq[xbase + XW_A(pp)];
 				xb = xq[xbase + XW_B(pp)];
 				xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);

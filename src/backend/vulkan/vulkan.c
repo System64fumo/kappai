@@ -31,6 +31,7 @@
 #define VK_QMV_ROWS 2
 #define VK_QMV_COLS 4
 #define VK_QMM_TILE 64
+#define VK_QMM_WIDE_TILE 128
 #define VK_XQ_BLOCK_BYTES 48
 #define VK_ATTN_DEC_MAX_M 4
 #define VK_ATTN_DEC_MAX_HEAD_DIM 512
@@ -296,6 +297,7 @@ typedef struct {
 	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_qmv[VQ_COUNT][2];
 	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	vk_pipeline_set p_qmm_wide;
 	buffer			xq_buf[2];
 	struct {
 		const vk_buf *buf;
@@ -941,7 +943,7 @@ static void vk_flush_pending_desc_frees(vk_priv *p) {
 	p->pending_free_count = 0;
 }
 
-#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
+#define VK_QCORE_PIPES (5 + VQ_MM_COUNT + 2 * VQ_COUNT)
 
 static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
 	if (i < 2)
@@ -950,7 +952,9 @@ static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
 		return &p->p_attn_decode;
 	if (i == 3)
 		return &p->p_attn_merge;
-	i -= 4;
+	if (i == 4)
+		return &p->p_qmm_wide;
+	i -= 5;
 	if (i < VQ_MM_COUNT)
 		return &p->p_qmm[i];
 	i -= VQ_MM_COUNT;
@@ -2087,6 +2091,13 @@ static void vk_qcore_init(vk_priv *p) {
 									&p->p_qmm[t]) != OK)
 			return;
 		p->p_qmm[t].name = MM[t].name;
+	}
+	if (p->caps.is_mali && p->caps.subgroup_size == 16 &&
+		p->caps.max_workgroup_invocations >= 512 && p->caps.max_workgroup_size[0] >= 512) {
+		uint32_t spec[] = {qmm_blocks, VK_QMM_WIDE_TILE, 512};
+		if (vk_create_pipeline_spec(p, MM[VQ_Q8_0].spv, MM[VQ_Q8_0].len, 4, 16, spec, sizeof(spec),
+									&p->p_qmm_wide) == OK)
+			p->p_qmm_wide.name = "q_matmul_q8_0_wide";
 	}
 	p->qcore_ok = 1;
 }
@@ -4034,6 +4045,9 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	vk_priv *p		   = self->priv;
 	p->n_ctx_stored	   = desc->n_ctx;
 	p->kv_head_dim_max = desc->head_dim;
+	p->rope_uploaded	 = 0;
+	p->rope_uploaded_alt = 0;
+	p->rope_ff_base		 = NULL;
 
 	int n_kv_layers	   = desc->n_kv_layers > 0 ? desc->n_kv_layers : 1;
 	int has_layer_dims = desc->layer_head_dim && desc->layer_n_kv_heads && n_kv_layers > 0;
@@ -4570,8 +4584,13 @@ static status_code vk_qcore_matmul(vk_priv *p, int t, const buffer *w, const buf
 	vk_pipeline_set *ps;
 	uint32_t		 gx, gy;
 	if (m >= VK_QMM_MIN_M) {
+		int tile_cols = VK_QMM_TILE;
 		ps = &p->p_qmm[t];
-		gx = (uint32_t)((m + VK_QMM_TILE - 1) / VK_QMM_TILE);
+		if (t == VQ_Q8_0 && m >= VK_QMM_WIDE_TILE && p->p_qmm_wide.pipeline) {
+			ps		  = &p->p_qmm_wide;
+			tile_cols = VK_QMM_WIDE_TILE;
+		}
+		gx = (uint32_t)((m + tile_cols - 1) / tile_cols);
 		gy = (uint32_t)((n + VK_QMM_TILE - 1) / VK_QMM_TILE);
 	} else {
 		int c = m == 1 ? 0 : 1;

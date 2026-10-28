@@ -521,6 +521,46 @@ static void test_op_rope(backend *ref, backend *tgt, int n_heads, int head_dim, 
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static void test_rope_new_context(backend *tgt) {
+	const char *label = "rope table reused by a new context";
+	if (!tgt->rope || !tgt->kv_alloc || !tgt->kv_free) {
+		record_result(OPFAM_ROPE, label, V_SKIP, "backend lacks rope or KV allocation");
+		return;
+	}
+	float input[64], expected[64], got[64] = {0};
+	float cosine[64], sine[64];
+	for (int i = 0; i < 64; i++)
+		input[i] = (float)(i + 1);
+	kv_desc desc = {.n_ctx = 2, .n_kv_heads = 1, .head_dim = 64, .n_layers = 1, .n_kv_layers = 1};
+	int		old_neox = tgt->rope_neox;
+	tgt->rope_neox	 = 0;
+	status_code st	 = OK;
+	for (int context = 0; context < 2 && st == OK; context++) {
+		for (int i = 0; i < 64; i++) {
+			cosine[i]	= context == 0 ? 1.0f : 0.0f;
+			sine[i]		= context == 0 ? 0.0f : 1.0f;
+			expected[i] = context == 0 ? input[i] : (i % 2 ? input[i - 1] : -input[i + 1]);
+		}
+		buffer kc = {0}, vc = {0}, vec = {0};
+		st = tgt->kv_alloc(tgt, &desc, &kc, &vc);
+		if (st == OK)
+			st = tgt->buffer_alloc_scratch(tgt, sizeof(input), &vec);
+		if (st == OK)
+			st = tgt->buffer_write_f32(tgt, &vec, input, 64);
+		if (st == OK)
+			st = tgt->rope(tgt, &vec, 1, 64, 1, cosine, sine);
+		if (st == OK)
+			st = tgt->buffer_read_f32(tgt, &vec, got, 64);
+		if (st == OK && memcmp(expected, got, sizeof(expected)))
+			st = ERR_INTERNAL;
+		if (vec.handle)
+			tgt->buffer_free(tgt, &vec);
+		tgt->kv_free(tgt, &kc, &vc);
+	}
+	tgt->rope_neox = old_neox;
+	test_parity_compare_status(OPFAM_ROPE, label, expected, got, 64, st);
+}
+
 static void test_op_rope_ext(backend *ref, backend *tgt, int n_heads, int head_dim, int pos,
 							 int use_freq_factors) {
 	if (!tgt->rope_ext) {
@@ -4642,6 +4682,11 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_batch_matmul_parity(ref, tgt, qt, 17, 32, 16);
 		test_batch_matmul_parity(ref, tgt, qt, 17, 96, 17);
 		test_batch_matmul_parity(ref, tgt, qt, 67, 160, 37);
+		if (qt->type == GGML_TYPE_Q8_0) {
+			test_batch_matmul_parity(ref, tgt, qt, 17, 32, 128);
+			test_batch_matmul_parity(ref, tgt, qt, 67, 96, 129);
+			test_batch_matmul_parity(ref, tgt, qt, 129, 160, 257);
+		}
 	}
 	flush_family(OPFAM_BATCH_PARITY);
 
@@ -4696,6 +4741,7 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rope(ref, tgt, 16, 64, 1);
 	test_op_rope(ref, tgt, 16, 64, 127);
 	test_op_rope(ref, tgt, 32, 128, 50);
+	test_rope_new_context(tgt);
 	flush_family(OPFAM_ROPE);
 
 	test_op_rope_ext(ref, tgt, 8, 64, 0, 0);
