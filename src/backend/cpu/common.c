@@ -2037,6 +2037,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->rmsnorm_batch					 = cpu_rmsnorm_batch;
 	out->add_batch						 = cpu_add_batch;
 	out->ffn_activate_batch				 = cpu_ffn_activate_batch;
+	out->ffn_activate_fused_batch		 = cpu_ffn_activate_fused_batch;
 	out->rope_batch						 = cpu_rope_batch;
 	out->rope_qk_batch					 = cpu_rope_qk_batch;
 	out->attention_full_batch			 = cpu_attention_full_batch;
@@ -2080,6 +2081,30 @@ status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, b
 	cpu_rmsnorm_batch_job job = {
 		.x = cpu_ptr(x), .w = cpu_ptr(w), .y = cpu_ptr(y), .n = n, .eps = eps};
 	cpu_run_batch(p->pool, m, cpu_rmsnorm_batch_chunk, &job);
+	return OK;
+}
+
+static void cpu_ffn_activate_fused_chunk(int begin, int end, int tid, void *ctx) {
+	cpu_ffn_act_batch_job *j = ctx;
+	for (int row = begin; row < end; row++) {
+		const float			 *g = j->g + (size_t)row * 2 * j->n;
+		cpu_ffn_down_act_args a = {
+			.g = g, .u = g + j->n, .o = j->o + (size_t)row * j->n, .activation = j->activation};
+		cpu_ffn_down_act_chunk(0, j->n, tid, &a);
+	}
+}
+
+status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out, int n,
+										 int activation, int m) {
+	if (m == 1) {
+		buffer gate = buffer_slice(fused, 0, (size_t)n * sizeof(float));
+		buffer up	= buffer_slice(fused, (size_t)n * sizeof(float), (size_t)n * sizeof(float));
+		return cpu_ffn_activate_ex(self, &gate, &up, out, n, activation);
+	}
+	cpu_priv			 *p	  = self->priv;
+	cpu_ffn_act_batch_job job = {
+		.g = cpu_ptr(fused), .o = cpu_ptr(out), .n = n, .activation = activation};
+	cpu_run_batch(p->pool, m, cpu_ffn_activate_fused_chunk, &job);
 	return OK;
 }
 

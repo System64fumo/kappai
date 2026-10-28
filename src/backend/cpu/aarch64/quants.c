@@ -5967,6 +5967,67 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 
 #define NR 4
 
+#if defined(__ARM_FEATURE_DOTPROD)
+static inline void q8_transpose_x4(const int8x16_t rows[4], int8x16_t columns[4]) {
+	int32x4_t a = vzip1q_s32(vreinterpretq_s32_s8(rows[0]), vreinterpretq_s32_s8(rows[2]));
+	int32x4_t b = vzip1q_s32(vreinterpretq_s32_s8(rows[1]), vreinterpretq_s32_s8(rows[3]));
+	int32x4_t c = vzip2q_s32(vreinterpretq_s32_s8(rows[0]), vreinterpretq_s32_s8(rows[2]));
+	int32x4_t d = vzip2q_s32(vreinterpretq_s32_s8(rows[1]), vreinterpretq_s32_s8(rows[3]));
+	columns[0]	= vreinterpretq_s8_s32(vzip1q_s32(a, b));
+	columns[1]	= vreinterpretq_s8_s32(vzip2q_s32(a, b));
+	columns[2]	= vreinterpretq_s8_s32(vzip1q_s32(c, d));
+	columns[3]	= vreinterpretq_s8_s32(vzip2q_s32(c, d));
+}
+
+typedef struct {
+	float  scales[4];
+	int8_t values[128];
+} q8_x4_panel;
+
+static const q8_x4_panel *q8_pack_x4(const q8_0_block *xq, size_t stride, int blocks, int rows) {
+	static _Thread_local q8_x4_panel *panels;
+	static _Thread_local size_t		  capacity;
+	size_t							  need = (size_t)(rows / 4) * blocks;
+	if (!panels || capacity < need) {
+		int first = panels == NULL;
+		panels	  = xrealloc(panels, need * sizeof(*panels));
+		capacity  = need;
+		if (first)
+			tlocal_register((void **)&panels);
+	}
+	for (int row = 0; row + 4 <= rows; row += 4) {
+		for (int bi = 0; bi < blocks; bi++) {
+			q8_x4_panel *out = &panels[(size_t)(row / 4) * blocks + bi];
+			int8x16_t	 lo[4], hi[4], packed[8];
+			for (int j = 0; j < 4; j++) {
+				const q8_0_block *in = &xq[(size_t)(row + j) * stride + bi];
+				out->scales[j]		 = f16_to_f32_fast(in->d);
+				lo[j]				 = vld1q_s8(in->qs);
+				hi[j]				 = vld1q_s8(in->qs + 16);
+			}
+			q8_transpose_x4(lo, packed);
+			q8_transpose_x4(hi, packed + 4);
+			for (int j = 0; j < 8; j++)
+				vst1q_s8(out->values + 16 * j, packed[j]);
+		}
+	}
+	return panels;
+}
+
+static inline int32x4_t q8_dot_x4_lanes(int8x16_t lo, int8x16_t hi, const int8x16_t x[8]) {
+	int32x4_t sum = vdupq_n_s32(0);
+	sum			  = vdotq_laneq_s32(sum, x[0], lo, 0);
+	sum			  = vdotq_laneq_s32(sum, x[1], lo, 1);
+	sum			  = vdotq_laneq_s32(sum, x[2], lo, 2);
+	sum			  = vdotq_laneq_s32(sum, x[3], lo, 3);
+	sum			  = vdotq_laneq_s32(sum, x[4], hi, 0);
+	sum			  = vdotq_laneq_s32(sum, x[5], hi, 1);
+	sum			  = vdotq_laneq_s32(sum, x[6], hi, 2);
+	sum			  = vdotq_laneq_s32(sum, x[7], hi, 3);
+	return sum;
+}
+#endif
+
 void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 									   size_t	   xq_row_stride_blocks, float *restrict y,
 									   int y_row_stride, int n, int k, int m) {
@@ -5987,7 +6048,11 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 	const int	   blocks_per_row = k / 32;
 	const size_t   row_stride	  = (size_t)blocks_per_row * sizeof(q8_0_block);
 	const uint8_t *Wb			  = w;
-	int			   i			  = 0;
+#if defined(__ARM_FEATURE_DOTPROD)
+	const q8_x4_panel *panels =
+		n >= MR && m >= NR ? q8_pack_x4(xq, xq_row_stride_blocks, blocks_per_row, m) : NULL;
+#endif
+	int i = 0;
 
 	for (; i + MR <= n; i += MR) {
 		const uint8_t *group = Wb + ((size_t)i * row_stride);
@@ -5998,24 +6063,33 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 			for (int r = 0; r < MR; r++)
 				acc_row[r] = vdupq_n_f32(0.0f);
 
+#if !defined(__ARM_FEATURE_DOTPROD)
 			const q8_0_block *xrow[NR];
 			for (int c = 0; c < NR; c++)
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
+#endif
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				const uint8_t *blk = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
 
 				PREFETCH(blk + Q8_0_REPACKED_GROUP_BYTES);
 
+#if defined(__ARM_FEATURE_DOTPROD)
+				const q8_x4_panel *panel  = &panels[(size_t)(t / 4) * blocks_per_row + bi];
+				const float32x4_t  xd_vec = vld1q_f32(panel->scales);
+				int8x16_t		   packed[8];
+				for (int j = 0; j < 8; j++)
+					packed[j] = vld1q_s8(panel->values + 16 * j);
+#else
 				float	  xd[NR];
-				int8x16_t xq_lo[NR];
-				int8x16_t xq_hi[NR];
+				int8x16_t xq_lo[NR], xq_hi[NR];
 				for (int c = 0; c < NR; c++) {
 					xd[c]	 = f16_to_f32_fast(xrow[c][bi].d);
 					xq_lo[c] = vld1q_s8(xrow[c][bi].qs);
 					xq_hi[c] = vld1q_s8(xrow[c][bi].qs + 16);
 				}
 				const float32x4_t xd_vec = vld1q_f32(xd);
+#endif
 
 				const uint16_t *d_ptr = (const uint16_t *)blk;
 				const int8_t   *qs_ptr =
@@ -6026,7 +6100,11 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 					const int8x16_t lo	= vld1q_s8(qs_ptr + (size_t)r * 32);
 					const int8x16_t hi	= vld1q_s8(qs_ptr + (size_t)r * 32 + 16);
 
-					const int32x4_t	  sumi4	 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
+#if defined(__ARM_FEATURE_DOTPROD)
+					const int32x4_t sumi4 = q8_dot_x4_lanes(lo, hi, packed);
+#else
+					const int32x4_t sumi4 = q4_dot_x4_sumi4(lo, hi, xq_lo, xq_hi);
+#endif
 					const float32x4_t sumi_f = vcvtq_f32_s32(sumi4);
 					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, vmulq_n_f32(sumi_f, d_w));
 				}

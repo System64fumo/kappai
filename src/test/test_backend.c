@@ -3561,6 +3561,55 @@ static void rs_free(backend *b, buffer **bufs, int n) {
 		b->buffer_free(b, bufs[i]);
 }
 
+static void test_ffn_activate_fused_batch(backend *tgt, int n, int m, int activation) {
+	char label[128];
+	snprintf(label, sizeof(label), "ffn_activate_fused_batch %s N=%d M=%d",
+			 activation == 1 ? "GELU" : "SiLU", n, m);
+	if (!tgt->ffn_activate_fused_batch || !tgt->ffn_activate_ex) {
+		record_result(OPFAM_FFN_ACTIVATE_EX, label, V_SKIP, "backend lacks fused activation");
+		return;
+	}
+	int	   total	= n * m;
+	float *x		= xmalloc((size_t)(2 * total + 3) * sizeof(float));
+	float *expected = xmalloc((size_t)(total + 4) * sizeof(float));
+	float *got		= xmalloc((size_t)(total + 4) * sizeof(float));
+	seed_test_rng(0xF05EDULL + (uint64_t)n * 17 + (uint64_t)m + (uint64_t)activation);
+	fill_random_f32(x, 2 * total + 3, 4.0f);
+	for (int i = 0; i < total + 4; i++)
+		expected[i] = 1234.5f;
+	buffer		input	  = rs_scratch(tgt, x, 2 * total + 3);
+	buffer		reference = rs_scratch(tgt, expected, total + 4);
+	buffer		output	  = rs_scratch(tgt, expected, total + 4);
+	status_code st		  = OK;
+	for (int row = 0; row < m && st == OK; row++) {
+		buffer g = buffer_slice(&input, (size_t)(3 + 2 * row * n) * sizeof(float),
+								(size_t)n * sizeof(float));
+		buffer u = buffer_slice(&g, (size_t)n * sizeof(float), (size_t)n * sizeof(float));
+		buffer o = buffer_slice(&reference, (size_t)(2 + row * n) * sizeof(float),
+								(size_t)n * sizeof(float));
+		st		 = tgt->ffn_activate_ex(tgt, &g, &u, &o, n, activation);
+	}
+	rs_read(tgt, &reference, expected, total + 4);
+	buffer fused = buffer_slice(&input, 3 * sizeof(float), (size_t)2 * total * sizeof(float));
+	buffer out	 = buffer_slice(&output, 2 * sizeof(float), (size_t)total * sizeof(float));
+	if (st == OK)
+		st = tgt->ffn_activate_fused_batch(tgt, &fused, &out, n, activation, m);
+	rs_read(tgt, &output, got, total + 4);
+	char	detail[256];
+	verdict v = classify_output("loose", expected + 2, got + 2, total, st, detail, sizeof(detail));
+	if (memcmp(expected, got, 2 * sizeof(float)) ||
+		memcmp(expected + total + 2, got + total + 2, 2 * sizeof(float))) {
+		v = V_FAIL;
+		snprintf(detail, sizeof(detail), "output guards overwritten");
+	}
+	record_result(OPFAM_FFN_ACTIVATE_EX, label, v, detail);
+	buffer *all[] = {&input, &reference, &output};
+	rs_free(tgt, all, 3);
+	free(x);
+	free(expected);
+	free(got);
+}
+
 static void rs_skip(const char *label, const char *why) {
 	record_result(RS_FAM, label, V_SKIP, why);
 }
@@ -4548,6 +4597,13 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_ffn_activate_ex(ref, tgt, 4096, 0);
 	test_op_ffn_activate_ex(ref, tgt, 6144, 1);
 	test_op_ffn_activate_ex(ref, tgt, 12288, 1);
+	for (int act = 0; act < 2; act++) {
+		test_ffn_activate_fused_batch(tgt, 31, 1, act);
+		test_ffn_activate_fused_batch(tgt, 12289, 1, act);
+		test_ffn_activate_fused_batch(tgt, 67, 5, act);
+		test_ffn_activate_fused_batch(tgt, 4608, 128, act);
+		test_ffn_activate_fused_batch(tgt, 12289, 3, act);
+	}
 	flush_family(OPFAM_FFN_ACTIVATE_EX);
 
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 0, 0);
@@ -4695,6 +4751,11 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 12288, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 70);
 	}
+	const qtype_info *q8_repacked = rs_qtype(GGML_TYPE_Q8_0_REPACKED);
+	int q8_shapes[][3] = {{8, 32, 4}, {24, 96, 5}, {16, 256, 7}, {24, 96, 9}, {16, 256, 128}};
+	for (int i = 0; i < (int)(sizeof(q8_shapes) / sizeof(q8_shapes[0])); i++)
+		test_batch_matmul_parity(ref, tgt, q8_repacked, q8_shapes[i][0], q8_shapes[i][1],
+								 q8_shapes[i][2]);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);
 	test_batch_rope_parity(ref, tgt, 16, 128, 200, 5);

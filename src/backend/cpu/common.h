@@ -630,6 +630,8 @@ status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up
 							 int n);
 status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								int n, int activation);
+status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out, int n,
+										 int activation, int m);
 status_code cpu_rmsnorm_per_head(backend *self, const buffer *x, const buffer *w, buffer *y,
 								 int n_heads, int head_dim, float eps);
 status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
