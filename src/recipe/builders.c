@@ -381,6 +381,29 @@ void recipe_emit_dense_ffn(op_emitter *e, const model *m, int li, uint8_t norm_w
 	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
 }
 
+void recipe_emit_qk_norm_attention(op_emitter *e, const model *m, int li) {
+	int dim	   = m->dim;
+	int q_out  = m->n_heads * m->head_dim;
+	int kv_out = m->n_kv_heads * m->head_dim;
+	int neox   = m->arch_info->uses_neox_rope;
+
+	OP_EMIT(e,
+			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
+
+	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
+	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, m->n_kv_heads));
+	OP_EMIT(e, mk_rope(RECIPE_SLOT_Q, m->n_heads, m->head_dim, neox));
+	OP_EMIT(e, mk_rope(RECIPE_SLOT_K, m->n_kv_heads, m->head_dim, neox));
+	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
+	OP_EMIT(e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, m->n_kv_heads,
+										  m->head_dim, m->n_ctx, m->sliding_window));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL));
+	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
+}
+
 void recipe_emit_moe_ffn(op_emitter *e, const struct model *m, uint8_t router_in_slot,
 						 uint8_t experts_in_slot, uint8_t out_slot) {
 	int dim		  = m->dim;

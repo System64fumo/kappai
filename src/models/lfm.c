@@ -18,36 +18,13 @@ static void lfm_append_conv_block(op_emitter *e, const model *m, int li) {
 	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
 }
 
-static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
-	int dim	   = m->dim;
-	int q_out  = m->n_heads * m->head_dim;
-	int kv_out = m->n_kv_heads * m->head_dim;
-	int neox   = m->arch_info->uses_neox_rope;
-
-	OP_EMIT(e,
-			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
-
-	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
-	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, m->n_kv_heads));
-	OP_EMIT(e, mk_rope(RECIPE_SLOT_Q, m->n_heads, m->head_dim, neox));
-	OP_EMIT(e, mk_rope(RECIPE_SLOT_K, m->n_kv_heads, m->head_dim, neox));
-	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
-	OP_EMIT(e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, m->n_kv_heads,
-										  m->head_dim, m->n_ctx, m->sliding_window));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL));
-	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
-}
-
 enum { LFM_MAX_OPS_PER_LAYER = 24 };
 
 static void lfm_append_layer(op_emitter *e, const model *m, int li) {
 	if (model_layer_is_recurrent(m, li))
 		lfm_append_conv_block(e, m, li);
 	else
-		lfm_append_attention_block(e, m, li);
+		recipe_emit_qk_norm_attention(e, m, li);
 }
 
 static model_recipe *build_lfm2_recipe(const model *m) {

@@ -145,6 +145,12 @@ static inline uint32_t wtype_to_q8type(uint32_t w_type) {
 
 status_code gguf_load(gguf_ctx *ctx, const char *path);
 
+void gguf_ctx_build_index(gguf_ctx *ctx);
+
+bool		safetensors_detect(const void *data, size_t fsize);
+status_code safetensors_parse(gguf_ctx *ctx, void *data, size_t fsize, int fd, void *map_ptr,
+							  int header_only);
+
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
 
 ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);

@@ -349,6 +349,10 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 int n_tokens, int pos_start, int flash_attn,
 										 float *logits_out);
 
+status_code compute_hidden_states_recipe(struct model *m, struct kvcache *cache,
+										 struct compute_scratch *s, const int32_t *tokens,
+										 int n_tokens, int flash_attn, float *hidden_out);
+
 int recipe_is_decode_batchable(const struct model *m);
 
 status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
@@ -407,6 +411,7 @@ recipe_op mk_partial_rope_qk(uint8_t q, uint8_t k);
 void	  recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_fused,
 									 int has_matmul_multi, int activation);
 void	  recipe_emit_dense_ffn(op_emitter *e, const struct model *m, int li, uint8_t norm_widx);
+void	  recipe_emit_qk_norm_attention(op_emitter *e, const struct model *m, int li);
 void	  recipe_emit_moe_ffn(op_emitter *e, const struct model *m, uint8_t router_in_slot,
 							  uint8_t experts_in_slot, uint8_t out_slot);
 

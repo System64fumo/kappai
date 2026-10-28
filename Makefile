@@ -160,6 +160,7 @@ LIB_SRCS := \
 	$(wildcard $(SRC_DIR)/recipe/*.c) \
 	$(wildcard $(SRC_DIR)/models/*.c) \
 	$(wildcard $(SRC_DIR)/moe/*.c) \
+	$(wildcard $(SRC_DIR)/diffusion/*.c) \
 	$(SRC_DIR)/backend/backend.c
 
 BACKEND_DIR     := $(OUT_DIR)/backends
@@ -222,6 +223,7 @@ TEST_SRCS   := $(wildcard $(SRC_DIR)/test/*.c)
 SERVER_SRCS := $(wildcard $(SRC_DIR)/server/*.c)
 SERVER_LIBS := $(JSON_LIBS) $(HTTP_LIBS)
 CLI_SRCS    := $(wildcard $(SRC_DIR)/cli/*.c)
+DIFFUSION_SRCS := $(wildcard $(SRC_DIR)/diffusion/cli/*.c)
 TUI_SRCS    := $(wildcard $(SRC_DIR)/tui/*.c)
 TUI_LIBS    := $(CURSES_LIBS) $(HTTP_LIBS)
 HEADERS     = $(shell find $(SRC_DIR) -type f \( -name "*.h" -o -name "*.hpp" \))
@@ -234,6 +236,7 @@ TEST_OBJS    := $(patsubst $(SRC_DIR)/test/%.c,$(TEST_OBJ_DIR)/%.o,$(TEST_SRCS))
 TEST_OBJS    += $(OBJ_DIR)/server/task.o
 SERVER_OBJS  := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SERVER_SRCS))
 CLI_OBJS     := $(patsubst $(SRC_DIR)/cli/%.c,$(OBJ_DIR)/cli/%.o,$(CLI_SRCS))
+DIFFUSION_OBJS := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(DIFFUSION_SRCS))
 TUI_OBJS     := $(patsubst $(SRC_DIR)/tui/%.c,$(OBJ_DIR)/tui/%.o,$(TUI_SRCS)) $(OBJ_DIR)/server/openai.o $(OBJ_DIR)/server/task.o
 
 $(SERVER_OBJS): CFLAGS += $(HTTP_CFLAGS)
@@ -253,17 +256,18 @@ $(TASK_MODE_FILE): force-task-backend
 
 ENGINE      := $(OUT_DIR)/libkappai$(SHLIB_SUFFIX)
 CLI_BIN     := $(OUT_DIR)/kappai-cli
+DIFFUSION_BIN := $(OUT_DIR)/kappai-diffusion
 SERVER_BIN  := $(OUT_DIR)/kappai-server
 TEST_BIN    := $(OUT_DIR)/kappai-test
 MONITOR_BIN := $(OUT_DIR)/kappai-monitor
 TUI_BIN     := $(OUT_DIR)/kappai
 
-SHIPPED_BINS := $(CLI_BIN) $(SERVER_BIN) $(TEST_BIN) $(TUI_BIN) $(ENGINE) $(BACKEND_LIBS)
+SHIPPED_BINS := $(CLI_BIN) $(DIFFUSION_BIN) $(SERVER_BIN) $(TEST_BIN) $(TUI_BIN) $(ENGINE) $(BACKEND_LIBS)
 
 ENGINE_LDFLAGS := -L$(OUT_DIR) -lkappai -Wl,-rpath,'$(RPATH_ORIGIN)' $(LDFLAGS)
 BACKEND_LINK_FLAGS = $(SHLIB_LDFLAGS) -L$(OUT_DIR) -lkappai -Wl,-rpath,'$(RPATH_ORIGIN)/..' $(LDFLAGS) $(LTO_FLAGS)
 
-BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS) $(TUI_OBJS)))
+BUILD_DIRS := $(BACKEND_DIR) $(sort $(dir $(LIB_OBJS) $(TEST_OBJS) $(SERVER_OBJS) $(CLI_OBJS) $(DIFFUSION_OBJS) $(TUI_OBJS)))
 
 FORMAT_FLAGS := -i -style=file
 TIDY_LOG     := $(OUT_DIR)/tidy.log
@@ -425,7 +429,7 @@ ifneq ($(HAS_OPENGL),)
 	@printf '#endif\n' >> $@
 endif
 
-.PHONY: all cli kappai kappai-test server monitor clean print-config format tidy backends-help config
+.PHONY: all cli kappai-diffusion kappai kappai-test server monitor clean print-config format tidy backends-help config
 
 all: $(BACKEND_LIBS) cli kappai kappai-test server
 
@@ -462,6 +466,12 @@ cli: $(CLI_BIN)
 $(CLI_BIN): $(CLI_OBJS) | $(ENGINE) $(BACKEND_LIBS)
 	@echo "  LD      $@"
 	@$(CC) $(CFLAGS) $(CLI_OBJS) $(ENGINE_LDFLAGS) $(JSON_LIBS) -o $@
+	$(SPLIT_DEBUG)
+
+kappai-diffusion: $(DIFFUSION_BIN)
+$(DIFFUSION_BIN): $(DIFFUSION_OBJS) | $(ENGINE) $(BACKEND_LIBS)
+	@echo "  LD      $@"
+	@$(CC) $(CFLAGS) $(DIFFUSION_OBJS) $(ENGINE_LDFLAGS) $(JSON_LIBS) -o $@
 	$(SPLIT_DEBUG)
 
 server: $(SERVER_BIN)
@@ -576,4 +586,4 @@ tidy: | $(OUT_DIR)
 		'
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
--include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(sort $(BACKEND_OBJS:.o=.d)) $(MONITOR_BIN).d
+-include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(DIFFUSION_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(sort $(BACKEND_OBJS:.o=.d)) $(MONITOR_BIN).d

@@ -628,7 +628,7 @@ static status_code part_run(model *m, compute_scratch *s, const row_desc *rows,
 
 static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 										struct compute_scratch *s, const int32_t *tokens,
-										int flash_attn, float *logits_out) {
+										int flash_attn, float *logits_out, float *hidden_out) {
 	struct kvcache *cache	  = rows->cache;
 	const int		n_tokens  = rows->n_rows;
 	const int		pos_start = rows->pos_start;
@@ -668,6 +668,12 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 	st = part_run(m, s, rows, tokens, flash_attn);
 	if (st != OK)
 		goto done;
+	if (hidden_out) {
+		ensure_sync(a);
+		buffer *x = batch_slot(bs, RECIPE_SLOT_X);
+		st		  = x->owner->buffer_read_f32(x->owner, x, hidden_out, n_tokens * dim);
+		goto done;
+	}
 	st = batch_run_post_ops(m, cache, s, bs, n_out, flash_attn, logits_out);
 
 done:
@@ -690,7 +696,7 @@ status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache 
 					 .cache		   = caches[0],
 					 .caches	   = caches,
 					 .needs_logits = needs_logits};
-	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out);
+	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out, NULL);
 }
 
 status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
@@ -709,5 +715,12 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 	last_only[n_tokens - 1] = 1;
 	row_desc rows			= {
 		.n_rows = n_tokens, .pos_start = pos_start, .cache = cache, .needs_logits = last_only};
-	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out);
+	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out, NULL);
+}
+
+status_code compute_hidden_states_recipe(struct model *m, struct kvcache *cache,
+										 struct compute_scratch *s, const int32_t *tokens,
+										 int n_tokens, int flash_attn, float *hidden_out) {
+	row_desc rows = {.n_rows = n_tokens, .pos_start = 0, .cache = cache};
+	return compute_forward_rows(m, &rows, s, tokens, flash_attn, NULL, hidden_out);
 }

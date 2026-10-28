@@ -80,6 +80,14 @@ static const arch_info k_registry[] = {
 		.is_hybrid_recurrent = true,
 		.hybrid_shortconv	 = true,
 	},
+	{
+		.arch				= ARCH_QWEN3VL,
+		.gguf_name			= "qwen3vl",
+		.key_prefix			= "qwen3vl",
+		.default_rope_theta = 5000000.0f,
+		.has_qk_norm		= true,
+		.uses_neox_rope		= true,
+	},
 };
 
 const arch_info *arch_lookup(model_arch a) {

@@ -1300,7 +1300,7 @@ status_code tokenizer_init(tokenizer *t, const gguf_ctx *g) {
 	if (pre_status == OK && pre_str) {
 		if (strstr(pre_str, "llama3") || strstr(pre_str, "llama-bpe")) {
 			t->pre_type = TOK_PRE_LLAMA3;
-		} else if (strstr(pre_str, "qwen35")) {
+		} else if (strstr(pre_str, "qwen")) {
 			t->pre_type = TOK_PRE_QWEN35;
 		}
 	} else if (!t->is_sentencepiece && model_name && (strstr(model_name, "gpt2") == NULL)) {

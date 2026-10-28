@@ -22,6 +22,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 - OpenAI-compatible server
 - Tool calling
 - Decision models
+- Diffusion models
 
 ## Support matrix
 
@@ -41,6 +42,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `qwen35`     | Qwen 3.5, Qwen 3.6, Qwen 3.8 |
 | `glm-dsa`    | GLM 5.2, GLM 5.3             |
 | `glm5-next`  | GLM 5.3 Flash                |
+| `qwen-image` | Qwen Image 2.1               |
 
 | Backend       | State                                            |
 |---------------|--------------------------------------------------|
