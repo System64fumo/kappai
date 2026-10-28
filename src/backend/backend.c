@@ -355,7 +355,7 @@ static void log_op_homes(backend *b) {
 			int	   is_native = b->matmul_type_native((backend *)b, types[i].t);
 			char  *dst		 = is_native ? native : nonnative;
 			size_t len		 = strlen(dst);
-			snprintf(dst + len, is_native ? sizeof(native) : sizeof(nonnative), "%s%s",
+			snprintf(dst + len, (is_native ? sizeof(native) : sizeof(nonnative)) - len, "%s%s",
 					 len ? ", " : "", types[i].n);
 		}
 		DEBUG("backend '%s': matmul native types: %s", b->name, native[0] ? native : "(none)");

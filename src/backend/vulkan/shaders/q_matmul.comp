@@ -1,7 +1,10 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_integer_dot_product : require
+
+layout(constant_id = 0) const uint K_BLOCKS = 1u;
 
 #define BM 64u
 #define BN 64u
@@ -9,7 +12,7 @@
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer W {
-	uint16_t w16[];
+	uint w32[];
 };
 layout(set = 0, binding = 1) readonly buffer XQ {
 	uint xq[];
@@ -29,15 +32,15 @@ layout(push_constant) uniform Params {
 }
 pc;
 
-#define W16 w16
+#define W32 w32
 #include "qblock.glsl"
 
-shared uint	 s_w[8u * BM];
-shared float s_dw[BM];
-shared float s_mw[BM];
-shared uint	 s_x[8u * BN];
-shared float s_dx[BN];
-shared float s_sx[BN];
+shared uint	 s_w[K_BLOCKS * 8u * BM];
+shared float s_dw[K_BLOCKS * BM];
+shared float s_mw[K_BLOCKS * BM];
+shared uint	 s_x[K_BLOCKS * 8u * BN];
+shared float s_dx[K_BLOCKS * BN];
+shared float s_sx[K_BLOCKS * BN];
 
 void main() {
 	qblock_init();
@@ -69,51 +72,56 @@ void main() {
 	xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
 	xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
 
-	for (uint bi = 0u; bi < kb; bi++) {
+	for (uint bi = 0u; bi < kb; bi += K_BLOCKS) {
 		barrier();
-		s_w[XW_A(pp) * BM + lr] = wa;
-		s_w[XW_B(pp) * BM + lr] = wb;
-		s_x[XW_A(pp) * BN + lr] = xa;
-		s_x[XW_B(pp) * BN + lr] = xb;
-		if (pp == 0u) {
-			s_dw[lr] = wd;
-			s_mw[lr] = wm;
-			s_dx[lr] = xd;
-			s_sx[lr] = xs;
+		[[unroll]] for (uint block = 0u; block < K_BLOCKS; block++) {
+			s_w[block * 8u * BM + XW_A(pp) * BM + lr] = wa;
+			s_w[block * 8u * BM + XW_B(pp) * BM + lr] = wb;
+			s_x[block * 8u * BN + XW_A(pp) * BN + lr] = xa;
+			s_x[block * 8u * BN + XW_B(pp) * BN + lr] = xb;
+			if (pp == 0u) {
+				s_dw[block * BM + lr] = wd;
+				s_mw[block * BM + lr] = wm;
+				s_dx[block * BN + lr] = xd;
+				s_sx[block * BN + lr] = xs;
+			}
+			if (bi + block + 1u < kb) {
+				wbase += BLOCK_U16;
+				xbase += XQ_BLOCK_WORDS;
+				load_wpart(wbase, pp, wa, wb, wd, wm);
+				xa = xq[xbase + XW_A(pp)];
+				xb = xq[xbase + XW_B(pp)];
+				xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
+				xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
+			}
 		}
 		barrier();
-
-		if (bi + 1u < kb) {
-			wbase += BLOCK_U16;
-			xbase += XQ_BLOCK_WORDS;
-			load_wpart(wbase, pp, wa, wb, wd, wm);
-			xa = xq[xbase + XW_A(pp)];
-			xb = xq[xbase + XW_B(pp)];
-			xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
-			xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
-		}
-
-		int sumi[16];
-		for (uint i = 0u; i < 16u; i++)
-			sumi[i] = 0;
-		for (uint wd8 = 0u; wd8 < 8u; wd8++) {
-			uint  ab = wd8 * BM + tr * 4u;
-			uint  bb = wd8 * BN + tc * 4u;
-			uvec4 a	 = uvec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
-			uvec4 b	 = uvec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
-			for (uint i = 0u; i < 4u; i++)
-				for (uint j = 0u; j < 4u; j++)
-					sumi[i * 4u + j] += dotPacked4x8EXT(int(a[i]), int(b[j]));
-		}
-		for (uint i = 0u; i < 4u; i++) {
-			float dwi = s_dw[tr * 4u + i];
-			float mwi = s_mw[tr * 4u + i];
-			for (uint j = 0u; j < 4u; j++) {
-				float a = acc[i * 4u + j];
+		[[unroll]] for (uint block = 0u; block < K_BLOCKS; block++) {
+			if (bi + block >= kb)
+				break;
+			int sumi[16];
+			for (uint i = 0u; i < 16u; i++)
+				sumi[i] = 0;
+			for (uint wd8 = 0u; wd8 < 8u; wd8++) {
+				uint  ab = (block * 8u + wd8) * BM + tr * 4u;
+				uint  bb = (block * 8u + wd8) * BN + tc * 4u;
+				uvec4 a	 = uvec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
+				uvec4 b	 = uvec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
+				for (uint i = 0u; i < 4u; i++)
+					for (uint j = 0u; j < 4u; j++)
+						sumi[i * 4u + j] += dotPacked4x8EXT(int(a[i]), int(b[j]));
+			}
+			for (uint i = 0u; i < 4u; i++) {
+				float dwi = s_dw[block * BM + tr * 4u + i];
+				float mwi = s_mw[block * BM + tr * 4u + i];
+				for (uint j = 0u; j < 4u; j++) {
+					float a = acc[i * 4u + j];
 #ifdef HAS_MIN
-				a = mwi * s_sx[tc * 4u + j] + a;
+					a = mwi * s_sx[block * BN + tc * 4u + j] + a;
 #endif
-				acc[i * 4u + j] = fma(dwi * s_dx[tc * 4u + j], float(sumi[i * 4u + j]), a);
+					acc[i * 4u + j] =
+						fma(dwi * s_dx[block * BN + tc * 4u + j], float(sumi[i * 4u + j]), a);
+				}
 			}
 		}
 	}

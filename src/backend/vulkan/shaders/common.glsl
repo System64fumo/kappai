@@ -103,24 +103,20 @@ float div_exact(float a, float b) {
 	uint Nn	 = (nb & 0x7FFFFFu) | 0x800000u;
 	uint Dd	 = (db & 0x7FFFFFu) | 0x800000u;
 	int	 eq	 = int((nb >> 23u) & 0xFFu) - int((db >> 23u) & 0xFFu);
-	uint M24 = 0u;
-	uint rem;
-	int	 me;
-	if (Nn >= Dd) {
-		me	= eq;
-		rem = Nn - Dd;
-	} else {
-		me	= eq - 1;
-		rem = (Nn << 1u) - Dd;
+	uint numerator = Nn >= Dd ? Nn : Nn << 1u;
+	int	 me		   = Nn >= Dd ? eq : eq - 1;
+	uint quotient  = uint((float(numerator) / float(Dd)) * 8388608.0);
+	int	 remainder = int((numerator << 23u) - quotient * Dd);
+	while (remainder < 0) {
+		quotient--;
+		remainder += int(Dd);
 	}
-	for (int i = 0; i < 23; i++) {
-		rem <<= 1u;
-		M24 <<= 1u;
-		if (rem >= Dd) {
-			rem -= Dd;
-			M24 |= 1u;
-		}
+	while (uint(remainder) >= Dd) {
+		quotient++;
+		remainder -= int(Dd);
 	}
+	uint M24 = quotient - 0x800000u;
+	uint rem = uint(remainder);
 	uint r2 = rem << 1u;
 	if (r2 > Dd || (r2 == Dd && (M24 & 1u) == 1u))
 		M24++;

@@ -5,7 +5,10 @@
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 256, local_size_x_id = 0) in;
+#if defined(PER_HEAD) && defined(USE_SUBGROUP)
+layout(constant_id = 1) const bool PACK_HEADS = false;
+#endif
 
 layout(set = 0, binding = 0) readonly buffer XBuf {
 	float x[];
@@ -90,6 +93,10 @@ shared float partial[256];
 #endif
 
 float block_sum(float sum) {
+#if defined(PER_HEAD) && defined(USE_SUBGROUP)
+	if (PACK_HEADS)
+		return subgroupAdd(sum);
+#endif
 	uint tid = gl_LocalInvocationID.x;
 	barrier();
 #ifdef USE_SUBGROUP
@@ -114,7 +121,7 @@ float block_sum(float sum) {
 #else
 	partial[tid] = sum;
 	barrier();
-	for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+	for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
 		if (tid < stride)
 			partial[tid] += partial[tid + stride];
 		barrier();
@@ -126,9 +133,20 @@ float block_sum(float sum) {
 
 void main() {
 	uint tid = gl_LocalInvocationID.x;
+	uint step = gl_WorkGroupSize.x;
+#if defined(PER_HEAD) && defined(USE_SUBGROUP)
+	if (PACK_HEADS) {
+		tid	 = gl_SubgroupInvocationID;
+		step = gl_SubgroupSize;
+	}
+#endif
 
 #ifdef PER_HEAD
 	int h = int(gl_WorkGroupID.x);
+#ifdef USE_SUBGROUP
+	if (PACK_HEADS)
+		h = int(gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID);
+#endif
 	if (h >= params.n_heads)
 		return;
 	int head_dim = params.head_dim;
@@ -151,7 +169,7 @@ void main() {
 #endif
 
 	float sum = 0.0;
-	for (int i = int(tid); i < n; i += 256) {
+	for (int i = int(tid); i < n; i += int(step)) {
 		float v = x[x_off + uint(i)];
 		sum += v * v;
 	}
@@ -163,7 +181,7 @@ void main() {
 #ifdef NORM2
 	float sum2 = 0.0;
 #endif
-	for (int i = int(tid); i < n; i += 256) {
+	for (int i = int(tid); i < n; i += int(step)) {
 		float xv = x[x_off + uint(i)];
 		float result;
 #ifdef HAS_WEIGHT
@@ -188,7 +206,7 @@ void main() {
 	sum2 = block_sum(sum2);
 	float scale2 =
 		(sum2 > 0.0 || params.eps > 0.0) ? inversesqrt(sum2 / float(n) + params.eps) : 0.0;
-	for (int i = int(tid); i < n; i += 256) {
+	for (int i = int(tid); i < n; i += int(step)) {
 		float r2			= s_y[i] * scale2 * w2[i];
 		y2[y_off + uint(i)] = r2;
 		s_y[i]				= r2;

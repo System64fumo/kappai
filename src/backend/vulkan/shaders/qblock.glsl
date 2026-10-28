@@ -61,11 +61,12 @@ uint spread4(uint h) {
 }
 
 uint wq16(uint i) {
-	return uint(W16[i]);
+	return (W32[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu;
 }
 
 uint wq32(uint i) {
-	return wq16(i) | (wq16(i + 1u) << 16u);
+	uint word = W32[i >> 1u];
+	return (i & 1u) == 0u ? word : (word >> 16u) | (W32[(i >> 1u) + 1u] << 16u);
 }
 
 void load_wpart(uint b, uint p, out uint wa, out uint wb, out float d, out float mn) {

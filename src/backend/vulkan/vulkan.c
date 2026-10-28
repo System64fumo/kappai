@@ -109,6 +109,8 @@ typedef struct {
 	VkBuffer				  buf;
 	VkDeviceMemory			  mem;
 	size_t					  size;
+	VkDeviceSize			  alloc_size;
+	VkMemoryPropertyFlags	  memory_flags;
 	void					 *mapped;
 	struct vk_suballoc_block *sub_block;
 	VkDeviceSize			  sub_off;
@@ -192,6 +194,7 @@ typedef struct {
 		uint32_t	 max_workgroup_invocations;
 		VkDeviceSize storage_buffer_offset_alignment;
 		VkDeviceSize max_storage_buffer_range;
+		VkDeviceSize non_coherent_atom_size;
 		uint32_t	 subgroup_size;
 		int			 unified_memory;
 		int			 is_mali;
@@ -289,6 +292,7 @@ typedef struct {
 	vk_pipeline_set p_matmul_iq4_nl_batch;
 
 	int				qcore_ok;
+	uint32_t		norm_heads_per_wg;
 	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_qmv[VQ_COUNT][2];
 	vk_pipeline_set p_qmm[VQ_MM_COUNT];
@@ -328,12 +332,12 @@ typedef struct {
 	buffer rope_cos_buf;
 	buffer rope_sin_buf;
 	buffer rope_ff_buf;
-	int	   rope_buf_cap;
+	int	   rope_uploaded;
 	int	   rope_ff_cap;
 
 	buffer		 rope_cos_buf_alt;
 	buffer		 rope_sin_buf_alt;
-	int			 rope_buf_cap_alt;
+	int			 rope_uploaded_alt;
 	int			 rope_half_stored_alt;
 	const float *rope_cos_base_alt;
 	const float *rope_sin_base_alt;
@@ -814,6 +818,8 @@ static status_code vk_alloc_buffer(vk_priv *p, size_t size, VkBufferUsageFlags u
 	vkGetBufferMemoryRequirements(p->dev, out->buf, &req);
 
 	out->mapped	   = NULL;
+	out->alloc_size	  = req.size;
+	out->memory_flags = 0;
 	out->sub_block = NULL;
 	out->sub_off   = 0;
 	out->sub_size  = 0;
@@ -845,6 +851,7 @@ static status_code vk_alloc_buffer(vk_priv *p, size_t size, VkBufferUsageFlags u
 	out->size = size;
 
 	VkMemoryPropertyFlags actual_flags = p->mem_props.memoryTypes[mt].propertyFlags;
+	out->memory_flags				   = actual_flags;
 	if (actual_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
 		p->device_local_allocated += req.size;
 	if (actual_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -852,6 +859,26 @@ static status_code vk_alloc_buffer(vk_priv *p, size_t size, VkBufferUsageFlags u
 			out->mapped = NULL;
 		}
 	}
+	return OK;
+}
+
+static status_code vk_sync_mapped_range(vk_priv *p, const vk_buf *b, size_t off, size_t size,
+										bool invalidate) {
+	if (!size || !b->mapped || (b->memory_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+		return OK;
+	VkDeviceSize		atom  = p->caps.non_coherent_atom_size;
+	VkDeviceSize		start = (VkDeviceSize)off & ~(atom - 1);
+	VkDeviceSize		end	  = MIN(ALIGN_UP((VkDeviceSize)off + size, atom), b->alloc_size);
+	VkMappedMemoryRange range = {
+		.sType	= VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+		.memory = b->mem,
+		.offset = start,
+		.size	= end - start,
+	};
+	if (invalidate)
+		VK_CHECK(vkInvalidateMappedMemoryRanges(p->dev, 1, &range));
+	else
+		VK_CHECK(vkFlushMappedMemoryRanges(p->dev, 1, &range));
 	return OK;
 }
 
@@ -1086,7 +1113,9 @@ static int vk_prof_begin(vk_priv *p, const char *name) {
 	}
 	int q									= p->prof.n_rec[idx]++;
 	p->prof.rec[idx * VK_PROF_SLOT_CAP + q] = name ? name : "?";
-	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, p->prof.pool,
+	vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+						 VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 0, NULL);
+	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, p->prof.pool,
 						(uint32_t)((idx * VK_PROF_SLOT_CAP + q) * 2));
 	return q;
 }
@@ -1094,7 +1123,7 @@ static int vk_prof_begin(vk_priv *p, const char *name) {
 static void vk_prof_end(vk_priv *p, int q) {
 	if (q < 0)
 		return;
-	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p->prof.pool,
+	vkCmdWriteTimestamp(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, p->prof.pool,
 						(uint32_t)((p->ring_cur * VK_PROF_SLOT_CAP + q) * 2 + 1));
 }
 
@@ -1256,6 +1285,17 @@ static status_code vk_ring_submit(vk_priv *p, int idx, int wait_now) {
 	vk_ring_slot *r = &p->ring[idx];
 	if (!r->recording || r->submitted)
 		return OK;
+
+	if (p->caps.unified_memory) {
+		VkMemoryBarrier barrier = {
+			.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT,
+		};
+		p->stats.barriers++;
+		vkCmdPipelineBarrier(r->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+							 0, 1, &barrier, 0, NULL, 0, NULL);
+	}
 
 	VkResult end_res = vkEndCommandBuffer(r->cmd);
 	if (end_res != VK_SUCCESS) {
@@ -2041,8 +2081,10 @@ static void vk_qcore_init(vk_priv *p) {
 			p->p_qmv[t][c].name = MV[t].name[c];
 		}
 	}
+	uint32_t qmm_blocks = p->caps.is_mali ? 2 : 1;
 	for (int t = 0; t < VQ_MM_COUNT; t++) {
-		if (vk_create_pipeline(p, MM[t].spv, MM[t].len, 4, 16, &p->p_qmm[t]) != OK)
+		if (vk_create_pipeline_spec(p, MM[t].spv, MM[t].len, 4, 16, &qmm_blocks, sizeof(qmm_blocks),
+									&p->p_qmm[t]) != OK)
 			return;
 		p->p_qmm[t].name = MM[t].name;
 	}
@@ -2325,6 +2367,7 @@ static status_code vk_init(backend *self, int device_index) {
 	p->caps.max_workgroup_count[0]			= props.limits.maxComputeWorkGroupCount[0];
 	p->caps.max_workgroup_count[1]			= props.limits.maxComputeWorkGroupCount[1];
 	p->caps.max_storage_buffer_range		= props.limits.maxStorageBufferRange;
+	p->caps.non_coherent_atom_size			= props.limits.nonCoherentAtomSize;
 
 	p->caps.is_mali		= (props.vendorID == 0x13B5);
 	p->caps.is_power_vr = (props.vendorID == 0x1010);
@@ -2722,14 +2765,18 @@ static status_code vk_init(backend *self, int device_index) {
 						   &p->p_rmsnorm_noweight_batch);
 	if (s == OK)
 		p->p_rmsnorm_noweight_batch.name = "rmsnorm_noweight_batch";
-	s = vk_create_pipeline(p, shader_rmsnorm_per_head_batch_spv,
-						   shader_rmsnorm_per_head_batch_spv_len, 3, 16,
-						   &p->p_rmsnorm_per_head_batch);
+	uint32_t norm_head_wg	   = p->caps.is_mali ? 64 : 256;
+	p->norm_heads_per_wg	   = p->caps.is_mali && p->caps.subgroup_size == 16 ? 4 : 1;
+	uint32_t norm_head_spec[2] = {norm_head_wg, p->norm_heads_per_wg > 1};
+	s						   = vk_create_pipeline_spec(p, shader_rmsnorm_per_head_batch_spv,
+														 shader_rmsnorm_per_head_batch_spv_len, 3, 16, &norm_head_wg,
+														 sizeof(norm_head_wg), &p->p_rmsnorm_per_head_batch);
 	if (s == OK)
 		p->p_rmsnorm_per_head_batch.name = "rmsnorm_per_head_batch";
-	s = vk_create_pipeline(p, shader_rmsnorm_noweight_per_head_batch_spv,
-						   shader_rmsnorm_noweight_per_head_batch_spv_len, 2, 16,
-						   &p->p_rmsnorm_noweight_per_head_batch);
+	s = vk_create_pipeline_spec(p, shader_rmsnorm_noweight_per_head_batch_spv,
+								shader_rmsnorm_noweight_per_head_batch_spv_len, 2, 16,
+								&norm_head_wg, sizeof(norm_head_wg),
+								&p->p_rmsnorm_noweight_per_head_batch);
 	if (s == OK)
 		p->p_rmsnorm_noweight_per_head_batch.name = "rmsnorm_noweight_per_head_batch";
 
@@ -2744,14 +2791,15 @@ static status_code vk_init(backend *self, int device_index) {
 							   &p->p_rmsnorm_noweight_sg_batch);
 		if (s == OK)
 			p->p_rmsnorm_noweight_sg_batch.name = "rmsnorm_noweight_sg_batch";
-		s = vk_create_pipeline(p, shader_rmsnorm_per_head_sg_batch_spv,
-							   shader_rmsnorm_per_head_sg_batch_spv_len, 3, 16,
-							   &p->p_rmsnorm_per_head_sg_batch);
+		s = vk_create_pipeline_spec(p, shader_rmsnorm_per_head_sg_batch_spv,
+									shader_rmsnorm_per_head_sg_batch_spv_len, 3, 16, norm_head_spec,
+									sizeof(norm_head_spec), &p->p_rmsnorm_per_head_sg_batch);
 		if (s == OK)
 			p->p_rmsnorm_per_head_sg_batch.name = "rmsnorm_per_head_sg_batch";
-		s = vk_create_pipeline(p, shader_rmsnorm_noweight_per_head_sg_batch_spv,
-							   shader_rmsnorm_noweight_per_head_sg_batch_spv_len, 2, 16,
-							   &p->p_rmsnorm_noweight_per_head_sg_batch);
+		s = vk_create_pipeline_spec(p, shader_rmsnorm_noweight_per_head_sg_batch_spv,
+									shader_rmsnorm_noweight_per_head_sg_batch_spv_len, 2, 16,
+									norm_head_spec, sizeof(norm_head_spec),
+									&p->p_rmsnorm_noweight_per_head_sg_batch);
 		if (s == OK)
 			p->p_rmsnorm_noweight_per_head_sg_batch.name = "rmsnorm_noweight_per_head_sg_batch";
 		s = vk_create_pipeline(p, shader_rmsnorm_add_batch_spv, shader_rmsnorm_add_batch_spv_len, 4,
@@ -3086,7 +3134,7 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 
 	VkMemoryPropertyFlags preferred;
 	if (p->caps.unified_memory) {
-		preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+		preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
 					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 	} else {
 		preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -3163,6 +3211,8 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 		vk_drain_gpu(p);
 		if (b->mapped) {
 			status_code s = tensor_desc_read(desc, 0, b->mapped, size);
+			if (s == OK)
+				s = vk_sync_mapped_range(p, b, 0, size, false);
 			if (s != OK)
 				return s;
 		} else {
@@ -3191,7 +3241,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 		status_code			  s		= vk_alloc_buffer(p, alloc_size, weight_usage, flags, bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
-				p, size, weight_usage,
+				p, alloc_size, weight_usage,
 				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bnew);
 		}
 		if (s != OK) {
@@ -3214,7 +3264,7 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 			vk_alloc_buffer(p, alloc_size, weight_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
-				p, size, weight_usage,
+				p, alloc_size, weight_usage,
 				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, bnew);
 		}
 		if (s != OK) {
@@ -3660,8 +3710,15 @@ static status_code vk_buffer_upload(backend *self, buffer *buf, const void *host
 			r->has_work = 0;
 			vk_dirty_clear(p);
 		}
+		size_t atom = (size_t)p->caps.non_coherent_atom_size;
+		if ((off | size) & (atom - 1)) {
+			status_code s = vk_sync_mapped_range(p, vb, off, size, true);
+			if (s != OK)
+				return s;
+		}
 		memcpy((uint8_t *)vb->mapped + off, host_src, size);
-		return OK;
+		p->stats.uploads++;
+		return vk_sync_mapped_range(p, vb, off, size, false);
 	}
 
 	if (p->device_lost)
@@ -3699,7 +3756,11 @@ static status_code vk_buf_download_raw(backend *self, vk_buf *vb, size_t off, vo
 			r->has_work = 0;
 			vk_dirty_clear(p);
 		}
+		status_code s = vk_sync_mapped_range(p, vb, off, size, true);
+		if (s != OK)
+			return s;
 		memcpy(host_dst, (uint8_t *)vb->mapped + off, size);
+		p->stats.downloads++;
 		return OK;
 	}
 
@@ -4832,9 +4893,9 @@ static status_code vk_alloc_rope_buf(vk_priv *p, size_t size, buffer *out) {
 }
 
 static status_code vk_ensure_rope_bufs(backend *self, int half, const float *cos_base,
-									   const float *sin_base) {
+									   const float *sin_base, int min_n_ctx) {
 	vk_priv *p	   = self->priv;
-	int		 n_ctx = p->n_ctx_stored;
+	int		 n_ctx = min_n_ctx;
 	if (n_ctx <= 0 || half <= 0)
 		return ERR_INVALID_ARG;
 
@@ -4842,7 +4903,7 @@ static status_code vk_ensure_rope_bufs(backend *self, int half, const float *cos
 
 	buffer		 *cos_buf;
 	buffer		 *sin_buf;
-	int			 *cap;
+	int			 *uploaded;
 	int			 *half_stored;
 	const float **cos_base_p;
 	const float **sin_base_p;
@@ -4850,21 +4911,21 @@ static status_code vk_ensure_rope_bufs(backend *self, int half, const float *cos
 	if (p->rope_cos_base == cos_base && p->rope_sin_base == sin_base) {
 		cos_buf		= &p->rope_cos_buf;
 		sin_buf		= &p->rope_sin_buf;
-		cap			= &p->rope_buf_cap;
+		uploaded	= &p->rope_uploaded;
 		half_stored = &p->rope_half_stored;
 		cos_base_p	= &p->rope_cos_base;
 		sin_base_p	= &p->rope_sin_base;
 	} else if (p->rope_cos_base_alt == cos_base && p->rope_sin_base_alt == sin_base) {
 		cos_buf		= &p->rope_cos_buf_alt;
 		sin_buf		= &p->rope_sin_buf_alt;
-		cap			= &p->rope_buf_cap_alt;
+		uploaded	= &p->rope_uploaded_alt;
 		half_stored = &p->rope_half_stored_alt;
 		cos_base_p	= &p->rope_cos_base_alt;
 		sin_base_p	= &p->rope_sin_base_alt;
 	} else if (p->rope_cos_base == NULL) {
 		cos_buf		= &p->rope_cos_buf;
 		sin_buf		= &p->rope_sin_buf;
-		cap			= &p->rope_buf_cap;
+		uploaded	= &p->rope_uploaded;
 		half_stored = &p->rope_half_stored;
 		cos_base_p	= &p->rope_cos_base;
 		sin_base_p	= &p->rope_sin_base;
@@ -4872,45 +4933,52 @@ static status_code vk_ensure_rope_bufs(backend *self, int half, const float *cos
 		if (p->rope_cos_base_alt == NULL) {
 			cos_buf		= &p->rope_cos_buf_alt;
 			sin_buf		= &p->rope_sin_buf_alt;
-			cap			= &p->rope_buf_cap_alt;
+			uploaded	= &p->rope_uploaded_alt;
 			half_stored = &p->rope_half_stored_alt;
 			cos_base_p	= &p->rope_cos_base_alt;
 			sin_base_p	= &p->rope_sin_base_alt;
 		} else {
 			cos_buf		= &p->rope_cos_buf;
 			sin_buf		= &p->rope_sin_buf;
-			cap			= &p->rope_buf_cap;
+			uploaded	= &p->rope_uploaded;
 			half_stored = &p->rope_half_stored;
 			cos_base_p	= &p->rope_cos_base;
 			sin_base_p	= &p->rope_sin_base;
 		}
 	}
 
-	int need_upload =
-		(need > *cap || *half_stored != half || *cos_base_p != cos_base || *sin_base_p != sin_base);
+	if (*half_stored != half || *cos_base_p != cos_base || *sin_base_p != sin_base)
+		*uploaded = 0;
 
-	if (need_upload) {
-		if (need > *cap) {
-			if (cos_buf->handle)
-				vk_buffer_free(self, cos_buf);
-			if (sin_buf->handle)
-				vk_buffer_free(self, sin_buf);
-
-			status_code s = vk_alloc_rope_buf(p, (size_t)need * sizeof(float), cos_buf);
-			if (s != OK)
-				return s;
-			s = vk_alloc_rope_buf(p, (size_t)need * sizeof(float), sin_buf);
-			if (s != OK)
-				return s;
-			*cap = need;
-		}
-
-		status_code s = vk_buffer_write_f32(self, cos_buf, cos_base, need);
+	if ((size_t)need * sizeof(float) > cos_buf->size ||
+		(size_t)need * sizeof(float) > sin_buf->size) {
+		if (cos_buf->handle)
+			vk_buffer_free(self, cos_buf);
+		if (sin_buf->handle)
+			vk_buffer_free(self, sin_buf);
+		size_t		bytes = (size_t)MAX(p->n_ctx_stored, n_ctx) * half * sizeof(float);
+		status_code s	  = vk_alloc_rope_buf(p, bytes, cos_buf);
 		if (s != OK)
 			return s;
-		s = vk_buffer_write_f32(self, sin_buf, sin_base, need);
+		s = vk_alloc_rope_buf(p, bytes, sin_buf);
 		if (s != OK)
 			return s;
+		*uploaded = 0;
+	}
+
+	if (need > *uploaded) {
+		size_t		off		 = (size_t)*uploaded * sizeof(float);
+		size_t		bytes	 = (size_t)(need - *uploaded) * sizeof(float);
+		buffer		cos_view = buffer_slice(cos_buf, off, bytes);
+		buffer		sin_view = buffer_slice(sin_buf, off, bytes);
+		status_code s =
+			vk_buffer_write_f32(self, &cos_view, cos_base + *uploaded, need - *uploaded);
+		if (s != OK)
+			return s;
+		s = vk_buffer_write_f32(self, &sin_view, sin_base + *uploaded, need - *uploaded);
+		if (s != OK)
+			return s;
+		*uploaded	 = need;
 		*cos_base_p	 = cos_base;
 		*sin_base_p	 = sin_base;
 		*half_stored = half;
@@ -6156,8 +6224,9 @@ static status_code vk_rmsnorm_per_head_batch(backend *self, const buffer *x, con
 	} push				 = {n_heads, head_dim, eps, m};
 	vk_buf		*bufs[3] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(y)};
 	VkDeviceSize offs[3] = {x->offset, w->offset, y->offset};
-	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 3, &push, sizeof(push), (uint32_t)n_heads,
-							 (uint32_t)m, 1u << 2);
+	uint32_t	 heads	 = ps == &p->p_rmsnorm_per_head_sg_batch ? p->norm_heads_per_wg : 1;
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 3, &push, sizeof(push),
+							 (n_heads + heads - 1) / heads, (uint32_t)m, 1u << 2);
 }
 
 static status_code vk_rmsnorm_noweight_per_head_batch(backend *self, const buffer *x, buffer *y,
@@ -6176,8 +6245,9 @@ static status_code vk_rmsnorm_noweight_per_head_batch(backend *self, const buffe
 	} push				 = {n_heads, head_dim, eps, m};
 	vk_buf		*bufs[2] = {as_vkbuf(x), as_vkbuf(y)};
 	VkDeviceSize offs[2] = {x->offset, y->offset};
-	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 2, &push, sizeof(push), (uint32_t)n_heads,
-							 (uint32_t)m, 1u << 1);
+	uint32_t	 heads = ps == &p->p_rmsnorm_noweight_per_head_sg_batch ? p->norm_heads_per_wg : 1;
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, 2, &push, sizeof(push),
+							 (n_heads + heads - 1) / heads, (uint32_t)m, 1u << 1);
 }
 
 static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
@@ -6370,7 +6440,7 @@ static status_code vk_rope_batch(backend *self, buffer *vec, int n_heads, int he
 	if (!p->p_rope_batch.pipeline)
 		return ERR_UNSUPPORTED;
 	int			half = head_dim / 2;
-	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base, pos_start + m);
 	if (s != OK)
 		return s;
 	struct {
@@ -6392,7 +6462,7 @@ static status_code vk_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_h
 	if (!p->p_rope_qk_batch.pipeline)
 		return ERR_UNSUPPORTED;
 	int			half = head_dim / 2;
-	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base, pos_start + m);
 	if (s != OK)
 		return s;
 	struct {
@@ -6419,7 +6489,8 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 		return ERR_UNSUPPORTED;
 
 	int			half = head_dim / 2;
-	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	status_code s =
+		vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base, pos_start + n_rows);
 	if (s != OK)
 		return s;
 	struct {
@@ -6438,11 +6509,11 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 
 static status_code vk_rope_tables_get(backend *self, int head_dim, const float *rope_cos_base,
 									  const float *rope_sin_base, const float *freq_factors,
-									  vk_rope_tables *out) {
+									  int min_n_ctx, vk_rope_tables *out) {
 	vk_priv *p	  = self->priv;
 	int		 half = head_dim / 2;
 	if (freq_factors) {
-		int n_ctx = p->n_ctx_stored;
+		int n_ctx = MAX(p->n_ctx_stored, min_n_ctx);
 		if (n_ctx <= 0 || half <= 0)
 			return ERR_INVALID_ARG;
 		size_t table_floats = (size_t)n_ctx * (size_t)half;
@@ -6497,7 +6568,7 @@ static status_code vk_rope_tables_get(backend *self, int head_dim, const float *
 		*out		= (vk_rope_tables){ffb, ffb, 0, (VkDeviceSize)table_floats * sizeof(float)};
 		return OK;
 	}
-	status_code s = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	status_code s = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base, min_n_ctx);
 	if (s != OK)
 		return s;
 	*out =
@@ -6513,8 +6584,8 @@ static status_code vk_rope_ext_batch(backend *self, buffer *vec, int n_heads, in
 	if (freq_factors && !p->p_rope_ext_batch.pipeline)
 		return ERR_UNSUPPORTED;
 	vk_rope_tables t;
-	status_code	   s =
-		vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors, &t);
+	status_code s = vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors,
+									   pos_start + m, &t);
 	if (s != OK)
 		return s;
 	struct {
@@ -6537,8 +6608,8 @@ static status_code vk_qk_norm_rope(backend *self, buffer *q, buffer *k, const bu
 	if (freq_factors && !p->p_rope_ext_batch.pipeline)
 		return ERR_UNSUPPORTED;
 	vk_rope_tables t;
-	status_code	   s =
-		vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors, &t);
+	status_code s = vk_rope_tables_get(self, head_dim, rope_cos_base, rope_sin_base, freq_factors,
+									   pos_start + m, &t);
 	if (s != OK)
 		return s;
 	struct {

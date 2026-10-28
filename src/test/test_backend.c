@@ -297,8 +297,10 @@ static void test_op_rmsnorm(backend *ref, backend *tgt, int n) {
 	tgt->buffer_free(tgt, &y_tgt);
 }
 
-static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, int head_dim) {
-	if (!tgt->rmsnorm_per_head) {
+static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, int head_dim,
+									 int rows, int weighted) {
+	if (!(weighted ? tgt->rmsnorm_per_head && tgt->rmsnorm_per_head_batch
+				   : tgt->rmsnorm_noweight_per_head && tgt->rmsnorm_noweight_per_head_batch)) {
 		char label[112];
 		snprintf(label, sizeof(label), "rmsnorm_per_head h=%d d=%d (%s)", n_heads, head_dim,
 				 tgt->name);
@@ -306,14 +308,14 @@ static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, in
 					  "backend has no native rmsnorm_per_head");
 		return;
 	}
-	int	   N = n_heads * head_dim;
+	int	   N = rows * n_heads * head_dim;
 	float *x = xmalloc((size_t)N * sizeof(float));
 	float *w = xmalloc((size_t)head_dim * sizeof(float));
 	seed_test_rng(0x9EADULL + ((uint64_t)n_heads * 91) + ((uint64_t)head_dim * 13));
 	fill_random_f32(x, N, 2.0f);
 	fill_random_f32(w, head_dim, 1.0f);
 	for (int i = 0; i < head_dim; i++)
-		w[i] += 1.0f;
+		w[i] = weighted ? w[i] + 1.0f : 1.0f;
 
 	buffer x_ref   = {0};
 	buffer w_ref   = {0};
@@ -323,7 +325,12 @@ static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, in
 	ref->buffer_alloc_scratch(ref, (size_t)N * sizeof(float), &y_ref_b);
 	ref->buffer_write_f32(ref, &x_ref, x, N);
 	ref->buffer_write_f32(ref, &w_ref, w, head_dim);
-	ref->rmsnorm_per_head(ref, &x_ref, &w_ref, &y_ref_b, n_heads, head_dim, 1e-5f);
+	for (int row = 0; row < rows; row++) {
+		size_t bytes = (size_t)n_heads * head_dim * sizeof(float);
+		buffer x_row = buffer_slice(&x_ref, (size_t)row * bytes, bytes);
+		buffer y_row = buffer_slice(&y_ref_b, (size_t)row * bytes, bytes);
+		ref->rmsnorm_per_head(ref, &x_row, &w_ref, &y_row, n_heads, head_dim, 1e-5f);
+	}
 	if (ref && ref->synchronize)
 		ref->synchronize(ref);
 	float *y_ref = xmalloc((size_t)N * sizeof(float));
@@ -339,7 +346,16 @@ static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, in
 	tgt->buffer_write_f32(tgt, &w_tgt, w, head_dim);
 	status_code s_tgt;
 	{
-		s_tgt = tgt->rmsnorm_per_head(tgt, &x_tgt, &w_tgt, &y_tgt, n_heads, head_dim, 1e-5f);
+		if (weighted && rows == 1)
+			s_tgt = tgt->rmsnorm_per_head(tgt, &x_tgt, &w_tgt, &y_tgt, n_heads, head_dim, 1e-5f);
+		else if (weighted)
+			s_tgt = tgt->rmsnorm_per_head_batch(tgt, &x_tgt, &w_tgt, &y_tgt, n_heads, head_dim,
+												1e-5f, rows);
+		else if (rows == 1)
+			s_tgt = tgt->rmsnorm_noweight_per_head(tgt, &x_tgt, &y_tgt, n_heads, head_dim, 1e-5f);
+		else
+			s_tgt = tgt->rmsnorm_noweight_per_head_batch(tgt, &x_tgt, &y_tgt, n_heads, head_dim,
+														 1e-5f, rows);
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
 	}
@@ -348,7 +364,8 @@ static void test_op_rmsnorm_per_head(backend *ref, backend *tgt, int n_heads, in
 
 	char label[112];
 	char detail[256];
-	snprintf(label, sizeof(label), "rmsnorm_per_head h=%d d=%d", n_heads, head_dim);
+	snprintf(label, sizeof(label), "rmsnorm_per_head h=%d d=%d rows=%d weighted=%d", n_heads,
+			 head_dim, rows, weighted);
 	verdict v = classify_output("loose", y_ref, y_got, N, s_tgt, detail, sizeof(detail));
 	if (v != V_PASS && v != V_SKIP)
 		compute_debug(y_ref, y_got, N);
@@ -3113,8 +3130,15 @@ static void test_batch_rope_parity(backend *ref, backend *tgt, int n_heads, int 
 		buffer vb_tgt  = {0};
 		tgt->buffer_alloc_scratch(tgt, (size_t)N * (size_t)m * sizeof(float), &vb_tgt);
 		tgt->buffer_write_f32(tgt, &vb_tgt, vec, N * m);
-		status_code s_tgt =
-			tgt->rope_batch(tgt, &vb_tgt, n_heads, head_dim, pos_start, cos_v, sin_v, m);
+		status_code s_tgt = OK;
+		if (m > 1) {
+			s_tgt =
+				tgt->rope_batch(tgt, &vb_tgt, n_heads, head_dim, pos_start, cos_v, sin_v, m - 1);
+			if (s_tgt == OK)
+				s_tgt = tgt->buffer_write_f32(tgt, &vb_tgt, vec, N * m);
+		}
+		if (s_tgt == OK)
+			s_tgt = tgt->rope_batch(tgt, &vb_tgt, n_heads, head_dim, pos_start, cos_v, sin_v, m);
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
 		float *y_tgt = xmalloc((size_t)N * (size_t)m * sizeof(float));
@@ -4044,6 +4068,48 @@ static void test_rs_copy_slices(backend *ref, backend *tgt, int total, int dst_o
 	free(y_got);
 }
 
+static void test_host_device_slices(backend *tgt, int total, int off, int len) {
+	char label[128];
+	snprintf(label, sizeof(label), "host/device slice coherence total=%d off=%d len=%d", total, off,
+			 len);
+	if (!tgt->scale_inplace) {
+		rs_skip(label, "backend lacks scale_inplace");
+		return;
+	}
+	float *expected = xmalloc((size_t)total * sizeof(float));
+	float *got		= xmalloc((size_t)total * sizeof(float));
+	for (int i = 0; i < total; i++)
+		expected[i] = (float)(i + 1);
+	buffer		buf	 = rs_scratch(tgt, expected, total);
+	buffer		view = buffer_slice(&buf, (size_t)off * sizeof(float), (size_t)len * sizeof(float));
+	status_code st	 = OK;
+	for (int round = 0; round < 3 && st == OK; round++) {
+		st = tgt->scale_inplace(tgt, &buf, 2.0f, total);
+		for (int i = 0; i < total; i++)
+			expected[i] *= 2.0f;
+		for (int i = off; i < off + len; i++)
+			expected[i] = (float)(round + 1);
+		if (st == OK)
+			st = tgt->buffer_write_f32(tgt, &view, expected + off, len);
+		if (st == OK)
+			st = tgt->scale_inplace(tgt, &buf, 0.5f, total);
+		for (int i = 0; i < total; i++)
+			expected[i] *= 0.5f;
+		if (st == OK)
+			st = tgt->buffer_read_f32(tgt, &view, got + off, len);
+		if (st == OK && memcmp(expected + off, got + off, (size_t)len * sizeof(float)) != 0)
+			st = ERR_INTERNAL;
+		if (st == OK)
+			st = tgt->buffer_read_f32(tgt, &buf, got, total);
+		if (st == OK && memcmp(expected, got, (size_t)total * sizeof(float)) != 0)
+			st = ERR_INTERNAL;
+	}
+	test_parity_compare_status(RS_FAM, label, expected, got, total, st);
+	tgt->buffer_free(tgt, &buf);
+	free(expected);
+	free(got);
+}
+
 enum { RS_KV_LAYERS = 2, RS_KV_HEADS_Q = 8, RS_KV_CTX = 64, RS_KV_HD_MAX = 512 };
 static const int RS_KV_HD[RS_KV_LAYERS] = {256, 512};
 
@@ -4145,6 +4211,9 @@ static void run_real_shape_tests(backend *ref, backend *tgt) {
 
 	test_rs_copy_slices(ref, tgt, 4096, 1024, 2048, 1024);
 	test_rs_copy_slices(ref, tgt, 8960, 256, 0, 256);
+	test_host_device_slices(tgt, 3, 1, 1);
+	test_host_device_slices(tgt, 257, 1, 129);
+	test_host_device_slices(tgt, 257, 256, 1);
 
 	test_rs_kv_mixed(ref, tgt, 1);
 	test_rs_kv_mixed(ref, tgt, 2);
@@ -4564,6 +4633,17 @@ static void run_native_exec_op_tests(backend *ref, backend *tgt) {
 
 void run_per_op_tests(backend *ref, backend *tgt) {
 	print_op_coverage(ref, tgt);
+	test_batch_rope_parity(ref, tgt, 8, 64, 0, 16);
+	test_batch_rope_parity(ref, tgt, 8, 64, 7, 128);
+	for (int qi = 0; qi < QTYPES_N; qi++) {
+		const qtype_info *qt = &QTYPES[qi];
+		if (qt->block != 32 || (tgt->matmul_type_native && !tgt->matmul_type_native(tgt, qt->type)))
+			continue;
+		test_batch_matmul_parity(ref, tgt, qt, 17, 32, 16);
+		test_batch_matmul_parity(ref, tgt, qt, 17, 96, 17);
+		test_batch_matmul_parity(ref, tgt, qt, 67, 160, 37);
+	}
+	flush_family(OPFAM_BATCH_PARITY);
 
 	int shapes[][2] = {{32, 32}, {128, 256}, {64, 512}, {17, 256}, {512, 512}};
 	for (int sh = 0; sh < (int)(sizeof(shapes) / sizeof(shapes[0])); sh++) {
@@ -4590,13 +4670,20 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rmsnorm(ref, tgt, 4096);
 	flush_family(OPFAM_RMSNORM);
 
-	test_op_rmsnorm_per_head(ref, tgt, 8, 64);
-	test_op_rmsnorm_per_head(ref, tgt, 4, 64);
-	test_op_rmsnorm_per_head(ref, tgt, 32, 128);
-	test_op_rmsnorm_per_head(ref, tgt, 8, 256);
-	test_op_rmsnorm_per_head(ref, tgt, 8, 512);
-	test_op_rmsnorm_per_head(ref, tgt, 1, 256);
-	test_op_rmsnorm_per_head(ref, tgt, 1, 512);
+	test_op_rmsnorm_per_head(ref, tgt, 8, 64, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 4, 64, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 32, 128, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 8, 256, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 8, 512, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 1, 256, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 1, 512, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 3, 64, 1, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 5, 64, 7, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 16, 64, 128, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 3, 8, 3, 1);
+	test_op_rmsnorm_per_head(ref, tgt, 5, 128, 7, 0);
+	test_op_rmsnorm_per_head(ref, tgt, 16, 64, 128, 0);
+	test_op_rmsnorm_per_head(ref, tgt, 3, 64, 1, 0);
 	flush_family(OPFAM_RMSNORM_PER_HEAD);
 
 	test_op_rmsnorm_noweight(ref, tgt, 64);

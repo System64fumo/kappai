@@ -13,7 +13,7 @@ layout(constant_id = 0) const uint COLS = 1;
 layout(constant_id = 1) const uint ROWS = 2;
 
 layout(set = 0, binding = 0) readonly buffer W {
-	uint16_t w16[];
+	uint w32[];
 };
 layout(set = 0, binding = 1) readonly buffer XQ {
 	uint xq[];
@@ -33,7 +33,7 @@ layout(push_constant) uniform Params {
 }
 pc;
 
-#define W16 w16
+#define W32 w32
 #include "qblock.glsl"
 
 shared float s_red[16 * MAX_SUBGROUPS];
