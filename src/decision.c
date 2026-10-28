@@ -13,6 +13,7 @@
 struct decision_model {
 	const decision_ops *ops;
 	jinja_program	   *tmpl;
+	float				temperatures[3][4];
 };
 
 static const decision_ops *g_decision_registry[DECISION_MAX_TYPES];
@@ -37,15 +38,20 @@ const char *decision_type_of(const gguf_ctx *g) {
 	return gguf_get_str(g, key, &type) == OK ? type : NULL;
 }
 
+const decision_ops *decision_ops_of(const gguf_ctx *g) {
+	const char *type = decision_type_of(g);
+	for (int i = 0; type && i < g_decision_count; i++)
+		if (!strcmp(g_decision_registry[i]->type, type))
+			return g_decision_registry[i];
+	return NULL;
+}
+
 decision_model *decision_open(const gguf_ctx *g, char *err, size_t err_len) {
 	const char *type = decision_type_of(g);
 	if (!type)
 		return NULL;
 
-	const decision_ops *ops = NULL;
-	for (int i = 0; i < g_decision_count; i++)
-		if (!strcmp(g_decision_registry[i]->type, type))
-			ops = g_decision_registry[i];
+	const decision_ops *ops = decision_ops_of(g);
 	if (!ops) {
 		snprintf(err, err_len, "unsupported decision model type '%s'", type);
 		return NULL;
@@ -57,9 +63,27 @@ decision_model *decision_open(const gguf_ctx *g, char *err, size_t err_len) {
 		return NULL;
 	}
 
-	decision_model *dm = xcalloc(1, sizeof(*dm));
-	dm->ops			   = ops;
-	dm->tmpl		   = jinja_compile(tmpl_src, err, err_len);
+	decision_model *dm				   = xcalloc(1, sizeof(*dm));
+	dm->ops							   = ops;
+	static const char *const buckets[] = {"2", "3_5", "6_10", "11"};
+	const char				*arch	   = NULL;
+	gguf_get_str(g, "general.architecture", &arch);
+	for (int t = 0; t < 3; t++) {
+		char  key[160];
+		float fallback = 1.0f;
+		snprintf(key, sizeof(key), "%s.decision.temperature.%s", arch, qtype_name(t));
+		gguf_get_f32(g, key, &fallback);
+		if (!isfinite(fallback) || fallback <= 0.0f)
+			fallback = 1.0f;
+		for (size_t i = 0; i < ARRAY_LEN(buckets); i++) {
+			float value = fallback;
+			snprintf(key, sizeof(key), "%s.decision.temperature.%s.%s", arch, qtype_name(t),
+					 buckets[i]);
+			gguf_get_f32(g, key, &value);
+			dm->temperatures[t][i] = isfinite(value) && value > 0.0f ? value : fallback;
+		}
+	}
+	dm->tmpl = jinja_compile(tmpl_src, err, err_len);
 	if (!dm->tmpl) {
 		free(dm);
 		return NULL;
@@ -148,7 +172,9 @@ static bool parse_noul(const decision_ops *ops, decision_question *q, json_objec
 	q->options						 = xcalloc(2, sizeof(*q->options));
 	for (int i = 0; i < 2; i++) {
 		int			 slot = ops->true_first ? 1 - i : i;
-		json_object *desc = criteria ? json_get(criteria, keys[i]) : NULL;
+		json_object *desc = NULL;
+		if (criteria && !json_object_object_get_ex(criteria, keys[i], &desc))
+			desc = json_get(criteria, i ? "yes" : "no");
 		set_option(q, slot, keys[i], desc);
 	}
 	return true;
@@ -236,7 +262,7 @@ decision_parse_status decision_parse(const decision_model *dm, json_object *body
 	int i			 = 0;
 	json_object_object_foreach(questions, id, jq) {
 		if (!parse_question(dm->ops, id, jq, &req->questions[i], err, err_len)) {
-			req->n_questions = i;
+			req->n_questions = i + 1;
 			decision_request_free(req);
 			return DECISION_PARSE_INVALID;
 		}
@@ -251,15 +277,14 @@ static jinja_value *options_to_jinja(const decision_question *q, const decision_
 		jinja_value *o = jinja_dict();
 		jinja_dict_set(o, "key", jinja_string(q->options[i].key));
 		jinja_dict_set(o, "description", json_to_jinja(q->options[i].description));
-		jinja_dict_set(o, "label", jinja_string(labels[i].code));
+		jinja_dict_set(o, "label", jinja_string(labels ? labels[i].code : ""));
 		jinja_list_append(list, o);
 	}
 	return list;
 }
 
-static status_code render_prompt(const decision_model *dm, const decision_request *req,
-								 const decision_question *q, const decision_label *labels,
-								 char **out) {
+jinja_value *decision_prompt_values(const decision_request *req, const decision_question *q,
+									const decision_label *labels) {
 	jinja_value *g = jinja_dict();
 	jinja_dict_set(g, "id", jinja_string(q->id));
 	jinja_dict_set(g, "type", jinja_string(qtype_name(q->type)));
@@ -268,29 +293,19 @@ static status_code render_prompt(const decision_model *dm, const decision_reques
 	jinja_dict_set(g, "options", options_to_jinja(q, labels));
 	jinja_dict_set(g, "images", jinja_list());
 
-	char		errbuf[256];
-	status_code rc = jinja_render(dm->tmpl, g, out, errbuf, sizeof(errbuf));
+	return g;
+}
+
+static status_code render_prompt(const decision_model *dm, const decision_request *req,
+								 const decision_question *q, const decision_label *labels,
+								 char **out) {
+	jinja_value *g = decision_prompt_values(req, q, labels);
+	char		 errbuf[256];
+	status_code	 rc = jinja_render(dm->tmpl, g, out, errbuf, sizeof(errbuf));
 	jinja_value_free(g);
 	if (rc != OK)
 		ERROR("decision: systemone template render failed: %s", errbuf);
 	return rc;
-}
-
-static float question_temperature(const context *c, const decision_question *q) {
-	int			n	   = q->n_options;
-	const char *bucket = n <= 2 ? "2" : n <= 5 ? "3_5" : n <= 10 ? "6_10" : "11";
-	const char *type   = qtype_name(q->type);
-	const char *arch   = c->m.arch_info->key_prefix;
-	char		key[160];
-	float		temp;
-
-	snprintf(key, sizeof(key), "%s.decision.temperature.%s.%s", arch, type, bucket);
-	if (gguf_get_f32(&c->m.gctx, key, &temp) == OK && temp > 0.0f)
-		return temp;
-	snprintf(key, sizeof(key), "%s.decision.temperature.%s", arch, type);
-	if (gguf_get_f32(&c->m.gctx, key, &temp) == OK && temp > 0.0f)
-		return temp;
-	return 1.0f;
 }
 
 static void softmax_scores(const float *scores, int n, float temperature, double *probs) {
@@ -379,6 +394,8 @@ static json_object *answer_json(const decision_question *q, const double *probs)
 static status_code question_scores(const decision_model *dm, context *c,
 								   const decision_request *req, const decision_question *q,
 								   float *scores, int *n_tokens) {
+	if (dm->ops->scores)
+		return dm->ops->scores(c, dm->tmpl, req, q, scores, n_tokens);
 	decision_label *labels = xcalloc((size_t)q->n_options, sizeof(*labels));
 	char		   *prompt = NULL;
 	int32_t		   *ids	   = NULL;
@@ -431,7 +448,9 @@ status_code decision_run(const decision_model *dm, context *c, const decision_re
 		double					*probs	= xmalloc((size_t)q->n_options * sizeof(*probs));
 		status_code				 rc		= question_scores(dm, c, req, q, scores, n_tokens);
 		if (rc == OK) {
-			softmax_scores(scores, q->n_options, question_temperature(c, q), probs);
+			int n	   = q->n_options;
+			int bucket = n <= 2 ? 0 : n <= 5 ? 1 : n <= 10 ? 2 : 3;
+			softmax_scores(scores, n, dm->temperatures[q->type][bucket], probs);
 			json_object_object_add(out, q->id, answer_json(q, probs));
 		}
 		free(scores);

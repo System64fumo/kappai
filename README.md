@@ -38,6 +38,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `gemma4`     | Gemma 4 (E2B, A4B, 12B, 26B) |
 | `lfm`        | LFM 2.5                      |
 | `lfm-d1`     | LFM 2.5 D1                   |
+| `lfm-d1-omni` | LFM 2 D1 Omni (text/JSON)     |
 | `qwen35`     | Qwen 3.5, Qwen 3.6, Qwen 3.8 |
 | `glm-dsa`    | GLM 5.2, GLM 5.3             |
 | `glm5-next`  | GLM 5.3 Flash                |
@@ -88,6 +89,8 @@ For server use:
 ```bash
 ./build/kappai-server -m model.gguf
 ```
+
+D1 and D1 Omni models accept `state` and `questions` at `POST /v1/systemone`. D1 Omni supports text and JSON input with `choice`, `score`, and `noul` questions.
 
 ## Contribution
 

@@ -8,6 +8,7 @@ typedef struct {
 	int			 dim, kernel, history;
 	int			 in_stride, out_stride;
 	int			 n_rows;
+	int			 centered;
 } shortconv_job;
 
 static status_code split_qgate_run(exec_ctx *ctx, backend *t) {
@@ -209,13 +210,27 @@ static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
 	const int	   K = j->kernel;
 	for (int c = begin; c < end; c++) {
 		const float *w	   = j->conv_w + (size_t)c * K;
-		float		*hist  = j->state + (size_t)c * j->history;
+		float		*hist  = j->state ? j->state + (size_t)c * j->history : NULL;
 		const float *b_col = j->mixed + c;
 		const float *c_col = j->mixed + (size_t)j->dim + c;
 		const float *x_col = j->mixed + 2 * (size_t)j->dim + c;
 		float		*o_col = j->out + c;
 
-		if (K == 3) {
+		if (j->centered) {
+			for (int t = 0; t < j->n_rows; t++) {
+				size_t off = (size_t)t * j->in_stride;
+				float  sum = (b_col[off] * x_col[off]) * w[1];
+				if (t > 0) {
+					size_t prev = off - j->in_stride;
+					sum += (b_col[prev] * x_col[prev]) * w[0];
+				}
+				if (t + 1 < j->n_rows) {
+					size_t next = off + j->in_stride;
+					sum += (b_col[next] * x_col[next]) * w[2];
+				}
+				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
+			}
+		} else if (K == 3) {
 			float h0 = hist[0], h1 = hist[1];
 			for (int t = 0; t < j->n_rows; t++) {
 				size_t off						 = (size_t)t * j->in_stride;
@@ -243,13 +258,15 @@ static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
 }
 
 status_code op_shortconv(exec_ctx *ctx) {
-	if (!ctx || !ctx->m || !ctx->rows.cache || !ctx->rows.cache->hybrid || !ctx->s)
+	if (!ctx || !ctx->m || !ctx->s ||
+		(!ctx->op->u.shortconv.centered && (!ctx->rows.cache || !ctx->rows.cache->hybrid)))
 		return ERR_INVALID_ARG;
 	model					  *m	  = ctx->m;
 	layer_weights			  *L	  = &m->layers[ctx->li];
 	const model_hybrid_params *p	  = &m->hybrid;
 	const float				  *conv_w = (const float *)L->ssm_conv1d_w.host_ptr;
-	if (!conv_w || p->conv_kernel < 2 || ctx->li < 0 || ctx->li >= m->n_layers)
+	if (!conv_w || p->conv_kernel < 2 || ctx->li < 0 || ctx->li >= m->n_layers ||
+		(ctx->op->u.shortconv.centered && p->conv_kernel != 3))
 		return ERR_FORMAT;
 
 	profile_scope ps = profile_begin(&ctx->s->prof, ctx->op->stage);
@@ -269,23 +286,25 @@ status_code op_shortconv(exec_ctx *ctx) {
 	tpool		 *pool = model_get_pool(m);
 	exec_segments seg  = exec_segments_of(ctx);
 	for (int c = 0; c < seg.n_calls; c++) {
-		kvcache_hybrid *hc	  = exec_segment_cache(ctx, c)->hybrid;
-		float		   *state = hc->conv_state + (size_t)ctx->li * hc->conv_stride;
-		if (exec_segment_pos(ctx, c) == 0)
+		kvcache_hybrid *hc =
+			ctx->op->u.shortconv.centered ? NULL : exec_segment_cache(ctx, c)->hybrid;
+		float *state = hc ? hc->conv_state + (size_t)ctx->li * hc->conv_stride : NULL;
+		if (state && exec_segment_pos(ctx, c) == 0)
 			memset(state, 0, (size_t)m->dim * (size_t)(p->conv_kernel - 1) * sizeof(float));
 		size_t		  row0 = (size_t)c * seg.rows;
 		shortconv_job job  = {
-			.out		= out + row0 * out_stride,
-			.state		= state,
-			.mixed		= mixed + row0 * in_stride,
-			.conv_w		= conv_w,
-			.dim		= m->dim,
-			.kernel		= p->conv_kernel,
-			.history	= p->conv_kernel - 1,
-			.in_stride	= in_stride,
-			.out_stride = out_stride,
-			.n_rows		= seg.rows,
-		};
+			 .out		 = out + row0 * out_stride,
+			 .state		 = state,
+			 .mixed		 = mixed + row0 * in_stride,
+			 .conv_w	 = conv_w,
+			 .dim		 = m->dim,
+			 .kernel	 = p->conv_kernel,
+			 .history	 = p->conv_kernel - 1,
+			 .in_stride	 = in_stride,
+			 .out_stride = out_stride,
+			 .n_rows	 = seg.rows,
+			 .centered	 = ctx->op->u.shortconv.centered,
+		 };
 		if (pool && m->dim > 8 && tpool_current_tid() < 0)
 			tpool_parallel_for(pool, m->dim, 8, shortconv_chunk, &job);
 		else

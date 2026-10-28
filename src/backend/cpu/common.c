@@ -1355,6 +1355,7 @@ void cpu_free(backend *self) {
 	for (int i = 0; i < 4; i++)
 		free(p->matmul_multi_scratch[i].q8_buf);
 
+	free(p->full_attn_kv.p);
 	free(p->mla_krot.buf);
 	free(p->residual_tmp);
 	free(p->bitrev_perm_cache);
@@ -2038,6 +2039,7 @@ status_code cpu_backend_fill(backend *out) {
 	out->ffn_activate_batch				 = cpu_ffn_activate_batch;
 	out->rope_batch						 = cpu_rope_batch;
 	out->rope_qk_batch					 = cpu_rope_qk_batch;
+	out->attention_full_batch			 = cpu_attention_full_batch;
 	out->attention_batch				 = cpu_attention_batch;
 	out->attention_swa_batch			 = cpu_attention_swa_batch;
 	out->rmsnorm_add					 = cpu_rmsnorm_add;
@@ -3349,4 +3351,35 @@ status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w
 	act_b.owner	 = self;
 	act_b.size	 = (size_t)m * (size_t)k * sizeof(float);
 	return cpu_matmul_batch(self, w, w_type, &act_b, y, n, k, m);
+}
+
+cpu_attn_batch_job cpu_full_attn_job(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale) {
+	cpu_priv	*p		= self->priv;
+	size_t		 elems	= (size_t)n_rows * n_kv_heads * head_dim;
+	uint16_t	*packed = (uint16_t *)float_buf_ensure_nocopy(&p->full_attn_kv, elems, 64);
+	const float *kf = cpu_ptr(k), *vf = cpu_ptr(v);
+	for (int h = 0; h < n_kv_heads; h++) {
+		for (int row = 0; row < n_rows; row++) {
+			size_t src = ((size_t)row * n_kv_heads + h) * head_dim;
+			size_t dst = ((size_t)h * n_rows + row) * head_dim;
+			cpu_kv_put_f16_head(packed + dst, packed + elems + dst, kf + src, vf + src, head_dim);
+		}
+	}
+	return (cpu_attn_batch_job){.kl_base	= packed,
+								.vl_base	= packed + elems,
+								.qf			= cpu_ptr(q),
+								.outf		= cpu_ptr(out),
+								.n_groups	= n_heads / n_kv_heads,
+								.head_dim	= head_dim,
+								.hd_stride	= head_dim,
+								.n_heads	= n_heads,
+								.m			= n_rows,
+								.n_keys		= n_rows,
+								.flash_attn = flash_attn,
+								.scale		= scale,
+								.kvh_stride = (size_t)n_rows * head_dim,
+								.p			= p,
+								.kv_rows	= n_rows};
 }

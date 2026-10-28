@@ -12,17 +12,20 @@ static void lfm_append_conv_block(op_emitter *e, const model *m, int li) {
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_HYB_PROJ, WIDX_ATTN_QKV, p->conv_dim, dim,
 						 STAGE_MATMUL));
-	OP_EMIT(e, mk_shortconv(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_XB2));
+	recipe_op conv			  = mk_shortconv(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_XB2);
+	conv.u.shortconv.centered = m->full_sequence;
+	OP_EMIT(e, conv);
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_SSM_OUT, dim, p->value_dim,
 						 STAGE_MATMUL));
 	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
 }
 
 static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
-	int dim	   = m->dim;
-	int q_out  = m->n_heads * m->head_dim;
-	int kv_out = m->n_kv_heads * m->head_dim;
-	int neox   = m->arch_info->uses_neox_rope;
+	int dim		   = m->dim;
+	int q_out	   = m->n_heads * m->head_dim;
+	int n_kv_heads = model_layer_kv_heads(m, li);
+	int kv_out	   = n_kv_heads * m->head_dim;
+	int neox	   = m->arch_info->uses_neox_rope;
 
 	OP_EMIT(e,
 			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
@@ -31,19 +34,27 @@ static void lfm_append_attention_block(op_emitter *e, const model *m, int li) {
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
 
 	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
-	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, m->n_kv_heads));
+	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, n_kv_heads));
 	OP_EMIT(e, mk_rope(RECIPE_SLOT_Q, m->n_heads, m->head_dim, neox));
-	OP_EMIT(e, mk_rope(RECIPE_SLOT_K, m->n_kv_heads, m->head_dim, neox));
-	OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
-	OP_EMIT(e, mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, m->n_kv_heads,
-										  m->head_dim, m->n_ctx, m->sliding_window));
+	OP_EMIT(e, mk_rope(RECIPE_SLOT_K, n_kv_heads, m->head_dim, neox));
+	if (!m->full_sequence)
+		OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
+	recipe_op attn =
+		mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, n_kv_heads,
+								   m->head_dim, m->n_ctx, m->sliding_window);
+	if (m->full_sequence) {
+		attn.kind  = OP_ATTENTION_FULL;
+		attn.in[1] = RECIPE_SLOT_K;
+		attn.in[2] = RECIPE_SLOT_V;
+	}
+	OP_EMIT(e, attn);
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL));
 	recipe_emit_dense_ffn(e, m, li, WIDX_FFN_NORM);
 }
 
 enum { LFM_MAX_OPS_PER_LAYER = 24 };
 
-static void lfm_append_layer(op_emitter *e, const model *m, int li) {
+void recipe_emit_lfm_layer(op_emitter *e, const model *m, int li) {
 	if (model_layer_is_recurrent(m, li))
 		lfm_append_conv_block(e, m, li);
 	else
@@ -54,7 +65,7 @@ static model_recipe *build_lfm2_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(*r));
 	recipe_build_pre_ops(r, m);
 
-	recipe_build_layers(r, m, LFM_MAX_OPS_PER_LAYER, "lfm2", lfm_append_layer);
+	recipe_build_layers(r, m, LFM_MAX_OPS_PER_LAYER, "lfm2", recipe_emit_lfm_layer);
 	recipe_build_post_ops(r, m);
 	return r;
 }

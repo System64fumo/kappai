@@ -1063,9 +1063,10 @@ static void run_generation(req_ctx *rc, oa_slot *slot) {
 }
 
 static void run_decision(req_ctx *rc, oa_slot *slot) {
-	oa_gen	*g = &rc->gen;
-	context *c = &slot->sess;
-	g->sctx	   = c;
+	oa_gen	*g	 = &rc->gen;
+	context *c	 = &slot->sess;
+	c->interrupt = 0;
+	g->sctx		 = c;
 
 	g->generated = -1;
 	if (!gen_dead(g) &&
@@ -1890,9 +1891,11 @@ openai_state *openai_init(context *ctx, const cli_args *args) {
 	st->slots[0].busy	 = false;
 	st->slots[0].owns	 = true;
 	st->slots[0].last_ns = time_us();
-	slot_warm(&st->slots[0].sess, args->warmup);
-	if (args->warmup && !st->slots[0].sess.session_poisoned)
-		context_idle_prefill_start(&st->slots[0].sess);
+	if (!st->decision) {
+		slot_warm(&st->slots[0].sess, args->warmup);
+		if (args->warmup && !st->slots[0].sess.session_poisoned)
+			context_idle_prefill_start(&st->slots[0].sess);
+	}
 	context_release_thread(st->ctx);
 
 	if (pthread_create(&st->worker, NULL, worker_main, st) != 0) {

@@ -21,6 +21,22 @@ typedef struct {
 
 static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 	{
+
+		[OP_LAYERNORM] = {.name = "layernorm", .reads = {OP_TOUCH_IN0}, .writes = {OP_TOUCH_OUT}},
+		[OP_ADD_BIAS]  = {.name = "add_bias", .reads = {OP_TOUCH_IN0}, .writes = {OP_TOUCH_OUT}},
+		[OP_ADD_TYPE_EMBD] = {.name	  = "add_type_embd",
+							  .reads  = {OP_TOUCH_IN0},
+							  .writes = {OP_TOUCH_OUT}},
+		[OP_SPLIT_QKV]	   = {.name	  = "split_qkv",
+							  .reads  = {OP_TOUCH_IN0},
+							  .writes = {OP_TOUCH_OUT, OP_TOUCH_OUT1, OP_TOUCH_OUT2}},
+		[OP_ACTIVATE] = {.name = "activate", .reads = {OP_TOUCH_IN0}, .writes = {OP_TOUCH_OUT}},
+		[OP_ATTENTION_FULL] = {.name	= "attention_full",
+							   .fn_name = "attention_full_batch",
+							   .slot0	= OP_FN_SLOT(attention_full_batch),
+							   .slot1	= OP_NO_SLOT,
+							   .reads	= {OP_TOUCH_IN0, OP_TOUCH_IN1, OP_TOUCH_IN2},
+							   .writes	= {OP_TOUCH_OUT}},
 		[OP_NONE] =
 			{
 				.name = "none",

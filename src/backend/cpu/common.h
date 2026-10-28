@@ -128,6 +128,7 @@ typedef struct {
 	int *bitrev_perm_cache;
 	int	 bitrev_perm_cap;
 
+	float_buf		   full_attn_kv;
 	cpu_mla_krot_cache mla_krot;
 	cpu_rope_cs_cache  rope_cs;
 
@@ -393,6 +394,7 @@ typedef struct {
 	float		   *outf;
 	int				n_groups, head_dim, hd_stride;
 	int				n_heads, pos_start, m, sliding_window, flash_attn;
+	int				n_keys;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;
@@ -714,5 +716,12 @@ void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
 void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
 status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 							   const float *freq_factors, float **cs_out);
+
+cpu_attn_batch_job cpu_full_attn_job(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale);
+status_code		   cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
+											const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+											int head_dim, int n_rows, int flash_attn, float scale);
 
 #endif

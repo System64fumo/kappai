@@ -357,6 +357,9 @@ struct backend {
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
 								 int head_dim, int pos_start, const float *rope_cos_base,
 								 const float *rope_sin_base, int m);
+	status_code (*attention_full_batch)(struct backend *self, const buffer *q, const buffer *k,
+										const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+										int head_dim, int n_rows, int flash_attn, float scale);
 	status_code (*attention_batch)(backend *self, const buffer *q, const buffer *k_cache,
 								   const buffer *v_cache, buffer *out, int layer, int pos_start,
 								   int n_heads, int n_kv_heads, int head_dim, int n_ctx,

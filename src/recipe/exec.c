@@ -455,6 +455,12 @@ static const op_handler g_op_handlers[OP_KIND_COUNT] = {
 	[OP_FFN_ACTIVATE_FUSED] = op_ffn_activate_fused,
 	[OP_SCALE]				= op_scale,
 	[OP_SOFTCAP]			= op_softcap,
+	[OP_LAYERNORM]			= op_layernorm,
+	[OP_ADD_BIAS]			= op_add_bias,
+	[OP_ADD_TYPE_EMBD]		= op_add_bias,
+	[OP_SPLIT_QKV]			= op_split_qkv,
+	[OP_ACTIVATE]			= op_activate,
+	[OP_ATTENTION_FULL]		= op_attention_full,
 	[OP_LOGITS_READBACK]	= op_logits_readback,
 	[OP_PLE_BUILD]			= ple_build_batch,
 	[OP_PLE_PROJ_INJECT]	= ple_proj_inject_batch,
@@ -502,7 +508,7 @@ static status_code batch_run_post_ops(model *m, kvcache *cache, compute_scratch 
 									  float *logits_out) {
 	backend			   *a	  = m->backend;
 	const model_recipe *r	  = m->recipe;
-	const int			total = n_rows * m->vocab_size;
+	const int			total = n_rows * model_output_size(m);
 	bs_ensure_slot(bs, a, r->logits_slot, (size_t)total);
 	status_code st = exec_outer_schedule(r->exec, &r->exec->post, OP_NONE, OP_NONE, m, cache, s, bs,
 										 0, n_rows, flash_attn, logits_out);
@@ -672,7 +678,7 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 
 done:
 	if (st != OK && logits_out)
-		memset(logits_out, 0, (size_t)n_out * m->vocab_size * sizeof(float));
+		memset(logits_out, 0, (size_t)n_out * model_output_size(m) * sizeof(float));
 	return st;
 }
 
@@ -710,4 +716,16 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 	row_desc rows			= {
 		.n_rows = n_tokens, .pos_start = pos_start, .cache = cache, .needs_logits = last_only};
 	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out);
+}
+
+status_code compute_forward_sequence_recipe(model *m, compute_scratch *s, const int32_t *tokens,
+											int n_tokens, const uint8_t *outputs, int token_type,
+											int flash_attn, float *scores) {
+	if (!m || !m->full_sequence || n_tokens < 1 || n_tokens > m->n_ctx)
+		return ERR_INVALID_ARG;
+	status_code st = compute_scratch_ensure(s, m, n_tokens);
+	if (st != OK)
+		return st;
+	row_desc rows = {.n_rows = n_tokens, .needs_logits = outputs, .token_type = token_type};
+	return compute_forward_rows(m, &rows, s, tokens, flash_attn, scores);
 }

@@ -10,6 +10,16 @@
 struct model_recipe;
 typedef struct model_recipe model_recipe;
 
+struct model;
+
+typedef struct {
+	status_code (*configure)(struct model *m);
+	status_code (*load_layer)(struct model *m, int li);
+	model_recipe *(*recipe)(const struct model *m);
+} model_variant;
+
+typedef struct model_tensor_binding model_tensor_binding;
+
 typedef struct weight_ref {
 	buffer		buf;
 	uint32_t	type;
@@ -198,6 +208,9 @@ typedef struct model {
 	const char				*repack_config;
 	const char				*fuse_config;
 	model_recipe			*recipe;
+	const model_variant		*variant;
+	void					*variant_data;
+	model_tensor_binding	*bindings;
 	weight_ref			   **wrefs_by_layer;
 	backend				   **layer_backends;
 	const mem_topology		*topo;
@@ -232,6 +245,8 @@ typedef struct model {
 	bool owns_backend;
 	bool use_mmap;
 	bool mixed_backend_mode;
+	bool full_sequence;
+	int	 output_size;
 
 	size_t mem_non_expert_bytes;
 	size_t mem_per_expert_bytes;
@@ -288,26 +303,30 @@ static inline int model_layer_backend_is_host(const model *m, int li) {
 
 status_code model_set_layer_backend_range(model *m, int begin, int end, backend *b);
 status_code model_build_weight_refs(model *m);
+status_code model_bind_tensor(model *m, int li, uint8_t index, const char *name, int n_dims,
+							  uint64_t d0, uint64_t d1, weight_class wc);
+
+static inline int model_output_size(const model *m) {
+	return m->output_size > 0 ? m->output_size : m->vocab_size;
+}
 
 #define model_mixed_backend_mode(m) ((m) && (m)->mixed_backend_mode)
 #define model_layer_is_sliding(m, li) ((m)->sliding_window > 0 && (m)->layers[li].is_sliding)
 
 static inline int model_layer_head_dim(const model *m, int li) {
-	if (!m->arch_info->has_variable_layer_dims)
-		return m->head_dim;
-	if (li < 0 || li >= m->n_layers)
+	if (!m->layers || li < 0 || li >= m->n_layers || m->layers[li].head_dim <= 0)
 		return m->head_dim;
 	return m->layers[li].head_dim;
 }
 
 static inline int model_layer_intermediate(const model *m, int li) {
-	if (!m->arch_info->has_variable_layer_dims)
+	if (!m->layers || li < 0 || li >= m->n_layers || m->layers[li].intermediate <= 0)
 		return m->intermediate;
 	return m->layers[li].intermediate;
 }
 
 static inline int model_layer_kv_heads(const model *m, int li) {
-	if (!m->arch_info->has_variable_layer_dims)
+	if (!m->layers || li < 0 || li >= m->n_layers || m->layers[li].n_kv_heads <= 0)
 		return m->n_kv_heads;
 	return m->layers[li].n_kv_heads;
 }

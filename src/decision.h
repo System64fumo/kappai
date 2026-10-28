@@ -35,20 +35,25 @@ typedef struct {
 	int		n_tok;
 } decision_label;
 
+typedef struct decision_request decision_request;
+
 typedef struct {
 	const char *type;
 	int			max_options;
 	bool		true_first;
 	status_code (*labels)(tokenizer *tok, const decision_question *q, decision_label *out);
+	const model_variant *variant;
+	status_code (*scores)(context *c, jinja_program *tmpl, const decision_request *req,
+						  const decision_question *q, float *scores, int *n_tokens);
 } decision_ops;
 
 typedef struct decision_model decision_model;
 
-typedef struct {
+struct decision_request {
 	decision_question *questions;
 	int				   n_questions;
 	json_object		  *state;
-} decision_request;
+};
 
 typedef enum {
 	DECISION_PARSE_OK,
@@ -63,7 +68,8 @@ void decision_register(const decision_ops *ops);
 		decision_register(ops_ptr);                                                                \
 	}
 
-const char *decision_type_of(const gguf_ctx *g);
+const decision_ops *decision_ops_of(const gguf_ctx *g);
+const char		   *decision_type_of(const gguf_ctx *g);
 
 decision_model *decision_open(const gguf_ctx *g, char *err, size_t err_len);
 void			decision_close(decision_model *dm);
@@ -74,6 +80,9 @@ void				  decision_request_free(decision_request *req);
 
 status_code decision_run(const decision_model *dm, context *c, const decision_request *req,
 						 json_object **answers, int *n_tokens);
+
+jinja_value *decision_prompt_values(const decision_request *req, const decision_question *q,
+									const decision_label *labels);
 
 int32_t decision_single_token(tokenizer *tok, const char *text);
 
