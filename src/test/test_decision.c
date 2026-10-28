@@ -83,6 +83,22 @@ static void test_encoder(const char *path, backend *b, int use_mmap) {
 	st		  = compute_forward_sequence_recipe(&m, &scratch, tokens, 4, outputs, 0, 1, again);
 	ok		  = st == OK && !memcmp(selected, again, sizeof(selected));
 	record_resultf(OPFAM_EDGE_CASE, "decision.recovery", ok, "backend=%s", b->name);
+	st				   = compute_forward_sequence_recipe(&m, &scratch, tokens, 9, NULL, 0, 1, all);
+	const int counts[] = {1, 2, 4, 9};
+	for (size_t i = 0; i < ARRAY_LEN(counts); i++) {
+		uint8_t mask[9] = {0};
+		float	scores[9];
+		int		count = counts[i];
+		for (int row = 0; row < count; row++)
+			mask[row * 8 / MAX(count - 1, 1)] = 1;
+		status_code selected_st =
+			compute_forward_sequence_recipe(&m, &scratch, tokens, 9, mask, 0, 1, scores);
+		ok = st == OK && selected_st == OK;
+		for (int row = 0; ok && row < count; row++)
+			ok = fabsf(scores[row] - all[row * 8 / MAX(count - 1, 1)]) < 1e-6f;
+		record_resultf(OPFAM_EDGE_CASE, "decision.marker_counts", ok, "backend=%s count=%d",
+					   b->name, count);
+	}
 	kvcache cache;
 	st = kvcache_init(&cache, &m, 64, KV_QUANT_F16);
 	ok = st == OK && cache.n_kv_layers == 0 && cache.hybrid == NULL;

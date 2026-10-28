@@ -2024,6 +2024,7 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	out->rmsnorm_noweight_per_head		 = cpu_rmsnorm_noweight_per_head;
 	out->argmax							 = cpu_argmax;
 	out->gated_delta_net				 = cpu_gated_delta_net;
+	out->shortconv						 = cpu_shortconv;
 	out->repack_plan					 = cpu_repack_plan;
 	out->repack_weight					 = cpu_repack_weight;
 	out->dequant_row					 = cpu_dequant_row;
@@ -2209,6 +2210,84 @@ status_code cpu_ple_combine(backend *self, buffer *ple, const buffer *proj, int 
 							float combine_scale) {
 	(void)self;
 	add_scale_f32(cpu_ptr(ple), cpu_ptr(proj), combine_scale, n);
+	return OK;
+}
+
+static void shortconv_centered_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	const shortconv_desc *j = ctx;
+	for (int t = begin; t < end; t++) {
+		const float *b	 = j->mixed + (size_t)t * j->in_stride;
+		const float *c	 = b + j->dim;
+		const float *x	 = c + j->dim;
+		float		*out = j->out + (size_t)t * j->out_stride;
+		for (int i = 0; i < j->dim; i++) {
+			const float *w	 = j->conv_w + 3 * (size_t)i;
+			float		 sum = (b[i] * x[i]) * w[1];
+			if (t > 0)
+				sum += (b[i - j->in_stride] * x[i - j->in_stride]) * w[0];
+			if (t + 1 < j->n_rows)
+				sum += (b[i + j->in_stride] * x[i + j->in_stride]) * w[2];
+			out[i] = c[i] * sum;
+		}
+	}
+}
+
+static void shortconv_causal_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	const shortconv_desc *j		  = ctx;
+	const int			  history = j->kernel - 1;
+	const int			  K		  = j->kernel;
+	for (int c = begin; c < end; c++) {
+		const float *w	   = j->conv_w + (size_t)c * K;
+		float		*hist  = j->state ? j->state + (size_t)c * history : NULL;
+		const float *b_col = j->mixed + c;
+		const float *c_col = j->mixed + (size_t)j->dim + c;
+		const float *x_col = j->mixed + 2 * (size_t)j->dim + c;
+		float		*o_col = j->out + c;
+
+		if (K == 3) {
+			float h0 = hist[0], h1 = hist[1];
+			for (int t = 0; t < j->n_rows; t++) {
+				size_t off						 = (size_t)t * j->in_stride;
+				float  bx						 = b_col[off] * x_col[off];
+				float  sum						 = h0 * w[0] + h1 * w[1] + bx * w[2];
+				h0								 = h1;
+				h1								 = bx;
+				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
+			}
+			hist[0] = h0;
+			hist[1] = h1;
+		} else {
+			for (int t = 0; t < j->n_rows; t++) {
+				size_t off = (size_t)t * j->in_stride;
+				float  bx  = b_col[off] * x_col[off];
+				float  sum = bx * w[K - 1];
+				for (int k = 0; k < history; k++)
+					sum += hist[k] * w[k];
+				memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
+				hist[history - 1]				 = bx;
+				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
+			}
+		}
+	}
+}
+
+status_code cpu_shortconv(backend *self, const shortconv_desc *d) {
+	if (!d || !d->out || !d->mixed || !d->conv_w || d->dim < 1 || d->n_rows < 1 ||
+		d->in_stride < 3 * d->dim || d->out_stride < d->dim || d->kernel < 2 ||
+		(d->centered ? d->kernel != 3 : !d->state))
+		return ERR_INVALID_ARG;
+	cpu_priv	  *p	 = self->priv;
+	tpool_chunk_fn chunk = shortconv_causal_chunk;
+	int			   count = d->dim, grain = 8;
+	if (d->centered) {
+		chunk =
+			p->shortconv_centered_chunk ? p->shortconv_centered_chunk : shortconv_centered_chunk;
+		count = d->n_rows;
+		grain = 1;
+	}
+	cpu_run_batch_full(p->pool, count, grain, grain + 1, chunk, (void *)d);
 	return OK;
 }
 

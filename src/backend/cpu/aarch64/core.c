@@ -2648,12 +2648,50 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
+static void shortconv_centered_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	const shortconv_desc *j = ctx;
+	for (int t = begin; t < end; t++) {
+		const float *b	 = j->mixed + (size_t)t * j->in_stride;
+		const float *c	 = b + j->dim;
+		const float *x	 = c + j->dim;
+		float		*out = j->out + (size_t)t * j->out_stride;
+		int			 i	 = 0;
+		for (; i + 4 <= j->dim; i += 4) {
+			float32x4x3_t w	  = vld3q_f32(j->conv_w + 3 * (size_t)i);
+			float32x4_t	  bx  = vmulq_f32(vld1q_f32(b + i), vld1q_f32(x + i));
+			float32x4_t	  sum = vmulq_f32(bx, w.val[1]);
+			if (t > 0) {
+				float32x4_t prev =
+					vmulq_f32(vld1q_f32(b + i - j->in_stride), vld1q_f32(x + i - j->in_stride));
+				sum = vmlaq_f32(sum, prev, w.val[0]);
+			}
+			if (t + 1 < j->n_rows) {
+				float32x4_t next =
+					vmulq_f32(vld1q_f32(b + i + j->in_stride), vld1q_f32(x + i + j->in_stride));
+				sum = vmlaq_f32(sum, next, w.val[2]);
+			}
+			vst1q_f32(out + i, vmulq_f32(vld1q_f32(c + i), sum));
+		}
+		for (; i < j->dim; i++) {
+			const float *w	 = j->conv_w + 3 * (size_t)i;
+			float		 sum = (b[i] * x[i]) * w[1];
+			if (t > 0)
+				sum += (b[i - j->in_stride] * x[i - j->in_stride]) * w[0];
+			if (t + 1 < j->n_rows)
+				sum += (b[i + j->in_stride] * x[i + j->in_stride]) * w[2];
+			out[i] = c[i] * sum;
+		}
+	}
+}
+
 static status_code cpu_arch_init(backend *self, int device_index) {
 	status_code st = cpu_init(self, device_index);
 	if (st != OK)
 		return st;
+	cpu_priv *p					= self->priv;
+	p->shortconv_centered_chunk = shortconv_centered_neon;
 #if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
-	cpu_priv *p		  = self->priv;
 	p->matmul_packing = &cpu_q8_x4_packing;
 #endif
 	return OK;

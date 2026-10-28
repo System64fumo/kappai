@@ -328,6 +328,7 @@ typedef struct model_recipe {
 	recipe_op	*post_ops;
 	int			 n_pre_ops;
 	int			 n_post_ops;
+	int			 post_weight_layer;
 	uint8_t		 embd_slot;
 	uint8_t		 logits_slot;
 

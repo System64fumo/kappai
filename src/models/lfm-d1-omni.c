@@ -101,14 +101,27 @@ static status_code omni_load_layer(model *m, int li) {
 	return omni_bind_tensors(m, li, tensors, ARRAY_LEN(tensors));
 }
 
+static void omni_append_ffn(op_emitter *e, const model *m, int li) {
+	const omni_params *p	 = m->variant_data;
+	int				   dim	 = m->dim;
+	int				   inter = model_layer_intermediate(m, li);
+	OP_EMIT(e, mk_layernorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, WIDX_FFN_NORM_B, dim,
+							p->norm_eps));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_add_bias(RECIPE_SLOT_FFN_UP, WIDX_UP_B, inter));
+	OP_EMIT(e, mk_activate(RECIPE_SLOT_FFN_UP, inter, ACTIVATION_RELU));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_UP, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter, STAGE_MATMUL));
+	OP_EMIT(e, mk_add_bias(RECIPE_SLOT_XB2, WIDX_DOWN_B, dim));
+	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
+}
+
 static void omni_append_layer(op_emitter *e, const model *m, int li) {
 	const omni_params *p = m->variant_data;
 	if (li < p->encoder_layers) {
 		recipe_emit_lfm_layer(e, m, li);
 		return;
 	}
-	int dim	  = m->dim;
-	int inter = model_layer_intermediate(m, li);
+	int dim = m->dim;
 	if (li == p->encoder_layers) {
 		OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_X, WIDX_OUTPUT_NORM, m->norm_eps,
 							  STAGE_RMSNORM));
@@ -129,14 +142,8 @@ static void omni_append_layer(op_emitter *e, const model *m, int li) {
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, dim, STAGE_MATMUL));
 	OP_EMIT(e, mk_add_bias(RECIPE_SLOT_ATTN_OUT, WIDX_WO_B, dim));
 	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD));
-	OP_EMIT(e, mk_layernorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, WIDX_FFN_NORM_B, dim,
-							p->norm_eps));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_UP, WIDX_UP, inter, dim, STAGE_MATMUL));
-	OP_EMIT(e, mk_add_bias(RECIPE_SLOT_FFN_UP, WIDX_UP_B, inter));
-	OP_EMIT(e, mk_activate(RECIPE_SLOT_FFN_UP, inter, ACTIVATION_RELU));
-	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_UP, RECIPE_SLOT_XB2, WIDX_DOWN, dim, inter, STAGE_MATMUL));
-	OP_EMIT(e, mk_add_bias(RECIPE_SLOT_XB2, WIDX_DOWN_B, dim));
-	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
+	if (li + 1 < m->n_layers || model_layer_backend(m, li) != m->backend)
+		omni_append_ffn(e, m, li);
 }
 
 static model_recipe *omni_recipe(const model *m) {
@@ -144,8 +151,13 @@ static model_recipe *omni_recipe(const model *m) {
 	model_recipe	  *r = xcalloc(1, sizeof(*r));
 	recipe_build_pre_ops(r, m);
 	recipe_build_layers(r, m, 26, "lfm2-d1-omni", omni_append_layer);
-	r->post_ops	 = xcalloc(7, sizeof(recipe_op));
-	op_emitter e = op_emitter_make(r->post_ops, 7, "lfm2-d1-omni");
+	r->post_ops		= xcalloc(14, sizeof(recipe_op));
+	op_emitter e	= op_emitter_make(r->post_ops, 14, "lfm2-d1-omni");
+	int		   last = m->n_layers - 1;
+	if (model_layer_backend(m, last) == m->backend) {
+		r->post_weight_layer = last;
+		omni_append_ffn(&e, m, last);
+	}
 	OP_EMIT(&e, mk_layernorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_CLS_NORM, WIDX_CLS_NORM_B, m->dim,
 							 p->norm_eps));
 	OP_EMIT(&e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_XB2, WIDX_CLS, m->dim, m->dim,

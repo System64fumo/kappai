@@ -366,6 +366,9 @@ static const op_requirement OP_REQUIREMENTS[OP_KIND_COUNT] =
 		[OP_SHORTCONV] =
 			{
 				.name		  = "shortconv",
+				.fn_name	  = "shortconv",
+				.slot0		  = OP_FN_SLOT(shortconv),
+				.slot1		  = OP_NO_SLOT,
 				.state_reads  = CG_STATE_RECURRENT,
 				.state_writes = CG_STATE_RECURRENT,
 				.reads		  = {OP_TOUCH_IN0},

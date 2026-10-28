@@ -1,16 +1,5 @@
 #include "recipe/internal.h"
 
-typedef struct {
-	float		*out;
-	float		*state;
-	const float *mixed;
-	const float *conv_w;
-	int			 dim, kernel, history;
-	int			 in_stride, out_stride;
-	int			 n_rows;
-	int			 centered;
-} shortconv_job;
-
 static status_code split_qgate_run(exec_ctx *ctx, backend *t) {
 	if (!ctx || !ctx->m || !ctx->s)
 		return ERR_INVALID_ARG;
@@ -204,59 +193,6 @@ static int lfm_attn_buf(const model *m) {
 	return buf > q_out ? buf : q_out;
 }
 
-static void shortconv_chunk(int begin, int end, int tid, void *ctx) {
-	(void)tid;
-	shortconv_job *j = ctx;
-	const int	   K = j->kernel;
-	for (int c = begin; c < end; c++) {
-		const float *w	   = j->conv_w + (size_t)c * K;
-		float		*hist  = j->state ? j->state + (size_t)c * j->history : NULL;
-		const float *b_col = j->mixed + c;
-		const float *c_col = j->mixed + (size_t)j->dim + c;
-		const float *x_col = j->mixed + 2 * (size_t)j->dim + c;
-		float		*o_col = j->out + c;
-
-		if (j->centered) {
-			for (int t = 0; t < j->n_rows; t++) {
-				size_t off = (size_t)t * j->in_stride;
-				float  sum = (b_col[off] * x_col[off]) * w[1];
-				if (t > 0) {
-					size_t prev = off - j->in_stride;
-					sum += (b_col[prev] * x_col[prev]) * w[0];
-				}
-				if (t + 1 < j->n_rows) {
-					size_t next = off + j->in_stride;
-					sum += (b_col[next] * x_col[next]) * w[2];
-				}
-				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
-			}
-		} else if (K == 3) {
-			float h0 = hist[0], h1 = hist[1];
-			for (int t = 0; t < j->n_rows; t++) {
-				size_t off						 = (size_t)t * j->in_stride;
-				float  bx						 = b_col[off] * x_col[off];
-				float  sum						 = h0 * w[0] + h1 * w[1] + bx * w[2];
-				h0								 = h1;
-				h1								 = bx;
-				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
-			}
-			hist[0] = h0;
-			hist[1] = h1;
-		} else {
-			for (int t = 0; t < j->n_rows; t++) {
-				size_t off = (size_t)t * j->in_stride;
-				float  bx  = b_col[off] * x_col[off];
-				float  sum = bx * w[K - 1];
-				for (int k = 0; k < j->history; k++)
-					sum += hist[k] * w[k];
-				memmove(hist, hist + 1, (size_t)(j->history - 1) * sizeof(float));
-				hist[j->history - 1]			 = bx;
-				o_col[(size_t)t * j->out_stride] = c_col[off] * sum;
-			}
-		}
-	}
-}
-
 status_code op_shortconv(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s ||
 		(!ctx->op->u.shortconv.centered && (!ctx->rows.cache || !ctx->rows.cache->hybrid)))
@@ -283,32 +219,34 @@ status_code op_shortconv(exec_ctx *ctx) {
 	if (!out || !mixed)
 		return ERR_INVALID_ARG;
 
-	tpool		 *pool = model_get_pool(m);
-	exec_segments seg  = exec_segments_of(ctx);
+	backend *a = OP_BACKEND(exec_layer_backend(ctx), shortconv);
+	if (!a->shortconv)
+		return ERR_UNSUPPORTED;
+	exec_segments seg = exec_segments_of(ctx);
 	for (int c = 0; c < seg.n_calls; c++) {
 		kvcache_hybrid *hc =
 			ctx->op->u.shortconv.centered ? NULL : exec_segment_cache(ctx, c)->hybrid;
 		float *state = hc ? hc->conv_state + (size_t)ctx->li * hc->conv_stride : NULL;
 		if (state && exec_segment_pos(ctx, c) == 0)
 			memset(state, 0, (size_t)m->dim * (size_t)(p->conv_kernel - 1) * sizeof(float));
-		size_t		  row0 = (size_t)c * seg.rows;
-		shortconv_job job  = {
-			 .out		 = out + row0 * out_stride,
-			 .state		 = state,
-			 .mixed		 = mixed + row0 * in_stride,
-			 .conv_w	 = conv_w,
-			 .dim		 = m->dim,
-			 .kernel	 = p->conv_kernel,
-			 .history	 = p->conv_kernel - 1,
-			 .in_stride	 = in_stride,
-			 .out_stride = out_stride,
-			 .n_rows	 = seg.rows,
-			 .centered	 = ctx->op->u.shortconv.centered,
-		 };
-		if (pool && m->dim > 8 && tpool_current_tid() < 0)
-			tpool_parallel_for(pool, m->dim, 8, shortconv_chunk, &job);
-		else
-			shortconv_chunk(0, m->dim, -1, &job);
+		size_t		   row0 = (size_t)c * seg.rows;
+		shortconv_desc desc = {
+			.out		= out + row0 * out_stride,
+			.state		= state,
+			.mixed		= mixed + row0 * in_stride,
+			.conv_w		= conv_w,
+			.dim		= m->dim,
+			.kernel		= p->conv_kernel,
+			.in_stride	= in_stride,
+			.out_stride = out_stride,
+			.n_rows		= seg.rows,
+			.centered	= ctx->op->u.shortconv.centered,
+		};
+		status_code st = a->shortconv(a, &desc);
+		if (st != OK) {
+			profile_end(&ctx->s->prof, &ps);
+			return st;
+		}
 	}
 
 	status_code st = recipe_slot_write_commit(ctx, ctx->op->out, out, out_n);

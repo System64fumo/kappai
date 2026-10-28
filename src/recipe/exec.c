@@ -17,6 +17,7 @@ typedef struct {
 	int				 n_steps;
 	const recipe_op *ops;
 	int				 n_ops;
+	int				 weight_layer;
 } exec_schedule;
 
 struct exec_plan {
@@ -259,7 +260,7 @@ static status_code exec_outer_schedule(const struct exec_plan *plan, const exec_
 			.bs			= bs,
 			.li			= -1,
 			.flash_attn = flash_attn,
-			.wtab_row	= plan->wtab,
+			.wtab_row	= plan->wtab + (size_t)sch->weight_layer * WIDX_COUNT,
 			.logits_out = logits_out,
 			.caps		= step->caps,
 		};
@@ -360,15 +361,18 @@ void exec_plan_free(struct exec_plan *p) {
 }
 
 status_code exec_plan_build(model_recipe *r, const struct model *m) {
+	if (r->post_weight_layer < 0 || r->post_weight_layer >= MAX(m->n_layers, 1))
+		return ERR_INVALID_ARG;
 	const cg_set *gs = r->graphs;
 	if (!graph_set_executable(gs)) {
 		ERROR("graph: the optimized graph could not be lowered to an execution schedule");
 		return ERR_UNSUPPORTED;
 	}
-	struct exec_plan *p = xcalloc(1, sizeof(*p));
-	p->n_variants		= gs->n_graphs;
-	p->n_layers			= m->n_layers;
-	p->layer			= xcalloc((size_t)gs->n_graphs, sizeof(exec_schedule));
+	struct exec_plan *p	 = xcalloc(1, sizeof(*p));
+	p->n_variants		 = gs->n_graphs;
+	p->n_layers			 = m->n_layers;
+	p->layer			 = xcalloc((size_t)gs->n_graphs, sizeof(exec_schedule));
+	p->post.weight_layer = r->post_weight_layer;
 	int ok = exec_schedule_build(&p->pre, gs->graphs[0], CG_SECTION_PRE, graph_set_pre_ops(gs),
 								 r->n_pre_ops) == OK &&
 			 exec_schedule_build(&p->post, gs->graphs[0], CG_SECTION_POST, graph_set_post_ops(gs),

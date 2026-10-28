@@ -137,6 +137,13 @@ typedef struct {
 } gdn_desc;
 
 typedef struct {
+	float		*out, *state;
+	const float *mixed, *conv_w;
+	int			 dim, kernel, in_stride, out_stride, n_rows;
+	bool		 centered;
+} shortconv_desc;
+
+typedef struct {
 	const buffer *buf;
 	uint32_t	  type;
 } backend_weight;
@@ -387,6 +394,7 @@ struct backend {
 							  const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
 							  int qk_rope, int n_ctx, float eps);
 	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
+	status_code (*shortconv)(backend *self, const shortconv_desc *d);
 	status_code (*hc_init)(backend *self, const hc_init_desc *d);
 	status_code (*hc_pre)(backend *self, const hc_pre_desc *d);
 	status_code (*hc_post)(backend *self, const hc_post_desc *d);

@@ -116,6 +116,7 @@ typedef struct {
 typedef struct {
 	quant_scratch			  qscratch;
 	const cpu_matmul_packing *matmul_packing;
+	tpool_chunk_fn			  shortconv_centered_chunk;
 	void					 *matmul_packed;
 	size_t					  matmul_packed_cap;
 
@@ -656,6 +657,7 @@ status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x, buffer
 										  int head_dim, float eps);
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx);
 status_code cpu_gated_delta_net(backend *self, const gdn_desc *d);
+status_code cpu_shortconv(backend *self, const shortconv_desc *d);
 status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
 							uint32_t *re_type_out);
 status_code cpu_repack_weight(backend *self, uint32_t type, const void *src, void *dst, int n_rows,
