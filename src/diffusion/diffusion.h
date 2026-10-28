@@ -11,6 +11,7 @@ typedef struct {
 
 typedef struct {
 	const char *diffusion_model;
+	const char *device;
 	const char *vae;
 	const char *llm;
 } diffusion_files;

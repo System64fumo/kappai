@@ -53,8 +53,14 @@ status_code weight_upload(backend *be, uint32_t type, size_t k, size_t rows, con
 	return OK;
 }
 
+status_code weight_load_rows(backend *be, const gguf_tensor *t, size_t row_begin, size_t rows,
+							 weight *out) {
+	const char *data = (const char *)t->data + row_begin * ggml_row_size(t->type, t->dims[0]);
+	return weight_upload(be, t->type, t->dims[0], rows, data, out);
+}
+
 status_code weight_load(backend *be, const gguf_tensor *t, weight *out) {
-	return weight_upload(be, t->type, t->dims[0], tensor_rows(t), t->data, out);
+	return weight_load_rows(be, t, 0, tensor_rows(t), out);
 }
 
 void weight_free(backend *be, weight *w) {
@@ -65,6 +71,8 @@ void weight_free(backend *be, weight *w) {
 }
 
 float *tensor_to_f32(backend *be, const gguf_tensor *t) {
+	if (!backend_has_cap(be, BCAP_IS_HOST))
+		be = backend_host();
 	size_t n   = tensor_elems(t);
 	float *dst = xmalloc(n * sizeof(float));
 	if (t->type == GGML_TYPE_F32)

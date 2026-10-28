@@ -167,7 +167,7 @@ BACKEND_DIR     := $(OUT_DIR)/backends
 BACKEND_OBJ_DIR := $(OUT_DIR)/backend_obj
 BACKEND_CFLAGS  := $(CFLAGS) -fvisibility=hidden
 
-CPU_SHARED_OBJS := $(BACKEND_OBJ_DIR)/backend/cpu/common.o
+CPU_SHARED_OBJS := $(BACKEND_OBJ_DIR)/backend/cpu/common.o $(BACKEND_OBJ_DIR)/backend/cpu/nn_ops.o
 
 cpu_backend_objs = $(CPU_SHARED_OBJS) \
 	$(BACKEND_OBJ_DIR)/backend/cpu/$(1)/core.o \
@@ -344,6 +344,11 @@ SHADER_SPVS := \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/ffn_activate_fused_batch.spv \
 	$(OBJ_DIR)/backend/vulkan/elementwise_batch.spv \
+	$(OBJ_DIR)/backend/vulkan/layernorm_modulate.spv \
+	$(OBJ_DIR)/backend/vulkan/rope_table.spv \
+	$(OBJ_DIR)/backend/vulkan/attention_dense.spv \
+	$(OBJ_DIR)/backend/vulkan/im2col.spv \
+	$(OBJ_DIR)/backend/vulkan/upsample_shortcut.spv \
 	$(OBJ_DIR)/backend/vulkan/matmul_iq4_nl_batch.spv \
 	$(foreach t,$(QCORE_TYPES),$(OBJ_DIR)/backend/vulkan/q_matvec_$(t).spv) \
 	$(foreach t,$(QCORE_TYPES),$(OBJ_DIR)/backend/vulkan/q_matmul_$(t).spv) \

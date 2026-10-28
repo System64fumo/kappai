@@ -191,6 +191,25 @@ typedef struct {
 	float		  *ws;
 } mla_absorbed_desc;
 
+typedef struct {
+	const buffer *q, *k0, *v0, *k1, *v1;
+	buffer		 *out;
+	int			  n_q, n_heads, head_dim, n0, n1;
+	int			  causal;
+} dense_attention_desc;
+
+typedef struct {
+	const buffer *in;
+	buffer		 *col;
+	int			  first_pixel, n_pixels, width, in_height, in_width, channels, shift;
+} im2col_desc;
+
+typedef struct {
+	const buffer *in;
+	buffer		 *out;
+	int			  height, width, in_channels, out_channels, repeats, frames_up, factor;
+} upsample_shortcut_desc;
+
 static inline float *buffer_f32(const buffer *b) {
 	return (float *)(b->handle ? (char *)b->handle + b->offset : (char *)b->host_ptr);
 }
@@ -411,6 +430,17 @@ struct backend {
 							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
 							int n_kv_heads_active);
+	status_code (*layernorm_modulate)(backend *self, const buffer *x, const buffer *scale,
+									  buffer *y, int rows, int dim, float eps);
+	status_code (*gated_add)(backend *self, buffer *x, const buffer *y, const buffer *gate,
+							 int rows, int dim);
+	status_code (*add_bias)(backend *self, buffer *x, const buffer *bias, int rows, int dim);
+	status_code (*activate)(backend *self, buffer *x, int n, int activation);
+	status_code (*rope_table)(backend *self, buffer *x, const buffer *table, int rows, int heads,
+							  int head_dim);
+	status_code (*attention_dense)(backend *self, const dense_attention_desc *d);
+	status_code (*im2col3x3)(backend *self, const im2col_desc *d);
+	status_code (*upsample_shortcut_add)(backend *self, const upsample_shortcut_desc *d);
 	const char *desc;
 };
 

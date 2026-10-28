@@ -27,6 +27,10 @@ params;
 #define MODE_SOFTCAP 4
 #define MODE_SPLIT_QGATE 5
 #define MODE_ATTN_OUTPUT_GATE 6
+#define MODE_ACT_SILU 7
+#define MODE_ACT_GELU 8
+#define MODE_ADD_BIAS 9
+#define MODE_GATED_ADD 10
 
 void main() {
 	uint row = gl_WorkGroupID.y;
@@ -64,6 +68,22 @@ void main() {
 	}
 	case MODE_ATTN_OUTPUT_GATE:
 		dst[row_off + i] = dst[row_off + i] * (1.0 / (1.0 + exp(-src1[row_off + i])));
+		break;
+	case MODE_ACT_SILU: {
+		float v			 = dst[row_off + i];
+		dst[row_off + i] = v / (1.0 + exp(-v));
+		break;
+	}
+	case MODE_ACT_GELU: {
+		float v			 = dst[row_off + i];
+		dst[row_off + i] = 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
+		break;
+	}
+	case MODE_ADD_BIAS:
+		dst[row_off + i] = dst[row_off + i] + src1[i];
+		break;
+	case MODE_GATED_ADD:
+		dst[row_off + i] = dst[row_off + i] + src1[row_off + i] * tanh(src2[i]);
 		break;
 	default:
 		break;

@@ -15,6 +15,7 @@ static void usage(const char *prog) {
 			"      --steps N             (default 20)\n"
 			"      --cfg-scale F         (default 6.0)\n"
 			"      --seed N              (default 0)\n"
+			"      --device SPEC         (default cpu0, e.g. vulkan0)\n"
 			"  -o, --out PATH            (default image.png)\n"
 			"      --out-preview PATH\n"
 			"      --preview-interval S  (default 1.0)\n"
@@ -29,6 +30,7 @@ enum {
 	OPT_STEPS,
 	OPT_CFG,
 	OPT_SEED,
+	OPT_DEVICE,
 	OPT_PREVIEW,
 	OPT_PREVIEW_INTERVAL,
 	OPT_DEBUG,
@@ -45,6 +47,7 @@ static const struct option long_opts[] = {
 	{"steps", required_argument, 0, OPT_STEPS},
 	{"cfg-scale", required_argument, 0, OPT_CFG},
 	{"seed", required_argument, 0, OPT_SEED},
+	{"device", required_argument, 0, OPT_DEVICE},
 	{"out", required_argument, 0, 'o'},
 	{"out-preview", required_argument, 0, OPT_PREVIEW},
 	{"preview-interval", required_argument, 0, OPT_PREVIEW_INTERVAL},
@@ -88,6 +91,9 @@ static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_
 		case OPT_SEED:
 			p->seed = strtoull(optarg, NULL, 10);
 			break;
+		case OPT_DEVICE:
+			files->device = optarg;
+			break;
 		case 'o':
 			*out_path = optarg;
 			break;
@@ -108,7 +114,7 @@ static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_
 }
 
 int main(int argc, char **argv) {
-	diffusion_files	 files = {0};
+	diffusion_files	 files = {.device = "cpu0"};
 	diffusion_params p	   = {
 		.prompt			  = NULL,
 		.negative_prompt  = "",

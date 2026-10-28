@@ -2035,6 +2035,14 @@ status_code cpu_backend_fill(backend *out) {
 	out->cpu_info						 = cpu_info;
 	out->rmsnorm_batch					 = cpu_rmsnorm_batch;
 	out->add_batch						 = cpu_add_batch;
+	out->layernorm_modulate				 = cpu_layernorm_modulate;
+	out->gated_add						 = cpu_gated_add;
+	out->add_bias						 = cpu_add_bias;
+	out->activate						 = cpu_activate;
+	out->rope_table						 = cpu_rope_table;
+	out->attention_dense				 = cpu_attention_dense;
+	out->im2col3x3						 = cpu_im2col3x3;
+	out->upsample_shortcut_add			 = cpu_upsample_shortcut_add;
 	out->ffn_activate_batch				 = cpu_ffn_activate_batch;
 	out->rope_batch						 = cpu_rope_batch;
 	out->rope_qk_batch					 = cpu_rope_qk_batch;
