@@ -63,6 +63,13 @@ ifneq ($(UNKNOWN_BACKENDS),)
 endif
 HAS_VULKAN  := $(filter vulkan,$(REQUESTED_BACKENDS))
 HAS_OPENGL := $(filter opengl,$(REQUESTED_BACKENDS))
+HAS_ROCKET := $(filter rocket,$(REQUESTED_BACKENDS))
+
+ifneq ($(HAS_ROCKET),)
+  ifneq ($(HOST_OS),Linux)
+    $(error The rocket backend requires Linux)
+  endif
+endif
 
 CONFIG_FILE := $(OUT_DIR)/config.mk
 CONFIG_AGNOSTIC_GOALS := clean format tidy print-config backends-help config
@@ -206,6 +213,13 @@ ifneq ($(HAS_OPENGL),)
   GL_BACKEND := $(BACKEND_DIR)/libkappai_opengl$(SHLIB_SUFFIX)
   BACKEND_LIBS += $(GL_BACKEND)
   BACKEND_OBJS += $(GL_BACKEND_OBJS)
+endif
+
+ifneq ($(HAS_ROCKET),)
+  ROCKET_BACKEND_OBJS := $(patsubst $(SRC_DIR)/%.c,$(BACKEND_OBJ_DIR)/%.o,$(wildcard $(SRC_DIR)/backend/rocket/*.c))
+  ROCKET_BACKEND := $(BACKEND_DIR)/libkappai_rocket$(SHLIB_SUFFIX)
+  BACKEND_LIBS += $(ROCKET_BACKEND)
+  BACKEND_OBJS += $(ROCKET_BACKEND_OBJS)
 endif
 
 ifneq ($(HAS_VULKAN),)
@@ -496,6 +510,13 @@ $(SCALAR_BACKEND): $(SCALAR_BACKEND_OBJS) | $(ENGINE)
 	@echo "  LD(b)   $@"
 	@$(CC) $(BACKEND_CFLAGS) $(SCALAR_BACKEND_OBJS) $(BACKEND_LINK_FLAGS) -o $@
 	$(SPLIT_DEBUG)
+
+ifneq ($(HAS_ROCKET),)
+$(ROCKET_BACKEND): $(ROCKET_BACKEND_OBJS) | $(ENGINE)
+	@echo "  LD(b)   $@"
+	@$(CC) $(BACKEND_CFLAGS) $(ROCKET_BACKEND_OBJS) $(BACKEND_LINK_FLAGS) -o $@
+	$(SPLIT_DEBUG)
+endif
 
 ifneq ($(CPU_ARCH_DIR),)
 $(ARCH_BACKEND): $(ARCH_BACKEND_OBJS) | $(ENGINE)

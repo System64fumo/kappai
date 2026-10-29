@@ -2977,6 +2977,19 @@ static void test_batch_matmul_parity(backend *ref, backend *tgt, const qtype_inf
 			tgt->buffer_read_f32(tgt, &yb_tgt, y_tgt, n * m);
 		snprintf(label, sizeof(label), "%s batch cross N=%d K=%d M=%d", qt->name, n, k, m);
 		test_parity_compare_status(OPFAM_BATCH_PARITY, label, y_batch, y_tgt, n * m, s_tgt);
+		if (qt->type == GGML_TYPE_Q8_0 && m >= 32 && s_tgt == OK) {
+			for (int i = 0; i < k * m; i++)
+				x[i] = -x[i];
+			for (int i = 0; i < n * m; i++)
+				y_batch[i] = -y_batch[i];
+			tgt->buffer_write_f32(tgt, &xb_tgt, x, k * m);
+			s_tgt = tgt->matmul_batch(tgt, &w_tgt, qt->type, &xb_tgt, &yb_tgt, n, k, m);
+			ensure_sync(tgt);
+			if (s_tgt == OK)
+				tgt->buffer_read_f32(tgt, &yb_tgt, y_tgt, n * m);
+			snprintf(label, sizeof(label), "%s batch reuse N=%d K=%d M=%d", qt->name, n, k, m);
+			test_parity_compare_status(OPFAM_BATCH_PARITY, label, y_batch, y_tgt, n * m, s_tgt);
+		}
 		free(y_tgt);
 		tgt->buffer_free(tgt, &w_tgt);
 		tgt->buffer_free(tgt, &xb_tgt);
@@ -4686,6 +4699,11 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 			test_batch_matmul_parity(ref, tgt, qt, 17, 32, 128);
 			test_batch_matmul_parity(ref, tgt, qt, 67, 96, 129);
 			test_batch_matmul_parity(ref, tgt, qt, 129, 160, 257);
+			test_batch_matmul_parity(ref, tgt, qt, 8257, 256, 33);
+			test_batch_matmul_parity(ref, tgt, qt, 17, 8224, 33);
+			test_batch_matmul_parity(ref, tgt, qt, 384, 4096, 128);
+			test_batch_matmul_parity(ref, tgt, qt, 384, 4608, 128);
+			test_batch_matmul_parity(ref, tgt, qt, 8193, 1152, 32);
 		}
 	}
 	flush_family(OPFAM_BATCH_PARITY);

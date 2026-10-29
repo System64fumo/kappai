@@ -98,6 +98,7 @@ void config_usage(FILE *fp, bool is_server) {
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
 			"  --mmap [bool]            mmap model weights (default: on)\n"
 			"  --repack MODE            weight repacking: all|none|<types> (default: smart)\n"
+			"  --npu-int8 [bool]        experimental NPU INT8 quantization (default: off)\n"
 			"  --fuse LIST              load-time weight fusion, comma list: qkv\n"
 			"  --moe-stream [bool]      streaming expert cache for MoE models (default: on)\n"
 			"  --moe-cache <n>          per-layer LRU capacity for expert cache\n"
@@ -379,6 +380,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_MONITOR,
 		OPT_MMAP,
 		OPT_REPACK,
+		OPT_NPU_INT8,
 		OPT_FUSE,
 		OPT_REASONING,
 		OPT_DISABLE_FAILSAFES,
@@ -425,6 +427,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"monitor", OPT_MONITOR, CLI_OPT_MONITOR, NULL, 0, 0},
 		{"mmap", OPT_MMAP, CLI_OPT_BOOL_FLAG, &cfg->use_mmap, 0, 0},
 		{"repack", OPT_REPACK, CLI_OPT_STRING, &cfg->repack, 0, 0},
+		{"npu-int8", OPT_NPU_INT8, CLI_OPT_BOOL_FLAG, &cfg->npu_int8, 0, 0},
 		{"fuse", OPT_FUSE, CLI_OPT_STRING, &cfg->fuse, 0, 0},
 		{"reasoning", OPT_REASONING, CLI_OPT_BOOL_FLAG, &cfg->reasoning, 0, 0},
 		{"disable-failsafes", OPT_DISABLE_FAILSAFES, CLI_OPT_FLAG_TRUE, &cfg->disable_failsafes, 0,

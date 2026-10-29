@@ -158,6 +158,8 @@ int run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends) 
 		run_per_op_tests(ref, tgt);
 		run_arch_tests(ref, tgt);
 		backend_destroy(tgt);
+		if (strcmp(infos[bi].name, "rocket") == 0)
+			run_rocket_tests();
 	}
 	if (!any_run)
 		fprintf(stderr, "No matching/available backends were tested.\n");

@@ -167,6 +167,7 @@ void usage(const char *prog);
 
 int	 run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends);
 void run_per_op_tests(backend *ref, backend *tgt);
+void run_rocket_tests(void);
 void run_arch_tests(backend *ref, backend *tgt);
 
 void		synth_suite_common_init(void);
