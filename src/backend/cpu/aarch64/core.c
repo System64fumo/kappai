@@ -1375,7 +1375,7 @@ static void cpu_attn_batch_chunk_neon(int begin, int end, int tid, void *ctx) {
 			continue;
 
 		int pos		   = j->pos_start + row;
-		int n_pos	   = pos + 1;
+		int n_pos	   = j->n_keys > 0 ? j->n_keys : pos + 1;
 		int attn_start = 0;
 		if (j->sliding_window > 0 && n_pos > j->sliding_window) {
 			attn_start = n_pos - j->sliding_window;
@@ -2648,4 +2648,70 @@ void detect_features(char *buf, size_t cap) {
 	feat_add(buf, cap, "i8mm");
 #endif
 }
-CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, NULL)
+static void shortconv_centered_neon(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	const shortconv_desc *j = ctx;
+	for (int t = begin; t < end; t++) {
+		const float *b	 = j->mixed + (size_t)t * j->in_stride;
+		const float *c	 = b + j->dim;
+		const float *x	 = c + j->dim;
+		float		*out = j->out + (size_t)t * j->out_stride;
+		int			 i	 = 0;
+		for (; i + 4 <= j->dim; i += 4) {
+			float32x4x3_t w	  = vld3q_f32(j->conv_w + 3 * (size_t)i);
+			float32x4_t	  bx  = vmulq_f32(vld1q_f32(b + i), vld1q_f32(x + i));
+			float32x4_t	  sum = vmulq_f32(bx, w.val[1]);
+			if (t > 0) {
+				float32x4_t prev =
+					vmulq_f32(vld1q_f32(b + i - j->in_stride), vld1q_f32(x + i - j->in_stride));
+				sum = vmlaq_f32(sum, prev, w.val[0]);
+			}
+			if (t + 1 < j->n_rows) {
+				float32x4_t next =
+					vmulq_f32(vld1q_f32(b + i + j->in_stride), vld1q_f32(x + i + j->in_stride));
+				sum = vmlaq_f32(sum, next, w.val[2]);
+			}
+			vst1q_f32(out + i, vmulq_f32(vld1q_f32(c + i), sum));
+		}
+		for (; i < j->dim; i++) {
+			const float *w	 = j->conv_w + 3 * (size_t)i;
+			float		 sum = (b[i] * x[i]) * w[1];
+			if (t > 0)
+				sum += (b[i - j->in_stride] * x[i - j->in_stride]) * w[0];
+			if (t + 1 < j->n_rows)
+				sum += (b[i + j->in_stride] * x[i + j->in_stride]) * w[2];
+			out[i] = c[i] * sum;
+		}
+	}
+}
+
+static status_code cpu_arch_init(backend *self, int device_index) {
+	status_code st = cpu_init(self, device_index);
+	if (st != OK)
+		return st;
+	cpu_priv *p					= self->priv;
+	p->shortconv_centered_chunk = shortconv_centered_neon;
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+	p->matmul_packing = &cpu_q8_x4_packing;
+#endif
+	return OK;
+}
+
+CPU_BACKEND_REGISTER("cpu", cpu_arch_ctor, 10, NULL, cpu_arch_init)
+
+status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale) {
+	if (n_rows < 1 || n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 1 ||
+		head_dim > HEAD_DIM_MAX)
+		return ERR_INVALID_ARG;
+	cpu_attn_batch_job job	 = cpu_full_attn_job(self, q, k, v, out, n_heads, n_kv_heads, head_dim,
+												 n_rows, flash_attn, scale);
+	cpu_priv		  *p	 = self->priv;
+	int				   total = n_rows * n_heads;
+	if (p->pool && p->thread_scratch && tpool_current_tid() < 0 && total >= 2)
+		tpool_parallel_for(p->pool, total, 1, cpu_attn_batch_chunk_neon, &job);
+	else
+		cpu_attn_batch_chunk_neon(0, total, 0, &job);
+	return OK;
+}

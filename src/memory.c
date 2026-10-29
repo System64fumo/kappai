@@ -158,7 +158,7 @@ typedef struct {
 
 static size_t calc_embeddings_bytes(const model *m) {
 	size_t total = ggml_row_size(m->tok_embd.type, m->dim) * m->vocab_size;
-	if (!m->tie_embeddings)
+	if (!m->tie_embeddings && m->output_w.host_ptr)
 		total += ggml_row_size(m->output_w.type, m->dim) * m->vocab_size;
 	return total;
 }
@@ -280,6 +280,8 @@ static size_t model_kda_state_bytes(const model *m, int n_ctx) {
 
 size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
 								  int compacted) {
+	if (m->full_sequence)
+		return 0;
 	size_t kv_cache = 0;
 	if (m->arch_info->is_kda)
 		return model_kda_state_bytes(m, n_ctx);
@@ -319,7 +321,20 @@ static int moe_cache_cap(const model *m, const config *cfg) {
 
 static non_expert_breakdown calc_non_expert_breakdown(const model *m) {
 	non_expert_breakdown b = {0};
-	b.embd				   = calc_embeddings_bytes(m);
+	if (m->full_sequence) {
+		for (size_t i = 0; i < m->gctx.n_tensors; i++) {
+			const gguf_tensor *t = &m->gctx.tensors[i];
+			if (gguf_tensor_layer_index(t->name) < 0)
+				b.embd += t->byte_size;
+			else if (strstr(t->name, ".ffn_"))
+				b.dense_ffn += t->byte_size;
+			else
+				b.attn += t->byte_size;
+		}
+		b.total = b.embd + b.attn + b.dense_ffn;
+		return b;
+	}
+	b.embd = calc_embeddings_bytes(m);
 	for (int i = 0; i < m->n_layers; i++) {
 		b.attn += calc_attn_bytes(m, i);
 		b.dense_ffn += calc_dense_ffn_bytes(m, i);
@@ -352,6 +367,16 @@ void model_mem_estimates_ensure(model *m) {
 
 size_t model_device_weight_bytes(const model *m, const backend *b) {
 	size_t total = 0;
+	if (m->full_sequence) {
+		for (size_t i = 0; i < m->gctx.n_tensors; i++) {
+			const gguf_tensor *t	 = &m->gctx.tensors[i];
+			int				   li	 = gguf_tensor_layer_index(t->name);
+			backend			  *owner = li < 0 ? m->backend : model_layer_backend(m, li);
+			if (owner == b)
+				total += t->byte_size;
+		}
+		return total;
+	}
 	for (int i = 0; i < m->n_layers; i++) {
 		if (model_layer_backend(m, i) != b)
 			continue;

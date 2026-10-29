@@ -531,10 +531,13 @@ static int layer_node_count(const cg_graph *g) {
 	return g->section_begin[CG_SECTION_POST] - g->section_begin[CG_SECTION_LAYER];
 }
 
-static void resolve_outer_weights(cg_graph *g, const struct model *m) {
-	for (int i = 0; i < g->n_nodes; i++)
-		if (g->nodes[i].section != CG_SECTION_LAYER)
-			g->nodes[i].weight = recipe_resolve_weight_ref(m, -1, g->nodes[i].w_idx);
+static void resolve_outer_weights(cg_graph *g, const struct model *m, const model_recipe *r) {
+	for (int i = 0; i < g->n_nodes; i++) {
+		if (g->nodes[i].section == CG_SECTION_LAYER)
+			continue;
+		int li			   = g->nodes[i].section == CG_SECTION_POST ? r->post_weight_layer : -1;
+		g->nodes[i].weight = recipe_resolve_weight_ref(m, li, g->nodes[i].w_idx);
+	}
 }
 
 static void resolve_layer_weights(cg_set *s, const struct model *m, int count) {
@@ -714,7 +717,7 @@ cg_set *graph_set_build(const model_recipe *r, const struct model *m, int n_laye
 	}
 	if (m) {
 		for (int g = 0; g < s->n_graphs; g++)
-			resolve_outer_weights(s->graphs[g], m);
+			resolve_outer_weights(s->graphs[g], m, r);
 		resolve_layer_weights(s, m, count);
 		resolve_layer_backends(s, m, count);
 		resolve_impls(s, m, count);

@@ -266,7 +266,21 @@ static inline backend *op_backend_pick(backend *a, int has_field, const char *op
 	return op_backend_fallback(a, op_name);
 }
 
-static inline float	 *batch_buf_ptr(const buffer *b);
+static inline float		 *batch_buf_ptr(const buffer *b);
+static inline weight_ref *exec_weight_ref(const exec_ctx *ctx, uint8_t w_idx) {
+	if (w_idx == RECIPE_NO_WEIGHT || w_idx == WIDX_NONE)
+		return (weight_ref *)&WEIGHT_REF_NONE;
+	if (ctx->wtab_row) {
+		weight_ref *w = ctx->wtab_row[w_idx];
+		return w ? w : (weight_ref *)&WEIGHT_REF_NONE;
+	}
+	return resolve_weight_ref(ctx->m, ctx->li, w_idx);
+}
+
+static inline const buffer *exec_weight(const exec_ctx *ctx, uint8_t w_idx) {
+	return &exec_weight_ref(ctx, w_idx)->buf;
+}
+
 static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 	return batch_slot(ctx->bs, idx);
 }
@@ -316,5 +330,11 @@ static inline float *batch_buf_ptr(const buffer *b) {
 		return (float *)((const char *)b->host_ptr + b->offset);
 	return (float *)((char *)b->handle + b->offset);
 }
+
+status_code op_layernorm(exec_ctx *ctx);
+status_code op_add_bias(exec_ctx *ctx);
+status_code op_split_qkv(exec_ctx *ctx);
+status_code op_activate(exec_ctx *ctx);
+status_code op_attention_full(exec_ctx *ctx);
 
 #endif

@@ -60,16 +60,16 @@ static inline size_t cpu_host_mem_total(void) {
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
 	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT)
 
-status_code cpu_backend_fill(backend *out);
+status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int));
 
-#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str)                                    \
+#define CPU_BACKEND_REGISTER(name_str, ctor_fn, prio, desc_str, init_fn)                           \
 	static status_code ctor_fn(backend *out) {                                                     \
 		memset(out, 0, sizeof(*out));                                                              \
 		out->name	  = name_str;                                                                  \
 		out->priority = prio;                                                                      \
 		out->caps	  = CPU_BACKEND_CAPS;                                                          \
 		out->desc	  = desc_str;                                                                  \
-		return cpu_backend_fill(out);                                                              \
+		return cpu_backend_fill(out, init_fn);                                                     \
 	}                                                                                              \
 	BACKEND_REGISTER(name_str, ctor_fn)
 
@@ -106,7 +106,19 @@ typedef struct {
 } cpu_rope_cs_cache;
 
 typedef struct {
-	quant_scratch qscratch;
+	uint32_t w_type;
+	status_code (*prepare)(const void *xq, size_t row_stride_blocks, int k, int m, void **out,
+						   size_t *capacity);
+	void (*matmul)(const void *w, const void *packed, float *y, int y_row_stride, int n, int k,
+				   int m);
+} cpu_matmul_packing;
+
+typedef struct {
+	quant_scratch			  qscratch;
+	const cpu_matmul_packing *matmul_packing;
+	tpool_chunk_fn			  shortconv_centered_chunk;
+	void					 *matmul_packed;
+	size_t					  matmul_packed_cap;
 
 	void		 *xq8_buf;
 	size_t		  xq8_buf_cap;
@@ -128,6 +140,7 @@ typedef struct {
 	int *bitrev_perm_cache;
 	int	 bitrev_perm_cap;
 
+	float_buf		   full_attn_kv;
 	cpu_mla_krot_cache mla_krot;
 	cpu_rope_cs_cache  rope_cs;
 
@@ -393,6 +406,7 @@ typedef struct {
 	float		   *outf;
 	int				n_groups, head_dim, hd_stride;
 	int				n_heads, pos_start, m, sliding_window, flash_attn;
+	int				n_keys;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;
@@ -628,6 +642,8 @@ status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up
 							 int n);
 status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								int n, int activation);
+status_code cpu_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out, int n,
+										 int activation, int m);
 status_code cpu_rmsnorm_per_head(backend *self, const buffer *x, const buffer *w, buffer *y,
 								 int n_heads, int head_dim, float eps);
 status_code cpu_rmsnorm_per_head_batch(backend *self, const buffer *x, const buffer *w, buffer *y,
@@ -641,6 +657,7 @@ status_code cpu_rmsnorm_noweight_per_head(backend *self, const buffer *x, buffer
 										  int head_dim, float eps);
 status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx);
 status_code cpu_gated_delta_net(backend *self, const gdn_desc *d);
+status_code cpu_shortconv(backend *self, const shortconv_desc *d);
 status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
 							uint32_t *re_type_out);
 status_code cpu_repack_weight(backend *self, uint32_t type, const void *src, void *dst, int n_rows,
@@ -714,5 +731,12 @@ void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
 void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
 status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 							   const float *freq_factors, float **cs_out);
+
+cpu_attn_batch_job cpu_full_attn_job(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale);
+status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale);
 
 #endif

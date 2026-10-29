@@ -87,20 +87,6 @@ status_code recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const flo
 	return b->owner->buffer_write_f32(b->owner, b, staged, n);
 }
 
-static inline weight_ref *exec_weight_ref(const exec_ctx *ctx, uint8_t w_idx) {
-	if (w_idx == RECIPE_NO_WEIGHT || w_idx == WIDX_NONE)
-		return (weight_ref *)&WEIGHT_REF_NONE;
-	if (ctx->wtab_row) {
-		weight_ref *w = ctx->wtab_row[w_idx];
-		return w ? w : (weight_ref *)&WEIGHT_REF_NONE;
-	}
-	return resolve_weight_ref(ctx->m, ctx->li, w_idx);
-}
-
-static inline const buffer *exec_weight(const exec_ctx *ctx, uint8_t w_idx) {
-	return &exec_weight_ref(ctx, w_idx)->buf;
-}
-
 static status_code copy_k_to_v_buffers(backend *a, buffer *kb, buffer *vb, int kv_out,
 									   int kv_stride, int n_rows, float_buf *stage) {
 	if (a->copy_buffer && kb->owner == vb->owner) {
@@ -701,7 +687,7 @@ static status_code ffn_fused_host(exec_ctx *ctx) {
 	int			 n	   = ctx->op->u.ffn_act.n;
 	const float *fused = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->in[0]));
 	float		*out   = batch_buf_ptr(batch_slot(ctx->bs, ctx->op->out));
-	backend		*t	   = op_host_backend();
+	backend		*t	   = exec_layer_backend(ctx);
 	if (!t->ffn_activate_ex)
 		return ERR_UNSUPPORTED;
 	return ffn_activate_ex_rows(t, fused, out, n, ctx->op->u.ffn_act.activation, ctx->rows.n_rows,
@@ -769,7 +755,7 @@ status_code op_logits_readback(exec_ctx *ctx) {
 	ensure_sync(ctx->m->backend);
 	buffer *logits = exec_slot(ctx, ctx->op->in[0]);
 	return logits->owner->buffer_read_f32(logits->owner, logits, ctx->logits_out,
-										  ctx->rows.n_rows * ctx->m->vocab_size);
+										  ctx->rows.n_rows * model_output_size(ctx->m));
 }
 
 typedef status_code (*batch_row_fn)(buffer *row, void *ud);

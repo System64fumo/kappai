@@ -409,7 +409,7 @@ status_code context_init(context *c, const config *cfg) {
 		goto fail_model;
 	}
 
-	s = chat_template_init(&c->chat, &c->m.gctx, &c->tok);
+	s = c->m.full_sequence ? OK : chat_template_init(&c->chat, &c->m.gctx, &c->tok);
 	if (s != OK) {
 		ERROR("failed to init chat template");
 		goto fail_tokenizer;
@@ -453,7 +453,7 @@ status_code context_init(context *c, const config *cfg) {
 		goto fail_chat;
 	}
 
-	if (c->m.mixed_backend_mode) {
+	if (c->m.mixed_backend_mode && !c->m.full_sequence) {
 		s = kvcache_alloc_mirrors(&c->kv, &c->m);
 		if (s != OK) {
 			ERROR("failed to allocate host-side KV cache mirror for mixed backend mode");

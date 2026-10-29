@@ -636,7 +636,7 @@ static void cpu_attn_batch_chunk(int begin, int end, int tid, void *ctx) {
 			continue;
 
 		int pos		   = j->pos_start + row;
-		int n_pos	   = pos + 1;
+		int n_pos	   = j->n_keys > 0 ? j->n_keys : pos + 1;
 		int attn_start = 0;
 		if (j->sliding_window > 0 && n_pos > j->sliding_window) {
 			attn_start = n_pos - j->sliding_window;
@@ -1458,4 +1458,21 @@ status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
 	return matmul_vec(self, &d->wo, ho, d->out, dim, H * vh);
 }
 
-CPU_BACKEND_REGISTER("cpu_scalar", cpu_scalar_ctor, 0, NULL)
+CPU_BACKEND_REGISTER("cpu_scalar", cpu_scalar_ctor, 0, NULL, cpu_init)
+
+status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale) {
+	if (n_rows < 1 || n_heads < 1 || n_kv_heads < 1 || n_heads % n_kv_heads != 0 || head_dim < 1 ||
+		head_dim > HEAD_DIM_MAX)
+		return ERR_INVALID_ARG;
+	cpu_attn_batch_job job	 = cpu_full_attn_job(self, q, k, v, out, n_heads, n_kv_heads, head_dim,
+												 n_rows, flash_attn, scale);
+	cpu_priv		  *p	 = self->priv;
+	int				   total = n_rows * n_heads;
+	if (p->pool && p->thread_scratch && tpool_current_tid() < 0 && total >= 2)
+		tpool_parallel_for(p->pool, total, 1, cpu_attn_batch_chunk, &job);
+	else
+		cpu_attn_batch_chunk(0, total, 0, &job);
+	return OK;
+}

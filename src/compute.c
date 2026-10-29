@@ -193,7 +193,7 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 
 	s->model.backend = m->backend;
 
-	s->logits_host = xmalloc((size_t)m->vocab_size * sizeof(float));
+	s->logits_host = xmalloc((size_t)model_output_size(m) * sizeof(float));
 
 	if (m->arch_info->is_moe)
 		s->moe.slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe.slot_buf));

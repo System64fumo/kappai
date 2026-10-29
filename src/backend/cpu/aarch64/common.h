@@ -6,6 +6,10 @@
 #include <arm_neon.h>
 #include <string.h>
 
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+extern const cpu_matmul_packing cpu_q8_x4_packing;
+#endif
+
 #define CACHE_LINE_BYTES (g_cpu_cache.line_bytes)
 #define L1D_SIZE_BYTES (g_cpu_cache.l1d_bytes)
 #define L2_SIZE_BYTES (g_cpu_cache.l2_bytes)

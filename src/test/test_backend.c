@@ -3561,6 +3561,110 @@ static void rs_free(backend *b, buffer **bufs, int n) {
 		b->buffer_free(b, bufs[i]);
 }
 
+static void test_multi_batch_shared_input(backend *ref, backend *tgt, uint32_t middle_type, int m) {
+	char label[128];
+	snprintf(label, sizeof(label), "multi_batch shared Q8 input middle=%s M=%d",
+			 rs_qtype(middle_type)->name, m);
+	if (!tgt->matmul_multi_batch || !tgt->matmul_batch) {
+		record_result(OPFAM_BATCH_PARITY, label, V_SKIP, "backend lacks batch matmul");
+		return;
+	}
+	const int	   k		= 256;
+	const int	   ns[3]	= {24, 16, 8};
+	const uint32_t types[3] = {GGML_TYPE_Q8_0_REPACKED, middle_type, GGML_TYPE_Q8_0_REPACKED};
+	int			   total	= (ns[0] + ns[1] + ns[2]) * m;
+	float		  *x		= xmalloc((size_t)k * m * sizeof(float));
+	float		  *expected = xmalloc((size_t)total * sizeof(float));
+	float		  *got		= xmalloc((size_t)total * sizeof(float));
+	seed_test_rng(0x5A4EDULL + (uint64_t)middle_type * 17 + (uint64_t)m);
+	fill_random_f32(x, k * m, 1.0f);
+	for (int i = 0; i < total; i++)
+		got[i] = NAN;
+	buffer		xb = rs_scratch(tgt, x, k * m);
+	buffer		weights[3], outputs[3];
+	void	   *raw[3];
+	status_code st	   = OK;
+	int			offset = 0;
+	for (int i = 0; i < 3; i++) {
+		const qtype_info *qt = rs_qtype(types[i]);
+		raw[i]				 = test_make_weight(ref, qt, ns[i], k, NULL);
+		weights[i]			 = rs_weight(tgt, qt, raw[i], ns[i], k);
+		outputs[i]			 = rs_scratch(tgt, NULL, ns[i] * m);
+		if (st == OK)
+			st = tgt->matmul_batch(tgt, &weights[i], types[i], &xb, &outputs[i], ns[i], k, m);
+		rs_read(tgt, &outputs[i], expected + offset, ns[i] * m);
+		tgt->buffer_write_f32(tgt, &outputs[i], got + offset, ns[i] * m);
+		offset += ns[i] * m;
+	}
+	const buffer *ws[3] = {&weights[0], &weights[1], &weights[2]};
+	buffer		 *ys[3] = {&outputs[0], &outputs[1], &outputs[2]};
+	if (st == OK)
+		st = tgt->matmul_multi_batch(tgt, ws, types, &xb, ys, ns, k, 3, m);
+	offset = 0;
+	for (int i = 0; i < 3; i++) {
+		rs_read(tgt, &outputs[i], got + offset, ns[i] * m);
+		offset += ns[i] * m;
+	}
+	test_parity_compare_status(OPFAM_BATCH_PARITY, label, expected, got, total, st);
+	buffer *all[] = {&xb,		  &weights[0], &weights[1], &weights[2],
+					 &outputs[0], &outputs[1], &outputs[2]};
+	rs_free(tgt, all, 7);
+	for (int i = 0; i < 3; i++)
+		free(raw[i]);
+	free(x);
+	free(expected);
+	free(got);
+}
+
+static void test_ffn_activate_fused_batch(backend *tgt, int n, int m, int activation) {
+	char label[128];
+	snprintf(label, sizeof(label), "ffn_activate_fused_batch %s N=%d M=%d",
+			 activation == 1 ? "GELU" : "SiLU", n, m);
+	if (!tgt->ffn_activate_fused_batch || !tgt->ffn_activate_ex) {
+		record_result(OPFAM_FFN_ACTIVATE_EX, label, V_SKIP, "backend lacks fused activation");
+		return;
+	}
+	int	   total	= n * m;
+	float *x		= xmalloc((size_t)(2 * total + 3) * sizeof(float));
+	float *expected = xmalloc((size_t)(total + 4) * sizeof(float));
+	float *got		= xmalloc((size_t)(total + 4) * sizeof(float));
+	seed_test_rng(0xF05EDULL + (uint64_t)n * 17 + (uint64_t)m + (uint64_t)activation);
+	fill_random_f32(x, 2 * total + 3, 4.0f);
+	for (int i = 0; i < total + 4; i++)
+		expected[i] = 1234.5f;
+	buffer		input	  = rs_scratch(tgt, x, 2 * total + 3);
+	buffer		reference = rs_scratch(tgt, expected, total + 4);
+	buffer		output	  = rs_scratch(tgt, expected, total + 4);
+	status_code st		  = OK;
+	for (int row = 0; row < m && st == OK; row++) {
+		buffer g = buffer_slice(&input, (size_t)(3 + 2 * row * n) * sizeof(float),
+								(size_t)n * sizeof(float));
+		buffer u = buffer_slice(&g, (size_t)n * sizeof(float), (size_t)n * sizeof(float));
+		buffer o = buffer_slice(&reference, (size_t)(2 + row * n) * sizeof(float),
+								(size_t)n * sizeof(float));
+		st		 = tgt->ffn_activate_ex(tgt, &g, &u, &o, n, activation);
+	}
+	rs_read(tgt, &reference, expected, total + 4);
+	buffer fused = buffer_slice(&input, 3 * sizeof(float), (size_t)2 * total * sizeof(float));
+	buffer out	 = buffer_slice(&output, 2 * sizeof(float), (size_t)total * sizeof(float));
+	if (st == OK)
+		st = tgt->ffn_activate_fused_batch(tgt, &fused, &out, n, activation, m);
+	rs_read(tgt, &output, got, total + 4);
+	char	detail[256];
+	verdict v = classify_output("loose", expected + 2, got + 2, total, st, detail, sizeof(detail));
+	if (memcmp(expected, got, 2 * sizeof(float)) ||
+		memcmp(expected + total + 2, got + total + 2, 2 * sizeof(float))) {
+		v = V_FAIL;
+		snprintf(detail, sizeof(detail), "output guards overwritten");
+	}
+	record_result(OPFAM_FFN_ACTIVATE_EX, label, v, detail);
+	buffer *all[] = {&input, &reference, &output};
+	rs_free(tgt, all, 3);
+	free(x);
+	free(expected);
+	free(got);
+}
+
 static void rs_skip(const char *label, const char *why) {
 	record_result(RS_FAM, label, V_SKIP, why);
 }
@@ -4548,6 +4652,13 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_ffn_activate_ex(ref, tgt, 4096, 0);
 	test_op_ffn_activate_ex(ref, tgt, 6144, 1);
 	test_op_ffn_activate_ex(ref, tgt, 12288, 1);
+	for (int act = 0; act < 2; act++) {
+		test_ffn_activate_fused_batch(tgt, 31, 1, act);
+		test_ffn_activate_fused_batch(tgt, 12289, 1, act);
+		test_ffn_activate_fused_batch(tgt, 67, 5, act);
+		test_ffn_activate_fused_batch(tgt, 4608, 128, act);
+		test_ffn_activate_fused_batch(tgt, 12289, 3, act);
+	}
 	flush_family(OPFAM_FFN_ACTIVATE_EX);
 
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 0, 0);
@@ -4694,6 +4805,18 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 6144, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 1536, 12288, 8);
 		test_batch_matmul_parity(ref, tgt, qt, 2048, 1536, 70);
+	}
+	const qtype_info *q8_repacked = rs_qtype(GGML_TYPE_Q8_0_REPACKED);
+	int q8_shapes[][3] = {{8, 32, 4}, {24, 96, 5}, {16, 256, 7}, {24, 96, 9}, {16, 256, 128}};
+	for (int i = 0; i < (int)(sizeof(q8_shapes) / sizeof(q8_shapes[0])); i++)
+		test_batch_matmul_parity(ref, tgt, q8_repacked, q8_shapes[i][0], q8_shapes[i][1],
+								 q8_shapes[i][2]);
+	const uint32_t shared_types[] = {GGML_TYPE_Q8_0_REPACKED, GGML_TYPE_Q4_0_REPACKED,
+									 GGML_TYPE_Q4_K_REPACKED, GGML_TYPE_F32};
+	for (int i = 0; i < (int)ARRAY_LEN(shared_types); i++) {
+		test_multi_batch_shared_input(ref, tgt, shared_types[i], 3);
+		test_multi_batch_shared_input(ref, tgt, shared_types[i], 5);
+		test_multi_batch_shared_input(ref, tgt, shared_types[i], 128);
 	}
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);
