@@ -50,6 +50,7 @@ It doesn't try to replace bigger or more serious engines. It just tries to make 
 | `cpu_x86_64`  | Works, Requires modern CPUs, Lacks some features |
 | `vulkan`      | Works, Requires modern GPUs, Lacks some features |
 | `opengl`      | Works, Lacks some features                       |
+| `rocket`      | Experimental RK3588 NPU, batched Q8_0 matmul     |
 
 | OS    | Architecture                   |
 |-------|--------------------------------|
@@ -69,6 +70,39 @@ With some backends enabled:
 make config BUILD=release BACKENDS=vulkan,opengl
 make -j 4
 ```
+
+The RK3588 NPU backend uses the mainline Linux `rocket` driver and the kernel's
+`drm/rocket_accel.h` header. Build it with `BACKENDS=rocket` or
+`BACKENDS=vulkan,rocket`, then select it explicitly with `--device rocket0`.
+The user running kappai needs read and write access to `/dev/accel/accel0`.
+No Rockchip runtime or model converter is required.
+
+The experimental backend offloads `Q8_0` matrix operations with at least 32 rows.
+It reuses CPU implementations for small batches, other weight formats, attention
+and remaining operations. Prepared weights are cached within one quarter of
+available memory, capped at 2 GiB; weights exceeding that budget use the CPU.
+Weights are prepared on first use, so the first request is slower.
+
+By default, it retains GGUF block scales and uses three compensated FP16 products
+on the NPU. For faster INT8 execution, use
+`--device rocket0 --npu-int8 --fuse qkv`. This option rotates channels and
+quantizes activations and weights in groups of up to 512 channels, then combines
+INT32 partial results on the CPU. It changes model numerics and remains opt-in.
+INT8 prepared weights take roughly the canonical Q8_0 storage, plus scales and
+padding; compensated FP16 takes about six times as
+much. Both modes share device buffers, scheduling and CPU fallback. Contiguous
+Q/K/V weights created by `--fuse qkv` run as one matrix operation.
+
+Select `rocket0` explicitly: it is excluded from automatic device selection.
+On RK3588 at 600 MHz, the D1 Omni 600M Q8_0 decision benchmark with a single
+128-token NOUL question takes about 200 ms after warmup with INT8, QKV fusion and
+eight CPU threads, versus 270 ms on CPU alone with QKV fusion. The fused INT8 pass
+uses 470 device tasks in 210 submissions. Contraction groups for narrow outputs run
+across the three cores, reducing partial products without changing quantization.
+Nine existing decision cases pass the benchmark's 0.03 probability and confidence
+tolerance; this is a limited numerical check, not a general model quality evaluation.
+The default compensated FP16 path takes about 451 ms.
+The 100 ms target requires further reductions in device work and CPU processing.
 
 ## Usage
 
