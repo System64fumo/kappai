@@ -83,7 +83,16 @@ static bool read_prompt(char *line, size_t cap) {
 	fflush(stdout);
 	if (!fgets(line, (int)cap, stdin))
 		return false;
-	size_t len = strlen(line);
+	size_t len		= strlen(line);
+	bool   complete = len > 0 && line[len - 1] == '\n';
+	if (!complete && !feof(stdin)) {
+		int ch;
+		while ((ch = getchar()) != '\n' && ch != EOF)
+			;
+		fprintf(stderr, "prompt too long (max %d characters)\n\n", PROMPT_MAX - 1);
+		line[0] = '\0';
+		return true;
+	}
 	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
 		line[--len] = '\0';
 	return true;

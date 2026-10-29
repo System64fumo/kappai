@@ -309,11 +309,12 @@ void sc_defaults(saved_config *sc) {
 	sc->kv_quant = KV_QUANT_F16;
 
 	snprintf(sc->output_dir, sizeof(sc->output_dir), ".");
-	sc->width			 = 512;
-	sc->height			 = 512;
-	sc->steps			 = 20;
-	sc->cfg_scale		 = 6.0f;
-	sc->preview_interval = 1.0f;
+	diffusion_params defaults = diffusion_params_defaults();
+	sc->width				  = defaults.width;
+	sc->height				  = defaults.height;
+	sc->steps				  = defaults.steps;
+	sc->cfg_scale			  = defaults.cfg_scale;
+	sc->preview_interval	  = defaults.preview_interval;
 }
 
 void sc_sanitize_name(const char *in, char *out, size_t outlen) {

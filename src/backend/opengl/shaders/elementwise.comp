@@ -16,12 +16,13 @@ layout(location = 1) uniform int u_mode;
 layout(location = 2) uniform float u_scale;
 layout(location = 3) uniform int u_aux;
 layout(location = 4) uniform int u_m;
+layout(location = 5) uniform int u_col0;
 void main(void) {
 	uint row = gl_WorkGroupID.y + 65535u * gl_WorkGroupID.z;
 	if (row >= uint(u_m))
 		return;
 	uint row_off = row * uint(u_n);
-	uint i		 = gl_GlobalInvocationID.x;
+	uint i		 = gl_GlobalInvocationID.x + uint(u_col0);
 	if (int(i) >= u_n)
 		return;
 	if (u_mode == 1) {

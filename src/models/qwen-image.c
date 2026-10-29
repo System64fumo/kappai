@@ -272,13 +272,17 @@ static status_code load_dit(qwen_image *m) {
 	return s;
 }
 
-static void detect_config(qwen_image *m) {
-	const gguf_tensor *img_in = gguf_find_tensor(&m->dit, "img_in.weight");
-	const gguf_tensor *proj	  = gguf_find_tensor(&m->dit, "proj_out.weight");
+static status_code detect_config(qwen_image *m) {
+	const gguf_tensor *img_in = gguf_require_tensor(&m->dit, "img_in.weight");
+	const gguf_tensor *proj	  = gguf_require_tensor(&m->dit, "proj_out.weight");
 	const gguf_tensor *norm_q =
-		gguf_find_tensor(&m->dit, "transformer_blocks.0.attn.norm_q.weight");
+		gguf_require_tensor(&m->dit, "transformer_blocks.0.attn.norm_q.weight");
 	const gguf_tensor *gu =
-		gguf_find_tensor(&m->dit, "transformer_blocks.0.img_mlp.gate_up.weight");
+		gguf_require_tensor(&m->dit, "transformer_blocks.0.img_mlp.gate_up.weight");
+	if (!img_in || !proj || !norm_q || !gu)
+		return ERR_NOT_FOUND;
+	if (img_in->n_dims < 2 || proj->n_dims < 2 || gu->n_dims < 2 || norm_q->dims[0] == 0)
+		return ERR_FORMAT;
 	m->in_channels	= (int)img_in->dims[0];
 	m->hidden		= (int)img_in->dims[1];
 	m->out_channels = (int)proj->dims[1];
@@ -295,6 +299,7 @@ static void detect_config(qwen_image *m) {
 	m->rope_axes[0] = ROPE_FRAME_DIM;
 	m->rope_axes[1] = (m->head_dim - ROPE_FRAME_DIM) / 2;
 	m->rope_axes[2] = (m->head_dim - ROPE_FRAME_DIM) / 2;
+	return OK;
 }
 
 static void qwen_image_close(diffusion_model *dm) {
@@ -609,7 +614,10 @@ static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *
 		qwen_image_close(&m->base);
 		return NULL;
 	}
-	detect_config(m);
+	if (detect_config(m) != OK) {
+		qwen_image_close(&m->base);
+		return NULL;
+	}
 	INFO("qwen-image: %d layers, hidden %d, %d heads", m->n_layers, m->hidden, m->heads);
 	if (load_dit(m) != OK) {
 		qwen_image_close(&m->base);

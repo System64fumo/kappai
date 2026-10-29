@@ -19,6 +19,7 @@
 #define GL_MAX_BINDINGS 8
 #define GL_SCRATCH_POOL_CAP 32
 #define GL_MAX_DISPATCH_PER_DIM 65535u
+#define GL_ELEMENTWISE_WG 128u
 #define GL_PIPELINE_MAX_UNIFORMS 16
 #define GL_UNIFORM_NAME_CAP 32
 #define GL_PIPELINE_NAME_PTR_CAP 32
@@ -2467,7 +2468,8 @@ static status_code gl_rmsnorm_ph_impl(gl_priv *p, const buffer *x, const buffer 
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_has_residual", rb ? 1 : 0);
 	gl_puf(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_out_scale", out_scale);
 
-	gl_launch(p, (GLuint)n_heads, (GLuint)rows, 1);
+	gl_launch(p, (GLuint)n_heads, (GLuint)MIN((size_t)rows, (size_t)GL_MAX_DISPATCH_PER_DIM),
+			  (GLuint)(((size_t)rows + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM));
 	yb->device_dirty = 1;
 	return OK;
 }
@@ -2589,10 +2591,14 @@ static status_code gl_elementwise(gl_priv *p, buffer *x, const buffer *y, const 
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_aux", aux);
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_m", rows);
 
-	GLuint groups = (GLuint)((n + 127) / 128);
-	GLuint gy	  = (GLuint)MIN(rows, 65535);
-	GLuint gz	  = (GLuint)((rows + 65534) / 65535);
-	gl_launch(p, groups, gy, gz);
+	GLuint gy = (GLuint)MIN((size_t)rows, (size_t)GL_MAX_DISPATCH_PER_DIM);
+	GLuint gz = (GLuint)(((size_t)rows + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM);
+	const size_t cols_per_launch = (size_t)GL_MAX_DISPATCH_PER_DIM * GL_ELEMENTWISE_WG;
+	for (size_t col0 = 0; col0 < (size_t)n; col0 += cols_per_launch) {
+		size_t cols = MIN(cols_per_launch, (size_t)n - col0);
+		gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_col0", (int)col0);
+		gl_launch(p, (GLuint)((cols + GL_ELEMENTWISE_WG - 1) / GL_ELEMENTWISE_WG), gy, gz);
+	}
 	bufs[0]->device_dirty = 1;
 	if (z)
 		bufs[2]->device_dirty = 1;

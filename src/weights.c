@@ -19,7 +19,7 @@ status_code weight_upload(backend *be, uint32_t type, size_t k, size_t rows, con
 						  weight *out) {
 	memset(out, 0, sizeof(*out));
 	uint32_t re_type = 0;
-	if (model_should_repack(type, NULL) && be->repack_plan)
+	if (backend_has_cap(be, BCAP_IS_HOST) && model_should_repack(type, NULL) && be->repack_plan)
 		be->repack_plan(be, type, k, rows, &re_type);
 
 	void *host = NULL;

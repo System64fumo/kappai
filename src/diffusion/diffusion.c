@@ -3,8 +3,12 @@
 #include "log.h"
 #include "profile.h"
 
+#include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
 
 #define DIFFUSION_MAX_MODELS 8
 
@@ -23,9 +27,7 @@ static const diffusion_ops *diffusion_find_ops(const gguf_ctx *dit) {
 	return NULL;
 }
 
-bool diffusion_probe(const char *path) {
-	if (!path || !*path)
-		return false;
+static bool diffusion_probe_file(const char *path) {
 	gguf_ctx  dit;
 	log_level saved = log_get_level();
 	log_set_level((log_level)(LOG_ERROR + 1));
@@ -36,6 +38,44 @@ bool diffusion_probe(const char *path) {
 	bool found = diffusion_find_ops(&dit) != NULL;
 	gguf_free(&dit);
 	return found;
+}
+
+static pthread_mutex_t g_probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	bool   valid, found;
+	char   path[PATH_MAX];
+	time_t mtime;
+	off_t  size;
+} g_probe;
+
+bool diffusion_probe(const char *path) {
+	struct stat st;
+	if (!path || !*path || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+		return false;
+	pthread_mutex_lock(&g_probe_mutex);
+	bool hit = g_probe.valid && !strcmp(g_probe.path, path) && g_probe.mtime == st.st_mtime &&
+			   g_probe.size == st.st_size;
+	if (!hit) {
+		snprintf(g_probe.path, sizeof(g_probe.path), "%s", path);
+		g_probe.mtime = st.st_mtime;
+		g_probe.size  = st.st_size;
+		g_probe.found = diffusion_probe_file(path);
+		g_probe.valid = true;
+	}
+	bool found = g_probe.found;
+	pthread_mutex_unlock(&g_probe_mutex);
+	return found;
+}
+
+diffusion_params diffusion_params_defaults(void) {
+	return (diffusion_params){
+		.negative_prompt  = "",
+		.width			  = 512,
+		.height			  = 512,
+		.steps			  = 20,
+		.cfg_scale		  = 6.0f,
+		.preview_interval = 1.0f,
+	};
 }
 
 #define DIFFUSION_STR_(x) #x
@@ -140,6 +180,12 @@ static status_code predict_guided(const diffusion_ops *ops, diffusion_model *dm,
 	return s;
 }
 
+static void free_conds(const diffusion_ops *ops, diffusion_cond **cond) {
+	for (int i = 0; i < 2; i++)
+		if (cond[i])
+			ops->cond_free(cond[i]);
+}
+
 static bool diffusion_interrupted(const diffusion_params *p) {
 	return p->interrupt && *p->interrupt;
 }
@@ -154,8 +200,10 @@ status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 
 	diffusion_cond *cond[2] = {0};
 	status_code		s		= ops->encode(dm, texts, guided ? 2 : 1, cond);
-	if (s != OK)
+	if (s != OK) {
+		free_conds(ops, cond);
 		return s;
+	}
 
 	float *x		= xmalloc(n * sizeof(float));
 	float *v		= xmalloc(n * sizeof(float));
@@ -189,9 +237,7 @@ status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 		INFO("step %d/%d sigma %.4f (%.1fs)", i + 1, p->steps, sigmas[i], (double)(now - t0) / 1e6);
 	}
 
-	for (int i = 0; i < 2; i++)
-		if (cond[i])
-			ops->cond_free(cond[i]);
+	free_conds(ops, cond);
 	if (s == OK) {
 		log_range("latent", x, n);
 		s = ops->decode(dm, x, shape, out);

@@ -913,8 +913,7 @@ status_code cg_backend_open(const char *spec, backend **out) {
 	}
 	if (!cg_backend_supported(*out))
 		return ERR_UNSUPPORTED;
-	if (!backend_has_cap(*out, BCAP_IS_HOST))
-		backend_host_use(*out);
+	backend_host_use(*out);
 	return OK;
 }
 

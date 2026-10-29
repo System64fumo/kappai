@@ -73,6 +73,7 @@ void diffusion_register(const diffusion_ops *ops);
 
 bool			 diffusion_probe(const char *path);
 const char		*diffusion_params_error(const diffusion_params *p);
+diffusion_params diffusion_params_defaults(void);
 diffusion_model *diffusion_open(const diffusion_files *files, char *err, size_t err_len);
 void			 diffusion_close(diffusion_model *dm);
 

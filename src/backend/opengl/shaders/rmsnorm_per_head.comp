@@ -25,7 +25,7 @@ layout(location = 6) uniform float u_out_scale;
 shared float s_ss[64];
 void		 main(void) {
 	uint h	 = gl_WorkGroupID.x;
-	uint row = gl_WorkGroupID.y;
+	uint row = gl_WorkGroupID.y + 65535u * gl_WorkGroupID.z;
 	if (int(h) >= u_n_heads || int(row) >= u_rows)
 		return;
 	uint  tid		 = gl_LocalInvocationID.x;

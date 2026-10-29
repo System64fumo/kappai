@@ -120,14 +120,7 @@ static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_
 
 int main(int argc, char **argv) {
 	diffusion_files	 files = {.device = "cpu0"};
-	diffusion_params p	   = {
-		.negative_prompt  = "",
-		.width			  = 512,
-		.height			  = 512,
-		.steps			  = 20,
-		.cfg_scale		  = 6.0f,
-		.preview_interval = 1.0f,
-	};
+	diffusion_params p	   = diffusion_params_defaults();
 	diffusion_output out   = {.dir = ".", .name = "image"};
 	bool			 debug = false;
 
