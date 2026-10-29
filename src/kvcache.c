@@ -130,6 +130,8 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	c->n_pos	= 0;
 	c->backend	= m->backend;
 	c->kv_quant = kv_quant;
+	if (m->full_sequence)
+		return OK;
 
 	int is_mla	  = m->arch_info->is_mla;
 	int is_hybrid = m->arch_info->is_hybrid_recurrent;

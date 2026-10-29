@@ -192,6 +192,7 @@ void		run_portability_tests(void);
 void run_host_memory_tests(void);
 #endif
 void run_model_lifecycle_tests(void);
+void run_decision_tests(void);
 void run_server_task_tests(void);
 void test_quant_determinism(backend *ref, const qtype_info *qt);
 void test_quant_finiteness(backend *ref, const qtype_info *qt);

@@ -72,6 +72,7 @@ typedef struct {
 	int			   conv_kernel;
 	int			   ctx;
 	int			   vocab;
+	int			   n_decision_layers;
 	uint64_t	   seed;
 	const uint8_t *is_conv;
 } tsg_lfm2_spec;

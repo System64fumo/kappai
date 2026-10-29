@@ -111,6 +111,7 @@ static const decision_ops lfm2_d1_ops = {
 	.max_options = D1_MAX_OPTIONS,
 	.true_first	 = true,
 	.labels		 = d1_labels,
+	.forward	 = decision_forward_prefill,
 };
 
 DECISION_REGISTER(lfm2_d1, &lfm2_d1_ops)

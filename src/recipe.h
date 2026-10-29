@@ -125,6 +125,12 @@ typedef enum {
 	OP_DF_ROPE_TABLE,
 	OP_DF_ATTENTION,
 	OP_DF_UPSAMPLE_SHORTCUT_ADD,
+	OP_LAYERNORM,
+	OP_ADD_BIAS,
+	OP_ADD_TYPE_EMBD,
+	OP_SPLIT_QKV,
+	OP_ACTIVATE,
+	OP_ATTENTION_FULL,
 
 	OP_KIND_COUNT
 } op_kind;
@@ -135,6 +141,8 @@ typedef enum {
 enum {
 	ACTIVATION_SILU = 0,
 	ACTIVATION_GELU = 1,
+	ACTIVATION_RELU,
+	ACTIVATION_GELU_ERF,
 };
 
 typedef enum {
@@ -195,6 +203,19 @@ typedef enum {
 	WIDX_SSM_G_B,
 	WIDX_HC_ATTN_FN,
 	WIDX_HC_FFN_FN,
+	WIDX_ATTN_NORM_B,
+	WIDX_ATTN_QKV_B,
+	WIDX_WO_B,
+	WIDX_FFN_NORM_B,
+	WIDX_UP_B,
+	WIDX_DOWN_B,
+	WIDX_TYPE_EMBD,
+	WIDX_CLS_NORM,
+	WIDX_CLS_NORM_B,
+	WIDX_CLS,
+	WIDX_CLS_B,
+	WIDX_CLS_OUT,
+	WIDX_CLS_OUT_B,
 	WIDX_COUNT
 } weight_idx;
 
@@ -235,6 +256,14 @@ typedef union {
 	} df_rope;
 	df_attention_dims df_attention;
 	df_upsample_dims  df_upsample;
+	struct {
+		int		n;
+		uint8_t bias_idx;
+		float	eps;
+	} layernorm;
+	struct {
+		int centered;
+	} shortconv;
 	struct {
 		float eps;
 		int	  n_heads;
@@ -286,6 +315,7 @@ typedef union {
 	struct {
 		int n;
 		int activation;
+		int n_types;
 	} ffn_act;
 	struct {
 		float scale;
@@ -349,6 +379,7 @@ typedef struct model_recipe {
 	recipe_op	*post_ops;
 	int			 n_pre_ops;
 	int			 n_post_ops;
+	int			 post_weight_layer;
 	uint8_t		 embd_slot;
 	uint8_t		 logits_slot;
 
@@ -371,6 +402,7 @@ typedef struct {
 	struct kvcache	*cache;
 	struct kvcache **caches;
 	const uint8_t	*needs_logits;
+	int				 token_type;
 } row_desc;
 
 typedef struct {
@@ -415,6 +447,19 @@ status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache 
 void	batch_scratch_free(struct batch_scratch *bs);
 void	compute_scratch_reserve_rows(struct model *m, struct compute_scratch *s, int n_rows);
 buffer *compute_logits_device(struct compute_scratch *s);
+
+status_code compute_forward_sequence_recipe(struct model *m, struct compute_scratch *s,
+											const int32_t *tokens, int n_tokens,
+											const uint8_t *outputs, int token_type, int flash_attn,
+											float *scores);
+
+recipe_op mk_layernorm(uint8_t in, uint8_t out, uint8_t weight, uint8_t bias, int n, float eps);
+recipe_op mk_add_bias(uint8_t io, uint8_t weight, int n);
+recipe_op mk_add_type_embd(uint8_t io, uint8_t weight, int n, int n_types);
+recipe_op mk_split_qkv(uint8_t in, int dim);
+recipe_op mk_activate(uint8_t io, int n, int activation);
+recipe_op mk_logits_readback(void);
+void	  recipe_emit_lfm_layer(op_emitter *e, const model *m, int li);
 
 recipe_op mk_rmsnorm(uint8_t in, uint8_t out, uint8_t widx, float eps, stage stage);
 recipe_op mk_rmsnorm_add(uint8_t in, uint8_t residual, uint8_t out, uint8_t widx, float eps,

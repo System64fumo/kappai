@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "model.h"
 #include "config.h"
+#include "decision.h"
 #include "log.h"
 #include "memory.h"
 #include "moe/moe_stream.h"
@@ -18,6 +19,42 @@
 #include <sys/mman.h>
 
 #define MODEL_READAHEAD_LAYERS 2
+
+struct model_tensor_binding {
+	struct model_tensor_binding *next;
+	weight_ref					 ref;
+	const gguf_tensor			*tensor;
+	int							 layer;
+	uint8_t						 index;
+	weight_class				 wc;
+};
+
+status_code model_bind_tensor(model *m, int li, uint8_t index, const char *name, int n_dims,
+							  uint64_t d0, uint64_t d1, weight_class wc) {
+	const gguf_tensor *t = gguf_find_tensor(&m->gctx, name);
+	if (!t || t->n_dims != (uint32_t)n_dims || t->dims[0] != d0 ||
+		(n_dims == 2 && t->dims[1] != d1) || (wc != WCLASS_MATMUL && t->type != GGML_TYPE_F32)) {
+		ERROR("model: missing or invalid tensor '%s'", name);
+		return ERR_FORMAT;
+	}
+	struct model_tensor_binding *b = xcalloc(1, sizeof(*b));
+	b->ref.host_ptr				   = t->data;
+	b->ref.type					   = t->type;
+	b->tensor					   = t;
+	b->layer					   = li;
+	b->index					   = index;
+	b->wc						   = wc;
+	b->next						   = m->bindings;
+	m->bindings					   = b;
+	return OK;
+}
+
+static int layer_has_bindings(const model *m, int li) {
+	for (const struct model_tensor_binding *b = m->bindings; b; b = b->next)
+		if (b->layer == li)
+			return 1;
+	return 0;
+}
 
 static void madvise_access_pattern(const void *map_base, size_t map_size, const void *ptr,
 								   size_t bytes, int advice) {
@@ -254,7 +291,7 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	if (m->has_per_layer_embeddings &&
 		require_tensor_f32_if_present(g, "per_layer_proj_norm.weight"))
 		return -1;
-	if (!m->tie_embeddings) {
+	if (!m->tie_embeddings && m->output_w.host_ptr) {
 		if (require_dims_2d(g, "output.weight", m->dim, m->vocab_size))
 			return -1;
 	}
@@ -276,6 +313,8 @@ static int validate_model_dims(const model *m, const gguf_ctx *g) {
 	}
 
 	for (int i = 0; i < m->n_layers; i++) {
+		if (layer_has_bindings(m, i))
+			continue;
 		int head_dim = model_layer_head_dim(m, i);
 		if (head_dim > HEAD_DIM_MAX) {
 			ERROR("model: layer %d head_dim=%d exceeds supported maximum %d", i, head_dim,
@@ -1119,6 +1158,23 @@ static status_code upload_one_repack_to(model *m, weight_ref *ref, int ndims, ui
 								   &ref->buf);
 }
 
+static status_code upload_bound_tensors(model *m, int li) {
+	backend *be = li < 0 ? m->backend : model_layer_backend(m, li);
+	for (struct model_tensor_binding *b = m->bindings; b; b = b->next) {
+		if (b->layer != li)
+			continue;
+		const gguf_tensor *t = b->tensor;
+		status_code st = b->wc == WCLASS_MATMUL
+							 ? upload_one_repack_to(m, &b->ref, t->n_dims, t->dims[0],
+													t->n_dims == 2 ? t->dims[1] : 1, b->wc, be)
+							 : upload_one_to(m, &b->ref, t->type, t->n_dims, t->dims[0],
+											 t->n_dims == 2 ? t->dims[1] : 1, b->wc, be);
+		if (st != OK)
+			return st;
+	}
+	return OK;
+}
+
 static int tied_output_shares_buffer(const model *m) {
 	if (!m->tie_embeddings || !m->tok_embd.buf.owner)
 		return 0;
@@ -1159,7 +1215,7 @@ static status_code upload_embeddings(model *m, progress *prog) {
 
 	if (tied_output_shares_buffer(m)) {
 		m->output_w.buf = m->tok_embd.buf;
-	} else {
+	} else if (m->output_w.host_ptr) {
 		s = upload_one_repack_to(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL,
 								 m->backend);
 		if (s != OK) {
@@ -1586,7 +1642,9 @@ static status_code upload_all_weights(model *m) {
 	if (g_monitor && g_monitor->fd >= 0)
 		monitor_emit_load_readahead_done(g_monitor, (time_us() - ra_t0) / 1000);
 
-	s = upload_embeddings(m, &prog);
+	s = upload_bound_tensors(m, -1);
+	if (s == OK)
+		s = upload_embeddings(m, &prog);
 	if (s != OK) {
 		progress_finish(&prog);
 		return s;
@@ -1609,7 +1667,11 @@ static status_code upload_all_weights(model *m) {
 			}
 		}
 
-		s = upload_layer_weights(m, i, &prog);
+		if (layer_has_bindings(m, i)) {
+			s = upload_bound_tensors(m, i);
+			progress_step(&prog);
+		} else
+			s = upload_layer_weights(m, i, &prog);
 		if (s != OK) {
 			progress_finish(&prog);
 			return s;
@@ -2234,13 +2296,19 @@ static status_code model_load_metadata(model *m, const gguf_ctx *g, const char *
 	}
 	m->dim		= v32;
 	m->dim_sqrt = sqrtf((float)v32);
-	if (m->arch_info->has_variable_layer_dims) {
+	if (m->arch_info->has_variable_layer_dims || m->arch_info->is_hybrid_recurrent) {
 		const int32_t *ffn_arr;
 		size_t		   ffn_n;
 		char		   ffn_key[64];
 		snprintf(ffn_key, sizeof(ffn_key), "%s.feed_forward_length", prefix);
 		if (gguf_get_arr_i32(g, ffn_key, &ffn_arr, &ffn_n) == OK && ffn_n > 0) {
+			if (ffn_n < (size_t)m->n_layers)
+				return ERR_FORMAT;
 			m->intermediate = ffn_arr[0];
+			if (!m->arch_info->has_variable_layer_dims) {
+				m->layer_dims.ffn_lengths = xmalloc((size_t)m->n_layers * sizeof(int32_t));
+				memcpy(m->layer_dims.ffn_lengths, ffn_arr, (size_t)m->n_layers * sizeof(int32_t));
+			}
 		} else if (akey_i32(g, prefix, "feed_forward_length", &v32) == OK) {
 			m->intermediate = v32;
 			DEBUG("ffn_intermediate = %d (uniform)", v32);
@@ -2462,11 +2530,11 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 	}
 	{
 		const gguf_tensor *t = gguf_find_tensor(g, "output.weight");
-		m->tie_embeddings	 = (t == NULL);
+		m->tie_embeddings	 = (t == NULL && !m->full_sequence);
 		if (m->tie_embeddings) {
 			m->output_w = m->tok_embd;
 			DEBUG("output tied to token_embd type=%u", m->tok_embd.type);
-		} else {
+		} else if (t) {
 			m->output_w.host_ptr = t->data;
 			m->output_w.type	 = t->type;
 			DEBUG("output type=%u (%s)", t->type, ggml_type_name(t->type));
@@ -2525,6 +2593,18 @@ static status_code model_load_tensor_layout(model *m, const gguf_ctx *g) {
 		L->has_own_v = 1;
 		if (m->arch_info->is_hybrid_recurrent)
 			L->is_recurrent = m->hybrid.recurrent_layers[i] != 0;
+
+		if (m->layer_dims.ffn_lengths)
+			L->intermediate = m->layer_dims.ffn_lengths[i];
+		if (m->layer_dims.n_kv_heads_per_layer && m->layer_dims.n_kv_heads_per_layer[i] > 0)
+			L->n_kv_heads = m->layer_dims.n_kv_heads_per_layer[i];
+		if (m->variant && m->variant->load_layer) {
+			status_code st = m->variant->load_layer(m, i);
+			if (st == OK)
+				continue;
+			if (st != ERR_NOT_FOUND)
+				return st;
+		}
 
 		if (load_layer_tensor(g, tname, sizeof(tname), i, &L->attn_norm_w,
 							  "blk.%d.attn_norm.weight", 0) != OK)
@@ -3142,6 +3222,12 @@ status_code model_build_weight_refs(model *m) {
 		row[WIDX_HC_FFN_FN]			   = &L->hc_ffn_fn_w;
 	}
 
+	for (struct model_tensor_binding *b = m->bindings; b; b = b->next) {
+		int first = b->layer < 0 ? 0 : b->layer;
+		int end	  = b->layer < 0 ? m->n_layers : first + 1;
+		for (int li = first; li < end; li++)
+			m->wrefs_by_layer[(size_t)li * WIDX_COUNT + b->index] = &b->ref;
+	}
 	return OK;
 }
 
@@ -3194,6 +3280,14 @@ status_code model_load_parse(model *m, const char *path, backend *bk, int use_mm
 	s = model_load_metadata(m, g, prefix);
 	if (s != OK) {
 		goto fail;
+	}
+
+	const decision_ops *decision = decision_ops_of(g);
+	m->variant					 = decision ? decision->variant : NULL;
+	if (m->variant && m->variant->configure) {
+		s = m->variant->configure(m);
+		if (s != OK)
+			goto fail;
 	}
 
 	s = model_load_tensor_layout(m, g);
@@ -3300,6 +3394,10 @@ void model_free(model *m) {
 		m->moe_cache = NULL;
 	}
 
+	for (struct model_tensor_binding *b = m->bindings; b; b = b->next) {
+		free_weight_buf(&b->ref.buf);
+		memset(&b->ref.buf, 0, sizeof(b->ref.buf));
+	}
 	if (m->backend && m->layers) {
 		for (int i = 0; i < m->n_layers; i++) {
 			layer_weights *L = &m->layers[i];
@@ -3352,6 +3450,12 @@ void model_free(model *m) {
 		free_weight_buf(&m->rope_freqs_w.buf);
 	}
 
+	while (m->bindings) {
+		struct model_tensor_binding *next = m->bindings->next;
+		free(m->bindings);
+		m->bindings = next;
+	}
+	free(m->variant_data);
 	free(m->layers);
 	free(m->layer_dims.is_global_layer);
 	free(m->layer_dims.ffn_lengths);

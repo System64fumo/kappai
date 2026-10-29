@@ -191,7 +191,7 @@ model_recipe *recipe_build(const struct model *m) {
 		ERROR("recipe_build: no recipe builder registered for arch '%s'", m->arch_info->gguf_name);
 		return NULL;
 	}
-	model_recipe *r = (*fb)(m);
+	model_recipe *r = m->variant ? m->variant->recipe(m) : (*fb)(m);
 	if (!r)
 		return NULL;
 

@@ -141,6 +141,13 @@ typedef struct {
 } gdn_desc;
 
 typedef struct {
+	float		*out, *state;
+	const float *mixed, *conv_w;
+	int			 dim, kernel, in_stride, out_stride, n_rows;
+	bool		 centered;
+} shortconv_desc;
+
+typedef struct {
 	const buffer *buf;
 	uint32_t	  type;
 } backend_weight;
@@ -380,6 +387,9 @@ struct backend {
 	status_code (*rope_qk_batch)(backend *self, buffer *q, buffer *k, int n_heads, int n_kv_heads,
 								 int head_dim, int pos_start, const float *rope_cos_base,
 								 const float *rope_sin_base, int m);
+	status_code (*attention_full_batch)(struct backend *self, const buffer *q, const buffer *k,
+										const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+										int head_dim, int n_rows, int flash_attn, float scale);
 	status_code (*attention_batch)(backend *self, const buffer *q, const buffer *k_cache,
 								   const buffer *v_cache, buffer *out, int layer, int pos_start,
 								   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
@@ -407,6 +417,7 @@ struct backend {
 							  const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
 							  int qk_rope, int n_ctx, float eps);
 	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
+	status_code (*shortconv)(backend *self, const shortconv_desc *d);
 	status_code (*hc_init)(backend *self, const hc_init_desc *d);
 	status_code (*hc_pre)(backend *self, const hc_pre_desc *d);
 	status_code (*hc_post)(backend *self, const hc_post_desc *d);

@@ -353,13 +353,28 @@ void tsg_build_lfm2(const char *path, const tsg_lfm2_spec *s) {
 
 	int32_t *kv_arr = malloc((size_t)s->n_layers * sizeof(int32_t));
 	for (int i = 0; i < s->n_layers; i++)
-		kv_arr[i] = s->is_conv[i] ? 0 : s->n_kv_heads;
+		kv_arr[i] = i >= s->n_layers - s->n_decision_layers ? s->n_heads
+					: s->is_conv[i]							? 0
+															: s->n_kv_heads;
 
 	tsg_kv_str(&w, "general.architecture", "lfm2");
 	tsg_kv_i32(&w, "lfm2.context_length", s->ctx);
 	tsg_kv_i32(&w, "lfm2.block_count", s->n_layers);
 	tsg_kv_i32(&w, "lfm2.embedding_length", s->dim);
-	tsg_kv_i32(&w, "lfm2.feed_forward_length", s->intermediate);
+	if (s->n_decision_layers) {
+		int32_t *ffn = malloc((size_t)s->n_layers * sizeof(int32_t));
+		for (int i = 0; i < s->n_layers; i++)
+			ffn[i] =
+				i >= s->n_layers - s->n_decision_layers ? 2 * s->intermediate : s->intermediate;
+		tsg_kv_arr_i32(&w, "lfm2.feed_forward_length", ffn, (size_t)s->n_layers);
+		free(ffn);
+		tsg_kv_str(&w, "lfm2.decision.type", "lfm2-d1-omni");
+		tsg_kv_i32(&w, "lfm2.decision.block_count", s->n_decision_layers);
+		tsg_kv_bool(&w, "lfm2.attention.causal", 0);
+		tsg_kv_f32(&w, "lfm2.attention.layer_norm_epsilon", 1e-5f);
+		tsg_kv_str(&w, "tokenizer.chat_template.systemone", "{{ state }}");
+	} else
+		tsg_kv_i32(&w, "lfm2.feed_forward_length", s->intermediate);
 	tsg_kv_i32(&w, "lfm2.attention.head_count", s->n_heads);
 	tsg_kv_arr_i32(&w, "lfm2.attention.head_count_kv", kv_arr, (size_t)s->n_layers);
 	tsg_kv_i32(&w, "lfm2.attention.key_length", s->head_dim);
@@ -374,10 +389,40 @@ void tsg_build_lfm2(const char *path, const tsg_lfm2_spec *s) {
 	char nm[128];
 	tsg_add2(&w, "token_embd.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
 	tsg_add1(&w, "output_norm.weight", (uint64_t)s->dim, -1.0f);
-	tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
+	if (s->n_decision_layers) {
+		tsg_add2(&w, "token_types.weight", s->dim, 3, 0.1f);
+		tsg_add1(&w, "cls.norm.weight", s->dim, -1.0f);
+		tsg_add1(&w, "cls.norm.bias", s->dim, 0.1f);
+		tsg_add2(&w, "cls.weight", s->dim, s->dim, 0.1f);
+		tsg_add1(&w, "cls.bias", s->dim, 0.1f);
+		tsg_add1(&w, "cls.output.weight", s->dim, 0.1f);
+		tsg_add1(&w, "cls.output.bias", 1, 0.1f);
+	} else
+		tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
 	for (int i = 0; i < s->n_layers; i++) {
 		snprintf(nm, sizeof(nm), "blk.%d.attn_norm.weight", i);
 		tsg_add1(&w, nm, (uint64_t)s->dim, -1.0f);
+		if (i >= s->n_layers - s->n_decision_layers) {
+			static const char *const norms[] = {"attn_norm", "ffn_norm"};
+			for (size_t j = 0; j < 2; j++) {
+				if (j) {
+					snprintf(nm, sizeof(nm), "blk.%d.%s.weight", i, norms[j]);
+					tsg_add1(&w, nm, s->dim, -1.0f);
+				}
+				snprintf(nm, sizeof(nm), "blk.%d.%s.bias", i, norms[j]);
+				tsg_add1(&w, nm, s->dim, 0.1f);
+			}
+			const char *names[]	  = {"attn_qkv", "attn_output", "ffn_up", "ffn_down"};
+			int			inputs[]  = {s->dim, s->dim, s->dim, 2 * s->intermediate};
+			int			outputs[] = {3 * s->dim, s->dim, 2 * s->intermediate, s->dim};
+			for (size_t j = 0; j < 4; j++) {
+				snprintf(nm, sizeof(nm), "blk.%d.%s.weight", i, names[j]);
+				tsg_add2(&w, nm, inputs[j], outputs[j], 0.08f);
+				snprintf(nm, sizeof(nm), "blk.%d.%s.bias", i, names[j]);
+				tsg_add1(&w, nm, outputs[j], 0.1f);
+			}
+			continue;
+		}
 		if (s->is_conv[i]) {
 			snprintf(nm, sizeof(nm), "blk.%d.shortconv.in_proj.weight", i);
 			tsg_add2(&w, nm, (uint64_t)s->dim, (uint64_t)conv_dim, 0.08f);

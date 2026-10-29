@@ -1,8 +1,9 @@
 #include "recipe/capability.h"
 
 const char *cap_host_only_fn(op_kind kind) {
-	if (kind == OP_SHORTCONV)
-		return "shortconv";
+	if (kind == OP_LAYERNORM || kind == OP_ADD_BIAS || kind == OP_ADD_TYPE_EMBD ||
+		kind == OP_SPLIT_QKV || kind == OP_ACTIVATE)
+		return "encoder_elementwise";
 	if (kind == OP_MOE_ROUTER)
 		return "moe_router_topk";
 	return NULL;

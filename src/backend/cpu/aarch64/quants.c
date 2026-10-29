@@ -118,11 +118,19 @@ static inline void iq3s_pair_dot(int8x16_t d00, int8x16_t d01, int8x16_t d10, in
 
 static inline void store_acc_row_mr_nr(const float32x4_t acc_row[MR], float *restrict y,
 									   int y_row_stride, size_t i, size_t t, int nr) {
-	for (int r = 0; r < MR; r++) {
-		float tmp[4];
-		vst1q_f32(tmp, acc_row[r]);
-		for (int c = 0; c < nr; c++)
-			y[((size_t)(t + c) * y_row_stride) + (i + r)] = tmp[c];
+	for (int r = 0; r < MR; r += 4) {
+		float32x4_t a		   = vtrn1q_f32(acc_row[r], acc_row[r + 1]);
+		float32x4_t b		   = vtrn2q_f32(acc_row[r], acc_row[r + 1]);
+		float32x4_t c		   = vtrn1q_f32(acc_row[r + 2], acc_row[r + 3]);
+		float32x4_t d		   = vtrn2q_f32(acc_row[r + 2], acc_row[r + 3]);
+		float32x4_t columns[4] = {
+			vcombine_f32(vget_low_f32(a), vget_low_f32(c)),
+			vcombine_f32(vget_low_f32(b), vget_low_f32(d)),
+			vcombine_f32(vget_high_f32(a), vget_high_f32(c)),
+			vcombine_f32(vget_high_f32(b), vget_high_f32(d)),
+		};
+		for (int col = 0; col < nr; col++)
+			vst1q_f32(y + (t + col) * y_row_stride + i + r, columns[col]);
 	}
 }
 
@@ -5967,9 +5975,92 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 
 #define NR 4
 
-void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+typedef struct {
+	float  scales[4];
+	int8_t values[128];
+} q8_x4_panel;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+#if !defined(__ARM_FEATURE_MATMUL_INT8)
+static inline void q8_transpose_x4(const int8x16_t rows[4], int8x16_t columns[4]) {
+	int32x4_t a = vzip1q_s32(vreinterpretq_s32_s8(rows[0]), vreinterpretq_s32_s8(rows[2]));
+	int32x4_t b = vzip1q_s32(vreinterpretq_s32_s8(rows[1]), vreinterpretq_s32_s8(rows[3]));
+	int32x4_t c = vzip2q_s32(vreinterpretq_s32_s8(rows[0]), vreinterpretq_s32_s8(rows[2]));
+	int32x4_t d = vzip2q_s32(vreinterpretq_s32_s8(rows[1]), vreinterpretq_s32_s8(rows[3]));
+	columns[0]	= vreinterpretq_s8_s32(vzip1q_s32(a, b));
+	columns[1]	= vreinterpretq_s8_s32(vzip2q_s32(a, b));
+	columns[2]	= vreinterpretq_s8_s32(vzip1q_s32(c, d));
+	columns[3]	= vreinterpretq_s8_s32(vzip2q_s32(c, d));
+}
+
+static void q8_pack_x4_rows(q8_x4_panel *panels, const q8_0_block *xq, size_t stride, int blocks,
+							int rows) {
+	for (int row = 0; row + 4 <= rows; row += 4) {
+		for (int bi = 0; bi < blocks; bi++) {
+			q8_x4_panel *out = &panels[(size_t)(row / 4) * blocks + bi];
+			int8x16_t	 lo[4], hi[4], packed[8];
+			for (int j = 0; j < 4; j++) {
+				const q8_0_block *in = &xq[(size_t)(row + j) * stride + bi];
+				out->scales[j]		 = f16_to_f32_fast(in->d);
+				lo[j]				 = vld1q_s8(in->qs);
+				hi[j]				 = vld1q_s8(in->qs + 16);
+			}
+			q8_transpose_x4(lo, packed);
+			q8_transpose_x4(hi, packed + 4);
+			for (int j = 0; j < 8; j++)
+				vst1q_s8(out->values + 16 * j, packed[j]);
+		}
+	}
+}
+
+static const q8_x4_panel *q8_pack_x4(const q8_0_block *xq, size_t stride, int blocks, int rows) {
+	static _Thread_local q8_x4_panel *panels;
+	static _Thread_local size_t		  capacity;
+	size_t							  need = (size_t)(rows / 4) * blocks;
+	if (!panels || capacity < need) {
+		int first = panels == NULL;
+		panels	  = xrealloc(panels, need * sizeof(*panels));
+		capacity  = need;
+		if (first)
+			tlocal_register((void **)&panels);
+	}
+	q8_pack_x4_rows(panels, xq, stride, blocks, rows);
+	return panels;
+}
+#endif
+
+static inline void q8_dot_x4_rows(const int8_t *weights, const int8x16_t x[8], int32x4_t sums[4]) {
+	int8x16_t w[4];
+	for (int r = 0; r < 4; r++) {
+		w[r]	= vld1q_s8(weights + r * 32);
+		sums[r] = vdotq_laneq_s32(vdupq_n_s32(0), x[0], w[r], 0);
+	}
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[1], w[r], 1);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[2], w[r], 2);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[3], w[r], 3);
+	for (int r = 0; r < 4; r++) {
+		w[r]	= vld1q_s8(weights + r * 32 + 16);
+		sums[r] = vdotq_laneq_s32(sums[r], x[4], w[r], 0);
+	}
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[5], w[r], 1);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[6], w[r], 2);
+	for (int r = 0; r < 4; r++)
+		sums[r] = vdotq_laneq_s32(sums[r], x[7], w[r], 3);
+}
+#endif
+
+static void matmul_q8_0_repacked_batch(const void *w, const q8_0_block *restrict xq,
 									   size_t	   xq_row_stride_blocks, float *restrict y,
-									   int y_row_stride, int n, int k, int m) {
+									   int y_row_stride, int n, int k, int m,
+									   const q8_x4_panel *panels) {
+#if !defined(__ARM_FEATURE_DOTPROD)
+	(void)panels;
+#endif
 	{
 		int n_full = n - (n % Q8_0_REPACKED_ROWS);
 		if (n_full < n) {
@@ -5998,29 +6089,53 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 			for (int r = 0; r < MR; r++)
 				acc_row[r] = vdupq_n_f32(0.0f);
 
+#if !defined(__ARM_FEATURE_DOTPROD)
 			const q8_0_block *xrow[NR];
 			for (int c = 0; c < NR; c++)
 				xrow[c] = xq + ((size_t)(t + c) * xq_row_stride_blocks);
+#endif
 
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				const uint8_t *blk = group + (size_t)bi * Q8_0_REPACKED_GROUP_BYTES;
 
 				PREFETCH(blk + Q8_0_REPACKED_GROUP_BYTES);
 
+#if defined(__ARM_FEATURE_DOTPROD)
+				const q8_x4_panel *panel  = &panels[(size_t)(t / 4) * blocks_per_row + bi];
+				const float32x4_t  xd_vec = vld1q_f32(panel->scales);
+				int8x16_t		   packed[8];
+				for (int j = 0; j < 8; j++)
+					packed[j] = vld1q_s8(panel->values + 16 * j);
+#else
 				float	  xd[NR];
-				int8x16_t xq_lo[NR];
-				int8x16_t xq_hi[NR];
+				int8x16_t xq_lo[NR], xq_hi[NR];
 				for (int c = 0; c < NR; c++) {
 					xd[c]	 = f16_to_f32_fast(xrow[c][bi].d);
 					xq_lo[c] = vld1q_s8(xrow[c][bi].qs);
 					xq_hi[c] = vld1q_s8(xrow[c][bi].qs + 16);
 				}
 				const float32x4_t xd_vec = vld1q_f32(xd);
+#endif
 
 				const uint16_t *d_ptr = (const uint16_t *)blk;
 				const int8_t   *qs_ptr =
 					(const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
+#if defined(__ARM_FEATURE_DOTPROD)
+				for (int r = 0; r < MR; r += 4) {
+					int32x4_t sums[4];
+					q8_dot_x4_rows(qs_ptr + (size_t)r * 32, packed, sums);
+					float32x4_t dw = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(d_ptr + r)));
+					acc_row[r]	   = vfmaq_f32(acc_row[r], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[0]), dw, 0));
+					acc_row[r + 1] = vfmaq_f32(acc_row[r + 1], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[1]), dw, 1));
+					acc_row[r + 2] = vfmaq_f32(acc_row[r + 2], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[2]), dw, 2));
+					acc_row[r + 3] = vfmaq_f32(acc_row[r + 3], xd_vec,
+											   vmulq_laneq_f32(vcvtq_f32_s32(sums[3]), dw, 3));
+				}
+#else
 				for (int r = 0; r < MR; r++) {
 					const float		d_w = f16_to_f32_fast(d_ptr[r]);
 					const int8x16_t lo	= vld1q_s8(qs_ptr + (size_t)r * 32);
@@ -6030,6 +6145,7 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 					const float32x4_t sumi_f = vcvtq_f32_s32(sumi4);
 					acc_row[r] = vfmaq_f32(acc_row[r], xd_vec, vmulq_n_f32(sumi_f, d_w));
 				}
+#endif
 			}
 
 			store_acc_row_mr_nr(acc_row, y, y_row_stride, i, t, NR);
@@ -6041,6 +6157,50 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 		}
 	}
 }
+
+void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m) {
+	const q8_x4_panel *panels = NULL;
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+	if (n >= MR && m >= NR)
+		panels = q8_pack_x4(xq, xq_row_stride_blocks, k / 32, m);
+#endif
+	matmul_q8_0_repacked_batch(w, xq, xq_row_stride_blocks, y, y_row_stride, n, k, m, panels);
+}
+
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+typedef struct {
+	const q8_0_block *xq;
+	size_t			  row_stride_blocks;
+	q8_x4_panel		  panels[];
+} q8_x4_input;
+
+static status_code q8_prepare_x4(const void *xq, size_t stride, int k, int m, void **out,
+								 size_t *capacity) {
+	if (m < NR || k < 32 || k % 32)
+		return ERR_UNSUPPORTED;
+	size_t		need = sizeof(q8_x4_input) + (size_t)(m / NR) * (k / 32) * sizeof(q8_x4_panel);
+	status_code st	 = cpu_buf_grow(out, capacity, need, 64);
+	if (st != OK)
+		return st;
+	q8_x4_input *input		 = *out;
+	input->xq				 = xq;
+	input->row_stride_blocks = stride;
+	q8_pack_x4_rows(input->panels, xq, stride, k / 32, m);
+	return OK;
+}
+
+static void q8_matmul_x4(const void *w, const void *packed, float *y, int y_row_stride, int n,
+						 int k, int m) {
+	const q8_x4_input *input = packed;
+	matmul_q8_0_repacked_batch(w, input->xq, input->row_stride_blocks, y, y_row_stride, n, k, m,
+							   input->panels);
+}
+
+const cpu_matmul_packing cpu_q8_x4_packing = {
+	.w_type = GGML_TYPE_Q8_0_REPACKED, .prepare = q8_prepare_x4, .matmul = q8_matmul_x4};
+#endif
 
 #undef NR
 

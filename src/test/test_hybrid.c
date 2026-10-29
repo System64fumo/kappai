@@ -75,8 +75,88 @@ static void make_tokens(int32_t *t, int n, uint64_t seed, int vocab) {
 		t[i] = (int32_t)(tsg_rand() % (uint32_t)vocab);
 }
 
+static void test_shortconv(backend *b) {
+	if (!b->shortconv)
+		return;
+	const int dims[] = {1, 3, 4, 7, 16, 33};
+	const int rows[] = {1, 2, 9};
+	for (size_t di = 0; di < ARRAY_LEN(dims); di++) {
+		for (size_t ri = 0; ri < ARRAY_LEN(rows); ri++) {
+			int	  dim = dims[di], n = rows[ri];
+			int	  in_stride = 3 * dim + 3, out_stride = dim + 5;
+			float mixed[n * in_stride], out[n * out_stride];
+			for (size_t i = 0; i < ARRAY_LEN(mixed); i++)
+				mixed[i] = ((int)(i % 23) - 11) / 17.0f;
+			for (int centered = 0; centered <= 1; centered++) {
+				for (int kernel = centered ? 3 : 2; kernel <= (centered ? 3 : 4); kernel++) {
+					int	  history = kernel - 1;
+					float weights[dim * kernel], state[dim * history], initial[dim * history];
+					for (size_t i = 0; i < ARRAY_LEN(weights); i++)
+						weights[i] = ((int)(i % 17) - 8) / 19.0f;
+					for (size_t i = 0; i < ARRAY_LEN(state); i++)
+						state[i] = initial[i] = ((int)(i % 13) - 6) / 23.0f;
+					for (size_t i = 0; i < ARRAY_LEN(out); i++)
+						out[i] = 123.0f;
+					shortconv_desc d	 = {.out		= out,
+											.state		= centered ? NULL : state,
+											.mixed		= mixed,
+											.conv_w		= weights,
+											.dim		= dim,
+											.kernel		= kernel,
+											.in_stride	= in_stride,
+											.out_stride = out_stride,
+											.n_rows		= n,
+											.centered	= centered};
+					status_code	   st	 = b->shortconv(b, &d);
+					float		   error = 0.0f;
+					int			   ok	 = st == OK;
+					for (int t = 0; t < n; t++) {
+						for (int c = 0; c < dim; c++) {
+							double sum = 0.0;
+							for (int k = 0; k < kernel; k++) {
+								int	  source = t + k - (centered ? 1 : history);
+								float bx	 = 0.0f;
+								if (source < 0 && !centered)
+									bx = initial[c * history + source + history];
+								else if (source >= 0 && source < n)
+									bx = mixed[source * in_stride + c] *
+										 mixed[source * in_stride + 2 * dim + c];
+								sum += bx * weights[c * kernel + k];
+							}
+							float expected = mixed[t * in_stride + dim + c] * sum;
+							error		   = MAX(error, fabsf(out[t * out_stride + c] - expected));
+						}
+						for (int c = dim; c < out_stride; c++)
+							ok &= out[t * out_stride + c] == 123.0f;
+					}
+					if (!centered) {
+						for (int c = 0; c < dim; c++) {
+							for (int k = 0; k < history; k++) {
+								int	  source   = n + k - history;
+								float expected = source < 0
+													 ? initial[c * history + n + k]
+													 : mixed[source * in_stride + c] *
+														   mixed[source * in_stride + 2 * dim + c];
+								ok &= state[c * history + k] == expected;
+							}
+						}
+					}
+					record_resultf(OPFAM_HYBRID_STATE, "shortconv", ok && error < 1e-6f,
+								   "backend=%s dim=%d rows=%d kernel=%d centered=%d error=%.3g",
+								   b->name, dim, n, kernel, centered, error);
+				}
+			}
+		}
+	}
+}
+
 void run_hybrid_state_tests(backend *ref) {
-	(void)ref;
+	test_shortconv(ref);
+	backend *cpu = NULL;
+	if (backend_create("cpu", 0, &cpu) == OK) {
+		test_shortconv(cpu);
+		backend_destroy(cpu);
+	}
 	char detail[512];
 
 	const uint8_t is_conv[HYB_LAYERS] = {1, 1, 0, 1, 0, 1};

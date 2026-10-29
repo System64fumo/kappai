@@ -318,7 +318,7 @@ static recipe_op mk_softcap(uint8_t in, float cap) {
 	return op;
 }
 
-static recipe_op mk_logits_readback(void) {
+recipe_op mk_logits_readback(void) {
 	return mk_op_base(OP_LOGITS_READBACK, RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
 }
@@ -460,4 +460,44 @@ void recipe_build_post_ops(model_recipe *r, const model *m) {
 
 	r->post_ops	  = ops;
 	r->n_post_ops = i;
+}
+
+recipe_op mk_layernorm(uint8_t in, uint8_t out, uint8_t weight, uint8_t bias, int n, float eps) {
+	recipe_op op	 = mk_op_base(OP_LAYERNORM, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, out, weight,
+								  STAGE_RMSNORM);
+	op.u.layernorm.n = n;
+	op.u.layernorm.eps		= eps;
+	op.u.layernorm.bias_idx = bias;
+	return op;
+}
+
+recipe_op mk_add_bias(uint8_t io, uint8_t weight, int n) {
+	recipe_op op =
+		mk_op_base(OP_ADD_BIAS, io, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, io, weight, STAGE_ADD);
+	op.u.ffn_act.n = n;
+	return op;
+}
+
+recipe_op mk_add_type_embd(uint8_t io, uint8_t weight, int n, int n_types) {
+	recipe_op op		 = mk_add_bias(io, weight, n);
+	op.kind				 = OP_ADD_TYPE_EMBD;
+	op.u.ffn_act.n_types = n_types;
+	return op;
+}
+
+recipe_op mk_split_qkv(uint8_t in, int dim) {
+	recipe_op op  = mk_op_base(OP_SPLIT_QKV, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_Q,
+							   WIDX_NONE, STAGE_MATMUL);
+	op.out1		  = RECIPE_SLOT_K;
+	op.out2		  = RECIPE_SLOT_V;
+	op.u.matmul.k = dim;
+	return op;
+}
+
+recipe_op mk_activate(uint8_t io, int n, int activation) {
+	recipe_op op   = mk_op_base(OP_ACTIVATE, io, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, io, WIDX_NONE,
+								STAGE_FFN_ACT);
+	op.u.ffn_act.n = n;
+	op.u.ffn_act.activation = activation;
+	return op;
 }
