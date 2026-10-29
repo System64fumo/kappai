@@ -13,22 +13,24 @@ typedef struct cpu_cache_info cpu_cache_info;
 typedef status_code (*backend_ctor_fn)(backend *out);
 
 typedef enum {
-	BCAP_NONE				  = 0,
-	BCAP_IS_HOST			  = 1 << 0,
-	BCAP_MULTI_MATMUL		  = 1 << 1,
-	BCAP_MATMUL_RESIDUAL	  = 1 << 2,
-	BCAP_ROPE_QK_FUSED		  = 1 << 3,
-	BCAP_RMSNORM_ADD		  = 1 << 4,
-	BCAP_MATMUL_FFN_DOWN	  = 1 << 5,
-	BCAP_MATMUL_QONLY		  = 1 << 6,
-	BCAP_HOST_VISIBLE_BUFFERS = 1 << 7,
-	BCAP_KV_QUANT_Q8_0		  = 1 << 8,
-	BCAP_MOE_EXPERT_RESIDENT  = 1 << 9,
-	BCAP_KV_POS_CAP			  = 1 << 10,
-	BCAP_UNIFIED_MEMORY		  = 1 << 11,
-	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
-	BCAP_KV_SHIFT			  = 1 << 13,
-	BCAP_QK_NORM_ROPE		  = 1 << 14,
+	BCAP_NONE				   = 0,
+	BCAP_IS_HOST			   = 1 << 0,
+	BCAP_MULTI_MATMUL		   = 1 << 1,
+	BCAP_MATMUL_RESIDUAL	   = 1 << 2,
+	BCAP_ROPE_QK_FUSED		   = 1 << 3,
+	BCAP_RMSNORM_ADD		   = 1 << 4,
+	BCAP_MATMUL_FFN_DOWN	   = 1 << 5,
+	BCAP_MATMUL_QONLY		   = 1 << 6,
+	BCAP_HOST_VISIBLE_BUFFERS  = 1 << 7,
+	BCAP_KV_QUANT_Q8_0		   = 1 << 8,
+	BCAP_MOE_EXPERT_RESIDENT   = 1 << 9,
+	BCAP_KV_POS_CAP			   = 1 << 10,
+	BCAP_UNIFIED_MEMORY		   = 1 << 11,
+	BCAP_IN_ORDER_QUEUE		   = 1 << 12,
+	BCAP_KV_SHIFT			   = 1 << 13,
+	BCAP_QK_NORM_ROPE		   = 1 << 14,
+	BCAP_KV_LAYER_DIMS		   = 1 << 15,
+	BCAP_HOST_RESIDENT_BUFFERS = 1 << 16,
 } backend_cap;
 
 #define BACKEND_TOKEN_REGS 2
@@ -423,6 +425,7 @@ struct backend {
 							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
 							int n_kv_heads_active);
 	const char *desc;
+	void	   *device_priv;
 };
 
 static inline int backend_has_cap(const backend *b, uint64_t cap) {
@@ -443,7 +446,7 @@ static inline tpool *backend_get_pool(backend *b) {
 static inline int buffer_is_host_resident(const buffer *b) {
 	if (!b->handle)
 		return 1;
-	return b->owner && backend_has_cap(b->owner, BCAP_IS_HOST);
+	return backend_has_cap(b->owner, BCAP_IS_HOST | BCAP_HOST_RESIDENT_BUFFERS);
 }
 
 static inline void ensure_sync(backend *a) {

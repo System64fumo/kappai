@@ -22,7 +22,7 @@ cap_resolution cap_resolve(backend *be, const struct model *m, op_kind kind, con
 						   int batched) {
 	const char *host_only = cap_host_only_fn(kind);
 	if (host_only)
-		return backend_has_cap(be, BCAP_IS_HOST)
+		return backend_has_cap(be, BCAP_IS_HOST | BCAP_HOST_RESIDENT_BUFFERS)
 				   ? (cap_resolution){.impl = CAP_NATIVE}
 				   : host_resolution(host_only, HFB_OP_NOT_NATIVE,
 									 "no device implementation; executes on the host");

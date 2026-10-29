@@ -58,7 +58,7 @@ static inline size_t cpu_host_mem_total(void) {
 #define CPU_BACKEND_CAPS                                                                           \
 	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
-	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT)
+	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT | BCAP_KV_LAYER_DIMS)
 
 status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int));
 
@@ -322,8 +322,8 @@ static inline size_t cpu_kv_put_slot(cpu_priv *p, int layer, int pos, int n_ctx,
 }
 
 static inline void *cpu_ptr(const buffer *b) {
-	if (b->owner && !backend_has_cap(b->owner, BCAP_IS_HOST) &&
-		!backend_has_cap(b->owner, BCAP_HOST_VISIBLE_BUFFERS)) {
+	if (b->owner && !backend_has_cap(b->owner, BCAP_IS_HOST | BCAP_HOST_VISIBLE_BUFFERS |
+												   BCAP_HOST_RESIDENT_BUFFERS)) {
 		ERROR("cpu_ptr: buffer owned by backend '%s' passed to CPU compute path; "
 			  "this backend is missing a native op and silently fell back to host, "
 			  "which corrupts memory for non-CPU-resident buffers",

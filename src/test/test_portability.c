@@ -135,12 +135,43 @@ static void test_posix_monitor(void) {
 	record_resultf(OPFAM_EDGE_CASE, "posix.monitor_cleanup", ok, "socket removed");
 }
 
+static void test_buffer_residency(void) {
+	backend	 host		= {.caps = BCAP_IS_HOST};
+	backend	 resident	= {.caps = BCAP_HOST_RESIDENT_BUFFERS};
+	backend	 mirror		= {.caps = BCAP_HOST_VISIBLE_BUFFERS | BCAP_UNIFIED_MEMORY};
+	backend	 opaque		= {0};
+	float	 data[4]	= {0};
+	buffer	 b			= {.handle = data, .host_ptr = data, .size = sizeof(data)};
+	backend *owners[]	= {&host, &resident, &mirror, &opaque};
+	int		 expected[] = {1, 1, 0, 0};
+	for (size_t i = 0; i < ARRAY_LEN(owners); i++) {
+		b.owner = owners[i];
+		record_resultf(OPFAM_EDGE_CASE, "buffer.host_residency",
+					   buffer_is_host_resident(&b) == expected[i], "case=%zu", i);
+	}
+	backend	   *cpu			 = NULL;
+	status_code st			 = backend_create("cpu_scalar", 0, &cpu);
+	float		values[]	 = {1, 2, 3, 4};
+	float		increments[] = {1, 1, 1, 1};
+	buffer		dst			 = buffer_host_view(&resident, values, sizeof(values));
+	buffer		src			 = buffer_host_view(&resident, increments, sizeof(increments));
+	if (st == OK)
+		st = cpu->add_inplace(cpu, &dst, &src, 4);
+	int ok = st == OK;
+	for (int i = 0; i < 4; i++)
+		ok = ok && values[i] == (float)(i + 2);
+	record_resultf(OPFAM_EDGE_CASE, "buffer.resident_cpu_interop", ok,
+				   "CPU consumes resident storage");
+	backend_destroy(cpu);
+}
+
 void run_portability_tests(void) {
 #if defined(__APPLE__)
 	run_host_memory_tests();
 #endif
 	test_posix_file_io();
 	test_posix_monitor();
+	test_buffer_residency();
 	void *local = xmalloc(16);
 	tlocal_register(&local);
 	tlocal_free_all();

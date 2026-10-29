@@ -218,7 +218,7 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 	int *layer_head_dim	  = NULL;
 	int *layer_n_kv_heads = NULL;
 	if ((m->arch_info->has_variable_layer_dims || is_hybrid) &&
-		backend_has_cap(kv_backend, BCAP_IS_HOST)) {
+		backend_has_cap(kv_backend, BCAP_KV_LAYER_DIMS)) {
 		layer_head_dim	 = xcalloc(m->n_layers, sizeof(int));
 		layer_n_kv_heads = xcalloc(m->n_layers, sizeof(int));
 		for (int i = 0; i < m->n_layers; i++) {
@@ -421,7 +421,7 @@ static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, back
 
 	bool per_layer_dims =
 		(m->arch_info->has_variable_layer_dims || m->arch_info->is_hybrid_recurrent) &&
-		backend_has_cap(be, BCAP_IS_HOST);
+		backend_has_cap(be, BCAP_KV_LAYER_DIMS);
 	int *slot_list		= xcalloc((size_t)n_slots, sizeof(int));
 	int *layer_head_dim = per_layer_dims ? xcalloc((size_t)n_slots, sizeof(int)) : NULL;
 	int *layer_n_kv		= per_layer_dims ? xcalloc((size_t)n_slots, sizeof(int)) : NULL;
