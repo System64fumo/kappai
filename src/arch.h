@@ -13,6 +13,7 @@ typedef enum {
 	ARCH_QWEN35,
 	ARCH_LFM2,
 	ARCH_GLM5_NEXT,
+	ARCH_QWEN3VL,
 } model_arch;
 
 typedef struct {

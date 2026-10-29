@@ -83,18 +83,11 @@ uint w1_read_u32(uint byte_offset) {
 #undef W_NAME
 #undef W_PFX
 
-float gelu_tanh(float x) {
-	const float c	  = 0.7978845608028654;
-	float		x3	  = x * x * x;
-	float		inner = c * (x + 0.044715 * x3);
-	return 0.5 * x * (1.0 + tanh(inner));
-}
-
 float activate(float g, float u) {
 	if (params.activation == 1) {
 		return gelu_tanh(g) * u;
 	} else {
-		return g / (1.0 + exp(-g)) * u;
+		return silu(g) * u;
 	}
 }
 

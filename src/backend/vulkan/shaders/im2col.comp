@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuf {
+	float in_[];
+};
+layout(set = 0, binding = 1) writeonly buffer ColBuf {
+	float col[];
+};
+
+layout(push_constant) uniform Params {
+	int first_pixel;
+	int n_pixels;
+	int width;
+	int in_height;
+	int in_width;
+	int channels;
+	int shift;
+}
+params;
+
+void main() {
+	uint idx   = gl_GlobalInvocationID.x;
+	uint ch	   = uint(params.channels);
+	uint total = uint(params.n_pixels) * 9u * ch;
+	if (idx >= total)
+		return;
+	uint  c		= idx % ch;
+	uint  tap	= (idx / ch) % 9u;
+	uint  r		= idx / (9u * ch);
+	int	  pixel = params.first_pixel + int(r);
+	int	  y		= pixel / params.width;
+	int	  x		= pixel % params.width;
+	int	  sy	= y + int(tap / 3u) - 1;
+	int	  sx	= x + int(tap % 3u) - 1;
+	int	  iy	= sy >> params.shift;
+	int	  ix	= sx >> params.shift;
+	float v		= 0.0;
+	if (sy >= 0 && sx >= 0 && iy < params.in_height && ix < params.in_width)
+		v = in_[(uint(iy) * uint(params.in_width) + uint(ix)) * ch + c];
+	col[idx] = v;
+}

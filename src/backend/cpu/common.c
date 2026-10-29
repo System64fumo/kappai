@@ -2040,6 +2040,14 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	out->cpu_info						 = cpu_info;
 	out->rmsnorm_batch					 = cpu_rmsnorm_batch;
 	out->add_batch						 = cpu_add_batch;
+	out->layernorm_modulate				 = cpu_layernorm_modulate;
+	out->gated_add						 = cpu_gated_add;
+	out->add_bias						 = cpu_add_bias;
+	out->activate						 = cpu_activate;
+	out->rope_table						 = cpu_rope_table;
+	out->attention_dense				 = cpu_attention_dense;
+	out->im2col3x3						 = cpu_im2col3x3;
+	out->upsample_shortcut_add			 = cpu_upsample_shortcut_add;
 	out->ffn_activate_batch				 = cpu_ffn_activate_batch;
 	out->ffn_activate_fused_batch		 = cpu_ffn_activate_fused_batch;
 	out->rope_batch						 = cpu_rope_batch;
@@ -2442,26 +2450,6 @@ status_code cpu_gated_delta_net(backend *self, const gdn_desc *d) {
 	return OK;
 }
 
-void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
-	double base_freq = 1.0;
-	for (int j = 0; j < half; j++) {
-		double ff = 1.0;
-		if (freq_factors) {
-			float fv = freq_factors[j];
-			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
-		}
-		if (ff > 0.0) {
-			double angle	= base_freq * ff * (double)pos;
-			cs[2 * j]		= (float)cos(angle);
-			cs[(2 * j) + 1] = (float)sin(angle);
-		} else {
-			cs[2 * j]		= 1.0f;
-			cs[(2 * j) + 1] = 0.0f;
-		}
-		base_freq *= theta_scale;
-	}
-}
-
 status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 							   const float *freq_factors, float **cs_out) {
 	int half = head_dim / 2;
@@ -2489,7 +2477,7 @@ status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 	}
 
 	if (!cache_valid) {
-		cpu_rope_cs_fill(p->rope_cs.cs, half, pos, theta_scale, freq_factors);
+		rope_cs_fill(p->rope_cs.cs, half, pos, theta_scale, freq_factors);
 		p->rope_cs.pos_cached		   = pos;
 		p->rope_cs.theta_cs_cached	   = theta;
 		p->rope_cs.head_dim_cs_cached  = head_dim;

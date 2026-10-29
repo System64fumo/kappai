@@ -35,6 +35,9 @@ static const char *const fuse_choices[] = {"qkv", NULL};
 #define S_INT(k, l, h, f, lo, hi)                                                                  \
 	{k,	   l,		 h,	   FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),      \
 	 NULL, UIK_TEXT, false}
+#define S_INT_STEP(k, l, h, f, lo, hi, step)                                                       \
+	{k,	   l,		 h,		FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),     \
+	 NULL, UIK_TEXT, false, step}
 #define S_FLT(k, l, h, f, lo, hi)                                                                  \
 	{k, l, h, FLD_FLOAT, offsetof(saved_config, f), 0, (lo), (hi), NULL, UIK_TEXT, false}
 #define S_BOOL(k, l, h, f)                                                                         \
@@ -48,6 +51,25 @@ static const field_desc MODEL_FIELDS[] = {
 	S_PATH("model", "Model path", "path to the GGUF model file", model, SC_PATH_MAX),
 	S_INT("ctx_size", "Context size", "0 = use model default", ctx_size, 0, INT_MAX),
 	S_INT("threads", "Threads", "0 = auto-detect", n_threads, 0, 4096),
+};
+
+static const field_desc DIFFUSION_FIELDS[] = {
+	S_PATH("vae", "VAE path", "path to the VAE GGUF file", vae, SC_PATH_MAX),
+	S_PATH("llm", "LLM path", "path to the text encoder LLM GGUF file", llm, SC_PATH_MAX),
+	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
+		  negative_prompt, SC_SYSTEM_MAX),
+	S_INT_STEP("width", "Width", "pixels, multiple of 32", width, 32, 16384,
+			   DIFFUSION_DIMENSION_STEP),
+	S_INT_STEP("height", "Height", "pixels, multiple of 32", height, 32, 16384,
+			   DIFFUSION_DIMENSION_STEP),
+	S_INT("steps", "Steps", "denoising steps", steps, 1, 1000),
+	S_FLT("cfg_scale", "CFG scale", "prompt guidance, 1.0 = no guidance", cfg_scale, 0.0, 1000.0),
+	S_PATH("output_dir", "Output directory", "final images are saved here, created if missing",
+		   output_dir, SC_PATH_MAX),
+	S_PATH("preview_path", "Preview image", "PNG rewritten while generating, empty = off",
+		   preview_path, SC_PATH_MAX),
+	S_FLT("preview_interval", "Preview interval", "minimum seconds between preview updates",
+		  preview_interval, 0.0, 3600.0),
 };
 
 static const field_desc ENGINE_FIELDS[] = {
@@ -100,6 +122,7 @@ static const field_desc SERVER_FIELDS[] = {
 
 const schema_tab SCHEMA_TABS[] = {
 	{"model", MODEL_FIELDS, ARRAY_LEN(MODEL_FIELDS)},
+	{"diffusion", DIFFUSION_FIELDS, ARRAY_LEN(DIFFUSION_FIELDS)},
 	{"engine", ENGINE_FIELDS, ARRAY_LEN(ENGINE_FIELDS)},
 	{"moe", MOE_FIELDS, ARRAY_LEN(MOE_FIELDS)},
 	{"sampling", SAMPLING_FIELDS, ARRAY_LEN(SAMPLING_FIELDS)},
@@ -175,6 +198,10 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 		if ((double)n < f->lo || (double)n > f->hi) {
 			snprintf(err, errlen, "'%s' value %lld out of range [%lld, %lld]", f->key, n,
 					 (long long)f->lo, (long long)f->hi);
+			return -1;
+		}
+		if (f->multiple_of && n % f->multiple_of != 0) {
+			snprintf(err, errlen, "'%s' must be a multiple of %d", f->key, f->multiple_of);
 			return -1;
 		}
 		*(int *)sc_field_ptr(sc, f) = (int)n;
@@ -280,6 +307,14 @@ void sc_defaults(saved_config *sc) {
 	sc->server_slots   = a.server_slots;
 
 	sc->kv_quant = KV_QUANT_F16;
+
+	snprintf(sc->output_dir, sizeof(sc->output_dir), ".");
+	diffusion_params defaults = diffusion_params_defaults();
+	sc->width				  = defaults.width;
+	sc->height				  = defaults.height;
+	sc->steps				  = defaults.steps;
+	sc->cfg_scale			  = defaults.cfg_scale;
+	sc->preview_interval	  = defaults.preview_interval;
 }
 
 void sc_sanitize_name(const char *in, char *out, size_t outlen) {
@@ -659,29 +694,6 @@ int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
 	return rc;
 }
 
-static int mkdir_p(const char *path, char *err, size_t errlen) {
-	char tmp[SC_PATH_MAX];
-	if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
-		snprintf(err, errlen, "config directory path too long");
-		return -1;
-	}
-	for (char *p = tmp + 1; *p; p++) {
-		if (*p != '/')
-			continue;
-		*p = '\0';
-		if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-			snprintf(err, errlen, "cannot create directory '%s': %s", tmp, strerror(errno));
-			return -1;
-		}
-		*p = '/';
-	}
-	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-		snprintf(err, errlen, "cannot create directory '%s': %s", tmp, strerror(errno));
-		return -1;
-	}
-	return 0;
-}
-
 static void write_hcs(FILE *fp, const hcs_config *h) {
 	char devices[HCS_MAX_DEVICES * (HCS_NAME_MAX + 2)];
 	hcs_format_devices(h, devices, sizeof(devices));
@@ -815,6 +827,27 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	a->server_port	  = sc->server_port;
 	a->server_slots	  = sc->server_slots > 0 ? sc->server_slots : 4;
 	a->server_api_key = sc->api_key[0] ? sc->api_key : NULL;
+}
+
+void sc_materialize_diffusion(const saved_config *sc, diffusion_files *files, diffusion_params *p,
+							  diffusion_output *out) {
+	*files = (diffusion_files){
+		.diffusion_model = sc->model,
+		.device			 = sc->hcs.devices[0].name,
+		.vae			 = sc->vae,
+		.llm			 = sc->llm,
+	};
+	*p = (diffusion_params){
+		.negative_prompt  = sc->negative_prompt,
+		.width			  = sc->width,
+		.height			  = sc->height,
+		.steps			  = sc->steps,
+		.cfg_scale		  = sc->cfg_scale,
+		.seed			  = sc->seed,
+		.preview_path	  = sc->preview_path[0] ? sc->preview_path : NULL,
+		.preview_interval = sc->preview_interval,
+	};
+	*out = (diffusion_output){.dir = sc->output_dir, .name = sc->name};
 }
 
 void sc_multi_parse(const char *val, const char *const choices[], int n, bool empty_all,

@@ -1,5 +1,6 @@
 #include "recipe/plan.h"
 #include "log.h"
+#include "recipe/capability.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -417,4 +418,249 @@ int part_plan_check_carry(const part_plan *p, const cg_set *graphs) {
 		}
 	}
 	return missing;
+}
+
+typedef struct {
+	size_t begin, end;
+} layout_span;
+
+static const char *const VG_SECTION_LABELS[CG_SECTION_COUNT] = {"pre", "layer", "post"};
+
+static void vrange_merge(cg_range *r, cg_range from) {
+	r->start = MIN(r->start, from.start);
+	r->end	 = MAX(r->end, from.end);
+}
+
+static cg_range *vrange_roots(const cg_graph *c) {
+	cg_range *ranges = graph_value_ranges(c);
+	cg_range *roots	 = xmalloc((size_t)(c->n_values + 1) * sizeof(cg_range));
+	for (int v = 0; v < c->n_values; v++)
+		roots[v] = (cg_range){.start = INT_MAX, .end = -1};
+	for (int v = 0; v < c->n_values; v++)
+		if (ranges[v].end >= 0)
+			vrange_merge(&roots[cg_value_root(c, v)], ranges[v]);
+	free(ranges);
+	return roots;
+}
+
+static bool vrange_overlap(cg_range a, cg_range b) {
+	return a.start <= b.end && b.start <= a.end;
+}
+
+static size_t aligned_floats(size_t floats) {
+	return (floats + CG_ARENA_ALIGN_FLOATS - 1) / CG_ARENA_ALIGN_FLOATS * CG_ARENA_ALIGN_FLOATS;
+}
+
+static int layout_span_cmp(const void *a, const void *b) {
+	size_t x = ((const layout_span *)a)->begin, y = ((const layout_span *)b)->begin;
+	return x < y ? -1 : x > y;
+}
+
+static size_t layout_first_fit(layout_span *taken, int n, size_t floats) {
+	qsort(taken, (size_t)n, sizeof(layout_span), layout_span_cmp);
+	size_t cursor = 0;
+	for (int i = 0; i < n; i++) {
+		if (taken[i].begin >= cursor + floats)
+			break;
+		cursor = MAX(cursor, taken[i].end);
+	}
+	return cursor;
+}
+
+static const cg_graph *layout_sort_graph;
+
+static int layout_by_size_desc(const void *a, const void *b) {
+	size_t x = layout_sort_graph->values[*(const int *)a].elems;
+	size_t y = layout_sort_graph->values[*(const int *)b].elems;
+	return x < y ? 1 : x > y ? -1 : *(const int *)a - *(const int *)b;
+}
+
+static bool layout_needs_arena(const cg_graph *c, const cg_range *r, int v) {
+	const cg_value *val = &c->values[v];
+	return val->alias_of == CG_NONE && val->view_of == CG_NONE && val->external != CG_EXT_LAYER &&
+		   r[v].end >= 0;
+}
+
+void cg_arena_layout_plan(cg_arena_layout *l, const cg_graph *c, const cg_range *r) {
+	int			*order	= xmalloc((size_t)(c->n_values + 1) * sizeof(int));
+	layout_span *taken	= xmalloc((size_t)(c->n_values + 1) * sizeof(layout_span));
+	int			 n		= 0;
+	l->arena_floats		= 0;
+	l->unplanned_floats = 0;
+	for (int v = 0; v < c->n_values; v++) {
+		l->offset[v] = CG_NO_OFFSET;
+		if (layout_needs_arena(c, r, v)) {
+			order[n++] = v;
+			l->unplanned_floats += aligned_floats(c->values[v].elems);
+		}
+	}
+	layout_sort_graph = c;
+	qsort(order, (size_t)n, sizeof(int), layout_by_size_desc);
+	for (int i = 0; i < n; i++) {
+		int	   v	   = order[i];
+		size_t floats  = aligned_floats(c->values[v].elems);
+		int	   n_taken = 0;
+		for (int j = 0; j < i; j++) {
+			int u = order[j];
+			if (vrange_overlap(r[v], r[u]))
+				taken[n_taken++] =
+					(layout_span){l->offset[u], l->offset[u] + aligned_floats(c->values[u].elems)};
+		}
+		l->offset[v]	= layout_first_fit(taken, n_taken, floats);
+		l->arena_floats = MAX(l->arena_floats, l->offset[v] + floats);
+	}
+	free(order);
+	free(taken);
+}
+
+void cg_arena_layout_release(cg_arena_layout *l) {
+	free(l->offset);
+	l->offset = NULL;
+}
+
+status_code cg_arena_layout_build(cg_arena_layout *l, const cg_graph *c) {
+	l->offset	= xmalloc((size_t)(c->n_values + 1) * sizeof(size_t));
+	cg_range *r = vrange_roots(c);
+	cg_arena_layout_plan(l, c, r);
+	free(r);
+	return OK;
+}
+
+static bool vg_param_present(const cg_node *n, const cg_param *p) {
+	switch (n->kind) {
+	case OP_DF_MATMUL:
+		return p && p->mat;
+	case OP_DF_CONV:
+		return p && p->conv;
+	case OP_DF_RMSNORM:
+	case OP_DF_RMSNORM_PER_HEAD:
+		return p && p->vec;
+	default:
+		return true;
+	}
+}
+
+static status_code vg_check_params(const cg_builder *g) {
+	for (int i = 0; i < g->g->n_nodes; i++) {
+		const cg_node *n = &g->g->nodes[i];
+		if (n->param.scope == CG_SCOPE_LAYER && !g->layer_params) {
+			ERROR("graph: n%d %s uses layer params but none are bound", i, recipe_op_name(n->kind));
+			return ERR_NOT_FOUND;
+		}
+		int layers = n->param.scope == CG_SCOPE_LAYER ? g->n_layers : 1;
+		for (int l = 0; l < layers; l++)
+			if (!vg_param_present(n, cg_builder_param(g, n->param, l))) {
+				ERROR("graph: n%d %s has no weight (layer %d)", i, recipe_op_name(n->kind), l);
+				return ERR_NOT_FOUND;
+			}
+	}
+	return OK;
+}
+
+static status_code vg_resolve_steps(cg_plan *p, backend *be) {
+	bool resolved[OP_KIND_COUNT] = {false};
+	for (int i = 0; i < p->graph->g->n_nodes; i++) {
+		op_kind kind = p->graph->g->nodes[i].kind;
+		if (!resolved[kind]) {
+			cap_resolution res = cap_resolve(be, NULL, kind, NULL, 1);
+			if (res.impl != CAP_NATIVE || !cg_node_handler_for(kind)) {
+				ERROR("graph: backend '%s' cannot run %s (missing %s)", be->name,
+					  recipe_op_name(kind), res.fn ? res.fn : "handler");
+				cap_report(be, &res);
+				return ERR_UNSUPPORTED;
+			}
+			resolved[kind] = true;
+		}
+		p->steps[i].fn = cg_node_handler_for(kind);
+	}
+	return OK;
+}
+
+status_code cg_plan_build(cg_builder *g, backend *be, const char *label, cg_plan **out) {
+	cg_builder_finish(g);
+	cg_plan *p	  = xcalloc(1, sizeof(*p));
+	p->graph	  = g;
+	p->label	  = label;
+	p->profiling  = log_get_level() <= LOG_DEBUG;
+	p->steps	  = xcalloc((size_t)g->g->n_nodes + 1, sizeof(cg_node_step));
+	status_code s = cg_builder_validate(g) == 0 ? vg_check_params(g) : ERR_FORMAT;
+	if (s == OK)
+		s = vg_resolve_steps(p, be);
+	if (s != OK) {
+		ERROR("%s graph rejected", label);
+		cg_plan_free(p);
+		return s;
+	}
+	status_code s2 = cg_arena_layout_build(&p->layout, g->g);
+	if (s2 != OK) {
+		cg_plan_free(p);
+		return s2;
+	}
+	if (graph_dump_mode() == CG_DUMP_TEXT)
+		graph_dump(g->g, stderr);
+	else if (graph_dump_mode() == CG_DUMP_DOT)
+		graph_dump_dot(g->g, stderr);
+	DEBUG("%s graph: %d nodes, %d values, arena %.1f MiB (%.1f MiB without reuse)", label,
+		  g->g->n_nodes, g->g->n_values,
+		  (double)(p->layout.arena_floats * sizeof(float)) / (1 << 20),
+		  (double)(p->layout.unplanned_floats * sizeof(float)) / (1 << 20));
+	*out = p;
+	return OK;
+}
+
+void cg_plan_report(cg_plan *p, FILE *fp) {
+	bool printed = false;
+	for (int i = 0; i < p->graph->g->n_nodes; i++) {
+		cg_node_step *st = &p->steps[i];
+		if (!st->calls)
+			continue;
+		if (!printed) {
+			fprintf(fp, "[profile] %s  per graph node (host dispatch time)\n", p->label);
+			printed = true;
+		}
+		const cg_node *n = &p->graph->g->nodes[i];
+		fprintf(fp, "  %-5s n%-4d %-24s calls=%-6llu us=%-9llu us/call=%.1f\n",
+				VG_SECTION_LABELS[n->section], i, recipe_op_name(n->kind),
+				(unsigned long long)st->calls, (unsigned long long)st->us,
+				(double)st->us / (double)st->calls);
+		st->us	  = 0;
+		st->calls = 0;
+	}
+}
+
+void cg_plan_free(cg_plan *p) {
+	if (!p)
+		return;
+	if (p->profiling)
+		cg_plan_report(p, stderr);
+	cg_builder_free(p->graph);
+	free(p->steps);
+	cg_arena_layout_release(&p->layout);
+	free(p);
+}
+
+cg_plan *cg_plan_cache_get(const cg_plan_cache *c, uint64_t key) {
+	for (int i = 0; i < c->count; i++)
+		if (c->keys[i] == key)
+			return c->plans[i];
+	return NULL;
+}
+
+void cg_plan_cache_put(cg_plan_cache *c, uint64_t key, cg_plan *plan) {
+	int slot;
+	if (c->count < CG_PLAN_CACHE_SIZE)
+		slot = c->count++;
+	else {
+		slot	= c->next;
+		c->next = (c->next + 1) % CG_PLAN_CACHE_SIZE;
+		cg_plan_free(c->plans[slot]);
+	}
+	c->plans[slot] = plan;
+	c->keys[slot]  = key;
+}
+
+void cg_plan_cache_free(cg_plan_cache *c) {
+	for (int i = 0; i < c->count; i++)
+		cg_plan_free(c->plans[i]);
+	memset(c, 0, sizeof(*c));
 }

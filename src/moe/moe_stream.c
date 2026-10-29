@@ -700,12 +700,9 @@ static void *pin_copy_worker(void *arg) {
 }
 
 static void moe_slot_free_dev_buffers(moe_expert_slot *sl) {
-	if (sl->dev_gate.owner)
-		sl->dev_gate.owner->buffer_free(sl->dev_gate.owner, &sl->dev_gate);
-	if (sl->dev_up.owner)
-		sl->dev_up.owner->buffer_free(sl->dev_up.owner, &sl->dev_up);
-	if (sl->dev_down.owner)
-		sl->dev_down.owner->buffer_free(sl->dev_down.owner, &sl->dev_down);
+	buffer_release(&sl->dev_gate);
+	buffer_release(&sl->dev_up);
+	buffer_release(&sl->dev_down);
 	sl->dev_gate  = (buffer){0};
 	sl->dev_up	  = (buffer){0};
 	sl->dev_down  = (buffer){0};

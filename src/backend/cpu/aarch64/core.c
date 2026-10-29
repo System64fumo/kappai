@@ -403,7 +403,7 @@ static void cpu_rope_ext_batch_chunk_neon(int begin, int end, int tid, void *ctx
 		}
 		float  cs_stack[512];
 		float *cs = half > 256 ? xmalloc((size_t)half * 2 * sizeof(float)) : cs_stack;
-		cpu_rope_cs_fill(cs, half, pos, theta_scale, j->freq_factors);
+		rope_cs_fill(cs, half, pos, theta_scale, j->freq_factors);
 		for (int h = 0; h < j->n_heads; h++)
 			cpu_rope_cs_one_neon(v + ((size_t)h * j->head_dim), half, cs, j->neox);
 		if (cs != cs_stack)

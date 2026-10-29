@@ -20,12 +20,7 @@ layout(push_constant) uniform Params {
 }
 params;
 
-float gelu_tanh(float x) {
-	const float c	  = 0.7978845608028654;
-	float		x3	  = x * x * x;
-	float		inner = c * (x + 0.044715 * x3);
-	return 0.5 * x * (1.0 + tanh(inner));
-}
+#include "common.glsl"
 
 void main() {
 	uint row = gl_WorkGroupID.y;
@@ -37,6 +32,6 @@ void main() {
 		return;
 	float g			  = gate[row_off + i] * params.gs;
 	float u			  = up[row_off + i] * params.us;
-	float activated	  = params.activation == 1 ? gelu_tanh(g) : g / (1.0 + exp(-g));
+	float activated	  = params.activation == 1 ? gelu_tanh(g) : silu(g);
 	out_[row_off + i] = activated * u;
 }

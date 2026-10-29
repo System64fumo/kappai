@@ -7,13 +7,40 @@
 #include "common.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #if defined(__GLIBC__) || defined(__APPLE__)
 #include <execinfo.h>
 #endif
+#include <math.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+
+int mkdir_p(const char *path, char *err, size_t errlen) {
+	char tmp[PATH_MAX];
+	if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int)sizeof(tmp)) {
+		snprintf(err, errlen, "directory path too long");
+		return -1;
+	}
+	for (char *p = tmp + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+			snprintf(err, errlen, "cannot create directory '%s': %s", tmp, strerror(errno));
+			return -1;
+		}
+		*p = '/';
+	}
+	if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+		snprintf(err, errlen, "cannot create directory '%s': %s", tmp, strerror(errno));
+		return -1;
+	}
+	return 0;
+}
 
 const char *status_str(status_code s) {
 	switch (s) {
@@ -393,5 +420,25 @@ void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_s
 								   MIN(bytes - next, WEIGHT_COPY_CHUNK_BYTES));
 		memcpy((char *)dst + off, (const char *)src + off, len);
 		weight_source_release((const char *)src + off, len);
+	}
+}
+
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
+	double base_freq = 1.0;
+	for (int j = 0; j < half; j++) {
+		double ff = 1.0;
+		if (freq_factors) {
+			float fv = freq_factors[j];
+			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+		}
+		if (ff > 0.0) {
+			double angle	= base_freq * ff * (double)pos;
+			cs[2 * j]		= (float)cos(angle);
+			cs[(2 * j) + 1] = (float)sin(angle);
+		} else {
+			cs[2 * j]		= 1.0f;
+			cs[(2 * j) + 1] = 0.0f;
+		}
+		base_freq *= theta_scale;
 	}
 }

@@ -14,13 +14,8 @@ static void rng_seed(rng *r, uint64_t seed) {
 	if (seed == 0)
 		seed = 0xDEADBEEFCAFEBABEULL;
 	uint64_t z = seed;
-	for (int i = 0; i < 4; i++) {
-		z += 0x9E3779B97F4A7C15ULL;
-		uint64_t t = z;
-		t		   = (t ^ (t >> 30)) * 0xBF58476D1CE4E5B9ULL;
-		t		   = (t ^ (t >> 27)) * 0x94D049BB133111EBULL;
-		r->s[i]	   = t ^ (t >> 31);
-	}
+	for (int i = 0; i < 4; i++)
+		r->s[i] = splitmix64(&z);
 }
 
 static float rng_uniform(rng *r) {

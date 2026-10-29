@@ -1,4 +1,5 @@
 #version 450
+#include "common.glsl"
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) buffer DstBuf {
@@ -27,6 +28,10 @@ params;
 #define MODE_SOFTCAP 4
 #define MODE_SPLIT_QGATE 5
 #define MODE_ATTN_OUTPUT_GATE 6
+#define MODE_ACT_SILU 7
+#define MODE_ACT_GELU 8
+#define MODE_ADD_BIAS 9
+#define MODE_GATED_ADD 10
 
 void main() {
 	uint row = gl_WorkGroupID.y;
@@ -64,6 +69,22 @@ void main() {
 	}
 	case MODE_ATTN_OUTPUT_GATE:
 		dst[row_off + i] = dst[row_off + i] * (1.0 / (1.0 + exp(-src1[row_off + i])));
+		break;
+	case MODE_ACT_SILU: {
+		float v			 = dst[row_off + i];
+		dst[row_off + i] = silu(v);
+		break;
+	}
+	case MODE_ACT_GELU: {
+		float v			 = dst[row_off + i];
+		dst[row_off + i] = gelu_tanh(v);
+		break;
+	}
+	case MODE_ADD_BIAS:
+		dst[row_off + i] = dst[row_off + i] + src1[i];
+		break;
+	case MODE_GATED_ADD:
+		dst[row_off + i] = dst[row_off + i] + src1[row_off + i] * tanh(src2[i]);
 		break;
 	default:
 		break;

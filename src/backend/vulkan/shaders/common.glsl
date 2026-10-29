@@ -136,4 +136,15 @@ float div_exact(float a, float b) {
 	return uintBitsToFloat(sign | (uint(fe) << 23u) | M24);
 }
 
+float silu(float x) {
+	return x / (1.0 + exp(-x));
+}
+
+float gelu_tanh(float x) {
+	const float c	  = 0.7978845608028654;
+	float		x3	  = x * x * x;
+	float		inner = c * (x + 0.044715 * x3);
+	return 0.5 * x * (1.0 + tanh(inner));
+}
+
 #endif

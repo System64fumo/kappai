@@ -1,4 +1,5 @@
 #version 310 es
+#include "activate.glsl"
 precision highp float;
 precision highp int;
 
@@ -27,10 +28,9 @@ float xin(uint i) {
 	float u	 = up[gi + uint(u_up_off)] * u_us;
 	float gv;
 	if (u_act == 1) {
-		float t = 0.7978845608 * (g + 0.044715 * g * g * g);
-		gv		= 0.5 * g * (1.0 + tanh(t));
+		gv = gelu_tanh(g);
 	} else {
-		gv = g / (1.0 + exp(-g));
+		gv = silu(g);
 	}
 	return gv * u;
 }

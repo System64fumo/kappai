@@ -1,0 +1,29 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer VecBuf {
+	float vec[];
+};
+layout(std430, binding = 1) readonly buffer TableBuf {
+	float table[];
+};
+layout(location = 0) uniform int u_rows;
+layout(location = 1) uniform int u_heads;
+layout(location = 2) uniform int u_head_dim;
+void main(void) {
+	uint half_dim = uint(u_head_dim) / 2u;
+	uint total	  = uint(u_rows) * uint(u_heads) * half_dim;
+	uint gid	  = (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * 128u + gl_LocalInvocationID.x;
+	if (gid >= total)
+		return;
+	uint  i		 = gid % half_dim;
+	uint  rh	 = gid / half_dim;
+	uint  row	 = rh / uint(u_heads);
+	uint  at	 = rh * uint(u_head_dim) + 2u * i;
+	float co	 = table[(row * half_dim + i) * 2u];
+	float si	 = table[(row * half_dim + i) * 2u + 1u];
+	float x0	 = vec[at];
+	float x1	 = vec[at + 1u];
+	vec[at]		 = x0 * co - x1 * si;
+	vec[at + 1u] = x0 * si + x1 * co;
+}

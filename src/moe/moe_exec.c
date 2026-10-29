@@ -119,8 +119,7 @@ status_code moe_exec_upload_host(struct compute_scratch *s, backend *a, buffer *
 	buffer *stage = &s->moe.stage[s->moe.stage_next];
 	size_t	bytes = (size_t)dim * sizeof(float);
 	if (!stage->owner || stage->size < bytes) {
-		if (stage->owner)
-			stage->owner->buffer_free(stage->owner, stage);
+		buffer_release(stage);
 		memset(stage, 0, sizeof(*stage));
 		status_code as = a->buffer_alloc_scratch(a, bytes, stage);
 		if (as != OK)

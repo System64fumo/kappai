@@ -440,11 +440,14 @@ int graph_peak_live_buffers(const cg_graph *g) {
 	return peak;
 }
 
+static const char *slot_label(uint8_t slot) {
+	return slot < RECIPE_SLOT_MAX && SLOT_NAMES[slot] ? SLOT_NAMES[slot] : "-";
+}
+
 static void dump_value(FILE *out, const cg_graph *g, int id) {
 	const cg_value *v = &g->values[id];
-	fprintf(out, " v%d:%s%s%s%s", id, SLOT_NAMES[v->slot] ? SLOT_NAMES[v->slot] : "?",
-			v->alias_of != CG_NONE ? "~" : "", v->view_of != CG_NONE ? "^" : "",
-			v->loop_carried ? "*" : "");
+	fprintf(out, " v%d:%s%s%s%s", id, slot_label(v->slot), v->alias_of != CG_NONE ? "~" : "",
+			v->view_of != CG_NONE ? "^" : "", v->loop_carried ? "*" : "");
 }
 
 static void dump_node(FILE *out, const cg_graph *g, int id) {
@@ -479,10 +482,6 @@ void graph_dump(const cg_graph *g, FILE *out) {
 	for (int i = 0; i < g->n_carry; i++)
 		fprintf(out, "carry %s: v%d -> v%d\n", SLOT_NAMES[g->carry[i].slot], g->carry[i].in,
 				g->carry[i].out);
-}
-
-static const char *slot_label(uint8_t slot) {
-	return SLOT_NAMES[slot] ? SLOT_NAMES[slot] : "?";
 }
 
 void graph_dump_dot(const cg_graph *g, FILE *out) {
@@ -794,4 +793,348 @@ void graph_set_dump(const cg_set *s, FILE *out, int dot) {
 		else
 			graph_dump(s->graphs[g], out);
 	}
+}
+
+cg_builder *cg_builder_new(void) {
+	cg_builder *g = xcalloc(1, sizeof(*g));
+	g->g		  = xcalloc(1, sizeof(cg_graph));
+	for (int s = 0; s <= CG_SECTION_COUNT; s++)
+		g->g->section_begin[s] = CG_NONE;
+	g->g->section_begin[CG_SECTION_PRE] = 0;
+	g->n_layers							= 1;
+	return g;
+}
+
+void cg_builder_free(cg_builder *g) {
+	if (!g)
+		return;
+	graph_free(g->g);
+	free(g->globals);
+	free(g);
+}
+
+void cg_builder_section(cg_builder *g, cg_section section) {
+	g->current					 = section;
+	g->g->section_begin[section] = g->g->n_nodes;
+}
+
+void cg_builder_layers(cg_builder *g, int n_layers, const cg_param *rows, int stride) {
+	g->n_layers		= n_layers;
+	g->layer_params = rows;
+	g->layer_stride = stride;
+}
+
+void cg_builder_finish(cg_builder *g) {
+	cg_graph *c						   = g->g;
+	int		  end					   = c->n_nodes;
+	c->section_begin[CG_SECTION_COUNT] = end;
+	for (int s = CG_SECTION_COUNT - 1; s >= 0; s--) {
+		if (c->section_begin[s] == CG_NONE)
+			c->section_begin[s] = end;
+		end = c->section_begin[s];
+	}
+	graph_index_consumers(c);
+	graph_freeze(c);
+}
+
+static cg_param_ref builder_add_global(cg_builder *g, cg_param p) {
+	ARR_RESERVE(g->globals, g->n_globals, g->cap_globals);
+	g->globals[g->n_globals] = p;
+	return (cg_param_ref){CG_SCOPE_GLOBAL, g->n_globals++};
+}
+
+cg_param_ref cg_param_mat(cg_builder *g, const weight *w) {
+	return builder_add_global(g, (cg_param){.mat = w});
+}
+
+cg_param_ref cg_param_vec(cg_builder *g, const buffer *v) {
+	return builder_add_global(g, (cg_param){.vec = v});
+}
+
+cg_param_ref cg_param_conv(cg_builder *g, const conv_layer *c) {
+	return builder_add_global(g, (cg_param){.conv = c});
+}
+
+const cg_param *cg_builder_param(const cg_builder *g, cg_param_ref ref, int layer) {
+	if (ref.scope == CG_SCOPE_GLOBAL)
+		return &g->globals[ref.idx];
+	if (ref.scope == CG_SCOPE_LAYER)
+		return &g->layer_params[(size_t)layer * g->layer_stride + ref.idx];
+	return NULL;
+}
+
+static cg_value builder_make_value(size_t elems) {
+	return (cg_value){.producer	 = CG_NONE,
+					  .alias_of	 = CG_NONE,
+					  .view_of	 = CG_NONE,
+					  .slot		 = RECIPE_SLOT_NONE,
+					  .rows		 = CG_ROWS_BATCH,
+					  .dtype	 = CG_DTYPE_F32,
+					  .residency = CG_RES_DEVICE,
+					  .bind		 = CG_NONE,
+					  .elems	 = elems};
+}
+
+static int builder_add_value(cg_builder *g, cg_value v) {
+	cg_graph *c = g->g;
+	ARR_RESERVE(c->values, c->n_values, g->cap_values);
+	c->values[c->n_values] = v;
+	return c->n_values++;
+}
+
+int cg_input(cg_builder *g, size_t elems, int bind) {
+	cg_value v = builder_make_value(elems);
+	v.external = CG_EXT_HOST_INPUT;
+	v.bind	   = bind;
+	return builder_add_value(g, v);
+}
+
+int cg_layer_external(cg_builder *g, size_t elems, size_t layer_stride, int bind) {
+	cg_value v	   = builder_make_value(elems);
+	v.external	   = CG_EXT_LAYER;
+	v.bind		   = bind;
+	v.layer_stride = layer_stride;
+	return builder_add_value(g, v);
+}
+
+int cg_view(cg_builder *g, int parent, size_t offset, size_t elems) {
+	cg_value v	  = builder_make_value(elems);
+	v.view_of	  = parent;
+	v.view_offset = offset;
+	return builder_add_value(g, v);
+}
+
+void cg_output_value(cg_builder *g, int value, int bind) {
+	if (g->n_outputs >= CG_MAX_BINDS) {
+		ERROR("graph: too many outputs");
+		abort();
+	}
+	g->outputs[g->n_outputs++] = (cg_output){value, bind};
+}
+
+static int builder_node_out(cg_builder *g, int out, size_t elems) {
+	if (out == CG_NEW)
+		out = builder_add_value(g, builder_make_value(elems));
+	g->g->values[out].producer = g->g->n_nodes;
+	return out;
+}
+
+static int builder_node_alias(cg_builder *g, int x) {
+	cg_value v = builder_make_value(g->g->values[x].elems);
+	v.alias_of = x;
+	v.producer = g->g->n_nodes;
+	return builder_add_value(g, v);
+}
+
+static int builder_emit(cg_builder *g, op_kind kind, cg_param_ref param, int out, const int *in,
+						int n_in, op_params p) {
+	cg_graph *c = g->g;
+	ARR_RESERVE(c->nodes, c->n_nodes, g->cap_nodes);
+	cg_node *n = &c->nodes[c->n_nodes++];
+	memset(n, 0, sizeof(*n));
+	n->kind			= kind;
+	n->section		= g->current;
+	n->recipe_index = CG_NONE;
+	n->params		= p;
+	n->param		= param;
+	n->n_in			= n_in;
+	n->n_out		= 1;
+	n->out[0]		= out;
+	for (int k = 0; k < CG_STATE_SLOTS; k++)
+		n->state_dep[k] = CG_NONE;
+	for (int i = 0; i < n_in; i++) {
+		n->in[i] = in[i];
+		c->values[in[i]].n_uses++;
+	}
+	return out;
+}
+
+int cg_matmul(cg_builder *g, cg_param_ref w, int in, int out, int n, int k, int rows) {
+	out = builder_node_out(g, out, (size_t)rows * n);
+	return builder_emit(g, OP_DF_MATMUL, w, out, (int[]){in}, 1,
+						(op_params){.df_matmul = {n, k, rows}});
+}
+
+int cg_conv(cg_builder *g, cg_param_ref conv, int in, int out, int height, int width, int shift) {
+	const conv_layer *c = g->globals[conv.idx].conv;
+	out					= builder_node_out(g, out, (size_t)height * width * c->oc);
+	return builder_emit(g, OP_DF_CONV, conv, out, (int[]){in}, 1,
+						(op_params){.df_conv = {height, width, shift}});
+}
+
+int cg_rmsnorm(cg_builder *g, cg_param_ref gamma, int in, int out, int dim, float eps, int rows) {
+	out = builder_node_out(g, out, (size_t)rows * dim);
+	return builder_emit(g, OP_DF_RMSNORM, gamma, out, (int[]){in}, 1,
+						(op_params){.df_norm = {dim, rows, eps}});
+}
+
+int cg_rmsnorm_per_head(cg_builder *g, cg_param_ref gamma, int in, int out, int heads, int head_dim,
+						float eps, int rows) {
+	out = builder_node_out(g, out, (size_t)rows * heads * head_dim);
+	return builder_emit(g, OP_DF_RMSNORM_PER_HEAD, gamma, out, (int[]){in}, 1,
+						(op_params){.df_head_norm = {heads, head_dim, rows, eps}});
+}
+
+int cg_layernorm_modulate(cg_builder *g, int in, int scale, int out, int dim, float eps, int rows) {
+	out = builder_node_out(g, out, (size_t)rows * dim);
+	return builder_emit(g, OP_DF_LAYERNORM_MODULATE, (cg_param_ref){0}, out, (int[]){in, scale}, 2,
+						(op_params){.df_norm = {dim, rows, eps}});
+}
+
+int cg_add(cg_builder *g, int x, int y, int dim, int rows) {
+	int out = builder_node_alias(g, x);
+	return builder_emit(g, OP_DF_ADD, (cg_param_ref){0}, out, (int[]){x, y}, 2,
+						(op_params){.df_add = {dim, rows}});
+}
+
+int cg_gated_add(cg_builder *g, int x, int y, int gate, int dim, int rows) {
+	int out = builder_node_alias(g, x);
+	return builder_emit(g, OP_DF_GATED_ADD, (cg_param_ref){0}, out, (int[]){x, y, gate}, 3,
+						(op_params){.df_add = {dim, rows}});
+}
+
+int cg_activate(cg_builder *g, int x, int activation) {
+	int out = builder_node_alias(g, x);
+	return builder_emit(g, OP_DF_ACTIVATE, (cg_param_ref){0}, out, (int[]){x}, 1,
+						(op_params){.df_activate = {(int)g->g->values[x].elems, activation}});
+}
+
+int cg_ffn_activate(cg_builder *g, int gate, int up, int out, int inter, int activation, int rows) {
+	out = builder_node_out(g, out, (size_t)rows * inter);
+	return builder_emit(g, OP_DF_FFN_ACTIVATE, (cg_param_ref){0}, out, (int[]){gate, up}, 2,
+						(op_params){.df_ffn = {inter, activation, rows}});
+}
+
+int cg_rope_table(cg_builder *g, int x, int table, int rows, int heads, int head_dim) {
+	int out = builder_node_alias(g, x);
+	return builder_emit(g, OP_DF_ROPE_TABLE, (cg_param_ref){0}, out, (int[]){x, table}, 2,
+						(op_params){.df_rope = {rows, heads, head_dim}});
+}
+
+int cg_attention(cg_builder *g, int q, int k0, int v0, int k1, int v1, int out,
+				 cg_attention_dims dims) {
+	out = builder_node_out(g, out, (size_t)dims.n_q * dims.n_heads * dims.head_dim);
+	int in[CG_EMIT_MAX_IN] = {q, k0, v0, k1, v1};
+	return builder_emit(g, OP_DF_ATTENTION, (cg_param_ref){0}, out, in, k1 == CG_NONE ? 3 : 5,
+						(op_params){.df_attention = dims});
+}
+
+int cg_upsample_shortcut_add(cg_builder *g, int in, int acc, cg_upsample_dims dims) {
+	int out = builder_node_alias(g, acc);
+	return builder_emit(g, OP_DF_UPSAMPLE_SHORTCUT_ADD, (cg_param_ref){0}, out, (int[]){in, acc}, 2,
+						(op_params){.df_upsample = dims});
+}
+
+int cg_value_root(const cg_graph *c, int value) {
+	for (;;) {
+		const cg_value *v	   = &c->values[value];
+		int				parent = v->alias_of != CG_NONE ? v->alias_of : v->view_of;
+		if (parent == CG_NONE)
+			return value;
+		value = parent;
+	}
+}
+
+static bool builder_is_defined(const cg_graph *c, int value, int node) {
+	const cg_value *v = &c->values[value];
+	if (v->producer != CG_NONE)
+		return v->producer < node;
+	if (v->external != CG_EXT_NONE)
+		return true;
+	int parent = v->alias_of != CG_NONE ? v->alias_of : v->view_of;
+	return parent != CG_NONE && builder_is_defined(c, parent, node);
+}
+
+typedef struct {
+	size_t in[4], out;
+} size_expect;
+
+static size_expect builder_expected_sizes(const cg_node *n) {
+	const op_params *p = &n->params;
+	switch (n->kind) {
+	case OP_DF_MATMUL:
+		return (size_expect){.in  = {(size_t)p->df_matmul.rows * p->df_matmul.k},
+							 .out = (size_t)p->df_matmul.rows * p->df_matmul.n};
+	case OP_DF_RMSNORM: {
+		size_t total = (size_t)p->df_norm.rows * p->df_norm.dim;
+		return (size_expect){.in = {total}, .out = total};
+	}
+	case OP_DF_LAYERNORM_MODULATE: {
+		size_t total = (size_t)p->df_norm.rows * p->df_norm.dim;
+		return (size_expect){.in = {total, (size_t)p->df_norm.dim}, .out = total};
+	}
+	case OP_DF_RMSNORM_PER_HEAD: {
+		size_t total =
+			(size_t)p->df_head_norm.rows * p->df_head_norm.heads * p->df_head_norm.head_dim;
+		return (size_expect){.in = {total}, .out = total};
+	}
+	case OP_DF_ADD: {
+		size_t total = (size_t)p->df_add.rows * p->df_add.dim;
+		return (size_expect){.in = {total, total}};
+	}
+	case OP_DF_GATED_ADD: {
+		size_t total = (size_t)p->df_add.rows * p->df_add.dim;
+		return (size_expect){.in = {total, total, (size_t)p->df_add.dim}};
+	}
+	case OP_DF_FFN_ACTIVATE: {
+		size_t total = (size_t)p->df_ffn.rows * p->df_ffn.inter;
+		return (size_expect){.in = {total, total}, .out = total};
+	}
+	case OP_DF_ROPE_TABLE:
+		return (size_expect){
+			.in = {(size_t)p->df_rope.rows * p->df_rope.heads * p->df_rope.head_dim,
+				   (size_t)p->df_rope.rows * p->df_rope.head_dim}};
+	case OP_DF_ATTENTION: {
+		const df_attention_dims *a	 = &p->df_attention;
+		size_t					 row = (size_t)a->n_heads * a->head_dim;
+		return (size_expect){.in  = {a->n_q * row, a->n0 * row, a->n0 * row, a->n1 * row},
+							 .out = a->n_q * row};
+	}
+	default:
+		return (size_expect){0};
+	}
+}
+
+static int builder_check_size(const cg_graph *c, int node, const char *what, int value,
+							  size_t expect) {
+	if (!expect || c->values[value].elems == expect)
+		return 0;
+	ERROR("graph: n%d %s %s has %zu floats, expected %zu", node,
+		  recipe_op_name(c->nodes[node].kind), what, c->values[value].elems, expect);
+	return 1;
+}
+
+static int builder_validate_node(const cg_graph *c, int index) {
+	const cg_node *n	  = &c->nodes[index];
+	int			   errors = 0;
+	for (int i = 0; i < n->n_in; i++)
+		if (!builder_is_defined(c, n->in[i], index)) {
+			ERROR("graph: n%d %s reads v%d before it is defined", index, recipe_op_name(n->kind),
+				  n->in[i]);
+			errors++;
+		}
+	size_expect e = builder_expected_sizes(n);
+	for (int i = 0; i < n->n_in && i < 4; i++)
+		errors += builder_check_size(c, index, "input", n->in[i], e.in[i]);
+	if (n->n_out > 0)
+		errors += builder_check_size(c, index, "output", n->out[0], e.out);
+	return errors;
+}
+
+int cg_builder_validate(const cg_builder *g) {
+	const cg_graph *c	   = g->g;
+	int				errors = 0;
+	for (int i = 0; i < c->n_nodes; i++)
+		errors += builder_validate_node(c, i);
+	for (int o = 0; o < g->n_outputs; o++)
+		if (g->outputs[o].bind < 0 || g->outputs[o].bind >= CG_MAX_BINDS)
+			errors++;
+	for (int v = 0; v < c->n_values; v++) {
+		const cg_value *val = &c->values[v];
+		if (val->external != CG_EXT_NONE && (val->bind < 0 || val->bind >= CG_MAX_BINDS)) {
+			ERROR("graph: v%d has invalid bind %d", v, val->bind);
+			errors++;
+		}
+	}
+	return errors;
 }

@@ -262,7 +262,7 @@ static void cpu_rope_ext_batch_chunk_avx(int begin, int end, int tid, void *ctx)
 		if (j->freq_factors) {
 			if (half > 256)
 				csp = xmalloc((size_t)half * 2 * sizeof(float));
-			cpu_rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
+			rope_cs_fill(csp, half, pos, theta_scale, j->freq_factors);
 			float *v = j->base + (size_t)r * j->row_stride;
 			for (int h = 0; h < j->n_heads; h++)
 				cpu_rope_cs_one_avx(v + ((size_t)h * j->head_dim), half, csp, j->neox);

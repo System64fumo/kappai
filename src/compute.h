@@ -121,6 +121,10 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out);
 
+status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
+								  const int32_t *tokens, int n_tokens, int flash_attn,
+								  float *hidden_out);
+
 status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,
 										 const int32_t *tokens, const int *positions,
 										 const uint8_t *needs_logits, int n_seqs, int flash_attn,

@@ -64,9 +64,7 @@ static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head
 }
 
 static void free_buf(buffer *b) {
-	if (!b->owner)
-		return;
-	b->owner->buffer_free(b->owner, b);
+	buffer_release(b);
 }
 
 static void scratch_free_device_buffers(compute_scratch *s) {
@@ -138,10 +136,8 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 }
 
 static void expert_dev_entry_release(expert_dev_entry *e) {
-	if (e->x.owner)
-		e->x.owner->buffer_free(e->x.owner, &e->x);
-	if (e->out.owner)
-		e->out.owner->buffer_free(e->out.owner, &e->out);
+	buffer_release(&e->x);
+	buffer_release(&e->out);
 	memset(e, 0, sizeof(*e));
 }
 
@@ -257,6 +253,16 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 		return st;
 	return compute_forward_batch_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn,
 										logits_out);
+}
+
+status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
+								  const int32_t *tokens, int n_tokens, int flash_attn,
+								  float *hidden_out) {
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	compute_scratch_reserve_rows(m, s, n_tokens);
+	return compute_hidden_states_recipe(m, cache, s, tokens, n_tokens, flash_attn, hidden_out);
 }
 
 status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scratch *s,

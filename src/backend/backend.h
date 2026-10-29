@@ -66,6 +66,10 @@ static inline buffer buffer_slice(const buffer *parent, size_t byte_off, size_t 
 	return s;
 }
 
+static inline buffer buffer_rows(const buffer *parent, int first, int count, size_t row_bytes) {
+	return buffer_slice(parent, (size_t)first * row_bytes, (size_t)count * row_bytes);
+}
+
 static inline buffer buffer_host_view(backend *owner, void *ptr, size_t bytes) {
 	buffer b   = {0};
 	b.handle   = ptr;
@@ -197,6 +201,25 @@ typedef struct {
 	buffer		  *out;
 	float		  *ws;
 } mla_absorbed_desc;
+
+typedef struct {
+	const buffer *q, *k0, *v0, *k1, *v1;
+	buffer		 *out;
+	int			  n_q, n_heads, head_dim, n0, n1;
+	int			  causal;
+} dense_attention_desc;
+
+typedef struct {
+	const buffer *in;
+	buffer		 *col;
+	int			  first_pixel, n_pixels, width, in_height, in_width, channels, shift;
+} im2col_desc;
+
+typedef struct {
+	const buffer *in;
+	buffer		 *out;
+	int			  height, width, in_channels, out_channels, repeats, frames_up, factor;
+} upsample_shortcut_desc;
 
 static inline float *buffer_f32(const buffer *b) {
 	return (float *)(b->handle ? (char *)b->handle + b->offset : (char *)b->host_ptr);
@@ -422,6 +445,17 @@ struct backend {
 							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
 							int n_kv_heads_active);
+	status_code (*layernorm_modulate)(backend *self, const buffer *x, const buffer *scale,
+									  buffer *y, int rows, int dim, float eps);
+	status_code (*gated_add)(backend *self, buffer *x, const buffer *y, const buffer *gate,
+							 int rows, int dim);
+	status_code (*add_bias)(backend *self, buffer *x, const buffer *bias, int rows, int dim);
+	status_code (*activate)(backend *self, buffer *x, int n, int activation);
+	status_code (*rope_table)(backend *self, buffer *x, const buffer *table, int rows, int heads,
+							  int head_dim);
+	status_code (*attention_dense)(backend *self, const dense_attention_desc *d);
+	status_code (*im2col3x3)(backend *self, const im2col_desc *d);
+	status_code (*upsample_shortcut_add)(backend *self, const upsample_shortcut_desc *d);
 	const char *desc;
 };
 
@@ -475,6 +509,9 @@ size_t		backend_name_brief_len(const char *name);
 int			backend_parse_device(const char *spec, char *name, size_t name_cap, int *device_index);
 
 status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes);
+status_code buffer_alloc_f32(backend *a, size_t floats, buffer *out);
+status_code buffer_upload_f32(backend *a, const float *host, size_t floats, buffer *out);
+void		buffer_release(buffer *b);
 
 typedef void (*host_matmul_generic_fn)(const void *w, uint32_t w_type, const float *x, float *y,
 									   int n, int k);

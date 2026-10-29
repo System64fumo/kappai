@@ -63,6 +63,18 @@ static int run_saved_config(const saved_config *sc, bool server_mode) {
 		return 1;
 	}
 
+	if (diffusion_probe(sc->model)) {
+		if (server_mode) {
+			fprintf(stderr, "kappai: server mode is not supported for diffusion models\n");
+			return 1;
+		}
+		diffusion_files	 files;
+		diffusion_params params;
+		diffusion_output out;
+		sc_materialize_diffusion(sc, &files, &params, &out);
+		return diffusion_run(&files, &params, &out, sc->debug);
+	}
+
 	config	 cfg;
 	cli_args a;
 	sc_materialize(sc, &cfg, &a);

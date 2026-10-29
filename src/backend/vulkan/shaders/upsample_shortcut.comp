@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer InBuf {
+	float in_[];
+};
+layout(set = 0, binding = 1) buffer OutBuf {
+	float out_[];
+};
+
+layout(push_constant) uniform Params {
+	int height;
+	int width;
+	int in_channels;
+	int out_channels;
+	int repeats;
+	int frames_up;
+	int factor;
+}
+params;
+
+void main() {
+	uint idx	= gl_GlobalInvocationID.x;
+	uint oc		= uint(params.out_channels);
+	uint f		= uint(params.factor);
+	uint out_w	= uint(params.width) * f;
+	uint pixels = uint(params.height) * f * out_w;
+	if (idx >= pixels * oc)
+		return;
+	uint o	   = idx % oc;
+	uint r	   = idx / oc;
+	uint Y	   = r / out_w;
+	uint X	   = r % out_w;
+	uint y	   = Y / f;
+	uint b	   = Y % f;
+	uint x	   = X / f;
+	uint e	   = X % f;
+	uint fu	   = uint(params.frames_up);
+	uint group = ((o * fu + (fu - 1u)) * f + b) * f + e;
+	out_[idx] +=
+		in_[(y * uint(params.width) + x) * uint(params.in_channels) + group / uint(params.repeats)];
+}

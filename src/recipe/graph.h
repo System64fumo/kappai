@@ -1,7 +1,10 @@
 #ifndef RECIPE_GRAPH_H
 #define RECIPE_GRAPH_H
 
+#include "backend/backend.h"
+#include "common.h"
 #include "recipe.h"
+#include "recipe/conv.h"
 
 #include <stdio.h>
 
@@ -45,6 +48,13 @@ typedef enum { CG_ROWS_BATCH = 0, CG_ROWS_OUTPUT } cg_rows;
 typedef enum { CG_DTYPE_F32 = 0, CG_DTYPE_I32 } cg_dtype;
 typedef enum { CG_RES_DEVICE = 0, CG_RES_HOST } cg_residency;
 
+typedef enum { CG_EXT_NONE = 0, CG_EXT_HOST_INPUT, CG_EXT_LAYER } cg_external;
+
+typedef struct {
+	uint8_t scope;
+	int		idx;
+} cg_param_ref;
+
 typedef struct {
 	int		producer;
 	int		alias_of;
@@ -57,6 +67,11 @@ typedef struct {
 	uint8_t rows;
 	uint8_t dtype;
 	uint8_t residency;
+	uint8_t external;
+	int		bind;
+	size_t	elems;
+	size_t	view_offset;
+	size_t	layer_stride;
 } cg_value;
 
 typedef struct {
@@ -77,6 +92,7 @@ typedef struct {
 	int				  state_dep[CG_STATE_SLOTS];
 	op_params		  params;
 	const weight_ref *weight;
+	cg_param_ref	  param;
 } cg_node;
 
 typedef struct {
@@ -181,5 +197,82 @@ int	 graph_fuse_matmul_residual(cg_graph *g, const cg_pass_ctx *ctx);
 void graph_optimize_recipe(model_recipe *r, const struct model *m);
 int	 graph_lower_section(const cg_graph *g, cg_section section, const recipe_op *orig, int n_orig,
 						 recipe_op *out);
+
+#define CG_NEW CG_NONE
+#define CG_EMIT_MAX_IN 5
+#define CG_MAX_BINDS 4
+
+typedef enum {
+	CG_SCOPE_NONE = 0,
+	CG_SCOPE_GLOBAL,
+	CG_SCOPE_LAYER,
+} cg_scope;
+
+typedef struct {
+	const weight	 *mat;
+	const buffer	 *vec;
+	const conv_layer *conv;
+} cg_param;
+
+typedef struct {
+	int value;
+	int bind;
+} cg_output;
+
+typedef struct cg_builder {
+	cg_graph	   *g;
+	int				cap_nodes, cap_values;
+	cg_param	   *globals;
+	int				n_globals, cap_globals;
+	cg_output		outputs[CG_MAX_BINDS];
+	int				n_outputs;
+	cg_section		current;
+	int				n_layers;
+	const cg_param *layer_params;
+	int				layer_stride;
+} cg_builder;
+
+typedef df_attention_dims cg_attention_dims;
+typedef df_upsample_dims  cg_upsample_dims;
+
+cg_builder *cg_builder_new(void);
+void		cg_builder_free(cg_builder *g);
+
+void cg_builder_section(cg_builder *g, cg_section section);
+void cg_builder_layers(cg_builder *g, int n_layers, const cg_param *rows, int stride);
+void cg_builder_finish(cg_builder *g);
+
+cg_param_ref cg_param_mat(cg_builder *g, const weight *w);
+cg_param_ref cg_param_vec(cg_builder *g, const buffer *v);
+cg_param_ref cg_param_conv(cg_builder *g, const conv_layer *c);
+
+static inline cg_param_ref cg_layer_param(int idx) {
+	return (cg_param_ref){CG_SCOPE_LAYER, idx};
+}
+
+const cg_param *cg_builder_param(const cg_builder *g, cg_param_ref ref, int layer);
+
+int	 cg_input(cg_builder *g, size_t elems, int bind);
+int	 cg_layer_external(cg_builder *g, size_t elems, size_t layer_stride, int bind);
+int	 cg_view(cg_builder *g, int parent, size_t offset, size_t elems);
+void cg_output_value(cg_builder *g, int value, int bind);
+
+int cg_matmul(cg_builder *g, cg_param_ref w, int in, int out, int n, int k, int rows);
+int cg_conv(cg_builder *g, cg_param_ref conv, int in, int out, int height, int width, int shift);
+int cg_rmsnorm(cg_builder *g, cg_param_ref gamma, int in, int out, int dim, float eps, int rows);
+int cg_rmsnorm_per_head(cg_builder *g, cg_param_ref gamma, int in, int out, int heads, int head_dim,
+						float eps, int rows);
+int cg_layernorm_modulate(cg_builder *g, int in, int scale, int out, int dim, float eps, int rows);
+int cg_add(cg_builder *g, int x, int y, int dim, int rows);
+int cg_gated_add(cg_builder *g, int x, int y, int gate, int dim, int rows);
+int cg_activate(cg_builder *g, int x, int activation);
+int cg_ffn_activate(cg_builder *g, int gate, int up, int out, int inter, int activation, int rows);
+int cg_rope_table(cg_builder *g, int x, int table, int rows, int heads, int head_dim);
+int cg_attention(cg_builder *g, int q, int k0, int v0, int k1, int v1, int out,
+				 cg_attention_dims dims);
+int cg_upsample_shortcut_add(cg_builder *g, int in, int acc, cg_upsample_dims dims);
+
+int cg_value_root(const cg_graph *c, int value);
+int cg_builder_validate(const cg_builder *g);
 
 #endif

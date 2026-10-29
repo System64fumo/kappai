@@ -3367,9 +3367,7 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk
 }
 
 static void free_weight_buf(buffer *buf) {
-	if (!buf->owner)
-		return;
-	buf->owner->buffer_free(buf->owner, buf);
+	buffer_release(buf);
 }
 
 static bool widx_is_model_global(weight_idx w) {

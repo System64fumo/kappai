@@ -39,6 +39,15 @@
 #define VK_ATTN_DEC_MIN_CHUNK 16
 #define VK_PROF_NAMES 128
 
+typedef enum {
+	VK_NN_LAYERNORM_MODULATE,
+	VK_NN_ROPE_TABLE,
+	VK_NN_ATTENTION_DENSE,
+	VK_NN_IM2COL,
+	VK_NN_UPSAMPLE_SHORTCUT,
+	VK_NN_COUNT,
+} vk_nn_pipe;
+
 enum elem_mode {
 	ELEM_MODE_COPY			   = 0,
 	ELEM_MODE_ADD_INPLACE	   = 1,
@@ -47,6 +56,10 @@ enum elem_mode {
 	ELEM_MODE_SOFTCAP		   = 4,
 	ELEM_MODE_SPLIT_QGATE	   = 5,
 	ELEM_MODE_ATTN_OUTPUT_GATE = 6,
+	ELEM_MODE_ACT_SILU		   = 7,
+	ELEM_MODE_ACT_GELU		   = 8,
+	ELEM_MODE_ADD_BIAS		   = 9,
+	ELEM_MODE_GATED_ADD		   = 10,
 };
 
 typedef struct {
@@ -324,6 +337,7 @@ typedef struct {
 	vk_pipeline_set p_ffn_activate_batch;
 	vk_pipeline_set p_ffn_activate_fused_batch;
 	vk_pipeline_set p_elementwise_batch;
+	vk_pipeline_set p_nn[VK_NN_COUNT];
 
 	buffer rope_cos_buf;
 	buffer rope_sin_buf;
@@ -1026,6 +1040,8 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_elementwise_batch,
 			&p->p_dequant,
 		};
+		for (int i = 0; i < VK_NN_COUNT; i++)
+			vk_desc_cache_drop_buf(p, &p->p_nn[i], freed);
 		const int n_pipelines = (int)(sizeof(pipelines) / sizeof(pipelines[0]));
 		for (int i = 0; i < n_pipelines; i++)
 			vk_desc_cache_drop_buf(p, pipelines[i], freed);
@@ -1700,6 +1716,11 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 		groups_x = 1;
 	if (groups_y == 0)
 		groups_y = 1;
+	if (groups_x > p->caps.max_workgroup_count[0] || groups_y > p->caps.max_workgroup_count[1]) {
+		ERROR("vk: dispatch %s (%u, %u) exceeds device limit (%u, %u)", ps->name, groups_x,
+			  groups_y, p->caps.max_workgroup_count[0], p->caps.max_workgroup_count[1]);
+		return ERR_INVALID_ARG;
+	}
 
 	p->stream_seq++;
 	if (!p->ring[p->ring_cur].recording) {
@@ -2809,6 +2830,33 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s == OK)
 		p->p_elementwise_batch.name = "elementwise_batch";
 
+	static const struct {
+		const uint32_t *spv;
+		size_t			len;
+		int				n_bufs;
+		uint32_t		push_size;
+		const char	   *name;
+	} nn_pipes[VK_NN_COUNT] = {
+		[VK_NN_LAYERNORM_MODULATE] = {shader_layernorm_modulate_spv,
+									  shader_layernorm_modulate_spv_len, 3, 12,
+									  "layernorm_modulate"},
+		[VK_NN_ROPE_TABLE]		   = {shader_rope_table_spv, shader_rope_table_spv_len, 2, 12,
+									  "rope_table"},
+		[VK_NN_ATTENTION_DENSE]	   = {shader_attention_dense_spv, shader_attention_dense_spv_len, 6,
+									  20, "attention_dense"},
+		[VK_NN_IM2COL]			   = {shader_im2col_spv, shader_im2col_spv_len, 2, 28, "im2col"},
+		[VK_NN_UPSAMPLE_SHORTCUT] = {shader_upsample_shortcut_spv, shader_upsample_shortcut_spv_len,
+									 2, 28, "upsample_shortcut"},
+	};
+	for (int i = 0; i < VK_NN_COUNT; i++) {
+		s = vk_create_pipeline(p, nn_pipes[i].spv, nn_pipes[i].len, nn_pipes[i].n_bufs,
+							   nn_pipes[i].push_size, &p->p_nn[i]);
+		if (s == OK)
+			p->p_nn[i].name = nn_pipes[i].name;
+		else
+			WARN("vulkan: failed to create %s pipeline", nn_pipes[i].name);
+	}
+
 	return OK;
 }
 
@@ -2899,6 +2947,8 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_ffn_activate_batch);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_fused_batch);
 		vk_destroy_pipeline(p, &p->p_elementwise_batch);
+		for (int i = 0; i < VK_NN_COUNT; i++)
+			vk_destroy_pipeline(p, &p->p_nn[i]);
 		for (int i = 0; i < VK_QCORE_PIPES; i++)
 			vk_destroy_pipeline(p, vk_qcore_pipe(p, i));
 		for (int i = 0; i < 2; i++) {
@@ -5378,6 +5428,142 @@ static status_code vk_copy_buffer(backend *self, const buffer *src, buffer *dst,
 							 groups, 1, 0x1);
 }
 
+static status_code vk_elementwise(backend *self, buffer *dst, const buffer *src1,
+								  const buffer *src2, int n, int mode, int m) {
+	vk_priv *p = self->priv;
+	if (!p->p_elementwise_batch.pipeline)
+		return ERR_UNSUPPORTED;
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		size_t		row_bytes = (size_t)n * sizeof(float);
+		status_code st		  = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int			  rows = MIN(max_rows, m - r);
+			buffer		  d	   = buffer_rows(dst, r, rows, row_bytes);
+			buffer		  s1;
+			const buffer *s1p = src1;
+			if (src1 && mode != ELEM_MODE_ADD_BIAS) {
+				s1	= buffer_rows(src1, r, rows, row_bytes);
+				s1p = &s1;
+			}
+			st = vk_elementwise(self, &d, s1p, src2, n, mode, rows);
+		}
+		return st;
+	}
+	struct {
+		int32_t n, mode;
+		float	scale;
+		int32_t _pad;
+		int32_t m;
+	} push			= {n, mode, 0.0f, 0, m};
+	vk_buf *dummy	= vk_dummy_buf(p);
+	vk_buf *bufs[3] = {as_vkbuf(dst), src1 ? as_vkbuf(src1) : dummy, src2 ? as_vkbuf(src2) : dummy};
+	VkDeviceSize offs[3] = {dst->offset, src1 ? src1->offset : 0, src2 ? src2->offset : 0};
+	uint32_t	 groups	 = (uint32_t)((n + 127) / 128);
+	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
+							 groups, (uint32_t)m, 0x1);
+}
+
+static status_code vk_activate(backend *self, buffer *x, int n, int activation) {
+	return vk_elementwise(self, x, NULL, NULL, n,
+						  activation ? ELEM_MODE_ACT_GELU : ELEM_MODE_ACT_SILU, 1);
+}
+
+static status_code vk_add_bias(backend *self, buffer *x, const buffer *bias, int rows, int dim) {
+	return vk_elementwise(self, x, bias, NULL, dim, ELEM_MODE_ADD_BIAS, rows);
+}
+
+static status_code vk_gated_add(backend *self, buffer *x, const buffer *y, const buffer *gate,
+								int rows, int dim) {
+	return vk_elementwise(self, x, y, gate, dim, ELEM_MODE_GATED_ADD, rows);
+}
+
+static status_code vk_nn_dispatch(backend *self, vk_nn_pipe pipe, vk_buf **bufs,
+								  const VkDeviceSize *offs, int n_bufs, const void *push,
+								  uint32_t push_size, uint32_t groups, uint32_t write_mask) {
+	vk_priv			*p	= self->priv;
+	vk_pipeline_set *ps = &p->p_nn[pipe];
+	if (!ps->pipeline)
+		return ERR_UNSUPPORTED;
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, push, push_size, groups, 1,
+							 write_mask);
+}
+
+static status_code vk_layernorm_modulate(backend *self, const buffer *x, const buffer *scale,
+										 buffer *y, int rows, int dim, float eps) {
+	struct {
+		int32_t dim, rows;
+		float	eps;
+	} push				 = {dim, rows, eps};
+	vk_buf		*bufs[3] = {as_vkbuf(x), as_vkbuf(scale), as_vkbuf(y)};
+	VkDeviceSize offs[3] = {x->offset, scale->offset, y->offset};
+	return vk_nn_dispatch(self, VK_NN_LAYERNORM_MODULATE, bufs, offs, 3, &push, sizeof(push),
+						  (uint32_t)rows, 1u << 2);
+}
+
+static status_code vk_rope_table(backend *self, buffer *x, const buffer *table, int rows, int heads,
+								 int head_dim) {
+	struct {
+		int32_t rows, heads, head_dim;
+	} push				 = {rows, heads, head_dim};
+	vk_buf		*bufs[2] = {as_vkbuf(x), as_vkbuf(table)};
+	VkDeviceSize offs[2] = {x->offset, table->offset};
+	uint32_t	 total	 = (uint32_t)rows * heads * (head_dim / 2);
+	return vk_nn_dispatch(self, VK_NN_ROPE_TABLE, bufs, offs, 2, &push, sizeof(push),
+						  (total + 127) / 128, 1u << 0);
+}
+
+#define VK_DENSE_ATTN_MAX_HEAD_DIM 2048
+
+static status_code vk_attention_dense(backend *self, const dense_attention_desc *d) {
+	if (d->head_dim > VK_DENSE_ATTN_MAX_HEAD_DIM)
+		return ERR_UNSUPPORTED;
+	vk_priv *p = self->priv;
+	struct {
+		int32_t n_heads, head_dim, n0, n1, causal;
+	} push				 = {d->n_heads, d->head_dim, d->n0, d->n1, d->causal};
+	vk_buf		*dummy	 = vk_dummy_buf(p);
+	vk_buf		*bufs[6] = {as_vkbuf(d->q),
+							as_vkbuf(d->k0),
+							as_vkbuf(d->v0),
+							d->n1 ? as_vkbuf(d->k1) : dummy,
+							d->n1 ? as_vkbuf(d->v1) : dummy,
+							as_vkbuf(d->out)};
+	VkDeviceSize offs[6] = {d->q->offset,
+							d->k0->offset,
+							d->v0->offset,
+							d->n1 ? d->k1->offset : 0,
+							d->n1 ? d->v1->offset : 0,
+							d->out->offset};
+	return vk_nn_dispatch(self, VK_NN_ATTENTION_DENSE, bufs, offs, 6, &push, sizeof(push),
+						  (uint32_t)d->n_q * d->n_heads, 1u << 5);
+}
+
+static status_code vk_im2col3x3(backend *self, const im2col_desc *d) {
+	struct {
+		int32_t first_pixel, n_pixels, width, in_height, in_width, channels, shift;
+	} push				 = {d->first_pixel, d->n_pixels, d->width, d->in_height,
+							d->in_width,	d->channels, d->shift};
+	vk_buf		*bufs[2] = {as_vkbuf(d->in), as_vkbuf(d->col)};
+	VkDeviceSize offs[2] = {d->in->offset, d->col->offset};
+	uint32_t	 total	 = (uint32_t)d->n_pixels * 9u * (uint32_t)d->channels;
+	return vk_nn_dispatch(self, VK_NN_IM2COL, bufs, offs, 2, &push, sizeof(push),
+						  (total + 127) / 128, 1u << 1);
+}
+
+static status_code vk_upsample_shortcut_add(backend *self, const upsample_shortcut_desc *d) {
+	struct {
+		int32_t height, width, in_channels, out_channels, repeats, frames_up, factor;
+	} push				 = {d->height,	d->width,	  d->in_channels, d->out_channels,
+							d->repeats, d->frames_up, d->factor};
+	vk_buf		*bufs[2] = {as_vkbuf(d->in), as_vkbuf(d->out)};
+	VkDeviceSize offs[2] = {d->in->offset, d->out->offset};
+	uint32_t	 total =
+		(uint32_t)d->height * d->factor * d->width * d->factor * (uint32_t)d->out_channels;
+	return vk_nn_dispatch(self, VK_NN_UPSAMPLE_SHORTCUT, bufs, offs, 2, &push, sizeof(push),
+						  (total + 127) / 128, 1u << 1);
+}
+
 static status_code vk_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
 								  float combine_scale) {
 	vk_priv *p = self->priv;
@@ -5756,6 +5942,18 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 	if (n <= 0 || k <= 0)
 		return OK;
 
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		status_code st = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int	   rows = MIN(max_rows, m - r);
+			buffer xs	= buffer_rows(x, r, rows, (size_t)k * sizeof(float));
+			buffer ys	= buffer_rows(y, r, rows, (size_t)n * sizeof(float));
+			st			= vk_matmul_batch(self, w, w_type, &xs, &ys, n, k, rows);
+		}
+		return st;
+	}
+
 	if (!w->handle && w->host_ptr) {
 		status_code st = OK;
 		for (int row = 0; row < m && st == OK; row++) {
@@ -6028,6 +6226,18 @@ static status_code vk_rmsnorm_batch(backend *self, const buffer *x, const buffer
 									int n, float eps, int m) {
 	vk_priv *p = self->priv;
 
+	int max_rows = (int)p->caps.max_workgroup_count[1];
+	if (m > max_rows) {
+		status_code st = OK;
+		for (int r = 0; r < m && st == OK; r += max_rows) {
+			int	   rows = MIN(max_rows, m - r);
+			buffer xs	= buffer_rows(x, r, rows, (size_t)n * sizeof(float));
+			buffer ys	= buffer_rows(y, r, rows, (size_t)n * sizeof(float));
+			st			= vk_rmsnorm_batch(self, &xs, w, &ys, n, eps, rows);
+		}
+		return st;
+	}
+
 	if (!w->handle && w->host_ptr) {
 		backend_report_host_fallback(
 			self, "rmsnorm_batch", HFB_BUF_HOST_RESIDENT,
@@ -6181,21 +6391,7 @@ static status_code vk_rmsnorm_noweight_per_head_batch(backend *self, const buffe
 }
 
 static status_code vk_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
-	vk_priv *p = self->priv;
-	if (!p->p_elementwise_batch.pipeline)
-		return ERR_UNSUPPORTED;
-	struct {
-		int32_t n, mode;
-		float	scale;
-		int32_t _pad;
-		int32_t m;
-	} push				  = {n, ELEM_MODE_ADD_INPLACE, 0.0f, 0, m};
-	vk_buf		*dummy	  = vk_dummy_buf(p);
-	vk_buf		*bufs[3]  = {as_vkbuf(x), as_vkbuf(y), dummy};
-	VkDeviceSize offs[3]  = {x->offset, y->offset, 0};
-	uint32_t	 groups_x = (uint32_t)((n + 127) / 128);
-	return vk_dispatch_2d_ex(p, &p->p_elementwise_batch, bufs, offs, NULL, 3, &push, sizeof(push),
-							 groups_x, (uint32_t)m, 0x1);
+	return vk_elementwise(self, x, y, NULL, n, ELEM_MODE_ADD_INPLACE, m);
 }
 
 static int vk_dequant_block_elems(uint32_t type, int *out_elems, int *out_block_bytes) {
@@ -6756,6 +6952,14 @@ static status_code vk_ctor(backend *out) {
 	out->rmsnorm_per_head_batch			 = vk_rmsnorm_per_head_batch;
 	out->rmsnorm_noweight_per_head_batch = vk_rmsnorm_noweight_per_head_batch;
 	out->add_batch						 = vk_add_batch;
+	out->layernorm_modulate				 = vk_layernorm_modulate;
+	out->gated_add						 = vk_gated_add;
+	out->add_bias						 = vk_add_bias;
+	out->activate						 = vk_activate;
+	out->rope_table						 = vk_rope_table;
+	out->attention_dense				 = vk_attention_dense;
+	out->im2col3x3						 = vk_im2col3x3;
+	out->upsample_shortcut_add			 = vk_upsample_shortcut_add;
 	out->ffn_activate_batch				 = vk_ffn_activate_batch;
 	out->ffn_activate_fused_batch		 = vk_ffn_activate_fused_batch;
 	out->rope_batch						 = vk_rope_batch;

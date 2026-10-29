@@ -721,10 +721,28 @@ status_code buffer_ensure_scratch(backend *a, buffer *b, size_t bytes) {
 	size_t need = bytes > 0 ? ((bytes + (size_t)65535) & ~((size_t)65535)) : 0;
 	if (b->owner == a && b->size >= need)
 		return OK;
+	buffer_release(b);
+	return a->buffer_alloc_scratch(a, need, b);
+}
+
+status_code buffer_alloc_f32(backend *a, size_t floats, buffer *out) {
+	memset(out, 0, sizeof(*out));
+	return a->buffer_alloc_scratch(a, floats * sizeof(float), out);
+}
+
+status_code buffer_upload_f32(backend *a, const float *host, size_t floats, buffer *out) {
+	status_code s = buffer_alloc_f32(a, floats, out);
+	if (s == OK)
+		s = a->buffer_write_f32(a, out, host, (int)floats);
+	if (s != OK)
+		buffer_release(out);
+	return s;
+}
+
+void buffer_release(buffer *b) {
 	if (b->owner)
 		b->owner->buffer_free(b->owner, b);
 	memset(b, 0, sizeof(*b));
-	return a->buffer_alloc_scratch(a, need, b);
 }
 
 size_t backend_mem_available(const backend *b) {

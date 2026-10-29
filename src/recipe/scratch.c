@@ -20,14 +20,14 @@ static int bs_ensure_detached(batch_scratch *bs, backend *owner, uint8_t slot, s
 		if (p->b.owner == owner && p->b.handle && p->b.size >= bytes)
 			return 0;
 		if (p->b.handle && p->b.owner && !backend_has_cap(p->b.owner, BCAP_IS_HOST))
-			p->b.owner->buffer_free(p->b.owner, &p->b);
+			buffer_release(&p->b);
 		memset(&p->b, 0, sizeof(p->b));
 		owner->buffer_alloc_scratch(owner, bytes, &p->b);
 		return 1;
 	}
 	if (p->b.handle && p->b.owner && p->b.owner != owner &&
 		!backend_has_cap(p->b.owner, BCAP_IS_HOST)) {
-		p->b.owner->buffer_free(p->b.owner, &p->b);
+		buffer_release(&p->b);
 		memset(&p->b, 0, sizeof(p->b));
 	}
 	int	   existed = p->b.handle != NULL;
@@ -60,7 +60,7 @@ int bs_ensure_slot(batch_scratch *bs, backend *owner, uint8_t slot, size_t n_ele
 static void bs_release_slot(batch_scratch *bs, uint8_t slot) {
 	bs_pair *p = &bs->pair[slot];
 	if (bs->own[slot] && p->b.owner && !backend_has_cap(p->b.owner, BCAP_IS_HOST))
-		p->b.owner->buffer_free(p->b.owner, &p->b);
+		buffer_release(&p->b);
 	free(p->fb.p);
 	memset(p, 0, sizeof(*p));
 	bs->own[slot] = 0;
@@ -73,7 +73,7 @@ static void bs_arena_ensure(batch_scratch *bs, backend *owner, size_t bytes) {
 		float_buf_ensure_nocopy(&bs->arena_host, bytes / sizeof(float), 64);
 	} else {
 		if (bs->arena.owner)
-			bs->arena.owner->buffer_free(bs->arena.owner, &bs->arena);
+			buffer_release(&bs->arena);
 		memset(&bs->arena, 0, sizeof(bs->arena));
 		if (owner->buffer_alloc_scratch(owner, bytes, &bs->arena) != OK) {
 			ERROR("batch scratch: arena allocation of %zu B failed", bytes);
@@ -109,7 +109,7 @@ void batch_scratch_free(batch_scratch *bs) {
 	for (int slot = 0; slot < RECIPE_SLOT_MAX; slot++)
 		bs_release_slot(bs, (uint8_t)slot);
 	if (bs->arena.owner)
-		bs->arena.owner->buffer_free(bs->arena.owner, &bs->arena);
+		buffer_release(&bs->arena);
 	free(bs->arena_host.p);
 	free(bs->moe_pack);
 	free(bs->copy_tmp.p);
@@ -130,12 +130,8 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_out.p);
 	free(bs->moe_router_logits.p);
 	free(bs->moe_router_inp.p);
-	if (bs->moe_router_logits_dev.owner)
-		bs->moe_router_logits_dev.owner->buffer_free(bs->moe_router_logits_dev.owner,
-													 &bs->moe_router_logits_dev);
-	if (bs->moe_router_inp_dev.owner)
-		bs->moe_router_inp_dev.owner->buffer_free(bs->moe_router_inp_dev.owner,
-												  &bs->moe_router_inp_dev);
+	buffer_release(&bs->moe_router_logits_dev);
+	buffer_release(&bs->moe_router_inp_dev);
 	free(bs->moe_xb_f.p);
 	free(bs->moe_gather_x.p);
 	free(bs->moe_exp_gu.p);
@@ -148,17 +144,13 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_per_token_slots);
 	free(bs->moe_union_slots);
 	free(bs->ple_buf.p);
-	if (bs->ple_all.owner)
-		bs->ple_all.owner->buffer_free(bs->ple_all.owner, &bs->ple_all);
+	buffer_release(&bs->ple_all);
 	free(bs->ple_inp.p);
 	free(bs->ple_proj.p);
 	free(bs->ple_slice.p);
-	if (bs->ple_inp_dev.owner)
-		bs->ple_inp_dev.owner->buffer_free(bs->ple_inp_dev.owner, &bs->ple_inp_dev);
-	if (bs->ple_slice_dev.owner)
-		bs->ple_slice_dev.owner->buffer_free(bs->ple_slice_dev.owner, &bs->ple_slice_dev);
-	if (bs->ple_proj_dev.owner)
-		bs->ple_proj_dev.owner->buffer_free(bs->ple_proj_dev.owner, &bs->ple_proj_dev);
+	buffer_release(&bs->ple_inp_dev);
+	buffer_release(&bs->ple_slice_dev);
+	buffer_release(&bs->ple_proj_dev);
 	memset(bs, 0, sizeof(*bs));
 }
 

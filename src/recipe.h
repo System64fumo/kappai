@@ -113,6 +113,18 @@ typedef enum {
 	OP_KDA,
 	OP_MLA_ABSORBED,
 
+	OP_DF_MATMUL,
+	OP_DF_CONV,
+	OP_DF_RMSNORM,
+	OP_DF_RMSNORM_PER_HEAD,
+	OP_DF_LAYERNORM_MODULATE,
+	OP_DF_ADD,
+	OP_DF_GATED_ADD,
+	OP_DF_ACTIVATE,
+	OP_DF_FFN_ACTIVATE,
+	OP_DF_ROPE_TABLE,
+	OP_DF_ATTENTION,
+	OP_DF_UPSAMPLE_SHORTCUT_ADD,
 	OP_LAYERNORM,
 	OP_ADD_BIAS,
 	OP_ADD_TYPE_EMBD,
@@ -122,6 +134,9 @@ typedef enum {
 
 	OP_KIND_COUNT
 } op_kind;
+
+#define OP_DF_FIRST OP_DF_MATMUL
+#define OP_DF_LAST OP_DF_UPSAMPLE_SHORTCUT_ADD
 
 enum {
 	ACTIVATION_SILU = 0,
@@ -204,7 +219,43 @@ typedef enum {
 	WIDX_COUNT
 } weight_idx;
 
+typedef struct {
+	int n_q, n_heads, head_dim, n0, n1, causal;
+} df_attention_dims;
+
+typedef struct {
+	int height, width, in_channels, out_channels, repeats, frames_up, factor;
+} df_upsample_dims;
+
 typedef union {
+	struct {
+		int n, k, rows;
+	} df_matmul;
+	struct {
+		int height, width, shift;
+	} df_conv;
+	struct {
+		int	  dim, rows;
+		float eps;
+	} df_norm;
+	struct {
+		int	  heads, head_dim, rows;
+		float eps;
+	} df_head_norm;
+	struct {
+		int dim, rows;
+	} df_add;
+	struct {
+		int n, activation;
+	} df_activate;
+	struct {
+		int inter, activation, rows;
+	} df_ffn;
+	struct {
+		int rows, heads, head_dim;
+	} df_rope;
+	df_attention_dims df_attention;
+	df_upsample_dims  df_upsample;
 	struct {
 		int		n;
 		uint8_t bias_idx;
@@ -382,6 +433,10 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 int n_tokens, int pos_start, int flash_attn,
 										 float *logits_out);
 
+status_code compute_hidden_states_recipe(struct model *m, struct kvcache *cache,
+										 struct compute_scratch *s, const int32_t *tokens,
+										 int n_tokens, int flash_attn, float *hidden_out);
+
 int recipe_is_decode_batchable(const struct model *m);
 
 status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
@@ -453,6 +508,7 @@ recipe_op mk_partial_rope_qk(uint8_t q, uint8_t k);
 void	  recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_fused,
 									 int has_matmul_multi, int activation);
 void	  recipe_emit_dense_ffn(op_emitter *e, const struct model *m, int li, uint8_t norm_widx);
+void	  recipe_emit_qk_norm_attention(op_emitter *e, const struct model *m, int li);
 void	  recipe_emit_moe_ffn(op_emitter *e, const struct model *m, uint8_t router_in_slot,
 							  uint8_t experts_in_slot, uint8_t out_slot);
 

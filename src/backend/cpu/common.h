@@ -685,6 +685,17 @@ size_t		cpu_mem_total(backend *self);
 status_code cpu_rmsnorm_batch(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
 							  float eps, int m);
 status_code cpu_add_batch(backend *self, buffer *x, const buffer *y, int n, int m);
+status_code cpu_layernorm_modulate(backend *self, const buffer *x, const buffer *scale, buffer *y,
+								   int rows, int dim, float eps);
+status_code cpu_gated_add(backend *self, buffer *x, const buffer *y, const buffer *gate, int rows,
+						  int dim);
+status_code cpu_add_bias(backend *self, buffer *x, const buffer *bias, int rows, int dim);
+status_code cpu_activate(backend *self, buffer *x, int n, int activation);
+status_code cpu_rope_table(backend *self, buffer *x, const buffer *table, int rows, int heads,
+						   int head_dim);
+status_code cpu_attention_dense(backend *self, const dense_attention_desc *d);
+status_code cpu_im2col3x3(backend *self, const im2col_desc *d);
+status_code cpu_upsample_shortcut_add(backend *self, const upsample_shortcut_desc *d);
 status_code cpu_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								   int n, int activation, int m);
 status_code cpu_rope_batch(backend *self, buffer *vec, int n_heads, int head_dim, int pos_start,
@@ -724,11 +735,10 @@ status_code cpu_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w
 void		cpu_kv_free(backend *self, buffer *k, buffer *v);
 void		cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx);
 
-void cpu_softcap_chunk(int begin, int end, int tid, void *ctx);
-void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx);
-void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx);
-void cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
-void cpu_rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+void		cpu_softcap_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx);
+void		cpu_partial_rope_qk_chunk(int begin, int end, int tid, void *ctx);
 status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 							   const float *freq_factors, float **cs_out);
 

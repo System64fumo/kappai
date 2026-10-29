@@ -97,6 +97,12 @@ void context_set_debug_prompt(context *c, bool enabled) {
 	c->debug_prompt = enabled;
 }
 
+static void context_release_backend(context *c) {
+	if (!c->borrows_backend)
+		backend_destroy(c->backend);
+	c->backend = NULL;
+}
+
 static void context_destroy_extra_backends(context *c) {
 	for (int i = 0; i < c->n_extra_backends; i++)
 		backend_destroy(c->extra_backends[i]);
@@ -284,7 +290,11 @@ status_code context_init(context *c, const config *cfg) {
 		monitor_reset(&c->monitor);
 
 	status_code s = ERR_INVALID_ARG;
-	if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
+	if (cfg->shared_backend) {
+		c->backend		   = cfg->shared_backend;
+		c->borrows_backend = true;
+		s				   = OK;
+	} else if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
 		s = backend_create_best(&c->backend);
 	} else {
 		char name[32];
@@ -484,8 +494,7 @@ fail_backend:
 	context_destroy_extra_backends(c);
 	monitor_free(&c->monitor);
 	g_monitor = NULL;
-	backend_destroy(c->backend);
-	c->backend = NULL;
+	context_release_backend(c);
 	return s;
 }
 
@@ -502,8 +511,7 @@ void context_free(context *c) {
 	tokenizer_free(&c->tok);
 	model_free(&c->m);
 	context_destroy_extra_backends(c);
-	backend_destroy(c->backend);
-	c->backend = NULL;
+	context_release_backend(c);
 	free(c->ids_buf.p);
 	free(c->idle_ids_buf.p);
 	free(c->fed_ids.p);

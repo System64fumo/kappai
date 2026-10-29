@@ -878,8 +878,17 @@ static const char *kv_key_at(const void *ctx, size_t i) {
 	return ((const char *const *)ctx)[i];
 }
 
+void gguf_ctx_build_index(gguf_ctx *ctx) {
+	strtab_build(&ctx->tensor_hash, &ctx->tensor_hash_cap, ctx->n_tensors, ctx->n_tensors * 2,
+				 tensor_name_at, ctx->tensors, "tensor name");
+	strtab_build(&ctx->kv_hash, &ctx->kv_hash_cap, ctx->n_kv, ctx->n_kv * 2 + 1, kv_key_at,
+				 ctx->kv_keys, "metadata key");
+}
+
 static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, int fd, void *map_ptr,
 									 int header_only) {
+	if (safetensors_detect(data, fsize))
+		return safetensors_parse(ctx, data, fsize, fd, map_ptr, header_only);
 	gguf_reader r = {(const uint8_t *)data, (const uint8_t *)data + fsize};
 	str_arena_init(&ctx->strs);
 
@@ -996,9 +1005,6 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 		ts[i].data = (const uint8_t *)ctx->data_start + ts[i].offset;
 	}
 
-	strtab_build(&ctx->tensor_hash, &ctx->tensor_hash_cap, ctx->n_tensors, ctx->n_tensors * 2,
-				 tensor_name_at, ts, "tensor name");
-
 	ctx->kv_keys	 = (char **)xcalloc(ctx->n_kv, sizeof(char *));
 	ctx->kv_types	 = xcalloc(ctx->n_kv, sizeof(uint32_t));
 	ctx->kv_vals	 = xcalloc(ctx->n_kv, sizeof(uint64_t));
@@ -1017,14 +1023,12 @@ static status_code gguf_parse_common(gguf_ctx *ctx, void *data, size_t fsize, in
 	}
 	free(kv);
 
-	strtab_build(&ctx->kv_hash, &ctx->kv_hash_cap, ctx->n_kv, ctx->n_kv * 2 + 1, kv_key_at,
-				 ctx->kv_keys, "metadata key");
-
 	ctx->tensors  = ts;
 	ctx->fd		  = fd;
 	ctx->map	  = map_ptr;
 	ctx->map_size = fsize;
 	ctx->valid	  = 1;
+	gguf_ctx_build_index(ctx);
 	return OK;
 
 bad_kv_ts:
@@ -1622,6 +1626,13 @@ const gguf_tensor *gguf_find_tensor(const gguf_ctx *c, const char *name) {
 	if (i < 0 || c->tensors[i].byte_size == 0)
 		return NULL;
 	return &c->tensors[i];
+}
+
+const gguf_tensor *gguf_require_tensor(const gguf_ctx *c, const char *name) {
+	const gguf_tensor *t = gguf_find_tensor(c, name);
+	if (!t)
+		ERROR("tensor '%s' not found", name);
+	return t;
 }
 
 static const char *type_name(uint32_t t) {

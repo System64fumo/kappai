@@ -2,6 +2,7 @@
 #define TUI_SCHEMA_H
 
 #include "config.h"
+#include "diffusion/runner.h"
 #include "hcs.h"
 
 #include <limits.h>
@@ -23,6 +24,11 @@
 typedef struct {
 	char name[SC_NAME_MAX];
 	char model[SC_PATH_MAX];
+	char vae[SC_PATH_MAX];
+	char llm[SC_PATH_MAX];
+	char negative_prompt[SC_SYSTEM_MAX];
+	char output_dir[SC_PATH_MAX];
+	char preview_path[SC_PATH_MAX];
 	char repack[SC_TEXT_MAX];
 	char fuse[SC_TEXT_MAX];
 	char moe_pin_list[SC_PINLIST_MAX];
@@ -44,11 +50,16 @@ typedef struct {
 	int repeat_last_n;
 	int server_port;
 	int server_slots;
+	int width;
+	int height;
+	int steps;
 
 	float temperature;
 	float top_p;
 	float min_p;
 	float repeat_penalty;
+	float cfg_scale;
+	float preview_interval;
 
 	bool flash_attn;
 	bool use_mmap;
@@ -91,6 +102,7 @@ typedef struct {
 	const char *const *choices;
 	fld_uikind		   uik;
 	bool			   empty_all;
+	int				   multiple_of;
 } field_desc;
 
 typedef struct {
@@ -122,6 +134,8 @@ int			sc_save(const saved_config *sc, const char *orig_name, char *err, size_t e
 int			sc_delete(const sc_entry *entry, char *err, size_t errlen);
 
 void sc_materialize(const saved_config *sc, config *cfg, cli_args *a);
+void sc_materialize_diffusion(const saved_config *sc, diffusion_files *files, diffusion_params *p,
+							  diffusion_output *out);
 
 void sc_multi_parse(const char *val, const char *const choices[], int n, bool empty_all, bool *sel);
 void sc_multi_format(char *out, size_t cap, const char *const choices[], int n, bool empty_all,

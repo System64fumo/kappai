@@ -1,0 +1,36 @@
+#version 310 es
+precision highp float;
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly buffer InBuf {
+	float in_[];
+};
+layout(std430, binding = 1) buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_height;
+layout(location = 1) uniform int u_width;
+layout(location = 2) uniform int u_in_channels;
+layout(location = 3) uniform int u_out_channels;
+layout(location = 4) uniform int u_repeats;
+layout(location = 5) uniform int u_frames_up;
+layout(location = 6) uniform int u_factor;
+void main(void) {
+	uint idx	= (gl_WorkGroupID.x + gl_WorkGroupID.y * 65535u) * 128u + gl_LocalInvocationID.x;
+	uint oc		= uint(u_out_channels);
+	uint f		= uint(u_factor);
+	uint out_w	= uint(u_width) * f;
+	uint pixels = uint(u_height) * f * out_w;
+	if (idx >= pixels * oc)
+		return;
+	uint o	   = idx % oc;
+	uint r	   = idx / oc;
+	uint Y	   = r / out_w;
+	uint X	   = r % out_w;
+	uint y	   = Y / f;
+	uint b	   = Y % f;
+	uint x	   = X / f;
+	uint e	   = X % f;
+	uint fu	   = uint(u_frames_up);
+	uint group = ((o * fu + (fu - 1u)) * f + b) * f + e;
+	out_[idx] += in_[(y * uint(u_width) + x) * uint(u_in_channels) + group / uint(u_repeats)];
+}

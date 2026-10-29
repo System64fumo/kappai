@@ -1,0 +1,253 @@
+#include "diffusion/diffusion.h"
+#include "diffusion/image.h"
+#include "log.h"
+#include "profile.h"
+
+#include <limits.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#define DIFFUSION_MAX_MODELS 8
+
+static const diffusion_ops *g_registry[DIFFUSION_MAX_MODELS];
+static int					g_registry_count;
+
+void diffusion_register(const diffusion_ops *ops) {
+	if (g_registry_count < DIFFUSION_MAX_MODELS)
+		g_registry[g_registry_count++] = ops;
+}
+
+static const diffusion_ops *diffusion_find_ops(const gguf_ctx *dit) {
+	for (int i = 0; i < g_registry_count; i++)
+		if (g_registry[i]->detect(dit))
+			return g_registry[i];
+	return NULL;
+}
+
+static bool diffusion_probe_file(const char *path) {
+	gguf_ctx  dit;
+	log_level saved = log_get_level();
+	log_set_level((log_level)(LOG_ERROR + 1));
+	status_code s = gguf_load_metadata(&dit, path);
+	log_set_level(saved);
+	if (s != OK)
+		return false;
+	bool found = diffusion_find_ops(&dit) != NULL;
+	gguf_free(&dit);
+	return found;
+}
+
+static pthread_mutex_t g_probe_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	bool   valid, found;
+	char   path[PATH_MAX];
+	time_t mtime;
+	off_t  size;
+} g_probe;
+
+bool diffusion_probe(const char *path) {
+	struct stat st;
+	if (!path || !*path || stat(path, &st) != 0 || !S_ISREG(st.st_mode))
+		return false;
+	pthread_mutex_lock(&g_probe_mutex);
+	bool hit = g_probe.valid && !strcmp(g_probe.path, path) && g_probe.mtime == st.st_mtime &&
+			   g_probe.size == st.st_size;
+	if (!hit) {
+		snprintf(g_probe.path, sizeof(g_probe.path), "%s", path);
+		g_probe.mtime = st.st_mtime;
+		g_probe.size  = st.st_size;
+		g_probe.found = diffusion_probe_file(path);
+		g_probe.valid = true;
+	}
+	bool found = g_probe.found;
+	pthread_mutex_unlock(&g_probe_mutex);
+	return found;
+}
+
+diffusion_params diffusion_params_defaults(void) {
+	return (diffusion_params){
+		.negative_prompt  = "",
+		.width			  = 512,
+		.height			  = 512,
+		.steps			  = 20,
+		.cfg_scale		  = 6.0f,
+		.preview_interval = 1.0f,
+	};
+}
+
+#define DIFFUSION_STR_(x) #x
+#define DIFFUSION_STR(x) DIFFUSION_STR_(x)
+
+const char *diffusion_params_error(const diffusion_params *p) {
+	bool valid_size = p->width > 0 && p->height > 0 && p->width % DIFFUSION_DIMENSION_STEP == 0 &&
+					  p->height % DIFFUSION_DIMENSION_STEP == 0;
+	if (valid_size && p->steps >= 1)
+		return NULL;
+	return "width and height must be multiples of " DIFFUSION_STR(
+		DIFFUSION_DIMENSION_STEP) " and steps at least 1";
+}
+
+diffusion_model *diffusion_open(const diffusion_files *files, char *err, size_t err_len) {
+	gguf_ctx dit;
+	if (gguf_load(&dit, files->diffusion_model) != OK) {
+		snprintf(err, err_len, "cannot load '%s'", files->diffusion_model);
+		return NULL;
+	}
+	const diffusion_ops *ops = diffusion_find_ops(&dit);
+	if (!ops) {
+		snprintf(err, err_len, "'%s' is not a supported diffusion model", files->diffusion_model);
+		gguf_free(&dit);
+		return NULL;
+	}
+	diffusion_model *dm = ops->open(files, &dit);
+	if (!dm)
+		snprintf(err, err_len, "failed to load %s", ops->name);
+	return dm;
+}
+
+void diffusion_close(diffusion_model *dm) {
+	if (dm)
+		dm->ops->close(dm);
+}
+
+static void compute_sigmas(const diffusion_schedule *s, int seq_len, int steps, float *sigmas) {
+	float slope = (s->max_shift - s->base_shift) / (float)(s->max_seq - s->base_seq);
+	float mu	= (float)seq_len * slope + (s->base_shift - slope * (float)s->base_seq);
+	for (int i = 0; i < steps; i++) {
+		float t	  = 1.0f - (float)i / (float)steps;
+		sigmas[i] = t <= 0 ? 0 : expf(mu) / (expf(mu) + (1.0f / t - 1.0f));
+	}
+	if (s->shift_terminal > 0 && steps > 1) {
+		float scale = (1.0f - sigmas[steps - 1]) / (1.0f - s->shift_terminal);
+		for (int i = 0; i < steps; i++)
+			sigmas[i] = 1.0f - (1.0f - sigmas[i]) / scale;
+	}
+	sigmas[steps] = 0;
+}
+
+static uint64_t rng_next(uint64_t *state) {
+	uint64_t z = (*state += 0x9e3779b97f4a7c15ull);
+	z		   = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+	z		   = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+	return z ^ (z >> 31);
+}
+
+static void fill_noise(float *x, size_t n, uint64_t seed) {
+	uint64_t state = seed;
+	for (size_t i = 0; i < n; i += 2) {
+		double u1 = ((double)(rng_next(&state) >> 11) + 1.0) / 9007199254740993.0;
+		double u2 = (double)(rng_next(&state) >> 11) / 9007199254740992.0;
+		double r  = sqrt(-2.0 * log(u1));
+		x[i]	  = (float)(r * cos(2.0 * M_PI * u2));
+		if (i + 1 < n)
+			x[i + 1] = (float)(r * sin(2.0 * M_PI * u2));
+	}
+}
+
+static void write_preview(const diffusion_ops *ops, const diffusion_params *p, const float *x0,
+						  latent_shape shape) {
+	diffusion_image small = {0}, full = {0};
+	ops->preview(x0, shape, &small);
+	image_resize(&small, p->width, p->height, &full);
+	image_drop_opaque_alpha(&full);
+	diffusion_image_write_png(p->preview_path, &full);
+	diffusion_image_free(&small);
+	diffusion_image_free(&full);
+}
+
+static void log_range(const char *what, const float *x, size_t n) {
+	float lo = INFINITY, hi = -INFINITY;
+	for (size_t i = 0; i < n; i++) {
+		lo = MIN(lo, x[i]);
+		hi = MAX(hi, x[i]);
+	}
+	DEBUG("%s range [%g, %g]", what, lo, hi);
+}
+
+static status_code predict_guided(const diffusion_ops *ops, diffusion_model *dm, const float *x,
+								  latent_shape shape, float sigma, float cfg_scale,
+								  diffusion_cond **cond, float *v, float *v_uncond) {
+	size_t		n = (size_t)shape.lw * shape.lh * shape.lc;
+	status_code s = ops->predict(dm, x, shape, sigma, cond[0], v);
+	if (s != OK || cfg_scale == 1.0f)
+		return s;
+	s = ops->predict(dm, x, shape, sigma, cond[1], v_uncond);
+	for (size_t i = 0; s == OK && i < n; i++)
+		v[i] = v_uncond[i] + cfg_scale * (v[i] - v_uncond[i]);
+	return s;
+}
+
+static void free_conds(const diffusion_ops *ops, diffusion_cond **cond) {
+	for (int i = 0; i < 2; i++)
+		if (cond[i])
+			ops->cond_free(cond[i]);
+}
+
+static bool diffusion_interrupted(const diffusion_params *p) {
+	return p->interrupt && *p->interrupt;
+}
+
+status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
+							   diffusion_image *out) {
+	const diffusion_ops *ops	 = dm->ops;
+	latent_shape		 shape	 = ops->shape(p->width, p->height);
+	size_t				 n		 = (size_t)shape.lw * shape.lh * shape.lc;
+	bool				 guided	 = p->cfg_scale != 1.0f;
+	const char			*texts[] = {p->prompt, p->negative_prompt[0] ? p->negative_prompt : " "};
+
+	diffusion_cond *cond[2] = {0};
+	status_code		s		= ops->encode(dm, texts, guided ? 2 : 1, cond);
+	if (s != OK) {
+		free_conds(ops, cond);
+		return s;
+	}
+
+	float *x		= xmalloc(n * sizeof(float));
+	float *v		= xmalloc(n * sizeof(float));
+	float *v_uncond = guided ? xmalloc(n * sizeof(float)) : NULL;
+	float *x0		= xmalloc(n * sizeof(float));
+	float *sigmas	= xmalloc((size_t)(p->steps + 1) * sizeof(float));
+	compute_sigmas(&ops->schedule, shape.lw * shape.lh, p->steps, sigmas);
+	fill_noise(x, n, p->seed);
+
+	uint64_t last_preview = 0;
+	for (int i = 0; i < p->steps && s == OK; i++) {
+		if (diffusion_interrupted(p)) {
+			s = ERR_INTERRUPTED;
+			break;
+		}
+		uint64_t t0 = time_us();
+		s			= predict_guided(ops, dm, x, shape, sigmas[i], p->cfg_scale, cond, v, v_uncond);
+		if (s != OK)
+			break;
+		log_range("velocity", v, n);
+		for (size_t j = 0; j < n; j++)
+			x0[j] = x[j] - sigmas[i] * v[j];
+		uint64_t now = time_us();
+		if (p->preview_path &&
+			(!last_preview || (double)(now - last_preview) / 1e6 >= p->preview_interval)) {
+			write_preview(ops, p, x0, shape);
+			last_preview = time_us();
+		}
+		for (size_t j = 0; j < n; j++)
+			x[j] += (sigmas[i + 1] - sigmas[i]) * v[j];
+		INFO("step %d/%d sigma %.4f (%.1fs)", i + 1, p->steps, sigmas[i], (double)(now - t0) / 1e6);
+	}
+
+	free_conds(ops, cond);
+	if (s == OK) {
+		log_range("latent", x, n);
+		s = ops->decode(dm, x, shape, out);
+		if (s == OK)
+			image_drop_opaque_alpha(out);
+	}
+	free(x);
+	free(v);
+	free(v_uncond);
+	free(x0);
+	free(sigmas);
+	return s;
+}

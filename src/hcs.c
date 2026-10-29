@@ -2,6 +2,7 @@
 
 #include "backend/backend.h"
 #include "common.h"
+#include "diffusion/diffusion.h"
 #include "log.h"
 #include "model.h"
 
@@ -627,6 +628,11 @@ int hcs_validate(const hcs_config *config, const char *model_path, bool moe_stre
 	if (h->n_devices > 0) {
 		if (!config->enabled)
 			return err[0] ? -1 : 0;
+		if (diffusion_probe(model_path)) {
+			if (h->n_devices > 1)
+				add_violation(&v, NULL, "devices", "diffusion models run on a single device");
+			return err[0] ? -1 : 0;
+		}
 		if (hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) == 0)
 			check_model_rules(&v, h, n_layers, n_experts, star_owner, experts_star_owner,
 							  moe_stream);

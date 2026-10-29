@@ -19,6 +19,7 @@
 #define GL_MAX_BINDINGS 8
 #define GL_SCRATCH_POOL_CAP 32
 #define GL_MAX_DISPATCH_PER_DIM 65535u
+#define GL_ELEMENTWISE_WG 128u
 #define GL_PIPELINE_MAX_UNIFORMS 16
 #define GL_UNIFORM_NAME_CAP 32
 #define GL_PIPELINE_NAME_PTR_CAP 32
@@ -157,6 +158,11 @@ typedef enum {
 	GL_PIPE_MATMUL_MM_IQ4_NL,
 	GL_PIPE_MATMUL_MM_Q4_0,
 	GL_PIPE_MATMUL_MM_Q8_0,
+	GL_PIPE_LAYERNORM_MODULATE,
+	GL_PIPE_ROPE_TABLE,
+	GL_PIPE_ATTENTION_DENSE,
+	GL_PIPE_IM2COL,
+	GL_PIPE_UPSAMPLE_SHORTCUT,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -672,9 +678,65 @@ static void gl_pui(gl_pipeline *p, const char *const *names, const int *vals, in
 		gl_pu(p, names[i], vals[i]);
 }
 
+static const struct {
+	const char *name;
+	const char *src;
+} gl_shader_includes[] = {
+	{"activate.glsl", gl_shader_activate_src},
+};
+
+static char *gl_shader_splice_includes(const char *src) {
+	if (!strstr(src, "#include "))
+		return NULL;
+	str_builder b;
+	sb_init(&b);
+	const char *p = src;
+	while (*p) {
+		const char *eol	 = strchr(p, '\n');
+		size_t		len	 = eol ? (size_t)(eol - p) + 1 : strlen(p);
+		const char *body = NULL;
+		if (len < 128) {
+			char line[128];
+			memcpy(line, p, len);
+			line[len] = '\0';
+			char name[64];
+			if (sscanf(line, " #include \"%63[^\"]\"", name) == 1) {
+				for (size_t i = 0; i < ARRAY_LEN(gl_shader_includes); i++)
+					if (strcmp(gl_shader_includes[i].name, name) == 0) {
+						body = gl_shader_includes[i].src;
+						break;
+					}
+				if (!body) {
+					ERROR("gl: unknown shader include '%s'", name);
+					sb_free(&b);
+					return NULL;
+				}
+			}
+		}
+		if (body) {
+			sb_puts(&b, body);
+			size_t blen = strlen(body);
+			if (blen == 0 || body[blen - 1] != '\n')
+				sb_putc(&b, '\n');
+		} else {
+			sb_putb(&b, p, len);
+		}
+		p += len;
+	}
+	return sb_finish(&b);
+}
+
 static status_code gl_build_pipeline(const char *src, const char *name, gl_pipeline *out) {
+	char *spliced = gl_shader_splice_includes(src);
+	if (spliced)
+		src = spliced;
+	else if (strstr(src, "#include ")) {
+		ERROR("gl: failed to resolve shader includes for pipeline '%s'", name);
+		return ERR_FORMAT;
+	}
 	GLuint		shader;
 	status_code s = gl_compile_shader(src, GL_COMPUTE_SHADER, &shader);
+	free(spliced);
 	if (s != OK) {
 		ERROR("gl: failed to compile shader for pipeline '%s'", name);
 		return s;
@@ -942,6 +1004,14 @@ static bool gl_buf_fill_from_desc(gl_buf *b, const tensor_desc *desc, size_t siz
 	return true;
 }
 
+static void gl_buf_fill_from_host(const void *data, size_t size) {
+	for (size_t off = 0; off < size; off += WEIGHT_COPY_CHUNK_BYTES) {
+		size_t len = MIN(size - off, WEIGHT_COPY_CHUNK_BYTES);
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)off, (GLsizeiptr)len,
+						(const char *)data + off);
+	}
+}
+
 static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void *initial_data,
 							   bool keep_host_mirror, const tensor_desc *src_desc) {
 	if (size == 0)
@@ -980,9 +1050,9 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 			free(b);
 			return NULL;
 		}
-	} else if (initial_data && alloc_size != size) {
+	} else if (initial_data && (alloc_size != size || size > WEIGHT_COPY_CHUNK_BYTES)) {
 		glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)alloc_size, NULL, usage);
-		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)size, initial_data);
+		gl_buf_fill_from_host(initial_data, size);
 	} else {
 		glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)alloc_size, initial_data, usage);
 	}
@@ -1411,6 +1481,14 @@ static status_code gl_init(backend *self, int device_index) {
 									UINT32_MAX, 4, 0},
 		[GL_PIPE_QUANTIZE_X_NORM] = {"rmsnorm_quantize", gl_shader_quantize_x_src, 0, UINT32_MAX, 1,
 									 0},
+		[GL_PIPE_LAYERNORM_MODULATE] = {"layernorm_modulate", gl_shader_layernorm_modulate_src, 0,
+										UINT32_MAX, 1, 0},
+		[GL_PIPE_ROPE_TABLE]		= {"rope_table", gl_shader_rope_table_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_ATTENTION_DENSE]	= {"attention_dense", gl_shader_attention_dense_src, 0,
+									   UINT32_MAX, 1, 0},
+		[GL_PIPE_IM2COL]			= {"im2col", gl_shader_im2col_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_UPSAMPLE_SHORTCUT] = {"upsample_shortcut", gl_shader_upsample_shortcut_src, 0,
+									   UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -2390,7 +2468,8 @@ static status_code gl_rmsnorm_ph_impl(gl_priv *p, const buffer *x, const buffer 
 	gl_pu(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_has_residual", rb ? 1 : 0);
 	gl_puf(&p->pipes[GL_PIPE_RMSNORM_PER_HEAD], "u_out_scale", out_scale);
 
-	gl_launch(p, (GLuint)n_heads, (GLuint)rows, 1);
+	gl_launch(p, (GLuint)n_heads, (GLuint)MIN((size_t)rows, (size_t)GL_MAX_DISPATCH_PER_DIM),
+			  (GLuint)(((size_t)rows + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM));
 	yb->device_dirty = 1;
 	return OK;
 }
@@ -2512,10 +2591,14 @@ static status_code gl_elementwise(gl_priv *p, buffer *x, const buffer *y, const 
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_aux", aux);
 	gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_m", rows);
 
-	GLuint groups = (GLuint)((n + 127) / 128);
-	GLuint gy	  = (GLuint)MIN(rows, 65535);
-	GLuint gz	  = (GLuint)((rows + 65534) / 65535);
-	gl_launch(p, groups, gy, gz);
+	GLuint gy = (GLuint)MIN((size_t)rows, (size_t)GL_MAX_DISPATCH_PER_DIM);
+	GLuint gz = (GLuint)(((size_t)rows + GL_MAX_DISPATCH_PER_DIM - 1) / GL_MAX_DISPATCH_PER_DIM);
+	const size_t cols_per_launch = (size_t)GL_MAX_DISPATCH_PER_DIM * GL_ELEMENTWISE_WG;
+	for (size_t col0 = 0; col0 < (size_t)n; col0 += cols_per_launch) {
+		size_t cols = MIN(cols_per_launch, (size_t)n - col0);
+		gl_pu(&p->pipes[GL_PIPE_ELEMENTWISE], "u_col0", (int)col0);
+		gl_launch(p, (GLuint)((cols + GL_ELEMENTWISE_WG - 1) / GL_ELEMENTWISE_WG), gy, gz);
+	}
 	bufs[0]->device_dirty = 1;
 	if (z)
 		bufs[2]->device_dirty = 1;
@@ -2622,6 +2705,186 @@ static status_code gl_attn_output_gate(backend *self, buffer *out, const buffer 
 			return host->attn_output_gate(host, out, gate, n, n_rows);
 	}
 	return s;
+}
+
+#define GL_DENSE_ATTN_MAX_HEAD_DIM 2048
+#define GL_THREADS_PER_GROUP 128
+
+static void gl_sync_buffers(gl_buf *const *bufs, int n) {
+	for (int i = 0; i < n; i++)
+		gl_buf_sync_to_device(bufs[i]);
+}
+
+static void gl_launch_groups(gl_priv *p, size_t groups) {
+	GLuint gx = groups > GL_MAX_DISPATCH_PER_DIM ? GL_MAX_DISPATCH_PER_DIM : (GLuint)groups;
+	GLuint gy = (GLuint)((groups + gx - 1) / gx);
+	gl_launch(p, gx, gy, 1);
+}
+
+static void gl_launch_threads(gl_priv *p, size_t threads) {
+	gl_launch_groups(p, (threads + GL_THREADS_PER_GROUP - 1) / GL_THREADS_PER_GROUP);
+}
+
+static status_code gl_activate(backend *self, buffer *x, int n, int activation) {
+	if (n <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	return gl_elementwise(p, x, NULL, NULL, n, activation ? 10 : 9, 0.0f, 0, 1);
+}
+
+static status_code gl_add_bias(backend *self, buffer *x, const buffer *bias, int rows, int dim) {
+	if (rows <= 0 || dim <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	return gl_elementwise(p, x, bias, NULL, dim, 11, 0.0f, 0, rows);
+}
+
+static status_code gl_gated_add(backend *self, buffer *x, const buffer *y, const buffer *gate,
+								int rows, int dim) {
+	if (rows <= 0 || dim <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	return gl_elementwise(p, x, y, gate, dim, 12, 0.0f, 0, rows);
+}
+
+static status_code gl_layernorm_modulate(backend *self, const buffer *x, const buffer *scale,
+										 buffer *y, int rows, int dim, float eps) {
+	if (rows <= 0 || dim <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	gl_buf *bufs[3] = {as_glbuf(x), as_glbuf(scale), as_glbuf(y)};
+	gl_sync_buffers(bufs, 3);
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_LAYERNORM_MODULATE];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo(0, x);
+	gl_bind_ssbo(1, scale);
+	gl_bind_ssbo_out(2, y);
+	gl_pu(pipe, "u_dim", dim);
+	gl_pu(pipe, "u_rows", rows);
+	gl_puf(pipe, "u_eps", eps);
+	gl_launch_groups(p, (size_t)rows);
+	bufs[2]->device_dirty = 1;
+	return OK;
+}
+
+static status_code gl_rope_table(backend *self, buffer *x, const buffer *table, int rows, int heads,
+								 int head_dim) {
+	if (rows <= 0 || heads <= 0 || head_dim < 2)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	gl_buf *bufs[2] = {as_glbuf(x), as_glbuf(table)};
+	gl_sync_buffers(bufs, 2);
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_ROPE_TABLE];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo_out(0, x);
+	gl_bind_ssbo(1, table);
+	gl_pu(pipe, "u_rows", rows);
+	gl_pu(pipe, "u_heads", heads);
+	gl_pu(pipe, "u_head_dim", head_dim);
+	gl_launch_threads(p, (size_t)rows * heads * (head_dim / 2));
+	bufs[0]->device_dirty = 1;
+	return OK;
+}
+
+static status_code gl_attention_dense(backend *self, const dense_attention_desc *d) {
+	if (d->head_dim > GL_DENSE_ATTN_MAX_HEAD_DIM)
+		return ERR_UNSUPPORTED;
+	if (d->n_q <= 0 || d->n_heads <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	status_code s = gl_ensure_dummy(p);
+	if (s != OK)
+		return s;
+
+	const buffer *k1	  = d->n1 ? d->k1 : NULL;
+	const buffer *v1	  = d->n1 ? d->v1 : NULL;
+	gl_buf		 *bufs[6] = {as_glbuf(d->q),
+							 as_glbuf(d->k0),
+							 as_glbuf(d->v0),
+							 k1 ? as_glbuf(k1) : p->dummy,
+							 v1 ? as_glbuf(v1) : p->dummy,
+							 as_glbuf(d->out)};
+	gl_sync_buffers(bufs, 6);
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_ATTENTION_DENSE];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo(0, d->q);
+	gl_bind_ssbo(1, d->k0);
+	gl_bind_ssbo(2, d->v0);
+	if (k1) {
+		gl_bind_ssbo(3, k1);
+		gl_bind_ssbo(4, v1);
+	} else {
+		gl_bind_raw(p, 3, p->dummy->name, 0, 0, 0);
+		gl_bind_raw(p, 4, p->dummy->name, 0, 0, 0);
+	}
+	gl_bind_ssbo_out(5, d->out);
+	gl_pu(pipe, "u_n_heads", d->n_heads);
+	gl_pu(pipe, "u_head_dim", d->head_dim);
+	gl_pu(pipe, "u_n0", d->n0);
+	gl_pu(pipe, "u_n1", d->n1);
+	gl_pu(pipe, "u_causal", d->causal);
+	gl_pu(pipe, "u_n_q", d->n_q);
+	gl_launch_groups(p, (size_t)d->n_q * d->n_heads);
+	bufs[5]->device_dirty = 1;
+	return OK;
+}
+
+static status_code gl_im2col3x3(backend *self, const im2col_desc *d) {
+	if (d->n_pixels <= 0 || d->channels <= 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	gl_buf *bufs[2] = {as_glbuf(d->in), as_glbuf(d->col)};
+	gl_sync_buffers(bufs, 2);
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_IM2COL];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo(0, d->in);
+	gl_bind_ssbo_out(1, d->col);
+	gl_pu(pipe, "u_first_pixel", d->first_pixel);
+	gl_pu(pipe, "u_n_pixels", d->n_pixels);
+	gl_pu(pipe, "u_width", d->width);
+	gl_pu(pipe, "u_in_height", d->in_height);
+	gl_pu(pipe, "u_in_width", d->in_width);
+	gl_pu(pipe, "u_channels", d->channels);
+	gl_pu(pipe, "u_shift", d->shift);
+	gl_launch_threads(p, (size_t)d->n_pixels * 9 * d->channels);
+	bufs[1]->device_dirty = 1;
+	return OK;
+}
+
+static status_code gl_upsample_shortcut_add(backend *self, const upsample_shortcut_desc *d) {
+	size_t threads = (size_t)d->height * d->factor * d->width * d->factor * d->out_channels;
+	if (threads == 0)
+		return OK;
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	gl_buf *bufs[2] = {as_glbuf(d->in), as_glbuf(d->out)};
+	gl_sync_buffers(bufs, 2);
+
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_UPSAMPLE_SHORTCUT];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo(0, d->in);
+	gl_bind_ssbo_out(1, d->out);
+	gl_pu(pipe, "u_height", d->height);
+	gl_pu(pipe, "u_width", d->width);
+	gl_pu(pipe, "u_in_channels", d->in_channels);
+	gl_pu(pipe, "u_out_channels", d->out_channels);
+	gl_pu(pipe, "u_repeats", d->repeats);
+	gl_pu(pipe, "u_frames_up", d->frames_up);
+	gl_pu(pipe, "u_factor", d->factor);
+	gl_launch_threads(p, threads);
+	bufs[1]->device_dirty = 1;
+	return OK;
 }
 
 static status_code gl_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
@@ -5724,6 +5987,14 @@ static status_code gl_ctor(backend *out) {
 	out->hc_final						 = gl_hc_final;
 	out->kda							 = gl_kda;
 	out->mla_absorbed					 = gl_mla_absorbed;
+	out->layernorm_modulate				 = gl_layernorm_modulate;
+	out->gated_add						 = gl_gated_add;
+	out->add_bias						 = gl_add_bias;
+	out->activate						 = gl_activate;
+	out->rope_table						 = gl_rope_table;
+	out->attention_dense				 = gl_attention_dense;
+	out->im2col3x3						 = gl_im2col3x3;
+	out->upsample_shortcut_add			 = gl_upsample_shortcut_add;
 
 	return OK;
 }

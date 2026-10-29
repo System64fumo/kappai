@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer VecBuf {
+	float vec[];
+};
+layout(set = 0, binding = 1) readonly buffer TableBuf {
+	float table[];
+};
+
+layout(push_constant) uniform Params {
+	int rows;
+	int heads;
+	int head_dim;
+}
+params;
+
+void main() {
+	uint half_dim = uint(params.head_dim) / 2u;
+	uint total	  = uint(params.rows) * uint(params.heads) * half_dim;
+	uint gid	  = gl_GlobalInvocationID.x;
+	if (gid >= total)
+		return;
+	uint  i		 = gid % half_dim;
+	uint  rh	 = gid / half_dim;
+	uint  row	 = rh / uint(params.heads);
+	uint  at	 = rh * uint(params.head_dim) + 2u * i;
+	float co	 = table[(row * half_dim + i) * 2u];
+	float si	 = table[(row * half_dim + i) * 2u + 1u];
+	float x0	 = vec[at];
+	float x1	 = vec[at + 1u];
+	vec[at]		 = x0 * co - x1 * si;
+	vec[at + 1u] = x0 * si + x1 * co;
+}
