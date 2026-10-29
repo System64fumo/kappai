@@ -579,7 +579,7 @@ static req_ctx *rc_new(openai_state *st) {
 static void gen_queue_push(oa_gen *g, const char *payload, size_t len) {
 	pthread_mutex_lock(&g->q_mtx);
 	if (!gen_dead(g)) {
-		ARR_RESERVE(g->queue, g->q_len, g->q_cap);
+		arr_reserve((void **)&(g->queue), (g->q_len), &(g->q_cap), sizeof(*(g->queue)));
 		char *frame = xmalloc(6 + len + 2);
 		memcpy(frame, "data: ", 6);
 		memcpy(frame + 6, payload, len);
@@ -835,7 +835,8 @@ static void check_stop_sequences(oa_gen *g) {
 	size_t window_len	= 2 * max_needle - 1;
 	size_t window_start = total > window_len ? total - window_len : 0;
 	size_t wlen			= total - window_start;
-	ARR_ENSURE(g->stop_window, wlen + 1, g->stop_window_cap);
+	arr_ensure((void **)&(g->stop_window), (wlen + 1), &(g->stop_window_cap),
+			   sizeof(*(g->stop_window)));
 	char *window = g->stop_window;
 	if (window_start < rlen) {
 		memcpy(window, g->reasoning.p + window_start, rlen - window_start);

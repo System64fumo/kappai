@@ -1264,6 +1264,16 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	return OK;
 }
 
+static status_code upload_layer_one(model *m, backend *target, weight_ref *ref, uint32_t wtype,
+									int ndims, uint64_t d0, uint64_t d1, weight_class wc) {
+	return upload_one_to(m, ref, wtype, ndims, d0, d1, wc, target);
+}
+
+static status_code upload_layer_one_repack(model *m, backend *target, weight_ref *ref, int ndims,
+										   uint64_t d0, uint64_t d1, weight_class wc) {
+	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, target);
+}
+
 static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	status_code	   s;
 	layer_weights *L		= &m->layers[i];
@@ -1281,14 +1291,14 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
-		s = upload_one_to(m, (ref), (wtype), (ndims), (d0), (d1), (wc), layer_be);                 \
+		s = upload_layer_one(m, layer_be, (ref), (wtype), (ndims), (d0), (d1), (wc));              \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
 
 #define UPLOAD_REP(ref, ndims, d0, d1, wc)                                                         \
 	do {                                                                                           \
-		s = upload_one_repack_to(m, (ref), (ndims), (d0), (d1), (wc), layer_be);                   \
+		s = upload_layer_one_repack(m, layer_be, (ref), (ndims), (d0), (d1), (wc));                \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)

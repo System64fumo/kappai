@@ -59,12 +59,10 @@ status_code gl_render_node_identity(char *out, size_t cap) {
 			while (fgets(line, sizeof(line), f)) {
 				if (strncmp(line, "PCI_SLOT_NAME=", 14) != 0)
 					continue;
-				char slot[64];
-				snprintf(slot, sizeof(slot), "%s", line + 14);
-				size_t len = strlen(slot);
-				while (len > 0 && (slot[len - 1] == '\n' || slot[len - 1] == '\r'))
-					slot[--len] = '\0';
-				snprintf(out, cap, "PCI:%s", slot);
+				size_t slot_len = strlen(line);
+				while (slot_len > 14 && (line[slot_len - 1] == '\n' || line[slot_len - 1] == '\r'))
+					line[--slot_len] = '\0';
+				snprintf(out, cap, "PCI:%s", line + 14);
 				s = OK;
 				break;
 			}

@@ -11,14 +11,14 @@ typedef struct {
 	const char *fn_name;
 	size_t		slot0;
 	size_t		slot1;
-	uint32_t	batch_extra_mask;
-	int8_t		reads[4];
-	int8_t		writes[4];
 	const char *name;
+	op_also		also[2];
+	uint32_t	batch_extra_mask;
 	uint8_t		state_reads;
 	uint8_t		state_writes;
 	uint8_t		layer_geom;
-	op_also		also[2];
+	int8_t		reads[4];
+	int8_t		writes[4];
 } op_requirement;
 
 #define OP_NO_SLOT ((size_t)-1)

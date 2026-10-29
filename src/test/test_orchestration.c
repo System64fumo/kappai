@@ -826,6 +826,12 @@ static void t_context_full_unit(void) {
 	restore_logging();
 }
 
+static void orch_push(char (*argv_buf)[512], char **argv, int *ai, const char *arg) {
+	snprintf(argv_buf[*ai], sizeof(argv_buf[*ai]), "%s", arg);
+	argv[*ai] = argv_buf[*ai];
+	(*ai)++;
+}
+
 static void t_engine_exit_code_context_full(void) {
 	silence_logging();
 	char detail[512];
@@ -836,30 +842,23 @@ static void t_engine_exit_code_context_full(void) {
 	char  argv_buf[18][512];
 	char *argv[18];
 	int	  ai = 0;
-#define ORCH_PUSH(arg)                                                                             \
-	do {                                                                                           \
-		snprintf(argv_buf[ai], sizeof(argv_buf[ai]), "%s", arg);                                   \
-		argv[ai] = argv_buf[ai];                                                                   \
-		ai++;                                                                                      \
-	} while (0)
-	ORCH_PUSH("kappai-test");
-	ORCH_PUSH("-m");
-	ORCH_PUSH(synth_chat_model_path);
-	ORCH_PUSH("--device");
-	ORCH_PUSH("cpu0");
-	ORCH_PUSH("-c");
-	ORCH_PUSH("40");
-	ORCH_PUSH("-p");
-	ORCH_PUSH(prompt);
-	ORCH_PUSH("-n");
-	ORCH_PUSH(nbuf);
-	ORCH_PUSH("-t");
-	ORCH_PUSH("0");
-	ORCH_PUSH("--seed");
-	ORCH_PUSH("7");
-	ORCH_PUSH("--stream");
-	ORCH_PUSH("off");
-#undef ORCH_PUSH
+	orch_push(argv_buf, argv, &ai, "kappai-test");
+	orch_push(argv_buf, argv, &ai, "-m");
+	orch_push(argv_buf, argv, &ai, synth_chat_model_path);
+	orch_push(argv_buf, argv, &ai, "--device");
+	orch_push(argv_buf, argv, &ai, "cpu0");
+	orch_push(argv_buf, argv, &ai, "-c");
+	orch_push(argv_buf, argv, &ai, "40");
+	orch_push(argv_buf, argv, &ai, "-p");
+	orch_push(argv_buf, argv, &ai, prompt);
+	orch_push(argv_buf, argv, &ai, "-n");
+	orch_push(argv_buf, argv, &ai, nbuf);
+	orch_push(argv_buf, argv, &ai, "-t");
+	orch_push(argv_buf, argv, &ai, "0");
+	orch_push(argv_buf, argv, &ai, "--seed");
+	orch_push(argv_buf, argv, &ai, "7");
+	orch_push(argv_buf, argv, &ai, "--stream");
+	orch_push(argv_buf, argv, &ai, "off");
 
 	cli_args a;
 	context	 ctx;

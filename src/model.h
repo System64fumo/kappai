@@ -7,6 +7,9 @@
 #include "gguf.h"
 #include "memory.h"
 
+#define MODEL_MAX_EXPERT_PARTS 8
+#define MODEL_REPACK_TABLE_SIZE 128
+
 struct model_recipe;
 typedef struct model_recipe model_recipe;
 
@@ -113,8 +116,6 @@ typedef struct layer_weights {
 	bool	is_moe_layer;
 	bool	experts_resident;
 } layer_weights;
-
-#define MODEL_MAX_EXPERT_PARTS 8
 
 typedef struct {
 	struct backend *be;
@@ -252,7 +253,6 @@ typedef struct model {
 	size_t mem_per_expert_bytes;
 	bool   mem_estimates_valid;
 
-#define MODEL_REPACK_TABLE_SIZE 128
 	uint8_t repack_table[MODEL_REPACK_TABLE_SIZE];
 	bool	repack_table_valid;
 } model;

@@ -270,7 +270,6 @@ static int set_section_key(hcs_section *s, const char *key, const char *value, c
 		rc	= s->seen & bit ? 0 : hcs_parse_priority(value, &s->dev.priority);
 	} else if (strcasecmp(key, "pins") == 0) {
 		bit = SEEN_PINS;
-		rc	= 0;
 		if (s->seen & bit)
 			rc = -1;
 		else {

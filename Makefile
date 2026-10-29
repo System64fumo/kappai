@@ -585,11 +585,15 @@ tidy: | $(OUT_DIR)
 	@echo "  TIDY    -> $(TIDY_LOG)"
 	@: > $(TIDY_LOG)
 	@printf '%s\n' $(TIDY_SRCS) | \
-		xargs -P $(NPROC) \
-		-I {} sh -c ' \
-			echo "  TIDY    {}"; \
-			clang-tidy --config-file=.clang-tidy {} -- $(filter-out $(ARCH_FLAGS) -fvect-cost-model=%,$(CFLAGS)) $(DETECTED_ARCH_FLAGS) -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true \
-		'
+		xargs -P $(NPROC) -n 1 \
+		sh -c ' \
+			echo "  TIDY    $$1"; \
+			case "$$1" in \
+			*/opengl/*) TIDY_INC="-I$(OUT_DIR)/src/backend/opengl";; \
+			*/vulkan/*) TIDY_INC="-I$(OUT_DIR)/src/backend/vulkan";; \
+			esac; \
+			clang-tidy --config-file=.clang-tidy "$$1" -- $(filter-out $(ARCH_FLAGS) $(DETECTED_ARCH_FLAGS) -fvect-cost-model=%,$(CFLAGS)) -march=native $$TIDY_INC -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true \
+		' sh
 	@echo "  TIDY    done, see $(TIDY_LOG)"
 
 -include $(LIB_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(DIFFUSION_OBJS:.o=.d) $(TUI_OBJS:.o=.d) $(sort $(BACKEND_OBJS:.o=.d)) $(MONITOR_BIN).d

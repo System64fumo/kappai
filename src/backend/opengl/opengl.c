@@ -55,6 +55,19 @@
 #define GL_MATMUL_MULTI_MAX 8
 #define GL_KV_ZERO_CHUNK_BYTES ((size_t)1 << 20)
 
+#define GL_ARGMAX_WG_CHUNK 8192
+#define GL_ARGMAX_MAX_GROUPS 256
+
+#define GL_DENSE_ATTN_MAX_HEAD_DIM 2048
+#define GL_THREADS_PER_GROUP 128
+
+static const struct {
+	const char *name;
+	const char *src;
+} gl_shader_includes[] = {
+	{"activate.glsl", gl_shader_activate_src},
+};
+
 typedef struct gl_priv gl_priv;
 
 typedef struct {
@@ -489,7 +502,6 @@ static status_code gl_ensure_context(gl_priv *p) {
 		if (gl_enter_st_ != OK)                                                                    \
 			return gl_enter_st_;                                                                   \
 	} while (0)
-
 #define GL_ENTER_VOID(p_)                                                                          \
 	do {                                                                                           \
 		if (gl_ensure_context(p_) != OK)                                                           \
@@ -677,13 +689,6 @@ static void gl_pui(gl_pipeline *p, const char *const *names, const int *vals, in
 	for (int i = 0; i < count; i++)
 		gl_pu(p, names[i], vals[i]);
 }
-
-static const struct {
-	const char *name;
-	const char *src;
-} gl_shader_includes[] = {
-	{"activate.glsl", gl_shader_activate_src},
-};
 
 static char *gl_shader_splice_includes(const char *src) {
 	if (!strstr(src, "#include "))
@@ -1579,6 +1584,16 @@ static status_code gl_init(backend *self, int device_index) {
 			return s;
 		}
 	}
+	if (s != OK) {
+		for (int j = 0; j < GL_PIPE_COUNT; j++)
+			glDeleteProgram(p->pipes[j].program);
+		free(p->attention_src);
+		free(p->attention_batch_src);
+		gl_context_free(&p->ctx);
+		free(p);
+		self->priv = NULL;
+		return s;
+	}
 
 	static const int8_t iq4nl_values[16] = {
 		-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -2102,9 +2117,6 @@ static void gl_submit(backend *self) {
 	glFlush();
 	p->dispatches_since_flush = 0;
 }
-
-#define GL_ARGMAX_WG_CHUNK 8192
-#define GL_ARGMAX_MAX_GROUPS 256
 
 static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int *groups_out) {
 	int groups = (n + GL_ARGMAX_WG_CHUNK - 1) / GL_ARGMAX_WG_CHUNK;
@@ -2706,9 +2718,6 @@ static status_code gl_attn_output_gate(backend *self, buffer *out, const buffer 
 	}
 	return s;
 }
-
-#define GL_DENSE_ATTN_MAX_HEAD_DIM 2048
-#define GL_THREADS_PER_GROUP 128
 
 static void gl_sync_buffers(gl_buf *const *bufs, int n) {
 	for (int i = 0; i < n; i++)

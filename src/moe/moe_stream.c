@@ -2826,7 +2826,7 @@ static void moe_preload_push_region(moe_preload_region **regions, size_t *n, siz
 									const void *ptr, size_t bytes) {
 	if (!ptr || bytes == 0)
 		return;
-	ARR_RESERVE(*regions, *n, *cap);
+	arr_reserve((void **)&(*regions), (*n), &(*cap), sizeof(*(*regions)));
 	(*regions)[*n].ptr	 = ptr;
 	(*regions)[*n].bytes = bytes;
 	(*n)++;

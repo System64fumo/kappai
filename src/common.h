@@ -23,6 +23,8 @@
 
 #define FNV1A_OFFSET_BASIS 0xcbf29ce484222325ULL
 
+#define WEIGHT_COPY_CHUNK_BYTES ((size_t)(8 << 20))
+
 #define HEAD_DIM_MAX 512
 
 typedef enum {
@@ -92,8 +94,6 @@ static inline void prefault(void *ptr, size_t bytes) {
 		p[off] = p[off];
 	p[bytes - 1] = p[bytes - 1];
 }
-
-#define WEIGHT_COPY_CHUNK_BYTES ((size_t)(8 << 20))
 
 void weight_source_prefetch(const void *ptr, size_t bytes);
 void weight_source_release(const void *ptr, size_t bytes);
@@ -264,19 +264,24 @@ static inline uint64_t fnv1a_update_str(uint64_t h, const char *s) {
 	return s ? fnv1a_update(h, s, strlen(s)) : h;
 }
 
-#define ARR_RESERVE(items, n, cap)                                                                 \
+static inline void *arr_grow(void *items, size_t new_cap, size_t elem_size) {
+	return xrealloc(items, new_cap * elem_size);
+}
+
+#define arr_reserve(items, n, cap_p, es)                                                           \
 	do {                                                                                           \
-		if ((n) == (cap)) {                                                                        \
-			(cap)	= (cap) ? (cap) * 2 : 8;                                                       \
-			(items) = xrealloc((items), (cap) * sizeof(*(items)));                                 \
+		if ((size_t)(n) == (size_t)*(cap_p)) {                                                     \
+			size_t _arr_new_cap = (size_t)*(cap_p) ? (size_t)*(cap_p) * 2 : 8;                     \
+			*(items)			= arr_grow(*(items), _arr_new_cap, (es));                          \
+			*(cap_p)			= _arr_new_cap;                                                    \
 		}                                                                                          \
 	} while (0)
 
-#define ARR_ENSURE(items, need, cap)                                                               \
+#define arr_ensure(items, need, cap_p, es)                                                         \
 	do {                                                                                           \
-		if ((cap) < (need)) {                                                                      \
-			(cap)	= (need);                                                                      \
-			(items) = xrealloc((items), (size_t)(cap) * sizeof(*(items)));                         \
+		if ((size_t)*(cap_p) < (size_t)(need)) {                                                   \
+			*(items) = arr_grow(*(items), (size_t)(need), (es));                                   \
+			*(cap_p) = (need);                                                                     \
 		}                                                                                          \
 	} while (0)
 

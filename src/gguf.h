@@ -53,7 +53,6 @@ typedef enum {
 	GGML_TYPE_IQ4_XS  = 23,
 	GGML_TYPE_BF16	  = 30,
 
-	/* 0x40+ = engine-internal repacked types */
 	GGML_TYPE_Q8_0_REPACKED	  = 0x43,
 	GGML_TYPE_Q4_0_REPACKED	  = 0x44,
 	GGML_TYPE_IQ3_S_REPACKED  = 0x45,

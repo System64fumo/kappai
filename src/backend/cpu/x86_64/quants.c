@@ -9,6 +9,15 @@
 #define MR 8
 _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple of 4");
 
+#define IQ3_S_REPACKED_OFF_D 0
+#define IQ3_S_REPACKED_OFF_SCALES (IQ3_S_REPACKED_ROWS * sizeof(uint16_t))
+#define IQ3_S_REPACKED_OFF_IDX (IQ3_S_REPACKED_OFF_SCALES + IQ3_S_REPACKED_ROWS * 4)
+
+#define IQ4_NL_REPACKED_GROUP_BYTES                                                                \
+	(IQ4_NL_REPACKED_ROWS * sizeof(uint16_t) + IQ4_NL_REPACKED_ROWS * 16)
+
+typedef int32_t (*iq_block_tot_fn)(const void *b, const int8_t *restrict q8);
+
 static inline void *grow_avx_cache(void *old, size_t count, size_t item_size) {
 	if (count > SIZE_MAX / item_size)
 		oom_abort(SIZE_MAX);
@@ -123,10 +132,6 @@ static inline __m256i iq3_s_repacked_unpack_group(const uint8_t *idx_ptr, __m256
 	__m256i nib	   = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
 	return _mm256_shuffle_epi8(tbl, nib);
 }
-
-#define IQ3_S_REPACKED_OFF_D 0
-#define IQ3_S_REPACKED_OFF_SCALES (IQ3_S_REPACKED_ROWS * sizeof(uint16_t))
-#define IQ3_S_REPACKED_OFF_IDX (IQ3_S_REPACKED_OFF_SCALES + IQ3_S_REPACKED_ROWS * 4)
 
 static void matmul_iq3_s_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													 float *restrict y, int n, int k) {
@@ -1812,9 +1817,6 @@ void matmul_q4_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 	}
 }
 #undef NR
-
-#define IQ4_NL_REPACKED_GROUP_BYTES                                                                \
-	(IQ4_NL_REPACKED_ROWS * sizeof(uint16_t) + IQ4_NL_REPACKED_ROWS * 16)
 
 static void matmul_iq4_nl_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 													float *restrict y, int n, int k) {
@@ -4792,8 +4794,6 @@ static int32_t iq4_xs_block_tot(const void *b_, const int8_t *restrict q8) {
 	}
 	return tot;
 }
-
-typedef int32_t (*iq_block_tot_fn)(const void *b, const int8_t *restrict q8);
 
 static void iq_run_rows(const void *w, size_t row_stride, int bpr, size_t block_size,
 						iq_block_tot_fn tot_fn, float factor, const q8_k_block *restrict xq,

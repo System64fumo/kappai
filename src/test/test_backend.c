@@ -7,6 +7,85 @@
 static float *ref_softmax_attn(const float *q, const float *k, const float *v, int n_heads, int kvh,
 							   int hd, int t0, int n_pos, float scale);
 
+#define RS_FAM OPFAM_REAL_SHAPE
+#define RS_DIM 1536
+#define RS_PLE 256
+
+static const uint32_t RS_MATMUL_TYPES[] = {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+										   GGML_TYPE_F32, GGML_TYPE_BF16};
+#define RS_MATMUL_TYPES_N ((int)(sizeof(RS_MATMUL_TYPES) / sizeof(RS_MATMUL_TYPES[0])))
+
+static const int RS_MATMUL_SHAPES[][2] = {
+	{256, 1536},   {512, 1536},	 {2048, 1536}, {4096, 1536}, {8960, 1536},	{6144, 1536},
+	{12288, 1536}, {1536, 2048}, {1536, 4096}, {1536, 6144}, {1536, 12288},
+};
+#define RS_MATMUL_SHAPES_N ((int)(sizeof(RS_MATMUL_SHAPES) / sizeof(RS_MATMUL_SHAPES[0])))
+
+static const int RS_ROW_SPLIT_ROWS[] = {65540, 262148};
+
+enum { RS_KV_LAYERS = 2, RS_KV_HEADS_Q = 8, RS_KV_CTX = 64, RS_KV_HD_MAX = 512 };
+static const int RS_KV_HD[RS_KV_LAYERS] = {256, 512};
+
+#define NOP_FILL(arr, scale)                                                                       \
+	fill_random_f32((float *)(arr), (int)(sizeof(arr) / sizeof(float)), (scale))
+
+enum { HCO_DIM = 64, HCO_HC = 4, HCO_COEF = HCO_HC + HCO_HC * HCO_HC };
+
+typedef struct {
+	float sub[HCO_DIM];
+	float coef[HCO_COEF];
+	float hc[HCO_HC * HCO_DIM];
+} nop_hc_post_data;
+
+enum { HCP_DIM = 64, HCP_HC = 4, HCP_MIX = 24, HCP_FLAT = 256, HCP_COEF = 20 };
+
+typedef struct {
+	float stream[HCP_FLAT];
+	float fn[HCP_MIX * HCP_FLAT];
+	float base[HCP_MIX];
+	float scale[3];
+} nop_hc_pre_data;
+
+enum {
+	KDA_DIM	  = 64,
+	KDA_H	  = 4,
+	KDA_S	  = 16,
+	KDA_D	  = KDA_H * KDA_S,
+	KDA_K	  = 4,
+	KDA_STEPS = 2,
+};
+
+typedef struct {
+	float wq[KDA_D * KDA_DIM], wk[KDA_D * KDA_DIM], wv[KDA_D * KDA_DIM], wo[KDA_DIM * KDA_D];
+	float f_a[KDA_S * KDA_DIM], f_b[KDA_D * KDA_S], g_a[KDA_S * KDA_DIM], g_b[KDA_D * KDA_S];
+	float beta[KDA_H * KDA_DIM];
+	float conv_q[KDA_K * KDA_D], conv_k[KDA_K * KDA_D], conv_v[KDA_K * KDA_D];
+	float dt_bias[KDA_D], ssm_a[KDA_H], out_norm[KDA_S];
+	float x[KDA_STEPS][KDA_DIM];
+} nop_kda_data;
+
+enum { KDA_W = 9, KDA_P = 6 };
+
+enum {
+	MLA_DIM	  = 64,
+	MLA_H	  = 4,
+	MLA_R	  = 16,
+	MLA_QK	  = 24,
+	MLA_VH	  = 16,
+	MLA_QL	  = 32,
+	MLA_STEPS = 3,
+};
+
+typedef struct {
+	float q_a[MLA_QL * MLA_DIM], q_b[MLA_H * MLA_QK * MLA_QL], kv_a[MLA_R * MLA_DIM];
+	float wo[MLA_DIM * MLA_H * MLA_VH];
+	float q_a_norm[MLA_QL], kv_a_norm[MLA_R];
+	float k_b[MLA_H * MLA_R * MLA_QK], v_b[MLA_H * MLA_VH * MLA_R];
+	float x[MLA_STEPS][MLA_DIM];
+} nop_mla_data;
+
+enum { MLA_W = 4, MLA_P = 4 };
+
 static void test_op_matmul(backend *ref, backend *tgt, op_family fam, const qtype_info *qt, int n,
 						   int k) {
 	char label[128];
@@ -3512,22 +3591,6 @@ static void print_op_coverage(backend *ref, backend *tgt) {
 			   rows[i].has_tgt ? '+' : '-');
 	}
 }
-#define RS_FAM OPFAM_REAL_SHAPE
-#define RS_DIM 1536
-#define RS_PLE 256
-
-static const uint32_t RS_MATMUL_TYPES[] = {GGML_TYPE_IQ4_NL, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
-										   GGML_TYPE_F32, GGML_TYPE_BF16};
-#define RS_MATMUL_TYPES_N ((int)(sizeof(RS_MATMUL_TYPES) / sizeof(RS_MATMUL_TYPES[0])))
-
-static const int RS_MATMUL_SHAPES[][2] = {
-	{256, 1536},   {512, 1536},	 {2048, 1536}, {4096, 1536}, {8960, 1536},	{6144, 1536},
-	{12288, 1536}, {1536, 2048}, {1536, 4096}, {1536, 6144}, {1536, 12288},
-};
-#define RS_MATMUL_SHAPES_N ((int)(sizeof(RS_MATMUL_SHAPES) / sizeof(RS_MATMUL_SHAPES[0])))
-
-static const int RS_ROW_SPLIT_ROWS[] = {65540, 262148};
-
 static const qtype_info *rs_qtype(uint32_t type) {
 	for (int i = 0; i < QTYPES_N; i++)
 		if (QTYPES[i].type == type)
@@ -4044,9 +4107,6 @@ static void test_rs_copy_slices(backend *ref, backend *tgt, int total, int dst_o
 	free(y_got);
 }
 
-enum { RS_KV_LAYERS = 2, RS_KV_HEADS_Q = 8, RS_KV_CTX = 64, RS_KV_HD_MAX = 512 };
-static const int RS_KV_HD[RS_KV_LAYERS] = {256, 512};
-
 static status_code rs_kv_mixed(backend *b, int n_kv, int n_steps, const float *kf, const float *vf,
 							   const float *qf, float *out) {
 	int			layer_hd[RS_KV_LAYERS]	= {RS_KV_HD[0], RS_KV_HD[1]};
@@ -4178,9 +4238,6 @@ static void nop_compare(op_family fam, const char *label, const float *y_ref, co
 	record_result(fam, label, v, detail);
 }
 
-#define NOP_FILL(arr, scale)                                                                       \
-	fill_random_f32((float *)(arr), (int)(sizeof(arr) / sizeof(float)), (scale))
-
 static buffer nop_scratch(backend *b, const float *data, int n) {
 	buffer buf = {0};
 	b->buffer_alloc_scratch(b, (size_t)n * sizeof(float), &buf);
@@ -4252,14 +4309,6 @@ static void test_op_hc_final(backend *ref, backend *tgt) {
 	nop_compare(OPFAM_HC_FINAL, label, y_ref, y_tgt, DIM, st);
 }
 
-enum { HCO_DIM = 64, HCO_HC = 4, HCO_COEF = HCO_HC + HCO_HC * HCO_HC };
-
-typedef struct {
-	float sub[HCO_DIM];
-	float coef[HCO_COEF];
-	float hc[HCO_HC * HCO_DIM];
-} nop_hc_post_data;
-
 static status_code nop_hc_post_run(backend *b, const nop_hc_post_data *dt, float *out) {
 	buffer		 bufs[3] = {nop_scratch(b, dt->sub, HCO_DIM), nop_scratch(b, dt->coef, HCO_COEF),
 							nop_scratch(b, dt->hc, HCO_HC * HCO_DIM)};
@@ -4286,15 +4335,6 @@ static void test_op_hc_post(backend *ref, backend *tgt) {
 	status_code st = nop_hc_post_run(tgt, &dt, y_tgt);
 	nop_compare(OPFAM_HC_POST, label, y_ref, y_tgt, HCO_HC * HCO_DIM, st);
 }
-
-enum { HCP_DIM = 64, HCP_HC = 4, HCP_MIX = 24, HCP_FLAT = 256, HCP_COEF = 20 };
-
-typedef struct {
-	float stream[HCP_FLAT];
-	float fn[HCP_MIX * HCP_FLAT];
-	float base[HCP_MIX];
-	float scale[3];
-} nop_hc_pre_data;
 
 static status_code nop_hc_pre_run(backend *b, const nop_hc_pre_data *dt, float *out) {
 	buffer fn	   = nop_weight(b, dt->fn, HCP_MIX, HCP_FLAT);
@@ -4338,26 +4378,6 @@ static void test_op_hc_pre(backend *ref, backend *tgt) {
 	nop_compare(OPFAM_HC_PRE, label, y_ref, y_tgt, HCP_DIM + HCP_COEF, st);
 	free(dt);
 }
-
-enum {
-	KDA_DIM	  = 64,
-	KDA_H	  = 4,
-	KDA_S	  = 16,
-	KDA_D	  = KDA_H * KDA_S,
-	KDA_K	  = 4,
-	KDA_STEPS = 2,
-};
-
-typedef struct {
-	float wq[KDA_D * KDA_DIM], wk[KDA_D * KDA_DIM], wv[KDA_D * KDA_DIM], wo[KDA_DIM * KDA_D];
-	float f_a[KDA_S * KDA_DIM], f_b[KDA_D * KDA_S], g_a[KDA_S * KDA_DIM], g_b[KDA_D * KDA_S];
-	float beta[KDA_H * KDA_DIM];
-	float conv_q[KDA_K * KDA_D], conv_k[KDA_K * KDA_D], conv_v[KDA_K * KDA_D];
-	float dt_bias[KDA_D], ssm_a[KDA_H], out_norm[KDA_S];
-	float x[KDA_STEPS][KDA_DIM];
-} nop_kda_data;
-
-enum { KDA_W = 9, KDA_P = 6 };
 
 static status_code nop_kda_run(backend *b, const nop_kda_data *dt, float *out) {
 	const int	 hist = KDA_K - 1;
@@ -4451,26 +4471,6 @@ static void test_op_kda(backend *ref, backend *tgt) {
 	nop_compare(OPFAM_KDA, label, y_ref, y_tgt, KDA_STEPS * KDA_DIM, st);
 	free(dt);
 }
-
-enum {
-	MLA_DIM	  = 64,
-	MLA_H	  = 4,
-	MLA_R	  = 16,
-	MLA_QK	  = 24,
-	MLA_VH	  = 16,
-	MLA_QL	  = 32,
-	MLA_STEPS = 3,
-};
-
-typedef struct {
-	float q_a[MLA_QL * MLA_DIM], q_b[MLA_H * MLA_QK * MLA_QL], kv_a[MLA_R * MLA_DIM];
-	float wo[MLA_DIM * MLA_H * MLA_VH];
-	float q_a_norm[MLA_QL], kv_a_norm[MLA_R];
-	float k_b[MLA_H * MLA_R * MLA_QK], v_b[MLA_H * MLA_VH * MLA_R];
-	float x[MLA_STEPS][MLA_DIM];
-} nop_mla_data;
-
-enum { MLA_W = 4, MLA_P = 4 };
 
 static status_code nop_mla_run(backend *b, const nop_mla_data *dt, float *out) {
 	buffer		 w[MLA_W];

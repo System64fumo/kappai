@@ -568,6 +568,13 @@ static size_t next_pretoken_unicode(const char *s, size_t len, size_t *pos, int 
 	return 1;
 }
 
+static void *bpe_take(uintptr_t *cursor, size_t align, size_t count, size_t elem_size) {
+	*cursor = (*cursor + (align - 1)) & ~(uintptr_t)(align - 1);
+	void *p = (void *)*cursor;
+	*cursor += count * elem_size;
+	return p;
+}
+
 static int32_t bpe_pair_rank(tokenizer *t, bpe_state *bs, int i) {
 	const piece *a = &bs->pcs[i];
 	const piece *b = &bs->pcs[bs->next[i]];
@@ -762,23 +769,16 @@ static int bpe_encode_uncached(tokenizer *t, const char *text, size_t len, int32
 	memset(&bs, 0, sizeof(bs));
 	{
 		uintptr_t cursor = (uintptr_t)t->bpe_work;
-#define BPE_TAKE(ptr, type, count)                                                                 \
-	do {                                                                                           \
-		cursor = (cursor + (_Alignof(type) - 1)) & ~(uintptr_t)(_Alignof(type) - 1);               \
-		(ptr)  = (type *)cursor;                                                                   \
-		cursor += (size_t)(count) * sizeof(type);                                                  \
-	} while (0)
-		BPE_TAKE(bs.prev, int, npcs);
-		BPE_TAKE(bs.next, int, npcs);
-		BPE_TAKE(bs.alive, uint8_t, npcs);
-		BPE_TAKE(bs.ver, uint32_t, npcs);
-		BPE_TAKE(bs.hrank, int32_t, heap_cap);
-		BPE_TAKE(bs.hnode, int, heap_cap);
-		BPE_TAKE(bs.hver, uint32_t, heap_cap);
-#undef BPE_TAKE
-		bs.pcs	= pcs;
-		bs.npcs = npcs;
-		bs.head = 0;
+		bs.prev			 = bpe_take(&cursor, _Alignof(int), (size_t)npcs, sizeof(int));
+		bs.next			 = bpe_take(&cursor, _Alignof(int), (size_t)npcs, sizeof(int));
+		bs.alive		 = bpe_take(&cursor, _Alignof(uint8_t), (size_t)npcs, sizeof(uint8_t));
+		bs.ver			 = bpe_take(&cursor, _Alignof(uint32_t), (size_t)npcs, sizeof(uint32_t));
+		bs.hrank		 = bpe_take(&cursor, _Alignof(int32_t), heap_cap, sizeof(int32_t));
+		bs.hnode		 = bpe_take(&cursor, _Alignof(int), heap_cap, sizeof(int));
+		bs.hver			 = bpe_take(&cursor, _Alignof(uint32_t), heap_cap, sizeof(uint32_t));
+		bs.pcs			 = pcs;
+		bs.npcs			 = npcs;
+		bs.head			 = 0;
 	}
 
 	for (int i = 0; i < npcs; i++) {
@@ -793,7 +793,7 @@ static int bpe_encode_uncached(tokenizer *t, const char *text, size_t len, int32
 			bpe_heap_push(&bs, r, i, 0);
 	}
 
-	ARR_ENSURE(t->bpe_arena, len, t->bpe_arena_cap);
+	arr_ensure((void **)&(t->bpe_arena), (len), &(t->bpe_arena_cap), sizeof(*(t->bpe_arena)));
 	size_t arena_cap  = t->bpe_arena_cap;
 	char  *arena	  = t->bpe_arena;
 	size_t arena_used = 0;

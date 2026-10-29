@@ -94,15 +94,15 @@ typedef struct {
 	const char		  *key;
 	const char		  *label;
 	const char		  *hint;
-	fld_type		   type;
 	size_t			   offset;
 	size_t			   max_len;
 	double			   lo;
 	double			   hi;
 	const char *const *choices;
+	fld_type		   type;
 	fld_uikind		   uik;
-	bool			   empty_all;
 	int				   multiple_of;
+	bool			   empty_all;
 } field_desc;
 
 typedef struct {

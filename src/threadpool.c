@@ -59,8 +59,7 @@ typedef struct {
 	_Atomic int		  job_end;
 	_Atomic int		  chunk_size;
 	_Atomic int		  n_workers;
-	/* High 32 bits: job epoch. Low 32: next unclaimed chunk start. One
-	 * atomic so a claim can never land on a newer job's range. */
+
 	_Atomic int64_t cursor_ep;
 	_Atomic int		executed;
 	_Atomic int		job_epoch;

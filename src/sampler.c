@@ -87,7 +87,7 @@ void sampler_free(sampler *s) {
 }
 
 void sampler_set_vocab(sampler *s, int vocab_size) {
-	ARR_ENSURE(s->logits_buf, vocab_size, s->buf_vocab);
+	arr_ensure((void **)&(s->logits_buf), (vocab_size), &(s->buf_vocab), sizeof(*(s->logits_buf)));
 }
 
 void sampler_set_params(sampler *s, float temp, int top_k, float top_p, float min_p,
@@ -237,7 +237,7 @@ static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
 		if (logits[i] * inv_temp > mx)
 			mx = logits[i] * inv_temp;
 
-	ARR_ENSURE(s->logits_buf, vocab, s->buf_vocab);
+	arr_ensure((void **)&(s->logits_buf), (vocab), &(s->buf_vocab), sizeof(*(s->logits_buf)));
 	float *exp = s->logits_buf;
 	double sum = 0.0;
 	for (int i = 0; i < vocab; i++) {
@@ -314,7 +314,7 @@ static int32_t sample_greedy(const float *logits, int vocab) {
 
 static int32_t sample_filtered(sampler *s, const float *logits, int vocab) {
 	int need_cands = (s->top_k > 0 && s->top_k < vocab) ? s->top_k : vocab;
-	ARR_ENSURE(s->cand_buf, need_cands, s->cand_vocab);
+	arr_ensure((void **)&(s->cand_buf), (need_cands), &(s->cand_vocab), sizeof(*(s->cand_buf)));
 	sampler_top_k_entry *arr  = s->cand_buf;
 	int					 kept = collect_candidates(s, logits, vocab, arr);
 	if (kept <= 0)

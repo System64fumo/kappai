@@ -533,15 +533,14 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 	return V_FAIL;
 }
 
-#define TIME_OP(call_expr, sync_b, out_us)                                                         \
-	do {                                                                                           \
-		uint64_t	_t0 = time_us();                                                               \
-		status_code _s	= (call_expr);                                                             \
-		if ((sync_b) && (sync_b)->synchronize)                                                     \
-			(sync_b)->synchronize(sync_b);                                                         \
-		*(out_us) = time_us() - _t0;                                                               \
-		(void)_s;                                                                                  \
-	} while (0)
+static status_code time_op(status_code (*call)(void), backend *sync_b, uint64_t *out_us) {
+	uint64_t	t0 = time_us();
+	status_code s  = call();
+	if (sync_b && sync_b->synchronize)
+		sync_b->synchronize(sync_b);
+	*out_us = time_us() - t0;
+	return s;
+}
 
 static uint64_t g_seed;
 uint32_t		next_u32(void) {

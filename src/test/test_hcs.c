@@ -136,7 +136,7 @@ static void test_enabled_flag(void) {
 
 	hcs_loader_init(&l);
 	hcs_loader_set(&l, -1, "devices", "cpu0", err, sizeof(err));
-	a  = hcs_loader_open_section(&l, "cpu0", err, sizeof(err));
+	(void)hcs_loader_open_section(&l, "cpu0", err, sizeof(err));
 	ok = hcs_loader_finish(&l, &h, err, sizeof(err)) == 0 && h.enabled;
 	record_hcs("enabled.defaults_on_when_section_present", ok, "enabled=%d", h.enabled);
 

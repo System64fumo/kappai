@@ -27,25 +27,81 @@ static const char *const repack_choices[]	= {
 static const char *const fuse_choices[] = {"qkv", NULL};
 
 #define S_STR(k, l, h, f, cap)                                                                     \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_TEXT, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_STR,                                                                           \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .max_len = cap,                                                                               \
+	 .uik	  = UIK_TEXT}
 #define S_PATH(k, l, h, f, cap)                                                                    \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_PATH, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_STR,                                                                           \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .max_len = cap,                                                                               \
+	 .uik	  = UIK_PATH}
 #define S_MULTI(k, l, h, f, cap, ch, ea)                                                           \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, ch, UIK_MULTI, ea}
-#define S_INT(k, l, h, f, lo, hi)                                                                  \
-	{k,	   l,		 h,	   FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),      \
-	 NULL, UIK_TEXT, false}
-#define S_INT_STEP(k, l, h, f, lo, hi, step)                                                       \
-	{k,	   l,		 h,		FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),     \
-	 NULL, UIK_TEXT, false, step}
-#define S_FLT(k, l, h, f, lo, hi)                                                                  \
-	{k, l, h, FLD_FLOAT, offsetof(saved_config, f), 0, (lo), (hi), NULL, UIK_TEXT, false}
+	{.key		= k,                                                                               \
+	 .label		= l,                                                                               \
+	 .hint		= h,                                                                               \
+	 .type		= FLD_STR,                                                                         \
+	 .offset	= offsetof(saved_config, f),                                                       \
+	 .max_len	= cap,                                                                             \
+	 .choices	= ch,                                                                              \
+	 .uik		= UIK_MULTI,                                                                       \
+	 .empty_all = ea}
+#define S_INT(k, l, h, f, lo_, hi_)                                                                \
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_INT,                                                                            \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .lo	 = (double)(lo_),                                                                      \
+	 .hi	 = (double)(hi_),                                                                      \
+	 .uik	 = UIK_TEXT}
+#define S_INT_STEP(k, l, h, f, lo_, hi_, step)                                                     \
+	{.key		  = k,                                                                             \
+	 .label		  = l,                                                                             \
+	 .hint		  = h,                                                                             \
+	 .type		  = FLD_INT,                                                                       \
+	 .offset	  = offsetof(saved_config, f),                                                     \
+	 .lo		  = (double)(lo_),                                                                 \
+	 .hi		  = (double)(hi_),                                                                 \
+	 .uik		  = UIK_TEXT,                                                                      \
+	 .multiple_of = step}
+#define S_FLT(k, l, h, f, lo_, hi_)                                                                \
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_FLOAT,                                                                          \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .lo	 = (lo_),                                                                              \
+	 .hi	 = (hi_),                                                                              \
+	 .uik	 = UIK_TEXT}
 #define S_BOOL(k, l, h, f)                                                                         \
-	{k, l, h, FLD_BOOL, offsetof(saved_config, f), 0, 0, 0, NULL, UIK_TEXT, false}
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_BOOL,                                                                           \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .uik	 = UIK_TEXT}
 #define S_ENUM(k, l, h, f, ch)                                                                     \
-	{k, l, h, FLD_ENUM, offsetof(saved_config, f), 0, 0, 0, ch, UIK_SELECT, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_ENUM,                                                                          \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .choices = ch,                                                                                \
+	 .uik	  = UIK_SELECT}
 #define S_U64(k, l, h, f)                                                                          \
-	{k, l, h, FLD_U64, offsetof(saved_config, f), 0, 0, 0, NULL, UIK_TEXT, false}
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_U64,                                                                            \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .uik	 = UIK_TEXT}
 
 static const field_desc MODEL_FIELDS[] = {
 	S_PATH("model", "Model path", "path to the GGUF model file", model, SC_PATH_MAX),

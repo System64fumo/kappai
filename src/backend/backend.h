@@ -7,6 +7,8 @@
 
 #define BACKEND_MAX 8
 
+#define BACKEND_DEVICE_NAME_MAX 64
+
 typedef struct backend		  backend;
 typedef struct cpu_cache_info cpu_cache_info;
 
@@ -495,8 +497,6 @@ status_code backend_create_best(backend **out);
 status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
-
-#define BACKEND_DEVICE_NAME_MAX 64
 
 int			backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
 bool		backend_device_is_host(const char *spec);

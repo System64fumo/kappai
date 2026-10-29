@@ -12,14 +12,8 @@
 #define VK_CHECK(expr)                                                                             \
 	do {                                                                                           \
 		VkResult _r = (expr);                                                                      \
-		if (_r != VK_SUCCESS) {                                                                    \
-			ERROR("vk: %s returned %d at %s:%d", #expr, (int)_r, __FILE__, __LINE__);              \
-			if (p && _r == VK_ERROR_DEVICE_LOST)                                                   \
-				p->device_lost = 1;                                                                \
-			if (p && p->debug.abort_on_error)                                                      \
-				abort();                                                                           \
-			return ERR_INTERNAL;                                                                   \
-		}                                                                                          \
+		if (_r != VK_SUCCESS)                                                                      \
+			return vk_check_fail(p, _r, #expr, __FILE__, __LINE__);                                \
 	} while (0)
 
 #define VK_DESC_CACHE_CAP 256
@@ -38,6 +32,11 @@
 #define VK_ATTN_DEC_MAX_SPLITS 64
 #define VK_ATTN_DEC_MIN_CHUNK 16
 #define VK_PROF_NAMES 128
+#define VK_DEAD_BUF_CAP 64
+#define VK_DIRTY_MAX 128
+#define VK_DIRTY_TABLE_SIZE 256
+#define VK_MOE_META_SLOTS 2
+#define VK_SCRATCH_POOL_CAP 32
 
 typedef enum {
 	VK_NN_LAYERNORM_MODULATE,
@@ -178,27 +177,77 @@ typedef struct {
 	VkDebugUtilsMessengerEXT debug_messenger;
 	VkPhysicalDevice		 phys;
 	VkDevice				 dev;
-	uint32_t				 queue_family;
 	VkQueue					 queue;
-	VkCommandPool			 cmd_pools[VK_RING_DEPTH];
 	VkCommandBuffer			 cmd;
 	VkDescriptorPool		 desc_pool;
 	VkFence					 fence;
-
-	int			 timeline_supported;
-	VkSemaphore	 timeline;
-	uint64_t	 timeline_value;
-	uint64_t	 timeline_completed;
-	vk_ring_slot ring[VK_RING_DEPTH];
-	int			 ring_cur;
-
-	VkPhysicalDeviceMemoryProperties mem_props;
-	vk_suballoc_block				*sub_blocks;
-	int								 sub_block_count;
-
-	int	   has_memory_budget_ext;
-	size_t device_local_allocated;
-
+	VkSemaphore				 timeline;
+	uint64_t				 timeline_value;
+	uint64_t				 timeline_completed;
+	vk_suballoc_block		*sub_blocks;
+	size_t					 device_local_allocated;
+	uint64_t				 desc_tick;
+	uint64_t				 total_desc_allocs;
+	VkPipeline				 last_pipeline;
+	const char				*last_pipeline_name;
+	VkDescriptorSet			 last_desc_set;
+	uint64_t				 diag_desc_allocs;
+	uint64_t				 diag_buf_allocs;
+	uint64_t				 stream_seq;
+	size_t					 attn_part_cap;
+	const float				*rope_cos_base_alt;
+	const float				*rope_sin_base_alt;
+	const float				*rope_cos_base;
+	const float				*rope_sin_base;
+	const float				*rope_ff_base;
+	buffer					*rope_cos_buf_active;
+	buffer					*rope_sin_buf_active;
+	size_t					 staging_cap;
+	size_t					 wbatch_off;
+	uint64_t				 staging_pending_value;
+	uint64_t				 last_signal_value;
+	uint64_t				 pending_free_after;
+	size_t					 argmax_partial_cap;
+	size_t					 moe_batch_arena_cap;
+	size_t					 moe_meta_cap;
+	void				   **kv_handles;
+	size_t					 xq_cap[2];
+	uint64_t				 tok_signal[BACKEND_TOKEN_REGS];
+	uint64_t				 moe_meta_signal[VK_MOE_META_SLOTS];
+	VkCommandPool			 cmd_pools[VK_RING_DEPTH];
+	struct {
+		const vk_buf *buf;
+		VkDeviceSize  off;
+		int			  k, m;
+		uint64_t	  seq;
+	} xq_fused;
+	buffer attn_part_buf;
+	buffer rope_cos_buf;
+	buffer rope_sin_buf;
+	buffer rope_ff_buf;
+	buffer rope_cos_buf_alt;
+	buffer rope_sin_buf_alt;
+	buffer attn_scores_buf;
+	buffer ffn_act_buf;
+	vk_buf staging_buf;
+	vk_buf tok_reg_buf;
+	vk_buf tok_rb_buf;
+	vk_buf argmax_partial_buf;
+	vk_buf moe_arena;
+	vk_buf moe_batch_arena;
+	vk_buf dummy_buf;
+	vk_buf iq3s_grid_buf;
+	vk_buf iqx_grid_buf;
+	struct {
+		uint64_t dispatches;
+		uint64_t barriers;
+		uint64_t submits;
+		uint64_t waits;
+		uint64_t uploads;
+		uint64_t downloads;
+		uint64_t wait_us;
+	} stats;
+	buffer xq_buf[2];
 	struct {
 		uint32_t	 max_shared_memory;
 		uint32_t	 max_workgroup_size[3];
@@ -217,38 +266,28 @@ typedef struct {
 		int			 supports_16bit_storage;
 		uint32_t	 max_workgroup_count[2];
 	} caps;
-
-	int		 pending_dispatches;
-	int		 cmd_recording;
-	uint64_t desc_tick;
-	uint64_t total_desc_allocs;
-
-	VkPipeline		last_pipeline;
-	const char	   *last_pipeline_name;
-	VkDescriptorSet last_desc_set;
-	int				last_desc_pipeline_match;
-
-#define VK_DEAD_BUF_CAP 64
-	VkBuffer dead_bufs[VK_DEAD_BUF_CAP];
-	int		 dead_buf_count;
-
+	vk_buf							 moe_meta_slots[VK_MOE_META_SLOTS];
+	vk_ring_slot					 ring[VK_RING_DEPTH];
+	vk_buf							*scratch_pool[VK_SCRATCH_POOL_CAP];
+	size_t							 scratch_pool_sizes[VK_SCRATCH_POOL_CAP];
+	VkBuffer						 dead_bufs[VK_DEAD_BUF_CAP];
+	VkBuffer						 read_set[VK_READ_SET_CAP];
+	VkPhysicalDeviceMemoryProperties mem_props;
+	VkBuffer						 dirty_table[VK_DIRTY_TABLE_SIZE];
+	struct {
+		int			 enabled;
+		VkQueryPool	 pool;
+		double		 ns_per_tick;
+		uint64_t	 ts_mask;
+		const char **rec;
+		int			 n_rec[VK_RING_DEPTH];
+		int			 reset_done[VK_RING_DEPTH];
+		const char	*names[VK_PROF_NAMES];
+		uint64_t	 ns[VK_PROF_NAMES];
+		uint64_t	 calls[VK_PROF_NAMES];
+		int			 n_names;
+	} prof;
 	VkDescriptorSet pending_free_sets[VK_DESC_CACHE_CAP * 4];
-	int				pending_free_count;
-	uint64_t		diag_desc_allocs;
-	uint64_t		diag_buf_allocs;
-
-#define VK_DIRTY_MAX 128
-#define VK_DIRTY_TABLE_SIZE 256
-	VkBuffer dirty_table[VK_DIRTY_TABLE_SIZE];
-	int		 dirty_count;
-
-	int matmul_wg_size;
-	int matmul_rows_per_thread;
-	int matmul_lanes_per_row;
-	int matmul_tile_k;
-	int matmul_m_per_wg;
-
-	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
 	vk_pipeline_set p_kv_put;
 	vk_pipeline_set p_kv_shift_gather;
 	vk_pipeline_set p_embd_lookup;
@@ -256,7 +295,6 @@ typedef struct {
 	vk_pipeline_set p_argmax_reduce;
 	vk_pipeline_set p_moe_gather;
 	vk_pipeline_set p_moe_combine;
-
 	vk_pipeline_set p_matmul_q4_0_batch;
 	vk_pipeline_set p_matmul_q4_0_res_batch;
 	vk_pipeline_set p_matmul_q4_0_dual_batch;
@@ -300,24 +338,8 @@ typedef struct {
 	vk_pipeline_set p_matmul_bf16_wide_batch;
 	vk_pipeline_set p_matmul_bf16_wide_res_batch;
 	vk_pipeline_set p_matmul_iq4_nl_batch;
-
-	int				qcore_ok;
-	vk_pipeline_set p_q8_quant[2];
-	vk_pipeline_set p_qmv[VQ_COUNT][2];
-	vk_pipeline_set p_qmm[VQ_MM_COUNT];
-	buffer			xq_buf[2];
-	struct {
-		const vk_buf *buf;
-		VkDeviceSize  off;
-		int			  k, m;
-		uint64_t	  seq;
-	} xq_fused;
-	uint64_t		stream_seq;
-	size_t			xq_cap[2];
 	vk_pipeline_set p_attn_decode;
 	vk_pipeline_set p_attn_merge;
-	buffer			attn_part_buf;
-	size_t			attn_part_cap;
 	vk_pipeline_set p_rmsnorm_batch;
 	vk_pipeline_set p_rmsnorm_sg_batch;
 	vk_pipeline_set p_rmsnorm_noweight_batch;
@@ -337,122 +359,59 @@ typedef struct {
 	vk_pipeline_set p_ffn_activate_batch;
 	vk_pipeline_set p_ffn_activate_fused_batch;
 	vk_pipeline_set p_elementwise_batch;
+	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_nn[VK_NN_COUNT];
-
-	buffer rope_cos_buf;
-	buffer rope_sin_buf;
-	buffer rope_ff_buf;
-	int	   rope_buf_cap;
-	int	   rope_ff_cap;
-
-	buffer		 rope_cos_buf_alt;
-	buffer		 rope_sin_buf_alt;
-	int			 rope_buf_cap_alt;
-	int			 rope_half_stored_alt;
-	const float *rope_cos_base_alt;
-	const float *rope_sin_base_alt;
-
-	int n_ctx_stored;
-	int kv_head_dim_max;
-
-	const float *rope_cos_base;
-	const float *rope_sin_base;
-	const float *rope_ff_base;
-	int			 rope_ff_head_dim;
-	int			 rope_ff_n_ctx;
-	float		 rope_ff_theta;
-	int			 rope_half_stored;
-
-	buffer *rope_cos_buf_active;
-	buffer *rope_sin_buf_active;
-
-	buffer attn_scores_buf;
-	int	   attn_scores_cap;
-
-	buffer ffn_act_buf;
-	int	   ffn_act_cap;
-
-	vk_buf	 staging_buf;
-	size_t	 staging_cap;
-	size_t	 wbatch_off;
-	int		 wbatch_count;
-	uint64_t staging_pending_value;
-	int		 staging_read_recorded;
-	uint64_t last_signal_value;
-	uint64_t pending_free_after;
-
-	vk_buf	 tok_reg_buf;
-	vk_buf	 tok_rb_buf;
-	uint64_t tok_signal[BACKEND_TOKEN_REGS];
-	int		 tok_pipe;
-	size_t	 argmax_partial_cap;
-	vk_buf	 argmax_partial_buf;
-
-	vk_buf moe_arena;
-	int	   moe_arena_inter;
-	int	   moe_arena_dim;
-	vk_buf moe_batch_arena;
-	size_t moe_batch_arena_cap;
-#define VK_MOE_META_SLOTS 2
-	vk_buf	 moe_meta_slots[VK_MOE_META_SLOTS];
-	size_t	 moe_meta_cap;
-	uint64_t moe_meta_signal[VK_MOE_META_SLOTS];
-	int		 moe_meta_cur;
-
-	vk_buf dummy_buf;
-
-	vk_buf iq3s_grid_buf;
-	vk_buf iqx_grid_buf;
-
-	void **kv_handles;
-	int	   kv_handle_count;
-	int	   kv_handle_cap;
-
-	int device_lost;
-
-	int device_lost_warned;
-
-#define VK_SCRATCH_POOL_CAP 32
-	vk_buf *scratch_pool[VK_SCRATCH_POOL_CAP];
-	size_t	scratch_pool_sizes[VK_SCRATCH_POOL_CAP];
-	int		scratch_pool_count;
-
-	int batch_active;
-
-	VkBuffer read_set[VK_READ_SET_CAP];
-	int		 n_read;
-	int		 read_overflow;
-
-	struct {
-		uint64_t dispatches;
-		uint64_t barriers;
-		uint64_t submits;
-		uint64_t waits;
-		uint64_t uploads;
-		uint64_t downloads;
-		uint64_t wait_us;
-	} stats;
-
-	struct {
-		int			 enabled;
-		VkQueryPool	 pool;
-		double		 ns_per_tick;
-		uint64_t	 ts_mask;
-		const char **rec;
-		int			 n_rec[VK_RING_DEPTH];
-		int			 reset_done[VK_RING_DEPTH];
-		const char	*names[VK_PROF_NAMES];
-		uint64_t	 ns[VK_PROF_NAMES];
-		uint64_t	 calls[VK_PROF_NAMES];
-		int			 n_names;
-	} prof;
-
+	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	vk_pipeline_set p_qmv[VQ_COUNT][2];
+	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
+	uint32_t		queue_family;
+	int				timeline_supported;
+	int				ring_cur;
+	int				sub_block_count;
+	int				has_memory_budget_ext;
+	int				pending_dispatches;
+	int				cmd_recording;
+	int				last_desc_pipeline_match;
+	int				dead_buf_count;
+	int				pending_free_count;
+	int				dirty_count;
+	int				matmul_wg_size;
+	int				matmul_rows_per_thread;
+	int				matmul_lanes_per_row;
+	int				matmul_tile_k;
+	int				matmul_m_per_wg;
+	int				qcore_ok;
+	int				rope_buf_cap;
+	int				rope_ff_cap;
+	int				rope_buf_cap_alt;
+	int				rope_half_stored_alt;
+	int				n_ctx_stored;
+	int				kv_head_dim_max;
+	int				rope_ff_head_dim;
+	int				rope_ff_n_ctx;
+	float			rope_ff_theta;
+	int				rope_half_stored;
+	int				attn_scores_cap;
+	int				ffn_act_cap;
+	int				wbatch_count;
+	int				staging_read_recorded;
+	int				tok_pipe;
+	int				moe_arena_inter;
+	int				moe_arena_dim;
+	int				moe_meta_cur;
+	int				kv_handle_count;
+	int				kv_handle_cap;
+	int				device_lost;
+	int				device_lost_warned;
+	int				scratch_pool_count;
+	int				batch_active;
+	int				n_read;
+	int				read_overflow;
 	struct {
 		int diag;
 		int abort_on_error;
 		int validate;
 	} debug;
-
 } vk_priv;
 
 static inline uint32_t vk_f32_to_bits(float f) {
@@ -505,6 +464,33 @@ static void		   vk_timeline_poll(vk_priv *p);
 static int		   vk_timeline_done(vk_priv *p, uint64_t value);
 
 static int g_probed = -1;
+
+#define VK_SUBALLOC_BLOCK_SIZE (64ull << 20)
+#define VK_SUBALLOC_MAX_REQ (4ull << 20)
+#define VK_SUBALLOC_MAX_BLOCKS 8
+
+#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
+
+#define VQ_MV(t, label)                                                                            \
+	{                                                                                              \
+		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
+			"q_matvec_" label, "q_matvec_m4_" label                                                \
+		}                                                                                          \
+	}
+#define VQ_MM(t, label) {shader_##t##_spv, sizeof(shader_##t##_spv), "q_matmul_" label}
+
+static const uint32_t VQ_MV_SPEC[2][2] = {{1, 4}, {VK_QMV_COLS, 2}};
+
+#define VK_WEIGHT_TAIL_PAD 32
+
+#define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
+#define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
+
+#define FLASH_MAX_DPL 16
+#define FLASH_MAX_SPLIT 64
+#define FLASH_K_PAD 4
+
+#define VK_DENSE_ATTN_MAX_HEAD_DIM 2048
 
 static const char *vk_result_str(int r) {
 	switch (r) {
@@ -678,6 +664,16 @@ static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, si
 	return ERR_UNSUPPORTED;
 }
 
+static status_code vk_check_fail(vk_priv *p, VkResult r, const char *expr, const char *file,
+								 int line) {
+	ERROR("vk: %s returned %d at %s:%d", expr, (int)r, file, line);
+	if (p && r == VK_ERROR_DEVICE_LOST)
+		p->device_lost = 1;
+	if (p && p->debug.abort_on_error)
+		abort();
+	return ERR_INTERNAL;
+}
+
 static uint32_t find_memory_type(vk_priv *p, uint32_t type_bits, VkMemoryPropertyFlags want) {
 	for (uint32_t i = 0; i < p->mem_props.memoryTypeCount; i++) {
 		if (!(type_bits & (1u << i)))
@@ -687,10 +683,6 @@ static uint32_t find_memory_type(vk_priv *p, uint32_t type_bits, VkMemoryPropert
 	}
 	return UINT32_MAX;
 }
-
-#define VK_SUBALLOC_BLOCK_SIZE (64ull << 20)
-#define VK_SUBALLOC_MAX_REQ (4ull << 20)
-#define VK_SUBALLOC_MAX_BLOCKS 8
 
 static void vk_suballoc_release(vk_priv *p, vk_buf *b) {
 	(void)p;
@@ -703,7 +695,8 @@ static void vk_suballoc_release(vk_priv *p, vk_buf *b) {
 		else
 			break;
 	}
-	ARR_RESERVE(blk->ranges, blk->n_ranges, blk->cap_ranges);
+	arr_reserve((void **)&(blk->ranges), (blk->n_ranges), &(blk->cap_ranges),
+				sizeof(*(blk->ranges)));
 	memmove(blk->ranges + pos + 1, blk->ranges + pos,
 			(size_t)(blk->n_ranges - pos) * sizeof(*blk->ranges));
 	blk->ranges[pos].off  = lo;
@@ -927,8 +920,6 @@ static void vk_flush_pending_desc_frees(vk_priv *p) {
 						 p->pending_free_sets);
 	p->pending_free_count = 0;
 }
-
-#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
 
 static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
 	if (i < 2)
@@ -1583,7 +1574,7 @@ static status_code vk_create_pipeline_spec(vk_priv *p, const uint32_t *spv, size
 	if (pr != VK_SUCCESS) {
 		ERROR("vk: vkCreateComputePipelines failed (result=%d).", (int)pr);
 		ERROR("vk:       Device maxComputeSharedMemorySize=%u bytes.", p->caps.max_shared_memory);
-		ERROR("vk:	 If the shader uses > %u bytes of shared memory, reduce the "
+		ERROR("vk:       If the shader uses > %u bytes of shared memory, reduce the "
 			  "tile size.",
 			  p->caps.max_shared_memory);
 		vkDestroyPipelineLayout(p->dev, out->layout, NULL);
@@ -2004,16 +1995,6 @@ static VkBool32 vk_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT	  sever
 	return VK_FALSE;
 }
 
-#define VQ_MV(t, label)                                                                            \
-	{                                                                                              \
-		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
-			"q_matvec_" label, "q_matvec_m4_" label                                                \
-		}                                                                                          \
-	}
-#define VQ_MM(t, label) {shader_##t##_spv, sizeof(shader_##t##_spv), "q_matmul_" label}
-
-static const uint32_t VQ_MV_SPEC[2][2] = {{1, 4}, {VK_QMV_COLS, 2}};
-
 static void vk_qcore_init(vk_priv *p) {
 	static const struct {
 		const uint32_t *spv;
@@ -2319,7 +2300,6 @@ static status_code vk_init(backend *self, int device_index) {
 	};
 	if (vkCreateDevice(p->phys, &dci, NULL, &p->dev) != VK_SUCCESS) {
 		timeline_available			= 0;
-		int8_available				= 0;
 		int16_available				= 0;
 		dot_product_available		= 0;
 		has_memory_budget_ext		= 0;
@@ -3084,7 +3064,8 @@ static vk_buf *vk_dummy_buf(vk_priv *p) {
 }
 
 static void vk_kv_registry_add(vk_priv *p, void *h) {
-	ARR_RESERVE(p->kv_handles, p->kv_handle_count, p->kv_handle_cap);
+	arr_reserve((void **)&(p->kv_handles), (p->kv_handle_count), &(p->kv_handle_cap),
+				sizeof(*(p->kv_handles)));
 	p->kv_handles[p->kv_handle_count++] = h;
 }
 
@@ -3159,11 +3140,6 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 
 	return OK;
 }
-
-#define VK_WEIGHT_TAIL_PAD 32
-
-#define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
-#define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
 
 static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const tensor_desc *desc, size_t size) {
 	for (size_t off = 0; off < size; off += VK_WEIGHT_STAGE_CHUNK_BYTES) {
@@ -5009,10 +4985,6 @@ static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 	return vk_ensure_scores_buf_batch(self, n_heads, n_ctx, 1);
 }
 
-#define FLASH_MAX_DPL 16
-#define FLASH_MAX_SPLIT 64
-#define FLASH_K_PAD 4
-
 static int vk_flash_layout(vk_priv *p, int head_dim, int n_groups, uint32_t spec[6]) {
 	const int sg = (int)p->caps.subgroup_size;
 	if (sg < 1 || head_dim < 1 || head_dim > 256 || n_groups < 1)
@@ -5512,8 +5484,6 @@ static status_code vk_rope_table(backend *self, buffer *x, const buffer *table, 
 	return vk_nn_dispatch(self, VK_NN_ROPE_TABLE, bufs, offs, 2, &push, sizeof(push),
 						  (total + 127) / 128, 1u << 0);
 }
-
-#define VK_DENSE_ATTN_MAX_HEAD_DIM 2048
 
 static status_code vk_attention_dense(backend *self, const dense_attention_desc *d) {
 	if (d->head_dim > VK_DENSE_ATTN_MAX_HEAD_DIM)

@@ -619,7 +619,8 @@ void context_slot_free(context *s) {
 }
 
 static void fed_ids_append(context *c, int32_t token) {
-	ARR_RESERVE(c->fed_ids.p, c->fed_ids.n, c->fed_ids.cap);
+	arr_reserve((void **)&(c->fed_ids.p), (c->fed_ids.n), &(c->fed_ids.cap),
+				sizeof(*(c->fed_ids.p)));
 	c->fed_ids.p[c->fed_ids.n++] = token;
 }
 
@@ -1407,7 +1408,7 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 }
 
 int32_t *context_ids_scratch(context *c, int n) {
-	ARR_ENSURE(c->ids_buf.p, n, c->ids_buf.cap);
+	arr_ensure((void **)&(c->ids_buf.p), (n), &(c->ids_buf.cap), sizeof(*(c->ids_buf.p)));
 	return c->ids_buf.p;
 }
 
@@ -1582,7 +1583,8 @@ static void *idle_prefill_thread(void *arg) {
 	memcpy(header, r1, header_bytes);
 	header[header_bytes] = '\0';
 
-	ARR_ENSURE(c->idle_ids_buf.p, c->n_ctx + 1, c->idle_ids_buf.cap);
+	arr_ensure((void **)&(c->idle_ids_buf.p), (c->n_ctx + 1), &(c->idle_ids_buf.cap),
+			   sizeof(*(c->idle_ids_buf.p)));
 	int32_t *ids = c->idle_ids_buf.p;
 	int n = tokenizer_encode_with_specials(&c->tok, header, 0, ids, c->n_ctx, &c->scratch.prof);
 	if (n < 0 || c->interrupt)
