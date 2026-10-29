@@ -15,8 +15,12 @@ typedef struct {
 	int	   rows;
 } text_encoding;
 
-status_code text_encoder_run(const text_encoder_spec *spec, const char *const *texts, int n,
+typedef struct text_encoder text_encoder;
+
+status_code text_encoder_open(const text_encoder_spec *spec, text_encoder **out);
+status_code text_encoder_run(text_encoder *enc, const char *const *texts, int n,
 							 text_encoding *out);
+void		text_encoder_close(text_encoder *enc);
 void		text_encoding_free(text_encoding *e);
 
 #endif

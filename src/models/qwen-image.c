@@ -136,7 +136,7 @@ typedef struct {
 	diffusion_model base;
 	backend		   *be;
 	gguf_ctx		dit;
-	char		   *llm_path;
+	text_encoder   *encoder;
 	char		   *device;
 	diffusion_vae  *vae;
 	int				hidden, heads, head_dim, inter, n_layers, in_channels, out_channels;
@@ -325,7 +325,7 @@ static void qwen_image_close(diffusion_model *dm) {
 	free(m->layers);
 	diffusion_vae_close(m->vae);
 	gguf_free(&m->dit);
-	free(m->llm_path);
+	text_encoder_close(m->encoder);
 	free(m->device);
 	if (m->be)
 		backend_destroy(m->be);
@@ -539,16 +539,9 @@ static status_code build_prefix(qwen_image *m, const float *hidden, int rows,
 
 static status_code qwen_image_encode(diffusion_model *dm, const char *const *texts, int n,
 									 diffusion_cond **out) {
-	qwen_image		 *m			   = (qwen_image *)dm;
-	text_encoder_spec spec		   = {.llm_path	   = m->llm_path,
-									  .device	   = m->device,
-									  .backend	   = m->be,
-									  .system	   = TEXT_SYSTEM,
-									  .user_prefix = TEXT_USER_PREFIX,
-									  .user_suffix = TEXT_USER_SUFFIX,
-									  .ctx_tokens  = TEXT_CTX_TOKENS};
-	text_encoding	  encodings[2] = {0};
-	status_code		  s			   = text_encoder_run(&spec, texts, n, encodings);
+	qwen_image	 *m			   = (qwen_image *)dm;
+	text_encoding encodings[2] = {0};
+	status_code	  s			   = text_encoder_run(m->encoder, texts, n, encodings);
 	for (int i = 0; i < n; i++) {
 		if (s == OK)
 			s = build_prefix(m, encodings[i].hidden, encodings[i].rows, &out[i]);
@@ -611,7 +604,6 @@ static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *
 	qwen_image *m = xcalloc(1, sizeof(*m));
 	m->base.ops	  = &qwen_image_ops;
 	m->dit		  = *dit;
-	m->llm_path	  = xstrdup(files->llm);
 	m->device	  = xstrdup(files->device);
 	if (cg_backend_open(m->device, &m->be) != OK) {
 		qwen_image_close(&m->base);
@@ -625,6 +617,17 @@ static diffusion_model *qwen_image_open(const diffusion_files *files, gguf_ctx *
 	}
 	m->vae = diffusion_vae_open(m->be, files->vae, &qwen_image_vae_stats);
 	if (!m->vae) {
+		qwen_image_close(&m->base);
+		return NULL;
+	}
+	text_encoder_spec spec = {.llm_path	   = files->llm,
+							  .device	   = m->device,
+							  .backend	   = m->be,
+							  .system	   = TEXT_SYSTEM,
+							  .user_prefix = TEXT_USER_PREFIX,
+							  .user_suffix = TEXT_USER_SUFFIX,
+							  .ctx_tokens  = TEXT_CTX_TOKENS};
+	if (text_encoder_open(&spec, &m->encoder) != OK) {
 		qwen_image_close(&m->base);
 		return NULL;
 	}

@@ -43,6 +43,8 @@ void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float 
 
 const char *status_str(status_code s);
 
+int mkdir_p(const char *path, char *err, size_t errlen);
+
 void  oom_abort(size_t bytes);
 void *xmalloc(size_t n);
 void *xmalloc_aligned(size_t n, size_t align);

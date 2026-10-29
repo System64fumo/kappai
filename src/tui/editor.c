@@ -3,6 +3,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "dialog.h"
+#include "diffusion/diffusion.h"
 #include "hcs.h"
 #include "ui.h"
 
@@ -27,6 +28,7 @@ typedef struct {
 	char		 probe_path[SC_PATH_MAX];
 	bool		 probed;
 	bool		 probe_ok;
+	bool		 probe_diffusion;
 	int			 n_layers;
 	int			 n_experts;
 	int			 n_kv_layers;
@@ -119,6 +121,8 @@ static bool editor_model_is_moe(const editor_state *st) {
 static bool editor_tab_visible(const editor_state *st, int tab) {
 	if (editor_tab_is_hcs(tab))
 		return true;
+	if (strcmp(editor_schema_tab(tab)->name, "diffusion") == 0)
+		return st->probe_diffusion;
 	if (strcmp(editor_schema_tab(tab)->name, "moe") != 0)
 		return true;
 	return editor_model_is_moe(st) && !st->sc.hcs.enabled;
@@ -444,6 +448,7 @@ static void editor_refresh_probe(editor_state *st) {
 	st->probed = true;
 	st->probe_ok =
 		hcs_probe_model(st->sc.model, &st->n_layers, &st->n_experts, &st->n_kv_layers) == 0;
+	st->probe_diffusion = diffusion_probe(st->sc.model);
 	editor_pools_build(st);
 	if (!editor_model_is_dense(st))
 		return;

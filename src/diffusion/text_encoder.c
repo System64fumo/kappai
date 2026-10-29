@@ -8,6 +8,13 @@
 
 #define PROMPT_MAX_CHARS 8192
 
+struct text_encoder {
+	context			  ctx;
+	text_encoder_spec spec;
+	int32_t			 *ids;
+	int				  skip;
+};
+
 static status_code encode_one(context *ctx, const text_encoder_spec *spec, const char *text,
 							  int skip, int32_t *ids, text_encoding *out) {
 	char prompt[PROMPT_MAX_CHARS];
@@ -30,8 +37,7 @@ static status_code encode_one(context *ctx, const text_encoder_spec *spec, const
 	return s;
 }
 
-status_code text_encoder_run(const text_encoder_spec *spec, const char *const *texts, int n,
-							 text_encoding *out) {
+status_code text_encoder_open(const text_encoder_spec *spec, text_encoder **out) {
 	config cfg		   = config_defaults();
 	cfg.model		   = spec->llm_path;
 	cfg.device		   = spec->device;
@@ -40,19 +46,36 @@ status_code text_encoder_run(const text_encoder_spec *spec, const char *const *t
 	cfg.debug		   = log_get_level() <= LOG_DEBUG;
 	config_init(&cfg);
 
-	context		ctx;
-	status_code s = context_init(&ctx, &cfg);
-	if (s != OK)
+	text_encoder *enc = xcalloc(1, sizeof(*enc));
+	status_code	  s	  = context_init(&enc->ctx, &cfg);
+	if (s != OK) {
+		free(enc);
 		return s;
+	}
+	enc->spec		   = *spec;
+	enc->spec.llm_path = NULL;
+	enc->spec.device   = NULL;
+	enc->ids		   = xmalloc((size_t)spec->ctx_tokens * sizeof(int32_t));
+	enc->skip		   = tokenizer_encode_with_specials(&enc->ctx.tok, spec->system, 0, enc->ids,
+														spec->ctx_tokens, NULL);
+	*out			   = enc;
+	return OK;
+}
 
-	int32_t *ids = xmalloc((size_t)spec->ctx_tokens * sizeof(int32_t));
-	int		 skip =
-		tokenizer_encode_with_specials(&ctx.tok, spec->system, 0, ids, spec->ctx_tokens, NULL);
+status_code text_encoder_run(text_encoder *enc, const char *const *texts, int n,
+							 text_encoding *out) {
+	status_code s = OK;
 	for (int i = 0; i < n && s == OK; i++)
-		s = encode_one(&ctx, spec, texts[i], skip, ids, &out[i]);
-	free(ids);
-	context_free(&ctx);
+		s = encode_one(&enc->ctx, &enc->spec, texts[i], enc->skip, enc->ids, &out[i]);
 	return s;
+}
+
+void text_encoder_close(text_encoder *enc) {
+	if (!enc)
+		return;
+	context_free(&enc->ctx);
+	free(enc->ids);
+	free(enc);
 }
 
 void text_encoding_free(text_encoding *e) {

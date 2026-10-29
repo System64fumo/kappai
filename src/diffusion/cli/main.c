@@ -1,26 +1,26 @@
-#include "diffusion/diffusion.h"
-#include "log.h"
+#include "diffusion/runner.h"
 
 #include <getopt.h>
 #include <stdio.h>
-
-#define MIN_DIMENSION_STEP 32
+#include <stdlib.h>
 
 static void usage(const char *prog) {
 	fprintf(stderr,
-			"usage: %s --diffusion-model PATH --vae PATH --llm PATH -p PROMPT [options]\n"
+			"usage: %s --diffusion-model PATH --vae PATH --llm PATH [-p PROMPT] [options]\n"
+			"  without -p an interactive session starts, each prompt generates a new image\n"
 			"  -n, --negative-prompt TEXT\n"
 			"  -W, --width N             (default 512, multiple of %d)\n"
 			"  -H, --height N            (default 512, multiple of %d)\n"
 			"      --steps N             (default 20)\n"
 			"      --cfg-scale F         (default 6.0)\n"
-			"      --seed N              (default 0)\n"
+			"      --seed N              (default 0 = random)\n"
 			"      --device SPEC         (default cpu0, e.g. vulkan0)\n"
-			"  -o, --out PATH            (default image.png)\n"
+			"  -o, --out PATH            exact output file, only with -p\n"
+			"      --out-dir DIR         (default ., images are named automatically)\n"
 			"      --out-preview PATH\n"
 			"      --preview-interval S  (default 1.0)\n"
 			"      --debug\n",
-			prog, MIN_DIMENSION_STEP, MIN_DIMENSION_STEP);
+			prog, DIFFUSION_DIMENSION_STEP, DIFFUSION_DIMENSION_STEP);
 }
 
 enum {
@@ -31,6 +31,7 @@ enum {
 	OPT_CFG,
 	OPT_SEED,
 	OPT_DEVICE,
+	OPT_OUT_DIR,
 	OPT_PREVIEW,
 	OPT_PREVIEW_INTERVAL,
 	OPT_DEBUG,
@@ -49,6 +50,7 @@ static const struct option long_opts[] = {
 	{"seed", required_argument, 0, OPT_SEED},
 	{"device", required_argument, 0, OPT_DEVICE},
 	{"out", required_argument, 0, 'o'},
+	{"out-dir", required_argument, 0, OPT_OUT_DIR},
 	{"out-preview", required_argument, 0, OPT_PREVIEW},
 	{"preview-interval", required_argument, 0, OPT_PREVIEW_INTERVAL},
 	{"debug", no_argument, 0, OPT_DEBUG},
@@ -57,7 +59,7 @@ static const struct option long_opts[] = {
 };
 
 static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_params *p,
-					   const char **out_path, bool *debug) {
+					   diffusion_output *out, bool *debug) {
 	int opt;
 	while ((opt = getopt_long(argc, argv, "p:n:W:H:o:h", long_opts, NULL)) != -1) {
 		switch (opt) {
@@ -95,7 +97,10 @@ static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_
 			files->device = optarg;
 			break;
 		case 'o':
-			*out_path = optarg;
+			out->path = optarg;
+			break;
+		case OPT_OUT_DIR:
+			out->dir = optarg;
 			break;
 		case OPT_PREVIEW:
 			p->preview_path = optarg;
@@ -110,13 +115,12 @@ static bool parse_args(int argc, char **argv, diffusion_files *files, diffusion_
 			return false;
 		}
 	}
-	return files->diffusion_model && files->vae && files->llm && p->prompt;
+	return files->diffusion_model != NULL;
 }
 
 int main(int argc, char **argv) {
 	diffusion_files	 files = {.device = "cpu0"};
 	diffusion_params p	   = {
-		.prompt			  = NULL,
 		.negative_prompt  = "",
 		.width			  = 512,
 		.height			  = 512,
@@ -124,40 +128,12 @@ int main(int argc, char **argv) {
 		.cfg_scale		  = 6.0f,
 		.preview_interval = 1.0f,
 	};
-	const char *out_path = "image.png";
-	bool		debug	 = false;
+	diffusion_output out   = {.dir = ".", .name = "image"};
+	bool			 debug = false;
 
-	if (!parse_args(argc, argv, &files, &p, &out_path, &debug)) {
+	if (!parse_args(argc, argv, &files, &p, &out, &debug)) {
 		usage(argv[0]);
 		return 1;
 	}
-	if (p.width <= 0 || p.height <= 0 || p.width % MIN_DIMENSION_STEP ||
-		p.height % MIN_DIMENSION_STEP || p.steps < 1) {
-		fprintf(stderr, "width and height must be multiples of %d and steps at least 1\n",
-				MIN_DIMENSION_STEP);
-		return 1;
-	}
-
-	log_init(log_default_config());
-	if (debug)
-		log_set_level(LOG_DEBUG);
-
-	char			 err[256] = {0};
-	diffusion_model *dm		  = diffusion_open(&files, err, sizeof(err));
-	if (!dm) {
-		ERROR("%s", err);
-		return 1;
-	}
-
-	diffusion_image img = {0};
-	status_code		s	= diffusion_generate(dm, &p, &img);
-	diffusion_close(dm);
-	if (s != OK) {
-		ERROR("generation failed: %s", status_str(s));
-		return 1;
-	}
-
-	s = diffusion_image_write_png(out_path, &img);
-	diffusion_image_free(&img);
-	return s == OK ? 0 : 1;
+	return diffusion_run(&files, &p, &out, debug);
 }

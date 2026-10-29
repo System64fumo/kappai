@@ -4,6 +4,10 @@
 #include "common.h"
 #include "gguf.h"
 
+#include <signal.h>
+
+#define DIFFUSION_DIMENSION_STEP 32
+
 typedef struct {
 	int		 width, height, channels;
 	uint8_t *pixels;
@@ -50,13 +54,14 @@ struct diffusion_model {
 };
 
 typedef struct {
-	const char *prompt;
-	const char *negative_prompt;
-	int			width, height, steps;
-	float		cfg_scale;
-	uint64_t	seed;
-	const char *preview_path;
-	float		preview_interval;
+	const char					*prompt;
+	const char					*negative_prompt;
+	int							 width, height, steps;
+	float						 cfg_scale;
+	uint64_t					 seed;
+	const char					*preview_path;
+	float						 preview_interval;
+	const volatile sig_atomic_t *interrupt;
 } diffusion_params;
 
 void diffusion_register(const diffusion_ops *ops);
@@ -66,6 +71,8 @@ void diffusion_register(const diffusion_ops *ops);
 		diffusion_register(ops_ptr);                                                               \
 	}
 
+bool			 diffusion_probe(const char *path);
+const char		*diffusion_params_error(const diffusion_params *p);
 diffusion_model *diffusion_open(const diffusion_files *files, char *err, size_t err_len);
 void			 diffusion_close(diffusion_model *dm);
 

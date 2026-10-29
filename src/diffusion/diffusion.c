@@ -16,23 +16,56 @@ void diffusion_register(const diffusion_ops *ops) {
 		g_registry[g_registry_count++] = ops;
 }
 
+static const diffusion_ops *diffusion_find_ops(const gguf_ctx *dit) {
+	for (int i = 0; i < g_registry_count; i++)
+		if (g_registry[i]->detect(dit))
+			return g_registry[i];
+	return NULL;
+}
+
+bool diffusion_probe(const char *path) {
+	if (!path || !*path)
+		return false;
+	gguf_ctx  dit;
+	log_level saved = log_get_level();
+	log_set_level((log_level)(LOG_ERROR + 1));
+	status_code s = gguf_load_metadata(&dit, path);
+	log_set_level(saved);
+	if (s != OK)
+		return false;
+	bool found = diffusion_find_ops(&dit) != NULL;
+	gguf_free(&dit);
+	return found;
+}
+
+#define DIFFUSION_STR_(x) #x
+#define DIFFUSION_STR(x) DIFFUSION_STR_(x)
+
+const char *diffusion_params_error(const diffusion_params *p) {
+	bool valid_size = p->width > 0 && p->height > 0 && p->width % DIFFUSION_DIMENSION_STEP == 0 &&
+					  p->height % DIFFUSION_DIMENSION_STEP == 0;
+	if (valid_size && p->steps >= 1)
+		return NULL;
+	return "width and height must be multiples of " DIFFUSION_STR(
+		DIFFUSION_DIMENSION_STEP) " and steps at least 1";
+}
+
 diffusion_model *diffusion_open(const diffusion_files *files, char *err, size_t err_len) {
 	gguf_ctx dit;
 	if (gguf_load(&dit, files->diffusion_model) != OK) {
 		snprintf(err, err_len, "cannot load '%s'", files->diffusion_model);
 		return NULL;
 	}
-	for (int i = 0; i < g_registry_count; i++) {
-		if (!g_registry[i]->detect(&dit))
-			continue;
-		diffusion_model *dm = g_registry[i]->open(files, &dit);
-		if (!dm)
-			snprintf(err, err_len, "failed to load %s", g_registry[i]->name);
-		return dm;
+	const diffusion_ops *ops = diffusion_find_ops(&dit);
+	if (!ops) {
+		snprintf(err, err_len, "'%s' is not a supported diffusion model", files->diffusion_model);
+		gguf_free(&dit);
+		return NULL;
 	}
-	snprintf(err, err_len, "'%s' is not a supported diffusion model", files->diffusion_model);
-	gguf_free(&dit);
-	return NULL;
+	diffusion_model *dm = ops->open(files, &dit);
+	if (!dm)
+		snprintf(err, err_len, "failed to load %s", ops->name);
+	return dm;
 }
 
 void diffusion_close(diffusion_model *dm) {
@@ -107,6 +140,10 @@ static status_code predict_guided(const diffusion_ops *ops, diffusion_model *dm,
 	return s;
 }
 
+static bool diffusion_interrupted(const diffusion_params *p) {
+	return p->interrupt && *p->interrupt;
+}
+
 status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 							   diffusion_image *out) {
 	const diffusion_ops *ops	 = dm->ops;
@@ -130,6 +167,10 @@ status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 
 	uint64_t last_preview = 0;
 	for (int i = 0; i < p->steps && s == OK; i++) {
+		if (diffusion_interrupted(p)) {
+			s = ERR_INTERRUPTED;
+			break;
+		}
 		uint64_t t0 = time_us();
 		s			= predict_guided(ops, dm, x, shape, sigmas[i], p->cfg_scale, cond, v, v_uncond);
 		if (s != OK)
