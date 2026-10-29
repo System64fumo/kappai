@@ -1163,12 +1163,12 @@ static status_code upload_bound_tensors(model *m, int li) {
 	for (struct model_tensor_binding *b = m->bindings; b; b = b->next) {
 		if (b->layer != li)
 			continue;
-		const gguf_tensor *t  = b->tensor;
-		status_code		   st = b->wc == WCLASS_MATMUL
-									? upload_one_repack_to(m, &b->ref, t->n_dims, t->dims[0],
-													   t->n_dims == 2 ? t->dims[1] : 1, b->wc, be)
-									: upload_one_to(m, &b->ref, t->type, t->n_dims, t->dims[0],
-												t->n_dims == 2 ? t->dims[1] : 1, b->wc, be);
+		const gguf_tensor *t = b->tensor;
+		status_code st = b->wc == WCLASS_MATMUL
+							 ? upload_one_repack_to(m, &b->ref, t->n_dims, t->dims[0],
+													t->n_dims == 2 ? t->dims[1] : 1, b->wc, be)
+							 : upload_one_to(m, &b->ref, t->type, t->n_dims, t->dims[0],
+											 t->n_dims == 2 ? t->dims[1] : 1, b->wc, be);
 		if (st != OK)
 			return st;
 	}

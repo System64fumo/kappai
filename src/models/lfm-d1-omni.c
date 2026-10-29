@@ -1,8 +1,6 @@
 #include "decision.h"
 #include "recipe.h"
 
-#include <ctype.h>
-#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -172,177 +170,12 @@ static model_recipe *omni_recipe(const model *m) {
 	return r;
 }
 
-static char *omni_escape(const char *text) {
-	str_builder out = {0};
-	for (const char *p = text; *p;) {
-		if (!strncmp(p, "<<d1omni:", 9)) {
-			sb_puts(&out, "<<d1omni ");
-			p += 9;
-			continue;
-		}
-		if (p[0] == '<' && p[1] == '|') {
-			const char *end = p + 2;
-			while (isalnum((unsigned char)*end) || *end == '_')
-				end++;
-			if (end > p + 2 && end[0] == '|' && end[1] == '>') {
-				sb_puts(&out, "<¦");
-				sb_putb(&out, p + 2, (size_t)(end - p - 2));
-				sb_puts(&out, "¦>");
-				p = end + 2;
-				continue;
-			}
-		}
-		sb_putb(&out, p++, 1);
-	}
-	return out.p ? out.p : xstrdup("");
-}
-
-static void omni_escape_values(jinja_value *v) {
-	if (v->type == JV_STRING) {
-		char *escaped = omni_escape(v->as.s);
-		free(v->as.s);
-		v->as.s = escaped;
-	} else if (v->type == JV_LIST) {
-		for (uint32_t i = 0; i < v->as.list.n; i++)
-			omni_escape_values(v->as.list.items[i]);
-	} else if (v->type == JV_DICT) {
-		for (jinja_dict_entry *e = v->as.dict; e; e = e->next) {
-			char *key = omni_escape(e->key);
-			free(e->key);
-			e->key = key;
-			omni_escape_values(e->val);
-		}
-	}
-}
-
-typedef struct {
-	int32_t *ids;
-	int		 n, cap;
-} omni_tokens;
-
-static status_code omni_tokenize(tokenizer *tok, const char *text, omni_tokens *tokens, int limit) {
-	for (;;) {
-		int n = tokenizer_encode_with_specials(tok, text, 0, tokens->ids, tokens->cap, NULL);
-		if (n >= 0) {
-			tokens->n = MIN(n, limit);
-			return OK;
-		}
-		size_t bytes = strlen(text);
-		if (bytes >= INT_MAX || tokens->cap > (int)bytes)
-			return ERR_INVALID_ARG;
-		tokens->cap = tokens->cap > (int)bytes / 2 ? (int)bytes + 1 : tokens->cap * 2;
-		tokens->ids = xrealloc(tokens->ids, (size_t)tokens->cap * sizeof(int32_t));
-	}
-}
-
-static status_code omni_prepare(context *c, jinja_program *tmpl, const decision_request *req,
-								const decision_question *q, omni_tokens *out) {
-	jinja_value *g = decision_prompt_values(req, q, NULL);
-	omni_escape_values(g);
-	jinja_dict_set(g, "audio", jinja_bool(false));
-	jinja_dict_set(g, "sep", jinja_string(OMNI_SEP));
-	jinja_dict_set(g, "mark_state", jinja_string(OMNI_STATE));
-	jinja_dict_set(g, "mark_question", jinja_string(OMNI_QUESTION));
-	jinja_dict_set(g, "mark_option", jinja_string(OMNI_OPTION));
-	char	   *prompt = NULL;
-	char		err[256];
-	status_code st = jinja_render(tmpl, g, &prompt, err, sizeof(err));
-	jinja_value_free(g);
-	if (st != OK) {
-		ERROR("lfm2-d1-omni: %s", err);
-		return st;
-	}
-	int32_t	   *prefix	 = xmalloc(OMNI_MAX_TOKENS * sizeof(int32_t));
-	int32_t	   *state	 = xmalloc(OMNI_MAX_TOKENS * sizeof(int32_t));
-	int			n_prefix = 0, n_state = 0, n_tail = 0;
-	int			budget	   = MAX(96, MIN(24 * q->n_options + 32, OMNI_MAX_TOKENS / 2));
-	int			option_max = MAX(2, (budget - 3 * q->n_options) / q->n_options);
-	omni_tokens span	   = {.ids = xmalloc(256 * sizeof(int32_t)), .cap = 256};
-	bool		has_state  = false;
-	out->ids			   = xmalloc(OMNI_MAX_TOKENS * sizeof(int32_t));
-	for (char *piece = prompt; piece;) {
-		char *next = strstr(piece, OMNI_SEP);
-		if (next)
-			*next = '\0';
-		int	 limit	  = OMNI_MAX_TOKENS;
-		bool is_state = !strncmp(piece, OMNI_STATE, strlen(OMNI_STATE));
-		if (is_state)
-			piece += strlen(OMNI_STATE);
-		else if (!strncmp(piece, OMNI_QUESTION, strlen(OMNI_QUESTION))) {
-			piece += strlen(OMNI_QUESTION);
-			limit = MAX(16, budget);
-		} else if (!strncmp(piece, OMNI_OPTION, strlen(OMNI_OPTION))) {
-			piece += strlen(OMNI_OPTION);
-			limit = option_max;
-		}
-		st = omni_tokenize(&c->tok, piece, &span, limit);
-		if (st != OK)
-			break;
-		if (is_state) {
-			if (has_state) {
-				st = ERR_FORMAT;
-				break;
-			}
-			memcpy(state, span.ids, (size_t)span.n * sizeof(int32_t));
-			n_state	  = span.n;
-			has_state = true;
-		} else {
-			int		*n	 = has_state ? &n_tail : &n_prefix;
-			int32_t *dst = has_state ? out->ids : prefix;
-			if (*n + span.n > OMNI_MAX_TOKENS) {
-				st = ERR_INVALID_ARG;
-				break;
-			}
-			memcpy(dst + *n, span.ids, (size_t)span.n * sizeof(int32_t));
-			*n += span.n;
-		}
-		piece = next ? next + strlen(OMNI_SEP) : NULL;
-	}
-	if (!has_state || n_prefix + n_tail > OMNI_MAX_TOKENS)
-		st = ERR_FORMAT;
-	n_state = MIN(n_state, MAX(0, OMNI_MAX_TOKENS - n_prefix - n_tail));
-	out->n	= n_prefix + n_state + n_tail;
-	if (out->n > c->n_ctx)
-		st = ERR_INVALID_ARG;
-	if (st == OK) {
-		memmove(out->ids + n_prefix + n_state, out->ids, (size_t)n_tail * sizeof(int32_t));
-		memcpy(out->ids, prefix, (size_t)n_prefix * sizeof(int32_t));
-		memcpy(out->ids + n_prefix, state, (size_t)n_state * sizeof(int32_t));
-	}
-	free(span.ids);
-	free(prefix);
-	free(state);
-	free(prompt);
-	return st;
-}
-
-static status_code omni_scores(context *c, jinja_program *tmpl, const decision_request *req,
-							   const decision_question *q, float *scores, int *n_tokens) {
-	omni_tokens tokens = {0};
-	status_code st	   = omni_prepare(c, tmpl, req, q, &tokens);
-	if (st != OK) {
-		free(tokens.ids);
-		return st;
-	}
-	int		 marker	 = tokenizer_find_token(&c->tok, "<|mask|>");
-	uint8_t *outputs = xcalloc((size_t)tokens.n, 1);
-	int		 n		 = 0;
-	for (int i = 0; i < tokens.n; i++) {
-		outputs[i] = tokens.ids[i] == marker;
-		n += outputs[i];
-	}
-	if (marker < 0 || n != q->n_options)
-		st = ERR_FORMAT;
-	else if (c->interrupt)
-		st = ERR_INTERRUPTED;
-	else
-		st = compute_forward_sequence_recipe(&c->m, &c->scratch, tokens.ids, tokens.n, outputs,
-											 q->type, c->flash_attn, scores);
-	if (st == OK)
-		*n_tokens += tokens.n;
-	free(outputs);
-	free(tokens.ids);
-	return st;
+static void omni_limits(const decision_question *q, decision_limits *lim) {
+	int budget	  = MAX(96, MIN(24 * q->n_options + 32, OMNI_MAX_TOKENS / 2));
+	lim->plain	  = OMNI_MAX_TOKENS;
+	lim->question = MAX(16, budget);
+	lim->option	  = MAX(2, (budget - 3 * q->n_options) / q->n_options);
+	lim->total	  = OMNI_MAX_TOKENS;
 }
 
 static const model_variant omni_variant = {
@@ -352,10 +185,17 @@ static const model_variant omni_variant = {
 };
 
 static const decision_ops omni_ops = {
-	.type		 = "lfm2-d1-omni",
-	.max_options = OMNI_MAX_OPTIONS,
-	.variant	 = &omni_variant,
-	.scores		 = omni_scores,
+	.type		   = "lfm2-d1-omni",
+	.max_options   = OMNI_MAX_OPTIONS,
+	.variant	   = &omni_variant,
+	.escape		   = true,
+	.sep		   = OMNI_SEP,
+	.state_mark	   = OMNI_STATE,
+	.question_mark = OMNI_QUESTION,
+	.option_mark   = OMNI_OPTION,
+	.score_mark	   = "<|mask|>",
+	.limits		   = omni_limits,
+	.forward	   = decision_forward_masked,
 };
 
 DECISION_REGISTER(lfm2_d1_omni, &omni_ops)

@@ -735,8 +735,8 @@ status_code cpu_rope_cs_cached(cpu_priv *p, int head_dim, int pos, float theta,
 cpu_attn_batch_job cpu_full_attn_job(backend *self, const buffer *q, const buffer *k,
 									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
 									 int head_dim, int n_rows, int flash_attn, float scale);
-status_code		   cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
-											const buffer *v, buffer *out, int n_heads, int n_kv_heads,
-											int head_dim, int n_rows, int flash_attn, float scale);
+status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffer *k,
+									 const buffer *v, buffer *out, int n_heads, int n_kv_heads,
+									 int head_dim, int n_rows, int flash_attn, float scale);
 
 #endif

@@ -42,13 +42,13 @@ status_code op_layernorm(exec_ctx *ctx) {
 	int				 n	   = op->u.layernorm.n;
 	int				 total = n * ctx->rows.n_rows;
 	layernorm_job	 job   = {
-			 .x	   = recipe_slot_read_f32(ctx, op->in[0], &ctx->s->run.stage_a, total),
-			 .w	   = encoder_weight(ctx, op->w_idx, &ctx->s->run.op_ws, n),
-			 .bias = encoder_weight(ctx, op->u.layernorm.bias_idx, &ctx->s->run.scale_tmp, n),
-			 .out  = recipe_slot_write_stage(ctx, op->out, &ctx->s->run.stage_b, total),
-			 .n	   = n,
-			 .eps  = op->u.layernorm.eps,
-	 };
+		.x	  = recipe_slot_read_f32(ctx, op->in[0], &ctx->s->run.stage_a, total),
+		.w	  = encoder_weight(ctx, op->w_idx, &ctx->s->run.op_ws, n),
+		.bias = encoder_weight(ctx, op->u.layernorm.bias_idx, &ctx->s->run.scale_tmp, n),
+		.out  = recipe_slot_write_stage(ctx, op->out, &ctx->s->run.stage_b, total),
+		.n	  = n,
+		.eps  = op->u.layernorm.eps,
+	};
 	if (!job.x || !job.w || !job.bias || !job.out)
 		return ERR_INVALID_ARG;
 	tpool *pool = model_get_pool(ctx->m);

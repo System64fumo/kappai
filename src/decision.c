@@ -1,8 +1,11 @@
 #include "decision.h"
 #include "chat_template.h"
+#include "jinja.h"
 #include "json_helpers.h"
 #include "log.h"
+#include "recipe.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -296,16 +299,187 @@ jinja_value *decision_prompt_values(const decision_request *req, const decision_
 	return g;
 }
 
-static status_code render_prompt(const decision_model *dm, const decision_request *req,
-								 const decision_question *q, const decision_label *labels,
-								 char **out) {
-	jinja_value *g = decision_prompt_values(req, q, labels);
-	char		 errbuf[256];
-	status_code	 rc = jinja_render(dm->tmpl, g, out, errbuf, sizeof(errbuf));
+static char *escape_marks(const char *text) {
+	str_builder out = {0};
+	for (const char *p = text; *p;) {
+		if (!strncmp(p, "<<d1omni:", 9)) {
+			sb_puts(&out, "<<d1omni ");
+			p += 9;
+			continue;
+		}
+		if (p[0] == '<' && p[1] == '|') {
+			const char *end = p + 2;
+			while (isalnum((unsigned char)*end) || *end == '_')
+				end++;
+			if (end > p + 2 && end[0] == '|' && end[1] == '>') {
+				sb_puts(&out, "<¦");
+				sb_putb(&out, p + 2, (size_t)(end - p - 2));
+				sb_puts(&out, "¦>");
+				p = end + 2;
+				continue;
+			}
+		}
+		sb_putb(&out, p++, 1);
+	}
+	return out.p ? out.p : xstrdup("");
+}
+
+static void escape_marks_values(jinja_value *v) {
+	if (v->type == JV_STRING) {
+		char *escaped = escape_marks(v->as.s);
+		free(v->as.s);
+		v->as.s = escaped;
+	} else if (v->type == JV_LIST) {
+		for (uint32_t i = 0; i < v->as.list.n; i++)
+			escape_marks_values(v->as.list.items[i]);
+	} else if (v->type == JV_DICT) {
+		for (jinja_dict_entry *e = v->as.dict; e; e = e->next) {
+			char *key = escape_marks(e->key);
+			free(e->key);
+			e->key = key;
+			escape_marks_values(e->val);
+		}
+	}
+}
+
+static status_code decision_encode(tokenizer *tok, const char *text, profile *prof,
+								   int32_t **out_ids, int *out_n) {
+	size_t	 cap = strlen(text) + 1;
+	int32_t *ids = xmalloc(cap * sizeof(int32_t));
+	int		 n	 = tokenizer_encode_with_specials(tok, text, 0, ids, (int)cap, prof);
+	if (n < 0) {
+		free(ids);
+		return ERR_INVALID_ARG;
+	}
+	*out_ids = ids;
+	*out_n	 = n;
+	return OK;
+}
+
+static status_code decision_assemble(tokenizer *tok, char *prompt, const decision_ops *ops,
+									 const decision_limits *lim, int32_t **out_ids, int *out_n) {
+	int			total	 = lim->total;
+	int32_t	   *ids		 = xmalloc((size_t)total * sizeof(int32_t));
+	int32_t	   *prefix	 = xmalloc((size_t)total * sizeof(int32_t));
+	int32_t	   *state	 = xmalloc((size_t)total * sizeof(int32_t));
+	int32_t	   *span	 = xmalloc((strlen(prompt) + 1) * sizeof(int32_t));
+	int			n_prefix = 0, n_state = 0, n_tail = 0;
+	bool		has_state = false;
+	status_code st		  = OK;
+	for (char *piece = prompt; piece && st == OK;) {
+		char *next = ops->sep ? strstr(piece, ops->sep) : NULL;
+		if (next)
+			*next = '\0';
+		int	 limit	  = lim->plain;
+		bool is_state = false;
+		if (ops->state_mark && !strncmp(piece, ops->state_mark, strlen(ops->state_mark))) {
+			is_state = true;
+			piece += strlen(ops->state_mark);
+		} else if (ops->question_mark &&
+				   !strncmp(piece, ops->question_mark, strlen(ops->question_mark))) {
+			piece += strlen(ops->question_mark);
+			limit = lim->question;
+		} else if (ops->option_mark &&
+				   !strncmp(piece, ops->option_mark, strlen(ops->option_mark))) {
+			piece += strlen(ops->option_mark);
+			limit = lim->option;
+		}
+		int n_span =
+			tokenizer_encode_with_specials(tok, piece, 0, span, (int)strlen(piece) + 1, NULL);
+		if (n_span < 0) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		n_span = MIN(n_span, limit);
+		if (is_state) {
+			if (has_state) {
+				st = ERR_FORMAT;
+				break;
+			}
+			memcpy(state, span, (size_t)n_span * sizeof(int32_t));
+			n_state	  = n_span;
+			has_state = true;
+		} else {
+			int		*n	 = has_state ? &n_tail : &n_prefix;
+			int32_t *dst = has_state ? ids : prefix;
+			if (*n + n_span > total) {
+				st = ERR_INVALID_ARG;
+				break;
+			}
+			memcpy(dst + *n, span, (size_t)n_span * sizeof(int32_t));
+			*n += n_span;
+		}
+		piece = next ? next + strlen(ops->sep) : NULL;
+	}
+	if (st == OK && ops->state_mark && !has_state)
+		st = ERR_FORMAT;
+	if (st == OK && n_prefix + n_state + n_tail > total)
+		st = ERR_INVALID_ARG;
+	if (st == OK) {
+		memmove(ids + n_prefix + n_state, ids, (size_t)n_tail * sizeof(int32_t));
+		memcpy(ids, prefix, (size_t)n_prefix * sizeof(int32_t));
+		memcpy(ids + n_prefix, state, (size_t)n_state * sizeof(int32_t));
+		*out_n	 = n_prefix + n_state + n_tail;
+		*out_ids = ids;
+		ids		 = NULL;
+	}
+	free(ids);
+	free(prefix);
+	free(state);
+	free(span);
+	return st;
+}
+
+static status_code decision_build(const decision_model *dm, context *c, const decision_request *req,
+								  const decision_question *q, const decision_label *labels,
+								  int32_t **out_ids, int *out_n) {
+	const decision_ops *ops = dm->ops;
+	jinja_value		   *g	= decision_prompt_values(req, q, labels);
+	if (ops->escape)
+		escape_marks_values(g);
+	jinja_dict_set(g, "audio", jinja_bool(false));
+	if (ops->sep)
+		jinja_dict_set(g, "sep", jinja_string(ops->sep));
+	if (ops->state_mark)
+		jinja_dict_set(g, "mark_state", jinja_string(ops->state_mark));
+	if (ops->question_mark)
+		jinja_dict_set(g, "mark_question", jinja_string(ops->question_mark));
+	if (ops->option_mark)
+		jinja_dict_set(g, "mark_option", jinja_string(ops->option_mark));
+	char	   *prompt = NULL;
+	char		err[256];
+	status_code st = jinja_render(dm->tmpl, g, &prompt, err, sizeof(err));
 	jinja_value_free(g);
-	if (rc != OK)
-		ERROR("decision: systemone template render failed: %s", errbuf);
-	return rc;
+	if (st != OK) {
+		ERROR("decision: systemone template render failed: %s", err);
+		return st;
+	}
+	decision_limits lim = {.total = c->n_ctx};
+	if (ops->limits)
+		ops->limits(q, &lim);
+	if (lim.plain < 1)
+		lim.plain = lim.total;
+	if (lim.question < 1)
+		lim.question = lim.total;
+	if (lim.option < 1)
+		lim.option = lim.total;
+	if (ops->sep) {
+		*out_n	 = 0;
+		*out_ids = NULL;
+		st		 = decision_assemble(&c->tok, prompt, ops, &lim, out_ids, out_n);
+		if (st == OK && *out_n > c->n_ctx) {
+			ERROR("decision: prompt of %d tokens does not fit the context of %d", *out_n, c->n_ctx);
+			st = ERR_INVALID_ARG;
+		}
+	} else {
+		st = decision_encode(&c->tok, prompt, &c->scratch.prof, out_ids, out_n);
+		if (st == OK && (*out_n <= 0 || *out_n >= c->n_ctx)) {
+			ERROR("decision: prompt of %d tokens does not fit the context of %d", *out_n, c->n_ctx);
+			st = ERR_INVALID_ARG;
+		}
+	}
+	free(prompt);
+	return st;
 }
 
 static void softmax_scores(const float *scores, int n, float temperature, double *probs) {
@@ -391,49 +565,76 @@ static json_object *answer_json(const decision_question *q, const double *probs)
 	return ans;
 }
 
-static status_code question_scores(const decision_model *dm, context *c,
-								   const decision_request *req, const decision_question *q,
-								   float *scores, int *n_tokens) {
-	if (dm->ops->scores)
-		return dm->ops->scores(c, dm->tmpl, req, q, scores, n_tokens);
-	decision_label *labels = xcalloc((size_t)q->n_options, sizeof(*labels));
-	char		   *prompt = NULL;
-	int32_t		   *ids	   = NULL;
-	status_code		rc	   = dm->ops->labels(&c->tok, q, labels);
-	if (rc == OK)
-		rc = render_prompt(dm, req, q, labels, &prompt);
-	if (rc != OK)
-		goto out;
-
-	int cap = (int)strlen(prompt) + 1;
-	ids		= xmalloc((size_t)cap * sizeof(*ids));
-	int n	= tokenizer_encode_with_specials(&c->tok, prompt, 0, ids, cap, &c->scratch.prof);
-	if (n <= 0 || n >= c->n_ctx) {
-		ERROR("decision: prompt of %d tokens does not fit the context of %d", n, c->n_ctx);
-		rc = ERR_INVALID_ARG;
-		goto out;
-	}
-
+status_code decision_forward_prefill(const decision_model *dm, context *c, const int32_t *ids,
+									 int n, const decision_question *q,
+									 const decision_label *labels, float *scores, int *n_tokens) {
+	(void)dm;
+	if (!labels)
+		return ERR_INVALID_ARG;
 	context_reset(c);
 	c->interrupt = 0;
 	int fed		 = context_prefill_tokens(c, ids, n, "decision", true).rc;
 	if (fed < 0) {
-		rc = (status_code)fed;
-		if (rc == ERR_COMPUTE_FAIL)
+		if ((status_code)fed == ERR_COMPUTE_FAIL)
 			c->session_poisoned = true;
-		goto out;
+		return (status_code)fed;
 	}
-
 	for (int i = 0; i < q->n_options; i++) {
 		scores[i] = c->scratch.logits_host[labels[i].tok[0]];
 		for (int t = 1; t < labels[i].n_tok; t++)
 			scores[i] = MAX(scores[i], c->scratch.logits_host[labels[i].tok[t]]);
 	}
 	*n_tokens += n;
+	return OK;
+}
 
+status_code decision_forward_masked(const decision_model *dm, context *c, const int32_t *ids, int n,
+									const decision_question *q, const decision_label *labels,
+									float *scores, int *n_tokens) {
+	(void)labels;
+	int32_t		marker = tokenizer_find_token(&c->tok, dm->ops->score_mark);
+	status_code st	   = ERR_FORMAT;
+	if (marker >= 0) {
+		uint8_t *outputs = xcalloc((size_t)n, 1);
+		int		 count	 = 0;
+		for (int i = 0; i < n; i++) {
+			outputs[i] = ids[i] == marker;
+			count += outputs[i];
+		}
+		if (count != q->n_options)
+			st = ERR_FORMAT;
+		else if (c->interrupt)
+			st = ERR_INTERRUPTED;
+		else {
+			st = compute_forward_sequence_recipe(&c->m, &c->scratch, ids, n, outputs, (int)q->type,
+												 c->flash_attn, scores);
+			if (st == OK)
+				*n_tokens += n;
+		}
+		free(outputs);
+	} else
+		ERROR("decision: score mark '%s' is not a single token", dm->ops->score_mark);
+	return st;
+}
+
+static status_code question_scores(const decision_model *dm, context *c,
+								   const decision_request *req, const decision_question *q,
+								   float *scores, int *n_tokens) {
+	decision_label *labels = NULL;
+	int32_t		   *ids	   = NULL;
+	int				n	   = 0;
+	status_code		rc;
+	if (dm->ops->labels) {
+		labels = xcalloc((size_t)q->n_options, sizeof(*labels));
+		rc	   = dm->ops->labels(&c->tok, q, labels);
+		if (rc != OK)
+			goto out;
+	}
+	rc = decision_build(dm, c, req, q, labels, &ids, &n);
+	if (rc == OK)
+		rc = dm->ops->forward(dm, c, ids, n, q, labels, scores, n_tokens);
 out:
 	free(labels);
-	free(prompt);
 	free(ids);
 	return rc;
 }

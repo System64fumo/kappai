@@ -30,12 +30,20 @@ typedef struct {
 enum { DECISION_LABEL_FORMS = 3 };
 
 typedef struct {
+	int plain;
+	int question;
+	int option;
+	int total;
+} decision_limits;
+
+typedef struct {
 	char	code[8];
 	int32_t tok[DECISION_LABEL_FORMS];
 	int		n_tok;
 } decision_label;
 
 typedef struct decision_request decision_request;
+typedef struct decision_model	decision_model;
 
 typedef struct {
 	const char *type;
@@ -43,11 +51,17 @@ typedef struct {
 	bool		true_first;
 	status_code (*labels)(tokenizer *tok, const decision_question *q, decision_label *out);
 	const model_variant *variant;
-	status_code (*scores)(context *c, jinja_program *tmpl, const decision_request *req,
-						  const decision_question *q, float *scores, int *n_tokens);
+	bool				 escape;
+	const char			*sep;
+	const char			*state_mark;
+	const char			*question_mark;
+	const char			*option_mark;
+	const char			*score_mark;
+	void (*limits)(const decision_question *q, decision_limits *out);
+	status_code (*forward)(const decision_model *dm, context *c, const int32_t *ids, int n,
+						   const decision_question *q, const decision_label *labels, float *scores,
+						   int *n_tokens);
 } decision_ops;
-
-typedef struct decision_model decision_model;
 
 struct decision_request {
 	decision_question *questions;
@@ -85,5 +99,13 @@ jinja_value *decision_prompt_values(const decision_request *req, const decision_
 									const decision_label *labels);
 
 int32_t decision_single_token(tokenizer *tok, const char *text);
+
+status_code decision_forward_prefill(const decision_model *dm, context *c, const int32_t *ids,
+									 int n, const decision_question *q,
+									 const decision_label *labels, float *scores, int *n_tokens);
+
+status_code decision_forward_masked(const decision_model *dm, context *c, const int32_t *ids, int n,
+									const decision_question *q, const decision_label *labels,
+									float *scores, int *n_tokens);
 
 #endif
