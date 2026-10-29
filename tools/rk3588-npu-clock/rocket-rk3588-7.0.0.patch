@@ -1,0 +1,840 @@
+--- a/drivers/accel/rocket/rocket_core.c
++++ b/drivers/accel/rocket/rocket_core.c
+@@ -7,12 +7,26 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/iommu.h>
++#include <linux/moduleparam.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ 
+ #include "rocket_core.h"
++#include "rocket_drv.h"
+ #include "rocket_job.h"
++
++/*
++ * Deadline for the clock park below (see rocket_device_runtime_suspend() in
++ * rocket_drv.c). The stock 50 ms is too eager once the park exists: it fires
++ * INSIDE a single inference, not just between inferences. 0 leaves the PM core's
++ * own default untouched.
++ */
++static unsigned int rocket_autosuspend_ms = 1000;
++module_param(rocket_autosuspend_ms, uint, 0644);
++MODULE_PARM_DESC(rocket_autosuspend_ms,
++	"runtime-PM autosuspend delay in ms (default 1000; 0 = leave the PM core default)");
+ 
+ int rocket_core_init(struct rocket_core *core)
+ {
+@@ -28,9 +42,52 @@
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get resets for core %d\n", core->index);
+ 
++	core->clks[0].id = "aclk";
++	core->clks[1].id = "hclk";
++	core->clks[2].id = "npu";
++	core->clks[3].id = "pclk";
+ 	err = devm_clk_bulk_get(dev, ARRAY_SIZE(core->clks), core->clks);
+ 	if (err)
+ 		return dev_err_probe(dev, err, "failed to get clocks for core %d\n", core->index);
++
++	/*
++	 * Acquire the shared SCMI NPU compute clock ("npu") once, for the device
++	 * lifetime, so the rocket_npu_clk_hz re-rate in runtime-resume/suspend
++	 * needs no per-transition clk_get/clk_put (mirrors the npu_supply
++	 * regulator acquisition). It is only RE-RATED from runtime-resume, never
++	 * set cold (that wedges SCMI). Optional: a board without the clock just
++	 * runs stock 200 MHz and never fails to probe -- the "degrade, don't
++	 * disrupt" rule of the clock lever. -EPROBE_DEFER is propagated so the
++	 * clock is retried once its provider is up.
++	 */
++	core->npu_clk = devm_clk_get_optional(dev, "npu");
++	if (IS_ERR(core->npu_clk)) {
++		if (PTR_ERR(core->npu_clk) == -EPROBE_DEFER)
++			return PTR_ERR(core->npu_clk);
++		dev_info(dev, "rocket: no \"npu\" clock (%ld); NPU clock scaling disabled\n",
++			 PTR_ERR(core->npu_clk));
++		core->npu_clk = NULL;
++	}
++
++	/*
++	 * Acquire the NPU rail (DT "npu-supply" = vdd_npu_s0) once, for the
++	 * device lifetime, so the voltage vote we cast when the clock is raised
++	 * persists (see struct rocket_core / rocket_drv.c). The rail is also
++	 * pd_npu's domain-supply, so the genpd enables it -- we never enable it
++	 * here, only scale its voltage. Optional: a board without the supply
++	 * just runs clock-only, never failing to probe -- mirroring the "degrade,
++	 * don't disrupt" rule of the clock path. -EPROBE_DEFER (the PMIC has not
++	 * probed yet) is the one error we propagate, so the supply is retried
++	 * rather than silently and permanently collapsed to clock-only.
++	 */
++	core->npu_supply = devm_regulator_get_optional(dev, "npu");
++	if (IS_ERR(core->npu_supply)) {
++		if (PTR_ERR(core->npu_supply) == -EPROBE_DEFER)
++			return PTR_ERR(core->npu_supply);
++		dev_info(dev, "rocket: no \"npu\" supply (%ld); NPU voltage scaling disabled\n",
++			 PTR_ERR(core->npu_supply));
++		core->npu_supply = NULL;
++	}
+ 
+ 	core->pc_iomem = devm_platform_ioremap_resource_byname(pdev, "pc");
+ 	if (IS_ERR(core->pc_iomem)) {
+@@ -68,12 +125,25 @@
+ 	pm_runtime_use_autosuspend(dev);
+ 
+ 	/*
+-	 * As this NPU will be most often used as part of a media pipeline that
+-	 * ends presenting in a display, choose 50 ms (~3 frames at 60Hz) as an
+-	 * autosuspend delay as that will keep the device powered up while the
+-	 * pipeline is running.
++	 * The park above needs a deadline that outlives a host-side gap WITHIN one
++	 * inference, not merely the gap between inferences.
++	 *
++	 * Upstream's 50 ms is "~3 frames at 60Hz" -- sized for a media pipeline that
++	 * submits one inference per frame, where the only idle gaps that matter fall
++	 * BETWEEN inferences. An LLM/ASR workload breaks that assumption: the host
++	 * packs the operands into the NPU's native tiled layout (it cannot be done
++	 * on-chip), so a SINGLE inference contains host-side gaps in which every core
++	 * goes idle. At 50 ms those gaps trip runtime suspend mid-inference, the last
++	 * core down parks the shared clock to 200 MHz, and the next submit runs at a
++	 * third of the rate until it ramps back -- so the clock lever silently undoes
++	 * itself on exactly the workloads it exists for.
++	 *
++	 * 1000 ms is past the measured knee (~200 ms on a small encoder) with headroom
++	 * for a large one, whose packing gaps are several times longer (they scale with
++	 * the weight bytes). Park-at-idle is preserved; only its deadline moves.
+ 	 */
+-	pm_runtime_set_autosuspend_delay(dev, 50);
++	if (rocket_autosuspend_ms)
++		pm_runtime_set_autosuspend_delay(dev, rocket_autosuspend_ms);
+ 
+ 	pm_runtime_enable(dev);
+ 
+@@ -98,9 +168,20 @@
+ {
+ 	pm_runtime_dont_use_autosuspend(core->dev);
+ 	pm_runtime_disable(core->dev);
++
++	/*
++	 * Stop the scheduler before tearing down the IOMMU so an in-flight
++	 * job can no longer touch the (about to be detached) domain.
++	 */
++	rocket_job_fini(core);
++
++	if (core->attached_domain) {
++		iommu_detach_group(core->attached_domain->domain, core->iommu_group);
++		rocket_iommu_domain_put(core->attached_domain);
++		core->attached_domain = NULL;
++	}
+ 	iommu_group_put(core->iommu_group);
+ 	core->iommu_group = NULL;
+-	rocket_job_fini(core);
+ }
+ 
+ void rocket_core_reset(struct rocket_core *core)
+--- a/drivers/accel/rocket/rocket_core.h
++++ b/drivers/accel/rocket/rocket_core.h
+@@ -11,6 +11,8 @@
+ #include <linux/reset.h>
+ 
+ #include "rocket_registers.h"
++
++struct regulator;
+ 
+ #define rocket_pc_readl(core, reg) \
+ 	readl((core)->pc_iomem + (REG_PC_##reg))
+@@ -27,6 +29,8 @@
+ #define rocket_core_writel(core, reg, value) \
+ 	writel(value, (core)->core_iomem + (REG_CORE_##reg) - REG_CORE_S_STATUS)
+ 
++struct rocket_iommu_domain;
++
+ struct rocket_core {
+ 	struct device *dev;
+ 	struct rocket_device *rdev;
+@@ -39,7 +43,36 @@
+ 	struct clk_bulk_data clks[4];
+ 	struct reset_control_bulk_data resets[2];
+ 
++	/*
++	 * Shared SCMI NPU compute clock ("npu"), acquired once for the device
++	 * lifetime (devm) so runtime-resume/suspend can re-rate it without a
++	 * clk_get/clk_put on every PM transition. NULL when no "npu" clock is
++	 * wired (then the rocket_npu_clk_hz lever is a no-op). Only ever re-rated
++	 * from runtime-resume/suspend, never set cold (that wedges SCMI). See
++	 * rocket_drv.c.
++	 */
++	struct clk *npu_clk;
++
++	/*
++	 * vdd_npu_s0 rail (DT "npu-supply"); held for the device lifetime so our
++	 * voltage vote persists (the regulator framework aggregates LIVE
++	 * consumers by max -- dropping the handle would drop the vote). Scaled
++	 * with the compute clock by the rocket_npu_clk_hz path; NULL when no
++	 * supply is wired (then we run clock-only). See rocket_drv.c.
++	 */
++	struct regulator *npu_supply;
++
+ 	struct iommu_group *iommu_group;
++	/*
++	 * The IOMMU domain currently attached to this core's group, kept attached
++	 * across jobs from the same context (see rocket_job_run). Invariant:
++	 * attached_domain holds exactly one reference on the domain iff it is
++	 * non-NULL -- so every place that clears it must iommu_detach_group() and
++	 * rocket_iommu_domain_put() together. Mutated only from the drm_sched
++	 * single-threaded run/reset path (see the serialization note in
++	 * rocket_job_run).
++	 */
++	struct rocket_iommu_domain *attached_domain;
+ 
+ 	struct mutex job_lock;
+ 	struct rocket_job *in_flight_job;
+--- a/drivers/accel/rocket/rocket_drv.c
++++ b/drivers/accel/rocket/rocket_drv.c
+@@ -9,9 +9,11 @@
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/iommu.h>
++#include <linux/mutex.h>
+ #include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ 
+ #include "rocket_device.h"
+ #include "rocket_drv.h"
+@@ -25,11 +27,101 @@
+ static struct platform_device *drm_dev;
+ static struct rocket_device *rdev;
+ 
++#define ROCKET_NPU_POWER_DOWN_HZ	200000000UL	/* vendor POWER_DOWN_FREQ */
++
++/*
++ * The compute clock is ONE SCMI clock shared by every core, but runtime-PM is
++ * PER core -- so the park must be refcounted, or one core going idle drops the
++ * rate out from under the cores that are still running.
++ *
++ * The damage is not merely a mid-flight rate cut: a core that is still
++ * runtime-ACTIVE never re-raises the clock (pm_runtime_get on an active device
++ * fires no resume callback), so once a sibling parks the rate that core keeps
++ * running at 200 MHz until it happens to suspend and resume. Only the LAST core
++ * down may park the clock.
++ *
++ * Counts cores that are runtime-resumed, independent of rocket_npu_clk_hz, so
++ * that flipping the (sysfs-writable) param while cores are active cannot strand
++ * the count. Serialised against a concurrent resume on another core -- both
++ * callbacks run in process context and may sleep, so this is a mutex, not an
++ * atomic: it guards the rate change as well as the count.
++ */
++static DEFINE_MUTEX(rocket_clk_lock);
++static unsigned int rocket_clk_users;
++
++/*
++ * If non-zero, program the shared SCMI NPU compute clock ("npu") to this rate
++ * from runtime-resume, i.e. only AFTER the PM core has powered the domain.
++ * 0 leaves the DT default (200 MHz) untouched (stock). Writable via sysfs so
++ * the rate can be swept without rebuilding.
++ */
++static unsigned long rocket_npu_clk_hz;
++module_param(rocket_npu_clk_hz, ulong, 0644);
++MODULE_PARM_DESC(rocket_npu_clk_hz,
++	"NPU compute clock target in Hz applied in runtime-resume (e.g. 600000000); 0 = stock 200 MHz");
++
++/*
++ * NPU rail (vdd_npu_s0) voltage coupling, applied together with
++ * rocket_npu_clk_hz so a raised clock always gets a matching voltage.
++ *
++ * Floor of 0.80 V: the rail already sits at 0.80 V today, and the regulator
++ * framework aggregates consumers by max -- so voting the floor PINS the rail at
++ * today's voltage (no change at <=600 MHz) and, crucially, prevents our own
++ * vote from ever dropping the shared rail below 0.80 V. The 0.95 V ceiling is
++ * the RK8602 vdd_npu_s0 DT regulator-max. Firmware (BL31) sets only the PLL and
++ * never the voltage, so if Linux does not couple V to f, nothing does -- which
++ * is the V/f-marginal state that hard-locked the box at 900 MHz.
++ */
++#define ROCKET_NPU_VOLT_FLOOR_UV	800000UL	/* proven-stable rail at <=600 MHz */
++#define ROCKET_NPU_VOLT_MAX_UV		950000		/* vdd_npu_s0 ceiling (DT regulator-max) */
++
++/*
++ * Optional fixed override of the NPU rail voltage in microvolts, applied with
++ * rocket_npu_clk_hz. 0 (default) selects the vendor f->V map with the 0.80 V
++ * floor (npu_uv_for_hz()). For future >600 MHz bring-up only; the map+floor
++ * default is what keeps the proven 600 MHz operating point byte-for-byte.
++ */
++static unsigned long rocket_npu_uv;
++module_param(rocket_npu_uv, ulong, 0644);
++MODULE_PARM_DESC(rocket_npu_uv,
++	"NPU rail voltage override in microvolts applied with rocket_npu_clk_hz; 0 = vendor f/V map with 0.80 V floor");
++
++/*
++ * Vendor RK3588 npu_opp_table frequency->voltage points (rockchip-linux 6.6
++ * rk3588s.dtsi): 300-700 MHz -> 0.70 V, 800 -> 0.75 V, 900 -> 0.80 V,
++ * 1000 -> 0.85 V (the vendor never exceeds 0.85 V for the NPU). Returns the
++ * vendor microvolts for a target rate, clamped UP to the 0.80 V floor. The true
++ * per-chip ceiling is OTP PVTPLL, not this table -- this is a conservative safe
++ * map for enabling >600 MHz later; it makes the lever safe, it does not pull it.
++ */
++static unsigned long npu_uv_for_hz(unsigned long hz)
++{
++	unsigned long uv;
++
++	if (hz <= 700000000UL)
++		uv = 700000UL;
++	else if (hz <= 800000000UL)
++		uv = 750000UL;
++	else if (hz <= 900000000UL)
++		uv = 800000UL;
++	else
++		uv = 850000UL;		/* >= 1 GHz */
++
++	return max(uv, ROCKET_NPU_VOLT_FLOOR_UV);
++}
++
+ static void
+ rocket_iommu_domain_destroy(struct kref *kref)
+ {
+ 	struct rocket_iommu_domain *domain = container_of(kref, struct rocket_iommu_domain, kref);
+ 
++	/*
++	 * Last reference gone: every BO mapped into this domain has been freed
++	 * (each drops a domain ref in its free path after removing its IOVA node),
++	 * so the allocator is empty here and the takedown is race-free.
++	 */
++	drm_mm_takedown(&domain->mm);
++	mutex_destroy(&domain->mm_lock);
+ 	iommu_domain_free(domain->domain);
+ 	domain->domain = NULL;
+ 	kfree(domain);
+@@ -52,6 +144,16 @@
+ 	}
+ 	kref_init(&domain->kref);
+ 
++	/*
++	 * The IOVA allocator spans this domain's aperture and shares its
++	 * refcounted lifetime (see struct rocket_iommu_domain). Torn down in
++	 * rocket_iommu_domain_destroy when the last reference drops.
++	 */
++	drm_mm_init(&domain->mm, domain->domain->geometry.aperture_start,
++		    domain->domain->geometry.aperture_end -
++		    domain->domain->geometry.aperture_start + 1);
++	mutex_init(&domain->mm_lock);
++
+ 	return domain;
+ }
+ 
+@@ -73,7 +175,6 @@
+ {
+ 	struct rocket_device *rdev = to_rocket_device(dev);
+ 	struct rocket_file_priv *rocket_priv;
+-	u64 start, end;
+ 	int ret;
+ 
+ 	if (!try_module_get(THIS_MODULE))
+@@ -94,20 +195,13 @@
+ 
+ 	file->driver_priv = rocket_priv;
+ 
+-	start = rocket_priv->domain->domain->geometry.aperture_start;
+-	end = rocket_priv->domain->domain->geometry.aperture_end;
+-	drm_mm_init(&rocket_priv->mm, start, end - start + 1);
+-	mutex_init(&rocket_priv->mm_lock);
+-
+ 	ret = rocket_job_open(rocket_priv);
+ 	if (ret)
+-		goto err_mm_takedown;
++		goto err_domain_put;
+ 
+ 	return 0;
+ 
+-err_mm_takedown:
+-	mutex_destroy(&rocket_priv->mm_lock);
+-	drm_mm_takedown(&rocket_priv->mm);
++err_domain_put:
+ 	rocket_iommu_domain_put(rocket_priv->domain);
+ err_free:
+ 	kfree(rocket_priv);
+@@ -122,8 +216,11 @@
+ 	struct rocket_file_priv *rocket_priv = file->driver_priv;
+ 
+ 	rocket_job_close(rocket_priv);
+-	mutex_destroy(&rocket_priv->mm_lock);
+-	drm_mm_takedown(&rocket_priv->mm);
++	/*
++	 * The IOVA allocator is owned by the domain now, not the file: dropping
++	 * our domain reference here tears it down once the last BO (possibly freed
++	 * after us by the drm_sched free worker) has released its reference.
++	 */
+ 	rocket_iommu_domain_put(rocket_priv->domain);
+ 	kfree(rocket_priv);
+ 	module_put(THIS_MODULE);
+@@ -246,6 +343,91 @@
+ 		return err;
+ 	}
+ 
++	/*
++	 * The power domain for this core is now powered (the PM core resumed the
++	 * genpd before calling us) and the bulk clocks are enabled, so it is safe
++	 * to (re)program the shared SCMI NPU compute clock here. Setting it cold,
++	 * with the domain off (DT of_clk_set_defaults at probe, or an external
++	 * module), wedges the SCMI firmware -- so do it ONLY from here.
++	 *
++	 * Under rocket_clk_lock: the rate is shared, so this must not interleave
++	 * with a sibling core's park in rocket_device_runtime_suspend().
++	 */
++	mutex_lock(&rocket_clk_lock);
++
++	if (rocket_npu_clk_hz) {
++		struct regulator *npu_reg = rdev->cores[core].npu_supply;
++		struct clk *npu_clk = rdev->cores[core].npu_clk;
++		bool raised_v = false;
++
++		/*
++		 * Voltage-up BEFORE clock-up. A fast clock at a low voltage is the
++		 * V/f-marginal state that hard-locked the box at 900 MHz, and BL31
++		 * never scales the rail -- so we must raise it here first. The rail
++		 * is the pd_npu domain-supply (already enabled by the genpd), shared
++		 * with the genpd consumer, so we only adjust voltage (no
++		 * regulator_enable) and read back the effective value to confirm the
++		 * request took. With the default 0.80 V floor this is a no-op at
++		 * <=600 MHz (the rail already sits at 0.80 V). On a failed/absent
++		 * regulator we warn and raise the clock anyway -- clock-only is
++		 * exactly today's behaviour, never worse.
++		 */
++		if (npu_reg) {
++			unsigned long uv = rocket_npu_uv ? rocket_npu_uv :
++					   npu_uv_for_hz(rocket_npu_clk_hz);
++			int vr = regulator_set_voltage(npu_reg, uv, ROCKET_NPU_VOLT_MAX_UV);
++
++			if (vr) {
++				dev_warn(dev, "rocket: regulator_set_voltage(npu, %lu uV) failed: %d (clock-only)\n",
++					 uv, vr);
++			} else {
++				raised_v = true;
++				dev_info(dev, "rocket: core %d NPU vdd -> %lu uV (reads back %d uV)\n",
++					 core, uv, regulator_get_voltage(npu_reg));
++			}
++		}
++
++		if (!npu_clk) {
++			dev_warn(dev, "rocket: no \"npu\" clock; cannot apply %lu Hz\n",
++				 rocket_npu_clk_hz);
++		} else {
++			int r = clk_set_rate(npu_clk, rocket_npu_clk_hz);
++
++			if (r) {
++				/*
++				 * Clock raise failed AFTER the voltage raise. Roll the rail
++				 * back to the idle floor (never strand it high at the stock
++				 * clock), undo the bulk-clock enable, and PROPAGATE the
++				 * failure: a degraded resume must not silently return 0 with
++				 * the device half-programmed. The PM core then leaves the
++				 * domain suspended rather than running at an unintended rate.
++				 * The refcount is NOT taken -- this core never held the rate.
++				 */
++				dev_warn(dev, "rocket: clk_set_rate(npu, %lu Hz) failed: %d (reverting voltage, failing resume)\n",
++					 rocket_npu_clk_hz, r);
++				if (raised_v)
++					regulator_set_voltage(npu_reg,
++							      npu_uv_for_hz(ROCKET_NPU_POWER_DOWN_HZ),
++							      ROCKET_NPU_VOLT_MAX_UV);
++				mutex_unlock(&rocket_clk_lock);
++				clk_bulk_disable_unprepare(ARRAY_SIZE(rdev->cores[core].clks),
++							   rdev->cores[core].clks);
++				return r;
++			}
++
++			dev_info(dev, "rocket: core %d NPU clk -> %lu Hz (reads back %lu)\n",
++				 core, rocket_npu_clk_hz, clk_get_rate(npu_clk));
++		}
++	}
++
++	/*
++	 * This core now holds the shared rate. Counted even when rocket_npu_clk_hz
++	 * is 0 (stock), so the count always tracks resumed cores and a runtime flip
++	 * of the param cannot strand it.
++	 */
++	rocket_clk_users++;
++	mutex_unlock(&rocket_clk_lock);
++
+ 	return 0;
+ }
+ 
+@@ -259,6 +441,63 @@
+ 
+ 	if (!rocket_job_is_idle(&rdev->cores[core]))
+ 		return -EBUSY;
++
++	/*
++	 * Park the compute clock back at the vendor power-down rate (200 MHz)
++	 * while the domain is still powered, so it never powers off (and back on)
++	 * at a raised rate -- mirroring the vendor's POWER_DOWN_FREQ handling.
++	 *
++	 * ONLY when this is the LAST core down. The rate is one shared SCMI clock;
++	 * parking it per-core cuts it out from under siblings that are still
++	 * running, and (worse) they never re-raise it, because an already-active
++	 * device gets no resume callback. See rocket_clk_users.
++	 *
++	 * The decrement sits after the rocket_job_is_idle() -EBUSY bail above: a
++	 * core that refuses to suspend still holds the rate.
++	 */
++	mutex_lock(&rocket_clk_lock);
++
++	if (rocket_clk_users)
++		rocket_clk_users--;
++
++	if (rocket_npu_clk_hz) {
++		struct regulator *npu_reg = rdev->cores[core].npu_supply;
++		struct clk *npu_clk = rdev->cores[core].npu_clk;
++
++		if (npu_clk && rocket_clk_users == 0)
++			clk_set_rate(npu_clk, ROCKET_NPU_POWER_DOWN_HZ);
++
++		/*
++		 * Clock-down BEFORE voltage-down (mirror of resume). Lower the rail
++		 * to the idle target only AFTER the clock is parked at 200 MHz, so
++		 * the domain never powers off at a rate above its voltage. The idle
++		 * target is the 0.80 V floor (npu_uv_for_hz(200 MHz)) -- we never
++		 * drop below today's voltage. The shared rail aggregates by max, so
++		 * a sibling core still running at a raised rate keeps its voltage.
++		 * A failed lowering is non-fatal (the rail simply stays higher, which
++		 * is the safe direction) but must not be swallowed silently.
++		 *
++		 * This stays PER CORE -- it is deliberately NOT gated on
++		 * rocket_clk_users the way the clock park above is, and must not be.
++		 * The rail only actually falls once EVERY core has lowered its own
++		 * request, which is exactly what the regulator's max-aggregation
++		 * gives us; gating it on the last core would instead leave the
++		 * earlier cores' requests stranded high and the rail would never come
++		 * down at all. It is also safe when we did NOT park the clock above
++		 * (siblings still running): their requests hold the rail at the rate
++		 * they need.
++		 */
++		if (npu_reg) {
++			int vr = regulator_set_voltage(npu_reg,
++						       npu_uv_for_hz(ROCKET_NPU_POWER_DOWN_HZ),
++						       ROCKET_NPU_VOLT_MAX_UV);
++
++			if (vr)
++				dev_warn(dev, "rocket: regulator_set_voltage(npu, idle) failed: %d\n", vr);
++		}
++	}
++
++	mutex_unlock(&rocket_clk_lock);
+ 
+ 	clk_bulk_disable_unprepare(ARRAY_SIZE(rdev->cores[core].clks), rdev->cores[core].clks);
+ 
+--- a/drivers/accel/rocket/rocket_drv.h
++++ b/drivers/accel/rocket/rocket_drv.h
+@@ -6,22 +6,35 @@
+ 
+ #include <drm/drm_mm.h>
+ #include <drm/gpu_scheduler.h>
++#include <linux/mutex.h>
+ 
+ #include "rocket_device.h"
+ 
+ extern const struct dev_pm_ops rocket_pm_ops;
+ 
++/*
++ * The per-context IOMMU domain. The IOVA allocator (mm/mm_lock) lives HERE, not
++ * in rocket_file_priv, so it shares the domain's refcounted lifetime: the domain
++ * is referenced by the file, by every BO mapped into it, and (while attached) by
++ * the core, and is destroyed only when the last of those drops. A BO's free path
++ * removes its IOVA node under this lock, and a just-completed job's BO references
++ * are dropped asynchronously by the drm_sched free worker -- which can run AFTER
++ * the file is closed. Keeping mm in the file would let that free path touch a
++ * freed rocket_file_priv (a use-after-free, seen first as a drm_mm_takedown
++ * "allocator still has nodes" warning); anchoring it to the domain the BO already
++ * holds a reference to makes the node removal always valid.
++ */
+ struct rocket_iommu_domain {
+ 	struct iommu_domain *domain;
+ 	struct kref kref;
++	struct drm_mm mm;
++	struct mutex mm_lock;
+ };
+ 
+ struct rocket_file_priv {
+ 	struct rocket_device *rdev;
+ 
+ 	struct rocket_iommu_domain *domain;
+-	struct drm_mm mm;
+-	struct mutex mm_lock;
+ 
+ 	struct drm_sched_entity sched_entity;
+ };
+--- a/drivers/accel/rocket/rocket_gem.c
++++ b/drivers/accel/rocket/rocket_gem.c
+@@ -14,7 +14,6 @@
+ static void rocket_gem_bo_free(struct drm_gem_object *obj)
+ {
+ 	struct rocket_gem_object *bo = to_rocket_bo(obj);
+-	struct rocket_file_priv *rocket_priv = bo->driver_priv;
+ 	size_t unmapped;
+ 
+ 	drm_WARN_ON(obj->dev, refcount_read(&bo->base.pages_use_count) > 1);
+@@ -22,9 +21,14 @@
+ 	unmapped = iommu_unmap(bo->domain->domain, bo->mm.start, bo->size);
+ 	drm_WARN_ON(obj->dev, unmapped != bo->size);
+ 
+-	mutex_lock(&rocket_priv->mm_lock);
++	/*
++	 * The IOVA node and its lock live in the domain (see rocket_drv.h), which
++	 * the BO holds a reference to until the put below -- so this is valid even
++	 * when the drm_sched free worker runs this after the owning file closed.
++	 */
++	mutex_lock(&bo->domain->mm_lock);
+ 	drm_mm_remove_node(&bo->mm);
+-	mutex_unlock(&rocket_priv->mm_lock);
++	mutex_unlock(&bo->domain->mm_lock);
+ 
+ 	rocket_iommu_domain_put(bo->domain);
+ 	bo->domain = NULL;
+@@ -74,7 +78,6 @@
+ 	gem_obj = &shmem_obj->base;
+ 	rkt_obj = to_rocket_bo(gem_obj);
+ 
+-	rkt_obj->driver_priv = rocket_priv;
+ 	rkt_obj->domain = rocket_iommu_domain_get(rocket_priv);
+ 	rkt_obj->size = args->size;
+ 	rkt_obj->offset = 0;
+@@ -85,11 +88,11 @@
+ 		goto err;
+ 	}
+ 
+-	mutex_lock(&rocket_priv->mm_lock);
+-	ret = drm_mm_insert_node_generic(&rocket_priv->mm, &rkt_obj->mm,
++	mutex_lock(&rocket_priv->domain->mm_lock);
++	ret = drm_mm_insert_node_generic(&rocket_priv->domain->mm, &rkt_obj->mm,
+ 					 rkt_obj->size, PAGE_SIZE,
+ 					 0, 0);
+-	mutex_unlock(&rocket_priv->mm_lock);
++	mutex_unlock(&rocket_priv->domain->mm_lock);
+ 	if (ret)
+ 		goto err;
+ 
+@@ -122,9 +125,9 @@
+ 		    rkt_obj->mm.start, rkt_obj->size);
+ 
+ err_remove_node:
+-	mutex_lock(&rocket_priv->mm_lock);
++	mutex_lock(&rocket_priv->domain->mm_lock);
+ 	drm_mm_remove_node(&rkt_obj->mm);
+-	mutex_unlock(&rocket_priv->mm_lock);
++	mutex_unlock(&rocket_priv->domain->mm_lock);
+ 
+ err:
+ 	drm_gem_shmem_object_free(gem_obj);
+--- a/drivers/accel/rocket/rocket_gem.h
++++ b/drivers/accel/rocket/rocket_gem.h
+@@ -8,8 +8,6 @@
+ 
+ struct rocket_gem_object {
+ 	struct drm_gem_shmem_object base;
+-
+-	struct rocket_file_priv *driver_priv;
+ 
+ 	struct rocket_iommu_domain *domain;
+ 	struct drm_mm_node mm;
+--- a/drivers/accel/rocket/rocket_job.c
++++ b/drivers/accel/rocket/rocket_job.c
+@@ -9,6 +9,7 @@
+ #include <drm/rocket_accel.h>
+ #include <linux/interrupt.h>
+ #include <linux/iommu.h>
++#include <linux/kref.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ 
+@@ -310,13 +311,25 @@
+ 		dma_fence_put(job->done_fence);
+ 	job->done_fence = dma_fence_get(fence);
+ 
+-	ret = pm_runtime_get_sync(core->dev);
++	ret = pm_runtime_resume_and_get(core->dev);
+ 	if (ret < 0)
+-		return fence;
+-
+-	ret = iommu_attach_group(job->domain->domain, core->iommu_group);
+-	if (ret < 0)
+-		return fence;
++		goto err_signal;
++
++	/* drm_sched_stop() serializes reset against this scheduler callback. */
++	if (core->attached_domain != job->domain) {
++		if (core->attached_domain) {
++			iommu_detach_group(core->attached_domain->domain, core->iommu_group);
++			rocket_iommu_domain_put(core->attached_domain);
++			core->attached_domain = NULL;
++		}
++
++		ret = iommu_attach_group(job->domain->domain, core->iommu_group);
++		if (ret < 0)
++			goto err_pm;
++
++		kref_get(&job->domain->kref);
++		core->attached_domain = job->domain;
++	}
+ 
+ 	scoped_guard(mutex, &core->job_lock) {
+ 		core->in_flight_job = job;
+@@ -324,27 +337,40 @@
+ 	}
+ 
+ 	return fence;
++
++err_pm:
++	pm_runtime_mark_last_busy(core->dev);
++	pm_runtime_put_autosuspend(core->dev);
++err_signal:
++	dma_fence_set_error(fence, ret);
++	dma_fence_signal(fence);
++	return fence;
+ }
+ 
+ static void rocket_job_handle_irq(struct rocket_core *core)
+ {
+ 	pm_runtime_mark_last_busy(core->dev);
+ 
+-	rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
+-	rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
+-
+-	scoped_guard(mutex, &core->job_lock)
++	scoped_guard(mutex, &core->job_lock) {
++		/*
++		 * Stopping the block belongs under the lock.  rocket_job_hw_submit()
++		 * writes OPERATION_ENABLE from inside it, so this zero landing after
++		 * that one stops a task that has only just started.
++		 */
++		rocket_pc_writel(core, OPERATION_ENABLE, 0x0);
++		rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
++
+ 		if (core->in_flight_job) {
+ 			if (core->in_flight_job->next_task_idx < core->in_flight_job->task_count) {
+ 				rocket_job_hw_submit(core, core->in_flight_job);
+ 				return;
+ 			}
+ 
+-			iommu_detach_group(NULL, iommu_group_get(core->dev));
+ 			dma_fence_signal(core->in_flight_job->done_fence);
+ 			pm_runtime_put_autosuspend(core->dev);
+ 			core->in_flight_job = NULL;
+ 		}
++	}
+ }
+ 
+ static void
+@@ -356,21 +382,105 @@
+ 	drm_sched_stop(&core->sched, bad);
+ 
+ 	/*
+-	 * Remaining interrupts have been handled, but we might still have
+-	 * stuck jobs. Let's make sure the PM counters stay balanced by
+-	 * manually calling pm_runtime_put_noidle().
++	 * Mask the block before waiting.  rocket_job_hw_submit() arms a
++	 * completion pair in INTERRUPT_MASK on every submit and only the
++	 * hardirq clears it, so on an ordinary timeout it is still live and a
++	 * completion can arrive after the sync below returns.  The next submit
++	 * re-arms it, so nothing is lost here.
++	 *
++	 * Only when the device is already awake, though.  This function holds
++	 * no runtime PM reference of its own: the only one in the window
++	 * belongs to in_flight_job, and the completion path may have put it
++	 * and cleared the pointer before the timeout worker got here.
++	 * drm_sched_stop() above can block for a long time, and it drops
++	 * every pending job's credits, so rocket_job_is_idle() is true and
++	 * nothing keeps the core resumed.  On this hardware a register access
++	 * with the domain down takes an async SError, so a reset must not be
++	 * the thing that causes one.
++	 *
++	 * Only a positive answer will do.  pm_runtime_get_if_active() tests
++	 * power.disable_depth before power.runtime_status, so -EINVAL MASKS a
++	 * suspended device rather than excluding one, and this driver makes
++	 * that state in both pm_runtime_force_suspend() and
++	 * rocket_core_fini().
++	 *
++	 * The cost is the other half of that ambiguity.  A core that is still
++	 * up with runtime PM disabled -- pm_runtime_force_suspend() before its
++	 * callback has run, or CONFIG_PM=n under COMPILE_TEST -- keeps its mask
++	 * and its latched bits, because writing to it would mean writing to the
++	 * half that is down as well.
++	 *
++	 * Clear the raw status along with the mask.  Masking alone leaves the
++	 * completion bit latched until rocket_core_reset(), and the hardirq
++	 * decides on INTERRUPT_RAW_STATUS alone, so on this shared line
++	 * another device's interrupt would wake the thread again and what the
++	 * comment below asserts would stop holding.
++	 *
++	 * Under job_lock, because rocket_job_hw_submit() arms this same
++	 * register and always runs under that lock.  reset.pending is set in
++	 * rocket_job_timedout() without the lock and read in hw_submit() with
++	 * it, so a submit that has already passed its check can re-arm the mask
++	 * after this clears it: the block is then left running a task with its
++	 * interrupt live, while the sync below fences a handler that has
++	 * already finished.  That is the race 090 closed on OPERATION_ENABLE,
++	 * on the other register.
++	 *
++	 * pm_runtime_get_if_active() takes a reference on an already-active
++	 * device without invoking a callback, and pm_runtime_put_autosuspend()
++	 * is asynchronous, so holding job_lock across them cannot re-enter this
++	 * driver's runtime PM callbacks.
++	 */
++	scoped_guard(mutex, &core->job_lock) {
++		if (pm_runtime_get_if_active(core->dev) > 0) {
++			rocket_pc_writel(core, INTERRUPT_MASK, 0x0);
++			rocket_pc_writel(core, INTERRUPT_CLEAR, 0x1ffff);
++			pm_runtime_put_autosuspend(core->dev);
++		}
++	}
++
++	/*
++	 * drm_sched_stop() returns without waiting for a threaded handler that
++	 * is already running, so wait for one here.  This has to stay outside
++	 * job_lock: rocket_job_handle_irq() takes that lock, so waiting for the
++	 * handler while holding it would be waiting for a handler that is
++	 * waiting for us.  Nothing is held at this point, and both callers run
++	 * in process context, so sleeping here is allowed.
++	 */
++	synchronize_irq(core->irq);
++
++	/*
++	 * No handler is running now, but we might still have stuck jobs. Let's
++	 * make sure the PM counters stay balanced by putting the reference the
++	 * job took, and request idle while doing it so the core can suspend.
+ 	 */
+ 	scoped_guard(mutex, &core->job_lock) {
+ 		if (core->in_flight_job)
+-			pm_runtime_put_noidle(core->dev);
+-
+-		iommu_detach_group(NULL, core->iommu_group);
++			pm_runtime_put_autosuspend(core->dev);
+ 
+ 		core->in_flight_job = NULL;
+ 	}
+ 
+-	/* Proceed with reset now. */
++	/*
++	 * Reset the NPU before touching its IOMMU. A reset is entered because
++	 * the core is wedged -- typically mid-DMA -- and detaching the group
++	 * while it still is makes the rk_iommu stall handshake time out, which
++	 * is both a dev_err per bank and, when the force-reset behind the
++	 * default domain fails too, a WARN in the IOMMU core reachable by any
++	 * client of /dev/accel.
++	 */
+ 	rocket_core_reset(core);
++
++	/*
++	 * The reset wiped the IOMMU page-table base, so drop the attached
++	 * domain to force the next job to re-attach and reprogram it. Safe
++	 * outside job_lock: attached_domain is written only from the
++	 * drm_sched run/reset path, which drm_sched_stop() above has fenced.
++	 */
++	if (core->attached_domain) {
++		iommu_detach_group(core->attached_domain->domain, core->iommu_group);
++		rocket_iommu_domain_put(core->attached_domain);
++		core->attached_domain = NULL;
++	}
+ 
+ 	/* NPU has been reset, we can clear the reset pending bit. */
+ 	atomic_set(&core->reset.pending, 0);
