@@ -102,6 +102,39 @@ void decision_close(decision_model *dm) {
 }
 
 int32_t decision_single_token(tokenizer *tok, const char *text) {
+	enum { DST_KEY_MAX = 15, DST_CACHE_CAP = 1024 };
+	typedef struct {
+		const void *tok;
+		char		key[DST_KEY_MAX + 1];
+		int32_t		id;
+	} dst_entry;
+	static _Thread_local dst_entry cache[DST_CACHE_CAP];
+
+	size_t len = strlen(text);
+	if (len <= DST_KEY_MAX) {
+		uint32_t h = 2166136261u;
+		for (const unsigned char *p = (const unsigned char *)&tok;
+			 p < (const unsigned char *)(&tok + 1); p++)
+			h = (h ^ *p) * 16777619u;
+		for (size_t i = 0; i < len; i++)
+			h = (h ^ (unsigned char)text[i]) * 16777619u;
+		uint32_t slot = h & (DST_CACHE_CAP - 1);
+		for (uint32_t probe = 0; probe < DST_CACHE_CAP;
+			 probe++, slot = (slot + 1) & (DST_CACHE_CAP - 1)) {
+			dst_entry *e = &cache[slot];
+			if (!e->key[0] && !e->id) {
+				int32_t ids[4];
+				int		n  = tokenizer_encode_with_specials(tok, text, 0, ids, 4, NULL);
+				int32_t id = n == 1 ? ids[0] : -1;
+				e->tok	   = tok;
+				snprintf(e->key, sizeof(e->key), "%s", text);
+				e->id = id;
+				return id;
+			}
+			if (e->tok == tok && !strcmp(e->key, text))
+				return e->id;
+		}
+	}
 	int32_t ids[4];
 	int		n = tokenizer_encode_with_specials(tok, text, 0, ids, 4, NULL);
 	return n == 1 ? ids[0] : -1;
@@ -123,6 +156,9 @@ void decision_request_free(decision_request *req) {
 	for (int i = 0; i < req->n_questions; i++)
 		question_free(&req->questions[i]);
 	free(req->questions);
+	free(req->span_cache.text);
+	free(req->span_cache.ids);
+	jinja_value_free(req->state_value);
 	memset(req, 0, sizeof(*req));
 }
 
@@ -286,13 +322,48 @@ static jinja_value *options_to_jinja(const decision_question *q, const decision_
 	return list;
 }
 
+static jinja_value *jinja_clone(const jinja_value *v) {
+	if (!v)
+		return NULL;
+	switch (v->type) {
+	case JV_BOOL:
+		return jinja_bool(v->as.b);
+	case JV_INT: {
+		jinja_value *c = jinja_int(v->as.integer.value);
+		if (v->as.integer.text_ready)
+			snprintf(c->as.integer.text, sizeof(c->as.integer.text), "%s", v->as.integer.text);
+		c->as.integer.text_ready = v->as.integer.text_ready;
+		return c;
+	}
+	case JV_FLOAT:
+		return jinja_float(v->as.floating.value);
+	case JV_STRING:
+		return jinja_string(v->as.s);
+	case JV_LIST: {
+		jinja_value *l = jinja_list();
+		for (uint32_t i = 0; i < v->as.list.n; i++)
+			jinja_list_append(l, jinja_clone(v->as.list.items[i]));
+		return l;
+	}
+	case JV_DICT: {
+		jinja_value *d = jinja_dict();
+		for (const jinja_dict_entry *e = v->as.dict; e; e = e->next)
+			jinja_dict_set(d, e->key, jinja_clone(e->val));
+		return d;
+	}
+	default:
+		return jinja_none();
+	}
+}
+
 jinja_value *decision_prompt_values(const decision_request *req, const decision_question *q,
 									const decision_label *labels) {
 	jinja_value *g = jinja_dict();
 	jinja_dict_set(g, "id", jinja_string(q->id));
 	jinja_dict_set(g, "type", jinja_string(qtype_name(q->type)));
 	jinja_dict_set(g, "instructions", json_to_jinja(q->instructions));
-	jinja_dict_set(g, "state", json_to_jinja(req->state));
+	jinja_dict_set(g, "state",
+				   req->state_value ? jinja_clone(req->state_value) : json_to_jinja(req->state));
 	jinja_dict_set(g, "options", options_to_jinja(q, labels));
 	jinja_dict_set(g, "images", jinja_list());
 
@@ -356,17 +427,34 @@ static status_code decision_encode(tokenizer *tok, const char *text, profile *pr
 	return OK;
 }
 
+typedef struct {
+	const char *text;
+	int			limit;
+	bool		is_state;
+	bool		shared;
+} decision_piece;
+
 static status_code decision_assemble(tokenizer *tok, char *prompt, const decision_ops *ops,
-									 const decision_limits *lim, int32_t **out_ids, int *out_n) {
-	int			total	 = lim->total;
-	int32_t	   *ids		 = xmalloc((size_t)total * sizeof(int32_t));
-	int32_t	   *prefix	 = xmalloc((size_t)total * sizeof(int32_t));
-	int32_t	   *state	 = xmalloc((size_t)total * sizeof(int32_t));
-	int32_t	   *span	 = xmalloc((strlen(prompt) + 1) * sizeof(int32_t));
-	int			n_prefix = 0, n_state = 0, n_tail = 0;
-	bool		has_state = false;
-	status_code st		  = OK;
-	for (char *piece = prompt; piece && st == OK;) {
+									 const decision_limits *lim, decision_span_cache *cache,
+									 int32_t **out_ids, int *out_n) {
+	int	   total	  = lim->total;
+	size_t max_pieces = 1;
+	for (const char *p = prompt; ops->sep && *p;) {
+		if (!(p = strstr(p, ops->sep)))
+			break;
+		max_pieces++;
+		p += strlen(ops->sep);
+	}
+	decision_piece *pieces	 = xmalloc(max_pieces * sizeof(*pieces));
+	int				n_pieces = 0;
+	int32_t		   *ids		 = xmalloc((size_t)total * sizeof(int32_t));
+	int32_t		   *span	 = xmalloc((strlen(prompt) + 1) * sizeof(int32_t));
+	str_builder		key		 = {0};
+	int				n_prefix = 0, n_state = 0, n_tail = 0;
+	bool			has_state = false;
+	status_code		st		  = OK;
+
+	for (char *piece = prompt; piece;) {
 		char *next = ops->sep ? strstr(piece, ops->sep) : NULL;
 		if (next)
 			*next = '\0';
@@ -384,57 +472,96 @@ static status_code decision_assemble(tokenizer *tok, char *prompt, const decisio
 			piece += strlen(ops->option_mark);
 			limit = lim->option;
 		}
-		int n_span =
-			tokenizer_encode_with_specials(tok, piece, 0, span, (int)strlen(piece) + 1, NULL);
-		if (n_span < 0) {
-			st = ERR_INVALID_ARG;
-			break;
-		}
-		n_span = MIN(n_span, limit);
 		if (is_state) {
 			if (has_state) {
 				st = ERR_FORMAT;
 				break;
 			}
-			memcpy(state, span, (size_t)n_span * sizeof(int32_t));
-			n_state	  = n_span;
 			has_state = true;
-		} else {
-			int		*n	 = has_state ? &n_tail : &n_prefix;
-			int32_t *dst = has_state ? ids : prefix;
-			if (*n + n_span > total) {
-				st = ERR_INVALID_ARG;
-				break;
-			}
-			memcpy(dst + *n, span, (size_t)n_span * sizeof(int32_t));
-			*n += n_span;
+		}
+		bool shared		   = is_state || !has_state;
+		pieces[n_pieces++] = (decision_piece){piece, limit, is_state, shared};
+		if (shared) {
+			sb_puts(&key, piece);
+			sb_putb(&key, "\x01", 1);
 		}
 		piece = next ? next + strlen(ops->sep) : NULL;
 	}
+
+	bool hit =
+		st == OK && cache && cache->valid && cache->text && key.p && !strcmp(cache->text, key.p);
 	if (st == OK && ops->state_mark && !has_state)
 		st = ERR_FORMAT;
+	if (st == OK && hit) {
+		n_prefix = cache->n_prefix;
+		n_state	 = cache->n - cache->n_prefix;
+		if (cache->n > total) {
+			st = ERR_INVALID_ARG;
+		} else {
+			memcpy(ids, cache->ids, (size_t)cache->n * sizeof(int32_t));
+		}
+	}
+
+	for (int i = 0; st == OK && i < n_pieces; i++) {
+		const decision_piece *pc = &pieces[i];
+		if (pc->shared && hit)
+			continue;
+		int n_span =
+			tokenizer_encode_with_specials(tok, pc->text, 0, span, (int)strlen(pc->text) + 1, NULL);
+		if (n_span < 0) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		n_span	   = MIN(n_span, pc->limit);
+		int offset = pc->is_state ? n_prefix : n_prefix + n_state + n_tail;
+		if (offset + n_span > total) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		memcpy(ids + offset, span, (size_t)n_span * sizeof(int32_t));
+		if (pc->is_state)
+			n_state = n_span;
+		else if (pc->shared)
+			n_prefix += n_span;
+		else
+			n_tail += n_span;
+	}
+
 	if (st == OK && n_prefix + n_state + n_tail > total)
 		st = ERR_INVALID_ARG;
 	if (st == OK) {
-		memmove(ids + n_prefix + n_state, ids, (size_t)n_tail * sizeof(int32_t));
-		memcpy(ids, prefix, (size_t)n_prefix * sizeof(int32_t));
-		memcpy(ids + n_prefix, state, (size_t)n_state * sizeof(int32_t));
 		*out_n	 = n_prefix + n_state + n_tail;
 		*out_ids = ids;
 		ids		 = NULL;
+		if (cache && !hit) {
+			free(cache->text);
+			free(cache->ids);
+			cache->n_prefix = n_prefix;
+			cache->n		= n_prefix + n_state;
+			cache->ids		= xmalloc((size_t)cache->n * sizeof(int32_t));
+			memcpy(cache->ids, *out_ids, (size_t)cache->n * sizeof(int32_t));
+			cache->text	 = key.p ? key.p : xstrdup("");
+			key.p		 = NULL;
+			cache->valid = true;
+		}
 	}
 	free(ids);
-	free(prefix);
-	free(state);
 	free(span);
+	free(pieces);
+	sb_free(&key);
 	return st;
 }
 
-static status_code decision_build(const decision_model *dm, context *c, const decision_request *req,
+static status_code decision_build(const decision_model *dm, context *c, decision_request *req,
 								  const decision_question *q, const decision_label *labels,
 								  int32_t **out_ids, int *out_n) {
 	const decision_ops *ops = dm->ops;
-	jinja_value		   *g	= decision_prompt_values(req, q, labels);
+	if (!req->state_value) {
+		req->state_value = json_to_jinja(req->state);
+		if (ops->escape)
+			escape_marks_values(req->state_value);
+	}
+	jinja_value *g = decision_prompt_values(req, q, labels);
 	if (ops->escape)
 		escape_marks_values(g);
 	jinja_dict_set(g, "audio", jinja_bool(false));
@@ -466,7 +593,7 @@ static status_code decision_build(const decision_model *dm, context *c, const de
 	if (ops->sep) {
 		*out_n	 = 0;
 		*out_ids = NULL;
-		st		 = decision_assemble(&c->tok, prompt, ops, &lim, out_ids, out_n);
+		st		 = decision_assemble(&c->tok, prompt, ops, &lim, &req->span_cache, out_ids, out_n);
 		if (st == OK && *out_n > c->n_ctx) {
 			ERROR("decision: prompt of %d tokens does not fit the context of %d", *out_n, c->n_ctx);
 			st = ERR_INVALID_ARG;
@@ -565,25 +692,31 @@ static json_object *answer_json(const decision_question *q, const double *probs)
 	return ans;
 }
 
+static void label_scores_from_logits(const decision_label *labels, int n_options,
+									 const float *logits, float *scores) {
+	for (int i = 0; i < n_options; i++) {
+		scores[i] = logits[labels[i].tok[0]];
+		for (int t = 1; t < labels[i].n_tok; t++)
+			scores[i] = MAX(scores[i], logits[labels[i].tok[t]]);
+	}
+}
+
 status_code decision_forward_prefill(const decision_model *dm, context *c, const int32_t *ids,
 									 int n, const decision_question *q,
 									 const decision_label *labels, float *scores, int *n_tokens) {
 	(void)dm;
 	if (!labels)
 		return ERR_INVALID_ARG;
-	context_reset(c);
+	if (c->session_poisoned || (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent))
+		context_reset(c);
 	c->interrupt = 0;
-	int fed		 = context_prefill_tokens(c, ids, n, "decision", true).rc;
+	int fed		 = context_prefill_prompt(c, ids, n, "decision", true).rc;
 	if (fed < 0) {
 		if ((status_code)fed == ERR_COMPUTE_FAIL)
 			c->session_poisoned = true;
 		return (status_code)fed;
 	}
-	for (int i = 0; i < q->n_options; i++) {
-		scores[i] = c->scratch.logits_host[labels[i].tok[0]];
-		for (int t = 1; t < labels[i].n_tok; t++)
-			scores[i] = MAX(scores[i], c->scratch.logits_host[labels[i].tok[t]]);
-	}
+	label_scores_from_logits(labels, q->n_options, c->scratch.logits_host, scores);
 	*n_tokens += n;
 	return OK;
 }
@@ -617,9 +750,8 @@ status_code decision_forward_masked(const decision_model *dm, context *c, const 
 	return st;
 }
 
-static status_code question_scores(const decision_model *dm, context *c,
-								   const decision_request *req, const decision_question *q,
-								   float *scores, int *n_tokens) {
+static status_code question_scores(const decision_model *dm, context *c, decision_request *req,
+								   const decision_question *q, float *scores, int *n_tokens) {
 	decision_label *labels = NULL;
 	int32_t		   *ids	   = NULL;
 	int				n	   = 0;
@@ -639,27 +771,169 @@ out:
 	return rc;
 }
 
-status_code decision_run(const decision_model *dm, context *c, const decision_request *req,
+static void answer_question(const decision_model *dm, const decision_question *q,
+							const float *scores, json_object *out) {
+	int		n	   = q->n_options;
+	double *probs  = xmalloc((size_t)n * sizeof(*probs));
+	int		bucket = n <= 2 ? 0 : n <= 5 ? 1 : n <= 10 ? 2 : 3;
+	softmax_scores(scores, n, dm->temperatures[q->type][bucket], probs);
+	json_object_object_add(out, q->id, answer_json(q, probs));
+	free(probs);
+}
+
+typedef struct {
+	float *conv;
+	float *recurrent;
+	int	   pos;
+} decision_state_snapshot;
+
+static bool decision_hybrid_host_backed(const context *c) {
+	const kvcache_hybrid *h = c->kv.hybrid;
+	return !h || (!h->conv_buf && !h->state_buf && !h->latent_buf);
+}
+
+static status_code decision_snapshot_capture(const context *c, decision_state_snapshot *snap) {
+	const kvcache_hybrid *h = c->kv.hybrid;
+	snap->conv				= NULL;
+	snap->recurrent			= NULL;
+	snap->pos				= c->kv.n_pos;
+	if (!h)
+		return OK;
+	if (!decision_hybrid_host_backed(c))
+		return ERR_UNSUPPORTED;
+	if (h->conv_total > 0) {
+		snap->conv = xmalloc(h->conv_total * sizeof(float));
+		memcpy(snap->conv, h->conv_state, h->conv_total * sizeof(float));
+	}
+	if (h->recurrent_total > 0) {
+		snap->recurrent = xmalloc(h->recurrent_total * sizeof(float));
+		memcpy(snap->recurrent, h->recurrent_state, h->recurrent_total * sizeof(float));
+	}
+	return OK;
+}
+
+static void decision_snapshot_restore(context *c, const decision_state_snapshot *snap) {
+	kvcache_hybrid *h = c->kv.hybrid;
+	if (h && snap->conv)
+		memcpy(h->conv_state, snap->conv, h->conv_total * sizeof(float));
+	if (h && snap->recurrent)
+		memcpy(h->recurrent_state, snap->recurrent, h->recurrent_total * sizeof(float));
+	c->kv.n_pos	 = snap->pos;
+	c->fed_ids.n = snap->pos;
+}
+
+static void decision_snapshot_free(decision_state_snapshot *snap) {
+	free(snap->conv);
+	free(snap->recurrent);
+}
+
+static status_code decision_run_prefill(const decision_model *dm, context *c, decision_request *req,
+										json_object *out, int *n_tokens) {
+	const decision_ops *ops	   = dm->ops;
+	int					n_q	   = req->n_questions;
+	decision_label	  **labels = xcalloc((size_t)n_q, sizeof(*labels));
+	int32_t			  **idss   = xcalloc((size_t)n_q, sizeof(*idss));
+	int				   *ns	   = xcalloc((size_t)n_q, sizeof(*ns));
+	status_code			rc	   = OK;
+
+	for (int i = 0; i < n_q && rc == OK; i++) {
+		const decision_question *q = &req->questions[i];
+		labels[i]				   = xcalloc((size_t)q->n_options, sizeof(*labels[i]));
+		rc						   = ops->labels(&c->tok, q, labels[i]);
+		if (rc == OK)
+			rc = decision_build(dm, c, req, q, labels[i], &idss[i], &ns[i]);
+	}
+
+	int shared = 0;
+	if (rc == OK) {
+		shared = ns[0];
+		for (int i = 1; i < n_q; i++) {
+			int m = MIN(shared, ns[i]), k = 0;
+			while (k < m && idss[0][k] == idss[i][k])
+				k++;
+			shared = k;
+		}
+		int min_n = ns[0];
+		for (int i = 1; i < n_q; i++)
+			min_n = MIN(min_n, ns[i]);
+		shared = MAX(0, MIN(shared, min_n - 1));
+	}
+
+	decision_state_snapshot snap = {0};
+	if (rc == OK) {
+		if (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent)
+			context_reset(c);
+		c->interrupt = 0;
+		int fed		 = context_prefill_prompt(c, idss[0], shared, "decision", true).rc;
+		if (fed < 0) {
+			rc = (status_code)fed;
+			if (rc == ERR_COMPUTE_FAIL)
+				c->session_poisoned = true;
+		} else
+			rc = decision_snapshot_capture(c, &snap);
+	}
+	if (rc == OK && c->kv.n_pos != shared)
+		rc = ERR_INTERNAL;
+
+	for (int i = 0; rc == OK && i < n_q; i++) {
+		const decision_question *q = &req->questions[i];
+		if (c->interrupt) {
+			rc = ERR_INTERRUPTED;
+			break;
+		}
+		if (i > 0)
+			decision_snapshot_restore(c, &snap);
+		int fed = context_prefill_tokens(c, idss[i] + shared, ns[i] - shared, "decision", true).rc;
+		if (fed < 0) {
+			rc = (status_code)fed;
+			if (rc == ERR_COMPUTE_FAIL)
+				c->session_poisoned = true;
+			break;
+		}
+		float *scores = xmalloc((size_t)q->n_options * sizeof(*scores));
+		label_scores_from_logits(labels[i], q->n_options, c->scratch.logits_host, scores);
+		*n_tokens += ns[i];
+		answer_question(dm, q, scores, out);
+		free(scores);
+	}
+
+	decision_snapshot_free(&snap);
+	for (int i = 0; i < n_q; i++) {
+		free(labels[i]);
+		free(idss[i]);
+	}
+	free(labels);
+	free(idss);
+	free(ns);
+	return rc;
+}
+
+status_code decision_run(const decision_model *dm, context *c, decision_request *req,
 						 json_object **answers, int *n_tokens) {
 	json_object *out = json_object_new_object();
 	*n_tokens		 = 0;
-	for (int i = 0; i < req->n_questions; i++) {
-		const decision_question *q		= &req->questions[i];
-		float					*scores = xmalloc((size_t)q->n_options * sizeof(*scores));
-		double					*probs	= xmalloc((size_t)q->n_options * sizeof(*probs));
-		status_code				 rc		= question_scores(dm, c, req, q, scores, n_tokens);
-		if (rc == OK) {
-			int n	   = q->n_options;
-			int bucket = n <= 2 ? 0 : n <= 5 ? 1 : n <= 10 ? 2 : 3;
-			softmax_scores(scores, n, dm->temperatures[q->type][bucket], probs);
-			json_object_object_add(out, q->id, answer_json(q, probs));
+	status_code rc;
+	if (dm->ops->forward == decision_forward_prefill && dm->ops->labels &&
+		decision_hybrid_host_backed(c)) {
+		rc = decision_run_prefill(dm, c, req, out, n_tokens);
+	} else {
+		rc = OK;
+		for (int i = 0; i < req->n_questions; i++) {
+			const decision_question *q		= &req->questions[i];
+			float					*scores = xmalloc((size_t)q->n_options * sizeof(*scores));
+			status_code				 qrc	= question_scores(dm, c, req, q, scores, n_tokens);
+			if (qrc == OK)
+				answer_question(dm, q, scores, out);
+			free(scores);
+			if (qrc != OK) {
+				rc = qrc;
+				break;
+			}
 		}
-		free(scores);
-		free(probs);
-		if (rc != OK) {
-			json_object_put(out);
-			return rc;
-		}
+	}
+	if (rc != OK) {
+		json_object_put(out);
+		return rc;
 	}
 	*answers = out;
 	return OK;

@@ -782,7 +782,8 @@ static int32_t context_reuse_prefix(context *c, const int32_t *ids, int n, kv_re
 }
 
 static prefill_result context_prefill_with_plan(context *c, const int32_t *tokens, int n_tokens,
-												const kv_reuse_plan *plan) {
+												const kv_reuse_plan *plan, const char *phase,
+												bool quiet) {
 	prefill_result total = {0};
 	int32_t		   base	 = c->kv.n_pos;
 	int			   n_fed = 0;
@@ -791,7 +792,7 @@ static prefill_result context_prefill_with_plan(context *c, const int32_t *token
 		const kv_shift_chunk *chunk = &plan->chunks[i];
 		int					  gap	= chunk->dst_pos - c->kv.n_pos;
 		if (gap > 0) {
-			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, "prefill", false);
+			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, phase, quiet);
 			total.us += part.us;
 			if (part.rc < 0) {
 				total.rc = part.rc;
@@ -804,12 +805,20 @@ static prefill_result context_prefill_with_plan(context *c, const int32_t *token
 		c->kv.n_pos = chunk->dst_pos + chunk->n_rows;
 	}
 	int done = c->kv.n_pos - base;
-	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, "prefill", false);
+	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, phase, quiet);
 	total.rc = part.rc;
 	total.us += part.us;
 	n_fed += n_tokens - done;
 	total.tps = total.us > 0 ? n_fed * 1.0e6 / (double)total.us : part.tps;
 	return total;
+}
+
+prefill_result context_prefill_prompt(context *c, const int32_t *tokens, int n_tokens,
+									  const char *phase, bool quiet) {
+	fed_ids_sync(c);
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, tokens, n_tokens, &plan);
+	return context_prefill_with_plan(c, tokens + reuse, n_tokens - reuse, &plan, phase, quiet);
 }
 
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
@@ -1339,7 +1348,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	bool prof_was_on = c->scratch.prof.enabled;
 
 	int32_t		   n_pos_before = c->kv.n_pos;
-	prefill_result pf			= context_prefill_with_plan(c, tokens, n_tokens, plan);
+	prefill_result pf = context_prefill_with_plan(c, tokens, n_tokens, plan, "prefill", false);
 	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",

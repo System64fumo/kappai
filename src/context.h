@@ -101,6 +101,8 @@ void context_monitor_send_start(context *c);
 
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,
 									  const char *phase, bool quiet);
+prefill_result context_prefill_prompt(context *c, const int32_t *tokens, int n_tokens,
+									  const char *phase, bool quiet);
 
 int context_chat_turn(context *c, const char *role, const char *content, bool add_generation_prompt,
 					  int max_tokens, const sampler_params						 *samp,

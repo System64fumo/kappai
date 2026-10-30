@@ -842,10 +842,10 @@ static void editor_draw(const editor_state *st) {
 			ui_putn(LINES - 2, dx, dirty, COLS - 2 - dx, ui_attr(UI_DIM));
 	}
 
-	static const char key_bar[] = "Enter: edit   Left/Right: section   S: save   Esc: back";
-	static const char hcs_bar[] = "Enter: edit   A: add device   X: remove device   Left/Right: "
-								  "section   S: save   Esc: back";
-	bool use_hcs_bar = editor_tab_is_hcs(st->tab) && st->sc.hcs.enabled;
+	static const char key_bar[]	  = "Enter: edit   Left/Right: section   S: save   Esc: back";
+	static const char hcs_bar[]	  = "Enter: edit   A: add device   X: remove device   Left/Right: "
+									"section   S: save   Esc: back";
+	bool			  use_hcs_bar = editor_tab_is_hcs(st->tab) && st->sc.hcs.enabled;
 	ui_putn(LINES - 1, 2, use_hcs_bar ? hcs_bar : key_bar, COLS - 4, ui_attr(UI_DIM));
 	refresh();
 }
