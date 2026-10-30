@@ -4,6 +4,7 @@
 #include "common.h"
 #include "hcs.h"
 #include "log.h"
+#include "settings.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -42,6 +43,15 @@ static const char *const fuse_choices[] = {"qkv", NULL};
 	 .offset  = offsetof(saved_config, f),                                                         \
 	 .max_len = cap,                                                                               \
 	 .uik	  = UIK_PATH}
+#define S_MODEL_PATH(k, l, h, f, cap, ty)                                                          \
+	{.key		 = k,                                                                              \
+	 .label		 = l,                                                                              \
+	 .hint		 = h,                                                                              \
+	 .type		 = FLD_STR,                                                                        \
+	 .offset	 = offsetof(saved_config, f),                                                      \
+	 .max_len	 = cap,                                                                            \
+	 .uik		 = UIK_MODEL_PATH,                                                                 \
+	 .model_type = ty}
 #define S_MULTI(k, l, h, f, cap, ch, ea)                                                           \
 	{.key		= k,                                                                               \
 	 .label		= l,                                                                               \
@@ -104,14 +114,18 @@ static const char *const fuse_choices[] = {"qkv", NULL};
 	 .uik	 = UIK_TEXT}
 
 static const field_desc MODEL_FIELDS[] = {
-	S_PATH("model", "Model path", "path to the GGUF model file", model, SC_PATH_MAX),
+	S_MODEL_PATH("model", "Model path",
+				 "GGUF model file, relative paths resolve against the models directory", model,
+				 SC_PATH_MAX, "language"),
 	S_INT("ctx_size", "Context size", "0 = use model default", ctx_size, 0, INT_MAX),
 	S_INT("threads", "Threads", "0 = auto-detect", n_threads, 0, 4096),
 };
 
 static const field_desc DIFFUSION_FIELDS[] = {
-	S_PATH("vae", "VAE path", "path to the VAE GGUF file", vae, SC_PATH_MAX),
-	S_PATH("llm", "LLM path", "path to the text encoder LLM GGUF file", llm, SC_PATH_MAX),
+	S_MODEL_PATH("vae", "VAE path", "VAE GGUF file, relative to the models directory", vae,
+				 SC_PATH_MAX, "image"),
+	S_MODEL_PATH("llm", "LLM path", "text encoder LLM GGUF file, relative to the models directory",
+				 llm, SC_PATH_MAX, "language"),
 	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
 		  negative_prompt, SC_SYSTEM_MAX),
 	S_INT_STEP("width", "Width", "pixels, multiple of 32", width, 32, 16384,
@@ -595,134 +609,182 @@ static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char
 	return 1;
 }
 
-static int ini_finish_hcs(saved_config *sc, const hcs_loader *loader, bool hcs_used,
-						  const hcs_legacy *legacy, char *err, size_t errlen) {
-	if (!hcs_used)
+typedef struct {
+	const schema_tab *tab;
+	int				  hcs_section;
+	bool			  hcs_used;
+	bool			  skipping;
+	bool			  lenient;
+	hcs_loader		  loader;
+	hcs_legacy		  legacy;
+} ini_parser;
+
+typedef struct {
+	char  *buf;
+	size_t cap;
+	size_t len;
+} ini_warnings;
+
+static void ini_warn(ini_warnings *w, const char *msg) {
+	size_t n = strlen(msg);
+	if (!w->buf || w->len + n + 2 > w->cap)
+		return;
+	memcpy(w->buf + w->len, msg, n);
+	w->len += n;
+	w->buf[w->len++] = '\n';
+	w->buf[w->len]	 = '\0';
+}
+
+static int ini_finish_hcs(saved_config *sc, ini_parser *p, char *err, size_t errlen) {
+	const hcs_legacy *legacy = &p->legacy;
+	if (!p->hcs_used)
 		return hcs_migrate_legacy(&sc->hcs, legacy, err, errlen);
 	if (legacy->has_device || legacy->has_ngl || legacy->has_cache) {
 		snprintf(err, errlen,
 				 "legacy keys ([model] device/ngl, [moe] cache) cannot be combined with [hcs]");
 		return -1;
 	}
-	return hcs_loader_finish(loader, &sc->hcs, err, errlen);
+	return hcs_loader_finish(&p->loader, &sc->hcs, err, errlen);
 }
 
-static int ini_apply(saved_config *sc, const char *data, char *err, size_t errlen) {
-	ini_cursor		  cur = {data, 0};
-	char			  line[SC_SYSTEM_MAX * 2];
-	const schema_tab *tab		  = NULL;
-	int				  hcs_section = HCS_SECTION_NONE;
-	bool			  hcs_used	  = false;
-	hcs_loader		  loader;
-	hcs_legacy		  legacy = {0};
-	int				  r;
-
-	hcs_loader_init(&loader);
-
-	while ((r = ini_next_line(&cur, line, sizeof(line))) == 1) {
-		str_span	sp	= span_trim(line, strlen(line));
-		const char *s	= sp.p;
-		size_t		len = sp.len;
-		if (len == 0 || s[0] == '#' || s[0] == ';')
-			continue;
-
-		if (s[0] == '[') {
-			const char *close = memchr(s, ']', len);
-			if (!close) {
-				snprintf(err, errlen, "line %d: missing ']' after section name", cur.line_no);
-				return -1;
-			}
-			str_span sec = span_trim(s + 1, (size_t)(close - s - 1));
-			if (sec.len == 0) {
-				snprintf(err, errlen, "line %d: empty section name", cur.line_no);
-				return -1;
-			}
-			str_span device = {0};
-			tab				= NULL;
-			hcs_section		= HCS_SECTION_NONE;
-			if (section_is_hcs(sec, &device)) {
-				hcs_used	= true;
-				hcs_section = HCS_SECTION_ROOT;
-				if (device.len > 0) {
-					char name[HCS_NAME_MAX];
-					snprintf(name, sizeof(name), "%.*s", (int)device.len, device.p);
-					char perr[SC_ERR_MAX];
-					hcs_section = hcs_loader_open_section(&loader, name, perr, sizeof(perr));
-					if (hcs_section < 0) {
-						snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-						return -1;
-					}
-				}
-				continue;
-			}
-			tab = find_tab(sec.p, sec.len);
-			if (!tab) {
-				snprintf(err, errlen, "line %d: unknown section '%.*s'", cur.line_no, (int)sec.len,
-						 sec.p);
-				return -1;
-			}
-			continue;
-		}
-
-		const char *eq = memchr(s, '=', len);
-		if (!eq) {
-			snprintf(err, errlen, "line %d: expected 'key = value'", cur.line_no);
-			return -1;
-		}
-		str_span key = span_trim(s, (size_t)(eq - s));
-		str_span val = span_trim(eq + 1, len - (size_t)(eq - s) - 1);
-		if (key.len == 0) {
-			snprintf(err, errlen, "line %d: empty key", cur.line_no);
-			return -1;
-		}
-		if (!tab && hcs_section == HCS_SECTION_NONE) {
-			snprintf(err, errlen, "line %d: '%.*s' appears before any section", cur.line_no,
-					 (int)key.len, key.p);
-			return -1;
-		}
-		char perr[SC_ERR_MAX];
-		char keybuf[SC_TEXT_MAX];
-		char valbuf[SC_SYSTEM_MAX * 2];
-		if (val.len >= sizeof(valbuf))
-			val.len = sizeof(valbuf) - 1;
-		snprintf(keybuf, sizeof(keybuf), "%.*s", (int)key.len, key.p);
-		memcpy(valbuf, val.p, val.len);
-		valbuf[val.len] = '\0';
-
-		if (!tab) {
-			if (hcs_loader_set(&loader, hcs_section, keybuf, valbuf, perr, sizeof(perr)) < 0) {
-				snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-				return -1;
-			}
-			continue;
-		}
-		int legacy_rc = take_legacy_key(&legacy, tab, keybuf, valbuf, perr, sizeof(perr));
-		if (legacy_rc < 0) {
-			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-			return -1;
-		}
-		if (legacy_rc > 0)
-			continue;
-
-		const field_desc *f = find_field(tab, key.p, key.len);
-		if (!f) {
-			snprintf(err, errlen, "line %d: unknown key '%.*s' in section [%s]", cur.line_no,
-					 (int)key.len, key.p, tab->name);
-			return -1;
-		}
-		if (sc_parse_value(sc, f, valbuf, perr, sizeof(perr)) < 0) {
-			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-			return -1;
-		}
-	}
-	if (r < 0) {
-		snprintf(err, errlen, "line %d: line too long", cur.line_no);
+static int ini_section_line(ini_parser *p, const char *s, size_t len, int line_no, char *err,
+							size_t errlen) {
+	p->tab			  = NULL;
+	p->hcs_section	  = HCS_SECTION_NONE;
+	p->skipping		  = true;
+	const char *close = memchr(s, ']', len);
+	if (!close) {
+		snprintf(err, errlen, "line %d: missing ']' after section name", line_no);
 		return -1;
 	}
-	return ini_finish_hcs(sc, &loader, hcs_used, &legacy, err, errlen);
+	str_span sec = span_trim(s + 1, (size_t)(close - s - 1));
+	if (sec.len == 0) {
+		snprintf(err, errlen, "line %d: empty section name", line_no);
+		return -1;
+	}
+	str_span device = {0};
+	if (section_is_hcs(sec, &device)) {
+		p->hcs_used	   = true;
+		p->hcs_section = HCS_SECTION_ROOT;
+		if (device.len > 0) {
+			char name[HCS_NAME_MAX];
+			char perr[SC_ERR_MAX];
+			snprintf(name, sizeof(name), "%.*s", (int)device.len, device.p);
+			p->hcs_section = hcs_loader_open_section(&p->loader, name, perr, sizeof(perr));
+			if (p->hcs_section < 0) {
+				p->hcs_section = HCS_SECTION_NONE;
+				snprintf(err, errlen, "line %d: %s", line_no, perr);
+				return -1;
+			}
+		}
+		p->skipping = false;
+		return 0;
+	}
+	p->tab = find_tab(sec.p, sec.len);
+	if (!p->tab) {
+		snprintf(err, errlen, "line %d: unknown section '%.*s'", line_no, (int)sec.len, sec.p);
+		return -1;
+	}
+	p->skipping = false;
+	return 0;
 }
 
-int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
+static int ini_key_line(ini_parser *p, saved_config *sc, const char *s, size_t len, int line_no,
+						char *err, size_t errlen) {
+	const char *eq = memchr(s, '=', len);
+	if (!eq) {
+		snprintf(err, errlen, "line %d: expected 'key = value'", line_no);
+		return -1;
+	}
+	str_span key = span_trim(s, (size_t)(eq - s));
+	str_span val = span_trim(eq + 1, len - (size_t)(eq - s) - 1);
+	if (key.len == 0) {
+		snprintf(err, errlen, "line %d: empty key", line_no);
+		return -1;
+	}
+	if (p->skipping)
+		return 0;
+	if (!p->tab && p->hcs_section == HCS_SECTION_NONE) {
+		snprintf(err, errlen, "line %d: '%.*s' appears before any section", line_no, (int)key.len,
+				 key.p);
+		return -1;
+	}
+	char perr[SC_ERR_MAX];
+	char keybuf[SC_TEXT_MAX];
+	char valbuf[SC_SYSTEM_MAX * 2];
+	if (val.len >= sizeof(valbuf))
+		val.len = sizeof(valbuf) - 1;
+	snprintf(keybuf, sizeof(keybuf), "%.*s", (int)key.len, key.p);
+	memcpy(valbuf, val.p, val.len);
+	valbuf[val.len] = '\0';
+
+	if (!p->tab) {
+		if (hcs_loader_set(&p->loader, p->hcs_section, keybuf, valbuf, perr, sizeof(perr)) < 0) {
+			snprintf(err, errlen, "line %d: %s", line_no, perr);
+			return -1;
+		}
+		return 0;
+	}
+	int legacy_rc = take_legacy_key(&p->legacy, p->tab, keybuf, valbuf, perr, sizeof(perr));
+	if (legacy_rc < 0) {
+		snprintf(err, errlen, "line %d: %s", line_no, perr);
+		return -1;
+	}
+	if (legacy_rc > 0)
+		return 0;
+
+	const field_desc *f = find_field(p->tab, key.p, key.len);
+	if (!f) {
+		snprintf(err, errlen, "line %d: unknown key '%.*s' in section [%s]", line_no, (int)key.len,
+				 key.p, p->tab->name);
+		return -1;
+	}
+	if (sc_parse_value(sc, f, valbuf, perr, sizeof(perr)) < 0) {
+		snprintf(err, errlen, "line %d: %s", line_no, perr);
+		return -1;
+	}
+	return 0;
+}
+
+static int ini_apply(saved_config *sc, const char *data, bool lenient, ini_warnings *warn,
+					 char *err, size_t errlen) {
+	ini_cursor cur = {data, 0};
+	char	   line[SC_SYSTEM_MAX * 2];
+	ini_parser p = {.hcs_section = HCS_SECTION_NONE, .lenient = lenient};
+	hcs_loader_init(&p.loader);
+
+	for (;;) {
+		int r = ini_next_line(&cur, line, sizeof(line));
+		if (r == 0)
+			break;
+		int		 rc = -1;
+		str_span sp = span_trim(line, strlen(line));
+		if (r < 0)
+			snprintf(err, errlen, "line %d: line too long", cur.line_no);
+		else if (sp.len == 0 || sp.p[0] == '#' || sp.p[0] == ';')
+			continue;
+		else if (sp.p[0] == '[')
+			rc = ini_section_line(&p, sp.p, sp.len, cur.line_no, err, errlen);
+		else
+			rc = ini_key_line(&p, sc, sp.p, sp.len, cur.line_no, err, errlen);
+		if (rc == 0)
+			continue;
+		if (!lenient)
+			return -1;
+		ini_warn(warn, err);
+	}
+
+	int rc = ini_finish_hcs(sc, &p, err, errlen);
+	if (rc == 0 || !lenient)
+		return rc;
+	ini_warn(warn, err);
+	if (p.hcs_used)
+		hcs_loader_finish_lenient(&p.loader, &sc->hcs);
+	return 0;
+}
+
+static int sc_load_impl(const char *path, saved_config *sc, bool lenient, ini_warnings *warn,
+						char *err, size_t errlen) {
 	sc_defaults(sc);
 
 	size_t len	= 0;
@@ -735,8 +797,10 @@ int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
 		(unsigned char)data[2] == 0xBF)
 		parse = data + 3;
 
-	int rc = ini_apply(sc, parse, err, errlen);
+	int rc = ini_apply(sc, parse, lenient, warn, err, errlen);
 	if (rc == 0) {
+		if (!sc->hcs.enabled)
+			hcs_set_simple(&sc->hcs, sc->hcs.devices[0].name);
 		const char *base = path_basename(path);
 		size_t		bl	 = strlen(base);
 		if (bl > 5 && strcmp(base + bl - 5, ".conf") == 0)
@@ -748,6 +812,31 @@ int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
 	}
 	free(data);
 	return rc;
+}
+
+int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
+	ini_warnings none = {0};
+	return sc_load_impl(path, sc, false, &none, err, errlen);
+}
+
+int sc_load_lenient(const char *path, saved_config *sc, char *warn, size_t warnlen, char *err,
+					size_t errlen) {
+	if (warnlen)
+		warn[0] = '\0';
+	ini_warnings w = {warn, warnlen, 0};
+	return sc_load_impl(path, sc, true, &w, err, errlen);
+}
+
+static void resolve_in_place(char *path, size_t cap) {
+	char resolved[SC_PATH_MAX];
+	tui_resolve_path(path, resolved, sizeof(resolved));
+	snprintf(path, cap, "%s", resolved);
+}
+
+void sc_resolve_model_paths(saved_config *sc) {
+	resolve_in_place(sc->model, sizeof(sc->model));
+	resolve_in_place(sc->vae, sizeof(sc->vae));
+	resolve_in_place(sc->llm, sizeof(sc->llm));
 }
 
 static void write_hcs(FILE *fp, const hcs_config *h) {

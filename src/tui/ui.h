@@ -25,6 +25,7 @@ void ui_shutdown(void);
 void ui_after_resume(void);
 void ui_install_interrupt(void);
 int	 ui_getch(void);
+int	 ui_poll(void);
 
 int	 ui_disp_width(const char *s);
 void ui_center(int y, const char *s, chtype attr);

@@ -116,6 +116,7 @@ typedef struct {
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
+bool		ggml_type_loadable(uint32_t t);
 size_t		ggml_row_size(uint32_t type, size_t n);
 
 extern const uint32_t ggml_iq3s_grid[512];

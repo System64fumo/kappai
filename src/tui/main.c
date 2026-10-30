@@ -6,6 +6,8 @@
 #include "menu.h"
 #include "schema.h"
 #include "server/openai.h"
+#include "settings.h"
+#include "setup.h"
 #include "ui.h"
 
 #include <locale.h>
@@ -56,7 +58,8 @@ static void wait_for_keypress(void) {
 		;
 }
 
-static int run_saved_config(const saved_config *sc, bool server_mode) {
+static int run_saved_config(saved_config *sc, bool server_mode) {
+	sc_resolve_model_paths(sc);
 	char hcs_err[HCS_ERR_MAX];
 	if (hcs_validate(&sc->hcs, sc->model, sc->moe_stream, hcs_err, sizeof(hcs_err)) < 0) {
 		fprintf(stderr, "kappai: malformed/misconfigured config '%s':\n%s", sc->name, hcs_err);
@@ -160,14 +163,26 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "usage: %s [config_name chat|server]\n", argv[0]);
 		return 1;
 	}
-	if (argc == 3)
+	if (argc == 3) {
+		char settings_err[SC_ERR_MAX];
+		if (tui_settings_load(settings_err, sizeof(settings_err)) < 0) {
+			fprintf(stderr, "kappai: %s\n", settings_err);
+			return 1;
+		}
 		return launch_config(argv[1], argv[2]);
+	}
 
 	setlocale(LC_ALL, "");
 	if (ui_init() < 0) {
 		fprintf(stderr, "failed to initialize the terminal\n");
 		return 1;
 	}
+
+	char settings_err[SC_ERR_MAX];
+	if (tui_settings_load(settings_err, sizeof(settings_err)) < 0)
+		ui_message("Could not load TUI settings", settings_err, true);
+	if (!tui_settings_get()->setup_done)
+		setup_run();
 
 	int rc = 0;
 	for (;;) {
@@ -178,12 +193,11 @@ int main(int argc, char **argv) {
 		}
 		if (mr.action == MENU_QUIT)
 			break;
-		if (mr.action == MENU_NEW) {
-			editor_run(NULL);
-			continue;
-		}
-		if (mr.action == MENU_EDIT) {
-			editor_run(&mr.entry);
+		if (mr.action == MENU_NEW || mr.action == MENU_EDIT) {
+			char saved[SC_NAME_MAX];
+			editor_run(mr.action == MENU_EDIT ? &mr.entry : NULL, saved, sizeof(saved));
+			if (saved[0])
+				menu_select(saved);
 			continue;
 		}
 		if (mr.action == MENU_RUN) {

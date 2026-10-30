@@ -311,6 +311,19 @@ int hcs_loader_set(hcs_loader *l, int section, const char *key, const char *valu
 	return set_section_key(&l->sections[section], key, value, err, errlen);
 }
 
+static int find_section(const hcs_loader *l, const char *name) {
+	for (int i = 0; i < l->n_sections; i++)
+		if (strcmp(l->sections[i].name, name) == 0)
+			return i;
+	return -1;
+}
+
+static void append_section_device(hcs_config *h, const hcs_section *s, const char *name) {
+	hcs_device *d = &h->devices[h->n_devices++];
+	*d			  = s->dev;
+	snprintf(d->name, HCS_NAME_MAX, "%s", name);
+}
+
 int hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t errlen) {
 	if (!l->has_devices) {
 		snprintf(err, errlen, "section [hcs] requires 'devices'");
@@ -327,17 +340,13 @@ int hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t er
 			snprintf(err, errlen, "'devices' lists more than %d devices", HCS_MAX_DEVICES);
 			return -1;
 		}
-		int found = -1;
-		for (int i = 0; i < l->n_sections; i++)
-			if (strcmp(l->sections[i].name, tok) == 0)
-				found = i;
+		int found = find_section(l, tok);
 		if (found < 0) {
 			snprintf(err, errlen, "device '%s' has no [hcs.%s] section", tok, tok);
 			return -1;
 		}
-		used[found]				 = true;
-		h.devices[h.n_devices++] = l->sections[found].dev;
-		snprintf(h.devices[h.n_devices - 1].name, HCS_NAME_MAX, "%s", tok);
+		used[found] = true;
+		append_section_device(&h, &l->sections[found], tok);
 	}
 	for (int i = 0; i < l->n_sections; i++) {
 		if (!used[i]) {
@@ -351,6 +360,33 @@ int hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t er
 		hcs_set_simple(&h, "");
 	*out = h;
 	return 0;
+}
+
+void hcs_loader_finish_lenient(const hcs_loader *l, hcs_config *out) {
+	bool		used[HCS_MAX_DEVICES] = {false};
+	char		tok[HCS_NAME_MAX];
+	const char *cursor = l->has_devices ? l->devices : NULL;
+	hcs_config	h	   = {0};
+	while (h.n_devices < HCS_MAX_DEVICES && next_token(&cursor, tok, sizeof(tok))) {
+		if (!tok[0])
+			continue;
+		int found = find_section(l, tok);
+		if (found >= 0) {
+			used[found] = true;
+			append_section_device(&h, &l->sections[found], tok);
+			continue;
+		}
+		hcs_device *d = &h.devices[h.n_devices++];
+		device_defaults(d);
+		snprintf(d->name, HCS_NAME_MAX, "%s", tok);
+	}
+	for (int i = 0; i < l->n_sections && h.n_devices < HCS_MAX_DEVICES; i++)
+		if (!used[i])
+			append_section_device(&h, &l->sections[i], l->sections[i].name);
+	if (h.n_devices == 0)
+		return;
+	h.enabled = l->has_enabled ? l->enabled : true;
+	*out	  = h;
 }
 
 int hcs_migrate_legacy(hcs_config *h, const hcs_legacy *legacy, char *err, size_t errlen) {

@@ -19,6 +19,7 @@ typedef struct {
 	sc_entry	entry;
 } menu_result;
 
-int menu_run(menu_result *out);
+int	 menu_run(menu_result *out);
+void menu_select(const char *name);
 
 #endif

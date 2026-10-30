@@ -120,6 +120,10 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 	return table[t].name ? &table[t] : NULL;
 }
 
+bool ggml_type_loadable(uint32_t t) {
+	return t < GGML_TYPE_Q8_0_REPACKED && ggml_type_lookup(t) != NULL;
+}
+
 const char *ggml_type_name(uint32_t t) {
 	const ggml_type_info *info = ggml_type_lookup(t);
 	return info ? info->name : "?";

@@ -83,6 +83,7 @@ int	 hcs_loader_open_section(hcs_loader *l, const char *device, char *err, size_
 int	 hcs_loader_set(hcs_loader *l, int section, const char *key, const char *value, char *err,
 					size_t errlen);
 int	 hcs_loader_finish(const hcs_loader *l, hcs_config *out, char *err, size_t errlen);
+void hcs_loader_finish_lenient(const hcs_loader *l, hcs_config *out);
 
 int hcs_migrate_legacy(hcs_config *h, const hcs_legacy *legacy, char *err, size_t errlen);
 

@@ -97,6 +97,12 @@ int ui_getch(void) {
 	}
 }
 
+int ui_poll(void) {
+	if (ui_interrupt)
+		return KBD_INTERRUPT;
+	return getch();
+}
+
 int ui_disp_width(const char *s) {
 	int w = 0;
 	for (const unsigned char *p = (const unsigned char *)s; *p; p++)
