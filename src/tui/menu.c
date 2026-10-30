@@ -11,6 +11,14 @@
 #define MENU_CHROME_ROWS 6
 #define MENU_MIN_COL_W 30
 
+static const char *menu_display_name(const char *name, char *out, size_t cap) {
+	snprintf(out, cap, "%s", name);
+	for (char *p = out; *p; p++)
+		if (*p == '_')
+			*p = ' ';
+	return out;
+}
+
 typedef struct {
 	sc_entry entries[SC_MAX_CONFIGS];
 	int		 n;
@@ -32,7 +40,8 @@ void menu_select(const char *name) {
 static void menu_measure(menu_state *m) {
 	int w = MENU_MIN_COL_W;
 	for (int i = 0; i < m->n; i++) {
-		int name_w = ui_disp_width(m->entries[i].name) + 4;
+		char disp[SC_NAME_MAX];
+		int	 name_w = ui_disp_width(menu_display_name(m->entries[i].name, disp, sizeof(disp))) + 4;
 		if (name_w > w)
 			w = name_w;
 	}
@@ -109,7 +118,9 @@ static void menu_draw(menu_state *m) {
 	for (int i = 0; i < shown; i++) {
 		int	   idx	= m->vis_top + i;
 		chtype attr = (idx == m->sel) ? (A_REVERSE | A_BOLD) : 0;
-		ui_cell(y + i, x, m->col_w, m->entries[idx].name, attr);
+		char   disp[SC_NAME_MAX];
+		ui_cell(y + i, x, m->col_w, menu_display_name(m->entries[idx].name, disp, sizeof(disp)),
+				attr);
 	}
 	if (m->n > shown) {
 		char pos[16];
@@ -117,8 +128,8 @@ static void menu_draw(menu_state *m) {
 		ui_center(y + list_rows, pos, ui_attr(UI_DIM));
 	}
 	ui_putn(LINES - 1, 2,
-			"Up/Down: select   Enter: run   E: edit   N: new   X: delete   S: settings   "
-			"Left/Right: chat/server   Esc: quit",
+			"Esc: quit   Enter: run   S: settings   N: new   E: edit   X: delete   "
+			"Left/Right: mode",
 			COLS - 4, ui_attr(UI_DIM));
 	refresh();
 }
@@ -133,8 +144,10 @@ static void menu_help(void) {
 }
 
 static void menu_delete(menu_state *m) {
+	char disp[SC_NAME_MAX];
 	char msg[SC_NAME_MAX + 64];
-	snprintf(msg, sizeof(msg), "Are you sure you want to delete '%s'?", m->entries[m->sel].name);
+	snprintf(msg, sizeof(msg), "Are you sure you want to delete '%s'?",
+			 menu_display_name(m->entries[m->sel].name, disp, sizeof(disp)));
 	if (tui_settings_get()->confirm_delete && !ui_confirm("Delete config", msg))
 		return;
 	char err[SC_ERR_MAX];

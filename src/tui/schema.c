@@ -196,19 +196,20 @@ const char *sc_field_hint(const field_desc *f) {
 	return f->hint ? f->hint : "";
 }
 
-const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen) {
+const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen,
+							bool display) {
 	switch (f->type) {
 	case FLD_STR: {
 		const char *val = (const char *)((const char *)sc + f->offset);
-		if (f->uik == UIK_MULTI && !val[0] && f->empty_all)
+		if (display && f->uik == UIK_MULTI && !val[0] && f->empty_all)
 			return "all";
 		return val;
 	}
 	case FLD_INT: {
 		int v = *(int *)((char *)sc + f->offset);
-		if (v == 0 && strcmp(f->key, "ctx_size") == 0)
+		if (display && v == 0 && strcmp(f->key, "ctx_size") == 0)
 			return "Max trained limit";
-		if (v == 0 && strcmp(f->key, "threads") == 0)
+		if (display && v == 0 && strcmp(f->key, "threads") == 0)
 			return "All";
 		snprintf(buf, buflen, "%d", v);
 		return buf;
@@ -224,7 +225,7 @@ const char *sc_format_value(const saved_config *sc, const field_desc *f, char *b
 	}
 	case FLD_U64: {
 		uint64_t v = *(uint64_t *)((char *)sc + f->offset);
-		if (v == 0 && strcmp(f->key, "seed") == 0)
+		if (display && v == 0 && strcmp(f->key, "seed") == 0)
 			return "Random";
 		snprintf(buf, buflen, "%llu", (unsigned long long)v);
 		return buf;
@@ -905,7 +906,7 @@ int sc_save(const saved_config *sc, const char *orig_name, char *err, size_t err
 		for (int i = 0; i < tab->n_fields; i++) {
 			const field_desc *f = &tab->fields[i];
 			char			  vbuf[SC_SYSTEM_MAX + 16];
-			const char		 *val = sc_format_value(sc, f, vbuf, sizeof(vbuf));
+			const char		 *val = sc_format_value(sc, f, vbuf, sizeof(vbuf), false);
 			fprintf(fp, "%s = %s\n", f->key, val);
 		}
 		fputc('\n', fp);

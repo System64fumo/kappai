@@ -115,7 +115,8 @@ typedef struct {
 } sc_entry;
 
 void	   *sc_field_ptr(saved_config *sc, const field_desc *f);
-const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen);
+const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen,
+							bool display);
 int			sc_parse_value(saved_config *sc, const field_desc *f, const char *value, char *err,
 						   size_t errlen);
 const char *sc_field_hint(const field_desc *f);

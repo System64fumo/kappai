@@ -635,7 +635,7 @@ static void editor_draw_rows(const editor_state *st) {
 		} else {
 			f = editor_field_at(st, st->tab, row);
 			snprintf(label, sizeof(label), "%s", f->label);
-			val = sc_format_value(&st->sc, f, vbuf, sizeof(vbuf));
+			val = sc_format_value(&st->sc, f, vbuf, sizeof(vbuf), true);
 		}
 
 		if (selected)
@@ -974,7 +974,7 @@ static void editor_edit_field(editor_state *st, const field_desc *f) {
 	}
 
 	char		buf[SC_SYSTEM_MAX + 16];
-	const char *cur = sc_format_value(&st->sc, f, buf, sizeof(buf));
+	const char *cur = sc_format_value(&st->sc, f, buf, sizeof(buf), true);
 	char		initial[SC_SYSTEM_MAX + 16];
 	if (f->type == FLD_INT)
 		snprintf(initial, sizeof(initial), "%d", *(int *)sc_field_ptr(&st->sc, f));
