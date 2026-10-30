@@ -118,7 +118,7 @@ static void menu_draw(menu_state *m) {
 	}
 	ui_putn(LINES - 1, 2,
 			"Up/Down: select   Enter: run   E: edit   N: new   X: delete   S: settings   "
-			"Tab: chat/server   Esc: quit",
+			"Left/Right: chat/server   Esc: quit",
 			COLS - 4, ui_attr(UI_DIM));
 	refresh();
 }
@@ -127,7 +127,7 @@ static void menu_help(void) {
 	ui_message("Help",
 			   "Up/Down, PgUp/PgDn, Home/End: select   Enter: run\nE: edit   N: new   X: delete "
 			   "(with confirm)\nS: settings page (models directory, Hugging Face downloads)\n"
-			   "Tab: switch chat / OpenAI-server run mode\nR: rescan the config directory\n"
+			   "Left/Right: switch chat / OpenAI-server run mode\nR: rescan the config directory\n"
 			   "H or F1: this help   Esc: quit",
 			   false);
 }
@@ -203,8 +203,8 @@ int menu_run(menu_result *out) {
 		case KEY_END:
 			m.sel = MAX(m.n - 1, 0);
 			break;
-		case '\t':
-		case KEY_BTAB:
+		case KEY_RIGHT:
+		case KEY_LEFT:
 			m.server_mode = !m.server_mode;
 			break;
 		case '\n':

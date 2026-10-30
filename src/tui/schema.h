@@ -31,7 +31,6 @@ typedef struct {
 	char output_dir[SC_PATH_MAX];
 	char preview_path[SC_PATH_MAX];
 	char repack[SC_TEXT_MAX];
-	char fuse[SC_TEXT_MAX];
 	char moe_pin_list[SC_PINLIST_MAX];
 	char monitor[SC_PATH_MAX];
 	char metrics[SC_METRICS_MAX];
@@ -45,8 +44,6 @@ typedef struct {
 
 	int ctx_size;
 	int n_threads;
-	int kv_quant;
-	int n_predict;
 	int top_k;
 	int repeat_last_n;
 	int server_port;
@@ -68,11 +65,6 @@ typedef struct {
 	bool moe_preload;
 	bool reasoning;
 	bool warmup;
-	bool output_stream;
-	bool profile_time;
-	bool debug;
-	bool debug_forward;
-	bool disable_failsafes;
 } saved_config;
 
 typedef enum {

@@ -75,7 +75,7 @@ static int run_saved_config(saved_config *sc, bool server_mode) {
 		diffusion_params params;
 		diffusion_output out;
 		sc_materialize_diffusion(sc, &files, &params, &out);
-		return diffusion_run(&files, &params, &out, sc->debug);
+		return diffusion_run(&files, &params, &out, false);
 	}
 
 	config	 cfg;

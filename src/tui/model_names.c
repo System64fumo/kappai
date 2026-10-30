@@ -8,6 +8,21 @@
 
 #define QUANT_PATH_MAX 512
 #define SHARD_TAIL 20
+#define SAFETENSORS_SUFFIX ".safetensors"
+
+static bool has_suffix_ci(const char *name, const char *suffix) {
+	size_t n = strlen(name);
+	size_t s = strlen(suffix);
+	return n > s && strcasecmp(name + n - s, suffix) == 0;
+}
+
+bool model_has_gguf_suffix(const char *name) {
+	return has_suffix_ci(name, ".gguf");
+}
+
+bool model_has_safetensors_suffix(const char *name) {
+	return has_suffix_ci(name, SAFETENSORS_SUFFIX);
+}
 
 const char *const MODEL_TYPE_NAMES[MODEL_TYPE_COUNT] = {"language",	 "image",	 "audio",
 														"embedding", "decision", "other"};
@@ -35,8 +50,10 @@ void model_detect_quant(const char *path, char *out, size_t cap) {
 	char stem[QUANT_PATH_MAX];
 	snprintf(stem, sizeof(stem), "%s", path);
 	size_t len = strlen(stem);
-	if (len > 5 && strcasecmp(stem + len - 5, ".gguf") == 0)
+	if (model_has_gguf_suffix(stem))
 		stem[len - 5] = '\0';
+	else if (model_has_safetensors_suffix(stem))
+		stem[len - strlen(SAFETENSORS_SUFFIX)] = '\0';
 	snprintf(out, cap, "?");
 	char *save = NULL;
 	for (char *tok = strtok_r(stem, "-./", &save); tok; tok = strtok_r(NULL, "-./", &save)) {

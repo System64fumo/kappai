@@ -222,9 +222,10 @@ static void draw_panel(const browser *b) {
 }
 
 static const char *key_bar(const browser *b) {
-	return b->manage
-			   ? "D: download   X: delete   C: add custom model   Tab: switch tab   Esc: back"
-			   : "Enter: select   C: custom model   D: download   Tab: switch tab   Esc: cancel";
+	return b->manage ? "D: download   X: delete   C: add custom model   Left/Right: switch tab   "
+					   "Esc: back"
+					 : "Enter: select   C: custom model   D: download   Left/Right: switch tab   "
+					   "Esc: cancel";
 }
 
 static void draw(const browser *b, const char *title) {
@@ -267,8 +268,8 @@ static int validate_custom(const char *value, char *err, size_t errlen, void *ud
 
 static bool add_custom(browser *b, char *added, size_t cap) {
 	char buf[SC_PATH_MAX], expanded[SC_PATH_MAX], err[SC_ERR_MAX];
-	if (ui_input("Custom model path (.gguf file)", "", buf, sizeof(buf), validate_custom, NULL,
-				 ui_path_complete) <= 0)
+	if (ui_input("Custom model path (.gguf or .safetensors file)", "", buf, sizeof(buf),
+				 validate_custom, NULL, ui_path_complete) <= 0)
 		return false;
 	if (tui_custom_check(buf, expanded, sizeof(expanded), err, sizeof(err)) < 0 ||
 		tui_settings_add_custom(expanded, err, sizeof(err)) < 0) {
@@ -332,10 +333,10 @@ static model_pick_result run_loop(browser *b, const char *title, char *out, size
 		case KEY_END:
 			move_selection(b, LIB_MAX_MODELS);
 			break;
-		case '	':
+		case KEY_RIGHT:
 			switch_tab(b, 1);
 			break;
-		case KEY_BTAB:
+		case KEY_LEFT:
 			switch_tab(b, -1);
 			break;
 		case 'c':

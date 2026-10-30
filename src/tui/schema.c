@@ -21,11 +21,9 @@ typedef struct {
 	int			line_no;
 } ini_cursor;
 
-static const char *const kv_quant_choices[] = {"f16", "q8_0", NULL};
-static const char *const repack_choices[]	= {
+static const char *const repack_choices[] = {
 	"iq3_s", "q8_0", "iq4_nl", "q4_0", "q4_k", "q5_k", "q6_k", NULL,
 };
-static const char *const fuse_choices[] = {"qkv", NULL};
 
 #define S_STR(k, l, h, f, cap)                                                                     \
 	{.key	  = k,                                                                                 \
@@ -113,27 +111,22 @@ static const char *const fuse_choices[] = {"qkv", NULL};
 	 .offset = offsetof(saved_config, f),                                                          \
 	 .uik	 = UIK_TEXT}
 
-static const field_desc MODEL_FIELDS[] = {
+static const field_desc MAIN_FIELDS[] = {
 	S_MODEL_PATH("model", "Model path",
 				 "GGUF model file, relative paths resolve against the models directory", model,
 				 SC_PATH_MAX, "language"),
-	S_INT("ctx_size", "Context size", "0 = use model default", ctx_size, 0, INT_MAX),
-	S_INT("threads", "Threads", "0 = auto-detect", n_threads, 0, 4096),
+	S_MODEL_PATH("vae", "VAE path", "VAE GGUF file, relative to the models directory", vae,
+				 SC_PATH_MAX, "image"),
+	S_MODEL_PATH("llm", "Text encoder", "text encoder GGUF file, relative to the models directory",
+				 llm, SC_PATH_MAX, "language"),
+	S_STR("monitor", "Monitor socket", "monitoring socket path, empty = off", monitor, SC_PATH_MAX),
 };
 
 static const field_desc DIFFUSION_FIELDS[] = {
-	S_MODEL_PATH("vae", "VAE path", "VAE GGUF file, relative to the models directory", vae,
-				 SC_PATH_MAX, "image"),
-	S_MODEL_PATH("llm", "LLM path", "text encoder LLM GGUF file, relative to the models directory",
-				 llm, SC_PATH_MAX, "language"),
-	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
-		  negative_prompt, SC_SYSTEM_MAX),
 	S_INT_STEP("width", "Width", "pixels, multiple of 32", width, 32, 16384,
 			   DIFFUSION_DIMENSION_STEP),
 	S_INT_STEP("height", "Height", "pixels, multiple of 32", height, 32, 16384,
 			   DIFFUSION_DIMENSION_STEP),
-	S_INT("steps", "Steps", "denoising steps", steps, 1, 1000),
-	S_FLT("cfg_scale", "CFG scale", "prompt guidance, 1.0 = no guidance", cfg_scale, 0.0, 1000.0),
 	S_PATH("output_dir", "Output directory", "final images are saved here, created if missing",
 		   output_dir, SC_PATH_MAX),
 	S_PATH("preview_path", "Preview image", "PNG rewritten while generating, empty = off",
@@ -143,22 +136,15 @@ static const field_desc DIFFUSION_FIELDS[] = {
 };
 
 static const field_desc ENGINE_FIELDS[] = {
+	S_BOOL("reasoning", "Reasoning", "allow model thinking", reasoning),
 	S_BOOL("flash_attn", "Flash attention", "flash attention kernels", flash_attn),
-	S_ENUM("kv_quant", "KV cache quant", "KV cache precision", kv_quant, kv_quant_choices),
+	S_INT("ctx_size", "Context size", "0 = max trained limit", ctx_size, 0, INT_MAX),
+	S_INT("threads", "Threads", "0/* = all cores", n_threads, 0, 4096),
 	S_BOOL("mmap", "mmap weights", "memory-map model weights", use_mmap),
 	S_MULTI("repack", "Repack", "select weight types to repack", repack, SC_TEXT_MAX,
 			repack_choices, true),
-	S_MULTI("fuse", "Weight fusion", "select load-time fusions", fuse, SC_TEXT_MAX, fuse_choices,
-			false),
-	S_STR("monitor", "Monitor socket", "monitoring socket path, empty = off", monitor, SC_PATH_MAX),
 	S_BOOL("warmup", "Warmup", "pre-process chat template prefix at startup", warmup),
 	S_STR("metrics", "Metrics", "comma list: pp, tg, ttft", metrics, SC_METRICS_MAX),
-	S_U64("seed", "Seed", "0 = random each run", seed),
-	S_BOOL("profile_time", "Timing breakdown", "print per-stage timings", profile_time),
-	S_BOOL("debug", "Debug logging", "verbose debug logs", debug),
-	S_BOOL("debug_forward", "Forward debug", "per-layer activation stats", debug_forward),
-	S_BOOL("disable_failsafes", "Failsafes off", "skip memory guardrails (unsafe)",
-		   disable_failsafes),
 };
 
 static const field_desc MOE_FIELDS[] = {
@@ -170,6 +156,7 @@ static const field_desc MOE_FIELDS[] = {
 
 static const field_desc SAMPLING_FIELDS[] = {
 	S_STR("system", "System prompt", "default system prompt, single line", system, SC_SYSTEM_MAX),
+	S_U64("seed", "Seed", "0/* = random each run", seed),
 	S_FLT("temperature", "Temperature", "0 = greedy", temperature, 0.0, 1000.0),
 	S_INT("top_k", "Top-k", "0 = disabled", top_k, 0, INT_MAX),
 	S_FLT("top_p", "Top-p", "1.0 = disabled", top_p, 0.0, 1.0),
@@ -177,9 +164,10 @@ static const field_desc SAMPLING_FIELDS[] = {
 	S_FLT("repeat_penalty", "Repeat penalty", "1.0 = disabled", repeat_penalty, 1e-6, 1000.0),
 	S_INT("repeat_last_n", "Repeat window", "tokens considered by repeat penalty", repeat_last_n, 0,
 		  INT_MAX),
-	S_INT("n_predict", "Max tokens", "tokens per turn, -1 = unlimited", n_predict, -1, INT_MAX),
-	S_BOOL("reasoning", "Reasoning", "allow model thinking", reasoning),
-	S_BOOL("stream", "Stream output", "stream tokens while generating", output_stream),
+	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
+		  negative_prompt, SC_SYSTEM_MAX),
+	S_INT("steps", "Steps", "denoising steps", steps, 1, 1000),
+	S_FLT("cfg_scale", "CFG scale", "prompt guidance, 1.0 = no guidance", cfg_scale, 0.0, 1000.0),
 };
 
 static const field_desc SERVER_FIELDS[] = {
@@ -191,9 +179,9 @@ static const field_desc SERVER_FIELDS[] = {
 };
 
 const schema_tab SCHEMA_TABS[] = {
-	{"model", MODEL_FIELDS, ARRAY_LEN(MODEL_FIELDS)},
+	{"main", MAIN_FIELDS, ARRAY_LEN(MAIN_FIELDS)},
 	{"diffusion", DIFFUSION_FIELDS, ARRAY_LEN(DIFFUSION_FIELDS)},
-	{"engine", ENGINE_FIELDS, ARRAY_LEN(ENGINE_FIELDS)},
+	{"llm", ENGINE_FIELDS, ARRAY_LEN(ENGINE_FIELDS)},
 	{"moe", MOE_FIELDS, ARRAY_LEN(MOE_FIELDS)},
 	{"sampling", SAMPLING_FIELDS, ARRAY_LEN(SAMPLING_FIELDS)},
 	{"server", SERVER_FIELDS, ARRAY_LEN(SERVER_FIELDS)},
@@ -216,9 +204,15 @@ const char *sc_format_value(const saved_config *sc, const field_desc *f, char *b
 			return "all";
 		return val;
 	}
-	case FLD_INT:
-		snprintf(buf, buflen, "%d", *(int *)((char *)sc + f->offset));
+	case FLD_INT: {
+		int v = *(int *)((char *)sc + f->offset);
+		if (v == 0 && strcmp(f->key, "ctx_size") == 0)
+			return "Max trained limit";
+		if (v == 0 && strcmp(f->key, "threads") == 0)
+			return "All";
+		snprintf(buf, buflen, "%d", v);
 		return buf;
+	}
 	case FLD_FLOAT:
 		snprintf(buf, buflen, "%g", (double)*(float *)((char *)sc + f->offset));
 		return buf;
@@ -228,9 +222,13 @@ const char *sc_format_value(const saved_config *sc, const field_desc *f, char *b
 		int idx = *(int *)((char *)sc + f->offset);
 		return f->choices[idx];
 	}
-	case FLD_U64:
-		snprintf(buf, buflen, "%llu", (unsigned long long)*(uint64_t *)((char *)sc + f->offset));
+	case FLD_U64: {
+		uint64_t v = *(uint64_t *)((char *)sc + f->offset);
+		if (v == 0 && strcmp(f->key, "seed") == 0)
+			return "Random";
+		snprintf(buf, buflen, "%llu", (unsigned long long)v);
 		return buf;
+	}
 	}
 	return "";
 }
@@ -257,6 +255,10 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 		if (len == 0) {
 			snprintf(err, errlen, "empty value for '%s'", f->key);
 			return -1;
+		}
+		if (strcmp(f->key, "threads") == 0 && len == 1 && s[0] == '*') {
+			*(int *)sc_field_ptr(sc, f) = 0;
+			return 0;
 		}
 		char *end	= NULL;
 		errno		= 0;
@@ -331,6 +333,10 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 			snprintf(err, errlen, "empty value for '%s'", f->key);
 			return -1;
 		}
+		if (strcmp(f->key, "seed") == 0 && len == 1 && s[0] == '*') {
+			*(uint64_t *)sc_field_ptr(sc, f) = 0;
+			return 0;
+		}
 		char *end			 = NULL;
 		errno				 = 0;
 		unsigned long long n = strtoull(s, &end, 10);
@@ -357,26 +363,21 @@ void sc_defaults(saved_config *sc) {
 	snprintf(sc->metrics, sizeof(sc->metrics), "%s", a.metrics);
 	snprintf(sc->host, sizeof(sc->host), "%s", a.server_host);
 	snprintf(sc->repack, sizeof(sc->repack), "all");
-	snprintf(sc->fuse, sizeof(sc->fuse), "qkv");
 
 	sc->use_mmap   = c.use_mmap;
 	sc->flash_attn = c.flash_attn;
 	sc->reasoning  = c.reasoning;
 	sc->moe_stream = c.moe_stream;
 
-	sc->n_predict	   = a.n_predict;
 	sc->temperature	   = a.temperature;
 	sc->top_k		   = a.top_k;
 	sc->top_p		   = a.top_p;
 	sc->min_p		   = a.min_p;
 	sc->repeat_penalty = a.repeat_penalty;
 	sc->repeat_last_n  = a.repeat_last_n;
-	sc->output_stream  = a.output_stream;
 	sc->warmup		   = a.warmup;
 	sc->server_port	   = a.server_port;
 	sc->server_slots   = a.server_slots;
-
-	sc->kv_quant = KV_QUANT_F16;
 
 	snprintf(sc->output_dir, sizeof(sc->output_dir), ".");
 	diffusion_params defaults = diffusion_params_defaults();
@@ -570,7 +571,7 @@ static bool section_is_hcs(str_span sec, str_span *device) {
 
 static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char *key,
 						   const char *value, char *err, size_t errlen) {
-	bool is_model = strcasecmp(tab->name, "model") == 0;
+	bool is_model = strcasecmp(tab->name, "main") == 0;
 	bool is_moe	  = strcasecmp(tab->name, "moe") == 0;
 	if (is_moe && strcasecmp(key, "pin") == 0) {
 		char *end = NULL;
@@ -939,33 +940,25 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 
 	cfg->model		  = sc->model[0] ? sc->model : NULL;
 	cfg->repack		  = sc->repack[0] ? sc->repack : NULL;
-	cfg->fuse		  = sc->fuse[0] ? sc->fuse : NULL;
 	cfg->moe_pin_list = sc->moe_pin_list[0] ? sc->moe_pin_list : NULL;
 	cfg->monitor	  = sc->monitor[0] ? sc->monitor : NULL;
 	cfg->seed		  = sc->seed;
 	cfg->n_threads	  = sc->n_threads;
 	cfg->ctx_size	  = sc->ctx_size;
-	cfg->kv_quant	  = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
 	hcs_materialize(&sc->hcs, sc->model, cfg);
-	cfg->debug			   = sc->debug;
-	cfg->use_mmap		   = sc->use_mmap;
-	cfg->flash_attn		   = sc->flash_attn;
-	cfg->debug_forward	   = sc->debug_forward;
-	cfg->moe_stream		   = sc->moe_stream;
-	cfg->moe_preload	   = sc->moe_preload;
-	cfg->profile_time	   = sc->profile_time;
-	cfg->reasoning		   = sc->reasoning;
-	cfg->disable_failsafes = sc->disable_failsafes;
+	cfg->use_mmap	 = sc->use_mmap;
+	cfg->flash_attn	 = sc->flash_attn;
+	cfg->moe_stream	 = sc->moe_stream;
+	cfg->moe_preload = sc->moe_preload;
+	cfg->reasoning	 = sc->reasoning;
 
 	a->system		  = sc->system;
-	a->n_predict	  = sc->n_predict;
 	a->temperature	  = sc->temperature;
 	a->top_k		  = sc->top_k;
 	a->top_p		  = sc->top_p;
 	a->min_p		  = sc->min_p;
 	a->repeat_penalty = sc->repeat_penalty;
 	a->repeat_last_n  = sc->repeat_last_n;
-	a->output_stream  = sc->output_stream;
 	snprintf(a->metrics, sizeof(a->metrics), "%s", sc->metrics);
 	a->warmup		  = sc->warmup;
 	a->server_host	  = sc->host[0] ? sc->host : "127.0.0.1";

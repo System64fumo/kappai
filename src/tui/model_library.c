@@ -16,9 +16,8 @@
 
 #define LIB_MAX_DEPTH 4
 
-static bool has_gguf_suffix(const char *name) {
-	size_t n = strlen(name);
-	return n > 5 && strcasecmp(name + n - 5, ".gguf") == 0;
+static bool has_model_suffix(const char *name) {
+	return model_has_gguf_suffix(name) || model_has_safetensors_suffix(name);
 }
 
 static void classify(lib_model *m) {
@@ -71,7 +70,7 @@ static void scan_dir(model_lib *lib, const char *root, const char *rel, int dept
 			continue;
 		if (S_ISDIR(sb.st_mode) && depth < LIB_MAX_DEPTH)
 			scan_dir(lib, root, child, depth + 1);
-		else if (S_ISREG(sb.st_mode) && has_gguf_suffix(de->d_name))
+		else if (S_ISREG(sb.st_mode) && has_model_suffix(de->d_name))
 			fill_model(&lib->items[lib->count++], child, (size_t)sb.st_size, false);
 	}
 	closedir(d);

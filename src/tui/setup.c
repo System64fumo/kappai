@@ -41,8 +41,8 @@ static const setup_step STEPS[] = {
 	 {"kappai runs local language and image models on your own hardware.",
 	  "This short setup picks where your models live and chooses a default run mode. "
 	  "Everything can be changed later in Settings (S).",
-	  "Keys that work everywhere: Up/Down move, Enter chooses or edits, Tab switches tabs, Esc "
-	  "goes back (or quits from the main menu), H or F1 shows help."}},
+	  "Keys that work everywhere: Up/Down move, Enter chooses or edits, Left/Right switch "
+	  "sections, Esc goes back (or quits from the main menu)."}},
 	{STEP_MODELS_DIR,
 	 "Models directory",
 	 {"Pick one folder for all your models. Configs can then use short relative paths such as "
@@ -53,7 +53,8 @@ static const setup_step STEPS[] = {
 	 "Default run mode",
 	 {"Chat opens an interactive terminal chat with the model. Server exposes an "
 	  "OpenAI-compatible API.",
-	  "You can still switch per run with Tab in the main menu.", "Enter: choose.   Right: skip."}},
+	  "You can still switch per run with Left/Right in the main menu.",
+	  "Enter: choose.   Right: skip."}},
 	{STEP_FINISH,
 	 "You're all set",
 	 {"From here: press N in the main menu to create a config, pick its model with the model "

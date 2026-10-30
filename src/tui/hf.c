@@ -1078,8 +1078,10 @@ static const char *page_key_bar(const hf_page *pg) {
 	if (pg->modal == MODAL_CONFIRM)
 		return "Left/Right: choose   Enter: confirm   T: change type   Esc: cancel";
 	if (pg->tab == TAB_SEARCH)
-		return "/: search   Up/Down: select   Enter: open files   Tab: switch tab   Esc: back";
-	return "Up/Down: select   Enter: check and download   /: new search   Tab: switch tab   Esc: "
+		return "/: search   Up/Down: select   Enter: open files   Left/Right: switch tab   Esc: "
+			   "back";
+	return "Up/Down: select   Enter: check and download   /: new search   Left/Right: switch tab   "
+		   "Esc: "
 		   "back";
 }
 
@@ -1409,10 +1411,10 @@ static bool handle_key(hf_page *pg, int ch) {
 	case KEY_END:
 		move_selection(pg, HF_MAX_FILES);
 		break;
-	case '\t':
+	case KEY_RIGHT:
 		switch_tab(pg, 1);
 		break;
-	case KEY_BTAB:
+	case KEY_LEFT:
 		switch_tab(pg, -1);
 		break;
 	case '/':

@@ -1,6 +1,7 @@
 #include "settings.h"
 
 #include "common.h"
+#include "model_names.h"
 #include "schema.h"
 
 #include <errno.h>
@@ -144,7 +145,7 @@ int tui_custom_check(const char *value, char *expanded, size_t cap, char *err, s
 		return -1;
 	size_t len = strlen(expanded);
 	if (!len) {
-		snprintf(err, errlen, "enter the path of a .gguf file");
+		snprintf(err, errlen, "enter the path of a .gguf or .safetensors file");
 		return -1;
 	}
 	struct stat st;
@@ -152,8 +153,8 @@ int tui_custom_check(const char *value, char *expanded, size_t cap, char *err, s
 		snprintf(err, errlen, "'%s' is not a file", expanded);
 		return -1;
 	}
-	if (len <= 5 || strcasecmp(expanded + len - 5, ".gguf") != 0) {
-		snprintf(err, errlen, "expected a .gguf file");
+	if (!model_has_gguf_suffix(expanded) && !model_has_safetensors_suffix(expanded)) {
+		snprintf(err, errlen, "expected a .gguf or .safetensors file");
 		return -1;
 	}
 	return 0;
