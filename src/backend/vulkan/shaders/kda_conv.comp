@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 1) readonly buffer WBuf {
+	float w[];
+};
+layout(set = 0, binding = 2) buffer StateBuf {
+	float state[];
+};
+
+layout(push_constant) uniform Params {
+	int channels;
+	int kernel;
+	int reset;
+	int state_base;
+}
+params;
+
+const int MAX_HIST = 8;
+
+void main() {
+	int c = int(gl_GlobalInvocationID.x);
+	if (c >= params.channels)
+		return;
+	int	  hist	= params.kernel - 1;
+	int	  sbase = params.state_base + c * hist;
+	int	  wbase = c * params.kernel;
+	float old[MAX_HIST];
+	float cur = x[c];
+	float sum = cur * w[wbase + hist];
+	for (int k = 0; k < hist; k++) {
+		old[k] = params.reset != 0 ? 0.0 : state[sbase + k];
+		sum += old[k] * w[wbase + k];
+	}
+	for (int k = 0; k + 1 < hist; k++)
+		state[sbase + k] = old[k + 1];
+	state[sbase + hist - 1] = cur;
+	x[c]					= sum / (1.0 + exp(-sum));
+}

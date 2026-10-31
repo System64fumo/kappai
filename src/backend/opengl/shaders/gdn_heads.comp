@@ -1,0 +1,134 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer ConvOutBuf {
+	float conv_out[];
+};
+layout(std430, binding = 1) readonly buffer ZBuf {
+	float z[];
+};
+layout(std430, binding = 2) readonly buffer AlphaBuf {
+	float alpha[];
+};
+layout(std430, binding = 3) readonly buffer BetaBuf {
+	float beta[];
+};
+layout(std430, binding = 4) readonly buffer DtBuf {
+	float dt[];
+};
+layout(std430, binding = 5) readonly buffer ABuf {
+	float a_vec[];
+};
+layout(std430, binding = 6) readonly buffer NormBuf {
+	float norm_w[];
+};
+layout(std430, binding = 7) buffer StateBuf {
+	float state[];
+};
+layout(std430, binding = 8) writeonly buffer OutBuf {
+	float out_[];
+};
+layout(location = 0) uniform int u_n_tokens;
+layout(location = 1) uniform int u_n_value_heads;
+layout(location = 2) uniform int u_n_key_heads;
+layout(location = 3) uniform int u_key_dim;
+layout(location = 4) uniform int u_kd;
+layout(location = 5) uniform int u_vd;
+layout(location = 6) uniform int u_value_dim;
+layout(location = 7) uniform int u_conv_dim;
+layout(location = 8) uniform float u_eps;
+
+const int MAX_PER_THREAD = 8;
+
+shared float s_red[64];
+
+float reduce_sum(int tid, float v_in) {
+	s_red[tid] = v_in;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_red[tid] += s_red[tid + s];
+		barrier();
+	}
+	float r = s_red[0];
+	barrier();
+	return r;
+}
+
+void main(void) {
+	int tid = int(gl_LocalInvocationID.x);
+	int vh	= int(gl_WorkGroupID.x);
+	int kh	= vh % u_n_key_heads;
+	int kd	= u_kd;
+	int vd	= u_vd;
+	int per = (vd + 63) / 64;
+	if (per > MAX_PER_THREAD)
+		return;
+	uint sbase = uint(vh) * uint(kd) * uint(vd);
+
+	for (int t = 0; t < u_n_tokens; t++) {
+		uint  cbase	  = uint(t) * uint(u_conv_dim);
+		uint  qbase	  = cbase + uint(kh) * uint(kd);
+		uint  kbase	  = cbase + uint(u_key_dim) + uint(kh) * uint(kd);
+		uint  vbase	  = cbase + uint(2 * u_key_dim) + uint(vh) * uint(vd);
+		uint  zbase	  = uint(t) * uint(u_value_dim) + uint(vh) * uint(vd);
+		float alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float sp_arg  = alpha_t + dt[vh];
+		float sp	  = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
+		float decay	  = exp(a_vec[vh] * sp);
+		float bg	  = 1.0 / (1.0 + exp(-beta_t));
+
+		float qss = 0.0;
+		float kss = 0.0;
+		for (int d = tid; d < kd; d += 64) {
+			float qv  = conv_out[qbase + uint(d)];
+			float kv_ = conv_out[kbase + uint(d)];
+			qss += qv * qv;
+			kss += kv_ * kv_;
+		}
+		qss		 = reduce_sum(tid, qss);
+		kss		 = reduce_sum(tid, kss);
+		float qn = inversesqrt(float(kd)) / sqrt(u_eps + qss);
+		float kn = 1.0 / sqrt(u_eps + kss);
+
+		float y[MAX_PER_THREAD];
+		for (int jj = 0; jj < per; jj++) {
+			int j = tid + 64 * jj;
+			if (j >= vd) {
+				y[jj] = 0.0;
+				continue;
+			}
+			uint  scol = sbase + uint(j);
+			float mem  = 0.0;
+			for (int d = 0; d < kd; d++)
+				mem += state[scol + uint(d) * uint(vd)] * decay * (conv_out[kbase + uint(d)] * kn);
+			float delta = (conv_out[vbase + uint(j)] - mem) * bg;
+			float yacc	= 0.0;
+			for (int d = 0; d < kd; d++) {
+				uint  idx  = scol + uint(d) * uint(vd);
+				float row  = state[idx] * decay + (conv_out[kbase + uint(d)] * kn) * delta;
+				state[idx] = row;
+				yacc += row * (conv_out[qbase + uint(d)] * qn);
+			}
+			y[jj] = yacc;
+		}
+
+		float yss = 0.0;
+		for (int jj = 0; jj < per; jj++) {
+			int j = tid + 64 * jj;
+			if (j < vd)
+				yss += y[jj] * y[jj];
+		}
+		yss			  = reduce_sum(tid, yss);
+		float inv_rms = 1.0 / sqrt(u_eps + yss / float(vd));
+		for (int jj = 0; jj < per; jj++) {
+			int j = tid + 64 * jj;
+			if (j >= vd)
+				continue;
+			float zv			  = z[zbase + uint(j)];
+			out_[zbase + uint(j)] = y[jj] * inv_rms * norm_w[j] * (zv / (1.0 + exp(-zv)));
+		}
+	}
+}

@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer KbBuf {
+	float k_b[];
+};
+layout(set = 0, binding = 1) readonly buffer QBuf {
+	float q[];
+};
+layout(set = 0, binding = 2) writeonly buffer QAbsBuf {
+	float q_abs[];
+};
+
+layout(push_constant) uniform Params {
+	int total;
+	int kv_lora;
+	int qk_head;
+}
+params;
+
+void main() {
+	int idx = int(gl_GlobalInvocationID.x);
+	if (idx >= params.total)
+		return;
+	int	  h	  = idx / params.kv_lora;
+	int	  row = idx * params.qk_head;
+	int	  qh  = h * params.qk_head;
+	float s	  = 0.0;
+	for (int i = 0; i < params.qk_head; i++)
+		s += k_b[row + i] * q[qh + i];
+	q_abs[idx] = s;
+}

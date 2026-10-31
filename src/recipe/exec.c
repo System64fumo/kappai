@@ -62,7 +62,7 @@ uint32_t mla_qkv_caps(const backend *a) {
 }
 
 uint32_t gdn_caps(const backend *a) {
-	return a && a->gated_delta_net && backend_has_cap(a, BCAP_IS_HOST) ? GDN_NATIVE : 0;
+	return a && a->gated_delta_net ? GDN_NATIVE : 0;
 }
 
 static uint32_t exec_pick_caps(op_kind kind, const backend *a) {

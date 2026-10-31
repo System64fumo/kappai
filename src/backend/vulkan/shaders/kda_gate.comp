@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer GBuf {
+	float g[];
+};
+layout(set = 0, binding = 1) readonly buffer DtBuf {
+	float dt_bias[];
+};
+layout(set = 0, binding = 2) readonly buffer AuxBuf {
+	float ssm_a[];
+};
+layout(set = 0, binding = 3) buffer BetaBuf {
+	float beta[];
+};
+
+layout(push_constant) uniform Params {
+	int	  inner;
+	int	  n_heads;
+	int	  head_dim;
+	int	  use_lower_bound;
+	float lower_bound;
+}
+params;
+
+float sigmoidf(float v) {
+	return 1.0 / (1.0 + exp(-v));
+}
+
+void main() {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i < params.inner) {
+		int	  h = i / params.head_dim;
+		float t = g[i] + dt_bias[i];
+		if (params.use_lower_bound != 0) {
+			g[i] = params.lower_bound * sigmoidf(-(t * ssm_a[h]));
+		} else {
+			float sp = t > 20.0 ? t : log(1.0 + exp(t));
+			g[i]	 = sp * ssm_a[h];
+		}
+		return;
+	}
+	int h = i - params.inner;
+	if (h < params.n_heads)
+		beta[h] = sigmoidf(beta[h]);
+}

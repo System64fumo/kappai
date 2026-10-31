@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer MixBuf {
+	float mixes[];
+};
+layout(set = 0, binding = 1) readonly buffer BaseBuf {
+	float base[];
+};
+layout(set = 0, binding = 2) readonly buffer ScaleBuf {
+	float scale[];
+};
+layout(set = 0, binding = 3) readonly buffer StreamBuf {
+	float stream[];
+};
+layout(set = 0, binding = 4) writeonly buffer XBuf {
+	float x[];
+};
+
+layout(push_constant) uniform Params {
+	int	  dim;
+	int	  n_hc;
+	float eps;
+}
+params;
+
+void main() {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= params.dim)
+		return;
+	float acc = 0.0;
+	for (int h = 0; h < params.n_hc; h++) {
+		float pre = 1.0 / (1.0 + exp(-(mixes[h] * scale[0] + base[h]))) + params.eps;
+		acc += pre * stream[h * params.dim + i];
+	}
+	x[i] = acc;
+}

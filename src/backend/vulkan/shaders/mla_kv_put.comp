@@ -1,0 +1,46 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer KvaBuf {
+	float kv_a[];
+};
+layout(set = 0, binding = 1) readonly buffer NormBuf {
+	float norm_w[];
+};
+layout(set = 0, binding = 2) buffer CacheBuf {
+	float cache[];
+};
+
+layout(push_constant) uniform Params {
+	int	  kv_lora;
+	int	  qk_rope;
+	int	  pos;
+	float eps;
+	uint  layer_off;
+}
+params;
+
+shared float s_ss[64];
+
+void main() {
+	int tid = int(gl_LocalInvocationID.x);
+	int kl	= params.kv_lora;
+
+	float partial = 0.0;
+	for (int i = tid; i < kl; i += 64)
+		partial += kv_a[i] * kv_a[i];
+	s_ss[tid] = partial;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_ss[tid] += s_ss[tid + s];
+		barrier();
+	}
+
+	float rstd = inversesqrt(s_ss[0] / float(kl) + params.eps);
+	uint  base = params.layer_off + uint(params.pos * (kl + params.qk_rope));
+	for (int i = tid; i < kl; i += 64)
+		cache[base + uint(i)] = kv_a[i] * rstd * norm_w[i];
+	for (int j = tid; j < params.qk_rope; j += 64)
+		cache[base + uint(kl + j)] = kv_a[kl + j];
+}

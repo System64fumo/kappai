@@ -1,0 +1,45 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer MixBuf {
+	float mixed[];
+};
+layout(std430, binding = 1) readonly buffer WBuf {
+	float conv_w[];
+};
+layout(std430, binding = 2) buffer ConvStateBuf {
+	float conv_state[];
+};
+layout(std430, binding = 3) writeonly buffer ConvOutBuf {
+	float conv_out[];
+};
+layout(location = 0) uniform int u_conv_dim;
+layout(location = 1) uniform int u_kernel;
+layout(location = 2) uniform int u_tokens;
+
+const int MAX_HIST = 8;
+
+void main(void) {
+	int c = int(gl_GlobalInvocationID.x);
+	if (c >= u_conv_dim)
+		return;
+	int hist = u_kernel - 1;
+	if (hist > MAX_HIST)
+		return;
+	int	  wbase = c * u_kernel;
+	float st[MAX_HIST];
+	for (int k = 0; k < hist; k++)
+		st[k] = conv_state[c * hist + k];
+	for (int t = 0; t < u_tokens; t++) {
+		float m	  = mixed[t * u_conv_dim + c];
+		float sum = m * conv_w[wbase + hist];
+		for (int k = 0; k < hist; k++) {
+			sum += st[k] * conv_w[wbase + k];
+			st[k] = (k + 1 < hist) ? st[k + 1] : m;
+		}
+		conv_out[t * u_conv_dim + c] = sum / (1.0 + exp(-sum));
+	}
+	for (int k = 0; k < hist; k++)
+		conv_state[c * hist + k] = st[k];
+}

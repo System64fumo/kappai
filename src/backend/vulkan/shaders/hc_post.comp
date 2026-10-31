@@ -1,0 +1,37 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer SubBuf {
+	float sub[];
+};
+layout(set = 0, binding = 1) readonly buffer CoefBuf {
+	float coef[];
+};
+layout(set = 0, binding = 2) buffer HcBuf {
+	float hc[];
+};
+
+layout(push_constant) uniform Params {
+	int dim;
+	int n_hc;
+}
+params;
+
+const int MAX_HC = 8;
+
+void main() {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= params.dim)
+		return;
+	int	  n_hc = params.n_hc;
+	float cur[MAX_HC];
+	for (int h = 0; h < n_hc; h++)
+		cur[h] = hc[h * params.dim + i];
+	float s = sub[i];
+	for (int dst = 0; dst < n_hc; dst++) {
+		float acc = s * coef[dst];
+		for (int src = 0; src < n_hc; src++)
+			acc += cur[src] * coef[n_hc + dst + src * n_hc];
+		hc[dst * params.dim + i] = acc;
+	}
+}

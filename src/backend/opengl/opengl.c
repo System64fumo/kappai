@@ -176,6 +176,8 @@ typedef enum {
 	GL_PIPE_ATTENTION_DENSE,
 	GL_PIPE_IM2COL,
 	GL_PIPE_UPSAMPLE_SHORTCUT,
+	GL_PIPE_GDN_CONV,
+	GL_PIPE_GDN_HEADS,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -1494,6 +1496,8 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_IM2COL]			= {"im2col", gl_shader_im2col_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_UPSAMPLE_SHORTCUT] = {"upsample_shortcut", gl_shader_upsample_shortcut_src, 0,
 									   UINT32_MAX, 1, 0},
+		[GL_PIPE_GDN_CONV]			= {"gdn_conv", gl_shader_gdn_conv_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_GDN_HEADS]			= {"gdn_heads", gl_shader_gdn_heads_src, 0, UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -1668,12 +1672,12 @@ static void gl_free(backend *self) {
 		return;
 	}
 
-	INFO("gl: totals: %llu dispatches, %llu barriers, %llu flushes, %llu finishes, %llu readbacks",
-		 (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
-		 (unsigned long long)p->stats.flushes, (unsigned long long)p->stats.finishes,
-		 (unsigned long long)p->stats.readbacks);
-	INFO("gl: host time: %.1f ms in dispatch/barrier calls, %.1f ms waiting in glFinish",
-		 (double)p->stats.launch_us / 1000.0, (double)p->stats.wait_us / 1000.0);
+	DEBUG("gl: totals: %llu dispatches, %llu barriers, %llu flushes, %llu finishes, %llu readbacks",
+		  (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
+		  (unsigned long long)p->stats.flushes, (unsigned long long)p->stats.finishes,
+		  (unsigned long long)p->stats.readbacks);
+	DEBUG("gl: host time: %.1f ms in dispatch/barrier calls, %.1f ms waiting in glFinish",
+		  (double)p->stats.launch_us / 1000.0, (double)p->stats.wait_us / 1000.0);
 
 	gl_gpuprof_report(p);
 
@@ -5901,6 +5905,153 @@ static status_code gl_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
 	return s;
 }
 
+typedef struct {
+	buffer mixed, conv_out, conv_w, dt, a_vec, norm_w;
+	buffer z, alpha, beta, conv_state, state, out;
+} gl_gdn_scratch;
+
+#define GL_GDN_MAX_VD 512
+
+static status_code gl_gdn_scratch_alloc(backend *self, const gdn_desc *d, buffer *root,
+										gl_gdn_scratch *out) {
+	const size_t T	  = (size_t)d->n_tokens;
+	const size_t hist = (size_t)d->conv_kernel - 1;
+	const size_t nvh  = (size_t)d->n_value_heads;
+	const size_t kd	  = (size_t)d->state_size;
+	const size_t vd	  = (size_t)d->value_head_dim;
+	struct {
+		size_t	n;
+		buffer *slot;
+	} segs[] = {
+		{T * (size_t)d->conv_dim, &out->mixed},
+		{T * (size_t)d->conv_dim, &out->conv_out},
+		{(size_t)d->conv_dim * (size_t)d->conv_kernel, &out->conv_w},
+		{nvh, &out->dt},
+		{nvh, &out->a_vec},
+		{vd, &out->norm_w},
+		{T * (size_t)d->value_dim, &out->z},
+		{T * nvh, &out->alpha},
+		{T * nvh, &out->beta},
+		{(size_t)d->conv_dim * hist, &out->conv_state},
+		{nvh * kd * vd, &out->state},
+		{T * (size_t)d->value_dim, &out->out},
+	};
+	size_t total = 0;
+	for (size_t i = 0; i < ARRAY_LEN(segs); i++)
+		total += ALIGN_UP(segs[i].n ? segs[i].n : 1, 64);
+	status_code s = self->buffer_alloc_scratch(self, total * sizeof(float), root);
+	if (s != OK)
+		return s;
+	size_t off = 0;
+	for (size_t i = 0; i < ARRAY_LEN(segs); i++) {
+		*segs[i].slot = gl_float_slice(root, off, segs[i].n);
+		off += ALIGN_UP(segs[i].n ? segs[i].n : 1, 64);
+	}
+	return OK;
+}
+
+static status_code gl_gated_delta_net(backend *self, const gdn_desc *d) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (!p->pipes[GL_PIPE_GDN_CONV].program || !p->pipes[GL_PIPE_GDN_HEADS].program)
+		return ERR_UNSUPPORTED;
+	const int hist = d->conv_kernel - 1;
+	if (d->n_tokens < 1 || d->conv_dim < 1 || hist < 1 || hist > GL_KDA_MAX_HIST ||
+		d->state_size < 1 || d->value_head_dim < 1 || d->value_head_dim > GL_GDN_MAX_VD ||
+		d->n_value_heads < 1 || d->n_key_heads < 1 || !d->mixed || !d->z || !d->alpha || !d->beta ||
+		!d->conv_w || !d->dt || !d->a_vec || !d->norm_w || !d->conv_state || !d->state || !d->out) {
+		return ERR_UNSUPPORTED;
+	}
+
+	buffer		   root = {0};
+	gl_gdn_scratch sc;
+	status_code	   s = gl_gdn_scratch_alloc(self, d, &root, &sc);
+	if (s != OK)
+		return s;
+
+	const size_t T	 = (size_t)d->n_tokens;
+	const size_t nvh = (size_t)d->n_value_heads;
+	const size_t kd	 = (size_t)d->state_size;
+	const size_t vd	 = (size_t)d->value_head_dim;
+	const struct {
+		const float *src;
+		buffer		*dst;
+		size_t		 n;
+	} uploads[] = {
+		{d->mixed, &sc.mixed, T * (size_t)d->conv_dim},
+		{d->conv_w, &sc.conv_w, (size_t)d->conv_dim * (size_t)d->conv_kernel},
+		{d->dt, &sc.dt, nvh},
+		{d->a_vec, &sc.a_vec, nvh},
+		{d->norm_w, &sc.norm_w, vd},
+		{d->z, &sc.z, T * (size_t)d->value_dim},
+		{d->alpha, &sc.alpha, T * nvh},
+		{d->beta, &sc.beta, T * nvh},
+		{d->conv_state, &sc.conv_state, (size_t)d->conv_dim * (size_t)hist},
+		{d->state, &sc.state, nvh * kd * vd},
+	};
+	size_t total   = root.size / sizeof(float);
+	float *staging = xmalloc(total * sizeof(float));
+	if (!staging) {
+		self->buffer_free(self, &root);
+		return ERR_OUT_OF_MEMORY;
+	}
+	for (size_t i = 0; i < ARRAY_LEN(uploads); i++)
+		memcpy(staging + uploads[i].dst->offset / sizeof(float), uploads[i].src,
+			   uploads[i].n * sizeof(float));
+	s = self->buffer_write_f32(self, &root, staging, (int)total);
+	free(staging);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+	gl_buf_sync_to_device(as_glbuf(&root));
+
+	gl_pipeline *conv = &p->pipes[GL_PIPE_GDN_CONV];
+	gl_use_pipeline(p, conv);
+	gl_bind_ssbo(0, &sc.mixed);
+	gl_bind_ssbo(1, &sc.conv_w);
+	gl_bind_ssbo(2, &sc.conv_state);
+	gl_bind_ssbo_out(3, &sc.conv_out);
+	gl_pu(conv, "u_conv_dim", d->conv_dim);
+	gl_pu(conv, "u_kernel", d->conv_kernel);
+	gl_pu(conv, "u_tokens", d->n_tokens);
+	gl_launch(p, gl_groups_for(d->conv_dim, 64), 1, 1);
+
+	gl_pipeline *heads = &p->pipes[GL_PIPE_GDN_HEADS];
+	gl_use_pipeline(p, heads);
+	gl_bind_ssbo(0, &sc.conv_out);
+	gl_bind_ssbo(1, &sc.z);
+	gl_bind_ssbo(2, &sc.alpha);
+	gl_bind_ssbo(3, &sc.beta);
+	gl_bind_ssbo(4, &sc.dt);
+	gl_bind_ssbo(5, &sc.a_vec);
+	gl_bind_ssbo(6, &sc.norm_w);
+	gl_bind_ssbo_out(7, &sc.state);
+	gl_bind_ssbo_out(8, &sc.out);
+	gl_pu(heads, "u_n_tokens", d->n_tokens);
+	gl_pu(heads, "u_n_value_heads", d->n_value_heads);
+	gl_pu(heads, "u_n_key_heads", d->n_key_heads);
+	gl_pu(heads, "u_key_dim", d->key_dim);
+	gl_pu(heads, "u_kd", d->state_size);
+	gl_pu(heads, "u_vd", d->value_head_dim);
+	gl_pu(heads, "u_value_dim", d->value_dim);
+	gl_pu(heads, "u_conv_dim", d->conv_dim);
+	gl_puf(heads, "u_eps", d->eps);
+	gl_launch(p, (GLuint)d->n_value_heads, 1, 1);
+	as_glbuf(&sc.conv_state)->device_dirty = 1;
+	as_glbuf(&sc.state)->device_dirty	   = 1;
+	as_glbuf(&sc.out)->device_dirty		   = 1;
+
+	s = self->buffer_read_f32(self, &sc.state, d->state, (int)(nvh * kd * vd));
+	if (s == OK)
+		s = self->buffer_read_f32(self, &sc.conv_state, d->conv_state,
+								  (int)((size_t)d->conv_dim * (size_t)hist));
+	if (s == OK)
+		s = self->buffer_read_f32(self, &sc.out, d->out, (int)(T * (size_t)d->value_dim));
+	self->buffer_free(self, &root);
+	return s;
+}
+
 static status_code gl_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "opengl";
@@ -6004,6 +6155,7 @@ static status_code gl_ctor(backend *out) {
 	out->attention_dense				 = gl_attention_dense;
 	out->im2col3x3						 = gl_im2col3x3;
 	out->upsample_shortcut_add			 = gl_upsample_shortcut_add;
+	out->gated_delta_net				 = gl_gated_delta_net;
 
 	return OK;
 }
