@@ -1034,5 +1034,5 @@ status_code compute_forward_sequence_recipe(model *m, compute_scratch *s, const 
 	if (st != OK)
 		return st;
 	row_desc rows = {.n_rows = n_tokens, .needs_logits = outputs, .token_type = token_type};
-	return compute_forward_rows(m, &rows, s, tokens, flash_attn, scores);
+	return compute_forward_rows(m, &rows, s, tokens, flash_attn, scores, NULL);
 }
