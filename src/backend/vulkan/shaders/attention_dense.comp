@@ -21,6 +21,7 @@ layout(set = 0, binding = 5) writeonly buffer OutBuf {
 };
 
 layout(push_constant) uniform Params {
+	int n_q;
 	int n_heads;
 	int head_dim;
 	int n0;
@@ -30,11 +31,15 @@ layout(push_constant) uniform Params {
 params;
 
 #define TILE 128
+#define DC 16
+#define KPAD 17
 #define MAX_DIMS_PER_THREAD 16
 #define NEG_BIG (-3.0e38)
 
-shared float qs[TILE * MAX_DIMS_PER_THREAD];
-shared float sc[TILE];
+shared float k_tile[TILE * KPAD];
+shared vec4	 qs[DC];
+shared vec4	 sp[TILE];
+shared vec4	 sr[TILE];
 
 float key_at(uint j, uint stride, uint head_off, uint d) {
 	uint n0 = uint(params.n0);
@@ -48,72 +53,108 @@ float value_at(uint j, uint stride, uint head_off, uint d) {
 
 void main() {
 	uint  tid	   = gl_LocalInvocationID.x;
-	uint  heads	   = uint(params.n_heads);
 	uint  dims	   = uint(params.head_dim);
-	uint  qi	   = gl_WorkGroupID.x / heads;
-	uint  h		   = gl_WorkGroupID.x % heads;
+	uint  heads	   = uint(params.n_heads);
+	uint  n_q	   = uint(params.n_q);
+	uint  groups   = (n_q + 3u) / 4u;
+	uint  h		   = gl_WorkGroupID.x / groups;
+	uint  q0	   = (gl_WorkGroupID.x - h * groups) * 4u;
 	uint  stride   = heads * dims;
 	uint  head_off = h * dims;
-	uint  qbase	   = qi * stride + head_off;
+	uint  total	   = uint(params.n0 + params.n1);
 	float scale	   = 1.0 / sqrt(float(dims));
 
-	for (uint d = tid; d < dims; d += TILE)
-		qs[d] = q[qbase + d];
-	barrier();
+	uint  last	= n_q - 1u;
+	uvec4 qi	= uvec4(min(q0, last), min(q0 + 1u, last), min(q0 + 2u, last), min(q0 + 3u, last));
+	uvec4 qbase = qi * stride + head_off;
+	uvec4 vis	= params.causal != 0 ? qi + 1u : uvec4(total);
+	uint  vis_max = vis.w;
 
-	uint total = uint(params.n0 + params.n1);
-	uint vis   = params.causal != 0 ? qi + 1u : total;
-
-	float acc[MAX_DIMS_PER_THREAD];
+	vec4 acc[MAX_DIMS_PER_THREAD];
 	for (int e = 0; e < MAX_DIMS_PER_THREAD; e++)
-		acc[e] = 0.0;
-	float run_max = NEG_BIG;
-	float run_sum = 0.0;
+		acc[e] = vec4(0.0);
+	vec4 run_max = vec4(NEG_BIG);
+	vec4 run_sum = vec4(0.0);
 
-	for (uint base = 0u; base < vis; base += TILE) {
-		uint  j = base + tid;
-		float s = NEG_BIG;
-		if (j < vis) {
-			float a = 0.0;
-			for (uint d = 0u; d < dims; d++)
-				a += qs[d] * key_at(j, stride, head_off, d);
-			s = a * scale;
+	for (uint base = 0u; base < vis_max; base += uint(TILE)) {
+		uint j	= base + tid;
+		vec4 s4 = vec4(0.0);
+		for (uint d0 = 0u; d0 < dims; d0 += uint(DC)) {
+			if (tid < uint(DC)) {
+				uint d	= d0 + tid;
+				vec4 qv = vec4(0.0);
+				if (d < dims)
+					qv = vec4(q[qbase.x + d], q[qbase.y + d], q[qbase.z + d], q[qbase.w + d]);
+				qs[tid] = qv;
+			}
+			for (uint r = 0u; r < uint(DC); r++) {
+				uint  idx = tid + r * uint(TILE);
+				uint  t	  = idx / uint(DC);
+				uint  dd  = idx % uint(DC);
+				uint  jj  = base + t;
+				uint  d	  = d0 + dd;
+				float kv  = 0.0;
+				if (jj < vis_max && d < dims)
+					kv = key_at(jj, stride, head_off, d);
+				k_tile[t * uint(KPAD) + dd] = kv;
+			}
+			barrier();
+			if (j < vis_max) {
+				for (uint dd = 0u; dd < uint(DC); dd++)
+					s4 += qs[dd] * k_tile[tid * uint(KPAD) + dd];
+			}
+			barrier();
 		}
-		sc[tid] = s;
+
+		bvec4 live = lessThan(uvec4(j), vis);
+		vec4  sv   = mix(vec4(NEG_BIG), s4 * scale, live);
+		sr[tid]	   = sv;
+		barrier();
+		for (uint off = uint(TILE) / 2u; off > 0u; off >>= 1u) {
+			if (tid < off)
+				sr[tid] = max(sr[tid], sr[tid + off]);
+			barrier();
+		}
+		vec4 new_max = max(run_max, sr[0]);
 		barrier();
 
-		float tile_max = NEG_BIG;
-		for (uint t = 0u; t < TILE; t++)
-			tile_max = max(tile_max, sc[t]);
-		float new_max = max(run_max, tile_max);
-		float alpha	  = exp(run_max - new_max);
+		vec4 alpha = exp(run_max - new_max);
+		vec4 p	   = mix(vec4(0.0), exp(sv - new_max), live);
+		sp[tid]	   = p;
+		sr[tid]	   = p;
 		barrier();
+		for (uint off = uint(TILE) / 2u; off > 0u; off >>= 1u) {
+			if (tid < off)
+				sr[tid] += sr[tid + off];
+			barrier();
+		}
+		run_sum = run_sum * alpha + sr[0];
+		run_max = new_max;
 
-		sc[tid] = j < vis ? exp(s - new_max) : 0.0;
-		barrier();
-
-		uint  count = min(uint(TILE), vis - base);
-		float psum	= 0.0;
-		for (uint t = 0u; t < count; t++)
-			psum += sc[t];
-		run_sum = run_sum * alpha + psum;
-
-		for (uint e = 0u; e < MAX_DIMS_PER_THREAD; e++) {
-			uint d = tid + e * TILE;
+		uint count = min(uint(TILE), vis_max - base);
+		for (uint e = 0u; e < uint(MAX_DIMS_PER_THREAD); e++) {
+			uint d = tid + e * uint(TILE);
 			if (d < dims) {
-				float a = acc[e] * alpha;
+				vec4 c = acc[e] * alpha;
 				for (uint t = 0u; t < count; t++)
-					a += sc[t] * value_at(base + t, stride, head_off, d);
-				acc[e] = a;
+					c += sp[t] * value_at(base + t, stride, head_off, d);
+				acc[e] = c;
 			}
 		}
-		run_max = new_max;
 		barrier();
 	}
 
-	for (uint e = 0u; e < MAX_DIMS_PER_THREAD; e++) {
-		uint d = tid + e * TILE;
-		if (d < dims)
-			out_[qbase + d] = acc[e] / run_sum;
+	for (uint e = 0u; e < uint(MAX_DIMS_PER_THREAD); e++) {
+		uint d = tid + e * uint(TILE);
+		if (d < dims) {
+			vec4 r			  = acc[e] / run_sum;
+			out_[qbase.x + d] = r.x;
+			if (q0 + 1u < n_q)
+				out_[qbase.y + d] = r.y;
+			if (q0 + 2u < n_q)
+				out_[qbase.z + d] = r.z;
+			if (q0 + 3u < n_q)
+				out_[qbase.w + d] = r.w;
+		}
 	}
 }

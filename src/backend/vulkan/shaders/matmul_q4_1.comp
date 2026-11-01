@@ -12,25 +12,14 @@ layout(set = 0, binding = 0) readonly buffer W0Buf {
 layout(set = 0, binding = 1) readonly buffer XBuf {
 	float x[];
 };
-#ifdef HAS_RESIDUAL
-layout(set = 0, binding = 2) readonly buffer RBuf {
-	float residual[];
-};
-layout(set = 0, binding = 3) writeonly buffer YBuf {
-	float y[];
-};
-#else
 layout(set = 0, binding = 2) writeonly buffer YBuf {
 	float y[];
 };
-#endif
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
 
-layout(push_constant) uniform Params {
-	int n;
-	int k;
-	int m;
-}
-params;
+#include "matmul_push.glsl"
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
 layout(constant_id = 2) const int TILE_K		  = 2048;
@@ -58,10 +47,8 @@ void main() {
 
 	uint row   = gl_WorkGroupID.y;
 	uint x_off = row * uint(k);
-	uint y_off = row * uint(params.n);
-#ifdef HAS_RESIDUAL
+	uint y_off = row * uint(params.n0);
 	uint r_off = y_off;
-#endif
 
 	precise float acc[ROWS_PER_THREAD];
 	precise float off[ROWS_PER_THREAD];
@@ -71,7 +58,7 @@ void main() {
 	}
 	bool valid[ROWS_PER_THREAD];
 	for (int r = 0; r < ROWS_PER_THREAD; r++)
-		valid[r] = (int(base_i) + r < params.n);
+		valid[r] = (int(base_i) + r < params.n0);
 
 	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
 		int tile_end = min(tile_start + TILE_K, k);
@@ -129,10 +116,7 @@ void main() {
 	for (int r = 0; r < ROWS_PER_THREAD; r++) {
 		if (!valid[r])
 			continue;
-#ifdef HAS_RESIDUAL
-		y[y_off + base_i + uint(r)] = (acc[r] + off[r]) + residual[r_off + base_i + uint(r)];
-#else
-		y[y_off + base_i + uint(r)] = acc[r] + off[r];
-#endif
+		y[y_off + base_i + uint(r)] =
+			(acc[r] + off[r]) + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
 	}
 }

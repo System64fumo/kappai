@@ -121,9 +121,18 @@ status_code cpu_rope_table(backend *self, buffer *x, const buffer *table, int ro
 	return OK;
 }
 
+#define DOT_LANES 8
+
 static float dot(const float *a, const float *b, int n) {
+	float lanes[DOT_LANES] = {0};
+	int	  i				   = 0;
+	for (; i + DOT_LANES <= n; i += DOT_LANES)
+		for (int l = 0; l < DOT_LANES; l++)
+			lanes[l] += a[i + l] * b[i + l];
 	float s = 0;
-	for (int i = 0; i < n; i++)
+	for (int l = 0; l < DOT_LANES; l++)
+		s += lanes[l];
+	for (; i < n; i++)
 		s += a[i] * b[i];
 	return s;
 }
@@ -137,8 +146,8 @@ static void attention_items(int begin, int end, int tid, void *ctx) {
 	float						scale  = 1.0f / sqrtf((float)d->head_dim);
 	float					   *scores = xmalloc((size_t)total * sizeof(float));
 	for (int it = begin; it < end; it++) {
-		int			 qi	  = it / d->n_heads;
-		int			 h	  = it % d->n_heads;
+		int			 h	  = it / d->n_q;
+		int			 qi	  = it % d->n_q;
 		const float *q	  = j->q + (size_t)qi * stride + (size_t)h * d->head_dim;
 		float		*o	  = j->out + (size_t)qi * stride + (size_t)h * d->head_dim;
 		int			 vis  = d->causal ? qi + 1 : total;
@@ -155,12 +164,13 @@ static void attention_items(int begin, int end, int tid, void *ctx) {
 			scores[c] = expf(scores[c] - maxv);
 			sum += scores[c];
 		}
+		float inv_sum = 1.0f / sum;
 		memset(o, 0, (size_t)d->head_dim * sizeof(float));
 		for (int c = 0; c < vis; c++) {
 			const float *v =
 				(c < d->n0 ? j->v0 + (size_t)c * stride : j->v1 + (size_t)(c - d->n0) * stride) +
 				(size_t)h * d->head_dim;
-			float w = scores[c] / sum;
+			float w = scores[c] * inv_sum;
 			for (int e = 0; e < d->head_dim; e++)
 				o[e] += w * v[e];
 		}

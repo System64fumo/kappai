@@ -21,6 +21,10 @@
 #define VK_RING_DEPTH 4
 #define VK_PROF_SLOT_CAP 4096
 #define VK_QMM_MIN_M 16
+#define VK_MMF_TYPES 21
+#define VK_MMF_FIRST_GRID 8
+#define VK_MV_FIRST 3
+#define VK_MV_PIPE_OFFSET 9
 #define VK_READ_SET_CAP 64
 #define VK_QMV_ROWS 2
 #define VK_QMV_COLS 4
@@ -325,47 +329,28 @@ typedef struct {
 	vk_pipeline_set p_moe_gather;
 	vk_pipeline_set p_moe_combine;
 	vk_pipeline_set p_matmul_q4_0_batch;
-	vk_pipeline_set p_matmul_q4_0_res_batch;
 	vk_pipeline_set p_matmul_q4_0_dual_batch;
 	vk_pipeline_set p_matmul_q4_0_triple_batch;
 	vk_pipeline_set p_matmul_q4_1_batch;
-	vk_pipeline_set p_matmul_q4_1_res_batch;
 	vk_pipeline_set p_matmul_q5_0_batch;
-	vk_pipeline_set p_matmul_q5_0_res_batch;
 	vk_pipeline_set p_matmul_q5_1_batch;
-	vk_pipeline_set p_matmul_q5_1_res_batch;
 	vk_pipeline_set p_matmul_q8_0_batch;
-	vk_pipeline_set p_matmul_q8_0_res_batch;
 	vk_pipeline_set p_matmul_q4_k_batch;
-	vk_pipeline_set p_matmul_q4_k_res_batch;
 	vk_pipeline_set p_matmul_q4_k_dual_batch;
 	vk_pipeline_set p_matmul_q5_k_batch;
-	vk_pipeline_set p_matmul_q5_k_res_batch;
 	vk_pipeline_set p_matmul_q6_k_batch;
-	vk_pipeline_set p_matmul_q6_k_res_batch;
 	vk_pipeline_set p_matmul_q6_k_dual_batch;
 	vk_pipeline_set p_matmul_iq3_s_batch;
-	vk_pipeline_set p_matmul_iq3_s_res_batch;
 	vk_pipeline_set p_matmul_iq2_s_batch;
-	vk_pipeline_set p_matmul_iq2_s_res_batch;
 	vk_pipeline_set p_matmul_iq2_xxs_batch;
-	vk_pipeline_set p_matmul_iq2_xxs_res_batch;
 	vk_pipeline_set p_matmul_iq3_xxs_batch;
-	vk_pipeline_set p_matmul_iq3_xxs_res_batch;
 	vk_pipeline_set p_matmul_iq4_xs_batch;
-	vk_pipeline_set p_matmul_iq4_xs_res_batch;
 	vk_pipeline_set p_matmul_f32_batch;
-	vk_pipeline_set p_matmul_f32_res_batch;
 	vk_pipeline_set p_matmul_f16_batch;
-	vk_pipeline_set p_matmul_f16_res_batch;
 	vk_pipeline_set p_matmul_bf16_batch;
-	vk_pipeline_set p_matmul_bf16_res_batch;
 	vk_pipeline_set p_matmul_f32_wide_batch;
-	vk_pipeline_set p_matmul_f32_wide_res_batch;
 	vk_pipeline_set p_matmul_f16_wide_batch;
-	vk_pipeline_set p_matmul_f16_wide_res_batch;
 	vk_pipeline_set p_matmul_bf16_wide_batch;
-	vk_pipeline_set p_matmul_bf16_wide_res_batch;
 	vk_pipeline_set p_matmul_iq4_nl_batch;
 	vk_pipeline_set p_attn_decode;
 	vk_pipeline_set p_attn_merge;
@@ -391,6 +376,7 @@ typedef struct {
 	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_nn[VK_NN_COUNT];
 	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	vk_pipeline_set p_mmf[VK_MMF_TYPES];
 	vk_pipeline_set p_qmv[VQ_COUNT][2];
 	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
 	uint32_t		queue_family;
@@ -498,7 +484,7 @@ static int g_probed = -1;
 #define VK_SUBALLOC_MAX_REQ (4ull << 20)
 #define VK_SUBALLOC_MAX_BLOCKS 8
 
-#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
+#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT + VK_MMF_TYPES)
 
 #define VQ_MV(t, label)                                                                            \
 	{                                                                                              \
@@ -973,6 +959,8 @@ static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
 	if (i < VQ_MM_COUNT)
 		return &p->p_qmm[i];
 	i -= VQ_MM_COUNT;
+	if (i >= 2 * VQ_COUNT)
+		return &p->p_mmf[i - 2 * VQ_COUNT];
 	return &p->p_qmv[i / 2][i % 2];
 }
 
@@ -1026,41 +1014,25 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_moe_gather,
 			&p->p_moe_combine,
 			&p->p_matmul_q4_0_batch,
-			&p->p_matmul_q4_0_res_batch,
 			&p->p_matmul_q4_0_dual_batch,
 			&p->p_matmul_q4_0_triple_batch,
 			&p->p_matmul_q4_1_batch,
-			&p->p_matmul_q4_1_res_batch,
 			&p->p_matmul_q5_0_batch,
-			&p->p_matmul_q5_0_res_batch,
 			&p->p_matmul_q5_1_batch,
-			&p->p_matmul_q5_1_res_batch,
 			&p->p_matmul_q8_0_batch,
-			&p->p_matmul_q8_0_res_batch,
 			&p->p_matmul_q4_k_batch,
-			&p->p_matmul_q4_k_res_batch,
 			&p->p_matmul_q4_k_dual_batch,
 			&p->p_matmul_q5_k_batch,
-			&p->p_matmul_q5_k_res_batch,
 			&p->p_matmul_q6_k_batch,
-			&p->p_matmul_q6_k_res_batch,
 			&p->p_matmul_q6_k_dual_batch,
 			&p->p_matmul_iq3_s_batch,
-			&p->p_matmul_iq3_s_res_batch,
 			&p->p_matmul_iq2_s_batch,
-			&p->p_matmul_iq2_s_res_batch,
 			&p->p_matmul_iq2_xxs_batch,
-			&p->p_matmul_iq2_xxs_res_batch,
 			&p->p_matmul_iq3_xxs_batch,
-			&p->p_matmul_iq3_xxs_res_batch,
 			&p->p_matmul_iq4_xs_batch,
-			&p->p_matmul_iq4_xs_res_batch,
 			&p->p_matmul_f32_batch,
-			&p->p_matmul_f32_res_batch,
 			&p->p_matmul_f16_batch,
-			&p->p_matmul_f16_res_batch,
 			&p->p_matmul_bf16_batch,
-			&p->p_matmul_bf16_res_batch,
 			&p->p_matmul_iq4_nl_batch,
 			&p->p_rmsnorm_batch,
 			&p->p_rmsnorm_sg_batch,
@@ -2073,6 +2045,39 @@ static void vk_qcore_init(vk_priv *p) {
 	if (vk_create_pipeline(p, shader_attn_merge_spv, sizeof(shader_attn_merge_spv), 2, 8,
 						   &p->p_attn_merge) == OK)
 		p->p_attn_merge.name = "attn_merge";
+	static const struct {
+		const uint32_t *spv;
+		size_t			len;
+		const char	   *name;
+		int				nbufs;
+	} MMF[VK_MMF_TYPES] = {
+		{shader_mmf_q4_0_spv, sizeof(shader_mmf_q4_0_spv), "mmf_q4_0", 4},
+		{shader_mmf_q8_0_spv, sizeof(shader_mmf_q8_0_spv), "mmf_q8_0", 4},
+		{shader_mmf_iq4_nl_spv, sizeof(shader_mmf_iq4_nl_spv), "mmf_iq4_nl", 4},
+		{shader_mmf_q4_k_spv, sizeof(shader_mmf_q4_k_spv), "mmf_q4_k", 4},
+		{shader_mmf_bf16_spv, sizeof(shader_mmf_bf16_spv), "mmf_bf16", 4},
+		{shader_mmf_f16_spv, sizeof(shader_mmf_f16_spv), "mmf_f16", 4},
+		{shader_mmf_f32_spv, sizeof(shader_mmf_f32_spv), "mmf_f32", 4},
+		{shader_mmf_q6_k_spv, sizeof(shader_mmf_q6_k_spv), "mmf_q6_k", 4},
+		{shader_mmf_iq2_xxs_spv, sizeof(shader_mmf_iq2_xxs_spv), "mmf_iq2_xxs", 5},
+		{shader_mmf_iq2_s_spv, sizeof(shader_mmf_iq2_s_spv), "mmf_iq2_s", 5},
+		{shader_mmf_iq3_xxs_spv, sizeof(shader_mmf_iq3_xxs_spv), "mmf_iq3_xxs", 5},
+		{shader_mmf_iq3_s_spv, sizeof(shader_mmf_iq3_s_spv), "mmf_iq3_s", 5},
+		{shader_mvk_q4_k_spv, sizeof(shader_mvk_q4_k_spv), "mvk_q4_k", 4},
+		{shader_mvk_bf16_spv, sizeof(shader_mvk_bf16_spv), "mvk_bf16", 4},
+		{shader_mvk_f16_spv, sizeof(shader_mvk_f16_spv), "mvk_f16", 4},
+		{shader_mvk_f32_spv, sizeof(shader_mvk_f32_spv), "mvk_f32", 4},
+		{shader_mvk_q6_k_spv, sizeof(shader_mvk_q6_k_spv), "mvk_q6_k", 4},
+		{shader_mvk_iq2_xxs_spv, sizeof(shader_mvk_iq2_xxs_spv), "mvk_iq2_xxs", 5},
+		{shader_mvk_iq2_s_spv, sizeof(shader_mvk_iq2_s_spv), "mvk_iq2_s", 5},
+		{shader_mvk_iq3_xxs_spv, sizeof(shader_mvk_iq3_xxs_spv), "mvk_iq3_xxs", 5},
+		{shader_mvk_iq3_s_spv, sizeof(shader_mvk_iq3_s_spv), "mvk_iq3_s", 5},
+	};
+	for (int t = 0; t < VK_MMF_TYPES && p->caps.max_workgroup_invocations >= 256 &&
+					p->caps.max_shared_memory >= 16384;
+		 t++)
+		if (vk_create_pipeline(p, MMF[t].spv, MMF[t].len, MMF[t].nbufs, 16, &p->p_mmf[t]) == OK)
+			p->p_mmf[t].name = MMF[t].name;
 	p->qcore_ok = 0;
 	if (!p->caps.supports_integer_dot_product || !p->caps.supports_16bit_storage ||
 		!p->caps.supports_subgroup_arithmetic || p->caps.max_workgroup_invocations < 256 ||
@@ -2757,22 +2762,14 @@ static status_code vk_init(backend *self, int device_index) {
 		}
 	}
 
-	s = vk_create_pipeline_spec(p, shader_matmul_f32_batch_spv, shader_matmul_f32_batch_spv_len, 3,
-								12, spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow),
+	s = vk_create_pipeline_spec(p, shader_matmul_f32_batch_spv, shader_matmul_f32_batch_spv_len, 4,
+								24, spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow),
 								&p->p_matmul_f32_batch);
 	if (s != OK)
 		WARN("vulkan: failed to create matmul_f32_batch pipeline -- "
 			 "batched prefill will fall back to per-token dispatch");
 	else
 		p->p_matmul_f32_batch.name = "matmul_f32_batch";
-
-	s = vk_create_pipeline_spec(
-		p, shader_matmul_f32_residual_batch_spv, shader_matmul_f32_residual_batch_spv_len, 4, 12,
-		spec_matmul_dense_narrow, sizeof(spec_matmul_dense_narrow), &p->p_matmul_f32_res_batch);
-	if (s != OK)
-		WARN("vulkan: failed to create matmul_f32_res_batch pipeline");
-	else
-		p->p_matmul_f32_res_batch.name = "matmul_f32_res_batch";
 
 #define VK_CREATE_BATCH_MATMUL_FIELD(field, spv_prefix, n_bind, push_sz, spec_arr)                 \
 	do {                                                                                           \
@@ -2783,17 +2780,6 @@ static status_code vk_init(backend *self, int device_index) {
 			WARN("vulkan: failed to create " #spv_prefix "_batch pipeline");                       \
 		else                                                                                       \
 			p->p_matmul_##field##_batch.name = #spv_prefix "_batch";                               \
-	} while (0)
-
-#define VK_CREATE_BATCH_MATMUL_RES_FIELD(field, spv_prefix, n_bind, push_sz, spec_arr)             \
-	do {                                                                                           \
-		s = vk_create_pipeline_spec(p, shader_##spv_prefix##_residual_batch_spv,                   \
-									shader_##spv_prefix##_residual_batch_spv_len, n_bind, push_sz, \
-									spec_arr, sizeof(spec_arr), &p->p_matmul_##field##_res_batch); \
-		if (s != OK)                                                                               \
-			WARN("vulkan: failed to create " #spv_prefix "_res_batch pipeline");                   \
-		else                                                                                       \
-			p->p_matmul_##field##_res_batch.name = #spv_prefix "_res_batch";                       \
 	} while (0)
 
 #define VK_CREATE_BATCH_MATMUL_NMAT(qname, spv_prefix, variant, n_bind, push_sz, spec_arr)         \
@@ -2811,60 +2797,41 @@ static status_code vk_init(backend *self, int device_index) {
 #define VK_CREATE_BATCH_MATMUL_DUAL(qname, spv_prefix, n_bind, push_sz, spec_arr)                  \
 	VK_CREATE_BATCH_MATMUL_NMAT(qname, spv_prefix, dual, n_bind, push_sz, spec_arr)
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q4_0, matmul_q4_0, 3, 16, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_0, matmul_q4_0, 4, 16, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_DUAL(q4_0, matmul_q4_0, 5, 16, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_NMAT(q4_0, matmul_q4_0, triple, 7, 20, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_0, matmul_q4_0, 4, 24, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_DUAL(q4_0, matmul_q4_0, 5, 24, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_NMAT(q4_0, matmul_q4_0, triple, 7, 24, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q4_1, matmul_q4_1, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_1, matmul_q4_1, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_1, matmul_q4_1, 4, 24, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q5_0, matmul_q5_0, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_0, matmul_q5_0, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_0, matmul_q5_0, 4, 24, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q5_1, matmul_q5_1, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_1, matmul_q5_1, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_1, matmul_q5_1, 4, 24, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q8_0, matmul_q8_0, 3, 12, spec_matmul);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q8_0, matmul_q8_0, 4, 12, spec_matmul);
+	VK_CREATE_BATCH_MATMUL_FIELD(q8_0, matmul_q8_0, 4, 24, spec_matmul);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q4_k, matmul_q4_k, 3, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q4_k, matmul_q4_k, 4, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_DUAL(q4_k, matmul_q4_k, 5, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q4_k, matmul_q4_k, 4, 24, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_DUAL(q4_k, matmul_q4_k, 5, 24, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q5_k, matmul_q5_k, 3, 12, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q5_k, matmul_q5_k, 4, 12, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q5_k, matmul_q5_k, 4, 24, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(q6_k, matmul_q6_k, 3, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(q6_k, matmul_q6_k, 4, 16, spec_matmul_kquant);
-	VK_CREATE_BATCH_MATMUL_DUAL(q6_k, matmul_q6_k, 5, 16, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_FIELD(q6_k, matmul_q6_k, 4, 24, spec_matmul_kquant);
+	VK_CREATE_BATCH_MATMUL_DUAL(q6_k, matmul_q6_k, 5, 24, spec_matmul_kquant);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(iq3_s, matmul_iq3_s, 4, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_s, matmul_iq3_s, 5, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_FIELD(iq2_s, matmul_iq2_s, 4, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq2_s, matmul_iq2_s, 5, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_FIELD(iq2_xxs, matmul_iq2_xxs, 4, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq2_xxs, matmul_iq2_xxs, 5, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_FIELD(iq3_xxs, matmul_iq3_xxs, 4, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq3_xxs, matmul_iq3_xxs, 5, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_FIELD(iq4_xs, matmul_iq4_xs, 3, 16, spec_matmul_iq3s);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(iq4_xs, matmul_iq4_xs, 4, 16, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq3_s, matmul_iq3_s, 5, 24, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq2_s, matmul_iq2_s, 5, 24, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq2_xxs, matmul_iq2_xxs, 5, 24, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq3_xxs, matmul_iq3_xxs, 5, 24, spec_matmul_iq3s);
+	VK_CREATE_BATCH_MATMUL_FIELD(iq4_xs, matmul_iq4_xs, 4, 24, spec_matmul_iq3s);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 3, 12, spec_matmul_dense_narrow);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16, matmul_f16, 4, 12, spec_matmul_dense_narrow);
-	VK_CREATE_BATCH_MATMUL_FIELD(bf16, matmul_bf16, 3, 12, spec_matmul_dense_narrow);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16, matmul_bf16, 4, 12, spec_matmul_dense_narrow);
+	VK_CREATE_BATCH_MATMUL_FIELD(f16, matmul_f16, 4, 24, spec_matmul_dense_narrow);
+	VK_CREATE_BATCH_MATMUL_FIELD(bf16, matmul_bf16, 4, 24, spec_matmul_dense_narrow);
 
-	VK_CREATE_BATCH_MATMUL_FIELD(f32_wide, matmul_f32, 3, 12, spec_matmul_wide);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(f32_wide, matmul_f32, 4, 12, spec_matmul_wide);
-	VK_CREATE_BATCH_MATMUL_FIELD(f16_wide, matmul_f16, 3, 12, spec_matmul_wide);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(f16_wide, matmul_f16, 4, 12, spec_matmul_wide);
-	VK_CREATE_BATCH_MATMUL_FIELD(bf16_wide, matmul_bf16, 3, 12, spec_matmul_wide);
-	VK_CREATE_BATCH_MATMUL_RES_FIELD(bf16_wide, matmul_bf16, 4, 12, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_FIELD(f32_wide, matmul_f32, 4, 24, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_FIELD(f16_wide, matmul_f16, 4, 24, spec_matmul_wide);
+	VK_CREATE_BATCH_MATMUL_FIELD(bf16_wide, matmul_bf16, 4, 24, spec_matmul_wide);
 
 #undef VK_CREATE_BATCH_MATMUL_DUAL
 #undef VK_CREATE_BATCH_MATMUL_FIELD
-#undef VK_CREATE_BATCH_MATMUL_RES_FIELD
 
 	s = vk_create_pipeline_spec(p, shader_matmul_iq4_nl_batch_spv,
 								shader_matmul_iq4_nl_batch_spv_len, 7, 32, spec_matmul,
@@ -2985,7 +2952,7 @@ static status_code vk_init(backend *self, int device_index) {
 		[VK_NN_ROPE_TABLE]		   = {shader_rope_table_spv, shader_rope_table_spv_len, 2, 12,
 									  "rope_table"},
 		[VK_NN_ATTENTION_DENSE]	   = {shader_attention_dense_spv, shader_attention_dense_spv_len, 6,
-									  20, "attention_dense"},
+									  24, "attention_dense"},
 		[VK_NN_IM2COL]			   = {shader_im2col_spv, shader_im2col_spv_len, 2, 28, "im2col"},
 		[VK_NN_UPSAMPLE_SHORTCUT] = {shader_upsample_shortcut_spv, shader_upsample_shortcut_spv_len,
 									 2, 28, "upsample_shortcut"},
@@ -3053,47 +3020,28 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_moe_combine);
 
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q4_0_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_dual_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_triple_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_1_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q4_1_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q5_0_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q5_0_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q5_1_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q5_1_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q8_0_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q8_0_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_k_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q4_k_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q4_k_dual_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q5_k_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q5_k_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q6_k_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_q6_k_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_q6_k_dual_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq3_s_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_iq3_s_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq2_s_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_iq2_s_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq2_xxs_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_iq2_xxs_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq3_xxs_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_iq3_xxs_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq4_xs_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_iq4_xs_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f32_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_f32_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f16_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_f16_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_bf16_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_bf16_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f32_wide_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_f32_wide_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_f16_wide_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_f16_wide_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_bf16_wide_batch);
-		vk_destroy_pipeline(p, &p->p_matmul_bf16_wide_res_batch);
 		vk_destroy_pipeline(p, &p->p_matmul_iq4_nl_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_batch);
 		vk_destroy_pipeline(p, &p->p_rmsnorm_sg_batch);
@@ -4673,8 +4621,7 @@ static status_code vk_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	return s;
 }
 
-static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual,
-												 int use_wide);
+static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int use_wide);
 static status_code vk_dispatch_iq4_nl_unified(vk_priv *p, int mode, const buffer *w0,
 											  const buffer *b1, const buffer *b2, buffer *y0,
 											  buffer *y1_opt, int n, int n1, int k, int activation,
@@ -4713,15 +4660,15 @@ static status_code vk_rmsnorm(backend *self, const buffer *x, const buffer *w, b
 	return vk_rmsnorm_batch(self, x, w, y, n, eps, 1);
 }
 
-static vk_pipeline_set *vk_matmul_pipeline(vk_priv *p, uint32_t w_type, int residual) {
-	return vk_matmul_batch_pipeline(p, w_type, residual, 0);
+static vk_pipeline_set *vk_matmul_pipeline(vk_priv *p, uint32_t w_type) {
+	return vk_matmul_batch_pipeline(p, w_type, 0);
 }
 
 static int vk_matmul_type_native(backend *self, uint32_t w_type) {
 	vk_priv *p = self->priv;
 	if (w_type == GGML_TYPE_IQ4_NL)
 		return p->p_matmul_iq4_nl_batch.pipeline != NULL;
-	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type, 0);
+	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type);
 	if (!ps || !ps->pipeline)
 		return 0;
 	return 1;
@@ -4889,6 +4836,134 @@ static status_code vk_qcore_run(backend *self, int t, const buffer *w, const buf
 	return vk_qcore_matmul(self->priv, t, w, x, y, res, n, k, m);
 }
 
+static vk_buf *vk_iq_grid_buf(vk_priv *p, uint32_t w_type) {
+	switch (w_type) {
+	case GGML_TYPE_IQ3_S:
+		return p->iq3s_grid_buf.buf ? &p->iq3s_grid_buf : NULL;
+	case GGML_TYPE_IQ2_XXS:
+	case GGML_TYPE_IQ2_S:
+	case GGML_TYPE_IQ3_XXS:
+		return p->iqx_grid_buf.buf ? &p->iqx_grid_buf : NULL;
+	default:
+		return NULL;
+	}
+}
+
+static int vk_mmf_index(uint32_t w_type) {
+	switch (w_type) {
+	case GGML_TYPE_Q4_0:
+		return 0;
+	case GGML_TYPE_Q8_0:
+		return 1;
+	case GGML_TYPE_IQ4_NL:
+		return 2;
+	case GGML_TYPE_Q4_K:
+		return 3;
+	case GGML_TYPE_BF16:
+		return 4;
+	case GGML_TYPE_F16:
+		return 5;
+	case GGML_TYPE_F32:
+		return 6;
+	case GGML_TYPE_Q6_K:
+		return 7;
+	case GGML_TYPE_IQ2_XXS:
+		return 8;
+	case GGML_TYPE_IQ2_S:
+		return 9;
+	case GGML_TYPE_IQ3_XXS:
+		return 10;
+	case GGML_TYPE_IQ3_S:
+		return 11;
+	default:
+		return -1;
+	}
+}
+
+static int vk_mmf_usable(vk_priv *p, uint32_t w_type, int k, int m) {
+	int idx = vk_mmf_index(w_type);
+	if (idx < 0 || m < VK_QMM_MIN_M || !p->p_mmf[idx].pipeline)
+		return 0;
+	if (idx >= VK_MMF_FIRST_GRID && !vk_iq_grid_buf(p, w_type))
+		return 0;
+	if (idx < 3)
+		return !p->qcore_ok && k % 32 == 0;
+	return k % (idx == 3 || idx >= 7 ? 256 : 32) == 0;
+}
+
+static status_code vk_mmf_dispatch(vk_priv *p, int pipe, const buffer *w, const buffer *x,
+								   buffer *y, const buffer *res, vk_buf *grid,
+								   const int32_t push[4], uint32_t gx, uint32_t gy) {
+	vk_buf *bufs[5] = {as_vkbuf(w), as_vkbuf(x), as_vkbuf(y), res ? as_vkbuf(res) : vk_dummy_buf(p),
+					   grid};
+	VkDeviceSize offs[5] = {w->offset, x->offset, y->offset, res ? res->offset : 0, 0};
+	return vk_dispatch_ex(p, &p->p_mmf[pipe], bufs, offs, NULL, grid ? 5 : 4, push,
+						  4 * sizeof(int32_t), gx, gy, 1u << 2);
+}
+
+static status_code vk_mmf_run(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+							  buffer *y, int n, int k, int m) {
+	const int32_t push[4] = {n, k / 32, m, 0};
+	return vk_mmf_dispatch(self->priv, vk_mmf_index(w_type), w, x, y, NULL,
+						   vk_iq_grid_buf(self->priv, w_type), push, (uint32_t)((m + 63) / 64),
+						   (uint32_t)((n + 63) / 64));
+}
+
+static int vk_mv_usable(vk_priv *p, uint32_t w_type, int k) {
+	int idx = vk_mmf_index(w_type);
+	return !p->qcore_ok && idx >= VK_MV_FIRST && k % 256 == 0 &&
+		   p->p_mmf[idx + VK_MV_PIPE_OFFSET].pipeline &&
+		   (idx < VK_MMF_FIRST_GRID || vk_iq_grid_buf(p, w_type));
+}
+
+static status_code vk_mv_run(vk_priv *p, const buffer *w, uint32_t w_type, const buffer *x,
+							 const buffer *residual, buffer *y, int n, int k) {
+	const int32_t push[4] = {n, k / 32, 1, residual ? 1 : 0};
+	return vk_mmf_dispatch(p, vk_mmf_index(w_type) + VK_MV_PIPE_OFFSET, w, x, y, residual,
+						   vk_iq_grid_buf(p, w_type), push, (uint32_t)((n + 7) / 8), 1);
+}
+
+typedef struct {
+	int32_t n0, n1, n2, k, m, res_mode;
+} vk_matmul_push;
+
+static status_code vk_matmul_legacy(vk_priv *p, const buffer *w, uint32_t w_type, const buffer *x,
+									const buffer *residual, buffer *y, int n, int k, int m) {
+	int is_iqx_grid =
+		(w_type == GGML_TYPE_IQ2_S || w_type == GGML_TYPE_IQ2_XXS || w_type == GGML_TYPE_IQ3_XXS);
+	int is_kquant =
+		(w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_Q6_K ||
+		 w_type == GGML_TYPE_IQ3_S || is_iqx_grid || w_type == GGML_TYPE_IQ4_XS);
+	int is_dense = (w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16);
+
+	uint32_t groups_x	   = is_kquant ? (uint32_t)((n + p->matmul_wg_size - 1) / p->matmul_wg_size)
+									   : (uint32_t)vk_matmul_groups_x(p, n, w_type);
+	int		 m_per_wg	   = p->matmul_m_per_wg > 0 ? p->matmul_m_per_wg : 1;
+	int		 wide_groups_y = (m + m_per_wg - 1) / m_per_wg;
+	int		 use_wide = m > 1 && is_dense && m_per_wg > 1 && (int)groups_x * wide_groups_y >= 128;
+
+	vk_pipeline_set *ps = vk_matmul_batch_pipeline(p, w_type, use_wide);
+	if (!ps || !ps->pipeline) {
+		use_wide = 0;
+		ps		 = vk_matmul_batch_pipeline(p, w_type, 0);
+	}
+	if (!ps || !ps->pipeline)
+		return ERR_UNSUPPORTED;
+
+	vk_buf		*bufs[6] = {as_vkbuf(w), as_vkbuf(x), as_vkbuf(y),
+							residual ? as_vkbuf(residual) : vk_dummy_buf(p)};
+	VkDeviceSize offs[6] = {w->offset, x->offset, y->offset, residual ? residual->offset : 0};
+	int			 n_bufs	 = 4;
+	if (w_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf)
+		bufs[n_bufs++] = &p->iq3s_grid_buf;
+	if (is_iqx_grid && p->iqx_grid_buf.buf)
+		bufs[n_bufs++] = &p->iqx_grid_buf;
+
+	vk_matmul_push push = {n, 0, 0, k, m, residual ? 1 : 0};
+	return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups_x,
+							 use_wide ? (uint32_t)wide_groups_y : (uint32_t)m, 1u << 2);
+}
+
 static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 								  const buffer *residual, buffer *y, int n, int k) {
 	vk_priv *p			  = self->priv;
@@ -4902,6 +4977,9 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 		return vk_matmul_host_fallback(self, w, w_type, x, residual, y, n, k);
 	}
 
+	if (vk_mv_usable(p, w_type, k))
+		return vk_mv_run(p, w, w_type, x, residual, y, n, k);
+
 	int qt = vk_qcore_type(p, w_type, k, 1);
 	if (qt >= 0) {
 		status_code qs = vk_qcore_run(self, qt, w, x, NULL, -1, y, residual, n, k, 1);
@@ -4909,7 +4987,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 			return qs;
 	}
 
-	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type, has_residual);
+	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type);
 
 	if (w_type == GGML_TYPE_IQ4_NL && p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
 		vk_buf		 *dummy = vk_dummy_buf(p);
@@ -4934,66 +5012,7 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 		return vk_matmul_host_fallback(self, w, w_type, x, residual, y, n, k);
 	}
 
-	int is_iq3_s	 = (w_type == GGML_TYPE_IQ3_S);
-	int is_iqx		 = (w_type == GGML_TYPE_IQ2_S || w_type == GGML_TYPE_IQ2_XXS ||
-						w_type == GGML_TYPE_IQ3_XXS || w_type == GGML_TYPE_IQ4_XS);
-	int is_kquant	 = (w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S || is_iqx);
-	int unified_push = (w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K ||
-						w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ3_S || is_iqx);
-
-	vk_buf		*bufs[5];
-	VkDeviceSize offs[5];
-	int			 n_bufs;
-	if (has_residual) {
-		bufs[0] = as_vkbuf(w);
-		offs[0] = w->offset;
-		bufs[1] = as_vkbuf(x);
-		offs[1] = x->offset;
-		bufs[2] = as_vkbuf(residual);
-		offs[2] = residual->offset;
-		bufs[3] = as_vkbuf(y);
-		offs[3] = y->offset;
-		n_bufs	= 4;
-	} else {
-		bufs[0] = as_vkbuf(w);
-		offs[0] = w->offset;
-		bufs[1] = as_vkbuf(x);
-		offs[1] = x->offset;
-		bufs[2] = as_vkbuf(y);
-		offs[2] = y->offset;
-		n_bufs	= 3;
-	}
-	if (is_iq3_s && p->iq3s_grid_buf.buf) {
-		bufs[n_bufs] = &p->iq3s_grid_buf;
-		offs[n_bufs] = 0;
-		n_bufs++;
-	}
-	if (is_iqx && w_type != GGML_TYPE_IQ4_XS && p->iqx_grid_buf.buf) {
-		bufs[n_bufs] = &p->iqx_grid_buf;
-		offs[n_bufs] = 0;
-		n_bufs++;
-	}
-	uint32_t groups;
-	if (is_kquant) {
-		groups = (uint32_t)((n + (int)p->matmul_wg_size - 1) / (int)p->matmul_wg_size);
-	} else {
-		groups = (uint32_t)vk_matmul_groups_x(p, n, w_type);
-	}
-	uint32_t wmask = has_residual ? 0x8 : (1u << 2);
-	if (unified_push) {
-		struct {
-			int32_t n0, n1, k, m;
-		} push = {n, 0, k, 1};
-		return vk_dispatch_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups, 1,
-							  wmask);
-	} else {
-		struct {
-			int32_t n, k, m;
-		} push = {n, k, 1};
-		return vk_dispatch_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups, 1,
-							  wmask);
-	}
+	return vk_matmul_legacy(p, w, w_type, x, residual, y, n, k, 1);
 }
 
 static status_code vk_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
@@ -5806,8 +5825,8 @@ static status_code vk_attention_dense(backend *self, const dense_attention_desc 
 		return ERR_UNSUPPORTED;
 	vk_priv *p = self->priv;
 	struct {
-		int32_t n_heads, head_dim, n0, n1, causal;
-	} push				 = {d->n_heads, d->head_dim, d->n0, d->n1, d->causal};
+		int32_t n_q, n_heads, head_dim, n0, n1, causal;
+	} push				 = {d->n_q, d->n_heads, d->head_dim, d->n0, d->n1, d->causal};
 	vk_buf		*dummy	 = vk_dummy_buf(p);
 	vk_buf		*bufs[6] = {as_vkbuf(d->q),
 							as_vkbuf(d->k0),
@@ -5822,7 +5841,7 @@ static status_code vk_attention_dense(backend *self, const dense_attention_desc 
 							d->n1 ? d->v1->offset : 0,
 							d->out->offset};
 	return vk_nn_dispatch(self, VK_NN_ATTENTION_DENSE, bufs, offs, 6, &push, sizeof(push),
-						  (uint32_t)d->n_q * d->n_heads, 1u << 5);
+						  (uint32_t)((d->n_q + 3) / 4) * d->n_heads, 1u << 5);
 }
 
 static status_code vk_im2col3x3(backend *self, const im2col_desc *d) {
@@ -6445,47 +6464,46 @@ static status_code vk_attention_swa(backend *self, const buffer *q, const buffer
 							 sliding_window, attn_start, n_pos - attn_start);
 }
 
-static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int residual,
-												 int use_wide) {
+static vk_pipeline_set *vk_matmul_batch_pipeline(vk_priv *p, uint32_t w_type, int use_wide) {
 	switch (w_type) {
 	case GGML_TYPE_Q4_0:
-		return residual ? &p->p_matmul_q4_0_res_batch : &p->p_matmul_q4_0_batch;
+		return &p->p_matmul_q4_0_batch;
 	case GGML_TYPE_Q4_1:
-		return residual ? &p->p_matmul_q4_1_res_batch : &p->p_matmul_q4_1_batch;
+		return &p->p_matmul_q4_1_batch;
 	case GGML_TYPE_Q5_0:
-		return residual ? &p->p_matmul_q5_0_res_batch : &p->p_matmul_q5_0_batch;
+		return &p->p_matmul_q5_0_batch;
 	case GGML_TYPE_Q5_1:
-		return residual ? &p->p_matmul_q5_1_res_batch : &p->p_matmul_q5_1_batch;
+		return &p->p_matmul_q5_1_batch;
 	case GGML_TYPE_Q8_0:
-		return residual ? &p->p_matmul_q8_0_res_batch : &p->p_matmul_q8_0_batch;
+		return &p->p_matmul_q8_0_batch;
 	case GGML_TYPE_F32:
 		if (use_wide)
-			return residual ? &p->p_matmul_f32_wide_res_batch : &p->p_matmul_f32_wide_batch;
-		return residual ? &p->p_matmul_f32_res_batch : &p->p_matmul_f32_batch;
+			return &p->p_matmul_f32_wide_batch;
+		return &p->p_matmul_f32_batch;
 	case GGML_TYPE_F16:
 		if (use_wide)
-			return residual ? &p->p_matmul_f16_wide_res_batch : &p->p_matmul_f16_wide_batch;
-		return residual ? &p->p_matmul_f16_res_batch : &p->p_matmul_f16_batch;
+			return &p->p_matmul_f16_wide_batch;
+		return &p->p_matmul_f16_batch;
 	case GGML_TYPE_BF16:
 		if (use_wide)
-			return residual ? &p->p_matmul_bf16_wide_res_batch : &p->p_matmul_bf16_wide_batch;
-		return residual ? &p->p_matmul_bf16_res_batch : &p->p_matmul_bf16_batch;
+			return &p->p_matmul_bf16_wide_batch;
+		return &p->p_matmul_bf16_batch;
 	case GGML_TYPE_Q4_K:
-		return residual ? &p->p_matmul_q4_k_res_batch : &p->p_matmul_q4_k_batch;
+		return &p->p_matmul_q4_k_batch;
 	case GGML_TYPE_Q5_K:
-		return residual ? &p->p_matmul_q5_k_res_batch : &p->p_matmul_q5_k_batch;
+		return &p->p_matmul_q5_k_batch;
 	case GGML_TYPE_Q6_K:
-		return residual ? &p->p_matmul_q6_k_res_batch : &p->p_matmul_q6_k_batch;
+		return &p->p_matmul_q6_k_batch;
 	case GGML_TYPE_IQ3_S:
-		return residual ? &p->p_matmul_iq3_s_res_batch : &p->p_matmul_iq3_s_batch;
+		return &p->p_matmul_iq3_s_batch;
 	case GGML_TYPE_IQ2_S:
-		return residual ? &p->p_matmul_iq2_s_res_batch : &p->p_matmul_iq2_s_batch;
+		return &p->p_matmul_iq2_s_batch;
 	case GGML_TYPE_IQ2_XXS:
-		return residual ? &p->p_matmul_iq2_xxs_res_batch : &p->p_matmul_iq2_xxs_batch;
+		return &p->p_matmul_iq2_xxs_batch;
 	case GGML_TYPE_IQ3_XXS:
-		return residual ? &p->p_matmul_iq3_xxs_res_batch : &p->p_matmul_iq3_xxs_batch;
+		return &p->p_matmul_iq3_xxs_batch;
 	case GGML_TYPE_IQ4_XS:
-		return residual ? &p->p_matmul_iq4_xs_res_batch : &p->p_matmul_iq4_xs_batch;
+		return &p->p_matmul_iq4_xs_batch;
 	default:
 		return NULL;
 	}
@@ -6524,6 +6542,9 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 		return st;
 	}
 
+	if (vk_mmf_usable(p, w_type, k, m))
+		return vk_mmf_run(self, w, w_type, x, y, n, k, m);
+
 	int qt = vk_qcore_type(p, w_type, k, m);
 	if (qt >= 0) {
 		status_code qs = vk_qcore_run(self, qt, w, x, NULL, -1, y, NULL, n, k, m);
@@ -6545,67 +6566,7 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 								 sizeof(push), groups_x, (uint32_t)m, 1u << 3);
 	}
 
-	int is_iqx_grid =
-		(w_type == GGML_TYPE_IQ2_S || w_type == GGML_TYPE_IQ2_XXS || w_type == GGML_TYPE_IQ3_XXS);
-	int is_kquant =
-		(w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q5_K || w_type == GGML_TYPE_Q6_K ||
-		 w_type == GGML_TYPE_IQ3_S || is_iqx_grid || w_type == GGML_TYPE_IQ4_XS);
-	int unified_push =
-		(w_type == GGML_TYPE_Q4_0 || w_type == GGML_TYPE_Q4_K || w_type == GGML_TYPE_Q6_K ||
-		 w_type == GGML_TYPE_IQ3_S || is_iqx_grid || w_type == GGML_TYPE_IQ4_XS);
-
-	uint32_t groups_x;
-	if (is_kquant) {
-		groups_x = (uint32_t)((n + p->matmul_wg_size - 1) / p->matmul_wg_size);
-	} else {
-		groups_x = (uint32_t)vk_matmul_groups_x(p, n, w_type);
-	}
-
-	int is_dense = (w_type == GGML_TYPE_F32 || w_type == GGML_TYPE_F16 || w_type == GGML_TYPE_BF16);
-	int m_per_wg = p->matmul_m_per_wg > 0 ? p->matmul_m_per_wg : 1;
-	int min_total_groups = 128;
-	int wide_groups_y	 = (m + m_per_wg - 1) / m_per_wg;
-	int use_wide = is_dense && m_per_wg > 1 && (int)groups_x * wide_groups_y >= min_total_groups;
-
-	vk_pipeline_set *ps = vk_matmul_batch_pipeline(p, w_type, 0, use_wide);
-	if (!ps || !ps->pipeline) {
-		use_wide = 0;
-		ps		 = vk_matmul_batch_pipeline(p, w_type, 0, 0);
-	}
-	if (!ps || !ps->pipeline)
-		return ERR_UNSUPPORTED;
-
-	vk_buf		*bufs[4] = {as_vkbuf(w), as_vkbuf(x), as_vkbuf(y)};
-	VkDeviceSize offs[4] = {w->offset, x->offset, y->offset};
-	int			 n_bufs	 = 3;
-	if (w_type == GGML_TYPE_IQ3_S && p->iq3s_grid_buf.buf) {
-		bufs[n_bufs] = &p->iq3s_grid_buf;
-		offs[n_bufs] = 0;
-		n_bufs++;
-	}
-	if (is_iqx_grid && p->iqx_grid_buf.buf) {
-		bufs[n_bufs] = &p->iqx_grid_buf;
-		offs[n_bufs] = 0;
-		n_bufs++;
-	}
-
-	uint32_t groups_y = (uint32_t)m;
-	if (use_wide)
-		groups_y = (uint32_t)wide_groups_y;
-
-	if (unified_push) {
-		struct {
-			int32_t n0, n1, k, m;
-		} push = {n, 0, k, m};
-		return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups_x,
-								 groups_y, 1u << 2);
-	} else {
-		struct {
-			int32_t n, k, m;
-		} push = {n, k, m};
-		return vk_dispatch_2d_ex(p, ps, bufs, offs, NULL, n_bufs, &push, sizeof(push), groups_x,
-								 groups_y, 1u << 2);
-	}
+	return vk_matmul_legacy(p, w, w_type, x, NULL, y, n, k, m);
 }
 
 static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
@@ -6639,6 +6600,16 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 		return st;
 	}
 
+	int all_mmf = 1;
+	for (int i = 0; i < n_matmuls; i++)
+		all_mmf &= vk_mmf_usable(p, w_types[i], k, m);
+	if (all_mmf) {
+		status_code st = OK;
+		for (int i = 0; i < n_matmuls && st == OK; i++)
+			st = vk_mmf_run(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
+		return st;
+	}
+
 	int qts[8];
 	int all_q = n_matmuls <= 8;
 	int fams  = 0;
@@ -6665,19 +6636,17 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 	if (n_matmuls == 3 && w_types[0] == w_types[1] && w_types[1] == w_types[2] &&
 		w_types[0] == GGML_TYPE_Q4_0 && p->p_matmul_q4_0_triple_batch.pipeline && k > 0) {
 		int n0 = n_list[0], n1 = n_list[1], n2 = n_list[2];
-		int n_max = n0 > n1 ? n0 : n1;
-		n_max	  = n_max > n2 ? n_max : n2;
-		struct {
-			int32_t n0, n1, n2, k, m;
-		} push				  = {n0, n1, n2, k, m};
-		vk_buf		*bufs[7]  = {as_vkbuf(w[0]), as_vkbuf(w[1]), as_vkbuf(w[2]), as_vkbuf(x),
-								 as_vkbuf(y[0]), as_vkbuf(y[1]), as_vkbuf(y[2])};
-		VkDeviceSize offs[7]  = {w[0]->offset, w[1]->offset, w[2]->offset, x->offset,
-								 y[0]->offset, y[1]->offset, y[2]->offset};
-		int			 rows	  = p->matmul_rows_per_thread;
-		int			 wg		  = p->matmul_wg_size;
-		uint32_t	 groups_x = (uint32_t)((n_max + (wg * rows) - 1) / (wg * rows));
-		uint32_t	 wmask	  = (1u << 4) | (1u << 5) | (1u << 6);
+		int n_max				= n0 > n1 ? n0 : n1;
+		n_max					= n_max > n2 ? n_max : n2;
+		vk_matmul_push push		= {n0, n1, n2, k, m, 0};
+		vk_buf		  *bufs[7]	= {as_vkbuf(w[0]), as_vkbuf(w[1]), as_vkbuf(w[2]), as_vkbuf(x),
+								   as_vkbuf(y[0]), as_vkbuf(y[1]), as_vkbuf(y[2])};
+		VkDeviceSize   offs[7]	= {w[0]->offset, w[1]->offset, w[2]->offset, x->offset,
+								   y[0]->offset, y[1]->offset, y[2]->offset};
+		int			   rows		= p->matmul_rows_per_thread;
+		int			   wg		= p->matmul_wg_size;
+		uint32_t	   groups_x = (uint32_t)((n_max + (wg * rows) - 1) / (wg * rows));
+		uint32_t	   wmask	= (1u << 4) | (1u << 5) | (1u << 6);
 		return vk_dispatch_2d_ex(p, &p->p_matmul_q4_0_triple_batch, bufs, offs, NULL, 7, &push,
 								 sizeof(push), groups_x, (uint32_t)m, wmask);
 	}
@@ -6701,13 +6670,11 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 		}
 
 		if (ps && ps->pipeline && k > 0) {
-			int n0	  = n_list[0];
-			int n1	  = n_list[1];
-			int n_max = (n0 > n1) ? n0 : n1;
-			struct {
-				int32_t n0, n1, k, m;
-			} push			= {n0, n1, k, m};
-			vk_buf *bufs[5] = {
+			int			   n0	   = n_list[0];
+			int			   n1	   = n_list[1];
+			int			   n_max   = (n0 > n1) ? n0 : n1;
+			vk_matmul_push push	   = {n0, n1, 0, k, m, 0};
+			vk_buf		  *bufs[5] = {
 				as_vkbuf(w[0]), as_vkbuf(w[1]), as_vkbuf(x), as_vkbuf(y[0]), as_vkbuf(y[1]),
 			};
 			VkDeviceSize offs[5] = {

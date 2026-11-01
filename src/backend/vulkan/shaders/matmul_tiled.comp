@@ -1,0 +1,74 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+#include "matmul_common.glsl"
+
+#define BM 64u
+#define BN 64u
+
+shared float s_w[32u * BM];
+shared float s_x[32u * BN];
+
+void main() {
+	uint tid  = gl_LocalInvocationID.x;
+	uint n	  = uint(pc.n);
+	uint m	  = uint(pc.m);
+	uint kb	  = uint(pc.kb);
+	uint col0 = gl_WorkGroupID.x * BN;
+	uint row0 = gl_WorkGroupID.y * BM;
+	uint lr	  = tid >> 2u;
+	uint qd	  = tid & 3u;
+	uint eb	  = elem_base(qd);
+	uint tr	  = tid & 15u;
+	uint tc	  = tid >> 4u;
+
+	uint rbase = row_base(min(row0 + lr, n - 1u), kb);
+	uint xbase = min(col0 + lr, m - 1u) * kb * 32u + qd * 8u;
+
+	float acc[16];
+	for (uint i = 0u; i < 16u; i++)
+		acc[i] = 0.0;
+
+	uint raw[NRAW];
+	fetch_raw(rbase, 0u, qd, raw);
+	float xv[8];
+	for (uint j = 0u; j < 8u; j++)
+		xv[j] = x[xbase + j];
+
+	for (uint bi = 0u; bi < kb; bi++) {
+		float o[8];
+		dequant8(raw, bi, qd, o);
+		barrier();
+		for (uint j = 0u; j < 8u; j++) {
+			s_w[(eb + j) * BM + lr]		 = o[j];
+			s_x[(qd * 8u + j) * BN + lr] = xv[j];
+		}
+		barrier();
+
+		if (bi + 1u < kb) {
+			fetch_raw(rbase, bi + 1u, qd, raw);
+			xbase += 32u;
+			for (uint j = 0u; j < 8u; j++)
+				xv[j] = x[xbase + j];
+		}
+
+		for (uint kk = 0u; kk < 32u; kk++) {
+			uint ab = kk * BM + tr * 4u;
+			uint bb = kk * BN + tc * 4u;
+			vec4 a	= vec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
+			vec4 b	= vec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
+			for (uint i = 0u; i < 4u; i++)
+				for (uint j = 0u; j < 4u; j++)
+					acc[i * 4u + j] = fma(a[i], b[j], acc[i * 4u + j]);
+		}
+	}
+
+	for (uint i = 0u; i < 4u; i++) {
+		uint row = row0 + tr * 4u + i;
+		for (uint j = 0u; j < 4u; j++) {
+			uint col = col0 + tc * 4u + j;
+			if (row < n && col < m)
+				y[col * n + row] = acc[i * 4u + j];
+		}
+	}
+}

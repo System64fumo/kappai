@@ -41,11 +41,21 @@ static bool write_chunk(FILE *fp, const char type[4], const uint8_t *data, size_
 		   fwrite(tail, 1, 4, fp) == 4;
 }
 
+#define ADLER_MOD 65521u
+#define ADLER_NMAX 5552
+
 static uint32_t adler32(const uint8_t *buf, size_t len) {
 	uint32_t a = 1, b = 0;
-	for (size_t i = 0; i < len; i++) {
-		a = (a + buf[i]) % 65521;
-		b = (b + a) % 65521;
+	while (len > 0) {
+		size_t chunk = MIN(len, (size_t)ADLER_NMAX);
+		for (size_t i = 0; i < chunk; i++) {
+			a += buf[i];
+			b += a;
+		}
+		a %= ADLER_MOD;
+		b %= ADLER_MOD;
+		buf += chunk;
+		len -= chunk;
 	}
 	return (b << 16) | a;
 }

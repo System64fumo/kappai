@@ -1,0 +1,38 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+#include "matmul_common.glsl"
+
+shared float red[256];
+
+void main() {
+	uint tid   = gl_LocalInvocationID.x;
+	uint t	   = tid & 31u;
+	uint row   = gl_WorkGroupID.x * 8u + (tid >> 5u);
+	uint n	   = uint(pc.n);
+	uint kb	   = uint(pc.kb);
+	uint qd	   = t & 3u;
+	uint eb	   = elem_base(qd);
+	uint rbase = row_base(min(row, n - 1u), kb);
+
+	float acc = 0.0;
+	for (uint sb = t >> 2u; sb < kb; sb += 8u) {
+		uint raw[NRAW];
+		fetch_raw(rbase, sb, qd, raw);
+		float o[8];
+		dequant8(raw, sb, qd, o);
+		uint xo = sb * 32u + eb;
+		for (uint j = 0u; j < 8u; j++)
+			acc += o[j] * x[xo + j];
+	}
+
+	red[tid] = acc;
+	barrier();
+	for (uint off = 16u; off > 0u; off >>= 1u) {
+		if (t < off)
+			red[tid] += red[tid + off];
+		barrier();
+	}
+	if (t == 0u && row < n)
+		y[row] = pc.res_mode == 1 ? red[tid] + res[row] : red[tid];
+}
