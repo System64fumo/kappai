@@ -9,16 +9,18 @@
 #define CONFIG_PRIORITY_UNSET (-1)
 
 struct backend;
+struct gguf_ctx;
 
 typedef struct config {
-	const char	   *device;
-	struct backend *shared_backend;
-	const char	   *model;
-	const char	   *moe_pin_list;
-	const char	   *monitor;
-	const char	   *repack;
-	const char	   *fuse;
-	uint64_t		seed;
+	const char		*device;
+	struct backend	*shared_backend;
+	const char		*model;
+	struct gguf_ctx *preparsed_gguf;
+	const char		*moe_pin_list;
+	const char		*monitor;
+	const char		*repack;
+	const char		*fuse;
+	uint64_t		 seed;
 
 	int			n_threads;
 	int			ctx_size;

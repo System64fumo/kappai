@@ -2,6 +2,12 @@
 #include "log.h"
 #include "model.h"
 
+#if defined(__F16C__) && defined(__AVX__)
+#include <immintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #define WEIGHT_ALIGN 64
 
 static size_t tensor_rows(const gguf_tensor *t) {
@@ -93,6 +99,19 @@ static float f16_bits_to_f32(uint16_t h) {
 	return f;
 }
 
+static void f16_array_to_f32(const uint16_t *src, float *dst, size_t n) {
+	size_t i = 0;
+#if defined(__F16C__) && defined(__AVX__)
+	for (; i + 8 <= n; i += 8)
+		_mm256_storeu_ps(dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i))));
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(dst + i, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src + i))));
+#endif
+	for (; i < n; i++)
+		dst[i] = f16_bits_to_f32(src[i]);
+}
+
 static bool convert_plain_to_f32(const gguf_tensor *t, size_t n, float *dst) {
 	const uint16_t *half = t->data;
 	switch (t->type) {
@@ -100,8 +119,7 @@ static bool convert_plain_to_f32(const gguf_tensor *t, size_t n, float *dst) {
 		memcpy(dst, t->data, n * sizeof(float));
 		return true;
 	case GGML_TYPE_F16:
-		for (size_t i = 0; i < n; i++)
-			dst[i] = f16_bits_to_f32(half[i]);
+		f16_array_to_f32(half, dst, n);
 		return true;
 	case GGML_TYPE_BF16:
 		for (size_t i = 0; i < n; i++) {

@@ -22,18 +22,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TPOOL_SPIN_BUDGET_MIN_NS 5000
-#define TPOOL_SPIN_BUDGET_MAX_NS 40000
-#define TPOOL_SPIN_BUDGET_INITIAL_NS 50000
 #define TPOOL_WAIT_EPOCH_SPIN_BUDGET_NS 20000
+#define TPOOL_COMPLETION_SPIN_NS 20000
+#define TPOOL_COMPLETION_PARK_NS 1000000
 #define TPOOL_SPIN_CHECK_EVERY 128
 #define TPOOL_MIN_CHUNKS_PER_THREAD 32
 #define TPOOL_GUIDED_DIVISOR 4
 #define TPOOL_MAX_THREADS 256
-#define TPOOL_SPIN_EMA_NUM 1
-#define TPOOL_SPIN_EMA_DEN 4
-#define TPOOL_SPIN_BUDGET_FRACTION_NUM 1
-#define TPOOL_SPIN_BUDGET_FRACTION_DEN 2
 
 typedef struct tlocal_slot {
 	void			  **ptr;
@@ -69,10 +64,10 @@ typedef struct {
 	_Alignas(64) _Atomic int epoch;
 	_Atomic int parked_workers;
 	_Atomic int shutdown;
-	_Atomic int spin_budget_ns;
 	_Atomic int pub_gate;
 	_Atomic int active_workers;
 	_Atomic int in_job;
+	_Atomic int done_waiting;
 } tpool_sync_block;
 
 struct tpool {
@@ -83,6 +78,8 @@ struct tpool {
 	pthread_mutex_t			wake_mtx;
 	pthread_cond_t			wake_cv;
 	pthread_mutex_t			pub_mtx;
+	pthread_mutex_t			done_mtx;
+	pthread_cond_t			done_cv;
 	pthread_t				threads[TPOOL_MAX_THREADS];
 	int						n_threads;
 	int						stats_enabled;
@@ -200,32 +197,63 @@ static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 	return e;
 }
 
-static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
+static void tpool_signal_done(tpool *pool) {
+	if (!atomic_load_explicit(&pool->sync.done_waiting, memory_order_seq_cst))
+		return;
+	pthread_mutex_lock(&pool->done_mtx);
+	pthread_cond_broadcast(&pool->done_cv);
+	pthread_mutex_unlock(&pool->done_mtx);
+}
+
+static void tpool_wait_done(tpool *pool, int n_items) {
+	uint64_t t_start = time_ns();
+	unsigned spins	 = 0;
+	while (atomic_load_explicit(&pool->job.executed, memory_order_acquire) < n_items) {
+		if (++spins % TPOOL_SPIN_CHECK_EVERY != 0) {
+			cpu_relax();
+			continue;
+		}
+		uint64_t elapsed = time_ns() - t_start;
+		if (elapsed < TPOOL_COMPLETION_SPIN_NS) {
+			cpu_relax();
+			continue;
+		}
+		if (elapsed < TPOOL_COMPLETION_PARK_NS) {
+			sched_yield();
+			continue;
+		}
+		atomic_store_explicit(&pool->sync.done_waiting, 1, memory_order_seq_cst);
+		pthread_mutex_lock(&pool->done_mtx);
+		while (atomic_load_explicit(&pool->job.executed, memory_order_seq_cst) < n_items)
+			pthread_cond_wait(&pool->done_cv, &pool->done_mtx);
+		pthread_mutex_unlock(&pool->done_mtx);
+		atomic_store_explicit(&pool->sync.done_waiting, 0, memory_order_relaxed);
+		return;
+	}
+}
+
+static void tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
+	if (atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire) != expected_epoch)
+		return;
+
+	tpool_chunk_fn fn = atomic_load_explicit(&pool->job.job_fn, memory_order_acquire);
+	if (!fn)
+		return;
+	void *ctx		= (void *)atomic_load_explicit(&pool->job.job_ctx, memory_order_acquire);
+	int	  end		= atomic_load_explicit(&pool->job.job_end, memory_order_acquire);
+	int	  min_chunk = atomic_load_explicit(&pool->job.chunk_size, memory_order_acquire);
+	int	  n_active	= atomic_load_explicit(&pool->job.n_workers, memory_order_relaxed) + 1;
+
 	tpool_slot *s = &pool->slot[tid];
-
 	for (;;) {
-		int live_epoch = atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire);
-		if (live_epoch != expected_epoch)
-			return 0;
-
-		tpool_chunk_fn fn  = atomic_load_explicit(&pool->job.job_fn, memory_order_acquire);
-		void		  *ctx = (void *)atomic_load_explicit(&pool->job.job_ctx, memory_order_acquire);
-		int			   end = atomic_load_explicit(&pool->job.job_end, memory_order_acquire);
-		int min_chunk	   = atomic_load_explicit(&pool->job.chunk_size, memory_order_acquire);
-		if (!fn)
-			return 1;
-		if (atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire) != expected_epoch)
-			return 0;
-
 		int64_t snap = atomic_load_explicit(&pool->job.cursor_ep, memory_order_acquire);
 		if ((int)(snap >> 32) != expected_epoch)
-			return 0;
+			return;
 		int cur = (int)(snap & 0xffffffffll);
 		if (cur >= end)
-			return 1;
+			return;
 
-		int n_active = atomic_load_explicit(&pool->job.n_workers, memory_order_relaxed) + 1;
-		int chunk	 = (end - cur) / (TPOOL_GUIDED_DIVISOR * n_active);
+		int chunk = (end - cur) / (TPOOL_GUIDED_DIVISOR * n_active);
 		if (chunk < min_chunk)
 			chunk = min_chunk;
 		int next = cur + chunk;
@@ -233,11 +261,15 @@ static int tpool_drain_work(tpool *pool, int tid, int expected_epoch) {
 			next = end;
 
 		int64_t claimed = ((int64_t)expected_epoch << 32) | (int64_t)next;
-		if (atomic_compare_exchange_weak_explicit(&pool->job.cursor_ep, &snap, claimed,
-												  memory_order_acq_rel, memory_order_relaxed)) {
-			tpool_run_timed(s, fn, cur, next, tid, ctx, pool->stats_enabled);
-			atomic_fetch_add_explicit(&pool->job.executed, next - cur, memory_order_release);
-		}
+		if (!atomic_compare_exchange_weak_explicit(&pool->job.cursor_ep, &snap, claimed,
+												   memory_order_acq_rel, memory_order_relaxed))
+			continue;
+		tpool_run_timed(s, fn, cur, next, tid, ctx, pool->stats_enabled);
+		int done =
+			atomic_fetch_add_explicit(&pool->job.executed, next - cur, memory_order_seq_cst) +
+			(next - cur);
+		if (done == end)
+			tpool_signal_done(pool);
 	}
 }
 
@@ -297,16 +329,17 @@ tpool *tpool_create(int n_threads) {
 	memset(pool->slot, 0, (size_t)n_threads * sizeof(tpool_slot));
 	pthread_mutex_init(&pool->wake_mtx, NULL);
 	pthread_mutex_init(&pool->pub_mtx, NULL);
+	pthread_mutex_init(&pool->done_mtx, NULL);
 	pthread_cond_init(&pool->wake_cv, NULL);
+	pthread_cond_init(&pool->done_cv, NULL);
 
 	atomic_store_explicit(&pool->sync.epoch, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.shutdown, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.parked_workers, 0, memory_order_relaxed);
-	atomic_store_explicit(&pool->sync.spin_budget_ns, TPOOL_SPIN_BUDGET_INITIAL_NS,
-						  memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.pub_gate, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.active_workers, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.in_job, 0, memory_order_relaxed);
+	atomic_store_explicit(&pool->sync.done_waiting, 0, memory_order_relaxed);
 	pool->job.chunk_size = 1;
 	pool->job.job_fn	 = NULL;
 	pool->job.job_ctx	 = 0;
@@ -391,7 +424,9 @@ void tpool_destroy(tpool *pool) {
 		pthread_join(pool->threads[i], NULL);
 	pthread_mutex_destroy(&pool->wake_mtx);
 	pthread_mutex_destroy(&pool->pub_mtx);
+	pthread_mutex_destroy(&pool->done_mtx);
 	pthread_cond_destroy(&pool->wake_cv);
+	pthread_cond_destroy(&pool->done_cv);
 	free(pool->slot);
 	free(pool);
 }
@@ -403,19 +438,6 @@ int tpool_n_threads(const tpool *pool) {
 void tpool_set_worker_cleanup(tpool *pool, tpool_worker_cleanup_fn fn) {
 	if (pool)
 		pool->worker_cleanup = fn;
-}
-
-static void tpool_update_spin_budget(tpool *pool, long long wall_ns) {
-	long target =
-		(long)((double)wall_ns * TPOOL_SPIN_BUDGET_FRACTION_NUM / TPOOL_SPIN_BUDGET_FRACTION_DEN);
-	if (target < TPOOL_SPIN_BUDGET_MIN_NS)
-		target = TPOOL_SPIN_BUDGET_MIN_NS;
-	if (target > TPOOL_SPIN_BUDGET_MAX_NS)
-		target = TPOOL_SPIN_BUDGET_MAX_NS;
-
-	int cur		= atomic_load_explicit(&pool->sync.spin_budget_ns, memory_order_relaxed);
-	int updated = (int)(cur + ((target - cur) * TPOOL_SPIN_EMA_NUM / TPOOL_SPIN_EMA_DEN));
-	atomic_store_explicit(&pool->sync.spin_budget_ns, updated, memory_order_relaxed);
 }
 
 void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpool_chunk_fn fn,
@@ -474,28 +496,11 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 		pthread_cond_broadcast(&pool->wake_cv);
 	pthread_mutex_unlock(&pool->wake_mtx);
 
-	long long t_wall_start = time_ns();
-
 	tpool_drain_work(pool, 0, new_epoch);
-
-	int		 budget_ns	  = atomic_load_explicit(&pool->sync.spin_budget_ns, memory_order_relaxed);
-	uint64_t t_spin_start = time_ns();
-	unsigned spins		  = 0;
-	while (atomic_load_explicit(&pool->job.executed, memory_order_acquire) < n_items) {
-		spins++;
-		if (spins % TPOOL_SPIN_CHECK_EVERY == 0 && time_ns() - t_spin_start > (uint64_t)budget_ns) {
-			sched_yield();
-		} else {
-			cpu_relax();
-		}
-	}
+	tpool_wait_done(pool, n_items);
 
 	atomic_store_explicit(&pool->sync.pub_gate, 0, memory_order_release);
-	spin_wait_relax(tpool_retired_pred, pool);
-
 	atomic_store_explicit(&pool->sync.in_job, 0, memory_order_relaxed);
 
 	pthread_mutex_unlock(&pool->pub_mtx);
-
-	tpool_update_spin_budget(pool, time_ns() - t_wall_start);
 }

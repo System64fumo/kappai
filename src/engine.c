@@ -344,8 +344,14 @@ static bool model_is_decision(const char *model_path) {
 static int engine_load(context *ctx, cli_args *a) {
 	const config *ec = config_get();
 
-	if (!a->is_server && model_is_decision(ec->model)) {
+	gguf_ctx preparsed;
+	bool	 has_preparsed = !ec->use_mmap && gguf_load_metadata(&preparsed, ec->model) == OK;
+	bool	 is_decision   = !a->is_server && (has_preparsed ? decision_type_of(&preparsed) != NULL
+															 : model_is_decision(ec->model));
+	if (is_decision) {
 		ERROR("decision models can only run in server mode (kappai-server)");
+		if (has_preparsed)
+			gguf_free(&preparsed);
 		return ERR_UNSUPPORTED;
 	}
 
@@ -354,8 +360,12 @@ static int engine_load(context *ctx, cli_args *a) {
 	DEBUG("model path: %s", ec->model);
 	DEBUG("device=%s use_mmap=%d seed=%llu", ec->device ? ec->device : "auto", ec->use_mmap,
 		  (unsigned long long)ec->seed);
-	uint64_t	t0 = time_ms();
-	status_code s  = context_init(ctx, ec);
+	uint64_t t0				= time_ms();
+	config	 load_cfg		= *ec;
+	load_cfg.preparsed_gguf = has_preparsed ? &preparsed : NULL;
+	status_code s			= context_init(ctx, &load_cfg);
+	if (has_preparsed)
+		gguf_free(&preparsed);
 	if (s != OK) {
 		ERROR("failed to load model: %d", s);
 		return s;

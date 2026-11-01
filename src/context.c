@@ -316,7 +316,8 @@ status_code context_init(context *c, const config *cfg) {
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
 	uint64_t load_t0 = time_us();
-	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack);
+	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack,
+										cfg->preparsed_gguf);
 	if (s != OK) {
 		ERROR("failed to parse model '%s'", cfg->model);
 		monitor_emit_load_phase_model_failed(&c->monitor, s);

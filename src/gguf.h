@@ -75,6 +75,7 @@ typedef struct {
 	uint32_t	type;
 	uint64_t	offset;
 	const void *data;
+	void	   *data_alloc;
 	size_t		byte_size;
 	uint8_t		loaded;
 } gguf_tensor;
@@ -85,7 +86,7 @@ typedef struct {
 	int			used;
 } gguf_strtab_entry;
 
-typedef struct {
+typedef struct gguf_ctx {
 	int				   fd;
 	void			  *map;
 	size_t			   map_size;
@@ -152,6 +153,7 @@ status_code safetensors_parse(gguf_ctx *ctx, void *data, size_t fsize, int fd, v
 							  int header_only);
 
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
+void		gguf_move(gguf_ctx *dst, gguf_ctx *src);
 
 ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);
 

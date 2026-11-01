@@ -262,7 +262,7 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk
 										 const char *repack_config);
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config);
+							 const char *repack_config, gguf_ctx *preparsed);
 status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);

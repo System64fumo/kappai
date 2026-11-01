@@ -13,6 +13,8 @@ Kappai is a local AI inference engine that heavily prioritizes performance and e
 The aim is to cut the hardware, time and electricity it takes to run models locally.<br>
 It's usually faster than other engines, though how much depends on your hardware, model and quant. See [benchmarks](docs/benchmarks.md) for some examples.
 
+![preview](screenshot.png "preview")
+
 ## Features
 
 - CPU inference tuned for `aarch64` and `x86_64`

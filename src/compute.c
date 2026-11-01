@@ -1,6 +1,7 @@
 #include "compute.h"
 #include "log.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,6 +64,64 @@ static void build_rope_table(float *cos_out, float *sin_out, int n_ctx, int head
 	rope_table_chunk(0, half, -1, &job);
 }
 
+typedef struct rope_entry {
+	struct rope_entry *next;
+	float			  *cos_table;
+	float			  *sin_table;
+	float			   theta;
+	int				   head_dim;
+	int				   n_ctx;
+	int				   refs;
+} rope_entry;
+
+static pthread_mutex_t rope_cache_mtx = PTHREAD_MUTEX_INITIALIZER;
+static rope_entry	  *rope_cache;
+
+static void rope_table_acquire(int head_dim, float theta, int n_ctx, float **cos_out,
+							   float **sin_out) {
+	pthread_mutex_lock(&rope_cache_mtx);
+	rope_entry *e = rope_cache;
+	while (e && !(e->head_dim == head_dim && e->theta == theta && e->n_ctx >= n_ctx))
+		e = e->next;
+	if (!e) {
+		const size_t n = (size_t)n_ctx * (size_t)(head_dim / 2);
+		e			   = xcalloc(1, sizeof(*e));
+		e->cos_table   = xmalloc(n * sizeof(float));
+		e->sin_table   = xmalloc(n * sizeof(float));
+		e->theta	   = theta;
+		e->head_dim	   = head_dim;
+		e->n_ctx	   = n_ctx;
+		build_rope_table(e->cos_table, e->sin_table, n_ctx, head_dim, theta);
+		e->next	   = rope_cache;
+		rope_cache = e;
+	}
+	e->refs++;
+	*cos_out = e->cos_table;
+	*sin_out = e->sin_table;
+	pthread_mutex_unlock(&rope_cache_mtx);
+}
+
+static void rope_table_release(float **cos_table, float **sin_table) {
+	if (!*cos_table)
+		return;
+	pthread_mutex_lock(&rope_cache_mtx);
+	for (rope_entry **link = &rope_cache; *link; link = &(*link)->next) {
+		rope_entry *e = *link;
+		if (e->cos_table != *cos_table)
+			continue;
+		if (--e->refs == 0) {
+			*link = e->next;
+			free(e->cos_table);
+			free(e->sin_table);
+			free(e);
+		}
+		break;
+	}
+	pthread_mutex_unlock(&rope_cache_mtx);
+	*cos_table = NULL;
+	*sin_table = NULL;
+}
+
 static void free_buf(buffer *b) {
 	buffer_release(b);
 }
@@ -91,10 +150,8 @@ static void scratch_free_device_buffers(compute_scratch *s) {
 }
 
 static void scratch_free_host_buffers(compute_scratch *s) {
-	free(s->model.rope_cos);
-	free(s->model.rope_sin);
-	free(s->model.rope_cos_swa);
-	free(s->model.rope_sin_swa);
+	rope_table_release(&s->model.rope_cos, &s->model.rope_sin);
+	rope_table_release(&s->model.rope_cos_swa, &s->model.rope_sin_swa);
 	free(s->ple.proj_host.p);
 	free(s->ple.inpL_host.p);
 	s->ple.proj_host.p	 = NULL;
@@ -196,29 +253,17 @@ status_code compute_scratch_ensure(compute_scratch *s, const model *m, int n_ctx
 		s->moe.slot_buf = xcalloc(MOE_MAX_TOPK, sizeof(*s->moe.slot_buf));
 
 	if (m->arch_info->has_variable_layer_dims) {
-		const int half_swa	  = m->layer_dims.head_dim_swa / 2;
-		s->model.rope_cos_swa = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		s->model.rope_sin_swa = xmalloc((size_t)n_ctx * half_swa * sizeof(float));
-		build_rope_table(s->model.rope_cos_swa, s->model.rope_sin_swa, n_ctx,
-						 m->layer_dims.head_dim_swa, m->layer_dims.rope_theta_swa);
-
-		const int half_global = m->layer_dims.head_dim_global / 2;
-		s->model.rope_cos	  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		s->model.rope_sin	  = xmalloc((size_t)n_ctx * half_global * sizeof(float));
-		build_rope_table(s->model.rope_cos, s->model.rope_sin, n_ctx, m->layer_dims.head_dim_global,
-						 m->layer_dims.rope_theta_global);
-
+		rope_table_acquire(m->layer_dims.head_dim_swa, m->layer_dims.rope_theta_swa, n_ctx,
+						   &s->model.rope_cos_swa, &s->model.rope_sin_swa);
+		rope_table_acquire(m->layer_dims.head_dim_global, m->layer_dims.rope_theta_global, n_ctx,
+						   &s->model.rope_cos, &s->model.rope_sin);
 	} else {
 		const int rope_head_dim =
 			m->arch_info->is_mla ? m->mla.qk_rope
 								 : (m->arch_info->is_hybrid_recurrent ? m->rope_dim : m->head_dim);
-		const int half = rope_head_dim / 2;
-		if (half > 0) {
-			s->model.rope_cos = xmalloc((size_t)n_ctx * half * sizeof(float));
-			s->model.rope_sin = xmalloc((size_t)n_ctx * half * sizeof(float));
-			build_rope_table(s->model.rope_cos, s->model.rope_sin, n_ctx, rope_head_dim,
-							 m->rope_theta);
-		}
+		if (rope_head_dim / 2 > 0)
+			rope_table_acquire(rope_head_dim, m->rope_theta, n_ctx, &s->model.rope_cos,
+							   &s->model.rope_sin);
 	}
 
 	s->model.allocated_n_ctx = n_ctx;
