@@ -809,6 +809,18 @@ static status_code vk_suballoc_place(vk_priv *p, VkBuffer buf, const VkMemoryReq
 	return ERR_OUT_OF_MEMORY;
 }
 
+static VkMemoryPropertyFlags vk_host_visible_flags(const vk_priv *p) {
+	VkMemoryPropertyFlags flags =
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (p->caps.unified_memory)
+		flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	return flags;
+}
+
+static VkMemoryPropertyFlags vk_resident_flags(const vk_priv *p) {
+	return p->caps.unified_memory ? vk_host_visible_flags(p) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+}
+
 static status_code vk_alloc_buffer(vk_priv *p, size_t size, VkBufferUsageFlags usage,
 								   VkMemoryPropertyFlags mem_flags, vk_buf *out) {
 	if (size == 0)
@@ -2645,12 +2657,9 @@ static status_code vk_init(backend *self, int device_index) {
 		return s;
 	p->p_moe_combine.name = "moe_combine";
 	{
-		VkBufferUsageFlags	  grid_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags grid_flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		if (p->caps.unified_memory)
-			grid_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		s = vk_alloc_buffer(p, sizeof(ggml_iq3s_grid), grid_usage, grid_flags, &p->iq3s_grid_buf);
+		VkBufferUsageFlags grid_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		s = vk_alloc_buffer(p, sizeof(ggml_iq3s_grid), grid_usage, vk_host_visible_flags(p),
+							&p->iq3s_grid_buf);
 		if (s != OK) {
 			WARN("vulkan: failed to allocate IQ3_S grid buffer -- "
 				 "IQ3_S grid path will be disabled");
@@ -2660,15 +2669,11 @@ static status_code vk_init(backend *self, int device_index) {
 		}
 	}
 	{
-		uint8_t				 *iqx		= NULL;
-		size_t				  iqx_bytes = sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
-										  sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs);
-		VkBufferUsageFlags	  iqx_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags iqx_flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		if (p->caps.unified_memory)
-			iqx_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		s = vk_alloc_buffer(p, iqx_bytes, iqx_usage, iqx_flags, &p->iqx_grid_buf);
+		uint8_t			  *iqx		 = NULL;
+		size_t			   iqx_bytes = sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
+									   sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs);
+		VkBufferUsageFlags iqx_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		s = vk_alloc_buffer(p, iqx_bytes, iqx_usage, vk_host_visible_flags(p), &p->iqx_grid_buf);
 		if (s != OK) {
 			WARN("vulkan: failed to allocate IQX grid buffer -- "
 				 "IQ2_S/IQ2_XXS/IQ3_XXS grid paths will be disabled");
@@ -3145,10 +3150,8 @@ static vk_buf *as_vkbuf(const buffer *b) {
 
 static vk_buf *vk_dummy_buf(vk_priv *p) {
 	if (!p->dummy_buf.buf) {
-		VkBufferUsageFlags	  usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		vk_alloc_buffer(p, 16, usage, flags, &p->dummy_buf);
+		VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		vk_alloc_buffer(p, 16, usage, vk_host_visible_flags(p), &p->dummy_buf);
 	}
 	return &p->dummy_buf;
 }
@@ -3205,15 +3208,7 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags preferred;
-	if (p->caps.unified_memory) {
-		preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	} else {
-		preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	}
-
-	status_code s = vk_alloc_buffer(p, size, usage, preferred, b);
+	status_code s = vk_alloc_buffer(p, size, usage, vk_resident_flags(p), b);
 	if (s != OK) {
 		VkMemoryPropertyFlags fallback =
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -3301,10 +3296,8 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 									  VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
 	if (p->caps.unified_memory) {
-		VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-									  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-									  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		status_code			  s		= vk_alloc_buffer(p, alloc_size, weight_usage, flags, bnew);
+		status_code s =
+			vk_alloc_buffer(p, alloc_size, weight_usage, vk_host_visible_flags(p), bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
 				p, size, weight_usage,
@@ -3429,7 +3422,7 @@ static status_code vk_buffer_alloc_from_host(backend *self, const void *host_dat
 	vk_buf			  *b	 = xcalloc(1, sizeof(vk_buf));
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-	status_code s = vk_alloc_buffer(p, alloc_size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b);
+	status_code		   s	 = vk_alloc_buffer(p, alloc_size, usage, vk_resident_flags(p), b);
 	if (s != OK) {
 		s = vk_alloc_buffer(
 			p, alloc_size, usage,
@@ -3905,16 +3898,9 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 											  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 											  VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags kv_preferred;
-	VkMemoryPropertyFlags kv_fallback;
-	if (p->caps.unified_memory) {
-		kv_preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-					   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		kv_fallback	 = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	} else {
-		kv_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		kv_fallback	 = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	}
+	VkMemoryPropertyFlags kv_preferred = vk_resident_flags(p);
+	VkMemoryPropertyFlags kv_fallback =
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	int needs_chunking =
 		p->caps.max_storage_buffer_range > 0 && total > p->caps.max_storage_buffer_range;
@@ -4925,12 +4911,7 @@ static status_code vk_alloc_rope_buf(vk_priv *p, size_t size, buffer *out) {
 	VkBufferUsageFlags usage =
 		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags preferred =
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	if (p->caps.unified_memory)
-		preferred |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	status_code s = vk_alloc_buffer(p, size, usage, preferred, b);
+	status_code s = vk_alloc_buffer(p, size, usage, vk_host_visible_flags(p), b);
 	if (s != OK) {
 		VkMemoryPropertyFlags fallback =
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -6538,11 +6519,7 @@ static status_code vk_dequant_weight(backend *self, uint32_t type, const void *s
 	const size_t dst_bytes = (size_t)k * (size_t)n_rows * sizeof(float);
 	const int	 n_units   = ((n_rows * k) / unit_elems);
 
-	VkMemoryPropertyFlags mem_flags =
-		p->caps.unified_memory
-			? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-			   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-			: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags mem_flags = vk_resident_flags(p);
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 

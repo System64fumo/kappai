@@ -14,19 +14,16 @@ layout(std430, binding = 2) readonly buffer AlphaBuf {
 layout(std430, binding = 3) readonly buffer BetaBuf {
 	float beta[];
 };
-layout(std430, binding = 4) readonly buffer DtBuf {
-	float dt[];
+layout(std430, binding = 4) readonly buffer HeadParamBuf {
+	float head_params[];
 };
-layout(std430, binding = 5) readonly buffer ABuf {
-	float a_vec[];
-};
-layout(std430, binding = 6) readonly buffer NormBuf {
+layout(std430, binding = 5) readonly buffer NormBuf {
 	float norm_w[];
 };
-layout(std430, binding = 7) buffer StateBuf {
+layout(std430, binding = 6) buffer StateBuf {
 	float state[];
 };
-layout(std430, binding = 8) writeonly buffer OutBuf {
+layout(std430, binding = 7) writeonly buffer OutBuf {
 	float out_[];
 };
 layout(location = 0) uniform int u_n_tokens;
@@ -69,18 +66,18 @@ void main(void) {
 	uint sbase = uint(vh) * uint(kd) * uint(vd);
 
 	for (int t = 0; t < u_n_tokens; t++) {
-		const bool rz	   = u_reset != 0 && t == 0;
-		uint	   cbase   = uint(t) * uint(u_conv_dim);
-		uint	   qbase   = cbase + uint(kh) * uint(kd);
-		uint	   kbase   = cbase + uint(u_key_dim) + uint(kh) * uint(kd);
-		uint	   vbase   = cbase + uint(2 * u_key_dim) + uint(vh) * uint(vd);
-		uint	   zbase   = uint(t) * uint(u_value_dim) + uint(vh) * uint(vd);
-		float	   alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
-		float	   beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
-		float	   sp_arg  = alpha_t + dt[vh];
-		float	   sp	   = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
-		float	   decay   = exp(a_vec[vh] * sp);
-		float	   bg	   = 1.0 / (1.0 + exp(-beta_t));
+		bool  rz	  = u_reset != 0 && t == 0;
+		uint  cbase	  = uint(t) * uint(u_conv_dim);
+		uint  qbase	  = cbase + uint(kh) * uint(kd);
+		uint  kbase	  = cbase + uint(u_key_dim) + uint(kh) * uint(kd);
+		uint  vbase	  = cbase + uint(2 * u_key_dim) + uint(vh) * uint(vd);
+		uint  zbase	  = uint(t) * uint(u_value_dim) + uint(vh) * uint(vd);
+		float alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float sp_arg  = alpha_t + head_params[vh];
+		float sp	  = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
+		float decay	  = exp(head_params[u_n_value_heads + vh] * sp);
+		float bg	  = 1.0 / (1.0 + exp(-beta_t));
 
 		float qss = 0.0;
 		float kss = 0.0;
