@@ -2411,24 +2411,58 @@ static void gdn_chunk(int begin, int end, int tid, void *ctx) {
 }
 
 status_code cpu_gated_delta_net(backend *self, const gdn_desc *d) {
-	tpool *pool			  = (self && self->get_pool) ? self->get_pool(self) : NULL;
-	int	   scratch_stride = 2 * d->state_size + 2 * d->value_head_dim;
-	float *conv			  = d->ws;
-	float *scratch		  = d->ws + (size_t)d->n_tokens * d->conv_dim;
+	tpool *pool		 = (self && self->get_pool) ? self->get_pool(self) : NULL;
+	int	   n_threads = pool ? tpool_n_threads(pool) : 1;
+	if (n_threads < 1)
+		n_threads = 1;
+	int			 scratch_stride = 2 * d->state_size + 2 * d->value_head_dim;
+	float		*conv_state		= buffer_f32(d->conv_state);
+	float		*state			= buffer_f32(d->state);
+	const float *mixed			= buffer_f32(d->mixed);
+	const float *z				= buffer_f32(d->z);
+	const float *alpha			= buffer_f32(d->alpha);
+	const float *beta			= buffer_f32(d->beta);
+	const float *conv_w			= buffer_f32(d->conv_w);
+	const float *dt				= buffer_f32(d->dt);
+	const float *a_vec			= buffer_f32(d->a_vec);
+	const float *norm_w			= buffer_f32(d->norm_w);
+	float		*out			= buffer_f32(d->out);
+	if (!conv_state || !state || !mixed || !z || !alpha || !beta || !conv_w || !dt || !a_vec ||
+		!norm_w || !out)
+		return ERR_INVALID_ARG;
+	if (d->reset) {
+		memset(conv_state, 0, (size_t)d->conv_dim * (size_t)(d->conv_kernel - 1) * sizeof(float));
+		memset(state, 0,
+			   (size_t)d->n_value_heads * (size_t)d->state_size * (size_t)d->value_head_dim *
+				   sizeof(float));
+	}
 
-	gdn_conv_tokens(pool, conv, d->conv_state, d->mixed, d->conv_w, d->conv_dim, d->conv_kernel,
-					d->n_tokens, d->conv_dim);
+	size_t conv_need	= (size_t)d->n_tokens * d->conv_dim;
+	size_t scratch_need = (size_t)n_threads * (size_t)scratch_stride;
+	float *own_ws		= NULL;
+	float *ws			= d->ws;
+	if (!ws) {
+		own_ws = xmalloc((conv_need + scratch_need) * sizeof(float));
+		ws	   = own_ws;
+		if (!ws)
+			return ERR_OUT_OF_MEMORY;
+	}
+	float *conv	   = ws;
+	float *scratch = ws + conv_need;
+
+	gdn_conv_tokens(pool, conv, conv_state, mixed, conv_w, d->conv_dim, d->conv_kernel, d->n_tokens,
+					d->conv_dim);
 
 	gdn_job job = {
-		.state			= d->state,
+		.state			= state,
 		.conv			= conv,
-		.z				= d->z,
-		.alpha			= d->alpha,
-		.beta			= d->beta,
-		.out			= d->out,
-		.dt				= d->dt,
-		.a				= d->a_vec,
-		.norm_w			= d->norm_w,
+		.z				= z,
+		.alpha			= alpha,
+		.beta			= beta,
+		.out			= out,
+		.dt				= dt,
+		.a				= a_vec,
+		.norm_w			= norm_w,
 		.scratch		= scratch,
 		.n_tokens		= d->n_tokens,
 		.conv_stride	= d->conv_dim,
@@ -2447,6 +2481,7 @@ status_code cpu_gated_delta_net(backend *self, const gdn_desc *d) {
 		tpool_parallel_for(pool, d->n_value_heads, 1, gdn_chunk, &job);
 	else
 		gdn_heads(0, d->n_value_heads, &job, scratch);
+	free(own_ws);
 	return OK;
 }
 

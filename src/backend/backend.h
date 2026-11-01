@@ -132,14 +132,15 @@ typedef struct {
 } backend_info;
 
 typedef struct {
-	int			 n_tokens, n_value_heads, n_key_heads;
-	int			 conv_dim, conv_kernel, key_dim, state_size, value_head_dim, value_dim;
-	float		 eps;
-	const float *mixed, *z, *alpha, *beta;
-	const float *conv_w, *dt, *a_vec, *norm_w;
-	float		*conv_state, *state;
-	float		*out;
-	float		*ws;
+	int			  n_tokens, n_value_heads, n_key_heads;
+	int			  conv_dim, conv_kernel, key_dim, state_size, value_head_dim, value_dim;
+	int			  reset;
+	float		  eps;
+	const buffer *mixed, *z, *alpha, *beta;
+	const buffer *conv_w, *dt, *a_vec, *norm_w;
+	buffer		 *conv_state, *state;
+	buffer		 *out;
+	float		 *ws;
 } gdn_desc;
 
 typedef struct {

@@ -81,31 +81,48 @@ status_code op_attn_output_gate(exec_ctx *ctx) {
 	return st;
 }
 
-static status_code gdn_run(exec_ctx *ctx, backend *t, kvcache *kc, int n_tokens, bool reset,
-						   const float *mixed, const float *z, const float *alpha,
-						   const float *beta, float *out, float *ws) {
-	model					  *m	  = ctx->m;
-	const model_hybrid_params *p	  = &m->hybrid;
-	layer_weights			  *L	  = &m->layers[ctx->li];
-	const float				  *conv_w = (const float *)L->ssm_conv1d_w.host_ptr;
-	const float				  *dt	  = (const float *)L->ssm_dt_b.host_ptr;
-	const float				  *a	  = (const float *)L->ssm_a.host_ptr;
-	const float				  *norm_w = (const float *)L->ssm_norm_w.host_ptr;
-	if (!conv_w || !dt || !a || !norm_w)
-		return ERR_FORMAT;
-	if (!t->gated_delta_net)
-		return ERR_UNSUPPORTED;
+static buffer gdn_rows(const buffer *whole, int row0, int row_elems, int n_rows) {
+	return buffer_slice(whole, (size_t)row0 * (size_t)row_elems * sizeof(float),
+						(size_t)n_rows * (size_t)row_elems * sizeof(float));
+}
 
-	kvcache_hybrid *cache	   = kc->hybrid;
-	float		   *conv_state = cache->conv_state + (size_t)ctx->li * cache->conv_stride;
-	float		   *state	   = cache->recurrent_state + (size_t)ctx->li * cache->recurrent_stride;
-	if (reset) {
-		memset(conv_state, 0, cache->conv_stride * sizeof(float));
-		memset(state, 0, cache->recurrent_stride * sizeof(float));
+static buffer gdn_host_rows(backend *owner, const float *base, int row0, int row_elems,
+							int n_rows) {
+	return buffer_host_view(owner, (void *)(base + (size_t)row0 * (size_t)row_elems),
+							(size_t)n_rows * (size_t)row_elems * sizeof(float));
+}
+
+status_code op_gated_delta_net(exec_ctx *ctx) {
+	if (!ctx || !ctx->m || !ctx->rows.cache || !ctx->s || !ctx->rows.cache->hybrid)
+		return ERR_INVALID_ARG;
+	profile_scope			   ps		 = profile_begin(&ctx->s->prof, ctx->op->stage);
+	const model_hybrid_params *p		 = &ctx->m->hybrid;
+	layer_weights			  *L		 = &ctx->m->layers[ctx->li];
+	int						   n_tokens	 = ctx->rows.n_rows > 0 ? ctx->rows.n_rows : 1;
+	backend					  *a		 = exec_layer_backend(ctx);
+	kvcache_hybrid			  *hc0		 = ctx->rows.cache->hybrid;
+	const int				   state_dev = hc0->conv_buf != NULL;
+	backend					  *t;
+	if (state_dev) {
+		t = a;
+	} else {
+		const int native = (exec_caps(ctx, gdn_caps) & GDN_NATIVE) != 0;
+		if (!native)
+			backend_report_host_fallback(a, "gated_delta_net", HFB_OP_NOT_NATIVE,
+										 "gated delta net executes on the host (cpu) fallback");
+		t = native && backend_has_cap(a, BCAP_IS_HOST) ? a : op_host_backend();
+	}
+	if (!t->gated_delta_net) {
+		profile_end(&ctx->s->prof, &ps);
+		return ERR_UNSUPPORTED;
+	}
+	if (!L->ssm_conv1d_w.buf.owner || !L->ssm_dt_b.buf.owner || !L->ssm_a.buf.owner ||
+		!L->ssm_norm_w.buf.owner) {
+		profile_end(&ctx->s->prof, &ps);
+		return ERR_FORMAT;
 	}
 
-	gdn_desc desc = {
-		.n_tokens		= n_tokens,
+	gdn_desc d = {
 		.n_value_heads	= p->n_value_heads,
 		.n_key_heads	= p->n_key_heads,
 		.conv_dim		= p->conv_dim,
@@ -114,47 +131,65 @@ static status_code gdn_run(exec_ctx *ctx, backend *t, kvcache *kc, int n_tokens,
 		.state_size		= p->state_size,
 		.value_head_dim = p->value_head_dim,
 		.value_dim		= p->value_dim,
-		.eps			= m->norm_eps,
-		.mixed			= mixed,
-		.z				= z,
-		.alpha			= alpha,
-		.beta			= beta,
-		.conv_w			= conv_w,
-		.dt				= dt,
-		.a_vec			= a,
-		.norm_w			= norm_w,
-		.conv_state		= conv_state,
-		.state			= state,
-		.out			= out,
-		.ws				= ws,
+		.eps			= ctx->m->norm_eps,
+		.conv_w			= &L->ssm_conv1d_w.buf,
+		.dt				= &L->ssm_dt_b.buf,
+		.a_vec			= &L->ssm_a.buf,
+		.norm_w			= &L->ssm_norm_w.buf,
 	};
-	return t->gated_delta_net(t, &desc);
-}
 
-status_code op_gated_delta_net(exec_ctx *ctx) {
-	if (!ctx || !ctx->m || !ctx->rows.cache || !ctx->s || !ctx->rows.cache->hybrid)
-		return ERR_INVALID_ARG;
-	profile_scope			   ps		= profile_begin(&ctx->s->prof, ctx->op->stage);
-	const model_hybrid_params *p		= &ctx->m->hybrid;
-	int						   n_tokens = ctx->rows.n_rows > 0 ? ctx->rows.n_rows : 1;
-	backend					  *a		= exec_layer_backend(ctx);
-	const int				   native	= (exec_caps(ctx, gdn_caps) & GDN_NATIVE) != 0;
-	if (!native)
-		backend_report_host_fallback(a, "gated_delta_net", HFB_OP_NOT_NATIVE,
-									 "gated delta net executes on the host (cpu) fallback");
-	backend *t = native ? a : op_host_backend();
-	if (!t->gated_delta_net) {
-		profile_end(&ctx->s->prof, &ps);
-		return ERR_UNSUPPORTED;
+	if (backend_has_cap(t, BCAP_IS_HOST)) {
+		tpool *bpool	 = backend_get_pool(t);
+		int	   n_threads = bpool ? tpool_n_threads(bpool) : 1;
+		if (n_threads < 1)
+			n_threads = 1;
+		size_t conv_need	= (size_t)n_tokens * p->conv_dim;
+		size_t scratch_need = (size_t)n_threads * (2 * p->state_size + 2 * p->value_head_dim);
+		d.ws				= float_buf_ensure(&ctx->s->hybrid.gdn_ws, conv_need + scratch_need);
+		if (!d.ws) {
+			profile_end(&ctx->s->prof, &ps);
+			return ERR_INVALID_ARG;
+		}
 	}
 
-	tpool *bpool	 = backend_get_pool(t);
-	int	   n_threads = bpool ? tpool_n_threads(bpool) : 1;
-	if (n_threads < 1)
-		n_threads = 1;
-
-	size_t conv_need	= (size_t)n_tokens * p->conv_dim;
-	size_t scratch_need = (size_t)n_threads * (2 * p->state_size + 2 * p->value_head_dim);
+	status_code st = OK;
+	if (state_dev) {
+		buffer *mixed_b = exec_slot(ctx, ctx->op->in[0]);
+		buffer *z_b		= exec_slot(ctx, ctx->op->in[1]);
+		buffer *alpha_b = exec_slot(ctx, ctx->op->in[2]);
+		buffer *beta_b	= exec_slot(ctx, ctx->op->in[3]);
+		buffer *out_b	= exec_slot(ctx, ctx->op->out);
+		if (!mixed_b || !z_b || !alpha_b || !beta_b || !out_b) {
+			profile_end(&ctx->s->prof, &ps);
+			return ERR_INVALID_ARG;
+		}
+		exec_segments seg = exec_segments_of(ctx);
+		for (int c = 0; c < seg.n_calls && st == OK; c++) {
+			kvcache_hybrid *hc = exec_segment_cache(ctx, c)->hybrid;
+			if (!hc || !hc->conv_buf || !hc->state_buf) {
+				st = ERR_INVALID_ARG;
+				break;
+			}
+			int	   row0	   = c * seg.rows;
+			buffer mixed_v = gdn_rows(mixed_b, row0, p->conv_dim, seg.rows);
+			buffer z_v	   = gdn_rows(z_b, row0, p->value_dim, seg.rows);
+			buffer alpha_v = gdn_rows(alpha_b, row0, p->n_value_heads, seg.rows);
+			buffer beta_v  = gdn_rows(beta_b, row0, p->n_value_heads, seg.rows);
+			buffer out_v   = gdn_rows(out_b, row0, p->value_dim, seg.rows);
+			d.n_tokens	   = seg.rows;
+			d.reset		   = exec_segment_pos(ctx, c) == 0;
+			d.mixed		   = &mixed_v;
+			d.z			   = &z_v;
+			d.alpha		   = &alpha_v;
+			d.beta		   = &beta_v;
+			d.out		   = &out_v;
+			d.conv_state   = &hc->conv_buf[ctx->li];
+			d.state		   = &hc->state_buf[ctx->li];
+			st			   = t->gated_delta_net(t, &d);
+		}
+		profile_end(&ctx->s->prof, &ps);
+		return st;
+	}
 
 	int mixed_n = n_tokens * p->conv_dim;
 	int z_n		= n_tokens * p->value_dim;
@@ -168,18 +203,62 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 		recipe_slot_read_f32(ctx, ctx->op->in[2], &ctx->s->hybrid.gdn_alpha, alpha_n);
 	const float *beta = recipe_slot_read_f32(ctx, ctx->op->in[3], &ctx->s->hybrid.gdn_beta, beta_n);
 	float		*out  = recipe_slot_write_stage(ctx, ctx->op->out, &ctx->s->hybrid.gdn_out, out_n);
-	if (!mixed || !z || !alpha || !beta || !out)
+	if (!mixed || !z || !alpha || !beta || !out) {
+		profile_end(&ctx->s->prof, &ps);
 		return ERR_INVALID_ARG;
+	}
 
-	float		 *ws  = float_buf_ensure(&ctx->s->hybrid.gdn_ws, conv_need + scratch_need);
+	const weight_ref *gdn_w[4]	= {&L->ssm_conv1d_w, &L->ssm_dt_b, &L->ssm_a, &L->ssm_norm_w};
+	const int		  gdn_wn[4] = {p->conv_dim * p->conv_kernel, p->n_value_heads, p->n_value_heads,
+								   p->value_head_dim};
+	buffer			  w_v[4];
+	for (int i = 0; i < 4; i++) {
+		if (buffer_is_host_resident(&gdn_w[i]->buf)) {
+			w_v[i] = gdn_w[i]->buf;
+			continue;
+		}
+		float *stg = float_buf_ensure(&ctx->s->hybrid.gdn_w[i], gdn_wn[i]);
+		if (!stg || !gdn_w[i]->buf.owner ||
+			gdn_w[i]->buf.owner->buffer_read_f32(gdn_w[i]->buf.owner, &gdn_w[i]->buf, stg,
+												 gdn_wn[i]) != OK) {
+			profile_end(&ctx->s->prof, &ps);
+			return ERR_INVALID_ARG;
+		}
+		w_v[i] = buffer_host_view(t, stg, (size_t)gdn_wn[i] * sizeof(float));
+	}
+	d.conv_w = &w_v[0];
+	d.dt	 = &w_v[1];
+	d.a_vec	 = &w_v[2];
+	d.norm_w = &w_v[3];
+
 	exec_segments seg = exec_segments_of(ctx);
-	status_code	  st  = OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		size_t row0 = (size_t)c * seg.rows;
-		st = gdn_run(ctx, t, exec_segment_cache(ctx, c), seg.rows, exec_segment_pos(ctx, c) == 0,
-					 mixed + row0 * p->conv_dim, z + row0 * p->value_dim,
-					 alpha + row0 * p->n_value_heads, beta + row0 * p->n_value_heads,
-					 out + row0 * p->value_dim, ws);
+		kvcache_hybrid *hc = exec_segment_cache(ctx, c)->hybrid;
+		if (!hc || !hc->conv_state || !hc->recurrent_state) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		int	   row0	   = c * seg.rows;
+		buffer mixed_v = gdn_host_rows(t, mixed, row0, p->conv_dim, seg.rows);
+		buffer z_v	   = gdn_host_rows(t, z, row0, p->value_dim, seg.rows);
+		buffer alpha_v = gdn_host_rows(t, alpha, row0, p->n_value_heads, seg.rows);
+		buffer beta_v  = gdn_host_rows(t, beta, row0, p->n_value_heads, seg.rows);
+		buffer out_v   = gdn_host_rows(t, out, row0, p->value_dim, seg.rows);
+		buffer conv_v  = buffer_host_view(t, hc->conv_state + (size_t)ctx->li * hc->conv_stride,
+										  hc->conv_stride * sizeof(float));
+		buffer state_v =
+			buffer_host_view(t, hc->recurrent_state + (size_t)ctx->li * hc->recurrent_stride,
+							 hc->recurrent_stride * sizeof(float));
+		d.n_tokens	 = seg.rows;
+		d.reset		 = exec_segment_pos(ctx, c) == 0;
+		d.mixed		 = &mixed_v;
+		d.z			 = &z_v;
+		d.alpha		 = &alpha_v;
+		d.beta		 = &beta_v;
+		d.out		 = &out_v;
+		d.conv_state = &conv_v;
+		d.state		 = &state_v;
+		st			 = t->gated_delta_net(t, &d);
 	}
 	if (st == OK)
 		st = recipe_slot_write_commit(ctx, ctx->op->out, out, out_n);

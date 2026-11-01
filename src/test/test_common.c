@@ -97,6 +97,7 @@ const char *op_family_name(op_family f) {
 		[OPFAM_HC_FINAL]		 = "hc_final",
 		[OPFAM_KDA]				 = "kda",
 		[OPFAM_MLA_ABSORBED]	 = "mla_absorbed",
+		[OPFAM_GDN]				 = "gdn",
 	};
 	if (f >= OPFAM_COUNT)
 		return "?";

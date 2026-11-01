@@ -278,6 +278,17 @@ static size_t model_kda_state_bytes(const model *m, int n_ctx) {
 	return total;
 }
 
+static size_t model_gdn_state_bytes(const model *m) {
+	const size_t conv_floats = (size_t)m->hybrid.conv_dim * (size_t)(m->hybrid.conv_kernel - 1);
+	const size_t recurrent_floats = (size_t)m->hybrid.n_value_heads * (size_t)m->hybrid.state_size *
+									(size_t)m->hybrid.value_head_dim;
+	size_t		 total			  = 0;
+	for (int i = 0; i < m->n_layers; i++)
+		if (model_layer_is_recurrent(m, i))
+			total += (conv_floats + recurrent_floats) * sizeof(float);
+	return total;
+}
+
 size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_quant,
 								  int compacted) {
 	if (m->full_sequence)
@@ -290,6 +301,9 @@ size_t model_kv_cache_bytes_quant(const model *m, int n_ctx, kv_quant_type kv_qu
 				   (size_t)m->n_layers * sizeof(float);
 		return kv_cache;
 	}
+	if (m->arch_info->is_hybrid_recurrent && !m->arch_info->hybrid_shortconv && m->backend &&
+		m->backend->gated_delta_net)
+		kv_cache += model_gdn_state_bytes(m);
 	int n_kv_layers =
 		m->layer_dims.n_layer_kv_from_start > 0 ? m->layer_dims.n_layer_kv_from_start : m->n_layers;
 	if (n_kv_layers > m->n_layers)

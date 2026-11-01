@@ -116,9 +116,10 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 	expert_dev_scratch_release(&s->moe.expert_dev);
 
 	float_buf *buffers[] = {
-		&s->hybrid.host,	  &s->hybrid.host2,	   &s->hybrid.gdn_ws,  &s->run.op_ws,
-		&s->run.stage_a,	  &s->run.stage_b,	   &s->run.scale_tmp,  &s->hybrid.gdn_z,
-		&s->hybrid.gdn_alpha, &s->hybrid.gdn_beta, &s->hybrid.gdn_out,
+		&s->hybrid.host,	  &s->hybrid.host2,	   &s->hybrid.gdn_ws,	&s->run.op_ws,
+		&s->run.stage_a,	  &s->run.stage_b,	   &s->run.scale_tmp,	&s->hybrid.gdn_z,
+		&s->hybrid.gdn_alpha, &s->hybrid.gdn_beta, &s->hybrid.gdn_out,	&s->hybrid.gdn_w[0],
+		&s->hybrid.gdn_w[1],  &s->hybrid.gdn_w[2], &s->hybrid.gdn_w[3],
 	};
 	for (size_t i = 0; i < ARRAY_LEN(buffers); i++) {
 		free(buffers[i]->p);

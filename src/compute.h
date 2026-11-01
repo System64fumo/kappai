@@ -81,6 +81,7 @@ typedef struct {
 	float_buf gdn_alpha;
 	float_buf gdn_beta;
 	float_buf gdn_out;
+	float_buf gdn_w[4];
 } scratch_hybrid;
 
 typedef struct {

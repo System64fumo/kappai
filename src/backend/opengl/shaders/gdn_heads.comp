@@ -38,6 +38,7 @@ layout(location = 5) uniform int u_vd;
 layout(location = 6) uniform int u_value_dim;
 layout(location = 7) uniform int u_conv_dim;
 layout(location = 8) uniform float u_eps;
+layout(location = 9) uniform int u_reset;
 
 const int MAX_PER_THREAD = 8;
 
@@ -68,17 +69,18 @@ void main(void) {
 	uint sbase = uint(vh) * uint(kd) * uint(vd);
 
 	for (int t = 0; t < u_n_tokens; t++) {
-		uint  cbase	  = uint(t) * uint(u_conv_dim);
-		uint  qbase	  = cbase + uint(kh) * uint(kd);
-		uint  kbase	  = cbase + uint(u_key_dim) + uint(kh) * uint(kd);
-		uint  vbase	  = cbase + uint(2 * u_key_dim) + uint(vh) * uint(vd);
-		uint  zbase	  = uint(t) * uint(u_value_dim) + uint(vh) * uint(vd);
-		float alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
-		float beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
-		float sp_arg  = alpha_t + dt[vh];
-		float sp	  = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
-		float decay	  = exp(a_vec[vh] * sp);
-		float bg	  = 1.0 / (1.0 + exp(-beta_t));
+		const bool rz	   = u_reset != 0 && t == 0;
+		uint	   cbase   = uint(t) * uint(u_conv_dim);
+		uint	   qbase   = cbase + uint(kh) * uint(kd);
+		uint	   kbase   = cbase + uint(u_key_dim) + uint(kh) * uint(kd);
+		uint	   vbase   = cbase + uint(2 * u_key_dim) + uint(vh) * uint(vd);
+		uint	   zbase   = uint(t) * uint(u_value_dim) + uint(vh) * uint(vd);
+		float	   alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float	   beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
+		float	   sp_arg  = alpha_t + dt[vh];
+		float	   sp	   = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
+		float	   decay   = exp(a_vec[vh] * sp);
+		float	   bg	   = 1.0 / (1.0 + exp(-beta_t));
 
 		float qss = 0.0;
 		float kss = 0.0;
@@ -103,12 +105,14 @@ void main(void) {
 			uint  scol = sbase + uint(j);
 			float mem  = 0.0;
 			for (int d = 0; d < kd; d++)
-				mem += state[scol + uint(d) * uint(vd)] * decay * (conv_out[kbase + uint(d)] * kn);
+				mem += (rz ? 0.0 : state[scol + uint(d) * uint(vd)]) * decay *
+					   (conv_out[kbase + uint(d)] * kn);
 			float delta = (conv_out[vbase + uint(j)] - mem) * bg;
 			float yacc	= 0.0;
 			for (int d = 0; d < kd; d++) {
-				uint  idx  = scol + uint(d) * uint(vd);
-				float row  = state[idx] * decay + (conv_out[kbase + uint(d)] * kn) * delta;
+				uint  idx = scol + uint(d) * uint(vd);
+				float row =
+					(rz ? 0.0 : state[idx]) * decay + (conv_out[kbase + uint(d)] * kn) * delta;
 				state[idx] = row;
 				yacc += row * (conv_out[qbase + uint(d)] * qn);
 			}

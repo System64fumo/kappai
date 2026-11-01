@@ -14,6 +14,7 @@ typedef struct kvcache_hybrid {
 	size_t	recurrent_total;
 	size_t	mla_latent_stride;
 	int		n_layers;
+	int		owns_all_kv;
 	buffer *conv_buf;
 	buffer *state_buf;
 	buffer *latent_buf;

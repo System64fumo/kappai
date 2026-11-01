@@ -67,6 +67,24 @@ typedef struct {
 enum { KDA_W = 9, KDA_P = 6 };
 
 enum {
+	GDN_NKH		  = 2,
+	GDN_SS		  = 8,
+	GDN_NVH		  = 4,
+	GDN_VD		  = 16,
+	GDN_KEY_DIM	  = GDN_NKH * GDN_SS,
+	GDN_VALUE_DIM = GDN_NVH * GDN_VD,
+	GDN_CONV_DIM  = 2 * GDN_KEY_DIM + GDN_VALUE_DIM,
+	GDN_KERNEL	  = 4,
+	GDN_HIST	  = GDN_KERNEL - 1,
+};
+
+typedef struct {
+	float mixed[2 * GDN_CONV_DIM], z[2 * GDN_VALUE_DIM], alpha[2 * GDN_NVH], beta[2 * GDN_NVH];
+	float conv_w[GDN_CONV_DIM * GDN_KERNEL], dt[GDN_NVH], a_vec[GDN_NVH], norm_w[GDN_VD];
+	float tail_mixed[GDN_CONV_DIM], tail_z[GDN_VALUE_DIM], tail_alpha[GDN_NVH], tail_beta[GDN_NVH];
+} nop_gdn_data;
+
+enum {
 	MLA_DIM	  = 64,
 	MLA_H	  = 4,
 	MLA_R	  = 16,
@@ -4524,6 +4542,90 @@ static status_code nop_mla_run(backend *b, const nop_mla_data *dt, float *out) {
 	return st;
 }
 
+static status_code nop_gdn_run(backend *b, const nop_gdn_data *dt, float *out) {
+	buffer p[8] = {
+		nop_scratch(b, dt->mixed, 2 * GDN_CONV_DIM),
+		nop_scratch(b, dt->z, 2 * GDN_VALUE_DIM),
+		nop_scratch(b, dt->alpha, 2 * GDN_NVH),
+		nop_scratch(b, dt->beta, 2 * GDN_NVH),
+		nop_scratch(b, dt->conv_w, GDN_CONV_DIM * GDN_KERNEL),
+		nop_scratch(b, dt->dt, GDN_NVH),
+		nop_scratch(b, dt->a_vec, GDN_NVH),
+		nop_scratch(b, dt->norm_w, GDN_VD),
+	};
+	buffer conv_state = nop_zeros(b, GDN_CONV_DIM * GDN_HIST);
+	buffer state	  = nop_zeros(b, GDN_NVH * GDN_SS * GDN_VD);
+	buffer y		  = nop_zeros(b, 3 * GDN_VALUE_DIM);
+
+	gdn_desc d = {
+		.n_value_heads	= GDN_NVH,
+		.n_key_heads	= GDN_NKH,
+		.conv_dim		= GDN_CONV_DIM,
+		.conv_kernel	= GDN_KERNEL,
+		.key_dim		= GDN_KEY_DIM,
+		.state_size		= GDN_SS,
+		.value_head_dim = GDN_VD,
+		.value_dim		= GDN_VALUE_DIM,
+		.eps			= 1e-6f,
+		.mixed			= &p[0],
+		.z				= &p[1],
+		.alpha			= &p[2],
+		.beta			= &p[3],
+		.conv_w			= &p[4],
+		.dt				= &p[5],
+		.a_vec			= &p[6],
+		.norm_w			= &p[7],
+		.conv_state		= &conv_state,
+		.state			= &state,
+		.out			= &y,
+	};
+	d.n_tokens	   = 2;
+	d.reset		   = 1;
+	status_code st = b->gated_delta_net(b, &d);
+	nop_read(b, &y, out, 2 * GDN_VALUE_DIM);
+	if (st == OK) {
+		b->buffer_write_f32(b, &p[0], dt->tail_mixed, GDN_CONV_DIM);
+		b->buffer_write_f32(b, &p[1], dt->tail_z, GDN_VALUE_DIM);
+		b->buffer_write_f32(b, &p[2], dt->tail_alpha, GDN_NVH);
+		b->buffer_write_f32(b, &p[3], dt->tail_beta, GDN_NVH);
+		d.n_tokens = 1;
+		d.reset	   = 0;
+		st		   = b->gated_delta_net(b, &d);
+		nop_read(b, &y, out + 2 * GDN_VALUE_DIM, GDN_VALUE_DIM);
+	}
+	nop_free(b, p, 8);
+	b->buffer_free(b, &conv_state);
+	b->buffer_free(b, &state);
+	b->buffer_free(b, &y);
+	return st;
+}
+
+static void test_op_gdn(backend *ref, backend *tgt) {
+	char label[160];
+	if (!nop_gate(OPFAM_GDN, "gdn", "v_heads=4 key_heads=2 state=8 vd=16", tgt,
+				  ref->gated_delta_net != NULL, tgt->gated_delta_net != NULL, label, sizeof(label)))
+		return;
+	nop_gdn_data *dt = xmalloc(sizeof(*dt));
+	seed_test_rng(0x4807);
+	NOP_FILL(dt->mixed, 1.0f);
+	NOP_FILL(dt->z, 1.0f);
+	NOP_FILL(dt->alpha, 0.5f);
+	NOP_FILL(dt->beta, 0.5f);
+	NOP_FILL(dt->conv_w, 0.5f);
+	NOP_FILL(dt->dt, 0.5f);
+	NOP_FILL(dt->a_vec, 0.5f);
+	NOP_FILL(dt->norm_w, 1.0f);
+	NOP_FILL(dt->tail_mixed, 1.0f);
+	NOP_FILL(dt->tail_z, 1.0f);
+	NOP_FILL(dt->tail_alpha, 0.5f);
+	NOP_FILL(dt->tail_beta, 0.5f);
+	float y_ref[3 * GDN_VALUE_DIM], y_tgt[3 * GDN_VALUE_DIM];
+	nop_gdn_run(ref, dt, y_ref);
+	status_code st = nop_gdn_run(tgt, dt, y_tgt);
+	nop_compare(OPFAM_GDN, label, y_ref, y_tgt, 3 * GDN_VALUE_DIM, st);
+	free(dt);
+}
+
 static void test_op_mla_absorbed(backend *ref, backend *tgt) {
 	char label[160];
 	if (!nop_gate(OPFAM_MLA_ABSORBED, "mla_absorbed", "dim=64 heads=4 kv_lora=16", tgt,
@@ -4560,6 +4662,8 @@ static void run_native_exec_op_tests(backend *ref, backend *tgt) {
 	flush_family(OPFAM_KDA);
 	test_op_mla_absorbed(ref, tgt);
 	flush_family(OPFAM_MLA_ABSORBED);
+	test_op_gdn(ref, tgt);
+	flush_family(OPFAM_GDN);
 }
 
 void run_per_op_tests(backend *ref, backend *tgt) {

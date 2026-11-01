@@ -82,7 +82,6 @@ struct tpool {
 	tpool_worker_cleanup_fn worker_cleanup;
 	pthread_mutex_t			wake_mtx;
 	pthread_cond_t			wake_cv;
-	clockid_t				wake_clock;
 	pthread_mutex_t			pub_mtx;
 	pthread_t				threads[TPOOL_MAX_THREADS];
 	int						n_threads;
@@ -176,8 +175,8 @@ static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 	}
 
 	uint64_t t_park_start = time_ns();
-	atomic_fetch_add_explicit(&pool->sync.parked_workers, 1, memory_order_relaxed);
 	pthread_mutex_lock(&pool->wake_mtx);
+	atomic_fetch_add_explicit(&pool->sync.parked_workers, 1, memory_order_relaxed);
 	int e;
 	for (;;) {
 		e = atomic_load_explicit(&pool->sync.epoch, memory_order_acquire);
@@ -186,23 +185,10 @@ static int tpool_wait_epoch(tpool *pool, int last_seen_epoch, int tid) {
 		if (atomic_load_explicit(&pool->sync.shutdown, memory_order_acquire))
 			break;
 
-		struct timespec ts;
-#if defined(__APPLE__)
-		ts.tv_sec  = 0;
-		ts.tv_nsec = 200000;
-		pthread_cond_timedwait_relative_np(&pool->wake_cv, &pool->wake_mtx, &ts);
-#else
-		clock_gettime(pool->wake_clock, &ts);
-		ts.tv_nsec += 200000;
-		if (ts.tv_nsec >= 1000000000L) {
-			ts.tv_sec++;
-			ts.tv_nsec -= 1000000000L;
-		}
-		pthread_cond_timedwait(&pool->wake_cv, &pool->wake_mtx, &ts);
-#endif
+		pthread_cond_wait(&pool->wake_cv, &pool->wake_mtx);
 	}
-	pthread_mutex_unlock(&pool->wake_mtx);
 	atomic_fetch_sub_explicit(&pool->sync.parked_workers, 1, memory_order_relaxed);
+	pthread_mutex_unlock(&pool->wake_mtx);
 
 	if (tid >= 0) {
 		uint64_t now = time_ns();
@@ -311,17 +297,7 @@ tpool *tpool_create(int n_threads) {
 	memset(pool->slot, 0, (size_t)n_threads * sizeof(tpool_slot));
 	pthread_mutex_init(&pool->wake_mtx, NULL);
 	pthread_mutex_init(&pool->pub_mtx, NULL);
-	{
-		pthread_condattr_t cattr;
-		pthread_condattr_init(&cattr);
-		pool->wake_clock = CLOCK_REALTIME;
-#if defined(_POSIX_CLOCK_SELECTION) && _POSIX_CLOCK_SELECTION >= 0 && !defined(__APPLE__)
-		if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) == 0)
-			pool->wake_clock = CLOCK_MONOTONIC;
-#endif
-		pthread_cond_init(&pool->wake_cv, &cattr);
-		pthread_condattr_destroy(&cattr);
-	}
+	pthread_cond_init(&pool->wake_cv, NULL);
 
 	atomic_store_explicit(&pool->sync.epoch, 0, memory_order_relaxed);
 	atomic_store_explicit(&pool->sync.shutdown, 0, memory_order_relaxed);
@@ -492,14 +468,11 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 		atomic_store_explicit(&pool->job.job_epoch, new_epoch, memory_order_release);
 	}
 
-	if (atomic_load_explicit(&pool->sync.parked_workers, memory_order_relaxed) == 0) {
-		atomic_store_explicit(&pool->sync.epoch, new_epoch, memory_order_release);
-	} else {
-		pthread_mutex_lock(&pool->wake_mtx);
-		atomic_store_explicit(&pool->sync.epoch, new_epoch, memory_order_release);
+	pthread_mutex_lock(&pool->wake_mtx);
+	atomic_store_explicit(&pool->sync.epoch, new_epoch, memory_order_release);
+	if (atomic_load_explicit(&pool->sync.parked_workers, memory_order_relaxed) > 0)
 		pthread_cond_broadcast(&pool->wake_cv);
-		pthread_mutex_unlock(&pool->wake_mtx);
-	}
+	pthread_mutex_unlock(&pool->wake_mtx);
 
 	long long t_wall_start = time_ns();
 

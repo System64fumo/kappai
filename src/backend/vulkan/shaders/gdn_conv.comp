@@ -18,6 +18,7 @@ layout(push_constant) uniform Params {
 	int conv_dim;
 	int kernel;
 	int n_tokens;
+	int reset;
 }
 params;
 
@@ -33,7 +34,7 @@ void main() {
 	int	  wbase = c * params.kernel;
 	float st[MAX_HIST];
 	for (int k = 0; k < hist; k++)
-		st[k] = conv_state[c * hist + k];
+		st[k] = params.reset != 0 ? 0.0 : conv_state[c * hist + k];
 	for (int t = 0; t < params.n_tokens; t++) {
 		float m	  = mixed[t * params.conv_dim + c];
 		float sum = m * conv_w[wbase + hist];

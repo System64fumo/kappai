@@ -96,12 +96,15 @@ static status_code kvcache_alloc_layer_state(backend *be, buffer *out, size_t fl
 	return buffer_alloc_f32(be, floats, out);
 }
 
-static status_code kvcache_alloc_kda_state(kvcache_hybrid *q, const model *m) {
+static status_code kvcache_alloc_layer_state_bufs(kvcache_hybrid *q, const model *m,
+												  int (*layer_wants)(const model *, int)) {
 	const size_t n = (size_t)m->n_layers;
 	q->conv_buf	   = xcalloc(n, sizeof(buffer));
 	q->state_buf   = xcalloc(n, sizeof(buffer));
 	q->latent_buf  = xcalloc(n, sizeof(buffer));
 	for (int li = 0; li < m->n_layers; li++) {
+		if (layer_wants && !layer_wants(m, li))
+			continue;
 		backend	   *be		  = model_layer_backend(m, li);
 		const int	recurrent = model_layer_is_recurrent(m, li);
 		status_code s =
@@ -113,6 +116,33 @@ static status_code kvcache_alloc_kda_state(kvcache_hybrid *q, const model *m) {
 			return s;
 	}
 	return OK;
+}
+
+static int kvcache_kda_layer(const model *m, int li) {
+	(void)m;
+	(void)li;
+	return 1;
+}
+
+static status_code kvcache_alloc_kda_state(kvcache_hybrid *q, const model *m) {
+	return kvcache_alloc_layer_state_bufs(q, m, kvcache_kda_layer);
+}
+
+static int kvcache_gdn_layer(const model *m, int li) {
+	return model_layer_is_recurrent(m, li) && model_layer_backend(m, li)->gated_delta_net != NULL;
+}
+
+static int kvcache_gdn_state_device_backed(const model *m) {
+	if (m->arch_info->hybrid_shortconv)
+		return 0;
+	for (int li = 0; li < m->n_layers; li++)
+		if (model_layer_is_recurrent(m, li) && model_layer_backend(m, li)->gated_delta_net == NULL)
+			return 0;
+	return 1;
+}
+
+static status_code kvcache_alloc_gdn_state(kvcache_hybrid *q, const model *m) {
+	return kvcache_alloc_layer_state_bufs(q, m, kvcache_gdn_layer);
 }
 
 static void kvcache_free_layer_states(kvcache_hybrid *q) {
@@ -182,11 +212,19 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		c->hybrid			= q;
 		if (m->arch_info->is_kda) {
 			q->mla_latent_stride = (size_t)n_ctx * (size_t)m->mla.kv_lora;
+			q->owns_all_kv		 = 1;
 			return kvcache_alloc_kda_state(q, m);
 		}
-		q->conv_state = xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
-		if (q->recurrent_stride > 0)
-			q->recurrent_state = xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		if (q->recurrent_stride > 0 && kvcache_gdn_state_device_backed(m)) {
+			status_code ds = kvcache_alloc_gdn_state(q, m);
+			if (ds != OK)
+				return ds;
+		} else {
+			q->conv_state = xcalloc((size_t)m->n_layers, q->conv_stride * sizeof(float));
+			if (q->recurrent_stride > 0)
+				q->recurrent_state =
+					xcalloc((size_t)m->n_layers, q->recurrent_stride * sizeof(float));
+		}
 	}
 
 	backend *kv_backend = c->backend->kv_alloc ? c->backend : backend_host();
@@ -277,7 +315,7 @@ static void kv_pair_free(backend *be, buffer *k, buffer *v, bool mla) {
 void kvcache_free(kvcache *c) {
 	if (!c->backend)
 		return;
-	if (!(c->hybrid && c->hybrid->conv_buf)) {
+	if (!(c->hybrid && c->hybrid->owns_all_kv)) {
 		bool mla = c->is_mla;
 		kv_pair_free(c->backend, &c->k, &c->v, mla);
 		for (int i = 0; i < c->n_mirrors; i++) {
@@ -468,7 +506,7 @@ static status_code kvcache_alloc_slots(kvcache *c, const model *m, int dev, back
 }
 
 status_code kvcache_alloc_mirrors(kvcache *c, const model *m) {
-	if (!c || !m || !m->mixed_backend_mode || (c->hybrid && c->hybrid->conv_buf))
+	if (!c || !m || !m->mixed_backend_mode || (c->hybrid && c->hybrid->owns_all_kv))
 		return OK;
 	status_code s = kvcache_map_slots(c, m);
 	for (int i = 0; s == OK && i < c->n_mirrors; i++) {
