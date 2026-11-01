@@ -310,6 +310,8 @@ static void log_op_homes(backend *b) {
 		{"add_batch", b->add_batch != NULL},
 		{"moe_expert_ffn", b->moe_expert_ffn != NULL},
 		{"kv_shift", b->kv_shift != NULL},
+		{"kv_export", b->kv_export != NULL},
+		{"kv_import", b->kv_import != NULL},
 		{"copy_buffer", b->copy_buffer != NULL},
 		{"ple_combine", b->ple_combine != NULL},
 	};

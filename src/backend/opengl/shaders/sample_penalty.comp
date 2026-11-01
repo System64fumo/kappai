@@ -1,0 +1,47 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 256) in;
+
+#define HIST_CAP 1024u
+
+layout(std430, binding = 0) buffer LogitsBuf {
+	float logits[];
+};
+layout(std430, binding = 1) readonly buffer HistBuf {
+	uint hist[];
+};
+
+layout(location = 0) uniform int u_hist_base;
+layout(location = 1) uniform int u_last_n;
+layout(location = 2) uniform float u_penalty;
+
+uint hist_at(uint base, uint head, uint n, uint i) {
+	return hist[base + 2u + (head + HIST_CAP - n + i) % HIST_CAP];
+}
+
+void main() {
+	uint base  = uint(u_hist_base);
+	uint count = hist[base];
+	uint head  = hist[base + 1u];
+	uint n	   = min(count, uint(u_last_n));
+
+	for (uint i = gl_LocalInvocationID.x; i < n; i += 256u) {
+		uint tok	   = hist_at(base, head, n, i);
+		bool duplicate = false;
+		uint times	   = 1u;
+		for (uint j = 0u; j < n; j++) {
+			if (hist_at(base, head, n, j) != tok)
+				continue;
+			if (j < i)
+				duplicate = true;
+			else if (j > i)
+				times++;
+		}
+		if (duplicate)
+			continue;
+		float factor = pow(u_penalty, float(times));
+		float l		 = logits[tok];
+		logits[tok]	 = l > 0.0 ? l / factor : l * factor;
+	}
+}

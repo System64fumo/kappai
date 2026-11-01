@@ -43,6 +43,8 @@ typedef struct kvcache {
 	int			  n_slot_devices;
 	float		 *kv_transfer_buf;
 	size_t		  kv_transfer_cap;
+	void		 *kv_native_buf;
+	size_t		  kv_native_cap;
 	kv_quant_type kv_quant;
 	bool		  is_mla;
 	backend		 *backend;

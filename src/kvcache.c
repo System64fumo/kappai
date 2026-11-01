@@ -342,6 +342,9 @@ void kvcache_free(kvcache *c) {
 	free(c->kv_transfer_buf);
 	c->kv_transfer_buf = NULL;
 	c->kv_transfer_cap = 0;
+	free(c->kv_native_buf);
+	c->kv_native_buf = NULL;
+	c->kv_native_cap = 0;
 	memset(c, 0, sizeof(*c));
 }
 
@@ -555,8 +558,46 @@ static void kv_host_pair_bufs(kvcache *c, int k_floats, buffer *k_out, buffer *v
 	v_out->owner	= backend_host();
 }
 
+typedef struct {
+	buffer k;
+	buffer v;
+	bool   ready;
+} kv_staged_pair;
+
+static status_code kvcache_read_host_f32(const buffer *in, backend *owner, float *dst, int n) {
+	if (owner && owner->buffer_read_f32)
+		return owner->buffer_read_f32(owner, in, dst, n);
+	if (!in->host_ptr)
+		return ERR_UNSUPPORTED;
+	memcpy(dst, in->host_ptr, (size_t)n * sizeof(float));
+	return OK;
+}
+
+static status_code kvcache_stage_host(kvcache *c, int k_floats, backend *k_owner, backend *v_owner,
+									  const buffer *k_in, const buffer *v_in,
+									  kv_staged_pair *staged) {
+	if (staged->ready)
+		return OK;
+	ensure_sync(k_owner);
+	if (v_owner != k_owner)
+		ensure_sync(v_owner);
+	status_code st = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
+	if (st != OK)
+		return st;
+	kv_host_pair_bufs(c, k_floats, &staged->k, &staged->v);
+	st = kvcache_read_host_f32(k_in, k_owner, c->kv_transfer_buf, k_floats);
+	if (st != OK)
+		return st;
+	st = kvcache_read_host_f32(v_in, v_owner, (float *)staged->v.handle, k_floats);
+	if (st != OK)
+		return st;
+	staged->ready = true;
+	return OK;
+}
+
 static status_code kvcache_put_device(kvcache *c, const model *m, int dev, int layer, int pos,
-									  const buffer *k_in, const buffer *v_in) {
+									  const buffer *k_in, const buffer *v_in,
+									  kv_staged_pair *staged) {
 	int hd		   = model_layer_head_dim(m, layer);
 	int kvh_stride = kvcache_kv_heads_stride(c);
 	int kvh_active = model_layer_kv_heads(m, layer);
@@ -570,38 +611,12 @@ static status_code kvcache_put_device(kvcache *c, const model *m, int dev, int l
 	backend *v_in_owner	 = v_in->owner ? v_in->owner : kv_backend;
 
 	if (k_in_owner != kv_backend || v_in_owner != kv_backend) {
-		ensure_sync(k_in_owner);
-		if (v_in_owner != k_in_owner)
-			ensure_sync(v_in_owner);
-
-		int			k_floats = kvh_active * hd;
-		status_code st		 = kvcache_ensure_transfer_buf(c, (size_t)k_floats * 2);
+		status_code st =
+			kvcache_stage_host(c, kvh_active * hd, k_in_owner, v_in_owner, k_in, v_in, staged);
 		if (st != OK)
 			return st;
-		buffer k_host_buf, v_host_buf;
-		kv_host_pair_bufs(c, k_floats, &k_host_buf, &v_host_buf);
-
-		if (k_in_owner && k_in_owner->buffer_read_f32) {
-			st = k_in_owner->buffer_read_f32(k_in_owner, k_in, c->kv_transfer_buf, k_floats);
-			if (st != OK)
-				return st;
-		} else if (k_in->host_ptr) {
-			memcpy(c->kv_transfer_buf, k_in->host_ptr, (size_t)k_floats * sizeof(float));
-		} else {
-			return ERR_UNSUPPORTED;
-		}
-		if (v_in_owner && v_in_owner->buffer_read_f32) {
-			st =
-				v_in_owner->buffer_read_f32(v_in_owner, v_in, (float *)v_host_buf.handle, k_floats);
-			if (st != OK)
-				return st;
-		} else if (v_in->host_ptr) {
-			memcpy(v_host_buf.handle, v_in->host_ptr, (size_t)k_floats * sizeof(float));
-		} else {
-			return ERR_UNSUPPORTED;
-		}
-		return kv_backend->kv_put(kv_backend, kb, vb, slot, pos, &k_host_buf, &v_host_buf,
-								  kvh_stride, hd, c->n_ctx, kvh_active);
+		return kv_backend->kv_put(kv_backend, kb, vb, slot, pos, &staged->k, &staged->v, kvh_stride,
+								  hd, c->n_ctx, kvh_active);
 	}
 
 	if (kv_backend != c->backend)
@@ -619,20 +634,122 @@ static unsigned kvcache_put_mask(const kvcache *c, const model *m, int layer, in
 	return mask | (1u << dev);
 }
 
+static buffer kvcache_row_view(const buffer *in, int row, int row_stride) {
+	buffer view = *in;
+	view.offset += (size_t)row * (size_t)row_stride * sizeof(float);
+	return view;
+}
+
+static status_code kvcache_put_device_range(kvcache *c, const model *m, int dev, int layer,
+											int pos_start, const buffer *k_in, const buffer *v_in,
+											int row_stride, int n_rows, kv_staged_pair *staged) {
+	buffer *kb, *vb;
+	int		slot;
+	kvcache_device_view(c, dev, layer, &kb, &vb, &slot);
+	backend *kv_backend = kb->owner ? kb->owner : (dev > 0 ? c->mirror[dev - 1].be : c->backend);
+	bool	 batchable	= n_rows > 1 && kv_backend->kv_put_batch &&
+						  (k_in->owner ? k_in->owner : kv_backend) == kv_backend &&
+						  (v_in->owner ? v_in->owner : kv_backend) == kv_backend;
+	if (batchable) {
+		if (kv_backend != c->backend)
+			ensure_sync(kv_backend);
+		return kv_backend->kv_put_batch(kv_backend, kb, vb, slot, pos_start, k_in, v_in, row_stride,
+										kvcache_kv_heads_stride(c), model_layer_head_dim(m, layer),
+										c->n_ctx, model_layer_kv_heads(m, layer), n_rows);
+	}
+	for (int row = 0; row < n_rows; row++) {
+		buffer		krow = kvcache_row_view(k_in, row, row_stride);
+		buffer		vrow = kvcache_row_view(v_in, row, row_stride);
+		status_code st =
+			kvcache_put_device(c, m, dev, layer, pos_start + row, &krow, &vrow, staged);
+		if (st != OK)
+			return st;
+		if (n_rows > 1)
+			staged->ready = false;
+	}
+	return OK;
+}
+
+static bool kvcache_native_pair(const backend *src, const backend *dst) {
+	return src != dst && src && dst && src->kv_export && dst->kv_import;
+}
+
+static status_code kvcache_native_export(kvcache *c, backend *be, buffer *kb, buffer *vb, int slot,
+										 int pos_start, int n_rows, int hd, int kvh_active,
+										 int kvh_stride, size_t *side) {
+	*side = (size_t)kvh_active * (size_t)n_rows * kv_row_bytes(c->kv_quant, hd);
+	if (c->kv_native_cap < *side * 2) {
+		c->kv_native_buf = xrealloc(c->kv_native_buf, *side * 2);
+		c->kv_native_cap = *side * 2;
+	}
+	ensure_sync(be);
+	return be->kv_export(be, kb, vb, slot, pos_start, n_rows, kvh_stride, hd, c->n_ctx, kvh_active,
+						 c->kv_native_buf, (uint8_t *)c->kv_native_buf + *side);
+}
+
+static status_code kvcache_put_range(kvcache *c, const model *m, int layer, int pos_start,
+									 const buffer *k_in, const buffer *v_in, int row_stride,
+									 int n_rows) {
+	int			   owner;
+	unsigned	   mask	  = kvcache_put_mask(c, m, layer, &owner);
+	kv_staged_pair staged = {0};
+	status_code st = kvcache_put_device_range(c, m, owner, layer, pos_start, k_in, v_in, row_stride,
+											  n_rows, &staged);
+
+	int		hd		   = model_layer_head_dim(m, layer);
+	int		kvh_active = model_layer_kv_heads(m, layer);
+	int		kvh_stride = kvcache_kv_heads_stride(c);
+	buffer *okb, *ovb;
+	int		oslot;
+	kvcache_device_view(c, owner, layer, &okb, &ovb, &oslot);
+	backend *src		  = okb->owner ? okb->owner : kvcache_device_backend(c, owner);
+	bool	 native_ready = false;
+	bool	 native_off	  = false;
+	size_t	 side		  = 0;
+
+	for (int dev = 0; st == OK && dev <= c->n_mirrors; dev++) {
+		if (dev == owner || !(mask & (1u << dev)))
+			continue;
+		buffer *kb, *vb;
+		int		slot;
+		kvcache_device_view(c, dev, layer, &kb, &vb, &slot);
+		backend *dst = kb->owner ? kb->owner : kvcache_device_backend(c, dev);
+
+		if (!native_off && kvcache_native_pair(src, dst)) {
+			if (!native_ready) {
+				st			 = kvcache_native_export(c, src, okb, ovb, oslot, pos_start, n_rows, hd,
+													 kvh_active, kvh_stride, &side);
+				native_off	 = st == ERR_UNSUPPORTED;
+				native_ready = st == OK;
+				if (native_off)
+					st = OK;
+			}
+			if (native_ready) {
+				if (dst != c->backend)
+					ensure_sync(dst);
+				st = dst->kv_import(dst, kb, vb, slot, pos_start, n_rows, kvh_stride, hd, c->n_ctx,
+									kvh_active, c->kv_native_buf,
+									(const uint8_t *)c->kv_native_buf + side);
+				if (st != ERR_UNSUPPORTED)
+					continue;
+				st		   = OK;
+				native_off = true;
+			}
+		}
+		if (st == OK)
+			st = kvcache_put_device_range(c, m, dev, layer, pos_start, k_in, v_in, row_stride,
+										  n_rows, &staged);
+	}
+	return st;
+}
+
 status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const buffer *k_in,
 						const buffer *v_in) {
 	if (pos < 0 || pos >= c->n_ctx)
 		return ERR_INVALID_ARG;
 	if (layer < 0 || layer >= m->n_layers)
 		return ERR_INVALID_ARG;
-
-	int			owner;
-	unsigned	mask = kvcache_put_mask(c, m, layer, &owner);
-	status_code st	 = kvcache_put_device(c, m, owner, layer, pos, k_in, v_in);
-	for (int dev = 0; st == OK && dev <= c->n_mirrors; dev++)
-		if (dev != owner && (mask & (1u << dev)))
-			st = kvcache_put_device(c, m, dev, layer, pos, k_in, v_in);
-	return st;
+	return kvcache_put_range(c, m, layer, pos, k_in, v_in, 0, 1);
 }
 
 static unsigned kvcache_slot_mask(const kvcache *c, int slot) {
@@ -731,38 +848,5 @@ status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_sta
 		return ERR_INVALID_ARG;
 	if (pos_start < 0 || pos_start + n_rows > c->n_ctx)
 		return ERR_INVALID_ARG;
-
-	int hd		   = model_layer_head_dim(m, layer);
-	int kvh_stride = kvcache_kv_heads_stride(c);
-	int kvh_active = model_layer_kv_heads(m, layer);
-
-	int		 owner;
-	unsigned mask = kvcache_put_mask(c, m, layer, &owner);
-
-	backend *kv_backend = c->k.owner ? c->k.owner : c->backend;
-	backend *k_owner	= k_in->owner ? k_in->owner : kv_backend;
-	backend *v_owner	= v_in->owner ? v_in->owner : kv_backend;
-
-	bool same_backend = (k_owner == kv_backend && v_owner == kv_backend);
-	bool fast_ok = same_backend && kv_backend->kv_put_batch != NULL && owner == 0 && mask == 1u;
-	if (fast_ok) {
-		buffer *kb, *vb;
-		int		slot;
-		kvcache_device_view(c, 0, layer, &kb, &vb, &slot);
-		return kv_backend->kv_put_batch(kv_backend, kb, vb, slot, pos_start, k_in, v_in,
-										kv_row_stride, kvh_stride, hd, c->n_ctx, kvh_active,
-										n_rows);
-	}
-
-	for (int row = 0; row < n_rows; row++) {
-		buffer krow = *k_in;
-		buffer vrow = *v_in;
-		size_t off	= (size_t)row * (size_t)kv_row_stride * sizeof(float);
-		krow.offset += off;
-		vrow.offset += off;
-		status_code st = kvcache_put(c, m, layer, pos_start + row, &krow, &vrow);
-		if (st != OK)
-			return st;
-	}
-	return OK;
+	return kvcache_put_range(c, m, layer, pos_start, k_in, v_in, kv_row_stride, n_rows);
 }

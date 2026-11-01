@@ -213,6 +213,8 @@ void chat_template_set_tools(chat_template_state *cts, json_object *tools,
 	}
 	free(cts->tool_choice);
 	cts->tool_choice = NULL;
+	free(cts->static_prefix_system);
+	cts->static_prefix_system = NULL;
 	if (tools && (!tool_choice || strcmp(tool_choice, "none") != 0)) {
 		cts->tools		 = json_object_get(tools);
 		cts->tool_choice = xstrdup(tool_choice ? tool_choice : "auto");
@@ -224,17 +226,18 @@ void chat_template_clone(chat_template_state *dst, const chat_template_state *sr
 	memset(dst, 0, sizeof(*dst));
 	if (!src)
 		return;
-	*dst			  = *src;
-	dst->prog		  = src->prog;
-	dst->owns_prog	  = false;
-	dst->messages	  = NULL;
-	dst->n_messages	  = 0;
-	dst->cap_messages = 0;
-	dst->last_render  = xstrdup(src->last_render ? src->last_render : "");
-	dst->bos_token	  = xstrdup(src->bos_token ? src->bos_token : "");
-	dst->eos_token	  = xstrdup(src->eos_token ? src->eos_token : "");
-	dst->tools		  = NULL;
-	dst->tool_choice  = src->tool_choice ? xstrdup(src->tool_choice) : NULL;
+	*dst					  = *src;
+	dst->prog				  = src->prog;
+	dst->owns_prog			  = false;
+	dst->messages			  = NULL;
+	dst->n_messages			  = 0;
+	dst->cap_messages		  = 0;
+	dst->last_render		  = xstrdup(src->last_render ? src->last_render : "");
+	dst->bos_token			  = xstrdup(src->bos_token ? src->bos_token : "");
+	dst->eos_token			  = xstrdup(src->eos_token ? src->eos_token : "");
+	dst->static_prefix_system = NULL;
+	dst->tools				  = NULL;
+	dst->tool_choice		  = src->tool_choice ? xstrdup(src->tool_choice) : NULL;
 	if (src->tools)
 		dst->tools = json_object_get(src->tools);
 	for (size_t i = 0; i < src->n_messages; i++)
@@ -251,6 +254,7 @@ void chat_template_free(chat_template_state *cts) {
 	chat_template_clear_messages(cts);
 	chat_template_set_tools(cts, NULL, NULL);
 	free(cts->last_render);
+	free(cts->static_prefix_system);
 	free(cts->bos_token);
 	free(cts->eos_token);
 	if (cts->owns_prog)
@@ -434,7 +438,10 @@ size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *
 	if (!cts || !cts->prog)
 		return 0;
 
-	const char	*sys	 = (system && *system) ? system : "";
+	const char *sys = (system && *system) ? system : "";
+	if (cts->static_prefix_system && cts->static_prefix_thinking == cts->enable_thinking &&
+		strcmp(cts->static_prefix_system, sys) == 0)
+		return cts->static_prefix_bytes;
 	chat_message sys_msg = {.role = (char *)"system", .content = (char *)sys};
 
 	char  *r1 = NULL, *r2 = NULL;
@@ -452,6 +459,10 @@ size_t chat_template_detect_static_prefix(chat_template_state *cts, const char *
 
 	prefix_len = str_lcp_len(r1, r2);
 	DEBUG("static prefix: %zu bytes", prefix_len);
+	free(cts->static_prefix_system);
+	cts->static_prefix_system	= xstrdup(sys);
+	cts->static_prefix_bytes	= prefix_len;
+	cts->static_prefix_thinking = cts->enable_thinking;
 
 out:
 	jinja_set_time_shift(0);

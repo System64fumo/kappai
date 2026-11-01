@@ -188,9 +188,6 @@ static void scratch_free_host_buffers(compute_scratch *s) {
 		free(s->bs);
 		s->bs = NULL;
 	}
-	free(s->run.last_only);
-	s->run.last_only	 = NULL;
-	s->run.last_only_cap = 0;
 }
 
 static void expert_dev_entry_release(expert_dev_entry *e) {

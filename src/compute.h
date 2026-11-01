@@ -57,8 +57,6 @@ typedef struct {
 	float_buf stage_a;
 	float_buf stage_b;
 	float_buf scale_tmp;
-	uint8_t	 *last_only;
-	size_t	  last_only_cap;
 } scratch_run;
 
 typedef struct {

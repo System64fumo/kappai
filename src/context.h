@@ -67,8 +67,14 @@ typedef struct {
 	void *yield_ud;
 
 	status_code (*decode_step)(void *ud, int32_t token, int pos, float *logits_out);
-	void *decode_step_ud;
-	bool  logits_on_host;
+	void	*decode_step_ud;
+	bool	 logits_on_host;
+	int		 device_hist_slot;
+	bool	 device_hist_valid;
+	uint64_t device_hist_obs;
+	uint64_t device_hist_appends;
+	bool	 has_presampled;
+	int32_t	 presampled_token;
 } context;
 
 typedef struct {
@@ -92,6 +98,8 @@ status_code context_init(context *c, const config *cfg);
 void		context_free(context *c);
 void		context_release_thread(context *c);
 void		context_reset_session(context *c);
+bool		context_can_sample_on_device(const context *c);
+status_code context_sample_device_row(context *c, const buffer *row, int32_t *tok);
 void		context_reset(context *c);
 
 status_code context_slot_init(context *s, const context *e);

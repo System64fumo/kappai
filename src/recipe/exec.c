@@ -500,13 +500,20 @@ static int backend_has_batch_ops(const model *m, const backend *a) {
 	return 1;
 }
 
-static int backend_supports_batch_ops(const model *m) {
+static int compute_supports_batch_ops(const model *m) {
 	if (!model_mixed_backend_mode(m))
 		return backend_has_batch_ops(m, m->backend);
 	for (int li = 0; li < m->n_layers; li++)
 		if (!backend_has_batch_ops(m, model_layer_backend(m, li)))
 			return 0;
 	return backend_has_batch_ops(m, m->backend);
+}
+
+static int backend_supports_batch_ops(const model *m) {
+	model_recipe *r = m->recipe;
+	if (r->batch_ops_state == BATCH_OPS_UNKNOWN)
+		r->batch_ops_state = compute_supports_batch_ops(m) ? BATCH_OPS_YES : BATCH_OPS_NO;
+	return r->batch_ops_state == BATCH_OPS_YES;
 }
 
 static status_code batch_run_post_ops(model *m, kvcache *cache, compute_scratch *s,
@@ -527,7 +534,15 @@ static status_code batch_run_post_ops(model *m, kvcache *cache, compute_scratch 
 	return logits->owner->buffer_read_f32(logits->owner, logits, logits_out, total);
 }
 
+static int row_needs_logits(const row_desc *rows, int row) {
+	if (rows->last_only)
+		return row == rows->n_rows - 1;
+	return !rows->needs_logits || rows->needs_logits[row];
+}
+
 static int rows_n_logit_rows(const row_desc *rows) {
+	if (rows->last_only)
+		return 1;
 	if (!rows->needs_logits)
 		return rows->n_rows;
 	int n = 0;
@@ -594,12 +609,12 @@ static status_code part_run_layers(model *m, compute_scratch *s, const row_desc 
 
 static status_code part_run_gather(model *m, compute_scratch *s, const part_plan *p,
 								   const part_node *node, const row_desc *rows) {
-	if (!rows->needs_logits)
+	if (!rows->needs_logits && !rows->last_only)
 		return OK;
 	batch_scratch *bs  = part_scratch(m, s, node->be);
 	int			   dst = 0;
 	for (int src = 0; src < rows->n_rows; src++) {
-		if (!rows->needs_logits[src])
+		if (!row_needs_logits(rows, src))
 			continue;
 		for (int c = 0; src != dst && c < p->n_carry; c++) {
 			const buffer *whole = batch_slot(bs, p->carry[c].slot);
@@ -717,16 +732,7 @@ status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 float *logits_out) {
 	if (n_tokens < 1)
 		return OK;
-	scratch_run *run = &s->run;
-	if (run->last_only_cap < (size_t)n_tokens) {
-		run->last_only	   = xrealloc(run->last_only, (size_t)n_tokens);
-		run->last_only_cap = (size_t)n_tokens;
-	}
-	uint8_t *last_only = run->last_only;
-	memset(last_only, 0, (size_t)n_tokens);
-	last_only[n_tokens - 1] = 1;
-	row_desc rows			= {
-		.n_rows = n_tokens, .pos_start = pos_start, .cache = cache, .needs_logits = last_only};
+	row_desc rows = {.n_rows = n_tokens, .pos_start = pos_start, .cache = cache, .last_only = 1};
 	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out, NULL);
 }
 

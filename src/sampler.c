@@ -112,6 +112,7 @@ void sampler_set_params(sampler *s, float temp, int top_k, float top_p, float mi
 }
 
 void sampler_observe(sampler *s, int32_t token) {
+	s->observed++;
 	if (s->recent_count >= s->recent_capacity) {
 		s->recent[s->recent_head] = token;
 		s->recent_head			  = (s->recent_head + 1) % s->recent_capacity;
@@ -348,4 +349,41 @@ int32_t sampler_sample(sampler *s, const float *logits_in, int vocab) {
 		return sample_full_vocab(s, logits, vocab);
 
 	return sample_filtered(s, logits, vocab);
+}
+
+static bool sampler_is_greedy(const sampler *s) {
+	return s->temperature <= 0.0f || s->top_k == 1;
+}
+
+bool sampler_device_eligible(const sampler *s, const backend *b, int vocab) {
+	if (sampler_is_greedy(s) && s->repeat_penalty == 1.0f)
+		return false;
+	if (s->repeat_penalty != 1.0f && s->repeat_last_n > DEVICE_SAMPLE_HIST_CAP)
+		return false;
+	if (sampler_is_greedy(s))
+		return backend_can_device_sample(b, vocab, 1, 1.0f, 0.0f);
+	return backend_can_device_sample(b, vocab, s->top_k, s->top_p, s->min_p);
+}
+
+int sampler_recent_window(const sampler *s, int32_t *out, int cap) {
+	int n = MIN(MIN(s->repeat_last_n, s->recent_count), cap);
+	for (int i = 0; i < n; i++)
+		out[i] = s->recent[(s->recent_head + s->recent_count - n + i) % s->recent_capacity];
+	return n;
+}
+
+void sampler_device_params(sampler *s, int vocab, int history_slot, device_sample_params *out) {
+	bool greedy = sampler_is_greedy(s);
+	int	 k_eff	= 0;
+	int	 path	= greedy ? DEVICE_SAMPLE_SMALL
+						 : device_sample_plan(s->top_k, s->top_p, s->min_p, vocab, &k_eff);
+	*out		= (device_sample_params){.path			 = path,
+										 .top_k			 = greedy ? 1 : k_eff,
+										 .inv_temp		 = greedy ? 1.0f : 1.0f / s->temperature,
+										 .top_p			 = greedy ? 1.0f : s->top_p,
+										 .min_p			 = greedy ? 0.0f : s->min_p,
+										 .uniform_sample = greedy ? 0.0f : rng_uniform(&s->rng),
+										 .repeat_penalty = s->repeat_penalty,
+										 .repeat_last_n	 = s->repeat_last_n,
+										 .history_slot	 = history_slot};
 }

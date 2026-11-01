@@ -599,6 +599,12 @@ status_code cpu_kv_shift(backend *self, buffer *k, buffer *v, int layer,
 						 const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 						 const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
 						 int n_kv_heads_active);
+status_code cpu_kv_export(backend *self, const buffer *k, const buffer *v, int layer, int pos_start,
+						  int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+						  int n_kv_heads_active, void *k_dst, void *v_dst);
+status_code cpu_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start, int n_rows,
+						  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+						  const void *k_src, const void *v_src);
 status_code cpu_embd_lookup(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
 							int token, int dim, buffer *x_out);
 status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,

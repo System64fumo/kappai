@@ -373,6 +373,8 @@ typedef struct {
 	int		   n_ops;
 } layer_recipe;
 
+enum { BATCH_OPS_UNKNOWN, BATCH_OPS_YES, BATCH_OPS_NO };
+
 typedef struct model_recipe {
 	layer_recipe layer;
 	recipe_op	*pre_ops;
@@ -391,6 +393,7 @@ typedef struct model_recipe {
 	struct part_plan *part;
 
 	int has_sliding_layers;
+	int batch_ops_state;
 	int ple_build_dev_ok;
 	int ple_build_dev_ok_batch;
 } model_recipe;
@@ -403,6 +406,7 @@ typedef struct {
 	struct kvcache **caches;
 	const uint8_t	*needs_logits;
 	int				 token_type;
+	int				 last_only;
 } row_desc;
 
 typedef struct {

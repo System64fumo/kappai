@@ -1356,6 +1356,42 @@ static void decode_batch_collect(openai_state *st) {
 	}
 }
 
+static bool decode_batch_on_device(openai_state *st, const oa_decode_batch *b) {
+	const size_t row_bytes = (size_t)st->ctx->m.vocab_size * sizeof(float);
+	if (row_bytes % 256 != 0)
+		return false;
+	for (int i = 0; i < b->n; i++) {
+		oa_task *t = b->tasks[i];
+		if (t->decode_logits || !t->slot->sess.backend->sample ||
+			!context_can_sample_on_device(&t->slot->sess))
+			return false;
+	}
+	return true;
+}
+
+static void decode_batch_sample_on_device(openai_state *st, oa_decode_batch *b) {
+	const size_t  vocab	 = (size_t)st->ctx->m.vocab_size;
+	const buffer *logits = compute_logits_device(&b->scratch);
+	for (int i = 0; i < b->n; i++) {
+		oa_task *t	 = b->tasks[i];
+		context *c	 = &t->slot->sess;
+		buffer	 row = *logits;
+		row.offset += (size_t)i * vocab * sizeof(float);
+		row.size = vocab * sizeof(float);
+
+		c->logits_on_host		  = true;
+		int32_t		tok			  = 0;
+		status_code sample_status = context_sample_device_row(c, &row, &tok);
+		if (sample_status == OK) {
+			c->presampled_token = tok;
+			c->has_presampled	= true;
+			continue;
+		}
+		t->decode_status =
+			row.owner->buffer_read_f32(row.owner, &row, c->scratch.logits_host, (int)vocab);
+	}
+}
+
 static void run_decode_step(openai_state *st) {
 	oa_decode_batch *b = &st->decode;
 	decode_batch_reserve(st);
@@ -1363,22 +1399,29 @@ static void run_decode_step(openai_state *st) {
 	if (b->n == 0)
 		return;
 
+	const bool	on_device	 = decode_batch_on_device(st, b);
 	context	   *lead		 = &st->slots[0].sess;
 	status_code batch_status = compute_scratch_ensure(&b->scratch, &lead->m, lead->n_ctx);
 	if (batch_status == OK) {
 		compute_scratch_reserve_rows(&lead->m, &b->scratch, st->slots_cap);
-		batch_status =
-			compute_forward_decode_batch(&lead->m, b->caches, &b->scratch, b->tokens, b->positions,
-										 NULL, b->n, lead->flash_attn, b->logits);
+		batch_status = compute_forward_decode_batch(&lead->m, b->caches, &b->scratch, b->tokens,
+													b->positions, NULL, b->n, lead->flash_attn,
+													on_device ? NULL : b->logits);
+	}
+
+	for (int i = 0; i < b->n; i++)
+		b->tasks[i]->decode_status = batch_status;
+	if (batch_status != OK)
+		return;
+	if (on_device) {
+		decode_batch_sample_on_device(st, b);
+		return;
 	}
 
 	const size_t vocab = (size_t)st->ctx->m.vocab_size;
 	for (int i = 0; i < b->n; i++) {
-		oa_task *t		 = b->tasks[i];
-		context *c		 = &t->slot->sess;
-		t->decode_status = batch_status;
-		if (batch_status != OK)
-			continue;
+		oa_task *t = b->tasks[i];
+		context *c = &t->slot->sess;
 		memcpy(t->decode_logits ? t->decode_logits : c->scratch.logits_host,
 			   b->logits + (size_t)i * vocab, vocab * sizeof(float));
 		c->logits_on_host = true;

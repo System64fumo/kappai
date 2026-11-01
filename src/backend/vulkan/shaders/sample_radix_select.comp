@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) coherent buffer StateBuf {
+	uint state[];
+};
+
+layout(push_constant) uniform Params {
+	int shift;
+	int k;
+}
+params;
+
+shared uint s_bucket;
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	if (tid == 0u) {
+		uint k_rem	= params.shift == 24 ? uint(params.k) : state[257];
+		uint prefix = params.shift == 24 ? 0u : state[256];
+		uint acc	= 0u;
+		uint chosen = 0u;
+		for (int b = 255; b >= 0; b--) {
+			uint c = state[b];
+			if (acc + c >= k_rem) {
+				chosen = uint(b);
+				break;
+			}
+			acc += c;
+		}
+		state[257] = k_rem - acc;
+		state[256] = (prefix << 8) | chosen;
+		if (params.shift == 0)
+			state[259] = 0u;
+	}
+	memoryBarrierBuffer();
+	barrier();
+	state[tid] = 0u;
+}

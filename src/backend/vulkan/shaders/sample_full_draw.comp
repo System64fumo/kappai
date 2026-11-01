@@ -1,0 +1,107 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(set = 0, binding = 1) readonly buffer MaxBuf {
+	uvec2 maxes[];
+};
+layout(set = 0, binding = 2) readonly buffer SumBuf {
+	float sums[];
+};
+layout(set = 0, binding = 3) buffer RegBuf {
+	uint reg_idx[];
+};
+layout(set = 0, binding = 4) buffer ReadbackBuf {
+	uint readback_idx[];
+};
+layout(set = 0, binding = 5) buffer HistBuf {
+	uint hist[];
+};
+
+layout(push_constant) uniform Params {
+	int	  n;
+	int	  chunk;
+	int	  groups;
+	int	  slot;
+	float inv_temp;
+	float uniform_sample;
+	int	  hist_base;
+}
+params;
+
+shared float s_seg[256];
+shared float s_mx;
+shared float s_target;
+shared uint	 s_lo;
+shared uint	 s_hi;
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+
+	if (tid == 0u) {
+		float mx	= uintBitsToFloat(0xFF800000u);
+		float total = 0.0;
+		for (int g = 0; g < params.groups; g++) {
+			mx = max(mx, uintBitsToFloat(maxes[g].x));
+			total += sums[g];
+		}
+		s_mx		 = mx * params.inv_temp;
+		float target = params.uniform_sample * total;
+		int	  chosen = params.groups - 1;
+		float acc	 = 0.0;
+		for (int g = 0; g < params.groups; g++) {
+			if (target < acc + sums[g]) {
+				chosen = g;
+				break;
+			}
+			acc += sums[g];
+		}
+		s_target = target - acc;
+		s_lo	 = uint(chosen) * uint(params.chunk);
+		s_hi	 = min(s_lo + uint(params.chunk), uint(params.n));
+	}
+	barrier();
+
+	uint  len	  = s_hi - s_lo;
+	uint  per	  = (len + 255u) / 256u;
+	uint  seg_lo  = s_lo + tid * per;
+	uint  seg_hi  = min(seg_lo + per, s_hi);
+	float seg_sum = 0.0;
+	for (uint i = seg_lo; i < seg_hi; i++)
+		seg_sum += exp(logits[i] * params.inv_temp - s_mx);
+	s_seg[tid] = seg_sum;
+	barrier();
+
+	if (tid != 0u)
+		return;
+
+	float acc	 = 0.0;
+	uint  picked = s_hi - 1u;
+	for (uint t = 0u; t < 256u; t++) {
+		if (s_target < acc + s_seg[t]) {
+			uint lo = s_lo + t * per;
+			uint hi = min(lo + per, s_hi);
+			picked	= hi - 1u;
+			for (uint i = lo; i < hi; i++) {
+				acc += exp(logits[i] * params.inv_temp - s_mx);
+				if (s_target < acc) {
+					picked = i;
+					break;
+				}
+			}
+			break;
+		}
+		acc += s_seg[t];
+	}
+
+	reg_idx[params.slot]	  = picked;
+	readback_idx[params.slot] = picked;
+
+	uint base			   = uint(params.hist_base);
+	uint head			   = hist[base + 1u];
+	hist[base + 2u + head] = picked;
+	hist[base + 1u]		   = (head + 1u) % 1024u;
+	hist[base]			   = min(hist[base] + 1u, 1024u);
+}

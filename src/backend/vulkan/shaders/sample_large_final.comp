@@ -1,0 +1,136 @@
+#version 450
+layout(local_size_x = 256) in;
+
+#define N 1024u
+
+layout(set = 0, binding = 0) readonly buffer StateBuf {
+	uint state[];
+};
+layout(set = 0, binding = 1) readonly buffer CandBuf {
+	uvec2 cand[];
+};
+layout(set = 0, binding = 2) buffer RegBuf {
+	uint reg_idx[];
+};
+layout(set = 0, binding = 3) buffer ReadbackBuf {
+	uint readback_idx[];
+};
+layout(set = 0, binding = 4) buffer HistBuf {
+	uint hist[];
+};
+
+layout(push_constant) uniform Params {
+	int	  k;
+	int	  slot;
+	float inv_temp;
+	float top_p;
+	float min_p;
+	float uniform_sample;
+	int	  hist_base;
+}
+params;
+
+shared uint	 s_key[N];
+shared uint	 s_idx[N];
+shared float s_w[N];
+
+float key_float(uint key) {
+	uint u = (key & 0x80000000u) != 0u ? (key & 0x7FFFFFFFu) : ~key;
+	return uintBitsToFloat(u);
+}
+
+bool better(uint ka, uint ia, uint kb, uint ib) {
+	return ka > kb || (ka == kb && ia < ib);
+}
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint m	 = min(state[259], N);
+
+	for (uint i = tid; i < N; i += 256u) {
+		if (i < m) {
+			uvec2 c	 = cand[i];
+			s_key[i] = c.x;
+			s_idx[i] = c.y;
+		} else {
+			s_key[i] = 0u;
+			s_idx[i] = 0xFFFFFFFFu;
+		}
+	}
+	barrier();
+
+	for (uint size = 2u; size <= N; size <<= 1u) {
+		for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+			for (uint i = tid; i < N; i += 256u) {
+				uint other = i ^ stride;
+				if (other <= i)
+					continue;
+				bool want_better_first = (i & size) == 0u;
+				bool other_better	   = better(s_key[other], s_idx[other], s_key[i], s_idx[i]);
+				if (want_better_first == other_better) {
+					uint tk		 = s_key[i];
+					uint ti		 = s_idx[i];
+					s_key[i]	 = s_key[other];
+					s_idx[i]	 = s_idx[other];
+					s_key[other] = tk;
+					s_idx[other] = ti;
+				}
+			}
+			barrier();
+		}
+	}
+
+	if (tid != 0u)
+		return;
+
+	int	  k	  = int(min(uint(params.k), m));
+	float mx  = key_float(s_key[0]) * params.inv_temp;
+	float sum = 0.0;
+	for (int i = 0; i < k; i++) {
+		s_w[i] = exp(key_float(s_key[i]) * params.inv_temp - mx);
+		sum += s_w[i];
+	}
+
+	int kept = k;
+	if (params.top_p < 1.0) {
+		float cumulative = 0.0;
+		for (int i = 0; i < k; i++) {
+			cumulative += s_w[i] / sum;
+			if (cumulative > params.top_p) {
+				kept = i + 1;
+				break;
+			}
+		}
+	}
+	if (params.min_p > 0.0) {
+		float min_prob = params.min_p * (s_w[0] / sum);
+		int	  n_keep   = 0;
+		while (n_keep < kept && (s_w[n_keep] / sum) >= min_prob)
+			n_keep++;
+		kept = n_keep > 0 ? n_keep : 1;
+	}
+
+	float psum = 0.0;
+	for (int i = 0; i < kept; i++)
+		psum += s_w[i];
+	float target = params.uniform_sample * psum;
+	float acc	 = 0.0;
+	int	  picked = kept - 1;
+	for (int i = 0; i < kept; i++) {
+		acc += s_w[i];
+		if (target < acc) {
+			picked = i;
+			break;
+		}
+	}
+
+	uint tok				  = s_idx[picked];
+	reg_idx[params.slot]	  = tok;
+	readback_idx[params.slot] = tok;
+
+	uint base			   = uint(params.hist_base);
+	uint head			   = hist[base + 1u];
+	hist[base + 2u + head] = tok;
+	hist[base + 1u]		   = (head + 1u) % 1024u;
+	hist[base]			   = min(hist[base] + 1u, 1024u);
+}

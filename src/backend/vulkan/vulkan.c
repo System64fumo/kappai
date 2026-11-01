@@ -233,6 +233,10 @@ typedef struct {
 	vk_buf tok_reg_buf;
 	vk_buf tok_rb_buf;
 	vk_buf argmax_partial_buf;
+	vk_buf sample_cand_buf;
+	vk_buf sample_state_buf;
+	vk_buf sample_sum_buf;
+	vk_buf sample_hist_buf;
 	vk_buf moe_arena;
 	vk_buf moe_batch_arena;
 	vk_buf dummy_buf;
@@ -309,6 +313,15 @@ typedef struct {
 	vk_pipeline_set p_embd_lookup;
 	vk_pipeline_set p_argmax;
 	vk_pipeline_set p_argmax_reduce;
+	vk_pipeline_set p_sample_topk;
+	vk_pipeline_set p_sample_final;
+	vk_pipeline_set p_sample_penalty;
+	vk_pipeline_set p_sample_radix_hist;
+	vk_pipeline_set p_sample_radix_select;
+	vk_pipeline_set p_sample_gather;
+	vk_pipeline_set p_sample_large_final;
+	vk_pipeline_set p_sample_full_sum;
+	vk_pipeline_set p_sample_full_draw;
 	vk_pipeline_set p_moe_gather;
 	vk_pipeline_set p_moe_combine;
 	vk_pipeline_set p_matmul_q4_0_batch;
@@ -1001,6 +1014,15 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_embd_lookup,
 			&p->p_argmax,
 			&p->p_argmax_reduce,
+			&p->p_sample_topk,
+			&p->p_sample_final,
+			&p->p_sample_penalty,
+			&p->p_sample_radix_hist,
+			&p->p_sample_radix_select,
+			&p->p_sample_gather,
+			&p->p_sample_large_final,
+			&p->p_sample_full_sum,
+			&p->p_sample_full_draw,
 			&p->p_moe_gather,
 			&p->p_moe_combine,
 			&p->p_matmul_q4_0_batch,
@@ -2646,6 +2668,51 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_argmax_reduce.name = "argmax_reduce";
+	s = vk_create_pipeline(p, shader_sample_topk_spv, shader_sample_topk_spv_len, 2, 12,
+						   &p->p_sample_topk);
+	if (s != OK)
+		return s;
+	p->p_sample_topk.name = "sample_topk";
+	s = vk_create_pipeline(p, shader_sample_final_spv, shader_sample_final_spv_len, 4, 32,
+						   &p->p_sample_final);
+	if (s != OK)
+		return s;
+	p->p_sample_final.name = "sample_final";
+	s = vk_create_pipeline(p, shader_sample_penalty_spv, shader_sample_penalty_spv_len, 2, 12,
+						   &p->p_sample_penalty);
+	if (s != OK)
+		return s;
+	p->p_sample_penalty.name = "sample_penalty";
+	s = vk_create_pipeline(p, shader_sample_radix_hist_spv, shader_sample_radix_hist_spv_len, 2, 12,
+						   &p->p_sample_radix_hist);
+	if (s != OK)
+		return s;
+	p->p_sample_radix_hist.name = "sample_radix_hist";
+	s = vk_create_pipeline(p, shader_sample_radix_select_spv, shader_sample_radix_select_spv_len, 1,
+						   8, &p->p_sample_radix_select);
+	if (s != OK)
+		return s;
+	p->p_sample_radix_select.name = "sample_radix_select";
+	s = vk_create_pipeline(p, shader_sample_gather_spv, shader_sample_gather_spv_len, 3, 8,
+						   &p->p_sample_gather);
+	if (s != OK)
+		return s;
+	p->p_sample_gather.name = "sample_gather";
+	s = vk_create_pipeline(p, shader_sample_large_final_spv, shader_sample_large_final_spv_len, 5,
+						   28, &p->p_sample_large_final);
+	if (s != OK)
+		return s;
+	p->p_sample_large_final.name = "sample_large_final";
+	s = vk_create_pipeline(p, shader_sample_full_sum_spv, shader_sample_full_sum_spv_len, 3, 16,
+						   &p->p_sample_full_sum);
+	if (s != OK)
+		return s;
+	p->p_sample_full_sum.name = "sample_full_sum";
+	s = vk_create_pipeline(p, shader_sample_full_draw_spv, shader_sample_full_draw_spv_len, 6, 28,
+						   &p->p_sample_full_draw);
+	if (s != OK)
+		return s;
+	p->p_sample_full_draw.name = "sample_full_draw";
 	s = vk_create_pipeline(p, shader_moe_gather_spv, shader_moe_gather_spv_len, 3, 8,
 						   &p->p_moe_gather);
 	if (s != OK)
@@ -2973,6 +3040,15 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
 		vk_destroy_pipeline(p, &p->p_argmax);
 		vk_destroy_pipeline(p, &p->p_argmax_reduce);
+		vk_destroy_pipeline(p, &p->p_sample_topk);
+		vk_destroy_pipeline(p, &p->p_sample_final);
+		vk_destroy_pipeline(p, &p->p_sample_penalty);
+		vk_destroy_pipeline(p, &p->p_sample_radix_hist);
+		vk_destroy_pipeline(p, &p->p_sample_radix_select);
+		vk_destroy_pipeline(p, &p->p_sample_gather);
+		vk_destroy_pipeline(p, &p->p_sample_large_final);
+		vk_destroy_pipeline(p, &p->p_sample_full_sum);
+		vk_destroy_pipeline(p, &p->p_sample_full_draw);
 		vk_destroy_pipeline(p, &p->p_moe_gather);
 		vk_destroy_pipeline(p, &p->p_moe_combine);
 
@@ -3095,6 +3171,18 @@ static void vk_free(backend *self) {
 		}
 		if (p->argmax_partial_buf.buf) {
 			vk_free_buffer(p, &p->argmax_partial_buf);
+		}
+		if (p->sample_cand_buf.buf) {
+			vk_free_buffer(p, &p->sample_cand_buf);
+		}
+		if (p->sample_state_buf.buf) {
+			vk_free_buffer(p, &p->sample_state_buf);
+		}
+		if (p->sample_sum_buf.buf) {
+			vk_free_buffer(p, &p->sample_sum_buf);
+		}
+		if (p->sample_hist_buf.buf) {
+			vk_free_buffer(p, &p->sample_hist_buf);
 		}
 		if (p->moe_arena.buf) {
 			vk_free_buffer(p, &p->moe_arena);
@@ -4210,6 +4298,147 @@ static status_code vk_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 								   int m) {
 	return vk_kv_put_impl(self, k, v, layer, pos_start, k_in, v_in, in_row_stride, n_kv_heads,
 						  head_dim, n_ctx, n_kv_heads_active, m, 0);
+}
+
+typedef struct {
+	vk_buf *kb;
+	vk_buf *vb;
+	size_t	first_off;
+	size_t	head_stride;
+	size_t	head_bytes;
+	int		n_heads;
+} vk_kv_range;
+
+static vk_kv_range vk_kv_range_get(const buffer *k, const buffer *v, int layer, int pos_start,
+								   int n_rows, int head_dim, int n_ctx, int n_active) {
+	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
+	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
+	return (vk_kv_range){
+		.kb			 = vk_kv_layer_buf(kh, layer, NULL),
+		.vb			 = vk_kv_layer_buf(vh, layer, NULL),
+		.first_off	 = (vk_kv_layer_off_elems(kh, layer) + (size_t)pos_start * (size_t)head_dim) *
+					   sizeof(uint16_t),
+		.head_stride = (size_t)n_ctx * (size_t)head_dim * sizeof(uint16_t),
+		.head_bytes	 = (size_t)n_rows * (size_t)head_dim * sizeof(uint16_t),
+		.n_heads	 = n_active,
+	};
+}
+
+static void vk_kv_range_regions(const vk_kv_range *r, size_t staging_off, VkBufferCopy *out,
+								int to_cache) {
+	for (int h = 0; h < r->n_heads; h++) {
+		size_t cache_off = r->first_off + (size_t)h * r->head_stride;
+		size_t host_off	 = staging_off + (size_t)h * r->head_bytes;
+		out[h]			 = (VkBufferCopy){.srcOffset = to_cache ? host_off : cache_off,
+										  .dstOffset = to_cache ? cache_off : host_off,
+										  .size		 = r->head_bytes};
+	}
+}
+
+static status_code vk_kv_export(backend *self, const buffer *k, const buffer *v, int layer,
+								int pos_start, int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								int n_kv_heads_active, void *k_dst, void *v_dst) {
+	vk_priv	   *p		 = self->priv;
+	int			n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	vk_kv_range r	 = vk_kv_range_get(k, v, layer, pos_start, n_rows, head_dim, n_ctx, n_active);
+	size_t		side = (size_t)n_active * r.head_bytes;
+
+	if (r.kb->mapped || r.vb->mapped) {
+		for (int h = 0; h < n_active; h++) {
+			size_t		cache_off = r.first_off + (size_t)h * r.head_stride;
+			status_code s		  = vk_buf_download_raw(
+				self, r.kb, cache_off, (uint8_t *)k_dst + (size_t)h * r.head_bytes, r.head_bytes);
+			if (s == OK)
+				s = vk_buf_download_raw(self, r.vb, cache_off,
+										(uint8_t *)v_dst + (size_t)h * r.head_bytes, r.head_bytes);
+			if (s != OK)
+				return s;
+		}
+		return OK;
+	}
+
+	if (p->device_lost)
+		return ERR_INTERNAL;
+
+	if (p->dirty_count > 0) {
+		VkMemoryBarrier barrier = {
+			.sType		   = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+			.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		};
+		vkCmdPipelineBarrier(p->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+							 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+		vk_dirty_clear(p);
+	}
+
+	status_code s = vk_ensure_staging_cap(p, side * 2);
+	if (s != OK)
+		return s;
+
+	VkBufferCopy *regions = xmalloc((size_t)n_active * sizeof(VkBufferCopy));
+	vk_kv_range_regions(&r, 0, regions, 0);
+	vkCmdCopyBuffer(p->cmd, r.kb->buf, p->staging_buf.buf, (uint32_t)n_active, regions);
+	vk_kv_range_regions(&r, side, regions, 0);
+	vkCmdCopyBuffer(p->cmd, r.vb->buf, p->staging_buf.buf, (uint32_t)n_active, regions);
+	free(regions);
+
+	s = vk_run_cmd_sync(p);
+	if (s != OK)
+		return s;
+	memcpy(k_dst, p->staging_buf.mapped, side);
+	memcpy(v_dst, (uint8_t *)p->staging_buf.mapped + side, side);
+	p->stats.downloads++;
+	return OK;
+}
+
+static status_code vk_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								int n_kv_heads_active, const void *k_src, const void *v_src) {
+	vk_priv	   *p		 = self->priv;
+	int			n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	vk_kv_range r	 = vk_kv_range_get(k, v, layer, pos_start, n_rows, head_dim, n_ctx, n_active);
+	size_t		side = (size_t)n_active * r.head_bytes;
+
+	if (r.kb->mapped || r.vb->mapped) {
+		for (int h = 0; h < n_active; h++) {
+			buffer kdst = {
+				.handle = r.kb, .offset = r.first_off + (size_t)h * r.head_stride, .owner = self};
+			buffer vdst = {
+				.handle = r.vb, .offset = r.first_off + (size_t)h * r.head_stride, .owner = self};
+			status_code s = vk_buffer_upload(
+				self, &kdst, (const uint8_t *)k_src + (size_t)h * r.head_bytes, r.head_bytes);
+			if (s == OK)
+				s = vk_buffer_upload(self, &vdst, (const uint8_t *)v_src + (size_t)h * r.head_bytes,
+									 r.head_bytes);
+			if (s != OK)
+				return s;
+		}
+		return OK;
+	}
+
+	p->stream_seq++;
+	if (p->device_lost)
+		return ERR_INTERNAL;
+
+	status_code s = vk_flush(p);
+	if (s != OK)
+		return s;
+	s = vk_ensure_staging_cap(p, side * 2);
+	if (s != OK)
+		return s;
+
+	memcpy(p->staging_buf.mapped, k_src, side);
+	memcpy((uint8_t *)p->staging_buf.mapped + side, v_src, side);
+	p->stats.uploads++;
+
+	VkBufferCopy *regions = xmalloc((size_t)n_active * sizeof(VkBufferCopy));
+	vk_kv_range_regions(&r, 0, regions, 1);
+	vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, r.kb->buf, (uint32_t)n_active, regions);
+	vk_kv_range_regions(&r, side, regions, 1);
+	vkCmdCopyBuffer(p->cmd, p->staging_buf.buf, r.vb->buf, (uint32_t)n_active, regions);
+	free(regions);
+	p->staging_read_recorded = 1;
+	return vk_run_cmd(p);
 }
 
 static status_code vk_kv_shift(backend *self, buffer *k, buffer *v, int layer,
@@ -5765,9 +5994,11 @@ static status_code vk_argmax_dispatch(vk_priv *p, const buffer *logits, int n, i
 	struct {
 		int32_t n;
 		int32_t groups;
-	} push				   = {n, groups};
-	vk_buf *stage1_bufs[2] = {as_vkbuf(logits), &p->argmax_partial_buf};
-	s = vk_dispatch(p, &p->p_argmax, stage1_bufs, 2, &push, sizeof(push), groups);
+	} push						= {n, groups};
+	vk_buf		*stage1_bufs[2] = {as_vkbuf(logits), &p->argmax_partial_buf};
+	VkDeviceSize stage1_offs[2] = {logits->offset, 0};
+	s = vk_dispatch_ex(p, &p->p_argmax, stage1_bufs, stage1_offs, NULL, 2, &push, sizeof(push),
+					   (uint32_t)groups, 1, 0x2);
 	if (s != OK)
 		return s;
 
@@ -5803,6 +6034,276 @@ static status_code vk_argmax_to_reg(backend *self, const buffer *logits, int n, 
 	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->timeline_supported)
 		return ERR_INVALID_ARG;
 	status_code s = vk_argmax_dispatch(p, logits, n, reg);
+	if (s != OK)
+		return s;
+	s = vk_run_cmd(p);
+	if (s != OK)
+		return s;
+	p->tok_signal[reg] = p->last_signal_value;
+	p->tok_pipe		   = 1;
+	return OK;
+}
+
+#define VK_SAMPLE_CHUNK 2048
+#define VK_SAMPLE_MAX_GROUPS 128
+#define VK_SAMPLE_HIST_STRIDE (DEVICE_SAMPLE_HIST_CAP + 2)
+#define VK_SAMPLE_STATE_WORDS 1024
+
+static status_code vk_sample_upload(backend *self, vk_buf *vb, size_t off, const void *src,
+									size_t size) {
+	buffer tmp = {.handle = vb, .offset = off, .owner = self};
+	return vk_buffer_upload(self, &tmp, src, size);
+}
+
+static status_code vk_sample_alloc(backend *self, vk_priv *p, vk_buf *buf, size_t bytes,
+								   bool zero) {
+	if (buf->buf)
+		return OK;
+	status_code s = vk_alloc_buffer(
+		p, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, buf);
+	if (s != OK || !zero)
+		return s;
+	void *zeros = xcalloc(1, bytes);
+	s			= vk_sample_upload(self, buf, 0, zeros, bytes);
+	free(zeros);
+	return s;
+}
+
+static status_code vk_sample_ensure(backend *self, vk_priv *p) {
+	status_code s = vk_ensure_token_regs(p);
+	if (s != OK)
+		return s;
+	size_t cand_bytes = (size_t)VK_SAMPLE_MAX_GROUPS * DEVICE_SAMPLE_SMALL_K * 2 * sizeof(uint32_t);
+	s				  = vk_sample_alloc(self, p, &p->sample_cand_buf, cand_bytes, false);
+	if (s == OK)
+		s = vk_sample_alloc(self, p, &p->sample_state_buf, VK_SAMPLE_STATE_WORDS * sizeof(uint32_t),
+							true);
+	if (s == OK)
+		s = vk_sample_alloc(self, p, &p->sample_sum_buf, VK_SAMPLE_MAX_GROUPS * sizeof(float),
+							false);
+	if (s == OK)
+		s = vk_sample_alloc(self, p, &p->sample_hist_buf,
+							(size_t)DEVICE_SAMPLE_SLOTS * VK_SAMPLE_HIST_STRIDE * sizeof(uint32_t),
+							true);
+	return s;
+}
+
+typedef struct {
+	vk_priv					   *p;
+	vk_buf					   *logits;
+	VkDeviceSize				logits_off;
+	const device_sample_params *params;
+	int							n;
+	int							chunk;
+	int							groups;
+	int							slot;
+	int							hist_base;
+} vk_sample_ctx;
+
+static status_code vk_sample_run(vk_sample_ctx *x, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
+								 bool first_is_logits, const void *push, uint32_t push_size,
+								 uint32_t groups, uint32_t wmask) {
+	VkDeviceSize offs[VK_MAX_BINDINGS] = {0};
+	if (first_is_logits)
+		offs[0] = x->logits_off;
+	return vk_dispatch_ex(x->p, ps, bufs, offs, NULL, n_bufs, push, push_size, groups, 1, wmask);
+}
+
+static status_code vk_sample_penalty(vk_sample_ctx *x) {
+	struct {
+		int32_t hist_base;
+		int32_t last_n;
+		float	penalty;
+	} push			= {x->hist_base, x->params->repeat_last_n, x->params->repeat_penalty};
+	vk_buf *bufs[2] = {x->logits, &x->p->sample_hist_buf};
+	return vk_sample_run(x, &x->p->p_sample_penalty, bufs, 2, true, &push, sizeof(push), 1, 0x1);
+}
+
+static status_code vk_sample_topk(vk_sample_ctx *x, int k) {
+	struct {
+		int32_t n;
+		int32_t chunk;
+		int32_t k;
+	} push			= {x->n, x->chunk, k};
+	vk_buf *bufs[2] = {x->logits, &x->p->sample_cand_buf};
+	return vk_sample_run(x, &x->p->p_sample_topk, bufs, 2, true, &push, sizeof(push),
+						 (uint32_t)x->groups, 0x2);
+}
+
+static status_code vk_sample_path_small(vk_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	status_code					s = vk_sample_topk(x, q->top_k);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t n_cand;
+		int32_t k;
+		int32_t slot;
+		float	inv_temp;
+		float	top_p;
+		float	min_p;
+		float	uniform_sample;
+		int32_t hist_base;
+	} push			 = {x->groups * q->top_k, q->top_k,	   x->slot, q->inv_temp, q->top_p, q->min_p,
+						q->uniform_sample,	  x->hist_base};
+	vk_priv *p		 = x->p;
+	vk_buf	*bufs[4] = {&p->sample_cand_buf, &p->tok_reg_buf, &p->tok_rb_buf, &p->sample_hist_buf};
+	return vk_sample_run(x, &p->p_sample_final, bufs, 4, false, &push, sizeof(push), 1, 0xF);
+}
+
+static status_code vk_sample_path_large(vk_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	vk_priv					   *p = x->p;
+	for (int shift = 24; shift >= 0; shift -= 8) {
+		struct {
+			int32_t n;
+			int32_t chunk;
+			int32_t shift;
+		} hist_push				 = {x->n, x->chunk, shift};
+		vk_buf	   *hist_bufs[2] = {x->logits, &p->sample_state_buf};
+		status_code s = vk_sample_run(x, &p->p_sample_radix_hist, hist_bufs, 2, true, &hist_push,
+									  sizeof(hist_push), (uint32_t)x->groups, 0x2);
+		if (s != OK)
+			return s;
+		struct {
+			int32_t shift;
+			int32_t k;
+		} sel_push			= {shift, q->top_k};
+		vk_buf *sel_bufs[1] = {&p->sample_state_buf};
+		s = vk_sample_run(x, &p->p_sample_radix_select, sel_bufs, 1, false, &sel_push,
+						  sizeof(sel_push), 1, 0x1);
+		if (s != OK)
+			return s;
+	}
+
+	struct {
+		int32_t n;
+		int32_t chunk;
+	} gather_push			   = {x->n, x->chunk};
+	vk_buf	   *gather_bufs[3] = {x->logits, &p->sample_state_buf, &p->sample_cand_buf};
+	status_code s = vk_sample_run(x, &p->p_sample_gather, gather_bufs, 3, true, &gather_push,
+								  sizeof(gather_push), (uint32_t)x->groups, 0x6);
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t k;
+		int32_t slot;
+		float	inv_temp;
+		float	top_p;
+		float	min_p;
+		float	uniform_sample;
+		int32_t hist_base;
+	} push = {q->top_k, x->slot, q->inv_temp, q->top_p, q->min_p, q->uniform_sample, x->hist_base};
+	vk_buf *bufs[5] = {&p->sample_state_buf, &p->sample_cand_buf, &p->tok_reg_buf, &p->tok_rb_buf,
+					   &p->sample_hist_buf};
+	return vk_sample_run(x, &p->p_sample_large_final, bufs, 5, false, &push, sizeof(push), 1, 0x1C);
+}
+
+static status_code vk_sample_path_full(vk_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	vk_priv					   *p = x->p;
+	status_code					s = vk_sample_topk(x, 1);
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t n;
+		int32_t chunk;
+		int32_t groups;
+		float	inv_temp;
+	} sum_push			= {x->n, x->chunk, x->groups, q->inv_temp};
+	vk_buf *sum_bufs[3] = {x->logits, &p->sample_cand_buf, &p->sample_sum_buf};
+	s = vk_sample_run(x, &p->p_sample_full_sum, sum_bufs, 3, true, &sum_push, sizeof(sum_push),
+					  (uint32_t)x->groups, 0x4);
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t n;
+		int32_t chunk;
+		int32_t groups;
+		int32_t slot;
+		float	inv_temp;
+		float	uniform_sample;
+		int32_t hist_base;
+	} push = {x->n, x->chunk, x->groups, x->slot, q->inv_temp, q->uniform_sample, x->hist_base};
+	vk_buf *bufs[6] = {x->logits,		&p->sample_cand_buf, &p->sample_sum_buf,
+					   &p->tok_reg_buf, &p->tok_rb_buf,		 &p->sample_hist_buf};
+	return vk_sample_run(x, &p->p_sample_full_draw, bufs, 6, true, &push, sizeof(push), 1, 0x38);
+}
+
+static status_code vk_sample_dispatch(backend *self, vk_priv *p, const buffer *logits, int n,
+									  const device_sample_params *params, int slot) {
+	status_code s = vk_sample_ensure(self, p);
+	if (s != OK)
+		return s;
+	int groups = (n + VK_SAMPLE_CHUNK - 1) / VK_SAMPLE_CHUNK;
+	if (groups < 1 || groups > VK_SAMPLE_MAX_GROUPS || params->path == DEVICE_SAMPLE_NONE ||
+		params->history_slot < 0 || params->history_slot >= DEVICE_SAMPLE_SLOTS)
+		return ERR_UNSUPPORTED;
+
+	vk_sample_ctx x = {.p		   = p,
+					   .logits	   = as_vkbuf(logits),
+					   .logits_off = logits->offset,
+					   .params	   = params,
+					   .n		   = n,
+					   .chunk	   = (n + groups - 1) / groups,
+					   .groups	   = groups,
+					   .slot	   = slot,
+					   .hist_base  = params->history_slot * VK_SAMPLE_HIST_STRIDE};
+
+	if (params->repeat_penalty != 1.0f) {
+		s = vk_sample_penalty(&x);
+		if (s != OK)
+			return s;
+	}
+	switch (params->path) {
+	case DEVICE_SAMPLE_SMALL:
+		return vk_sample_path_small(&x);
+	case DEVICE_SAMPLE_LARGE:
+		return vk_sample_path_large(&x);
+	default:
+		return vk_sample_path_full(&x);
+	}
+}
+
+static status_code vk_sample_history_set(backend *self, int slot, const int32_t *tokens, int n) {
+	vk_priv *p = self->priv;
+	if (slot < 0 || slot >= DEVICE_SAMPLE_SLOTS || n < 0 || n > DEVICE_SAMPLE_HIST_CAP)
+		return ERR_INVALID_ARG;
+	status_code s = vk_sample_ensure(self, p);
+	if (s != OK)
+		return s;
+	uint32_t words[VK_SAMPLE_HIST_STRIDE] = {0};
+	words[0]							  = (uint32_t)n;
+	words[1]							  = (uint32_t)n % DEVICE_SAMPLE_HIST_CAP;
+	memcpy(words + 2, tokens, (size_t)n * sizeof(uint32_t));
+	return vk_sample_upload(self, &p->sample_hist_buf,
+							(size_t)slot * VK_SAMPLE_HIST_STRIDE * sizeof(uint32_t), words,
+							sizeof(words));
+}
+
+static status_code vk_sample(backend *self, const buffer *logits, int n,
+							 const device_sample_params *params, int32_t *out_idx) {
+	vk_priv	   *p = self->priv;
+	status_code s = vk_sample_dispatch(self, p, logits, n, params, BACKEND_TOKEN_REGS);
+	if (s != OK)
+		return s;
+	s = vk_flush(p);
+	if (s != OK)
+		return s;
+	*out_idx = (int32_t)vk_token_slot_value(p, BACKEND_TOKEN_REGS);
+	return OK;
+}
+
+static status_code vk_sample_to_reg(backend *self, const buffer *logits, int n,
+									const device_sample_params *params, int reg) {
+	vk_priv *p = self->priv;
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS || !p->timeline_supported)
+		return ERR_INVALID_ARG;
+	status_code s = vk_sample_dispatch(self, p, logits, n, params, reg);
 	if (s != OK)
 		return s;
 	s = vk_run_cmd(p);
@@ -7589,12 +8090,18 @@ static status_code vk_ctor(backend *out) {
 	out->kv_put							 = vk_kv_put;
 	out->kv_put_batch					 = vk_kv_put_batch;
 	out->kv_shift						 = vk_kv_shift;
+	out->kv_export						 = vk_kv_export;
+	out->kv_import						 = vk_kv_import;
 	out->embd_lookup					 = vk_embd_lookup;
 	out->rmsnorm						 = vk_rmsnorm;
 	out->matmul							 = vk_matmul;
 	out->matmul_type_native				 = vk_matmul_type_native;
 	out->argmax_to_reg					 = vk_argmax_to_reg;
 	out->read_token_reg					 = vk_read_token_reg;
+	out->sample							 = vk_sample;
+	out->sample_to_reg					 = vk_sample_to_reg;
+	out->sample_history_set				 = vk_sample_history_set;
+	out->sample_max_vocab				 = VK_SAMPLE_CHUNK * VK_SAMPLE_MAX_GROUPS;
 	out->qk_norm_rope					 = vk_qk_norm_rope;
 	out->dequant_type_native			 = vk_dequant_type_native;
 	out->dequant_weight					 = vk_dequant_weight;

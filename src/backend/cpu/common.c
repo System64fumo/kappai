@@ -1622,6 +1622,48 @@ status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int
 	return OK;
 }
 
+static status_code cpu_kv_range_copy(backend *self, const buffer *k, const buffer *v, int layer,
+									 int pos_start, int n_rows, int n_kv_heads, int head_dim,
+									 int n_ctx, int n_kv_heads_active, void *k_host, void *v_host,
+									 const void *k_src, const void *v_src) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	size_t	  rows	   = cpu_kv_layer_rows(p, layer, n_ctx);
+	if (rows < (size_t)n_ctx)
+		return ERR_UNSUPPORTED;
+
+	size_t row_bytes  = kv_row_bytes(p->kv_quant, head_dim);
+	size_t kvh_stride = rows * row_bytes;
+	size_t layer_base = cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * kvh_stride, 1);
+	size_t span		  = (size_t)n_rows * row_bytes;
+	for (int kvh = 0; kvh < n_active; kvh++) {
+		size_t cache_off = layer_base + (size_t)kvh * kvh_stride + (size_t)pos_start * row_bytes;
+		size_t host_off	 = (size_t)kvh * span;
+		if (k_src) {
+			memcpy((uint8_t *)k->handle + cache_off, (const uint8_t *)k_src + host_off, span);
+			memcpy((uint8_t *)v->handle + cache_off, (const uint8_t *)v_src + host_off, span);
+			continue;
+		}
+		memcpy((uint8_t *)k_host + host_off, (const uint8_t *)k->handle + cache_off, span);
+		memcpy((uint8_t *)v_host + host_off, (const uint8_t *)v->handle + cache_off, span);
+	}
+	return OK;
+}
+
+status_code cpu_kv_export(backend *self, const buffer *k, const buffer *v, int layer, int pos_start,
+						  int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+						  int n_kv_heads_active, void *k_dst, void *v_dst) {
+	return cpu_kv_range_copy(self, k, v, layer, pos_start, n_rows, n_kv_heads, head_dim, n_ctx,
+							 n_kv_heads_active, k_dst, v_dst, NULL, NULL);
+}
+
+status_code cpu_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start, int n_rows,
+						  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+						  const void *k_src, const void *v_src) {
+	return cpu_kv_range_copy(self, k, v, layer, pos_start, n_rows, n_kv_heads, head_dim, n_ctx,
+							 n_kv_heads_active, NULL, NULL, k_src, v_src);
+}
+
 void cpu_synchronize(backend *self) {
 	(void)self;
 }
@@ -1998,6 +2040,8 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	out->kv_put							 = cpu_kv_put;
 	out->kv_put_batch					 = cpu_kv_put_batch;
 	out->kv_shift						 = cpu_kv_shift;
+	out->kv_export						 = cpu_kv_export;
+	out->kv_import						 = cpu_kv_import;
 	out->embd_lookup					 = cpu_embd_lookup;
 	out->rmsnorm						 = cpu_rmsnorm;
 	out->matmul							 = cpu_matmul;
