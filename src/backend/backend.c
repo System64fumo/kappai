@@ -312,8 +312,6 @@ static void log_op_homes(backend *b) {
 		{"kv_shift", b->kv_shift != NULL},
 		{"copy_buffer", b->copy_buffer != NULL},
 		{"ple_combine", b->ple_combine != NULL},
-		{"prequantize_x", b->prequantize_x != NULL},
-		{"matmul_qonly", b->matmul_qonly != NULL},
 	};
 	int	 n_native = 0;
 	int	 n_total  = (int)ARRAY_LEN(ops);

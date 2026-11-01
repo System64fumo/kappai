@@ -204,7 +204,7 @@ static jinja_value	  *eval_expr(eval_ctx *ctx, expr_node *e);
 static jinja_filter_fn lookup_filter(const char *name);
 
 static void strlist_add(strlist *sl, char *msg) {
-	ARR_RESERVE(sl->msgs, sl->n, sl->cap);
+	arr_reserve((void **)&(sl->msgs), (sl->n), &(sl->cap), sizeof(*(sl->msgs)));
 	sl->msgs[sl->n++] = msg;
 }
 
@@ -271,7 +271,7 @@ static void arena_track(jinja_value *v) {
 	jinja_arena *a = g_render_arena;
 	if (!a)
 		return;
-	ARR_RESERVE(a->vals, a->n, a->cap);
+	arr_reserve((void **)&(a->vals), (a->n), &(a->cap), sizeof(*(a->vals)));
 	a->vals[a->n++] = v;
 }
 
@@ -395,7 +395,8 @@ void jinja_dict_set(jinja_value *d, const char *key, jinja_value *val) {
 }
 
 void jinja_list_append(jinja_value *l, jinja_value *val) {
-	ARR_RESERVE(l->as.list.items, l->as.list.n, l->as.list.cap);
+	arr_reserve((void **)&(l->as.list.items), (l->as.list.n), &(l->as.list.cap),
+				sizeof(*(l->as.list.items)));
 	l->as.list.items[l->as.list.n++] = val;
 }
 
@@ -479,7 +480,7 @@ static const char *value_as_cstr(const jinja_value *v) {
 
 static void lex_push(lexer *lx, tok_type type, const char *start, size_t len, int strip_left,
 					 int strip_right) {
-	ARR_RESERVE(lx->toks, lx->n_toks, lx->cap_toks);
+	arr_reserve((void **)&(lx->toks), (lx->n_toks), &(lx->cap_toks), sizeof(*(lx->toks)));
 	token *t	   = &lx->toks[lx->n_toks++];
 	t->type		   = type;
 	t->start	   = start;

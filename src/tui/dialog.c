@@ -1,5 +1,7 @@
 #include "dialog.h"
 
+#include "settings.h"
+
 #include <ctype.h>
 #include <dirent.h>
 #include <limits.h>
@@ -239,7 +241,7 @@ int ui_input(const char *title, const char *initial, char *buf, size_t buflen, u
 	return rc;
 }
 
-int ui_path_complete(const char *buf, size_t pos, ui_completion *out) {
+static int path_complete(const char *base, const char *buf, size_t pos, ui_completion *out) {
 	memset(out, 0, sizeof(*out));
 
 	size_t from = pos;
@@ -255,7 +257,13 @@ int ui_path_complete(const char *buf, size_t pos, ui_completion *out) {
 	const char *word = buf + from;
 	size_t		wlen = pos - from;
 
-	DIR *d = opendir(from ? dir : ".");
+	char lookup[PATH_MAX];
+	bool relative = base && base[0] && buf[0] != '/';
+	if (snprintf(lookup, sizeof(lookup), "%s%s%s", relative ? base : "", relative ? "/" : "",
+				 dir) >= (int)sizeof(lookup))
+		return 0;
+
+	DIR *d = opendir(lookup[0] ? lookup : ".");
 	if (!d)
 		return 0;
 
@@ -295,9 +303,8 @@ int ui_path_complete(const char *buf, size_t pos, ui_completion *out) {
 	if (n_total == 1) {
 		char		full[PATH_MAX];
 		struct stat st;
-		bool		is_dir =
-			snprintf(full, sizeof(full), "%s%s", from ? dir : "", ref) < (int)sizeof(full) &&
-			stat(full, &st) == 0 && S_ISDIR(st.st_mode);
+		bool is_dir = snprintf(full, sizeof(full), "%s%s", lookup, ref) < (int)sizeof(full) &&
+					  stat(full, &st) == 0 && S_ISDIR(st.st_mode);
 		snprintf(out->insert, sizeof(out->insert), "%s%s", ref + wlen, is_dir ? "/" : "");
 	} else {
 		size_t n = common - wlen;
@@ -307,6 +314,14 @@ int ui_path_complete(const char *buf, size_t pos, ui_completion *out) {
 		out->insert[n] = '\0';
 	}
 	return n_total;
+}
+
+int ui_path_complete(const char *buf, size_t pos, ui_completion *out) {
+	return path_complete(NULL, buf, pos, out);
+}
+
+int ui_model_path_complete(const char *buf, size_t pos, ui_completion *out) {
+	return path_complete(tui_models_dir(), buf, pos, out);
 }
 
 static void list_geometry(const char *title, const char *const choices[], int n, int prefix, int *w,

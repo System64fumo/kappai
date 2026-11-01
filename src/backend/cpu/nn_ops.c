@@ -11,6 +11,24 @@ typedef struct {
 	float		 eps;
 } row_job;
 
+typedef struct {
+	const dense_attention_desc *d;
+	const float				   *q, *k0, *v0, *k1, *v1;
+	float					   *out;
+} attention_job;
+
+typedef struct {
+	const im2col_desc *d;
+	const float		  *in;
+	float			  *col;
+} im2col_job;
+
+typedef struct {
+	const upsample_shortcut_desc *d;
+	const float					 *in;
+	float						 *out;
+} shortcut_job;
+
 static float activate_one(int activation, float v) {
 	if (activation == ACT_GELU)
 		return gelu_tanh(v);
@@ -103,12 +121,6 @@ status_code cpu_rope_table(backend *self, buffer *x, const buffer *table, int ro
 	return OK;
 }
 
-typedef struct {
-	const dense_attention_desc *d;
-	const float				   *q, *k0, *v0, *k1, *v1;
-	float					   *out;
-} attention_job;
-
 static float dot(const float *a, const float *b, int n) {
 	float s = 0;
 	for (int i = 0; i < n; i++)
@@ -168,12 +180,6 @@ status_code cpu_attention_dense(backend *self, const dense_attention_desc *d) {
 	return OK;
 }
 
-typedef struct {
-	const im2col_desc *d;
-	const float		  *in;
-	float			  *col;
-} im2col_job;
-
 static void im2col_rows(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	const im2col_job  *j = ctx;
@@ -201,12 +207,6 @@ status_code cpu_im2col3x3(backend *self, const im2col_desc *d) {
 	cpu_run_batch_full(cpu_get_pool(self), d->n_pixels, 64, 2, im2col_rows, &j);
 	return OK;
 }
-
-typedef struct {
-	const upsample_shortcut_desc *d;
-	const float					 *in;
-	float						 *out;
-} shortcut_job;
 
 static void upsample_shortcut_rows(int begin, int end, int tid, void *ctx) {
 	(void)tid;

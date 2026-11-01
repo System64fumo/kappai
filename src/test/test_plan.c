@@ -5,6 +5,21 @@
 
 #define record_plan(label, ok, ...) record_resultf(OPFAM_PLAN, (label), (ok), __VA_ARGS__)
 
+#define PARITY_TOKENS 12
+#define PARITY_CTX 128
+#define PARITY_SEQS 2
+
+typedef struct {
+	backend		   *be;
+	model			m;
+	compute_scratch s;
+	kvcache			kv[PARITY_SEQS];
+	int				n_kv;
+	int				has_scratch;
+} parity_sess;
+
+typedef float *(*parity_fn)(parity_sess *p, int *count);
+
 static void append_test_layer(op_emitter *e, const model *m, int li) {
 	for (int i = 0; i <= li; i++)
 		OP_EMIT(e, mk_matmul(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_WQ, li + 1, m->dim, STAGE_MATMUL));
@@ -823,21 +838,6 @@ static void test_graph_state(void) {
 	record_plan("graph.state_read_before_write", ok, "");
 	graph_free(g);
 }
-
-#define PARITY_TOKENS 12
-#define PARITY_CTX 128
-#define PARITY_SEQS 2
-
-typedef struct {
-	backend		   *be;
-	model			m;
-	compute_scratch s;
-	kvcache			kv[PARITY_SEQS];
-	int				n_kv;
-	int				has_scratch;
-} parity_sess;
-
-typedef float *(*parity_fn)(parity_sess *p, int *count);
 
 static void parity_close(parity_sess *p) {
 	if (p->has_scratch)

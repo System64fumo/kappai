@@ -540,41 +540,54 @@ typedef void (*matmul_row_fn)(const void *w, const float *restrict x, float *res
 
 #define MATMUL_QONLY_PANEL_BYTES ((size_t)128 << 10)
 
-#define MATMUL_QONLY_DISPATCH(name, xq_t, qk, row_align, w_row_bytes)                              \
-	void matmul_##name##_qonly_f32(const void *w, const xq_t *restrict xq,                         \
-								   size_t	   xq_row_stride_blocks, float *restrict y,            \
-								   int y_row_stride, int n, int k, int m) {                        \
-		size_t w_row = (w_row_bytes);                                                              \
-		if (m <= 1 || w_row == 0) {                                                                \
-			for (int t = 0; t < m; t++)                                                            \
-				matmul_##name##_qonly_f32_row(w, xq + ((size_t)t * xq_row_stride_blocks),          \
-											  y + ((size_t)t * y_row_stride), n, k);               \
-			return;                                                                                \
-		}                                                                                          \
-		int nb = (int)(MATMUL_QONLY_PANEL_BYTES / w_row);                                          \
-		if (nb < (row_align))                                                                      \
-			nb = (row_align);                                                                      \
-		nb -= nb % (row_align);                                                                    \
-		if (nb < (row_align))                                                                      \
-			nb = (row_align);                                                                      \
-		for (int i0 = 0; i0 < n; i0 += nb) {                                                       \
-			int			   nn = (n - i0) < nb ? (n - i0) : nb;                                     \
-			const uint8_t *wp = (const uint8_t *)w + ((size_t)i0 * w_row);                         \
-			for (int t = 0; t < m; t++)                                                            \
-				matmul_##name##_qonly_f32_row(wp, xq + ((size_t)t * xq_row_stride_blocks),         \
-											  y + ((size_t)t * y_row_stride) + i0, nn, k);         \
-		}                                                                                          \
-	}
+typedef void (*matmul_qonly_row_fn)(const void *w, const void *xq, float *restrict y, int n, int k);
 
-MATMUL_QONLY_DISPATCH(iq3_s_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(iq3s_block))
+static void matmul_qonly_dispatch(const void *w, const void *xq, size_t xq_elem,
+								  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								  int n, int k, int m, size_t w_row_bytes, int row_align,
+								  matmul_qonly_row_fn row) {
+	size_t w_row = w_row_bytes;
+	if (m <= 1 || w_row == 0) {
+		for (int t = 0; t < m; t++)
+			row(w, (const char *)xq + ((size_t)t * xq_row_stride_blocks) * xq_elem,
+				y + ((size_t)t * y_row_stride), n, k);
+		return;
+	}
+	int nb = (int)(MATMUL_QONLY_PANEL_BYTES / w_row);
+	if (nb < row_align)
+		nb = row_align;
+	nb -= nb % row_align;
+	if (nb < row_align)
+		nb = row_align;
+	for (int i0 = 0; i0 < n; i0 += nb) {
+		int			   nn = (n - i0) < nb ? (n - i0) : nb;
+		const uint8_t *wp = (const uint8_t *)w + ((size_t)i0 * w_row);
+		for (int t = 0; t < m; t++)
+			row(wp, (const char *)xq + ((size_t)t * xq_row_stride_blocks) * xq_elem,
+				y + ((size_t)t * y_row_stride) + i0, nn, k);
+	}
+}
+
+void matmul_iq3_s_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								 size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								 int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * sizeof(iq3s_block)), (1),
+						  (matmul_qonly_row_fn)matmul_iq3_s_q8_k_qonly_f32_row);
+}
 
 static void matmul_iq3_s_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													 float *restrict y, int n, int k) {
 	matmul_iq3_s_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(iq3_s_repacked_q8_k, q8_k_block, 256, IQ3_S_REPACKED_ROWS,
-					  ((size_t)k / 256) * IQ3_S_REPACKED_BLOCK_BYTES)
+void matmul_iq3_s_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										  size_t	  xq_row_stride_blocks, float *restrict y,
+										  int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * IQ3_S_REPACKED_BLOCK_BYTES), (IQ3_S_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_iq3_s_repacked_q8_k_qonly_f32_row);
+}
 
 void dequant_iq4_nl_row(const void *blocks, size_t n_blocks, float *dst) {
 	const iq4_nl_block *b = blocks;
@@ -593,48 +606,79 @@ static void matmul_iq4_nl_repacked_q8_qonly_f32_row(const void *w, const q8_0_bl
 	matmul_iq4_nl_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(iq4_nl_repacked_q8, q8_0_block, 32, IQ4_NL_REPACKED_ROWS,
-					  ((size_t)k / 32) * sizeof(iq4_nl_block))
+void matmul_iq4_nl_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(iq4_nl_block)), (IQ4_NL_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_iq4_nl_repacked_q8_qonly_f32_row);
+}
 
 static void matmul_q8_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 												  float *restrict y, int n, int k) {
 	matmul_q8_0_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q8_0_repacked_q8, q8_0_block, 32, Q8_0_REPACKED_ROWS,
-					  ((size_t)k / 32) * sizeof(q8_0_block))
+void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q8_0_block)), (Q8_0_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_q8_0_repacked_q8_qonly_f32_row);
+}
 
 static void matmul_q4_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													float *restrict y, int n, int k) {
 	matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q4_k_repacked_q8_k, q8_k_block, 256, Q4_K_REPACKED_ROWS,
-					  ((size_t)k / 256) * Q4_K_REPACKED_ROW_BYTES)
+void matmul_q4_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * Q4_K_REPACKED_ROW_BYTES), (Q4_K_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_q4_k_repacked_q8_k_qonly_f32_row);
+}
 
 static void matmul_q5_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													float *restrict y, int n, int k) {
 	matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q5_k_repacked_q8_k, q8_k_block, 256, Q5_K_REPACKED_ROWS,
-					  ((size_t)k / 256) * Q5_K_REPACKED_ROW_BYTES)
+void matmul_q5_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * Q5_K_REPACKED_ROW_BYTES), (Q5_K_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_q5_k_repacked_q8_k_qonly_f32_row);
+}
 
 static void matmul_q6_k_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													float *restrict y, int n, int k) {
 	matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q6_k_repacked_q8_k, q8_k_block, 256, Q6_K_REPACKED_ROWS,
-					  ((size_t)k / 256) * (Q6_K_REPACKED_GROUP_BYTES / Q6_K_REPACKED_ROWS))
+void matmul_q6_k_repacked_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+										 size_t		 xq_row_stride_blocks, float *restrict y,
+										 int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * (Q6_K_REPACKED_GROUP_BYTES / Q6_K_REPACKED_ROWS)),
+						  (Q6_K_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_q6_k_repacked_q8_k_qonly_f32_row);
+}
 
 static void matmul_q4_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 												  float *restrict y, int n, int k) {
 	matmul_q4_0_repacked_q8_qonly_f32_rows_range(w, xq, y, 0, n, k);
 }
 
-MATMUL_QONLY_DISPATCH(q4_0_repacked_q8, q8_0_block, 32, Q4_0_REPACKED_ROWS,
-					  ((size_t)k / 32) * sizeof(q4_0_block))
+void matmul_q4_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+									   size_t	   xq_row_stride_blocks, float *restrict y,
+									   int y_row_stride, int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q4_0_block)), (Q4_0_REPACKED_ROWS),
+						  (matmul_qonly_row_fn)matmul_q4_0_repacked_q8_qonly_f32_row);
+}
 
 void dequant_f16_row(const void *src, int n, float *dst) {
 	const uint16_t *s = src;
@@ -915,9 +959,21 @@ static void matmul_q8_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 	}
 }
 
-MATMUL_QONLY_DISPATCH(q4_q8, q8_0_block, 32, 1, ((size_t)k / 32) * sizeof(q4_0_block))
+void matmul_q4_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+							size_t xq_row_stride_blocks, float *restrict y, int y_row_stride, int n,
+							int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q4_0_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q4_q8_qonly_f32_row);
+}
 
-MATMUL_QONLY_DISPATCH(q8_0_q8, q8_0_block, 32, 1, ((size_t)k / 32) * sizeof(q8_0_block))
+void matmul_q8_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+							  int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q8_0_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q8_0_q8_qonly_f32_row);
+}
 
 static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 										   float *restrict y, int n, int k) {
@@ -966,7 +1022,13 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 	}
 }
 
-MATMUL_QONLY_DISPATCH(iq4_nl_q8, q8_0_block, 32, 1, ((size_t)k / 32) * sizeof(iq4_nl_block))
+void matmul_iq4_nl_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+								size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(iq4_nl_block)), (1),
+						  (matmul_qonly_row_fn)matmul_iq4_nl_q8_qonly_f32_row);
+}
 
 static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restrict xq,
 										 float *restrict y, int n, int k) {
@@ -1017,7 +1079,13 @@ static void matmul_q4_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 	}
 }
 
-MATMUL_QONLY_DISPATCH(q4_1_q8, q8_1_block, 32, 1, ((size_t)k / 32) * sizeof(q4_1_block))
+void matmul_q4_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
+							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+							  int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_1_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q4_1_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q4_1_q8_qonly_f32_row);
+}
 
 static void matmul_q5_0_q8_qonly_f32_row(const void *w, const q8_0_block *restrict xq,
 										 float *restrict y, int n, int k) {
@@ -1068,7 +1136,13 @@ static void matmul_q5_0_q8_qonly_f32_row(const void *w, const q8_0_block *restri
 
 MATMUL_Q8_F32(q5_0_q8, q8_0_block, 32, quantize_q8_0, matmul_q5_0_q8_qonly_f32)
 
-MATMUL_QONLY_DISPATCH(q5_0_q8, q8_0_block, 32, 1, ((size_t)k / 32) * sizeof(q5_0_block))
+void matmul_q5_0_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
+							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+							  int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_0_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q5_0_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q5_0_q8_qonly_f32_row);
+}
 
 static void matmul_q5_1_q8_qonly_f32_row(const void *w, const q8_1_block *restrict xq,
 										 float *restrict y, int n, int k) {
@@ -1121,7 +1195,13 @@ static void matmul_q5_1_q8_qonly_f32_row(const void *w, const q8_1_block *restri
 
 MATMUL_Q8_F32(q5_1_q8, q8_1_block, 32, quantize_q8_1, matmul_q5_1_q8_qonly_f32)
 
-MATMUL_QONLY_DISPATCH(q5_1_q8, q8_1_block, 32, 1, ((size_t)k / 32) * sizeof(q5_1_block))
+void matmul_q5_1_q8_qonly_f32(const void *w, const q8_1_block *restrict xq,
+							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+							  int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_1_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 32) * sizeof(q5_1_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q5_1_q8_qonly_f32_row);
+}
 
 static void matmul_q6_k_q8_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 										 float *restrict y, int n, int k) {
@@ -1166,7 +1246,13 @@ static void matmul_q6_k_q8_qonly_f32_row(const void *w, const q8_k_block *restri
 	}
 }
 
-MATMUL_QONLY_DISPATCH(q6_k_q8, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(q6_k_block))
+void matmul_q6_k_q8_qonly_f32(const void *w, const q8_k_block *restrict xq,
+							  size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+							  int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * sizeof(q6_k_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q6_k_q8_qonly_f32_row);
+}
 
 static void matmul_q4_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 										   float *restrict y, int n, int k) {
@@ -1215,7 +1301,13 @@ static void matmul_q4_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 	}
 }
 
-MATMUL_QONLY_DISPATCH(q4_k_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(q4_k_block))
+void matmul_q4_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * sizeof(q4_k_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q4_k_q8_k_qonly_f32_row);
+}
 
 static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 										   float *restrict y, int n, int k) {
@@ -1264,8 +1356,13 @@ static void matmul_q5_k_q8_k_qonly_f32_row(const void *w, const q8_k_block *rest
 	}
 }
 
-MATMUL_QONLY_DISPATCH(q5_k_q8_k, q8_k_block, 256, 1, ((size_t)k / 256) * sizeof(q5_k_block))
-#undef MATMUL_QONLY_DISPATCH
+void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
+								size_t xq_row_stride_blocks, float *restrict y, int y_row_stride,
+								int n, int k, int m) {
+	matmul_qonly_dispatch(w, xq, sizeof(q8_k_block), xq_row_stride_blocks, y, y_row_stride, n, k, m,
+						  (((size_t)k / 256) * sizeof(q5_k_block)), (1),
+						  (matmul_qonly_row_fn)matmul_q5_k_q8_k_qonly_f32_row);
+}
 
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {

@@ -4,6 +4,7 @@
 #include "common.h"
 #include "hcs.h"
 #include "log.h"
+#include "settings.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -20,50 +21,112 @@ typedef struct {
 	int			line_no;
 } ini_cursor;
 
-static const char *const kv_quant_choices[] = {"f16", "q8_0", NULL};
-static const char *const repack_choices[]	= {
+static const char *const repack_choices[] = {
 	"iq3_s", "q8_0", "iq4_nl", "q4_0", "q4_k", "q5_k", "q6_k", NULL,
 };
-static const char *const fuse_choices[] = {"qkv", NULL};
 
 #define S_STR(k, l, h, f, cap)                                                                     \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_TEXT, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_STR,                                                                           \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .max_len = cap,                                                                               \
+	 .uik	  = UIK_TEXT}
 #define S_PATH(k, l, h, f, cap)                                                                    \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, NULL, UIK_PATH, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_STR,                                                                           \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .max_len = cap,                                                                               \
+	 .uik	  = UIK_PATH}
+#define S_MODEL_PATH(k, l, h, f, cap, ty)                                                          \
+	{.key		 = k,                                                                              \
+	 .label		 = l,                                                                              \
+	 .hint		 = h,                                                                              \
+	 .type		 = FLD_STR,                                                                        \
+	 .offset	 = offsetof(saved_config, f),                                                      \
+	 .max_len	 = cap,                                                                            \
+	 .uik		 = UIK_MODEL_PATH,                                                                 \
+	 .model_type = ty}
 #define S_MULTI(k, l, h, f, cap, ch, ea)                                                           \
-	{k, l, h, FLD_STR, offsetof(saved_config, f), cap, 0, 0, ch, UIK_MULTI, ea}
-#define S_INT(k, l, h, f, lo, hi)                                                                  \
-	{k,	   l,		 h,	   FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),      \
-	 NULL, UIK_TEXT, false}
-#define S_INT_STEP(k, l, h, f, lo, hi, step)                                                       \
-	{k,	   l,		 h,		FLD_INT, offsetof(saved_config, f), 0, (double)(lo), (double)(hi),     \
-	 NULL, UIK_TEXT, false, step}
-#define S_FLT(k, l, h, f, lo, hi)                                                                  \
-	{k, l, h, FLD_FLOAT, offsetof(saved_config, f), 0, (lo), (hi), NULL, UIK_TEXT, false}
+	{.key		= k,                                                                               \
+	 .label		= l,                                                                               \
+	 .hint		= h,                                                                               \
+	 .type		= FLD_STR,                                                                         \
+	 .offset	= offsetof(saved_config, f),                                                       \
+	 .max_len	= cap,                                                                             \
+	 .choices	= ch,                                                                              \
+	 .uik		= UIK_MULTI,                                                                       \
+	 .empty_all = ea}
+#define S_INT(k, l, h, f, lo_, hi_)                                                                \
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_INT,                                                                            \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .lo	 = (double)(lo_),                                                                      \
+	 .hi	 = (double)(hi_),                                                                      \
+	 .uik	 = UIK_TEXT}
+#define S_INT_STEP(k, l, h, f, lo_, hi_, step)                                                     \
+	{.key		  = k,                                                                             \
+	 .label		  = l,                                                                             \
+	 .hint		  = h,                                                                             \
+	 .type		  = FLD_INT,                                                                       \
+	 .offset	  = offsetof(saved_config, f),                                                     \
+	 .lo		  = (double)(lo_),                                                                 \
+	 .hi		  = (double)(hi_),                                                                 \
+	 .uik		  = UIK_TEXT,                                                                      \
+	 .multiple_of = step}
+#define S_FLT(k, l, h, f, lo_, hi_)                                                                \
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_FLOAT,                                                                          \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .lo	 = (lo_),                                                                              \
+	 .hi	 = (hi_),                                                                              \
+	 .uik	 = UIK_TEXT}
 #define S_BOOL(k, l, h, f)                                                                         \
-	{k, l, h, FLD_BOOL, offsetof(saved_config, f), 0, 0, 0, NULL, UIK_TEXT, false}
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_BOOL,                                                                           \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .uik	 = UIK_TEXT}
 #define S_ENUM(k, l, h, f, ch)                                                                     \
-	{k, l, h, FLD_ENUM, offsetof(saved_config, f), 0, 0, 0, ch, UIK_SELECT, false}
+	{.key	  = k,                                                                                 \
+	 .label	  = l,                                                                                 \
+	 .hint	  = h,                                                                                 \
+	 .type	  = FLD_ENUM,                                                                          \
+	 .offset  = offsetof(saved_config, f),                                                         \
+	 .choices = ch,                                                                                \
+	 .uik	  = UIK_SELECT}
 #define S_U64(k, l, h, f)                                                                          \
-	{k, l, h, FLD_U64, offsetof(saved_config, f), 0, 0, 0, NULL, UIK_TEXT, false}
+	{.key	 = k,                                                                                  \
+	 .label	 = l,                                                                                  \
+	 .hint	 = h,                                                                                  \
+	 .type	 = FLD_U64,                                                                            \
+	 .offset = offsetof(saved_config, f),                                                          \
+	 .uik	 = UIK_TEXT}
 
-static const field_desc MODEL_FIELDS[] = {
-	S_PATH("model", "Model path", "path to the GGUF model file", model, SC_PATH_MAX),
-	S_INT("ctx_size", "Context size", "0 = use model default", ctx_size, 0, INT_MAX),
-	S_INT("threads", "Threads", "0 = auto-detect", n_threads, 0, 4096),
+static const field_desc MAIN_FIELDS[] = {
+	S_MODEL_PATH("model", "Model path",
+				 "GGUF model file, relative paths resolve against the models directory", model,
+				 SC_PATH_MAX, "language"),
+	S_MODEL_PATH("vae", "VAE path", "VAE GGUF file, relative to the models directory", vae,
+				 SC_PATH_MAX, "image"),
+	S_MODEL_PATH("llm", "Text encoder", "text encoder GGUF file, relative to the models directory",
+				 llm, SC_PATH_MAX, "language"),
+	S_STR("monitor", "Monitor socket", "monitoring socket path, empty = off", monitor, SC_PATH_MAX),
 };
 
 static const field_desc DIFFUSION_FIELDS[] = {
-	S_PATH("vae", "VAE path", "path to the VAE GGUF file", vae, SC_PATH_MAX),
-	S_PATH("llm", "LLM path", "path to the text encoder LLM GGUF file", llm, SC_PATH_MAX),
-	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
-		  negative_prompt, SC_SYSTEM_MAX),
 	S_INT_STEP("width", "Width", "pixels, multiple of 32", width, 32, 16384,
 			   DIFFUSION_DIMENSION_STEP),
 	S_INT_STEP("height", "Height", "pixels, multiple of 32", height, 32, 16384,
 			   DIFFUSION_DIMENSION_STEP),
-	S_INT("steps", "Steps", "denoising steps", steps, 1, 1000),
-	S_FLT("cfg_scale", "CFG scale", "prompt guidance, 1.0 = no guidance", cfg_scale, 0.0, 1000.0),
 	S_PATH("output_dir", "Output directory", "final images are saved here, created if missing",
 		   output_dir, SC_PATH_MAX),
 	S_PATH("preview_path", "Preview image", "PNG rewritten while generating, empty = off",
@@ -73,22 +136,15 @@ static const field_desc DIFFUSION_FIELDS[] = {
 };
 
 static const field_desc ENGINE_FIELDS[] = {
+	S_BOOL("reasoning", "Reasoning", "allow model thinking", reasoning),
 	S_BOOL("flash_attn", "Flash attention", "flash attention kernels", flash_attn),
-	S_ENUM("kv_quant", "KV cache quant", "KV cache precision", kv_quant, kv_quant_choices),
+	S_INT("ctx_size", "Context size", "0 = max trained limit", ctx_size, 0, INT_MAX),
+	S_INT("threads", "Threads", "0/* = all cores", n_threads, 0, 4096),
 	S_BOOL("mmap", "mmap weights", "memory-map model weights", use_mmap),
 	S_MULTI("repack", "Repack", "select weight types to repack", repack, SC_TEXT_MAX,
 			repack_choices, true),
-	S_MULTI("fuse", "Weight fusion", "select load-time fusions", fuse, SC_TEXT_MAX, fuse_choices,
-			false),
-	S_STR("monitor", "Monitor socket", "monitoring socket path, empty = off", monitor, SC_PATH_MAX),
 	S_BOOL("warmup", "Warmup", "pre-process chat template prefix at startup", warmup),
 	S_STR("metrics", "Metrics", "comma list: pp, tg, ttft", metrics, SC_METRICS_MAX),
-	S_U64("seed", "Seed", "0 = random each run", seed),
-	S_BOOL("profile_time", "Timing breakdown", "print per-stage timings", profile_time),
-	S_BOOL("debug", "Debug logging", "verbose debug logs", debug),
-	S_BOOL("debug_forward", "Forward debug", "per-layer activation stats", debug_forward),
-	S_BOOL("disable_failsafes", "Failsafes off", "skip memory guardrails (unsafe)",
-		   disable_failsafes),
 };
 
 static const field_desc MOE_FIELDS[] = {
@@ -100,6 +156,7 @@ static const field_desc MOE_FIELDS[] = {
 
 static const field_desc SAMPLING_FIELDS[] = {
 	S_STR("system", "System prompt", "default system prompt, single line", system, SC_SYSTEM_MAX),
+	S_U64("seed", "Seed", "0/* = random each run", seed),
 	S_FLT("temperature", "Temperature", "0 = greedy", temperature, 0.0, 1000.0),
 	S_INT("top_k", "Top-k", "0 = disabled", top_k, 0, INT_MAX),
 	S_FLT("top_p", "Top-p", "1.0 = disabled", top_p, 0.0, 1.0),
@@ -107,9 +164,10 @@ static const field_desc SAMPLING_FIELDS[] = {
 	S_FLT("repeat_penalty", "Repeat penalty", "1.0 = disabled", repeat_penalty, 1e-6, 1000.0),
 	S_INT("repeat_last_n", "Repeat window", "tokens considered by repeat penalty", repeat_last_n, 0,
 		  INT_MAX),
-	S_INT("n_predict", "Max tokens", "tokens per turn, -1 = unlimited", n_predict, -1, INT_MAX),
-	S_BOOL("reasoning", "Reasoning", "allow model thinking", reasoning),
-	S_BOOL("stream", "Stream output", "stream tokens while generating", output_stream),
+	S_STR("negative_prompt", "Negative prompt", "what to steer away from, single line",
+		  negative_prompt, SC_SYSTEM_MAX),
+	S_INT("steps", "Steps", "denoising steps", steps, 1, 1000),
+	S_FLT("cfg_scale", "CFG scale", "prompt guidance, 1.0 = no guidance", cfg_scale, 0.0, 1000.0),
 };
 
 static const field_desc SERVER_FIELDS[] = {
@@ -121,9 +179,9 @@ static const field_desc SERVER_FIELDS[] = {
 };
 
 const schema_tab SCHEMA_TABS[] = {
-	{"model", MODEL_FIELDS, ARRAY_LEN(MODEL_FIELDS)},
+	{"main", MAIN_FIELDS, ARRAY_LEN(MAIN_FIELDS)},
 	{"diffusion", DIFFUSION_FIELDS, ARRAY_LEN(DIFFUSION_FIELDS)},
-	{"engine", ENGINE_FIELDS, ARRAY_LEN(ENGINE_FIELDS)},
+	{"llm", ENGINE_FIELDS, ARRAY_LEN(ENGINE_FIELDS)},
 	{"moe", MOE_FIELDS, ARRAY_LEN(MOE_FIELDS)},
 	{"sampling", SAMPLING_FIELDS, ARRAY_LEN(SAMPLING_FIELDS)},
 	{"server", SERVER_FIELDS, ARRAY_LEN(SERVER_FIELDS)},
@@ -138,17 +196,24 @@ const char *sc_field_hint(const field_desc *f) {
 	return f->hint ? f->hint : "";
 }
 
-const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen) {
+const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen,
+							bool display) {
 	switch (f->type) {
 	case FLD_STR: {
 		const char *val = (const char *)((const char *)sc + f->offset);
-		if (f->uik == UIK_MULTI && !val[0] && f->empty_all)
+		if (display && f->uik == UIK_MULTI && !val[0] && f->empty_all)
 			return "all";
 		return val;
 	}
-	case FLD_INT:
-		snprintf(buf, buflen, "%d", *(int *)((char *)sc + f->offset));
+	case FLD_INT: {
+		int v = *(int *)((char *)sc + f->offset);
+		if (display && v == 0 && strcmp(f->key, "ctx_size") == 0)
+			return "Max trained limit";
+		if (display && v == 0 && strcmp(f->key, "threads") == 0)
+			return "All";
+		snprintf(buf, buflen, "%d", v);
 		return buf;
+	}
 	case FLD_FLOAT:
 		snprintf(buf, buflen, "%g", (double)*(float *)((char *)sc + f->offset));
 		return buf;
@@ -158,9 +223,13 @@ const char *sc_format_value(const saved_config *sc, const field_desc *f, char *b
 		int idx = *(int *)((char *)sc + f->offset);
 		return f->choices[idx];
 	}
-	case FLD_U64:
-		snprintf(buf, buflen, "%llu", (unsigned long long)*(uint64_t *)((char *)sc + f->offset));
+	case FLD_U64: {
+		uint64_t v = *(uint64_t *)((char *)sc + f->offset);
+		if (display && v == 0 && strcmp(f->key, "seed") == 0)
+			return "Random";
+		snprintf(buf, buflen, "%llu", (unsigned long long)v);
 		return buf;
+	}
 	}
 	return "";
 }
@@ -187,6 +256,10 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 		if (len == 0) {
 			snprintf(err, errlen, "empty value for '%s'", f->key);
 			return -1;
+		}
+		if (strcmp(f->key, "threads") == 0 && len == 1 && s[0] == '*') {
+			*(int *)sc_field_ptr(sc, f) = 0;
+			return 0;
 		}
 		char *end	= NULL;
 		errno		= 0;
@@ -261,6 +334,10 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 			snprintf(err, errlen, "empty value for '%s'", f->key);
 			return -1;
 		}
+		if (strcmp(f->key, "seed") == 0 && len == 1 && s[0] == '*') {
+			*(uint64_t *)sc_field_ptr(sc, f) = 0;
+			return 0;
+		}
 		char *end			 = NULL;
 		errno				 = 0;
 		unsigned long long n = strtoull(s, &end, 10);
@@ -287,26 +364,21 @@ void sc_defaults(saved_config *sc) {
 	snprintf(sc->metrics, sizeof(sc->metrics), "%s", a.metrics);
 	snprintf(sc->host, sizeof(sc->host), "%s", a.server_host);
 	snprintf(sc->repack, sizeof(sc->repack), "all");
-	snprintf(sc->fuse, sizeof(sc->fuse), "qkv");
 
 	sc->use_mmap   = c.use_mmap;
 	sc->flash_attn = c.flash_attn;
 	sc->reasoning  = c.reasoning;
 	sc->moe_stream = c.moe_stream;
 
-	sc->n_predict	   = a.n_predict;
 	sc->temperature	   = a.temperature;
 	sc->top_k		   = a.top_k;
 	sc->top_p		   = a.top_p;
 	sc->min_p		   = a.min_p;
 	sc->repeat_penalty = a.repeat_penalty;
 	sc->repeat_last_n  = a.repeat_last_n;
-	sc->output_stream  = a.output_stream;
 	sc->warmup		   = a.warmup;
 	sc->server_port	   = a.server_port;
 	sc->server_slots   = a.server_slots;
-
-	sc->kv_quant = KV_QUANT_F16;
 
 	snprintf(sc->output_dir, sizeof(sc->output_dir), ".");
 	diffusion_params defaults = diffusion_params_defaults();
@@ -500,7 +572,7 @@ static bool section_is_hcs(str_span sec, str_span *device) {
 
 static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char *key,
 						   const char *value, char *err, size_t errlen) {
-	bool is_model = strcasecmp(tab->name, "model") == 0;
+	bool is_model = strcasecmp(tab->name, "main") == 0;
 	bool is_moe	  = strcasecmp(tab->name, "moe") == 0;
 	if (is_moe && strcasecmp(key, "pin") == 0) {
 		char *end = NULL;
@@ -539,134 +611,182 @@ static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char
 	return 1;
 }
 
-static int ini_finish_hcs(saved_config *sc, const hcs_loader *loader, bool hcs_used,
-						  const hcs_legacy *legacy, char *err, size_t errlen) {
-	if (!hcs_used)
+typedef struct {
+	const schema_tab *tab;
+	int				  hcs_section;
+	bool			  hcs_used;
+	bool			  skipping;
+	bool			  lenient;
+	hcs_loader		  loader;
+	hcs_legacy		  legacy;
+} ini_parser;
+
+typedef struct {
+	char  *buf;
+	size_t cap;
+	size_t len;
+} ini_warnings;
+
+static void ini_warn(ini_warnings *w, const char *msg) {
+	size_t n = strlen(msg);
+	if (!w->buf || w->len + n + 2 > w->cap)
+		return;
+	memcpy(w->buf + w->len, msg, n);
+	w->len += n;
+	w->buf[w->len++] = '\n';
+	w->buf[w->len]	 = '\0';
+}
+
+static int ini_finish_hcs(saved_config *sc, ini_parser *p, char *err, size_t errlen) {
+	const hcs_legacy *legacy = &p->legacy;
+	if (!p->hcs_used)
 		return hcs_migrate_legacy(&sc->hcs, legacy, err, errlen);
 	if (legacy->has_device || legacy->has_ngl || legacy->has_cache) {
 		snprintf(err, errlen,
 				 "legacy keys ([model] device/ngl, [moe] cache) cannot be combined with [hcs]");
 		return -1;
 	}
-	return hcs_loader_finish(loader, &sc->hcs, err, errlen);
+	return hcs_loader_finish(&p->loader, &sc->hcs, err, errlen);
 }
 
-static int ini_apply(saved_config *sc, const char *data, char *err, size_t errlen) {
-	ini_cursor		  cur = {data, 0};
-	char			  line[SC_SYSTEM_MAX * 2];
-	const schema_tab *tab		  = NULL;
-	int				  hcs_section = HCS_SECTION_NONE;
-	bool			  hcs_used	  = false;
-	hcs_loader		  loader;
-	hcs_legacy		  legacy = {0};
-	int				  r;
-
-	hcs_loader_init(&loader);
-
-	while ((r = ini_next_line(&cur, line, sizeof(line))) == 1) {
-		str_span	sp	= span_trim(line, strlen(line));
-		const char *s	= sp.p;
-		size_t		len = sp.len;
-		if (len == 0 || s[0] == '#' || s[0] == ';')
-			continue;
-
-		if (s[0] == '[') {
-			const char *close = memchr(s, ']', len);
-			if (!close) {
-				snprintf(err, errlen, "line %d: missing ']' after section name", cur.line_no);
-				return -1;
-			}
-			str_span sec = span_trim(s + 1, (size_t)(close - s - 1));
-			if (sec.len == 0) {
-				snprintf(err, errlen, "line %d: empty section name", cur.line_no);
-				return -1;
-			}
-			str_span device = {0};
-			tab				= NULL;
-			hcs_section		= HCS_SECTION_NONE;
-			if (section_is_hcs(sec, &device)) {
-				hcs_used	= true;
-				hcs_section = HCS_SECTION_ROOT;
-				if (device.len > 0) {
-					char name[HCS_NAME_MAX];
-					snprintf(name, sizeof(name), "%.*s", (int)device.len, device.p);
-					char perr[SC_ERR_MAX];
-					hcs_section = hcs_loader_open_section(&loader, name, perr, sizeof(perr));
-					if (hcs_section < 0) {
-						snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-						return -1;
-					}
-				}
-				continue;
-			}
-			tab = find_tab(sec.p, sec.len);
-			if (!tab) {
-				snprintf(err, errlen, "line %d: unknown section '%.*s'", cur.line_no, (int)sec.len,
-						 sec.p);
-				return -1;
-			}
-			continue;
-		}
-
-		const char *eq = memchr(s, '=', len);
-		if (!eq) {
-			snprintf(err, errlen, "line %d: expected 'key = value'", cur.line_no);
-			return -1;
-		}
-		str_span key = span_trim(s, (size_t)(eq - s));
-		str_span val = span_trim(eq + 1, len - (size_t)(eq - s) - 1);
-		if (key.len == 0) {
-			snprintf(err, errlen, "line %d: empty key", cur.line_no);
-			return -1;
-		}
-		if (!tab && hcs_section == HCS_SECTION_NONE) {
-			snprintf(err, errlen, "line %d: '%.*s' appears before any section", cur.line_no,
-					 (int)key.len, key.p);
-			return -1;
-		}
-		char perr[SC_ERR_MAX];
-		char keybuf[SC_TEXT_MAX];
-		char valbuf[SC_SYSTEM_MAX * 2];
-		if (val.len >= sizeof(valbuf))
-			val.len = sizeof(valbuf) - 1;
-		snprintf(keybuf, sizeof(keybuf), "%.*s", (int)key.len, key.p);
-		memcpy(valbuf, val.p, val.len);
-		valbuf[val.len] = '\0';
-
-		if (!tab) {
-			if (hcs_loader_set(&loader, hcs_section, keybuf, valbuf, perr, sizeof(perr)) < 0) {
-				snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-				return -1;
-			}
-			continue;
-		}
-		int legacy_rc = take_legacy_key(&legacy, tab, keybuf, valbuf, perr, sizeof(perr));
-		if (legacy_rc < 0) {
-			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-			return -1;
-		}
-		if (legacy_rc > 0)
-			continue;
-
-		const field_desc *f = find_field(tab, key.p, key.len);
-		if (!f) {
-			snprintf(err, errlen, "line %d: unknown key '%.*s' in section [%s]", cur.line_no,
-					 (int)key.len, key.p, tab->name);
-			return -1;
-		}
-		if (sc_parse_value(sc, f, valbuf, perr, sizeof(perr)) < 0) {
-			snprintf(err, errlen, "line %d: %s", cur.line_no, perr);
-			return -1;
-		}
-	}
-	if (r < 0) {
-		snprintf(err, errlen, "line %d: line too long", cur.line_no);
+static int ini_section_line(ini_parser *p, const char *s, size_t len, int line_no, char *err,
+							size_t errlen) {
+	p->tab			  = NULL;
+	p->hcs_section	  = HCS_SECTION_NONE;
+	p->skipping		  = true;
+	const char *close = memchr(s, ']', len);
+	if (!close) {
+		snprintf(err, errlen, "line %d: missing ']' after section name", line_no);
 		return -1;
 	}
-	return ini_finish_hcs(sc, &loader, hcs_used, &legacy, err, errlen);
+	str_span sec = span_trim(s + 1, (size_t)(close - s - 1));
+	if (sec.len == 0) {
+		snprintf(err, errlen, "line %d: empty section name", line_no);
+		return -1;
+	}
+	str_span device = {0};
+	if (section_is_hcs(sec, &device)) {
+		p->hcs_used	   = true;
+		p->hcs_section = HCS_SECTION_ROOT;
+		if (device.len > 0) {
+			char name[HCS_NAME_MAX];
+			char perr[SC_ERR_MAX];
+			snprintf(name, sizeof(name), "%.*s", (int)device.len, device.p);
+			p->hcs_section = hcs_loader_open_section(&p->loader, name, perr, sizeof(perr));
+			if (p->hcs_section < 0) {
+				p->hcs_section = HCS_SECTION_NONE;
+				snprintf(err, errlen, "line %d: %s", line_no, perr);
+				return -1;
+			}
+		}
+		p->skipping = false;
+		return 0;
+	}
+	p->tab = find_tab(sec.p, sec.len);
+	if (!p->tab) {
+		snprintf(err, errlen, "line %d: unknown section '%.*s'", line_no, (int)sec.len, sec.p);
+		return -1;
+	}
+	p->skipping = false;
+	return 0;
 }
 
-int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
+static int ini_key_line(ini_parser *p, saved_config *sc, const char *s, size_t len, int line_no,
+						char *err, size_t errlen) {
+	const char *eq = memchr(s, '=', len);
+	if (!eq) {
+		snprintf(err, errlen, "line %d: expected 'key = value'", line_no);
+		return -1;
+	}
+	str_span key = span_trim(s, (size_t)(eq - s));
+	str_span val = span_trim(eq + 1, len - (size_t)(eq - s) - 1);
+	if (key.len == 0) {
+		snprintf(err, errlen, "line %d: empty key", line_no);
+		return -1;
+	}
+	if (p->skipping)
+		return 0;
+	if (!p->tab && p->hcs_section == HCS_SECTION_NONE) {
+		snprintf(err, errlen, "line %d: '%.*s' appears before any section", line_no, (int)key.len,
+				 key.p);
+		return -1;
+	}
+	char perr[SC_ERR_MAX];
+	char keybuf[SC_TEXT_MAX];
+	char valbuf[SC_SYSTEM_MAX * 2];
+	if (val.len >= sizeof(valbuf))
+		val.len = sizeof(valbuf) - 1;
+	snprintf(keybuf, sizeof(keybuf), "%.*s", (int)key.len, key.p);
+	memcpy(valbuf, val.p, val.len);
+	valbuf[val.len] = '\0';
+
+	if (!p->tab) {
+		if (hcs_loader_set(&p->loader, p->hcs_section, keybuf, valbuf, perr, sizeof(perr)) < 0) {
+			snprintf(err, errlen, "line %d: %s", line_no, perr);
+			return -1;
+		}
+		return 0;
+	}
+	int legacy_rc = take_legacy_key(&p->legacy, p->tab, keybuf, valbuf, perr, sizeof(perr));
+	if (legacy_rc < 0) {
+		snprintf(err, errlen, "line %d: %s", line_no, perr);
+		return -1;
+	}
+	if (legacy_rc > 0)
+		return 0;
+
+	const field_desc *f = find_field(p->tab, key.p, key.len);
+	if (!f) {
+		snprintf(err, errlen, "line %d: unknown key '%.*s' in section [%s]", line_no, (int)key.len,
+				 key.p, p->tab->name);
+		return -1;
+	}
+	if (sc_parse_value(sc, f, valbuf, perr, sizeof(perr)) < 0) {
+		snprintf(err, errlen, "line %d: %s", line_no, perr);
+		return -1;
+	}
+	return 0;
+}
+
+static int ini_apply(saved_config *sc, const char *data, bool lenient, ini_warnings *warn,
+					 char *err, size_t errlen) {
+	ini_cursor cur = {data, 0};
+	char	   line[SC_SYSTEM_MAX * 2];
+	ini_parser p = {.hcs_section = HCS_SECTION_NONE, .lenient = lenient};
+	hcs_loader_init(&p.loader);
+
+	for (;;) {
+		int r = ini_next_line(&cur, line, sizeof(line));
+		if (r == 0)
+			break;
+		int		 rc = -1;
+		str_span sp = span_trim(line, strlen(line));
+		if (r < 0)
+			snprintf(err, errlen, "line %d: line too long", cur.line_no);
+		else if (sp.len == 0 || sp.p[0] == '#' || sp.p[0] == ';')
+			continue;
+		else if (sp.p[0] == '[')
+			rc = ini_section_line(&p, sp.p, sp.len, cur.line_no, err, errlen);
+		else
+			rc = ini_key_line(&p, sc, sp.p, sp.len, cur.line_no, err, errlen);
+		if (rc == 0)
+			continue;
+		if (!lenient)
+			return -1;
+		ini_warn(warn, err);
+	}
+
+	int rc = ini_finish_hcs(sc, &p, err, errlen);
+	if (rc == 0 || !lenient)
+		return rc;
+	ini_warn(warn, err);
+	if (p.hcs_used)
+		hcs_loader_finish_lenient(&p.loader, &sc->hcs);
+	return 0;
+}
+
+static int sc_load_impl(const char *path, saved_config *sc, bool lenient, ini_warnings *warn,
+						char *err, size_t errlen) {
 	sc_defaults(sc);
 
 	size_t len	= 0;
@@ -679,8 +799,10 @@ int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
 		(unsigned char)data[2] == 0xBF)
 		parse = data + 3;
 
-	int rc = ini_apply(sc, parse, err, errlen);
+	int rc = ini_apply(sc, parse, lenient, warn, err, errlen);
 	if (rc == 0) {
+		if (!sc->hcs.enabled)
+			hcs_set_simple(&sc->hcs, sc->hcs.devices[0].name);
 		const char *base = path_basename(path);
 		size_t		bl	 = strlen(base);
 		if (bl > 5 && strcmp(base + bl - 5, ".conf") == 0)
@@ -692,6 +814,31 @@ int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
 	}
 	free(data);
 	return rc;
+}
+
+int sc_load(const char *path, saved_config *sc, char *err, size_t errlen) {
+	ini_warnings none = {0};
+	return sc_load_impl(path, sc, false, &none, err, errlen);
+}
+
+int sc_load_lenient(const char *path, saved_config *sc, char *warn, size_t warnlen, char *err,
+					size_t errlen) {
+	if (warnlen)
+		warn[0] = '\0';
+	ini_warnings w = {warn, warnlen, 0};
+	return sc_load_impl(path, sc, true, &w, err, errlen);
+}
+
+static void resolve_in_place(char *path, size_t cap) {
+	char resolved[SC_PATH_MAX];
+	tui_resolve_path(path, resolved, sizeof(resolved));
+	snprintf(path, cap, "%s", resolved);
+}
+
+void sc_resolve_model_paths(saved_config *sc) {
+	resolve_in_place(sc->model, sizeof(sc->model));
+	resolve_in_place(sc->vae, sizeof(sc->vae));
+	resolve_in_place(sc->llm, sizeof(sc->llm));
 }
 
 static void write_hcs(FILE *fp, const hcs_config *h) {
@@ -759,7 +906,7 @@ int sc_save(const saved_config *sc, const char *orig_name, char *err, size_t err
 		for (int i = 0; i < tab->n_fields; i++) {
 			const field_desc *f = &tab->fields[i];
 			char			  vbuf[SC_SYSTEM_MAX + 16];
-			const char		 *val = sc_format_value(sc, f, vbuf, sizeof(vbuf));
+			const char		 *val = sc_format_value(sc, f, vbuf, sizeof(vbuf), false);
 			fprintf(fp, "%s = %s\n", f->key, val);
 		}
 		fputc('\n', fp);
@@ -794,33 +941,25 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 
 	cfg->model		  = sc->model[0] ? sc->model : NULL;
 	cfg->repack		  = sc->repack[0] ? sc->repack : NULL;
-	cfg->fuse		  = sc->fuse[0] ? sc->fuse : NULL;
 	cfg->moe_pin_list = sc->moe_pin_list[0] ? sc->moe_pin_list : NULL;
 	cfg->monitor	  = sc->monitor[0] ? sc->monitor : NULL;
 	cfg->seed		  = sc->seed;
 	cfg->n_threads	  = sc->n_threads;
 	cfg->ctx_size	  = sc->ctx_size;
-	cfg->kv_quant	  = sc->kv_quant == 1 ? KV_QUANT_Q8_0 : KV_QUANT_F16;
 	hcs_materialize(&sc->hcs, sc->model, cfg);
-	cfg->debug			   = sc->debug;
-	cfg->use_mmap		   = sc->use_mmap;
-	cfg->flash_attn		   = sc->flash_attn;
-	cfg->debug_forward	   = sc->debug_forward;
-	cfg->moe_stream		   = sc->moe_stream;
-	cfg->moe_preload	   = sc->moe_preload;
-	cfg->profile_time	   = sc->profile_time;
-	cfg->reasoning		   = sc->reasoning;
-	cfg->disable_failsafes = sc->disable_failsafes;
+	cfg->use_mmap	 = sc->use_mmap;
+	cfg->flash_attn	 = sc->flash_attn;
+	cfg->moe_stream	 = sc->moe_stream;
+	cfg->moe_preload = sc->moe_preload;
+	cfg->reasoning	 = sc->reasoning;
 
 	a->system		  = sc->system;
-	a->n_predict	  = sc->n_predict;
 	a->temperature	  = sc->temperature;
 	a->top_k		  = sc->top_k;
 	a->top_p		  = sc->top_p;
 	a->min_p		  = sc->min_p;
 	a->repeat_penalty = sc->repeat_penalty;
 	a->repeat_last_n  = sc->repeat_last_n;
-	a->output_stream  = sc->output_stream;
 	snprintf(a->metrics, sizeof(a->metrics), "%s", sc->metrics);
 	a->warmup		  = sc->warmup;
 	a->server_host	  = sc->host[0] ? sc->host : "127.0.0.1";

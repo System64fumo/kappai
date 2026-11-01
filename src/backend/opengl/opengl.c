@@ -55,6 +55,19 @@
 #define GL_MATMUL_MULTI_MAX 8
 #define GL_KV_ZERO_CHUNK_BYTES ((size_t)1 << 20)
 
+#define GL_ARGMAX_WG_CHUNK 8192
+#define GL_ARGMAX_MAX_GROUPS 256
+
+#define GL_DENSE_ATTN_MAX_HEAD_DIM 2048
+#define GL_THREADS_PER_GROUP 128
+
+static const struct {
+	const char *name;
+	const char *src;
+} gl_shader_includes[] = {
+	{"activate.glsl", gl_shader_activate_src},
+};
+
 typedef struct gl_priv gl_priv;
 
 typedef struct {
@@ -163,6 +176,8 @@ typedef enum {
 	GL_PIPE_ATTENTION_DENSE,
 	GL_PIPE_IM2COL,
 	GL_PIPE_UPSAMPLE_SHORTCUT,
+	GL_PIPE_GDN_CONV,
+	GL_PIPE_GDN_HEADS,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -489,7 +504,6 @@ static status_code gl_ensure_context(gl_priv *p) {
 		if (gl_enter_st_ != OK)                                                                    \
 			return gl_enter_st_;                                                                   \
 	} while (0)
-
 #define GL_ENTER_VOID(p_)                                                                          \
 	do {                                                                                           \
 		if (gl_ensure_context(p_) != OK)                                                           \
@@ -677,13 +691,6 @@ static void gl_pui(gl_pipeline *p, const char *const *names, const int *vals, in
 	for (int i = 0; i < count; i++)
 		gl_pu(p, names[i], vals[i]);
 }
-
-static const struct {
-	const char *name;
-	const char *src;
-} gl_shader_includes[] = {
-	{"activate.glsl", gl_shader_activate_src},
-};
 
 static char *gl_shader_splice_includes(const char *src) {
 	if (!strstr(src, "#include "))
@@ -1073,10 +1080,6 @@ static gl_buf *gl_buf_alloc_ex(gl_priv *p, size_t size, GLenum usage, const void
 	gl_buf_register(p, b);
 	p->device_local_allocated += size;
 	return b;
-}
-
-static gl_buf *gl_buf_alloc(gl_priv *p, size_t size, GLenum usage, const void *initial_data) {
-	return gl_buf_alloc_ex(p, size, usage, initial_data, true, NULL);
 }
 
 static inline void *gl_buf_handle(gl_buf *b) {
@@ -1489,6 +1492,8 @@ static status_code gl_init(backend *self, int device_index) {
 		[GL_PIPE_IM2COL]			= {"im2col", gl_shader_im2col_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_UPSAMPLE_SHORTCUT] = {"upsample_shortcut", gl_shader_upsample_shortcut_src, 0,
 									   UINT32_MAX, 1, 0},
+		[GL_PIPE_GDN_CONV]			= {"gdn_conv", gl_shader_gdn_conv_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_GDN_HEADS]			= {"gdn_heads", gl_shader_gdn_heads_src, 0, UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -1579,6 +1584,16 @@ static status_code gl_init(backend *self, int device_index) {
 			return s;
 		}
 	}
+	if (s != OK) {
+		for (int j = 0; j < GL_PIPE_COUNT; j++)
+			glDeleteProgram(p->pipes[j].program);
+		free(p->attention_src);
+		free(p->attention_batch_src);
+		gl_context_free(&p->ctx);
+		free(p);
+		self->priv = NULL;
+		return s;
+	}
 
 	static const int8_t iq4nl_values[16] = {
 		-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -1587,7 +1602,8 @@ static status_code gl_init(backend *self, int device_index) {
 	for (int b = 0; b < 256; b++)
 		iq4nl_pairs[b] =
 			(uint32_t)((int32_t)iq4nl_values[b & 15] + (int32_t)iq4nl_values[b >> 4] * 65536);
-	p->iq3s_grid = gl_buf_alloc(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid);
+	p->iq3s_grid =
+		gl_buf_alloc_ex(p, sizeof(ggml_iq3s_grid), GL_STATIC_DRAW, ggml_iq3s_grid, false, NULL);
 	{
 		static uint8_t iqx_data[sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
 								sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs)];
@@ -1599,9 +1615,10 @@ static status_code gl_init(backend *self, int device_index) {
 		memcpy(dp, ggml_iq3xxs_grid, sizeof(ggml_iq3xxs_grid));
 		dp += sizeof(ggml_iq3xxs_grid);
 		memcpy(dp, ggml_ksigns_iq2xs, sizeof(ggml_ksigns_iq2xs));
-		p->iqx_grid = gl_buf_alloc(p, sizeof(iqx_data), GL_STATIC_DRAW, iqx_data);
+		p->iqx_grid = gl_buf_alloc_ex(p, sizeof(iqx_data), GL_STATIC_DRAW, iqx_data, false, NULL);
 	}
-	p->iq4nl_pairs = gl_buf_alloc(p, sizeof(iq4nl_pairs), GL_STATIC_DRAW, iq4nl_pairs);
+	p->iq4nl_pairs =
+		gl_buf_alloc_ex(p, sizeof(iq4nl_pairs), GL_STATIC_DRAW, iq4nl_pairs, false, NULL);
 	if (!p->iq3s_grid || !p->iq4nl_pairs || !p->iqx_grid) {
 		if (p->iq3s_grid)
 			gl_buf_free(p, p->iq3s_grid);
@@ -1653,12 +1670,12 @@ static void gl_free(backend *self) {
 		return;
 	}
 
-	INFO("gl: totals: %llu dispatches, %llu barriers, %llu flushes, %llu finishes, %llu readbacks",
-		 (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
-		 (unsigned long long)p->stats.flushes, (unsigned long long)p->stats.finishes,
-		 (unsigned long long)p->stats.readbacks);
-	INFO("gl: host time: %.1f ms in dispatch/barrier calls, %.1f ms waiting in glFinish",
-		 (double)p->stats.launch_us / 1000.0, (double)p->stats.wait_us / 1000.0);
+	DEBUG("gl: totals: %llu dispatches, %llu barriers, %llu flushes, %llu finishes, %llu readbacks",
+		  (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
+		  (unsigned long long)p->stats.flushes, (unsigned long long)p->stats.finishes,
+		  (unsigned long long)p->stats.readbacks);
+	DEBUG("gl: host time: %.1f ms in dispatch/barrier calls, %.1f ms waiting in glFinish",
+		  (double)p->stats.launch_us / 1000.0, (double)p->stats.wait_us / 1000.0);
 
 	gl_gpuprof_report(p);
 
@@ -1751,7 +1768,7 @@ static status_code gl_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 		out->owner		= self;
 		return OK;
 	}
-	b = gl_buf_alloc(p, size, GL_DYNAMIC_COPY, NULL);
+	b = gl_buf_alloc_ex(p, size, GL_DYNAMIC_COPY, NULL, true, NULL);
 	if (!b)
 		return ERR_OUT_OF_MEMORY;
 	b->scratch	  = 1;
@@ -1801,17 +1818,20 @@ static void gl_buffer_free(backend *self, buffer *buf) {
 }
 
 static status_code gl_readback_reserve(gl_priv *p, size_t bytes) {
+	if (p->ctx.unified_memory)
+		return OK;
 	if (p->readback && p->readback_bytes >= bytes)
 		return OK;
 	size_t want = (bytes + (size_t)65535) & ~(size_t)65535;
 	if (p->readback)
 		gl_buf_free(p, p->readback);
-	p->readback		  = gl_buf_alloc(p, want, GL_DYNAMIC_COPY, NULL);
+	p->readback		  = gl_buf_alloc_ex(p, want, GL_DYNAMIC_COPY, NULL, false, NULL);
 	p->readback_bytes = p->readback ? want : 0;
 	return p->readback ? OK : ERR_OUT_OF_MEMORY;
 }
 
-static status_code gl_readback_map(gl_priv *p, size_t bytes, void **src) {
+static status_code gl_readback_map(gl_priv *p, GLuint name, size_t offset, size_t bytes,
+								   void **src) {
 	glBindBuffer(GL_COPY_READ_BUFFER, 0);
 	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 	if (glGetError() != GL_NO_ERROR)
@@ -1826,8 +1846,9 @@ static status_code gl_readback_map(gl_priv *p, size_t bytes, void **src) {
 	glDeleteSync(fence);
 	if (wr != GL_ALREADY_SIGNALED && wr != GL_CONDITION_SATISFIED)
 		return ERR_INTERNAL;
-	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->readback->name);
-	*src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, name);
+	*src = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, (GLintptr)offset, (GLsizeiptr)bytes,
+							GL_MAP_READ_BIT);
 	if (!*src) {
 		glGetError();
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -1850,12 +1871,18 @@ static status_code gl_read_region_f32(gl_priv *p, gl_buf *b, size_t byte_off, vo
 		return st;
 	gl_barrier_if_pending(p);
 	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-	glBindBuffer(GL_COPY_READ_BUFFER, b->name);
-	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
-	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)byte_off, 0,
-						(GLsizeiptr)bytes);
+	GLuint map_name	  = b->name;
+	size_t map_offset = byte_off;
+	if (!p->ctx.unified_memory) {
+		glBindBuffer(GL_COPY_READ_BUFFER, b->name);
+		glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
+		glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)byte_off, 0,
+							(GLsizeiptr)bytes);
+		map_name   = p->readback->name;
+		map_offset = 0;
+	}
 	void *src;
-	st = gl_readback_map(p, bytes, &src);
+	st = gl_readback_map(p, map_name, map_offset, bytes, &src);
 	if (st != OK)
 		return st;
 	memcpy(dst, src, bytes);
@@ -1881,7 +1908,7 @@ static status_code gl_read_two_regions_f32(gl_priv *p, gl_buf *b0, size_t off0, 
 	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)off1, (GLintptr)pad0,
 						(GLsizeiptr)bytes1);
 	void *src;
-	st = gl_readback_map(p, total, &src);
+	st = gl_readback_map(p, p->readback->name, 0, total, &src);
 	if (st != OK)
 		return st;
 	memcpy(dst0, src, bytes0);
@@ -1900,7 +1927,7 @@ static status_code gl_buffer_read_f32_x2(backend *self, const buffer *buf_a, flo
 	gl_buf *bb		= as_glbuf(buf_b);
 	size_t	bytes_a = (size_t)n_a * sizeof(float);
 	size_t	bytes_b = (size_t)n_b * sizeof(float);
-	int fused = n_a > 0 && n_b > 0 && ba->name && bb->name &&
+	int fused = !p->ctx.unified_memory && n_a > 0 && n_b > 0 && ba->name && bb->name &&
 				(ba->device_dirty || !ba->host_mirror) && (bb->device_dirty || !bb->host_mirror) &&
 				buf_a->offset + bytes_a <= ba->size_bytes &&
 				buf_b->offset + bytes_b <= bb->size_bytes;
@@ -2103,9 +2130,6 @@ static void gl_submit(backend *self) {
 	p->dispatches_since_flush = 0;
 }
 
-#define GL_ARGMAX_WG_CHUNK 8192
-#define GL_ARGMAX_MAX_GROUPS 256
-
 static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int *groups_out) {
 	int groups = (n + GL_ARGMAX_WG_CHUNK - 1) / GL_ARGMAX_WG_CHUNK;
 	groups	   = MIN(groups, GL_ARGMAX_MAX_GROUPS);
@@ -2115,7 +2139,7 @@ static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int
 	if (!p->argmax_partial || p->argmax_partial_bytes < partial_bytes) {
 		if (p->argmax_partial)
 			gl_buf_free(p, p->argmax_partial);
-		p->argmax_partial = gl_buf_alloc(p, partial_bytes, GL_DYNAMIC_COPY, NULL);
+		p->argmax_partial = gl_buf_alloc_ex(p, partial_bytes, GL_DYNAMIC_COPY, NULL, true, NULL);
 		if (!p->argmax_partial)
 			return ERR_OUT_OF_MEMORY;
 		p->argmax_partial_bytes			= partial_bytes;
@@ -2162,8 +2186,8 @@ static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t
 static status_code gl_ensure_token_regs(gl_priv *p) {
 	if (p->tok_reg && p->tok_rb)
 		return OK;
-	p->tok_reg = gl_buf_alloc(p, 64, GL_DYNAMIC_COPY, NULL);
-	p->tok_rb  = gl_buf_alloc(p, 64, GL_DYNAMIC_COPY, NULL);
+	p->tok_reg = gl_buf_alloc_ex(p, 64, GL_DYNAMIC_COPY, NULL, false, NULL);
+	p->tok_rb  = gl_buf_alloc_ex(p, 64, GL_DYNAMIC_COPY, NULL, false, NULL);
 	return p->tok_reg && p->tok_rb ? OK : ERR_OUT_OF_MEMORY;
 }
 
@@ -2416,7 +2440,7 @@ static status_code gl_rmsnorm(backend *self, const buffer *x, const buffer *w, b
 
 static status_code gl_ensure_dummy(gl_priv *p) {
 	if (!p->dummy) {
-		p->dummy = gl_buf_alloc(p, 16, GL_DYNAMIC_COPY, NULL);
+		p->dummy = gl_buf_alloc_ex(p, 16, GL_DYNAMIC_COPY, NULL, false, NULL);
 		if (!p->dummy)
 			return ERR_OUT_OF_MEMORY;
 	}
@@ -2519,7 +2543,7 @@ static status_code gl_elementwise(gl_priv *p, buffer *x, const buffer *y, const 
 								  int mode, float scale, int aux, int rows) {
 	gl_buf *dummy = NULL;
 	if (!p->dummy) {
-		p->dummy = gl_buf_alloc(p, 16, GL_DYNAMIC_COPY, NULL);
+		p->dummy = gl_buf_alloc_ex(p, 16, GL_DYNAMIC_COPY, NULL, false, NULL);
 		if (!p->dummy)
 			return ERR_OUT_OF_MEMORY;
 	}
@@ -2706,9 +2730,6 @@ static status_code gl_attn_output_gate(backend *self, buffer *out, const buffer 
 	}
 	return s;
 }
-
-#define GL_DENSE_ATTN_MAX_HEAD_DIM 2048
-#define GL_THREADS_PER_GROUP 128
 
 static void gl_sync_buffers(gl_buf *const *bufs, int n) {
 	for (int i = 0; i < n; i++)
@@ -3055,8 +3076,8 @@ static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, con
 		while (capacity <= last)
 			capacity *= 2;
 		size_t	 bytes	 = (size_t)capacity * (size_t)half * sizeof(float);
-		gl_buf	*cos_buf = gl_buf_alloc(p, bytes, GL_DYNAMIC_COPY, NULL);
-		gl_buf	*sin_buf = gl_buf_alloc(p, bytes, GL_DYNAMIC_COPY, NULL);
+		gl_buf	*cos_buf = gl_buf_alloc_ex(p, bytes, GL_DYNAMIC_COPY, NULL, false, NULL);
+		gl_buf	*sin_buf = gl_buf_alloc_ex(p, bytes, GL_DYNAMIC_COPY, NULL, false, NULL);
 		uint8_t *valid	 = xcalloc((size_t)capacity, 1);
 		if (!cos_buf || !sin_buf || !valid) {
 			if (cos_buf)
@@ -3397,7 +3418,7 @@ static status_code gl_quantize_run(gl_priv *p, const gl_quantize_spec *spec, gl_
 	if (!ce->stage || ce->stage->size_bytes < need) {
 		if (ce->stage)
 			gl_buf_free(p, ce->stage);
-		ce->stage = gl_buf_alloc(p, need, GL_DYNAMIC_COPY, NULL);
+		ce->stage = gl_buf_alloc_ex(p, need, GL_DYNAMIC_COPY, NULL, false, NULL);
 		if (!ce->stage)
 			return ERR_OUT_OF_MEMORY;
 	}
@@ -4519,7 +4540,7 @@ static status_code gl_attention_impl(backend *self, const buffer *q, const buffe
 	if (!p->attn_part || p->attn_part_cap < part_bytes) {
 		if (p->attn_part)
 			gl_buf_free(p, p->attn_part);
-		p->attn_part = gl_buf_alloc(p, part_bytes, GL_DYNAMIC_COPY, NULL);
+		p->attn_part = gl_buf_alloc_ex(p, part_bytes, GL_DYNAMIC_COPY, NULL, false, NULL);
 		if (!p->attn_part)
 			return ERR_OUT_OF_MEMORY;
 		p->attn_part_cap = part_bytes;
@@ -5892,6 +5913,117 @@ static status_code gl_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
 	return s;
 }
 
+typedef struct {
+	buffer conv_out;
+} gl_gdn_scratch;
+
+#define GL_GDN_MAX_VD 512
+
+static status_code gl_gdn_scratch_alloc(backend *self, const gdn_desc *d, buffer *root,
+										gl_gdn_scratch *out) {
+	const size_t T = (size_t)d->n_tokens;
+	size_t		 n = T * (size_t)d->conv_dim;
+	if (n == 0)
+		n = 1;
+	status_code s = self->buffer_alloc_scratch(self, ALIGN_UP(n, 64) * sizeof(float), root);
+	if (s != OK)
+		return s;
+	out->conv_out = gl_float_slice(root, 0, n);
+	return OK;
+}
+
+static status_code gl_gated_delta_net(backend *self, const gdn_desc *d) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (!p->pipes[GL_PIPE_GDN_CONV].program || !p->pipes[GL_PIPE_GDN_HEADS].program)
+		return ERR_UNSUPPORTED;
+	const int hist = d->conv_kernel - 1;
+	if (d->n_tokens < 1 || d->conv_dim < 1 || hist < 1 || hist > GL_KDA_MAX_HIST ||
+		d->state_size < 1 || d->value_head_dim < 1 || d->value_head_dim > GL_GDN_MAX_VD ||
+		d->n_value_heads < 1 || d->n_key_heads < 1 ||
+		(GLuint)d->n_value_heads > GL_MAX_DISPATCH_PER_DIM) {
+		ERROR(
+			"gl: gdn: unsupported shape v_heads=%d key_dim=%d state=%d vd=%d conv_dim=%d kernel=%d",
+			d->n_value_heads, d->key_dim, d->state_size, d->value_head_dim, d->conv_dim,
+			d->conv_kernel);
+		return ERR_UNSUPPORTED;
+	}
+
+	const buffer *ops[] = {d->mixed, d->conv_w, d->conv_state, d->z,	 d->alpha, d->beta,
+						   d->dt,	 d->a_vec,	d->norm_w,	   d->state, d->out};
+	status_code	  s		= gl_require_resident(self, "gdn", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+
+	buffer		   root = {0};
+	gl_gdn_scratch sc;
+	s = gl_gdn_scratch_alloc(self, d, &root, &sc);
+	if (s != OK)
+		return s;
+
+	gl_sync_operands(ops, (int)ARRAY_LEN(ops));
+
+	buffer head_params = {0};
+	s = self->buffer_alloc_scratch(self, (size_t)d->n_value_heads * 2 * sizeof(float),
+								   &head_params);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+	buffer head_a =
+		gl_float_slice(&head_params, (size_t)d->n_value_heads, (size_t)d->n_value_heads);
+	s = gl_copy_buffer(self, d->dt, &head_params, d->n_value_heads);
+	if (s == OK)
+		s = gl_copy_buffer(self, d->a_vec, &head_a, d->n_value_heads);
+	if (s != OK) {
+		self->buffer_free(self, &head_params);
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	gl_pipeline *conv = &p->pipes[GL_PIPE_GDN_CONV];
+	gl_use_pipeline(p, conv);
+	gl_bind_ssbo(0, d->mixed);
+	gl_bind_ssbo(1, d->conv_w);
+	gl_bind_ssbo_out(2, d->conv_state);
+	gl_bind_ssbo_out(3, &sc.conv_out);
+	gl_pu(conv, "u_conv_dim", d->conv_dim);
+	gl_pu(conv, "u_kernel", d->conv_kernel);
+	gl_pu(conv, "u_tokens", d->n_tokens);
+	gl_pu(conv, "u_reset", d->reset);
+	gl_launch(p, gl_groups_for(d->conv_dim, 64), 1, 1);
+
+	gl_pipeline *heads = &p->pipes[GL_PIPE_GDN_HEADS];
+	gl_use_pipeline(p, heads);
+	gl_bind_ssbo(0, &sc.conv_out);
+	gl_bind_ssbo(1, d->z);
+	gl_bind_ssbo(2, d->alpha);
+	gl_bind_ssbo(3, d->beta);
+	gl_bind_ssbo(4, &head_params);
+	gl_bind_ssbo(5, d->norm_w);
+	gl_bind_ssbo_out(6, d->state);
+	gl_bind_ssbo_out(7, d->out);
+	gl_pu(heads, "u_n_tokens", d->n_tokens);
+	gl_pu(heads, "u_n_value_heads", d->n_value_heads);
+	gl_pu(heads, "u_n_key_heads", d->n_key_heads);
+	gl_pu(heads, "u_key_dim", d->key_dim);
+	gl_pu(heads, "u_kd", d->state_size);
+	gl_pu(heads, "u_vd", d->value_head_dim);
+	gl_pu(heads, "u_value_dim", d->value_dim);
+	gl_pu(heads, "u_conv_dim", d->conv_dim);
+	gl_pu(heads, "u_reset", d->reset);
+	gl_puf(heads, "u_eps", d->eps);
+	gl_launch(p, (GLuint)d->n_value_heads, 1, 1);
+	as_glbuf(d->conv_state)->device_dirty = 1;
+	as_glbuf(d->state)->device_dirty	  = 1;
+	as_glbuf(d->out)->device_dirty		  = 1;
+	as_glbuf(&root)->device_dirty		  = 1;
+
+	self->buffer_free(self, &head_params);
+	self->buffer_free(self, &root);
+	return s;
+}
+
 static status_code gl_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "opengl";
@@ -5995,6 +6127,7 @@ static status_code gl_ctor(backend *out) {
 	out->attention_dense				 = gl_attention_dense;
 	out->im2col3x3						 = gl_im2col3x3;
 	out->upsample_shortcut_add			 = gl_upsample_shortcut_add;
+	out->gated_delta_net				 = gl_gated_delta_net;
 
 	return OK;
 }

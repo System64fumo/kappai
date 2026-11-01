@@ -91,6 +91,7 @@ typedef enum {
 	OPFAM_HC_FINAL,
 	OPFAM_KDA,
 	OPFAM_MLA_ABSORBED,
+	OPFAM_GDN,
 	OPFAM_COUNT
 } op_family;
 

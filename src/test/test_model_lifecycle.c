@@ -64,7 +64,7 @@ void run_model_lifecycle_tests(void) {
 				b->buffer_free		   = lifecycle_free_buffer;
 			}
 			model m;
-			st = model_load_parse(&m, synth_chat_model_path, b, use_mmap, "none");
+			st = model_load_parse(&m, synth_chat_model_path, b, use_mmap, "none", NULL);
 			if (st == OK) {
 				m.fuse_config = "qkv";
 				st			  = model_upload_weights(&m);

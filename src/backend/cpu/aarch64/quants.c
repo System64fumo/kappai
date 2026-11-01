@@ -17,6 +17,36 @@ _Static_assert(MR % 4 == 0, "matmul_iq4_nl_q8_qonly_f32 assumes MR is a multiple
 #define I8MM_NR 4
 #endif
 
+#define Q4_0_CACHE_MAX_BLOCKS                                                                      \
+	((int)((L1D_SIZE_BYTES * 3 / 4) / (MR * (int)(2 * sizeof(int8x16_t) + sizeof(float)))))
+
+typedef struct {
+	float  scales[4];
+	int8_t values[128];
+} q8_x4_panel;
+
+#if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
+typedef struct {
+	const q8_0_block *xq;
+	size_t			  row_stride_blocks;
+	q8_x4_panel		  panels[];
+} q8_x4_input;
+#endif
+
+#define IQ4_NL_REPACKED_GROUP_BYTES                                                                \
+	(IQ4_NL_REPACKED_ROWS * sizeof(uint16_t) + IQ4_NL_REPACKED_ROWS * 16)
+
+#define IQ3_S_REPACKED_OFF_D 0
+
+#define IQ3_S_REPACKED_OFF_SCALES (IQ3_S_REPACKED_ROWS * sizeof(uint16_t))
+
+#define IQ3_S_REPACKED_OFF_IDX (IQ3_S_REPACKED_OFF_SCALES + IQ3_S_REPACKED_ROWS * 4)
+
+#define IQ_MR 8
+#define IQ_NR 4
+
+typedef void (*iq_unpack_fn)(const void *b, int8_t *vals, float *sc);
+
 static inline int tls_realloc(void **ptr, size_t elem_size, int n_elems) {
 	void *tmp = realloc(*ptr, elem_size * (size_t)n_elems);
 	if (!tmp)
@@ -1294,9 +1324,6 @@ static inline void q4_0_unpack(const q4_0_block *b, int8x16_t *lo, int8x16_t *hi
 	*lo						= vsubq_s8(vreinterpretq_s8_u8(nib_lo), vdupq_n_s8(8));
 	*hi						= vsubq_s8(vreinterpretq_s8_u8(nib_hi), vdupq_n_s8(8));
 }
-
-#define Q4_0_CACHE_MAX_BLOCKS                                                                      \
-	((int)((L1D_SIZE_BYTES * 3 / 4) / (MR * (int)(2 * sizeof(int8x16_t) + sizeof(float)))))
 
 void matmul_q4_q8_qonly_f32(const void *w, const q8_0_block *restrict xq,
 							size_t xq_row_stride_blocks, float *restrict y, int y_row_stride, int n,
@@ -4275,30 +4302,31 @@ static void matmul_iq4_nl_q8_qonly_f32_row(const void *w, const q8_0_block *rest
 
 #define SVE_MAX_B 16
 
-#define Q4_PROC_SINGLE_8(XROW, ACC_LO, ACC_HI)                                                     \
-	do {                                                                                           \
-		const q8_0_block *xb	= &XROW[bi];                                                       \
-		const int32_t	  x_sum = sve_sum_i8(xb->qs, 32);                                          \
-		const int32_t	  off	= 8 * x_sum;                                                       \
-		const float		  d_x	= f16_to_f32_fast(xb->d);                                          \
-		int32_t			  dots_lo[4], dots_hi[4];                                                  \
-		for (int r = 0; r < 4; r++) {                                                              \
-			const q4_0_block *wb =                                                                 \
-				(const q4_0_block *)(row_base[r] + ((size_t)bi * sizeof(q4_0_block)));             \
-			dots_lo[r] = sve_q4_q8_block_dot_raw(wb, xb) - off;                                    \
-		}                                                                                          \
-		for (int r = 0; r < 4; r++) {                                                              \
-			const q4_0_block *wb =                                                                 \
-				(const q4_0_block *)(row_base[r + 4] + ((size_t)bi * sizeof(q4_0_block)));         \
-			dots_hi[r] = sve_q4_q8_block_dot_raw(wb, xb) - off;                                    \
-		}                                                                                          \
-		svfloat32_t dotf_lo = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_lo));                         \
-		svfloat32_t dotf_hi = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_hi));                         \
-		svfloat32_t dxdw_lo = svmul_f32_x(pg, dw_v, svdup_n_f32(d_x));                             \
-		svfloat32_t dxdw_hi = svmul_f32_x(pg, dw_v_hi, svdup_n_f32(d_x));                          \
-		ACC_LO				= svmla_f32_x(pg, ACC_LO, dotf_lo, dxdw_lo);                           \
-		ACC_HI				= svmla_f32_x(pg, ACC_HI, dotf_hi, dxdw_hi);                           \
-	} while (0)
+static inline void q4_proc_single_8(const q8_0_block *xrow, int bi,
+									const uint8_t *const row_base[8], svbool_t pg, svfloat32_t dw_v,
+									svfloat32_t dw_v_hi, svfloat32_t *acc_lo, svfloat32_t *acc_hi) {
+	const q8_0_block *xb	= &xrow[bi];
+	const int32_t	  x_sum = sve_sum_i8(xb->qs, 32);
+	const int32_t	  off	= 8 * x_sum;
+	const float		  d_x	= f16_to_f32_fast(xb->d);
+	int32_t			  dots_lo[4], dots_hi[4];
+	for (int r = 0; r < 4; r++) {
+		const q4_0_block *wb =
+			(const q4_0_block *)(row_base[r] + ((size_t)bi * sizeof(q4_0_block)));
+		dots_lo[r] = sve_q4_q8_block_dot_raw(wb, xb) - off;
+	}
+	for (int r = 0; r < 4; r++) {
+		const q4_0_block *wb =
+			(const q4_0_block *)(row_base[r + 4] + ((size_t)bi * sizeof(q4_0_block)));
+		dots_hi[r] = sve_q4_q8_block_dot_raw(wb, xb) - off;
+	}
+	svfloat32_t dotf_lo = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_lo));
+	svfloat32_t dotf_hi = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_hi));
+	svfloat32_t dxdw_lo = svmul_f32_x(pg, dw_v, svdup_n_f32(d_x));
+	svfloat32_t dxdw_hi = svmul_f32_x(pg, dw_v_hi, svdup_n_f32(d_x));
+	(*acc_lo)			= svmla_f32_x(pg, (*acc_lo), dotf_lo, dxdw_lo);
+	(*acc_hi)			= svmla_f32_x(pg, (*acc_hi), dotf_hi, dxdw_hi);
+}
 
 static void matmul_q4_q8_qonly_f32_sve(const void *w, const q8_0_block *restrict xq,
 									   size_t	   xq_row_stride_blocks, float *restrict y,
@@ -4343,10 +4371,10 @@ static void matmul_q4_q8_qonly_f32_sve(const void *w, const q8_0_block *restrict
 					dw_data_hi[r] = f16_to_f32_fast(wb->d);
 				}
 				svfloat32_t dw_v_hi = svld1_f32(pg, dw_data_hi);
-				Q4_PROC_SINGLE_8(xrow0, acc0_lo, acc0_hi);
-				Q4_PROC_SINGLE_8(xrow1, acc1_lo, acc1_hi);
-				Q4_PROC_SINGLE_8(xrow2, acc2_lo, acc2_hi);
-				Q4_PROC_SINGLE_8(xrow3, acc3_lo, acc3_hi);
+				q4_proc_single_8(xrow0, bi, row_base, pg, dw_v, dw_v_hi, &acc0_lo, &acc0_hi);
+				q4_proc_single_8(xrow1, bi, row_base, pg, dw_v, dw_v_hi, &acc1_lo, &acc1_hi);
+				q4_proc_single_8(xrow2, bi, row_base, pg, dw_v, dw_v_hi, &acc2_lo, &acc2_hi);
+				q4_proc_single_8(xrow3, bi, row_base, pg, dw_v, dw_v_hi, &acc3_lo, &acc3_hi);
 			}
 			svst1_f32(pg, y + ((size_t)(t + 0) * y_row_stride) + i, acc0_lo);
 			svst1_f32(pg, y + ((size_t)(t + 0) * y_row_stride) + i + 4, acc0_hi);
@@ -4409,35 +4437,34 @@ static void matmul_q4_q8_qonly_f32_sve(const void *w, const q8_0_block *restrict
 	}
 }
 
-#undef Q4_PROC_SINGLE_8
-
-#define Q8_0_PROC_SINGLE_8(XROW, ACC_LO, ACC_HI)                                                   \
-	do {                                                                                           \
-		const q8_0_block *xb  = &XROW[bi];                                                         \
-		const float		  d_x = f16_to_f32_fast(xb->d);                                            \
-		int32_t			  dots_lo[4], dots_hi[4];                                                  \
-		float			  dw_lo[4], dw_hi[4];                                                      \
-		for (int r = 0; r < 4; r++) {                                                              \
-			const q8_0_block *wb =                                                                 \
-				(const q8_0_block *)(row_base[r] + ((size_t)bi * sizeof(q8_0_block)));             \
-			dw_lo[r]   = f16_to_f32_fast(wb->d);                                                   \
-			dots_lo[r] = sve_q8_0_block_dot(wb, xb);                                               \
-		}                                                                                          \
-		for (int r = 0; r < 4; r++) {                                                              \
-			const q8_0_block *wb =                                                                 \
-				(const q8_0_block *)(row_base[r + 4] + ((size_t)bi * sizeof(q8_0_block)));         \
-			dw_hi[r]   = f16_to_f32_fast(wb->d);                                                   \
-			dots_hi[r] = sve_q8_0_block_dot(wb, xb);                                               \
-		}                                                                                          \
-		svfloat32_t dotf_lo = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_lo));                         \
-		svfloat32_t dotf_hi = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_hi));                         \
-		svfloat32_t dwv_lo	= svld1_f32(pg, dw_lo);                                                \
-		svfloat32_t dwv_hi	= svld1_f32(pg, dw_hi);                                                \
-		svfloat32_t dxdw_lo = svmul_f32_x(pg, dwv_lo, svdup_n_f32(d_x));                           \
-		svfloat32_t dxdw_hi = svmul_f32_x(pg, dwv_hi, svdup_n_f32(d_x));                           \
-		ACC_LO				= svmla_f32_x(pg, ACC_LO, dotf_lo, dxdw_lo);                           \
-		ACC_HI				= svmla_f32_x(pg, ACC_HI, dotf_hi, dxdw_hi);                           \
-	} while (0)
+static inline void q8_0_proc_single_8(const q8_0_block *xrow, int bi,
+									  const uint8_t *const row_base[8], svbool_t pg,
+									  svfloat32_t *acc_lo, svfloat32_t *acc_hi) {
+	const q8_0_block *xb  = &xrow[bi];
+	const float		  d_x = f16_to_f32_fast(xb->d);
+	int32_t			  dots_lo[4], dots_hi[4];
+	float			  dw_lo[4], dw_hi[4];
+	for (int r = 0; r < 4; r++) {
+		const q8_0_block *wb =
+			(const q8_0_block *)(row_base[r] + ((size_t)bi * sizeof(q8_0_block)));
+		dw_lo[r]   = f16_to_f32_fast(wb->d);
+		dots_lo[r] = sve_q8_0_block_dot(wb, xb);
+	}
+	for (int r = 0; r < 4; r++) {
+		const q8_0_block *wb =
+			(const q8_0_block *)(row_base[r + 4] + ((size_t)bi * sizeof(q8_0_block)));
+		dw_hi[r]   = f16_to_f32_fast(wb->d);
+		dots_hi[r] = sve_q8_0_block_dot(wb, xb);
+	}
+	svfloat32_t dotf_lo = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_lo));
+	svfloat32_t dotf_hi = svcvt_f32_s32_x(pg, svld1_s32(pg, dots_hi));
+	svfloat32_t dwv_lo	= svld1_f32(pg, dw_lo);
+	svfloat32_t dwv_hi	= svld1_f32(pg, dw_hi);
+	svfloat32_t dxdw_lo = svmul_f32_x(pg, dwv_lo, svdup_n_f32(d_x));
+	svfloat32_t dxdw_hi = svmul_f32_x(pg, dwv_hi, svdup_n_f32(d_x));
+	(*acc_lo)			= svmla_f32_x(pg, (*acc_lo), dotf_lo, dxdw_lo);
+	(*acc_hi)			= svmla_f32_x(pg, (*acc_hi), dotf_hi, dxdw_hi);
+}
 
 static void matmul_q8_0_q8_qonly_f32_sve(const void *w, const q8_0_block *restrict xq,
 										 size_t		 xq_row_stride_blocks, float *restrict y,
@@ -4468,10 +4495,10 @@ static void matmul_q8_0_q8_qonly_f32_sve(const void *w, const q8_0_block *restri
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				PREFETCH(row_base[0] + ((size_t)(bi + 1) * sizeof(q8_0_block)));
 				PREFETCH(row_base[7] + ((size_t)(bi + 1) * sizeof(q8_0_block)));
-				Q8_0_PROC_SINGLE_8(xrow0, acc0_lo, acc0_hi);
-				Q8_0_PROC_SINGLE_8(xrow1, acc1_lo, acc1_hi);
-				Q8_0_PROC_SINGLE_8(xrow2, acc2_lo, acc2_hi);
-				Q8_0_PROC_SINGLE_8(xrow3, acc3_lo, acc3_hi);
+				q8_0_proc_single_8(xrow0, bi, row_base, pg, &acc0_lo, &acc0_hi);
+				q8_0_proc_single_8(xrow1, bi, row_base, pg, &acc1_lo, &acc1_hi);
+				q8_0_proc_single_8(xrow2, bi, row_base, pg, &acc2_lo, &acc2_hi);
+				q8_0_proc_single_8(xrow3, bi, row_base, pg, &acc3_lo, &acc3_hi);
 			}
 			svst1_f32(pg, y + ((size_t)(t + 0) * y_row_stride) + i, acc0_lo);
 			svst1_f32(pg, y + ((size_t)(t + 0) * y_row_stride) + i + 4, acc0_hi);
@@ -4487,7 +4514,7 @@ static void matmul_q8_0_q8_qonly_f32_sve(const void *w, const q8_0_block *restri
 			svfloat32_t acc_lo = svdup_n_f32(0.0f), acc_hi = svdup_n_f32(0.0f);
 			for (int bi = 0; bi < blocks_per_row; bi++) {
 				const q8_0_block *xrow_single = xrow;
-				Q8_0_PROC_SINGLE_8(xrow_single, acc_lo, acc_hi);
+				q8_0_proc_single_8(xrow_single, bi, row_base, pg, &acc_lo, &acc_hi);
 			}
 			svst1_f32(pg, y + ((size_t)t * y_row_stride) + i, acc_lo);
 			svst1_f32(pg, y + ((size_t)t * y_row_stride) + i + 4, acc_hi);
@@ -4507,8 +4534,6 @@ static void matmul_q8_0_q8_qonly_f32_sve(const void *w, const q8_0_block *restri
 		}
 	}
 }
-
-#undef Q8_0_PROC_SINGLE_8
 
 #endif
 
@@ -5975,11 +6000,6 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 
 #define NR 4
 
-typedef struct {
-	float  scales[4];
-	int8_t values[128];
-} q8_x4_panel;
-
 #if defined(__ARM_FEATURE_DOTPROD)
 #if !defined(__ARM_FEATURE_MATMUL_INT8)
 static inline void q8_transpose_x4(const int8x16_t rows[4], int8x16_t columns[4]) {
@@ -6170,12 +6190,6 @@ void matmul_q8_0_repacked_q8_qonly_f32(const void *w, const q8_0_block *restrict
 }
 
 #if defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_MATMUL_INT8)
-typedef struct {
-	const q8_0_block *xq;
-	size_t			  row_stride_blocks;
-	q8_x4_panel		  panels[];
-} q8_x4_input;
-
 static status_code q8_prepare_x4(const void *xq, size_t stride, int k, int m, void **out,
 								 size_t *capacity) {
 	if (m < NR || k < 32 || k % 32)
@@ -6203,9 +6217,6 @@ const cpu_matmul_packing cpu_q8_x4_packing = {
 #endif
 
 #undef NR
-
-#define IQ4_NL_REPACKED_GROUP_BYTES                                                                \
-	(IQ4_NL_REPACKED_ROWS * sizeof(uint16_t) + IQ4_NL_REPACKED_ROWS * 16)
 
 static inline void iq4_nl_repacked_block_accum(const uint8_t *blk, const uint8x16_t kvalues_u,
 											   const uint8x16_t lo_mask, float d_xq,
@@ -6494,12 +6505,6 @@ static inline void iq3_s_repacked_unpack_group(const uint8_t *idx_ptr, uint8x16_
 	*out0 = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, lo));
 	*out1 = vreinterpretq_s8_u8(vqtbl1q_u8(tbl, hi));
 }
-
-#define IQ3_S_REPACKED_OFF_D 0
-
-#define IQ3_S_REPACKED_OFF_SCALES (IQ3_S_REPACKED_ROWS * sizeof(uint16_t))
-
-#define IQ3_S_REPACKED_OFF_IDX (IQ3_S_REPACKED_OFF_SCALES + IQ3_S_REPACKED_ROWS * 4)
 
 static void matmul_iq3_s_repacked_q8_k_qonly_f32_row(const void *w, const q8_k_block *restrict xq,
 													 float *restrict y, int n, int k) {
@@ -9524,49 +9529,88 @@ static inline void iq4_xs_unpack(const iq4_xs_block *b, int8_t *vals, float *sca
 	}
 }
 
-#define DEFINE_IQ_Q8K_KERNEL(name, block_t, unpack_fn, nscales)                                    \
-	static void matmul_##name##_qonly_row(const void *w, const q8_k_block *restrict xq,            \
-										  float *restrict y, int n, int k) {                       \
-		int			   bpr = k / 256;                                                              \
-		size_t		   rs  = (size_t)bpr * sizeof(block_t);                                        \
-		const block_t *wb  = w;                                                                    \
-		int8_t		   vals[256];                                                                  \
-		float		   sc[nscales];                                                                \
-		for (int i = 0; i < n; i++) {                                                              \
-			const block_t *row	= (const block_t *)((const uint8_t *)wb + (size_t)i * rs);         \
-			float		   sumf = 0.0f;                                                            \
-			for (int bi = 0; bi < bpr; bi++) {                                                     \
-				unpack_fn(&row[bi], vals, sc);                                                     \
-				const int8_t *q8   = xq[bi].qs;                                                    \
-				float		  d	   = xq[bi].d;                                                     \
-				float		  sacc = 0.0f;                                                         \
-				if ((nscales) == 16) {                                                             \
-					for (int gg = 0; gg < 8; gg++) {                                               \
-						int32_t s0 = neon_dot16(vals + gg * 32, q8 + gg * 32);                     \
-						int32_t s1 = neon_dot16(vals + gg * 32 + 16, q8 + gg * 32 + 16);           \
-						sacc += sc[2 * gg] * (float)s0 + sc[2 * gg + 1] * (float)s1;               \
-					}                                                                              \
-				} else {                                                                           \
-					for (int gg = 0; gg < 8; gg++)                                                 \
-						sacc += sc[gg] * (float)neon_dot32(vals + gg * 32, q8 + gg * 32);          \
-				}                                                                                  \
-				sumf += d * sacc;                                                                  \
-			}                                                                                      \
-			y[i] = sumf;                                                                           \
-		}                                                                                          \
-	}                                                                                              \
-	void matmul_##name##_f32(const void *w, const float *restrict x, float *restrict y, int n,     \
-							 int k, quant_scratch *qs) {                                           \
-		int bpr = k / 256;                                                                         \
-		quant_scratch_ensure(qs, (size_t)bpr * sizeof(q8_k_block));                                \
-		quantize_q8_k(x, (q8_k_block *)qs->q8_buf, k);                                             \
-		matmul_##name##_qonly_row(w, (const q8_k_block *)qs->q8_buf, y, n, k);                     \
+static void iq_q8k_matmul_qonly_row(const void *w, const q8_k_block *restrict xq, float *restrict y,
+									int n, int k, size_t block_size, int nscales,
+									void (*unpack_fn)(const void *, int8_t *, float *)) {
+	int			   bpr = k / 256;
+	size_t		   rs  = (size_t)bpr * block_size;
+	const uint8_t *wb  = w;
+	int8_t		   vals[256];
+	float		   sc[16];
+	for (int i = 0; i < n; i++) {
+		const uint8_t *row	= wb + (size_t)i * rs;
+		float		   sumf = 0.0f;
+		for (int bi = 0; bi < bpr; bi++) {
+			unpack_fn(row + (size_t)bi * block_size, vals, sc);
+			const int8_t *q8   = xq[bi].qs;
+			float		  d	   = xq[bi].d;
+			float		  sacc = 0.0f;
+			if (nscales == 16) {
+				for (int gg = 0; gg < 8; gg++) {
+					int32_t s0 = neon_dot16(vals + gg * 32, q8 + gg * 32);
+					int32_t s1 = neon_dot16(vals + gg * 32 + 16, q8 + gg * 32 + 16);
+					sacc += sc[2 * gg] * (float)s0 + sc[2 * gg + 1] * (float)s1;
+				}
+			} else {
+				for (int gg = 0; gg < 8; gg++)
+					sacc += sc[gg] * (float)neon_dot32(vals + gg * 32, q8 + gg * 32);
+			}
+			sumf += d * sacc;
+		}
+		y[i] = sumf;
 	}
+}
+static void iq2_s_unpack_ad(const void *b, int8_t *vals, float *sc) {
+	iq2_s_unpack((const iq2_s_block *)b, vals, sc);
+}
 
-DEFINE_IQ_Q8K_KERNEL(iq2_s_q8_k, iq2_s_block, iq2_s_unpack, 16)
-DEFINE_IQ_Q8K_KERNEL(iq2_xxs_q8_k, iq2_xxs_block, iq2_xxs_unpack, 8)
-DEFINE_IQ_Q8K_KERNEL(iq3_xxs_q8_k, iq3_xxs_block, iq3_xxs_unpack, 8)
-DEFINE_IQ_Q8K_KERNEL(iq4_xs_q8_k, iq4_xs_block, iq4_xs_unpack, 8)
+void matmul_iq2_s_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
+						   quant_scratch *qs) {
+	int bpr = k / 256;
+	quant_scratch_ensure(qs, (size_t)bpr * sizeof(q8_k_block));
+	quantize_q8_k(x, (q8_k_block *)qs->q8_buf, k);
+	iq_q8k_matmul_qonly_row(w, (const q8_k_block *)qs->q8_buf, y, n, k, sizeof(iq2_s_block), 16,
+							iq2_s_unpack_ad);
+}
+
+static void iq2_xxs_unpack_ad(const void *b, int8_t *vals, float *sc) {
+	iq2_xxs_unpack((const iq2_xxs_block *)b, vals, sc);
+}
+
+void matmul_iq2_xxs_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n,
+							 int k, quant_scratch *qs) {
+	int bpr = k / 256;
+	quant_scratch_ensure(qs, (size_t)bpr * sizeof(q8_k_block));
+	quantize_q8_k(x, (q8_k_block *)qs->q8_buf, k);
+	iq_q8k_matmul_qonly_row(w, (const q8_k_block *)qs->q8_buf, y, n, k, sizeof(iq2_xxs_block), 8,
+							iq2_xxs_unpack_ad);
+}
+
+static void iq3_xxs_unpack_ad(const void *b, int8_t *vals, float *sc) {
+	iq3_xxs_unpack((const iq3_xxs_block *)b, vals, sc);
+}
+
+void matmul_iq3_xxs_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n,
+							 int k, quant_scratch *qs) {
+	int bpr = k / 256;
+	quant_scratch_ensure(qs, (size_t)bpr * sizeof(q8_k_block));
+	quantize_q8_k(x, (q8_k_block *)qs->q8_buf, k);
+	iq_q8k_matmul_qonly_row(w, (const q8_k_block *)qs->q8_buf, y, n, k, sizeof(iq3_xxs_block), 8,
+							iq3_xxs_unpack_ad);
+}
+
+static void iq4_xs_unpack_ad(const void *b, int8_t *vals, float *sc) {
+	iq4_xs_unpack((const iq4_xs_block *)b, vals, sc);
+}
+
+void matmul_iq4_xs_q8_k_f32(const void *w, const float *restrict x, float *restrict y, int n, int k,
+							quant_scratch *qs) {
+	int bpr = k / 256;
+	quant_scratch_ensure(qs, (size_t)bpr * sizeof(q8_k_block));
+	quantize_q8_k(x, (q8_k_block *)qs->q8_buf, k);
+	iq_q8k_matmul_qonly_row(w, (const q8_k_block *)qs->q8_buf, y, n, k, sizeof(iq4_xs_block), 8,
+							iq4_xs_unpack_ad);
+}
 
 void dequant_iq2_s_row(const void *blocks, size_t n_blocks, float *dst) {
 	const iq2_s_block *b = blocks;
@@ -9707,11 +9751,6 @@ static void iq3_xxs_row_fused(const uint8_t *w, size_t wb_row, int bpr, const q8
 							  float *y, int n);
 static void iq4_xs_row_fused(const uint8_t *w, size_t wb_row, int bpr, const q8_k_block *xq,
 							 float *y, int n);
-
-#define IQ_MR 8
-#define IQ_NR 4
-
-typedef void (*iq_unpack_fn)(const void *b, int8_t *vals, float *sc);
 
 static void iq_qonly_rows(const void *w, size_t wb_row, int bpr, iq_unpack_fn unpack, int nsc,
 						  size_t wsz, const q8_k_block *restrict xq, float *restrict y, int n) {

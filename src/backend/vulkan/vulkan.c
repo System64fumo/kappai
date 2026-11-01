@@ -12,18 +12,12 @@
 #define VK_CHECK(expr)                                                                             \
 	do {                                                                                           \
 		VkResult _r = (expr);                                                                      \
-		if (_r != VK_SUCCESS) {                                                                    \
-			ERROR("vk: %s returned %d at %s:%d", #expr, (int)_r, __FILE__, __LINE__);              \
-			if (p && _r == VK_ERROR_DEVICE_LOST)                                                   \
-				p->device_lost = 1;                                                                \
-			if (p && p->debug.abort_on_error)                                                      \
-				abort();                                                                           \
-			return ERR_INTERNAL;                                                                   \
-		}                                                                                          \
+		if (_r != VK_SUCCESS)                                                                      \
+			return vk_check_fail(p, _r, #expr, __FILE__, __LINE__);                                \
 	} while (0)
 
 #define VK_DESC_CACHE_CAP 256
-#define VK_MAX_BINDINGS 8
+#define VK_MAX_BINDINGS 16
 #define VK_RING_DEPTH 4
 #define VK_PROF_SLOT_CAP 4096
 #define VK_QMM_MIN_M 16
@@ -38,6 +32,11 @@
 #define VK_ATTN_DEC_MAX_SPLITS 64
 #define VK_ATTN_DEC_MIN_CHUNK 16
 #define VK_PROF_NAMES 128
+#define VK_DEAD_BUF_CAP 64
+#define VK_DIRTY_MAX 128
+#define VK_DIRTY_TABLE_SIZE 256
+#define VK_MOE_META_SLOTS 2
+#define VK_SCRATCH_POOL_CAP 32
 
 typedef enum {
 	VK_NN_LAYERNORM_MODULATE,
@@ -178,27 +177,77 @@ typedef struct {
 	VkDebugUtilsMessengerEXT debug_messenger;
 	VkPhysicalDevice		 phys;
 	VkDevice				 dev;
-	uint32_t				 queue_family;
 	VkQueue					 queue;
-	VkCommandPool			 cmd_pools[VK_RING_DEPTH];
 	VkCommandBuffer			 cmd;
 	VkDescriptorPool		 desc_pool;
 	VkFence					 fence;
-
-	int			 timeline_supported;
-	VkSemaphore	 timeline;
-	uint64_t	 timeline_value;
-	uint64_t	 timeline_completed;
-	vk_ring_slot ring[VK_RING_DEPTH];
-	int			 ring_cur;
-
-	VkPhysicalDeviceMemoryProperties mem_props;
-	vk_suballoc_block				*sub_blocks;
-	int								 sub_block_count;
-
-	int	   has_memory_budget_ext;
-	size_t device_local_allocated;
-
+	VkSemaphore				 timeline;
+	uint64_t				 timeline_value;
+	uint64_t				 timeline_completed;
+	vk_suballoc_block		*sub_blocks;
+	size_t					 device_local_allocated;
+	uint64_t				 desc_tick;
+	uint64_t				 total_desc_allocs;
+	VkPipeline				 last_pipeline;
+	const char				*last_pipeline_name;
+	VkDescriptorSet			 last_desc_set;
+	uint64_t				 diag_desc_allocs;
+	uint64_t				 diag_buf_allocs;
+	uint64_t				 stream_seq;
+	size_t					 attn_part_cap;
+	const float				*rope_cos_base_alt;
+	const float				*rope_sin_base_alt;
+	const float				*rope_cos_base;
+	const float				*rope_sin_base;
+	const float				*rope_ff_base;
+	buffer					*rope_cos_buf_active;
+	buffer					*rope_sin_buf_active;
+	size_t					 staging_cap;
+	size_t					 wbatch_off;
+	uint64_t				 staging_pending_value;
+	uint64_t				 last_signal_value;
+	uint64_t				 pending_free_after;
+	size_t					 argmax_partial_cap;
+	size_t					 moe_batch_arena_cap;
+	size_t					 moe_meta_cap;
+	void				   **kv_handles;
+	size_t					 xq_cap[2];
+	uint64_t				 tok_signal[BACKEND_TOKEN_REGS];
+	uint64_t				 moe_meta_signal[VK_MOE_META_SLOTS];
+	VkCommandPool			 cmd_pools[VK_RING_DEPTH];
+	struct {
+		const vk_buf *buf;
+		VkDeviceSize  off;
+		int			  k, m;
+		uint64_t	  seq;
+	} xq_fused;
+	buffer attn_part_buf;
+	buffer rope_cos_buf;
+	buffer rope_sin_buf;
+	buffer rope_ff_buf;
+	buffer rope_cos_buf_alt;
+	buffer rope_sin_buf_alt;
+	buffer attn_scores_buf;
+	buffer ffn_act_buf;
+	vk_buf staging_buf;
+	vk_buf tok_reg_buf;
+	vk_buf tok_rb_buf;
+	vk_buf argmax_partial_buf;
+	vk_buf moe_arena;
+	vk_buf moe_batch_arena;
+	vk_buf dummy_buf;
+	vk_buf iq3s_grid_buf;
+	vk_buf iqx_grid_buf;
+	struct {
+		uint64_t dispatches;
+		uint64_t barriers;
+		uint64_t submits;
+		uint64_t waits;
+		uint64_t uploads;
+		uint64_t downloads;
+		uint64_t wait_us;
+	} stats;
+	buffer xq_buf[2];
 	struct {
 		uint32_t	 max_shared_memory;
 		uint32_t	 max_workgroup_size[3];
@@ -217,38 +266,44 @@ typedef struct {
 		int			 supports_16bit_storage;
 		uint32_t	 max_workgroup_count[2];
 	} caps;
-
-	int		 pending_dispatches;
-	int		 cmd_recording;
-	uint64_t desc_tick;
-	uint64_t total_desc_allocs;
-
-	VkPipeline		last_pipeline;
-	const char	   *last_pipeline_name;
-	VkDescriptorSet last_desc_set;
-	int				last_desc_pipeline_match;
-
-#define VK_DEAD_BUF_CAP 64
-	VkBuffer dead_bufs[VK_DEAD_BUF_CAP];
-	int		 dead_buf_count;
-
+	vk_buf							 moe_meta_slots[VK_MOE_META_SLOTS];
+	vk_ring_slot					 ring[VK_RING_DEPTH];
+	vk_buf							*scratch_pool[VK_SCRATCH_POOL_CAP];
+	size_t							 scratch_pool_sizes[VK_SCRATCH_POOL_CAP];
+	VkBuffer						 dead_bufs[VK_DEAD_BUF_CAP];
+	VkBuffer						 read_set[VK_READ_SET_CAP];
+	VkPhysicalDeviceMemoryProperties mem_props;
+	VkBuffer						 dirty_table[VK_DIRTY_TABLE_SIZE];
+	struct {
+		int			 enabled;
+		VkQueryPool	 pool;
+		double		 ns_per_tick;
+		uint64_t	 ts_mask;
+		const char **rec;
+		int			 n_rec[VK_RING_DEPTH];
+		int			 reset_done[VK_RING_DEPTH];
+		const char	*names[VK_PROF_NAMES];
+		uint64_t	 ns[VK_PROF_NAMES];
+		uint64_t	 calls[VK_PROF_NAMES];
+		int			 n_names;
+	} prof;
 	VkDescriptorSet pending_free_sets[VK_DESC_CACHE_CAP * 4];
-	int				pending_free_count;
-	uint64_t		diag_desc_allocs;
-	uint64_t		diag_buf_allocs;
-
-#define VK_DIRTY_MAX 128
-#define VK_DIRTY_TABLE_SIZE 256
-	VkBuffer dirty_table[VK_DIRTY_TABLE_SIZE];
-	int		 dirty_count;
-
-	int matmul_wg_size;
-	int matmul_rows_per_thread;
-	int matmul_lanes_per_row;
-	int matmul_tile_k;
-	int matmul_m_per_wg;
-
-	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
+	vk_pipeline_set p_hc_init;
+	vk_pipeline_set p_hc_final;
+	vk_pipeline_set p_hc_post;
+	vk_pipeline_set p_hc_pre_coef;
+	vk_pipeline_set p_hc_pre_mix;
+	vk_pipeline_set p_kda_conv;
+	vk_pipeline_set p_kda_l2norm;
+	vk_pipeline_set p_kda_gate;
+	vk_pipeline_set p_kda_delta;
+	vk_pipeline_set p_kda_out;
+	vk_pipeline_set p_mla_absorb_q;
+	vk_pipeline_set p_mla_absorb_attn;
+	vk_pipeline_set p_mla_kv_put;
+	vk_pipeline_set p_mla_attention;
+	vk_pipeline_set p_gdn_conv;
+	vk_pipeline_set p_gdn_heads;
 	vk_pipeline_set p_kv_put;
 	vk_pipeline_set p_kv_shift_gather;
 	vk_pipeline_set p_embd_lookup;
@@ -256,7 +311,6 @@ typedef struct {
 	vk_pipeline_set p_argmax_reduce;
 	vk_pipeline_set p_moe_gather;
 	vk_pipeline_set p_moe_combine;
-
 	vk_pipeline_set p_matmul_q4_0_batch;
 	vk_pipeline_set p_matmul_q4_0_res_batch;
 	vk_pipeline_set p_matmul_q4_0_dual_batch;
@@ -300,24 +354,8 @@ typedef struct {
 	vk_pipeline_set p_matmul_bf16_wide_batch;
 	vk_pipeline_set p_matmul_bf16_wide_res_batch;
 	vk_pipeline_set p_matmul_iq4_nl_batch;
-
-	int				qcore_ok;
-	vk_pipeline_set p_q8_quant[2];
-	vk_pipeline_set p_qmv[VQ_COUNT][2];
-	vk_pipeline_set p_qmm[VQ_MM_COUNT];
-	buffer			xq_buf[2];
-	struct {
-		const vk_buf *buf;
-		VkDeviceSize  off;
-		int			  k, m;
-		uint64_t	  seq;
-	} xq_fused;
-	uint64_t		stream_seq;
-	size_t			xq_cap[2];
 	vk_pipeline_set p_attn_decode;
 	vk_pipeline_set p_attn_merge;
-	buffer			attn_part_buf;
-	size_t			attn_part_cap;
 	vk_pipeline_set p_rmsnorm_batch;
 	vk_pipeline_set p_rmsnorm_sg_batch;
 	vk_pipeline_set p_rmsnorm_noweight_batch;
@@ -337,122 +375,59 @@ typedef struct {
 	vk_pipeline_set p_ffn_activate_batch;
 	vk_pipeline_set p_ffn_activate_fused_batch;
 	vk_pipeline_set p_elementwise_batch;
+	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_nn[VK_NN_COUNT];
-
-	buffer rope_cos_buf;
-	buffer rope_sin_buf;
-	buffer rope_ff_buf;
-	int	   rope_buf_cap;
-	int	   rope_ff_cap;
-
-	buffer		 rope_cos_buf_alt;
-	buffer		 rope_sin_buf_alt;
-	int			 rope_buf_cap_alt;
-	int			 rope_half_stored_alt;
-	const float *rope_cos_base_alt;
-	const float *rope_sin_base_alt;
-
-	int n_ctx_stored;
-	int kv_head_dim_max;
-
-	const float *rope_cos_base;
-	const float *rope_sin_base;
-	const float *rope_ff_base;
-	int			 rope_ff_head_dim;
-	int			 rope_ff_n_ctx;
-	float		 rope_ff_theta;
-	int			 rope_half_stored;
-
-	buffer *rope_cos_buf_active;
-	buffer *rope_sin_buf_active;
-
-	buffer attn_scores_buf;
-	int	   attn_scores_cap;
-
-	buffer ffn_act_buf;
-	int	   ffn_act_cap;
-
-	vk_buf	 staging_buf;
-	size_t	 staging_cap;
-	size_t	 wbatch_off;
-	int		 wbatch_count;
-	uint64_t staging_pending_value;
-	int		 staging_read_recorded;
-	uint64_t last_signal_value;
-	uint64_t pending_free_after;
-
-	vk_buf	 tok_reg_buf;
-	vk_buf	 tok_rb_buf;
-	uint64_t tok_signal[BACKEND_TOKEN_REGS];
-	int		 tok_pipe;
-	size_t	 argmax_partial_cap;
-	vk_buf	 argmax_partial_buf;
-
-	vk_buf moe_arena;
-	int	   moe_arena_inter;
-	int	   moe_arena_dim;
-	vk_buf moe_batch_arena;
-	size_t moe_batch_arena_cap;
-#define VK_MOE_META_SLOTS 2
-	vk_buf	 moe_meta_slots[VK_MOE_META_SLOTS];
-	size_t	 moe_meta_cap;
-	uint64_t moe_meta_signal[VK_MOE_META_SLOTS];
-	int		 moe_meta_cur;
-
-	vk_buf dummy_buf;
-
-	vk_buf iq3s_grid_buf;
-	vk_buf iqx_grid_buf;
-
-	void **kv_handles;
-	int	   kv_handle_count;
-	int	   kv_handle_cap;
-
-	int device_lost;
-
-	int device_lost_warned;
-
-#define VK_SCRATCH_POOL_CAP 32
-	vk_buf *scratch_pool[VK_SCRATCH_POOL_CAP];
-	size_t	scratch_pool_sizes[VK_SCRATCH_POOL_CAP];
-	int		scratch_pool_count;
-
-	int batch_active;
-
-	VkBuffer read_set[VK_READ_SET_CAP];
-	int		 n_read;
-	int		 read_overflow;
-
-	struct {
-		uint64_t dispatches;
-		uint64_t barriers;
-		uint64_t submits;
-		uint64_t waits;
-		uint64_t uploads;
-		uint64_t downloads;
-		uint64_t wait_us;
-	} stats;
-
-	struct {
-		int			 enabled;
-		VkQueryPool	 pool;
-		double		 ns_per_tick;
-		uint64_t	 ts_mask;
-		const char **rec;
-		int			 n_rec[VK_RING_DEPTH];
-		int			 reset_done[VK_RING_DEPTH];
-		const char	*names[VK_PROF_NAMES];
-		uint64_t	 ns[VK_PROF_NAMES];
-		uint64_t	 calls[VK_PROF_NAMES];
-		int			 n_names;
-	} prof;
-
+	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	vk_pipeline_set p_qmv[VQ_COUNT][2];
+	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
+	uint32_t		queue_family;
+	int				timeline_supported;
+	int				ring_cur;
+	int				sub_block_count;
+	int				has_memory_budget_ext;
+	int				pending_dispatches;
+	int				cmd_recording;
+	int				last_desc_pipeline_match;
+	int				dead_buf_count;
+	int				pending_free_count;
+	int				dirty_count;
+	int				matmul_wg_size;
+	int				matmul_rows_per_thread;
+	int				matmul_lanes_per_row;
+	int				matmul_tile_k;
+	int				matmul_m_per_wg;
+	int				qcore_ok;
+	int				rope_buf_cap;
+	int				rope_ff_cap;
+	int				rope_buf_cap_alt;
+	int				rope_half_stored_alt;
+	int				n_ctx_stored;
+	int				kv_head_dim_max;
+	int				rope_ff_head_dim;
+	int				rope_ff_n_ctx;
+	float			rope_ff_theta;
+	int				rope_half_stored;
+	int				attn_scores_cap;
+	int				ffn_act_cap;
+	int				wbatch_count;
+	int				staging_read_recorded;
+	int				tok_pipe;
+	int				moe_arena_inter;
+	int				moe_arena_dim;
+	int				moe_meta_cur;
+	int				kv_handle_count;
+	int				kv_handle_cap;
+	int				device_lost;
+	int				device_lost_warned;
+	int				scratch_pool_count;
+	int				batch_active;
+	int				n_read;
+	int				read_overflow;
 	struct {
 		int diag;
 		int abort_on_error;
 		int validate;
 	} debug;
-
 } vk_priv;
 
 static inline uint32_t vk_f32_to_bits(float f) {
@@ -505,6 +480,33 @@ static void		   vk_timeline_poll(vk_priv *p);
 static int		   vk_timeline_done(vk_priv *p, uint64_t value);
 
 static int g_probed = -1;
+
+#define VK_SUBALLOC_BLOCK_SIZE (64ull << 20)
+#define VK_SUBALLOC_MAX_REQ (4ull << 20)
+#define VK_SUBALLOC_MAX_BLOCKS 8
+
+#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
+
+#define VQ_MV(t, label)                                                                            \
+	{                                                                                              \
+		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
+			"q_matvec_" label, "q_matvec_m4_" label                                                \
+		}                                                                                          \
+	}
+#define VQ_MM(t, label) {shader_##t##_spv, sizeof(shader_##t##_spv), "q_matmul_" label}
+
+static const uint32_t VQ_MV_SPEC[2][2] = {{1, 4}, {VK_QMV_COLS, 2}};
+
+#define VK_WEIGHT_TAIL_PAD 32
+
+#define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
+#define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
+
+#define FLASH_MAX_DPL 16
+#define FLASH_MAX_SPLIT 64
+#define FLASH_K_PAD 4
+
+#define VK_DENSE_ATTN_MAX_HEAD_DIM 2048
 
 static const char *vk_result_str(int r) {
 	switch (r) {
@@ -678,6 +680,16 @@ static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, si
 	return ERR_UNSUPPORTED;
 }
 
+static status_code vk_check_fail(vk_priv *p, VkResult r, const char *expr, const char *file,
+								 int line) {
+	ERROR("vk: %s returned %d at %s:%d", expr, (int)r, file, line);
+	if (p && r == VK_ERROR_DEVICE_LOST)
+		p->device_lost = 1;
+	if (p && p->debug.abort_on_error)
+		abort();
+	return ERR_INTERNAL;
+}
+
 static uint32_t find_memory_type(vk_priv *p, uint32_t type_bits, VkMemoryPropertyFlags want) {
 	for (uint32_t i = 0; i < p->mem_props.memoryTypeCount; i++) {
 		if (!(type_bits & (1u << i)))
@@ -687,10 +699,6 @@ static uint32_t find_memory_type(vk_priv *p, uint32_t type_bits, VkMemoryPropert
 	}
 	return UINT32_MAX;
 }
-
-#define VK_SUBALLOC_BLOCK_SIZE (64ull << 20)
-#define VK_SUBALLOC_MAX_REQ (4ull << 20)
-#define VK_SUBALLOC_MAX_BLOCKS 8
 
 static void vk_suballoc_release(vk_priv *p, vk_buf *b) {
 	(void)p;
@@ -703,7 +711,8 @@ static void vk_suballoc_release(vk_priv *p, vk_buf *b) {
 		else
 			break;
 	}
-	ARR_RESERVE(blk->ranges, blk->n_ranges, blk->cap_ranges);
+	arr_reserve((void **)&(blk->ranges), (blk->n_ranges), &(blk->cap_ranges),
+				sizeof(*(blk->ranges)));
 	memmove(blk->ranges + pos + 1, blk->ranges + pos,
 			(size_t)(blk->n_ranges - pos) * sizeof(*blk->ranges));
 	blk->ranges[pos].off  = lo;
@@ -798,6 +807,18 @@ static status_code vk_suballoc_place(vk_priv *p, VkBuffer buf, const VkMemoryReq
 		return OK;
 	}
 	return ERR_OUT_OF_MEMORY;
+}
+
+static VkMemoryPropertyFlags vk_host_visible_flags(const vk_priv *p) {
+	VkMemoryPropertyFlags flags =
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (p->caps.unified_memory)
+		flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	return flags;
+}
+
+static VkMemoryPropertyFlags vk_resident_flags(const vk_priv *p) {
+	return p->caps.unified_memory ? vk_host_visible_flags(p) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 }
 
 static status_code vk_alloc_buffer(vk_priv *p, size_t size, VkBufferUsageFlags usage,
@@ -927,8 +948,6 @@ static void vk_flush_pending_desc_frees(vk_priv *p) {
 						 p->pending_free_sets);
 	p->pending_free_count = 0;
 }
-
-#define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT)
 
 static vk_pipeline_set *vk_qcore_pipe(vk_priv *p, int i) {
 	if (i < 2)
@@ -1503,7 +1522,7 @@ static status_code vk_create_pipeline_spec(vk_priv *p, const uint32_t *spv, size
 	VkShaderModule mod;
 	VK_CHECK(vkCreateShaderModule(p->dev, &smci, NULL, &mod));
 
-	VkDescriptorSetLayoutBinding bindings[8];
+	VkDescriptorSetLayoutBinding bindings[VK_MAX_BINDINGS];
 	for (int i = 0; i < n_bindings; i++) {
 		bindings[i] = (VkDescriptorSetLayoutBinding){
 			.binding		 = (uint32_t)i,
@@ -1583,7 +1602,7 @@ static status_code vk_create_pipeline_spec(vk_priv *p, const uint32_t *spv, size
 	if (pr != VK_SUCCESS) {
 		ERROR("vk: vkCreateComputePipelines failed (result=%d).", (int)pr);
 		ERROR("vk:       Device maxComputeSharedMemorySize=%u bytes.", p->caps.max_shared_memory);
-		ERROR("vk:	 If the shader uses > %u bytes of shared memory, reduce the "
+		ERROR("vk:       If the shader uses > %u bytes of shared memory, reduce the "
 			  "tile size.",
 			  p->caps.max_shared_memory);
 		vkDestroyPipelineLayout(p->dev, out->layout, NULL);
@@ -2004,16 +2023,6 @@ static VkBool32 vk_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT	  sever
 	return VK_FALSE;
 }
 
-#define VQ_MV(t, label)                                                                            \
-	{                                                                                              \
-		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
-			"q_matvec_" label, "q_matvec_m4_" label                                                \
-		}                                                                                          \
-	}
-#define VQ_MM(t, label) {shader_##t##_spv, sizeof(shader_##t##_spv), "q_matmul_" label}
-
-static const uint32_t VQ_MV_SPEC[2][2] = {{1, 4}, {VK_QMV_COLS, 2}};
-
 static void vk_qcore_init(vk_priv *p) {
 	static const struct {
 		const uint32_t *spv;
@@ -2319,7 +2328,6 @@ static status_code vk_init(backend *self, int device_index) {
 	};
 	if (vkCreateDevice(p->phys, &dci, NULL, &p->dev) != VK_SUCCESS) {
 		timeline_available			= 0;
-		int8_available				= 0;
 		int16_available				= 0;
 		dot_product_available		= 0;
 		has_memory_budget_ext		= 0;
@@ -2545,6 +2553,80 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_kv_put.name = "kv_put";
+
+	s = vk_create_pipeline(p, shader_hc_init_spv, shader_hc_init_spv_len, 2, 8, &p->p_hc_init);
+	if (s != OK)
+		return s;
+	p->p_hc_init.name = "hc_init";
+	s = vk_create_pipeline(p, shader_hc_final_spv, shader_hc_final_spv_len, 2, 8, &p->p_hc_final);
+	if (s != OK)
+		return s;
+	p->p_hc_final.name = "hc_final";
+	s = vk_create_pipeline(p, shader_hc_post_spv, shader_hc_post_spv_len, 3, 8, &p->p_hc_post);
+	if (s != OK)
+		return s;
+	p->p_hc_post.name = "hc_post";
+	s = vk_create_pipeline(p, shader_hc_pre_coef_spv, shader_hc_pre_coef_spv_len, 4, 12,
+						   &p->p_hc_pre_coef);
+	if (s != OK)
+		return s;
+	p->p_hc_pre_coef.name = "hc_pre_coef";
+	s = vk_create_pipeline(p, shader_hc_pre_mix_spv, shader_hc_pre_mix_spv_len, 5, 12,
+						   &p->p_hc_pre_mix);
+	if (s != OK)
+		return s;
+	p->p_hc_pre_mix.name = "hc_pre_mix";
+	s = vk_create_pipeline(p, shader_kda_conv_spv, shader_kda_conv_spv_len, 3, 16, &p->p_kda_conv);
+	if (s != OK)
+		return s;
+	p->p_kda_conv.name = "kda_conv";
+	s = vk_create_pipeline(p, shader_kda_l2norm_spv, shader_kda_l2norm_spv_len, 1, 8,
+						   &p->p_kda_l2norm);
+	if (s != OK)
+		return s;
+	p->p_kda_l2norm.name = "kda_l2norm";
+	s = vk_create_pipeline(p, shader_kda_gate_spv, shader_kda_gate_spv_len, 4, 20, &p->p_kda_gate);
+	if (s != OK)
+		return s;
+	p->p_kda_gate.name = "kda_gate";
+	s				   = vk_create_pipeline(p, shader_kda_delta_spv, shader_kda_delta_spv_len, 7, 8,
+											&p->p_kda_delta);
+	if (s != OK)
+		return s;
+	p->p_kda_delta.name = "kda_delta";
+	s = vk_create_pipeline(p, shader_kda_out_spv, shader_kda_out_spv_len, 3, 8, &p->p_kda_out);
+	if (s != OK)
+		return s;
+	p->p_kda_out.name = "kda_out";
+	s = vk_create_pipeline(p, shader_mla_absorb_q_spv, shader_mla_absorb_q_spv_len, 3, 12,
+						   &p->p_mla_absorb_q);
+	if (s != OK)
+		return s;
+	p->p_mla_absorb_q.name = "mla_absorb_q";
+	s = vk_create_pipeline(p, shader_mla_absorb_attn_spv, shader_mla_absorb_attn_spv_len, 4, 16,
+						   &p->p_mla_absorb_attn);
+	if (s != OK)
+		return s;
+	p->p_mla_absorb_attn.name = "mla_absorb_attn";
+	s = vk_create_pipeline(p, shader_mla_kv_put_spv, shader_mla_kv_put_spv_len, 3, 20,
+						   &p->p_mla_kv_put);
+	if (s != OK)
+		return s;
+	p->p_mla_kv_put.name = "mla_kv_put";
+	s = vk_create_pipeline(p, shader_mla_attention_spv, shader_mla_attention_spv_len, 7, 40,
+						   &p->p_mla_attention);
+	if (s != OK)
+		return s;
+	p->p_mla_attention.name = "mla_attention";
+	s = vk_create_pipeline(p, shader_gdn_conv_spv, shader_gdn_conv_spv_len, 4, 16, &p->p_gdn_conv);
+	if (s != OK)
+		return s;
+	p->p_gdn_conv.name = "gdn_conv";
+	s = vk_create_pipeline(p, shader_gdn_heads_spv, shader_gdn_heads_spv_len, 9, 40,
+						   &p->p_gdn_heads);
+	if (s != OK)
+		return s;
+	p->p_gdn_heads.name = "gdn_heads";
 	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 36,
 						   &p->p_kv_shift_gather);
 	if (s != OK)
@@ -2575,12 +2657,9 @@ static status_code vk_init(backend *self, int device_index) {
 		return s;
 	p->p_moe_combine.name = "moe_combine";
 	{
-		VkBufferUsageFlags	  grid_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags grid_flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		if (p->caps.unified_memory)
-			grid_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		s = vk_alloc_buffer(p, sizeof(ggml_iq3s_grid), grid_usage, grid_flags, &p->iq3s_grid_buf);
+		VkBufferUsageFlags grid_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		s = vk_alloc_buffer(p, sizeof(ggml_iq3s_grid), grid_usage, vk_host_visible_flags(p),
+							&p->iq3s_grid_buf);
 		if (s != OK) {
 			WARN("vulkan: failed to allocate IQ3_S grid buffer -- "
 				 "IQ3_S grid path will be disabled");
@@ -2590,15 +2669,11 @@ static status_code vk_init(backend *self, int device_index) {
 		}
 	}
 	{
-		uint8_t				 *iqx		= NULL;
-		size_t				  iqx_bytes = sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
-										  sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs);
-		VkBufferUsageFlags	  iqx_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags iqx_flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		if (p->caps.unified_memory)
-			iqx_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		s = vk_alloc_buffer(p, iqx_bytes, iqx_usage, iqx_flags, &p->iqx_grid_buf);
+		uint8_t			  *iqx		 = NULL;
+		size_t			   iqx_bytes = sizeof(ggml_iq2s_grid) + sizeof(ggml_iq2xxs_grid) +
+									   sizeof(ggml_iq3xxs_grid) + sizeof(ggml_ksigns_iq2xs);
+		VkBufferUsageFlags iqx_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		s = vk_alloc_buffer(p, iqx_bytes, iqx_usage, vk_host_visible_flags(p), &p->iqx_grid_buf);
 		if (s != OK) {
 			WARN("vulkan: failed to allocate IQX grid buffer -- "
 				 "IQ2_S/IQ2_XXS/IQ3_XXS grid paths will be disabled");
@@ -2866,12 +2941,12 @@ static void vk_free(backend *self) {
 		return;
 	if (p->dev) {
 		vkDeviceWaitIdle(p->dev);
-		INFO("vk: totals: %llu dispatches, %llu barriers, %llu submits, %llu waits, %llu uploads, "
-			 "%llu downloads, %.1f ms waiting",
-			 (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
-			 (unsigned long long)p->stats.submits, (unsigned long long)p->stats.waits,
-			 (unsigned long long)p->stats.uploads, (unsigned long long)p->stats.downloads,
-			 (double)p->stats.wait_us / 1000.0);
+		DEBUG("vk: totals: %llu dispatches, %llu barriers, %llu submits, %llu waits, %llu uploads, "
+			  "%llu downloads, %.1f ms waiting",
+			  (unsigned long long)p->stats.dispatches, (unsigned long long)p->stats.barriers,
+			  (unsigned long long)p->stats.submits, (unsigned long long)p->stats.waits,
+			  (unsigned long long)p->stats.uploads, (unsigned long long)p->stats.downloads,
+			  (double)p->stats.wait_us / 1000.0);
 		vk_prof_report(p);
 
 		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++)
@@ -3075,16 +3150,15 @@ static vk_buf *as_vkbuf(const buffer *b) {
 
 static vk_buf *vk_dummy_buf(vk_priv *p) {
 	if (!p->dummy_buf.buf) {
-		VkBufferUsageFlags	  usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-		VkMemoryPropertyFlags flags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		vk_alloc_buffer(p, 16, usage, flags, &p->dummy_buf);
+		VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+		vk_alloc_buffer(p, 16, usage, vk_host_visible_flags(p), &p->dummy_buf);
 	}
 	return &p->dummy_buf;
 }
 
 static void vk_kv_registry_add(vk_priv *p, void *h) {
-	ARR_RESERVE(p->kv_handles, p->kv_handle_count, p->kv_handle_cap);
+	arr_reserve((void **)&(p->kv_handles), (p->kv_handle_count), &(p->kv_handle_cap),
+				sizeof(*(p->kv_handles)));
 	p->kv_handles[p->kv_handle_count++] = h;
 }
 
@@ -3134,15 +3208,7 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags preferred;
-	if (p->caps.unified_memory) {
-		preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	} else {
-		preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-	}
-
-	status_code s = vk_alloc_buffer(p, size, usage, preferred, b);
+	status_code s = vk_alloc_buffer(p, size, usage, vk_resident_flags(p), b);
 	if (s != OK) {
 		VkMemoryPropertyFlags fallback =
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -3159,11 +3225,6 @@ static status_code vk_buffer_alloc_scratch(backend *self, size_t size, buffer *o
 
 	return OK;
 }
-
-#define VK_WEIGHT_TAIL_PAD 32
-
-#define VK_WEIGHT_STAGE_CHUNK_BYTES ((size_t)(32 << 20))
-#define VK_WEIGHT_STAGE_BATCH_BYTES ((size_t)(64 << 20))
 
 static status_code vk_stage_upload(vk_priv *p, vk_buf *dst, const tensor_desc *desc, size_t size) {
 	for (size_t off = 0; off < size; off += VK_WEIGHT_STAGE_CHUNK_BYTES) {
@@ -3235,10 +3296,8 @@ static status_code vk_buffer_alloc_weight(backend *self, const tensor_desc *desc
 									  VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
 	if (p->caps.unified_memory) {
-		VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-									  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-									  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		status_code			  s		= vk_alloc_buffer(p, alloc_size, weight_usage, flags, bnew);
+		status_code s =
+			vk_alloc_buffer(p, alloc_size, weight_usage, vk_host_visible_flags(p), bnew);
 		if (s != OK) {
 			s = vk_alloc_buffer(
 				p, size, weight_usage,
@@ -3363,7 +3422,7 @@ static status_code vk_buffer_alloc_from_host(backend *self, const void *host_dat
 	vk_buf			  *b	 = xcalloc(1, sizeof(vk_buf));
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-	status_code s = vk_alloc_buffer(p, alloc_size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, b);
+	status_code		   s	 = vk_alloc_buffer(p, alloc_size, usage, vk_resident_flags(p), b);
 	if (s != OK) {
 		s = vk_alloc_buffer(
 			p, alloc_size, usage,
@@ -3839,16 +3898,9 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 											  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 											  VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags kv_preferred;
-	VkMemoryPropertyFlags kv_fallback;
-	if (p->caps.unified_memory) {
-		kv_preferred = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-					   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		kv_fallback	 = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	} else {
-		kv_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-		kv_fallback	 = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	}
+	VkMemoryPropertyFlags kv_preferred = vk_resident_flags(p);
+	VkMemoryPropertyFlags kv_fallback =
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
 	int needs_chunking =
 		p->caps.max_storage_buffer_range > 0 && total > p->caps.max_storage_buffer_range;
@@ -4859,12 +4911,7 @@ static status_code vk_alloc_rope_buf(vk_priv *p, size_t size, buffer *out) {
 	VkBufferUsageFlags usage =
 		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags preferred =
-		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	if (p->caps.unified_memory)
-		preferred |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-
-	status_code s = vk_alloc_buffer(p, size, usage, preferred, b);
+	status_code s = vk_alloc_buffer(p, size, usage, vk_host_visible_flags(p), b);
 	if (s != OK) {
 		VkMemoryPropertyFlags fallback =
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -5008,10 +5055,6 @@ static status_code vk_ensure_scores_buf_batch(backend *self, int n_heads, int n_
 static status_code vk_ensure_scores_buf(backend *self, int n_heads, int n_ctx) {
 	return vk_ensure_scores_buf_batch(self, n_heads, n_ctx, 1);
 }
-
-#define FLASH_MAX_DPL 16
-#define FLASH_MAX_SPLIT 64
-#define FLASH_K_PAD 4
 
 static int vk_flash_layout(vk_priv *p, int head_dim, int n_groups, uint32_t spec[6]) {
 	const int sg = (int)p->caps.subgroup_size;
@@ -5512,8 +5555,6 @@ static status_code vk_rope_table(backend *self, buffer *x, const buffer *table, 
 	return vk_nn_dispatch(self, VK_NN_ROPE_TABLE, bufs, offs, 2, &push, sizeof(push),
 						  (total + 127) / 128, 1u << 0);
 }
-
-#define VK_DENSE_ATTN_MAX_HEAD_DIM 2048
 
 static status_code vk_attention_dense(backend *self, const dense_attention_desc *d) {
 	if (d->head_dim > VK_DENSE_ATTN_MAX_HEAD_DIM)
@@ -6478,11 +6519,7 @@ static status_code vk_dequant_weight(backend *self, uint32_t type, const void *s
 	const size_t dst_bytes = (size_t)k * (size_t)n_rows * sizeof(float);
 	const int	 n_units   = ((n_rows * k) / unit_elems);
 
-	VkMemoryPropertyFlags mem_flags =
-		p->caps.unified_memory
-			? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-			   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-			: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryPropertyFlags mem_flags = vk_resident_flags(p);
 	VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
 							   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
@@ -6878,6 +6915,641 @@ static status_code vk_moe_activate(backend *self, const buffer *gate, const buff
 										up_scale);
 }
 
+#define VK_HC_MAX 8
+#define VK_KDA_MAX_HIST 8
+#define VK_KDA_L2_EPS 1e-6f
+#define VK_MLA_MAX_LORA 1024
+#define VK_MLA_MAX_KV_LORA 512
+#define VK_MLA_MAX_QK_HEAD 512
+#define VK_GDN_MAX_VD 512
+
+static status_code vk_require_resident(backend *self, const char *op, const buffer *const *bufs,
+									   int n) {
+	for (int i = 0; i < n; i++) {
+		const buffer *b = bufs[i];
+		if (b && b->handle && b->owner == self)
+			continue;
+		ERROR("vk: %s: operand %d is not resident on '%s'", op, i, self->name);
+		return ERR_INVALID_ARG;
+	}
+	return OK;
+}
+
+static buffer vk_float_slice(const buffer *parent, size_t float_off, size_t n_floats) {
+	return buffer_slice(parent, float_off * sizeof(float), n_floats * sizeof(float));
+}
+
+static uint32_t vk_groups64(int n) {
+	return (uint32_t)((n + 63) / 64);
+}
+
+static status_code vk_hc_init(backend *self, const hc_init_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_hc_init.pipeline)
+		return ERR_UNSUPPORTED;
+	const buffer *ops[] = {d->x, d->hc};
+	status_code	  s		= vk_require_resident(self, "hc_init", ops, 2);
+	if (s != OK)
+		return s;
+	int total = d->dim * d->n_hc;
+	struct {
+		int32_t dim, total;
+	} push				 = {d->dim, total};
+	vk_buf		*bufs[2] = {as_vkbuf(d->x), as_vkbuf(d->hc)};
+	VkDeviceSize offs[2] = {d->x->offset, d->hc->offset};
+	return vk_dispatch_ex(p, &p->p_hc_init, bufs, offs, NULL, 2, &push, sizeof(push),
+						  vk_groups64(total), 1, 0x2);
+}
+
+static status_code vk_hc_final(backend *self, const hc_final_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_hc_final.pipeline)
+		return ERR_UNSUPPORTED;
+	const buffer *ops[] = {d->hc, d->x};
+	status_code	  s		= vk_require_resident(self, "hc_final", ops, 2);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t dim, n_hc;
+	} push				 = {d->dim, d->n_hc};
+	vk_buf		*bufs[2] = {as_vkbuf(d->hc), as_vkbuf(d->x)};
+	VkDeviceSize offs[2] = {d->hc->offset, d->x->offset};
+	return vk_dispatch_ex(p, &p->p_hc_final, bufs, offs, NULL, 2, &push, sizeof(push),
+						  vk_groups64(d->dim), 1, 0x2);
+}
+
+static status_code vk_hc_post(backend *self, const hc_post_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_hc_post.pipeline)
+		return ERR_UNSUPPORTED;
+	if (d->n_hc > VK_HC_MAX) {
+		ERROR("vk: hc_post: n_hc=%d exceeds %d", d->n_hc, VK_HC_MAX);
+		return ERR_UNSUPPORTED;
+	}
+	const buffer *ops[] = {d->sub, d->coef, d->hc};
+	status_code	  s		= vk_require_resident(self, "hc_post", ops, 3);
+	if (s != OK)
+		return s;
+	struct {
+		int32_t dim, n_hc;
+	} push				 = {d->dim, d->n_hc};
+	vk_buf		*bufs[3] = {as_vkbuf(d->sub), as_vkbuf(d->coef), as_vkbuf(d->hc)};
+	VkDeviceSize offs[3] = {d->sub->offset, d->coef->offset, d->hc->offset};
+	return vk_dispatch_ex(p, &p->p_hc_post, bufs, offs, NULL, 3, &push, sizeof(push),
+						  vk_groups64(d->dim), 1, 0x4);
+}
+
+static status_code vk_hc_pre(backend *self, const hc_pre_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_hc_pre_coef.pipeline || !p->p_hc_pre_mix.pipeline)
+		return ERR_UNSUPPORTED;
+	if (d->n_hc > VK_HC_MAX) {
+		ERROR("vk: hc_pre: n_hc=%d exceeds %d", d->n_hc, VK_HC_MAX);
+		return ERR_UNSUPPORTED;
+	}
+	const buffer *ops[] = {d->stream, d->fn.buf, d->base, d->scale, d->x, d->coef};
+	status_code	  s		= vk_require_resident(self, "hc_pre", ops, 6);
+	if (s != OK)
+		return s;
+
+	const int	 flat	 = d->n_hc * d->dim;
+	const int	 mix_dim = hc_mix_dim(d->n_hc);
+	const size_t flat_p	 = ALIGN_UP((size_t)flat, 64);
+	const size_t mix_p	 = ALIGN_UP((size_t)mix_dim, 64);
+	buffer		 root	 = {0};
+	s = self->buffer_alloc_scratch(self, (flat_p + mix_p) * sizeof(float), &root);
+	if (s != OK)
+		return s;
+	buffer normed = vk_float_slice(&root, 0, (size_t)flat);
+	buffer mixes  = vk_float_slice(&root, flat_p, (size_t)mix_dim);
+
+	s = vk_rmsnorm_noweight(self, d->stream, &normed, flat, d->norm_eps);
+	if (s == OK)
+		s = vk_matmul(self, d->fn.buf, d->fn.type, &normed, &mixes, mix_dim, flat);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t n_hc, iters;
+		float	eps;
+	} coef_push				  = {d->n_hc, d->sinkhorn_iters, d->eps};
+	vk_buf		*coef_bufs[4] = {as_vkbuf(&mixes), as_vkbuf(d->base), as_vkbuf(d->scale),
+								 as_vkbuf(d->coef)};
+	VkDeviceSize coef_offs[4] = {mixes.offset, d->base->offset, d->scale->offset, d->coef->offset};
+	s = vk_dispatch_ex(p, &p->p_hc_pre_coef, coef_bufs, coef_offs, NULL, 4, &coef_push,
+					   sizeof(coef_push), 1, 1, 0x8);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t dim, n_hc;
+		float	eps;
+	} mix_push				 = {d->dim, d->n_hc, d->eps};
+	vk_buf		*mix_bufs[5] = {as_vkbuf(&mixes), as_vkbuf(d->base), as_vkbuf(d->scale),
+								as_vkbuf(d->stream), as_vkbuf(d->x)};
+	VkDeviceSize mix_offs[5] = {mixes.offset, d->base->offset, d->scale->offset, d->stream->offset,
+								d->x->offset};
+	s = vk_dispatch_ex(p, &p->p_hc_pre_mix, mix_bufs, mix_offs, NULL, 5, &mix_push,
+					   sizeof(mix_push), vk_groups64(d->dim), 1, 0x10);
+	self->buffer_free(self, &root);
+	return s;
+}
+
+static void vk_kda_conv(vk_priv *p, buffer *x, const buffer *w, buffer *state, int state_base,
+						int channels, int kernel, int reset) {
+	struct {
+		int32_t channels, kernel, reset, state_base;
+	} push				 = {channels, kernel, reset, state_base};
+	vk_buf		*bufs[3] = {as_vkbuf(x), as_vkbuf(w), as_vkbuf(state)};
+	VkDeviceSize offs[3] = {x->offset, w->offset, state->offset};
+	status_code	 s = vk_dispatch_ex(p, &p->p_kda_conv, bufs, offs, NULL, 3, &push, sizeof(push),
+									vk_groups64(channels), 1, 0x5);
+	(void)s;
+}
+
+static void vk_kda_l2norm(vk_priv *p, buffer *x, int n_heads, int head_dim) {
+	struct {
+		int32_t head_dim;
+		float	eps;
+	} push				 = {head_dim, VK_KDA_L2_EPS};
+	vk_buf		*bufs[1] = {as_vkbuf(x)};
+	VkDeviceSize offs[1] = {x->offset};
+	status_code	 s = vk_dispatch_ex(p, &p->p_kda_l2norm, bufs, offs, NULL, 1, &push, sizeof(push),
+									(uint32_t)n_heads, 1, 0x1);
+	(void)s;
+}
+
+static status_code vk_kda_project(backend *self, const backend_weight *w, const buffer *x,
+								  buffer *y, int n, int k) {
+	return vk_matmul(self, w->buf, w->type, x, y, n, k);
+}
+
+typedef struct {
+	buffer q, k, v, g, o, g2;
+	buffer tmp_f, tmp_g, beta;
+} vk_kda_scratch;
+
+static status_code vk_kda_scratch_alloc(backend *self, const kda_desc *d, buffer *root,
+										vk_kda_scratch *out) {
+	const size_t D	= (size_t)d->n_heads * d->head_dim;
+	const size_t S	= ALIGN_UP((size_t)d->head_dim, 64);
+	const size_t H	= ALIGN_UP((size_t)d->n_heads, 64);
+	const size_t Dp = ALIGN_UP(D, 64);
+	status_code	 s	= self->buffer_alloc_scratch(self, (6 * Dp + 2 * S + H) * sizeof(float), root);
+	if (s != OK)
+		return s;
+	buffer *const slots[] = {&out->q, &out->k, &out->v, &out->g, &out->o, &out->g2};
+	size_t		  off	  = 0;
+	for (int i = 0; i < 6; i++, off += Dp)
+		*slots[i] = vk_float_slice(root, off, D);
+	out->tmp_f = vk_float_slice(root, off, (size_t)d->head_dim);
+	off += S;
+	out->tmp_g = vk_float_slice(root, off, (size_t)d->head_dim);
+	off += S;
+	out->beta = vk_float_slice(root, off, (size_t)d->n_heads);
+	return OK;
+}
+
+static status_code vk_kda(backend *self, const kda_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_kda_conv.pipeline || !p->p_kda_gate.pipeline || !p->p_kda_delta.pipeline ||
+		!p->p_kda_out.pipeline)
+		return ERR_UNSUPPORTED;
+	const int dim = d->dim, H = d->n_heads, S = d->head_dim, D = H * S;
+	const int hist = d->conv_kernel - 1;
+	if (hist < 1 || hist > VK_KDA_MAX_HIST || (uint32_t)D > p->caps.max_workgroup_count[0]) {
+		ERROR("vk: kda: unsupported shape heads=%d head_dim=%d conv_kernel=%d", H, S,
+			  d->conv_kernel);
+		return ERR_UNSUPPORTED;
+	}
+	const buffer *ops[] = {d->x,		d->wq.buf,	   d->wk.buf,  d->wv.buf,  d->wo.buf,
+						   d->f_a.buf,	d->f_b.buf,	   d->g_a.buf, d->g_b.buf, d->beta.buf,
+						   d->conv_q,	d->conv_k,	   d->conv_v,  d->dt_bias, d->ssm_a,
+						   d->out_norm, d->conv_state, d->state,   d->out};
+	status_code	  s		= vk_require_resident(self, "kda", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+	const int conv_stride = D * hist;
+
+	buffer		   root = {0};
+	vk_kda_scratch sc;
+	s = vk_kda_scratch_alloc(self, d, &root, &sc);
+	if (s != OK)
+		return s;
+
+	s = vk_kda_project(self, &d->wq, d->x, &sc.q, D, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->wk, d->x, &sc.k, D, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->wv, d->x, &sc.v, D, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->f_a, d->x, &sc.tmp_f, S, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->f_b, &sc.tmp_f, &sc.g, D, S);
+	if (s == OK)
+		s = vk_kda_project(self, &d->beta, d->x, &sc.beta, H, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->g_a, d->x, &sc.tmp_g, S, dim);
+	if (s == OK)
+		s = vk_kda_project(self, &d->g_b, &sc.tmp_g, &sc.g2, D, S);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	vk_kda_conv(p, &sc.q, d->conv_q, d->conv_state, 0, D, d->conv_kernel, d->reset);
+	vk_kda_conv(p, &sc.k, d->conv_k, d->conv_state, conv_stride, D, d->conv_kernel, d->reset);
+	vk_kda_conv(p, &sc.v, d->conv_v, d->conv_state, 2 * conv_stride, D, d->conv_kernel, d->reset);
+	vk_kda_l2norm(p, &sc.q, H, S);
+	vk_kda_l2norm(p, &sc.k, H, S);
+
+	struct {
+		int32_t inner, n_heads, head_dim, use_lower_bound;
+		float	lower_bound;
+	} gate_push				  = {D, H, S, d->gate_lower_bound > -INFINITY ? 1 : 0,
+								 d->gate_lower_bound > -INFINITY ? d->gate_lower_bound : 0.0f};
+	vk_buf		*gate_bufs[4] = {as_vkbuf(&sc.g), as_vkbuf(d->dt_bias), as_vkbuf(d->ssm_a),
+								 as_vkbuf(&sc.beta)};
+	VkDeviceSize gate_offs[4] = {sc.g.offset, d->dt_bias->offset, d->ssm_a->offset, sc.beta.offset};
+	s = vk_dispatch_ex(p, &p->p_kda_gate, gate_bufs, gate_offs, NULL, 4, &gate_push,
+					   sizeof(gate_push), vk_groups64(D + H), 1, 0x9);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t head_dim, reset;
+	} delta_push			   = {S, d->reset};
+	vk_buf		*delta_bufs[7] = {as_vkbuf(d->state), as_vkbuf(&sc.q), as_vkbuf(&sc.k),
+								  as_vkbuf(&sc.v),	  as_vkbuf(&sc.g), as_vkbuf(&sc.beta),
+								  as_vkbuf(&sc.o)};
+	VkDeviceSize delta_offs[7] = {d->state->offset, sc.q.offset,	sc.k.offset, sc.v.offset,
+								  sc.g.offset,		sc.beta.offset, sc.o.offset};
+	s = vk_dispatch_ex(p, &p->p_kda_delta, delta_bufs, delta_offs, NULL, 7, &delta_push,
+					   sizeof(delta_push), (uint32_t)D, 1, 0x41);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t head_dim;
+		float	eps;
+	} out_push				 = {S, d->norm_eps};
+	vk_buf		*out_bufs[3] = {as_vkbuf(&sc.o), as_vkbuf(&sc.g2), as_vkbuf(d->out_norm)};
+	VkDeviceSize out_offs[3] = {sc.o.offset, sc.g2.offset, d->out_norm->offset};
+	s = vk_dispatch_ex(p, &p->p_kda_out, out_bufs, out_offs, NULL, 3, &out_push, sizeof(out_push),
+					   (uint32_t)H, 1, 0x1);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	s = vk_kda_project(self, &d->wo, &sc.o, d->out, dim, D);
+	self->buffer_free(self, &root);
+	return s;
+}
+
+static status_code vk_mla_absorbed(backend *self, const mla_absorbed_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_mla_absorb_q.pipeline || !p->p_mla_absorb_attn.pipeline)
+		return ERR_UNSUPPORTED;
+	const int dim = d->dim, H = d->n_heads, R = d->kv_lora, QK = d->qk_head, VH = d->v_head;
+	const int QL = d->q_lora;
+	if (R > VK_MLA_MAX_LORA || (uint32_t)H > p->caps.max_workgroup_count[0]) {
+		ERROR("vk: mla_absorbed: unsupported shape heads=%d kv_lora=%d", H, R);
+		return ERR_UNSUPPORTED;
+	}
+	const buffer *ops[] = {d->x,	  d->q_a.buf,	   d->q_b.buf,	 d->kv_a.buf,
+						   d->wo.buf, d->q_a_norm,	   d->kv_a_norm, d->k_b,
+						   d->v_b,	  d->latent_cache, d->out};
+	status_code	  s		= vk_require_resident(self, "mla_absorbed", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+
+	const size_t ql_p = ALIGN_UP((size_t)QL, 64), q_p = ALIGN_UP((size_t)H * QK, 64);
+	const size_t qa_p = ALIGN_UP((size_t)H * R, 64), kv_p = ALIGN_UP((size_t)R, 64);
+	const size_t ho_p = ALIGN_UP((size_t)H * VH, 64);
+	buffer		 root = {0};
+	s = self->buffer_alloc_scratch(self, (2 * ql_p + q_p + qa_p + 2 * kv_p + ho_p) * sizeof(float),
+								   &root);
+	if (s != OK)
+		return s;
+	size_t off = 0;
+	buffer qa  = vk_float_slice(&root, off, (size_t)QL);
+	off += ql_p;
+	buffer qn = vk_float_slice(&root, off, (size_t)QL);
+	off += ql_p;
+	buffer q = vk_float_slice(&root, off, (size_t)H * QK);
+	off += q_p;
+	buffer q_abs = vk_float_slice(&root, off, (size_t)H * R);
+	off += qa_p;
+	buffer kv = vk_float_slice(&root, off, (size_t)R);
+	off += kv_p;
+	buffer kvn = vk_float_slice(&root, off, (size_t)R);
+	off += kv_p;
+	buffer ho	  = vk_float_slice(&root, off, (size_t)H * VH);
+	buffer latent = vk_float_slice(d->latent_cache, (size_t)d->pos * R, (size_t)R);
+
+	s = vk_matmul(self, d->q_a.buf, d->q_a.type, d->x, &qa, QL, dim);
+	if (s == OK)
+		s = vk_rmsnorm(self, &qa, d->q_a_norm, &qn, QL, d->norm_eps);
+	if (s == OK)
+		s = vk_matmul(self, d->q_b.buf, d->q_b.type, &qn, &q, H * QK, QL);
+	if (s == OK)
+		s = vk_matmul(self, d->kv_a.buf, d->kv_a.type, d->x, &kv, R, dim);
+	if (s == OK)
+		s = vk_rmsnorm(self, &kv, d->kv_a_norm, &kvn, R, d->norm_eps);
+	if (s == OK)
+		s = vk_copy_buffer(self, &kvn, &latent, R);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t total, kv_lora, qk_head;
+	} absorb_push				= {H * R, R, QK};
+	vk_buf		*absorb_bufs[3] = {as_vkbuf(d->k_b), as_vkbuf(&q), as_vkbuf(&q_abs)};
+	VkDeviceSize absorb_offs[3] = {d->k_b->offset, q.offset, q_abs.offset};
+	s = vk_dispatch_ex(p, &p->p_mla_absorb_q, absorb_bufs, absorb_offs, NULL, 3, &absorb_push,
+					   sizeof(absorb_push), vk_groups64(H * R), 1, 0x4);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t n_pos, kv_lora, v_head;
+		float	scale;
+	} attn_push				  = {d->pos + 1, R, VH, 1.0f / sqrtf((float)QK)};
+	vk_buf		*attn_bufs[4] = {as_vkbuf(&q_abs), as_vkbuf(d->latent_cache), as_vkbuf(d->v_b),
+								 as_vkbuf(&ho)};
+	VkDeviceSize attn_offs[4] = {q_abs.offset, d->latent_cache->offset, d->v_b->offset, ho.offset};
+	s = vk_dispatch_ex(p, &p->p_mla_absorb_attn, attn_bufs, attn_offs, NULL, 4, &attn_push,
+					   sizeof(attn_push), (uint32_t)H, 1, 0x8);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	s = vk_matmul(self, d->wo.buf, d->wo.type, &ho, d->out, dim, H * VH);
+	self->buffer_free(self, &root);
+	return s;
+}
+
+static uint32_t vk_mla_wtype_code(uint32_t type) {
+	if (type == GGML_TYPE_F32)
+		return 0;
+	if (type == GGML_TYPE_F16)
+		return 1;
+	if (type == GGML_TYPE_BF16)
+		return 2;
+	return UINT32_MAX;
+}
+
+static size_t vk_mla_layer_off_elems(const vk_kv_handle *h, int layer) {
+	if (layer < 0)
+		layer = 0;
+	const vk_kv_store *s = &h->store;
+	if (s->chunked || s->n_kv_layers < 1)
+		return 0;
+	if (s->layer_off_elems) {
+		if (layer > s->n_kv_layers)
+			layer = s->n_kv_layers;
+		return s->layer_off_elems[layer] / 2;
+	}
+	size_t per_layer_elems = s->per_layer_size / sizeof(float);
+	return (size_t)layer * per_layer_elems;
+}
+
+static status_code vk_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora, int qk_rope,
+								   buffer *kv_out) {
+	vk_priv		 *p			  = self->priv;
+	size_t		  layer_bytes = (size_t)(kv_lora + qk_rope) * (size_t)n_ctx * sizeof(float);
+	size_t		  total		  = layer_bytes * (size_t)(n_layers > 0 ? n_layers : 1);
+	vk_kv_handle *kh		  = xcalloc(1, sizeof(vk_kv_handle));
+	status_code	  s = vk_kv_store_alloc(p, total, layer_bytes, n_layers > 0 ? n_layers : 1, NULL,
+										NULL, &kh->store);
+	if (s != OK) {
+		ERROR("vk: kv_alloc_mla: failed to allocate %d MLA layer buffers of %zu bytes", n_layers,
+			  layer_bytes);
+		free(kh);
+		return ERR_OUT_OF_MEMORY;
+	}
+	if (p->n_ctx_stored < n_ctx)
+		p->n_ctx_stored = n_ctx;
+	kv_out->handle	 = kh;
+	kv_out->size	 = total;
+	kv_out->host_ptr = NULL;
+	kv_out->offset	 = 0;
+	kv_out->owner	 = self;
+	vk_kv_registry_add(p, kh);
+	return OK;
+}
+
+static status_code vk_kv_put_mla(backend *self, buffer *kv_cache, int layer, int pos,
+								 const buffer *kv_a_in, const buffer *kv_a_norm_w, int kv_lora,
+								 int qk_rope, int n_ctx, float eps) {
+	vk_priv *p = self->priv;
+	(void)n_ctx;
+	if (kv_lora <= 0 && qk_rope <= 0)
+		return OK;
+	if (!p->p_mla_kv_put.pipeline)
+		return ERR_UNSUPPORTED;
+	const vk_kv_handle *kh = (const vk_kv_handle *)kv_cache->handle;
+	vk_buf			   *cb = vk_kv_layer_buf(kh, layer, NULL);
+
+	bool   norm_device = kv_lora > 0 && kv_a_norm_w->owner == self && kv_a_norm_w->handle;
+	buffer norm_staged = {0};
+	if (kv_lora > 0 && !norm_device) {
+		const float *nd = kv_a_norm_w->host_ptr ? (const float *)kv_a_norm_w->host_ptr
+												: (const float *)kv_a_norm_w->handle;
+		if (!nd)
+			return ERR_INVALID_ARG;
+		status_code s =
+			self->buffer_alloc_scratch(self, (size_t)kv_lora * sizeof(float), &norm_staged);
+		if (s != OK)
+			return s;
+		s = self->buffer_write_f32(self, &norm_staged, nd, kv_lora);
+		if (s != OK) {
+			self->buffer_free(self, &norm_staged);
+			return s;
+		}
+	}
+
+	struct {
+		int32_t	 kv_lora, qk_rope, pos;
+		float	 eps;
+		uint32_t layer_off;
+	} push			= {kv_lora, qk_rope, pos, eps, (uint32_t)vk_mla_layer_off_elems(kh, layer)};
+	vk_buf *bufs[3] = {as_vkbuf(kv_a_in),
+					   kv_lora > 0 ? (norm_device ? as_vkbuf(kv_a_norm_w) : as_vkbuf(&norm_staged))
+								   : vk_dummy_buf(p),
+					   cb};
+	VkDeviceSize offs[3] = {
+		kv_a_in->offset, kv_lora > 0 ? (norm_device ? kv_a_norm_w->offset : norm_staged.offset) : 0,
+		0};
+	status_code s =
+		vk_dispatch_ex(p, &p->p_mla_kv_put, bufs, offs, NULL, 3, &push, sizeof(push), 1, 1, 0x4);
+	if (kv_lora > 0 && !norm_device)
+		self->buffer_free(self, &norm_staged);
+	return s;
+}
+
+static status_code vk_attention_mla(backend *self, const buffer *q, const buffer *kv_cache,
+									const buffer *k_b_w, const buffer *v_b_w, buffer *out,
+									int layer, int pos, int n_heads, int qk_head, int qk_rope,
+									int qk_nope, int v_head, int kv_lora, int n_ctx,
+									const float *rope_cos_base, const float *rope_sin_base,
+									uint32_t k_b_type, uint32_t v_b_type, float scale) {
+	vk_priv *p = self->priv;
+	(void)n_ctx;
+	if (!p->p_mla_attention.pipeline)
+		return ERR_UNSUPPORTED;
+	if (qk_nope < 0 || kv_lora < 0 || kv_lora > VK_MLA_MAX_KV_LORA || (qk_rope & 1) ||
+		qk_head != qk_nope + qk_rope || qk_head > VK_MLA_MAX_QK_HEAD || pos < 0 || n_heads <= 0 ||
+		qk_head < 0) {
+		return ERR_INVALID_ARG;
+	}
+	uint32_t kw = vk_mla_wtype_code(k_b_type);
+	uint32_t vw = vk_mla_wtype_code(v_b_type);
+	if (kw == UINT32_MAX || vw == UINT32_MAX) {
+		ERROR("vk: attention_mla: unsupported k_b/v_b weight type %s/%s", ggml_type_name(k_b_type),
+			  ggml_type_name(v_b_type));
+		return ERR_UNSUPPORTED;
+	}
+	const buffer *ops[] = {q, k_b_w, v_b_w, out};
+	status_code	  s		= vk_require_resident(self, "attention_mla", ops, 4);
+	if (s != OK)
+		return s;
+
+	int half_rope = qk_rope / 2;
+	if (half_rope > 0 && rope_cos_base && rope_sin_base) {
+		if (p->n_ctx_stored <= pos)
+			p->n_ctx_stored = pos + 1;
+		s = vk_ensure_rope_bufs(self, half_rope, rope_cos_base, rope_sin_base);
+		if (s != OK)
+			return s;
+	}
+
+	const vk_kv_handle *kh	  = (const vk_kv_handle *)kv_cache->handle;
+	vk_buf			   *kb	  = vk_kv_layer_buf(kh, layer, NULL);
+	vk_buf			   *dummy = vk_dummy_buf(p);
+	vk_buf			   *cos_b = (p->rope_cos_buf_active && p->rope_cos_buf_active->handle)
+									? as_vkbuf(p->rope_cos_buf_active)
+									: dummy;
+	vk_buf			   *sin_b = (p->rope_sin_buf_active && p->rope_sin_buf_active->handle)
+									? as_vkbuf(p->rope_sin_buf_active)
+									: dummy;
+
+	struct {
+		int32_t	 pos, qk_head, qk_nope, qk_rope, v_head, kv_lora;
+		float	 scale;
+		int32_t	 kwtype, vwtype;
+		uint32_t layer_off;
+	} push = {
+		pos,	 qk_head, qk_nope,	   qk_rope,		v_head,
+		kv_lora, scale,	  (int32_t)kw, (int32_t)vw, (uint32_t)vk_mla_layer_off_elems(kh, layer)};
+	vk_buf		*bufs[7] = {qk_head > 0 ? as_vkbuf(q) : dummy,
+							kb,
+							(qk_nope > 0 && kv_lora > 0) ? as_vkbuf(k_b_w) : dummy,
+							(kv_lora > 0 && v_head > 0) ? as_vkbuf(v_b_w) : dummy,
+							cos_b,
+							sin_b,
+							v_head > 0 ? as_vkbuf(out) : dummy};
+	VkDeviceSize offs[7] = {qk_head > 0 ? q->offset : 0,
+							0,
+							(qk_nope > 0 && kv_lora > 0) ? k_b_w->offset : 0,
+							(kv_lora > 0 && v_head > 0) ? v_b_w->offset : 0,
+							cos_b == dummy ? 0 : p->rope_cos_buf_active->offset,
+							sin_b == dummy ? 0 : p->rope_sin_buf_active->offset,
+							v_head > 0 ? out->offset : 0};
+	return vk_dispatch_ex(p, &p->p_mla_attention, bufs, offs, NULL, 7, &push, sizeof(push),
+						  (uint32_t)n_heads, 1, 0x40);
+}
+
+typedef struct {
+	buffer conv_out;
+} vk_gdn_scratch;
+
+static status_code vk_gdn_scratch_alloc(backend *self, const gdn_desc *d, buffer *root,
+										vk_gdn_scratch *out) {
+	const size_t T = (size_t)d->n_tokens;
+	size_t		 n = T * (size_t)d->conv_dim;
+	if (n == 0)
+		n = 1;
+	status_code s = self->buffer_alloc_scratch(self, ALIGN_UP(n, 64) * sizeof(float), root);
+	if (s != OK)
+		return s;
+	out->conv_out = vk_float_slice(root, 0, n);
+	return OK;
+}
+
+static status_code vk_gated_delta_net(backend *self, const gdn_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_gdn_conv.pipeline || !p->p_gdn_heads.pipeline)
+		return ERR_UNSUPPORTED;
+	const int hist = d->conv_kernel - 1;
+	if (d->n_tokens < 1 || d->conv_dim < 1 || hist < 1 || hist > VK_KDA_MAX_HIST ||
+		d->state_size < 1 || d->value_head_dim < 1 || d->value_head_dim > VK_GDN_MAX_VD ||
+		d->n_value_heads < 1 || d->n_key_heads < 1 ||
+		(uint32_t)d->n_value_heads > p->caps.max_workgroup_count[0]) {
+		ERROR(
+			"vk: gdn: unsupported shape v_heads=%d key_dim=%d state=%d vd=%d conv_dim=%d kernel=%d",
+			d->n_value_heads, d->key_dim, d->state_size, d->value_head_dim, d->conv_dim,
+			d->conv_kernel);
+		return ERR_UNSUPPORTED;
+	}
+
+	const buffer *ops[] = {d->mixed, d->conv_w, d->conv_state, d->z,	 d->alpha, d->beta,
+						   d->dt,	 d->a_vec,	d->norm_w,	   d->state, d->out};
+	status_code	  s		= vk_require_resident(self, "gdn", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+
+	buffer		   root = {0};
+	vk_gdn_scratch sc;
+	s = vk_gdn_scratch_alloc(self, d, &root, &sc);
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t conv_dim, kernel, n_tokens, reset;
+	} conv_push				  = {d->conv_dim, d->conv_kernel, d->n_tokens, d->reset};
+	vk_buf		*conv_bufs[4] = {as_vkbuf(d->mixed), as_vkbuf(d->conv_w), as_vkbuf(d->conv_state),
+								 as_vkbuf(&sc.conv_out)};
+	VkDeviceSize conv_offs[4] = {d->mixed->offset, d->conv_w->offset, d->conv_state->offset,
+								 sc.conv_out.offset};
+	s = vk_dispatch_ex(p, &p->p_gdn_conv, conv_bufs, conv_offs, NULL, 4, &conv_push,
+					   sizeof(conv_push), vk_groups64(d->conv_dim), 1, 0xC);
+	if (s != OK) {
+		self->buffer_free(self, &root);
+		return s;
+	}
+
+	struct {
+		int32_t n_tokens, n_value_heads, n_key_heads, key_dim, kd, vd, value_dim, conv_dim, reset;
+		float	eps;
+	} heads_push = {d->n_tokens,	   d->n_value_heads, d->n_key_heads, d->key_dim, d->state_size,
+					d->value_head_dim, d->value_dim,	 d->conv_dim,	 d->reset,	 d->eps};
+	vk_buf		*heads_bufs[9] = {as_vkbuf(&sc.conv_out), as_vkbuf(d->z),	  as_vkbuf(d->alpha),
+								  as_vkbuf(d->beta),	  as_vkbuf(d->dt),	  as_vkbuf(d->a_vec),
+								  as_vkbuf(d->norm_w),	  as_vkbuf(d->state), as_vkbuf(d->out)};
+	VkDeviceSize heads_offs[9] = {sc.conv_out.offset, d->z->offset,		d->alpha->offset,
+								  d->beta->offset,	  d->dt->offset,	d->a_vec->offset,
+								  d->norm_w->offset,  d->state->offset, d->out->offset};
+	s = vk_dispatch_ex(p, &p->p_gdn_heads, heads_bufs, heads_offs, NULL, 9, &heads_push,
+					   sizeof(heads_push), (uint32_t)d->n_value_heads, 1, 0x180);
+	self->buffer_free(self, &root);
+	return s;
+}
+
 static status_code vk_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "vulkan";
@@ -6967,6 +7639,16 @@ static status_code vk_ctor(backend *out) {
 	out->rope_ext_batch					 = vk_rope_ext_batch;
 	out->attention_batch				 = vk_attention_batch;
 	out->attention_swa_batch			 = vk_attention_swa_batch;
+	out->hc_init						 = vk_hc_init;
+	out->hc_pre							 = vk_hc_pre;
+	out->hc_post						 = vk_hc_post;
+	out->hc_final						 = vk_hc_final;
+	out->kda							 = vk_kda;
+	out->mla_absorbed					 = vk_mla_absorbed;
+	out->attention_mla					 = vk_attention_mla;
+	out->kv_alloc_mla					 = vk_kv_alloc_mla;
+	out->kv_put_mla						 = vk_kv_put_mla;
+	out->gated_delta_net				 = vk_gated_delta_net;
 	return OK;
 }
 

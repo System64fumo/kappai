@@ -316,7 +316,8 @@ status_code context_init(context *c, const config *cfg) {
 	monitor_emit_load_phase_model_start(&c->monitor, cfg->model);
 
 	uint64_t load_t0 = time_us();
-	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack);
+	s				 = model_load_parse(&c->m, cfg->model, c->backend, cfg->use_mmap, cfg->repack,
+										cfg->preparsed_gguf);
 	if (s != OK) {
 		ERROR("failed to parse model '%s'", cfg->model);
 		monitor_emit_load_phase_model_failed(&c->monitor, s);
@@ -619,7 +620,8 @@ void context_slot_free(context *s) {
 }
 
 static void fed_ids_append(context *c, int32_t token) {
-	ARR_RESERVE(c->fed_ids.p, c->fed_ids.n, c->fed_ids.cap);
+	arr_reserve((void **)&(c->fed_ids.p), (c->fed_ids.n), &(c->fed_ids.cap),
+				sizeof(*(c->fed_ids.p)));
 	c->fed_ids.p[c->fed_ids.n++] = token;
 }
 
@@ -781,7 +783,8 @@ static int32_t context_reuse_prefix(context *c, const int32_t *ids, int n, kv_re
 }
 
 static prefill_result context_prefill_with_plan(context *c, const int32_t *tokens, int n_tokens,
-												const kv_reuse_plan *plan) {
+												const kv_reuse_plan *plan, const char *phase,
+												bool quiet) {
 	prefill_result total = {0};
 	int32_t		   base	 = c->kv.n_pos;
 	int			   n_fed = 0;
@@ -790,7 +793,7 @@ static prefill_result context_prefill_with_plan(context *c, const int32_t *token
 		const kv_shift_chunk *chunk = &plan->chunks[i];
 		int					  gap	= chunk->dst_pos - c->kv.n_pos;
 		if (gap > 0) {
-			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, "prefill", false);
+			part = context_prefill_tokens(c, tokens + (c->kv.n_pos - base), gap, phase, quiet);
 			total.us += part.us;
 			if (part.rc < 0) {
 				total.rc = part.rc;
@@ -803,12 +806,20 @@ static prefill_result context_prefill_with_plan(context *c, const int32_t *token
 		c->kv.n_pos = chunk->dst_pos + chunk->n_rows;
 	}
 	int done = c->kv.n_pos - base;
-	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, "prefill", false);
+	part	 = context_prefill_tokens(c, tokens + done, n_tokens - done, phase, quiet);
 	total.rc = part.rc;
 	total.us += part.us;
 	n_fed += n_tokens - done;
 	total.tps = total.us > 0 ? n_fed * 1.0e6 / (double)total.us : part.tps;
 	return total;
+}
+
+prefill_result context_prefill_prompt(context *c, const int32_t *tokens, int n_tokens,
+									  const char *phase, bool quiet) {
+	fed_ids_sync(c);
+	kv_reuse_plan plan;
+	int32_t		  reuse = context_reuse_prefix(c, tokens, n_tokens, &plan);
+	return context_prefill_with_plan(c, tokens + reuse, n_tokens - reuse, &plan, phase, quiet);
 }
 
 static int context_feed_token_inner(context *c, int32_t token, float *logits_out) {
@@ -1338,7 +1349,7 @@ static int run_generation(context *c, const int32_t *tokens, int n_tokens, int m
 	bool prof_was_on = c->scratch.prof.enabled;
 
 	int32_t		   n_pos_before = c->kv.n_pos;
-	prefill_result pf			= context_prefill_with_plan(c, tokens, n_tokens, plan);
+	prefill_result pf = context_prefill_with_plan(c, tokens, n_tokens, plan, "prefill", false);
 	if (pf.rc == ERR_INTERRUPTED) {
 		ERROR("prefill interrupted at pos %d of %d -- session poisoned, resetting before "
 			  "the next turn",
@@ -1407,7 +1418,7 @@ static void assistant_capture_cb(int32_t id, const char *piece, int n, void *ud_
 }
 
 int32_t *context_ids_scratch(context *c, int n) {
-	ARR_ENSURE(c->ids_buf.p, n, c->ids_buf.cap);
+	arr_ensure((void **)&(c->ids_buf.p), (n), &(c->ids_buf.cap), sizeof(*(c->ids_buf.p)));
 	return c->ids_buf.p;
 }
 
@@ -1582,7 +1593,8 @@ static void *idle_prefill_thread(void *arg) {
 	memcpy(header, r1, header_bytes);
 	header[header_bytes] = '\0';
 
-	ARR_ENSURE(c->idle_ids_buf.p, c->n_ctx + 1, c->idle_ids_buf.cap);
+	arr_ensure((void **)&(c->idle_ids_buf.p), (c->n_ctx + 1), &(c->idle_ids_buf.cap),
+			   sizeof(*(c->idle_ids_buf.p)));
 	int32_t *ids = c->idle_ids_buf.p;
 	int n = tokenizer_encode_with_specials(&c->tok, header, 0, ids, c->n_ctx, &c->scratch.prof);
 	if (n < 0 || c->interrupt)

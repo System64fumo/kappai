@@ -4,6 +4,7 @@
 #include "common.h"
 #include "context.h"
 #include "gguf.h"
+#include "jinja.h"
 #include "tokenizer.h"
 
 #include <json-c/json.h>
@@ -63,10 +64,20 @@ typedef struct {
 						   int *n_tokens);
 } decision_ops;
 
+typedef struct {
+	char	*text;
+	int32_t *ids;
+	int		 n;
+	int		 n_prefix;
+	bool	 valid;
+} decision_span_cache;
+
 struct decision_request {
-	decision_question *questions;
-	int				   n_questions;
-	json_object		  *state;
+	decision_question  *questions;
+	int					n_questions;
+	json_object		   *state;
+	jinja_value		   *state_value;
+	decision_span_cache span_cache;
 };
 
 typedef enum {
@@ -92,7 +103,7 @@ decision_parse_status decision_parse(const decision_model *dm, json_object *body
 									 decision_request *req, char *err, size_t err_len);
 void				  decision_request_free(decision_request *req);
 
-status_code decision_run(const decision_model *dm, context *c, const decision_request *req,
+status_code decision_run(const decision_model *dm, context *c, decision_request *req,
 						 json_object **answers, int *n_tokens);
 
 jinja_value *decision_prompt_values(const decision_request *req, const decision_question *q,

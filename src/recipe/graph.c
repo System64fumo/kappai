@@ -838,7 +838,7 @@ void cg_builder_finish(cg_builder *g) {
 }
 
 static cg_param_ref builder_add_global(cg_builder *g, cg_param p) {
-	ARR_RESERVE(g->globals, g->n_globals, g->cap_globals);
+	arr_reserve((void **)&(g->globals), (g->n_globals), &(g->cap_globals), sizeof(*(g->globals)));
 	g->globals[g->n_globals] = p;
 	return (cg_param_ref){CG_SCOPE_GLOBAL, g->n_globals++};
 }
@@ -877,7 +877,7 @@ static cg_value builder_make_value(size_t elems) {
 
 static int builder_add_value(cg_builder *g, cg_value v) {
 	cg_graph *c = g->g;
-	ARR_RESERVE(c->values, c->n_values, g->cap_values);
+	arr_reserve((void **)&(c->values), (c->n_values), &(g->cap_values), sizeof(*(c->values)));
 	c->values[c->n_values] = v;
 	return c->n_values++;
 }
@@ -929,7 +929,7 @@ static int builder_node_alias(cg_builder *g, int x) {
 static int builder_emit(cg_builder *g, op_kind kind, cg_param_ref param, int out, const int *in,
 						int n_in, op_params p) {
 	cg_graph *c = g->g;
-	ARR_RESERVE(c->nodes, c->n_nodes, g->cap_nodes);
+	arr_reserve((void **)&(c->nodes), (c->n_nodes), &(g->cap_nodes), sizeof(*(c->nodes)));
 	cg_node *n = &c->nodes[c->n_nodes++];
 	memset(n, 0, sizeof(*n));
 	n->kind			= kind;

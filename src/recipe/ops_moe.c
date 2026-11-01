@@ -464,9 +464,12 @@ status_code moe_router_batch(exec_ctx *ctx) {
 	}
 
 	{
-		ARR_ENSURE(ctx->bs->moe_union_order, n_union, ctx->bs->moe_union_order_cap);
-		ARR_ENSURE(ctx->bs->moe_union_sorted_ids, n_union, ctx->bs->moe_union_sorted_ids_cap);
-		ARR_ENSURE(ctx->bs->moe_order_pairs, n_union, ctx->bs->moe_order_pairs_cap);
+		arr_ensure((void **)&(ctx->bs->moe_union_order), (n_union), &(ctx->bs->moe_union_order_cap),
+				   sizeof(*(ctx->bs->moe_union_order)));
+		arr_ensure((void **)&(ctx->bs->moe_union_sorted_ids), (n_union),
+				   &(ctx->bs->moe_union_sorted_ids_cap), sizeof(*(ctx->bs->moe_union_sorted_ids)));
+		arr_ensure((void **)&(ctx->bs->moe_order_pairs), (n_union), &(ctx->bs->moe_order_pairs_cap),
+				   sizeof(*(ctx->bs->moe_order_pairs)));
 		for (int u = 0; u < n_union; u++)
 			ctx->bs->moe_order_pairs[u] =
 				(moe_order_pair){.cnt = ctx->bs->moe_union_count[u], .u = u};
@@ -481,7 +484,8 @@ status_code moe_router_batch(exec_ctx *ctx) {
 
 	{
 		int total_slots = ctx->rows.n_rows * K;
-		ARR_ENSURE(ctx->bs->moe_per_token_slots, total_slots, ctx->bs->moe_per_token_slots_cap);
+		arr_ensure((void **)&(ctx->bs->moe_per_token_slots), (total_slots),
+				   &(ctx->bs->moe_per_token_slots_cap), sizeof(*(ctx->bs->moe_per_token_slots)));
 	}
 
 	moe_union_slots_ensure(ctx->bs, n_union);

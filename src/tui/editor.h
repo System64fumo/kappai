@@ -3,6 +3,6 @@
 
 #include "schema.h"
 
-int editor_run(const sc_entry *entry);
+int editor_run(const sc_entry *entry, char *saved_name, size_t cap);
 
 #endif

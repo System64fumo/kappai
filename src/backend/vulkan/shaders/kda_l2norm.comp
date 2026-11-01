@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) buffer XBuf {
+	float x[];
+};
+
+layout(push_constant) uniform Params {
+	int	  head_dim;
+	float eps;
+}
+params;
+
+shared float s_ss[64];
+
+void main() {
+	int	  tid  = int(gl_LocalInvocationID.x);
+	int	  base = int(gl_WorkGroupID.x) * params.head_dim;
+	float my   = 0.0;
+	for (int i = tid; i < params.head_dim; i += 64)
+		my += x[base + i] * x[base + i];
+	s_ss[tid] = my;
+	barrier();
+	for (int s = 32; s > 0; s >>= 1) {
+		if (tid < s)
+			s_ss[tid] += s_ss[tid + s];
+		barrier();
+	}
+	float inv = 1.0 / sqrt(s_ss[0] + params.eps);
+	for (int i = tid; i < params.head_dim; i += 64)
+		x[base + i] *= inv;
+}

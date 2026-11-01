@@ -708,9 +708,10 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 	gguf_tensor *t = owned_tensor_for_ptr(m, host_ptr);
 	if (!t || weight_retains_host_copy(m, t))
 		return;
-	free((void *)t->data);
-	t->data	  = NULL;
-	t->loaded = 0;
+	free(t->data_alloc);
+	t->data_alloc = NULL;
+	t->data		  = NULL;
+	t->loaded	  = 0;
 }
 
 int model_should_repack(uint32_t type, const char *repack_config) {
@@ -1264,6 +1265,16 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	return OK;
 }
 
+static status_code upload_layer_one(model *m, backend *target, weight_ref *ref, uint32_t wtype,
+									int ndims, uint64_t d0, uint64_t d1, weight_class wc) {
+	return upload_one_to(m, ref, wtype, ndims, d0, d1, wc, target);
+}
+
+static status_code upload_layer_one_repack(model *m, backend *target, weight_ref *ref, int ndims,
+										   uint64_t d0, uint64_t d1, weight_class wc) {
+	return upload_one_repack_to(m, ref, ndims, d0, d1, wc, target);
+}
+
 static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	status_code	   s;
 	layer_weights *L		= &m->layers[i];
@@ -1281,14 +1292,14 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 #define UPLOAD(ref, wtype, ndims, d0, d1, wc)                                                      \
 	do {                                                                                           \
-		s = upload_one_to(m, (ref), (wtype), (ndims), (d0), (d1), (wc), layer_be);                 \
+		s = upload_layer_one(m, layer_be, (ref), (wtype), (ndims), (d0), (d1), (wc));              \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
 
 #define UPLOAD_REP(ref, ndims, d0, d1, wc)                                                         \
 	do {                                                                                           \
-		s = upload_one_repack_to(m, (ref), (ndims), (d0), (d1), (wc), layer_be);                   \
+		s = upload_layer_one_repack(m, layer_be, (ref), (ndims), (d0), (d1), (wc));                \
 		if (s != OK)                                                                               \
 			return s;                                                                              \
 	} while (0)
@@ -2206,12 +2217,18 @@ static status_code load_kda_metadata(model *m, const gguf_ctx *g, const char *pr
 }
 
 static status_code model_load_open(model *m, const char *path, int use_mmap,
-								   const char *repack_config) {
+								   const char *repack_config, gguf_ctx *preparsed) {
 	m->use_mmap		 = use_mmap;
 	m->model_path	 = xstrdup(path);
 	m->repack_config = repack_config ? xstrdup(repack_config) : NULL;
 	model_repack_table_build(m);
-	status_code s = use_mmap ? gguf_load(&m->gctx, path) : gguf_load_metadata(&m->gctx, path);
+	status_code s = OK;
+	if (use_mmap)
+		s = gguf_load(&m->gctx, path);
+	else if (preparsed && preparsed->valid)
+		gguf_move(&m->gctx, preparsed);
+	else
+		s = gguf_load_metadata(&m->gctx, path);
 	if (s == OK && !use_mmap)
 		s = gguf_sparse_alloc_tensors(&m->gctx, path);
 	if (s == OK && !use_mmap)
@@ -3250,11 +3267,11 @@ status_code model_set_layer_backend_range(model *m, int begin, int end, backend 
 }
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config) {
+							 const char *repack_config, gguf_ctx *preparsed) {
 	memset(m, 0, sizeof(*m));
 	m->backend = bk;
 
-	status_code s = model_load_open(m, path, use_mmap, repack_config);
+	status_code s = model_load_open(m, path, use_mmap, repack_config, preparsed);
 	if (s != OK) {
 		goto fail;
 	}
@@ -3347,7 +3364,7 @@ status_code model_build_recipe(model *m) {
 
 status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk, int use_mmap,
 										 const char *repack_config) {
-	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config);
+	status_code s = model_load_parse(m, path, bk, use_mmap, repack_config, NULL);
 	if (s != OK)
 		return s;
 

@@ -1,0 +1,71 @@
+#version 450
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer MixBuf {
+	float mixes[];
+};
+layout(set = 0, binding = 1) readonly buffer BaseBuf {
+	float base[];
+};
+layout(set = 0, binding = 2) readonly buffer ScaleBuf {
+	float scale[];
+};
+layout(set = 0, binding = 3) writeonly buffer CoefBuf {
+	float coef[];
+};
+
+layout(push_constant) uniform Params {
+	int	  n_hc;
+	int	  iters;
+	float eps;
+}
+params;
+
+const int MAX_HC = 8;
+
+float sigmoidf(float v) {
+	return 1.0 / (1.0 + exp(-v));
+}
+
+void main() {
+	int hc = params.n_hc;
+	for (int h = 0; h < hc; h++)
+		coef[h] = 2.0 * sigmoidf(mixes[hc + h] * scale[1] + base[hc + h]);
+
+	float comb[MAX_HC * MAX_HC];
+	for (int j = 0; j < hc * hc; j++)
+		comb[j] = mixes[2 * hc + j] * scale[2] + base[2 * hc + j];
+
+	for (int src = 0; src < hc; src++) {
+		float mx = comb[src * hc];
+		for (int d = 1; d < hc; d++)
+			mx = max(mx, comb[src * hc + d]);
+		float sum = 0.0;
+		for (int d = 0; d < hc; d++) {
+			comb[src * hc + d] = exp(comb[src * hc + d] - mx);
+			sum += comb[src * hc + d];
+		}
+		for (int d = 0; d < hc; d++)
+			comb[src * hc + d] = comb[src * hc + d] / sum + params.eps;
+	}
+	for (int it = 0; it < params.iters; it++) {
+		if (it > 0) {
+			for (int src = 0; src < hc; src++) {
+				float sum = params.eps;
+				for (int d = 0; d < hc; d++)
+					sum += comb[src * hc + d];
+				for (int d = 0; d < hc; d++)
+					comb[src * hc + d] /= sum;
+			}
+		}
+		for (int d = 0; d < hc; d++) {
+			float sum = params.eps;
+			for (int src = 0; src < hc; src++)
+				sum += comb[src * hc + d];
+			for (int src = 0; src < hc; src++)
+				comb[src * hc + d] /= sum;
+		}
+	}
+	for (int j = 0; j < hc * hc; j++)
+		coef[hc + j] = comb[j];
+}

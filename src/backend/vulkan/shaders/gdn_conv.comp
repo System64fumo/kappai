@@ -1,0 +1,49 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer MixBuf {
+	float mixed[];
+};
+layout(set = 0, binding = 1) readonly buffer WBuf {
+	float conv_w[];
+};
+layout(set = 0, binding = 2) buffer ConvStateBuf {
+	float conv_state[];
+};
+layout(set = 0, binding = 3) writeonly buffer ConvOutBuf {
+	float conv_out[];
+};
+
+layout(push_constant) uniform Params {
+	int conv_dim;
+	int kernel;
+	int n_tokens;
+	int reset;
+}
+params;
+
+const int MAX_HIST = 8;
+
+void main() {
+	int c = int(gl_GlobalInvocationID.x);
+	if (c >= params.conv_dim)
+		return;
+	int hist = params.kernel - 1;
+	if (hist > MAX_HIST)
+		return;
+	int	  wbase = c * params.kernel;
+	float st[MAX_HIST];
+	for (int k = 0; k < hist; k++)
+		st[k] = params.reset != 0 ? 0.0 : conv_state[c * hist + k];
+	for (int t = 0; t < params.n_tokens; t++) {
+		float m	  = mixed[t * params.conv_dim + c];
+		float sum = m * conv_w[wbase + hist];
+		for (int k = 0; k < hist; k++) {
+			sum += st[k] * conv_w[wbase + k];
+			st[k] = (k + 1 < hist) ? st[k + 1] : m;
+		}
+		conv_out[t * params.conv_dim + c] = sum / (1.0 + exp(-sum));
+	}
+	for (int k = 0; k < hist; k++)
+		conv_state[c * hist + k] = st[k];
+}

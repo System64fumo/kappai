@@ -20,6 +20,7 @@
 
 #define SC_MAX_CONFIGS 512
 #define SC_ERR_MAX 512
+#define SC_WARN_MAX 512
 
 typedef struct {
 	char name[SC_NAME_MAX];
@@ -30,7 +31,6 @@ typedef struct {
 	char output_dir[SC_PATH_MAX];
 	char preview_path[SC_PATH_MAX];
 	char repack[SC_TEXT_MAX];
-	char fuse[SC_TEXT_MAX];
 	char moe_pin_list[SC_PINLIST_MAX];
 	char monitor[SC_PATH_MAX];
 	char metrics[SC_METRICS_MAX];
@@ -44,8 +44,6 @@ typedef struct {
 
 	int ctx_size;
 	int n_threads;
-	int kv_quant;
-	int n_predict;
 	int top_k;
 	int repeat_last_n;
 	int server_port;
@@ -67,11 +65,6 @@ typedef struct {
 	bool moe_preload;
 	bool reasoning;
 	bool warmup;
-	bool output_stream;
-	bool profile_time;
-	bool debug;
-	bool debug_forward;
-	bool disable_failsafes;
 } saved_config;
 
 typedef enum {
@@ -86,6 +79,7 @@ typedef enum {
 typedef enum {
 	UIK_TEXT = 0,
 	UIK_PATH,
+	UIK_MODEL_PATH,
 	UIK_SELECT,
 	UIK_MULTI,
 } fld_uikind;
@@ -94,15 +88,16 @@ typedef struct {
 	const char		  *key;
 	const char		  *label;
 	const char		  *hint;
-	fld_type		   type;
 	size_t			   offset;
 	size_t			   max_len;
 	double			   lo;
 	double			   hi;
 	const char *const *choices;
+	fld_type		   type;
 	fld_uikind		   uik;
-	bool			   empty_all;
 	int				   multiple_of;
+	bool			   empty_all;
+	const char		  *model_type;
 } field_desc;
 
 typedef struct {
@@ -120,7 +115,8 @@ typedef struct {
 } sc_entry;
 
 void	   *sc_field_ptr(saved_config *sc, const field_desc *f);
-const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen);
+const char *sc_format_value(const saved_config *sc, const field_desc *f, char *buf, size_t buflen,
+							bool display);
 int			sc_parse_value(saved_config *sc, const field_desc *f, const char *value, char *err,
 						   size_t errlen);
 const char *sc_field_hint(const field_desc *f);
@@ -130,8 +126,11 @@ void		sc_sanitize_name(const char *in, char *out, size_t outlen);
 const char *sc_configs_dir(void);
 int			sc_list(sc_entry *entries, int max, char *err, size_t errlen);
 int			sc_load(const char *path, saved_config *sc, char *err, size_t errlen);
-int			sc_save(const saved_config *sc, const char *orig_name, char *err, size_t errlen);
-int			sc_delete(const sc_entry *entry, char *err, size_t errlen);
+int	 sc_load_lenient(const char *path, saved_config *sc, char *warn, size_t warnlen, char *err,
+					 size_t errlen);
+void sc_resolve_model_paths(saved_config *sc);
+int	 sc_save(const saved_config *sc, const char *orig_name, char *err, size_t errlen);
+int	 sc_delete(const sc_entry *entry, char *err, size_t errlen);
 
 void sc_materialize(const saved_config *sc, config *cfg, cli_args *a);
 void sc_materialize_diffusion(const saved_config *sc, diffusion_files *files, diffusion_params *p,

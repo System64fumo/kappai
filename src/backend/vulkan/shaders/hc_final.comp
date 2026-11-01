@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer HcBuf {
+	float hc[];
+};
+layout(set = 0, binding = 1) writeonly buffer XBuf {
+	float x[];
+};
+
+layout(push_constant) uniform Params {
+	int dim;
+	int n_hc;
+}
+params;
+
+void main() {
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= params.dim)
+		return;
+	float acc = 0.0;
+	for (int h = 0; h < params.n_hc; h++)
+		acc += hc[h * params.dim + i];
+	x[i] = acc / float(params.n_hc);
+}

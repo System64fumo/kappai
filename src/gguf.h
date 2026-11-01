@@ -53,7 +53,6 @@ typedef enum {
 	GGML_TYPE_IQ4_XS  = 23,
 	GGML_TYPE_BF16	  = 30,
 
-	/* 0x40+ = engine-internal repacked types */
 	GGML_TYPE_Q8_0_REPACKED	  = 0x43,
 	GGML_TYPE_Q4_0_REPACKED	  = 0x44,
 	GGML_TYPE_IQ3_S_REPACKED  = 0x45,
@@ -76,6 +75,7 @@ typedef struct {
 	uint32_t	type;
 	uint64_t	offset;
 	const void *data;
+	void	   *data_alloc;
 	size_t		byte_size;
 	uint8_t		loaded;
 } gguf_tensor;
@@ -86,7 +86,7 @@ typedef struct {
 	int			used;
 } gguf_strtab_entry;
 
-typedef struct {
+typedef struct gguf_ctx {
 	int				   fd;
 	void			  *map;
 	size_t			   map_size;
@@ -117,6 +117,7 @@ typedef struct {
 } gguf_ctx;
 
 const char *ggml_type_name(uint32_t t);
+bool		ggml_type_loadable(uint32_t t);
 size_t		ggml_row_size(uint32_t type, size_t n);
 
 extern const uint32_t ggml_iq3s_grid[512];
@@ -152,6 +153,7 @@ status_code safetensors_parse(gguf_ctx *ctx, void *data, size_t fsize, int fd, v
 							  int header_only);
 
 status_code gguf_load_metadata(gguf_ctx *ctx, const char *path);
+void		gguf_move(gguf_ctx *dst, gguf_ctx *src);
 
 ssize_t gguf_pread_full(int fd, void *dst, size_t len, uint64_t file_off);
 

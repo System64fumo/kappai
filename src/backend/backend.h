@@ -7,6 +7,8 @@
 
 #define BACKEND_MAX 8
 
+#define BACKEND_DEVICE_NAME_MAX 64
+
 typedef struct backend		  backend;
 typedef struct cpu_cache_info cpu_cache_info;
 
@@ -130,14 +132,15 @@ typedef struct {
 } backend_info;
 
 typedef struct {
-	int			 n_tokens, n_value_heads, n_key_heads;
-	int			 conv_dim, conv_kernel, key_dim, state_size, value_head_dim, value_dim;
-	float		 eps;
-	const float *mixed, *z, *alpha, *beta;
-	const float *conv_w, *dt, *a_vec, *norm_w;
-	float		*conv_state, *state;
-	float		*out;
-	float		*ws;
+	int			  n_tokens, n_value_heads, n_key_heads;
+	int			  conv_dim, conv_kernel, key_dim, state_size, value_head_dim, value_dim;
+	int			  reset;
+	float		  eps;
+	const buffer *mixed, *z, *alpha, *beta;
+	const buffer *conv_w, *dt, *a_vec, *norm_w;
+	buffer		 *conv_state, *state;
+	buffer		 *out;
+	float		 *ws;
 } gdn_desc;
 
 typedef struct {
@@ -495,8 +498,6 @@ status_code backend_create_best(backend **out);
 status_code backend_create_host(backend **out);
 void		backend_destroy(backend *b);
 void		backend_destroyed(backend *b);
-
-#define BACKEND_DEVICE_NAME_MAX 64
 
 int			backend_enum_devices(char (*out)[BACKEND_DEVICE_NAME_MAX], int max);
 bool		backend_device_is_host(const char *spec);

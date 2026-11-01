@@ -73,6 +73,11 @@ static inline void gguf_ctx_init(gguf_ctx *ctx) {
 	ctx->sparse_direct_fd = -1;
 }
 
+void gguf_move(gguf_ctx *dst, gguf_ctx *src) {
+	*dst = *src;
+	gguf_ctx_init(src);
+}
+
 static int gguf_open_ro(const char *path, size_t *fsize) {
 	int fd = open(path, O_RDONLY);
 	if (fd < 0)
@@ -118,6 +123,10 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 	if (t >= ARRAY_LEN(table))
 		return NULL;
 	return table[t].name ? &table[t] : NULL;
+}
+
+bool ggml_type_loadable(uint32_t t) {
+	return t < GGML_TYPE_Q8_0_REPACKED && ggml_type_lookup(t) != NULL;
 }
 
 const char *ggml_type_name(uint32_t t) {
@@ -1172,9 +1181,6 @@ static void *gguf_load_worker(void *arg) {
 		}
 		if (atomic_fetch_sub_explicit(&j->chunk_remaining[ch->tidx], 1, memory_order_acq_rel) != 1)
 			continue;
-		size_t slop = gguf_tensor_slop(j->ctx, ch->t, j->align);
-		if (slop)
-			memmove((void *)ch->t->data, (const char *)ch->t->data + slop, ch->t->byte_size);
 	}
 	return NULL;
 }
@@ -1345,13 +1351,15 @@ status_code gguf_sparse_alloc_tensors(gguf_ctx *ctx, const char *path) {
 			ret = ERR_OUT_OF_MEMORY;
 			break;
 		}
-		t->data = buf;
+		t->data_alloc = buf;
+		t->data		  = (const char *)buf + gguf_tensor_slop(ctx, t, align);
 	}
 
 	if (ret != OK) {
 		for (size_t i = 0; i < ctx->n_tensors; i++) {
-			free((void *)ctx->tensors[i].data);
-			ctx->tensors[i].data = NULL;
+			free(ctx->tensors[i].data_alloc);
+			ctx->tensors[i].data_alloc = NULL;
+			ctx->tensors[i].data	   = NULL;
 		}
 		return ret;
 	}
@@ -1377,7 +1385,7 @@ static void gguf_chunk_tensor(gguf_load_chunk *chunks, size_t *n_chunks, const g
 			.t		  = t,
 			.file_off = base_off + off,
 			.len	  = piece,
-			.dst	  = (char *)t->data + off,
+			.dst	  = (char *)t->data_alloc + off,
 			.tidx	  = tidx,
 			.plain	  = align > 0 && (piece & (align - 1)) != 0,
 		};
@@ -1480,7 +1488,7 @@ status_code gguf_tensor_read(void *source, size_t off, void *dst, size_t len) {
 void gguf_free(gguf_ctx *ctx) {
 	if (ctx && ctx->valid && ctx->owns_tensor_data) {
 		for (size_t i = 0; i < ctx->n_tensors; i++)
-			free((void *)ctx->tensors[i].data);
+			free(ctx->tensors[i].data_alloc);
 	}
 	if (!ctx || !ctx->valid)
 		return;

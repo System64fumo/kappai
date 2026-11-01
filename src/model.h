@@ -7,6 +7,9 @@
 #include "gguf.h"
 #include "memory.h"
 
+#define MODEL_MAX_EXPERT_PARTS 8
+#define MODEL_REPACK_TABLE_SIZE 128
+
 struct model_recipe;
 typedef struct model_recipe model_recipe;
 
@@ -113,8 +116,6 @@ typedef struct layer_weights {
 	bool	is_moe_layer;
 	bool	experts_resident;
 } layer_weights;
-
-#define MODEL_MAX_EXPERT_PARTS 8
 
 typedef struct {
 	struct backend *be;
@@ -252,7 +253,6 @@ typedef struct model {
 	size_t mem_per_expert_bytes;
 	bool   mem_estimates_valid;
 
-#define MODEL_REPACK_TABLE_SIZE 128
 	uint8_t repack_table[MODEL_REPACK_TABLE_SIZE];
 	bool	repack_table_valid;
 } model;
@@ -262,7 +262,7 @@ status_code model_load_backend_ex_repack(model *m, const char *path, backend *bk
 										 const char *repack_config);
 
 status_code model_load_parse(model *m, const char *path, backend *bk, int use_mmap,
-							 const char *repack_config);
+							 const char *repack_config, gguf_ctx *preparsed);
 status_code model_probe_shape(const char *path, int *n_layers, int *n_experts, int *n_kv_layers);
 status_code model_upload_weights(model *m);
 status_code model_build_recipe(model *m);
