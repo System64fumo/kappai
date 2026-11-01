@@ -1429,7 +1429,7 @@ int editor_run(const sc_entry *entry, char *saved_name, size_t cap) {
 			return -1;
 		}
 		if (warn[0]) {
-			char msg[SC_WARN_MAX + 192];
+			char msg[SC_WARN_MAX + SC_NAME_MAX + 128];
 			snprintf(msg, sizeof(msg),
 					 "'%s' has problems:\n%s\nOpen it anyway? Invalid entries are dropped, and "
 					 "saving rewrites the file.",

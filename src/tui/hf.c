@@ -584,11 +584,23 @@ static int dest_path(const hf_page *pg, const char *name, char *dest, size_t cap
 	char rel[SC_PATH_MAX];
 	if (dest_rel(pg, name, rel, sizeof(rel)) < 0)
 		return -1;
-	return snprintf(dest, cap, "%s/%s", tui_models_dir(), rel) < (int)cap ? 0 : -1;
+	const char *base	 = tui_models_dir();
+	size_t		base_len = strlen(base);
+	size_t		rel_len	 = strlen(rel);
+	if (base_len + rel_len + 2 > cap)
+		return -1;
+	memcpy(dest, base, base_len);
+	dest[base_len] = '/';
+	memcpy(dest + base_len + 1, rel, rel_len + 1);
+	return 0;
 }
 
 static void set_status(hf_page *pg, int kind, const char *msg) {
-	snprintf(pg->status, sizeof(pg->status), "%s", msg);
+	size_t n = strlen(msg);
+	if (n >= sizeof(pg->status))
+		n = sizeof(pg->status) - 1;
+	memcpy(pg->status, msg, n);
+	pg->status[n]	= '\0';
 	pg->status_kind = kind;
 }
 
@@ -763,7 +775,7 @@ static void draw_model_panel(const hf_model *m, int x, int w) {
 }
 
 static const char *local_state(const char *dest, size_t expected, char *buf, size_t cap) {
-	char part[SC_PATH_MAX];
+	char part[SC_PATH_MAX + 8];
 	snprintf(part, sizeof(part), "%s.part", dest);
 	if (expected && file_size(dest) == expected)
 		return "downloaded";
@@ -880,7 +892,7 @@ static int emit_estimates(const hf_page *pg, double weights, bool draw, int x, i
 	for (int i = 0; i < n; i++, y++) {
 		if (!draw)
 			continue;
-		char label[16];
+		char label[32];
 		model_format_bytes(estimate_total(weights, &pg->meta, true, ctxs[i], 2.0), a, sizeof(a));
 		model_format_bytes(estimate_total(weights, &pg->meta, true, ctxs[i], 34.0 / 32.0), b,
 						   sizeof(b));
@@ -1111,7 +1123,7 @@ typedef enum { DL_OK, DL_CANCELLED, DL_FAILED } dl_result;
 
 static dl_result download_one(hf_page *pg, const hf_entry *f, const char *dest,
 							  size_t finished_before, char *err, size_t errlen) {
-	char part[SC_PATH_MAX];
+	char part[SC_PATH_MAX + 8];
 	char url[1024];
 	snprintf(part, sizeof(part), "%s.part", dest);
 	snprintf(url, sizeof(url), HF_HOST "/%s/resolve/main/%s", pg->repo, f->name);
@@ -1151,7 +1163,7 @@ static dl_result download_one(hf_page *pg, const hf_entry *f, const char *dest,
 		return DL_FAILED;
 	}
 	if (rename(part, dest) != 0) {
-		snprintf(err, errlen, "cannot move '%s' into place: %s", part, strerror(errno));
+		snprintf(err, errlen, "cannot move '%.256s' into place: %s", part, strerror(errno));
 		return DL_FAILED;
 	}
 	return DL_OK;

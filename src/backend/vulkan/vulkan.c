@@ -2952,6 +2952,22 @@ static void vk_free(backend *self) {
 		for (int ci = 0; ci < VK_ATTN_KIND_MAX; ci++)
 			for (int fi = 0; fi < VK_ATTN_CACHE_CAP; fi++)
 				vk_destroy_pipeline(p, &p->attn_cache[ci].set[fi]);
+		vk_destroy_pipeline(p, &p->p_hc_init);
+		vk_destroy_pipeline(p, &p->p_hc_final);
+		vk_destroy_pipeline(p, &p->p_hc_post);
+		vk_destroy_pipeline(p, &p->p_hc_pre_coef);
+		vk_destroy_pipeline(p, &p->p_hc_pre_mix);
+		vk_destroy_pipeline(p, &p->p_kda_conv);
+		vk_destroy_pipeline(p, &p->p_kda_l2norm);
+		vk_destroy_pipeline(p, &p->p_kda_gate);
+		vk_destroy_pipeline(p, &p->p_kda_delta);
+		vk_destroy_pipeline(p, &p->p_kda_out);
+		vk_destroy_pipeline(p, &p->p_mla_absorb_q);
+		vk_destroy_pipeline(p, &p->p_mla_absorb_attn);
+		vk_destroy_pipeline(p, &p->p_mla_kv_put);
+		vk_destroy_pipeline(p, &p->p_mla_attention);
+		vk_destroy_pipeline(p, &p->p_gdn_conv);
+		vk_destroy_pipeline(p, &p->p_gdn_heads);
 		vk_destroy_pipeline(p, &p->p_kv_put);
 		vk_destroy_pipeline(p, &p->p_kv_shift_gather);
 		vk_destroy_pipeline(p, &p->p_embd_lookup);

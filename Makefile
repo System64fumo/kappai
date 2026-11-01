@@ -371,5 +371,5 @@ tidy:
 		*/opengl/*) inc="-I$(OBJ_DIR)/backend/opengl";; \
 		*/vulkan/*) inc="-I$(OBJ_DIR)/backend/vulkan";; \
 		esac; \
-		clang-tidy --config-file=.clang-tidy "$$1" -- $(filter-out -fvect-cost-model=%,$(CFLAGS)) $(ARCH_FLAGS) $$inc -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true' sh
+		clang-tidy --config-file=.clang-tidy "$$1" -- $(filter-out -fvect-cost-model=% $(ARCH_FLAGS),$(CFLAGS)) $$inc -I$(SRC_DIR) >> $(TIDY_LOG) 2>&1 || true' sh
 	@echo "  TIDY    done, see $(TIDY_LOG)"
