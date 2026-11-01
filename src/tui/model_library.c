@@ -152,11 +152,11 @@ static int delete_parts(const char *abs, char *err, size_t errlen) {
 	int			   rc = 0;
 	struct dirent *de;
 	while ((de = readdir(d)) != NULL) {
-		char full[SC_PATH_MAX], other[SC_PATH_MAX];
+		char full[SC_PATH_MAX + 256], other[SC_PATH_MAX];
 		snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
 		if (model_shard_key(full, other, sizeof(other), NULL) && strcmp(key, other) == 0 &&
 			unlink(full) != 0) {
-			snprintf(err, errlen, "cannot delete '%s': %s", full, strerror(errno));
+			snprintf(err, errlen, "cannot delete '%.256s': %s", full, strerror(errno));
 			rc = -1;
 		}
 	}
