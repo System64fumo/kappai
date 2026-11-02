@@ -1,0 +1,195 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(set = 0, binding = 1) readonly buffer BiasBuf {
+	float bias[];
+};
+layout(set = 0, binding = 2) writeonly buffer OutBuf {
+	float result[];
+};
+
+layout(push_constant) uniform Params {
+	int	  rows;
+	int	  n_experts;
+	int	  top_k;
+	int	  use_softmax;
+	int	  norm_topk;
+	float routed_scale;
+	int	  n_group;
+	int	  topk_group;
+	int	  has_bias;
+}
+params;
+
+#define MAX_TOPK 64
+
+void heap_sift_down(inout float score[MAX_TOPK], inout int idx[MAX_TOPK], int n) {
+	int pos = 0;
+	for (;;) {
+		int l		 = 2 * pos + 1;
+		int r		 = 2 * pos + 2;
+		int smallest = pos;
+		if (l < n && score[l] < score[smallest])
+			smallest = l;
+		if (r < n && score[r] < score[smallest])
+			smallest = r;
+		if (smallest == pos)
+			return;
+		float ts		= score[pos];
+		score[pos]		= score[smallest];
+		score[smallest] = ts;
+		int ti			= idx[pos];
+		idx[pos]		= idx[smallest];
+		idx[smallest]	= ti;
+		pos				= smallest;
+	}
+}
+
+void heap_offer(inout float score[MAX_TOPK], inout int idx[MAX_TOPK], inout int n, int k, float s,
+				int id) {
+	if (n < k) {
+		idx[n]	 = id;
+		score[n] = s;
+		int pos	 = n++;
+		while (pos > 0) {
+			int parent = (pos - 1) / 2;
+			if (score[parent] <= score[pos])
+				break;
+			float ts	  = score[pos];
+			score[pos]	  = score[parent];
+			score[parent] = ts;
+			int ti		  = idx[pos];
+			idx[pos]	  = idx[parent];
+			idx[parent]	  = ti;
+			pos			  = parent;
+		}
+		return;
+	}
+	if (s > score[0]) {
+		score[0] = s;
+		idx[0]	 = id;
+		heap_sift_down(score, idx, n);
+	}
+}
+
+float expert_score(uint base, int e, float max_logit, float sum_exp) {
+	float l = logits[base + uint(e)];
+	if (params.use_softmax != 0)
+		return exp(l - max_logit) / sum_exp;
+	return (1.0 / (1.0 + exp(-l))) + (params.has_bias != 0 ? bias[e] : 0.0);
+}
+
+int group_of(int e, int epg, int rem) {
+	int boundary = rem * (epg + 1);
+	if (e < boundary)
+		return e / (epg + 1);
+	return rem + (e - boundary) / epg;
+}
+
+void main() {
+	uint row = gl_GlobalInvocationID.x;
+	if (row >= uint(params.rows))
+		return;
+
+	int	 E	  = params.n_experts;
+	int	 K	  = min(params.top_k, MAX_TOPK);
+	uint base = row * uint(E);
+	uint slot = row * uint(params.top_k);
+	uint wofs = uint(params.rows) * uint(params.top_k);
+
+	bool finite = true;
+	for (int e = 0; e < E; e++) {
+		float l = logits[base + uint(e)];
+		if (isnan(l) || isinf(l))
+			finite = false;
+	}
+	if (!finite) {
+		for (int k = 0; k < params.top_k; k++) {
+			result[slot + uint(k)]		  = -2.0;
+			result[wofs + slot + uint(k)] = 0.0;
+		}
+		return;
+	}
+
+	float max_logit = 0.0;
+	float sum_exp	= 1.0;
+	if (params.use_softmax != 0) {
+		max_logit = logits[base];
+		for (int e = 1; e < E; e++)
+			max_logit = max(max_logit, logits[base + uint(e)]);
+		sum_exp = 0.0;
+		for (int e = 0; e < E; e++)
+			sum_exp += exp(logits[base + uint(e)] - max_logit);
+	}
+
+	float hs[MAX_TOPK];
+	int	  hi[MAX_TOPK];
+	int	  hn = 0;
+
+	bool grouped = params.use_softmax == 0 && params.n_group > 1 && params.topk_group > 0 &&
+				   params.topk_group < params.n_group && params.n_group <= E;
+	if (!grouped) {
+		for (int e = 0; e < E; e++)
+			heap_offer(hs, hi, hn, K, expert_score(base, e, max_logit, sum_exp), e);
+	} else {
+		float gs[MAX_TOPK];
+		int	  gi[MAX_TOPK];
+		int	  gn	  = 0;
+		int	  epg	  = E / params.n_group;
+		int	  rem	  = E % params.n_group;
+		int	  g_start = 0;
+		for (int g = 0; g < params.n_group; g++) {
+			int	  g_end	 = g_start + epg + (g < rem ? 1 : 0);
+			float best	 = -1e30;
+			float second = -1e30;
+			for (int e = g_start; e < g_end; e++) {
+				float s = expert_score(base, e, max_logit, sum_exp);
+				if (s > best) {
+					second = best;
+					best   = s;
+				} else if (s > second) {
+					second = s;
+				}
+			}
+			heap_offer(gs, gi, gn, params.topk_group, best + second, g);
+			g_start = g_end;
+		}
+		bool selected[MAX_TOPK];
+		for (int g = 0; g < MAX_TOPK; g++)
+			selected[g] = false;
+		for (int i = 0; i < gn; i++)
+			selected[gi[i]] = true;
+		for (int e = 0; e < E; e++)
+			if (selected[group_of(e, epg, rem)])
+				heap_offer(hs, hi, hn, K, expert_score(base, e, max_logit, sum_exp), e);
+	}
+
+	float weight[MAX_TOPK];
+	for (int k = 0; k < K; k++) {
+		if (k >= hn) {
+			hi[k] = -1;
+			hs[k] = -1e30;
+		}
+		if (params.use_softmax != 0)
+			weight[k] = hs[k];
+		else
+			weight[k] = hi[k] >= 0 ? hs[k] - (params.has_bias != 0 ? bias[hi[k]] : 0.0) : 0.0;
+	}
+
+	float inv = params.routed_scale;
+	if (params.norm_topk != 0) {
+		float sum = 0.0;
+		for (int k = 0; k < K; k++)
+			sum += weight[k];
+		if (sum > 1e-20)
+			inv = params.routed_scale / sum;
+	}
+	for (int k = 0; k < params.top_k; k++) {
+		bool valid					  = k < K;
+		result[slot + uint(k)]		  = valid ? float(hi[k]) : -1.0;
+		result[wofs + slot + uint(k)] = valid ? weight[k] * inv : 0.0;
+	}
+}

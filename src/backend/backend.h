@@ -493,6 +493,9 @@ struct backend {
 									 const int *rows_packed, const float *weights_packed);
 	status_code (*moe_activate)(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								int n, float gate_scale, float up_scale, int use_gelu);
+	status_code (*moe_router_topk)(backend *self, const buffer *logits, const buffer *bias,
+								   buffer *out, int rows, int n_experts, int top_k, int use_softmax,
+								   int norm_topk, float routed_scale, int n_group, int topk_group);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
 	cpu_cache_info (*cpu_info)(void);

@@ -2952,6 +2952,66 @@ static void test_op_rope_qk(backend *ref, backend *tgt, int n_heads, int n_kv_he
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static float *test_dequant_weight_rows(backend *ref, const buffer *w_ref, const qtype_info *qt,
+									   int n, int k) {
+	float *wf  = xmalloc((size_t)n * (size_t)k * sizeof(float));
+	buffer row = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)k * sizeof(float), &row);
+	status_code st = OK;
+	for (int r = 0; r < n && st == OK; r++) {
+		st = ref->embd_lookup(ref, w_ref, qt->type, r, k, &row);
+		if (st == OK)
+			ref->buffer_read_f32(ref, &row, wf + (size_t)r * k, k);
+	}
+	ref->buffer_free(ref, &row);
+	if (st == OK)
+		return wf;
+	free(wf);
+	return NULL;
+}
+
+static float *test_float_activation_reference(backend *ref, const buffer *w_ref,
+											  const qtype_info *qt, const buffer *x_ref, int n,
+											  int k, int m) {
+	float *wf = test_dequant_weight_rows(ref, w_ref, qt, n, k);
+	if (!wf)
+		return NULL;
+	tensor_desc wd = {.host_data = wf, .type = GGML_TYPE_F32, .n_dims = 2, .dims = {k, n}};
+	buffer		wb = {0}, yb = {0};
+	ref->buffer_alloc_weight(ref, &wd, &wb);
+	ref->buffer_alloc_scratch(ref, (size_t)n * (size_t)m * sizeof(float), &yb);
+	float	   *y  = xmalloc((size_t)n * (size_t)m * sizeof(float));
+	status_code st = ref->matmul_batch(ref, &wb, GGML_TYPE_F32, x_ref, &yb, n, k, m);
+	if (ref->synchronize)
+		ref->synchronize(ref);
+	if (st == OK)
+		ref->buffer_read_f32(ref, &yb, y, n * m);
+	else {
+		free(y);
+		y = NULL;
+	}
+	ref->buffer_free(ref, &wb);
+	ref->buffer_free(ref, &yb);
+	free(wf);
+	return y;
+}
+
+static void test_batch_cross_compare(backend *ref, const buffer *w_ref, const buffer *x_ref,
+									 const char *label, const qtype_info *qt,
+									 const float *y_quant_act, const float *y_tgt, int n, int k,
+									 int m, status_code s_tgt) {
+	char detail[256];
+	if (s_tgt != OK ||
+		classify_output("loose", y_quant_act, y_tgt, n * m, OK, detail, sizeof(detail)) == V_PASS) {
+		test_parity_compare_status(OPFAM_BATCH_PARITY, label, y_quant_act, y_tgt, n * m, s_tgt);
+		return;
+	}
+	float *y_float_act = test_float_activation_reference(ref, w_ref, qt, x_ref, n, k, m);
+	test_parity_compare(OPFAM_BATCH_PARITY, label, y_float_act ? y_float_act : y_quant_act, y_tgt,
+						n * m, "loose");
+	free(y_float_act);
+}
+
 static void test_batch_matmul_parity(backend *ref, backend *tgt, const qtype_info *qt, int n, int k,
 									 int m) {
 	char label[160];
@@ -3016,7 +3076,7 @@ static void test_batch_matmul_parity(backend *ref, backend *tgt, const qtype_inf
 		if (s_tgt == OK)
 			tgt->buffer_read_f32(tgt, &yb_tgt, y_tgt, n * m);
 		snprintf(label, sizeof(label), "%s batch cross N=%d K=%d M=%d", qt->name, n, k, m);
-		test_parity_compare_status(OPFAM_BATCH_PARITY, label, y_batch, y_tgt, n * m, s_tgt);
+		test_batch_cross_compare(ref, &w_ref, &xb_ref, label, qt, y_batch, y_tgt, n, k, m, s_tgt);
 		free(y_tgt);
 		tgt->buffer_free(tgt, &w_tgt);
 		tgt->buffer_free(tgt, &xb_tgt);

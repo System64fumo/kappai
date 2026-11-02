@@ -35,18 +35,21 @@
 #define XQ_S_WORD 9u
 
 #ifdef IQ4_NL
-shared uint s_kv[16];
+shared uint s_kv[4][16];
 const uint	KV_BYTES[16] = uint[16](0x81u, 0x98u, 0xADu, 0xBFu, 0xCFu, 0xDDu, 0xEAu, 0xF6u, 0x01u,
 									0x0Du, 0x19u, 0x26u, 0x35u, 0x45u, 0x59u, 0x71u);
 
 void qblock_init() {
-	if (gl_LocalInvocationIndex < 16u)
-		s_kv[gl_LocalInvocationIndex] = KV_BYTES[gl_LocalInvocationIndex];
+	if (gl_LocalInvocationIndex < 64u)
+		s_kv[gl_LocalInvocationIndex >> 4u][gl_LocalInvocationIndex & 15u] =
+			KV_BYTES[gl_LocalInvocationIndex & 15u] << ((gl_LocalInvocationIndex >> 4u) * 8u);
 }
 
-uint kv4(uint nib) {
-	return s_kv[nib & 0xFu] | (s_kv[(nib >> 8u) & 0xFu] << 8u) |
-		   (s_kv[(nib >> 16u) & 0xFu] << 16u) | (s_kv[nib >> 24u] << 24u);
+uint kv4(uint q, uint shift) {
+	return s_kv[0][bitfieldExtract(q, int(shift), 4)] |
+		   s_kv[1][bitfieldExtract(q, int(shift + 8u), 4)] |
+		   s_kv[2][bitfieldExtract(q, int(shift + 16u), 4)] |
+		   s_kv[3][bitfieldExtract(q, int(shift + 24u), 4)];
 }
 #else
 void qblock_init() {}
@@ -88,8 +91,8 @@ void load_wpart(uint b, uint p, out uint wa, out uint wb, out float d, out float
 	hi |= spread4((qh >> (16u + 4u * p)) & 0xFu);
 #endif
 #if defined(IQ4_NL)
-	wa = kv4(lo);
-	wb = kv4(hi);
+	wa = kv4(q, 0u);
+	wb = kv4(q, 4u);
 #elif defined(Q4_0)
 	wa = sub_bytes(lo, 0x08080808u);
 	wb = sub_bytes(hi, 0x08080808u);

@@ -100,6 +100,9 @@ struct batch_scratch {
 	float_buf moe_router_inp;
 	buffer	  moe_router_logits_dev;
 	buffer	  moe_router_inp_dev;
+	buffer	  moe_router_bias_dev;
+	buffer	  moe_router_out_dev;
+	float_buf moe_router_out;
 	float_buf moe_xb_f;
 
 	float_buf moe_gather_x;

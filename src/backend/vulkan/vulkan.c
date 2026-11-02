@@ -22,6 +22,7 @@
 #define VK_PROF_SLOT_CAP 4096
 #define VK_QMM_MIN_M 16
 #define VK_MMF_TYPES 21
+#define VK_MOE_ROUTER_MAX_TOPK 64
 #define VK_MMF_FIRST_GRID 8
 #define VK_MV_FIRST 3
 #define VK_MV_PIPE_OFFSET 9
@@ -327,6 +328,7 @@ typedef struct {
 	vk_pipeline_set p_sample_full_sum;
 	vk_pipeline_set p_sample_full_draw;
 	vk_pipeline_set p_moe_gather;
+	vk_pipeline_set p_moe_router;
 	vk_pipeline_set p_moe_combine;
 	vk_pipeline_set p_matmul_q4_0_batch;
 	vk_pipeline_set p_matmul_q4_0_dual_batch;
@@ -1012,6 +1014,7 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_sample_full_sum,
 			&p->p_sample_full_draw,
 			&p->p_moe_gather,
+			&p->p_moe_router,
 			&p->p_moe_combine,
 			&p->p_matmul_q4_0_batch,
 			&p->p_matmul_q4_0_dual_batch,
@@ -2723,6 +2726,11 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_moe_gather.name = "moe_gather";
+	s = vk_create_pipeline(p, shader_moe_router_spv, shader_moe_router_spv_len, 3, 36,
+						   &p->p_moe_router);
+	if (s != OK)
+		return s;
+	p->p_moe_router.name = "moe_router";
 	s = vk_create_pipeline(p, shader_moe_combine_spv, shader_moe_combine_spv_len, 4, 12,
 						   &p->p_moe_combine);
 	if (s != OK)
@@ -3017,6 +3025,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_sample_full_sum);
 		vk_destroy_pipeline(p, &p->p_sample_full_draw);
 		vk_destroy_pipeline(p, &p->p_moe_gather);
+		vk_destroy_pipeline(p, &p->p_moe_router);
 		vk_destroy_pipeline(p, &p->p_moe_combine);
 
 		vk_destroy_pipeline(p, &p->p_matmul_q4_0_batch);
@@ -6602,11 +6611,12 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 
 	int all_mmf = 1;
 	for (int i = 0; i < n_matmuls; i++)
-		all_mmf &= vk_mmf_usable(p, w_types[i], k, m);
+		all_mmf &= n_list[i] <= 0 || vk_mmf_usable(p, w_types[i], k, m);
 	if (all_mmf) {
 		status_code st = OK;
 		for (int i = 0; i < n_matmuls && st == OK; i++)
-			st = vk_mmf_run(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
+			if (n_list[i] > 0)
+				st = vk_mmf_run(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
 		return st;
 	}
 
@@ -7393,6 +7403,41 @@ static status_code vk_ffn_activate_batch(backend *self, const buffer *gate, cons
 	return vk_ffn_activate_batch_scales(self, gate, up, out, n, activation, m, 1.0f, 1.0f);
 }
 
+static status_code vk_require_resident(backend *self, const char *op, const buffer *const *bufs,
+									   int n);
+
+static status_code vk_moe_router_topk(backend *self, const buffer *logits, const buffer *bias,
+									  buffer *out, int rows, int n_experts, int top_k,
+									  int use_softmax, int norm_topk, float routed_scale,
+									  int n_group, int topk_group) {
+	vk_priv *p = self->priv;
+	if (!p->p_moe_router.pipeline || top_k > VK_MOE_ROUTER_MAX_TOPK)
+		return ERR_UNSUPPORTED;
+	int grouped = !use_softmax && n_group > 1 && topk_group > 0 && topk_group < n_group &&
+				  n_group <= n_experts;
+	if (grouped && n_group > VK_MOE_ROUTER_MAX_TOPK)
+		return ERR_UNSUPPORTED;
+	if (rows <= 0 || n_experts <= 0 || top_k <= 0)
+		return ERR_INVALID_ARG;
+
+	const buffer *resident[3] = {logits, out, bias};
+	status_code	  s = vk_require_resident(self, "moe_router_topk", resident, bias ? 3 : 2);
+	if (s != OK)
+		return s;
+
+	vk_buf *dummy = vk_dummy_buf(p);
+	struct {
+		int32_t rows, n_experts, top_k, use_softmax, norm_topk;
+		float	routed_scale;
+		int32_t n_group, topk_group, has_bias;
+	} push				 = {rows,		  n_experts, top_k,		 use_softmax, norm_topk,
+							routed_scale, n_group,	 topk_group, bias ? 1 : 0};
+	vk_buf		*bufs[3] = {as_vkbuf(logits), bias ? as_vkbuf(bias) : dummy, as_vkbuf(out)};
+	VkDeviceSize offs[3] = {logits->offset, bias ? bias->offset : 0, out->offset};
+	return vk_dispatch_ex(p, &p->p_moe_router, bufs, offs, NULL, 3, &push, sizeof(push),
+						  (uint32_t)((rows + 63) / 64), 1, 1u << 2);
+}
+
 static status_code vk_moe_activate(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								   int n, float gate_scale, float up_scale, int use_gelu) {
 	return vk_ffn_activate_batch_scales(self, gate, up, out, n, use_gelu ? 1 : 0, 1, gate_scale,
@@ -7413,7 +7458,9 @@ static status_code vk_require_resident(backend *self, const char *op, const buff
 		const buffer *b = bufs[i];
 		if (b && b->handle && b->owner == self)
 			continue;
-		ERROR("vk: %s: operand %d is not resident on '%s'", op, i, self->name);
+		ERROR("vk: %s: operand %d is not resident on '%s' (%s, owner '%s', host_ptr %s)", op, i,
+			  self->name, !b ? "null buffer" : (b->handle ? "has handle" : "no handle"),
+			  b && b->owner ? b->owner->name : "none", b && b->host_ptr ? "set" : "unset");
 		return ERR_INVALID_ARG;
 	}
 	return OK;
@@ -7908,8 +7955,17 @@ static status_code vk_attention_mla(backend *self, const buffer *q, const buffer
 			  ggml_type_name(v_b_type));
 		return ERR_UNSUPPORTED;
 	}
-	const buffer *ops[] = {q, k_b_w, v_b_w, out};
-	status_code	  s		= vk_require_resident(self, "attention_mla", ops, 4);
+	const buffer *ops[4];
+	int			  n_ops = 0;
+	if (qk_head > 0)
+		ops[n_ops++] = q;
+	if (qk_nope > 0 && kv_lora > 0)
+		ops[n_ops++] = k_b_w;
+	if (kv_lora > 0 && v_head > 0)
+		ops[n_ops++] = v_b_w;
+	if (v_head > 0)
+		ops[n_ops++] = out;
+	status_code s = vk_require_resident(self, "attention_mla", ops, n_ops);
 	if (s != OK)
 		return s;
 
@@ -8089,6 +8145,7 @@ static status_code vk_ctor(backend *out) {
 	out->moe_expert_ffn					 = vk_moe_expert_ffn;
 	out->moe_experts_batch				 = vk_moe_experts_batch;
 	out->moe_activate					 = vk_moe_activate;
+	out->moe_router_topk				 = vk_moe_router_topk;
 	out->copy_buffer					 = vk_copy_buffer;
 	out->ple_combine					 = vk_ple_combine;
 	out->ffn_activate					 = vk_ffn_activate;
