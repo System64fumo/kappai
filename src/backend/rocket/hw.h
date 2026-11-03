@@ -117,4 +117,32 @@
 
 enum { PREC_INT8 = 0, PREC_FLOAT16 = 2, PREC_INT32 = 4, PREC_FLOAT32 = 5 };
 
+#define DPU_BS_CFG_ALU_ALGO(x) (((uint32_t)(x) & 0xFu) << 16)
+#define DPU_BS_CFG_ALU_SRC(x) (((uint32_t)(x) & 0x1u) << 8)
+#define DPU_BS_CFG_RELUX_EN(x) (((uint32_t)(x) & 0x1u) << 7)
+#define DPU_BS_CFG_RELU_BYPASS(x) (((uint32_t)(x) & 0x1u) << 6)
+#define DPU_BS_CFG_MUL_PRELU(x) (((uint32_t)(x) & 0x1u) << 5)
+#define DPU_BS_CFG_MUL_BYPASS(x) (((uint32_t)(x) & 0x1u) << 4)
+#define DPU_BS_CFG_ALU_BYPASS(x) (((uint32_t)(x) & 0x1u) << 1)
+#define DPU_BS_CFG_BYPASS(x) ((uint32_t)(x) & 0x1u)
+
+#define DPU_EW_CFG_CVT_TYPE(x) (((uint32_t)(x) & 0x1u) << 31)
+#define DPU_EW_CFG_DATA_MODE(x) (((uint32_t)(x) & 0x3u) << 28)
+#define DPU_EW_CFG_EDATA_SIZE(x) (((uint32_t)(x) & 0x3u) << 22)
+#define DPU_EW_CFG_ALU_ALGO(x) (((uint32_t)(x) & 0xFu) << 16)
+#define DPU_EW_CFG_RELUX_EN(x) (((uint32_t)(x) & 0x1u) << 10)
+#define DPU_EW_CFG_RELU_BYPASS(x) (((uint32_t)(x) & 0x1u) << 9)
+#define DPU_EW_CFG_LUT_BYPASS(x) (((uint32_t)(x) & 0x1u) << 7)
+#define DPU_EW_CFG_OP_SRC(x) (((uint32_t)(x) & 0x1u) << 6)
+#define DPU_EW_CFG_OP_TYPE(x) (((uint32_t)(x) & 0x1u) << 2)
+#define DPU_EW_CFG_OP_BYPASS(x) (((uint32_t)(x) & 0x1u) << 1)
+#define DPU_EW_CFG_BYPASS(x) ((uint32_t)(x) & 0x1u)
+
+#define DPU_LUT_ACCESS_CFG_TYPE(x) (((uint32_t)(x) & 0x1u) << 17)
+#define DPU_LUT_ACCESS_CFG_TABLE_ID(x) (((uint32_t)(x) & 0x1u) << 16)
+#define DPU_LUT_ACCESS_CFG_ADDR(x) ((uint32_t)(x) & 0x3FFu)
+#define DPU_LUT_CFG_ROAD_SEL(x) ((uint32_t)(x) & 0x1u)
+#define DPU_LUT_INFO_LO_INDEX_SELECT(x) (((uint32_t)(x) & 0xFFu) << 16)
+#define DPU_LUT_INFO_LE_INDEX_SELECT(x) (((uint32_t)(x) & 0xFFu) << 8)
+
 #endif

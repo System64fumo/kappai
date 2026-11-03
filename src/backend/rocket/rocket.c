@@ -13,6 +13,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#define RKT_FFNA_SILU 0
+#define RKT_FFNA_GELU 1
+
 #define RKT_DEVICE_PATH "/dev/accel/accel0"
 #define RKT_WEIGHT_MAGIC 0x524B5457u
 #define RKT_TIMEOUT_NS 10000000000LL
@@ -21,6 +24,8 @@
 #define RKT_F16_BLOCK_BYTES (CBUF_BANK_BYTES * 2)
 #define RKT_TILE_ROWS 16
 #define RKT_TILE_COLS 32
+
+#define RKT_FOLD_K_LEN RKT_K_ALIGN
 
 typedef struct {
 	rkt_bo bo;
@@ -32,6 +37,8 @@ typedef struct {
 	int		 k_off;
 	int		 k_len;
 	rkt_part part[RKT_MAX_CORES];
+	int		 fold_ready;
+	rkt_bo	 fold_bo[RKT_MAX_CORES];
 } rkt_kchunk;
 
 typedef struct rkt_weight rkt_weight;
@@ -46,9 +53,6 @@ struct rkt_weight {
 	int			n_kchunks;
 	rkt_kchunk *kchunks;
 	void	   *host_copy;
-	/* set once this weight's rows were merged into a larger fused weight; the
-	 * weight then owns no NPU state and is addressed as rows [fused_row0, ..)
-	 * of fused_parent */
 	rkt_weight *fused_parent;
 	int			fused_row0;
 	int			fuse_tried;
@@ -65,6 +69,21 @@ typedef enum {
 	SLOT_BATCH,
 	SLOT_CLASSES,
 } slot_class;
+
+struct rkt_act_cache {
+	int			n;
+	int			k;
+	int			uploaded_kind;
+	rkt_lut_cfg cfg;
+	int			n_weight_cores;
+	int			weight_core_start[RKT_MAX_CORES];
+	int			weight_core_count[RKT_MAX_CORES];
+	rkt_bo		weight_core[RKT_MAX_CORES];
+	rkt_bo		in[RKT_MAX_CORES];
+	rkt_bo		out[RKT_MAX_CORES];
+	rkt_bo		regcmd[RKT_MAX_CORES];
+};
+typedef struct rkt_act_cache rkt_act_cache;
 
 typedef struct {
 	rkt_device		dev;
@@ -89,6 +108,9 @@ typedef struct {
 	size_t			y_tmp_cap;
 	float		   *attn_ws;
 	size_t			attn_ws_cap;
+	rkt_act_cache	act;
+	float		   *act_tmp;
+	size_t			act_tmp_cap;
 } rkt_priv;
 
 static inline uint16_t f32_to_f16_bits(float v) {
@@ -197,9 +219,13 @@ static int unregister_weight(rkt_priv *p, const rkt_weight *w) {
 }
 
 static void destroy_weight(rkt_priv *p, rkt_weight *w) {
-	for (int ci = 0; ci < w->n_kchunks; ci++)
-		for (int c = 0; c < RKT_MAX_CORES; c++)
+	for (int ci = 0; ci < w->n_kchunks; ci++) {
+		for (int c = 0; c < RKT_MAX_CORES; c++) {
 			rkt_bo_destroy(&p->dev, &w->kchunks[ci].part[c].bo);
+			rkt_bo_destroy(&p->dev, &w->kchunks[ci].fold_bo[c]);
+		}
+		w->kchunks[ci].fold_ready = 0;
+	}
 	free(w->kchunks);
 	free(w->host_copy);
 	w->magic = 0;
@@ -357,9 +383,13 @@ static void keep_on_host(rkt_weight *w, const tensor_desc *desc) {
 }
 
 static void release_npu_state(rkt_priv *p, rkt_weight *w) {
-	for (int ci = 0; ci < w->n_kchunks; ci++)
-		for (int c = 0; c < RKT_MAX_CORES; c++)
+	for (int ci = 0; ci < w->n_kchunks; ci++) {
+		for (int c = 0; c < RKT_MAX_CORES; c++) {
 			rkt_bo_destroy(&p->dev, &w->kchunks[ci].part[c].bo);
+			rkt_bo_destroy(&p->dev, &w->kchunks[ci].fold_bo[c]);
+		}
+		w->kchunks[ci].fold_ready = 0;
+	}
 	free(w->kchunks);
 	w->kchunks	 = NULL;
 	w->n_kchunks = 0;
@@ -680,6 +710,58 @@ static const uint16_t *chunk_input(rkt_priv *p, const rkt_kchunk *kc, int k, int
 	return p->x_chunk;
 }
 
+static status_code npu_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, int n,
+								   const uint16_t *x16, float *y, int m) {
+	for (int ci = 0; ci < w->n_kchunks; ci++) {
+		const rkt_kchunk *kc = &w->kchunks[ci];
+		int				  ok;
+		const uint16_t	 *xc = chunk_input(p, kc, w->k_pad, m, &ok);
+		if (!ok)
+			return ERR_OUT_OF_MEMORY;
+
+		block_ctx b = {
+			.w = w, .kc = kc, .row0 = row0, .n = n, .m = m, .y = y, .accumulate = ci > 0};
+		int max_rows = max_batch_rows(kc->k_len);
+		for (int done = 0; done < m;) {
+			int blk		  = next_block_rows(m - done, max_rows);
+			b.m_done	  = done;
+			b.cls		  = blk == 1 ? SLOT_DECODE : SLOT_BATCH;
+			status_code s = run_block(p, &b, blk, xc + (size_t)done * kc->k_len);
+			if (s != OK)
+				return s;
+			done += blk;
+		}
+	}
+
+	const rkt_kchunk *kc = &w->kchunks[0];
+	if (!ensure_capacity((void **)&p->x_chunk, &p->x_chunk_cap, (size_t)m * RKT_FOLD_K_LEN,
+						 sizeof(uint16_t)))
+		return ERR_OUT_OF_MEMORY;
+	memset(p->x_chunk, 0, (size_t)m * RKT_FOLD_K_LEN * sizeof(uint16_t));
+	for (int r = 0; r < m; r++)
+		p->x_chunk[(size_t)r * RKT_FOLD_K_LEN] = x16[(size_t)r * w->k_pad + w->k];
+
+	rkt_kchunk fold_kc = {
+		.k_off = w->k,
+		.k_len = RKT_FOLD_K_LEN,
+	};
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		fold_kc.part[c]	   = kc->part[c];
+		fold_kc.part[c].bo = kc->fold_bo[c];
+	}
+	block_ctx fb = {.w = w, .kc = &fold_kc, .row0 = row0, .n = n, .m = m, .y = y, .accumulate = 1};
+	for (int done = 0; done < m;) {
+		int blk		  = next_block_rows(m - done, RKT_TILE_ROWS);
+		fb.m_done	  = done;
+		fb.cls		  = blk == 1 ? SLOT_DECODE : SLOT_BATCH;
+		status_code s = run_block(p, &fb, blk, p->x_chunk + (size_t)done * RKT_FOLD_K_LEN);
+		if (s != OK)
+			return s;
+		done += blk;
+	}
+	return OK;
+}
+
 static status_code npu_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
 							  float *y, int m) {
 	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m * w->k_pad, sizeof(uint16_t)))
@@ -818,11 +900,6 @@ static void copy_weight_row(const rkt_part *sp, int s_row, const rkt_part *dp, i
 	}
 }
 
-/* Merge several NPU-resident weights that share K (and always run on the same input) into one
- * weight whose rows are the members' padded rows back to back. A job's cost is a fixed
- * submit/sync overhead (~0.2 ms) plus weight streaming, so one job over the merged rows is cheaper
- * than one job per member. The members become aliases of the merged weight, so single-weight
- * calls keep working. Caller holds p->lock. Returns the merged weight or NULL (nothing changed). */
 static rkt_weight *fuse_weights(rkt_priv *p, rkt_weight **ws, int count) {
 	int total = 0;
 	for (int i = 0; i < count; i++) {
@@ -907,8 +984,6 @@ static status_code run_npu_or_cpu(rkt_priv *p, const rkt_weight *w, int row0, in
 	return s;
 }
 
-/* One job set for several weights that share the input. ERR_UNSUPPORTED means "not fusable, run
- * them one by one". */
 static status_code multi_fused(backend *self, const buffer **w, const buffer *x, buffer **y,
 							   const int *n_list, int k, int n_matmuls, int m) {
 	rkt_priv   *p = self->priv;
@@ -992,24 +1067,452 @@ static status_code rkt_matmul_multi(backend *self, const buffer **w, const uint3
 	return rkt_matmul_multi_batch(self, w, w_types, x, y, n_list, k, n_matmuls, 1);
 }
 
+static int ensure_fold_bos(rkt_priv *p, rkt_kchunk *kc) {
+	if (kc->fold_ready)
+		return 1;
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		if (!kc->part[c].bo.map || kc->part[c].row_count <= 0)
+			continue;
+		size_t bytes = (size_t)kc->part[c].row_count * RKT_FOLD_K_LEN * sizeof(uint16_t);
+		if (rkt_bo_create(&p->dev, kc->part[c].bo.core, bytes, &kc->fold_bo[c]))
+			return 0;
+	}
+	kc->fold_ready = 1;
+	return 1;
+}
+
 static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 									   const buffer *x, const buffer *residual, buffer *y, int n,
 									   int k) {
-	const float *r	  = rkt_ptr(residual);
-	float		*copy = NULL;
-	if (r == rkt_ptr(y)) {
-		copy = xmalloc((size_t)n * sizeof(float));
-		memcpy(copy, r, (size_t)n * sizeof(float));
-		r = copy;
+	(void)w_type;
+	rkt_priv   *p  = self->priv;
+	rkt_weight *wt = w->handle;
+	if (!wt || wt->magic != RKT_WEIGHT_MAGIC || wt->k != k)
+		return ERR_INVALID_ARG;
+	if (w->offset % wt->src_row_bytes != 0)
+		return ERR_INVALID_ARG;
+	int row0 = (int)(w->offset / wt->src_row_bytes);
+	if (row0 + n > wt->n)
+		return ERR_INVALID_ARG;
+	if (wt->fused_parent) {
+		row0 += wt->fused_row0;
+		wt = wt->fused_parent;
 	}
-	status_code s = rkt_matmul(self, w, w_type, x, y, n, k);
-	if (s == OK) {
-		float *yf = rkt_ptr(y);
+	if (wt->host_copy || wt->n_kchunks != 1 || wt->kchunks[0].k_len + RKT_FOLD_K_LEN > p->max_k ||
+		wt->k_pad != wt->k || rkt_ptr(residual) == NULL) {
+		const float *rr = rkt_ptr(residual);
+		float		*rc = NULL;
+		if (rr && rr == rkt_ptr(y)) {
+			rc = xmalloc((size_t)n * sizeof(float));
+			memcpy(rc, rr, (size_t)n * sizeof(float));
+			rr = rc;
+		}
+		status_code s2 = rkt_matmul(self, w, w_type, x, y, n, k);
+		if (s2 == OK && rr) {
+			float *y2 = rkt_ptr(y);
+			for (int i = 0; i < n; i++)
+				y2[i] += rr[i];
+		}
+		free(rc);
+		return s2;
+	}
+
+	const float *xf	   = rkt_ptr(x);
+	float		*yf	   = rkt_ptr(y);
+	const float *r	   = rkt_ptr(residual);
+	float		*rcopy = NULL;
+	if (r == yf) {
+		rcopy = xmalloc((size_t)n * sizeof(float));
+		memcpy(rcopy, r, (size_t)n * sizeof(float));
+		r = rcopy;
+	}
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = ERR_COMPUTE_FAIL;
+	if (!p->npu_failed) {
+		rkt_kchunk *kc = &wt->kchunks[0];
+		if (ensure_fold_bos(p, kc)) {
+			for (int c = 0; c < RKT_MAX_CORES; c++) {
+				if (!kc->fold_bo[c].map)
+					continue;
+				memset(kc->fold_bo[c].map, 0, kc->fold_bo[c].size);
+				uint16_t wr[RKT_FOLD_K_LEN];
+				for (int rr = 0; rr < kc->part[c].row_count; rr++) {
+					int global = kc->part[c].row_start + rr;
+					memset(wr, 0, sizeof(wr));
+					if (global >= row0 && global < row0 + n)
+						wr[0] = f32_to_f16_bits(r[global - row0]);
+					tile_weight_row(kc->fold_bo[c].map, wr, RKT_FOLD_K_LEN, rr);
+				}
+				if (rkt_bo_flush(&p->dev, &kc->fold_bo[c]))
+					s = ERR_IO;
+			}
+			if (s == OK) {
+				if (ensure_capacity((void **)&p->x16, &p->x16_cap,
+									(size_t)1 * (wt->k + RKT_FOLD_K_LEN), sizeof(uint16_t))) {
+					convert_to_f16(p->x16, xf, (size_t)k);
+					memset(p->x16 + k, 0, (size_t)(wt->k_pad - wt->k) * sizeof(uint16_t));
+					p->x16[k] = 0x3C00u;
+					s		  = npu_matmul_fold(p, wt, row0, n, p->x16, yf, 1);
+				} else {
+					s = ERR_OUT_OF_MEMORY;
+				}
+			}
+		}
+	}
+	if (s != OK && !p->npu_failed) {
+		p->npu_failed = 1;
+		WARN("rocket: npu residual-fold matmul failed (n=%d k=%d status=%d, errno=%d), npu "
+			 "disabled, using cpu",
+			 n, k, s, errno);
+	}
+	if (s != OK) {
+		tiled_matmul_cpu(wt, row0, n, xf, yf, 1);
+		float *y2 = rkt_ptr(y);
 		for (int i = 0; i < n; i++)
-			yf[i] += r[i];
+			y2[i] += r[i];
+		s = OK;
 	}
-	free(copy);
+	pthread_mutex_unlock(&p->lock);
+	free(rcopy);
 	return s;
+}
+
+#define RKT_LUT_HQ_SEL 4
+
+static double rkt_lut_fn(rkt_lut_kind kind, double x) {
+	if (kind == RKT_LUT_GELU_TANH)
+		return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+	return x / (1.0 + exp(-x));
+}
+
+static void rkt_lut_build(rkt_lut_cfg *cfg, uint16_t *le) {
+	cfg->kind		= RKT_LUT_NONE;
+	cfg->sel		= RKT_LUT_HQ_SEL;
+	cfg->S			= 256;
+	cfg->F			= 2048;
+	cfg->start		= -(RKT_LUT_WINDOW_HALF << cfg->sel);
+	cfg->end		= (RKT_LUT_WINDOW_HALF << cfg->sel) - 1;
+	cfg->tail_slope = cfg->F / cfg->S;
+	if (!le)
+		return;
+
+	long step = 1L << cfg->sel;
+	for (int i = 0; i < RKT_LUT_ENTRIES; i++) {
+		long   y_int = (long)cfg->start + (long)i * step;
+		double v	 = rkt_lut_fn(cfg->kind, (double)y_int / cfg->S) * cfg->F;
+		long   r	 = lround(v);
+		if (r > 32767)
+			r = 32767;
+		if (r < -32768)
+			r = -32768;
+		le[i] = (uint16_t)((int32_t)r & 0xFFFF);
+	}
+}
+
+static void rkt_act_cache_reset(rkt_priv *p, rkt_act_cache *a) {
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		rkt_bo_destroy(&p->dev, &a->weight_core[c]);
+		rkt_bo_destroy(&p->dev, &a->in[c]);
+		rkt_bo_destroy(&p->dev, &a->out[c]);
+		rkt_bo_destroy(&p->dev, &a->regcmd[c]);
+	}
+	a->n = a->k		  = 0;
+	a->n_weight_cores = 0;
+	a->uploaded_kind  = -1;
+}
+
+static status_code rkt_lut_upload_tables(rkt_priv *p, rkt_act_cache *a, const uint16_t *le) {
+	uint16_t chunk[RKT_LUT_UPLOAD_CHUNK];
+	for (int off = 0; off < RKT_LUT_ENTRIES; off += RKT_LUT_UPLOAD_CHUNK) {
+		int count = RKT_LUT_ENTRIES - off < RKT_LUT_UPLOAD_CHUNK ? RKT_LUT_ENTRIES - off
+																 : RKT_LUT_UPLOAD_CHUNK;
+		for (int i = 0; i < count; i++)
+			chunk[i] = le[off + i];
+		for (int c = 0; c < a->n_weight_cores; c++) {
+			uint32_t n_ops = (uint32_t)rkt_emit_lut_upload(
+				a->regcmd[c].map, 0, off, chunk, count, (uint32_t)a->in[c].dma_addr,
+				(uint32_t)a->weight_core[c].dma_addr, (uint32_t)a->out[c].dma_addr);
+			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
+				return ERR_INTERNAL;
+			if (rkt_bo_flush(&p->dev, &a->regcmd[c]))
+				return ERR_IO;
+			if (rkt_submit(&p->dev, &a->regcmd[c], n_ops, &a->in[c], &a->out[c]))
+				return ERR_COMPUTE_FAIL;
+			if (rkt_bo_wait(&p->dev, &a->out[c]))
+				return ERR_COMPUTE_FAIL;
+		}
+	}
+	return OK;
+}
+
+static status_code rkt_act_cache_build(rkt_priv *p, rkt_act_cache *a, int n, int k,
+									   rkt_lut_kind kind) {
+	if (a->n == n && a->k == k && a->uploaded_kind == (int)kind)
+		return OK;
+	if (a->n != n || a->k != k) {
+		rkt_act_cache_reset(p, a);
+		if (k % RKT_K_ALIGN != 0 || k > p->max_k || n % RKT_N_ALIGN != 0)
+			return ERR_UNSUPPORTED;
+		a->n = n;
+		a->k = k;
+		rkt_lut_build(&a->cfg, NULL);
+		a->cfg.kind = kind;
+		int start[RKT_MAX_CORES], count[RKT_MAX_CORES];
+		int used = partition_rows(n, p->dev.n_cores, start, count);
+		for (int c = 0; c < used; c++) {
+			size_t w_bytes	 = (size_t)count[c] * k * sizeof(uint16_t);
+			size_t in_bytes	 = (size_t)RKT_TILE_ROWS * k * sizeof(uint16_t);
+			size_t out_bytes = (size_t)RKT_TILE_ROWS * count[c] * sizeof(float);
+			if (rkt_bo_create(&p->dev, c, w_bytes, &a->weight_core[c]) ||
+				rkt_bo_create(&p->dev, c, in_bytes, &a->in[c]) ||
+				rkt_bo_create(&p->dev, c, out_bytes, &a->out[c]) ||
+				rkt_bo_create(&p->dev, c, RKT_REGCMD_BYTES, &a->regcmd[c]))
+				return ERR_OUT_OF_MEMORY;
+			a->weight_core_count[c] = count[c];
+			a->weight_core_start[c] = start[c];
+		}
+		a->n_weight_cores = used;
+
+		uint16_t *row = xcalloc((size_t)k, sizeof(uint16_t));
+		for (int c = 0; c < used; c++) {
+			uint16_t *bo = a->weight_core[c].map;
+			for (int r = 0; r < count[c]; r++) {
+				memset(row, 0, (size_t)k * sizeof(uint16_t));
+				row[start[c] + r] = f32_to_f16_bits((float)a->cfg.S);
+				tile_weight_row(bo, row, k, r);
+			}
+			if (rkt_bo_flush(&p->dev, &a->weight_core[c]))
+				return ERR_IO;
+		}
+		free(row);
+	}
+
+	uint16_t le[RKT_LUT_ENTRIES];
+	rkt_lut_build(&a->cfg, le);
+	a->cfg.kind = kind;
+	if (a->uploaded_kind != (int)kind) {
+		status_code s = rkt_lut_upload_tables(p, a, le);
+		if (s != OK)
+			return s;
+		a->uploaded_kind = (int)kind;
+	}
+	return OK;
+}
+
+static status_code rkt_lut_act_rows(rkt_priv *p, rkt_act_cache *a, rkt_lut_kind kind,
+									const float *gate, int gate_stride, float *out, int n, int m) {
+	status_code s = rkt_act_cache_build(p, a, n, n, kind);
+	if (s != OK)
+		return s;
+
+	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)RKT_TILE_ROWS * n,
+						 sizeof(uint16_t)))
+		return ERR_OUT_OF_MEMORY;
+
+	int max_rows = max_batch_rows(n);
+	if (max_rows > RKT_TILE_ROWS)
+		max_rows = RKT_TILE_ROWS;
+	for (int done = 0; done < m && s == OK;) {
+		int blk = next_block_rows(m - done, max_rows);
+
+		memset(p->x16, 0, (size_t)blk * n * sizeof(uint16_t));
+		for (int r = 0; r < blk; r++)
+			convert_to_f16(p->x16 + (size_t)r * n, gate + (size_t)(done + r) * gate_stride,
+						   (size_t)n);
+		for (int c = 0; c < a->n_weight_cores; c++) {
+			tile_input(a->in[c].map, p->x16, blk, a->k);
+			if (rkt_bo_flush(&p->dev, &a->in[c]))
+				return ERR_IO;
+		}
+
+		int n_ops[RKT_MAX_CORES];
+		int active[RKT_MAX_CORES];
+		int n_active = 0;
+		for (int c = 0; c < a->n_weight_cores; c++) {
+			int start = a->weight_core_start[c];
+			if (start >= n)
+				continue;
+			int rows = a->weight_core_count[c];
+			if (start + rows > n)
+				rows = n - start;
+			n_ops[c] = (uint32_t)rkt_emit_matmul_f16_lut(
+				a->regcmd[c].map, blk, a->k, rows, (uint32_t)a->in[c].dma_addr,
+				(uint32_t)a->weight_core[c].dma_addr, (uint32_t)a->out[c].dma_addr, &a->cfg);
+			if (n_ops[c] > RKT_REGCMD_MAX_OPS)
+				return ERR_INTERNAL;
+			if (rkt_bo_flush(&p->dev, &a->regcmd[c]))
+				return ERR_IO;
+			active[n_active++] = c;
+		}
+		for (int i = 0; i < n_active && s == OK; i++) {
+			int c = active[i];
+			if (rkt_submit(&p->dev, &a->regcmd[c], n_ops[c], &a->in[c], &a->out[c]))
+				s = ERR_COMPUTE_FAIL;
+		}
+		for (int i = 0; i < n_active && s == OK; i++) {
+			int c = active[i];
+			if (rkt_bo_wait(&p->dev, &a->out[c]))
+				s = ERR_COMPUTE_FAIL;
+		}
+		if (s != OK)
+			return s;
+
+		for (int i = 0; i < n_active; i++) {
+			int c	  = active[i];
+			int start = a->weight_core_start[c];
+			int rows  = a->weight_core_count[c];
+			if (start + rows > n)
+				rows = n - start;
+			const float *om = a->out[c].map;
+			for (int nn = 0; nn < rows; nn++) {
+				int col = start + nn;
+				for (int r = 0; r < blk; r++) {
+					int idx = blk == 1 ? nn : rkt_feature_index(blk, RKT_OUT_C2_F32, nn + 1, r + 1);
+					out[(size_t)(done + r) * n + col] = om[idx] / (float)a->cfg.F;
+				}
+			}
+		}
+		done += blk;
+	}
+	return s;
+}
+
+static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, const buffer *up,
+										 buffer *out, int n, int activation, int m, int gate_stride,
+										 int up_stride, int fused) {
+	rkt_priv *p		= self->priv;
+	float	 *ucopy = NULL;
+	if (n <= 0 || m <= 0)
+		return OK;
+	if (activation != RKT_FFNA_SILU && activation != RKT_FFNA_GELU)
+		goto host;
+	rkt_lut_kind kind = activation == RKT_FFNA_GELU ? RKT_LUT_GELU_TANH : RKT_LUT_SILU;
+
+	const float *gf = rkt_ptr(gate);
+	const float *uf = rkt_ptr(up);
+	float		*of = rkt_ptr(out);
+	if (uf == of) {
+		ucopy = xmalloc((size_t)n * (size_t)m * sizeof(float));
+		for (int r = 0; r < m; r++)
+			memcpy(ucopy + (size_t)r * n, uf + (size_t)r * up_stride, (size_t)n * sizeof(float));
+		uf = ucopy;
+	}
+
+	if (n % RKT_N_ALIGN || n > RKT_MAX_N_CHUNK) {
+	host:
+		free(ucopy);
+		if (fused || gate_stride != n || up_stride != n)
+			return ERR_UNSUPPORTED;
+		backend_report_host_fallback(self, "ffn_activate", HFB_OP_NOT_NATIVE,
+									 "shape n=%d m=%d act=%d", n, m, activation);
+		backend *host = backend_host();
+		if (!host || !host->ffn_activate_batch)
+			return ERR_UNSUPPORTED;
+		return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
+	}
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL
+								  : rkt_lut_act_rows(p, &p->act, kind, gf, gate_stride, of, n, m);
+	if (s != OK && !p->npu_failed) {
+		p->npu_failed = 1;
+		WARN("rocket: npu ffn_activate failed (n=%d m=%d status=%d, errno=%d), npu disabled", n, m,
+			 s, errno);
+	}
+	pthread_mutex_unlock(&p->lock);
+	free(ucopy);
+	if (s != OK)
+		goto host;
+
+	for (int r = 0; r < m; r++) {
+		const float *g = of + (size_t)r * n;
+		const float *u = uf + (size_t)r * up_stride;
+		float		*o = of + (size_t)r * n;
+		for (int i = 0; i < n; i++)
+			o[i] = g[i] * u[i];
+	}
+	return OK;
+}
+
+static status_code rkt_ffn_activate(backend *self, const buffer *gate, const buffer *up,
+									buffer *out, int n) {
+	return rkt_ffn_activate_kind(self, gate, up, out, n, RKT_FFNA_SILU, 1, n, n, 0);
+}
+
+static status_code rkt_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up,
+									   buffer *out, int n, int activation) {
+	return rkt_ffn_activate_kind(self, gate, up, out, n, activation, 1, n, n, 0);
+}
+
+static status_code rkt_ffn_activate_batch(backend *self, const buffer *gate, const buffer *up,
+										  buffer *out, int n, int activation, int m) {
+	return rkt_ffn_activate_kind(self, gate, up, out, n, activation, m, n, n, 0);
+}
+
+static status_code rkt_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out,
+												int n, int activation, int m) {
+	buffer up =
+		buffer_slice(fused, (size_t)n * sizeof(float), (size_t)m * (size_t)n * sizeof(float));
+	return rkt_ffn_activate_kind(self, fused, &up, out, n, activation, m, 2 * n, 2 * n, 1);
+}
+
+static status_code rkt_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
+											 const buffer *gate, const buffer *up, buffer *y, int n,
+											 int k, int activation, int m) {
+	rkt_priv *p = self->priv;
+	if (m <= 0)
+		return ERR_INVALID_ARG;
+	if ((activation != RKT_FFNA_SILU && activation != RKT_FFNA_GELU) || k % RKT_K_ALIGN ||
+		k > RKT_MAX_K || n % RKT_N_ALIGN) {
+		backend_report_host_fallback(self, "matmul_ffn_down", HFB_OP_NOT_NATIVE,
+									 "shape n=%d k=%d m=%d act=%d", n, k, m, activation);
+		backend *host = backend_host();
+		if (!host || !host->matmul_ffn_down_batch)
+			return ERR_UNSUPPORTED;
+		return host->matmul_ffn_down_batch(host, w, w_type, gate, up, y, n, k, activation, m);
+	}
+	rkt_lut_kind kind = activation == RKT_FFNA_GELU ? RKT_LUT_GELU_TANH : RKT_LUT_SILU;
+
+	const float *gf = rkt_ptr(gate);
+	const float *uf = rkt_ptr(up);
+	if (!ensure_capacity((void **)&p->act_tmp, &p->act_tmp_cap, (size_t)m * k, sizeof(float)))
+		return ERR_OUT_OF_MEMORY;
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL
+								  : rkt_lut_act_rows(p, &p->act, kind, gf, k, p->act_tmp, k, m);
+	if (s != OK && !p->npu_failed) {
+		p->npu_failed = 1;
+		WARN("rocket: npu ffn down activation failed (k=%d m=%d status=%d, errno=%d), npu disabled",
+			 k, m, s, errno);
+	}
+	pthread_mutex_unlock(&p->lock);
+	if (s != OK) {
+		backend_report_host_fallback(self, "matmul_ffn_down", HFB_OP_NOT_NATIVE,
+									 "npu activation failed (k=%d m=%d status=%d)", k, m, s);
+		backend *host = backend_host();
+		if (!host || !host->matmul_ffn_down_batch)
+			return ERR_UNSUPPORTED;
+		return host->matmul_ffn_down_batch(host, w, w_type, gate, up, y, n, k, activation, m);
+	}
+
+	for (int r = 0; r < m; r++) {
+		const float *g = p->act_tmp + (size_t)r * k;
+		const float *u = uf + (size_t)r * k;
+		float		*o = p->act_tmp + (size_t)r * k;
+		for (int i = 0; i < k; i++)
+			o[i] = g[i] * u[i];
+	}
+
+	buffer act_buf = buffer_host_view(self, p->act_tmp, (size_t)m * k * sizeof(float));
+	return rkt_matmul_batch(self, w, w_type, &act_buf, y, n, k, m);
+}
+
+static status_code rkt_matmul_ffn_down(backend *self, const buffer *w, uint32_t w_type,
+									   const buffer *gate, const buffer *up, buffer *y, int n,
+									   int k, int activation) {
+	return rkt_matmul_ffn_down_batch(self, w, w_type, gate, up, y, n, k, activation, 1);
 }
 
 static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
@@ -1314,6 +1817,7 @@ static void rkt_free(backend *self) {
 		log_tag("ROCKET", "fused %d weights into %d larger job sets", p->fused_weights,
 				p->fused_groups);
 	free_slots(p);
+	rkt_act_cache_reset(p, &p->act);
 	rkt_device_close(&p->dev);
 	pthread_mutex_destroy(&p->lock);
 	free(p->weights);
@@ -1322,6 +1826,7 @@ static void rkt_free(backend *self) {
 	free(p->x_chunk);
 	free(p->y_tmp);
 	free(p->attn_ws);
+	free(p->act_tmp);
 	free(p);
 	self->priv = NULL;
 }
@@ -1358,23 +1863,29 @@ static status_code rkt_ctor(backend *out) {
 	out->init				 = rkt_init;
 	out->free				 = rkt_free;
 	out->buffer_alloc_weight = rkt_buffer_alloc_weight;
-	out->buffer_alloc_scratch = rkt_buffer_alloc_scratch;
-	out->buffer_free		  = rkt_buffer_free;
-	out->buffer_read_f32	  = rkt_buffer_read_f32;
-	out->buffer_write_f32	  = rkt_buffer_write_f32;
-	out->matmul				  = rkt_matmul;
-	out->matmul_batch		  = rkt_matmul_batch;
-	out->matmul_multi		  = rkt_matmul_multi;
-	out->matmul_multi_batch	  = rkt_matmul_multi_batch;
-	out->matmul_residual	  = rkt_matmul_residual;
-	out->attention			  = rkt_attention;
-	out->attention_batch	  = rkt_attention_batch_fn;
-	out->attention_swa		  = rkt_attention_swa;
-	out->attention_swa_batch  = rkt_attention_swa_batch;
-	out->kv_alloc			  = rkt_kv_alloc;
-	out->kv_free			  = rkt_kv_free;
-	out->kv_put				  = rkt_kv_put;
-	out->kv_put_batch		  = rkt_kv_put_batch;
+	out->buffer_alloc_scratch	  = rkt_buffer_alloc_scratch;
+	out->buffer_free			  = rkt_buffer_free;
+	out->buffer_read_f32		  = rkt_buffer_read_f32;
+	out->buffer_write_f32		  = rkt_buffer_write_f32;
+	out->matmul					  = rkt_matmul;
+	out->matmul_batch			  = rkt_matmul_batch;
+	out->matmul_multi			  = rkt_matmul_multi;
+	out->matmul_multi_batch		  = rkt_matmul_multi_batch;
+	out->matmul_residual		  = rkt_matmul_residual;
+	out->ffn_activate			  = rkt_ffn_activate;
+	out->ffn_activate_ex		  = rkt_ffn_activate_ex;
+	out->ffn_activate_batch		  = rkt_ffn_activate_batch;
+	// BUG: Temporarily disabled: out->ffn_activate_fused_batch = rkt_ffn_activate_fused_batch;
+	out->matmul_ffn_down		  = rkt_matmul_ffn_down;
+	out->matmul_ffn_down_batch	  = rkt_matmul_ffn_down_batch;
+	out->attention				  = rkt_attention;
+	out->attention_batch		  = rkt_attention_batch_fn;
+	out->attention_swa			  = rkt_attention_swa;
+	out->attention_swa_batch	  = rkt_attention_swa_batch;
+	out->kv_alloc				  = rkt_kv_alloc;
+	out->kv_free				  = rkt_kv_free;
+	out->kv_put					  = rkt_kv_put;
+	out->kv_put_batch			  = rkt_kv_put_batch;
 	return OK;
 }
 

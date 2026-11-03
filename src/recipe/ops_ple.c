@@ -371,8 +371,18 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 			goto ple_cleanup;
 		}
 	} else {
-		st = a->ffn_activate_batch(a, &ple_inp_b, &ple_slice_b, &ple_inp_b, n_embd_per_layer,
-								   ACTIVATION_GELU, n_rows);
+		backend *act_be = a;
+		if (!a->ffn_activate_batch) {
+			act_be = backend_host();
+			if (!act_be || !act_be->ffn_activate_batch) {
+				st = ERR_UNSUPPORTED;
+				goto ple_cleanup;
+			}
+			ensure_sync(a);
+			op_fallback_note(a, "ffn_activate");
+		}
+		st = act_be->ffn_activate_batch(act_be, &ple_inp_b, &ple_slice_b, &ple_inp_b,
+										n_embd_per_layer, ACTIVATION_GELU, n_rows);
 		if (st != OK) {
 			ERROR("ple_proj_inject_batch: ffn_activate_batch failed (st=%d)", (int)st);
 			goto ple_cleanup;
@@ -396,13 +406,33 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		if (st != OK)
 			ERROR("ple_proj_inject_batch: rmsnorm_add_batch failed (st=%d)", (int)st);
 	} else {
-		st = a->rmsnorm_batch(a, aob, plan.post_norm_w, aob, inj_dim, eps, n_rows);
+		backend *norm_be = a;
+		if (!a->rmsnorm_batch) {
+			norm_be = backend_host();
+			if (!norm_be || !norm_be->rmsnorm_batch) {
+				st = ERR_UNSUPPORTED;
+				goto ple_cleanup;
+			}
+			ensure_sync(a);
+			op_fallback_note(a, "rmsnorm");
+		}
+		st = norm_be->rmsnorm_batch(norm_be, aob, plan.post_norm_w, aob, inj_dim, eps, n_rows);
 		if (st != OK) {
 			ERROR("ple_proj_inject_batch: rmsnorm_batch failed (st=%d)", (int)st);
 			goto ple_cleanup;
 		}
 
-		st = a->add_batch(a, xb2b, aob, inj_dim, n_rows);
+		backend *add_be = a;
+		if (!a->add_batch) {
+			add_be = backend_host();
+			if (!add_be || !add_be->add_batch) {
+				st = ERR_UNSUPPORTED;
+				goto ple_cleanup;
+			}
+			ensure_sync(a);
+			op_fallback_note(a, "add");
+		}
+		st = add_be->add_batch(add_be, xb2b, aob, inj_dim, n_rows);
 		if (st != OK) {
 			ERROR("ple_proj_inject_batch: add_batch failed (st=%d)", (int)st);
 			goto ple_cleanup;

@@ -1,6 +1,8 @@
 #include "emit.h"
 #include "hw.h"
 
+#include <string.h>
+
 typedef struct {
 	uint64_t *ops;
 	int		  n;
@@ -151,4 +153,131 @@ int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uin
 	put(&c, OP_40, 0, 0);
 	put(&c, OP_ENABLE, PC_OPERATION_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
 	return c.n;
+}
+
+static uint64_t *find_op(uint64_t *ops, int n, uint32_t block_op, uint32_t reg) {
+	for (int i = 0; i < n; i++) {
+		uint64_t w = ops[i];
+		if ((uint32_t)(w >> 48) == block_op && (uint32_t)(w & 0xFFFFu) == reg)
+			return &ops[i];
+	}
+	return NULL;
+}
+
+static void set_op(uint64_t *ops, int n, uint32_t block_op, uint32_t reg, uint32_t value) {
+	uint64_t *slot = find_op(ops, n, block_op, reg);
+	if (slot)
+		*slot = ((uint64_t)block_op << 48) | ((uint64_t)value << 16) | (uint64_t)reg;
+}
+
+static uint32_t f32_bits(float v) {
+	uint32_t bits;
+	memcpy(&bits, &v, sizeof(bits));
+	return bits;
+}
+
+static uint16_t f32_to_f16_bits(float v) {
+	_Float16 h = (_Float16)v;
+	uint16_t bits;
+	memcpy(&bits, &h, sizeof(bits));
+	return bits;
+}
+
+int rkt_emit_matmul_f16_act(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							uint32_t out_dma, const rkt_post_cfg *post) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	if (!post || post->act == RKT_ACT_NONE)
+		return n_ops;
+
+	uint32_t bs = 0, alu = 0, mul = 0, cmp = 0;
+	switch (post->act) {
+	case RKT_ACT_RELU:
+		bs = DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_MUL_BYPASS(1);
+		break;
+	case RKT_ACT_RELUX:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELUX_EN(1);
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_PRELU:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1) | DPU_BS_CFG_MUL_PRELU(1);
+		mul = (uint32_t)f32_to_f16_bits(post->prelu_alpha) << 16;
+		break;
+	case RKT_ACT_ADDC:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		break;
+	case RKT_ACT_MULC:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	case RKT_ACT_AFFINE:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	case RKT_ACT_SUBC:
+		bs	= DPU_BS_CFG_ALU_ALGO(4) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		break;
+	case RKT_ACT_RELU6_ALU:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_RELUX_EN(1) | DPU_BS_CFG_MUL_BYPASS(1);
+		alu = f32_bits(post->addc);
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_RELU6_MUL:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELUX_EN(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_MUL_RELU:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	default:
+		return n_ops;
+	}
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_CFG, bs);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_ALU_CFG, alu);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_MUL_CFG, mul);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_RELUX_CMP_VALUE, cmp);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							uint32_t out_dma, const rkt_lut_cfg *cfg) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	if (!cfg || cfg->kind == RKT_LUT_NONE)
+		return n_ops;
+
+	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, 0x302);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_CFG, DPU_LUT_CFG_ROAD_SEL(0));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_INFO, DPU_LUT_INFO_LE_INDEX_SELECT((uint32_t)cfg->sel));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_START, (uint32_t)cfg->start);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_END, (uint32_t)cfg->end);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SCALE, cfg->tail_slope << 16);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SHIFT, 0);
+	return n_ops;
+}
+
+int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *words, int count,
+						uint32_t in_dma, uint32_t w_dma, uint32_t out_dma) {
+	if (count < 1 || count > RKT_LUT_UPLOAD_CHUNK)
+		return 0;
+	int n	  = rkt_emit_matmul_f16(ops, 1, RKT_K_ALIGN, RKT_N_ALIGN, in_dma, w_dma, out_dma);
+	int extra = count + 1;
+	if (n + extra > RKT_REGCMD_MAX_OPS)
+		return 0;
+
+	memmove(ops + n - 4 + extra, ops + n - 4, 4 * sizeof(uint64_t));
+	int idx = n - 4;
+	ops[idx++] =
+		((uint64_t)OP_REG_DPU << 48) |
+		((uint64_t)(DPU_LUT_ACCESS_CFG_TYPE(1) | DPU_LUT_ACCESS_CFG_TABLE_ID((uint32_t)table) |
+					DPU_LUT_ACCESS_CFG_ADDR((uint32_t)start))
+		 << 16) |
+		(uint64_t)DPU_LUT_ACCESS_CFG;
+	for (int i = 0; i < count; i++)
+		ops[idx++] = ((uint64_t)OP_REG_DPU << 48) | ((uint64_t)words[i] << 16) |
+					 (uint64_t)DPU_LUT_ACCESS_DATA;
+	return n + extra;
 }
