@@ -42,6 +42,7 @@ ifneq ($(filter-out $(AVAILABLE_BACKENDS),$(BACKEND_LIST)),)
 endif
 HAS_VULKAN := $(filter vulkan,$(BACKEND_LIST))
 HAS_OPENGL := $(filter opengl,$(BACKEND_LIST))
+HAS_ROCKET := $(filter rocket,$(BACKEND_LIST))
 
 UNAME     := $(shell uname -sm)
 HOST_OS   := $(word 1,$(UNAME))
@@ -172,6 +173,11 @@ ifneq ($(HAS_OPENGL),)
   GL_OBJS := $(call backend_objs,opengl/opengl.o opengl/gl_context.o)
   $(eval $(call add_backend,opengl,$(GL_OBJS),$(call pkg_libs,$(GL_PKG))))
   $(GL_OBJS): BACKEND_CFLAGS += -I$(OBJ_DIR)/backend/opengl -I$(SRC_DIR)/backend/opengl $(call pkg_flags,$(GL_PKG))
+endif
+
+ifneq ($(HAS_ROCKET),)
+  RKT_OBJS := $(call backend_objs,rocket/rocket.o rocket/device.o rocket/emit.o)
+  $(eval $(call add_backend,rocket,$(RKT_OBJS),))
 endif
 
 ifneq ($(HAS_VULKAN),)

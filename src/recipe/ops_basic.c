@@ -457,8 +457,20 @@ status_code op_matmul_residual(exec_ctx *ctx) {
 	profile_weight_bytes(prof, ctx->op->stage, wt, n, k);
 	buffer *tmp = batch_slot(ctx->bs, RECIPE_SLOT_RESID_TMP);
 	st = a->matmul_batch(a, w, wt, exec_slot(ctx, ctx->op->in[0]), tmp, n, k, ctx->rows.n_rows);
-	if (st == OK)
-		st = a->add_batch(a, exec_slot(ctx, ctx->op->out), tmp, n, ctx->rows.n_rows);
+	if (st != OK)
+		goto out;
+	backend *add_be = a;
+	if (!a->add_batch) {
+		add_be = backend_host();
+		if (!add_be || !add_be->add_batch) {
+			st = ERR_UNSUPPORTED;
+			goto out;
+		}
+		ensure_sync(a);
+		op_fallback_note(a, "add");
+	}
+	st = add_be->add_batch(add_be, exec_slot(ctx, ctx->op->out), tmp, n, ctx->rows.n_rows);
+out:
 	profile_end(prof, &ps);
 	return st;
 }
@@ -481,11 +493,19 @@ static status_code ffn_down_fused(exec_ctx *ctx, backend *a) {
 }
 
 static status_code ffn_down_composed(exec_ctx *ctx, backend *a) {
-	ffn_down_args g	  = ffn_down_args_of(ctx);
-	buffer		 *act = batch_slot(ctx->bs, RECIPE_SLOT_FFN_ACT);
-	status_code	  st =
-		a->ffn_activate_batch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
-							  act, g.k, g.act, ctx->rows.n_rows);
+	ffn_down_args g		 = ffn_down_args_of(ctx);
+	buffer		 *act	 = batch_slot(ctx->bs, RECIPE_SLOT_FFN_ACT);
+	backend		 *act_be = a;
+	if (!a->ffn_activate_batch) {
+		act_be = backend_host();
+		if (!act_be || !act_be->ffn_activate_batch)
+			return ERR_UNSUPPORTED;
+		ensure_sync(a);
+		op_fallback_note(a, "ffn_activate");
+	}
+	status_code st = act_be->ffn_activate_batch(act_be, exec_slot(ctx, ctx->op->in[0]),
+												exec_slot(ctx, ctx->op->in[1]), act, g.k, g.act,
+												ctx->rows.n_rows);
 	if (st != OK)
 		return st;
 	return a->matmul_batch(a, g.w, g.wt, act, exec_slot(ctx, ctx->op->out), g.n, g.k,
@@ -625,6 +645,11 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 				break;
 		}
 		kvcache_attn_view(seg_cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
+		backend *kv_owner = kb->owner ? kb->owner : seg_cache->backend;
+		if (a != kv_owner && !backend_has_cap(kv_owner, BCAP_IS_HOST)) {
+			st = ERR_UNSUPPORTED;
+			break;
+		}
 		if (use_swa)
 			st = a->attention_swa_batch(a, &q_view, kb, vb, &o_view, kv_slot,
 										exec_segment_pos(ctx, c), n_heads, n_kv_heads, head_dim,
@@ -641,9 +666,16 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 
 static status_code attention_dynamic(exec_ctx *ctx) {
 	backend *a		 = exec_layer_backend(ctx);
-	int		 use_swa = ctx->op->u.attention.sliding_window > 0 && ctx->li >= 0 &&
-					   model_layer_is_sliding(ctx->m, ctx->li) && a->attention_swa_batch != NULL;
-	return attention_run(ctx, a, use_swa);
+	int		 sliding = ctx->op->u.attention.sliding_window > 0 && ctx->li >= 0 &&
+					   model_layer_is_sliding(ctx->m, ctx->li);
+	if (sliding && !a->attention_swa_batch) {
+		backend *host = backend_host();
+		if (!host || !host->attention_swa_batch)
+			return ERR_UNSUPPORTED;
+		op_fallback_note(a, "attention_swa");
+		a = host;
+	}
+	return attention_run(ctx, a, sliding);
 }
 
 status_code op_attention_global(exec_ctx *ctx) {

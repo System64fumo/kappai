@@ -193,6 +193,13 @@ static void embd_fill_chunk(int begin, int end, int tid, void *ctx) {
 
 status_code embd_fill_rows(backend *a, const buffer *w, uint32_t w_type, const int32_t *tokens,
 						   buffer *xs, int n_rows, int dim, float scale) {
+	if (!a->embd_lookup) {
+		backend *host = backend_host();
+		if (!host || !host->embd_lookup)
+			return ERR_UNSUPPORTED;
+		op_fallback_note(a, "embd_lookup");
+		a = host;
+	}
 	tpool *pool = backend_get_pool(a);
 	if (pool && n_rows >= 16 && backend_has_cap(a, BCAP_IS_HOST) && tpool_current_tid() < 0 &&
 		tpool_n_threads(pool) > 1) {

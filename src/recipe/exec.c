@@ -327,6 +327,24 @@ static const backend *exec_variant_backend(const cg_set *gs, int variant) {
 	return be;
 }
 
+static status_code op_host_dispatch(exec_ctx *ctx) {
+	backend	   *saved = ctx->layer_be;
+	backend	   *host  = backend_host();
+	op_handler	fn;
+	status_code st;
+	ctx->layer_be = host;
+	if (!host) {
+		ctx->layer_be = saved;
+		return ERR_UNSUPPORTED;
+	}
+	fn = exec_pick_variant(ctx->op, host);
+	if (!fn)
+		fn = g_op_handlers[ctx->op->kind];
+	st			  = fn(ctx);
+	ctx->layer_be = saved;
+	return st;
+}
+
 static void exec_resolve_steps(exec_schedule *sch, const cg_set *gs, int variant,
 							   const backend *outer_be) {
 	const backend *variant_be = variant >= 0 ? exec_variant_backend(gs, variant) : outer_be;
@@ -338,6 +356,11 @@ static void exec_resolve_steps(exec_schedule *sch, const cg_set *gs, int variant
 			if (fn)
 				step->fn = fn;
 			step->caps = variant_be ? exec_pick_caps(kind, variant_be) : 0;
+			if (variant_be && !backend_has_cap(variant_be, BCAP_IS_HOST) &&
+				recipe_op_missing_fn((backend *)variant_be, kind)) {
+				step->fn = op_host_dispatch;
+				op_fallback_note((backend *)variant_be, recipe_op_name(kind));
+			}
 			continue;
 		}
 		int impl = exec_variant_impl(gs, variant, step->node);
@@ -490,12 +513,26 @@ static const op_handler g_op_handlers[OP_KIND_COUNT] = {
 	[OP_MLA_ABSORBED]		= op_mla_absorbed,
 };
 
+static int batch_op_available(const backend *a, int has_fn) {
+	if (has_fn)
+		return 1;
+	if (!backend_has_cap(a, BCAP_HOST_VISIBLE_BUFFERS))
+		return 0;
+	backend *host = backend_host();
+	return host && host != a;
+}
+
 static int backend_has_batch_ops(const model *m, const backend *a) {
-	if (!(a->matmul_batch && a->rmsnorm_batch && a->add_batch && a->ffn_activate_batch &&
-		  a->rope_batch && a->rope_qk_batch && a->attention_batch))
+	if (!(batch_op_available(a, a->matmul_batch != NULL) &&
+		  batch_op_available(a, a->rmsnorm_batch != NULL) &&
+		  batch_op_available(a, a->add_batch != NULL) &&
+		  batch_op_available(a, a->ffn_activate_batch != NULL) &&
+		  batch_op_available(a, a->rope_batch != NULL) &&
+		  batch_op_available(a, a->rope_qk_batch != NULL) &&
+		  batch_op_available(a, a->attention_batch != NULL)))
 		return 0;
 	int has_sliding = m->recipe ? m->recipe->has_sliding_layers : model_has_sliding_layers(m);
-	if (has_sliding && !a->attention_swa_batch)
+	if (has_sliding && !batch_op_available(a, a->attention_swa_batch != NULL))
 		return 0;
 	return 1;
 }
