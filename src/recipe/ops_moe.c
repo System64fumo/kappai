@@ -331,6 +331,53 @@ static void moe_union_slots_ensure(batch_scratch *bs, int n_union) {
 	}
 }
 
+static status_code moe_router_emit_device(exec_ctx *ctx, backend *a, const buffer *logits, int E,
+										  int K, int uses_softmax, int norm_topk,
+										  float routed_scale) {
+	batch_scratch *bs	   = ctx->bs;
+	layer_weights *L	   = &ctx->m->layers[ctx->li];
+	int			   rows	   = ctx->rows.n_rows;
+	size_t		   n_slots = (size_t)rows * (size_t)K;
+	const buffer  *bias	   = NULL;
+	status_code	   st;
+
+	if (!uses_softmax && L->router_bias.host_ptr) {
+		st = buffer_ensure_scratch(a, &bs->moe_router_bias_dev, (size_t)E * sizeof(float));
+		if (st != OK)
+			return st;
+		st = a->buffer_write_f32(a, &bs->moe_router_bias_dev,
+								 (const float *)L->router_bias.host_ptr, E);
+		if (st != OK)
+			return st;
+		bias = &bs->moe_router_bias_dev;
+	}
+
+	st = buffer_ensure_scratch(a, &bs->moe_router_out_dev, 2 * n_slots * sizeof(float));
+	if (st != OK)
+		return st;
+	st = a->moe_router_topk(a, logits, bias, &bs->moe_router_out_dev, rows, E, K, uses_softmax,
+							norm_topk, routed_scale, ctx->m->moe.n_group, ctx->m->moe.topk_group);
+	if (st != OK)
+		return st;
+
+	float *out = float_buf_ensure(&bs->moe_router_out, 2 * n_slots);
+	st		   = a->buffer_read_f32(a, &bs->moe_router_out_dev, out, (int)(2 * n_slots));
+	if (st != OK)
+		return st;
+
+	for (size_t i = 0; i < n_slots; i++) {
+		int id = (int)out[i];
+		if (id == -2) {
+			ERROR("moe_router_batch: non-finite router logit (layer=%d, rows=%d, E=%d)", ctx->li,
+				  rows, E);
+			return ERR_FORMAT;
+		}
+		bs->moe_router_ids[i] = id < 0 ? -1 : id;
+		bs->moe_router_w[i]	  = out[n_slots + i];
+	}
+	return OK;
+}
+
 status_code moe_router_batch(exec_ctx *ctx) {
 
 	backend *a = exec_layer_backend(ctx);
@@ -389,32 +436,44 @@ status_code moe_router_batch(exec_ctx *ctx) {
 	if (st != OK)
 		return st;
 
-	st = a->buffer_read_f32(a, router_logits_buf, ctx->bs->moe_router_logits.p,
-							ctx->rows.n_rows * E);
-	if (st != OK)
+	st = ERR_UNSUPPORTED;
+	if (a->moe_router_topk && !backend_has_cap(a, BCAP_IS_HOST))
+		st = moe_router_emit_device(ctx, a, router_logits_buf, E, K, uses_softmax, norm_topk,
+									routed_scale);
+	if (st != OK && st != ERR_UNSUPPORTED)
 		return st;
+	int routed_on_device = st == OK;
 
-	if (!moe_router_logits_finite(ctx->bs->moe_router_logits.p, (size_t)ctx->rows.n_rows * E)) {
-		ERROR("moe_router_batch: non-finite router logit (layer=%d, rows=%d, E=%d)", ctx->li,
-			  ctx->rows.n_rows, E);
-		return ERR_FORMAT;
+	if (!routed_on_device) {
+		st = a->buffer_read_f32(a, router_logits_buf, ctx->bs->moe_router_logits.p,
+								ctx->rows.n_rows * E);
+		if (st != OK)
+			return st;
+
+		if (!moe_router_logits_finite(ctx->bs->moe_router_logits.p, (size_t)ctx->rows.n_rows * E)) {
+			ERROR("moe_router_batch: non-finite router logit (layer=%d, rows=%d, E=%d)", ctx->li,
+				  ctx->rows.n_rows, E);
+			return ERR_FORMAT;
+		}
 	}
 
-	tpool			   *router_pool = model_get_pool(ctx->m);
-	moe_router_emit_job emit_job	= {.bs			 = ctx->bs,
-									   .L			 = L,
-									   .E			 = E,
-									   .K			 = K,
-									   .rows		 = ctx->rows.n_rows,
-									   .uses_softmax = uses_softmax,
-									   .norm_topk	 = norm_topk,
-									   .routed_scale = routed_scale,
-									   .n_group		 = ctx->m->moe.n_group,
-									   .topk_group	 = ctx->m->moe.topk_group};
-	if (router_pool && ctx->rows.n_rows >= 8 && E >= 8 && tpool_current_tid() < 0) {
-		tpool_parallel_for(router_pool, ctx->rows.n_rows, 1, moe_router_emit_chunk, &emit_job);
-	} else {
-		moe_router_emit_chunk(0, ctx->rows.n_rows, 0, &emit_job);
+	if (!routed_on_device) {
+		tpool			   *router_pool = model_get_pool(ctx->m);
+		moe_router_emit_job emit_job	= {.bs			 = ctx->bs,
+										   .L			 = L,
+										   .E			 = E,
+										   .K			 = K,
+										   .rows		 = ctx->rows.n_rows,
+										   .uses_softmax = uses_softmax,
+										   .norm_topk	 = norm_topk,
+										   .routed_scale = routed_scale,
+										   .n_group		 = ctx->m->moe.n_group,
+										   .topk_group	 = ctx->m->moe.topk_group};
+		if (router_pool && ctx->rows.n_rows >= 8 && E >= 8 && tpool_current_tid() < 0) {
+			tpool_parallel_for(router_pool, ctx->rows.n_rows, 1, moe_router_emit_chunk, &emit_job);
+		} else {
+			moe_router_emit_chunk(0, ctx->rows.n_rows, 0, &emit_job);
+		}
 	}
 
 	int gen = ++ctx->bs->moe_expert_gen;

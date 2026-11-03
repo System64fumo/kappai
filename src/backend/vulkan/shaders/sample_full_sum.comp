@@ -1,0 +1,45 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(set = 0, binding = 1) readonly buffer MaxBuf {
+	uvec2 maxes[];
+};
+layout(set = 0, binding = 2) writeonly buffer SumBuf {
+	float sums[];
+};
+
+layout(push_constant) uniform Params {
+	int	  n;
+	int	  chunk;
+	int	  groups;
+	float inv_temp;
+}
+params;
+
+shared float s_part[256];
+
+void main() {
+	uint  tid = gl_LocalInvocationID.x;
+	float mx  = uintBitsToFloat(0xFF800000u);
+	for (int g = 0; g < params.groups; g++)
+		mx = max(mx, uintBitsToFloat(maxes[g].x));
+	mx *= params.inv_temp;
+
+	uint  lo  = gl_WorkGroupID.x * uint(params.chunk);
+	uint  hi  = min(lo + uint(params.chunk), uint(params.n));
+	float acc = 0.0;
+	for (uint i = lo + tid; i < hi; i += 256u)
+		acc += exp(logits[i] * params.inv_temp - mx);
+	s_part[tid] = acc;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_part[tid] += s_part[tid + s];
+		barrier();
+	}
+	if (tid == 0u)
+		sums[gl_WorkGroupID.x] = s_part[0];
+}

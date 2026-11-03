@@ -159,6 +159,8 @@ static void write_preview(const diffusion_ops *ops, const diffusion_params *p, c
 }
 
 static void log_range(const char *what, const float *x, size_t n) {
+	if (log_get_level() > LOG_DEBUG)
+		return;
 	float lo = INFINITY, hi = -INFINITY;
 	for (size_t i = 0; i < n; i++) {
 		lo = MIN(lo, x[i]);
@@ -208,7 +210,7 @@ status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 	float *x		= xmalloc(n * sizeof(float));
 	float *v		= xmalloc(n * sizeof(float));
 	float *v_uncond = guided ? xmalloc(n * sizeof(float)) : NULL;
-	float *x0		= xmalloc(n * sizeof(float));
+	float *x0		= p->preview_path ? xmalloc(n * sizeof(float)) : NULL;
 	float *sigmas	= xmalloc((size_t)(p->steps + 1) * sizeof(float));
 	compute_sigmas(&ops->schedule, shape.lw * shape.lh, p->steps, sigmas);
 	fill_noise(x, n, p->seed);
@@ -224,16 +226,17 @@ status_code diffusion_generate(diffusion_model *dm, const diffusion_params *p,
 		if (s != OK)
 			break;
 		log_range("velocity", v, n);
-		for (size_t j = 0; j < n; j++)
-			x0[j] = x[j] - sigmas[i] * v[j];
 		uint64_t now = time_us();
 		if (p->preview_path &&
 			(!last_preview || (double)(now - last_preview) / 1e6 >= p->preview_interval)) {
+			for (size_t j = 0; j < n; j++)
+				x0[j] = x[j] - sigmas[i] * v[j];
 			write_preview(ops, p, x0, shape);
 			last_preview = time_us();
 		}
+		float dt = sigmas[i + 1] - sigmas[i];
 		for (size_t j = 0; j < n; j++)
-			x[j] += (sigmas[i + 1] - sigmas[i]) * v[j];
+			x[j] += dt * v[j];
 		INFO("step %d/%d sigma %.4f (%.1fs)", i + 1, p->steps, sigmas[i], (double)(now - t0) / 1e6);
 	}
 

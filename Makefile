@@ -193,7 +193,7 @@ vk  = $(eval $(call vk_rule,$(1),$(2),$(3)))
 rms = $(call vk,rmsnorm$(1)_batch,rmsnorm,$(2) -DBATCHED)
 
 
-VK_PLAIN := argmax argmax_reduce moe_gather moe_combine attention attention_flash embd_lookup \
+VK_PLAIN := argmax argmax_reduce sample_topk sample_final sample_penalty sample_radix_hist sample_radix_select sample_gather sample_large_final sample_full_sum sample_full_draw moe_gather moe_combine moe_router attention attention_flash embd_lookup \
             kv_put kv_shift_gather q8_quant attn_decode attn_merge qk_norm_rope dequant \
             ffn_activate_fused_batch layernorm_modulate rope_table attention_dense im2col \
             upsample_shortcut hc_init hc_final hc_post hc_pre_coef hc_pre_mix kda_conv kda_l2norm \
@@ -209,15 +209,20 @@ VK_DENSE := f32 f16 bf16
 VK_TYPES := $(VK_QCORE) $(VK_KQ) $(VK_DENSE)
 VK_DEFS  := $(join $(addsuffix :,$(VK_TYPES)),$(shell echo $(VK_TYPES) | tr a-z A-Z))
 def       = -D$(patsubst $(1):%,%,$(filter $(1):%,$(VK_DEFS)))
+VK_IQ    := iq2_xxs iq2_s iq3_xxs iq3_s
+upper_def = -D$(shell echo $(1) | tr a-z A-Z)
 
 $(foreach s,$(VK_PLAIN),$(call vk,$(s),$(s),))
 $(foreach s,$(VK_MATMUL),$(call vk,$(s)_batch,$(s),-DBATCHED))
-$(foreach s,$(VK_MATMUL),$(call vk,$(s)_residual_batch,$(s),-DHAS_RESIDUAL -DBATCHED))
 $(foreach s,matmul_q4_0 matmul_q4_k matmul_q6_k,$(call vk,$(s)_dual_batch,$(s),-DNMAT_DUAL -DBATCHED))
 $(call vk,matmul_q4_0_triple_batch,matmul_q4_0,-DNMAT_TRIPLE -DBATCHED)
 $(call vk,matmul_iq4_nl_batch,matmul_iq4_nl,-DBATCHED)
 $(foreach t,$(VK_QCORE),$(call vk,q_matvec_$(t),q_matvec,$(call def,$(t))))
 $(foreach t,$(VK_QCORE),$(call vk,q_matmul_$(t),q_matmul,$(call def,$(t))))
+$(foreach t,q4_0 q8_0 iq4_nl q4_k bf16 f16 f32 q6_k,$(call vk,mmf_$(t),matmul_tiled,$(call def,$(t))))
+$(foreach t,$(VK_IQ),$(call vk,mmf_$(t),matmul_tiled,$(call upper_def,$(t))))
+$(foreach t,q4_k bf16 f16 f32 q6_k,$(call vk,mvk_$(t),matmul_matvec,$(call def,$(t))))
+$(foreach t,$(VK_IQ),$(call vk,mvk_$(t),matmul_matvec,$(call upper_def,$(t))))
 $(foreach t,$(VK_KQ),$(call vk,kq_matvec_$(t),kq_matvec,$(call def,$(t))))
 $(foreach t,$(VK_DENSE),$(call vk,dense_matvec_$(t),dense_matvec,$(call def,$(t))))
 $(call vk,q8k_quant,q8_quant,-DQ8K)

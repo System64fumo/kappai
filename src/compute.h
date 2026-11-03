@@ -57,8 +57,10 @@ typedef struct {
 	float_buf stage_a;
 	float_buf stage_b;
 	float_buf scale_tmp;
-	uint8_t	 *last_only;
-	size_t	  last_only_cap;
+	int		  seg_kv_k;
+	int		  seg_kv_v;
+	int		  seg_kv_stride;
+	int		  seg_kv_pending;
 } scratch_run;
 
 typedef struct {
@@ -130,6 +132,10 @@ status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scr
 										 const int32_t *tokens, const int *positions,
 										 const uint8_t *needs_logits, int n_seqs, int flash_attn,
 										 float *logits_out);
+
+status_code compute_forward_segments(model *m, kvcache **caches, compute_scratch *s,
+									 const int32_t *tokens, const int *seg_rows, const int *seg_pos,
+									 int n_segs, int flash_attn, float *logits_out);
 
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud);
 

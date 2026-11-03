@@ -68,6 +68,9 @@ static const struct {
 	{"activate.glsl", gl_shader_activate_src},
 };
 
+#define GL_SAMPLE_CHUNK 2048
+#define GL_SAMPLE_MAX_GROUPS 128
+
 typedef struct gl_priv gl_priv;
 
 typedef struct {
@@ -178,6 +181,15 @@ typedef enum {
 	GL_PIPE_UPSAMPLE_SHORTCUT,
 	GL_PIPE_GDN_CONV,
 	GL_PIPE_GDN_HEADS,
+	GL_PIPE_SAMPLE_TOPK,
+	GL_PIPE_SAMPLE_FINAL,
+	GL_PIPE_SAMPLE_PENALTY,
+	GL_PIPE_SAMPLE_RADIX_HIST,
+	GL_PIPE_SAMPLE_RADIX_SELECT,
+	GL_PIPE_SAMPLE_GATHER,
+	GL_PIPE_SAMPLE_LARGE_FINAL,
+	GL_PIPE_SAMPLE_FULL_SUM,
+	GL_PIPE_SAMPLE_FULL_DRAW,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -345,6 +357,10 @@ struct gl_priv {
 
 	gl_buf *argmax_partial;
 	size_t	argmax_partial_bytes;
+	gl_buf *sample_cand;
+	gl_buf *sample_state;
+	gl_buf *sample_sums;
+	gl_buf *sample_hist;
 	gl_buf *tok_reg;
 	gl_buf *tok_rb;
 	GLsync	tok_fence[BACKEND_TOKEN_REGS];
@@ -1301,6 +1317,12 @@ static status_code gl_init(backend *self, int device_index) {
 		return ERR_UNSUPPORTED;
 	}
 
+	GLint max_invocations = 0, max_shared = 0;
+	glGetIntegerv(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &max_invocations);
+	glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &max_shared);
+	self->sample_max_vocab =
+		max_invocations >= 256 && max_shared >= 16384 ? GL_SAMPLE_CHUNK * GL_SAMPLE_MAX_GROUPS : 0;
+
 	p->matmul_wg	 = gl_matmul_wg(&p->ctx);
 	p->attention_src = gl_shader_with_define(gl_shader_attention_src, "ATTN_WG", GL_ATTENTION_WG);
 	p->attention_batch_tile_t = gl_attention_batch_tile_t(&p->ctx);
@@ -1320,9 +1342,25 @@ static status_code gl_init(backend *self, int device_index) {
 								   0},
 		[GL_PIPE_ARGMAX_STAGE2] = {"argmax_stage2", gl_shader_argmax_stage2_src, 0, UINT32_MAX, 1,
 								   0},
-		[GL_PIPE_RMSNORM]		= {"rmsnorm", gl_shader_rmsnorm_src, 0, UINT32_MAX, 1, 0},
-		[GL_PIPE_RMSNORM_PER_HEAD] = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src, 0,
-									  UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_TOPK]	= {"sample_topk", gl_shader_sample_topk_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_FINAL]	= {"sample_final", gl_shader_sample_final_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_PENALTY] = {"sample_penalty", gl_shader_sample_penalty_src, 0, UINT32_MAX,
+									1, 0},
+		[GL_PIPE_SAMPLE_RADIX_HIST]	  = {"sample_radix_hist", gl_shader_sample_radix_hist_src, 0,
+										 UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_RADIX_SELECT] = {"sample_radix_select", gl_shader_sample_radix_select_src,
+										 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_GATHER] = {"sample_gather", gl_shader_sample_gather_src, 0, UINT32_MAX, 1,
+								   0},
+		[GL_PIPE_SAMPLE_LARGE_FINAL] = {"sample_large_final", gl_shader_sample_large_final_src, 0,
+										UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_FULL_SUM]	 = {"sample_full_sum", gl_shader_sample_full_sum_src, 0,
+										UINT32_MAX, 1, 0},
+		[GL_PIPE_SAMPLE_FULL_DRAW]	 = {"sample_full_draw", gl_shader_sample_full_draw_src, 0,
+										UINT32_MAX, 1, 0},
+		[GL_PIPE_RMSNORM]			 = {"rmsnorm", gl_shader_rmsnorm_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_RMSNORM_PER_HEAD]	 = {"rmsnorm_per_head", gl_shader_rmsnorm_per_head_src, 0,
+										UINT32_MAX, 1, 0},
 		[GL_PIPE_ELEMENTWISE]	  = {"elementwise", gl_shader_elementwise_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_EMBD_LOOKUP_F16] = {"embd_lookup_f16", gl_shader_embd_lookup_f16_src, 0,
 									 UINT32_MAX, 1, 0},
@@ -1621,7 +1659,11 @@ static status_code gl_init(backend *self, int device_index) {
 		gl_buf_alloc_ex(p, sizeof(iq4nl_pairs), GL_STATIC_DRAW, iq4nl_pairs, false, NULL);
 	if (!p->iq3s_grid || !p->iq4nl_pairs || !p->iqx_grid) {
 		if (p->iq3s_grid)
-			gl_buf_free(p, p->iq3s_grid);
+			gl_buf_free(p, p->sample_cand);
+		gl_buf_free(p, p->sample_state);
+		gl_buf_free(p, p->sample_sums);
+		gl_buf_free(p, p->sample_hist);
+		gl_buf_free(p, p->iq3s_grid);
 		if (p->iqx_grid)
 			gl_buf_free(p, p->iqx_grid);
 		if (p->iq4nl_pairs)
@@ -2146,13 +2188,16 @@ static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int
 		p->argmax_partial->device_dirty = 1;
 	}
 
-	gl_buf			  *s1_bufs[2]	  = {as_glbuf(logits), p->argmax_partial};
-	int				   s1_uniforms[2] = {n, (n + groups - 1) / groups};
-	static const char *s1_unames[2]	  = {"u_n", "u_chunk"};
-	status_code s = gl_dispatch_all_dirty(p, &p->pipes[GL_PIPE_ARGMAX_STAGE1], s1_bufs, 2,
-										  s1_unames, s1_uniforms, 2, (GLuint)groups, 1, 1, 1);
-	*groups_out	  = groups;
-	return s;
+	gl_pipeline *pipe = &p->pipes[GL_PIPE_ARGMAX_STAGE1];
+	gl_use_pipeline(p, pipe);
+	gl_bind_ssbo(0, logits);
+	gl_bind_raw(p, 1, p->argmax_partial->name, 0, 0, 1);
+	gl_pu(pipe, "u_n", n);
+	gl_pu(pipe, "u_chunk", (n + groups - 1) / groups);
+	gl_launch(p, (GLuint)groups, 1, 1);
+	p->argmax_partial->device_dirty = 1;
+	*groups_out						= groups;
+	return OK;
 }
 
 static status_code gl_argmax(backend *self, const buffer *logits, int n, int32_t *out_idx) {
@@ -2257,6 +2302,266 @@ static status_code gl_read_token_reg(backend *self, int reg, int32_t *out_token)
 	glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	return OK;
+}
+
+#define GL_SAMPLE_HIST_STRIDE (DEVICE_SAMPLE_HIST_CAP + 2)
+#define GL_SAMPLE_STATE_WORDS 1024
+
+static gl_buf *gl_sample_buf(gl_priv *p, size_t bytes) {
+	void   *zeros = xcalloc(1, bytes);
+	gl_buf *b	  = gl_buf_alloc_ex(p, bytes, GL_DYNAMIC_COPY, zeros, false, NULL);
+	free(zeros);
+	return b;
+}
+
+static status_code gl_sample_ensure(gl_priv *p) {
+	status_code s = gl_ensure_token_regs(p);
+	if (s != OK)
+		return s;
+	if (!p->sample_cand)
+		p->sample_cand = gl_sample_buf(p, (size_t)GL_SAMPLE_MAX_GROUPS * DEVICE_SAMPLE_SMALL_K * 2 *
+											  sizeof(uint32_t));
+	if (!p->sample_state)
+		p->sample_state = gl_sample_buf(p, GL_SAMPLE_STATE_WORDS * sizeof(uint32_t));
+	if (!p->sample_sums)
+		p->sample_sums = gl_sample_buf(p, GL_SAMPLE_MAX_GROUPS * sizeof(float));
+	if (!p->sample_hist)
+		p->sample_hist = gl_sample_buf(p, (size_t)DEVICE_SAMPLE_SLOTS * GL_SAMPLE_HIST_STRIDE *
+											  sizeof(uint32_t));
+	return p->sample_cand && p->sample_state && p->sample_sums && p->sample_hist
+			   ? OK
+			   : ERR_OUT_OF_MEMORY;
+}
+
+typedef struct {
+	gl_priv					   *p;
+	const buffer			   *logits;
+	const device_sample_params *params;
+	int							n;
+	int							chunk;
+	int							groups;
+	int							slot;
+	int							hist_base;
+} gl_sample_ctx;
+
+static void gl_sample_bind(gl_sample_ctx *x, int binding, const gl_buf *b, int write) {
+	gl_bind_raw(x->p, binding, b->name, 0, 0, write);
+}
+
+static void gl_sample_bind_logits(gl_sample_ctx *x, int binding) {
+	gl_bind_ssbo(binding, x->logits);
+}
+
+static gl_pipeline *gl_sample_pipe(gl_sample_ctx *x, int pipe_index) {
+	gl_pipeline *pipe = &x->p->pipes[pipe_index];
+	gl_use_pipeline(x->p, pipe);
+	return pipe;
+}
+
+static void gl_sample_topk(gl_sample_ctx *x, int k) {
+	gl_pipeline *pipe = gl_sample_pipe(x, GL_PIPE_SAMPLE_TOPK);
+	gl_sample_bind_logits(x, 0);
+	gl_sample_bind(x, 1, x->p->sample_cand, 1);
+	gl_pu(pipe, "u_n", x->n);
+	gl_pu(pipe, "u_chunk", x->chunk);
+	gl_pu(pipe, "u_k", k);
+	gl_launch(x->p, (GLuint)x->groups, 1, 1);
+}
+
+static void gl_sample_penalty(gl_sample_ctx *x) {
+	gl_pipeline *pipe = gl_sample_pipe(x, GL_PIPE_SAMPLE_PENALTY);
+	gl_bind_ssbo_out(0, x->logits);
+	gl_sample_bind(x, 1, x->p->sample_hist, 0);
+	gl_pu(pipe, "u_hist_base", x->hist_base);
+	gl_pu(pipe, "u_last_n", x->params->repeat_last_n);
+	gl_puf(pipe, "u_penalty", x->params->repeat_penalty);
+	gl_launch(x->p, 1, 1, 1);
+}
+
+static void gl_sample_path_small(gl_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	gl_priv					   *p = x->p;
+	gl_sample_topk(x, q->top_k);
+	gl_pipeline *pipe = gl_sample_pipe(x, GL_PIPE_SAMPLE_FINAL);
+	gl_sample_bind(x, 0, p->sample_cand, 1);
+	gl_bind_raw(p, 1, p->tok_reg->name, 0, 0, 1);
+	gl_bind_raw(p, 2, p->tok_rb->name, 0, 0, 1);
+	gl_sample_bind(x, 3, p->sample_hist, 1);
+	gl_pu(pipe, "u_n_cand", x->groups * q->top_k);
+	gl_pu(pipe, "u_k", q->top_k);
+	gl_pu(pipe, "u_slot", x->slot);
+	gl_puf(pipe, "u_inv_temp", q->inv_temp);
+	gl_puf(pipe, "u_top_p", q->top_p);
+	gl_puf(pipe, "u_min_p", q->min_p);
+	gl_puf(pipe, "u_uniform_sample", q->uniform_sample);
+	gl_pu(pipe, "u_hist_base", x->hist_base);
+	gl_launch(p, 1, 1, 1);
+}
+
+static void gl_sample_path_large(gl_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	gl_priv					   *p = x->p;
+	for (int shift = 24; shift >= 0; shift -= 8) {
+		gl_pipeline *hist = gl_sample_pipe(x, GL_PIPE_SAMPLE_RADIX_HIST);
+		gl_sample_bind_logits(x, 0);
+		gl_sample_bind(x, 1, p->sample_state, 1);
+		gl_pu(hist, "u_n", x->n);
+		gl_pu(hist, "u_chunk", x->chunk);
+		gl_pu(hist, "u_shift", shift);
+		gl_launch(p, (GLuint)x->groups, 1, 1);
+
+		gl_pipeline *sel = gl_sample_pipe(x, GL_PIPE_SAMPLE_RADIX_SELECT);
+		gl_sample_bind(x, 0, p->sample_state, 1);
+		gl_pu(sel, "u_shift", shift);
+		gl_pu(sel, "u_k", q->top_k);
+		gl_launch(p, 1, 1, 1);
+	}
+
+	gl_pipeline *gather = gl_sample_pipe(x, GL_PIPE_SAMPLE_GATHER);
+	gl_sample_bind_logits(x, 0);
+	gl_sample_bind(x, 1, p->sample_state, 1);
+	gl_sample_bind(x, 2, p->sample_cand, 1);
+	gl_pu(gather, "u_n", x->n);
+	gl_pu(gather, "u_chunk", x->chunk);
+	gl_launch(p, (GLuint)x->groups, 1, 1);
+
+	gl_pipeline *pipe = gl_sample_pipe(x, GL_PIPE_SAMPLE_LARGE_FINAL);
+	gl_sample_bind(x, 0, p->sample_state, 0);
+	gl_sample_bind(x, 1, p->sample_cand, 0);
+	gl_bind_raw(p, 2, p->tok_reg->name, 0, 0, 1);
+	gl_bind_raw(p, 3, p->tok_rb->name, 0, 0, 1);
+	gl_sample_bind(x, 4, p->sample_hist, 1);
+	gl_pu(pipe, "u_k", q->top_k);
+	gl_pu(pipe, "u_slot", x->slot);
+	gl_puf(pipe, "u_inv_temp", q->inv_temp);
+	gl_puf(pipe, "u_top_p", q->top_p);
+	gl_puf(pipe, "u_min_p", q->min_p);
+	gl_puf(pipe, "u_uniform_sample", q->uniform_sample);
+	gl_pu(pipe, "u_hist_base", x->hist_base);
+	gl_launch(p, 1, 1, 1);
+}
+
+static void gl_sample_path_full(gl_sample_ctx *x) {
+	const device_sample_params *q = x->params;
+	gl_priv					   *p = x->p;
+	gl_sample_topk(x, 1);
+
+	gl_pipeline *sum = gl_sample_pipe(x, GL_PIPE_SAMPLE_FULL_SUM);
+	gl_sample_bind_logits(x, 0);
+	gl_sample_bind(x, 1, p->sample_cand, 0);
+	gl_sample_bind(x, 2, p->sample_sums, 1);
+	gl_pu(sum, "u_n", x->n);
+	gl_pu(sum, "u_chunk", x->chunk);
+	gl_pu(sum, "u_groups", x->groups);
+	gl_puf(sum, "u_inv_temp", q->inv_temp);
+	gl_launch(p, (GLuint)x->groups, 1, 1);
+
+	gl_pipeline *draw = gl_sample_pipe(x, GL_PIPE_SAMPLE_FULL_DRAW);
+	gl_sample_bind_logits(x, 0);
+	gl_sample_bind(x, 1, p->sample_cand, 0);
+	gl_sample_bind(x, 2, p->sample_sums, 0);
+	gl_bind_raw(p, 3, p->tok_reg->name, 0, 0, 1);
+	gl_bind_raw(p, 4, p->tok_rb->name, 0, 0, 1);
+	gl_sample_bind(x, 5, p->sample_hist, 1);
+	gl_pu(draw, "u_n", x->n);
+	gl_pu(draw, "u_chunk", x->chunk);
+	gl_pu(draw, "u_groups", x->groups);
+	gl_pu(draw, "u_slot", x->slot);
+	gl_puf(draw, "u_inv_temp", q->inv_temp);
+	gl_puf(draw, "u_uniform_sample", q->uniform_sample);
+	gl_pu(draw, "u_hist_base", x->hist_base);
+	gl_launch(p, 1, 1, 1);
+}
+
+static status_code gl_sample_dispatch(gl_priv *p, const buffer *logits, int n,
+									  const device_sample_params *params, int slot) {
+	status_code s = gl_sample_ensure(p);
+	if (s != OK)
+		return s;
+	int groups = (n + GL_SAMPLE_CHUNK - 1) / GL_SAMPLE_CHUNK;
+	if (groups < 1 || groups > GL_SAMPLE_MAX_GROUPS || params->path == DEVICE_SAMPLE_NONE ||
+		params->history_slot < 0 || params->history_slot >= DEVICE_SAMPLE_SLOTS)
+		return ERR_UNSUPPORTED;
+
+	gl_sample_ctx x = {.p		  = p,
+					   .logits	  = logits,
+					   .params	  = params,
+					   .n		  = n,
+					   .chunk	  = (n + groups - 1) / groups,
+					   .groups	  = groups,
+					   .slot	  = slot,
+					   .hist_base = params->history_slot * GL_SAMPLE_HIST_STRIDE};
+
+	if (params->repeat_penalty != 1.0f)
+		gl_sample_penalty(&x);
+	switch (params->path) {
+	case DEVICE_SAMPLE_SMALL:
+		gl_sample_path_small(&x);
+		break;
+	case DEVICE_SAMPLE_LARGE:
+		gl_sample_path_large(&x);
+		break;
+	default:
+		gl_sample_path_full(&x);
+		break;
+	}
+	return OK;
+}
+
+static status_code gl_sample_to_reg(backend *self, const buffer *logits, int n,
+									const device_sample_params *params, int reg) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (reg < 0 || reg >= BACKEND_TOKEN_REGS)
+		return ERR_INVALID_ARG;
+	status_code s = gl_sample_dispatch(p, logits, n, params, reg);
+	if (s != OK)
+		return s;
+
+	gl_barrier_if_pending(p);
+	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	glBindBuffer(GL_COPY_READ_BUFFER, p->tok_reg->name);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, p->tok_rb->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr)(reg * 4),
+						(GLintptr)(reg * 4), 4);
+	glBindBuffer(GL_COPY_READ_BUFFER, 0);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	if (p->tok_fence[reg])
+		glDeleteSync(p->tok_fence[reg]);
+	p->tok_fence[reg] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	p->stats.flushes++;
+	glFlush();
+	return p->tok_fence[reg] ? OK : ERR_INTERNAL;
+}
+
+static status_code gl_sample(backend *self, const buffer *logits, int n,
+							 const device_sample_params *params, int32_t *out_idx) {
+	status_code s = gl_sample_to_reg(self, logits, n, params, 0);
+	if (s != OK)
+		return s;
+	return gl_read_token_reg(self, 0, out_idx);
+}
+
+static status_code gl_sample_history_set(backend *self, int slot, const int32_t *tokens, int n) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	if (slot < 0 || slot >= DEVICE_SAMPLE_SLOTS || n < 0 || n > DEVICE_SAMPLE_HIST_CAP)
+		return ERR_INVALID_ARG;
+	status_code s = gl_sample_ensure(p);
+	if (s != OK)
+		return s;
+	uint32_t words[GL_SAMPLE_HIST_STRIDE] = {0};
+	words[0]							  = (uint32_t)n;
+	words[1]							  = (uint32_t)n % DEVICE_SAMPLE_HIST_CAP;
+	memcpy(words + 2, tokens, (size_t)n * sizeof(uint32_t));
+	gl_barrier_if_pending(p);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, p->sample_hist->name);
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER,
+					(GLintptr)((size_t)slot * GL_SAMPLE_HIST_STRIDE * sizeof(uint32_t)),
+					(GLsizeiptr)sizeof(words), words);
+	GLenum err = glGetError();
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	return err == GL_NO_ERROR ? OK : ERR_INTERNAL;
 }
 
 static status_code gl_buf_read_range(gl_buf *b, size_t byte_off, size_t len, void *dst) {
@@ -6056,6 +6361,9 @@ static status_code gl_ctor(backend *out) {
 	out->argmax							 = gl_argmax;
 	out->argmax_to_reg					 = gl_argmax_to_reg;
 	out->read_token_reg					 = gl_read_token_reg;
+	out->sample							 = gl_sample;
+	out->sample_to_reg					 = gl_sample_to_reg;
+	out->sample_history_set				 = gl_sample_history_set;
 	out->embd_lookup					 = gl_embd_lookup;
 	out->rmsnorm						 = gl_rmsnorm;
 	out->rmsnorm_per_head				 = gl_rmsnorm_per_head;

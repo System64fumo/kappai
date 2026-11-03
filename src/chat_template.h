@@ -50,6 +50,10 @@ typedef struct {
 	char		*tool_choice;
 
 	char *last_render;
+
+	char  *static_prefix_system;
+	size_t static_prefix_bytes;
+	bool   static_prefix_thinking;
 } chat_template_state;
 
 void chat_template_set_invalidate_cb(chat_template_state *cts, void (*cb)(void *), void *ud);

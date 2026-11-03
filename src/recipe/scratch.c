@@ -132,6 +132,9 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_router_inp.p);
 	buffer_release(&bs->moe_router_logits_dev);
 	buffer_release(&bs->moe_router_inp_dev);
+	buffer_release(&bs->moe_router_bias_dev);
+	buffer_release(&bs->moe_router_out_dev);
+	free(bs->moe_router_out.p);
 	free(bs->moe_xb_f.p);
 	free(bs->moe_gather_x.p);
 	free(bs->moe_exp_gu.p);

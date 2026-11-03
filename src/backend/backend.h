@@ -34,6 +34,42 @@ typedef enum {
 } backend_cap;
 
 #define BACKEND_TOKEN_REGS 2
+#define DEVICE_SAMPLE_SMALL_K 64
+#define DEVICE_SAMPLE_LARGE_K 1024
+#define DEVICE_SAMPLE_HIST_CAP 1024
+#define DEVICE_SAMPLE_SLOTS 64
+
+typedef enum {
+	DEVICE_SAMPLE_NONE = -1,
+	DEVICE_SAMPLE_SMALL,
+	DEVICE_SAMPLE_LARGE,
+	DEVICE_SAMPLE_FULL,
+} device_sample_path;
+
+typedef struct {
+	int	  path;
+	int	  top_k;
+	float inv_temp;
+	float top_p;
+	float min_p;
+	float uniform_sample;
+	float repeat_penalty;
+	int	  repeat_last_n;
+	int	  history_slot;
+} device_sample_params;
+
+static inline int device_sample_plan(int top_k, float top_p, float min_p, int vocab, int *k_eff) {
+	bool k_active = top_k > 0 && top_k < vocab;
+	bool filtered = top_p < 1.0f || min_p > 0.0f;
+	if (k_active) {
+		*k_eff = top_k;
+		if (top_k <= DEVICE_SAMPLE_SMALL_K)
+			return DEVICE_SAMPLE_SMALL;
+		return top_k <= DEVICE_SAMPLE_LARGE_K ? DEVICE_SAMPLE_LARGE : DEVICE_SAMPLE_NONE;
+	}
+	*k_eff = vocab < DEVICE_SAMPLE_LARGE_K ? vocab : DEVICE_SAMPLE_LARGE_K;
+	return filtered ? DEVICE_SAMPLE_LARGE : DEVICE_SAMPLE_FULL;
+}
 #define TOKEN_FROM_REG(reg) (-1 - (reg))
 #define TOKEN_IS_REG(token) ((token) < 0)
 #define TOKEN_REG_INDEX(token) (-1 - (token))
@@ -122,6 +158,12 @@ typedef struct {
 	int dst_pos;
 	int n_rows;
 } kv_shift_chunk;
+
+static inline size_t kv_row_bytes(kv_quant_type quant, int head_dim) {
+	if (quant == KV_QUANT_Q8_0)
+		return ((size_t)head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK * KV_Q8_0_BLOCK_BYTES;
+	return (size_t)head_dim * sizeof(uint16_t);
+}
 
 typedef struct {
 	char	 name[32];
@@ -269,6 +311,12 @@ struct backend {
 								const buffer *k_in, const buffer *v_in, int in_row_stride,
 								int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
 								int m);
+	status_code (*kv_export)(backend *self, const buffer *k, const buffer *v, int layer,
+							 int pos_start, int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+							 int n_kv_heads_active, void *k_dst, void *v_dst);
+	status_code (*kv_import)(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+							 int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+							 int n_kv_heads_active, const void *k_src, const void *v_src);
 	status_code (*embd_lookup)(backend *self, const buffer *tok_embd, uint32_t tok_embd_type,
 							   int token, int dim, buffer *x_out);
 	status_code (*rmsnorm)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -358,6 +406,11 @@ struct backend {
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
 	status_code (*argmax_to_reg)(backend *self, const buffer *logits, int n, int reg);
 	status_code (*read_token_reg)(backend *self, int reg, int32_t *out_token);
+	status_code (*sample)(backend *self, const buffer *logits, int n,
+						  const device_sample_params *params, int32_t *out_idx);
+	status_code (*sample_to_reg)(backend *self, const buffer *logits, int n,
+								 const device_sample_params *params, int reg);
+	status_code (*sample_history_set)(backend *self, int slot, const int32_t *tokens, int n);
 	status_code (*repack_plan)(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
 							   uint32_t *re_type_out);
 	status_code (*repack_weight)(backend *self, uint32_t type, const void *src, void *dst,
@@ -440,6 +493,9 @@ struct backend {
 									 const int *rows_packed, const float *weights_packed);
 	status_code (*moe_activate)(backend *self, const buffer *gate, const buffer *up, buffer *out,
 								int n, float gate_scale, float up_scale, int use_gelu);
+	status_code (*moe_router_topk)(backend *self, const buffer *logits, const buffer *bias,
+								   buffer *out, int rows, int n_experts, int top_k, int use_softmax,
+								   int norm_topk, float routed_scale, int n_group, int topk_group);
 	size_t (*mem_available)(backend *self);
 	size_t (*mem_total)(backend *self);
 	cpu_cache_info (*cpu_info)(void);
@@ -459,8 +515,17 @@ struct backend {
 	status_code (*attention_dense)(backend *self, const dense_attention_desc *d);
 	status_code (*im2col3x3)(backend *self, const im2col_desc *d);
 	status_code (*upsample_shortcut_add)(backend *self, const upsample_shortcut_desc *d);
+	int			sample_max_vocab;
 	const char *desc;
 };
+
+static inline int backend_can_device_sample(const backend *b, int vocab, int top_k, float top_p,
+											float min_p) {
+	int k_eff;
+	return b && b->sample && b->sample_to_reg && b->sample_history_set &&
+		   vocab <= b->sample_max_vocab &&
+		   device_sample_plan(top_k, top_p, min_p, vocab, &k_eff) != DEVICE_SAMPLE_NONE;
+}
 
 static inline int backend_has_cap(const backend *b, uint64_t cap) {
 	return b && (b->caps & cap) != 0;

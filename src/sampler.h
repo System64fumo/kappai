@@ -23,6 +23,7 @@ typedef struct {
 	rng					 rng;
 	int32_t				*recent;
 	int					 recent_count;
+	uint64_t			 observed;
 	int					 recent_capacity;
 	int					 recent_head;
 	float				*logits_buf;
@@ -43,6 +44,9 @@ void	sampler_set_vocab(sampler *s, int vocab_size);
 void	sampler_observe(sampler *s, int32_t token);
 int32_t sampler_sample(sampler *s, const float *logits, int vocab);
 int32_t sampler_argmax(const float *logits, int vocab);
+bool	sampler_device_eligible(const sampler *s, const backend *b, int vocab);
+void	sampler_device_params(sampler *s, int vocab, int history_slot, device_sample_params *out);
+int		sampler_recent_window(const sampler *s, int32_t *out, int cap);
 
 int sampler_top_k(const float *logits, int vocab, int k, sampler_top_k_entry *out);
 

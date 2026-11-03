@@ -1,0 +1,44 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(std430, binding = 1) readonly buffer MaxBuf {
+	uvec2 maxes[];
+};
+layout(std430, binding = 2) writeonly buffer SumBuf {
+	float sums[];
+};
+
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_chunk;
+layout(location = 2) uniform int u_groups;
+layout(location = 3) uniform float u_inv_temp;
+
+shared float s_part[256];
+
+void main() {
+	uint  tid = gl_LocalInvocationID.x;
+	float mx  = uintBitsToFloat(0xFF800000u);
+	for (int g = 0; g < u_groups; g++)
+		mx = max(mx, uintBitsToFloat(maxes[g].x));
+	mx *= u_inv_temp;
+
+	uint  lo  = gl_WorkGroupID.x * uint(u_chunk);
+	uint  hi  = min(lo + uint(u_chunk), uint(u_n));
+	float acc = 0.0;
+	for (uint i = lo + tid; i < hi; i += 256u)
+		acc += exp(logits[i] * u_inv_temp - mx);
+	s_part[tid] = acc;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1u) {
+		if (tid < s)
+			s_part[tid] += s_part[tid + s];
+		barrier();
+	}
+	if (tid == 0u)
+		sums[gl_WorkGroupID.x] = s_part[0];
+}

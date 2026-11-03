@@ -61,30 +61,15 @@ layout(set = 0, binding = 0) readonly buffer W0Buf {
 layout(set = 0, binding = 1) readonly buffer XBuf {
 	float x[];
 };
-#ifdef HAS_RESIDUAL
-layout(set = 0, binding = 2) readonly buffer RBuf {
-	float residual[];
-};
-layout(set = 0, binding = 3) writeonly buffer Y0Buf {
-	float y0[];
-};
-#else
 layout(set = 0, binding = 2) writeonly buffer Y0Buf {
 	float y0[];
 };
-#endif
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
 #endif
 
-layout(push_constant) uniform Params {
-	int n0;
-	int n1;
-#if NMAT >= 3
-	int n2;
-#endif
-	int k;
-	int m;
-}
-params;
+#include "matmul_push.glsl"
 
 #include "common.glsl"
 
@@ -126,9 +111,7 @@ void main() {
 	uint row	= gl_WorkGroupID.y;
 	uint x_off	= row * uint(k);
 	uint y0_off = row * uint(params.n0);
-#ifdef HAS_RESIDUAL
-	uint r_off = y0_off;
-#endif
+	uint r_off	= y0_off;
 #if NMAT >= 2
 	uint y1_off = row * uint(params.n1);
 #endif
@@ -284,10 +267,9 @@ void main() {
 			continue;
 #if NMAT >= 2
 		y0[y0_off + base_i + uint(r)] = acc0[r];
-#elif defined(HAS_RESIDUAL)
-		y0[y0_off + base_i + uint(r)] = acc0[r] + residual[r_off + base_i + uint(r)];
 #else
-		y0[y0_off + base_i + uint(r)] = acc0[r];
+		y0[y0_off + base_i + uint(r)] =
+			acc0[r] + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
 #endif
 	}
 

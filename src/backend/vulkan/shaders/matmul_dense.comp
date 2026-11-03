@@ -12,25 +12,14 @@ layout(set = 0, binding = 0) readonly restrict buffer WBuf {
 layout(set = 0, binding = 1) readonly restrict buffer XBuf {
 	float x[];
 };
-#ifdef HAS_RESIDUAL
-layout(set = 0, binding = 2) readonly restrict buffer RBuf {
-	float residual[];
-};
-layout(set = 0, binding = 3) writeonly restrict buffer YBuf {
-	float y[];
-};
-#else
 layout(set = 0, binding = 2) writeonly restrict buffer YBuf {
 	float y[];
 };
-#endif
+layout(set = 0, binding = 3) readonly restrict buffer RBuf {
+	float residual[];
+};
 
-layout(push_constant) uniform Params {
-	int n;
-	int k;
-	int m;
-}
-params;
+#include "matmul_push.glsl"
 
 layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
 layout(constant_id = 2) const int TILE_K		  = 2048;
@@ -84,7 +73,7 @@ shared float x_shared[M_PER_WG][TILE_K];
 shared float red[RED_SLOTS];
 
 void main() {
-	const int n = params.n;
+	const int n = params.n0;
 	const int k = params.k;
 	const int m = params.m;
 	if (n <= 0)
@@ -196,11 +185,7 @@ void main() {
 			if (!valid[r])
 				continue;
 			const int o = y_off + base_i + r;
-#ifdef HAS_RESIDUAL
-			y[o] = acc[mr][r] + residual[o];
-#else
-			y[o] = acc[mr][r];
-#endif
+			y[o]		= acc[mr][r] + (params.res_mode != 0 ? residual[o] : 0.0);
 		}
 	}
 }

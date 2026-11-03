@@ -12,25 +12,14 @@ layout(set = 0, binding = 0) readonly buffer W0Buf {
 layout(set = 0, binding = 1) readonly buffer XBuf {
 	float x[];
 };
-#ifdef HAS_RESIDUAL
-layout(set = 0, binding = 2) readonly buffer RBuf {
-	float residual[];
-};
-layout(set = 0, binding = 3) writeonly buffer YBuf {
-	float y[];
-};
-#else
 layout(set = 0, binding = 2) writeonly buffer YBuf {
 	float y[];
 };
-#endif
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
 
-layout(push_constant) uniform Params {
-	int n;
-	int k;
-	int m;
-}
-params;
+#include "matmul_push.glsl"
 
 #include "common.glsl"
 
@@ -64,13 +53,11 @@ void main() {
 
 	uint row   = gl_WorkGroupID.y;
 	uint x_off = row * uint(k);
-	uint y_off = row * uint(params.n);
-#ifdef HAS_RESIDUAL
+	uint y_off = row * uint(params.n0);
 	uint r_off = y_off;
-#endif
 
 	precise float acc	= 0.0;
-	bool		  valid = (int(i) < params.n);
+	bool		  valid = (int(i) < params.n0);
 
 	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
 		int tile_end = min(tile_start + TILE_K, k);
@@ -177,9 +164,5 @@ void main() {
 
 	if (!valid)
 		return;
-#ifdef HAS_RESIDUAL
-	y[y_off + i] = acc + residual[r_off + i];
-#else
-	y[y_off + i] = acc;
-#endif
+	y[y_off + i] = acc + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
 }

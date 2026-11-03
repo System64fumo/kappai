@@ -7,16 +7,30 @@
 
 #define WG 64
 #define MAX_SUBGROUPS 16
+#if defined(Q6_K)
 #define PARTS 16u
+#else
+#define PARTS 8u
+#endif
 #define XQ_BLOCK_WORDS 76u
+#define XQ_BLOCK_UVEC4 19u
 
 layout(local_size_x = WG) in;
 layout(constant_id = 0) const uint COLS = 1;
 layout(constant_id = 1) const uint ROWS = 2;
 
+#if defined(Q4_K) || defined(Q5_K)
+layout(set = 0, binding = 0) readonly buffer W128 {
+	uvec4 w128[];
+};
+layout(set = 0, binding = 1) readonly buffer XQ4 {
+	uvec4 xq4[];
+};
+#else
 layout(set = 0, binding = 0) readonly buffer W {
 	uint16_t w16[];
 };
+#endif
 layout(set = 0, binding = 1) readonly buffer XQ {
 	uint xq[];
 };
@@ -36,15 +50,82 @@ layout(push_constant) uniform Params {
 pc;
 
 #if defined(Q4_K)
-#define BLOCK_U16 72u
-#define QS_U16 8u
+#define BLOCK_U128 9u
+#define QS_U128 1u
 #elif defined(Q5_K)
-#define BLOCK_U16 88u
-#define QS_U16 24u
+#define BLOCK_U128 11u
+#define QS_U128 3u
 #elif defined(Q6_K)
 #define BLOCK_U16 105u
 #endif
 
+int dot2(uint w0, uint w1, uint x0, uint x1) {
+	return dotPacked4x8EXT(int(w0), int(x0)) + dotPacked4x8EXT(int(w1), int(x1));
+}
+
+#if defined(Q4_K) || defined(Q5_K)
+struct xpart {
+	uvec4 lo;
+	uvec4 hi;
+	float d;
+	int	  sum_lo;
+	int	  sum_hi;
+};
+
+int dot4(uvec4 w, uvec4 x) {
+	return dot2(w.x, w.y, x.x, x.y) + dot2(w.z, w.w, x.z, x.w);
+}
+
+xpart load_xpart(uint xblock, uint g, uint qq2) {
+	xpart xp;
+	uint  xb4 = xblock * XQ_BLOCK_UVEC4 + 4u * g + qq2;
+	xp.lo	  = xq4[xb4];
+	xp.hi	  = xq4[xb4 + 2u];
+	xp.d	  = uintBitsToFloat(xq[xblock * XQ_BLOCK_WORDS + 64u]);
+	xp.sum_lo = dot4(uvec4(0x01010101u), xp.lo);
+	xp.sum_hi = dot4(uvec4(0x01010101u), xp.hi);
+	return xp;
+}
+
+void scale_min(uvec3 s, uint g, out int sc0, out int sc1, out int mn0, out int mn1) {
+	uint shift = (g & 1u) * 16u;
+	uint xs	   = (s.x >> shift) & 0xFFFFu;
+	uint ys	   = (s.y >> shift) & 0xFFFFu;
+	uint scs, mns;
+	if (g < 2u) {
+		scs = xs & 0x3F3Fu;
+		mns = ys & 0x3F3Fu;
+	} else {
+		uint zs = (s.z >> shift) & 0xFFFFu;
+		scs		= (zs & 0x0F0Fu) | ((xs & 0xC0C0u) >> 2u);
+		mns		= ((zs >> 4u) & 0x0F0Fu) | ((ys & 0xC0C0u) >> 2u);
+	}
+	sc0 = int(scs & 0xFFu);
+	sc1 = int(scs >> 8u);
+	mn0 = int(mns & 0xFFu);
+	mn1 = int(mns >> 8u);
+}
+
+float block_part(uint blk, uint part, xpart xp) {
+	uint  g	   = part >> 1u;
+	uint  base = blk * BLOCK_U128;
+	uvec4 hdr  = w128[base];
+	uvec4 q	   = w128[base + QS_U128 + part];
+	uvec4 l	   = q & 0x0F0F0F0Fu;
+	uvec4 h	   = (q >> 4u) & 0x0F0F0F0Fu;
+#ifdef Q5_K
+	uvec4 e = w128[base + 1u + (part & 1u)];
+	l |= ((e >> (2u * g)) & 0x01010101u) << 4u;
+	h |= ((e >> (2u * g + 1u)) & 0x01010101u) << 4u;
+#endif
+	int s0, s1, m0, m1;
+	scale_min(hdr.yzw, g, s0, s1, m0, m1);
+	int	 sumi = s0 * dot4(l, xp.lo) + s1 * dot4(h, xp.hi);
+	int	 summ = m0 * xp.sum_lo + m1 * xp.sum_hi;
+	vec2 dm	  = unpackHalf2x16(hdr.x);
+	return xp.d * (dm.x * float(sumi) - dm.y * float(summ));
+}
+#else
 uint wq16(uint i) {
 	return uint(w16[i]);
 }
@@ -53,64 +134,11 @@ uint wq32(uint i) {
 	return wq16(i) | (wq16(i + 1u) << 16u);
 }
 
-int dot2(uint w0, uint w1, uint x0, uint x1) {
-	return dotPacked4x8EXT(int(w0), int(x0)) + dotPacked4x8EXT(int(w1), int(x1));
-}
-
 uint sub_bytes(uint v, uint k) {
 	return ((v | 0x80808080u) - k) ^ 0x80808080u;
 }
 
-#if defined(Q4_K) || defined(Q5_K)
-uint sbyte(uint b, uint i) {
-	return (wq16(b + 2u + (i >> 1u)) >> ((i & 1u) * 8u)) & 0xFFu;
-}
-
-void scale_min(uint b, uint j, out int sc, out int mn) {
-	if (j < 4u) {
-		sc = int(sbyte(b, j) & 63u);
-		mn = int(sbyte(b, j + 4u) & 63u);
-	} else {
-		sc = int((sbyte(b, j + 4u) & 0xFu) | ((sbyte(b, j - 4u) >> 6u) << 4u));
-		mn = int((sbyte(b, j + 4u) >> 4u) | ((sbyte(b, j) >> 6u) << 4u));
-	}
-}
-#endif
-
 float block_part(uint b, uint xbase, uint p) {
-#if defined(Q4_K) || defined(Q5_K)
-	uint g	= p >> 2u;
-	uint qq = p & 3u;
-	uint q0 = wq32(b + QS_U16 + g * 16u + qq * 4u);
-	uint q1 = wq32(b + QS_U16 + g * 16u + qq * 4u + 2u);
-	uint l0 = q0 & 0x0F0F0F0Fu;
-	uint l1 = q1 & 0x0F0F0F0Fu;
-	uint h0 = (q0 >> 4u) & 0x0F0F0F0Fu;
-	uint h1 = (q1 >> 4u) & 0x0F0F0F0Fu;
-#ifdef Q5_K
-	uint e0 = wq32(b + 8u + qq * 4u);
-	uint e1 = wq32(b + 8u + qq * 4u + 2u);
-	l0 |= ((e0 >> (2u * g)) & 0x01010101u) << 4u;
-	l1 |= ((e1 >> (2u * g)) & 0x01010101u) << 4u;
-	h0 |= ((e0 >> (2u * g + 1u)) & 0x01010101u) << 4u;
-	h1 |= ((e1 >> (2u * g + 1u)) & 0x01010101u) << 4u;
-#endif
-	uint xa	  = xbase + 2u * g * 8u + qq * 2u;
-	uint xb	  = xa + 8u;
-	int	 dot0 = dot2(l0, l1, xq[xa], xq[xa + 1u]);
-	int	 dot1 = dot2(h0, h1, xq[xb], xq[xb + 1u]);
-	int	 s0, m0, s1, m1;
-	scale_min(b, 2u * g, s0, m0);
-	scale_min(b, 2u * g + 1u, s1, m1);
-	int sumi = s0 * dot0 + s1 * dot1;
-	int summ = 0;
-	if (qq == 0u)
-		summ = m0 * int(xq[xbase + 65u + 2u * g]) + m1 * int(xq[xbase + 66u + 2u * g]);
-	float d	   = unpackHalf2x16(wq16(b)).x;
-	float dmin = unpackHalf2x16(wq16(b + 1u)).x;
-	float xd   = uintBitsToFloat(xq[xbase + 64u]);
-	return xd * (d * float(sumi) - dmin * float(summ));
-#else
 	uint h	  = p >> 3u;
 	uint sub  = (p >> 2u) & 1u;
 	uint qq	  = p & 3u;
@@ -140,8 +168,8 @@ float block_part(uint b, uint xbase, uint p) {
 	float d	 = unpackHalf2x16(wq16(b + 104u)).x;
 	float xd = uintBitsToFloat(xq[xbase + 64u]);
 	return d * xd * float(sumi);
-#endif
 }
+#endif
 
 shared float s_red[16 * MAX_SUBGROUPS];
 
@@ -157,6 +185,25 @@ void main() {
 	for (uint i = 0u; i < ROWS * COLS; i++)
 		acc[i] = 0.0;
 
+#if defined(Q4_K) || defined(Q5_K)
+	uint wrow[ROWS];
+	for (uint r = 0u; r < ROWS; r++)
+		wrow[r] = min(row0 + r, n - 1u) * kb;
+	uint xcol[COLS];
+	for (uint c = 0u; c < COLS; c++)
+		xcol[c] = min(col0 + c, m - 1u) * kb;
+
+	for (uint it = tid; it < kb * PARTS; it += WG) {
+		uint  bi = it / PARTS;
+		uint  pp = it % PARTS;
+		xpart xp[COLS];
+		for (uint c = 0u; c < COLS; c++)
+			xp[c] = load_xpart(xcol[c] + bi, pp >> 1u, pp & 1u);
+		for (uint r = 0u; r < ROWS; r++)
+			for (uint c = 0u; c < COLS; c++)
+				acc[r * COLS + c] += block_part(wrow[r] + bi, pp, xp[c]);
+	}
+#else
 	for (uint it = tid; it < kb * PARTS; it += WG) {
 		uint bi = it / PARTS;
 		uint pp = it % PARTS;
@@ -168,6 +215,8 @@ void main() {
 			}
 		}
 	}
+
+#endif
 
 	for (uint i = 0u; i < ROWS * COLS; i++) {
 		float v = subgroupAdd(acc[i]);

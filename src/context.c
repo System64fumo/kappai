@@ -278,8 +278,12 @@ void context_release_thread(context *c) {
 		backend_release_thread(c->extra_backends[i]);
 }
 
+static int g_next_hist_slot;
+
 status_code context_init(context *c, const config *cfg) {
 	memset(c, 0, sizeof(*c));
+	c->device_hist_slot =
+		__atomic_fetch_add(&g_next_hist_slot, 1, __ATOMIC_RELAXED) % DEVICE_SAMPLE_SLOTS;
 
 	const char *mon_path =
 		cfg->monitor ? (cfg->monitor[0] ? cfg->monitor : "/tmp/kappai.monitor") : NULL;
@@ -524,6 +528,7 @@ void context_reset_session(context *c) {
 	context_idle_prefill_wait(c);
 	c->samp.recent_count = 0;
 	c->samp.recent_head	 = 0;
+	c->device_hist_valid = false;
 	chat_template_clear_messages(&c->chat);
 	sync_set(c, NULL, 0, 0);
 	c->interrupt		 = 0;
@@ -862,9 +867,11 @@ static int context_feed_reg(context *c, int reg) {
 	return pos + 1;
 }
 
-static bool context_token_regs_usable(const context *c) {
+static bool context_token_regs_usable(const context *c, bool sample) {
 	const backend *b = c->backend;
-	if (!b || !b->argmax_to_reg || !b->read_token_reg || c->decode_step || c->debug_forward)
+	if (!b || !b->read_token_reg || c->decode_step || c->debug_forward)
+		return false;
+	if (sample ? !b->sample_to_reg : !b->argmax_to_reg)
 		return false;
 	if (c->m.mixed_backend_mode)
 		return false;
@@ -1013,6 +1020,69 @@ fail:
 	return status;
 }
 
+enum { PREFILL_BRANCHES_MAX_ROWS = 512 };
+
+status_code context_prefill_branches(context *c, const int32_t *const *seqs, const int *lens,
+									 int n_seq, float *logits_out) {
+	if (!c || !seqs || !lens || !logits_out || n_seq < 2)
+		return ERR_INVALID_ARG;
+	const kvcache_hybrid *h = c->kv.hybrid;
+	if (!c->m.arch_info || !c->m.arch_info->hybrid_shortconv || !h || !h->conv_state ||
+		h->recurrent_total > 0 || h->conv_buf || h->state_buf || h->latent_buf ||
+		c->kv.n_mirrors > 0 || !c->kv.backend || !backend_has_cap(c->kv.backend, BCAP_IS_HOST))
+		return ERR_UNSUPPORTED;
+
+	const int base	= c->kv.n_pos;
+	int		  total = 0;
+	for (int i = 0; i < n_seq; i++) {
+		if (lens[i] < 1 || base + lens[i] > c->kv.n_ctx)
+			return ERR_INVALID_ARG;
+		total += lens[i];
+	}
+	if (total > PREFILL_BRANCHES_MAX_ROWS)
+		return ERR_UNSUPPORTED;
+	if (c->interrupt)
+		return ERR_INTERRUPTED;
+
+	status_code st = compute_scratch_ensure(&c->scratch, &c->m, c->kv.n_ctx);
+	if (st != OK)
+		return st;
+	compute_scratch_reserve_rows(&c->m, &c->scratch, total);
+
+	int32_t		   *tokens	 = xmalloc((size_t)total * sizeof(*tokens));
+	int			   *seg_rows = xmalloc((size_t)n_seq * sizeof(*seg_rows));
+	int			   *seg_pos	 = xmalloc((size_t)n_seq * sizeof(*seg_pos));
+	kvcache		  **caches	 = xcalloc((size_t)n_seq, sizeof(*caches));
+	kvcache		   *views	 = xcalloc((size_t)n_seq, sizeof(*views));
+	kvcache_hybrid *states	 = xcalloc((size_t)n_seq, sizeof(*states));
+	int				row		 = 0;
+	for (int i = 0; i < n_seq; i++) {
+		memcpy(tokens + row, seqs[i], (size_t)lens[i] * sizeof(*tokens));
+		row += lens[i];
+		seg_rows[i]			 = lens[i];
+		seg_pos[i]			 = base;
+		states[i]			 = *h;
+		states[i].conv_state = xmalloc(h->conv_total * sizeof(float));
+		memcpy(states[i].conv_state, h->conv_state, h->conv_total * sizeof(float));
+		views[i]		= c->kv;
+		views[i].hybrid = &states[i];
+		caches[i]		= &views[i];
+	}
+
+	st = compute_forward_segments(&c->m, caches, &c->scratch, tokens, seg_rows, seg_pos, n_seq,
+								  c->flash_attn, logits_out);
+
+	for (int i = 0; i < n_seq; i++)
+		free(states[i].conv_state);
+	free(states);
+	free(views);
+	free(caches);
+	free(seg_pos);
+	free(seg_rows);
+	free(tokens);
+	return st;
+}
+
 static void debug_print_logits(context *c) {
 	buffer *logits = compute_logits_device(&c->scratch);
 	if (c->backend && c->backend->argmax) {
@@ -1051,14 +1121,77 @@ static void debug_print_logits(context *c) {
 	sb_free(&sb);
 }
 
+static void context_sync_device_history(context *c) {
+	const sampler *s = &c->samp;
+	if (s->repeat_penalty == 1.0f)
+		return;
+	if (c->device_hist_valid && s->observed - c->device_hist_obs == c->device_hist_appends)
+		return;
+	int32_t window[DEVICE_SAMPLE_HIST_CAP];
+	int		n = sampler_recent_window(s, window, DEVICE_SAMPLE_HIST_CAP);
+	if (c->backend->sample_history_set(c->backend, c->device_hist_slot, window, n) != OK)
+		return;
+	c->device_hist_valid   = true;
+	c->device_hist_obs	   = s->observed;
+	c->device_hist_appends = 0;
+}
+
+static status_code context_device_pick(context *c, const buffer *logits, bool sample,
+									   int32_t *tok) {
+	if (!sample)
+		return c->backend->argmax(c->backend, logits, c->m.vocab_size, tok);
+	device_sample_params params;
+	sampler_device_params(&c->samp, c->m.vocab_size, c->device_hist_slot, &params);
+	status_code st = c->backend->sample(c->backend, logits, c->m.vocab_size, &params, tok);
+	if (st == OK)
+		c->device_hist_appends++;
+	return st;
+}
+
+static status_code context_device_pick_reg(context *c, const buffer *logits, bool sample, int reg) {
+	if (!sample)
+		return c->backend->argmax_to_reg(c->backend, logits, c->m.vocab_size, reg);
+	device_sample_params params;
+	sampler_device_params(&c->samp, c->m.vocab_size, c->device_hist_slot, &params);
+	status_code st = c->backend->sample_to_reg(c->backend, logits, c->m.vocab_size, &params, reg);
+	if (st == OK)
+		c->device_hist_appends++;
+	return st;
+}
+
+bool context_can_sample_on_device(const context *c) {
+	if (!c->backend || c->debug_forward || (c->m.arch_info && c->m.arch_info->is_hybrid_recurrent))
+		return false;
+	bool greedy = (c->samp.temperature <= 0.0f || c->samp.top_k == 1) &&
+				  c->samp.repeat_penalty == 1.0f && c->backend->argmax;
+	return greedy || sampler_device_eligible(&c->samp, c->backend, c->m.vocab_size);
+}
+
+status_code context_sample_device_row(context *c, const buffer *row, int32_t *tok) {
+	if (!context_can_sample_on_device(c))
+		return ERR_UNSUPPORTED;
+	bool sample = sampler_device_eligible(&c->samp, c->backend, c->m.vocab_size);
+	if (sample)
+		context_sync_device_history(c);
+	return context_device_pick(c, row, sample, tok);
+}
+
 int32_t context_sample_next(context *c) {
+	if (c->has_presampled) {
+		c->has_presampled = false;
+		sampler_observe(&c->samp, c->presampled_token);
+		return c->presampled_token;
+	}
 	if (c->debug_forward)
 		debug_print_logits(c);
-	if (!c->logits_on_host && c->backend && c->backend->argmax &&
-		(c->samp.temperature <= 0.0f || c->samp.top_k == 1) && c->samp.repeat_penalty == 1.0f) {
+	bool greedy = (c->samp.temperature <= 0.0f || c->samp.top_k == 1) &&
+				  c->samp.repeat_penalty == 1.0f && c->backend && c->backend->argmax;
+	bool sample = sampler_device_eligible(&c->samp, c->backend, c->m.vocab_size);
+	if (!c->logits_on_host && (greedy || sample)) {
+		if (sample)
+			context_sync_device_history(c);
 		int32_t		idx;
-		status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
-											c->m.vocab_size, &idx);
+		status_code st = context_device_pick(c, compute_logits_device(&c->scratch), sample, &idx);
 		if (st == OK) {
 			sampler_observe(&c->samp, idx);
 			return idx;
@@ -1091,16 +1224,21 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 							   void (*on_token)(int32_t, const char *, int, void *), void *ud,
 							   uint64_t ttft_start_us, uint64_t *out_ttft_us,
 							   bool *out_unfed_tail) {
-	int		 generated	   = 0;
-	bool	 ttft_captured = (out_ttft_us == NULL);
-	bool	 fast_argmax   = samp && samp->repeat_penalty == 1.0f &&
-							 (samp->temperature <= 0.0f || samp->top_k == 1) && c->backend &&
-							 c->backend->argmax && !c->debug_forward &&
-							 !(c->m.arch_info && c->m.arch_info->is_hybrid_recurrent);
-	bool	 pipelined	   = fast_argmax && context_token_regs_usable(c);
-	bool	 has_fed_tok   = false;
-	int32_t	 last_fed_tok  = -1;
-	uint64_t last_poll_us  = 0;
+	int	 generated		  = 0;
+	bool ttft_captured	  = (out_ttft_us == NULL);
+	bool decode_on_device = samp && c->backend && !c->debug_forward &&
+							!(c->m.arch_info && c->m.arch_info->is_hybrid_recurrent);
+	bool device_sample =
+		decode_on_device && sampler_device_eligible(&c->samp, c->backend, c->m.vocab_size);
+	bool device_pick =
+		device_sample || (decode_on_device && samp->repeat_penalty == 1.0f &&
+						  (samp->temperature <= 0.0f || samp->top_k == 1) && c->backend->argmax);
+	if (device_sample)
+		context_sync_device_history(c);
+	bool	 pipelined	  = device_pick && context_token_regs_usable(c, device_sample);
+	bool	 has_fed_tok  = false;
+	int32_t	 last_fed_tok = -1;
+	uint64_t last_poll_us = 0;
 
 	for (int i = 0; max_tokens < 0 || i < max_tokens; i++) {
 		if (c->interrupt)
@@ -1120,8 +1258,8 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 		int		pre_rc	  = 0;
 		if (pipelined) {
 			int			reg = i % BACKEND_TOKEN_REGS;
-			status_code st	= c->backend->argmax_to_reg(
-				c->backend, compute_logits_device(&c->scratch), c->m.vocab_size, reg);
+			status_code st =
+				context_device_pick_reg(c, compute_logits_device(&c->scratch), device_sample, reg);
 			if (st == OK) {
 				pre_rc	 = context_feed_reg(c, reg);
 				spec_fed = pre_rc >= 0;
@@ -1141,17 +1279,17 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 				spec_fed	= false;
 				pre_rc		= 0;
 				pipelined	= false;
-				fast_argmax = false;
+				device_pick = false;
 				host_redo	= true;
 			}
-		} else if (fast_argmax && !c->logits_on_host) {
-			status_code st = c->backend->argmax(c->backend, compute_logits_device(&c->scratch),
-												c->m.vocab_size, &tok);
+		} else if (device_pick && !c->logits_on_host) {
+			status_code st =
+				context_device_pick(c, compute_logits_device(&c->scratch), device_sample, &tok);
 			if (st == OK) {
 				sampler_observe(&c->samp, tok);
 			} else {
 				WARN("device argmax failed (%s); falling back to host sampling", status_str(st));
-				fast_argmax = false;
+				device_pick = false;
 				host_redo	= true;
 			}
 		} else {
@@ -1192,7 +1330,7 @@ static int context_decode_loop(context *c, int max_tokens, const sampler_params 
 								   pn);
 		}
 		generated++;
-		float *logits_out = fast_argmax ? NULL : c->scratch.logits_host;
+		float *logits_out = device_pick ? NULL : c->scratch.logits_host;
 		int	   rc;
 		if (spec_fed) {
 			fed_ids_append(c, tok);

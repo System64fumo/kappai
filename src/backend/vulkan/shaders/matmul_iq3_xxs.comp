@@ -14,28 +14,15 @@ layout(set = 0, binding = 0) readonly buffer W0Buf {
 layout(set = 0, binding = 1) readonly buffer XBuf {
 	float x[];
 };
-#ifdef HAS_RESIDUAL
-layout(set = 0, binding = 2) readonly buffer RBuf {
-	float residual[];
-};
-layout(set = 0, binding = 3) writeonly buffer Y0Buf {
-	float y0[];
-};
-#define IQX_GRID_BINDING 4
-#else
 layout(set = 0, binding = 2) writeonly buffer Y0Buf {
 	float y0[];
 };
-#define IQX_GRID_BINDING 3
-#endif
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#define IQX_GRID_BINDING 4
 
-layout(push_constant) uniform Params {
-	int n0;
-	int n1;
-	int k;
-	int m;
-}
-params;
+#include "matmul_push.glsl"
 
 #include "common.glsl"
 #include "iqx_grids.glsl"
@@ -67,9 +54,7 @@ void main() {
 	uint row	= gl_WorkGroupID.y;
 	uint x_off	= row * uint(k);
 	uint y0_off = row * uint(params.n0);
-#ifdef HAS_RESIDUAL
-	uint r_off = y0_off;
-#endif
+	uint r_off	= y0_off;
 
 	precise float acc0	 = 0.0;
 	bool		  valid0 = (int(i) < params.n0);
@@ -151,11 +136,6 @@ void main() {
 		barrier();
 	}
 
-#if defined(HAS_RESIDUAL)
 	if (valid0)
-		y0[y0_off + i] = acc0 + residual[r_off + i];
-#else
-	if (valid0)
-		y0[y0_off + i] = acc0;
-#endif
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
 }

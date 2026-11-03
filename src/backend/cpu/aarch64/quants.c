@@ -5897,6 +5897,8 @@ static void matmul_q8_0_repacked_q8_qonly_f32_row(const void *w, const q8_0_bloc
 }
 
 #if defined(__ARM_FEATURE_MATMUL_INT8)
+_Static_assert(I8MM_NR == 4, "repacked q8_0 i8mm kernel assumes 4 columns per tile");
+
 static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_block *restrict xq,
 												   size_t xq_row_stride_blocks, float *restrict y,
 												   int y_row_stride, int n, int k, int m) {
@@ -5926,12 +5928,16 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 
 				int8x16_t xq_lo[I8MM_NR];
 				int8x16_t xq_hi[I8MM_NR];
-				float	  xd[I8MM_NR];
 				for (int c = 0; c < I8MM_NR; c++) {
-					xd[c]	 = f16_to_f32_fast(xrow[c][bi].d);
 					xq_lo[c] = vld1q_s8(xrow[c][bi].qs);
 					xq_hi[c] = vld1q_s8(xrow[c][bi].qs + 16);
 				}
+
+				const uint16_t	  xdh_raw[4] = {xrow[0][bi].d, xrow[1][bi].d, xrow[2][bi].d,
+												xrow[3][bi].d};
+				const float32x4_t xd4	  = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(xdh_raw)));
+				const float32x4_t dcol[2] = {vcombine_f32(vget_low_f32(xd4), vget_low_f32(xd4)),
+											 vcombine_f32(vget_high_f32(xd4), vget_high_f32(xd4))};
 
 				int8x16_t bvec[I8MM_NR / 2][4];
 				for (int cp = 0; cp < I8MM_NR / 2; cp++) {
@@ -5943,14 +5949,16 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 					bvec[cp][3]	 = vcombine_s8(vget_high_s8(xq_hi[ca]), vget_high_s8(xq_hi[cb]));
 				}
 
-				const uint16_t *d_ptr = (const uint16_t *)blk;
-				const int8_t   *qs_ptr =
+				const uint16x8_t  dw_u16 = vld1q_u16((const uint16_t *)blk);
+				const float32x4_t dw_lo	 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(dw_u16)));
+				const float32x4_t dw_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(dw_u16)));
+				const float32x4_t srow[MR / 2] = {
+					vzip1q_f32(dw_lo, dw_lo), vzip2q_f32(dw_lo, dw_lo), vzip1q_f32(dw_hi, dw_hi),
+					vzip2q_f32(dw_hi, dw_hi)};
+				const int8_t *qs_ptr =
 					(const int8_t *)(blk + Q8_0_REPACKED_ROWS * sizeof(uint16_t));
 
 				for (int p = 0; p < MR / 2; p++) {
-					const float dwa = f16_to_f32_fast(d_ptr[2 * p]);
-					const float dwb = f16_to_f32_fast(d_ptr[2 * p + 1]);
-
 					const int8x16_t w0		= vld1q_s8(qs_ptr + (size_t)(2 * p) * 32);
 					const int8x16_t wh0		= vld1q_s8(qs_ptr + (size_t)(2 * p) * 32 + 16);
 					const int8x16_t w1		= vld1q_s8(qs_ptr + (size_t)(2 * p + 1) * 32);
@@ -5962,18 +5970,14 @@ static void matmul_q8_0_repacked_q8_qonly_f32_i8mm(const void *w, const q8_0_blo
 						vcombine_s8(vget_high_s8(wh0), vget_high_s8(wh1)),
 					};
 
-					const float32x4_t srow = vcombine_f32(vdup_n_f32(dwa), vdup_n_f32(dwb));
-
 					for (int cp = 0; cp < I8MM_NR / 2; cp++) {
-						const float32x4_t dcol =
-							vzip1q_f32(vdupq_n_f32(xd[2 * cp]), vdupq_n_f32(xd[2 * cp + 1]));
 						int32x4_t s = vdupq_n_s32(0);
 						s			= vmmlaq_s32(s, avec[0], bvec[cp][0]);
 						s			= vmmlaq_s32(s, avec[1], bvec[cp][1]);
 						s			= vmmlaq_s32(s, avec[2], bvec[cp][2]);
 						s			= vmmlaq_s32(s, avec[3], bvec[cp][3]);
 						facc[p][cp] =
-							vfmaq_f32(facc[p][cp], vcvtq_f32_s32(s), vmulq_f32(srow, dcol));
+							vfmaq_f32(facc[p][cp], vcvtq_f32_s32(s), vmulq_f32(srow[p], dcol[cp]));
 					}
 				}
 			}

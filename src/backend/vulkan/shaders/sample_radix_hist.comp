@@ -1,0 +1,34 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(set = 0, binding = 1) coherent buffer StateBuf {
+	uint state[];
+};
+
+layout(push_constant) uniform Params {
+	int n;
+	int chunk;
+	int shift;
+}
+params;
+
+uint float_key(float f) {
+	uint u = floatBitsToUint(f);
+	return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+	uint lo		= gl_WorkGroupID.x * uint(params.chunk);
+	uint hi		= min(lo + uint(params.chunk), uint(params.n));
+	uint shift	= uint(params.shift);
+	uint prefix = state[256];
+	for (uint i = lo + gl_LocalInvocationID.x; i < hi; i += 256u) {
+		uint key = float_key(logits[i]);
+		if (shift != 24u && (key >> (shift + 8u)) != prefix)
+			continue;
+		atomicAdd(state[(key >> shift) & 255u], 1u);
+	}
+}

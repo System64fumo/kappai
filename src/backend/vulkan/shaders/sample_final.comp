@@ -1,0 +1,139 @@
+#version 450
+layout(local_size_x = 256) in;
+
+#define K_MAX 64
+
+layout(set = 0, binding = 0) coherent buffer CandBuf {
+	uvec2 cand[];
+};
+layout(set = 0, binding = 1) buffer RegBuf {
+	uint reg_idx[];
+};
+layout(set = 0, binding = 2) buffer ReadbackBuf {
+	uint readback_idx[];
+};
+layout(set = 0, binding = 3) buffer HistBuf {
+	uint hist[];
+};
+
+layout(push_constant) uniform Params {
+	int	  n_cand;
+	int	  k;
+	int	  slot;
+	float inv_temp;
+	float top_p;
+	float min_p;
+	float uniform_sample;
+	int	  hist_base;
+}
+params;
+
+shared float s_best_val[256];
+shared uint	 s_best_pos[256];
+shared float s_sel_val[K_MAX];
+shared uint	 s_sel_tok[K_MAX];
+
+const uint NEG_INF_BITS = 0xFF800000u;
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint n	 = uint(params.n_cand);
+
+	for (int r = 0; r < params.k; r++) {
+		float best_val = uintBitsToFloat(NEG_INF_BITS);
+		uint  best_pos = 0xFFFFFFFFu;
+		for (uint e = tid; e < n; e += 256u) {
+			float v = uintBitsToFloat(cand[e].x);
+			if (v > best_val || (v == best_val && e < best_pos)) {
+				best_val = v;
+				best_pos = e;
+			}
+		}
+		s_best_val[tid] = best_val;
+		s_best_pos[tid] = best_pos;
+		barrier();
+
+		for (uint s = 128u; s > 0u; s >>= 1u) {
+			if (tid < s) {
+				float ov = s_best_val[tid + s];
+				uint  op = s_best_pos[tid + s];
+				float mv = s_best_val[tid];
+				uint  mp = s_best_pos[tid];
+				if (ov > mv || (ov == mv && op < mp)) {
+					s_best_val[tid] = ov;
+					s_best_pos[tid] = op;
+				}
+			}
+			barrier();
+		}
+
+		if (tid == 0u) {
+			uint pos = s_best_pos[0];
+			if (pos == 0xFFFFFFFFu) {
+				s_sel_val[r] = uintBitsToFloat(NEG_INF_BITS);
+				s_sel_tok[r] = 0u;
+			} else {
+				s_sel_val[r] = s_best_val[0];
+				s_sel_tok[r] = cand[pos].y;
+				cand[pos].x	 = NEG_INF_BITS;
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+
+	if (tid != 0u)
+		return;
+
+	int	  k	 = params.k;
+	float mx = s_sel_val[0] * params.inv_temp;
+	float weights[K_MAX];
+	float sum = 0.0;
+	for (int i = 0; i < k; i++) {
+		weights[i] = exp(s_sel_val[i] * params.inv_temp - mx);
+		sum += weights[i];
+	}
+
+	int kept = k;
+	if (params.top_p < 1.0) {
+		float cumulative = 0.0;
+		for (int i = 0; i < k; i++) {
+			cumulative += weights[i] / sum;
+			if (cumulative > params.top_p) {
+				kept = i + 1;
+				break;
+			}
+		}
+	}
+	if (params.min_p > 0.0) {
+		float min_prob = params.min_p * (weights[0] / sum);
+		int	  n_keep   = 0;
+		while (n_keep < kept && (weights[n_keep] / sum) >= min_prob)
+			n_keep++;
+		kept = n_keep > 0 ? n_keep : 1;
+	}
+
+	float psum = 0.0;
+	for (int i = 0; i < kept; i++)
+		psum += weights[i];
+	float target = params.uniform_sample * psum;
+	float acc	 = 0.0;
+	int	  picked = kept - 1;
+	for (int i = 0; i < kept; i++) {
+		acc += weights[i];
+		if (target < acc) {
+			picked = i;
+			break;
+		}
+	}
+
+	uint tok				  = s_sel_tok[picked];
+	reg_idx[params.slot]	  = tok;
+	readback_idx[params.slot] = tok;
+
+	uint base			   = uint(params.hist_base);
+	uint head			   = hist[base + 1u];
+	hist[base + 2u + head] = tok;
+	hist[base + 1u]		   = (head + 1u) % 1024u;
+	hist[base]			   = min(hist[base] + 1u, 1024u);
+}

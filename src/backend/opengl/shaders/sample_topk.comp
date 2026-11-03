@@ -1,0 +1,74 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 256) in;
+
+#define CHUNK_MAX 2048u
+
+layout(std430, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(std430, binding = 1) writeonly buffer CandBuf {
+	uvec2 cand[];
+};
+
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_chunk;
+layout(location = 2) uniform int u_k;
+
+shared float s_vals[CHUNK_MAX];
+shared float s_best_val[256];
+shared uint	 s_best_pos[256];
+
+const uint NEG_INF_BITS = 0xFF800000u;
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint lo	 = gl_WorkGroupID.x * uint(u_chunk);
+	uint len = uint(max(0, min(int(lo) + u_chunk, u_n) - int(lo)));
+
+	for (uint j = tid; j < len; j += 256u)
+		s_vals[j] = logits[lo + j];
+	barrier();
+
+	for (int r = 0; r < u_k; r++) {
+		float best_val = uintBitsToFloat(NEG_INF_BITS);
+		uint  best_pos = 0xFFFFFFFFu;
+		for (uint j = tid; j < len; j += 256u) {
+			float v = s_vals[j];
+			if (v > best_val) {
+				best_val = v;
+				best_pos = j;
+			}
+		}
+		s_best_val[tid] = best_val;
+		s_best_pos[tid] = best_pos;
+		barrier();
+
+		for (uint s = 128u; s > 0u; s >>= 1u) {
+			if (tid < s) {
+				float ov = s_best_val[tid + s];
+				uint  op = s_best_pos[tid + s];
+				float mv = s_best_val[tid];
+				uint  mp = s_best_pos[tid];
+				if (ov > mv || (ov == mv && op < mp)) {
+					s_best_val[tid] = ov;
+					s_best_pos[tid] = op;
+				}
+			}
+			barrier();
+		}
+
+		if (tid == 0u) {
+			uint pos	 = s_best_pos[0];
+			uint out_idx = gl_WorkGroupID.x * uint(u_k) + uint(r);
+			if (pos == 0xFFFFFFFFu) {
+				cand[out_idx] = uvec2(NEG_INF_BITS, 0u);
+			} else {
+				cand[out_idx] = uvec2(floatBitsToUint(s_best_val[0]), lo + pos);
+				s_vals[pos]	  = uintBitsToFloat(NEG_INF_BITS);
+			}
+		}
+		barrier();
+	}
+}

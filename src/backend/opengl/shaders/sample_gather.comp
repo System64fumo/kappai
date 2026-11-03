@@ -1,0 +1,38 @@
+#version 310 es
+precision highp float;
+precision highp int;
+layout(local_size_x = 256) in;
+
+#define CAND_CAP 1024u
+
+layout(std430, binding = 0) readonly buffer LogitsBuf {
+	float logits[];
+};
+layout(std430, binding = 1) coherent buffer StateBuf {
+	uint state[];
+};
+layout(std430, binding = 2) writeonly buffer CandBuf {
+	uvec2 cand[];
+};
+
+layout(location = 0) uniform int u_n;
+layout(location = 1) uniform int u_chunk;
+
+uint float_key(float f) {
+	uint u = floatBitsToUint(f);
+	return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+	uint lo		   = gl_WorkGroupID.x * uint(u_chunk);
+	uint hi		   = min(lo + uint(u_chunk), uint(u_n));
+	uint threshold = state[256];
+	for (uint i = lo + gl_LocalInvocationID.x; i < hi; i += 256u) {
+		uint key = float_key(logits[i]);
+		if (key < threshold)
+			continue;
+		uint slot = atomicAdd(state[259], 1u);
+		if (slot < CAND_CAP)
+			cand[slot] = uvec2(key, i);
+	}
+}

@@ -1622,6 +1622,48 @@ status_code cpu_kv_put_batch(backend *self, buffer *k, buffer *v, int layer, int
 	return OK;
 }
 
+static status_code cpu_kv_range_copy(backend *self, const buffer *k, const buffer *v, int layer,
+									 int pos_start, int n_rows, int n_kv_heads, int head_dim,
+									 int n_ctx, int n_kv_heads_active, void *k_host, void *v_host,
+									 const void *k_src, const void *v_src) {
+	cpu_priv *p		   = self->priv;
+	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	size_t	  rows	   = cpu_kv_layer_rows(p, layer, n_ctx);
+	if (rows < (size_t)n_ctx)
+		return ERR_UNSUPPORTED;
+
+	size_t row_bytes  = kv_row_bytes(p->kv_quant, head_dim);
+	size_t kvh_stride = rows * row_bytes;
+	size_t layer_base = cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * kvh_stride, 1);
+	size_t span		  = (size_t)n_rows * row_bytes;
+	for (int kvh = 0; kvh < n_active; kvh++) {
+		size_t cache_off = layer_base + (size_t)kvh * kvh_stride + (size_t)pos_start * row_bytes;
+		size_t host_off	 = (size_t)kvh * span;
+		if (k_src) {
+			memcpy((uint8_t *)k->handle + cache_off, (const uint8_t *)k_src + host_off, span);
+			memcpy((uint8_t *)v->handle + cache_off, (const uint8_t *)v_src + host_off, span);
+			continue;
+		}
+		memcpy((uint8_t *)k_host + host_off, (const uint8_t *)k->handle + cache_off, span);
+		memcpy((uint8_t *)v_host + host_off, (const uint8_t *)v->handle + cache_off, span);
+	}
+	return OK;
+}
+
+status_code cpu_kv_export(backend *self, const buffer *k, const buffer *v, int layer, int pos_start,
+						  int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+						  int n_kv_heads_active, void *k_dst, void *v_dst) {
+	return cpu_kv_range_copy(self, k, v, layer, pos_start, n_rows, n_kv_heads, head_dim, n_ctx,
+							 n_kv_heads_active, k_dst, v_dst, NULL, NULL);
+}
+
+status_code cpu_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start, int n_rows,
+						  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
+						  const void *k_src, const void *v_src) {
+	return cpu_kv_range_copy(self, k, v, layer, pos_start, n_rows, n_kv_heads, head_dim, n_ctx,
+							 n_kv_heads_active, NULL, NULL, k_src, v_src);
+}
+
 void cpu_synchronize(backend *self) {
 	(void)self;
 }
@@ -1998,6 +2040,8 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	out->kv_put							 = cpu_kv_put;
 	out->kv_put_batch					 = cpu_kv_put_batch;
 	out->kv_shift						 = cpu_kv_shift;
+	out->kv_export						 = cpu_kv_export;
+	out->kv_import						 = cpu_kv_import;
 	out->embd_lookup					 = cpu_embd_lookup;
 	out->rmsnorm						 = cpu_rmsnorm;
 	out->matmul							 = cpu_matmul;
@@ -2716,6 +2760,32 @@ static void cpu_matmul_generic_block(const cpu_matmul_job *j, const uint8_t *res
 	}
 }
 
+static int cpu_matmul_col_block(size_t xq_row_bytes, int m) {
+	enum { MIN_COLS = 32, COL_TILE = 8 };
+	if (m <= MIN_COLS || xq_row_bytes == 0)
+		return m;
+	size_t cores  = g_cpu_cache.n_cpus > 0 ? (size_t)g_cpu_cache.n_cpus : 1;
+	size_t budget = (g_cpu_cache.l2_bytes + g_cpu_cache.l3_bytes / cores) / 4 * 3;
+	size_t fit	  = budget / xq_row_bytes;
+	if (fit >= (size_t)m)
+		return m;
+	int limit  = fit < MIN_COLS ? MIN_COLS : (int)fit;
+	int blocks = (m + limit - 1) / limit;
+	int even   = (m + blocks - 1) / blocks;
+	even	   = (even + COL_TILE - 1) / COL_TILE * COL_TILE;
+	return even < m ? even : m;
+}
+
+static void cpu_matmul_qonly_cols(const cpu_matmul_job *j, const matmul_kernel *entry,
+								  const void *W_sub, float *y_sub, int n_sub) {
+	const int block = cpu_matmul_col_block(j->xq_row_stride, j->m);
+	for (int t = 0; t < j->m; t += block) {
+		int cols = j->m - t < block ? j->m - t : block;
+		entry->qonly(W_sub, (const uint8_t *)j->xq + ((size_t)t * j->xq_row_stride),
+					 j->xq_row_stride_blocks, y_sub + ((size_t)t * j->n), j->n, n_sub, j->k, cols);
+	}
+}
+
 static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_matmul_job *j			  = ctx;
@@ -2730,7 +2800,7 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	if (j->packing) {
 		j->packing->matmul(W_sub, j->packed_xq, y_sub, j->n, n_sub, j->k, j->m);
 	} else if (entry) {
-		entry->qonly(W_sub, j->xq, j->xq_row_stride_blocks, y_sub, j->n, n_sub, j->k, j->m);
+		cpu_matmul_qonly_cols(j, entry, W_sub, y_sub, n_sub);
 	} else if (j->w_type == GGML_TYPE_F32) {
 		matmul_f32_f32_batch((const float *)W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
 	} else if (j->w_type == GGML_TYPE_F16) {
