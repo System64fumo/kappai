@@ -827,6 +827,41 @@ static void decision_snapshot_free(decision_state_snapshot *snap) {
 	free(snap->recurrent);
 }
 
+static status_code decision_answer_batched_tails(const decision_model *dm, context *c,
+												 decision_request *req, decision_label **labels,
+												 int32_t **idss, const int *ns, int shared,
+												 json_object *out, int *n_tokens, bool *done) {
+	const int		n_q		 = req->n_questions;
+	const size_t	row_size = (size_t)model_output_size(&c->m);
+	const int32_t **tails	 = xcalloc((size_t)n_q, sizeof(*tails));
+	int			   *lens	 = xmalloc((size_t)n_q * sizeof(*lens));
+	for (int i = 0; i < n_q; i++) {
+		tails[i] = idss[i] + shared;
+		lens[i]	 = ns[i] - shared;
+	}
+	float	   *logits = xmalloc((size_t)n_q * row_size * sizeof(*logits));
+	status_code rc	   = context_prefill_branches(c, tails, lens, n_q, logits);
+	if (rc == OK) {
+		for (int i = 0; i < n_q; i++) {
+			const decision_question *q		= &req->questions[i];
+			float					*scores = xmalloc((size_t)q->n_options * sizeof(*scores));
+			label_scores_from_logits(labels[i], q->n_options, logits + (size_t)i * row_size,
+									 scores);
+			*n_tokens += ns[i];
+			answer_question(dm, q, scores, out);
+			free(scores);
+		}
+		*done = true;
+	} else if (rc != ERR_INTERRUPTED) {
+		DEBUG("decision: batched tails unavailable (%s), running sequentially", status_str(rc));
+		rc = OK;
+	}
+	free(logits);
+	free(lens);
+	free(tails);
+	return rc;
+}
+
 static status_code decision_run_prefill(const decision_model *dm, context *c, decision_request *req,
 										json_object *out, int *n_tokens) {
 	const decision_ops *ops	   = dm->ops;
@@ -875,7 +910,12 @@ static status_code decision_run_prefill(const decision_model *dm, context *c, de
 	if (rc == OK && c->kv.n_pos != shared)
 		rc = ERR_INTERNAL;
 
-	for (int i = 0; rc == OK && i < n_q; i++) {
+	bool batched = false;
+	if (rc == OK && n_q > 1)
+		rc = decision_answer_batched_tails(dm, c, req, labels, idss, ns, shared, out, n_tokens,
+										   &batched);
+
+	for (int i = 0; rc == OK && !batched && i < n_q; i++) {
 		const decision_question *q = &req->questions[i];
 		if (c->interrupt) {
 			rc = ERR_INTERRUPTED;
@@ -908,10 +948,20 @@ static status_code decision_run_prefill(const decision_model *dm, context *c, de
 	return rc;
 }
 
+static void decision_profile_dump(context *c, uint64_t t0_us) {
+	if (!c->scratch.prof.enabled)
+		return;
+	profile_set_wall(&c->scratch.prof, time_us() - t0_us);
+	profile_print(&c->scratch.prof, "decision", stderr);
+	recipe_exec_profile_report(c->m.recipe, "decision", stderr);
+	profile_reset(&c->scratch.prof);
+}
+
 status_code decision_run(const decision_model *dm, context *c, decision_request *req,
 						 json_object **answers, int *n_tokens) {
-	json_object *out = json_object_new_object();
-	*n_tokens		 = 0;
+	json_object *out  = json_object_new_object();
+	*n_tokens		  = 0;
+	uint64_t	t0_us = time_us();
 	status_code rc;
 	if (dm->ops->forward == decision_forward_prefill && dm->ops->labels &&
 		decision_hybrid_host_backed(c)) {
@@ -931,6 +981,7 @@ status_code decision_run(const decision_model *dm, context *c, decision_request 
 			}
 		}
 	}
+	decision_profile_dump(c, t0_us);
 	if (rc != OK) {
 		json_object_put(out);
 		return rc;

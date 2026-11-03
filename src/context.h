@@ -107,6 +107,9 @@ void		context_slot_free(context *s);
 
 void context_monitor_send_start(context *c);
 
+status_code context_prefill_branches(context *c, const int32_t *const *seqs, const int *lens,
+									 int n_seq, float *logits_out);
+
 prefill_result context_prefill_tokens(context *c, const int32_t *tokens, int n_tokens,
 									  const char *phase, bool quiet);
 prefill_result context_prefill_prompt(context *c, const int32_t *tokens, int n_tokens,

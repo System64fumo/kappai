@@ -32,11 +32,11 @@ static status_code partial_rope_qk_run(exec_ctx *ctx, backend *t) {
 	status_code	  st		 = OK;
 	exec_segments seg		 = exec_segments_of(ctx);
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer q_view = batch_row_view(q, c * seg.rows, n_heads * head_dim);
-		buffer k_view = batch_row_view(k, c * seg.rows, n_kv_heads * head_dim);
+		buffer q_view = batch_row_view(q, exec_seg_row0(&seg, c), n_heads * head_dim);
+		buffer k_view = batch_row_view(k, exec_seg_row0(&seg, c), n_kv_heads * head_dim);
 		st = t->partial_rope_qk(t, &q_view, &k_view, n_heads, n_kv_heads, head_dim, m->rope_dim,
 								exec_segment_pos(ctx, c), ctx->s->model.rope_cos,
-								ctx->s->model.rope_sin, seg.rows);
+								ctx->s->model.rope_sin, exec_seg_rows(&seg, c));
 	}
 	return st;
 }
@@ -308,7 +308,7 @@ status_code op_shortconv(exec_ctx *ctx) {
 		float *state = hc ? hc->conv_state + (size_t)ctx->li * hc->conv_stride : NULL;
 		if (state && exec_segment_pos(ctx, c) == 0)
 			memset(state, 0, (size_t)m->dim * (size_t)(p->conv_kernel - 1) * sizeof(float));
-		size_t		   row0 = (size_t)c * seg.rows;
+		size_t		   row0 = (size_t)exec_seg_row0(&seg, c);
 		shortconv_desc desc = {
 			.out		= out + row0 * out_stride,
 			.state		= state,
@@ -318,7 +318,7 @@ status_code op_shortconv(exec_ctx *ctx) {
 			.kernel		= p->conv_kernel,
 			.in_stride	= in_stride,
 			.out_stride = out_stride,
-			.n_rows		= seg.rows,
+			.n_rows		= exec_seg_rows(&seg, c),
 			.centered	= ctx->op->u.shortconv.centered,
 		};
 		status_code st = a->shortconv(a, &desc);

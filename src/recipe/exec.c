@@ -726,6 +726,41 @@ status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache 
 	return compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out, NULL);
 }
 
+status_code compute_forward_segments_recipe(struct model *m, struct kvcache **caches,
+											struct compute_scratch *s, const int32_t *tokens,
+											const int *seg_rows, const int *seg_pos, int n_segs,
+											int flash_attn, float *logits_out) {
+	if (n_segs < 1)
+		return OK;
+	if (!m->arch_info->hybrid_shortconv || m->arch_info->is_kda || m->arch_info->is_mla ||
+		m->full_sequence || model_mixed_backend_mode(m) ||
+		(m->recipe && m->recipe->has_sliding_layers))
+		return ERR_UNSUPPORTED;
+	int total = 0;
+	for (int i = 0; i < n_segs; i++) {
+		if (seg_rows[i] < 1)
+			return ERR_INVALID_ARG;
+		total += seg_rows[i];
+	}
+	uint8_t *needs_logits = xcalloc((size_t)total, 1);
+	int		 row		  = 0;
+	for (int i = 0; i < n_segs; i++) {
+		row += seg_rows[i];
+		needs_logits[row - 1] = 1;
+	}
+	row_desc	rows = {.n_rows		  = total,
+						.pos_start	  = seg_pos[0],
+						.cache		  = caches[0],
+						.caches		  = caches,
+						.needs_logits = needs_logits,
+						.seg_rows	  = seg_rows,
+						.seg_pos	  = seg_pos,
+						.n_segs		  = n_segs};
+	status_code st	 = compute_forward_rows(m, &rows, s, tokens, flash_attn, logits_out, NULL);
+	free(needs_logits);
+	return st;
+}
+
 status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,
 										 int n_tokens, int pos_start, int flash_attn,

@@ -2760,6 +2760,32 @@ static void cpu_matmul_generic_block(const cpu_matmul_job *j, const uint8_t *res
 	}
 }
 
+static int cpu_matmul_col_block(size_t xq_row_bytes, int m) {
+	enum { MIN_COLS = 32, COL_TILE = 8 };
+	if (m <= MIN_COLS || xq_row_bytes == 0)
+		return m;
+	size_t cores  = g_cpu_cache.n_cpus > 0 ? (size_t)g_cpu_cache.n_cpus : 1;
+	size_t budget = (g_cpu_cache.l2_bytes + g_cpu_cache.l3_bytes / cores) / 4 * 3;
+	size_t fit	  = budget / xq_row_bytes;
+	if (fit >= (size_t)m)
+		return m;
+	int limit  = fit < MIN_COLS ? MIN_COLS : (int)fit;
+	int blocks = (m + limit - 1) / limit;
+	int even   = (m + blocks - 1) / blocks;
+	even	   = (even + COL_TILE - 1) / COL_TILE * COL_TILE;
+	return even < m ? even : m;
+}
+
+static void cpu_matmul_qonly_cols(const cpu_matmul_job *j, const matmul_kernel *entry,
+								  const void *W_sub, float *y_sub, int n_sub) {
+	const int block = cpu_matmul_col_block(j->xq_row_stride, j->m);
+	for (int t = 0; t < j->m; t += block) {
+		int cols = j->m - t < block ? j->m - t : block;
+		entry->qonly(W_sub, (const uint8_t *)j->xq + ((size_t)t * j->xq_row_stride),
+					 j->xq_row_stride_blocks, y_sub + ((size_t)t * j->n), j->n, n_sub, j->k, cols);
+	}
+}
+
 static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_matmul_job *j			  = ctx;
@@ -2774,7 +2800,7 @@ static void cpu_matmul_rows_worker(int begin, int end, int tid, void *ctx) {
 	if (j->packing) {
 		j->packing->matmul(W_sub, j->packed_xq, y_sub, j->n, n_sub, j->k, j->m);
 	} else if (entry) {
-		entry->qonly(W_sub, j->xq, j->xq_row_stride_blocks, y_sub, j->n, n_sub, j->k, j->m);
+		cpu_matmul_qonly_cols(j, entry, W_sub, y_sub, n_sub);
 	} else if (j->w_type == GGML_TYPE_F32) {
 		matmul_f32_f32_batch((const float *)W_sub, j->xf, y_sub, n_sub, j->k, j->m, j->k, j->n);
 	} else if (j->w_type == GGML_TYPE_F16) {

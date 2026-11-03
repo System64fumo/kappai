@@ -405,6 +405,9 @@ typedef struct {
 	struct kvcache	*cache;
 	struct kvcache **caches;
 	const uint8_t	*needs_logits;
+	const int		*seg_rows;
+	const int		*seg_pos;
+	int				 n_segs;
 	int				 token_type;
 	int				 last_only;
 } row_desc;
@@ -431,6 +434,11 @@ void		  recipe_free(model_recipe *r);
 status_code compute_forward_recipe(struct model *m, struct kvcache *cache,
 								   struct compute_scratch *s, int token, int pos, int flash_attn,
 								   float *logits_out);
+
+status_code compute_forward_segments_recipe(struct model *m, struct kvcache **caches,
+											struct compute_scratch *s, const int32_t *tokens,
+											const int *seg_rows, const int *seg_pos, int n_segs,
+											int flash_attn, float *logits_out);
 
 status_code compute_forward_batch_recipe(struct model *m, struct kvcache *cache,
 										 struct compute_scratch *s, const int32_t *tokens,

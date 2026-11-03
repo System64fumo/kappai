@@ -25,8 +25,9 @@
 #define OP_BACKEND(be, field) op_backend_pick((be), ((be)->field != NULL), #field)
 
 typedef struct {
-	int n_calls;
-	int rows;
+	int		   n_calls;
+	int		   rows;
+	const int *counts;
 } exec_segments;
 
 #define EXEC_CAPS_RESOLVED 0x80000000u
@@ -289,16 +290,41 @@ static inline buffer *exec_slot(const exec_ctx *ctx, uint8_t idx) {
 }
 
 static inline exec_segments exec_segments_of(const exec_ctx *ctx) {
+	if (ctx->rows.seg_rows)
+		return (exec_segments){ctx->rows.n_segs, 0, ctx->rows.seg_rows};
 	if (ctx->rows.pos)
-		return (exec_segments){ctx->rows.n_rows, 1};
-	return (exec_segments){1, ctx->rows.n_rows};
+		return (exec_segments){ctx->rows.n_rows, 1, NULL};
+	return (exec_segments){1, ctx->rows.n_rows, NULL};
+}
+
+static inline int exec_seg_rows(const exec_segments *seg, int call) {
+	return seg->counts ? seg->counts[call] : seg->rows;
+}
+
+static inline int exec_seg_row0(const exec_segments *seg, int call) {
+	if (!seg->counts)
+		return call * seg->rows;
+	int row = 0;
+	for (int i = 0; i < call; i++)
+		row += seg->counts[i];
+	return row;
 }
 
 static inline int exec_segment_pos(const exec_ctx *ctx, int call) {
+	if (ctx->rows.seg_pos)
+		return ctx->rows.seg_pos[call];
 	return ctx->rows.pos ? ctx->rows.pos[call] : ctx->rows.pos_start;
 }
 
 static inline int exec_row_pos(const exec_ctx *ctx, int row) {
+	if (ctx->rows.seg_rows) {
+		for (int i = 0; i < ctx->rows.n_segs; i++) {
+			if (row < ctx->rows.seg_rows[i])
+				return ctx->rows.seg_pos[i] + row;
+			row -= ctx->rows.seg_rows[i];
+		}
+		return -1;
+	}
 	return ctx->rows.pos ? ctx->rows.pos[row] : ctx->rows.pos_start + row;
 }
 

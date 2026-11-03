@@ -290,9 +290,9 @@ static status_code rope_ext_batched(exec_ctx *ctx, backend *a) {
 	exec_segments seg	= exec_segments_of(ctx);
 	status_code	  st	= OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer view = batch_row_view(whole, c * seg.rows, g.row_stride);
+		buffer view = batch_row_view(whole, exec_seg_row0(&seg, c), g.row_stride);
 		st = a->rope_ext_batch(a, &view, g.n_heads, g.head_dim, exec_segment_pos(ctx, c), g.rt.cos,
-							   g.rt.sin, g.rt.freq_factors, seg.rows);
+							   g.rt.sin, g.rt.freq_factors, exec_seg_rows(&seg, c));
 	}
 	return st;
 }
@@ -370,14 +370,15 @@ static status_code qk_norm_rope_fused(exec_ctx *ctx) {
 	buffer				*k_all		= n_kv_heads ? exec_slot(ctx, ctx->op->in[1]) : NULL;
 	status_code			 st			= OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer q_view = batch_row_view(q_all, c * seg.rows, lc->q_row_stride);
+		buffer q_view = batch_row_view(q_all, exec_seg_row0(&seg, c), lc->q_row_stride);
 		buffer k_view = {0};
 		if (n_kv_heads)
-			k_view = batch_row_view(k_all, c * seg.rows, lc->kv_row_stride);
+			k_view = batch_row_view(k_all, exec_seg_row0(&seg, c), lc->kv_row_stride);
 		st = a->qk_norm_rope(a, &q_view, n_kv_heads ? &k_view : NULL,
 							 exec_weight(ctx, WIDX_ATTN_Q_NORM), exec_weight(ctx, WIDX_ATTN_K_NORM),
 							 ctx->m->n_heads, n_kv_heads, lc->head_dim, ctx->op->u.qk_norm_rope.eps,
-							 exec_segment_pos(ctx, c), rt.cos, rt.sin, rt.freq_factors, seg.rows);
+							 exec_segment_pos(ctx, c), rt.cos, rt.sin, rt.freq_factors,
+							 exec_seg_rows(&seg, c));
 		if (st == ERR_UNSUPPORTED && c == 0) {
 			profile_end(&ctx->s->prof, &ps);
 			return qk_norm_rope_unfused(ctx, lc);
@@ -525,9 +526,9 @@ status_code op_rope(exec_ctx *ctx) {
 	buffer		 *whole	   = exec_slot(ctx, ctx->op->in[0]);
 	st					   = OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer view = batch_row_view(whole, c * seg.rows, n_heads * head_dim);
-		st			= a->rope_batch(a, &view, n_heads, head_dim, exec_segment_pos(ctx, c),
-									ctx->s->model.rope_cos, ctx->s->model.rope_sin, seg.rows);
+		buffer view = batch_row_view(whole, exec_seg_row0(&seg, c), n_heads * head_dim);
+		st = a->rope_batch(a, &view, n_heads, head_dim, exec_segment_pos(ctx, c),
+						   ctx->s->model.rope_cos, ctx->s->model.rope_sin, exec_seg_rows(&seg, c));
 	}
 	profile_end(prof, &ps);
 	return st;
@@ -547,11 +548,11 @@ status_code op_rope_qk_fused(exec_ctx *ctx) {
 	buffer		 *k_all		 = exec_slot(ctx, ctx->op->in[1]);
 	st						 = OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer q_view = batch_row_view(q_all, c * seg.rows, n_heads * head_dim);
-		buffer k_view = batch_row_view(k_all, c * seg.rows, n_kv_heads * head_dim);
+		buffer q_view = batch_row_view(q_all, exec_seg_row0(&seg, c), n_heads * head_dim);
+		buffer k_view = batch_row_view(k_all, exec_seg_row0(&seg, c), n_kv_heads * head_dim);
 		st			  = a->rope_qk_batch(a, &q_view, &k_view, n_heads, n_kv_heads, head_dim,
 										 exec_segment_pos(ctx, c), ctx->s->model.rope_cos,
-										 ctx->s->model.rope_sin, seg.rows);
+										 ctx->s->model.rope_sin, exec_seg_rows(&seg, c));
 	}
 	profile_end(prof, &ps);
 	return st;
@@ -564,11 +565,21 @@ status_code op_kv_put(exec_ctx *ctx) {
 	exec_segments seg			= exec_segments_of(ctx);
 	buffer		 *k_all			= batch_slot(ctx->bs, ctx->op->in[0]);
 	buffer		 *v_all			= batch_slot(ctx->bs, ctx->op->in[1]);
+	if (ctx->rows.seg_rows) {
+		scratch_run *run	= &ctx->s->run;
+		run->seg_kv_k		= ctx->op->in[0];
+		run->seg_kv_v		= ctx->op->in[1];
+		run->seg_kv_stride	= kv_row_stride;
+		run->seg_kv_pending = 1;
+		profile_end(&ctx->s->prof, &ps);
+		return OK;
+	}
 	for (int c = 0; c < seg.n_calls; c++) {
-		buffer k_view = batch_row_view(k_all, c * seg.rows, kv_row_stride);
-		buffer v_view = batch_row_view(v_all, c * seg.rows, kv_row_stride);
-		st = kvcache_put_batch(exec_segment_cache(ctx, c), ctx->m, ctx->li,
-							   exec_segment_pos(ctx, c), &k_view, &v_view, kv_row_stride, seg.rows);
+		buffer k_view = batch_row_view(k_all, exec_seg_row0(&seg, c), kv_row_stride);
+		buffer v_view = batch_row_view(v_all, exec_seg_row0(&seg, c), kv_row_stride);
+		st =
+			kvcache_put_batch(exec_segment_cache(ctx, c), ctx->m, ctx->li, exec_segment_pos(ctx, c),
+							  &k_view, &v_view, kv_row_stride, exec_seg_rows(&seg, c));
 		if (st != OK)
 			break;
 	}
@@ -580,7 +591,6 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 	int	  n_heads			= ctx->op->u.attention.n_heads;
 	int	  n_kv_heads		= ctx->op->u.attention.n_kv_heads;
 	int	  head_dim			= ctx->op->u.attention.head_dim;
-	int	  n_ctx				= ctx->rows.cache->n_ctx;
 	float scale				= ctx->op->u.attention.scale;
 	int	  sliding_window	= ctx->op->u.attention.sliding_window;
 	int	  n_kv_heads_active = ctx->op->u.attention.n_kv_heads_active;
@@ -592,23 +602,40 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 	buffer		 *o_all = batch_slot(ctx->bs, ctx->op->out);
 	status_code	  st	= OK;
 	for (int c = 0; c < seg.n_calls && st == OK; c++) {
-		buffer	q_view = batch_row_view(q_all, c * seg.rows, n_heads * head_dim);
-		buffer	o_view = batch_row_view(o_all, c * seg.rows, n_heads * head_dim);
-		buffer *kb;
-		buffer *vb;
-		int		kv_slot;
-		kvcache_attn_view(exec_segment_cache(ctx, c), ctx->m, ctx->li, kv_layer, &kb, &vb,
-						  &kv_slot);
+		buffer	 q_view = batch_row_view(q_all, exec_seg_row0(&seg, c), n_heads * head_dim);
+		buffer	 o_view = batch_row_view(o_all, exec_seg_row0(&seg, c), n_heads * head_dim);
+		buffer	*kb;
+		buffer	*vb;
+		int		 kv_slot;
+		kvcache *seg_cache = exec_segment_cache(ctx, c);
+		int		 n_ctx	   = seg_cache->n_ctx;
+		if (ctx->rows.seg_rows) {
+			scratch_run *run = &ctx->s->run;
+			if (!run->seg_kv_pending) {
+				st = ERR_INVALID_ARG;
+				break;
+			}
+			buffer k_view = batch_row_view(batch_slot(ctx->bs, run->seg_kv_k),
+										   exec_seg_row0(&seg, c), run->seg_kv_stride);
+			buffer v_view = batch_row_view(batch_slot(ctx->bs, run->seg_kv_v),
+										   exec_seg_row0(&seg, c), run->seg_kv_stride);
+			st = kvcache_put_batch(seg_cache, ctx->m, ctx->li, exec_segment_pos(ctx, c), &k_view,
+								   &v_view, run->seg_kv_stride, exec_seg_rows(&seg, c));
+			if (st != OK)
+				break;
+		}
+		kvcache_attn_view(seg_cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
 		if (use_swa)
 			st = a->attention_swa_batch(a, &q_view, kb, vb, &o_view, kv_slot,
 										exec_segment_pos(ctx, c), n_heads, n_kv_heads, head_dim,
 										n_ctx, ctx->flash_attn, scale, sliding_window,
-										n_kv_heads_active, seg.rows);
+										n_kv_heads_active, exec_seg_rows(&seg, c));
 		else
 			st = a->attention_batch(a, &q_view, kb, vb, &o_view, kv_slot, exec_segment_pos(ctx, c),
 									n_heads, n_kv_heads, head_dim, n_ctx, ctx->flash_attn, scale,
-									n_kv_heads_active, seg.rows);
+									n_kv_heads_active, exec_seg_rows(&seg, c));
 	}
+	ctx->s->run.seg_kv_pending = 0;
 	return st;
 }
 

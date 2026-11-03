@@ -319,6 +319,20 @@ status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scr
 											   n_seqs, flash_attn, logits_out);
 }
 
+status_code compute_forward_segments(model *m, kvcache **caches, compute_scratch *s,
+									 const int32_t *tokens, const int *seg_rows, const int *seg_pos,
+									 int n_segs, int flash_attn, float *logits_out) {
+	int n_ctx = caches[0]->n_ctx;
+	for (int i = 1; i < n_segs; i++)
+		if (caches[i]->n_ctx > n_ctx)
+			n_ctx = caches[i]->n_ctx;
+	status_code st = compute_scratch_ensure(s, m, n_ctx);
+	if (st != OK)
+		return st;
+	return compute_forward_segments_recipe(m, caches, s, tokens, seg_rows, seg_pos, n_segs,
+										   flash_attn, logits_out);
+}
+
 void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, void *ud) {
 	s->layer_cb	   = cb;
 	s->layer_cb_ud = ud;

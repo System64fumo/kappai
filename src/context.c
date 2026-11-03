@@ -1020,6 +1020,69 @@ fail:
 	return status;
 }
 
+enum { PREFILL_BRANCHES_MAX_ROWS = 512 };
+
+status_code context_prefill_branches(context *c, const int32_t *const *seqs, const int *lens,
+									 int n_seq, float *logits_out) {
+	if (!c || !seqs || !lens || !logits_out || n_seq < 2)
+		return ERR_INVALID_ARG;
+	const kvcache_hybrid *h = c->kv.hybrid;
+	if (!c->m.arch_info || !c->m.arch_info->hybrid_shortconv || !h || !h->conv_state ||
+		h->recurrent_total > 0 || h->conv_buf || h->state_buf || h->latent_buf ||
+		c->kv.n_mirrors > 0 || !c->kv.backend || !backend_has_cap(c->kv.backend, BCAP_IS_HOST))
+		return ERR_UNSUPPORTED;
+
+	const int base	= c->kv.n_pos;
+	int		  total = 0;
+	for (int i = 0; i < n_seq; i++) {
+		if (lens[i] < 1 || base + lens[i] > c->kv.n_ctx)
+			return ERR_INVALID_ARG;
+		total += lens[i];
+	}
+	if (total > PREFILL_BRANCHES_MAX_ROWS)
+		return ERR_UNSUPPORTED;
+	if (c->interrupt)
+		return ERR_INTERRUPTED;
+
+	status_code st = compute_scratch_ensure(&c->scratch, &c->m, c->kv.n_ctx);
+	if (st != OK)
+		return st;
+	compute_scratch_reserve_rows(&c->m, &c->scratch, total);
+
+	int32_t		   *tokens	 = xmalloc((size_t)total * sizeof(*tokens));
+	int			   *seg_rows = xmalloc((size_t)n_seq * sizeof(*seg_rows));
+	int			   *seg_pos	 = xmalloc((size_t)n_seq * sizeof(*seg_pos));
+	kvcache		  **caches	 = xcalloc((size_t)n_seq, sizeof(*caches));
+	kvcache		   *views	 = xcalloc((size_t)n_seq, sizeof(*views));
+	kvcache_hybrid *states	 = xcalloc((size_t)n_seq, sizeof(*states));
+	int				row		 = 0;
+	for (int i = 0; i < n_seq; i++) {
+		memcpy(tokens + row, seqs[i], (size_t)lens[i] * sizeof(*tokens));
+		row += lens[i];
+		seg_rows[i]			 = lens[i];
+		seg_pos[i]			 = base;
+		states[i]			 = *h;
+		states[i].conv_state = xmalloc(h->conv_total * sizeof(float));
+		memcpy(states[i].conv_state, h->conv_state, h->conv_total * sizeof(float));
+		views[i]		= c->kv;
+		views[i].hybrid = &states[i];
+		caches[i]		= &views[i];
+	}
+
+	st = compute_forward_segments(&c->m, caches, &c->scratch, tokens, seg_rows, seg_pos, n_seq,
+								  c->flash_attn, logits_out);
+
+	for (int i = 0; i < n_seq; i++)
+		free(states[i].conv_state);
+	free(states);
+	free(views);
+	free(caches);
+	free(seg_pos);
+	free(seg_rows);
+	free(tokens);
+	return st;
+}
+
 static void debug_print_logits(context *c) {
 	buffer *logits = compute_logits_device(&c->scratch);
 	if (c->backend && c->backend->argmax) {
