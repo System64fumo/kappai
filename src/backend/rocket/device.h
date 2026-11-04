@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define RKT_MAX_CORES 3
+#define RKT_MAX_TASKS 16
 
 typedef struct {
 	uint32_t handle;
@@ -29,7 +30,7 @@ void rkt_bo_destroy(rkt_device *dev, rkt_bo *bo);
 int	 rkt_bo_flush(rkt_device *dev, const rkt_bo *bo);
 int	 rkt_bo_wait(rkt_device *dev, const rkt_bo *bo);
 
-int rkt_submit(rkt_device *dev, const rkt_bo *regcmd, uint32_t n_ops, const rkt_bo *in,
-			   const rkt_bo *out);
+int rkt_submit(rkt_device *dev, const uint32_t *regcmd_dma, const uint32_t *n_ops, int n_tasks,
+			   const rkt_bo *regcmd_pool, const rkt_bo *in, const rkt_bo *out);
 
 #endif

@@ -95,18 +95,26 @@ int rkt_bo_wait(rkt_device *dev, const rkt_bo *bo) {
 	return ioctl(dev->fd[bo->core], DRM_IOCTL_ROCKET_PREP_BO, &prep) < 0 ? -errno : 0;
 }
 
-int rkt_submit(rkt_device *dev, const rkt_bo *regcmd, uint32_t n_ops, const rkt_bo *in,
-			   const rkt_bo *out) {
-	struct drm_rocket_task task = {.regcmd = (uint32_t)regcmd->dma_addr, .regcmd_count = n_ops};
-	uint32_t			   in_handles[2]  = {in->handle, regcmd->handle};
-	uint32_t			   out_handles[1] = {out->handle};
+int rkt_submit(rkt_device *dev, const uint32_t *regcmd_dma, const uint32_t *n_ops, int n_tasks,
+			   const rkt_bo *regcmd_pool, const rkt_bo *in, const rkt_bo *out) {
+	if (n_tasks < 1 || n_tasks > RKT_MAX_TASKS)
+		return -EINVAL;
+
+	struct drm_rocket_task tasks[RKT_MAX_TASKS];
+	for (int i = 0; i < n_tasks; i++)
+		tasks[i] = (struct drm_rocket_task){
+			.regcmd		  = regcmd_dma[i],
+			.regcmd_count = n_ops[i],
+		};
+	uint32_t in_handles[2]	= {in->handle, regcmd_pool->handle};
+	uint32_t out_handles[1] = {out->handle};
 
 	struct drm_rocket_job job = {
-		.tasks				 = (uint64_t)(uintptr_t)&task,
+		.tasks				 = (uint64_t)(uintptr_t)tasks,
 		.in_bo_handles		 = (uint64_t)(uintptr_t)in_handles,
 		.out_bo_handles		 = (uint64_t)(uintptr_t)out_handles,
-		.task_count			 = 1,
-		.task_struct_size	 = sizeof(task),
+		.task_count			 = (uint32_t)n_tasks,
+		.task_struct_size	 = sizeof(tasks[0]),
 		.in_bo_handle_count	 = 2,
 		.out_bo_handle_count = 1,
 	};
