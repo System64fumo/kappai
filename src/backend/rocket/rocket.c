@@ -35,6 +35,7 @@
 #define RKT_ACT_MAX_ROUNDS 4
 
 #define RKT_QUEUE_ARENA_CAP ((size_t)4 << 20)
+#define RKT_QUEUE_BANKS 2
 #define RKT_QUEUE_ALIGN 64
 #define RKT_STREAM_POOL_BYTES ((size_t)2 << 20)
 #define RKT_STREAM_TABLE_SIZE 4096
@@ -154,6 +155,14 @@ typedef struct {
 	rkt_task   tasks[RKT_MAX_TASKS];
 } rkt_core_queue;
 
+typedef struct {
+	int			   valid;
+	int			   bank;
+	int			   n_active;
+	int			   active[RKT_MAX_CORES];
+	rkt_core_queue queue[RKT_MAX_CORES];
+} rkt_pending;
+
 typedef struct rkt_act_cache rkt_act_cache;
 
 typedef struct {
@@ -173,7 +182,9 @@ typedef struct {
 	int				 poison;
 	int				 npu_failed;
 	int				 npu_consecutive_failures;
-	rkt_slot		 slots[SLOT_CLASSES][RKT_MAX_CORES];
+	rkt_slot		 slots[RKT_QUEUE_BANKS][SLOT_CLASSES][RKT_MAX_CORES];
+	int				 bank;
+	rkt_pending		 pending[RKT_QUEUE_BANKS];
 	uint16_t		*x16;
 	size_t			 x16_cap;
 	uint16_t		*x_chunk;
@@ -1105,15 +1116,15 @@ static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int co
 		}
 		free(list);
 	}
-	double t_wait = w4_now_ms();
-	for (int i = 0; i < count; i++)
+	*wait_ms = 0.0;
+	for (int i = 0; i < count; i++) {
+		double t_wait = w4_now_ms();
 		for (int c = 0; c < p->dev.n_cores; c++)
 			if (submitted_core[c] && ws[i]->w4->core[c].n > 0 &&
 				rkt_bo_wait(&p->dev, io[i][c].out) && s == OK)
 				s = ERR_COMPUTE_FAIL;
-	*wait_ms = w4_now_ms() - t_wait;
-	if (p->poison)
-		for (int i = 0; i < count && s == OK; i++)
+		*wait_ms += w4_now_ms() - t_wait;
+		if (p->poison)
 			for (int c = 0; c < p->dev.n_cores && s == OK; c++)
 				if (ws[i]->w4->core[c].n > 0 &&
 					poison_hits(io[i][c].out->map, io[i][c].out->size / sizeof(uint32_t))) {
@@ -1121,8 +1132,9 @@ static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int co
 						 ws[i]->n);
 					s = ERR_COMPUTE_FAIL;
 				}
-	for (int i = 0; i < count && s == OK; i++)
-		s = w4_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
+		if (s == OK)
+			s = w4_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
+	}
 	free(s_act);
 	return s;
 }
@@ -1334,7 +1346,7 @@ static int ensure_bo(rkt_priv *p, int core, size_t bytes, rkt_bo *bo) {
 }
 
 static int grow_slot_input(rkt_priv *p, slot_class cls, int core, size_t used, size_t bytes) {
-	rkt_bo *in = &p->slots[cls][core].in;
+	rkt_bo *in = &p->slots[p->bank][cls][core].in;
 	if (in->map && in->size >= bytes)
 		return 1;
 	size_t size = in->size * 2 > bytes ? in->size * 2 : bytes;
@@ -1375,6 +1387,8 @@ static void reset_queue(rkt_priv *p) {
 	p->in_len = 0;
 }
 
+static status_code drain_all_pending(rkt_priv *p);
+
 static stream_entry *stream_lookup(rkt_stream_cache *sc, const stream_key *key) {
 	const uint32_t *words = (const uint32_t *)key;
 	uint32_t		h	  = 2166136261u;
@@ -1395,6 +1409,9 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 	size_t worst_bytes = (size_t)q->n_tasks * RKT_REGCMD_BYTES;
 	if (sc->bytes_used + worst_bytes > sc->bo.size ||
 		sc->n_entries + q->n_tasks > RKT_STREAM_MAX_ENTRIES) {
+		status_code drained = drain_all_pending(p);
+		if (drained != OK)
+			return drained;
 		memset(sc->entries, 0, sizeof(sc->entries));
 		sc->bytes_used = 0;
 		sc->n_entries  = 0;
@@ -1437,7 +1454,7 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 static status_code stage_core_queue(rkt_priv *p, int core) {
 	rkt_core_queue *q = &p->queue[core];
 	q->cls			  = p->queue_cls;
-	rkt_slot *sl	  = &p->slots[q->cls][core];
+	rkt_slot *sl	  = &p->slots[p->bank][q->cls][core];
 	if (!ensure_bo(p, core, q->out_bytes, &sl->out))
 		return ERR_OUT_OF_MEMORY;
 	status_code s = stage_streams(p, core, q, sl);
@@ -1491,22 +1508,68 @@ static void npu_record_failure(rkt_priv *p) {
 	WARN("rocket: %d consecutive npu failures, npu disabled", p->npu_consecutive_failures);
 }
 
-static status_code flush_queue(rkt_priv *p) {
-	status_code s					  = OK;
-	int			active[RKT_MAX_CORES] = {0};
-	int			n_active			  = 0;
+static status_code drain_bank(rkt_priv *p, int bank) {
+	rkt_pending *pd = &p->pending[bank];
+	if (!pd->valid)
+		return OK;
+	pd->valid	  = 0;
+	status_code s = OK;
+	for (int i = 0; i < pd->n_active; i++) {
+		int c	= pd->active[i];
+		int err = rkt_bo_wait(&p->dev, &p->slots[bank][pd->queue[c].cls][c].out);
+		if (err && s == OK) {
+			ERROR("rocket: wait on core %d failed: %s", c, strerror(-err));
+			s = ERR_COMPUTE_FAIL;
+		}
+	}
+	for (int i = 0; i < pd->n_active && s == OK; i++) {
+		const rkt_core_queue *q	 = &pd->queue[pd->active[i]];
+		const rkt_slot		 *sl = &p->slots[bank][q->cls][pd->active[i]];
+		for (int t = 0; t < q->n_tasks && s == OK; t++)
+			s = collect_task(p, &q->tasks[t],
+							 (const float *)((const uint8_t *)sl->out.map + q->tasks[t].out_off));
+	}
+	return s;
+}
+
+static status_code drain_all_pending(rkt_priv *p) {
+	status_code s = OK;
+	for (int bank = 0; bank < RKT_QUEUE_BANKS; bank++) {
+		status_code bs = drain_bank(p, (p->bank + 1 + bank) % RKT_QUEUE_BANKS);
+		if (s == OK)
+			s = bs;
+	}
+	return s;
+}
+
+static void abort_queue(rkt_priv *p) {
+	drain_all_pending(p);
+	reset_queue(p);
+}
+
+static status_code submit_queue(rkt_priv *p, int overlap) {
+	int active[RKT_MAX_CORES] = {0};
+	int n_active			  = 0;
 	for (int c = 0; c < RKT_MAX_CORES; c++)
 		if (p->queue[c].n_tasks)
 			active[n_active++] = c;
+	if (n_active == 0) {
+		status_code s = drain_all_pending(p);
+		reset_queue(p);
+		return s;
+	}
 
+	status_code s = OK;
 	for (int i = 0; i < n_active && s == OK; i++)
 		s = stage_core_queue(p, active[i]);
 
-	int submitted = 0;
+	int			 bank	   = p->bank;
+	rkt_pending *pd		   = &p->pending[bank];
+	int			 submitted = 0;
 	for (; submitted < n_active && s == OK; submitted++) {
 		int					  c	 = active[submitted];
 		const rkt_core_queue *q	 = &p->queue[c];
-		const rkt_slot		 *sl = &p->slots[q->cls][c];
+		const rkt_slot		 *sl = &p->slots[bank][q->cls][c];
 		uint32_t			  n_ops[RKT_MAX_TASKS];
 		uint32_t			  regcmd_dma[RKT_MAX_TASKS];
 		for (int t = 0; t < q->n_tasks; t++) {
@@ -1521,22 +1584,37 @@ static status_code flush_queue(rkt_priv *p) {
 			s = ERR_COMPUTE_FAIL;
 		}
 	}
+
+	pd->valid	 = submitted > 0;
+	pd->bank	 = bank;
+	pd->n_active = submitted;
 	for (int i = 0; i < submitted; i++) {
-		int c	= active[i];
-		int err = rkt_bo_wait(&p->dev, &p->slots[p->queue[c].cls][c].out);
-		if (err && s == OK) {
-			ERROR("rocket: wait on core %d failed: %s", c, strerror(-err));
-			s = ERR_COMPUTE_FAIL;
-		}
-	}
-	for (int i = 0; i < n_active && s == OK; i++) {
-		const rkt_core_queue *q	 = &p->queue[active[i]];
-		const rkt_slot		 *sl = &p->slots[q->cls][active[i]];
-		for (int t = 0; t < q->n_tasks && s == OK; t++)
-			s = collect_task(p, &q->tasks[t],
-							 (const float *)((const uint8_t *)sl->out.map + q->tasks[t].out_off));
+		int					  c	  = active[i];
+		const rkt_core_queue *src = &p->queue[c];
+		rkt_core_queue		 *dst = &pd->queue[c];
+		pd->active[i]			  = c;
+		dst->cls				  = src->cls;
+		dst->n_tasks			  = src->n_tasks;
+		dst->out_bytes			  = src->out_bytes;
+		memcpy(dst->tasks, src->tasks, (size_t)src->n_tasks * sizeof(src->tasks[0]));
 	}
 	reset_queue(p);
+
+	status_code older = drain_bank(p, (bank + 1) % RKT_QUEUE_BANKS);
+	if (s == OK)
+		s = older;
+	if (s != OK || !overlap) {
+		status_code mine = drain_bank(p, bank);
+		if (s == OK)
+			s = mine;
+	} else {
+		p->bank = (bank + 1) % RKT_QUEUE_BANKS;
+	}
+	return s;
+}
+
+static status_code flush_queue(rkt_priv *p) {
+	status_code s = submit_queue(p, 0);
 	if (s == OK)
 		p->npu_consecutive_failures = 0;
 	return s;
@@ -1579,7 +1657,7 @@ static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const u
 			rkt_core_queue *q = &p->queue[jobs[i].core];
 			if (q->n_tasks == p->max_tasks || (p->in_len && p->queue_cls != cls) ||
 				(!staged && p->in_len && p->in_len + in_bytes > RKT_QUEUE_ARENA_CAP)) {
-				status_code s = flush_queue(p);
+				status_code s = submit_queue(p, 1);
 				if (s != OK)
 					return s;
 				staged = 0;
@@ -1594,8 +1672,9 @@ static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const u
 			if (!written[jobs[i].core]) {
 				if (!grow_slot_input(p, cls, jobs[i].core, in_off, p->in_len))
 					return ERR_OUT_OF_MEMORY;
-				tile_input((uint16_t *)((uint8_t *)p->slots[cls][jobs[i].core].in.map + in_off),
-						   x_block, blk, b->kc->k_len);
+				tile_input(
+					(uint16_t *)((uint8_t *)p->slots[p->bank][cls][jobs[i].core].in.map + in_off),
+					x_block, blk, b->kc->k_len);
 				written[jobs[i].core] = 1;
 			}
 			q->tasks[q->n_tasks++] = (rkt_task){
@@ -1694,7 +1773,7 @@ static status_code npu_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, i
 		s = enqueue_fold(p, w, &fold_kc, row0, n, x16, y, m);
 	if (s == OK)
 		return flush_queue(p);
-	reset_queue(p);
+	abort_queue(p);
 	return s;
 }
 
@@ -1715,7 +1794,7 @@ static status_code npu_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n,
 	status_code s = npu_matmul_enqueue(p, w, row0, n, x, y, m);
 	if (s == OK)
 		return flush_queue(p);
-	reset_queue(p);
+	abort_queue(p);
 	return s;
 }
 
@@ -2861,7 +2940,7 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 		}
 	}
 	if (s != OK) {
-		reset_queue(p);
+		abort_queue(p);
 		if (!p->npu_failed) {
 			npu_record_failure(p);
 			WARN("rocket: npu attention failed (status %d, errno=%d)", s, errno);
@@ -2933,11 +3012,12 @@ static status_code rkt_probe(void) {
 }
 
 static void free_slots(rkt_priv *p) {
-	for (int cls = 0; cls < SLOT_CLASSES; cls++)
-		for (int c = 0; c < RKT_MAX_CORES; c++) {
-			rkt_bo_destroy(&p->dev, &p->slots[cls][c].in);
-			rkt_bo_destroy(&p->dev, &p->slots[cls][c].out);
-		}
+	for (int bank = 0; bank < RKT_QUEUE_BANKS; bank++)
+		for (int cls = 0; cls < SLOT_CLASSES; cls++)
+			for (int c = 0; c < RKT_MAX_CORES; c++) {
+				rkt_bo_destroy(&p->dev, &p->slots[bank][cls][c].in);
+				rkt_bo_destroy(&p->dev, &p->slots[bank][cls][c].out);
+			}
 	for (int c = 0; c < RKT_MAX_CORES; c++)
 		rkt_bo_destroy(&p->dev, &p->streams[c].bo);
 	for (int c = 0; c < RKT_MAX_CORES; c++) {

@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define RKT_MAX_CORES 3
-#define RKT_MAX_TASKS 16
+#define RKT_MAX_TASKS 64
 #define RKT_MAX_HANDLES 64
 
 typedef struct {
