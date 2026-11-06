@@ -129,10 +129,16 @@ static void emit_dpu_bypass(regcmd *c, int m, int n) {
 
 static void emit_dpu_lut_idle(regcmd *c) {
 	static const uint32_t regs[] = {
-		DPU_LUT_ACCESS_CFG,		DPU_LUT_ACCESS_DATA,	DPU_LUT_CFG,
-		DPU_LUT_INFO,			DPU_LUT_LE_START,		DPU_LUT_LE_END,
-		DPU_LUT_LO_START,		DPU_LUT_LO_END,			DPU_LUT_LE_SLOPE_SCALE,
-		DPU_LUT_LE_SLOPE_SHIFT, DPU_LUT_LO_SLOPE_SCALE, DPU_LUT_LO_SLOPE_SHIFT,
+		DPU_LUT_CFG,
+		DPU_LUT_INFO,
+		DPU_LUT_LE_START,
+		DPU_LUT_LE_END,
+		DPU_LUT_LO_START,
+		DPU_LUT_LO_END,
+		DPU_LUT_LE_SLOPE_SCALE,
+		DPU_LUT_LE_SLOPE_SHIFT,
+		DPU_LUT_LO_SLOPE_SCALE,
+		DPU_LUT_LO_SLOPE_SHIFT,
 	};
 	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
 		put(c, OP_REG_DPU, regs[i], 0);
@@ -280,4 +286,90 @@ int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *wor
 		ops[idx++] = ((uint64_t)OP_REG_DPU << 48) | ((uint64_t)words[i] << 16) |
 					 (uint64_t)DPU_LUT_ACCESS_DATA;
 	return n + extra;
+}
+
+int rkt_emit_quant(uint64_t *ops, int bits, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+				   uint32_t out_dma) {
+	regcmd	 c	= {.ops = ops};
+	uint32_t um = (uint32_t)m, uk = (uint32_t)k, un = (uint32_t)n;
+	uint32_t kbytes	   = uk * (uint32_t)bits / 8;
+	uint32_t precision = bits == 4 ? RKT_PRECISION_INT4 : RKT_PRECISION_INT8;
+	uint32_t conv_con1 = (precision << 4) | (precision << 7);
+	int		 banks	   = (int)((um * kbytes + 32767) / 32768);
+	if (banks < 1)
+		banks = 1;
+	uint32_t cbuf = (uint32_t)(((12 - banks) << 4) | banks);
+
+	put(&c, OP_REG_CNA, 0x1040, cbuf);
+	put(&c, OP_REG_CNA, 0x1104, 0);
+	put(&c, OP_REG_CNA, 0x1100, 0);
+	put(&c, OP_REG_CNA, 0x100c, conv_con1);
+	put(&c, OP_REG_DPU, 0x4004, 0xE);
+	put(&c, OP_REG_CNA, 0x100c, conv_con1);
+	put(&c, OP_REG_CNA, 0x1010, 2u << 4);
+	put(&c, OP_REG_CNA, 0x1014, 9);
+	put(&c, OP_REG_CNA, 0x1020, (um << 16) | 1u);
+	put(&c, OP_REG_CNA, 0x1024, ((uk - 1) << 16) | uk);
+	put(&c, OP_REG_CNA, 0x1028, um);
+	put(&c, OP_REG_CNA, 0x102c, um);
+	put(&c, OP_REG_CNA, 0x1030, kbytes * un);
+	put(&c, OP_REG_CNA, 0x1034, kbytes);
+	put(&c, OP_REG_CNA, 0x1038, 0x01010000u | un);
+	put(&c, OP_REG_CNA, 0x1040, cbuf);
+	put(&c, OP_REG_CNA, 0x1044, um * ((kbytes + 63) / 64));
+	put(&c, OP_REG_CNA, 0x104c, 0xB);
+	for (uint32_t reg = 0x1050; reg <= 0x105c; reg += 4)
+		put(&c, OP_REG_CNA, reg, 0x10000);
+	put(&c, OP_REG_CNA, 0x1060, 0);
+	put(&c, OP_REG_CNA, 0x1064, 0);
+	put(&c, OP_REG_CNA, 0x1068, 0);
+	put(&c, OP_REG_CNA, 0x1070, in_dma);
+	put(&c, OP_REG_CNA, 0x1074, 0);
+	put(&c, OP_REG_CNA, 0x1078, 0xF000F);
+	put(&c, OP_REG_CNA, 0x107c, 4 * um);
+	put(&c, OP_REG_CNA, 0x1080, (uint32_t)(-3 * m) & 0xFFFFFFFu);
+	put(&c, OP_REG_CNA, 0x1084, (um << 16) | 1u);
+	put(&c, OP_REG_CNA, 0x1088, uk);
+	put(&c, OP_REG_CNA, 0x1100, 0);
+	put(&c, OP_REG_CNA, 0x1104, 0);
+	put(&c, OP_REG_CNA, 0x1110, w_dma);
+	put_zeros(&c, OP_REG_CNA, 0x1140, 18);
+	put(&c, OP_REG_CORE, 0x3010, (precision << 8) | 1u);
+	put(&c, OP_REG_CORE, 0x3014, um - 1);
+	put(&c, OP_REG_CORE, 0x3018, un - 1);
+	put(&c, OP_REG_CORE, 0x301c, 0);
+	put(&c, OP_REG_CORE, 0x3030, 0);
+	put(&c, OP_REG_DPU, 0x400c, 0x1E4);
+	put(&c, OP_REG_DPU, 0x4010, bits == 4 ? 0x38000006u : ((uint32_t)RKT_PRECISION_INT32 << 29));
+	put(&c, OP_REG_DPU, 0x4014, 0);
+	put(&c, OP_REG_DPU, 0x4020, out_dma);
+	put(&c, OP_REG_DPU, 0x4024, 16 * um);
+	put(&c, OP_REG_DPU, 0x4030, um - 1);
+	put(&c, OP_REG_DPU, 0x4034, 0);
+	put(&c, OP_REG_DPU, 0x4038, 0);
+	put(&c, OP_REG_DPU, 0x403c, ((un - 1) << 16) | (un - 1));
+	put(&c, OP_REG_DPU, 0x4040, 0x53);
+	put_zeros(&c, OP_REG_DPU, 0x4044, 3);
+	put(&c, OP_REG_DPU, 0x4050, 0x7FE);
+	put(&c, OP_REG_DPU, 0x4054, 0);
+	put(&c, OP_REG_DPU, 0x4058, un - 1);
+	put(&c, OP_REG_DPU, 0x405c, um - 1);
+	put(&c, OP_REG_DPU, 0x4060, 0x53);
+	put_zeros(&c, OP_REG_DPU, 0x4064, 3);
+	put(&c, OP_REG_DPU, 0x4070, 0x383);
+	put(&c, OP_REG_DPU, 0x4074, 0);
+	put(&c, OP_REG_DPU, 0x4078, 1);
+	put(&c, OP_REG_DPU, 0x407c, 0);
+	put(&c, OP_REG_DPU, 0x4080, 0);
+	put(&c, OP_REG_DPU, 0x4084, 1);
+	put(&c, OP_REG_DPU, 0x4088, 0);
+	put_zeros(&c, OP_REG_DPU, 0x4090, 8);
+	put(&c, OP_REG_DPU, 0x40C0, 128 * um);
+	put(&c, OP_REG_DPU, 0x40C4, 0);
+	put_zeros(&c, OP_REG_DPU, 0x4108, 10);
+	put(&c, OP_NONE, 0, 0);
+	put(&c, OP_REG_PC, PC_REGISTER_AMOUNTS, 0);
+	put(&c, OP_40, 0, 0);
+	put(&c, OP_ENABLE, PC_OPERATION_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return c.n;
 }

@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#define RKT_PRECISION_INT8 0
+#define RKT_PRECISION_INT4 6
+#define RKT_PRECISION_INT32 4
 #define RKT_REGCMD_BYTES 4096
 #define RKT_REGCMD_MAX_OPS 512
 #define RKT_FEATURE_C2_F16 8
@@ -56,6 +59,9 @@ typedef struct {
 
 int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
 						uint32_t out_dma);
+
+int rkt_emit_quant(uint64_t *ops, int bits, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+				   uint32_t out_dma);
 
 int rkt_emit_matmul_f16_act(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
 							uint32_t out_dma, const rkt_post_cfg *post);

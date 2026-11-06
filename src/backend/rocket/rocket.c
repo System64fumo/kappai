@@ -10,6 +10,10 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <string.h>
 #include <unistd.h>
 
@@ -21,7 +25,6 @@
 #define RKT_TIMEOUT_NS 10000000000LL
 #define RKT_POISON_WORD 0xCAFEBABEu
 #define RKT_PRIORITY 50
-#define RKT_F16_BLOCK_BYTES (CBUF_BANK_BYTES * 2)
 #define RKT_TILE_ROWS 16
 #define RKT_TILE_COLS 32
 
@@ -53,6 +56,7 @@ typedef struct {
 } rkt_kchunk;
 
 typedef struct rkt_weight rkt_weight;
+typedef struct rkt_w4	  rkt_w4;
 struct rkt_weight {
 	uint32_t	magic;
 	int			n;
@@ -63,7 +67,9 @@ struct rkt_weight {
 	size_t		src_row_bytes;
 	int			n_kchunks;
 	rkt_kchunk *kchunks;
-	void	   *host_copy;
+	buffer	   *host_copy;
+	void	   *host_source;
+	rkt_w4	   *w4;
 	rkt_weight *fused_parent;
 	int			fused_row0;
 	int			fuse_tried;
@@ -151,22 +157,46 @@ typedef struct {
 typedef struct rkt_act_cache rkt_act_cache;
 
 typedef struct {
+	rkt_bo	  in;
+	rkt_bo	  out;
+	rkt_bo	  reg;
+	uint32_t *n_ops;
+	size_t	  n_ops_cap;
+} rkt_w4_scratch;
+
+enum { PROF_MATMUL, PROF_W4_WAIT, PROF_W4_HOST, PROF_ATTN, PROF_ACT, PROF_PREFILL_MATMUL, PROF_N };
+
+typedef struct {
 	rkt_device		 dev;
 	pthread_mutex_t	 lock;
 	int				 max_k;
 	int				 poison;
 	int				 npu_failed;
+	int				 npu_consecutive_failures;
 	rkt_slot		 slots[SLOT_CLASSES][RKT_MAX_CORES];
 	uint16_t		*x16;
 	size_t			 x16_cap;
-	uint16_t		*x_tile;
-	size_t			 x_tile_cap;
 	uint16_t		*x_chunk;
 	size_t			 x_chunk_cap;
 	rkt_weight	   **weights;
 	size_t			 n_weights;
 	size_t			 cap_weights;
 	int				 fuse;
+	int				 w4_on;
+	int				 w4_group;
+	int				 w4_failed;
+	int				 w4_prefill_failed;
+	int				 w4_prefill_tokens;
+	int				 w4_check;
+	int				 w4_prefill;
+	int				 w8_on;
+	int				 wq_accepted[2];
+	rkt_w4_scratch	 w4_pf[RKT_MAX_CORES];
+	int				 w4_logged;
+	int				 w4_checked;
+	int				 prof;
+	double			 prof_ms[PROF_N];
+	long			 prof_n[PROF_N];
 	int				 fused_groups;
 	int				 fused_weights;
 	float			*y_tmp;
@@ -179,9 +209,8 @@ typedef struct {
 	int				 max_tasks;
 	rkt_core_queue	 queue[RKT_MAX_CORES];
 	rkt_stream_cache streams[RKT_MAX_CORES];
-	uint8_t			*arena;
-	size_t			 arena_cap;
-	size_t			 arena_len;
+	size_t			 in_len;
+	slot_class		 queue_cls;
 } rkt_priv;
 
 static inline uint16_t f32_to_f16_bits(float v) {
@@ -244,7 +273,7 @@ static int partition_rows(int n, int n_cores, int *start, int *count) {
 }
 
 static int max_batch_rows(int k_len) {
-	int m = RKT_F16_BLOCK_BYTES / (k_len * 2);
+	int m = (CBUF_BANKS - 1) * CBUF_BANK_BYTES / (k_len * 2);
 	m	  = m / 4 * 4;
 	return m < 4 ? 4 : m;
 }
@@ -292,6 +321,8 @@ static int unregister_weight(rkt_priv *p, const rkt_weight *w) {
 	return 0;
 }
 
+static void w4_free(rkt_priv *p, rkt_w4 *q);
+
 static void destroy_weight(rkt_priv *p, rkt_weight *w) {
 	for (int ci = 0; ci < w->n_kchunks; ci++) {
 		for (int c = 0; c < RKT_MAX_CORES; c++) {
@@ -301,7 +332,13 @@ static void destroy_weight(rkt_priv *p, rkt_weight *w) {
 		w->kchunks[ci].fold_ready = 0;
 	}
 	free(w->kchunks);
-	free(w->host_copy);
+	if (w->host_copy) {
+		backend *host = backend_host();
+		host->buffer_free(host, w->host_copy);
+		free(w->host_copy);
+	}
+	free(w->host_source);
+	w4_free(p, w->w4);
 	w->magic = 0;
 	free(w);
 }
@@ -450,10 +487,26 @@ static status_code upload_to_npu(rkt_priv *p, rkt_weight *w, const tensor_desc *
 	return s;
 }
 
-static void keep_on_host(rkt_weight *w, const tensor_desc *desc) {
-	size_t bytes = w->src_row_bytes * (size_t)w->n;
-	w->host_copy = xmalloc(bytes);
-	memcpy(w->host_copy, desc->host_data, bytes);
+static status_code keep_on_host(rkt_weight *w, const tensor_desc *desc) {
+	backend *host		 = backend_host();
+	size_t	 bytes		 = w->src_row_bytes * (size_t)w->n;
+	size_t	 padded_rows = ((size_t)w->n + 7) & ~(size_t)7;
+	w->host_source		 = xcalloc(1, w->src_row_bytes * padded_rows + 64);
+	memcpy(w->host_source, desc->host_data, bytes);
+	tensor_desc owned		  = *desc;
+	owned.host_data			  = w->host_source;
+	owned.release_host_source = 0;
+	owned.read_fn			  = NULL;
+	owned.read_ctx			  = NULL;
+	w->host_copy			  = xcalloc(1, sizeof(*w->host_copy));
+	status_code s			  = host->buffer_alloc_weight(host, &owned, w->host_copy);
+	if (s == OK)
+		return OK;
+	free(w->host_copy);
+	free(w->host_source);
+	w->host_copy   = NULL;
+	w->host_source = NULL;
+	return s;
 }
 
 static void release_npu_state(rkt_priv *p, rkt_weight *w) {
@@ -467,6 +520,662 @@ static void release_npu_state(rkt_priv *p, rkt_weight *w) {
 	free(w->kchunks);
 	w->kchunks	 = NULL;
 	w->n_kchunks = 0;
+}
+
+static int poison_hits(const uint32_t *words, size_t count);
+
+#define RKT_W4_NTILE 4096
+#define RKT_W4_HEAD_ROWS 65536
+#define RKT_MAX_FUSE 8
+#define RKT_W4_MAX_CHILDREN RKT_MAX_FUSE
+#define RKT_W4_PREFILL_TOKENS_MAX 32
+
+typedef struct {
+	int		  n0;
+	int		  n;
+	int		  n_tasks;
+	rkt_bo	  in;
+	rkt_bo	  out;
+	rkt_bo	  wt;
+	rkt_bo	  reg;
+	size_t	 *w_off;
+	size_t	 *out_off;
+	uint32_t *n_ops;
+} rkt_w4_core;
+
+struct rkt_w4 {
+	int			bits;
+	int			group;
+	int			n_ktiles;
+	int			n64;
+	rkt_w4_core core[RKT_MAX_CORES];
+	float	   *s_w;
+	int16_t	   *corr;
+};
+
+static int w4_tile_len(const rkt_weight *w, int group, int kt) {
+	int rest = w->k_pad - kt * group;
+	return rest < group ? rest : group;
+}
+
+static void w4_free(rkt_priv *p, rkt_w4 *q) {
+	if (!q)
+		return;
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		rkt_bo_destroy(&p->dev, &q->core[c].in);
+		rkt_bo_destroy(&p->dev, &q->core[c].out);
+		rkt_bo_destroy(&p->dev, &q->core[c].wt);
+		rkt_bo_destroy(&p->dev, &q->core[c].reg);
+		free(q->core[c].w_off);
+		free(q->core[c].out_off);
+		free(q->core[c].n_ops);
+	}
+	free(q->s_w);
+	free(q->corr);
+	free(q);
+}
+
+static void w4_put_nibble(uint8_t *row16, int j, int v) {
+	uint8_t nib = (uint8_t)(v & 15);
+	if (j & 1)
+		row16[j / 2] |= nib;
+	else
+		row16[j / 2] = (uint8_t)(nib << 4);
+}
+
+static int w4_alloc_cores(rkt_priv *p, rkt_weight *w, rkt_w4 *q) {
+	int blocks = q->n64 / 64;
+	int used   = blocks < p->dev.n_cores ? blocks : p->dev.n_cores;
+	int base   = blocks / used;
+	int rem	   = blocks % used;
+	int n0	   = 0;
+	for (int c = 0; c < used; c++) {
+		rkt_w4_core *wc = &q->core[c];
+		wc->n0			= n0;
+		wc->n			= (base + (c < rem ? 1 : 0)) * 64;
+		n0 += wc->n;
+		int n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		wc->n_tasks	 = n_ntiles * q->n_ktiles;
+		wc->w_off	 = xcalloc((size_t)wc->n_tasks, sizeof(size_t));
+		wc->out_off	 = xcalloc((size_t)wc->n_tasks, sizeof(size_t));
+		wc->n_ops	 = xcalloc((size_t)wc->n_tasks, sizeof(uint32_t));
+		size_t w_acc = 0, o_acc = 0;
+		for (int nt = 0; nt < n_ntiles; nt++) {
+			int ncols =
+				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			for (int kt = 0; kt < q->n_ktiles; kt++) {
+				int t		   = nt * q->n_ktiles + kt;
+				wc->w_off[t]   = w_acc;
+				wc->out_off[t] = o_acc;
+				w_acc += (size_t)w4_tile_len(w, q->group, kt) * ncols * q->bits / 8;
+				o_acc += (size_t)4 * ncols;
+			}
+		}
+		if (rkt_bo_create(&p->dev, c, (size_t)w->k_pad, &wc->in) ||
+			rkt_bo_create(&p->dev, c, o_acc, &wc->out) ||
+			rkt_bo_create(&p->dev, c, w_acc, &wc->wt) ||
+			rkt_bo_create(&p->dev, c, (size_t)wc->n_tasks * RKT_REGCMD_BYTES, &wc->reg))
+			return 0;
+		memset(wc->wt.map, 0, wc->wt.size);
+	}
+	return 1;
+}
+
+static int quant_bits_for_type(uint32_t type) {
+	switch (type) {
+	case GGML_TYPE_Q4_0:
+	case GGML_TYPE_Q4_1:
+	case GGML_TYPE_Q4_K:
+	case GGML_TYPE_Q3_K:
+	case GGML_TYPE_Q2_K:
+	case GGML_TYPE_IQ4_NL:
+	case GGML_TYPE_IQ4_XS:
+	case GGML_TYPE_IQ3_S:
+	case GGML_TYPE_IQ3_XXS:
+	case GGML_TYPE_IQ2_S:
+	case GGML_TYPE_IQ2_XXS:
+		return 4;
+	case GGML_TYPE_Q5_0:
+	case GGML_TYPE_Q5_1:
+	case GGML_TYPE_Q5_K:
+	case GGML_TYPE_Q6_K:
+	case GGML_TYPE_Q8_0:
+	case GGML_TYPE_Q8_K:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
+static void w4_put_weight(const rkt_w4 *q, uint8_t *base, int col, int kl, int kb, int j, int v) {
+	int		 atom_cols = 256 / q->bits;
+	uint8_t *row =
+		base + (((size_t)(col / atom_cols) * (kl / 32) + kb / 32) * atom_cols + col % atom_cols) *
+				   (4 * q->bits);
+	if (q->bits == 4)
+		w4_put_nibble(row, j, v);
+	else
+		row[j] = (uint8_t)(int8_t)v;
+}
+
+static int w4_rows(const rkt_w4 *q, int tokens) {
+	return (q->bits == 4 ? 2 : 1) * tokens;
+}
+
+static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc, int bits) {
+	if (w->n < 1 || w->k < 1 || p->dev.n_cores < 1)
+		return ERR_UNSUPPORTED;
+	rkt_w4 *q	= xcalloc(1, sizeof(*q));
+	q->bits		= bits;
+	q->group	= p->w4_group;
+	q->n_ktiles = (w->k_pad + q->group - 1) / q->group;
+	q->n64		= (w->n + 63) / 64 * 64;
+	q->s_w		= xcalloc((size_t)q->n_ktiles * q->n64, sizeof(float));
+	q->corr		= bits == 4 ? xcalloc((size_t)q->n_ktiles * q->n64, sizeof(int16_t)) : NULL;
+	if (!w4_alloc_cores(p, w, q)) {
+		w4_free(p, q);
+		return ERR_OUT_OF_MEMORY;
+	}
+
+	backend	   *host = backend_host();
+	float	   *tmp	 = xmalloc((size_t)w->k * sizeof(float));
+	status_code s	 = OK;
+	for (int r = 0; r < w->n && s == OK; r++) {
+		const uint8_t *src = (const uint8_t *)desc->host_data + (size_t)r * w->src_row_bytes;
+		if (desc->type == GGML_TYPE_F32) {
+			memcpy(tmp, src, (size_t)w->k * sizeof(float));
+		} else if (desc->type == GGML_TYPE_F16) {
+			for (int i = 0; i < w->k; i++) {
+				uint16_t bits;
+				memcpy(&bits, src + (size_t)i * 2, sizeof(bits));
+				tmp[i] = f16_bits_to_f32(bits);
+			}
+		} else if (host && host->dequant_row) {
+			s = host->dequant_row(host, desc->type, src, w->k, tmp);
+		} else {
+			s = ERR_UNSUPPORTED;
+		}
+		if (s != OK)
+			break;
+
+		int c = 0;
+		while (c + 1 < RKT_MAX_CORES && q->core[c + 1].n > 0 && r >= q->core[c + 1].n0)
+			c++;
+		rkt_w4_core *wc	 = &q->core[c];
+		int			 lr	 = r - wc->n0;
+		int			 nt	 = lr / RKT_W4_NTILE;
+		int			 col = lr % RKT_W4_NTILE;
+		for (int kt = 0; kt < q->n_ktiles; kt++) {
+			int	  k0 = kt * q->group, kl = w4_tile_len(w, q->group, kt);
+			float amax = 0.0f;
+			for (int j = 0; j < kl && k0 + j < w->k; j++)
+				if (fabsf(tmp[k0 + j]) > amax)
+					amax = fabsf(tmp[k0 + j]);
+			int		 qmax  = (1 << (bits - 1)) - 1;
+			int		 qmin  = bits == 4 ? -qmax - 1 : -qmax;
+			float	 scale = amax / (float)qmax;
+			float	 inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
+			uint8_t *base  = (uint8_t *)wc->wt.map + wc->w_off[nt * q->n_ktiles + kt];
+			int		 sum   = 0;
+			for (int kb = 0; kb < kl; kb += 32)
+				for (int j = 0; j < 32; j++) {
+					int	  kk = k0 + kb + j;
+					float v	 = kk < w->k ? tmp[kk] : 0.0f;
+					long  qv = lrintf(v * inv);
+					qv		 = qv > qmax ? qmax : qv < qmin ? qmin : qv;
+					sum += (int)qv;
+					w4_put_weight(q, base, col, kl, kb, j, (int)qv);
+				}
+			q->s_w[(size_t)kt * q->n64 + r] = scale;
+			if (q->corr)
+				q->corr[(size_t)kt * q->n64 + r] = (int16_t)(8 * sum);
+		}
+	}
+	free(tmp);
+
+	for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
+		rkt_w4_core *wc = &q->core[c];
+		if (wc->n == 0)
+			continue;
+		int n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		for (int nt = 0; nt < n_ntiles; nt++) {
+			int ncols =
+				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			for (int kt = 0; kt < q->n_ktiles; kt++) {
+				int t		 = nt * q->n_ktiles + kt;
+				wc->n_ops[t] = (uint32_t)rkt_emit_quant(
+					(uint64_t *)((uint8_t *)wc->reg.map + (size_t)t * RKT_REGCMD_BYTES), bits,
+					w4_rows(q, 1), w4_tile_len(w, q->group, kt), ncols,
+					(uint32_t)(wc->in.dma_addr + (size_t)kt * q->group),
+					(uint32_t)(wc->wt.dma_addr + wc->w_off[t]),
+					(uint32_t)(wc->out.dma_addr + wc->out_off[t]));
+				if (wc->n_ops[t] > RKT_REGCMD_MAX_OPS)
+					s = ERR_INTERNAL;
+			}
+		}
+		if (s == OK && (rkt_bo_flush(&p->dev, &wc->wt) || rkt_bo_flush(&p->dev, &wc->reg)))
+			s = ERR_IO;
+	}
+	if (s != OK) {
+		w4_free(p, q);
+		return s;
+	}
+	w->w4 = q;
+	p->wq_accepted[bits == 8]++;
+	return OK;
+}
+
+static status_code w4_build_best(rkt_priv *p, rkt_weight *w, const tensor_desc *desc) {
+	int bits = quant_bits_for_type(desc->type);
+	if (bits == 0 || (bits == 8 && !p->w8_on))
+		return ERR_UNSUPPORTED;
+	return w4_build(p, w, desc, bits);
+}
+
+static double w4_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static void prof_add(rkt_priv *p, int kind, double ms) {
+	p->prof_ms[kind] += ms;
+	p->prof_n[kind]++;
+}
+
+static void prof_print(const rkt_priv *p) {
+	static const char *names[PROF_N] = {"decode matmul (all paths)", "w4 npu wait",
+										"w4 host pre/post",			 "decode attention",
+										"decode ffn activation",	 "prefill matmul (all paths)"};
+	for (int i = 0; i < PROF_N; i++)
+		log_tag("ROCKET-PROF", "%-26s calls=%-7ld total=%9.1f ms  avg=%7.3f ms", names[i],
+				p->prof_n[i], p->prof_ms[i], p->prof_n[i] ? p->prof_ms[i] / p->prof_n[i] : 0.0);
+}
+
+typedef struct {
+	const rkt_bo   *in;
+	const rkt_bo   *out;
+	const rkt_bo   *reg;
+	const uint32_t *n_ops;
+} w4_io;
+
+typedef struct {
+	const w4_io *io;
+	int			 task;
+} w4_job_task;
+
+static int ensure_bo(rkt_priv *p, int core, size_t bytes, rkt_bo *bo);
+
+static int w4_prefill_prepare(rkt_priv *p, const rkt_weight *w, int tokens, w4_io *io) {
+	int m = w4_rows(w->w4, tokens);
+	for (int c = 0; c < p->dev.n_cores; c++) {
+		const rkt_w4_core *wc = &w->w4->core[c];
+		if (wc->n == 0)
+			continue;
+		rkt_w4_scratch *sc = &p->w4_pf[c];
+		if (!ensure_bo(p, c, (size_t)w->k_pad * tokens, &sc->in) ||
+			!ensure_bo(p, c, wc->out.size * tokens, &sc->out) ||
+			!ensure_bo(p, c, (size_t)wc->n_tasks * RKT_REGCMD_BYTES, &sc->reg) ||
+			!ensure_capacity((void **)&sc->n_ops, &sc->n_ops_cap, (size_t)wc->n_tasks,
+							 sizeof(uint32_t)))
+			return 0;
+		for (int t = 0; t < wc->n_tasks; t++) {
+			int kt = t % w->w4->n_ktiles;
+			int nt = t / w->w4->n_ktiles;
+			int ncols =
+				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			sc->n_ops[t] = (uint32_t)rkt_emit_quant(
+				(uint64_t *)((uint8_t *)sc->reg.map + (size_t)t * RKT_REGCMD_BYTES), w->w4->bits, m,
+				w4_tile_len(w, w->w4->group, kt), ncols,
+				(uint32_t)(sc->in.dma_addr + (size_t)kt * w->w4->group * tokens),
+				(uint32_t)(wc->wt.dma_addr + wc->w_off[t]),
+				(uint32_t)(sc->out.dma_addr + wc->out_off[t] * tokens));
+			if (sc->n_ops[t] > RKT_REGCMD_MAX_OPS)
+				return 0;
+		}
+		if (rkt_bo_flush(&p->dev, &sc->reg))
+			return 0;
+		io[c] = (w4_io){&sc->in, &sc->out, &sc->reg, sc->n_ops};
+	}
+	return 1;
+}
+
+static float w4_absmax(const float *x, int n) {
+	float m = 0.0f;
+	int	  i = 0;
+#if defined(__ARM_NEON)
+	float32x4_t v = vdupq_n_f32(0.0f);
+	for (; i + 4 <= n; i += 4)
+		v = vmaxq_f32(v, vabsq_f32(vld1q_f32(x + i)));
+	m = vmaxvq_f32(v);
+#endif
+	for (; i < n; i++)
+		if (fabsf(x[i]) > m)
+			m = fabsf(x[i]);
+	return m;
+}
+
+static void w4_activation_scales(const rkt_weight *w, const float *x, int tokens, float *s_act) {
+	int group = w->w4->group, n_ktiles = w->w4->n_ktiles;
+	for (int tk = 0; tk < tokens; tk++)
+		for (int kt = 0; kt < n_ktiles; kt++) {
+			int	  k0 = kt * group, kl = w4_tile_len(w, group, kt);
+			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
+			float amax	= w4_absmax(x + (size_t)tk * w->k + k0, valid > 0 ? valid : 0);
+			s_act[tk * n_ktiles + kt] = amax > 0.0f ? amax / 127.0f : 1.0f;
+		}
+}
+
+static int w4_quantize_activation(float v, float scale) {
+	long qv = lrintf(v / scale);
+	return qv > 127 ? 127 : qv < -127 ? -127 : (int)qv;
+}
+
+static void w4_quantize_tile(const float *x, int valid, int kl, float scale, int8_t *q) {
+	int j = 0;
+#if defined(__ARM_NEON)
+	float32x4_t sv = vdupq_n_f32(scale);
+	for (; j + 8 <= valid; j += 8) {
+		int32x4_t a = vcvtnq_s32_f32(vdivq_f32(vld1q_f32(x + j), sv));
+		int32x4_t b = vcvtnq_s32_f32(vdivq_f32(vld1q_f32(x + j + 4), sv));
+		int8x8_t  o = vqmovn_s16(vcombine_s16(vqmovn_s32(a), vqmovn_s32(b)));
+		vst1_s8(q + j, vmax_s8(o, vdup_n_s8(-127)));
+	}
+#endif
+	for (; j < valid; j++)
+		q[j] = (int8_t)w4_quantize_activation(x[j], scale);
+	for (; j < kl; j++)
+		q[j] = 0;
+}
+
+static void w4_pack_activation(const rkt_weight *w, const float *x, int tokens, const float *s_act,
+							   int bits, uint8_t *packed) {
+	int		group = w->w4->group, n_ktiles = w->w4->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
+	int8_t *q = xmalloc((size_t)group);
+	for (int tk = 0; tk < tokens; tk++) {
+		const float *xt = x + (size_t)tk * w->k;
+		for (int kt = 0; kt < n_ktiles; kt++) {
+			int	  k0 = kt * group, kl = w4_tile_len(w, group, kt);
+			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
+			float scale = s_act[tk * n_ktiles + kt];
+			w4_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
+			if (bits == 8) {
+				for (int plane = 0; plane < kl / 16; plane++)
+					memcpy(packed + (size_t)k0 * tokens + ((size_t)plane * tokens + tk) * 16,
+						   q + plane * 16, 16);
+				continue;
+			}
+			for (int kb = 0; kb < kl; kb += 32)
+				for (int row = 0; row < 2; row++) {
+					uint8_t *dst =
+						packed + (size_t)k0 * tokens + ((size_t)(kb / 32) * m + 2 * tk + row) * 16;
+					for (int j = 0; j < 32; j++) {
+						int u = q[kb + j] + 128;
+						w4_put_nibble(dst, j, row == 0 ? (u >> 4) - 8 : (u & 15) - 8);
+					}
+				}
+		}
+	}
+	free(q);
+}
+
+static void w4_reduce_i4(const rkt_w4 *q, const uint8_t *tile, size_t tile_stride, int m, int tk,
+						 int r0, int col, const float *sa, float *dst) {
+	const int16_t *o0 = (const int16_t *)tile;
+#if defined(__ARM_NEON)
+	float32x4_t y0 = vdupq_n_f32(0.0f), y1 = vdupq_n_f32(0.0f);
+	for (int kt = 0; kt < q->n_ktiles; kt++) {
+		const int16_t *hi = o0 + (size_t)kt * tile_stride + (size_t)col * m + tk * 16;
+		int16x8_t	   h  = vld1q_s16(hi);
+		int16x8_t	   l  = vld1q_s16(hi + 8);
+		int16x8_t	   cv = vld1q_s16(q->corr + (size_t)kt * q->n64 + r0 + col);
+		int32x4_t	   a0 =
+			vmlal_n_s16(vaddl_s16(vget_low_s16(l), vget_low_s16(cv)), vget_low_s16(h), 16);
+		int32x4_t a1 =
+			vmlal_n_s16(vaddl_s16(vget_high_s16(l), vget_high_s16(cv)), vget_high_s16(h), 16);
+		const float *sw = q->s_w + (size_t)kt * q->n64 + r0 + col;
+		y0				= vfmaq_f32(y0, vmulq_n_f32(vld1q_f32(sw), sa[kt]), vcvtq_f32_s32(a0));
+		y1				= vfmaq_f32(y1, vmulq_n_f32(vld1q_f32(sw + 4), sa[kt]), vcvtq_f32_s32(a1));
+	}
+	vst1q_f32(dst, y0);
+	vst1q_f32(dst + 4, y1);
+#else
+	for (int j = 0; j < 8; j++) {
+		float v = 0.0f;
+		for (int kt = 0; kt < q->n_ktiles; kt++) {
+			const int16_t *hi = o0 + (size_t)kt * tile_stride + (size_t)col * m + tk * 16;
+			int32_t		   a = 16 * hi[j] + hi[8 + j] + q->corr[(size_t)kt * q->n64 + r0 + col + j];
+			v += q->s_w[(size_t)kt * q->n64 + r0 + col + j] * sa[kt] * (float)a;
+		}
+		dst[j] = v;
+	}
+#endif
+}
+
+static void w4_reduce_i8(const rkt_w4 *q, const uint8_t *tile, size_t tile_stride, int m, int tk,
+						 int r0, int col, const float *sa, float *dst) {
+	const int32_t *o0 = (const int32_t *)tile;
+#if defined(__ARM_NEON)
+	float32x4_t y0 = vdupq_n_f32(0.0f), y1 = vdupq_n_f32(0.0f);
+	for (int kt = 0; kt < q->n_ktiles; kt++) {
+		const int32_t *lo = o0 + (size_t)kt * tile_stride + (size_t)col * m + tk * 4;
+		const float	  *sw = q->s_w + (size_t)kt * q->n64 + r0 + col;
+		y0 = vfmaq_f32(y0, vmulq_n_f32(vld1q_f32(sw), sa[kt]), vcvtq_f32_s32(vld1q_s32(lo)));
+		y1 = vfmaq_f32(y1, vmulq_n_f32(vld1q_f32(sw + 4), sa[kt]),
+					   vcvtq_f32_s32(vld1q_s32(lo + 4 * m)));
+	}
+	vst1q_f32(dst, y0);
+	vst1q_f32(dst + 4, y1);
+#else
+	for (int j = 0; j < 8; j++) {
+		float v = 0.0f;
+		for (int kt = 0; kt < q->n_ktiles; kt++) {
+			const int32_t *lo = o0 + (size_t)kt * tile_stride + (size_t)col * m + tk * 4 +
+								(size_t)(j / 4) * 4 * m + j % 4;
+			v += q->s_w[(size_t)kt * q->n64 + r0 + col + j] * sa[kt] * (float)*lo;
+		}
+		dst[j] = v;
+	}
+#endif
+}
+
+static status_code w4_accumulate(rkt_priv *p, const rkt_weight *w, const w4_io *io, int tokens,
+								 const float *s_act, float *y) {
+	const rkt_w4 *q = w->w4;
+	int			  m = w4_rows(q, tokens), n_ktiles = q->n_ktiles;
+	if (!ensure_capacity((void **)&p->y_tmp, &p->y_tmp_cap, (size_t)q->n64 * tokens, sizeof(float)))
+		return ERR_OUT_OF_MEMORY;
+	for (int c = 0; c < p->dev.n_cores; c++) {
+		const rkt_w4_core *wc		= &q->core[c];
+		int				   n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		for (int nt = 0; nt < n_ntiles; nt++) {
+			int ncols =
+				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			const uint8_t *tile =
+				(const uint8_t *)io[c].out->map + wc->out_off[nt * n_ktiles] * tokens;
+			int r0 = wc->n0 + nt * RKT_W4_NTILE;
+			for (int tk = 0; tk < tokens; tk++)
+				for (int col = 0; col < ncols; col += 8) {
+					float		*dst = p->y_tmp + (size_t)tk * q->n64 + r0 + col;
+					const float *sa	 = s_act + tk * n_ktiles;
+					if (q->bits == 4)
+						w4_reduce_i4(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
+					else
+						w4_reduce_i8(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
+				}
+		}
+	}
+	for (int tk = 0; tk < tokens; tk++)
+		for (int r = 0; r < w->n; r++)
+			y[(size_t)tk * w->n + r] = p->y_tmp[(size_t)tk * q->n64 + r];
+	return OK;
+}
+
+static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int count, const float *x,
+								int tokens, double *wait_ms) {
+	const rkt_weight *w0	= ws[0];
+	int				  k_pad = w0->k_pad, group = w0->w4->group;
+	if (tokens > 1 && count != 1)
+		return ERR_UNSUPPORTED;
+	for (int i = 1; i < count; i++)
+		if (ws[i]->k_pad != k_pad || ws[i]->w4->group != group)
+			return ERR_UNSUPPORTED;
+
+	w4_io io[RKT_W4_MAX_CHILDREN][RKT_MAX_CORES] = {0};
+	if (tokens > 1) {
+		if (!w4_prefill_prepare(p, w0, tokens, io[0]))
+			return ERR_OUT_OF_MEMORY;
+	} else {
+		for (int i = 0; i < count; i++)
+			for (int c = 0; c < RKT_MAX_CORES; c++) {
+				const rkt_w4_core *wc = &ws[i]->w4->core[c];
+				io[i][c]			  = (w4_io){&wc->in, &wc->out, &wc->reg, wc->n_ops};
+			}
+	}
+
+	float	*s_act	   = xmalloc((size_t)tokens * w0->w4->n_ktiles * sizeof(float));
+	uint8_t *packed[2] = {NULL, NULL};
+	w4_activation_scales(w0, x, tokens, s_act);
+	for (int i = 0; i < count; i++) {
+		int bits = ws[i]->w4->bits;
+		if (!packed[bits == 8]) {
+			packed[bits == 8] = xcalloc((size_t)k_pad * tokens, 1);
+			w4_pack_activation(w0, x, tokens, s_act, bits, packed[bits == 8]);
+		}
+	}
+
+	status_code s = OK;
+	for (int i = 0; i < count && s == OK; i++)
+		for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
+			if (ws[i]->w4->core[c].n == 0)
+				continue;
+			memcpy(io[i][c].in->map, packed[ws[i]->w4->bits == 8], (size_t)k_pad * tokens);
+			if (rkt_bo_flush(&p->dev, io[i][c].in))
+				s = ERR_IO;
+		}
+	free(packed[0]);
+	free(packed[1]);
+
+	if (p->poison)
+		for (int i = 0; i < count && s == OK; i++)
+			for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
+				if (ws[i]->w4->core[c].n == 0)
+					continue;
+				uint32_t *ow = io[i][c].out->map;
+				for (size_t j = 0; j < io[i][c].out->size / sizeof(uint32_t); j++)
+					ow[j] = RKT_POISON_WORD;
+				if (rkt_bo_flush(&p->dev, io[i][c].out))
+					s = ERR_IO;
+			}
+	int submitted_core[RKT_MAX_CORES] = {0};
+	for (int c = 0; c < p->dev.n_cores && s == OK; c++) {
+		int n_list = 0;
+		for (int i = 0; i < count; i++)
+			n_list += ws[i]->w4->core[c].n > 0 ? ws[i]->w4->core[c].n_tasks : 0;
+		if (n_list == 0)
+			continue;
+		w4_job_task *list = xmalloc((size_t)n_list * sizeof(*list));
+		int			 at	  = 0;
+		for (int i = 0; i < count; i++) {
+			const rkt_w4_core *wc = &ws[i]->w4->core[c];
+			for (int t = 0; wc->n > 0 && t < wc->n_tasks; t++)
+				list[at++] = (w4_job_task){.io = &io[i][c], .task = t};
+		}
+		for (int start = 0; start < n_list && s == OK; start += RKT_MAX_TASKS) {
+			int			  n_tasks = n_list - start < RKT_MAX_TASKS ? n_list - start : RKT_MAX_TASKS;
+			uint32_t	  dma[RKT_MAX_TASKS], ops[RKT_MAX_TASKS];
+			const rkt_bo *in[RKT_MAX_HANDLES], *out[RKT_MAX_HANDLES];
+			int			  n_in = 0, n_out = 0;
+			const w4_io	 *last = NULL;
+			for (int j = 0; j < n_tasks; j++) {
+				const w4_io *tio = list[start + j].io;
+				int			 t	 = list[start + j].task;
+				dma[j]			 = (uint32_t)(tio->reg->dma_addr + (size_t)t * RKT_REGCMD_BYTES);
+				ops[j]			 = tio->n_ops[t];
+				if (tio != last) {
+					last		 = tio;
+					in[n_in++]	 = tio->in;
+					in[n_in++]	 = tio->reg;
+					out[n_out++] = tio->out;
+				}
+			}
+			if (rkt_submit_bos(&p->dev, c, dma, ops, n_tasks, in, n_in, out, n_out))
+				s = ERR_COMPUTE_FAIL;
+			submitted_core[c] = 1;
+		}
+		free(list);
+	}
+	double t_wait = w4_now_ms();
+	for (int i = 0; i < count; i++)
+		for (int c = 0; c < p->dev.n_cores; c++)
+			if (submitted_core[c] && ws[i]->w4->core[c].n > 0 &&
+				rkt_bo_wait(&p->dev, io[i][c].out) && s == OK)
+				s = ERR_COMPUTE_FAIL;
+	*wait_ms = w4_now_ms() - t_wait;
+	if (p->poison)
+		for (int i = 0; i < count && s == OK; i++)
+			for (int c = 0; c < p->dev.n_cores && s == OK; c++)
+				if (ws[i]->w4->core[c].n > 0 &&
+					poison_hits(io[i][c].out->map, io[i][c].out->size / sizeof(uint32_t))) {
+					WARN("rocket: w4 core %d output k=%d n=%d still holds poison", c, ws[i]->k,
+						 ws[i]->n);
+					s = ERR_COMPUTE_FAIL;
+				}
+	for (int i = 0; i < count && s == OK; i++)
+		s = w4_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
+	free(s_act);
+	return s;
+}
+
+static status_code w4_run_many(rkt_priv *p, rkt_weight **ws, float **ys, int count, const float *x,
+							   int tokens) {
+	double		t0		= w4_now_ms();
+	double		wait_ms = 0.0;
+	status_code s		= w4_run_inner(p, ws, ys, count, x, tokens, &wait_ms);
+	double		total	= w4_now_ms() - t0;
+	if (p->prof) {
+		prof_add(p, PROF_W4_WAIT, wait_ms);
+		prof_add(p, PROF_W4_HOST, total - wait_ms);
+	}
+	if ((total > 40.0 || s != OK) && p->w4_logged < 24) {
+		p->w4_logged++;
+		int tasks = 0;
+		for (int i = 0; i < count; i++)
+			tasks += ws[i]->w4->core[0].n_tasks;
+		WARN("rocket: w4 call k=%d n=%d count=%d tasks/core=%d status=%d: %.1f ms (wait %.1f ms)",
+			 ws[0]->k, ws[0]->n, count, tasks, s, total, wait_ms);
+	}
+	return s;
+}
+
+static void w4_disable(rkt_priv *p, status_code s) {
+	if (p->w4_failed)
+		return;
+	p->w4_failed = 1;
+	WARN("rocket: w4 decode path failed (status %d, errno=%d), back to f16 weights", s, errno);
+}
+
+static void w4_report(rkt_priv *p, const rkt_weight *w, const float *x, const float *y4,
+					  const float *yref, int prefill) {
+	if (p->w4_checked >= 400)
+		return;
+	p->w4_checked++;
+	double num = 0.0, den = 0.0, xx = 0.0, xmax = 0.0;
+	for (int i = 0; i < w->n; i++) {
+		double d = (double)y4[i] - (double)yref[i];
+		num += d * d;
+		den += (double)yref[i] * (double)yref[i];
+	}
+	for (int i = 0; i < w->k; i++) {
+		xx += (double)x[i] * (double)x[i];
+		if (fabs((double)x[i]) > xmax)
+			xmax = fabs((double)x[i]);
+	}
+	double rms = sqrt(xx / (double)w->k);
+	char   tag[16];
+	snprintf(tag, sizeof(tag), prefill ? "W%dCHK-PF" : "W%dCHK", w->w4->bits);
+	log_tag(tag, "k=%d n=%d rel_rmse=%.4f x_max/rms=%.1f", w->k, w->n,
+			den > 0.0 ? sqrt(num / den) : 0.0, rms > 0.0 ? xmax / rms : 0.0);
 }
 
 #define RKT_KV_MAGIC 0x524B5456u
@@ -546,8 +1255,10 @@ static status_code rkt_buffer_alloc_weight(backend *self, const tensor_desc *des
 	rkt_weight *w = new_weight(desc);
 	bytes		  = w->src_row_bytes * (size_t)w->n;
 
+	int quant_head = p->w4_on && w->n >= RKT_W4_HEAD_ROWS && quant_bits_for_type(desc->type) != 0;
+
 	status_code s = ERR_UNSUPPORTED;
-	if (weight_shape_supported(p, w)) {
+	if (!quant_head && weight_shape_supported(p, w)) {
 		s = upload_to_npu(p, w, desc);
 		if (s != OK)
 			release_npu_state(p, w);
@@ -556,7 +1267,17 @@ static status_code rkt_buffer_alloc_weight(backend *self, const tensor_desc *des
 		if (s != ERR_UNSUPPORTED)
 			WARN("rocket: weight %dx%d (%s) stays on host: status %d", w->k, w->n,
 				 ggml_type_name(desc->type), s);
-		keep_on_host(w, desc);
+		status_code host_s = keep_on_host(w, desc);
+		if (host_s != OK) {
+			destroy_weight(p, w);
+			return host_s;
+		}
+	}
+	if ((s == OK || quant_head) && p->w4_on) {
+		status_code s4 = w4_build_best(p, w, desc);
+		if (s4 != OK && s4 != ERR_UNSUPPORTED)
+			WARN("rocket: w4 build for %dx%d (%s) failed: status %d, stays f16", w->k, w->n,
+				 ggml_type_name(desc->type), s4);
 	}
 
 	pthread_mutex_lock(&p->lock);
@@ -612,9 +1333,19 @@ static int ensure_bo(rkt_priv *p, int core, size_t bytes, rkt_bo *bo) {
 	return rkt_bo_create(&p->dev, core, bytes, bo) == 0;
 }
 
-static int ensure_slot(rkt_priv *p, slot_class cls, int core, size_t in_bytes, size_t out_bytes) {
-	rkt_slot *s = &p->slots[cls][core];
-	return ensure_bo(p, core, in_bytes, &s->in) && ensure_bo(p, core, out_bytes, &s->out);
+static int grow_slot_input(rkt_priv *p, slot_class cls, int core, size_t used, size_t bytes) {
+	rkt_bo *in = &p->slots[cls][core].in;
+	if (in->map && in->size >= bytes)
+		return 1;
+	size_t size = in->size * 2 > bytes ? in->size * 2 : bytes;
+	rkt_bo grown;
+	if (rkt_bo_create(&p->dev, core, size, &grown))
+		return 0;
+	if (in->map)
+		memcpy(grown.map, in->map, used < in->size ? used : in->size);
+	rkt_bo_destroy(&p->dev, in);
+	*in = grown;
+	return 1;
 }
 
 static int poison_hits(const uint32_t *words, size_t count) {
@@ -641,7 +1372,7 @@ static void reset_queue(rkt_priv *p) {
 		p->queue[c].n_tasks	  = 0;
 		p->queue[c].out_bytes = 0;
 	}
-	p->arena_len = 0;
+	p->in_len = 0;
 }
 
 static stream_entry *stream_lookup(rkt_stream_cache *sc, const stream_key *key) {
@@ -705,15 +1436,10 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 
 static status_code stage_core_queue(rkt_priv *p, int core) {
 	rkt_core_queue *q = &p->queue[core];
-	q->cls			  = SLOT_DECODE;
-	for (int i = 0; i < q->n_tasks; i++)
-		if (q->tasks[i].blk > 1)
-			q->cls = SLOT_BATCH;
-	if (!ensure_slot(p, q->cls, core, p->arena_len, q->out_bytes))
+	q->cls			  = p->queue_cls;
+	rkt_slot *sl	  = &p->slots[q->cls][core];
+	if (!ensure_bo(p, core, q->out_bytes, &sl->out))
 		return ERR_OUT_OF_MEMORY;
-
-	rkt_slot *sl = &p->slots[q->cls][core];
-	memcpy(sl->in.map, p->arena, p->arena_len);
 	status_code s = stage_streams(p, core, q, sl);
 	if (s != OK)
 		return s;
@@ -756,6 +1482,15 @@ static status_code collect_task(const rkt_priv *p, const rkt_task *t, const floa
 	return OK;
 }
 
+#define RKT_NPU_MAX_CONSECUTIVE_FAILURES 3
+
+static void npu_record_failure(rkt_priv *p) {
+	if (++p->npu_consecutive_failures < RKT_NPU_MAX_CONSECUTIVE_FAILURES)
+		return;
+	p->npu_failed = 1;
+	WARN("rocket: %d consecutive npu failures, npu disabled", p->npu_consecutive_failures);
+}
+
 static status_code flush_queue(rkt_priv *p) {
 	status_code s					  = OK;
 	int			active[RKT_MAX_CORES] = {0};
@@ -778,14 +1513,21 @@ static status_code flush_queue(rkt_priv *p) {
 			n_ops[t]	  = q->tasks[t].n_ops;
 			regcmd_dma[t] = q->tasks[t].regcmd_dma;
 		}
-		if (rkt_submit(&p->dev, regcmd_dma, n_ops, q->n_tasks, &p->streams[c].bo, &sl->in,
-					   &sl->out))
+		int err = rkt_submit(&p->dev, regcmd_dma, n_ops, q->n_tasks, &p->streams[c].bo, &sl->in,
+							 &sl->out);
+		if (err) {
+			ERROR("rocket: submit on core %d failed (%d tasks, cls %d): %s", c, q->n_tasks, q->cls,
+				  strerror(-err));
 			s = ERR_COMPUTE_FAIL;
+		}
 	}
 	for (int i = 0; i < submitted; i++) {
-		int c = active[i];
-		if (rkt_bo_wait(&p->dev, &p->slots[p->queue[c].cls][c].out) && s == OK)
+		int c	= active[i];
+		int err = rkt_bo_wait(&p->dev, &p->slots[p->queue[c].cls][c].out);
+		if (err && s == OK) {
+			ERROR("rocket: wait on core %d failed: %s", c, strerror(-err));
 			s = ERR_COMPUTE_FAIL;
+		}
 	}
 	for (int i = 0; i < n_active && s == OK; i++) {
 		const rkt_core_queue *q	 = &p->queue[active[i]];
@@ -795,6 +1537,8 @@ static status_code flush_queue(rkt_priv *p) {
 							 (const float *)((const uint8_t *)sl->out.map + q->tasks[t].out_off));
 	}
 	reset_queue(p);
+	if (s == OK)
+		p->npu_consecutive_failures = 0;
 	return s;
 }
 
@@ -821,35 +1565,38 @@ static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const u
 	if (hi > b->w->n_pad)
 		hi = b->w->n_pad;
 
-	size_t in_bytes = (size_t)blk * b->kc->k_len * sizeof(uint16_t);
-	if (!ensure_capacity((void **)&p->x_tile, &p->x_tile_cap, (size_t)blk * b->kc->k_len,
-						 sizeof(uint16_t)))
-		return ERR_OUT_OF_MEMORY;
-	tile_input(p->x_tile, x_block, blk, b->kc->k_len);
-
-	size_t	 in_off = 0;
-	int		 staged = 0;
-	job_desc jobs[RKT_MAX_CORES];
+	size_t	   in_bytes				  = (size_t)blk * b->kc->k_len * sizeof(uint16_t);
+	slot_class cls					  = blk > 1 ? SLOT_BATCH : SLOT_DECODE;
+	size_t	   in_off				  = 0;
+	int		   staged				  = 0;
+	uint8_t	   written[RKT_MAX_CORES] = {0};
+	job_desc   jobs[RKT_MAX_CORES];
 	for (int round = 0;; round++) {
 		int n_jobs = plan_jobs(b, lo, hi, round, jobs);
 		if (n_jobs == 0)
 			return OK;
 		for (int i = 0; i < n_jobs; i++) {
 			rkt_core_queue *q = &p->queue[jobs[i].core];
-			if (q->n_tasks == p->max_tasks ||
-				(!staged && p->arena_len && p->arena_len + in_bytes > RKT_QUEUE_ARENA_CAP)) {
+			if (q->n_tasks == p->max_tasks || (p->in_len && p->queue_cls != cls) ||
+				(!staged && p->in_len && p->in_len + in_bytes > RKT_QUEUE_ARENA_CAP)) {
 				status_code s = flush_queue(p);
 				if (s != OK)
 					return s;
 				staged = 0;
+				memset(written, 0, sizeof(written));
 			}
 			if (!staged) {
-				in_off = align_queue(p->arena_len);
-				if (!ensure_capacity((void **)&p->arena, &p->arena_cap, in_off + in_bytes, 1))
-					return ERR_OUT_OF_MEMORY;
-				memcpy(p->arena + in_off, p->x_tile, in_bytes);
-				p->arena_len = in_off + in_bytes;
+				in_off		 = align_queue(p->in_len);
+				p->in_len	 = in_off + in_bytes;
+				p->queue_cls = cls;
 				staged		 = 1;
+			}
+			if (!written[jobs[i].core]) {
+				if (!grow_slot_input(p, cls, jobs[i].core, in_off, p->in_len))
+					return ERR_OUT_OF_MEMORY;
+				tile_input((uint16_t *)((uint8_t *)p->slots[cls][jobs[i].core].in.map + in_off),
+						   x_block, blk, b->kc->k_len);
+				written[jobs[i].core] = 1;
 			}
 			q->tasks[q->n_tasks++] = (rkt_task){
 				.ctx	 = *b,
@@ -1007,24 +1754,87 @@ static status_code host_matmul(const rkt_weight *w, int row0, int n, const buffe
 							   int m) {
 	backend *host = backend_host();
 	size_t	 off  = (size_t)row0 * w->src_row_bytes;
-	buffer	 wv	  = buffer_host_view(host, (uint8_t *)w->host_copy + off, w->src_row_bytes * n);
-	buffer	 xv	  = buffer_host_view(host, rkt_ptr(x), (size_t)m * w->k * sizeof(float));
-	buffer	 yv	  = buffer_host_view(host, rkt_ptr(y), (size_t)m * n * sizeof(float));
+	buffer	 wv	  = *w->host_copy;
+	wv.offset += off;
+	buffer xv = buffer_host_view(host, rkt_ptr(x), (size_t)m * w->k * sizeof(float));
+	buffer yv = buffer_host_view(host, rkt_ptr(y), (size_t)m * n * sizeof(float));
 	return host->matmul_batch(host, &wv, w->src_type, &xv, &yv, n, w->k, m);
 }
 
 static status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type,
-									const buffer *x, buffer *y, int n, int k, int m) {
+									const buffer *x, buffer *y, int n, int k, int m);
+
+static status_code rkt_matmul_batch_inner(backend *self, const buffer *wbuf, uint32_t w_type,
+										  const buffer *x, buffer *y, int n, int k, int m) {
 	(void)w_type;
 	rkt_priv   *p = self->priv;
 	rkt_weight *w = wbuf->handle;
-	if (!w || w->magic != RKT_WEIGHT_MAGIC || w->k != k)
+	if (!w || w->magic != RKT_WEIGHT_MAGIC) {
+		ERROR("rocket: matmul weight is not a rocket weight (owner=%s)",
+			  wbuf->owner ? wbuf->owner->name : "none");
 		return ERR_INVALID_ARG;
-	if (wbuf->offset % w->src_row_bytes != 0)
+	}
+	if (w->k != k || wbuf->offset % w->src_row_bytes != 0) {
+		ERROR("rocket: matmul shape mismatch (k=%d weight k=%d offset=%zu row_bytes=%zu)", k, w->k,
+			  (size_t)wbuf->offset, (size_t)w->src_row_bytes);
 		return ERR_INVALID_ARG;
+	}
 	int row0 = (int)(wbuf->offset / w->src_row_bytes);
-	if (row0 + n > w->n)
+	if (row0 + n > w->n) {
+		ERROR("rocket: matmul rows out of range (row0=%d n=%d weight n=%d)", row0, n, w->n);
 		return ERR_INVALID_ARG;
+	}
+	if (m == 1 && w->w4 && p->w4_on && !p->w4_failed && !p->npu_failed && row0 == 0 && n == w->n) {
+		rkt_weight *one = w;
+		float	   *yo	= p->w4_check ? xmalloc((size_t)n * sizeof(float)) : rkt_ptr(y);
+		pthread_mutex_lock(&p->lock);
+		status_code s4 = w4_run_many(p, &one, &yo, 1, rkt_ptr(x), 1);
+		pthread_mutex_unlock(&p->lock);
+		if (s4 == OK && !p->w4_check)
+			return OK;
+		if (s4 == OK) {
+			p->w4_on	   = 0;
+			status_code sr = rkt_matmul_batch(self, wbuf, w_type, x, y, n, k, m);
+			p->w4_on	   = 1;
+			w4_report(p, w, rkt_ptr(x), yo, rkt_ptr(y), 0);
+			free(yo);
+			return sr;
+		}
+		if (p->w4_check)
+			free(yo);
+		w4_disable(p, s4);
+	}
+	if (m > 1 && w->w4 && p->w4_on && p->w4_prefill && !p->w4_failed && !p->w4_prefill_failed &&
+		!p->npu_failed && row0 == 0 && n == w->n) {
+		rkt_weight *one = w;
+		status_code s4	= OK;
+		float	   *yw	= p->w4_check ? xmalloc((size_t)m * n * sizeof(float)) : rkt_ptr(y);
+		pthread_mutex_lock(&p->lock);
+		for (int t0 = 0; t0 < m && s4 == OK; t0 += p->w4_prefill_tokens) {
+			int	   tokens = m - t0 < p->w4_prefill_tokens ? m - t0 : p->w4_prefill_tokens;
+			float *yo	  = yw + (size_t)t0 * n;
+			s4 = w4_run_many(p, &one, &yo, 1, (const float *)rkt_ptr(x) + (size_t)t0 * k, tokens);
+		}
+		pthread_mutex_unlock(&p->lock);
+		if (s4 == OK && !p->w4_check)
+			return OK;
+		if (s4 == OK) {
+			p->w4_on		= 0;
+			status_code sr	= rkt_matmul_batch(self, wbuf, w_type, x, y, n, k, m);
+			p->w4_on		= 1;
+			const float *xf = rkt_ptr(x), *yr = rkt_ptr(y);
+			w4_report(p, w, xf, yw, yr, 1);
+			w4_report(p, w, xf + (size_t)(m - 1) * k, yw + (size_t)(m - 1) * n,
+					  yr + (size_t)(m - 1) * n, 1);
+			free(yw);
+			return sr;
+		}
+		if (p->w4_check)
+			free(yw);
+		p->w4_prefill_failed = 1;
+		WARN("rocket: w4 prefill path failed (status %d, errno=%d), prefill back to f16 weights",
+			 s4, errno);
+	}
 	if (w->fused_parent) {
 		row0 += w->fused_row0;
 		w = w->fused_parent;
@@ -1038,8 +1848,8 @@ static status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t 
 	pthread_mutex_lock(&p->lock);
 	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : npu_matmul(p, w, row0, n, xf, yf, m);
 	if (s != OK && !p->npu_failed) {
-		p->npu_failed = 1;
-		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), npu disabled, using "
+		npu_record_failure(p);
+		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), using "
 			 "cpu on "
 			 "tiled weights",
 			 n, k, m, s, errno);
@@ -1052,12 +1862,20 @@ static status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t 
 	return s;
 }
 
+static status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type,
+									const buffer *x, buffer *y, int n, int k, int m) {
+	rkt_priv   *p  = self->priv;
+	double		t0 = p->prof ? w4_now_ms() : 0.0;
+	status_code s  = rkt_matmul_batch_inner(self, wbuf, w_type, x, y, n, k, m);
+	if (p->prof)
+		prof_add(p, m == 1 ? PROF_MATMUL : PROF_PREFILL_MATMUL, w4_now_ms() - t0);
+	return s;
+}
+
 static status_code rkt_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 							  buffer *y, int n, int k) {
 	return rkt_matmul_batch(self, w, w_type, x, y, n, k, 1);
 }
-
-#define RKT_MAX_FUSE 8
 
 static void copy_weight_row(const rkt_part *sp, int s_row, const rkt_part *dp, int d_row,
 							int k_len) {
@@ -1149,8 +1967,8 @@ static status_code run_npu_or_cpu(rkt_priv *p, const rkt_weight *w, int row0, in
 								  const float *xf, float *yf, int m) {
 	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : npu_matmul(p, w, row0, n, xf, yf, m);
 	if (s != OK && !p->npu_failed) {
-		p->npu_failed = 1;
-		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), npu disabled, using "
+		npu_record_failure(p);
+		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), using "
 			 "cpu on tiled weights",
 			 n, w->k, m, s, errno);
 	}
@@ -1225,6 +2043,47 @@ static status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const
 										  const buffer *x, buffer **y, const int *n_list, int k,
 										  int n_matmuls, int m) {
 	rkt_priv *p = self->priv;
+	if (m == 1 && p->w4_on && p->w4_check) {
+		for (int i = 0; i < n_matmuls; i++) {
+			status_code s = rkt_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
+			if (s != OK)
+				return s;
+		}
+		return OK;
+	}
+	if (m == 1 && p->w4_on && !p->w4_failed && !p->npu_failed && n_matmuls <= RKT_W4_MAX_CHILDREN) {
+		rkt_weight *ws[RKT_W4_MAX_CHILDREN];
+		float	   *ys[RKT_W4_MAX_CHILDREN];
+		uint8_t		is_w4[RKT_W4_MAX_CHILDREN] = {0};
+		int			count					   = 0;
+		for (int i = 0; i < n_matmuls; i++) {
+			rkt_weight *wi = w[i]->handle;
+			is_w4[i]	   = wi && wi->magic == RKT_WEIGHT_MAGIC && wi->w4 && w[i]->offset == 0 &&
+							 n_list[i] == wi->n && wi->k == k;
+			if (is_w4[i]) {
+				ws[count] = wi;
+				ys[count] = rkt_ptr(y[i]);
+				count++;
+			}
+		}
+		if (count > 0) {
+			pthread_mutex_lock(&p->lock);
+			status_code s4 = w4_run_many(p, ws, ys, count, rkt_ptr(x), 1);
+			pthread_mutex_unlock(&p->lock);
+			if (s4 == OK) {
+				for (int i = 0; i < n_matmuls; i++) {
+					if (is_w4[i])
+						continue;
+					status_code s =
+						rkt_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
+					if (s != OK)
+						return s;
+				}
+				return OK;
+			}
+			w4_disable(p, s4);
+		}
+	}
 	if (p->fuse && n_matmuls >= 2) {
 		status_code s = multi_fused(self, w, x, y, n_list, k, n_matmuls, m);
 		if (s != ERR_UNSUPPORTED)
@@ -1272,12 +2131,14 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 	int row0 = (int)(w->offset / wt->src_row_bytes);
 	if (row0 + n > wt->n)
 		return ERR_INVALID_ARG;
+	int use_w4 = p->w4_on && !p->w4_failed && !p->npu_failed && wt->w4 && row0 == 0 && n == wt->n;
 	if (wt->fused_parent) {
 		row0 += wt->fused_row0;
 		wt = wt->fused_parent;
 	}
-	if (wt->host_copy || wt->n_kchunks != 1 || wt->kchunks[0].k_len + RKT_FOLD_K_LEN > p->max_k ||
-		wt->k_pad != wt->k || rkt_ptr(residual) == NULL) {
+	if (use_w4 || wt->host_copy || wt->n_kchunks != 1 ||
+		wt->kchunks[0].k_len + RKT_FOLD_K_LEN > p->max_k || wt->k_pad != wt->k ||
+		rkt_ptr(residual) == NULL) {
 		const float *rr = rkt_ptr(residual);
 		float		*rc = NULL;
 		if (rr && rr == rkt_ptr(y)) {
@@ -1338,9 +2199,9 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 		}
 	}
 	if (s != OK && !p->npu_failed) {
-		p->npu_failed = 1;
-		WARN("rocket: npu residual-fold matmul failed (n=%d k=%d status=%d, errno=%d), npu "
-			 "disabled, using cpu",
+		npu_record_failure(p);
+		WARN("rocket: npu residual-fold matmul failed (n=%d k=%d status=%d, errno=%d), "
+			 "using cpu",
 			 n, k, s, errno);
 	}
 	if (s != OK) {
@@ -1356,6 +2217,7 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 }
 
 #define RKT_LUT_HQ_SEL 4
+#define RKT_LUT_HOST_LIMIT 15.5f
 
 static double rkt_lut_fn(rkt_lut_kind kind, double x) {
 	if (kind == RKT_LUT_GELU_TANH)
@@ -1546,12 +2408,27 @@ static status_code rkt_lut_act_rows(rkt_priv *p, rkt_act_cache *a, rkt_lut_kind 
 		}
 		s = rkt_act_round(p, a, p->x16, blocks, n_blocks, out, n, chunks_per_row);
 	}
-	return s;
+	if (s != OK)
+		return s;
+	for (int r = 0; r < m; r++) {
+		const uint16_t *x = p->x16 + (size_t)r * chunks_per_row * RKT_ACT_CHUNK;
+		float		   *o = out + (size_t)r * n;
+		for (int i = 0; i < n; i++) {
+			float v = f16_bits_to_f32(x[i]);
+			if (fabsf(v) >= RKT_LUT_HOST_LIMIT)
+				o[i] = (float)rkt_lut_fn(kind, (double)v);
+		}
+	}
+	return OK;
 }
 
 static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, const buffer *up,
 										 buffer *out, int n, int activation, int m, int gate_stride,
-										 int up_stride, int fused) {
+										 int up_stride, int fused);
+
+static status_code rkt_ffn_activate_kind_inner(backend *self, const buffer *gate, const buffer *up,
+											   buffer *out, int n, int activation, int m,
+											   int gate_stride, int up_stride, int fused) {
 	rkt_priv *p		= self->priv;
 	float	 *ucopy = NULL;
 	if (n <= 0 || m <= 0)
@@ -1560,10 +2437,12 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 		goto host;
 	rkt_lut_kind kind = activation == RKT_FFNA_GELU ? RKT_LUT_GELU_TANH : RKT_LUT_SILU;
 
-	const float *gf = rkt_ptr(gate);
-	const float *uf = rkt_ptr(up);
-	float		*of = rkt_ptr(out);
-	if (uf == of) {
+	const float *gf		 = rkt_ptr(gate);
+	const float *uf		 = rkt_ptr(up);
+	float		*of		 = rkt_ptr(out);
+	const float *up_end	 = uf + (size_t)(m - 1) * up_stride + n;
+	const float *out_end = of + (size_t)m * n;
+	if (of < up_end && uf < out_end) {
 		ucopy = xmalloc((size_t)n * (size_t)m * sizeof(float));
 		for (int r = 0; r < m; r++)
 			memcpy(ucopy + (size_t)r * n, uf + (size_t)r * up_stride, (size_t)n * sizeof(float));
@@ -1589,9 +2468,8 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL
 								  : rkt_lut_act_rows(p, &p->act, kind, gf, gate_stride, of, n, m);
 	if (s != OK && !p->npu_failed) {
-		p->npu_failed = 1;
-		WARN("rocket: npu ffn_activate failed (n=%d m=%d status=%d, errno=%d), npu disabled", n, m,
-			 s, errno);
+		npu_record_failure(p);
+		WARN("rocket: npu ffn_activate failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
 	}
 	pthread_mutex_unlock(&p->lock);
 	if (s != OK)
@@ -1607,6 +2485,18 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 	}
 	free(ucopy);
 	return OK;
+}
+
+static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, const buffer *up,
+										 buffer *out, int n, int activation, int m, int gate_stride,
+										 int up_stride, int fused) {
+	rkt_priv   *p  = self->priv;
+	double		t0 = p->prof && m == 1 ? w4_now_ms() : 0.0;
+	status_code s  = rkt_ffn_activate_kind_inner(self, gate, up, out, n, activation, m, gate_stride,
+												 up_stride, fused);
+	if (p->prof && m == 1)
+		prof_add(p, PROF_ACT, w4_now_ms() - t0);
+	return s;
 }
 
 static status_code rkt_ffn_activate(backend *self, const buffer *gate, const buffer *up,
@@ -1626,9 +2516,11 @@ static status_code rkt_ffn_activate_batch(backend *self, const buffer *gate, con
 
 static status_code rkt_ffn_activate_fused_batch(backend *self, const buffer *fused, buffer *out,
 												int n, int activation, int m) {
-	buffer up =
-		buffer_slice(fused, (size_t)n * sizeof(float), (size_t)m * (size_t)n * sizeof(float));
-	return rkt_ffn_activate_kind(self, fused, &up, out, n, activation, m, 2 * n, 2 * n, 1);
+	(void)self;
+	backend *host = backend_host();
+	if (!host || !host->ffn_activate_fused_batch)
+		return ERR_UNSUPPORTED;
+	return host->ffn_activate_fused_batch(host, fused, out, n, activation, m);
 }
 
 static status_code rkt_matmul_ffn_down_batch(backend *self, const buffer *w, uint32_t w_type,
@@ -1764,10 +2656,12 @@ static status_code rkt_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 				break;
 			}
 			tile_weight_row(pt->bo.map, row, kc->k_len, k_global - pt->row_start);
-			int v_col = pos / RKT_TILE_COLS, v_rem = pos % RKT_TILE_COLS;
+			int				v_col = pos / RKT_TILE_COLS, v_rem = pos % RKT_TILE_COLS;
+			const rkt_part *vp = NULL;
 			for (int d = 0; d < head_dim; d++) {
-				int				v_global = h * sl->hd_pad + d;
-				const rkt_part *vp		 = part_for_row(vc, v_global);
+				int v_global = h * sl->hd_pad + d;
+				if (!vp || v_global < vp->row_start || v_global >= vp->row_start + vp->row_count)
+					vp = part_for_row(vc, v_global);
 				if (!vp) {
 					s = ERR_INTERNAL;
 					break;
@@ -1801,6 +2695,76 @@ static status_code rkt_kv_put(backend *self, buffer *k, buffer *v, int layer, in
 							head_dim, n_ctx, n_kv_heads_active, 1);
 }
 
+#if defined(__ARM_NEON)
+static inline float32x4_t neon_expf(float32x4_t x) {
+	x			   = vmaxq_f32(x, vdupq_n_f32(-87.3f));
+	int32x4_t	n  = vcvtnq_s32_f32(vmulq_f32(x, vdupq_n_f32(1.44269504f)));
+	float32x4_t nf = vcvtq_f32_s32(n);
+	float32x4_t r  = vfmsq_f32(x, nf, vdupq_n_f32(0.693145751953125f));
+	r			   = vfmsq_f32(r, nf, vdupq_n_f32(1.428606765330187e-06f));
+	float32x4_t p  = vdupq_n_f32(1.0f / 720.0f);
+	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), p, r);
+	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), p, r);
+	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), p, r);
+	p			   = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+	p			   = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+	p			   = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+	int32x4_t e	   = vshlq_n_s32(vaddq_s32(n, vdupq_n_s32(127)), 23);
+	return vmulq_f32(p, vreinterpretq_f32_s32(e));
+}
+#endif
+
+static float softmax_scaled_max(const float *sc, int lo, int hi, float scale) {
+	float mx = -INFINITY;
+	int	  t	 = lo;
+#if defined(__ARM_NEON)
+	float32x4_t vm = vdupq_n_f32(-INFINITY);
+	for (; t + 4 <= hi; t += 4)
+		vm = vmaxq_f32(vm, vmulq_n_f32(vld1q_f32(sc + t), scale));
+	mx = vmaxvq_f32(vm);
+#endif
+	for (; t < hi; t++) {
+		float v = sc[t] * scale;
+		if (v > mx)
+			mx = v;
+	}
+	return mx;
+}
+
+static double softmax_exp_sum(const float *sc, float *pr, int lo, int hi, float scale, float mx) {
+	double sum = 0.0;
+	int	   t   = lo;
+#if defined(__ARM_NEON)
+	float32x4_t vmx = vdupq_n_f32(mx);
+	while (t + 4 <= hi) {
+		float32x4_t acc = vdupq_n_f32(0.0f);
+		int			end = t + 4 * 256 < hi ? t + 4 * 256 : hi;
+		for (; t + 4 <= end; t += 4) {
+			float32x4_t e = neon_expf(vsubq_f32(vmulq_n_f32(vld1q_f32(sc + t), scale), vmx));
+			vst1q_f32(pr + t, e);
+			acc = vaddq_f32(acc, e);
+		}
+		sum += (double)vaddvq_f32(acc);
+	}
+#endif
+	for (; t < hi; t++) {
+		float e = expf(sc[t] * scale - mx);
+		pr[t]	= e;
+		sum += e;
+	}
+	return sum;
+}
+
+static void softmax_round_f16(float *pr, int n, float inv) {
+	int t = 0;
+#if defined(__ARM_NEON)
+	for (; t + 4 <= n; t += 4)
+		vst1q_f32(pr + t, vcvt_f32_f16(vcvt_f16_f32(vmulq_n_f32(vld1q_f32(pr + t), inv))));
+#endif
+	for (; t < n; t++)
+		pr[t] = f16_bits_to_f32(f32_to_f16_bits(pr[t] * inv));
+}
+
 static void attention_softmax(const float *scores, float *probs, int m, int n_i, int span16,
 							  int pos_pad, int pos_start, int window, float scale) {
 	for (int r = 0; r < m; r++) {
@@ -1809,23 +2773,11 @@ static void attention_softmax(const float *scores, float *probs, int m, int n_i,
 		if (t_lo < 0)
 			t_lo = 0;
 		for (int i = 0; i < n_i; i++) {
-			const float *sc = scores + (size_t)(r * n_i + i) * span16;
-			float		*pr = probs + (size_t)(r * n_i + i) * pos_pad;
-			float		 mx = -INFINITY;
-			for (int t = t_lo; t < lim; t++) {
-				float v = sc[t] * scale;
-				if (v > mx)
-					mx = v;
-			}
-			double sum = 0.0;
-			for (int t = t_lo; t < lim; t++) {
-				float e = expf(sc[t] * scale - mx);
-				pr[t]	= e;
-				sum += e;
-			}
-			float inv = (float)(1.0 / sum);
-			for (int t = 0; t < lim; t++)
-				pr[t] = f16_bits_to_f32(f32_to_f16_bits(pr[t] * inv));
+			const float *sc	 = scores + (size_t)(r * n_i + i) * span16;
+			float		*pr	 = probs + (size_t)(r * n_i + i) * pos_pad;
+			float		 mx	 = softmax_scaled_max(sc, t_lo, lim, scale);
+			double		 sum = softmax_exp_sum(sc, pr, t_lo, lim, scale, mx);
+			softmax_round_f16(pr, lim, (float)(1.0 / sum));
 		}
 	}
 }
@@ -1834,7 +2786,13 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 									   const buffer *v_cache, buffer *out, int layer, int pos_start,
 									   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									   int flash_attn, float scale, int n_kv_heads_active, int m,
-									   int window) {
+									   int window);
+
+static status_code rkt_attention_batch_inner(backend *self, const buffer *q, const buffer *k_cache,
+											 const buffer *v_cache, buffer *out, int layer,
+											 int pos_start, int n_heads, int n_kv_heads,
+											 int head_dim, int n_ctx, int flash_attn, float scale,
+											 int n_kv_heads_active, int m, int window) {
 	(void)flash_attn;
 	(void)n_ctx;
 	(void)n_kv_heads;
@@ -1905,11 +2863,26 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 	if (s != OK) {
 		reset_queue(p);
 		if (!p->npu_failed) {
-			p->npu_failed = 1;
-			WARN("rocket: npu attention failed (status %d, errno=%d), npu disabled", s, errno);
+			npu_record_failure(p);
+			WARN("rocket: npu attention failed (status %d, errno=%d)", s, errno);
 		}
 	}
 	pthread_mutex_unlock(&p->lock);
+	return s;
+}
+
+static status_code rkt_attention_batch(backend *self, const buffer *q, const buffer *k_cache,
+									   const buffer *v_cache, buffer *out, int layer, int pos_start,
+									   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
+									   int flash_attn, float scale, int n_kv_heads_active, int m,
+									   int window) {
+	rkt_priv   *p  = self->priv;
+	double		t0 = p->prof && m == 1 ? w4_now_ms() : 0.0;
+	status_code s  = rkt_attention_batch_inner(self, q, k_cache, v_cache, out, layer, pos_start,
+											   n_heads, n_kv_heads, head_dim, n_ctx, flash_attn,
+											   scale, n_kv_heads_active, m, window);
+	if (p->prof && m == 1)
+		prof_add(p, PROF_ATTN, w4_now_ms() - t0);
 	return s;
 }
 
@@ -1967,6 +2940,12 @@ static void free_slots(rkt_priv *p) {
 		}
 	for (int c = 0; c < RKT_MAX_CORES; c++)
 		rkt_bo_destroy(&p->dev, &p->streams[c].bo);
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		rkt_bo_destroy(&p->dev, &p->w4_pf[c].in);
+		rkt_bo_destroy(&p->dev, &p->w4_pf[c].out);
+		rkt_bo_destroy(&p->dev, &p->w4_pf[c].reg);
+		free(p->w4_pf[c].n_ops);
+	}
 }
 
 static void rkt_free(backend *self) {
@@ -1978,18 +2957,20 @@ static void rkt_free(backend *self) {
 	if (p->fused_groups)
 		log_tag("RKT", "fused %d weights into %d larger job sets", p->fused_weights,
 				p->fused_groups);
+	if (p->w4_on)
+		log_tag("RKT", "quantized weights: %d w4, %d w8", p->wq_accepted[0], p->wq_accepted[1]);
 	free_slots(p);
 	rkt_act_cache_reset(p, &p->act);
 	rkt_device_close(&p->dev);
 	pthread_mutex_destroy(&p->lock);
 	free(p->weights);
 	free(p->x16);
-	free(p->x_tile);
 	free(p->x_chunk);
 	free(p->y_tmp);
 	free(p->attn_ws);
 	free(p->act_tmp);
-	free(p->arena);
+	if (p->prof)
+		prof_print(p);
 	free(p);
 	self->priv = NULL;
 }
@@ -1999,8 +2980,16 @@ static status_code rkt_init(backend *self, int device_index) {
 	rkt_priv *p = xcalloc(1, sizeof(*p));
 	p->max_k =
 		env_int("KAPPAI_ROCKET_MAX_K", RKT_MAX_K, RKT_K_ALIGN, RKT_MAX_K) & ~(RKT_K_ALIGN - 1);
-	p->poison	 = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
-	p->fuse		 = env_int("KAPPAI_ROCKET_FUSE", 1, 0, 1);
+	p->poison	  = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
+	p->fuse		  = env_int("KAPPAI_ROCKET_FUSE", 1, 0, 1);
+	p->w4_on	  = 1;
+	p->w4_group	  = 480;
+	p->w4_check	  = env_int("KAPPAI_ROCKET_W4_CHECK", 0, 0, 1);
+	p->w4_prefill = 1;
+	p->w4_prefill_tokens =
+		env_int("KAPPAI_ROCKET_W4_PREFILL_TOKENS", 16, 1, RKT_W4_PREFILL_TOKENS_MAX);
+	p->w8_on	 = env_int("KAPPAI_ROCKET_W8", 1, 0, 1);
+	p->prof		 = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
 	p->max_tasks = env_int("KAPPAI_ROCKET_CHAIN", 1, 0, 1) ? RKT_MAX_TASKS : 1;
 	pthread_mutex_init(&p->lock, NULL);
 	self->priv = p;
@@ -2012,8 +3001,11 @@ static status_code rkt_init(backend *self, int device_index) {
 		rkt_free(self);
 		return ERR_UNSUPPORTED;
 	}
-	log_tag("RKT", "%s: %d core(s), max_k=%d, poison=%d, tasks/job=%d", device_path(),
-			p->dev.n_cores, p->max_k, p->poison, p->max_tasks);
+	log_tag("RKT",
+			"%s: %d core(s), max_k=%d, poison=%d, tasks/job=%d, w4=%d w8=%d group=%d "
+			"prefill=%d prefill_tokens=%d",
+			device_path(), p->dev.n_cores, p->max_k, p->poison, p->max_tasks, p->w4_on, p->w8_on,
+			p->w4_group, p->w4_prefill, p->w4_prefill_tokens);
 	return OK;
 }
 
@@ -2027,29 +3019,29 @@ static status_code rkt_ctor(backend *out) {
 	out->init				 = rkt_init;
 	out->free				 = rkt_free;
 	out->buffer_alloc_weight = rkt_buffer_alloc_weight;
-	out->buffer_alloc_scratch = rkt_buffer_alloc_scratch;
-	out->buffer_free		  = rkt_buffer_free;
-	out->buffer_read_f32	  = rkt_buffer_read_f32;
-	out->buffer_write_f32	  = rkt_buffer_write_f32;
-	out->matmul				  = rkt_matmul;
-	out->matmul_batch		  = rkt_matmul_batch;
-	out->matmul_multi		  = rkt_matmul_multi;
-	out->matmul_multi_batch	  = rkt_matmul_multi_batch;
-	out->matmul_residual	  = rkt_matmul_residual;
-	out->ffn_activate		  = rkt_ffn_activate;
-	out->ffn_activate_ex	  = rkt_ffn_activate_ex;
-	out->ffn_activate_batch	  = rkt_ffn_activate_batch;
-	// BUG: Temporarily disabled: out->ffn_activate_fused_batch = rkt_ffn_activate_fused_batch;
-	out->matmul_ffn_down	   = rkt_matmul_ffn_down;
-	out->matmul_ffn_down_batch = rkt_matmul_ffn_down_batch;
-	out->attention			   = rkt_attention;
-	out->attention_batch	   = rkt_attention_batch_fn;
-	out->attention_swa		   = rkt_attention_swa;
-	out->attention_swa_batch   = rkt_attention_swa_batch;
-	out->kv_alloc			   = rkt_kv_alloc;
-	out->kv_free			   = rkt_kv_free;
-	out->kv_put				   = rkt_kv_put;
-	out->kv_put_batch		   = rkt_kv_put_batch;
+	out->buffer_alloc_scratch	  = rkt_buffer_alloc_scratch;
+	out->buffer_free			  = rkt_buffer_free;
+	out->buffer_read_f32		  = rkt_buffer_read_f32;
+	out->buffer_write_f32		  = rkt_buffer_write_f32;
+	out->matmul					  = rkt_matmul;
+	out->matmul_batch			  = rkt_matmul_batch;
+	out->matmul_multi			  = rkt_matmul_multi;
+	out->matmul_multi_batch		  = rkt_matmul_multi_batch;
+	out->matmul_residual		  = rkt_matmul_residual;
+	out->ffn_activate			  = rkt_ffn_activate;
+	out->ffn_activate_ex		  = rkt_ffn_activate_ex;
+	out->ffn_activate_batch		  = rkt_ffn_activate_batch;
+	out->ffn_activate_fused_batch = rkt_ffn_activate_fused_batch;
+	out->matmul_ffn_down		  = rkt_matmul_ffn_down;
+	out->matmul_ffn_down_batch	  = rkt_matmul_ffn_down_batch;
+	out->attention				  = rkt_attention;
+	out->attention_batch		  = rkt_attention_batch_fn;
+	out->attention_swa			  = rkt_attention_swa;
+	out->attention_swa_batch	  = rkt_attention_swa_batch;
+	out->kv_alloc				  = rkt_kv_alloc;
+	out->kv_free				  = rkt_kv_free;
+	out->kv_put					  = rkt_kv_put;
+	out->kv_put_batch			  = rkt_kv_put_batch;
 	return OK;
 }
 

@@ -125,3 +125,39 @@ int rkt_submit(rkt_device *dev, const uint32_t *regcmd_dma, const uint32_t *n_op
 	};
 	return ioctl(dev->fd[in->core], DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0 ? -errno : 0;
 }
+
+int rkt_submit_bos(rkt_device *dev, int core, const uint32_t *regcmd_dma, const uint32_t *n_ops,
+				   int n_tasks, const rkt_bo *const *in, int n_in, const rkt_bo *const *out,
+				   int n_out) {
+	if (n_tasks < 1 || n_tasks > RKT_MAX_TASKS || n_in > RKT_MAX_HANDLES || n_out > RKT_MAX_HANDLES)
+		return -EINVAL;
+
+	struct drm_rocket_task tasks[RKT_MAX_TASKS];
+	for (int i = 0; i < n_tasks; i++)
+		tasks[i] = (struct drm_rocket_task){
+			.regcmd		  = regcmd_dma[i],
+			.regcmd_count = n_ops[i],
+		};
+	uint32_t in_handles[RKT_MAX_HANDLES];
+	uint32_t out_handles[RKT_MAX_HANDLES];
+	for (int i = 0; i < n_in; i++)
+		in_handles[i] = in[i]->handle;
+	for (int i = 0; i < n_out; i++)
+		out_handles[i] = out[i]->handle;
+
+	struct drm_rocket_job job = {
+		.tasks				 = (uint64_t)(uintptr_t)tasks,
+		.in_bo_handles		 = (uint64_t)(uintptr_t)in_handles,
+		.out_bo_handles		 = (uint64_t)(uintptr_t)out_handles,
+		.task_count			 = (uint32_t)n_tasks,
+		.task_struct_size	 = sizeof(tasks[0]),
+		.in_bo_handle_count	 = (uint32_t)n_in,
+		.out_bo_handle_count = (uint32_t)n_out,
+	};
+	struct drm_rocket_submit submit = {
+		.jobs			 = (uint64_t)(uintptr_t)&job,
+		.job_count		 = 1,
+		.job_struct_size = sizeof(job),
+	};
+	return ioctl(dev->fd[core], DRM_IOCTL_ROCKET_SUBMIT, &submit) < 0 ? -errno : 0;
+}

@@ -142,13 +142,14 @@ int						model_has_sliding_layers(const model *m);
 
 recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads);
 
-uint32_t	ple_inject_caps(const backend *a);
-uint32_t	moe_shared_caps(const backend *a);
-uint32_t	mla_qkv_caps(const backend *a);
-uint32_t	gdn_caps(const backend *a);
-void		exec_plan_free(struct exec_plan *p);
-status_code exec_plan_build(model_recipe *r, const struct model *m);
-int			recipe_is_decode_batchable(const model *m);
+uint32_t	  ple_inject_caps(const backend *a);
+uint32_t	  moe_shared_caps(const backend *a);
+uint32_t	  mla_qkv_caps(const backend *a);
+const buffer *mla_host_weight(const weight_ref *w, size_t bytes, backend *host, buffer *view);
+uint32_t	  gdn_caps(const backend *a);
+void		  exec_plan_free(struct exec_plan *p);
+status_code	  exec_plan_build(model_recipe *r, const struct model *m);
+int			  recipe_is_decode_batchable(const model *m);
 
 const char *recipe_op_name(op_kind k);
 

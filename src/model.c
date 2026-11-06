@@ -673,6 +673,7 @@ static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t typ
 	int				   home_host = backend_has_cap(home, BCAP_IS_HOST);
 	gguf_tensor		  *owned	 = owned_tensor_for_ptr(m, host_ptr);
 	gguf_tensor_source source	 = {&m->gctx, owned};
+	desc.name					 = owned ? owned->name : NULL;
 	if (!home_host && owned && !owned->loaded && !weight_retains_host_copy(m, owned)) {
 		desc.read_fn  = gguf_tensor_read;
 		desc.read_ctx = &source;

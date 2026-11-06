@@ -1102,6 +1102,17 @@ status_code moe_shared_batch(exec_ctx *ctx) {
 	const buffer *down_w_buf = plan.down_w;
 	uint32_t	  down_wt	 = plan.down_type;
 
+	buffer gate_view, up_view, down_view;
+	if (backend_has_cap(a, BCAP_IS_HOST) && !plan.gate_up_fused) {
+		const layer_weights *L = &ctx->m->layers[ctx->li];
+		const weight_ref	*g = plan.is_moe ? &L->shexp_gate_w : &L->gate_w;
+		const weight_ref	*u = plan.is_moe ? &L->shexp_up_w : &L->up_w;
+		const weight_ref	*d = plan.is_moe ? &L->shexp_down_w : &L->down_w;
+		gate_w_buf = mla_host_weight(g, ggml_row_size(gate_wt, dim) * sh_inter, a, &gate_view);
+		up_w_buf   = mla_host_weight(u, ggml_row_size(up_wt, dim) * sh_inter, a, &up_view);
+		down_w_buf = mla_host_weight(d, ggml_row_size(down_wt, sh_inter) * dim, a, &down_view);
+	}
+
 	if (plan.gate_up_fused) {
 		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_GATE_UP,
 					   (size_t)ctx->rows.n_rows * 2 * sh_inter);
@@ -1216,6 +1227,7 @@ down_batch:
 		if (st != OK)
 			return st;
 	} else {
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_ACT, (size_t)ctx->rows.n_rows * dim);
 		batch_sync(ctx);
 		memcpy(batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b),
 			   batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b),
