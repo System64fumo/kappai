@@ -162,11 +162,14 @@ typedef struct {
 	size_t	per_layer_size;
 	int		n_kv_layers;
 	size_t *layer_off_elems;
+	size_t *layer_off_bytes;
 	size_t *layer_bytes;
 } vk_kv_store;
 
 typedef struct {
 	vk_kv_store store;
+	int			kv_quant;
+	size_t		kv_row_bytes;
 } vk_kv_handle;
 
 typedef struct {
@@ -2042,7 +2045,7 @@ static void vk_qcore_init(vk_priv *p) {
 		[VQ_Q5_0] = VQ_MM(q_matmul_q5_0, "q5_0"), [VQ_Q5_1] = VQ_MM(q_matmul_q5_1, "q5_1"),
 		[VQ_Q8_0] = VQ_MM(q_matmul_q8_0, "q8_0"), [VQ_IQ4_NL] = VQ_MM(q_matmul_iq4_nl, "iq4_nl"),
 	};
-	if (vk_create_pipeline(p, shader_attn_decode_spv, sizeof(shader_attn_decode_spv), 5, 40,
+	if (vk_create_pipeline(p, shader_attn_decode_spv, sizeof(shader_attn_decode_spv), 5, 48,
 						   &p->p_attn_decode) == OK)
 		p->p_attn_decode.name = "attn_decode";
 	if (vk_create_pipeline(p, shader_attn_merge_spv, sizeof(shader_attn_merge_spv), 2, 8,
@@ -2579,7 +2582,7 @@ static status_code vk_init(backend *self, int device_index) {
 		kquant_tile_k,
 	};
 
-	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 36, &p->p_kv_put);
+	s = vk_create_pipeline(p, shader_kv_put_spv, shader_kv_put_spv_len, 4, 44, &p->p_kv_put);
 	if (s != OK)
 		return s;
 	p->p_kv_put.name = "kv_put";
@@ -2657,7 +2660,7 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_gdn_heads.name = "gdn_heads";
-	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 36,
+	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 44,
 						   &p->p_kv_shift_gather);
 	if (s != OK)
 		return s;
@@ -3934,10 +3937,12 @@ static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
 
 static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_size,
 									 int n_kv_layers, const size_t *layer_bytes,
-									 size_t *layer_off_elems, vk_kv_store *out) {
+									 size_t *layer_off_elems, size_t *layer_off_bytes,
+									 vk_kv_store *out) {
 	memset(out, 0, sizeof(*out));
 	out->n_kv_layers	 = n_kv_layers > 0 ? n_kv_layers : 1;
 	out->layer_off_elems = NULL;
+	out->layer_off_bytes = NULL;
 	out->layer_bytes	 = NULL;
 	if (layer_bytes && n_kv_layers > 0) {
 		out->layer_bytes = xmalloc((size_t)n_kv_layers * sizeof(size_t));
@@ -3952,6 +3957,10 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 	if (layer_off_elems && n_kv_layers > 0) {
 		out->layer_off_elems = xmalloc((size_t)(n_kv_layers + 1) * sizeof(size_t));
 		memcpy(out->layer_off_elems, layer_off_elems, (size_t)(n_kv_layers + 1) * sizeof(size_t));
+	}
+	if (layer_off_bytes && n_kv_layers > 0) {
+		out->layer_off_bytes = xmalloc((size_t)(n_kv_layers + 1) * sizeof(size_t));
+		memcpy(out->layer_off_bytes, layer_off_bytes, (size_t)(n_kv_layers + 1) * sizeof(size_t));
 	}
 
 	size_t			   per_layer_for_checks = layer_bytes ? out->per_layer_size : per_layer_size;
@@ -4051,6 +4060,8 @@ static void vk_kv_store_free(vk_priv *p, vk_kv_store *store) {
 	store->layer_bytes = NULL;
 	free(store->layer_off_elems);
 	store->layer_off_elems = NULL;
+	free(store->layer_off_bytes);
+	store->layer_off_bytes = NULL;
 }
 
 static vk_buf *vk_kv_layer_buf(const vk_kv_handle *h, int layer, int *shader_layer_out) {
@@ -4082,6 +4093,20 @@ static size_t vk_kv_layer_off_elems(const vk_kv_handle *h, int layer) {
 	}
 	size_t per_layer_elems = s->per_layer_size / sizeof(uint16_t);
 	return (size_t)layer * per_layer_elems;
+}
+
+static size_t vk_kv_layer_off_bytes(const vk_kv_handle *h, int layer) {
+	if (layer < 0)
+		layer = 0;
+	vk_kv_store *s = (vk_kv_store *)&h->store;
+	if (s->chunked || s->n_kv_layers < 1)
+		return 0;
+	if (s->layer_off_bytes) {
+		if (layer > s->n_kv_layers)
+			layer = s->n_kv_layers;
+		return s->layer_off_bytes[layer];
+	}
+	return (size_t)layer * s->per_layer_size;
 }
 
 static size_t vk_device_local_heap_total(vk_priv *p) {
@@ -4142,46 +4167,85 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 
 	size_t *layer_bytes		  = NULL;
 	size_t *layer_off_elems	  = NULL;
+	size_t *layer_off_bytes	  = NULL;
 	size_t	per_layer_uniform = 0;
 	size_t	total;
+	size_t	max_row_bytes = 0;
+	int		kv_quant	  = desc->kv_quant;
 	if (has_layer_dims) {
-		layer_bytes		= xcalloc((size_t)n_kv_layers, sizeof(size_t));
-		layer_off_elems = xcalloc((size_t)n_kv_layers + 1, sizeof(size_t));
-		size_t acc		= 0;
+		layer_bytes		 = xcalloc((size_t)n_kv_layers, sizeof(size_t));
+		layer_off_elems	 = xcalloc((size_t)n_kv_layers + 1, sizeof(size_t));
+		layer_off_bytes	 = xcalloc((size_t)n_kv_layers + 1, sizeof(size_t));
+		size_t acc_elems = 0;
+		size_t acc_bytes = 0;
 		for (int i = 0; i < n_kv_layers; i++) {
 			size_t elems =
 				(size_t)desc->layer_n_kv_heads[i] * desc->n_ctx * (size_t)desc->layer_head_dim[i];
-			layer_bytes[i]	   = elems * sizeof(uint16_t);
-			layer_off_elems[i] = acc;
+			size_t row_bytes;
+			if (kv_quant == KV_QUANT_Q8_0) {
+				int n_blocks = (desc->layer_head_dim[i] + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+				row_bytes	 = (size_t)n_blocks * 34;
+			} else {
+				row_bytes = (size_t)desc->layer_head_dim[i] * sizeof(uint16_t);
+			}
+			layer_bytes[i]	   = (size_t)desc->layer_n_kv_heads[i] * desc->n_ctx * row_bytes;
+			layer_off_elems[i] = acc_elems;
+			layer_off_bytes[i] = acc_bytes;
+			if (row_bytes > max_row_bytes)
+				max_row_bytes = row_bytes;
 			if (elems > per_layer_uniform)
 				per_layer_uniform = elems;
-			acc += elems;
+			acc_elems += elems;
+			acc_bytes += layer_bytes[i];
 		}
-		layer_off_elems[n_kv_layers] = acc;
-		per_layer_uniform *= sizeof(uint16_t);
-		total = acc * sizeof(uint16_t);
+		layer_off_elems[n_kv_layers] = acc_elems;
+		layer_off_bytes[n_kv_layers] = acc_bytes;
+		if (kv_quant == KV_QUANT_Q8_0) {
+			per_layer_uniform = 0;
+			total			  = acc_bytes;
+		} else {
+			per_layer_uniform *= sizeof(uint16_t);
+			total = acc_elems * sizeof(uint16_t);
+		}
 	} else {
-		per_layer_uniform =
-			(size_t)desc->n_ctx * desc->n_kv_heads * desc->head_dim * sizeof(uint16_t);
-		total = per_layer_uniform * (size_t)n_kv_layers;
+		size_t row_bytes;
+		if (kv_quant == KV_QUANT_Q8_0) {
+			int n_blocks = (desc->head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+			row_bytes	 = (size_t)n_blocks * 34;
+		} else {
+			row_bytes = (size_t)desc->head_dim * sizeof(uint16_t);
+		}
+		per_layer_uniform = (size_t)desc->n_ctx * desc->n_kv_heads * row_bytes;
+		total			  = per_layer_uniform * (size_t)n_kv_layers;
+		max_row_bytes	  = row_bytes;
+		layer_off_elems	  = xcalloc((size_t)n_kv_layers + 1, sizeof(size_t));
+		layer_off_bytes	  = xcalloc((size_t)n_kv_layers + 1, sizeof(size_t));
+		for (int i = 0; i <= n_kv_layers; i++) {
+			layer_off_elems[i] =
+				(size_t)i * (size_t)desc->n_ctx * desc->n_kv_heads * desc->head_dim;
+			layer_off_bytes[i] = (size_t)i * per_layer_uniform;
+		}
 	}
 
 	vk_kv_handle *kh = xcalloc(1, sizeof(vk_kv_handle));
 	vk_kv_handle *vh = xcalloc(1, sizeof(vk_kv_handle));
 
 	status_code s = vk_kv_store_alloc(p, total, per_layer_uniform, n_kv_layers, layer_bytes,
-									  layer_off_elems, &kh->store);
+									  layer_off_elems, layer_off_bytes, &kh->store);
 	if (s != OK) {
 		free(layer_bytes);
 		free(layer_off_elems);
+		free(layer_off_bytes);
 		free(kh);
 		free(vh);
 		return s;
 	}
 
-	s = vk_kv_store_alloc(p, total, 0, n_kv_layers, layer_bytes, layer_off_elems, &vh->store);
+	s = vk_kv_store_alloc(p, total, 0, n_kv_layers, layer_bytes, layer_off_elems, layer_off_bytes,
+						  &vh->store);
 	free(layer_bytes);
 	free(layer_off_elems);
+	free(layer_off_bytes);
 	if (s != OK) {
 		vk_kv_store_free(p, &kh->store);
 		free(kh);
@@ -4194,6 +4258,12 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 			 "split into %d per-layer buffers",
 			 total, n_kv_layers);
 	}
+
+	kh->kv_quant = kv_quant;
+	kh->kv_row_bytes =
+		max_row_bytes > 0 ? max_row_bytes : (size_t)desc->head_dim * sizeof(uint16_t);
+	vh->kv_quant	 = kv_quant;
+	vh->kv_row_bytes = kh->kv_row_bytes;
 
 	k_out->handle	= kh;
 	k_out->size		= total;
@@ -4208,6 +4278,10 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	return OK;
 }
 
+static status_code vk_kv_export(backend *self, const buffer *k, const buffer *v, int layer,
+								int pos_start, int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								int n_kv_heads_active, void *k_dst, void *v_dst);
+
 static status_code vk_kv_put_impl(backend *self, buffer *k, buffer *v, int layer, int pos_start,
 								  const buffer *k_in, const buffer *v_in, int in_row_stride,
 								  int n_kv_heads, int head_dim, int n_ctx, int n_kv_heads_active,
@@ -4220,26 +4294,46 @@ static status_code vk_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
 	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
 
+	int	   kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+	size_t kv_row_bytes;
+	if (kv_q8)
+		kv_row_bytes = (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+	else
+		kv_row_bytes = (size_t)head_dim * sizeof(uint16_t);
+
 	struct {
 		uint32_t layer_off;
 		int32_t	 pos_start, n_kv_heads, head_dim, n_ctx, stride_head_dim;
 		int32_t	 in_row_stride, m_tokens, in_row0;
-	} push					 = {(uint32_t)vk_kv_layer_off_elems(kh, layer),
-								pos_start,
-								n_active,
-								head_dim,
-								n_ctx,
-								head_dim,
-								in_row_stride > 0 ? in_row_stride : n_active * head_dim,
-								m,
-								in_row0};
+		int32_t	 kv_q8;
+		int32_t	 kv_row_bytes;
+	} push = {
+		(uint32_t)(kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : vk_kv_layer_off_elems(kh, layer)),
+		pos_start,
+		n_active,
+		head_dim,
+		n_ctx,
+		head_dim,
+		in_row_stride > 0 ? in_row_stride : n_active * head_dim,
+		m,
+		in_row0,
+		kv_q8,
+		(int)kv_row_bytes};
 	vk_buf		*bufs[4]	 = {kb, vb, as_vkbuf(k_in), as_vkbuf(v_in)};
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
 	int			 total_pairs = n_active * (head_dim / 2);
-	uint64_t	 total		 = (uint64_t)total_pairs * (uint64_t)m;
-	uint32_t	 groups		 = (uint32_t)((total + 127) / 128);
-	return vk_dispatch_ex(p, &p->p_kv_put, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
-						  0x3);
+
+	static int dumped	= 0;
+	int		   n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+	uint64_t   total;
+	if (kv_q8)
+		total = (uint64_t)(n_active * n_blocks * 2) * (uint64_t)m;
+	else
+		total = (uint64_t)total_pairs * (uint64_t)m;
+	uint32_t	groups = (uint32_t)((total + 127) / 128);
+	status_code dr =
+		vk_dispatch_ex(p, &p->p_kv_put, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1, 0x3);
+	return dr;
 }
 
 static status_code vk_kv_put(backend *self, buffer *k, buffer *v, int layer, int pos,
@@ -4270,13 +4364,14 @@ static vk_kv_range vk_kv_range_get(const buffer *k, const buffer *v, int layer, 
 								   int n_rows, int head_dim, int n_ctx, int n_active) {
 	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
+	size_t				row_bytes =
+		kh->kv_row_bytes > 0 ? kh->kv_row_bytes : (size_t)head_dim * sizeof(uint16_t);
 	return (vk_kv_range){
 		.kb			 = vk_kv_layer_buf(kh, layer, NULL),
 		.vb			 = vk_kv_layer_buf(vh, layer, NULL),
-		.first_off	 = (vk_kv_layer_off_elems(kh, layer) + (size_t)pos_start * (size_t)head_dim) *
-					   sizeof(uint16_t),
-		.head_stride = (size_t)n_ctx * (size_t)head_dim * sizeof(uint16_t),
-		.head_bytes	 = (size_t)n_rows * (size_t)head_dim * sizeof(uint16_t),
+		.first_off	 = vk_kv_layer_off_bytes(kh, layer) + (size_t)pos_start * row_bytes,
+		.head_stride = (size_t)n_ctx * row_bytes,
+		.head_bytes	 = (size_t)n_rows * row_bytes,
 		.n_heads	 = n_active,
 	};
 }
@@ -4437,18 +4532,29 @@ static status_code vk_kv_shift(backend *self, buffer *k, buffer *v, int layer,
 								   as_vkbuf(&sin_b)};
 	int					row0	= 0;
 	for (int i = 0; i < n_chunks && s == OK; i++) {
+		int kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+		int kv_row_bytes;
+		if (kv_q8)
+			kv_row_bytes = ((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+		else
+			kv_row_bytes = head_dim * (int)sizeof(uint16_t);
 		struct {
 			uint32_t layer_off;
 			int32_t	 src_pos, n_kv_heads, head_dim, n_ctx, neox, tmp_row0, tbl_off, m_rows;
-		} push			= {(uint32_t)vk_kv_layer_off_elems(kh, layer),
-						   chunks[i].src_pos,
-						   n_active,
-						   head_dim,
-						   n_ctx,
-						   self->rope_neox ? 1 : 0,
-						   row0,
-						   i * half,
-						   chunks[i].n_rows};
+			int32_t	 kv_q8;
+			int32_t	 kv_row_bytes;
+		} push = {
+			(uint32_t)(kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : vk_kv_layer_off_elems(kh, layer)),
+			chunks[i].src_pos,
+			n_active,
+			head_dim,
+			n_ctx,
+			self->rope_neox ? 1 : 0,
+			row0,
+			i * half,
+			chunks[i].n_rows,
+			kv_q8,
+			kv_row_bytes};
 		uint64_t total	= (uint64_t)n_active * (uint64_t)half * (uint64_t)chunks[i].n_rows;
 		uint32_t groups = (uint32_t)((total + 127) / 128);
 		s = vk_dispatch_ex(p, &p->p_kv_shift_gather, bufs, NULL, NULL, 6, &push, sizeof(push),
@@ -5471,18 +5577,18 @@ static status_code vk_ensure_attn_flash(vk_priv *p, int kind, int head_dim, int 
 static status_code vk_ensure_flash_pipeline(vk_priv *p, int head_dim, int n_groups,
 											vk_pipeline_set **out) {
 	return vk_ensure_attn_flash(p, VK_ATTN_FLASH, head_dim, n_groups, shader_attention_flash_spv,
-								shader_attention_flash_spv_len, 4, 36, "attention_flash", out);
+								shader_attention_flash_spv_len, 4, 44, "attention_flash", out);
 }
 
 static status_code vk_ensure_attention_pipeline(vk_priv *p, int head_dim, vk_pipeline_set **out) {
 	return vk_ensure_attn_spec(p, VK_ATTN_PLAIN, head_dim, 1, shader_attention_spv,
-							   shader_attention_spv_len, 5, 36, "attention", out);
+							   shader_attention_spv_len, 5, 44, "attention", out);
 }
 
 static status_code vk_attention_decode(backend *self, const buffer *q, vk_buf *kb, vk_buf *vb,
 									   size_t layer_off, buffer *out, int pos_start, int n_heads,
 									   int n_kv_heads, int head_dim, int n_ctx, float scale,
-									   int window, int m) {
+									   int window, int m, int kv_q8, int kv_row_bytes) {
 	vk_priv *p		  = self->priv;
 	int		 start	  = window > 0 ? MAX(0, pos_start + 1 - window) : 0;
 	int		 n_pos	  = MAX(pos_start + m - start, 1);
@@ -5502,6 +5608,8 @@ static status_code vk_attention_decode(backend *self, const buffer *q, vk_buf *k
 		int32_t	 pos, n_heads, n_kv_heads, head_dim, n_ctx;
 		float	 scale;
 		int32_t	 window, chunk, n_splits;
+		int32_t	 kv_q8;
+		int32_t	 kv_row_bytes;
 	} push				 = {(uint32_t)layer_off,
 							pos_start,
 							n_heads,
@@ -5511,7 +5619,9 @@ static status_code vk_attention_decode(backend *self, const buffer *q, vk_buf *k
 							scale,
 							window,
 							chunk,
-							n_splits};
+							n_splits,
+							kv_q8,
+							kv_row_bytes};
 	vk_buf		*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_part_buf), as_vkbuf(out)};
 	VkDeviceSize offs[5] = {q->offset, 0, 0, p->attn_part_buf.offset, out->offset};
 	vk_buf		*pb		 = as_vkbuf(&p->attn_part_buf);
@@ -5541,10 +5651,11 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 
 	const vk_kv_handle *kh = (const vk_kv_handle *)k_cache->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v_cache->handle;
-	int					shader_layer_k;
-	int					shader_layer_v;
-	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
-	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
+
+	int		shader_layer_k;
+	int		shader_layer_v;
+	vk_buf *kb = vk_kv_layer_buf(kh, layer, &shader_layer_k);
+	vk_buf *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
 
 	if (p->debug.diag) {
 		static int seen[512];
@@ -5584,51 +5695,107 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 
 	n_kv_heads = n_active;
 
+	int	   kv_q8_flash = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+	size_t layer_off_flash =
+		kv_q8_flash ? vk_kv_layer_off_bytes(kh, layer) : (size_t)vk_kv_layer_off_elems(kh, layer);
+
 	if (head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 && p->p_attn_decode.pipeline &&
-		p->p_attn_merge.pipeline)
-		return vk_attention_decode(self, q, kb, vb, vk_kv_layer_off_elems(kh, layer), out, pos,
-								   n_heads, n_kv_heads, head_dim, n_ctx, scale, sliding_window, 1);
+		p->p_attn_merge.pipeline) {
+		int	   kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+		size_t layer_off =
+			kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : vk_kv_layer_off_elems(kh, layer);
+		int kv_row_bytes;
+		if (kv_q8)
+			kv_row_bytes = ((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+		else
+			kv_row_bytes = head_dim * (int)sizeof(uint16_t);
+		return vk_attention_decode(self, q, kb, vb, layer_off, out, pos, n_heads, n_kv_heads,
+								   head_dim, n_ctx, scale, sliding_window, 1, kv_q8, kv_row_bytes);
+	}
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
 	int can_flash = flash_attn && vk_ensure_flash_pipeline(p, head_dim, n_groups, &flash_ps) == OK;
 
-	size_t layer_off = vk_kv_layer_off_elems(kh, layer);
-
 	if (can_flash) {
+		int	   kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+		size_t kv_row_bytes;
+		if (kv_q8)
+			kv_row_bytes = (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+		else
+			kv_row_bytes = (size_t)head_dim * sizeof(uint16_t);
 		struct {
 			uint32_t layer_off;
 			int32_t	 pos, n_heads, n_kv_heads, head_dim, n_ctx;
 			float	 scale;
 			int32_t	 stride_head_dim;
 			int32_t	 attn_start;
-		} push = {(uint32_t)layer_off, pos, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-				  attn_start};
+			int32_t	 kv_q8;
+			int32_t	 kv_row_bytes;
+		} push = {(uint32_t)(kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : layer_off_flash),
+				  pos,
+				  n_heads,
+				  n_kv_heads,
+				  head_dim,
+				  n_ctx,
+				  scale,
+				  head_dim,
+				  attn_start,
+				  kv_q8,
+				  (int)kv_row_bytes};
 		uint32_t	 groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf		*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		VkDeviceSize offs[4] = {q->offset, 0, 0, out->offset};
-		return vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
+		status_code _fds = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
 							  1u << 3);
+		if (_fds == OK) {
+			static int _dbg_flash = 0;
+			if (!_dbg_flash) {
+				_dbg_flash = 1;
+				float v = 0.0f;
+				vk_buf_download_raw(self, as_vkbuf(out), out->offset, &v, sizeof(float));
+				fprintf(stderr, "FLASH debug: out0=%.6f kv_q8=%d layer_off=%zu\\n", (double)v, kv_q8, layer_off_flash);
+			}
+		}
+		return _fds;
 	}
 
 	status_code s = vk_ensure_scores_buf(self, n_heads, n_ctx);
 	if (s != OK)
 		return s;
+	int	   kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+	size_t kv_row_bytes;
+	if (kv_q8)
+		kv_row_bytes = (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+	else
+		kv_row_bytes = (size_t)head_dim * sizeof(uint16_t);
 	struct {
 		uint32_t layer_off;
 		int32_t	 pos, n_heads, n_kv_heads, head_dim, n_ctx;
 		float	 scale;
 		int32_t	 stride_head_dim;
 		int32_t	 attn_start;
-	} push = {(uint32_t)layer_off, pos, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-			  attn_start};
+		int32_t	 kv_q8;
+		int32_t	 kv_row_bytes;
+	} push = {(uint32_t)(kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : layer_off_flash),
+			  pos,
+			  n_heads,
+			  n_kv_heads,
+			  head_dim,
+			  n_ctx,
+			  scale,
+			  head_dim,
+			  attn_start,
+			  kv_q8,
+			  (int)kv_row_bytes};
 	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
 	vk_pipeline_set *ps		 = NULL;
 	if (vk_ensure_attention_pipeline(p, head_dim, &ps) != OK)
 		return ERR_UNSUPPORTED;
 	VkDeviceSize offs[5] = {q->offset, 0, 0, 0, out->offset};
-	return vk_dispatch_ex(p, ps, bufs, offs, NULL, 5, &push, sizeof(push), (uint32_t)n_heads, 1,
-						  0x18);
+	status_code	 _ds =
+		vk_dispatch_ex(p, ps, bufs, offs, NULL, 5, &push, sizeof(push), (uint32_t)n_heads, 1, 0x18);
+	return _ds;
 }
 
 static status_code vk_attention(backend *self, const buffer *q, const buffer *k_cache,
@@ -7288,13 +7455,13 @@ static status_code vk_ensure_flash_pipeline_batch(vk_priv *p, int head_dim, int 
 												  vk_pipeline_set **out) {
 	return vk_ensure_attn_flash(
 		p, VK_ATTN_FLASH_BATCH, head_dim, n_groups, shader_attention_flash_batch_spv,
-		shader_attention_flash_batch_spv_len, 4, 40, "attention_flash_batch", out);
+		shader_attention_flash_batch_spv_len, 4, 48, "attention_flash_batch", out);
 }
 
 static status_code vk_ensure_attention_pipeline_batch(vk_priv *p, int head_dim,
 													  vk_pipeline_set **out) {
 	return vk_ensure_attn_spec(p, VK_ATTN_PLAIN_BATCH, head_dim, 1, shader_attention_batch_spv,
-							   shader_attention_batch_spv_len, 5, 40, "attention_batch", out);
+							   shader_attention_batch_spv_len, 5, 52, "attention_batch", out);
 }
 
 static status_code vk_attention_batch_impl(backend *self, const buffer *q, const buffer *k_cache,
@@ -7318,18 +7485,26 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 	vk_buf			   *kb = vk_kv_layer_buf(kh, layer, NULL);
 	vk_buf			   *vb = vk_kv_layer_buf(vh, layer, NULL);
 
+	int	   kv_q8 = kh->kv_quant == KV_QUANT_Q8_0 ? 1 : 0;
+	size_t layer_off =
+		kv_q8 ? vk_kv_layer_off_bytes(kh, layer) : (size_t)vk_kv_layer_off_elems(kh, layer);
+	size_t kv_row_bytes;
+	if (kv_q8)
+		kv_row_bytes = (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34;
+	else
+		kv_row_bytes = (size_t)head_dim * sizeof(uint16_t);
+
 	if (m <= VK_ATTN_DEC_MAX_M && head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 &&
-		p->p_attn_decode.pipeline && p->p_attn_merge.pipeline)
-		return vk_attention_decode(self, q, kb, vb, vk_kv_layer_off_elems(kh, layer), out,
-								   pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale,
-								   sliding_window, m);
+		p->p_attn_decode.pipeline && p->p_attn_merge.pipeline) {
+		return vk_attention_decode(self, q, kb, vb, layer_off, out, pos_start, n_heads, n_kv_heads,
+								   head_dim, n_ctx, scale, sliding_window, m, kv_q8,
+								   (int)kv_row_bytes);
+	}
 
 	int				 n_groups = n_heads / n_kv_heads;
 	vk_pipeline_set *flash_ps = NULL;
 	int can_flash = flash_attn && VK_ATTN_FLASH_BATCH_ENABLED &&
 					vk_ensure_flash_pipeline_batch(p, head_dim, n_groups, &flash_ps) == OK;
-
-	size_t layer_off = vk_kv_layer_off_elems(kh, layer);
 
 	if (can_flash) {
 		struct {
@@ -7338,10 +7513,21 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 			float	 scale;
 			int32_t	 stride_head_dim;
 			int32_t	 attn_start;
+			int32_t	 kv_q8;
+			int32_t	 kv_row_bytes;
 			int32_t	 m;
-		} push = {
-			(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-			attn_start,			 m};
+		} push				  = {(uint32_t)layer_off,
+								 pos_start,
+								 n_heads,
+								 n_kv_heads,
+								 head_dim,
+								 n_ctx,
+								 scale,
+								 head_dim,
+								 attn_start,
+								 kv_q8,
+								 (int)kv_row_bytes,
+								 m};
 		uint32_t	 groups_x = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf		*bufs[4]  = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		VkDeviceSize offs[4]  = {q->offset, 0, 0, out->offset};
@@ -7358,9 +7544,21 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 		float	 scale;
 		int32_t	 stride_head_dim;
 		int32_t	 attn_start;
+		int32_t	 kv_q8;
+		int32_t	 kv_row_bytes;
 		int32_t	 m;
-	} push = {(uint32_t)layer_off, pos_start, n_heads, n_kv_heads, head_dim, n_ctx, scale, head_dim,
-			  attn_start,		   m};
+	} push					 = {(uint32_t)layer_off,
+								pos_start,
+								n_heads,
+								n_kv_heads,
+								head_dim,
+								n_ctx,
+								scale,
+								head_dim,
+								attn_start,
+								kv_q8,
+								(int)kv_row_bytes,
+								m};
 	vk_buf			*bufs[5] = {as_vkbuf(q), kb, vb, as_vkbuf(&p->attn_scores_buf), as_vkbuf(out)};
 	VkDeviceSize	 offs[5] = {q->offset, 0, 0, 0, out->offset};
 	vk_pipeline_set *ps		 = NULL;
@@ -7866,7 +8064,7 @@ static status_code vk_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int k
 	size_t		  total		  = layer_bytes * (size_t)(n_layers > 0 ? n_layers : 1);
 	vk_kv_handle *kh		  = xcalloc(1, sizeof(vk_kv_handle));
 	status_code	  s = vk_kv_store_alloc(p, total, layer_bytes, n_layers > 0 ? n_layers : 1, NULL,
-										NULL, &kh->store);
+										NULL, NULL, &kh->store);
 	if (s != OK) {
 		ERROR("vk: kv_alloc_mla: failed to allocate %d MLA layer buffers of %zu bytes", n_layers,
 			  layer_bytes);
@@ -8094,9 +8292,10 @@ static status_code vk_ctor(backend *out) {
 	memset(out, 0, sizeof(*out));
 	out->name	  = "vulkan";
 	out->priority = 100;
-	out->caps = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
-				BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT | BCAP_KV_SHIFT | BCAP_QK_NORM_ROPE;
-	out->probe							 = vk_probe;
+	out->caps  = BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL | BCAP_MULTI_MATMUL | BCAP_RMSNORM_ADD |
+				 BCAP_MATMUL_FFN_DOWN | BCAP_MOE_EXPERT_RESIDENT | BCAP_KV_SHIFT |
+				 BCAP_QK_NORM_ROPE | BCAP_KV_QUANT_Q8_0;
+	out->probe = vk_probe;
 	out->device_count					 = vk_device_count;
 	out->device_identity				 = vk_device_identity;
 	out->init							 = vk_init;

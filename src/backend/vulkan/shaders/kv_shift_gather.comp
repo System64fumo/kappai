@@ -30,13 +30,29 @@ layout(push_constant) uniform Params {
 	int	 tmp_row0;
 	int	 tbl_off;
 	int	 m_rows;
+	int	 kv_q8;
+	int	 kv_row_bytes;
 }
 params;
 
-float load_elem(bool is_v, uint idx) {
-	uint w = is_v ? vcache[idx >> 1u] : kcache[idx >> 1u];
-	uint h = ((idx & 1u) != 0u) ? (w >> 16u) : (w & 0xFFFFu);
-	return unpackHalf2x16(h).x;
+float load_elem(bool is_v, uint base, int elem) {
+	if (params.kv_q8 == 0) {
+		uint idx = base + uint(elem);
+		uint w	 = is_v ? vcache[idx >> 1u] : kcache[idx >> 1u];
+		uint h	 = ((idx & 1u) != 0u) ? (w >> 16u) : (w & 0xFFFFu);
+		return unpackHalf2x16(h).x;
+	}
+	uint  row_byte = base;
+	int	  b		   = elem / 32;
+	int	  o		   = elem % 32;
+	uint  soff	   = row_byte + uint(b) * 34u;
+	uint  w		   = is_v ? vcache[soff >> 2u] : kcache[soff >> 2u];
+	float scale	   = unpackHalf2x16((w >> ((soff & 2u) << 3u)) & 0xFFFFu).x;
+	uint  wb = is_v ? vcache[(soff + 2u + uint(o)) >> 2u] : kcache[(soff + 2u + uint(o)) >> 2u];
+	int	  q	 = int((wb >> (((soff + 2u + uint(o)) & 3u) << 3u)) & 0xFFu);
+	if (q > 127)
+		q -= 256;
+	return scale * float(q);
 }
 
 void main() {
@@ -52,18 +68,25 @@ void main() {
 	int kvh = rem / half_dim;
 	int j	= rem - kvh * half_dim;
 
-	uint row_base = params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(head_dim) +
-					uint(params.src_pos + row) * uint(head_dim);
-	int	 out_base = (params.tmp_row0 + row) * params.n_kv_heads * head_dim + kvh * head_dim;
+	uint row_base;
+	if (params.kv_q8 == 0) {
+		row_base = params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(head_dim) +
+				   uint(params.src_pos + row) * uint(head_dim);
+	} else {
+		row_base = params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(params.kv_row_bytes) +
+				   uint(params.src_pos + row) * uint(params.kv_row_bytes);
+	}
+
+	int out_base = (params.tmp_row0 + row) * params.n_kv_heads * head_dim + kvh * head_dim;
 
 	int v0					= 2 * j;
-	vtmp[out_base + v0]		= load_elem(true, row_base + uint(v0));
-	vtmp[out_base + v0 + 1] = load_elem(true, row_base + uint(v0) + 1u);
+	vtmp[out_base + v0]		= load_elem(true, row_base, v0);
+	vtmp[out_base + v0 + 1] = load_elem(true, row_base, v0 + 1);
 
 	int	  i0			= (params.neox != 0) ? j : 2 * j;
 	int	  i1			= (params.neox != 0) ? j + half_dim : 2 * j + 1;
-	float a				= load_elem(false, row_base + uint(i0));
-	float b				= load_elem(false, row_base + uint(i1));
+	float a				= load_elem(false, row_base, i0);
+	float b				= load_elem(false, row_base, i1);
 	float c				= rcos[params.tbl_off + j];
 	float s				= rsin[params.tbl_off + j];
 	ktmp[out_base + i0] = a * c - b * s;
