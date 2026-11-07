@@ -1,6 +1,7 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "log.h"
+#include <stdatomic.h>
 #include "profile.h"
 #include "recipe.h"
 #include "shaders_embedded.h"
@@ -5659,15 +5660,17 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 
 	if (p->debug.diag) {
 		static int seen[512];
-		static int n_seen  = 0;
-		int		   already = 0;
-		for (int i = 0; i < n_seen; i++)
+		static _Atomic int n_seen = 0;
+		int			   already  = 0;
+		int			   cur_seen  = atomic_load(&n_seen);
+		for (int i = 0; i < cur_seen; i++)
 			if (seen[i] == layer) {
 				already = 1;
 				break;
 			}
-		if (!already && n_seen < 512) {
-			seen[n_seen++] = layer;
+		if (!already && cur_seen < 512) {
+			seen[cur_seen] = layer;
+			atomic_store(&n_seen, cur_seen + 1);
 			fprintf(stderr, "[VK_DIAG] %s path: %s\n", diag_label,
 					(kb->mapped && vb->mapped) ? "cpu_mapped" : "device");
 			if (sliding_window > 0) {

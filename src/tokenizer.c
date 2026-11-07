@@ -1,6 +1,8 @@
 #include "tokenizer.h"
 #include "log.h"
 #include <ctype.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #define TOK_CHUNK_CACHE_SLOTS (1u << 14)
 #define TOK_CHUNK_CACHE_MAX_ENTRIES 4096
@@ -81,10 +83,10 @@ static uint8_t	g_is_digit_tab[256];
 static uint8_t	g_is_space_tab[256];
 static uint8_t	g_is_newline_tab[256];
 static uint8_t	g_utf8_len_tab[256];
-static int		g_tables_ready = 0;
+static _Atomic int g_tables_ready = 0;
 
-static void tokenizer_tables_ensure(void) {
-	if (g_tables_ready)
+static void tokenizer_tables_ensure_impl(void) {
+	if (atomic_load(&g_tables_ready))
 		return;
 	for (int i = 0; i < 256; i++) {
 		unsigned char c = (unsigned char)i;
@@ -98,7 +100,13 @@ static void tokenizer_tables_ensure(void) {
 		g_is_newline_tab[i] = (uint8_t)(c == '\n' || c == '\r');
 		g_utf8_len_tab[i]	= (uint8_t)(c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1);
 	}
-	g_tables_ready = 1;
+	atomic_store(&g_tables_ready, 1);
+}
+
+static pthread_once_t g_tables_once = PTHREAD_ONCE_INIT;
+
+static void tokenizer_tables_ensure(void) {
+	pthread_once(&g_tables_once, tokenizer_tables_ensure_impl);
 }
 
 static int cp_to_utf8(int cp, char *out) {
@@ -156,10 +164,10 @@ static char	   g_byte_utf8[256][4];
 static uint8_t g_byte_utf8_len[256];
 static uint8_t g_byte_encode_passthrough[256];
 static uint8_t g_byte_decode_passthrough[256];
-static int	   g_byte_utf8_ready = 0;
+static _Atomic int g_byte_utf8_ready = 0;
 
-static void gpt2_byte_table_ensure(void) {
-	if (g_byte_utf8_ready)
+static void gpt2_byte_table_ensure_impl(void) {
+	if (atomic_load(&g_byte_utf8_ready))
 		return;
 	for (int i = 0; i < 256; i++) {
 		g_byte_utf8_len[i] = (uint8_t)cp_to_utf8(g_byte_to_cp[i], g_byte_utf8[i]);
@@ -169,7 +177,13 @@ static void gpt2_byte_table_ensure(void) {
 	}
 	for (int i = 0; i < 256; i++)
 		g_byte_decode_passthrough[i] = (uint8_t)(i < 0x80 && g_cp_to_byte[i] == i);
-	g_byte_utf8_ready = 1;
+	atomic_store(&g_byte_utf8_ready, 1);
+}
+
+static pthread_once_t g_byte_utf8_once = PTHREAD_ONCE_INIT;
+
+static void gpt2_byte_table_ensure(void) {
+	pthread_once(&g_byte_utf8_once, gpt2_byte_table_ensure_impl);
 }
 
 static const char *gpt2_encode_bytes(tokenizer *t, const char *in, size_t in_len, size_t *out_len) {
