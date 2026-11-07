@@ -7,6 +7,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,8 +41,9 @@ static const struct {
 	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
 };
 
-static config g_cfg;
-static int	  g_cfg_initialized = 0;
+static config		   g_cfg;
+static int			   g_cfg_initialized = 0;
+static pthread_mutex_t g_cfg_mtx		 = PTHREAD_MUTEX_INITIALIZER;
 
 config config_defaults(void) {
 	config c;
@@ -59,8 +61,10 @@ config config_defaults(void) {
 }
 
 void config_init(const config *cfg) {
+	pthread_mutex_lock(&g_cfg_mtx);
 	g_cfg			  = cfg ? *cfg : config_defaults();
 	g_cfg_initialized = 1;
+	pthread_mutex_unlock(&g_cfg_mtx);
 
 	if (g_cfg.debug) {
 		log_set_level(LOG_DEBUG);
@@ -68,10 +72,12 @@ void config_init(const config *cfg) {
 }
 
 const config *config_get(void) {
+	pthread_mutex_lock(&g_cfg_mtx);
 	if (!g_cfg_initialized) {
 		g_cfg			  = config_defaults();
 		g_cfg_initialized = 1;
 	}
+	pthread_mutex_unlock(&g_cfg_mtx);
 	return &g_cfg;
 }
 

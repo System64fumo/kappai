@@ -87,7 +87,7 @@ static void monitor_emit(monitor *mon, const char *json_fmt, ...) {
 	monitor_poll(mon);
 }
 
-monitor *g_monitor = NULL;
+_Atomic(monitor *) g_monitor = NULL;
 
 static _Atomic int	g_monitors_listening;
 static _Atomic long g_moe_emit_count;

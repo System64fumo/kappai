@@ -41,7 +41,9 @@ log_config log_default_config(void) {
 void log_init(log_config cfg) {
 	if (!cfg.stream)
 		cfg.stream = stderr;
+	pthread_mutex_lock(&g_log_mtx);
 	g_log = cfg;
+	pthread_mutex_unlock(&g_log_mtx);
 }
 
 log_level log_get_level(void) {
@@ -49,7 +51,9 @@ log_level log_get_level(void) {
 }
 
 void log_set_level(log_level level) {
+	pthread_mutex_lock(&g_log_mtx);
 	g_log.level = level;
+	pthread_mutex_unlock(&g_log_mtx);
 }
 
 static void log_line_locked(FILE *out, const char *color, const char *tag, const char *fmt,

@@ -289,5 +289,6 @@ void gl_context_free(gl_context *ctx) {
 		gbm_device_destroy(ctx->gbm);
 	if (ctx->drm_fd >= 0)
 		close(ctx->drm_fd);
+	eglReleaseThread();
 	memset(ctx, 0, sizeof(*ctx));
 }

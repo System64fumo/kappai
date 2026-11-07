@@ -330,8 +330,11 @@ jinja_value *jinja_float(double n) {
 		if (!isfinite(n) || strtod(v->as.floating.text, NULL) == n)
 			break;
 	}
-	if (isfinite(n) && !strchr(v->as.floating.text, '.') && !strchr(v->as.floating.text, 'e'))
-		strcat(v->as.floating.text, ".0");
+	if (isfinite(n) && !strchr(v->as.floating.text, '.') && !strchr(v->as.floating.text, 'e')) {
+		size_t _len = strlen(v->as.floating.text);
+		if (_len + 2 < sizeof(v->as.floating.text))
+			strcpy(v->as.floating.text + _len, ".0");
+	}
 	arena_track(v);
 	return v;
 }
@@ -903,9 +906,9 @@ static expr_node *parse_primary(parser *p) {
 				break;
 			}
 			padvance(p);
-			expr_node *val = parse_expr(p);
-			n->dict_keys = xrealloc(n->dict_keys, (n->n_dict + 1) * sizeof(expr_node *));
-			n->dict_vals = xrealloc(n->dict_vals, (n->n_dict + 1) * sizeof(expr_node *));
+			expr_node *val			= parse_expr(p);
+			n->dict_keys			= xrealloc(n->dict_keys, (n->n_dict + 1) * sizeof(expr_node *));
+			n->dict_vals			= xrealloc(n->dict_vals, (n->n_dict + 1) * sizeof(expr_node *));
 			n->dict_keys[n->n_dict] = key;
 			n->dict_vals[n->n_dict] = val;
 			n->n_dict++;
@@ -2420,7 +2423,7 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 		jinja_value *out = jinja_dict();
 		for (size_t i = 0; i < e->n_dict; i++) {
 			jinja_value *key = eval_expr(ctx, e->dict_keys[i]);
-			const char *ks = (key && key->type == JV_STRING) ? key->as.s : NULL;
+			const char	*ks	 = (key && key->type == JV_STRING) ? key->as.s : NULL;
 			jinja_value *val = eval_expr(ctx, e->dict_vals[i]);
 			if (ks)
 				jinja_dict_set(out, ks, val);

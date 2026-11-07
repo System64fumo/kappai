@@ -289,7 +289,7 @@ status_code context_init(context *c, const config *cfg) {
 		cfg->monitor ? (cfg->monitor[0] ? cfg->monitor : "/tmp/kappai.monitor") : NULL;
 	if (mon_path) {
 		monitor_init(&c->monitor, mon_path);
-		g_monitor = &c->monitor;
+		atomic_store(&g_monitor, &c->monitor);
 	} else
 		monitor_reset(&c->monitor);
 
@@ -498,7 +498,7 @@ fail_model:
 fail_backend:
 	context_destroy_extra_backends(c);
 	monitor_free(&c->monitor);
-	g_monitor = NULL;
+	atomic_store(&g_monitor, NULL);
 	context_release_backend(c);
 	return s;
 }
@@ -508,7 +508,7 @@ void context_free(context *c) {
 		return;
 	context_idle_prefill_wait(c);
 	monitor_free(&c->monitor);
-	g_monitor = NULL;
+	atomic_store(&g_monitor, NULL);
 	sampler_free(&c->samp);
 	compute_scratch_free(&c->scratch);
 	kvcache_free(&c->kv);
