@@ -3938,7 +3938,7 @@ static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
 static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_size,
 									 int n_kv_layers, const size_t *layer_bytes,
 									 size_t *layer_off_elems, size_t *layer_off_bytes,
-									 vk_kv_store *out) {
+									 int host_visible, vk_kv_store *out) {
 	memset(out, 0, sizeof(*out));
 	out->n_kv_layers	 = n_kv_layers > 0 ? n_kv_layers : 1;
 	out->layer_off_elems = NULL;
@@ -3968,7 +3968,8 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 											  VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
 											  VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
-	VkMemoryPropertyFlags kv_preferred = vk_resident_flags(p);
+	VkMemoryPropertyFlags kv_preferred =
+		host_visible ? vk_host_visible_flags(p) : vk_resident_flags(p);
 	VkMemoryPropertyFlags kv_fallback =
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
@@ -4161,7 +4162,6 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	vk_priv *p		   = self->priv;
 	p->n_ctx_stored	   = desc->n_ctx;
 	p->kv_head_dim_max = desc->head_dim;
-
 	int n_kv_layers	   = desc->n_kv_layers > 0 ? desc->n_kv_layers : 1;
 	int has_layer_dims = desc->layer_head_dim && desc->layer_n_kv_heads && n_kv_layers > 0;
 
@@ -4230,8 +4230,9 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	vk_kv_handle *kh = xcalloc(1, sizeof(vk_kv_handle));
 	vk_kv_handle *vh = xcalloc(1, sizeof(vk_kv_handle));
 
-	status_code s = vk_kv_store_alloc(p, total, per_layer_uniform, n_kv_layers, layer_bytes,
-									  layer_off_elems, layer_off_bytes, &kh->store);
+	status_code s =
+		vk_kv_store_alloc(p, total, per_layer_uniform, n_kv_layers, layer_bytes, layer_off_elems,
+						  layer_off_bytes, desc->host_visible, &kh->store);
 	if (s != OK) {
 		free(layer_bytes);
 		free(layer_off_elems);
@@ -4242,7 +4243,7 @@ static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out
 	}
 
 	s = vk_kv_store_alloc(p, total, 0, n_kv_layers, layer_bytes, layer_off_elems, layer_off_bytes,
-						  &vh->store);
+						  desc->host_visible, &vh->store);
 	free(layer_bytes);
 	free(layer_off_elems);
 	free(layer_off_bytes);
@@ -5746,17 +5747,8 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 		uint32_t	 groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf		*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		VkDeviceSize offs[4] = {q->offset, 0, 0, out->offset};
-		status_code _fds = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
-							  1u << 3);
-		if (_fds == OK) {
-			static int _dbg_flash = 0;
-			if (!_dbg_flash) {
-				_dbg_flash = 1;
-				float v = 0.0f;
-				vk_buf_download_raw(self, as_vkbuf(out), out->offset, &v, sizeof(float));
-				fprintf(stderr, "FLASH debug: out0=%.6f kv_q8=%d layer_off=%zu\\n", (double)v, kv_q8, layer_off_flash);
-			}
-		}
+		status_code	 _fds	 = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push),
+											  groups, 1, 1u << 3);
 		return _fds;
 	}
 
@@ -8064,7 +8056,7 @@ static status_code vk_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int k
 	size_t		  total		  = layer_bytes * (size_t)(n_layers > 0 ? n_layers : 1);
 	vk_kv_handle *kh		  = xcalloc(1, sizeof(vk_kv_handle));
 	status_code	  s = vk_kv_store_alloc(p, total, layer_bytes, n_layers > 0 ? n_layers : 1, NULL,
-										NULL, NULL, &kh->store);
+										NULL, NULL, 0, &kh->store);
 	if (s != OK) {
 		ERROR("vk: kv_alloc_mla: failed to allocate %d MLA layer buffers of %zu bytes", n_layers,
 			  layer_bytes);

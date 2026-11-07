@@ -57,6 +57,7 @@ A few flags you'll probably reach for:
 
 - `--device vulkan0` picks a compute device. `--list-devices` shows what kappai found.
 - `--ngl 20` puts the first 20 layers on the device and keeps the rest on the CPU.
+- `--kv-on-host` keeps model weights on the GPU but allocates the KV cache in system RAM, allowing much larger contexts without VRAM OOM.
 - `-c 8192` sets the context size.
 - `--system "..."` sets a system prompt.
 - `-t 0` makes sampling greedy.

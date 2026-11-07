@@ -47,6 +47,7 @@ typedef struct config {
 	bool profile_time;
 	bool reasoning;
 	bool disable_failsafes;
+	bool kv_on_host;
 } config;
 
 config config_defaults(void);

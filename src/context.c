@@ -386,7 +386,8 @@ status_code context_init(context *c, const config *cfg) {
 			reserve_for_weights = model_pending_weight_bytes(&c->m, cfg);
 
 		size_t needed_precheck = kv_bytes_precheck + reserve_for_weights;
-		if (!cfg->disable_failsafes && avail_precheck > 0 && needed_precheck > avail_precheck) {
+		if (!cfg->kv_on_host && !cfg->disable_failsafes && avail_precheck > 0 &&
+			needed_precheck > avail_precheck) {
 			ERROR("KV cache (ctx=%d, %.1f MB) + pending weights (%.1f MB) need %.1f MB but only "
 				  "%.1f MB is available on backend '%s' -- refusing to run (see "
 				  "--disable-failsafes).",
@@ -450,7 +451,7 @@ status_code context_init(context *c, const config *cfg) {
 		size_t kv_bytes = model_kv_cache_bytes_quant(&c->m, n_ctx, kv_quant,
 													 backend_has_cap(kv_owner, BCAP_KV_POS_CAP));
 		size_t avail	= mem_topology_pool_available(&c->topo, kv_owner);
-		if (!cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
+		if (!cfg->kv_on_host && !cfg->disable_failsafes && avail > 0 && kv_bytes > avail) {
 			ERROR("KV cache (ctx=%d) needs %.1f MB but only %.1f MB is available on "
 				  "backend '%s' after loading weights -- refusing to run (see "
 				  "--disable-failsafes).",
@@ -461,6 +462,8 @@ status_code context_init(context *c, const config *cfg) {
 	}
 
 	c->flash_attn = cfg->flash_attn ? 1 : 0;
+
+	c->m.kv_host_visible = cfg->kv_on_host;
 
 	s = kvcache_init(&c->kv, &c->m, n_ctx, kv_quant);
 	if (s != OK) {

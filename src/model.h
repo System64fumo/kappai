@@ -247,6 +247,7 @@ typedef struct model {
 	bool use_mmap;
 	bool mixed_backend_mode;
 	bool full_sequence;
+	bool kv_host_visible;
 	int	 output_size;
 
 	size_t mem_non_expert_bytes;

@@ -96,6 +96,7 @@ void config_usage(FILE *fp, bool is_server) {
 			"  --threads <n>            CPU worker threads (default: auto)\n"
 			"  -f, --flash-attn [bool]  flash attention kernel (default: on)\n"
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
+			"  --kv-on-host              allocate KV cache in host/system memory\n"
 			"  --mmap [bool]            mmap model weights (default: on)\n"
 			"  --repack MODE            weight repacking: all|none|<types> (default: smart)\n"
 			"  --fuse LIST              load-time weight fusion, comma list: qkv\n"
@@ -382,6 +383,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_FUSE,
 		OPT_REASONING,
 		OPT_DISABLE_FAILSAFES,
+		OPT_KV_ON_HOST,
 		OPT_DEBUG_PROMPT,
 		OPT_GREP_VOCAB,
 		OPT_KV_QUANT,
@@ -429,6 +431,7 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"reasoning", OPT_REASONING, CLI_OPT_BOOL_FLAG, &cfg->reasoning, 0, 0},
 		{"disable-failsafes", OPT_DISABLE_FAILSAFES, CLI_OPT_FLAG_TRUE, &cfg->disable_failsafes, 0,
 		 0},
+		{"kv-on-host", OPT_KV_ON_HOST, CLI_OPT_FLAG_TRUE, &cfg->kv_on_host, 0, 0},
 		{"debug-prompt", OPT_DEBUG_PROMPT, CLI_OPT_FLAG_TRUE, &a->debug_prompt, 0, 0},
 		{"grep-vocab", OPT_GREP_VOCAB, CLI_OPT_STRING, &a->grep_vocab, 0, 0},
 		{"kv-quant", OPT_KV_QUANT, CLI_OPT_KV_QUANT, NULL, 0, 0},

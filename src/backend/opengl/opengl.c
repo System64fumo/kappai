@@ -373,6 +373,7 @@ struct gl_priv {
 	int	   kv_n_layers;
 	int	   kv_quant;
 	size_t kv_row_bytes;
+	int	   kv_host_visible;
 
 	gl_buf *attn_part;
 	size_t	attn_part_cap;
@@ -4278,13 +4279,17 @@ static void gl_buf_zero(gl_buf *b) {
 
 static status_code gl_kv_store_alloc(gl_priv *p, gl_kv_store *st, int n_layers,
 									 size_t layer_bytes) {
+	GLenum usage	   = p->kv_host_visible ? GL_DYNAMIC_COPY : GL_STATIC_DRAW;
+	bool   keep_mirror = !p->kv_host_visible;
 	st->layers = xcalloc((size_t)n_layers, sizeof(gl_buf *));
 	for (int i = 0; i < n_layers; i++) {
-		st->layers[i] = gl_buf_alloc_ex(p, layer_bytes, GL_DYNAMIC_COPY, NULL, false, NULL);
+		st->layers[i] = gl_buf_alloc_ex(p, layer_bytes, usage, NULL, keep_mirror, NULL);
 		if (!st->layers[i])
 			return ERR_OUT_OF_MEMORY;
 		st->n_layers = i + 1;
 		gl_buf_zero(st->layers[i]);
+		if (keep_mirror)
+			st->layers[i]->host_dirty = 0;
 	}
 	return OK;
 }
@@ -4300,26 +4305,44 @@ static gl_buf *gl_kv_layer_buf(const buffer *kv, int layer) {
 
 static void *gl_kv_layer_read(gl_priv *p, const gl_buf *b) {
 	void *copy = xmalloc(b->size_bytes);
+	gl_buf *gb = (gl_buf *)b;
+	gl_buf_sync_to_host(gb);
+	if (gb->host_mirror) {
+		memcpy(copy, gb->host_mirror, gb->size_bytes);
+		return copy;
+	}
+
+	gl_buf *staging = gl_buf_alloc_ex(p, b->size_bytes, GL_DYNAMIC_COPY, NULL, true, NULL);
+	if (!staging) {
+		memset(copy, 0, b->size_bytes);
+		return copy;
+	}
 	gl_barrier_if_pending(p);
 	gl_finish(p);
-	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
-	void *mapped =
-		glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)b->size_bytes, GL_MAP_READ_BIT);
-	if (mapped) {
-		memcpy(copy, mapped, b->size_bytes);
-		glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-	} else {
-		ERROR("gl: kv layer readback map(%zu bytes) failed (glErr=0x%04x)", b->size_bytes,
-			  (unsigned)glGetError());
+	glBindBuffer(GL_COPY_READ_BUFFER, b->name);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, staging->name);
+	glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, (GLsizeiptr)b->size_bytes);
+	GLenum err = glGetError();
+	glBindBuffer(GL_COPY_READ_BUFFER, 0);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	if (err != GL_NO_ERROR) {
+		ERROR("gl: kv layer readback copy failed (glErr=0x%04x)", (unsigned)err);
+		gl_buf_free(p, staging);
 		memset(copy, 0, b->size_bytes);
+		return copy;
 	}
-	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	staging->device_dirty = 1;
+	gl_buf_sync_to_host(staging);
+	if (staging->host_mirror)
+		memcpy(copy, staging->host_mirror, b->size_bytes);
+	gl_buf_free(p, staging);
 	return copy;
 }
 
 static status_code gl_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
+	p->kv_host_visible = desc->host_visible;
 	int n_kv_layers = desc->n_kv_layers > 0 ? desc->n_kv_layers : 1;
 	int n_kv_heads	= desc->n_kv_heads;
 	int head_dim	= desc->head_dim;

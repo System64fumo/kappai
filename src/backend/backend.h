@@ -148,6 +148,7 @@ typedef enum {
 typedef struct {
 	int			  n_layers, n_kv_layers, n_kv_heads, head_dim, n_ctx;
 	kv_quant_type kv_quant;
+	int			  host_visible;
 	const int	 *layer_head_dim;
 	const int	 *layer_n_kv_heads;
 	const int	 *layer_pos_cap;

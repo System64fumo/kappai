@@ -903,9 +903,9 @@ static expr_node *parse_primary(parser *p) {
 				break;
 			}
 			padvance(p);
-			expr_node *val = parse_expr(p);
-			n->dict_keys = xrealloc(n->dict_keys, (n->n_dict + 1) * sizeof(expr_node *));
-			n->dict_vals = xrealloc(n->dict_vals, (n->n_dict + 1) * sizeof(expr_node *));
+			expr_node *val			= parse_expr(p);
+			n->dict_keys			= xrealloc(n->dict_keys, (n->n_dict + 1) * sizeof(expr_node *));
+			n->dict_vals			= xrealloc(n->dict_vals, (n->n_dict + 1) * sizeof(expr_node *));
 			n->dict_keys[n->n_dict] = key;
 			n->dict_vals[n->n_dict] = val;
 			n->n_dict++;
@@ -2420,7 +2420,7 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 		jinja_value *out = jinja_dict();
 		for (size_t i = 0; i < e->n_dict; i++) {
 			jinja_value *key = eval_expr(ctx, e->dict_keys[i]);
-			const char *ks = (key && key->type == JV_STRING) ? key->as.s : NULL;
+			const char	*ks	 = (key && key->type == JV_STRING) ? key->as.s : NULL;
 			jinja_value *val = eval_expr(ctx, e->dict_vals[i]);
 			if (ks)
 				jinja_dict_set(out, ks, val);
