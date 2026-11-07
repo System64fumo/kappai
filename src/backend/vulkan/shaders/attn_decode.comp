@@ -35,6 +35,8 @@ layout(push_constant) uniform Params {
 	int	  window;
 	int	  chunk;
 	int	  n_splits;
+	int	  kv_q8;
+	int	  kv_row_bytes;
 }
 pc;
 
@@ -47,10 +49,38 @@ shared vec2	 red[WG];
 shared float l_red[WG];
 
 float k_partial(uint row, int lane, int pairs) {
-	float a	 = 0.0;
-	uint  wb = row >> 1u;
-	for (int p = lane; p < pairs; p += LANES)
-		a += dot(unpackHalf2x16(kcache[wb + uint(p)]), q2[p]);
+	float a = 0.0;
+	if (pc.kv_q8 == 0) {
+		uint wb = row >> 1u;
+		for (int p = lane; p < pairs; p += LANES)
+			a += dot(unpackHalf2x16(kcache[wb + uint(p)]), q2[p]);
+		return a;
+	}
+	for (int p = lane; p < pairs; p += LANES) {
+		int	  d0	= p * 2;
+		int	  d1	= d0 + 1;
+		int	  b0	= d0 / 32;
+		int	  o0	= d0 % 32;
+		uint  soff0 = row + uint(b0) * 34u;
+		uint  w0	= kcache[soff0 >> 2u];
+		float s0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
+		uint  wb0	= kcache[(soff0 + 2u + uint(o0)) >> 2u];
+		int	  q0	= int((wb0 >> (((soff0 + 2u + uint(o0)) & 3u) * 8u)) & 0xFFu);
+		if (q0 > 127)
+			q0 -= 256;
+		float v0	= s0 * float(q0);
+		int	  b1	= d1 / 32;
+		int	  o1	= d1 % 32;
+		uint  soff1 = row + uint(b1) * 34u;
+		uint  w1	= kcache[soff1 >> 2u];
+		float s1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
+		uint  wb1	= kcache[(soff1 + 2u + uint(o1)) >> 2u];
+		int	  q1	= int((wb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
+		if (q1 > 127)
+			q1 -= 256;
+		float v1 = s1 * float(q1);
+		a += v0 * q2[p].x + v1 * q2[p].y;
+	}
 	return a;
 }
 
@@ -74,8 +104,8 @@ void main() {
 		q2[p] = vec2(q[q_base + uint(p * 2)], q[q_base + uint(p * 2) + 1u]);
 	barrier();
 
-	uint kv_base	= pc.layer_off + uint(kvh) * uint(pc.n_ctx) * uint(head_dim);
-	uint row_stride = uint(head_dim);
+	uint row_stride = (pc.kv_q8 != 0) ? uint(pc.kv_row_bytes) : uint(head_dim);
+	uint kv_base	= pc.layer_off + uint(kvh) * uint(pc.n_ctx) * row_stride;
 
 	int	 split_groups = pairs > WG / 2 ? 1 : WG / pairs;
 	int	 slot_group	  = split_groups == 1 ? 0 : int(tid) / pairs;
@@ -134,12 +164,40 @@ void main() {
 				o_acc[j] *= alpha;
 			for (int t = slot_group; t < len; t += split_groups) {
 				float e	  = e_tile[t];
-				uint  row = (kv_base + uint(t0 + t) * row_stride) >> 1u;
+				uint  row = kv_base + uint(t0 + t) * row_stride;
 				for (int j = 0; j < MAX_PAIR_SLOTS; j++) {
 					int p = slot_pair + j * WG;
 					if (p >= pairs)
 						break;
-					o_acc[j] += e * unpackHalf2x16(vcache[row + uint(p)]);
+					vec2 vp;
+					if (pc.kv_q8 == 0) {
+						vp = unpackHalf2x16(vcache[(row >> 1u) + uint(p)]);
+					} else {
+						int	  d0	= p * 2;
+						int	  d1	= d0 + 1;
+						int	  b0	= d0 / 32;
+						int	  o0	= d0 % 32;
+						uint  soff0 = row + uint(b0) * 34u;
+						uint  w0	= vcache[soff0 >> 2u];
+						float s0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
+						uint  wb0	= vcache[(soff0 + 2u + uint(o0)) >> 2u];
+						int	  q0	= int((wb0 >> (((soff0 + 2u + uint(o0)) & 3u) * 8u)) & 0xFFu);
+						if (q0 > 127)
+							q0 -= 256;
+						float v0	= s0 * float(q0);
+						int	  b1	= d1 / 32;
+						int	  o1	= d1 % 32;
+						uint  soff1 = row + uint(b1) * 34u;
+						uint  w1	= vcache[soff1 >> 2u];
+						float s1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
+						uint  wb1	= vcache[(soff1 + 2u + uint(o1)) >> 2u];
+						int	  q1	= int((wb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
+						if (q1 > 127)
+							q1 -= 256;
+						float v1 = s1 * float(q1);
+						vp		 = vec2(v0, v1);
+					}
+					o_acc[j] += e * vp;
 				}
 				l_part += e;
 			}

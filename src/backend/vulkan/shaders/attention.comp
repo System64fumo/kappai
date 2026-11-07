@@ -28,6 +28,8 @@ layout(push_constant) uniform Params {
 	float scale;
 	int	  stride_head_dim;
 	int	  attn_start;
+	int	  kv_q8;
+	int	  kv_row_bytes;
 #ifdef BATCHED
 	int m;
 #endif
@@ -35,6 +37,23 @@ layout(push_constant) uniform Params {
 params;
 
 #include "common.glsl"
+
+uint ld8k(uint byte_off) {
+	uint w = kcache[byte_off >> 2u];
+	return (w >> ((byte_off & 3u) << 3u)) & 0xFFu;
+}
+uint ld16k(uint byte_off) {
+	uint w = kcache[byte_off >> 2u];
+	return (w >> ((byte_off & 2u) << 3u)) & 0xFFFFu;
+}
+uint ld8v(uint byte_off) {
+	uint w = vcache[byte_off >> 2u];
+	return (w >> ((byte_off & 3u) << 3u)) & 0xFFu;
+}
+uint ld16v(uint byte_off) {
+	uint w = vcache[byte_off >> 2u];
+	return (w >> ((byte_off & 2u) << 3u)) & 0xFFFFu;
+}
 
 layout(constant_id = 0) const int MAX_HEAD_DIM = 256;
 layout(constant_id = 1) const int TILE_T	   = 16;
@@ -74,7 +93,9 @@ void main() {
 	}
 	barrier();
 
-	uint kvh_stride = uint(n_ctx) * uint(params.stride_head_dim);
+	uint row_stride =
+		(params.kv_q8 != 0) ? uint(params.kv_row_bytes) : uint(params.stride_head_dim);
+	uint kvh_stride = uint(n_ctx) * row_stride;
 	uint kv_base	= params.layer_off + uint(kvh) * kvh_stride;
 
 	uint sc_base	= sc_row_off + h * uint(n_ctx);
@@ -86,13 +107,36 @@ void main() {
 
 		int total_words = tile_len * (head_dim / 2);
 		for (int idx = int(tid); idx < total_words; idx += 64) {
-			int	 t	= idx / (head_dim / 2);
-			int	 dw = idx % (head_dim / 2);
-			uint elem_idx =
-				kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
-			uint word						   = kcache[elem_idx >> 1u];
-			kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
-			kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+			int t  = idx / (head_dim / 2);
+			int dw = idx % (head_dim / 2);
+			int d0 = dw * 2;
+			int d1 = d0 + 1;
+			if (params.kv_q8 == 0) {
+				uint elem_idx			   = kv_base + uint(tile_t0 + t) * row_stride + uint(d0);
+				uint word				   = kcache[elem_idx >> 1u];
+				kv_tile[t * head_dim + d0] = half_to_float(word & 0xFFFFu);
+				kv_tile[t * head_dim + d1] = half_to_float(word >> 16u);
+			} else {
+				uint row_byte = kv_base + uint(tile_t0 + t) * uint(params.kv_row_bytes);
+				// dequant d0
+				int	  b0	  = d0 / 32;
+				int	  o0	  = d0 % 32;
+				uint  soff0	  = row_byte + uint(b0) * 34u;
+				float d0scale = unpackHalf2x16(ld16k(soff0)).x;
+				int	  q0	  = int(ld8k(soff0 + 2u + uint(o0)));
+				if (q0 > 127)
+					q0 -= 256;
+				kv_tile[t * head_dim + d0] = d0scale * float(q0);
+				// dequant d1
+				int	  b1	  = d1 / 32;
+				int	  o1	  = d1 % 32;
+				uint  soff1	  = row_byte + uint(b1) * 34u;
+				float d1scale = unpackHalf2x16(ld16k(soff1)).x;
+				int	  q1	  = int(ld8k(soff1 + 2u + uint(o1)));
+				if (q1 > 127)
+					q1 -= 256;
+				kv_tile[t * head_dim + d1] = d1scale * float(q1);
+			}
 		}
 		barrier();
 
@@ -164,13 +208,34 @@ void main() {
 
 		int total_words = tile_len * (head_dim / 2);
 		for (int idx = int(tid); idx < total_words; idx += 64) {
-			int	 t	= idx / (head_dim / 2);
-			int	 dw = idx % (head_dim / 2);
-			uint elem_idx =
-				kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
-			uint word						   = vcache[elem_idx >> 1u];
-			kv_tile[t * head_dim + dw * 2]	   = half_to_float(word & 0xFFFFu);
-			kv_tile[t * head_dim + dw * 2 + 1] = half_to_float(word >> 16u);
+			int t  = idx / (head_dim / 2);
+			int dw = idx % (head_dim / 2);
+			int d0 = dw * 2;
+			int d1 = d0 + 1;
+			if (params.kv_q8 == 0) {
+				uint elem_idx			   = kv_base + uint(tile_t0 + t) * row_stride + uint(d0);
+				uint word				   = vcache[elem_idx >> 1u];
+				kv_tile[t * head_dim + d0] = half_to_float(word & 0xFFFFu);
+				kv_tile[t * head_dim + d1] = half_to_float(word >> 16u);
+			} else {
+				uint  row_byte = kv_base + uint(tile_t0 + t) * row_stride;
+				int	  b0	   = d0 / 32;
+				int	  o0	   = d0 % 32;
+				uint  soff0	   = row_byte + uint(b0) * 34u;
+				float s0	   = unpackHalf2x16(ld16v(soff0)).x;
+				int	  q0	   = int(ld8v(soff0 + 2u + uint(o0)));
+				if (q0 > 127)
+					q0 -= 256;
+				kv_tile[t * head_dim + d0] = s0 * float(q0);
+				int	  b1				   = d1 / 32;
+				int	  o1				   = d1 % 32;
+				uint  soff1				   = row_byte + uint(b1) * 34u;
+				float s1				   = unpackHalf2x16(ld16v(soff1)).x;
+				int	  q1				   = int(ld8v(soff1 + 2u + uint(o1)));
+				if (q1 > 127)
+					q1 -= 256;
+				kv_tile[t * head_dim + d1] = s1 * float(q1);
+			}
 		}
 		barrier();
 
