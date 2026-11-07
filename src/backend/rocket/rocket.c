@@ -32,9 +32,14 @@
 #define RKT_FOLD_K_LEN RKT_K_ALIGN
 
 #define RKT_MAX_JOB_WEIGHT_BYTES ((size_t)12582912)
-#define RKT_ACT_CHUNK 256
-#define RKT_ACT_BLOCK_ROWS RKT_TILE_ROWS
-#define RKT_ACT_MAX_ROUNDS 4
+#define RKT_LUT_CHUNK 256
+#define RKT_LUT_BLOCK_ROWS RKT_TILE_ROWS
+#define RKT_LUT_BLOCKS_PER_CORE 32
+#define RKT_LUT_UPLOAD_TASKS (RKT_LUT_ENTRIES / RKT_LUT_UPLOAD_CHUNK)
+#define RKT_LUT_TASKS_PER_CORE (RKT_LUT_UPLOAD_TASKS + RKT_LUT_BLOCKS_PER_CORE)
+#define RKT_LUT_IN_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(uint16_t))
+#define RKT_LUT_OUT_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(float))
+#define RKT_LUT_KINDS 3
 
 #define RKT_QUEUE_ARENA_CAP ((size_t)4 << 20)
 #define RKT_QUEUE_BANKS 2
@@ -59,7 +64,7 @@ typedef struct {
 } rkt_kchunk;
 
 typedef struct rkt_weight rkt_weight;
-typedef struct rkt_w4	  rkt_w4;
+typedef struct rkt_quant  rkt_quant;
 struct rkt_weight {
 	uint32_t	magic;
 	int			n;
@@ -72,7 +77,7 @@ struct rkt_weight {
 	rkt_kchunk *kchunks;
 	buffer	   *host_copy;
 	void	   *host_source;
-	rkt_w4	   *w4;
+	rkt_quant  *quant;
 	rkt_weight *fused_parent;
 	int			fused_row0;
 	int			fuse_tried;
@@ -89,14 +94,16 @@ typedef enum {
 	SLOT_CLASSES,
 } slot_class;
 
-struct rkt_act_cache {
-	int			ready;
-	int			uploaded_kind;
-	rkt_lut_cfg cfg;
-	rkt_bo		identity[RKT_MAX_CORES];
-	rkt_bo		in[RKT_MAX_CORES];
-	rkt_bo		out[RKT_MAX_CORES];
-	rkt_bo		regcmd[RKT_MAX_CORES];
+struct rkt_lut_state {
+	int			 ready;
+	rkt_lut_kind table_kind;
+	int			 verified[RKT_LUT_KINDS];
+	uint32_t	 upload_ops[RKT_LUT_UPLOAD_TASKS];
+	rkt_lut_cfg	 cfg;
+	rkt_bo		 identity[RKT_MAX_CORES];
+	rkt_bo		 in[RKT_MAX_CORES];
+	rkt_bo		 out[RKT_MAX_CORES];
+	rkt_bo		 regcmd[RKT_MAX_CORES];
 };
 typedef struct {
 	int core;
@@ -165,7 +172,7 @@ typedef struct {
 	rkt_core_queue queue[RKT_MAX_CORES];
 } rkt_pending;
 
-typedef struct rkt_act_cache rkt_act_cache;
+typedef struct rkt_lut_state rkt_lut_state;
 
 typedef struct {
 	rkt_bo	  in;
@@ -173,54 +180,62 @@ typedef struct {
 	rkt_bo	  reg;
 	uint32_t *n_ops;
 	size_t	  n_ops_cap;
-} rkt_w4_scratch;
+} rkt_quant_scratch;
 
-enum { PROF_MATMUL, PROF_W4_WAIT, PROF_W4_HOST, PROF_ATTN, PROF_ACT, PROF_PREFILL_MATMUL, PROF_N };
+enum {
+	PROF_MATMUL,
+	PROF_QUANT_WAIT,
+	PROF_QUANT_HOST,
+	PROF_ATTN,
+	PROF_LUT,
+	PROF_PREFILL_MATMUL,
+	PROF_N
+};
 
 typedef struct {
-	rkt_device		 dev;
-	pthread_mutex_t	 lock;
-	int				 max_k;
-	int				 poison;
-	int				 npu_failed;
-	int				 npu_consecutive_failures;
-	rkt_slot		 slots[RKT_QUEUE_BANKS][SLOT_CLASSES][RKT_MAX_CORES];
-	int				 bank;
-	rkt_pending		 pending[RKT_QUEUE_BANKS];
-	uint16_t		*x16;
-	size_t			 x16_cap;
-	uint16_t		*x_chunk;
-	size_t			 x_chunk_cap;
-	rkt_weight	   **weights;
-	size_t			 n_weights;
-	size_t			 cap_weights;
-	int				 fuse;
-	int				 w4_on;
-	int				 w4_group;
-	int				 w4_failed;
-	int				 w4_prefill_failed;
-	int				 w4_check;
-	int				 w4_prefill;
-	int				 wq_accepted[2];
-	rkt_w4_scratch	 w4_pf[RKT_MAX_CORES];
-	int				 w4_logged;
-	int				 w4_checked;
-	int				 prof;
-	double			 prof_ms[PROF_N];
-	long			 prof_n[PROF_N];
-	int				 fused_groups;
-	int				 fused_weights;
-	float			*y_tmp;
-	size_t			 y_tmp_cap;
-	float			*attn_ws;
-	size_t			 attn_ws_cap;
-	rkt_act_cache	 act;
-	float			*act_tmp;
-	size_t			 act_tmp_cap;
-	rkt_core_queue	 queue[RKT_MAX_CORES];
-	rkt_stream_cache streams[RKT_MAX_CORES];
-	size_t			 in_len;
-	slot_class		 queue_cls;
+	rkt_device		  dev;
+	pthread_mutex_t	  lock;
+	int				  max_k;
+	int				  poison;
+	int				  npu_failed;
+	int				  npu_consecutive_failures;
+	rkt_slot		  slots[RKT_QUEUE_BANKS][SLOT_CLASSES][RKT_MAX_CORES];
+	int				  bank;
+	rkt_pending		  pending[RKT_QUEUE_BANKS];
+	uint16_t		 *x16;
+	size_t			  x16_cap;
+	uint16_t		 *x_chunk;
+	size_t			  x_chunk_cap;
+	rkt_weight		**weights;
+	size_t			  n_weights;
+	size_t			  cap_weights;
+	int				  fuse;
+	int				  quant_on;
+	int				  quant_group;
+	int				  quant_failed;
+	int				  quant_prefill_failed;
+	int				  quant_check;
+	int				  quant_prefill;
+	int				  quant_accepted[2];
+	rkt_quant_scratch quant_pf[RKT_MAX_CORES];
+	int				  quant_logged;
+	int				  quant_checked;
+	int				  prof;
+	double			  prof_ms[PROF_N];
+	long			  prof_n[PROF_N];
+	int				  fused_groups;
+	int				  fused_weights;
+	float			 *y_tmp;
+	size_t			  y_tmp_cap;
+	float			 *attn_ws;
+	size_t			  attn_ws_cap;
+	rkt_lut_state	  lut;
+	float			 *ffn_act_tmp;
+	size_t			  ffn_act_tmp_cap;
+	rkt_core_queue	  queue[RKT_MAX_CORES];
+	rkt_stream_cache  streams[RKT_MAX_CORES];
+	size_t			  in_len;
+	slot_class		  queue_cls;
 } rkt_priv;
 
 static inline uint16_t f32_to_f16_bits(float v) {
@@ -331,7 +346,7 @@ static int unregister_weight(rkt_priv *p, const rkt_weight *w) {
 	return 0;
 }
 
-static void w4_free(rkt_priv *p, rkt_w4 *q);
+static void quant_free(rkt_priv *p, rkt_quant *q);
 
 static void destroy_weight(rkt_priv *p, rkt_weight *w) {
 	for (int ci = 0; ci < w->n_kchunks; ci++) {
@@ -348,7 +363,7 @@ static void destroy_weight(rkt_priv *p, rkt_weight *w) {
 		free(w->host_copy);
 	}
 	free(w->host_source);
-	w4_free(p, w->w4);
+	quant_free(p, w->quant);
 	w->magic = 0;
 	free(w);
 }
@@ -501,10 +516,10 @@ typedef struct {
 	const uint8_t *data;
 	size_t		   row_bytes;
 	int			   k;
-} quant_rows;
+} gguf_rows;
 
-static status_code quant_row_source(void *ctx, int row, uint16_t *dst, float *tmp) {
-	quant_rows *q = ctx;
+static status_code gguf_row_source(void *ctx, int row, uint16_t *dst, float *tmp) {
+	gguf_rows *q = ctx;
 	return row_to_f16(q->host, q->type, q->data + (size_t)row * q->row_bytes, q->k, tmp, dst);
 }
 
@@ -523,14 +538,14 @@ static rkt_weight *new_weight(const tensor_desc *desc) {
 static status_code upload_to_npu(rkt_priv *p, rkt_weight *w, const tensor_desc *desc) {
 	if (!build_layout(p, w))
 		return ERR_OUT_OF_MEMORY;
-	quant_rows q = {
+	gguf_rows q = {
 		.host	   = backend_host(),
 		.type	   = desc->type,
 		.data	   = desc->host_data,
 		.row_bytes = w->src_row_bytes,
 		.k		   = w->k,
 	};
-	return fill_weight(p, w, quant_row_source, &q);
+	return fill_weight(p, w, gguf_row_source, &q);
 }
 
 static status_code keep_on_host(rkt_weight *w, const tensor_desc *desc) {
@@ -570,11 +585,11 @@ static void release_npu_state(rkt_priv *p, rkt_weight *w) {
 
 static int poison_hits(const uint32_t *words, size_t count);
 
-#define RKT_W4_NTILE 4096
-#define RKT_W4_HEAD_ROWS 65536
+#define RKT_QUANT_NTILE 4096
+#define RKT_QUANT_HEAD_ROWS 65536
 #define RKT_MAX_FUSE 8
-#define RKT_W4_MAX_CHILDREN RKT_MAX_FUSE
-#define RKT_W4_PREFILL_TOKENS 16
+#define RKT_QUANT_MAX_CHILDREN RKT_MAX_FUSE
+#define RKT_QUANT_PREFILL_TOKENS 16
 
 typedef struct {
 	int		  n0;
@@ -587,24 +602,24 @@ typedef struct {
 	size_t	 *w_off;
 	size_t	 *out_off;
 	uint32_t *n_ops;
-} rkt_w4_core;
+} rkt_quant_core;
 
-struct rkt_w4 {
-	int			bits;
-	int			group;
-	int			n_ktiles;
-	int			n64;
-	rkt_w4_core core[RKT_MAX_CORES];
-	float	   *s_w;
-	int16_t	   *corr;
+struct rkt_quant {
+	int			   bits;
+	int			   group;
+	int			   n_ktiles;
+	int			   n64;
+	rkt_quant_core core[RKT_MAX_CORES];
+	float		  *s_w;
+	int16_t		  *corr;
 };
 
-static int w4_tile_len(const rkt_weight *w, int group, int kt) {
+static int quant_tile_len(const rkt_weight *w, int group, int kt) {
 	int rest = w->k_pad - kt * group;
 	return rest < group ? rest : group;
 }
 
-static void w4_free(rkt_priv *p, rkt_w4 *q) {
+static void quant_free(rkt_priv *p, rkt_quant *q) {
 	if (!q)
 		return;
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
@@ -621,7 +636,7 @@ static void w4_free(rkt_priv *p, rkt_w4 *q) {
 	free(q);
 }
 
-static void w4_put_nibble(uint8_t *row16, int j, int v) {
+static void quant_put_nibble(uint8_t *row16, int j, int v) {
 	uint8_t nib = (uint8_t)(v & 15);
 	if (j & 1)
 		row16[j / 2] |= nib;
@@ -629,31 +644,32 @@ static void w4_put_nibble(uint8_t *row16, int j, int v) {
 		row16[j / 2] = (uint8_t)(nib << 4);
 }
 
-static int w4_alloc_cores(rkt_priv *p, rkt_weight *w, rkt_w4 *q) {
+static int quant_alloc_cores(rkt_priv *p, rkt_weight *w, rkt_quant *q) {
 	int blocks = q->n64 / 64;
 	int used   = blocks < p->dev.n_cores ? blocks : p->dev.n_cores;
 	int base   = blocks / used;
 	int rem	   = blocks % used;
 	int n0	   = 0;
 	for (int c = 0; c < used; c++) {
-		rkt_w4_core *wc = &q->core[c];
-		wc->n0			= n0;
-		wc->n			= (base + (c < rem ? 1 : 0)) * 64;
+		rkt_quant_core *wc = &q->core[c];
+		wc->n0			   = n0;
+		wc->n			   = (base + (c < rem ? 1 : 0)) * 64;
 		n0 += wc->n;
-		int n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		int n_ntiles = (wc->n + RKT_QUANT_NTILE - 1) / RKT_QUANT_NTILE;
 		wc->n_tasks	 = n_ntiles * q->n_ktiles;
 		wc->w_off	 = xcalloc((size_t)wc->n_tasks, sizeof(size_t));
 		wc->out_off	 = xcalloc((size_t)wc->n_tasks, sizeof(size_t));
 		wc->n_ops	 = xcalloc((size_t)wc->n_tasks, sizeof(uint32_t));
 		size_t w_acc = 0, o_acc = 0;
 		for (int nt = 0; nt < n_ntiles; nt++) {
-			int ncols =
-				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			int ncols = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE
+							? wc->n - nt * RKT_QUANT_NTILE
+							: RKT_QUANT_NTILE;
 			for (int kt = 0; kt < q->n_ktiles; kt++) {
 				int t		   = nt * q->n_ktiles + kt;
 				wc->w_off[t]   = w_acc;
 				wc->out_off[t] = o_acc;
-				w_acc += (size_t)w4_tile_len(w, q->group, kt) * ncols * q->bits / 8;
+				w_acc += (size_t)quant_tile_len(w, q->group, kt) * ncols * q->bits / 8;
 				o_acc += (size_t)4 * ncols;
 			}
 		}
@@ -693,32 +709,33 @@ static int quant_bits_for_type(uint32_t type) {
 	}
 }
 
-static void w4_put_weight(const rkt_w4 *q, uint8_t *base, int col, int kl, int kb, int j, int v) {
+static void quant_put_weight(const rkt_quant *q, uint8_t *base, int col, int kl, int kb, int j,
+							 int v) {
 	int		 atom_cols = 256 / q->bits;
 	uint8_t *row =
 		base + (((size_t)(col / atom_cols) * (kl / 32) + kb / 32) * atom_cols + col % atom_cols) *
 				   (4 * q->bits);
 	if (q->bits == 4)
-		w4_put_nibble(row, j, v);
+		quant_put_nibble(row, j, v);
 	else
 		row[j] = (uint8_t)(int8_t)v;
 }
 
-static int w4_rows(const rkt_w4 *q, int tokens) {
+static int quant_token_rows(const rkt_quant *q, int tokens) {
 	return (q->bits == 4 ? 2 : 1) * tokens;
 }
 
 typedef struct {
 	const rkt_weight  *w;
-	rkt_w4			  *q;
+	rkt_quant		  *q;
 	const tensor_desc *desc;
 	backend			  *host;
-} w4_job;
+} quant_job;
 
-static status_code w4_build_rows(void *arg, int lo, int hi) {
-	w4_job			  *job	= arg;
+static status_code quant_build_rows(void *arg, int lo, int hi) {
+	quant_job		  *job	= arg;
 	const rkt_weight  *w	= job->w;
-	rkt_w4			  *q	= job->q;
+	rkt_quant		  *q	= job->q;
 	const tensor_desc *desc = job->desc;
 	backend			  *host = job->host;
 	int				   bits = q->bits;
@@ -745,12 +762,12 @@ static status_code w4_build_rows(void *arg, int lo, int hi) {
 		int c = 0;
 		while (c + 1 < RKT_MAX_CORES && q->core[c + 1].n > 0 && r >= q->core[c + 1].n0)
 			c++;
-		rkt_w4_core *wc	 = &q->core[c];
-		int			 lr	 = r - wc->n0;
-		int			 nt	 = lr / RKT_W4_NTILE;
-		int			 col = lr % RKT_W4_NTILE;
+		rkt_quant_core *wc	= &q->core[c];
+		int				lr	= r - wc->n0;
+		int				nt	= lr / RKT_QUANT_NTILE;
+		int				col = lr % RKT_QUANT_NTILE;
 		for (int kt = 0; kt < q->n_ktiles; kt++) {
-			int	  k0 = kt * q->group, kl = w4_tile_len(w, q->group, kt);
+			int	  k0 = kt * q->group, kl = quant_tile_len(w, q->group, kt);
 			float amax = 0.0f;
 			for (int j = 0; j < kl && k0 + j < w->k; j++)
 				if (fabsf(tmp[k0 + j]) > amax)
@@ -768,7 +785,7 @@ static status_code w4_build_rows(void *arg, int lo, int hi) {
 					long  qv = lrintf(v * inv);
 					qv		 = qv > qmax ? qmax : qv < qmin ? qmin : qv;
 					sum += (int)qv;
-					w4_put_weight(q, base, col, kl, kb, j, (int)qv);
+					quant_put_weight(q, base, col, kl, kb, j, (int)qv);
 				}
 			q->s_w[(size_t)kt * q->n64 + r] = scale;
 			if (q->corr)
@@ -779,37 +796,38 @@ static status_code w4_build_rows(void *arg, int lo, int hi) {
 	return s;
 }
 
-static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc, int bits) {
+static status_code quant_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc, int bits) {
 	if (w->n < 1 || w->k < 1 || p->dev.n_cores < 1)
 		return ERR_UNSUPPORTED;
-	rkt_w4 *q	= xcalloc(1, sizeof(*q));
-	q->bits		= bits;
-	q->group	= p->w4_group;
-	q->n_ktiles = (w->k_pad + q->group - 1) / q->group;
-	q->n64		= (w->n + 63) / 64 * 64;
-	q->s_w		= xcalloc((size_t)q->n_ktiles * q->n64, sizeof(float));
-	q->corr		= bits == 4 ? xcalloc((size_t)q->n_ktiles * q->n64, sizeof(int16_t)) : NULL;
-	if (!w4_alloc_cores(p, w, q)) {
-		w4_free(p, q);
+	rkt_quant *q = xcalloc(1, sizeof(*q));
+	q->bits		 = bits;
+	q->group	 = p->quant_group;
+	q->n_ktiles	 = (w->k_pad + q->group - 1) / q->group;
+	q->n64		 = (w->n + 63) / 64 * 64;
+	q->s_w		 = xcalloc((size_t)q->n_ktiles * q->n64, sizeof(float));
+	q->corr		 = bits == 4 ? xcalloc((size_t)q->n_ktiles * q->n64, sizeof(int16_t)) : NULL;
+	if (!quant_alloc_cores(p, w, q)) {
+		quant_free(p, q);
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	w4_job		job = {.w = w, .q = q, .desc = desc, .host = backend_host()};
-	status_code s	= parallel_rows(w->n, w4_build_rows, &job);
+	quant_job	job = {.w = w, .q = q, .desc = desc, .host = backend_host()};
+	status_code s	= parallel_rows(w->n, quant_build_rows, &job);
 
 	for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
-		rkt_w4_core *wc = &q->core[c];
+		rkt_quant_core *wc = &q->core[c];
 		if (wc->n == 0)
 			continue;
-		int n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		int n_ntiles = (wc->n + RKT_QUANT_NTILE - 1) / RKT_QUANT_NTILE;
 		for (int nt = 0; nt < n_ntiles; nt++) {
-			int ncols =
-				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			int ncols = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE
+							? wc->n - nt * RKT_QUANT_NTILE
+							: RKT_QUANT_NTILE;
 			for (int kt = 0; kt < q->n_ktiles; kt++) {
 				int t		 = nt * q->n_ktiles + kt;
 				wc->n_ops[t] = (uint32_t)rkt_emit_quant(
 					(uint64_t *)((uint8_t *)wc->reg.map + (size_t)t * RKT_REGCMD_BYTES), bits,
-					w4_rows(q, 1), w4_tile_len(w, q->group, kt), ncols,
+					quant_token_rows(q, 1), quant_tile_len(w, q->group, kt), ncols,
 					(uint32_t)(wc->in.dma_addr + (size_t)kt * q->group),
 					(uint32_t)(wc->wt.dma_addr + wc->w_off[t]),
 					(uint32_t)(wc->out.dma_addr + wc->out_off[t]));
@@ -821,22 +839,22 @@ static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc,
 			s = ERR_IO;
 	}
 	if (s != OK) {
-		w4_free(p, q);
+		quant_free(p, q);
 		return s;
 	}
-	w->w4 = q;
-	p->wq_accepted[bits == 8]++;
+	w->quant = q;
+	p->quant_accepted[bits == 8]++;
 	return OK;
 }
 
-static status_code w4_build_best(rkt_priv *p, rkt_weight *w, const tensor_desc *desc) {
+static status_code quant_build_best(rkt_priv *p, rkt_weight *w, const tensor_desc *desc) {
 	int bits = quant_bits_for_type(desc->type);
 	if (bits == 0)
 		return ERR_UNSUPPORTED;
-	return w4_build(p, w, desc, bits);
+	return quant_build(p, w, desc, bits);
 }
 
-static double w4_now_ms(void) {
+static double now_ms(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
@@ -848,8 +866,8 @@ static void prof_add(rkt_priv *p, int kind, double ms) {
 }
 
 static void prof_print(const rkt_priv *p) {
-	static const char *names[PROF_N] = {"decode matmul (all paths)", "w4 npu wait",
-										"w4 host pre/post",			 "decode attention",
+	static const char *names[PROF_N] = {"decode matmul (all paths)", "quant npu wait",
+										"quant host pre/post",		 "decode attention",
 										"decode ffn activation",	 "prefill matmul (all paths)"};
 	for (int i = 0; i < PROF_N; i++)
 		log_tag("ROCKET-PROF", "%-26s calls=%-7ld total=%9.1f ms  avg=%7.3f ms", names[i],
@@ -861,22 +879,22 @@ typedef struct {
 	const rkt_bo   *out;
 	const rkt_bo   *reg;
 	const uint32_t *n_ops;
-} w4_io;
+} quant_io;
 
 typedef struct {
-	const w4_io *io;
-	int			 task;
-} w4_job_task;
+	const quant_io *io;
+	int				task;
+} quant_job_task;
 
 static int ensure_bo(rkt_priv *p, int core, size_t bytes, rkt_bo *bo);
 
-static int w4_prefill_prepare(rkt_priv *p, const rkt_weight *w, int tokens, w4_io *io) {
-	int m = w4_rows(w->w4, tokens);
+static int quant_prefill_prepare(rkt_priv *p, const rkt_weight *w, int tokens, quant_io *io) {
+	int m = quant_token_rows(w->quant, tokens);
 	for (int c = 0; c < p->dev.n_cores; c++) {
-		const rkt_w4_core *wc = &w->w4->core[c];
+		const rkt_quant_core *wc = &w->quant->core[c];
 		if (wc->n == 0)
 			continue;
-		rkt_w4_scratch *sc = &p->w4_pf[c];
+		rkt_quant_scratch *sc = &p->quant_pf[c];
 		if (!ensure_bo(p, c, (size_t)w->k_pad * tokens, &sc->in) ||
 			!ensure_bo(p, c, wc->out.size * tokens, &sc->out) ||
 			!ensure_bo(p, c, (size_t)wc->n_tasks * RKT_REGCMD_BYTES, &sc->reg) ||
@@ -884,14 +902,15 @@ static int w4_prefill_prepare(rkt_priv *p, const rkt_weight *w, int tokens, w4_i
 							 sizeof(uint32_t)))
 			return 0;
 		for (int t = 0; t < wc->n_tasks; t++) {
-			int kt = t % w->w4->n_ktiles;
-			int nt = t / w->w4->n_ktiles;
-			int ncols =
-				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			int kt		 = t % w->quant->n_ktiles;
+			int nt		 = t / w->quant->n_ktiles;
+			int ncols	 = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE
+							   ? wc->n - nt * RKT_QUANT_NTILE
+							   : RKT_QUANT_NTILE;
 			sc->n_ops[t] = (uint32_t)rkt_emit_quant(
-				(uint64_t *)((uint8_t *)sc->reg.map + (size_t)t * RKT_REGCMD_BYTES), w->w4->bits, m,
-				w4_tile_len(w, w->w4->group, kt), ncols,
-				(uint32_t)(sc->in.dma_addr + (size_t)kt * w->w4->group * tokens),
+				(uint64_t *)((uint8_t *)sc->reg.map + (size_t)t * RKT_REGCMD_BYTES), w->quant->bits,
+				m, quant_tile_len(w, w->quant->group, kt), ncols,
+				(uint32_t)(sc->in.dma_addr + (size_t)kt * w->quant->group * tokens),
 				(uint32_t)(wc->wt.dma_addr + wc->w_off[t]),
 				(uint32_t)(sc->out.dma_addr + wc->out_off[t] * tokens));
 			if (sc->n_ops[t] > RKT_REGCMD_MAX_OPS)
@@ -899,12 +918,12 @@ static int w4_prefill_prepare(rkt_priv *p, const rkt_weight *w, int tokens, w4_i
 		}
 		if (rkt_bo_flush(&p->dev, &sc->reg))
 			return 0;
-		io[c] = (w4_io){&sc->in, &sc->out, &sc->reg, sc->n_ops};
+		io[c] = (quant_io){&sc->in, &sc->out, &sc->reg, sc->n_ops};
 	}
 	return 1;
 }
 
-static float w4_absmax(const float *x, int n) {
+static float quant_absmax(const float *x, int n) {
 	float m = 0.0f;
 	int	  i = 0;
 #if defined(__ARM_NEON)
@@ -919,23 +938,23 @@ static float w4_absmax(const float *x, int n) {
 	return m;
 }
 
-static void w4_activation_scales(const rkt_weight *w, const float *x, int tokens, float *s_act) {
-	int group = w->w4->group, n_ktiles = w->w4->n_ktiles;
+static void quant_activation_scales(const rkt_weight *w, const float *x, int tokens, float *s_act) {
+	int group = w->quant->group, n_ktiles = w->quant->n_ktiles;
 	for (int tk = 0; tk < tokens; tk++)
 		for (int kt = 0; kt < n_ktiles; kt++) {
-			int	  k0 = kt * group, kl = w4_tile_len(w, group, kt);
+			int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
 			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
-			float amax	= w4_absmax(x + (size_t)tk * w->k + k0, valid > 0 ? valid : 0);
+			float amax	= quant_absmax(x + (size_t)tk * w->k + k0, valid > 0 ? valid : 0);
 			s_act[tk * n_ktiles + kt] = amax > 0.0f ? amax / 127.0f : 1.0f;
 		}
 }
 
-static int w4_quantize_activation(float v, float scale) {
+static int quant_quantize_activation(float v, float scale) {
 	long qv = lrintf(v / scale);
 	return qv > 127 ? 127 : qv < -127 ? -127 : (int)qv;
 }
 
-static void w4_quantize_tile(const float *x, int valid, int kl, float scale, int8_t *q) {
+static void quant_quantize_tile(const float *x, int valid, int kl, float scale, int8_t *q) {
 	int j = 0;
 #if defined(__ARM_NEON)
 	float32x4_t sv = vdupq_n_f32(scale);
@@ -947,22 +966,22 @@ static void w4_quantize_tile(const float *x, int valid, int kl, float scale, int
 	}
 #endif
 	for (; j < valid; j++)
-		q[j] = (int8_t)w4_quantize_activation(x[j], scale);
+		q[j] = (int8_t)quant_quantize_activation(x[j], scale);
 	for (; j < kl; j++)
 		q[j] = 0;
 }
 
-static void w4_pack_activation(const rkt_weight *w, const float *x, int tokens, const float *s_act,
-							   int bits, uint8_t *packed) {
-	int		group = w->w4->group, n_ktiles = w->w4->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
+static void quant_pack_activation(const rkt_weight *w, const float *x, int tokens,
+								  const float *s_act, int bits, uint8_t *packed) {
+	int group = w->quant->group, n_ktiles = w->quant->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
 	int8_t *q = xmalloc((size_t)group);
 	for (int tk = 0; tk < tokens; tk++) {
 		const float *xt = x + (size_t)tk * w->k;
 		for (int kt = 0; kt < n_ktiles; kt++) {
-			int	  k0 = kt * group, kl = w4_tile_len(w, group, kt);
+			int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
 			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
 			float scale = s_act[tk * n_ktiles + kt];
-			w4_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
+			quant_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
 			if (bits == 8) {
 				for (int plane = 0; plane < kl / 16; plane++)
 					memcpy(packed + (size_t)k0 * tokens + ((size_t)plane * tokens + tk) * 16,
@@ -975,7 +994,7 @@ static void w4_pack_activation(const rkt_weight *w, const float *x, int tokens, 
 						packed + (size_t)k0 * tokens + ((size_t)(kb / 32) * m + 2 * tk + row) * 16;
 					for (int j = 0; j < 32; j++) {
 						int u = q[kb + j] + 128;
-						w4_put_nibble(dst, j, row == 0 ? (u >> 4) - 8 : (u & 15) - 8);
+						quant_put_nibble(dst, j, row == 0 ? (u >> 4) - 8 : (u & 15) - 8);
 					}
 				}
 		}
@@ -983,8 +1002,8 @@ static void w4_pack_activation(const rkt_weight *w, const float *x, int tokens, 
 	free(q);
 }
 
-static void w4_reduce_i4(const rkt_w4 *q, const uint8_t *tile, size_t tile_stride, int m, int tk,
-						 int r0, int col, const float *sa, float *dst) {
+static void quant_reduce_i4(const rkt_quant *q, const uint8_t *tile, size_t tile_stride, int m,
+							int tk, int r0, int col, const float *sa, float *dst) {
 	const int16_t *o0 = (const int16_t *)tile;
 #if defined(__ARM_NEON)
 	float32x4_t y0 = vdupq_n_f32(0.0f), y1 = vdupq_n_f32(0.0f);
@@ -1016,8 +1035,8 @@ static void w4_reduce_i4(const rkt_w4 *q, const uint8_t *tile, size_t tile_strid
 #endif
 }
 
-static void w4_reduce_i8(const rkt_w4 *q, const uint8_t *tile, size_t tile_stride, int m, int tk,
-						 int r0, int col, const float *sa, float *dst) {
+static void quant_reduce_i8(const rkt_quant *q, const uint8_t *tile, size_t tile_stride, int m,
+							int tk, int r0, int col, const float *sa, float *dst) {
 	const int32_t *o0 = (const int32_t *)tile;
 #if defined(__ARM_NEON)
 	float32x4_t y0 = vdupq_n_f32(0.0f), y1 = vdupq_n_f32(0.0f);
@@ -1043,29 +1062,30 @@ static void w4_reduce_i8(const rkt_w4 *q, const uint8_t *tile, size_t tile_strid
 #endif
 }
 
-static status_code w4_accumulate(rkt_priv *p, const rkt_weight *w, const w4_io *io, int tokens,
-								 const float *s_act, float *y) {
-	const rkt_w4 *q = w->w4;
-	int			  m = w4_rows(q, tokens), n_ktiles = q->n_ktiles;
+static status_code quant_accumulate(rkt_priv *p, const rkt_weight *w, const quant_io *io,
+									int tokens, const float *s_act, float *y) {
+	const rkt_quant *q = w->quant;
+	int				 m = quant_token_rows(q, tokens), n_ktiles = q->n_ktiles;
 	if (!ensure_capacity((void **)&p->y_tmp, &p->y_tmp_cap, (size_t)q->n64 * tokens, sizeof(float)))
 		return ERR_OUT_OF_MEMORY;
 	for (int c = 0; c < p->dev.n_cores; c++) {
-		const rkt_w4_core *wc		= &q->core[c];
-		int				   n_ntiles = (wc->n + RKT_W4_NTILE - 1) / RKT_W4_NTILE;
+		const rkt_quant_core *wc	   = &q->core[c];
+		int					  n_ntiles = (wc->n + RKT_QUANT_NTILE - 1) / RKT_QUANT_NTILE;
 		for (int nt = 0; nt < n_ntiles; nt++) {
-			int ncols =
-				wc->n - nt * RKT_W4_NTILE < RKT_W4_NTILE ? wc->n - nt * RKT_W4_NTILE : RKT_W4_NTILE;
+			int			   ncols = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE
+									   ? wc->n - nt * RKT_QUANT_NTILE
+									   : RKT_QUANT_NTILE;
 			const uint8_t *tile =
 				(const uint8_t *)io[c].out->map + wc->out_off[nt * n_ktiles] * tokens;
-			int r0 = wc->n0 + nt * RKT_W4_NTILE;
+			int r0 = wc->n0 + nt * RKT_QUANT_NTILE;
 			for (int tk = 0; tk < tokens; tk++)
 				for (int col = 0; col < ncols; col += 8) {
 					float		*dst = p->y_tmp + (size_t)tk * q->n64 + r0 + col;
 					const float *sa	 = s_act + tk * n_ktiles;
 					if (q->bits == 4)
-						w4_reduce_i4(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
+						quant_reduce_i4(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
 					else
-						w4_reduce_i8(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
+						quant_reduce_i8(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
 				}
 		}
 	}
@@ -1075,45 +1095,45 @@ static status_code w4_accumulate(rkt_priv *p, const rkt_weight *w, const w4_io *
 	return OK;
 }
 
-static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int count, const float *x,
-								int tokens, double *wait_ms) {
+static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int count,
+								   const float *x, int tokens, double *wait_ms) {
 	const rkt_weight *w0	= ws[0];
-	int				  k_pad = w0->k_pad, group = w0->w4->group;
+	int				  k_pad = w0->k_pad, group = w0->quant->group;
 	if (tokens > 1 && count != 1)
 		return ERR_UNSUPPORTED;
 	for (int i = 1; i < count; i++)
-		if (ws[i]->k_pad != k_pad || ws[i]->w4->group != group)
+		if (ws[i]->k_pad != k_pad || ws[i]->quant->group != group)
 			return ERR_UNSUPPORTED;
 
-	w4_io io[RKT_W4_MAX_CHILDREN][RKT_MAX_CORES] = {0};
+	quant_io io[RKT_QUANT_MAX_CHILDREN][RKT_MAX_CORES] = {0};
 	if (tokens > 1) {
-		if (!w4_prefill_prepare(p, w0, tokens, io[0]))
+		if (!quant_prefill_prepare(p, w0, tokens, io[0]))
 			return ERR_OUT_OF_MEMORY;
 	} else {
 		for (int i = 0; i < count; i++)
 			for (int c = 0; c < RKT_MAX_CORES; c++) {
-				const rkt_w4_core *wc = &ws[i]->w4->core[c];
-				io[i][c]			  = (w4_io){&wc->in, &wc->out, &wc->reg, wc->n_ops};
+				const rkt_quant_core *wc = &ws[i]->quant->core[c];
+				io[i][c]				 = (quant_io){&wc->in, &wc->out, &wc->reg, wc->n_ops};
 			}
 	}
 
-	float	*s_act	   = xmalloc((size_t)tokens * w0->w4->n_ktiles * sizeof(float));
+	float	*s_act	   = xmalloc((size_t)tokens * w0->quant->n_ktiles * sizeof(float));
 	uint8_t *packed[2] = {NULL, NULL};
-	w4_activation_scales(w0, x, tokens, s_act);
+	quant_activation_scales(w0, x, tokens, s_act);
 	for (int i = 0; i < count; i++) {
-		int bits = ws[i]->w4->bits;
+		int bits = ws[i]->quant->bits;
 		if (!packed[bits == 8]) {
 			packed[bits == 8] = xcalloc((size_t)k_pad * tokens, 1);
-			w4_pack_activation(w0, x, tokens, s_act, bits, packed[bits == 8]);
+			quant_pack_activation(w0, x, tokens, s_act, bits, packed[bits == 8]);
 		}
 	}
 
 	status_code s = OK;
 	for (int i = 0; i < count && s == OK; i++)
 		for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
-			if (ws[i]->w4->core[c].n == 0)
+			if (ws[i]->quant->core[c].n == 0)
 				continue;
-			memcpy(io[i][c].in->map, packed[ws[i]->w4->bits == 8], (size_t)k_pad * tokens);
+			memcpy(io[i][c].in->map, packed[ws[i]->quant->bits == 8], (size_t)k_pad * tokens);
 			if (rkt_bo_flush(&p->dev, io[i][c].in))
 				s = ERR_IO;
 		}
@@ -1123,7 +1143,7 @@ static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int co
 	if (p->poison)
 		for (int i = 0; i < count && s == OK; i++)
 			for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
-				if (ws[i]->w4->core[c].n == 0)
+				if (ws[i]->quant->core[c].n == 0)
 					continue;
 				uint32_t *ow = io[i][c].out->map;
 				for (size_t j = 0; j < io[i][c].out->size / sizeof(uint32_t); j++)
@@ -1135,27 +1155,27 @@ static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int co
 	for (int c = 0; c < p->dev.n_cores && s == OK; c++) {
 		int n_list = 0;
 		for (int i = 0; i < count; i++)
-			n_list += ws[i]->w4->core[c].n > 0 ? ws[i]->w4->core[c].n_tasks : 0;
+			n_list += ws[i]->quant->core[c].n > 0 ? ws[i]->quant->core[c].n_tasks : 0;
 		if (n_list == 0)
 			continue;
-		w4_job_task *list = xmalloc((size_t)n_list * sizeof(*list));
-		int			 at	  = 0;
+		quant_job_task *list = xmalloc((size_t)n_list * sizeof(*list));
+		int				at	 = 0;
 		for (int i = 0; i < count; i++) {
-			const rkt_w4_core *wc = &ws[i]->w4->core[c];
+			const rkt_quant_core *wc = &ws[i]->quant->core[c];
 			for (int t = 0; wc->n > 0 && t < wc->n_tasks; t++)
-				list[at++] = (w4_job_task){.io = &io[i][c], .task = t};
+				list[at++] = (quant_job_task){.io = &io[i][c], .task = t};
 		}
 		for (int start = 0; start < n_list && s == OK; start += RKT_MAX_TASKS) {
 			int			  n_tasks = n_list - start < RKT_MAX_TASKS ? n_list - start : RKT_MAX_TASKS;
 			uint32_t	  dma[RKT_MAX_TASKS], ops[RKT_MAX_TASKS];
 			const rkt_bo *in[RKT_MAX_HANDLES], *out[RKT_MAX_HANDLES];
 			int			  n_in = 0, n_out = 0;
-			const w4_io	 *last = NULL;
+			const quant_io *last = NULL;
 			for (int j = 0; j < n_tasks; j++) {
-				const w4_io *tio = list[start + j].io;
-				int			 t	 = list[start + j].task;
-				dma[j]			 = (uint32_t)(tio->reg->dma_addr + (size_t)t * RKT_REGCMD_BYTES);
-				ops[j]			 = tio->n_ops[t];
+				const quant_io *tio = list[start + j].io;
+				int				t	= list[start + j].task;
+				dma[j]				= (uint32_t)(tio->reg->dma_addr + (size_t)t * RKT_REGCMD_BYTES);
+				ops[j]				= tio->n_ops[t];
 				if (tio != last) {
 					last		 = tio;
 					in[n_in++]	 = tio->in;
@@ -1171,57 +1191,57 @@ static status_code w4_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int co
 	}
 	*wait_ms = 0.0;
 	for (int i = 0; i < count; i++) {
-		double t_wait = w4_now_ms();
+		double t_wait = now_ms();
 		for (int c = 0; c < p->dev.n_cores; c++)
-			if (submitted_core[c] && ws[i]->w4->core[c].n > 0 &&
+			if (submitted_core[c] && ws[i]->quant->core[c].n > 0 &&
 				rkt_bo_wait(&p->dev, io[i][c].out) && s == OK)
 				s = ERR_COMPUTE_FAIL;
-		*wait_ms += w4_now_ms() - t_wait;
+		*wait_ms += now_ms() - t_wait;
 		if (p->poison)
 			for (int c = 0; c < p->dev.n_cores && s == OK; c++)
-				if (ws[i]->w4->core[c].n > 0 &&
+				if (ws[i]->quant->core[c].n > 0 &&
 					poison_hits(io[i][c].out->map, io[i][c].out->size / sizeof(uint32_t))) {
-					WARN("rocket: w4 core %d output k=%d n=%d still holds poison", c, ws[i]->k,
+					WARN("rocket: quant core %d output k=%d n=%d still holds poison", c, ws[i]->k,
 						 ws[i]->n);
 					s = ERR_COMPUTE_FAIL;
 				}
 		if (s == OK)
-			s = w4_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
+			s = quant_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
 	}
 	free(s_act);
 	return s;
 }
 
-static status_code w4_run_many(rkt_priv *p, rkt_weight **ws, float **ys, int count, const float *x,
-							   int tokens) {
-	double		t0		= w4_now_ms();
+static status_code quant_run_many(rkt_priv *p, rkt_weight **ws, float **ys, int count,
+								  const float *x, int tokens) {
+	double		t0		= now_ms();
 	double		wait_ms = 0.0;
-	status_code s		= w4_run_inner(p, ws, ys, count, x, tokens, &wait_ms);
-	double		total	= w4_now_ms() - t0;
+	status_code s		= quant_run_inner(p, ws, ys, count, x, tokens, &wait_ms);
+	double		total	= now_ms() - t0;
 	if (p->prof) {
-		prof_add(p, PROF_W4_WAIT, wait_ms);
-		prof_add(p, PROF_W4_HOST, total - wait_ms);
+		prof_add(p, PROF_QUANT_WAIT, wait_ms);
+		prof_add(p, PROF_QUANT_HOST, total - wait_ms);
 	}
-	if (s != OK && p->w4_logged < 24) {
-		p->w4_logged++;
-		WARN("rocket: w4 call k=%d n=%d count=%d status=%d: %.1f ms (wait %.1f ms)", ws[0]->k,
+	if (s != OK && p->quant_logged < 24) {
+		p->quant_logged++;
+		WARN("rocket: quant call k=%d n=%d count=%d status=%d: %.1f ms (wait %.1f ms)", ws[0]->k,
 			 ws[0]->n, count, s, total, wait_ms);
 	}
 	return s;
 }
 
-static void w4_disable(rkt_priv *p, status_code s) {
-	if (p->w4_failed)
+static void quant_disable(rkt_priv *p, status_code s) {
+	if (p->quant_failed)
 		return;
-	p->w4_failed = 1;
-	WARN("rocket: w4 decode path failed (status %d, errno=%d), back to f16 weights", s, errno);
+	p->quant_failed = 1;
+	WARN("rocket: quant decode path failed (status %d, errno=%d), back to f16 weights", s, errno);
 }
 
-static void w4_report(rkt_priv *p, const rkt_weight *w, const float *x, const float *y4,
-					  const float *yref, int prefill) {
-	if (p->w4_checked >= 400)
+static void quant_report(rkt_priv *p, const rkt_weight *w, const float *x, const float *y4,
+						 const float *yref, int prefill) {
+	if (p->quant_checked >= 400)
 		return;
-	p->w4_checked++;
+	p->quant_checked++;
 	double num = 0.0, den = 0.0, xx = 0.0, xmax = 0.0;
 	for (int i = 0; i < w->n; i++) {
 		double d = (double)y4[i] - (double)yref[i];
@@ -1235,7 +1255,7 @@ static void w4_report(rkt_priv *p, const rkt_weight *w, const float *x, const fl
 	}
 	double rms = sqrt(xx / (double)w->k);
 	char   tag[16];
-	snprintf(tag, sizeof(tag), prefill ? "W%dCHK-PF" : "W%dCHK", w->w4->bits);
+	snprintf(tag, sizeof(tag), prefill ? "Q%dCHK-PF" : "Q%dCHK", w->quant->bits);
 	log_tag(tag, "k=%d n=%d rel_rmse=%.4f x_max/rms=%.1f", w->k, w->n,
 			den > 0.0 ? sqrt(num / den) : 0.0, rms > 0.0 ? xmax / rms : 0.0);
 }
@@ -1317,7 +1337,8 @@ static status_code rkt_buffer_alloc_weight(backend *self, const tensor_desc *des
 	rkt_weight *w = new_weight(desc);
 	bytes		  = w->src_row_bytes * (size_t)w->n;
 
-	int quant_head = p->w4_on && w->n >= RKT_W4_HEAD_ROWS && quant_bits_for_type(desc->type) != 0;
+	int quant_head =
+		p->quant_on && w->n >= RKT_QUANT_HEAD_ROWS && quant_bits_for_type(desc->type) != 0;
 
 	status_code s = ERR_UNSUPPORTED;
 	if (!quant_head && weight_shape_supported(p, w)) {
@@ -1335,10 +1356,10 @@ static status_code rkt_buffer_alloc_weight(backend *self, const tensor_desc *des
 			return host_s;
 		}
 	}
-	if ((s == OK || quant_head) && p->w4_on) {
-		status_code s4 = w4_build_best(p, w, desc);
+	if ((s == OK || quant_head) && p->quant_on) {
+		status_code s4 = quant_build_best(p, w, desc);
 		if (s4 != OK && s4 != ERR_UNSUPPORTED)
-			WARN("rocket: w4 build for %dx%d (%s) failed: status %d, stays f16", w->k, w->n,
+			WARN("rocket: quant build for %dx%d (%s) failed: status %d, stays f16", w->k, w->n,
 				 ggml_type_name(desc->type), s4);
 	}
 
@@ -1816,8 +1837,8 @@ static status_code enqueue_fold(rkt_priv *p, const rkt_weight *w, const rkt_kchu
 	return OK;
 }
 
-static status_code npu_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, int n,
-								   const uint16_t *x16, float *y, int m) {
+static status_code dense_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, int n,
+									 const uint16_t *x16, float *y, int m) {
 	rkt_kchunk fold_kc = {
 		.k_off = w->k,
 		.k_len = RKT_FOLD_K_LEN,
@@ -1836,8 +1857,8 @@ static status_code npu_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, i
 	return s;
 }
 
-static status_code npu_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
-									  const float *x, float *y, int m) {
+static status_code dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
+										const float *x, float *y, int m) {
 	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m * w->k_pad, sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	for (int r = 0; r < m; r++) {
@@ -1848,9 +1869,9 @@ static status_code npu_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0
 	return enqueue_kchunks(p, w, row0, n, y, m);
 }
 
-static status_code npu_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
-							  float *y, int m) {
-	status_code s = npu_matmul_enqueue(p, w, row0, n, x, y, m);
+static status_code dense_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
+								float *y, int m) {
+	status_code s = dense_matmul_enqueue(p, w, row0, n, x, y, m);
 	if (s == OK)
 		return flush_queue(p);
 	abort_queue(p);
@@ -1922,55 +1943,57 @@ static status_code rkt_matmul_batch_inner(backend *self, const buffer *wbuf, uin
 		ERROR("rocket: matmul rows out of range (row0=%d n=%d weight n=%d)", row0, n, w->n);
 		return ERR_INVALID_ARG;
 	}
-	if (m == 1 && w->w4 && p->w4_on && !p->w4_failed && !p->npu_failed && row0 == 0 && n == w->n) {
+	if (m == 1 && w->quant && p->quant_on && !p->quant_failed && !p->npu_failed && row0 == 0 &&
+		n == w->n) {
 		rkt_weight *one = w;
-		float	   *yo	= p->w4_check ? xmalloc((size_t)n * sizeof(float)) : rkt_ptr(y);
+		float	   *yo	= p->quant_check ? xmalloc((size_t)n * sizeof(float)) : rkt_ptr(y);
 		pthread_mutex_lock(&p->lock);
-		status_code s4 = w4_run_many(p, &one, &yo, 1, rkt_ptr(x), 1);
+		status_code s4 = quant_run_many(p, &one, &yo, 1, rkt_ptr(x), 1);
 		pthread_mutex_unlock(&p->lock);
-		if (s4 == OK && !p->w4_check)
+		if (s4 == OK && !p->quant_check)
 			return OK;
 		if (s4 == OK) {
-			p->w4_on	   = 0;
+			p->quant_on	   = 0;
 			status_code sr = rkt_matmul_batch(self, wbuf, w_type, x, y, n, k, m);
-			p->w4_on	   = 1;
-			w4_report(p, w, rkt_ptr(x), yo, rkt_ptr(y), 0);
+			p->quant_on	   = 1;
+			quant_report(p, w, rkt_ptr(x), yo, rkt_ptr(y), 0);
 			free(yo);
 			return sr;
 		}
-		if (p->w4_check)
+		if (p->quant_check)
 			free(yo);
-		w4_disable(p, s4);
+		quant_disable(p, s4);
 	}
-	if (m > 1 && w->w4 && p->w4_on && p->w4_prefill && !p->w4_failed && !p->w4_prefill_failed &&
-		!p->npu_failed && row0 == 0 && n == w->n) {
+	if (m > 1 && w->quant && p->quant_on && p->quant_prefill && !p->quant_failed &&
+		!p->quant_prefill_failed && !p->npu_failed && row0 == 0 && n == w->n) {
 		rkt_weight *one = w;
 		status_code s4	= OK;
-		float	   *yw	= p->w4_check ? xmalloc((size_t)m * n * sizeof(float)) : rkt_ptr(y);
+		float	   *yw	= p->quant_check ? xmalloc((size_t)m * n * sizeof(float)) : rkt_ptr(y);
 		pthread_mutex_lock(&p->lock);
-		for (int t0 = 0; t0 < m && s4 == OK; t0 += RKT_W4_PREFILL_TOKENS) {
-			int	   tokens = m - t0 < RKT_W4_PREFILL_TOKENS ? m - t0 : RKT_W4_PREFILL_TOKENS;
+		for (int t0 = 0; t0 < m && s4 == OK; t0 += RKT_QUANT_PREFILL_TOKENS) {
+			int	   tokens = m - t0 < RKT_QUANT_PREFILL_TOKENS ? m - t0 : RKT_QUANT_PREFILL_TOKENS;
 			float *yo	  = yw + (size_t)t0 * n;
-			s4 = w4_run_many(p, &one, &yo, 1, (const float *)rkt_ptr(x) + (size_t)t0 * k, tokens);
+			s4 =
+				quant_run_many(p, &one, &yo, 1, (const float *)rkt_ptr(x) + (size_t)t0 * k, tokens);
 		}
 		pthread_mutex_unlock(&p->lock);
-		if (s4 == OK && !p->w4_check)
+		if (s4 == OK && !p->quant_check)
 			return OK;
 		if (s4 == OK) {
-			p->w4_on		= 0;
+			p->quant_on		= 0;
 			status_code sr	= rkt_matmul_batch(self, wbuf, w_type, x, y, n, k, m);
-			p->w4_on		= 1;
+			p->quant_on		= 1;
 			const float *xf = rkt_ptr(x), *yr = rkt_ptr(y);
-			w4_report(p, w, xf, yw, yr, 1);
-			w4_report(p, w, xf + (size_t)(m - 1) * k, yw + (size_t)(m - 1) * n,
-					  yr + (size_t)(m - 1) * n, 1);
+			quant_report(p, w, xf, yw, yr, 1);
+			quant_report(p, w, xf + (size_t)(m - 1) * k, yw + (size_t)(m - 1) * n,
+						 yr + (size_t)(m - 1) * n, 1);
 			free(yw);
 			return sr;
 		}
-		if (p->w4_check)
+		if (p->quant_check)
 			free(yw);
-		p->w4_prefill_failed = 1;
-		WARN("rocket: w4 prefill path failed (status %d, errno=%d), prefill back to f16 weights",
+		p->quant_prefill_failed = 1;
+		WARN("rocket: quant prefill path failed (status %d, errno=%d), prefill back to f16 weights",
 			 s4, errno);
 	}
 	if (w->fused_parent) {
@@ -1984,7 +2007,7 @@ static status_code rkt_matmul_batch_inner(backend *self, const buffer *wbuf, uin
 		return host_matmul(w, row0, n, x, y, m);
 
 	pthread_mutex_lock(&p->lock);
-	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : npu_matmul(p, w, row0, n, xf, yf, m);
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : dense_matmul(p, w, row0, n, xf, yf, m);
 	if (s != OK && !p->npu_failed) {
 		npu_record_failure(p);
 		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), using "
@@ -2003,10 +2026,10 @@ static status_code rkt_matmul_batch_inner(backend *self, const buffer *wbuf, uin
 static status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type,
 									const buffer *x, buffer *y, int n, int k, int m) {
 	rkt_priv   *p  = self->priv;
-	double		t0 = p->prof ? w4_now_ms() : 0.0;
+	double		t0 = p->prof ? now_ms() : 0.0;
 	status_code s  = rkt_matmul_batch_inner(self, wbuf, w_type, x, y, n, k, m);
 	if (p->prof)
-		prof_add(p, m == 1 ? PROF_MATMUL : PROF_PREFILL_MATMUL, w4_now_ms() - t0);
+		prof_add(p, m == 1 ? PROF_MATMUL : PROF_PREFILL_MATMUL, now_ms() - t0);
 	return s;
 }
 
@@ -2095,14 +2118,12 @@ static rkt_weight *fuse_weights(rkt_priv *p, rkt_weight **ws, int count) {
 	}
 	p->fused_groups++;
 	p->fused_weights += count;
-	if (p->fused_groups == 1)
-		log_tag("RKT", "fusing projections that share an input into larger jobs");
 	return f;
 }
 
 static status_code run_npu_or_cpu(rkt_priv *p, const rkt_weight *w, int row0, int n,
 								  const float *xf, float *yf, int m) {
-	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : npu_matmul(p, w, row0, n, xf, yf, m);
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : dense_matmul(p, w, row0, n, xf, yf, m);
 	if (s != OK && !p->npu_failed) {
 		npu_record_failure(p);
 		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), using "
@@ -2180,7 +2201,7 @@ static status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const
 										  const buffer *x, buffer **y, const int *n_list, int k,
 										  int n_matmuls, int m) {
 	rkt_priv *p = self->priv;
-	if (m == 1 && p->w4_on && p->w4_check) {
+	if (m == 1 && p->quant_on && p->quant_check) {
 		for (int i = 0; i < n_matmuls; i++) {
 			status_code s = rkt_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
 			if (s != OK)
@@ -2188,16 +2209,17 @@ static status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const
 		}
 		return OK;
 	}
-	if (m == 1 && p->w4_on && !p->w4_failed && !p->npu_failed && n_matmuls <= RKT_W4_MAX_CHILDREN) {
-		rkt_weight *ws[RKT_W4_MAX_CHILDREN];
-		float	   *ys[RKT_W4_MAX_CHILDREN];
-		uint8_t		is_w4[RKT_W4_MAX_CHILDREN] = {0};
-		int			count					   = 0;
+	if (m == 1 && p->quant_on && !p->quant_failed && !p->npu_failed &&
+		n_matmuls <= RKT_QUANT_MAX_CHILDREN) {
+		rkt_weight *ws[RKT_QUANT_MAX_CHILDREN];
+		float	   *ys[RKT_QUANT_MAX_CHILDREN];
+		uint8_t		is_quant[RKT_QUANT_MAX_CHILDREN] = {0};
+		int			count							 = 0;
 		for (int i = 0; i < n_matmuls; i++) {
 			rkt_weight *wi = w[i]->handle;
-			is_w4[i]	   = wi && wi->magic == RKT_WEIGHT_MAGIC && wi->w4 && w[i]->offset == 0 &&
-							 n_list[i] == wi->n && wi->k == k;
-			if (is_w4[i]) {
+			is_quant[i] = wi && wi->magic == RKT_WEIGHT_MAGIC && wi->quant && w[i]->offset == 0 &&
+						  n_list[i] == wi->n && wi->k == k;
+			if (is_quant[i]) {
 				ws[count] = wi;
 				ys[count] = rkt_ptr(y[i]);
 				count++;
@@ -2205,11 +2227,11 @@ static status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const
 		}
 		if (count > 0) {
 			pthread_mutex_lock(&p->lock);
-			status_code s4 = w4_run_many(p, ws, ys, count, rkt_ptr(x), 1);
+			status_code s4 = quant_run_many(p, ws, ys, count, rkt_ptr(x), 1);
 			pthread_mutex_unlock(&p->lock);
 			if (s4 == OK) {
 				for (int i = 0; i < n_matmuls; i++) {
-					if (is_w4[i])
+					if (is_quant[i])
 						continue;
 					status_code s =
 						rkt_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
@@ -2218,7 +2240,7 @@ static status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const
 				}
 				return OK;
 			}
-			w4_disable(p, s4);
+			quant_disable(p, s4);
 		}
 	}
 	if (p->fuse && n_matmuls >= 2) {
@@ -2268,12 +2290,13 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 	int row0 = (int)(w->offset / wt->src_row_bytes);
 	if (row0 + n > wt->n)
 		return ERR_INVALID_ARG;
-	int use_w4 = p->w4_on && !p->w4_failed && !p->npu_failed && wt->w4 && row0 == 0 && n == wt->n;
+	int use_quant =
+		p->quant_on && !p->quant_failed && !p->npu_failed && wt->quant && row0 == 0 && n == wt->n;
 	if (wt->fused_parent) {
 		row0 += wt->fused_row0;
 		wt = wt->fused_parent;
 	}
-	if (use_w4 || wt->host_copy || wt->n_kchunks != 1 ||
+	if (use_quant || wt->host_copy || wt->n_kchunks != 1 ||
 		wt->kchunks[0].k_len + RKT_FOLD_K_LEN > p->max_k || wt->k_pad != wt->k ||
 		rkt_ptr(residual) == NULL) {
 		const float *rr = rkt_ptr(residual);
@@ -2328,7 +2351,7 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 					convert_to_f16(p->x16, xf, (size_t)k);
 					memset(p->x16 + k, 0, (size_t)(wt->k_pad - wt->k) * sizeof(uint16_t));
 					p->x16[k] = 0x3C00u;
-					s		  = npu_matmul_fold(p, wt, row0, n, p->x16, yf, 1);
+					s		  = dense_matmul_fold(p, wt, row0, n, p->x16, yf, 1);
 				} else {
 					s = ERR_OUT_OF_MEMORY;
 				}
@@ -2355,14 +2378,32 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 
 #define RKT_LUT_HQ_SEL 4
 #define RKT_LUT_HOST_LIMIT 15.5f
+#define RKT_LUT_VERIFY_N 512
+#define RKT_LUT_VERIFY_RANGE 12.0f
+#define RKT_LUT_VERIFY_ABS_TOL 2.0e-3
+#define RKT_LUT_VERIFY_REL_TOL 2.0e-3
 
-static double rkt_lut_fn(rkt_lut_kind kind, double x) {
+static const char *lut_name(rkt_lut_kind kind) {
+	return kind == RKT_LUT_GELU_TANH ? "gelu" : "silu";
+}
+
+static rkt_lut_kind lut_kind_for_activation(int activation) {
+	if (activation == RKT_FFNA_SILU)
+		return RKT_LUT_SILU;
+	if (activation == RKT_FFNA_GELU)
+		return RKT_LUT_GELU_TANH;
+	return RKT_LUT_NONE;
+}
+
+static double lut_eval(rkt_lut_kind kind, double x) {
+	if (x < -40.0)
+		return 0.0;
 	if (kind == RKT_LUT_GELU_TANH)
 		return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 	return x / (1.0 + exp(-x));
 }
 
-static void rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
+static void lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
 	cfg->kind		= kind;
 	cfg->sel		= RKT_LUT_HQ_SEL;
 	cfg->S			= 256;
@@ -2372,11 +2413,11 @@ static void rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
 	cfg->tail_slope = cfg->F / cfg->S;
 }
 
-static void rkt_lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
+static void lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
 	long step = 1L << cfg->sel;
 	for (int i = 0; i < RKT_LUT_ENTRIES; i++) {
 		long   y_int = (long)cfg->start + (long)i * step;
-		double v	 = rkt_lut_fn(cfg->kind, (double)y_int / cfg->S) * cfg->F;
+		double v	 = lut_eval(cfg->kind, (double)y_int / cfg->S) * cfg->F;
 		long   r	 = lround(v);
 		if (r > 32767)
 			r = 32767;
@@ -2386,242 +2427,323 @@ static void rkt_lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
 	}
 }
 
-static void rkt_act_cache_reset(rkt_priv *p, rkt_act_cache *a) {
+static void lut_state_reset(rkt_priv *p, rkt_lut_state *a) {
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
 		rkt_bo_destroy(&p->dev, &a->identity[c]);
 		rkt_bo_destroy(&p->dev, &a->in[c]);
 		rkt_bo_destroy(&p->dev, &a->out[c]);
 		rkt_bo_destroy(&p->dev, &a->regcmd[c]);
 	}
-	a->ready		 = 0;
-	a->uploaded_kind = -1;
+	a->ready	  = 0;
+	a->table_kind = RKT_LUT_NONE;
 }
 
-static status_code rkt_lut_upload_tables(rkt_priv *p, rkt_act_cache *a, const uint16_t *le) {
-	for (int off = 0; off < RKT_LUT_ENTRIES; off += RKT_LUT_UPLOAD_CHUNK) {
-		int count = RKT_LUT_ENTRIES - off < RKT_LUT_UPLOAD_CHUNK ? RKT_LUT_ENTRIES - off
-																 : RKT_LUT_UPLOAD_CHUNK;
-		for (int c = 0; c < p->dev.n_cores; c++) {
-			uint32_t n_ops = (uint32_t)rkt_emit_lut_upload(
-				a->regcmd[c].map, 0, off, le + off, count, (uint32_t)a->in[c].dma_addr,
-				(uint32_t)a->identity[c].dma_addr, (uint32_t)a->out[c].dma_addr);
-			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
-				return ERR_INTERNAL;
-			if (rkt_bo_flush(&p->dev, &a->regcmd[c]))
-				return ERR_IO;
-			uint32_t regcmd_dma = (uint32_t)a->regcmd[c].dma_addr;
-			if (rkt_submit(&p->dev, &regcmd_dma, &n_ops, 1, &a->regcmd[c], &a->in[c], &a->out[c]))
-				return ERR_COMPUTE_FAIL;
-			if (rkt_bo_wait(&p->dev, &a->out[c]))
-				return ERR_COMPUTE_FAIL;
-		}
-	}
-	return OK;
-}
-
-static status_code rkt_act_cache_init(rkt_priv *p, rkt_act_cache *a) {
+static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
 	if (a->ready)
 		return OK;
-	rkt_lut_configure(&a->cfg, RKT_LUT_NONE);
-	size_t	 identity_bytes = (size_t)RKT_ACT_CHUNK * RKT_ACT_CHUNK * sizeof(uint16_t);
-	size_t	 in_bytes		= (size_t)RKT_ACT_BLOCK_ROWS * RKT_ACT_CHUNK * sizeof(uint16_t);
-	size_t	 out_bytes		= (size_t)RKT_ACT_BLOCK_ROWS * RKT_ACT_CHUNK * sizeof(float);
-	uint16_t row[RKT_ACT_CHUNK];
+	lut_configure(&a->cfg, RKT_LUT_NONE);
+	size_t	 identity_bytes = (size_t)RKT_LUT_CHUNK * RKT_LUT_CHUNK * sizeof(uint16_t);
+	uint16_t row[RKT_LUT_CHUNK];
 	for (int c = 0; c < p->dev.n_cores; c++) {
 		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity[c]) ||
-			rkt_bo_create(&p->dev, c, in_bytes, &a->in[c]) ||
-			rkt_bo_create(&p->dev, c, out_bytes, &a->out[c]) ||
-			rkt_bo_create(&p->dev, c, RKT_REGCMD_BYTES, &a->regcmd[c])) {
-			rkt_act_cache_reset(p, a);
+			rkt_bo_create(&p->dev, c, RKT_LUT_BLOCKS_PER_CORE * RKT_LUT_IN_BLOCK_BYTES,
+						  &a->in[c]) ||
+			rkt_bo_create(&p->dev, c, RKT_LUT_BLOCKS_PER_CORE * RKT_LUT_OUT_BLOCK_BYTES,
+						  &a->out[c]) ||
+			rkt_bo_create(&p->dev, c, RKT_LUT_TASKS_PER_CORE * RKT_REGCMD_BYTES, &a->regcmd[c])) {
+			lut_state_reset(p, a);
 			return ERR_OUT_OF_MEMORY;
 		}
-		for (int j = 0; j < RKT_ACT_CHUNK; j++) {
+		for (int j = 0; j < RKT_LUT_CHUNK; j++) {
 			memset(row, 0, sizeof(row));
 			row[j] = f32_to_f16_bits((float)a->cfg.S);
-			tile_weight_row(a->identity[c].map, row, RKT_ACT_CHUNK, j);
+			tile_weight_row(a->identity[c].map, row, RKT_LUT_CHUNK, j);
 		}
 		if (rkt_bo_flush(&p->dev, &a->identity[c])) {
-			rkt_act_cache_reset(p, a);
+			lut_state_reset(p, a);
 			return ERR_IO;
 		}
 	}
-	a->uploaded_kind = -1;
-	a->ready		 = 1;
+	a->ready = 1;
 	return OK;
 }
 
-static status_code rkt_act_cache_select(rkt_priv *p, rkt_act_cache *a, rkt_lut_kind kind) {
-	status_code s = rkt_act_cache_init(p, a);
+static status_code lut_write_upload_tasks(rkt_priv *p, rkt_lut_state *a, const uint16_t *le) {
+	for (int c = 0; c < p->dev.n_cores; c++) {
+		for (int t = 0; t < RKT_LUT_UPLOAD_TASKS; t++) {
+			uint32_t n_ops = (uint32_t)rkt_emit_lut_upload(
+				(uint64_t *)((uint8_t *)a->regcmd[c].map + (size_t)t * RKT_REGCMD_BYTES), 0,
+				t * RKT_LUT_UPLOAD_CHUNK, le + t * RKT_LUT_UPLOAD_CHUNK, RKT_LUT_UPLOAD_CHUNK,
+				(uint32_t)a->in[c].dma_addr, (uint32_t)a->identity[c].dma_addr,
+				(uint32_t)a->out[c].dma_addr);
+			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
+				return ERR_INTERNAL;
+			a->upload_ops[t] = n_ops;
+		}
+		if (rkt_bo_flush(&p->dev, &a->regcmd[c]))
+			return ERR_IO;
+	}
+	return OK;
+}
+
+static status_code lut_state_select(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	status_code s = lut_state_init(p, a);
 	if (s != OK)
 		return s;
-	rkt_lut_configure(&a->cfg, kind);
-	if (a->uploaded_kind == (int)kind)
+	lut_configure(&a->cfg, kind);
+	if (a->table_kind == kind)
 		return OK;
 	uint16_t le[RKT_LUT_ENTRIES];
-	rkt_lut_fill(&a->cfg, le);
-	s = rkt_lut_upload_tables(p, a, le);
+	lut_fill(&a->cfg, le);
+	s = lut_write_upload_tasks(p, a, le);
 	if (s == OK)
-		a->uploaded_kind = (int)kind;
+		a->table_kind = kind;
 	return s;
 }
 
 typedef struct {
 	int first;
 	int rows;
-} act_block;
+} lut_block;
 
-static status_code rkt_act_round(rkt_priv *p, rkt_act_cache *a, const uint16_t *x16,
-								 const act_block *blocks, int n_blocks, float *out, int n,
-								 int chunks_per_row) {
-	uint32_t n_ops[RKT_MAX_CORES];
-	for (int c = 0; c < n_blocks; c++) {
-		const act_block *b = &blocks[c];
-		tile_input(a->in[c].map, x16 + (size_t)b->first * RKT_ACT_CHUNK, b->rows, RKT_ACT_CHUNK);
-		n_ops[c] = (uint32_t)rkt_emit_matmul_f16_lut(
-			a->regcmd[c].map, b->rows, RKT_ACT_CHUNK, RKT_ACT_CHUNK, (uint32_t)a->in[c].dma_addr,
-			(uint32_t)a->identity[c].dma_addr, (uint32_t)a->out[c].dma_addr, &a->cfg);
-		if (n_ops[c] > RKT_REGCMD_MAX_OPS)
+static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, const uint16_t *x16,
+								const lut_block *blocks, int n_blocks) {
+	int		 n_cores				 = p->dev.n_cores;
+	int		 per_core[RKT_MAX_CORES] = {0};
+	uint32_t n_ops[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
+	uint32_t regcmd_dma[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
+
+	for (int c = 0; c < n_cores; c++)
+		for (int t = 0; t < RKT_LUT_UPLOAD_TASKS; t++) {
+			n_ops[c][t]		 = a->upload_ops[t];
+			regcmd_dma[c][t] = (uint32_t)(a->regcmd[c].dma_addr + (size_t)t * RKT_REGCMD_BYTES);
+		}
+
+	for (int i = 0; i < n_blocks; i++) {
+		const lut_block *b	  = &blocks[i];
+		int				 c	  = i % n_cores;
+		int				 slot = i / n_cores;
+		int				 task = RKT_LUT_UPLOAD_TASKS + slot;
+		tile_input((uint16_t *)((uint8_t *)a->in[c].map + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
+				   x16 + (size_t)b->first * RKT_LUT_CHUNK, b->rows, RKT_LUT_CHUNK);
+		n_ops[c][task] = (uint32_t)rkt_emit_matmul_f16_lut(
+			(uint64_t *)((uint8_t *)a->regcmd[c].map + (size_t)task * RKT_REGCMD_BYTES), b->rows,
+			RKT_LUT_CHUNK, RKT_LUT_CHUNK,
+			(uint32_t)(a->in[c].dma_addr + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
+			(uint32_t)a->identity[c].dma_addr,
+			(uint32_t)(a->out[c].dma_addr + (size_t)slot * RKT_LUT_OUT_BLOCK_BYTES), &a->cfg);
+		if (!n_ops[c][task] || n_ops[c][task] > RKT_REGCMD_MAX_OPS)
 			return ERR_INTERNAL;
-		if (rkt_bo_flush(&p->dev, &a->in[c]) || rkt_bo_flush(&p->dev, &a->regcmd[c]))
-			return ERR_IO;
+		regcmd_dma[c][task] = (uint32_t)(a->regcmd[c].dma_addr + (size_t)task * RKT_REGCMD_BYTES);
+		per_core[c]++;
 	}
+
+	for (int c = 0; c < n_cores; c++)
+		if (per_core[c] &&
+			(rkt_bo_flush(&p->dev, &a->in[c]) || rkt_bo_flush(&p->dev, &a->regcmd[c])))
+			return ERR_IO;
 
 	status_code s		  = OK;
 	int			submitted = 0;
-	for (; submitted < n_blocks && s == OK; submitted++) {
-		uint32_t regcmd_dma = (uint32_t)a->regcmd[submitted].dma_addr;
-		if (rkt_submit(&p->dev, &regcmd_dma, &n_ops[submitted], 1, &a->regcmd[submitted],
+	for (; submitted < n_cores && per_core[submitted] && s == OK; submitted++)
+		if (rkt_submit(&p->dev, regcmd_dma[submitted], n_ops[submitted],
+					   RKT_LUT_UPLOAD_TASKS + per_core[submitted], &a->regcmd[submitted],
 					   &a->in[submitted], &a->out[submitted]))
 			s = ERR_COMPUTE_FAIL;
-	}
 	for (int c = 0; c < submitted; c++)
 		if (rkt_bo_wait(&p->dev, &a->out[c]) && s == OK)
 			s = ERR_COMPUTE_FAIL;
-	if (s != OK)
-		return s;
-
-	float inv = 1.0f / (float)a->cfg.F;
-	for (int c = 0; c < n_blocks; c++) {
-		const act_block *b	= &blocks[c];
-		const float		*om = a->out[c].map;
-		for (int r = 0; r < b->rows; r++) {
-			int	   pixel = b->first + r;
-			int	   col0	 = (pixel % chunks_per_row) * RKT_ACT_CHUNK;
-			int	   cols	 = n - col0 < RKT_ACT_CHUNK ? n - col0 : RKT_ACT_CHUNK;
-			float *dst	 = out + (size_t)(pixel / chunks_per_row) * n + col0;
-			for (int nn = 0; nn < cols; nn++)
-				dst[nn] = om[(size_t)(nn / RKT_OUT_C2_F32) * b->rows * RKT_OUT_C2_F32 +
-							 (size_t)r * RKT_OUT_C2_F32 + nn % RKT_OUT_C2_F32] *
-						  inv;
-		}
-	}
-	return OK;
+	return s;
 }
 
-static status_code rkt_lut_act_rows(rkt_priv *p, rkt_act_cache *a, rkt_lut_kind kind,
-									const float *gate, int gate_stride, float *out, int n, int m) {
-	status_code s = rkt_act_cache_select(p, a, kind);
+typedef struct {
+	const rkt_lut_state *a;
+	const lut_block		*blocks;
+	const uint16_t		*x16;
+	const float			*up;
+	float				*out;
+	int					 up_stride;
+	int					 n;
+	int					 chunks_per_row;
+	int					 n_cores;
+	rkt_lut_kind		 kind;
+	float				 inv;
+} lut_gather;
+
+static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	const lut_gather *g = arg;
+	for (int i = begin; i < end; i++) {
+		const lut_block *b	  = &g->blocks[i];
+		int				 c	  = i % g->n_cores;
+		int				 slot = i / g->n_cores;
+		const float		*om	  = (const float *)((const uint8_t *)g->a->out[c].map +
+												(size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
+		for (int r = 0; r < b->rows; r++) {
+			int				pixel = b->first + r;
+			int				row	  = pixel / g->chunks_per_row;
+			int				col0  = (pixel % g->chunks_per_row) * RKT_LUT_CHUNK;
+			int				cols  = g->n - col0 < RKT_LUT_CHUNK ? g->n - col0 : RKT_LUT_CHUNK;
+			const uint16_t *x	  = g->x16 + (size_t)pixel * RKT_LUT_CHUNK;
+			const float	   *u	  = g->up + (size_t)row * g->up_stride + col0;
+			float		   *dst	  = g->out + (size_t)row * g->n + col0;
+			for (int j = 0; j < cols; j++) {
+				float v	 = om[(size_t)(j / RKT_OUT_C2_F32) * b->rows * RKT_OUT_C2_F32 +
+							  (size_t)r * RKT_OUT_C2_F32 + j % RKT_OUT_C2_F32] *
+						   g->inv;
+				float xv = f16_bits_to_f32(x[j]);
+				if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
+					v = (float)lut_eval(g->kind, (double)xv);
+				dst[j] = v * u[j];
+			}
+		}
+	}
+}
+
+static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
+									 const float *gate, int gate_stride, const float *up,
+									 int up_stride, float *out, int n, int m) {
+	status_code s = lut_state_select(p, a, kind);
 	if (s != OK)
 		return s;
 
-	int chunks_per_row = (n + RKT_ACT_CHUNK - 1) / RKT_ACT_CHUNK;
+	int chunks_per_row = (n + RKT_LUT_CHUNK - 1) / RKT_LUT_CHUNK;
 	int pixels		   = m * chunks_per_row;
-	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)pixels * RKT_ACT_CHUNK,
+	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)pixels * RKT_LUT_CHUNK,
 						 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	for (int r = 0; r < m; r++) {
-		uint16_t *dst = p->x16 + (size_t)r * chunks_per_row * RKT_ACT_CHUNK;
+		uint16_t *dst = p->x16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
 		convert_to_f16(dst, gate + (size_t)r * gate_stride, (size_t)n);
-		memset(dst + n, 0, ((size_t)chunks_per_row * RKT_ACT_CHUNK - (size_t)n) * sizeof(uint16_t));
+		memset(dst + n, 0, ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
 	}
 
-	act_block blocks[RKT_MAX_CORES];
-	for (int done = 0; done < pixels && s == OK;) {
+	lut_block blocks[RKT_MAX_CORES * RKT_LUT_BLOCKS_PER_CORE];
+	int		  wave_capacity = p->dev.n_cores * RKT_LUT_BLOCKS_PER_CORE;
+	tpool	 *pool			= tpool_fetch_pool();
+	for (int done = 0; done < pixels;) {
 		int n_blocks = 0;
-		while (n_blocks < p->dev.n_cores && done < pixels) {
-			int rows		   = next_block_rows(pixels - done, RKT_ACT_BLOCK_ROWS);
-			blocks[n_blocks++] = (act_block){.first = done, .rows = rows};
+		while (n_blocks < wave_capacity && done < pixels) {
+			int rows		   = next_block_rows(pixels - done, RKT_LUT_BLOCK_ROWS);
+			blocks[n_blocks++] = (lut_block){.first = done, .rows = rows};
 			done += rows;
 		}
-		s = rkt_act_round(p, a, p->x16, blocks, n_blocks, out, n, chunks_per_row);
-	}
-	a->uploaded_kind = -1;
-	if (s != OK)
-		return s;
-	for (int r = 0; r < m; r++) {
-		const uint16_t *x = p->x16 + (size_t)r * chunks_per_row * RKT_ACT_CHUNK;
-		float		   *o = out + (size_t)r * n;
-		for (int i = 0; i < n; i++) {
-			float v = f16_bits_to_f32(x[i]);
-			if (fabsf(v) >= RKT_LUT_HOST_LIMIT)
-				o[i] = (float)rkt_lut_fn(kind, (double)v);
-		}
+		s = lut_run_wave(p, a, p->x16, blocks, n_blocks);
+		if (s != OK)
+			return s;
+		lut_gather g = {.a				= a,
+						.blocks			= blocks,
+						.x16			= p->x16,
+						.up				= up,
+						.out			= out,
+						.up_stride		= up_stride,
+						.n				= n,
+						.chunks_per_row = chunks_per_row,
+						.n_cores		= p->dev.n_cores,
+						.kind			= kind,
+						.inv			= 1.0f / (float)a->cfg.F};
+		tpool_parallel_for(pool, n_blocks, 4, lut_gather_chunk, &g);
 	}
 	return OK;
 }
 
-static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, const buffer *up,
-										 buffer *out, int n, int activation, int m, int gate_stride,
-										 int up_stride, int fused);
+static status_code lut_verify(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	float ramp[RKT_LUT_VERIFY_N], ones[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		ramp[i] = -RKT_LUT_VERIFY_RANGE +
+				  2.0f * RKT_LUT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
+		ones[i] = 1.0f;
+	}
+	status_code s = lut_activate_rows(p, a, kind, ramp, RKT_LUT_VERIFY_N, ones, RKT_LUT_VERIFY_N,
+									  got, RKT_LUT_VERIFY_N, 1);
+	if (s != OK)
+		return s;
+
+	double worst   = 0.0;
+	float  worst_x = 0.0f;
+	int	   bad	   = 0;
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
+		double ref = lut_eval(kind, (double)x);
+		double err = fabs((double)got[i] - ref);
+		if (err > worst) {
+			worst	= err;
+			worst_x = x;
+		}
+		if (!(err <= RKT_LUT_VERIFY_ABS_TOL + RKT_LUT_VERIFY_REL_TOL * fabs(ref)))
+			bad++;
+	}
+	if (bad) {
+		WARN("rocket: lut %s verification failed: %d/%d points off, max err %.5f at x=%.4f, "
+			 "activation stays on host",
+			 lut_name(kind), bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
+		return ERR_COMPUTE_FAIL;
+	}
+	return OK;
+}
+
+static status_code lut_ensure_verified(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	if (a->verified[kind] > 0)
+		return OK;
+	if (a->verified[kind] < 0)
+		return ERR_UNSUPPORTED;
+	status_code s	  = lut_verify(p, a, kind);
+	a->verified[kind] = s == OK ? 1 : -1;
+	return s;
+}
+
+static status_code ffn_activate_host(backend *self, const buffer *gate, const buffer *up,
+									 buffer *out, int n, int activation, int m, int gate_stride,
+									 int up_stride, int fused) {
+	if (fused || gate_stride != n || up_stride != n)
+		return ERR_UNSUPPORTED;
+	backend_report_host_fallback(self, "ffn_activate", HFB_OP_NOT_NATIVE, "shape n=%d m=%d act=%d",
+								 n, m, activation);
+	backend *host = backend_host();
+	if (!host || !host->ffn_activate_batch)
+		return ERR_UNSUPPORTED;
+	return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
+}
 
 static status_code rkt_ffn_activate_kind_inner(backend *self, const buffer *gate, const buffer *up,
 											   buffer *out, int n, int activation, int m,
 											   int gate_stride, int up_stride, int fused) {
-	rkt_priv *p		= self->priv;
-	float	 *ucopy = NULL;
+	rkt_priv *p = self->priv;
 	if (n <= 0 || m <= 0)
 		return OK;
-	if (m > 1 || activation != RKT_FFNA_SILU)
-		goto host;
-	rkt_lut_kind kind = RKT_LUT_SILU;
+	rkt_lut_kind kind = lut_kind_for_activation(activation);
+	if (kind == RKT_LUT_NONE || p->npu_failed)
+		return ffn_activate_host(self, gate, up, out, n, activation, m, gate_stride, up_stride,
+								 fused);
 
-	const float *gf		 = rkt_ptr(gate);
-	const float *uf		 = rkt_ptr(up);
-	float		*of		 = rkt_ptr(out);
-	const float *up_end	 = uf + (size_t)(m - 1) * up_stride + n;
-	const float *out_end = of + (size_t)m * n;
+	const float *gf		  = rkt_ptr(gate);
+	const float *uf		  = rkt_ptr(up);
+	float		*of		  = rkt_ptr(out);
+	float		*ucopy	  = NULL;
+	const float *up_end	  = uf + (size_t)(m - 1) * up_stride + n;
+	const float *out_end  = of + (size_t)m * n;
+	int			 u_stride = up_stride;
 	if (of < up_end && uf < out_end) {
 		ucopy = xmalloc((size_t)n * (size_t)m * sizeof(float));
 		for (int r = 0; r < m; r++)
 			memcpy(ucopy + (size_t)r * n, uf + (size_t)r * up_stride, (size_t)n * sizeof(float));
-		uf = ucopy;
-	}
-
-	int chunks_per_row = (n + RKT_ACT_CHUNK - 1) / RKT_ACT_CHUNK;
-	if ((size_t)m * chunks_per_row >
-		(size_t)p->dev.n_cores * RKT_ACT_BLOCK_ROWS * RKT_ACT_MAX_ROUNDS) {
-	host:
-		free(ucopy);
-		if (fused || gate_stride != n || up_stride != n)
-			return ERR_UNSUPPORTED;
-		backend_report_host_fallback(self, "ffn_activate", HFB_OP_NOT_NATIVE,
-									 "shape n=%d m=%d act=%d", n, m, activation);
-		backend *host = backend_host();
-		if (!host || !host->ffn_activate_batch)
-			return ERR_UNSUPPORTED;
-		return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
+		uf		 = ucopy;
+		u_stride = n;
 	}
 
 	pthread_mutex_lock(&p->lock);
-	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL
-								  : rkt_lut_act_rows(p, &p->act, kind, gf, gate_stride, of, n, m);
-	if (s != OK && !p->npu_failed) {
+	status_code s = lut_ensure_verified(p, &p->lut, kind);
+	if (s == OK)
+		s = lut_activate_rows(p, &p->lut, kind, gf, gate_stride, uf, u_stride, of, n, m);
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.verified[kind] > 0) {
 		npu_record_failure(p);
 		WARN("rocket: npu ffn_activate failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
 	}
 	pthread_mutex_unlock(&p->lock);
-	if (s != OK)
-		goto host;
-
-	int u_stride = ucopy ? n : up_stride;
-	for (int r = 0; r < m; r++) {
-		const float *g = of + (size_t)r * n;
-		const float *u = uf + (size_t)r * u_stride;
-		float		*o = of + (size_t)r * n;
-		for (int i = 0; i < n; i++)
-			o[i] = g[i] * u[i];
-	}
 	free(ucopy);
+	if (s != OK)
+		return ffn_activate_host(self, gate, up, out, n, activation, m, gate_stride, up_stride,
+								 fused);
 	return OK;
 }
 
@@ -2629,11 +2751,11 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 										 buffer *out, int n, int activation, int m, int gate_stride,
 										 int up_stride, int fused) {
 	rkt_priv   *p  = self->priv;
-	double		t0 = p->prof && m == 1 ? w4_now_ms() : 0.0;
+	double		t0 = p->prof && m == 1 ? now_ms() : 0.0;
 	status_code s  = rkt_ffn_activate_kind_inner(self, gate, up, out, n, activation, m, gate_stride,
 												 up_stride, fused);
 	if (p->prof && m == 1)
-		prof_add(p, PROF_ACT, w4_now_ms() - t0);
+		prof_add(p, PROF_LUT, now_ms() - t0);
 	return s;
 }
 
@@ -2667,10 +2789,11 @@ static status_code rkt_matmul_ffn_down_batch(backend *self, const buffer *w, uin
 	rkt_priv *p = self->priv;
 	if (m <= 0)
 		return ERR_INVALID_ARG;
-	if (!ensure_capacity((void **)&p->act_tmp, &p->act_tmp_cap, (size_t)m * k, sizeof(float)))
+	if (!ensure_capacity((void **)&p->ffn_act_tmp, &p->ffn_act_tmp_cap, (size_t)m * k,
+						 sizeof(float)))
 		return ERR_OUT_OF_MEMORY;
 
-	buffer		act_buf = buffer_host_view(self, p->act_tmp, (size_t)m * k * sizeof(float));
+	buffer		act_buf = buffer_host_view(self, p->ffn_act_tmp, (size_t)m * k * sizeof(float));
 	status_code s = rkt_ffn_activate_kind(self, gate, up, &act_buf, k, activation, m, k, k, 0);
 	if (s != OK)
 		return s;
@@ -2977,7 +3100,7 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 					memcpy(q_buf + (size_t)(r * n_groups + h) * head_dim,
 						   qf + ((size_t)r * n_heads + (size_t)g * n_groups + h) * head_dim,
 						   (size_t)head_dim * sizeof(float));
-			s = npu_matmul_enqueue(p, sl->k, g * sl->pos_pad, span16, q_buf, scores, M);
+			s = dense_matmul_enqueue(p, sl->k, g * sl->pos_pad, span16, q_buf, scores, M);
 		}
 		if (s == OK)
 			s = flush_queue(p);
@@ -2989,7 +3112,7 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 			float *probs   = scores + (size_t)M * span16;
 			attention_softmax(scores, probs, m, n_groups, span16, sl->pos_pad, pos_start, window,
 							  scale);
-			s = npu_matmul_enqueue(p, sl->v, (g0 + i) * sl->hd_pad, head_dim, probs, out_buf, M);
+			s = dense_matmul_enqueue(p, sl->v, (g0 + i) * sl->hd_pad, head_dim, probs, out_buf, M);
 		}
 		if (s == OK)
 			s = flush_queue(p);
@@ -3033,12 +3156,12 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 										 n_kv_heads_active, m);
 		return ERR_UNSUPPORTED;
 	}
-	double		t0 = p->prof && m == 1 ? w4_now_ms() : 0.0;
+	double		t0 = p->prof && m == 1 ? now_ms() : 0.0;
 	status_code s  = rkt_attention_batch_inner(self, q, k_cache, v_cache, out, layer, pos_start,
 											   n_heads, n_kv_heads, head_dim, n_ctx, flash_attn,
 											   scale, n_kv_heads_active, m, window);
 	if (p->prof && m == 1)
-		prof_add(p, PROF_ATTN, w4_now_ms() - t0);
+		prof_add(p, PROF_ATTN, now_ms() - t0);
 	return s;
 }
 
@@ -3098,10 +3221,10 @@ static void free_slots(rkt_priv *p) {
 	for (int c = 0; c < RKT_MAX_CORES; c++)
 		rkt_bo_destroy(&p->dev, &p->streams[c].bo);
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
-		rkt_bo_destroy(&p->dev, &p->w4_pf[c].in);
-		rkt_bo_destroy(&p->dev, &p->w4_pf[c].out);
-		rkt_bo_destroy(&p->dev, &p->w4_pf[c].reg);
-		free(p->w4_pf[c].n_ops);
+		rkt_bo_destroy(&p->dev, &p->quant_pf[c].in);
+		rkt_bo_destroy(&p->dev, &p->quant_pf[c].out);
+		rkt_bo_destroy(&p->dev, &p->quant_pf[c].reg);
+		free(p->quant_pf[c].n_ops);
 	}
 }
 
@@ -3114,10 +3237,11 @@ static void rkt_free(backend *self) {
 	if (p->fused_groups)
 		log_tag("RKT", "fused %d weights into %d larger job sets", p->fused_weights,
 				p->fused_groups);
-	if (p->w4_on)
-		log_tag("RKT", "quantized weights: %d w4, %d w8", p->wq_accepted[0], p->wq_accepted[1]);
+	if (p->quant_on)
+		log_tag("RKT", "quantized weights: %d int4, %d int8", p->quant_accepted[0],
+				p->quant_accepted[1]);
 	free_slots(p);
-	rkt_act_cache_reset(p, &p->act);
+	lut_state_reset(p, &p->lut);
 	rkt_device_close(&p->dev);
 	pthread_mutex_destroy(&p->lock);
 	free(p->weights);
@@ -3125,7 +3249,7 @@ static void rkt_free(backend *self) {
 	free(p->x_chunk);
 	free(p->y_tmp);
 	free(p->attn_ws);
-	free(p->act_tmp);
+	free(p->ffn_act_tmp);
 	if (p->prof)
 		prof_print(p);
 	free(p);
@@ -3137,13 +3261,13 @@ static status_code rkt_init(backend *self, int device_index) {
 	rkt_priv *p = xcalloc(1, sizeof(*p));
 	p->max_k =
 		env_int("KAPPAI_ROCKET_MAX_K", RKT_MAX_K, RKT_K_ALIGN, RKT_MAX_K) & ~(RKT_K_ALIGN - 1);
-	p->poison	  = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
-	p->fuse		  = 1;
-	p->w4_on	  = 1;
-	p->w4_group	  = 480;
-	p->w4_check	  = env_int("KAPPAI_ROCKET_W4_CHECK", 0, 0, 1);
-	p->w4_prefill = 1;
-	p->prof		  = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
+	p->poison		 = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
+	p->fuse			 = 1;
+	p->quant_on		 = 1;
+	p->quant_group	 = 480;
+	p->quant_check	 = env_int("KAPPAI_ROCKET_QUANT_CHECK", 0, 0, 1);
+	p->quant_prefill = 1;
+	p->prof			 = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
 	pthread_mutex_init(&p->lock, NULL);
 	self->priv = p;
 
@@ -3157,8 +3281,8 @@ static status_code rkt_init(backend *self, int device_index) {
 	log_tag(
 		"RKT",
 		"%s: %d core(s), max_k=%d, poison=%d, tasks/job=%d, group=%d prefill=%d prefill_tokens=%d",
-		device_path(), p->dev.n_cores, p->max_k, p->poison, RKT_MAX_TASKS, p->w4_group,
-		p->w4_prefill, RKT_W4_PREFILL_TOKENS);
+		device_path(), p->dev.n_cores, p->max_k, p->poison, RKT_MAX_TASKS, p->quant_group,
+		p->quant_prefill, RKT_QUANT_PREFILL_TOKENS);
 	return OK;
 }
 
