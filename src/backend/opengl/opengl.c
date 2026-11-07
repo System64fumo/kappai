@@ -1289,13 +1289,14 @@ static status_code gl_probe(void) {
 }
 
 static int gl_device_count(void) {
-	return gl_context_probe() == OK ? 1 : 0;
+	return gl_render_node_count();
 }
 
 static status_code gl_device_identity(int device_index, char *out, size_t cap) {
-	if (device_index != 0)
+	int node = gl_render_node_at(device_index);
+	if (node < 0)
 		return ERR_INVALID_ARG;
-	return gl_render_node_identity(out, cap);
+	return gl_render_node_identity(node, out, cap);
 }
 
 static status_code gl_init(backend *self, int device_index) {
@@ -1303,7 +1304,10 @@ static status_code gl_init(backend *self, int device_index) {
 	gl_priv *p = xcalloc(1, sizeof(gl_priv));
 	self->priv = p;
 
-	status_code s = gl_context_init(&p->ctx);
+	int node = gl_render_node_at(device_index);
+	if (node < 0)
+		node = device_index;
+	status_code s = gl_context_init(&p->ctx, node);
 	if (s != OK) {
 		free(p);
 		self->priv = NULL;
