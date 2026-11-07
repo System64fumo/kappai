@@ -200,9 +200,10 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 			proj_buf = ctx->bs->ple_proj_dev;
 		}
 
-		st = a->matmul_batch(a, &m->layer_dims.per_layer_model_proj.buf,
-							 m->layer_dims.per_layer_model_proj.type, xb, &proj_buf, total_ple, dim,
-							 n_rows);
+		backend *mm_be = op_backend_pick(a, a->matmul_batch != NULL, "matmul");
+		st = mm_be->matmul_batch(mm_be, &m->layer_dims.per_layer_model_proj.buf,
+								 m->layer_dims.per_layer_model_proj.type, xb, &proj_buf, total_ple,
+								 dim, n_rows);
 		if (st != OK)
 			return st;
 
@@ -260,11 +261,14 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 
 	ple_host_finish(&plan, ple, ple_proj, n_rows);
 
-	if (a->copy_buffer) {
-		st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
-		if (st != OK)
-			return st;
+	if (!a->buffer_write_f32) {
+		ERROR("ple_build: backend '%s' lacks buffer_write_f32; cannot upload host-built PLE",
+			  a->name);
+		return ERR_UNSUPPORTED;
 	}
+	st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
+	if (st != OK)
+		return st;
 
 	return OK;
 }
@@ -351,12 +355,13 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		}
 	}
 
-	buffer		 *xb2b = batch_slot(ctx->bs, ctx->op->in[0]);
-	profile_scope pps  = profile_begin(&ctx->s->prof, ctx->op->stage);
+	buffer		 *xb2b	= batch_slot(ctx->bs, ctx->op->in[0]);
+	backend		 *mm_be = op_backend_pick(a, a->matmul_batch != NULL, "matmul");
+	profile_scope pps	= profile_begin(&ctx->s->prof, ctx->op->stage);
 	profile_weight_bytes(&ctx->s->prof, ctx->op->stage, plan.gate_type, inj_dim, n_embd_per_layer);
 	profile_weight_bytes(&ctx->s->prof, ctx->op->stage, plan.proj_type, n_embd_per_layer, inj_dim);
-	st = a->matmul_batch(a, plan.gate_w, plan.gate_type, xb2b, &ple_inp_b, n_embd_per_layer,
-						 inj_dim, n_rows);
+	st = mm_be->matmul_batch(mm_be, plan.gate_w, plan.gate_type, xb2b, &ple_inp_b, n_embd_per_layer,
+							 inj_dim, n_rows);
 	if (st != OK) {
 		ERROR("ple_proj_inject_batch: matmul_batch(ple_inp_gate) failed (st=%d)", (int)st);
 		goto ple_cleanup;
@@ -364,8 +369,10 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 
 	buffer *aob = batch_slot(ctx->bs, ctx->op->in[1]);
 	if (caps & PLE_CAP_FUSED_DOWN) {
-		st = a->matmul_ffn_down_batch(a, plan.proj_w, plan.proj_type, &ple_inp_b, &ple_slice_b, aob,
-									  inj_dim, n_embd_per_layer, ACTIVATION_GELU, n_rows);
+		backend *down_be = op_backend_pick(a, a->matmul_ffn_down_batch != NULL, "ffn_down");
+		st = down_be->matmul_ffn_down_batch(down_be, plan.proj_w, plan.proj_type, &ple_inp_b,
+											&ple_slice_b, aob, inj_dim, n_embd_per_layer,
+											ACTIVATION_GELU, n_rows);
 		if (st != OK) {
 			ERROR("ple_proj_inject_batch: matmul_ffn_down_batch failed (st=%d)", (int)st);
 			goto ple_cleanup;
@@ -387,8 +394,8 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 			ERROR("ple_proj_inject_batch: ffn_activate_batch failed (st=%d)", (int)st);
 			goto ple_cleanup;
 		}
-		st = a->matmul_batch(a, plan.proj_w, plan.proj_type, &ple_inp_b, aob, inj_dim,
-							 n_embd_per_layer, n_rows);
+		st = mm_be->matmul_batch(mm_be, plan.proj_w, plan.proj_type, &ple_inp_b, aob, inj_dim,
+								 n_embd_per_layer, n_rows);
 		if (st != OK) {
 			ERROR("ple_proj_inject_batch: matmul_batch(ple_proj) failed (st=%d)", (int)st);
 			goto ple_cleanup;

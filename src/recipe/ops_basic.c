@@ -646,7 +646,8 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 		}
 		kvcache_attn_view(seg_cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
 		backend *kv_owner = kb->owner ? kb->owner : seg_cache->backend;
-		if (a != kv_owner && !backend_has_cap(kv_owner, BCAP_IS_HOST)) {
+		if (a != kv_owner && !backend_has_cap(kv_owner, BCAP_IS_HOST) &&
+			!backend_has_cap(kv_owner, BCAP_HOST_VISIBLE_BUFFERS)) {
 			st = ERR_UNSUPPORTED;
 			break;
 		}

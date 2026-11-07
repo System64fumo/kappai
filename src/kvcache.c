@@ -289,6 +289,13 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		.layer_pos_cap	  = layer_pos_cap,
 	};
 	status_code s = kv_backend->kv_alloc(kv_backend, &desc, &c->k, &c->v);
+	if (s == ERR_UNSUPPORTED && kv_backend != backend_host()) {
+		backend_report_host_fallback(kv_backend, "kv_alloc", HFB_CAPABILITY,
+									 "backend '%s' cannot hold this KV cache; using host memory",
+									 kv_backend->name);
+		kv_backend = backend_host();
+		s		   = kv_backend->kv_alloc(kv_backend, &desc, &c->k, &c->v);
+	}
 	free(layer_head_dim);
 	free(layer_n_kv_heads);
 	free(layer_pos_cap);

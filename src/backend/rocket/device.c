@@ -88,10 +88,10 @@ int rkt_bo_flush(rkt_device *dev, const rkt_bo *bo) {
 }
 
 int rkt_bo_wait(rkt_device *dev, const rkt_bo *bo) {
-	struct drm_rocket_prep_bo prep = {.handle = bo->handle};
+	struct drm_rocket_prep_bo prep = {.handle	  = bo->handle,
+									  .timeout_ns = monotonic_ns() + dev->timeout_ns};
 	if (ioctl(dev->fd[bo->core], DRM_IOCTL_ROCKET_PREP_BO, &prep) == 0)
 		return 0;
-	prep.timeout_ns = monotonic_ns() + dev->timeout_ns;
 	return ioctl(dev->fd[bo->core], DRM_IOCTL_ROCKET_PREP_BO, &prep) < 0 ? -errno : 0;
 }
 

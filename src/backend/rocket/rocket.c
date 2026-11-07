@@ -5,6 +5,7 @@
 #include "gguf.h"
 #include "hw.h"
 #include "log.h"
+#include "threadpool.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -30,6 +31,7 @@
 
 #define RKT_FOLD_K_LEN RKT_K_ALIGN
 
+#define RKT_MAX_JOB_WEIGHT_BYTES ((size_t)12582912)
 #define RKT_ACT_CHUNK 256
 #define RKT_ACT_BLOCK_ROWS RKT_TILE_ROWS
 #define RKT_ACT_MAX_ROUNDS 4
@@ -197,10 +199,8 @@ typedef struct {
 	int				 w4_group;
 	int				 w4_failed;
 	int				 w4_prefill_failed;
-	int				 w4_prefill_tokens;
 	int				 w4_check;
 	int				 w4_prefill;
-	int				 w8_on;
 	int				 wq_accepted[2];
 	rkt_w4_scratch	 w4_pf[RKT_MAX_CORES];
 	int				 w4_logged;
@@ -217,7 +217,6 @@ typedef struct {
 	rkt_act_cache	 act;
 	float			*act_tmp;
 	size_t			 act_tmp_cap;
-	int				 max_tasks;
 	rkt_core_queue	 queue[RKT_MAX_CORES];
 	rkt_stream_cache streams[RKT_MAX_CORES];
 	size_t			 in_len;
@@ -430,14 +429,47 @@ static int flush_weight(rkt_priv *p, rkt_weight *w) {
 	return 1;
 }
 
-typedef status_code (*row_source_fn)(void *ctx, int row, uint16_t *dst);
+#define RKT_PAR_MIN_ROWS 16
 
-static status_code fill_weight(rkt_priv *p, rkt_weight *w, row_source_fn source, void *ctx) {
+typedef struct {
+	int status;
+	status_code (*fn)(void *ctx, int lo, int hi);
+	void *ctx;
+} par_job;
+
+static void par_chunk(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	par_job *j = arg;
+	if (__atomic_load_n(&j->status, __ATOMIC_RELAXED) != OK)
+		return;
+	status_code s = j->fn(j->ctx, begin, end);
+	if (s != OK)
+		__atomic_store_n(&j->status, (int)s, __ATOMIC_RELAXED);
+}
+
+static status_code parallel_rows(int n, status_code (*fn)(void *ctx, int lo, int hi), void *ctx) {
+	par_job job = {.status = OK, .fn = fn, .ctx = ctx};
+	tpool_parallel_for(tpool_fetch_pool(), n, RKT_PAR_MIN_ROWS, par_chunk, &job);
+	return (status_code)job.status;
+}
+
+typedef status_code (*row_source_fn)(void *ctx, int row, uint16_t *dst, float *tmp);
+
+typedef struct {
+	rkt_weight	 *w;
+	row_source_fn source;
+	void		 *ctx;
+} fill_job;
+
+static status_code fill_rows(void *arg, int lo, int hi) {
+	fill_job   *job = arg;
+	rkt_weight *w	= job->w;
 	uint16_t   *row = xcalloc((size_t)w->k_pad, sizeof(uint16_t));
+	float	   *tmp = xmalloc((size_t)w->k * sizeof(float));
 	status_code s	= OK;
-	for (int r = 0; r < w->n_pad && s == OK; r++) {
+	for (int r = lo; r < hi && s == OK; r++) {
 		if (r < w->n)
-			s = source(ctx, r, row);
+			s = job->source(job->ctx, r, row, tmp);
 		else
 			memset(row, 0, (size_t)w->k_pad * sizeof(uint16_t));
 		for (int ci = 0; ci < w->n_kchunks && s == OK; ci++) {
@@ -450,7 +482,14 @@ static status_code fill_weight(rkt_priv *p, rkt_weight *w, row_source_fn source,
 			tile_weight_row(pt->bo.map, row + kc->k_off, kc->k_len, r - pt->row_start);
 		}
 	}
+	free(tmp);
 	free(row);
+	return s;
+}
+
+static status_code fill_weight(rkt_priv *p, rkt_weight *w, row_source_fn source, void *ctx) {
+	fill_job	job = {.w = w, .source = source, .ctx = ctx};
+	status_code s	= parallel_rows(w->n_pad, fill_rows, &job);
 	if (s == OK && !flush_weight(p, w))
 		s = ERR_IO;
 	return s;
@@ -462,12 +501,11 @@ typedef struct {
 	const uint8_t *data;
 	size_t		   row_bytes;
 	int			   k;
-	float		  *tmp;
 } quant_rows;
 
-static status_code quant_row_source(void *ctx, int row, uint16_t *dst) {
+static status_code quant_row_source(void *ctx, int row, uint16_t *dst, float *tmp) {
 	quant_rows *q = ctx;
-	return row_to_f16(q->host, q->type, q->data + (size_t)row * q->row_bytes, q->k, q->tmp, dst);
+	return row_to_f16(q->host, q->type, q->data + (size_t)row * q->row_bytes, q->k, tmp, dst);
 }
 
 static rkt_weight *new_weight(const tensor_desc *desc) {
@@ -491,11 +529,8 @@ static status_code upload_to_npu(rkt_priv *p, rkt_weight *w, const tensor_desc *
 		.data	   = desc->host_data,
 		.row_bytes = w->src_row_bytes,
 		.k		   = w->k,
-		.tmp	   = xmalloc((size_t)w->k * sizeof(float)),
 	};
-	status_code s = fill_weight(p, w, quant_row_source, &q);
-	free(q.tmp);
-	return s;
+	return fill_weight(p, w, quant_row_source, &q);
 }
 
 static status_code keep_on_host(rkt_weight *w, const tensor_desc *desc) {
@@ -539,7 +574,7 @@ static int poison_hits(const uint32_t *words, size_t count);
 #define RKT_W4_HEAD_ROWS 65536
 #define RKT_MAX_FUSE 8
 #define RKT_W4_MAX_CHILDREN RKT_MAX_FUSE
-#define RKT_W4_PREFILL_TOKENS_MAX 32
+#define RKT_W4_PREFILL_TOKENS 16
 
 typedef struct {
 	int		  n0;
@@ -673,25 +708,23 @@ static int w4_rows(const rkt_w4 *q, int tokens) {
 	return (q->bits == 4 ? 2 : 1) * tokens;
 }
 
-static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc, int bits) {
-	if (w->n < 1 || w->k < 1 || p->dev.n_cores < 1)
-		return ERR_UNSUPPORTED;
-	rkt_w4 *q	= xcalloc(1, sizeof(*q));
-	q->bits		= bits;
-	q->group	= p->w4_group;
-	q->n_ktiles = (w->k_pad + q->group - 1) / q->group;
-	q->n64		= (w->n + 63) / 64 * 64;
-	q->s_w		= xcalloc((size_t)q->n_ktiles * q->n64, sizeof(float));
-	q->corr		= bits == 4 ? xcalloc((size_t)q->n_ktiles * q->n64, sizeof(int16_t)) : NULL;
-	if (!w4_alloc_cores(p, w, q)) {
-		w4_free(p, q);
-		return ERR_OUT_OF_MEMORY;
-	}
+typedef struct {
+	const rkt_weight  *w;
+	rkt_w4			  *q;
+	const tensor_desc *desc;
+	backend			  *host;
+} w4_job;
 
-	backend	   *host = backend_host();
-	float	   *tmp	 = xmalloc((size_t)w->k * sizeof(float));
-	status_code s	 = OK;
-	for (int r = 0; r < w->n && s == OK; r++) {
+static status_code w4_build_rows(void *arg, int lo, int hi) {
+	w4_job			  *job	= arg;
+	const rkt_weight  *w	= job->w;
+	rkt_w4			  *q	= job->q;
+	const tensor_desc *desc = job->desc;
+	backend			  *host = job->host;
+	int				   bits = q->bits;
+	float			  *tmp	= xmalloc((size_t)w->k * sizeof(float));
+	status_code		   s	= OK;
+	for (int r = lo; r < hi && s == OK; r++) {
 		const uint8_t *src = (const uint8_t *)desc->host_data + (size_t)r * w->src_row_bytes;
 		if (desc->type == GGML_TYPE_F32) {
 			memcpy(tmp, src, (size_t)w->k * sizeof(float));
@@ -743,6 +776,26 @@ static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc,
 		}
 	}
 	free(tmp);
+	return s;
+}
+
+static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc, int bits) {
+	if (w->n < 1 || w->k < 1 || p->dev.n_cores < 1)
+		return ERR_UNSUPPORTED;
+	rkt_w4 *q	= xcalloc(1, sizeof(*q));
+	q->bits		= bits;
+	q->group	= p->w4_group;
+	q->n_ktiles = (w->k_pad + q->group - 1) / q->group;
+	q->n64		= (w->n + 63) / 64 * 64;
+	q->s_w		= xcalloc((size_t)q->n_ktiles * q->n64, sizeof(float));
+	q->corr		= bits == 4 ? xcalloc((size_t)q->n_ktiles * q->n64, sizeof(int16_t)) : NULL;
+	if (!w4_alloc_cores(p, w, q)) {
+		w4_free(p, q);
+		return ERR_OUT_OF_MEMORY;
+	}
+
+	w4_job		job = {.w = w, .q = q, .desc = desc, .host = backend_host()};
+	status_code s	= parallel_rows(w->n, w4_build_rows, &job);
 
 	for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
 		rkt_w4_core *wc = &q->core[c];
@@ -778,7 +831,7 @@ static status_code w4_build(rkt_priv *p, rkt_weight *w, const tensor_desc *desc,
 
 static status_code w4_build_best(rkt_priv *p, rkt_weight *w, const tensor_desc *desc) {
 	int bits = quant_bits_for_type(desc->type);
-	if (bits == 0 || (bits == 8 && !p->w8_on))
+	if (bits == 0)
 		return ERR_UNSUPPORTED;
 	return w4_build(p, w, desc, bits);
 }
@@ -1149,13 +1202,10 @@ static status_code w4_run_many(rkt_priv *p, rkt_weight **ws, float **ys, int cou
 		prof_add(p, PROF_W4_WAIT, wait_ms);
 		prof_add(p, PROF_W4_HOST, total - wait_ms);
 	}
-	if ((total > 40.0 || s != OK) && p->w4_logged < 24) {
+	if (s != OK && p->w4_logged < 24) {
 		p->w4_logged++;
-		int tasks = 0;
-		for (int i = 0; i < count; i++)
-			tasks += ws[i]->w4->core[0].n_tasks;
-		WARN("rocket: w4 call k=%d n=%d count=%d tasks/core=%d status=%d: %.1f ms (wait %.1f ms)",
-			 ws[0]->k, ws[0]->n, count, tasks, s, total, wait_ms);
+		WARN("rocket: w4 call k=%d n=%d count=%d status=%d: %.1f ms (wait %.1f ms)", ws[0]->k,
+			 ws[0]->n, count, s, total, wait_ms);
 	}
 	return s;
 }
@@ -1620,18 +1670,27 @@ static status_code flush_queue(rkt_priv *p) {
 	return s;
 }
 
+static int job_max_rows(int k_len) {
+	int rows = (int)(RKT_MAX_JOB_WEIGHT_BYTES / ((size_t)k_len * sizeof(uint16_t)));
+	rows	 = rows & ~(RKT_N_ALIGN - 1);
+	if (rows < RKT_N_ALIGN)
+		return RKT_N_ALIGN;
+	return rows < RKT_MAX_N_CHUNK ? rows : RKT_MAX_N_CHUNK;
+}
+
 static int plan_jobs(const block_ctx *b, int lo, int hi, int round, job_desc *jobs) {
-	int n_jobs = 0;
+	int n_jobs	 = 0;
+	int max_rows = job_max_rows(b->kc->k_len);
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
 		const rkt_part *pt = &b->kc->part[c];
 		if (!pt->bo.map)
 			continue;
 		int a	  = lo > pt->row_start ? lo : pt->row_start;
 		int e	  = hi < pt->row_start + pt->row_count ? hi : pt->row_start + pt->row_count;
-		int start = a + round * RKT_MAX_N_CHUNK;
+		int start = a + round * max_rows;
 		if (start >= e)
 			continue;
-		int rows	   = e - start < RKT_MAX_N_CHUNK ? e - start : RKT_MAX_N_CHUNK;
+		int rows	   = e - start < max_rows ? e - start : max_rows;
 		jobs[n_jobs++] = (job_desc){.core = c, .row_start = start, .rows = rows};
 	}
 	return n_jobs;
@@ -1655,7 +1714,7 @@ static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const u
 			return OK;
 		for (int i = 0; i < n_jobs; i++) {
 			rkt_core_queue *q = &p->queue[jobs[i].core];
-			if (q->n_tasks == p->max_tasks || (p->in_len && p->queue_cls != cls) ||
+			if (q->n_tasks == RKT_MAX_TASKS || (p->in_len && p->queue_cls != cls) ||
 				(!staged && p->in_len && p->in_len + in_bytes > RKT_QUEUE_ARENA_CAP)) {
 				status_code s = submit_queue(p, 1);
 				if (s != OK)
@@ -1889,8 +1948,8 @@ static status_code rkt_matmul_batch_inner(backend *self, const buffer *wbuf, uin
 		status_code s4	= OK;
 		float	   *yw	= p->w4_check ? xmalloc((size_t)m * n * sizeof(float)) : rkt_ptr(y);
 		pthread_mutex_lock(&p->lock);
-		for (int t0 = 0; t0 < m && s4 == OK; t0 += p->w4_prefill_tokens) {
-			int	   tokens = m - t0 < p->w4_prefill_tokens ? m - t0 : p->w4_prefill_tokens;
+		for (int t0 = 0; t0 < m && s4 == OK; t0 += RKT_W4_PREFILL_TOKENS) {
+			int	   tokens = m - t0 < RKT_W4_PREFILL_TOKENS ? m - t0 : RKT_W4_PREFILL_TOKENS;
 			float *yo	  = yw + (size_t)t0 * n;
 			s4 = w4_run_many(p, &one, &yo, 1, (const float *)rkt_ptr(x) + (size_t)t0 * k, tokens);
 		}
@@ -2037,8 +2096,7 @@ static rkt_weight *fuse_weights(rkt_priv *p, rkt_weight **ws, int count) {
 	p->fused_groups++;
 	p->fused_weights += count;
 	if (p->fused_groups == 1)
-		log_tag("RKT", "fusing projections that share an input into larger jobs "
-					   "(KAPPAI_ROCKET_FUSE=0 disables)");
+		log_tag("RKT", "fusing projections that share an input into larger jobs");
 	return f;
 }
 
@@ -2487,6 +2545,7 @@ static status_code rkt_lut_act_rows(rkt_priv *p, rkt_act_cache *a, rkt_lut_kind 
 		}
 		s = rkt_act_round(p, a, p->x16, blocks, n_blocks, out, n, chunks_per_row);
 	}
+	a->uploaded_kind = -1;
 	if (s != OK)
 		return s;
 	for (int r = 0; r < m; r++) {
@@ -2512,9 +2571,9 @@ static status_code rkt_ffn_activate_kind_inner(backend *self, const buffer *gate
 	float	 *ucopy = NULL;
 	if (n <= 0 || m <= 0)
 		return OK;
-	if (activation != RKT_FFNA_SILU && activation != RKT_FFNA_GELU)
+	if (m > 1 || activation != RKT_FFNA_SILU)
 		goto host;
-	rkt_lut_kind kind = activation == RKT_FFNA_GELU ? RKT_LUT_GELU_TANH : RKT_LUT_SILU;
+	rkt_lut_kind kind = RKT_LUT_SILU;
 
 	const float *gf		 = rkt_ptr(gate);
 	const float *uf		 = rkt_ptr(up);
@@ -2630,13 +2689,14 @@ static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 		return ERR_UNSUPPORTED;
 	if (rkt_align_up(desc->n_ctx, RKT_K_ALIGN) > RKT_MAX_K)
 		return ERR_UNSUPPORTED;
+	int		n_slots = desc->n_kv_layers > 0 ? desc->n_kv_layers : desc->n_layers;
 	rkt_kv *kv		= xcalloc(1, sizeof(*kv));
 	kv->magic		= RKT_KV_MAGIC;
-	kv->n_slots		= desc->n_layers;
-	kv->slots		= xcalloc((size_t)desc->n_layers, sizeof(*kv->slots));
+	kv->n_slots		= n_slots;
+	kv->slots		= xcalloc((size_t)n_slots, sizeof(*kv->slots));
 	int			pos = rkt_align_up(desc->n_ctx, RKT_K_ALIGN);
 	status_code s	= OK;
-	for (int i = 0; i < desc->n_layers && s == OK; i++) {
+	for (int i = 0; i < n_slots && s == OK; i++) {
 		rkt_kv_slot *sl = &kv->slots[i];
 		sl->hd			= desc->layer_head_dim ? desc->layer_head_dim[i] : desc->head_dim;
 		sl->kvh			= desc->layer_n_kv_heads ? desc->layer_n_kv_heads[i] : desc->n_kv_heads;
@@ -2653,7 +2713,7 @@ static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 			s = ERR_OUT_OF_MEMORY;
 	}
 	if (s != OK) {
-		for (int i = 0; i < desc->n_layers; i++) {
+		for (int i = 0; i < n_slots; i++) {
 			if (kv->slots[i].k)
 				destroy_weight(p, kv->slots[i].k);
 			if (kv->slots[i].v)
@@ -2663,8 +2723,13 @@ static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 		free(kv);
 		return s;
 	}
-	size_t bytes = (size_t)desc->n_layers * desc->n_kv_heads * pos *
-				   rkt_align_up(desc->head_dim, RKT_K_ALIGN) * sizeof(uint16_t) * 2;
+	int max_hd = desc->head_dim;
+	if (desc->layer_head_dim)
+		for (int i = 0; i < n_slots; i++)
+			if (desc->layer_head_dim[i] > max_hd)
+				max_hd = desc->layer_head_dim[i];
+	size_t bytes = (size_t)n_slots * desc->n_kv_heads * pos * rkt_align_up(max_hd, RKT_K_ALIGN) *
+				   sizeof(uint16_t) * 2;
 	*k_out		 = (buffer){.handle = kv, .size = bytes, .owner = self};
 	*v_out		 = *k_out;
 	return OK;
@@ -2955,7 +3020,19 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 									   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									   int flash_attn, float scale, int n_kv_heads_active, int m,
 									   int window) {
-	rkt_priv   *p  = self->priv;
+	rkt_priv *p = self->priv;
+	if (!kv_slot_of(k_cache, layer) && k_cache->owner && k_cache->owner != self) {
+		backend *host = backend_host();
+		if (window > 0 && host && host->attention_swa_batch)
+			return host->attention_swa_batch(host, q, k_cache, v_cache, out, layer, pos_start,
+											 n_heads, n_kv_heads, head_dim, n_ctx, flash_attn,
+											 scale, window, n_kv_heads_active, m);
+		if (window <= 0 && host && host->attention_batch)
+			return host->attention_batch(host, q, k_cache, v_cache, out, layer, pos_start, n_heads,
+										 n_kv_heads, head_dim, n_ctx, flash_attn, scale,
+										 n_kv_heads_active, m);
+		return ERR_UNSUPPORTED;
+	}
 	double		t0 = p->prof && m == 1 ? w4_now_ms() : 0.0;
 	status_code s  = rkt_attention_batch_inner(self, q, k_cache, v_cache, out, layer, pos_start,
 											   n_heads, n_kv_heads, head_dim, n_ctx, flash_attn,
@@ -3061,16 +3138,12 @@ static status_code rkt_init(backend *self, int device_index) {
 	p->max_k =
 		env_int("KAPPAI_ROCKET_MAX_K", RKT_MAX_K, RKT_K_ALIGN, RKT_MAX_K) & ~(RKT_K_ALIGN - 1);
 	p->poison	  = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
-	p->fuse		  = env_int("KAPPAI_ROCKET_FUSE", 1, 0, 1);
+	p->fuse		  = 1;
 	p->w4_on	  = 1;
 	p->w4_group	  = 480;
 	p->w4_check	  = env_int("KAPPAI_ROCKET_W4_CHECK", 0, 0, 1);
 	p->w4_prefill = 1;
-	p->w4_prefill_tokens =
-		env_int("KAPPAI_ROCKET_W4_PREFILL_TOKENS", 16, 1, RKT_W4_PREFILL_TOKENS_MAX);
-	p->w8_on	 = env_int("KAPPAI_ROCKET_W8", 1, 0, 1);
-	p->prof		 = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
-	p->max_tasks = env_int("KAPPAI_ROCKET_CHAIN", 1, 0, 1) ? RKT_MAX_TASKS : 1;
+	p->prof		  = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
 	pthread_mutex_init(&p->lock, NULL);
 	self->priv = p;
 
@@ -3081,11 +3154,11 @@ static status_code rkt_init(backend *self, int device_index) {
 		rkt_free(self);
 		return ERR_UNSUPPORTED;
 	}
-	log_tag("RKT",
-			"%s: %d core(s), max_k=%d, poison=%d, tasks/job=%d, w4=%d w8=%d group=%d "
-			"prefill=%d prefill_tokens=%d",
-			device_path(), p->dev.n_cores, p->max_k, p->poison, p->max_tasks, p->w4_on, p->w8_on,
-			p->w4_group, p->w4_prefill, p->w4_prefill_tokens);
+	log_tag(
+		"RKT",
+		"%s: %d core(s), max_k=%d, poison=%d, tasks/job=%d, group=%d prefill=%d prefill_tokens=%d",
+		device_path(), p->dev.n_cores, p->max_k, p->poison, RKT_MAX_TASKS, p->w4_group,
+		p->w4_prefill, RKT_W4_PREFILL_TOKENS);
 	return OK;
 }
 
