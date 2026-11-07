@@ -40,6 +40,8 @@ typedef enum {
 	TOK_RPAREN,
 	TOK_COMMA,
 	TOK_COLON,
+	TOK_LBRACE,
+	TOK_RBRACE,
 	TOK_OP,
 	TOK_PIPE,
 	TOK_UNKNOWN,
@@ -85,6 +87,7 @@ typedef enum {
 	EX_ISDEFINED,
 	EX_CALL,
 	EX_LIST,
+	EX_DICT,
 	EX_TERNARY,
 	EX_METHODCALL,
 	EX_DYNINDEX,
@@ -104,6 +107,9 @@ typedef struct expr_node {
 	expr_arg		  *args;
 	struct expr_node **items;
 	uint32_t		   n_items;
+	struct expr_node **dict_keys;
+	struct expr_node **dict_vals;
+	uint32_t		   n_dict;
 } expr_node;
 
 typedef enum {
@@ -632,6 +638,12 @@ static status_code lex_tag_inner(lexer *lx, const char *src) {
 		} else if (c == ':') {
 			lex_push(lx, TOK_COLON, src + lx->pos, 1, 0, 0);
 			lx->pos++;
+		} else if (c == '{') {
+			lex_push(lx, TOK_LBRACE, src + lx->pos, 1, 0, 0);
+			lx->pos++;
+		} else if (c == '}') {
+			lex_push(lx, TOK_RBRACE, src + lx->pos, 1, 0, 0);
+			lx->pos++;
 		} else if (c == '|') {
 			lex_push(lx, TOK_PIPE, src + lx->pos, 1, 0, 0);
 			lx->pos++;
@@ -881,6 +893,31 @@ static expr_node *parse_primary(parser *p) {
 		n->kind = EX_NUMBER;
 		n->str	= tok_dup(pcur(p));
 		padvance(p);
+	} else if (ptok_is(p, TOK_LBRACE)) {
+		padvance(p);
+		n->kind = EX_DICT;
+		while (!ptok_is(p, TOK_RBRACE) && !ptok_is(p, TOK_EOF)) {
+			expr_node *key = parse_expr(p);
+			if (!ptok_is(p, TOK_COLON)) {
+				perr(p, "expected ':' in dict literal");
+				break;
+			}
+			padvance(p);
+			expr_node *val = parse_expr(p);
+			n->dict_keys = xrealloc(n->dict_keys, (n->n_dict + 1) * sizeof(expr_node *));
+			n->dict_vals = xrealloc(n->dict_vals, (n->n_dict + 1) * sizeof(expr_node *));
+			n->dict_keys[n->n_dict] = key;
+			n->dict_vals[n->n_dict] = val;
+			n->n_dict++;
+			if (ptok_is(p, TOK_COMMA))
+				padvance(p);
+			else
+				break;
+		}
+		if (!ptok_is(p, TOK_RBRACE))
+			perr(p, "expected '}'");
+		else
+			padvance(p);
 	} else if (ptok_is(p, TOK_LBRACKET)) {
 		padvance(p);
 		n->kind = EX_LIST;
@@ -1566,6 +1603,12 @@ static void scan_expr(parser *p, expr_node *e) {
 	case EX_LIST:
 		for (size_t i = 0; i < e->n_items; i++)
 			scan_expr(p, e->items[i]);
+		break;
+	case EX_DICT:
+		for (size_t i = 0; i < e->n_dict; i++) {
+			scan_expr(p, e->dict_keys[i]);
+			scan_expr(p, e->dict_vals[i]);
+		}
 		break;
 	default:
 		break;
@@ -2371,6 +2414,17 @@ static jinja_value *eval_expr(eval_ctx *ctx, expr_node *e) {
 		jinja_value *out = jinja_list();
 		for (size_t i = 0; i < e->n_items; i++)
 			jinja_list_append(out, eval_expr(ctx, e->items[i]));
+		return out;
+	}
+	case EX_DICT: {
+		jinja_value *out = jinja_dict();
+		for (size_t i = 0; i < e->n_dict; i++) {
+			jinja_value *key = eval_expr(ctx, e->dict_keys[i]);
+			const char *ks = (key && key->type == JV_STRING) ? key->as.s : NULL;
+			jinja_value *val = eval_expr(ctx, e->dict_vals[i]);
+			if (ks)
+				jinja_dict_set(out, ks, val);
+		}
 		return out;
 	}
 	case EX_TERNARY: {
