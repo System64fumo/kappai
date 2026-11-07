@@ -1,11 +1,11 @@
 #include "backend/backend.h"
 #include "common.h"
 #include "log.h"
-#include <stdatomic.h>
 #include "profile.h"
 #include "recipe.h"
 #include "shaders_embedded.h"
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
@@ -5659,10 +5659,10 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 	vk_buf *vb = vk_kv_layer_buf(vh, layer, &shader_layer_v);
 
 	if (p->debug.diag) {
-		static int seen[512];
-		static _Atomic int n_seen = 0;
-		int			   already  = 0;
-		int			   cur_seen  = atomic_load(&n_seen);
+		static int		   seen[512];
+		static _Atomic int n_seen	= 0;
+		int				   already	= 0;
+		int				   cur_seen = atomic_load(&n_seen);
 		for (int i = 0; i < cur_seen; i++)
 			if (seen[i] == layer) {
 				already = 1;
@@ -5749,15 +5749,16 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 		uint32_t	 groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf		*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		VkDeviceSize offs[4] = {q->offset, 0, 0, out->offset};
-		status_code _fds = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
-							  1u << 3);
+		status_code	 _fds	 = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push),
+											  groups, 1, 1u << 3);
 		if (_fds == OK) {
 			static int _dbg_flash = 0;
 			if (!_dbg_flash) {
 				_dbg_flash = 1;
-				float v = 0.0f;
+				float v	   = 0.0f;
 				vk_buf_download_raw(self, as_vkbuf(out), out->offset, &v, sizeof(float));
-				fprintf(stderr, "FLASH debug: out0=%.6f kv_q8=%d layer_off=%zu\\n", (double)v, kv_q8, layer_off_flash);
+				fprintf(stderr, "FLASH debug: out0=%.6f kv_q8=%d layer_off=%zu\\n", (double)v,
+						kv_q8, layer_off_flash);
 			}
 		}
 		return _fds;

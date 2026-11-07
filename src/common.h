@@ -1,10 +1,10 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -77,8 +77,8 @@ static inline void madvise_hugepage(void *ptr, size_t bytes) {
 }
 
 static inline long page_size_cached(void) {
-	static _Atomic long ps = 0;
-	long cur = atomic_load(&ps);
+	static _Atomic long ps	= 0;
+	long				cur = atomic_load(&ps);
 	if (cur <= 0) {
 		long val = sysconf(_SC_PAGESIZE);
 		if (val <= 0)

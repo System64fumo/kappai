@@ -77,12 +77,12 @@ static const int g_cp_to_byte[512] = {
 	-1,	 -1,  -1,  -1,	-1,	 -1,  -1,  -1,	-1,	 -1,  -1,  -1,	-1,	 -1,  -1,  -1,	-1,	 -1,
 };
 
-static uint64_t g_byte_hash[256];
-static uint8_t	g_is_letter_tab[256];
-static uint8_t	g_is_digit_tab[256];
-static uint8_t	g_is_space_tab[256];
-static uint8_t	g_is_newline_tab[256];
-static uint8_t	g_utf8_len_tab[256];
+static uint64_t	   g_byte_hash[256];
+static uint8_t	   g_is_letter_tab[256];
+static uint8_t	   g_is_digit_tab[256];
+static uint8_t	   g_is_space_tab[256];
+static uint8_t	   g_is_newline_tab[256];
+static uint8_t	   g_utf8_len_tab[256];
 static _Atomic int g_tables_ready = 0;
 
 static void tokenizer_tables_ensure_impl(void) {
@@ -160,10 +160,10 @@ static int utf8_to_cp(const char *s, int len, int *cp) {
 	return 1;
 }
 
-static char	   g_byte_utf8[256][4];
-static uint8_t g_byte_utf8_len[256];
-static uint8_t g_byte_encode_passthrough[256];
-static uint8_t g_byte_decode_passthrough[256];
+static char		   g_byte_utf8[256][4];
+static uint8_t	   g_byte_utf8_len[256];
+static uint8_t	   g_byte_encode_passthrough[256];
+static uint8_t	   g_byte_decode_passthrough[256];
 static _Atomic int g_byte_utf8_ready = 0;
 
 static void gpt2_byte_table_ensure_impl(void) {

@@ -41,9 +41,9 @@ static const struct {
 	{"yes", 1}, {"on", 1}, {"true", 1}, {"1", 1}, {"no", 0}, {"off", 0}, {"false", 0}, {"0", 0},
 };
 
-static config			 g_cfg;
-static int			 g_cfg_initialized = 0;
-static pthread_mutex_t g_cfg_mtx = PTHREAD_MUTEX_INITIALIZER;
+static config		   g_cfg;
+static int			   g_cfg_initialized = 0;
+static pthread_mutex_t g_cfg_mtx		 = PTHREAD_MUTEX_INITIALIZER;
 
 config config_defaults(void) {
 	config c;

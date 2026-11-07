@@ -216,7 +216,8 @@ void main() {
 		}
 		out_[d0 + uint(i)] = acc * inv_s;
 	}
-	if (params.kv_q8 != 0 && params.layer_off == 0u && gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x == 0u) {
+	if (params.kv_q8 != 0 && params.layer_off == 0u && gl_WorkGroupID.x == 0u &&
+		gl_LocalInvocationID.x == 0u) {
 		out_[0] = k_tile[0];
 	}
 }
