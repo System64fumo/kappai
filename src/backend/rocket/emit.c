@@ -265,6 +265,50 @@ int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
 	return n_ops;
 }
 
+int rkt_ew_operand_index(int m, int row, int channel) {
+	int b = channel >> 3;
+	return ((b + 1) / 2) * (16 * m) + (b / 2) * (8 * m) + row * 8 + (channel & 7);
+}
+
+int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, uint32_t operand_dma) {
+	int n_ops  = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	int tail   = 4;
+	int extra  = 18;
+	int insert = n_ops - tail;
+	if (n_ops + extra > RKT_REGCMD_MAX_OPS)
+		return 0;
+
+	memmove(ops + insert + extra, ops + insert, (size_t)tail * sizeof(uint64_t));
+	regcmd	 c		 = {.ops = ops, .n = insert};
+	uint32_t surface = (uint32_t)m * RKT_EW_SURFACE_CHANNELS * 2;
+	uint32_t notch	 = (2u * (uint32_t)m) << 4;
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_S_POINTER, 0xE);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_WIDTH, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_HEIGHT, (uint32_t)(m - 1) & 0x1FFF);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_CHANNEL, (uint32_t)(n - 1) & 0x1FFF);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SRC_BASE_ADDR, operand_dma);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BRDMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BS_BASE_ADDR, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_NRDMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BN_BASE_ADDR, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_ERDMA_CFG, DPU_RDMA_ERDMA_CFG_F16);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_BASE_ADDR, operand_dma + surface);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_SURF_STRIDE, ((uint32_t)m & 0xFFFFFFF) << 4);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_FEATURE_MODE_CFG, DPU_RDMA_FEATURE_MODE_CFG_F16);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SRC_DMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SURF_NOTCH, notch);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_PAD_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_WEIGHT, 0x01010101);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_SURF_NOTCH, notch);
+	n_ops += extra;
+
+	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_ADD_F16);
+	set_op(ops, n_ops, OP_ENABLE, PC_OPERATION_ENABLE,
+		   PC_ENABLE_DPU_RDMA | PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return n_ops;
+}
+
 int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *words, int count,
 						uint32_t in_dma, uint32_t w_dma, uint32_t out_dma) {
 	if (count < 1 || count > RKT_LUT_UPLOAD_CHUNK)

@@ -69,6 +69,11 @@ int rkt_emit_matmul_f16_act(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
 int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
 							uint32_t out_dma, const rkt_lut_cfg *cfg);
 
+int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, uint32_t operand_dma);
+
+int rkt_ew_operand_index(int m, int row, int channel);
+
 int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *words, int count,
 						uint32_t in_dma, uint32_t w_dma, uint32_t out_dma);
 

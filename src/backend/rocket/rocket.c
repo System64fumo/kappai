@@ -37,9 +37,14 @@
 #define RKT_LUT_BLOCKS_PER_CORE 32
 #define RKT_LUT_UPLOAD_TASKS (RKT_LUT_ENTRIES / RKT_LUT_UPLOAD_CHUNK)
 #define RKT_LUT_TASKS_PER_CORE (RKT_LUT_UPLOAD_TASKS + RKT_LUT_BLOCKS_PER_CORE)
+#define RKT_EW_OPERAND_BLOCK_BYTES                                                                 \
+	((size_t)RKT_LUT_BLOCK_ROWS * (RKT_LUT_CHUNK / RKT_EW_SURFACE_CHANNELS) *                      \
+	 RKT_EW_SURFACE_SLOTS * sizeof(uint16_t))
 #define RKT_LUT_IN_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(uint16_t))
 #define RKT_LUT_OUT_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(float))
 #define RKT_LUT_KINDS 3
+#define RKT_LUT_TIERS 2
+#define RKT_LUT_SMALL_BLOCKS_PER_CORE 2
 
 #define RKT_QUEUE_ARENA_CAP ((size_t)4 << 20)
 #define RKT_QUEUE_BANKS 2
@@ -94,16 +99,31 @@ typedef enum {
 	SLOT_CLASSES,
 } slot_class;
 
-struct rkt_lut_state {
-	int			 ready;
-	rkt_lut_kind table_kind;
-	int			 verified[RKT_LUT_KINDS];
-	uint32_t	 upload_ops[RKT_LUT_UPLOAD_TASKS];
-	rkt_lut_cfg	 cfg;
-	rkt_bo		 identity[RKT_MAX_CORES];
+typedef struct {
+	int			 blocks_per_core;
+	rkt_lut_kind uploaded_kind;
 	rkt_bo		 in[RKT_MAX_CORES];
+	rkt_bo		 ew[RKT_MAX_CORES];
 	rkt_bo		 out[RKT_MAX_CORES];
-	rkt_bo		 regcmd[RKT_MAX_CORES];
+	rkt_bo		 reg_upload[RKT_MAX_CORES];
+	rkt_bo		 reg_blocks[RKT_MAX_CORES];
+} rkt_lut_tier;
+
+struct rkt_lut_state {
+	int				ready;
+	int				post_active;
+	int				scale_verified;
+	int				add_verified;
+	const uint16_t *ew16;
+	const float	   *ew_src;
+	float			ew_scale;
+	rkt_post_cfg	post;
+	int				verified[RKT_LUT_KINDS];
+	uint32_t		upload_ops[RKT_LUT_UPLOAD_TASKS];
+	rkt_lut_cfg		cfg;
+	rkt_bo			identity[RKT_MAX_CORES];
+	rkt_bo			identity_one[RKT_MAX_CORES];
+	rkt_lut_tier	tier[RKT_LUT_TIERS];
 };
 typedef struct {
 	int core;
@@ -186,6 +206,9 @@ enum {
 	PROF_MATMUL,
 	PROF_QUANT_WAIT,
 	PROF_QUANT_HOST,
+	PROF_QUANT_PRE,
+	PROF_QUANT_SUBMIT,
+	PROF_QUANT_REDUCE,
 	PROF_ATTN,
 	PROF_LUT,
 	PROF_PREFILL_MATMUL,
@@ -204,6 +227,14 @@ typedef struct {
 	rkt_pending		  pending[RKT_QUEUE_BANKS];
 	uint16_t		 *x16;
 	size_t			  x16_cap;
+	uint16_t		 *y16;
+	size_t			  y16_cap;
+	uint8_t			 *quant_pack[2];
+	size_t			  quant_pack_cap[2];
+	float			 *quant_s_act;
+	float			 *scale_tmp;
+	size_t			  scale_tmp_cap;
+	size_t			  quant_s_act_cap;
 	uint16_t		 *x_chunk;
 	size_t			  x_chunk_cap;
 	rkt_weight		**weights;
@@ -321,6 +352,15 @@ static void tile_input(uint16_t *dst, const uint16_t *src, int m, int k) {
 				   src + (size_t)r * k + (size_t)g * RKT_FEATURE_C2_F16,
 				   RKT_FEATURE_C2_F16 * sizeof(uint16_t));
 	}
+}
+
+static void pack_ew_operand(uint16_t *dst, const uint16_t *src, int m, int channels) {
+	memset(dst, 0,
+		   (size_t)(channels / RKT_EW_SURFACE_CHANNELS) * RKT_EW_SURFACE_SLOTS * m *
+			   sizeof(uint16_t));
+	for (int r = 0; r < m; r++)
+		for (int c = 0; c < channels; c++)
+			dst[rkt_ew_operand_index(m, r, c)] = src[(size_t)r * channels + c];
 }
 
 static void convert_to_f16(uint16_t *dst, const float *src, size_t n) {
@@ -590,6 +630,9 @@ static int poison_hits(const uint32_t *words, size_t count);
 #define RKT_MAX_FUSE 8
 #define RKT_QUANT_MAX_CHILDREN RKT_MAX_FUSE
 #define RKT_QUANT_PREFILL_TOKENS 16
+#define RKT_QUANT_GROUP 480
+#define RKT_QUANT_REDUCE_MIN_BLOCKS 16
+#define RKT_QUANT_PACK_MIN_TOKENS 2
 
 typedef struct {
 	int		  n0;
@@ -866,9 +909,15 @@ static void prof_add(rkt_priv *p, int kind, double ms) {
 }
 
 static void prof_print(const rkt_priv *p) {
-	static const char *names[PROF_N] = {"decode matmul (all paths)", "quant npu wait",
-										"quant host pre/post",		 "decode attention",
-										"decode ffn activation",	 "prefill matmul (all paths)"};
+	static const char *names[PROF_N] = {"decode matmul (all paths)",
+										"quant npu wait",
+										"quant host total",
+										"quant host pre",
+										"quant submit",
+										"quant host reduce",
+										"decode attention",
+										"decode ffn activation",
+										"prefill matmul (all paths)"};
 	for (int i = 0; i < PROF_N; i++)
 		log_tag("ROCKET-PROF", "%-26s calls=%-7ld total=%9.1f ms  avg=%7.3f ms", names[i],
 				p->prof_n[i], p->prof_ms[i], p->prof_n[i] ? p->prof_ms[i] / p->prof_n[i] : 0.0);
@@ -971,35 +1020,55 @@ static void quant_quantize_tile(const float *x, int valid, int kl, float scale, 
 		q[j] = 0;
 }
 
+static void quant_pack_token(const rkt_weight *w, const float *x, int tk, int tokens,
+							 const float *s_act, int bits, uint8_t *packed) {
+	int	   group = w->quant->group, n_ktiles = w->quant->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
+	int8_t q[RKT_QUANT_GROUP];
+	const float *xt = x + (size_t)tk * w->k;
+	for (int kt = 0; kt < n_ktiles; kt++) {
+		int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
+		int	  valid = kl < w->k - k0 ? kl : w->k - k0;
+		float scale = s_act[tk * n_ktiles + kt];
+		quant_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
+		if (bits == 8) {
+			for (int plane = 0; plane < kl / 16; plane++)
+				memcpy(packed + (size_t)k0 * tokens + ((size_t)plane * tokens + tk) * 16,
+					   q + plane * 16, 16);
+			continue;
+		}
+		for (int kb = 0; kb < kl; kb += 32)
+			for (int row = 0; row < 2; row++) {
+				uint8_t *dst =
+					packed + (size_t)k0 * tokens + ((size_t)(kb / 32) * m + 2 * tk + row) * 16;
+				for (int j = 0; j < 32; j++) {
+					int u = q[kb + j] + 128;
+					quant_put_nibble(dst, j, row == 0 ? (u >> 4) - 8 : (u & 15) - 8);
+				}
+			}
+	}
+}
+
+typedef struct {
+	const rkt_weight *w;
+	const float		 *x;
+	const float		 *s_act;
+	uint8_t			 *packed;
+	int				  tokens;
+	int				  bits;
+} quant_pack_job;
+
+static void quant_pack_chunk(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	const quant_pack_job *j = arg;
+	for (int tk = begin; tk < end; tk++)
+		quant_pack_token(j->w, j->x, tk, j->tokens, j->s_act, j->bits, j->packed);
+}
+
 static void quant_pack_activation(const rkt_weight *w, const float *x, int tokens,
 								  const float *s_act, int bits, uint8_t *packed) {
-	int group = w->quant->group, n_ktiles = w->quant->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
-	int8_t *q = xmalloc((size_t)group);
-	for (int tk = 0; tk < tokens; tk++) {
-		const float *xt = x + (size_t)tk * w->k;
-		for (int kt = 0; kt < n_ktiles; kt++) {
-			int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
-			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
-			float scale = s_act[tk * n_ktiles + kt];
-			quant_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
-			if (bits == 8) {
-				for (int plane = 0; plane < kl / 16; plane++)
-					memcpy(packed + (size_t)k0 * tokens + ((size_t)plane * tokens + tk) * 16,
-						   q + plane * 16, 16);
-				continue;
-			}
-			for (int kb = 0; kb < kl; kb += 32)
-				for (int row = 0; row < 2; row++) {
-					uint8_t *dst =
-						packed + (size_t)k0 * tokens + ((size_t)(kb / 32) * m + 2 * tk + row) * 16;
-					for (int j = 0; j < 32; j++) {
-						int u = q[kb + j] + 128;
-						quant_put_nibble(dst, j, row == 0 ? (u >> 4) - 8 : (u & 15) - 8);
-					}
-				}
-		}
-	}
-	free(q);
+	quant_pack_job job = {w, x, s_act, packed, tokens, bits};
+	tpool_parallel_for(tpool_fetch_pool(), tokens, RKT_QUANT_PACK_MIN_TOKENS, quant_pack_chunk,
+					   &job);
 }
 
 static void quant_reduce_i4(const rkt_quant *q, const uint8_t *tile, size_t tile_stride, int m,
@@ -1062,42 +1131,70 @@ static void quant_reduce_i8(const rkt_quant *q, const uint8_t *tile, size_t tile
 #endif
 }
 
-static status_code quant_accumulate(rkt_priv *p, const rkt_weight *w, const quant_io *io,
-									int tokens, const float *s_act, float *y) {
-	const rkt_quant *q = w->quant;
-	int				 m = quant_token_rows(q, tokens), n_ktiles = q->n_ktiles;
-	if (!ensure_capacity((void **)&p->y_tmp, &p->y_tmp_cap, (size_t)q->n64 * tokens, sizeof(float)))
-		return ERR_OUT_OF_MEMORY;
-	for (int c = 0; c < p->dev.n_cores; c++) {
-		const rkt_quant_core *wc	   = &q->core[c];
-		int					  n_ntiles = (wc->n + RKT_QUANT_NTILE - 1) / RKT_QUANT_NTILE;
-		for (int nt = 0; nt < n_ntiles; nt++) {
-			int			   ncols = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE
-									   ? wc->n - nt * RKT_QUANT_NTILE
-									   : RKT_QUANT_NTILE;
-			const uint8_t *tile =
-				(const uint8_t *)io[c].out->map + wc->out_off[nt * n_ktiles] * tokens;
-			int r0 = wc->n0 + nt * RKT_QUANT_NTILE;
-			for (int tk = 0; tk < tokens; tk++)
-				for (int col = 0; col < ncols; col += 8) {
-					float		*dst = p->y_tmp + (size_t)tk * q->n64 + r0 + col;
-					const float *sa	 = s_act + tk * n_ktiles;
-					if (q->bits == 4)
-						quant_reduce_i4(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
-					else
-						quant_reduce_i8(q, tile, (size_t)m * ncols, m, tk, r0, col, sa, dst);
-				}
-		}
+typedef struct {
+	const rkt_quant *q;
+	const uint8_t	*tile;
+	const float		*s_act;
+	float			*y;
+	size_t			 tile_stride;
+	int				 n;
+	int				 m;
+	int				 r0;
+	int				 col_blocks;
+} quant_reduce_job;
+
+static void quant_reduce_chunk(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	const quant_reduce_job *j = arg;
+	float					tail[8];
+	for (int blk = begin; blk < end; blk++) {
+		int tk	= blk / j->col_blocks;
+		int col = (blk % j->col_blocks) * 8;
+		int row = j->r0 + col;
+		if (row >= j->n)
+			continue;
+		float		*dst = j->y + (size_t)tk * j->n + row;
+		float		*out = row + 8 <= j->n ? dst : tail;
+		const float *sa	 = j->s_act + (size_t)tk * j->q->n_ktiles;
+		if (j->q->bits == 4)
+			quant_reduce_i4(j->q, j->tile, j->tile_stride, j->m, tk, j->r0, col, sa, out);
+		else
+			quant_reduce_i8(j->q, j->tile, j->tile_stride, j->m, tk, j->r0, col, sa, out);
+		if (out == tail)
+			memcpy(dst, tail, (size_t)(j->n - row) * sizeof(float));
 	}
-	for (int tk = 0; tk < tokens; tk++)
-		for (int r = 0; r < w->n; r++)
-			y[(size_t)tk * w->n + r] = p->y_tmp[(size_t)tk * q->n64 + r];
-	return OK;
+}
+
+static void quant_accumulate_core(const rkt_weight *w, const quant_io *io, int core, int tokens,
+								  const float *s_act, float *y) {
+	const rkt_quant		 *q		   = w->quant;
+	const rkt_quant_core *wc	   = &q->core[core];
+	int					  m		   = quant_token_rows(q, tokens);
+	int					  n_ntiles = (wc->n + RKT_QUANT_NTILE - 1) / RKT_QUANT_NTILE;
+	tpool				 *pool	   = tpool_fetch_pool();
+	for (int nt = 0; nt < n_ntiles; nt++) {
+		int ncols = wc->n - nt * RKT_QUANT_NTILE < RKT_QUANT_NTILE ? wc->n - nt * RKT_QUANT_NTILE
+																   : RKT_QUANT_NTILE;
+		quant_reduce_job job = {
+			.q			 = q,
+			.tile		 = (const uint8_t *)io->out->map + wc->out_off[nt * q->n_ktiles] * tokens,
+			.s_act		 = s_act,
+			.y			 = y,
+			.tile_stride = (size_t)m * ncols,
+			.n			 = w->n,
+			.m			 = m,
+			.r0			 = wc->n0 + nt * RKT_QUANT_NTILE,
+			.col_blocks	 = ncols / 8,
+		};
+		tpool_parallel_for(pool, tokens * job.col_blocks, RKT_QUANT_REDUCE_MIN_BLOCKS,
+						   quant_reduce_chunk, &job);
+	}
 }
 
 static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int count,
 								   const float *x, int tokens, double *wait_ms) {
-	const rkt_weight *w0	= ws[0];
+	double			  t_start = now_ms();
+	const rkt_weight *w0	  = ws[0];
 	int				  k_pad = w0->k_pad, group = w0->quant->group;
 	if (tokens > 1 && count != 1)
 		return ERR_UNSUPPORTED;
@@ -1117,15 +1214,23 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 			}
 	}
 
-	float	*s_act	   = xmalloc((size_t)tokens * w0->quant->n_ktiles * sizeof(float));
+	if (!ensure_capacity((void **)&p->quant_s_act, &p->quant_s_act_cap,
+						 (size_t)tokens * w0->quant->n_ktiles, sizeof(float)))
+		return ERR_OUT_OF_MEMORY;
+	float	*s_act	   = p->quant_s_act;
 	uint8_t *packed[2] = {NULL, NULL};
 	quant_activation_scales(w0, x, tokens, s_act);
 	for (int i = 0; i < count; i++) {
 		int bits = ws[i]->quant->bits;
-		if (!packed[bits == 8]) {
-			packed[bits == 8] = xcalloc((size_t)k_pad * tokens, 1);
-			quant_pack_activation(w0, x, tokens, s_act, bits, packed[bits == 8]);
-		}
+		int slot = bits == 8;
+		if (packed[slot])
+			continue;
+		if (!ensure_capacity((void **)&p->quant_pack[slot], &p->quant_pack_cap[slot],
+							 (size_t)k_pad * tokens, 1))
+			return ERR_OUT_OF_MEMORY;
+		packed[slot] = p->quant_pack[slot];
+		memset(packed[slot], 0, (size_t)k_pad * tokens);
+		quant_pack_activation(w0, x, tokens, s_act, bits, packed[slot]);
 	}
 
 	status_code s = OK;
@@ -1137,8 +1242,6 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 			if (rkt_bo_flush(&p->dev, io[i][c].in))
 				s = ERR_IO;
 		}
-	free(packed[0]);
-	free(packed[1]);
 
 	if (p->poison)
 		for (int i = 0; i < count && s == OK; i++)
@@ -1151,7 +1254,8 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 				if (rkt_bo_flush(&p->dev, io[i][c].out))
 					s = ERR_IO;
 			}
-	int submitted_core[RKT_MAX_CORES] = {0};
+	double t_submit						 = now_ms();
+	int	   submitted_core[RKT_MAX_CORES] = {0};
 	for (int c = 0; c < p->dev.n_cores && s == OK; c++) {
 		int n_list = 0;
 		for (int i = 0; i < count; i++)
@@ -1189,26 +1293,35 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 		}
 		free(list);
 	}
-	*wait_ms = 0.0;
-	for (int i = 0; i < count; i++) {
-		double t_wait = now_ms();
-		for (int c = 0; c < p->dev.n_cores; c++)
-			if (submitted_core[c] && ws[i]->quant->core[c].n > 0 &&
-				rkt_bo_wait(&p->dev, io[i][c].out) && s == OK)
-				s = ERR_COMPUTE_FAIL;
-		*wait_ms += now_ms() - t_wait;
-		if (p->poison)
-			for (int c = 0; c < p->dev.n_cores && s == OK; c++)
-				if (ws[i]->quant->core[c].n > 0 &&
-					poison_hits(io[i][c].out->map, io[i][c].out->size / sizeof(uint32_t))) {
-					WARN("rocket: quant core %d output k=%d n=%d still holds poison", c, ws[i]->k,
-						 ws[i]->n);
-					s = ERR_COMPUTE_FAIL;
-				}
-		if (s == OK)
-			s = quant_accumulate(p, ws[i], io[i], tokens, s_act, ys[i]);
+	double reduce_ms = 0.0;
+	if (p->prof) {
+		prof_add(p, PROF_QUANT_PRE, t_submit - t_start);
+		prof_add(p, PROF_QUANT_SUBMIT, now_ms() - t_submit);
 	}
-	free(s_act);
+	*wait_ms = 0.0;
+	for (int i = 0; i < count; i++)
+		for (int c = 0; c < p->dev.n_cores; c++) {
+			if (!submitted_core[c] || ws[i]->quant->core[c].n == 0)
+				continue;
+			double t_wait = now_ms();
+			if (rkt_bo_wait(&p->dev, io[i][c].out) && s == OK)
+				s = ERR_COMPUTE_FAIL;
+			*wait_ms += now_ms() - t_wait;
+			if (s != OK)
+				continue;
+			if (p->poison &&
+				poison_hits(io[i][c].out->map, io[i][c].out->size / sizeof(uint32_t))) {
+				WARN("rocket: quant core %d output k=%d n=%d still holds poison", c, ws[i]->k,
+					 ws[i]->n);
+				s = ERR_COMPUTE_FAIL;
+				continue;
+			}
+			double t_reduce = now_ms();
+			quant_accumulate_core(ws[i], &io[i][c], c, tokens, s_act, ys[i]);
+			reduce_ms += now_ms() - t_reduce;
+		}
+	if (p->prof)
+		prof_add(p, PROF_QUANT_REDUCE, reduce_ms);
 	return s;
 }
 
@@ -2377,6 +2490,9 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 }
 
 #define RKT_LUT_HQ_SEL 4
+#define RKT_ADD_MAX_SCALED 65000.0f
+#define RKT_ADD_VERIFY_REL_TOL 4.0e-3
+#define RKT_ADD_VERIFY_ABS_TOL 1.0e-3
 #define RKT_LUT_HOST_LIMIT 15.5f
 #define RKT_LUT_VERIFY_N 512
 #define RKT_LUT_VERIFY_RANGE 12.0f
@@ -2427,15 +2543,43 @@ static void lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
 	}
 }
 
+static void lut_tier_destroy(rkt_priv *p, rkt_lut_tier *t) {
+	for (int c = 0; c < RKT_MAX_CORES; c++) {
+		rkt_bo_destroy(&p->dev, &t->in[c]);
+		rkt_bo_destroy(&p->dev, &t->ew[c]);
+		rkt_bo_destroy(&p->dev, &t->out[c]);
+		rkt_bo_destroy(&p->dev, &t->reg_upload[c]);
+		rkt_bo_destroy(&p->dev, &t->reg_blocks[c]);
+	}
+	t->uploaded_kind = RKT_LUT_NONE;
+}
+
+static status_code lut_tier_create(rkt_priv *p, rkt_lut_tier *t, int blocks_per_core) {
+	t->blocks_per_core = blocks_per_core;
+	t->uploaded_kind   = RKT_LUT_NONE;
+	for (int c = 0; c < p->dev.n_cores; c++)
+		if (rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_LUT_IN_BLOCK_BYTES,
+						  &t->in[c]) ||
+			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_EW_OPERAND_BLOCK_BYTES,
+						  &t->ew[c]) ||
+			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_LUT_OUT_BLOCK_BYTES,
+						  &t->out[c]) ||
+			rkt_bo_create(&p->dev, c, (size_t)RKT_LUT_UPLOAD_TASKS * RKT_REGCMD_BYTES,
+						  &t->reg_upload[c]) ||
+			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_REGCMD_BYTES,
+						  &t->reg_blocks[c]))
+			return ERR_OUT_OF_MEMORY;
+	return OK;
+}
+
 static void lut_state_reset(rkt_priv *p, rkt_lut_state *a) {
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
 		rkt_bo_destroy(&p->dev, &a->identity[c]);
-		rkt_bo_destroy(&p->dev, &a->in[c]);
-		rkt_bo_destroy(&p->dev, &a->out[c]);
-		rkt_bo_destroy(&p->dev, &a->regcmd[c]);
+		rkt_bo_destroy(&p->dev, &a->identity_one[c]);
 	}
-	a->ready	  = 0;
-	a->table_kind = RKT_LUT_NONE;
+	for (int t = 0; t < RKT_LUT_TIERS; t++)
+		lut_tier_destroy(p, &a->tier[t]);
+	a->ready = 0;
 }
 
 static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
@@ -2446,11 +2590,7 @@ static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
 	uint16_t row[RKT_LUT_CHUNK];
 	for (int c = 0; c < p->dev.n_cores; c++) {
 		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity[c]) ||
-			rkt_bo_create(&p->dev, c, RKT_LUT_BLOCKS_PER_CORE * RKT_LUT_IN_BLOCK_BYTES,
-						  &a->in[c]) ||
-			rkt_bo_create(&p->dev, c, RKT_LUT_BLOCKS_PER_CORE * RKT_LUT_OUT_BLOCK_BYTES,
-						  &a->out[c]) ||
-			rkt_bo_create(&p->dev, c, RKT_LUT_TASKS_PER_CORE * RKT_REGCMD_BYTES, &a->regcmd[c])) {
+			rkt_bo_create(&p->dev, c, identity_bytes, &a->identity_one[c])) {
 			lut_state_reset(p, a);
 			return ERR_OUT_OF_MEMORY;
 		}
@@ -2459,30 +2599,45 @@ static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
 			row[j] = f32_to_f16_bits((float)a->cfg.S);
 			tile_weight_row(a->identity[c].map, row, RKT_LUT_CHUNK, j);
 		}
-		if (rkt_bo_flush(&p->dev, &a->identity[c])) {
+		for (int j = 0; j < RKT_LUT_CHUNK; j++) {
+			memset(row, 0, sizeof(row));
+			row[j] = f32_to_f16_bits(1.0f);
+			tile_weight_row(a->identity_one[c].map, row, RKT_LUT_CHUNK, j);
+		}
+		if (rkt_bo_flush(&p->dev, &a->identity[c]) || rkt_bo_flush(&p->dev, &a->identity_one[c])) {
 			lut_state_reset(p, a);
 			return ERR_IO;
 		}
+	}
+	if (lut_tier_create(p, &a->tier[0], RKT_LUT_SMALL_BLOCKS_PER_CORE) != OK ||
+		lut_tier_create(p, &a->tier[1], RKT_LUT_BLOCKS_PER_CORE) != OK) {
+		lut_state_reset(p, a);
+		return ERR_OUT_OF_MEMORY;
 	}
 	a->ready = 1;
 	return OK;
 }
 
-static status_code lut_write_upload_tasks(rkt_priv *p, rkt_lut_state *a, const uint16_t *le) {
+static status_code lut_tier_prepare(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t) {
+	if (t->uploaded_kind == a->cfg.kind)
+		return OK;
+	uint16_t le[RKT_LUT_ENTRIES];
+	lut_fill(&a->cfg, le);
 	for (int c = 0; c < p->dev.n_cores; c++) {
-		for (int t = 0; t < RKT_LUT_UPLOAD_TASKS; t++) {
+		for (int task = 0; task < RKT_LUT_UPLOAD_TASKS; task++) {
 			uint32_t n_ops = (uint32_t)rkt_emit_lut_upload(
-				(uint64_t *)((uint8_t *)a->regcmd[c].map + (size_t)t * RKT_REGCMD_BYTES), 0,
-				t * RKT_LUT_UPLOAD_CHUNK, le + t * RKT_LUT_UPLOAD_CHUNK, RKT_LUT_UPLOAD_CHUNK,
-				(uint32_t)a->in[c].dma_addr, (uint32_t)a->identity[c].dma_addr,
-				(uint32_t)a->out[c].dma_addr);
+				(uint64_t *)((uint8_t *)t->reg_upload[c].map + (size_t)task * RKT_REGCMD_BYTES), 0,
+				task * RKT_LUT_UPLOAD_CHUNK, le + task * RKT_LUT_UPLOAD_CHUNK, RKT_LUT_UPLOAD_CHUNK,
+				(uint32_t)t->in[c].dma_addr, (uint32_t)a->identity[c].dma_addr,
+				(uint32_t)t->out[c].dma_addr);
 			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
 				return ERR_INTERNAL;
-			a->upload_ops[t] = n_ops;
+			a->upload_ops[task] = n_ops;
 		}
-		if (rkt_bo_flush(&p->dev, &a->regcmd[c]))
+		if (rkt_bo_flush(&p->dev, &t->reg_upload[c]))
 			return ERR_IO;
 	}
+	t->uploaded_kind = a->cfg.kind;
 	return OK;
 }
 
@@ -2491,14 +2646,8 @@ static status_code lut_state_select(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind 
 	if (s != OK)
 		return s;
 	lut_configure(&a->cfg, kind);
-	if (a->table_kind == kind)
-		return OK;
-	uint16_t le[RKT_LUT_ENTRIES];
-	lut_fill(&a->cfg, le);
-	s = lut_write_upload_tasks(p, a, le);
-	if (s == OK)
-		a->table_kind = kind;
-	return s;
+	a->post_active = 0;
+	return OK;
 }
 
 typedef struct {
@@ -2506,68 +2655,95 @@ typedef struct {
 	int rows;
 } lut_block;
 
-static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, const uint16_t *x16,
+static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, const uint16_t *x16,
 								const lut_block *blocks, int n_blocks) {
+	int			n_upload = a->post_active ? 0 : RKT_LUT_UPLOAD_TASKS;
+	status_code s		 = n_upload ? lut_tier_prepare(p, a, t) : OK;
+	if (s != OK)
+		return s;
+
 	int		 n_cores				 = p->dev.n_cores;
 	int		 per_core[RKT_MAX_CORES] = {0};
 	uint32_t n_ops[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
 	uint32_t regcmd_dma[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
 
 	for (int c = 0; c < n_cores; c++)
-		for (int t = 0; t < RKT_LUT_UPLOAD_TASKS; t++) {
-			n_ops[c][t]		 = a->upload_ops[t];
-			regcmd_dma[c][t] = (uint32_t)(a->regcmd[c].dma_addr + (size_t)t * RKT_REGCMD_BYTES);
+		for (int task = 0; task < n_upload; task++) {
+			n_ops[c][task] = a->upload_ops[task];
+			regcmd_dma[c][task] =
+				(uint32_t)(t->reg_upload[c].dma_addr + (size_t)task * RKT_REGCMD_BYTES);
 		}
 
 	for (int i = 0; i < n_blocks; i++) {
 		const lut_block *b	  = &blocks[i];
 		int				 c	  = i % n_cores;
 		int				 slot = i / n_cores;
-		int				 task = RKT_LUT_UPLOAD_TASKS + slot;
-		tile_input((uint16_t *)((uint8_t *)a->in[c].map + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
+		int				 task = n_upload + slot;
+		tile_input((uint16_t *)((uint8_t *)t->in[c].map + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
 				   x16 + (size_t)b->first * RKT_LUT_CHUNK, b->rows, RKT_LUT_CHUNK);
-		n_ops[c][task] = (uint32_t)rkt_emit_matmul_f16_lut(
-			(uint64_t *)((uint8_t *)a->regcmd[c].map + (size_t)task * RKT_REGCMD_BYTES), b->rows,
-			RKT_LUT_CHUNK, RKT_LUT_CHUNK,
-			(uint32_t)(a->in[c].dma_addr + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
-			(uint32_t)a->identity[c].dma_addr,
-			(uint32_t)(a->out[c].dma_addr + (size_t)slot * RKT_LUT_OUT_BLOCK_BYTES), &a->cfg);
+		uint64_t *reg =
+			(uint64_t *)((uint8_t *)t->reg_blocks[c].map + (size_t)slot * RKT_REGCMD_BYTES);
+		uint32_t in_dma	 = (uint32_t)(t->in[c].dma_addr + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES);
+		uint32_t out_dma = (uint32_t)(t->out[c].dma_addr + (size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
+		uint32_t w_dma =
+			(uint32_t)(a->ew16 ? a->identity_one[c].dma_addr : a->identity[c].dma_addr);
+		uint32_t ew_dma = 0;
+		if (a->ew16) {
+			size_t ew_slot = (size_t)slot * RKT_EW_OPERAND_BLOCK_BYTES;
+			pack_ew_operand((uint16_t *)((uint8_t *)t->ew[c].map + ew_slot),
+							a->ew16 + (size_t)b->first * RKT_LUT_CHUNK, b->rows, RKT_LUT_CHUNK);
+			ew_dma = (uint32_t)(t->ew[c].dma_addr + ew_slot);
+		}
+		n_ops[c][task] =
+			a->ew16
+				? (uint32_t)rkt_emit_matmul_f16_ewadd(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
+													  in_dma, w_dma, out_dma, ew_dma)
+			: a->post_active
+				? (uint32_t)rkt_emit_matmul_f16_act(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
+													in_dma, w_dma, out_dma, &a->post)
+				: (uint32_t)rkt_emit_matmul_f16_lut(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
+													in_dma, w_dma, out_dma, &a->cfg);
 		if (!n_ops[c][task] || n_ops[c][task] > RKT_REGCMD_MAX_OPS)
 			return ERR_INTERNAL;
-		regcmd_dma[c][task] = (uint32_t)(a->regcmd[c].dma_addr + (size_t)task * RKT_REGCMD_BYTES);
+		regcmd_dma[c][task] =
+			(uint32_t)(t->reg_blocks[c].dma_addr + (size_t)slot * RKT_REGCMD_BYTES);
 		per_core[c]++;
 	}
 
 	for (int c = 0; c < n_cores; c++)
 		if (per_core[c] &&
-			(rkt_bo_flush(&p->dev, &a->in[c]) || rkt_bo_flush(&p->dev, &a->regcmd[c])))
+			(rkt_bo_flush(&p->dev, &t->in[c]) || rkt_bo_flush(&p->dev, &t->reg_blocks[c]) ||
+			 (a->ew16 && rkt_bo_flush(&p->dev, &t->ew[c]))))
 			return ERR_IO;
 
-	status_code s		  = OK;
-	int			submitted = 0;
-	for (; submitted < n_cores && per_core[submitted] && s == OK; submitted++)
-		if (rkt_submit(&p->dev, regcmd_dma[submitted], n_ops[submitted],
-					   RKT_LUT_UPLOAD_TASKS + per_core[submitted], &a->regcmd[submitted],
-					   &a->in[submitted], &a->out[submitted]))
+	int submitted = 0;
+	for (; submitted < n_cores && per_core[submitted] && s == OK; submitted++) {
+		const rkt_bo *w_bo		  = a->ew16 ? &a->identity_one[submitted] : &a->identity[submitted];
+		const rkt_bo *in_list[5]  = {&t->in[submitted], w_bo, &t->reg_upload[submitted],
+									 &t->reg_blocks[submitted], &t->ew[submitted]};
+		const rkt_bo *out_list[1] = {&t->out[submitted]};
+		if (rkt_submit_bos(&p->dev, submitted, regcmd_dma[submitted], n_ops[submitted],
+						   n_upload + per_core[submitted], in_list, a->ew16 ? 5 : 4, out_list, 1))
 			s = ERR_COMPUTE_FAIL;
+	}
 	for (int c = 0; c < submitted; c++)
-		if (rkt_bo_wait(&p->dev, &a->out[c]) && s == OK)
+		if (rkt_bo_wait(&p->dev, &t->out[c]) && s == OK)
 			s = ERR_COMPUTE_FAIL;
 	return s;
 }
 
 typedef struct {
-	const rkt_lut_state *a;
-	const lut_block		*blocks;
-	const uint16_t		*x16;
-	const float			*up;
-	float				*out;
-	int					 up_stride;
-	int					 n;
-	int					 chunks_per_row;
-	int					 n_cores;
-	rkt_lut_kind		 kind;
-	float				 inv;
+	const rkt_lut_tier *tier;
+	const lut_block	   *blocks;
+	const uint16_t	   *x16;
+	const float		   *up;
+	float			   *out;
+	int					up_stride;
+	int					n;
+	int					chunks_per_row;
+	int					n_cores;
+	rkt_lut_kind		kind;
+	float				inv;
 } lut_gather;
 
 static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
@@ -2577,7 +2753,7 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 		const lut_block *b	  = &g->blocks[i];
 		int				 c	  = i % g->n_cores;
 		int				 slot = i / g->n_cores;
-		const float		*om	  = (const float *)((const uint8_t *)g->a->out[c].map +
+		const float		*om	  = (const float *)((const uint8_t *)g->tier->out[c].map +
 												(size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
 		for (int r = 0; r < b->rows; r++) {
 			int				pixel = b->first + r;
@@ -2585,30 +2761,29 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 			int				col0  = (pixel % g->chunks_per_row) * RKT_LUT_CHUNK;
 			int				cols  = g->n - col0 < RKT_LUT_CHUNK ? g->n - col0 : RKT_LUT_CHUNK;
 			const uint16_t *x	  = g->x16 + (size_t)pixel * RKT_LUT_CHUNK;
-			const float	   *u	  = g->up + (size_t)row * g->up_stride + col0;
+			const float	   *u	  = g->up ? g->up + (size_t)row * g->up_stride + col0 : NULL;
 			float		   *dst	  = g->out + (size_t)row * g->n + col0;
 			for (int j = 0; j < cols; j++) {
-				float v	 = om[(size_t)(j / RKT_OUT_C2_F32) * b->rows * RKT_OUT_C2_F32 +
-							  (size_t)r * RKT_OUT_C2_F32 + j % RKT_OUT_C2_F32] *
-						   g->inv;
-				float xv = f16_bits_to_f32(x[j]);
-				if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
-					v = (float)lut_eval(g->kind, (double)xv);
-				dst[j] = v * u[j];
+				float v = om[(size_t)(j / RKT_OUT_C2_F32) * b->rows * RKT_OUT_C2_F32 +
+							 (size_t)r * RKT_OUT_C2_F32 + j % RKT_OUT_C2_F32] *
+						  g->inv;
+				if (g->kind != RKT_LUT_NONE) {
+					float xv = f16_bits_to_f32(x[j]);
+					if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
+						v = (float)lut_eval(g->kind, (double)xv);
+				}
+				dst[j] = u ? v * u[j] : v;
 			}
 		}
 	}
 }
 
-static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
-									 const float *gate, int gate_stride, const float *up,
-									 int up_stride, float *out, int n, int m) {
-	status_code s = lut_state_select(p, a, kind);
-	if (s != OK)
-		return s;
-
-	int chunks_per_row = (n + RKT_LUT_CHUNK - 1) / RKT_LUT_CHUNK;
-	int pixels		   = m * chunks_per_row;
+static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind, const float *gate,
+								int gate_stride, const float *up, int up_stride, float *out, int n,
+								int m, float inv) {
+	status_code s			   = OK;
+	int			chunks_per_row = (n + RKT_LUT_CHUNK - 1) / RKT_LUT_CHUNK;
+	int			pixels		   = m * chunks_per_row;
 	if (!ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)pixels * RKT_LUT_CHUNK,
 						 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
@@ -2616,6 +2791,24 @@ static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind
 		uint16_t *dst = p->x16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
 		convert_to_f16(dst, gate + (size_t)r * gate_stride, (size_t)n);
 		memset(dst + n, 0, ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
+	}
+
+	if (a->ew_src) {
+		if (!ensure_capacity((void **)&p->y16, &p->y16_cap, (size_t)pixels * RKT_LUT_CHUNK,
+							 sizeof(uint16_t)))
+			return ERR_OUT_OF_MEMORY;
+		for (int r = 0; r < m; r++) {
+			uint16_t *dst = p->y16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
+			for (int j = 0; j < n; j++) {
+				float v = a->ew_src[(size_t)r * n + j] * a->ew_scale;
+				if (!(fabsf(v) <= RKT_ADD_MAX_SCALED))
+					return ERR_UNSUPPORTED;
+				dst[j] = f32_to_f16_bits(v);
+			}
+			memset(dst + n, 0,
+				   ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
+		}
+		a->ew16 = p->y16;
 	}
 
 	lut_block blocks[RKT_MAX_CORES * RKT_LUT_BLOCKS_PER_CORE];
@@ -2628,10 +2821,12 @@ static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind
 			blocks[n_blocks++] = (lut_block){.first = done, .rows = rows};
 			done += rows;
 		}
-		s = lut_run_wave(p, a, p->x16, blocks, n_blocks);
+		rkt_lut_tier *tier =
+			n_blocks <= p->dev.n_cores * RKT_LUT_SMALL_BLOCKS_PER_CORE ? &a->tier[0] : &a->tier[1];
+		s = lut_run_wave(p, a, tier, p->x16, blocks, n_blocks);
 		if (s != OK)
 			return s;
-		lut_gather g = {.a				= a,
+		lut_gather g = {.tier			= tier,
 						.blocks			= blocks,
 						.x16			= p->x16,
 						.up				= up,
@@ -2641,8 +2836,69 @@ static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind
 						.chunks_per_row = chunks_per_row,
 						.n_cores		= p->dev.n_cores,
 						.kind			= kind,
-						.inv			= 1.0f / (float)a->cfg.F};
+						.inv			= inv};
 		tpool_parallel_for(pool, n_blocks, 4, lut_gather_chunk, &g);
+	}
+	return OK;
+}
+
+static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
+									 const float *gate, int gate_stride, const float *up,
+									 int up_stride, float *out, int n, int m) {
+	status_code s = lut_state_select(p, a, kind);
+	if (s != OK)
+		return s;
+	return lut_run_rows(p, a, kind, gate, gate_stride, up, up_stride, out, n, m,
+						1.0f / (float)a->cfg.F);
+}
+
+static status_code lut_scale_rows(rkt_priv *p, rkt_lut_state *a, const float *x, float *out, int n,
+								  float scale) {
+	if (!isfinite(scale))
+		return ERR_INVALID_ARG;
+	status_code s = lut_state_init(p, a);
+	if (s != OK)
+		return s;
+	int	  exponent;
+	float mantissa = frexpf(scale, &exponent);
+	lut_configure(&a->cfg, RKT_LUT_NONE);
+	a->post_active = 1;
+	a->post		   = (rkt_post_cfg){.act = RKT_ACT_MULC, .mulc = 2.0f * mantissa};
+	return lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, 1,
+						ldexpf(1.0f, exponent - 1) / (float)a->cfg.S);
+}
+
+#define RKT_SCALE_VERIFY_REL_TOL 4.0e-3
+#define RKT_SCALE_VERIFY_ABS_TOL 1.0e-4
+#define RKT_SCALE_VERIFY_VALUE 0.0371f
+
+static status_code lut_scale_verify(rkt_priv *p, rkt_lut_state *a) {
+	float ramp[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++)
+		ramp[i] = -RKT_LUT_VERIFY_RANGE +
+				  2.0f * RKT_LUT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
+	status_code s = lut_scale_rows(p, a, ramp, got, RKT_LUT_VERIFY_N, RKT_SCALE_VERIFY_VALUE);
+	if (s != OK)
+		return s;
+	double worst   = 0.0;
+	float  worst_x = 0.0f;
+	int	   bad	   = 0;
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
+		double ref = (double)x * (double)RKT_SCALE_VERIFY_VALUE;
+		double err = fabs((double)got[i] - ref);
+		if (err > worst) {
+			worst	= err;
+			worst_x = x;
+		}
+		if (!(err <= RKT_SCALE_VERIFY_ABS_TOL + RKT_SCALE_VERIFY_REL_TOL * fabs(ref)))
+			bad++;
+	}
+	if (bad) {
+		WARN("rocket: npu scale verification failed: %d/%d points off, max err %.6f at x=%.4f, "
+			 "scale stays on host",
+			 bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
+		return ERR_COMPUTE_FAIL;
 	}
 	return OK;
 }
@@ -2703,6 +2959,102 @@ static status_code ffn_activate_host(backend *self, const buffer *gate, const bu
 	if (!host || !host->ffn_activate_batch)
 		return ERR_UNSUPPORTED;
 	return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
+}
+
+static status_code lut_add_rows(rkt_priv *p, rkt_lut_state *a, const float *x, const float *y,
+								float *out, int n, int m) {
+	status_code s = lut_state_init(p, a);
+	if (s != OK)
+		return s;
+	lut_configure(&a->cfg, RKT_LUT_NONE);
+	a->post_active = 1;
+	a->post		   = (rkt_post_cfg){.act = RKT_ACT_NONE};
+	a->ew_src	   = y;
+	a->ew_scale	   = 1.0f;
+	s			   = lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, m, 1.0f);
+	a->ew_src	   = NULL;
+	a->ew16		   = NULL;
+	return s;
+}
+
+static status_code lut_add_verify(rkt_priv *p, rkt_lut_state *a) {
+	float x[RKT_LUT_VERIFY_N], y[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		float t = (float)i / (float)(RKT_LUT_VERIFY_N - 1);
+		x[i]	= -RKT_LUT_VERIFY_RANGE + 2.0f * RKT_LUT_VERIFY_RANGE * t;
+		y[i]	= 0.37f * RKT_LUT_VERIFY_RANGE * (1.0f - 2.0f * t * t);
+	}
+	status_code s = lut_add_rows(p, a, x, y, got, RKT_LUT_VERIFY_N, 1);
+	if (s != OK)
+		return s;
+	double worst   = 0.0;
+	int	   bad	   = 0;
+	int	   worst_i = 0;
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		double ref = (double)f16_bits_to_f32(f32_to_f16_bits(x[i])) +
+					 (double)f16_bits_to_f32(f32_to_f16_bits(y[i]));
+		double err = fabs((double)got[i] - ref);
+		if (err > worst) {
+			worst	= err;
+			worst_i = i;
+		}
+		if (!(err <= RKT_ADD_VERIFY_ABS_TOL + RKT_ADD_VERIFY_REL_TOL * fabs(ref)))
+			bad++;
+	}
+	if (bad) {
+		WARN("rocket: npu add verification failed: %d/%d points off, max err %.6f at i=%d "
+			 "(x=%.4f y=%.4f got=%.4f), add stays on host",
+			 bad, RKT_LUT_VERIFY_N, worst, worst_i, (double)x[worst_i], (double)y[worst_i],
+			 (double)got[worst_i]);
+		return ERR_COMPUTE_FAIL;
+	}
+	return OK;
+}
+
+static status_code lut_add_checked(rkt_priv *p, rkt_lut_state *a, float *x, const float *y, int n,
+								   int m) {
+	if (a->add_verified < 0)
+		return ERR_UNSUPPORTED;
+	if (a->add_verified == 0) {
+		status_code v	= lut_add_verify(p, a);
+		a->add_verified = v == OK ? 1 : -1;
+		if (v != OK)
+			return v;
+	}
+	size_t total = (size_t)n * (size_t)m;
+	if (!ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, total, sizeof(float)))
+		return ERR_OUT_OF_MEMORY;
+	status_code s = lut_add_rows(p, a, x, y, p->scale_tmp, n, m);
+	if (s == OK)
+		memcpy(x, p->scale_tmp, total * sizeof(float));
+	return s;
+}
+
+static status_code rkt_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
+	rkt_priv *p = self->priv;
+	if (n <= 0 || m <= 0)
+		return OK;
+	status_code s = ERR_UNSUPPORTED;
+	if (!p->npu_failed) {
+		pthread_mutex_lock(&p->lock);
+		s = lut_add_checked(p, &p->lut, rkt_ptr(x), rkt_ptr(y), n, m);
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.add_verified > 0) {
+			npu_record_failure(p);
+			WARN("rocket: npu add failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
+		}
+		pthread_mutex_unlock(&p->lock);
+	}
+	if (s == OK)
+		return OK;
+	backend *host = backend_host();
+	if (!host || !host->add_batch)
+		return ERR_UNSUPPORTED;
+	backend_report_host_fallback(self, "add", HFB_OP_NOT_NATIVE, "n=%d m=%d", n, m);
+	return host->add_batch(host, x, y, n, m);
+}
+
+static status_code rkt_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
+	return rkt_add_batch(self, x, y, n, 1);
 }
 
 static status_code rkt_ffn_activate_kind_inner(backend *self, const buffer *gate, const buffer *up,
@@ -2804,6 +3156,47 @@ static status_code rkt_matmul_ffn_down(backend *self, const buffer *w, uint32_t 
 									   const buffer *gate, const buffer *up, buffer *y, int n,
 									   int k, int activation) {
 	return rkt_matmul_ffn_down_batch(self, w, w_type, gate, up, y, n, k, activation, 1);
+}
+
+static status_code lut_scale_checked(rkt_priv *p, rkt_lut_state *a, float *x, int n, float scale) {
+	if (a->scale_verified < 0)
+		return ERR_UNSUPPORTED;
+	if (a->scale_verified == 0) {
+		status_code v	  = lut_scale_verify(p, a);
+		a->scale_verified = v == OK ? 1 : -1;
+		if (v != OK)
+			return v;
+	}
+	if (!ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, (size_t)n, sizeof(float)))
+		return ERR_OUT_OF_MEMORY;
+	status_code s = lut_scale_rows(p, a, x, p->scale_tmp, n, scale);
+	if (s == OK)
+		memcpy(x, p->scale_tmp, (size_t)n * sizeof(float));
+	return s;
+}
+
+static status_code rkt_scale_inplace(backend *self, buffer *x, float scale, int n) {
+	rkt_priv *p = self->priv;
+	if (n <= 0 || scale == 1.0f)
+		return OK;
+	status_code s = ERR_UNSUPPORTED;
+	if (!p->npu_failed) {
+		pthread_mutex_lock(&p->lock);
+		s = lut_scale_checked(p, &p->lut, rkt_ptr(x), n, scale);
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.scale_verified > 0) {
+			npu_record_failure(p);
+			WARN("rocket: npu scale failed (n=%d status=%d, errno=%d)", n, s, errno);
+		}
+		pthread_mutex_unlock(&p->lock);
+	}
+	if (s == OK)
+		return OK;
+	backend *host = backend_host();
+	if (!host || !host->scale_inplace)
+		return ERR_UNSUPPORTED;
+	backend_report_host_fallback(self, "scale_inplace", HFB_OP_NOT_NATIVE, "n=%d scale=%g", n,
+								 (double)scale);
+	return host->scale_inplace(host, x, scale, n);
 }
 
 static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
@@ -3248,6 +3641,10 @@ static void rkt_free(backend *self) {
 	free(p->x16);
 	free(p->x_chunk);
 	free(p->y_tmp);
+	free(p->quant_pack[0]);
+	free(p->quant_pack[1]);
+	free(p->quant_s_act);
+	free(p->scale_tmp);
 	free(p->attn_ws);
 	free(p->ffn_act_tmp);
 	if (p->prof)
@@ -3264,7 +3661,7 @@ static status_code rkt_init(backend *self, int device_index) {
 	p->poison		 = env_int("KAPPAI_ROCKET_POISON", 0, 0, 1);
 	p->fuse			 = 1;
 	p->quant_on		 = 1;
-	p->quant_group	 = 480;
+	p->quant_group	 = RKT_QUANT_GROUP;
 	p->quant_check	 = env_int("KAPPAI_ROCKET_QUANT_CHECK", 0, 0, 1);
 	p->quant_prefill = 1;
 	p->prof			 = env_int("KAPPAI_ROCKET_PROF", 0, 0, 1);
@@ -3306,6 +3703,9 @@ static status_code rkt_ctor(backend *out) {
 	out->matmul_multi_batch		  = rkt_matmul_multi_batch;
 	out->matmul_residual		  = rkt_matmul_residual;
 	out->ffn_activate			  = rkt_ffn_activate;
+	out->scale_inplace			  = rkt_scale_inplace;
+	out->add_inplace			  = rkt_add_inplace;
+	out->add_batch				  = rkt_add_batch;
 	out->ffn_activate_ex		  = rkt_ffn_activate_ex;
 	out->ffn_activate_batch		  = rkt_ffn_activate_batch;
 	out->ffn_activate_fused_batch = rkt_ffn_activate_fused_batch;
