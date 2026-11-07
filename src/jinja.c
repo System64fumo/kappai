@@ -330,8 +330,11 @@ jinja_value *jinja_float(double n) {
 		if (!isfinite(n) || strtod(v->as.floating.text, NULL) == n)
 			break;
 	}
-	if (isfinite(n) && !strchr(v->as.floating.text, '.') && !strchr(v->as.floating.text, 'e'))
-		strcat(v->as.floating.text, ".0");
+	if (isfinite(n) && !strchr(v->as.floating.text, '.') && !strchr(v->as.floating.text, 'e')) {
+		size_t _len = strlen(v->as.floating.text);
+		if (_len + 2 < sizeof(v->as.floating.text))
+			strcpy(v->as.floating.text + _len, ".0");
+	}
 	arena_track(v);
 	return v;
 }
