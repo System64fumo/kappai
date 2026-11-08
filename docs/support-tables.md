@@ -16,6 +16,7 @@
 | `cpu_x86_64`  | Works, requires modern CPUs, lacks some features |
 | `vulkan`      | Works, requires modern GPUs, lacks some features |
 | `opengl`      | Works, lacks some features                       |
+| `rocket`      | Works, lacks a lot of features                   |
 
 ## Quantizations
 

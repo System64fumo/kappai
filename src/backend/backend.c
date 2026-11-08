@@ -683,6 +683,9 @@ backend *backend_weight_home(backend *b, weight_class wc) {
 	case WCLASS_EMBEDDING:
 		native = (b->embd_lookup != NULL);
 		break;
+	case WCLASS_GATED_DELTA_NET:
+		native = (b->gated_delta_net != NULL);
+		break;
 	case WCLASS_MISC:
 	default:
 		native = 1;

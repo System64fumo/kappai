@@ -2392,8 +2392,7 @@ static int fmt_result_ok(rkt_priv *p, const rkt_weight *w, int row0, int n, cons
 		return 1;
 	}
 	p->fmt_failed[w->fmt] = 1;
-	WARN("rocket: %s npu matmul disagrees with cpu reference (rel rms %.3g), disabling it; "
-		 "%s",
+	WARN("rocket: %s npu matmul disagrees with cpu reference (rel rms %.3g), disabling it",
 		 w->fmt == RKT_FMT_BF16 ? "bf16" : "tf32", norm > 0.0 ? sqrt(err / norm) : 0.0);
 	return 0;
 }
@@ -4244,6 +4243,7 @@ static void rkt_free(backend *self) {
 	pthread_mutex_destroy(&p->lock);
 	free(p->weights);
 	free(p->x16);
+	free(p->y16);
 	free(p->x_chunk);
 	free(p->y_tmp);
 	free(p->quant_pack[0]);
