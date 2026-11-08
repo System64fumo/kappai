@@ -14,6 +14,18 @@
 #define RKT_K_ALIGN 32
 #define RKT_MAX_N_CHUNK 8192
 #define RKT_MAX_K 8192
+#define RKT_MAX_K_TF32 4096
+
+typedef enum {
+	RKT_FMT_F16 = 0,
+	RKT_FMT_BF16,
+	RKT_FMT_TF32,
+	RKT_FMT_COUNT,
+} rkt_float_fmt;
+
+static inline int rkt_fmt_bytes(rkt_float_fmt fmt) {
+	return fmt == RKT_FMT_TF32 ? 4 : 2;
+}
 
 typedef enum {
 	RKT_ACT_NONE = 0,
@@ -57,6 +69,11 @@ typedef struct {
 	int32_t		 end;
 	uint32_t	 tail_slope;
 } rkt_lut_cfg;
+
+void rkt_emit_set_bf16_dpu_precision(uint32_t precision);
+
+int rkt_emit_matmul_fmt(uint64_t *ops, rkt_float_fmt fmt, int m, int k, int n, uint32_t in_dma,
+						uint32_t w_dma, uint32_t out_dma);
 
 int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
 						uint32_t out_dma);

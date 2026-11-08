@@ -26,8 +26,31 @@ int rkt_feature_index(int height, int c2, int channel, int row) {
 	return ((channel - 1) / c2) * height * c2 + c2 * (row - 1) + (channel - 1) % c2;
 }
 
-static uint32_t feature_banks(int m, int k) {
-	uint32_t banks = ((uint32_t)(m * k * 2) + CBUF_BANK_BYTES - 1) / CBUF_BANK_BYTES;
+typedef struct {
+	uint32_t precision;
+	uint32_t dpu_precision;
+	int		 bytes;
+} fmt_params;
+
+static uint32_t bf16_dpu_precision = PREC_BFLOAT16;
+
+void rkt_emit_set_bf16_dpu_precision(uint32_t precision) {
+	bf16_dpu_precision = precision;
+}
+
+static fmt_params fmt_params_for(rkt_float_fmt fmt) {
+	switch (fmt) {
+	case RKT_FMT_BF16:
+		return (fmt_params){PREC_BFLOAT16, bf16_dpu_precision, 2};
+	case RKT_FMT_TF32:
+		return (fmt_params){PREC_TF32, PREC_FLOAT32, 4};
+	default:
+		return (fmt_params){PREC_FLOAT16, PREC_FLOAT16, 2};
+	}
+}
+
+static uint32_t feature_banks(int m, int k, int bytes) {
+	uint32_t banks = ((uint32_t)(m * k * bytes) + CBUF_BANK_BYTES - 1) / CBUF_BANK_BYTES;
 	if (banks < 1)
 		return 1;
 	return banks > CBUF_BANKS - 1 ? CBUF_BANKS - 1 : banks;
@@ -38,22 +61,24 @@ static int surface_stride(int m) {
 	return stride < 0 ? stride + 1 : stride;
 }
 
-static void emit_cna(regcmd *c, int m, int k, int n, uint32_t in_dma, uint32_t w_dma) {
-	uint32_t fd_banks = feature_banks(m, k);
+static void emit_cna(regcmd *c, const fmt_params *f, int m, int k, int n, uint32_t in_dma,
+					 uint32_t w_dma) {
+	int		 k_atom	  = 64 / f->bytes;
+	uint32_t fd_banks = feature_banks(m, k, f->bytes);
 	uint32_t w_banks  = CBUF_BANKS - fd_banks;
 
-	put(c, OP_REG_CNA, CNA_CONV_CON1, (PREC_FLOAT16 << 7) | (PREC_FLOAT16 << 4));
+	put(c, OP_REG_CNA, CNA_CONV_CON1, (f->precision << 7) | (f->precision << 4));
 	put(c, OP_REG_CNA, CNA_CONV_CON2, ((uint32_t)(m + 1) & 0x3FF) << 4);
 	put(c, OP_REG_CNA, CNA_CONV_CON3, (1 << 3) | 1);
 	put(c, OP_REG_CNA, CNA_DATA_SIZE0, pack(1, (uint32_t)m & 0x7FF));
 	put(c, OP_REG_CNA, CNA_DATA_SIZE1, pack((uint32_t)(k - 1) & 0xFFFF, (uint32_t)k & 0xFFFF));
 	put(c, OP_REG_CNA, CNA_DATA_SIZE2, 1);
 	put(c, OP_REG_CNA, CNA_DATA_SIZE3, (uint32_t)m & 0x3FFFF);
-	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE0, (uint32_t)(k * 2 * n));
-	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE1, (uint32_t)(k * 2) & 0x7FFFF);
+	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE0, (uint32_t)(k * f->bytes * n));
+	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE1, (uint32_t)(k * f->bytes) & 0x7FFFF);
 	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE2, (1 << 24) | (1 << 16) | ((uint32_t)n & 0x3FFF));
 	put(c, OP_REG_CNA, CNA_CBUF_CON0, ((w_banks & 0xF) << 4) | (fd_banks & 0xF));
-	put(c, OP_REG_CNA, CNA_CBUF_CON1, (uint32_t)((k + 31) / 32) & 0x1FFF);
+	put(c, OP_REG_CNA, CNA_CBUF_CON1, (uint32_t)((k + k_atom - 1) / k_atom) & 0x1FFF);
 	put(c, OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
 	put(c, OP_REG_CNA, CNA_CVT_CON1, 1u << 16);
 	put(c, OP_REG_CNA, CNA_CVT_CON2, 1u << 16);
@@ -77,20 +102,20 @@ static void emit_cna(regcmd *c, int m, int k, int n, uint32_t in_dma, uint32_t w
 	put(c, OP_REG_CNA, CNA_PAD_CON1, 0);
 }
 
-static void emit_core(regcmd *c, int m, int n) {
-	put(c, OP_REG_CORE, CORE_MISC_CFG, (PREC_FLOAT16 << 8) | 1);
+static void emit_core(regcmd *c, const fmt_params *f, int m, int n) {
+	put(c, OP_REG_CORE, CORE_MISC_CFG, (f->precision << 8) | 1);
 	put(c, OP_REG_CORE, CORE_DATAOUT_SIZE_0, pack((uint32_t)(m - 1) & 0xFFFF, 0));
 	put(c, OP_REG_CORE, CORE_DATAOUT_SIZE_1, (uint32_t)(n - 1) & 0xFFFF);
 	put(c, OP_REG_CORE, CORE_CLIP_TRUNCATE, 0);
 	put(c, OP_REG_CORE, CORE_3030, 0);
 }
 
-static void emit_dpu_output(regcmd *c, int m, int n, uint32_t out_dma) {
+static void emit_dpu_output(regcmd *c, const fmt_params *f, int m, int n, uint32_t out_dma) {
 	uint32_t channel = (uint32_t)(n - 1) & 0x1FFF;
 
 	put(c, OP_REG_DPU, DPU_FEATURE_MODE_CFG, (0xF << 5) | (2 << 1));
 	put(c, OP_REG_DPU, DPU_DATA_FORMAT,
-		((uint32_t)PREC_FLOAT32 << 29) | ((uint32_t)PREC_FLOAT16 << 26) | PREC_FLOAT16);
+		((uint32_t)PREC_FLOAT32 << 29) | (f->dpu_precision << 26) | f->dpu_precision);
 	put(c, OP_REG_DPU, DPU_OFFSET_PEND, 0);
 	put(c, OP_REG_DPU, DPU_DST_BASE_ADD, out_dma);
 	put(c, OP_REG_DPU, DPU_DST_SURF_STRIDE, ((uint32_t)m & 0xFFFFFFF) << 4);
@@ -144,14 +169,15 @@ static void emit_dpu_lut_idle(regcmd *c) {
 		put(c, OP_REG_DPU, regs[i], 0);
 }
 
-int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
-						uint32_t out_dma) {
-	regcmd c = {.ops = ops};
+int rkt_emit_matmul_fmt(uint64_t *ops, rkt_float_fmt fmt, int m, int k, int n, uint32_t in_dma,
+						uint32_t w_dma, uint32_t out_dma) {
+	regcmd	   c = {.ops = ops};
+	fmt_params f = fmt_params_for(fmt);
 
 	put(&c, OP_REG_DPU, DPU_S_POINTER, 0xE);
-	emit_cna(&c, m, k, n, in_dma, w_dma);
-	emit_core(&c, m, n);
-	emit_dpu_output(&c, m, n, out_dma);
+	emit_cna(&c, &f, m, k, n, in_dma, w_dma);
+	emit_core(&c, &f, m, n);
+	emit_dpu_output(&c, &f, m, n, out_dma);
 	emit_dpu_bypass(&c, m, n);
 	emit_dpu_lut_idle(&c);
 	put(&c, OP_NONE, 0, 0);
@@ -159,6 +185,11 @@ int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uin
 	put(&c, OP_40, 0, 0);
 	put(&c, OP_ENABLE, PC_OPERATION_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
 	return c.n;
+}
+
+int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+						uint32_t out_dma) {
+	return rkt_emit_matmul_fmt(ops, RKT_FMT_F16, m, k, n, in_dma, w_dma, out_dma);
 }
 
 static uint64_t *find_op(uint64_t *ops, int n, uint32_t block_op, uint32_t reg) {

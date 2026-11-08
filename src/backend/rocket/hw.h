@@ -136,7 +136,14 @@
 #define CBUF_BANK_BYTES 32768
 #define CBUF_BANKS 12
 
-enum { PREC_INT8 = 0, PREC_FLOAT16 = 2, PREC_INT32 = 4, PREC_FLOAT32 = 5 };
+enum {
+	PREC_INT8	  = 0,
+	PREC_FLOAT16  = 2,
+	PREC_BFLOAT16 = 3,
+	PREC_INT32	  = 4,
+	PREC_FLOAT32  = 5,
+	PREC_TF32	  = 7
+};
 
 #define DPU_BS_CFG_ALU_ALGO(x) (((uint32_t)(x) & 0xFu) << 16)
 #define DPU_BS_CFG_ALU_SRC(x) (((uint32_t)(x) & 0x1u) << 8)
