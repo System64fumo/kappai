@@ -1,12 +1,5 @@
 #include "recipe/internal.h"
 
-#define OP_FALLBACK_SEEN_MAX 64
-
-typedef struct {
-	const backend *be;
-	const char	  *op;
-} op_fallback_seen;
-
 typedef struct {
 	const float *cos;
 	const float *sin;
@@ -40,10 +33,7 @@ typedef struct {
 	int		 n;
 } rmsnorm_nw_row_ud;
 
-_Atomic(backend *)		cached_host_backend = NULL;
-static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
-static _Atomic int		g_op_fallback_n_seen;
-static pthread_mutex_t	g_op_fallback_mtx = PTHREAD_MUTEX_INITIALIZER;
+_Atomic(backend *) cached_host_backend = NULL;
 
 static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int n_tokens, uint8_t k_slot,
 									 uint8_t v_slot, int kv_row_stride);
@@ -208,31 +198,6 @@ int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb,
 	}
 	*out_status = OK;
 	return n;
-}
-
-static bool op_fallback_seen_before(const backend *a, const char *op_name, int n) {
-	for (int i = 0; i < n && i < OP_FALLBACK_SEEN_MAX; i++)
-		if (g_op_fallback_seen[i].be == a && strcmp(g_op_fallback_seen[i].op, op_name) == 0)
-			return true;
-	return false;
-}
-
-void op_fallback_note(backend *a, const char *op_name) {
-	if (op_fallback_seen_before(a, op_name, atomic_load(&g_op_fallback_n_seen)))
-		return;
-	pthread_mutex_lock(&g_op_fallback_mtx);
-	int n = atomic_load(&g_op_fallback_n_seen);
-	if (n >= OP_FALLBACK_SEEN_MAX || op_fallback_seen_before(a, op_name, n)) {
-		pthread_mutex_unlock(&g_op_fallback_mtx);
-		return;
-	}
-	g_op_fallback_seen[n].be = a;
-	g_op_fallback_seen[n].op = op_name;
-	atomic_store(&g_op_fallback_n_seen, n + 1);
-	pthread_mutex_unlock(&g_op_fallback_mtx);
-	backend_report_host_fallback(a, op_name, HFB_OP_NOT_NATIVE,
-								 "backend has no native '%s'; running on the host fallback",
-								 op_name);
 }
 
 static inline void backend_sync_rope(backend *t, backend *a) {
@@ -429,7 +394,6 @@ static status_code matmul_softcap_apply(exec_ctx *ctx, backend *a, float cap, in
 		return ERR_UNSUPPORTED;
 	if (t != a) {
 		ensure_sync(a);
-		op_fallback_note(a, "softcap");
 	}
 	return t->softcap(t, exec_slot(ctx, ctx->op->out), cap, n * ctx->rows.n_rows);
 }
@@ -487,7 +451,6 @@ status_code op_matmul_residual(exec_ctx *ctx) {
 			goto out;
 		}
 		ensure_sync(a);
-		op_fallback_note(a, "add");
 	}
 	st = add_be->add_batch(add_be, exec_slot(ctx, ctx->op->out), tmp, n, ctx->rows.n_rows);
 out:
@@ -521,7 +484,6 @@ static status_code ffn_down_composed(exec_ctx *ctx, backend *a) {
 		if (!act_be || !act_be->ffn_activate_batch)
 			return ERR_UNSUPPORTED;
 		ensure_sync(a);
-		op_fallback_note(a, "ffn_activate");
 	}
 	status_code st = act_be->ffn_activate_batch(act_be, exec_slot(ctx, ctx->op->in[0]),
 												exec_slot(ctx, ctx->op->in[1]), act, g.k, g.act,
@@ -693,7 +655,6 @@ static status_code attention_dynamic(exec_ctx *ctx) {
 		backend *host = backend_host();
 		if (!host || !host->attention_swa_batch)
 			return ERR_UNSUPPORTED;
-		op_fallback_note(a, "attention_swa");
 		a = host;
 	}
 	return attention_run(ctx, a, sliding);
@@ -757,8 +718,6 @@ status_code op_ffn_activate(exec_ctx *ctx) {
 
 static status_code ffn_fused_device(exec_ctx *ctx, backend *a) {
 	int n = ctx->op->u.ffn_act.n;
-	backend_report_host_fallback(a, "ffn_activate_fused", HFB_BATCH_DESIGN,
-								 "batch prefill stages gate/up activation through host memory");
 	return ffn_activate_fused_device_fallback(ctx, a, n, ctx->op->u.ffn_act.activation, 2 * n,
 											  ctx->rows.n_rows);
 }
@@ -1143,7 +1102,6 @@ static status_code matmul_multi_activate(exec_ctx *ctx, backend *a, int n, int a
 		return ERR_UNSUPPORTED;
 	if (t != a) {
 		ensure_sync(a);
-		op_fallback_note(a, "ffn_activate");
 	}
 	buffer *act = batch_slot(ctx->bs, ctx->op->out);
 	return t->ffn_activate_batch(t, act, batch_slot(ctx->bs, ctx->op->out1), act, n, activation,

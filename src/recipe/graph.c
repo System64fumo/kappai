@@ -583,7 +583,7 @@ static int fallback_seen(const cg_set *s, const backend *be, op_kind kind) {
 static void add_fallback(cg_set *s, backend *be, op_kind kind, const char *fn) {
 	s->fallbacks = xrealloc(s->fallbacks, (size_t)(s->n_fallbacks + 1) * sizeof(cg_fallback));
 	s->fallbacks[s->n_fallbacks++] = (cg_fallback){.be = be, .kind = kind, .fn = fn};
-	INFO("graph: backend '%s' lacks %s; %s executes via fallback", be->name ? be->name : "?", fn,
+	WARN("backend '%s' lacks %s; %s executes via fallback", be->name ? be->name : "?", fn,
 		 recipe_op_name(kind));
 }
 
@@ -594,7 +594,6 @@ static void resolve_node(cg_set *s, const struct model *m, backend *be, const cg
 	if (res.impl == CAP_NATIVE || fallback_seen(s, be, n->kind))
 		return;
 	add_fallback(s, be, n->kind, res.fn);
-	cap_report(be, &res);
 }
 
 static void resolve_impls(cg_set *s, const struct model *m, int count) {

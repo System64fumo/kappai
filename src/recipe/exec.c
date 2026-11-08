@@ -357,10 +357,8 @@ static void exec_resolve_steps(exec_schedule *sch, const cg_set *gs, int variant
 				step->fn = fn;
 			step->caps = variant_be ? exec_pick_caps(kind, variant_be) : 0;
 			if (variant_be && !backend_has_cap(variant_be, BCAP_IS_HOST) &&
-				recipe_op_missing_fn((backend *)variant_be, kind)) {
+				recipe_op_missing_fn((backend *)variant_be, kind))
 				step->fn = op_host_dispatch;
-				op_fallback_note((backend *)variant_be, recipe_op_name(kind));
-			}
 			continue;
 		}
 		int impl = exec_variant_impl(gs, variant, step->node);

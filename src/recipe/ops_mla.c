@@ -34,7 +34,7 @@ static status_code mla_kv_put_row(exec_ctx *ctx, kvcache *cache, backend *a, con
 		return a->kv_put_mla(a, kv, slot, pos, kv_a_row, &L->kv_a_norm_w.buf, kv_lora, qk_rope,
 							 cache->n_ctx, m->norm_eps);
 
-	backend		 *host = op_backend_fallback(a, "kv_put_mla");
+	backend		 *host = op_backend_fallback(a);
 	buffer		  norm_view;
 	const buffer *norm_w =
 		mla_host_weight(&L->kv_a_norm_w, (size_t)kv_lora * sizeof(float), host, &norm_view);
@@ -60,7 +60,7 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 								m->mla.kv_lora, cache->n_ctx, ctx->s->model.rope_cos,
 								ctx->s->model.rope_sin, L->k_b_w.type, L->v_b_w.type, scale);
 
-	backend		 *host = op_backend_fallback(a, "attention_mla");
+	backend		 *host = op_backend_fallback(a);
 	buffer		  k_b_view, v_b_view;
 	const buffer *k_b_w = mla_host_weight(
 		&L->k_b_w, (size_t)n_heads * m->mla.qk_nope * m->mla.kv_lora * sizeof(float), host,
@@ -85,7 +85,7 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 
 static status_code mla_rmsnorm_q_a(exec_ctx *ctx, backend *a, buffer *q_a_b,
 								   const layer_weights *L) {
-	backend *nb = a->rmsnorm_batch ? a : op_backend_fallback(a, "rmsnorm_batch");
+	backend *nb = a->rmsnorm_batch ? a : op_backend_fallback(a);
 	return nb->rmsnorm_batch(nb, q_a_b, &L->q_a_norm_w.buf, q_a_b, ctx->m->mla.q_lora,
 							 ctx->m->norm_eps, ctx->rows.n_rows);
 }

@@ -197,7 +197,6 @@ status_code embd_fill_rows(backend *a, const buffer *w, uint32_t w_type, const i
 		backend *host = backend_host();
 		if (!host || !host->embd_lookup)
 			return ERR_UNSUPPORTED;
-		op_fallback_note(a, "embd_lookup");
 		a = host;
 	}
 	tpool *pool = backend_get_pool(a);

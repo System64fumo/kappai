@@ -600,7 +600,6 @@ void backend_host_use(backend *b);
 
 typedef enum {
 	HFB_OP_NOT_NATIVE	  = 0,
-	HFB_BATCH_DESIGN	  = 1,
 	HFB_WEIGHT_TYPE		  = 2,
 	HFB_BUF_HOST_RESIDENT = 3,
 	HFB_CAPABILITY		  = 4,

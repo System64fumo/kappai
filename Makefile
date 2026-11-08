@@ -176,7 +176,7 @@ ifneq ($(HAS_OPENGL),)
 endif
 
 ifneq ($(HAS_ROCKET),)
-  RKT_OBJS := $(call backend_objs,rocket/rocket.o rocket/device.o rocket/emit.o)
+  RKT_OBJS := $(call backend_objs,rocket/rocket.o rocket/matmul.o rocket/device.o rocket/emit.o)
   $(eval $(call add_backend,rocket,$(RKT_OBJS),))
 endif
 

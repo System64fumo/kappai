@@ -188,9 +188,6 @@ void moe_apply_weights(float *weight, int n_k, int norm_topk, float routed_scale
 
 status_code moe_activate(backend *a, float *act, const float *gate, const float *up, int n_i,
 						 float gs, float us, int use_gelu) {
-	if (!(a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)))
-		backend_report_host_fallback(a, "moe_activate", HFB_OP_NOT_NATIVE,
-									 "moe activation executes on the host (cpu) fallback");
 	backend *h = (a && a->moe_activate && backend_has_cap(a, BCAP_IS_HOST)) ? a : backend_host();
 	if (!h || !h->moe_activate)
 		return ERR_UNSUPPORTED;
