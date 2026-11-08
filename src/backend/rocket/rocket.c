@@ -3806,16 +3806,21 @@ static status_code rkt_kv_alloc(backend *self, const kv_desc *desc, buffer *k_ou
 		sl->hd			= desc->layer_head_dim ? desc->layer_head_dim[i] : desc->head_dim;
 		sl->kvh			= desc->layer_n_kv_heads ? desc->layer_n_kv_heads[i] : desc->n_kv_heads;
 		sl->pos_pad		= pos;
-		sl->hd_pad		= rkt_align_up(sl->hd, RKT_K_ALIGN);
-		if (sl->hd < 1 || sl->kvh < 1 || sl->hd_pad > RKT_MAX_K ||
-			(p->max_k < sl->pos_pad || p->max_k < sl->hd_pad)) {
-			s = ERR_INVALID_ARG;
-			break;
+		if (sl->hd < 1 || sl->kvh < 1) {
+			sl->hd	   = 0;
+			sl->kvh	   = 0;
+			sl->hd_pad = 0;
+			continue;
 		}
-		sl->k = kv_weight_build(p, sl->kvh * sl->pos_pad, sl->hd, sl->hd_pad);
-		sl->v = kv_weight_build(p, sl->kvh * sl->hd_pad, sl->pos_pad, sl->pos_pad);
-		if (!sl->k || !sl->v)
-			s = ERR_OUT_OF_MEMORY;
+		sl->hd_pad = rkt_align_up(sl->hd, RKT_K_ALIGN);
+		if (sl->hd_pad > RKT_MAX_K || p->max_k < sl->pos_pad || p->max_k < sl->hd_pad)
+			s = ERR_UNSUPPORTED;
+		else {
+			sl->k = kv_weight_build(p, sl->kvh * sl->pos_pad, sl->hd, sl->hd_pad);
+			sl->v = kv_weight_build(p, sl->kvh * sl->hd_pad, sl->pos_pad, sl->pos_pad);
+			if (!sl->k || !sl->v)
+				s = ERR_OUT_OF_MEMORY;
+		}
 	}
 	if (s != OK) {
 		for (int i = 0; i < n_slots; i++) {
@@ -4125,8 +4130,9 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 									   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									   int flash_attn, float scale, int n_kv_heads_active, int m,
 									   int window) {
-	rkt_priv *p = self->priv;
-	if (!kv_slot_of(k_cache, layer) && k_cache->owner && k_cache->owner != self) {
+	rkt_priv		  *p	= self->priv;
+	const rkt_kv_slot *slot = kv_slot_of(k_cache, layer);
+	if ((!slot || slot->kvh < 1 || slot->hd < 1) && k_cache->owner && k_cache->owner != self) {
 		backend *host = backend_host();
 		if (window > 0 && host && host->attention_swa_batch)
 			return host->attention_swa_batch(host, q, k_cache, v_cache, out, layer, pos_start,
