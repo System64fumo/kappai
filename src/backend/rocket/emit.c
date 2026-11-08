@@ -249,12 +249,7 @@ int rkt_emit_matmul_f16_act(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
 	return n_ops;
 }
 
-int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
-							uint32_t out_dma, const rkt_lut_cfg *cfg) {
-	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
-	if (!cfg || cfg->kind == RKT_LUT_NONE)
-		return n_ops;
-
+static void apply_lut(uint64_t *ops, int n_ops, const rkt_lut_cfg *cfg) {
 	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, 0x302);
 	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_CFG, DPU_LUT_CFG_ROAD_SEL(0));
 	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_INFO, DPU_LUT_INFO_LE_INDEX_SELECT((uint32_t)cfg->sel));
@@ -262,6 +257,21 @@ int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
 	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_END, (uint32_t)cfg->end);
 	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SCALE, cfg->tail_slope << 16);
 	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SHIFT, 0);
+}
+
+int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							uint32_t out_dma, const rkt_lut_cfg *cfg) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	if (cfg && cfg->kind != RKT_LUT_NONE)
+		apply_lut(ops, n_ops, cfg);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_act_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+								uint32_t out_dma, const rkt_lut_cfg *cfg, float mulc) {
+	rkt_post_cfg post  = {.act = RKT_ACT_MULC, .mulc = mulc};
+	int			 n_ops = rkt_emit_matmul_f16_act(ops, m, k, n, in_dma, w_dma, out_dma, &post);
+	apply_lut(ops, n_ops, cfg);
 	return n_ops;
 }
 

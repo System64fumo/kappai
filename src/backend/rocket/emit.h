@@ -41,6 +41,7 @@ typedef enum {
 	RKT_LUT_NONE = 0,
 	RKT_LUT_GELU_TANH,
 	RKT_LUT_SILU,
+	RKT_LUT_TANH,
 } rkt_lut_kind;
 
 #define RKT_LUT_WINDOW_HALF 256
@@ -73,6 +74,9 @@ int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dm
 							  uint32_t out_dma, uint32_t operand_dma);
 
 int rkt_ew_operand_index(int m, int row, int channel);
+
+int rkt_emit_matmul_f16_act_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+								uint32_t out_dma, const rkt_lut_cfg *cfg, float mulc);
 
 int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *words, int count,
 						uint32_t in_dma, uint32_t w_dma, uint32_t out_dma);

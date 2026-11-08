@@ -455,6 +455,12 @@ struct backend {
 									   int n_heads, int n_kv_heads, int head_dim, int n_ctx,
 									   int flash_attn, float scale, int sliding_window,
 									   int n_kv_heads_active, int m);
+	status_code (*matmul_gate_act_batch)(backend *self, const buffer *w_gate, uint32_t gate_type,
+										 const buffer *w_up, uint32_t up_type, const buffer *x,
+										 buffer *act_out, buffer *up_out, int n, int k,
+										 int activation, int m);
+	status_code (*matmul_softcap_batch)(backend *self, const buffer *w, uint32_t w_type,
+										const buffer *x, buffer *y, int n, int k, int m, float cap);
 	status_code (*matmul_multi_batch)(backend *self, const buffer **w, const uint32_t *w_types,
 									  const buffer *x, buffer **y, const int *n_list, int k,
 									  int n_matmuls, int m);

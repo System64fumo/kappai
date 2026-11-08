@@ -423,15 +423,35 @@ status_code op_rmsnorm(exec_ctx *ctx) {
 	return st;
 }
 
+static status_code matmul_softcap_apply(exec_ctx *ctx, backend *a, float cap, int n) {
+	backend *t = a->softcap ? a : backend_host();
+	if (!t || !t->softcap)
+		return ERR_UNSUPPORTED;
+	if (t != a) {
+		ensure_sync(a);
+		op_fallback_note(a, "softcap");
+	}
+	return t->softcap(t, exec_slot(ctx, ctx->op->out), cap, n * ctx->rows.n_rows);
+}
+
 status_code op_matmul_plain(exec_ctx *ctx) {
 	const recipe_op *op	  = ctx->op;
 	weight_ref		*wref = exec_weight_ref(ctx, op->w_idx);
 	int				 n = op->u.matmul.n, k = op->u.matmul.k;
 	profile_scope	 ps = profile_begin(&ctx->s->prof, op->stage);
 	profile_weight_bytes(&ctx->s->prof, op->stage, wref->type, n, k);
-	backend	   *a  = exec_layer_backend(ctx);
-	status_code st = a->matmul_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
-									 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows);
+	backend	   *a	= exec_layer_backend(ctx);
+	float		cap = op->u.matmul.softcap;
+	status_code st	= ERR_UNSUPPORTED;
+	if (cap > 0.0f && a->matmul_softcap_batch)
+		st = a->matmul_softcap_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
+									 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows, cap);
+	if (st == ERR_UNSUPPORTED) {
+		st = a->matmul_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
+							 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows);
+		if (st == OK && cap > 0.0f)
+			st = matmul_softcap_apply(ctx, a, cap, n);
+	}
 	profile_end(&ctx->s->prof, &ps);
 	return st;
 }
@@ -1117,6 +1137,19 @@ static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a,
 	return a->buffer_write_f32(a, out_buf, out_host, n_rows * n);
 }
 
+static status_code matmul_multi_activate(exec_ctx *ctx, backend *a, int n, int activation) {
+	backend *t = a->ffn_activate_batch ? a : backend_host();
+	if (!t || !t->ffn_activate_batch)
+		return ERR_UNSUPPORTED;
+	if (t != a) {
+		ensure_sync(a);
+		op_fallback_note(a, "ffn_activate");
+	}
+	buffer *act = batch_slot(ctx->bs, ctx->op->out);
+	return t->ffn_activate_batch(t, act, batch_slot(ctx->bs, ctx->op->out1), act, n, activation,
+								 ctx->rows.n_rows);
+}
+
 static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 	const layer_weights *lw = &ctx->m->layers[ctx->li];
 	int					 k	= ctx->op->u.matmul_multi.k;
@@ -1153,15 +1186,27 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 		return st;
 	}
 	if (ctx->op->w_idx == WIDX_GATE) {
-		const int *n_out = ctx->op->u.matmul_multi.n_out;
+		const int *n_out	= ctx->op->u.matmul_multi.n_out;
+		int		   act_fuse = ctx->op->u.matmul_multi.act_fuse;
 		if (fused) {
 			const buffer *ws[2]	 = {&lw->gate_w.buf, &lw->up_w.buf};
 			uint32_t	  wts[2] = {lw->gate_w.type, lw->up_w.type};
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[0], n_out[0], k);
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[1], n_out[1], k);
 			buffer *ys[2] = {batch_slot(ctx->bs, ctx->op->out), batch_slot(ctx->bs, ctx->op->out1)};
-			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
-										 k, 2, ctx->rows.n_rows);
+			status_code st = ERR_UNSUPPORTED;
+			if (act_fuse && a->matmul_gate_act_batch)
+				st = a->matmul_gate_act_batch(a, ws[0], wts[0], ws[1], wts[1],
+											  batch_slot(ctx->bs, ctx->op->in[0]), ys[0], ys[1],
+											  n_out[0], k, act_fuse - 1, ctx->rows.n_rows);
+			if (st == OK)
+				return OK;
+			if (st != ERR_UNSUPPORTED)
+				return st;
+			st = a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
+									   k, 2, ctx->rows.n_rows);
+			return st == OK && act_fuse ? matmul_multi_activate(ctx, a, n_out[0], act_fuse - 1)
+										: st;
 		}
 		status_code st = a->matmul_batch(
 			a, &lw->gate_w.buf, lw->gate_w.type, batch_slot(ctx->bs, ctx->op->in[0]),
@@ -1170,7 +1215,7 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			st = a->matmul_batch(a, &lw->up_w.buf, lw->up_w.type,
 								 batch_slot(ctx->bs, ctx->op->in[0]),
 								 batch_slot(ctx->bs, ctx->op->out1), n_out[1], k, ctx->rows.n_rows);
-		return st;
+		return st == OK && act_fuse ? matmul_multi_activate(ctx, a, n_out[0], act_fuse - 1) : st;
 	}
 	return ERR_INVALID_ARG;
 }

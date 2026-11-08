@@ -155,6 +155,23 @@ static int ple_inject_plan_fill(ple_inject_plan *p, struct model *m, int li) {
 	return 1;
 }
 
+static status_code ple_device_project(exec_ctx *ctx, const ple_build_plan *p, backend *a,
+									  buffer *xb, float *proj_host, int n_rows) {
+	const weight_ref *w = &p->m->layer_dims.per_layer_model_proj;
+	if (!a->matmul_batch || !a->buffer_read_f32 || !w->buf.handle || !matmul_type_ok(a, w->type))
+		return ERR_UNSUPPORTED;
+	size_t		n  = (size_t)n_rows * p->total_ple;
+	status_code st = buffer_ensure_scratch(a, &ctx->bs->ple_proj_dev, n * sizeof(float));
+	if (st != OK)
+		return st;
+	st = a->matmul_batch(a, &w->buf, w->type, xb, &ctx->bs->ple_proj_dev, p->total_ple, p->dim,
+						 n_rows);
+	if (st != OK)
+		return st;
+	ensure_sync(a);
+	return a->buffer_read_f32(a, &ctx->bs->ple_proj_dev, proj_host, (int)n);
+}
+
 static status_code ple_build_run(exec_ctx *ctx, int mode) {
 
 	if (!ctx->m->has_per_layer_embeddings)
@@ -243,21 +260,23 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 			return st;
 	}
 
-	float *ple_proj	 = float_buf_ensure(&ctx->s->ple.proj_host, (size_t)n_rows * total_ple);
-	float *inpL_host = float_buf_ensure(&ctx->s->ple.inpL_host, (size_t)n_rows * dim);
+	float  *ple_proj = float_buf_ensure(&ctx->s->ple.proj_host, (size_t)n_rows * total_ple);
+	buffer *xb		 = batch_slot(ctx->bs, ctx->op->in[0]);
 
-	buffer	*xb		 = batch_slot(ctx->bs, ctx->op->in[0]);
-	backend *x_owner = xb->owner;
-	st				 = x_owner->buffer_read_f32(x_owner, xb, inpL_host, n_rows * dim);
-	if (st != OK)
-		return st;
+	if (ple_device_project(ctx, &plan, a, xb, ple_proj, n_rows) != OK) {
+		float	*inpL_host = float_buf_ensure(&ctx->s->ple.inpL_host, (size_t)n_rows * dim);
+		backend *x_owner   = xb->owner;
+		st				   = x_owner->buffer_read_f32(x_owner, xb, inpL_host, n_rows * dim);
+		if (st != OK)
+			return st;
 
-	backend_report_host_fallback(a, "ple_proj_matmul", HFB_OP_NOT_NATIVE,
-								 "device backend lacks a batched per-layer projection path; "
-								 "projection matmul executes on host (cpu)");
-	for (int row = 0; row < n_rows; row++)
-		ple_host_project_row(&plan, inpL_host + (size_t)row * dim,
-							 ple_proj + (size_t)row * total_ple);
+		backend_report_host_fallback(a, "ple_proj_matmul", HFB_OP_NOT_NATIVE,
+									 "device backend lacks a batched per-layer projection path; "
+									 "projection matmul executes on host (cpu)");
+		for (int row = 0; row < n_rows; row++)
+			ple_host_project_row(&plan, inpL_host + (size_t)row * dim,
+								 ple_proj + (size_t)row * total_ple);
+	}
 
 	ple_host_finish(&plan, ple, ple_proj, n_rows);
 

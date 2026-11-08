@@ -42,7 +42,7 @@
 	 RKT_EW_SURFACE_SLOTS * sizeof(uint16_t))
 #define RKT_LUT_IN_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(uint16_t))
 #define RKT_LUT_OUT_BLOCK_BYTES ((size_t)RKT_LUT_BLOCK_ROWS * RKT_LUT_CHUNK * sizeof(float))
-#define RKT_LUT_KINDS 3
+#define RKT_LUT_KINDS 4
 #define RKT_LUT_TIERS 2
 #define RKT_LUT_SMALL_BLOCKS_PER_CORE 2
 
@@ -114,17 +114,22 @@ struct rkt_lut_state {
 	int				post_active;
 	int				scale_verified;
 	int				add_verified;
+	int				gate_act_verified[RKT_LUT_KINDS];
+	rkt_lut_kind	resident;
+	float			in_scale;
+	float			out_scale;
 	const uint16_t *ew16;
 	const float	   *ew_src;
-	float			ew_scale;
 	rkt_post_cfg	post;
 	int				verified[RKT_LUT_KINDS];
 	uint32_t		upload_ops[RKT_LUT_UPLOAD_TASKS];
 	rkt_lut_cfg		cfg;
 	rkt_bo			identity[RKT_MAX_CORES];
-	rkt_bo			identity_one[RKT_MAX_CORES];
+	rkt_bo			identity_unit[RKT_MAX_CORES];
 	rkt_lut_tier	tier[RKT_LUT_TIERS];
 };
+static void lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind);
+
 typedef struct {
 	int core;
 	int row_start;
@@ -140,6 +145,8 @@ typedef struct {
 	int				  m;
 	int				  m_done;
 	int				  accumulate;
+	int				  epi;
+	float			  epi_cap;
 	float			 *y;
 } block_ctx;
 
@@ -160,6 +167,8 @@ typedef struct {
 	uint32_t in_dma;
 	uint32_t w_dma;
 	uint32_t out_dma;
+	uint32_t epi;
+	uint32_t epi_cap_bits;
 } stream_key;
 
 typedef struct {
@@ -227,6 +236,8 @@ typedef struct {
 	rkt_pending		  pending[RKT_QUEUE_BANKS];
 	uint16_t		 *x16;
 	size_t			  x16_cap;
+	int				  epi_kind;
+	float			  epi_cap;
 	uint16_t		 *y16;
 	size_t			  y16_cap;
 	uint8_t			 *quant_pack[2];
@@ -1612,13 +1623,25 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 			.w_dma	= (uint32_t)(pt->bo.dma_addr +
 								 (size_t)(t->job.row_start - pt->row_start) * t->ctx.kc->k_len * 2),
 			.out_dma = (uint32_t)(sl->out.dma_addr + t->out_off),
+			.epi	 = (uint32_t)t->ctx.epi,
 		};
+		if (t->ctx.epi_cap > 0.0f)
+			memcpy(&key.epi_cap_bits, &t->ctx.epi_cap, sizeof(key.epi_cap_bits));
 		stream_entry *e = stream_lookup(sc, &key);
 		if (!e->used) {
 			size_t	  offset = align_queue(sc->bytes_used);
 			uint64_t *ops	 = (uint64_t *)((uint8_t *)sc->bo.map + offset);
-			uint32_t  n_ops	 = (uint32_t)rkt_emit_matmul_f16(ops, key.blk, key.k_len, key.rows,
-															 key.in_dma, key.w_dma, key.out_dma);
+			uint32_t  n_ops;
+			if (key.epi) {
+				rkt_lut_cfg cfg;
+				lut_configure(&cfg, (rkt_lut_kind)key.epi);
+				n_ops = (uint32_t)rkt_emit_matmul_f16_act_lut(
+					ops, key.blk, key.k_len, key.rows, key.in_dma, key.w_dma, key.out_dma, &cfg,
+					t->ctx.epi_cap > 0.0f ? (float)cfg.S / t->ctx.epi_cap : (float)cfg.S);
+			} else {
+				n_ops = (uint32_t)rkt_emit_matmul_f16(ops, key.blk, key.k_len, key.rows, key.in_dma,
+													  key.w_dma, key.out_dma);
+			}
 			if (n_ops > RKT_REGCMD_MAX_OPS)
 				return ERR_INTERNAL;
 			*e = (stream_entry){.key = key, .offset = (uint32_t)offset, .n_ops = n_ops, .used = 1};
@@ -1664,6 +1687,12 @@ static status_code collect_task(const rkt_priv *p, const rkt_task *t, const floa
 		return ERR_COMPUTE_FAIL;
 	}
 
+	float out_scale = 1.0f;
+	if (b->epi) {
+		rkt_lut_cfg cfg;
+		lut_configure(&cfg, (rkt_lut_kind)b->epi);
+		out_scale = (b->epi_cap > 0.0f ? b->epi_cap : 1.0f) / (float)cfg.F;
+	}
 	int lo = (b->row0 > j->row_start ? b->row0 : j->row_start) - j->row_start;
 	int hi = (b->row0 + b->n < j->row_start + j->rows ? b->row0 + b->n : j->row_start + j->rows) -
 			 j->row_start;
@@ -1674,6 +1703,7 @@ static status_code collect_task(const rkt_priv *p, const rkt_task *t, const floa
 		for (int nn = lo; nn < hi; nn++) {
 			float v = om[(size_t)(nn / RKT_OUT_C2_F32) * blk * RKT_OUT_C2_F32 +
 						 (size_t)r * RKT_OUT_C2_F32 + nn % RKT_OUT_C2_F32];
+			v *= out_scale;
 			if (b->accumulate)
 				dst[nn - lo] += v;
 			else
@@ -1914,9 +1944,16 @@ static status_code enqueue_kchunks(rkt_priv *p, const rkt_weight *w, int row0, i
 		if (!ok)
 			return ERR_OUT_OF_MEMORY;
 
-		block_ctx b = {
-			.w = w, .kc = kc, .row0 = row0, .n = n, .m = m, .y = y, .accumulate = ci > 0};
-		int max_rows = max_batch_rows(kc->k_len);
+		block_ctx b		   = {.w		  = w,
+							  .kc		  = kc,
+							  .row0		  = row0,
+							  .n		  = n,
+							  .m		  = m,
+							  .y		  = y,
+							  .accumulate = ci > 0,
+							  .epi		  = p->epi_kind,
+							  .epi_cap	  = p->epi_cap};
+		int		  max_rows = max_batch_rows(kc->k_len);
 		for (int done = 0; done < m;) {
 			int blk		  = next_block_rows(m - done, max_rows);
 			b.m_done	  = done;
@@ -2500,6 +2537,8 @@ static status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t 
 #define RKT_LUT_VERIFY_REL_TOL 2.0e-3
 
 static const char *lut_name(rkt_lut_kind kind) {
+	if (kind == RKT_LUT_TANH)
+		return "tanh";
 	return kind == RKT_LUT_GELU_TANH ? "gelu" : "silu";
 }
 
@@ -2512,6 +2551,8 @@ static rkt_lut_kind lut_kind_for_activation(int activation) {
 }
 
 static double lut_eval(rkt_lut_kind kind, double x) {
+	if (kind == RKT_LUT_TANH)
+		return tanh(x);
 	if (x < -40.0)
 		return 0.0;
 	if (kind == RKT_LUT_GELU_TANH)
@@ -2526,7 +2567,7 @@ static void lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
 	cfg->F			= 2048;
 	cfg->start		= -(RKT_LUT_WINDOW_HALF << cfg->sel);
 	cfg->end		= (RKT_LUT_WINDOW_HALF << cfg->sel) - 1;
-	cfg->tail_slope = cfg->F / cfg->S;
+	cfg->tail_slope = kind == RKT_LUT_TANH ? 0 : cfg->F / cfg->S;
 }
 
 static void lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
@@ -2575,11 +2616,12 @@ static status_code lut_tier_create(rkt_priv *p, rkt_lut_tier *t, int blocks_per_
 static void lut_state_reset(rkt_priv *p, rkt_lut_state *a) {
 	for (int c = 0; c < RKT_MAX_CORES; c++) {
 		rkt_bo_destroy(&p->dev, &a->identity[c]);
-		rkt_bo_destroy(&p->dev, &a->identity_one[c]);
+		rkt_bo_destroy(&p->dev, &a->identity_unit[c]);
 	}
 	for (int t = 0; t < RKT_LUT_TIERS; t++)
 		lut_tier_destroy(p, &a->tier[t]);
-	a->ready = 0;
+	a->ready	= 0;
+	a->resident = RKT_LUT_NONE;
 }
 
 static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
@@ -2589,8 +2631,7 @@ static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
 	size_t	 identity_bytes = (size_t)RKT_LUT_CHUNK * RKT_LUT_CHUNK * sizeof(uint16_t);
 	uint16_t row[RKT_LUT_CHUNK];
 	for (int c = 0; c < p->dev.n_cores; c++) {
-		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity[c]) ||
-			rkt_bo_create(&p->dev, c, identity_bytes, &a->identity_one[c])) {
+		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity[c])) {
 			lut_state_reset(p, a);
 			return ERR_OUT_OF_MEMORY;
 		}
@@ -2599,12 +2640,20 @@ static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
 			row[j] = f32_to_f16_bits((float)a->cfg.S);
 			tile_weight_row(a->identity[c].map, row, RKT_LUT_CHUNK, j);
 		}
+		if (rkt_bo_flush(&p->dev, &a->identity[c])) {
+			lut_state_reset(p, a);
+			return ERR_IO;
+		}
+		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity_unit[c])) {
+			lut_state_reset(p, a);
+			return ERR_OUT_OF_MEMORY;
+		}
 		for (int j = 0; j < RKT_LUT_CHUNK; j++) {
 			memset(row, 0, sizeof(row));
 			row[j] = f32_to_f16_bits(1.0f);
-			tile_weight_row(a->identity_one[c].map, row, RKT_LUT_CHUNK, j);
+			tile_weight_row(a->identity_unit[c].map, row, RKT_LUT_CHUNK, j);
 		}
-		if (rkt_bo_flush(&p->dev, &a->identity[c]) || rkt_bo_flush(&p->dev, &a->identity_one[c])) {
+		if (rkt_bo_flush(&p->dev, &a->identity_unit[c])) {
 			lut_state_reset(p, a);
 			return ERR_IO;
 		}
@@ -2686,7 +2735,7 @@ static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, 
 		uint32_t in_dma	 = (uint32_t)(t->in[c].dma_addr + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES);
 		uint32_t out_dma = (uint32_t)(t->out[c].dma_addr + (size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
 		uint32_t w_dma =
-			(uint32_t)(a->ew16 ? a->identity_one[c].dma_addr : a->identity[c].dma_addr);
+			(uint32_t)(a->ew16 ? a->identity_unit[c].dma_addr : a->identity[c].dma_addr);
 		uint32_t ew_dma = 0;
 		if (a->ew16) {
 			size_t ew_slot = (size_t)slot * RKT_EW_OPERAND_BLOCK_BYTES;
@@ -2695,7 +2744,11 @@ static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, 
 			ew_dma = (uint32_t)(t->ew[c].dma_addr + ew_slot);
 		}
 		n_ops[c][task] =
-			a->ew16
+			a->post_active && a->cfg.kind != RKT_LUT_NONE && !a->ew16
+				? (uint32_t)rkt_emit_matmul_f16_act_lut(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
+														in_dma, w_dma, out_dma, &a->cfg,
+														a->post.mulc)
+			: a->ew16
 				? (uint32_t)rkt_emit_matmul_f16_ewadd(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
 													  in_dma, w_dma, out_dma, ew_dma)
 			: a->post_active
@@ -2717,10 +2770,10 @@ static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, 
 			return ERR_IO;
 
 	int submitted = 0;
-	for (; submitted < n_cores && per_core[submitted] && s == OK; submitted++) {
-		const rkt_bo *w_bo		  = a->ew16 ? &a->identity_one[submitted] : &a->identity[submitted];
-		const rkt_bo *in_list[5]  = {&t->in[submitted], w_bo, &t->reg_upload[submitted],
-									 &t->reg_blocks[submitted], &t->ew[submitted]};
+	for (; submitted < n_cores && (per_core[submitted] || n_upload) && s == OK; submitted++) {
+		const rkt_bo *in_list[5] = {
+			&t->in[submitted], a->ew16 ? &a->identity_unit[submitted] : &a->identity[submitted],
+			&t->reg_upload[submitted], &t->reg_blocks[submitted], &t->ew[submitted]};
 		const rkt_bo *out_list[1] = {&t->out[submitted]};
 		if (rkt_submit_bos(&p->dev, submitted, regcmd_dma[submitted], n_ops[submitted],
 						   n_upload + per_core[submitted], in_list, a->ew16 ? 5 : 4, out_list, 1))
@@ -2729,6 +2782,8 @@ static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, 
 	for (int c = 0; c < submitted; c++)
 		if (rkt_bo_wait(&p->dev, &t->out[c]) && s == OK)
 			s = ERR_COMPUTE_FAIL;
+	if (s == OK && n_upload)
+		a->resident = a->cfg.kind;
 	return s;
 }
 
@@ -2744,6 +2799,7 @@ typedef struct {
 	int					n_cores;
 	rkt_lut_kind		kind;
 	float				inv;
+	float				out_scale;
 } lut_gather;
 
 static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
@@ -2772,7 +2828,7 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 					if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
 						v = (float)lut_eval(g->kind, (double)xv);
 				}
-				dst[j] = u ? v * u[j] : v;
+				dst[j] = (u ? v * u[j] : v) * g->out_scale;
 			}
 		}
 	}
@@ -2788,8 +2844,13 @@ static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind
 						 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	for (int r = 0; r < m; r++) {
-		uint16_t *dst = p->x16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
-		convert_to_f16(dst, gate + (size_t)r * gate_stride, (size_t)n);
+		uint16_t	*dst = p->x16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
+		const float *src = gate + (size_t)r * gate_stride;
+		if (a->in_scale > 0.0f)
+			for (int j = 0; j < n; j++)
+				dst[j] = f32_to_f16_bits(src[j] * a->in_scale);
+		else
+			convert_to_f16(dst, src, (size_t)n);
 		memset(dst + n, 0, ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
 	}
 
@@ -2800,7 +2861,7 @@ static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind
 		for (int r = 0; r < m; r++) {
 			uint16_t *dst = p->y16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
 			for (int j = 0; j < n; j++) {
-				float v = a->ew_src[(size_t)r * n + j] * a->ew_scale;
+				float v = a->ew_src[(size_t)r * n + j];
 				if (!(fabsf(v) <= RKT_ADD_MAX_SCALED))
 					return ERR_UNSUPPORTED;
 				dst[j] = f32_to_f16_bits(v);
@@ -2836,7 +2897,8 @@ static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind
 						.chunks_per_row = chunks_per_row,
 						.n_cores		= p->dev.n_cores,
 						.kind			= kind,
-						.inv			= inv};
+						.inv			= inv,
+						.out_scale		= a->out_scale > 0.0f ? a->out_scale : 1.0f};
 		tpool_parallel_for(pool, n_blocks, 4, lut_gather_chunk, &g);
 	}
 	return OK;
@@ -2961,8 +3023,216 @@ static status_code ffn_activate_host(backend *self, const buffer *gate, const bu
 	return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
 }
 
+static status_code lut_softcap_rows(rkt_priv *p, rkt_lut_state *a, const float *x, float *out,
+									int n, float cap) {
+	status_code s = lut_state_select(p, a, RKT_LUT_TANH);
+	if (s != OK)
+		return s;
+	a->in_scale	 = 1.0f / cap;
+	a->out_scale = cap;
+	s = lut_run_rows(p, a, RKT_LUT_TANH, x, n, NULL, 0, out, n, 1, 1.0f / (float)a->cfg.F);
+	a->in_scale	 = 0.0f;
+	a->out_scale = 0.0f;
+	return s;
+}
+
+static status_code rkt_softcap(backend *self, buffer *x, float cap, int n) {
+	rkt_priv *p = self->priv;
+	if (n <= 0)
+		return OK;
+	status_code s = ERR_UNSUPPORTED;
+	if (cap > 0.0f && !p->npu_failed) {
+		pthread_mutex_lock(&p->lock);
+		s = lut_ensure_verified(p, &p->lut, RKT_LUT_TANH);
+		if (s == OK &&
+			!ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, (size_t)n, sizeof(float)))
+			s = ERR_OUT_OF_MEMORY;
+		if (s == OK) {
+			s = lut_softcap_rows(p, &p->lut, rkt_ptr(x), p->scale_tmp, n, cap);
+			if (s == OK)
+				memcpy(rkt_ptr(x), p->scale_tmp, (size_t)n * sizeof(float));
+		}
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed &&
+			p->lut.verified[RKT_LUT_TANH] > 0) {
+			npu_record_failure(p);
+			WARN("rocket: npu softcap failed (n=%d status=%d, errno=%d)", n, s, errno);
+		}
+		pthread_mutex_unlock(&p->lock);
+	}
+	if (s == OK)
+		return OK;
+	backend *host = backend_host();
+	if (!host || !host->softcap)
+		return ERR_UNSUPPORTED;
+	backend_report_host_fallback(self, "softcap", HFB_OP_NOT_NATIVE, "n=%d", n);
+	return host->softcap(host, x, cap, n);
+}
+
+static status_code lut_make_resident(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	status_code s = lut_state_select(p, a, kind);
+	if (s != OK || a->resident == kind)
+		return s;
+	return lut_run_wave(p, a, &a->tier[0], NULL, NULL, 0);
+}
+
+#define RKT_GATE_ACT_VERIFY_RANGE 20.0f
+#define RKT_GATE_ACT_VERIFY_REL_TOL 1.0e-2
+
+static status_code lut_gate_act_verify(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	float ramp[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++)
+		ramp[i] = -RKT_GATE_ACT_VERIFY_RANGE +
+				  2.0f * RKT_GATE_ACT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
+	status_code s = lut_make_resident(p, a, kind);
+	if (s != OK)
+		return s;
+	a->post_active = 1;
+	a->post		   = (rkt_post_cfg){.act = RKT_ACT_MULC, .mulc = 1.0f};
+	s = lut_run_rows(p, a, RKT_LUT_NONE, ramp, RKT_LUT_VERIFY_N, NULL, 0, got, RKT_LUT_VERIFY_N, 1,
+					 1.0f / (float)a->cfg.F);
+	if (s != OK)
+		return s;
+	double worst   = 0.0;
+	float  worst_x = 0.0f;
+	int	   bad	   = 0;
+	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
+		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
+		double ref = lut_eval(kind, (double)x);
+		double err = fabs((double)got[i] - ref);
+		if (err > worst) {
+			worst	= err;
+			worst_x = x;
+		}
+		if (!(err <= RKT_LUT_VERIFY_ABS_TOL + RKT_GATE_ACT_VERIFY_REL_TOL * fabs(ref)))
+			bad++;
+	}
+	if (bad) {
+		WARN("rocket: gate+%s epilogue verification failed: %d/%d points off, max err %.5f at "
+			 "x=%.4f, gate activation stays separate",
+			 lut_name(kind), bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
+		return ERR_COMPUTE_FAIL;
+	}
+	return OK;
+}
+
+static status_code lut_gate_act_prepare(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
+	if (a->gate_act_verified[kind] < 0)
+		return ERR_UNSUPPORTED;
+	if (a->gate_act_verified[kind] == 0) {
+		status_code v			   = lut_gate_act_verify(p, a, kind);
+		a->gate_act_verified[kind] = v == OK ? 1 : -1;
+		if (v != OK)
+			return v;
+	}
+	return lut_make_resident(p, a, kind);
+}
+
+static int gate_act_chainable(const rkt_priv *p, const buffer *wbuf, int n, int k,
+							  const rkt_weight **dw, int *row0) {
+	const rkt_weight *w = wbuf->handle;
+	if (p->npu_failed || !w || w->magic != RKT_WEIGHT_MAGIC || w->k != k || w->host_copy)
+		return 0;
+	if (wbuf->offset % w->src_row_bytes != 0 || (int)(wbuf->offset / w->src_row_bytes) + n > w->n)
+		return 0;
+	if (w->quant && p->quant_on && !p->quant_failed)
+		return 0;
+	*row0 = (int)(wbuf->offset / w->src_row_bytes);
+	if (w->fused_parent) {
+		*row0 += w->fused_row0;
+		w = w->fused_parent;
+	}
+	*dw = w;
+	return 1;
+}
+
+static status_code rkt_matmul_gate_act_batch(backend *self, const buffer *w_gate,
+											 uint32_t gate_type, const buffer *w_up,
+											 uint32_t up_type, const buffer *x, buffer *act_out,
+											 buffer *up_out, int n, int k, int activation, int m) {
+	(void)gate_type;
+	(void)up_type;
+	rkt_priv		 *p		= self->priv;
+	rkt_lut_kind	  kind	= lut_kind_for_activation(activation);
+	const rkt_weight *gw	= NULL;
+	const rkt_weight *uw	= NULL;
+	int				  grow0 = 0;
+	int				  urow0 = 0;
+	if (kind == RKT_LUT_NONE || n <= 0 || m <= 0 ||
+		!gate_act_chainable(p, w_gate, n, k, &gw, &grow0) ||
+		!gate_act_chainable(p, w_up, n, k, &uw, &urow0) || gw->n_kchunks != 1 || uw->n_kchunks != 1)
+		return ERR_UNSUPPORTED;
+
+	float *act = rkt_ptr(act_out);
+	float *up  = rkt_ptr(up_out);
+	pthread_mutex_lock(&p->lock);
+	status_code s = lut_gate_act_prepare(p, &p->lut, kind);
+	if (s == OK) {
+		p->epi_kind = (int)kind;
+		s			= dense_matmul_enqueue(p, gw, grow0, n, rkt_ptr(x), act, m);
+		p->epi_kind = 0;
+		if (s == OK)
+			s = dense_matmul_enqueue(p, uw, urow0, n, rkt_ptr(x), up, m);
+		if (s == OK)
+			s = flush_queue(p);
+		else
+			abort_queue(p);
+	}
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.gate_act_verified[kind] > 0) {
+		npu_record_failure(p);
+		WARN("rocket: npu gate+%s matmul failed (n=%d k=%d m=%d status=%d, errno=%d)",
+			 lut_name(kind), n, k, m, s, errno);
+	}
+	pthread_mutex_unlock(&p->lock);
+	if (s != OK)
+		return ERR_UNSUPPORTED;
+	size_t total = (size_t)n * (size_t)m;
+	for (size_t i = 0; i < total; i++)
+		act[i] *= up[i];
+	return OK;
+}
+
+static status_code rkt_matmul_softcap_fallback(backend *self, const buffer *w, uint32_t w_type,
+											   const buffer *x, buffer *y, int n, int k, int m,
+											   float cap) {
+	status_code s = rkt_matmul_batch(self, w, w_type, x, y, n, k, m);
+	if (s != OK)
+		return s;
+	return rkt_softcap(self, y, cap, n * m);
+}
+
+static status_code rkt_matmul_softcap_batch(backend *self, const buffer *wbuf, uint32_t w_type,
+											const buffer *x, buffer *y, int n, int k, int m,
+											float cap) {
+	rkt_priv		 *p	   = self->priv;
+	const rkt_weight *dw   = NULL;
+	int				  row0 = 0;
+	if (!(cap > 0.0f) || n <= 0 || m <= 0 || !gate_act_chainable(p, wbuf, n, k, &dw, &row0) ||
+		dw->n_kchunks != 1)
+		return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = lut_gate_act_prepare(p, &p->lut, RKT_LUT_TANH);
+	if (s == OK) {
+		p->epi_kind = RKT_LUT_TANH;
+		p->epi_cap	= cap;
+		s			= dense_matmul(p, dw, row0, n, rkt_ptr(x), rkt_ptr(y), m);
+		p->epi_kind = 0;
+		p->epi_cap	= 0.0f;
+	}
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed &&
+		p->lut.gate_act_verified[RKT_LUT_TANH] > 0) {
+		npu_record_failure(p);
+		WARN("rocket: npu matmul+softcap failed (n=%d k=%d m=%d status=%d, errno=%d)", n, k, m, s,
+			 errno);
+	}
+	pthread_mutex_unlock(&p->lock);
+	if (s == OK)
+		return OK;
+	return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
+}
+
 static status_code lut_add_rows(rkt_priv *p, rkt_lut_state *a, const float *x, const float *y,
-								float *out, int n, int m) {
+								float *out, int n, int m, float out_scale) {
 	status_code s = lut_state_init(p, a);
 	if (s != OK)
 		return s;
@@ -2970,8 +3240,7 @@ static status_code lut_add_rows(rkt_priv *p, rkt_lut_state *a, const float *x, c
 	a->post_active = 1;
 	a->post		   = (rkt_post_cfg){.act = RKT_ACT_NONE};
 	a->ew_src	   = y;
-	a->ew_scale	   = 1.0f;
-	s			   = lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, m, 1.0f);
+	s			   = lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, m, out_scale);
 	a->ew_src	   = NULL;
 	a->ew16		   = NULL;
 	return s;
@@ -2984,7 +3253,7 @@ static status_code lut_add_verify(rkt_priv *p, rkt_lut_state *a) {
 		x[i]	= -RKT_LUT_VERIFY_RANGE + 2.0f * RKT_LUT_VERIFY_RANGE * t;
 		y[i]	= 0.37f * RKT_LUT_VERIFY_RANGE * (1.0f - 2.0f * t * t);
 	}
-	status_code s = lut_add_rows(p, a, x, y, got, RKT_LUT_VERIFY_N, 1);
+	status_code s = lut_add_rows(p, a, x, y, got, RKT_LUT_VERIFY_N, 1, 1.0f);
 	if (s != OK)
 		return s;
 	double worst   = 0.0;
@@ -3012,7 +3281,7 @@ static status_code lut_add_verify(rkt_priv *p, rkt_lut_state *a) {
 }
 
 static status_code lut_add_checked(rkt_priv *p, rkt_lut_state *a, float *x, const float *y, int n,
-								   int m) {
+								   int m, float out_scale) {
 	if (a->add_verified < 0)
 		return ERR_UNSUPPORTED;
 	if (a->add_verified == 0) {
@@ -3024,20 +3293,21 @@ static status_code lut_add_checked(rkt_priv *p, rkt_lut_state *a, float *x, cons
 	size_t total = (size_t)n * (size_t)m;
 	if (!ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, total, sizeof(float)))
 		return ERR_OUT_OF_MEMORY;
-	status_code s = lut_add_rows(p, a, x, y, p->scale_tmp, n, m);
+	status_code s = lut_add_rows(p, a, x, y, p->scale_tmp, n, m, out_scale);
 	if (s == OK)
 		memcpy(x, p->scale_tmp, total * sizeof(float));
 	return s;
 }
 
-static status_code rkt_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
+static status_code rkt_add_scaled(backend *self, buffer *x, const buffer *y, int n, int m,
+								  float out_scale) {
 	rkt_priv *p = self->priv;
 	if (n <= 0 || m <= 0)
 		return OK;
 	status_code s = ERR_UNSUPPORTED;
 	if (!p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
-		s = lut_add_checked(p, &p->lut, rkt_ptr(x), rkt_ptr(y), n, m);
+		s = lut_add_checked(p, &p->lut, rkt_ptr(x), rkt_ptr(y), n, m, out_scale);
 		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.add_verified > 0) {
 			npu_record_failure(p);
 			WARN("rocket: npu add failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
@@ -3047,10 +3317,26 @@ static status_code rkt_add_batch(backend *self, buffer *x, const buffer *y, int 
 	if (s == OK)
 		return OK;
 	backend *host = backend_host();
-	if (!host || !host->add_batch)
+	if (!host)
 		return ERR_UNSUPPORTED;
-	backend_report_host_fallback(self, "add", HFB_OP_NOT_NATIVE, "n=%d m=%d", n, m);
-	return host->add_batch(host, x, y, n, m);
+	if (out_scale == 1.0f && host->add_batch) {
+		backend_report_host_fallback(self, "add", HFB_OP_NOT_NATIVE, "n=%d m=%d", n, m);
+		return host->add_batch(host, x, y, n, m);
+	}
+	if (out_scale != 1.0f && host->ple_combine) {
+		backend_report_host_fallback(self, "ple_combine", HFB_OP_NOT_NATIVE, "n=%d", n);
+		return host->ple_combine(host, x, y, n * m, out_scale);
+	}
+	return ERR_UNSUPPORTED;
+}
+
+static status_code rkt_add_batch(backend *self, buffer *x, const buffer *y, int n, int m) {
+	return rkt_add_scaled(self, x, y, n, m, 1.0f);
+}
+
+static status_code rkt_ple_combine(backend *self, buffer *ple, const buffer *proj, int n,
+								   float combine_scale) {
+	return rkt_add_scaled(self, ple, proj, n, 1, combine_scale);
 }
 
 static status_code rkt_add_inplace(backend *self, buffer *x, const buffer *y, int n) {
@@ -3705,7 +3991,11 @@ static status_code rkt_ctor(backend *out) {
 	out->ffn_activate			  = rkt_ffn_activate;
 	out->scale_inplace			  = rkt_scale_inplace;
 	out->add_inplace			  = rkt_add_inplace;
+	out->matmul_softcap_batch	  = rkt_matmul_softcap_batch;
+	out->matmul_gate_act_batch	  = rkt_matmul_gate_act_batch;
+	out->softcap				  = rkt_softcap;
 	out->add_batch				  = rkt_add_batch;
+	out->ple_combine			  = rkt_ple_combine;
 	out->ffn_activate_ex		  = rkt_ffn_activate_ex;
 	out->ffn_activate_batch		  = rkt_ffn_activate_batch;
 	out->ffn_activate_fused_batch = rkt_ffn_activate_fused_batch;
