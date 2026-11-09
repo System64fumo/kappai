@@ -363,6 +363,27 @@ static int engine_load(context *ctx, cli_args *a) {
 	uint64_t t0				= time_ms();
 	config	 load_cfg		= *ec;
 	load_cfg.preparsed_gguf = has_preparsed ? &preparsed : NULL;
+
+	backend *early_backend	= NULL;
+	if (ec->shared_backend) {
+		early_backend = ec->shared_backend;
+	} else if (!ec->device || strcmp(ec->device, "auto") == 0) {
+		backend_create_best(&early_backend);
+	} else {
+		char name[32];
+		int	 device_index = 0;
+		if (backend_parse_device(ec->device, name, sizeof(name), &device_index) == 0)
+			backend_create(name, device_index, &early_backend);
+	}
+	if (early_backend && backend_has_cap(early_backend, BCAP_UNIFIED_MEMORY)) {
+		if (!ec->moe_stream)
+			load_cfg.moe_stream = true;
+		if (ec->n_threads == 0)
+			load_cfg.n_threads = 8;
+	}
+	if (early_backend && !ec->shared_backend)
+		backend_destroy(early_backend);
+
 	status_code s			= context_init(ctx, &load_cfg);
 	if (has_preparsed)
 		gguf_free(&preparsed);
