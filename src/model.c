@@ -1228,13 +1228,15 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	progress_step(prog);
 
 	if (m->has_per_layer_embeddings) {
-		s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
-						  m->layer_dims.per_layer_tok_embd.type, 2,
-						  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
-						  WCLASS_EMBEDDING, m->backend);
-		if (s != OK) {
-			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
-			return s;
+		if (!ple_table_host_only(m)) {
+			s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
+							  m->layer_dims.per_layer_tok_embd.type, 2,
+							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
+							  WCLASS_EMBEDDING, m->backend);
+			if (s != OK) {
+				ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
+				return s;
+			}
 		}
 		progress_step(prog);
 		s = upload_one_repack_to(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,

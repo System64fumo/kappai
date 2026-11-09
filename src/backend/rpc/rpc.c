@@ -27,6 +27,7 @@ typedef struct {
 	rpc_conn		conn;
 	pthread_mutex_t table_mtx;
 	char			desc[RPC_IDENT_MAX];
+	char			device[BACKEND_DEVICE_NAME_MAX];
 	uint8_t			type_native[RPC_TYPE_MAX];
 	int				sent_neox;
 	float			sent_theta;
@@ -776,6 +777,7 @@ static status_code hello(backend *self, rpc_priv *p, bool *present) {
 	const uint8_t *types = rpc_rd_bytes(&rd, RPC_TYPE_MAX);
 	if (types)
 		memcpy(p->type_native, types, RPC_TYPE_MAX);
+	rpc_rd_str(&rd, p->device, sizeof(p->device));
 	self->caps = (caps & ~(uint64_t)RPC_FORWARD_MASK) | BCAP_REMOTE;
 	s		   = rd.bad ? ERR_FORMAT : OK;
 	rpc_reply_free(&r);
@@ -813,7 +815,7 @@ static status_code rpc_backend_init(backend *self, int device_index) {
 	}
 	install_ops(self, present);
 	self->desc = p->desc;
-	INFO("rpc: connected to worker %s (%s)", addr, p->desc);
+	log_tag("RPC", "Worker: %s (%s)", addr, p->device);
 	return OK;
 }
 

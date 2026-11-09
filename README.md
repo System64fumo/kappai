@@ -22,6 +22,7 @@ See [benchmarks](docs/benchmarks.md) for some examples.
 - Vulkan and OpenGL backends
 - Experimental rk3588 NPU backend
 - A smart highly tunable scheduler (Alpha)
+- Networked clustering
 - MoE expert streaming
 - An OpenAI-compatible server with tool calling
 - Decision models

@@ -76,6 +76,11 @@ int ple_device_path_possible(const struct model *m) {
 		   ple_build_dev_caps_ok(m->backend, m, 1);
 }
 
+int ple_table_host_only(const struct model *m) {
+	return m->has_per_layer_embeddings && m->mixed_backend_mode && m->backend &&
+		   backend_has_cap(m->backend, BCAP_REMOTE);
+}
+
 static status_code ple_host_decode_row(const ple_build_plan *p, int token, float *ple_row) {
 	size_t row_stride	= ggml_row_size(p->m->layer_dims.per_layer_tok_embd.type, p->total_ple);
 	const uint8_t *embd = (const uint8_t *)p->m->layer_dims.per_layer_tok_embd.host_ptr +

@@ -117,6 +117,7 @@ static status_code context_open_device(context *c, const char *spec, backend **o
 		return ERR_INVALID_ARG;
 	}
 	if (strcmp(name, "cpu") == 0) {
+		backend_host_request();
 		*out = backend_host();
 		return OK;
 	}
@@ -237,12 +238,27 @@ static void context_log_assignment(context *c, const config *cfg) {
 	}
 }
 
-static void context_build_topology(context *c) {
-	backend *all[CONFIG_MAX_LAYER_DEVICES + 1];
+static bool context_assigns_host(const context *c, const config *cfg) {
+	for (int i = 0; i < cfg->n_layer_devices; i++)
+		if (backend_device_is_host(cfg->layer_devices[i]))
+			return true;
+	if (c->m.moe.n_experts > 0)
+		for (int i = 0; i < cfg->n_expert_devices; i++)
+			if (backend_device_is_host(cfg->expert_devices[i]))
+				return true;
+	return cfg->ngl >= 0 && cfg->ngl < c->m.n_layers;
+}
+
+static void context_build_topology(context *c, bool host_assigned) {
+	backend *all[CONFIG_MAX_LAYER_DEVICES + 2];
 	int		 n = 0;
 	all[n++]   = c->backend;
 	for (int i = 0; i < c->n_extra_backends; i++)
 		all[n++] = c->extra_backends[i];
+	if (host_assigned) {
+		backend_host_request();
+		all[n++] = backend_host();
+	}
 	mem_topology_build(&c->topo, all, n);
 	c->m.topo = &c->topo;
 }
@@ -349,7 +365,7 @@ status_code context_init(context *c, const config *cfg) {
 	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
 		c->m.fuse_config = cfg->fuse;
 
-	context_build_topology(c);
+	context_build_topology(c, context_assigns_host(c, cfg));
 	report_memory(&c->m, &c->topo, c->backend->kv_alloc ? c->backend : backend_host(),
 				  cfg->ctx_size, (kv_quant_type)cfg->kv_quant);
 	context_log_assignment(c, cfg);

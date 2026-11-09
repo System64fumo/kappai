@@ -712,6 +712,7 @@ static status_code reply_hello(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	for (uint32_t t = 0; t < RPC_TYPE_MAX; t++)
 		types[t] = !be->matmul_type_native || be->matmul_type_native(be, t);
 	rpc_wr_bytes(out, types, sizeof(types));
+	rpc_wr_str(out, s->device);
 	return OK;
 }
 

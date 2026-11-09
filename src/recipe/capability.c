@@ -24,9 +24,13 @@ cap_resolution cap_resolve(backend *be, const struct model *m, op_kind kind, con
 		return backend_has_cap(be, BCAP_IS_HOST) || (kind == OP_MOE_ROUTER && be->moe_router_topk)
 				   ? (cap_resolution){.impl = CAP_NATIVE}
 				   : host_resolution(host_only);
-	if (kind == OP_PLE_BUILD)
-		return ple_build_dev_path_ok(be, m, batched) ? (cap_resolution){.impl = CAP_NATIVE}
-													 : host_resolution("ple_build");
+	if (kind == OP_PLE_BUILD) {
+		if (ple_build_dev_path_ok(be, m, batched))
+			return (cap_resolution){.impl = CAP_NATIVE};
+		cap_resolution res = host_resolution("ple_build");
+		res.by_design	   = m && ple_table_host_only(m);
+		return res;
+	}
 	if (kind == OP_FFN_ACTIVATE_FUSED && !backend_has_cap(be, BCAP_IS_HOST) &&
 		!be->ffn_activate_fused_batch)
 		return host_resolution("ffn_activate_fused");

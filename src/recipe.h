@@ -558,6 +558,7 @@ void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 	}
 
 int ple_device_path_possible(const struct model *m);
+int ple_table_host_only(const struct model *m);
 int ple_build_dev_path_ok(backend *a, const struct model *m, int batched);
 
 #endif

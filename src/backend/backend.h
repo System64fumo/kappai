@@ -598,6 +598,7 @@ backend *backend_host_at(const char *file, int line, const char *func);
 #define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
+void backend_host_request(void);
 
 typedef enum {
 	HFB_OP_NOT_NATIVE	  = 0,
