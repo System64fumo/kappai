@@ -2,6 +2,7 @@
 #define ROCKET_DEVICE_H
 
 #include "uapi.h"
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 

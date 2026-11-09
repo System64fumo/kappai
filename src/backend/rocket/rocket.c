@@ -70,7 +70,7 @@ static void tile_weight_row_esz(uint8_t *bo, const uint8_t *row, int k_len, int 
 	}
 }
 
-static void tile_weight_row(uint16_t *bo, const uint16_t *row, int k_len, int local_row) {
+void rkt_tile_weight_row(uint16_t *bo, const uint16_t *row, int k_len, int local_row) {
 	tile_weight_row_esz((uint8_t *)bo, (const uint8_t *)row, k_len, local_row, 2);
 }
 
@@ -83,26 +83,57 @@ void rkt_tile_input_esz(uint8_t *dst, const uint8_t *src, int m, int k, int esz)
 	}
 }
 
-static void tile_input(uint16_t *dst, const uint16_t *src, int m, int k) {
+void rkt_tile_input(uint16_t *dst, const uint16_t *src, int m, int k) {
 	rkt_tile_input_esz((uint8_t *)dst, (const uint8_t *)src, m, k, 2);
 }
 
-static void pack_ew_operand(uint16_t *dst, const uint16_t *src, int m, int channels) {
+void rkt_pack_ew_operand(uint16_t *dst, const uint16_t *src, int m, int channels) {
 	memset(dst, 0,
 		   (size_t)(channels / RKT_EW_SURFACE_CHANNELS) * RKT_EW_SURFACE_SLOTS * m *
 			   sizeof(uint16_t));
-	for (int r = 0; r < m; r++)
-		for (int c = 0; c < channels; c++)
-			dst[rkt_ew_operand_index(m, r, c)] = src[(size_t)r * channels + c];
+	for (int block = 0; block < channels / 8; block++) {
+		uint16_t *base = dst + (size_t)((block + 1) / 2) * 16 * m + (size_t)(block / 2) * 8 * m;
+		for (int r = 0; r < m; r++)
+			memcpy(base + (size_t)r * 8, src + (size_t)r * channels + (size_t)block * 8,
+				   8 * sizeof(uint16_t));
+	}
 }
 
 void rkt_convert_to_bf16(uint16_t *dst, const float *src, size_t n) {
-	for (size_t i = 0; i < n; i++)
+	const uint32x4_t abs_mask = vdupq_n_u32(0x7FFFFFFFu);
+	const uint32x4_t inf_bits = vdupq_n_u32(0x7F800000u);
+	const uint32x4_t round	  = vdupq_n_u32(0x7FFFu);
+	const uint32x4_t quiet	  = vdupq_n_u32(0x40u);
+	const uint32x4_t one	  = vdupq_n_u32(1u);
+	size_t			 i		  = 0;
+	for (; i + 4 <= n; i += 4) {
+		uint32x4_t bits	  = vreinterpretq_u32_f32(vld1q_f32(src + i));
+		uint32x4_t high	  = vshrq_n_u32(bits, 16);
+		uint32x4_t is_nan = vcgtq_u32(vandq_u32(bits, abs_mask), inf_bits);
+		uint32x4_t rounded =
+			vshrq_n_u32(vaddq_u32(vaddq_u32(bits, round), vandq_u32(high, one)), 16);
+		vst1_u16(dst + i, vmovn_u32(vbslq_u32(is_nan, vorrq_u32(high, quiet), rounded)));
+	}
+	for (; i < n; i++)
 		dst[i] = f32_to_bf16_bits(src[i]);
 }
 
+void rkt_convert_from_f16(float *dst, const uint16_t *src, size_t n) {
+	size_t i = 0;
+	for (; i + 4 <= n; i += 4)
+		vst1q_f32(dst + i, vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(src + i))));
+	for (; i < n; i++)
+		dst[i] = f16_bits_to_f32(src[i]);
+}
+
 void rkt_convert_to_f16(uint16_t *dst, const float *src, size_t n) {
-	for (size_t i = 0; i < n; i++)
+	size_t i = 0;
+	for (; i + 8 <= n; i += 8) {
+		float16x8_t h =
+			vcombine_f16(vcvt_f16_f32(vld1q_f32(src + i)), vcvt_f16_f32(vld1q_f32(src + i + 4)));
+		vst1q_u16(dst + i, vreinterpretq_u16_f16(h));
+	}
+	for (; i < n; i++)
 		dst[i] = f32_to_f16_bits(src[i]);
 }
 
@@ -330,7 +361,7 @@ static status_code gguf_row_source(void *ctx, int row, void *dst, float *tmp) {
 }
 
 static rkt_float_fmt native_fmt_for_type(const rkt_priv *p, uint32_t type) {
-	if (type == GGML_TYPE_BF16 && p->bf16_native && !p->fmt_failed[RKT_FMT_BF16])
+	if (type == GGML_TYPE_BF16 && p->bf16_native)
 		return RKT_FMT_BF16;
 	if (type == GGML_TYPE_F32)
 		return RKT_FMT_TF32;
@@ -538,6 +569,11 @@ static void rkt_buffer_free(backend *self, buffer *buf) {
 	*buf = (buffer){0};
 }
 
+static void rkt_synchronize(backend *self) {
+	(void)self;
+	rkt_native_settle();
+}
+
 static status_code rkt_buffer_read_f32(backend *self, const buffer *buf, float *dst, int n) {
 	(void)self;
 	memcpy(dst, rkt_ptr(buf), (size_t)n * sizeof(float));
@@ -550,516 +586,6 @@ static status_code rkt_buffer_write_f32(backend *self, buffer *buf, const float 
 	return OK;
 }
 
-#define RKT_LUT_HQ_SEL 4
-#define RKT_ADD_MAX_SCALED 65000.0f
-#define RKT_ADD_VERIFY_REL_TOL 4.0e-3
-#define RKT_ADD_VERIFY_ABS_TOL 1.0e-3
-#define RKT_LUT_HOST_LIMIT 15.5f
-#define RKT_LUT_VERIFY_N 512
-#define RKT_LUT_VERIFY_RANGE 12.0f
-#define RKT_LUT_VERIFY_ABS_TOL 2.0e-3
-#define RKT_LUT_VERIFY_REL_TOL 2.0e-3
-
-static const char *lut_name(rkt_lut_kind kind) {
-	if (kind == RKT_LUT_TANH)
-		return "tanh";
-	return kind == RKT_LUT_GELU_TANH ? "gelu" : "silu";
-}
-
-static rkt_lut_kind lut_kind_for_activation(int activation) {
-	if (activation == RKT_FFNA_SILU)
-		return RKT_LUT_SILU;
-	if (activation == RKT_FFNA_GELU)
-		return RKT_LUT_GELU_TANH;
-	return RKT_LUT_NONE;
-}
-
-static double lut_eval(rkt_lut_kind kind, double x) {
-	if (kind == RKT_LUT_TANH)
-		return tanh(x);
-	if (x < -40.0)
-		return 0.0;
-	if (kind == RKT_LUT_GELU_TANH)
-		return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
-	return x / (1.0 + exp(-x));
-}
-
-void rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
-	cfg->kind		= kind;
-	cfg->sel		= RKT_LUT_HQ_SEL;
-	cfg->S			= 256;
-	cfg->F			= 2048;
-	cfg->start		= -(RKT_LUT_WINDOW_HALF << cfg->sel);
-	cfg->end		= (RKT_LUT_WINDOW_HALF << cfg->sel) - 1;
-	cfg->tail_slope = kind == RKT_LUT_TANH ? 0 : cfg->F / cfg->S;
-}
-
-static void lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
-	long step = 1L << cfg->sel;
-	for (int i = 0; i < RKT_LUT_ENTRIES; i++) {
-		long   y_int = (long)cfg->start + (long)i * step;
-		double v	 = lut_eval(cfg->kind, (double)y_int / cfg->S) * cfg->F;
-		long   r	 = lround(v);
-		if (r > 32767)
-			r = 32767;
-		if (r < -32768)
-			r = -32768;
-		le[i] = (uint16_t)((int32_t)r & 0xFFFF);
-	}
-}
-
-static void lut_tier_destroy(rkt_priv *p, rkt_lut_tier *t) {
-	for (int c = 0; c < RKT_MAX_CORES; c++) {
-		rkt_bo_destroy(&p->dev, &t->in[c]);
-		rkt_bo_destroy(&p->dev, &t->ew[c]);
-		rkt_bo_destroy(&p->dev, &t->out[c]);
-		rkt_bo_destroy(&p->dev, &t->reg_upload[c]);
-		rkt_bo_destroy(&p->dev, &t->reg_blocks[c]);
-	}
-	t->uploaded_kind = RKT_LUT_NONE;
-}
-
-static status_code lut_tier_create(rkt_priv *p, rkt_lut_tier *t, int blocks_per_core) {
-	t->blocks_per_core = blocks_per_core;
-	t->uploaded_kind   = RKT_LUT_NONE;
-	for (int c = 0; c < p->dev.n_cores; c++)
-		if (rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_LUT_IN_BLOCK_BYTES,
-						  &t->in[c]) ||
-			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_EW_OPERAND_BLOCK_BYTES,
-						  &t->ew[c]) ||
-			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_LUT_OUT_BLOCK_BYTES,
-						  &t->out[c]) ||
-			rkt_bo_create(&p->dev, c, (size_t)RKT_LUT_UPLOAD_TASKS * RKT_REGCMD_BYTES,
-						  &t->reg_upload[c]) ||
-			rkt_bo_create(&p->dev, c, (size_t)blocks_per_core * RKT_REGCMD_BYTES,
-						  &t->reg_blocks[c]))
-			return ERR_OUT_OF_MEMORY;
-	return OK;
-}
-
-static void lut_state_reset(rkt_priv *p, rkt_lut_state *a) {
-	for (int c = 0; c < RKT_MAX_CORES; c++) {
-		rkt_bo_destroy(&p->dev, &a->identity[c]);
-		rkt_bo_destroy(&p->dev, &a->identity_unit[c]);
-	}
-	for (int t = 0; t < RKT_LUT_TIERS; t++)
-		lut_tier_destroy(p, &a->tier[t]);
-	a->ready	= 0;
-	a->resident = RKT_LUT_NONE;
-}
-
-static status_code lut_state_init(rkt_priv *p, rkt_lut_state *a) {
-	if (a->ready)
-		return OK;
-	rkt_lut_configure(&a->cfg, RKT_LUT_NONE);
-	size_t	 identity_bytes = (size_t)RKT_LUT_CHUNK * RKT_LUT_CHUNK * sizeof(uint16_t);
-	uint16_t row[RKT_LUT_CHUNK];
-	for (int c = 0; c < p->dev.n_cores; c++) {
-		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity[c])) {
-			lut_state_reset(p, a);
-			return ERR_OUT_OF_MEMORY;
-		}
-		for (int j = 0; j < RKT_LUT_CHUNK; j++) {
-			memset(row, 0, sizeof(row));
-			row[j] = f32_to_f16_bits((float)a->cfg.S);
-			tile_weight_row(a->identity[c].map, row, RKT_LUT_CHUNK, j);
-		}
-		if (rkt_bo_flush(&p->dev, &a->identity[c])) {
-			lut_state_reset(p, a);
-			return ERR_IO;
-		}
-		if (rkt_bo_create(&p->dev, c, identity_bytes, &a->identity_unit[c])) {
-			lut_state_reset(p, a);
-			return ERR_OUT_OF_MEMORY;
-		}
-		for (int j = 0; j < RKT_LUT_CHUNK; j++) {
-			memset(row, 0, sizeof(row));
-			row[j] = f32_to_f16_bits(1.0f);
-			tile_weight_row(a->identity_unit[c].map, row, RKT_LUT_CHUNK, j);
-		}
-		if (rkt_bo_flush(&p->dev, &a->identity_unit[c])) {
-			lut_state_reset(p, a);
-			return ERR_IO;
-		}
-	}
-	if (lut_tier_create(p, &a->tier[0], RKT_LUT_SMALL_BLOCKS_PER_CORE) != OK ||
-		lut_tier_create(p, &a->tier[1], RKT_LUT_BLOCKS_PER_CORE) != OK) {
-		lut_state_reset(p, a);
-		return ERR_OUT_OF_MEMORY;
-	}
-	a->ready = 1;
-	return OK;
-}
-
-static status_code lut_tier_prepare(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t) {
-	if (t->uploaded_kind == a->cfg.kind)
-		return OK;
-	uint16_t le[RKT_LUT_ENTRIES];
-	lut_fill(&a->cfg, le);
-	for (int c = 0; c < p->dev.n_cores; c++) {
-		for (int task = 0; task < RKT_LUT_UPLOAD_TASKS; task++) {
-			uint32_t n_ops = (uint32_t)rkt_emit_lut_upload(
-				(uint64_t *)((uint8_t *)t->reg_upload[c].map + (size_t)task * RKT_REGCMD_BYTES), 0,
-				task * RKT_LUT_UPLOAD_CHUNK, le + task * RKT_LUT_UPLOAD_CHUNK, RKT_LUT_UPLOAD_CHUNK,
-				(uint32_t)t->in[c].dma_addr, (uint32_t)a->identity[c].dma_addr,
-				(uint32_t)t->out[c].dma_addr);
-			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
-				return ERR_INTERNAL;
-			a->upload_ops[task] = n_ops;
-		}
-		if (rkt_bo_flush(&p->dev, &t->reg_upload[c]))
-			return ERR_IO;
-	}
-	t->uploaded_kind = a->cfg.kind;
-	return OK;
-}
-
-static status_code lut_state_select(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	status_code s = lut_state_init(p, a);
-	if (s != OK)
-		return s;
-	rkt_lut_configure(&a->cfg, kind);
-	a->post_active = 0;
-	return OK;
-}
-
-typedef struct {
-	int first;
-	int rows;
-} lut_block;
-
-static status_code lut_run_wave(rkt_priv *p, rkt_lut_state *a, rkt_lut_tier *t, const uint16_t *x16,
-								const lut_block *blocks, int n_blocks) {
-	int			n_upload = a->post_active ? 0 : RKT_LUT_UPLOAD_TASKS;
-	status_code s		 = n_upload ? lut_tier_prepare(p, a, t) : OK;
-	if (s != OK)
-		return s;
-
-	int		 n_cores				 = p->dev.n_cores;
-	int		 per_core[RKT_MAX_CORES] = {0};
-	uint32_t n_ops[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
-	uint32_t regcmd_dma[RKT_MAX_CORES][RKT_LUT_TASKS_PER_CORE];
-
-	for (int c = 0; c < n_cores; c++)
-		for (int task = 0; task < n_upload; task++) {
-			n_ops[c][task] = a->upload_ops[task];
-			regcmd_dma[c][task] =
-				(uint32_t)(t->reg_upload[c].dma_addr + (size_t)task * RKT_REGCMD_BYTES);
-		}
-
-	for (int i = 0; i < n_blocks; i++) {
-		const lut_block *b	  = &blocks[i];
-		int				 c	  = i % n_cores;
-		int				 slot = i / n_cores;
-		int				 task = n_upload + slot;
-		tile_input((uint16_t *)((uint8_t *)t->in[c].map + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES),
-				   x16 + (size_t)b->first * RKT_LUT_CHUNK, b->rows, RKT_LUT_CHUNK);
-		uint64_t *reg =
-			(uint64_t *)((uint8_t *)t->reg_blocks[c].map + (size_t)slot * RKT_REGCMD_BYTES);
-		uint32_t in_dma	 = (uint32_t)(t->in[c].dma_addr + (size_t)slot * RKT_LUT_IN_BLOCK_BYTES);
-		uint32_t out_dma = (uint32_t)(t->out[c].dma_addr + (size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
-		uint32_t w_dma =
-			(uint32_t)(a->ew16 ? a->identity_unit[c].dma_addr : a->identity[c].dma_addr);
-		uint32_t ew_dma = 0;
-		if (a->ew16) {
-			size_t ew_slot = (size_t)slot * RKT_EW_OPERAND_BLOCK_BYTES;
-			pack_ew_operand((uint16_t *)((uint8_t *)t->ew[c].map + ew_slot),
-							a->ew16 + (size_t)b->first * RKT_LUT_CHUNK, b->rows, RKT_LUT_CHUNK);
-			ew_dma = (uint32_t)(t->ew[c].dma_addr + ew_slot);
-		}
-		n_ops[c][task] =
-			a->post_active && a->cfg.kind != RKT_LUT_NONE && !a->ew16
-				? (uint32_t)rkt_emit_matmul_f16_act_lut(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
-														in_dma, w_dma, out_dma, &a->cfg,
-														a->post.mulc)
-			: a->ew16
-				? (uint32_t)rkt_emit_matmul_f16_ewadd(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
-													  in_dma, w_dma, out_dma, ew_dma)
-			: a->post_active
-				? (uint32_t)rkt_emit_matmul_f16_act(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
-													in_dma, w_dma, out_dma, &a->post)
-				: (uint32_t)rkt_emit_matmul_f16_lut(reg, b->rows, RKT_LUT_CHUNK, RKT_LUT_CHUNK,
-													in_dma, w_dma, out_dma, &a->cfg);
-		if (!n_ops[c][task] || n_ops[c][task] > RKT_REGCMD_MAX_OPS)
-			return ERR_INTERNAL;
-		regcmd_dma[c][task] =
-			(uint32_t)(t->reg_blocks[c].dma_addr + (size_t)slot * RKT_REGCMD_BYTES);
-		per_core[c]++;
-	}
-
-	for (int c = 0; c < n_cores; c++)
-		if (per_core[c] &&
-			(rkt_bo_flush(&p->dev, &t->in[c]) || rkt_bo_flush(&p->dev, &t->reg_blocks[c]) ||
-			 (a->ew16 && rkt_bo_flush(&p->dev, &t->ew[c]))))
-			return ERR_IO;
-
-	int submitted = 0;
-	for (; submitted < n_cores && (per_core[submitted] || n_upload) && s == OK; submitted++) {
-		const rkt_bo *in_list[5] = {
-			&t->in[submitted], a->ew16 ? &a->identity_unit[submitted] : &a->identity[submitted],
-			&t->reg_upload[submitted], &t->reg_blocks[submitted], &t->ew[submitted]};
-		const rkt_bo *out_list[1] = {&t->out[submitted]};
-		if (rkt_submit_bos(&p->dev, submitted, regcmd_dma[submitted], n_ops[submitted],
-						   n_upload + per_core[submitted], in_list, a->ew16 ? 5 : 4, out_list, 1))
-			s = ERR_COMPUTE_FAIL;
-	}
-	for (int c = 0; c < submitted; c++)
-		if (rkt_bo_wait(&p->dev, &t->out[c]) && s == OK)
-			s = ERR_COMPUTE_FAIL;
-	if (s == OK && n_upload)
-		a->resident = a->cfg.kind;
-	return s;
-}
-
-typedef struct {
-	const rkt_lut_tier *tier;
-	const lut_block	   *blocks;
-	const uint16_t	   *x16;
-	const float		   *up;
-	float			   *out;
-	int					up_stride;
-	int					n;
-	int					chunks_per_row;
-	int					n_cores;
-	rkt_lut_kind		kind;
-	float				inv;
-	float				out_scale;
-} lut_gather;
-
-static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
-	(void)tid;
-	const lut_gather *g = arg;
-	for (int i = begin; i < end; i++) {
-		const lut_block *b	  = &g->blocks[i];
-		int				 c	  = i % g->n_cores;
-		int				 slot = i / g->n_cores;
-		const float		*om	  = (const float *)((const uint8_t *)g->tier->out[c].map +
-												(size_t)slot * RKT_LUT_OUT_BLOCK_BYTES);
-		for (int r = 0; r < b->rows; r++) {
-			int				pixel = b->first + r;
-			int				row	  = pixel / g->chunks_per_row;
-			int				col0  = (pixel % g->chunks_per_row) * RKT_LUT_CHUNK;
-			int				cols  = g->n - col0 < RKT_LUT_CHUNK ? g->n - col0 : RKT_LUT_CHUNK;
-			const uint16_t *x	  = g->x16 + (size_t)pixel * RKT_LUT_CHUNK;
-			const float	   *u	  = g->up ? g->up + (size_t)row * g->up_stride + col0 : NULL;
-			float		   *dst	  = g->out + (size_t)row * g->n + col0;
-			for (int j = 0; j < cols; j++) {
-				float v = om[(size_t)(j / RKT_OUT_C2_F32) * b->rows * RKT_OUT_C2_F32 +
-							 (size_t)r * RKT_OUT_C2_F32 + j % RKT_OUT_C2_F32] *
-						  g->inv;
-				if (g->kind != RKT_LUT_NONE) {
-					float xv = f16_bits_to_f32(x[j]);
-					if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
-						v = (float)lut_eval(g->kind, (double)xv);
-				}
-				dst[j] = (u ? v * u[j] : v) * g->out_scale;
-			}
-		}
-	}
-}
-
-static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind, const float *gate,
-								int gate_stride, const float *up, int up_stride, float *out, int n,
-								int m, float inv) {
-	status_code s			   = OK;
-	int			chunks_per_row = (n + RKT_LUT_CHUNK - 1) / RKT_LUT_CHUNK;
-	int			pixels		   = m * chunks_per_row;
-	if (!rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)pixels * RKT_LUT_CHUNK,
-							 sizeof(uint16_t)))
-		return ERR_OUT_OF_MEMORY;
-	for (int r = 0; r < m; r++) {
-		uint16_t	*dst = p->x16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
-		const float *src = gate + (size_t)r * gate_stride;
-		if (a->in_scale > 0.0f)
-			for (int j = 0; j < n; j++)
-				dst[j] = f32_to_f16_bits(src[j] * a->in_scale);
-		else
-			rkt_convert_to_f16(dst, src, (size_t)n);
-		memset(dst + n, 0, ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
-	}
-
-	if (a->ew_src) {
-		if (!rkt_ensure_capacity((void **)&p->y16, &p->y16_cap, (size_t)pixels * RKT_LUT_CHUNK,
-								 sizeof(uint16_t)))
-			return ERR_OUT_OF_MEMORY;
-		for (int r = 0; r < m; r++) {
-			uint16_t *dst = p->y16 + (size_t)r * chunks_per_row * RKT_LUT_CHUNK;
-			for (int j = 0; j < n; j++) {
-				float v = a->ew_src[(size_t)r * n + j];
-				if (!(fabsf(v) <= RKT_ADD_MAX_SCALED))
-					return ERR_UNSUPPORTED;
-				dst[j] = f32_to_f16_bits(v);
-			}
-			memset(dst + n, 0,
-				   ((size_t)chunks_per_row * RKT_LUT_CHUNK - (size_t)n) * sizeof(uint16_t));
-		}
-		a->ew16 = p->y16;
-	}
-
-	lut_block blocks[RKT_MAX_CORES * RKT_LUT_BLOCKS_PER_CORE];
-	int		  wave_capacity = p->dev.n_cores * RKT_LUT_BLOCKS_PER_CORE;
-	tpool	 *pool			= tpool_fetch_pool();
-	for (int done = 0; done < pixels;) {
-		int n_blocks = 0;
-		while (n_blocks < wave_capacity && done < pixels) {
-			int rows		   = rkt_next_block_rows(pixels - done, RKT_LUT_BLOCK_ROWS);
-			blocks[n_blocks++] = (lut_block){.first = done, .rows = rows};
-			done += rows;
-		}
-		rkt_lut_tier *tier =
-			n_blocks <= p->dev.n_cores * RKT_LUT_SMALL_BLOCKS_PER_CORE ? &a->tier[0] : &a->tier[1];
-		s = lut_run_wave(p, a, tier, p->x16, blocks, n_blocks);
-		if (s != OK)
-			return s;
-		lut_gather g = {.tier			= tier,
-						.blocks			= blocks,
-						.x16			= p->x16,
-						.up				= up,
-						.out			= out,
-						.up_stride		= up_stride,
-						.n				= n,
-						.chunks_per_row = chunks_per_row,
-						.n_cores		= p->dev.n_cores,
-						.kind			= kind,
-						.inv			= inv,
-						.out_scale		= a->out_scale > 0.0f ? a->out_scale : 1.0f};
-		tpool_parallel_for(pool, n_blocks, 4, lut_gather_chunk, &g);
-	}
-	return OK;
-}
-
-static status_code lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
-									 const float *gate, int gate_stride, const float *up,
-									 int up_stride, float *out, int n, int m) {
-	status_code s = lut_state_select(p, a, kind);
-	if (s != OK)
-		return s;
-	return lut_run_rows(p, a, kind, gate, gate_stride, up, up_stride, out, n, m,
-						1.0f / (float)a->cfg.F);
-}
-
-static status_code lut_scale_rows(rkt_priv *p, rkt_lut_state *a, const float *x, float *out, int n,
-								  float scale) {
-	if (!isfinite(scale))
-		return ERR_INVALID_ARG;
-	status_code s = lut_state_init(p, a);
-	if (s != OK)
-		return s;
-	int	  exponent;
-	float mantissa = frexpf(scale, &exponent);
-	rkt_lut_configure(&a->cfg, RKT_LUT_NONE);
-	a->post_active = 1;
-	a->post		   = (rkt_post_cfg){.act = RKT_ACT_MULC, .mulc = 2.0f * mantissa};
-	return lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, 1,
-						ldexpf(1.0f, exponent - 1) / (float)a->cfg.S);
-}
-
-#define RKT_SCALE_VERIFY_REL_TOL 4.0e-3
-#define RKT_SCALE_VERIFY_ABS_TOL 1.0e-4
-#define RKT_SCALE_VERIFY_VALUE 0.0371f
-
-static status_code lut_scale_verify(rkt_priv *p, rkt_lut_state *a) {
-	float ramp[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++)
-		ramp[i] = -RKT_LUT_VERIFY_RANGE +
-				  2.0f * RKT_LUT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
-	status_code s = lut_scale_rows(p, a, ramp, got, RKT_LUT_VERIFY_N, RKT_SCALE_VERIFY_VALUE);
-	if (s != OK)
-		return s;
-	double worst   = 0.0;
-	float  worst_x = 0.0f;
-	int	   bad	   = 0;
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
-		double ref = (double)x * (double)RKT_SCALE_VERIFY_VALUE;
-		double err = fabs((double)got[i] - ref);
-		if (err > worst) {
-			worst	= err;
-			worst_x = x;
-		}
-		if (!(err <= RKT_SCALE_VERIFY_ABS_TOL + RKT_SCALE_VERIFY_REL_TOL * fabs(ref)))
-			bad++;
-	}
-	if (bad) {
-		WARN("rocket: npu scale verification failed: %d/%d points off, max err %.6f at x=%.4f, "
-			 "scale stays on host",
-			 bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
-		return ERR_COMPUTE_FAIL;
-	}
-	return OK;
-}
-
-static status_code lut_verify(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	float ramp[RKT_LUT_VERIFY_N], ones[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		ramp[i] = -RKT_LUT_VERIFY_RANGE +
-				  2.0f * RKT_LUT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
-		ones[i] = 1.0f;
-	}
-	status_code s = lut_activate_rows(p, a, kind, ramp, RKT_LUT_VERIFY_N, ones, RKT_LUT_VERIFY_N,
-									  got, RKT_LUT_VERIFY_N, 1);
-	if (s != OK)
-		return s;
-
-	double worst   = 0.0;
-	float  worst_x = 0.0f;
-	int	   bad	   = 0;
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
-		double ref = lut_eval(kind, (double)x);
-		double err = fabs((double)got[i] - ref);
-		if (err > worst) {
-			worst	= err;
-			worst_x = x;
-		}
-		if (!(err <= RKT_LUT_VERIFY_ABS_TOL + RKT_LUT_VERIFY_REL_TOL * fabs(ref)))
-			bad++;
-	}
-	if (bad) {
-		WARN("rocket: lut %s verification failed: %d/%d points off, max err %.5f at x=%.4f, "
-			 "activation stays on host",
-			 lut_name(kind), bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
-		return ERR_COMPUTE_FAIL;
-	}
-	return OK;
-}
-
-static status_code lut_ensure_verified(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	if (a->verified[kind] > 0)
-		return OK;
-	if (a->verified[kind] < 0)
-		return ERR_UNSUPPORTED;
-	status_code s	  = lut_verify(p, a, kind);
-	a->verified[kind] = s == OK ? 1 : -1;
-	return s;
-}
-
-static status_code ffn_activate_host(backend *self, const buffer *gate, const buffer *up,
-									 buffer *out, int n, int activation, int m, int gate_stride,
-									 int up_stride, int fused) {
-	if (fused || gate_stride != n || up_stride != n)
-		return ERR_UNSUPPORTED;
-	backend_report_host_fallback(self, "ffn_activate", HFB_OP_NOT_NATIVE, "shape n=%d m=%d act=%d",
-								 n, m, activation);
-	backend *host = backend_host();
-	if (!host || !host->ffn_activate_batch)
-		return ERR_UNSUPPORTED;
-	return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
-}
-
-static status_code lut_softcap_rows(rkt_priv *p, rkt_lut_state *a, const float *x, float *out,
-									int n, float cap) {
-	status_code s = lut_state_select(p, a, RKT_LUT_TANH);
-	if (s != OK)
-		return s;
-	a->in_scale	 = 1.0f / cap;
-	a->out_scale = cap;
-	s = lut_run_rows(p, a, RKT_LUT_TANH, x, n, NULL, 0, out, n, 1, 1.0f / (float)a->cfg.F);
-	a->in_scale	 = 0.0f;
-	a->out_scale = 0.0f;
-	return s;
-}
-
 static status_code rkt_softcap(backend *self, buffer *x, float cap, int n) {
 	rkt_priv *p = self->priv;
 	if (n <= 0)
@@ -1067,17 +593,15 @@ static status_code rkt_softcap(backend *self, buffer *x, float cap, int n) {
 	status_code s = ERR_UNSUPPORTED;
 	if (cap > 0.0f && !p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
-		s = lut_ensure_verified(p, &p->lut, RKT_LUT_TANH);
-		if (s == OK && !rkt_ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, (size_t)n,
-											sizeof(float)))
-			s = ERR_OUT_OF_MEMORY;
+		s = rkt_ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, (size_t)n, sizeof(float))
+				? OK
+				: ERR_OUT_OF_MEMORY;
 		if (s == OK) {
-			s = lut_softcap_rows(p, &p->lut, rkt_ptr(x), p->scale_tmp, n, cap);
+			s = rkt_lut_softcap_rows(p, &p->lut, rkt_ptr(x), p->scale_tmp, n, cap);
 			if (s == OK)
 				memcpy(rkt_ptr(x), p->scale_tmp, (size_t)n * sizeof(float));
 		}
-		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed &&
-			p->lut.verified[RKT_LUT_TANH] > 0) {
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 			rkt_npu_record_failure(p);
 			WARN("rocket: npu softcap failed (n=%d status=%d, errno=%d)", n, s, errno);
 		}
@@ -1090,65 +614,6 @@ static status_code rkt_softcap(backend *self, buffer *x, float cap, int n) {
 		return ERR_UNSUPPORTED;
 	backend_report_host_fallback(self, "softcap", HFB_OP_NOT_NATIVE, "n=%d", n);
 	return host->softcap(host, x, cap, n);
-}
-
-static status_code lut_make_resident(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	status_code s = lut_state_select(p, a, kind);
-	if (s != OK || a->resident == kind)
-		return s;
-	return lut_run_wave(p, a, &a->tier[0], NULL, NULL, 0);
-}
-
-#define RKT_GATE_ACT_VERIFY_RANGE 20.0f
-#define RKT_GATE_ACT_VERIFY_REL_TOL 1.0e-2
-
-static status_code lut_gate_act_verify(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	float ramp[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++)
-		ramp[i] = -RKT_GATE_ACT_VERIFY_RANGE +
-				  2.0f * RKT_GATE_ACT_VERIFY_RANGE * (float)i / (float)(RKT_LUT_VERIFY_N - 1);
-	status_code s = lut_make_resident(p, a, kind);
-	if (s != OK)
-		return s;
-	a->post_active = 1;
-	a->post		   = (rkt_post_cfg){.act = RKT_ACT_MULC, .mulc = 1.0f};
-	s = lut_run_rows(p, a, RKT_LUT_NONE, ramp, RKT_LUT_VERIFY_N, NULL, 0, got, RKT_LUT_VERIFY_N, 1,
-					 1.0f / (float)a->cfg.F);
-	if (s != OK)
-		return s;
-	double worst   = 0.0;
-	float  worst_x = 0.0f;
-	int	   bad	   = 0;
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		float  x   = f16_bits_to_f32(f32_to_f16_bits(ramp[i]));
-		double ref = lut_eval(kind, (double)x);
-		double err = fabs((double)got[i] - ref);
-		if (err > worst) {
-			worst	= err;
-			worst_x = x;
-		}
-		if (!(err <= RKT_LUT_VERIFY_ABS_TOL + RKT_GATE_ACT_VERIFY_REL_TOL * fabs(ref)))
-			bad++;
-	}
-	if (bad) {
-		WARN("rocket: gate+%s epilogue verification failed: %d/%d points off, max err %.5f at "
-			 "x=%.4f, gate activation stays separate",
-			 lut_name(kind), bad, RKT_LUT_VERIFY_N, worst, (double)worst_x);
-		return ERR_COMPUTE_FAIL;
-	}
-	return OK;
-}
-
-static status_code lut_gate_act_prepare(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind) {
-	if (a->gate_act_verified[kind] < 0)
-		return ERR_UNSUPPORTED;
-	if (a->gate_act_verified[kind] == 0) {
-		status_code v			   = lut_gate_act_verify(p, a, kind);
-		a->gate_act_verified[kind] = v == OK ? 1 : -1;
-		if (v != OK)
-			return v;
-	}
-	return lut_make_resident(p, a, kind);
 }
 
 static int gate_act_chainable(const rkt_priv *p, const buffer *wbuf, int n, int k,
@@ -1176,7 +641,7 @@ static status_code rkt_matmul_gate_act_batch(backend *self, const buffer *w_gate
 	(void)gate_type;
 	(void)up_type;
 	rkt_priv		 *p		= self->priv;
-	rkt_lut_kind	  kind	= lut_kind_for_activation(activation);
+	rkt_lut_kind	  kind	= rkt_lut_kind_for_activation(activation);
 	const rkt_weight *gw	= NULL;
 	const rkt_weight *uw	= NULL;
 	int				  grow0 = 0;
@@ -1188,8 +653,10 @@ static status_code rkt_matmul_gate_act_batch(backend *self, const buffer *w_gate
 
 	float *act = rkt_ptr(act_out);
 	float *up  = rkt_ptr(up_out);
+	if (rkt_native_gate_act(p, gw, grow0, uw, urow0, rkt_ptr(x), act, n, m, kind) == OK)
+		return OK;
 	pthread_mutex_lock(&p->lock);
-	status_code s = lut_gate_act_prepare(p, &p->lut, kind);
+	status_code s = rkt_lut_gate_act_prepare(p, &p->lut, kind);
 	if (s == OK) {
 		p->epi_kind = (int)kind;
 		s			= rkt_dense_matmul_enqueue(p, gw, grow0, n, rkt_ptr(x), act, m);
@@ -1201,10 +668,10 @@ static status_code rkt_matmul_gate_act_batch(backend *self, const buffer *w_gate
 		else
 			rkt_queue_abort(p);
 	}
-	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.gate_act_verified[kind] > 0) {
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 		rkt_npu_record_failure(p);
 		WARN("rocket: npu gate+%s matmul failed (n=%d k=%d m=%d status=%d, errno=%d)",
-			 lut_name(kind), n, k, m, s, errno);
+			 rkt_lut_name(kind), n, k, m, s, errno);
 	}
 	pthread_mutex_unlock(&p->lock);
 	if (s != OK)
@@ -1235,7 +702,7 @@ static status_code rkt_matmul_softcap_batch(backend *self, const buffer *wbuf, u
 		return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
 
 	pthread_mutex_lock(&p->lock);
-	status_code s = lut_gate_act_prepare(p, &p->lut, RKT_LUT_TANH);
+	status_code s = rkt_lut_gate_act_prepare(p, &p->lut, RKT_LUT_TANH);
 	if (s == OK) {
 		p->epi_kind = RKT_LUT_TANH;
 		p->epi_cap	= cap;
@@ -1243,8 +710,7 @@ static status_code rkt_matmul_softcap_batch(backend *self, const buffer *wbuf, u
 		p->epi_kind = 0;
 		p->epi_cap	= 0.0f;
 	}
-	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed &&
-		p->lut.gate_act_verified[RKT_LUT_TANH] > 0) {
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 		rkt_npu_record_failure(p);
 		WARN("rocket: npu matmul+softcap failed (n=%d k=%d m=%d status=%d, errno=%d)", n, k, m, s,
 			 errno);
@@ -1255,74 +721,6 @@ static status_code rkt_matmul_softcap_batch(backend *self, const buffer *wbuf, u
 	return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
 }
 
-static status_code lut_add_rows(rkt_priv *p, rkt_lut_state *a, const float *x, const float *y,
-								float *out, int n, int m, float out_scale) {
-	status_code s = lut_state_init(p, a);
-	if (s != OK)
-		return s;
-	rkt_lut_configure(&a->cfg, RKT_LUT_NONE);
-	a->post_active = 1;
-	a->post		   = (rkt_post_cfg){.act = RKT_ACT_NONE};
-	a->ew_src	   = y;
-	s			   = lut_run_rows(p, a, RKT_LUT_NONE, x, n, NULL, 0, out, n, m, out_scale);
-	a->ew_src	   = NULL;
-	a->ew16		   = NULL;
-	return s;
-}
-
-static status_code lut_add_verify(rkt_priv *p, rkt_lut_state *a) {
-	float x[RKT_LUT_VERIFY_N], y[RKT_LUT_VERIFY_N], got[RKT_LUT_VERIFY_N];
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		float t = (float)i / (float)(RKT_LUT_VERIFY_N - 1);
-		x[i]	= -RKT_LUT_VERIFY_RANGE + 2.0f * RKT_LUT_VERIFY_RANGE * t;
-		y[i]	= 0.37f * RKT_LUT_VERIFY_RANGE * (1.0f - 2.0f * t * t);
-	}
-	status_code s = lut_add_rows(p, a, x, y, got, RKT_LUT_VERIFY_N, 1, 1.0f);
-	if (s != OK)
-		return s;
-	double worst   = 0.0;
-	int	   bad	   = 0;
-	int	   worst_i = 0;
-	for (int i = 0; i < RKT_LUT_VERIFY_N; i++) {
-		double ref = (double)f16_bits_to_f32(f32_to_f16_bits(x[i])) +
-					 (double)f16_bits_to_f32(f32_to_f16_bits(y[i]));
-		double err = fabs((double)got[i] - ref);
-		if (err > worst) {
-			worst	= err;
-			worst_i = i;
-		}
-		if (!(err <= RKT_ADD_VERIFY_ABS_TOL + RKT_ADD_VERIFY_REL_TOL * fabs(ref)))
-			bad++;
-	}
-	if (bad) {
-		WARN("rocket: npu add verification failed: %d/%d points off, max err %.6f at i=%d "
-			 "(x=%.4f y=%.4f got=%.4f), add stays on host",
-			 bad, RKT_LUT_VERIFY_N, worst, worst_i, (double)x[worst_i], (double)y[worst_i],
-			 (double)got[worst_i]);
-		return ERR_COMPUTE_FAIL;
-	}
-	return OK;
-}
-
-static status_code lut_add_checked(rkt_priv *p, rkt_lut_state *a, float *x, const float *y, int n,
-								   int m, float out_scale) {
-	if (a->add_verified < 0)
-		return ERR_UNSUPPORTED;
-	if (a->add_verified == 0) {
-		status_code v	= lut_add_verify(p, a);
-		a->add_verified = v == OK ? 1 : -1;
-		if (v != OK)
-			return v;
-	}
-	size_t total = (size_t)n * (size_t)m;
-	if (!rkt_ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, total, sizeof(float)))
-		return ERR_OUT_OF_MEMORY;
-	status_code s = lut_add_rows(p, a, x, y, p->scale_tmp, n, m, out_scale);
-	if (s == OK)
-		memcpy(x, p->scale_tmp, total * sizeof(float));
-	return s;
-}
-
 static status_code rkt_add_scaled(backend *self, buffer *x, const buffer *y, int n, int m,
 								  float out_scale) {
 	rkt_priv *p = self->priv;
@@ -1331,8 +729,8 @@ static status_code rkt_add_scaled(backend *self, buffer *x, const buffer *y, int
 	status_code s = ERR_UNSUPPORTED;
 	if (!p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
-		s = lut_add_checked(p, &p->lut, rkt_ptr(x), rkt_ptr(y), n, m, out_scale);
-		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.add_verified > 0) {
+		s = rkt_lut_add_inplace(p, &p->lut, rkt_ptr(x), rkt_ptr(y), n, m, out_scale);
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 			rkt_npu_record_failure(p);
 			WARN("rocket: npu add failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
 		}
@@ -1367,20 +765,35 @@ static status_code rkt_add_inplace(backend *self, buffer *x, const buffer *y, in
 	return rkt_add_batch(self, x, y, n, 1);
 }
 
+static status_code ffn_activate_host(backend *self, const buffer *gate, const buffer *up,
+									 buffer *out, int n, int activation, int m, int gate_stride,
+									 int up_stride, int fused) {
+	if (fused || gate_stride != n || up_stride != n)
+		return ERR_UNSUPPORTED;
+	backend_report_host_fallback(self, "ffn_activate", HFB_OP_NOT_NATIVE, "shape n=%d m=%d act=%d",
+								 n, m, activation);
+	backend *host = backend_host();
+	if (!host || !host->ffn_activate_batch)
+		return ERR_UNSUPPORTED;
+	return host->ffn_activate_batch(host, gate, up, out, n, activation, m);
+}
+
 static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, const buffer *up,
 										 buffer *out, int n, int activation, int m, int gate_stride,
 										 int up_stride, int fused) {
 	rkt_priv *p = self->priv;
 	if (n <= 0 || m <= 0)
 		return OK;
-	rkt_lut_kind kind = lut_kind_for_activation(activation);
+	rkt_lut_kind kind = rkt_lut_kind_for_activation(activation);
 	if (kind == RKT_LUT_NONE || p->npu_failed)
 		return ffn_activate_host(self, gate, up, out, n, activation, m, gate_stride, up_stride,
 								 fused);
 
-	const float *gf		  = rkt_ptr(gate);
-	const float *uf		  = rkt_ptr(up);
-	float		*of		  = rkt_ptr(out);
+	const float *gf = rkt_ptr(gate);
+	const float *uf = rkt_ptr(up);
+	float		*of = rkt_ptr(out);
+	if (rkt_native_ffn_activate(p, kind, gf, gate_stride, uf, up_stride, of, n, m) == OK)
+		return OK;
 	float		*ucopy	  = NULL;
 	const float *up_end	  = uf + (size_t)(m - 1) * up_stride + n;
 	const float *out_end  = of + (size_t)m * n;
@@ -1394,10 +807,9 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 	}
 
 	pthread_mutex_lock(&p->lock);
-	status_code s = lut_ensure_verified(p, &p->lut, kind);
-	if (s == OK)
-		s = lut_activate_rows(p, &p->lut, kind, gf, gate_stride, uf, u_stride, of, n, m);
-	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.verified[kind] > 0) {
+	status_code s =
+		rkt_lut_activate_rows(p, &p->lut, kind, gf, gate_stride, uf, u_stride, of, n, m);
+	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 		rkt_npu_record_failure(p);
 		WARN("rocket: npu ffn_activate failed (n=%d m=%d status=%d, errno=%d)", n, m, s, errno);
 	}
@@ -1456,23 +868,6 @@ static status_code rkt_matmul_ffn_down(backend *self, const buffer *w, uint32_t 
 	return rkt_matmul_ffn_down_batch(self, w, w_type, gate, up, y, n, k, activation, 1);
 }
 
-static status_code lut_scale_checked(rkt_priv *p, rkt_lut_state *a, float *x, int n, float scale) {
-	if (a->scale_verified < 0)
-		return ERR_UNSUPPORTED;
-	if (a->scale_verified == 0) {
-		status_code v	  = lut_scale_verify(p, a);
-		a->scale_verified = v == OK ? 1 : -1;
-		if (v != OK)
-			return v;
-	}
-	if (!rkt_ensure_capacity((void **)&p->scale_tmp, &p->scale_tmp_cap, (size_t)n, sizeof(float)))
-		return ERR_OUT_OF_MEMORY;
-	status_code s = lut_scale_rows(p, a, x, p->scale_tmp, n, scale);
-	if (s == OK)
-		memcpy(x, p->scale_tmp, (size_t)n * sizeof(float));
-	return s;
-}
-
 static status_code rkt_scale_inplace(backend *self, buffer *x, float scale, int n) {
 	rkt_priv *p = self->priv;
 	if (n <= 0 || scale == 1.0f)
@@ -1480,8 +875,8 @@ static status_code rkt_scale_inplace(backend *self, buffer *x, float scale, int 
 	status_code s = ERR_UNSUPPORTED;
 	if (!p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
-		s = lut_scale_checked(p, &p->lut, rkt_ptr(x), n, scale);
-		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed && p->lut.scale_verified > 0) {
+		s = rkt_lut_scale_inplace(p, &p->lut, rkt_ptr(x), n, scale);
+		if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
 			rkt_npu_record_failure(p);
 			WARN("rocket: npu scale failed (n=%d status=%d, errno=%d)", n, s, errno);
 		}
@@ -1618,7 +1013,7 @@ static status_code rkt_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 				s = ERR_INTERNAL;
 				break;
 			}
-			tile_weight_row(pt->bo.map, row, kc->k_len, k_global - pt->row_start);
+			rkt_tile_weight_row(pt->bo.map, row, kc->k_len, k_global - pt->row_start);
 			int				v_col = pos / RKT_TILE_COLS, v_rem = pos % RKT_TILE_COLS;
 			const rkt_part *vp = NULL;
 			for (int d = 0; d < head_dim; d++) {
@@ -1743,6 +1138,135 @@ static status_code rkt_attention_batch(backend *self, const buffer *q, const buf
 									   int flash_attn, float scale, int n_kv_heads_active, int m,
 									   int window);
 
+typedef struct {
+	rkt_priv		  *p;
+	const rkt_kv_slot *sl;
+	const float		  *qf;
+	float			  *outf;
+	size_t			   group_floats;
+	float			   scale;
+	int				   n_active;
+	int				   n_heads;
+	int				   n_groups;
+	int				   m;
+	int				   rows;
+	int				   span;
+	int				   span16;
+	int				   pos_start;
+	int				   window;
+	int				   head_dim;
+} attn_job;
+
+typedef struct {
+	float *q;
+	float *out;
+	float *scores;
+	float *probs;
+} attn_head_buf;
+
+static attn_head_buf attn_head(const attn_job *j, float *ws, int i) {
+	float *q	  = ws + (size_t)i * j->group_floats;
+	float *scores = q + (size_t)2 * j->rows * j->head_dim;
+	return (attn_head_buf){.q	   = q,
+						   .out	   = q + (size_t)j->rows * j->head_dim,
+						   .scores = scores,
+						   .probs  = scores + (size_t)j->rows * j->span16};
+}
+
+static status_code attn_enqueue_scores(const attn_job *j, float *ws, int g0, int count) {
+	for (int i = 0; i < count; i++) {
+		int			  g = g0 + i;
+		attn_head_buf b = attn_head(j, ws, i);
+		for (int row = 0; row < j->rows; row++)
+			memset(b.probs + (size_t)row * j->sl->pos_pad, 0, (size_t)j->span * sizeof(float));
+		for (int r = 0; r < j->m; r++)
+			for (int h = 0; h < j->n_groups; h++)
+				memcpy(b.q + (size_t)(r * j->n_groups + h) * j->head_dim,
+					   j->qf + ((size_t)r * j->n_heads + (size_t)g * j->n_groups + h) * j->head_dim,
+					   (size_t)j->head_dim * sizeof(float));
+		status_code s = rkt_dense_matmul_enqueue(j->p, j->sl->k, g * j->sl->pos_pad, j->span16, b.q,
+												 b.scores, j->rows);
+		if (s != OK)
+			return s;
+	}
+	return OK;
+}
+
+static status_code attn_enqueue_values(const attn_job *j, float *ws, int g0, int count) {
+	for (int i = 0; i < count; i++) {
+		attn_head_buf b = attn_head(j, ws, i);
+		attention_softmax(b.scores, b.probs, j->m, j->n_groups, j->span16, j->sl->pos_pad,
+						  j->pos_start, j->window, j->scale);
+		status_code s = rkt_dense_matmul_enqueue_k(j->p, j->sl->v, (g0 + i) * j->sl->hd_pad,
+												   j->head_dim, b.probs, b.out, j->rows, j->span);
+		if (s != OK)
+			return s;
+	}
+	return OK;
+}
+
+static void attn_copy_out(const attn_job *j, float *ws, int g0, int count) {
+	for (int i = 0; i < count; i++) {
+		attn_head_buf b = attn_head(j, ws, i);
+		for (int r = 0; r < j->m; r++)
+			for (int h = 0; h < j->n_groups; h++)
+				memcpy(j->outf + ((size_t)r * j->n_heads + (size_t)(g0 + i) * j->n_groups + h) *
+									 j->head_dim,
+					   b.out + (size_t)(r * j->n_groups + h) * j->head_dim,
+					   (size_t)j->head_dim * sizeof(float));
+	}
+}
+
+static int attn_group_count(const attn_job *j, int g0, int batch) {
+	return j->n_active - g0 < batch ? j->n_active - g0 : batch;
+}
+
+static status_code attn_run_serial(const attn_job *j, float *ws, int batch) {
+	for (int g0 = 0; g0 < j->n_active; g0 += batch) {
+		int			count = attn_group_count(j, g0, batch);
+		status_code s	  = attn_enqueue_scores(j, ws, g0, count);
+		if (s == OK)
+			s = rkt_queue_flush(j->p);
+		if (s == OK)
+			s = attn_enqueue_values(j, ws, g0, count);
+		if (s == OK)
+			s = rkt_queue_flush(j->p);
+		if (s != OK)
+			return s;
+		attn_copy_out(j, ws, g0, count);
+	}
+	return OK;
+}
+
+static status_code attn_run_pipelined(const attn_job *j, int batch) {
+	rkt_priv   *p	  = j->p;
+	float	   *ws[2] = {p->attn_ws, p->attn_ws + j->group_floats * (size_t)batch};
+	status_code s	  = attn_enqueue_scores(j, ws[0], 0, attn_group_count(j, 0, batch));
+	if (s == OK)
+		s = rkt_queue_flush_async(p);
+	for (int g0 = 0, turn = 0; s == OK && g0 < j->n_active; g0 += batch, turn ^= 1) {
+		int	   count   = attn_group_count(j, g0, batch);
+		int	   next_g0 = g0 + batch;
+		float *current = ws[turn];
+		if (next_g0 < j->n_active) {
+			s = attn_enqueue_scores(j, ws[turn ^ 1], next_g0, attn_group_count(j, next_g0, batch));
+			if (s == OK)
+				s = rkt_queue_flush_async(p);
+		} else {
+			s = rkt_queue_sync(p);
+		}
+		if (s == OK)
+			s = attn_enqueue_values(j, current, g0, count);
+		if (s == OK)
+			s = rkt_queue_flush_async(p);
+		if (s == OK)
+			s = rkt_queue_sync(p);
+		if (s == OK)
+			attn_copy_out(j, current, g0, count);
+	}
+	return s;
+}
+
 static status_code rkt_attention_batch_inner(backend *self, const buffer *q, const buffer *k_cache,
 											 const buffer *v_cache, buffer *out, int layer,
 											 int pos_start, int n_heads, int n_kv_heads,
@@ -1767,55 +1291,32 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 	size_t group_floats = (size_t)M * (2 * head_dim + span16 + sl->pos_pad);
 	int	   batch		= (int)(RKT_ATTN_BATCH_FLOATS / group_floats);
 	batch				= batch < 1 ? 1 : batch > n_active ? n_active : batch;
-	float *qf			= rkt_ptr(q);
-	float *outf			= rkt_ptr(out);
-	if (!rkt_ensure_capacity((void **)&p->attn_ws, &p->attn_ws_cap, group_floats * batch,
-							 sizeof(float)))
+	int pipelined		= n_active > batch;
+	if (!rkt_ensure_capacity((void **)&p->attn_ws, &p->attn_ws_cap,
+							 group_floats * batch * (pipelined ? 2 : 1), sizeof(float)))
 		return ERR_OUT_OF_MEMORY;
 
+	attn_job job = {.p			  = p,
+					.sl			  = sl,
+					.qf			  = rkt_ptr(q),
+					.outf		  = rkt_ptr(out),
+					.group_floats = group_floats,
+					.scale		  = scale,
+					.n_active	  = n_active,
+					.n_heads	  = n_heads,
+					.n_groups	  = n_groups,
+					.m			  = m,
+					.rows		  = M,
+					.span		  = span,
+					.span16		  = span16,
+					.pos_start	  = pos_start,
+					.window		  = window,
+					.head_dim	  = head_dim};
+
 	pthread_mutex_lock(&p->lock);
-	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : OK;
-	for (int g0 = 0; s == OK && g0 < n_active; g0 += batch) {
-		int count = n_active - g0 < batch ? n_active - g0 : batch;
-		for (int i = 0; i < count && s == OK; i++) {
-			int	   g	  = g0 + i;
-			float *q_buf  = p->attn_ws + (size_t)i * group_floats;
-			float *scores = q_buf + (size_t)2 * M * head_dim;
-			float *probs  = scores + (size_t)M * span16;
-			memset(probs, 0, (size_t)M * sl->pos_pad * sizeof(float));
-			for (int r = 0; r < m; r++)
-				for (int h = 0; h < n_groups; h++)
-					memcpy(q_buf + (size_t)(r * n_groups + h) * head_dim,
-						   qf + ((size_t)r * n_heads + (size_t)g * n_groups + h) * head_dim,
-						   (size_t)head_dim * sizeof(float));
-			s = rkt_dense_matmul_enqueue(p, sl->k, g * sl->pos_pad, span16, q_buf, scores, M);
-		}
-		if (s == OK)
-			s = rkt_queue_flush(p);
-
-		for (int i = 0; i < count && s == OK; i++) {
-			float *q_buf   = p->attn_ws + (size_t)i * group_floats;
-			float *out_buf = q_buf + (size_t)M * head_dim;
-			float *scores  = q_buf + (size_t)2 * M * head_dim;
-			float *probs   = scores + (size_t)M * span16;
-			attention_softmax(scores, probs, m, n_groups, span16, sl->pos_pad, pos_start, window,
-							  scale);
-			s = rkt_dense_matmul_enqueue(p, sl->v, (g0 + i) * sl->hd_pad, head_dim, probs, out_buf,
-										 M);
-		}
-		if (s == OK)
-			s = rkt_queue_flush(p);
-
-		for (int i = 0; i < count && s == OK; i++) {
-			const float *out_buf = p->attn_ws + (size_t)i * group_floats + (size_t)M * head_dim;
-			for (int r = 0; r < m; r++)
-				for (int h = 0; h < n_groups; h++)
-					memcpy(outf +
-							   ((size_t)r * n_heads + (size_t)(g0 + i) * n_groups + h) * head_dim,
-						   out_buf + (size_t)(r * n_groups + h) * head_dim,
-						   (size_t)head_dim * sizeof(float));
-		}
-	}
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL
+					: pipelined	  ? attn_run_pipelined(&job, batch)
+								  : attn_run_serial(&job, p->attn_ws, batch);
 	if (s != OK) {
 		rkt_queue_abort(p);
 		if (!p->npu_failed) {
@@ -1958,12 +1459,14 @@ static void rkt_free(backend *self) {
 				p->fused_groups);
 	rkt_log_pipeline_usage(p);
 	free_slots(p);
-	lut_state_reset(p, &p->lut);
+	rkt_lut_state_reset(p, &p->lut);
 	rkt_device_close(&p->dev);
 	pthread_mutex_destroy(&p->lock);
 	free(p->weights);
+	rkt_native_free(p);
 	free(p->x16);
 	free(p->y16);
+	free(p->res16);
 	free(p->x_chunk);
 	free(p->y_tmp);
 	free(p->quant_pack[0]);
@@ -2014,6 +1517,7 @@ static status_code rkt_ctor(backend *out) {
 	out->buffer_free			  = rkt_buffer_free;
 	out->buffer_read_f32		  = rkt_buffer_read_f32;
 	out->buffer_write_f32		  = rkt_buffer_write_f32;
+	out->synchronize			  = rkt_synchronize;
 	out->matmul					  = rkt_matmul;
 	out->matmul_batch			  = rkt_matmul_batch;
 	out->matmul_multi			  = rkt_matmul_multi;

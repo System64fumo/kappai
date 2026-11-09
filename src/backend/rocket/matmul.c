@@ -382,13 +382,29 @@ static float quant_absmax(const float *x, int n) {
 	return m;
 }
 
-static void quant_activation_scales(const rkt_weight *w, const float *x, int tokens, float *s_act) {
+typedef struct {
+	const float	   *f32;
+	const uint16_t *f16;
+} quant_src;
+
+static const float *quant_src_tile(const quant_src *src, size_t offset, int n, float *tmp) {
+	if (src->f32)
+		return src->f32 + offset;
+	rkt_convert_from_f16(tmp, src->f16 + offset, (size_t)n);
+	return tmp;
+}
+
+static void quant_activation_scales(const rkt_weight *w, const quant_src *x, int tokens,
+									float *s_act) {
 	int group = w->quant->group, n_ktiles = w->quant->n_ktiles;
 	for (int tk = 0; tk < tokens; tk++)
 		for (int kt = 0; kt < n_ktiles; kt++) {
 			int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
 			int	  valid = kl < w->k - k0 ? kl : w->k - k0;
-			float amax	= quant_absmax(x + (size_t)tk * w->k + k0, valid > 0 ? valid : 0);
+			float tile[RKT_QUANT_GROUP];
+			float amax =
+				quant_absmax(quant_src_tile(x, (size_t)tk * w->k + k0, valid > 0 ? valid : 0, tile),
+							 valid > 0 ? valid : 0);
 			s_act[tk * n_ktiles + kt] = amax > 0.0f ? amax / 127.0f : 1.0f;
 		}
 }
@@ -413,16 +429,17 @@ static void quant_quantize_tile(const float *x, int valid, int kl, float scale, 
 		q[j] = 0;
 }
 
-static void quant_pack_token(const rkt_weight *w, const float *x, int tk, int tokens,
+static void quant_pack_token(const rkt_weight *w, const quant_src *x, int tk, int tokens,
 							 const float *s_act, int bits, uint8_t *packed) {
 	int	   group = w->quant->group, n_ktiles = w->quant->n_ktiles, m = tokens * (bits == 4 ? 2 : 1);
 	int8_t q[RKT_QUANT_GROUP];
-	const float *xt = x + (size_t)tk * w->k;
 	for (int kt = 0; kt < n_ktiles; kt++) {
 		int	  k0 = kt * group, kl = quant_tile_len(w, group, kt);
 		int	  valid = kl < w->k - k0 ? kl : w->k - k0;
 		float scale = s_act[tk * n_ktiles + kt];
-		quant_quantize_tile(xt + k0, valid > 0 ? valid : 0, kl, scale, q);
+		float tile[RKT_QUANT_GROUP];
+		quant_quantize_tile(quant_src_tile(x, (size_t)tk * w->k + k0, valid > 0 ? valid : 0, tile),
+							valid > 0 ? valid : 0, kl, scale, q);
 		if (bits == 8) {
 			for (int plane = 0; plane < kl / 16; plane++)
 				memcpy(packed + (size_t)k0 * tokens + ((size_t)plane * tokens + tk) * 16,
@@ -456,7 +473,7 @@ static void quant_pack_token(const rkt_weight *w, const float *x, int tk, int to
 
 typedef struct {
 	const rkt_weight *w;
-	const float		 *x;
+	const quant_src	 *x;
 	const float		 *s_act;
 	uint8_t			 *packed;
 	int				  tokens;
@@ -470,7 +487,7 @@ static void quant_pack_chunk(int begin, int end, int tid, void *arg) {
 		quant_pack_token(j->w, j->x, tk, j->tokens, j->s_act, j->bits, j->packed);
 }
 
-static void quant_pack_activation(const rkt_weight *w, const float *x, int tokens,
+static void quant_pack_activation(const rkt_weight *w, const quant_src *x, int tokens,
 								  const float *s_act, int bits, uint8_t *packed) {
 	quant_pack_job job = {w, x, s_act, packed, tokens, bits};
 	tpool_parallel_for(tpool_fetch_pool(), tokens, RKT_QUANT_PACK_MIN_TOKENS, quant_pack_chunk,
@@ -572,6 +589,81 @@ static void quant_accumulate_core(const rkt_weight *w, const quant_io *io, int c
 	}
 }
 
+typedef struct {
+	rkt_priv	*p;
+	rkt_weight **ws;
+	quant_io (*io)[RKT_MAX_CORES];
+	uint8_t	   *packed[2];
+	size_t		input_bytes;
+	int			count;
+	int			core;
+	int			submitted;
+	status_code status;
+} quant_core_submit;
+
+static int quant_core_task_count(rkt_weight **ws, int count, int core) {
+	int n_list = 0;
+	for (int i = 0; i < count; i++)
+		n_list += ws[i]->quant->core[core].n > 0 ? ws[i]->quant->core[core].n_tasks : 0;
+	return n_list;
+}
+
+static status_code quant_stage_core_input(const quant_core_submit *job) {
+	for (int i = 0; i < job->count; i++) {
+		if (job->ws[i]->quant->core[job->core].n == 0)
+			continue;
+		const quant_io *io = &job->io[i][job->core];
+		memcpy(io->in->map, job->packed[job->ws[i]->quant->bits == 8], job->input_bytes);
+		if (rkt_bo_flush(&job->p->dev, io->in))
+			return ERR_IO;
+	}
+	return OK;
+}
+
+static status_code quant_submit_core_tasks(quant_core_submit *job) {
+	int				c	   = job->core;
+	int				n_list = quant_core_task_count(job->ws, job->count, c);
+	quant_job_task *list   = xmalloc((size_t)n_list * sizeof(*list));
+	int				at	   = 0;
+	for (int i = 0; i < job->count; i++) {
+		const rkt_quant_core *wc = &job->ws[i]->quant->core[c];
+		for (int t = 0; wc->n > 0 && t < wc->n_tasks; t++)
+			list[at++] = (quant_job_task){.io = &job->io[i][c], .task = t};
+	}
+	status_code s = OK;
+	for (int start = 0; start < n_list && s == OK; start += RKT_MAX_TASKS) {
+		int				n_tasks = n_list - start < RKT_MAX_TASKS ? n_list - start : RKT_MAX_TASKS;
+		uint32_t		dma[RKT_MAX_TASKS], ops[RKT_MAX_TASKS];
+		const rkt_bo   *in[RKT_MAX_HANDLES], *out[RKT_MAX_HANDLES];
+		int				n_in = 0, n_out = 0;
+		const quant_io *last = NULL;
+		for (int j = 0; j < n_tasks; j++) {
+			const quant_io *tio = list[start + j].io;
+			int				t	= list[start + j].task;
+			dma[j]				= (uint32_t)(tio->reg->dma_addr + (size_t)t * RKT_REGCMD_BYTES);
+			ops[j]				= tio->n_ops[t];
+			if (tio != last) {
+				last		 = tio;
+				in[n_in++]	 = tio->in;
+				in[n_in++]	 = tio->reg;
+				out[n_out++] = tio->out;
+			}
+		}
+		if (rkt_submit_bos(&job->p->dev, c, dma, ops, n_tasks, in, n_in, out, n_out))
+			s = ERR_COMPUTE_FAIL;
+		job->submitted = 1;
+	}
+	free(list);
+	return s;
+}
+
+static void quant_core_run(void *arg) {
+	quant_core_submit *job = arg;
+	job->status			   = quant_stage_core_input(job);
+	if (job->status == OK)
+		job->status = quant_submit_core_tasks(job);
+}
+
 static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int count,
 								   const float *x, int tokens) {
 	const rkt_weight *w0	= ws[0];
@@ -597,9 +689,10 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 	if (!rkt_ensure_capacity((void **)&p->quant_s_act, &p->quant_s_act_cap,
 							 (size_t)tokens * w0->quant->n_ktiles, sizeof(float)))
 		return ERR_OUT_OF_MEMORY;
-	float	*s_act	   = p->quant_s_act;
-	uint8_t *packed[2] = {NULL, NULL};
-	quant_activation_scales(w0, x, tokens, s_act);
+	float	 *s_act		= p->quant_s_act;
+	uint8_t	 *packed[2] = {NULL, NULL};
+	quant_src src		= {.f32 = x, .f16 = x ? NULL : p->quant_x16};
+	quant_activation_scales(w0, &src, tokens, s_act);
 	for (int i = 0; i < count; i++) {
 		int bits = ws[i]->quant->bits;
 		int slot = bits == 8;
@@ -609,56 +702,33 @@ static status_code quant_run_inner(rkt_priv *p, rkt_weight **ws, float **ys, int
 								 (size_t)k_pad * tokens, 1))
 			return ERR_OUT_OF_MEMORY;
 		packed[slot] = p->quant_pack[slot];
-		quant_pack_activation(w0, x, tokens, s_act, bits, packed[slot]);
+		quant_pack_activation(w0, &src, tokens, s_act, bits, packed[slot]);
 	}
 
-	status_code s = OK;
-	for (int i = 0; i < count && s == OK; i++)
-		for (int c = 0; c < RKT_MAX_CORES && s == OK; c++) {
-			if (ws[i]->quant->core[c].n == 0)
-				continue;
-			memcpy(io[i][c].in->map, packed[ws[i]->quant->bits == 8], (size_t)k_pad * tokens);
-			if (rkt_bo_flush(&p->dev, io[i][c].in))
-				s = ERR_IO;
-		}
-
-	int submitted_core[RKT_MAX_CORES] = {0};
-	for (int c = 0; c < p->dev.n_cores && s == OK; c++) {
-		int n_list = 0;
-		for (int i = 0; i < count; i++)
-			n_list += ws[i]->quant->core[c].n > 0 ? ws[i]->quant->core[c].n_tasks : 0;
-		if (n_list == 0)
+	quant_core_submit jobs[RKT_MAX_CORES];
+	int				  n_active = 0;
+	for (int c = 0; c < p->dev.n_cores; c++) {
+		if (quant_core_task_count(ws, count, c) == 0)
 			continue;
-		quant_job_task *list = xmalloc((size_t)n_list * sizeof(*list));
-		int				at	 = 0;
-		for (int i = 0; i < count; i++) {
-			const rkt_quant_core *wc = &ws[i]->quant->core[c];
-			for (int t = 0; wc->n > 0 && t < wc->n_tasks; t++)
-				list[at++] = (quant_job_task){.io = &io[i][c], .task = t};
-		}
-		for (int start = 0; start < n_list && s == OK; start += RKT_MAX_TASKS) {
-			int			  n_tasks = n_list - start < RKT_MAX_TASKS ? n_list - start : RKT_MAX_TASKS;
-			uint32_t	  dma[RKT_MAX_TASKS], ops[RKT_MAX_TASKS];
-			const rkt_bo *in[RKT_MAX_HANDLES], *out[RKT_MAX_HANDLES];
-			int			  n_in = 0, n_out = 0;
-			const quant_io *last = NULL;
-			for (int j = 0; j < n_tasks; j++) {
-				const quant_io *tio = list[start + j].io;
-				int				t	= list[start + j].task;
-				dma[j]				= (uint32_t)(tio->reg->dma_addr + (size_t)t * RKT_REGCMD_BYTES);
-				ops[j]				= tio->n_ops[t];
-				if (tio != last) {
-					last		 = tio;
-					in[n_in++]	 = tio->in;
-					in[n_in++]	 = tio->reg;
-					out[n_out++] = tio->out;
-				}
-			}
-			if (rkt_submit_bos(&p->dev, c, dma, ops, n_tasks, in, n_in, out, n_out))
-				s = ERR_COMPUTE_FAIL;
-			submitted_core[c] = 1;
-		}
-		free(list);
+		jobs[n_active++] = (quant_core_submit){.p			= p,
+											   .ws			= ws,
+											   .io			= io,
+											   .count		= count,
+											   .core		= c,
+											   .input_bytes = (size_t)k_pad * tokens,
+											   .status		= OK};
+		memcpy(jobs[n_active - 1].packed, packed, sizeof(packed));
+	}
+	for (int i = 0; i < n_active; i++)
+		quant_core_run(&jobs[i]);
+
+	status_code s							  = OK;
+	int			submitted_core[RKT_MAX_CORES] = {0};
+	for (int i = 0; i < n_active; i++) {
+		const quant_core_submit *job = &jobs[i];
+		submitted_core[job->core]	 = job->submitted;
+		if (s == OK)
+			s = job->status;
 	}
 	for (int i = 0; i < count; i++)
 		for (int c = 0; c < p->dev.n_cores; c++) {
@@ -712,6 +782,21 @@ status_code rkt_quant_matmul(rkt_priv *p, rkt_weight *w, const float *x, float *
 		float *yo	  = y + (size_t)t0 * w->n;
 		s			  = rkt_quant_run_many(p, &one, &yo, 1, x + (size_t)t0 * w->k, tokens);
 	}
+	pthread_mutex_unlock(&p->lock);
+	return s;
+}
+
+status_code rkt_quant_matmul_native(rkt_priv *p, rkt_weight *w, float *y, int m) {
+	rkt_weight *one = w;
+	status_code s	= OK;
+	pthread_mutex_lock(&p->lock);
+	for (int t0 = 0; t0 < m && s == OK; t0 += RKT_QUANT_PREFILL_TOKENS) {
+		int	   tokens = m - t0 < RKT_QUANT_PREFILL_TOKENS ? m - t0 : RKT_QUANT_PREFILL_TOKENS;
+		float *yo	  = y + (size_t)t0 * w->n;
+		p->quant_x16  = p->nat_act + (size_t)t0 * w->k;
+		s			  = rkt_quant_run_many(p, &one, &yo, 1, NULL, tokens);
+	}
+	p->quant_x16 = NULL;
 	pthread_mutex_unlock(&p->lock);
 	return s;
 }
@@ -865,6 +950,8 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 													   t->ctx.kc->k_len * rkt_weight_esz(t->ctx.w)),
 			.out_dma = (uint32_t)(sl->out.dma_addr + t->out_off),
 			.epi	 = (uint32_t)t->ctx.epi,
+			.out16	 = t->ctx.y16 != NULL,
+			.ew_dma	 = t->ctx.ew16 ? (uint32_t)(sl->in.dma_addr + t->ew_off) : 0,
 		};
 		if (t->ctx.epi_cap > 0.0f)
 			memcpy(&key.epi_cap_bits, &t->ctx.epi_cap, sizeof(key.epi_cap_bits));
@@ -873,7 +960,14 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 			size_t	  offset = align_queue(sc->bytes_used);
 			uint64_t *ops	 = (uint64_t *)((uint8_t *)sc->bo.map + offset);
 			uint32_t  n_ops;
-			if (key.epi) {
+			if (key.ew_dma) {
+				n_ops = (uint32_t)rkt_emit_matmul_f16_ewadd(ops, key.blk, key.k_len, key.rows,
+															key.in_dma, key.w_dma, key.out_dma,
+															key.ew_dma);
+			} else if (key.out16) {
+				n_ops = (uint32_t)rkt_emit_matmul_f16_out16(ops, key.blk, key.k_len, key.rows,
+															key.in_dma, key.w_dma, key.out_dma, 2);
+			} else if (key.epi) {
 				rkt_lut_cfg cfg;
 				rkt_lut_configure(&cfg, (rkt_lut_kind)key.epi);
 				n_ops = (uint32_t)rkt_emit_matmul_f16_act_lut(
@@ -883,7 +977,7 @@ static status_code stage_streams(rkt_priv *p, int core, rkt_core_queue *q, const
 				n_ops = (uint32_t)rkt_emit_matmul_fmt(ops, t->ctx.w->fmt, key.blk, key.k_len,
 													  key.rows, key.in_dma, key.w_dma, key.out_dma);
 			}
-			if (n_ops > RKT_REGCMD_MAX_OPS)
+			if (!n_ops || n_ops > RKT_REGCMD_MAX_OPS)
 				return ERR_INTERNAL;
 			*e = (stream_entry){.key = key, .offset = (uint32_t)offset, .n_ops = n_ops, .used = 1};
 			sc->bytes_used = offset + (size_t)n_ops * sizeof(uint64_t);
@@ -911,6 +1005,35 @@ static status_code stage_core_queue(rkt_priv *p, int core) {
 	return rkt_bo_flush(&p->dev, &sl->in) ? ERR_IO : OK;
 }
 
+static inline void collect_store(float *dst, float v, int accumulate) {
+	if (accumulate)
+		*dst += v;
+	else
+		*dst = v;
+}
+
+static inline float collect_at(const float *src_row, size_t group_stride, int nn) {
+	return src_row[(size_t)(nn / RKT_OUT_C2_F32) * group_stride + nn % RKT_OUT_C2_F32];
+}
+
+static void collect_task_f16(const rkt_task *t, const uint16_t *om, int lo, int hi) {
+	const block_ctx *b	   = &t->ctx;
+	const job_desc	*j	   = &t->job;
+	size_t			 plane = (size_t)t->blk * 8;
+	for (int r = 0; r < t->blk; r++) {
+		uint16_t *dst =
+			b->y16 + (size_t)(b->m_done + r) * b->y16_stride + (j->row_start + lo - b->row0);
+		int nn = lo;
+		for (; nn < hi && nn % 8; nn++)
+			dst[nn - lo] = om[(size_t)(nn / 8) * plane + (size_t)r * 8 + nn % 8];
+		for (; nn + 8 <= hi; nn += 8)
+			memcpy(dst + (nn - lo), om + (size_t)(nn / 8) * plane + (size_t)r * 8,
+				   8 * sizeof(uint16_t));
+		for (; nn < hi; nn++)
+			dst[nn - lo] = om[(size_t)(nn / 8) * plane + (size_t)r * 8 + nn % 8];
+	}
+}
+
 static status_code collect_task(const rkt_task *t, const float *om) {
 	const block_ctx *b		   = &t->ctx;
 	const job_desc	*j		   = &t->job;
@@ -926,17 +1049,27 @@ static status_code collect_task(const rkt_task *t, const float *om) {
 			 j->row_start;
 	if (hi <= lo)
 		return OK;
+	if (b->y16) {
+		collect_task_f16(t, (const uint16_t *)om, lo, hi);
+		return OK;
+	}
+	size_t group_stride = (size_t)blk * RKT_OUT_C2_F32;
 	for (int r = 0; r < blk; r++) {
-		float *dst = &b->y[(size_t)(b->m_done + r) * b->n + (j->row_start + lo - b->row0)];
-		for (int nn = lo; nn < hi; nn++) {
-			float v = om[(size_t)(nn / RKT_OUT_C2_F32) * blk * RKT_OUT_C2_F32 +
-						 (size_t)r * RKT_OUT_C2_F32 + nn % RKT_OUT_C2_F32];
-			v *= out_scale;
-			if (b->accumulate)
-				dst[nn - lo] += v;
-			else
-				dst[nn - lo] = v;
+		float		*dst = &b->y[(size_t)(b->m_done + r) * b->n + (j->row_start + lo - b->row0)];
+		const float *src_row = om + (size_t)r * RKT_OUT_C2_F32;
+		int			 nn		 = lo;
+		for (; nn < hi && nn % RKT_OUT_C2_F32; nn++)
+			collect_store(dst + (nn - lo), collect_at(src_row, group_stride, nn) * out_scale,
+						  b->accumulate);
+		for (; nn + RKT_OUT_C2_F32 <= hi; nn += RKT_OUT_C2_F32) {
+			float32x4_t v = vmulq_n_f32(
+				vld1q_f32(src_row + (size_t)(nn / RKT_OUT_C2_F32) * group_stride), out_scale);
+			float *d = dst + (nn - lo);
+			vst1q_f32(d, b->accumulate ? vaddq_f32(vld1q_f32(d), v) : v);
 		}
+		for (; nn < hi; nn++)
+			collect_store(dst + (nn - lo), collect_at(src_row, group_stride, nn) * out_scale,
+						  b->accumulate);
 	}
 	return OK;
 }
@@ -948,6 +1081,45 @@ void rkt_npu_record_failure(rkt_priv *p) {
 		return;
 	p->npu_failed = 1;
 	WARN("rocket: %d consecutive npu failures, npu disabled", p->npu_consecutive_failures);
+}
+
+typedef struct {
+	const rkt_priv	  *p;
+	const rkt_pending *pd;
+	int				   bank;
+	int				   status;
+} collect_drain;
+
+static status_code collect_core(const collect_drain *d, int core) {
+	const rkt_core_queue *q	 = &d->pd->queue[core];
+	const rkt_slot		 *sl = &d->p->slots[d->bank][q->cls][core];
+	for (int t = 0; t < q->n_tasks; t++) {
+		status_code s = collect_task(
+			&q->tasks[t], (const float *)((const uint8_t *)sl->out.map + q->tasks[t].out_off));
+		if (s != OK)
+			return s;
+	}
+	return OK;
+}
+
+static void collect_drain_chunk(int begin, int end, int tid, void *arg) {
+	(void)tid;
+	collect_drain *d = arg;
+	for (int i = begin; i < end; i++) {
+		status_code s = collect_core(d, d->pd->active[i]);
+		if (s != OK)
+			__atomic_store_n(&d->status, (int)s, __ATOMIC_RELAXED);
+	}
+}
+
+static status_code collect_pending(const rkt_priv *p, const rkt_pending *pd, int bank) {
+	collect_drain d			  = {.p = p, .pd = pd, .bank = bank, .status = OK};
+	size_t		  total_bytes = 0;
+	for (int i = 0; i < pd->n_active; i++)
+		total_bytes += pd->queue[pd->active[i]].out_bytes;
+	int min_items = total_bytes >= RKT_COLLECT_PAR_MIN_BYTES ? 1 : pd->n_active + 1;
+	tpool_parallel_for(tpool_fetch_pool(), pd->n_active, min_items, collect_drain_chunk, &d);
+	return (status_code)d.status;
 }
 
 static status_code drain_bank(rkt_priv *p, int bank) {
@@ -964,14 +1136,9 @@ static status_code drain_bank(rkt_priv *p, int bank) {
 			s = ERR_COMPUTE_FAIL;
 		}
 	}
-	for (int i = 0; i < pd->n_active && s == OK; i++) {
-		const rkt_core_queue *q	 = &pd->queue[pd->active[i]];
-		const rkt_slot		 *sl = &p->slots[bank][q->cls][pd->active[i]];
-		for (int t = 0; t < q->n_tasks && s == OK; t++)
-			s = collect_task(&q->tasks[t],
-							 (const float *)((const uint8_t *)sl->out.map + q->tasks[t].out_off));
-	}
-	return s;
+	if (s != OK)
+		return s;
+	return collect_pending(p, pd, bank);
 }
 
 static status_code drain_all_pending(rkt_priv *p) {
@@ -987,6 +1154,31 @@ static status_code drain_all_pending(rkt_priv *p) {
 void rkt_queue_abort(rkt_priv *p) {
 	drain_all_pending(p);
 	reset_queue(p);
+}
+
+typedef struct {
+	rkt_priv *p;
+	int		  bank;
+	int		  core;
+	int		  err;
+} core_submit;
+
+static void submit_core_queue(void *arg) {
+	core_submit			 *job = arg;
+	rkt_priv			 *p	  = job->p;
+	const rkt_core_queue *q	  = &p->queue[job->core];
+	const rkt_slot		 *sl  = &p->slots[job->bank][q->cls][job->core];
+	uint32_t			  n_ops[RKT_MAX_TASKS];
+	uint32_t			  regcmd_dma[RKT_MAX_TASKS];
+	for (int t = 0; t < q->n_tasks; t++) {
+		n_ops[t]	  = q->tasks[t].n_ops;
+		regcmd_dma[t] = q->tasks[t].regcmd_dma;
+	}
+	job->err = rkt_submit(&p->dev, regcmd_dma, n_ops, q->n_tasks, &p->streams[job->core].bo,
+						  &sl->in, &sl->out);
+	if (job->err)
+		ERROR("rocket: submit on core %d failed (%d tasks, cls %d): %s", job->core, q->n_tasks,
+			  q->cls, strerror(-job->err));
 }
 
 static status_code submit_queue(rkt_priv *p, int overlap) {
@@ -1005,28 +1197,20 @@ static status_code submit_queue(rkt_priv *p, int overlap) {
 	for (int i = 0; i < n_active && s == OK; i++)
 		s = stage_core_queue(p, active[i]);
 
-	int			 bank	   = p->bank;
-	rkt_pending *pd		   = &p->pending[bank];
+	int			 bank = p->bank;
+	rkt_pending *pd	  = &p->pending[bank];
+	core_submit	 jobs[RKT_MAX_CORES];
 	int			 submitted = 0;
-	for (; submitted < n_active && s == OK; submitted++) {
-		int					  c	 = active[submitted];
-		const rkt_core_queue *q	 = &p->queue[c];
-		const rkt_slot		 *sl = &p->slots[bank][q->cls][c];
-		uint32_t			  n_ops[RKT_MAX_TASKS];
-		uint32_t			  regcmd_dma[RKT_MAX_TASKS];
-		for (int t = 0; t < q->n_tasks; t++) {
-			n_ops[t]	  = q->tasks[t].n_ops;
-			regcmd_dma[t] = q->tasks[t].regcmd_dma;
-		}
-		int err = rkt_submit(&p->dev, regcmd_dma, n_ops, q->n_tasks, &p->streams[c].bo, &sl->in,
-							 &sl->out);
-		if (err) {
-			ERROR("rocket: submit on core %d failed (%d tasks, cls %d): %s", c, q->n_tasks, q->cls,
-				  strerror(-err));
-			s = ERR_COMPUTE_FAIL;
-		}
+	if (s == OK) {
+		for (int i = 0; i < n_active; i++)
+			jobs[i] = (core_submit){.p = p, .bank = bank, .core = active[i]};
+		for (int i = 0; i < n_active; i++)
+			submit_core_queue(&jobs[i]);
+		for (int i = 0; i < n_active; i++)
+			if (jobs[i].err)
+				s = ERR_COMPUTE_FAIL;
+		submitted = n_active;
 	}
-
 	pd->valid	 = submitted > 0;
 	pd->bank	 = bank;
 	pd->n_active = submitted;
@@ -1062,6 +1246,17 @@ status_code rkt_queue_flush(rkt_priv *p) {
 	return s;
 }
 
+status_code rkt_queue_flush_async(rkt_priv *p) {
+	status_code s = submit_queue(p, 1);
+	if (s == OK)
+		p->npu_consecutive_failures = 0;
+	return s;
+}
+
+status_code rkt_queue_sync(rkt_priv *p) {
+	return drain_all_pending(p);
+}
+
 static int job_max_rows(int k_len, int esz) {
 	int rows = (int)(RKT_MAX_JOB_WEIGHT_BYTES / ((size_t)k_len * esz));
 	rows	 = rows & ~(RKT_N_ALIGN - 1);
@@ -1086,6 +1281,27 @@ static int plan_jobs(const block_ctx *b, int lo, int hi, int round, job_desc *jo
 		jobs[n_jobs++] = (job_desc){.core = c, .row_start = start, .rows = rows};
 	}
 	return n_jobs;
+}
+
+static status_code stage_ew_operand(rkt_priv *p, slot_class cls, const block_ctx *b, int blk,
+									const job_desc *job, size_t *off) {
+	if (blk != 1 || job->rows % RKT_EW_SURFACE_CHANNELS || job->rows > RKT_MAX_N_CHUNK)
+		return ERR_UNSUPPORTED;
+	size_t bytes =
+		(size_t)(job->rows / RKT_EW_SURFACE_CHANNELS) * RKT_EW_SURFACE_SLOTS * sizeof(uint16_t);
+	size_t at = align_queue(p->in_len);
+	if (!grow_slot_input(p, cls, job->core, at, at + bytes))
+		return ERR_OUT_OF_MEMORY;
+	uint16_t residual[RKT_MAX_N_CHUNK];
+	for (int channel = 0; channel < job->rows; channel++) {
+		int col			  = job->row_start + channel - b->row0;
+		residual[channel] = col >= 0 && col < b->n ? b->ew16[col] : 0;
+	}
+	rkt_pack_ew_operand((uint16_t *)((uint8_t *)p->slots[p->bank][cls][job->core].in.map + at),
+						residual, 1, job->rows);
+	p->in_len = at + bytes;
+	*off	  = at;
+	return OK;
 }
 
 static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const void *x_block) {
@@ -1127,14 +1343,22 @@ static status_code queue_block(rkt_priv *p, const block_ctx *b, int blk, const v
 								   x_block, blk, b->kc->k_len, rkt_weight_esz(b->w));
 				written[jobs[i].core] = 1;
 			}
+			size_t ew_off = 0;
+			if (b->ew16) {
+				status_code s = stage_ew_operand(p, cls, b, blk, &jobs[i], &ew_off);
+				if (s != OK)
+					return s;
+			}
 			q->tasks[q->n_tasks++] = (rkt_task){
 				.ctx	 = *b,
 				.blk	 = blk,
 				.job	 = jobs[i],
 				.in_off	 = in_off,
 				.out_off = q->out_bytes,
+				.ew_off	 = ew_off,
 			};
-			q->out_bytes += align_queue((size_t)blk * jobs[i].rows * sizeof(float));
+			q->out_bytes += align_queue((size_t)blk * jobs[i].rows *
+										(b->y16 ? sizeof(uint16_t) : sizeof(float)));
 		}
 	}
 }
@@ -1148,9 +1372,10 @@ int rkt_next_block_rows(int remaining, int max_rows) {
 
 static const uint8_t *chunk_input(rkt_priv *p, const rkt_kchunk *kc, int k, int m, int esz,
 								  int *stride_ok) {
-	*stride_ok = 1;
+	*stride_ok			= 1;
+	const uint8_t *base = (const uint8_t *)(p->x_src ? p->x_src : p->x16);
 	if (kc->k_len == k)
-		return (const uint8_t *)p->x16;
+		return base;
 	if (!rkt_ensure_capacity((void **)&p->x_chunk, &p->x_chunk_cap, (size_t)m * kc->k_len * esz / 2,
 							 sizeof(uint16_t))) {
 		*stride_ok = 0;
@@ -1158,8 +1383,7 @@ static const uint8_t *chunk_input(rkt_priv *p, const rkt_kchunk *kc, int k, int 
 	}
 	for (int r = 0; r < m; r++)
 		memcpy((uint8_t *)p->x_chunk + (size_t)r * kc->k_len * esz,
-			   (const uint8_t *)p->x16 + ((size_t)r * k + kc->k_off) * esz,
-			   (size_t)kc->k_len * esz);
+			   base + ((size_t)r * k + kc->k_off) * esz, (size_t)kc->k_len * esz);
 	return (const uint8_t *)p->x_chunk;
 }
 
@@ -1181,7 +1405,10 @@ static status_code enqueue_kchunks(rkt_priv *p, const rkt_weight *w, int row0, i
 							  .y		  = y,
 							  .accumulate = ci > 0,
 							  .epi		  = p->epi_kind,
-							  .epi_cap	  = p->epi_cap};
+							  .epi_cap	  = p->epi_cap,
+							  .y16		  = p->out16_dst,
+							  .y16_stride = p->out16_stride,
+							  .ew16		  = ci == 0 ? p->ew_res16 : NULL};
 		int		  max_rows = rkt_max_batch_rows(kc->k_len, esz);
 		for (int done = 0; done < m;) {
 			int blk		  = rkt_next_block_rows(m - done, max_rows);
@@ -1245,18 +1472,54 @@ static void convert_activation_row(rkt_float_fmt fmt, uint8_t *dst, const float 
 		memcpy(dst, src, (size_t)k * sizeof(float));
 }
 
-status_code rkt_dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
-									 const float *x, float *y, int m) {
+status_code rkt_dense_matmul_enqueue_k(rkt_priv *p, const rkt_weight *w, int row0, int n,
+									   const float *x, float *y, int m, int k_used) {
 	int esz = rkt_weight_esz(w);
 	if (!rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m * w->k_pad * esz / 2,
 							 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	for (int r = 0; r < m; r++) {
 		uint8_t *dst = (uint8_t *)p->x16 + (size_t)r * w->k_pad * esz;
-		convert_activation_row(w->fmt, dst, x + (size_t)r * w->k, w->k);
-		memset(dst + (size_t)w->k * esz, 0, (size_t)(w->k_pad - w->k) * esz);
+		convert_activation_row(w->fmt, dst, x + (size_t)r * w->k, k_used);
+		memset(dst + (size_t)k_used * esz, 0, (size_t)(w->k_pad - k_used) * esz);
 	}
 	return enqueue_kchunks(p, w, row0, n, y, m);
+}
+
+status_code rkt_dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
+									 const float *x, float *y, int m) {
+	return rkt_dense_matmul_enqueue_k(p, w, row0, n, x, y, m, w->k);
+}
+
+status_code rkt_dense_matmul_enqueue_f16(rkt_priv *p, const rkt_weight *w, int row0, int n,
+										 const float *x, uint16_t *y16, int y16_stride, int m) {
+	p->out16_dst	= y16;
+	p->out16_stride = y16_stride;
+	status_code s	= rkt_dense_matmul_enqueue(p, w, row0, n, x, NULL, m);
+	p->out16_dst	= NULL;
+	return s;
+}
+
+status_code rkt_dense_matmul_native(rkt_priv *p, const rkt_weight *w, int row0, int n, float *y,
+									int m) {
+	if (w->k == w->k_pad) {
+		p->x_src = p->nat_act;
+	} else {
+		if (!rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m * w->k_pad,
+								 sizeof(uint16_t)))
+			return ERR_OUT_OF_MEMORY;
+		for (int r = 0; r < m; r++) {
+			uint16_t *dst = p->x16 + (size_t)r * w->k_pad;
+			memcpy(dst, p->nat_act + (size_t)r * w->k, (size_t)w->k * sizeof(uint16_t));
+			memset(dst + w->k, 0, (size_t)(w->k_pad - w->k) * sizeof(uint16_t));
+		}
+	}
+	status_code s = enqueue_kchunks(p, w, row0, n, y, m);
+	p->x_src	  = NULL;
+	if (s == OK)
+		return rkt_queue_flush(p);
+	rkt_queue_abort(p);
+	return s;
 }
 
 status_code rkt_dense_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
@@ -1313,53 +1576,6 @@ static void tiled_matmul_cpu(const rkt_weight *w, int row0, int n, const float *
 	}
 }
 
-static int demote_bf16_weight(rkt_priv *p, rkt_weight *w) {
-	for (int ci = 0; ci < w->n_kchunks; ci++) {
-		for (int c = 0; c < RKT_MAX_CORES; c++) {
-			rkt_bo *bo = &w->kchunks[ci].part[c].bo;
-			if (!bo->map)
-				continue;
-			uint16_t *bits = bo->map;
-			for (size_t i = 0; i < bo->size / sizeof(uint16_t); i++) {
-				float v = fminf(fmaxf(bf16_bits_to_f32(bits[i]), -65504.0f), 65504.0f);
-				bits[i] = f32_to_f16_bits(v);
-			}
-			if (rkt_bo_flush(&p->dev, bo))
-				return 0;
-		}
-	}
-	w->fmt = RKT_FMT_F16;
-	return 1;
-}
-
-static int fmt_result_ok(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
-						 const float *y, int m) {
-	if (w->fmt == RKT_FMT_F16 || p->fmt_verified[w->fmt])
-		return 1;
-	int	   rows = n < 16 ? n : 16;
-	float *ref	= xmalloc((size_t)m * rows * sizeof(float));
-	tiled_matmul_cpu(w, row0, rows, x, ref, m);
-	double err = 0.0, norm = 0.0;
-	for (int r = 0; r < m; r++) {
-		for (int j = 0; j < rows; j++) {
-			double want = ref[(size_t)r * rows + j];
-			double diff = y[(size_t)r * n + j] - want;
-			err += diff * diff;
-			norm += want * want;
-		}
-	}
-	free(ref);
-	int ok = err <= 1e-4 * norm + 1e-12;
-	if (ok) {
-		p->fmt_verified[w->fmt] = 1;
-		return 1;
-	}
-	p->fmt_failed[w->fmt] = 1;
-	WARN("rocket: %s npu matmul disagrees with cpu reference (rel rms %.3g), disabling it",
-		 rkt_fmt_name(w->fmt), norm > 0.0 ? sqrt(err / norm) : 0.0);
-	return 0;
-}
-
 static status_code host_matmul(const rkt_weight *w, int row0, int n, const buffer *x, buffer *y,
 							   int m) {
 	backend *host = backend_host();
@@ -1393,6 +1609,14 @@ status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type,
 		return ERR_INVALID_ARG;
 	}
 	if (rkt_quant_servable(p, w, row0, n, m)) {
+		if (rkt_native_pending(p, x, k, m)) {
+			status_code ns = rkt_quant_matmul_native(p, w, rkt_ptr(y), m);
+			if (ns == OK) {
+				rkt_native_release(p);
+				return OK;
+			}
+			rkt_native_settle();
+		}
 		status_code s4 = rkt_quant_matmul(p, w, rkt_ptr(x), rkt_ptr(y), m);
 		if (s4 == OK)
 			return OK;
@@ -1410,26 +1634,25 @@ status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type,
 		w = w->fused_parent;
 	}
 
+	if (rkt_native_matches(p, x, w, k, m)) {
+		pthread_mutex_lock(&p->lock);
+		status_code ns = rkt_dense_matmul_native(p, w, row0, n, rkt_ptr(y), m);
+		pthread_mutex_unlock(&p->lock);
+		if (ns == OK) {
+			rkt_native_release(p);
+			return OK;
+		}
+		rkt_native_settle();
+	}
+
 	const float *xf = rkt_ptr(x);
 	float		*yf = rkt_ptr(y);
 	if (w->host_copy)
 		return host_matmul(w, row0, n, x, y, m);
 
 	pthread_mutex_lock(&p->lock);
-	if (w->fmt == RKT_FMT_BF16 && p->fmt_failed[RKT_FMT_BF16])
-		demote_bf16_weight(p, w);
-	int			fmt_off = p->fmt_failed[w->fmt];
-	status_code s =
-		p->npu_failed || fmt_off ? ERR_COMPUTE_FAIL : rkt_dense_matmul(p, w, row0, n, xf, yf, m);
-	if (s == OK && !fmt_result_ok(p, w, row0, n, xf, yf, m)) {
-		s		= ERR_COMPUTE_FAIL;
-		fmt_off = 1;
-		if (w->fmt == RKT_FMT_BF16 && demote_bf16_weight(p, w)) {
-			s		= rkt_dense_matmul(p, w, row0, n, xf, yf, m);
-			fmt_off = 0;
-		}
-	}
-	if (s != OK && !p->npu_failed && !fmt_off) {
+	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL : rkt_dense_matmul(p, w, row0, n, xf, yf, m);
+	if (s != OK && !p->npu_failed) {
 		rkt_npu_record_failure(p);
 		WARN("rocket: npu matmul failed (n=%d k=%d m=%d status=%d, errno=%d), using "
 			 "cpu on "
@@ -1678,6 +1901,61 @@ static int ensure_fold_bos(rkt_priv *p, rkt_kchunk *kc) {
 	return 1;
 }
 
+static int residual_ew_eligible(const rkt_priv *p, const rkt_weight *w, int use_quant) {
+	return !p->ew_residual_failed && !p->npu_failed && !use_quant && !w->host_copy &&
+		   w->fmt == RKT_FMT_F16 && w->n_kchunks > 0;
+}
+
+static status_code residual_to_f16(rkt_priv *p, const float *r, int n) {
+	if (!rkt_ensure_capacity((void **)&p->res16, &p->res16_cap, (size_t)n, sizeof(uint16_t)))
+		return ERR_OUT_OF_MEMORY;
+	for (int i = 0; i < n; i++) {
+		if (!(fabsf(r[i]) <= RKT_RESIDUAL_MAX))
+			return ERR_UNSUPPORTED;
+		p->res16[i] = f32_to_f16_bits(r[i]);
+	}
+	return OK;
+}
+
+static status_code residual_ew_matmul(rkt_priv *p, rkt_weight *wt, int row0, int n, int k,
+									  const buffer *x, const buffer *residual, buffer *y) {
+	int			 native = rkt_native_matches(p, x, wt, k, 1);
+	const float *xf		= native ? NULL : rkt_ptr(x);
+	float		*yf		= rkt_ptr(y);
+	const float *r		= rkt_ptr(residual);
+	float		*rcopy	= NULL;
+	if (r == yf) {
+		rcopy = xmalloc((size_t)n * sizeof(float));
+		memcpy(rcopy, r, (size_t)n * sizeof(float));
+		r = rcopy;
+	}
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = residual_to_f16(p, r, n);
+	if (s == OK) {
+		p->ew_res16 = p->res16;
+		s			= native ? rkt_dense_matmul_native(p, wt, row0, n, yf, 1)
+							 : rkt_dense_matmul(p, wt, row0, n, xf, yf, 1);
+		p->ew_res16 = NULL;
+		if (s != OK) {
+			WARN("rocket: npu ew residual add failed (n=%d k=%d status=%d), using fold path", n, k,
+				 s);
+			p->ew_residual_failed = 1;
+		}
+	}
+	if (s == OK && native)
+		rkt_native_release(p);
+	if (s != OK) {
+		if (rcopy)
+			memcpy(yf, rcopy, (size_t)n * sizeof(float));
+		if (native)
+			rkt_native_settle();
+	}
+	pthread_mutex_unlock(&p->lock);
+	free(rcopy);
+	return s;
+}
+
 status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
 								const buffer *residual, buffer *y, int n, int k) {
 	(void)w_type;
@@ -1695,6 +1973,9 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 		row0 += wt->fused_row0;
 		wt = wt->fused_parent;
 	}
+	if (residual_ew_eligible(p, wt, use_quant) && rkt_ptr(residual) != NULL &&
+		residual_ew_matmul(p, wt, row0, n, k, x, residual, y) == OK)
+		return OK;
 	if (use_quant || wt->host_copy || wt->fmt != RKT_FMT_F16 || wt->n_kchunks != 1 ||
 		wt->kchunks[0].k_len + RKT_FOLD_K_LEN > RKT_MAX_K || wt->k_pad != wt->k ||
 		rkt_ptr(residual) == NULL) {
@@ -1715,10 +1996,11 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 		return s2;
 	}
 
-	const float *xf	   = rkt_ptr(x);
-	float		*yf	   = rkt_ptr(y);
-	const float *r	   = rkt_ptr(residual);
-	float		*rcopy = NULL;
+	int			 native = rkt_native_matches(p, x, wt, k, 1);
+	const float *xf		= native ? NULL : rkt_ptr(x);
+	float		*yf		= rkt_ptr(y);
+	const float *r		= rkt_ptr(residual);
+	float		*rcopy	= NULL;
 	if (r == yf) {
 		rcopy = xmalloc((size_t)n * sizeof(float));
 		memcpy(rcopy, r, (size_t)n * sizeof(float));
@@ -1747,7 +2029,10 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 			if (s == OK) {
 				if (rkt_ensure_capacity((void **)&p->x16, &p->x16_cap,
 										(size_t)1 * (wt->k + RKT_FOLD_K_LEN), sizeof(uint16_t))) {
-					rkt_convert_to_f16(p->x16, xf, (size_t)k);
+					if (native)
+						memcpy(p->x16, p->nat_act, (size_t)k * sizeof(uint16_t));
+					else
+						rkt_convert_to_f16(p->x16, xf, (size_t)k);
 					memset(p->x16 + k, 0, (size_t)(wt->k_pad - wt->k) * sizeof(uint16_t));
 					p->x16[k] = 0x3C00u;
 					s		  = dense_matmul_fold(p, wt, row0, n, p->x16, yf, 1);
@@ -1762,6 +2047,12 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 		WARN("rocket: npu residual-fold matmul failed (n=%d k=%d status=%d, errno=%d), "
 			 "using cpu",
 			 n, k, s, errno);
+	}
+	if (s == OK && native)
+		rkt_native_release(p);
+	if (s != OK && native) {
+		rkt_native_settle();
+		xf = rkt_ptr_raw(x);
 	}
 	if (s != OK) {
 		tiled_matmul_cpu(wt, row0, n, xf, yf, 1);

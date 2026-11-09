@@ -53,6 +53,8 @@
 #define RKT_STREAM_TABLE_SIZE 4096
 #define RKT_STREAM_MAX_ENTRIES (RKT_STREAM_TABLE_SIZE * 3 / 4)
 #define RKT_ATTN_BATCH_FLOATS ((size_t)1 << 20)
+#define RKT_COLLECT_PAR_MIN_BYTES ((size_t)65536)
+#define RKT_RESIDUAL_MAX 65000.0f
 
 typedef struct {
 	rkt_bo bo;
@@ -108,21 +110,20 @@ typedef struct {
 	rkt_bo		 out[RKT_MAX_CORES];
 	rkt_bo		 reg_upload[RKT_MAX_CORES];
 	rkt_bo		 reg_blocks[RKT_MAX_CORES];
+	rkt_bo		 reg_mul[RKT_MAX_CORES];
 } rkt_lut_tier;
 
 struct rkt_lut_state {
 	int				ready;
 	int				post_active;
-	int				scale_verified;
-	int				add_verified;
-	int				gate_act_verified[RKT_LUT_KINDS];
 	rkt_lut_kind	resident;
 	float			in_scale;
 	float			out_scale;
 	const uint16_t *ew16;
 	const float	   *ew_src;
+	uint16_t	   *out16;
+	int				out16_stride;
 	rkt_post_cfg	post;
-	int				verified[RKT_LUT_KINDS];
 	uint32_t		upload_ops[RKT_LUT_UPLOAD_TASKS];
 	rkt_lut_cfg		cfg;
 	rkt_bo			identity[RKT_MAX_CORES];
@@ -148,6 +149,9 @@ typedef struct {
 	int				  epi;
 	float			  epi_cap;
 	float			 *y;
+	uint16_t		 *y16;
+	int				  y16_stride;
+	const uint16_t	 *ew16;
 } block_ctx;
 
 typedef struct {
@@ -156,6 +160,7 @@ typedef struct {
 	job_desc  job;
 	size_t	  in_off;
 	size_t	  out_off;
+	size_t	  ew_off;
 	uint32_t  n_ops;
 	uint32_t  regcmd_dma;
 } rkt_task;
@@ -169,6 +174,8 @@ typedef struct {
 	uint32_t out_dma;
 	uint32_t epi;
 	uint32_t epi_cap_bits;
+	uint32_t out16;
+	uint32_t ew_dma;
 } stream_key;
 
 typedef struct {
@@ -220,11 +227,28 @@ typedef struct {
 	int				  bank;
 	rkt_pending		  pending[RKT_QUEUE_BANKS];
 	uint16_t		 *x16;
+	const uint16_t	 *x_src;
 	size_t			  x16_cap;
 	int				  epi_kind;
 	float			  epi_cap;
+	uint16_t		 *out16_dst;
+	int				  out16_stride;
+	uint16_t		 *nat_gate;
+	size_t			  nat_gate_cap;
+	uint16_t		 *nat_up;
+	size_t			  nat_up_cap;
+	uint16_t		 *nat_act;
+	size_t			  nat_act_cap;
+	float			 *nat_f32;
+	const uint16_t	 *quant_x16;
+	int				  nat_n;
+	int				  nat_m;
 	uint16_t		 *y16;
 	size_t			  y16_cap;
+	uint16_t		 *res16;
+	size_t			  res16_cap;
+	const uint16_t	 *ew_res16;
+	int				  ew_residual_failed;
 	uint8_t			 *quant_pack[2];
 	size_t			  quant_pack_cap[2];
 	float			 *quant_s_act;
@@ -238,8 +262,6 @@ typedef struct {
 	size_t			  cap_weights;
 	int				  fuse;
 	int				  bf16_native;
-	int				  fmt_verified[RKT_FMT_COUNT];
-	int				  fmt_failed[RKT_FMT_COUNT];
 	int				  quant_failed;
 	int				  quant_prefill_failed;
 	rkt_quant_scratch quant_pf[RKT_MAX_CORES];
@@ -295,8 +317,18 @@ static const char *rkt_fmt_name(rkt_float_fmt fmt) {
 	return names[fmt];
 }
 
-static inline void *rkt_ptr(const buffer *b) {
+extern const void *rkt_native_key;
+void			   rkt_native_settle(void);
+
+static inline void *rkt_ptr_raw(const buffer *b) {
 	return (char *)b->handle + b->offset;
+}
+
+static inline void *rkt_ptr(const buffer *b) {
+	void *ptr = rkt_ptr_raw(b);
+	if (ptr == rkt_native_key)
+		rkt_native_settle();
+	return ptr;
 }
 
 #define RKT_QUANT_NTILE 4096
@@ -350,30 +382,72 @@ status_code rkt_quant_run_many(rkt_priv *p, rkt_weight **ws, float **ys, int cou
 							   int tokens);
 int			rkt_quant_servable(const rkt_priv *p, const rkt_weight *w, int row0, int n, int m);
 
-void		rkt_queue_abort(rkt_priv *p);
-status_code rkt_queue_flush(rkt_priv *p);
-status_code rkt_dense_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
-							 float *y, int m);
-status_code rkt_dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
-									 const float *x, float *y, int m);
-int			rkt_next_block_rows(int remaining, int max_rows);
-void		rkt_npu_record_failure(rkt_priv *p);
-status_code rkt_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x, buffer *y,
-					   int n, int k);
-status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type, const buffer *x,
-							 buffer *y, int n, int k, int m);
-status_code rkt_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
-							 const buffer *x, buffer **y, const int *n_list, int k, int n_matmuls);
-status_code rkt_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
-								   const buffer *x, buffer **y, const int *n_list, int k,
-								   int n_matmuls, int m);
-status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
-								const buffer *residual, buffer *y, int n, int k);
-int			rkt_build_layout(rkt_priv *p, rkt_weight *w);
-int			rkt_flush_weight(rkt_priv *p, rkt_weight *w);
-void		rkt_register_weight(rkt_priv *p, rkt_weight *w);
-void		rkt_release_npu_state(rkt_priv *p, rkt_weight *w);
-void		rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind);
+void		 rkt_queue_abort(rkt_priv *p);
+status_code	 rkt_queue_flush(rkt_priv *p);
+status_code	 rkt_queue_flush_async(rkt_priv *p);
+status_code	 rkt_queue_sync(rkt_priv *p);
+status_code	 rkt_dense_matmul(rkt_priv *p, const rkt_weight *w, int row0, int n, const float *x,
+							  float *y, int m);
+status_code	 rkt_dense_matmul_enqueue_k(rkt_priv *p, const rkt_weight *w, int row0, int n,
+										const float *x, float *y, int m, int k_used);
+status_code	 rkt_dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
+									  const float *x, float *y, int m);
+int			 rkt_next_block_rows(int remaining, int max_rows);
+void		 rkt_npu_record_failure(rkt_priv *p);
+status_code	 rkt_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x, buffer *y,
+						int n, int k);
+status_code	 rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type, const buffer *x,
+							  buffer *y, int n, int k, int m);
+status_code	 rkt_matmul_multi(backend *self, const buffer **w, const uint32_t *w_types,
+							  const buffer *x, buffer **y, const int *n_list, int k, int n_matmuls);
+status_code	 rkt_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
+									const buffer *x, buffer **y, const int *n_list, int k,
+									int n_matmuls, int m);
+status_code	 rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+								 const buffer *residual, buffer *y, int n, int k);
+int			 rkt_build_layout(rkt_priv *p, rkt_weight *w);
+int			 rkt_flush_weight(rkt_priv *p, rkt_weight *w);
+void		 rkt_register_weight(rkt_priv *p, rkt_weight *w);
+void		 rkt_release_npu_state(rkt_priv *p, rkt_weight *w);
+void		 rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind);
+const char	*rkt_lut_name(rkt_lut_kind kind);
+rkt_lut_kind rkt_lut_kind_for_activation(int activation);
+void		 rkt_lut_state_reset(rkt_priv *p, rkt_lut_state *a);
+status_code	 rkt_lut_state_init(rkt_priv *p, rkt_lut_state *a);
+status_code	 rkt_lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
+								   const float *gate, int gate_stride, const float *up,
+								   int up_stride, float *out, int n, int m);
+status_code	 rkt_lut_softcap_rows(rkt_priv *p, rkt_lut_state *a, const float *x, float *out, int n,
+								  float cap);
+status_code	 rkt_lut_gate_act_prepare(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind);
+status_code	 rkt_lut_add_inplace(rkt_priv *p, rkt_lut_state *a, float *x, const float *y, int n,
+								 int m, float out_scale);
+status_code	 rkt_lut_scale_inplace(rkt_priv *p, rkt_lut_state *a, float *x, int n, float scale);
+status_code	 rkt_native_gate_act(rkt_priv *p, const rkt_weight *gw, int grow0, const rkt_weight *uw,
+								 int urow0, const float *x, float *act, int n, int m,
+								 rkt_lut_kind kind);
+int			 rkt_native_pending(const rkt_priv *p, const buffer *x, int k, int m);
+int rkt_native_matches(const rkt_priv *p, const buffer *x, const rkt_weight *w, int k, int m);
+status_code rkt_native_ffn_activate(rkt_priv *p, rkt_lut_kind kind, const float *gate,
+									int gate_stride, const float *up, int up_stride, float *out,
+									int n, int m);
+status_code rkt_quant_matmul_native(rkt_priv *p, rkt_weight *w, float *y, int m);
+status_code rkt_lut_activate_rows_f16(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
+									  const float *gate, int gate_stride, const float *up,
+									  int up_stride, uint16_t *out16, int out_stride, int n, int m);
+void		rkt_native_free(rkt_priv *p);
+void		rkt_native_release(rkt_priv *p);
+status_code rkt_dense_matmul_enqueue_f16(rkt_priv *p, const rkt_weight *w, int row0, int n,
+										 const float *x, uint16_t *y16, int y16_stride, int m);
+status_code rkt_dense_matmul_native(rkt_priv *p, const rkt_weight *w, int row0, int n, float *y,
+									int m);
+status_code rkt_lut_activate_native_mul(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
+										const uint16_t *gate16, const uint16_t *up16,
+										uint16_t *out16, int out_stride, int n, int m);
+void		rkt_convert_from_f16(float *dst, const uint16_t *src, size_t n);
+void		rkt_tile_weight_row(uint16_t *bo, const uint16_t *row, int k_len, int local_row);
+void		rkt_tile_input(uint16_t *dst, const uint16_t *src, int m, int k);
+void		rkt_pack_ew_operand(uint16_t *dst, const uint16_t *src, int m, int channels);
 void		rkt_convert_to_bf16(uint16_t *dst, const float *src, size_t n);
 void		rkt_convert_to_f16(uint16_t *dst, const float *src, size_t n);
 void		rkt_tile_input_esz(uint8_t *dst, const uint8_t *src, int m, int k, int esz);

@@ -89,6 +89,16 @@ int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
 
 int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
 							  uint32_t out_dma, uint32_t operand_dma);
+int rkt_emit_matmul_f16_ewmul_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+									uint32_t w_dma, uint32_t out_dma, uint32_t operand_dma,
+									float mulc, int surface_groups);
+
+int rkt_emit_matmul_f16_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, int surface_groups);
+
+int rkt_emit_matmul_f16_lut_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+								  uint32_t w_dma, uint32_t out_dma, const rkt_lut_cfg *cfg,
+								  int surface_groups);
 
 int rkt_ew_operand_index(int m, int row, int channel);
 

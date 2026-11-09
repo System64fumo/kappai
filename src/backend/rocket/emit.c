@@ -311,9 +311,7 @@ int rkt_ew_operand_index(int m, int row, int channel) {
 	return ((b + 1) / 2) * (16 * m) + (b / 2) * (8 * m) + row * 8 + (channel & 7);
 }
 
-int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
-							  uint32_t out_dma, uint32_t operand_dma) {
-	int n_ops  = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+static int add_ew_operand(uint64_t *ops, int n_ops, int m, int n, uint32_t operand_dma) {
 	int tail   = 4;
 	int extra  = 18;
 	int insert = n_ops - tail;
@@ -343,10 +341,54 @@ int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dm
 	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_WEIGHT, 0x01010101);
 	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_SURF_NOTCH, notch);
 	n_ops += extra;
-
-	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_ADD_F16);
 	set_op(ops, n_ops, OP_ENABLE, PC_OPERATION_ENABLE,
 		   PC_ENABLE_DPU_RDMA | PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return n_ops;
+}
+
+static void apply_out16(uint64_t *ops, int n_ops, int m, int surface_groups) {
+	set_op(ops, n_ops, OP_REG_DPU, DPU_DATA_FORMAT,
+		   ((uint32_t)PREC_FLOAT16 << 29) | ((uint32_t)PREC_FLOAT16 << 26) | PREC_FLOAT16);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_OW_CFG, (1 << 8) | (1 << 5) | (1 << 2) | (1 << 1));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_OUT_CVT_SCALE, (1u << 16) | 1);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_SURFACE_ADD,
+		   ((uint32_t)(m * surface_groups) & 0xFFFFFFF) << 4);
+}
+
+int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, uint32_t operand_dma) {
+	int n_ops = add_ew_operand(ops, rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma), m, n,
+							   operand_dma);
+	if (n_ops)
+		set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_ADD_F16);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_ewmul_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+									uint32_t w_dma, uint32_t out_dma, uint32_t operand_dma,
+									float mulc, int surface_groups) {
+	rkt_post_cfg post  = {.act = RKT_ACT_MULC, .mulc = mulc};
+	int			 n_ops = rkt_emit_matmul_f16_act(ops, m, k, n, in_dma, w_dma, out_dma, &post);
+	n_ops			   = add_ew_operand(ops, n_ops, m, n, operand_dma);
+	if (!n_ops)
+		return 0;
+	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_MUL_F16);
+	apply_out16(ops, n_ops, m, surface_groups);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_lut_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+								  uint32_t w_dma, uint32_t out_dma, const rkt_lut_cfg *cfg,
+								  int surface_groups) {
+	int n_ops = rkt_emit_matmul_f16_lut(ops, m, k, n, in_dma, w_dma, out_dma, cfg);
+	apply_out16(ops, n_ops, m, surface_groups);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, int surface_groups) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	apply_out16(ops, n_ops, m, surface_groups);
 	return n_ops;
 }
 
