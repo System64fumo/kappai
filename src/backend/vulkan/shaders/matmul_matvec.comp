@@ -3,7 +3,11 @@
 
 #include "matmul_common.glsl"
 
-shared float red[256];
+shared float x_shared_cache[8192];
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
 
 void main() {
 	uint tid   = gl_LocalInvocationID.x;
@@ -11,11 +15,36 @@ void main() {
 	uint row   = gl_WorkGroupID.x * 8u + (tid >> 5u);
 	uint n	   = uint(pc.n);
 	uint kb	   = uint(pc.kb);
+	int k = int(kb) * 32;
+	for (int j = int(tid); j < k; j += 256)
+		x_shared_cache[j] = x[j];
+	barrier();
 	uint qd	   = t & 3u;
 	uint eb	   = elem_base(qd);
 	uint rbase = row_base(min(row, n - 1u), kb);
 
 	float acc = 0.0;
+#if defined(Q4_0)
+	uint n_iters = (kb + 7u) / 8u;
+	for (uint iter = 0u; iter < n_iters; iter++) {
+		uint sb = iter * 8u + (t >> 2u);
+		if (sb >= kb)
+			break;
+		uint raw[NRAW];
+		fetch_raw(rbase, sb, qd, raw);
+		float o[8];
+		dequant8(raw, sb, qd, o);
+
+		uint xq_base = sb * 12u;
+		float d_x = x[xq_base + 8u];
+		for (uint j = 0u; j < 8u; j++) {
+			uint word = floatBitsToUint(x[xq_base + (eb >> 2u) + (j >> 2u)]);
+			uint byte = (word >> ((j & 3u) * 8u)) & 0xFFu;
+			int q = int(byte) - ((byte >= 128u) ? 256 : 0);
+			acc += o[j] * (d_x * float(q));
+		}
+	}
+#else
 	for (uint sb = t >> 2u; sb < kb; sb += 8u) {
 		uint raw[NRAW];
 		fetch_raw(rbase, sb, qd, raw);
@@ -23,16 +52,11 @@ void main() {
 		dequant8(raw, sb, qd, o);
 		uint xo = sb * 32u + eb;
 		for (uint j = 0u; j < 8u; j++)
-			acc += o[j] * x[xo + j];
+			acc += o[j] * x_shared_cache[xo + j];
 	}
+#endif
 
-	red[tid] = acc;
-	barrier();
-	for (uint off = 16u; off > 0u; off >>= 1u) {
-		if (t < off)
-			red[tid] += red[tid + off];
-		barrier();
-	}
-	if (t == 0u && row < n)
-		y[row] = pc.res_mode == 1 ? red[tid] + res[row] : red[tid];
+	float total = subgroupAdd(acc);
+	if (gl_SubgroupInvocationID == 0u && row < n)
+		y[row] = pc.res_mode == 1 ? total + res[row] : total;
 }

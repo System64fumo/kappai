@@ -48,7 +48,7 @@ void store_byte(uint byte_off, uint val, bool is_v) {
 
 void main() {
 	int head_dim = params.head_dim;
-	int n_blocks = (head_dim + 31) / 32;
+	int n_blocks = (head_dim + 31) >> 5;
 
 	if (params.kv_q8 == 0) {
 		uint pair			  = gl_GlobalInvocationID.x;

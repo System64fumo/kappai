@@ -59,8 +59,8 @@ float k_partial(uint row, int lane, int pairs) {
 	for (int p = lane; p < pairs; p += LANES) {
 		int	  d0	= p * 2;
 		int	  d1	= d0 + 1;
-		int	  b0	= d0 / 32;
-		int	  o0	= d0 % 32;
+		int	  b0	= d0 >> 5;
+		int	  o0	= d0 & 31;
 		uint  soff0 = row + uint(b0) * 34u;
 		uint  w0	= kcache[soff0 >> 2u];
 		float s0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
@@ -69,8 +69,8 @@ float k_partial(uint row, int lane, int pairs) {
 		if (q0 > 127)
 			q0 -= 256;
 		float v0	= s0 * float(q0);
-		int	  b1	= d1 / 32;
-		int	  o1	= d1 % 32;
+		int	  b1	= d1 >> 5;
+		int	  o1	= d1 & 31;
 		uint  soff1 = row + uint(b1) * 34u;
 		uint  w1	= kcache[soff1 >> 2u];
 		float s1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
@@ -175,8 +175,8 @@ void main() {
 					} else {
 						int	  d0	= p * 2;
 						int	  d1	= d0 + 1;
-						int	  b0	= d0 / 32;
-						int	  o0	= d0 % 32;
+						int	  b0	= d0 >> 5;
+						int	  o0	= d0 & 31;
 						uint  soff0 = row + uint(b0) * 34u;
 						uint  w0	= vcache[soff0 >> 2u];
 						float s0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
@@ -185,8 +185,8 @@ void main() {
 						if (q0 > 127)
 							q0 -= 256;
 						float v0	= s0 * float(q0);
-						int	  b1	= d1 / 32;
-						int	  o1	= d1 % 32;
+						int	  b1	= d1 >> 5;
+						int	  o1	= d1 & 31;
 						uint  soff1 = row + uint(b1) * 34u;
 						uint  w1	= vcache[soff1 >> 2u];
 						float s1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;

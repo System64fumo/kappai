@@ -110,8 +110,8 @@ void main() {
 			} else {
 				uint ko = kv_base + uint(tile_t0 + t) * stride_head;
 				// k d0
-				int	  b0	= d0 / 32;
-				int	  o0	= d0 % 32;
+				int	  b0	= d0 >> 5;
+				int	  o0	= d0 & 31;
 				uint  soff0 = ko + uint(b0) * 34u;
 				uint  w0	= kcache[soff0 >> 2u];
 				float sk0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
@@ -121,8 +121,8 @@ void main() {
 					qk0 -= 256;
 				k_tile[t * KSTRIDE + d0] = sk0 * float(qk0);
 				// k d1
-				int	  b1	= d1 / 32;
-				int	  o1	= d1 % 32;
+				int	  b1	= d1 >> 5;
+				int	  o1	= d1 & 31;
 				uint  soff1 = ko + uint(b1) * 34u;
 				uint  w1	= kcache[soff1 >> 2u];
 				float sk1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
