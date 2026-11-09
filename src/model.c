@@ -673,6 +673,7 @@ static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t typ
 	int				   home_host = backend_has_cap(home, BCAP_IS_HOST);
 	gguf_tensor		  *owned	 = owned_tensor_for_ptr(m, host_ptr);
 	gguf_tensor_source source	 = {&m->gctx, owned};
+	desc.name					 = owned ? owned->name : NULL;
 	if (!home_host && owned && !owned->loaded && !weight_retains_host_copy(m, owned)) {
 		desc.read_fn  = gguf_tensor_read;
 		desc.read_ctx = &source;
@@ -1347,7 +1348,7 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
 			UPLOAD_REP(&L->attn_gate_w, 2, m->dim, m->hybrid.value_dim, WCLASS_MATMUL);
 			UPLOAD(&L->ssm_conv1d_w, GGML_TYPE_F32, 2, m->hybrid.conv_kernel, m->hybrid.conv_dim,
-				   WCLASS_MISC);
+				   WCLASS_GATED_DELTA_NET);
 			UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
 			UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->hybrid.n_value_heads, 0, WCLASS_MISC);
 			UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->hybrid.n_value_heads, WCLASS_MATMUL);

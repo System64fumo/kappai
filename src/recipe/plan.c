@@ -566,7 +566,6 @@ static status_code vg_resolve_steps(cg_plan *p, backend *be) {
 			if (res.impl != CAP_NATIVE || !cg_node_handler_for(kind)) {
 				ERROR("graph: backend '%s' cannot run %s (missing %s)", be->name,
 					  recipe_op_name(kind), res.fn ? res.fn : "handler");
-				cap_report(be, &res);
 				return ERR_UNSUPPORTED;
 			}
 			resolved[kind] = true;

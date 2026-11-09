@@ -15,8 +15,7 @@ static buffer *mla_kv_view(const exec_ctx *ctx, kvcache *cache, int *slot) {
 	return k;
 }
 
-static const buffer *mla_host_weight(const weight_ref *w, size_t bytes, backend *host,
-									 buffer *view) {
+const buffer *mla_host_weight(const weight_ref *w, size_t bytes, backend *host, buffer *view) {
 	if (!w->buf.owner || backend_has_cap(w->buf.owner, BCAP_IS_HOST))
 		return &w->buf;
 	*view = buffer_host_view(host, (void *)w->host_ptr, bytes);
@@ -35,7 +34,7 @@ static status_code mla_kv_put_row(exec_ctx *ctx, kvcache *cache, backend *a, con
 		return a->kv_put_mla(a, kv, slot, pos, kv_a_row, &L->kv_a_norm_w.buf, kv_lora, qk_rope,
 							 cache->n_ctx, m->norm_eps);
 
-	backend		 *host = op_backend_fallback(a, "kv_put_mla");
+	backend		 *host = op_backend_fallback(a);
 	buffer		  norm_view;
 	const buffer *norm_w =
 		mla_host_weight(&L->kv_a_norm_w, (size_t)kv_lora * sizeof(float), host, &norm_view);
@@ -61,7 +60,7 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 								m->mla.kv_lora, cache->n_ctx, ctx->s->model.rope_cos,
 								ctx->s->model.rope_sin, L->k_b_w.type, L->v_b_w.type, scale);
 
-	backend		 *host = op_backend_fallback(a, "attention_mla");
+	backend		 *host = op_backend_fallback(a);
 	buffer		  k_b_view, v_b_view;
 	const buffer *k_b_w = mla_host_weight(
 		&L->k_b_w, (size_t)n_heads * m->mla.qk_nope * m->mla.kv_lora * sizeof(float), host,
@@ -82,6 +81,13 @@ static status_code mla_attention_row(exec_ctx *ctx, kvcache *cache, backend *a, 
 	if (st == OK)
 		st = a->buffer_write_f32(a, out, out_host.handle, out_n);
 	return st;
+}
+
+static status_code mla_rmsnorm_q_a(exec_ctx *ctx, backend *a, buffer *q_a_b,
+								   const layer_weights *L) {
+	backend *nb = a->rmsnorm_batch ? a : op_backend_fallback(a);
+	return nb->rmsnorm_batch(nb, q_a_b, &L->q_a_norm_w.buf, q_a_b, ctx->m->mla.q_lora,
+							 ctx->m->norm_eps, ctx->rows.n_rows);
 }
 
 status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
@@ -119,8 +125,7 @@ status_code op_mla_qkv_proj_fused(exec_ctx *ctx) {
 		goto mla_qkv_cleanup;
 
 	if (q_lora > 0)
-		st = a->rmsnorm_batch(a, q_a_b, &L->q_a_norm_w.buf, q_a_b, q_lora, ctx->m->norm_eps,
-							  ctx->rows.n_rows);
+		st = mla_rmsnorm_q_a(ctx, a, q_a_b, L);
 	if (st != OK)
 		goto mla_qkv_cleanup;
 
@@ -158,8 +163,7 @@ status_code op_mla_q_proj(exec_ctx *ctx) {
 	if (st != OK)
 		goto mla_q_cleanup;
 	if (q_lora > 0)
-		st = a->rmsnorm_batch(a, q_a_b, &L->q_a_norm_w.buf, q_a_b, q_lora, ctx->m->norm_eps,
-							  ctx->rows.n_rows);
+		st = mla_rmsnorm_q_a(ctx, a, q_a_b, L);
 	if (st != OK)
 		goto mla_q_cleanup;
 	buffer *q_buf = batch_slot(ctx->bs, ctx->op->out);

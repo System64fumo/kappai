@@ -76,8 +76,6 @@ static const char *hfb_reason_str(host_fallback_reason r) {
 	switch (r) {
 	case HFB_OP_NOT_NATIVE:
 		return "not native";
-	case HFB_BATCH_DESIGN:
-		return "batch staging";
 	case HFB_WEIGHT_TYPE:
 		return "weight type not native";
 	case HFB_BUF_HOST_RESIDENT:
@@ -331,7 +329,7 @@ static void log_op_homes(backend *b) {
 		DEBUG("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
 	} else {
 		DEBUG("backend '%s': %d/%d core ops native", b->name, n_native, n_total);
-		WARN("backend '%s': missing native ops: %s", b->name, missing);
+		DEBUG("backend '%s': missing native ops: %s", b->name, missing);
 	}
 
 	if (b->matmul_type_native) {
@@ -682,6 +680,9 @@ backend *backend_weight_home(backend *b, weight_class wc) {
 		break;
 	case WCLASS_EMBEDDING:
 		native = (b->embd_lookup != NULL);
+		break;
+	case WCLASS_GATED_DELTA_NET:
+		native = (b->gated_delta_net != NULL);
 		break;
 	case WCLASS_MISC:
 	default:

@@ -311,13 +311,6 @@ static recipe_op mk_ple_build(uint8_t x) {
 					  RECIPE_NO_WEIGHT, STAGE_EMBD);
 }
 
-static recipe_op mk_softcap(uint8_t in, float cap) {
-	recipe_op op = mk_op_base(OP_SOFTCAP, in, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
-							  RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
-	op.u.softcap.cap = cap;
-	return op;
-}
-
 recipe_op mk_logits_readback(void) {
 	return mk_op_base(OP_LOGITS_READBACK, RECIPE_SLOT_LOGITS, RECIPE_SLOT_NONE, RECIPE_SLOT_NONE,
 					  RECIPE_SLOT_NONE, RECIPE_NO_WEIGHT, STAGE_LOGITS_READBACK);
@@ -356,6 +349,13 @@ void recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_f
 		OP_EMIT(e, mk_ffn_activate_fused(RECIPE_SLOT_FFN_GATE_UP, RECIPE_SLOT_FFN_ACT, inter, act));
 		return;
 	}
+	if (has_matmul_multi == 2) {
+		recipe_op op = mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_FFN_UP,
+										WIDX_GATE, inter, inter, dim);
+		op.u.matmul_multi.act_fuse = act + 1;
+		OP_EMIT(e, op);
+		return;
+	}
 	if (has_matmul_multi) {
 		OP_EMIT(e, mk_matmul_multi2(RECIPE_SLOT_XB, RECIPE_SLOT_FFN_GATE, RECIPE_SLOT_FFN_UP,
 									WIDX_GATE, inter, inter, dim));
@@ -369,13 +369,19 @@ void recipe_emit_ffn_activation(op_emitter *e, int dim, int inter, int gate_up_f
 							   act));
 }
 
+static int ffn_multi_mode(const backend *a, int act) {
+	if (!backend_has_cap(a, BCAP_MULTI_MATMUL))
+		return 0;
+	return a->matmul_gate_act_batch && (act == ACTIVATION_SILU || act == ACTIVATION_GELU) ? 2 : 1;
+}
+
 void recipe_emit_dense_ffn(op_emitter *e, const model *m, int li, uint8_t norm_widx) {
 	int act =
 		m->arch_info && m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
 	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT, STAGE_ADD));
 	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, norm_widx, m->norm_eps, STAGE_RMSNORM));
 	recipe_emit_ffn_activation(e, m->dim, m->intermediate, li >= 0 && m->layers[li].gate_up_fused,
-							   backend_has_cap(m->backend, BCAP_MULTI_MATMUL), act);
+							   ffn_multi_mode(m->backend, act), act);
 	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, m->dim, m->intermediate,
 						 STAGE_MATMUL));
 	OP_EMIT(e, mk_add(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
@@ -452,9 +458,8 @@ void recipe_build_post_ops(model_recipe *r, const model *m) {
 	ops[i++] = mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_LOGITS, WIDX_OUTPUT_W, m->vocab_size, dim,
 						 STAGE_LOGITS_MATMUL);
 
-	if (m->final_logit_softcap > 0.0f) {
-		ops[i++] = mk_softcap(RECIPE_SLOT_LOGITS, m->final_logit_softcap);
-	}
+	if (m->final_logit_softcap > 0.0f)
+		ops[i - 1].u.matmul.softcap = m->final_logit_softcap;
 
 	ops[i++] = mk_logits_readback();
 

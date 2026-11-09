@@ -29,6 +29,16 @@ typedef struct {
 	int	  v_head;
 } synth_cfg;
 
+static void weight_alloc(backend *a, weight_class wc, const tensor_desc *desc, buffer *out) {
+	backend *home = backend_weight_home(a, wc);
+	home->buffer_alloc_weight(home, desc, out);
+}
+
+static void weight_free(buffer *buf) {
+	if (buf->owner)
+		buf->owner->buffer_free(buf->owner, buf);
+}
+
 static void *alloc_q4_k_weights(int rows, int cols) {
 	if (cols % 256 != 0) {
 		fprintf(stderr, "alloc_q4_k_weights: cols=%d not multiple of 256\n", cols);
@@ -464,7 +474,7 @@ static void synth_upload_layer(model *m, int li) {
 						.n_dims	   = 1,
 						.dims	   = {cfg->dim},
 						.name	   = tname};
-	a->buffer_alloc_weight(a, &d_an, &L->attn_norm_w.buf);
+	weight_alloc(a, WCLASS_NORM, &d_an, &L->attn_norm_w.buf);
 
 	snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", li);
 	tensor_desc dq = {.host_data = L->wq.host_ptr,
@@ -472,7 +482,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->dim, q_out},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &dq, &L->wq.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dq, &L->wq.buf);
 	L->wq.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.attn_k.weight", li);
@@ -481,7 +491,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->dim, kv_out},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &dk, &L->wk.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dk, &L->wk.buf);
 	L->wk.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.attn_v.weight", li);
@@ -490,7 +500,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->dim, kv_out},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &dv, &L->wv.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dv, &L->wv.buf);
 	L->wv.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.attn_o.weight", li);
@@ -499,7 +509,7 @@ static void synth_upload_layer(model *m, int li) {
 					   .n_dims	  = 2,
 					   .dims	  = {q_out, cfg->dim},
 					   .name	  = tname};
-	a->buffer_alloc_weight(a, &dwo, &L->wo.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dwo, &L->wo.buf);
 	L->wo.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.ffn_norm.weight", li);
@@ -508,7 +518,7 @@ static void synth_upload_layer(model *m, int li) {
 					   .n_dims	  = 1,
 					   .dims	  = {cfg->dim},
 					   .name	  = tname};
-	a->buffer_alloc_weight(a, &dfn, &L->ffn_norm_w.buf);
+	weight_alloc(a, WCLASS_NORM, &dfn, &L->ffn_norm_w.buf);
 
 	snprintf(tname, sizeof(tname), "blk.%d.ffn_gate.weight", li);
 	tensor_desc dg = {.host_data = L->gate_w.host_ptr,
@@ -516,7 +526,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->dim, cfg->intermediate},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &dg, &L->gate_w.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dg, &L->gate_w.buf);
 	L->gate_w.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.ffn_up.weight", li);
@@ -525,7 +535,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->dim, cfg->intermediate},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &du, &L->up_w.buf);
+	weight_alloc(a, WCLASS_MATMUL, &du, &L->up_w.buf);
 	L->up_w.type = GGML_TYPE_Q4_K;
 
 	snprintf(tname, sizeof(tname), "blk.%d.ffn_down.weight", li);
@@ -534,7 +544,7 @@ static void synth_upload_layer(model *m, int li) {
 					  .n_dims	 = 2,
 					  .dims		 = {cfg->intermediate, cfg->dim},
 					  .name		 = tname};
-	a->buffer_alloc_weight(a, &dd, &L->down_w.buf);
+	weight_alloc(a, WCLASS_MATMUL, &dd, &L->down_w.buf);
 	L->down_w.type = GGML_TYPE_Q4_K;
 
 	if (ai->has_qk_norm) {
@@ -545,7 +555,7 @@ static void synth_upload_layer(model *m, int li) {
 						 .n_dims	= 1,
 						 .dims		= {hd},
 						 .name		= tname};
-		a->buffer_alloc_weight(a, &d, &L->attn_q_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &d, &L->attn_q_norm_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.attn_k_norm.weight", li);
 		tensor_desc d2 = {.host_data = L->attn_k_norm_w.host_ptr,
@@ -553,7 +563,7 @@ static void synth_upload_layer(model *m, int li) {
 						  .n_dims	 = 1,
 						  .dims		 = {hd},
 						  .name		 = tname};
-		a->buffer_alloc_weight(a, &d2, &L->attn_k_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &d2, &L->attn_k_norm_w.buf);
 	}
 	if (ai->has_attn_post_norm) {
 		snprintf(tname, sizeof(tname), "blk.%d.post_attn_norm.weight", li);
@@ -562,7 +572,7 @@ static void synth_upload_layer(model *m, int li) {
 						 .n_dims	= 1,
 						 .dims		= {cfg->dim},
 						 .name		= tname};
-		a->buffer_alloc_weight(a, &d, &L->post_attn_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &d, &L->post_attn_norm_w.buf);
 	}
 	if (ai->has_ffn_post_norm) {
 		snprintf(tname, sizeof(tname), "blk.%d.post_ffn_norm.weight", li);
@@ -571,7 +581,7 @@ static void synth_upload_layer(model *m, int li) {
 						 .n_dims	= 1,
 						 .dims		= {cfg->dim},
 						 .name		= tname};
-		a->buffer_alloc_weight(a, &d, &L->post_ffn_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &d, &L->post_ffn_norm_w.buf);
 	}
 
 	if (L->is_moe_layer) {
@@ -583,7 +593,7 @@ static void synth_upload_layer(model *m, int li) {
 						  .n_dims	 = 2,
 						  .dims		 = {cfg->dim, E},
 						  .name		 = tname};
-		a->buffer_alloc_weight(a, &dr, &L->router_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dr, &L->router_w.buf);
 
 		if (ai->uses_moe_softmax_router) {
 			snprintf(tname, sizeof(tname), "blk.%d.ffn_gate_inp.scale", li);
@@ -592,7 +602,7 @@ static void synth_upload_layer(model *m, int li) {
 							   .n_dims	  = 1,
 							   .dims	  = {cfg->dim},
 							   .name	  = tname};
-			a->buffer_alloc_weight(a, &drs, &L->router_scale_w.buf);
+			weight_alloc(a, WCLASS_MISC, &drs, &L->router_scale_w.buf);
 		}
 
 		snprintf(tname, sizeof(tname), "blk.%d.ffn_pre_norm_2.weight", li);
@@ -601,7 +611,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {cfg->dim},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &dpn2, &L->ffn_pre_norm_2_w.buf);
+		weight_alloc(a, WCLASS_NORM, &dpn2, &L->ffn_pre_norm_2_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ffn_post_norm_1.weight", li);
 		tensor_desc dpn1 = {.host_data = L->ffn_post_norm_1_w.host_ptr,
@@ -609,7 +619,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {cfg->dim},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &dpn1, &L->ffn_post_norm_1_w.buf);
+		weight_alloc(a, WCLASS_NORM, &dpn1, &L->ffn_post_norm_1_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ffn_post_norm_2.weight", li);
 		tensor_desc dpn22 = {.host_data = L->ffn_post_norm_2_w.host_ptr,
@@ -617,7 +627,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {cfg->dim},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &dpn22, &L->ffn_post_norm_2_w.buf);
+		weight_alloc(a, WCLASS_NORM, &dpn22, &L->ffn_post_norm_2_w.buf);
 
 		if (L->shexp_gate_w.host_ptr) {
 			int sh_inter = cfg->moe_intermediate * cfg->n_shared_experts;
@@ -628,7 +638,7 @@ static void synth_upload_layer(model *m, int li) {
 								.n_dims	   = 2,
 								.dims	   = {cfg->dim, sh_inter},
 								.name	   = tname};
-			a->buffer_alloc_weight(a, &d_sg, &L->shexp_gate_w.buf);
+			weight_alloc(a, WCLASS_MATMUL, &d_sg, &L->shexp_gate_w.buf);
 
 			snprintf(tname, sizeof(tname), "blk.%d.shexp_up.weight", li);
 			tensor_desc d_su = {.host_data = L->shexp_up_w.host_ptr,
@@ -636,7 +646,7 @@ static void synth_upload_layer(model *m, int li) {
 								.n_dims	   = 2,
 								.dims	   = {cfg->dim, sh_inter},
 								.name	   = tname};
-			a->buffer_alloc_weight(a, &d_su, &L->shexp_up_w.buf);
+			weight_alloc(a, WCLASS_MATMUL, &d_su, &L->shexp_up_w.buf);
 
 			snprintf(tname, sizeof(tname), "blk.%d.shexp_down.weight", li);
 			tensor_desc d_sd = {.host_data = L->shexp_down_w.host_ptr,
@@ -644,7 +654,7 @@ static void synth_upload_layer(model *m, int li) {
 								.n_dims	   = 2,
 								.dims	   = {sh_inter, cfg->dim},
 								.name	   = tname};
-			a->buffer_alloc_weight(a, &d_sd, &L->shexp_down_w.buf);
+			weight_alloc(a, WCLASS_MATMUL, &d_sd, &L->shexp_down_w.buf);
 
 			L->shexp_up_w.buf.offset   = 0;
 			L->shexp_down_w.buf.offset = 0;
@@ -667,7 +677,7 @@ static void synth_upload_layer(model *m, int li) {
 						   .n_dims	  = 2,
 						   .dims	  = {dim, q_lora},
 						   .name	  = tname};
-		a->buffer_alloc_weight(a, &dqa, &L->q_a_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dqa, &L->q_a_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.kv_a.weight", li);
 		tensor_desc dkva = {.host_data = L->kv_a_w.host_ptr,
@@ -675,7 +685,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {dim, kv_a_rows},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &dkva, &L->kv_a_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dkva, &L->kv_a_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.q_a_norm.weight", li);
 		tensor_desc dqan = {.host_data = L->q_a_norm_w.host_ptr,
@@ -683,7 +693,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {q_lora},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &dqan, &L->q_a_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &dqan, &L->q_a_norm_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.q_b.weight", li);
 		tensor_desc dqb = {.host_data = L->q_b_w.host_ptr,
@@ -691,7 +701,7 @@ static void synth_upload_layer(model *m, int li) {
 						   .n_dims	  = 2,
 						   .dims	  = {q_lora, q_b_rows},
 						   .name	  = tname};
-		a->buffer_alloc_weight(a, &dqb, &L->q_b_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dqb, &L->q_b_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.kv_a_norm.weight", li);
 		tensor_desc dkvan = {.host_data = L->kv_a_norm_w.host_ptr,
@@ -699,7 +709,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {kv_lora},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &dkvan, &L->kv_a_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &dkvan, &L->kv_a_norm_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.k_b.weight", li);
 		tensor_desc dkb = {.host_data = L->k_b_w.host_ptr,
@@ -707,7 +717,7 @@ static void synth_upload_layer(model *m, int li) {
 						   .n_dims	  = 2,
 						   .dims	  = {kv_lora, wo_in},
 						   .name	  = tname};
-		a->buffer_alloc_weight(a, &dkb, &L->k_b_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dkb, &L->k_b_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.v_b.weight", li);
 		tensor_desc dvb = {.host_data = L->v_b_w.host_ptr,
@@ -715,7 +725,7 @@ static void synth_upload_layer(model *m, int li) {
 						   .n_dims	  = 2,
 						   .dims	  = {kv_lora, wo_in},
 						   .name	  = tname};
-		a->buffer_alloc_weight(a, &dvb, &L->v_b_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &dvb, &L->v_b_w.buf);
 	}
 
 	if (ai->is_kda) {
@@ -733,7 +743,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 2,
 							 .dims		= {hc_dim, hc_mix},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_haf, &L->hc_attn_fn_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_haf, &L->hc_attn_fn_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_fn.weight", li);
 		tensor_desc d_hff = {.host_data = L->hc_ffn_fn_w.host_ptr,
@@ -741,7 +751,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 2,
 							 .dims		= {hc_dim, hc_mix},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_hff, &L->hc_ffn_fn_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_hff, &L->hc_ffn_fn_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.hc_attn_base.weight", li);
 		tensor_desc d_hab = {.host_data = L->hc_attn_base_w.host_ptr,
@@ -749,7 +759,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {hc_mix},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_hab, &L->hc_attn_base_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_hab, &L->hc_attn_base_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_base.weight", li);
 		tensor_desc d_hfb = {.host_data = L->hc_ffn_base_w.host_ptr,
@@ -757,7 +767,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {hc_mix},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_hfb, &L->hc_ffn_base_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_hfb, &L->hc_ffn_base_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.hc_attn_scale.weight", li);
 		tensor_desc d_has = {.host_data = L->hc_attn_scale_w.host_ptr,
@@ -765,7 +775,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {3},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_has, &L->hc_attn_scale_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_has, &L->hc_attn_scale_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.hc_ffn_scale.weight", li);
 		tensor_desc d_hfs = {.host_data = L->hc_ffn_scale_w.host_ptr,
@@ -773,7 +783,7 @@ static void synth_upload_layer(model *m, int li) {
 							 .n_dims	= 1,
 							 .dims		= {3},
 							 .name		= tname};
-		a->buffer_alloc_weight(a, &d_hfs, &L->hc_ffn_scale_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_hfs, &L->hc_ffn_scale_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_f_a.weight", li);
 		tensor_desc d_fa = {.host_data = L->kda_f_a_w.host_ptr,
@@ -781,7 +791,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)m->dim, (uint64_t)S},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_fa, &L->kda_f_a_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_fa, &L->kda_f_a_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_f_b.weight", li);
 		tensor_desc d_fb = {.host_data = L->kda_f_b_w.host_ptr,
@@ -789,7 +799,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)S, (uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_fb, &L->kda_f_b_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_fb, &L->kda_f_b_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_g_a.weight", li);
 		tensor_desc d_ga = {.host_data = L->kda_g_a_w.host_ptr,
@@ -797,7 +807,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)m->dim, (uint64_t)S},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_ga, &L->kda_g_a_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_ga, &L->kda_g_a_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_g_b.weight", li);
 		tensor_desc d_gb = {.host_data = L->kda_g_b_w.host_ptr,
@@ -805,7 +815,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)S, (uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_gb, &L->kda_g_b_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_gb, &L->kda_g_b_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_beta.weight", li);
 		tensor_desc d_sb = {.host_data = L->ssm_beta_w.host_ptr,
@@ -813,7 +823,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)m->dim, (uint64_t)H},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_sb, &L->ssm_beta_w.buf);
+		weight_alloc(a, WCLASS_MATMUL, &d_sb, &L->ssm_beta_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_a", li);
 		tensor_desc d_sa = {.host_data = L->ssm_a.host_ptr,
@@ -821,7 +831,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {(uint64_t)H},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_sa, &L->ssm_a.buf);
+		weight_alloc(a, WCLASS_MISC, &d_sa, &L->ssm_a.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_dt.bias", li);
 		tensor_desc d_dt = {.host_data = L->ssm_dt_b.host_ptr,
@@ -829,7 +839,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {(uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_dt, &L->ssm_dt_b.buf);
+		weight_alloc(a, WCLASS_MISC, &d_dt, &L->ssm_dt_b.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_norm.weight", li);
 		tensor_desc d_sn = {.host_data = L->ssm_norm_w.host_ptr,
@@ -837,7 +847,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 1,
 							.dims	   = {(uint64_t)S},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_sn, &L->ssm_norm_w.buf);
+		weight_alloc(a, WCLASS_NORM, &d_sn, &L->ssm_norm_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_q.weight", li);
 		tensor_desc d_cq = {.host_data = L->kda_conv_q_w.host_ptr,
@@ -845,7 +855,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_cq, &L->kda_conv_q_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_cq, &L->kda_conv_q_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_k.weight", li);
 		tensor_desc d_ck = {.host_data = L->kda_conv_k_w.host_ptr,
@@ -853,7 +863,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_ck, &L->kda_conv_k_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_ck, &L->kda_conv_k_w.buf);
 
 		snprintf(tname, sizeof(tname), "blk.%d.ssm_conv1d_v.weight", li);
 		tensor_desc d_cv = {.host_data = L->kda_conv_v_w.host_ptr,
@@ -861,7 +871,7 @@ static void synth_upload_layer(model *m, int li) {
 							.n_dims	   = 2,
 							.dims	   = {(uint64_t)K, (uint64_t)d_inner},
 							.name	   = tname};
-		a->buffer_alloc_weight(a, &d_cv, &L->kda_conv_v_w.buf);
+		weight_alloc(a, WCLASS_MISC, &d_cv, &L->kda_conv_v_w.buf);
 	}
 }
 
@@ -972,7 +982,7 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 		.dims	   = {cfg->dim, cfg->vocab},
 		.name	   = "token_embd.weight",
 	};
-	a->buffer_alloc_weight(a, &d_tok, &m->tok_embd.buf);
+	weight_alloc(a, WCLASS_EMBEDDING, &d_tok, &m->tok_embd.buf);
 	m->tok_embd.type = GGML_TYPE_Q4_K;
 
 	sm->output_norm_raw = alloc_f32_weights(cfg->dim, 1.0f);
@@ -983,7 +993,7 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 		.dims	   = {cfg->dim},
 		.name	   = "output_norm.weight",
 	};
-	a->buffer_alloc_weight(a, &d_onorm, &m->output_norm_w.buf);
+	weight_alloc(a, WCLASS_NORM, &d_onorm, &m->output_norm_w.buf);
 
 	sm->output_w_raw  = alloc_q4_k_weights(cfg->vocab, cfg->dim);
 	tensor_desc d_out = {
@@ -993,7 +1003,7 @@ static synth_model *synth_model_build(backend *a, model_arch arch, const synth_c
 		.dims	   = {cfg->dim, cfg->vocab},
 		.name	   = "output.weight",
 	};
-	a->buffer_alloc_weight(a, &d_out, &m->output_w.buf);
+	weight_alloc(a, WCLASS_MATMUL, &d_out, &m->output_w.buf);
 	m->output_w.type = GGML_TYPE_Q4_K;
 
 	m->layers = xcalloc((size_t)cfg->n_layers, sizeof(layer_weights));
@@ -1018,54 +1028,54 @@ static void synth_free_layer(layer_weights *L, int li) {
 	(void)li;
 	backend *a = L->attn_norm_w.buf.owner;
 	if (a) {
-		a->buffer_free(a, &L->attn_norm_w.buf);
-		a->buffer_free(a, &L->wq.buf);
-		a->buffer_free(a, &L->wk.buf);
-		a->buffer_free(a, &L->wv.buf);
-		a->buffer_free(a, &L->wo.buf);
-		a->buffer_free(a, &L->ffn_norm_w.buf);
-		a->buffer_free(a, &L->gate_w.buf);
-		a->buffer_free(a, &L->up_w.buf);
-		a->buffer_free(a, &L->down_w.buf);
-		a->buffer_free(a, &L->attn_q_norm_w.buf);
-		a->buffer_free(a, &L->attn_k_norm_w.buf);
-		a->buffer_free(a, &L->post_attn_norm_w.buf);
-		a->buffer_free(a, &L->post_ffn_norm_w.buf);
-		a->buffer_free(a, &L->router_w.buf);
-		a->buffer_free(a, &L->router_scale_w.buf);
-		a->buffer_free(a, &L->ffn_pre_norm_2_w.buf);
-		a->buffer_free(a, &L->ffn_post_norm_1_w.buf);
-		a->buffer_free(a, &L->ffn_post_norm_2_w.buf);
-		a->buffer_free(a, &L->shexp_gate_w.buf);
-		a->buffer_free(a, &L->shexp_up_w.buf);
-		a->buffer_free(a, &L->shexp_down_w.buf);
+		weight_free(&L->attn_norm_w.buf);
+		weight_free(&L->wq.buf);
+		weight_free(&L->wk.buf);
+		weight_free(&L->wv.buf);
+		weight_free(&L->wo.buf);
+		weight_free(&L->ffn_norm_w.buf);
+		weight_free(&L->gate_w.buf);
+		weight_free(&L->up_w.buf);
+		weight_free(&L->down_w.buf);
+		weight_free(&L->attn_q_norm_w.buf);
+		weight_free(&L->attn_k_norm_w.buf);
+		weight_free(&L->post_attn_norm_w.buf);
+		weight_free(&L->post_ffn_norm_w.buf);
+		weight_free(&L->router_w.buf);
+		weight_free(&L->router_scale_w.buf);
+		weight_free(&L->ffn_pre_norm_2_w.buf);
+		weight_free(&L->ffn_post_norm_1_w.buf);
+		weight_free(&L->ffn_post_norm_2_w.buf);
+		weight_free(&L->shexp_gate_w.buf);
+		weight_free(&L->shexp_up_w.buf);
+		weight_free(&L->shexp_down_w.buf);
 		if (L->q_a_w.host_ptr) {
-			a->buffer_free(a, &L->q_a_w.buf);
-			a->buffer_free(a, &L->kv_a_w.buf);
-			a->buffer_free(a, &L->q_a_norm_w.buf);
-			a->buffer_free(a, &L->q_b_w.buf);
-			a->buffer_free(a, &L->kv_a_norm_w.buf);
-			a->buffer_free(a, &L->k_b_w.buf);
-			a->buffer_free(a, &L->v_b_w.buf);
+			weight_free(&L->q_a_w.buf);
+			weight_free(&L->kv_a_w.buf);
+			weight_free(&L->q_a_norm_w.buf);
+			weight_free(&L->q_b_w.buf);
+			weight_free(&L->kv_a_norm_w.buf);
+			weight_free(&L->k_b_w.buf);
+			weight_free(&L->v_b_w.buf);
 		}
 		if (L->hc_attn_fn_w.host_ptr) {
-			a->buffer_free(a, &L->hc_attn_fn_w.buf);
-			a->buffer_free(a, &L->hc_ffn_fn_w.buf);
-			a->buffer_free(a, &L->hc_attn_base_w.buf);
-			a->buffer_free(a, &L->hc_ffn_base_w.buf);
-			a->buffer_free(a, &L->hc_attn_scale_w.buf);
-			a->buffer_free(a, &L->hc_ffn_scale_w.buf);
-			a->buffer_free(a, &L->kda_f_a_w.buf);
-			a->buffer_free(a, &L->kda_f_b_w.buf);
-			a->buffer_free(a, &L->kda_g_a_w.buf);
-			a->buffer_free(a, &L->kda_g_b_w.buf);
-			a->buffer_free(a, &L->ssm_beta_w.buf);
-			a->buffer_free(a, &L->ssm_a.buf);
-			a->buffer_free(a, &L->ssm_dt_b.buf);
-			a->buffer_free(a, &L->ssm_norm_w.buf);
-			a->buffer_free(a, &L->kda_conv_q_w.buf);
-			a->buffer_free(a, &L->kda_conv_k_w.buf);
-			a->buffer_free(a, &L->kda_conv_v_w.buf);
+			weight_free(&L->hc_attn_fn_w.buf);
+			weight_free(&L->hc_ffn_fn_w.buf);
+			weight_free(&L->hc_attn_base_w.buf);
+			weight_free(&L->hc_ffn_base_w.buf);
+			weight_free(&L->hc_attn_scale_w.buf);
+			weight_free(&L->hc_ffn_scale_w.buf);
+			weight_free(&L->kda_f_a_w.buf);
+			weight_free(&L->kda_f_b_w.buf);
+			weight_free(&L->kda_g_a_w.buf);
+			weight_free(&L->kda_g_b_w.buf);
+			weight_free(&L->ssm_beta_w.buf);
+			weight_free(&L->ssm_a.buf);
+			weight_free(&L->ssm_dt_b.buf);
+			weight_free(&L->ssm_norm_w.buf);
+			weight_free(&L->kda_conv_q_w.buf);
+			weight_free(&L->kda_conv_k_w.buf);
+			weight_free(&L->kda_conv_v_w.buf);
 		}
 	}
 
@@ -1133,9 +1143,9 @@ static void synth_model_free(synth_model *sm) {
 	if (!sm)
 		return;
 	backend *a = sm->m.backend;
-	a->buffer_free(a, &sm->m.tok_embd.buf);
-	a->buffer_free(a, &sm->m.output_norm_w.buf);
-	a->buffer_free(a, &sm->m.output_w.buf);
+	weight_free(&sm->m.tok_embd.buf);
+	weight_free(&sm->m.output_norm_w.buf);
+	weight_free(&sm->m.output_w.buf);
 	for (int li = 0; li < sm->n_layers; li++)
 		synth_free_layer(&sm->m.layers[li], li);
 	free(sm->tok_embd_raw);
@@ -1991,6 +2001,24 @@ static void missing_native_ops(const backend *b, const arch_info *ai, char *out,
 	}
 }
 
+static void missing_base_ops(const backend *b, char *out, size_t cap) {
+	const struct {
+		const char *name;
+		bool		has;
+	} ops[] = {
+		{"rmsnorm", b->rmsnorm != NULL},
+		{"rope", b->rope != NULL},
+		{"embd_lookup", b->embd_lookup != NULL},
+	};
+	out[0] = '\0';
+	for (size_t i = 0; i < ARRAY_LEN(ops); i++) {
+		if (ops[i].has)
+			continue;
+		size_t len = strlen(out);
+		snprintf(out + len, cap - len, "%s%s", len ? ", " : "", ops[i].name);
+	}
+}
+
 static void test_arch_generate(backend *ref, backend *tgt, model_arch arch, const synth_cfg *cfg,
 							   int n_prefill, int n_decode, int flash_attn) {
 	const char *arch_name = arch_lookup(arch)->gguf_name;
@@ -2179,6 +2207,17 @@ static void test_arch_generate(backend *ref, backend *tgt, model_arch arch, cons
 }
 
 void run_arch_tests(backend *ref, backend *tgt) {
+	char missing[128] = "";
+	if (tgt)
+		missing_base_ops(tgt, missing, sizeof(missing));
+	if (missing[0]) {
+		char label[160];
+		char detail[256];
+		snprintf(label, sizeof(label), "arch.* (%s)", tgt->name);
+		snprintf(detail, sizeof(detail), "missing native implementation: %s", missing);
+		record_result(OPFAM_ARCH_LAYER, label, V_SKIP, detail);
+		tgt = NULL;
+	}
 	if (tgt) {
 		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 0);
 		test_arch_single_layer(ref, tgt, &ARCH_CFG_SMALL, 1);

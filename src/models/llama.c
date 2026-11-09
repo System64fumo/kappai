@@ -76,7 +76,11 @@ static model_recipe *build_standard_recipe(const model *m) {
 		OP_EMIT(&e, mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
 
 		recipe_emit_ffn_activation(&e, dim, intermediate, m->layers[0].gate_up_fused,
-								   has_matmul_multi, act);
+								   has_matmul_multi && a->matmul_gate_act_batch &&
+										   (act == ACTIVATION_SILU || act == ACTIVATION_GELU)
+									   ? 2
+									   : has_matmul_multi,
+								   act);
 
 		if (can_fuse_ffn_residual) {
 			OP_EMIT(&e, mk_matmul_residual(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_X, RECIPE_SLOT_X,

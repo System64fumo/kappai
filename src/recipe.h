@@ -270,14 +270,16 @@ typedef union {
 		float out_scale;
 	} rmsnorm;
 	struct {
-		int n;
-		int k;
+		int	  n;
+		int	  k;
+		float softcap;
 	} matmul;
 	struct {
 		int n;
 		int k;
 		int n_out[3];
 		int v_from_k;
+		int act_fuse;
 	} matmul_multi;
 	struct {
 		int n;

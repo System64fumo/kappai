@@ -1,12 +1,5 @@
 #include "recipe/internal.h"
 
-#define OP_FALLBACK_SEEN_MAX 64
-
-typedef struct {
-	const backend *be;
-	const char	  *op;
-} op_fallback_seen;
-
 typedef struct {
 	const float *cos;
 	const float *sin;
@@ -40,10 +33,7 @@ typedef struct {
 	int		 n;
 } rmsnorm_nw_row_ud;
 
-_Atomic(backend *)		cached_host_backend = NULL;
-static op_fallback_seen g_op_fallback_seen[OP_FALLBACK_SEEN_MAX];
-static _Atomic int		g_op_fallback_n_seen;
-static pthread_mutex_t	g_op_fallback_mtx = PTHREAD_MUTEX_INITIALIZER;
+_Atomic(backend *) cached_host_backend = NULL;
 
 static status_code batch_copy_k_to_v(model *m, batch_scratch *bs, int n_tokens, uint8_t k_slot,
 									 uint8_t v_slot, int kv_row_stride);
@@ -208,31 +198,6 @@ int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb,
 	}
 	*out_status = OK;
 	return n;
-}
-
-static bool op_fallback_seen_before(const backend *a, const char *op_name, int n) {
-	for (int i = 0; i < n && i < OP_FALLBACK_SEEN_MAX; i++)
-		if (g_op_fallback_seen[i].be == a && strcmp(g_op_fallback_seen[i].op, op_name) == 0)
-			return true;
-	return false;
-}
-
-void op_fallback_note(backend *a, const char *op_name) {
-	if (op_fallback_seen_before(a, op_name, atomic_load(&g_op_fallback_n_seen)))
-		return;
-	pthread_mutex_lock(&g_op_fallback_mtx);
-	int n = atomic_load(&g_op_fallback_n_seen);
-	if (n >= OP_FALLBACK_SEEN_MAX || op_fallback_seen_before(a, op_name, n)) {
-		pthread_mutex_unlock(&g_op_fallback_mtx);
-		return;
-	}
-	g_op_fallback_seen[n].be = a;
-	g_op_fallback_seen[n].op = op_name;
-	atomic_store(&g_op_fallback_n_seen, n + 1);
-	pthread_mutex_unlock(&g_op_fallback_mtx);
-	backend_report_host_fallback(a, op_name, HFB_OP_NOT_NATIVE,
-								 "backend has no native '%s'; running on the host fallback",
-								 op_name);
 }
 
 static inline void backend_sync_rope(backend *t, backend *a) {
@@ -423,15 +388,34 @@ status_code op_rmsnorm(exec_ctx *ctx) {
 	return st;
 }
 
+static status_code matmul_softcap_apply(exec_ctx *ctx, backend *a, float cap, int n) {
+	backend *t = a->softcap ? a : backend_host();
+	if (!t || !t->softcap)
+		return ERR_UNSUPPORTED;
+	if (t != a) {
+		ensure_sync(a);
+	}
+	return t->softcap(t, exec_slot(ctx, ctx->op->out), cap, n * ctx->rows.n_rows);
+}
+
 status_code op_matmul_plain(exec_ctx *ctx) {
 	const recipe_op *op	  = ctx->op;
 	weight_ref		*wref = exec_weight_ref(ctx, op->w_idx);
 	int				 n = op->u.matmul.n, k = op->u.matmul.k;
 	profile_scope	 ps = profile_begin(&ctx->s->prof, op->stage);
 	profile_weight_bytes(&ctx->s->prof, op->stage, wref->type, n, k);
-	backend	   *a  = exec_layer_backend(ctx);
-	status_code st = a->matmul_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
-									 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows);
+	backend	   *a	= exec_layer_backend(ctx);
+	float		cap = op->u.matmul.softcap;
+	status_code st	= ERR_UNSUPPORTED;
+	if (cap > 0.0f && a->matmul_softcap_batch)
+		st = a->matmul_softcap_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
+									 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows, cap);
+	if (st == ERR_UNSUPPORTED) {
+		st = a->matmul_batch(a, &wref->buf, wref->type, exec_slot(ctx, op->in[0]),
+							 exec_slot(ctx, op->out), n, k, ctx->rows.n_rows);
+		if (st == OK && cap > 0.0f)
+			st = matmul_softcap_apply(ctx, a, cap, n);
+	}
 	profile_end(&ctx->s->prof, &ps);
 	return st;
 }
@@ -457,8 +441,19 @@ status_code op_matmul_residual(exec_ctx *ctx) {
 	profile_weight_bytes(prof, ctx->op->stage, wt, n, k);
 	buffer *tmp = batch_slot(ctx->bs, RECIPE_SLOT_RESID_TMP);
 	st = a->matmul_batch(a, w, wt, exec_slot(ctx, ctx->op->in[0]), tmp, n, k, ctx->rows.n_rows);
-	if (st == OK)
-		st = a->add_batch(a, exec_slot(ctx, ctx->op->out), tmp, n, ctx->rows.n_rows);
+	if (st != OK)
+		goto out;
+	backend *add_be = a;
+	if (!a->add_batch) {
+		add_be = backend_host();
+		if (!add_be || !add_be->add_batch) {
+			st = ERR_UNSUPPORTED;
+			goto out;
+		}
+		ensure_sync(a);
+	}
+	st = add_be->add_batch(add_be, exec_slot(ctx, ctx->op->out), tmp, n, ctx->rows.n_rows);
+out:
 	profile_end(prof, &ps);
 	return st;
 }
@@ -481,11 +476,18 @@ static status_code ffn_down_fused(exec_ctx *ctx, backend *a) {
 }
 
 static status_code ffn_down_composed(exec_ctx *ctx, backend *a) {
-	ffn_down_args g	  = ffn_down_args_of(ctx);
-	buffer		 *act = batch_slot(ctx->bs, RECIPE_SLOT_FFN_ACT);
-	status_code	  st =
-		a->ffn_activate_batch(a, exec_slot(ctx, ctx->op->in[0]), exec_slot(ctx, ctx->op->in[1]),
-							  act, g.k, g.act, ctx->rows.n_rows);
+	ffn_down_args g		 = ffn_down_args_of(ctx);
+	buffer		 *act	 = batch_slot(ctx->bs, RECIPE_SLOT_FFN_ACT);
+	backend		 *act_be = a;
+	if (!a->ffn_activate_batch) {
+		act_be = backend_host();
+		if (!act_be || !act_be->ffn_activate_batch)
+			return ERR_UNSUPPORTED;
+		ensure_sync(a);
+	}
+	status_code st = act_be->ffn_activate_batch(act_be, exec_slot(ctx, ctx->op->in[0]),
+												exec_slot(ctx, ctx->op->in[1]), act, g.k, g.act,
+												ctx->rows.n_rows);
 	if (st != OK)
 		return st;
 	return a->matmul_batch(a, g.w, g.wt, act, exec_slot(ctx, ctx->op->out), g.n, g.k,
@@ -625,6 +627,12 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 				break;
 		}
 		kvcache_attn_view(seg_cache, ctx->m, ctx->li, kv_layer, &kb, &vb, &kv_slot);
+		backend *kv_owner = kb->owner ? kb->owner : seg_cache->backend;
+		if (a != kv_owner && !backend_has_cap(kv_owner, BCAP_IS_HOST) &&
+			!backend_has_cap(kv_owner, BCAP_HOST_VISIBLE_BUFFERS)) {
+			st = ERR_UNSUPPORTED;
+			break;
+		}
 		if (use_swa)
 			st = a->attention_swa_batch(a, &q_view, kb, vb, &o_view, kv_slot,
 										exec_segment_pos(ctx, c), n_heads, n_kv_heads, head_dim,
@@ -641,9 +649,15 @@ static status_code attention_run(exec_ctx *ctx, backend *a, int use_swa) {
 
 static status_code attention_dynamic(exec_ctx *ctx) {
 	backend *a		 = exec_layer_backend(ctx);
-	int		 use_swa = ctx->op->u.attention.sliding_window > 0 && ctx->li >= 0 &&
-					   model_layer_is_sliding(ctx->m, ctx->li) && a->attention_swa_batch != NULL;
-	return attention_run(ctx, a, use_swa);
+	int		 sliding = ctx->op->u.attention.sliding_window > 0 && ctx->li >= 0 &&
+					   model_layer_is_sliding(ctx->m, ctx->li);
+	if (sliding && !a->attention_swa_batch) {
+		backend *host = backend_host();
+		if (!host || !host->attention_swa_batch)
+			return ERR_UNSUPPORTED;
+		a = host;
+	}
+	return attention_run(ctx, a, sliding);
 }
 
 status_code op_attention_global(exec_ctx *ctx) {
@@ -704,8 +718,6 @@ status_code op_ffn_activate(exec_ctx *ctx) {
 
 static status_code ffn_fused_device(exec_ctx *ctx, backend *a) {
 	int n = ctx->op->u.ffn_act.n;
-	backend_report_host_fallback(a, "ffn_activate_fused", HFB_BATCH_DESIGN,
-								 "batch prefill stages gate/up activation through host memory");
 	return ffn_activate_fused_device_fallback(ctx, a, n, ctx->op->u.ffn_act.activation, 2 * n,
 											  ctx->rows.n_rows);
 }
@@ -1084,6 +1096,18 @@ static status_code ffn_activate_fused_device_fallback(exec_ctx *ctx, backend *a,
 	return a->buffer_write_f32(a, out_buf, out_host, n_rows * n);
 }
 
+static status_code matmul_multi_activate(exec_ctx *ctx, backend *a, int n, int activation) {
+	backend *t = a->ffn_activate_batch ? a : backend_host();
+	if (!t || !t->ffn_activate_batch)
+		return ERR_UNSUPPORTED;
+	if (t != a) {
+		ensure_sync(a);
+	}
+	buffer *act = batch_slot(ctx->bs, ctx->op->out);
+	return t->ffn_activate_batch(t, act, batch_slot(ctx->bs, ctx->op->out1), act, n, activation,
+								 ctx->rows.n_rows);
+}
+
 static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 	const layer_weights *lw = &ctx->m->layers[ctx->li];
 	int					 k	= ctx->op->u.matmul_multi.k;
@@ -1120,15 +1144,27 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 		return st;
 	}
 	if (ctx->op->w_idx == WIDX_GATE) {
-		const int *n_out = ctx->op->u.matmul_multi.n_out;
+		const int *n_out	= ctx->op->u.matmul_multi.n_out;
+		int		   act_fuse = ctx->op->u.matmul_multi.act_fuse;
 		if (fused) {
 			const buffer *ws[2]	 = {&lw->gate_w.buf, &lw->up_w.buf};
 			uint32_t	  wts[2] = {lw->gate_w.type, lw->up_w.type};
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[0], n_out[0], k);
 			profile_weight_bytes(&ctx->s->prof, ctx->op->stage, wts[1], n_out[1], k);
 			buffer *ys[2] = {batch_slot(ctx->bs, ctx->op->out), batch_slot(ctx->bs, ctx->op->out1)};
-			return a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
-										 k, 2, ctx->rows.n_rows);
+			status_code st = ERR_UNSUPPORTED;
+			if (act_fuse && a->matmul_gate_act_batch)
+				st = a->matmul_gate_act_batch(a, ws[0], wts[0], ws[1], wts[1],
+											  batch_slot(ctx->bs, ctx->op->in[0]), ys[0], ys[1],
+											  n_out[0], k, act_fuse - 1, ctx->rows.n_rows);
+			if (st == OK)
+				return OK;
+			if (st != ERR_UNSUPPORTED)
+				return st;
+			st = a->matmul_multi_batch(a, ws, wts, batch_slot(ctx->bs, ctx->op->in[0]), ys, n_out,
+									   k, 2, ctx->rows.n_rows);
+			return st == OK && act_fuse ? matmul_multi_activate(ctx, a, n_out[0], act_fuse - 1)
+										: st;
 		}
 		status_code st = a->matmul_batch(
 			a, &lw->gate_w.buf, lw->gate_w.type, batch_slot(ctx->bs, ctx->op->in[0]),
@@ -1137,7 +1173,7 @@ static status_code matmul_multi_run(exec_ctx *ctx, backend *a, int fused) {
 			st = a->matmul_batch(a, &lw->up_w.buf, lw->up_w.type,
 								 batch_slot(ctx->bs, ctx->op->in[0]),
 								 batch_slot(ctx->bs, ctx->op->out1), n_out[1], k, ctx->rows.n_rows);
-		return st;
+		return st == OK && act_fuse ? matmul_multi_activate(ctx, a, n_out[0], act_fuse - 1) : st;
 	}
 	return ERR_INVALID_ARG;
 }

@@ -22,7 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OP_BACKEND(be, field) op_backend_pick((be), ((be)->field != NULL), #field)
+#define OP_BACKEND(be, field) op_backend_pick((be), ((be)->field != NULL))
 
 typedef struct {
 	int		   n_calls;
@@ -142,13 +142,14 @@ int						model_has_sliding_layers(const model *m);
 
 recipe_op mk_rmsnorm_per_head(uint8_t io, uint8_t widx, float eps, int n_heads);
 
-uint32_t	ple_inject_caps(const backend *a);
-uint32_t	moe_shared_caps(const backend *a);
-uint32_t	mla_qkv_caps(const backend *a);
-uint32_t	gdn_caps(const backend *a);
-void		exec_plan_free(struct exec_plan *p);
-status_code exec_plan_build(model_recipe *r, const struct model *m);
-int			recipe_is_decode_batchable(const model *m);
+uint32_t	  ple_inject_caps(const backend *a);
+uint32_t	  moe_shared_caps(const backend *a);
+uint32_t	  mla_qkv_caps(const backend *a);
+const buffer *mla_host_weight(const weight_ref *w, size_t bytes, backend *host, buffer *view);
+uint32_t	  gdn_caps(const backend *a);
+void		  exec_plan_free(struct exec_plan *p);
+status_code	  exec_plan_build(model_recipe *r, const struct model *m);
+int			  recipe_is_decode_batchable(const model *m);
 
 const char *recipe_op_name(op_kind k);
 
@@ -157,12 +158,11 @@ const float *recipe_slot_read_f32(const exec_ctx *ctx, uint8_t idx, float_buf *s
 float		*recipe_slot_write_stage(const exec_ctx *ctx, uint8_t idx, float_buf *stage, int n);
 status_code	 recipe_slot_write_commit(const exec_ctx *ctx, uint8_t idx, const float *staged, int n);
 void		 profile_weight_bytes(profile *prof, stage s, uint32_t w_type, int rows, int k);
-int	 exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, compute_scratch *s,
-									 int li, buffer *xb, buffer *ys[], int n_rows,
-									 status_code *out_status);
-int	 exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb, buffer **y_list,
-						   int li, int n_rows, status_code *out_status);
-void op_fallback_note(backend *a, const char *op_name);
+int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, compute_scratch *s,
+									int li, buffer *xb, buffer *ys[], int n_rows,
+									status_code *out_status);
+int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb, buffer **y_list,
+						  int li, int n_rows, status_code *out_status);
 status_code op_ffn_activate_ex(exec_ctx *ctx);
 status_code op_rope_ext_batched(exec_ctx *ctx);
 status_code op_rope_ext(exec_ctx *ctx);
@@ -261,13 +261,13 @@ static inline backend *op_host_backend(void) {
 	return b;
 }
 
-static inline backend *op_backend_fallback(backend *a, const char *op_name);
-static inline backend *op_backend_pick(backend *a, int has_field, const char *op_name) {
+static inline backend *op_backend_fallback(backend *a);
+static inline backend *op_backend_pick(backend *a, int has_field) {
 	if (has_field)
 		return a;
 	if (backend_has_cap(a, BCAP_IS_HOST))
 		return a;
-	return op_backend_fallback(a, op_name);
+	return op_backend_fallback(a);
 }
 
 static inline float		 *batch_buf_ptr(const buffer *b);
@@ -344,8 +344,7 @@ static inline uint32_t exec_caps(const exec_ctx *ctx, uint32_t (*resolve)(const 
 	return ctx->caps ? ctx->caps : (resolve(exec_layer_backend(ctx)) | EXEC_CAPS_RESOLVED);
 }
 
-static inline backend *op_backend_fallback(backend *a, const char *op_name) {
-	op_fallback_note(a, op_name);
+static inline backend *op_backend_fallback(backend *a) {
 	ensure_sync(a);
 	return op_host_backend();
 }

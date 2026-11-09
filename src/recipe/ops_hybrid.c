@@ -107,10 +107,7 @@ status_code op_gated_delta_net(exec_ctx *ctx) {
 		t = a;
 	} else {
 		const int native = (exec_caps(ctx, gdn_caps) & GDN_NATIVE) != 0;
-		if (!native)
-			backend_report_host_fallback(a, "gated_delta_net", HFB_OP_NOT_NATIVE,
-										 "gated delta net executes on the host (cpu) fallback");
-		t = native && backend_has_cap(a, BCAP_IS_HOST) ? a : op_host_backend();
+		t				 = native && backend_has_cap(a, BCAP_IS_HOST) ? a : op_host_backend();
 	}
 	if (!t->gated_delta_net) {
 		profile_end(&ctx->s->prof, &ps);

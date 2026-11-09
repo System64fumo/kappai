@@ -1,0 +1,502 @@
+#include "emit.h"
+#include "hw.h"
+
+#include <string.h>
+
+typedef struct {
+	uint64_t *ops;
+	int		  n;
+} regcmd;
+
+static void put(regcmd *c, uint32_t block_op, uint32_t reg, uint32_t value) {
+	c->ops[c->n++] =
+		((uint64_t)(block_op & 0xFFFF) << 48) | ((uint64_t)value << 16) | (reg & 0xFFFF);
+}
+
+static void put_zeros(regcmd *c, uint32_t block_op, uint32_t first_reg, int count) {
+	for (int i = 0; i < count; i++)
+		put(c, block_op, first_reg + (uint32_t)i * 4, 0);
+}
+
+static uint32_t pack(uint32_t hi, uint32_t lo) {
+	return (hi << 16) | lo;
+}
+
+int rkt_feature_index(int height, int c2, int channel, int row) {
+	return ((channel - 1) / c2) * height * c2 + c2 * (row - 1) + (channel - 1) % c2;
+}
+
+typedef struct {
+	uint32_t precision;
+	uint32_t dpu_precision;
+	int		 bytes;
+} fmt_params;
+
+static uint32_t bf16_dpu_precision = PREC_BFLOAT16;
+
+void rkt_emit_set_bf16_dpu_precision(uint32_t precision) {
+	bf16_dpu_precision = precision;
+}
+
+static fmt_params fmt_params_for(rkt_float_fmt fmt) {
+	switch (fmt) {
+	case RKT_FMT_BF16:
+		return (fmt_params){PREC_BFLOAT16, bf16_dpu_precision, 2};
+	case RKT_FMT_TF32:
+		return (fmt_params){PREC_TF32, PREC_FLOAT32, 4};
+	default:
+		return (fmt_params){PREC_FLOAT16, PREC_FLOAT16, 2};
+	}
+}
+
+static uint32_t feature_banks(int m, int k, int bytes) {
+	uint32_t banks = ((uint32_t)(m * k * bytes) + CBUF_BANK_BYTES - 1) / CBUF_BANK_BYTES;
+	if (banks < 1)
+		return 1;
+	return banks > CBUF_BANKS - 1 ? CBUF_BANKS - 1 : banks;
+}
+
+static int surface_stride(int m) {
+	int stride = 4 * (m / 4 - 1);
+	return stride < 0 ? stride + 1 : stride;
+}
+
+static void emit_cna(regcmd *c, const fmt_params *f, int m, int k, int n, uint32_t in_dma,
+					 uint32_t w_dma) {
+	int		 k_atom	  = 64 / f->bytes;
+	uint32_t fd_banks = feature_banks(m, k, f->bytes);
+	uint32_t w_banks  = CBUF_BANKS - fd_banks;
+
+	put(c, OP_REG_CNA, CNA_CONV_CON1, (f->precision << 7) | (f->precision << 4));
+	put(c, OP_REG_CNA, CNA_CONV_CON2, ((uint32_t)(m + 1) & 0x3FF) << 4);
+	put(c, OP_REG_CNA, CNA_CONV_CON3, (1 << 3) | 1);
+	put(c, OP_REG_CNA, CNA_DATA_SIZE0, pack(1, (uint32_t)m & 0x7FF));
+	put(c, OP_REG_CNA, CNA_DATA_SIZE1, pack((uint32_t)(k - 1) & 0xFFFF, (uint32_t)k & 0xFFFF));
+	put(c, OP_REG_CNA, CNA_DATA_SIZE2, 1);
+	put(c, OP_REG_CNA, CNA_DATA_SIZE3, (uint32_t)m & 0x3FFFF);
+	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE0, (uint32_t)(k * f->bytes * n));
+	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE1, (uint32_t)(k * f->bytes) & 0x7FFFF);
+	put(c, OP_REG_CNA, CNA_WEIGHT_SIZE2, (1 << 24) | (1 << 16) | ((uint32_t)n & 0x3FFF));
+	put(c, OP_REG_CNA, CNA_CBUF_CON0, ((w_banks & 0xF) << 4) | (fd_banks & 0xF));
+	put(c, OP_REG_CNA, CNA_CBUF_CON1, (uint32_t)((k + k_atom - 1) / k_atom) & 0x1FFF);
+	put(c, OP_REG_CNA, CNA_CVT_CON0, (1 << 3) | (1 << 1) | 1);
+	put(c, OP_REG_CNA, CNA_CVT_CON1, 1u << 16);
+	put(c, OP_REG_CNA, CNA_CVT_CON2, 1u << 16);
+	put(c, OP_REG_CNA, CNA_CVT_CON3, 1u << 16);
+	put(c, OP_REG_CNA, CNA_CVT_CON4, 1u << 16);
+	put(c, OP_REG_CNA, CNA_FC_CON0, 0);
+	put(c, OP_REG_CNA, CNA_FC_CON1, 0);
+	put(c, OP_REG_CNA, CNA_PAD_CON0, 0);
+	put(c, OP_REG_CNA, CNA_FEATURE_DATA_ADDR, in_dma);
+	put(c, OP_REG_CNA, CNA_FC_CON2, 0);
+	put(c, OP_REG_CNA, CNA_DMA_CON0, pack(0xF, 0xF));
+	put(c, OP_REG_CNA, CNA_DMA_CON1, 4);
+	put(c, OP_REG_CNA, CNA_DMA_CON2, (uint32_t)surface_stride(m) & 0xFFFFFFF);
+	put(c, OP_REG_CNA, CNA_FC_DATA_SIZE0, pack(1, (uint32_t)m & 0x7FF));
+	put(c, OP_REG_CNA, CNA_FC_DATA_SIZE1, (uint32_t)k & 0xFFFF);
+	put(c, OP_REG_CNA, CNA_DCOMP_CTRL, 0);
+	put(c, OP_REG_CNA, CNA_DCOMP_REGNUM, 0);
+	put(c, OP_REG_CNA, CNA_DCOMP_ADDR0, w_dma);
+	put_zeros(c, OP_REG_CNA, CNA_DCOMP_AMOUNT, 16);
+	put(c, OP_REG_CNA, CNA_CVT_CON5, 0);
+	put(c, OP_REG_CNA, CNA_PAD_CON1, 0);
+}
+
+static void emit_core(regcmd *c, const fmt_params *f, int m, int n) {
+	put(c, OP_REG_CORE, CORE_MISC_CFG, (f->precision << 8) | 1);
+	put(c, OP_REG_CORE, CORE_DATAOUT_SIZE_0, pack((uint32_t)(m - 1) & 0xFFFF, 0));
+	put(c, OP_REG_CORE, CORE_DATAOUT_SIZE_1, (uint32_t)(n - 1) & 0xFFFF);
+	put(c, OP_REG_CORE, CORE_CLIP_TRUNCATE, 0);
+	put(c, OP_REG_CORE, CORE_3030, 0);
+}
+
+static void emit_dpu_output(regcmd *c, const fmt_params *f, int m, int n, uint32_t out_dma) {
+	uint32_t channel = (uint32_t)(n - 1) & 0x1FFF;
+
+	put(c, OP_REG_DPU, DPU_FEATURE_MODE_CFG, (0xF << 5) | (2 << 1));
+	put(c, OP_REG_DPU, DPU_DATA_FORMAT,
+		((uint32_t)PREC_FLOAT32 << 29) | (f->dpu_precision << 26) | f->dpu_precision);
+	put(c, OP_REG_DPU, DPU_OFFSET_PEND, 0);
+	put(c, OP_REG_DPU, DPU_DST_BASE_ADD, out_dma);
+	put(c, OP_REG_DPU, DPU_DST_SURF_STRIDE, ((uint32_t)m & 0xFFFFFFF) << 4);
+	put(c, OP_REG_DPU, DPU_DATA_CUBE_WIDTH, 0);
+	put(c, OP_REG_DPU, DPU_DATA_CUBE_HEIGHT, (uint32_t)(m - 1) & 0x1FFF);
+	put(c, OP_REG_DPU, DPU_DATA_CUBE_NOTCH_ADDR, 0);
+	put(c, OP_REG_DPU, DPU_DATA_CUBE_CHANNEL, pack(channel, channel));
+}
+
+static void emit_dpu_bypass(regcmd *c, int m, int n) {
+	uint32_t bypass_all = (1 << 6) | (1 << 4) | (1 << 1) | 1;
+
+	put(c, OP_REG_DPU, DPU_BS_CFG, bypass_all);
+	put(c, OP_REG_DPU, DPU_BS_ALU_CFG, 0);
+	put(c, OP_REG_DPU, DPU_BS_MUL_CFG, 0);
+	put(c, OP_REG_DPU, DPU_BS_RELUX_CMP_VALUE, 0);
+	put(c, OP_REG_DPU, DPU_BS_OW_CFG, (3 << 8) | (3 << 5) | (3 << 2) | (1 << 1));
+	put(c, OP_REG_DPU, DPU_BS_OW_OP, 0);
+	put(c, OP_REG_DPU, DPU_WDMA_SIZE_0, (uint32_t)(n - 1) & 0x1FFF);
+	put(c, OP_REG_DPU, DPU_WDMA_SIZE_1, pack((uint32_t)(m - 1) & 0x1FFF, 0));
+	put(c, OP_REG_DPU, DPU_BN_CFG, bypass_all);
+	put(c, OP_REG_DPU, DPU_BN_ALU_CFG, 0);
+	put(c, OP_REG_DPU, DPU_BN_MUL_CFG, 0);
+	put(c, OP_REG_DPU, DPU_BN_RELUX_CMP_VALUE, 0);
+	put(c, OP_REG_DPU, DPU_EW_CFG, (1 << 9) | (1 << 8) | (1 << 7) | (1 << 1) | 1);
+	put(c, OP_REG_DPU, DPU_EW_CVT_OFFSET_VALUE, 0);
+	put(c, OP_REG_DPU, DPU_EW_CVT_SCALE_VALUE, 1);
+	put(c, OP_REG_DPU, DPU_EW_RELUX_CMP_VALUE, 0);
+	put(c, OP_REG_DPU, DPU_OUT_CVT_OFFSET, 0);
+	put(c, OP_REG_DPU, DPU_OUT_CVT_SCALE, 1);
+	put(c, OP_REG_DPU, DPU_OUT_CVT_SHIFT, 0);
+	put_zeros(c, OP_REG_DPU, DPU_EW_OP_VALUE_0, 8);
+	put(c, OP_REG_DPU, DPU_SURFACE_ADD, ((uint32_t)(m * 4) & 0xFFFFFFF) << 4);
+	put(c, OP_REG_DPU, DPU_40C4, 0);
+}
+
+static void emit_dpu_lut_idle(regcmd *c) {
+	static const uint32_t regs[] = {
+		DPU_LUT_CFG,
+		DPU_LUT_INFO,
+		DPU_LUT_LE_START,
+		DPU_LUT_LE_END,
+		DPU_LUT_LO_START,
+		DPU_LUT_LO_END,
+		DPU_LUT_LE_SLOPE_SCALE,
+		DPU_LUT_LE_SLOPE_SHIFT,
+		DPU_LUT_LO_SLOPE_SCALE,
+		DPU_LUT_LO_SLOPE_SHIFT,
+	};
+	for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++)
+		put(c, OP_REG_DPU, regs[i], 0);
+}
+
+int rkt_emit_matmul_fmt(uint64_t *ops, rkt_float_fmt fmt, int m, int k, int n, uint32_t in_dma,
+						uint32_t w_dma, uint32_t out_dma) {
+	regcmd	   c = {.ops = ops};
+	fmt_params f = fmt_params_for(fmt);
+
+	put(&c, OP_REG_DPU, DPU_S_POINTER, 0xE);
+	emit_cna(&c, &f, m, k, n, in_dma, w_dma);
+	emit_core(&c, &f, m, n);
+	emit_dpu_output(&c, &f, m, n, out_dma);
+	emit_dpu_bypass(&c, m, n);
+	emit_dpu_lut_idle(&c);
+	put(&c, OP_NONE, 0, 0);
+	put(&c, OP_REG_PC, PC_REGISTER_AMOUNTS, 0);
+	put(&c, OP_40, 0, 0);
+	put(&c, OP_ENABLE, PC_OPERATION_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return c.n;
+}
+
+int rkt_emit_matmul_f16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+						uint32_t out_dma) {
+	return rkt_emit_matmul_fmt(ops, RKT_FMT_F16, m, k, n, in_dma, w_dma, out_dma);
+}
+
+static uint64_t *find_op(uint64_t *ops, int n, uint32_t block_op, uint32_t reg) {
+	for (int i = 0; i < n; i++) {
+		uint64_t w = ops[i];
+		if ((uint32_t)(w >> 48) == block_op && (uint32_t)(w & 0xFFFFu) == reg)
+			return &ops[i];
+	}
+	return NULL;
+}
+
+static void set_op(uint64_t *ops, int n, uint32_t block_op, uint32_t reg, uint32_t value) {
+	uint64_t *slot = find_op(ops, n, block_op, reg);
+	if (slot)
+		*slot = ((uint64_t)block_op << 48) | ((uint64_t)value << 16) | (uint64_t)reg;
+}
+
+static uint32_t f32_bits(float v) {
+	uint32_t bits;
+	memcpy(&bits, &v, sizeof(bits));
+	return bits;
+}
+
+static uint16_t f32_to_f16_bits(float v) {
+	_Float16 h = (_Float16)v;
+	uint16_t bits;
+	memcpy(&bits, &h, sizeof(bits));
+	return bits;
+}
+
+int rkt_emit_matmul_f16_act(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							uint32_t out_dma, const rkt_post_cfg *post) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	if (!post || post->act == RKT_ACT_NONE)
+		return n_ops;
+
+	uint32_t bs = 0, alu = 0, mul = 0, cmp = 0;
+	switch (post->act) {
+	case RKT_ACT_RELU:
+		bs = DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_MUL_BYPASS(1);
+		break;
+	case RKT_ACT_RELUX:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELUX_EN(1);
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_PRELU:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1) | DPU_BS_CFG_MUL_PRELU(1);
+		mul = (uint32_t)f32_to_f16_bits(post->prelu_alpha) << 16;
+		break;
+	case RKT_ACT_ADDC:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		break;
+	case RKT_ACT_MULC:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	case RKT_ACT_AFFINE:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	case RKT_ACT_SUBC:
+		bs	= DPU_BS_CFG_ALU_ALGO(4) | DPU_BS_CFG_MUL_BYPASS(1) | DPU_BS_CFG_RELU_BYPASS(1);
+		alu = f32_bits(post->addc);
+		break;
+	case RKT_ACT_RELU6_ALU:
+		bs	= DPU_BS_CFG_ALU_ALGO(2) | DPU_BS_CFG_RELUX_EN(1) | DPU_BS_CFG_MUL_BYPASS(1);
+		alu = f32_bits(post->addc);
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_RELU6_MUL:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1) | DPU_BS_CFG_RELUX_EN(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		cmp = f32_bits(post->relux_max);
+		break;
+	case RKT_ACT_MUL_RELU:
+		bs	= DPU_BS_CFG_ALU_BYPASS(1);
+		mul = (uint32_t)f32_to_f16_bits(post->mulc) << 16;
+		break;
+	default:
+		return n_ops;
+	}
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_CFG, bs);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_ALU_CFG, alu);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_MUL_CFG, mul);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_RELUX_CMP_VALUE, cmp);
+	return n_ops;
+}
+
+static void apply_lut(uint64_t *ops, int n_ops, const rkt_lut_cfg *cfg) {
+	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, 0x302);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_CFG, DPU_LUT_CFG_ROAD_SEL(0));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_INFO, DPU_LUT_INFO_LE_INDEX_SELECT((uint32_t)cfg->sel));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_START, (uint32_t)cfg->start);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_END, (uint32_t)cfg->end);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SCALE, cfg->tail_slope << 16);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_LUT_LE_SLOPE_SHIFT, 0);
+}
+
+int rkt_emit_matmul_f16_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							uint32_t out_dma, const rkt_lut_cfg *cfg) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	if (cfg && cfg->kind != RKT_LUT_NONE)
+		apply_lut(ops, n_ops, cfg);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_act_lut(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+								uint32_t out_dma, const rkt_lut_cfg *cfg, float mulc) {
+	rkt_post_cfg post  = {.act = RKT_ACT_MULC, .mulc = mulc};
+	int			 n_ops = rkt_emit_matmul_f16_act(ops, m, k, n, in_dma, w_dma, out_dma, &post);
+	apply_lut(ops, n_ops, cfg);
+	return n_ops;
+}
+
+int rkt_ew_operand_index(int m, int row, int channel) {
+	int b = channel >> 3;
+	return ((b + 1) / 2) * (16 * m) + (b / 2) * (8 * m) + row * 8 + (channel & 7);
+}
+
+static int add_ew_operand(uint64_t *ops, int n_ops, int m, int n, uint32_t operand_dma) {
+	int tail   = 4;
+	int extra  = 18;
+	int insert = n_ops - tail;
+	if (n_ops + extra > RKT_REGCMD_MAX_OPS)
+		return 0;
+
+	memmove(ops + insert + extra, ops + insert, (size_t)tail * sizeof(uint64_t));
+	regcmd	 c		 = {.ops = ops, .n = insert};
+	uint32_t surface = (uint32_t)m * RKT_EW_SURFACE_CHANNELS * 2;
+	uint32_t notch	 = (2u * (uint32_t)m) << 4;
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_S_POINTER, 0xE);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_WIDTH, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_HEIGHT, (uint32_t)(m - 1) & 0x1FFF);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_DATA_CUBE_CHANNEL, (uint32_t)(n - 1) & 0x1FFF);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SRC_BASE_ADDR, operand_dma);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BRDMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BS_BASE_ADDR, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_NRDMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_BN_BASE_ADDR, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_ERDMA_CFG, DPU_RDMA_ERDMA_CFG_F16);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_BASE_ADDR, operand_dma + surface);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_SURF_STRIDE, ((uint32_t)m & 0xFFFFFFF) << 4);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_FEATURE_MODE_CFG, DPU_RDMA_FEATURE_MODE_CFG_F16);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SRC_DMA_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_SURF_NOTCH, notch);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_PAD_CFG, 0);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_WEIGHT, 0x01010101);
+	put(&c, OP_REG_DPU_RDMA, DPU_RDMA_EW_SURF_NOTCH, notch);
+	n_ops += extra;
+	set_op(ops, n_ops, OP_ENABLE, PC_OPERATION_ENABLE,
+		   PC_ENABLE_DPU_RDMA | PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return n_ops;
+}
+
+static void apply_out16(uint64_t *ops, int n_ops, int m, int surface_groups) {
+	set_op(ops, n_ops, OP_REG_DPU, DPU_DATA_FORMAT,
+		   ((uint32_t)PREC_FLOAT16 << 29) | ((uint32_t)PREC_FLOAT16 << 26) | PREC_FLOAT16);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_BS_OW_CFG, (1 << 8) | (1 << 5) | (1 << 2) | (1 << 1));
+	set_op(ops, n_ops, OP_REG_DPU, DPU_OUT_CVT_SCALE, (1u << 16) | 1);
+	set_op(ops, n_ops, OP_REG_DPU, DPU_SURFACE_ADD,
+		   ((uint32_t)(m * surface_groups) & 0xFFFFFFF) << 4);
+}
+
+int rkt_emit_matmul_f16_ewadd(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, uint32_t operand_dma) {
+	int n_ops = add_ew_operand(ops, rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma), m, n,
+							   operand_dma);
+	if (n_ops)
+		set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_ADD_F16);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_ewmul_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+									uint32_t w_dma, uint32_t out_dma, uint32_t operand_dma,
+									float mulc, int surface_groups) {
+	rkt_post_cfg post  = {.act = RKT_ACT_MULC, .mulc = mulc};
+	int			 n_ops = rkt_emit_matmul_f16_act(ops, m, k, n, in_dma, w_dma, out_dma, &post);
+	n_ops			   = add_ew_operand(ops, n_ops, m, n, operand_dma);
+	if (!n_ops)
+		return 0;
+	set_op(ops, n_ops, OP_REG_DPU, DPU_EW_CFG, DPU_EW_CFG_MUL_F16);
+	apply_out16(ops, n_ops, m, surface_groups);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_lut_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma,
+								  uint32_t w_dma, uint32_t out_dma, const rkt_lut_cfg *cfg,
+								  int surface_groups) {
+	int n_ops = rkt_emit_matmul_f16_lut(ops, m, k, n, in_dma, w_dma, out_dma, cfg);
+	apply_out16(ops, n_ops, m, surface_groups);
+	return n_ops;
+}
+
+int rkt_emit_matmul_f16_out16(uint64_t *ops, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+							  uint32_t out_dma, int surface_groups) {
+	int n_ops = rkt_emit_matmul_f16(ops, m, k, n, in_dma, w_dma, out_dma);
+	apply_out16(ops, n_ops, m, surface_groups);
+	return n_ops;
+}
+
+int rkt_emit_lut_upload(uint64_t *ops, int table, int start, const uint16_t *words, int count,
+						uint32_t in_dma, uint32_t w_dma, uint32_t out_dma) {
+	if (count < 1 || count > RKT_LUT_UPLOAD_CHUNK)
+		return 0;
+	int n	  = rkt_emit_matmul_f16(ops, 1, RKT_K_ALIGN, RKT_N_ALIGN, in_dma, w_dma, out_dma);
+	int extra = count + 1;
+	if (n + extra > RKT_REGCMD_MAX_OPS)
+		return 0;
+
+	memmove(ops + n - 4 + extra, ops + n - 4, 4 * sizeof(uint64_t));
+	int idx = n - 4;
+	ops[idx++] =
+		((uint64_t)OP_REG_DPU << 48) |
+		((uint64_t)(DPU_LUT_ACCESS_CFG_TYPE(1) | DPU_LUT_ACCESS_CFG_TABLE_ID((uint32_t)table) |
+					DPU_LUT_ACCESS_CFG_ADDR((uint32_t)start))
+		 << 16) |
+		(uint64_t)DPU_LUT_ACCESS_CFG;
+	for (int i = 0; i < count; i++)
+		ops[idx++] = ((uint64_t)OP_REG_DPU << 48) | ((uint64_t)words[i] << 16) |
+					 (uint64_t)DPU_LUT_ACCESS_DATA;
+	return n + extra;
+}
+
+int rkt_emit_quant(uint64_t *ops, int bits, int m, int k, int n, uint32_t in_dma, uint32_t w_dma,
+				   uint32_t out_dma) {
+	regcmd	 c	= {.ops = ops};
+	uint32_t um = (uint32_t)m, uk = (uint32_t)k, un = (uint32_t)n;
+	uint32_t kbytes	   = uk * (uint32_t)bits / 8;
+	uint32_t precision = bits == 4 ? RKT_PRECISION_INT4 : RKT_PRECISION_INT8;
+	uint32_t conv_con1 = (precision << 4) | (precision << 7);
+	int		 banks	   = (int)((um * kbytes + 32767) / 32768);
+	if (banks < 1)
+		banks = 1;
+	uint32_t cbuf = (uint32_t)(((12 - banks) << 4) | banks);
+
+	put(&c, OP_REG_CNA, 0x1040, cbuf);
+	put(&c, OP_REG_CNA, 0x1104, 0);
+	put(&c, OP_REG_CNA, 0x1100, 0);
+	put(&c, OP_REG_CNA, 0x100c, conv_con1);
+	put(&c, OP_REG_DPU, 0x4004, 0xE);
+	put(&c, OP_REG_CNA, 0x100c, conv_con1);
+	put(&c, OP_REG_CNA, 0x1010, 2u << 4);
+	put(&c, OP_REG_CNA, 0x1014, 9);
+	put(&c, OP_REG_CNA, 0x1020, (um << 16) | 1u);
+	put(&c, OP_REG_CNA, 0x1024, ((uk - 1) << 16) | uk);
+	put(&c, OP_REG_CNA, 0x1028, um);
+	put(&c, OP_REG_CNA, 0x102c, um);
+	put(&c, OP_REG_CNA, 0x1030, kbytes * un);
+	put(&c, OP_REG_CNA, 0x1034, kbytes);
+	put(&c, OP_REG_CNA, 0x1038, 0x01010000u | un);
+	put(&c, OP_REG_CNA, 0x1040, cbuf);
+	put(&c, OP_REG_CNA, 0x1044, um * ((kbytes + 63) / 64));
+	put(&c, OP_REG_CNA, 0x104c, 0xB);
+	for (uint32_t reg = 0x1050; reg <= 0x105c; reg += 4)
+		put(&c, OP_REG_CNA, reg, 0x10000);
+	put(&c, OP_REG_CNA, 0x1060, 0);
+	put(&c, OP_REG_CNA, 0x1064, 0);
+	put(&c, OP_REG_CNA, 0x1068, 0);
+	put(&c, OP_REG_CNA, 0x1070, in_dma);
+	put(&c, OP_REG_CNA, 0x1074, 0);
+	put(&c, OP_REG_CNA, 0x1078, 0xF000F);
+	put(&c, OP_REG_CNA, 0x107c, 4 * um);
+	put(&c, OP_REG_CNA, 0x1080, (uint32_t)(-3 * m) & 0xFFFFFFFu);
+	put(&c, OP_REG_CNA, 0x1084, (um << 16) | 1u);
+	put(&c, OP_REG_CNA, 0x1088, uk);
+	put(&c, OP_REG_CNA, 0x1100, 0);
+	put(&c, OP_REG_CNA, 0x1104, 0);
+	put(&c, OP_REG_CNA, 0x1110, w_dma);
+	put_zeros(&c, OP_REG_CNA, 0x1140, 18);
+	put(&c, OP_REG_CORE, 0x3010, (precision << 8) | 1u);
+	put(&c, OP_REG_CORE, 0x3014, um - 1);
+	put(&c, OP_REG_CORE, 0x3018, un - 1);
+	put(&c, OP_REG_CORE, 0x301c, 0);
+	put(&c, OP_REG_CORE, 0x3030, 0);
+	put(&c, OP_REG_DPU, 0x400c, 0x1E4);
+	put(&c, OP_REG_DPU, 0x4010, bits == 4 ? 0x38000006u : ((uint32_t)RKT_PRECISION_INT32 << 29));
+	put(&c, OP_REG_DPU, 0x4014, 0);
+	put(&c, OP_REG_DPU, 0x4020, out_dma);
+	put(&c, OP_REG_DPU, 0x4024, 16 * um);
+	put(&c, OP_REG_DPU, 0x4030, um - 1);
+	put(&c, OP_REG_DPU, 0x4034, 0);
+	put(&c, OP_REG_DPU, 0x4038, 0);
+	put(&c, OP_REG_DPU, 0x403c, ((un - 1) << 16) | (un - 1));
+	put(&c, OP_REG_DPU, 0x4040, 0x53);
+	put_zeros(&c, OP_REG_DPU, 0x4044, 3);
+	put(&c, OP_REG_DPU, 0x4050, 0x7FE);
+	put(&c, OP_REG_DPU, 0x4054, 0);
+	put(&c, OP_REG_DPU, 0x4058, un - 1);
+	put(&c, OP_REG_DPU, 0x405c, um - 1);
+	put(&c, OP_REG_DPU, 0x4060, 0x53);
+	put_zeros(&c, OP_REG_DPU, 0x4064, 3);
+	put(&c, OP_REG_DPU, 0x4070, 0x383);
+	put(&c, OP_REG_DPU, 0x4074, 0);
+	put(&c, OP_REG_DPU, 0x4078, 1);
+	put(&c, OP_REG_DPU, 0x407c, 0);
+	put(&c, OP_REG_DPU, 0x4080, 0);
+	put(&c, OP_REG_DPU, 0x4084, 1);
+	put(&c, OP_REG_DPU, 0x4088, 0);
+	put_zeros(&c, OP_REG_DPU, 0x4090, 8);
+	put(&c, OP_REG_DPU, 0x40C0, 128 * um);
+	put(&c, OP_REG_DPU, 0x40C4, 0);
+	put_zeros(&c, OP_REG_DPU, 0x4108, 10);
+	put(&c, OP_NONE, 0, 0);
+	put(&c, OP_REG_PC, PC_REGISTER_AMOUNTS, 0);
+	put(&c, OP_40, 0, 0);
+	put(&c, OP_ENABLE, PC_OPERATION_ENABLE, PC_ENABLE_DPU | PC_ENABLE_CNA | PC_ENABLE);
+	return c.n;
+}
