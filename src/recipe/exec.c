@@ -603,10 +603,18 @@ static status_code part_run_transfer(model *m, compute_scratch *s, const part_pl
 	batch_scratch *to	= part_scratch(m, s, node->be);
 	if (!from || !to)
 		return ERR_UNSUPPORTED;
-	for (int c = 0; c < p->n_carry; c++) {
-		status_code st = compute_copy_buffer_cross(s, batch_slot(from, p->carry[c].slot),
-												   batch_slot(to, p->carry[c].slot),
-												   n_rows * p->carry[c].row_elems);
+	for (int c = 0; c < p->n_carry; c += 2) {
+		const part_carry *a	 = &p->carry[c];
+		status_code		  st = OK;
+		if (c + 1 < p->n_carry) {
+			const part_carry *b = &p->carry[c + 1];
+			st					= compute_copy_buffer_cross_pair(
+							s, batch_slot(from, a->slot), batch_slot(to, a->slot), n_rows * a->row_elems,
+							batch_slot(from, b->slot), batch_slot(to, b->slot), n_rows * b->row_elems);
+		} else {
+			st = compute_copy_buffer_cross(s, batch_slot(from, a->slot), batch_slot(to, a->slot),
+										   n_rows * a->row_elems);
+		}
 		if (st != OK)
 			return st;
 	}

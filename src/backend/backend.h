@@ -133,6 +133,7 @@ typedef struct {
 	const void *host_data;
 	const char *name;
 	int			release_host_source;
+	int			repack;
 	status_code (*read_fn)(void *ctx, size_t off, void *dst, size_t len);
 	void *read_ctx;
 } tensor_desc;

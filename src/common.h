@@ -40,6 +40,7 @@ typedef enum {
 	ERR_INTERRUPTED	  = -8,
 	ERR_FALLBACK	  = -9,
 	ERR_COMPUTE_FAIL  = -10,
+	ERR_BUSY		  = -11,
 } status_code;
 
 void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);

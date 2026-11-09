@@ -141,6 +141,8 @@ void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, voi
 
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
+status_code compute_copy_buffer_cross_pair(compute_scratch *s, const buffer *src_a, buffer *dst_a,
+										   int n_a, const buffer *src_b, buffer *dst_b, int n_b);
 
 int compute_device_index(const compute_scratch *s, const backend *b);
 

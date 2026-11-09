@@ -1,6 +1,7 @@
 #include "rpc/rpc.h"
 #include "backend/backend.h"
 #include "log.h"
+#include "profile.h"
 
 #include <stdio.h>
 
@@ -24,10 +25,22 @@ typedef struct {
 } rpc_table;
 
 typedef struct {
+	uint32_t type;
+	uint64_t d0;
+	uint64_t d1;
+	uint32_t re_type;
+} rpc_plan_entry;
+
+typedef struct {
 	rpc_conn		conn;
 	pthread_mutex_t table_mtx;
 	char			desc[RPC_IDENT_MAX];
 	char			device[BACKEND_DEVICE_NAME_MAX];
+	uint64_t		mem_total;
+	uint64_t		mem_avail;
+	uint64_t		mem_avail_us;
+	rpc_plan_entry	plans[RPC_PLAN_CACHE];
+	int				n_plans;
 	uint8_t			type_native[RPC_TYPE_MAX];
 	int				sent_neox;
 	float			sent_theta;
@@ -416,6 +429,10 @@ static status_code stub_buffer_write_f32(backend *self, buffer *buf, const float
 	return op_send(self, RPC_OP_buffer_write_f32, &w);
 }
 
+static void invalidate_mem(backend *self) {
+	priv_of(self)->mem_avail_us = 0;
+}
+
 static status_code call_alloc(backend *self, uint32_t op, rpc_wr *w, buffer *out) {
 	rpc_reply	r;
 	status_code s = op_call(self, op, w, &r);
@@ -426,8 +443,10 @@ static status_code call_alloc(backend *self, uint32_t op, rpc_wr *w, buffer *out
 	uint32_t id	  = rpc_rd_u32(&rd);
 	uint64_t size = rpc_rd_u64(&rd);
 	s			  = rd.bad ? ERR_FORMAT : OK;
-	if (s == OK)
+	if (s == OK) {
 		fill_buffer(self, out, id, size);
+		invalidate_mem(self);
+	}
 	rpc_reply_free(&r);
 	return s;
 }
@@ -445,6 +464,7 @@ static void stub_buffer_free(backend *self, buffer *buf) {
 	rpc_wr w;
 	rpc_wr_init(&w);
 	rpc_wr_u32(&w, (uint32_t)(uintptr_t)buf->handle);
+	invalidate_mem(self);
 	op_send(self, RPC_OP_buffer_free, &w);
 }
 
@@ -490,6 +510,7 @@ static status_code stub_buffer_alloc_weight(backend *self, const tensor_desc *de
 	rpc_wr_i32(&w, desc->n_dims);
 	for (int i = 0; i < 4; i++)
 		rpc_wr_u64(&w, desc->dims[i]);
+	rpc_wr_u8(&w, desc->repack != 0);
 	return call_alloc(self, RPC_OP_buffer_alloc_weight, &w, out);
 }
 
@@ -550,6 +571,7 @@ static status_code stub_kv_alloc(backend *self, const kv_desc *d, buffer *k_out,
 	if (s == OK) {
 		fill_buffer(self, k_out, kid, ksize);
 		fill_buffer(self, v_out, vid, vsize);
+		invalidate_mem(self);
 	}
 	rpc_reply_free(&r);
 	return s;
@@ -716,11 +738,61 @@ static size_t call_size(backend *self, uint32_t op) {
 }
 
 static size_t stub_mem_available(backend *self) {
-	return call_size(self, RPC_OP_mem_available);
+	rpc_priv *p	  = priv_of(self);
+	uint64_t  now = time_us();
+	if (p->mem_avail_us && now - p->mem_avail_us < RPC_MEM_CACHE_US)
+		return p->mem_avail;
+	p->mem_avail	 = call_size(self, RPC_OP_mem_available);
+	p->mem_avail_us = now ? now : 1;
+	return p->mem_avail;
 }
 
 static size_t stub_mem_total(backend *self) {
-	return call_size(self, RPC_OP_mem_total);
+	rpc_priv *p = priv_of(self);
+	if (!p->mem_total)
+		p->mem_total = call_size(self, RPC_OP_mem_total);
+	return p->mem_total;
+}
+
+static status_code query_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
+									 uint32_t *re_type) {
+	rpc_wr w;
+	rpc_wr_init(&w);
+	rpc_wr_u32(&w, type);
+	rpc_wr_u64(&w, d0);
+	rpc_wr_u64(&w, d1);
+	rpc_reply	r;
+	status_code s = op_call(self, RPC_OP_repack_plan, &w, &r);
+	if (s != OK)
+		return s;
+	rpc_rd rd;
+	rpc_rd_init(&rd, r.data, r.len);
+	*re_type = rpc_rd_u32(&rd);
+	s		 = rd.bad ? ERR_FORMAT : OK;
+	rpc_reply_free(&r);
+	return s;
+}
+
+static status_code stub_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
+									uint32_t *re_type_out) {
+	rpc_priv *p = priv_of(self);
+	for (int i = 0; i < p->n_plans; i++) {
+		const rpc_plan_entry *e = &p->plans[i];
+		if (e->type == type && e->d0 == d0 && e->d1 == d1) {
+			*re_type_out = e->re_type;
+			return e->re_type ? OK : ERR_UNSUPPORTED;
+		}
+	}
+	uint32_t	 re_type = 0;
+	status_code s		 = query_repack_plan(self, type, d0, d1, &re_type);
+	if (s != OK)
+		return s;
+	if (p->n_plans < RPC_PLAN_CACHE)
+		p->plans[p->n_plans++] = (rpc_plan_entry){type, d0, d1, re_type};
+	if (!re_type)
+		return ERR_UNSUPPORTED;
+	*re_type_out = re_type;
+	return OK;
 }
 
 static status_code rpc_backend_probe(void) {
@@ -747,6 +819,23 @@ static status_code rpc_backend_identity(int device_index, char *out, size_t cap)
 	else
 		snprintf(out, cap, "%s (unreachable)", addr);
 	return OK;
+}
+
+static void read_hello_exts(rpc_rd *rd, rpc_priv *p) {
+	if (rd->pos >= rd->len)
+		return;
+	uint16_t n = rpc_rd_u16(rd);
+	for (uint16_t i = 0; i < n && !rd->bad; i++) {
+		uint16_t	   id	= rpc_rd_u16(rd);
+		uint16_t	   len = rpc_rd_u16(rd);
+		const uint8_t *v   = rpc_rd_bytes(rd, len);
+		if (!v)
+			return;
+		if (id == RPC_EXT_DEVICE)
+			snprintf(p->device, sizeof(p->device), "%.*s", (int)len, (const char *)v);
+		else if (id == RPC_EXT_MEM_TOTAL && len == sizeof(p->mem_total))
+			memcpy(&p->mem_total, v, sizeof(p->mem_total));
+	}
 }
 
 static status_code hello(backend *self, rpc_priv *p, bool *present) {
@@ -777,7 +866,8 @@ static status_code hello(backend *self, rpc_priv *p, bool *present) {
 	const uint8_t *types = rpc_rd_bytes(&rd, RPC_TYPE_MAX);
 	if (types)
 		memcpy(p->type_native, types, RPC_TYPE_MAX);
-	rpc_rd_str(&rd, p->device, sizeof(p->device));
+	snprintf(p->device, sizeof(p->device), "%s", p->desc);
+	read_hello_exts(&rd, p);
 	self->caps = (caps & ~(uint64_t)RPC_FORWARD_MASK) | BCAP_REMOTE;
 	s		   = rd.bad ? ERR_FORMAT : OK;
 	rpc_reply_free(&r);

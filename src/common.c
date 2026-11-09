@@ -66,6 +66,8 @@ const char *status_str(status_code s) {
 		return "fallback";
 	case ERR_COMPUTE_FAIL:
 		return "compute failed";
+	case ERR_BUSY:
+		return "busy";
 	default:
 		return "unknown";
 	}

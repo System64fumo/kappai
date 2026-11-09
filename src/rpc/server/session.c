@@ -35,6 +35,7 @@ static bool op_is_sync(uint32_t op) {
 	case RPC_OP_mem_available:
 	case RPC_OP_mem_total:
 	case RPC_OP_synchronize:
+	case RPC_OP_repack_plan:
 		return true;
 	default:
 		return false;
@@ -139,6 +140,26 @@ static bool retained(const buffer *b, const void *data) {
 	return b->handle == data || b->host_ptr == data;
 }
 
+static status_code repack_upload(srv_session *s, tensor_desc *d, void **packed) {
+	backend *be = s->be;
+	uint32_t re = 0;
+	*packed		= NULL;
+	if (d->n_dims != 2 || !backend_has_cap(be, BCAP_IS_HOST) || !be->repack_plan ||
+		!be->repack_weight ||
+		be->repack_plan(be, d->type, d->dims[0], d->dims[1], &re) != OK || !re)
+		return OK;
+	void *dst = xmalloc_aligned(ggml_row_size(re, (size_t)d->dims[0]) * (size_t)d->dims[1], 64);
+	status_code st = be->repack_weight(be, d->type, s->upload, dst, (int)d->dims[1], (int)d->dims[0]);
+	if (st != OK) {
+		free(dst);
+		return st;
+	}
+	d->type		 = re;
+	d->host_data = dst;
+	*packed		 = dst;
+	return OK;
+}
+
 static status_code op_alloc_weight(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	backend	   *be = s->be;
 	tensor_desc d  = {0};
@@ -146,23 +167,45 @@ static status_code op_alloc_weight(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	d.n_dims	   = rpc_rd_i32(rd);
 	for (int i = 0; i < 4; i++)
 		d.dims[i] = rpc_rd_u64(rd);
+	d.repack = rpc_rd_u8(rd);
 	if (rd->bad || d.n_dims < 1 || d.n_dims > 4)
 		return ERR_FORMAT;
 	size_t total = rpc_tensor_bytes(d.type, d.n_dims, d.dims);
 	if (!upload_ready(s, total))
 		return ERR_FORMAT;
 	d.host_data	   = s->upload;
-	buffer		b  = {0};
-	status_code st = be->buffer_alloc_weight(be, &d, &b);
-	void	   *up = s->upload;
-	s->upload	   = NULL;
-	upload_drop(s);
+	void	   *packed = NULL;
+	status_code st	   = d.repack ? repack_upload(s, &d, &packed) : OK;
+	if (st != OK)
+		return st;
+	size_t stored = packed ? rpc_tensor_bytes(d.type, d.n_dims, d.dims) : total;
+	void  *keep	  = packed ? packed : s->upload;
+	buffer b	  = {0};
+	st			  = be->buffer_alloc_weight(be, &d, &b);
+	if (packed)
+		upload_drop(s);
+	else
+		s->upload = NULL;
 	if (st != OK) {
-		free(up);
+		free(keep);
 		return st;
 	}
-	b.size = MAX(b.size, total);
-	return reply_alloc(s, out, &b, up, retained(&b, up));
+	b.size = MAX(b.size, stored);
+	return reply_alloc(s, out, &b, keep, retained(&b, keep));
+}
+
+static status_code op_repack_plan(srv_session *s, rpc_rd *rd, rpc_wr *out) {
+	uint32_t type = rpc_rd_u32(rd);
+	uint64_t d0	  = rpc_rd_u64(rd);
+	uint64_t d1	  = rpc_rd_u64(rd);
+	if (rd->bad)
+		return ERR_FORMAT;
+	uint32_t re = 0;
+	if (!backend_has_cap(s->be, BCAP_IS_HOST) || !s->be->repack_plan ||
+		s->be->repack_plan(s->be, type, d0, d1, &re) != OK)
+		re = 0;
+	rpc_wr_u32(out, re);
+	return OK;
 }
 
 static status_code op_alloc_from_host(srv_session *s, rpc_rd *rd, rpc_wr *out) {
@@ -584,6 +627,8 @@ static status_code exec_special(srv_session *s, rpc_msg *msg, uint32_t op, rpc_w
 		return op_alloc_scratch(s, rd, out);
 	case RPC_OP_buffer_alloc_from_host:
 		return op_alloc_from_host(s, rd, out);
+	case RPC_OP_repack_plan:
+		return op_repack_plan(s, rd, out);
 	case RPC_OP_dequant_weight:
 		return op_dequant_weight(s, rd, out);
 	case RPC_OP_buffer_free:
@@ -650,6 +695,10 @@ static status_code exec_special(srv_session *s, rpc_msg *msg, uint32_t op, rpc_w
 	}
 }
 
+static pthread_mutex_t g_lease_mtx = PTHREAD_MUTEX_INITIALIZER;
+static backend		  *g_shared_be = NULL;
+static bool			   g_leased	   = false;
+
 static status_code ensure_backend(srv_session *s) {
 	if (s->be)
 		return OK;
@@ -657,12 +706,33 @@ static status_code ensure_backend(srv_session *s) {
 	int	 index = 0;
 	if (backend_parse_device(s->device, name, sizeof(name), &index) != 0)
 		return ERR_INVALID_ARG;
-	status_code st = backend_create(name, index, &s->be);
+	pthread_mutex_lock(&g_lease_mtx);
+	status_code st = g_leased ? ERR_BUSY : OK;
+	if (st == OK && !g_shared_be)
+		st = backend_create(name, index, &g_shared_be);
 	if (st == OK) {
+		g_leased	 = true;
+		s->be		 = g_shared_be;
 		s->emulate_moe = backend_has_cap(s->be, BCAP_IS_HOST) && !s->be->moe_expert_ffn;
-		INFO("rpc: session opened device '%s' (%s)", s->device, s->be->name);
 	}
+	pthread_mutex_unlock(&g_lease_mtx);
+	if (st == ERR_BUSY)
+		WARN("rpc: refusing session, device '%s' is in use by another client", s->device);
+	else if (st == OK)
+		INFO("rpc: session opened device '%s' (%s)", s->device, s->be->name);
 	return st;
+}
+
+static void release_backend(srv_session *s) {
+	if (!s->be)
+		return;
+	if (s->be->synchronize)
+		s->be->synchronize(s->be);
+	backend_release_thread(s->be);
+	pthread_mutex_lock(&g_lease_mtx);
+	g_leased = false;
+	pthread_mutex_unlock(&g_lease_mtx);
+	s->be = NULL;
 }
 
 static status_code reply_info(srv_session *s, rpc_rd *rd, rpc_wr *out) {
@@ -675,6 +745,12 @@ static status_code reply_info(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	rpc_wr_str(out, s->device);
 	rpc_wr_str(out, identity);
 	return OK;
+}
+
+static void write_ext(rpc_wr *out, uint16_t id, const void *p, size_t len) {
+	rpc_wr_u16(out, id);
+	rpc_wr_u16(out, (uint16_t)len);
+	rpc_wr_bytes(out, p, len);
 }
 
 static status_code reply_hello(srv_session *s, rpc_rd *rd, rpc_wr *out) {
@@ -712,7 +788,10 @@ static status_code reply_hello(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	for (uint32_t t = 0; t < RPC_TYPE_MAX; t++)
 		types[t] = !be->matmul_type_native || be->matmul_type_native(be, t);
 	rpc_wr_bytes(out, types, sizeof(types));
-	rpc_wr_str(out, s->device);
+	rpc_wr_u16(out, 2);
+	write_ext(out, RPC_EXT_DEVICE, s->device, strlen(s->device));
+	uint64_t mem_total = backend_mem_total(be);
+	write_ext(out, RPC_EXT_MEM_TOTAL, &mem_total, sizeof(mem_total));
 	return OK;
 }
 
@@ -749,10 +828,9 @@ static status_code exec_frame(srv_session *s, uint32_t op, const uint8_t *p, siz
 static void session_close(srv_session *s) {
 	for (uint32_t i = 0; i < s->n_bufs; i++)
 		buf_release(s, i + 1);
+	release_backend(s);
 	for (size_t i = 0; i < ARRAY_LEN(s->tables); i++)
 		free(s->tables[i].data);
-	if (s->be)
-		backend_destroy(s->be);
 	free(s->bufs);
 	free(s->upload);
 	free(s->ws.p);

@@ -18,47 +18,54 @@
 #define RPC_MAX_VALS 160
 #define RPC_MAX_BUFS 2048
 #define RPC_MAX_TABLES 32
-#define RPC_TYPE_MAX 64
+#define RPC_TYPE_MAX 128
 #define RPC_CONNECT_TIMEOUT_MS 3000
 #define RPC_WR_INLINE 1024
+#define RPC_KEEPALIVE_IDLE_S 10
+#define RPC_KEEPALIVE_INTERVAL_S 5
+#define RPC_KEEPALIVE_COUNT 3
+#define RPC_MEM_CACHE_US 1000000
+#define RPC_PLAN_CACHE 64
 
 #define RPC_FIELD_OPS(X)                                                                           \
 	X(kv_put)                                                                                      \
-	X(kv_put_batch)                                                                                \
-	X(embd_lookup)                                                                                 \
-	X(rmsnorm) X(matmul) X(matmul_residual) X(matmul_qonly) X(prequantize_x) X(add_inplace)        \
-		X(scale_inplace) X(softcap) X(split_qgate) X(attn_output_gate) X(copy_buffer)              \
-			X(ple_combine) X(ffn_activate) X(ffn_activate_ex) X(rmsnorm_per_head)                  \
-				X(rmsnorm_noweight) X(rmsnorm_noweight_per_head) X(rmsnorm_add)                    \
-					X(rmsnorm_add_batch) X(rmsnorm_add_norm_batch) X(rmsnorm_per_head_batch)       \
-						X(rmsnorm_noweight_batch) X(rmsnorm_noweight_per_head_batch)               \
-							X(matmul_ffn_down) X(matmul_ffn_down_batch) X(rmsnorm_batch)           \
-								X(matmul_batch) X(add_batch) X(ffn_activate_batch)                 \
-									X(ffn_activate_fused_batch) X(attention) X(attention_swa)      \
-										X(attention_batch) X(attention_swa_batch)                  \
-											X(attention_full_batch) X(matmul_gate_act_batch)       \
-												X(matmul_softcap_batch) X(layernorm_modulate)      \
-													X(gated_add) X(add_bias) X(activate)           \
-														X(rope_table) X(kv_put_mla)                \
+	X(kv_put_batch) X(embd_lookup) X(rmsnorm) X(matmul) X(matmul_residual) X(matmul_qonly)         \
+		X(prequantize_x) X(add_inplace) X(scale_inplace) X(softcap) X(split_qgate)                 \
+			X(attn_output_gate) X(copy_buffer) X(ple_combine) X(ffn_activate) X(ffn_activate_ex)   \
+				X(rmsnorm_per_head) X(rmsnorm_noweight) X(rmsnorm_noweight_per_head)               \
+					X(rmsnorm_add) X(rmsnorm_add_batch) X(rmsnorm_add_norm_batch)                  \
+						X(rmsnorm_per_head_batch) X(rmsnorm_noweight_batch)                        \
+							X(rmsnorm_noweight_per_head_batch) X(matmul_ffn_down)                  \
+								X(matmul_ffn_down_batch) X(rmsnorm_batch) X(matmul_batch)          \
+									X(add_batch) X(ffn_activate_batch) X(ffn_activate_fused_batch) \
+										X(attention) X(attention_swa) X(attention_batch)           \
+											X(attention_swa_batch) X(attention_full_batch)         \
+												X(matmul_gate_act_batch) X(matmul_softcap_batch)   \
+													X(layernorm_modulate) X(gated_add) X(add_bias) \
+														X(activate) X(rope_table) X(kv_put_mla)    \
 															X(moe_activate) X(moe_router_topk)
 
 #define RPC_SPECIAL_OPS(X)                                                                         \
 	X(rope)                                                                                        \
-	X(rope_qk)                                                                                     \
-	X(rope_ext)                                                                                    \
-	X(rope_ext_batch) X(rope_batch) X(qk_norm_rope) X(rope_qk_batch) X(partial_rope_qk)            \
-		X(attention_mla) X(matmul_multi) X(matmul_multi_batch) X(argmax) X(argmax_to_reg)          \
-			X(read_token_reg) X(sample) X(sample_to_reg) X(sample_history_set) X(buffer_read_f32)  \
-				X(buffer_read_f32_x2) X(buffer_write_f32) X(buffer_alloc_weight)                   \
-					X(buffer_alloc_scratch) X(buffer_free) X(buffer_alloc_from_host)               \
-						X(dequant_weight) X(kv_alloc) X(kv_free) X(kv_alloc_mla)                   \
-							X(gated_delta_net) X(hc_init) X(hc_pre) X(hc_post) X(hc_final) X(kda)  \
-								X(mla_absorbed) X(attention_dense) X(im2col3x3)                    \
+	X(rope_qk) X(rope_ext) X(rope_ext_batch) X(rope_batch) X(qk_norm_rope) X(rope_qk_batch)        \
+		X(partial_rope_qk) X(attention_mla) X(matmul_multi) X(matmul_multi_batch) X(argmax)        \
+			X(argmax_to_reg) X(read_token_reg) X(sample) X(sample_to_reg) X(sample_history_set)    \
+				X(buffer_read_f32) X(buffer_read_f32_x2) X(buffer_write_f32)                       \
+					X(buffer_alloc_weight) X(buffer_alloc_scratch) X(buffer_free)                  \
+						X(buffer_alloc_from_host) X(dequant_weight) X(kv_alloc) X(kv_free)         \
+							X(kv_alloc_mla) X(gated_delta_net) X(hc_init) X(hc_pre) X(hc_post)     \
+								X(hc_final) X(kda) X(mla_absorbed) X(attention_dense) X(im2col3x3) \
 									X(upsample_shortcut_add) X(moe_expert_ffn)                     \
 										X(moe_experts_batch) X(synchronize) X(submit)              \
 											X(begin_batch) X(end_batch) X(set_gpu_profile)         \
 												X(matmul_type_native) X(dequant_type_native)       \
+													X(repack_plan)                                    \
 													X(mem_available) X(mem_total)
+
+typedef enum {
+	RPC_EXT_DEVICE = 1,
+	RPC_EXT_MEM_TOTAL,
+} rpc_hello_ext;
 
 #define RPC_ALL_OPS(X) RPC_FIELD_OPS(X) RPC_SPECIAL_OPS(X)
 

@@ -24,6 +24,17 @@ static void usage(const char *prog) {
 		   prog, RPC_DEFAULT_BIND, RPC_DEFAULT_PORT);
 }
 
+static void set_keepalive(int fd) {
+	int on = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+	int idle = RPC_KEEPALIVE_IDLE_S, interval = RPC_KEEPALIVE_INTERVAL_S, count = RPC_KEEPALIVE_COUNT;
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+}
+
 static void *connection_thread(void *arg) {
 	conn_args *c = arg;
 	session_run(c->fd, c->device);
@@ -103,6 +114,7 @@ int main(int argc, char **argv) {
 		snprintf(args->device, sizeof(args->device), "%s", device);
 		int one = 1;
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		set_keepalive(fd);
 		pthread_t tid;
 		if (pthread_create(&tid, NULL, connection_thread, args) != 0) {
 			close(fd);
