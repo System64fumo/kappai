@@ -1,6 +1,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -76,13 +77,19 @@ static inline void madvise_hugepage(void *ptr, size_t bytes) {
 }
 
 static inline long page_size_cached(void) {
-	static long ps = 0;
-	if (ps <= 0) {
-		ps = sysconf(_SC_PAGESIZE);
-		if (ps <= 0)
-			ps = 4096;
+	static _Atomic long ps	= 0;
+	long				cur = atomic_load(&ps);
+	if (cur <= 0) {
+		long val = sysconf(_SC_PAGESIZE);
+		if (val <= 0)
+			val = 4096;
+		long expected = 0;
+		atomic_compare_exchange_strong(&ps, &expected, val);
+		cur = atomic_load(&ps);
+		if (cur <= 0)
+			cur = 4096;
 	}
-	return ps;
+	return cur;
 }
 
 static inline void prefault(void *ptr, size_t bytes) {

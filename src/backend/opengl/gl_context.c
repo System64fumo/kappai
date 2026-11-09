@@ -10,18 +10,50 @@
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
-static int open_drm_render_node(int *out_index) {
-	static const int MAX_NODES = 8;
-	for (int i = 0; i < MAX_NODES; i++) {
-		char path[64];
-		snprintf(path, sizeof(path), "/dev/dri/renderD%d", 128 + i);
-		int fd = open(path, O_RDWR | O_CLOEXEC);
-		if (fd >= 0) {
-			*out_index = i;
-			return fd;
+#define GL_MAX_RENDER_NODES 8
+
+static int g_gl_node_indices[GL_MAX_RENDER_NODES];
+static int g_gl_node_count = -1;
+
+static int open_render_node_fd(int node_index) {
+	if (node_index < 0 || node_index >= GL_MAX_RENDER_NODES)
+		return -1;
+	char path[64];
+	snprintf(path, sizeof(path), "/dev/dri/renderD%d", 128 + node_index);
+	return open(path, O_RDWR | O_CLOEXEC);
+}
+
+static void gl_enumerate_render_nodes_impl(void) {
+	if (g_gl_node_count >= 0)
+		return;
+	g_gl_node_count = 0;
+	for (int i = 0; i < GL_MAX_RENDER_NODES; i++) {
+		gl_context tmp;
+		memset(&tmp, 0, sizeof(tmp));
+		if (gl_context_init(&tmp, i) == OK) {
+			gl_context_free(&tmp);
+			if (g_gl_node_count < GL_MAX_RENDER_NODES)
+				g_gl_node_indices[g_gl_node_count++] = i;
 		}
 	}
-	return -1;
+}
+
+void gl_enumerate_render_nodes(void) {
+	gl_enumerate_render_nodes_impl();
+}
+
+int gl_render_node_count(void) {
+	if (g_gl_node_count < 0)
+		gl_enumerate_render_nodes_impl();
+	return g_gl_node_count;
+}
+
+int gl_render_node_at(int device_index) {
+	if (g_gl_node_count < 0)
+		gl_enumerate_render_nodes_impl();
+	if (device_index < 0 || device_index >= g_gl_node_count)
+		return -1;
+	return g_gl_node_indices[device_index];
 }
 
 static bool sysfs_read_u64(int fd, const char *link, uint64_t *out) {
@@ -42,11 +74,11 @@ static bool sysfs_read_u64(int fd, const char *link, uint64_t *out) {
 	return ok;
 }
 
-status_code gl_render_node_identity(char *out, size_t cap) {
-	int drm_index = 0;
-	int fd		  = open_drm_render_node(&drm_index);
+status_code gl_render_node_identity(int node_index, char *out, size_t cap) {
+	int fd = open_render_node_fd(node_index);
 	if (fd < 0)
 		return ERR_UNSUPPORTED;
+	int			drm_index = node_index;
 	struct stat st;
 	status_code s = ERR_UNSUPPORTED;
 	if (fstat(fd, &st) == 0) {
@@ -95,11 +127,9 @@ status_code gl_context_probe(void) {
 	EGLSurface prev_draw = eglGetCurrentSurface(EGL_DRAW);
 	EGLSurface prev_read = eglGetCurrentSurface(EGL_READ);
 
-	gl_context tmp;
-	memset(&tmp, 0, sizeof(tmp));
-	status_code s = gl_context_init(&tmp);
+	gl_enumerate_render_nodes_impl();
+	status_code s = (g_gl_node_count > 0) ? OK : ERR_UNSUPPORTED;
 	if (s == OK) {
-		gl_context_free(&tmp);
 		g_probed = 1;
 	} else {
 		g_probed = 0;
@@ -111,15 +141,15 @@ status_code gl_context_probe(void) {
 	return s == OK ? OK : ERR_UNSUPPORTED;
 }
 
-status_code gl_context_init(gl_context *out) {
+status_code gl_context_init(gl_context *out, int node_index) {
 	memset(out, 0, sizeof(*out));
 
-	int drm_index = 0;
-	int fd		  = open_drm_render_node(&drm_index);
+	int fd = open_render_node_fd(node_index);
 	if (fd < 0) {
-		DEBUG("gl: no /dev/dri/renderD128+ node available");
+		DEBUG("gl: render node %d unavailable", node_index);
 		return ERR_UNSUPPORTED;
 	}
+	int drm_index = node_index;
 
 	struct gbm_device *gbm = gbm_create_device(fd);
 	if (!gbm) {
@@ -259,5 +289,6 @@ void gl_context_free(gl_context *ctx) {
 		gbm_device_destroy(ctx->gbm);
 	if (ctx->drm_fd >= 0)
 		close(ctx->drm_fd);
+	eglReleaseThread();
 	memset(ctx, 0, sizeof(*ctx));
 }

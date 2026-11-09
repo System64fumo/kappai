@@ -9,6 +9,7 @@
 #include <GLES3/gl31.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -646,19 +647,27 @@ static void gl_pipeline_cache_uniforms(gl_pipeline *p) {
 	}
 }
 
+static pthread_mutex_t gl_warn_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 static void gl_pipeline_warn_missing(const gl_pipeline *p, const char *name) {
 	static const gl_pipeline *warned[32];
 	static char				  names[32][GL_UNIFORM_NAME_CAP];
 	static int				  n_warned = 0;
+	pthread_mutex_lock(&gl_warn_mtx);
 	for (int i = 0; i < n_warned; i++)
-		if (warned[i] == p && strcmp(names[i], name) == 0)
+		if (warned[i] == p && strcmp(names[i], name) == 0) {
+			pthread_mutex_unlock(&gl_warn_mtx);
 			return;
+		}
+	pthread_mutex_unlock(&gl_warn_mtx);
 	WARN("gl: pipeline '%s' has no active uniform '%s' (skipped)", p->name ? p->name : "?", name);
+	pthread_mutex_lock(&gl_warn_mtx);
 	if (n_warned < 32) {
 		warned[n_warned] = p;
 		snprintf(names[n_warned], GL_UNIFORM_NAME_CAP, "%s", name);
 		n_warned++;
 	}
+	pthread_mutex_unlock(&gl_warn_mtx);
 }
 
 static int gl_pipeline_index(gl_pipeline *p, const char *name) {
@@ -1289,13 +1298,14 @@ static status_code gl_probe(void) {
 }
 
 static int gl_device_count(void) {
-	return gl_context_probe() == OK ? 1 : 0;
+	return gl_render_node_count();
 }
 
 static status_code gl_device_identity(int device_index, char *out, size_t cap) {
-	if (device_index != 0)
+	int node = gl_render_node_at(device_index);
+	if (node < 0)
 		return ERR_INVALID_ARG;
-	return gl_render_node_identity(out, cap);
+	return gl_render_node_identity(node, out, cap);
 }
 
 static status_code gl_init(backend *self, int device_index) {
@@ -1303,7 +1313,10 @@ static status_code gl_init(backend *self, int device_index) {
 	gl_priv *p = xcalloc(1, sizeof(gl_priv));
 	self->priv = p;
 
-	status_code s = gl_context_init(&p->ctx);
+	int node = gl_render_node_at(device_index);
+	if (node < 0)
+		node = device_index;
+	status_code s = gl_context_init(&p->ctx, node);
 	if (s != OK) {
 		free(p);
 		self->priv = NULL;

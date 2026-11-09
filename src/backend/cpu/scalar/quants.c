@@ -1564,8 +1564,13 @@ void iq_qonly_via_dequant(const void *w, uint32_t wtype, const q8_k_block *restr
 	dequant_row_plan(wtype, &dq, &div);
 	size_t wb  = ggml_row_size(wtype, k);
 	int	   bpr = k / 256;
-	float *xf  = malloc((size_t)k * sizeof(float));
-	float *wf  = malloc((size_t)k * sizeof(float));
+	float *xf  = xmalloc((size_t)k * sizeof(float));
+	float *wf  = xmalloc((size_t)k * sizeof(float));
+	if (!dq) {
+		free(xf);
+		free(wf);
+		return;
+	}
 	for (int t = 0; t < m; t++) {
 		const q8_k_block *xb = xq + (size_t)t * xs;
 		for (int bi = 0; bi < bpr; bi++) {

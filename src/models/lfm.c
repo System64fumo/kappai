@@ -61,6 +61,97 @@ void recipe_emit_lfm_layer(op_emitter *e, const model *m, int li) {
 		lfm_append_attention_block(e, m, li);
 }
 
+static void lfm3_append_conv_block(op_emitter *e, const model *m, int li) {
+	int						   dim = m->dim;
+	const model_hybrid_params *p   = &m->hybrid;
+	const float				   eps = m->norm_eps;
+	int						   act =
+		m->arch_info && m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
+
+	OP_EMIT(e,
+			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_HYB_PROJ, WIDX_ATTN_QKV, p->conv_dim, dim,
+						 STAGE_MATMUL));
+	recipe_op conv			  = mk_shortconv(RECIPE_SLOT_HYB_PROJ, RECIPE_SLOT_XB2);
+	conv.u.shortconv.centered = m->full_sequence;
+	OP_EMIT(e, conv);
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_SSM_OUT, dim, p->value_dim,
+						 STAGE_MATMUL));
+	OP_EMIT(e, mk_rmsnorm_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT,
+							  WIDX_POST_ATTN_NORM, eps, STAGE_ADD));
+	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
+	recipe_emit_ffn_activation(e, m->dim, m->intermediate, li >= 0 && m->layers[li].gate_up_fused,
+							   backend_has_cap(m->backend, BCAP_MULTI_MATMUL), act);
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, m->dim, m->intermediate,
+						 STAGE_MATMUL));
+	OP_EMIT(e, mk_rmsnorm_add(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB2,
+							  WIDX_POST_FFN_NORM, eps, STAGE_ADD));
+	OP_EMIT(e, mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
+}
+
+static void lfm3_append_attention_block(op_emitter *e, const model *m, int li) {
+	int			dim		   = m->dim;
+	int			q_out	   = m->n_heads * m->head_dim;
+	int			n_kv_heads = model_layer_kv_heads(m, li);
+	int			kv_out	   = n_kv_heads * m->head_dim;
+	int			neox	   = m->arch_info->uses_neox_rope;
+	const float eps		   = m->norm_eps;
+
+	OP_EMIT(e,
+			mk_rmsnorm(RECIPE_SLOT_X, RECIPE_SLOT_XB, WIDX_ATTN_NORM, m->norm_eps, STAGE_RMSNORM));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_Q, WIDX_WQ, q_out, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_K, WIDX_WK, kv_out, dim, STAGE_MATMUL));
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB, RECIPE_SLOT_V, WIDX_WV, kv_out, dim, STAGE_MATMUL));
+
+	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_Q, WIDX_ATTN_Q_NORM, m->norm_eps, m->n_heads));
+	OP_EMIT(e, mk_rmsnorm_per_head(RECIPE_SLOT_K, WIDX_ATTN_K_NORM, m->norm_eps, n_kv_heads));
+	OP_EMIT(e, mk_rope(RECIPE_SLOT_Q, m->n_heads, m->head_dim, neox));
+	OP_EMIT(e, mk_rope(RECIPE_SLOT_K, n_kv_heads, m->head_dim, neox));
+	if (!m->full_sequence)
+		OP_EMIT(e, mk_kvput(RECIPE_SLOT_K, RECIPE_SLOT_V));
+	recipe_op attn =
+		mk_attention_default_scale(RECIPE_SLOT_Q, RECIPE_SLOT_XB2, m->n_heads, n_kv_heads,
+								   m->head_dim, m->n_ctx, m->sliding_window);
+	if (m->full_sequence) {
+		attn.kind  = OP_ATTENTION_FULL;
+		attn.in[1] = RECIPE_SLOT_K;
+		attn.in[2] = RECIPE_SLOT_V;
+	}
+	OP_EMIT(e, attn);
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, WIDX_WO, dim, q_out, STAGE_MATMUL));
+	OP_EMIT(e, mk_rmsnorm_add(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_X, RECIPE_SLOT_ATTN_OUT,
+							  WIDX_POST_ATTN_NORM, eps, STAGE_ADD));
+
+	int act =
+		m->arch_info && m->arch_info->uses_gelu_activation ? ACTIVATION_GELU : ACTIVATION_SILU;
+	OP_EMIT(e, mk_rmsnorm(RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB, WIDX_FFN_NORM, eps, STAGE_RMSNORM));
+	recipe_emit_ffn_activation(e, m->dim, m->intermediate, li >= 0 && m->layers[li].gate_up_fused,
+							   backend_has_cap(m->backend, BCAP_MULTI_MATMUL), act);
+	OP_EMIT(e, mk_matmul(RECIPE_SLOT_FFN_ACT, RECIPE_SLOT_XB2, WIDX_DOWN, m->dim, m->intermediate,
+						 STAGE_MATMUL));
+	OP_EMIT(e, mk_rmsnorm_add(RECIPE_SLOT_XB2, RECIPE_SLOT_ATTN_OUT, RECIPE_SLOT_XB2,
+							  WIDX_POST_FFN_NORM, eps, STAGE_ADD));
+	OP_EMIT(e, mk_swap(RECIPE_SLOT_X, RECIPE_SLOT_XB2, STAGE_ADD));
+}
+
+void recipe_emit_lfm3_layer(op_emitter *e, const model *m, int li) {
+	if (model_layer_is_recurrent(m, li))
+		lfm3_append_conv_block(e, m, li);
+	else
+		lfm3_append_attention_block(e, m, li);
+}
+
+static model_recipe *build_lfm3_recipe(const model *m) {
+	model_recipe *r = xcalloc(1, sizeof(*r));
+	recipe_build_pre_ops(r, m);
+
+	recipe_build_layers(r, m, LFM_MAX_OPS_PER_LAYER, "lfm3", recipe_emit_lfm3_layer);
+	recipe_build_post_ops(r, m);
+	return r;
+}
+
+RECIPE_REGISTER(lfm3, "lfm3", build_lfm3_recipe)
+
 static model_recipe *build_lfm2_recipe(const model *m) {
 	model_recipe *r = xcalloc(1, sizeof(*r));
 	recipe_build_pre_ops(r, m);

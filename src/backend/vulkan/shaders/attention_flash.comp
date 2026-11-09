@@ -26,6 +26,8 @@ layout(push_constant) uniform Params {
 	float scale;
 	int	  stride_head_dim;
 	int	  attn_start;
+	int	  kv_q8;
+	int	  kv_row_bytes;
 #ifdef BATCHED
 	int m;
 #endif
@@ -74,10 +76,11 @@ void main() {
 #endif
 
 	const int  attn_start = params.attn_start;
-	const uint kv_base =
-		params.layer_off + uint(kvh) * uint(params.n_ctx) * uint(params.stride_head_dim);
-	const uint q_base = q_row_off + uint(my_head) * uint(HEAD_DIM);
-	const int  hs	  = hslot * TILE_T;
+	const uint stride_head =
+		(params.kv_q8 != 0) ? uint(params.kv_row_bytes) : uint(params.stride_head_dim);
+	const uint kv_base = params.layer_off + uint(kvh) * uint(params.n_ctx) * stride_head;
+	const uint q_base  = q_row_off + uint(my_head) * uint(HEAD_DIM);
+	const int  hs	   = hslot * TILE_T;
 
 	precise float M = neg_max_float();
 	precise float S = 0.0;
@@ -92,16 +95,59 @@ void main() {
 		const int words_tile = tile_len * words_head;
 
 		for (int idx = int(tid); idx < words_tile; idx += LOCAL_SIZE_X) {
-			const int  t  = idx / words_head;
-			const int  dw = idx % words_head;
-			const uint ko =
-				kv_base + uint(tile_t0 + t) * uint(params.stride_head_dim) + uint(dw * 2);
-			const vec2 kf					  = vec2(unpackHalf2x16(kcache[ko >> 1u]));
-			const vec2 vf					  = vec2(unpackHalf2x16(vcache[ko >> 1u]));
-			k_tile[t * KSTRIDE + dw * 2]	  = kf.x;
-			k_tile[t * KSTRIDE + dw * 2 + 1]  = kf.y;
-			v_tile[t * HEAD_DIM + dw * 2]	  = vf.x;
-			v_tile[t * HEAD_DIM + dw * 2 + 1] = vf.y;
+			const int t	 = idx / words_head;
+			const int dw = idx % words_head;
+			const int d0 = dw * 2;
+			const int d1 = d0 + 1;
+			if (params.kv_q8 == 0) {
+				const uint ko			  = kv_base + uint(tile_t0 + t) * stride_head + uint(d0);
+				const vec2 kf			  = vec2(unpackHalf2x16(kcache[ko >> 1u]));
+				const vec2 vf			  = vec2(unpackHalf2x16(vcache[ko >> 1u]));
+				k_tile[t * KSTRIDE + d0]  = kf.x;
+				k_tile[t * KSTRIDE + d1]  = kf.y;
+				v_tile[t * HEAD_DIM + d0] = vf.x;
+				v_tile[t * HEAD_DIM + d1] = vf.y;
+			} else {
+				uint ko = kv_base + uint(tile_t0 + t) * stride_head;
+				// k d0
+				int	  b0	= d0 / 32;
+				int	  o0	= d0 % 32;
+				uint  soff0 = ko + uint(b0) * 34u;
+				uint  w0	= kcache[soff0 >> 2u];
+				float sk0	= unpackHalf2x16((w0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  wb0	= kcache[(soff0 + 2u + uint(o0)) >> 2u];
+				int	  qk0	= int((wb0 >> (((soff0 + 2u + uint(o0)) & 3u) * 8u)) & 0xFFu);
+				if (qk0 > 127)
+					qk0 -= 256;
+				k_tile[t * KSTRIDE + d0] = sk0 * float(qk0);
+				// k d1
+				int	  b1	= d1 / 32;
+				int	  o1	= d1 % 32;
+				uint  soff1 = ko + uint(b1) * 34u;
+				uint  w1	= kcache[soff1 >> 2u];
+				float sk1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  wb1	= kcache[(soff1 + 2u + uint(o1)) >> 2u];
+				int	  qk1	= int((wb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
+				if (qk1 > 127)
+					qk1 -= 256;
+				k_tile[t * KSTRIDE + d1] = sk1 * float(qk1);
+				// v d0
+				uint  vo0 = vcache[soff0 >> 2u];
+				float sv0 = unpackHalf2x16((vo0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  vb0 = vcache[(soff0 + 2u + uint(o0)) >> 2u];
+				int	  qv0 = int((vb0 >> (((soff0 + 2u + uint(o0)) & 3u) * 8u)) & 0xFFu);
+				if (qv0 > 127)
+					qv0 -= 256;
+				v_tile[t * HEAD_DIM + d0] = sv0 * float(qv0);
+				// v d1
+				uint  vo1 = vcache[soff1 >> 2u];
+				float sv1 = unpackHalf2x16((vo1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  vb1 = vcache[(soff1 + 2u + uint(o1)) >> 2u];
+				int	  qv1 = int((vb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
+				if (qv1 > 127)
+					qv1 -= 256;
+				v_tile[t * HEAD_DIM + d1] = sv1 * float(qv1);
+			}
 		}
 		barrier();
 
@@ -169,5 +215,9 @@ void main() {
 			acc += part[off + i] * exp(part[off + DPL] - m_all);
 		}
 		out_[d0 + uint(i)] = acc * inv_s;
+	}
+	if (params.kv_q8 != 0 && params.layer_off == 0u && gl_WorkGroupID.x == 0u &&
+		gl_LocalInvocationID.x == 0u) {
+		out_[0] = k_tile[0];
 	}
 }

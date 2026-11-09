@@ -30,12 +30,18 @@ typedef struct {
 	char renderer[128];
 } gl_context;
 
-status_code gl_context_init(gl_context *out);
+status_code gl_context_init(gl_context *out, int node_index);
 
 void gl_context_free(gl_context *ctx);
 
 status_code gl_context_probe(void);
 
-status_code gl_render_node_identity(char *out, size_t cap);
+void gl_enumerate_render_nodes(void);
+
+int gl_render_node_count(void);
+
+int gl_render_node_at(int device_index);
+
+status_code gl_render_node_identity(int node_index, char *out, size_t cap);
 
 #endif

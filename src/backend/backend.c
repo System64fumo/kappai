@@ -798,11 +798,15 @@ static int already_loaded(const char *candidate) {
 	char		real[4096];
 	if (!realpath(candidate, real))
 		snprintf(real, sizeof(real), "%s", candidate);
+	pthread_mutex_lock(&g_hfb_mtx);
 	for (int i = 0; i < n_loaded; i++)
-		if (strcmp(loaded[i], real) == 0)
+		if (strcmp(loaded[i], real) == 0) {
+			pthread_mutex_unlock(&g_hfb_mtx);
 			return 1;
+		}
 	if (n_loaded < BACKEND_MAX)
 		snprintf(loaded[n_loaded++], sizeof(loaded[0]), "%s", real);
+	pthread_mutex_unlock(&g_hfb_mtx);
 	return 0;
 }
 

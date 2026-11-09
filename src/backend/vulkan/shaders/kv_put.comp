@@ -2,10 +2,10 @@
 #extension GL_GOOGLE_include_directive : enable
 layout(local_size_x = 128) in;
 
-layout(set = 0, binding = 0) writeonly buffer KCache {
+layout(set = 0, binding = 0) coherent buffer KCache {
 	uint kcache[];
 };
-layout(set = 0, binding = 1) writeonly buffer VCache {
+layout(set = 0, binding = 1) coherent buffer VCache {
 	uint vcache[];
 };
 layout(set = 0, binding = 2) readonly buffer KIn {
@@ -25,40 +25,110 @@ layout(push_constant) uniform Params {
 	int	 in_row_stride;
 	int	 m_tokens;
 	int	 in_row0;
+	int	 kv_q8;
+	int	 kv_row_bytes;
 }
 params;
 
 #include "common.glsl"
 
+void store_byte(uint byte_off, uint val, bool is_v) {
+	uint word_idx = byte_off >> 2u;
+	uint shift	  = (byte_off & 3u) << 3u;
+	uint mask	  = 0xFFu << shift;
+	uint shifted  = (val & 0xFFu) << shift;
+	if (is_v) {
+		atomicAnd(vcache[word_idx], ~mask);
+		atomicOr(vcache[word_idx], shifted);
+	} else {
+		atomicAnd(kcache[word_idx], ~mask);
+		atomicOr(kcache[word_idx], shifted);
+	}
+}
+
 void main() {
-	uint pair			  = gl_GlobalInvocationID.x;
-	int	 head_dim		  = params.head_dim;
-	int	 stride_head_dim  = params.stride_head_dim;
-	int	 n_pairs_per_head = head_dim / 2;
-	int	 total_pairs	  = params.n_kv_heads * n_pairs_per_head;
-	if (int(pair) >= total_pairs * params.m_tokens)
+	int head_dim = params.head_dim;
+	int n_blocks = (head_dim + 31) / 32;
+
+	if (params.kv_q8 == 0) {
+		uint pair			  = gl_GlobalInvocationID.x;
+		int	 n_pairs_per_head = head_dim / 2;
+		int	 total_pairs	  = params.n_kv_heads * n_pairs_per_head;
+		if (int(pair) >= total_pairs * params.m_tokens)
+			return;
+
+		int row	   = int(pair) / total_pairs;
+		int kvh	   = int(pair % uint(total_pairs)) / n_pairs_per_head;
+		int d_pair = int(pair % uint(total_pairs)) % n_pairs_per_head;
+		int d0	   = d_pair * 2;
+		int d1	   = d0 + 1;
+
+		uint kvh_stride = uint(params.n_ctx) * uint(params.stride_head_dim);
+		uint pos_off	= uint(params.pos_start + row) * uint(params.stride_head_dim);
+		uint base		= params.layer_off + uint(kvh) * kvh_stride + pos_off;
+
+		uint word_idx = (base + uint(d0)) >> 1u;
+
+		int in_base = (params.in_row0 + row) * params.in_row_stride + kvh * head_dim;
+		int in_idx0 = in_base + d0;
+		int in_idx1 = in_base + d1;
+
+		uint k0			 = float_to_half(kin[in_idx0]);
+		uint k1			 = float_to_half(kin[in_idx1]);
+		kcache[word_idx] = k0 | (k1 << 16u);
+
+		uint v0			 = float_to_half(vin[in_idx0]);
+		uint v1			 = float_to_half(vin[in_idx1]);
+		vcache[word_idx] = v0 | (v1 << 16u);
+		return;
+	}
+
+	int	 jobs_per_kvh = n_blocks * 2;
+	int	 jobs_per_row = params.n_kv_heads * jobs_per_kvh;
+	uint gid		  = gl_GlobalInvocationID.x;
+	if (int(gid) >= jobs_per_row * params.m_tokens)
 		return;
 
-	int row	   = int(pair) / total_pairs;
-	int kvh	   = int(pair % uint(total_pairs)) / n_pairs_per_head;
-	int d_pair = int(pair % uint(total_pairs)) % n_pairs_per_head;
-	int d0	   = d_pair * 2;
-	int d1	   = d0 + 1;
+	int row = int(gid) / jobs_per_row;
+	int rem = int(gid) - row * jobs_per_row;
+	int kvh = rem / jobs_per_kvh;
+	int job = rem - kvh * jobs_per_kvh;
 
-	uint kvh_stride = uint(params.n_ctx) * uint(stride_head_dim);
-	uint pos_off	= uint(params.pos_start + row) * uint(stride_head_dim);
-	uint base		= params.layer_off + uint(kvh) * kvh_stride + pos_off;
-	uint word_idx	= (base + uint(d0)) >> 1u;
+	bool is_v	   = (job >= n_blocks);
+	int	 b		   = is_v ? (job - n_blocks) : job;
+	int	 elem_base = b * 32;
+
+	uint kvh_stride = uint(params.n_ctx) * uint(params.kv_row_bytes);
+	uint pos_off	= uint(params.pos_start + row) * uint(params.kv_row_bytes);
+	uint row_base	= params.layer_off + uint(kvh) * kvh_stride + pos_off;
 
 	int in_base = (params.in_row0 + row) * params.in_row_stride + kvh * head_dim;
-	int in_idx0 = in_base + d0;
-	int in_idx1 = in_base + d1;
 
-	uint k0			 = float_to_half(kin[in_idx0]);
-	uint k1			 = float_to_half(kin[in_idx1]);
-	kcache[word_idx] = k0 | (k1 << 16u);
+	float amax = 0.0;
+	for (int j = 0; j < 32; j++) {
+		int e = elem_base + j;
+		if (e < head_dim) {
+			float v = is_v ? vin[in_base + e] : kin[in_base + e];
+			amax	= max(amax, abs(v));
+		}
+	}
+	float d	 = amax / 127.0;
+	float id = d > 0.0 ? 1.0 / d : 0.0;
 
-	uint v0			 = float_to_half(vin[in_idx0]);
-	uint v1			 = float_to_half(vin[in_idx1]);
-	vcache[word_idx] = v0 | (v1 << 16u);
+	uint d16 = float_to_half(d) & 0xFFFFu;
+
+	uint blk_off = row_base + uint(b) * 34u;
+
+	store_byte(blk_off + 0u, (d16 >> 0u) & 0xFFu, is_v);
+	store_byte(blk_off + 1u, (d16 >> 8u) & 0xFFu, is_v);
+
+	for (int j = 0; j < 32; j++) {
+		int	  e = elem_base + j;
+		float v = 0.0;
+		if (e < head_dim)
+			v = is_v ? vin[in_base + e] : kin[in_base + e];
+		float qf = clamp(v * id, -127.0, 127.0);
+		int	  q	 = int(round(qf));
+		store_byte(blk_off + 2u + uint(j), uint(q) & 0xFFu, is_v);
+	}
 }

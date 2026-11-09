@@ -33,7 +33,7 @@ static inline int monitor_active(const monitor *mon) {
 	return mon && mon->fd >= 0;
 }
 
-extern monitor *g_monitor;
+extern _Atomic(monitor *) g_monitor;
 
 void monitor_emit_load_phase_backend(monitor *mon, const char *backend_name);
 void monitor_emit_load_phase_model_start(monitor *mon, const char *model_path);
