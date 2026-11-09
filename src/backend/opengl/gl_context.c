@@ -108,12 +108,17 @@ status_code gl_render_node_identity(int node_index, char *out, size_t cap) {
 static void query_memory_topology(gl_context *ctx) {
 	ctx->unified_memory		= 1;
 	ctx->video_memory_bytes = 0;
+	ctx->gtt_memory_bytes	= 0;
 
 	uint64_t vram = 0;
 	if (sysfs_read_u64(ctx->drm_fd, "mem_info_vram_total", &vram) && vram > 0) {
 		ctx->unified_memory		= 0;
 		ctx->video_memory_bytes = (size_t)vram;
 	}
+
+	uint64_t gtt = 0;
+	if (sysfs_read_u64(ctx->drm_fd, "mem_info_gtt_total", &gtt) && gtt > 0)
+		ctx->gtt_memory_bytes = (size_t)gtt;
 }
 
 static int g_probed = -1;

@@ -388,6 +388,9 @@ struct gl_priv {
 	size_t device_local_total_estimate;
 
 	int device_lost;
+	int is_uma;
+	int is_low_power;
+
 	int matmul_wg;
 
 	char *attention_src;
@@ -899,6 +902,7 @@ static void gl_barrier(gl_priv *p) {
 }
 
 static void gl_finish(gl_priv *p) {
+	if (p->is_low_power) return;
 	uint64_t t0 = time_us();
 	p->stats.finishes++;
 	glFinish();
@@ -909,7 +913,8 @@ static void gl_finish(gl_priv *p) {
 }
 
 static void gl_flush_if_due(gl_priv *p) {
-	if (++p->dispatches_since_flush < GL_FLUSH_INTERVAL_DISPATCHES)
+	int interval = p->is_low_power ? (GL_FLUSH_INTERVAL_DISPATCHES * 16) : GL_FLUSH_INTERVAL_DISPATCHES;
+	if (++p->dispatches_since_flush < interval)
 		return;
 	p->stats.flushes++;
 	glFlush();
@@ -1160,6 +1165,18 @@ static void gl_buf_sync_to_host(gl_buf *b) {
 		return;
 	if (gl_ensure_context(b->owner) != OK)
 		return;
+	if (b->owner->is_low_power) {
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
+		void *ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)b->size_bytes,
+									 GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+		if (ptr) {
+			memcpy(b->host_mirror, ptr, b->size_bytes);
+			glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+			b->device_dirty = 0;
+		}
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+		return;
+	}
 	gl_finish(b->owner);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
 	gl_barrier(b->owner);
@@ -1322,6 +1339,14 @@ static status_code gl_init(backend *self, int device_index) {
 		self->priv = NULL;
 		return s;
 	}
+	int small_carveout = p->ctx.video_memory_bytes > 0 &&
+						 p->ctx.video_memory_bytes <= (2ULL * 1024 * 1024 * 1024) &&
+						 p->ctx.gtt_memory_bytes > p->ctx.video_memory_bytes;
+	p->is_uma = p->ctx.unified_memory || p->ctx.video_memory_bytes == 0 || small_carveout;
+	p->is_low_power = p->is_uma;
+	DEBUG("opengl: memory topology unified=%d vram=%zu gtt=%zu -> is_uma=%d is_low_power=%d",
+		  p->ctx.unified_memory, p->ctx.video_memory_bytes, p->ctx.gtt_memory_bytes, p->is_uma,
+		  p->is_low_power);
 	if (!p->ctx.has_compute) {
 		ERROR("gl: GLES context up but compute shaders unavailable -- cannot use this backend");
 		gl_context_free(&p->ctx);
@@ -1691,7 +1716,7 @@ static status_code gl_init(backend *self, int device_index) {
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	if (p->ctx.unified_memory)
+	if (p->is_uma)
 		self->caps |= BCAP_UNIFIED_MEMORY;
 	p->device_local_total_estimate =
 		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes
@@ -2580,6 +2605,17 @@ static status_code gl_sample_history_set(backend *self, int slot, const int32_t 
 static status_code gl_buf_read_range(gl_buf *b, size_t byte_off, size_t len, void *dst) {
 	if (!b || byte_off + len > b->size_bytes)
 		return ERR_INVALID_ARG;
+	if (b->owner->is_low_power) {
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
+		void *ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, (GLintptr)byte_off, (GLsizeiptr)len,
+									 GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+		if (!ptr)
+			return ERR_INTERNAL;
+		memcpy(dst, ptr, len);
+		glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+		return OK;
+	}
 	if (gl_ensure_context(b->owner) != OK)
 		return ERR_INTERNAL;
 	gl_finish(b->owner);

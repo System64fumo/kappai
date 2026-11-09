@@ -26,6 +26,7 @@ typedef struct {
 
 	int	   unified_memory;
 	size_t video_memory_bytes;
+	size_t gtt_memory_bytes;
 
 	char renderer[128];
 } gl_context;

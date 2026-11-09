@@ -424,6 +424,8 @@ typedef struct {
 	int				kv_handle_cap;
 	int				device_lost;
 	int				device_lost_warned;
+	int				is_uma;
+	int				is_low_power;
 	int				scratch_pool_count;
 	int				batch_active;
 	int				n_read;
@@ -1751,6 +1753,8 @@ static status_code vk_dispatch_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs
 	int flush_limit;
 	if (p->caps.is_mali || p->caps.is_power_vr || p->caps.is_adreno) {
 		flush_limit = 256;
+	} else if (p->is_low_power) {
+		flush_limit = 65536;
 	} else {
 		flush_limit = p->batch_active ? 4096 : 256;
 	}
@@ -2113,6 +2117,7 @@ static void vk_qcore_init(vk_priv *p) {
 	p->qcore_ok = 1;
 }
 
+static size_t vk_device_local_heap_total(vk_priv *p);
 static status_code vk_init(backend *self, int device_index) {
 	vk_priv *p = xcalloc(1, sizeof(vk_priv));
 	self->priv = p;
@@ -2200,6 +2205,9 @@ static status_code vk_init(backend *self, int device_index) {
 	free(devs);
 
 	vkGetPhysicalDeviceMemoryProperties(p->phys, &p->mem_props);
+
+	p->is_uma = 0;
+	p->is_low_power = 0;
 
 	uint32_t qf_count = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(p->phys, &qf_count, NULL);
@@ -2414,6 +2422,8 @@ static status_code vk_init(backend *self, int device_index) {
 							 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 	if (p->caps.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
+	p->is_uma = p->caps.unified_memory ? 1 : 0;
+	p->is_low_power = p->is_uma;
 
 	log_tag("VLK", "%.*s", (int)backend_name_brief_len(props.deviceName), props.deviceName);
 	DEBUG("vulkan: device: %s", props.deviceName);
@@ -2422,6 +2432,11 @@ static status_code vk_init(backend *self, int device_index) {
 		p->matmul_wg_size		  = 32;
 		p->matmul_rows_per_thread = 2;
 		p->matmul_tile_k		  = 1024;
+		p->matmul_m_per_wg		  = 4;
+	} else if (p->is_low_power) {
+		p->matmul_wg_size		  = 64;
+		p->matmul_rows_per_thread = 2;
+		p->matmul_tile_k		  = 2048;
 		p->matmul_m_per_wg		  = 4;
 	} else {
 		p->matmul_wg_size		  = 64;
@@ -6802,6 +6817,7 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 		if (all_q)
 			fams |= 1 << vk_qfamily(qts[i]);
 	}
+
 	if (all_q && fams) {
 		status_code st = OK;
 		for (int f = 0; f < 2 && st == OK; f++)
