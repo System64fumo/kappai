@@ -2117,7 +2117,7 @@ static void vk_qcore_init(vk_priv *p) {
 	p->qcore_ok = 1;
 }
 
-static size_t vk_device_local_heap_total(vk_priv *p);
+static size_t	   vk_device_local_heap_total(vk_priv *p);
 static status_code vk_init(backend *self, int device_index) {
 	vk_priv *p = xcalloc(1, sizeof(vk_priv));
 	self->priv = p;
@@ -2206,7 +2206,7 @@ static status_code vk_init(backend *self, int device_index) {
 
 	vkGetPhysicalDeviceMemoryProperties(p->phys, &p->mem_props);
 
-	p->is_uma = 0;
+	p->is_uma		= 0;
 	p->is_low_power = 0;
 
 	uint32_t qf_count = 0;
@@ -2422,7 +2422,7 @@ static status_code vk_init(backend *self, int device_index) {
 							 props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 	if (p->caps.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
-	p->is_uma = p->caps.unified_memory ? 1 : 0;
+	p->is_uma		= p->caps.unified_memory ? 1 : 0;
 	p->is_low_power = p->is_uma;
 
 	log_tag("VLK", "%.*s", (int)backend_name_brief_len(props.deviceName), props.deviceName);

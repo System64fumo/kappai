@@ -902,7 +902,8 @@ static void gl_barrier(gl_priv *p) {
 }
 
 static void gl_finish(gl_priv *p) {
-	if (p->is_low_power) return;
+	if (p->is_low_power)
+		return;
 	uint64_t t0 = time_us();
 	p->stats.finishes++;
 	glFinish();
@@ -913,7 +914,8 @@ static void gl_finish(gl_priv *p) {
 }
 
 static void gl_flush_if_due(gl_priv *p) {
-	int interval = p->is_low_power ? (GL_FLUSH_INTERVAL_DISPATCHES * 16) : GL_FLUSH_INTERVAL_DISPATCHES;
+	int interval =
+		p->is_low_power ? (GL_FLUSH_INTERVAL_DISPATCHES * 16) : GL_FLUSH_INTERVAL_DISPATCHES;
 	if (++p->dispatches_since_flush < interval)
 		return;
 	p->stats.flushes++;
@@ -1342,8 +1344,8 @@ static status_code gl_init(backend *self, int device_index) {
 	int small_carveout = p->ctx.video_memory_bytes > 0 &&
 						 p->ctx.video_memory_bytes <= (2ULL * 1024 * 1024 * 1024) &&
 						 p->ctx.gtt_memory_bytes > p->ctx.video_memory_bytes;
-	p->is_uma = p->ctx.unified_memory || p->ctx.video_memory_bytes == 0 || small_carveout;
-	p->is_low_power = p->is_uma;
+	p->is_uma		   = p->ctx.unified_memory || p->ctx.video_memory_bytes == 0 || small_carveout;
+	p->is_low_power	   = p->is_uma;
 	DEBUG("opengl: memory topology unified=%d vram=%zu gtt=%zu -> is_uma=%d is_low_power=%d",
 		  p->ctx.unified_memory, p->ctx.video_memory_bytes, p->ctx.gtt_memory_bytes, p->is_uma,
 		  p->is_low_power);

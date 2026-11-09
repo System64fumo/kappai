@@ -364,7 +364,7 @@ static int engine_load(context *ctx, cli_args *a) {
 	config	 load_cfg		= *ec;
 	load_cfg.preparsed_gguf = has_preparsed ? &preparsed : NULL;
 
-	backend *early_backend	= NULL;
+	backend *early_backend = NULL;
 	if (ec->shared_backend) {
 		early_backend = ec->shared_backend;
 	} else if (!ec->device || strcmp(ec->device, "auto") == 0) {
@@ -384,7 +384,7 @@ static int engine_load(context *ctx, cli_args *a) {
 	if (early_backend && !ec->shared_backend)
 		backend_destroy(early_backend);
 
-	status_code s			= context_init(ctx, &load_cfg);
+	status_code s = context_init(ctx, &load_cfg);
 	if (has_preparsed)
 		gguf_free(&preparsed);
 	if (s != OK) {

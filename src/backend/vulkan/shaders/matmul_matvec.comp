@@ -8,14 +8,13 @@ shared float x_shared_cache[8192];
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 
-
 void main() {
-	uint tid   = gl_LocalInvocationID.x;
-	uint t	   = tid & 31u;
-	uint row   = gl_WorkGroupID.x * 8u + (tid >> 5u);
-	uint n	   = uint(pc.n);
-	uint kb	   = uint(pc.kb);
-	int k = int(kb) * 32;
+	uint tid = gl_LocalInvocationID.x;
+	uint t	 = tid & 31u;
+	uint row = gl_WorkGroupID.x * 8u + (tid >> 5u);
+	uint n	 = uint(pc.n);
+	uint kb	 = uint(pc.kb);
+	int	 k	 = int(kb) * 32;
 	for (int j = int(tid); j < k; j += 256)
 		x_shared_cache[j] = x[j];
 	barrier();
@@ -35,12 +34,12 @@ void main() {
 		float o[8];
 		dequant8(raw, sb, qd, o);
 
-		uint xq_base = sb * 12u;
-		float d_x = x[xq_base + 8u];
+		uint  xq_base = sb * 12u;
+		float d_x	  = x[xq_base + 8u];
 		for (uint j = 0u; j < 8u; j++) {
 			uint word = floatBitsToUint(x[xq_base + (eb >> 2u) + (j >> 2u)]);
 			uint byte = (word >> ((j & 3u) * 8u)) & 0xFFu;
-			int q = int(byte) - ((byte >= 128u) ? 256 : 0);
+			int	 q	  = int(byte) - ((byte >= 128u) ? 256 : 0);
 			acc += o[j] * (d_x * float(q));
 		}
 	}
