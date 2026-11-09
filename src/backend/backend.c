@@ -558,7 +558,7 @@ int backend_best_device(char *out, size_t out_cap) {
 	int			 best_priority = -1;
 	int			 best_idx	   = -1;
 	for (int i = 0; i < n_backends; i++) {
-		if (!infos[i].available || (infos[i].caps & BCAP_IS_HOST))
+		if (!infos[i].available || (infos[i].caps & (BCAP_IS_HOST | BCAP_REMOTE)))
 			continue;
 		if (infos[i].priority <= best_priority)
 			continue;

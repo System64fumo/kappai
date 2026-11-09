@@ -35,7 +35,7 @@ ifeq ($(filter $(TASK_BACKEND),auto ucontext pthread),)
   $(error Invalid TASK_BACKEND='$(TASK_BACKEND)'. Valid options: auto ucontext pthread)
 endif
 
-AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/,$(wildcard $(SRC_DIR)/backend/*/)))))
+AVAILABLE_BACKENDS := $(sort $(notdir $(patsubst %/,%,$(filter-out %/cpu/ %/rpc/,$(wildcard $(SRC_DIR)/backend/*/)))))
 BACKEND_LIST       := $(sort $(subst $(comma), ,$(subst ",,$(BACKENDS))))
 ifneq ($(filter-out $(AVAILABLE_BACKENDS),$(BACKEND_LIST)),)
   $(error Unknown backend(s): $(filter-out $(AVAILABLE_BACKENDS),$(BACKEND_LIST)). Available: $(AVAILABLE_BACKENDS))
@@ -119,12 +119,13 @@ TASK_CFLAGS := $(if $(HAVE_UCONTEXT),-DKAPPAI_TASK_UCONTEXT=1)
 objs = $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(1))
 
 LIB_SRCS := $(wildcard $(SRC_DIR)/*.c $(SRC_DIR)/recipe/*.c $(SRC_DIR)/models/*.c \
-                       $(SRC_DIR)/moe/*.c $(SRC_DIR)/diffusion/*.c) $(SRC_DIR)/backend/backend.c
+                       $(SRC_DIR)/moe/*.c $(SRC_DIR)/diffusion/*.c $(SRC_DIR)/rpc/*.c) $(SRC_DIR)/backend/backend.c
 SERVER_SHARED  := $(OBJ_DIR)/server/openai.o $(OBJ_DIR)/server/task.o
 LIB_OBJS       := $(call objs,$(LIB_SRCS))
 CLI_OBJS       := $(call objs,$(wildcard $(SRC_DIR)/cli/*.c))
 SERVER_OBJS    := $(call objs,$(wildcard $(SRC_DIR)/server/*.c))
 DIFFUSION_OBJS := $(call objs,$(wildcard $(SRC_DIR)/diffusion/cli/*.c))
+RPC_SERVER_OBJS := $(call objs,$(wildcard $(SRC_DIR)/rpc/server/*.c))
 TUI_OBJS       := $(call objs,$(wildcard $(SRC_DIR)/tui/*.c)) $(SERVER_SHARED)
 TEST_OBJS      := $(call objs,$(wildcard $(SRC_DIR)/test/*.c)) $(OBJ_DIR)/server/task.o
 
@@ -154,6 +155,7 @@ $$(BACKEND_DIR)/libkappai_$(1)$$(SHLIB_SUFFIX): $(2) | $$(ENGINE)
 endef
 
 $(eval $(call add_backend,cpu_scalar,$(call cpu_objs,scalar),))
+$(eval $(call add_backend,rpc,$(call backend_objs,rpc/rpc.o),))
 
 ifeq ($(CPU_ARCH_OPT),1)
   ifneq ($(filter aarch64 x86_64,$(CPU_ARCH)),)
@@ -295,10 +297,10 @@ $(GL_HEADER): $(sort $(wildcard $(GL_SRC)/*.comp $(GL_SRC)/*.glsl))
 
 endif
 
-.PHONY: all backends libkappai kappai kappai-cli kappai-server kappai-diffusion kappai-test kappai-monitor
+.PHONY: all backends libkappai kappai kappai-cli kappai-server kappai-diffusion kappai-rpc-server kappai-test kappai-monitor
 .PHONY: config help clean format tidy
 
-all: backends kappai kappai-cli kappai-server kappai-diffusion
+all: backends kappai kappai-cli kappai-server kappai-diffusion kappai-rpc-server
 backends: $(BACKEND_LIBS)
 libkappai: $(ENGINE)
 
@@ -314,6 +316,7 @@ $(eval $(call link_binary,kappai,$(TUI_OBJS),$(PKG_LIBS)))
 $(eval $(call link_binary,kappai-cli,$(CLI_OBJS),$(PKG_LIBS)))
 $(eval $(call link_binary,kappai-server,$(SERVER_OBJS),$(PKG_LIBS)))
 $(eval $(call link_binary,kappai-diffusion,$(DIFFUSION_OBJS),$(PKG_LIBS)))
+$(eval $(call link_binary,kappai-rpc-server,$(RPC_SERVER_OBJS),$(PKG_LIBS)))
 $(eval $(call link_binary,kappai-test,$(TEST_OBJS),$(PKG_LIBS)))
 
 kappai-monitor: $(OUT_DIR)/kappai-monitor
@@ -336,7 +339,7 @@ $(BACKEND_OBJ_DIR)/%.o: $(SRC_DIR)/%.c $(CONFIG_FILE)
 	@echo "  CC(b)   $<"
 	@$(CC) $(BACKEND_CFLAGS) $(LTO_FLAGS) -fPIC -I$(SRC_DIR) -c $< -o $@
 
--include $(sort $(LIB_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(DIFFUSION_OBJS:.o=.d) \
+-include $(sort $(LIB_OBJS:.o=.d) $(CLI_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(DIFFUSION_OBJS:.o=.d) $(RPC_SERVER_OBJS:.o=.d) \
                 $(TUI_OBJS:.o=.d) $(TEST_OBJS:.o=.d) $(BACKEND_OBJS:.o=.d)) $(OUT_DIR)/kappai-monitor.d
 
 config:
@@ -350,7 +353,7 @@ config:
 help:
 	@echo "make config [BUILD=debug|release] [BACKENDS=$(subst $(space),$(comma),$(AVAILABLE_BACKENDS))]"
 	@echo "            [CPU_ARCH_OPT=0|1] [TSAN=0|1] [TASK_BACKEND=auto|ucontext|pthread]"
-	@echo "make                  kappai, kappai-cli, kappai-server, kappai-diffusion"
+	@echo "make                  kappai, kappai-cli, kappai-server, kappai-diffusion, kappai-rpc-server"
 	@echo "make kappai-test      backend regression tests"
 	@echo "make kappai-monitor   monitor viewer"
 	@echo "make clean | format | tidy"

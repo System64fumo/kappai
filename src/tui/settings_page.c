@@ -2,6 +2,7 @@
 
 #include "dialog.h"
 #include "model_picker.h"
+#include "rpc_page.h"
 #include "schema.h"
 #include "settings.h"
 #include "setup.h"
@@ -18,6 +19,7 @@ typedef enum {
 	ITEM_CONFIRM_DELETE,
 	ITEM_MODELS,
 	ITEM_SETUP,
+	ITEM_RPC,
 } item_kind;
 
 typedef struct {
@@ -43,6 +45,9 @@ static const page_item ITEMS[] = {
 	{ITEM_SECTION, "Models", ""},
 	{ITEM_MODELS, "Manage models...",
 	 "browse installed models, download new ones from Hugging Face, delete or add custom models"},
+	{ITEM_SECTION, "Cluster", ""},
+	{ITEM_RPC, "Manage RPC workers...",
+	 "add worker nodes running kappai-rpc-server; they show up as rpc0, rpc1, ... devices"},
 };
 #define ITEM_COUNT ((int)(sizeof(ITEMS) / sizeof(ITEMS[0])))
 
@@ -173,6 +178,9 @@ static void activate(page_state *st) {
 		break;
 	case ITEM_MODELS:
 		model_manager_run();
+		break;
+	case ITEM_RPC:
+		rpc_page_run();
 		break;
 	case ITEM_SETUP:
 		setup_run();

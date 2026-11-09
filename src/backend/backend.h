@@ -31,6 +31,7 @@ typedef enum {
 	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
 	BCAP_KV_SHIFT			  = 1 << 13,
 	BCAP_QK_NORM_ROPE		  = 1 << 14,
+	BCAP_REMOTE				  = 1 << 15,
 } backend_cap;
 
 #define BACKEND_TOKEN_REGS 2
