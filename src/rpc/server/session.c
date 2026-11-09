@@ -145,11 +145,12 @@ static status_code repack_upload(srv_session *s, tensor_desc *d, void **packed) 
 	uint32_t re = 0;
 	*packed		= NULL;
 	if (d->n_dims != 2 || !backend_has_cap(be, BCAP_IS_HOST) || !be->repack_plan ||
-		!be->repack_weight ||
-		be->repack_plan(be, d->type, d->dims[0], d->dims[1], &re) != OK || !re)
+		!be->repack_weight || be->repack_plan(be, d->type, d->dims[0], d->dims[1], &re) != OK ||
+		!re)
 		return OK;
 	void *dst = xmalloc_aligned(ggml_row_size(re, (size_t)d->dims[0]) * (size_t)d->dims[1], 64);
-	status_code st = be->repack_weight(be, d->type, s->upload, dst, (int)d->dims[1], (int)d->dims[0]);
+	status_code st =
+		be->repack_weight(be, d->type, s->upload, dst, (int)d->dims[1], (int)d->dims[0]);
 	if (st != OK) {
 		free(dst);
 		return st;
@@ -173,7 +174,7 @@ static status_code op_alloc_weight(srv_session *s, rpc_rd *rd, rpc_wr *out) {
 	size_t total = rpc_tensor_bytes(d.type, d.n_dims, d.dims);
 	if (!upload_ready(s, total))
 		return ERR_FORMAT;
-	d.host_data	   = s->upload;
+	d.host_data		   = s->upload;
 	void	   *packed = NULL;
 	status_code st	   = d.repack ? repack_upload(s, &d, &packed) : OK;
 	if (st != OK)
@@ -711,8 +712,8 @@ static status_code ensure_backend(srv_session *s) {
 	if (st == OK && !g_shared_be)
 		st = backend_create(name, index, &g_shared_be);
 	if (st == OK) {
-		g_leased	 = true;
-		s->be		 = g_shared_be;
+		g_leased	   = true;
+		s->be		   = g_shared_be;
 		s->emulate_moe = backend_has_cap(s->be, BCAP_IS_HOST) && !s->be->moe_expert_ffn;
 	}
 	pthread_mutex_unlock(&g_lease_mtx);

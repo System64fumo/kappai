@@ -405,6 +405,9 @@ struct backend {
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
 	status_code (*buffer_read_f32_x2)(backend *self, const buffer *a, float *dst_a, int n_a,
 									  const buffer *b, float *dst_b, int n_b);
+	status_code (*buffer_read_f32_post)(backend *self, const buffer *a, int n_a, const buffer *b,
+										int n_b);
+	status_code (*buffer_read_f32_wait)(backend *self, float *dst_a, float *dst_b);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
 	status_code (*argmax_to_reg)(backend *self, const buffer *logits, int n, int reg);

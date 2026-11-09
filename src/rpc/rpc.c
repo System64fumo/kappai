@@ -651,6 +651,23 @@ status_code rpc_call(rpc_conn *c, uint32_t op, const void *payload, size_t len, 
 	return s;
 }
 
+status_code rpc_call_begin(rpc_conn *c, uint32_t op, const void *payload, size_t len) {
+	pthread_mutex_lock(&c->mtx);
+	status_code s = conn_queue_locked(c, op, payload, len);
+	if (s == OK)
+		s = conn_flush_locked(c);
+	pthread_mutex_unlock(&c->mtx);
+	return s;
+}
+
+status_code rpc_call_end(rpc_conn *c, rpc_reply *out) {
+	memset(out, 0, sizeof(*out));
+	pthread_mutex_lock(&c->mtx);
+	status_code s = c->dead ? ERR_IO : conn_read_reply_locked(c, out);
+	pthread_mutex_unlock(&c->mtx);
+	return s;
+}
+
 void rpc_reply_free(rpc_reply *r) {
 	free(r->data);
 	memset(r, 0, sizeof(*r));

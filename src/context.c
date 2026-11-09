@@ -954,6 +954,27 @@ static int context_prefill_chunk_size(const context *c, int n_threads) {
 	return chunk;
 }
 
+typedef struct {
+	context	 *c;
+	progress *prog;
+	int		  n;
+	int		  done;
+} pipelined_prefill;
+
+static status_code pipelined_prefill_done(void *ud, int offset, int size) {
+	pipelined_prefill *pf = ud;
+	pf->done			  = offset + size;
+	if (pf->prog)
+		progress_update(pf->prog, (uint64_t)pf->done);
+	if (pf->done >= pf->n)
+		return OK;
+	if (pf->c->interrupt)
+		return ERR_INTERRUPTED;
+	if (pf->c->yield)
+		pf->c->yield(pf->c->yield_ud);
+	return OK;
+}
+
 int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool quiet) {
 	if (n <= 0)
 		return 0;
@@ -988,32 +1009,51 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 
 	int status = ERR_COMPUTE_FAIL;
 	int chunk_offset;
-	for (chunk_offset = 0; chunk_offset < n; chunk_offset += chunk) {
-		if (c->interrupt) {
+	if (n > chunk && compute_prefill_pipelinable(&c->m)) {
+		pipelined_prefill pf = {.c = c, .prog = show_progress ? &prog : NULL, .n = n};
+		compute_set_layer_progress_cb(&c->scratch, NULL, NULL);
+		status_code pst = compute_forward_prefill_pipelined(
+			&c->m, &c->kv, &c->scratch, tokens, n, pos, chunk, c->flash_attn,
+			c->scratch.logits_host, pipelined_prefill_done, &pf);
+		compute_set_layer_progress_cb(&c->scratch, saved_cb, saved_cb_ud);
+		chunk_offset = pf.done;
+		if (pst == ERR_INTERRUPTED) {
 			status = ERR_INTERRUPTED;
 			goto fail;
 		}
-
-		int chunk_size = MIN(chunk, n - chunk_offset);
-		prefill_progress_start_chunk(&pp, chunk_offset, chunk_size);
-
-		status_code cfb_st = compute_forward_batch(
-			&c->m, &c->kv, &c->scratch, tokens + chunk_offset, chunk_size, pos + chunk_offset,
-			c->flash_attn, (chunk_offset + chunk_size == n) ? c->scratch.logits_host : NULL);
-		if (cfb_st == ERR_INTERRUPTED) {
-			status = ERR_INTERRUPTED;
-			goto fail;
-		}
-		if (cfb_st != OK) {
-			ERROR("compute_forward_batch failed: %s at chunk_offset=%d chunk_size=%d -- "
-				  "prompt processing aborted",
-				  status_str(cfb_st), chunk_offset, chunk_size);
+		if (pst != OK) {
+			ERROR("pipelined prefill failed: %s after %d/%d tokens -- prompt processing aborted",
+				  status_str(pst), pf.done, n);
 			status = ERR_COMPUTE_FAIL;
 			goto fail;
 		}
-		if (c->yield && chunk_offset + chunk_size < n)
-			c->yield(c->yield_ud);
-	}
+	} else
+		for (chunk_offset = 0; chunk_offset < n; chunk_offset += chunk) {
+			if (c->interrupt) {
+				status = ERR_INTERRUPTED;
+				goto fail;
+			}
+
+			int chunk_size = MIN(chunk, n - chunk_offset);
+			prefill_progress_start_chunk(&pp, chunk_offset, chunk_size);
+
+			status_code cfb_st = compute_forward_batch(
+				&c->m, &c->kv, &c->scratch, tokens + chunk_offset, chunk_size, pos + chunk_offset,
+				c->flash_attn, (chunk_offset + chunk_size == n) ? c->scratch.logits_host : NULL);
+			if (cfb_st == ERR_INTERRUPTED) {
+				status = ERR_INTERRUPTED;
+				goto fail;
+			}
+			if (cfb_st != OK) {
+				ERROR("compute_forward_batch failed: %s at chunk_offset=%d chunk_size=%d -- "
+					  "prompt processing aborted",
+					  status_str(cfb_st), chunk_offset, chunk_size);
+				status = ERR_COMPUTE_FAIL;
+				goto fail;
+			}
+			if (c->yield && chunk_offset + chunk_size < n)
+				c->yield(c->yield_ud);
+		}
 
 	if (show_progress) {
 		compute_set_layer_progress_cb(&c->scratch, saved_cb, saved_cb_ud);

@@ -609,8 +609,8 @@ static status_code part_run_transfer(model *m, compute_scratch *s, const part_pl
 		if (c + 1 < p->n_carry) {
 			const part_carry *b = &p->carry[c + 1];
 			st					= compute_copy_buffer_cross_pair(
-							s, batch_slot(from, a->slot), batch_slot(to, a->slot), n_rows * a->row_elems,
-							batch_slot(from, b->slot), batch_slot(to, b->slot), n_rows * b->row_elems);
+				s, batch_slot(from, a->slot), batch_slot(to, a->slot), n_rows * a->row_elems,
+				batch_slot(from, b->slot), batch_slot(to, b->slot), n_rows * b->row_elems);
 		} else {
 			st = compute_copy_buffer_cross(s, batch_slot(from, a->slot), batch_slot(to, a->slot),
 										   n_rows * a->row_elems);
@@ -749,6 +749,167 @@ static status_code compute_forward_rows(struct model *m, const row_desc *rows,
 done:
 	if (st != OK && logits_out)
 		memset(logits_out, 0, (size_t)n_out * model_output_size(m) * sizeof(float));
+	return st;
+}
+
+int recipe_prefill_pipelinable(const model *m) {
+	const part_plan *p = m->recipe ? m->recipe->part : NULL;
+	if (!p || !model_mixed_backend_mode(m) || m->full_sequence || !recipe_is_decode_batchable(m))
+		return 0;
+	const arch_info *ai = m->arch_info;
+	if (ai->is_moe || ai->hybrid_shortconv || ai->is_hybrid_recurrent || ai->is_kda || ai->is_mla)
+		return 0;
+	if (p->n_nodes != 5 || p->n_carry < 1 || p->n_carry > PART_CARRY_MAX)
+		return 0;
+	const part_node *c0 = &p->nodes[0], *t = &p->nodes[1], *c1 = &p->nodes[2];
+	if (c0->kind != PART_COMPUTE || t->kind != PART_TRANSFER || c1->kind != PART_COMPUTE ||
+		p->nodes[3].kind != PART_TRANSFER || p->nodes[4].kind != PART_GATHER)
+		return 0;
+	backend *remote = c0->be;
+	return remote == m->backend && t->src == remote && t->be == c1->be &&
+		   backend_has_cap(remote, BCAP_REMOTE) && remote->buffer_read_f32_post &&
+		   remote->buffer_read_f32_wait && backend_has_cap(c1->be, BCAP_IS_HOST);
+}
+
+typedef struct {
+	model			*m;
+	compute_scratch *s;
+	kvcache			*cache;
+	const int32_t	*tokens;
+	int				 pos_start;
+	int				 chunk;
+	int				 n_tokens;
+	int				 flash_attn;
+} pipe_job;
+
+typedef struct {
+	int			   off;
+	int			   n;
+	const int32_t *tokens;
+	row_desc	   rows;
+} pipe_chunk;
+
+static pipe_chunk pipe_chunk_of(const pipe_job *j, int k) {
+	pipe_chunk c;
+	c.off	 = k * j->chunk;
+	c.n		 = MIN(j->chunk, j->n_tokens - c.off);
+	c.tokens = j->tokens + c.off;
+	c.rows	 = (row_desc){
+		.n_rows = c.n, .pos_start = j->pos_start + c.off, .cache = j->cache, .last_only = 1};
+	return c;
+}
+
+static batch_scratch *pipe_bind(const pipe_job *j, int k, int n) {
+	batch_scratch *bs = batch_scratch_prepare(j->m, j->s, n);
+	bs->ple_cur		  = k & 1;
+	return bs;
+}
+
+static status_code pipe_head(const pipe_job *j, int k) {
+	pipe_chunk			c  = pipe_chunk_of(j, k);
+	model			   *m  = j->m;
+	const model_recipe *r  = m->recipe;
+	batch_scratch	   *bs = pipe_bind(j, k, c.n);
+	bs->tokens			   = c.tokens;
+	status_code st = embd_fill_rows(m->backend, &m->tok_embd.buf, m->tok_embd.type, c.tokens,
+									&bs->pair[r->embd_slot].b, c.n, m->dim,
+									m->arch_info->has_scale_embeddings ? m->dim_sqrt : 1.0f);
+	if (st != OK)
+		return st;
+	st = exec_outer_schedule(r->exec, &r->exec->pre, OP_EMBD_LOOKUP, OP_SCALE_EMBEDDINGS, m,
+							 j->cache, j->s, bs, c.rows.pos_start, c.n, j->flash_attn, NULL);
+	if (st != OK)
+		return st;
+	return part_run_layers(m, j->s, &c.rows, &r->part->nodes[0], c.tokens, j->flash_attn);
+}
+
+static status_code pipe_post(const pipe_job *j, int k) {
+	pipe_chunk		 c = pipe_chunk_of(j, k);
+	const part_plan *p = j->m->recipe->part;
+	const part_node *t = &p->nodes[1];
+	pipe_bind(j, k, c.n);
+	batch_scratch *from = part_scratch(j->m, j->s, t->src);
+	if (!from)
+		return ERR_UNSUPPORTED;
+	const buffer *a = batch_slot(from, p->carry[0].slot);
+	const buffer *b = p->n_carry > 1 ? batch_slot(from, p->carry[1].slot) : NULL;
+	return t->src->buffer_read_f32_post(t->src, a, c.n * p->carry[0].row_elems, b,
+										b ? c.n * p->carry[1].row_elems : 0);
+}
+
+static status_code pipe_wait(const pipe_job *j, int k) {
+	pipe_chunk		 c = pipe_chunk_of(j, k);
+	const part_plan *p = j->m->recipe->part;
+	const part_node *t = &p->nodes[1];
+	pipe_bind(j, k, c.n);
+	batch_scratch *to = part_scratch(j->m, j->s, t->be);
+	float		  *da = NULL, *db = NULL;
+	if (to) {
+		da = buffer_f32(batch_slot(to, p->carry[0].slot));
+		db = p->n_carry > 1 ? buffer_f32(batch_slot(to, p->carry[1].slot)) : NULL;
+	}
+	status_code st = t->src->buffer_read_f32_wait(t->src, da, db);
+	if (st != OK)
+		return st;
+	if (!to)
+		return ERR_UNSUPPORTED;
+	to->tokens = c.tokens;
+	return OK;
+}
+
+static status_code pipe_tail(const pipe_job *j, int k, bool last, float *logits_out) {
+	pipe_chunk		 c	= pipe_chunk_of(j, k);
+	model			*m	= j->m;
+	const part_plan *p	= m->recipe->part;
+	status_code		 st = part_run_layers(m, j->s, &c.rows, &p->nodes[2], c.tokens, j->flash_attn);
+	if (st != OK || !last)
+		return st;
+	st = part_run_transfer(m, j->s, p, &p->nodes[3], c.n, c.tokens);
+	if (st == OK)
+		st = part_run_gather(m, j->s, p, &p->nodes[4], &c.rows);
+	if (st == OK)
+		st = batch_run_post_ops(m, j->cache, j->s, j->s->bs, rows_n_logit_rows(&c.rows),
+								j->flash_attn, logits_out);
+	return st;
+}
+
+status_code compute_prefill_pipelined_recipe(struct model *m, struct kvcache *cache,
+											 struct compute_scratch *s, const int32_t *tokens,
+											 int n_tokens, int pos_start, int chunk, int flash_attn,
+											 float *logits_out, prefill_chunk_cb done, void *ud) {
+	if (n_tokens < 1)
+		return OK;
+	if (chunk < 1 || !recipe_prefill_pipelinable(m))
+		return ERR_UNSUPPORTED;
+	status_code st = compute_scratch_ensure_mirror(s, m);
+	if (st != OK)
+		return st;
+	pipe_job j		  = {.m			 = m,
+						 .s			 = s,
+						 .cache		 = cache,
+						 .tokens	 = tokens,
+						 .pos_start	 = pos_start,
+						 .chunk		 = chunk,
+						 .n_tokens	 = n_tokens,
+						 .flash_attn = flash_attn};
+	int		 n_chunks = (n_tokens + chunk - 1) / chunk;
+	st				  = pipe_head(&j, 0);
+	for (int k = 0; st == OK && k < n_chunks; k++) {
+		st = pipe_post(&j, k);
+		if (st != OK)
+			break;
+		status_code ahead = k + 1 < n_chunks ? pipe_head(&j, k + 1) : OK;
+		status_code got	  = pipe_wait(&j, k);
+		st				  = ahead != OK ? ahead : got;
+		if (st == OK)
+			st = pipe_tail(&j, k, k + 1 == n_chunks, logits_out);
+		if (st == OK && done) {
+			pipe_chunk c = pipe_chunk_of(&j, k);
+			st			 = done(ud, c.off, c.n);
+		}
+	}
+	if (st != OK && logits_out)
+		memset(logits_out, 0, (size_t)model_output_size(m) * sizeof(float));
 	return st;
 }
 

@@ -124,6 +124,13 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out);
 
+int compute_prefill_pipelinable(const model *m);
+
+status_code compute_forward_prefill_pipelined(model *m, kvcache *cache, compute_scratch *s,
+											  const int32_t *tokens, int n_tokens, int pos_start,
+											  int chunk, int flash_attn, float *logits_out,
+											  prefill_chunk_cb done, void *ud);
+
 status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int flash_attn,
 								  float *hidden_out);

@@ -39,6 +39,11 @@ typedef struct {
 	uint64_t		mem_total;
 	uint64_t		mem_avail;
 	uint64_t		mem_avail_us;
+	bool			read_pending;
+	bool			stash_valid;
+	status_code		stash_err;
+	rpc_reply		stash;
+	int				pend_n[2];
 	rpc_plan_entry	plans[RPC_PLAN_CACHE];
 	int				n_plans;
 	uint8_t			type_native[RPC_TYPE_MAX];
@@ -80,9 +85,19 @@ static status_code op_send(backend *self, uint32_t op, rpc_wr *w) {
 	return s;
 }
 
+static void drain_pending_read(backend *self) {
+	rpc_priv *p = priv_of(self);
+	if (!p->read_pending)
+		return;
+	p->read_pending = false;
+	p->stash_err	= rpc_call_end(&p->conn, &p->stash);
+	p->stash_valid	= p->stash_err == OK;
+}
+
 static status_code op_call(backend *self, uint32_t op, rpc_wr *w, rpc_reply *r) {
 	status_code s = w->bad ? ERR_UNSUPPORTED : OK;
 	memset(r, 0, sizeof(*r));
+	drain_pending_read(self);
 	if (s == OK) {
 		sync_params(self);
 		s = rpc_call(&priv_of(self)->conn, op, w->p, w->len, r);
@@ -420,6 +435,59 @@ static status_code stub_buffer_read_f32_x2(backend *self, const buffer *a, float
 	return OK;
 }
 
+static status_code stub_buffer_read_f32_post(backend *self, const buffer *a, int n_a,
+											 const buffer *b, int n_b) {
+	rpc_priv *p = priv_of(self);
+	drain_pending_read(self);
+	if (p->stash_valid) {
+		rpc_reply_free(&p->stash);
+		p->stash_valid = false;
+	}
+	rpc_wr w;
+	rpc_wr_init(&w);
+	rpc_wr_i32(&w, b ? 2 : 1);
+	rpc_wr_buf(&w, self, a);
+	rpc_wr_i32(&w, n_a);
+	if (b) {
+		rpc_wr_buf(&w, self, b);
+		rpc_wr_i32(&w, n_b);
+	}
+	status_code s = w.bad ? ERR_UNSUPPORTED : OK;
+	if (s == OK) {
+		sync_params(self);
+		s = rpc_call_begin(&p->conn, RPC_OP_buffer_read_f32, w.p, w.len);
+	}
+	rpc_wr_free(&w);
+	if (s == OK) {
+		p->read_pending = true;
+		p->pend_n[0]	= n_a;
+		p->pend_n[1]	= b ? n_b : 0;
+	}
+	return s;
+}
+
+static status_code stub_buffer_read_f32_wait(backend *self, float *dst_a, float *dst_b) {
+	rpc_priv *p = priv_of(self);
+	drain_pending_read(self);
+	if (!p->stash_valid)
+		return p->stash_err != OK ? p->stash_err : ERR_INTERNAL;
+	rpc_reply r	   = p->stash;
+	p->stash_valid = false;
+	memset(&p->stash, 0, sizeof(p->stash));
+	status_code s  = r.status != OK ? (status_code)r.status : OK;
+	size_t		na = (size_t)p->pend_n[0], nb = (size_t)p->pend_n[1];
+	if (s == OK && r.len < (na + nb) * sizeof(float))
+		s = ERR_FORMAT;
+	if (s == OK) {
+		if (dst_a)
+			memcpy(dst_a, r.data, na * sizeof(float));
+		if (nb && dst_b)
+			memcpy(dst_b, r.data + na * sizeof(float), nb * sizeof(float));
+	}
+	rpc_reply_free(&r);
+	return s;
+}
+
 static status_code stub_buffer_write_f32(backend *self, buffer *buf, const float *host_src, int n) {
 	rpc_wr w;
 	rpc_wr_init(&w);
@@ -742,7 +810,7 @@ static size_t stub_mem_available(backend *self) {
 	uint64_t  now = time_us();
 	if (p->mem_avail_us && now - p->mem_avail_us < RPC_MEM_CACHE_US)
 		return p->mem_avail;
-	p->mem_avail	 = call_size(self, RPC_OP_mem_available);
+	p->mem_avail	= call_size(self, RPC_OP_mem_available);
 	p->mem_avail_us = now ? now : 1;
 	return p->mem_avail;
 }
@@ -783,8 +851,8 @@ static status_code stub_repack_plan(backend *self, uint32_t type, uint64_t d0, u
 			return e->re_type ? OK : ERR_UNSUPPORTED;
 		}
 	}
-	uint32_t	 re_type = 0;
-	status_code s		 = query_repack_plan(self, type, d0, d1, &re_type);
+	uint32_t	re_type = 0;
+	status_code s		= query_repack_plan(self, type, d0, d1, &re_type);
 	if (s != OK)
 		return s;
 	if (p->n_plans < RPC_PLAN_CACHE)
@@ -826,7 +894,7 @@ static void read_hello_exts(rpc_rd *rd, rpc_priv *p) {
 		return;
 	uint16_t n = rpc_rd_u16(rd);
 	for (uint16_t i = 0; i < n && !rd->bad; i++) {
-		uint16_t	   id	= rpc_rd_u16(rd);
+		uint16_t	   id  = rpc_rd_u16(rd);
 		uint16_t	   len = rpc_rd_u16(rd);
 		const uint8_t *v   = rpc_rd_bytes(rd, len);
 		if (!v)
@@ -876,6 +944,10 @@ static status_code hello(backend *self, rpc_priv *p, bool *present) {
 
 static void install_ops(backend *self, const bool *present) {
 	RPC_ALL_OPS(INSTALL_OP)
+	if (present[RPC_OP_buffer_read_f32]) {
+		self->buffer_read_f32_post = stub_buffer_read_f32_post;
+		self->buffer_read_f32_wait = stub_buffer_read_f32_wait;
+	}
 }
 
 static status_code rpc_backend_init(backend *self, int device_index) {
@@ -914,6 +986,8 @@ static void rpc_backend_free(backend *self) {
 	if (!p)
 		return;
 	rpc_conn_close(&p->conn);
+	if (p->stash_valid)
+		rpc_reply_free(&p->stash);
 	pthread_mutex_destroy(&p->table_mtx);
 	free(p);
 	self->priv = NULL;
