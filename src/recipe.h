@@ -453,6 +453,15 @@ status_code compute_hidden_states_recipe(struct model *m, struct kvcache *cache,
 
 int recipe_is_decode_batchable(const struct model *m);
 
+typedef status_code (*prefill_chunk_cb)(void *ud, int offset, int size);
+
+int recipe_prefill_pipelinable(const struct model *m);
+
+status_code compute_prefill_pipelined_recipe(struct model *m, struct kvcache *cache,
+											 struct compute_scratch *s, const int32_t *tokens,
+											 int n_tokens, int pos_start, int chunk, int flash_attn,
+											 float *logits_out, prefill_chunk_cb done, void *ud);
+
 status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
 												struct compute_scratch *s, const int32_t *tokens,
 												const int *positions, const uint8_t *needs_logits,
@@ -558,6 +567,7 @@ void recipe_build_pre_ops(model_recipe *r, const struct model *m);
 	}
 
 int ple_device_path_possible(const struct model *m);
+int ple_table_host_only(const struct model *m);
 int ple_build_dev_path_ok(backend *a, const struct model *m, int batched);
 
 #endif

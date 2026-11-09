@@ -31,6 +31,7 @@ typedef enum {
 	BCAP_IN_ORDER_QUEUE		  = 1 << 12,
 	BCAP_KV_SHIFT			  = 1 << 13,
 	BCAP_QK_NORM_ROPE		  = 1 << 14,
+	BCAP_REMOTE				  = 1 << 15,
 } backend_cap;
 
 #define BACKEND_TOKEN_REGS 2
@@ -132,6 +133,7 @@ typedef struct {
 	const void *host_data;
 	const char *name;
 	int			release_host_source;
+	int			repack;
 	status_code (*read_fn)(void *ctx, size_t off, void *dst, size_t len);
 	void *read_ctx;
 } tensor_desc;
@@ -403,6 +405,9 @@ struct backend {
 	status_code (*buffer_read_f32)(backend *self, const buffer *buf, float *host_dst, int n);
 	status_code (*buffer_read_f32_x2)(backend *self, const buffer *a, float *dst_a, int n_a,
 									  const buffer *b, float *dst_b, int n_b);
+	status_code (*buffer_read_f32_post)(backend *self, const buffer *a, int n_a, const buffer *b,
+										int n_b);
+	status_code (*buffer_read_f32_wait)(backend *self, float *dst_a, float *dst_b);
 	status_code (*buffer_write_f32)(backend *self, buffer *buf, const float *host_src, int n);
 	status_code (*argmax)(backend *self, const buffer *logits, int n, int32_t *out_idx);
 	status_code (*argmax_to_reg)(backend *self, const buffer *logits, int n, int reg);
@@ -597,6 +602,7 @@ backend *backend_host_at(const char *file, int line, const char *func);
 #define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
+void backend_host_request(void);
 
 typedef enum {
 	HFB_OP_NOT_NATIVE	  = 0,

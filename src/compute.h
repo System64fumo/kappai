@@ -124,6 +124,13 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out);
 
+int compute_prefill_pipelinable(const model *m);
+
+status_code compute_forward_prefill_pipelined(model *m, kvcache *cache, compute_scratch *s,
+											  const int32_t *tokens, int n_tokens, int pos_start,
+											  int chunk, int flash_attn, float *logits_out,
+											  prefill_chunk_cb done, void *ud);
+
 status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int flash_attn,
 								  float *hidden_out);
@@ -141,6 +148,8 @@ void compute_set_layer_progress_cb(compute_scratch *s, layer_progress_cb cb, voi
 
 status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m);
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n);
+status_code compute_copy_buffer_cross_pair(compute_scratch *s, const buffer *src_a, buffer *dst_a,
+										   int n_a, const buffer *src_b, buffer *dst_b, int n_b);
 
 int compute_device_index(const compute_scratch *s, const backend *b);
 

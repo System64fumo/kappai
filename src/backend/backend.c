@@ -558,7 +558,7 @@ int backend_best_device(char *out, size_t out_cap) {
 	int			 best_priority = -1;
 	int			 best_idx	   = -1;
 	for (int i = 0; i < n_backends; i++) {
-		if (!infos[i].available || (infos[i].caps & BCAP_IS_HOST))
+		if (!infos[i].available || (infos[i].caps & (BCAP_IS_HOST | BCAP_REMOTE)))
 			continue;
 		if (infos[i].priority <= best_priority)
 			continue;
@@ -629,6 +629,11 @@ static _Atomic(backend *) g_host_override	= NULL;
 static const char		 *g_host_first_file = "?";
 static int				  g_host_first_line = 0;
 static const char		 *g_host_first_func = "?";
+static _Atomic bool		  g_host_requested	= false;
+
+void backend_host_request(void) {
+	atomic_store(&g_host_requested, true);
+}
 
 void backend_host_use(backend *b) {
 	if (!b || !backend_has_cap(b, BCAP_IS_HOST))
@@ -654,8 +659,9 @@ static void host_backend_init(void) {
 	}
 	if (atomic_load(&g_host_override) == NULL)
 		atomic_store(&g_host_override, g_host_backend);
-	INFO("host (cpu) fallback backend '%s' created; first needed by %s() at %s:%d",
-		 g_host_backend->name, g_host_first_func, g_host_first_file, g_host_first_line);
+	if (!atomic_load(&g_host_requested))
+		INFO("host (cpu) fallback backend '%s' created; first needed by %s() at %s:%d",
+			 g_host_backend->name, g_host_first_func, g_host_first_file, g_host_first_line);
 }
 
 backend *backend_host_at(const char *file, int line, const char *func) {

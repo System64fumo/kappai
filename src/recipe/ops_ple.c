@@ -76,6 +76,11 @@ int ple_device_path_possible(const struct model *m) {
 		   ple_build_dev_caps_ok(m->backend, m, 1);
 }
 
+int ple_table_host_only(const struct model *m) {
+	return m->has_per_layer_embeddings && m->mixed_backend_mode && m->backend &&
+		   backend_has_cap(m->backend, BCAP_REMOTE);
+}
+
 static status_code ple_host_decode_row(const ple_build_plan *p, int token, float *ple_row) {
 	size_t row_stride	= ggml_row_size(p->m->layer_dims.per_layer_tok_embd.type, p->total_ple);
 	const uint8_t *embd = (const uint8_t *)p->m->layer_dims.per_layer_tok_embd.host_ptr +
@@ -192,6 +197,7 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 
 	int dev_path_ok =
 		mode == PLE_BUILD_AUTO ? ple_build_dev_path_cached(m, a, 1) : mode == PLE_BUILD_DEVICE;
+	ctx->bs->ple_host_valid[ctx->bs->ple_cur] = 0;
 
 	if (dev_path_ok) {
 		st = embd_fill_rows(a, &m->layer_dims.per_layer_tok_embd.buf,
@@ -247,9 +253,10 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 
 	ensure_sync(a);
 
-	float_buf_ensure(&ctx->bs->ple_buf, (size_t)n_rows * total_ple);
+	float_buf *ple_host_buf = &ctx->bs->ple_buf[ctx->bs->ple_cur];
+	float_buf_ensure(ple_host_buf, (size_t)n_rows * total_ple);
 	float_buf_ensure(&ctx->bs->ple_proj, (size_t)n_rows * total_ple);
-	float *ple = ctx->bs->ple_buf.p;
+	float *ple = ple_host_buf->p;
 	for (int row = 0; row < n_rows; row++) {
 		int token = ctx->bs->tokens ? ctx->bs->tokens[row] : 0;
 		st		  = ple_host_decode_row(&plan, token, ple + (size_t)row * total_ple);
@@ -282,6 +289,7 @@ static status_code ple_build_run(exec_ctx *ctx, int mode) {
 	st = a->buffer_write_f32(a, &ctx->bs->ple_all, ple, n_rows * total_ple);
 	if (st != OK)
 		return st;
+	ctx->bs->ple_host_valid[ctx->bs->ple_cur] = 1;
 
 	return OK;
 }
@@ -344,7 +352,12 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		ple_slice_b = bs_cached_view(&ctx->bs->ple_slice, a, n_ple);
 	}
 
-	if (!slice_in_place && ple_src_bs->ple_all.handle) {
+	const float *ple_host_src = ple_src_bs->ple_host_valid[ple_src_bs->ple_cur]
+									? ple_src_bs->ple_buf[ple_src_bs->ple_cur].p
+									: NULL;
+	int			 use_host_src = !slice_in_place && ple_host_src && backend_has_cap(a, BCAP_IS_HOST);
+
+	if (!slice_in_place && !use_host_src && ple_src_bs->ple_all.handle) {
 		for (int row = 0; row < n_rows; row++) {
 			buffer ple_src = ple_src_bs->ple_all;
 			ple_src.offset +=
@@ -359,10 +372,10 @@ status_code ple_proj_inject_batch(exec_ctx *ctx) {
 		}
 	} else if (!slice_in_place) {
 		for (int row = 0; row < n_rows; row++) {
-			float *ple_row = ple_src_bs->ple_buf.p + (size_t)row * total_ple +
-							 (size_t)ctx->li * n_embd_per_layer;
-			buffer dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
-			st			   = a->buffer_write_f32(a, &dst_row, ple_row, n_embd_per_layer);
+			const float *ple_row = ple_src_bs->ple_buf[ple_src_bs->ple_cur].p +
+								   (size_t)row * total_ple + (size_t)ctx->li * n_embd_per_layer;
+			buffer		 dst_row = batch_row_view(&ple_slice_b, row, n_embd_per_layer);
+			st					 = a->buffer_write_f32(a, &dst_row, ple_row, n_embd_per_layer);
 			if (st != OK)
 				goto ple_cleanup;
 		}

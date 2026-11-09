@@ -276,26 +276,55 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 	return compute_forward_recipe(m, cache, s, token, pos, flash_attn, logits_out);
 }
 
+static status_code batch_window_check(const model *m, int pos_start, int n_tokens) {
+	long w = m->sliding_window;
+	if (w <= 0)
+		return OK;
+	long slack = w / 4 < 8 ? 8 : w / 4;
+	long cap   = w + slack;
+	if (pos_start + n_tokens > cap && n_tokens > slack + 1) {
+		ERROR("batch of %d tokens exceeds the %ld-token sliding-window slack (window %ld, "
+			  "capacity %ld): rows early in this batch would lose window history. "
+			  "Reduce the prefill chunk size to %ld.",
+			  n_tokens, slack, w, cap, slack + 1);
+		return ERR_INVALID_ARG;
+	}
+	return OK;
+}
+
 status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int pos_start,
 								  int flash_attn, float *logits_out) {
-	long w = m->sliding_window;
-	if (w > 0) {
-		long slack = w / 4 < 8 ? 8 : w / 4;
-		long cap   = w + slack;
-		if (pos_start + n_tokens > cap && n_tokens > slack + 1) {
-			ERROR("batch of %d tokens exceeds the %ld-token sliding-window slack (window %ld, "
-				  "capacity %ld): rows early in this batch would lose window history. "
-				  "Reduce the prefill chunk size to %ld.",
-				  n_tokens, slack, w, cap, slack + 1);
-			return ERR_INVALID_ARG;
-		}
-	}
+	status_code wst = batch_window_check(m, pos_start, n_tokens);
+	if (wst != OK)
+		return wst;
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
 	return compute_forward_batch_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn,
 										logits_out);
+}
+
+int compute_prefill_pipelinable(const model *m) {
+	return recipe_prefill_pipelinable(m);
+}
+
+status_code compute_forward_prefill_pipelined(model *m, kvcache *cache, compute_scratch *s,
+											  const int32_t *tokens, int n_tokens, int pos_start,
+											  int chunk, int flash_attn, float *logits_out,
+											  prefill_chunk_cb done, void *ud) {
+	if (chunk < 1)
+		return ERR_INVALID_ARG;
+	for (int off = 0; off < n_tokens; off += chunk) {
+		status_code wst = batch_window_check(m, pos_start + off, MIN(chunk, n_tokens - off));
+		if (wst != OK)
+			return wst;
+	}
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	return compute_prefill_pipelined_recipe(m, cache, s, tokens, n_tokens, pos_start, chunk,
+											flash_attn, logits_out, done, ud);
 }
 
 status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
@@ -376,6 +405,11 @@ status_code compute_scratch_ensure_mirror(compute_scratch *s, const model *m) {
 	return OK;
 }
 
+static bool remote_ordered_read(const backend *owner, const buffer *b) {
+	return owner && backend_has_cap(owner, BCAP_REMOTE) && owner->buffer_read_f32 &&
+		   !buffer_is_host_resident(b);
+}
+
 status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buffer *dst, int n) {
 	if (!src || !dst || n <= 0)
 		return ERR_INVALID_ARG;
@@ -402,7 +436,8 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return ERR_UNSUPPORTED;
 	}
 
-	ensure_sync(src_owner);
+	if (!remote_ordered_read(src_owner, src))
+		ensure_sync(src_owner);
 
 	const int	 dst_direct = buffer_is_host_resident(dst);
 	const float *from		= NULL;
@@ -437,4 +472,18 @@ status_code compute_copy_buffer_cross(compute_scratch *s, const buffer *src, buf
 		return OK;
 	}
 	return ERR_UNSUPPORTED;
+}
+
+status_code compute_copy_buffer_cross_pair(compute_scratch *s, const buffer *src_a, buffer *dst_a,
+										   int n_a, const buffer *src_b, buffer *dst_b, int n_b) {
+	backend *owner = src_a->owner;
+	bool	 fused = owner && owner == src_b->owner && owner->buffer_read_f32_x2 &&
+					 remote_ordered_read(owner, src_a) && remote_ordered_read(owner, src_b) &&
+					 buffer_is_host_resident(dst_a) && buffer_is_host_resident(dst_b) &&
+					 dst_a->owner != owner && dst_b->owner != owner;
+	if (fused)
+		return owner->buffer_read_f32_x2(owner, src_a, buffer_f32(dst_a), n_a, src_b,
+										 buffer_f32(dst_b), n_b);
+	status_code st = compute_copy_buffer_cross(s, src_a, dst_a, n_a);
+	return st != OK ? st : compute_copy_buffer_cross(s, src_b, dst_b, n_b);
 }

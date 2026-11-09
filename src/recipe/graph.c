@@ -591,7 +591,7 @@ static void resolve_node(cg_set *s, const struct model *m, backend *be, const cg
 						 const weight_ref *w, uint8_t *impl) {
 	cap_resolution res = cap_resolve(be, m, n->kind, w, 1);
 	*impl			   = (uint8_t)res.impl;
-	if (res.impl == CAP_NATIVE || fallback_seen(s, be, n->kind))
+	if (res.impl == CAP_NATIVE || res.by_design || fallback_seen(s, be, n->kind))
 		return;
 	add_fallback(s, be, n->kind, res.fn);
 }

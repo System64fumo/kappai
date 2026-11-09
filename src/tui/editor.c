@@ -1196,9 +1196,6 @@ static void editor_add_hcs_device(editor_state *st) {
 	int prev_priority = 0;
 	for (int i = 0; i < h->n_devices; i++)
 		prev_priority = MAX(prev_priority, h->devices[i].priority);
-	for (int i = 0; i < h->n_devices; i++)
-		if (h->devices[i].layers == HCS_COUNT_ALL)
-			h->devices[i].layers = st->probe_ok ? (st->n_layers + 1) / 2 : 0;
 	hcs_device *d = &h->devices[h->n_devices++];
 	snprintf(d->name, sizeof(d->name), "%.*s", (int)sizeof(d->name) - 1, pick);
 	d->tasks		= HCS_TASKS_ALL;
@@ -1315,7 +1312,7 @@ static const char *editor_row_hint(const editor_state *st, char *label_buf, size
 		hcs_ref ref = editor_hcs_ref(st, st->row);
 		editor_hcs_row_text(st, st->row, label_buf, label_cap, value_buf, value_cap);
 		return ref.kind == HCS_REF_ENABLE	 ? EDITOR_HCS_ENABLE_HINT
-			   : ref.kind == HCS_REF_ADD	 ? "add another device; it takes '*' (the remainder)"
+			   : ref.kind == HCS_REF_ADD	 ? "add another device; it starts with no layers"
 			   : ref.kind == HCS_REF_STREAM	 ? "stream experts between devices instead of holding "
 											   "them all in memory"
 			   : ref.kind == HCS_REF_PRELOAD ? "load all expert weights at startup"

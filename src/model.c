@@ -662,12 +662,13 @@ static void release_original_weight_data(model *m, const void *host_ptr, size_t 
 
 static status_code upload_tensor_to(model *m, const void *host_ptr, uint32_t type, int n_dims,
 									uint64_t d0, uint64_t d1, weight_class wc,
-									backend *target_backend, buffer *out) {
+									backend *target_backend, buffer *out, int repack) {
 	tensor_desc desc = {
 		.type	   = type,
 		.n_dims	   = n_dims,
 		.dims	   = {d0, d1, 0, 0},
 		.host_data = host_ptr,
+		.repack	   = repack,
 	};
 	backend			  *home = backend_weight_home(target_backend ? target_backend : m->backend, wc);
 	int				   home_host = backend_has_cap(home, BCAP_IS_HOST);
@@ -808,12 +809,24 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 
 	int home_is_cpu = backend_has_cap(home, BCAP_IS_HOST);
 
-	int do_repack = home_is_cpu && n_dims == 2 && wc == WCLASS_MATMUL && d0 > 0 && d1 > 0 &&
-					model_should_repack_cached(m, type);
+	int remote	  = backend_has_cap(home, BCAP_REMOTE);
+	int do_repack = (home_is_cpu || remote) && n_dims == 2 && wc == WCLASS_MATMUL && d0 > 0 &&
+					d1 > 0 && model_should_repack_cached(m, type);
 
 	uint32_t re_type = 0;
 	if (do_repack && home->repack_plan)
 		home->repack_plan(home, type, d0, d1, &re_type);
+
+	if (re_type && remote) {
+		status_code s =
+			upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out, 1);
+		if (s != OK)
+			return s;
+		out->size = ggml_row_size(re_type, (size_t)d0) * (size_t)d1;
+		if (type_io)
+			*type_io = re_type;
+		return OK;
+	}
 
 	if (re_type) {
 		status_code ls = ensure_tensor_loaded(m, host_ptr);
@@ -857,7 +870,7 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 		return OK;
 	}
 
-	status_code s = upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out);
+	status_code s = upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out, 0);
 	if (s != OK)
 		return s;
 	return OK;
@@ -1151,7 +1164,7 @@ static status_code upload_one_to(model *m, weight_ref *ref, uint32_t wtype, int 
 							  ref->dequant_rows);
 		release_original_weight_data(m, orig, bytes);
 	}
-	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf);
+	return upload_tensor_to(m, ref->host_ptr, ref->type, ndims, d0, d1, wc, target, &ref->buf, 0);
 }
 
 static status_code upload_one_repack_to(model *m, weight_ref *ref, int ndims, uint64_t d0,
@@ -1228,13 +1241,15 @@ static status_code upload_embeddings(model *m, progress *prog) {
 	progress_step(prog);
 
 	if (m->has_per_layer_embeddings) {
-		s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
-						  m->layer_dims.per_layer_tok_embd.type, 2,
-						  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
-						  WCLASS_EMBEDDING, m->backend);
-		if (s != OK) {
-			ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
-			return s;
+		if (!ple_table_host_only(m)) {
+			s = upload_one_to(m, &m->layer_dims.per_layer_tok_embd,
+							  m->layer_dims.per_layer_tok_embd.type, 2,
+							  (uint64_t)m->layer_dims.n_embd_per_layer * m->n_layers, m->vocab_size,
+							  WCLASS_EMBEDDING, m->backend);
+			if (s != OK) {
+				ERROR("model_upload: per_layer_token_embd upload failed (%d)", s);
+				return s;
+			}
 		}
 		progress_step(prog);
 		s = upload_one_repack_to(m, &m->layer_dims.per_layer_model_proj, 2, m->dim,

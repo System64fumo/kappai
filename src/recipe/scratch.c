@@ -146,7 +146,8 @@ void batch_scratch_free(batch_scratch *bs) {
 	free(bs->moe_zeros.p);
 	free(bs->moe_per_token_slots);
 	free(bs->moe_union_slots);
-	free(bs->ple_buf.p);
+	free(bs->ple_buf[0].p);
+	free(bs->ple_buf[1].p);
 	buffer_release(&bs->ple_all);
 	free(bs->ple_inp.p);
 	free(bs->ple_proj.p);

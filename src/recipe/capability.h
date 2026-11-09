@@ -11,6 +11,7 @@ typedef enum {
 typedef struct {
 	cap_impl	impl;
 	const char *fn;
+	int			by_design;
 } cap_resolution;
 
 cap_resolution cap_resolve(backend *be, const struct model *m, op_kind kind, const weight_ref *w,

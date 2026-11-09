@@ -124,7 +124,9 @@ struct batch_scratch {
 
 	const int32_t *tokens;
 
-	float_buf ple_buf;
+	float_buf ple_buf[2];
+	int		  ple_host_valid[2];
+	int		  ple_cur;
 	buffer	  ple_all;
 	float_buf ple_inp;
 	float_buf ple_proj;
