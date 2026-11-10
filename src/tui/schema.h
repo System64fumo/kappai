@@ -43,7 +43,6 @@ typedef struct {
 	uint64_t seed;
 
 	int ctx_size;
-	int n_threads;
 	int top_k;
 	int repeat_last_n;
 	int server_port;

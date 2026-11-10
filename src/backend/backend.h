@@ -512,6 +512,7 @@ struct backend {
 	size_t (*mem_total)(backend *self);
 	cpu_cache_info (*cpu_info)(void);
 	void (*release_thread)(backend *self);
+	void (*bind_phase)(backend *self, unsigned phase);
 	status_code (*kv_shift)(backend *self, buffer *k, buffer *v, int layer,
 							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
@@ -581,6 +582,7 @@ bool		backend_device_is_host(const char *spec);
 bool		backend_device_uma(const char *spec);
 status_code backend_device_identity(const char *spec, char *out, size_t cap);
 status_code backend_identity(const backend *b, char *out, size_t cap);
+void		backend_device_label(const char *spec, char *out, size_t cap);
 int			backend_best_device(char *out, size_t out_cap);
 int			backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
 size_t		backend_name_brief_len(const char *name);
@@ -602,6 +604,7 @@ backend *backend_host_at(const char *file, int line, const char *func);
 #define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
+void backend_bind_phase(unsigned phase);
 void backend_host_request(void);
 
 typedef enum {

@@ -19,6 +19,45 @@ static void portability_chunk(int begin, int end, int tid, void *ud) {
 	atomic_fetch_add(&job->completed, end - begin);
 }
 
+typedef struct {
+	atomic_uint tids;
+} roster_job;
+
+static void roster_chunk(int begin, int end, int tid, void *ud) {
+	(void)begin;
+	(void)end;
+	roster_job *job = ud;
+	atomic_fetch_or(&job->tids, 1u << tid);
+}
+
+static void test_threadpool_phase_rosters(void) {
+	tpool_member members[] = {
+		{.cpu = -1, .phases = TPOOL_PHASES_ALL},
+		{.cpu = -1, .phases = TPOOL_PHASES_ALL},
+		{.cpu = -1, .phases = TPOOL_PHASE_PREFILL},
+		{.cpu = -1, .phases = TPOOL_PHASE_PREFILL},
+	};
+	tpool	  *pool		  = tpool_create(members, 4);
+	roster_job decode_job = {0};
+	tpool_bind_phase(pool, TPOOL_PHASE_DECODE);
+	for (int i = 0; i < 64; i++)
+		tpool_parallel_for(pool, 4096, 1, roster_chunk, &decode_job);
+
+	portability_job prefill_job = {0};
+	tpool_bind_phase(pool, TPOOL_PHASE_PREFILL);
+	for (int i = 0; i < 64; i++)
+		tpool_parallel_for(pool, 4096, 1, portability_chunk, &prefill_job);
+	tpool_bind_phase(pool, 0);
+	tpool_destroy(pool);
+
+	unsigned decode_tids = atomic_load(&decode_job.tids);
+	record_resultf(OPFAM_EDGE_CASE, "threadpool.decode_roster_excludes_prefill_members",
+				   (decode_tids & ~3u) == 0, "tids=0x%x", decode_tids);
+	record_resultf(OPFAM_EDGE_CASE, "threadpool.prefill_roster_completes",
+				   atomic_load(&prefill_job.completed) == 64 * 4096, "completed=%d",
+				   atomic_load(&prefill_job.completed));
+}
+
 static void test_posix_file_io(void) {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/posix-io-XXXXXX", synth_fixture_dir);
@@ -179,8 +218,9 @@ void run_portability_tests(void) {
 				   "available=%zu total=%zu", available, total);
 #endif
 
+	test_threadpool_phase_rosters();
 	portability_job job	 = {0};
-	tpool		   *pool = tpool_create(2);
+	tpool		   *pool = tpool_create(NULL, 2);
 	for (int i = 0; i < 32; i++)
 		tpool_parallel_for(pool, 127, 1, portability_chunk, &job);
 	tpool_destroy(pool);

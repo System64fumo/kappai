@@ -90,7 +90,8 @@ static const char EDITOR_HCS_MOE_LAYERS_HINT[] =
 
 static const char *const HCS_FIELD_HINTS[HCS_REF_FIELD_COUNT] = {
 	"compute device, <backend><n>",
-	"phases this device runs for the weights it holds; prefill and decode must both be enabled",
+	"phases this device runs; only cpu devices can run a single phase, together they must cover "
+	"both",
 	"transformer layers held, a number or '*' for the remainder (one '*' per config)",
 	"experts of every layer cached (LRU) on this device, a number, '*' for the remainder (one '*' "
 	"per config) or empty for the default",
@@ -426,7 +427,7 @@ static void editor_hcs_row_text(const editor_state *st, int row, char *label, si
 	switch (ref.kind) {
 	case HCS_REF_DEVICE:
 		snprintf(label, label_cap, "Device %d", ref.device + 1);
-		snprintf(val, val_cap, "%s", d->name);
+		backend_device_label(d->name, val, val_cap);
 		break;
 	case HCS_REF_TASKS:
 		snprintf(label, label_cap, "  Tasks");
@@ -889,12 +890,15 @@ static void editor_edit_select(editor_state *st, const field_desc *f) {
 
 static void editor_edit_device(editor_state *st, const char *title, char *cur, size_t cap) {
 	char		specs[EDITOR_DEV_MAX][BACKEND_DEVICE_NAME_MAX];
+	char		labels[EDITOR_DEV_MAX][BACKEND_DEVICE_NAME_MAX + 48];
 	const char *choices[EDITOR_DEV_MAX + 2];
 	int			n	  = backend_enum_devices(specs, EDITOR_DEV_MAX);
 	int			extra = 0;
 
-	for (int i = 0; i < n; i++)
-		choices[i] = specs[i];
+	for (int i = 0; i < n; i++) {
+		backend_device_label(specs[i], labels[i], sizeof(labels[i]));
+		choices[i] = labels[i];
+	}
 	bool found = false;
 	for (int i = 0; i < n; i++)
 		if (strcmp(specs[i], cur) == 0)
@@ -902,9 +906,11 @@ static void editor_edit_device(editor_state *st, const char *title, char *cur, s
 	if (cur[0] && !found)
 		choices[n + extra++] = cur;
 	int cur_idx = 0;
-	for (int i = 0; i < n + extra; i++)
-		if (strcmp(choices[i], cur) == 0)
+	for (int i = 0; i < n; i++)
+		if (strcmp(specs[i], cur) == 0)
 			cur_idx = i;
+	if (extra)
+		cur_idx = n;
 	static const char custom[] = "custom...";
 	choices[n + extra]		   = custom;
 	int total				   = n + extra + 1;
@@ -920,8 +926,8 @@ static void editor_edit_device(editor_state *st, const char *title, char *cur, s
 			return;
 		snprintf(cur, cap, "%s", buf);
 		st->dirty = true;
-	} else if (strcmp(cur, choices[idx]) != 0) {
-		snprintf(cur, cap, "%s", choices[idx]);
+	} else if (idx < n && strcmp(cur, specs[idx]) != 0) {
+		snprintf(cur, cap, "%s", specs[idx]);
 		st->dirty = true;
 	}
 }

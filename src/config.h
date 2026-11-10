@@ -6,6 +6,7 @@
 #include <stdio.h>
 
 #define CONFIG_MAX_LAYER_DEVICES 8
+#define CONFIG_MAX_CPU_CLUSTERS 8
 #define CONFIG_PRIORITY_UNSET (-1)
 
 struct backend;
@@ -22,7 +23,6 @@ typedef struct config {
 	const char		*fuse;
 	uint64_t		 seed;
 
-	int			n_threads;
 	int			ctx_size;
 	int			kv_quant;
 	int			moe_cache_cap;
@@ -37,6 +37,7 @@ typedef struct config {
 	int			expert_priorities[CONFIG_MAX_LAYER_DEVICES];
 	const char *expert_pins[CONFIG_MAX_LAYER_DEVICES];
 	int			host_priority;
+	unsigned	cpu_cluster_tasks[CONFIG_MAX_CPU_CLUSTERS];
 
 	bool debug;
 	bool use_mmap;

@@ -458,12 +458,12 @@ static void check_device_name(violations *v, const hcs_config *h, int idx,
 
 static void check_device_fields(violations *v, const hcs_config *h, int idx, int *star_owner) {
 	const hcs_device *d = &h->devices[idx];
-	if (d->tasks != HCS_TASKS_ALL)
-		add_violation(
-			v, d->name, "tasks",
-			!d->tasks ? "no tasks listed; a device must run both prefill and decode"
-					  : "splitting prefill/decode execution is not supported yet; "
-						"a device must run both prefill and decode ('tasks = prefill, decode')");
+	if (!d->tasks)
+		add_violation(v, d->name, "tasks", "no tasks listed; use prefill, decode or both");
+	else if (d->tasks != HCS_TASKS_ALL && !backend_device_is_host(d->name))
+		add_violation(v, d->name, "tasks",
+					  "only cpu devices can run a single task; this device must run both "
+					  "prefill and decode ('tasks = prefill, decode')");
 	if (d->layers == HCS_COUNT_UNSET)
 		add_violation(v, d->name, "layers", "not set; use a layer count or '*'");
 	if (d->layers != HCS_COUNT_ALL)
@@ -556,6 +556,23 @@ static bool check_coverage(violations *v, const hcs_config *h, hcs_field field, 
 	return true;
 }
 
+static void check_cpu_task_coverage(violations *v, const hcs_config *h) {
+	unsigned covered = 0;
+	int		 first	 = -1;
+	for (int i = 0; i < h->n_devices; i++) {
+		if (!backend_device_is_host(h->devices[i].name))
+			continue;
+		covered |= h->devices[i].tasks;
+		first = first < 0 ? i : first;
+	}
+	if (first < 0)
+		return;
+	if (!(covered & HCS_TASK_PREFILL))
+		add_violation(v, h->devices[first].name, "tasks", "no cpu device runs prefill");
+	if (!(covered & HCS_TASK_DECODE))
+		add_violation(v, h->devices[first].name, "tasks", "no cpu device runs decode");
+}
+
 static int first_set_experts(const hcs_config *h) {
 	for (int i = 0; i < h->n_devices; i++)
 		if (h->devices[i].experts != HCS_COUNT_UNSET)
@@ -621,7 +638,8 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 		if (n_experts == 0 && d->has_priority)
 			add_violation(v, d->name, "priority", "model is not a MoE model; remove this key");
 		bool no_experts = (d->experts == 0 || d->experts == HCS_COUNT_UNSET) && !d->pins[0];
-		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET)
+		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET &&
+			!backend_device_is_host(d->name))
 			add_violation(v, d->name, "device", "holds nothing; remove it from 'devices'");
 	}
 }
@@ -658,6 +676,7 @@ int hcs_validate(const hcs_config *config, const char *model_path, bool moe_stre
 		check_device_fields(&v, h, i, &star_owner);
 	}
 	int experts_star_owner = check_experts_star(&v, h);
+	check_cpu_task_coverage(&v, h);
 
 	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
 	if (h->n_devices > 0) {
@@ -737,10 +756,24 @@ static void materialize_expert_parts(const hcs_config *h, int n_experts, config 
 	}
 }
 
+static void materialize_cpu_tasks(const hcs_config *eff, config *cfg) {
+	memset(cfg->cpu_cluster_tasks, 0, sizeof(cfg->cpu_cluster_tasks));
+	for (int d = 0; d < eff->n_devices; d++) {
+		char name[BACKEND_DEVICE_NAME_MAX];
+		int	 cluster = 0;
+		if (!backend_device_is_host(eff->devices[d].name) ||
+			backend_parse_device(eff->devices[d].name, name, sizeof(name), &cluster) != 0 ||
+			cluster >= CONFIG_MAX_CPU_CLUSTERS)
+			continue;
+		cfg->cpu_cluster_tasks[cluster] |= eff->devices[d].tasks;
+	}
+}
+
 void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
 	hcs_config eff = hcs_effective(h);
 	cfg->ngl	   = -1;
 	cfg->device	   = h->devices[0].name;
+	materialize_cpu_tasks(&eff, cfg);
 	if (eff.n_devices >= 2)
 		materialize_layer_map(h, model_path, cfg);
 
