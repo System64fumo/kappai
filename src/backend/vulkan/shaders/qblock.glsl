@@ -40,9 +40,8 @@ const uint	KV_BYTES[16] = uint[16](0x81u, 0x98u, 0xADu, 0xBFu, 0xCFu, 0xDDu, 0xE
 									0x0Du, 0x19u, 0x26u, 0x35u, 0x45u, 0x59u, 0x71u);
 
 void qblock_init() {
-	if (gl_LocalInvocationIndex < 64u)
-		s_kv[gl_LocalInvocationIndex >> 4u][gl_LocalInvocationIndex & 15u] =
-			KV_BYTES[gl_LocalInvocationIndex & 15u] << ((gl_LocalInvocationIndex >> 4u) * 8u);
+	for (uint i = gl_LocalInvocationIndex; i < 64u; i += gl_WorkGroupSize.x)
+		s_kv[i >> 4u][i & 15u] = KV_BYTES[i & 15u] << ((i >> 4u) * 8u);
 }
 
 uint kv4(uint q, uint shift) {

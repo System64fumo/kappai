@@ -492,9 +492,10 @@ static int g_probed = -1;
 
 #define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT + VK_MMF_TYPES)
 
-#define VQ_MV(t, label)                                                                            \
+#define VQ_MV(family, type, label)                                                                 \
 	{                                                                                              \
-		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
+		shader_##family##_##type##_spv, sizeof(shader_##family##_##type##_spv),                    \
+			shader_##family##_wg16_##type##_spv, sizeof(shader_##family##_wg16_##type##_spv), {    \
 			"q_matvec_" label, "q_matvec_m4_" label                                                \
 		}                                                                                          \
 	}
@@ -2028,14 +2029,16 @@ static void vk_qcore_init(vk_priv *p) {
 	static const struct {
 		const uint32_t *spv;
 		size_t			len;
+		const uint32_t *spv_wg16;
+		size_t			len_wg16;
 		const char	   *name[2];
 	} MV[VQ_COUNT] = {
-		[VQ_Q4_0] = VQ_MV(q_matvec_q4_0, "q4_0"),  [VQ_Q4_1] = VQ_MV(q_matvec_q4_1, "q4_1"),
-		[VQ_Q5_0] = VQ_MV(q_matvec_q5_0, "q5_0"),  [VQ_Q5_1] = VQ_MV(q_matvec_q5_1, "q5_1"),
-		[VQ_Q8_0] = VQ_MV(q_matvec_q8_0, "q8_0"),  [VQ_IQ4_NL] = VQ_MV(q_matvec_iq4_nl, "iq4_nl"),
-		[VQ_Q4_K] = VQ_MV(kq_matvec_q4_k, "q4_k"), [VQ_Q5_K] = VQ_MV(kq_matvec_q5_k, "q5_k"),
-		[VQ_Q6_K] = VQ_MV(kq_matvec_q6_k, "q6_k"), [VQ_F32] = VQ_MV(dense_matvec_f32, "f32"),
-		[VQ_F16] = VQ_MV(dense_matvec_f16, "f16"), [VQ_BF16] = VQ_MV(dense_matvec_bf16, "bf16"),
+		[VQ_Q4_0] = VQ_MV(q_matvec, q4_0, "q4_0"),	[VQ_Q4_1] = VQ_MV(q_matvec, q4_1, "q4_1"),
+		[VQ_Q5_0] = VQ_MV(q_matvec, q5_0, "q5_0"),	[VQ_Q5_1] = VQ_MV(q_matvec, q5_1, "q5_1"),
+		[VQ_Q8_0] = VQ_MV(q_matvec, q8_0, "q8_0"),	[VQ_IQ4_NL] = VQ_MV(q_matvec, iq4_nl, "iq4_nl"),
+		[VQ_Q4_K] = VQ_MV(kq_matvec, q4_k, "q4_k"), [VQ_Q5_K] = VQ_MV(kq_matvec, q5_k, "q5_k"),
+		[VQ_Q6_K] = VQ_MV(kq_matvec, q6_k, "q6_k"), [VQ_F32] = VQ_MV(dense_matvec, f32, "f32"),
+		[VQ_F16] = VQ_MV(dense_matvec, f16, "f16"), [VQ_BF16] = VQ_MV(dense_matvec, bf16, "bf16"),
 	};
 	static const struct {
 		const uint32_t *spv;
@@ -2099,7 +2102,9 @@ static void vk_qcore_init(vk_priv *p) {
 	p->p_q8_quant[1].name = "q8k_quant";
 	for (int t = 0; t < VQ_COUNT; t++) {
 		for (int c = 0; c < 2; c++) {
-			if (vk_create_pipeline_spec(p, MV[t].spv, MV[t].len, 4, 16, VQ_MV_SPEC[c],
+			bool wg16 = p->caps.is_mali;
+			if (vk_create_pipeline_spec(p, wg16 ? MV[t].spv_wg16 : MV[t].spv,
+										wg16 ? MV[t].len_wg16 : MV[t].len, 4, 16, VQ_MV_SPEC[c],
 										sizeof(VQ_MV_SPEC[c]), &p->p_qmv[t][c]) != OK)
 				return;
 			p->p_qmv[t][c].name = MV[t].name[c];

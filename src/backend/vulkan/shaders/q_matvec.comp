@@ -5,7 +5,9 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+#ifndef WG
 #define WG 64
+#endif
 #define MAX_SUBGROUPS 16
 
 layout(local_size_x = WG) in;
@@ -37,6 +39,9 @@ pc;
 #include "qblock.glsl"
 
 shared float s_red[16 * MAX_SUBGROUPS];
+#ifdef SHARED_REDUCE
+shared float s_part[8 * WG];
+#endif
 
 void main() {
 	qblock_init();
@@ -91,11 +96,16 @@ void main() {
 		}
 	}
 
+#ifdef SHARED_REDUCE
+	for (uint i = 0u; i < ROWS * COLS; i++)
+		s_part[i * WG + tid] = acc[i];
+#else
 	for (uint i = 0u; i < ROWS * COLS; i++) {
 		float v = subgroupAdd(acc[i]);
 		if (subgroupElect())
 			s_red[i * MAX_SUBGROUPS + gl_SubgroupID] = v;
 	}
+#endif
 	barrier();
 	if (tid >= ROWS * COLS)
 		return;
@@ -106,8 +116,13 @@ void main() {
 	if (row >= n || col >= m)
 		return;
 	float v = 0.0;
+#ifdef SHARED_REDUCE
+	for (uint s = 0u; s < WG; s++)
+		v += s_part[tid * WG + s];
+#else
 	for (uint s = 0u; s < gl_NumSubgroups; s++)
 		v += s_red[tid * MAX_SUBGROUPS + s];
+#endif
 	uint yi = col * n + row;
 	if (pc.res_mode == 1)
 		y[yi] = v + res[row];
