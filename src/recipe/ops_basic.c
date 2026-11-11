@@ -122,7 +122,7 @@ void profile_weight_bytes(profile *prof, stage s, uint32_t w_type, int rows, int
 int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, compute_scratch *s,
 									int li, buffer *xb, buffer *ys[], int n_rows,
 									status_code *out_status) {
-	backend *a = m->backend;
+	backend *a = model_layer_backend(m, li);
 	if (!a->matmul_multi_batch || n_ops < 2) {
 		*out_status = OK;
 		return 0;
@@ -148,13 +148,17 @@ int exec_matmul_run_coalesced_batch(const recipe_op *ops, int n_ops, model *m, c
 	status_code st = a->matmul_multi_batch(a, w_list, w_types, xb, ys, n_out, k, n, n_rows);
 	profile_end(prof, &ps);
 
+	if (st == ERR_UNSUPPORTED) {
+		*out_status = OK;
+		return 0;
+	}
 	*out_status = st;
 	return n;
 }
 
 int exec_matmul_run_qonly(const recipe_op *ops, int n_ops, model *m, buffer *xb, buffer **y_list,
 						  int li, int n_rows, status_code *out_status) {
-	backend *a	= m->backend;
+	backend *a	= model_layer_backend(m, li);
 	*out_status = OK;
 	if (n_ops < 2 || !backend_has_cap(a, BCAP_MATMUL_QONLY) || !a->prequantize_x ||
 		!a->matmul_qonly)

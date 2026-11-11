@@ -181,6 +181,11 @@ static status_code layer_run_step(layer_run *w, exec_ctx *ctx, const recipe_op *
 		if (consumed == 0 && coalesced_status == OK)
 			consumed = exec_matmul_run_qonly(&lops[j], run_len, m, batch_slot(w->bs, rop->in[0]),
 											 ys, li, w->rows.n_rows, &coalesced_status);
+		if (consumed != 0 && coalesced_status != OK) {
+			ERROR("layer %d op[%d] node %d coalesced matmul failed: %s", li, j, node_id,
+				  status_str(coalesced_status));
+			return coalesced_status;
+		}
 		if (consumed < 0)
 			return coalesced_status;
 		if (consumed > 0) {
