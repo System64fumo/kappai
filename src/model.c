@@ -870,10 +870,7 @@ static status_code upload_tensor_repack_to(model *m, const void *host_ptr, uint3
 		return OK;
 	}
 
-	status_code s = upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out, 0);
-	if (s != OK)
-		return s;
-	return OK;
+	return upload_tensor_to(m, host_ptr, type, n_dims, d0, d1, wc, target_backend, out, 0);
 }
 
 static void dequant_weight_to_f32(const backend *dev, const void **w, uint32_t *type,

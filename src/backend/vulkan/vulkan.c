@@ -599,6 +599,30 @@ static int vk_device_count(void) {
 	return (int)count;
 }
 
+static int vk_device_uma(int device_index) {
+	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
+								.apiVersion = VK_API_VERSION_1_1};
+	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+								.pApplicationInfo = &app};
+	VkInstance			 inst;
+	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
+		return 0;
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	int uma = 0;
+	if (device_index >= 0 && (uint32_t)device_index < count) {
+		VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
+		vkEnumeratePhysicalDevices(inst, &count, devs);
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(devs[device_index], &props);
+		uma = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+			  props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+		free(devs);
+	}
+	vkDestroyInstance(inst, NULL);
+	return uma;
+}
+
 static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap);
 
 static status_code vk_device_identity(int device_index, char *out, size_t cap) {
@@ -1994,12 +2018,6 @@ have_set:;
 	p->pending_dispatches++;
 	p->ring[p->ring_cur].has_work = 1;
 	return OK;
-}
-
-static status_code vk_dispatch(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
-							   const void *push, uint32_t push_size, uint32_t groups_x) {
-	uint32_t wmask = (n_bufs > 0) ? (1u << (n_bufs - 1)) : 0;
-	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, 1, wmask);
 }
 
 static status_code vk_dispatch_2d_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs,
@@ -4329,9 +4347,8 @@ static status_code vk_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
 	int			 total_pairs = n_active * (head_dim / 2);
 
-	static int dumped	= 0;
-	int		   n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-	uint64_t   total;
+	int		 n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+	uint64_t total;
 	if (kv_q8)
 		total = (uint64_t)(n_active * n_blocks * 2) * (uint64_t)m;
 	else
@@ -4370,8 +4387,9 @@ static vk_kv_range vk_kv_range_get(const buffer *k, const buffer *v, int layer, 
 								   int n_rows, int head_dim, int n_ctx, int n_active) {
 	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	size_t				row_bytes =
-		kh->kv_row_bytes > 0 ? kh->kv_row_bytes : (size_t)head_dim * sizeof(uint16_t);
+	size_t row_bytes	   = kh->kv_quant == KV_QUANT_Q8_0
+								 ? (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34
+								 : (size_t)head_dim * sizeof(uint16_t);
 	return (vk_kv_range){
 		.kb			 = vk_kv_layer_buf(kh, layer, NULL),
 		.vb			 = vk_kv_layer_buf(vh, layer, NULL),
@@ -6125,6 +6143,15 @@ static void vk_submit(backend *self) {
 	status_code s = vk_run_cmd(p);
 	if (s != OK)
 		ERROR("vk: vk_submit: submit failed (%s)", status_str(s));
+}
+
+static bool vk_is_idle(backend *self) {
+	vk_priv *p = self->priv;
+	if (!p->dev || p->device_lost || !p->timeline_supported)
+		return false;
+	if (p->ring[p->ring_cur].has_work)
+		vk_submit(self);
+	return vk_timeline_done(p, p->last_signal_value) != 0;
 }
 
 static void vk_begin_batch(backend *self) {
@@ -8307,6 +8334,7 @@ static status_code vk_ctor(backend *out) {
 	out->probe = vk_probe;
 	out->device_count					 = vk_device_count;
 	out->device_identity				 = vk_device_identity;
+	out->device_uma						 = vk_device_uma;
 	out->init							 = vk_init;
 	out->free							 = vk_free;
 	out->buffer_alloc_weight			 = vk_buffer_alloc_weight;
@@ -8361,6 +8389,7 @@ static status_code vk_ctor(backend *out) {
 	out->synchronize					 = vk_synchronize;
 	out->set_gpu_profile				 = vk_set_gpu_profile;
 	out->submit							 = vk_submit;
+	out->is_idle						 = vk_is_idle;
 	out->begin_batch					 = vk_begin_batch;
 	out->end_batch						 = vk_end_batch;
 	out->rmsnorm_per_head				 = vk_rmsnorm_per_head;

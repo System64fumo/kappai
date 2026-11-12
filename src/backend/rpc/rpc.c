@@ -934,7 +934,7 @@ static status_code hello(backend *self, rpc_priv *p, bool *present) {
 	const uint8_t *types = rpc_rd_bytes(&rd, RPC_TYPE_MAX);
 	if (types)
 		memcpy(p->type_native, types, RPC_TYPE_MAX);
-	snprintf(p->device, sizeof(p->device), "%s", p->desc);
+	snprintf(p->device, sizeof(p->device), "%.*s", (int)sizeof(p->device) - 1, p->desc);
 	read_hello_exts(&rd, p);
 	self->caps = (caps & ~(uint64_t)RPC_FORWARD_MASK) | BCAP_REMOTE;
 	s		   = rd.bad ? ERR_FORMAT : OK;

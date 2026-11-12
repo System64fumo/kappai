@@ -330,6 +330,17 @@ status_code compute_forward_prefill_pipelined(model *m, kvcache *cache, compute_
 											flash_attn, logits_out, done, ud);
 }
 
+status_code compute_prefill_range(model *m, kvcache *cache, compute_scratch *s,
+								  const int32_t *tokens, int n_tokens, int pos_start,
+								  int flash_attn, const recipe_layer_gate *gate,
+								  float *logits_out) {
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	return compute_prefill_range_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn, gate,
+										logits_out);
+}
+
 status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
 								  const int32_t *tokens, int n_tokens, int flash_attn,
 								  float *hidden_out) {

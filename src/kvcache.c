@@ -857,3 +857,56 @@ status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_sta
 		return ERR_INVALID_ARG;
 	return kvcache_put_range(c, m, layer, pos_start, k_in, v_in, kv_row_stride, n_rows);
 }
+
+static bool kvcache_range_view(const kvcache *c, const model *m, int layer, buffer **kb,
+							   buffer **vb, int *slot, backend **be, int *hd, int *kvh) {
+	if (c->is_mla || c->hybrid || layer < 0 || layer >= c->n_kv_layers)
+		return false;
+	if (kvcache_device_view(c, 0, layer, kb, vb, slot) < 0)
+		return false;
+	*hd	 = model_layer_head_dim(m, layer);
+	*kvh = model_layer_kv_heads(m, layer);
+	if (*kvh <= 0)
+		return false;
+	*be = (*kb)->owner ? (*kb)->owner : c->backend;
+	return true;
+}
+
+size_t kvcache_range_bytes(const kvcache *c, const model *m, int layer, int n_rows) {
+	buffer	*kb, *vb;
+	backend *be;
+	int		 slot, hd, kvh;
+	if (!kvcache_range_view(c, m, layer, &kb, &vb, &slot, &be, &hd, &kvh))
+		return 0;
+	return 2 * (size_t)kvh * (size_t)n_rows * kv_row_bytes(c->kv_quant, hd);
+}
+
+status_code kvcache_export_range(kvcache *c, const model *m, int layer, int pos_start, int n_rows,
+								 void *dst) {
+	buffer	*kb, *vb;
+	backend *be;
+	int		 slot, hd, kvh;
+	if (!kvcache_range_view(c, m, layer, &kb, &vb, &slot, &be, &hd, &kvh))
+		return OK;
+	if (!be->kv_export)
+		return ERR_UNSUPPORTED;
+	size_t side = (size_t)kvh * (size_t)n_rows * kv_row_bytes(c->kv_quant, hd);
+	ensure_sync(be);
+	return be->kv_export(be, kb, vb, slot, pos_start, n_rows, kvcache_kv_heads_stride(c), hd,
+						 c->n_ctx, kvh, dst, (uint8_t *)dst + side);
+}
+
+status_code kvcache_import_range(kvcache *c, const model *m, int layer, int pos_start, int n_rows,
+								 const void *src) {
+	buffer	*kb, *vb;
+	backend *be;
+	int		 slot, hd, kvh;
+	if (!kvcache_range_view(c, m, layer, &kb, &vb, &slot, &be, &hd, &kvh))
+		return OK;
+	if (!be->kv_import)
+		return ERR_UNSUPPORTED;
+	size_t side = (size_t)kvh * (size_t)n_rows * kv_row_bytes(c->kv_quant, hd);
+	ensure_sync(be);
+	return be->kv_import(be, kb, vb, slot, pos_start, n_rows, kvcache_kv_heads_stride(c), hd,
+						 c->n_ctx, kvh, src, (const uint8_t *)src + side);
+}

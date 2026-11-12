@@ -1697,26 +1697,58 @@ static status_code cpu_kv_range_copy(backend *self, const buffer *k, const buffe
 									 int pos_start, int n_rows, int n_kv_heads, int head_dim,
 									 int n_ctx, int n_kv_heads_active, void *k_host, void *v_host,
 									 const void *k_src, const void *v_src) {
-	cpu_priv *p		   = self->priv;
-	int		  n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-	size_t	  rows	   = cpu_kv_layer_rows(p, layer, n_ctx);
-	if (rows < (size_t)n_ctx)
+	cpu_priv *p			= self->priv;
+	int		  n_active	= n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	size_t	  rows		= cpu_kv_layer_rows(p, layer, n_ctx);
+	bool	  compacted = rows < (size_t)n_ctx;
+	if (compacted && !p->kv_base_pos)
 		return ERR_UNSUPPORTED;
 
 	size_t row_bytes  = kv_row_bytes(p->kv_quant, head_dim);
 	size_t kvh_stride = rows * row_bytes;
 	size_t layer_base = cpu_kv_layer_base(p, layer, (size_t)n_kv_heads * kvh_stride, 1);
 	size_t span		  = (size_t)n_rows * row_bytes;
+	if (compacted && k_src)
+		cpu_kv_put_slot(p, layer, pos_start + n_rows - 1, n_ctx, k->handle, v->handle, layer_base,
+						kvh_stride, row_bytes, n_active);
+	size_t base_pos = compacted ? p->kv_base_pos[layer] : 0;
+
 	for (int kvh = 0; kvh < n_active; kvh++) {
-		size_t cache_off = layer_base + (size_t)kvh * kvh_stride + (size_t)pos_start * row_bytes;
-		size_t host_off	 = (size_t)kvh * span;
-		if (k_src) {
-			memcpy((uint8_t *)k->handle + cache_off, (const uint8_t *)k_src + host_off, span);
-			memcpy((uint8_t *)v->handle + cache_off, (const uint8_t *)v_src + host_off, span);
+		size_t head_off = layer_base + (size_t)kvh * kvh_stride;
+		size_t host_off = (size_t)kvh * span;
+		if (!compacted) {
+			size_t cache_off = head_off + (size_t)pos_start * row_bytes;
+			if (k_src) {
+				memcpy((uint8_t *)k->handle + cache_off, (const uint8_t *)k_src + host_off, span);
+				memcpy((uint8_t *)v->handle + cache_off, (const uint8_t *)v_src + host_off, span);
+				continue;
+			}
+			memcpy((uint8_t *)k_host + host_off, (const uint8_t *)k->handle + cache_off, span);
+			memcpy((uint8_t *)v_host + host_off, (const uint8_t *)v->handle + cache_off, span);
 			continue;
 		}
-		memcpy((uint8_t *)k_host + host_off, (const uint8_t *)k->handle + cache_off, span);
-		memcpy((uint8_t *)v_host + host_off, (const uint8_t *)v->handle + cache_off, span);
+		for (int t = 0; t < n_rows; t++) {
+			size_t pos		= (size_t)pos_start + (size_t)t;
+			size_t row_host = host_off + (size_t)t * row_bytes;
+			bool   present	= pos >= base_pos && pos - base_pos < rows;
+			size_t row_off	= head_off + (pos - base_pos) * row_bytes;
+			if (k_src) {
+				if (!present)
+					continue;
+				memcpy((uint8_t *)k->handle + row_off, (const uint8_t *)k_src + row_host,
+					   row_bytes);
+				memcpy((uint8_t *)v->handle + row_off, (const uint8_t *)v_src + row_host,
+					   row_bytes);
+				continue;
+			}
+			if (!present) {
+				memset((uint8_t *)k_host + row_host, 0, row_bytes);
+				memset((uint8_t *)v_host + row_host, 0, row_bytes);
+				continue;
+			}
+			memcpy((uint8_t *)k_host + row_host, (const uint8_t *)k->handle + row_off, row_bytes);
+			memcpy((uint8_t *)v_host + row_host, (const uint8_t *)v->handle + row_off, row_bytes);
+		}
 	}
 	return OK;
 }
@@ -3273,9 +3305,10 @@ status_code cpu_matmul_multi(backend *self, const buffer **w, const uint32_t *w_
 	return OK;
 }
 
-status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
-								   const buffer *x, buffer **y, const int *n_list, int k,
-								   int n_matmuls, int m) {
+static status_code cpu_matmul_multi_batch_local(backend *self, const buffer **w,
+												const uint32_t *w_types, const buffer *x,
+												buffer **y, const int *n_list, int k, int n_matmuls,
+												int m) {
 	if (m <= 1) {
 		buffer *y1[CPU_MATMUL_MULTI_MAX];
 		for (int i = 0; i < n_matmuls; i++)
@@ -3389,6 +3422,19 @@ status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32
 	return OK;
 }
 
+static status_code cpu_matmul_batch_local(backend *self, const buffer *w, uint32_t w_type,
+										  const buffer *x, buffer *y, int n, int k, int m);
+
+static status_code cpu_matmul_batch_prequant(backend *self, const void *W, uint32_t w_type,
+											 const void *xq, size_t xq_row_stride, float *yf, int n,
+											 int k, int m);
+
+status_code cpu_matmul_multi_batch(backend *self, const buffer **w, const uint32_t *w_types,
+								   const buffer *x, buffer **y, const int *n_list, int k,
+								   int n_matmuls, int m) {
+	return cpu_matmul_multi_batch_local(self, w, w_types, x, y, n_list, k, n_matmuls, m);
+}
+
 status_code cpu_matmul(backend *self, const buffer *w, uint32_t w_type, const buffer *x, buffer *y,
 					   int n, int k) {
 	return cpu_matmul_batch(self, w, w_type, x, y, n, k, 1);
@@ -3438,8 +3484,8 @@ static status_code cpu_matmul_batch_prequant(backend *self, const void *W, uint3
 	return OK;
 }
 
-status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
-							 buffer *y, int n, int k, int m) {
+static status_code cpu_matmul_batch_local(backend *self, const buffer *w, uint32_t w_type,
+										  const buffer *x, buffer *y, int n, int k, int m) {
 	cpu_priv	*p	= self->priv;
 	const float *xf = cpu_ptr(x);
 	float		*yf = cpu_ptr(y);
@@ -3477,6 +3523,11 @@ status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type, co
 
 	cpu_matmul_dispatch_rows(p->pool, w_type, n, job, cpu_matmul_rows_worker);
 	return OK;
+}
+
+status_code cpu_matmul_batch(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+							 buffer *y, int n, int k, int m) {
+	return cpu_matmul_batch_local(self, w, w_type, x, y, n, k, m);
 }
 
 status_code cpu_prequantize_x(backend *self, const buffer *x, int k, uint32_t q8_type,

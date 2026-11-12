@@ -519,11 +519,18 @@ bool backend_device_uma(const char *spec) {
 	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
 		return false;
 
-	backend_info infos[BACKEND_MAX];
-	int			 n_backends = backend_list(infos, BACKEND_MAX);
-	for (int i = 0; i < n_backends; i++)
-		if (strcmp(infos[i].name, name) == 0)
-			return (infos[i].caps & BCAP_UNIFIED_MEMORY) != 0;
+	backend_load();
+	for (int i = 0; i < g_registry_count; i++) {
+		if (strcmp(g_registry[i].name, name) != 0)
+			continue;
+		backend probe;
+		memset(&probe, 0, sizeof(probe));
+		if (g_registry[i].ctor(&probe) != OK)
+			return false;
+		if (probe.device_uma)
+			return probe.device_uma(device_index) != 0;
+		return (probe.caps & BCAP_UNIFIED_MEMORY) != 0;
+	}
 	return false;
 }
 

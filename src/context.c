@@ -2,6 +2,7 @@
 #include "backend/cpu/common.h"
 #include "compute.h"
 #include "config.h"
+#include "coop.h"
 #include "log.h"
 #include "memory.h"
 #include "model.h"
@@ -360,6 +361,17 @@ status_code context_init(context *c, const config *cfg) {
 					goto fail_model;
 			}
 
+	backend *prefill_backends[CONFIG_MAX_LAYER_DEVICES];
+	int		 n_prefill_backends = 0;
+	if (c->m.moe.n_experts == 0)
+		for (int i = 0; i < cfg->n_prefill_devices; i++) {
+			s = context_open_device(c, cfg->prefill_devices[i],
+									&prefill_backends[n_prefill_backends]);
+			if (s != OK)
+				goto fail_model;
+			n_prefill_backends++;
+		}
+
 	c->backend->rope_neox = c->m.arch_info->uses_neox_rope;
 
 	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
@@ -497,6 +509,7 @@ status_code context_init(context *c, const config *cfg) {
 	compute_scratch_init(&c->scratch);
 	c->scratch.interrupt	 = &c->interrupt;
 	c->scratch.model.backend = c->backend;
+	coop_open(&c->coop, c, cfg, prefill_backends, n_prefill_backends);
 	sampler_init(&c->samp, cfg->seed);
 	sampler_set_vocab(&c->samp, c->m.vocab_size);
 	c->fed_ids.p   = xmalloc((size_t)n_ctx * sizeof(int32_t));
@@ -526,6 +539,7 @@ void context_free(context *c) {
 	monitor_free(&c->monitor);
 	atomic_store(&g_monitor, NULL);
 	sampler_free(&c->samp);
+	coop_close(c->coop);
 	compute_scratch_free(&c->scratch);
 	kvcache_free(&c->kv);
 	chat_template_free(&c->chat);
@@ -568,6 +582,7 @@ status_code context_slot_init(context *s, const context *e) {
 	s->session_poisoned	  = false;
 	s->last_prompt_tokens = 0;
 	s->sync_render		  = e->sync_render ? xstrdup(e->sync_render) : NULL;
+	s->coop				  = NULL;
 	s->idle.active		  = false;
 	s->yield			  = NULL;
 	s->yield_ud			  = NULL;
@@ -1007,9 +1022,25 @@ int context_feed_tokens_batch(context *c, const int32_t *tokens, int n, bool qui
 		compute_set_layer_progress_cb(&c->scratch, prefill_progress_on_layer, &pp);
 	}
 
-	int status = ERR_COMPUTE_FAIL;
-	int chunk_offset;
-	if (n > chunk && compute_prefill_pipelinable(&c->m)) {
+	int			status		 = ERR_COMPUTE_FAIL;
+	int			chunk_offset = 0;
+	status_code coop_st		 = ERR_UNSUPPORTED;
+	if (coop_usable(c->coop, c, n)) {
+		compute_set_layer_progress_cb(&c->scratch, NULL, NULL);
+		coop_st = coop_prefill(c->coop, c, tokens, n, pos, chunk, show_progress ? &prog : NULL,
+							   saved_cb, saved_cb_ud);
+		if (show_progress)
+			compute_set_layer_progress_cb(&c->scratch, prefill_progress_on_layer, &pp);
+		else
+			compute_set_layer_progress_cb(&c->scratch, saved_cb, saved_cb_ud);
+	}
+	if (coop_st != OK && coop_st != ERR_UNSUPPORTED) {
+		status = coop_st;
+		goto fail;
+	}
+	if (coop_st == OK)
+		chunk_offset = n;
+	else if (n > chunk && compute_prefill_pipelinable(&c->m)) {
 		pipelined_prefill pf = {.c = c, .prog = show_progress ? &prog : NULL, .n = n};
 		compute_set_layer_progress_cb(&c->scratch, NULL, NULL);
 		status_code pst = compute_forward_prefill_pipelined(

@@ -1286,3 +1286,66 @@ status_code compute_forward_sequence_recipe(model *m, compute_scratch *s, const 
 	row_desc rows = {.n_rows = n_tokens, .needs_logits = outputs, .token_type = token_type};
 	return compute_forward_rows(m, &rows, s, tokens, flash_attn, scores, NULL);
 }
+
+status_code compute_prefill_range_recipe(struct model *m, struct kvcache *cache,
+										 struct compute_scratch *s, const int32_t *tokens,
+										 int n_tokens, int pos_start, int flash_attn,
+										 const recipe_layer_gate *gate, float *logits_out) {
+	if (n_tokens < 1)
+		return OK;
+	if (!recipe_is_decode_batchable(m) || model_mixed_backend_mode(m))
+		return ERR_UNSUPPORTED;
+	const model_recipe *r = m->recipe;
+	const part_plan	   *p = r->part;
+	if (!p || p->n_nodes != 2 || p->nodes[0].kind != PART_COMPUTE)
+		return ERR_UNSUPPORTED;
+
+	row_desc rows = {.n_rows = n_tokens, .pos_start = pos_start, .cache = cache, .last_only = 1};
+	batch_scratch *bs = batch_scratch_prepare(m, s, n_tokens);
+	bs->tokens		  = tokens;
+
+	status_code st = embd_fill_rows(m->backend, &m->tok_embd.buf, m->tok_embd.type, tokens,
+									&bs->pair[r->embd_slot].b, n_tokens, m->dim,
+									m->arch_info->has_scale_embeddings ? m->dim_sqrt : 1.0f);
+	if (st != OK)
+		return st;
+	st = exec_outer_schedule(r->exec, &r->exec->pre, OP_EMBD_LOOKUP, OP_SCALE_EMBEDDINGS, m, cache,
+							 s, bs, pos_start, n_tokens, flash_attn, NULL);
+	if (st != OK)
+		return st;
+
+	const part_node span = p->nodes[0];
+	for (int li = span.first_layer; li < span.first_layer + span.n_layers; li++) {
+		if (gate && gate->before) {
+			st = gate->before(gate->ud, li);
+			if (st != OK)
+				return st;
+		}
+		part_node one	= span;
+		one.first_layer = li;
+		one.n_layers	= 1;
+		st				= part_run_layers(m, s, &rows, &one, tokens, flash_attn);
+		if (st != OK)
+			return st;
+		if (gate && gate->after) {
+			st = gate->after(gate->ud, li);
+			if (st != OK)
+				return st;
+		}
+	}
+	if (!logits_out)
+		return OK;
+	st = part_run_gather(m, s, p, &p->nodes[1], &rows);
+	if (st != OK)
+		return st;
+	return batch_run_post_ops(m, cache, s, bs, rows_n_logit_rows(&rows), flash_attn, logits_out);
+}
+
+status_code compute_logits_publish(struct model *m, struct compute_scratch *s,
+								   const float *logits) {
+	const model_recipe *r	  = m->recipe;
+	const size_t		total = (size_t)model_output_size(m);
+	bs_ensure_slot(s->bs, m->backend, r->logits_slot, total);
+	buffer *dst = batch_slot(s->bs, r->logits_slot);
+	return dst->owner->buffer_write_f32(dst->owner, dst, logits, total);
+}

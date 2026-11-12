@@ -300,6 +300,7 @@ struct backend {
 	status_code (*probe)(void);
 	int (*device_count)(void);
 	status_code (*device_identity)(int device_index, char *out, size_t cap);
+	int (*device_uma)(int device_index);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -429,6 +430,7 @@ struct backend {
 	void (*synchronize)(backend *self);
 	void (*set_gpu_profile)(backend *self, int enable);
 	void (*submit)(backend *self);
+	bool (*is_idle)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
 	status_code (*rmsnorm_batch)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,

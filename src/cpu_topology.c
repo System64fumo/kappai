@@ -11,7 +11,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define CLUSTER_PERF_TOLERANCE_PCT 15
+#define CLUSTER_PERF_TOLERANCE_PCT 2
 
 typedef struct {
 	int	 cpu;
@@ -61,6 +61,27 @@ static long read_cpu_sysfs(int cpu, const char *file) {
 #endif
 }
 
+static long read_domain_capacity(int cpu) {
+#if defined(__linux__)
+	char path[96];
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpufreq/related_cpus", cpu);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return read_cpu_sysfs(cpu, "cpu_capacity");
+	long best = read_cpu_sysfs(cpu, "cpu_capacity");
+	int	 sibling;
+	while (fscanf(f, "%d", &sibling) == 1) {
+		long capacity = read_cpu_sysfs(sibling, "cpu_capacity");
+		if (capacity > best)
+			best = capacity;
+	}
+	fclose(f);
+	return best;
+#else
+	return read_cpu_sysfs(cpu, "cpu_capacity");
+#endif
+}
+
 static long sample_perf(const cpu_sample *s, bool use_capacity, bool use_khz) {
 	if (use_capacity)
 		return s->capacity;
@@ -83,7 +104,7 @@ static void build_topology(void) {
 	bool	   use_khz		= true;
 	for (int i = 0; i < n; i++) {
 		samples[i].cpu		= cpus[i];
-		samples[i].capacity = read_cpu_sysfs(cpus[i], "cpu_capacity");
+		samples[i].capacity = read_domain_capacity(cpus[i]);
 		samples[i].khz		= read_cpu_sysfs(cpus[i], "cpufreq/cpuinfo_max_freq");
 		use_capacity &= samples[i].capacity > 0;
 		use_khz &= samples[i].khz > 0;

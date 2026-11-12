@@ -38,6 +38,8 @@ typedef struct config {
 	const char *expert_pins[CONFIG_MAX_LAYER_DEVICES];
 	int			host_priority;
 	unsigned	cpu_cluster_tasks[CONFIG_MAX_CPU_CLUSTERS];
+	int			n_prefill_devices;
+	char		prefill_devices[CONFIG_MAX_LAYER_DEVICES][64];
 
 	bool debug;
 	bool use_mmap;

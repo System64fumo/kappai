@@ -1,4 +1,6 @@
 #ifndef CPU_THREADPOOL_H
+#include <stdbool.h>
+
 #define CPU_THREADPOOL_H
 
 #include <stddef.h>
@@ -22,6 +24,7 @@ typedef struct tpool tpool;
 tpool *tpool_create(const tpool_member *members, int n_threads);
 void   tpool_destroy(tpool *pool);
 int	   tpool_current_tid(void);
+bool   tpool_phase_is_prefill(void);
 int	   tpool_default_n_threads(void);
 tpool *tpool_fetch_pool(void);
 void   tpool_bind_phase(tpool *pool, unsigned phase);

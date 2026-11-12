@@ -202,6 +202,10 @@ int tpool_current_tid(void) {
 	return tpool_cur_tid;
 }
 
+bool tpool_phase_is_prefill(void) {
+	return tpool_cur_roster == tpool_roster_index(TPOOL_PHASE_PREFILL);
+}
+
 static int tpool_retired_pred(void *ud) {
 	tpool *pool = ud;
 	return atomic_load_explicit(&pool->sync.active_workers, memory_order_acquire) == 0;

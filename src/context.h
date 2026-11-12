@@ -15,6 +15,8 @@
 #include <signal.h>
 #include <stdatomic.h>
 
+struct coop;
+
 typedef struct {
 	model				  m;
 	tokenizer			  tok;
@@ -37,6 +39,7 @@ typedef struct {
 	bool				  borrows_backend;
 	mem_topology		  topo;
 	char				  extra_specs[CONFIG_MAX_LAYER_DEVICES][64];
+	struct coop			 *coop;
 	monitor_layer_tracker layer_tracker;
 	chat_template_state	  chat;
 	bool				  warmup_done;

@@ -460,10 +460,12 @@ static void check_device_fields(violations *v, const hcs_config *h, int idx, int
 	const hcs_device *d = &h->devices[idx];
 	if (!d->tasks)
 		add_violation(v, d->name, "tasks", "no tasks listed; use prefill, decode or both");
-	else if (d->tasks != HCS_TASKS_ALL && !backend_device_is_host(d->name))
+	else if (d->tasks != HCS_TASKS_ALL && !backend_device_is_host(d->name) &&
+			 !(d->tasks == HCS_TASK_PREFILL && backend_device_uma(d->name)))
 		add_violation(v, d->name, "tasks",
-					  "only cpu devices can run a single task; this device must run both "
-					  "prefill and decode ('tasks = prefill, decode')");
+					  "only cpu devices, or a unified-memory device running 'prefill' alone, can "
+					  "run a single task; this device must run both prefill and decode "
+					  "('tasks = prefill, decode')");
 	if (d->layers == HCS_COUNT_UNSET)
 		add_violation(v, d->name, "layers", "not set; use a layer count or '*'");
 	if (d->layers != HCS_COUNT_ALL)
@@ -639,7 +641,7 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 			add_violation(v, d->name, "priority", "model is not a MoE model; remove this key");
 		bool no_experts = (d->experts == 0 || d->experts == HCS_COUNT_UNSET) && !d->pins[0];
 		if (held[i] == 0 && no_experts && d->layers != HCS_COUNT_UNSET &&
-			!backend_device_is_host(d->name))
+			!backend_device_is_host(d->name) && d->tasks != HCS_TASK_PREFILL)
 			add_violation(v, d->name, "device", "holds nothing; remove it from 'devices'");
 	}
 }
@@ -758,6 +760,14 @@ static void materialize_expert_parts(const hcs_config *h, int n_experts, config 
 
 static void materialize_cpu_tasks(const hcs_config *eff, config *cfg) {
 	memset(cfg->cpu_cluster_tasks, 0, sizeof(cfg->cpu_cluster_tasks));
+	cfg->n_prefill_devices = 0;
+	for (int d = 0; d < eff->n_devices; d++)
+		if (!backend_device_is_host(eff->devices[d].name) &&
+			eff->devices[d].tasks == HCS_TASK_PREFILL &&
+			cfg->n_prefill_devices < CONFIG_MAX_LAYER_DEVICES) {
+			char *slot = cfg->prefill_devices[cfg->n_prefill_devices++];
+			snprintf(slot, sizeof(cfg->prefill_devices[0]), "%s", eff->devices[d].name);
+		}
 	for (int d = 0; d < eff->n_devices; d++) {
 		char name[BACKEND_DEVICE_NAME_MAX];
 		int	 cluster = 0;

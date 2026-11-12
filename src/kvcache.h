@@ -74,6 +74,12 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 bool		kvcache_can_shift(const kvcache *c, const model *m);
 status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks);
 
+size_t		kvcache_range_bytes(const kvcache *c, const model *m, int layer, int n_rows);
+status_code kvcache_export_range(kvcache *c, const model *m, int layer, int pos_start, int n_rows,
+								 void *dst);
+status_code kvcache_import_range(kvcache *c, const model *m, int layer, int pos_start, int n_rows,
+								 const void *src);
+
 status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_start,
 							  const buffer *k_in, const buffer *v_in, int kv_row_stride,
 							  int n_rows);
