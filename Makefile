@@ -206,7 +206,7 @@ VK_PLAIN := argmax argmax_reduce sample_topk sample_final sample_penalty sample_
             ffn_activate_fused_batch layernorm_modulate rope_table attention_dense im2col \
             upsample_shortcut hc_init hc_final hc_post hc_pre_coef hc_pre_mix kda_conv kda_l2norm \
             kda_gate kda_delta kda_out mla_absorb_q mla_absorb_attn mla_kv_put mla_attention \
-            gdn_conv gdn_heads
+            gdn_conv gdn_heads shortconv
 VK_MATMUL := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k \
              matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16 matmul_iq2_s matmul_iq2_xxs \
              matmul_iq3_xxs matmul_iq4_xs

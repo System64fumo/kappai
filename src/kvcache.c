@@ -96,6 +96,15 @@ static status_code kvcache_alloc_layer_state(backend *be, buffer *out, size_t fl
 	return buffer_alloc_f32(be, floats, out);
 }
 
+static int kvcache_layer_kv_heads(const model *m, int layer) {
+	if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
+		layer < m->n_layers)
+		return m->layer_dims.n_kv_heads_per_layer[layer] > 0
+				   ? m->layer_dims.n_kv_heads_per_layer[layer]
+				   : 0;
+	return model_layer_kv_heads(m, layer);
+}
+
 static status_code kvcache_alloc_layer_state_bufs(kvcache_hybrid *q, const model *m,
 												  int (*layer_wants)(const model *, int)) {
 	const size_t n = (size_t)m->n_layers;
@@ -259,14 +268,8 @@ status_code kvcache_init(kvcache *c, const model *m, int n_ctx, kv_quant_type kv
 		layer_head_dim	 = xcalloc(m->n_layers, sizeof(int));
 		layer_n_kv_heads = xcalloc(m->n_layers, sizeof(int));
 		for (int i = 0; i < m->n_layers; i++) {
-			layer_head_dim[i] = model_layer_head_dim(m, i);
-			int kvh			  = model_layer_kv_heads(m, i);
-			if (!m->arch_info->has_variable_layer_dims && m->layer_dims.n_kv_heads_per_layer &&
-				i < m->n_layers)
-				kvh = m->layer_dims.n_kv_heads_per_layer[i] > 0
-						  ? m->layer_dims.n_kv_heads_per_layer[i]
-						  : 0;
-			layer_n_kv_heads[i] = kvh;
+			layer_head_dim[i]	= model_layer_head_dim(m, i);
+			layer_n_kv_heads[i] = kvcache_layer_kv_heads(m, i);
 		}
 	}
 
@@ -860,12 +863,12 @@ status_code kvcache_put_batch(kvcache *c, const model *m, int layer, int pos_sta
 
 static bool kvcache_range_view(const kvcache *c, const model *m, int layer, buffer **kb,
 							   buffer **vb, int *slot, backend **be, int *hd, int *kvh) {
-	if (c->is_mla || c->hybrid || layer < 0 || layer >= c->n_kv_layers)
+	if (c->is_mla || (c->hybrid && c->hybrid->owns_all_kv) || layer < 0 || layer >= c->n_kv_layers)
 		return false;
 	if (kvcache_device_view(c, 0, layer, kb, vb, slot) < 0)
 		return false;
 	*hd	 = model_layer_head_dim(m, layer);
-	*kvh = model_layer_kv_heads(m, layer);
+	*kvh = kvcache_layer_kv_heads(m, layer);
 	if (*kvh <= 0)
 		return false;
 	*be = (*kb)->owner ? (*kb)->owner : c->backend;
@@ -909,4 +912,75 @@ status_code kvcache_import_range(kvcache *c, const model *m, int layer, int pos_
 	ensure_sync(be);
 	return be->kv_import(be, kb, vb, slot, pos_start, n_rows, kvcache_kv_heads_stride(c), hd,
 						 c->n_ctx, kvh, src, (const uint8_t *)src + side);
+}
+
+size_t kvcache_state_bytes(const kvcache *c, const model *m, int layer) {
+	if (!c->hybrid || !model_layer_is_recurrent(m, layer))
+		return 0;
+	return (c->hybrid->conv_stride + c->hybrid->recurrent_stride) * sizeof(float);
+}
+
+status_code kvcache_export_state(kvcache *c, const model *m, int layer, float *dst) {
+	kvcache_hybrid *q = c->hybrid;
+	if (!kvcache_state_bytes(c, m, layer))
+		return OK;
+	if (!q->conv_buf) {
+		memcpy(dst, q->conv_state + (size_t)layer * q->conv_stride, q->conv_stride * sizeof(float));
+		if (q->recurrent_stride)
+			memcpy(dst + q->conv_stride, q->recurrent_state + (size_t)layer * q->recurrent_stride,
+				   q->recurrent_stride * sizeof(float));
+		return OK;
+	}
+	buffer	*conv = &q->conv_buf[layer];
+	backend *be	  = conv->owner ? conv->owner : c->backend;
+	if (!be->buffer_read_f32)
+		return ERR_UNSUPPORTED;
+	ensure_sync(be);
+	status_code st = be->buffer_read_f32(be, conv, dst, (int)q->conv_stride);
+	if (st == OK && q->recurrent_stride)
+		st = be->buffer_read_f32(be, &q->state_buf[layer], dst + q->conv_stride,
+								 (int)q->recurrent_stride);
+	return st;
+}
+
+status_code kvcache_import_state(kvcache *c, const model *m, int layer, const float *src) {
+	kvcache_hybrid *q = c->hybrid;
+	if (!kvcache_state_bytes(c, m, layer))
+		return OK;
+	if (!q->conv_buf) {
+		memcpy(q->conv_state + (size_t)layer * q->conv_stride, src, q->conv_stride * sizeof(float));
+		if (q->recurrent_stride)
+			memcpy(q->recurrent_state + (size_t)layer * q->recurrent_stride, src + q->conv_stride,
+				   q->recurrent_stride * sizeof(float));
+		return OK;
+	}
+	buffer	*conv = &q->conv_buf[layer];
+	backend *be	  = conv->owner ? conv->owner : c->backend;
+	if (!be->buffer_write_f32)
+		return ERR_UNSUPPORTED;
+	ensure_sync(be);
+	status_code st = be->buffer_write_f32(be, conv, src, (int)q->conv_stride);
+	if (st == OK && q->recurrent_stride)
+		st = be->buffer_write_f32(be, &q->state_buf[layer], src + q->conv_stride,
+								  (int)q->recurrent_stride);
+	return st;
+}
+
+static int kvcache_recurrent_layer(const model *m, int li) {
+	return model_layer_is_recurrent(m, li);
+}
+
+status_code kvcache_adopt_device_conv_state(kvcache *c, const model *m) {
+	kvcache_hybrid *q = c->hybrid;
+	if (!q || !m->arch_info->hybrid_shortconv || q->conv_buf || q->recurrent_stride > 0)
+		return OK;
+	for (int li = 0; li < m->n_layers; li++)
+		if (model_layer_is_recurrent(m, li) && !model_layer_backend(m, li)->shortconv_dev)
+			return OK;
+	status_code s = kvcache_alloc_layer_state_bufs(q, m, kvcache_recurrent_layer);
+	if (s != OK)
+		return s;
+	free(q->conv_state);
+	q->conv_state = NULL;
+	return OK;
 }

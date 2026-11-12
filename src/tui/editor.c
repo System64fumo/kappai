@@ -804,7 +804,7 @@ static void editor_draw_hcs_panel(const editor_state *st) {
 }
 
 static void editor_draw_hcs_banner(const editor_state *st) {
-	static const char alpha[] = "HCS is currently in Alpha stages, Advanced users only";
+	static const char alpha[] = "HCS is currently in Beta stages, Advanced users only";
 	ui_putn(2, 3, alpha, COLS - 6, A_BOLD | ui_attr(UI_ERR));
 	if (!st->sc.hcs.enabled)
 		return;

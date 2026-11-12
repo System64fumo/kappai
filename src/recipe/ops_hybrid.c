@@ -269,10 +269,57 @@ static int lfm_attn_buf(const model *m) {
 	return buf > q_out ? buf : q_out;
 }
 
+static status_code op_shortconv_device(exec_ctx *ctx, backend *a) {
+	model					  *m	 = ctx->m;
+	layer_weights			  *L	 = &m->layers[ctx->li];
+	const model_hybrid_params *p	 = &m->hybrid;
+	buffer					  *mixed = exec_slot(ctx, ctx->op->in[0]);
+	buffer					  *out	 = exec_slot(ctx, ctx->op->out);
+	if (!mixed || !out || !L->ssm_conv1d_w.buf.owner || p->conv_kernel < 2)
+		return ERR_INVALID_ARG;
+
+	profile_scope ps		 = profile_begin(&ctx->s->prof, ctx->op->stage);
+	int			  in_stride	 = model_hybrid_proj_size(m);
+	int			  out_stride = lfm_attn_buf(m);
+	exec_segments seg		 = exec_segments_of(ctx);
+	status_code	  st		 = OK;
+	for (int c = 0; c < seg.n_calls && st == OK; c++) {
+		kvcache_hybrid *hc = exec_segment_cache(ctx, c)->hybrid;
+		if (!hc || !hc->conv_buf) {
+			st = ERR_INVALID_ARG;
+			break;
+		}
+		int				   row0	   = exec_seg_row0(&seg, c);
+		int				   rows	   = exec_seg_rows(&seg, c);
+		buffer			   mixed_v = gdn_rows(mixed, row0, in_stride, rows);
+		buffer			   out_v   = gdn_rows(out, row0, out_stride, rows);
+		shortconv_dev_desc d	   = {
+			.n_rows		= rows,
+			.dim		= m->dim,
+			.kernel		= p->conv_kernel,
+			.in_stride	= in_stride,
+			.out_stride = out_stride,
+			.reset		= exec_segment_pos(ctx, c) == 0,
+			.mixed		= &mixed_v,
+			.conv_w		= &L->ssm_conv1d_w.buf,
+			.state		= &hc->conv_buf[ctx->li],
+			.out		= &out_v,
+		};
+		st = a->shortconv_dev(a, &d);
+	}
+	profile_end(&ctx->s->prof, &ps);
+	return st;
+}
+
 status_code op_shortconv(exec_ctx *ctx) {
 	if (!ctx || !ctx->m || !ctx->s ||
 		(!ctx->op->u.shortconv.centered && (!ctx->rows.cache || !ctx->rows.cache->hybrid)))
 		return ERR_INVALID_ARG;
+	if (!ctx->op->u.shortconv.centered) {
+		backend *dev = exec_layer_backend(ctx);
+		if (dev->shortconv_dev && ctx->rows.cache->hybrid->conv_buf)
+			return op_shortconv_device(ctx, dev);
+	}
 	model					  *m	  = ctx->m;
 	layer_weights			  *L	  = &m->layers[ctx->li];
 	const model_hybrid_params *p	  = &m->hybrid;

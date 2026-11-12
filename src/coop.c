@@ -30,6 +30,7 @@ typedef struct {
 	bool		last;
 	_Atomic int layers_done;
 	void	  **stage;
+	void	  **state;
 	int		   *left;
 } coop_range;
 
@@ -104,11 +105,34 @@ static int coop_hard_rows(const model *m) {
 	return MAX(8, m->sliding_window / 4) + 1;
 }
 
-static bool coop_model_eligible(const model *m) {
+static const char *coop_model_blocker(const model *m) {
 	const arch_info *ai = m->arch_info;
-	return m->recipe && !m->full_sequence && !model_mixed_backend_mode(m) && !ai->is_moe &&
-		   !ai->hybrid_shortconv && !ai->is_hybrid_recurrent && !ai->is_kda && !ai->is_mla &&
-		   coop_hard_rows(m) >= COOP_MIN_ROWS && recipe_is_decode_batchable(m);
+	if (!m->recipe)
+		return "model recipe is not built";
+	if (m->full_sequence)
+		return "full-sequence (embedding) models are not supported";
+	if (model_mixed_backend_mode(m))
+		return "layer-split (mixed backend) mode is active";
+	if (ai->is_moe)
+		return "mixture-of-experts models are not supported";
+	if (ai->is_kda)
+		return "KDA models are not supported";
+	if (ai->is_mla)
+		return "MLA models are not supported";
+	if (coop_hard_rows(m) < COOP_MIN_ROWS)
+		return "sliding window is too small to split into ranges";
+	if (!recipe_is_decode_batchable(m))
+		return "the device cannot batch every operation of this model";
+	return NULL;
+}
+
+static const char *coop_backend_blocker(const backend *be, const model *m) {
+	const arch_info *ai = m->arch_info;
+	if (ai->hybrid_shortconv && !be->shortconv)
+		return "device lacks shortconv";
+	if (ai->is_hybrid_recurrent && !ai->hybrid_shortconv && !be->gated_delta_net)
+		return "device lacks gated_delta_net";
+	return NULL;
 }
 
 static void coop_fail(coop_board *b, status_code st) {
@@ -129,6 +153,7 @@ static coop_range *coop_new_range(coop_board *b, int pos_start, int n, int tok_o
 	atomic_init(&r->layers_done, 0);
 	r->stage = xcalloc((size_t)b->n_layers, sizeof(void *));
 	r->left	 = xcalloc((size_t)b->n_layers, sizeof(int));
+	r->state = xcalloc((size_t)b->n_layers, sizeof(void *));
 	return r;
 }
 
@@ -146,7 +171,8 @@ static void coop_report_progress(coop_board *b, const coop_lane *lane) {
 		b->layer_cb(atomic_load(&lane->flight_layers), b->n_layers, done_tokens, 1, b->layer_cb_ud);
 }
 
-static status_code coop_export_layer(coop_board *b, coop_lane *lane, coop_range *r, int layer) {
+static status_code coop_export_layer(coop_board *b, coop_lane *lane, coop_range *r, int layer,
+									 bool with_state) {
 	void  *buf	 = NULL;
 	size_t bytes = kvcache_range_bytes(lane->kv, lane->m, layer, r->n);
 	if (bytes) {
@@ -157,7 +183,19 @@ static status_code coop_export_layer(coop_board *b, coop_lane *lane, coop_range 
 			return st;
 		}
 	}
+	void  *state	   = NULL;
+	size_t state_bytes = with_state ? kvcache_state_bytes(lane->kv, lane->m, layer) : 0;
+	if (state_bytes) {
+		state		   = xmalloc(state_bytes);
+		status_code st = kvcache_export_state(lane->kv, lane->m, layer, state);
+		if (st != OK) {
+			free(buf);
+			free(state);
+			return st;
+		}
+	}
 	pthread_mutex_lock(&b->mu);
+	r->state[layer] = state;
 	r->stage[layer] = buf;
 	r->left[layer]	= buf ? b->n_consumers : 0;
 	atomic_store(&r->layers_done, layer + 1);
@@ -213,6 +251,11 @@ static status_code coop_import_upto(coop_board *b, coop_lane *lane, int layer, i
 					return st;
 				coop_consume(b, r, layer);
 			}
+			if (lane->cursor[layer] == upto - 1 && r->state[layer]) {
+				st = kvcache_import_state(lane->kv, lane->m, layer, r->state[layer]);
+				if (st != OK)
+					return st;
+			}
 		}
 		lane->cursor[layer]++;
 	}
@@ -235,7 +278,14 @@ static status_code coop_after(void *ud, int layer) {
 	coop_gate *g			= ud;
 	uint64_t   export_start = time_us();
 	g->lane->compute_us += export_start - g->started_us;
-	status_code st = coop_export_layer(g->board, g->lane, &g->board->ranges[g->range], layer);
+	status_code st = coop_export_layer(g->board, g->lane, &g->board->ranges[g->range], layer, true);
+	if (st == OK && g->range > 0) {
+		coop_range *prev = &g->board->ranges[g->range - 1];
+		pthread_mutex_lock(&g->board->mu);
+		free(prev->state[layer]);
+		prev->state[layer] = NULL;
+		pthread_mutex_unlock(&g->board->mu);
+	}
 	g->lane->export_us += time_us() - export_start;
 	atomic_store(&g->lane->flight_layers, layer + 1);
 	coop_report_progress(g->board, g->lane);
@@ -363,7 +413,7 @@ static status_code coop_stage_gap(coop_board *b, coop_lane *primary, int gap_sta
 	for (int off = gap_start; off < pos; off += COOP_GAP_PIECE_ROWS) {
 		coop_range *r = coop_new_range(b, off, MIN(COOP_GAP_PIECE_ROWS, pos - off), -1, 0);
 		for (int layer = 0; layer < b->n_layers; layer++) {
-			status_code st = coop_export_layer(b, primary, r, layer);
+			status_code st = coop_export_layer(b, primary, r, layer, off + r->n >= pos);
 			if (st != OK)
 				return st;
 		}
@@ -412,9 +462,12 @@ static status_code coop_run_lanes(coop *k, coop_board *b) {
 
 static void coop_release_board(coop *k, coop_board *b) {
 	for (int i = 0; i < b->n_ranges; i++) {
-		for (int layer = 0; layer < b->n_layers; layer++)
+		for (int layer = 0; layer < b->n_layers; layer++) {
 			free(b->ranges[i].stage[layer]);
+			free(b->ranges[i].state[layer]);
+		}
 		free(b->ranges[i].stage);
+		free(b->ranges[i].state);
 		free(b->ranges[i].left);
 	}
 	free(b->ranges);
@@ -554,8 +607,9 @@ void coop_close(coop *k) {
 	free(k);
 }
 
-static status_code coop_lane_load(coop_lane *lane, const context *c, const config *cfg,
-								  backend *be) {
+static status_code coop_lane_load(coop_lane *lane, const context *c, const config *cfg, backend *be,
+								  const char **why) {
+	*why		  = NULL;
 	lane->be	  = be;
 	lane->m		  = &lane->own_m;
 	lane->kv	  = &lane->own_kv;
@@ -573,10 +627,17 @@ static status_code coop_lane_load(coop_lane *lane, const context *c, const confi
 	st			  = model_upload_weights(&lane->own_m);
 	if (st == OK)
 		st = model_build_recipe(&lane->own_m);
-	if (st == OK && !coop_model_eligible(&lane->own_m))
-		st = ERR_UNSUPPORTED;
+	if (st == OK) {
+		*why = coop_model_blocker(&lane->own_m);
+		if (!*why)
+			*why = coop_backend_blocker(be, &lane->own_m);
+		if (*why)
+			st = ERR_UNSUPPORTED;
+	}
 	if (st == OK)
 		st = kvcache_init(&lane->own_kv, &lane->own_m, c->n_ctx, c->kv.kv_quant);
+	if (st == OK)
+		st = kvcache_adopt_device_conv_state(&lane->own_kv, &lane->own_m);
 	lane->own_scratch.interrupt		= &c->interrupt;
 	lane->own_scratch.model.backend = be;
 	return st;
@@ -678,8 +739,13 @@ static void coop_calibrate(coop *k, int flash_attn) {
 status_code coop_open(coop **out, context *c, const config *cfg, backend *const *devices,
 					  int n_devices) {
 	*out = NULL;
-	if (n_devices < 1 || !coop_model_eligible(&c->m))
+	if (n_devices < 1)
 		return OK;
+	const char *blocker = coop_model_blocker(&c->m);
+	if (blocker) {
+		WARN("cooperative prefill disabled: %s", blocker);
+		return OK;
+	}
 	coop *k				= xcalloc(1, sizeof(*k));
 	k->lanes[0].be		= c->backend;
 	k->lanes[0].m		= &c->m;
@@ -689,21 +755,23 @@ status_code coop_open(coop **out, context *c, const config *cfg, backend *const 
 
 	for (int i = 0; i < n_devices && k->n_lanes < COOP_MAX_LANES; i++) {
 		if (coop_backend_taken(k, devices[i])) {
-			WARN("cooperative prefill: device '%s' shares a backend with another lane; skipped",
+			WARN("cooperative prefill: device '%s' skipped: it shares a backend with another lane",
 				 devices[i]->name);
 			continue;
 		}
 		coop_lane  *lane = &k->lanes[k->n_lanes];
-		status_code st	 = coop_lane_load(lane, c, cfg, devices[i]);
+		const char *why	 = NULL;
+		status_code st	 = coop_lane_load(lane, c, cfg, devices[i], &why);
 		if (st != OK) {
-			WARN("cooperative prefill: device '%s' unavailable (%s); skipped", devices[i]->name,
-				 status_str(st));
+			WARN("cooperative prefill: device '%s' skipped: %s", devices[i]->name,
+				 why ? why : status_str(st));
 			coop_lane_free(lane);
 			continue;
 		}
 		k->n_lanes++;
 	}
 	if (k->n_lanes < 2) {
+		WARN("cooperative prefill disabled: no usable prefill device");
 		coop_close(k);
 		return OK;
 	}

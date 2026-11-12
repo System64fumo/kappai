@@ -363,6 +363,8 @@ status_code context_init(context *c, const config *cfg) {
 
 	backend *prefill_backends[CONFIG_MAX_LAYER_DEVICES];
 	int		 n_prefill_backends = 0;
+	if (c->m.moe.n_experts > 0 && cfg->n_prefill_devices > 0)
+		WARN("cooperative prefill disabled: mixture-of-experts models are not supported");
 	if (c->m.moe.n_experts == 0)
 		for (int i = 0; i < cfg->n_prefill_devices; i++) {
 			s = context_open_device(c, cfg->prefill_devices[i],

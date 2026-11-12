@@ -74,6 +74,10 @@ status_code kvcache_put(kvcache *c, const model *m, int layer, int pos, const bu
 bool		kvcache_can_shift(const kvcache *c, const model *m);
 status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks);
 
+status_code kvcache_adopt_device_conv_state(kvcache *c, const model *m);
+size_t		kvcache_state_bytes(const kvcache *c, const model *m, int layer);
+status_code kvcache_export_state(kvcache *c, const model *m, int layer, float *dst);
+status_code kvcache_import_state(kvcache *c, const model *m, int layer, const float *src);
 size_t		kvcache_range_bytes(const kvcache *c, const model *m, int layer, int n_rows);
 status_code kvcache_export_range(kvcache *c, const model *m, int layer, int pos_start, int n_rows,
 								 void *dst);

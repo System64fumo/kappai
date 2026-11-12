@@ -317,6 +317,7 @@ typedef struct {
 	vk_pipeline_set p_mla_attention;
 	vk_pipeline_set p_gdn_conv;
 	vk_pipeline_set p_gdn_heads;
+	vk_pipeline_set p_shortconv;
 	vk_pipeline_set p_kv_put;
 	vk_pipeline_set p_kv_shift_gather;
 	vk_pipeline_set p_embd_lookup;
@@ -2684,6 +2685,11 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_gdn_heads.name = "gdn_heads";
+	s = vk_create_pipeline(p, shader_shortconv_spv, shader_shortconv_spv_len, 4, 24,
+						   &p->p_shortconv);
+	if (s != OK)
+		return s;
+	p->p_shortconv.name = "shortconv";
 	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 44,
 						   &p->p_kv_shift_gather);
 	if (s != OK)
@@ -3037,6 +3043,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_mla_attention);
 		vk_destroy_pipeline(p, &p->p_gdn_conv);
 		vk_destroy_pipeline(p, &p->p_gdn_heads);
+		vk_destroy_pipeline(p, &p->p_shortconv);
 		vk_destroy_pipeline(p, &p->p_kv_put);
 		vk_destroy_pipeline(p, &p->p_kv_shift_gather);
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
@@ -8265,6 +8272,70 @@ static status_code vk_gdn_scratch_alloc(backend *self, const gdn_desc *d, buffer
 	return OK;
 }
 
+static status_code vk_shortconv(backend *self, const shortconv_desc *d) {
+	(void)self;
+	if (!d || !d->out || !d->mixed || !d->conv_w || d->dim < 1 || d->n_rows < 1 ||
+		d->in_stride < 3 * d->dim || d->out_stride < d->dim || d->kernel < 2 ||
+		(d->centered ? d->kernel != 3 : !d->state))
+		return ERR_INVALID_ARG;
+	const int history = d->kernel - 1;
+	for (int t = 0; t < d->n_rows; t++) {
+		const float *row = d->mixed + (size_t)t * (size_t)d->in_stride;
+		float		*out = d->out + (size_t)t * (size_t)d->out_stride;
+		for (int i = 0; i < d->dim; i++) {
+			const float *w	 = d->conv_w + (size_t)i * (size_t)d->kernel;
+			float		 bx	 = row[i] * row[2 * d->dim + i];
+			float		 sum = 0.0f;
+			if (d->centered) {
+				sum = bx * w[1];
+				if (t > 0) {
+					const float *prev = row - d->in_stride;
+					sum += prev[i] * prev[2 * d->dim + i] * w[0];
+				}
+				if (t + 1 < d->n_rows) {
+					const float *next = row + d->in_stride;
+					sum += next[i] * next[2 * d->dim + i] * w[2];
+				}
+				out[i] = row[d->dim + i] * sum;
+				continue;
+			}
+			float *hist = d->state + (size_t)i * (size_t)history;
+			sum			= bx * w[d->kernel - 1];
+			for (int k = 0; k < history; k++)
+				sum += hist[k] * w[k];
+			memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
+			hist[history - 1] = bx;
+			out[i]			  = row[d->dim + i] * sum;
+		}
+	}
+	return OK;
+}
+
+static status_code vk_shortconv_dev(backend *self, const shortconv_dev_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_shortconv.pipeline)
+		return ERR_UNSUPPORTED;
+	const int hist = d->kernel - 1;
+	if (d->n_rows < 1 || d->dim < 1 || hist < 1 || hist > VK_KDA_MAX_HIST ||
+		d->in_stride < 3 * d->dim || d->out_stride < d->dim ||
+		(uint32_t)vk_groups64(d->dim) > p->caps.max_workgroup_count[0])
+		return ERR_INVALID_ARG;
+
+	const buffer *ops[] = {d->mixed, d->conv_w, d->state, d->out};
+	status_code	  s		= vk_require_resident(self, "shortconv", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t dim, kernel, n_rows, in_stride, out_stride, reset;
+	} push				 = {d->dim, d->kernel, d->n_rows, d->in_stride, d->out_stride, d->reset};
+	vk_buf		*bufs[4] = {as_vkbuf(d->mixed), as_vkbuf(d->conv_w), as_vkbuf(d->state),
+							as_vkbuf(d->out)};
+	VkDeviceSize offs[4] = {d->mixed->offset, d->conv_w->offset, d->state->offset, d->out->offset};
+	return vk_dispatch_ex(p, &p->p_shortconv, bufs, offs, NULL, 4, &push, sizeof(push),
+						  vk_groups64(d->dim), 1, 0xC);
+}
+
 static status_code vk_gated_delta_net(backend *self, const gdn_desc *d) {
 	vk_priv *p = self->priv;
 	if (!p->p_gdn_conv.pipeline || !p->p_gdn_heads.pipeline)
@@ -8433,6 +8504,8 @@ static status_code vk_ctor(backend *out) {
 	out->kv_alloc_mla					 = vk_kv_alloc_mla;
 	out->kv_put_mla						 = vk_kv_put_mla;
 	out->gated_delta_net				 = vk_gated_delta_net;
+	out->shortconv						 = vk_shortconv;
+	out->shortconv_dev					 = vk_shortconv_dev;
 	return OK;
 }
 
