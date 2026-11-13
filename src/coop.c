@@ -443,8 +443,14 @@ static status_code coop_prepare_lanes(coop *k, coop_board *b, int rows) {
 	return OK;
 }
 
+static void coop_release_worker_lanes(coop *k) {
+	for (int i = 1; i < k->n_lanes; i++)
+		backend_release_thread(k->lanes[i].be);
+}
+
 static status_code coop_run_lanes(coop *k, coop_board *b) {
 	bool started[COOP_MAX_LANES] = {false};
+	coop_release_worker_lanes(k);
 	for (int i = 1; i < k->n_lanes; i++) {
 		if (pthread_create(&k->lanes[i].thread, NULL, coop_thread_main, &k->lanes[i]) != 0) {
 			coop_fail(b, ERR_COMPUTE_FAIL);
@@ -705,6 +711,7 @@ static void *coop_calib_thread(void *arg) {
 static void coop_calibrate(coop *k, int flash_attn) {
 	for (int i = 0; i < k->n_lanes; i++)
 		coop_warm(&k->lanes[i], flash_attn);
+	coop_release_worker_lanes(k);
 
 	_Atomic int first_done = 0;
 	coop_calib	calib[COOP_MAX_LANES];

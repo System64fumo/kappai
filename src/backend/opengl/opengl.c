@@ -1308,6 +1308,13 @@ static status_code gl_device_identity(int device_index, char *out, size_t cap) {
 	return gl_render_node_identity(node, out, cap);
 }
 
+static int gl_device_uma(int device_index) {
+	int node = gl_render_node_at(device_index);
+	return node >= 0 && gl_render_node_uma(node);
+}
+
+static void gl_release_thread(backend *self);
+
 static status_code gl_init(backend *self, int device_index) {
 	(void)device_index;
 	gl_priv *p = xcalloc(1, sizeof(gl_priv));
@@ -1693,15 +1700,14 @@ static status_code gl_init(backend *self, int device_index) {
 
 	if (p->ctx.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
-	p->device_local_total_estimate =
-		p->ctx.video_memory_bytes ? p->ctx.video_memory_bytes
-								  : (p->ctx.unified_memory ? backend_mem_total(backend_host()) : 0);
+	p->device_local_total_estimate = p->ctx.video_memory_bytes;
 
 	log_tag("OGL", "%.*s", (int)backend_name_brief_len(p->ctx.renderer), p->ctx.renderer);
 	DEBUG("opengl: %s (max_wg=%d, shared=%dKB, ssbo_bindings=%d, attn_wg=%d, matmul_wg=%d)",
 		  p->ctx.renderer, p->ctx.max_wg_size, p->ctx.max_shared_bytes / 1024,
 		  p->ctx.max_ssbo_bindings, GL_ATTENTION_WG, p->matmul_wg);
 
+	gl_release_thread(self);
 	return OK;
 }
 
@@ -2087,17 +2093,19 @@ static status_code gl_copy_buffer(backend *self, const buffer *src, buffer *dst,
 	return OK;
 }
 
+static size_t gl_mem_total(backend *self) {
+	gl_priv *p = self->priv;
+	if (!p->device_local_total_estimate && p->ctx.unified_memory)
+		p->device_local_total_estimate = backend_mem_total(backend_host());
+	return p->device_local_total_estimate;
+}
+
 static size_t gl_mem_available(backend *self) {
 	gl_priv *p	   = self->priv;
-	size_t	 total = p->device_local_total_estimate;
+	size_t	 total = gl_mem_total(self);
 	if (total < p->device_local_allocated)
 		return 0;
 	return total - p->device_local_allocated;
-}
-
-static size_t gl_mem_total(backend *self) {
-	gl_priv *p = self->priv;
-	return p->device_local_total_estimate;
 }
 
 static void gl_release_thread(backend *self) {
@@ -4471,6 +4479,131 @@ static status_code gl_kv_put_batch(backend *self, buffer *k, buffer *v, int laye
 						  head_dim, n_ctx, n_kv_heads_active, m, 0);
 }
 
+static status_code gl_kv_write_region(gl_priv *p, gl_buf *b, size_t offset, const void *src,
+									  size_t bytes) {
+	gl_barrier_if_pending(p);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, b->name);
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)offset, (GLsizeiptr)bytes, src);
+	GLenum err = glGetError();
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	if (err != GL_NO_ERROR)
+		return ERR_INTERNAL;
+	gl_xq_cache_invalidate(p, b);
+	return OK;
+}
+
+static status_code gl_kv_range_transfer(backend *self, const buffer *kv, int layer, int pos_start,
+										int n_rows, int head_dim, int n_ctx, int n_active,
+										void *dst, const void *src) {
+	gl_priv *p		   = self->priv;
+	gl_buf	*b		   = gl_kv_layer_buf(kv, layer);
+	size_t	 dev_row   = p->kv_row_bytes;
+	size_t	 host_row  = kv_row_bytes(p->kv_quant, head_dim);
+	size_t	 head_span = (size_t)n_ctx * dev_row;
+	if (pos_start < 0 || n_rows < 0 || pos_start + n_rows > n_ctx || host_row > dev_row ||
+		(size_t)n_active * head_span > b->size_bytes)
+		return ERR_INVALID_ARG;
+	bool   whole	   = host_row == dev_row;
+	size_t rows_per_op = whole ? (size_t)n_rows : 1;
+	size_t ops		   = whole ? 1 : (size_t)n_rows;
+	for (int h = 0; h < n_active; h++)
+		for (size_t i = 0; i < ops; i++) {
+			size_t dev_off =
+				(size_t)h * head_span + ((size_t)pos_start + i * (whole ? 0 : 1)) * dev_row;
+			size_t		host_off = ((size_t)h * (size_t)n_rows + i * (whole ? 0 : 1)) * host_row;
+			size_t		bytes	 = rows_per_op * host_row;
+			status_code st =
+				dst ? gl_read_region_f32(p, b, dev_off, (uint8_t *)dst + host_off, bytes)
+					: gl_kv_write_region(p, b, dev_off, (const uint8_t *)src + host_off, bytes);
+			if (st != OK)
+				return st;
+		}
+	return OK;
+}
+
+static status_code gl_kv_read_batched(gl_priv *p, gl_buf *kb, gl_buf *vb, size_t first_off,
+									  size_t head_span, size_t span, int n_active, void *k_dst,
+									  void *v_dst) {
+	size_t	side	= (size_t)n_active * span;
+	size_t	pad		= (side + (size_t)255) & ~(size_t)255;
+	gl_buf *bufs[2] = {kb, vb};
+	void   *dsts[2] = {k_dst, v_dst};
+	gl_barrier_if_pending(p);
+	glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	if (p->ctx.unified_memory) {
+		size_t mapped = (size_t)(n_active - 1) * head_span + span;
+		for (int i = 0; i < 2; i++) {
+			void	   *src;
+			status_code st = gl_readback_map(p, bufs[i]->name, first_off, mapped, &src);
+			if (st != OK)
+				return st;
+			for (int h = 0; h < n_active; h++)
+				memcpy((uint8_t *)dsts[i] + (size_t)h * span,
+					   (const uint8_t *)src + (size_t)h * head_span, span);
+			gl_readback_unmap();
+		}
+		return OK;
+	}
+	status_code st = gl_readback_reserve(p, pad * 2);
+	if (st != OK)
+		return st;
+	glBindBuffer(GL_COPY_WRITE_BUFFER, p->readback->name);
+	for (int i = 0; i < 2; i++) {
+		glBindBuffer(GL_COPY_READ_BUFFER, bufs[i]->name);
+		for (int h = 0; h < n_active; h++)
+			glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+								(GLintptr)(first_off + (size_t)h * head_span),
+								(GLintptr)((size_t)i * pad + (size_t)h * span), (GLsizeiptr)span);
+	}
+	void *src;
+	st = gl_readback_map(p, p->readback->name, 0, pad * 2, &src);
+	if (st != OK)
+		return st;
+	memcpy(k_dst, src, side);
+	memcpy(v_dst, (const uint8_t *)src + pad, side);
+	gl_readback_unmap();
+	return OK;
+}
+
+static status_code gl_kv_export(backend *self, const buffer *k, const buffer *v, int layer,
+								int pos_start, int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								int n_kv_heads_active, void *k_dst, void *v_dst) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	int		n_active  = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	gl_buf *kb		  = gl_kv_layer_buf(k, layer);
+	gl_buf *vb		  = gl_kv_layer_buf(v, layer);
+	size_t	dev_row	  = p->kv_row_bytes;
+	size_t	head_span = (size_t)n_ctx * dev_row;
+	bool batched = n_rows > 0 && n_active > 0 && kv_row_bytes(p->kv_quant, head_dim) == dev_row &&
+				   pos_start >= 0 && pos_start + n_rows <= n_ctx &&
+				   (size_t)n_active * head_span <= kb->size_bytes &&
+				   (size_t)n_active * head_span <= vb->size_bytes;
+	if (batched)
+		return gl_kv_read_batched(p, kb, vb, (size_t)pos_start * dev_row, head_span,
+								  (size_t)n_rows * dev_row, n_active, k_dst, v_dst);
+	status_code st = gl_kv_range_transfer(self, k, layer, pos_start, n_rows, head_dim, n_ctx,
+										  n_active, k_dst, NULL);
+	if (st != OK)
+		return st;
+	return gl_kv_range_transfer(self, v, layer, pos_start, n_rows, head_dim, n_ctx, n_active, v_dst,
+								NULL);
+}
+
+static status_code gl_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								int n_kv_heads_active, const void *k_src, const void *v_src) {
+	gl_priv *p = self->priv;
+	GL_ENTER(p);
+	int			n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	status_code st		 = gl_kv_range_transfer(self, k, layer, pos_start, n_rows, head_dim, n_ctx,
+												n_active, NULL, k_src);
+	if (st != OK)
+		return st;
+	return gl_kv_range_transfer(self, v, layer, pos_start, n_rows, head_dim, n_ctx, n_active, NULL,
+								v_src);
+}
+
 static status_code gl_kv_shift(backend *self, buffer *k, buffer *v, int layer,
 							   const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 							   const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
@@ -6354,6 +6487,7 @@ static status_code gl_ctor(backend *out) {
 	out->probe							 = gl_probe;
 	out->device_count					 = gl_device_count;
 	out->device_identity				 = gl_device_identity;
+	out->device_uma						 = gl_device_uma;
 	out->init							 = gl_init;
 	out->free							 = gl_free;
 	out->buffer_alloc_weight			 = gl_buffer_alloc_weight;
@@ -6407,6 +6541,8 @@ static status_code gl_ctor(backend *out) {
 	out->kv_put							 = gl_kv_put;
 	out->kv_put_batch					 = gl_kv_put_batch;
 	out->kv_shift						 = gl_kv_shift;
+	out->kv_export						 = gl_kv_export;
+	out->kv_import						 = gl_kv_import;
 	out->attention_mla					 = gl_attention_mla;
 	out->kv_alloc_mla					 = gl_kv_alloc_mla;
 	out->kv_put_mla						 = gl_kv_put_mla;
