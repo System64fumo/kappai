@@ -145,7 +145,6 @@ BACKEND_LIBS :=
 BACKEND_OBJS :=
 
 define add_backend
-BACKEND_LIBS += $$(BACKEND_DIR)/libkappai_$(1)$$(SHLIB_SUFFIX)
 BACKEND_OBJS += $(2)
 $$(BACKEND_DIR)/libkappai_$(1)$$(SHLIB_SUFFIX): $(2) | $$(ENGINE)
 	@mkdir -p $$(@D)
@@ -154,19 +153,30 @@ $$(BACKEND_DIR)/libkappai_$(1)$$(SHLIB_SUFFIX): $(2) | $$(ENGINE)
 	$$(SPLIT_DEBUG)
 endef
 
+define use_backend
+BACKEND_LIBS += $$(BACKEND_DIR)/libkappai_$(1)$$(SHLIB_SUFFIX)
+endef
+
+ARCH_OPT := $(if $(filter 1,$(CPU_ARCH_OPT)),$(filter aarch64 x86_64,$(CPU_ARCH)),)
+SCALAR_LIB := $(BACKEND_DIR)/libkappai_cpu_scalar$(SHLIB_SUFFIX)
+
 $(eval $(call add_backend,cpu_scalar,$(call cpu_objs,scalar),))
 $(eval $(call add_backend,rpc,$(call backend_objs,rpc/rpc.o),))
+$(eval $(call use_backend,rpc))
 
-ifeq ($(CPU_ARCH_OPT),1)
-  ifneq ($(filter aarch64 x86_64,$(CPU_ARCH)),)
-    $(eval $(call add_backend,cpu_$(CPU_ARCH),$(call cpu_objs,$(CPU_ARCH)),))
-  endif
+ifeq ($(ARCH_OPT),)
+  $(eval $(call use_backend,cpu_scalar))
+else
+  $(eval $(call add_backend,cpu_$(CPU_ARCH),$(call cpu_objs,$(CPU_ARCH)),))
+  $(eval $(call use_backend,cpu_$(CPU_ARCH)))
+  $(OUT_DIR)/kappai-test: $(SCALAR_LIB)
 endif
 
 ifneq ($(HAS_VULKAN),)
   VK_PKG  := $(or $(call pkg,vulkan),-lvulkan)
   VK_OBJS := $(call backend_objs,vulkan/vulkan.o)
   $(eval $(call add_backend,vulkan,$(VK_OBJS),$(call pkg_libs,$(VK_PKG))))
+  $(eval $(call use_backend,vulkan))
   $(VK_OBJS): BACKEND_CFLAGS += -I$(OBJ_DIR)/backend/vulkan -I$(SRC_DIR)/backend/vulkan $(call pkg_flags,$(VK_PKG))
 endif
 
@@ -174,12 +184,14 @@ ifneq ($(HAS_OPENGL),)
   GL_PKG  := $(or $(call pkg,egl glesv2 gbm),-lEGL -lGLESv2 -lgbm)
   GL_OBJS := $(call backend_objs,opengl/opengl.o opengl/gl_context.o)
   $(eval $(call add_backend,opengl,$(GL_OBJS),$(call pkg_libs,$(GL_PKG))))
+  $(eval $(call use_backend,opengl))
   $(GL_OBJS): BACKEND_CFLAGS += -I$(OBJ_DIR)/backend/opengl -I$(SRC_DIR)/backend/opengl $(call pkg_flags,$(GL_PKG))
 endif
 
 ifneq ($(HAS_ROCKET),)
   RKT_OBJS := $(call backend_objs,rocket/rocket.o rocket/lut.o rocket/native.o rocket/matmul.o rocket/device.o rocket/emit.o)
   $(eval $(call add_backend,rocket,$(RKT_OBJS),))
+  $(eval $(call use_backend,rocket))
 endif
 
 ifneq ($(HAS_VULKAN),)
