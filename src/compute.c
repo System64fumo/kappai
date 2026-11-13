@@ -273,6 +273,7 @@ status_code compute_forward(model *m, kvcache *cache, compute_scratch *s, int to
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
+	backend_bind_phase(TPOOL_PHASE_DECODE);
 	return compute_forward_recipe(m, cache, s, token, pos, flash_attn, logits_out);
 }
 
@@ -301,6 +302,7 @@ status_code compute_forward_batch(model *m, kvcache *cache, compute_scratch *s,
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
+	backend_bind_phase(TPOOL_PHASE_PREFILL);
 	return compute_forward_batch_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn,
 										logits_out);
 }
@@ -323,8 +325,20 @@ status_code compute_forward_prefill_pipelined(model *m, kvcache *cache, compute_
 	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
 	if (st != OK)
 		return st;
+	backend_bind_phase(TPOOL_PHASE_PREFILL);
 	return compute_prefill_pipelined_recipe(m, cache, s, tokens, n_tokens, pos_start, chunk,
 											flash_attn, logits_out, done, ud);
+}
+
+status_code compute_prefill_range(model *m, kvcache *cache, compute_scratch *s,
+								  const int32_t *tokens, int n_tokens, int pos_start,
+								  int flash_attn, const recipe_layer_gate *gate,
+								  float *logits_out) {
+	status_code st = compute_scratch_ensure(s, m, cache->n_ctx);
+	if (st != OK)
+		return st;
+	return compute_prefill_range_recipe(m, cache, s, tokens, n_tokens, pos_start, flash_attn, gate,
+										logits_out);
 }
 
 status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
@@ -334,6 +348,7 @@ status_code compute_hidden_states(model *m, kvcache *cache, compute_scratch *s,
 	if (st != OK)
 		return st;
 	compute_scratch_reserve_rows(m, s, n_tokens);
+	backend_bind_phase(TPOOL_PHASE_PREFILL);
 	return compute_hidden_states_recipe(m, cache, s, tokens, n_tokens, flash_attn, hidden_out);
 }
 
@@ -344,6 +359,7 @@ status_code compute_forward_decode_batch(model *m, kvcache **caches, compute_scr
 	status_code st = compute_scratch_ensure(s, m, caches[0]->n_ctx);
 	if (st != OK)
 		return st;
+	backend_bind_phase(TPOOL_PHASE_DECODE);
 	return compute_forward_decode_batch_recipe(m, caches, s, tokens, positions, needs_logits,
 											   n_seqs, flash_attn, logits_out);
 }
@@ -358,6 +374,7 @@ status_code compute_forward_segments(model *m, kvcache **caches, compute_scratch
 	status_code st = compute_scratch_ensure(s, m, n_ctx);
 	if (st != OK)
 		return st;
+	backend_bind_phase(TPOOL_PHASE_PREFILL);
 	return compute_forward_segments_recipe(m, caches, s, tokens, seg_rows, seg_pos, n_segs,
 										   flash_attn, logits_out);
 }

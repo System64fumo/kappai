@@ -21,7 +21,8 @@ See [benchmarks](docs/benchmarks.md) for some examples.
 - CPU inference tuned for `aarch64` and `x86_64`
 - Vulkan and OpenGL backends
 - Experimental rk3588 NPU backend
-- A smart highly tunable scheduler (Alpha)
+- A smart highly tunable scheduler (Beta)
+- Cooperative prefill (Experimental)
 - Networked clustering
 - MoE expert streaming
 - An OpenAI-compatible server with tool calling

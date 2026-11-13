@@ -1053,6 +1053,98 @@ static status_code rkt_kv_put(backend *self, buffer *k, buffer *v, int layer, in
 							head_dim, n_ctx, n_kv_heads_active, 1);
 }
 
+static status_code rkt_kv_range_copy(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+									 int n_rows, int head_dim, int n_kv_heads_active,
+									 uint8_t *dst_k, uint8_t *dst_v, const uint8_t *src_k,
+									 const uint8_t *src_v) {
+	rkt_priv		  *p  = self->priv;
+	const rkt_kv_slot *sl = kv_slot_of(k, layer);
+	if (!sl || sl->hd != head_dim || !v || v->handle != k->handle)
+		return ERR_INVALID_ARG;
+	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : sl->kvh;
+	if (n_active > sl->kvh || n_rows < 1 || pos_start < 0 || pos_start + n_rows > sl->pos_pad)
+		return ERR_INVALID_ARG;
+	bool			  importing = src_k != NULL;
+	const rkt_kchunk *kc		= &sl->k->kchunks[0];
+	const rkt_kchunk *vc		= &sl->v->kchunks[0];
+	const int		  k_groups	= (head_dim + RKT_TILE_COLS - 1) / RKT_TILE_COLS;
+
+	pthread_mutex_lock(&p->lock);
+	status_code s = OK;
+	for (int h = 0; s == OK && h < n_active; h++)
+		for (int t = 0; s == OK && t < n_rows; t++) {
+			int				pos		 = pos_start + t;
+			size_t			host_off = ((size_t)h * (size_t)n_rows + (size_t)t) * (size_t)head_dim;
+			int				k_global = h * sl->pos_pad + pos;
+			const rkt_part *kp		 = rkt_part_for_row(kc, k_global);
+			if (!kp) {
+				s = ERR_INTERNAL;
+				break;
+			}
+			int local = k_global - kp->row_start;
+			for (int g = 0; g < k_groups; g++) {
+				int	   cols = MIN(RKT_TILE_COLS, head_dim - g * RKT_TILE_COLS);
+				size_t tile = ((size_t)(local / RKT_TILE_ROWS) * (kc->k_len / RKT_TILE_COLS) + g) *
+								  (RKT_TILE_ROWS * RKT_TILE_COLS) +
+							  (size_t)(local % RKT_TILE_ROWS) * RKT_TILE_COLS;
+				uint16_t *dev  = (uint16_t *)kp->bo.map + tile;
+				size_t	  host = host_off + (size_t)g * RKT_TILE_COLS;
+				if (importing)
+					memcpy(dev, (const uint16_t *)src_k + host, (size_t)cols * sizeof(uint16_t));
+				else
+					memcpy((uint16_t *)dst_k + host, dev, (size_t)cols * sizeof(uint16_t));
+			}
+			int				v_col = pos / RKT_TILE_COLS, v_rem = pos % RKT_TILE_COLS;
+			const rkt_part *vp = NULL;
+			for (int d = 0; d < head_dim; d++) {
+				int v_global = h * sl->hd_pad + d;
+				if (!vp || v_global < vp->row_start || v_global >= vp->row_start + vp->row_count)
+					vp = rkt_part_for_row(vc, v_global);
+				if (!vp) {
+					s = ERR_INTERNAL;
+					break;
+				}
+				int		  vlocal = v_global - vp->row_start;
+				size_t	  vtile	 = ((size_t)(vlocal / RKT_TILE_ROWS) * (vc->k_len / RKT_TILE_COLS) +
+									(size_t)v_col) *
+								   (RKT_TILE_ROWS * RKT_TILE_COLS);
+				uint16_t *cell	 = (uint16_t *)vp->bo.map + vtile +
+								   (size_t)(vlocal % RKT_TILE_ROWS) * RKT_TILE_COLS + v_rem;
+				if (importing)
+					*cell = ((const uint16_t *)src_v)[host_off + d];
+				else
+					((uint16_t *)dst_v)[host_off + d] = *cell;
+			}
+		}
+	if (s == OK && importing)
+		for (int c = 0; c < RKT_MAX_CORES; c++) {
+			if (kc->part[c].bo.map && rkt_bo_flush(&p->dev, &kc->part[c].bo))
+				s = ERR_IO;
+			if (vc->part[c].bo.map && rkt_bo_flush(&p->dev, &vc->part[c].bo))
+				s = ERR_IO;
+		}
+	pthread_mutex_unlock(&p->lock);
+	return s;
+}
+
+static status_code rkt_kv_export(backend *self, const buffer *k, const buffer *v, int layer,
+								 int pos_start, int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								 int n_kv_heads_active, void *k_dst, void *v_dst) {
+	(void)n_kv_heads;
+	(void)n_ctx;
+	return rkt_kv_range_copy(self, (buffer *)k, (buffer *)v, layer, pos_start, n_rows, head_dim,
+							 n_kv_heads_active, k_dst, v_dst, NULL, NULL);
+}
+
+static status_code rkt_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start,
+								 int n_rows, int n_kv_heads, int head_dim, int n_ctx,
+								 int n_kv_heads_active, const void *k_src, const void *v_src) {
+	(void)n_kv_heads;
+	(void)n_ctx;
+	return rkt_kv_range_copy(self, k, v, layer, pos_start, n_rows, head_dim, n_kv_heads_active,
+							 NULL, NULL, k_src, v_src);
+}
+
 static inline float32x4_t neon_expf(float32x4_t x) {
 	x			   = vmaxq_f32(x, vdupq_n_f32(-87.3f));
 	int32x4_t	n  = vcvtnq_s32_f32(vmulq_f32(x, vdupq_n_f32(1.44269504f)));
@@ -1544,6 +1636,8 @@ static status_code rkt_ctor(backend *out) {
 	out->kv_free				  = rkt_kv_free;
 	out->kv_put					  = rkt_kv_put;
 	out->kv_put_batch			  = rkt_kv_put_batch;
+	out->kv_export				  = rkt_kv_export;
+	out->kv_import				  = rkt_kv_import;
 	return OK;
 }
 

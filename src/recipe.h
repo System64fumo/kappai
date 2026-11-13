@@ -462,6 +462,19 @@ status_code compute_prefill_pipelined_recipe(struct model *m, struct kvcache *ca
 											 int n_tokens, int pos_start, int chunk, int flash_attn,
 											 float *logits_out, prefill_chunk_cb done, void *ud);
 
+typedef struct recipe_layer_gate {
+	status_code (*before)(void *ud, int layer);
+	status_code (*after)(void *ud, int layer);
+	void *ud;
+} recipe_layer_gate;
+
+status_code compute_logits_publish(struct model *m, struct compute_scratch *s, const float *logits);
+
+status_code compute_prefill_range_recipe(struct model *m, struct kvcache *cache,
+										 struct compute_scratch *s, const int32_t *tokens,
+										 int n_tokens, int pos_start, int flash_attn,
+										 const recipe_layer_gate *gate, float *logits_out);
+
 status_code compute_forward_decode_batch_recipe(struct model *m, struct kvcache **caches,
 												struct compute_scratch *s, const int32_t *tokens,
 												const int *positions, const uint8_t *needs_logits,

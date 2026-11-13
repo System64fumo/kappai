@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer MixBuf {
+	float mixed[];
+};
+layout(set = 0, binding = 1) readonly buffer WBuf {
+	float conv_w[];
+};
+layout(set = 0, binding = 2) buffer StateBuf {
+	float conv_state[];
+};
+layout(set = 0, binding = 3) writeonly buffer OutBuf {
+	float conv_out[];
+};
+
+layout(push_constant) uniform Params {
+	int dim;
+	int kernel;
+	int n_rows;
+	int in_stride;
+	int out_stride;
+	int reset;
+}
+params;
+
+const int MAX_HIST = 8;
+
+void main() {
+	int c = int(gl_GlobalInvocationID.x);
+	if (c >= params.dim)
+		return;
+	int hist = params.kernel - 1;
+	if (hist > MAX_HIST)
+		return;
+	int	  wbase = c * params.kernel;
+	float st[MAX_HIST];
+	for (int k = 0; k < hist; k++)
+		st[k] = params.reset != 0 ? 0.0 : conv_state[c * hist + k];
+	for (int t = 0; t < params.n_rows; t++) {
+		int	  row = t * params.in_stride;
+		float bx  = mixed[row + c] * mixed[row + 2 * params.dim + c];
+		float sum = bx * conv_w[wbase + hist];
+		for (int k = 0; k < hist; k++) {
+			sum += st[k] * conv_w[wbase + k];
+			st[k] = (k + 1 < hist) ? st[k + 1] : bx;
+		}
+		conv_out[t * params.out_stride + c] = mixed[row + params.dim + c] * sum;
+	}
+	for (int k = 0; k < hist; k++)
+		conv_state[c * hist + k] = st[k];
+}

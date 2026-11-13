@@ -241,6 +241,7 @@ typedef struct model {
 	int32_t	   n_layer_backends;
 
 	bool tie_embeddings;
+	bool skip_output_head;
 	bool has_per_layer_embeddings;
 	bool moe_stream_enabled;
 	bool owns_backend;

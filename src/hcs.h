@@ -2,6 +2,7 @@
 #define HCS_H
 
 #include "config.h"
+#include "threadpool.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -10,9 +11,9 @@
 #define HCS_NAME_MAX 64
 #define HCS_ERR_MAX 4096
 
-#define HCS_TASK_PREFILL 1u
-#define HCS_TASK_DECODE 2u
-#define HCS_TASKS_ALL (HCS_TASK_PREFILL | HCS_TASK_DECODE)
+#define HCS_TASK_PREFILL TPOOL_PHASE_PREFILL
+#define HCS_TASK_DECODE TPOOL_PHASE_DECODE
+#define HCS_TASKS_ALL TPOOL_PHASES_ALL
 
 #define HCS_COUNT_ALL (-1)
 #define HCS_COUNT_UNSET (-2)

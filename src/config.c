@@ -99,7 +99,6 @@ void config_usage(FILE *fp, bool is_server) {
 			"  --ngl <n>                offload the first <n> layers to the --device backend\n"
 			"                           and keep the remaining layers on CPU (-1 = all on the\n"
 			"                           device, 0 = all on CPU; default: -1)\n"
-			"  --threads <n>            CPU worker threads (default: auto)\n"
 			"  -f, --flash-attn [bool]  flash attention kernel (default: on)\n"
 			"  --kv-quant [f16|q8_0]    KV cache precision (default: f16)\n"
 			"  --mmap [bool]            mmap model weights (default: on)\n"
@@ -376,7 +375,6 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		OPT_DUMP_METADATA,
 		OPT_DEBUG_FWD,
 		OPT_DEBUG,
-		OPT_THREADS,
 		OPT_MOE_CACHE,
 		OPT_MOE_STREAM,
 		OPT_MOE_PRELOAD,
@@ -422,7 +420,6 @@ int parse_args(int argc, char **argv, config *cfg, cli_args *a) {
 		{"dump-metadata", OPT_DUMP_METADATA, CLI_OPT_FLAG_TRUE, &a->dump_metadata, 0, 0},
 		{"debug-forward", OPT_DEBUG_FWD, CLI_OPT_FLAG_TRUE, &cfg->debug_forward, 0, 0},
 		{"debug", OPT_DEBUG, CLI_OPT_FLAG_TRUE, &cfg->debug, 0, 0},
-		{"threads", OPT_THREADS, CLI_OPT_INT, &cfg->n_threads, 0, INT_MAX},
 		{"moe-cache", OPT_MOE_CACHE, CLI_OPT_INT, &cfg->moe_cache_cap, 0, INT_MAX},
 		{"moe-stream", OPT_MOE_STREAM, CLI_OPT_BOOL_FLAG, &cfg->moe_stream, 0, 0},
 		{"moe-preload", OPT_MOE_PRELOAD, CLI_OPT_FLAG_TRUE, &cfg->moe_preload, 0, 0},

@@ -139,7 +139,6 @@ static const field_desc ENGINE_FIELDS[] = {
 	S_BOOL("reasoning", "Reasoning", "allow model thinking", reasoning),
 	S_BOOL("flash_attn", "Flash attention", "flash attention kernels", flash_attn),
 	S_INT("ctx_size", "Context size", "0 = max trained limit", ctx_size, 0, INT_MAX),
-	S_INT("threads", "Threads", "0/* = all cores", n_threads, 0, 4096),
 	S_BOOL("mmap", "mmap weights", "memory-map model weights", use_mmap),
 	S_MULTI("repack", "Repack", "select weight types to repack", repack, SC_TEXT_MAX,
 			repack_choices, true),
@@ -209,8 +208,6 @@ const char *sc_format_value(const saved_config *sc, const field_desc *f, char *b
 		int v = *(int *)((char *)sc + f->offset);
 		if (display && v == 0 && strcmp(f->key, "ctx_size") == 0)
 			return "Max trained limit";
-		if (display && v == 0 && strcmp(f->key, "threads") == 0)
-			return "All";
 		snprintf(buf, buflen, "%d", v);
 		return buf;
 	}
@@ -256,10 +253,6 @@ int sc_parse_value(saved_config *sc, const field_desc *f, const char *value, cha
 		if (len == 0) {
 			snprintf(err, errlen, "empty value for '%s'", f->key);
 			return -1;
-		}
-		if (strcmp(f->key, "threads") == 0 && len == 1 && s[0] == '*') {
-			*(int *)sc_field_ptr(sc, f) = 0;
-			return 0;
 		}
 		char *end	= NULL;
 		errno		= 0;
@@ -574,6 +567,8 @@ static int take_legacy_key(hcs_legacy *legacy, const schema_tab *tab, const char
 						   const char *value, char *err, size_t errlen) {
 	bool is_model = strcasecmp(tab->name, "main") == 0;
 	bool is_moe	  = strcasecmp(tab->name, "moe") == 0;
+	if (strcasecmp(tab->name, "llm") == 0 && strcasecmp(key, "threads") == 0)
+		return 1;
 	if (is_moe && strcasecmp(key, "pin") == 0) {
 		char *end = NULL;
 		(void)strtol(value, &end, 10);
@@ -944,7 +939,6 @@ void sc_materialize(const saved_config *sc, config *cfg, cli_args *a) {
 	cfg->moe_pin_list = sc->moe_pin_list[0] ? sc->moe_pin_list : NULL;
 	cfg->monitor	  = sc->monitor[0] ? sc->monitor : NULL;
 	cfg->seed		  = sc->seed;
-	cfg->n_threads	  = sc->n_threads;
 	cfg->ctx_size	  = sc->ctx_size;
 	hcs_materialize(&sc->hcs, sc->model, cfg);
 	cfg->use_mmap	 = sc->use_mmap;

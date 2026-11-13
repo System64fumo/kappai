@@ -6,6 +6,7 @@
 #include <EGL/eglext.h>
 #include <gbm.h>
 #include <GLES3/gl31.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -43,5 +44,7 @@ int gl_render_node_count(void);
 int gl_render_node_at(int device_index);
 
 status_code gl_render_node_identity(int node_index, char *out, size_t cap);
+
+bool gl_render_node_uma(int node_index);
 
 #endif

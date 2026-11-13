@@ -49,7 +49,6 @@ void run_model_lifecycle_tests(void) {
 	config	  saved		= *config_get();
 	log_level saved_log = log_get_level();
 	log_set_level((log_level)(LOG_ERROR + 1));
-	((config *)config_get())->n_threads = 2;
 	for (int use_mmap = 0; use_mmap <= 1; use_mmap++) {
 		for (int owned = 0; owned <= 1; owned++) {
 			backend	   *b  = NULL;

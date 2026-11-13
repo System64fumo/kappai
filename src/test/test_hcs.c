@@ -122,6 +122,27 @@ static void test_layer_map(void) {
 	record_hcs("map.accelerators_keep_listing_order", ok, "n=%d", cfg.n_layer_devices);
 }
 
+static void test_cpu_clusters(void) {
+	hcs_config h = single_device("cpu0", HCS_TASKS_ALL, HCS_COUNT_ALL, HCS_COUNT_UNSET);
+	h.n_devices	 = 2;
+	h.devices[1] = single_device("cpu1", HCS_TASK_PREFILL, 0, HCS_COUNT_UNSET).devices[0];
+
+	config cfg = config_defaults();
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
+	int ok = cfg.cpu_cluster_tasks[0] == HCS_TASKS_ALL &&
+			 cfg.cpu_cluster_tasks[1] == HCS_TASK_PREFILL && cfg.cpu_cluster_tasks[2] == 0 &&
+			 cfg.n_layer_devices == 1;
+	record_hcs("cpu.cluster_tasks_materialized", ok, "t0=%u t1=%u layer_devices=%d",
+			   cfg.cpu_cluster_tasks[0], cfg.cpu_cluster_tasks[1], cfg.n_layer_devices);
+
+	h.enabled = false;
+	cfg		  = config_defaults();
+	hcs_materialize(&h, synth_chat_model_path, &cfg);
+	ok = cfg.cpu_cluster_tasks[0] == HCS_TASKS_ALL && cfg.cpu_cluster_tasks[1] == 0;
+	record_hcs("cpu.simple_mode_uses_first_cluster_only", ok, "t0=%u t1=%u",
+			   cfg.cpu_cluster_tasks[0], cfg.cpu_cluster_tasks[1]);
+}
+
 static void test_enabled_flag(void) {
 	char	   err[256];
 	hcs_loader l;
@@ -193,8 +214,12 @@ static void test_validate(void) {
 	record_hcs("validate.over_subscription", validate_has(&h, "remove 1"), "n=%d", n_layers);
 
 	h = single_device("cpu0", HCS_TASK_DECODE, HCS_COUNT_ALL, HCS_COUNT_UNSET);
-	record_hcs("validate.tasks_must_cover_both",
-			   validate_has(&h, "must run both prefill and decode"), "");
+	record_hcs("validate.cpu_tasks_must_cover_both", validate_has(&h, "no cpu device runs prefill"),
+			   "");
+
+	h = single_device("vulkan0", HCS_TASK_DECODE, HCS_COUNT_ALL, HCS_COUNT_UNSET);
+	record_hcs("validate.accelerator_runs_both_tasks",
+			   validate_has(&h, "only cpu devices can run a single task"), "");
 
 	h = single_device("cpu0", HCS_TASKS_ALL, HCS_COUNT_ALL, 4);
 	record_hcs("validate.experts_on_dense", validate_has(&h, "not a MoE"), "experts=%d", n_experts);
@@ -293,6 +318,7 @@ void run_hcs_tests(void) {
 	test_priority();
 	test_loader();
 	test_layer_map();
+	test_cpu_clusters();
 	test_enabled_flag();
 	test_legacy();
 	test_validate();

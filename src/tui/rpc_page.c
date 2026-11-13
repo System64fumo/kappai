@@ -30,8 +30,8 @@ static void probe_one(page_state *st, int i) {
 		snprintf(st->status[i], STATUS_MAX, "unreachable");
 		return;
 	}
-	snprintf(st->status[i], STATUS_MAX, "%s (%s)", info.identity[0] ? info.identity : "device",
-			 info.device);
+	snprintf(st->status[i], STATUS_MAX, "%.96s (%.48s)",
+			 info.identity[0] ? info.identity : "device", info.device);
 }
 
 static void probe_all(page_state *st) {

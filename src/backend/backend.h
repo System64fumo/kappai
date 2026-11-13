@@ -196,6 +196,12 @@ typedef struct {
 } shortconv_desc;
 
 typedef struct {
+	int			  n_rows, dim, kernel, in_stride, out_stride, reset;
+	const buffer *mixed, *conv_w;
+	buffer		 *state, *out;
+} shortconv_dev_desc;
+
+typedef struct {
 	const buffer *buf;
 	uint32_t	  type;
 } backend_weight;
@@ -300,6 +306,7 @@ struct backend {
 	status_code (*probe)(void);
 	int (*device_count)(void);
 	status_code (*device_identity)(int device_index, char *out, size_t cap);
+	int (*device_uma)(int device_index);
 	status_code (*init)(backend *self, int device_index);
 	void (*free)(backend *self);
 	status_code (*buffer_alloc_weight)(backend *self, const tensor_desc *desc, buffer *out);
@@ -429,6 +436,7 @@ struct backend {
 	void (*synchronize)(backend *self);
 	void (*set_gpu_profile)(backend *self, int enable);
 	void (*submit)(backend *self);
+	bool (*is_idle)(backend *self);
 	void (*begin_batch)(backend *self);
 	void (*end_batch)(backend *self);
 	status_code (*rmsnorm_batch)(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
@@ -486,6 +494,7 @@ struct backend {
 							  int qk_rope, int n_ctx, float eps);
 	status_code (*gated_delta_net)(backend *self, const gdn_desc *d);
 	status_code (*shortconv)(backend *self, const shortconv_desc *d);
+	status_code (*shortconv_dev)(backend *self, const shortconv_dev_desc *d);
 	status_code (*hc_init)(backend *self, const hc_init_desc *d);
 	status_code (*hc_pre)(backend *self, const hc_pre_desc *d);
 	status_code (*hc_post)(backend *self, const hc_post_desc *d);
@@ -512,6 +521,7 @@ struct backend {
 	size_t (*mem_total)(backend *self);
 	cpu_cache_info (*cpu_info)(void);
 	void (*release_thread)(backend *self);
+	void (*bind_phase)(backend *self, unsigned phase);
 	status_code (*kv_shift)(backend *self, buffer *k, buffer *v, int layer,
 							const kv_shift_chunk *chunks, int n_chunks, const float *cos_tbl,
 							const float *sin_tbl, int n_kv_heads, int head_dim, int n_ctx,
@@ -581,6 +591,7 @@ bool		backend_device_is_host(const char *spec);
 bool		backend_device_uma(const char *spec);
 status_code backend_device_identity(const char *spec, char *out, size_t cap);
 status_code backend_identity(const backend *b, char *out, size_t cap);
+void		backend_device_label(const char *spec, char *out, size_t cap);
 int			backend_best_device(char *out, size_t out_cap);
 int			backend_format_device(const char *name, int device_index, char *out, size_t out_cap);
 size_t		backend_name_brief_len(const char *name);
@@ -602,6 +613,7 @@ backend *backend_host_at(const char *file, int line, const char *func);
 #define backend_host() backend_host_at(__FILE__, __LINE__, __func__)
 
 void backend_host_use(backend *b);
+void backend_bind_phase(unsigned phase);
 void backend_host_request(void);
 
 typedef enum {

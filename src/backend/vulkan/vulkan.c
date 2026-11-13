@@ -317,6 +317,7 @@ typedef struct {
 	vk_pipeline_set p_mla_attention;
 	vk_pipeline_set p_gdn_conv;
 	vk_pipeline_set p_gdn_heads;
+	vk_pipeline_set p_shortconv;
 	vk_pipeline_set p_kv_put;
 	vk_pipeline_set p_kv_shift_gather;
 	vk_pipeline_set p_embd_lookup;
@@ -492,9 +493,10 @@ static int g_probed = -1;
 
 #define VK_QCORE_PIPES (4 + VQ_MM_COUNT + 2 * VQ_COUNT + VK_MMF_TYPES)
 
-#define VQ_MV(t, label)                                                                            \
+#define VQ_MV(family, type, label)                                                                 \
 	{                                                                                              \
-		shader_##t##_spv, sizeof(shader_##t##_spv), {                                              \
+		shader_##family##_##type##_spv, sizeof(shader_##family##_##type##_spv),                    \
+			shader_##family##_wg16_##type##_spv, sizeof(shader_##family##_wg16_##type##_spv), {    \
 			"q_matvec_" label, "q_matvec_m4_" label                                                \
 		}                                                                                          \
 	}
@@ -596,6 +598,30 @@ static int vk_device_count(void) {
 	vkEnumeratePhysicalDevices(inst, &count, NULL);
 	vkDestroyInstance(inst, NULL);
 	return (int)count;
+}
+
+static int vk_device_uma(int device_index) {
+	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
+								.apiVersion = VK_API_VERSION_1_1};
+	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+								.pApplicationInfo = &app};
+	VkInstance			 inst;
+	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
+		return 0;
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	int uma = 0;
+	if (device_index >= 0 && (uint32_t)device_index < count) {
+		VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
+		vkEnumeratePhysicalDevices(inst, &count, devs);
+		VkPhysicalDeviceProperties props;
+		vkGetPhysicalDeviceProperties(devs[device_index], &props);
+		uma = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+			  props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+		free(devs);
+	}
+	vkDestroyInstance(inst, NULL);
+	return uma;
 }
 
 static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap);
@@ -1995,12 +2021,6 @@ have_set:;
 	return OK;
 }
 
-static status_code vk_dispatch(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs, int n_bufs,
-							   const void *push, uint32_t push_size, uint32_t groups_x) {
-	uint32_t wmask = (n_bufs > 0) ? (1u << (n_bufs - 1)) : 0;
-	return vk_dispatch_ex(p, ps, bufs, NULL, NULL, n_bufs, push, push_size, groups_x, 1, wmask);
-}
-
 static status_code vk_dispatch_2d_ex(vk_priv *p, vk_pipeline_set *ps, vk_buf **bufs,
 									 const VkDeviceSize *offs, const VkDeviceSize *ranges,
 									 int n_bufs, const void *push, uint32_t push_size,
@@ -2028,14 +2048,16 @@ static void vk_qcore_init(vk_priv *p) {
 	static const struct {
 		const uint32_t *spv;
 		size_t			len;
+		const uint32_t *spv_wg16;
+		size_t			len_wg16;
 		const char	   *name[2];
 	} MV[VQ_COUNT] = {
-		[VQ_Q4_0] = VQ_MV(q_matvec_q4_0, "q4_0"),  [VQ_Q4_1] = VQ_MV(q_matvec_q4_1, "q4_1"),
-		[VQ_Q5_0] = VQ_MV(q_matvec_q5_0, "q5_0"),  [VQ_Q5_1] = VQ_MV(q_matvec_q5_1, "q5_1"),
-		[VQ_Q8_0] = VQ_MV(q_matvec_q8_0, "q8_0"),  [VQ_IQ4_NL] = VQ_MV(q_matvec_iq4_nl, "iq4_nl"),
-		[VQ_Q4_K] = VQ_MV(kq_matvec_q4_k, "q4_k"), [VQ_Q5_K] = VQ_MV(kq_matvec_q5_k, "q5_k"),
-		[VQ_Q6_K] = VQ_MV(kq_matvec_q6_k, "q6_k"), [VQ_F32] = VQ_MV(dense_matvec_f32, "f32"),
-		[VQ_F16] = VQ_MV(dense_matvec_f16, "f16"), [VQ_BF16] = VQ_MV(dense_matvec_bf16, "bf16"),
+		[VQ_Q4_0] = VQ_MV(q_matvec, q4_0, "q4_0"),	[VQ_Q4_1] = VQ_MV(q_matvec, q4_1, "q4_1"),
+		[VQ_Q5_0] = VQ_MV(q_matvec, q5_0, "q5_0"),	[VQ_Q5_1] = VQ_MV(q_matvec, q5_1, "q5_1"),
+		[VQ_Q8_0] = VQ_MV(q_matvec, q8_0, "q8_0"),	[VQ_IQ4_NL] = VQ_MV(q_matvec, iq4_nl, "iq4_nl"),
+		[VQ_Q4_K] = VQ_MV(kq_matvec, q4_k, "q4_k"), [VQ_Q5_K] = VQ_MV(kq_matvec, q5_k, "q5_k"),
+		[VQ_Q6_K] = VQ_MV(kq_matvec, q6_k, "q6_k"), [VQ_F32] = VQ_MV(dense_matvec, f32, "f32"),
+		[VQ_F16] = VQ_MV(dense_matvec, f16, "f16"), [VQ_BF16] = VQ_MV(dense_matvec, bf16, "bf16"),
 	};
 	static const struct {
 		const uint32_t *spv;
@@ -2099,7 +2121,9 @@ static void vk_qcore_init(vk_priv *p) {
 	p->p_q8_quant[1].name = "q8k_quant";
 	for (int t = 0; t < VQ_COUNT; t++) {
 		for (int c = 0; c < 2; c++) {
-			if (vk_create_pipeline_spec(p, MV[t].spv, MV[t].len, 4, 16, VQ_MV_SPEC[c],
+			bool wg16 = p->caps.is_mali;
+			if (vk_create_pipeline_spec(p, wg16 ? MV[t].spv_wg16 : MV[t].spv,
+										wg16 ? MV[t].len_wg16 : MV[t].len, 4, 16, VQ_MV_SPEC[c],
 										sizeof(VQ_MV_SPEC[c]), &p->p_qmv[t][c]) != OK)
 				return;
 			p->p_qmv[t][c].name = MV[t].name[c];
@@ -2661,6 +2685,11 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s != OK)
 		return s;
 	p->p_gdn_heads.name = "gdn_heads";
+	s = vk_create_pipeline(p, shader_shortconv_spv, shader_shortconv_spv_len, 4, 24,
+						   &p->p_shortconv);
+	if (s != OK)
+		return s;
+	p->p_shortconv.name = "shortconv";
 	s = vk_create_pipeline(p, shader_kv_shift_gather_spv, shader_kv_shift_gather_spv_len, 6, 44,
 						   &p->p_kv_shift_gather);
 	if (s != OK)
@@ -3014,6 +3043,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_mla_attention);
 		vk_destroy_pipeline(p, &p->p_gdn_conv);
 		vk_destroy_pipeline(p, &p->p_gdn_heads);
+		vk_destroy_pipeline(p, &p->p_shortconv);
 		vk_destroy_pipeline(p, &p->p_kv_put);
 		vk_destroy_pipeline(p, &p->p_kv_shift_gather);
 		vk_destroy_pipeline(p, &p->p_embd_lookup);
@@ -4324,9 +4354,8 @@ static status_code vk_kv_put_impl(backend *self, buffer *k, buffer *v, int layer
 	VkDeviceSize offs[4]	 = {0, 0, k_in->offset, v_in->offset};
 	int			 total_pairs = n_active * (head_dim / 2);
 
-	static int dumped	= 0;
-	int		   n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
-	uint64_t   total;
+	int		 n_blocks = (head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK;
+	uint64_t total;
 	if (kv_q8)
 		total = (uint64_t)(n_active * n_blocks * 2) * (uint64_t)m;
 	else
@@ -4365,8 +4394,9 @@ static vk_kv_range vk_kv_range_get(const buffer *k, const buffer *v, int layer, 
 								   int n_rows, int head_dim, int n_ctx, int n_active) {
 	const vk_kv_handle *kh = (const vk_kv_handle *)k->handle;
 	const vk_kv_handle *vh = (const vk_kv_handle *)v->handle;
-	size_t				row_bytes =
-		kh->kv_row_bytes > 0 ? kh->kv_row_bytes : (size_t)head_dim * sizeof(uint16_t);
+	size_t row_bytes	   = kh->kv_quant == KV_QUANT_Q8_0
+								 ? (size_t)((head_dim + KV_Q8_0_BLOCK - 1) / KV_Q8_0_BLOCK) * 34
+								 : (size_t)head_dim * sizeof(uint16_t);
 	return (vk_kv_range){
 		.kb			 = vk_kv_layer_buf(kh, layer, NULL),
 		.vb			 = vk_kv_layer_buf(vh, layer, NULL),
@@ -6120,6 +6150,15 @@ static void vk_submit(backend *self) {
 	status_code s = vk_run_cmd(p);
 	if (s != OK)
 		ERROR("vk: vk_submit: submit failed (%s)", status_str(s));
+}
+
+static bool vk_is_idle(backend *self) {
+	vk_priv *p = self->priv;
+	if (!p->dev || p->device_lost || !p->timeline_supported)
+		return false;
+	if (p->ring[p->ring_cur].has_work)
+		vk_submit(self);
+	return vk_timeline_done(p, p->last_signal_value) != 0;
 }
 
 static void vk_begin_batch(backend *self) {
@@ -8233,6 +8272,70 @@ static status_code vk_gdn_scratch_alloc(backend *self, const gdn_desc *d, buffer
 	return OK;
 }
 
+static status_code vk_shortconv(backend *self, const shortconv_desc *d) {
+	(void)self;
+	if (!d || !d->out || !d->mixed || !d->conv_w || d->dim < 1 || d->n_rows < 1 ||
+		d->in_stride < 3 * d->dim || d->out_stride < d->dim || d->kernel < 2 ||
+		(d->centered ? d->kernel != 3 : !d->state))
+		return ERR_INVALID_ARG;
+	const int history = d->kernel - 1;
+	for (int t = 0; t < d->n_rows; t++) {
+		const float *row = d->mixed + (size_t)t * (size_t)d->in_stride;
+		float		*out = d->out + (size_t)t * (size_t)d->out_stride;
+		for (int i = 0; i < d->dim; i++) {
+			const float *w	 = d->conv_w + (size_t)i * (size_t)d->kernel;
+			float		 bx	 = row[i] * row[2 * d->dim + i];
+			float		 sum = 0.0f;
+			if (d->centered) {
+				sum = bx * w[1];
+				if (t > 0) {
+					const float *prev = row - d->in_stride;
+					sum += prev[i] * prev[2 * d->dim + i] * w[0];
+				}
+				if (t + 1 < d->n_rows) {
+					const float *next = row + d->in_stride;
+					sum += next[i] * next[2 * d->dim + i] * w[2];
+				}
+				out[i] = row[d->dim + i] * sum;
+				continue;
+			}
+			float *hist = d->state + (size_t)i * (size_t)history;
+			sum			= bx * w[d->kernel - 1];
+			for (int k = 0; k < history; k++)
+				sum += hist[k] * w[k];
+			memmove(hist, hist + 1, (size_t)(history - 1) * sizeof(float));
+			hist[history - 1] = bx;
+			out[i]			  = row[d->dim + i] * sum;
+		}
+	}
+	return OK;
+}
+
+static status_code vk_shortconv_dev(backend *self, const shortconv_dev_desc *d) {
+	vk_priv *p = self->priv;
+	if (!p->p_shortconv.pipeline)
+		return ERR_UNSUPPORTED;
+	const int hist = d->kernel - 1;
+	if (d->n_rows < 1 || d->dim < 1 || hist < 1 || hist > VK_KDA_MAX_HIST ||
+		d->in_stride < 3 * d->dim || d->out_stride < d->dim ||
+		(uint32_t)vk_groups64(d->dim) > p->caps.max_workgroup_count[0])
+		return ERR_INVALID_ARG;
+
+	const buffer *ops[] = {d->mixed, d->conv_w, d->state, d->out};
+	status_code	  s		= vk_require_resident(self, "shortconv", ops, (int)ARRAY_LEN(ops));
+	if (s != OK)
+		return s;
+
+	struct {
+		int32_t dim, kernel, n_rows, in_stride, out_stride, reset;
+	} push				 = {d->dim, d->kernel, d->n_rows, d->in_stride, d->out_stride, d->reset};
+	vk_buf		*bufs[4] = {as_vkbuf(d->mixed), as_vkbuf(d->conv_w), as_vkbuf(d->state),
+							as_vkbuf(d->out)};
+	VkDeviceSize offs[4] = {d->mixed->offset, d->conv_w->offset, d->state->offset, d->out->offset};
+	return vk_dispatch_ex(p, &p->p_shortconv, bufs, offs, NULL, 4, &push, sizeof(push),
+						  vk_groups64(d->dim), 1, 0xC);
+}
+
 static status_code vk_gated_delta_net(backend *self, const gdn_desc *d) {
 	vk_priv *p = self->priv;
 	if (!p->p_gdn_conv.pipeline || !p->p_gdn_heads.pipeline)
@@ -8302,6 +8405,7 @@ static status_code vk_ctor(backend *out) {
 	out->probe = vk_probe;
 	out->device_count					 = vk_device_count;
 	out->device_identity				 = vk_device_identity;
+	out->device_uma						 = vk_device_uma;
 	out->init							 = vk_init;
 	out->free							 = vk_free;
 	out->buffer_alloc_weight			 = vk_buffer_alloc_weight;
@@ -8356,6 +8460,7 @@ static status_code vk_ctor(backend *out) {
 	out->synchronize					 = vk_synchronize;
 	out->set_gpu_profile				 = vk_set_gpu_profile;
 	out->submit							 = vk_submit;
+	out->is_idle						 = vk_is_idle;
 	out->begin_batch					 = vk_begin_batch;
 	out->end_batch						 = vk_end_batch;
 	out->rmsnorm_per_head				 = vk_rmsnorm_per_head;
@@ -8399,6 +8504,8 @@ static status_code vk_ctor(backend *out) {
 	out->kv_alloc_mla					 = vk_kv_alloc_mla;
 	out->kv_put_mla						 = vk_kv_put_mla;
 	out->gated_delta_net				 = vk_gated_delta_net;
+	out->shortconv						 = vk_shortconv;
+	out->shortconv_dev					 = vk_shortconv_dev;
 	return OK;
 }
 

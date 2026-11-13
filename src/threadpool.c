@@ -8,13 +8,13 @@
 #include "threadpool.h"
 #include "backend/cpu/common.h"
 #include "common.h"
-#include "config.h"
 #include "log.h"
 #include "profile.h"
 
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +28,8 @@
 #define TPOOL_SPIN_CHECK_EVERY 128
 #define TPOOL_MIN_CHUNKS_PER_THREAD 32
 #define TPOOL_GUIDED_DIVISOR 4
-#define TPOOL_MAX_THREADS 256
+#define TPOOL_ROSTERS 3
+#define TPOOL_ROSTER_ANY 0
 
 typedef struct tlocal_slot {
 	void			  **ptr;
@@ -49,8 +50,15 @@ typedef struct {
 } tpool_thread_arg;
 
 typedef struct {
+	int rank[TPOOL_MAX_THREADS];
+	int n_active;
+	int caller_slot;
+} tpool_roster;
+
+typedef struct {
 	_Alignas(64) _Atomic tpool_chunk_fn job_fn;
 	_Atomic uintptr_t job_ctx;
+	_Atomic int		  job_roster;
 	_Atomic int		  job_end;
 	_Atomic int		  chunk_size;
 	_Atomic int		  n_workers;
@@ -81,12 +89,16 @@ struct tpool {
 	pthread_mutex_t			done_mtx;
 	pthread_cond_t			done_cv;
 	pthread_t				threads[TPOOL_MAX_THREADS];
+	tpool_roster			roster[TPOOL_ROSTERS];
+	int						member_cpu[TPOOL_MAX_THREADS];
 	int						n_threads;
 	int						stats_enabled;
 };
 
-static _Thread_local int tpool_cur_tid = -1;
-static pthread_once_t	 tlocal_once   = PTHREAD_ONCE_INIT;
+static _Thread_local int tpool_cur_tid	  = -1;
+static _Thread_local int tpool_cur_roster = TPOOL_ROSTER_ANY;
+static _Thread_local int tpool_cur_cpu	  = -1;
+static pthread_once_t	 tlocal_once	  = PTHREAD_ONCE_INIT;
 static pthread_key_t	 tlocal_key;
 
 static void tlocal_cleanup(void *v) {
@@ -123,6 +135,53 @@ void tlocal_free_all(void) {
 	pthread_setspecific(tlocal_key, NULL);
 }
 
+static bool tpool_pin_current(int cpu) {
+#if defined(__linux__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+	(void)cpu;
+	return false;
+#endif
+}
+
+static int tpool_roster_index(unsigned phase) {
+	if (phase == TPOOL_PHASE_PREFILL)
+		return 1;
+	if (phase == TPOOL_PHASE_DECODE)
+		return 2;
+	return TPOOL_ROSTER_ANY;
+}
+
+static bool tpool_member_serves(const tpool_member *member, unsigned phase) {
+	return !phase || (member->phases & phase) != 0;
+}
+
+static void tpool_build_roster(tpool_roster *roster, const tpool_member *members, int n,
+							   unsigned phase) {
+	int active = 0;
+	for (int i = 0; i < n; i++)
+		active += tpool_member_serves(&members[i], phase);
+	if (active == 0) {
+		phase  = 0;
+		active = n;
+	}
+	memset(roster, 0, sizeof(*roster));
+	roster->n_active	= active;
+	roster->caller_slot = -1;
+	int next			= 1;
+	for (int i = 0; i < n; i++) {
+		if (!tpool_member_serves(&members[i], phase))
+			continue;
+		if (roster->caller_slot < 0)
+			roster->caller_slot = i;
+		else
+			roster->rank[i] = next++;
+	}
+}
+
 static inline void tpool_run_timed(tpool_slot *slot, tpool_chunk_fn fn, int begin, int end, int tid,
 								   void *ctx, int stats_enabled) {
 	int n = end - begin;
@@ -141,6 +200,10 @@ static inline void tpool_run_timed(tpool_slot *slot, tpool_chunk_fn fn, int begi
 
 int tpool_current_tid(void) {
 	return tpool_cur_tid;
+}
+
+bool tpool_phase_is_prefill(void) {
+	return tpool_cur_roster == tpool_roster_index(TPOOL_PHASE_PREFILL);
 }
 
 static int tpool_retired_pred(void *ud) {
@@ -294,8 +357,10 @@ static void *tpool_worker_main(void *arg) {
 		int pub_ok = atomic_load_explicit(&pool->sync.pub_gate, memory_order_acquire) == new_epoch;
 		int job_epoch_now = atomic_load_explicit(&pool->job.job_epoch, memory_order_acquire);
 		int n_workers_now = atomic_load_explicit(&pool->job.n_workers, memory_order_relaxed);
+		int job_roster	  = atomic_load_explicit(&pool->job.job_roster, memory_order_relaxed);
+		int rank		  = pool->roster[job_roster].rank[tid];
 
-		if (pub_ok && job_epoch_now == new_epoch && tid >= 1 && tid <= n_workers_now) {
+		if (pub_ok && job_epoch_now == new_epoch && rank >= 1 && rank <= n_workers_now) {
 			tpool_cur_tid = tid;
 			tpool_drain_work(pool, tid, new_epoch);
 			tpool_cur_tid = -1;
@@ -306,26 +371,38 @@ static void *tpool_worker_main(void *arg) {
 }
 
 int tpool_default_n_threads(void) {
-	int v = config_get()->n_threads;
-	if (v > 0)
-		return v > TPOOL_MAX_THREADS ? TPOOL_MAX_THREADS : v;
-
 	int n = backend_host_cpu_info().n_cpus;
 	if (n > TPOOL_MAX_THREADS)
 		n = TPOOL_MAX_THREADS;
 	return n;
 }
 
-tpool *tpool_create(int n_threads) {
+static void tpool_build_rosters(tpool *pool, const tpool_member *members) {
+	static const unsigned phases[TPOOL_ROSTERS] = {0, TPOOL_PHASE_PREFILL, TPOOL_PHASE_DECODE};
+	for (int r = 0; r < TPOOL_ROSTERS; r++)
+		tpool_build_roster(&pool->roster[r], members, pool->n_threads, phases[r]);
+}
+
+tpool *tpool_create(const tpool_member *members, int n_threads) {
 	if (n_threads < 1)
 		n_threads = 1;
 	if (n_threads > TPOOL_MAX_THREADS)
 		n_threads = TPOOL_MAX_THREADS;
 
+	tpool_member default_members[TPOOL_MAX_THREADS];
+	if (!members) {
+		for (int i = 0; i < n_threads; i++)
+			default_members[i] = (tpool_member){.cpu = -1, .phases = TPOOL_PHASES_ALL};
+		members = default_members;
+	}
+
 	tpool *pool = xmalloc_aligned(sizeof(*pool), 64);
 	memset(pool, 0, sizeof(*pool));
 	pool->n_threads = n_threads;
-	pool->slot		= xmalloc_aligned((size_t)n_threads * sizeof(tpool_slot), _Alignof(tpool_slot));
+	for (int i = 0; i < n_threads; i++)
+		pool->member_cpu[i] = members[i].cpu;
+	tpool_build_rosters(pool, members);
+	pool->slot = xmalloc_aligned((size_t)n_threads * sizeof(tpool_slot), _Alignof(tpool_slot));
 	memset(pool->slot, 0, (size_t)n_threads * sizeof(tpool_slot));
 	pthread_mutex_init(&pool->wake_mtx, NULL);
 	pthread_mutex_init(&pool->pub_mtx, NULL);
@@ -364,6 +441,7 @@ tpool *tpool_create(int n_threads) {
 			for (int j = 1; j < i; j++)
 				pthread_join(pool->threads[j], NULL);
 			pool->n_threads = started;
+			tpool_build_rosters(pool, members);
 			atomic_store_explicit(&pool->sync.shutdown, 0, memory_order_relaxed);
 			return pool;
 		}
@@ -402,7 +480,7 @@ static tpool *g_fetch_pool;
 
 static void tpool_fetch_pool_init(void) {
 	int n		 = tpool_default_n_threads();
-	g_fetch_pool = n > 1 ? tpool_create(n) : NULL;
+	g_fetch_pool = n > 1 ? tpool_create(NULL, n) : NULL;
 }
 
 tpool *tpool_fetch_pool(void) {
@@ -440,12 +518,24 @@ void tpool_set_worker_cleanup(tpool *pool, tpool_worker_cleanup_fn fn) {
 		pool->worker_cleanup = fn;
 }
 
+void tpool_bind_phase(tpool *pool, unsigned phase) {
+	tpool_cur_roster = tpool_roster_index(phase);
+	if (!pool || tpool_cur_tid >= 0)
+		return;
+	int cpu = pool->member_cpu[pool->roster[tpool_cur_roster].caller_slot];
+	if (cpu < 0 || cpu == tpool_cur_cpu)
+		return;
+	if (tpool_pin_current(cpu))
+		tpool_cur_cpu = cpu;
+}
+
 void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpool_chunk_fn fn,
 						void *ctx) {
 	if (n_items <= 0)
 		return;
 
-	int n_threads = pool ? pool->n_threads : 1;
+	const tpool_roster *roster	  = pool ? &pool->roster[tpool_cur_roster] : NULL;
+	int					n_threads = roster ? roster->n_active : 1;
 	if (min_items_per_thread < 1)
 		min_items_per_thread = 1;
 
@@ -477,6 +567,7 @@ void tpool_parallel_for(tpool *pool, int n_items, int min_items_per_thread, tpoo
 	atomic_store_explicit(&pool->sync.in_job, 1, memory_order_relaxed);
 	spin_wait_relax(tpool_retired_pred, pool);
 
+	atomic_store_explicit(&pool->job.job_roster, tpool_cur_roster, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.job_end, n_items, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.chunk_size, chunk_size, memory_order_relaxed);
 	atomic_store_explicit(&pool->job.job_fn, fn, memory_order_relaxed);

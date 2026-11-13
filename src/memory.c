@@ -158,7 +158,7 @@ typedef struct {
 
 static size_t calc_embeddings_bytes(const model *m) {
 	size_t total = ggml_row_size(m->tok_embd.type, m->dim) * m->vocab_size;
-	if (!m->tie_embeddings && m->output_w.host_ptr)
+	if (!m->tie_embeddings && m->output_w.host_ptr && !m->skip_output_head)
 		total += ggml_row_size(m->output_w.type, m->dim) * m->vocab_size;
 	return total;
 }
@@ -435,8 +435,10 @@ static size_t hcs_pending_expert_bytes(const model *m, const config *cfg) {
 size_t model_pending_weight_bytes(const model *m, const config *cfg) {
 	if (m->arch_info->is_moe && cfg->n_expert_devices > 0)
 		return hcs_pending_expert_bytes(m, cfg);
+	if (!m->arch_info->is_moe)
+		return cfg->use_mmap ? model_device_weight_bytes(m, m->backend) : 0;
 	int full_resident = !cfg->use_mmap && cfg->moe_stream == 0;
-	if (full_resident || !m->arch_info->is_moe)
+	if (full_resident)
 		return cfg->use_mmap ? model_total_weight_bytes(m) : 0;
 
 	size_t per_expert = model_cached_per_expert_size(m);

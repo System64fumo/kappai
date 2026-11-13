@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "backend.h"
 #include "backend/cpu/common.h"
+#include "cpu_topology.h"
 #include "log.h"
 #include "model.h"
 #include <dirent.h>
@@ -518,11 +519,18 @@ bool backend_device_uma(const char *spec) {
 	if (backend_parse_device(spec, name, sizeof(name), &device_index) != 0)
 		return false;
 
-	backend_info infos[BACKEND_MAX];
-	int			 n_backends = backend_list(infos, BACKEND_MAX);
-	for (int i = 0; i < n_backends; i++)
-		if (strcmp(infos[i].name, name) == 0)
-			return (infos[i].caps & BCAP_UNIFIED_MEMORY) != 0;
+	backend_load();
+	for (int i = 0; i < g_registry_count; i++) {
+		if (strcmp(g_registry[i].name, name) != 0)
+			continue;
+		backend probe;
+		memset(&probe, 0, sizeof(probe));
+		if (g_registry[i].ctor(&probe) != OK)
+			return false;
+		if (probe.device_uma)
+			return probe.device_uma(device_index) != 0;
+		return (probe.caps & BCAP_UNIFIED_MEMORY) != 0;
+	}
 	return false;
 }
 
@@ -550,6 +558,19 @@ status_code backend_device_identity(const char *spec, char *out, size_t cap) {
 		return probe.device_identity(device_index, out, cap);
 	}
 	return ERR_UNSUPPORTED;
+}
+
+void backend_device_label(const char *spec, char *out, size_t cap) {
+	char name[BACKEND_DEVICE_NAME_MAX];
+	int	 index = 0;
+	if (backend_parse_device(spec, name, sizeof(name), &index) == 0 && strcmp(name, "cpu") == 0 &&
+		index < cpu_topology_get()->n_clusters && cpu_topology_get()->n_clusters > 1) {
+		char desc[48];
+		cpu_cluster_describe(index, desc, sizeof(desc));
+		snprintf(out, cap, "%s (%s)", spec, desc);
+		return;
+	}
+	snprintf(out, cap, "%s", spec);
 }
 
 int backend_best_device(char *out, size_t out_cap) {
@@ -639,6 +660,12 @@ void backend_host_use(backend *b) {
 	if (!b || !backend_has_cap(b, BCAP_IS_HOST))
 		return;
 	atomic_store(&g_host_override, b);
+}
+
+void backend_bind_phase(unsigned phase) {
+	backend *host = atomic_load(&g_host_override);
+	if (host && host->bind_phase)
+		host->bind_phase(host, phase);
 }
 
 void backend_destroyed(backend *b) {

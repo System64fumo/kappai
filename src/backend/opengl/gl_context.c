@@ -116,6 +116,16 @@ static void query_memory_topology(gl_context *ctx) {
 	}
 }
 
+bool gl_render_node_uma(int node_index) {
+	int fd = open_render_node_fd(node_index);
+	if (fd < 0)
+		return false;
+	uint64_t vram	  = 0;
+	bool	 discrete = sysfs_read_u64(fd, "mem_info_vram_total", &vram) && vram > 0;
+	close(fd);
+	return !discrete;
+}
+
 static int g_probed = -1;
 
 status_code gl_context_probe(void) {
