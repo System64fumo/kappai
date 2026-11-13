@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "coop.h"
 #include "compute.h"
 #include "kvcache.h"
@@ -7,9 +11,11 @@
 
 #include <limits.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #define COOP_MIN_ROWS 32
 #define COOP_MIN_TOKENS 64
@@ -98,6 +104,43 @@ typedef struct {
 	int			range;
 	uint64_t	started_us;
 } coop_gate;
+
+typedef struct {
+	bool engaged;
+#if defined(__linux__)
+	cpu_set_t mask;
+#endif
+} coop_thread_state;
+
+static void coop_lane_enter(const backend *be, coop_thread_state *st) {
+	st->engaged = false;
+	if (backend_has_cap(be, BCAP_IS_HOST)) {
+		backend_bind_phase(TPOOL_PHASE_PREFILL);
+		return;
+	}
+#if defined(__linux__)
+	if (sched_getaffinity(0, sizeof(st->mask), &st->mask) != 0)
+		return;
+	cpu_set_t all;
+	CPU_ZERO(&all);
+	long n_cpus = sysconf(_SC_NPROCESSORS_CONF);
+	for (long i = 0; i < n_cpus && i < CPU_SETSIZE; i++)
+		CPU_SET(i, &all);
+	if (sched_setaffinity(0, sizeof(all), &all) != 0)
+		return;
+	st->engaged = true;
+#endif
+}
+
+static void coop_lane_leave(const coop_thread_state *st) {
+#if defined(__linux__)
+	if (!st->engaged)
+		return;
+	sched_setaffinity(0, sizeof(st->mask), &st->mask);
+#else
+	(void)st;
+#endif
+}
 
 static int coop_hard_rows(const model *m) {
 	if (m->sliding_window <= 0)
@@ -294,30 +337,32 @@ static status_code coop_after(void *ud, int layer) {
 
 static int coop_rows_for(const coop_board *b, const coop_lane *lane) {
 	double fastest = 0;
+	double slowest = 0;
 	double total   = 0;
 	for (int i = 0; i < b->k->n_lanes; i++) {
 		double rate = b->k->lanes[i].rate;
 		if (rate <= 0)
 			continue;
 		fastest = MAX(fastest, rate);
+		slowest = slowest > 0 ? MIN(slowest, rate) : rate;
 		total += rate;
 	}
 	if (fastest <= 0)
 		return b->base_rows;
 	double rate	   = lane->rate > 0 ? lane->rate : fastest;
 	double seconds = (double)b->n_tokens / total / COOP_RANGES_PER_RUN;
+	seconds		   = MAX(seconds, (double)COOP_MIN_ROWS / slowest);
 	seconds		   = MIN(seconds, (double)b->max_rows / fastest);
 	int rows	   = (int)(rate * seconds);
-	if (rows < COOP_MIN_ROWS && rate < fastest)
-		return 0;
 	return MIN(MAX(rows, COOP_MIN_ROWS), b->max_rows);
 }
 
-static bool coop_tail_declined(const coop_board *b, const coop_lane *lane, int rows, uint64_t now) {
+static bool coop_tail_declined(const coop_board *b, const coop_lane *lane, int rows, bool last,
+							   uint64_t now) {
 	double self_done = (double)now + (double)rows / lane->rate * 1e6;
 	for (int i = 0; i < b->k->n_lanes; i++) {
 		const coop_lane *other = &b->k->lanes[i];
-		if (other == lane || other->rate <= lane->rate)
+		if (other == lane || other->rate <= lane->rate || (last && other->idx != 0))
 			continue;
 		double free_at = MAX((double)now, (double)other->busy_until_us);
 		if (free_at + (double)rows / other->rate * 1e6 < self_done)
@@ -334,20 +379,25 @@ static bool coop_claim(coop_board *b, coop_lane *lane, int *idx) {
 	}
 	int left = b->n_tokens - b->next_tok;
 	int rows = coop_rows_for(b, lane);
-	if (rows == 0) {
-		pthread_mutex_unlock(&b->mu);
-		return false;
-	}
 	if (rows >= left || (left - rows < COOP_MIN_ROWS && left <= b->hard_rows))
 		rows = left;
+	bool last = rows == left;
+	if (last && lane->idx != 0) {
+		rows = left - COOP_MIN_ROWS;
+		last = false;
+		if (rows < COOP_MIN_ROWS) {
+			pthread_mutex_unlock(&b->mu);
+			return false;
+		}
+	}
 	uint64_t now = time_us();
-	if (left <= b->max_rows && lane->rate > 0 && coop_tail_declined(b, lane, rows, now)) {
+	if (left <= b->max_rows && lane->rate > 0 && coop_tail_declined(b, lane, rows, last, now)) {
 		pthread_mutex_unlock(&b->mu);
 		return false;
 	}
 	lane->busy_until_us = now + (lane->rate > 0 ? (uint64_t)((double)rows / lane->rate * 1e6) : 0);
 	coop_range *r		= coop_new_range(b, b->pos + b->next_tok, rows, b->next_tok, lane->idx);
-	r->last				= rows == left;
+	r->last				= last;
 	*idx				= b->n_ranges - 1;
 	b->next_tok += rows;
 	pthread_mutex_unlock(&b->mu);
@@ -404,9 +454,9 @@ static status_code coop_lane_run(coop_board *b, coop_lane *lane) {
 }
 
 static void *coop_thread_main(void *arg) {
-	coop_lane *lane = arg;
-	if (backend_has_cap(lane->be, BCAP_IS_HOST))
-		backend_bind_phase(TPOOL_PHASE_PREFILL);
+	coop_lane		 *lane = arg;
+	coop_thread_state state;
+	coop_lane_enter(lane->be, &state);
 	lane->result = coop_lane_run(lane->board, lane);
 	backend_release_thread(lane->be);
 	return NULL;
@@ -461,8 +511,10 @@ static status_code coop_run_lanes(coop *k, coop_board *b) {
 		}
 		started[i] = true;
 	}
-	backend_bind_phase(TPOOL_PHASE_PREFILL);
+	coop_thread_state state;
+	coop_lane_enter(k->lanes[0].be, &state);
 	coop_lane_run(b, &k->lanes[0]);
+	coop_lane_leave(&state);
 	for (int i = 1; i < k->n_lanes; i++)
 		if (started[i])
 			pthread_join(k->lanes[i].thread, NULL);
@@ -569,19 +621,8 @@ status_code coop_prefill(coop *k, context *c, const int32_t *tokens, int n, int 
 		st = coop_run_lanes(k, &b);
 
 	if (st == OK) {
-		for (int i = 0; i < b.n_ranges; i++) {
-			const coop_range *r = &b.ranges[i];
-			if (!r->last || r->producer == 0)
-				continue;
-			memcpy(c->scratch.logits_host, k->lanes[r->producer].scratch->logits_host,
-				   (size_t)model_output_size(&c->m) * sizeof(float));
-			st = compute_logits_publish(&c->m, &c->scratch, c->scratch.logits_host);
-		}
-		if (st == OK) {
-			coop_record_helpers(k, c, tokens, n, pos, avail);
-			coop_log_run(k, n, t0_us);
-		} else
-			coop_forget_helpers(k);
+		coop_record_helpers(k, c, tokens, n, pos, avail);
+		coop_log_run(k, n, t0_us);
 	} else
 		coop_forget_helpers(k);
 	coop_release_board(k, &b);
@@ -629,7 +670,8 @@ static status_code coop_lane_load(coop_lane *lane, const context *c, const confi
 		model_load_parse(&lane->own_m, cfg->model, be, cfg->use_mmap, cfg->repack, NULL);
 	if (st != OK)
 		return st;
-	lane->owned = true;
+	lane->owned					 = true;
+	lane->own_m.skip_output_head = true;
 	if (cfg->fuse && cfg->fuse[0] && strcmp(cfg->fuse, "none") != 0)
 		lane->own_m.fuse_config = cfg->fuse;
 	be->rope_neox = lane->own_m.arch_info->uses_neox_rope;
@@ -671,15 +713,16 @@ typedef struct {
 } coop_calib;
 
 static void coop_warm(coop_lane *lane, int flash_attn) {
-	int32_t tokens[COOP_CALIB_WARM_ROWS] = {0};
-	if (backend_has_cap(lane->be, BCAP_IS_HOST))
-		backend_bind_phase(TPOOL_PHASE_PREFILL);
-	if (compute_scratch_ensure(lane->scratch, lane->m, lane->kv->n_ctx) != OK)
-		return;
-	compute_scratch_reserve_rows(lane->m, lane->scratch, COOP_CALIB_ROWS);
-	if (compute_prefill_range(lane->m, lane->kv, lane->scratch, tokens, COOP_CALIB_WARM_ROWS, 0,
-							  flash_attn, NULL, NULL) == OK)
-		ensure_sync(lane->be);
+	int32_t			  tokens[COOP_CALIB_WARM_ROWS] = {0};
+	coop_thread_state state;
+	coop_lane_enter(lane->be, &state);
+	if (compute_scratch_ensure(lane->scratch, lane->m, lane->kv->n_ctx) == OK) {
+		compute_scratch_reserve_rows(lane->m, lane->scratch, COOP_CALIB_ROWS);
+		if (compute_prefill_range(lane->m, lane->kv, lane->scratch, tokens, COOP_CALIB_WARM_ROWS, 0,
+								  flash_attn, NULL, NULL) == OK)
+			ensure_sync(lane->be);
+	}
+	coop_lane_leave(&state);
 }
 
 static void coop_calib_run(coop_calib *cb) {
@@ -703,9 +746,9 @@ static void coop_calib_run(coop_calib *cb) {
 }
 
 static void *coop_calib_thread(void *arg) {
-	coop_calib *cb = arg;
-	if (backend_has_cap(cb->lane->be, BCAP_IS_HOST))
-		backend_bind_phase(TPOOL_PHASE_PREFILL);
+	coop_calib		 *cb = arg;
+	coop_thread_state state;
+	coop_lane_enter(cb->lane->be, &state);
 	coop_calib_run(cb);
 	backend_release_thread(cb->lane->be);
 	return NULL;
@@ -732,8 +775,10 @@ static void coop_calibrate(coop *k, int flash_attn) {
 		else
 			atomic_fetch_add(&first_done, 1);
 	}
-	backend_bind_phase(TPOOL_PHASE_PREFILL);
+	coop_thread_state state;
+	coop_lane_enter(k->lanes[0].be, &state);
 	coop_calib_run(&calib[0]);
+	coop_lane_leave(&state);
 	for (int i = 1; i < k->n_lanes; i++)
 		if (started[i])
 			pthread_join(k->lanes[i].thread, NULL);

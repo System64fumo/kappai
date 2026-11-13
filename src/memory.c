@@ -158,7 +158,7 @@ typedef struct {
 
 static size_t calc_embeddings_bytes(const model *m) {
 	size_t total = ggml_row_size(m->tok_embd.type, m->dim) * m->vocab_size;
-	if (!m->tie_embeddings && m->output_w.host_ptr)
+	if (!m->tie_embeddings && m->output_w.host_ptr && !m->skip_output_head)
 		total += ggml_row_size(m->output_w.type, m->dim) * m->vocab_size;
 	return total;
 }

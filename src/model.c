@@ -1227,7 +1227,7 @@ static status_code upload_embeddings(model *m, progress *prog) {
 
 	if (tied_output_shares_buffer(m)) {
 		m->output_w.buf = m->tok_embd.buf;
-	} else if (m->output_w.host_ptr) {
+	} else if (m->output_w.host_ptr && !m->skip_output_head) {
 		s = upload_one_repack_to(m, &m->output_w, 2, m->dim, m->vocab_size, WCLASS_MATMUL,
 								 m->backend);
 		if (s != OK) {
