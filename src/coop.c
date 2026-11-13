@@ -294,23 +294,22 @@ static status_code coop_after(void *ud, int layer) {
 
 static int coop_rows_for(const coop_board *b, const coop_lane *lane) {
 	double fastest = 0;
-	double slowest = 0;
 	double total   = 0;
 	for (int i = 0; i < b->k->n_lanes; i++) {
 		double rate = b->k->lanes[i].rate;
 		if (rate <= 0)
 			continue;
 		fastest = MAX(fastest, rate);
-		slowest = slowest > 0 ? MIN(slowest, rate) : rate;
 		total += rate;
 	}
 	if (fastest <= 0)
 		return b->base_rows;
 	double rate	   = lane->rate > 0 ? lane->rate : fastest;
 	double seconds = (double)b->n_tokens / total / COOP_RANGES_PER_RUN;
-	seconds		   = MAX(seconds, (double)COOP_MIN_ROWS / slowest);
 	seconds		   = MIN(seconds, (double)b->max_rows / fastest);
 	int rows	   = (int)(rate * seconds);
+	if (rows < COOP_MIN_ROWS && rate < fastest)
+		return 0;
 	return MIN(MAX(rows, COOP_MIN_ROWS), b->max_rows);
 }
 
@@ -335,6 +334,10 @@ static bool coop_claim(coop_board *b, coop_lane *lane, int *idx) {
 	}
 	int left = b->n_tokens - b->next_tok;
 	int rows = coop_rows_for(b, lane);
+	if (rows == 0) {
+		pthread_mutex_unlock(&b->mu);
+		return false;
+	}
 	if (rows >= left || (left - rows < COOP_MIN_ROWS && left <= b->hard_rows))
 		rows = left;
 	uint64_t now = time_us();

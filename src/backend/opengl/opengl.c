@@ -368,6 +368,8 @@ struct gl_priv {
 
 	gl_buf *readback;
 	size_t	readback_bytes;
+	gl_buf *kv_stage;
+	size_t	kv_stage_bytes;
 
 	size_t kv_layer_stride;
 	size_t kv_kvh_stride;
@@ -4590,14 +4592,67 @@ static status_code gl_kv_export(backend *self, const buffer *k, const buffer *v,
 								NULL);
 }
 
+static status_code gl_kv_stage_reserve(gl_priv *p, size_t bytes) {
+	if (p->kv_stage && p->kv_stage_bytes >= bytes)
+		return OK;
+	size_t want = (bytes + (size_t)65535) & ~(size_t)65535;
+	if (p->kv_stage)
+		gl_buf_free(p, p->kv_stage);
+	p->kv_stage		  = gl_buf_alloc_ex(p, want, GL_STREAM_DRAW, NULL, false, NULL);
+	p->kv_stage_bytes = p->kv_stage ? want : 0;
+	return p->kv_stage ? OK : ERR_OUT_OF_MEMORY;
+}
+
+static status_code gl_kv_write_batched(gl_priv *p, gl_buf *kb, gl_buf *vb, size_t first_off,
+									   size_t head_span, size_t span, int n_active,
+									   const void *k_src, const void *v_src) {
+	size_t		side = (size_t)n_active * span;
+	size_t		pad	 = (side + (size_t)255) & ~(size_t)255;
+	status_code st	 = gl_kv_stage_reserve(p, pad * 2);
+	if (st != OK)
+		return st;
+	gl_barrier_if_pending(p);
+	glBindBuffer(GL_COPY_READ_BUFFER, p->kv_stage->name);
+	glBufferData(GL_COPY_READ_BUFFER, (GLsizeiptr)p->kv_stage_bytes, NULL, GL_STREAM_DRAW);
+	glBufferSubData(GL_COPY_READ_BUFFER, 0, (GLsizeiptr)side, k_src);
+	glBufferSubData(GL_COPY_READ_BUFFER, (GLintptr)pad, (GLsizeiptr)side, v_src);
+	gl_buf *bufs[2] = {kb, vb};
+	for (int i = 0; i < 2; i++) {
+		glBindBuffer(GL_COPY_WRITE_BUFFER, bufs[i]->name);
+		for (int h = 0; h < n_active; h++)
+			glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER,
+								(GLintptr)((size_t)i * pad + (size_t)h * span),
+								(GLintptr)(first_off + (size_t)h * head_span), (GLsizeiptr)span);
+	}
+	GLenum err = glGetError();
+	glBindBuffer(GL_COPY_READ_BUFFER, 0);
+	glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
+	if (err != GL_NO_ERROR)
+		return ERR_INTERNAL;
+	gl_xq_cache_invalidate(p, kb);
+	gl_xq_cache_invalidate(p, vb);
+	return OK;
+}
+
 static status_code gl_kv_import(backend *self, buffer *k, buffer *v, int layer, int pos_start,
 								int n_rows, int n_kv_heads, int head_dim, int n_ctx,
 								int n_kv_heads_active, const void *k_src, const void *v_src) {
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
-	int			n_active = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
-	status_code st		 = gl_kv_range_transfer(self, k, layer, pos_start, n_rows, head_dim, n_ctx,
-												n_active, NULL, k_src);
+	int		n_active  = n_kv_heads_active > 0 ? n_kv_heads_active : n_kv_heads;
+	gl_buf *kb		  = gl_kv_layer_buf(k, layer);
+	gl_buf *vb		  = gl_kv_layer_buf(v, layer);
+	size_t	dev_row	  = p->kv_row_bytes;
+	size_t	head_span = (size_t)n_ctx * dev_row;
+	bool batched = n_rows > 0 && n_active > 0 && kv_row_bytes(p->kv_quant, head_dim) == dev_row &&
+				   pos_start >= 0 && pos_start + n_rows <= n_ctx &&
+				   (size_t)n_active * head_span <= kb->size_bytes &&
+				   (size_t)n_active * head_span <= vb->size_bytes;
+	if (batched)
+		return gl_kv_write_batched(p, kb, vb, (size_t)pos_start * dev_row, head_span,
+								   (size_t)n_rows * dev_row, n_active, k_src, v_src);
+	status_code st = gl_kv_range_transfer(self, k, layer, pos_start, n_rows, head_dim, n_ctx,
+										  n_active, NULL, k_src);
 	if (st != OK)
 		return st;
 	return gl_kv_range_transfer(self, v, layer, pos_start, n_rows, head_dim, n_ctx, n_active, NULL,
