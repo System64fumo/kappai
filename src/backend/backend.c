@@ -505,11 +505,14 @@ bool backend_device_is_host(const char *spec) {
 	if (strcmp(name, "cpu") == 0)
 		return true;
 
-	backend_info infos[BACKEND_MAX];
-	int			 n_backends = backend_list(infos, BACKEND_MAX);
-	for (int i = 0; i < n_backends; i++)
-		if (strcmp(infos[i].name, name) == 0)
-			return (infos[i].caps & BCAP_IS_HOST) != 0;
+	backend_load();
+	for (int i = 0; i < g_registry_count; i++) {
+		if (strcmp(g_registry[i].name, name) != 0)
+			continue;
+		backend probe;
+		memset(&probe, 0, sizeof(probe));
+		return g_registry[i].ctor(&probe) == OK && (probe.caps & BCAP_IS_HOST) != 0;
+	}
 	return false;
 }
 

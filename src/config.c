@@ -104,7 +104,7 @@ void config_usage(FILE *fp, bool is_server) {
 			"  --mmap [bool]            mmap model weights (default: on)\n"
 			"  --repack MODE            weight repacking: all|none|<types> (default: smart)\n"
 			"  --fuse LIST              load-time weight fusion, comma list: qkv\n"
-			"  --moe-stream [bool]      streaming expert cache for MoE models (default: on)\n"
+			"  --moe-stream [bool]      streaming expert cache for MoE models (default: off)\n"
 			"  --moe-cache <n>          per-layer LRU capacity for expert cache\n"
 			"  --moe-preload            eagerly load all expert weights at startup\n"
 			"  --moe-pin <n>            pin first n experts per layer (never evicted)\n"

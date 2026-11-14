@@ -5,6 +5,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "common.h"
+#include "log.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -98,6 +99,28 @@ void *xmalloc_aligned(size_t n, size_t align) {
 	void *p = NULL;
 	if (posix_memalign(&p, align, n) != 0)
 		oom_abort(n);
+	return p;
+}
+
+void madvise_hugepage(void *ptr, size_t bytes) {
+#ifdef MADV_HUGEPAGE
+	if (!ptr || bytes == 0)
+		return;
+	uintptr_t page	= (uintptr_t)page_size_cached();
+	uintptr_t start = ((uintptr_t)ptr + page - 1) & ~(page - 1);
+	uintptr_t end	= ((uintptr_t)ptr + bytes) & ~(page - 1);
+	if (end <= start)
+		return;
+	if (madvise((void *)start, end - start, MADV_HUGEPAGE) != 0)
+		DEBUG("madvise(MADV_HUGEPAGE) on %zu bytes failed: %s", bytes, strerror(errno));
+#endif
+}
+
+void *xmalloc_huge(size_t n) {
+	if (n < HUGE_PAGE_BYTES)
+		return xmalloc_aligned(n, 64);
+	void *p = xmalloc_aligned(n, HUGE_PAGE_BYTES);
+	madvise_hugepage(p, n);
 	return p;
 }
 

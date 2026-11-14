@@ -38,6 +38,7 @@ typedef struct {
 	int					  n_extra_backends;
 	bool				  borrows_backend;
 	mem_topology		  topo;
+	char				  device_spec[BACKEND_DEVICE_NAME_MAX];
 	char				  extra_specs[CONFIG_MAX_LAYER_DEVICES][64];
 	struct coop			 *coop;
 	monitor_layer_tracker layer_tracker;

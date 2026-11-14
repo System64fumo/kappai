@@ -52,6 +52,7 @@ int mkdir_p(const char *path, char *err, size_t errlen);
 void  oom_abort(size_t bytes);
 void *xmalloc(size_t n);
 void *xmalloc_aligned(size_t n, size_t align);
+void *xmalloc_huge(size_t n);
 void *xcalloc(size_t n, size_t sz);
 void *xrealloc(void *p, size_t n);
 char *xstrdup(const char *s);
@@ -69,13 +70,9 @@ typedef enum {
 
 void file_advise(int fd, off_t offset, off_t length, file_advice advice);
 
-static inline void madvise_hugepage(void *ptr, size_t bytes) {
-	if (!ptr || bytes == 0)
-		return;
-#ifdef MADV_HUGEPAGE
-	madvise(ptr, bytes, MADV_HUGEPAGE);
-#endif
-}
+#define HUGE_PAGE_BYTES ((size_t)2 << 20)
+
+void madvise_hugepage(void *ptr, size_t bytes);
 
 static inline long page_size_cached(void) {
 	static _Atomic long ps	= 0;

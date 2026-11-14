@@ -5,6 +5,7 @@
 #include "recipe.h"
 #include "shaders_embedded.h"
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -485,8 +486,6 @@ static status_code vk_timeline_wait(vk_priv *p, uint64_t value);
 static void		   vk_timeline_poll(vk_priv *p);
 static int		   vk_timeline_done(vk_priv *p, uint64_t value);
 
-static int g_probed = -1;
-
 #define VK_SUBALLOC_BLOCK_SIZE (64ull << 20)
 #define VK_SUBALLOC_MAX_REQ (4ull << 20)
 #define VK_SUBALLOC_MAX_BLOCKS 8
@@ -564,97 +563,6 @@ static const char *vk_result_str(int r) {
 	}
 }
 
-static status_code vk_probe(void) {
-	if (g_probed >= 0)
-		return g_probed == 1 ? OK : ERR_UNSUPPORTED;
-
-	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
-								.apiVersion = VK_API_VERSION_1_1};
-	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-								.pApplicationInfo = &app};
-	VkInstance			 inst;
-	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS) {
-		g_probed = 0;
-		return ERR_UNSUPPORTED;
-	}
-
-	uint32_t count = 0;
-	vkEnumeratePhysicalDevices(inst, &count, NULL);
-	vkDestroyInstance(inst, NULL);
-
-	g_probed = (count > 0) ? 1 : 0;
-	return g_probed == 1 ? OK : ERR_UNSUPPORTED;
-}
-
-static int vk_device_count(void) {
-	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
-								.apiVersion = VK_API_VERSION_1_1};
-	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-								.pApplicationInfo = &app};
-	VkInstance			 inst;
-	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
-		return 0;
-	uint32_t count = 0;
-	vkEnumeratePhysicalDevices(inst, &count, NULL);
-	vkDestroyInstance(inst, NULL);
-	return (int)count;
-}
-
-static int vk_device_uma(int device_index) {
-	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
-								.apiVersion = VK_API_VERSION_1_1};
-	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-								.pApplicationInfo = &app};
-	VkInstance			 inst;
-	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
-		return 0;
-	uint32_t count = 0;
-	vkEnumeratePhysicalDevices(inst, &count, NULL);
-	int uma = 0;
-	if (device_index >= 0 && (uint32_t)device_index < count) {
-		VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
-		vkEnumeratePhysicalDevices(inst, &count, devs);
-		VkPhysicalDeviceProperties props;
-		vkGetPhysicalDeviceProperties(devs[device_index], &props);
-		uma = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
-			  props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
-		free(devs);
-	}
-	vkDestroyInstance(inst, NULL);
-	return uma;
-}
-
-static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap);
-
-static status_code vk_device_identity(int device_index, char *out, size_t cap) {
-	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
-								.apiVersion = VK_API_VERSION_1_1};
-	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-								.pApplicationInfo = &app};
-	VkInstance			 inst;
-	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
-		return ERR_UNSUPPORTED;
-
-	uint32_t count = 0;
-	vkEnumeratePhysicalDevices(inst, &count, NULL);
-	if (count == 0) {
-		vkDestroyInstance(inst, NULL);
-		return ERR_UNSUPPORTED;
-	}
-	if (device_index < 0 || (uint32_t)device_index >= count) {
-		vkDestroyInstance(inst, NULL);
-		return ERR_INVALID_ARG;
-	}
-	VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
-	vkEnumeratePhysicalDevices(inst, &count, devs);
-	VkPhysicalDevice phys = devs[device_index];
-	free(devs);
-
-	status_code rc = vk_device_identity_query(phys, out, cap);
-	vkDestroyInstance(inst, NULL);
-	return rc;
-}
-
 static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, size_t cap) {
 	int has_pci_ext = 0;
 	{
@@ -709,6 +617,83 @@ static status_code vk_device_identity_query(VkPhysicalDevice phys, char *out, si
 		return OK;
 	}
 	return ERR_UNSUPPORTED;
+}
+
+#define VK_DEVICE_IDENTITY_CAP 48
+
+typedef struct {
+	int			uma;
+	status_code identity_rc;
+	char		identity[VK_DEVICE_IDENTITY_CAP];
+} vk_device_info;
+
+static pthread_once_t  g_device_infos_once = PTHREAD_ONCE_INIT;
+static vk_device_info *g_device_infos;
+static int			   g_device_total;
+
+static void vk_device_infos_init(void) {
+	VkApplicationInfo	 app = {.sType		= VK_STRUCTURE_TYPE_APPLICATION_INFO,
+								.apiVersion = VK_API_VERSION_1_1};
+	VkInstanceCreateInfo ici = {.sType			  = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+								.pApplicationInfo = &app};
+	VkInstance			 inst;
+	if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
+		return;
+
+	uint32_t count = 0;
+	vkEnumeratePhysicalDevices(inst, &count, NULL);
+	if (count > 0) {
+		VkPhysicalDevice *devs = xmalloc(count * sizeof(VkPhysicalDevice));
+		vkEnumeratePhysicalDevices(inst, &count, devs);
+		g_device_infos = xcalloc(count, sizeof(vk_device_info));
+		for (uint32_t i = 0; i < count; i++) {
+			VkPhysicalDeviceProperties props;
+			vkGetPhysicalDeviceProperties(devs[i], &props);
+			g_device_infos[i].uma = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+										props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+			g_device_infos[i].identity_rc =
+				vk_device_identity_query(devs[i], g_device_infos[i].identity, VK_DEVICE_IDENTITY_CAP);
+		}
+		free(devs);
+	}
+	g_device_total = (int)count;
+	vkDestroyInstance(inst, NULL);
+}
+
+static int vk_device_total(void) {
+	pthread_once(&g_device_infos_once, vk_device_infos_init);
+	return g_device_total;
+}
+
+static const vk_device_info *vk_device_info_at(int device_index) {
+	if (device_index < 0 || device_index >= vk_device_total())
+		return NULL;
+	return &g_device_infos[device_index];
+}
+
+static status_code vk_probe(void) {
+	return vk_device_total() > 0 ? OK : ERR_UNSUPPORTED;
+}
+
+static int vk_device_count(void) {
+	return vk_device_total();
+}
+
+static int vk_device_uma(int device_index) {
+	const vk_device_info *info = vk_device_info_at(device_index);
+	return info && info->uma;
+}
+
+static status_code vk_device_identity(int device_index, char *out, size_t cap) {
+	if (vk_device_total() == 0)
+		return ERR_UNSUPPORTED;
+	const vk_device_info *info = vk_device_info_at(device_index);
+	if (!info)
+		return ERR_INVALID_ARG;
+	if (info->identity_rc != OK)
+		return info->identity_rc;
+	snprintf(out, cap, "%s", info->identity);
+	return OK;
 }
 
 static status_code vk_check_fail(vk_priv *p, VkResult r, const char *expr, const char *file,

@@ -1581,17 +1581,15 @@ status_code cpu_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buff
 	}
 
 	p->kv_k_bytes	= total_bytes;
-	k_out->handle	= xmalloc_aligned(total_bytes, 64);
+	k_out->handle	= xmalloc_huge(total_bytes);
 	k_out->size		= total_bytes;
 	k_out->host_ptr = NULL;
 	k_out->owner	= self;
-	v_out->handle	= xmalloc_aligned(total_bytes, 64);
+	v_out->handle	= xmalloc_huge(total_bytes);
 	v_out->size		= total_bytes;
 	v_out->host_ptr = NULL;
 	v_out->owner	= self;
 
-	madvise_hugepage(k_out->handle, total_bytes);
-	madvise_hugepage(v_out->handle, total_bytes);
 	prefault(k_out->handle, total_bytes);
 	prefault(v_out->handle, total_bytes);
 
@@ -1884,11 +1882,10 @@ status_code cpu_kv_alloc_mla(backend *self, int n_layers, int n_ctx, int kv_lora
 	cpu_priv *p			= self->priv;
 	size_t	  per_layer = (size_t)(kv_lora + qk_rope) * (size_t)n_ctx * sizeof(float);
 	size_t	  total		= per_layer * (size_t)n_layers;
-	kv_out->handle		= xmalloc_aligned(total, 64);
+	kv_out->handle		= xmalloc_huge(total);
 	kv_out->size		= total;
 	kv_out->host_ptr	= NULL;
 	kv_out->owner		= self;
-	madvise_hugepage(kv_out->handle, total);
 	prefault(kv_out->handle, total);
 
 	if (p) {

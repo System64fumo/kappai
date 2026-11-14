@@ -117,6 +117,12 @@ static status_code context_open_device(context *c, const char *spec, backend **o
 		ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", spec);
 		return ERR_INVALID_ARG;
 	}
+	char canonical[BACKEND_DEVICE_NAME_MAX];
+	backend_format_device(name, device_index, canonical, sizeof(canonical));
+	if (strcmp(canonical, c->device_spec) == 0) {
+		*out = c->backend;
+		return OK;
+	}
 	if (strcmp(name, "cpu") == 0) {
 		backend_host_request();
 		*out = backend_host();
@@ -156,13 +162,11 @@ static status_code apply_layer_map(context *c, const config *cfg) {
 	int begin = 0;
 	for (int i = 0; i < cfg->n_layer_devices; i++) {
 		int		 end = begin + cfg->layer_counts[i];
-		backend *be	 = c->backend;
-		if (i > 0 || strcmp(cfg->layer_devices[i], cfg->device) != 0) {
-			status_code s = context_open_device(c, cfg->layer_devices[i], &be);
-			if (s != OK)
-				return s;
-			be->rope_neox = c->m.arch_info->uses_neox_rope;
-		}
+		backend *be	 = NULL;
+		status_code s = context_open_device(c, cfg->layer_devices[i], &be);
+		if (s != OK)
+			return s;
+		be->rope_neox = c->m.arch_info->uses_neox_rope;
 		if (be != c->backend && model_set_layer_backend_range(&c->m, begin, end, be) != OK)
 			return ERR_INVALID_ARG;
 		begin = end;
@@ -179,10 +183,8 @@ static status_code apply_expert_parts(context *c, const config *cfg) {
 		return ERR_INVALID_ARG;
 	}
 	for (int i = 0; i < cfg->n_expert_devices; i++) {
-		backend	   *be = c->backend;
-		status_code s  = OK;
-		if (!cfg->device || strcmp(cfg->expert_devices[i], cfg->device) != 0)
-			s = context_open_device(c, cfg->expert_devices[i], &be);
+		backend	   *be = NULL;
+		status_code s  = context_open_device(c, cfg->expert_devices[i], &be);
 		if (s != OK)
 			return s;
 		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
@@ -216,8 +218,7 @@ static void context_log_assignment(context *c, const config *cfg) {
 		for (int i = 0; i < cfg->n_layer_devices; i++) {
 			int		 end = begin + cfg->layer_counts[i];
 			backend *be	 = c->backend;
-			if (i > 0 || strcmp(cfg->layer_devices[i], cfg->device) != 0)
-				context_open_device(c, cfg->layer_devices[i], &be);
+			context_open_device(c, cfg->layer_devices[i], &be);
 			INFO("layers %d-%d on '%s' (%s)", begin, end - 1, be->name, cfg->layer_devices[i]);
 			begin = end;
 		}
@@ -231,8 +232,7 @@ static void context_log_assignment(context *c, const config *cfg) {
 		return;
 	for (int i = 0; i < cfg->n_expert_devices; i++) {
 		backend *be = c->backend;
-		if (!cfg->device || strcmp(cfg->expert_devices[i], cfg->device) != 0)
-			context_open_device(c, cfg->expert_devices[i], &be);
+		context_open_device(c, cfg->expert_devices[i], &be);
 		bool is_host = backend_has_cap(be, BCAP_IS_HOST);
 		INFO("experts: %d/layer on '%s' (%s)", cfg->expert_counts[i], is_host ? "cpu" : be->name,
 			 cfg->expert_devices[i]);
@@ -314,16 +314,22 @@ status_code context_init(context *c, const config *cfg) {
 	if (cfg->shared_backend) {
 		c->backend		   = cfg->shared_backend;
 		c->borrows_backend = true;
-		s				   = OK;
-	} else if (!cfg->device || strcmp(cfg->device, "auto") == 0) {
-		s = backend_create_best(&c->backend);
+		if (cfg->device)
+			snprintf(c->device_spec, sizeof(c->device_spec), "%s", cfg->device);
+		s = OK;
 	} else {
-		char name[32];
+		char best[BACKEND_DEVICE_NAME_MAX];
+		char name[BACKEND_DEVICE_NAME_MAX];
 		int	 device_index = 0;
-		if (backend_parse_device(cfg->device, name, sizeof(name), &device_index) != 0) {
-			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", cfg->device);
+		bool auto_device	 = !cfg->device || strcmp(cfg->device, "auto") == 0;
+		if (auto_device)
+			backend_best_device(best, sizeof(best));
+		const char *requested = auto_device ? best : cfg->device;
+		if (backend_parse_device(requested, name, sizeof(name), &device_index) != 0) {
+			ERROR("invalid device spec '%s' (expected <backend><n>, e.g. vulkan0)", requested);
 			return ERR_INVALID_ARG;
 		}
+		backend_format_device(name, device_index, c->device_spec, sizeof(c->device_spec));
 		s = backend_create(name, device_index, &c->backend);
 	}
 	if (s != OK) {
@@ -345,21 +351,19 @@ status_code context_init(context *c, const config *cfg) {
 		goto fail_backend;
 	}
 
-	for (int i = 0; i < cfg->n_layer_devices; i++)
-		if (strcmp(cfg->layer_devices[i], cfg->device) != 0) {
+	for (int i = 0; i < cfg->n_layer_devices; i++) {
+		backend *be = NULL;
+		s			= context_open_device(c, cfg->layer_devices[i], &be);
+		if (s != OK)
+			goto fail_model;
+	}
+	if (c->m.moe.n_experts > 0)
+		for (int i = 0; i < cfg->n_expert_devices; i++) {
 			backend *be = NULL;
-			s			= context_open_device(c, cfg->layer_devices[i], &be);
+			s			= context_open_device(c, cfg->expert_devices[i], &be);
 			if (s != OK)
 				goto fail_model;
 		}
-	if (c->m.moe.n_experts > 0)
-		for (int i = 0; i < cfg->n_expert_devices; i++)
-			if (strcmp(cfg->expert_devices[i], cfg->device) != 0) {
-				backend *be = NULL;
-				s			= context_open_device(c, cfg->expert_devices[i], &be);
-				if (s != OK)
-					goto fail_model;
-			}
 
 	backend *prefill_backends[CONFIG_MAX_LAYER_DEVICES];
 	int		 n_prefill_backends = 0;
@@ -495,14 +499,14 @@ status_code context_init(context *c, const config *cfg) {
 	s = kvcache_init(&c->kv, &c->m, n_ctx, kv_quant);
 	if (s != OK) {
 		ERROR("failed to init KV cache");
-		goto fail_chat;
+		goto fail_kv;
 	}
 
 	if (c->m.mixed_backend_mode && !c->m.full_sequence) {
 		s = kvcache_alloc_mirrors(&c->kv, &c->m);
 		if (s != OK) {
 			ERROR("failed to allocate host-side KV cache mirror for mixed backend mode");
-			goto fail_chat;
+			goto fail_kv;
 		}
 		DEBUG("mixed backend mode: allocated host KV cache mirror");
 	}
@@ -520,6 +524,8 @@ status_code context_init(context *c, const config *cfg) {
 	monitor_log_listening(&c->monitor);
 	return OK;
 
+fail_kv:
+	kvcache_free(&c->kv);
 fail_chat:
 	chat_template_free(&c->chat);
 fail_tokenizer:
