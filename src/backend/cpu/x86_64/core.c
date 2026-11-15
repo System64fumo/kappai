@@ -471,7 +471,7 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms			= expf(M_old - M);
+					ms			= num_expf(M_old - M);
 					__m256 ms_v = _mm256_set1_ps(ms);
 					int	   d	= 0;
 					for (; d + 64 <= head_dim; d += 64) {
@@ -507,7 +507,7 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 				}
 				vs = 1.0f;
 			} else {
-				vs = expf(ss - M);
+				vs = num_expf(ss - M);
 			}
 
 			__m256 vs_v = _mm256_set1_ps(vs);
@@ -850,7 +850,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 				float M_old = M;
 				M			= ss;
 				if (S > 0.0f) {
-					ms			= expf(M_old - M);
+					ms			= num_expf(M_old - M);
 					__m256 ms_v = _mm256_set1_ps(ms);
 					int	   d	= 0;
 					for (; d + 64 <= head_dim; d += 64) {
@@ -886,7 +886,7 @@ static void cpu_attention_inner_q8_0(const uint8_t *restrict k_slice,
 				}
 				vs = 1.0f;
 			} else {
-				vs = expf(ss - M);
+				vs = num_expf(ss - M);
 			}
 
 			const uint8_t *vt = v_slice + ((size_t)t * kv_stride);
@@ -1312,40 +1312,11 @@ static void cpu_ffn_silu_chunk_avx(int begin, int end, int tid, void *ctx) {
 	const float *restrict u = a->u;
 	float *restrict o		= a->o;
 	int i					= begin;
-	int n					= end;
-	for (; i + 32 <= n; i += 32) {
-		__m256 g0 = _mm256_loadu_ps(g + i);
-		__m256 g1 = _mm256_loadu_ps(g + i + 8);
-		__m256 g2 = _mm256_loadu_ps(g + i + 16);
-		__m256 g3 = _mm256_loadu_ps(g + i + 24);
-		__m256 s0 =
-			_mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
-		__m256 s1 =
-			_mm256_div_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g1))));
-		__m256 s2 =
-			_mm256_div_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g2))));
-		__m256 s3 =
-			_mm256_div_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g3))));
-		_mm256_storeu_ps(o + i, _mm256_mul_ps(s0, _mm256_loadu_ps(u + i)));
-		_mm256_storeu_ps(o + i + 8, _mm256_mul_ps(s1, _mm256_loadu_ps(u + i + 8)));
-		_mm256_storeu_ps(o + i + 16, _mm256_mul_ps(s2, _mm256_loadu_ps(u + i + 16)));
-		_mm256_storeu_ps(o + i + 24, _mm256_mul_ps(s3, _mm256_loadu_ps(u + i + 24)));
-	}
-	for (; i + 8 <= n; i += 8) {
-		__m256 g0 = _mm256_loadu_ps(g + i);
-		__m256 s0 =
-			_mm256_div_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), g0))));
-		_mm256_storeu_ps(o + i, _mm256_mul_ps(s0, _mm256_loadu_ps(u + i)));
-	}
-	for (; i < n; i++) {
-		float gv = g[i];
-		o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
-	}
+	for (; i + 8 <= end; i += 8)
+		_mm256_storeu_ps(o + i,
+						 _mm256_mul_ps(vsilu_ps(_mm256_loadu_ps(g + i)), _mm256_loadu_ps(u + i)));
+	for (; i < end; i++)
+		o[i] = silu(g[i]) * u[i];
 }
 
 status_code cpu_ffn_activate(backend *self, const buffer *gate, const buffer *up, buffer *out,
@@ -1363,59 +1334,12 @@ static void cpu_ffn_gelu_chunk_avx(int begin, int end, int tid, void *ctx) {
 	const float *restrict g = a->g;
 	const float *restrict u = a->u;
 	float *restrict o		= a->o;
-	const float c_fit		= 0.7978845608028654f;
-	const float c_x3		= 0.044715f;
-	int			i			= begin;
-	int			n			= end;
-	for (; i + 32 <= n; i += 32) {
-		__m256 g0	= _mm256_loadu_ps(g + i);
-		__m256 g1	= _mm256_loadu_ps(g + i + 8);
-		__m256 g2	= _mm256_loadu_ps(g + i + 16);
-		__m256 g3	= _mm256_loadu_ps(g + i + 24);
-		__m256 g0sq = _mm256_mul_ps(g0, g0);
-		__m256 g1sq = _mm256_mul_ps(g1, g1);
-		__m256 g2sq = _mm256_mul_ps(g2, g2);
-		__m256 g3sq = _mm256_mul_ps(g3, g3);
-		__m256 in0	= _mm256_mul_ps(
-			_mm256_set1_ps(c_fit),
-			_mm256_mul_ps(g0, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											_mm256_mul_ps(_mm256_set1_ps(c_x3), g0sq))));
-		__m256 in1 = _mm256_mul_ps(
-			_mm256_set1_ps(c_fit),
-			_mm256_mul_ps(g1, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											_mm256_mul_ps(_mm256_set1_ps(c_x3), g1sq))));
-		__m256 in2 = _mm256_mul_ps(
-			_mm256_set1_ps(c_fit),
-			_mm256_mul_ps(g2, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											_mm256_mul_ps(_mm256_set1_ps(c_x3), g2sq))));
-		__m256 in3 = _mm256_mul_ps(
-			_mm256_set1_ps(c_fit),
-			_mm256_mul_ps(g3, _mm256_add_ps(_mm256_set1_ps(1.0f),
-											_mm256_mul_ps(_mm256_set1_ps(c_x3), g3sq))));
-		__m256 t0 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in0));
-		__m256 t1 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in1));
-		__m256 t2 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in2));
-		__m256 t3 = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(in3));
+	int i					= begin;
+	for (; i + 8 <= end; i += 8)
 		_mm256_storeu_ps(o + i,
-						 _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), g0), t0),
-									   _mm256_loadu_ps(u + i)));
-		_mm256_storeu_ps(o + i + 8,
-						 _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), g1), t1),
-									   _mm256_loadu_ps(u + i + 8)));
-		_mm256_storeu_ps(o + i + 16,
-						 _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), g2), t2),
-									   _mm256_loadu_ps(u + i + 16)));
-		_mm256_storeu_ps(o + i + 24,
-						 _mm256_mul_ps(_mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), g3), t3),
-									   _mm256_loadu_ps(u + i + 24)));
-	}
-	for (; i < n; i++) {
-		float x		= g[i];
-		float x3	= x * x * x;
-		float inner = c_fit * (x + (c_x3 * x3));
-		float t		= tanhf(inner);
-		o[i]		= 0.5f * x * (1.0f + t) * u[i];
-	}
+						 _mm256_mul_ps(vgelu_ps(_mm256_loadu_ps(g + i)), _mm256_loadu_ps(u + i)));
+	for (; i < end; i++)
+		o[i] = gelu_tanh(g[i]) * u[i];
 }
 
 status_code cpu_ffn_activate_ex(backend *self, const buffer *gate, const buffer *up, buffer *out,
@@ -1472,7 +1396,7 @@ void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
 		_mm256_storeu_ps(j->x + i, _mm256_mul_ps(vtanh_ps(x), vcap));
 	}
 	for (; i < end; i++)
-		j->x[i] = cap * tanhf(j->x[i] * inv_cap);
+		j->x[i] = cap * num_tanhf(j->x[i] * inv_cap);
 }
 
 void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
@@ -1514,11 +1438,8 @@ void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx) {
 		const float *g = j->gate + (size_t)row * n;
 		int			 i = 0;
 		for (; i + 8 <= n; i += 8) {
-			__m256 gv = _mm256_loadu_ps(g + i);
-			__m256 sig =
-				_mm256_div_ps(_mm256_set1_ps(1.0f),
-							  _mm256_add_ps(_mm256_set1_ps(1.0f),
-											vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), gv))));
+			__m256 gv  = _mm256_loadu_ps(g + i);
+			__m256 sig = vsigmoid_ps(gv);
 			_mm256_storeu_ps(o + i, _mm256_mul_ps(_mm256_loadu_ps(o + i), sig));
 		}
 		for (; i < n; i++)
@@ -1537,7 +1458,7 @@ static void cpu_rmsnorm_add_batch_chunk_avx(int begin, int end, int tid, void *c
 		const float *rr		  = j->residual + ((size_t)row * n);
 		float		*yr		  = j->y + ((size_t)row * n);
 		float		 ss		  = rmsnorm_sum_sq(xr, n);
-		float		 scale	  = 1.0f / sqrtf((ss / (float)n) + j->eps);
+		float		 scale	  = num_rms_scale(ss, n, j->eps);
 		__m256		 scale_v  = _mm256_set1_ps(scale);
 		__m256		 oscale_v = _mm256_set1_ps(oscale);
 		int			 i		  = 0;
@@ -1569,7 +1490,7 @@ static void cpu_rmsnorm_add_batch_chunk_avx(int begin, int end, int tid, void *c
 												   oscale_v));
 		}
 		for (; i < n; i++)
-			yr[i] = (xr[i] * scale * w[i] + rr[i]) * oscale;
+			yr[i] = fmaf(xr[i] * scale, w[i], rr[i]) * oscale;
 	}
 }
 
@@ -1703,7 +1624,7 @@ static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 			if (score > M) {
 				float Mold = M;
 				M		   = score;
-				ms		   = expf(Mold - M);
+				ms		   = num_expf(Mold - M);
 				__m256 msv = _mm256_set1_ps(ms);
 				int	   i2  = 0;
 				for (; i2 + 8 <= j->kv_lora; i2 += 8)
@@ -1712,7 +1633,7 @@ static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 				for (; i2 < j->kv_lora; i2++)
 					VKQ_latent[i2] *= ms;
 			} else {
-				vs = expf(score - M);
+				vs = num_expf(score - M);
 			}
 			__m256 vsv = _mm256_set1_ps(vs);
 			int	   i3  = 0;
@@ -1942,7 +1863,7 @@ static status_code matmul_vec(backend *self, const backend_weight *w, const floa
 }
 
 static void rmsnorm_inplace(float *x, const float *w, int n, float eps) {
-	float  inv	 = 1.0f / sqrtf(rmsnorm_sum_sq(x, n) / (float)n + eps);
+	float  inv	 = num_rms_scale(rmsnorm_sum_sq(x, n), n, eps);
 	__m256 inv_v = _mm256_set1_ps(inv);
 	int	   i	 = 0;
 	for (; i + 8 <= n; i += 8) {
@@ -1988,7 +1909,7 @@ static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, floa
 			mx = fmaxf(mx, col[d]);
 		float sum = 0.0f;
 		for (int d = 0; d < HC; d++) {
-			col[d] = expf(col[d] - mx);
+			col[d] = num_expf(col[d] - mx);
 			sum += col[d];
 		}
 		for (int d = 0; d < HC; d++)
@@ -2030,8 +1951,8 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 
 	float pre[HC_SUPPORTED];
 	for (int h = 0; h < hc; h++) {
-		pre[h]	   = sigmoidf(mixes[h] * d->scale[0] + d->base[h]) + d->eps;
-		d->coef[h] = 2.0f * sigmoidf(mixes[hc + h] * d->scale[1] + d->base[hc + h]);
+		pre[h]	   = sigmoidf(fmaf(mixes[h], d->scale[0], d->base[h])) + d->eps;
+		d->coef[h] = 2.0f * sigmoidf(fmaf(mixes[hc + h], d->scale[1], d->base[hc + h]));
 	}
 	float *comb = d->coef + hc;
 	for (int j = 0; j < hc * hc; j++)
@@ -2118,7 +2039,7 @@ static void kda_heads(int begin, int end, int tid, void *arg) {
 		float		*o = j->out + (size_t)h * S;
 		float		 b = j->beta[h];
 		for (int i = 0; i < S; i++)
-			decay[i] = expf(g[i]);
+			decay[i] = num_expf(g[i]);
 		for (int r = 0; r < S; r++)
 			delta[r] = (v[r] - decay_dot_f32(M + (size_t)r * S, decay, k, S)) * b;
 		for (int r = 0; r < S; r++)
@@ -2167,7 +2088,7 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 			if (lb > -INFINITY) {
 				g[idx] = lb * sigmoidf(-(t * d->ssm_a[h]));
 			} else {
-				float sp = t > 20.0f ? t : log1pf(expf(t));
+				float sp = t > 20.0f ? t : log1pf(num_expf(t));
 				g[idx]	 = sp * d->ssm_a[h];
 			}
 		}
@@ -2209,7 +2130,7 @@ static void mla_heads(int begin, int end, int tid, void *arg) {
 		}
 		float sum = 0.0f;
 		for (int t = 0; t < j->n_pos; t++) {
-			sc[t] = expf(sc[t] - mx);
+			sc[t] = num_expf(sc[t] - mx);
 			sum += sc[t];
 		}
 		memset(lat, 0, (size_t)R * sizeof(float));

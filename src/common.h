@@ -43,7 +43,10 @@ typedef enum {
 	ERR_BUSY		  = -11,
 } status_code;
 
-void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
+double rope_freq_factor(const float *freq_factors, int j);
+void   rope_cs_row(float *cos_out, float *sin_out, int stride, int half, double pos,
+				   double theta_scale, const float *freq_factors);
+void   rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors);
 
 const char *status_str(status_code s);
 

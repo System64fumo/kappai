@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 #define MERGE_WG 64
@@ -35,7 +36,7 @@ void main(void) {
 	float m_max = s_red[0];
 	barrier();
 
-	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : exp(m_s - m_max);
+	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : num_exp(m_s - m_max);
 	w_split[tid] = w;
 	s_red[tid]	 = has_split ? w * part[base + tid * uint(stride) + 1u] : 0.0;
 	barrier();

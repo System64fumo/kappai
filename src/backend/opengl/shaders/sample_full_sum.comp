@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 layout(local_size_x = 256) in;
@@ -31,7 +32,7 @@ void main() {
 	uint  hi  = min(lo + uint(u_chunk), uint(u_n));
 	float acc = 0.0;
 	for (uint i = lo + tid; i < hi; i += 256u)
-		acc += exp(logits[i] * u_inv_temp - mx);
+		acc += num_exp(logits[i] * u_inv_temp - mx);
 	s_part[tid] = acc;
 	barrier();
 	for (uint s = 128u; s > 0u; s >>= 1u) {

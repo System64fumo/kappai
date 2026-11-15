@@ -448,22 +448,29 @@ void copy_weight_chunked(void *dst, const void *src, size_t bytes, int release_s
 	}
 }
 
-void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
+double rope_freq_factor(const float *freq_factors, int j) {
+	if (!freq_factors)
+		return 1.0;
+	float fv = freq_factors[j];
+	return (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+}
+
+void rope_cs_row(float *cos_out, float *sin_out, int stride, int half, double pos,
+				 double theta_scale, const float *freq_factors) {
 	double base_freq = 1.0;
-	for (int j = 0; j < half; j++) {
-		double ff = 1.0;
-		if (freq_factors) {
-			float fv = freq_factors[j];
-			ff		 = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
+	for (int j = 0; j < half; j++, base_freq *= theta_scale) {
+		double ff = rope_freq_factor(freq_factors, j);
+		if (ff <= 0.0) {
+			cos_out[(size_t)j * stride] = 1.0f;
+			sin_out[(size_t)j * stride] = 0.0f;
+			continue;
 		}
-		if (ff > 0.0) {
-			double angle	= base_freq * ff * (double)pos;
-			cs[2 * j]		= (float)cos(angle);
-			cs[(2 * j) + 1] = (float)sin(angle);
-		} else {
-			cs[2 * j]		= 1.0f;
-			cs[(2 * j) + 1] = 0.0f;
-		}
-		base_freq *= theta_scale;
+		double angle				= base_freq * ff * pos;
+		cos_out[(size_t)j * stride] = (float)cos(angle);
+		sin_out[(size_t)j * stride] = (float)sin(angle);
 	}
+}
+
+void rope_cs_fill(float *cs, int half, int pos, double theta_scale, const float *freq_factors) {
+	rope_cs_row(cs, cs + 1, 2, half, (double)pos, theta_scale, freq_factors);
 }

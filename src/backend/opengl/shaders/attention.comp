@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 #ifndef ATTN_WG
@@ -148,8 +149,8 @@ void main(void) {
 		for (int t = 0; t < ATTN_WG / 4; t++)
 			m_tile = max(m_tile, m_part[t]);
 		float m_new = max(m_run, m_tile);
-		e_tile[tid] = tok < t_end ? exp(score - m_new) : 0.0;
-		float alpha = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		e_tile[tid] = tok < t_end ? num_exp(score - m_new) : 0.0;
+		float alpha = (m_new == m_run) ? 1.0 : num_exp(m_run - m_new);
 		m_run		= m_new;
 		barrier();
 

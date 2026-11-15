@@ -66,7 +66,7 @@ static void gated_add_rows(int begin, int end, int tid, void *ctx) {
 	const row_job *j = ctx;
 	for (int r = begin; r < end; r++)
 		for (int i = 0; i < j->dim; i++)
-			j->y[(size_t)r * j->dim + i] += j->src[(size_t)r * j->dim + i] * tanhf(j->vec[i]);
+			j->y[(size_t)r * j->dim + i] += j->src[(size_t)r * j->dim + i] * num_tanhf(j->vec[i]);
 }
 
 status_code cpu_gated_add(backend *self, buffer *x, const buffer *y, const buffer *gate, int rows,
@@ -161,7 +161,7 @@ static void attention_items(int begin, int end, int tid, void *ctx) {
 		}
 		float sum = 0;
 		for (int c = 0; c < vis; c++) {
-			scores[c] = expf(scores[c] - maxv);
+			scores[c] = num_expf(scores[c] - maxv);
 			sum += scores[c];
 		}
 		float inv_sum = 1.0f / sum;

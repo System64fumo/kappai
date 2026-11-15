@@ -3,6 +3,7 @@
 
 #include "../../common.h"
 #include "gguf.h"
+#include "numeric.h"
 #include <math.h>
 
 #define Q8_0_REPACKED_ROWS 8
@@ -169,11 +170,13 @@ typedef struct {
 	size_t q8_buf_elems;
 } quant_scratch;
 
-float	 f16_to_f32(uint16_t h);
-uint16_t f32_to_f16(float f);
-void	 f32_to_f16_row(const float *src, uint16_t *dst, int n);
-void	 scale_f32(float *x, float s, int n);
-void	 add_scale_f32(float *x, const float *y, float s, int n);
+float				   f16_to_f32(uint16_t h);
+static inline uint16_t f32_to_f16(float f) {
+	return num_f32_to_f16(f);
+}
+void f32_to_f16_row(const float *src, uint16_t *dst, int n);
+void scale_f32(float *x, float s, int n);
+void add_scale_f32(float *x, const float *y, float s, int n);
 void gdn_decay_accum_f32(float *restrict row, float *restrict mem, float decay, float ks, int n);
 void gdn_out_norm_f32(float *restrict y, const float *restrict norm_w, const float *restrict z,
 					  float inv_rms, int n);
@@ -367,29 +370,23 @@ float dot_f32(const float *restrict a, const float *restrict b, int n);
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps);
 
 static inline float silu(float x) {
-	return x / (1.0f + expf(-x));
+	return num_silu(x);
 }
 
 static inline float gelu_tanh(float x) {
-	const float c	  = 0.7978845608028654f;
-	float		x3	  = x * x * x;
-	float		inner = c * (x + (0.044715f * x3));
-	return 0.5f * x * (1.0f + tanhf(inner));
+	return num_gelu_tanh(x);
 }
 
 static inline float sigmoidf(float x) {
-	if (x >= 0.0f)
-		return 1.0f / (1.0f + expf(-x));
-	float z = expf(x);
-	return z / (1.0f + z);
+	return num_sigmoidf(x);
 }
 
 static inline float softplusf(float x) {
 	if (x > 20.0f)
 		return x;
 	if (x < -20.0f)
-		return expf(x);
-	return log1pf(expf(x));
+		return num_expf(x);
+	return log1pf(num_expf(x));
 }
 
 static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rope_dim,

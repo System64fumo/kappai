@@ -113,8 +113,8 @@ static inline float attn_softmax_step(float ss, float *M, float *S, float *restr
 									  int head_dim) {
 	const float M_old = *M;
 	const float M_new = fmaxf(ss, M_old);
-	const float alpha = (*S > 0.0f) ? fast_expf(M_old - M_new) : 1.0f;
-	const float vs	  = fast_expf(ss - M_new);
+	const float alpha = (*S > 0.0f) ? num_expf(M_old - M_new) : 1.0f;
+	const float vs	  = num_expf(ss - M_new);
 
 	if (alpha != 1.0f)
 		scale_f32_vec(vkq, head_dim, alpha);
@@ -517,13 +517,7 @@ void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
 }
 
 static float32x4_t sigmoid_mul_vec4(float32x4_t g, float32x4_t u) {
-	float32x4_t t	= vexpq_f32(vnegq_f32(vabsq_f32(g)));
-	float32x4_t den = vaddq_f32(vdupq_n_f32(1.0f), t);
-	float32x4_t num = vbslq_f32(vcgeq_f32(g, vdupq_n_f32(0.0f)), vdupq_n_f32(1.0f), t);
-	float32x4_t r	= vrecpeq_f32(den);
-	r				= vmulq_f32(vrecpsq_f32(den, r), r);
-	r				= vmulq_f32(vrecpsq_f32(den, r), r);
-	return vmulq_f32(u, vmulq_f32(num, r));
+	return vmulq_f32(u, vsigmoidq_f32(g));
 }
 
 void cpu_attn_output_gate_chunk(int begin, int end, int tid, void *ctx) {
@@ -552,7 +546,7 @@ void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
 		vst1q_f32(j->x + i, vmulq_n_f32(vtanhq_f32(x), cap));
 	}
 	for (; i < end; i++)
-		j->x[i] = cap * tanhf(j->x[i] * inv_cap);
+		j->x[i] = cap * num_tanhf(j->x[i] * inv_cap);
 }
 
 float dot8(const float *restrict a, const float *restrict b, int head_dim) {
@@ -802,7 +796,7 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 
 			float bmax	= fmaxf(fmaxf(sb[0], sb[1]), fmaxf(sb[2], sb[3]));
 			float M_new = bmax > M ? bmax : M;
-			float alpha = (S > 0.0f && bmax > M) ? fast_expf(M - M_new) : 1.0f;
+			float alpha = (S > 0.0f && bmax > M) ? num_expf(M - M_new) : 1.0f;
 
 			float ds[4] __attribute__((aligned(16)));
 			ds[0] = sb[0] - M_new;
@@ -1161,7 +1155,7 @@ static void cpu_attn_gqa_flash_q8_0(const uint8_t *k_slice, const uint8_t *v_sli
 
 			float bmax	= fmaxf(fmaxf(sb[0], sb[1]), fmaxf(sb[2], sb[3]));
 			float M_new = bmax > M[g] ? bmax : M[g];
-			float alpha = (S[g] > 0.0f && bmax > M[g]) ? fast_expf(M[g] - M_new) : 1.0f;
+			float alpha = (S[g] > 0.0f && bmax > M[g]) ? num_expf(M[g] - M_new) : 1.0f;
 
 			float ds[4] __attribute__((aligned(16)));
 			ds[0] = sb[0] - M_new;
@@ -1540,7 +1534,7 @@ static void cpu_rmsnorm_add_batch_chunk_neon(int begin, int end, int tid, void *
 		float		*yr = j->y + ((size_t)row * n);
 
 		float		ss		 = rmsnorm_sum_sq(xr, n);
-		float		scale	 = 1.0f / sqrtf((ss / (float)n) + j->eps);
+		float		scale	 = num_rms_scale(ss, n, j->eps);
 		float32x4_t scale_v	 = vdupq_n_f32(scale);
 		float32x4_t oscale_v = vdupq_n_f32(oscale);
 
@@ -1565,7 +1559,7 @@ static void cpu_rmsnorm_add_batch_chunk_neon(int begin, int end, int tid, void *
 					  vmulq_f32(vfmaq_f32(vld1q_f32(rr + i), t, vld1q_f32(w + i)), oscale_v));
 		}
 		for (; i < n; i++)
-			yr[i] = (xr[i] * scale * w[i] + rr[i]) * oscale;
+			yr[i] = fmaf(xr[i] * scale, w[i], rr[i]) * oscale;
 	}
 }
 
@@ -1602,7 +1596,7 @@ static void cpu_ffn_silu_chunk_neon(int begin, int end, int tid, void *ctx) {
 		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 	for (; i < n; i++) {
 		float gv = g[i];
-		o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
+		o[i]	 = gv / (1.0f + num_expf(-gv)) * u[i];
 	}
 }
 
@@ -1621,10 +1615,8 @@ static void cpu_ffn_gelu_chunk_neon(int begin, int end, int tid, void *ctx) {
 	const float *restrict g = a->g;
 	const float *restrict u = a->u;
 	float *restrict o		= a->o;
-	const float c_fit		= 0.7978845608028654f;
-	const float c_x3		= 0.044715f;
-	int			i			= begin;
-	int			n			= end;
+	int i					= begin;
+	int n					= end;
 	for (; i + 16 <= n; i += 16) {
 		vst1q_f32(o + i, gelu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 		vst1q_f32(o + i + 4, gelu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
@@ -1632,11 +1624,7 @@ static void cpu_ffn_gelu_chunk_neon(int begin, int end, int tid, void *ctx) {
 		vst1q_f32(o + i + 12, gelu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 	}
 	for (; i < n; i++) {
-		float x		= g[i];
-		float x3	= x * x * x;
-		float inner = c_fit * (x + (c_x3 * x3));
-		float t		= tanhf(inner);
-		o[i]		= 0.5f * x * (1.0f + t) * u[i];
+		o[i] = gelu_tanh(g[i]) * u[i];
 	}
 }
 
@@ -1649,8 +1637,6 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 	int i					 = begin;
 	int n					 = end;
 	if (a->activation == 1) {
-		const float c_fit = 0.7978845608028654f;
-		const float c_x3  = 0.044715f;
 		for (; i + 16 <= n; i += 16) {
 			vst1q_f32(o + i, gelu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 			vst1q_f32(o + i + 4, gelu_mul_vec4(vld1q_f32(g + i + 4), vld1q_f32(u + i + 4)));
@@ -1658,11 +1644,7 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 			vst1q_f32(o + i + 12, gelu_mul_vec4(vld1q_f32(g + i + 12), vld1q_f32(u + i + 12)));
 		}
 		for (; i < n; i++) {
-			float x		= g[i];
-			float x3	= x * x * x;
-			float inner = c_fit * (x + (c_x3 * x3));
-			float t		= tanhf(inner);
-			o[i]		= 0.5f * x * (1.0f + t) * u[i];
+			o[i] = gelu_tanh(g[i]) * u[i];
 		}
 		return;
 	}
@@ -1676,7 +1658,7 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 		vst1q_f32(o + i, silu_mul_vec4(vld1q_f32(g + i), vld1q_f32(u + i)));
 	for (; i < n; i++) {
 		float gv = g[i];
-		o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
+		o[i]	 = gv / (1.0f + num_expf(-gv)) * u[i];
 	}
 }
 
@@ -1828,10 +1810,10 @@ static void cpu_attention_mla_head_neon(int begin, int end, int tid, void *ctx) 
 			if (score > M) {
 				float Mold = M;
 				M		   = score;
-				ms		   = fast_expf(Mold - M);
+				ms		   = num_expf(Mold - M);
 				scale_f32_vec(VKQ_latent, j->kv_lora, ms);
 			} else {
-				vs = fast_expf(score - M);
+				vs = num_expf(score - M);
 			}
 			float32x4_t vsv = vdupq_n_f32(vs);
 			int			i3	= 0;
@@ -1993,40 +1975,6 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 	return OK;
 }
 
-static inline float32x4_t vexpq_precise_f32(float32x4_t x) {
-	x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0f)), vdupq_n_f32(88.0f));
-
-	const float32x4_t inv_ln2 = vdupq_n_f32(1.4426950408889634f);
-	const float32x4_t ln2_hi  = vdupq_n_f32(6.9314718055994529e-01f);
-	const float32x4_t ln2_lo  = vdupq_n_f32(1.9082149292705877e-10f);
-
-	float32x4_t n_f = vrndnq_f32(vmulq_f32(x, inv_ln2));
-	int32x4_t	n_i = vcvtq_s32_f32(n_f);
-	float32x4_t r	= vfmsq_f32(vfmsq_f32(x, n_f, ln2_hi), n_f, ln2_lo);
-
-	float32x4_t p = vdupq_n_f32(1.0f / 5040.0f);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f / 720.0f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(0.5f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
-	p			  = vfmaq_f32(vdupq_n_f32(1.0f), r, p);
-
-	float32x4_t pow2n = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(n_i, vdupq_n_s32(127)), 23));
-	return vmulq_f32(p, pow2n);
-}
-
-static inline float32x4_t sigmoid_vec4(float32x4_t x) {
-	float32x4_t e = vexpq_precise_f32(vnegq_f32(x));
-	return vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), e));
-}
-
-static inline float32x4_t silu_vec4(float32x4_t x) {
-	float32x4_t e = vexpq_precise_f32(vnegq_f32(x));
-	return vdivq_f32(x, vaddq_f32(vdupq_n_f32(1.0f), e));
-}
-
 static inline tpool *cpu_pool_of(backend *self) {
 	cpu_priv *p = self->priv;
 	return p ? p->pool : NULL;
@@ -2076,7 +2024,7 @@ static status_code matmul_multi_vec(backend *self, const backend_weight *const *
 }
 
 static void rmsnorm_inplace_neon(float *x, const float *w, int n, float eps) {
-	float inv = 1.0f / sqrtf(rmsnorm_sum_sq(x, n) / (float)n + eps);
+	float inv = num_rms_scale(rmsnorm_sum_sq(x, n), n, eps);
 	if (!w) {
 		scale_f32_vec(x, n, inv);
 		return;
@@ -2187,7 +2135,7 @@ static void hc_sinkhorn_neon(float comb[16], int iters, float eps) {
 	float32x4_t		  row[4];
 	for (int src = 0; src < 4; src++) {
 		float32x4_t v = vld1q_f32(comb + src * 4);
-		float32x4_t e = vexpq_precise_f32(vsubq_f32(v, vdupq_n_f32(vmaxvq_f32(v))));
+		float32x4_t e = vexpq_f32(vsubq_f32(v, vdupq_n_f32(vmaxvq_f32(v))));
 		row[src]	  = vaddq_f32(vdivq_f32(e, vdupq_n_f32(vaddvq_f32(e))), eps_v);
 	}
 	for (int it = 0; it < iters; it++) {
@@ -2212,7 +2160,7 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 
 	float *normed = d->ws;
 	float *mixes  = normed + flat;
-	float  inv	  = 1.0f / sqrtf(rmsnorm_sum_sq(d->stream, flat) / (float)flat + d->norm_eps);
+	float  inv	  = num_rms_scale(rmsnorm_sum_sq(d->stream, flat), flat, d->norm_eps);
 	scale_store_f32_vec(normed, d->stream, flat, inv);
 
 	status_code st = matmul_vec(self, &d->fn, normed, mixes, hc_mix_dim(hc), flat);
@@ -2221,8 +2169,8 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 
 	float pre[4];
 	for (int h = 0; h < hc; h++) {
-		pre[h]	   = sigmoidf(mixes[h] * d->scale[0] + d->base[h]) + d->eps;
-		d->coef[h] = 2.0f * sigmoidf(mixes[hc + h] * d->scale[1] + d->base[hc + h]);
+		pre[h]	   = sigmoidf(fmaf(mixes[h], d->scale[0], d->base[h])) + d->eps;
+		d->coef[h] = 2.0f * sigmoidf(fmaf(mixes[hc + h], d->scale[1], d->base[hc + h]));
 	}
 	float *comb = d->coef + hc;
 	for (int j = 0; j < hc * hc; j++)
@@ -2271,7 +2219,7 @@ static void causal_conv_silu_neon(float *state, const float *w, float *x, int ch
 			nh.val[1] = h.val[2];
 			nh.val[2] = xv;
 			vst3q_f32(state + (size_t)c * 3, nh);
-			vst1q_f32(x + c, silu_vec4(sum));
+			vst1q_f32(x + c, vsiluq_f32(sum));
 		}
 	}
 	for (; c < channels; c++) {
@@ -2299,7 +2247,7 @@ static void kda_gates_neon(float *g, float *beta, const float *dt_bias, const fl
 			const float32x4_t one  = vdupq_n_f32(1.0f);
 			for (; i + 4 <= head_dim; i += 4) {
 				float32x4_t t = vaddq_f32(vld1q_f32(gh + i), vld1q_f32(dth + i));
-				float32x4_t e = vexpq_precise_f32(vmulq_n_f32(t, a));
+				float32x4_t e = vexpq_f32(vmulq_n_f32(t, a));
 				vst1q_f32(gh + i, vmulq_f32(lb_v, vdivq_f32(one, vaddq_f32(one, e))));
 			}
 		}
@@ -2308,7 +2256,7 @@ static void kda_gates_neon(float *g, float *beta, const float *dt_bias, const fl
 			if (bounded) {
 				gh[i] = lower_bound * sigmoidf(-(t * a));
 			} else {
-				float sp = t > 20.0f ? t : log1pf(expf(t));
+				float sp = t > 20.0f ? t : log1pf(num_expf(t));
 				gh[i]	 = sp * a;
 			}
 		}
@@ -2334,9 +2282,9 @@ static void kda_heads_neon(int begin, int end, int tid, void *arg) {
 
 		int i = 0;
 		for (; i + 4 <= S; i += 4)
-			vst1q_f32(decay + i, vexpq_precise_f32(vld1q_f32(g + i)));
+			vst1q_f32(decay + i, vexpq_f32(vld1q_f32(g + i)));
 		for (; i < S; i++)
-			decay[i] = expf(g[i]);
+			decay[i] = num_expf(g[i]);
 
 		for (int r = 0; r < S; r++) {
 			float	   *row = M + (size_t)r * S;
@@ -2447,14 +2395,14 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 	for (int h = 0; h < H; h++) {
 		float			 *oh	= o + (size_t)h * S;
 		const float		 *g2h	= g2 + (size_t)h * S;
-		const float		  inv	= 1.0f / sqrtf(rmsnorm_sum_sq(oh, S) / (float)S + d->norm_eps);
+		const float		  inv	= num_rms_scale(rmsnorm_sum_sq(oh, S), S, d->norm_eps);
 		const float32x4_t inv_v = vdupq_n_f32(inv);
 		int				  i		= 0;
 		for (; i + 4 <= S; i += 4) {
 			float32x4_t x = vmulq_f32(vld1q_f32(oh + i), inv_v);
 			if (d->out_norm)
 				x = vmulq_f32(x, vld1q_f32(d->out_norm + i));
-			vst1q_f32(oh + i, vmulq_f32(x, sigmoid_vec4(vld1q_f32(g2h + i))));
+			vst1q_f32(oh + i, vmulq_f32(x, vsigmoidq_f32(vld1q_f32(g2h + i))));
 		}
 		for (; i < S; i++) {
 			float x = oh[i] * inv * (d->out_norm ? d->out_norm[i] : 1.0f);
@@ -2523,13 +2471,13 @@ static void mla_attn_heads_neon(int begin, int end, int tid, void *arg) {
 		const float32x4_t mx_v	= vdupq_n_f32(mx);
 		float32x4_t		  sum_v = vdupq_n_f32(0.0f);
 		for (t = 0; t + 4 <= n; t += 4) {
-			float32x4_t e = vexpq_precise_f32(vsubq_f32(vld1q_f32(sc + t), mx_v));
+			float32x4_t e = vexpq_f32(vsubq_f32(vld1q_f32(sc + t), mx_v));
 			vst1q_f32(sc + t, e);
 			sum_v = vaddq_f32(sum_v, e);
 		}
 		float sum = vaddvq_f32(sum_v);
 		for (; t < n; t++) {
-			sc[t] = expf(sc[t] - mx);
+			sc[t] = num_expf(sc[t] - mx);
 			sum += sc[t];
 		}
 		scale_f32_vec(sc, n, 1.0f / sum);

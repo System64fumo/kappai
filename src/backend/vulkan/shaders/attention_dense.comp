@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 128) in;
 
 layout(set = 0, binding = 0) readonly buffer QBuf {
@@ -118,8 +120,8 @@ void main() {
 		vec4 new_max = max(run_max, sr[0]);
 		barrier();
 
-		vec4 alpha = exp(run_max - new_max);
-		vec4 p	   = mix(vec4(0.0), exp(sv - new_max), live);
+		vec4 alpha = num_exp(run_max - new_max);
+		vec4 p	   = mix(vec4(0.0), num_exp(sv - new_max), live);
 		sp[tid]	   = p;
 		sr[tid]	   = p;
 		barrier();

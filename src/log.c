@@ -46,8 +46,18 @@ void log_init(log_config cfg) {
 	pthread_mutex_unlock(&g_log_mtx);
 }
 
+static _Thread_local int g_log_mute_depth;
+
+void log_mute_push(void) {
+	g_log_mute_depth++;
+}
+
+void log_mute_pop(void) {
+	g_log_mute_depth--;
+}
+
 log_level log_get_level(void) {
-	return g_log.level;
+	return g_log_mute_depth > 0 ? (log_level)(LOG_ERROR + 1) : g_log.level;
 }
 
 void log_set_level(log_level level) {
@@ -68,7 +78,7 @@ static void log_line_locked(FILE *out, const char *color, const char *tag, const
 
 static void log_locked(log_level level, const char *color, const char *tag, const char *fmt,
 					   va_list ap) {
-	if (level < g_log.level)
+	if (level < log_get_level())
 		return;
 
 	FILE *out = g_log.stream ? g_log.stream : stderr;

@@ -56,7 +56,7 @@ void main() {
 		dst[row_off + i] = (dst[row_off + i] + src1[row_off + i]) * params.scale;
 		break;
 	case MODE_SOFTCAP:
-		dst[row_off + i] = params.scale * tanh(dst[row_off + i] / params.scale);
+		dst[row_off + i] = params.scale * num_tanh(dst[row_off + i] / params.scale);
 		break;
 	case MODE_SPLIT_QGATE: {
 		uint head_dim_v	  = uint(params._pad);
@@ -68,7 +68,7 @@ void main() {
 		break;
 	}
 	case MODE_ATTN_OUTPUT_GATE:
-		dst[row_off + i] = dst[row_off + i] * (1.0 / (1.0 + exp(-src1[row_off + i])));
+		dst[row_off + i] = dst[row_off + i] * num_sigmoid(src1[row_off + i]);
 		break;
 	case MODE_ACT_SILU: {
 		float v			 = dst[row_off + i];
@@ -84,7 +84,7 @@ void main() {
 		dst[row_off + i] = dst[row_off + i] + src1[i];
 		break;
 	case MODE_GATED_ADD:
-		dst[row_off + i] = dst[row_off + i] + src1[row_off + i] * tanh(src2[i]);
+		dst[row_off + i] = dst[row_off + i] + src1[row_off + i] * num_tanh(src2[i]);
 		break;
 	default:
 		break;

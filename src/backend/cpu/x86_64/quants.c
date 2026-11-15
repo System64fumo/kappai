@@ -4442,32 +4442,9 @@ float dot_f32(const float *restrict a, const float *restrict b, int n) {
 	return s;
 }
 
-float rmsnorm_sum_sq(const float *x, int n) {
-	__m128 ss_v = _mm_setzero_ps();
-	int	   i	= 0;
-	for (; i + 16 <= n; i += 16) {
-		__m128 x0 = _mm_loadu_ps(x + i);
-		__m128 x1 = _mm_loadu_ps(x + i + 4);
-		__m128 x2 = _mm_loadu_ps(x + i + 8);
-		__m128 x3 = _mm_loadu_ps(x + i + 12);
-		ss_v	  = _mm_fmadd_ps(x0, x0, ss_v);
-		ss_v	  = _mm_fmadd_ps(x1, x1, ss_v);
-		ss_v	  = _mm_fmadd_ps(x2, x2, ss_v);
-		ss_v	  = _mm_fmadd_ps(x3, x3, ss_v);
-	}
-	for (; i + 4 <= n; i += 4) {
-		__m128 x0 = _mm_loadu_ps(x + i);
-		ss_v	  = _mm_fmadd_ps(x0, x0, ss_v);
-	}
-	float ss = vreduce_add_ps_128(ss_v);
-	for (; i < n; i++)
-		ss += x[i] * x[i];
-	return ss;
-}
-
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 	float  ss	   = rmsnorm_sum_sq(x, n);
-	float  scale   = 1.0f / sqrtf((ss / (float)n) + eps);
+	float  scale   = num_rms_scale(ss, n, eps);
 	__m128 scale_v = _mm_set1_ps(scale);
 	int	   i	   = 0;
 	for (; i + 16 <= n; i += 16) {
@@ -4489,7 +4466,7 @@ void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 
 void rmsnorm_noweight(const float *x, float *y, int n, float eps) {
 	float  ss	   = rmsnorm_sum_sq(x, n);
-	float  scale   = 1.0f / sqrtf((ss / (float)n) + eps);
+	float  scale   = num_rms_scale(ss, n, eps);
 	__m128 scale_v = _mm_set1_ps(scale);
 	int	   i	   = 0;
 	for (; i + 16 <= n; i += 16) {
@@ -4510,7 +4487,7 @@ void rmsnorm_per_head(const float *x, const float *w, float *y, int n_heads, int
 		const float *xh		 = x + ((size_t)h * head_dim);
 		float		*yh		 = y + ((size_t)h * head_dim);
 		float		 ss		 = rmsnorm_sum_sq(xh, head_dim);
-		float		 scale	 = 1.0f / sqrtf((ss / (float)head_dim) + eps);
+		float		 scale	 = num_rms_scale(ss, head_dim, eps);
 		__m128		 scale_v = _mm_set1_ps(scale);
 		int			 j		 = 0;
 		for (; j + 16 <= head_dim; j += 16) {
@@ -4576,7 +4553,7 @@ void softmax_masked(float *restrict scores, int n_valid) {
 	}
 	float sum = vreduce_add_ps(sum_v);
 	for (; i < n_valid; i++) {
-		scores[i] = expf(scores[i] - mx);
+		scores[i] = num_expf(scores[i] - mx);
 		sum += scores[i];
 	}
 	float  inv	 = 1.0f / sum;
@@ -4596,31 +4573,11 @@ void softmax_masked(float *restrict scores, int n_valid) {
 
 void moe_activate_silu(float *restrict act, const float *restrict gate, const float *restrict up,
 					   int n, float gs, float us) {
-	__m256 gs_v	 = _mm256_set1_ps(gs);
-	__m256 us_v	 = _mm256_set1_ps(us);
-	__m256 one_v = _mm256_set1_ps(1.0f);
-	__m256 zero	 = _mm256_setzero_ps();
-	int	   i	 = 0;
-	for (; i + 32 <= n; i += 32) {
-		__m256 g0 = _mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v);
-		__m256 g1 = _mm256_mul_ps(_mm256_loadu_ps(gate + i + 8), gs_v);
-		__m256 g2 = _mm256_mul_ps(_mm256_loadu_ps(gate + i + 16), gs_v);
-		__m256 g3 = _mm256_mul_ps(_mm256_loadu_ps(gate + i + 24), gs_v);
-		__m256 s0 = _mm256_div_ps(g0, _mm256_add_ps(one_v, vexp_ps(_mm256_sub_ps(zero, g0))));
-		__m256 s1 = _mm256_div_ps(g1, _mm256_add_ps(one_v, vexp_ps(_mm256_sub_ps(zero, g1))));
-		__m256 s2 = _mm256_div_ps(g2, _mm256_add_ps(one_v, vexp_ps(_mm256_sub_ps(zero, g2))));
-		__m256 s3 = _mm256_div_ps(g3, _mm256_add_ps(one_v, vexp_ps(_mm256_sub_ps(zero, g3))));
-		_mm256_storeu_ps(act + i, _mm256_mul_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(up + i), us_v)));
-		_mm256_storeu_ps(act + i + 8,
-						 _mm256_mul_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(up + i + 8), us_v)));
-		_mm256_storeu_ps(act + i + 16,
-						 _mm256_mul_ps(s2, _mm256_mul_ps(_mm256_loadu_ps(up + i + 16), us_v)));
-		_mm256_storeu_ps(act + i + 24,
-						 _mm256_mul_ps(s3, _mm256_mul_ps(_mm256_loadu_ps(up + i + 24), us_v)));
-	}
+	__m256 gs_v = _mm256_set1_ps(gs);
+	__m256 us_v = _mm256_set1_ps(us);
+	int	   i	= 0;
 	for (; i + 8 <= n; i += 8) {
-		__m256 g = _mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v);
-		__m256 s = _mm256_div_ps(g, _mm256_add_ps(one_v, vexp_ps(_mm256_sub_ps(zero, g))));
+		__m256 s = vsilu_ps(_mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v));
 		_mm256_storeu_ps(act + i, _mm256_mul_ps(s, _mm256_mul_ps(_mm256_loadu_ps(up + i), us_v)));
 	}
 	for (; i < n; i++)
@@ -4629,48 +4586,11 @@ void moe_activate_silu(float *restrict act, const float *restrict gate, const fl
 
 void moe_activate_gelu(float *restrict act, const float *restrict gate, const float *restrict up,
 					   int n, float gs, float us) {
-	__m256 gs_v	  = _mm256_set1_ps(gs);
-	__m256 us_v	  = _mm256_set1_ps(us);
-	__m256 half_v = _mm256_set1_ps(0.5f);
-	__m256 one_v  = _mm256_set1_ps(1.0f);
-	__m256 c_v	  = _mm256_set1_ps(0.7978845608028654f);
-	__m256 k_v	  = _mm256_set1_ps(0.044715f);
-	int	   i	  = 0;
-	for (; i + 32 <= n; i += 32) {
-		__m256 g0	= _mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v);
-		__m256 g1	= _mm256_mul_ps(_mm256_loadu_ps(gate + i + 8), gs_v);
-		__m256 g2	= _mm256_mul_ps(_mm256_loadu_ps(gate + i + 16), gs_v);
-		__m256 g3	= _mm256_mul_ps(_mm256_loadu_ps(gate + i + 24), gs_v);
-		__m256 x3_0 = _mm256_mul_ps(g0, _mm256_mul_ps(g0, g0));
-		__m256 x3_1 = _mm256_mul_ps(g1, _mm256_mul_ps(g1, g1));
-		__m256 x3_2 = _mm256_mul_ps(g2, _mm256_mul_ps(g2, g2));
-		__m256 x3_3 = _mm256_mul_ps(g3, _mm256_mul_ps(g3, g3));
-		__m256 in0	= _mm256_mul_ps(c_v, _mm256_add_ps(g0, _mm256_mul_ps(k_v, x3_0)));
-		__m256 in1	= _mm256_mul_ps(c_v, _mm256_add_ps(g1, _mm256_mul_ps(k_v, x3_1)));
-		__m256 in2	= _mm256_mul_ps(c_v, _mm256_add_ps(g2, _mm256_mul_ps(k_v, x3_2)));
-		__m256 in3	= _mm256_mul_ps(c_v, _mm256_add_ps(g3, _mm256_mul_ps(k_v, x3_3)));
-		__m256 t0	= vtanh_ps(in0);
-		__m256 t1	= vtanh_ps(in1);
-		__m256 t2	= vtanh_ps(in2);
-		__m256 t3	= vtanh_ps(in3);
-		__m256 s0	= _mm256_mul_ps(half_v, _mm256_mul_ps(g0, _mm256_add_ps(one_v, t0)));
-		__m256 s1	= _mm256_mul_ps(half_v, _mm256_mul_ps(g1, _mm256_add_ps(one_v, t1)));
-		__m256 s2	= _mm256_mul_ps(half_v, _mm256_mul_ps(g2, _mm256_add_ps(one_v, t2)));
-		__m256 s3	= _mm256_mul_ps(half_v, _mm256_mul_ps(g3, _mm256_add_ps(one_v, t3)));
-		_mm256_storeu_ps(act + i, _mm256_mul_ps(s0, _mm256_mul_ps(_mm256_loadu_ps(up + i), us_v)));
-		_mm256_storeu_ps(act + i + 8,
-						 _mm256_mul_ps(s1, _mm256_mul_ps(_mm256_loadu_ps(up + i + 8), us_v)));
-		_mm256_storeu_ps(act + i + 16,
-						 _mm256_mul_ps(s2, _mm256_mul_ps(_mm256_loadu_ps(up + i + 16), us_v)));
-		_mm256_storeu_ps(act + i + 24,
-						 _mm256_mul_ps(s3, _mm256_mul_ps(_mm256_loadu_ps(up + i + 24), us_v)));
-	}
+	__m256 gs_v = _mm256_set1_ps(gs);
+	__m256 us_v = _mm256_set1_ps(us);
+	int	   i	= 0;
 	for (; i + 8 <= n; i += 8) {
-		__m256 g  = _mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v);
-		__m256 x3 = _mm256_mul_ps(g, _mm256_mul_ps(g, g));
-		__m256 in = _mm256_mul_ps(c_v, _mm256_add_ps(g, _mm256_mul_ps(k_v, x3)));
-		__m256 t  = vtanh_ps(in);
-		__m256 s  = _mm256_mul_ps(half_v, _mm256_mul_ps(g, _mm256_add_ps(one_v, t)));
+		__m256 s = vgelu_ps(_mm256_mul_ps(_mm256_loadu_ps(gate + i), gs_v));
 		_mm256_storeu_ps(act + i, _mm256_mul_ps(s, _mm256_mul_ps(_mm256_loadu_ps(up + i), us_v)));
 	}
 	for (; i < n; i++)
@@ -5100,22 +5020,6 @@ __attribute__((constructor)) static void f16_to_f32_table_init(void) {
 
 float f16_to_f32(uint16_t h) {
 	return f16_to_f32_table[h];
-}
-
-uint16_t f32_to_f16(float f) {
-	float	 base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
-	uint32_t w		= f32_to_bits(f);
-	uint32_t shl1_w = w + w;
-	uint32_t sign	= w & 0x80000000u;
-	uint32_t bias	= shl1_w & 0xFF000000u;
-	if (bias < 0x71000000u)
-		bias = 0x71000000u;
-	base			   = f32_from_bits((bias >> 1) + 0x07800000u) + base;
-	uint32_t bits	   = f32_to_bits(base);
-	uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
-	uint32_t mant_bits = bits & 0x0FFFu;
-	uint32_t nonsign   = exp_bits + mant_bits;
-	return (sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign);
 }
 
 float bf16_to_f32(uint16_t h) {

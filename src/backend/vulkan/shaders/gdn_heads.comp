@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer ConvOutBuf {
@@ -82,9 +84,9 @@ void main() {
 		float	   alpha_t = alpha[uint(t) * uint(params.n_value_heads) + uint(vh)];
 		float	   beta_t  = beta[uint(t) * uint(params.n_value_heads) + uint(vh)];
 		float	   sp_arg  = alpha_t + dt[vh];
-		float	   sp	   = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
-		float	   decay   = exp(a_vec[vh] * sp);
-		float	   bg	   = 1.0 / (1.0 + exp(-beta_t));
+		float	   sp	   = sp_arg > 20.0 ? sp_arg : log(1.0 + num_exp(sp_arg));
+		float	   decay   = num_exp(a_vec[vh] * sp);
+		float	   bg	   = num_sigmoid(beta_t);
 
 		float qss = 0.0;
 		float kss = 0.0;
@@ -137,7 +139,7 @@ void main() {
 			if (j >= vd)
 				continue;
 			float zv			  = z[zbase + uint(j)];
-			out_[obase + uint(j)] = y[jj] * inv_rms * norm_w[j] * (zv / (1.0 + exp(-zv)));
+			out_[obase + uint(j)] = y[jj] * inv_rms * norm_w[j] * num_silu(zv);
 		}
 	}
 }

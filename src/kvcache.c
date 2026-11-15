@@ -801,18 +801,9 @@ static void kvcache_shift_tables(const model *m, int is_global, int head_dim,
 	const float	 theta = is_global ? m->layer_dims.rope_theta_global : m->layer_dims.rope_theta_swa;
 	const float *ff	   = is_global ? m->rope_freqs : NULL;
 	const double theta_scale = pow((double)theta, -2.0 / (double)head_dim);
-	for (int i = 0; i < n_chunks; i++) {
-		double delta = (double)(chunks[i].dst_pos - chunks[i].src_pos);
-		double freq	 = 1.0;
-		for (int j = 0; j < half; j++, freq *= theta_scale) {
-			double factor = 1.0;
-			if (ff)
-				factor = (ff[j] >= 1e10f || ff[j] == 0.0f) ? 0.0 : (double)ff[j];
-			double angle				  = delta * freq * factor;
-			cos_tbl[(size_t)i * half + j] = (float)cos(angle);
-			sin_tbl[(size_t)i * half + j] = (float)sin(angle);
-		}
-	}
+	for (int i = 0; i < n_chunks; i++)
+		rope_cs_row(cos_tbl + ((size_t)i * half), sin_tbl + ((size_t)i * half), 1, half,
+					(double)(chunks[i].dst_pos - chunks[i].src_pos), theta_scale, ff);
 }
 
 status_code kvcache_shift(kvcache *c, const model *m, const kv_shift_chunk *chunks, int n_chunks) {

@@ -33,52 +33,6 @@ float half_to_float(uint h) {
 	return uintBitsToFloat(sign | bits);
 }
 
-float f32_to_f16_to_f32(float f) {
-	float base	 = (abs(f) * uintBitsToFloat(0x77800000u)) * uintBitsToFloat(0x08800000u);
-	uint  w		 = floatBitsToUint(f);
-	uint  shl1_w = w + w;
-	uint  sign	 = w & 0x80000000u;
-	uint  bias	 = shl1_w & 0xFF000000u;
-	if (bias < 0x71000000u)
-		bias = 0x71000000u;
-	base				= uintBitsToFloat((bias >> 1u) + 0x07800000u) + base;
-	uint  bits			= floatBitsToUint(base);
-	uint  exp_bits		= (bits >> 13u) & 0x7C00u;
-	uint  mant_bits		= bits & 0x0FFFu;
-	uint  nonsign		= exp_bits + mant_bits;
-	uint  h				= (sign >> 16u) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign);
-	uint  w_bits		= h << 16u;
-	uint  h_sign		= w_bits & 0x80000000u;
-	uint  two_w			= w_bits + w_bits;
-	uint  exp_offset	= 0xE0u << 23u;
-	float exp_scale		= uintBitsToFloat(0x07800000u);
-	float normalized	= uintBitsToFloat((two_w >> 4u) + exp_offset) * exp_scale;
-	uint  magic_mask	= 126u << 23u;
-	float denormalized	= uintBitsToFloat((two_w >> 17u) | magic_mask) - 0.5;
-	uint  denorm_cutoff = 1u << 27u;
-	uint  result_bits =
-		two_w < denorm_cutoff ? floatBitsToUint(denormalized) : floatBitsToUint(normalized);
-	return uintBitsToFloat(h_sign | result_bits);
-}
-
-uint float_to_half(float f) {
-	uint fbits	   = floatBitsToUint(f);
-	uint sign	   = (fbits >> 16u) & 0x8000u;
-	uint exp_mant  = fbits & 0x7FFFFFFFu;
-	uint exp_field = (fbits >> 23u) & 0xFFu;
-	if (exp_field == 0u || exp_field < 113u)
-		return sign;
-	if (exp_field >= 142u)
-		return sign | 0x7C00u;
-	uint mant_round = exp_mant + 0x00001000u;
-	uint exp_new	= (mant_round >> 23u) & 0xFFu;
-	if (exp_new >= 142u)
-		return sign | 0x7C00u;
-	uint h_exp	= ((mant_round >> 23u) + 15u - 127u) << 10u;
-	uint h_mant = (mant_round >> 13u) & 0x3FFu;
-	return sign | h_exp | h_mant;
-}
-
 float neg_max_float() {
 	return uintBitsToFloat(0xFF7FFFFFu);
 }
@@ -136,15 +90,144 @@ float div_exact(float a, float b) {
 	return uintBitsToFloat(sign | (uint(fe) << 23u) | M24);
 }
 
+#define num_fma(a, b, c) fma(a, b, c)
+
+float num_exp_split(float x, out float pow2n) {
+	float xc = min(max(x, -88.0), 88.0);
+	float n	 = roundEven(xc * uintBitsToFloat(0x3FB8AA3Bu));
+	float r	 = num_fma(-n, uintBitsToFloat(0x3F317218u), xc);
+	r		 = num_fma(-n, uintBitsToFloat(0xB102E308u), r);
+	float t	 = uintBitsToFloat(0x39500D01u);
+	t		 = num_fma(r, t, uintBitsToFloat(0x3AB60B61u));
+	t		 = num_fma(r, t, uintBitsToFloat(0x3C088889u));
+	t		 = num_fma(r, t, uintBitsToFloat(0x3D2AAAABu));
+	t		 = num_fma(r, t, uintBitsToFloat(0x3E2AAAABu));
+	t		 = num_fma(r, t, 0.5);
+	float r2 = r * r;
+	pow2n	 = uintBitsToFloat(uint(int(n) + 127) << 23u);
+	return num_fma(r2, t, r);
+}
+
+float num_exp(float x) {
+	float pow2n;
+	float em1 = num_exp_split(x, pow2n);
+	return num_fma(pow2n, em1, pow2n);
+}
+
+vec2 num_exp(vec2 x) {
+	return vec2(num_exp(x.x), num_exp(x.y));
+}
+
+vec4 num_exp(vec4 x) {
+	return vec4(num_exp(x.x), num_exp(x.y), num_exp(x.z), num_exp(x.w));
+}
+
+float num_expm1(float x) {
+	float pow2n;
+	float em1 = num_exp_split(x, pow2n);
+	return num_fma(pow2n, em1, pow2n - 1.0);
+}
+
+float num_tanh(float x) {
+	float a	  = min(abs(x), 10.0);
+	float em1 = num_expm1(a + a);
+	float t	  = div_exact(em1, em1 + 2.0);
+	return uintBitsToFloat(floatBitsToUint(t) | (floatBitsToUint(x) & 0x80000000u));
+}
+
+float num_sigmoid(float x) {
+	float e = num_exp(-abs(x));
+	return div_exact(x >= 0.0 ? 1.0 : e, 1.0 + e);
+}
+
+float num_silu(float x) {
+	return div_exact(x, 1.0 + num_exp(-x));
+}
+
+float num_gelu_tanh(float x) {
+	float x2 = x * x;
+	float inner =
+		(x * num_fma(x2, uintBitsToFloat(0x3D372713u), 1.0)) * uintBitsToFloat(0x3F4C422Au);
+	return (x * 0.5) * (1.0 + num_tanh(inner));
+}
+
 float silu(float x) {
-	return x / (1.0 + exp(-x));
+	return num_silu(x);
 }
 
 float gelu_tanh(float x) {
-	const float c	  = 0.7978845608028654;
-	float		x3	  = x * x * x;
-	float		inner = c * (x + 0.044715 * x3);
-	return 0.5 * x * (1.0 + tanh(inner));
+	return num_gelu_tanh(x);
+}
+
+float num_sqrt(float x) {
+	uint b	= floatBitsToUint(x);
+	uint ef = (b >> 23u) & 0xFFu;
+	if (ef == 0u || b >= 0x7F800000u)
+		return x;
+	uint m	= (b & 0x7FFFFFu) | 0x800000u;
+	int	 ee = int(ef) - 127;
+	if ((ee & 1) != 0) {
+		m <<= 1u;
+		ee -= 1;
+	}
+	uint root = 0u;
+	uint rem  = 0u;
+	for (int i = 24; i >= 0; i--) {
+		int	 j1	   = 2 * i + 1;
+		int	 j0	   = 2 * i;
+		uint b1	   = j1 >= 25 ? (m >> uint(j1 - 25)) & 1u : 0u;
+		uint b0	   = j0 >= 25 ? (m >> uint(j0 - 25)) & 1u : 0u;
+		rem		   = (rem << 2u) | (b1 << 1u) | b0;
+		uint trial = (root << 2u) | 1u;
+		root <<= 1u;
+		if (rem >= trial) {
+			rem -= trial;
+			root |= 1u;
+		}
+	}
+	uint mant  = root >> 1u;
+	uint guard = root & 1u;
+	if (guard == 1u && (rem != 0u || (mant & 1u) == 1u))
+		mant++;
+	int e2 = ee / 2;
+	if (mant == 0x1000000u) {
+		mant = 0x800000u;
+		e2++;
+	}
+	return uintBitsToFloat((uint(e2 + 127) << 23u) | (mant & 0x7FFFFFu));
+}
+
+float num_rms_scale(float sum_sq, int n, float eps) {
+	float v = div_exact(sum_sq, float(n)) + eps;
+	return v > 0.0 ? div_exact(1.0, num_sqrt(v)) : 0.0;
+}
+
+uint float_to_half(float f) {
+	uint bits = floatBitsToUint(f);
+	uint sign = (bits >> 16u) & 0x8000u;
+	uint a	  = bits & 0x7FFFFFFFu;
+	if (a >= 0x7F800000u)
+		return sign | (a > 0x7F800000u ? 0x7E00u : 0x7C00u);
+	if (a >= 0x477FF000u)
+		return sign | 0x7C00u;
+	if (a <= 0x33000000u)
+		return sign;
+	if (a < 0x38800000u) {
+		uint shift = 126u - (a >> 23u);
+		uint m	   = (a & 0x7FFFFFu) | 0x800000u;
+		uint h	   = m >> shift;
+		uint rem   = m & ((1u << shift) - 1u);
+		uint half_ = 1u << (shift - 1u);
+		if (rem > half_ || (rem == half_ && (h & 1u) == 1u))
+			h++;
+		return sign | h;
+	}
+	uint r = a + 0xFFFu + ((a >> 13u) & 1u);
+	return sign | ((r - 0x38000000u) >> 13u);
+}
+
+float f32_to_f16_to_f32(float f) {
+	return half_to_float(float_to_half(f));
 }
 
 #endif

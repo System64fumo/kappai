@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) buffer OBuf {
@@ -35,6 +37,6 @@ void main() {
 	float inv = 1.0 / sqrt(s_ss[0] / float(params.head_dim) + params.eps);
 	for (int i = tid; i < params.head_dim; i += 64) {
 		float gv	= gate[base + i];
-		o[base + i] = o[base + i] * inv * norm_w[i] * (1.0 / (1.0 + exp(-gv)));
+		o[base + i] = o[base + i] * inv * norm_w[i] * num_sigmoid(gv);
 	}
 }

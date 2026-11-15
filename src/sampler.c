@@ -1,4 +1,5 @@
 #include "sampler.h"
+#include "numeric.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -242,7 +243,7 @@ static int32_t sample_full_vocab(sampler *s, const float *logits, int vocab) {
 	float *exp = s->logits_buf;
 	double sum = 0.0;
 	for (int i = 0; i < vocab; i++) {
-		float e = expf(logits[i] * inv_temp - mx);
+		float e = num_expf(logits[i] * inv_temp - mx);
 		exp[i]	= e;
 		sum += e;
 	}
@@ -262,7 +263,7 @@ static float apply_temperature_softmax(sampler_top_k_entry *arr, int kept, float
 	float mx	   = arr[0].v * inv_temp;
 	float sum	   = 0.0f;
 	for (int i = 0; i < kept; i++) {
-		arr[i].v = expf((arr[i].v * inv_temp) - mx);
+		arr[i].v = num_expf((arr[i].v * inv_temp) - mx);
 		sum += arr[i].v;
 	}
 	return sum;

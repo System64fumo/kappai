@@ -59,6 +59,8 @@ void	   log_init(log_config cfg);
 log_config log_default_config(void);
 
 void	  log_set_level(log_level level);
+void	  log_mute_push(void);
+void	  log_mute_pop(void);
 log_level log_get_level(void);
 
 void log_msg(log_level level, const char *fmt, ...) __attribute__((format(printf, 2, 3)));

@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 
@@ -25,24 +26,6 @@ layout(location = 4) uniform int u_head_dim;
 layout(location = 5) uniform int u_kv_q8;
 layout(location = 6) uniform int u_in_row_stride;
 layout(location = 7) uniform int u_in_row0;
-
-uint float_to_half(float f) {
-	uint fbits	  = floatBitsToUint(f);
-	uint sign	  = (fbits >> 16u) & 0x8000u;
-	uint exp_mant = fbits & 0x7FFFFFFFu;
-	uint exp_f	  = (fbits >> 23u) & 0xFFu;
-	if (exp_f == 0u || exp_f < 113u)
-		return sign;
-	if (exp_f >= 142u)
-		return sign | 0x7C00u;
-	uint mant_round = exp_mant + 0x00001000u;
-	uint exp_new	= (mant_round >> 23u) & 0xFFu;
-	if (exp_new >= 142u)
-		return sign | 0x7C00u;
-	uint h_exp	= ((mant_round >> 23u) + 15u - 127u) << 10u;
-	uint h_mant = (mant_round >> 13u) & 0x3FFu;
-	return sign | h_exp | h_mant;
-}
 
 uint pack_halfs(float a, float b) {
 	return float_to_half(a) | (float_to_half(b) << 16u);
@@ -104,7 +87,7 @@ void main() {
 			float d	 = amax / 127.0;
 			float id = d > 0.0 ? 1.0 / d : 0.0;
 
-			uint d16 = packHalf2x16(vec2(d, 0.0)) & 0xFFFFu;
+			uint d16 = float_to_half(d) & 0xFFFFu;
 
 			uint blk_off = row_base + uint(b) * 34u;
 

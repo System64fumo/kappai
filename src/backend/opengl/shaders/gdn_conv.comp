@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 layout(local_size_x = 64) in;
@@ -39,7 +40,7 @@ void main(void) {
 			sum += st[k] * conv_w[wbase + k];
 			st[k] = (k + 1 < hist) ? st[k + 1] : m;
 		}
-		conv_out[t * u_conv_dim + c] = sum / (1.0 + exp(-sum));
+		conv_out[t * u_conv_dim + c] = num_silu(sum);
 	}
 	for (int k = 0; k < hist; k++)
 		conv_state[c * hist + k] = st[k];

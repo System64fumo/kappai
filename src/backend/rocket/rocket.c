@@ -1,4 +1,5 @@
 #include "rocket.h"
+#include "numeric_neon.h"
 
 static int env_int(const char *name, int fallback, int lo, int hi) {
 	const char *e = getenv(name);
@@ -1145,23 +1146,6 @@ static status_code rkt_kv_import(backend *self, buffer *k, buffer *v, int layer,
 							 NULL, NULL, k_src, v_src);
 }
 
-static inline float32x4_t neon_expf(float32x4_t x) {
-	x			   = vmaxq_f32(x, vdupq_n_f32(-87.3f));
-	int32x4_t	n  = vcvtnq_s32_f32(vmulq_f32(x, vdupq_n_f32(1.44269504f)));
-	float32x4_t nf = vcvtq_f32_s32(n);
-	float32x4_t r  = vfmsq_f32(x, nf, vdupq_n_f32(0.693145751953125f));
-	r			   = vfmsq_f32(r, nf, vdupq_n_f32(1.428606765330187e-06f));
-	float32x4_t p  = vdupq_n_f32(1.0f / 720.0f);
-	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 120.0f), p, r);
-	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), p, r);
-	p			   = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f), p, r);
-	p			   = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
-	p			   = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
-	p			   = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
-	int32x4_t e	   = vshlq_n_s32(vaddq_s32(n, vdupq_n_s32(127)), 23);
-	return vmulq_f32(p, vreinterpretq_f32_s32(e));
-}
-
 static float softmax_scaled_max(const float *sc, int lo, int hi, float scale) {
 	float		mx = -INFINITY;
 	int			t  = lo;
@@ -1185,14 +1169,14 @@ static double softmax_exp_sum(const float *sc, float *pr, int lo, int hi, float 
 		float32x4_t acc = vdupq_n_f32(0.0f);
 		int			end = t + 4 * 256 < hi ? t + 4 * 256 : hi;
 		for (; t + 4 <= end; t += 4) {
-			float32x4_t e = neon_expf(vsubq_f32(vmulq_n_f32(vld1q_f32(sc + t), scale), vmx));
+			float32x4_t e = vexpq_f32(vsubq_f32(vmulq_n_f32(vld1q_f32(sc + t), scale), vmx));
 			vst1q_f32(pr + t, e);
 			acc = vaddq_f32(acc, e);
 		}
 		sum += (double)vaddvq_f32(acc);
 	}
 	for (; t < hi; t++) {
-		float e = expf(sc[t] * scale - mx);
+		float e = num_expf(sc[t] * scale - mx);
 		pr[t]	= e;
 		sum += e;
 	}

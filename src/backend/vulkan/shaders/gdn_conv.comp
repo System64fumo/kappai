@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer MixBuf {
@@ -42,7 +44,7 @@ void main() {
 			sum += st[k] * conv_w[wbase + k];
 			st[k] = (k + 1 < hist) ? st[k + 1] : m;
 		}
-		conv_out[t * params.conv_dim + c] = sum / (1.0 + exp(-sum));
+		conv_out[t * params.conv_dim + c] = num_silu(sum);
 	}
 	for (int k = 0; k < hist; k++)
 		conv_state[c * hist + k] = st[k];

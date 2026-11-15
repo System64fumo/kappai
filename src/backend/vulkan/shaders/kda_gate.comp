@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) buffer GBuf {
@@ -24,7 +26,7 @@ layout(push_constant) uniform Params {
 params;
 
 float sigmoidf(float v) {
-	return 1.0 / (1.0 + exp(-v));
+	return num_sigmoid(v);
 }
 
 void main() {
@@ -35,7 +37,7 @@ void main() {
 		if (params.use_lower_bound != 0) {
 			g[i] = params.lower_bound * sigmoidf(-(t * ssm_a[h]));
 		} else {
-			float sp = t > 20.0 ? t : log(1.0 + exp(t));
+			float sp = t > 20.0 ? t : log(1.0 + num_exp(t));
 			g[i]	 = sp * ssm_a[h];
 		}
 		return;

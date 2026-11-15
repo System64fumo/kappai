@@ -1486,34 +1486,16 @@ float dot_f32(const float *restrict a, const float *restrict b, int n) {
 	return acc;
 }
 
-float rmsnorm_sum_sq(const float *x, int n) {
-	float ss0	 = 0;
-	float ss1	 = 0;
-	float ss2	 = 0;
-	float ss3	 = 0;
-	int	  i		 = 0;
-	int	  n_main = n - (n % 4);
-	for (; i < n_main; i += 4) {
-		ss0 += x[i] * x[i];
-		ss1 += x[i + 1] * x[i + 1];
-		ss2 += x[i + 2] * x[i + 2];
-		ss3 += x[i + 3] * x[i + 3];
-	}
-	for (; i < n; i++)
-		ss0 += x[i] * x[i];
-	return (ss0 + ss1) + (ss2 + ss3);
-}
-
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 	float ss	= rmsnorm_sum_sq(x, n);
-	float scale = 1.0f / sqrtf((ss / (float)n) + eps);
+	float scale = num_rms_scale(ss, n, eps);
 	for (int i = 0; i < n; i++)
 		y[i] = x[i] * scale * w[i];
 }
 
 void rmsnorm_noweight(const float *x, float *y, int n, float eps) {
 	float ss	= rmsnorm_sum_sq(x, n);
-	float scale = 1.0f / sqrtf((ss / (float)n) + eps);
+	float scale = num_rms_scale(ss, n, eps);
 	for (int i = 0; i < n; i++)
 		y[i] = x[i] * scale;
 }
@@ -1524,7 +1506,7 @@ void rmsnorm_per_head(const float *x, const float *w, float *y, int n_heads, int
 		const float *xh	   = x + ((size_t)h * head_dim);
 		float		*yh	   = y + ((size_t)h * head_dim);
 		float		 ss	   = rmsnorm_sum_sq(xh, head_dim);
-		float		 scale = 1.0f / sqrtf((ss / (float)head_dim) + eps);
+		float		 scale = num_rms_scale(ss, head_dim, eps);
 		for (int j = 0; j < head_dim; j++)
 			yh[j] = xh[j] * scale * w[j];
 	}
@@ -1537,7 +1519,7 @@ void softmax_masked(float *restrict scores, int n_valid) {
 			mx = scores[i];
 	float sum = 0.0f;
 	for (int i = 0; i < n_valid; i++) {
-		scores[i] = expf(scores[i] - mx);
+		scores[i] = num_expf(scores[i] - mx);
 		sum += scores[i];
 	}
 	float inv = 1.0f / sum;
@@ -1670,22 +1652,6 @@ __attribute__((constructor)) static void f16_to_f32_table_init(void) {
 
 float f16_to_f32(uint16_t h) {
 	return f16_to_f32_table[h];
-}
-
-uint16_t f32_to_f16(float f) {
-	float	 base	= (fabsf(f) * 0x1.0p+112f) * 0x1.0p-110f;
-	uint32_t w		= f32_to_bits(f);
-	uint32_t shl1_w = w + w;
-	uint32_t sign	= w & 0x80000000u;
-	uint32_t bias	= shl1_w & 0xFF000000u;
-	if (bias < 0x71000000u)
-		bias = 0x71000000u;
-	base			   = f32_from_bits((bias >> 1) + 0x07800000u) + base;
-	uint32_t bits	   = f32_to_bits(base);
-	uint32_t exp_bits  = (bits >> 13) & 0x7C00u;
-	uint32_t mant_bits = bits & 0x0FFFu;
-	uint32_t nonsign   = exp_bits + mant_bits;
-	return (sign >> 16) | (shl1_w > 0xFF000000u ? 0x7E00u : nonsign);
 }
 
 float bf16_to_f32(uint16_t h) {

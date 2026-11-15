@@ -33,7 +33,6 @@
 #define VK_QMV_COLS 4
 #define VK_QMM_TILE 64
 #define VK_XQ_BLOCK_BYTES 48
-#define VK_ATTN_DEC_MAX_M 4
 #define VK_ATTN_DEC_MAX_HEAD_DIM 512
 #define VK_ATTN_DEC_TARGET_WG 256
 #define VK_ATTN_DEC_MAX_SPLITS 64
@@ -650,9 +649,9 @@ static void vk_device_infos_init(void) {
 			VkPhysicalDeviceProperties props;
 			vkGetPhysicalDeviceProperties(devs[i], &props);
 			g_device_infos[i].uma = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
-										props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
-			g_device_infos[i].identity_rc =
-				vk_device_identity_query(devs[i], g_device_infos[i].identity, VK_DEVICE_IDENTITY_CAP);
+									props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+			g_device_infos[i].identity_rc = vk_device_identity_query(
+				devs[i], g_device_infos[i].identity, VK_DEVICE_IDENTITY_CAP);
 		}
 		free(devs);
 	}
@@ -5606,13 +5605,12 @@ static status_code vk_attention_decode(backend *self, const buffer *q, vk_buf *k
 									   int n_kv_heads, int head_dim, int n_ctx, float scale,
 									   int window, int m, int kv_q8, int kv_row_bytes) {
 	vk_priv *p		  = self->priv;
-	int		 start	  = window > 0 ? MAX(0, pos_start + 1 - window) : 0;
-	int		 n_pos	  = MAX(pos_start + m - start, 1);
+	int		 last_pos = pos_start + m - 1;
+	int		 start	  = window > 0 ? MAX(0, last_pos + 1 - window) : 0;
+	int		 n_pos	  = MAX(last_pos + 1 - start, 1);
 	int		 n_wg	  = n_heads * m;
-	int		 n_splits = MIN((VK_ATTN_DEC_TARGET_WG + n_wg - 1) / n_wg, VK_ATTN_DEC_MAX_SPLITS);
-	n_splits  = MAX(MIN(n_splits, (n_pos + VK_ATTN_DEC_MIN_CHUNK - 1) / VK_ATTN_DEC_MIN_CHUNK), 1);
-	int chunk = (n_pos + n_splits - 1) / n_splits;
-	n_splits  = (n_pos + chunk - 1) / chunk;
+	int		 chunk = MIN((VK_ATTN_DEC_TARGET_WG + n_heads - 1) / n_heads, VK_ATTN_DEC_MAX_SPLITS);
+	int n_splits = MAX(MIN(chunk, (n_pos + VK_ATTN_DEC_MIN_CHUNK - 1) / VK_ATTN_DEC_MIN_CHUNK), 1);
 
 	size_t		part_bytes = (size_t)n_wg * n_splits * (size_t)(head_dim + 2) * sizeof(float);
 	status_code s = vk_ensure_scratch(self, &p->attn_part_buf, &p->attn_part_cap, part_bytes);
@@ -7388,24 +7386,9 @@ static status_code vk_rope_tables_get(backend *self, int head_dim, const float *
 			float *tbl		   = xmalloc(need);
 			float *cos_tab	   = tbl;
 			float *sin_tab	   = tbl + table_floats;
-			double base_freq   = 1.0;
-			for (int j = 0; j < half; j++) {
-				double fv = freq_factors[j];
-				double ff = (fv >= 1e10 || fv == 0.0) ? 0.0 : fv;
-				if (ff > 0.0) {
-					for (int pp = 0; pp < n_ctx; pp++) {
-						double angle				   = base_freq * ff * (double)pp;
-						cos_tab[(size_t)pp * half + j] = (float)cos(angle);
-						sin_tab[(size_t)pp * half + j] = (float)sin(angle);
-					}
-				} else {
-					for (int pp = 0; pp < n_ctx; pp++) {
-						cos_tab[(size_t)pp * half + j] = 1.0f;
-						sin_tab[(size_t)pp * half + j] = 0.0f;
-					}
-				}
-				base_freq *= theta_scale;
-			}
+			for (int pp = 0; pp < n_ctx; pp++)
+				rope_cs_row(cos_tab + ((size_t)pp * half), sin_tab + ((size_t)pp * half), 1, half,
+							(double)pp, theta_scale, freq_factors);
 			status_code s = vk_buffer_upload(self, &p->rope_ff_buf, tbl, need);
 			free(tbl);
 			if (s != OK)
@@ -7522,8 +7505,8 @@ static status_code vk_attention_batch_impl(backend *self, const buffer *q, const
 	else
 		kv_row_bytes = (size_t)head_dim * sizeof(uint16_t);
 
-	if (m <= VK_ATTN_DEC_MAX_M && head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 &&
-		p->p_attn_decode.pipeline && p->p_attn_merge.pipeline) {
+	if (head_dim <= VK_ATTN_DEC_MAX_HEAD_DIM && (head_dim & 1) == 0 && p->p_attn_decode.pipeline &&
+		p->p_attn_merge.pipeline) {
 		return vk_attention_decode(self, q, kb, vb, layer_off, out, pos_start, n_heads, n_kv_heads,
 								   head_dim, n_ctx, scale, sliding_window, m, kv_q8,
 								   (int)kv_row_bytes);

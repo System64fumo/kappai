@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) buffer XBuf {
@@ -38,5 +40,5 @@ void main() {
 	for (int k = 0; k + 1 < hist; k++)
 		state[sbase + k] = old[k + 1];
 	state[sbase + hist - 1] = cur;
-	x[c]					= sum / (1.0 + exp(-sum));
+	x[c]					= num_silu(sum);
 }

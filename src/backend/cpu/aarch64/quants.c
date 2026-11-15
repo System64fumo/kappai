@@ -7738,32 +7738,9 @@ float dot_f32(const float *restrict a, const float *restrict b, int n) {
 	return s;
 }
 
-float rmsnorm_sum_sq(const float *x, int n) {
-	float32x4_t ss_v = vdupq_n_f32(0.0f);
-	int			i	 = 0;
-	for (; i + 16 <= n; i += 16) {
-		float32x4_t x0 = vld1q_f32(x + i);
-		float32x4_t x1 = vld1q_f32(x + i + 4);
-		float32x4_t x2 = vld1q_f32(x + i + 8);
-		float32x4_t x3 = vld1q_f32(x + i + 12);
-		ss_v		   = vfmaq_f32(ss_v, x0, x0);
-		ss_v		   = vfmaq_f32(ss_v, x1, x1);
-		ss_v		   = vfmaq_f32(ss_v, x2, x2);
-		ss_v		   = vfmaq_f32(ss_v, x3, x3);
-	}
-	for (; i + 4 <= n; i += 4) {
-		float32x4_t x0 = vld1q_f32(x + i);
-		ss_v		   = vfmaq_f32(ss_v, x0, x0);
-	}
-	float ss = vaddvq_f32(ss_v);
-	for (; i < n; i++)
-		ss += x[i] * x[i];
-	return ss;
-}
-
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 	float		ss		= rmsnorm_sum_sq(x, n);
-	float		scale	= 1.0f / sqrtf((ss / (float)n) + eps);
+	float		scale	= num_rms_scale(ss, n, eps);
 	float32x4_t scale_v = vdupq_n_f32(scale);
 	int			i		= 0;
 	for (; i + 16 <= n; i += 16) {
@@ -7786,7 +7763,7 @@ void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
 
 void rmsnorm_noweight(const float *x, float *y, int n, float eps) {
 	float		ss		= rmsnorm_sum_sq(x, n);
-	float		scale	= 1.0f / sqrtf((ss / (float)n) + eps);
+	float		scale	= num_rms_scale(ss, n, eps);
 	float32x4_t scale_v = vdupq_n_f32(scale);
 	int			i		= 0;
 	for (; i + 16 <= n; i += 16) {
@@ -7807,7 +7784,7 @@ void rmsnorm_per_head(const float *x, const float *w, float *y, int n_heads, int
 		const float *xh		 = x + ((size_t)h * head_dim);
 		float		*yh		 = y + ((size_t)h * head_dim);
 		float		 ss		 = rmsnorm_sum_sq(xh, head_dim);
-		float		 scale	 = 1.0f / sqrtf((ss / (float)head_dim) + eps);
+		float		 scale	 = num_rms_scale(ss, head_dim, eps);
 		float32x4_t	 scale_v = vdupq_n_f32(scale);
 		int			 j		 = 0;
 		for (; j + 16 <= head_dim; j += 16) {
@@ -7874,7 +7851,7 @@ void softmax_masked(float *restrict scores, int n_valid) {
 	}
 	float sum = vaddvq_f32(sum_v);
 	for (; i < n_valid; i++) {
-		scores[i] = expf(scores[i] - mx);
+		scores[i] = num_expf(scores[i] - mx);
 		sum += scores[i];
 	}
 	float		inv	  = 1.0f / sum;
@@ -10361,13 +10338,6 @@ float f16_to_f32(uint16_t h) {
 	return f16_to_f32_fast(h);
 }
 
-uint16_t f32_to_f16(float f) {
-	__fp16 v = (__fp16)f;
-	uint16_t h;
-	memcpy(&h, &v, sizeof(h));
-	return h;
-}
-
 float bf16_to_f32(uint16_t h) {
 	uint32_t u = (uint32_t)h << 16;
 	float	 f;
@@ -10375,15 +10345,24 @@ float bf16_to_f32(uint16_t h) {
 	return f;
 }
 
+static inline uint16x4_t f32x4_to_f16x4_canonical(float32x4_t v) {
+	uint16x4_t h	  = vreinterpret_u16_f16(vcvt_f16_f32(v));
+	uint16x4_t is_nan = vmovn_u32(vmvnq_u32(vceqq_f32(v, v)));
+	uint16x4_t quiet_nan =
+		vorr_u16(vand_u16(vshrn_n_u32(vreinterpretq_u32_f32(v), 16), vdup_n_u16(0x8000)),
+				 vdup_n_u16(0x7E00));
+	return vbsl_u16(is_nan, quiet_nan, h);
+}
+
 void f32_to_f16_row(const float *src, uint16_t *dst, int n) {
 	int i = 0;
 	for (; i + 8 <= n; i += 8) {
-		uint16x4_t lo = vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i)));
-		uint16x4_t hi = vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i + 4)));
+		uint16x4_t lo = f32x4_to_f16x4_canonical(vld1q_f32(src + i));
+		uint16x4_t hi = f32x4_to_f16x4_canonical(vld1q_f32(src + i + 4));
 		vst1q_u16(dst + i, vcombine_u16(lo, hi));
 	}
 	for (; i + 4 <= n; i += 4)
-		vst1_u16(dst + i, vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(src + i))));
+		vst1_u16(dst + i, f32x4_to_f16x4_canonical(vld1q_f32(src + i)));
 	for (; i < n; i++)
 		dst[i] = f32_to_f16(src[i]);
 }

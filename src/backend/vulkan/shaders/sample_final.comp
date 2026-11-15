@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 256) in;
 
 #define K_MAX 64
@@ -90,7 +92,7 @@ void main() {
 	float weights[K_MAX];
 	float sum = 0.0;
 	for (int i = 0; i < k; i++) {
-		weights[i] = exp(s_sel_val[i] * params.inv_temp - mx);
+		weights[i] = num_exp(s_sel_val[i] * params.inv_temp - mx);
 		sum += weights[i];
 	}
 

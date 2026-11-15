@@ -1,5 +1,7 @@
 #version 450
 
+#include "common.glsl"
+
 #define WG 64
 
 layout(local_size_x = WG) in;
@@ -39,7 +41,7 @@ void main() {
 	float m_max = s_red[0];
 	barrier();
 
-	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : exp(m_s - m_max);
+	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : num_exp(m_s - m_max);
 	w_split[tid] = w;
 	s_red[tid]	 = has_split ? w * part[base + tid * stride + 1u] : 0.0;
 	barrier();

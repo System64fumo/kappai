@@ -1,3 +1,4 @@
+#include "numeric.h"
 #include "recipe/internal.h"
 
 typedef struct {
@@ -241,7 +242,7 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 				max_logit = logits[e];
 		float sum_exp = 0.0f;
 		for (int e = 0; e < E; e++) {
-			logits[e] = expf(logits[e] - max_logit);
+			logits[e] = num_expf(logits[e] - max_logit);
 			sum_exp += logits[e];
 		}
 		for (int e = 0; e < E; e++)
@@ -257,7 +258,7 @@ int moe_router_emit_ex(int E, int K, int use_softmax, int norm_topk, float route
 			scores = (E <= (int)ARRAY_LEN(scores_stack)) ? scores_stack
 														 : xmalloc((size_t)E * sizeof(float));
 		for (int e = 0; e < E; e++)
-			scores[e] = (1.0f / (1.0f + expf(-logits[e]))) + (bias ? bias[e] : 0.0f);
+			scores[e] = num_sigmoidf(logits[e]) + (bias ? bias[e] : 0.0f);
 		K = moe_grouped_topk_select(scores, E, K, n_group, topk_group, top_idx, top_score);
 		if (scores != scores_scratch && scores != scores_stack)
 			free(scores);

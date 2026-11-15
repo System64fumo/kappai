@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 layout(local_size_x = 256) in;
@@ -86,7 +87,7 @@ void main() {
 	float mx  = key_float(s_key[0]) * u_inv_temp;
 	float sum = 0.0;
 	for (int i = 0; i < k; i++) {
-		s_w[i] = exp(key_float(s_key[i]) * u_inv_temp - mx);
+		s_w[i] = num_exp(key_float(s_key[i]) * u_inv_temp - mx);
 		sum += s_w[i];
 	}
 

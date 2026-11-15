@@ -351,11 +351,11 @@ static void cpu_attention_inner_q8_0(const uint8_t *k_slice, const uint8_t *v_sl
 			if (ss > M) {
 				float Mold = M;
 				M		   = ss;
-				ms		   = expf(Mold - M);
+				ms		   = num_expf(Mold - M);
 				for (int d = 0; d < head_dim; d++)
 					VKQ[d] *= ms;
 			} else {
-				vs = expf(ss - M);
+				vs = num_expf(ss - M);
 			}
 			const uint8_t *vt = v_slice + ((size_t)t * kv_stride_bytes);
 			accum_v_q8_0(VKQ, vt, vs, head_dim);
@@ -395,11 +395,11 @@ static void cpu_attention_inner(const uint16_t *k_slice, const uint16_t *v_slice
 			if (ss > M) {
 				float Mold = M;
 				M		   = ss;
-				ms		   = expf(Mold - M);
+				ms		   = num_expf(Mold - M);
 				for (int d = 0; d < head_dim; d++)
 					VKQ[d] *= ms;
 			} else {
-				vs = expf(ss - M);
+				vs = num_expf(ss - M);
 			}
 			const uint16_t *vt = v_slice + ((size_t)t * kv_stride);
 			for (int d = 0; d < head_dim; d++)
@@ -784,7 +784,7 @@ static void cpu_ffn_act_batch_chunk(int begin, int end, int tid, void *ctx) {
 		} else {
 			for (int i = 0; i < j->n; i++) {
 				float gv = g[i];
-				o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
+				o[i]	 = gv / (1.0f + num_expf(-gv)) * u[i];
 			}
 		}
 	}
@@ -860,11 +860,11 @@ static void cpu_attn_mla_head_compute(const cpu_attn_mla_job *j, int h) {
 		if (score > M) {
 			float Mold = M;
 			M		   = score;
-			ms		   = expf(Mold - M);
+			ms		   = num_expf(Mold - M);
 			for (int i = 0; i < j->kv_lora; i++)
 				VKQ_latent[i] *= ms;
 		} else {
-			vs = expf(score - M);
+			vs = num_expf(score - M);
 		}
 		for (int i = 0; i < j->kv_lora; i++)
 			VKQ_latent[i] = fmaf(latent[i], vs, VKQ_latent[i]);
@@ -1006,12 +1006,9 @@ static void cpu_rmsnorm_add_batch_chunk(int begin, int end, int tid, void *ctx) 
 		const float *rr	   = j->residual + ((size_t)row * j->n);
 		float		*yr	   = j->y + ((size_t)row * j->n);
 		float		 ss	   = rmsnorm_sum_sq(xr, j->n);
-		float		 scale = 1.0f / sqrtf((ss / (float)j->n) + j->eps);
-		float		 t;
-		for (int i = 0; i < j->n; i++) {
-			t	  = xr[i] * scale * j->w[i] + rr[i];
-			yr[i] = t * j->out_scale;
-		}
+		float		 scale = num_rms_scale(ss, j->n, j->eps);
+		for (int i = 0; i < j->n; i++)
+			yr[i] = fmaf(xr[i] * scale, j->w[i], rr[i]) * j->out_scale;
 	}
 }
 
@@ -1037,7 +1034,7 @@ void cpu_softcap_chunk(int begin, int end, int tid, void *ctx) {
 	float			 inv_cap = j->inv_cap;
 	float			 cap	 = j->cap;
 	for (int i = begin; i < end; i++)
-		x[i] = cap * tanhf(x[i] * inv_cap);
+		x[i] = cap * num_tanhf(x[i] * inv_cap);
 }
 
 void cpu_split_qgate_chunk(int begin, int end, int tid, void *ctx) {
@@ -1097,7 +1094,7 @@ void cpu_ffn_down_act_chunk(int begin, int end, int tid, void *ctx) {
 	} else {
 		for (int i = begin; i < end; i++) {
 			float gv = g[i];
-			o[i]	 = gv / (1.0f + expf(-gv)) * u[i];
+			o[i]	 = gv / (1.0f + num_expf(-gv)) * u[i];
 		}
 	}
 }
@@ -1125,10 +1122,7 @@ static status_code matmul_vec(backend *self, const backend_weight *w, const floa
 }
 
 static void rmsnorm_inplace(float *x, const float *w, int n, float eps) {
-	float ss = 0.0f;
-	for (int i = 0; i < n; i++)
-		ss += x[i] * x[i];
-	float inv = 1.0f / sqrtf(ss / (float)n + eps);
+	float inv = num_rms_scale(rmsnorm_sum_sq(x, n), n, eps);
 	for (int i = 0; i < n; i++)
 		x[i] = x[i] * inv * (w ? w[i] : 1.0f);
 }
@@ -1160,7 +1154,7 @@ static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, floa
 			mx = fmaxf(mx, col[d]);
 		float sum = 0.0f;
 		for (int d = 0; d < HC; d++) {
-			col[d] = expf(col[d] - mx);
+			col[d] = num_expf(col[d] - mx);
 			sum += col[d];
 		}
 		for (int d = 0; d < HC; d++)
@@ -1202,8 +1196,8 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 
 	float pre[HC_SUPPORTED];
 	for (int h = 0; h < hc; h++) {
-		pre[h]	   = sigmoidf(mixes[h] * d->scale[0] + d->base[h]) + d->eps;
-		d->coef[h] = 2.0f * sigmoidf(mixes[hc + h] * d->scale[1] + d->base[hc + h]);
+		pre[h]	   = sigmoidf(fmaf(mixes[h], d->scale[0], d->base[h])) + d->eps;
+		d->coef[h] = 2.0f * sigmoidf(fmaf(mixes[hc + h], d->scale[1], d->base[hc + h]));
 	}
 	float *comb = d->coef + hc;
 	for (int j = 0; j < hc * hc; j++)
@@ -1279,7 +1273,7 @@ static void kda_heads(int begin, int end, int tid, void *arg) {
 		float		 b = j->beta[h];
 		float		 decay[512];
 		for (int i = 0; i < S; i++)
-			decay[i] = expf(g[i]);
+			decay[i] = num_expf(g[i]);
 		for (int r = 0; r < S; r++) {
 			float *row = M + (size_t)r * S;
 			float  dot = 0.0f;
@@ -1342,7 +1336,7 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 			if (lb > -INFINITY) {
 				g[idx] = lb * sigmoidf(-(t * d->ssm_a[h]));
 			} else {
-				float sp = t > 20.0f ? t : log1pf(expf(t));
+				float sp = t > 20.0f ? t : log1pf(num_expf(t));
 				g[idx]	 = sp * d->ssm_a[h];
 			}
 		}
@@ -1388,7 +1382,7 @@ static void mla_heads(int begin, int end, int tid, void *arg) {
 		}
 		float sum = 0.0f;
 		for (int t = 0; t < j->n_pos; t++) {
-			sc[t] = expf(sc[t] - mx);
+			sc[t] = num_expf(sc[t] - mx);
 			sum += sc[t];
 		}
 		memset(lat, 0, (size_t)R * sizeof(float));

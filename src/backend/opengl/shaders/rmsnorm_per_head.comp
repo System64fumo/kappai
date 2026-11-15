@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 #define LOAD_BATCH 8
 layout(local_size_x = 64) in;
@@ -32,17 +33,15 @@ void		 main(void) {
 	uint  row_stride = uint(u_n_heads) * uint(u_head_dim);
 	uint  base		 = row * row_stride + h * uint(u_head_dim);
 	int	  head_dim	 = u_head_dim;
-	float my_sum	 = 0.0;
-	for (int i0 = int(tid); i0 < head_dim; i0 += 64 * LOAD_BATCH) {
-		float xv[LOAD_BATCH];
-		for (int j = 0; j < LOAD_BATCH; j++) {
-			int i = i0 + j * 64;
-			xv[j] = i < head_dim ? x[base + uint(i)] : 0.0;
-		}
-		for (int j = 0; j < LOAD_BATCH; j++)
-			my_sum += xv[j] * xv[j];
+	float lane[4]	 = float[4](0.0, 0.0, 0.0, 0.0);
+	for (int i = int(tid); i < head_dim; i += 64) {
+		int q	= (i >> 6) & 3;
+		lane[q] = num_fma(x[base + uint(i)], x[base + uint(i)], lane[q]);
 	}
-	s_ss[tid] = my_sum;
+	lane[0] += lane[2];
+	lane[1] += lane[3];
+	lane[0] += lane[1];
+	s_ss[tid] = lane[0];
 	barrier();
 	if (tid < 32u) {
 		s_ss[tid] += s_ss[tid + 32u];
@@ -69,7 +68,7 @@ void		 main(void) {
 	}
 	barrier();
 	float ss  = s_ss[0];
-	float inv = 1.0 / sqrt(ss / float(head_dim) + u_eps);
+	float inv = num_rms_scale(ss, head_dim, u_eps);
 	for (int i0 = int(tid); i0 < head_dim; i0 += 64 * LOAD_BATCH) {
 		float xv[LOAD_BATCH];
 		float wv[LOAD_BATCH];
@@ -84,7 +83,7 @@ void		 main(void) {
 		for (int j = 0; j < LOAD_BATCH; j++) {
 			int i = i0 + j * 64;
 			if (i < head_dim)
-				y[base + uint(i)] = (xv[j] * inv * wv[j] + rv[j]) * u_out_scale;
+				y[base + uint(i)] = num_fma(xv[j] * inv, wv[j], rv[j]) * u_out_scale;
 		}
 	}
 }

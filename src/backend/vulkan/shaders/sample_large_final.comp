@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 256) in;
 
 #define N 1024u
@@ -87,7 +89,7 @@ void main() {
 	float mx  = key_float(s_key[0]) * params.inv_temp;
 	float sum = 0.0;
 	for (int i = 0; i < k; i++) {
-		s_w[i] = exp(key_float(s_key[i]) * params.inv_temp - mx);
+		s_w[i] = num_exp(key_float(s_key[i]) * params.inv_temp - mx);
 		sum += s_w[i];
 	}
 

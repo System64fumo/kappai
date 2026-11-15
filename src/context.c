@@ -161,9 +161,9 @@ static status_code apply_layer_map(context *c, const config *cfg) {
 
 	int begin = 0;
 	for (int i = 0; i < cfg->n_layer_devices; i++) {
-		int		 end = begin + cfg->layer_counts[i];
-		backend *be	 = NULL;
-		status_code s = context_open_device(c, cfg->layer_devices[i], &be);
+		int			end = begin + cfg->layer_counts[i];
+		backend	   *be	= NULL;
+		status_code s	= context_open_device(c, cfg->layer_devices[i], &be);
 		if (s != OK)
 			return s;
 		be->rope_neox = c->m.arch_info->uses_neox_rope;
@@ -321,7 +321,7 @@ status_code context_init(context *c, const config *cfg) {
 		char best[BACKEND_DEVICE_NAME_MAX];
 		char name[BACKEND_DEVICE_NAME_MAX];
 		int	 device_index = 0;
-		bool auto_device	 = !cfg->device || strcmp(cfg->device, "auto") == 0;
+		bool auto_device  = !cfg->device || strcmp(cfg->device, "auto") == 0;
 		if (auto_device)
 			backend_best_device(best, sizeof(best));
 		const char *requested = auto_device ? best : cfg->device;

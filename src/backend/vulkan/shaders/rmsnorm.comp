@@ -1,9 +1,6 @@
 #version 450
 
-#ifdef USE_SUBGROUP
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_KHR_shader_subgroup_shuffle : enable
-#endif
+#include "common.glsl"
 
 layout(local_size_x = 256) in;
 
@@ -58,7 +55,6 @@ layout(set = 0, binding = 5) writeonly buffer Y2Buf {
 layout(set = 0, binding = XQ_BINDING) writeonly buffer XQBuf {
 	uint xq[];
 };
-#include "common.glsl"
 #define QUANT_MAX_N 4096
 shared float s_y[QUANT_MAX_N];
 #endif
@@ -83,35 +79,11 @@ layout(push_constant) uniform Params {
 params;
 #endif
 
-#ifdef USE_SUBGROUP
-shared float sg_partial[256];
-#else
 shared float partial[256];
-#endif
 
 float block_sum(float sum) {
 	uint tid = gl_LocalInvocationID.x;
 	barrier();
-#ifdef USE_SUBGROUP
-	sum = subgroupAdd(sum);
-	if (gl_NumSubgroups > 1) {
-		if (gl_SubgroupInvocationID == 0) {
-			sg_partial[gl_SubgroupID] = sum;
-		}
-		barrier();
-		if (gl_SubgroupID == 0) {
-			uint  n_sg = gl_NumSubgroups;
-			float sg_sum =
-				(gl_SubgroupInvocationID < n_sg) ? sg_partial[gl_SubgroupInvocationID] : 0.0;
-			sg_sum = subgroupAdd(sg_sum);
-			if (gl_SubgroupInvocationID == 0) {
-				sg_partial[0] = sg_sum;
-			}
-		}
-		barrier();
-		sum = sg_partial[0];
-	}
-#else
 	partial[tid] = sum;
 	barrier();
 	for (uint stride = 128u; stride > 0u; stride >>= 1u) {
@@ -119,9 +91,7 @@ float block_sum(float sum) {
 			partial[tid] += partial[tid + stride];
 		barrier();
 	}
-	sum = partial[0];
-#endif
-	return sum;
+	return partial[0];
 }
 
 void main() {
@@ -153,12 +123,12 @@ void main() {
 	float sum = 0.0;
 	for (int i = int(tid); i < n; i += 256) {
 		float v = x[x_off + uint(i)];
-		sum += v * v;
+		sum		= fma(v, v, sum);
 	}
 
 	sum = block_sum(sum);
 
-	float scale = (sum > 0.0 || params.eps > 0.0) ? inversesqrt(sum / float(n) + params.eps) : 0.0;
+	float scale = num_rms_scale(sum, n, params.eps);
 
 #ifdef NORM2
 	float sum2 = 0.0;
@@ -172,22 +142,24 @@ void main() {
 		result = xv * scale;
 #endif
 #ifdef ADD_RESIDUAL
-		result += residual[x_off + uint(i)];
-		result *= params.os;
+#ifdef HAS_WEIGHT
+		result = fma(xv * scale, w[i], residual[x_off + uint(i)]) * params.os;
+#else
+		result = (xv * scale + residual[x_off + uint(i)]) * params.os;
+#endif
 #endif
 		y[y_off + uint(i)] = result;
 #ifdef QUANT_OUT
 		s_y[i] = result;
 #endif
 #ifdef NORM2
-		sum2 += result * result;
+		sum2 = fma(result, result, sum2);
 #endif
 	}
 
 #ifdef NORM2
-	sum2 = block_sum(sum2);
-	float scale2 =
-		(sum2 > 0.0 || params.eps > 0.0) ? inversesqrt(sum2 / float(n) + params.eps) : 0.0;
+	sum2		 = block_sum(sum2);
+	float scale2 = num_rms_scale(sum2, n, params.eps);
 	for (int i = int(tid); i < n; i += 256) {
 		float r2			= s_y[i] * scale2 * w2[i];
 		y2[y_off + uint(i)] = r2;

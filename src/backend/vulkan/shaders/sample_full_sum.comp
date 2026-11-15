@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer LogitsBuf {
@@ -32,7 +34,7 @@ void main() {
 	uint  hi  = min(lo + uint(params.chunk), uint(params.n));
 	float acc = 0.0;
 	for (uint i = lo + tid; i < hi; i += 256u)
-		acc += exp(logits[i] * params.inv_temp - mx);
+		acc += num_exp(logits[i] * params.inv_temp - mx);
 	s_part[tid] = acc;
 	barrier();
 	for (uint s = 128u; s > 0u; s >>= 1u) {

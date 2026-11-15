@@ -1,6 +1,8 @@
 #ifndef CPU_X86_64_COMMON_H
 #define CPU_X86_64_COMMON_H
 
+#include "numeric.h"
+
 #include <immintrin.h>
 #include <math.h>
 #include <stdint.h>
@@ -21,40 +23,66 @@ static inline __m256 loadu_bf16x8_to_ps(const uint16_t *p) {
 	return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
 }
 
+static inline __m256 vexp_split_ps(__m256 x, __m256 *pow2n) {
+	x		 = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-NUM_EXP_LIMIT)),
+							 _mm256_set1_ps(NUM_EXP_LIMIT));
+	__m256 n = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(NUM_INV_LN2)),
+							   _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+	__m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(NUM_LN2_HI), x);
+	r		 = _mm256_fnmadd_ps(n, _mm256_set1_ps(NUM_LN2_LO), r);
+
+	__m256 t = _mm256_set1_ps(1.0f / 5040.0f);
+	t		 = _mm256_fmadd_ps(r, t, _mm256_set1_ps(1.0f / 720.0f));
+	t		 = _mm256_fmadd_ps(r, t, _mm256_set1_ps(1.0f / 120.0f));
+	t		 = _mm256_fmadd_ps(r, t, _mm256_set1_ps(1.0f / 24.0f));
+	t		 = _mm256_fmadd_ps(r, t, _mm256_set1_ps(1.0f / 6.0f));
+	t		 = _mm256_fmadd_ps(r, t, _mm256_set1_ps(0.5f));
+
+	__m256i e = _mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127));
+	*pow2n	  = _mm256_castsi256_ps(_mm256_slli_epi32(e, 23));
+	return _mm256_fmadd_ps(_mm256_mul_ps(r, r), t, r);
+}
+
 static inline __m256 vexp_ps(__m256 x) {
-	x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-88.0f)), _mm256_set1_ps(88.0f));
+	__m256 pow2n;
+	__m256 em1 = vexp_split_ps(x, &pow2n);
+	return _mm256_fmadd_ps(pow2n, em1, pow2n);
+}
 
-	const __m256 inv_ln2 = _mm256_set1_ps(1.4426950408889634f);
-	const __m256 ln2_hi	 = _mm256_set1_ps(6.9314718055994529e-01f);
-	const __m256 ln2_lo	 = _mm256_set1_ps(1.9082149292705877e-10f);
-
-	__m256 n_f =
-		_mm256_round_ps(_mm256_mul_ps(x, inv_ln2), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-	__m256i n_i = _mm256_cvtps_epi32(n_f);
-
-	__m256 r = _mm256_fnmadd_ps(n_f, ln2_hi, x);
-	r		 = _mm256_fnmadd_ps(n_f, ln2_lo, r);
-
-	__m256 p = _mm256_set1_ps(1.0f / 120.0f);
-	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f / 24.0f));
-	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f / 6.0f));
-	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(0.5f));
-	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f));
-	p		 = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0f));
-
-	__m256i e	  = _mm256_add_epi32(n_i, _mm256_set1_epi32(127));
-	__m256i e_shl = _mm256_slli_epi32(e, 23);
-	__m256	pow2n = _mm256_castsi256_ps(e_shl);
-
-	return _mm256_mul_ps(p, pow2n);
+static inline __m256 vexpm1_ps(__m256 x) {
+	__m256 pow2n;
+	__m256 em1 = vexp_split_ps(x, &pow2n);
+	return _mm256_fmadd_ps(pow2n, em1, _mm256_sub_ps(pow2n, _mm256_set1_ps(1.0f)));
 }
 
 static inline __m256 vtanh_ps(__m256 x) {
-	x		   = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-20.0f)), _mm256_set1_ps(20.0f));
-	__m256 e2x = vexp_ps(_mm256_mul_ps(x, _mm256_set1_ps(2.0f)));
-	__m256 num = _mm256_sub_ps(e2x, _mm256_set1_ps(1.0f));
-	__m256 den = _mm256_add_ps(e2x, _mm256_set1_ps(1.0f));
-	return _mm256_div_ps(num, den);
+	const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+	__m256		 a = _mm256_min_ps(_mm256_andnot_ps(sign_mask, x), _mm256_set1_ps(NUM_TANH_LIMIT));
+	__m256		 em1 = vexpm1_ps(_mm256_add_ps(a, a));
+	__m256		 t	 = _mm256_div_ps(em1, _mm256_add_ps(em1, _mm256_set1_ps(2.0f)));
+	return _mm256_or_ps(t, _mm256_and_ps(x, sign_mask));
+}
+
+static inline __m256 vsigmoid_ps(__m256 x) {
+	const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+	const __m256 one	   = _mm256_set1_ps(1.0f);
+	__m256		 e		   = vexp_ps(_mm256_or_ps(x, sign_mask));
+	__m256		 nonneg	   = _mm256_cmp_ps(x, _mm256_setzero_ps(), _CMP_GE_OQ);
+	return _mm256_div_ps(_mm256_blendv_ps(e, one, nonneg), _mm256_add_ps(one, e));
+}
+
+static inline __m256 vsilu_ps(__m256 x) {
+	__m256 e = vexp_ps(_mm256_sub_ps(_mm256_setzero_ps(), x));
+	return _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0f), e));
+}
+
+static inline __m256 vgelu_ps(__m256 x) {
+	__m256 x2	 = _mm256_mul_ps(x, x);
+	__m256 inner = _mm256_mul_ps(
+		_mm256_mul_ps(x, _mm256_fmadd_ps(x2, _mm256_set1_ps(0.044715f), _mm256_set1_ps(1.0f))),
+		_mm256_set1_ps(0.7978845608028654f));
+	__m256 t = _mm256_add_ps(_mm256_set1_ps(1.0f), vtanh_ps(inner));
+	return _mm256_mul_ps(_mm256_mul_ps(x, _mm256_set1_ps(0.5f)), t);
 }
 
 static inline float vreduce_add_ps(__m256 v) {

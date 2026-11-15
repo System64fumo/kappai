@@ -1,3 +1,4 @@
+#include "numeric.h"
 #include "rocket.h"
 
 #define RKT_LUT_HQ_SEL 4
@@ -26,6 +27,14 @@ static double lut_eval(rkt_lut_kind kind, double x) {
 	if (kind == RKT_LUT_GELU_TANH)
 		return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 	return x / (1.0 + exp(-x));
+}
+
+static float lut_eval_f32(rkt_lut_kind kind, float x) {
+	if (kind == RKT_LUT_TANH)
+		return num_tanhf(x);
+	if (kind == RKT_LUT_GELU_TANH)
+		return num_gelu_tanh(x);
+	return num_silu(x);
 }
 
 void rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
@@ -312,7 +321,7 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 						vst1q_f32(xs, xv);
 						for (int l = 0; l < RKT_OUT_C2_F32; l++)
 							if (fabsf(xs[l]) >= RKT_LUT_HOST_LIMIT)
-								vs[l] = (float)lut_eval(g->kind, (double)xs[l]);
+								vs[l] = lut_eval_f32(g->kind, xs[l]);
 						v = vld1q_f32(vs);
 					}
 				}
@@ -332,7 +341,7 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 				if (g->kind != RKT_LUT_NONE) {
 					float xv = f16_bits_to_f32(x[j]);
 					if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
-						v = (float)lut_eval(g->kind, (double)xv);
+						v = lut_eval_f32(g->kind, xv);
 				}
 				float up_j	 = u ? u[j] : u16 ? f16_bits_to_f32(u16[j]) : 1.0f;
 				float result = v * up_j * g->out_scale;

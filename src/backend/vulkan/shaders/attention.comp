@@ -181,7 +181,7 @@ void main() {
 
 	float local_sum = 0.0;
 	for (int t = attn_start + int(tid); t <= pos; t += 64) {
-		float e					  = exp(scores[sc_base + uint(t)] - mx);
+		float e					  = num_exp(scores[sc_base + uint(t)] - mx);
 		scores[sc_base + uint(t)] = e;
 		local_sum += e;
 	}

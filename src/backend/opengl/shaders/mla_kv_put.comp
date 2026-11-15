@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 
@@ -25,10 +26,15 @@ void main() {
 	int tid = int(gl_LocalInvocationID.x);
 	int kl	= u_kv_lora;
 
-	float partial = 0.0;
-	for (int i = tid; i < kl; i += 64)
-		partial += kv_a[i] * kv_a[i];
-	s_ss[tid] = partial;
+	float lane[4] = float[4](0.0, 0.0, 0.0, 0.0);
+	for (int i = tid; i < kl; i += 64) {
+		int q	= (i >> 6) & 3;
+		lane[q] = num_fma(kv_a[i], kv_a[i], lane[q]);
+	}
+	lane[0] += lane[2];
+	lane[1] += lane[3];
+	lane[0] += lane[1];
+	s_ss[tid] = lane[0];
 	barrier();
 	for (int s = 32; s > 0; s >>= 1) {
 		if (tid < s)
@@ -36,7 +42,7 @@ void main() {
 		barrier();
 	}
 
-	float rstd = inversesqrt(s_ss[0] / float(kl) + u_eps);
+	float rstd = num_rms_scale(s_ss[0], kl, u_eps);
 	uint  base = uint(u_pos * (kl + u_qk_rope));
 	for (int i = tid; i < kl; i += 64)
 		cache[base + uint(i)] = kv_a[i] * rstd * norm_w[i];

@@ -93,7 +93,7 @@ int hcs_parse_pinlist(const char *text, char *out, size_t cap) {
 			p++;
 		char *tail = NULL;
 		long  v	   = strtol(p, &tail, 10);
-		if (tail == p)
+		if (tail == p || v < 0)
 			return -1;
 		char piece[24];
 		snprintf(piece, sizeof(piece), "%s%ld", len ? "," : "", v);
@@ -649,10 +649,9 @@ static void check_model_rules(violations *v, const hcs_config *h, int n_layers, 
 int hcs_probe_model(const char *path, int *n_layers, int *n_experts, int *n_kv_layers) {
 	if (!path || !*path)
 		return -1;
-	log_level saved = log_get_level();
-	log_set_level((log_level)(LOG_ERROR + 1));
+	log_mute_push();
 	status_code s = model_probe_shape(path, n_layers, n_experts, n_kv_layers);
-	log_set_level(saved);
+	log_mute_pop();
 	return s == OK ? 0 : -1;
 }
 
@@ -709,11 +708,7 @@ int hcs_layout_order(const hcs_config *h, int *order) {
 	return n;
 }
 
-static void materialize_layer_map(const hcs_config *h, const char *model_path, config *cfg) {
-	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
-	if (hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) != 0)
-		return;
-
+static void materialize_layer_map(const hcs_config *h, int n_layers, config *cfg) {
 	int held[HCS_MAX_DEVICES];
 	int order[HCS_MAX_DEVICES];
 	hcs_resolve_counts(h, HCS_FIELD_LAYERS, n_layers, held);
@@ -784,11 +779,11 @@ void hcs_materialize(const hcs_config *h, const char *model_path, config *cfg) {
 	cfg->ngl	   = -1;
 	cfg->device	   = h->devices[0].name;
 	materialize_cpu_tasks(&eff, cfg);
-	if (eff.n_devices >= 2)
-		materialize_layer_map(h, model_path, cfg);
 
-	int n_layers = 0, n_experts = 0, n_kv_layers = 0;
-	hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers);
+	int	 n_layers = 0, n_experts = 0, n_kv_layers = 0;
+	bool probed = hcs_probe_model(model_path, &n_layers, &n_experts, &n_kv_layers) == 0;
+	if (probed && eff.n_devices >= 2)
+		materialize_layer_map(h, n_layers, cfg);
 	materialize_expert_parts(h, n_experts, cfg);
 
 	int expert_held[HCS_MAX_DEVICES];

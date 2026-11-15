@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 layout(local_size_x = 256) in;
@@ -69,7 +70,7 @@ void main() {
 	uint  seg_hi  = min(seg_lo + per, s_hi);
 	float seg_sum = 0.0;
 	for (uint i = seg_lo; i < seg_hi; i++)
-		seg_sum += exp(logits[i] * u_inv_temp - s_mx);
+		seg_sum += num_exp(logits[i] * u_inv_temp - s_mx);
 	s_seg[tid] = seg_sum;
 	barrier();
 
@@ -84,7 +85,7 @@ void main() {
 			uint hi = min(lo + per, s_hi);
 			picked	= hi - 1u;
 			for (uint i = lo; i < hi; i++) {
-				acc += exp(logits[i] * u_inv_temp - s_mx);
+				acc += num_exp(logits[i] * u_inv_temp - s_mx);
 				if (s_target < acc) {
 					picked = i;
 					break;

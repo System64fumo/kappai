@@ -1909,10 +1909,7 @@ status_code cpu_kv_put_mla(backend *self, buffer *kv_cache, int layer, int pos,
 	float		*cache_base	  = (float *)cpu_ptr(kv_cache);
 	size_t		 layer_stride = (size_t)total_dim * (size_t)n_ctx;
 	float		*slot = cache_base + ((size_t)layer * layer_stride) + ((size_t)pos * total_dim);
-	float		 ss	  = 0.0f;
-	for (int i = 0; i < kv_lora; i++)
-		ss += kv_a[i] * kv_a[i];
-	ss = 1.0f / sqrtf((ss / (float)kv_lora) + eps);
+	float		 ss	  = num_rms_scale(rmsnorm_sum_sq(kv_a, kv_lora), kv_lora, eps);
 	for (int i = 0; i < kv_lora; i++)
 		slot[i] = kv_a[i] * ss * norm_w[i];
 	for (int i = 0; i < qk_rope; i++)
@@ -2221,6 +2218,23 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	return OK;
 }
 
+float rmsnorm_sum_sq(const float *x, int n) {
+	float lane[NUM_RMS_LANES];
+	int	  used = n < NUM_RMS_LANES ? n : NUM_RMS_LANES;
+	for (int l = 0; l < used; l++)
+		lane[l] = 0.0f;
+	int full = n - (n % NUM_RMS_LANES);
+	for (int i = 0; i < full; i += NUM_RMS_LANES)
+		for (int l = 0; l < NUM_RMS_LANES; l++)
+			lane[l] = fmaf(x[i + l], x[i + l], lane[l]);
+	for (int l = 0; full + l < n; l++)
+		lane[l] = fmaf(x[full + l], x[full + l], lane[l]);
+	for (int s = NUM_RMS_LANES / 2; s > 0; s >>= 1)
+		for (int l = 0; l < s && l + s < used; l++)
+			lane[l] += lane[l + s];
+	return lane[0];
+}
+
 status_code cpu_rmsnorm(backend *self, const buffer *x, const buffer *w, buffer *y, int n,
 						float eps) {
 	return cpu_rmsnorm_batch(self, x, w, y, n, eps, 1);
@@ -2526,7 +2540,7 @@ static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 			float		 alpha_t = j->alpha[(size_t)t * j->alpha_stride + vh];
 			float		 beta_t	 = j->beta[(size_t)t * j->beta_stride + vh];
 
-			float decay = expf(j->a[vh] * softplusf(alpha_t + j->dt[vh]));
+			float decay = num_expf(j->a[vh] * softplusf(alpha_t + j->dt[vh]));
 			float b		= sigmoidf(beta_t);
 
 			float qn = q_scale / sqrtf(j->eps + rmsnorm_sum_sq(q, kd));
@@ -2545,7 +2559,7 @@ static void gdn_heads(int vh0, int vh1, const gdn_job *j, float *scratch) {
 			for (int d = 0; d < kd; d++)
 				gdn_update_accum_f32(shead + (size_t)d * vd, y, delta, k_s[d], q_s[d], vd);
 
-			float inv_rms = 1.0f / sqrtf(j->eps + rmsnorm_sum_sq(y, vd) / (float)vd);
+			float inv_rms = num_rms_scale(rmsnorm_sum_sq(y, vd), vd, j->eps);
 			gdn_out_norm_f32(y, j->norm_w, z_t, inv_rms, vd);
 		}
 	}

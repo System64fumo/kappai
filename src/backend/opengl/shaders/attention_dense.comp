@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer QBuf {
@@ -86,10 +87,10 @@ void main(void) {
 		for (uint t = 0u; t < TILE; t++)
 			tile_max = max(tile_max, s_sc[t]);
 		float new_max = max(run_max, tile_max);
-		float alpha	  = exp(run_max - new_max);
+		float alpha	  = num_exp(run_max - new_max);
 		barrier();
 
-		s_sc[tid] = j < vis ? exp(s - new_max) : 0.0;
+		s_sc[tid] = j < vis ? num_exp(s - new_max) : 0.0;
 		barrier();
 
 		uint  count = min(TILE, vis - base);

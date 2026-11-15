@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 
@@ -130,14 +131,14 @@ void main() {
 		for (int t = 0; t < tlen; t++)
 			m_tile = max(m_tile, s_sc[t]);
 		float m_new	 = max(m_run, m_tile);
-		float alpha	 = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		float alpha	 = (m_new == m_run) ? 1.0 : num_exp(m_run - m_new);
 		float l_tile = 0.0;
 		m_run		 = m_new;
 		for (int t = 0; t < tlen; t++)
-			l_tile += exp(s_sc[t] - m_new);
+			l_tile += num_exp(s_sc[t] - m_new);
 		l_run = l_run * alpha + l_tile;
 		if (tid < tlen) {
-			float e	 = exp(s_sc[tid] - m_new);
+			float e	 = num_exp(s_sc[tid] - m_new);
 			s_e[tid] = e;
 		}
 		barrier();

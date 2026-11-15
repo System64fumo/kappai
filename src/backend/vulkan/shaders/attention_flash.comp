@@ -166,8 +166,8 @@ void main() {
 		for (int t = tslot; t < tile_len; t += T_SPLIT) {
 			const precise float score = s_tile[hs + t];
 			const precise float m_new = max(M, score);
-			const precise float ms	  = exp(M - m_new);
-			const precise float vs	  = exp(score - m_new);
+			const precise float ms	  = num_exp(M - m_new);
+			const precise float vs	  = num_exp(score - m_new);
 
 			const int vb = t * HEAD_DIM + lane * DPL;
 			for (int i = 0; i < DPL; i += 4) {
@@ -203,7 +203,7 @@ void main() {
 	precise float s_all = 0.0;
 	for (int sidx = 0; sidx < T_SPLIT; sidx++) {
 		const int off = (part_lane + sidx * LANES) * PART_STRIDE;
-		s_all += part[off + DPL + 1] * exp(part[off + DPL] - m_all);
+		s_all += part[off + DPL + 1] * num_exp(part[off + DPL] - m_all);
 	}
 	const precise float inv_s = s_all > 0.0 ? 1.0 / s_all : 0.0;
 
@@ -212,12 +212,8 @@ void main() {
 		precise float acc = 0.0;
 		for (int sidx = 0; sidx < T_SPLIT; sidx++) {
 			const int off = (part_lane + sidx * LANES) * PART_STRIDE;
-			acc += part[off + i] * exp(part[off + DPL] - m_all);
+			acc += part[off + i] * num_exp(part[off + DPL] - m_all);
 		}
 		out_[d0 + uint(i)] = acc * inv_s;
-	}
-	if (params.kv_q8 != 0 && params.layer_off == 0u && gl_WorkGroupID.x == 0u &&
-		gl_LocalInvocationID.x == 0u) {
-		out_[0] = k_tile[0];
 	}
 }

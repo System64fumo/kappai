@@ -1,4 +1,6 @@
 #version 450
+#include "common.glsl"
+
 layout(local_size_x = 64) in;
 
 layout(set = 0, binding = 0) readonly buffer LogitsBuf {
@@ -78,8 +80,8 @@ void heap_offer(inout float score[MAX_TOPK], inout int idx[MAX_TOPK], inout int 
 float expert_score(uint base, int e, float max_logit, float sum_exp) {
 	float l = logits[base + uint(e)];
 	if (params.use_softmax != 0)
-		return exp(l - max_logit) / sum_exp;
-	return (1.0 / (1.0 + exp(-l))) + (params.has_bias != 0 ? bias[e] : 0.0);
+		return div_exact(num_exp(l - max_logit), sum_exp);
+	return num_sigmoid(l) + (params.has_bias != 0 ? bias[e] : 0.0);
 }
 
 int group_of(int e, int epg, int rem) {
@@ -122,7 +124,7 @@ void main() {
 			max_logit = max(max_logit, logits[base + uint(e)]);
 		sum_exp = 0.0;
 		for (int e = 0; e < E; e++)
-			sum_exp += exp(logits[base + uint(e)] - max_logit);
+			sum_exp += num_exp(logits[base + uint(e)] - max_logit);
 	}
 
 	float hs[MAX_TOPK];

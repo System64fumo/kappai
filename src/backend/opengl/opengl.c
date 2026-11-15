@@ -3,6 +3,7 @@
 #include "common.h"
 #include "gl_context.h"
 #include "log.h"
+#include "numeric.h"
 #include "recipe.h"
 #include "shaders_embedded.h"
 
@@ -66,7 +67,7 @@ static const struct {
 	const char *name;
 	const char *src;
 } gl_shader_includes[] = {
-	{"activate.glsl", gl_shader_activate_src},
+	{"numeric.glsl", gl_shader_numeric_src},
 };
 
 #define GL_SAMPLE_CHUNK 2048
@@ -488,7 +489,7 @@ static void gl_softmax_masked(float *scores, int n_valid) {
 			m = scores[i];
 	float sum = 0.0f;
 	for (int i = 0; i < n_valid; i++) {
-		scores[i] = expf(scores[i] - m);
+		scores[i] = num_expf(scores[i] - m);
 		sum += scores[i];
 	}
 	float inv = 1.0f / sum;
@@ -3372,23 +3373,9 @@ static gl_rope_cache *gl_rope_cache_slot(gl_priv *p, const float *cos_base, cons
 static void gl_rope_freq_rows(const float *freq_factors, int half, float theta, int pos0, int count,
 							  float *cos_out, float *sin_out) {
 	double theta_scale = pow((double)theta, -1.0 / (double)half);
-	for (int i = 0; i < count; i++) {
-		double base_freq = 1.0;
-		for (int j = 0; j < half; j++) {
-			float  fv = freq_factors[j];
-			double ff = (fv >= 1e10f || fv == 0.0f) ? 0.0 : (double)fv;
-			float  c  = 1.0f;
-			float  sn = 0.0f;
-			if (ff > 0.0) {
-				double angle = base_freq * ff * (double)(pos0 + i);
-				c			 = (float)cos(angle);
-				sn			 = (float)sin(angle);
-			}
-			cos_out[(size_t)i * half + j] = c;
-			sin_out[(size_t)i * half + j] = sn;
-			base_freq *= theta_scale;
-		}
-	}
+	for (int i = 0; i < count; i++)
+		rope_cs_row(cos_out + ((size_t)i * half), sin_out + ((size_t)i * half), 1, half,
+					(double)(pos0 + i), theta_scale, freq_factors);
 }
 
 static gl_rope_cache *gl_rope_cache_range(gl_priv *p, const float *cos_base, const float *sin_base,

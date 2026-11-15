@@ -1,6 +1,9 @@
 #version 450
 
+#include "common.glsl"
+
 #define WG 64
+#define MIN_CHUNK 16
 #define LANES 16
 #define PASS_TOKENS (WG / LANES)
 #define MAX_HEAD_DIM 512
@@ -85,20 +88,23 @@ float k_partial(uint row, int lane, int pairs) {
 }
 
 void main() {
-	uint h		  = gl_WorkGroupID.x;
-	int	 split	  = int(gl_WorkGroupID.y) % pc.n_splits;
-	uint r		  = gl_WorkGroupID.y / uint(pc.n_splits);
-	uint tid	  = gl_LocalInvocationID.x;
-	int	 n_groups = pc.n_heads / pc.n_kv_heads;
-	int	 kvh	  = int(h) / n_groups;
-	int	 head_dim = pc.head_dim;
-	int	 pairs	  = head_dim >> 1;
-	int	 pos	  = pc.pos + int(r);
-	int	 start	  = pc.window > 0 ? max(0, pos + 1 - pc.window) : 0;
-	int	 t_begin  = start + split * pc.chunk;
-	int	 t_end	  = min(pos + 1, t_begin + pc.chunk);
-	uint qh		  = r * uint(pc.n_heads) + h;
-	uint q_base	  = qh * uint(head_dim);
+	uint h		   = gl_WorkGroupID.x;
+	int	 split	   = int(gl_WorkGroupID.y) % pc.n_splits;
+	uint r		   = gl_WorkGroupID.y / uint(pc.n_splits);
+	uint tid	   = gl_LocalInvocationID.x;
+	int	 n_groups  = pc.n_heads / pc.n_kv_heads;
+	int	 kvh	   = int(h) / n_groups;
+	int	 head_dim  = pc.head_dim;
+	int	 pairs	   = head_dim >> 1;
+	int	 pos	   = pc.pos + int(r);
+	int	 start	   = pc.window > 0 ? max(0, pos + 1 - pc.window) : 0;
+	int	 n_pos_r   = pos + 1 - start;
+	int	 n_split_r = max(min(pc.chunk, (n_pos_r + MIN_CHUNK - 1) / MIN_CHUNK), 1);
+	int	 chunk_r   = (n_pos_r + n_split_r - 1) / n_split_r;
+	int	 t_begin   = start + split * chunk_r;
+	int	 t_end	   = min(pos + 1, t_begin + chunk_r);
+	uint qh		   = r * uint(pc.n_heads) + h;
+	uint q_base	   = qh * uint(head_dim);
 
 	for (int p = int(tid); p < pairs; p += WG)
 		q2[p] = vec2(q[q_base + uint(p * 2)], q[q_base + uint(p * 2) + 1u]);
@@ -153,8 +159,8 @@ void main() {
 		for (int t = 0; t < WG / 4; t++)
 			m_tile = max(m_tile, m_part[t]);
 		float m_new = max(m_run, m_tile);
-		e_tile[tid] = tok < t_end ? exp(score - m_new) : 0.0;
-		float alpha = (m_new == m_run) ? 1.0 : exp(m_run - m_new);
+		e_tile[tid] = tok < t_end ? num_exp(score - m_new) : 0.0;
+		float alpha = (m_new == m_run) ? 1.0 : num_exp(m_run - m_new);
 		m_run		= m_new;
 		barrier();
 

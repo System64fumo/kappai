@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) buffer StateBuf {
@@ -50,7 +51,7 @@ void main(void) {
 
 	float dot_k = 0.0;
 	for (int i = tid; i < S; i += 64) {
-		float cur = u_reset != 0 ? 0.0 : state[row + i] * exp(g[hv + i]);
+		float cur = u_reset != 0 ? 0.0 : state[row + i] * num_exp(g[hv + i]);
 		dot_k += cur * k[hv + i];
 	}
 	float dot	= reduce_sum(tid, dot_k);
@@ -58,7 +59,7 @@ void main(void) {
 
 	float dot_q = 0.0;
 	for (int i = tid; i < S; i += 64) {
-		float cur = u_reset != 0 ? 0.0 : state[row + i] * exp(g[hv + i]);
+		float cur = u_reset != 0 ? 0.0 : state[row + i] * num_exp(g[hv + i]);
 		cur += delta * k[hv + i];
 		state[row + i] = cur;
 		dot_q += cur * q[hv + i];

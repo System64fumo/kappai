@@ -1,4 +1,5 @@
 #version 310 es
+#include "numeric.glsl"
 precision highp float;
 precision highp int;
 layout(local_size_x = 64) in;
@@ -75,9 +76,9 @@ void main(void) {
 		float alpha_t = alpha[uint(t) * uint(u_n_value_heads) + uint(vh)];
 		float beta_t  = beta[uint(t) * uint(u_n_value_heads) + uint(vh)];
 		float sp_arg  = alpha_t + head_params[vh];
-		float sp	  = sp_arg > 20.0 ? sp_arg : log(1.0 + exp(sp_arg));
-		float decay	  = exp(head_params[u_n_value_heads + vh] * sp);
-		float bg	  = 1.0 / (1.0 + exp(-beta_t));
+		float sp	  = sp_arg > 20.0 ? sp_arg : log(1.0 + num_exp(sp_arg));
+		float decay	  = num_exp(head_params[u_n_value_heads + vh] * sp);
+		float bg	  = num_sigmoid(beta_t);
 
 		float qss = 0.0;
 		float kss = 0.0;
@@ -129,7 +130,7 @@ void main(void) {
 			if (j >= vd)
 				continue;
 			float zv			  = z[zbase + uint(j)];
-			out_[zbase + uint(j)] = y[jj] * inv_rms * norm_w[j] * (zv / (1.0 + exp(-zv)));
+			out_[zbase + uint(j)] = y[jj] * inv_rms * norm_w[j] * num_silu(zv);
 		}
 	}
 }
