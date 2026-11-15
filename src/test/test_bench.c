@@ -7,33 +7,28 @@
 
 typedef int (*bench_backend_fn)(backend *b, const char *name, void *ud);
 
-static int bench_for_each_backend(int argc, char **argv, backend_info *infos, int n_backends,
+static int bench_for_each_backend(int argc, char **argv, test_device *devs, int n_devs,
 								  bench_backend_fn fn, void *ud) {
 	int do_all	   = wants_all(argc, argv);
 	int has_filter = do_all;
 	for (int ai = 1; !has_filter && ai < argc; ai++) {
 		if (argv[ai][0] == '-')
 			continue;
-		for (int bi = 0; bi < n_backends; bi++)
-			if (strcmp(argv[ai], infos[bi].name) == 0)
-				has_filter = 1;
+		if (test_find_device(devs, n_devs, argv[ai]))
+			has_filter = 1;
 	}
 	int n_run = 0;
-	for (int bi = 0; bi < n_backends; bi++) {
-		int want = do_all || matches_name(argc, argv, infos[bi].name) ||
-				   (!has_filter && (infos[bi].caps & BCAP_IS_HOST));
+	for (int di = 0; di < n_devs; di++) {
+		int want = do_all || matches_name(argc, argv, devs[di].spec) ||
+				   (!has_filter && backend_device_is_host(devs[di].spec));
 		if (!want)
 			continue;
-		if (!infos[bi].available) {
-			printf("\n=== %s: SKIPPED (not available) ===\n", infos[bi].name);
-			continue;
-		}
 		backend *b = NULL;
-		if (backend_create(infos[bi].name, 0, &b) != OK) {
-			printf("\n=== %s: SKIPPED (failed to init) ===\n", infos[bi].name);
+		if (test_device_create(&devs[di], &b) != OK) {
+			printf("\n=== %s: SKIPPED (failed to init) ===\n", devs[di].spec);
 			continue;
 		}
-		n_run += fn(b, infos[bi].name, ud) == 0;
+		n_run += fn(b, devs[di].spec, ud) == 0;
 		backend_destroy(b);
 	}
 	return n_run;
@@ -467,7 +462,7 @@ static int bench_e2e_one(backend *b, const char *name, void *ud) {
 	return 0;
 }
 
-int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
+int run_bench_mode(int argc, char **argv, test_device *devs, int n_devs) {
 	int		  n = 4096, k = 4096, iters = 5;
 	int		  attn_iters = 200;
 	int		  ms[8], n_ms = 0;
@@ -509,11 +504,7 @@ int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 			usage(argv[0]);
 			return 1;
 		} else if (argv[ai][0] != '-') {
-			int known = 0;
-			for (int bi = 0; bi < n_backends; bi++)
-				if (strcmp(argv[ai], infos[bi].name) == 0)
-					known = 1;
-			if (!known) {
+			if (!test_find_device(devs, n_devs, argv[ai])) {
 				fprintf(stderr, "unknown bench target '%s'\n", argv[ai]);
 				usage(argv[0]);
 				return 1;
@@ -535,15 +526,15 @@ int run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends) {
 		mu.ms[i] = ms[i];
 	if (strcmp(which, "matmul") == 0 || strcmp(which, "all") == 0) {
 		printf("\n=== matmul batch GFLOPS  N=%d K=%d  best-of-%d ----\n", n, k, iters);
-		bench_for_each_backend(argc, argv, infos, n_backends, bench_matmul_one, &mu);
+		bench_for_each_backend(argc, argv, devs, n_devs, bench_matmul_one, &mu);
 	}
 	if (strcmp(which, "attn") == 0 || strcmp(which, "all") == 0)
-		bench_for_each_backend(argc, argv, infos, n_backends, bench_attn_one, &attn_iters);
+		bench_for_each_backend(argc, argv, devs, n_devs, bench_attn_one, &attn_iters);
 	if (strcmp(which, "dequant") == 0 || strcmp(which, "all") == 0)
-		bench_for_each_backend(argc, argv, infos, n_backends, bench_dequant_one, &iters);
+		bench_for_each_backend(argc, argv, devs, n_devs, bench_dequant_one, &iters);
 	if (strcmp(which, "e2e") == 0 || strcmp(which, "all") == 0) {
 		e2e_bench_ud eu = {.n_prefill = n_prefill, .n_decode = n_decode};
-		bench_for_each_backend(argc, argv, infos, n_backends, bench_e2e_one, &eu);
+		bench_for_each_backend(argc, argv, devs, n_devs, bench_e2e_one, &eu);
 	}
 	return 0;
 }

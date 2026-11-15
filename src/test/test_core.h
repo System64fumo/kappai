@@ -35,6 +35,14 @@
 #define MAX_RESULTS_PER_FAMILY 512
 #define V_COUNT 3
 
+#define TEST_MAX_DEVICES (BACKEND_MAX * 8)
+
+typedef struct {
+	char spec[BACKEND_DEVICE_NAME_MAX];
+	char backend[BACKEND_DEVICE_NAME_MAX];
+	int	 index;
+} test_device;
+
 typedef enum {
 	V_PASS = 0,
 	V_FAIL = 1,
@@ -166,7 +174,21 @@ int	 matches_name(int argc, char **argv, const char *name);
 int	 wants_all(int argc, char **argv);
 void usage(const char *prog);
 
-int	 run_per_op_mode(int argc, char **argv, backend_info *infos, int n_backends);
+typedef struct {
+	const char *ref;
+	const char *targets[TEST_MAX_DEVICES];
+	int			n_targets;
+} device_selection;
+
+int test_parse_device_selection(int argc, char **argv, const test_device *devs, int n_devs,
+								device_selection *sel);
+int test_enum_devices(test_device *out, int max);
+const test_device *test_find_device(const test_device *devs, int n, const char *spec);
+const test_device *test_default_reference(const test_device *devs, int n);
+int				   test_device_priority(const test_device *d);
+status_code		   test_device_create(const test_device *d, backend **out);
+
+int	 run_per_op_mode(int argc, char **argv, test_device *devs, int n_devs);
 void run_per_op_tests(backend *ref, backend *tgt);
 void run_arch_tests(backend *ref, backend *tgt);
 
@@ -202,7 +224,7 @@ void run_repack_parity_tests(backend *ref, backend *tgt);
 void test_dequant_parity_cross(backend *ref, backend *tgt, const qtype_info *qt, int dim, int n);
 void test_dequant_weight_parity(backend *ref, backend *tgt, const qtype_info *qt, int k,
 								int n_rows);
-int	 run_bench_mode(int argc, char **argv, backend_info *infos, int n_backends);
-int	 run_model_mode(int argc, char **argv, backend_info *infos, int n_backends);
+int	 run_bench_mode(int argc, char **argv, test_device *devs, int n_devs);
+int	 run_arch_cross_mode(int argc, char **argv, test_device *devs, int n_devs);
 
 #endif

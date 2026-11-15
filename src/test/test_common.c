@@ -897,13 +897,57 @@ int wants_all(int argc, char **argv) {
 	return 0;
 }
 
+int test_enum_devices(test_device *out, int max) {
+	char specs[TEST_MAX_DEVICES][BACKEND_DEVICE_NAME_MAX];
+	int	 n	  = backend_enum_devices(specs, MIN(max, TEST_MAX_DEVICES));
+	int	 kept = 0;
+	for (int i = 0; i < n; i++) {
+		test_device *d = &out[kept];
+		if (backend_parse_device(specs[i], d->backend, sizeof(d->backend), &d->index) != 0)
+			continue;
+		snprintf(d->spec, sizeof(d->spec), "%s", specs[i]);
+		kept++;
+	}
+	return kept;
+}
+
+const test_device *test_find_device(const test_device *devs, int n, const char *spec) {
+	for (int i = 0; i < n; i++)
+		if (strcmp(devs[i].spec, spec) == 0)
+			return &devs[i];
+	return NULL;
+}
+
+const test_device *test_default_reference(const test_device *devs, int n) {
+	for (int i = 0; i < n; i++)
+		if (strcmp(devs[i].backend, "cpu_scalar") == 0)
+			return &devs[i];
+	for (int i = 0; i < n; i++)
+		if (strcmp(devs[i].backend, "cpu") == 0)
+			return &devs[i];
+	return n > 0 ? &devs[0] : NULL;
+}
+
+int test_device_priority(const test_device *d) {
+	backend_info infos[BACKEND_MAX];
+	int			 n = backend_list(infos, BACKEND_MAX);
+	for (int i = 0; i < n; i++)
+		if (strcmp(infos[i].name, d->backend) == 0)
+			return infos[i].priority;
+	return -1;
+}
+
+status_code test_device_create(const test_device *d, backend **out) {
+	return backend_create(d->backend, d->index, out);
+}
+
 void usage(const char *prog) {
 	fprintf(stderr,
 			"Usage:\n"
-			"  %s [--all | <target>...]        per-op validation: target(s) vs default reference\n"
-			"  %s <ref> <target>...            backend-vs-backend: <ref> is the reference\n"
-			"  %s --bench [matmul|attn|dequant|tok|e2e|all] [--all | <backend>]   benchmarks\n"
-			"  %s --model <path> [--all | <b>...]  real-model greedy-decode cross-check\n"
+			"  %s [--all | <device>...]        per-op validation: device(s) vs default reference\n"
+			"  %s <ref> <device>...            device-vs-device: <ref> is the reference\n"
+			"  %s --bench [matmul|attn|dequant|tok|e2e|all] [--all | <device>]   benchmarks\n"
+			"  %s --archs [--all | [<ref>] <device>...]  per-architecture cross-device check\n"
 			"\n"
 			"Modes:\n"
 			"  (default)    per-op correctness (each op vs reference) plus combined-op tests\n"
@@ -915,20 +959,21 @@ void usage(const char *prog) {
 			"  --bench      matmul GFLOPS | attention latency | dequant throughput |\n"
 			"               tokenizer throughput | end-to-end tok/s\n"
 			"               (pick: matmul attn dequant tok e2e all)\n"
-			"  --model      load a real GGUF model and cross-validate greedy decode\n"
+			"  --archs      fabricate a GGUF per architecture, run prefill + decode on two\n"
+			"               devices and report where and by how much they diverge\n"
 			"\n"
 			"Options:\n"
-			"  --all              run against every available backend\n"
-			"  --n-prefill N      override prefill token count (model mode, e2e bench)\n"
-			"  --n-decode  N      override decode token count (model mode, e2e bench)\n"
+			"  --all              run against every available device\n"
+			"  --n-prefill N      override prefill token count (archs mode, e2e bench)\n"
+			"  --n-decode  N      override decode token count (archs mode, e2e bench)\n"
+			"  --arch NAME        restrict --archs to one architecture (repeatable)\n"
 			"  -h, --help         this message\n"
 			"\n"
-			"Available backends: ",
+			"Available devices: ",
 			prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
-	backend_info infos[BACKEND_MAX];
-	int			 n = backend_list(infos, BACKEND_MAX);
+	test_device devs[TEST_MAX_DEVICES];
+	int			n = test_enum_devices(devs, TEST_MAX_DEVICES);
 	for (int i = 0; i < n; i++)
-		fprintf(stderr, "%s%s%s", i ? ", " : "", infos[i].name,
-				infos[i].available ? "" : "(unavailable)");
+		fprintf(stderr, "%s%s", i ? ", " : "", devs[i].spec);
 	fprintf(stderr, "\n");
 }

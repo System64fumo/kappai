@@ -249,13 +249,19 @@ status_code op_mla_absorbed(exec_ctx *ctx) {
 		.k_b	   = &L->k_b_w.buf,
 		.v_b	   = &L->v_b_w.buf,
 	};
-	if (backend_has_cap(a, BCAP_IS_HOST))
+	exec_segments seg = exec_segments_of(ctx);
+	if (backend_has_cap(a, BCAP_IS_HOST)) {
+		for (int row = 0; row < seg.n_calls * seg.rows; row++) {
+			int pos = exec_row_pos(ctx, row);
+			if (pos > d.pos)
+				d.pos = pos;
+		}
 		d.ws = float_buf_ensure_nocopy(&ctx->s->run.op_ws, mla_absorbed_ws_floats(&d), 64);
+	}
 
-	exec_segments seg	  = exec_segments_of(ctx);
-	buffer		 *x_all	  = exec_slot(ctx, ctx->op->in[0]);
-	buffer		 *out_all = exec_slot(ctx, ctx->op->out);
-	status_code	  st	  = OK;
+	buffer	   *x_all	= exec_slot(ctx, ctx->op->in[0]);
+	buffer	   *out_all = exec_slot(ctx, ctx->op->out);
+	status_code st		= OK;
 	for (int call = 0; call < seg.n_calls && st == OK; call++) {
 		kvcache		   *rcache = exec_segment_cache(ctx, call);
 		kvcache_hybrid *rc	   = rcache ? rcache->hybrid : c;

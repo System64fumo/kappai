@@ -22,7 +22,7 @@ typedef struct {
 	size_t	 cap;
 } tsg_buf;
 
-#define TSG_MAX_TENSORS 128
+#define TSG_MAX_TENSORS 512
 #define TSG_ALIGN 32u
 
 typedef struct {
@@ -93,6 +93,18 @@ typedef struct {
 	uint64_t seed;
 } tsg_dsa_spec;
 
+typedef struct {
+	int		 dim;
+	int		 n_heads;
+	int		 n_kv_heads;
+	int		 head_dim;
+	int		 n_layers;
+	int		 intermediate;
+	int		 ctx;
+	int		 vocab;
+	uint64_t seed;
+} tsg_arch_spec;
+
 void	 tsg_seed(uint64_t s);
 void	 tsg_build_array_file(const char *path, uint32_t type, uint64_t count, const void *data,
 							  size_t bytes);
@@ -103,5 +115,11 @@ void	 tsg_build_vocab_file(const char *path, const char *model_name, const char 
 void	 tsg_build_chat_llama(const char *path, const tsg_llama_spec *s);
 void	 tsg_build_lfm2(const char *path, const tsg_lfm2_spec *s);
 void	 tsg_build_glm_dsa(const char *path, const tsg_dsa_spec *s);
+void	 tsg_build_qwen3vl(const char *path, const tsg_arch_spec *s);
+void	 tsg_build_lfm3(const char *path, const tsg_arch_spec *s);
+void	 tsg_build_gemma4(const char *path, const tsg_arch_spec *s);
+void	 tsg_build_gemma4_moe(const char *path, const tsg_arch_spec *s);
+void	 tsg_build_qwen35(const char *path, const tsg_arch_spec *s);
+void	 tsg_build_glm5_next(const char *path, const tsg_arch_spec *s);
 
 #endif

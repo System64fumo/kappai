@@ -1,5 +1,7 @@
 #include "test_synth_gguf.h"
 
+#include <math.h>
+
 static const char *tsg_chat_template =
 	"{% for m in messages %}{{ m['role'] }}:{{ m['content'] }}\n"
 	"{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}";
@@ -544,6 +546,407 @@ void tsg_build_glm_dsa(const char *path, const tsg_dsa_spec *s) {
 			tsg_add2(&w, nm, (uint64_t)s->intermediate, (uint64_t)s->dim, 0.08f);
 		}
 	}
+
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
+static float *tsg_blk1(tsg_writer *w, int i, const char *suffix, uint64_t d0, float scale) {
+	char nm[128];
+	snprintf(nm, sizeof(nm), "blk.%d.%s", i, suffix);
+	return tsg_add1(w, nm, d0, scale);
+}
+
+static float *tsg_blk2(tsg_writer *w, int i, const char *suffix, uint64_t d0, uint64_t d1,
+					   float scale) {
+	char nm[128];
+	snprintf(nm, sizeof(nm), "blk.%d.%s", i, suffix);
+	return tsg_add2(w, nm, d0, d1, scale);
+}
+
+static float *tsg_blk3(tsg_writer *w, int i, const char *suffix, uint64_t d0, uint64_t d1,
+					   uint64_t d2, float scale) {
+	char nm[128];
+	snprintf(nm, sizeof(nm), "blk.%d.%s", i, suffix);
+	return tsg_add3(w, nm, d0, d1, d2, scale);
+}
+
+static void tsg_kvp_i32(tsg_writer *w, const char *prefix, const char *suffix, int32_t v) {
+	char key[160];
+	snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+	tsg_kv_i32(w, key, v);
+}
+
+static void tsg_kvp_f32(tsg_writer *w, const char *prefix, const char *suffix, float v) {
+	char key[160];
+	snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+	tsg_kv_f32(w, key, v);
+}
+
+static void tsg_kvp_arr_i32(tsg_writer *w, const char *prefix, const char *suffix, const int32_t *v,
+							size_t n) {
+	char key[160];
+	snprintf(key, sizeof(key), "%s.%s", prefix, suffix);
+	tsg_kv_arr_i32(w, key, v, n);
+}
+
+static void tsg_arch_header(tsg_writer *w, const char *arch, const char *prefix,
+							const tsg_arch_spec *s) {
+	tsg_kv_str(w, "general.architecture", arch);
+	tsg_kvp_i32(w, prefix, "context_length", s->ctx);
+	tsg_kvp_i32(w, prefix, "block_count", s->n_layers);
+	tsg_kvp_i32(w, prefix, "embedding_length", s->dim);
+	tsg_kvp_i32(w, prefix, "attention.head_count", s->n_heads);
+	tsg_kvp_f32(w, prefix, "attention.layer_norm_rms_epsilon", 1e-5f);
+}
+
+static void tsg_arch_embeddings(tsg_writer *w, const tsg_arch_spec *s, int with_output) {
+	tsg_add2(w, "token_embd.weight", (uint64_t)s->dim, (uint64_t)s->vocab, 0.10f);
+	tsg_add1(w, "output_norm.weight", (uint64_t)s->dim, -1.0f);
+	if (with_output)
+		tsg_add2(w, "output.weight", (uint64_t)s->dim, (uint64_t)s->vocab, 0.10f);
+}
+
+static void tsg_blk_dense_ffn(tsg_writer *w, int i, int dim, int inter) {
+	tsg_blk2(w, i, "ffn_gate.weight", (uint64_t)dim, (uint64_t)inter, 0.08f);
+	tsg_blk2(w, i, "ffn_up.weight", (uint64_t)dim, (uint64_t)inter, 0.08f);
+	tsg_blk2(w, i, "ffn_down.weight", (uint64_t)inter, (uint64_t)dim, 0.08f);
+}
+
+static void tsg_blk_attention(tsg_writer *w, int i, int dim, int q_out, int kv_out, int with_k,
+							  int with_v) {
+	tsg_blk2(w, i, "attn_q.weight", (uint64_t)dim, (uint64_t)q_out, 0.08f);
+	if (with_k)
+		tsg_blk2(w, i, "attn_k.weight", (uint64_t)dim, (uint64_t)kv_out, 0.08f);
+	if (with_v)
+		tsg_blk2(w, i, "attn_v.weight", (uint64_t)dim, (uint64_t)kv_out, 0.08f);
+	tsg_blk2(w, i, "attn_output.weight", (uint64_t)q_out, (uint64_t)dim, 0.08f);
+}
+
+static void tsg_blk_mla(tsg_writer *w, int i, int dim, int n_heads, int q_lora, int kv_lora,
+						int qk_nope, int qk_head, int v_head) {
+	tsg_blk2(w, i, "attn_q_a.weight", (uint64_t)dim, (uint64_t)q_lora, 0.08f);
+	tsg_blk1(w, i, "attn_q_a_norm.weight", (uint64_t)q_lora, -1.0f);
+	tsg_blk2(w, i, "attn_q_b.weight", (uint64_t)q_lora, (uint64_t)(n_heads * qk_head), 0.08f);
+	tsg_blk2(w, i, "attn_kv_a_mqa.weight", (uint64_t)dim, (uint64_t)kv_lora, 0.08f);
+	tsg_blk1(w, i, "attn_kv_a_norm.weight", (uint64_t)kv_lora, -1.0f);
+	tsg_blk2(w, i, "attn_k_b.weight", (uint64_t)(qk_nope * kv_lora), (uint64_t)n_heads, 0.08f);
+	tsg_blk2(w, i, "attn_v_b.weight", (uint64_t)(kv_lora * v_head), (uint64_t)n_heads, 0.08f);
+	tsg_blk2(w, i, "attn_output.weight", (uint64_t)(n_heads * v_head), (uint64_t)dim, 0.08f);
+}
+
+void tsg_build_qwen3vl(const char *path, const tsg_arch_spec *s) {
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_seed(s->seed);
+
+	tsg_arch_header(&w, "qwen3vl", "qwen3vl", s);
+	tsg_kvp_i32(&w, "qwen3vl", "feed_forward_length", s->intermediate);
+	tsg_kvp_i32(&w, "qwen3vl", "attention.head_count_kv", s->n_kv_heads);
+	tsg_kvp_i32(&w, "qwen3vl", "attention.key_length", s->head_dim);
+	tsg_arch_embeddings(&w, s, 1);
+
+	int q_out  = s->n_heads * s->head_dim;
+	int kv_out = s->n_kv_heads * s->head_dim;
+	for (int i = 0; i < s->n_layers; i++) {
+		tsg_blk1(&w, i, "attn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_attention(&w, i, s->dim, q_out, kv_out, 1, 1);
+		tsg_blk1(&w, i, "attn_q_norm.weight", (uint64_t)s->head_dim, -1.0f);
+		tsg_blk1(&w, i, "attn_k_norm.weight", (uint64_t)s->head_dim, -1.0f);
+		tsg_blk1(&w, i, "ffn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_dense_ffn(&w, i, s->dim, s->intermediate);
+	}
+
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
+void tsg_build_lfm3(const char *path, const tsg_arch_spec *s) {
+	enum { CONV_KERNEL = 4, SLIDING_WINDOW = 12 };
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_seed(s->seed);
+
+	int32_t *kv_arr = malloc((size_t)s->n_layers * sizeof(int32_t));
+	for (int i = 0; i < s->n_layers; i++)
+		kv_arr[i] = i % 3 == 2 ? s->n_kv_heads : 0;
+
+	tsg_arch_header(&w, "lfm3", "lfm3", s);
+	tsg_kvp_i32(&w, "lfm3", "feed_forward_length", s->intermediate);
+	tsg_kvp_arr_i32(&w, "lfm3", "attention.head_count_kv", kv_arr, (size_t)s->n_layers);
+	tsg_kvp_i32(&w, "lfm3", "attention.key_length", s->head_dim);
+	tsg_kvp_i32(&w, "lfm3", "attention.sliding_window", SLIDING_WINDOW);
+	tsg_kvp_i32(&w, "lfm3", "shortconv.l_cache", CONV_KERNEL);
+	tsg_arch_embeddings(&w, s, 1);
+
+	int q_out  = s->n_heads * s->head_dim;
+	int kv_out = s->n_kv_heads * s->head_dim;
+	for (int i = 0; i < s->n_layers; i++) {
+		tsg_blk1(&w, i, "attn_norm.weight", (uint64_t)s->dim, -1.0f);
+		if (kv_arr[i] == 0) {
+			tsg_blk2(&w, i, "shortconv.in_proj.weight", (uint64_t)s->dim, (uint64_t)(3 * s->dim),
+					 0.08f);
+			tsg_blk2(&w, i, "shortconv.conv.weight", CONV_KERNEL, (uint64_t)s->dim, 0.20f);
+			tsg_blk2(&w, i, "shortconv.out_proj.weight", (uint64_t)s->dim, (uint64_t)s->dim, 0.08f);
+		} else {
+			tsg_blk_attention(&w, i, s->dim, q_out, kv_out, 1, 1);
+			tsg_blk1(&w, i, "attn_q_norm.weight", (uint64_t)s->head_dim, -1.0f);
+			tsg_blk1(&w, i, "attn_k_norm.weight", (uint64_t)s->head_dim, -1.0f);
+		}
+		tsg_blk1(&w, i, "post_attention_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk1(&w, i, "ffn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk1(&w, i, "post_ffw_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_dense_ffn(&w, i, s->dim, s->intermediate);
+	}
+	free(kv_arr);
+
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
+static void tsg_build_gemma4_impl(const char *path, const tsg_arch_spec *s, int moe) {
+	enum {
+		SLIDING_WINDOW	 = 12,
+		SHARED_KV_LAYERS = 2,
+		PLE_DIM			 = 8,
+		N_EXPERTS		 = 4,
+		N_USED			 = 2,
+		EXPERT_INTER	 = 16
+	};
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_seed(s->seed);
+
+	int32_t *sliding = malloc((size_t)s->n_layers * sizeof(int32_t));
+	for (int i = 0; i < s->n_layers; i++)
+		sliding[i] = i % 3 == 2 ? 0 : 1;
+	int head_swa	= s->head_dim;
+	int head_global = 2 * s->head_dim;
+
+	tsg_arch_header(&w, "gemma4", "gemma4", s);
+	tsg_kvp_i32(&w, "gemma4", "feed_forward_length", s->intermediate);
+	tsg_kvp_i32(&w, "gemma4", "attention.head_count_kv", s->n_kv_heads);
+	tsg_kvp_i32(&w, "gemma4", "attention.key_length", head_global);
+	tsg_kvp_i32(&w, "gemma4", "attention.key_length_swa", head_swa);
+	tsg_kvp_f32(&w, "gemma4", "rope.freq_base", 1000000.0f);
+	tsg_kvp_f32(&w, "gemma4", "rope.freq_base_swa", 10000.0f);
+	tsg_kvp_i32(&w, "gemma4", "attention.sliding_window", SLIDING_WINDOW);
+	tsg_kvp_arr_i32(&w, "gemma4", "attention.sliding_window_pattern", sliding, (size_t)s->n_layers);
+	tsg_kvp_i32(&w, "gemma4", "attention.shared_kv_layers", SHARED_KV_LAYERS);
+	tsg_kvp_i32(&w, "gemma4", "embedding_length_per_layer_input", PLE_DIM);
+	tsg_kvp_f32(&w, "gemma4", "final_logit_softcapping", 30.0f);
+	if (moe) {
+		tsg_kvp_i32(&w, "gemma4", "expert_count", N_EXPERTS);
+		tsg_kvp_i32(&w, "gemma4", "expert_used_count", N_USED);
+		tsg_kvp_i32(&w, "gemma4", "expert_feed_forward_length", EXPERT_INTER);
+	}
+
+	tsg_arch_embeddings(&w, s, 0);
+	tsg_add2(&w, "per_layer_token_embd.weight", (uint64_t)(PLE_DIM * s->n_layers),
+			 (uint64_t)s->vocab, 0.05f);
+	tsg_add2(&w, "per_layer_model_proj.weight", (uint64_t)s->dim, (uint64_t)(PLE_DIM * s->n_layers),
+			 0.05f);
+	tsg_add1(&w, "per_layer_proj_norm.weight", PLE_DIM, -1.0f);
+
+	for (int i = 0; i < s->n_layers; i++) {
+		int global = !sliding[i];
+		int hd	   = global ? head_global : head_swa;
+		int q_out  = s->n_heads * hd;
+		int kv_out = s->n_kv_heads * hd;
+		int has_kv = i < s->n_layers - SHARED_KV_LAYERS;
+
+		tsg_blk1(&w, i, "attn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_attention(&w, i, s->dim, q_out, kv_out, has_kv, has_kv && !global);
+		tsg_blk1(&w, i, "attn_q_norm.weight", (uint64_t)hd, -1.0f);
+		if (has_kv)
+			tsg_blk1(&w, i, "attn_k_norm.weight", (uint64_t)hd, -1.0f);
+		tsg_blk1(&w, i, "post_attention_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk1(&w, i, "ffn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk1(&w, i, "post_ffw_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_dense_ffn(&w, i, s->dim, s->intermediate);
+		if (moe) {
+			tsg_blk2(&w, i, "ffn_gate_inp.weight", (uint64_t)s->dim, N_EXPERTS, 0.30f);
+			tsg_blk1(&w, i, "ffn_gate_inp.scale", (uint64_t)s->dim, -1.0f);
+			tsg_blk3(&w, i, "ffn_gate_up_exps.weight", (uint64_t)s->dim, 2 * EXPERT_INTER,
+					 N_EXPERTS, 0.06f);
+			tsg_blk3(&w, i, "ffn_down_exps.weight", EXPERT_INTER, (uint64_t)s->dim, N_EXPERTS,
+					 0.06f);
+			tsg_blk1(&w, i, "pre_ffw_norm_2.weight", (uint64_t)s->dim, -1.0f);
+			tsg_blk1(&w, i, "post_ffw_norm_1.weight", (uint64_t)s->dim, -1.0f);
+			tsg_blk1(&w, i, "post_ffw_norm_2.weight", (uint64_t)s->dim, -1.0f);
+		}
+		tsg_blk1(&w, i, "post_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk2(&w, i, "inp_gate.weight", (uint64_t)s->dim, PLE_DIM, 0.08f);
+		tsg_blk2(&w, i, "proj.weight", PLE_DIM, (uint64_t)s->dim, 0.08f);
+		tsg_blk1(&w, i, "layer_output_scale.weight", 1, 0.05f)[0] = 0.9f;
+	}
+	free(sliding);
+
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
+void tsg_build_gemma4(const char *path, const tsg_arch_spec *s) {
+	tsg_build_gemma4_impl(path, s, 0);
+}
+
+void tsg_build_gemma4_moe(const char *path, const tsg_arch_spec *s) {
+	tsg_build_gemma4_impl(path, s, 1);
+}
+
+void tsg_build_qwen35(const char *path, const tsg_arch_spec *s) {
+	enum { CONV_KERNEL = 4, STATE = 16, KEY_HEADS = 2, VALUE_HEADS = 4, INTERVAL = 4 };
+	int inner	 = STATE * VALUE_HEADS;
+	int key_dim	 = STATE * KEY_HEADS;
+	int conv_dim = 2 * key_dim + inner;
+	int value_hd = inner / VALUE_HEADS;
+
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_seed(s->seed);
+
+	tsg_arch_header(&w, "qwen35", "qwen35", s);
+	tsg_kvp_i32(&w, "qwen35", "feed_forward_length", s->intermediate);
+	tsg_kvp_i32(&w, "qwen35", "attention.head_count_kv", s->n_kv_heads);
+	tsg_kvp_i32(&w, "qwen35", "attention.key_length", s->head_dim);
+	tsg_kvp_i32(&w, "qwen35", "rope.dimension_count", s->head_dim / 2);
+	tsg_kvp_i32(&w, "qwen35", "ssm.conv_kernel", CONV_KERNEL);
+	tsg_kvp_i32(&w, "qwen35", "ssm.inner_size", inner);
+	tsg_kvp_i32(&w, "qwen35", "ssm.state_size", STATE);
+	tsg_kvp_i32(&w, "qwen35", "ssm.time_step_rank", VALUE_HEADS);
+	tsg_kvp_i32(&w, "qwen35", "ssm.group_count", KEY_HEADS);
+	tsg_kvp_i32(&w, "qwen35", "attention.full_attention_interval", INTERVAL);
+	tsg_arch_embeddings(&w, s, 1);
+
+	int q_out  = s->n_heads * s->head_dim;
+	int kv_out = s->n_kv_heads * s->head_dim;
+	for (int i = 0; i < s->n_layers; i++) {
+		int recurrent = ((i + 1) % INTERVAL) != 0;
+		tsg_blk1(&w, i, "attn_norm.weight", (uint64_t)s->dim, -1.0f);
+		if (recurrent) {
+			tsg_blk2(&w, i, "attn_qkv.weight", (uint64_t)s->dim, (uint64_t)conv_dim, 0.08f);
+			tsg_blk2(&w, i, "attn_gate.weight", (uint64_t)s->dim, (uint64_t)inner, 0.08f);
+			tsg_blk2(&w, i, "ssm_conv1d.weight", CONV_KERNEL, (uint64_t)conv_dim, 0.20f);
+			tsg_blk1(&w, i, "ssm_dt.bias", VALUE_HEADS, 0.10f);
+			float *a = tsg_blk1(&w, i, "ssm_a", VALUE_HEADS, 0.50f);
+			for (int h = 0; h < VALUE_HEADS; h++)
+				a[h] = -(0.2f + fabsf(a[h]));
+			tsg_blk2(&w, i, "ssm_beta.weight", (uint64_t)s->dim, VALUE_HEADS, 0.08f);
+			tsg_blk2(&w, i, "ssm_alpha.weight", (uint64_t)s->dim, VALUE_HEADS, 0.08f);
+			tsg_blk1(&w, i, "ssm_norm.weight", (uint64_t)value_hd, -1.0f);
+			tsg_blk2(&w, i, "ssm_out.weight", (uint64_t)inner, (uint64_t)s->dim, 0.08f);
+		} else {
+			tsg_blk2(&w, i, "attn_q.weight", (uint64_t)s->dim, (uint64_t)(2 * q_out), 0.08f);
+			tsg_blk2(&w, i, "attn_k.weight", (uint64_t)s->dim, (uint64_t)kv_out, 0.08f);
+			tsg_blk2(&w, i, "attn_v.weight", (uint64_t)s->dim, (uint64_t)kv_out, 0.08f);
+			tsg_blk2(&w, i, "attn_output.weight", (uint64_t)q_out, (uint64_t)s->dim, 0.08f);
+			tsg_blk1(&w, i, "attn_q_norm.weight", (uint64_t)s->head_dim, -1.0f);
+			tsg_blk1(&w, i, "attn_k_norm.weight", (uint64_t)s->head_dim, -1.0f);
+		}
+		tsg_blk1(&w, i, "post_attention_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk_dense_ffn(&w, i, s->dim, s->intermediate);
+	}
+
+	if (tsg_finish(&w, path) != 0)
+		tsg_write_failed(path);
+	tsg_tensor_free_all(&w);
+}
+
+void tsg_build_glm5_next(const char *path, const tsg_arch_spec *s) {
+	enum {
+		CONV_KERNEL	 = 4,
+		KDA_HEAD	 = 16,
+		HC			 = 4,
+		SINKHORN	 = 2,
+		N_EXPERTS	 = 4,
+		N_USED		 = 2,
+		MOE_INTER	 = 16,
+		DENSE_LAYERS = 1,
+		Q_LORA		 = 32,
+		KV_LORA		 = 32,
+		QK_HEAD		 = 32,
+		V_HEAD		 = 32
+	};
+	const char *p		= "glm5-next";
+	int			d_inner = KDA_HEAD * s->n_heads;
+	uint64_t	hc_dim	= (uint64_t)HC * (uint64_t)s->dim;
+	uint64_t	hc_mix	= (uint64_t)(2 + HC) * HC;
+
+	int32_t *kv_arr = malloc((size_t)s->n_layers * sizeof(int32_t));
+	for (int i = 0; i < s->n_layers; i++)
+		kv_arr[i] = i % 4 == 3 ? s->n_heads : 0;
+
+	tsg_writer w;
+	tsg_winit(&w);
+	tsg_seed(s->seed);
+
+	tsg_arch_header(&w, p, p, s);
+	tsg_kvp_i32(&w, p, "feed_forward_length", s->intermediate);
+	tsg_kvp_arr_i32(&w, p, "attention.head_count_kv", kv_arr, (size_t)s->n_layers);
+	tsg_kvp_i32(&w, p, "attention.q_lora_rank", Q_LORA);
+	tsg_kvp_i32(&w, p, "attention.kv_lora_rank", KV_LORA);
+	tsg_kvp_i32(&w, p, "attention.key_length_mla", QK_HEAD);
+	tsg_kvp_i32(&w, p, "attention.value_length_mla", V_HEAD);
+	tsg_kvp_i32(&w, p, "rope.dimension_count", 0);
+	tsg_kvp_i32(&w, p, "expert_count", N_EXPERTS);
+	tsg_kvp_i32(&w, p, "expert_used_count", N_USED);
+	tsg_kvp_i32(&w, p, "expert_shared_count", 1);
+	tsg_kvp_i32(&w, p, "expert_feed_forward_length", MOE_INTER);
+	tsg_kvp_i32(&w, p, "leading_dense_block_count", DENSE_LAYERS);
+	tsg_kvp_i32(&w, p, "ssm.conv_kernel", CONV_KERNEL);
+	tsg_kvp_i32(&w, p, "kda.head_dim", KDA_HEAD);
+	tsg_kvp_i32(&w, p, "hyper_connection.count", HC);
+	tsg_kvp_i32(&w, p, "hyper_connection.sinkhorn_iterations", SINKHORN);
+	tsg_kvp_f32(&w, p, "hyper_connection.epsilon", 1e-6f);
+	tsg_arch_embeddings(&w, s, 1);
+
+	for (int i = 0; i < s->n_layers; i++) {
+		tsg_blk1(&w, i, "attn_norm.weight", (uint64_t)s->dim, -1.0f);
+		tsg_blk2(&w, i, "hc_attn_fn.weight", hc_dim, hc_mix, 0.05f);
+		tsg_blk1(&w, i, "hc_attn_base.weight", hc_mix, 0.05f);
+		tsg_blk1(&w, i, "hc_attn_scale.weight", 3, 0.20f);
+		tsg_blk2(&w, i, "hc_ffn_fn.weight", hc_dim, hc_mix, 0.05f);
+		tsg_blk1(&w, i, "hc_ffn_base.weight", hc_mix, 0.05f);
+		tsg_blk1(&w, i, "hc_ffn_scale.weight", 3, 0.20f);
+
+		if (kv_arr[i] == 0) {
+			tsg_blk2(&w, i, "attn_q.weight", (uint64_t)s->dim, (uint64_t)d_inner, 0.08f);
+			tsg_blk2(&w, i, "attn_k.weight", (uint64_t)s->dim, (uint64_t)d_inner, 0.08f);
+			tsg_blk2(&w, i, "attn_v.weight", (uint64_t)s->dim, (uint64_t)d_inner, 0.08f);
+			tsg_blk2(&w, i, "attn_output.weight", (uint64_t)d_inner, (uint64_t)s->dim, 0.08f);
+			tsg_blk2(&w, i, "ssm_f_a.weight", (uint64_t)s->dim, KDA_HEAD, 0.08f);
+			tsg_blk2(&w, i, "ssm_f_b.weight", KDA_HEAD, (uint64_t)d_inner, 0.08f);
+			tsg_blk2(&w, i, "ssm_g_a.weight", (uint64_t)s->dim, KDA_HEAD, 0.08f);
+			tsg_blk2(&w, i, "ssm_g_b.weight", KDA_HEAD, (uint64_t)d_inner, 0.08f);
+			tsg_blk2(&w, i, "ssm_beta.weight", (uint64_t)s->dim, (uint64_t)s->n_heads, 0.08f);
+			tsg_blk1(&w, i, "ssm_a", (uint64_t)s->n_heads, 0.20f);
+			tsg_blk1(&w, i, "ssm_dt.bias", (uint64_t)d_inner, 0.10f);
+			tsg_blk1(&w, i, "ssm_norm.weight", KDA_HEAD, -1.0f);
+			tsg_blk2(&w, i, "ssm_conv1d_q.weight", CONV_KERNEL, (uint64_t)d_inner, 0.20f);
+			tsg_blk2(&w, i, "ssm_conv1d_k.weight", CONV_KERNEL, (uint64_t)d_inner, 0.20f);
+			tsg_blk2(&w, i, "ssm_conv1d_v.weight", CONV_KERNEL, (uint64_t)d_inner, 0.20f);
+		} else {
+			tsg_blk_mla(&w, i, s->dim, s->n_heads, Q_LORA, KV_LORA, QK_HEAD, QK_HEAD, V_HEAD);
+		}
+
+		tsg_blk1(&w, i, "ffn_norm.weight", (uint64_t)s->dim, -1.0f);
+		if (i < DENSE_LAYERS) {
+			tsg_blk_dense_ffn(&w, i, s->dim, s->intermediate);
+			continue;
+		}
+		tsg_blk2(&w, i, "ffn_gate_inp.weight", (uint64_t)s->dim, N_EXPERTS, 0.30f);
+		tsg_blk2(&w, i, "ffn_gate_shexp.weight", (uint64_t)s->dim, MOE_INTER, 0.06f);
+		tsg_blk2(&w, i, "ffn_up_shexp.weight", (uint64_t)s->dim, MOE_INTER, 0.06f);
+		tsg_blk2(&w, i, "ffn_down_shexp.weight", MOE_INTER, (uint64_t)s->dim, 0.06f);
+		tsg_blk3(&w, i, "ffn_gate_exps.weight", (uint64_t)s->dim, MOE_INTER, N_EXPERTS, 0.06f);
+		tsg_blk3(&w, i, "ffn_up_exps.weight", (uint64_t)s->dim, MOE_INTER, N_EXPERTS, 0.06f);
+		tsg_blk3(&w, i, "ffn_down_exps.weight", MOE_INTER, (uint64_t)s->dim, N_EXPERTS, 0.06f);
+	}
+	free(kv_arr);
 
 	if (tsg_finish(&w, path) != 0)
 		tsg_write_failed(path);
