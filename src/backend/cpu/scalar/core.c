@@ -57,8 +57,6 @@ typedef struct {
 	float		 scale;
 } mla_job;
 
-static const float KDA_L2_EPS = 1e-6f;
-
 void detect_features(char *buf, size_t cap) {
 	snprintf(buf, cap, "generic");
 }
@@ -77,8 +75,8 @@ static void cpu_rope_one(float *v, int n_heads, int head_dim, const float *rope_
 			float s			= rope_sin[j];
 			float v0		= vh[2 * j];
 			float v1		= vh[(2 * j) + 1];
-			vh[2 * j]		= (v0 * c) - (v1 * s);
-			vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+			vh[2 * j]		= fmaf(-v1, s, v0 * c);
+			vh[(2 * j) + 1] = fmaf(v1, c, v0 * s);
 		}
 	}
 }
@@ -214,13 +212,13 @@ static void cpu_rope_ext_batch_chunk(int begin, int end, int tid, void *ctx) {
 					if (j->neox) {
 						float v0	  = vh[jj];
 						float v1	  = vh[jj + half];
-						vh[jj]		  = (v0 * c) - (v1 * s);
-						vh[jj + half] = (v0 * s) + (v1 * c);
+						vh[jj]		  = fmaf(-v1, s, v0 * c);
+						vh[jj + half] = fmaf(v1, c, v0 * s);
 					} else {
 						float v0		 = vh[2 * jj];
 						float v1		 = vh[(2 * jj) + 1];
-						vh[2 * jj]		 = (v0 * c) - (v1 * s);
-						vh[(2 * jj) + 1] = (v0 * s) + (v1 * c);
+						vh[2 * jj]		 = fmaf(-v1, s, v0 * c);
+						vh[(2 * jj) + 1] = fmaf(v1, c, v0 * s);
 					}
 				}
 			}
@@ -276,29 +274,7 @@ float dot8(const float *restrict a, const float *restrict b, int head_dim) {
 }
 
 float dot8_f16(const float *restrict a, const uint16_t *restrict b, int head_dim) {
-	float a0	  = 0;
-	float a1	  = 0;
-	float a2	  = 0;
-	float a3	  = 0;
-	int	  d		  = 0;
-	int	  hd_main = head_dim - (head_dim % 8);
-	for (; d < hd_main; d += 8) {
-		float b0 = f16_to_f32(b[d]);
-		float b1 = f16_to_f32(b[d + 1]);
-		float b2 = f16_to_f32(b[d + 2]);
-		float b3 = f16_to_f32(b[d + 3]);
-		float b4 = f16_to_f32(b[d + 4]);
-		float b5 = f16_to_f32(b[d + 5]);
-		float b6 = f16_to_f32(b[d + 6]);
-		float b7 = f16_to_f32(b[d + 7]);
-		a0 += (a[d] * b0) + (a[d + 4] * b4);
-		a1 += (a[d + 1] * b1) + (a[d + 5] * b5);
-		a2 += (a[d + 2] * b2) + (a[d + 6] * b6);
-		a3 += (a[d + 3] * b3) + (a[d + 7] * b7);
-	}
-	for (; d < head_dim; d++)
-		a0 += a[d] * f16_to_f32(b[d]);
-	return (a0 + a1) + (a2 + a3);
+	return num_dot_f32_f16(a, b, head_dim);
 }
 
 static inline float dot8_q8_0(const float *restrict a, const uint8_t *restrict block_ptr,
@@ -387,24 +363,41 @@ static void cpu_attention_inner(const uint16_t *k_slice, const uint16_t *v_slice
 		float M					= -INFINITY;
 		float S					= 0.0f;
 		float VKQ[HEAD_DIM_MAX] = {0};
-		for (int t = 0; t < n_pos; t++) {
-			const uint16_t *kt = k_slice + ((size_t)t * kv_stride);
-			float			ss = dot8_f16(qh, kt, head_dim) * scale;
-			float			ms = 1.0f;
-			float			vs = 1.0f;
-			if (ss > M) {
-				float Mold = M;
-				M		   = ss;
-				ms		   = num_expf(Mold - M);
+		int	  t					= 0;
+		for (; t + NUM_ATTN_BLOCK <= n_pos; t += NUM_ATTN_BLOCK) {
+			float sb[NUM_ATTN_BLOCK];
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++)
+				sb[i] = dot8_f16(qh, k_slice + ((size_t)(t + i) * kv_stride), head_dim) * scale;
+			float bmax	= fmaxf(fmaxf(sb[0], sb[1]), fmaxf(sb[2], sb[3]));
+			float M_new = bmax > M ? bmax : M;
+			float alpha = (S > 0.0f && bmax > M) ? num_expf(M - M_new) : 1.0f;
+			float w[NUM_ATTN_BLOCK];
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++)
+				w[i] = num_expf(sb[i] - M_new);
+			if (alpha != 1.0f)
 				for (int d = 0; d < head_dim; d++)
-					VKQ[d] *= ms;
-			} else {
-				vs = num_expf(ss - M);
+					VKQ[d] *= alpha;
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++) {
+				const uint16_t *vt = v_slice + ((size_t)(t + i) * kv_stride);
+				for (int d = 0; d < head_dim; d++)
+					VKQ[d] = fmaf(f16_to_f32(vt[d]), w[i], VKQ[d]);
 			}
+			S = fmaf(S, alpha, attn_block_sum4(w));
+			M = M_new;
+		}
+		for (; t < n_pos; t++) {
+			float ss	= dot8_f16(qh, k_slice + ((size_t)t * kv_stride), head_dim) * scale;
+			float M_new = ss > M ? ss : M;
+			float alpha = S > 0.0f ? num_expf(M - M_new) : 1.0f;
+			float vs	= num_expf(ss - M_new);
+			if (alpha != 1.0f)
+				for (int d = 0; d < head_dim; d++)
+					VKQ[d] *= alpha;
 			const uint16_t *vt = v_slice + ((size_t)t * kv_stride);
 			for (int d = 0; d < head_dim; d++)
 				VKQ[d] = fmaf(f16_to_f32(vt[d]), vs, VKQ[d]);
-			S = (S * ms) + vs;
+			S = fmaf(S, alpha, vs);
+			M = M_new;
 		}
 		float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
 		for (int d = 0; d < head_dim; d++)
@@ -806,81 +799,25 @@ status_code cpu_argmax(backend *self, const buffer *logits, int n, int32_t *out_
 }
 
 static void cpu_attn_mla_head_compute(const cpu_attn_mla_job *j, int h) {
-	const int	half_rope = j->qk_rope / 2;
-	const int	n_pos	  = j->pos + 1;
-	const float scale	  = j->scale;
-
-	float q_h[HEAD_DIM_MAX];
-	float q_absorbed[HEAD_DIM_MAX];
-	float VKQ_latent[HEAD_DIM_MAX];
-
-	const float *q_src = j->qf + ((size_t)h * j->qk_head);
-	for (int d = 0; d < j->qk_head; d++)
-		q_h[d] = q_src[d];
-	const float *q_rope_cos = j->rope_cos_base + ((size_t)j->pos * half_rope);
-	const float *q_rope_sin = j->rope_sin_base + ((size_t)j->pos * half_rope);
-	for (int k = 0; k < half_rope; k++) {
-		float c						  = q_rope_cos[k];
-		float s						  = q_rope_sin[k];
-		float a						  = q_h[j->qk_nope + (2 * k)];
-		float b						  = q_h[j->qk_nope + (2 * k) + 1];
-		q_h[j->qk_nope + (2 * k)]	  = (a * c) - (b * s);
-		q_h[j->qk_nope + (2 * k) + 1] = (a * s) + (b * c);
-	}
-
-	const float *k_b_h = j->k_b + ((size_t)h * j->qk_nope * j->kv_lora);
-	const float *v_b_h = j->v_b + ((size_t)h * j->kv_lora * j->v_head);
-
-	for (int i = 0; i < j->kv_lora; i++) {
-		float		 acc = 0.0f;
-		const float *row = k_b_h + ((size_t)i * j->qk_nope);
-		for (int d = 0; d < j->qk_nope; d++)
-			acc += row[d] * q_h[d];
-		q_absorbed[i] = acc;
-	}
-	const float *q_rope_part = q_h + j->qk_nope;
-
-	float M = -INFINITY;
-	float S = 0.0f;
-	memset(VKQ_latent, 0, (size_t)j->kv_lora * sizeof(float));
-	for (int t = 0; t < n_pos; t++) {
-		const float *slot	  = j->layer_c + ((size_t)t * j->total_dim);
-		const float *latent	  = slot;
-		const float *k_pe_rot = j->k_pe_rot_all + ((size_t)t * j->qk_rope);
-
-		float score = 0.0f;
-		for (int i = 0; i < j->kv_lora; i++)
-			score += latent[i] * q_absorbed[i];
-		for (int d = 0; d < j->qk_rope; d++)
-			score += q_rope_part[d] * k_pe_rot[d];
-		score *= scale;
-
-		float ms = 1.0f;
-		float vs = 1.0f;
-		if (score > M) {
-			float Mold = M;
-			M		   = score;
-			ms		   = num_expf(Mold - M);
-			for (int i = 0; i < j->kv_lora; i++)
-				VKQ_latent[i] *= ms;
-		} else {
-			vs = num_expf(score - M);
-		}
-		for (int i = 0; i < j->kv_lora; i++)
-			VKQ_latent[i] = fmaf(latent[i], vs, VKQ_latent[i]);
-		S = (S * ms) + vs;
-	}
-	float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
-	float VKQ[HEAD_DIM_MAX];
-	for (int d = 0; d < j->v_head; d++) {
-		float		 acc = 0.0f;
-		const float *row = v_b_h + ((size_t)d * j->kv_lora);
-		for (int i = 0; i < j->kv_lora; i++)
-			acc += VKQ_latent[i] * row[i];
-		VKQ[d] = acc * S_inv;
-	}
-	for (int d = 0; d < j->v_head; d++)
-		j->outf[((size_t)h * j->v_head) + d] = VKQ[d];
+	int				  half_rope = j->qk_rope / 2;
+	cpu_mla_head_args args		= {
+		.q_src		  = j->qf + ((size_t)h * j->qk_head),
+		.rope_cos	  = j->rope_cos_base + ((size_t)j->pos * half_rope),
+		.rope_sin	  = j->rope_sin_base + ((size_t)j->pos * half_rope),
+		.k_b_h		  = j->k_b + ((size_t)h * j->qk_nope * j->kv_lora),
+		.v_b_h		  = j->v_b + ((size_t)h * j->kv_lora * j->v_head),
+		.layer_c	  = j->layer_c,
+		.k_pe_rot_all = j->k_pe_rot_all,
+		.qk_head	  = j->qk_head,
+		.qk_nope	  = j->qk_nope,
+		.qk_rope	  = j->qk_rope,
+		.kv_lora	  = j->kv_lora,
+		.v_head		  = j->v_head,
+		.total_dim	  = j->total_dim,
+		.n_pos		  = j->pos + 1,
+		.scale		  = j->scale,
+	};
+	cpu_mla_head_canonical(&args, j->outf + ((size_t)h * j->v_head));
 }
 
 static void cpu_attn_mla_head_chunk(int begin, int end, int tid, void *ctx) {
@@ -936,8 +873,8 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 			float s			 = t_rope_sin[j];
 			float a			 = k_pe[2 * j];
 			float b			 = k_pe[(2 * j) + 1];
-			dst[2 * j]		 = (a * c) - (b * s);
-			dst[(2 * j) + 1] = (a * s) + (b * c);
+			dst[2 * j]		 = fmaf(-b, s, a * c);
+			dst[(2 * j) + 1] = fmaf(b, c, a * s);
 		}
 		p->mla_krot.n_pos_cached = n_pos;
 	} else {
@@ -952,8 +889,8 @@ status_code cpu_attention_mla(backend *self, const buffer *q, const buffer *kv_c
 				float s			 = t_rope_sin[j];
 				float a			 = k_pe[2 * j];
 				float b			 = k_pe[(2 * j) + 1];
-				dst[2 * j]		 = (a * c) - (b * s);
-				dst[(2 * j) + 1] = (a * s) + (b * c);
+				dst[2 * j]		 = fmaf(-b, s, a * c);
+				dst[(2 * j) + 1] = fmaf(b, c, a * s);
 			}
 		}
 		p->mla_krot.layer_c_cached	 = layer_c;
@@ -1152,22 +1089,19 @@ static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, floa
 		float  mx  = col[0];
 		for (int d = 1; d < HC; d++)
 			mx = fmaxf(mx, col[d]);
-		float sum = 0.0f;
-		for (int d = 0; d < HC; d++) {
+		for (int d = 0; d < HC; d++)
 			col[d] = num_expf(col[d] - mx);
-			sum += col[d];
-		}
+		float sum = (col[0] + col[1]) + (col[2] + col[3]);
 		for (int d = 0; d < HC; d++)
 			col[d] = col[d] / sum + eps;
 	}
 	for (int it = 0; it < iters; it++) {
 		if (it > 0) {
 			for (int src = 0; src < HC; src++) {
-				float sum = eps;
+				float *r   = comb + src * HC;
+				float  sum = eps + ((r[0] + r[1]) + (r[2] + r[3]));
 				for (int d = 0; d < HC; d++)
-					sum += comb[src * HC + d];
-				for (int d = 0; d < HC; d++)
-					comb[src * HC + d] /= sum;
+					r[d] /= sum;
 			}
 		}
 		for (int d = 0; d < HC; d++) {
@@ -1201,13 +1135,13 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 	}
 	float *comb = d->coef + hc;
 	for (int j = 0; j < hc * hc; j++)
-		comb[j] = mixes[2 * hc + j] * d->scale[2] + d->base[2 * hc + j];
+		comb[j] = fmaf(mixes[2 * hc + j], d->scale[2], d->base[2 * hc + j]);
 	hc_sinkhorn(comb, d->sinkhorn_iters, d->eps);
 
 	for (int i = 0; i < dim; i++) {
 		float acc = 0.0f;
 		for (int h = 0; h < hc; h++)
-			acc += pre[h] * d->stream[(size_t)h * dim + i];
+			acc = fmaf(pre[h], d->stream[(size_t)h * dim + i], acc);
 		d->x[i] = acc;
 	}
 	return OK;
@@ -1224,7 +1158,7 @@ status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 		for (int i = 0; i < dim; i++) {
 			float acc = d->sub[i] * post[dst_h];
 			for (int src_h = 0; src_h < hc; src_h++)
-				acc += d->hc_cur[(size_t)src_h * dim + i] * comb[dst_h + src_h * hc];
+				acc = fmaf(d->hc_cur[(size_t)src_h * dim + i], comb[dst_h + src_h * hc], acc);
 			dst[i] = acc;
 		}
 	}
@@ -1232,67 +1166,17 @@ status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 }
 
 static void l2_normalize_heads(float *x, int n_heads, int head_dim) {
-	for (int h = 0; h < n_heads; h++) {
-		float *v  = x + (size_t)h * head_dim;
-		float  ss = 0.0f;
-		for (int i = 0; i < head_dim; i++)
-			ss += v[i] * v[i];
-		float inv = 1.0f / sqrtf(ss + KDA_L2_EPS);
-		for (int i = 0; i < head_dim; i++)
-			v[i] *= inv;
-	}
+	cpu_l2_normalize_heads(x, n_heads, head_dim);
 }
 
 static void causal_conv_silu(float *state, const float *w, float *x, int channels, int kernel) {
-	const int hist = kernel - 1;
-	for (int c = 0; c < channels; c++) {
-		float		*h	 = state + (size_t)c * hist;
-		const float *wc	 = w + (size_t)c * kernel;
-		float		 sum = x[c] * wc[kernel - 1];
-		for (int k = 0; k < hist; k++)
-			sum += h[k] * wc[k];
-		memmove(h, h + 1, (size_t)(hist - 1) * sizeof(float));
-		h[hist - 1] = x[c];
-		x[c]		= silu(sum);
-	}
+	cpu_causal_conv_silu(state, w, x, channels, kernel);
 }
 
 static void kda_heads(int begin, int end, int tid, void *arg) {
 	(void)tid;
-	kda_job	   *j	  = arg;
-	const int	S	  = j->head_dim;
-	const float scale = 1.0f / sqrtf((float)S);
-	float		delta[512];
-	for (int h = begin; h < end; h++) {
-		float		*M = j->state + (size_t)h * S * S;
-		const float *q = j->q + (size_t)h * S;
-		const float *k = j->k + (size_t)h * S;
-		const float *v = j->v + (size_t)h * S;
-		const float *g = j->g + (size_t)h * S;
-		float		*o = j->out + (size_t)h * S;
-		float		 b = j->beta[h];
-		float		 decay[512];
-		for (int i = 0; i < S; i++)
-			decay[i] = num_expf(g[i]);
-		for (int r = 0; r < S; r++) {
-			float *row = M + (size_t)r * S;
-			float  dot = 0.0f;
-			for (int i = 0; i < S; i++) {
-				row[i] *= decay[i];
-				dot += row[i] * k[i];
-			}
-			delta[r] = (v[r] - dot) * b;
-		}
-		for (int r = 0; r < S; r++) {
-			float *row = M + (size_t)r * S;
-			float  dot = 0.0f;
-			for (int i = 0; i < S; i++) {
-				row[i] += delta[r] * k[i];
-				dot += row[i] * q[i];
-			}
-			o[r] = dot * scale;
-		}
-	}
+	kda_job *j = arg;
+	cpu_kda_heads_range(j->state, j->q, j->k, j->v, j->g, j->beta, j->out, j->head_dim, begin, end);
 }
 
 status_code cpu_kda(backend *self, const kda_host_desc *d) {
@@ -1328,20 +1212,7 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 		st = matmul_vec(self, &d->beta, d->x, beta, H, dim);
 	if (st != OK)
 		return st;
-	const float lb = d->gate_lower_bound;
-	for (int h = 0; h < H; h++) {
-		for (int i = 0; i < S; i++) {
-			int	  idx = h * S + i;
-			float t	  = g[idx] + d->dt_bias[idx];
-			if (lb > -INFINITY) {
-				g[idx] = lb * sigmoidf(-(t * d->ssm_a[h]));
-			} else {
-				float sp = t > 20.0f ? t : log1pf(num_expf(t));
-				g[idx]	 = sp * d->ssm_a[h];
-			}
-		}
-		beta[h] = sigmoidf(beta[h]);
-	}
+	cpu_kda_gates(g, beta, d->dt_bias, d->ssm_a, H, S, d->gate_lower_bound);
 
 	kda_job job	 = {d->state, q, k, v, g, beta, o, S};
 	tpool  *pool = self->get_pool ? self->get_pool(self) : NULL;
@@ -1365,43 +1236,13 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 }
 
 static void mla_heads(int begin, int end, int tid, void *arg) {
-	mla_job	 *j	  = arg;
-	float	 *sc  = j->scratch + (size_t)(tid < 0 ? 0 : tid) * j->scratch_stride;
-	float	 *lat = sc + j->n_pos;
-	const int R	  = j->kv_lora;
-	for (int h = begin; h < end; h++) {
-		const float *qa = j->q_abs + (size_t)h * R;
-		float		 mx = -INFINITY;
-		for (int t = 0; t < j->n_pos; t++) {
-			const float *kv = j->cache + (size_t)t * R;
-			float		 s	= 0.0f;
-			for (int r = 0; r < R; r++)
-				s += qa[r] * kv[r];
-			sc[t] = s * j->scale;
-			mx	  = fmaxf(mx, sc[t]);
-		}
-		float sum = 0.0f;
-		for (int t = 0; t < j->n_pos; t++) {
-			sc[t] = num_expf(sc[t] - mx);
-			sum += sc[t];
-		}
-		memset(lat, 0, (size_t)R * sizeof(float));
-		for (int t = 0; t < j->n_pos; t++) {
-			const float *kv = j->cache + (size_t)t * R;
-			float		 p	= sc[t] / sum;
-			for (int r = 0; r < R; r++)
-				lat[r] += p * kv[r];
-		}
-		const float *vb = j->v_b + (size_t)h * j->v_head * R;
-		float		*o	= j->out + (size_t)h * j->v_head;
-		for (int d = 0; d < j->v_head; d++) {
-			const float *row = vb + (size_t)d * R;
-			float		 s	 = 0.0f;
-			for (int r = 0; r < R; r++)
-				s += row[r] * lat[r];
-			o[d] = s;
-		}
-	}
+	mla_job			*j	  = arg;
+	float			*sc	  = j->scratch + (size_t)(tid < 0 ? 0 : tid) * j->scratch_stride;
+	float			*lat  = sc + j->n_pos;
+	cpu_mla_abs_args args = {j->q_abs, j->cache,   j->v_b,	  j->out,
+							 j->n_pos, j->kv_lora, j->v_head, j->scale};
+	for (int h = begin; h < end; h++)
+		cpu_mla_abs_head(&args, h, sc, lat);
 }
 
 status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
@@ -1432,13 +1273,8 @@ status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
 	for (int h = 0; h < H; h++) {
 		const float *qh = q + (size_t)h * qk;
 		const float *kh = d->k_b + (size_t)h * R * qk;
-		for (int r = 0; r < R; r++) {
-			const float *row = kh + (size_t)r * qk;
-			float		 s	 = 0.0f;
-			for (int i = 0; i < qk; i++)
-				s += row[i] * qh[i];
-			q_abs[(size_t)h * R + r] = s;
-		}
+		for (int r = 0; r < R; r++)
+			q_abs[(size_t)h * R + r] = dot_f32(kh + (size_t)r * qk, qh, qk);
 	}
 
 	mla_job job	 = {q_abs,			d->latent_cache,		d->v_b, ho, scr, n_pos, R, vh,

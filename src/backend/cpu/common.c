@@ -2218,6 +2218,156 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	return OK;
 }
 
+void cpu_mla_head_canonical(const cpu_mla_head_args *a, float *out_h) {
+	float q_h[HEAD_DIM_MAX];
+	float q_absorbed[HEAD_DIM_MAX];
+	float VKQ_latent[HEAD_DIM_MAX];
+
+	memcpy(q_h, a->q_src, (size_t)a->qk_head * sizeof(float));
+	int half_rope = a->qk_rope / 2;
+	for (int k = 0; k < half_rope; k++) {
+		float c						  = a->rope_cos[k];
+		float s						  = a->rope_sin[k];
+		float x						  = q_h[a->qk_nope + (2 * k)];
+		float y						  = q_h[a->qk_nope + (2 * k) + 1];
+		q_h[a->qk_nope + (2 * k)]	  = fmaf(-y, s, x * c);
+		q_h[a->qk_nope + (2 * k) + 1] = fmaf(y, c, x * s);
+	}
+
+	for (int i = 0; i < a->kv_lora; i++)
+		q_absorbed[i] = dot_f32(a->k_b_h + ((size_t)i * a->qk_nope), q_h, a->qk_nope);
+	const float *q_rope_part = q_h + a->qk_nope;
+
+	float M = -INFINITY;
+	float S = 0.0f;
+	memset(VKQ_latent, 0, (size_t)a->kv_lora * sizeof(float));
+	for (int t = 0; t < a->n_pos; t++) {
+		const float *latent	  = a->layer_c + ((size_t)t * a->total_dim);
+		const float *k_pe_rot = a->k_pe_rot_all + ((size_t)t * a->qk_rope);
+
+		float score =
+			(dot_f32(latent, q_absorbed, a->kv_lora) + dot_f32(q_rope_part, k_pe_rot, a->qk_rope)) *
+			a->scale;
+
+		float ms = 1.0f;
+		float vs = 1.0f;
+		if (score > M) {
+			float M_old = M;
+			M			= score;
+			ms			= num_expf(M_old - M);
+			for (int i = 0; i < a->kv_lora; i++)
+				VKQ_latent[i] *= ms;
+		} else {
+			vs = num_expf(score - M);
+		}
+		for (int i = 0; i < a->kv_lora; i++)
+			VKQ_latent[i] = fmaf(latent[i], vs, VKQ_latent[i]);
+		S = fmaf(S, ms, vs);
+	}
+
+	float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
+	for (int d = 0; d < a->v_head; d++)
+		out_h[d] = dot_f32(a->v_b_h + ((size_t)d * a->kv_lora), VKQ_latent, a->kv_lora) * S_inv;
+}
+
+#define KDA_L2_EPS_CANON 1e-6f
+
+void cpu_l2_normalize_heads(float *x, int n_heads, int head_dim) {
+	for (int h = 0; h < n_heads; h++) {
+		float *v   = x + (size_t)h * head_dim;
+		float  inv = 1.0f / sqrtf(dot_f32(v, v, head_dim) + KDA_L2_EPS_CANON);
+		for (int i = 0; i < head_dim; i++)
+			v[i] *= inv;
+	}
+}
+
+void cpu_causal_conv_silu(float *state, const float *w, float *x, int channels, int kernel) {
+	const int hist = kernel - 1;
+	for (int c = 0; c < channels; c++) {
+		float		*h	 = state + (size_t)c * hist;
+		const float *wc	 = w + (size_t)c * kernel;
+		float		 sum = x[c] * wc[kernel - 1];
+		for (int k = 0; k < hist; k++)
+			sum = fmaf(h[k], wc[k], sum);
+		memmove(h, h + 1, (size_t)(hist - 1) * sizeof(float));
+		h[hist - 1] = x[c];
+		x[c]		= silu(sum);
+	}
+}
+
+void cpu_kda_gates(float *g, float *beta, const float *dt_bias, const float *ssm_a, int n_heads,
+				   int head_dim, float lower_bound) {
+	for (int h = 0; h < n_heads; h++) {
+		for (int i = 0; i < head_dim; i++) {
+			int	  idx = h * head_dim + i;
+			float t	  = g[idx] + dt_bias[idx];
+			if (lower_bound > -INFINITY) {
+				g[idx] = lower_bound * sigmoidf(-(t * ssm_a[h]));
+			} else {
+				float sp = t > 20.0f ? t : log1pf(num_expf(t));
+				g[idx]	 = sp * ssm_a[h];
+			}
+		}
+		beta[h] = sigmoidf(beta[h]);
+	}
+}
+
+void cpu_kda_heads_range(float *state, const float *q, const float *k, const float *v,
+						 const float *g, const float *beta, float *out, int S, int begin, int end) {
+	const float scale = 1.0f / sqrtf((float)S);
+	float		delta[512];
+	float		decay[512];
+	for (int h = begin; h < end; h++) {
+		float		*M	= state + (size_t)h * S * S;
+		const float *qh = q + (size_t)h * S;
+		const float *kh = k + (size_t)h * S;
+		const float *vh = v + (size_t)h * S;
+		const float *gh = g + (size_t)h * S;
+		float		*oh = out + (size_t)h * S;
+		float		 b	= beta[h];
+		for (int i = 0; i < S; i++)
+			decay[i] = num_expf(gh[i]);
+		for (int r = 0; r < S; r++) {
+			float *row = M + (size_t)r * S;
+			for (int i = 0; i < S; i++)
+				row[i] *= decay[i];
+			delta[r] = (vh[r] - dot_f32(row, kh, S)) * b;
+		}
+		for (int r = 0; r < S; r++) {
+			float *row = M + (size_t)r * S;
+			for (int i = 0; i < S; i++)
+				row[i] = fmaf(delta[r], kh[i], row[i]);
+			oh[r] = dot_f32(row, qh, S) * scale;
+		}
+	}
+}
+
+void cpu_mla_abs_head(const cpu_mla_abs_args *a, int h, float *sc, float *lat) {
+	const int	 R	= a->kv_lora;
+	const float *qa = a->q_abs + (size_t)h * R;
+	float		 mx = -INFINITY;
+	for (int t = 0; t < a->n_pos; t++) {
+		sc[t] = dot_f32(qa, a->cache + (size_t)t * R, R) * a->scale;
+		mx	  = fmaxf(mx, sc[t]);
+	}
+	float sum = 0.0f;
+	for (int t = 0; t < a->n_pos; t++) {
+		sc[t] = num_expf(sc[t] - mx);
+		sum += sc[t];
+	}
+	memset(lat, 0, (size_t)R * sizeof(float));
+	for (int t = 0; t < a->n_pos; t++) {
+		const float *kv = a->cache + (size_t)t * R;
+		float		 p	= sc[t] / sum;
+		for (int r = 0; r < R; r++)
+			lat[r] = fmaf(kv[r], p, lat[r]);
+	}
+	const float *vb = a->v_b + (size_t)h * a->v_head * R;
+	float		*o	= a->out + (size_t)h * a->v_head;
+	for (int d = 0; d < a->v_head; d++)
+		o[d] = dot_f32(vb + (size_t)d * R, lat, R);
+}
+
 float rmsnorm_sum_sq(const float *x, int n) {
 	float lane[NUM_RMS_LANES];
 	int	  used = n < NUM_RMS_LANES ? n : NUM_RMS_LANES;

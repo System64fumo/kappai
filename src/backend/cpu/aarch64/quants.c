@@ -7526,184 +7526,113 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 	}
 }
 
+static inline float neon_dot16_finish(float32x4_t acc0, float32x4_t acc1, float32x4_t acc2,
+									  float32x4_t acc3, const float *a, const float *b, int j,
+									  int k) {
+	if (j < k) {
+		float lane[NUM_DOT_LANES];
+		vst1q_f32(lane, acc0);
+		vst1q_f32(lane + 4, acc1);
+		vst1q_f32(lane + 8, acc2);
+		vst1q_f32(lane + 12, acc3);
+		for (; j < k; j++)
+			lane[j & (NUM_DOT_LANES - 1)] = fmaf(a[j], b[j], lane[j & (NUM_DOT_LANES - 1)]);
+		acc0 = vld1q_f32(lane);
+		acc1 = vld1q_f32(lane + 4);
+		acc2 = vld1q_f32(lane + 8);
+		acc3 = vld1q_f32(lane + 12);
+	}
+	acc0			 = vaddq_f32(acc0, acc2);
+	acc1			 = vaddq_f32(acc1, acc3);
+	acc0			 = vaddq_f32(acc0, acc1);
+	float32x2_t pair = vadd_f32(vget_low_f32(acc0), vget_high_f32(acc0));
+	return vget_lane_f32(pair, 0) + vget_lane_f32(pair, 1);
+}
+
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {
-	const float *xp = x;
-	float		*yp = y;
-	const int	 mr = 8;
-	int			 i	= 0;
+	const int mr = 4;
+	int		  i	 = 0;
 	for (; i + mr <= n; i += mr) {
-		const float *rows[8];
-		for (int r = 0; r < 8; r++)
+		const float *rows[4];
+		float32x4_t	 acc[4][4];
+		for (int r = 0; r < mr; r++) {
 			rows[r] = w + ((size_t)(i + r) * k);
-		float32x4_t accA[8], accB[8];
-		for (int r = 0; r < 8; r++)
-			accA[r] = accB[r] = vdupq_n_f32(0.0f);
+			for (int q = 0; q < 4; q++)
+				acc[r][q] = vdupq_n_f32(0.0f);
+		}
 		int j = 0;
-		for (; j + 32 <= k; j += 32) {
-			PREFETCH(xp + j + PF_ELEMS(128));
-			for (int r = 0; r < 8; r++)
+		for (; j + 16 <= k; j += 16) {
+			PREFETCH(x + j + PF_ELEMS(128));
+			float32x4_t xv[4];
+			for (int q = 0; q < 4; q++)
+				xv[q] = vld1q_f32(x + j + (4 * q));
+			for (int r = 0; r < mr; r++) {
 				PREFETCH(rows[r] + j + PF_ELEMS(128));
-			float32x4_t x0 = vld1q_f32(xp + j);
-			float32x4_t x1 = vld1q_f32(xp + j + 4);
-			float32x4_t x2 = vld1q_f32(xp + j + 8);
-			float32x4_t x3 = vld1q_f32(xp + j + 12);
-			float32x4_t x4 = vld1q_f32(xp + j + 16);
-			float32x4_t x5 = vld1q_f32(xp + j + 20);
-			float32x4_t x6 = vld1q_f32(xp + j + 24);
-			float32x4_t x7 = vld1q_f32(xp + j + 28);
-			for (int r = 0; r < 8; r++) {
-				const float *wr = rows[r] + j;
-				float32x4_t	 w0 = vld1q_f32(wr);
-				float32x4_t	 w1 = vld1q_f32(wr + 4);
-				float32x4_t	 w2 = vld1q_f32(wr + 8);
-				float32x4_t	 w3 = vld1q_f32(wr + 12);
-				accA[r]			= vfmaq_f32(accA[r], x0, w0);
-				accA[r]			= vfmaq_f32(accA[r], x1, w1);
-				accA[r]			= vfmaq_f32(accA[r], x2, w2);
-				accA[r]			= vfmaq_f32(accA[r], x3, w3);
-				float32x4_t w4	= vld1q_f32(wr + 16);
-				float32x4_t w5	= vld1q_f32(wr + 20);
-				float32x4_t w6	= vld1q_f32(wr + 24);
-				float32x4_t w7	= vld1q_f32(wr + 28);
-				accB[r]			= vfmaq_f32(accB[r], x4, w4);
-				accB[r]			= vfmaq_f32(accB[r], x5, w5);
-				accB[r]			= vfmaq_f32(accB[r], x6, w6);
-				accB[r]			= vfmaq_f32(accB[r], x7, w7);
+				for (int q = 0; q < 4; q++)
+					acc[r][q] = vfmaq_f32(acc[r][q], vld1q_f32(rows[r] + j + (4 * q)), xv[q]);
 			}
 		}
-		for (; j + 16 <= k; j += 16) {
-			PREFETCH(xp + j + PF_ELEMS(64));
-			for (int r = 0; r < 8; r++)
-				PREFETCH(rows[r] + j + PF_ELEMS(64));
-			float32x4_t x0 = vld1q_f32(xp + j);
-			float32x4_t x1 = vld1q_f32(xp + j + 4);
-			float32x4_t x2 = vld1q_f32(xp + j + 8);
-			float32x4_t x3 = vld1q_f32(xp + j + 12);
-			for (int r = 0; r < 8; r++) {
-				const float *wr = rows[r] + j;
-				accA[r]			= vfmaq_f32(accA[r], x0, vld1q_f32(wr));
-				accA[r]			= vfmaq_f32(accA[r], x1, vld1q_f32(wr + 4));
-				accB[r]			= vfmaq_f32(accB[r], x2, vld1q_f32(wr + 8));
-				accB[r]			= vfmaq_f32(accB[r], x3, vld1q_f32(wr + 12));
-			}
-		}
-		for (int r = 0; r < 8; r++) {
-			float32x4_t rem_acc = vdupq_n_f32(0.0f);
-			int			j2		= j;
-			for (; j2 + 4 <= k; j2 += 4)
-				rem_acc = vfmaq_f32(rem_acc, vld1q_f32(xp + j2), vld1q_f32(rows[r] + j2));
-			float s = vaddvq_f32(vaddq_f32(accA[r], accB[r])) + vaddvq_f32(rem_acc);
-			for (; j2 < k; j2++)
-				s += rows[r][j2] * xp[j2];
-			yp[i + r] = s;
-		}
+		for (int r = 0; r < mr; r++)
+			y[i + r] =
+				neon_dot16_finish(acc[r][0], acc[r][1], acc[r][2], acc[r][3], rows[r], x, j, k);
 	}
-
-	for (; i < n; i++) {
-		const float *restrict wr = w + ((size_t)i * k);
-		float32x4_t acc0		 = vdupq_n_f32(0.0f);
-		float32x4_t acc1		 = vdupq_n_f32(0.0f);
-		float32x4_t acc2		 = vdupq_n_f32(0.0f);
-		float32x4_t acc3		 = vdupq_n_f32(0.0f);
-		int			j			 = 0;
-		for (; j + 32 <= k; j += 32) {
-			PREFETCH(wr + j + PF_ELEMS(64));
-			PREFETCH(xp + j + PF_ELEMS(64));
-			acc0 = vfmaq_f32(acc0, vld1q_f32(xp + j), vld1q_f32(wr + j));
-			acc1 = vfmaq_f32(acc1, vld1q_f32(xp + j + 4), vld1q_f32(wr + j + 4));
-			acc2 = vfmaq_f32(acc2, vld1q_f32(xp + j + 8), vld1q_f32(wr + j + 8));
-			acc3 = vfmaq_f32(acc3, vld1q_f32(xp + j + 12), vld1q_f32(wr + j + 12));
-			acc0 = vfmaq_f32(acc0, vld1q_f32(xp + j + 16), vld1q_f32(wr + j + 16));
-			acc1 = vfmaq_f32(acc1, vld1q_f32(xp + j + 20), vld1q_f32(wr + j + 20));
-			acc2 = vfmaq_f32(acc2, vld1q_f32(xp + j + 24), vld1q_f32(wr + j + 24));
-			acc3 = vfmaq_f32(acc3, vld1q_f32(xp + j + 28), vld1q_f32(wr + j + 28));
-		}
-		for (; j + 16 <= k; j += 16) {
-			acc0 = vfmaq_f32(acc0, vld1q_f32(xp + j), vld1q_f32(wr + j));
-			acc1 = vfmaq_f32(acc1, vld1q_f32(xp + j + 4), vld1q_f32(wr + j + 4));
-			acc2 = vfmaq_f32(acc2, vld1q_f32(xp + j + 8), vld1q_f32(wr + j + 8));
-			acc3 = vfmaq_f32(acc3, vld1q_f32(xp + j + 12), vld1q_f32(wr + j + 12));
-		}
-		for (; j + 4 <= k; j += 4)
-			acc0 = vfmaq_f32(acc0, vld1q_f32(xp + j), vld1q_f32(wr + j));
-		float s = vaddvq_f32(acc0) + vaddvq_f32(acc1) + vaddvq_f32(acc2) + vaddvq_f32(acc3);
-		for (; j < k; j++)
-			s += wr[j] * xp[j];
-		yp[i] = s;
-	}
+	for (; i < n; i++)
+		y[i] = dot_f32(w + ((size_t)i * k), x, k);
 }
 
 void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, float *restrict y,
 						  int n, int k, int m, int x_row_stride, int y_row_stride) {
-	const int MB = 4;
+	const int MB = 2;
+	const int NR = 2;
 	int		  mb = 0;
 	for (; mb + MB <= m; mb += MB) {
-		const float *xb[4];
-		for (int t = 0; t < 4; t++)
+		const float *xb[2];
+		for (int t = 0; t < MB; t++)
 			xb[t] = x + (size_t)(mb + t) * x_row_stride;
 
-		const int NR = 4;
-		int		  i	 = 0;
+		int i = 0;
 		for (; i + NR <= n; i += NR) {
-			const float *rows[4];
-			for (int r = 0; r < 4; r++)
+			const float *rows[2];
+			for (int r = 0; r < NR; r++)
 				rows[r] = w + (size_t)(i + r) * k;
 
-			float32x4_t acc[4][4];
-			for (int t = 0; t < 4; t++)
-				for (int r = 0; r < 4; r++)
-					acc[t][r] = vdupq_n_f32(0.0f);
+			float32x4_t acc[2][2][4];
+			for (int t = 0; t < MB; t++)
+				for (int r = 0; r < NR; r++)
+					for (int q = 0; q < 4; q++)
+						acc[t][r][q] = vdupq_n_f32(0.0f);
 
 			int j = 0;
-			for (; j + 4 <= k; j += 4) {
-				if (j + 32 < k) {
-					__builtin_prefetch(xb[0] + j + 32, 0, 1);
-					for (int r = 0; r < 4; r++)
-						__builtin_prefetch(rows[r] + j + 32, 0, 1);
+			for (; j + 16 <= k; j += 16) {
+				if (j + 64 < k) {
+					__builtin_prefetch(xb[0] + j + 64, 0, 1);
+					for (int r = 0; r < NR; r++)
+						__builtin_prefetch(rows[r] + j + 64, 0, 1);
 				}
-				float32x4_t w0 = vld1q_f32(rows[0] + j);
-				float32x4_t w1 = vld1q_f32(rows[1] + j);
-				float32x4_t w2 = vld1q_f32(rows[2] + j);
-				float32x4_t w3 = vld1q_f32(rows[3] + j);
-				for (int t = 0; t < 4; t++) {
-					float32x4_t xv = vld1q_f32(xb[t] + j);
-					acc[t][0]	   = vfmaq_f32(acc[t][0], xv, w0);
-					acc[t][1]	   = vfmaq_f32(acc[t][1], xv, w1);
-					acc[t][2]	   = vfmaq_f32(acc[t][2], xv, w2);
-					acc[t][3]	   = vfmaq_f32(acc[t][3], xv, w3);
-				}
+				float32x4_t wv[2][4];
+				for (int r = 0; r < NR; r++)
+					for (int q = 0; q < 4; q++)
+						wv[r][q] = vld1q_f32(rows[r] + j + (4 * q));
+				for (int t = 0; t < MB; t++)
+					for (int q = 0; q < 4; q++) {
+						float32x4_t xv = vld1q_f32(xb[t] + j + (4 * q));
+						for (int r = 0; r < NR; r++)
+							acc[t][r][q] = vfmaq_f32(acc[t][r][q], wv[r][q], xv);
+					}
 			}
-			for (int t = 0; t < 4; t++) {
-				float s[4];
-				for (int r = 0; r < 4; r++)
-					s[r] = vaddvq_f32(acc[t][r]);
-				for (int j2 = j; j2 < k; j2++) {
-					float xv = xb[t][j2];
-					for (int r = 0; r < 4; r++)
-						s[r] += rows[r][j2] * xv;
-				}
-				for (int r = 0; r < 4; r++)
-					y[(size_t)(mb + t) * y_row_stride + i + r] = s[r];
-			}
+			for (int t = 0; t < MB; t++)
+				for (int r = 0; r < NR; r++)
+					y[(size_t)(mb + t) * y_row_stride + i + r] =
+						neon_dot16_finish(acc[t][r][0], acc[t][r][1], acc[t][r][2], acc[t][r][3],
+										  rows[r], xb[t], j, k);
 		}
-		for (; i < n; i++) {
-			const float *wr = w + (size_t)i * k;
-			for (int t = 0; t < 4; t++) {
-				float32x4_t acc = vdupq_n_f32(0.0f);
-				int			j	= 0;
-				for (; j + 4 <= k; j += 4)
-					acc = vfmaq_f32(acc, vld1q_f32(xb[t] + j), vld1q_f32(wr + j));
-				float s = vaddvq_f32(acc);
-				for (; j < k; j++)
-					s += wr[j] * xb[t][j];
-				y[(size_t)(mb + t) * y_row_stride + i] = s;
-			}
-		}
+		for (; i < n; i++)
+			for (int t = 0; t < MB; t++)
+				y[(size_t)(mb + t) * y_row_stride + i] = dot_f32(w + (size_t)i * k, xb[t], k);
 	}
-	for (; mb < m; mb++) {
+	for (; mb < m; mb++)
 		matmul_f32_f32(w, x + (size_t)mb * x_row_stride, y + (size_t)mb * y_row_stride, n, k);
-	}
 }
 
 float dot_f32(const float *restrict a, const float *restrict b, int n) {
@@ -7712,30 +7641,15 @@ float dot_f32(const float *restrict a, const float *restrict b, int n) {
 	float32x4_t acc2 = vdupq_n_f32(0.0f);
 	float32x4_t acc3 = vdupq_n_f32(0.0f);
 	int			i	 = 0;
-	for (; i + 32 <= n; i += 32) {
+	for (; i + 16 <= n; i += 16) {
 		PREFETCH(a + i + 64);
 		PREFETCH(b + i + 64);
 		acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
 		acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
 		acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
 		acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
-		acc0 = vfmaq_f32(acc0, vld1q_f32(a + i + 16), vld1q_f32(b + i + 16));
-		acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 20), vld1q_f32(b + i + 20));
-		acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 24), vld1q_f32(b + i + 24));
-		acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 28), vld1q_f32(b + i + 28));
 	}
-	for (; i + 16 <= n; i += 16) {
-		acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
-		acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
-		acc2 = vfmaq_f32(acc2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
-		acc3 = vfmaq_f32(acc3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
-	}
-	for (; i + 4 <= n; i += 4)
-		acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
-	float s = vaddvq_f32(acc0) + vaddvq_f32(acc1) + vaddvq_f32(acc2) + vaddvq_f32(acc3);
-	for (; i < n; i++)
-		s += a[i] * b[i];
-	return s;
+	return neon_dot16_finish(acc0, acc1, acc2, acc3, a, b, i, n);
 }
 
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
@@ -10429,8 +10343,8 @@ void gdn_update_accum_f32(float *restrict row, float *restrict y, const float *r
 		vst1q_f32(y + i, vfmaq_n_f32(vld1q_f32(y + i), r, qs));
 	}
 	for (; i < n; i++) {
-		row[i] += ks * delta[i];
-		y[i] += row[i] * qs;
+		row[i] = fmaf(ks, delta[i], row[i]);
+		y[i]   = fmaf(row[i], qs, y[i]);
 	}
 }
 

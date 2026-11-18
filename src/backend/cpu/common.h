@@ -433,6 +433,37 @@ typedef struct {
 } cpu_mla_job;
 
 typedef struct {
+	const float *q_src;
+	const float *rope_cos;
+	const float *rope_sin;
+	const float *k_b_h;
+	const float *v_b_h;
+	const float *layer_c;
+	const float *k_pe_rot_all;
+	int			 qk_head, qk_nope, qk_rope, kv_lora, v_head, total_dim, n_pos;
+	float		 scale;
+} cpu_mla_head_args;
+
+void cpu_mla_head_canonical(const cpu_mla_head_args *a, float *out_h);
+
+typedef struct {
+	const float *q_abs;
+	const float *cache;
+	const float *v_b;
+	float		*out;
+	int			 n_pos, kv_lora, v_head;
+	float		 scale;
+} cpu_mla_abs_args;
+
+void cpu_mla_abs_head(const cpu_mla_abs_args *a, int h, float *sc, float *lat);
+void cpu_l2_normalize_heads(float *x, int n_heads, int head_dim);
+void cpu_causal_conv_silu(float *state, const float *w, float *x, int channels, int kernel);
+void cpu_kda_gates(float *g, float *beta, const float *dt_bias, const float *ssm_a, int n_heads,
+				   int head_dim, float lower_bound);
+void cpu_kda_heads_range(float *state, const float *q, const float *k, const float *v,
+						 const float *g, const float *beta, float *out, int S, int begin, int end);
+
+typedef struct {
 	const float *layer_c;
 	float		*k_pe_rot_all;
 	const float *rope_cos_base;

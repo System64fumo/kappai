@@ -3944,156 +3944,109 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 #undef NR
 #undef MATMUL_MR
 
+static inline float x86_dot16_finish(__m256 acc0, __m256 acc1, const float *a, const float *b,
+									 int j, int k) {
+	if (j < k) {
+		float lane[NUM_DOT_LANES];
+		_mm256_storeu_ps(lane, acc0);
+		_mm256_storeu_ps(lane + 8, acc1);
+		for (; j < k; j++)
+			lane[j & (NUM_DOT_LANES - 1)] = fmaf(a[j], b[j], lane[j & (NUM_DOT_LANES - 1)]);
+		acc0 = _mm256_loadu_ps(lane);
+		acc1 = _mm256_loadu_ps(lane + 8);
+	}
+	__m256 sum8 = _mm256_add_ps(acc0, acc1);
+	__m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(sum8), _mm256_extractf128_ps(sum8, 1));
+	sum4		= _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+	return _mm_cvtss_f32(_mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1)));
+}
+
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {
-	const float *xp = x;
-	float		*yp = y;
-	const int	 mr = 8;
-	int			 i	= 0;
+	const int mr = 4;
+	int		  i	 = 0;
 	for (; i + mr <= n; i += mr) {
-		__m256 acc[8];
-		for (int r = 0; r < 8; r++)
-			acc[r] = _mm256_setzero_ps();
-		const float *rows[8];
-		for (int r = 0; r < 8; r++)
-			rows[r] = w + ((size_t)(i + r) * k);
+		const float *rows[4];
+		__m256		 acc[4][2];
+		for (int r = 0; r < mr; r++) {
+			rows[r]	  = w + ((size_t)(i + r) * k);
+			acc[r][0] = _mm256_setzero_ps();
+			acc[r][1] = _mm256_setzero_ps();
+		}
 		int j = 0;
-		for (; j + 32 <= k; j += 32) {
-			__builtin_prefetch(xp + j + 64, 0, 1);
-			for (int r = 0; r < 8; r++)
+		for (; j + 16 <= k; j += 16) {
+			__builtin_prefetch(x + j + 64, 0, 1);
+			__m256 x0 = _mm256_loadu_ps(x + j);
+			__m256 x1 = _mm256_loadu_ps(x + j + 8);
+			for (int r = 0; r < mr; r++) {
 				__builtin_prefetch(rows[r] + j + 64, 0, 1);
-			__m256 x0 = _mm256_loadu_ps(xp + j);
-			__m256 x1 = _mm256_loadu_ps(xp + j + 8);
-			__m256 x2 = _mm256_loadu_ps(xp + j + 16);
-			__m256 x3 = _mm256_loadu_ps(xp + j + 24);
-			for (int r = 0; r < 8; r++) {
-				acc[r] = _mm256_fmadd_ps(x0, _mm256_loadu_ps(rows[r] + j), acc[r]);
-				acc[r] = _mm256_fmadd_ps(x1, _mm256_loadu_ps(rows[r] + j + 8), acc[r]);
-				acc[r] = _mm256_fmadd_ps(x2, _mm256_loadu_ps(rows[r] + j + 16), acc[r]);
-				acc[r] = _mm256_fmadd_ps(x3, _mm256_loadu_ps(rows[r] + j + 24), acc[r]);
+				acc[r][0] = _mm256_fmadd_ps(_mm256_loadu_ps(rows[r] + j), x0, acc[r][0]);
+				acc[r][1] = _mm256_fmadd_ps(_mm256_loadu_ps(rows[r] + j + 8), x1, acc[r][1]);
 			}
 		}
-		for (; j + 16 <= k; j += 16) {
-			__m256 x0 = _mm256_loadu_ps(xp + j);
-			__m256 x1 = _mm256_loadu_ps(xp + j + 8);
-			for (int r = 0; r < 8; r++) {
-				acc[r] = _mm256_fmadd_ps(x0, _mm256_loadu_ps(rows[r] + j), acc[r]);
-				acc[r] = _mm256_fmadd_ps(x1, _mm256_loadu_ps(rows[r] + j + 8), acc[r]);
-			}
-		}
-		for (int r = 0; r < 8; r++) {
-			__m128 rem_acc = _mm_setzero_ps();
-			int	   j2	   = j;
-			for (; j2 + 4 <= k; j2 += 4)
-				rem_acc = _mm_fmadd_ps(_mm_loadu_ps(xp + j2), _mm_loadu_ps(rows[r] + j2), rem_acc);
-			float s = vreduce_add_ps(acc[r]) + vreduce_add_ps_128(rem_acc);
-			for (; j2 < k; j2++)
-				s += rows[r][j2] * xp[j2];
-			yp[i + r] = s;
-		}
+		for (int r = 0; r < mr; r++)
+			y[i + r] = x86_dot16_finish(acc[r][0], acc[r][1], rows[r], x, j, k);
 	}
-
-	for (; i < n; i++) {
-		const float *restrict wr = w + ((size_t)i * k);
-		__m128 acc0				 = _mm_setzero_ps();
-		__m128 acc1				 = _mm_setzero_ps();
-		__m128 acc2				 = _mm_setzero_ps();
-		__m128 acc3				 = _mm_setzero_ps();
-		int	   j				 = 0;
-		for (; j + 32 <= k; j += 32) {
-			__builtin_prefetch(wr + j + 64, 0, 1);
-			__builtin_prefetch(xp + j + 64, 0, 1);
-			acc0 = _mm_fmadd_ps(_mm_loadu_ps(xp + j), _mm_loadu_ps(wr + j), acc0);
-			acc1 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 4), _mm_loadu_ps(wr + j + 4), acc1);
-			acc2 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 8), _mm_loadu_ps(wr + j + 8), acc2);
-			acc3 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 12), _mm_loadu_ps(wr + j + 12), acc3);
-			acc0 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 16), _mm_loadu_ps(wr + j + 16), acc0);
-			acc1 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 20), _mm_loadu_ps(wr + j + 20), acc1);
-			acc2 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 24), _mm_loadu_ps(wr + j + 24), acc2);
-			acc3 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 28), _mm_loadu_ps(wr + j + 28), acc3);
-		}
-		for (; j + 16 <= k; j += 16) {
-			acc0 = _mm_fmadd_ps(_mm_loadu_ps(xp + j), _mm_loadu_ps(wr + j), acc0);
-			acc1 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 4), _mm_loadu_ps(wr + j + 4), acc1);
-			acc2 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 8), _mm_loadu_ps(wr + j + 8), acc2);
-			acc3 = _mm_fmadd_ps(_mm_loadu_ps(xp + j + 12), _mm_loadu_ps(wr + j + 12), acc3);
-		}
-		for (; j + 4 <= k; j += 4)
-			acc0 = _mm_fmadd_ps(_mm_loadu_ps(xp + j), _mm_loadu_ps(wr + j), acc0);
-		float s = vreduce_add_ps_128(acc0) + vreduce_add_ps_128(acc1) + vreduce_add_ps_128(acc2) +
-				  vreduce_add_ps_128(acc3);
-		for (; j < k; j++)
-			s += wr[j] * xp[j];
-		yp[i] = s;
-	}
+	for (; i < n; i++)
+		y[i] = dot_f32(w + ((size_t)i * k), x, k);
 }
 
 void matmul_f32_f32_batch(const float *restrict w, const float *restrict x, float *restrict y,
 						  int n, int k, int m, int x_row_stride, int y_row_stride) {
-	const int MB = 4;
+	const int MB = 2;
+	const int NR = 2;
 	int		  mb = 0;
 	for (; mb + MB <= m; mb += MB) {
-		const float *xb[4];
-		for (int t = 0; t < 4; t++)
+		const float *xb[2];
+		for (int t = 0; t < MB; t++)
 			xb[t] = x + (size_t)(mb + t) * x_row_stride;
 
-		const int NR = 2;
-		int		  i	 = 0;
+		int i = 0;
 		for (; i + NR <= n; i += NR) {
 			const float *rows[2];
-			for (int r = 0; r < 2; r++)
+			for (int r = 0; r < NR; r++)
 				rows[r] = w + (size_t)(i + r) * k;
 
-			__m256 acc[4][2];
-			for (int t = 0; t < 4; t++)
-				for (int r = 0; r < 2; r++)
-					acc[t][r] = _mm256_setzero_ps();
+			__m256 acc[2][2][2];
+			for (int t = 0; t < MB; t++)
+				for (int r = 0; r < NR; r++) {
+					acc[t][r][0] = _mm256_setzero_ps();
+					acc[t][r][1] = _mm256_setzero_ps();
+				}
 
 			int j = 0;
-			for (; j + 8 <= k; j += 8) {
-				if (j + 32 < k) {
-					__builtin_prefetch(xb[0] + j + 32, 0, 1);
-					for (int r = 0; r < 2; r++)
-						__builtin_prefetch(rows[r] + j + 32, 0, 1);
+			for (; j + 16 <= k; j += 16) {
+				if (j + 64 < k) {
+					__builtin_prefetch(xb[0] + j + 64, 0, 1);
+					for (int r = 0; r < NR; r++)
+						__builtin_prefetch(rows[r] + j + 64, 0, 1);
 				}
-				__m256 w0 = _mm256_loadu_ps(rows[0] + j);
-				__m256 w1 = _mm256_loadu_ps(rows[1] + j);
-				for (int t = 0; t < 4; t++) {
-					__m256 xv = _mm256_loadu_ps(xb[t] + j);
-					acc[t][0] = _mm256_fmadd_ps(xv, w0, acc[t][0]);
-					acc[t][1] = _mm256_fmadd_ps(xv, w1, acc[t][1]);
+				__m256 w0[2];
+				__m256 w1[2];
+				for (int r = 0; r < NR; r++) {
+					w0[r] = _mm256_loadu_ps(rows[r] + j);
+					w1[r] = _mm256_loadu_ps(rows[r] + j + 8);
+				}
+				for (int t = 0; t < MB; t++) {
+					__m256 x0 = _mm256_loadu_ps(xb[t] + j);
+					__m256 x1 = _mm256_loadu_ps(xb[t] + j + 8);
+					for (int r = 0; r < NR; r++) {
+						acc[t][r][0] = _mm256_fmadd_ps(w0[r], x0, acc[t][r][0]);
+						acc[t][r][1] = _mm256_fmadd_ps(w1[r], x1, acc[t][r][1]);
+					}
 				}
 			}
-			for (int t = 0; t < 4; t++) {
-				float s[2];
-				for (int r = 0; r < 2; r++)
-					s[r] = vreduce_add_ps(acc[t][r]);
-				for (int j2 = j; j2 < k; j2++) {
-					float xv = xb[t][j2];
-					for (int r = 0; r < 2; r++)
-						s[r] += rows[r][j2] * xv;
-				}
-				for (int r = 0; r < 2; r++)
-					y[(size_t)(mb + t) * y_row_stride + i + r] = s[r];
-			}
+			for (int t = 0; t < MB; t++)
+				for (int r = 0; r < NR; r++)
+					y[(size_t)(mb + t) * y_row_stride + i + r] =
+						x86_dot16_finish(acc[t][r][0], acc[t][r][1], rows[r], xb[t], j, k);
 		}
-		for (; i < n; i++) {
-			const float *wr = w + (size_t)i * k;
-			for (int t = 0; t < 4; t++) {
-				__m256 acc = _mm256_setzero_ps();
-				int	   j   = 0;
-				for (; j + 8 <= k; j += 8)
-					acc = _mm256_fmadd_ps(_mm256_loadu_ps(xb[t] + j), _mm256_loadu_ps(wr + j), acc);
-				float s = vreduce_add_ps(acc);
-				for (; j < k; j++)
-					s += wr[j] * xb[t][j];
-				y[(size_t)(mb + t) * y_row_stride + i] = s;
-			}
-		}
+		for (; i < n; i++)
+			for (int t = 0; t < MB; t++)
+				y[(size_t)(mb + t) * y_row_stride + i] = dot_f32(w + (size_t)i * k, xb[t], k);
 	}
-	for (; mb < m; mb++) {
+	for (; mb < m; mb++)
 		matmul_f32_f32(w, x + (size_t)mb * x_row_stride, y + (size_t)mb * y_row_stride, n, k);
-	}
 }
 
 void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
@@ -4417,29 +4370,14 @@ void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float
 float dot_f32(const float *restrict a, const float *restrict b, int n) {
 	__m256 acc0 = _mm256_setzero_ps();
 	__m256 acc1 = _mm256_setzero_ps();
-	__m256 acc2 = _mm256_setzero_ps();
-	__m256 acc3 = _mm256_setzero_ps();
 	int	   i	= 0;
-	for (; i + 32 <= n; i += 32) {
+	for (; i + 16 <= n; i += 16) {
 		__builtin_prefetch(a + i + 64, 0, 1);
 		__builtin_prefetch(b + i + 64, 0, 1);
 		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
 		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
-		acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), acc2);
-		acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), acc3);
 	}
-	for (; i + 16 <= n; i += 16) {
-		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc0);
-		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), acc1);
-	}
-	__m128 acc4 = _mm_setzero_ps();
-	for (; i + 4 <= n; i += 4)
-		acc4 = _mm_fmadd_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i), acc4);
-	float s = vreduce_add_ps(acc0) + vreduce_add_ps(acc1) + vreduce_add_ps(acc2) +
-			  vreduce_add_ps(acc3) + vreduce_add_ps_128(acc4);
-	for (; i < n; i++)
-		s += a[i] * b[i];
-	return s;
+	return x86_dot16_finish(acc0, acc1, a, b, i, n);
 }
 
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
@@ -5049,15 +4987,15 @@ void add_scale_f32(float *x, const float *y, float s, int n) {
 void gdn_decay_accum_f32(float *restrict row, float *restrict mem, float decay, float ks, int n) {
 	for (int i = 0; i < n; i++) {
 		row[i] *= decay;
-		mem[i] += row[i] * ks;
+		mem[i] = fmaf(row[i], ks, mem[i]);
 	}
 }
 
 void gdn_update_accum_f32(float *restrict row, float *restrict y, const float *restrict delta,
 						  float ks, float qs, int n) {
 	for (int i = 0; i < n; i++) {
-		row[i] += ks * delta[i];
-		y[i] += row[i] * qs;
+		row[i] = fmaf(ks, delta[i], row[i]);
+		y[i]   = fmaf(row[i], qs, y[i]);
 	}
 }
 

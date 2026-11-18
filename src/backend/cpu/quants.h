@@ -369,6 +369,30 @@ float dot_f32(const float *restrict a, const float *restrict b, int n);
 
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps);
 
+static inline float num_dot_f32_f16(const float *a, const uint16_t *b, int n) {
+	float lane[NUM_DOT_LANES] = {0};
+	for (int d = 0; d < n; d++)
+		lane[d & (NUM_DOT_LANES - 1)] = fmaf(a[d], f16_to_f32(b[d]), lane[d & (NUM_DOT_LANES - 1)]);
+	for (int s = NUM_DOT_LANES / 2; s > 0; s >>= 1)
+		for (int l = 0; l < s; l++)
+			lane[l] += lane[l + s];
+	return lane[0];
+}
+
+static inline float num_dot_f32(const float *a, const float *b, int n) {
+	float lane[NUM_DOT_LANES] = {0};
+	for (int d = 0; d < n; d++)
+		lane[d & (NUM_DOT_LANES - 1)] = fmaf(a[d], b[d], lane[d & (NUM_DOT_LANES - 1)]);
+	for (int s = NUM_DOT_LANES / 2; s > 0; s >>= 1)
+		for (int l = 0; l < s; l++)
+			lane[l] += lane[l + s];
+	return lane[0];
+}
+
+static inline float attn_block_sum4(const float *w) {
+	return (w[0] + w[1]) + (w[2] + w[3]);
+}
+
 static inline float silu(float x) {
 	return num_silu(x);
 }
@@ -399,8 +423,8 @@ static inline void rope_rotate_neox(float *v, int n_heads, int head_dim, int rop
 			float s		 = rope_sin[j];
 			float v0	 = vh[j];
 			float v1	 = vh[j + half];
-			vh[j]		 = (v0 * c) - (v1 * s);
-			vh[j + half] = (v0 * s) + (v1 * c);
+			vh[j]		 = fmaf(-v1, s, v0 * c);
+			vh[j + half] = fmaf(v1, c, v0 * s);
 		}
 	}
 }
@@ -415,8 +439,8 @@ static inline void rope_rotate_rows(float *v, int n_heads, int row_stride, int h
 				float s		 = cs[(2 * j) + 1];
 				float v0	 = vh[j];
 				float v1	 = vh[j + half];
-				vh[j]		 = (v0 * c) - (v1 * s);
-				vh[j + half] = (v0 * s) + (v1 * c);
+				vh[j]		 = fmaf(-v1, s, v0 * c);
+				vh[j + half] = fmaf(v1, c, v0 * s);
 			}
 		}
 		return;
@@ -428,8 +452,8 @@ static inline void rope_rotate_rows(float *v, int n_heads, int row_stride, int h
 			float s			= cs[(2 * j) + 1];
 			float v0		= vh[2 * j];
 			float v1		= vh[(2 * j) + 1];
-			vh[2 * j]		= (v0 * c) - (v1 * s);
-			vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+			vh[2 * j]		= fmaf(-v1, s, v0 * c);
+			vh[(2 * j) + 1] = fmaf(v1, c, v0 * s);
 		}
 	}
 }

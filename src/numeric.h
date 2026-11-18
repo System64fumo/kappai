@@ -11,6 +11,8 @@
 #define NUM_LN2_HI 6.9314718055994529e-01f
 #define NUM_LN2_LO (-1.9046542121259336e-09f)
 #define NUM_RMS_LANES 256
+#define NUM_DOT_LANES 16
+#define NUM_ATTN_BLOCK 4
 
 static inline uint32_t num_f32_bits(float f) {
 	uint32_t u;

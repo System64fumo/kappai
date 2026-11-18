@@ -1366,33 +1366,8 @@ void matmul_q5_k_q8_k_qonly_f32(const void *w, const q8_k_block *restrict xq,
 
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {
-	const float *xp = x;
-	float		*yp = y;
-
-	const int MR = 8;
-	int		  i	 = 0;
-	for (; i + MR <= n; i += MR) {
-		float acc[MR];
-		for (int r = 0; r < MR; r++)
-			acc[r] = 0.0f;
-		const float *rows[MR];
-		for (int r = 0; r < MR; r++)
-			rows[r] = w + ((size_t)(i + r) * k);
-		for (int j = 0; j < k; j++) {
-			float xv = xp[j];
-			for (int r = 0; r < MR; r++)
-				acc[r] += rows[r][j] * xv;
-		}
-		for (int r = 0; r < MR; r++)
-			yp[i + r] = acc[r];
-	}
-	for (; i < n; i++) {
-		const float *restrict wr = w + ((size_t)i * k);
-		float acc				 = 0.0f;
-		for (int j = 0; j < k; j++)
-			acc += wr[j] * xp[j];
-		yp[i] = acc;
-	}
+	for (int i = 0; i < n; i++)
+		y[i] = num_dot_f32(w + ((size_t)i * k), x, k);
 }
 
 void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
@@ -1478,12 +1453,7 @@ void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float
 }
 
 float dot_f32(const float *restrict a, const float *restrict b, int n) {
-	if (n <= 0)
-		return 0.0f;
-	float acc = 0.0f;
-	for (int i = 0; i < n; i++)
-		acc += a[i] * b[i];
-	return acc;
+	return num_dot_f32(a, b, n);
 }
 
 void rmsnorm(const float *x, const float *w, float *y, int n, float eps) {
@@ -1681,15 +1651,15 @@ void add_scale_f32(float *x, const float *y, float s, int n) {
 void gdn_decay_accum_f32(float *restrict row, float *restrict mem, float decay, float ks, int n) {
 	for (int i = 0; i < n; i++) {
 		row[i] *= decay;
-		mem[i] += row[i] * ks;
+		mem[i] = fmaf(row[i], ks, mem[i]);
 	}
 }
 
 void gdn_update_accum_f32(float *restrict row, float *restrict y, const float *restrict delta,
 						  float ks, float qs, int n) {
 	for (int i = 0; i < n; i++) {
-		row[i] += ks * delta[i];
-		y[i] += row[i] * qs;
+		row[i] = fmaf(ks, delta[i], row[i]);
+		y[i]   = fmaf(row[i], qs, y[i]);
 	}
 }
 

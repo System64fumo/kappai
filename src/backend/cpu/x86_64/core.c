@@ -42,8 +42,6 @@ typedef struct {
 	float		 scale;
 } mla_job;
 
-static const float KDA_L2_EPS = 1e-6f;
-
 static void cpu_rope_neox_one_avx(float *vh, int half, const float *rope_cos,
 								  const float *rope_sin) {
 	int j = 0;
@@ -60,8 +58,8 @@ static void cpu_rope_neox_one_avx(float *vh, int half, const float *rope_cos,
 		float s		 = rope_sin[j];
 		float v0	 = vh[j];
 		float v1	 = vh[j + half];
-		vh[j]		 = (v0 * c) - (v1 * s);
-		vh[j + half] = (v0 * s) + (v1 * c);
+		vh[j]		 = fmaf(-v1, s, v0 * c);
+		vh[j + half] = fmaf(v1, c, v0 * s);
 	}
 }
 
@@ -75,8 +73,8 @@ static void cpu_rope_interleave_one_avx(float *vh, int half, const float *rope_c
 		__m128 s	= _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(rope_sin + j)));
 		__m128 ev	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
 		__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
-		__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-		__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		__m128 re	= _mm_fnmadd_ps(od, s, _mm_mul_ps(ev, c));
+		__m128 im	= _mm_fmadd_ps(od, c, _mm_mul_ps(ev, s));
 		_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
 	}
 	for (; j < half; j++) {
@@ -84,8 +82,8 @@ static void cpu_rope_interleave_one_avx(float *vh, int half, const float *rope_c
 		float s			= rope_sin[j];
 		float v0		= vh[2 * j];
 		float v1		= vh[(2 * j) + 1];
-		vh[2 * j]		= (v0 * c) - (v1 * s);
-		vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+		vh[2 * j]		= fmaf(-v1, s, v0 * c);
+		vh[(2 * j) + 1] = fmaf(v1, c, v0 * s);
 	}
 }
 
@@ -110,8 +108,8 @@ static void cpu_rope_cs_one_avx(float *vh, int half, const float *cs, int neox) 
 			float s		 = cs[(2 * j) + 1];
 			float v0	 = vh[j];
 			float v1	 = vh[j + half];
-			vh[j]		 = (v0 * c) - (v1 * s);
-			vh[j + half] = (v0 * s) + (v1 * c);
+			vh[j]		 = fmaf(-v1, s, v0 * c);
+			vh[j + half] = fmaf(v1, c, v0 * s);
 		}
 		return;
 	}
@@ -123,8 +121,8 @@ static void cpu_rope_cs_one_avx(float *vh, int half, const float *cs, int neox) 
 		__m128 od	= _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
 		__m128 c	= _mm_shuffle_ps(cs_v, cs_v, _MM_SHUFFLE(2, 0, 2, 0));
 		__m128 s	= _mm_shuffle_ps(cs_v, cs_v, _MM_SHUFFLE(3, 1, 3, 1));
-		__m128 re	= _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-		__m128 im	= _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		__m128 re	= _mm_fnmadd_ps(od, s, _mm_mul_ps(ev, c));
+		__m128 im	= _mm_fmadd_ps(od, c, _mm_mul_ps(ev, s));
 		_mm_storeu_ps(base, _mm_unpacklo_ps(re, im));
 	}
 	for (; j < half; j++) {
@@ -132,8 +130,8 @@ static void cpu_rope_cs_one_avx(float *vh, int half, const float *cs, int neox) 
 		float s			= cs[(2 * j) + 1];
 		float v0		= vh[2 * j];
 		float v1		= vh[(2 * j) + 1];
-		vh[2 * j]		= (v0 * c) - (v1 * s);
-		vh[(2 * j) + 1] = (v0 * s) + (v1 * c);
+		vh[2 * j]		= fmaf(-v1, s, v0 * c);
+		vh[(2 * j) + 1] = fmaf(v1, c, v0 * s);
 	}
 }
 
@@ -372,83 +370,48 @@ float dot8(const float *restrict a, const float *restrict b, int head_dim) {
 float dot8_f16(const float *restrict a, const uint16_t *restrict b, int head_dim) {
 	__m256 acc0 = _mm256_setzero_ps();
 	__m256 acc1 = _mm256_setzero_ps();
-	__m256 acc2 = _mm256_setzero_ps();
-	__m256 acc3 = _mm256_setzero_ps();
 	int	   d	= 0;
-
-	for (; d + 64 <= head_dim; d += 64) {
-		__m256 a0 = _mm256_loadu_ps(a + d);
-		__m256 a1 = _mm256_loadu_ps(a + d + 8);
-		__m256 a2 = _mm256_loadu_ps(a + d + 16);
-		__m256 a3 = _mm256_loadu_ps(a + d + 24);
-		__m256 a4 = _mm256_loadu_ps(a + d + 32);
-		__m256 a5 = _mm256_loadu_ps(a + d + 40);
-		__m256 a6 = _mm256_loadu_ps(a + d + 48);
-		__m256 a7 = _mm256_loadu_ps(a + d + 56);
-
-		__m256 b0 = loadu_f16x8_to_ps(b + d);
-		__m256 b1 = loadu_f16x8_to_ps(b + d + 8);
-		__m256 b2 = loadu_f16x8_to_ps(b + d + 16);
-		__m256 b3 = loadu_f16x8_to_ps(b + d + 24);
-		__m256 b4 = loadu_f16x8_to_ps(b + d + 32);
-		__m256 b5 = loadu_f16x8_to_ps(b + d + 40);
-		__m256 b6 = loadu_f16x8_to_ps(b + d + 48);
-		__m256 b7 = loadu_f16x8_to_ps(b + d + 56);
-
-		acc0 = _mm256_fmadd_ps(a0, b0, acc0);
-		acc1 = _mm256_fmadd_ps(a1, b1, acc1);
-		acc2 = _mm256_fmadd_ps(a2, b2, acc2);
-		acc3 = _mm256_fmadd_ps(a3, b3, acc3);
-		acc0 = _mm256_fmadd_ps(a4, b4, acc0);
-		acc1 = _mm256_fmadd_ps(a5, b5, acc1);
-		acc2 = _mm256_fmadd_ps(a6, b6, acc2);
-		acc3 = _mm256_fmadd_ps(a7, b7, acc3);
-	}
-
-	for (; d + 32 <= head_dim; d += 32) {
-		__m256 a0 = _mm256_loadu_ps(a + d);
-		__m256 a1 = _mm256_loadu_ps(a + d + 8);
-		__m256 a2 = _mm256_loadu_ps(a + d + 16);
-		__m256 a3 = _mm256_loadu_ps(a + d + 24);
-
-		__m256 b0 = loadu_f16x8_to_ps(b + d);
-		__m256 b1 = loadu_f16x8_to_ps(b + d + 8);
-		__m256 b2 = loadu_f16x8_to_ps(b + d + 16);
-		__m256 b3 = loadu_f16x8_to_ps(b + d + 24);
-
-		acc0 = _mm256_fmadd_ps(a0, b0, acc0);
-		acc1 = _mm256_fmadd_ps(a1, b1, acc1);
-		acc2 = _mm256_fmadd_ps(a2, b2, acc2);
-		acc3 = _mm256_fmadd_ps(a3, b3, acc3);
-	}
-
 	for (; d + 16 <= head_dim; d += 16) {
-		__m256 a0 = _mm256_loadu_ps(a + d);
-		__m256 a1 = _mm256_loadu_ps(a + d + 8);
-
-		__m256 b0 = loadu_f16x8_to_ps(b + d);
-		__m256 b1 = loadu_f16x8_to_ps(b + d + 8);
-
-		acc0 = _mm256_fmadd_ps(a0, b0, acc0);
-		acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), loadu_f16x8_to_ps(b + d), acc0);
+		acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d + 8), loadu_f16x8_to_ps(b + d + 8), acc1);
 	}
-
-	for (; d + 8 <= head_dim; d += 8) {
-		__m256 a0 = _mm256_loadu_ps(a + d);
-		__m256 b0 = loadu_f16x8_to_ps(b + d);
-		acc0	  = _mm256_fmadd_ps(a0, b0, acc0);
+	if (d + 8 <= head_dim) {
+		acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), loadu_f16x8_to_ps(b + d), acc0);
+		d += 8;
 	}
-
-	__m256 acc01 = _mm256_add_ps(acc0, acc1);
-	__m256 acc23 = _mm256_add_ps(acc2, acc3);
-	__m256 acc	 = _mm256_add_ps(acc01, acc23);
-	float  s	 = vreduce_add_ps(acc);
-
-	for (; d < head_dim; d++) {
-		s += a[d] * f16_to_f32_fast(b[d]);
+	if (d < head_dim) {
+		float lane[NUM_DOT_LANES];
+		_mm256_storeu_ps(lane, acc0);
+		_mm256_storeu_ps(lane + 8, acc1);
+		for (; d < head_dim; d++)
+			lane[d & (NUM_DOT_LANES - 1)] =
+				fmaf(a[d], f16_to_f32_fast(b[d]), lane[d & (NUM_DOT_LANES - 1)]);
+		acc0 = _mm256_loadu_ps(lane);
+		acc1 = _mm256_loadu_ps(lane + 8);
 	}
+	__m256 sum8 = _mm256_add_ps(acc0, acc1);
+	__m128 sum4 = _mm_add_ps(_mm256_castps256_ps128(sum8), _mm256_extractf128_ps(sum8, 1));
+	sum4		= _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
+	return _mm_cvtss_f32(_mm_add_ss(sum4, _mm_shuffle_ps(sum4, sum4, 1)));
+}
 
-	return s;
+static inline void x86_scale_f32(float *v, int n, float s) {
+	__m256 sv = _mm256_set1_ps(s);
+	int	   d  = 0;
+	for (; d + 8 <= n; d += 8)
+		_mm256_storeu_ps(v + d, _mm256_mul_ps(_mm256_loadu_ps(v + d), sv));
+	for (; d < n; d++)
+		v[d] *= s;
+}
+
+static inline void x86_fma_f16(float *acc, const uint16_t *v, float w, int n) {
+	__m256 wv = _mm256_set1_ps(w);
+	int	   d  = 0;
+	for (; d + 8 <= n; d += 8)
+		_mm256_storeu_ps(acc + d,
+						 _mm256_fmadd_ps(loadu_f16x8_to_ps(v + d), wv, _mm256_loadu_ps(acc + d)));
+	for (; d < n; d++)
+		acc[d] = fmaf(f16_to_f32_fast(v[d]), w, acc[d]);
 }
 
 static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v_slice,
@@ -460,135 +423,39 @@ static void cpu_attention_inner(uint16_t *restrict k_slice, uint16_t *restrict v
 		float VKQ[HEAD_DIM_MAX] __attribute__((aligned(64)));
 		memset(VKQ, 0, (size_t)head_dim * sizeof(float));
 
-		for (int t = 0; t < n_pos; t++) {
-			const uint16_t *kt = k_slice + ((size_t)t * kv_stride);
-			const uint16_t *vt = v_slice + ((size_t)t * kv_stride);
-			float			ss = dot8_f16(qh, kt, head_dim) * scale;
-
-			float vs;
-			float ms = 1.0f;
-			if (ss > M) {
-				float M_old = M;
-				M			= ss;
-				if (S > 0.0f) {
-					ms			= num_expf(M_old - M);
-					__m256 ms_v = _mm256_set1_ps(ms);
-					int	   d	= 0;
-					for (; d + 64 <= head_dim; d += 64) {
-						_mm256_storeu_ps(VKQ + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), ms_v));
-						_mm256_storeu_ps(VKQ + d + 8,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), ms_v));
-						_mm256_storeu_ps(VKQ + d + 16,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), ms_v));
-						_mm256_storeu_ps(VKQ + d + 24,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), ms_v));
-						_mm256_storeu_ps(VKQ + d + 32,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), ms_v));
-						_mm256_storeu_ps(VKQ + d + 40,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), ms_v));
-						_mm256_storeu_ps(VKQ + d + 48,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), ms_v));
-						_mm256_storeu_ps(VKQ + d + 56,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), ms_v));
-					}
-					for (; d + 32 <= head_dim; d += 32) {
-						_mm256_storeu_ps(VKQ + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), ms_v));
-						_mm256_storeu_ps(VKQ + d + 8,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), ms_v));
-						_mm256_storeu_ps(VKQ + d + 16,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), ms_v));
-						_mm256_storeu_ps(VKQ + d + 24,
-										 _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), ms_v));
-					}
-					for (; d + 8 <= head_dim; d += 8)
-						_mm256_storeu_ps(VKQ + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), ms_v));
-					for (; d < head_dim; d++)
-						VKQ[d] *= ms;
-				}
-				vs = 1.0f;
-			} else {
-				vs = num_expf(ss - M);
-			}
-
-			__m256 vs_v = _mm256_set1_ps(vs);
-			int	   d	= 0;
-			for (; d + 64 <= head_dim; d += 64) {
-				__m256 vt0 = loadu_f16x8_to_ps(vt + d);
-				__m256 vt1 = loadu_f16x8_to_ps(vt + d + 8);
-				__m256 vt2 = loadu_f16x8_to_ps(vt + d + 16);
-				__m256 vt3 = loadu_f16x8_to_ps(vt + d + 24);
-				__m256 vt4 = loadu_f16x8_to_ps(vt + d + 32);
-				__m256 vt5 = loadu_f16x8_to_ps(vt + d + 40);
-				__m256 vt6 = loadu_f16x8_to_ps(vt + d + 48);
-				__m256 vt7 = loadu_f16x8_to_ps(vt + d + 56);
-				_mm256_storeu_ps(VKQ + d, _mm256_fmadd_ps(vt0, vs_v, _mm256_loadu_ps(VKQ + d)));
-				_mm256_storeu_ps(VKQ + d + 8,
-								 _mm256_fmadd_ps(vt1, vs_v, _mm256_loadu_ps(VKQ + d + 8)));
-				_mm256_storeu_ps(VKQ + d + 16,
-								 _mm256_fmadd_ps(vt2, vs_v, _mm256_loadu_ps(VKQ + d + 16)));
-				_mm256_storeu_ps(VKQ + d + 24,
-								 _mm256_fmadd_ps(vt3, vs_v, _mm256_loadu_ps(VKQ + d + 24)));
-				_mm256_storeu_ps(VKQ + d + 32,
-								 _mm256_fmadd_ps(vt4, vs_v, _mm256_loadu_ps(VKQ + d + 32)));
-				_mm256_storeu_ps(VKQ + d + 40,
-								 _mm256_fmadd_ps(vt5, vs_v, _mm256_loadu_ps(VKQ + d + 40)));
-				_mm256_storeu_ps(VKQ + d + 48,
-								 _mm256_fmadd_ps(vt6, vs_v, _mm256_loadu_ps(VKQ + d + 48)));
-				_mm256_storeu_ps(VKQ + d + 56,
-								 _mm256_fmadd_ps(vt7, vs_v, _mm256_loadu_ps(VKQ + d + 56)));
-			}
-			for (; d + 32 <= head_dim; d += 32) {
-				__m256 vt0 = loadu_f16x8_to_ps(vt + d);
-				__m256 vt1 = loadu_f16x8_to_ps(vt + d + 8);
-				__m256 vt2 = loadu_f16x8_to_ps(vt + d + 16);
-				__m256 vt3 = loadu_f16x8_to_ps(vt + d + 24);
-				_mm256_storeu_ps(VKQ + d, _mm256_fmadd_ps(vt0, vs_v, _mm256_loadu_ps(VKQ + d)));
-				_mm256_storeu_ps(VKQ + d + 8,
-								 _mm256_fmadd_ps(vt1, vs_v, _mm256_loadu_ps(VKQ + d + 8)));
-				_mm256_storeu_ps(VKQ + d + 16,
-								 _mm256_fmadd_ps(vt2, vs_v, _mm256_loadu_ps(VKQ + d + 16)));
-				_mm256_storeu_ps(VKQ + d + 24,
-								 _mm256_fmadd_ps(vt3, vs_v, _mm256_loadu_ps(VKQ + d + 24)));
-			}
-			for (; d + 16 <= head_dim; d += 16) {
-				__m256 vt0 = loadu_f16x8_to_ps(vt + d);
-				__m256 vt1 = loadu_f16x8_to_ps(vt + d + 8);
-				_mm256_storeu_ps(VKQ + d, _mm256_fmadd_ps(vt0, vs_v, _mm256_loadu_ps(VKQ + d)));
-				_mm256_storeu_ps(VKQ + d + 8,
-								 _mm256_fmadd_ps(vt1, vs_v, _mm256_loadu_ps(VKQ + d + 8)));
-			}
-			for (; d + 8 <= head_dim; d += 8) {
-				__m256 vt0 = loadu_f16x8_to_ps(vt + d);
-				_mm256_storeu_ps(VKQ + d, _mm256_fmadd_ps(vt0, vs_v, _mm256_loadu_ps(VKQ + d)));
-			}
-			for (; d < head_dim; d++)
-				VKQ[d] = fmaf(vs, f16_to_f32_fast(vt[d]), VKQ[d]);
-			S = (S * ms) + vs;
+		int t = 0;
+		for (; t + NUM_ATTN_BLOCK <= n_pos; t += NUM_ATTN_BLOCK) {
+			float sb[NUM_ATTN_BLOCK];
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++)
+				sb[i] = dot8_f16(qh, k_slice + ((size_t)(t + i) * kv_stride), head_dim) * scale;
+			float bmax	= fmaxf(fmaxf(sb[0], sb[1]), fmaxf(sb[2], sb[3]));
+			float M_new = bmax > M ? bmax : M;
+			float alpha = (S > 0.0f && bmax > M) ? num_expf(M - M_new) : 1.0f;
+			float w[NUM_ATTN_BLOCK];
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++)
+				w[i] = num_expf(sb[i] - M_new);
+			if (alpha != 1.0f)
+				x86_scale_f32(VKQ, head_dim, alpha);
+			for (int i = 0; i < NUM_ATTN_BLOCK; i++)
+				x86_fma_f16(VKQ, v_slice + ((size_t)(t + i) * kv_stride), w[i], head_dim);
+			S = fmaf(S, alpha, attn_block_sum4(w));
+			M = M_new;
+		}
+		for (; t < n_pos; t++) {
+			float ss	= dot8_f16(qh, k_slice + ((size_t)t * kv_stride), head_dim) * scale;
+			float M_new = ss > M ? ss : M;
+			float alpha = S > 0.0f ? num_expf(M - M_new) : 1.0f;
+			float vs	= num_expf(ss - M_new);
+			if (alpha != 1.0f)
+				x86_scale_f32(VKQ, head_dim, alpha);
+			x86_fma_f16(VKQ, v_slice + ((size_t)t * kv_stride), vs, head_dim);
+			S = fmaf(S, alpha, vs);
+			M = M_new;
 		}
 
-		float  S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
-		__m256 inv_v = _mm256_set1_ps(S_inv);
-		int	   d	 = 0;
-		for (; d + 64 <= head_dim; d += 64) {
-			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
-			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
-			_mm256_storeu_ps(out_h + d + 32, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 32), inv_v));
-			_mm256_storeu_ps(out_h + d + 40, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 40), inv_v));
-			_mm256_storeu_ps(out_h + d + 48, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 48), inv_v));
-			_mm256_storeu_ps(out_h + d + 56, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 56), inv_v));
-		}
-		for (; d + 32 <= head_dim; d += 32) {
-			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
-			_mm256_storeu_ps(out_h + d + 8, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 8), inv_v));
-			_mm256_storeu_ps(out_h + d + 16, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 16), inv_v));
-			_mm256_storeu_ps(out_h + d + 24, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d + 24), inv_v));
-		}
-		for (; d + 8 <= head_dim; d += 8)
-			_mm256_storeu_ps(out_h + d, _mm256_mul_ps(_mm256_loadu_ps(VKQ + d), inv_v));
-		for (; d < head_dim; d++)
-			out_h[d] = VKQ[d] * S_inv;
+		float S_inv = (S == 0.0f) ? 0.0f : 1.0f / S;
+		memcpy(out_h, VKQ, (size_t)head_dim * sizeof(float));
+		x86_scale_f32(out_h, head_dim, S_inv);
 		return;
 	}
 
@@ -1555,112 +1422,25 @@ int32_t cpu_argmax_f32(const float *restrict logits, int vocab) {
 static void cpu_attention_mla_head_avx(int begin, int end, int tid, void *ctx) {
 	(void)tid;
 	cpu_mla_job *j = ctx;
-
-	float q_h[HEAD_DIM_MAX];
-	float q_absorbed[HEAD_DIM_MAX];
-	float VKQ_latent[HEAD_DIM_MAX];
-
-	const float *q_rope_cos = j->rope_cos_base + ((size_t)j->pos * j->half_rope);
-	const float *q_rope_sin = j->rope_sin_base + ((size_t)j->pos * j->half_rope);
-
 	for (int h = begin; h < end; h++) {
-		const float *q_src = j->qf + ((size_t)h * j->qk_head);
-		for (int d = 0; d < j->qk_head; d++)
-			q_h[d] = q_src[d];
-		for (int jj = 0; jj < j->half_rope; jj++) {
-			float c						   = q_rope_cos[jj];
-			float s						   = q_rope_sin[jj];
-			float a						   = q_h[j->qk_nope + (2 * jj)];
-			float b						   = q_h[j->qk_nope + (2 * jj) + 1];
-			q_h[j->qk_nope + (2 * jj)]	   = (a * c) - (b * s);
-			q_h[j->qk_nope + (2 * jj) + 1] = (a * s) + (b * c);
-		}
-
-		const float *k_b_h = j->k_b + ((size_t)h * j->qk_nope * j->kv_lora);
-		const float *v_b_h = j->v_b + ((size_t)h * j->kv_lora * j->v_head);
-
-		for (int i = 0; i < j->kv_lora; i++) {
-			const float *row = k_b_h + ((size_t)i * j->qk_nope);
-			__m256		 acc = _mm256_setzero_ps();
-			int			 d	 = 0;
-			for (; d + 8 <= j->qk_nope; d += 8)
-				acc = _mm256_fmadd_ps(_mm256_loadu_ps(row + d), _mm256_loadu_ps(q_h + d), acc);
-			float sum = vreduce_add_ps(acc);
-			for (; d < j->qk_nope; d++)
-				sum += row[d] * q_h[d];
-			q_absorbed[i] = sum;
-		}
-		const float *q_rope_part = q_h + j->qk_nope;
-
-		float M = -INFINITY;
-		float S = 0.0f;
-		memset(VKQ_latent, 0, (size_t)j->kv_lora * sizeof(float));
-		for (int t = 0; t < j->n_pos; t++) {
-			const float *slot	  = j->layer_c + ((size_t)t * (j->kv_lora + j->qk_rope));
-			const float *latent	  = slot;
-			const float *k_pe_rot = j->k_pe_rot_all + ((size_t)t * j->qk_rope);
-
-			__m256 acc0 = _mm256_setzero_ps();
-			int	   i	= 0;
-			for (; i + 8 <= j->kv_lora; i += 8)
-				acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(latent + i), _mm256_loadu_ps(q_absorbed + i),
-									   acc0);
-			float score = vreduce_add_ps(acc0);
-			for (; i < j->kv_lora; i++)
-				score += latent[i] * q_absorbed[i];
-
-			__m256 acc1 = _mm256_setzero_ps();
-			int	   d	= 0;
-			for (; d + 8 <= j->qk_rope; d += 8)
-				acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(q_rope_part + d),
-									   _mm256_loadu_ps(k_pe_rot + d), acc1);
-			score += vreduce_add_ps(acc1);
-			for (; d < j->qk_rope; d++)
-				score += q_rope_part[d] * k_pe_rot[d];
-			score *= j->scale;
-
-			float ms = 1.0f;
-			float vs = 1.0f;
-			if (score > M) {
-				float Mold = M;
-				M		   = score;
-				ms		   = num_expf(Mold - M);
-				__m256 msv = _mm256_set1_ps(ms);
-				int	   i2  = 0;
-				for (; i2 + 8 <= j->kv_lora; i2 += 8)
-					_mm256_storeu_ps(VKQ_latent + i2,
-									 _mm256_mul_ps(_mm256_loadu_ps(VKQ_latent + i2), msv));
-				for (; i2 < j->kv_lora; i2++)
-					VKQ_latent[i2] *= ms;
-			} else {
-				vs = num_expf(score - M);
-			}
-			__m256 vsv = _mm256_set1_ps(vs);
-			int	   i3  = 0;
-			for (; i3 + 8 <= j->kv_lora; i3 += 8)
-				_mm256_storeu_ps(VKQ_latent + i3,
-								 _mm256_fmadd_ps(_mm256_loadu_ps(latent + i3), vsv,
-												 _mm256_loadu_ps(VKQ_latent + i3)));
-			for (; i3 < j->kv_lora; i3++)
-				VKQ_latent[i3] = fmaf(latent[i3], vs, VKQ_latent[i3]);
-			S = (S * ms) + vs;
-		}
-		float S_inv = S == 0.0f ? 0.0f : 1.0f / S;
-		float VKQ[HEAD_DIM_MAX];
-		for (int d = 0; d < j->v_head; d++) {
-			const float *row = v_b_h + ((size_t)d * j->kv_lora);
-			__m256		 acc = _mm256_setzero_ps();
-			int			 i	 = 0;
-			for (; i + 8 <= j->kv_lora; i += 8)
-				acc =
-					_mm256_fmadd_ps(_mm256_loadu_ps(VKQ_latent + i), _mm256_loadu_ps(row + i), acc);
-			float sum = vreduce_add_ps(acc);
-			for (; i < j->kv_lora; i++)
-				sum += VKQ_latent[i] * row[i];
-			VKQ[d] = sum * S_inv;
-		}
-		for (int d = 0; d < j->v_head; d++)
-			j->outf[((size_t)h * j->v_head) + d] = VKQ[d];
+		cpu_mla_head_args args = {
+			.q_src		  = j->qf + ((size_t)h * j->qk_head),
+			.rope_cos	  = j->rope_cos_base + ((size_t)j->pos * j->half_rope),
+			.rope_sin	  = j->rope_sin_base + ((size_t)j->pos * j->half_rope),
+			.k_b_h		  = j->k_b + ((size_t)h * j->qk_nope * j->kv_lora),
+			.v_b_h		  = j->v_b + ((size_t)h * j->kv_lora * j->v_head),
+			.layer_c	  = j->layer_c,
+			.k_pe_rot_all = j->k_pe_rot_all,
+			.qk_head	  = j->qk_head,
+			.qk_nope	  = j->qk_nope,
+			.qk_rope	  = j->qk_rope,
+			.kv_lora	  = j->kv_lora,
+			.v_head		  = j->v_head,
+			.total_dim	  = j->kv_lora + j->qk_rope,
+			.n_pos		  = j->n_pos,
+			.scale		  = j->scale,
+		};
+		cpu_mla_head_canonical(&args, j->outf + ((size_t)h * j->v_head));
 	}
 }
 
@@ -1679,8 +1459,8 @@ static void cpu_mla_krot_one(const cpu_mla_krot_job *j, int t) {
 		__m128		 s	  = _mm_castsi128_ps(_mm_loadl_epi64((const __m128i *)(t_rope_sin + jj)));
 		__m128		 ev	  = _mm_shuffle_ps(p, p, _MM_SHUFFLE(2, 0, 2, 0));
 		__m128		 od	  = _mm_shuffle_ps(p, p, _MM_SHUFFLE(3, 1, 3, 1));
-		__m128		 re	  = _mm_sub_ps(_mm_mul_ps(ev, c), _mm_mul_ps(od, s));
-		__m128		 im	  = _mm_add_ps(_mm_mul_ps(ev, s), _mm_mul_ps(od, c));
+		__m128		 re	  = _mm_fnmadd_ps(od, s, _mm_mul_ps(ev, c));
+		__m128		 im	  = _mm_fmadd_ps(od, c, _mm_mul_ps(ev, s));
 		_mm_storeu_ps(dst + 2 * jj, _mm_unpacklo_ps(re, im));
 	}
 	for (; jj < j->half_rope; jj++) {
@@ -1688,8 +1468,8 @@ static void cpu_mla_krot_one(const cpu_mla_krot_job *j, int t) {
 		float s			  = t_rope_sin[jj];
 		float a			  = k_pe[2 * jj];
 		float b			  = k_pe[(2 * jj) + 1];
-		dst[2 * jj]		  = (a * c) - (b * s);
-		dst[(2 * jj) + 1] = (a * s) + (b * c);
+		dst[2 * jj]		  = fmaf(-b, s, a * c);
+		dst[(2 * jj) + 1] = fmaf(b, c, a * s);
 	}
 }
 
@@ -1907,22 +1687,19 @@ static void hc_sinkhorn(float comb[HC_SUPPORTED * HC_SUPPORTED], int iters, floa
 		float  mx  = col[0];
 		for (int d = 1; d < HC; d++)
 			mx = fmaxf(mx, col[d]);
-		float sum = 0.0f;
-		for (int d = 0; d < HC; d++) {
+		for (int d = 0; d < HC; d++)
 			col[d] = num_expf(col[d] - mx);
-			sum += col[d];
-		}
+		float sum = (col[0] + col[1]) + (col[2] + col[3]);
 		for (int d = 0; d < HC; d++)
 			col[d] = col[d] / sum + eps;
 	}
 	for (int it = 0; it < iters; it++) {
 		if (it > 0) {
 			for (int src = 0; src < HC; src++) {
-				float sum = eps;
+				float *r   = comb + src * HC;
+				float  sum = eps + ((r[0] + r[1]) + (r[2] + r[3]));
 				for (int d = 0; d < HC; d++)
-					sum += comb[src * HC + d];
-				for (int d = 0; d < HC; d++)
-					comb[src * HC + d] /= sum;
+					r[d] /= sum;
 			}
 		}
 		for (int d = 0; d < HC; d++) {
@@ -1956,7 +1733,7 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 	}
 	float *comb = d->coef + hc;
 	for (int j = 0; j < hc * hc; j++)
-		comb[j] = mixes[2 * hc + j] * d->scale[2] + d->base[2 * hc + j];
+		comb[j] = fmaf(mixes[2 * hc + j], d->scale[2], d->base[2 * hc + j]);
 	hc_sinkhorn(comb, d->sinkhorn_iters, d->eps);
 
 	int i = 0;
@@ -1970,7 +1747,7 @@ status_code cpu_hc_pre(backend *self, const hc_pre_host_desc *d) {
 	for (; i < dim; i++) {
 		float acc = 0.0f;
 		for (int h = 0; h < hc; h++)
-			acc += pre[h] * d->stream[(size_t)h * dim + i];
+			acc = fmaf(pre[h], d->stream[(size_t)h * dim + i], acc);
 		d->x[i] = acc;
 	}
 	return OK;
@@ -1995,7 +1772,7 @@ status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 		for (; i < dim; i++) {
 			float acc = d->sub[i] * post[dst_h];
 			for (int src_h = 0; src_h < hc; src_h++)
-				acc += d->hc_cur[(size_t)src_h * dim + i] * comb[dst_h + src_h * hc];
+				acc = fmaf(d->hc_cur[(size_t)src_h * dim + i], comb[dst_h + src_h * hc], acc);
 			dst[i] = acc;
 		}
 	}
@@ -2003,48 +1780,17 @@ status_code cpu_hc_post(backend *self, const hc_post_host_desc *d) {
 }
 
 static void l2_normalize_heads(float *x, int n_heads, int head_dim) {
-	for (int h = 0; h < n_heads; h++) {
-		float *v = x + (size_t)h * head_dim;
-		scale_vec_f32(v, 1.0f / sqrtf(rmsnorm_sum_sq(v, head_dim) + KDA_L2_EPS), head_dim);
-	}
+	cpu_l2_normalize_heads(x, n_heads, head_dim);
 }
 
 static void causal_conv_silu(float *state, const float *w, float *x, int channels, int kernel) {
-	const int hist = kernel - 1;
-	for (int c = 0; c < channels; c++) {
-		float		*h	 = state + (size_t)c * hist;
-		const float *wc	 = w + (size_t)c * kernel;
-		float		 sum = x[c] * wc[kernel - 1];
-		for (int k = 0; k < hist; k++)
-			sum += h[k] * wc[k];
-		memmove(h, h + 1, (size_t)(hist - 1) * sizeof(float));
-		h[hist - 1] = x[c];
-		x[c]		= silu(sum);
-	}
+	cpu_causal_conv_silu(state, w, x, channels, kernel);
 }
 
 static void kda_heads(int begin, int end, int tid, void *arg) {
 	(void)tid;
-	kda_job	   *j	  = arg;
-	const int	S	  = j->head_dim;
-	const float scale = 1.0f / sqrtf((float)S);
-	float		delta[512];
-	float		decay[512];
-	for (int h = begin; h < end; h++) {
-		float		*M = j->state + (size_t)h * S * S;
-		const float *q = j->q + (size_t)h * S;
-		const float *k = j->k + (size_t)h * S;
-		const float *v = j->v + (size_t)h * S;
-		const float *g = j->g + (size_t)h * S;
-		float		*o = j->out + (size_t)h * S;
-		float		 b = j->beta[h];
-		for (int i = 0; i < S; i++)
-			decay[i] = num_expf(g[i]);
-		for (int r = 0; r < S; r++)
-			delta[r] = (v[r] - decay_dot_f32(M + (size_t)r * S, decay, k, S)) * b;
-		for (int r = 0; r < S; r++)
-			o[r] = axpy_dot_f32(M + (size_t)r * S, k, delta[r], q, S) * scale;
-	}
+	kda_job *j = arg;
+	cpu_kda_heads_range(j->state, j->q, j->k, j->v, j->g, j->beta, j->out, j->head_dim, begin, end);
 }
 
 status_code cpu_kda(backend *self, const kda_host_desc *d) {
@@ -2080,20 +1826,7 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 		st = matmul_vec(self, &d->beta, d->x, beta, H, dim);
 	if (st != OK)
 		return st;
-	const float lb = d->gate_lower_bound;
-	for (int h = 0; h < H; h++) {
-		for (int i = 0; i < S; i++) {
-			int	  idx = h * S + i;
-			float t	  = g[idx] + d->dt_bias[idx];
-			if (lb > -INFINITY) {
-				g[idx] = lb * sigmoidf(-(t * d->ssm_a[h]));
-			} else {
-				float sp = t > 20.0f ? t : log1pf(num_expf(t));
-				g[idx]	 = sp * d->ssm_a[h];
-			}
-		}
-		beta[h] = sigmoidf(beta[h]);
-	}
+	cpu_kda_gates(g, beta, d->dt_bias, d->ssm_a, H, S, d->gate_lower_bound);
 
 	kda_job job	 = {d->state, q, k, v, g, beta, o, S};
 	tpool  *pool = self->get_pool ? self->get_pool(self) : NULL;
@@ -2117,30 +1850,13 @@ status_code cpu_kda(backend *self, const kda_host_desc *d) {
 }
 
 static void mla_heads(int begin, int end, int tid, void *arg) {
-	mla_job	 *j	  = arg;
-	float	 *sc  = j->scratch + (size_t)(tid < 0 ? 0 : tid) * j->scratch_stride;
-	float	 *lat = sc + j->n_pos;
-	const int R	  = j->kv_lora;
-	for (int h = begin; h < end; h++) {
-		const float *qa = j->q_abs + (size_t)h * R;
-		float		 mx = -INFINITY;
-		for (int t = 0; t < j->n_pos; t++) {
-			sc[t] = dot_f32(qa, j->cache + (size_t)t * R, R) * j->scale;
-			mx	  = fmaxf(mx, sc[t]);
-		}
-		float sum = 0.0f;
-		for (int t = 0; t < j->n_pos; t++) {
-			sc[t] = num_expf(sc[t] - mx);
-			sum += sc[t];
-		}
-		memset(lat, 0, (size_t)R * sizeof(float));
-		for (int t = 0; t < j->n_pos; t++)
-			axpy_f32(lat, j->cache + (size_t)t * R, sc[t] / sum, R);
-		const float *vb = j->v_b + (size_t)h * j->v_head * R;
-		float		*o	= j->out + (size_t)h * j->v_head;
-		for (int d = 0; d < j->v_head; d++)
-			o[d] = dot_f32(vb + (size_t)d * R, lat, R);
-	}
+	mla_job			*j	  = arg;
+	float			*sc	  = j->scratch + (size_t)(tid < 0 ? 0 : tid) * j->scratch_stride;
+	float			*lat  = sc + j->n_pos;
+	cpu_mla_abs_args args = {j->q_abs, j->cache,   j->v_b,	  j->out,
+							 j->n_pos, j->kv_lora, j->v_head, j->scale};
+	for (int h = begin; h < end; h++)
+		cpu_mla_abs_head(&args, h, sc, lat);
 }
 
 status_code cpu_mla_absorbed(backend *self, const mla_absorbed_host_desc *d) {
