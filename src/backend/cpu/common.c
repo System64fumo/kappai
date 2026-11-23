@@ -940,7 +940,7 @@ void matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_bl
 					ib += 2;
 					is += 2;
 				}
-				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
+				sumf[r] = fmaf(xb->d, fmaf(d, (float)sumi, -(dmin * (float)summ)), sumf[r]);
 			}
 		}
 		for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
@@ -1000,7 +1000,7 @@ void matmul_q5_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_bl
 					u1 <<= 2;
 					u2 <<= 2;
 				}
-				sumf[r] += xb->d * ((d * (float)sumi) - (dmin * (float)summ));
+				sumf[r] = fmaf(xb->d, fmaf(d, (float)sumi, -(dmin * (float)summ)), sumf[r]);
 			}
 		}
 		for (int r = 0; r < Q5_K_REPACKED_ROWS; r++) {
@@ -1042,7 +1042,7 @@ static float q6_k_repacked_dot(const uint8_t *ql, const uint8_t *qh, const int8_
 		xq8 += 16;
 		ap += 16;
 	}
-	return acc + d * (float)total;
+	return fmaf(d, (float)total, acc);
 }
 
 void matmul_q6_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_block *restrict xq,

@@ -13,7 +13,7 @@ int test_parse_device_selection(int argc, char **argv, const test_device *devs, 
 	int			n_pos = 0;
 	for (int ai = 1; ai < argc; ai++) {
 		if (strcmp(argv[ai], "--n-prefill") == 0 || strcmp(argv[ai], "--n-decode") == 0 ||
-			strcmp(argv[ai], "--arch") == 0) {
+			strcmp(argv[ai], "--arch") == 0 || strcmp(argv[ai], "--quant") == 0) {
 			ai++;
 			continue;
 		}

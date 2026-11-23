@@ -389,6 +389,17 @@ static inline float num_dot_f32(const float *a, const float *b, int n) {
 	return lane[0];
 }
 
+static inline float num_dot_f32_bf16(const float *a, const uint16_t *b, int n) {
+	float lane[NUM_DOT_LANES] = {0};
+	for (int d = 0; d < n; d++)
+		lane[d & (NUM_DOT_LANES - 1)] =
+			fmaf(a[d], num_bits_f32((uint32_t)b[d] << 16), lane[d & (NUM_DOT_LANES - 1)]);
+	for (int s = NUM_DOT_LANES / 2; s > 0; s >>= 1)
+		for (int l = 0; l < s; l++)
+			lane[l] += lane[l + s];
+	return lane[0];
+}
+
 static inline float attn_block_sum4(const float *w) {
 	return (w[0] + w[1]) + (w[2] + w[3]);
 }

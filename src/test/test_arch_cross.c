@@ -1,6 +1,7 @@
 #include "test_core.h"
 #include "test_synth_gguf.h"
 
+#include "gguf.h"
 #include "recipe/internal.h"
 
 #define CROSS_DEFAULT_PREFILL 24
@@ -40,19 +41,22 @@ static const cross_arch CROSS_ARCHS[] = {
 	{"qwen3vl", ARCH_QWEN3VL, NULL, tsg_build_qwen3vl, 3},
 };
 
+static int		   cross_wide_dims;
+static const char *cross_quant_name = "f32";
+
 static const char *cross_fixture(const cross_arch *e, char *buf, size_t sz) {
 	if (e->fixture_path)
 		return e->fixture_path();
-	tsg_arch_spec spec = {.dim			= 64,
+	tsg_arch_spec spec = {.dim			= cross_wide_dims ? 256 : 64,
 						  .n_heads		= 4,
 						  .n_kv_heads	= 2,
-						  .head_dim		= 16,
+						  .head_dim		= cross_wide_dims ? 64 : 16,
 						  .n_layers		= e->n_layers,
-						  .intermediate = 96,
+						  .intermediate = cross_wide_dims ? 512 : 96,
 						  .ctx			= 256,
 						  .vocab		= 96,
 						  .seed			= 0xA2C4ULL + (uint64_t)e->arch};
-	snprintf(buf, sz, "%s/archs_%s.gguf", synth_fixture_dir, e->name);
+	snprintf(buf, sz, "%s/archs_%s_%s.gguf", synth_fixture_dir, e->name, cross_quant_name);
 	e->build(buf, &spec);
 	return buf;
 }
@@ -295,6 +299,24 @@ static void cross_report_step(const char *label, const float *lr, const float *l
 		   same ? "match" : "MISMATCH", st.nonfinite ? " NON-FINITE" : "");
 }
 
+static void cross_quant_summary(const char *path, char *out, size_t sz) {
+	gguf_ctx ctx;
+	memset(&ctx, 0, sizeof(ctx));
+	snprintf(out, sz, "unknown");
+	if (gguf_load_metadata(&ctx, path) != OK)
+		return;
+	size_t weights	 = 0;
+	size_t quantized = 0;
+	for (size_t i = 0; i < ctx.n_tensors; i++) {
+		if (ctx.tensors[i].n_dims < 2)
+			continue;
+		weights++;
+		quantized += ctx.tensors[i].type != GGML_TYPE_F32;
+	}
+	snprintf(out, sz, "%zu of %zu matrices stored as %s", quantized, weights, cross_quant_name);
+	gguf_free(&ctx);
+}
+
 static uint32_t cross_rng_state;
 
 static uint32_t cross_rng(void) {
@@ -305,12 +327,16 @@ static uint32_t cross_rng(void) {
 static void cross_run_arch(const cross_arch *e, backend *ref, const char *ref_spec, backend *tgt,
 						   const char *tgt_spec, int n_prefill, int n_decode, int flash) {
 	char label[160];
-	snprintf(label, sizeof(label), "archs.%s %s vs %s", e->name, tgt_spec, ref_spec);
+	snprintf(label, sizeof(label), "archs.%s[%s] %s vs %s", e->name, cross_quant_name, tgt_spec,
+			 ref_spec);
 
 	char		built_path[512];
 	const char *path = cross_fixture(e, built_path, sizeof(built_path));
 
 	printf("\n=== %s: %s vs %s ===\n", e->name, tgt_spec, ref_spec);
+	char quant_info[96];
+	cross_quant_summary(path, quant_info, sizeof(quant_info));
+	printf("  weights: %s\n", quant_info);
 
 	int		   n_ctx = n_prefill + n_decode + 16;
 	cross_side r;
@@ -415,15 +441,19 @@ typedef struct {
 	int			n_prefill;
 	int			n_decode;
 	int			flash;
+	uint32_t	quant;
+	const char *quant_name;
 	const char *filters[CROSS_MAX_ARCH_FILTERS];
 	int			n_filters;
 } cross_options;
 
 static int cross_parse_options(int argc, char **argv, cross_options *o) {
-	o->n_prefill = CROSS_DEFAULT_PREFILL;
-	o->n_decode	 = CROSS_DEFAULT_DECODE;
-	o->flash	 = 1;
-	o->n_filters = 0;
+	o->n_prefill  = CROSS_DEFAULT_PREFILL;
+	o->n_decode	  = CROSS_DEFAULT_DECODE;
+	o->flash	  = 1;
+	o->quant	  = tsg_quant_by_name("f32");
+	o->quant_name = "f32";
+	o->n_filters  = 0;
 	for (int ai = 1; ai < argc; ai++) {
 		if (strcmp(argv[ai], "--n-prefill") == 0 && ai + 1 < argc) {
 			o->n_prefill = atoi(argv[++ai]);
@@ -431,6 +461,14 @@ static int cross_parse_options(int argc, char **argv, cross_options *o) {
 			o->n_decode = atoi(argv[++ai]);
 		} else if (strcmp(argv[ai], "--no-flash") == 0) {
 			o->flash = 0;
+		} else if (strcmp(argv[ai], "--quant") == 0 && ai + 1 < argc) {
+			o->quant_name = argv[++ai];
+			o->quant	  = tsg_quant_by_name(o->quant_name);
+			if (o->quant == UINT32_MAX) {
+				fprintf(stderr, "error: unknown quant '%s' (choose from: %s)\n", o->quant_name,
+						tsg_quant_names());
+				return -1;
+			}
 		} else if (strcmp(argv[ai], "--arch") == 0 && ai + 1 < argc) {
 			if (o->n_filters >= CROSS_MAX_ARCH_FILTERS) {
 				fprintf(stderr, "error: too many --arch filters\n");
@@ -483,6 +521,9 @@ int run_arch_cross_mode(int argc, char **argv, test_device *devs, int n_devs) {
 	}
 	printf("reference device: %s\n", sel.ref);
 
+	tsg_set_quant(opt.quant);
+	cross_quant_name = opt.quant_name;
+	cross_wide_dims	 = tsg_quant_block_elems(opt.quant) >= 256;
 	synth_suite_common_init();
 
 	int run_all = wants_all(argc, argv);

@@ -31,6 +31,8 @@ typedef struct {
 	uint64_t dims[4];
 	float	*data;
 	size_t	 nelem;
+	size_t	 nbytes;
+	uint32_t type;
 	size_t	 off_field_pos;
 } tsg_tensor;
 
@@ -105,21 +107,25 @@ typedef struct {
 	uint64_t seed;
 } tsg_arch_spec;
 
-void	 tsg_seed(uint64_t s);
-void	 tsg_build_array_file(const char *path, uint32_t type, uint64_t count, const void *data,
-							  size_t bytes);
-uint32_t tsg_rand(void);
-void	 tsg_build_vocab_file(const char *path, const char *model_name, const char *pre,
-							  int has_space_flag, int space_flag, const char *const *tokens,
-							  const int32_t *types, size_t n);
-void	 tsg_build_chat_llama(const char *path, const tsg_llama_spec *s);
-void	 tsg_build_lfm2(const char *path, const tsg_lfm2_spec *s);
-void	 tsg_build_glm_dsa(const char *path, const tsg_dsa_spec *s);
-void	 tsg_build_qwen3vl(const char *path, const tsg_arch_spec *s);
-void	 tsg_build_lfm3(const char *path, const tsg_arch_spec *s);
-void	 tsg_build_gemma4(const char *path, const tsg_arch_spec *s);
-void	 tsg_build_gemma4_moe(const char *path, const tsg_arch_spec *s);
-void	 tsg_build_qwen35(const char *path, const tsg_arch_spec *s);
-void	 tsg_build_glm5_next(const char *path, const tsg_arch_spec *s);
+void		tsg_seed(uint64_t s);
+uint32_t	tsg_quant_by_name(const char *name);
+uint32_t	tsg_quant_block_elems(uint32_t type);
+void		tsg_set_quant(uint32_t type);
+const char *tsg_quant_names(void);
+void		tsg_build_array_file(const char *path, uint32_t type, uint64_t count, const void *data,
+								 size_t bytes);
+uint32_t	tsg_rand(void);
+void		tsg_build_vocab_file(const char *path, const char *model_name, const char *pre,
+								 int has_space_flag, int space_flag, const char *const *tokens,
+								 const int32_t *types, size_t n);
+void		tsg_build_chat_llama(const char *path, const tsg_llama_spec *s);
+void		tsg_build_lfm2(const char *path, const tsg_lfm2_spec *s);
+void		tsg_build_glm_dsa(const char *path, const tsg_dsa_spec *s);
+void		tsg_build_qwen3vl(const char *path, const tsg_arch_spec *s);
+void		tsg_build_lfm3(const char *path, const tsg_arch_spec *s);
+void		tsg_build_gemma4(const char *path, const tsg_arch_spec *s);
+void		tsg_build_gemma4_moe(const char *path, const tsg_arch_spec *s);
+void		tsg_build_qwen35(const char *path, const tsg_arch_spec *s);
+void		tsg_build_glm5_next(const char *path, const tsg_arch_spec *s);
 
 #endif

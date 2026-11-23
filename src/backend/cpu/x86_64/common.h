@@ -23,6 +23,15 @@ static inline __m256 loadu_bf16x8_to_ps(const uint16_t *p) {
 	return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
 }
 
+static inline __m256 vround_away_ps(__m256 x) {
+	const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+	__m256		 t		   = _mm256_round_ps(x, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+	__m256		 frac	   = _mm256_andnot_ps(sign_mask, _mm256_sub_ps(x, t));
+	__m256		 ge_half   = _mm256_cmp_ps(frac, _mm256_set1_ps(0.5f), _CMP_GE_OQ);
+	__m256		 step	   = _mm256_or_ps(_mm256_set1_ps(1.0f), _mm256_and_ps(x, sign_mask));
+	return _mm256_add_ps(t, _mm256_and_ps(ge_half, step));
+}
+
 static inline __m256 vexp_split_ps(__m256 x, __m256 *pow2n) {
 	x		 = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-NUM_EXP_LIMIT)),
 							 _mm256_set1_ps(NUM_EXP_LIMIT));

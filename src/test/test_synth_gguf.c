@@ -1,5 +1,8 @@
 #include "test_synth_gguf.h"
 
+#include "gguf.h"
+#include "numeric.h"
+
 #include <math.h>
 
 static const char *tsg_chat_template =
@@ -111,6 +114,125 @@ static void tsg_kv_arr_str(tsg_writer *w, const char *key, const char *const *v,
 	for (size_t i = 0; i < n; i++)
 		tsg_str(&w->body, v[i]);
 }
+
+typedef struct {
+	const char *name;
+	uint32_t	type;
+	int			d_off;
+	int			m_off;
+	float		d;
+	float		m;
+} tsg_quant_desc;
+
+static const tsg_quant_desc TSG_QUANTS[] = {
+	{"f32", GGML_TYPE_F32, -1, -1, 0.0f, 0.0f},
+	{"f16", GGML_TYPE_F16, -1, -1, 0.0f, 0.0f},
+	{"bf16", GGML_TYPE_BF16, -1, -1, 0.0f, 0.0f},
+	{"q4_0", GGML_TYPE_Q4_0, 0, -1, 0.012f, 0.0f},
+	{"q4_1", GGML_TYPE_Q4_1, 0, 2, 0.012f, -0.09f},
+	{"q5_0", GGML_TYPE_Q5_0, 0, -1, 0.005f, 0.0f},
+	{"q5_1", GGML_TYPE_Q5_1, 0, 2, 0.005f, -0.08f},
+	{"q8_0", GGML_TYPE_Q8_0, 0, -1, 0.0008f, 0.0f},
+	{"iq4_nl", GGML_TYPE_IQ4_NL, 0, -1, 0.0008f, 0.0f},
+	{"q3_k", GGML_TYPE_Q3_K, 108, -1, 6e-4f, 0.0f},
+	{"q4_k", GGML_TYPE_Q4_K, 0, 2, 1e-4f, 1e-4f},
+	{"q5_k", GGML_TYPE_Q5_K, 0, 2, 5e-5f, 5e-5f},
+	{"q6_k", GGML_TYPE_Q6_K, 208, -1, 2e-5f, 0.0f},
+	{"iq4_xs", GGML_TYPE_IQ4_XS, 0, -1, 2e-5f, 0.0f},
+	{"iq3_s", GGML_TYPE_IQ3_S, 0, -1, 3e-3f, 0.0f},
+	{"iq3_xxs", GGML_TYPE_IQ3_XXS, 0, -1, 1e-4f, 0.0f},
+	{"iq2_xxs", GGML_TYPE_IQ2_XXS, 0, -1, 3e-4f, 0.0f},
+	{"iq2_s", GGML_TYPE_IQ2_S, 0, -1, 3e-4f, 0.0f},
+};
+
+static uint32_t tsg_quant_type = GGML_TYPE_F32;
+
+uint32_t tsg_quant_by_name(const char *name) {
+	for (size_t i = 0; i < ARRAY_LEN(TSG_QUANTS); i++)
+		if (strcmp(TSG_QUANTS[i].name, name) == 0)
+			return TSG_QUANTS[i].type;
+	return UINT32_MAX;
+}
+
+const char *tsg_quant_names(void) {
+	return "f32 f16 bf16 q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl q3_k q4_k q5_k q6_k iq4_xs iq3_s iq3_xxs "
+		   "iq2_xxs iq2_s";
+}
+
+uint32_t tsg_quant_block_elems(uint32_t type) {
+	size_t	 block_bytes = ggml_row_size(type, 1);
+	uint32_t elems		 = 1;
+	while (ggml_row_size(type, elems + 1) == block_bytes)
+		elems++;
+	return elems;
+}
+
+void tsg_set_quant(uint32_t type) {
+	tsg_quant_type = type;
+}
+
+static const tsg_quant_desc *tsg_quant_desc_for(uint32_t type) {
+	for (size_t i = 0; i < ARRAY_LEN(TSG_QUANTS); i++)
+		if (TSG_QUANTS[i].type == type)
+			return &TSG_QUANTS[i];
+	return NULL;
+}
+
+static int tsg_name_keeps_f32(const char *name) {
+	static const char *const keep[] = {"ssm_", "hc_",	   "ffn_gate_inp",
+									   "conv", "attn_k_b", "attn_v_b"};
+	for (size_t i = 0; i < ARRAY_LEN(keep); i++)
+		if (strstr(name, keep[i]))
+			return 1;
+	return 0;
+}
+
+static void tsg_put_half(uint8_t *dst, float v) {
+	uint16_t h = num_f32_to_f16(v);
+	memcpy(dst, &h, sizeof(h));
+}
+
+static void *tsg_make_quantized(uint32_t type, size_t nelem, float scale, size_t *nbytes) {
+	const tsg_quant_desc *desc = tsg_quant_desc_for(type);
+	if (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16) {
+		uint16_t *out = malloc(nelem * sizeof(uint16_t));
+		for (size_t i = 0; i < nelem; i++) {
+			float v = tsg_uniform(-scale, scale);
+			if (type == GGML_TYPE_F16) {
+				out[i] = num_f32_to_f16(v);
+			} else {
+				uint32_t bits = num_f32_bits(v);
+				out[i]		  = (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+			}
+		}
+		*nbytes = nelem * sizeof(uint16_t);
+		return out;
+	}
+	uint32_t blk_elems	 = tsg_quant_block_elems(type);
+	size_t	 block_bytes = ggml_row_size(type, 1);
+	size_t	 n_blocks	 = nelem / blk_elems;
+	uint8_t *out		 = malloc(n_blocks * block_bytes);
+	for (size_t b = 0; b < n_blocks; b++) {
+		uint8_t *blk = out + (b * block_bytes);
+		for (size_t i = 0; i < block_bytes; i++)
+			blk[i] = (uint8_t)(tsg_rand() >> 5);
+		tsg_put_half(blk + desc->d_off, desc->d);
+		if (desc->m_off >= 0)
+			tsg_put_half(blk + desc->m_off, desc->m);
+	}
+	*nbytes = n_blocks * block_bytes;
+	return out;
+}
+
+static int tsg_should_quantize(const char *name, uint32_t ndims, const uint64_t *dims,
+							   float scale) {
+	if (tsg_quant_type == GGML_TYPE_F32 || ndims < 2 || scale < 0.0f || tsg_name_keeps_f32(name))
+		return 0;
+	if (tsg_quant_type == GGML_TYPE_F16 || tsg_quant_type == GGML_TYPE_BF16)
+		return 1;
+	return dims[0] % tsg_quant_block_elems(tsg_quant_type) == 0;
+}
+
 static float *tsg_tensor_new(tsg_writer *w, const char *name, uint32_t ndims, const uint64_t *dims,
 							 float scale) {
 	if (w->n_tensors >= TSG_MAX_TENSORS)
@@ -123,7 +245,14 @@ static float *tsg_tensor_new(tsg_writer *w, const char *name, uint32_t ndims, co
 		t->dims[d] = dims[d];
 		t->nelem *= (size_t)dims[d];
 	}
-	t->data = malloc(t->nelem * sizeof(float));
+	t->type = GGML_TYPE_F32;
+	if (tsg_should_quantize(name, ndims, dims, scale)) {
+		t->type = tsg_quant_type;
+		t->data = tsg_make_quantized(t->type, t->nelem, scale, &t->nbytes);
+		return t->data;
+	}
+	t->nbytes = t->nelem * sizeof(float);
+	t->data	  = malloc(t->nbytes);
 	if (!t->data)
 		abort();
 	if (scale < 0.0f)
@@ -192,7 +321,7 @@ static int tsg_finish(tsg_writer *w, const char *path) {
 		tsg_u32(&w->body, w->tensors[i].ndims);
 		for (uint32_t d = 0; d < w->tensors[i].ndims; d++)
 			tsg_u64(&w->body, w->tensors[i].dims[d]);
-		tsg_u32(&w->body, 0u);
+		tsg_u32(&w->body, w->tensors[i].type);
 		w->tensors[i].off_field_pos = w->body.len;
 		tsg_u64(&w->body, 0);
 	}
@@ -204,7 +333,7 @@ static int tsg_finish(tsg_writer *w, const char *path) {
 		while (w->body.len % TSG_ALIGN)
 			tsg_put(&w->body, "\0", 1);
 		uint64_t off = (uint64_t)(w->body.len - data_start);
-		tsg_put(&w->body, w->tensors[i].data, w->tensors[i].nelem * sizeof(float));
+		tsg_put(&w->body, w->tensors[i].data, w->tensors[i].nbytes);
 		memcpy(w->body.buf + w->tensors[i].off_field_pos, &off, 8);
 	}
 
@@ -313,7 +442,7 @@ void tsg_build_chat_llama(const char *path, const tsg_llama_spec *s) {
 	if (!s->tied) {
 		float *outw = tsg_add2(&w, "output.weight", (uint64_t)s->dim, (uint64_t)V, 0.10f);
 		if (s->output_copies_embd && embd && outw)
-			memcpy(outw, embd, sizeof(float) * (size_t)s->dim * (size_t)V);
+			memcpy(outw, embd, w.tensors[w.n_tensors - 1].nbytes);
 	} else {
 		float *discard = malloc((size_t)s->dim * (size_t)V * sizeof(float));
 		if (!discard)

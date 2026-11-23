@@ -426,6 +426,11 @@ float max_combined_ratio_at(const float *a, const float *b, int n, float atol, f
 
 verdict classify_output(const char *tol_kind, const float *y_ref, const float *y_got, int n,
 						status_code tgt_status, char *detail, size_t detail_sz) {
+	static int bits_env = -1;
+	if (bits_env < 0)
+		bits_env = getenv("KAPPAI_TEST_BITS") != NULL;
+	if (bits_env && tol_kind && strcmp(tol_kind, "loose") == 0)
+		tol_kind = "bits";
 	if (tgt_status == ERR_UNSUPPORTED) {
 		snprintf(detail, detail_sz, "missing native implementation");
 		return V_SKIP;
@@ -453,19 +458,25 @@ verdict classify_output(const char *tol_kind, const float *y_ref, const float *y
 
 	if (tol_kind && strcmp(tol_kind, "bits") == 0) {
 		int ndiff = 0;
+		int first = -1;
 		for (int i = 0; i < n; i++) {
 			uint32_t a, b;
 			memcpy(&a, &y_ref[i], sizeof(a));
 			memcpy(&b, &y_got[i], sizeof(b));
-			if (a != b)
+			if (a != b) {
+				if (first < 0)
+					first = i;
 				ndiff++;
+			}
 		}
 		if (ndiff == 0) {
 			snprintf(detail, detail_sz, "bit-identical (%d values)", n);
 			return V_PASS;
 		}
-		snprintf(detail, detail_sz, "%d/%d values differ in low bits (not bit-identical)", ndiff,
-				 n);
+		snprintf(detail, detail_sz,
+				 "%d/%d values differ in low bits (not bit-identical); first@%d ref=%.9g got=%.9g",
+				 ndiff, n, first, first >= 0 ? y_ref[first] : 0.0f,
+				 first >= 0 ? y_got[first] : 0.0f);
 		return V_FAIL;
 	}
 
@@ -942,35 +953,38 @@ status_code test_device_create(const test_device *d, backend **out) {
 }
 
 void usage(const char *prog) {
-	fprintf(stderr,
-			"Usage:\n"
-			"  %s [--all | <device>...]        per-op validation: device(s) vs default reference\n"
-			"  %s <ref> <device>...            device-vs-device: <ref> is the reference\n"
-			"  %s --bench [matmul|attn|dequant|tok|e2e|all] [--all | <device>]   benchmarks\n"
-			"  %s --archs [--all | [<ref>] <device>...]  per-architecture cross-device check\n"
-			"\n"
-			"Modes:\n"
-			"  (default)    per-op correctness (each op vs reference) plus combined-op tests\n"
-			"               (single layer, multi-layer prefill, decode chains, and a full\n"
-			"               prompt-processing + %d-token generation sweep across "
-			"architectures) --\n"
-			"               catches compounding errors across op chains; reference errors or\n"
-			"               NaN/Inf at any step are always reported as a failure\n"
-			"  --bench      matmul GFLOPS | attention latency | dequant throughput |\n"
-			"               tokenizer throughput | end-to-end tok/s\n"
-			"               (pick: matmul attn dequant tok e2e all)\n"
-			"  --archs      fabricate a GGUF per architecture, run prefill + decode on two\n"
-			"               devices and report where and by how much they diverge\n"
-			"\n"
-			"Options:\n"
-			"  --all              run against every available device\n"
-			"  --n-prefill N      override prefill token count (archs mode, e2e bench)\n"
-			"  --n-decode  N      override decode token count (archs mode, e2e bench)\n"
-			"  --arch NAME        restrict --archs to one architecture (repeatable)\n"
-			"  -h, --help         this message\n"
-			"\n"
-			"Available devices: ",
-			prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
+	fprintf(
+		stderr,
+		"Usage:\n"
+		"  %s [--all | <device>...]        per-op validation: device(s) vs default reference\n"
+		"  %s <ref> <device>...            device-vs-device: <ref> is the reference\n"
+		"  %s --bench [matmul|attn|dequant|tok|e2e|all] [--all | <device>]   benchmarks\n"
+		"  %s --archs [--all | [<ref>] <device>...]  per-architecture cross-device check\n"
+		"\n"
+		"Modes:\n"
+		"  (default)    per-op correctness (each op vs reference) plus combined-op tests\n"
+		"               (single layer, multi-layer prefill, decode chains, and a full\n"
+		"               prompt-processing + %d-token generation sweep across "
+		"architectures) --\n"
+		"               catches compounding errors across op chains; reference errors or\n"
+		"               NaN/Inf at any step are always reported as a failure\n"
+		"  --bench      matmul GFLOPS | attention latency | dequant throughput |\n"
+		"               tokenizer throughput | end-to-end tok/s\n"
+		"               (pick: matmul attn dequant tok e2e all)\n"
+		"  --archs      fabricate a GGUF per architecture, run prefill + decode on two\n"
+		"               devices and report where and by how much they diverge\n"
+		"\n"
+		"Options:\n"
+		"  --all              run against every available device\n"
+		"  --n-prefill N      override prefill token count (archs mode, e2e bench)\n"
+		"  --n-decode  N      override decode token count (archs mode, e2e bench)\n"
+		"  --arch NAME        restrict --archs to one architecture (repeatable)\n"
+		"  --quant TYPE       store fabricated weights as TYPE (f32 f16 bf16 q4_0 q4_1 q5_0 q5_1\n"
+		"                     q8_0 iq4_nl q3_k q4_k q5_k q6_k iq4_xs iq3_s iq3_xxs iq2_xxs iq2_s)\n"
+		"  -h, --help         this message\n"
+		"\n"
+		"Available devices: ",
+		prog, prog, prog, prog, ARCH_GENERATE_N_DECODE);
 	test_device devs[TEST_MAX_DEVICES];
 	int			n = test_enum_devices(devs, TEST_MAX_DEVICES);
 	for (int i = 0; i < n; i++)
