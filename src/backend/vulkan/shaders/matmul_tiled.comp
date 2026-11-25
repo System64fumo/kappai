@@ -67,8 +67,14 @@ void main() {
 		uint row = row0 + tr * 4u + i;
 		for (uint j = 0u; j < 4u; j++) {
 			uint col = col0 + tc * 4u + j;
-			if (row < n && col < m)
-				y[col * n + row] = acc[i * 4u + j];
+			if (row < n && col < m) {
+				float v = acc[i * 4u + j];
+				if (pc.res_mode == 1)
+					v += res[row];
+				else if (pc.res_mode == 2)
+					v += y[col * n + row];
+				y[col * n + row] = v;
+			}
 		}
 	}
 }

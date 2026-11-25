@@ -220,7 +220,7 @@ VK_PLAIN := argmax argmax_reduce sample_topk sample_final sample_penalty sample_
             kda_gate kda_delta kda_out mla_absorb_q mla_absorb_attn mla_kv_put mla_attention \
             gdn_conv gdn_heads shortconv
 VK_MATMUL := matmul_q4_0 matmul_q4_1 matmul_q5_0 matmul_q5_1 matmul_q8_0 matmul_q4_k matmul_q5_k \
-             matmul_q6_k matmul_iq3_s matmul_f32 matmul_f16 matmul_bf16 matmul_iq2_s matmul_iq2_xxs \
+             matmul_q6_k matmul_iq3_s matmul_iq2_s matmul_iq2_xxs \
              matmul_iq3_xxs matmul_iq4_xs
 VK_QCORE := q4_0 q4_1 q5_0 q5_1 q8_0 iq4_nl
 VK_KQ    := q4_k q5_k q6_k
@@ -233,21 +233,28 @@ VK_IQ    := iq2_xxs iq2_s iq3_xxs iq3_s
 upper_def = -D$(shell echo $(1) | tr a-z A-Z)
 
 $(foreach s,$(VK_PLAIN),$(call vk,$(s),$(s),))
-$(foreach s,$(VK_MATMUL),$(call vk,$(s)_batch,$(s),-DBATCHED))
-$(foreach s,matmul_q4_0 matmul_q4_k matmul_q6_k,$(call vk,$(s)_dual_batch,$(s),-DNMAT_DUAL -DBATCHED))
-$(call vk,matmul_q4_0_triple_batch,matmul_q4_0,-DNMAT_TRIPLE -DBATCHED)
-$(call vk,matmul_iq4_nl_batch,matmul_iq4_nl,-DBATCHED)
-$(foreach t,$(VK_QCORE),$(call vk,q_matvec_$(t),q_matvec,$(call def,$(t))))
-$(foreach t,$(VK_QCORE),$(call vk,q_matvec_wg16_$(t),q_matvec,$(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
+$(foreach s,$(VK_MATMUL),$(call vk,$(s)_batch,matmul_legacy,$(call upper_def,$(patsubst matmul_%,%,$(s))) -DBATCHED))
+$(call vk,matmul_f32_batch,matmul_dense,-DBATCHED -DW_F32)
+$(call vk,matmul_f16_batch,matmul_dense,-DBATCHED -DW_F16)
+$(call vk,matmul_bf16_batch,matmul_dense,-DBATCHED -DW_BF16)
+$(call vk,matmul_q4_0_dual_batch,matmul_legacy,-DQ4_0 -DNMAT_DUAL -DBATCHED)
+$(call vk,matmul_q4_k_dual_batch,matmul_legacy,-DQ4_K -DNMAT_DUAL -DBATCHED)
+$(call vk,matmul_q6_k_dual_batch,matmul_legacy,-DQ6_K -DNMAT_DUAL -DBATCHED)
+$(call vk,matmul_q4_0_triple_batch,matmul_legacy,-DQ4_0 -DNMAT_TRIPLE -DBATCHED)
+$(call vk,matmul_iq4_nl_batch,matmul_legacy,-DIQ4_NL -DBATCHED)
+$(foreach t,$(VK_QCORE),$(call vk,q_matvec_$(t),matvec,-DMV_QCORE $(call def,$(t))))
+$(foreach t,$(VK_QCORE),$(call vk,q_matvec_wg16_$(t),matvec,-DMV_QCORE $(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
 $(foreach t,$(VK_QCORE),$(call vk,q_matmul_$(t),q_matmul,$(call def,$(t))))
+$(call vk,q_matmul_m16_iq4_nl,q_matmul,$(call def,iq4_nl) -DM_TILE=16)
 $(foreach t,q4_0 q8_0 iq4_nl q4_k bf16 f16 f32 q6_k,$(call vk,mmf_$(t),matmul_tiled,$(call def,$(t))))
 $(foreach t,$(VK_IQ),$(call vk,mmf_$(t),matmul_tiled,$(call upper_def,$(t))))
-$(foreach t,q4_k bf16 f16 f32 q6_k,$(call vk,mvk_$(t),matmul_matvec,$(call def,$(t))))
-$(foreach t,$(VK_IQ),$(call vk,mvk_$(t),matmul_matvec,$(call upper_def,$(t))))
-$(foreach t,$(VK_KQ),$(call vk,kq_matvec_$(t),kq_matvec,$(call def,$(t))))
-$(foreach t,$(VK_KQ),$(call vk,kq_matvec_wg16_$(t),kq_matvec,$(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
-$(foreach t,$(VK_DENSE),$(call vk,dense_matvec_$(t),dense_matvec,$(call def,$(t))))
-$(foreach t,$(VK_DENSE),$(call vk,dense_matvec_wg16_$(t),dense_matvec,$(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
+$(call vk,matmul_iq2s_tile,matmul_iq2s_tile,-DIQ2_S)
+$(foreach t,q4_k bf16 f16 f32 q6_k,$(call vk,mvk_$(t),matvec,-DMV_MVK $(call def,$(t))))
+$(foreach t,$(VK_IQ),$(call vk,mvk_$(t),matvec,-DMV_MVK $(call upper_def,$(t))))
+$(foreach t,$(VK_KQ),$(call vk,kq_matvec_$(t),matvec,-DMV_KQ $(call def,$(t))))
+$(foreach t,$(VK_KQ),$(call vk,kq_matvec_wg16_$(t),matvec,-DMV_KQ $(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
+$(foreach t,$(VK_DENSE),$(call vk,dense_matvec_$(t),matvec,-DMV_DENSE $(call def,$(t))))
+$(foreach t,$(VK_DENSE),$(call vk,dense_matvec_wg16_$(t),matvec,-DMV_DENSE $(call def,$(t)) -DWG=16 -DSHARED_REDUCE))
 $(call vk,q8k_quant,q8_quant,-DQ8K)
 $(call vk,rope_batch,rope,-DBATCHED)
 $(call vk,rope_ext_batch,rope,-DHAS_FF -DBATCHED)

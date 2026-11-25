@@ -44,14 +44,14 @@ void main() {
 		int j = int(gid) % hd2;
 		if (j >= rd2)
 			return;
-		float c	   = rcos[uint(pos) * uint(hd2) + uint(j)];
-		float s	   = rsin[uint(pos) * uint(hd2) + uint(j)];
+		float c	   = rcos[uint(pos) * uint(rd2) + uint(j)];
+		float s	   = rsin[uint(pos) * uint(rd2) + uint(j)];
 		uint  base = q_row_off + uint(h) * uint(params.head_dim);
 		if (params.neox != 0) {
 			float v0					  = q[base + uint(j)];
-			float v1					  = q[base + uint(j) + uint(hd2)];
+			float v1					  = q[base + uint(j) + uint(rd2)];
 			q[base + uint(j)]			  = v0 * c - v1 * s;
-			q[base + uint(j) + uint(hd2)] = v0 * s + v1 * c;
+			q[base + uint(j) + uint(rd2)] = v0 * s + v1 * c;
 		} else {
 			float v0				  = q[base + uint(j * 2)];
 			float v1				  = q[base + uint(j * 2 + 1)];
@@ -67,14 +67,14 @@ void main() {
 		int j = int(kid) % hd2;
 		if (j >= rd2)
 			return;
-		float c	   = rcos[uint(pos) * uint(hd2) + uint(j)];
-		float s	   = rsin[uint(pos) * uint(hd2) + uint(j)];
+		float c	   = rcos[uint(pos) * uint(rd2) + uint(j)];
+		float s	   = rsin[uint(pos) * uint(rd2) + uint(j)];
 		uint  base = k_row_off + uint(h) * uint(params.head_dim);
 		if (params.neox != 0) {
 			float v0					  = k[base + uint(j)];
-			float v1					  = k[base + uint(j) + uint(hd2)];
+			float v1					  = k[base + uint(j) + uint(rd2)];
 			k[base + uint(j)]			  = v0 * c - v1 * s;
-			k[base + uint(j) + uint(hd2)] = v0 * s + v1 * c;
+			k[base + uint(j) + uint(rd2)] = v0 * s + v1 * c;
 		} else {
 			float v0				  = k[base + uint(j * 2)];
 			float v1				  = k[base + uint(j * 2 + 1)];

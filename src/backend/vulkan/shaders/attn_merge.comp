@@ -41,9 +41,9 @@ void main() {
 	float m_max = s_red[0];
 	barrier();
 
-	float w		 = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : num_exp(m_s - m_max);
-	w_split[tid] = w;
-	s_red[tid]	 = has_split ? w * part[base + tid * stride + 1u] : 0.0;
+	precise float w = (m_s == neg_inf || m_max == neg_inf) ? 0.0 : num_exp(m_s - m_max);
+	w_split[tid]	= w;
+	s_red[tid]		= has_split ? w * part[base + tid * stride + 1u] : 0.0;
 	barrier();
 	for (uint r = WG / 2u; r > 0u; r >>= 1u) {
 		if (tid < r)
@@ -51,12 +51,12 @@ void main() {
 		barrier();
 	}
 	float l		= s_red[0];
-	float inv_l = l > 0.0 ? 1.0 / l : 0.0;
+	float inv_l = l > 0.0 ? div_exact(1.0, l) : 0.0;
 
 	for (uint e = tid; e < uint(pc.head_dim); e += WG) {
-		float o = 0.0;
+		precise float o = 0.0;
 		for (int s = 0; s < pc.n_splits; s++)
-			o += w_split[s] * part[base + uint(s) * stride + 2u + e];
+			o = fma(w_split[s], part[base + uint(s) * stride + 2u + e], o);
 		out_[qh * uint(pc.head_dim) + e] = o * inv_l;
 	}
 }

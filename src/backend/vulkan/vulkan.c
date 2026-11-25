@@ -383,6 +383,9 @@ typedef struct {
 	vk_pipeline_set p_q8_quant[2];
 	vk_pipeline_set p_nn[VK_NN_COUNT];
 	vk_pipeline_set p_qmm[VQ_MM_COUNT];
+	vk_pipeline_set p_qmm_iq4_m16;
+	vk_pipeline_set p_iq2s_tile;
+
 	vk_pipeline_set p_mmf[VK_MMF_TYPES];
 	vk_pipeline_set p_qmv[VQ_COUNT][2];
 	vk_attn_cache	attn_cache[VK_ATTN_KIND_MAX];
@@ -2118,6 +2121,12 @@ static void vk_qcore_init(vk_priv *p) {
 			return;
 		p->p_qmm[t].name = MM[t].name;
 	}
+	if (vk_create_pipeline(p, shader_q_matmul_m16_iq4_nl_spv, shader_q_matmul_m16_iq4_nl_spv_len, 4,
+						   16, &p->p_qmm_iq4_m16) == OK)
+		p->p_qmm_iq4_m16.name = "q_matmul_m16_iq4_nl";
+	if (vk_create_pipeline(p, shader_matmul_iq2s_tile_spv, shader_matmul_iq2s_tile_spv_len, 5, 16,
+						   &p->p_iq2s_tile) == OK)
+		p->p_iq2s_tile.name = "matmul_iq2s_tile";
 	p->qcore_ok = 1;
 }
 
@@ -4885,7 +4894,7 @@ static int vk_qcore_type(vk_priv *p, uint32_t w_type, int k, int m) {
 		if (MAP[i].type != w_type)
 			continue;
 		int fam = vk_qfamily(MAP[i].vq);
-		if (k % BLOCK[fam] != 0 || (fam != 0 && m >= VK_QMM_MIN_M))
+		if (k % BLOCK[fam] != 0 || (fam == 2 && m >= VK_QMM_MIN_M))
 			return -1;
 		return MAP[i].vq;
 	}
@@ -4932,9 +4941,14 @@ static status_code vk_qcore_matmul(vk_priv *p, int t, const buffer *w, const buf
 	VkDeviceSize	 offs[4] = {w->offset, xs->offset, y->offset, res ? res->offset : 0};
 	vk_pipeline_set *ps;
 	uint32_t		 gx, gy;
-	if (m >= VK_QMM_MIN_M) {
-		ps = &p->p_qmm[t];
-		gx = (uint32_t)((m + VK_QMM_TILE - 1) / VK_QMM_TILE);
+	if (t < VQ_MM_COUNT && (m >= VK_QMM_MIN_M || (t == VQ_IQ4_NL && m > 1))) {
+		int tile = VK_QMM_TILE;
+		ps		 = &p->p_qmm[t];
+		if (t == VQ_IQ4_NL && m <= 16 && p->p_qmm_iq4_m16.pipeline) {
+			ps	 = &p->p_qmm_iq4_m16;
+			tile = 16;
+		}
+		gx = (uint32_t)((m + tile - 1) / tile);
 		gy = (uint32_t)((n + VK_QMM_TILE - 1) / VK_QMM_TILE);
 	} else {
 		int c = m == 1 ? 0 : 1;
@@ -5014,6 +5028,8 @@ static int vk_mmf_usable(vk_priv *p, uint32_t w_type, int k, int m) {
 	int idx = vk_mmf_index(w_type);
 	if (idx < 0 || m < VK_QMM_MIN_M || !p->p_mmf[idx].pipeline)
 		return 0;
+	if (w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ2_S)
+		return 0;
 	if (idx >= VK_MMF_FIRST_GRID && !vk_iq_grid_buf(p, w_type))
 		return 0;
 	if (idx < 3)
@@ -5031,17 +5047,25 @@ static status_code vk_mmf_dispatch(vk_priv *p, int pipe, const buffer *w, const 
 						  4 * sizeof(int32_t), gx, gy, 1u << 2);
 }
 
-static status_code vk_mmf_run(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
-							  buffer *y, int n, int k, int m) {
-	const int32_t push[4] = {n, k / 32, m, 0};
-	return vk_mmf_dispatch(self->priv, vk_mmf_index(w_type), w, x, y, NULL,
+static status_code vk_mmf_run_res(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+								  const buffer *res, buffer *y, int n, int k, int m) {
+	int32_t res_mode = 0;
+	if (res)
+		res_mode = (as_vkbuf(res) == as_vkbuf(y) && res->offset == y->offset) ? 2 : 1;
+	const int32_t push[4] = {n, k / 32, m, res_mode};
+	return vk_mmf_dispatch(self->priv, vk_mmf_index(w_type), w, x, y, res,
 						   vk_iq_grid_buf(self->priv, w_type), push, (uint32_t)((m + 63) / 64),
 						   (uint32_t)((n + 63) / 64));
 }
 
+static status_code vk_mmf_run(backend *self, const buffer *w, uint32_t w_type, const buffer *x,
+							  buffer *y, int n, int k, int m) {
+	return vk_mmf_run_res(self, w, w_type, x, NULL, y, n, k, m);
+}
+
 static int vk_mv_usable(vk_priv *p, uint32_t w_type, int k) {
 	int idx = vk_mmf_index(w_type);
-	return !p->qcore_ok && idx >= VK_MV_FIRST && k % 256 == 0 &&
+	return !p->qcore_ok && idx >= VK_MV_FIRST && idx < 12 && k % 256 == 0 &&
 		   p->p_mmf[idx + VK_MV_PIPE_OFFSET].pipeline &&
 		   (idx < VK_MMF_FIRST_GRID || vk_iq_grid_buf(p, w_type));
 }
@@ -5116,6 +5140,9 @@ static status_code vk_matmul_impl(backend *self, const buffer *w, uint32_t w_typ
 		if (qs != ERR_UNSUPPORTED)
 			return qs;
 	}
+
+	if (vk_mmf_usable(p, w_type, k, 1))
+		return vk_mmf_run_res(self, w, w_type, x, residual, y, n, k, 1);
 
 	vk_pipeline_set *ps = vk_matmul_pipeline(p, w_type);
 
@@ -6754,6 +6781,21 @@ static status_code vk_matmul_batch(backend *self, const buffer *w, uint32_t w_ty
 			return qs;
 	}
 
+	if (w_type == GGML_TYPE_IQ2_S && m > 1 && p->p_iq2s_tile.pipeline && k > 0 && (k % 256) == 0) {
+		status_code qs = vk_qcore_quantize(self, 1, x, NULL, -1, k, m);
+		if (qs == OK) {
+			struct {
+				int32_t n, kb, m, res_mode;
+			} push			= {n, k / 256, m, 0};
+			vk_buf *grid	= vk_iq_grid_buf(p, w_type);
+			vk_buf *bufs[5] = {as_vkbuf(w), as_vkbuf(&p->xq_buf[1]), as_vkbuf(y), vk_dummy_buf(p),
+							   grid};
+			VkDeviceSize offs[5] = {w->offset, p->xq_buf[1].offset, y->offset, 0, 0};
+			return vk_dispatch_2d_ex(p, &p->p_iq2s_tile, bufs, offs, NULL, 5, &push, sizeof(push),
+									 (uint32_t)((n + 63) / 64), (uint32_t)((m + 15) / 16), 1u << 2);
+		}
+	}
+
 	if (w_type == GGML_TYPE_IQ4_NL && p->p_matmul_iq4_nl_batch.pipeline && k > 0 && (k % 32) == 0) {
 		vk_buf *dummy = vk_dummy_buf(p);
 		struct {
@@ -6799,6 +6841,18 @@ static status_code vk_matmul_multi_batch(backend *self, const buffer **w, const 
 				st			 = vk_matmul(self, w[i], w_types[i], &x_row, &y_row, n_list[i], k);
 			}
 		}
+		return st;
+	}
+
+	int all_dense = 1;
+	for (int i = 0; i < n_matmuls; i++)
+		all_dense &= w_types[i] == GGML_TYPE_F32 || w_types[i] == GGML_TYPE_F16 ||
+					 w_types[i] == GGML_TYPE_BF16;
+	if (all_dense && m > 0) {
+		status_code st = OK;
+		for (int i = 0; i < n_matmuls && st == OK; i++)
+			if (n_list[i] > 0)
+				st = vk_matmul_batch(self, w[i], w_types[i], x, y[i], n_list[i], k, m);
 		return st;
 	}
 
@@ -7316,13 +7370,13 @@ static status_code vk_rope_qk_batch(backend *self, buffer *q, buffer *k, int n_h
 	if (s != OK)
 		return s;
 	struct {
-		int32_t n_heads, n_kv_heads, head_dim, pos, neox, m;
-	} push				  = {n_heads, n_kv_heads, head_dim, pos_start, self->rope_neox, m};
-	vk_buf		*bufs[4]  = {as_vkbuf(q), as_vkbuf(k), as_vkbuf(p->rope_cos_buf_active),
-							 as_vkbuf(p->rope_sin_buf_active)};
-	VkDeviceSize offs[4]  = {q->offset, k->offset, 0, 0};
-	uint32_t	 total_q  = (uint32_t)(n_heads * half);
-	uint32_t	 total_k  = (uint32_t)(n_kv_heads * half);
+		int32_t n_heads, n_kv_heads, head_dim, pos, neox, m, rope_dim;
+	} push				 = {n_heads, n_kv_heads, head_dim, pos_start, self->rope_neox, m, head_dim};
+	vk_buf		*bufs[4] = {as_vkbuf(q), as_vkbuf(k), as_vkbuf(p->rope_cos_buf_active),
+							as_vkbuf(p->rope_sin_buf_active)};
+	VkDeviceSize offs[4] = {q->offset, k->offset, 0, 0};
+	uint32_t	 total_q = (uint32_t)(n_heads * half);
+	uint32_t	 total_k = (uint32_t)(n_kv_heads * half);
 	uint32_t	 groups_x = (total_q + total_k + 63) / 64;
 	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)m, 0x3);
@@ -7338,19 +7392,21 @@ static status_code vk_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	if (!p->p_rope_qk_batch.pipeline)
 		return ERR_UNSUPPORTED;
 
-	int			half = head_dim / 2;
-	status_code s	 = vk_ensure_rope_bufs(self, half, rope_cos_base, rope_sin_base);
+	int			table_half = rope_dim / 2;
+	status_code s		   = vk_ensure_rope_bufs(self, table_half, rope_cos_base, rope_sin_base);
 	if (s != OK)
 		return s;
+
 	struct {
 		int32_t n_heads, n_kv_heads, head_dim, pos, neox, m;
 		int32_t rope_dim;
-	} push = {n_heads, n_kv_heads, head_dim, pos_start, self->rope_neox, n_rows, rope_dim};
+	} push				  = {n_heads, n_kv_heads, head_dim, pos_start, 1, n_rows, rope_dim};
 	vk_buf		*bufs[4]  = {as_vkbuf(q), as_vkbuf(k), as_vkbuf(p->rope_cos_buf_active),
 							 as_vkbuf(p->rope_sin_buf_active)};
 	VkDeviceSize offs[4]  = {q->offset, k->offset, 0, 0};
-	uint32_t	 total_q  = (uint32_t)(n_heads * half);
-	uint32_t	 total_k  = (uint32_t)(n_kv_heads * half);
+	uint32_t	 half	  = (uint32_t)(head_dim / 2);
+	uint32_t	 total_q  = (uint32_t)n_heads * half;
+	uint32_t	 total_k  = (uint32_t)n_kv_heads * half;
 	uint32_t	 groups_x = (total_q + total_k + 63) / 64;
 	return vk_dispatch_2d_ex(p, &p->p_rope_qk_batch, bufs, offs, NULL, 4, &push, sizeof(push),
 							 groups_x, (uint32_t)n_rows, 0x3);

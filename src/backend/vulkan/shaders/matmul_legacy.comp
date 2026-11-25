@@ -1,0 +1,2449 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+
+#if defined(IQ2_S)
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#define IQX_GRID_BINDING 4
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+#include "iqx_grids.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			 = 256;
+const int  BLOCKS_PER_TILE	 = TILE_K / BLOCK;
+const uint IQ2_S_BLOCK_BYTES = 82u;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ2_S_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ2_S_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+
+				uint qs_off		= block_off + 2u;
+				uint signs_off	= block_off + 34u;
+				uint qh_off		= block_off + 66u;
+				uint scales_off = block_off + 74u;
+
+				int tot = 0;
+				for (int ib32 = 0; ib32 < 8; ib32++) {
+					uint scale = w0_read_u8(scales_off + uint(ib32));
+					int	 s0	   = 1 + 2 * int(scale & 0xFu);
+					int	 s1	   = 1 + 2 * int(scale >> 4u);
+					int	 sum0  = 0;
+					int	 sum1  = 0;
+					uint qh	   = w0_read_u8(qh_off + uint(ib32));
+					uint qs_b  = qs_off + uint(ib32) * 4u;
+					uint sg_b  = signs_off + uint(ib32) * 4u;
+
+					for (int l = 0; l < 4; l++) {
+						uint  q		= w0_read_u8(qs_b + uint(l));
+						uint  gidx	= q | ((qh << uint(8 - 2 * l)) & 0x300u);
+						uvec2 grid	= iqx_iq2s_grid(gidx);
+						uint  gw_lo = grid.x;
+						uint  gw_hi = grid.y;
+						int	  g0	= int((gw_lo >> 0u) & 0xFFu);
+						int	  g1	= int((gw_lo >> 8u) & 0xFFu);
+						int	  g2	= int((gw_lo >> 16u) & 0xFFu);
+						int	  g3	= int((gw_lo >> 24u) & 0xFFu);
+						int	  g4	= int((gw_hi >> 0u) & 0xFFu);
+						int	  g5	= int((gw_hi >> 8u) & 0xFFu);
+						int	  g6	= int((gw_hi >> 16u) & 0xFFu);
+						int	  g7	= int((gw_hi >> 24u) & 0xFFu);
+
+						uint sign_byte = w0_read_u8(sg_b + uint(l));
+						int	 s0v	   = (sign_byte & 1u) != 0u ? -g0 : g0;
+						int	 s1v	   = (sign_byte & 2u) != 0u ? -g1 : g1;
+						int	 s2v	   = (sign_byte & 4u) != 0u ? -g2 : g2;
+						int	 s3v	   = (sign_byte & 8u) != 0u ? -g3 : g3;
+						int	 s4v	   = (sign_byte & 16u) != 0u ? -g4 : g4;
+						int	 s5v	   = (sign_byte & 32u) != 0u ? -g5 : g5;
+						int	 s6v	   = (sign_byte & 64u) != 0u ? -g6 : g6;
+						int	 s7v	   = (sign_byte & 128u) != 0u ? -g7 : g7;
+
+						int xw0 = (x_base + ib32 * 32 + l * 8) >> 2;
+						int sum =
+							dotPacked4x8EXT(
+								pack32(i8vec4(int8_t(s0v), int8_t(s1v), int8_t(s2v), int8_t(s3v))),
+								int(xq_packed[xw0])) +
+							dotPacked4x8EXT(
+								pack32(i8vec4(int8_t(s4v), int8_t(s5v), int8_t(s6v), int8_t(s7v))),
+								int(xq_packed[xw0 + 1]));
+
+						if (l < 2)
+							sum0 += sum;
+						else
+							sum1 += sum;
+					}
+					tot += s0 * sum0 + s1 * sum1;
+				}
+				precise float wd = (0.125 * d_w) * xd;
+				acc0			 = fma(wd, float(tot), acc0);
+			}
+		}
+		barrier();
+	}
+
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(IQ2_XXS)
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#define IQX_GRID_BINDING 4
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+#include "iqx_grids.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			   = 256;
+const int  BLOCKS_PER_TILE	   = TILE_K / BLOCK;
+const uint IQ2_XXS_BLOCK_BYTES = 66u;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ2_XXS_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ2_XXS_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+
+				int tot = 0;
+				for (int ib32 = 0; ib32 < 8; ib32++) {
+					uint aux_off = block_off + 2u + uint(ib32) * 8u;
+					uint aux0	 = w0_read_u32(aux_off);
+					uint aux1	 = w0_read_u32(aux_off + 4u);
+					int	 scl	 = 1 + 2 * int(aux1 >> 28u);
+					int	 sum	 = 0;
+
+					for (int l = 0; l < 4; l++) {
+						uint  gidx	= (aux0 >> uint(l * 8)) & 0xFFu;
+						uvec2 grid	= iqx_iq2xxs_grid(gidx);
+						uint  gw_lo = grid.x;
+						uint  gw_hi = grid.y;
+						int	  g0	= int((gw_lo >> 0u) & 0xFFu);
+						int	  g1	= int((gw_lo >> 8u) & 0xFFu);
+						int	  g2	= int((gw_lo >> 16u) & 0xFFu);
+						int	  g3	= int((gw_lo >> 24u) & 0xFFu);
+						int	  g4	= int((gw_hi >> 0u) & 0xFFu);
+						int	  g5	= int((gw_hi >> 8u) & 0xFFu);
+						int	  g6	= int((gw_hi >> 16u) & 0xFFu);
+						int	  g7	= int((gw_hi >> 24u) & 0xFFu);
+
+						uint signs = iqx_ksign((aux1 >> uint(7 * l)) & 127u);
+						int	 s0	   = (signs & 1u) != 0u ? -g0 : g0;
+						int	 s1	   = (signs & 2u) != 0u ? -g1 : g1;
+						int	 s2	   = (signs & 4u) != 0u ? -g2 : g2;
+						int	 s3	   = (signs & 8u) != 0u ? -g3 : g3;
+						int	 s4	   = (signs & 16u) != 0u ? -g4 : g4;
+						int	 s5	   = (signs & 32u) != 0u ? -g5 : g5;
+						int	 s6	   = (signs & 64u) != 0u ? -g6 : g6;
+						int	 s7	   = (signs & 128u) != 0u ? -g7 : g7;
+
+						int xw0 = (x_base + ib32 * 32 + l * 8) >> 2;
+						sum += dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+								   int(xq_packed[xw0])) +
+							   dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+								   int(xq_packed[xw0 + 1]));
+					}
+					tot += scl * sum;
+				}
+				precise float wd = (0.125 * d_w) * xd;
+				acc0			 = fma(wd, float(tot), acc0);
+			}
+		}
+		barrier();
+	}
+
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(IQ3_S)
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#define IQ3S_GRID_BINDING 4
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+#include "iq3s_grid.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			 = 256;
+const int  BLOCKS_PER_TILE	 = TILE_K / BLOCK;
+const uint IQ3_S_BLOCK_BYTES = 110u;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ3_S_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ3_S_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+				float d		   = d_w * xd;
+
+				uint qs_off		= block_off + 2u;
+				uint qh_off		= block_off + 66u;
+				uint signs_off	= block_off + 74u;
+				uint scales_off = block_off + 106u;
+
+				int total = 0;
+
+				for (int ib32 = 0; ib32 < 8; ib32 += 2) {
+					int	 step		= ib32 / 2;
+					uint scale_byte = w0_read_u8(scales_off + uint(step));
+					int	 sc1		= 1 + 2 * int(scale_byte & 0xFu);
+					int	 sc2		= 1 + 2 * int(scale_byte >> 4u);
+
+					uint qh0 = w0_read_u8(qh_off + uint(step) * 2u);
+					uint qh1 = w0_read_u8(qh_off + uint(step) * 2u + 1u);
+
+					int	 group_sum1	 = 0;
+					uint qs_base1	 = qs_off + uint(step) * 16u;
+					uint signs_base1 = signs_off + uint(step) * 8u;
+					for (int l = 0; l < 4; l++) {
+						uint q2l   = w0_read_u8(qs_base1 + uint(2 * l));
+						uint q2l1  = w0_read_u8(qs_base1 + uint(2 * l + 1));
+						uint gidx1 = q2l | ((qh0 << uint(8 - 2 * l)) & 256u);
+						uint gidx2 = q2l1 | ((qh0 << uint(7 - 2 * l)) & 256u);
+
+						uint gw1  = iq3s_grid_word(gidx1);
+						uint gw2  = iq3s_grid_word(gidx2);
+						int	 g1_0 = int((gw1 >> 0u) & 0xFFu);
+						int	 g1_1 = int((gw1 >> 8u) & 0xFFu);
+						int	 g1_2 = int((gw1 >> 16u) & 0xFFu);
+						int	 g1_3 = int((gw1 >> 24u) & 0xFFu);
+						int	 g2_0 = int((gw2 >> 0u) & 0xFFu);
+						int	 g2_1 = int((gw2 >> 8u) & 0xFFu);
+						int	 g2_2 = int((gw2 >> 16u) & 0xFFu);
+						int	 g2_3 = int((gw2 >> 24u) & 0xFFu);
+
+						uint sign_byte = w0_read_u8(signs_base1 + uint(l));
+						int	 s0		   = (sign_byte & 1u) != 0u ? -g1_0 : g1_0;
+						int	 s1		   = (sign_byte & 2u) != 0u ? -g1_1 : g1_1;
+						int	 s2		   = (sign_byte & 4u) != 0u ? -g1_2 : g1_2;
+						int	 s3		   = (sign_byte & 8u) != 0u ? -g1_3 : g1_3;
+						int	 s4		   = (sign_byte & 16u) != 0u ? -g2_0 : g2_0;
+						int	 s5		   = (sign_byte & 32u) != 0u ? -g2_1 : g2_1;
+						int	 s6		   = (sign_byte & 64u) != 0u ? -g2_2 : g2_2;
+						int	 s7		   = (sign_byte & 128u) != 0u ? -g2_3 : g2_3;
+
+						int xw0 = (x_base + ib32 * 32 + l * 8) >> 2;
+						group_sum1 += dotPacked4x8EXT(
+							pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+							int(xq_packed[xw0]));
+						group_sum1 += dotPacked4x8EXT(
+							pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+							int(xq_packed[xw0 + 1]));
+					}
+
+					int	 group_sum2	 = 0;
+					uint qs_base2	 = qs_base1 + 8u;
+					uint signs_base2 = signs_base1 + 4u;
+					for (int l = 0; l < 4; l++) {
+						uint q2l   = w0_read_u8(qs_base2 + uint(2 * l));
+						uint q2l1  = w0_read_u8(qs_base2 + uint(2 * l + 1));
+						uint gidx1 = q2l | ((qh1 << uint(8 - 2 * l)) & 256u);
+						uint gidx2 = q2l1 | ((qh1 << uint(7 - 2 * l)) & 256u);
+
+						uint gw1  = iq3s_grid_word(gidx1);
+						uint gw2  = iq3s_grid_word(gidx2);
+						int	 g1_0 = int((gw1 >> 0u) & 0xFFu);
+						int	 g1_1 = int((gw1 >> 8u) & 0xFFu);
+						int	 g1_2 = int((gw1 >> 16u) & 0xFFu);
+						int	 g1_3 = int((gw1 >> 24u) & 0xFFu);
+						int	 g2_0 = int((gw2 >> 0u) & 0xFFu);
+						int	 g2_1 = int((gw2 >> 8u) & 0xFFu);
+						int	 g2_2 = int((gw2 >> 16u) & 0xFFu);
+						int	 g2_3 = int((gw2 >> 24u) & 0xFFu);
+
+						uint sign_byte = w0_read_u8(signs_base2 + uint(l));
+						int	 s0		   = (sign_byte & 1u) != 0u ? -g1_0 : g1_0;
+						int	 s1		   = (sign_byte & 2u) != 0u ? -g1_1 : g1_1;
+						int	 s2		   = (sign_byte & 4u) != 0u ? -g1_2 : g1_2;
+						int	 s3		   = (sign_byte & 8u) != 0u ? -g1_3 : g1_3;
+						int	 s4		   = (sign_byte & 16u) != 0u ? -g2_0 : g2_0;
+						int	 s5		   = (sign_byte & 32u) != 0u ? -g2_1 : g2_1;
+						int	 s6		   = (sign_byte & 64u) != 0u ? -g2_2 : g2_2;
+						int	 s7		   = (sign_byte & 128u) != 0u ? -g2_3 : g2_3;
+
+						int xw0 = (x_base + ib32 * 32 + 32 + l * 8) >> 2;
+						group_sum2 += dotPacked4x8EXT(
+							pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+							int(xq_packed[xw0]));
+						group_sum2 += dotPacked4x8EXT(
+							pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+							int(xq_packed[xw0 + 1]));
+					}
+
+					total += sc1 * group_sum1 + sc2 * group_sum2;
+				}
+
+				acc0 = fma(d, float(total), acc0);
+			}
+		}
+		barrier();
+	}
+
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(IQ3_XXS)
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#define IQX_GRID_BINDING 4
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+#include "iqx_grids.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			   = 256;
+const int  BLOCKS_PER_TILE	   = TILE_K / BLOCK;
+const uint IQ3_XXS_BLOCK_BYTES = 98u;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ3_XXS_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ3_XXS_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+
+				uint qs_off	  = block_off + 2u;
+				uint saux_off = block_off + 66u;
+
+				int tot = 0;
+				for (int ib32 = 0; ib32 < 8; ib32++) {
+					uint saux = w0_read_u32(saux_off + uint(ib32) * 4u);
+					int	 scl  = 1 + 2 * int(saux >> 28u);
+					int	 sum  = 0;
+					uint qs_b = qs_off + uint(ib32) * 8u;
+
+					for (int l = 0; l < 4; l++) {
+						uint q1	  = w0_read_u8(qs_b + uint(2 * l));
+						uint q2	  = w0_read_u8(qs_b + uint(2 * l + 1));
+						uint gw1  = iqx_iq3xxs_grid(q1);
+						uint gw2  = iqx_iq3xxs_grid(q2);
+						int	 g1_0 = int((gw1 >> 0u) & 0xFFu);
+						int	 g1_1 = int((gw1 >> 8u) & 0xFFu);
+						int	 g1_2 = int((gw1 >> 16u) & 0xFFu);
+						int	 g1_3 = int((gw1 >> 24u) & 0xFFu);
+						int	 g2_0 = int((gw2 >> 0u) & 0xFFu);
+						int	 g2_1 = int((gw2 >> 8u) & 0xFFu);
+						int	 g2_2 = int((gw2 >> 16u) & 0xFFu);
+						int	 g2_3 = int((gw2 >> 24u) & 0xFFu);
+
+						uint signs = iqx_ksign((saux >> uint(7 * l)) & 127u);
+						int	 s0	   = (signs & 1u) != 0u ? -g1_0 : g1_0;
+						int	 s1	   = (signs & 2u) != 0u ? -g1_1 : g1_1;
+						int	 s2	   = (signs & 4u) != 0u ? -g1_2 : g1_2;
+						int	 s3	   = (signs & 8u) != 0u ? -g1_3 : g1_3;
+						int	 s4	   = (signs & 16u) != 0u ? -g2_0 : g2_0;
+						int	 s5	   = (signs & 32u) != 0u ? -g2_1 : g2_1;
+						int	 s6	   = (signs & 64u) != 0u ? -g2_2 : g2_2;
+						int	 s7	   = (signs & 128u) != 0u ? -g2_3 : g2_3;
+
+						int xw0 = (x_base + ib32 * 32 + l * 8) >> 2;
+						sum += dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+								   int(xq_packed[xw0])) +
+							   dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+								   int(xq_packed[xw0 + 1]));
+					}
+					tot += scl * sum;
+				}
+				precise float wd = (0.25 * d_w) * xd;
+				acc0			 = fma(wd, float(tot), acc0);
+			}
+		}
+		barrier();
+	}
+
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(IQ4_NL)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer B0 {
+	uint b0[];
+};
+layout(set = 0, binding = 1) readonly buffer B1 {
+	float b1f[];
+};
+layout(set = 0, binding = 2) readonly buffer B2 {
+	float b2f[];
+};
+layout(set = 0, binding = 3) writeonly buffer B3 {
+	float b3f[];
+};
+layout(set = 0, binding = 4) writeonly buffer B4 {
+	float b4f[];
+};
+layout(set = 0, binding = 5) readonly buffer B5 {
+	uint b5[];
+};
+layout(set = 0, binding = 6) writeonly buffer B6 {
+	float b6f[];
+};
+
+layout(push_constant) uniform Params {
+	int mode;
+	int n;
+	int n1;
+	int k;
+	int activation;
+	int has_residual;
+	int n2;
+	int m;
+}
+params;
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+#include "iq4nl_table.glsl"
+
+#define MODE_SINGLE 0
+#define MODE_MULTI 1
+#define MODE_FFN_DOWN 2
+#define MODE_QKV 3
+
+#define W_NAME b0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+uint w1_read_u16(uint byte_offset) {
+	uint word_idx = byte_offset >> 2u;
+	uint shift	  = (byte_offset & 3u) * 8u;
+	uint lo		  = floatBitsToUint(b1f[word_idx]);
+	if (shift + 8u <= 32u)
+		return (lo >> shift) & 0xFFFFu;
+	uint hi = floatBitsToUint(b1f[word_idx + 1u]);
+	return ((lo >> shift) | (hi << (32u - shift))) & 0xFFFFu;
+}
+
+uint w1_read_u32(uint byte_offset) {
+	uint word_idx = byte_offset >> 2u;
+	uint shift	  = (byte_offset & 3u) * 8u;
+	uint lo		  = floatBitsToUint(b1f[word_idx]);
+	if (shift == 0u)
+		return lo;
+	uint hi = floatBitsToUint(b1f[word_idx + 1u]);
+	return (lo >> shift) | (hi << (32u - shift));
+}
+
+#define W_NAME b5
+#define W_PFX w2_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+float activate(float g, float u) {
+	if (params.activation == 1) {
+		return gelu_tanh(g) * u;
+	} else {
+		return silu(g) * u;
+	}
+}
+
+shared int	 kvalue_iq4nl_lut[16];
+shared float x_shared[TILE_K];
+shared float xq_d[TILE_K / 32];
+shared int	 xq_packed[(TILE_K / 32) * 8];
+
+void load_x_tile(int tile_start, int tile_len, uint x_off) {
+	uint tid = gl_LocalInvocationID.x;
+	for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+		float val;
+		if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+			val = b2f[x_off + uint(tile_start + j)];
+		} else if (params.mode == MODE_FFN_DOWN) {
+			float g = b1f[x_off + uint(tile_start + j)];
+			float u = b2f[x_off + uint(tile_start + j)];
+			val		= activate(g, u);
+		} else {
+			val = b1f[x_off + uint(tile_start + j)];
+		}
+		x_shared[j] = val;
+	}
+}
+
+#define DEFINE_DOT_BLOCK(SUFFIX)                                                                   \
+	float dot_block_##SUFFIX(uint block_off, int xp_base, float d_xq, float acc) {                 \
+		float d		 = half_to_float(SUFFIX##_read_u16(block_off)) * d_xq;                         \
+		uint  qs_off = block_off + 2u;                                                             \
+                                                                                                   \
+		int sumi = 0;                                                                              \
+		for (int w4 = 0; w4 < 4; w4++) {                                                           \
+			uint word = SUFFIX##_read_u32(qs_off + uint(w4 * 4));                                  \
+                                                                                                   \
+			int w_lo = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[word & 0xFu]),                        \
+									 int8_t(kvalue_iq4nl_lut[(word >> 8u) & 0xFu]),                \
+									 int8_t(kvalue_iq4nl_lut[(word >> 16u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 24u) & 0xFu])));             \
+			int w_hi = pack32(i8vec4(int8_t(kvalue_iq4nl_lut[(word >> 4u) & 0xFu]),                \
+									 int8_t(kvalue_iq4nl_lut[(word >> 12u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 20u) & 0xFu]),               \
+									 int8_t(kvalue_iq4nl_lut[(word >> 28u) & 0xFu])));             \
+                                                                                                   \
+			int x_lo = xq_packed[xp_base + w4];                                                    \
+			int x_hi = xq_packed[xp_base + w4 + 4];                                                \
+                                                                                                   \
+			sumi += dotPacked4x8EXT(w_lo, x_lo);                                                   \
+			sumi += dotPacked4x8EXT(w_hi, x_hi);                                                   \
+		}                                                                                          \
+		return fma(d, float(sumi), acc);                                                           \
+	}
+
+DEFINE_DOT_BLOCK(w0)
+DEFINE_DOT_BLOCK(w1)
+DEFINE_DOT_BLOCK(w2)
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	if (tid < 16u) {
+		kvalue_iq4nl_lut[tid] = IQ4NL_VALUES[tid];
+	}
+	barrier();
+
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	int n_out_a = params.n;
+	int n_out_b = params.n1;
+	int n_out_c = params.n2;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(n_out_a);
+	uint y1_off = row * uint(n_out_b);
+	uint y2_off = row * uint(n_out_c);
+
+	precise float acc0[ROWS_PER_THREAD];
+	precise float acc1[ROWS_PER_THREAD];
+	precise float acc2[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		acc0[r] = 0.0;
+		acc1[r] = 0.0;
+		acc2[r] = 0.0;
+	}
+	bool valid0[ROWS_PER_THREAD];
+	bool valid1[ROWS_PER_THREAD];
+	bool valid2[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		valid0[r] = (int(base_i) + r < n_out_a);
+		valid1[r] = (int(base_i) + r < n_out_b);
+		valid2[r] = (params.mode == MODE_QKV) && (int(base_i) + r < n_out_c);
+	}
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		load_x_tile(tile_start, tile_len, x_off);
+		barrier();
+
+		int block_start = tile_start / 32;
+		int block_end	= tile_end / 32;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			int x_base = bi * 32 - tile_start;
+
+			float amax = 0.0;
+			for (int j = 0; j < 32; j++) {
+				float ax = abs(x_shared[x_base + j]);
+				if (ax > amax)
+					amax = ax;
+			}
+			float d				   = div_exact(amax, 127.0);
+			float id			   = d > 0.0 ? div_exact(1.0, d) : 0.0;
+			xq_d[bi - block_start] = f32_to_f16_to_f32(d);
+
+			int q[32];
+			for (int j = 0; j < 32; j++) {
+				int val = round_away(x_shared[x_base + j] * id);
+				if (val > 127)
+					val = 127;
+				if (val < -127)
+					val = -127;
+				q[j] = val;
+			}
+
+			int xp_base = (bi - block_start) * 8;
+			for (int g = 0; g < 8; g++) {
+				int base			   = g * 4;
+				xq_packed[xp_base + g] = pack32(i8vec4(int8_t(q[base]), int8_t(q[base + 1]),
+													   int8_t(q[base + 2]), int8_t(q[base + 3])));
+			}
+		}
+		barrier();
+
+		for (int bi = block_start; bi < block_end; bi++) {
+			int	  xp_base = (bi - block_start) * 8;
+			float d_xq	  = xq_d[bi - block_start];
+
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid0[r])
+					continue;
+				uint row_idx   = base_i + uint(r);
+				uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES +
+								 uint(bi) * IQ4_NL_BLOCK_BYTES;
+				acc0[r]		   = dot_block_w0(block_off, xp_base, d_xq, acc0[r]);
+			}
+
+			if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+				for (int r = 0; r < ROWS_PER_THREAD; r++) {
+					if (!valid1[r])
+						continue;
+					uint row_idx   = base_i + uint(r);
+					uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES +
+									 uint(bi) * IQ4_NL_BLOCK_BYTES;
+					acc1[r]		   = dot_block_w1(block_off, xp_base, d_xq, acc1[r]);
+				}
+			}
+
+			if (params.mode == MODE_QKV) {
+				for (int r = 0; r < ROWS_PER_THREAD; r++) {
+					if (!valid2[r])
+						continue;
+					uint row_idx   = base_i + uint(r);
+					uint block_off = row_idx * uint(blocks_per_row) * IQ4_NL_BLOCK_BYTES +
+									 uint(bi) * IQ4_NL_BLOCK_BYTES;
+					acc2[r]		   = dot_block_w2(block_off, xp_base, d_xq, acc2[r]);
+				}
+			}
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid0[r])
+			continue;
+		float result = acc0[r];
+		if (params.mode == MODE_SINGLE && params.has_residual != 0) {
+			result += b2f[y0_off + base_i + uint(r)];
+		}
+		b3f[y0_off + base_i + uint(r)] = result;
+	}
+
+	if (params.mode == MODE_MULTI || params.mode == MODE_QKV) {
+		for (int r = 0; r < ROWS_PER_THREAD; r++) {
+			if (!valid1[r])
+				continue;
+			b4f[y1_off + base_i + uint(r)] = acc1[r];
+		}
+	}
+
+	if (params.mode == MODE_QKV) {
+		for (int r = 0; r < ROWS_PER_THREAD; r++) {
+			if (!valid2[r])
+				continue;
+			b6f[y2_off + base_i + uint(r)] = acc2[r];
+		}
+	}
+}
+#endif
+
+#if defined(IQ4_XS)
+layout(local_size_x_id = 0) in;
+
+layout(constant_id = 2) const int TILE_K = 2048;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+const int  BLOCK			  = 256;
+const int  BLOCKS_PER_TILE	  = TILE_K / BLOCK;
+const uint IQ4_XS_BLOCK_BYTES = 136u;
+
+const int KVALUES[16] =
+	int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * IQ4_XS_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * IQ4_XS_BLOCK_BYTES;
+				float d_w		= half_to_float(w0_read_u16(block_off));
+				uint  scales_h	= w0_read_u16(block_off + 2u);
+
+				int	  local_bi = bi - block_start;
+				int	  x_base   = bi * 256 - tile_start;
+				float xd	   = xq_d[local_bi];
+
+				uint qs_off		= block_off + 8u;
+				uint scales_off = block_off + 4u;
+
+				int tot = 0;
+				for (int ib = 0; ib < 8; ib++) {
+					uint sl_byte = w0_read_u8(scales_off + uint(ib >> 1));
+					uint sl		 = (sl_byte >> uint(4 * (ib & 1))) & 0xFu;
+					uint sh		 = (scales_h >> uint(2 * ib)) & 3u;
+					int	 dl		 = int(sl | (sh << 4u)) - 32;
+					uint qs_b	 = qs_off + uint(ib) * 16u;
+					int	 sum	 = 0;
+
+					for (int w = 0; w < 4; w++) {
+						int s0 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 0)) & 0xFu)];
+						int s1 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 1)) & 0xFu)];
+						int s2 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 2)) & 0xFu)];
+						int s3 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 3)) & 0xFu)];
+						int s4 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 0)) >> 4u)];
+						int s5 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 1)) >> 4u)];
+						int s6 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 2)) >> 4u)];
+						int s7 = KVALUES[int(w0_read_u8(qs_b + uint(w * 4 + 3)) >> 4u)];
+
+						int xw0 = (x_base + ib * 32 + w * 4) >> 2;
+						int xw1 = xw0 + 4;
+						sum += dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s0), int8_t(s1), int8_t(s2), int8_t(s3))),
+								   int(xq_packed[xw0])) +
+							   dotPacked4x8EXT(
+								   pack32(i8vec4(int8_t(s4), int8_t(s5), int8_t(s6), int8_t(s7))),
+								   int(xq_packed[xw1]));
+					}
+					tot += dl * sum;
+				}
+				precise float wd = (d_w)*xd;
+				acc0			 = fma(wd, float(tot), acc0);
+			}
+		}
+		barrier();
+	}
+
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(Q4_0)
+layout(local_size_x_id = 0) in;
+
+#if defined(NMAT_TRIPLE)
+#define NMAT 3
+#elif defined(NMAT_DUAL)
+#define NMAT 2
+#else
+#define NMAT 1
+#endif
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#if NMAT >= 3
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer W1Buf {
+	uint w1[];
+};
+layout(set = 0, binding = 2) readonly buffer W2Buf {
+	uint w2[];
+};
+layout(set = 0, binding = 3) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 4) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 5) writeonly buffer Y1Buf {
+	float y1[];
+};
+layout(set = 0, binding = 6) writeonly buffer Y2Buf {
+	float y2[];
+};
+#elif NMAT == 2
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer W1Buf {
+	uint w1[];
+};
+layout(set = 0, binding = 2) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 3) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 4) writeonly buffer Y1Buf {
+	float y1[];
+};
+#else
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#endif
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+#if NMAT >= 2
+#define W_NAME w1
+#define W_PFX w1_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+#endif
+
+#if NMAT >= 3
+#define W_NAME w2
+#define W_PFX w2_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+#endif
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[TILE_K / 32];
+shared int	 xq_sum[TILE_K / 32];
+
+#include "xq8_block.glsl"
+
+void main() {
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	uint tid			= gl_LocalInvocationID.x;
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+#if NMAT >= 2
+	uint y1_off = row * uint(params.n1);
+#endif
+#if NMAT >= 3
+	uint y2_off = row * uint(params.n2);
+#endif
+
+	precise float acc0[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		acc0[r] = 0.0;
+	bool valid0[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid0[r] = (int(base_i) + r < params.n0);
+
+#if NMAT >= 2
+	precise float acc1[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		acc1[r] = 0.0;
+	bool valid1[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid1[r] = (int(base_i) + r < params.n1);
+#endif
+
+#if NMAT >= 3
+	precise float acc2[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		acc2[r] = 0.0;
+	bool valid2[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid2[r] = (int(base_i) + r < params.n2);
+#endif
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		barrier();
+
+		int block_start = tile_start / 32;
+		int block_end	= tile_end / 32;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			int	  local_bi = bi - block_start;
+			float d;
+			int	  sum		 = xq8_quant_block(bi * 32 - tile_start, d);
+			xq_d[local_bi]	 = f32_to_f16_to_f32(d);
+			xq_sum[local_bi] = sum;
+		}
+		barrier();
+
+		for (int bi = block_start; bi < block_end; bi++) {
+			int	  x_base = bi * 32 - tile_start;
+			float d_xq	 = xq_d[bi - block_start];
+			int	  xsum	 = xq_sum[bi - block_start];
+
+			int wp = x_base >> 2;
+			int xq_words[4];
+			int xq_words_hi[4];
+			for (int w4 = 0; w4 < 4; w4++) {
+				xq_words[w4]	= int(xq_packed[wp + w4]);
+				xq_words_hi[w4] = int(xq_packed[wp + 4 + w4]);
+			}
+
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid0[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q4_0_BLOCK_BYTES + uint(bi) * Q4_0_BLOCK_BYTES;
+				float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
+				uint  qs_off = block_off + 2u;
+
+				int sumi = 0;
+				{
+					uint words[4];
+					w0_read_u32x4(qs_off, words);
+					for (int w4 = 0; w4 < 4; w4++) {
+						int lo_nibbles = int(words[w4] & 0x0F0F0F0Fu);
+						int hi_nibbles = int((words[w4] >> 4) & 0x0F0F0F0Fu);
+
+						sumi += dotPacked4x8EXT(lo_nibbles, xq_words[w4]);
+						sumi += dotPacked4x8EXT(hi_nibbles, xq_words_hi[w4]);
+					}
+				}
+
+				int corrected = sumi - 8 * xsum;
+				acc0[r]		  = fma(d, float(corrected), acc0[r]);
+			}
+
+#if NMAT >= 2
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid1[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q4_0_BLOCK_BYTES + uint(bi) * Q4_0_BLOCK_BYTES;
+				float d		 = half_to_float(w1_read_u16(block_off)) * d_xq;
+				uint  qs_off = block_off + 2u;
+
+				int sumi = 0;
+				{
+					uint words[4];
+					w1_read_u32x4(qs_off, words);
+					for (int w4 = 0; w4 < 4; w4++) {
+						int lo_nibbles = int(words[w4] & 0x0F0F0F0Fu);
+						int hi_nibbles = int((words[w4] >> 4) & 0x0F0F0F0Fu);
+
+						sumi += dotPacked4x8EXT(lo_nibbles, xq_words[w4]);
+						sumi += dotPacked4x8EXT(hi_nibbles, xq_words_hi[w4]);
+					}
+				}
+
+				int corrected = sumi - 8 * xsum;
+				acc1[r]		  = fma(d, float(corrected), acc1[r]);
+			}
+#endif
+
+#if NMAT >= 3
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid2[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q4_0_BLOCK_BYTES + uint(bi) * Q4_0_BLOCK_BYTES;
+				float d		 = half_to_float(w2_read_u16(block_off)) * d_xq;
+				uint  qs_off = block_off + 2u;
+
+				int sumi = 0;
+				{
+					uint words[4];
+					w2_read_u32x4(qs_off, words);
+					for (int w4 = 0; w4 < 4; w4++) {
+						int lo_nibbles = int(words[w4] & 0x0F0F0F0Fu);
+						int hi_nibbles = int((words[w4] >> 4) & 0x0F0F0F0Fu);
+
+						sumi += dotPacked4x8EXT(lo_nibbles, xq_words[w4]);
+						sumi += dotPacked4x8EXT(hi_nibbles, xq_words_hi[w4]);
+					}
+				}
+
+				int corrected = sumi - 8 * xsum;
+				acc2[r]		  = fma(d, float(corrected), acc2[r]);
+			}
+#endif
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid0[r])
+			continue;
+#if NMAT >= 2
+		y0[y0_off + base_i + uint(r)] = acc0[r];
+#else
+		y0[y0_off + base_i + uint(r)] =
+			acc0[r] + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
+#endif
+	}
+
+#if NMAT >= 2
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid1[r])
+			continue;
+		y1[y1_off + base_i + uint(r)] = acc1[r];
+	}
+#endif
+
+#if NMAT >= 3
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid2[r])
+			continue;
+		y2[y2_off + base_i + uint(r)] = acc2[r];
+	}
+#endif
+}
+#endif
+
+#if defined(Q4_1)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[TILE_K / 32];
+shared float xq_s[TILE_K / 32];
+
+#include "xq8_block.glsl"
+
+void main() {
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	uint tid			= gl_LocalInvocationID.x;
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	uint row   = gl_WorkGroupID.y;
+	uint x_off = row * uint(k);
+	uint y_off = row * uint(params.n0);
+	uint r_off = y_off;
+
+	precise float acc[ROWS_PER_THREAD];
+	precise float off[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		acc[r] = 0.0;
+		off[r] = 0.0;
+	}
+	bool valid[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid[r] = (int(base_i) + r < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		barrier();
+
+		int block_start = tile_start / 32;
+		int block_end	= tile_end / 32;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			int	  local_bi = bi - block_start;
+			float d;
+			int	  sum	   = xq8_quant_block(bi * 32 - tile_start, d);
+			xq_d[local_bi] = f32_to_f16_to_f32(d);
+			xq_s[local_bi] = f32_to_f16_to_f32(d * float(sum));
+		}
+		barrier();
+
+		for (int bi = block_start; bi < block_end; bi++) {
+			int	  x_base = bi * 32 - tile_start;
+			float d_xq	 = xq_d[bi - block_start];
+			float s_xq	 = xq_s[bi - block_start];
+
+			int wp = x_base >> 2;
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q4_1_BLOCK_BYTES + uint(bi) * Q4_1_BLOCK_BYTES;
+				float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
+				uint  qs_off = block_off + 4u;
+				int	  sumi	 = 0;
+				{
+					uint words[4];
+					w0_read_u32x4(qs_off, words);
+					for (int w4 = 0; w4 < 4; w4++) {
+						int lo_nibbles = int(words[w4] & 0x0F0F0F0Fu);
+						int hi_nibbles = int((words[w4] >> 4) & 0x0F0F0F0Fu);
+
+						sumi += dotPacked4x8EXT(lo_nibbles, int(xq_packed[wp + w4]));
+						sumi += dotPacked4x8EXT(hi_nibbles, int(xq_packed[wp + 4 + w4]));
+					}
+				}
+				acc[r] = fma(d, float(sumi), acc[r]);
+				off[r] = fma(half_to_float(w0_read_u16(block_off + 2u)), s_xq, off[r]);
+			}
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid[r])
+			continue;
+		y[y_off + base_i + uint(r)] =
+			(acc[r] + off[r]) + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
+	}
+}
+#endif
+
+#if defined(Q4_K)
+layout(local_size_x_id = 0) in;
+
+#ifdef NMAT_DUAL
+#define NMAT 2
+#else
+#define NMAT 1
+#endif
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#if NMAT >= 2
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer W1Buf {
+	uint w1[];
+};
+layout(set = 0, binding = 2) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 3) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 4) writeonly buffer Y1Buf {
+	float y1[];
+};
+#else
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#endif
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+#if NMAT >= 2
+#define W_NAME w1
+#define W_PFX w1_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+#endif
+
+const int BLOCK			  = 256;
+const int BLOCKS_PER_TILE = TILE_K / BLOCK;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+shared int	 xq_bsums[BLOCKS_PER_TILE * 16];
+
+#define XQ_HAVE_BSUMS 1
+#include "quant_x8_block.glsl"
+#undef XQ_HAVE_BSUMS
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int blocks_per_row = k / 256;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+#if NMAT >= 2
+	uint y1_off = row * uint(params.n1);
+#endif
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+#if NMAT >= 2
+	precise float acc1	 = 0.0;
+	bool		  valid1 = (int(i) < params.n1);
+#endif
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * uint(blocks_per_row) * Q4_K_BLOCK_BYTES;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * Q4_K_BLOCK_BYTES;
+				float d			= half_to_float(w0_read_u16(block_off + 0u));
+				float dmin		= half_to_float(w0_read_u16(block_off + 2u));
+
+				int	  local_bi = bi - block_start;
+				float xd	   = xq_d[local_bi];
+
+				int	 sumi = 0, summ = 0;
+				uint s_off = block_off + 4u;
+				uint q_off = block_off + 16u;
+				int	 ib	   = local_bi * 16;
+				int	 wp	   = (bi * 256 - tile_start) >> 2;
+
+				uint sc_d[8], sc_m[8];
+				w0_get_all_scale_min_k4(s_off, sc_d, sc_m);
+
+				for (int g = 0; g < 4; g++) {
+					int is = g * 2;
+					int s0 = int(sc_d[is]), m0 = int(sc_m[is]);
+					int s1 = int(sc_d[is + 1]), m1 = int(sc_m[is + 1]);
+
+					int dot0 = 0, dot1 = 0;
+					for (int l = 0; l < 32; l += 4) {
+						uint word		= w0_read_u32(q_off + uint(g * 32 + l));
+						int	 lo_nibbles = int(word & 0x0F0F0F0Fu);
+						int	 hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
+
+						dot0 += dotPacked4x8EXT(lo_nibbles, int(xq_packed[wp + g * 16 + l / 4]));
+						dot1 +=
+							dotPacked4x8EXT(hi_nibbles, int(xq_packed[wp + g * 16 + l / 4 + 8]));
+					}
+					sumi += s0 * dot0 + s1 * dot1;
+					summ += m0 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+					summ += m1 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+				}
+				acc0 = fma(xd, d * float(sumi) - dmin * float(summ), acc0);
+			}
+		}
+
+#if NMAT >= 2
+		if (valid1) {
+			uint row_off = i * uint(blocks_per_row) * Q4_K_BLOCK_BYTES;
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * Q4_K_BLOCK_BYTES;
+				float d			= half_to_float(w1_read_u16(block_off + 0u));
+				float dmin		= half_to_float(w1_read_u16(block_off + 2u));
+
+				int	  local_bi = bi - block_start;
+				float xd	   = xq_d[local_bi];
+
+				int	 sumi = 0, summ = 0;
+				uint s_off = block_off + 4u;
+				uint q_off = block_off + 16u;
+				int	 ib	   = local_bi * 16;
+				int	 wp	   = (bi * 256 - tile_start) >> 2;
+
+				uint sc_d[8], sc_m[8];
+				w1_get_all_scale_min_k4(s_off, sc_d, sc_m);
+
+				for (int g = 0; g < 4; g++) {
+					int is = g * 2;
+					int s0 = int(sc_d[is]), m0 = int(sc_m[is]);
+					int s1 = int(sc_d[is + 1]), m1 = int(sc_m[is + 1]);
+
+					int dot0 = 0, dot1 = 0;
+					for (int l = 0; l < 32; l += 4) {
+						uint word		= w1_read_u32(q_off + uint(g * 32 + l));
+						int	 lo_nibbles = int(word & 0x0F0F0F0Fu);
+						int	 hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
+
+						dot0 += dotPacked4x8EXT(lo_nibbles, int(xq_packed[wp + g * 16 + l / 4]));
+						dot1 +=
+							dotPacked4x8EXT(hi_nibbles, int(xq_packed[wp + g * 16 + l / 4 + 8]));
+					}
+					sumi += s0 * dot0 + s1 * dot1;
+					summ += m0 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+					summ += m1 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+				}
+				acc1 = fma(xd, d * float(sumi) - dmin * float(summ), acc1);
+			}
+		}
+#endif
+		barrier();
+	}
+
+#if NMAT >= 2
+	if (valid0)
+		y0[y0_off + i] = acc0;
+	if (valid1)
+		y1[y1_off + i] = acc1;
+#else
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+#endif
+}
+#endif
+
+#if defined(Q5_0)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[TILE_K / 32];
+shared int	 xq_sum[TILE_K / 32];
+
+#include "xq8_block.glsl"
+
+void main() {
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	uint tid			= gl_LocalInvocationID.x;
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	uint row   = gl_WorkGroupID.y;
+	uint x_off = row * uint(k);
+	uint y_off = row * uint(params.n0);
+	uint r_off = y_off;
+
+	precise float acc[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		acc[r] = 0.0;
+	bool valid[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid[r] = (int(base_i) + r < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		barrier();
+
+		int block_start = tile_start / 32;
+		int block_end	= tile_end / 32;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			int	  local_bi = bi - block_start;
+			float d;
+			int	  sum		 = xq8_quant_block(bi * 32 - tile_start, d);
+			xq_d[local_bi]	 = f32_to_f16_to_f32(d);
+			xq_sum[local_bi] = sum;
+		}
+		barrier();
+
+		for (int bi = block_start; bi < block_end; bi++) {
+			int	  x_base = bi * 32 - tile_start;
+			float d_xq	 = xq_d[bi - block_start];
+
+			int wp = x_base >> 2;
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q5_0_BLOCK_BYTES + uint(bi) * Q5_0_BLOCK_BYTES;
+
+				float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
+				uint  qh	 = w0_read_u32(block_off + 2u);
+				uint  qs_off = block_off + 6u;
+
+				int sumi = 0;
+				for (int w4 = 0; w4 < 4; w4++) {
+					uint word = w0_read_u32(qs_off + uint(w4 * 4));
+					int	 j	  = w4 * 4;
+
+					uint lo_word = 0u;
+					uint hi_word = 0u;
+					for (int b = 0; b < 4; b++) {
+						uint byte	= (word >> uint(b * 8)) & 0xFFu;
+						int	 lo4	= int(byte & 0xFu);
+						int	 hi4	= int(byte >> 4u);
+						int	 lo_bit = int((qh >> uint(j + b)) & 1u);
+						int	 hi_bit = int((qh >> uint(j + b + 16)) & 1u);
+						uint lo_val = uint((lo4 | (lo_bit << 4)) - 16) & 0xFFu;
+						uint hi_val = uint((hi4 | (hi_bit << 4)) - 16) & 0xFFu;
+						lo_word |= lo_val << uint(b * 8);
+						hi_word |= hi_val << uint(b * 8);
+					}
+
+					sumi += dotPacked4x8EXT(int(lo_word), int(xq_packed[wp + w4]));
+					sumi += dotPacked4x8EXT(int(hi_word), int(xq_packed[wp + 4 + w4]));
+				}
+
+				acc[r] = fma(d, float(sumi), acc[r]);
+			}
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid[r])
+			continue;
+		y[y_off + base_i + uint(r)] =
+			acc[r] + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
+	}
+}
+#endif
+
+#if defined(Q5_1)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[TILE_K / 32];
+shared float xq_s[TILE_K / 32];
+
+#include "xq8_block.glsl"
+
+void main() {
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	uint tid			= gl_LocalInvocationID.x;
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	uint row   = gl_WorkGroupID.y;
+	uint x_off = row * uint(k);
+	uint y_off = row * uint(params.n0);
+	uint r_off = y_off;
+
+	precise float acc[ROWS_PER_THREAD];
+	precise float off[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		acc[r] = 0.0;
+		off[r] = 0.0;
+	}
+	bool valid[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid[r] = (int(base_i) + r < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		barrier();
+
+		int block_start = tile_start / 32;
+		int block_end	= tile_end / 32;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			int	  local_bi = bi - block_start;
+			float d;
+			int	  sum	   = xq8_quant_block(bi * 32 - tile_start, d);
+			xq_d[local_bi] = f32_to_f16_to_f32(d);
+			xq_s[local_bi] = f32_to_f16_to_f32(d * float(sum));
+		}
+		barrier();
+
+		for (int bi = block_start; bi < block_end; bi++) {
+			int	  x_base = bi * 32 - tile_start;
+			float d_xq	 = xq_d[bi - block_start];
+			float s_xq	 = xq_s[bi - block_start];
+
+			int wp = x_base >> 2;
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q5_1_BLOCK_BYTES + uint(bi) * Q5_1_BLOCK_BYTES;
+				float d		 = half_to_float(w0_read_u16(block_off)) * d_xq;
+				uint  qh	 = w0_read_u32(block_off + 4u);
+				uint  qs_off = block_off + 8u;
+
+				int sumi = 0;
+				for (int w4 = 0; w4 < 4; w4++) {
+					uint word		= w0_read_u32(qs_off + uint(w4 * 4));
+					int	 lo_nibbles = int(word & 0x0F0F0F0Fu);
+					int	 hi_nibbles = int((word >> 4) & 0x0F0F0F0Fu);
+					int	 j			= w4 * 4;
+
+					int lo_qh	= int((qh >> uint(j)) & 1u) | (int((qh >> uint(j + 1)) & 1u) << 8) |
+								  (int((qh >> uint(j + 2)) & 1u) << 16) |
+								  (int((qh >> uint(j + 3)) & 1u) << 24);
+					int hi_qh	= int((qh >> uint(j + 16)) & 1u) |
+								  (int((qh >> uint(j + 17)) & 1u) << 8) |
+								  (int((qh >> uint(j + 18)) & 1u) << 16) |
+								  (int((qh >> uint(j + 19)) & 1u) << 24);
+					int lo_vals = lo_nibbles | (lo_qh << 4);
+					int hi_vals = hi_nibbles | (hi_qh << 4);
+
+					sumi += dotPacked4x8EXT(lo_vals, int(xq_packed[wp + w4]));
+					sumi += dotPacked4x8EXT(hi_vals, int(xq_packed[wp + 4 + w4]));
+				}
+
+				acc[r] = fma(d, float(sumi), acc[r]);
+				off[r] = fma(half_to_float(w0_read_u16(block_off + 2u)), s_xq, off[r]);
+			}
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid[r])
+			continue;
+		y[y_off + base_i + uint(r)] =
+			(acc[r] + off[r]) + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
+	}
+}
+#endif
+
+#if defined(Q5_K)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+layout(constant_id = 2) const int TILE_K = 2048;
+const int BLOCK							 = 256;
+const int BLOCKS_PER_TILE				 = TILE_K / BLOCK;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+shared int xq_bsums[BLOCKS_PER_TILE * 16];
+
+#define XQ_HAVE_BSUMS 1
+#include "quant_x8_block.glsl"
+#undef XQ_HAVE_BSUMS
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * Q5_K_BLOCK_BYTES;
+
+	uint row   = gl_WorkGroupID.y;
+	uint x_off = row * uint(k);
+	uint y_off = row * uint(params.n0);
+	uint r_off = y_off;
+
+	precise float acc	= 0.0;
+	bool		  valid = (int(i) < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid) {
+			uint row_off = i * row_stride;
+
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * Q5_K_BLOCK_BYTES;
+				float d			= half_to_float(w0_read_u16(block_off + 0u));
+				float dmin		= half_to_float(w0_read_u16(block_off + 2u));
+
+				int	  local_bi = bi - block_start;
+				float xd	   = xq_d[local_bi];
+
+				int	 sumi = 0, summ = 0;
+				uint s_off	= block_off + 4u;
+				uint qh_off = block_off + 16u;
+				uint qs_off = block_off + 48u;
+				int	 wp		= (bi * 256 - tile_start) >> 2;
+
+				uint qh_w0 = w0_read_u32(qh_off + 0u);
+				uint qh_w1 = w0_read_u32(qh_off + 4u);
+				uint qh_w2 = w0_read_u32(qh_off + 8u);
+				uint qh_w3 = w0_read_u32(qh_off + 12u);
+				uint qh_w4 = w0_read_u32(qh_off + 16u);
+				uint qh_w5 = w0_read_u32(qh_off + 20u);
+				uint qh_w6 = w0_read_u32(qh_off + 24u);
+				uint qh_w7 = w0_read_u32(qh_off + 28u);
+
+				uint sc_d[8], sc_m[8];
+				w0_get_all_scale_min_k4(s_off, sc_d, sc_m);
+
+				int ib = local_bi * 16;
+				for (int g = 0; g < 4; g++) {
+					int is = g * 2;
+					int s0 = int(sc_d[is]), m0 = int(sc_m[is]);
+					int s1 = int(sc_d[is + 1]), m1 = int(sc_m[is + 1]);
+
+					int dot0 = 0, dot1 = 0;
+					int g_shift = 2 * g;
+
+#define Q5K_STEP(L, QH_W)                                                                          \
+	{                                                                                              \
+		uint qs_word = w0_read_u32(qs_off + uint(g * 32 + (L)));                                   \
+		uint qh_word = QH_W;                                                                       \
+		int	 qb0	 = int((qs_word) & 0xFFu);                                                     \
+		int	 qb1	 = int((qs_word >> 8u) & 0xFFu);                                               \
+		int	 qb2	 = int((qs_word >> 16u) & 0xFFu);                                              \
+		int	 qb3	 = int((qs_word >> 24u) & 0xFFu);                                              \
+		int	 qh0	 = int((qh_word) & 0xFFu);                                                     \
+		int	 qh1	 = int((qh_word >> 8u) & 0xFFu);                                               \
+		int	 qh2	 = int((qh_word >> 16u) & 0xFFu);                                              \
+		int	 qh3	 = int((qh_word >> 24u) & 0xFFu);                                              \
+		int	 lo0	 = (qb0 & 0xF) | (int((qh0 >> g_shift) & 1) << 4);                             \
+		int	 lo1	 = (qb1 & 0xF) | (int((qh1 >> g_shift) & 1) << 4);                             \
+		int	 lo2	 = (qb2 & 0xF) | (int((qh2 >> g_shift) & 1) << 4);                             \
+		int	 lo3	 = (qb3 & 0xF) | (int((qh3 >> g_shift) & 1) << 4);                             \
+		int	 w_lo	 = pack32(i8vec4(int8_t(lo0), int8_t(lo1), int8_t(lo2), int8_t(lo3)));         \
+		dot0 += dotPacked4x8EXT(w_lo, int(xq_packed[wp + g * 16 + (L) / 4]));                      \
+		int hi0	 = (qb0 >> 4) | (int((qh0 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi1	 = (qb1 >> 4) | (int((qh1 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi2	 = (qb2 >> 4) | (int((qh2 >> (g_shift + 1)) & 1) << 4);                            \
+		int hi3	 = (qb3 >> 4) | (int((qh3 >> (g_shift + 1)) & 1) << 4);                            \
+		int w_hi = pack32(i8vec4(int8_t(hi0), int8_t(hi1), int8_t(hi2), int8_t(hi3)));             \
+		dot1 += dotPacked4x8EXT(w_hi, int(xq_packed[wp + g * 16 + (L) / 4 + 8]));                  \
+	}
+
+					Q5K_STEP(0, qh_w0)
+					Q5K_STEP(4, qh_w1)
+					Q5K_STEP(8, qh_w2)
+					Q5K_STEP(12, qh_w3)
+					Q5K_STEP(16, qh_w4)
+					Q5K_STEP(20, qh_w5)
+					Q5K_STEP(24, qh_w6)
+					Q5K_STEP(28, qh_w7)
+#undef Q5K_STEP
+
+					sumi += s0 * dot0 + s1 * dot1;
+					summ += m0 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+					summ += m1 * (xq_bsums[ib] + xq_bsums[ib + 1]);
+					ib += 2;
+				}
+				acc = fma(xd, d * float(sumi) - dmin * float(summ), acc);
+			}
+		}
+		barrier();
+	}
+
+	if (!valid)
+		return;
+	y[y_off + i] = acc + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+}
+#endif
+
+#if defined(Q6_K)
+layout(local_size_x_id = 0) in;
+
+#ifdef NMAT_DUAL
+#define NMAT 2
+#else
+#define NMAT 1
+#endif
+layout(constant_id = 2) const int TILE_K = 2048;
+
+#if NMAT >= 2
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer W1Buf {
+	uint w1[];
+};
+layout(set = 0, binding = 2) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 3) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 4) writeonly buffer Y1Buf {
+	float y1[];
+};
+#else
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer Y0Buf {
+	float y0[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+#endif
+
+#include "matmul_push.glsl"
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+#if NMAT >= 2
+#define W_NAME w1
+#define W_PFX w1_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+#endif
+
+const int BLOCK			  = 256;
+const int BLOCKS_PER_TILE = TILE_K / BLOCK;
+
+shared float x_shared[TILE_K];
+shared uint	 xq_packed[TILE_K / 4];
+shared float xq_d[BLOCKS_PER_TILE];
+
+#include "quant_x8_block.glsl"
+
+uint byte_from_word(uint word, uint byte_idx) {
+	return (word >> (byte_idx * 8u)) & 0xFFu;
+}
+
+#define DEFINE_DEQUANT16_Q6K(SUFFIX)                                                               \
+	void dequant16_q6k_##SUFFIX(uint ql_base, uint qh_base, int a_base, out int vals[16]) {        \
+		int	 l0		   = a_base & 31;                                                              \
+		int	 group	   = a_base >> 5;                                                              \
+		uint ql_start  = uint(l0) + ((group & 1) << 5);                                            \
+		bool nibble_hi = group >= 2;                                                               \
+		uint shift	   = uint(group) << 1;                                                         \
+		for (int w = 0; w < 4; w++) {                                                              \
+			uint ql_word = SUFFIX##_read_u32(ql_base + ql_start + uint(w) * 4u);                   \
+			uint qh_word = SUFFIX##_read_u32(qh_base + uint(l0) + uint(w) * 4u);                   \
+			for (int t = 0; t < 4; t++) {                                                          \
+				uint ql_v		= byte_from_word(ql_word, uint(t));                                \
+				uint qh_v		= byte_from_word(qh_word, uint(t));                                \
+				uint nibble		= nibble_hi ? (ql_v >> 4u) : (ql_v & 0xFu);                        \
+				uint hi			= ((qh_v >> shift) & 3u) << 4u;                                    \
+				vals[w * 4 + t] = int(nibble | hi) - 32;                                           \
+			}                                                                                      \
+		}                                                                                          \
+	}
+
+DEFINE_DEQUANT16_Q6K(w0)
+#if NMAT >= 2
+DEFINE_DEQUANT16_Q6K(w1)
+#endif
+
+void main() {
+	uint i	 = gl_GlobalInvocationID.x;
+	uint tid = gl_LocalInvocationID.x;
+	int	 k	 = params.k;
+
+	int	 blocks_per_row = k / 256;
+	uint row_stride		= uint(blocks_per_row) * Q6_K_BLOCK_BYTES;
+
+	uint row	= gl_WorkGroupID.y;
+	uint x_off	= row * uint(k);
+	uint y0_off = row * uint(params.n0);
+	uint r_off	= y0_off;
+#if NMAT >= 2
+	uint y1_off = row * uint(params.n1);
+#endif
+
+	precise float acc0	 = 0.0;
+	bool		  valid0 = (int(i) < params.n0);
+
+#if NMAT >= 2
+	precise float acc1	 = 0.0;
+	bool		  valid1 = (int(i) < params.n1);
+#endif
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x)) {
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		}
+		barrier();
+
+		int block_start = tile_start / 256;
+		int block_end	= tile_end / 256;
+
+		for (int bi = block_start + int(tid); bi < block_end; bi += int(gl_WorkGroupSize.x)) {
+			xq8_quant_superblock(bi, block_start, tile_start);
+		}
+		barrier();
+
+		if (valid0) {
+			uint row_off = i * row_stride;
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * Q6_K_BLOCK_BYTES;
+				uint  ql_off	= block_off;
+				uint  qh_off	= block_off + 128u;
+				uint  sc_off	= block_off + 192u;
+				float d_w		= half_to_float(w0_read_u16(block_off + 208u));
+
+				int	  local_bi = bi - block_start;
+				float d		   = d_w * xq_d[local_bi];
+
+				int wp	   = (bi * 256 - tile_start) >> 2;
+				int acc0_l = 0, acc1_l = 0;
+				for (int n_iter = 0; n_iter < 2; n_iter++) {
+					uint ql_base = ql_off + uint(n_iter) * 64u;
+					uint qh_base = qh_off + uint(n_iter) * 32u;
+
+					int j_base = n_iter * 8;
+					for (int jj = 0; jj < 8; jj++) {
+						int j = j_base + jj;
+						int s = w0_read_i8(sc_off + uint(j));
+
+						int av[16];
+						dequant16_q6k_w0(ql_base, qh_base, jj * 16, av);
+
+						int xw	  = wp + n_iter * 32 + jj * 4;
+						int w0_lo = pack32(
+							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
+						int l0	  = dotPacked4x8EXT(w0_lo, int(xq_packed[xw + 0]));
+						int w0_hi = pack32(
+							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
+						l0 += dotPacked4x8EXT(w0_hi, int(xq_packed[xw + 1]));
+
+						int w1_lo = pack32(
+							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
+						int l1	  = dotPacked4x8EXT(w1_lo, int(xq_packed[xw + 2]));
+						int w1_hi = pack32(
+							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
+						l1 += dotPacked4x8EXT(w1_hi, int(xq_packed[xw + 3]));
+
+						acc0_l += s * l0;
+						acc1_l += s * l1;
+					}
+				}
+				acc0 = fma(d, float(acc0_l + acc1_l), acc0);
+			}
+		}
+
+#if NMAT >= 2
+		if (valid1) {
+			uint row_off = i * row_stride;
+			for (int bi = block_start; bi < block_end; bi++) {
+				uint  block_off = row_off + uint(bi) * Q6_K_BLOCK_BYTES;
+				uint  ql_off	= block_off;
+				uint  qh_off	= block_off + 128u;
+				uint  sc_off	= block_off + 192u;
+				float d_w		= half_to_float(w1_read_u16(block_off + 208u));
+
+				int	  local_bi = bi - block_start;
+				float d		   = d_w * xq_d[local_bi];
+
+				int wp	   = (bi * 256 - tile_start) >> 2;
+				int acc0_l = 0, acc1_l = 0;
+				for (int n_iter = 0; n_iter < 2; n_iter++) {
+					uint ql_base = ql_off + uint(n_iter) * 64u;
+					uint qh_base = qh_off + uint(n_iter) * 32u;
+
+					int j_base = n_iter * 8;
+					for (int jj = 0; jj < 8; jj++) {
+						int j = j_base + jj;
+						int s = w1_read_i8(sc_off + uint(j));
+
+						int av[16];
+						dequant16_q6k_w1(ql_base, qh_base, jj * 16, av);
+
+						int xw	  = wp + n_iter * 32 + jj * 4;
+						int w0_lo = pack32(
+							i8vec4(int8_t(av[0]), int8_t(av[1]), int8_t(av[2]), int8_t(av[3])));
+						int l0	  = dotPacked4x8EXT(w0_lo, int(xq_packed[xw + 0]));
+						int w0_hi = pack32(
+							i8vec4(int8_t(av[4]), int8_t(av[5]), int8_t(av[6]), int8_t(av[7])));
+						l0 += dotPacked4x8EXT(w0_hi, int(xq_packed[xw + 1]));
+
+						int w1_lo = pack32(
+							i8vec4(int8_t(av[8]), int8_t(av[9]), int8_t(av[10]), int8_t(av[11])));
+						int l1	  = dotPacked4x8EXT(w1_lo, int(xq_packed[xw + 2]));
+						int w1_hi = pack32(
+							i8vec4(int8_t(av[12]), int8_t(av[13]), int8_t(av[14]), int8_t(av[15])));
+						l1 += dotPacked4x8EXT(w1_hi, int(xq_packed[xw + 3]));
+
+						acc0_l += s * l0;
+						acc1_l += s * l1;
+					}
+				}
+				acc1 = fma(d, float(acc0_l + acc1_l), acc1);
+			}
+		}
+#endif
+		barrier();
+	}
+
+#if NMAT >= 2
+	if (valid0)
+		y0[y0_off + i] = acc0;
+	if (valid1)
+		y1[y1_off + i] = acc1;
+#else
+	if (valid0)
+		y0[y0_off + i] = acc0 + (params.res_mode != 0 ? residual[r_off + i] : 0.0);
+#endif
+}
+#endif
+
+#if defined(Q8_0)
+layout(local_size_x_id = 0) in;
+
+layout(set = 0, binding = 0) readonly buffer W0Buf {
+	uint w0[];
+};
+layout(set = 0, binding = 1) readonly buffer XBuf {
+	float x[];
+};
+layout(set = 0, binding = 2) writeonly buffer YBuf {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer RBuf {
+	float residual[];
+};
+
+#include "matmul_push.glsl"
+
+layout(constant_id = 1) const int ROWS_PER_THREAD = 4;
+layout(constant_id = 2) const int TILE_K		  = 2048;
+
+#include "common.glsl"
+
+#define W_NAME w0
+#define W_PFX w0_
+#include "weight_io.glsl"
+#undef W_NAME
+#undef W_PFX
+
+shared float x_shared[TILE_K];
+shared float dx_scale_shared[TILE_K / 32];
+shared uint	 xq_packed[TILE_K / 4];
+
+#include "xq8_block.glsl"
+
+void main() {
+	uint base_i			= gl_GlobalInvocationID.x * uint(ROWS_PER_THREAD);
+	uint tid			= gl_LocalInvocationID.x;
+	int	 k				= params.k;
+	int	 blocks_per_row = k / 32;
+
+	uint row   = gl_WorkGroupID.y;
+	uint x_off = row * uint(k);
+	uint y_off = row * uint(params.n0);
+	uint r_off = y_off;
+
+	precise float acc[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		acc[r] = 0.0;
+	bool valid[ROWS_PER_THREAD];
+	for (int r = 0; r < ROWS_PER_THREAD; r++)
+		valid[r] = (int(base_i) + r < params.n0);
+
+	for (int tile_start = 0; tile_start < k; tile_start += TILE_K) {
+		int tile_end = min(tile_start + TILE_K, k);
+		int tile_len = tile_end - tile_start;
+
+		for (int j = int(tid); j < tile_len; j += int(gl_WorkGroupSize.x))
+			x_shared[j] = x[x_off + uint(tile_start + j)];
+		barrier();
+
+		int local_blocks = tile_len / 32;
+		for (int local_bi = int(tid); local_bi < local_blocks;
+			 local_bi += int(gl_WorkGroupSize.x)) {
+			float dx;
+			xq8_quant_block(local_bi * 32, dx);
+			dx_scale_shared[local_bi] = half_to_float(float_to_half(dx));
+		}
+		barrier();
+
+		for (int local_bi = 0; local_bi < local_blocks; local_bi++) {
+			int	  bi	   = tile_start / 32 + local_bi;
+			float dx_scale = dx_scale_shared[local_bi];
+
+			int wp = local_bi * 8;
+			for (int r = 0; r < ROWS_PER_THREAD; r++) {
+				if (!valid[r])
+					continue;
+				uint row_idx = base_i + uint(r);
+				uint block_off =
+					row_idx * uint(blocks_per_row) * Q8_0_BLOCK_BYTES + uint(bi) * Q8_0_BLOCK_BYTES;
+				float d		 = half_to_float(w0_read_u16(block_off));
+				uint  qs_off = block_off + 2u;
+
+				int sumi = 0;
+				for (int w4 = 0; w4 < 8; w4++) {
+					int qv = int(w0_read_u32(qs_off + uint(w4 * 4)));
+					sumi += dotPacked4x8EXT(qv, int(xq_packed[wp + w4]));
+				}
+				acc[r] = fma(d * dx_scale, float(sumi), acc[r]);
+			}
+		}
+		barrier();
+	}
+
+	for (int r = 0; r < ROWS_PER_THREAD; r++) {
+		if (!valid[r])
+			continue;
+		y[y_off + base_i + uint(r)] =
+			acc[r] + (params.res_mode != 0 ? residual[r_off + base_i + uint(r)] : 0.0);
+	}
+}
+#endif

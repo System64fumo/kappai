@@ -1,3 +1,6 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
 layout(local_size_x_id = 0) in;
 
 #if defined(W_F32)

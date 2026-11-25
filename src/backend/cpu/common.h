@@ -394,6 +394,7 @@ typedef struct {
 	float		   *outf;
 	int				n_groups, head_dim, hd_stride, n_pos, flash_attn;
 	int				n_heads;
+	int				decode_order;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;
@@ -407,6 +408,7 @@ typedef struct {
 	int				n_groups, head_dim, hd_stride;
 	int				n_heads, pos_start, m, sliding_window, flash_attn;
 	int				n_keys;
+	int				decode_order;
 	float			scale;
 	size_t			kvh_stride;
 	cpu_priv	   *p;

@@ -5,6 +5,10 @@
 
 #define BM 64u
 #define BN 64u
+#define SB 4u
+#ifndef M_TILE
+#define M_TILE BN
+#endif
 
 layout(local_size_x = 256) in;
 
@@ -35,9 +39,9 @@ pc;
 shared uint	 s_w[8u * BM];
 shared float s_dw[BM];
 shared float s_mw[BM];
-shared uint	 s_x[8u * BN];
-shared float s_dx[BN];
-shared float s_sx[BN];
+shared uint	 s_x[8u * M_TILE];
+shared float s_dx[M_TILE];
+shared float s_sx[M_TILE];
 
 void main() {
 	qblock_init();
@@ -47,15 +51,17 @@ void main() {
 	uint n	  = uint(pc.n);
 	uint m	  = uint(pc.m);
 	uint kb	  = uint(pc.kb);
-	uint col0 = gl_WorkGroupID.x * BN;
+	uint col0 = gl_WorkGroupID.x * M_TILE;
 	uint row0 = gl_WorkGroupID.y * BM;
 
 	uint lr	   = tid >> 2u;
 	uint pp	   = tid & 3u;
-	uint wbase = min(row0 + lr, n - 1u) * kb * BLOCK_U16;
-	uint xbase = min(col0 + lr, m - 1u) * kb * XQ_BLOCK_WORDS;
 	uint tr	   = tid & 15u;
 	uint tc	   = tid >> 4u;
+	uint wbase = min(row0 + lr, n - 1u) * kb * BLOCK_U16;
+	uint mrow  = min(M_TILE, m - col0);
+	bool mx	   = lr < mrow;
+	uint xbase = mx ? min(col0 + lr, m - 1u) * kb * XQ_BLOCK_WORDS : 0u;
 
 	float acc[16];
 	for (uint i = 0u; i < 16u; i++)
@@ -64,22 +70,26 @@ void main() {
 	uint  wa, wb, xa, xb;
 	float wd, wm, xd, xs;
 	load_wpart(wbase, pp, wa, wb, wd, wm);
-	xa = xq[xbase + XW_A(pp)];
-	xb = xq[xbase + XW_B(pp)];
-	xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
-	xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
+	xa = mx ? xq[xbase + XW_A(pp)] : 0u;
+	xb = mx ? xq[xbase + XW_B(pp)] : 0u;
+	xd = mx ? uintBitsToFloat(xq[xbase + XQ_D_WORD]) : 0.0;
+	xs = mx ? uintBitsToFloat(xq[xbase + XQ_S_WORD]) : 0.0;
 
 	for (uint bi = 0u; bi < kb; bi++) {
 		barrier();
 		s_w[XW_A(pp) * BM + lr] = wa;
 		s_w[XW_B(pp) * BM + lr] = wb;
-		s_x[XW_A(pp) * BN + lr] = xa;
-		s_x[XW_B(pp) * BN + lr] = xb;
+		if (mx) {
+			s_x[XW_A(pp) * M_TILE + lr] = xa;
+			s_x[XW_B(pp) * M_TILE + lr] = xb;
+			if (pp == 0u) {
+				s_dx[lr] = xd;
+				s_sx[lr] = xs;
+			}
+		}
 		if (pp == 0u) {
 			s_dw[lr] = wd;
 			s_mw[lr] = wm;
-			s_dx[lr] = xd;
-			s_sx[lr] = xs;
 		}
 		barrier();
 
@@ -87,33 +97,35 @@ void main() {
 			wbase += BLOCK_U16;
 			xbase += XQ_BLOCK_WORDS;
 			load_wpart(wbase, pp, wa, wb, wd, wm);
-			xa = xq[xbase + XW_A(pp)];
-			xb = xq[xbase + XW_B(pp)];
-			xd = uintBitsToFloat(xq[xbase + XQ_D_WORD]);
-			xs = uintBitsToFloat(xq[xbase + XQ_S_WORD]);
+			xa = mx ? xq[xbase + XW_A(pp)] : 0u;
+			xb = mx ? xq[xbase + XW_B(pp)] : 0u;
+			xd = mx ? uintBitsToFloat(xq[xbase + XQ_D_WORD]) : 0.0;
+			xs = mx ? uintBitsToFloat(xq[xbase + XQ_S_WORD]) : 0.0;
 		}
 
-		int sumi[16];
-		for (uint i = 0u; i < 16u; i++)
-			sumi[i] = 0;
-		for (uint wd8 = 0u; wd8 < 8u; wd8++) {
-			uint  ab = wd8 * BM + tr * 4u;
-			uint  bb = wd8 * BN + tc * 4u;
-			uvec4 a	 = uvec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
-			uvec4 b	 = uvec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
-			for (uint i = 0u; i < 4u; i++)
-				for (uint j = 0u; j < 4u; j++)
-					sumi[i * 4u + j] += dotPacked4x8EXT(int(a[i]), int(b[j]));
-		}
-		for (uint i = 0u; i < 4u; i++) {
-			float dwi = s_dw[tr * 4u + i];
-			float mwi = s_mw[tr * 4u + i];
-			for (uint j = 0u; j < 4u; j++) {
-				float a = acc[i * 4u + j];
+		if (tc * 4u < mrow) {
+			int sumi[16];
+			for (uint i = 0u; i < 16u; i++)
+				sumi[i] = 0;
+			for (uint wd8 = 0u; wd8 < 8u; wd8++) {
+				uint  ab = wd8 * BM + tr * 4u;
+				uint  bb = wd8 * M_TILE + tc * 4u;
+				uvec4 a	 = uvec4(s_w[ab], s_w[ab + 1u], s_w[ab + 2u], s_w[ab + 3u]);
+				uvec4 b	 = uvec4(s_x[bb], s_x[bb + 1u], s_x[bb + 2u], s_x[bb + 3u]);
+				for (uint i = 0u; i < 4u; i++)
+					for (uint j = 0u; j < 4u; j++)
+						sumi[i * 4u + j] += dotPacked4x8EXT(int(a[i]), int(b[j]));
+			}
+			for (uint i = 0u; i < 4u; i++) {
+				float dwi = s_dw[tr * 4u + i];
+				float mwi = s_mw[tr * 4u + i];
+				for (uint j = 0u; j < 4u; j++) {
+					float a = acc[i * 4u + j];
 #ifdef HAS_MIN
-				a = mwi * s_sx[tc * 4u + j] + a;
+					a = mwi * s_sx[tc * 4u + j] + a;
 #endif
-				acc[i * 4u + j] = fma(dwi * s_dx[tc * 4u + j], float(sumi[i * 4u + j]), a);
+					acc[i * 4u + j] = fma(dwi * s_dx[tc * 4u + j], float(sumi[i * 4u + j]), a);
+				}
 			}
 		}
 	}

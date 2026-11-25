@@ -432,6 +432,13 @@ static void cpu_attn_head_chunk(int begin, int end, int tid, void *ctx) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((size_t)h * j->head_dim);
 		float		*out_h = j->outf + ((size_t)h * j->head_dim);
+		if (j->decode_order && j->kv_quant == KV_QUANT_F16) {
+			const uint16_t *k16 = j->kl_base + ((size_t)kvh * j->kvh_stride);
+			const uint16_t *v16 = j->vl_base + ((size_t)kvh * j->kvh_stride);
+			cpu_attention_decode_f16(k16, v16, j->hd_stride, qh, out_h, j->head_dim, j->n_pos,
+									 j->n_heads, j->scale);
+			continue;
+		}
 		if (j->kv_quant == KV_QUANT_Q8_0) {
 			const uint8_t *k_slice = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride);
 			const uint8_t *v_slice = (const uint8_t *)j->vl_base + ((size_t)kvh * j->kvh_stride);
@@ -466,6 +473,13 @@ static void cpu_attn_kvh_chunk(int begin, int end, int tid, void *ctx) {
 		for (int h = h_start; h < h_end; h++) {
 			const float *qh	   = j->qf + ((size_t)h * j->head_dim);
 			float		*out_h = j->outf + ((size_t)h * j->head_dim);
+			if (j->decode_order && j->kv_quant == KV_QUANT_F16) {
+				const uint16_t *k16 = j->kl_base + ((size_t)kvh * j->kvh_stride);
+				const uint16_t *v16 = j->vl_base + ((size_t)kvh * j->kvh_stride);
+				cpu_attention_decode_f16(k16, v16, j->hd_stride, qh, out_h, j->head_dim, j->n_pos,
+										 j->n_heads, j->scale);
+				continue;
+			}
 			if (j->kv_quant == KV_QUANT_Q8_0) {
 				cpu_attention_inner_q8_0(k_slice, v_slice, (size_t)j->hd_stride, qh, out_h,
 										 j->head_dim, j->n_pos, j->scale, j->flash_attn, scores);
@@ -561,20 +575,21 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 
 	if (can_recurse && p->pool && p->thread_scratch && n_heads > 1 &&
 		(size_t)n_heads * (size_t)n_pos * (size_t)head_dim >= 4096) {
-		cpu_attn_job job = {.kl_base	= kl_base,
-							.vl_base	= vl_base,
-							.qf			= qf,
-							.outf		= outf,
-							.n_groups	= n_groups,
-							.head_dim	= head_dim,
-							.hd_stride	= hd_stride,
-							.n_pos		= n_pos,
-							.flash_attn = flash_attn,
-							.n_heads	= n_heads,
-							.scale		= scale,
-							.kvh_stride = kvh_stride,
-							.p			= p,
-							.kv_quant	= KV_QUANT_F16};
+		cpu_attn_job job = {.kl_base	  = kl_base,
+							.vl_base	  = vl_base,
+							.qf			  = qf,
+							.outf		  = outf,
+							.n_groups	  = n_groups,
+							.head_dim	  = head_dim,
+							.hd_stride	  = hd_stride,
+							.n_pos		  = n_pos,
+							.flash_attn	  = flash_attn,
+							.n_heads	  = n_heads,
+							.decode_order = 1,
+							.scale		  = scale,
+							.kvh_stride	  = kvh_stride,
+							.p			  = p,
+							.kv_quant	  = KV_QUANT_F16};
 		if (n_groups > 1)
 			tpool_parallel_for(p->pool, n_active, 1, cpu_attn_kvh_chunk, &job);
 		else
@@ -590,8 +605,12 @@ status_code cpu_attention_impl(backend *self, const buffer *q, const buffer *k_c
 
 		const float *qh	   = qf + ((size_t)h * head_dim);
 		float		*out_h = outf + ((size_t)h * head_dim);
-		cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
-							flash_attn, scores);
+		if (p->kv_quant == KV_QUANT_F16)
+			cpu_attention_decode_f16(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos,
+									 n_heads, scale);
+		else
+			cpu_attention_inner(k_slice, v_slice, hd_stride, qh, out_h, head_dim, n_pos, scale,
+								flash_attn, scores);
 	}
 	return OK;
 }
@@ -640,6 +659,15 @@ static void cpu_attn_batch_chunk(int begin, int end, int tid, void *ctx) {
 		int			 kvh   = h / j->n_groups;
 		const float *qh	   = j->qf + ((((size_t)row * j->n_heads) + h) * j->head_dim);
 		float		*out_h = j->outf + ((((size_t)row * j->n_heads) + h) * j->head_dim);
+		if (j->decode_order && j->kv_quant == KV_QUANT_F16) {
+			const uint16_t *k16 =
+				j->kl_base + ((size_t)kvh * j->kvh_stride) + ((size_t)attn_start * j->hd_stride);
+			const uint16_t *v16 =
+				j->vl_base + ((size_t)kvh * j->kvh_stride) + ((size_t)attn_start * j->hd_stride);
+			cpu_attention_decode_f16(k16, v16, j->hd_stride, qh, out_h, j->head_dim, n_pos,
+									 j->n_heads, j->scale);
+			continue;
+		}
 		if (j->kv_quant == KV_QUANT_Q8_0) {
 			const uint8_t *k_slice = (const uint8_t *)j->kl_base + ((size_t)kvh * j->kvh_stride) +
 									 ((size_t)attn_start * (size_t)j->hd_stride);
@@ -693,6 +721,7 @@ static status_code cpu_attention_batch_impl(backend *self, const buffer *q, cons
 							  .m			  = m,
 							  .sliding_window = sliding_window,
 							  .flash_attn	  = flash_attn,
+							  .decode_order	  = 1,
 							  .scale		  = scale,
 							  .kvh_stride	  = view.kvh_stride,
 							  .p			  = p,

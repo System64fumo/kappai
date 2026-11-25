@@ -208,6 +208,10 @@ void dequant_row_plan(uint32_t type, dequant_blocks_fn *fn_out, int *divisor_out
 
 float rmsnorm_sum_sq(const float *x, int n);
 
+void cpu_attention_decode_f16(const uint16_t *k_slice, const uint16_t *v_slice, int kv_stride,
+							  const float *qh, float *out_h, int head_dim, int n_pos, int n_heads,
+							  float scale);
+
 float bf16_to_f32(uint16_t h);
 
 void matmul_generic_f32(const void *w, uint32_t w_type, const float *x, float *y, int n, int k);

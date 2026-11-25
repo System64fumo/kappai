@@ -52,11 +52,14 @@ shared vec2	 red[WG];
 shared float l_red[WG];
 
 float k_partial(uint row, int lane, int pairs) {
-	float a = 0.0;
+	precise float a = 0.0;
 	if (pc.kv_q8 == 0) {
 		uint wb = row >> 1u;
-		for (int p = lane; p < pairs; p += LANES)
-			a += dot(unpackHalf2x16(kcache[wb + uint(p)]), q2[p]);
+		for (int p = lane; p < pairs; p += LANES) {
+			vec2 kv = unpackHalf2x16(kcache[wb + uint(p)]);
+			a		= fma(kv.x, q2[p].x, a);
+			a		= fma(kv.y, q2[p].y, a);
+		}
 		return a;
 	}
 	for (int p = lane; p < pairs; p += LANES) {
@@ -82,7 +85,8 @@ float k_partial(uint row, int lane, int pairs) {
 		if (q1 > 127)
 			q1 -= 256;
 		float v1 = s1 * float(q1);
-		a += v0 * q2[p].x + v1 * q2[p].y;
+		a		 = fma(v0, q2[p].x, a);
+		a		 = fma(v1, q2[p].y, a);
 	}
 	return a;
 }
@@ -139,10 +143,10 @@ void main() {
 		}
 		barrier();
 
-		int	  tok	= t0 + int(tid);
-		float score = neg_inf;
+		int			  tok	= t0 + int(tid);
+		precise float score = neg_inf;
 		if (tok < t_end) {
-			float s = 0.0;
+			precise float s = 0.0;
 			for (int l = 0; l < LANES; l++)
 				s += partial[int(tid) * LANES + l];
 			score = s * pc.scale;
@@ -203,7 +207,8 @@ void main() {
 						float v1 = s1 * float(q1);
 						vp		 = vec2(v0, v1);
 					}
-					o_acc[j] += e * vp;
+					o_acc[j].x = fma(e, vp.x, o_acc[j].x);
+					o_acc[j].y = fma(e, vp.y, o_acc[j].y);
 				}
 				l_part += e;
 			}
@@ -225,7 +230,7 @@ void main() {
 				l += l_red[g * pairs + slot_pair];
 			}
 			if (final_out) {
-				float inv_l	  = l > 0.0 ? 1.0 / l : 0.0;
+				float inv_l	  = l > 0.0 ? div_exact(1.0, l) : 0.0;
 				uint  ob	  = q_base + uint(slot_pair * 2);
 				out_[ob]	  = o.x * inv_l;
 				out_[ob + 1u] = o.y * inv_l;
@@ -241,7 +246,7 @@ void main() {
 		}
 		return;
 	}
-	float inv_l = l_part > 0.0 ? 1.0 / l_part : 0.0;
+	float inv_l = l_part > 0.0 ? div_exact(1.0, l_part) : 0.0;
 	if (!final_out && tid == 0u) {
 		part[pbase]		 = m_run;
 		part[pbase + 1u] = l_part;

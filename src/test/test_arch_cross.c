@@ -534,20 +534,20 @@ int run_arch_cross_mode(int argc, char **argv, test_device *devs, int n_devs) {
 			want = strcmp(sel.targets[t], devs[di].spec) == 0;
 		if (!want || strcmp(devs[di].spec, sel.ref) == 0)
 			continue;
-		backend *tgt = NULL;
-		if (test_device_create(&devs[di], &tgt) != OK) {
-			any_run = 1;
-			printf("\n=== %s: SKIPPED (failed to init) ===\n", devs[di].spec);
-			continue;
-		}
-		any_run = 1;
 		for (size_t ai = 0; ai < ARRAY_LEN(CROSS_ARCHS); ai++) {
 			if (!cross_arch_wanted(&opt, CROSS_ARCHS[ai].name))
 				continue;
+			backend *tgt = NULL;
+			if (test_device_create(&devs[di], &tgt) != OK) {
+				any_run = 1;
+				printf("\n=== %s: SKIPPED (failed to init) ===\n", devs[di].spec);
+				continue;
+			}
+			any_run = 1;
 			cross_run_arch(&CROSS_ARCHS[ai], ref, sel.ref, tgt, devs[di].spec, opt.n_prefill,
 						   opt.n_decode, opt.flash);
+			backend_destroy(tgt);
 		}
-		backend_destroy(tgt);
 	}
 	if (!any_run)
 		fprintf(stderr, "No matching/available devices were tested.\n");

@@ -212,7 +212,12 @@ static void test_op_embd_lookup(backend *ref, backend *tgt, const qtype_info *qt
 		record_result(OPFAM_EMBD_LOOKUP, label, V_SKIP, "reference cannot repack weight");
 		return;
 	}
-	int token = (int)(next_u32() % (uint32_t)vocab);
+	int n_tok = vocab < 256 ? vocab : 256;
+	int tokens[256];
+	for (int ti = 0; ti < n_tok; ti++)
+		tokens[ti] = ti;
+	if (n_tok > 0)
+		tokens[0] = (int)(next_u32() % (uint32_t)vocab);
 
 	tensor_desc wd = {
 		.host_data = blocks,
@@ -225,47 +230,37 @@ static void test_op_embd_lookup(backend *ref, backend *tgt, const qtype_info *qt
 	buffer out_ref = {0};
 	ref->buffer_alloc_weight(ref, &wd, &w_ref);
 	ref->buffer_alloc_scratch(ref, (size_t)dim * sizeof(float), &out_ref);
-	status_code s_ref;
-	{
-		s_ref = ref->embd_lookup(ref, &w_ref, qt->type, token, dim, &out_ref);
-	}
-	float *y_ref = xmalloc((size_t)dim * sizeof(float));
-	ref->buffer_read_f32(ref, &out_ref, y_ref, dim);
-
 	buffer w_tgt   = {0};
 	buffer out_tgt = {0};
 	tgt->buffer_alloc_weight(tgt, &wd, &w_tgt);
 	tgt->buffer_alloc_scratch(tgt, (size_t)dim * sizeof(float), &out_tgt);
-	status_code s_tgt;
-	{
-		s_tgt = tgt->embd_lookup(tgt, &w_tgt, qt->type, token, dim, &out_tgt);
+	float *y_ref = xmalloc((size_t)dim * sizeof(float));
+	float *y_got = xmalloc((size_t)dim * sizeof(float));
+	for (int ti = 0; ti < n_tok; ti++) {
+		int			token = tokens[ti];
+		status_code s_ref = ref->embd_lookup(ref, &w_ref, qt->type, token, dim, &out_ref);
+		if (ref->synchronize)
+			ref->synchronize(ref);
+		ref->buffer_read_f32(ref, &out_ref, y_ref, dim);
+		status_code s_tgt = tgt->embd_lookup(tgt, &w_tgt, qt->type, token, dim, &out_tgt);
 		if (tgt->synchronize)
 			tgt->synchronize(tgt);
+		tgt->buffer_read_f32(tgt, &out_tgt, y_got, dim);
+		char label[128];
+		char detail[256];
+		snprintf(label, sizeof(label), "%s embd_lookup dim=%d tok=%d", qt->name, dim, token);
+		verdict v = classify_output("loose", y_ref, y_got, dim, s_tgt, detail, sizeof(detail));
+		if (v != V_PASS && v != V_SKIP)
+			compute_debug(y_ref, y_got, dim);
+		record_result(OPFAM_EMBD_LOOKUP, label, v, detail);
 	}
-	float *y_got = xmalloc((size_t)dim * sizeof(float));
-	tgt->buffer_read_f32(tgt, &out_tgt, y_got, dim);
-
-	char label[128];
-	char detail[256];
-	snprintf(label, sizeof(label), "%s embd_lookup dim=%d tok=%d", qt->name, dim, token);
-	verdict v;
-	if (s_ref != OK) {
-		snprintf(detail, sizeof(detail), "reference status=%d", s_ref);
-		v = V_FAIL;
-	} else {
-		v = classify_output("loose", y_ref, y_got, dim, s_tgt, detail, sizeof(detail));
-	}
-	if (v != V_PASS && v != V_SKIP)
-		compute_debug(y_ref, y_got, dim);
-	record_result(OPFAM_EMBD_LOOKUP, label, v, detail);
-
 	free(y_ref);
 	free(y_got);
-	free(blocks);
 	ref->buffer_free(ref, &w_ref);
 	ref->buffer_free(ref, &out_ref);
 	tgt->buffer_free(tgt, &w_tgt);
 	tgt->buffer_free(tgt, &out_tgt);
+	return;
 }
 
 static void test_op_embd_lookup_f32(backend *ref, backend *tgt) {
@@ -536,11 +531,10 @@ static void test_op_rope(backend *ref, backend *tgt, int n_heads, int head_dim, 
 				  (uint64_t)pos);
 	fill_random_f32(vec, N, 1.0f);
 	for (int j = 0; j < half; j++) {
-		float c = cosf(((float)j * 0.0731f) + 0.1f);
-		float s = sinf(((float)j * 0.0731f) + 0.1f);
 		for (int p = 0; p < n_ctx; p++) {
-			cos_v[(p * half) + j] = c;
-			sin_v[(p * half) + j] = s;
+			float a				  = ((float)p * 0.117f) + ((float)j * 0.0731f) + 0.1f;
+			cos_v[(p * half) + j] = cosf(a);
+			sin_v[(p * half) + j] = sinf(a);
 		}
 	}
 
@@ -1024,6 +1018,156 @@ static void test_op_matmul_ffn_down_batch(backend *ref, backend *tgt, int n, int
 	tgt->buffer_free(tgt, &g_tgt);
 	tgt->buffer_free(tgt, &u_tgt);
 	tgt->buffer_free(tgt, &y_tgt);
+}
+
+static void test_op_matmul_batch(backend *ref, backend *tgt, const qtype_info *qt, int n, int k,
+								 int m) {
+	char label[128];
+	if (!tgt->matmul_batch || !ref->matmul_batch || !tgt->buffer_alloc_weight) {
+		snprintf(label, sizeof(label), "%s matmul_batch N=%d K=%d M=%d (%s)", qt->name, n, k, m,
+				 tgt->name);
+		record_result(OPFAM_MATMUL, label, V_SKIP, "backend has no native matmul_batch");
+		return;
+	}
+	if (k % qt->block != 0)
+		return;
+	if (tgt->matmul_type_native && !tgt->matmul_type_native(tgt, qt->type)) {
+		snprintf(label, sizeof(label), "%s matmul_batch N=%d K=%d M=%d (%s)", qt->name, n, k, m,
+				 tgt->name);
+		record_result(OPFAM_MATMUL, label, V_SKIP, "missing native implementation");
+		return;
+	}
+
+	seed_test_rng((0xB4B4ULL * (qt->type + 1) * 1000003ULL) + ((uint64_t)n * 37) + (uint64_t)k +
+				  (uint64_t)m);
+	void *blocks = test_make_weight(ref, qt, n, k, NULL);
+	if (!blocks) {
+		record_result(OPFAM_MATMUL, label, V_SKIP, "reference cannot repack weight");
+		return;
+	}
+
+	float *x = xmalloc((size_t)m * (size_t)k * sizeof(float));
+	fill_random_f32(x, m * k, 1.0f);
+
+	tensor_desc wd = {
+		.host_data = blocks,
+		.type	   = qt->type,
+		.n_dims	   = 2,
+		.dims	   = {k, n},
+	};
+
+	buffer w_ref = {0}, x_ref = {0}, y_ref_b = {0};
+	ref->buffer_alloc_weight(ref, &wd, &w_ref);
+	ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)k * sizeof(float), &x_ref);
+	ref->buffer_alloc_scratch(ref, (size_t)m * (size_t)n * sizeof(float), &y_ref_b);
+	ref->buffer_write_f32(ref, &x_ref, x, m * k);
+	status_code s_ref = ref->matmul_batch(ref, &w_ref, qt->type, &x_ref, &y_ref_b, n, k, m);
+	if (ref->synchronize)
+		ref->synchronize(ref);
+	float *y_ref = xmalloc((size_t)m * (size_t)n * sizeof(float));
+	ref->buffer_read_f32(ref, &y_ref_b, y_ref, m * n);
+
+	buffer w_tgt = {0}, x_tgt = {0}, y_tgt = {0};
+	tgt->buffer_alloc_weight(tgt, &wd, &w_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)k * sizeof(float), &x_tgt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)m * (size_t)n * sizeof(float), &y_tgt);
+	tgt->buffer_write_f32(tgt, &x_tgt, x, m * k);
+	status_code s_tgt = tgt->matmul_batch(tgt, &w_tgt, qt->type, &x_tgt, &y_tgt, n, k, m);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *y_got = xmalloc((size_t)m * (size_t)n * sizeof(float));
+	tgt->buffer_read_f32(tgt, &y_tgt, y_got, m * n);
+
+	char detail[256];
+	snprintf(label, sizeof(label), "%s matmul_batch N=%d K=%d M=%d", qt->name, n, k, m);
+	verdict v = classify_output("loose", y_ref, y_got, m * n, s_tgt != OK ? s_tgt : s_ref, detail,
+								sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(y_ref, y_got, m * n);
+	record_result(OPFAM_MATMUL, label, v, detail);
+
+	free(y_ref);
+	free(y_got);
+	free(x);
+	free(blocks);
+	ref->buffer_free(ref, &w_ref);
+	ref->buffer_free(ref, &x_ref);
+	ref->buffer_free(ref, &y_ref_b);
+	tgt->buffer_free(tgt, &w_tgt);
+	tgt->buffer_free(tgt, &x_tgt);
+	tgt->buffer_free(tgt, &y_tgt);
+}
+
+static void test_op_rmsnorm_per_head_batch(backend *ref, backend *tgt, int n_heads, int head_dim,
+										   int m) {
+	char label[160];
+	if (!ref->rmsnorm_per_head_batch || !tgt->rmsnorm_per_head_batch) {
+		snprintf(label, sizeof(label), "rmsnorm_per_head_batch h=%d d=%d m=%d", n_heads, head_dim,
+				 m);
+		record_result(OPFAM_BATCH_PARITY, label, V_SKIP,
+					  !ref->rmsnorm_per_head_batch
+						  ? "reference has no rmsnorm_per_head_batch"
+						  : "backend has no native rmsnorm_per_head_batch");
+		return;
+	}
+	int	   n = n_heads * head_dim * m;
+	float *x = xmalloc((size_t)n * sizeof(float));
+	float *w = xmalloc((size_t)head_dim * sizeof(float));
+	seed_test_rng(0x5A55ULL + ((uint64_t)n_heads * 31) + ((uint64_t)head_dim * 7) + (uint64_t)m);
+	fill_random_f32(x, n, 1.0f);
+	fill_random_f32(w, head_dim, 1.0f);
+
+	buffer xr = {0}, wr = {0}, yr = {0}, xt = {0}, wt = {0}, yt = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)n * sizeof(float), &xr);
+	ref->buffer_alloc_scratch(ref, (size_t)head_dim * sizeof(float), &wr);
+	ref->buffer_alloc_scratch(ref, (size_t)n * sizeof(float), &yr);
+	ref->buffer_write_f32(ref, &xr, x, n);
+	ref->buffer_write_f32(ref, &wr, w, head_dim);
+	ref->rmsnorm_per_head_batch(ref, &xr, &wr, &yr, n_heads, head_dim, 1e-5f, m);
+	float *y_ref = xmalloc((size_t)n * sizeof(float));
+	ref->buffer_read_f32(ref, &yr, y_ref, n);
+
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &xt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)head_dim * sizeof(float), &wt);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * sizeof(float), &yt);
+	tgt->buffer_write_f32(tgt, &xt, x, n);
+	tgt->buffer_write_f32(tgt, &wt, w, head_dim);
+	status_code st = tgt->rmsnorm_per_head_batch(tgt, &xt, &wt, &yt, n_heads, head_dim, 1e-5f, m);
+	float	   *y_got = xmalloc((size_t)n * sizeof(float));
+	tgt->buffer_read_f32(tgt, &yt, y_got, n);
+
+	char detail[256];
+	snprintf(label, sizeof(label), "rmsnorm_per_head_batch h=%d d=%d m=%d", n_heads, head_dim, m);
+	verdict v = classify_output("loose", y_ref, y_got, n, st, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(y_ref, y_got, n);
+	record_result(OPFAM_BATCH_PARITY, label, v, detail);
+
+	/* in-place: x == y (the model uses io-slot aliasing) */
+	ref->buffer_write_f32(ref, &xr, x, n);
+	ref->rmsnorm_per_head_batch(ref, &xr, &wr, &xr, n_heads, head_dim, 1e-5f, m);
+	ref->buffer_read_f32(ref, &xr, y_ref, n);
+	tgt->buffer_write_f32(tgt, &xt, x, n);
+	status_code st_ip =
+		tgt->rmsnorm_per_head_batch(tgt, &xt, &wt, &xt, n_heads, head_dim, 1e-5f, m);
+	tgt->buffer_read_f32(tgt, &xt, y_got, n);
+	snprintf(label, sizeof(label), "rmsnorm_per_head_batch in-place h=%d d=%d m=%d", n_heads,
+			 head_dim, m);
+	verdict vip = classify_output("loose", y_ref, y_got, n, st_ip, detail, sizeof(detail));
+	if (vip != V_PASS && vip != V_SKIP)
+		compute_debug(y_ref, y_got, n);
+	record_result(OPFAM_BATCH_PARITY, label, vip, detail);
+
+	free(x);
+	free(w);
+	free(y_ref);
+	free(y_got);
+	ref->buffer_free(ref, &xr);
+	ref->buffer_free(ref, &wr);
+	ref->buffer_free(ref, &yr);
+	tgt->buffer_free(tgt, &xt);
+	tgt->buffer_free(tgt, &wt);
+	tgt->buffer_free(tgt, &yt);
 }
 
 static void test_op_ffn_activate(backend *ref, backend *tgt, int n) {
@@ -2952,6 +3096,258 @@ static void test_op_rope_qk(backend *ref, backend *tgt, int n_heads, int n_kv_he
 	tgt->buffer_free(tgt, &vc_tgt);
 }
 
+static void test_op_partial_rope_qk(backend *ref, backend *tgt, int n_heads, int n_kv_heads,
+									int head_dim, int rope_dim, int pos_start, int n_rows) {
+	char label[160];
+	if (!ref->partial_rope_qk || !tgt->partial_rope_qk) {
+		snprintf(label, sizeof(label), "partial_rope_qk h=%d/%d d=%d rd=%d", n_heads, n_kv_heads,
+				 head_dim, rope_dim);
+		record_result(OPFAM_ROPE_QK, label, V_SKIP,
+					  !ref->partial_rope_qk ? "reference has no partial_rope_qk"
+											: "backend has no native partial_rope_qk");
+		return;
+	}
+	int nq	  = n_heads * head_dim;
+	int nk	  = n_kv_heads * head_dim;
+	int half  = rope_dim / 2;
+	int n_ctx = pos_start + n_rows;
+
+	float *q	 = xmalloc((size_t)nq * n_rows * sizeof(float));
+	float *k	 = xmalloc((size_t)nk * n_rows * sizeof(float));
+	float *cos_v = xmalloc((size_t)n_ctx * half * sizeof(float));
+	float *sin_v = xmalloc((size_t)n_ctx * half * sizeof(float));
+	seed_test_rng(0xB0A7ULL + ((uint64_t)n_heads * 131) + ((uint64_t)n_kv_heads * 17) +
+				  ((uint64_t)head_dim * 7) + ((uint64_t)rope_dim * 3) + (uint64_t)pos_start);
+	fill_random_f32(q, nq * n_rows, 1.0f);
+	fill_random_f32(k, nk * n_rows, 1.0f);
+	for (int j = 0; j < half; j++) {
+		float c = cosf(((float)j * 0.0731f) + 0.1f);
+		float s = sinf(((float)j * 0.0731f) + 0.1f);
+		for (int p = 0; p < n_ctx; p++) {
+			cos_v[(p * half) + j] = c;
+			sin_v[(p * half) + j] = s;
+		}
+	}
+
+	int saved_ref  = ref->rope_neox;
+	int saved_tgt  = tgt->rope_neox;
+	ref->rope_neox = 1;
+	tgt->rope_neox = 1;
+
+	buffer q_ref_b = {0}, k_ref_b = {0}, q_tgt_b = {0}, k_tgt_b = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)nq * n_rows * sizeof(float), &q_ref_b);
+	ref->buffer_alloc_scratch(ref, (size_t)nk * n_rows * sizeof(float), &k_ref_b);
+	ref->buffer_write_f32(ref, &q_ref_b, q, nq * n_rows);
+	ref->buffer_write_f32(ref, &k_ref_b, k, nk * n_rows);
+	ref->partial_rope_qk(ref, &q_ref_b, &k_ref_b, n_heads, n_kv_heads, head_dim, rope_dim,
+						 pos_start, cos_v, sin_v, n_rows);
+	if (ref->synchronize)
+		ref->synchronize(ref);
+	float *q_ref = xmalloc((size_t)nq * n_rows * sizeof(float));
+	float *k_ref = xmalloc((size_t)nk * n_rows * sizeof(float));
+	ref->buffer_read_f32(ref, &q_ref_b, q_ref, nq * n_rows);
+	ref->buffer_read_f32(ref, &k_ref_b, k_ref, nk * n_rows);
+
+	tgt->buffer_alloc_scratch(tgt, (size_t)nq * n_rows * sizeof(float), &q_tgt_b);
+	tgt->buffer_alloc_scratch(tgt, (size_t)nk * n_rows * sizeof(float), &k_tgt_b);
+	tgt->buffer_write_f32(tgt, &q_tgt_b, q, nq * n_rows);
+	tgt->buffer_write_f32(tgt, &k_tgt_b, k, nk * n_rows);
+	status_code s_tgt = tgt->partial_rope_qk(tgt, &q_tgt_b, &k_tgt_b, n_heads, n_kv_heads, head_dim,
+											 rope_dim, pos_start, cos_v, sin_v, n_rows);
+	if (tgt->synchronize)
+		tgt->synchronize(tgt);
+	float *q_got = xmalloc((size_t)nq * n_rows * sizeof(float));
+	float *k_got = xmalloc((size_t)nk * n_rows * sizeof(float));
+	tgt->buffer_read_f32(tgt, &q_tgt_b, q_got, nq * n_rows);
+	tgt->buffer_read_f32(tgt, &k_tgt_b, k_got, nk * n_rows);
+
+	char detail[256];
+	snprintf(label, sizeof(label), "partial_rope_qk Q h=%d/%d d=%d rd=%d pos=%d m=%d", n_heads,
+			 n_kv_heads, head_dim, rope_dim, pos_start, n_rows);
+	verdict vq = classify_output("loose", q_ref, q_got, nq * n_rows, s_tgt, detail, sizeof(detail));
+	if (vq != V_PASS && vq != V_SKIP)
+		compute_debug(q_ref, q_got, nq * n_rows);
+	record_result(OPFAM_ROPE_QK, label, vq, detail);
+
+	snprintf(label, sizeof(label), "partial_rope_qk K h=%d/%d d=%d rd=%d pos=%d m=%d", n_heads,
+			 n_kv_heads, head_dim, rope_dim, pos_start, n_rows);
+	verdict vk = classify_output("loose", k_ref, k_got, nk * n_rows, s_tgt, detail, sizeof(detail));
+	if (vk != V_PASS && vk != V_SKIP)
+		compute_debug(k_ref, k_got, nk * n_rows);
+	record_result(OPFAM_ROPE_QK, label, vk, detail);
+
+	ref->rope_neox = saved_ref;
+	tgt->rope_neox = saved_tgt;
+	free(q);
+	free(k);
+	free(cos_v);
+	free(sin_v);
+	free(q_ref);
+	free(k_ref);
+	free(q_got);
+	free(k_got);
+	ref->buffer_free(ref, &q_ref_b);
+	ref->buffer_free(ref, &k_ref_b);
+	tgt->buffer_free(tgt, &q_tgt_b);
+	tgt->buffer_free(tgt, &k_tgt_b);
+}
+
+static void test_op_split_qgate(backend *ref, backend *tgt, int n_heads, int head_dim, int n_rows) {
+	char label[160];
+	if (!ref->split_qgate || !tgt->split_qgate) {
+		snprintf(label, sizeof(label), "split_qgate h=%d d=%d m=%d", n_heads, head_dim, n_rows);
+		record_result(OPFAM_ATTENTION, label, V_SKIP,
+					  !ref->split_qgate ? "reference has no split_qgate"
+										: "backend has no native split_qgate");
+		return;
+	}
+	int	   n	   = n_heads * head_dim;
+	int	   mixed_n = 2 * n;
+	float *mixed   = xmalloc((size_t)mixed_n * n_rows * sizeof(float));
+	seed_test_rng(0x5A11ULL + ((uint64_t)n_heads * 31) + ((uint64_t)head_dim * 7) +
+				  (uint64_t)n_rows);
+	fill_random_f32(mixed, mixed_n * n_rows, 1.0f);
+
+	buffer mb = {0}, qb = {0}, gb = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)mixed_n * n_rows * sizeof(float), &mb);
+	ref->buffer_alloc_scratch(ref, (size_t)n * n_rows * sizeof(float), &qb);
+	ref->buffer_alloc_scratch(ref, (size_t)n * n_rows * sizeof(float), &gb);
+	ref->buffer_write_f32(ref, &mb, mixed, mixed_n * n_rows);
+	ref->split_qgate(ref, &mb, &qb, &gb, n_heads, head_dim, n_rows);
+	float *q_ref = xmalloc((size_t)n * n_rows * sizeof(float));
+	float *g_ref = xmalloc((size_t)n * n_rows * sizeof(float));
+	ref->buffer_read_f32(ref, &qb, q_ref, n * n_rows);
+	ref->buffer_read_f32(ref, &gb, g_ref, n * n_rows);
+
+	buffer mb2 = {0}, qb2 = {0}, gb2 = {0};
+	tgt->buffer_alloc_scratch(tgt, (size_t)mixed_n * n_rows * sizeof(float), &mb2);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * n_rows * sizeof(float), &qb2);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * n_rows * sizeof(float), &gb2);
+	tgt->buffer_write_f32(tgt, &mb2, mixed, mixed_n * n_rows);
+	status_code st	  = tgt->split_qgate(tgt, &mb2, &qb2, &gb2, n_heads, head_dim, n_rows);
+	float	   *q_got = xmalloc((size_t)n * n_rows * sizeof(float));
+	float	   *g_got = xmalloc((size_t)n * n_rows * sizeof(float));
+	tgt->buffer_read_f32(tgt, &qb2, q_got, n * n_rows);
+	tgt->buffer_read_f32(tgt, &gb2, g_got, n * n_rows);
+
+	char detail[256];
+	snprintf(label, sizeof(label), "split_qgate Q h=%d d=%d m=%d", n_heads, head_dim, n_rows);
+	verdict vq = classify_output("loose", q_ref, q_got, n * n_rows, st, detail, sizeof(detail));
+	if (vq != V_PASS && vq != V_SKIP)
+		compute_debug(q_ref, q_got, n * n_rows);
+	record_result(OPFAM_ATTENTION, label, vq, detail);
+	snprintf(label, sizeof(label), "split_qgate G h=%d d=%d m=%d", n_heads, head_dim, n_rows);
+	verdict vg = classify_output("loose", g_ref, g_got, n * n_rows, st, detail, sizeof(detail));
+	if (vg != V_PASS && vg != V_SKIP)
+		compute_debug(g_ref, g_got, n * n_rows);
+	record_result(OPFAM_ATTENTION, label, vg, detail);
+
+	for (int mode = 0; mode < 2; mode++) {
+		buffer ar = {0}, ag = {0}, at = {0}, au = {0};
+		ref->buffer_alloc_scratch(ref, (size_t)mixed_n * n_rows * sizeof(float), &ar);
+		ref->buffer_alloc_scratch(ref, (size_t)mixed_n * n_rows * sizeof(float), &ag);
+		tgt->buffer_alloc_scratch(tgt, (size_t)mixed_n * n_rows * sizeof(float), &at);
+		tgt->buffer_alloc_scratch(tgt, (size_t)mixed_n * n_rows * sizeof(float), &au);
+		ref->buffer_write_f32(ref, &ar, mixed, mixed_n * n_rows);
+		ref->buffer_write_f32(ref, &ag, mixed, mixed_n * n_rows);
+		tgt->buffer_write_f32(tgt, &at, mixed, mixed_n * n_rows);
+		tgt->buffer_write_f32(tgt, &au, mixed, mixed_n * n_rows);
+		buffer	   *mq	= mode == 0 ? &ar : &ag;
+		buffer	   *mt	= mode == 0 ? &at : &au;
+		status_code sr	= ref->split_qgate(ref, mq, &ar, &ag, n_heads, head_dim, n_rows);
+		status_code stt = tgt->split_qgate(tgt, mt, &at, &au, n_heads, head_dim, n_rows);
+		ref->buffer_read_f32(ref, &ar, q_ref, n * n_rows);
+		ref->buffer_read_f32(ref, &ag, g_ref, n * n_rows);
+		tgt->buffer_read_f32(tgt, &at, q_got, n * n_rows);
+		tgt->buffer_read_f32(tgt, &au, g_got, n * n_rows);
+		snprintf(label, sizeof(label), "split_qgate alias=%s Q h=%d d=%d m=%d",
+				 mode == 0 ? "mixed=q" : "mixed=gate", n_heads, head_dim, n_rows);
+		verdict va =
+			classify_output("loose", q_ref, q_got, n * n_rows, stt, detail, sizeof(detail));
+		if (va != V_PASS && va != V_SKIP)
+			compute_debug(q_ref, q_got, n * n_rows);
+		record_result(OPFAM_ATTENTION, label, va, detail);
+		snprintf(label, sizeof(label), "split_qgate alias=%s G h=%d d=%d m=%d",
+				 mode == 0 ? "mixed=q" : "mixed=gate", n_heads, head_dim, n_rows);
+		verdict vg2 =
+			classify_output("loose", g_ref, g_got, n * n_rows, stt, detail, sizeof(detail));
+		if (vg2 != V_PASS && vg2 != V_SKIP)
+			compute_debug(g_ref, g_got, n * n_rows);
+		record_result(OPFAM_ATTENTION, label, vg2, detail);
+		(void)sr;
+		ref->buffer_free(ref, &ar);
+		ref->buffer_free(ref, &ag);
+		tgt->buffer_free(tgt, &at);
+		tgt->buffer_free(tgt, &au);
+	}
+
+	free(mixed);
+	free(q_ref);
+	free(g_ref);
+	free(q_got);
+	free(g_got);
+	ref->buffer_free(ref, &mb);
+	ref->buffer_free(ref, &qb);
+	ref->buffer_free(ref, &gb);
+	tgt->buffer_free(tgt, &mb2);
+	tgt->buffer_free(tgt, &qb2);
+	tgt->buffer_free(tgt, &gb2);
+}
+
+static void test_op_attn_output_gate(backend *ref, backend *tgt, int n_heads, int head_dim,
+									 int n_rows) {
+	char label[160];
+	if (!ref->attn_output_gate || !tgt->attn_output_gate) {
+		snprintf(label, sizeof(label), "attn_output_gate h=%d d=%d m=%d", n_heads, head_dim,
+				 n_rows);
+		record_result(OPFAM_ATTENTION, label, V_SKIP,
+					  !ref->attn_output_gate ? "reference has no attn_output_gate"
+											 : "backend has no native attn_output_gate");
+		return;
+	}
+	int	   n = n_heads * head_dim;
+	float *o = xmalloc((size_t)n * n_rows * sizeof(float));
+	float *g = xmalloc((size_t)n * n_rows * sizeof(float));
+	seed_test_rng(0xA77EULL + ((uint64_t)n_heads * 31) + ((uint64_t)head_dim * 7) +
+				  (uint64_t)n_rows);
+	fill_random_f32(o, n * n_rows, 1.0f);
+	fill_random_f32(g, n * n_rows, 1.0f);
+
+	buffer ob = {0}, gb = {0};
+	ref->buffer_alloc_scratch(ref, (size_t)n * n_rows * sizeof(float), &ob);
+	ref->buffer_alloc_scratch(ref, (size_t)n * n_rows * sizeof(float), &gb);
+	ref->buffer_write_f32(ref, &ob, o, n * n_rows);
+	ref->buffer_write_f32(ref, &gb, g, n * n_rows);
+	ref->attn_output_gate(ref, &ob, &gb, n, n_rows);
+	float *o_ref = xmalloc((size_t)n * n_rows * sizeof(float));
+	ref->buffer_read_f32(ref, &ob, o_ref, n * n_rows);
+
+	buffer ob2 = {0}, gb2 = {0};
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * n_rows * sizeof(float), &ob2);
+	tgt->buffer_alloc_scratch(tgt, (size_t)n * n_rows * sizeof(float), &gb2);
+	tgt->buffer_write_f32(tgt, &ob2, o, n * n_rows);
+	tgt->buffer_write_f32(tgt, &gb2, g, n * n_rows);
+	status_code st	  = tgt->attn_output_gate(tgt, &ob2, &gb2, n, n_rows);
+	float	   *o_got = xmalloc((size_t)n * n_rows * sizeof(float));
+	tgt->buffer_read_f32(tgt, &ob2, o_got, n * n_rows);
+
+	char detail[256];
+	snprintf(label, sizeof(label), "attn_output_gate h=%d d=%d m=%d", n_heads, head_dim, n_rows);
+	verdict v = classify_output("loose", o_ref, o_got, n * n_rows, st, detail, sizeof(detail));
+	if (v != V_PASS && v != V_SKIP)
+		compute_debug(o_ref, o_got, n * n_rows);
+	record_result(OPFAM_ATTENTION, label, v, detail);
+
+	free(o);
+	free(g);
+	free(o_ref);
+	free(o_got);
+	ref->buffer_free(ref, &ob);
+	ref->buffer_free(ref, &gb);
+	tgt->buffer_free(tgt, &ob2);
+	tgt->buffer_free(tgt, &gb2);
+}
+
 static float *test_dequant_weight_rows(backend *ref, const buffer *w_ref, const qtype_info *qt,
 									   int n, int k) {
 	float *wf  = xmalloc((size_t)n * (size_t)k * sizeof(float));
@@ -4729,7 +5125,8 @@ static void run_native_exec_op_tests(backend *ref, backend *tgt) {
 void run_per_op_tests(backend *ref, backend *tgt) {
 	print_op_coverage(ref, tgt);
 
-	int shapes[][2] = {{32, 32}, {128, 256}, {64, 512}, {17, 256}, {512, 512}};
+	int shapes[][2] = {{32, 32},   {128, 256}, {64, 512}, {17, 256},
+					   {512, 512}, {16, 256},  {16, 512}};
 	for (int sh = 0; sh < (int)(sizeof(shapes) / sizeof(shapes[0])); sh++) {
 		int N = shapes[sh][0];
 		int K = shapes[sh][1];
@@ -4739,10 +5136,40 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 			test_op_matmul(ref, tgt, OPFAM_MATMUL, &QTYPES[qi], N, K);
 		}
 	}
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 256, 256, 24);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 256, 256, 8);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 48, 256, 8);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 48, 64, 5);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 64, 64, 5);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 8, 64, 5);
+	test_op_matmul(ref, tgt, OPFAM_MATMUL, &QTYPES[18], 2048, 2048);
+	for (int m = 2; m <= 8; m += 3)
+		test_op_matmul_batch(ref, tgt, &QTYPES[18], 2048, 2048, m);
+	for (int m = 2; m <= 8; m += 3)
+		test_op_matmul_batch(ref, tgt, &QTYPES[14], 2048, 2048, m);
+	test_op_matmul_batch(ref, tgt, &QTYPES[18], 2048, 2048, 24);
+	test_op_matmul_batch(ref, tgt, &QTYPES[14], 2048, 2048, 24);
+	for (int m = 2; m <= 8; m += 3)
+		test_op_matmul_batch(ref, tgt, &QTYPES[18], 2048, 1536, m);
+	test_op_matmul_batch(ref, tgt, &QTYPES[18], 2048, 1536, 24);
+	test_op_matmul_batch(ref, tgt, &QTYPES[18], 256, 1536, 8);
+	test_op_embd_lookup(ref, tgt, &QTYPES[18], 256, 128);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 256, 256, 2);
+	for (int qi = 0; qi < QTYPES_N; qi++)
+		test_op_matmul_batch(ref, tgt, &QTYPES[qi], 256, 256, 3);
 	flush_family(OPFAM_MATMUL);
 
 	for (int qi = 0; qi < QTYPES_N; qi++)
 		test_op_embd_lookup(ref, tgt, &QTYPES[qi], QTYPES[qi].block * 4, 32);
+	test_op_embd_lookup(ref, tgt, &QTYPES[19], 256, 96);
+	test_op_embd_lookup(ref, tgt, &QTYPES[11], 256, 96);
 	test_op_embd_lookup(ref, tgt, rs_qtype(GGML_TYPE_Q4_K), 1536, 64);
 	test_op_embd_lookup(ref, tgt, rs_qtype(GGML_TYPE_Q5_K), 8960, 64);
 	test_op_embd_lookup_f32(ref, tgt);
@@ -4756,6 +5183,8 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 
 	test_op_rmsnorm_per_head(ref, tgt, 8, 64);
 	test_op_rmsnorm_per_head(ref, tgt, 4, 64);
+	test_op_rmsnorm_per_head(ref, tgt, 4, 16);
+	test_op_rmsnorm_per_head(ref, tgt, 2, 16);
 	test_op_rmsnorm_per_head(ref, tgt, 32, 128);
 	test_op_rmsnorm_per_head(ref, tgt, 8, 256);
 	test_op_rmsnorm_per_head(ref, tgt, 8, 512);
@@ -4825,6 +5254,15 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	}
 	flush_family(OPFAM_FFN_ACTIVATE_EX);
 
+	test_op_split_qgate(ref, tgt, 4, 16, 1);
+	test_op_split_qgate(ref, tgt, 4, 16, 24);
+	test_op_split_qgate(ref, tgt, 8, 64, 1);
+	test_op_attn_output_gate(ref, tgt, 4, 16, 1);
+	test_op_attn_output_gate(ref, tgt, 4, 16, 24);
+	test_op_attention(ref, tgt, 4, 2, 16, 256, 0, 0);
+	test_op_attention(ref, tgt, 4, 2, 16, 256, 0, 1);
+	test_op_attention(ref, tgt, 4, 2, 16, 256, 23, 0);
+	test_op_attention(ref, tgt, 4, 2, 16, 256, 23, 1);
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 0, 0);
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 1, 1);
 	test_op_attention(ref, tgt, 8, 4, 64, 1024, 127, 0);
@@ -4936,6 +5374,10 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 	test_op_rope_qk(ref, tgt, 8, 4, 64, 1);
 	test_op_rope_qk(ref, tgt, 8, 4, 64, 127);
 	test_op_rope_qk(ref, tgt, 32, 8, 128, 511);
+	test_op_partial_rope_qk(ref, tgt, 8, 4, 64, 32, 0, 1);
+	test_op_partial_rope_qk(ref, tgt, 8, 4, 64, 32, 7, 4);
+	test_op_partial_rope_qk(ref, tgt, 4, 2, 16, 8, 0, 1);
+	test_op_partial_rope_qk(ref, tgt, 4, 2, 16, 8, 3, 4);
 	flush_family(OPFAM_ROPE_QK);
 
 	for (int qi = 0; qi < QTYPES_N; qi++) {
@@ -4955,6 +5397,8 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 			{8, 4, 64, 256, 0, 16},	 {8, 4, 64, 64, 0, 16},		{8, 2, 128, 256, 0, 16},
 			{8, 1, 256, 256, 0, 16}, {32, 8, 128, 512, 100, 8}, {8, 4, 64, 256, 40, 16},
 			{8, 1, 512, 256, 0, 16}, {8, 1, 512, 256, 100, 8},	{8, 1, 256, 600, 520, 8},
+			{4, 2, 16, 256, 0, 2},	 {4, 2, 16, 256, 0, 8},		{4, 2, 16, 256, 3, 4},
+			{4, 2, 16, 256, 0, 24},	 {4, 2, 16, 256, 3, 24},	{8, 2, 16, 256, 0, 24},
 		};
 		for (int i = 0; i < (int)(sizeof(bat_sh) / sizeof(bat_sh[0])); i++)
 			for (int fl = 0; fl < 2; fl++)
@@ -4982,6 +5426,9 @@ void run_per_op_tests(backend *ref, backend *tgt) {
 		test_multi_batch_shared_input(ref, tgt, shared_types[i], 5);
 		test_multi_batch_shared_input(ref, tgt, shared_types[i], 128);
 	}
+	test_op_rmsnorm_per_head_batch(ref, tgt, 4, 16, 24);
+	test_op_rmsnorm_per_head_batch(ref, tgt, 8, 64, 7);
+	test_op_partial_rope_qk(ref, tgt, 4, 2, 16, 8, 0, 24);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 2);
 	test_batch_rope_parity(ref, tgt, 8, 64, 60, 8);
 	test_batch_rope_parity(ref, tgt, 16, 128, 200, 5);

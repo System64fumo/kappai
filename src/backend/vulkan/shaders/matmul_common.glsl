@@ -30,6 +30,18 @@ pc;
 #elif defined(Q4_K)
 #define SUB_BYTES 18u
 #define NRAW 6
+#elif defined(Q4_1)
+#define SUB_BYTES 20u
+#define NRAW 3
+#elif defined(Q5_0)
+#define SUB_BYTES 22u
+#define NRAW 4
+#elif defined(Q5_1)
+#define SUB_BYTES 24u
+#define NRAW 4
+#elif defined(Q5_K)
+#define BLOCK256 176u
+#define NRAW 6
 #elif defined(Q6_K)
 #define BLOCK256 210u
 #define NRAW 6
@@ -45,6 +57,9 @@ pc;
 #elif defined(IQ3_S)
 #define BLOCK256 110u
 #define NRAW 6
+#elif defined(IQ4_XS)
+#define BLOCK256 136u
+#define NRAW 3
 #elif defined(F32)
 #define SUB_BYTES 128u
 #define NRAW 8
@@ -61,20 +76,21 @@ pc;
 #include "iq3s_grid.glsl"
 #endif
 
-#ifdef IQ4_NL
+#if defined(IQ4_NL) || defined(IQ4_XS)
 const float KV[16] = float[16](-127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0,
 							   25.0, 38.0, 53.0, 69.0, 89.0, 113.0);
 #endif
 
 uint elem_base(uint qd) {
-#if defined(Q4_0) || defined(IQ4_NL)
+#if defined(Q4_0) || defined(IQ4_NL) || defined(Q4_1) || defined(Q5_0) || defined(Q5_1)
 	return (qd >> 1u) * 16u + (qd & 1u) * 8u;
 #else
 	return qd * 8u;
 #endif
 }
 
-#if defined(Q8_0) || defined(Q4_0) || defined(IQ4_NL) || defined(BLOCK256)
+#if defined(Q8_0) || defined(Q4_0) || defined(IQ4_NL) || defined(Q4_1) || defined(Q5_0) ||         \
+	defined(Q5_1) || defined(BLOCK256)
 uint word_at(uint bo) {
 	uint wi = bo >> 2u;
 	if ((bo & 2u) == 0u)
@@ -117,6 +133,42 @@ void fetch_raw(uint rbase, uint sb, uint qd, out uint raw[NRAW]) {
 	raw[3]	 = word_at(qh + 4u);
 	raw[4]	 = byte_at(bo + 192u + (sub >> 2u) * 8u + (qd >> 1u) + qq * 2u);
 	raw[5]	 = word_at(bo + 208u);
+#elif defined(Q4_1)
+	uint bo = rbase + sb * SUB_BYTES;
+	raw[0]	= word_at(bo);
+	raw[1]	= word_at(bo + 4u + (qd & 1u) * 8u);
+	raw[2]	= word_at(bo + 4u + (qd & 1u) * 8u + 4u);
+#elif defined(Q5_0)
+	uint bo = rbase + sb * SUB_BYTES;
+	raw[0]	= word_at(bo);
+	raw[1]	= word_at(bo + 2u);
+	raw[2]	= word_at(bo + 6u + (qd & 1u) * 8u);
+	raw[3]	= word_at(bo + 6u + (qd & 1u) * 8u + 4u);
+#elif defined(Q5_1)
+	uint bo = rbase + sb * SUB_BYTES;
+	raw[0]	= word_at(bo);
+	raw[1]	= word_at(bo + 4u);
+	raw[2]	= word_at(bo + 8u + (qd & 1u) * 8u);
+	raw[3]	= word_at(bo + 8u + (qd & 1u) * 8u + 4u);
+#elif defined(Q5_K)
+	uint bo	 = rbase + (sb >> 3u) * BLOCK256;
+	uint sub = sb & 7u;
+	uint g	 = sub >> 1u;
+	raw[0]	 = word_at(bo);
+	raw[1]	 = word_at(bo + 4u);
+	raw[2]	 = word_at(bo + 8u);
+	raw[3]	 = word_at(bo + 12u);
+	raw[4]	 = word_at(bo + 16u + g * 4u);
+	raw[5]	 = word_at(bo + 48u + g * 32u + (sub & 1u) * 16u + qd * 4u);
+#elif defined(IQ4_XS)
+	uint bo	 = rbase + (sb >> 3u) * BLOCK256;
+	uint ib	 = sb & 7u;
+	uint slb = byte_at(bo + 4u + (ib >> 1u));
+	uint sl	 = (slb >> ((ib & 1u) * 4u)) & 0xFu;
+	uint sh	 = (word_at(bo + 2u) >> (2u * ib)) & 3u;
+	raw[0]	 = word_at(bo);
+	raw[1]	 = word_at(bo + 8u + ib * 16u + qd * 4u);
+	raw[2]	 = sl | (sh << 8u);
 #elif defined(IQ2_XXS)
 	uint bo	 = rbase + (sb >> 3u) * BLOCK256;
 	uint aux = bo + 2u + (sb & 7u) * 8u;
@@ -165,7 +217,7 @@ void fetch_raw(uint rbase, uint sb, uint qd, out uint raw[NRAW]) {
 #endif
 }
 
-#ifdef Q4_K
+#if defined(Q4_K) || defined(Q5_K)
 uint scale_byte(uint i, uint s0, uint s1, uint s2) {
 	uint word = i < 4u ? s0 : (i < 8u ? s1 : s2);
 	return (word >> ((i & 3u) * 8u)) & 0xFFu;
@@ -194,6 +246,65 @@ void dequant8(uint raw[NRAW], uint sb, uint qd, out float o[8]) {
 		uint b	 = (raw[4 + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
 		uint nib = high ? b >> 4u : b & 0xFu;
 		o[j]	 = scale * float(nib) - min_v;
+	}
+#elif defined(Q4_1)
+	vec2  dm   = unpackHalf2x16(raw[0]);
+	float d	   = dm.x;
+	float mn   = dm.y;
+	bool  high = (qd >> 1u) != 0u;
+	for (uint j = 0u; j < 8u; j++) {
+		uint b	 = (raw[1u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
+		uint nib = high ? b >> 4u : b & 0xFu;
+		o[j]	 = d * float(nib) + mn;
+	}
+#elif defined(Q5_0) || defined(Q5_1)
+	vec2  dm   = unpackHalf2x16(raw[0]);
+	float d	   = dm.x;
+	float mn   = dm.y;
+	bool  high = (qd >> 1u) != 0u;
+	for (uint j = 0u; j < 8u; j++) {
+		uint b	 = (raw[2u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
+		uint nib = high ? b >> 4u : b & 0xFu;
+		uint e	 = (qd & 1u) * 8u + j + (high ? 16u : 0u);
+		nib |= ((raw[1] >> e) & 1u) << 4u;
+#if defined(Q5_1)
+		o[j] = d * float(nib) + mn;
+#else
+		o[j] = d * float(int(nib) - 16);
+#endif
+	}
+#elif defined(Q5_K)
+	uint sub = sb & 7u;
+	uint g	 = sub >> 1u;
+	vec2 dm	 = unpackHalf2x16(raw[0]);
+	uint sc, mn;
+	if (sub < 4u) {
+		sc = scale_byte(sub, raw[1], raw[2], raw[3]) & 63u;
+		mn = scale_byte(sub + 4u, raw[1], raw[2], raw[3]) & 63u;
+	} else {
+		uint a = scale_byte(sub + 4u, raw[1], raw[2], raw[3]);
+		uint b = scale_byte(sub - 4u, raw[1], raw[2], raw[3]);
+		uint c = scale_byte(sub, raw[1], raw[2], raw[3]);
+		sc	   = (a & 15u) | ((b >> 6u) << 4u);
+		mn	   = (a >> 4u) | ((c >> 6u) << 4u);
+	}
+	float scale = dm.x * float(sc);
+	float min_v = dm.y * float(mn);
+	bool  high	= (sub & 1u) != 0u;
+	uint  bit	= (raw[4] >> (2u * g + (sub & 1u))) & 1u;
+	for (uint j = 0u; j < 8u; j++) {
+		uint b	 = (raw[5] >> ((j & 3u) * 8u)) & 0xFFu;
+		uint nib = high ? b >> 4u : b & 0xFu;
+		o[j]	 = scale * float(nib | (bit << 4u)) - min_v;
+	}
+#elif defined(IQ4_XS)
+	float d	 = unpackHalf2x16(raw[0] & 0xFFFFu).x;
+	int	  dl = int(raw[2] & 0xFFu) | (int((raw[2] >> 8u) & 3u) << 4);
+	dl -= 32;
+	for (uint j = 0u; j < 8u; j++) {
+		uint b	 = (raw[1u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
+		uint nib = (qd >> 1u) != 0u ? b >> 4u : b & 0xFu;
+		o[j]	 = d * float(dl) * KV[nib];
 	}
 #elif defined(Q6_K)
 	float d		= unpackHalf2x16(raw[5] & 0xFFFFu).x;

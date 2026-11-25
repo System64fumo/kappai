@@ -1,0 +1,163 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 64) in;
+
+#define N_TILE 64u
+#define M_TILE 16u
+#define IQ2S_U16 41u
+#define XQ_WORDS 76u
+
+layout(set = 0, binding = 0) readonly buffer W {
+	uint16_t w16[];
+};
+layout(set = 0, binding = 1) readonly buffer XQ {
+	uint xq[];
+};
+layout(set = 0, binding = 2) buffer Y {
+	float y[];
+};
+layout(set = 0, binding = 3) readonly buffer R {
+	float res[];
+};
+layout(set = 0, binding = 4) readonly buffer G {
+	uint grid[];
+};
+
+layout(push_constant) uniform Params {
+	int n;
+	int kb;
+	int m;
+	int res_mode;
+}
+pc;
+
+#include "common.glsl"
+#define IQX_GRID_BINDING 4
+#include "iqx_grids.glsl"
+
+shared uint16_t sw[N_TILE * IQ2S_U16];
+shared uint		sx[M_TILE * XQ_WORDS];
+
+uint r16(uint i) {
+	return uint(sw[i]);
+}
+uint swb(uint base, uint bo) {
+	uint w = r16(base + (bo >> 1u));
+	return (bo & 1u) != 0u ? (w >> 8u) : (w & 0xFFu);
+}
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint n	 = uint(pc.n);
+	uint m	 = uint(pc.m);
+	uint kb	 = uint(pc.kb);
+	uint n0	 = gl_WorkGroupID.x * N_TILE;
+	uint m0	 = gl_WorkGroupID.y * M_TILE;
+	uint ng	 = tid >> 2u;
+	uint mg	 = tid & 3u;
+
+	precise float acc[4][4];
+	for (uint i = 0u; i < 4u; i++)
+		for (uint j = 0u; j < 4u; j++)
+			acc[i][j] = 0.0;
+
+	for (uint bi = 0u; bi < kb; bi++) {
+		for (uint idx = tid; idx < N_TILE * IQ2S_U16; idx += 64u) {
+			uint r	 = idx / IQ2S_U16;
+			uint w	 = idx % IQ2S_U16;
+			uint row = min(n0 + r, n - 1u);
+			sw[idx]	 = w16[(row * kb + bi) * IQ2S_U16 + w];
+		}
+		for (uint idx = tid; idx < M_TILE * XQ_WORDS; idx += 64u) {
+			uint r	 = idx / XQ_WORDS;
+			uint w	 = idx % XQ_WORDS;
+			uint col = min(m0 + r, m - 1u);
+			sx[idx]	 = xq[(col * kb + bi) * XQ_WORDS + w];
+		}
+		barrier();
+
+		for (uint ni = 0u; ni < 4u; ni++) {
+			uint  wb	 = (ng * 4u + ni) * IQ2S_U16;
+			float dw	 = half_to_float(uint(sw[wb]));
+			int	  tot[4] = {0, 0, 0, 0};
+			for (uint ib = 0u; ib < 8u; ib++) {
+				uint scale	 = swb(wb, 74u + ib);
+				int	 s0		 = 1 + 2 * int(scale & 0xFu);
+				int	 s1		 = 1 + 2 * int(scale >> 4u);
+				int	 sum0[4] = {0, 0, 0, 0};
+				int	 sum1[4] = {0, 0, 0, 0};
+				uint qh		 = swb(wb, 66u + ib);
+				for (uint l = 0u; l < 4u; l++) {
+					uint  q	   = swb(wb, 2u + ib * 4u + l);
+					uint  gidx = q | ((qh << (8u - 2u * l)) & 0x300u);
+					uvec2 gv   = iqx_iq2s_grid(gidx);
+					uint  gl   = gv.x;
+					uint  gh   = gv.y;
+					int	  g0   = int((gl >> 0u) & 0xFFu);
+					int	  g1   = int((gl >> 8u) & 0xFFu);
+					int	  g2   = int((gl >> 16u) & 0xFFu);
+					int	  g3   = int((gl >> 24u) & 0xFFu);
+					int	  g4   = int((gh >> 0u) & 0xFFu);
+					int	  g5   = int((gh >> 8u) & 0xFFu);
+					int	  g6   = int((gh >> 16u) & 0xFFu);
+					int	  g7   = int((gh >> 24u) & 0xFFu);
+					uint  sb   = swb(wb, 34u + ib * 4u + l);
+					int	  s0v  = (sb & 1u) != 0u ? -g0 : g0;
+					int	  s1v  = (sb & 2u) != 0u ? -g1 : g1;
+					int	  s2v  = (sb & 4u) != 0u ? -g2 : g2;
+					int	  s3v  = (sb & 8u) != 0u ? -g3 : g3;
+					int	  s4v  = (sb & 16u) != 0u ? -g4 : g4;
+					int	  s5v  = (sb & 32u) != 0u ? -g5 : g5;
+					int	  s6v  = (sb & 64u) != 0u ? -g6 : g6;
+					int	  s7v  = (sb & 128u) != 0u ? -g7 : g7;
+					int	  wp   = int(ib * 8u + l * 2u);
+					int	  lo   = pack32(i8vec4(int8_t(s0v), int8_t(s1v), int8_t(s2v), int8_t(s3v)));
+					int	  hi   = pack32(i8vec4(int8_t(s4v), int8_t(s5v), int8_t(s6v), int8_t(s7v)));
+					for (uint mi = 0u; mi < 4u; mi++) {
+						uint xb	 = (mg * 4u + mi) * XQ_WORDS;
+						int	 sum = dotPacked4x8EXT(lo, int(sx[xb + uint(wp)])) +
+								   dotPacked4x8EXT(hi, int(sx[xb + uint(wp) + 1u]));
+						if (l < 2u)
+							sum0[mi] += sum;
+						else
+							sum1[mi] += sum;
+					}
+				}
+				for (uint mi = 0u; mi < 4u; mi++)
+					tot[mi] += s0 * sum0[mi] + s1 * sum1[mi];
+			}
+			for (uint mi = 0u; mi < 4u; mi++) {
+				uint col = mg * 4u + mi;
+				if (m0 + col >= m)
+					continue;
+				float		  dx = uintBitsToFloat(sx[(col)*XQ_WORDS + 64u]);
+				precise float wd = (0.125 * dw) * dx;
+				acc[ni][mi]		 = fma(wd, float(tot[mi]), acc[ni][mi]);
+			}
+		}
+		barrier();
+	}
+
+	for (uint ni = 0u; ni < 4u; ni++) {
+		uint orow = n0 + ng * 4u + ni;
+		if (orow >= n)
+			continue;
+		for (uint mi = 0u; mi < 4u; mi++) {
+			uint col = m0 + mg * 4u + mi;
+			if (col >= m)
+				continue;
+			uint  yi = col * n + orow;
+			float v	 = acc[ni][mi];
+			if (pc.res_mode == 1)
+				y[yi] = v + res[orow];
+			else if (pc.res_mode == 2)
+				y[yi] += v;
+			else
+				y[yi] = v;
+		}
+	}
+}
