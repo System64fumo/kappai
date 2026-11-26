@@ -55,6 +55,8 @@
 #define RKT_ATTN_BATCH_FLOATS ((size_t)1 << 20)
 #define RKT_COLLECT_PAR_MIN_BYTES ((size_t)65536)
 #define RKT_RESIDUAL_MAX 65000.0f
+#define RKT_MAX_BLOCK_ROWS 1020
+#define RKT_SPLIT_MAX_ROWS 64
 
 typedef struct {
 	rkt_bo bo;
@@ -88,6 +90,7 @@ struct rkt_weight {
 	rkt_weight	 *fused_parent;
 	int			  fused_row0;
 	int			  fuse_tried;
+	int			  has_lo;
 	rkt_float_fmt fmt;
 };
 
@@ -152,6 +155,7 @@ typedef struct {
 	uint16_t		 *y16;
 	int				  y16_stride;
 	const uint16_t	 *ew16;
+	int				  m_out;
 } block_ctx;
 
 typedef struct {
@@ -232,6 +236,10 @@ typedef struct {
 	int				  epi_kind;
 	float			  epi_cap;
 	uint16_t		 *out16_dst;
+	int				  split_rows;
+	int				  force_split;
+	rkt_weight		 *combine_w;
+	float			  combine_scale;
 	int				  out16_stride;
 	uint16_t		 *nat_gate;
 	size_t			  nat_gate_cap;
@@ -260,6 +268,9 @@ typedef struct {
 	rkt_weight		**weights;
 	size_t			  n_weights;
 	size_t			  cap_weights;
+	void			**copies;
+	size_t			  n_copies;
+	size_t			  cap_copies;
 	int				  fuse;
 	int				  bf16_native;
 	int				  quant_failed;
@@ -450,9 +461,10 @@ void		rkt_tile_input(uint16_t *dst, const uint16_t *src, int m, int k);
 void		rkt_pack_ew_operand(uint16_t *dst, const uint16_t *src, int m, int channels);
 void		rkt_convert_to_bf16(uint16_t *dst, const float *src, size_t n);
 void		rkt_convert_to_f16(uint16_t *dst, const float *src, size_t n);
-void		rkt_tile_input_esz(uint8_t *dst, const uint8_t *src, int m, int k, int esz);
-int			rkt_weight_esz(const rkt_weight *w);
-int			rkt_max_batch_rows(int k_len, int esz);
+void rkt_convert_to_f16_residual(uint16_t *dst, const uint16_t *hi, const float *src, size_t n);
+void rkt_tile_input_esz(uint8_t *dst, const uint8_t *src, int m, int k, int esz);
+int	 rkt_weight_esz(const rkt_weight *w);
+int	 rkt_max_batch_rows(int k_len, int esz);
 const rkt_part *rkt_part_for_row(const rkt_kchunk *kc, int row);
 void			rkt_log_pipeline_usage(rkt_priv *p);
 

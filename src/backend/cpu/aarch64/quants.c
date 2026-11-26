@@ -5278,7 +5278,46 @@ void matmul_f16_f32_batch(const void *restrict w, const float *restrict x, float
 	for (int t = 0; t < m; t++)
 		matmul_f16_f32(w, x + (size_t)t * x_row_stride, y + (size_t)t * y_row_stride, n, k);
 }
-MK_A64_MATMUL_F16(matmul_bf16_f32, load4_bf16, neon_dot16_finish_bf16, dot16_bf16)
+void matmul_bf16_f32(const void *restrict w, const float *restrict x, float *restrict y, int n,
+					 int k) {
+	const uint16_t *Wb = w;
+	const int		mr = 4;
+	int				i  = 0;
+	for (; i + mr <= n; i += mr) {
+		const uint16_t *rows[4];
+		float32x4_t		acc[4][4];
+		for (int r = 0; r < mr; r++) {
+			rows[r] = Wb + ((size_t)(i + r) * k);
+			for (int q = 0; q < 4; q++)
+				acc[r][q] = vdupq_n_f32(0.0f);
+		}
+		int j = 0;
+		for (; j + 16 <= k; j += 16) {
+			PREFETCH(x + j + PF_ELEMS(128));
+			float32x4_t xv[4];
+			for (int q = 0; q < 4; q++)
+				xv[q] = vld1q_f32(x + j + (4 * q));
+			for (int r = 0; r < mr; r++) {
+				PREFETCH(rows[r] + j + PF_ELEMS(128));
+				uint16x8_t b0 = vld1q_u16(rows[r] + j);
+				uint16x8_t b1 = vld1q_u16(rows[r] + j + 8);
+				acc[r][0]	  = vfmaq_f32(acc[r][0], xv[0],
+										  vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b0), 16)));
+				acc[r][1] =
+					vfmaq_f32(acc[r][1], xv[1], vreinterpretq_f32_u32(vshll_high_n_u16(b0, 16)));
+				acc[r][2] = vfmaq_f32(acc[r][2], xv[2],
+									  vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(b1), 16)));
+				acc[r][3] =
+					vfmaq_f32(acc[r][3], xv[3], vreinterpretq_f32_u32(vshll_high_n_u16(b1, 16)));
+			}
+		}
+		for (int r = 0; r < mr; r++)
+			y[i + r] = neon_dot16_finish_bf16(acc[r][0], acc[r][1], acc[r][2], acc[r][3], x,
+											  rows[r], j, k);
+	}
+	for (; i < n; i++)
+		y[i] = dot16_bf16(x, Wb + ((size_t)i * k), k);
+}
 void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, float *restrict y,
 						   int n, int k, int m, int x_row_stride, int y_row_stride) {
 	for (int t = 0; t < m; t++)
@@ -5286,6 +5325,25 @@ void matmul_bf16_f32_batch(const void *restrict w, const float *restrict x, floa
 }
 void matmul_f32_f32(const float *restrict w, const float *restrict x, float *restrict y, int n,
 					int k) {
+	int has_llc =
+		g_cpu_cache.l3_bytes >= ((size_t)1 << 20) || g_cpu_cache.l2_bytes >= ((size_t)1 << 20);
+	if (!has_llc) {
+		for (int i = 0; i < n; i++) {
+			const float *row = w + ((size_t)i * k);
+			float32x4_t	 a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+			int			 j = 0;
+			for (; j + 16 <= k; j += 16) {
+				PREFETCH(row + j + PF_ELEMS(128));
+				a0 = vfmaq_f32(a0, vld1q_f32(row + j), vld1q_f32(x + j));
+				a1 = vfmaq_f32(a1, vld1q_f32(row + j + 4), vld1q_f32(x + j + 4));
+				a2 = vfmaq_f32(a2, vld1q_f32(row + j + 8), vld1q_f32(x + j + 8));
+				a3 = vfmaq_f32(a3, vld1q_f32(row + j + 12), vld1q_f32(x + j + 12));
+			}
+			y[i] = neon_dot16_finish(a0, a1, a2, a3, row, x, j, k);
+		}
+		return;
+	}
+
 	const int mr = 4;
 	int		  i	 = 0;
 	for (; i + mr <= n; i += mr) {
@@ -5588,9 +5646,10 @@ void repack_iq4_nl_to_q8_0_rows(const void *src, void *dst, int row_begin, int r
 static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 														   const q8_k_block *restrict xq,
 														   float *restrict y, int n, int k) {
-	int			   blocks_per_row = k / 256;
-	const uint8_t *Wb			  = w;
-	int			   i			  = 0;
+	int				 blocks_per_row = k / 256;
+	const uint8_t	*Wb				= w;
+	const uint8x16_t lo_mask		= vdupq_n_u8(0x0F);
+	int				 i				= 0;
 
 	for (; i + MR <= n;) {
 		int			   ng	  = (i + 2 * MR <= n) ? 2 : 1;
@@ -5660,10 +5719,10 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 					int		  is		= 0;
 
 					for (int g = 0; g < 4; g++) {
-						int32x4_t s0 = vdupq_n_s32((int32_t)sc[is * 2 + 0]);
-						int32_t	  m0 = (int32_t)sc[is * 2 + 1];
-						int32x4_t s1 = vdupq_n_s32((int32_t)sc[is * 2 + 2]);
-						int32_t	  m1 = (int32_t)sc[is * 2 + 3];
+						int32_t s0 = (int32_t)sc[is * 2 + 0];
+						int32_t m0 = (int32_t)sc[is * 2 + 1];
+						int32_t s1 = (int32_t)sc[is * 2 + 2];
+						int32_t m1 = (int32_t)sc[is * 2 + 3];
 
 						const uint8_t *restrict qg = qbytes + (g * 32);
 						int32x4_t d0			   = vdupq_n_s32(0);
@@ -5671,7 +5730,7 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 
 						for (int half = 0; half < 2; half++) {
 							uint8x16_t qg_v	 = vld1q_u8(qg + half * 16);
-							uint8x16_t lo_u	 = vandq_u8(qg_v, vdupq_n_u8(0x0F));
+							uint8x16_t lo_u	 = vandq_u8(qg_v, lo_mask);
 							uint8x16_t hi_u	 = vshrq_n_u8(qg_v, 4);
 							int8x16_t  xq0_v = xq_cache[g][half][0];
 							int8x16_t  xq1_v = xq_cache[g][half][1];
@@ -5695,8 +5754,8 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 #endif
 						}
 
-						sumi_vec0 = vmlaq_s32(sumi_vec0, s0, d0);
-						sumi_vec1 = vmlaq_s32(sumi_vec1, s1, d1);
+						sumi_vec0 = vmlaq_n_s32(sumi_vec0, d0, s0);
+						sumi_vec1 = vmlaq_n_s32(sumi_vec1, d1, s1);
 						summ += m0 * bsum_pre[g * 2];
 						summ += m1 * bsum_pre[(g * 2) + 1];
 						is += 2;

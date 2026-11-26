@@ -55,6 +55,7 @@ int rkt_max_batch_rows(int k_len, int esz) {
 	if (data_banks < 1)
 		data_banks = 1;
 	int m = data_banks * CBUF_BANK_BYTES / (k_len * esz);
+	m	  = m > RKT_MAX_BLOCK_ROWS ? RKT_MAX_BLOCK_ROWS : m;
 	m	  = m / 4 * 4;
 	return m < 4 ? 4 : m;
 }
@@ -138,12 +139,46 @@ void rkt_convert_to_f16(uint16_t *dst, const float *src, size_t n) {
 		dst[i] = f32_to_f16_bits(src[i]);
 }
 
+void rkt_convert_to_f16_residual(uint16_t *dst, const uint16_t *hi, const float *src, size_t n) {
+	size_t i = 0;
+	for (; i + 4 <= n; i += 4) {
+		float32x4_t h	   = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(hi + i)));
+		float32x4_t d	   = vsubq_f32(vld1q_f32(src + i), h);
+		uint32x4_t	finite = vcaleq_f32(h, vdupq_n_f32(65504.0f));
+		d				   = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(d), finite));
+		vst1_u16(dst + i, vreinterpret_u16_f16(vcvt_f16_f32(d)));
+	}
+	for (; i < n; i++) {
+		float h = f16_bits_to_f32(hi[i]);
+		dst[i]	= fabsf(h) <= 65504.0f ? f32_to_f16_bits(src[i] - h) : 0;
+	}
+}
+
 void rkt_register_weight(rkt_priv *p, rkt_weight *w) {
 	if (p->n_weights == p->cap_weights) {
 		p->cap_weights = p->cap_weights ? p->cap_weights * 2 : 256;
 		p->weights	   = xrealloc(p->weights, p->cap_weights * sizeof(*p->weights));
 	}
 	p->weights[p->n_weights++] = w;
+}
+
+static void register_copy(rkt_priv *p, void *copy) {
+	pthread_mutex_lock(&p->lock);
+	if (p->n_copies == p->cap_copies) {
+		p->cap_copies = p->cap_copies ? p->cap_copies * 2 : 64;
+		p->copies	  = xrealloc(p->copies, p->cap_copies * sizeof(*p->copies));
+	}
+	p->copies[p->n_copies++] = copy;
+	pthread_mutex_unlock(&p->lock);
+}
+
+static void unregister_copy(rkt_priv *p, const void *copy) {
+	for (size_t i = 0; i < p->n_copies; i++) {
+		if (p->copies[i] != copy)
+			continue;
+		p->copies[i] = p->copies[--p->n_copies];
+		return;
+	}
 }
 
 static int unregister_weight(rkt_priv *p, const rkt_weight *w) {
@@ -229,14 +264,19 @@ int rkt_build_layout(rkt_priv *p, rkt_weight *w) {
 	int start[RKT_MAX_CORES], count[RKT_MAX_CORES];
 	int used = partition_rows(w->n_pad, p->dev.n_cores, start, count);
 
-	int esz		 = rkt_weight_esz(w);
-	int max_k	 = w->fmt == RKT_FMT_TF32 ? RKT_MAX_K_TF32 : RKT_MAX_K;
-	w->n_kchunks = (w->k_pad + max_k - 1) / max_k;
-	w->kchunks	 = xcalloc((size_t)w->n_kchunks, sizeof(*w->kchunks));
+	int esz			= rkt_weight_esz(w);
+	int max_k		= w->fmt == RKT_FMT_TF32 ? RKT_MAX_K_TF32 : RKT_MAX_K;
+	int base_chunks = (w->k_pad + max_k - 1) / max_k;
+	int lo_chunk	= w->has_lo && base_chunks == 1;
+	w->has_lo		= lo_chunk;
+	w->n_kchunks	= base_chunks + lo_chunk;
+	w->kchunks		= xcalloc((size_t)w->n_kchunks, sizeof(*w->kchunks));
 	for (int ci = 0; ci < w->n_kchunks; ci++) {
 		rkt_kchunk *kc = &w->kchunks[ci];
-		kc->k_off	   = ci * max_k;
-		kc->k_len	   = w->k_pad - kc->k_off < max_k ? w->k_pad - kc->k_off : max_k;
+		kc->k_off	   = ci < base_chunks ? ci * max_k : 0;
+		kc->k_len	   = ci >= base_chunks				? w->k_pad
+						 : w->k_pad - kc->k_off < max_k ? w->k_pad - kc->k_off
+														: max_k;
 		for (int c = 0; c < used; c++) {
 			kc->part[c].row_start = start[c];
 			kc->part[c].row_count = count[c];
@@ -295,6 +335,7 @@ typedef struct {
 	rkt_weight	 *w;
 	row_source_fn source;
 	void		 *ctx;
+	int			  only;
 } fill_job;
 
 static status_code fill_rows(void *arg, int lo, int hi) {
@@ -310,6 +351,8 @@ static status_code fill_rows(void *arg, int lo, int hi) {
 		else
 			memset(row, 0, (size_t)w->k_pad * esz);
 		for (int ci = 0; ci < w->n_kchunks && s == OK; ci++) {
+			if (job->only && job->only != ci + 1)
+				continue;
 			const rkt_kchunk *kc = &w->kchunks[ci];
 			const rkt_part	 *pt = rkt_part_for_row(kc, r);
 			if (!pt) {
@@ -325,8 +368,9 @@ static status_code fill_rows(void *arg, int lo, int hi) {
 	return s;
 }
 
-static status_code fill_weight(rkt_priv *p, rkt_weight *w, row_source_fn source, void *ctx) {
-	fill_job	job = {.w = w, .source = source, .ctx = ctx};
+static status_code fill_weight(rkt_priv *p, rkt_weight *w, row_source_fn source, void *ctx,
+							   int only) {
+	fill_job	job = {.w = w, .source = source, .ctx = ctx, .only = only};
 	status_code s	= rkt_parallel_rows(w->n_pad, fill_rows, &job);
 	if (s == OK && !rkt_flush_weight(p, w))
 		s = ERR_IO;
@@ -361,12 +405,32 @@ static status_code gguf_row_source(void *ctx, int row, void *dst, float *tmp) {
 	return OK;
 }
 
+static status_code gguf_lo_source(void *ctx, int row, void *dst, float *tmp) {
+	const gguf_rows *q	 = ctx;
+	const float		*src = (const float *)(q->data + (size_t)row * q->row_bytes);
+	uint16_t		*hi	 = (uint16_t *)tmp;
+	rkt_convert_to_f16(hi, src, (size_t)q->k);
+	rkt_convert_to_f16_residual(dst, hi, src, (size_t)q->k);
+	return OK;
+}
+
 static rkt_float_fmt native_fmt_for_type(const rkt_priv *p, uint32_t type) {
 	if (type == GGML_TYPE_BF16 && p->bf16_native)
 		return RKT_FMT_BF16;
 	if (type == GGML_TYPE_F32)
 		return RKT_FMT_TF32;
 	return RKT_FMT_F16;
+}
+
+static int f32_weights_fit_f16(const float *w, size_t n) {
+	float amax = 0.0f;
+	for (size_t i = 0; i < n; i++) {
+		float v = fabsf(w[i]);
+		if (!(v <= RKT_RESIDUAL_MAX))
+			return 0;
+		amax = v > amax ? v : amax;
+	}
+	return amax >= 0.015625f;
 }
 
 static rkt_weight *new_weight(const tensor_desc *desc) {
@@ -392,7 +456,12 @@ static status_code upload_to_npu(rkt_priv *p, rkt_weight *w, const tensor_desc *
 		.k		   = w->k,
 		.fmt	   = w->fmt,
 	};
-	return fill_weight(p, w, gguf_row_source, &q);
+	if (!w->has_lo)
+		return fill_weight(p, w, gguf_row_source, &q, 0);
+	status_code s = fill_weight(p, w, gguf_row_source, &q, 1);
+	if (s == OK)
+		s = fill_weight(p, w, gguf_lo_source, &q, 2);
+	return s;
 }
 
 static status_code keep_on_host(rkt_weight *w, const tensor_desc *desc) {
@@ -502,13 +571,19 @@ static status_code rkt_buffer_alloc_weight(backend *self, const tensor_desc *des
 			bytes *= (size_t)desc->dims[d];
 		void *copy = xmalloc(bytes);
 		memcpy(copy, desc->host_data, bytes);
+		register_copy(p, copy);
 		*out = (buffer){.handle = copy, .size = bytes, .host_ptr = copy, .owner = self};
 		return OK;
 	}
 
 	rkt_weight *w = new_weight(desc);
 	w->fmt		  = native_fmt_for_type(p, desc->type);
-	bytes		  = w->src_row_bytes * (size_t)w->n;
+	if (w->fmt == RKT_FMT_TF32 &&
+		f32_weights_fit_f16(desc->host_data, (size_t)w->k * (size_t)w->n)) {
+		w->fmt	  = RKT_FMT_F16;
+		w->has_lo = 1;
+	}
+	bytes = w->src_row_bytes * (size_t)w->n;
 
 	status_code s = rkt_quant_build_best(p, w, desc);
 	if (s != OK && s != ERR_UNSUPPORTED)
@@ -561,6 +636,8 @@ static void rkt_buffer_free(backend *self, buffer *buf) {
 	pthread_mutex_lock(&p->lock);
 	rkt_weight *w		  = buf->handle;
 	int			is_weight = unregister_weight(p, w);
+	if (!is_weight)
+		unregister_copy(p, buf->handle);
 	pthread_mutex_unlock(&p->lock);
 
 	if (is_weight)
@@ -683,50 +760,18 @@ static status_code rkt_matmul_gate_act_batch(backend *self, const buffer *w_gate
 	return OK;
 }
 
-static status_code rkt_matmul_softcap_fallback(backend *self, const buffer *w, uint32_t w_type,
-											   const buffer *x, buffer *y, int n, int k, int m,
-											   float cap) {
-	status_code s = rkt_matmul_batch(self, w, w_type, x, y, n, k, m);
-	if (s != OK)
-		return s;
-	return rkt_softcap(self, y, cap, n * m);
-}
-
-static status_code rkt_matmul_softcap_batch(backend *self, const buffer *wbuf, uint32_t w_type,
-											const buffer *x, buffer *y, int n, int k, int m,
-											float cap) {
-	rkt_priv		 *p	   = self->priv;
-	const rkt_weight *dw   = NULL;
-	int				  row0 = 0;
-	if (!(cap > 0.0f) || n <= 0 || m <= 0 || !gate_act_chainable(p, wbuf, n, k, &dw, &row0) ||
-		dw->n_kchunks != 1)
-		return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
-
-	pthread_mutex_lock(&p->lock);
-	status_code s = rkt_lut_gate_act_prepare(p, &p->lut, RKT_LUT_TANH);
-	if (s == OK) {
-		p->epi_kind = RKT_LUT_TANH;
-		p->epi_cap	= cap;
-		s			= rkt_dense_matmul(p, dw, row0, n, rkt_ptr(x), rkt_ptr(y), m);
-		p->epi_kind = 0;
-		p->epi_cap	= 0.0f;
-	}
-	if (s != OK && s != ERR_UNSUPPORTED && !p->npu_failed) {
-		rkt_npu_record_failure(p);
-		WARN("rocket: npu matmul+softcap failed (n=%d k=%d m=%d status=%d, errno=%d)", n, k, m, s,
-			 errno);
-	}
-	pthread_mutex_unlock(&p->lock);
-	if (s == OK)
-		return OK;
-	return rkt_matmul_softcap_fallback(self, wbuf, w_type, x, y, n, k, m, cap);
-}
-
 static status_code rkt_add_scaled(backend *self, buffer *x, const buffer *y, int n, int m,
 								  float out_scale) {
 	rkt_priv *p = self->priv;
 	if (n <= 0 || m <= 0)
 		return OK;
+	backend *host_first = backend_host();
+	if (host_first &&
+		(out_scale == 1.0f ? host_first->add_batch != NULL : host_first->ple_combine != NULL)) {
+		if (out_scale == 1.0f)
+			return host_first->add_batch(host_first, x, y, n, m);
+		return host_first->ple_combine(host_first, x, y, n * m, out_scale);
+	}
 	status_code s = ERR_UNSUPPORTED;
 	if (!p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
@@ -793,7 +838,8 @@ static status_code rkt_ffn_activate_kind(backend *self, const buffer *gate, cons
 	const float *gf = rkt_ptr(gate);
 	const float *uf = rkt_ptr(up);
 	float		*of = rkt_ptr(out);
-	if (rkt_native_ffn_activate(p, kind, gf, gate_stride, uf, up_stride, of, n, m) == OK)
+	if (m > RKT_SPLIT_MAX_ROWS &&
+		rkt_native_ffn_activate(p, kind, gf, gate_stride, uf, up_stride, of, n, m) == OK)
 		return OK;
 	float		*ucopy	  = NULL;
 	const float *up_end	  = uf + (size_t)(m - 1) * up_stride + n;
@@ -873,6 +919,9 @@ static status_code rkt_scale_inplace(backend *self, buffer *x, float scale, int 
 	rkt_priv *p = self->priv;
 	if (n <= 0 || scale == 1.0f)
 		return OK;
+	backend *host_first = backend_host();
+	if (host_first && host_first->scale_inplace)
+		return host_first->scale_inplace(host_first, x, scale, n);
 	status_code s = ERR_UNSUPPORTED;
 	if (!p->npu_failed) {
 		pthread_mutex_lock(&p->lock);
@@ -1183,12 +1232,12 @@ static double softmax_exp_sum(const float *sc, float *pr, int lo, int hi, float 
 	return sum;
 }
 
-static void softmax_round_f16(float *pr, int n, float inv) {
+static void softmax_normalize(float *pr, int n, float inv) {
 	int t = 0;
 	for (; t + 4 <= n; t += 4)
-		vst1q_f32(pr + t, vcvt_f32_f16(vcvt_f16_f32(vmulq_n_f32(vld1q_f32(pr + t), inv))));
+		vst1q_f32(pr + t, vmulq_n_f32(vld1q_f32(pr + t), inv));
 	for (; t < n; t++)
-		pr[t] = f16_bits_to_f32(f32_to_f16_bits(pr[t] * inv));
+		pr[t] *= inv;
 }
 
 static void attention_softmax(const float *scores, float *probs, int m, int n_i, int span16,
@@ -1203,7 +1252,7 @@ static void attention_softmax(const float *scores, float *probs, int m, int n_i,
 			float		*pr	 = probs + (size_t)(r * n_i + i) * pos_pad;
 			float		 mx	 = softmax_scaled_max(sc, t_lo, lim, scale);
 			double		 sum = softmax_exp_sum(sc, pr, t_lo, lim, scale, mx);
-			softmax_round_f16(pr, lim, (float)(1.0 / sum));
+			softmax_normalize(pr, lim, (float)(1.0 / sum));
 		}
 	}
 }
@@ -1530,6 +1579,11 @@ static void rkt_free(backend *self) {
 		return;
 	for (size_t i = 0; i < p->n_weights; i++)
 		destroy_weight(p, p->weights[i]);
+	if (p->combine_w)
+		destroy_weight(p, p->combine_w);
+	for (size_t i = 0; i < p->n_copies; i++)
+		free(p->copies[i]);
+	free(p->copies);
 	if (p->fused_groups)
 		log_tag("RKT", "fused %d weights into %d larger job sets", p->fused_weights,
 				p->fused_groups);
@@ -1602,7 +1656,6 @@ static status_code rkt_ctor(backend *out) {
 	out->ffn_activate			  = rkt_ffn_activate;
 	out->scale_inplace			  = rkt_scale_inplace;
 	out->add_inplace			  = rkt_add_inplace;
-	out->matmul_softcap_batch	  = rkt_matmul_softcap_batch;
 	out->matmul_gate_act_batch	  = rkt_matmul_gate_act_batch;
 	out->softcap				  = rkt_softcap;
 	out->add_batch				  = rkt_add_batch;

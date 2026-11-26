@@ -1335,3 +1335,170 @@ status_code cpu_attention_full_batch(backend *self, const buffer *q, const buffe
 		cpu_attn_batch_chunk(0, total, 0, &job);
 	return OK;
 }
+
+#define ATTN_DEC_WG 64
+
+static inline float attn_dec_score_c(const float *restrict qh, const uint16_t *restrict kt,
+									 int dim) {
+	float lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	float hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	int	  i		= 0;
+	for (; i + 8 <= dim; i += 8) {
+		for (int j = 0; j < 4; j++)
+			lo[j] = fmaf(qh[i + j], f16_to_f32(kt[i + j]), lo[j]);
+		for (int j = 0; j < 4; j++)
+			hi[j] = fmaf(qh[i + 4 + j], f16_to_f32(kt[i + 4 + j]), hi[j]);
+	}
+	for (int j = 0; i < dim; i++, j++) {
+		if (j < 4)
+			lo[j] = fmaf(qh[i], f16_to_f32(kt[i]), lo[j]);
+		else
+			hi[j - 4] = fmaf(qh[i], f16_to_f32(kt[i]), hi[j - 4]);
+	}
+	float tlo = (lo[0] + lo[1]) + (lo[2] + lo[3]);
+	float thi = (hi[0] + hi[1]) + (hi[2] + hi[3]);
+	return tlo + thi;
+}
+
+void cpu_attention_decode_f16(const uint16_t *k_slice, const uint16_t *v_slice, int kv_stride,
+							  const float *qh, float *out_h, int head_dim, int n_pos, int n_heads,
+							  float scale) {
+	int pairs		 = head_dim / 2;
+	int split_groups = pairs > ATTN_DEC_WG / 2 ? 1 : ATTN_DEC_WG / pairs;
+	int chunk		 = (256 + n_heads - 1) / n_heads;
+	if (chunk > 64)
+		chunk = 64;
+	int n_splits = (n_pos + 16 - 1) / 16;
+	if (n_splits > chunk)
+		n_splits = chunk;
+	if (n_splits < 1)
+		n_splits = 1;
+	int chunk_r = (n_pos + n_splits - 1) / n_splits;
+
+	float *o_s	= xmalloc((size_t)n_splits * (size_t)pairs * 2 * sizeof(float));
+	float *l_s	= xmalloc((size_t)n_splits * sizeof(float));
+	float *m_s	= xmalloc((size_t)n_splits * sizeof(float));
+	float *o_g	= xmalloc((size_t)split_groups * (size_t)pairs * 2 * sizeof(float));
+	float *l_g	= xmalloc((size_t)split_groups * (size_t)pairs * sizeof(float));
+	float *scor = xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
+	float *etl	= xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
+	float *red	= xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
+
+	for (int split = 0; split < n_splits; split++) {
+		int t_begin = split * chunk_r;
+		int t_end	= t_begin + chunk_r;
+		if (t_end > n_pos)
+			t_end = n_pos;
+		float m_run = -INFINITY;
+		memset(o_g, 0, (size_t)split_groups * (size_t)pairs * 2 * sizeof(float));
+		memset(l_g, 0, (size_t)split_groups * (size_t)pairs * sizeof(float));
+
+		for (int t0 = t_begin; t0 < t_end; t0 += ATTN_DEC_WG) {
+			int len = t_end - t0;
+			if (len > ATTN_DEC_WG)
+				len = ATTN_DEC_WG;
+			for (int t = 0; t < ATTN_DEC_WG; t++)
+				scor[t] = -INFINITY;
+			for (int t = 0; t < len; t++) {
+				const uint16_t *kt = k_slice + ((size_t)(t0 + t) * kv_stride);
+				scor[t]			   = attn_dec_score_c(qh, kt, head_dim) * scale;
+			}
+			float mp[ATTN_DEC_WG / 4];
+			for (int b = 0; b < ATTN_DEC_WG / 4; b++) {
+				float x0 = scor[b * 4 + 0];
+				float x1 = scor[b * 4 + 1];
+				float x2 = scor[b * 4 + 2];
+				float x3 = scor[b * 4 + 3];
+				mp[b]	 = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+			}
+			float m_tile = mp[0];
+			for (int b = 1; b < ATTN_DEC_WG / 4; b++)
+				m_tile = fmaxf(m_tile, mp[b]);
+			float m_new = fmaxf(m_run, m_tile);
+			for (int t = 0; t < ATTN_DEC_WG; t++)
+				etl[t] = t < len ? num_expf(scor[t] - m_new) : 0.0f;
+			float alpha = (m_new == m_run) ? 1.0f : num_expf(m_run - m_new);
+			m_run		= m_new;
+
+			for (int g = 0; g < split_groups; g++) {
+				for (int p = 0; p < pairs; p++) {
+					float *o = o_g + ((size_t)g * pairs + p) * 2;
+					float *l = l_g + (size_t)g * pairs + p;
+					o[0] *= alpha;
+					o[1] *= alpha;
+					*l *= alpha;
+					for (int t = g; t < len; t += split_groups) {
+						float			e  = etl[t];
+						const uint16_t *vt = v_slice + ((size_t)(t0 + t) * kv_stride);
+						o[0]			   = fmaf(e, f16_to_f32(vt[2 * p]), o[0]);
+						o[1]			   = fmaf(e, f16_to_f32(vt[2 * p + 1]), o[1]);
+						*l += e;
+					}
+				}
+			}
+		}
+
+		for (int p = 0; p < pairs; p++) {
+			float o0 = o_g[p * 2];
+			float o1 = o_g[p * 2 + 1];
+			float l	 = l_g[p];
+			for (int g = 1; g < split_groups; g++) {
+				o0 += o_g[((size_t)g * pairs + p) * 2];
+				o1 += o_g[((size_t)g * pairs + p) * 2 + 1];
+				l += l_g[(size_t)g * pairs + p];
+			}
+			o_s[((size_t)split * pairs + p) * 2]	 = o0;
+			o_s[((size_t)split * pairs + p) * 2 + 1] = o1;
+		}
+		m_s[split]	 = m_run;
+		float lsplit = l_g[0];
+		for (int g = 1; g < split_groups; g++)
+			lsplit += l_g[(size_t)g * pairs];
+		l_s[split] = lsplit;
+	}
+
+	if (n_splits == 1) {
+		float inv = l_s[0] > 0.0f ? 1.0f / l_s[0] : 0.0f;
+		for (int p = 0; p < pairs; p++) {
+			out_h[2 * p]	 = o_s[p * 2] * inv;
+			out_h[2 * p + 1] = o_s[p * 2 + 1] * inv;
+		}
+	} else {
+		for (int i = 0; i < ATTN_DEC_WG; i++)
+			red[i] = i < n_splits ? m_s[i] : -INFINITY;
+		for (int r = ATTN_DEC_WG / 2; r > 0; r >>= 1)
+			for (int i = 0; i < r; i++)
+				red[i] = fmaxf(red[i], red[i + r]);
+		float m_max = red[0];
+		float w[64];
+		for (int i = 0; i < ATTN_DEC_WG; i++)
+			w[i] = (i < n_splits && m_s[i] != -INFINITY && m_max != -INFINITY)
+					   ? num_expf(m_s[i] - m_max)
+					   : 0.0f;
+		for (int i = 0; i < ATTN_DEC_WG; i++)
+			red[i] = i < n_splits ? w[i] * l_s[i] : 0.0f;
+		for (int r = ATTN_DEC_WG / 2; r > 0; r >>= 1)
+			for (int i = 0; i < r; i++)
+				red[i] += red[i + r];
+		float l		= red[0];
+		float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+		for (int p = 0; p < pairs; p++) {
+			float o0 = 0.0f;
+			float o1 = 0.0f;
+			for (int s = 0; s < n_splits; s++) {
+				o0 = fmaf(w[s], o_s[((size_t)s * pairs + p) * 2], o0);
+				o1 = fmaf(w[s], o_s[((size_t)s * pairs + p) * 2 + 1], o1);
+			}
+			out_h[2 * p]	 = o0 * inv_l;
+			out_h[2 * p + 1] = o1 * inv_l;
+		}
+	}
+	free(o_s);
+	free(l_s);
+	free(m_s);
+	free(o_g);
+	free(l_g);
+	free(scor);
+	free(etl);
+	free(red);
+}

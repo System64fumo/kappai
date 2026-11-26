@@ -110,6 +110,12 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		printf("  SKIPPED: backend has no matmul_batch\n");
 		return 0;
 	}
+	double peak_bps = 0.0;
+	int	   has_bw	= b->mem_bandwidth_probe && backend_has_cap(b, BCAP_MEM_BANDWIDTH) &&
+					  b->mem_bandwidth_probe(b, &peak_bps) == OK && peak_bps > 0.0;
+	if (has_bw)
+		printf("  peak read bandwidth: %.2f GB/s (measured)\n", peak_bps / 1e9);
+
 	int name_width = qtype_name_width();
 	printf("  %-*s", name_width, "quant");
 	for (int mi = 0; mi < u->n_ms; mi++) {
@@ -117,6 +123,8 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		snprintf(label, sizeof(label), "M=%d", u->ms[mi]);
 		printf("   %7s", label);
 	}
+	if (has_bw)
+		printf("   %7s", "head%");
 	printf("\n");
 	for (int qi = 0; qi < QTYPES_N; qi++) {
 		if (u->k % QTYPES[qi].block != 0)
@@ -127,14 +135,48 @@ static int bench_matmul_one(backend *b, const char *name, void *ud) {
 		if (test_repack_base_type(QTYPES[qi].type, &repack_base) && u->n % 8 != 0)
 			continue;
 		printf("  %-*s", name_width, QTYPES[qi].name);
+		double g1	 = 0.0;
+		int	   have1 = 0;
 		for (int mi = 0; mi < u->n_ms; mi++) {
 			double g = bench_mul_gflops(b, &QTYPES[qi], u->n, u->k, u->ms[mi], u->iters);
 			printf("   %7.1f", g);
+			if (u->ms[mi] == 1) {
+				g1	  = g;
+				have1 = 1;
+			}
 			fflush(stdout);
+		}
+		if (has_bw) {
+			if (have1 && g1 > 0.0) {
+				double bpw	 = (double)QTYPES[qi].bytes / (double)QTYPES[qi].block;
+				double bw_ps = g1 * 1e9 * bpw / 2.0;
+				double pct	 = 100.0 * bw_ps / peak_bps;
+				if (pct > 100.0)
+					pct = 100.0;
+				printf("   %6.1f%%", 100.0 - pct);
+			} else {
+				printf("   %6s", "-");
+			}
 		}
 		printf("\n");
 		fflush(stdout);
 	}
+	return 0;
+}
+
+static int bench_mem_one(backend *b, const char *name, void *ud) {
+	(void)ud;
+	if (!b->mem_bandwidth_probe || !backend_has_cap(b, BCAP_MEM_BANDWIDTH)) {
+		printf("\n[%s]  memory bandwidth: not supported by backend\n", name);
+		return 0;
+	}
+	double bw = 0.0;
+	if (b->mem_bandwidth_probe(b, &bw) != OK || bw <= 0.0) {
+		printf("\n[%s]  memory bandwidth: probe failed\n", name);
+		return 0;
+	}
+	printf("\n[%s]  peak read bandwidth: %.2f GB/s (%.2f GiB/s, measured)\n", name, bw / 1e9,
+		   bw / (1024.0 * 1024.0 * 1024.0));
 	return 0;
 }
 
@@ -168,7 +210,15 @@ static int bench_attn_one(backend *b, const char *name, void *ud) {
 		printf("  SKIPPED: backend has no attention/kv ops\n");
 		return 0;
 	}
-	printf("  %-39s %12s %12s\n", "config", "us/call", "GFLOP/s");
+	double peak_bps = 0.0;
+	int	   has_bw	= b->mem_bandwidth_probe && backend_has_cap(b, BCAP_MEM_BANDWIDTH) &&
+					  b->mem_bandwidth_probe(b, &peak_bps) == OK && peak_bps > 0.0;
+	if (has_bw)
+		printf("  peak read bandwidth: %.2f GB/s (measured)\n", peak_bps / 1e9);
+	printf("  %-39s %12s %12s", "config", "us/call", "GFLOP/s");
+	if (has_bw)
+		printf(" %7s", "head%");
+	printf("\n");
 	for (unsigned qi = 0; qi < sizeof(quants) / sizeof(quants[0]); qi++)
 		for (unsigned si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++)
 			for (int fl = 0; fl < 2; fl++) {
@@ -227,8 +277,18 @@ static int bench_attn_one(backend *b, const char *name, void *ud) {
 				}
 				double flops  = 4.0 * (double)c.heads * (double)nt * (double)c.head_dim;
 				double gflops = best_us > 0 ? flops / best_us / 1e3 : 0.0;
-				printf("  h=%-3d kv=%-2d d=%-4d pos=%-5d %-4s fl=%d %12.1f %12.2f\n", c.heads,
+				printf("  h=%-3d kv=%-2d d=%-4d pos=%-5d %-4s fl=%d %12.1f %12.2f", c.heads,
 					   c.kv_heads, c.head_dim, c.pos, qn, c.flash, best_us, gflops);
+				if (has_bw) {
+					double kv_bytes = (double)c.kv_heads * (double)nt *
+									  (double)kv_row_bytes(c.kv_quant, c.head_dim) * 2.0;
+					double bw		= best_us > 0 ? kv_bytes * 1e6 / best_us : 0.0;
+					double pct		= 100.0 * bw / peak_bps;
+					if (pct > 100.0)
+						pct = 100.0;
+					printf(" %6.1f%%", 100.0 - pct);
+				}
+				printf("\n");
 				fflush(stdout);
 
 				b->buffer_free(b, &kc);
@@ -496,8 +556,14 @@ int run_bench_mode(int argc, char **argv, test_device *devs, int n_devs) {
 		} else if (strcmp(argv[ai], "matmul") == 0 || strcmp(argv[ai], "attn") == 0 ||
 				   strcmp(argv[ai], "tok") == 0 || strcmp(argv[ai], "tokenize") == 0 ||
 				   strcmp(argv[ai], "dequant") == 0 || strcmp(argv[ai], "e2e") == 0 ||
-				   strcmp(argv[ai], "all") == 0) {
-			which = strcmp(argv[ai], "tokenize") == 0 ? "tok" : argv[ai];
+				   strcmp(argv[ai], "mem") == 0 || strcmp(argv[ai], "bw") == 0 ||
+				   strcmp(argv[ai], "bandwidth") == 0 || strcmp(argv[ai], "all") == 0) {
+			if (strcmp(argv[ai], "tokenize") == 0)
+				which = "tok";
+			else if (strcmp(argv[ai], "bw") == 0 || strcmp(argv[ai], "bandwidth") == 0)
+				which = "mem";
+			else
+				which = argv[ai];
 		} else if (argv[ai][0] == '-' && strcmp(argv[ai], "--bench") != 0 &&
 				   strcmp(argv[ai], "--all") != 0) {
 			fprintf(stderr, "unknown bench option: %s\n", argv[ai]);
@@ -530,6 +596,8 @@ int run_bench_mode(int argc, char **argv, test_device *devs, int n_devs) {
 	}
 	if (strcmp(which, "attn") == 0 || strcmp(which, "all") == 0)
 		bench_for_each_backend(argc, argv, devs, n_devs, bench_attn_one, &attn_iters);
+	if (strcmp(which, "mem") == 0 || strcmp(which, "all") == 0)
+		bench_for_each_backend(argc, argv, devs, n_devs, bench_mem_one, NULL);
 	if (strcmp(which, "dequant") == 0 || strcmp(which, "all") == 0)
 		bench_for_each_backend(argc, argv, devs, n_devs, bench_dequant_one, &iters);
 	if (strcmp(which, "e2e") == 0 || strcmp(which, "all") == 0) {

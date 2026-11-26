@@ -108,8 +108,7 @@ void main() {
 				v_tile[t * HEAD_DIM + d0] = vf.x;
 				v_tile[t * HEAD_DIM + d1] = vf.y;
 			} else {
-				uint ko = kv_base + uint(tile_t0 + t) * stride_head;
-				// k d0
+				uint  ko	= kv_base + uint(tile_t0 + t) * stride_head;
 				int	  b0	= d0 / 32;
 				int	  o0	= d0 % 32;
 				uint  soff0 = ko + uint(b0) * 34u;
@@ -120,27 +119,24 @@ void main() {
 				if (qk0 > 127)
 					qk0 -= 256;
 				k_tile[t * KSTRIDE + d0] = sk0 * float(qk0);
-				// k d1
-				int	  b1	= d1 / 32;
-				int	  o1	= d1 % 32;
-				uint  soff1 = ko + uint(b1) * 34u;
-				uint  w1	= kcache[soff1 >> 2u];
-				float sk1	= unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
-				uint  wb1	= kcache[(soff1 + 2u + uint(o1)) >> 2u];
-				int	  qk1	= int((wb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
+				int	  b1				 = d1 / 32;
+				int	  o1				 = d1 % 32;
+				uint  soff1				 = ko + uint(b1) * 34u;
+				uint  w1				 = kcache[soff1 >> 2u];
+				float sk1				 = unpackHalf2x16((w1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  wb1				 = kcache[(soff1 + 2u + uint(o1)) >> 2u];
+				int	  qk1 = int((wb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);
 				if (qk1 > 127)
 					qk1 -= 256;
 				k_tile[t * KSTRIDE + d1] = sk1 * float(qk1);
-				// v d0
-				uint  vo0 = vcache[soff0 >> 2u];
-				float sv0 = unpackHalf2x16((vo0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
-				uint  vb0 = vcache[(soff0 + 2u + uint(o0)) >> 2u];
+				uint  vo0				 = vcache[soff0 >> 2u];
+				float sv0				 = unpackHalf2x16((vo0 >> ((soff0 & 2u) * 8u)) & 0xFFFFu).x;
+				uint  vb0				 = vcache[(soff0 + 2u + uint(o0)) >> 2u];
 				int	  qv0 = int((vb0 >> (((soff0 + 2u + uint(o0)) & 3u) * 8u)) & 0xFFu);
 				if (qv0 > 127)
 					qv0 -= 256;
 				v_tile[t * HEAD_DIM + d0] = sv0 * float(qv0);
-				// v d1
-				uint  vo1 = vcache[soff1 >> 2u];
+				uint  vo1				  = vcache[soff1 >> 2u];
 				float sv1 = unpackHalf2x16((vo1 >> ((soff1 & 2u) * 8u)) & 0xFFFFu).x;
 				uint  vb1 = vcache[(soff1 + 2u + uint(o1)) >> 2u];
 				int	  qv1 = int((vb1 >> (((soff1 + 2u + uint(o1)) & 3u) * 8u)) & 0xFFu);

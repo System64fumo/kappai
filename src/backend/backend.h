@@ -32,6 +32,7 @@ typedef enum {
 	BCAP_KV_SHIFT			  = 1 << 13,
 	BCAP_QK_NORM_ROPE		  = 1 << 14,
 	BCAP_REMOTE				  = 1 << 15,
+	BCAP_MEM_BANDWIDTH		  = 1 << 16,
 } backend_cap;
 
 #define BACKEND_TOKEN_REGS 2
@@ -433,6 +434,7 @@ struct backend {
 	int (*dequant_type_native)(backend *self, uint32_t type, int k);
 	status_code (*dequant_weight)(backend *self, uint32_t type, const void *src, int n_rows, int k,
 								  buffer *out);
+	status_code (*mem_bandwidth_probe)(backend *self, double *bytes_per_sec);
 	void (*synchronize)(backend *self);
 	void (*set_gpu_profile)(backend *self, int enable);
 	void (*submit)(backend *self);

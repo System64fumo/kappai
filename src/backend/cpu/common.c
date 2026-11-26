@@ -12,9 +12,11 @@
 #include <math.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/sysinfo.h>
@@ -2123,6 +2125,87 @@ static status_code cpu_mla_absorbed_buf(backend *self, const mla_absorbed_desc *
 	return st;
 }
 
+typedef struct {
+	const uint64_t	*p;
+	int				 streams;
+	_Atomic uint64_t sum;
+} cpu_bw_job;
+
+static void cpu_bw_read_chunk(int begin, int end, int tid, void *ctx) {
+	(void)tid;
+	cpu_bw_job *j	  = ctx;
+	int			n	  = end - begin;
+	int			s	  = j->streams;
+	uint64_t	total = 0;
+	if (s <= 1) {
+		for (int i = begin; i < end; i++)
+			total += j->p[i];
+	} else {
+		if (s > 8)
+			s = 8;
+		int		 per	= n / s;
+		uint64_t acc[8] = {0};
+		for (int i = 0; i < per; i++)
+			for (int k = 0; k < s; k++)
+				acc[k] += j->p[begin + (size_t)k * (size_t)per + i];
+		for (int k = 0; k < s; k++)
+			total += acc[k];
+		for (int i = begin + per * s; i < end; i++)
+			total += j->p[i];
+	}
+	atomic_fetch_add_explicit(&j->sum, total, memory_order_relaxed);
+}
+
+static uint64_t cpu_bw_now_ns(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static double cpu_bw_read_once(backend *self, const void *buf, size_t bytes, int streams) {
+	cpu_priv  *p   = self->priv;
+	int		   n   = (int)(bytes / sizeof(uint64_t));
+	cpu_bw_job job = {.p = buf, .streams = streams, .sum = 0};
+	uint64_t   t0  = cpu_bw_now_ns();
+	if (p->pool)
+		tpool_parallel_for(p->pool, n, 8192, cpu_bw_read_chunk, &job);
+	else
+		cpu_bw_read_chunk(0, n, 0, &job);
+	uint64_t dt = cpu_bw_now_ns() - t0;
+	return dt > 0 ? (double)bytes * 1e9 / (double)dt : 0.0;
+}
+
+status_code cpu_mem_bandwidth_probe(backend *self, double *bytes_per_sec) {
+	if (!bytes_per_sec)
+		return ERR_INVALID_ARG;
+
+	size_t bytes = (size_t)64 << 20;
+	void  *buf	 = NULL;
+	while (bytes >= ((size_t)8 << 20)) {
+		buf = xmalloc_aligned(bytes, 64);
+		if (buf)
+			break;
+		bytes /= 2;
+	}
+	if (!buf)
+		return ERR_UNSUPPORTED;
+
+	memset(buf, 0xA5, bytes);
+	double			 best		= 0.0;
+	static const int patterns[] = {1, 4};
+	for (size_t pi = 0; pi < sizeof(patterns) / sizeof(patterns[0]); pi++)
+		for (int i = 0; i < 3; i++) {
+			double bw = cpu_bw_read_once(self, buf, bytes, patterns[pi]);
+			if (bw > best)
+				best = bw;
+		}
+	free(buf);
+	if (best <= 0.0)
+		return ERR_UNSUPPORTED;
+	*bytes_per_sec = best;
+	return OK;
+}
+
 status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) {
 	out->probe							 = cpu_probe;
 	out->init							 = init;
@@ -2169,6 +2252,7 @@ status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int)) 
 	out->repack_plan					 = cpu_repack_plan;
 	out->repack_weight					 = cpu_repack_weight;
 	out->dequant_row					 = cpu_dequant_row;
+	out->mem_bandwidth_probe			 = cpu_mem_bandwidth_probe;
 	out->moe_activate					 = cpu_moe_activate;
 	out->synchronize					 = cpu_synchronize;
 	out->attention_mla					 = cpu_attention_mla;
@@ -2366,168 +2450,6 @@ void cpu_mla_abs_head(const cpu_mla_abs_args *a, int h, float *sc, float *lat) {
 	float		*o	= a->out + (size_t)h * a->v_head;
 	for (int d = 0; d < a->v_head; d++)
 		o[d] = dot_f32(vb + (size_t)d * R, lat, R);
-}
-
-#define ATTN_DEC_WG 64
-#define ATTN_DEC_LANES 16
-#define ATTN_DEC_PASS_TOKENS (ATTN_DEC_WG / ATTN_DEC_LANES)
-#define ATTN_DEC_MAX_HEAD_DIM 512
-
-void cpu_attention_decode_f16(const uint16_t *k_slice, const uint16_t *v_slice, int kv_stride,
-							  const float *qh, float *out_h, int head_dim, int n_pos, int n_heads,
-							  float scale) {
-	int pairs		 = head_dim / 2;
-	int split_groups = pairs > ATTN_DEC_WG / 2 ? 1 : ATTN_DEC_WG / pairs;
-	int chunk		 = (256 + n_heads - 1) / n_heads;
-	if (chunk > 64)
-		chunk = 64;
-	int n_splits = (n_pos + 16 - 1) / 16;
-	if (n_splits > chunk)
-		n_splits = chunk;
-	if (n_splits < 1)
-		n_splits = 1;
-	int chunk_r = (n_pos + n_splits - 1) / n_splits;
-
-	float *o_s	= xmalloc((size_t)n_splits * (size_t)pairs * 2 * sizeof(float));
-	float *l_s	= xmalloc((size_t)n_splits * sizeof(float));
-	float *m_s	= xmalloc((size_t)n_splits * sizeof(float));
-	float *o_g	= xmalloc((size_t)split_groups * (size_t)pairs * 2 * sizeof(float));
-	float *l_g	= xmalloc((size_t)split_groups * (size_t)pairs * sizeof(float));
-	float *scor = xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
-	float *etl	= xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
-	float *red	= xmalloc((size_t)ATTN_DEC_WG * sizeof(float));
-
-	for (int split = 0; split < n_splits; split++) {
-		int t_begin = split * chunk_r;
-		int t_end	= t_begin + chunk_r;
-		if (t_end > n_pos)
-			t_end = n_pos;
-		float m_run = -INFINITY;
-		memset(o_g, 0, (size_t)split_groups * (size_t)pairs * 2 * sizeof(float));
-		memset(l_g, 0, (size_t)split_groups * (size_t)pairs * sizeof(float));
-
-		for (int t0 = t_begin; t0 < t_end; t0 += ATTN_DEC_WG) {
-			int len = t_end - t0;
-			if (len > ATTN_DEC_WG)
-				len = ATTN_DEC_WG;
-			for (int t = 0; t < ATTN_DEC_WG; t++)
-				scor[t] = -INFINITY;
-			for (int t = 0; t < len; t++) {
-				const uint16_t *kt = k_slice + ((size_t)(t0 + t) * kv_stride);
-				float			a16[ATTN_DEC_LANES];
-				for (int lane = 0; lane < ATTN_DEC_LANES; lane++) {
-					float a = 0.0f;
-					for (int p = lane; p < pairs; p += ATTN_DEC_LANES) {
-						float k0 = f16_to_f32(kt[2 * p]);
-						float k1 = f16_to_f32(kt[2 * p + 1]);
-						a		 = fmaf(k0, qh[2 * p], a);
-						a		 = fmaf(k1, qh[2 * p + 1], a);
-					}
-					a16[lane] = a;
-				}
-				float s = 0.0f;
-				for (int lane = 0; lane < ATTN_DEC_LANES; lane++)
-					s += a16[lane];
-				scor[t] = s * scale;
-			}
-			float mp[ATTN_DEC_WG / 4];
-			for (int b = 0; b < ATTN_DEC_WG / 4; b++) {
-				float x0 = scor[b * 4 + 0];
-				float x1 = scor[b * 4 + 1];
-				float x2 = scor[b * 4 + 2];
-				float x3 = scor[b * 4 + 3];
-				mp[b]	 = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
-			}
-			float m_tile = mp[0];
-			for (int b = 1; b < ATTN_DEC_WG / 4; b++)
-				m_tile = fmaxf(m_tile, mp[b]);
-			float m_new = fmaxf(m_run, m_tile);
-			for (int t = 0; t < ATTN_DEC_WG; t++)
-				etl[t] = t < len ? num_expf(scor[t] - m_new) : 0.0f;
-			float alpha = (m_new == m_run) ? 1.0f : num_expf(m_run - m_new);
-			m_run		= m_new;
-
-			for (int g = 0; g < split_groups; g++) {
-				for (int p = 0; p < pairs; p++) {
-					float *o = o_g + ((size_t)g * pairs + p) * 2;
-					float *l = l_g + (size_t)g * pairs + p;
-					o[0] *= alpha;
-					o[1] *= alpha;
-					*l *= alpha;
-					for (int t = g; t < len; t += split_groups) {
-						float			e  = etl[t];
-						const uint16_t *vt = v_slice + ((size_t)(t0 + t) * kv_stride);
-						o[0]			   = fmaf(e, f16_to_f32(vt[2 * p]), o[0]);
-						o[1]			   = fmaf(e, f16_to_f32(vt[2 * p + 1]), o[1]);
-						*l += e;
-					}
-				}
-			}
-		}
-
-		for (int p = 0; p < pairs; p++) {
-			float o0 = o_g[p * 2];
-			float o1 = o_g[p * 2 + 1];
-			float l	 = l_g[p];
-			for (int g = 1; g < split_groups; g++) {
-				o0 += o_g[((size_t)g * pairs + p) * 2];
-				o1 += o_g[((size_t)g * pairs + p) * 2 + 1];
-				l += l_g[(size_t)g * pairs + p];
-			}
-			o_s[((size_t)split * pairs + p) * 2]	 = o0;
-			o_s[((size_t)split * pairs + p) * 2 + 1] = o1;
-		}
-		m_s[split]	 = m_run;
-		float lsplit = l_g[0];
-		for (int g = 1; g < split_groups; g++)
-			lsplit += l_g[(size_t)g * pairs];
-		l_s[split] = lsplit;
-	}
-
-	if (n_splits == 1) {
-		float inv = l_s[0] > 0.0f ? 1.0f / l_s[0] : 0.0f;
-		for (int p = 0; p < pairs; p++) {
-			out_h[2 * p]	 = o_s[p * 2] * inv;
-			out_h[2 * p + 1] = o_s[p * 2 + 1] * inv;
-		}
-	} else {
-		for (int i = 0; i < ATTN_DEC_WG; i++)
-			red[i] = i < n_splits ? m_s[i] : -INFINITY;
-		for (int r = ATTN_DEC_WG / 2; r > 0; r >>= 1)
-			for (int i = 0; i < r; i++)
-				red[i] = fmaxf(red[i], red[i + r]);
-		float m_max = red[0];
-		float w[64];
-		for (int i = 0; i < ATTN_DEC_WG; i++)
-			w[i] = (i < n_splits && m_s[i] != -INFINITY && m_max != -INFINITY)
-					   ? num_expf(m_s[i] - m_max)
-					   : 0.0f;
-		for (int i = 0; i < ATTN_DEC_WG; i++)
-			red[i] = i < n_splits ? w[i] * l_s[i] : 0.0f;
-		for (int r = ATTN_DEC_WG / 2; r > 0; r >>= 1)
-			for (int i = 0; i < r; i++)
-				red[i] += red[i + r];
-		float l		= red[0];
-		float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
-		for (int p = 0; p < pairs; p++) {
-			float o0 = 0.0f;
-			float o1 = 0.0f;
-			for (int s = 0; s < n_splits; s++) {
-				o0 = fmaf(w[s], o_s[((size_t)s * pairs + p) * 2], o0);
-				o1 = fmaf(w[s], o_s[((size_t)s * pairs + p) * 2 + 1], o1);
-			}
-			out_h[2 * p]	 = o0 * inv_l;
-			out_h[2 * p + 1] = o1 * inv_l;
-		}
-	}
-	free(o_s);
-	free(l_s);
-	free(m_s);
-	free(o_g);
-	free(l_g);
-	free(scor);
-	free(etl);
-	free(red);
 }
 
 float rmsnorm_sum_sq(const float *x, int n) {

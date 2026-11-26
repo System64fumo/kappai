@@ -1,14 +1,18 @@
 #include "numeric.h"
 #include "rocket.h"
 
-#define RKT_LUT_HQ_SEL 4
+#define RKT_LUT_HQ_SEL 7
 #define RKT_ADD_MAX_SCALED 65000.0f
-#define RKT_LUT_HOST_LIMIT 15.5f
+#define RKT_LUT_HOST_LIMIT 7.5f
+
+static int lut_is_gate(rkt_lut_kind kind) {
+	return kind == RKT_LUT_SILU_GATE || kind == RKT_LUT_GELU_GATE;
+}
 
 const char *rkt_lut_name(rkt_lut_kind kind) {
 	if (kind == RKT_LUT_TANH)
 		return "tanh";
-	return kind == RKT_LUT_GELU_TANH ? "gelu" : "silu";
+	return kind == RKT_LUT_GELU_TANH || kind == RKT_LUT_GELU_GATE ? "gelu" : "silu";
 }
 
 rkt_lut_kind rkt_lut_kind_for_activation(int activation) {
@@ -21,9 +25,13 @@ rkt_lut_kind rkt_lut_kind_for_activation(int activation) {
 
 static double lut_eval(rkt_lut_kind kind, double x) {
 	if (kind == RKT_LUT_TANH)
-		return tanh(x);
+		return x == 0.0 ? 1.0 : tanh(0.5 * x) / (0.5 * x);
 	if (x < -40.0)
 		return 0.0;
+	if (kind == RKT_LUT_GELU_GATE)
+		return 0.5 * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+	if (kind == RKT_LUT_SILU_GATE)
+		return 1.0 / (1.0 + exp(-x));
 	if (kind == RKT_LUT_GELU_TANH)
 		return 0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
 	return x / (1.0 + exp(-x));
@@ -31,8 +39,8 @@ static double lut_eval(rkt_lut_kind kind, double x) {
 
 static float lut_eval_f32(rkt_lut_kind kind, float x) {
 	if (kind == RKT_LUT_TANH)
-		return num_tanhf(x);
-	if (kind == RKT_LUT_GELU_TANH)
+		return num_tanhf(0.5f * x);
+	if (kind == RKT_LUT_GELU_TANH || kind == RKT_LUT_GELU_GATE)
 		return num_gelu_tanh(x);
 	return num_silu(x);
 }
@@ -40,11 +48,11 @@ static float lut_eval_f32(rkt_lut_kind kind, float x) {
 void rkt_lut_configure(rkt_lut_cfg *cfg, rkt_lut_kind kind) {
 	cfg->kind		= kind;
 	cfg->sel		= RKT_LUT_HQ_SEL;
-	cfg->S			= 256;
-	cfg->F			= 2048;
+	cfg->S			= 4096;
+	cfg->F			= lut_is_gate(kind) || kind == RKT_LUT_TANH ? 32767 : 4096;
 	cfg->start		= -(RKT_LUT_WINDOW_HALF << cfg->sel);
 	cfg->end		= (RKT_LUT_WINDOW_HALF << cfg->sel) - 1;
-	cfg->tail_slope = kind == RKT_LUT_TANH ? 0 : cfg->F / cfg->S;
+	cfg->tail_slope = kind == RKT_LUT_TANH || lut_is_gate(kind) ? 0 : cfg->F / cfg->S;
 }
 
 static void lut_fill(const rkt_lut_cfg *cfg, uint16_t *le) {
@@ -282,6 +290,9 @@ typedef struct {
 	int					n;
 	int					chunks_per_row;
 	int					n_cores;
+	int					xf_stride;
+	float				in_scale;
+	const float		   *xf;
 	rkt_lut_kind		kind;
 	float				inv;
 	float				out_scale;
@@ -302,6 +313,7 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 			int				col0  = (pixel % g->chunks_per_row) * RKT_LUT_CHUNK;
 			int				cols  = g->n - col0 < RKT_LUT_CHUNK ? g->n - col0 : RKT_LUT_CHUNK;
 			const uint16_t *x	  = g->x16 + (size_t)pixel * RKT_LUT_CHUNK;
+			const float	   *xe	  = g->xf ? g->xf + (size_t)row * g->xf_stride + col0 : NULL;
 			const float	   *u	  = g->up ? g->up + (size_t)row * g->up_stride + col0 : NULL;
 			const uint16_t *u16	  = g->up16 ? g->up16 + (size_t)row * g->up_stride + col0 : NULL;
 			float		   *dst	  = g->out ? g->out + (size_t)row * g->n + col0 : NULL;
@@ -313,8 +325,16 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 				float32x4_t v = vmulq_n_f32(
 					vld1q_f32(om_row + (size_t)(j / RKT_OUT_C2_F32) * group_stride), g->inv);
 				if (g->kind != RKT_LUT_NONE) {
-					float32x4_t xv	   = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(x + j)));
-					uint32x4_t	beyond = vcageq_f32(xv, vdupq_n_f32(RKT_LUT_HOST_LIMIT));
+					float32x4_t x16v = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(x + j)));
+					float32x4_t xv	 = x16v;
+					if (xe && g->kind != RKT_LUT_TANH) {
+						xv = vld1q_f32(xe + j);
+						v  = vmulq_f32(v, xv);
+					} else if (xe) {
+						v = vmulq_f32(v, vmulq_n_f32(vld1q_f32(xe + j), 0.5f * g->in_scale));
+					}
+
+					uint32x4_t beyond = vcageq_f32(xv, vdupq_n_f32(RKT_LUT_HOST_LIMIT));
 					if (vmaxvq_u32(beyond)) {
 						float vs[RKT_OUT_C2_F32], xs[RKT_OUT_C2_F32];
 						vst1q_f32(vs, v);
@@ -339,7 +359,15 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 				float v = om_row[(size_t)(j / RKT_OUT_C2_F32) * group_stride + j % RKT_OUT_C2_F32] *
 						  g->inv;
 				if (g->kind != RKT_LUT_NONE) {
-					float xv = f16_bits_to_f32(x[j]);
+					float x16f = f16_bits_to_f32(x[j]);
+					float xv   = x16f;
+					if (xe && g->kind != RKT_LUT_TANH) {
+						xv = xe[j];
+						v *= xv;
+					} else if (xe) {
+						v *= xe[j] * 0.5f * g->in_scale;
+					}
+
 					if (fabsf(xv) >= RKT_LUT_HOST_LIMIT)
 						v = lut_eval_f32(g->kind, xv);
 				}
@@ -429,6 +457,9 @@ static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind
 						.up_stride	= up_stride,
 						.n			= n,
 						.kind		= kind,
+						.xf			= lut_is_gate(kind) || kind == RKT_LUT_TANH ? gate : NULL,
+						.xf_stride	= gate_stride,
+						.in_scale	= a->in_scale,
 						.inv		= inv};
 	return lut_run_blocks(p, a, p->x16, pixels, chunks_per_row, &proto);
 }
@@ -436,6 +467,10 @@ static status_code lut_run_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind
 status_code rkt_lut_activate_rows(rkt_priv *p, rkt_lut_state *a, rkt_lut_kind kind,
 								  const float *gate, int gate_stride, const float *up,
 								  int up_stride, float *out, int n, int m) {
+	if (kind == RKT_LUT_SILU)
+		kind = RKT_LUT_SILU_GATE;
+	else if (kind == RKT_LUT_GELU_TANH)
+		kind = RKT_LUT_GELU_GATE;
 	status_code s = lut_state_select(p, a, kind);
 	if (s != OK)
 		return s;
@@ -464,7 +499,7 @@ status_code rkt_lut_softcap_rows(rkt_priv *p, rkt_lut_state *a, const float *x, 
 	status_code s = lut_state_select(p, a, RKT_LUT_TANH);
 	if (s != OK)
 		return s;
-	a->in_scale	 = 1.0f / cap;
+	a->in_scale	 = 2.0f / cap;
 	a->out_scale = cap;
 	s = lut_run_rows(p, a, RKT_LUT_TANH, x, n, NULL, 0, out, n, 1, 1.0f / (float)a->cfg.F);
 	a->in_scale	 = 0.0f;

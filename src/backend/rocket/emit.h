@@ -12,7 +12,7 @@
 #define RKT_OUT_C2_F32 4
 #define RKT_N_ALIGN 16
 #define RKT_K_ALIGN 32
-#define RKT_MAX_N_CHUNK 8192
+#define RKT_MAX_N_CHUNK 4096
 #define RKT_MAX_K 8192
 #define RKT_MAX_K_TF32 4096
 
@@ -54,6 +54,8 @@ typedef enum {
 	RKT_LUT_GELU_TANH,
 	RKT_LUT_SILU,
 	RKT_LUT_TANH,
+	RKT_LUT_SILU_GATE,
+	RKT_LUT_GELU_GATE,
 } rkt_lut_kind;
 
 #define RKT_LUT_WINDOW_HALF 256

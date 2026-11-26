@@ -1101,23 +1101,26 @@ status_code moe_shared_batch(exec_ctx *ctx) {
 	uint32_t	  down_wt	 = plan.down_type;
 
 	buffer gate_view, up_view, down_view;
-	if (backend_has_cap(a, BCAP_IS_HOST) && !plan.gate_up_fused) {
+	if (backend_has_cap(a, BCAP_IS_HOST)) {
 		const layer_weights *L = &ctx->m->layers[ctx->li];
-		const weight_ref	*g = plan.is_moe ? &L->shexp_gate_w : &L->gate_w;
-		const weight_ref	*u = plan.is_moe ? &L->shexp_up_w : &L->up_w;
 		const weight_ref	*d = plan.is_moe ? &L->shexp_down_w : &L->down_w;
-		gate_w_buf = mla_host_weight(g, ggml_row_size(gate_wt, dim) * sh_inter, a, &gate_view);
-		up_w_buf   = mla_host_weight(u, ggml_row_size(up_wt, dim) * sh_inter, a, &up_view);
 		down_w_buf = mla_host_weight(d, ggml_row_size(down_wt, sh_inter) * dim, a, &down_view);
+		if (!plan.gate_up_fused) {
+			const weight_ref *g = plan.is_moe ? &L->shexp_gate_w : &L->gate_w;
+			const weight_ref *u = plan.is_moe ? &L->shexp_up_w : &L->up_w;
+			gate_w_buf = mla_host_weight(g, ggml_row_size(gate_wt, dim) * sh_inter, a, &gate_view);
+			up_w_buf   = mla_host_weight(u, ggml_row_size(up_wt, dim) * sh_inter, a, &up_view);
+		}
 	}
 
 	if (plan.gate_up_fused) {
 		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_GATE_UP,
 					   (size_t)ctx->rows.n_rows * 2 * sh_inter);
 
-		status_code st = a->matmul_batch(a, plan.gate_up_w, plan.gate_up_type, xb,
-										 &ctx->bs->pair[RECIPE_SLOT_FFN_GATE_UP].b, 2 * sh_inter,
-										 dim, ctx->rows.n_rows);
+		backend	   *mm = plan.gate_up_w->owner ? plan.gate_up_w->owner : a;
+		status_code st = mm->matmul_batch(mm, plan.gate_up_w, plan.gate_up_type, xb,
+										  &ctx->bs->pair[RECIPE_SLOT_FFN_GATE_UP].b, 2 * sh_inter,
+										  dim, ctx->rows.n_rows);
 		if (st != OK)
 			return st;
 
@@ -1213,23 +1216,30 @@ status_code moe_shared_batch(exec_ctx *ctx) {
 down_batch:
 	ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b.size = (size_t)ctx->rows.n_rows * sh_inter * sizeof(float);
 
-	status_code st =
-		a->matmul_batch(a, down_w_buf, down_wt, &ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b,
-						&ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b, dim, sh_inter, ctx->rows.n_rows);
-	if (st != OK)
-		return st;
-
-	if (caps & MOE_SH_COPY) {
-		st = a->copy_buffer(a, &ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b,
-							&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b, ctx->rows.n_rows * dim);
+	size_t out_elems = (size_t)ctx->rows.n_rows * dim;
+	if (!(caps & MOE_SH_COPY)) {
+		float_buf_ensure_nocopy(&ctx->bs->copy_tmp, out_elems, 64);
+		buffer		down_out = buffer_host_view(a, ctx->bs->copy_tmp.p, out_elems * sizeof(float));
+		status_code st =
+			a->matmul_batch(a, down_w_buf, down_wt, &ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b,
+							&down_out, dim, sh_inter, ctx->rows.n_rows);
 		if (st != OK)
 			return st;
-	} else {
-		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_ACT, (size_t)ctx->rows.n_rows * dim);
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_FFN_ACT, out_elems);
 		batch_sync(ctx);
-		memcpy(batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b),
-			   batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b),
-			   (size_t)ctx->rows.n_rows * dim * sizeof(float));
+		memcpy(batch_buf_ptr(&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b), ctx->bs->copy_tmp.p,
+			   out_elems * sizeof(float));
+	} else {
+		bs_ensure_slot(ctx->bs, a, RECIPE_SLOT_RESID_TMP, out_elems);
+		status_code st = a->matmul_batch(
+			a, down_w_buf, down_wt, &ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b,
+			&ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b, dim, sh_inter, ctx->rows.n_rows);
+		if (st != OK)
+			return st;
+		st = a->copy_buffer(a, &ctx->bs->pair[RECIPE_SLOT_RESID_TMP].b,
+							&ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b, out_elems);
+		if (st != OK)
+			return st;
 	}
 	ctx->bs->pair[RECIPE_SLOT_FFN_ACT].b.size = (size_t)ctx->rows.n_rows * dim * sizeof(float);
 	return OK;

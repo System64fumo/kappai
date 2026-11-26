@@ -1020,7 +1020,8 @@ static void collect_task_f16(const rkt_task *t, const uint16_t *om, int lo, int 
 	const block_ctx *b	   = &t->ctx;
 	const job_desc	*j	   = &t->job;
 	size_t			 plane = (size_t)t->blk * 8;
-	for (int r = 0; r < t->blk; r++) {
+	int				 rows  = t->blk < b->m - b->m_done ? t->blk : b->m - b->m_done;
+	for (int r = 0; r < rows; r++) {
 		uint16_t *dst =
 			b->y16 + (size_t)(b->m_done + r) * b->y16_stride + (j->row_start + lo - b->row0);
 		int nn = lo;
@@ -1054,22 +1055,29 @@ static status_code collect_task(const rkt_task *t, const float *om) {
 		return OK;
 	}
 	size_t group_stride = (size_t)blk * RKT_OUT_C2_F32;
-	for (int r = 0; r < blk; r++) {
-		float		*dst = &b->y[(size_t)(b->m_done + r) * b->n + (j->row_start + lo - b->row0)];
+	int	   rows			= blk < b->m - b->m_done ? blk : b->m - b->m_done;
+	for (int r = 0; r < rows; r++) {
+		int orow	   = b->m_done + r;
+		int accumulate = b->accumulate;
+		if (b->m_out && orow >= b->m_out) {
+			orow -= b->m_out;
+			accumulate = 1;
+		}
+		float		*dst	 = &b->y[(size_t)orow * b->n + (j->row_start + lo - b->row0)];
 		const float *src_row = om + (size_t)r * RKT_OUT_C2_F32;
 		int			 nn		 = lo;
 		for (; nn < hi && nn % RKT_OUT_C2_F32; nn++)
 			collect_store(dst + (nn - lo), collect_at(src_row, group_stride, nn) * out_scale,
-						  b->accumulate);
+						  accumulate);
 		for (; nn + RKT_OUT_C2_F32 <= hi; nn += RKT_OUT_C2_F32) {
 			float32x4_t v = vmulq_n_f32(
 				vld1q_f32(src_row + (size_t)(nn / RKT_OUT_C2_F32) * group_stride), out_scale);
 			float *d = dst + (nn - lo);
-			vst1q_f32(d, b->accumulate ? vaddq_f32(vld1q_f32(d), v) : v);
+			vst1q_f32(d, accumulate ? vaddq_f32(vld1q_f32(d), v) : v);
 		}
 		for (; nn < hi; nn++)
 			collect_store(dst + (nn - lo), collect_at(src_row, group_stride, nn) * out_scale,
-						  b->accumulate);
+						  accumulate);
 	}
 	return OK;
 }
@@ -1408,12 +1416,24 @@ static status_code enqueue_kchunks(rkt_priv *p, const rkt_weight *w, int row0, i
 							  .epi_cap	  = p->epi_cap,
 							  .y16		  = p->out16_dst,
 							  .y16_stride = p->out16_stride,
-							  .ew16		  = ci == 0 ? p->ew_res16 : NULL};
+							  .ew16		  = ci == 0 ? p->ew_res16 : NULL,
+							  .m_out	  = p->split_rows};
 		int		  max_rows = rkt_max_batch_rows(kc->k_len, esz);
 		for (int done = 0; done < m;) {
-			int blk		  = rkt_next_block_rows(m - done, max_rows);
+			int			remaining = m - done;
+			int			blk		  = rkt_next_block_rows(remaining, max_rows);
+			const void *src		  = xc + (size_t)done * kc->k_len * esz;
+			uint8_t	   *padded	  = NULL;
+			if (blk == 1 && remaining > 1) {
+				size_t row_bytes = (size_t)kc->k_len * esz;
+				blk				 = 4;
+				padded			 = xcalloc(4, row_bytes);
+				memcpy(padded, src, (size_t)remaining * row_bytes);
+				src = padded;
+			}
 			b.m_done	  = done;
-			status_code s = queue_block(p, &b, blk, xc + (size_t)done * kc->k_len * esz);
+			status_code s = queue_block(p, &b, blk, src);
+			free(padded);
 			if (s != OK)
 				return s;
 			done += blk;
@@ -1423,15 +1443,22 @@ static status_code enqueue_kchunks(rkt_priv *p, const rkt_weight *w, int row0, i
 }
 
 static status_code enqueue_fold(rkt_priv *p, const rkt_weight *w, const rkt_kchunk *fold_kc,
-								int row0, int n, const uint16_t *x16, float *y, int m) {
+								int row0, int n, float *y, int m) {
 	if (!rkt_ensure_capacity((void **)&p->x_chunk, &p->x_chunk_cap, (size_t)m * RKT_FOLD_K_LEN,
 							 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	memset(p->x_chunk, 0, (size_t)m * RKT_FOLD_K_LEN * sizeof(uint16_t));
-	for (int r = 0; r < m; r++)
-		p->x_chunk[(size_t)r * RKT_FOLD_K_LEN] = x16[(size_t)r * w->k_pad + w->k];
+	p->x_chunk[0] = 0x3C00u;
+	p->x_chunk[1] = 0x3C00u;
 
-	block_ctx fb = {.w = w, .kc = fold_kc, .row0 = row0, .n = n, .m = m, .y = y, .accumulate = 1};
+	block_ctx fb = {.w			= w,
+					.kc			= fold_kc,
+					.row0		= row0,
+					.n			= n,
+					.m			= m,
+					.y			= y,
+					.accumulate = 1,
+					.m_out		= p->split_rows};
 	for (int done = 0; done < m;) {
 		int blk		  = rkt_next_block_rows(m - done, RKT_TILE_ROWS);
 		fb.m_done	  = done;
@@ -1443,8 +1470,8 @@ static status_code enqueue_fold(rkt_priv *p, const rkt_weight *w, const rkt_kchu
 	return OK;
 }
 
-static status_code dense_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, int n,
-									 const uint16_t *x16, float *y, int m) {
+static status_code dense_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0, int n, float *y,
+									 int m) {
 	rkt_kchunk fold_kc = {
 		.k_off = w->k,
 		.k_len = RKT_FOLD_K_LEN,
@@ -1456,7 +1483,7 @@ static status_code dense_matmul_fold(rkt_priv *p, const rkt_weight *w, int row0,
 
 	status_code s = enqueue_kchunks(p, w, row0, n, y, m);
 	if (s == OK)
-		s = enqueue_fold(p, w, &fold_kc, row0, n, x16, y, m);
+		s = enqueue_fold(p, w, &fold_kc, row0, n, y, m);
 	if (s == OK)
 		return rkt_queue_flush(p);
 	rkt_queue_abort(p);
@@ -1474,8 +1501,11 @@ static void convert_activation_row(rkt_float_fmt fmt, uint8_t *dst, const float 
 
 status_code rkt_dense_matmul_enqueue_k(rkt_priv *p, const rkt_weight *w, int row0, int n,
 									   const float *x, float *y, int m, int k_used) {
-	int esz = rkt_weight_esz(w);
-	if (!rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m * w->k_pad * esz / 2,
+	int esz	   = rkt_weight_esz(w);
+	int split  = w->fmt == RKT_FMT_F16 && (m <= RKT_SPLIT_MAX_ROWS || p->force_split) &&
+				 !p->out16_dst && !p->epi_kind && !p->ew_res16 && !p->x_src;
+	int m_rows = split ? 2 * m : m;
+	if (!rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)m_rows * w->k_pad * esz / 2,
 							 sizeof(uint16_t)))
 		return ERR_OUT_OF_MEMORY;
 	for (int r = 0; r < m; r++) {
@@ -1483,7 +1513,17 @@ status_code rkt_dense_matmul_enqueue_k(rkt_priv *p, const rkt_weight *w, int row
 		convert_activation_row(w->fmt, dst, x + (size_t)r * w->k, k_used);
 		memset(dst + (size_t)k_used * esz, 0, (size_t)(w->k_pad - k_used) * esz);
 	}
-	return enqueue_kchunks(p, w, row0, n, y, m);
+	if (split)
+		for (int r = 0; r < m; r++) {
+			const uint16_t *hi = p->x16 + (size_t)r * w->k_pad;
+			uint16_t	   *lo = p->x16 + (size_t)(m + r) * w->k_pad;
+			rkt_convert_to_f16_residual(lo, hi, x + (size_t)r * w->k, (size_t)k_used);
+			memset(lo + k_used, 0, (size_t)(w->k_pad - k_used) * sizeof(uint16_t));
+		}
+	p->split_rows = split ? m : 0;
+	status_code s = enqueue_kchunks(p, w, row0, n, y, m_rows);
+	p->split_rows = 0;
+	return s;
 }
 
 status_code rkt_dense_matmul_enqueue(rkt_priv *p, const rkt_weight *w, int row0, int n,
@@ -1695,7 +1735,7 @@ static rkt_weight *fuse_weights(rkt_priv *p, rkt_weight **ws, int count) {
 	for (int i = 0; i < count; i++) {
 		const rkt_weight *w = ws[i];
 		if (!w || w->magic != RKT_WEIGHT_MAGIC || w->host_copy || w->fused_parent ||
-			w->fmt != RKT_FMT_F16 || w->n_kchunks == 0 || w->k != ws[0]->k ||
+			w->fmt != RKT_FMT_F16 || w->has_lo || w->n_kchunks == 0 || w->k != ws[0]->k ||
 			w->k_pad != ws[0]->k_pad || w->n_kchunks != ws[0]->n_kchunks)
 			return NULL;
 		for (int j = 0; j < i; j++)
@@ -1901,6 +1941,13 @@ static int ensure_fold_bos(rkt_priv *p, rkt_kchunk *kc) {
 	return 1;
 }
 
+static int residual_in_range(const float *r, int n) {
+	for (int i = 0; i < n; i++)
+		if (!(fabsf(r[i]) <= RKT_RESIDUAL_MAX))
+			return 0;
+	return 1;
+}
+
 static int residual_ew_eligible(const rkt_priv *p, const rkt_weight *w, int use_quant) {
 	return !p->ew_residual_failed && !p->npu_failed && !use_quant && !w->host_copy &&
 		   w->fmt == RKT_FMT_F16 && w->n_kchunks > 0;
@@ -1973,12 +2020,13 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 		row0 += wt->fused_row0;
 		wt = wt->fused_parent;
 	}
-	if (residual_ew_eligible(p, wt, use_quant) && rkt_ptr(residual) != NULL &&
+	int fold_ok = !(use_quant || wt->host_copy || wt->fmt != RKT_FMT_F16 || wt->n_kchunks != 1 ||
+					wt->kchunks[0].k_len + RKT_FOLD_K_LEN > RKT_MAX_K || wt->k_pad != wt->k ||
+					rkt_ptr(residual) == NULL);
+	if (!fold_ok && residual_ew_eligible(p, wt, use_quant) && rkt_ptr(residual) != NULL &&
 		residual_ew_matmul(p, wt, row0, n, k, x, residual, y) == OK)
 		return OK;
-	if (use_quant || wt->host_copy || wt->fmt != RKT_FMT_F16 || wt->n_kchunks != 1 ||
-		wt->kchunks[0].k_len + RKT_FOLD_K_LEN > RKT_MAX_K || wt->k_pad != wt->k ||
-		rkt_ptr(residual) == NULL) {
+	if (!fold_ok || !residual_in_range(rkt_ptr(residual), n)) {
 		const float *rr = rkt_ptr(residual);
 		float		*rc = NULL;
 		if (rr && rr == rkt_ptr(y)) {
@@ -2017,25 +2065,31 @@ status_code rkt_matmul_residual(backend *self, const buffer *w, uint32_t w_type,
 					continue;
 				uint16_t *fold = kc->fold_bo[c].map;
 				for (int rr = 0; rr < kc->part[c].row_count; rr++) {
-					int global	  = kc->part[c].row_start + rr;
-					int tile_slot = (rr / RKT_TILE_ROWS) * (RKT_TILE_ROWS * RKT_TILE_COLS) +
-									(rr % RKT_TILE_ROWS) * RKT_TILE_COLS;
-					fold[tile_slot] =
-						global >= row0 && global < row0 + n ? f32_to_f16_bits(r[global - row0]) : 0;
+					int		 global	   = kc->part[c].row_start + rr;
+					int		 tile_slot = (rr / RKT_TILE_ROWS) * (RKT_TILE_ROWS * RKT_TILE_COLS) +
+										 (rr % RKT_TILE_ROWS) * RKT_TILE_COLS;
+					int		 live	   = global >= row0 && global < row0 + n;
+					uint16_t hi		   = live ? f32_to_f16_bits(r[global - row0]) : 0;
+					fold[tile_slot]	   = hi;
+					fold[tile_slot + 1] =
+						live ? f32_to_f16_bits(r[global - row0] - f16_bits_to_f32(hi)) : 0;
 				}
 				if (rkt_bo_flush(&p->dev, &kc->fold_bo[c]))
 					s = ERR_IO;
 			}
 			if (s == OK) {
-				if (rkt_ensure_capacity((void **)&p->x16, &p->x16_cap,
-										(size_t)1 * (wt->k + RKT_FOLD_K_LEN), sizeof(uint16_t))) {
-					if (native)
+				int fold_rows = native ? 1 : 2;
+				if (rkt_ensure_capacity((void **)&p->x16, &p->x16_cap, (size_t)fold_rows * wt->k,
+										sizeof(uint16_t))) {
+					if (native) {
 						memcpy(p->x16, p->nat_act, (size_t)k * sizeof(uint16_t));
-					else
+					} else {
 						rkt_convert_to_f16(p->x16, xf, (size_t)k);
-					memset(p->x16 + k, 0, (size_t)(wt->k_pad - wt->k) * sizeof(uint16_t));
-					p->x16[k] = 0x3C00u;
-					s		  = dense_matmul_fold(p, wt, row0, n, p->x16, yf, 1);
+						rkt_convert_to_f16_residual(p->x16 + k, p->x16, xf, (size_t)k);
+					}
+					p->split_rows = native ? 0 : 1;
+					s			  = dense_matmul_fold(p, wt, row0, n, yf, fold_rows);
+					p->split_rows = 0;
 				} else {
 					s = ERR_OUT_OF_MEMORY;
 				}

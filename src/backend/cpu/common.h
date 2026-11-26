@@ -58,7 +58,7 @@ static inline size_t cpu_host_mem_total(void) {
 #define CPU_BACKEND_CAPS                                                                           \
 	(BCAP_IS_HOST | BCAP_MULTI_MATMUL | BCAP_ROPE_QK_FUSED | BCAP_MATMUL_RESIDUAL |                \
 	 BCAP_MATMUL_QONLY | BCAP_RMSNORM_ADD | BCAP_MATMUL_FFN_DOWN | BCAP_KV_QUANT_Q8_0 |            \
-	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT)
+	 BCAP_KV_POS_CAP | BCAP_KV_SHIFT | BCAP_MEM_BANDWIDTH)
 
 status_code cpu_backend_fill(backend *out, status_code (*init)(backend *, int));
 

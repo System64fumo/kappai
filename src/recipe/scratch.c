@@ -89,7 +89,9 @@ static void bs_arena_ensure(batch_scratch *bs, backend *owner, size_t bytes) {
 static buffer bs_arena_view(const batch_scratch *bs, backend *owner, size_t offset, size_t bytes) {
 	if (backend_has_cap(owner, BCAP_IS_HOST))
 		return buffer_host_view(owner, (char *)bs->arena_host.p + offset, bytes);
-	return buffer_slice(&bs->arena, offset, bytes);
+	buffer view	  = buffer_slice(&bs->arena, offset, bytes);
+	view.host_ptr = bs->arena.host_ptr;
+	return view;
 }
 
 static void bs_bind_views(batch_scratch *bs, backend *owner) {

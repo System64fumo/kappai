@@ -1143,7 +1143,6 @@ static void test_op_rmsnorm_per_head_batch(backend *ref, backend *tgt, int n_hea
 		compute_debug(y_ref, y_got, n);
 	record_result(OPFAM_BATCH_PARITY, label, v, detail);
 
-	/* in-place: x == y (the model uses io-slot aliasing) */
 	ref->buffer_write_f32(ref, &xr, x, n);
 	ref->rmsnorm_per_head_batch(ref, &xr, &wr, &xr, n_heads, head_dim, 1e-5f, m);
 	ref->buffer_read_f32(ref, &xr, y_ref, n);
