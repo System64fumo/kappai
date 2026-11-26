@@ -70,14 +70,6 @@ static status_code recipe_require_capability(const struct model *m, const backen
 	return allow_fallback ? ERR_FORMAT : ERR_UNSUPPORTED;
 }
 
-static status_code recipe_require_native(const model_recipe *r, const struct model *m,
-										 op_kind kind) {
-	if (!recipe_uses_op(r, m, kind))
-		return OK;
-	cap_resolution res = cap_resolve(m->backend, m, kind, NULL, 1);
-	return res.impl == CAP_NATIVE ? OK : recipe_require_capability(m, m->backend, res.fn, 0, 0, 0);
-}
-
 static status_code recipe_check_backend_capabilities(const model_recipe *r, const struct model *m) {
 	const backend *a = m->backend;
 	status_code	   s;
@@ -93,13 +85,6 @@ static status_code recipe_check_backend_capabilities(const model_recipe *r, cons
 		backend *host = backend_host();
 		s = recipe_require_capability(m, a, "attention_swa", 0,
 									  host && host != a && host->attention_swa != NULL, 1);
-		if (s != OK)
-			return s;
-	}
-	static const op_kind NATIVE_REQUIRED_OPS[] = {OP_HC_INIT,  OP_HC_PRE, OP_HC_POST,
-												  OP_HC_FINAL, OP_KDA,	  OP_MLA_ABSORBED};
-	for (size_t i = 0; i < ARRAY_LEN(NATIVE_REQUIRED_OPS); i++) {
-		s = recipe_require_native(r, m, NATIVE_REQUIRED_OPS[i]);
 		if (s != OK)
 			return s;
 	}

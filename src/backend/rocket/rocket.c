@@ -1026,7 +1026,7 @@ static status_code rkt_kv_put_batch(backend *self, buffer *k, buffer *v, int lay
 	(void)n_kv_heads;
 	rkt_priv		  *p  = self->priv;
 	const rkt_kv_slot *sl = kv_slot_of(k, layer);
-	if (!sl || sl->hd != head_dim || !v || v->handle != k->handle) {
+	if (!sl || head_dim < 1 || head_dim > sl->hd || !v || v->handle != k->handle) {
 		ERROR("rocket: kv_put rejected: slot=%d sl=%p sl.hd=%d head_dim=%d handle_match=%d", layer,
 			  (const void *)sl, sl ? sl->hd : -1, head_dim, v && k && v->handle == k->handle);
 		return ERR_INVALID_ARG;
@@ -1109,7 +1109,7 @@ static status_code rkt_kv_range_copy(backend *self, buffer *k, buffer *v, int la
 									 const uint8_t *src_v) {
 	rkt_priv		  *p  = self->priv;
 	const rkt_kv_slot *sl = kv_slot_of(k, layer);
-	if (!sl || sl->hd != head_dim || !v || v->handle != k->handle)
+	if (!sl || head_dim < 1 || head_dim > sl->hd || !v || v->handle != k->handle)
 		return ERR_INVALID_ARG;
 	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : sl->kvh;
 	if (n_active > sl->kvh || n_rows < 1 || pos_start < 0 || pos_start + n_rows > sl->pos_pad)
@@ -1280,6 +1280,7 @@ typedef struct {
 	int				   pos_start;
 	int				   window;
 	int				   head_dim;
+	int				   q_dim;
 } attn_job;
 
 typedef struct {
@@ -1291,9 +1292,9 @@ typedef struct {
 
 static attn_head_buf attn_head(const attn_job *j, float *ws, int i) {
 	float *q	  = ws + (size_t)i * j->group_floats;
-	float *scores = q + (size_t)2 * j->rows * j->head_dim;
+	float *scores = q + (size_t)2 * j->rows * j->q_dim;
 	return (attn_head_buf){.q	   = q,
-						   .out	   = q + (size_t)j->rows * j->head_dim,
+						   .out	   = q + (size_t)j->rows * j->q_dim,
 						   .scores = scores,
 						   .probs  = scores + (size_t)j->rows * j->span16};
 }
@@ -1305,10 +1306,13 @@ static status_code attn_enqueue_scores(const attn_job *j, float *ws, int g0, int
 		for (int row = 0; row < j->rows; row++)
 			memset(b.probs + (size_t)row * j->sl->pos_pad, 0, (size_t)j->span * sizeof(float));
 		for (int r = 0; r < j->m; r++)
-			for (int h = 0; h < j->n_groups; h++)
-				memcpy(b.q + (size_t)(r * j->n_groups + h) * j->head_dim,
+			for (int h = 0; h < j->n_groups; h++) {
+				float *qrow = b.q + (size_t)(r * j->n_groups + h) * j->q_dim;
+				memcpy(qrow,
 					   j->qf + ((size_t)r * j->n_heads + (size_t)g * j->n_groups + h) * j->head_dim,
 					   (size_t)j->head_dim * sizeof(float));
+				memset(qrow + j->head_dim, 0, (size_t)(j->q_dim - j->head_dim) * sizeof(float));
+			}
 		status_code s = rkt_dense_matmul_enqueue(j->p, j->sl->k, g * j->sl->pos_pad, j->span16, b.q,
 												 b.scores, j->rows);
 		if (s != OK)
@@ -1402,7 +1406,7 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 	(void)n_kv_heads;
 	rkt_priv		  *p  = self->priv;
 	const rkt_kv_slot *sl = kv_slot_of(k_cache, layer);
-	if (!sl || sl->hd != head_dim || !v_cache || v_cache->handle != k_cache->handle)
+	if (!sl || head_dim < 1 || head_dim > sl->hd || !v_cache || v_cache->handle != k_cache->handle)
 		return ERR_INVALID_ARG;
 	int n_active = n_kv_heads_active > 0 ? n_kv_heads_active : sl->kvh;
 	if (n_active > sl->kvh || n_heads < n_active || n_heads % n_active != 0 || m < 1)
@@ -1413,7 +1417,7 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 		return ERR_INVALID_ARG;
 	int	   span16		= rkt_align_up(span, RKT_N_ALIGN);
 	int	   M			= m * n_groups;
-	size_t group_floats = (size_t)M * (2 * head_dim + span16 + sl->pos_pad);
+	size_t group_floats = (size_t)M * (2 * sl->hd + span16 + sl->pos_pad);
 	int	   batch		= (int)(RKT_ATTN_BATCH_FLOATS / group_floats);
 	batch				= batch < 1 ? 1 : batch > n_active ? n_active : batch;
 	int pipelined		= n_active > batch;
@@ -1436,7 +1440,8 @@ static status_code rkt_attention_batch_inner(backend *self, const buffer *q, con
 					.span16		  = span16,
 					.pos_start	  = pos_start,
 					.window		  = window,
-					.head_dim	  = head_dim};
+					.head_dim	  = head_dim,
+					.q_dim		  = sl->hd};
 
 	pthread_mutex_lock(&p->lock);
 	status_code s = p->npu_failed ? ERR_COMPUTE_FAIL

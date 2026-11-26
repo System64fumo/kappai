@@ -219,9 +219,9 @@ status_code op_attention_mla(exec_ctx *ctx) {
 }
 
 status_code op_mla_absorbed(exec_ctx *ctx) {
-	backend		   *a = exec_layer_backend(ctx);
+	backend		   *a = OP_BACKEND(exec_layer_backend(ctx), mla_absorbed);
 	kvcache_hybrid *c = ctx->rows.cache ? ctx->rows.cache->hybrid : NULL;
-	if (!a->mla_absorbed || !c || !c->latent_buf)
+	if (!a || !a->mla_absorbed || !c || !c->latent_buf)
 		return ERR_UNSUPPORTED;
 	const model			*m = ctx->m;
 	const layer_weights *L = &m->layers[ctx->li];

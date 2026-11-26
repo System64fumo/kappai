@@ -383,8 +383,8 @@ backend_weight weight_view(const weight_ref *w) {
 }
 
 status_code op_hc_init(exec_ctx *ctx) {
-	backend *a = exec_layer_backend(ctx);
-	if (!a->hc_init)
+	backend *a = OP_BACKEND(exec_layer_backend(ctx), hc_init);
+	if (!a || !a->hc_init)
 		return ERR_UNSUPPORTED;
 	const model	 *m		 = ctx->m;
 	exec_segments seg	 = exec_segments_of(ctx);
@@ -404,8 +404,8 @@ status_code op_hc_init(exec_ctx *ctx) {
 }
 
 status_code op_hc_final(exec_ctx *ctx) {
-	backend *a = exec_layer_backend(ctx);
-	if (!a->hc_final)
+	backend *a = OP_BACKEND(exec_layer_backend(ctx), hc_final);
+	if (!a || !a->hc_final)
 		return ERR_UNSUPPORTED;
 	const model	 *m		 = ctx->m;
 	exec_segments seg	 = exec_segments_of(ctx);
@@ -425,8 +425,8 @@ status_code op_hc_final(exec_ctx *ctx) {
 }
 
 status_code op_hc_pre(exec_ctx *ctx) {
-	backend *a = exec_layer_backend(ctx);
-	if (!a->hc_pre)
+	backend *a = OP_BACKEND(exec_layer_backend(ctx), hc_pre);
+	if (!a || !a->hc_pre)
 		return ERR_UNSUPPORTED;
 	const model			*m			= ctx->m;
 	const layer_weights *L			= &m->layers[ctx->li];
@@ -469,8 +469,8 @@ status_code op_hc_pre(exec_ctx *ctx) {
 }
 
 status_code op_hc_post(exec_ctx *ctx) {
-	backend *a = exec_layer_backend(ctx);
-	if (!a->hc_post)
+	backend *a = OP_BACKEND(exec_layer_backend(ctx), hc_post);
+	if (!a || !a->hc_post)
 		return ERR_UNSUPPORTED;
 	const model	 *m			 = ctx->m;
 	exec_segments seg		 = exec_segments_of(ctx);
@@ -500,9 +500,9 @@ status_code op_hc_post(exec_ctx *ctx) {
 }
 
 status_code op_kda(exec_ctx *ctx) {
-	backend		   *a = exec_layer_backend(ctx);
+	backend		   *a = OP_BACKEND(exec_layer_backend(ctx), kda);
 	kvcache_hybrid *c = ctx->rows.cache ? ctx->rows.cache->hybrid : NULL;
-	if (!a->kda || !c || !c->conv_buf || !c->state_buf)
+	if (!a || !a->kda || !c || !c->conv_buf || !c->state_buf)
 		return ERR_UNSUPPORTED;
 	const model			*m = ctx->m;
 	const layer_weights *L = &m->layers[ctx->li];

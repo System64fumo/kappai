@@ -1290,8 +1290,12 @@ static status_code upload_layer_one_repack(model *m, backend *target, weight_ref
 
 static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	status_code	   s;
-	layer_weights *L		= &m->layers[i];
-	backend		  *layer_be = model_layer_backend(m, i);
+	layer_weights *L		  = &m->layers[i];
+	backend		  *layer_be	  = model_layer_backend(m, i);
+	backend		  *hc_be	  = layer_be->hc_pre ? layer_be : backend_host();
+	backend		  *kda_be	  = layer_be->kda ? layer_be : backend_host();
+	backend		  *mla_abs_be = layer_be->mla_absorbed ? layer_be : backend_host();
+	backend		  *mla_be	  = m->arch_info->is_kda ? mla_abs_be : layer_be;
 
 	int q_out		  = m->n_heads * model_layer_head_dim(m, i);
 	int q_weight_out  = m->arch_info->has_attn_output_gate ? 2 * q_out : q_out;
@@ -1310,6 +1314,20 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 			return s;                                                                              \
 	} while (0)
 
+#define UPLOAD_ON(be, ref, wtype, ndims, d0, d1, wc)                                               \
+	do {                                                                                           \
+		s = upload_layer_one(m, (be), (ref), (wtype), (ndims), (d0), (d1), (wc));                  \
+		if (s != OK)                                                                               \
+			return s;                                                                              \
+	} while (0)
+
+#define UPLOAD_REP_ON(be, ref, ndims, d0, d1, wc)                                                  \
+	do {                                                                                           \
+		s = upload_layer_one_repack(m, (be), (ref), (ndims), (d0), (d1), (wc));                    \
+		if (s != OK)                                                                               \
+			return s;                                                                              \
+	} while (0)
+
 #define UPLOAD_REP(ref, ndims, d0, d1, wc)                                                         \
 	do {                                                                                           \
 		s = upload_layer_one_repack(m, layer_be, (ref), (ndims), (d0), (d1), (wc));                \
@@ -1320,37 +1338,37 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 	UPLOAD(&L->attn_norm_w, GGML_TYPE_F32, 1, m->dim, 0, WCLASS_NORM);
 
 	if (m->arch_info->has_hyper_connections) {
-		UPLOAD_REP(&L->hc_attn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
-				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
-		UPLOAD_REP(&L->hc_ffn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
-				   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
-		UPLOAD(&L->hc_attn_base_w, GGML_TYPE_F32, 1,
-			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
-		UPLOAD(&L->hc_ffn_base_w, GGML_TYPE_F32, 1,
-			   (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
-		UPLOAD(&L->hc_attn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
-		UPLOAD(&L->hc_ffn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+		UPLOAD_REP_ON(hc_be, &L->hc_attn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+					  (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD_REP_ON(hc_be, &L->hc_ffn_fn_w, 2, (uint64_t)m->kda.hc_count * m->dim,
+					  (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, WCLASS_MATMUL);
+		UPLOAD_ON(hc_be, &L->hc_attn_base_w, GGML_TYPE_F32, 1,
+				  (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD_ON(hc_be, &L->hc_ffn_base_w, GGML_TYPE_F32, 1,
+				  (uint64_t)(2 + m->kda.hc_count) * m->kda.hc_count, 0, WCLASS_MISC);
+		UPLOAD_ON(hc_be, &L->hc_attn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
+		UPLOAD_ON(hc_be, &L->hc_ffn_scale_w, GGML_TYPE_F32, 1, 3, 0, WCLASS_MISC);
 	}
 
 	if (m->arch_info->is_kda && model_layer_is_recurrent(m, i)) {
 		const uint64_t d_inner = (uint64_t)m->hybrid.value_dim;
 		const uint64_t hd	   = (uint64_t)m->kda.head_dim;
 		const uint64_t conv_k  = (uint64_t)m->hybrid.conv_kernel;
-		UPLOAD_REP(&L->wq, 2, m->dim, d_inner, WCLASS_MATMUL);
-		UPLOAD_REP(&L->wk, 2, m->dim, d_inner, WCLASS_MATMUL);
-		UPLOAD_REP(&L->wv, 2, m->dim, d_inner, WCLASS_MATMUL);
-		UPLOAD_REP(&L->wo, 2, d_inner, m->dim, WCLASS_MATMUL);
-		UPLOAD_REP(&L->kda_f_a_w, 2, m->dim, hd, WCLASS_MATMUL);
-		UPLOAD_REP(&L->kda_f_b_w, 2, hd, d_inner, WCLASS_MATMUL);
-		UPLOAD_REP(&L->kda_g_a_w, 2, m->dim, hd, WCLASS_MATMUL);
-		UPLOAD_REP(&L->kda_g_b_w, 2, hd, d_inner, WCLASS_MATMUL);
-		UPLOAD_REP(&L->ssm_beta_w, 2, m->dim, m->n_heads, WCLASS_MATMUL);
-		UPLOAD(&L->ssm_a, GGML_TYPE_F32, 1, m->n_heads, 0, WCLASS_MISC);
-		UPLOAD(&L->ssm_dt_b, GGML_TYPE_F32, 1, d_inner, 0, WCLASS_MISC);
-		UPLOAD(&L->ssm_norm_w, GGML_TYPE_F32, 1, hd, 0, WCLASS_NORM);
-		UPLOAD(&L->kda_conv_q_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
-		UPLOAD(&L->kda_conv_k_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
-		UPLOAD(&L->kda_conv_v_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD_REP_ON(kda_be, &L->wq, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->wk, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->wv, 2, m->dim, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->wo, 2, d_inner, m->dim, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->kda_f_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->kda_f_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->kda_g_a_w, 2, m->dim, hd, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->kda_g_b_w, 2, hd, d_inner, WCLASS_MATMUL);
+		UPLOAD_REP_ON(kda_be, &L->ssm_beta_w, 2, m->dim, m->n_heads, WCLASS_MATMUL);
+		UPLOAD_ON(kda_be, &L->ssm_a, GGML_TYPE_F32, 1, m->n_heads, 0, WCLASS_MISC);
+		UPLOAD_ON(kda_be, &L->ssm_dt_b, GGML_TYPE_F32, 1, d_inner, 0, WCLASS_MISC);
+		UPLOAD_ON(kda_be, &L->ssm_norm_w, GGML_TYPE_F32, 1, hd, 0, WCLASS_NORM);
+		UPLOAD_ON(kda_be, &L->kda_conv_q_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD_ON(kda_be, &L->kda_conv_k_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
+		UPLOAD_ON(kda_be, &L->kda_conv_v_w, GGML_TYPE_F32, 2, conv_k, d_inner, WCLASS_MISC);
 	} else if (model_layer_is_recurrent(m, i)) {
 		if (m->arch_info->hybrid_shortconv) {
 			UPLOAD_REP(&L->attn_qkv_w, 2, m->dim, m->hybrid.conv_dim, WCLASS_MATMUL);
@@ -1373,24 +1391,24 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 		int kv_lora	  = m->mla.kv_lora;
 		int kv_a_rows = kv_lora + m->mla.qk_rope;
 		int q_b_rows  = m->n_heads * m->mla.qk_head;
-		UPLOAD_REP(&L->q_a_w, 2, m->dim, q_lora, WCLASS_MATMUL);
-		UPLOAD_REP(&L->q_b_w, 2, q_lora, q_b_rows, WCLASS_MATMUL);
-		UPLOAD(&L->q_a_norm_w, GGML_TYPE_F32, 1, q_lora, 0, WCLASS_NORM);
-		UPLOAD_REP(&L->kv_a_w, 2, m->dim, kv_a_rows, WCLASS_MATMUL);
+		UPLOAD_REP_ON(mla_be, &L->q_a_w, 2, m->dim, q_lora, WCLASS_MATMUL);
+		UPLOAD_REP_ON(mla_be, &L->q_b_w, 2, q_lora, q_b_rows, WCLASS_MATMUL);
+		UPLOAD_ON(mla_be, &L->q_a_norm_w, GGML_TYPE_F32, 1, q_lora, 0, WCLASS_NORM);
+		UPLOAD_REP_ON(mla_be, &L->kv_a_w, 2, m->dim, kv_a_rows, WCLASS_MATMUL);
 		if (!m->arch_info->is_kda) {
 			UPLOAD_REP(&L->k_b_w, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads,
 					   WCLASS_MATMUL);
 			UPLOAD_REP(&L->v_b_w, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads,
 					   WCLASS_MATMUL);
 		} else {
-			UPLOAD(&L->k_b_w, L->k_b_w.type, 2, (uint64_t)m->mla.qk_nope * m->mla.kv_lora,
-				   m->n_heads, WCLASS_MATMUL);
-			UPLOAD(&L->v_b_w, L->v_b_w.type, 2, (uint64_t)m->mla.kv_lora * m->mla.v_head,
-				   m->n_heads, WCLASS_MATMUL);
+			UPLOAD_ON(mla_abs_be, &L->k_b_w, L->k_b_w.type, 2,
+					  (uint64_t)m->mla.qk_nope * m->mla.kv_lora, m->n_heads, WCLASS_MATMUL);
+			UPLOAD_ON(mla_abs_be, &L->v_b_w, L->v_b_w.type, 2,
+					  (uint64_t)m->mla.kv_lora * m->mla.v_head, m->n_heads, WCLASS_MATMUL);
 		}
-		UPLOAD(&L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
+		UPLOAD_ON(mla_be, &L->kv_a_norm_w, GGML_TYPE_F32, 1, kv_lora, 0, WCLASS_NORM);
 		int wo_in = m->n_heads * m->mla.v_head;
-		UPLOAD_REP(&L->wo, 2, wo_in, m->dim, WCLASS_MATMUL);
+		UPLOAD_REP_ON(mla_be, &L->wo, 2, wo_in, m->dim, WCLASS_MATMUL);
 		memset(&L->wq.buf, 0, sizeof(L->wq.buf));
 		memset(&L->wk.buf, 0, sizeof(L->wk.buf));
 		memset(&L->wv.buf, 0, sizeof(L->wv.buf));
@@ -1617,6 +1635,8 @@ static status_code upload_layer_weights(model *m, int i, progress *prog) {
 
 #undef UPLOAD
 #undef UPLOAD_REP
+#undef UPLOAD_ON
+#undef UPLOAD_REP_ON
 	progress_update(prog, prog->current + 1);
 	return OK;
 }

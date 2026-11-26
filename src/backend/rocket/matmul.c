@@ -151,6 +151,32 @@ typedef struct {
 	backend			  *host;
 } quant_job;
 
+static float quant_refine_scale_i4(const float *x, int n, float scale) {
+	const float32x4_t lo = vdupq_n_f32(-8.0f), hi = vdupq_n_f32(7.0f);
+	const float32x4_t vinv = vdupq_n_f32(1.0f / scale);
+	float32x4_t		  num = vdupq_n_f32(0.0f), den = vdupq_n_f32(0.0f);
+	int				  i = 0;
+	for (; i + 4 <= n; i += 4) {
+		float32x4_t v = vld1q_f32(x + i);
+		float32x4_t q = vminq_f32(hi, vmaxq_f32(lo, vrndnq_f32(vmulq_f32(v, vinv))));
+		num			  = vfmaq_f32(num, v, q);
+		den			  = vfmaq_f32(den, q, q);
+	}
+	float sum_xq = vaddvq_f32(num), sum_qq = vaddvq_f32(den);
+	for (; i < n; i++) {
+		float q = fminf(7.0f, fmaxf(-8.0f, rintf(x[i] / scale)));
+		sum_xq += x[i] * q;
+		sum_qq += q * q;
+	}
+	return sum_qq > 0.0f && sum_xq > 0.0f ? sum_xq / sum_qq : scale;
+}
+
+static float quant_best_scale_i4(const float *x, int n, float amax) {
+	float scale = amax / 7.0f;
+	scale		= quant_refine_scale_i4(x, n, scale);
+	return quant_refine_scale_i4(x, n, scale);
+}
+
 static status_code quant_build_rows(void *arg, int lo, int hi) {
 	quant_job		  *job		 = arg;
 	const rkt_weight  *w		 = job->w;
@@ -200,14 +226,15 @@ static status_code quant_build_rows(void *arg, int lo, int hi) {
 			for (; i < valid; i++)
 				if (fabsf(tmp[k0 + i]) > amax)
 					amax = fabsf(tmp[k0 + i]);
-			int				  qmax	 = (1 << (bits - 1)) - 1;
-			int				  qmin	 = bits == 4 ? -qmax - 1 : -qmax;
-			float			  scale	 = amax / (float)qmax;
-			float			  inv	 = scale > 0.0f ? 1.0f / scale : 0.0f;
-			uint8_t			 *base	 = (uint8_t *)wc->wt.map + wc->w_off[nt * q->n_ktiles + kt];
-			int				  blocks = kl / 32;
-			int				  sum	 = 0;
-			const float32x4_t sv	 = vdupq_n_f32(inv);
+			int		 qmax	= (1 << (bits - 1)) - 1;
+			int		 qmin	= bits == 4 ? -qmax - 1 : -qmax;
+			float	 scale	= bits == 4 && amax > 0.0f ? quant_best_scale_i4(tmp + k0, valid, amax)
+													   : amax / (float)qmax;
+			float	 inv	= scale > 0.0f ? 1.0f / scale : 0.0f;
+			uint8_t *base	= (uint8_t *)wc->wt.map + wc->w_off[nt * q->n_ktiles + kt];
+			int		 blocks = kl / 32;
+			int		 sum	= 0;
+			const float32x4_t sv	= vdupq_n_f32(inv);
 			const int32x4_t	  sqmax = vdupq_n_s32(qmax), sqmin = vdupq_n_s32(qmin);
 			for (int b = 0; b < blocks; b++) {
 				int		 kb	 = b * 32;
@@ -1627,11 +1654,24 @@ static status_code host_matmul(const rkt_weight *w, int row0, int n, const buffe
 	return host->matmul_batch(host, &wv, w->src_type, &xv, &yv, n, w->k, m);
 }
 
+static status_code host_scratch_matmul(const buffer *wbuf, uint32_t w_type, const buffer *x,
+									   buffer *y, int n, int k, int m) {
+	backend *host = backend_host();
+	if (!host || !host->matmul_batch)
+		return ERR_UNSUPPORTED;
+	size_t row_bytes = ggml_row_size(w_type, (size_t)k);
+	buffer wv		 = buffer_host_view(host, rkt_ptr_raw(wbuf), (size_t)n * row_bytes);
+	buffer xv		 = buffer_host_view(host, rkt_ptr(x), (size_t)m * k * sizeof(float));
+	buffer yv		 = buffer_host_view(host, rkt_ptr(y), (size_t)m * n * sizeof(float));
+	return host->matmul_batch(host, &wv, w_type, &xv, &yv, n, k, m);
+}
+
 status_code rkt_matmul_batch(backend *self, const buffer *wbuf, uint32_t w_type, const buffer *x,
 							 buffer *y, int n, int k, int m) {
-	(void)w_type;
 	rkt_priv *p = self->priv;
 	rkt_log_pipeline_usage(p);
+	if (wbuf->host_ptr)
+		return host_scratch_matmul(wbuf, w_type, x, y, n, k, m);
 	rkt_weight *w = wbuf->handle;
 	if (!w || w->magic != RKT_WEIGHT_MAGIC) {
 		ERROR("rocket: matmul weight is not a rocket weight (owner=%s)",

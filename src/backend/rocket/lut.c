@@ -298,6 +298,21 @@ typedef struct {
 	float				out_scale;
 } lut_gather;
 
+static inline float32x4_t lut_gate_slope_neon(rkt_lut_kind kind, float32x4_t g, float32x4_t x) {
+	float32x4_t s = vmulq_f32(g, vsubq_f32(vdupq_n_f32(1.0f), g));
+	if (kind != RKT_LUT_GELU_GATE)
+		return s;
+	float32x4_t poly = vmlaq_f32(vdupq_n_f32(1.0f), vdupq_n_f32(0.134145f), vmulq_f32(x, x));
+	return vmulq_f32(vmulq_n_f32(s, 2.0f * 0.7978845608028654f), poly);
+}
+
+static inline float lut_gate_slope(rkt_lut_kind kind, float g, float x) {
+	float s = g * (1.0f - g);
+	if (kind != RKT_LUT_GELU_GATE)
+		return s;
+	return s * 2.0f * 0.7978845608028654f * (1.0f + 0.134145f * x * x);
+}
+
 static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 	(void)tid;
 	const lut_gather *g = arg;
@@ -329,7 +344,10 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 					float32x4_t xv	 = x16v;
 					if (xe && g->kind != RKT_LUT_TANH) {
 						xv = vld1q_f32(xe + j);
-						v  = vmulq_f32(v, xv);
+						if (lut_is_gate(g->kind))
+							v = vmlaq_f32(v, lut_gate_slope_neon(g->kind, v, x16v),
+										  vsubq_f32(xv, x16v));
+						v = vmulq_f32(v, xv);
 					} else if (xe) {
 						v = vmulq_f32(v, vmulq_n_f32(vld1q_f32(xe + j), 0.5f * g->in_scale));
 					}
@@ -363,6 +381,8 @@ static void lut_gather_chunk(int begin, int end, int tid, void *arg) {
 					float xv   = x16f;
 					if (xe && g->kind != RKT_LUT_TANH) {
 						xv = xe[j];
+						if (lut_is_gate(g->kind))
+							v += lut_gate_slope(g->kind, v, x16f) * (xv - x16f);
 						v *= xv;
 					} else if (xe) {
 						v *= xe[j] * 0.5f * g->in_scale;
