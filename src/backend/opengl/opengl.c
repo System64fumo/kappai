@@ -192,6 +192,7 @@ typedef enum {
 	GL_PIPE_SAMPLE_LARGE_FINAL,
 	GL_PIPE_SAMPLE_FULL_SUM,
 	GL_PIPE_SAMPLE_FULL_DRAW,
+	GL_PIPE_MEM_READ,
 	GL_PIPE_COUNT
 } gl_pipe_id;
 
@@ -1555,6 +1556,7 @@ static status_code gl_init(backend *self, int device_index) {
 									   UINT32_MAX, 1, 0},
 		[GL_PIPE_GDN_CONV]			= {"gdn_conv", gl_shader_gdn_conv_src, 0, UINT32_MAX, 1, 0},
 		[GL_PIPE_GDN_HEADS]			= {"gdn_heads", gl_shader_gdn_heads_src, 0, UINT32_MAX, 1, 0},
+		[GL_PIPE_MEM_READ]			= {"mem_read", gl_shader_mem_read_src, 0, UINT32_MAX, 1, 0},
 	};
 	_Static_assert(ARRAY_LEN(defs) == GL_PIPE_COUNT, "pipeline definition count mismatch");
 
@@ -1703,6 +1705,7 @@ static status_code gl_init(backend *self, int device_index) {
 
 	if (p->ctx.unified_memory)
 		self->caps |= BCAP_UNIFIED_MEMORY;
+	self->caps |= BCAP_MEM_BANDWIDTH;
 	p->device_local_total_estimate = p->ctx.video_memory_bytes;
 
 	log_tag("OGL", "%.*s", (int)backend_name_brief_len(p->ctx.renderer), p->ctx.renderer);
@@ -2109,6 +2112,89 @@ static size_t gl_mem_available(backend *self) {
 	if (total < p->device_local_allocated)
 		return 0;
 	return total - p->device_local_allocated;
+}
+
+static status_code gl_mem_bandwidth_probe(backend *self, double *bytes_per_sec) {
+	gl_priv *p = self->priv;
+	if (!bytes_per_sec)
+		return ERR_INVALID_ARG;
+	GL_ENTER(p);
+	if (!p->pipes[GL_PIPE_MEM_READ].program)
+		return ERR_UNSUPPORTED;
+
+	gl_finish(p);
+
+	size_t want = (size_t)256 << 20;
+	want &= ~(size_t)15;
+	if (want < ((size_t)8 << 20))
+		return ERR_UNSUPPORTED;
+
+	gl_buf *src	  = NULL;
+	size_t	bytes = want;
+	for (; bytes >= ((size_t)8 << 20); bytes /= 2) {
+		src = gl_buf_alloc_ex(p, bytes, GL_STATIC_DRAW, NULL, false, NULL);
+		if (src)
+			break;
+	}
+	if (!src)
+		return ERR_OUT_OF_MEMORY;
+
+	const size_t pattern_bytes = (size_t)4 << 20;
+	uint32_t	*pattern	   = xmalloc(pattern_bytes);
+	uint32_t	 st			   = 0x9E3779B9u;
+	for (size_t i = 0; i < pattern_bytes / sizeof(uint32_t); i++) {
+		st ^= st << 13;
+		st ^= st >> 17;
+		st ^= st << 5;
+		pattern[i] = st;
+	}
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, src->name);
+	for (size_t off = 0; off < bytes; off += pattern_bytes) {
+		size_t len = MIN(bytes - off, pattern_bytes);
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr)off, (GLsizeiptr)len, pattern);
+	}
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	free(pattern);
+
+	uint32_t n_vec	= (uint32_t)(bytes / 16);
+	uint32_t groups = (n_vec + 4095u) / 4096u;
+	if (groups == 0)
+		groups = 1;
+	if (p->ctx.max_dispatch[0] > 0 && groups > (uint32_t)p->ctx.max_dispatch[0])
+		groups = (uint32_t)p->ctx.max_dispatch[0];
+
+	gl_buf *dst =
+		gl_buf_alloc_ex(p, (size_t)groups * sizeof(uint32_t), GL_DYNAMIC_COPY, NULL, false, NULL);
+	if (!dst) {
+		gl_buf_free(p, src);
+		return ERR_OUT_OF_MEMORY;
+	}
+
+	gl_buf	   *bufs[2]		= {src, dst};
+	const char *unames[2]	= {"u_n", "u_groups"};
+	int			uniforms[2] = {(int)n_vec, (int)groups};
+	double		best		= 0.0;
+	status_code s			= OK;
+	for (int i = 0; i < 7; i++) {
+		uint64_t t0 = time_us();
+		s = gl_dispatch(p, &p->pipes[GL_PIPE_MEM_READ], bufs, 2, unames, uniforms, 2, groups, 1, 1,
+						1);
+		if (s == OK)
+			gl_finish(p);
+		double us = (double)(time_us() - t0);
+		if (s != OK || i < 2)
+			continue;
+		double bw = us > 0.0 ? (double)bytes * 1e6 / us : 0.0;
+		if (bw > best)
+			best = bw;
+	}
+
+	gl_buf_free(p, src);
+	gl_buf_free(p, dst);
+	if (best <= 0.0)
+		return s != OK ? s : ERR_UNSUPPORTED;
+	*bytes_per_sec = best;
+	return OK;
 }
 
 static void gl_release_thread(backend *self) {
@@ -6543,6 +6629,7 @@ static status_code gl_ctor(backend *out) {
 	out->ple_combine					 = gl_ple_combine;
 	out->mem_available					 = gl_mem_available;
 	out->mem_total						 = gl_mem_total;
+	out->mem_bandwidth_probe			 = gl_mem_bandwidth_probe;
 	out->release_thread					 = gl_release_thread;
 	out->synchronize					 = gl_synchronize;
 	out->set_gpu_profile				 = gl_set_gpu_profile;

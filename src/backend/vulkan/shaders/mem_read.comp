@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer SrcBuf {
+	uvec4 src[];
+};
+layout(set = 0, binding = 1) writeonly buffer DstBuf {
+	uint dst[];
+};
+
+layout(push_constant) uniform Params {
+	uint n;
+	uint groups;
+}
+params;
+
+shared uint partial[256];
+
+void main() {
+	uint g	 = gl_WorkGroupID.x;
+	uint lid = gl_LocalInvocationID.x;
+
+	uint per   = (params.n + params.groups - 1u) / params.groups;
+	uint start = g * per;
+	uint end   = min(start + per, params.n);
+
+	uint acc = 0u;
+	for (uint i = start + lid; i < end; i += 256u) {
+		uvec4 v = src[i];
+		acc ^= v.x ^ v.y ^ v.z ^ v.w;
+	}
+
+	partial[lid] = acc;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1u) {
+		if (lid < s)
+			partial[lid] ^= partial[lid + s];
+		barrier();
+	}
+	if (lid == 0u)
+		dst[g] = partial[0];
+}

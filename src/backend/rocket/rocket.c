@@ -1533,6 +1533,13 @@ static size_t rkt_mem_total(backend *self) {
 	return backend_mem_total(backend_host());
 }
 
+static status_code rkt_mem_bandwidth_probe(backend *self, double *bytes_per_sec) {
+	backend *host = backend_host();
+	if (!host || host == self || !host->mem_bandwidth_probe)
+		return ERR_UNSUPPORTED;
+	return host->mem_bandwidth_probe(host, bytes_per_sec);
+}
+
 static status_code rkt_probe(void) {
 	return access(device_path(), R_OK | W_OK) == 0 ? OK : ERR_UNSUPPORTED;
 }
@@ -1630,6 +1637,9 @@ static status_code rkt_init(backend *self, int device_index) {
 		rkt_free(self);
 		return ERR_UNSUPPORTED;
 	}
+	backend *host = backend_host();
+	if (host && host != self && host->mem_bandwidth_probe)
+		self->caps |= BCAP_MEM_BANDWIDTH;
 	log_tag("RKT", "%s: %d core(s)", device_path(), p->dev.n_cores);
 	return OK;
 }
@@ -1646,6 +1656,7 @@ static status_code rkt_ctor(backend *out) {
 	out->free					  = rkt_free;
 	out->mem_available			  = rkt_mem_available;
 	out->mem_total				  = rkt_mem_total;
+	out->mem_bandwidth_probe	  = rkt_mem_bandwidth_probe;
 	out->matmul_type_native		  = rkt_matmul_type_native;
 	out->buffer_alloc_weight	  = rkt_buffer_alloc_weight;
 	out->buffer_alloc_scratch	  = rkt_buffer_alloc_scratch;

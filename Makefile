@@ -214,7 +214,7 @@ rms = $(call vk,rmsnorm$(1)_batch,rmsnorm,$(2) -DBATCHED)
 
 
 VK_PLAIN := argmax argmax_reduce sample_topk sample_final sample_penalty sample_radix_hist sample_radix_select sample_gather sample_large_final sample_full_sum sample_full_draw moe_gather moe_combine moe_router attention attention_flash embd_lookup \
-            kv_put kv_shift_gather q8_quant attn_decode attn_merge qk_norm_rope dequant \
+            kv_put kv_shift_gather q8_quant attn_decode attn_merge qk_norm_rope dequant mem_read \
             ffn_activate_fused_batch layernorm_modulate rope_table attention_dense im2col \
             upsample_shortcut hc_init hc_final hc_post hc_pre_coef hc_pre_mix kda_conv kda_l2norm \
             kda_gate kda_delta kda_out mla_absorb_q mla_absorb_attn mla_kv_put mla_attention \

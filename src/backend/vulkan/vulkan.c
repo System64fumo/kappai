@@ -377,6 +377,7 @@ typedef struct {
 	vk_pipeline_set p_qk_norm_rope;
 	vk_pipeline_set p_rope_qk_batch;
 	vk_pipeline_set p_dequant;
+	vk_pipeline_set p_mem_read;
 	vk_pipeline_set p_ffn_activate_batch;
 	vk_pipeline_set p_ffn_activate_fused_batch;
 	vk_pipeline_set p_elementwise_batch;
@@ -1072,6 +1073,7 @@ static void vk_invalidate_desc_cache_for_buf(vk_priv *p, VkBuffer freed) {
 			&p->p_ffn_activate_batch,
 			&p->p_elementwise_batch,
 			&p->p_dequant,
+			&p->p_mem_read,
 		};
 		for (int i = 0; i < VK_NN_COUNT; i++)
 			vk_desc_cache_drop_buf(p, &p->p_nn[i], freed);
@@ -2957,6 +2959,12 @@ static status_code vk_init(backend *self, int device_index) {
 	if (s == OK)
 		p->p_dequant.name = "dequant";
 
+	s = vk_create_pipeline(p, shader_mem_read_spv, shader_mem_read_spv_len, 2, 8, &p->p_mem_read);
+	if (s == OK) {
+		p->p_mem_read.name = "mem_read";
+		self->caps |= BCAP_MEM_BANDWIDTH;
+	}
+
 	s = vk_create_pipeline(p, shader_ffn_activate_batch_spv, shader_ffn_activate_batch_spv_len, 3,
 						   20, &p->p_ffn_activate_batch);
 	if (s == OK)
@@ -3095,6 +3103,7 @@ static void vk_free(backend *self) {
 		vk_destroy_pipeline(p, &p->p_qk_norm_rope);
 		vk_destroy_pipeline(p, &p->p_rope_qk_batch);
 		vk_destroy_pipeline(p, &p->p_dequant);
+		vk_destroy_pipeline(p, &p->p_mem_read);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_batch);
 		vk_destroy_pipeline(p, &p->p_ffn_activate_fused_batch);
 		vk_destroy_pipeline(p, &p->p_elementwise_batch);
@@ -3944,7 +3953,7 @@ static status_code vk_buffer_write_f32(backend *self, buffer *buf, const float *
 	return vk_buffer_upload(self, buf, host_src, (size_t)n * sizeof(float));
 }
 
-static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
+static status_code vk_fill_buffer(vk_priv *p, vk_buf *b, uint32_t value) {
 	if (!b->buf || !b->size)
 		return OK;
 	vk_ring_slot *r = &p->ring[p->ring_cur];
@@ -3954,7 +3963,7 @@ static status_code vk_zero_buffer(vk_priv *p, vk_buf *b) {
 			return bs;
 	}
 	p->stream_seq++;
-	vkCmdFillBuffer(p->cmd, b->buf, 0, VK_WHOLE_SIZE, 0);
+	vkCmdFillBuffer(p->cmd, b->buf, 0, VK_WHOLE_SIZE, value);
 	r->has_work = 1;
 	return vk_run_cmd_sync(p);
 }
@@ -4011,7 +4020,7 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 			s = vk_alloc_buffer(p, total, kv_usage, kv_fallback, &out->single);
 		if (s == OK) {
 			out->chunked = 0;
-			s			 = vk_zero_buffer(p, &out->single);
+			s			 = vk_fill_buffer(p, &out->single, 0);
 			if (s != OK)
 				return s;
 			return OK;
@@ -4058,7 +4067,7 @@ static status_code vk_kv_store_alloc(vk_priv *p, size_t total, size_t per_layer_
 				  i, n, layer_sz);
 			return s;
 		}
-		s = vk_zero_buffer(p, &chunks[i]);
+		s = vk_fill_buffer(p, &chunks[i], 0);
 		if (s != OK) {
 			for (int j = 0; j <= i; j++)
 				vk_free_buffer(p, &chunks[j]);
@@ -4179,6 +4188,89 @@ static size_t vk_mem_available(backend *self) {
 	if (heap_total <= p->device_local_allocated)
 		return 0;
 	return heap_total - p->device_local_allocated;
+}
+
+static status_code vk_mem_bandwidth_probe(backend *self, double *bytes_per_sec) {
+	vk_priv *p = self->priv;
+	if (!bytes_per_sec)
+		return ERR_INVALID_ARG;
+	if (!p->dev || p->device_lost || !p->p_mem_read.pipeline)
+		return ERR_UNSUPPORTED;
+
+	status_code s = vk_run_cmd_sync(p);
+	if (s != OK)
+		return s;
+
+	size_t want = (size_t)256 << 20;
+	if (p->caps.max_storage_buffer_range > 0 && want > (size_t)p->caps.max_storage_buffer_range)
+		want = (size_t)p->caps.max_storage_buffer_range;
+	want &= ~(size_t)15;
+	if (want < ((size_t)8 << 20))
+		return ERR_UNSUPPORTED;
+
+	vk_buf *src	  = NULL;
+	size_t	bytes = want;
+	for (; bytes >= ((size_t)8 << 20); bytes /= 2) {
+		src = xcalloc(1, sizeof(*src));
+		s	= vk_alloc_buffer(p, bytes,
+							  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+							  vk_resident_flags(p), src);
+		if (s == OK)
+			break;
+		free(src);
+		src = NULL;
+	}
+	if (!src)
+		return ERR_OUT_OF_MEMORY;
+
+	uint32_t n_vec	= (uint32_t)(bytes / 16);
+	uint32_t groups = (n_vec + 4095u) / 4096u;
+	if (groups == 0)
+		groups = 1;
+	if (p->caps.max_workgroup_count[0] > 0 && groups > p->caps.max_workgroup_count[0])
+		groups = p->caps.max_workgroup_count[0];
+
+	vk_buf *dst = xcalloc(1, sizeof(*dst));
+	s = vk_alloc_buffer(p, (size_t)groups * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+						vk_resident_flags(p), dst);
+	if (s != OK) {
+		vk_free_buffer(p, src);
+		free(src);
+		free(dst);
+		return s;
+	}
+
+	s = vk_fill_buffer(p, src, 0x9E3779B9u);
+	if (s == OK) {
+		struct {
+			uint32_t n, groups;
+		} push			= {n_vec, groups};
+		vk_buf *bufs[2] = {src, dst};
+		double	best	= 0.0;
+		for (int i = 0; i < 7; i++) {
+			uint64_t t0 = time_us();
+			s = vk_dispatch_ex(p, &p->p_mem_read, bufs, NULL, NULL, 2, &push, sizeof(push), groups,
+							   1, 0x2);
+			if (s == OK)
+				s = vk_run_cmd_sync(p);
+			double us = (double)(time_us() - t0);
+			if (s != OK || i < 2)
+				continue;
+			double bw = us > 0.0 ? (double)bytes * 1e6 / us : 0.0;
+			if (bw > best)
+				best = bw;
+		}
+		if (best > 0.0)
+			*bytes_per_sec = best;
+		else if (s == OK)
+			s = ERR_UNSUPPORTED;
+	}
+
+	vk_free_buffer(p, src);
+	vk_free_buffer(p, dst);
+	free(src);
+	free(dst);
+	return s;
 }
 
 static status_code vk_kv_alloc(backend *self, const kv_desc *desc, buffer *k_out, buffer *v_out) {
@@ -8439,6 +8531,7 @@ static status_code vk_ctor(backend *out) {
 	out->buffer_write_f32				 = vk_buffer_write_f32;
 	out->mem_available					 = vk_mem_available;
 	out->mem_total						 = vk_mem_total;
+	out->mem_bandwidth_probe			 = vk_mem_bandwidth_probe;
 	out->kv_alloc						 = vk_kv_alloc;
 	out->kv_free						 = vk_kv_free;
 	out->kv_put							 = vk_kv_put;
