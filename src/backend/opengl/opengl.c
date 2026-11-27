@@ -1254,7 +1254,7 @@ static void gl_scratch_pool_release(gl_priv *p, gl_buf *b) {
 	gl_buf_free(p, b);
 }
 
-static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int n_bufs,
+static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, const buffer *const *bufs, int n_bufs,
 							   const char *const *uniform_names, const int *uniforms,
 							   int n_uniforms, GLuint groups_x, GLuint groups_y, GLuint groups_z,
 							   int n_outputs) {
@@ -1267,33 +1267,24 @@ static status_code gl_dispatch(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int
 	GL_ENTER(p);
 
 	for (int i = 0; i < n_bufs && i < GL_MAX_BINDINGS; i++)
-		gl_buf_sync_to_device(bufs[i]);
+		if (bufs[i])
+			gl_buf_sync_to_device(as_glbuf(bufs[i]));
 
 	gl_use_pipeline(p, pipe);
 	for (int i = 0; i < n_bufs && i < GL_MAX_BINDINGS; i++) {
 		if (!bufs[i])
 			continue;
-		gl_bind_raw(p, i, bufs[i]->name, 0, 0, i >= n_bufs - n_outputs);
+		if (i >= n_bufs - n_outputs)
+			gl_bind_ssbo_out(i, bufs[i]);
+		else
+			gl_bind_ssbo(i, bufs[i]);
 	}
 	gl_pui(pipe, uniform_names, uniforms, n_uniforms);
 
 	gl_launch(p, groups_x, groups_y, groups_z);
-	return OK;
-}
-
-static status_code gl_dispatch_all_dirty(gl_priv *p, gl_pipeline *pipe, gl_buf **bufs, int n_bufs,
-										 const char *const *uniform_names, const int *uniforms,
-										 int n_uniforms, GLuint gx, GLuint gy, GLuint gz,
-										 int n_outputs) {
-	status_code s = gl_dispatch(p, pipe, bufs, n_bufs, uniform_names, uniforms, n_uniforms, gx, gy,
-								gz, n_outputs);
-	if (s != OK)
-		return s;
-	if (n_outputs > n_bufs)
-		n_outputs = n_bufs;
 	for (int i = n_bufs - n_outputs; i < n_bufs; i++)
-		if (bufs[i])
-			bufs[i]->device_dirty = 1;
+		if (i >= 0 && bufs[i])
+			as_glbuf(bufs[i])->device_dirty = 1;
 	return OK;
 }
 
@@ -2170,11 +2161,14 @@ static status_code gl_mem_bandwidth_probe(backend *self, double *bytes_per_sec) 
 		return ERR_OUT_OF_MEMORY;
 	}
 
-	gl_buf	   *bufs[2]		= {src, dst};
-	const char *unames[2]	= {"u_n", "u_groups"};
-	int			uniforms[2] = {(int)n_vec, (int)groups};
-	double		best		= 0.0;
-	status_code s			= OK;
+	buffer src_b = {.handle = gl_buf_handle(src), .size = bytes, .owner = self};
+	buffer dst_b = {
+		.handle = gl_buf_handle(dst), .size = (size_t)groups * sizeof(uint32_t), .owner = self};
+	const buffer *bufs[2]	  = {&src_b, &dst_b};
+	const char	 *unames[2]	  = {"u_n", "u_groups"};
+	int			  uniforms[2] = {(int)n_vec, (int)groups};
+	double		  best		  = 0.0;
+	status_code	  s			  = OK;
 	for (int i = 0; i < 7; i++) {
 		uint64_t t0 = time_us();
 		s = gl_dispatch(p, &p->pipes[GL_PIPE_MEM_READ], bufs, 2, unames, uniforms, 2, groups, 1, 1,
@@ -2297,6 +2291,8 @@ static status_code gl_argmax_stage1(gl_priv *p, const buffer *logits, int n, int
 		p->argmax_partial_bytes			= partial_bytes;
 		p->argmax_partial->device_dirty = 1;
 	}
+
+	gl_buf_sync_to_device(as_glbuf(logits));
 
 	gl_pipeline *pipe = &p->pipes[GL_PIPE_ARGMAX_STAGE1];
 	gl_use_pipeline(p, pipe);
@@ -2776,10 +2772,7 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	}
 	}
 
-	size_t	row_stride = ggml_row_size(tok_embd_type, dim);
-	gl_buf *bufs[2]	   = {as_glbuf(tok_embd), as_glbuf(x_out)};
-	gl_buf_sync_to_device(bufs[0]);
-	gl_buf_sync_to_device(bufs[1]);
+	size_t row_stride = ggml_row_size(tok_embd_type, dim);
 
 	if (pipe == &p->pipes[GL_PIPE_EMBD_LOOKUP_QUANT]) {
 		int uniforms[5]				 = {token, dim, (int)tok_embd_type, (int)row_stride, tok_slot};
@@ -2802,7 +2795,7 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 		gl_pu(pipe, unames[4], uniforms[4]);
 		GLuint groups = (GLuint)((dim + 63) / 64);
 		gl_launch(p, groups, 1, 1);
-		bufs[1]->device_dirty = 1;
+		as_glbuf(x_out)->device_dirty = 1;
 		return OK;
 	}
 
@@ -2811,10 +2804,8 @@ static status_code gl_embd_lookup(backend *self, const buffer *tok_embd, uint32_
 	GLuint			   groups	   = (GLuint)((dim + 63) / 64);
 	if (tok_slot >= 0)
 		gl_bind_raw(p, 5, p->tok_reg->name, 0, 0, 0);
-	status_code s = gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 4, groups, 1, 1, 1);
-	if (s == OK)
-		bufs[1]->device_dirty = 1;
-	return s;
+	const buffer *bufs[2] = {tok_embd, x_out};
+	return gl_dispatch(p, pipe, bufs, 2, unames, uniforms, 4, groups, 1, 1, 1);
 }
 
 static status_code gl_rmsnorm_quantize(gl_priv *p, const buffer *x, const buffer *w, buffer *y,
@@ -3115,16 +3106,31 @@ static status_code gl_split_qgate(backend *self, const buffer *mixed, buffer *q,
 		return OK;
 	gl_priv *p = self->priv;
 	GL_ENTER(p);
+	buffer		  stage	  = {0};
+	const buffer *mix_src = mixed;
+	if (as_glbuf(mixed) == as_glbuf(q) || as_glbuf(mixed) == as_glbuf(gate)) {
+		status_code cs = self->buffer_alloc_scratch(self, mixed->size, &stage);
+		if (cs != OK)
+			return cs;
+		cs = gl_copy_buffer(self, mixed, &stage, (int)(mixed->size / sizeof(float)));
+		if (cs != OK) {
+			self->buffer_free(self, &stage);
+			return cs;
+		}
+		mix_src = &stage;
+	}
 	status_code s =
-		gl_elementwise(p, q, mixed, gate, n_heads * head_dim, 5, 0.0f, head_dim, n_rows);
+		gl_elementwise(p, q, mix_src, gate, n_heads * head_dim, 5, 0.0f, head_dim, n_rows);
 	if (s == ERR_INVALID_ARG) {
 		WARN("gl: split_qgate: routing to CPU due to bad buffer");
 		backend_report_host_fallback(self, "split_qgate", HFB_BUF_HOST_RESIDENT,
 									 "buffer is not a device buffer; executed on host (cpu)");
 		backend *host = backend_host();
 		if (host && host->split_qgate)
-			return host->split_qgate(host, mixed, q, gate, n_heads, head_dim, n_rows);
+			s = host->split_qgate(host, mixed, q, gate, n_heads, head_dim, n_rows);
 	}
+	if (stage.owner)
+		self->buffer_free(self, &stage);
 	return s;
 }
 
@@ -3661,7 +3667,6 @@ static status_code gl_partial_rope_qk(backend *self, buffer *q, buffer *k, int n
 	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_n_kv_heads", n_kv_heads);
 	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_head_dim", head_dim);
 	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_rope_dim", rope_dim);
-	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_pos0", pos_start);
 	gl_pu(&p->pipes[GL_PIPE_PARTIAL_ROPE_QK], "u_n_rows", n_rows);
 
 	int	   total_heads = n_heads + n_kv_heads;

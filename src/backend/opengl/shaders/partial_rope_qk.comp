@@ -17,7 +17,6 @@ layout(location = 0) uniform int u_n_heads;
 layout(location = 1) uniform int u_n_kv_heads;
 layout(location = 2) uniform int u_head_dim;
 layout(location = 3) uniform int u_rope_dim;
-layout(location = 4) uniform int u_pos0;
 layout(location = 5) uniform int u_n_rows;
 
 void main(void) {
@@ -35,7 +34,7 @@ void main(void) {
 	int qn	 = u_n_heads * u_head_dim;
 	int kn	 = u_n_kv_heads * u_head_dim;
 	int base = row * (is_q != 0 ? qn : kn) + h * u_head_dim;
-	int coff = (u_pos0 + row) * half_rd;
+	int coff = row * half_rd;
 
 	for (int j = 0; j < half_rd; j++) {
 		float c = rcos[coff + j];
