@@ -463,10 +463,9 @@ static inline int32_t iq3s_block_dot(const iq3s_block *restrict b, const int8_t 
 	iq3s_block_decode(b, decoded);
 	return iq3s_block_dot_decoded(b, decoded, q8);
 }
-static inline void mk_a64_repacked_compute(const int8x16_t lo[8], const int8x16_t hi[8],
-										   int8x16_t xl, int8x16_t xh, int32x4_t corr,
-										   const uint16_t *d_ptr, float d_xq, float32x4_t *acc_lo,
-										   float32x4_t *acc_hi) {
+static inline void mk_a64_repacked_sumi(const int8x16_t lo[8], const int8x16_t hi[8], int8x16_t xl,
+										int8x16_t xh, int32x4_t corr, int32x4_t *sumi_lo,
+										int32x4_t *sumi_hi) {
 	int32x4_t acc[8];
 	for (int r = 0; r < 8; r++) {
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -483,12 +482,20 @@ static inline void mk_a64_repacked_compute(const int8x16_t lo[8], const int8x16_
 #endif
 		acc[r] = a;
 	}
-	const int32x4_t sum01	= vpaddq_s32(acc[0], acc[1]);
-	const int32x4_t sum23	= vpaddq_s32(acc[2], acc[3]);
-	const int32x4_t sum45	= vpaddq_s32(acc[4], acc[5]);
-	const int32x4_t sum67	= vpaddq_s32(acc[6], acc[7]);
-	const int32x4_t sumi_lo = vsubq_s32(vpaddq_s32(sum01, sum23), corr);
-	const int32x4_t sumi_hi = vsubq_s32(vpaddq_s32(sum45, sum67), corr);
+	const int32x4_t sum01 = vpaddq_s32(acc[0], acc[1]);
+	const int32x4_t sum23 = vpaddq_s32(acc[2], acc[3]);
+	const int32x4_t sum45 = vpaddq_s32(acc[4], acc[5]);
+	const int32x4_t sum67 = vpaddq_s32(acc[6], acc[7]);
+	*sumi_lo			  = vsubq_s32(vpaddq_s32(sum01, sum23), corr);
+	*sumi_hi			  = vsubq_s32(vpaddq_s32(sum45, sum67), corr);
+}
+
+static inline void mk_a64_repacked_compute(const int8x16_t lo[8], const int8x16_t hi[8],
+										   int8x16_t xl, int8x16_t xh, int32x4_t corr,
+										   const uint16_t *d_ptr, float d_xq, float32x4_t *acc_lo,
+										   float32x4_t *acc_hi) {
+	int32x4_t sumi_lo, sumi_hi;
+	mk_a64_repacked_sumi(lo, hi, xl, xh, corr, &sumi_lo, &sumi_hi);
 
 	const uint16x8_t d_w_u16 = vld1q_u16(d_ptr);
 	float32x4_t		 d_w0	 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(d_w_u16)));

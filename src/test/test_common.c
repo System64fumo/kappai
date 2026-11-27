@@ -692,6 +692,27 @@ int test_repack_base_type(uint32_t type, uint32_t *base_type_out) {
 	case GGML_TYPE_Q6_K_REPACKED:
 		*base_type_out = GGML_TYPE_Q6_K;
 		return 1;
+	case GGML_TYPE_Q4_1_REPACKED:
+		*base_type_out = GGML_TYPE_Q4_1;
+		return 1;
+	case GGML_TYPE_Q5_0_REPACKED:
+		*base_type_out = GGML_TYPE_Q5_0;
+		return 1;
+	case GGML_TYPE_Q5_1_REPACKED:
+		*base_type_out = GGML_TYPE_Q5_1;
+		return 1;
+	case GGML_TYPE_IQ2_XXS_REPACKED:
+		*base_type_out = GGML_TYPE_IQ2_XXS;
+		return 1;
+	case GGML_TYPE_IQ2_S_REPACKED:
+		*base_type_out = GGML_TYPE_IQ2_S;
+		return 1;
+	case GGML_TYPE_IQ3_XXS_REPACKED:
+		*base_type_out = GGML_TYPE_IQ3_XXS;
+		return 1;
+	case GGML_TYPE_IQ4_XS_REPACKED:
+		*base_type_out = GGML_TYPE_IQ4_XS;
+		return 1;
 	default:
 		*base_type_out = type;
 		return 0;
@@ -707,6 +728,13 @@ int test_repack_n_align(uint32_t type) {
 	case GGML_TYPE_Q4_K_REPACKED:
 	case GGML_TYPE_Q5_K_REPACKED:
 	case GGML_TYPE_Q6_K_REPACKED:
+	case GGML_TYPE_Q4_1_REPACKED:
+	case GGML_TYPE_Q5_0_REPACKED:
+	case GGML_TYPE_Q5_1_REPACKED:
+	case GGML_TYPE_IQ2_XXS_REPACKED:
+	case GGML_TYPE_IQ2_S_REPACKED:
+	case GGML_TYPE_IQ3_XXS_REPACKED:
+	case GGML_TYPE_IQ4_XS_REPACKED:
 		return 8;
 	default:
 		return 1;
@@ -719,6 +747,13 @@ int test_type_per_row(uint32_t type) {
 	case GGML_TYPE_Q8_0_REPACKED:
 	case GGML_TYPE_IQ4_NL_REPACKED:
 	case GGML_TYPE_IQ3_S_REPACKED:
+	case GGML_TYPE_Q4_1_REPACKED:
+	case GGML_TYPE_Q5_0_REPACKED:
+	case GGML_TYPE_Q5_1_REPACKED:
+	case GGML_TYPE_IQ2_XXS_REPACKED:
+	case GGML_TYPE_IQ2_S_REPACKED:
+	case GGML_TYPE_IQ3_XXS_REPACKED:
+	case GGML_TYPE_IQ4_XS_REPACKED:
 		return 0;
 	default:
 		return 1;
@@ -789,8 +824,17 @@ const qtype_info QTYPES[] = {
 	{"q4_0", GGML_TYPE_Q4_0, 32, 18},
 	{"q4_0_repacked", GGML_TYPE_Q4_0_REPACKED, 32, 18},
 	{"q4_1", GGML_TYPE_Q4_1, 32, 20},
+#if !defined(__x86_64__)
+	{"q4_1_repacked", GGML_TYPE_Q4_1_REPACKED, 32, 20},
+#endif
 	{"q5_0", GGML_TYPE_Q5_0, 32, 22},
+#if !defined(__x86_64__)
+	{"q5_0_repacked", GGML_TYPE_Q5_0_REPACKED, 32, 22},
+#endif
 	{"q5_1", GGML_TYPE_Q5_1, 32, 24},
+#if !defined(__x86_64__)
+	{"q5_1_repacked", GGML_TYPE_Q5_1_REPACKED, 32, 24},
+#endif
 	{"q8_0", GGML_TYPE_Q8_0, 32, 34},
 	{"q8_0_repacked", GGML_TYPE_Q8_0_REPACKED, 32, 34},
 	{"q4_K", GGML_TYPE_Q4_K, 256, 144},
@@ -800,11 +844,23 @@ const qtype_info QTYPES[] = {
 	{"q6_K", GGML_TYPE_Q6_K, 256, 210},
 	{"q6_k_repacked", GGML_TYPE_Q6_K_REPACKED, 256, 210},
 	{"iq2_xxs", GGML_TYPE_IQ2_XXS, 256, 66},
+#if !defined(__x86_64__)
+	{"iq2_xxs_repacked", GGML_TYPE_IQ2_XXS_REPACKED, 256, 138},
+#endif
 	{"iq2_s", GGML_TYPE_IQ2_S, 256, 82},
+#if !defined(__x86_64__)
+	{"iq2_s_repacked", GGML_TYPE_IQ2_S_REPACKED, 256, 146},
+#endif
 	{"iq3_xxs", GGML_TYPE_IQ3_XXS, 256, 98},
+#if !defined(__x86_64__)
+	{"iq3_xxs_repacked", GGML_TYPE_IQ3_XXS_REPACKED, 256, 138},
+#endif
 	{"iq3_s", GGML_TYPE_IQ3_S, 256, 110},
 	{"iq3_s_repacked", GGML_TYPE_IQ3_S_REPACKED, 256, 134},
 	{"iq4_xs", GGML_TYPE_IQ4_XS, 256, 136},
+#if !defined(__x86_64__)
+	{"iq4_xs_repacked", GGML_TYPE_IQ4_XS_REPACKED, 256, 138},
+#endif
 	{"iq4_nl", GGML_TYPE_IQ4_NL, 32, 18},
 	{"iq4_nl_repacked", GGML_TYPE_IQ4_NL_REPACKED, 32, 18},
 	{"f32", GGML_TYPE_F32, 1, sizeof(float)},

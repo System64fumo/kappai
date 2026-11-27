@@ -1937,6 +1937,259 @@ static void cpu_repack_chunk(int begin, int end, int tid, void *ctx) {
 	job->repack_fn(job->src, job->dst, row_begin, row_end, job->k);
 }
 
+#define REPACK_IDENTITY_ROWS(name, type)                                                           \
+	static void name(const void *src, void *dst, int row_begin, int row_end, int k) {              \
+		size_t row = ggml_row_size(type, (size_t)k);                                               \
+		memcpy((char *)dst + (size_t)row_begin * row, (const char *)src + (size_t)row_begin * row, \
+			   (size_t)(row_end - row_begin) * row);                                               \
+	}
+
+REPACK_IDENTITY_ROWS(repack_iq2_xxs_identity, GGML_TYPE_IQ2_XXS)
+REPACK_IDENTITY_ROWS(repack_iq2_s_identity, GGML_TYPE_IQ2_S)
+REPACK_IDENTITY_ROWS(repack_iq3_xxs_identity, GGML_TYPE_IQ3_XXS)
+REPACK_IDENTITY_ROWS(repack_iq4_xs_identity, GGML_TYPE_IQ4_XS)
+
+void repack_q4_1_to_q4_1_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
+	int			   bpr	   = k / 32;
+	size_t		   src_row = (size_t)bpr * sizeof(q4_1_block);
+	size_t		   group   = Q4_1_REPACKED_GROUP_BYTES;
+	const uint8_t *s	   = src;
+	uint8_t		  *d	   = dst;
+	int			   g0	   = row_begin - (row_begin % Q4_1_REPACKED_ROWS);
+	for (int g = g0; g < row_end; g += Q4_1_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / Q4_1_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *dblk = dgroup + (size_t)bi * group;
+			uint16_t *dd   = (uint16_t *)(dblk + Q4_1_REPACKED_OFF_D);
+			uint16_t *dm   = (uint16_t *)(dblk + Q4_1_REPACKED_OFF_M);
+			uint8_t	 *dq   = dblk + Q4_1_REPACKED_OFF_QS;
+			for (int r = 0; r < Q4_1_REPACKED_ROWS; r++) {
+				const q4_1_block *b = (const q4_1_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				= b->d;
+				dm[r]				= b->m;
+				memcpy(dq + (size_t)r * 16, b->qs, 16);
+			}
+		}
+	}
+}
+
+void repack_q5_0_to_q5_0_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
+	int			   bpr	   = k / 32;
+	size_t		   src_row = (size_t)bpr * sizeof(q5_0_block);
+	size_t		   group   = Q5_0_REPACKED_GROUP_BYTES;
+	const uint8_t *s	   = src;
+	uint8_t		  *d	   = dst;
+	int			   g0	   = row_begin - (row_begin % Q5_0_REPACKED_ROWS);
+	for (int g = g0; g < row_end; g += Q5_0_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / Q5_0_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *dblk = dgroup + (size_t)bi * group;
+			uint16_t *dd   = (uint16_t *)(dblk + Q5_0_REPACKED_OFF_D);
+			uint8_t	 *dqh  = dblk + Q5_0_REPACKED_OFF_QH;
+			uint8_t	 *dq   = dblk + Q5_0_REPACKED_OFF_QS;
+			for (int r = 0; r < Q5_0_REPACKED_ROWS; r++) {
+				const q5_0_block *b = (const q5_0_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				= b->d;
+				memcpy(dqh + (size_t)r * 4, b->qh, 4);
+				memcpy(dq + (size_t)r * 16, b->qs, 16);
+			}
+		}
+	}
+}
+
+void repack_q5_1_to_q5_1_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+									   int k) {
+	int			   bpr	   = k / 32;
+	size_t		   src_row = (size_t)bpr * sizeof(q5_1_block);
+	size_t		   group   = Q5_1_REPACKED_GROUP_BYTES;
+	const uint8_t *s	   = src;
+	uint8_t		  *d	   = dst;
+	int			   g0	   = row_begin - (row_begin % Q5_1_REPACKED_ROWS);
+	for (int g = g0; g < row_end; g += Q5_1_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / Q5_1_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *dblk = dgroup + (size_t)bi * group;
+			uint16_t *dd   = (uint16_t *)(dblk + Q5_1_REPACKED_OFF_D);
+			uint16_t *dm   = (uint16_t *)(dblk + Q5_1_REPACKED_OFF_M);
+			uint8_t	 *dqh  = dblk + Q5_1_REPACKED_OFF_QH;
+			uint8_t	 *dq   = dblk + Q5_1_REPACKED_OFF_QS;
+			for (int r = 0; r < Q5_1_REPACKED_ROWS; r++) {
+				const q5_1_block *b = (const q5_1_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				= b->d;
+				dm[r]				= b->m;
+				memcpy(dqh + (size_t)r * 4, b->qh, 4);
+				memcpy(dq + (size_t)r * 16, b->qs, 16);
+			}
+		}
+	}
+}
+
+REPACK_IDENTITY_ROWS(repack_q4_1_identity, GGML_TYPE_Q4_1)
+REPACK_IDENTITY_ROWS(repack_q5_0_identity, GGML_TYPE_Q5_0)
+REPACK_IDENTITY_ROWS(repack_q5_1_identity, GGML_TYPE_Q5_1)
+
+void repack_iq2_s_to_iq2_s_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										 int k) {
+	const int	   bpr		   = k / 256;
+	const size_t   src_row	   = (size_t)bpr * sizeof(iq2_s_block);
+	const size_t   group	   = IQ2_S_REPACKED_GROUP_BYTES;
+	const uint8_t *s		   = src;
+	uint8_t		  *d		   = dst;
+	const int	   group_begin = row_begin - (row_begin % IQ2_S_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ2_S_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / IQ2_S_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *blk	  = dgroup + (size_t)bi * group;
+			uint16_t *dd	  = (uint16_t *)(blk + IQ2_S_REPACKED_OFF_D);
+			int8_t	 *dscales = (int8_t *)(blk + IQ2_S_REPACKED_OFF_SCALES);
+			uint8_t	 *dqs	  = blk + IQ2_S_REPACKED_OFF_QS;
+			for (int r = 0; r < IQ2_S_REPACKED_ROWS; r++) {
+				const iq2_s_block *b = (const iq2_s_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				 = b->d;
+				const uint8_t *qs	 = b->qs;
+				const uint8_t *signs = b->qs + 32;
+				for (int ib = 0; ib < 8; ib++) {
+					uint8_t sc					 = b->scales[ib];
+					dscales[r * 16 + 2 * ib + 0] = (int8_t)(1 + 2 * (sc & 0xF));
+					dscales[r * 16 + 2 * ib + 1] = (int8_t)(1 + 2 * (sc >> 4));
+					uint8_t codes[32];
+					for (int l = 0; l < 4; l++) {
+						int index			= qs[4 * ib + l] | ((b->qh[ib] << (8 - 2 * l)) & 0x300);
+						const uint8_t *grid = (const uint8_t *)&ggml_iq2s_grid[index];
+						uint8_t		   sb	= signs[4 * ib + l];
+						for (int j = 0; j < 8; j++) {
+							int v			 = (sb & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j];
+							codes[l * 8 + j] = (uint8_t)(v & 0xF);
+						}
+					}
+					for (int j = 0; j < 16; j++)
+						dqs[r * 128 + ib * 16 + j] = (uint8_t)(codes[j] | (codes[j + 16] << 4));
+				}
+			}
+		}
+	}
+}
+
+void repack_iq2_xxs_to_iq2_xxs_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+											 int k) {
+	const int	   bpr		   = k / 256;
+	const size_t   src_row	   = (size_t)bpr * sizeof(iq2_xxs_block);
+	const size_t   group	   = IQ2_XXS_REPACKED_GROUP_BYTES;
+	const uint8_t *s		   = src;
+	uint8_t		  *d		   = dst;
+	const int	   group_begin = row_begin - (row_begin % IQ2_XXS_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ2_XXS_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / IQ2_XXS_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *blk	  = dgroup + (size_t)bi * group;
+			uint16_t *dd	  = (uint16_t *)(blk + IQ2_XXS_REPACKED_OFF_D);
+			int8_t	 *dscales = (int8_t *)(blk + IQ2_XXS_REPACKED_OFF_SCALES);
+			uint8_t	 *dqs	  = blk + IQ2_XXS_REPACKED_OFF_QS;
+			for (int r = 0; r < IQ2_XXS_REPACKED_ROWS; r++) {
+				const iq2_xxs_block *b =
+					(const iq2_xxs_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				= b->d;
+				const uint8_t *auxb = (const uint8_t *)b->qs;
+				for (int ib = 0; ib < 8; ib++) {
+					uint32_t aux[2];
+					memcpy(aux, auxb + (size_t)ib * 8, 8);
+					int scale			= (int)(aux[1] >> 28);
+					dscales[r * 8 + ib] = (int8_t)(1 + 2 * scale);
+					uint8_t codes[32];
+					for (int l = 0; l < 4; l++) {
+						uint8_t		   signs = ggml_ksigns_iq2xs[(aux[1] >> (7 * l)) & 127];
+						const uint8_t *grid =
+							(const uint8_t *)&ggml_iq2xxs_grid[((const uint8_t *)aux)[l]];
+						for (int j = 0; j < 8; j++) {
+							int v = (signs & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j];
+							codes[l * 8 + j] = (uint8_t)(v & 0xF);
+						}
+					}
+					for (int j = 0; j < 16; j++)
+						dqs[r * 128 + ib * 16 + j] = (uint8_t)(codes[j] | (codes[j + 16] << 4));
+				}
+			}
+		}
+	}
+}
+
+void repack_iq3_xxs_to_iq3_xxs_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+											 int k) {
+	const int	   bpr		   = k / 256;
+	const size_t   src_row	   = (size_t)bpr * sizeof(iq3_xxs_block);
+	const size_t   group	   = IQ3_XXS_REPACKED_GROUP_BYTES;
+	const uint8_t *s		   = src;
+	uint8_t		  *d		   = dst;
+	const int	   group_begin = row_begin - (row_begin % IQ3_XXS_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ3_XXS_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / IQ3_XXS_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *blk	  = dgroup + (size_t)bi * group;
+			uint16_t *dd	  = (uint16_t *)(blk + IQ3_XXS_REPACKED_OFF_D);
+			int8_t	 *dscales = (int8_t *)(blk + IQ3_XXS_REPACKED_OFF_SCALES);
+			uint8_t	 *dqs	  = blk + IQ3_XXS_REPACKED_OFF_QS;
+			for (int r = 0; r < IQ3_XXS_REPACKED_ROWS; r++) {
+				const iq3_xxs_block *b =
+					(const iq3_xxs_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]			  = b->d;
+				const uint8_t *qs = b->qs;
+				const uint8_t *ss = b->qs + 64;
+				for (int ib = 0; ib < 8; ib++) {
+					uint32_t aux;
+					memcpy(&aux, ss + 4 * ib, 4);
+					int scale			= (int)(aux >> 28);
+					dscales[r * 8 + ib] = (int8_t)(1 + 2 * scale);
+					uint8_t codes[32];
+					for (int l = 0; l < 4; l++) {
+						uint8_t		   signs = ggml_ksigns_iq2xs[(aux >> (7 * l)) & 127];
+						const uint8_t *g1	 = (const uint8_t *)&ggml_iq3xxs_grid[qs[2 * l]];
+						const uint8_t *g2	 = (const uint8_t *)&ggml_iq3xxs_grid[qs[2 * l + 1]];
+						for (int j = 0; j < 4; j++) {
+							int v1 = (signs & kmask_iq2xs[j]) ? -(int)g1[j] : (int)g1[j];
+							int v2 = (signs & kmask_iq2xs[j + 4]) ? -(int)g2[j] : (int)g2[j];
+							codes[l * 8 + j]	 = (uint8_t)(v1 & 0xF);
+							codes[l * 8 + 4 + j] = (uint8_t)(v2 & 0xF);
+						}
+					}
+					for (int j = 0; j < 16; j++)
+						dqs[r * 128 + ib * 16 + j] = (uint8_t)(codes[j] | (codes[j + 16] << 4));
+				}
+			}
+		}
+	}
+}
+
+void repack_iq4_xs_to_iq4_xs_repacked_rows(const void *src, void *dst, int row_begin, int row_end,
+										   int k) {
+	const int	   bpr		   = k / 256;
+	const size_t   src_row	   = (size_t)bpr * sizeof(iq4_xs_block);
+	const size_t   group	   = IQ4_XS_REPACKED_GROUP_BYTES;
+	const uint8_t *s		   = src;
+	uint8_t		  *d		   = dst;
+	const int	   group_begin = row_begin - (row_begin % IQ4_XS_REPACKED_ROWS);
+	for (int g = group_begin; g < row_end; g += IQ4_XS_REPACKED_ROWS) {
+		uint8_t *dgroup = d + (size_t)(g / IQ4_XS_REPACKED_ROWS) * bpr * group;
+		for (int bi = 0; bi < bpr; bi++) {
+			uint8_t	 *blk	  = dgroup + (size_t)bi * group;
+			uint16_t *dd	  = (uint16_t *)(blk + IQ4_XS_REPACKED_OFF_D);
+			int8_t	 *dscales = (int8_t *)(blk + IQ4_XS_REPACKED_OFF_SCALES);
+			uint8_t	 *dqs	  = blk + IQ4_XS_REPACKED_OFF_QS;
+			for (int r = 0; r < IQ4_XS_REPACKED_ROWS; r++) {
+				const iq4_xs_block *b = (const iq4_xs_block *)(s + (size_t)(g + r) * src_row) + bi;
+				dd[r]				  = b->d;
+				for (int ib = 0; ib < 8; ib++) {
+					int sl				= (b->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xF;
+					int sh				= (b->scales_h >> (2 * ib)) & 3;
+					dscales[r * 8 + ib] = (int8_t)((sl | (sh << 4)) - 32);
+				}
+				memcpy(dqs + (size_t)r * 128, b->qs, 128);
+			}
+		}
+	}
+}
+
 status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t d1,
 							uint32_t *re_type_out) {
 	(void)self;
@@ -1955,6 +2208,22 @@ status_code cpu_repack_plan(backend *self, uint32_t type, uint64_t d0, uint64_t 
 		re_type = GGML_TYPE_Q5_K_REPACKED;
 	} else if (type == GGML_TYPE_Q6_K && (d0 % 256) == 0 && (d1 % Q6_K_REPACKED_ROWS) == 0) {
 		re_type = GGML_TYPE_Q6_K_REPACKED;
+#if !defined(__x86_64__)
+	} else if (type == GGML_TYPE_Q4_1 && (d0 % 32) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_Q4_1_REPACKED;
+	} else if (type == GGML_TYPE_Q5_0 && (d0 % 32) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_Q5_0_REPACKED;
+	} else if (type == GGML_TYPE_Q5_1 && (d0 % 32) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_Q5_1_REPACKED;
+	} else if (type == GGML_TYPE_IQ2_XXS && (d0 % 256) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_IQ2_XXS_REPACKED;
+	} else if (type == GGML_TYPE_IQ2_S && (d0 % 256) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_IQ2_S_REPACKED;
+	} else if (type == GGML_TYPE_IQ3_XXS && (d0 % 256) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_IQ3_XXS_REPACKED;
+	} else if (type == GGML_TYPE_IQ4_XS && (d0 % 256) == 0 && (d1 % 8) == 0) {
+		re_type = GGML_TYPE_IQ4_XS_REPACKED;
+#endif
 	}
 	if (!re_type)
 		return ERR_UNSUPPORTED;
@@ -1986,6 +2255,29 @@ status_code cpu_repack_weight(backend *self, uint32_t type, const void *src, voi
 	} else if (type == GGML_TYPE_Q6_K) {
 		job.rows_per_group = Q6_K_REPACKED_ROWS;
 		job.repack_fn	   = repack_q6_k_to_q6_k_repacked_rows;
+#if !defined(__x86_64__)
+	} else if (type == GGML_TYPE_Q4_1) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_q4_1_to_q4_1_repacked_rows;
+	} else if (type == GGML_TYPE_Q5_0) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_q5_0_to_q5_0_repacked_rows;
+	} else if (type == GGML_TYPE_Q5_1) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_q5_1_to_q5_1_repacked_rows;
+	} else if (type == GGML_TYPE_IQ2_XXS) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_iq2_xxs_to_iq2_xxs_repacked_rows;
+	} else if (type == GGML_TYPE_IQ2_S) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_iq2_s_to_iq2_s_repacked_rows;
+	} else if (type == GGML_TYPE_IQ3_XXS) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_iq3_xxs_to_iq3_xxs_repacked_rows;
+	} else if (type == GGML_TYPE_IQ4_XS) {
+		job.rows_per_group = 8;
+		job.repack_fn	   = repack_iq4_xs_to_iq4_xs_repacked_rows;
+#endif
 	} else {
 		job.rows_per_group = 1;
 		job.repack_fn	   = repack_iq4_nl_to_q8_0_rows;
@@ -2989,7 +3281,7 @@ status_code cpu_partial_rope_qk(backend *self, buffer *q, buffer *k, int n_heads
 
 #define MATMUL_KERNEL(wt, fn, q8) [(wt)] = {(qonly_fn)fn, wt, q8}
 
-static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_REPACKED + 1] = {
+static const matmul_kernel k_kernel_by_type[GGML_TYPE_IQ4_XS_REPACKED + 1] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_0, matmul_q4_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_IQ4_NL, matmul_iq4_nl_q8_qonly_f32, 1),
 	MATMUL_KERNEL(GGML_TYPE_Q8_0, matmul_q8_0_q8_qonly_f32, 1),
@@ -3011,6 +3303,13 @@ static const matmul_kernel k_kernel_by_type[GGML_TYPE_Q6_K_REPACKED + 1] = {
 	MATMUL_KERNEL(GGML_TYPE_Q4_K_REPACKED, matmul_q4_k_repacked_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_Q5_K_REPACKED, matmul_q5_k_repacked_q8_k_qonly_f32, 3),
 	MATMUL_KERNEL(GGML_TYPE_Q6_K_REPACKED, matmul_q6_k_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_Q4_1_REPACKED, matmul_q4_1_repacked_q8_qonly_f32, 2),
+	MATMUL_KERNEL(GGML_TYPE_Q5_0_REPACKED, matmul_q5_0_repacked_q8_qonly_f32, 1),
+	MATMUL_KERNEL(GGML_TYPE_Q5_1_REPACKED, matmul_q5_1_repacked_q8_qonly_f32, 2),
+	MATMUL_KERNEL(GGML_TYPE_IQ2_XXS_REPACKED, matmul_iq2_xxs_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_IQ2_S_REPACKED, matmul_iq2_s_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_IQ3_XXS_REPACKED, matmul_iq3_xxs_repacked_q8_k_qonly_f32, 3),
+	MATMUL_KERNEL(GGML_TYPE_IQ4_XS_REPACKED, matmul_iq4_xs_repacked_q8_k_qonly_f32, 3),
 };
 
 static inline void cpu_matmul_add_bias_residual(float *restrict y, const float *restrict bias,
@@ -3190,6 +3489,13 @@ static const grouped_matmul_kernel k_grouped_by_type[] = {
 	GROUPED_KERNEL(GGML_TYPE_Q4_K_REPACKED, Q4_K_REPACKED_ROWS, cpu_matmul_groups_worker),
 	GROUPED_KERNEL(GGML_TYPE_Q5_K_REPACKED, Q5_K_REPACKED_ROWS, cpu_matmul_groups_worker),
 	GROUPED_KERNEL(GGML_TYPE_Q6_K_REPACKED, Q6_K_REPACKED_ROWS, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q4_1_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q5_0_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_Q5_1_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ2_XXS_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ2_S_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ3_XXS_REPACKED, 8, cpu_matmul_groups_worker),
+	GROUPED_KERNEL(GGML_TYPE_IQ4_XS_REPACKED, 8, cpu_matmul_groups_worker),
 };
 
 static const grouped_matmul_kernel *grouped_matmul_kernel_lookup(uint32_t w_type) {
@@ -3228,10 +3534,13 @@ static size_t cpu_matmul_w_row_stride(uint32_t w_type, int k) {
 	case GGML_TYPE_Q8_0_REPACKED:
 		return (size_t)(k / 32) * sizeof(q8_0_block);
 	case GGML_TYPE_Q4_1:
+	case GGML_TYPE_Q4_1_REPACKED:
 		return (size_t)(k / 32) * sizeof(q4_1_block);
 	case GGML_TYPE_Q5_0:
+	case GGML_TYPE_Q5_0_REPACKED:
 		return (size_t)(k / 32) * sizeof(q5_0_block);
 	case GGML_TYPE_Q5_1:
+	case GGML_TYPE_Q5_1_REPACKED:
 		return (size_t)(k / 32) * sizeof(q5_1_block);
 	case GGML_TYPE_F32:
 		return (size_t)k * sizeof(float);

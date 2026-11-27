@@ -720,11 +720,15 @@ int model_should_repack(uint32_t type, const char *repack_config) {
 	if (!repack_config)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
 			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-			   type == GGML_TYPE_Q6_K;
+			   type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+			   type == GGML_TYPE_Q5_1 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S ||
+			   type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS;
 	if (strcmp(repack_config, "all") == 0)
 		return type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ||
 			   type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-			   type == GGML_TYPE_Q6_K;
+			   type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_0 ||
+			   type == GGML_TYPE_Q5_1 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S ||
+			   type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS;
 	if (strcmp(repack_config, "none") == 0)
 		return 0;
 
