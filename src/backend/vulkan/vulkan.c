@@ -2106,14 +2106,16 @@ static void vk_qcore_init(vk_priv *p) {
 		vk_create_pipeline(p, shader_q8k_quant_spv, sizeof(shader_q8k_quant_spv), 3, 16,
 						   &p->p_q8_quant[1]) != OK)
 		return;
-	p->p_q8_quant[0].name = "q8_quant";
-	p->p_q8_quant[1].name = "q8k_quant";
+	p->p_q8_quant[0].name					 = "q8_quant";
+	p->p_q8_quant[1].name					 = "q8k_quant";
+	static const uint32_t VQ_MV_FAM0_SPEC[2] = {1, 8};
 	for (int t = 0; t < VQ_COUNT; t++) {
 		for (int c = 0; c < 2; c++) {
-			bool wg16 = p->caps.is_mali;
+			bool			wg16 = p->caps.is_mali;
+			const uint32_t *spec = (t < VQ_DENSE && c == 0) ? VQ_MV_FAM0_SPEC : VQ_MV_SPEC[c];
 			if (vk_create_pipeline_spec(p, wg16 ? MV[t].spv_wg16 : MV[t].spv,
-										wg16 ? MV[t].len_wg16 : MV[t].len, 4, 16, VQ_MV_SPEC[c],
-										sizeof(VQ_MV_SPEC[c]), &p->p_qmv[t][c]) != OK)
+										wg16 ? MV[t].len_wg16 : MV[t].len, 4, 16, spec, 8,
+										&p->p_qmv[t][c]) != OK)
 				return;
 			p->p_qmv[t][c].name = MV[t].name[c];
 		}
@@ -4986,7 +4988,7 @@ static int vk_qcore_type(vk_priv *p, uint32_t w_type, int k, int m) {
 		if (MAP[i].type != w_type)
 			continue;
 		int fam = vk_qfamily(MAP[i].vq);
-		if (k % BLOCK[fam] != 0 || (fam == 2 && m >= VK_QMM_MIN_M))
+		if (k % BLOCK[fam] != 0 || (fam == 2 && m >= VK_QMM_MIN_M && !p->caps.is_mali))
 			return -1;
 		return MAP[i].vq;
 	}
@@ -5043,10 +5045,11 @@ static status_code vk_qcore_matmul(vk_priv *p, int t, const buffer *w, const buf
 		gx = (uint32_t)((m + tile - 1) / tile);
 		gy = (uint32_t)((n + VK_QMM_TILE - 1) / VK_QMM_TILE);
 	} else {
-		int c = m == 1 ? 0 : 1;
-		ps	  = &p->p_qmv[t][c];
-		gx	  = (uint32_t)((n + (int)VQ_MV_SPEC[c][1] - 1) / (int)VQ_MV_SPEC[c][1]);
-		gy	  = (uint32_t)((m + (int)VQ_MV_SPEC[c][0] - 1) / (int)VQ_MV_SPEC[c][0]);
+		int c	 = m == 1 ? 0 : 1;
+		ps		 = &p->p_qmv[t][c];
+		int rows = (t < VQ_DENSE && c == 0) ? 8 : (int)VQ_MV_SPEC[c][1];
+		gx		 = (uint32_t)((n + rows - 1) / rows);
+		gy		 = (uint32_t)((m + (int)VQ_MV_SPEC[c][0] - 1) / (int)VQ_MV_SPEC[c][0]);
 	}
 	if (gx > p->caps.max_workgroup_count[0] || gy > p->caps.max_workgroup_count[1])
 		return ERR_UNSUPPORTED;
@@ -5119,6 +5122,8 @@ static int vk_mmf_index(uint32_t w_type) {
 static int vk_mmf_usable(vk_priv *p, uint32_t w_type, int k, int m) {
 	int idx = vk_mmf_index(w_type);
 	if (idx < 0 || m < VK_QMM_MIN_M || !p->p_mmf[idx].pipeline)
+		return 0;
+	if (p->caps.is_mali && idx >= 3 && idx <= 6)
 		return 0;
 	if (w_type == GGML_TYPE_Q6_K || w_type == GGML_TYPE_IQ2_S)
 		return 0;
@@ -5881,19 +5886,8 @@ static status_code vk_attention_impl(backend *self, const buffer *q, const buffe
 		uint32_t	 groups	 = (uint32_t)vk_flash_groups(p, head_dim, n_heads, n_kv_heads);
 		vk_buf		*bufs[4] = {as_vkbuf(q), kb, vb, as_vkbuf(out)};
 		VkDeviceSize offs[4] = {q->offset, 0, 0, out->offset};
-		status_code	 _fds	 = vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push),
-											  groups, 1, 1u << 3);
-		if (_fds == OK) {
-			static int _dbg_flash = 0;
-			if (!_dbg_flash) {
-				_dbg_flash = 1;
-				float v	   = 0.0f;
-				vk_buf_download_raw(self, as_vkbuf(out), out->offset, &v, sizeof(float));
-				fprintf(stderr, "FLASH debug: out0=%.6f kv_q8=%d layer_off=%zu\\n", (double)v,
-						kv_q8, layer_off_flash);
-			}
-		}
-		return _fds;
+		return vk_dispatch_ex(p, flash_ps, bufs, offs, NULL, 4, &push, sizeof(push), groups, 1,
+							  1u << 3);
 	}
 
 	status_code s = vk_ensure_scores_buf(self, n_heads, n_ctx);
