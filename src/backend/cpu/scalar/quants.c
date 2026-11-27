@@ -378,6 +378,7 @@ static void iq4b_rp_rows_range(const void *w, const q8_k_block *restrict xq, flo
 			for (int r = 0; r < IQ4_XS_REPACKED_ROWS; r++) {
 				const uint8_t *qrow = qs_all + (size_t)r * 128;
 				int32_t		   tot	= 0;
+				const int8_t  *sc	= scales + r * nscales;
 				for (int ib = 0; ib < 8; ib++) {
 					const uint8_t *q  = qrow + (size_t)ib * 16;
 					const int8_t  *x  = xb->qs + ib * 32;
@@ -386,7 +387,6 @@ static void iq4b_rp_rows_range(const void *w, const q8_k_block *restrict xq, flo
 						s0 += cb[q[j] & 0xF] * (int32_t)x[j];
 						s1 += cb[q[j] >> 4] * (int32_t)x[j + 16];
 					}
-					const int8_t *sc = scales + r * nscales;
 					if (nscales == 16)
 						tot += sc[2 * ib + 0] * s0 + sc[2 * ib + 1] * s1;
 					else

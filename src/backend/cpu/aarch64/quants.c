@@ -5188,6 +5188,7 @@ static void iq4b_rp_rows_range(const void *w, const q8_k_block *restrict xq, flo
 			for (int r = 0; r < IQ4_XS_REPACKED_ROWS; r++) {
 				const uint8_t *qrow = qs_all + (size_t)r * 128;
 				int32_t		   tot	= 0;
+				const int8_t  *sc	= scales + r * nscales;
 				for (int ib = 0; ib < 8; ib++) {
 					const uint8x16_t q = vld1q_u8(qrow + ib * 16);
 					vst1q_s8(lo_buf, vreinterpretq_s8_u8(vqtbl1q_u8(kv, vandq_u8(q, mask))));
@@ -5195,7 +5196,6 @@ static void iq4b_rp_rows_range(const void *w, const q8_k_block *restrict xq, flo
 					const int8_t *x	 = xb->qs + ib * 32;
 					int32_t		  d0 = neon_dot16(lo_buf, x);
 					int32_t		  d1 = neon_dot16(hi_buf, x + 16);
-					const int8_t *sc = scales + r * nscales;
 					if (nscales == 16)
 						tot += sc[2 * ib + 0] * d0 + sc[2 * ib + 1] * d1;
 					else
@@ -6671,7 +6671,7 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 				for (int r = 0; r < MR; r++) {
 					const uint8_t *restrict qbytes =
 						dblk + Q4_K_REPACKED_OFF_QS + ((size_t)r * 128);
-					const uint8_t *restrict sc = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 16);
+					const uint8_t *restrict sc = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 12);
 
 					int32x4_t sumi_vec0 = vdupq_n_s32(0);
 					int32x4_t sumi_vec1 = vdupq_n_s32(0);
@@ -6679,10 +6679,13 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 					int		  is		= 0;
 
 					for (int g = 0; g < 4; g++) {
-						int32_t s0 = (int32_t)sc[is * 2 + 0];
-						int32_t m0 = (int32_t)sc[is * 2 + 1];
-						int32_t s1 = (int32_t)sc[is * 2 + 2];
-						int32_t m1 = (int32_t)sc[is * 2 + 3];
+						uint8_t s0b, m0b, s1b, m1b;
+						get_scale_min_k4(is, sc, &s0b, &m0b);
+						get_scale_min_k4(is + 1, sc, &s1b, &m1b);
+						int32_t s0 = (int32_t)s0b;
+						int32_t m0 = (int32_t)m0b;
+						int32_t s1 = (int32_t)s1b;
+						int32_t m1 = (int32_t)m1b;
 
 						const uint8_t *restrict qg = qbytes + (g * 32);
 						int32x4_t d0			   = vdupq_n_s32(0);
@@ -6765,7 +6768,7 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 			const float dmin = f16_to_f32_fast(
 				*(const uint16_t *)(dblk + Q4_K_REPACKED_OFF_DMIN + (size_t)slot * 2));
 			const uint8_t *restrict qbytes = dblk + Q4_K_REPACKED_OFF_QS + ((size_t)slot * 128);
-			const uint8_t *restrict sc	   = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)slot * 16);
+			const uint8_t *restrict sc	   = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)slot * 12);
 
 			const q8_k_block *restrict xb = &xq[bi];
 			const int8_t *restrict xq8	  = xb->qs;
@@ -6774,8 +6777,9 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec_single(const void *w,
 			int32_t sumi = 0, summ = 0;
 			int		is = 0, ib = 0;
 			for (int g = 0; g < 4; g++) {
-				int s0 = sc[is * 2 + 0], m0 = sc[is * 2 + 1];
-				int s1 = sc[is * 2 + 2], m1 = sc[is * 2 + 3];
+				uint8_t s0, m0, s1, m1;
+				get_scale_min_k4(is, sc, &s0, &m0);
+				get_scale_min_k4(is + 1, sc, &s1, &m1);
 				const uint8_t *restrict qg = qbytes + (g * 32);
 				int32_t dot0 = 0, dot1 = 0;
 				for (int l = 0; l < 32; l++) {
@@ -6856,14 +6860,17 @@ static void matmul_q4_k_repacked_q8_k_qonly_f32_vec(const void *w, const q8_k_bl
 			vst1q_f32(&dmin_w_cache[bi][0], dm_lo);
 			vst1q_f32(&dmin_w_cache[bi][4], dm_hi);
 			for (int r = 0; r < MR; r++) {
-				const uint8_t *restrict se = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 16);
+				const uint8_t *restrict se = dblk + Q4_K_REPACKED_OFF_SE + ((size_t)r * 12);
 
 				int is = 0;
 				for (int g = 0; g < 4; g++) {
-					s_lo_cache[bi][r][g] = (int32_t)se[is * 2 + 0];
-					m_lo_cache[bi][r][g] = (int32_t)se[is * 2 + 1];
-					s_hi_cache[bi][r][g] = (int32_t)se[is * 2 + 2];
-					m_hi_cache[bi][r][g] = (int32_t)se[is * 2 + 3];
+					uint8_t s0b, m0b, s1b, m1b;
+					get_scale_min_k4(is, se, &s0b, &m0b);
+					get_scale_min_k4(is + 1, se, &s1b, &m1b);
+					s_lo_cache[bi][r][g] = (int32_t)s0b;
+					m_lo_cache[bi][r][g] = (int32_t)m0b;
+					s_hi_cache[bi][r][g] = (int32_t)s1b;
+					m_hi_cache[bi][r][g] = (int32_t)m1b;
 					is += 2;
 				}
 			}

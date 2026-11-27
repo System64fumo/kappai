@@ -116,7 +116,7 @@ static const ggml_type_info *ggml_type_lookup(uint32_t t) {
 		[GGML_TYPE_Q4_0_REPACKED]	 = {GGML_TYPE_Q4_0_REPACKED, "q4_0_repacked", 18, 32},
 		[GGML_TYPE_IQ3_S_REPACKED]	 = {GGML_TYPE_IQ3_S_REPACKED, "iq3_s_repacked", 134, 256},
 		[GGML_TYPE_IQ4_NL_REPACKED]	 = {GGML_TYPE_IQ4_NL_REPACKED, "iq4_nl_repacked", 18, 32},
-		[GGML_TYPE_Q4_K_REPACKED]	 = {GGML_TYPE_Q4_K_REPACKED, "q4_k_repacked", 148, 256},
+		[GGML_TYPE_Q4_K_REPACKED]	 = {GGML_TYPE_Q4_K_REPACKED, "q4_k_repacked", 144, 256},
 		[GGML_TYPE_Q5_K_REPACKED]	 = {GGML_TYPE_Q5_K_REPACKED, "q5_k_repacked", 180, 256},
 		[GGML_TYPE_Q6_K_REPACKED]	 = {GGML_TYPE_Q6_K_REPACKED, "q6_k_repacked", 210, 256},
 		[GGML_TYPE_Q4_1_REPACKED]	 = {GGML_TYPE_Q4_1_REPACKED, "q4_1_repacked", 20, 32},

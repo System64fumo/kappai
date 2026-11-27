@@ -174,7 +174,7 @@ static const repack_spec REPACK_SPECS[] = {
 	{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0_REPACKED, 32, 18, 18, "q4_0_repacked"},
 	{GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL_REPACKED, 32, 18, 18, "iq4_nl_repacked"},
 	{GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_S_REPACKED, 256, 110, 134, "iq3_s_repacked"},
-	{GGML_TYPE_Q4_K, GGML_TYPE_Q4_K_REPACKED, 256, 144, 148, "q4_k_repacked"},
+	{GGML_TYPE_Q4_K, GGML_TYPE_Q4_K_REPACKED, 256, 144, 144, "q4_k_repacked"},
 	{GGML_TYPE_Q5_K, GGML_TYPE_Q5_K_REPACKED, 256, 176, 180, "q5_k_repacked"},
 	{GGML_TYPE_Q6_K, GGML_TYPE_Q6_K_REPACKED, 256, 210, 210, "q6_k_repacked"},
 };

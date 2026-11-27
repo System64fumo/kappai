@@ -825,7 +825,7 @@ void repack_q4_k_to_q4_k_repacked_rows(const void *src, void *dst, int row_begin
 			for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
 				dst_d[r] = srow[r][bi].d;
 				dst_m[r] = srow[r][bi].dmin;
-				q4_k_expand_scales(srow[r][bi].scales, dst_se + (size_t)r * 16);
+				memcpy(dst_se + (size_t)r * 12, srow[r][bi].scales, 12);
 				memcpy(dst_q + (size_t)r * 128, srow[r][bi].qs, 128);
 			}
 		}
@@ -920,15 +920,16 @@ void matmul_q4_k_repacked_q8_k_qonly_f32_rows_range(const void *w, const q8_k_bl
 
 			const q8_k_block *restrict xb = &xq[bi];
 			for (int r = 0; r < Q4_K_REPACKED_ROWS; r++) {
-				const uint8_t *se	= dblk + Q4_K_REPACKED_OFF_SE + (size_t)r * 16;
+				const uint8_t *se	= dblk + Q4_K_REPACKED_OFF_SE + (size_t)r * 12;
 				const uint8_t *qb	= qss + (size_t)r * 128;
 				float		   d	= f16_to_f32(ds[r]);
 				float		   dmin = f16_to_f32(ms[r]);
 				int32_t		   sumi = 0, summ = 0;
 				int			   is = 0, ib = 0;
 				for (int g = 0; g < 4; g++) {
-					int s0 = se[is * 2 + 0], m0 = se[is * 2 + 1];
-					int s1 = se[is * 2 + 2], m1 = se[is * 2 + 3];
+					uint8_t s0, m0, s1, m1;
+					get_scale_min_k4(is, se, &s0, &m0);
+					get_scale_min_k4(is + 1, se, &s1, &m1);
 					const uint8_t *restrict qg = qb + (g * 32);
 					int32_t dot0 = 0, dot1 = 0;
 					for (int l = 0; l < 32; l++) {

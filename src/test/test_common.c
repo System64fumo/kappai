@@ -838,7 +838,7 @@ const qtype_info QTYPES[] = {
 	{"q8_0", GGML_TYPE_Q8_0, 32, 34},
 	{"q8_0_repacked", GGML_TYPE_Q8_0_REPACKED, 32, 34},
 	{"q4_K", GGML_TYPE_Q4_K, 256, 144},
-	{"q4_k_repacked", GGML_TYPE_Q4_K_REPACKED, 256, 148},
+	{"q4_k_repacked", GGML_TYPE_Q4_K_REPACKED, 256, 144},
 	{"q5_K", GGML_TYPE_Q5_K, 256, 176},
 	{"q5_k_repacked", GGML_TYPE_Q5_K_REPACKED, 256, 180},
 	{"q6_K", GGML_TYPE_Q6_K, 256, 210},
